@@ -1,0 +1,61 @@
+{
+  "name": "torchlette",
+  "version": "0.0.0",
+  "description": "Torchlette core library",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./browser": {
+      "import": "./dist/browser.js",
+      "types": "./dist/browser.d.ts"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "browser": "./dist/browser.js",
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "lint": "biome check --error-on-warnings",
+    "format": "biome format --write",
+    "bench": "pnpm build && node dist/bench/runner.js",
+    "bench:browser": "pnpm build && echo 'Open http://localhost:8080/bench/browser/ in Chrome' && npx serve -p 8080",
+    "test": "vitest run --coverage",
+    "test:webgpu": "vitest run test/webgpu.spec.ts",
+    "test:browser": "vitest run --config vitest.config.browser.ts",
+    "size": "size-limit"
+  },
+  "author": "Torchlette contributors",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "size-limit": [
+    {
+      "path": "dist/browser.js",
+      "limit": "3.5 KB"
+    }
+  ],
+  "dependencies": {
+    "webgpu": "latest"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.2.3",
+    "@size-limit/preset-small-lib": "^8.2.4",
+    "@types/node": "^22.18.1",
+    "@vitest/browser": "^3.2.4",
+    "@vitest/coverage-istanbul": "3.2.4",
+    "fast-check": "^4.5.3",
+    "playwright": "^1.57.0",
+    "size-limit": "^8.2.4",
+    "tsdown": "^0.15.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
