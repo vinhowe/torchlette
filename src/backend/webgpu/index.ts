@@ -132,10 +132,24 @@ class SimpleBufferPool {
   private allocCount = 0;
   private enabled = true;
   private debugTrace = false;
+  // Track new allocations by size class for pool pre-warming
+  private newAllocsByClass = new Map<number, number>();
+  // Stable buffer identity for deterministic pool ordering
+  private nextBufferPoolId = 1;
+  private bufferPoolIdMap = new WeakMap<GPUBuffer, number>();
+
+  // Window-based demand tracking for reservation
+  private windowTracking = false;
+  private currentWindowId = 0;
+  private windowDemand: Array<Map<number, { acquires: number; releases: number }>> = [];
+  private reservation: Map<number, number> | null = null;
 
   // Total byte budget for pooled + pending buffers.
-  // Default 1GB — allows high reuse without unbounded growth.
-  private maxPoolBytes = 1024 * 1024 * 1024;
+  // Default: no limit (Infinity). Like PyTorch's CUDA caching allocator, the
+  // pool grows as needed and relies on the memory tracker's eviction mechanism
+  // (in createTrackedBuffer) for pressure relief. Users can set an explicit
+  // cap via setMaxPoolBytes() or the TORCHLETTE_POOL_BUDGET_MB env var.
+  private maxPoolBytes = Infinity;
 
   // Fence integration (§14): buffers pending GPU completion
   private pendingRelease: Array<{
@@ -147,6 +161,11 @@ class SimpleBufferPool {
   private queue: GPUQueue | null = null;
   private fencePromise: Promise<void> | null = null;
 
+  // Reference counting: track how many owning tensors reference each GPUBuffer.
+  // Only owning tensors (ownsBuffer=true) participate. When refcount drops to 0,
+  // the buffer is eligible for pool promotion or reuse from pendingRelease.
+  private bufferLiveCount = new Map<GPUBuffer, number>();
+
   // Stats for understanding buffer reuse patterns
   private acquireFromPool = 0;
   private acquireFromPending = 0;
@@ -156,6 +175,10 @@ class SimpleBufferPool {
 
   setDebugTrace(enabled: boolean): void {
     this.debugTrace = enabled;
+  }
+
+  getPendingReleaseCount(): number {
+    return this.pendingRelease.length;
   }
 
   getDetailedStats() {
@@ -178,6 +201,24 @@ class SimpleBufferPool {
     this.releaseToDestroy = 0;
   }
 
+  /** Increment reference count for a buffer (called when an owning tensor is created). */
+  incRef(buffer: GPUBuffer): void {
+    this.bufferLiveCount.set(buffer, (this.bufferLiveCount.get(buffer) ?? 0) + 1);
+  }
+
+  /** Decrement reference count for a buffer (called when an owning tensor is destroyed or ownership transferred). */
+  decRef(buffer: GPUBuffer): void {
+    const c = this.bufferLiveCount.get(buffer);
+    if (c === undefined) return;
+    if (c <= 1) this.bufferLiveCount.delete(buffer);
+    else this.bufferLiveCount.set(buffer, c - 1);
+  }
+
+  /** Check if a buffer is still referenced by any owning tensor. */
+  isLive(buffer: GPUBuffer): boolean {
+    return this.bufferLiveCount.has(buffer);
+  }
+
   /**
    * Set the GPU queue for fence integration.
    * Must be called after WebGPU initialization.
@@ -194,27 +235,77 @@ class SimpleBufferPool {
    * are safe to reuse within the same execution because WebGPU guarantees
    * submission-order execution - writes to reused buffers happen after reads.
    */
+  /**
+   * Try to acquire a specific preferred buffer from the pool.
+   * Returns the preferred buffer if found and not in writeSet, else null.
+   * Used by resolveOutputBuffer to stabilize buffer assignments across steps,
+   * enabling bind group cache hits.
+   */
+  acquirePreferred(sizeBytes: number, preferred: GPUBuffer): GPUBuffer | null {
+    if (!this.enabled) return null;
+    if (sharedEncoder && sharedEncoderWriteSet.has(preferred)) return null;
+
+    const sizeClass = getSizeClass(sizeBytes);
+    const pooledBuffers = this.pool.get(sizeClass);
+    if (!pooledBuffers) return null;
+
+    const idx = pooledBuffers.indexOf(preferred);
+    if (idx === -1) return null;
+
+    pooledBuffers.splice(idx, 1);
+    const actualSize = getSizeForClass(sizeClass);
+    this.pooledBytes -= actualSize;
+    this.reuseCount++;
+    this.acquireFromPool++;
+    this.recordAcquire(sizeClass);
+    this.pooledBufferSet.add(preferred);
+    gpuMemoryTracker.trackAllocation(preferred, actualSize);
+    return preferred;
+  }
+
+  /**
+   * Sort each pool bucket by stable buffer ID for deterministic acquire order.
+   * Call at step start and after each flush to ensure the same set of buffers
+   * yields the same LIFO order for bind group cache stability.
+   */
+  sortPoolBuckets(): void {
+    const idMap = this.bufferPoolIdMap;
+    for (const bucket of this.pool.values()) {
+      if (bucket.length > 1) {
+        bucket.sort((a, b) => (idMap.get(a) ?? 0) - (idMap.get(b) ?? 0));
+      }
+    }
+  }
+
   acquire(sizeBytes: number): GPUBuffer | null {
     if (!this.enabled) return null;
 
     const sizeClass = getSizeClass(sizeBytes);
 
-    // First check the main pool (buffers from previous executions)
+    // Check the main pool (buffers from previous executions), skipping
+    // buffers in the shared encoder writeSet to avoid WAW hazards.
     const pooledBuffers = this.pool.get(sizeClass);
     if (pooledBuffers && pooledBuffers.length > 0) {
-      const buffer = pooledBuffers.pop()!;
-      const actualSize = getSizeForClass(sizeClass);
-      this.pooledBytes -= actualSize;
-      this.reuseCount++;
-      this.acquireFromPool++;
-      // Track that this buffer is from pool for release
-      this.pooledBufferSet.add(buffer);
-      // Re-track allocation (was deallocated when released to pool)
-      gpuMemoryTracker.trackAllocation(buffer, actualSize);
-      if (this.debugTrace) {
-        console.log(`[pool] acquire from POOL: ${(actualSize / 1e6).toFixed(2)} MB`);
+      // Scan from end (LIFO), skip writeSet members
+      for (let i = pooledBuffers.length - 1; i >= 0; i--) {
+        const buffer = pooledBuffers[i];
+        if (sharedEncoder && sharedEncoderWriteSet.has(buffer)) continue;
+        // Remove from array
+        pooledBuffers.splice(i, 1);
+        const actualSize = getSizeForClass(sizeClass);
+        this.pooledBytes -= actualSize;
+        this.reuseCount++;
+        this.acquireFromPool++;
+        this.recordAcquire(sizeClass);
+        // Track that this buffer is from pool for release
+        this.pooledBufferSet.add(buffer);
+        // Re-track allocation (was deallocated when released to pool)
+        gpuMemoryTracker.trackAllocation(buffer, actualSize);
+        if (this.debugTrace) {
+          console.log(`[pool] acquire from POOL: ${(actualSize / 1e6).toFixed(2)} MB`);
+        }
+        return buffer;
       }
-      return buffer;
     }
 
     // Then check pendingRelease for same-execution reuse.
@@ -227,13 +318,14 @@ class SimpleBufferPool {
     // written by earlier passes and their command buffers not yet submitted.
     if (!activeBatch && !pendingFencePromise && !sharedEncoder) {
       const pendingIdx = this.pendingRelease.findIndex(
-        (p) => p.sizeClass === sizeClass,
+        (p) => p.sizeClass === sizeClass && !this.bufferLiveCount.has(p.buffer),
       );
       if (pendingIdx !== -1) {
         const { buffer, size } = this.pendingRelease.splice(pendingIdx, 1)[0];
         this.pendingReleaseBytes -= size;
         this.reuseCount++;
         this.acquireFromPending++;
+        this.recordAcquire(sizeClass);
         this.pooledBufferSet.add(buffer);
         // Re-track allocation (was deallocated when added to pending)
         gpuMemoryTracker.trackAllocation(buffer, size);
@@ -252,9 +344,124 @@ class SimpleBufferPool {
    */
   trackNewAllocation(sizeBytes: number): void {
     this.acquireNew++;
+    const sc = getSizeClass(sizeBytes);
+    this.newAllocsByClass.set(sc, (this.newAllocsByClass.get(sc) ?? 0) + 1);
+    this.recordAcquire(sc);
     if (this.debugTrace) {
       console.log(`[pool] NEW allocation: ${(sizeBytes / 1e6).toFixed(2)} MB`);
     }
+  }
+
+  /**
+   * Pre-warm the pool by creating buffers for size classes that had misses last step.
+   * Call at the start of each step (before opening the shared encoder).
+   */
+  prewarm(device: GPUDevice): void {
+    for (const [sizeClass, count] of this.newAllocsByClass) {
+      const size = getSizeForClass(sizeClass);
+      for (let i = 0; i < count; i++) {
+        if (this.pooledBytes + this.pendingReleaseBytes + size > this.maxPoolBytes) break;
+        const buf = device.createBuffer({ size, usage: STORAGE_BUFFER_USAGE });
+        let bucket = this.pool.get(sizeClass);
+        if (!bucket) { bucket = []; this.pool.set(sizeClass, bucket); }
+        bucket.push(buf);
+        this.pooledBytes += size;
+      }
+    }
+    this.newAllocsByClass.clear();
+  }
+
+  /** Start recording window demand for this step. */
+  beginWindowTracking(): void {
+    this.windowTracking = true;
+    this.currentWindowId = 0;
+    this.windowDemand = [new Map()];
+  }
+
+  /** Advance to the next reclaim window. Call at each flushBufferPool boundary. */
+  beginWindow(): void {
+    if (!this.windowTracking) return;
+    this.currentWindowId++;
+    while (this.windowDemand.length <= this.currentWindowId) {
+      this.windowDemand.push(new Map());
+    }
+  }
+
+  /** Stop recording and compute reservation for next step. */
+  endWindowTracking(): void {
+    if (!this.windowTracking) return;
+    this.windowTracking = false;
+    this.computeReservation();
+  }
+
+  private recordAcquire(sizeClass: number): void {
+    if (!this.windowTracking) return;
+    const wm = this.windowDemand[this.currentWindowId];
+    if (!wm) return;
+    const e = wm.get(sizeClass) ?? { acquires: 0, releases: 0 };
+    e.acquires++;
+    wm.set(sizeClass, e);
+  }
+
+  private recordRelease(sizeClass: number): void {
+    if (!this.windowTracking) return;
+    const wm = this.windowDemand[this.currentWindowId];
+    if (!wm) return;
+    const e = wm.get(sizeClass) ?? { acquires: 0, releases: 0 };
+    e.releases++;
+    wm.set(sizeClass, e);
+  }
+
+  private computeReservation(): void {
+    const allSc = new Set<number>();
+    for (const wm of this.windowDemand) {
+      for (const sc of wm.keys()) allSc.add(sc);
+    }
+
+    const reservation = new Map<number, number>();
+    for (const sc of allSc) {
+      let cumAcq = 0, cumRel = 0, maxDeficit = 0;
+      for (let w = 0; w < this.windowDemand.length; w++) {
+        const e = this.windowDemand[w].get(sc);
+        cumAcq += e?.acquires ?? 0;
+        // Deficit at window w = cumAcquires[0..w] - cumReleases[0..w-1]
+        maxDeficit = Math.max(maxDeficit, cumAcq - cumRel);
+        cumRel += e?.releases ?? 0;
+      }
+      reservation.set(sc, maxDeficit);
+    }
+    this.reservation = reservation;
+  }
+
+  /**
+   * Reserve buffers to match the computed window-demand reservation.
+   * Only creates buffers for size classes where the pool has a deficit.
+   * Replaces prewarm() — call at beginStep() BEFORE opening shared encoder.
+   */
+  reserve(device: GPUDevice): void {
+    if (!this.reservation) {
+      // No reservation yet (step 0): fall back to prewarm
+      this.prewarm(device);
+      return;
+    }
+
+    for (const [sizeClass, needed] of this.reservation) {
+      const size = getSizeForClass(sizeClass);
+      const bucket = this.pool.get(sizeClass);
+      const have = bucket?.length ?? 0;
+      const deficit = needed - have;
+      if (deficit <= 0) continue;
+
+      for (let i = 0; i < deficit; i++) {
+        if (this.pooledBytes + this.pendingReleaseBytes + size > this.maxPoolBytes) break;
+        const buf = device.createBuffer({ size, usage: STORAGE_BUFFER_USAGE });
+        let b = this.pool.get(sizeClass);
+        if (!b) { b = []; this.pool.set(sizeClass, b); }
+        b.push(buf);
+        this.pooledBytes += size;
+      }
+    }
+    this.newAllocsByClass.clear();
   }
 
   /**
@@ -294,6 +501,10 @@ class SimpleBufferPool {
     this.pendingRelease.push({ buffer, sizeClass, size: actualSize });
     this.pendingReleaseBytes += actualSize;
     this.releaseToPool++;
+    // Note: recordRelease is called in flushPendingToPool() when the buffer
+    // actually promotes to the pool, NOT here. Buffers blocked by liveCount
+    // filtering never become pool-available, so recording here would cause
+    // the reservation formula to overestimate available releases.
 
     // Track deallocation immediately so user-facing stats reflect tensor usage
     // (not pool cache). The pool holds the buffer for reuse but from the
@@ -389,17 +600,27 @@ class SimpleBufferPool {
    * Always safe to call — these buffers are reusable after WebGPU submission ordering.
    */
   private flushPendingToPool(): void {
-    for (const { buffer, sizeClass, size } of this.pendingRelease) {
-      let pooledBuffers = this.pool.get(sizeClass);
-      if (!pooledBuffers) {
-        pooledBuffers = [];
-        this.pool.set(sizeClass, pooledBuffers);
+    // Move pending buffers to pool, but skip any that are still referenced
+    // by live owning tensors (refcount > 0). Those stay in pendingRelease
+    // until the owning tensor is destroyed.
+    const remaining: typeof this.pendingRelease = [];
+    let remainingBytes = 0;
+    for (const entry of this.pendingRelease) {
+      if (this.bufferLiveCount.has(entry.buffer)) {
+        remaining.push(entry);
+        remainingBytes += entry.size;
+        continue;
       }
-      pooledBuffers.push(buffer);
-      this.pooledBytes += size;
+      let bucket = this.pool.get(entry.sizeClass);
+      if (!bucket) { bucket = []; this.pool.set(entry.sizeClass, bucket); }
+      bucket.push(entry.buffer);
+      this.pooledBytes += entry.size;
+      // Record at promotion time (not release time) so the reservation formula
+      // only counts buffers that actually become pool-available.
+      this.recordRelease(entry.sizeClass);
     }
-    this.pendingRelease = [];
-    this.pendingReleaseBytes = 0;
+    this.pendingRelease = remaining;
+    this.pendingReleaseBytes = remainingBytes;
   }
 
   /**
@@ -436,6 +657,9 @@ class SimpleBufferPool {
    */
   markAsFromPool(buffer: GPUBuffer): void {
     this.pooledBufferSet.add(buffer);
+    if (!this.bufferPoolIdMap.has(buffer)) {
+      this.bufferPoolIdMap.set(buffer, this.nextBufferPoolId++);
+    }
   }
 
   /**
@@ -478,6 +702,7 @@ class SimpleBufferPool {
     this.pendingRelease = [];
     this.pendingReleaseBytes = 0;
     this.pendingDestroy = [];
+    this.bufferLiveCount.clear();
   }
 
   /**
@@ -538,6 +763,21 @@ class SimpleBufferPool {
   }
 
   /**
+   * Set the maximum byte budget for pooled + pending buffers.
+   * Pass Infinity (or null) for no limit (PyTorch-like behavior).
+   * When set, release() will destroy buffers rather than pooling them
+   * if the budget would be exceeded, and reserve() will stop pre-creating
+   * buffers at the budget boundary.
+   */
+  setMaxPoolBytes(bytes: number | null): void {
+    this.maxPoolBytes = bytes == null ? Infinity : bytes;
+  }
+
+  getMaxPoolBytes(): number {
+    return this.maxPoolBytes;
+  }
+
+  /**
    * Flush pending buffers to make them immediately available for reuse.
    *
    * This is safe to call when we know GPU work has completed (e.g., at the
@@ -588,15 +828,6 @@ class SimpleBufferPool {
   }
 
   /**
-   * Get number of buffers in the pendingRelease queue.
-   * Used by autoFlushSharedEncoder to trigger a flush when too many
-   * storage buffers are sitting idle in pending.
-   */
-  getPendingReleaseCount(): number {
-    return this.pendingRelease.length;
-  }
-
-  /**
    * Get total bytes held by the pool (free + pending release).
    * These bytes are in GPU memory but not tracked by the memory tracker
    * (trackDeallocation was called when buffers were released to pool).
@@ -632,6 +863,30 @@ export function clearBufferPool(): void {
 }
 
 /**
+ * Set the maximum byte budget for the buffer pool.
+ *
+ * Like PyTorch's CUDA caching allocator, the default is no limit —
+ * the pool grows to cache all released buffers, and memory pressure
+ * is handled by the eviction mechanism in createTrackedBuffer.
+ *
+ * Set an explicit limit to cap how much GPU memory the pool holds:
+ *   setBufferPoolBudget(2 * 1024 * 1024 * 1024)  // 2 GB
+ *   setBufferPoolBudget(null)                      // no limit (default)
+ *
+ * Can also be set via TORCHLETTE_POOL_BUDGET_MB environment variable.
+ */
+export function setBufferPoolBudget(bytes: number | null): void {
+  bufferPool.setMaxPoolBytes(bytes);
+}
+
+/**
+ * Get the current buffer pool budget in bytes (Infinity if no limit).
+ */
+export function getBufferPoolBudget(): number {
+  return bufferPool.getMaxPoolBytes();
+}
+
+/**
  * Flush pending buffers to make them immediately available for reuse.
  *
  * Call this when GPU work is known to be complete (e.g., at the start of
@@ -640,6 +895,8 @@ export function clearBufferPool(): void {
  */
 export function flushBufferPool(): void {
   bufferPool.flushPendingToAvailable();
+  bufferPool.sortPoolBuckets(); // deterministic acquire order for bind group cache
+  bufferPool.beginWindow();  // Advance window counter for demand tracking
 }
 
 /**
@@ -649,6 +906,15 @@ export function flushBufferPool(): void {
  */
 export async function flushBufferPoolWithSync(): Promise<void> {
   await bufferPool.flushAndDestroyPending();
+}
+
+/**
+ * Decrement the owning-tensor reference count for a GPUBuffer.
+ * Use this when transferring buffer ownership outside the normal
+ * createTensor/destroy lifecycle (e.g., external donation consumers).
+ */
+export function decRefBuffer(buffer: GPUBuffer): void {
+  bufferPool.decRef(buffer);
 }
 
 // ============================================================================
@@ -792,8 +1058,10 @@ export function donateBuffer(
     return null;
   }
 
-  // Transfer ownership - donor will not destroy the buffer
+  // Transfer ownership: decRef for this tensor, prevent closure from releasing
+  bufferPool.decRef(t.buffer);
   (t as any).ownsBuffer = false;
+  t.destroy = () => {}; // Prevent closure from firing (closure captures old ownsBuffer=true)
 
   return t.buffer as GPUBuffer;
 }
@@ -1276,6 +1544,14 @@ export async function initWebGPU(): Promise<boolean> {
   // Set queue on buffer pool for fence integration (§14)
   bufferPool.setQueue(device.queue);
 
+  // Apply pool budget from env var if set (e.g. TORCHLETTE_POOL_BUDGET_MB=2000)
+  if (typeof process !== "undefined" && process.env?.TORCHLETTE_POOL_BUDGET_MB) {
+    const mb = Number(process.env.TORCHLETTE_POOL_BUDGET_MB);
+    if (Number.isFinite(mb) && mb > 0) {
+      bufferPool.setMaxPoolBytes(mb * 1024 * 1024);
+    }
+  }
+
   // Initialize GPU timestamp profiling if supported
   if (isProfilingEnabled() && device.features.has("timestamp-query")) {
     initGpuTimestamps(device);
@@ -1328,6 +1604,7 @@ export function destroyWebGPU(): void {
     buf.destroy();
   }
   f16WeightCache.clear();
+  clearBindGroupCache();
   context.device.destroy();
   context.pipelines.clear();
   context = null;
@@ -1492,12 +1769,7 @@ const SHARED_ENCODER_MAX_PASSES = 2000;
 // Auto-flush when deferred uniform buffers exceed this threshold.
 // This returns params buffers to the pool so subsequent dispatches can reuse them
 // instead of calling device.createBuffer() for every uniform buffer.
-const PARAMS_FLUSH_THRESHOLD = 80;
-
-// Auto-flush when pending storage buffers exceed this threshold.
-// This ensures storage buffers are returned to the pool before the pool drains,
-// avoiding unnecessary device.createBuffer() calls.
-const STORAGE_FLUSH_THRESHOLD = 64;
+const PARAMS_FLUSH_THRESHOLD = 256;
 
 // Debug flag: set TORCHLETTE_DEBUG_SHARED_ENCODER=1 to enable verbose logging
 const DEBUG_SHARED_ENCODER = typeof process !== "undefined" && !!process.env?.TORCHLETTE_DEBUG_SHARED_ENCODER;
@@ -1506,6 +1778,11 @@ const DEBUG_SHARED_ENCODER = typeof process !== "undefined" && !!process.env?.TO
 let currentOpLabel: string | null = null;
 export function setCurrentOpLabel(label: string | null): void { currentOpLabel = label; }
 export function getCurrentOpLabel(): string | null { return currentOpLabel; }
+
+// Adam batch mode: when true, adamStep() skips its pre-dispatch flushSharedEncoder().
+// The caller (lazy.ts) is responsible for a single flush before the Adam batch.
+let adamBatchMode = false;
+export function setAdamBatchMode(active: boolean): void { adamBatchMode = active; }
 
 export function beginSharedEncoder(): void {
   if (!sharedEncoderEnabled) return;
@@ -1556,7 +1833,11 @@ export function flushSharedEncoder(): void {
 
   // Return deferred uniform buffers to pool so subsequent passes can reuse them.
   // This is critical for step-level scope where the encoder stays open across flushes.
-  for (const buf of sharedEncoderDeferredUniformBuffers) {
+  // Reverse iteration: buffers were deferred in forward order (A,B,C...), so pushing
+  // them in reverse (C,B,A) means the next LIFO pop() sequence returns A,B,C —
+  // matching the original acquisition order for bind group cache stability.
+  for (let i = sharedEncoderDeferredUniformBuffers.length - 1; i >= 0; i--) {
+    const buf = sharedEncoderDeferredUniformBuffers[i];
     const sc = paramsBufferSizeClass(buf.size);
     const pool = paramsBufferPools.get(sc);
     if (pool) {
@@ -1571,11 +1852,11 @@ export function flushSharedEncoder(): void {
   }
   sharedEncoderDeferredUniformBuffers = [];
 
-  // Flush pending storage buffers to the main pool. Since the encoder was just
-  // submitted, any buffers in pendingRelease are from earlier ops whose command
-  // buffers have been submitted — reusing them in the new encoder is safe because
-  // WebGPU guarantees submission-order execution.
-  bufferPool.flushPendingToAvailable();
+  // NOTE: Do NOT flush pendingRelease to pool here (§14.1). Mid-step buffer
+  // reclamation causes corruption — buffers released during a step (e.g.
+  // forward-pass intermediates) may still be in-flight on the GPU when
+  // reacquired by a subsequent op in the same step. Pending buffers are
+  // safely flushed at endSharedEncoder() (end-of-step).
 }
 
 export function endSharedEncoder(): void {
@@ -1615,8 +1896,10 @@ export function endSharedEncoder(): void {
 
     sharedEncoderPassCount = 0;
 
-    // Return deferred uniform buffers to pool now that all CBs are submitted
-    for (const buf of sharedEncoderDeferredUniformBuffers) {
+    // Return deferred uniform buffers to pool now that all CBs are submitted.
+    // Reverse iteration for LIFO stability (see flushSharedEncoder comment).
+    for (let i = sharedEncoderDeferredUniformBuffers.length - 1; i >= 0; i--) {
+      const buf = sharedEncoderDeferredUniformBuffers[i];
       const sc = paramsBufferSizeClass(buf.size);
       const pool = paramsBufferPools.get(sc);
       if (pool) {
@@ -1631,8 +1914,10 @@ export function endSharedEncoder(): void {
     }
     sharedEncoderDeferredUniformBuffers = [];
 
-    // Flush pending storage buffers to the main pool now that all CBs are submitted.
+    // Flush storage buffer pendingRelease → main pool. The encoder was just
+    // submitted, so buffers released by earlier passes are safe to reuse.
     bufferPool.flushPendingToAvailable();
+    bufferPool.beginWindow();  // End-of-step is also a window boundary
   }
 }
 
@@ -1641,10 +1926,28 @@ export function endSharedEncoder(): void {
  * Keeps the GPU command encoder open across force() boundaries,
  * only flushing at hard sync points (item() readback) and endStep().
  */
-export function beginStep(): void {
+export async function beginStep(): Promise<void> {
   if (stepLevelScope) return; // already in step scope
   stepLevelScope = true;
+  // Await any deferred fence from the previous markStep BEFORE opening the
+  // shared encoder.  This flushes pendingRelease buffers into the main pool
+  // so the upcoming training step can reuse them, eliminating the 2-step lag
+  // that previously caused hundreds of unnecessary createBuffer() calls.
+  await awaitDeferredFence();
+  // End the previous step's window tracking (if any) and compute reservation.
+  // This must happen AFTER awaitDeferredFence (which may trigger pool operations)
+  // and BEFORE reserve() (which uses the computed reservation).
+  // We end tracking here (not in endStep) so that post-step cleanup acquires
+  // (from markStep/GC) are captured in the recording.
+  bufferPool.endWindowTracking();
+  // Reserve buffers based on window-demand recording from previous step.
+  // Falls back to prewarm() on the first step (no recording yet).
+  // Must happen BEFORE opening the shared encoder (no writeSet conflicts).
+  bufferPool.reserve(requireContext().device);
+  bufferPool.sortPoolBuckets(); // deterministic acquire order for bind group cache
+  bufferPool.beginWindowTracking();  // Start recording this step's demand
   beginSharedEncoder(); // open the shared encoder for the whole step
+  resetDispatchSequence(); // reset bind group cache sequence counter for this step
 }
 
 /**
@@ -1655,6 +1958,9 @@ export function endStep(): void {
   if (!stepLevelScope) return;
   stepLevelScope = false;
   endSharedEncoder(); // depth goes to 0 and actually submits
+  // Note: endWindowTracking() is called at the start of the NEXT beginStep(),
+  // not here. This ensures post-step cleanup acquires (from markStep/GC)
+  // are captured in the window-demand recording.
 }
 
 export function isSharedEncoderActive(): boolean {
@@ -1681,8 +1987,7 @@ export function getSharedEncoderInstance(): GPUCommandEncoder | null {
 function autoFlushSharedEncoder(): void {
   if (sharedEncoder && (
     sharedEncoderPassCount >= SHARED_ENCODER_MAX_PASSES ||
-    sharedEncoderDeferredUniformBuffers.length >= PARAMS_FLUSH_THRESHOLD ||
-    bufferPool.getPendingReleaseCount() >= STORAGE_FLUSH_THRESHOLD
+    sharedEncoderDeferredUniformBuffers.length >= PARAMS_FLUSH_THRESHOLD
   )) {
     flushSharedEncoder();
   }
@@ -1978,6 +2283,11 @@ function createTensor(
   const isPoolCompatible =
     bufferUsage === STORAGE_BUFFER_USAGE && bufferSize === expectedPoolSize;
 
+  // Track owning reference for buffer liveness (refcount)
+  if (ownsBuffer) {
+    bufferPool.incRef(buffer);
+  }
+
   return {
     shape: shape.slice(),
     size: sizeOf(shape),
@@ -1993,6 +2303,8 @@ function createTensor(
       destroyed = true;
       // Only release/destroy if we own the buffer (not a view)
       if (ownsBuffer) {
+        // Release our owning reference before pool/destroy
+        bufferPool.decRef(buffer);
         // Don't track deallocation here - buffer isn't actually destroyed yet.
         // It goes to either pendingRelease (for pool reuse) or pendingDestroy
         // (for deferred destruction after GPU fence). Deallocation is tracked
@@ -2087,6 +2399,7 @@ function dtypeToWgsl(dtype: DType): string {
 function createTrackedBuffer(
   device: GPUDevice,
   descriptor: { size: number; usage: number; mappedAtCreation?: boolean },
+  preferredBuffer?: GPUBuffer,
 ): GPUBuffer {
   const alignedSize = alignBufferSize(descriptor.size);
 
@@ -2094,31 +2407,14 @@ function createTrackedBuffer(
   // Pool only contains buffers with STORAGE | COPY_SRC | COPY_DST usage
   const isStorageBuffer = descriptor.usage === STORAGE_BUFFER_USAGE;
   if (isStorageBuffer && !descriptor.mappedAtCreation) {
-    let pooled = bufferPool.acquire(alignedSize);
-    if (!pooled && sharedEncoder && bufferPool.getPendingReleaseCount() > 0) {
-      // Pool miss while pending buffers are idle — flush the shared encoder
-      // to move pending buffers to the main pool, then retry.
-      autoFlushSharedEncoder();
-      // Force flush if auto-flush didn't trigger (threshold not met)
-      if (bufferPool.getPendingReleaseCount() > 0) {
-        flushSharedEncoder();
-      }
-      pooled = bufferPool.acquire(alignedSize);
+    // Try preferred buffer first (for bind group cache stability)
+    if (preferredBuffer) {
+      const pooled = bufferPool.acquirePreferred(alignedSize, preferredBuffer);
+      if (pooled) return pooled;
     }
+    const pooled = bufferPool.acquire(alignedSize);
     if (pooled) {
-      // Safety: if this buffer was already written in the current shared encoder
-      // scope, we can't reuse it — a later pass writing to it would corrupt
-      // the data that an earlier pass wrote.
-      if (sharedEncoder && sharedEncoderWriteSet.has(pooled)) {
-        // Put it back and allocate fresh
-        bufferPool.release(pooled, alignedSize, descriptor.usage);
-      } else {
-        // Reusing a pooled buffer - no tracking change needed.
-        // The buffer is still tracked from its original allocation.
-        // We don't call trackDeallocation when buffers go to pool,
-        // so we don't need to call trackAllocation when reusing.
-        return pooled;
-      }
+      return pooled;
     }
   }
 
@@ -2197,6 +2493,12 @@ function createTrackedBuffer(
  * The buffer pool may return an input buffer when sizes share a size class.
  * WebGPU forbids the same buffer as both read and read_write in one pass.
  */
+// Sequence-indexed output buffer hints: record which GPUBuffer was used at each
+// resolveOutputBuffer position. On the next step, try to acquire the same buffer
+// from the pool for bind group cache stability.
+let outputSeqIndex = 0;
+const outputSequenceHints: Array<GPUBuffer | null> = [];
+
 function resolveOutputBuffer(
   device: GPUDevice,
   sizeBytes: number,
@@ -2204,36 +2506,34 @@ function resolveOutputBuffer(
   providedOutBuffer?: GPUBuffer,
 ): GPUBuffer {
   const alignedSize = alignBufferSize(sizeBytes);
+  // Use pool-rounded size for replacement allocations so they match the size
+  // class exactly. Without this, undersized buffers enter the pool and can
+  // later be acquired by tensors needing the full size class, causing overflow.
+  const pooledSize = getSizeForClass(getSizeClass(alignedSize));
   const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
-  let outBuffer = providedOutBuffer ?? createTrackedBuffer(device, { size: alignedSize, usage });
+  const outIdx = outputSeqIndex++;
+  const preferredBuf = providedOutBuffer ? undefined : (outputSequenceHints[outIdx] ?? undefined);
+  let outBuffer = providedOutBuffer ?? createTrackedBuffer(device, { size: alignedSize, usage }, preferredBuf);
 
   if (!providedOutBuffer && inputBuffers.some(b => b === outBuffer)) {
     const released = bufferPool.release(outBuffer, alignedSize, usage);
     if (!released) {
       bufferPool.deferredDestroy(outBuffer, alignedSize);
     }
-    outBuffer = device.createBuffer({ size: alignedSize, usage });
-    gpuMemoryTracker.trackAllocation(outBuffer, alignedSize);
-    bufferPool.trackAllocation(outBuffer, alignedSize);
+    outBuffer = device.createBuffer({ size: pooledSize, usage });
+    gpuMemoryTracker.trackAllocation(outBuffer, pooledSize);
+    bufferPool.trackAllocation(outBuffer, pooledSize);
     bufferPool.markAsFromPool(outBuffer);
-  }
-
-  // Safety: output must not alias any buffer written earlier in this shared encoder scope.
-  // The pool may return a buffer that was already written by an earlier pass in the same
-  // encoder — a later pass overwriting it would corrupt the earlier pass's output.
-  if (!providedOutBuffer && sharedEncoder && isInSharedEncoderWriteSet(outBuffer)) {
-    const released = bufferPool.release(outBuffer, alignedSize, usage);
-    if (!released) {
-      bufferPool.deferredDestroy(outBuffer, alignedSize);
-    }
-    outBuffer = device.createBuffer({ size: alignedSize, usage });
-    gpuMemoryTracker.trackAllocation(outBuffer, alignedSize);
-    bufferPool.trackAllocation(outBuffer, alignedSize);
-    bufferPool.markAsFromPool(outBuffer);
+    bufferPool.trackNewAllocation(pooledSize);
   }
 
   // Track this buffer as written in the current shared encoder scope
   trackSharedEncoderWrite(outBuffer);
+
+  // Record for next step's preferred-buffer hint
+  if (!providedOutBuffer) {
+    outputSequenceHints[outIdx] = outBuffer;
+  }
 
   return outBuffer;
 }
@@ -2295,7 +2595,7 @@ function createBufferWithData(
 // General-purpose params buffer pool — pools uniform buffers by size class (4, 8, 16, 32, 48, 64).
 // Replaces the old 4-byte-only uniformBufferPool with support for arbitrary param sizes.
 const paramsBufferPools: Map<number, GPUBuffer[]> = new Map();
-const MAX_PARAMS_POOL_SIZE_PER_CLASS = 128;
+const MAX_PARAMS_POOL_SIZE_PER_CLASS = 256;
 
 function paramsBufferSizeClass(byteLength: number): number {
   if (byteLength <= 4) return 4;
@@ -2306,14 +2606,32 @@ function paramsBufferSizeClass(byteLength: number): number {
   return 64;
 }
 
+// Sequence-indexed params buffer cache: reuse the same GPUBuffer at each dispatch
+// position across steps. This enables bind group cache hits since the params buffer
+// pointer stays stable for a given dispatch position.
+let paramsSeqIndex = 0;
+const paramsSequenceBuffers: Array<{ buffer: GPUBuffer; sizeClass: number } | null> = [];
+
 export function createParamsBuffer(device: GPUDevice, data: Uint32Array): GPUBuffer {
   const sizeClass = paramsBufferSizeClass(data.byteLength);
+  const idx = paramsSeqIndex++;
 
+  // Try to reuse the buffer from the same dispatch position (previous step).
+  // This keeps the GPUBuffer pointer stable so bind group caching can hit.
   if (!activeBatch) {
+    const cached = paramsSequenceBuffers[idx];
+    if (cached !== undefined && cached !== null && cached.sizeClass === sizeClass) {
+      profileApiCall("writeBuffer", () => device.queue.writeBuffer(cached.buffer, 0, data));
+      return cached.buffer;
+    }
+
+    // Fallback: try pool
     const pool = paramsBufferPools.get(sizeClass);
     if (pool && pool.length > 0) {
       const buffer = pool.pop()!;
       profileApiCall("writeBuffer", () => device.queue.writeBuffer(buffer, 0, data));
+      paramsSequenceBuffers[idx] = { buffer, sizeClass };
+      paramsSequenceSet.add(buffer);
       return buffer;
     }
   }
@@ -2323,10 +2641,20 @@ export function createParamsBuffer(device: GPUDevice, data: Uint32Array): GPUBuf
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   }));
   profileApiCall("writeBuffer", () => device.queue.writeBuffer(buffer, 0, data));
+  if (!activeBatch) {
+    paramsSequenceBuffers[idx] = { buffer, sizeClass };
+    paramsSequenceSet.add(buffer);
+  }
   return buffer;
 }
 
+// Track which buffers are pinned to sequence positions (not returnable to pool)
+const paramsSequenceSet = new Set<GPUBuffer>();
+
 export function releaseParamsBuffer(buffer: GPUBuffer): void {
+  // Sequence-cached params buffers are reused across steps — don't return to pool
+  if (paramsSequenceSet.has(buffer)) return;
+
   if (activeBatch) {
     activeBatch.deferredDestroyBuffers.push(buffer);
     return;
@@ -2366,6 +2694,93 @@ function profiledCreateBindGroup(device: GPUDevice, descriptor: any): GPUBindGro
   return profileApiCall("createBindGroup", () => device.createBindGroup(descriptor));
 }
 
+// --- Sequence-Indexed Bind Group Cache ---
+// Plans execute the same ops in the same order each step. Dispatch #i in step N
+// corresponds to dispatch #i in step N+1. Rather than building string keys from
+// unstable buffer IDs, index the cache by dispatch sequence position and validate
+// by GPUBuffer/pipeline pointer equality.
+let dispatchIndex = 0;
+const sequenceEntries: Array<{
+  bindGroup: GPUBindGroup;
+  pipeline: GPUComputePipeline;
+  buffers: GPUBuffer[];
+} | null> = [];
+let seqCacheHits = 0;
+let seqCacheMisses = 0;
+
+/**
+ * Create or retrieve a cached bind group for simple (no offset/size) buffer bindings.
+ * Entries are built internally: binding i → { buffer: buffers[i] }.
+ *
+ * Uses sequence-indexed caching: each dispatch position in a step maps to the same
+ * position in the next step. Validation is by pointer equality on pipeline + buffers.
+ */
+export function cachedCreateBindGroup(
+  device: GPUDevice,
+  pipeline: GPUComputePipeline,
+  buffers: GPUBuffer[],
+): GPUBindGroup {
+  const idx = dispatchIndex++;
+  const entry = sequenceEntries[idx];
+
+  if (entry !== undefined && entry !== null
+      && entry.pipeline === pipeline
+      && entry.buffers.length === buffers.length) {
+    let match = true;
+    for (let i = 0; i < buffers.length; i++) {
+      if (entry.buffers[i] !== buffers[i]) { match = false; break; }
+    }
+    if (match) {
+      seqCacheHits++;
+      return entry.bindGroup;
+    }
+  }
+
+  seqCacheMisses++;
+  const entries: Array<{ binding: number; resource: { buffer: GPUBuffer } }> = [];
+  for (let i = 0; i < buffers.length; i++) {
+    entries.push({ binding: i, resource: { buffer: buffers[i] } });
+  }
+  const bindGroup = profileApiCall("createBindGroup", () =>
+    device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries,
+    })
+  );
+
+  sequenceEntries[idx] = { bindGroup, pipeline, buffers: buffers.slice() };
+  return bindGroup;
+}
+
+/** Reset the dispatch sequence counter to 0. Call at the start of each step. */
+export function resetDispatchSequence(): void {
+  dispatchIndex = 0;
+  paramsSeqIndex = 0;
+  outputSeqIndex = 0;
+}
+
+export function clearBindGroupCache(): void {
+  sequenceEntries.length = 0;
+  dispatchIndex = 0;
+  seqCacheHits = 0;
+  seqCacheMisses = 0;
+  paramsSequenceBuffers.length = 0;
+  paramsSequenceSet.clear();
+  paramsSeqIndex = 0;
+  outputSequenceHints.length = 0;
+  outputSeqIndex = 0;
+}
+
+export function getBindGroupCacheStats(): { hits: number; misses: number; size: number; hitRate: number } {
+  const total = seqCacheHits + seqCacheMisses;
+  return { hits: seqCacheHits, misses: seqCacheMisses, size: sequenceEntries.length, hitRate: total > 0 ? seqCacheHits / total : 0 };
+}
+
+export function resetBindGroupCacheStats(): void {
+  seqCacheHits = 0;
+  seqCacheMisses = 0;
+}
+
 /**
  * Unified dispatch helper for elementwise compute shaders.
  * Collapses the common 6-step boilerplate (pipeline, output, params, bindgroup, dispatch, release)
@@ -2390,18 +2805,13 @@ function dispatchElementwise(desc: {
 
   const paramsBuffer = createParamsBuffer(ctx.device, desc.params);
 
-  const numInputs = desc.inputs.length;
-  const entries: Array<{ binding: number; resource: { buffer: GPUBuffer } }> = [];
-  for (let i = 0; i < numInputs; i++) {
-    entries.push({ binding: i, resource: { buffer: desc.inputs[i] } });
+  const bgBuffers: GPUBuffer[] = [];
+  for (let i = 0; i < desc.inputs.length; i++) {
+    bgBuffers.push(desc.inputs[i]);
   }
-  entries.push({ binding: numInputs, resource: { buffer: outBuffer } });
-  entries.push({ binding: numInputs + 1, resource: { buffer: paramsBuffer } });
-
-  const bindGroup = profiledCreateBindGroup(ctx.device, {
-    layout: pipeline.getBindGroupLayout(0),
-    entries,
-  });
+  bgBuffers.push(outBuffer);
+  bgBuffers.push(paramsBuffer);
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, bgBuffers);
 
   dispatchComputePass(pipeline, bindGroup, desc.dispatchX, desc.dispatchY ?? 1);
 
@@ -3244,9 +3654,11 @@ function dispatchMatmul(
 
   // Destroy contiguous copies if they were created (deferred for GPU fence)
   if (aWasCopied) {
+    bufferPool.decRef(effectiveA.buffer);
     bufferPool.deferredDestroy(effectiveA.buffer, effectiveA.size * (a.dtype === "f16" ? 2 : 4));
   }
   if (bWasCopied) {
+    bufferPool.decRef(effectiveB.buffer);
     bufferPool.deferredDestroy(effectiveB.buffer, effectiveB.size * (b.dtype === "f16" ? 2 : 4));
   }
 
@@ -3385,9 +3797,11 @@ export function dispatchMatmulWithEpilogue(
 
   // Destroy contiguous copies if they were created (deferred for GPU fence)
   if (aWasCopied) {
+    bufferPool.decRef(effectiveA.buffer);
     bufferPool.deferredDestroy(effectiveA.buffer, effectiveA.size * (a.dtype === "f16" ? 2 : 4));
   }
   if (bWasCopied) {
+    bufferPool.decRef(effectiveB.buffer);
     bufferPool.deferredDestroy(effectiveB.buffer, effectiveB.size * (b.dtype === "f16" ? 2 : 4));
   }
 
@@ -3442,23 +3856,10 @@ export function runFusedElementwise(
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
   const params = createUniformBuffer(ctx.device, size);
-  const entries = inputTensors.map((tensor, index) => ({
-    binding: index,
-    resource: { buffer: tensor.buffer },
-  }));
-  entries.push({
-    binding: inputTensors.length,
-    resource: { buffer: outBuffer },
-  });
-  entries.push({
-    binding: inputTensors.length + 1,
-    resource: { buffer: params },
-  });
-
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries,
-  });
+  const bgBuffers: GPUBuffer[] = inputTensors.map(t => t.buffer);
+  bgBuffers.push(outBuffer);
+  bgBuffers.push(params);
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, bgBuffers);
   dispatchComputePass(pipeline, bindGroup, Math.ceil(size / WORKGROUP_SIZE));
   releaseUniformBuffer(params);
   return createTensor(outShape, outBuffer);
@@ -3574,13 +3975,7 @@ function full(shape: number[], fillValue: number): WebGPUTensor {
   new Float32Array(paramsData.buffer, 4, 1)[0] = fillValue;
   const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
 
-  const bindGroup = profiledCreateBindGroup(ctx.device, {
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: outBuffer } },
-      { binding: 1, resource: { buffer: paramsBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [outBuffer, paramsBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
   releaseParamsBuffer(paramsBuffer);
@@ -3648,13 +4043,7 @@ function arange(end: number, start = 0, step = 1): WebGPUTensor {
   new Float32Array(paramsData.buffer, 8, 1)[0] = step;
   const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
 
-  const bindGroup = profiledCreateBindGroup(ctx.device, {
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: outBuffer } },
-      { binding: 1, resource: { buffer: paramsBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [outBuffer, paramsBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
   releaseParamsBuffer(paramsBuffer);
@@ -3743,20 +4132,14 @@ function triangularOp(a: WebGPUTensor, k: number, upper: boolean): WebGPUTensor 
   paramsData[3] = k;
   const paramsBuffer = createParamsBuffer(ctx.device, new Uint32Array(paramsData.buffer));
 
-  const bindGroup = profiledCreateBindGroup(ctx.device, {
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: input.buffer } },
-      { binding: 1, resource: { buffer: outBuffer } },
-      { binding: 2, resource: { buffer: paramsBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [input.buffer, outBuffer, paramsBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
   releaseParamsBuffer(paramsBuffer);
 
   // Destroy contiguous copy if one was created (deferred for GPU fence)
   if (input !== a) {
+    bufferPool.decRef((input as WebGPUTensor).buffer);
     bufferPool.deferredDestroy((input as WebGPUTensor).buffer, numElements * dtypeBytes(a.dtype));
   }
 
@@ -4169,14 +4552,7 @@ function cast(a: BackendTensor, dtype: DType): BackendTensor {
     [tensor.buffer],
   );
   const params = createUniformBuffer(ctx.device, tensor.size);
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: tensor.buffer } },
-      { binding: 1, resource: { buffer: outBuffer } },
-      { binding: 2, resource: { buffer: params } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, params]);
   dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
   releaseUniformBuffer(params);
   return createTensor(tensor.shape, outBuffer, undefined, 0, dtype);
@@ -4396,6 +4772,7 @@ function reshape(a: BackendTensor, shape: number[]): BackendTensor {
 
   // Incompatible: must materialize first, transfer buffer ownership to result
   const contig = contiguous(tensor) as WebGPUTensor;
+  bufferPool.decRef(contig.buffer); // Transfer ownership to result tensor
   return createTensor(shape, contig.buffer, undefined,
     contig.offset, tensor.dtype, true);
 }
@@ -4914,6 +5291,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   });
 
   if (gradTensor !== (grad as WebGPUTensor)) {
+    bufferPool.decRef(gradTensor.buffer);
     bufferPool.deferredDestroy(gradTensor.buffer, gradTensor.size * bytesPerElement);
   }
 
@@ -5119,14 +5497,7 @@ function sliceColumns(
     const dispatch = compute2DDispatch(Math.ceil(outSize / WORKGROUP_SIZE));
     const paramsBuffer = createParamsBuffer(ctx.device, new Uint32Array([K, N, colStart, sliceWidth, 0, dispatch.gridSizeX * WORKGROUP_SIZE]));
 
-    const bindGroup = profiledCreateBindGroup(ctx.device,{
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: input.buffer } },
-        { binding: 1, resource: { buffer: outBuffer } },
-        { binding: 2, resource: { buffer: paramsBuffer } },
-      ],
-    });
+    const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [input.buffer, outBuffer, paramsBuffer]);
 
     dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
 
@@ -5260,14 +5631,7 @@ function scatterColumnsToOutput(
     const dispatch = compute2DDispatch(Math.ceil(totalSize / WORKGROUP_SIZE));
     const paramsBuffer = createParamsBuffer(ctx.device, new Uint32Array([totalRows, N, colStart, sliceWidth, 0, 0, dispatch.gridSizeX * WORKGROUP_SIZE]));
 
-    const bindGroup = profiledCreateBindGroup(ctx.device,{
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: partial.buffer } },
-        { binding: 1, resource: { buffer: outBuffer } },
-        { binding: 2, resource: { buffer: paramsBuffer } },
-      ],
-    });
+    const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [partial.buffer, outBuffer, paramsBuffer]);
 
     dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
 
@@ -5784,14 +6148,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   const paramsBuffer = createParamsBuffer(ctx.device, new Uint32Array([batch, K, N, colStart, chunkWidth]));
 
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: b.buffer } },
-      { binding: 1, resource: { buffer: outBuffer } },
-      { binding: 2, resource: { buffer: paramsBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [b.buffer, outBuffer, paramsBuffer]);
 
   const workgroups = Math.ceil(outSize / WORKGROUP_SIZE);
   dispatchComputePass(pipeline, bindGroup, workgroups, 1);
@@ -5942,15 +6299,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   );
   const uniformBuffer = createUniformBuffer(ctx.device, outSize);
 
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: tensorA.buffer } },
-      { binding: 1, resource: { buffer: tensorIndex.buffer } },
-      { binding: 2, resource: { buffer: outBuffer } },
-      { binding: 3, resource: { buffer: uniformBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensorA.buffer, tensorIndex.buffer, outBuffer, uniformBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
   releaseUniformBuffer(uniformBuffer);
@@ -6305,15 +6654,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   );
   const uniformBuffer = createUniformBuffer(ctx.device, srcSize);
 
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: tensorIndex.buffer } },
-      { binding: 1, resource: { buffer: tensorSrc.buffer } },
-      { binding: 2, resource: { buffer: outBuffer } },
-      { binding: 3, resource: { buffer: uniformBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensorIndex.buffer, tensorSrc.buffer, outBuffer, uniformBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
   releaseUniformBuffer(uniformBuffer);
@@ -6582,10 +6923,7 @@ function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
   }
 
   const outSize = outShape.reduce((acc, d) => acc * d, 1);
-  const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-  });
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
 
   // Compute strides
   const inputStrides: number[] = [];
@@ -6760,14 +7098,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   const paramsBuffer = createParamsBuffer(ctx.device, new Uint32Array([outSize, reductionSize]));
 
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: tensor.buffer } },
-      { binding: 1, resource: { buffer: outBuffer } },
-      { binding: 2, resource: { buffer: paramsBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, paramsBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, Math.ceil(outSize / WORKGROUP_SIZE));
 
@@ -6964,17 +7295,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   const pipeline = getPipeline(ctx, cacheKey, code);
   const paramsBuffer = createParamsBuffer(ctx.device, new Uint32Array([outSize, reductionSize]));
 
-  const entries: Array<{ binding: number; resource: { buffer: GPUBuffer } }> = [];
+  const bgBuffers: GPUBuffer[] = [];
   for (let i = 0; i < arity; i++) {
-    entries.push({ binding: i, resource: { buffer: (inputs[i] as WebGPUTensor).buffer } });
+    bgBuffers.push((inputs[i] as WebGPUTensor).buffer);
   }
-  entries.push({ binding: arity, resource: { buffer: outBuffer } });
-  entries.push({ binding: arity + 1, resource: { buffer: paramsBuffer } });
-
-  const bindGroup = profiledCreateBindGroup(ctx.device, {
-    layout: pipeline.getBindGroupLayout(0),
-    entries,
-  });
+  bgBuffers.push(outBuffer);
+  bgBuffers.push(paramsBuffer);
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, bgBuffers);
 
   dispatchComputePass(pipeline, bindGroup, Math.ceil(outSize / WORKGROUP_SIZE));
   releaseParamsBuffer(paramsBuffer);
@@ -7032,17 +7359,13 @@ fn main() {
   const pipeline = getPipeline(ctx, cacheKey, code);
   const uniformBuffer = createUniformBuffer(ctx.device, inputSize);
 
-  const entries: Array<{ binding: number; resource: { buffer: GPUBuffer } }> = [];
+  const bgBuffers: GPUBuffer[] = [];
   for (let i = 0; i < arity; i++) {
-    entries.push({ binding: i, resource: { buffer: (inputs[i] as WebGPUTensor).buffer } });
+    bgBuffers.push((inputs[i] as WebGPUTensor).buffer);
   }
-  entries.push({ binding: arity, resource: { buffer: outBuffer } });
-  entries.push({ binding: arity + 1, resource: { buffer: uniformBuffer } });
-
-  const bindGroup = profiledCreateBindGroup(ctx.device, {
-    layout: pipeline.getBindGroupLayout(0),
-    entries,
-  });
+  bgBuffers.push(outBuffer);
+  bgBuffers.push(uniformBuffer);
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, bgBuffers);
 
   dispatchComputePass(pipeline, bindGroup, 1);
   releaseUniformBuffer(uniformBuffer);
@@ -7114,14 +7437,7 @@ fn main(
   const pipeline = getPipeline(ctx, `sumFull:${inputSize}`, code);
   const uniformBuffer = createUniformBuffer(ctx.device, inputSize);
 
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: tensor.buffer } },
-      { binding: 1, resource: { buffer: intermediateBuffer } },
-      { binding: 2, resource: { buffer: uniformBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, intermediateBuffer, uniformBuffer]);
 
   // Flush shared encoder before sync readback — we need to submit all
   // prior work and then do a standalone encoder for the readback.
@@ -7189,10 +7505,7 @@ function sumFullReduction(
   }
 
   // Create output buffer with single element
-  const outBuffer = createTrackedBuffer(ctx.device, {
-    size: 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-  });
+  const outBuffer = resolveOutputBuffer(ctx.device, 4, [tensor.buffer]);
 
   // Use a simple sequential sum shader
   const code = `
@@ -7217,14 +7530,7 @@ fn main() {
   const pipeline = getPipeline(ctx, `sumFullSeq:${inputSize}`, code);
   const uniformBuffer = createUniformBuffer(ctx.device, inputSize);
 
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: tensor.buffer } },
-      { binding: 1, resource: { buffer: outBuffer } },
-      { binding: 2, resource: { buffer: uniformBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, uniformBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, 1);
   releaseUniformBuffer(uniformBuffer);
@@ -7337,14 +7643,7 @@ fn main() {
   const finalPipeline = getPipeline(ctx, `sumFullSeq:${numChunks}`, finalCode);
   const finalParams = createUniformBuffer(ctx.device, numChunks);
 
-  const finalBindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: finalPipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: partialsBuffer } },
-      { binding: 1, resource: { buffer: outBuffer } },
-      { binding: 2, resource: { buffer: finalParams } },
-    ],
-  });
+  const finalBindGroup = cachedCreateBindGroup(ctx.device, finalPipeline, [partialsBuffer, outBuffer, finalParams]);
 
   dispatchComputePass(finalPipeline, finalBindGroup, 1);
   releaseUniformBuffer(finalParams);
@@ -7393,14 +7692,7 @@ fn main() {
   const pipeline = getPipeline(ctx, `maxFullSeq:${inputSize}`, code);
   const uniformBuffer = createUniformBuffer(ctx.device, inputSize);
 
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: tensor.buffer } },
-      { binding: 1, resource: { buffer: outBuffer } },
-      { binding: 2, resource: { buffer: uniformBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, uniformBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, 1);
   releaseUniformBuffer(uniformBuffer);
@@ -7621,14 +7913,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   const paramsBuffer = createParamsBuffer(ctx.device, new Uint32Array([outSize, reductionSize]));
 
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: tensor.buffer } },
-      { binding: 1, resource: { buffer: outBuffer } },
-      { binding: 2, resource: { buffer: paramsBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, paramsBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, Math.ceil(outSize / WORKGROUP_SIZE));
 
@@ -7672,10 +7957,7 @@ function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
   const ctx = requireContext();
   const outSize = sumTensor.size;
 
-  const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-  });
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [sumTensor.buffer]);
 
   const code = `
 struct Params {
@@ -7705,14 +7987,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   new Float32Array(meanParamsData, 4, 1)[0] = count;
   const paramsBuffer = createParamsBuffer(ctx.device, new Uint32Array(meanParamsData));
 
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: sumTensor.buffer } },
-      { binding: 1, resource: { buffer: outBuffer } },
-      { binding: 2, resource: { buffer: paramsBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [sumTensor.buffer, outBuffer, paramsBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, Math.ceil(outSize / WORKGROUP_SIZE));
 
@@ -8026,14 +8301,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   const paramsBuffer = createParamsBuffer(ctx.device, new Uint32Array([outSize, dimSize, dimStride]));
 
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: tensor.buffer } },
-      { binding: 1, resource: { buffer: outBuffer } },
-      { binding: 2, resource: { buffer: paramsBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, paramsBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, Math.ceil(outSize / WORKGROUP_SIZE));
 
@@ -8530,21 +8798,14 @@ function stridedScatterCopyDirect(
 
   const paramsBuffer = createParamsBuffer(ctx.device, new Uint32Array([baseSize, viewSize]));
 
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: contiguousBase.buffer } },
-      { binding: 1, resource: { buffer: srcTensor.buffer } },
-      { binding: 2, resource: { buffer: outBuffer } },
-      { binding: 3, resource: { buffer: paramsBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [contiguousBase.buffer, srcTensor.buffer, outBuffer, paramsBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
 
   releaseParamsBuffer(paramsBuffer);
 
   if (contiguousBase !== baseTensor) {
+    bufferPool.decRef(contiguousBase.buffer);
     bufferPool.deferredDestroy(contiguousBase.buffer, contiguousBase.size * 4);
   }
 
@@ -8873,21 +9134,14 @@ function stridedScatterAddDirect(
 
   const paramsBuffer = createParamsBuffer(ctx.device, new Uint32Array([baseSize, viewSize]));
 
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: contiguousBase.buffer } },
-      { binding: 1, resource: { buffer: srcTensor.buffer } },
-      { binding: 2, resource: { buffer: outBuffer } },
-      { binding: 3, resource: { buffer: paramsBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [contiguousBase.buffer, srcTensor.buffer, outBuffer, paramsBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
 
   releaseParamsBuffer(paramsBuffer);
 
   if (contiguousBase !== baseTensor) {
+    bufferPool.decRef(contiguousBase.buffer);
     bufferPool.deferredDestroy(contiguousBase.buffer, contiguousBase.size * 4);
   }
 
@@ -9026,13 +9280,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Fused Adam/AdamW Step
 // ============================================================================
 
-function adamStep(
+async function adamStep(
   grad: BackendTensor,
   param: BackendTensor,
   m: BackendTensor,
   v: BackendTensor,
   config: import("../types").AdamStepConfig,
-): { param: BackendTensor; m: BackendTensor; v: BackendTensor } {
+): Promise<{ param: BackendTensor; m: BackendTensor; v: BackendTensor }> {
   // Suppress memory limit checks for the entire adam step.
   // During optimizer steps, old param/m/v buffers haven't been released yet
   // while new output buffers are allocated — temporary 2x peak is expected.
@@ -9063,7 +9317,16 @@ function adamStep(
     // inputs in compute passes. The Adam kernel binds them as read_write,
     // which conflicts within the same command encoder synchronization scope.
     // Flushing ensures prior passes are submitted before the in-place writes.
-    flushSharedEncoder();
+    // In Adam batch mode, the caller already flushed once for the entire batch.
+    if (!adamBatchMode) {
+      flushSharedEncoder();
+    }
+
+    // Re-protect adam's input buffers in the write set.
+    trackSharedEncoderWrite(paramT.buffer);
+    trackSharedEncoderWrite(mT.buffer);
+    trackSharedEncoderWrite(vT.buffer);
+    trackSharedEncoderWrite(gradT.buffer);
 
     // WebGPU forbids binding the same buffer as read_write at multiple
     // binding points. De-alias input buffers if pool recycling caused
@@ -9097,6 +9360,7 @@ function adamStep(
     if (vBuf === gradBuf) {
       vBuf = copyToFresh(vBuf);
     }
+
     // If any copies were made, flush again so the copy commands are submitted
     // before the Adam kernel binds the original buffers as read_write.
     if (paramBuf !== paramT.buffer || mBuf !== mT.buffer || vBuf !== vT.buffer) {
@@ -9118,15 +9382,17 @@ function adamStep(
       infFlagBuf,
     );
 
-    // Flush the shared encoder after the adam dispatch. The adam kernel's compute
-    // pass is encoded on the shared encoder but NOT submitted yet. Without this
-    // flush, buffers referenced by the adam dispatch (grad, config, etc.) may be
-    // destroyed by endBatchExecution() before the encoder is submitted, causing
-    // "buffer used in submit while destroyed" errors.
-    flushSharedEncoder();
+    // Post-dispatch flush only needed outside shared encoder mode.
+    // In shared encoder mode, all buffer releases are deferred (deferredDestroy for grad,
+    // sharedEncoderDeferredUniformBuffers for config, noop'd destroy for param/m/v).
+    // No buffer destruction occurs during plan execution.
+    if (!isSharedEncoderActive()) {
+      flushSharedEncoder();
+    }
 
     // Destroy contiguous copy for grad only (read-only input, safe to free).
     if (gradT !== (grad as WebGPUTensor)) {
+      bufferPool.decRef(gradT.buffer);
       bufferPool.deferredDestroy(gradT.buffer, gradT.size * bpe(gradT));
     }
 
@@ -9141,6 +9407,10 @@ function adamStep(
     // the old storage handles, the buffer won't be released to the pool
     // (the result tensors now own it). This prevents double-free.
     _st = profileSubOpBegin();
+    // Explicitly decRef before noop-ing destroy — ownership transfers to result tensors.
+    if (paramT.ownsBuffer) bufferPool.decRef(paramT.buffer);
+    if (mT.ownsBuffer) bufferPool.decRef(mT.buffer);
+    if (vT.ownsBuffer) bufferPool.decRef(vT.buffer);
     const noop = () => {};
     paramT.destroy = noop;
     mT.destroy = noop;
@@ -9176,6 +9446,7 @@ function unscaleGrad(
   );
   // Destroy contiguous copy if one was created (deferred for GPU fence)
   if (gradT !== (grad as WebGPUTensor)) {
+    bufferPool.decRef(gradT.buffer);
     bufferPool.deferredDestroy(gradT.buffer, gradT.size * dtypeBytes(gradT.dtype));
   }
   return createTensor(gradT.shape, result.gradOutBuffer);
@@ -9353,13 +9624,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   const key = `mul_scalar_inplace:${size}`;
   const pipeline = getPipeline(ctx, key, code);
 
-  const bindGroup = profiledCreateBindGroup(ctx.device,{
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: a.buffer } },
-      { binding: 1, resource: { buffer: uniformBuffer } },
-    ],
-  });
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [a.buffer, uniformBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, Math.ceil(size / WORKGROUP_SIZE));
 

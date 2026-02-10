@@ -1,0 +1,33 @@
+node_modules
+coverage
+.nyc_output
+.venv
+.DS_Store
+*.log
+.vscode
+.idea
+compiled
+.awcache
+.rpt2_cache
+docs
+
+dist
+
+package-lock.json
+yarn.lock
+
+# Model weights (large binary files)
+models/
+
+# Cached training data
+.cache/
+
+# Claude Code local settings
+.claude/
+
+# Machine-specific scripts
+start-vin-gpu.sh
+
+# CPU profiler output
+CPU.*.cpuprofile
+*.cpuprofile

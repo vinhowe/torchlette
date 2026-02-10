@@ -1,0 +1,15 @@
+[project]
+name = "torchlette-oracle"
+version = "0.0.0"
+requires-python = ">=3.11,<3.13"
+dependencies = ["torch"]
+
+[tool.uv]
+index-strategy = "first-index"
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

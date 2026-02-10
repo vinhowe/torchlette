@@ -1,0 +1,103 @@
+{
+  "timestamp": "2026-01-04T19:44:05.819Z",
+  "warmupIters": 2,
+  "runIters": 5,
+  "results": [
+    {
+      "name": "matmul.128x128",
+      "status": "ok",
+      "iterations": 5,
+      "msMedian": 0.5966670000000249,
+      "flopsPerSec": 7029555849.409847,
+      "bytesPerSec": 329510430.4410866
+    },
+    {
+      "name": "matmul.256x256",
+      "status": "ok",
+      "iterations": 5,
+      "msMedian": 1.6671249999999418,
+      "flopsPerSec": 20127124240.834473,
+      "bytesPerSec": 471729474.39455795
+    },
+    {
+      "name": "matmul.512x512",
+      "status": "ok",
+      "iterations": 5,
+      "msMedian": 2.8473339999999325,
+      "flopsPerSec": 94276068771.70236,
+      "bytesPerSec": 1104797680.9183872
+    },
+    {
+      "name": "matmul.1024x1024",
+      "status": "ok",
+      "iterations": 5,
+      "msMedian": 4.694749999999999,
+      "flopsPerSec": 457422364982.161,
+      "bytesPerSec": 2680209169.8173494
+    },
+    {
+      "name": "matmul.2048x2048",
+      "status": "ok",
+      "iterations": 5,
+      "msMedian": 29.795875000000024,
+      "flopsPerSec": 576585489904.2229,
+      "bytesPerSec": 1689215302.453778
+    },
+    {
+      "name": "matmul.tall.4096x256x4096",
+      "status": "ok",
+      "iterations": 5,
+      "msMedian": 18.701790999999957,
+      "flopsPerSec": 459310800339.9257,
+      "bytesPerSec": 4036911331.1126285
+    },
+    {
+      "name": "matmul.tall.2048x128x2048",
+      "status": "ok",
+      "iterations": 5,
+      "msMedian": 2.9677919999999176,
+      "flopsPerSec": 361798206882.4331,
+      "bytesPerSec": 6359734105.355269
+    },
+    {
+      "name": "matmul.wide.256x1024x256",
+      "status": "ok",
+      "iterations": 5,
+      "msMedian": 0.7441669999998339,
+      "flopsPerSec": 180359688080.80707,
+      "bytesPerSec": 3170385142.045437
+    },
+    {
+      "name": "matmul.odd.100x150x80",
+      "status": "ok",
+      "iterations": 5,
+      "msMedian": 0.32316599999990103,
+      "flopsPerSec": 7426523829.860614,
+      "bytesPerSec": 433213890.07520247
+    },
+    {
+      "name": "matmul.odd.333x444x555",
+      "status": "ok",
+      "iterations": 5,
+      "msMedian": 0.8148330000001351,
+      "flopsPerSec": 201410252162.06607,
+      "bytesPerSec": 2842727282.7678995
+    },
+    {
+      "name": "matmul.gemv.1x1024x1024",
+      "status": "ok",
+      "iterations": 5,
+      "msMedian": 0.7065840000000208,
+      "flopsPerSec": 2968015126.297706,
+      "bytesPerSec": 5947624061.682513
+    },
+    {
+      "name": "matmul.gemv.1024x1024x1",
+      "status": "ok",
+      "iterations": 5,
+      "msMedian": 0.6338339999999789,
+      "flopsPerSec": 3308677035.3121953,
+      "bytesPerSec": 6630278590.293579
+    }
+  ]
+}

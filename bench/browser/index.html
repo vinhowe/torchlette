@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Torchlette WebGPU Benchmarks</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 {
+      color: #00d4ff;
+      border-bottom: 2px solid #00d4ff;
+      padding-bottom: 10px;
+    }
+    h2 {
+      color: #00d4ff;
+      margin-top: 30px;
+    }
+    .status {
+      padding: 15px;
+      border-radius: 8px;
+      margin: 20px 0;
+      font-family: monospace;
+    }
+    .status.info {
+      background: #16213e;
+      border: 1px solid #0f3460;
+    }
+    .status.error {
+      background: #3d1f1f;
+      border: 1px solid #8b0000;
+      color: #ff6b6b;
+    }
+    .status.success {
+      background: #1f3d1f;
+      border: 1px solid #006400;
+      color: #90ee90;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 20px 0;
+      background: #16213e;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    th, td {
+      padding: 12px 15px;
+      text-align: left;
+      border-bottom: 1px solid #0f3460;
+    }
+    th {
+      background: #0f3460;
+      color: #00d4ff;
+      font-weight: 600;
+    }
+    tr:hover {
+      background: #1a2744;
+    }
+    .number {
+      text-align: right;
+      font-family: monospace;
+    }
+    .best {
+      color: #90ee90;
+      font-weight: bold;
+    }
+    button {
+      background: #00d4ff;
+      color: #1a1a2e;
+      border: none;
+      padding: 12px 24px;
+      font-size: 16px;
+      font-weight: bold;
+      border-radius: 6px;
+      cursor: pointer;
+      margin: 5px;
+    }
+    button:hover {
+      background: #00a8cc;
+    }
+    button:disabled {
+      background: #555;
+      cursor: not-allowed;
+    }
+    .controls {
+      margin: 20px 0;
+    }
+    .progress {
+      margin: 10px 0;
+      font-family: monospace;
+      color: #888;
+    }
+    .gpu-info {
+      background: #16213e;
+      padding: 15px;
+      border-radius: 8px;
+      margin: 20px 0;
+      font-family: monospace;
+      font-size: 14px;
+    }
+    .gpu-info span {
+      color: #00d4ff;
+    }
+  </style>
+</head>
+<body>
+  <h1>Torchlette WebGPU Benchmarks</h1>
+
+  <div id="status" class="status info">Initializing WebGPU...</div>
+
+  <div id="gpu-info" class="gpu-info" style="display: none;">
+    <div>GPU: <span id="gpu-name">-</span></div>
+    <div>Vendor: <span id="gpu-vendor">-</span></div>
+    <div>Subgroups: <span id="gpu-subgroups">-</span></div>
+  </div>
+
+  <div class="controls">
+    <button id="btn-quick" disabled>Quick [f32]</button>
+    <button id="btn-full" disabled>Full [f32]</button>
+    <button id="btn-matmul" disabled>Large Matmul [f32]</button>
+    <button id="btn-subgroup" disabled style="display: none;">Subgroup [f32]</button>
+    <button id="btn-dtype" disabled>f16/f32 + Subgroups</button>
+  </div>
+
+  <div id="progress" class="progress"></div>
+
+  <div id="results"></div>
+
+  <script type="module">
+    // Import from the built browser bundle
+    import {
+      initWebGPU,
+      getWebGPUInitError,
+      syncWebGPU,
+      webgpuBackend,
+      getSubgroupSupport,
+      getWebGPUDevice,
+      dispatchTiledMatmul,
+      DEFAULT_CONFIG,
+    } from '../../dist/browser.js';
+
+    const statusEl = document.getElementById('status');
+    const gpuInfoEl = document.getElementById('gpu-info');
+    const progressEl = document.getElementById('progress');
+    const resultsEl = document.getElementById('results');
+    const btnQuick = document.getElementById('btn-quick');
+    const btnFull = document.getElementById('btn-full');
+    const btnMatmul = document.getElementById('btn-matmul');
+    const btnSubgroup = document.getElementById('btn-subgroup');
+    const btnDtype = document.getElementById('btn-dtype');
+
+    let isRunning = false;
+    let subgroupsSupported = false;
+
+    const GPUBufferUsage = {
+      STORAGE: 0x0080,
+      COPY_SRC: 0x0004,
+      COPY_DST: 0x0008,
+    };
+
+    function setStatus(message, type = 'info') {
+      statusEl.textContent = message;
+      statusEl.className = `status ${type}`;
+    }
+
+    function setProgress(message) {
+      progressEl.textContent = message;
+    }
+
+    function makeValues(size, offset = 0) {
+      const values = new Array(size);
+      for (let i = 0; i < size; i++) {
+        values[i] = ((i + offset) % 13 - 6) * 0.1;
+      }
+      return values;
+    }
+
+    async function benchmark(name, runFn, warmup = 3, iters = 5) {
+      // Warmup
+      for (let i = 0; i < warmup; i++) {
+        runFn();
+      }
+      await syncWebGPU();
+
+      // Timed runs
+      const times = [];
+      for (let i = 0; i < iters; i++) {
+        const start = performance.now();
+        runFn();
+        await syncWebGPU();
+        const end = performance.now();
+        times.push(end - start);
+      }
+
+      // Return median
+      times.sort((a, b) => a - b);
+      return times[Math.floor(times.length / 2)];
+    }
+
+    async function runMatmulBenchmark(m, n, k, warmup, iters) {
+      const flops = 2 * m * n * k;
+      const bytes = 4 * (m * k + k * n + m * n);
+
+      const aVals = makeValues(m * k, 0);
+      const bVals = makeValues(k * n, 1);
+
+      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]);
+      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]);
+
+      const ms = await benchmark(
+        `matmul ${m}x${n}x${k}`,
+        () => webgpuBackend.ops.matmul(a, b),
+        warmup,
+        iters
+      );
+
+      return {
+        name: `${m}x${n}x${k}`,
+        m, n, k,
+        medianMs: ms,
+        gflops: flops / (ms * 1e6),
+        gbps: bytes / (ms * 1e6),
+      };
+    }
+
+    function renderTable(title, results, columns) {
+      let html = `<h2>${title}</h2><table><tr>`;
+      for (const col of columns) {
+        html += `<th>${col.header}</th>`;
+      }
+      html += '</tr>';
+
+      // Find best GFLOPS for highlighting
+      const bestGflops = Math.max(...results.map(r => r.gflops || 0));
+
+      for (const r of results) {
+        html += '<tr>';
+        for (const col of columns) {
+          const value = col.format ? col.format(r[col.key], r) : r[col.key];
+          const isBest = col.key === 'gflops' && r.gflops === bestGflops;
+          html += `<td class="${col.numeric ? 'number' : ''} ${isBest ? 'best' : ''}">${value}</td>`;
+        }
+        html += '</tr>';
+      }
+      html += '</table>';
+      return html;
+    }
+
+    async function runQuickBenchmark() {
+      const sizes = [
+        { m: 256, n: 256, k: 256 },
+        { m: 512, n: 512, k: 512 },
+        { m: 1024, n: 1024, k: 1024 },
+      ];
+
+      const results = [];
+      for (let i = 0; i < sizes.length; i++) {
+        const { m, n, k } = sizes[i];
+        setProgress(`Running ${m}x${n}x${k} (${i + 1}/${sizes.length})...`);
+        results.push(await runMatmulBenchmark(m, n, k, 2, 3));
+      }
+
+      return results;
+    }
+
+    async function runFullBenchmark() {
+      const sizes = [
+        { m: 128, n: 128, k: 128, name: '128x128' },
+        { m: 256, n: 256, k: 256, name: '256x256' },
+        { m: 512, n: 512, k: 512, name: '512x512' },
+        { m: 1024, n: 1024, k: 1024, name: '1024x1024' },
+        { m: 2048, n: 2048, k: 2048, name: '2048x2048' },
+        { m: 4096, n: 4096, k: 256, name: 'Tall-skinny 4096x4096x256' },
+        { m: 256, n: 256, k: 1024, name: 'Short-wide 256x256x1024' },
+        { m: 1, n: 1024, k: 1024, name: 'GEMV 1x1024x1024' },
+      ];
+
+      const results = [];
+      for (let i = 0; i < sizes.length; i++) {
+        const { m, n, k, name } = sizes[i];
+        setProgress(`Running ${name || `${m}x${n}x${k}`} (${i + 1}/${sizes.length})...`);
+        const result = await runMatmulBenchmark(m, n, k, 3, 5);
+        result.name = name || result.name;
+        results.push(result);
+      }
+
+      return results;
+    }
+
+    async function runMatmulOnlyBenchmark() {
+      const sizes = [
+        { m: 1024, n: 1024, k: 1024 },
+        { m: 2048, n: 2048, k: 2048 },
+        { m: 4096, n: 4096, k: 4096 },
+      ];
+
+      const results = [];
+      for (let i = 0; i < sizes.length; i++) {
+        const { m, n, k } = sizes[i];
+        setProgress(`Running ${m}x${n}x${k} (${i + 1}/${sizes.length})...`);
+        results.push(await runMatmulBenchmark(m, n, k, 5, 7));
+      }
+
+      return results;
+    }
+
+    async function runSubgroupComparisonBenchmark() {
+      const ctx = getWebGPUDevice();
+      if (!ctx) {
+        throw new Error('WebGPU device not available');
+      }
+      const { device, queue } = ctx;
+
+      const sizes = [
+        { m: 1024, n: 1024, k: 1024, name: '1024x1024' },
+        { m: 2048, n: 2048, k: 2048, name: '2048x2048' },
+      ];
+
+      const allResults = [];
+
+      for (let sizeIdx = 0; sizeIdx < sizes.length; sizeIdx++) {
+        const { m, n, k, name } = sizes[sizeIdx];
+        const flops = 2 * m * n * k;
+        const bytes = 4 * (m * k + k * n + m * n);
+
+        // Create buffers
+        const aData = new Float32Array(m * k);
+        const bData = new Float32Array(k * n);
+        for (let i = 0; i < m * k; i++) aData[i] = ((i % 13) - 6) * 0.1;
+        for (let i = 0; i < k * n; i++) bData[i] = ((i % 11) - 5) * 0.1;
+
+        const aBuffer = device.createBuffer({
+          size: m * k * 4,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        const bBuffer = device.createBuffer({
+          size: k * n * 4,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        const outBuffer = device.createBuffer({
+          size: m * n * 4,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        });
+
+        queue.writeBuffer(aBuffer, 0, aData);
+        queue.writeBuffer(bBuffer, 0, bData);
+
+        const baseConfig = {
+          ...DEFAULT_CONFIG,
+          tileM: 64,
+          tileN: 64,
+          tileK: 16,
+        };
+
+        const configs = [
+          { label: 'no-subgroups', config: { ...baseConfig, useSubgroups: false } },
+          { label: 'with-subgroups', config: { ...baseConfig, useSubgroups: true } },
+        ];
+
+        for (const { label, config } of configs) {
+          try {
+            setProgress(`Running ${name} ${label}...`);
+
+            // Warmup
+            for (let i = 0; i < 3; i++) {
+              dispatchTiledMatmul({
+                device, queue,
+                a: aBuffer, b: bBuffer, out: outBuffer,
+                m, n, k,
+                config,
+                dtype: 'f32',
+              });
+            }
+            await syncWebGPU();
+
+            // Timed runs
+            const times = [];
+            for (let i = 0; i < 5; i++) {
+              const start = performance.now();
+              dispatchTiledMatmul({
+                device, queue,
+                a: aBuffer, b: bBuffer, out: outBuffer,
+                m, n, k,
+                config,
+                dtype: 'f32',
+              });
+              await syncWebGPU();
+              times.push(performance.now() - start);
+            }
+
+            times.sort((a, b) => a - b);
+            const ms = times[Math.floor(times.length / 2)];
+
+            allResults.push({
+              name: `${name} (${label})`,
+              size: name,
+              variant: label,
+              medianMs: ms,
+              gflops: flops / (ms * 1e6),
+              gbps: bytes / (ms * 1e6),
+            });
+          } catch (e) {
+            console.warn(`Skipping ${name} ${label}:`, e);
+          }
+        }
+      }
+
+      return allResults;
+    }
+
+    // Helper to convert f32 to f16 (IEEE 754 half-precision)
+    function float32ToFloat16(val) {
+      const floatView = new Float32Array(1);
+      const int32View = new Int32Array(floatView.buffer);
+      floatView[0] = val;
+      const x = int32View[0];
+
+      let bits = (x >> 16) & 0x8000; // sign
+      let m = (x >> 12) & 0x07ff; // mantissa
+      const e = (x >> 23) & 0xff; // exponent
+
+      if (e < 103) return bits;
+      if (e > 142) {
+        bits |= 0x7c00;
+        bits |= (e === 255 ? 0 : 1) && (x & 0x007fffff);
+        return bits;
+      }
+      if (e < 113) {
+        m |= 0x0800;
+        bits |= (m >> (114 - e)) + ((m >> (113 - e)) & 1);
+        return bits;
+      }
+      bits |= ((e - 112) << 10) | (m >> 1);
+      bits += (m & 1);
+      return bits;
+    }
+
+    async function runDtypeComparisonBenchmark() {
+      const ctx = getWebGPUDevice();
+      if (!ctx) {
+        throw new Error('WebGPU device not available');
+      }
+      const { device, queue } = ctx;
+
+      const sizes = [
+        { m: 1024, n: 1024, k: 1024, name: '1024x1024' },
+        { m: 2048, n: 2048, k: 2048, name: '2048x2048' },
+      ];
+
+      const allResults = [];
+
+      for (const { m, n, k, name } of sizes) {
+        const flops = 2 * m * n * k;
+
+        const baseConfig = {
+          ...DEFAULT_CONFIG,
+          tileM: 64,
+          tileN: 64,
+          tileK: 16,
+        };
+
+        // Test all combinations of dtype and subgroup usage
+        const variants = [
+          { label: 'f32', dtype: 'f32', bytesPerElement: 4, useSubgroups: false },
+          { label: 'f32+subgroups', dtype: 'f32', bytesPerElement: 4, useSubgroups: true },
+          { label: 'f16', dtype: 'f16', bytesPerElement: 2, useSubgroups: false },
+          { label: 'f16+subgroups', dtype: 'f16', bytesPerElement: 2, useSubgroups: true },
+        ];
+
+        for (const { label, dtype, bytesPerElement, useSubgroups } of variants) {
+          try {
+            setProgress(`Running ${name} ${label}...`);
+            const bytes = bytesPerElement * (m * k + k * n + m * n);
+            const config = { ...baseConfig, useSubgroups };
+
+            // Create buffers
+            const aBuffer = device.createBuffer({
+              size: m * k * bytesPerElement,
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            const bBuffer = device.createBuffer({
+              size: k * n * bytesPerElement,
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            const outBuffer = device.createBuffer({
+              size: m * n * bytesPerElement,
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+            });
+
+            // Initialize data
+            const aData = new Float32Array(m * k);
+            const bData = new Float32Array(k * n);
+            for (let i = 0; i < m * k; i++) aData[i] = ((i % 13) - 6) * 0.1;
+            for (let i = 0; i < k * n; i++) bData[i] = ((i % 11) - 5) * 0.1;
+
+            if (dtype === 'f16') {
+              const aData16 = new Uint16Array(m * k);
+              const bData16 = new Uint16Array(k * n);
+              for (let i = 0; i < m * k; i++) aData16[i] = float32ToFloat16(aData[i]);
+              for (let i = 0; i < k * n; i++) bData16[i] = float32ToFloat16(bData[i]);
+              queue.writeBuffer(aBuffer, 0, aData16);
+              queue.writeBuffer(bBuffer, 0, bData16);
+            } else {
+              queue.writeBuffer(aBuffer, 0, aData);
+              queue.writeBuffer(bBuffer, 0, bData);
+            }
+
+            // Warmup
+            for (let i = 0; i < 3; i++) {
+              dispatchTiledMatmul({
+                device, queue,
+                a: aBuffer, b: bBuffer, out: outBuffer,
+                m, n, k,
+                config,
+                dtype,
+              });
+            }
+            await syncWebGPU();
+
+            // Timed runs
+            const times = [];
+            for (let i = 0; i < 5; i++) {
+              const start = performance.now();
+              dispatchTiledMatmul({
+                device, queue,
+                a: aBuffer, b: bBuffer, out: outBuffer,
+                m, n, k,
+                config,
+                dtype,
+              });
+              await syncWebGPU();
+              times.push(performance.now() - start);
+            }
+
+            times.sort((a, b) => a - b);
+            const ms = times[Math.floor(times.length / 2)];
+
+            allResults.push({
+              name: `${name} (${label})`,
+              size: name,
+              variant: label,
+              medianMs: ms,
+              gflops: flops / (ms * 1e6),
+              gbps: bytes / (ms * 1e6),
+            });
+          } catch (e) {
+            console.warn(`Skipping ${name} ${label}:`, e);
+          }
+        }
+      }
+
+      return allResults;
+    }
+
+    async function runBenchmarkSuite(type) {
+      if (isRunning) return;
+      isRunning = true;
+
+      btnQuick.disabled = true;
+      btnFull.disabled = true;
+      btnMatmul.disabled = true;
+      btnSubgroup.disabled = true;
+      btnDtype.disabled = true;
+
+      try {
+        setStatus('Running benchmarks...', 'info');
+        resultsEl.innerHTML = '';
+
+        let results;
+        let title = 'Matmul Performance';
+
+        if (type === 'quick') {
+          results = await runQuickBenchmark();
+          title = 'Matmul Performance [f32]';
+        } else if (type === 'full') {
+          results = await runFullBenchmark();
+          title = 'Full Benchmark Suite [f32]';
+        } else if (type === 'subgroup') {
+          results = await runSubgroupComparisonBenchmark();
+          title = 'Subgroup Comparison [f32] (with vs without subgroup operations)';
+        } else if (type === 'dtype') {
+          results = await runDtypeComparisonBenchmark();
+          title = 'Dtype + Subgroup Comparison (f16/f32 × subgroups)';
+        } else {
+          results = await runMatmulOnlyBenchmark();
+          title = 'Large Matmul Performance [f32]';
+        }
+
+        const columns = [
+          { key: 'name', header: 'Size' },
+          { key: 'medianMs', header: 'Time (ms)', numeric: true, format: v => v.toFixed(3) },
+          { key: 'gflops', header: 'GFLOPS', numeric: true, format: v => v.toFixed(2) },
+          { key: 'gbps', header: 'GB/s', numeric: true, format: v => v.toFixed(2) },
+        ];
+
+        let html = renderTable(title, results, columns);
+
+        // Add speedup summary for subgroup comparison
+        if (type === 'subgroup' && results.length > 0) {
+          const sizes = [...new Set(results.map(r => r.size))];
+          html += '<h3>Speedup Summary</h3><ul>';
+          for (const size of sizes) {
+            const noSg = results.find(r => r.size === size && r.variant === 'no-subgroups');
+            const withSg = results.find(r => r.size === size && r.variant === 'with-subgroups');
+            if (noSg && withSg) {
+              const speedup = noSg.medianMs / withSg.medianMs;
+              const status = speedup > 1 ? 'faster' : 'slower';
+              const color = speedup > 1 ? '#90ee90' : '#ff6b6b';
+              html += `<li style="color: ${color}">${size}: ${speedup.toFixed(2)}x ${status} with subgroups</li>`;
+            }
+          }
+          html += '</ul>';
+        }
+
+        // Add speedup summary for dtype comparison
+        if (type === 'dtype' && results.length > 0) {
+          const sizes = [...new Set(results.map(r => r.size))];
+          html += '<h3>Speedup Summary</h3>';
+          for (const size of sizes) {
+            const f32 = results.find(r => r.size === size && r.variant === 'f32');
+            const f32sg = results.find(r => r.size === size && r.variant === 'f32+subgroups');
+            const f16 = results.find(r => r.size === size && r.variant === 'f16');
+            const f16sg = results.find(r => r.size === size && r.variant === 'f16+subgroups');
+
+            html += `<h4>${size}</h4><ul>`;
+
+            // f16 vs f32 (no subgroups)
+            if (f32 && f16) {
+              const speedup = f32.medianMs / f16.medianMs;
+              const color = speedup > 1 ? '#90ee90' : '#ff6b6b';
+              html += `<li style="color: ${color}">f16 vs f32 (no subgroups): ${speedup.toFixed(2)}x ${speedup > 1 ? 'faster' : 'slower'}</li>`;
+            }
+
+            // f16 vs f32 (with subgroups)
+            if (f32sg && f16sg) {
+              const speedup = f32sg.medianMs / f16sg.medianMs;
+              const color = speedup > 1 ? '#90ee90' : '#ff6b6b';
+              html += `<li style="color: ${color}">f16 vs f32 (with subgroups): ${speedup.toFixed(2)}x ${speedup > 1 ? 'faster' : 'slower'}</li>`;
+            }
+
+            // Subgroup benefit for f32
+            if (f32 && f32sg) {
+              const speedup = f32.medianMs / f32sg.medianMs;
+              const color = speedup > 1 ? '#90ee90' : '#ff6b6b';
+              html += `<li style="color: ${color}">f32 subgroup benefit: ${speedup.toFixed(2)}x ${speedup > 1 ? 'faster' : 'slower'}</li>`;
+            }
+
+            // Subgroup benefit for f16
+            if (f16 && f16sg) {
+              const speedup = f16.medianMs / f16sg.medianMs;
+              const color = speedup > 1 ? '#90ee90' : '#ff6b6b';
+              html += `<li style="color: ${color}">f16 subgroup benefit: ${speedup.toFixed(2)}x ${speedup > 1 ? 'faster' : 'slower'}</li>`;
+            }
+
+            // Best vs worst
+            if (f32 && f16sg) {
+              const speedup = f32.medianMs / f16sg.medianMs;
+              const color = speedup > 1 ? '#90ee90' : '#ff6b6b';
+              html += `<li style="color: ${color}"><strong>Best (f16+sg) vs worst (f32): ${speedup.toFixed(2)}x ${speedup > 1 ? 'faster' : 'slower'}</strong></li>`;
+            }
+
+            html += '</ul>';
+          }
+        }
+
+        resultsEl.innerHTML = html;
+        setProgress('');
+        setStatus('Benchmark complete!', 'success');
+
+      } catch (error) {
+        setStatus(`Benchmark failed: ${error.message}`, 'error');
+        console.error(error);
+      } finally {
+        isRunning = false;
+        btnQuick.disabled = false;
+        btnFull.disabled = false;
+        btnMatmul.disabled = false;
+        btnDtype.disabled = false;
+        if (subgroupsSupported) btnSubgroup.disabled = false;
+      }
+    }
+
+    // Initialize
+    async function init() {
+      try {
+        const ok = await initWebGPU();
+        if (!ok) {
+          setStatus(`WebGPU initialization failed: ${getWebGPUInitError()}`, 'error');
+          return;
+        }
+
+        // Show GPU info
+        gpuInfoEl.style.display = 'block';
+
+        // Try to get adapter info
+        if (navigator.gpu) {
+          const adapter = await navigator.gpu.requestAdapter();
+          if (adapter) {
+            // requestAdapterInfo is available in some browsers
+            if (adapter.info) {
+              document.getElementById('gpu-name').textContent = adapter.info.device || 'Unknown';
+              document.getElementById('gpu-vendor').textContent = adapter.info.vendor || 'Unknown';
+            } else {
+              document.getElementById('gpu-name').textContent = 'Available';
+              document.getElementById('gpu-vendor').textContent = 'Unknown';
+            }
+          }
+        }
+
+        const subgroups = getSubgroupSupport();
+        subgroupsSupported = subgroups?.supported || false;
+        document.getElementById('gpu-subgroups').textContent =
+          subgroups?.supported ? `Yes (size: ${subgroups.subgroupSize})` : 'No';
+
+        setStatus('WebGPU ready! Click a button to start benchmarking.', 'success');
+        btnQuick.disabled = false;
+        btnFull.disabled = false;
+        btnMatmul.disabled = false;
+        btnDtype.disabled = false;
+
+        // Show subgroup comparison button if supported
+        if (subgroupsSupported) {
+          btnSubgroup.style.display = 'inline-block';
+          btnSubgroup.disabled = false;
+        }
+
+      } catch (error) {
+        setStatus(`Initialization error: ${error.message}`, 'error');
+        console.error(error);
+      }
+    }
+
+    btnQuick.addEventListener('click', () => runBenchmarkSuite('quick'));
+    btnFull.addEventListener('click', () => runBenchmarkSuite('full'));
+    btnMatmul.addEventListener('click', () => runBenchmarkSuite('matmul'));
+    btnSubgroup.addEventListener('click', () => runBenchmarkSuite('subgroup'));
+    btnDtype.addEventListener('click', () => runBenchmarkSuite('dtype'));
+
+    init();
+  </script>
+</body>
+</html>
