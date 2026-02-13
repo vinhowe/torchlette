@@ -172,6 +172,12 @@ export type FusedCrossEntropyConfig = {
   vocabSize: number;
 };
 
+export type FusedLayerNormConfig = {
+  numRows: number;     // product of all dims except last (B*S for [B,S,D])
+  featureDim: number;  // last dim size (D)
+  eps: number;
+};
+
 export type AdamStepConfig = {
   beta1: number;
   beta2: number;
@@ -320,6 +326,26 @@ export interface BackendOps {
     gradOutput: BackendTensor,
     config: FusedCrossEntropyConfig,
   ): BackendTensor;
+  /** Fused LayerNorm forward: x [N,D] + weight [D] + bias [D] → output [N,D]. */
+  fusedLayerNormForward?(
+    x: BackendTensor,
+    weight: BackendTensor,
+    bias: BackendTensor,
+    config: FusedLayerNormConfig,
+  ): BackendTensor;
+  /** Fused LayerNorm backward gradX: grad [N,D] + x [N,D] + weight [D] → gradX [N,D]. */
+  fusedLayerNormBackwardGradX?(
+    gradOutput: BackendTensor,
+    x: BackendTensor,
+    weight: BackendTensor,
+    config: FusedLayerNormConfig,
+  ): BackendTensor;
+  /** Fused LayerNorm backward gradWeight+gradBias: grad [N,D] + x [N,D] → {gradWeight [D], gradBias [D]}. */
+  fusedLayerNormBackwardGradWeightBias?(
+    gradOutput: BackendTensor,
+    x: BackendTensor,
+    config: FusedLayerNormConfig,
+  ): { gradWeight: BackendTensor; gradBias: BackendTensor };
   /** Create a zeroed inf-flag buffer for unscaleGrad. */
   createInfCountBuffer?(): unknown;
   /** Read inf flag (0.0 or 1.0) and destroy buffer. */

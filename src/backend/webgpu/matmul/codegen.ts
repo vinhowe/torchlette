@@ -56,6 +56,8 @@ export type CodegenOptions = {
   inputCastA?: DType;
   /** Input B buffer is this wider dtype; cast to compute dtype during tile load */
   inputCastB?: DType;
+  /** K-split factor: split K-reduction across this many workgroups (Z dim) */
+  kSplit?: number;
 };
 
 /**
@@ -253,7 +255,7 @@ function genEpilogueBindings(
  * Generate the complete tiled matmul shader.
  */
 export function generateTiledMatmulShader(options: CodegenOptions): string {
-  const { config, transposeMode, dtype, dtypeB: dtypeBOpt, epilogue, batched, inputCastA, inputCastB } = options;
+  const { config, transposeMode, dtype, dtypeB: dtypeBOpt, epilogue, batched, inputCastA, inputCastB, kSplit } = options;
   const { tileM, tileN, tileK, threadTileM, threadTileN } = config;
 
   const wgSize = getWorkgroupSize(config);
@@ -280,7 +282,8 @@ export function generateTiledMatmulShader(options: CodegenOptions): string {
   const epilogueBindings = genEpilogueBindings(epilogue, epilogueBindingStart);
 
   // Determine if we need f16 support
-  const outputDtype = epilogue?.outputDtype ?? (dtype === "f32" || dtypeB === "f32" ? "f32" : dtype);
+  // K-split partials are always f32 (accumulated in f32 registers, no epilogue/cast)
+  const outputDtype = kSplit ? "f32" as DType : (epilogue?.outputDtype ?? (dtype === "f32" || dtypeB === "f32" ? "f32" : dtype));
   // Need f16 if any actual binding uses f16 or output is f16.
   // When inputCast is active, the overridden binding is f32, so don't count it.
   const needsF16 = wgslDtypeA === "f16" || wgslDtypeB === "f16" || outputDtype === "f16";
@@ -341,13 +344,16 @@ fn main(
   let ldc = params.ldc;
   let alpha = params.alpha;
 
-  // Batch offset (for batched matmul)
-  // Using stride-based indexing for proper broadcast support
+  // Batch / K-split offset
+  ${kSplit ? `// K-split mode: wg_id.z is the K-split index
+  let split_idx = wg_id.z;
+  let batch_offset_a = 0u;
+  let batch_offset_b = 0u;` : `// Using stride-based indexing for proper broadcast support
   // Stride of 0 means broadcast (same data for all batches)
   ${batched ? "let batch_idx = wg_id.z;" : "let batch_idx = 0u;"}
   let batch_offset_a = batch_idx * params.batchStrideA;
   let batch_offset_b = batch_idx * params.batchStrideB;
-  let batch_offset_c = batch_idx * params.batchStrideC;
+  let batch_offset_c = batch_idx * params.batchStrideC;`}
 
   // Workgroup tile position in output matrix
   let wg_row = wg_id.y * TILE_M;
@@ -363,12 +369,18 @@ fn main(
     acc[i] = 0.0;
   }
 
-  // Number of K tiles
-  let num_k_tiles = (k + TILE_K - 1u) / TILE_K;
+  // K-loop bounds
+  ${kSplit ? `// K-split: each Z-slice handles a chunk of K
+  let k_per_split = (k + ${kSplit}u - 1u) / ${kSplit}u;
+  let k_start = split_idx * k_per_split;
+  let k_end = min(k_start + k_per_split, k);
+  let num_k_tiles = (k_end - k_start + TILE_K - 1u) / TILE_K;` : `let num_k_tiles = (k + TILE_K - 1u) / TILE_K;
+  let k_start = 0u;
+  let k_end = k;`}
 
   // Loop over K tiles
   for (var k_tile = 0u; k_tile < num_k_tiles; k_tile = k_tile + 1u) {
-    let k_offset = k_tile * TILE_K;
+    let k_offset = k_start + k_tile * TILE_K;
 
     // Cooperative load of A tile into shared memory
     for (var i = 0u; i < ELEMS_PER_THREAD_A; i = i + 1u) {
@@ -378,7 +390,7 @@ fn main(
         let tile_col = flat_idx % TILE_K;
         let global_row = wg_row + tile_row;
         let global_col = k_offset + tile_col;
-        if (global_row < m && global_col < k) {
+        if (global_row < m && global_col < k_end) {
           tileA[flat_idx] = ${accType}(${genLoadA(transposeMode, "global_row", "global_col", "lda", "batch_offset_a")});
         } else {
           tileA[flat_idx] = 0.0;
@@ -394,7 +406,7 @@ fn main(
         let tile_col = flat_idx % TILE_N;
         let global_row = k_offset + tile_row;
         let global_col = wg_col + tile_col;
-        if (global_row < k && global_col < n) {
+        if (global_row < k_end && global_col < n) {
           tileB[flat_idx] = ${accType}(${genLoadB(transposeMode, "global_row", "global_col", "ldb", "batch_offset_b")});
         } else {
           tileB[flat_idx] = 0.0;
@@ -438,9 +450,11 @@ fn main(
       let out_row = wg_row + thread_row * THREAD_TILE_M + tm;
       let out_col = wg_col + thread_col * THREAD_TILE_N + tn;
       if (out_row < m && out_col < n) {
-        let out_idx = batch_offset_c + out_row * ldc + out_col;
+        ${kSplit ? `// K-split: write partial sum to temp[split_idx * m * n + ...]
+        let out_idx = split_idx * m * n + out_row * ldc + out_col;
+        out[out_idx] = acc[tm * THREAD_TILE_N + tn];` : `let out_idx = batch_offset_c + out_row * ldc + out_col;
         let result = acc[tm * THREAD_TILE_N + tn] * alpha;
-        ${genEpilogueCode(epilogue, "result", "out_idx", outputDtype, "out_col")}
+        ${genEpilogueCode(epilogue, "result", "out_idx", outputDtype, "out_col")}`}
       }
     }
   }
@@ -454,7 +468,7 @@ fn main(
  * Generate a cache key for a shader configuration.
  */
 export function getShaderCacheKey(options: CodegenOptions): string {
-  const { config, transposeMode, dtype, dtypeB, epilogue, batched, inputCastA, inputCastB } = options;
+  const { config, transposeMode, dtype, dtypeB, epilogue, batched, inputCastA, inputCastB, kSplit } = options;
   const epilogueKey = epilogue
     ? `${epilogue.ops.map((op) => op.kind).join(",")}_${epilogue.outputDtype}`
     : "none";
@@ -471,5 +485,47 @@ export function getShaderCacheKey(options: CodegenOptions): string {
     epilogueKey,
     inputCastA ? `castA_${inputCastA}` : "",
     inputCastB ? `castB_${inputCastB}` : "",
+    kSplit ? `ksplit${kSplit}` : "",
   ].filter(Boolean).join("_");
+}
+
+/**
+ * Generate a simple reduction shader that sums K-split partial results.
+ * Reads partials[P * M * N] and writes out[M * N] = sum(partials[p * M*N + i] for p in 0..P) * alpha.
+ */
+export function generateKSplitReductionShader(kSplitCount: number, outputDtype: DType): string {
+  const outType = dtypeToWgsl(outputDtype);
+  const needsF16 = outputDtype === "f16";
+  return `
+// K-split reduction: sum ${kSplitCount} partial results
+${needsF16 ? "enable f16;\n" : ""}
+struct Params {
+  totalElements: u32,
+  alpha: f32,
+}
+
+@group(0) @binding(0) var<storage, read> partials: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<${outType}>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+const K_SPLIT: u32 = ${kSplitCount}u;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= params.totalElements) { return; }
+  var sum: f32 = 0.0;
+  for (var p = 0u; p < K_SPLIT; p = p + 1u) {
+    sum = sum + partials[p * params.totalElements + idx];
+  }
+  out[idx] = ${outputDtype === "f16" ? `f16(sum * params.alpha)` : `sum * params.alpha`};
+}
+`;
+}
+
+/**
+ * Generate a cache key for a K-split reduction shader.
+ */
+export function getKSplitReductionCacheKey(kSplitCount: number, outputDtype: DType): string {
+  return `ksplit_reduce_${kSplitCount}_${outputDtype}`;
 }

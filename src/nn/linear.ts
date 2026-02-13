@@ -78,21 +78,7 @@ export class Linear extends Module {
    * @returns Output tensor of shape [..., outFeatures]
    */
   forward(input: Tensor): Tensor {
-    // input: [..., inFeatures]
-    // weight: [outFeatures, inFeatures]
-    // weight.T: [inFeatures, outFeatures]
-    // output = input @ weight.T: [..., outFeatures]
-
-    // Transpose creates a strided view; the backend detects this and handles it
-    // natively via a flipped transpose flag (no contiguous materialization needed).
-    const weightT = this.weight.transpose({ dim0: 0, dim1: 1 });
-    let output = input.matmul(weightT);
-
-    if (this.bias !== null) {
-      output = this.api.add(output, this.bias);
-    }
-
-    return output;
+    return this.api.linear(input, this.weight, this.bias);
   }
 
   /**

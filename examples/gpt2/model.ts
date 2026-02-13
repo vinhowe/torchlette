@@ -454,15 +454,10 @@ export class GPT2 extends Module {
     x = this.lnF.forward(x);
 
     // LM head: project to vocabulary (weight tied with token embeddings)
-    // logits = x @ wte.weight^T
-    // x: [batch, seqLen, embedDim]
-    // wte.weight: [vocabSize, embedDim]
-    // wte.weight^T: [embedDim, vocabSize]
-    // logits: [batch, seqLen, vocabSize]
-    // detectSimpleTranspose() in matmul handles the transposed weight natively
-    const logits = x.matmul(
-      this.wte.weight.transpose({ dim0: 0, dim1: 1 }),
-    );
+    // logits = x @ wte.weight^T  (using linear() for optimized backward)
+    // linear() backward computes dW = dY^T @ X directly in weight's shape,
+    // avoiding an explicit transpose that would prevent epilogue fusion.
+    const logits = this.api.linear(x, this.wte.weight, null);
 
     // Compute loss if targets provided
     let loss: Tensor | null = null;

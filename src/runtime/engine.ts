@@ -14,6 +14,7 @@ import {
   type ScatterAddOptions,
   type StridedScatterOptions,
   type FusedCrossEntropyConfig,
+  type FusedLayerNormConfig,
   type SubOptions,
   type SumOptions,
   type TransposeOptions,
@@ -35,7 +36,10 @@ import {
   type LazyRef,
   type OptimizedExecutionStats,
   storageTracker,
+  executeLoweredPlan,
+  getFusionAnalysisTemplate,
 } from "../engine/lazy";
+import { computePlanFingerprint } from "../engine/fusion-detect";
 import { OP_DTYPE_RULES, promoteDtype } from "../engine/dtype-rules";
 import {
   executeWithMemoryPlanning,
@@ -102,6 +106,7 @@ export class RuntimeEngine {
   private earlyReleaseEnabled = false;
   private checkpointSegmentationEnabled = false;
   private trueSegmentationEnabled = false;
+  private _webgpuFlushBufferPool: (() => void) | null = null;
 
   /**
    * Tracking scope for intermediate tensors created during backward pass.
@@ -425,6 +430,13 @@ export class RuntimeEngine {
     const plan = buildPlan(lazyRef.node);
     const backend = this.getBackend(tensor.device);
 
+    // --- Lowered Plan Fast-Path ---
+    // Try cached lowered execution plan first.
+    if (tensor.device === "webgpu" && this.fusionEnabled) {
+      const executed = await this.tryLoweredPlanExecution(plan, [tensor], tensor.device);
+      if (executed) return;
+    }
+
     // Get buffer pool flush function for checkpoint segmentation
     const flushBufferPool = this.getBufferPoolFlushFn(tensor.device);
 
@@ -501,16 +513,138 @@ export class RuntimeEngine {
    */
   private getBufferPoolFlushFn(device: DeviceKind): () => void {
     if (device === "webgpu") {
-      // Dynamically import to avoid circular dependencies
+      if (this._webgpuFlushBufferPool) return this._webgpuFlushBufferPool;
       try {
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const webgpu = require("../backend/webgpu");
-        return webgpu.flushBufferPool ?? (() => {});
+        this._webgpuFlushBufferPool = webgpu.flushBufferPool ?? (() => {});
+        return this._webgpuFlushBufferPool!;
       } catch {
         return () => {};
       }
     }
     return () => {};
+  }
+
+  // --- Lowered Plan Execution ---
+
+  /**
+   * Try to execute a plan using a cached lowered execution plan.
+   * On cache hit with a lowered plan, executes the plan and materializes all
+   * tensors, returning true. On miss, returns false for fallback to normal execution.
+   */
+  private async tryLoweredPlanExecution(
+    plan: { nodes: LazyIRNode[] },
+    tensors: Tensor[],
+    device: DeviceKind,
+  ): Promise<boolean> {
+    // Need external node IDs for fingerprint computation
+    let externalNodeIds: Set<number> | undefined;
+    try {
+      const { getPendingNodeIds } = await import("./tensor");
+      const pending = getPendingNodeIds();
+      if (pending.size > 0) {
+        externalNodeIds = pending;
+      }
+    } catch {
+      // tensor module not available
+    }
+
+    const fingerprint = computePlanFingerprint(plan.nodes, externalNodeIds);
+    const template = getFusionAnalysisTemplate(fingerprint);
+    if (!template?.loweredPlan) {
+      return false;
+    }
+
+    // Validate plan node count
+    if (plan.nodes.length !== template.finalPerm.length) {
+      return false;
+    }
+
+    // Reconstruct reordered plan nodes from template
+    const planNodes = template.finalPerm.map(i => plan.nodes[i]);
+
+    const backend = this.getBackend(device);
+
+    // Get or create buffer arena for this plan (persists across steps).
+    // Arena stabilizes buffer identities for bind group cache hits.
+    const useArena = process.env.TORCHLETTE_USE_ARENA !== "0";
+    if (useArena && !template.bufferArena) {
+      template.bufferArena = { resolve: [], alloc: [] };
+    }
+
+    // Save dispatch sequence counters before attempting lowered plan execution.
+    // If the lowered plan fails, we restore them so the fallback executePlanOptimized
+    // starts at the same dispatch position — preserving bind group cache alignment.
+    let savedCounters: { dispatch: number; params: number; output: number } | undefined;
+    if (device === "webgpu") {
+      try {
+        const { getDispatchSequenceCounters } = await import("../backend/webgpu/index");
+        savedCounters = getDispatchSequenceCounters();
+      } catch { /* non-WebGPU runtime */ }
+    }
+
+    try {
+      const { result, stats: loweredStats } = await executeLoweredPlan(
+        plan as { nodes: LazyIRNode[] },
+        planNodes,
+        template.loweredPlan,
+        backend,
+        {
+          enableEarlyRelease: this.earlyReleaseEnabled,
+          enableVectorization: this.vectorizationEnabled,
+          bufferArena: useArena ? template.bufferArena : undefined,
+        },
+      );
+
+      // Update fusion stats for consistency with normal execution path
+      this.lastFusionStats = loweredStats;
+      this.accumulateFusionStats(loweredStats);
+
+      // Materialize ALL tensors that were pending on executed nodes
+      const { materializePendingTensors: materialize } = await import("./tensor");
+      for (const node of plan.nodes) {
+        if (node.result) {
+          materialize(node.id, node.result);
+        }
+      }
+
+      // Materialize the primary tensors
+      for (const tensor of tensors) {
+        if (!tensor.isMaterialized() && !tensor.disposed) {
+          const lazyRef = tensor.lazyRef;
+          if (lazyRef.kind === "pending" && lazyRef.node.result) {
+            tensor._materialize(lazyRef.node.result);
+          }
+        }
+      }
+
+      // Drop node.result references to allow GC
+      for (const node of plan.nodes) {
+        node.result = undefined;
+      }
+
+      return true;
+    } catch (err) {
+      // Lowered plan execution failed — clean up and fall through.
+      // Disable lowered plan for this fingerprint so we don't retry every step.
+      // The template's bufferArena is preserved so executePlanOptimized can use it.
+      template.loweredPlan = undefined;
+
+      // Restore dispatch sequence counters so the fallback executePlanOptimized
+      // starts at the same position, keeping bind group cache indices aligned.
+      if (savedCounters && device === "webgpu") {
+        try {
+          const { setDispatchSequenceCounters } = await import("../backend/webgpu/index");
+          setDispatchSequenceCounters(savedCounters.dispatch, savedCounters.params, savedCounters.output);
+        } catch { /* non-WebGPU runtime */ }
+      }
+
+      for (const node of plan.nodes) {
+        node.result = undefined;
+      }
+      return false;
+    }
   }
 
   /**
@@ -556,6 +690,12 @@ export class RuntimeEngine {
         device = tensor.device;
         break;
       }
+    }
+
+    // Lowered plan fast-path for forceAllMerged
+    if (device === "webgpu" && this.fusionEnabled) {
+      const executed = await this.tryLoweredPlanExecution(plan, tensors, device);
+      if (executed) return;
     }
 
     const backend = this.getBackend(device);
@@ -686,6 +826,24 @@ export class RuntimeEngine {
 
     // Snapshot storage ID before execution to scope cleanup of orphaned intermediates
     const storageSnapshot = storageTracker.getNextStorageId();
+
+    // Lowered plan fast-path for forceAllPending
+    if (device === "webgpu" && this.fusionEnabled) {
+      const executed = await this.tryLoweredPlanExecution(plan, pendingTensors, device);
+      if (executed) {
+        // Handle skipped nodes (already executed from prior force() calls)
+        for (const tensor of pendingTensors) {
+          if (!tensor.isMaterialized() && !tensor.disposed) {
+            const lazyRef = tensor.lazyRef;
+            if (lazyRef.kind === "pending" && lazyRef.node.result) {
+              tensor._materialize(lazyRef.node.result);
+            }
+          }
+        }
+        storageTracker.destroyUnreachableSince(storageSnapshot);
+        return;
+      }
+    }
 
     const backend = this.getBackend(device);
 
@@ -1762,6 +1920,84 @@ export class RuntimeEngine {
     );
     return this.createAndTrack(createBaseId(), createPendingRef(node), shape, logits.device);
   }
+
+  /**
+   * Fused LayerNorm forward: x [N,D] + weight [D] + bias [D] → output [N,D].
+   */
+  fusedLayerNormForward(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    config: FusedLayerNormConfig,
+  ): Tensor {
+    const node = createLazyIRNode(
+      "fusedLayerNormForward",
+      [x.lazyRef, weight.lazyRef, bias.lazyRef],
+      x.shape.slice(),
+      "f32",
+      x.device,
+      config,
+    );
+    return this.createAndTrack(createBaseId(), createPendingRef(node), x.shape.slice(), x.device);
+  }
+
+  /**
+   * Fused LayerNorm backward gradX: grad [N,D] + x [N,D] + weight [D] → gradX [N,D].
+   */
+  fusedLayerNormBackwardGradX(
+    gradOutput: Tensor,
+    x: Tensor,
+    weight: Tensor,
+    config: FusedLayerNormConfig,
+  ): Tensor {
+    const node = createLazyIRNode(
+      "fusedLayerNormBackwardGradX",
+      [gradOutput.lazyRef, x.lazyRef, weight.lazyRef],
+      x.shape.slice(),
+      "f32",
+      x.device,
+      config,
+    );
+    return this.createAndTrack(createBaseId(), createPendingRef(node), x.shape.slice(), x.device);
+  }
+
+  /**
+   * Fused LayerNorm backward gradWeight+gradBias.
+   * Returns gradWeight as main output. gradBias extracted via extractLnBwdGradBias.
+   */
+  fusedLayerNormBackwardGradWeightBias(
+    gradOutput: Tensor,
+    x: Tensor,
+    config: FusedLayerNormConfig,
+  ): Tensor {
+    const shape = [config.featureDim];
+    const node = createLazyIRNode(
+      "fusedLayerNormBackwardGradWeightBias",
+      [gradOutput.lazyRef, x.lazyRef],
+      shape,
+      "f32",
+      gradOutput.device,
+      config,
+    );
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, gradOutput.device);
+  }
+
+  /**
+   * Extract the gradBias side output from a fusedLayerNormBackwardGradWeightBias node.
+   */
+  extractLnBwdGradBias(gradWeight: Tensor, featureDim: number): Tensor {
+    const shape = [featureDim];
+    const node = createLazyIRNode(
+      "extractLnBwdGradBias",
+      [gradWeight.lazyRef],
+      shape,
+      "f32",
+      gradWeight.device,
+      { featureDim },
+    );
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, gradWeight.device);
+  }
+
 }
 
 export const defaultEngine = new RuntimeEngine();

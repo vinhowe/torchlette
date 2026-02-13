@@ -1,5 +1,6 @@
 import type { DType } from "../backend/types";
 import type { IRGraph } from "./ir";
+import { canonicalizeF64Bits } from "./scalar";
 
 /**
  * Input signature for cache key generation.
@@ -38,12 +39,19 @@ export type CompiledCacheEntry = {
  * - Operation types and their order
  * - Data flow (which nodes connect to which)
  * - Shapes and dtypes
+ * - Scalar constant values per §8.2.1 (when provided)
  *
  * It does NOT include:
  * - Node IDs (which are runtime-specific)
  * - Epoch numbers (which vary per call)
+ *
+ * @param graph - The IR graph to hash
+ * @param scalarsByNode - Optional map of node ID → scalar input values.
+ *   When provided, overrides node.scalarValues. When omitted, uses
+ *   node.scalarValues if present. Backward compatible: omitting produces
+ *   the same hash as before for graphs without scalarValues.
  */
-export function hashIRGraph(graph: IRGraph): string {
+export function hashIRGraph(graph: IRGraph, scalarsByNode?: Map<number, number[]>): string {
   // Build a normalized representation
   // Map original node IDs to canonical indices (0, 1, 2, ...)
   const idToIndex = new Map<number, number>();
@@ -64,7 +72,16 @@ export function hashIRGraph(graph: IRGraph): string {
     // Build node signature: op[inputs](shape,dtype)
     const shapePart = node.shape ? node.shape.join("x") : "?";
     const dtypePart = node.dtype ?? "?";
-    const nodeSig = `${node.op}[${normalizedInputs.join(",")}](${shapePart},${dtypePart})`;
+    let nodeSig = `${node.op}[${normalizedInputs.join(",")}](${shapePart},${dtypePart})`;
+
+    // Add scalar values to signature per §8.2.1
+    // Prefer explicit scalarsByNode map, fall back to node.scalarValues
+    const nodeScalars = scalarsByNode?.get(node.id) ?? node.scalarValues;
+    if (nodeScalars && nodeScalars.length > 0) {
+      const scalarParts = nodeScalars.map(v => canonicalizeF64Bits(v).toString(16));
+      nodeSig += `{${scalarParts.join(",")}}`;
+    }
+
     parts.push(nodeSig);
   }
 
@@ -116,10 +133,13 @@ export function extractInputSignatures(graph: IRGraph): InputSignature[] {
 
 /**
  * Generate a full cache key for a compiled graph.
+ *
+ * @param graph - The IR graph
+ * @param scalarsByNode - Optional map of node ID → scalar input values (§8.2.1)
  */
-export function generateCacheKey(graph: IRGraph): CompiledCacheKey {
+export function generateCacheKey(graph: IRGraph, scalarsByNode?: Map<number, number[]>): CompiledCacheKey {
   return {
-    irHash: hashIRGraph(graph),
+    irHash: hashIRGraph(graph, scalarsByNode),
     inputSignatures: extractInputSignatures(graph),
   };
 }
