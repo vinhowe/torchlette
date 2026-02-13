@@ -906,9 +906,13 @@ function extractMatmulShapes(plan: ExecutionPlan): Array<[number, number, number
   return shapes;
 }
 
+/** Cache of already-pretuned matmul shape signatures. */
+const pretunedShapeSignatures = new Set<string>();
+
 /**
  * Pre-tune matmul shapes before plan execution.
  * Only runs if the backend supports pretuning.
+ * Caches tuned shape signatures to skip redundant pretune calls on subsequent steps.
  */
 export async function pretunePlanMatmuls(
   plan: ExecutionPlan,
@@ -919,8 +923,16 @@ export async function pretunePlanMatmuls(
   }
 
   const shapes = extractMatmulShapes(plan);
-  if (shapes.length > 0) {
-    await backend.pretuneMatmulShapes(shapes);
+  // Filter to only shapes not yet pretuned
+  const untunedShapes = shapes.filter(s => {
+    const sig = `${s[0]},${s[1]},${s[2]}`;
+    return !pretunedShapeSignatures.has(sig);
+  });
+  if (untunedShapes.length === 0) return;
+
+  await backend.pretuneMatmulShapes(untunedShapes);
+  for (const s of untunedShapes) {
+    pretunedShapeSignatures.add(`${s[0]},${s[1]},${s[2]}`);
   }
 }
 
@@ -3004,9 +3016,9 @@ export async function executeLoweredPlan(
   };
 
   const useTopLevelSharedEncoder = backend.name === "webgpu";
-  // Dispatch replay cache: disabled by default due to data source buffer
-  // identity issues (replayed bind groups reference stale data source buffers).
-  // Enable with TORCHLETTE_DISPATCH_REPLAY=1 for plans without data sources.
+  // Dispatch replay cache: opt-in. Arena stabilizes storage buffer identities,
+  // but uniform/params buffers in recorded bind groups can be destroyed between
+  // steps (not all are sequence-pinned). Enable with TORCHLETTE_DISPATCH_REPLAY=1.
   const useReplayCache = process.env.TORCHLETTE_DISPATCH_REPLAY === "1";
 
   // =========================================================================
@@ -3021,12 +3033,22 @@ export async function executeLoweredPlan(
     setActiveArena(options.bufferArena);
 
     try {
+      // Batch consecutive dispatch entries for efficient replay
+      const dispatchBatch: RecordedDispatch[] = [];
+      const flushDispatchBatch = () => {
+        if (dispatchBatch.length > 0) {
+          replayDispatches(dispatchBatch);
+          dispatchBatch.length = 0;
+        }
+      };
+
       for (const entry of cache.entries) {
         switch (entry.kind) {
           case "dispatch":
-            replayDispatches([entry.dispatch]);
+            dispatchBatch.push(entry.dispatch);
             break;
           case "data-source": {
+            flushDispatchBatch();
             const dsNode = planNodes[entry.nodeIndex];
             if (dsNode.result) break;
             const dsBackend = getBackend(dsNode.device) ?? backend;
@@ -3038,6 +3060,7 @@ export async function executeLoweredPlan(
           }
           case "view":
           case "sequential": {
+            flushDispatchBatch();
             const node = planNodes[entry.nodeIndex];
             if (node.result) break;
             const nodeBackend = getBackend(node.device) ?? backend;
@@ -3056,6 +3079,7 @@ export async function executeLoweredPlan(
             break;
           }
           case "adam-batch": {
+            flushDispatchBatch();
             flushSharedEncoder();
             flushBufferPool();
             // Set sequence counters so adam dispatches hit the correct cache positions
@@ -3110,14 +3134,19 @@ export async function executeLoweredPlan(
             break;
           }
           case "reclaim":
+            // During replay, flush encoder to submit pending dispatches but
+            // skip pool reclamation — arena buffers are persistent.
+            flushDispatchBatch();
             flushSharedEncoder();
-            flushBufferPool();
             break;
           case "pre-adam-reclaim":
+            flushDispatchBatch();
+            // Still need pre-adam flush for Adam's flushSharedEncoder requirement
             flushSharedEncoder();
             flushBufferPool();
             break;
           case "result": {
+            flushDispatchBatch();
             // Assign node result from cached metadata (arena buffers are stable).
             // Arena buffers persist across steps — ownsBuffer: false, no-op destroy.
             const nr = entry.nodeResult;
@@ -3139,6 +3168,7 @@ export async function executeLoweredPlan(
           }
         }
       }
+      flushDispatchBatch(); // Flush remaining batched dispatches
     } finally {
       clearActiveArena();
       if (useTopLevelSharedEncoder) endSharedEncoder();
@@ -3696,40 +3726,27 @@ export async function executeLoweredPlan(
                 recordingDispatchIdx++;
               }
             } else {
-              // Check if this sequential op consumes data source outputs
-              // (directly or through a view chain). These ops' bind groups
-              // reference data source buffers which change each step.
-              const consumesDataSource = node.inputs.some(inp => {
-                if (inp.kind !== "pending") return false;
-                const srcNode = inp.node;
-                return isDataSourceOp(srcNode.op) || isViewOp(srcNode.op);
-              });
-
-              if (consumesDataSource) {
-                // Must re-execute this op during replay (stale bind group buffers)
-                replayEntries.push({ kind: "sequential", nodeIndex: nodeIdx });
-                while (recordingDispatchIdx < recordingBuffer.length) {
-                  recordingDispatchIdx++;
-                }
-              } else {
-                // Safe to replay: capture dispatches
-                while (recordingDispatchIdx < recordingBuffer.length) {
-                  replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
-                  recordingDispatchIdx++;
-                }
-                // Record node result (inline for ordering)
-                if (node.result) {
-                  const bt = node.result.backendTensor as any;
-                  replayEntries.push({ kind: "result", nodeResult: {
-                    nodeIndex: nodeIdx,
-                    buffer: bt.buffer,
-                    shape: bt.shape?.slice() ?? [],
-                    dtype: bt.dtype ?? "f32",
-                    size: bt.size ?? 0,
-                    strides: bt.strides?.slice() ?? [],
-                    isView: isView,
-                  }});
-                }
+              // With arena active, all buffer identities are stable (arena returns
+              // same GPUBuffer object on subsequent steps). Data-source-consuming
+              // ops can be safely replayed — their bind groups reference arena
+              // buffers that don't change identity.
+              // Safe to replay: capture dispatches
+              while (recordingDispatchIdx < recordingBuffer.length) {
+                replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
+                recordingDispatchIdx++;
+              }
+              // Record node result (inline for ordering)
+              if (node.result) {
+                const bt = node.result.backendTensor as any;
+                replayEntries.push({ kind: "result", nodeResult: {
+                  nodeIndex: nodeIdx,
+                  buffer: bt.buffer,
+                  shape: bt.shape?.slice() ?? [],
+                  dtype: bt.dtype ?? "f32",
+                  size: bt.size ?? 0,
+                  strides: bt.strides?.slice() ?? [],
+                  isView: isView,
+                }});
               }
             }
           }

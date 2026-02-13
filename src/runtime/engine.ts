@@ -108,6 +108,9 @@ export class RuntimeEngine {
   private trueSegmentationEnabled = false;
   private _webgpuFlushBufferPool: (() => void) | null = null;
 
+  /** Cache plan fingerprints by cheap structural key to avoid O(N) hashing. */
+  private planFingerprintCache = new Map<string, number>();
+
   /**
    * Tracking scope for intermediate tensors created during backward pass.
    * When non-null, all tensors created by RuntimeEngine ops are tracked here.
@@ -538,19 +541,25 @@ export class RuntimeEngine {
     tensors: Tensor[],
     device: DeviceKind,
   ): Promise<boolean> {
-    // Need external node IDs for fingerprint computation
-    let externalNodeIds: Set<number> | undefined;
-    try {
-      const { getPendingNodeIds } = await import("./tensor");
-      const pending = getPendingNodeIds();
-      if (pending.size > 0) {
-        externalNodeIds = pending;
+    // Quick structural key for fingerprint cache lookup
+    const structKey = `${plan.nodes.length}:${plan.nodes[plan.nodes.length - 1].op}`;
+    let fingerprint = this.planFingerprintCache.get(structKey);
+
+    if (fingerprint === undefined) {
+      // First time — compute full O(N) fingerprint
+      let externalNodeIds: Set<number> | undefined;
+      try {
+        const { getPendingNodeIds } = await import("./tensor");
+        const pending = getPendingNodeIds();
+        if (pending.size > 0) {
+          externalNodeIds = pending;
+        }
+      } catch {
+        // tensor module not available
       }
-    } catch {
-      // tensor module not available
+      fingerprint = computePlanFingerprint(plan.nodes, externalNodeIds);
     }
 
-    const fingerprint = computePlanFingerprint(plan.nodes, externalNodeIds);
     const template = getFusionAnalysisTemplate(fingerprint);
     if (!template?.loweredPlan) {
       return false;
@@ -618,6 +627,9 @@ export class RuntimeEngine {
           }
         }
       }
+
+      // Cache fingerprint for this structural key on success
+      this.planFingerprintCache.set(structKey, fingerprint);
 
       // Drop node.result references to allow GC
       for (const node of plan.nodes) {
