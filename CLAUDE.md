@@ -79,15 +79,15 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
 
 1. **Wall clock** — Per-step timings from the WALL CLOCK SUMMARY table. Steady-state = avg of steps 2-4. Step 0 is pipeline warmup (expect 8-10x slower). Breakdown: forward, backward, optimizer, cleanup as % of total.
 
-2. **GPU time budget** — From the Phase table (`Phase | Ops | CPU(ms) | GPU(ms)`). Sum GPU(ms) across forward+backward+cleanup for total GPU time. **GPU utilization = total_GPU / wall_clock**. Current baseline: ~35% utilization (27ms GPU / 78ms wall).
+2. **GPU time budget** — From the Phase table (`Phase | Ops | CPU(ms) | GPU(ms)`). Sum GPU(ms) across forward+backward+cleanup for total GPU time. **GPU utilization = total_GPU / wall_clock**. Current baseline: ~40% utilization (27ms GPU / 68ms wall).
 
-3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). Current top offenders: `matmul` (7.3ms, 27%), `adamStep` (5.4ms, 20%), `matmul++cast+bias+binary` (4.6ms, 17%), `fusedLayerNormBackwardGradWeightBias` (1.7ms, 6%), `matmul++cast+bias` (1.7ms, 6%), `fused` (1.0ms, 4%), `sum` (0.8ms, 3%), `add` (0.8ms, 3%), `matmul++cast` (0.7ms, 3%).
+3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). Current top offenders: `matmul` (7.5ms, 28%), `adamStep` (5.4ms, 20%), `matmul++cast+bias+binary` (4.5ms, 17%), `fusedLayerNormBackwardGradWeightBias` (1.7ms, 6%), `matmul++cast+bias` (1.7ms, 6%), `fused` (1.0ms, 4%), `sum` (0.8ms, 3%), `add` (0.8ms, 3%), `matmul++cast` (0.7ms, 3%).
 
-4. **Cross-entropy** — Fused kernel implemented. Now 0.4ms/0.6% of GPU time (down from 34ms/31%). No longer a bottleneck.
+4. **Cross-entropy** — Fused kernel implemented. Now 0.4ms/1.4% of GPU time (down from 34ms/31%). No longer a bottleneck.
 
 5. **CPU dispatch overhead** — From `CPU API Call` table. Bind group cache at 92.7% (38 misses). 12 submits/step.
 
-6. **Fusion rate** — From Plan Analysis. Total: 1161 nodes, 318 fused (27.4%), 78 fusion groups, 717 sequential. Note: fused LayerNorm/cross-entropy ops replace ~9 decomposed ops each, so effective fusion is higher than the raw percentage. Key unfused ops: 69 `cast` ops (f32↔f16), 37 `add` ops, 37 `matmul` ops.
+6. **Fusion rate** — From Plan Analysis. Total: 1031 nodes, 240 fused (23.3%), 52 fusion groups, 665 sequential. Note: fused LayerNorm/cross-entropy ops replace ~9 decomposed ops each, so effective fusion is higher than the raw percentage. Key unfused ops: 69 `cast` ops (f32↔f16), 39 `reshape` ops, 37 `add` ops, 37 `matmul` ops.
 
 7. **Memory** — From Memory Stats section. Track: current/peak MB, buffer pool reuse rate (should be ~77%+), allocation histogram. No NaN values = working correctly.
 
@@ -476,7 +476,7 @@ Why: Within a step, multiple plan executions share the same encoder scope (forwa
 
 ## Remaining Performance Optimizations
 
-Profiled on DistilGPT-2 training (steady-state ~78ms/step, 12 submits/step, 27ms GPU, 35% GPU utilization). Targets ranked by impact:
+Profiled on DistilGPT-2 training (steady-state ~68ms/step, 12 submits/step, 27ms GPU, 40% GPU utilization). Targets ranked by impact:
 
 **Completed optimizations:**
 1. ~~**Intra-plan buffer reclamation**~~ — DONE. `createBuffer` avg cost dropped 365µs→81µs.
@@ -508,8 +508,8 @@ Profiled on DistilGPT-2 training (steady-state ~78ms/step, 12 submits/step, 27ms
 26. ~~**K-split matmul**~~ — DONE. For small-M backward matmuls (M=31) with large K, the output tile grid (12 workgroups) severely underutilizes the GPU. K-split divides K-reduction across P workgroups in the Z dimension: each Z-slice computes partial sums, then a lightweight reduction kernel sums them. Activated when `baseWorkgroups < 64 && K > 512 && batchSize == 1 && no epilogue`. 25 backward dX matmuls across all 6 transformer layers use K-split. Max matmul GPU: 11ms→1.4ms (−88%). Backward GPU: 28ms→12ms (−57%). Total GPU: 43ms→27ms (−37%). Submits: 14→12.
 
 **Open targets (ranked by estimated savings):**
-1. **GPU utilization gap** — 35% utilization (27ms GPU / 78ms wall). ~51ms of pure CPU overhead per step: Dawn API calls, plan management, GC. This is the meta-issue — every CPU-side ms saved directly reduces wall time.
-2. **Adam CPU overhead** — 4.4ms CPU for 5.1ms GPU work. `adam.dispatch` 1.4ms + `adam.configBuf` 0.9ms + `adam.createTensor` 0.6ms. Further reduction possible by caching config buffers.
-3. **Dispatch replay cache** — Infrastructure implemented, opt-in (`TORCHLETTE_DISPATCH_REPLAY=1`). Buffer pinning fix resolves Dawn validation errors (pin checks in all destroy paths including `destroyArena`/`arenaAllocAt`). Shows ~25% wall-clock improvement (42ms vs 56ms steady-state, f32 mode). **Known issue**: loss divergence on DistilGPT-2 after ~5 replay steps — loss plateaus at ~2.8 instead of continuing to decrease. Works correctly on small models (1-layer char GPT). Root cause likely stale buffer content in backward pass replay for multi-plan interactions. Needs further investigation before enabling by default.
-4. **Pipeline cache warmup** — Step 0 is 3.5s (40x steady-state) due to pipeline compilation. Pre-compile pipeline variants during model load.
-5. **GC pressure** — Object pooling for Tensor metadata to reduce garbage collection overhead. ~2-3ms/step potential.
+1. **GPU utilization gap** — 40% utilization (27ms GPU / 68ms wall). ~41ms of pure CPU overhead per step: Dawn API calls, plan management, GC. This is the meta-issue — every CPU-side ms saved directly reduces wall time.
+2. **Dispatch replay cache** — Infrastructure implemented, opt-in (`TORCHLETTE_DISPATCH_REPLAY=1`). Buffer pinning fix resolves Dawn validation errors (pin checks in all destroy paths including `destroyArena`/`arenaAllocAt`). Shows ~25% wall-clock improvement (42ms vs 56ms steady-state, f32 mode). **Known issue**: loss divergence on DistilGPT-2 after ~5 replay steps — loss plateaus at ~2.8 instead of continuing to decrease. Works correctly on small models (1-layer char GPT). Root cause likely stale buffer content in backward pass replay for multi-plan interactions. Needs further investigation before enabling by default.
+3. **Adam CPU overhead** — 4.5ms CPU for 5.4ms GPU work. `adam.dispatch` 1.6ms + `adam.configBuf` 0.9ms + `adam.createTensor` 0.5ms. Further reduction possible by caching config buffers.
+4. **GC pressure** — 3.4% of CPU profiler self-time. Object pooling for Tensor metadata to reduce garbage collection overhead. ~2-3ms/step potential.
+5. **Pipeline cache warmup** — Step 0 is 3.3s (49x steady-state) due to pipeline compilation. Pre-compile pipeline variants during model load.
