@@ -655,6 +655,7 @@ export class Torchlette {
       enableTrueSegmentation: options?.enableTrueSegmentation ?? false,
     });
     this.autocastContext = createAutocastContext();
+
   }
 
   /**
@@ -1318,6 +1319,66 @@ export class Torchlette {
     );
   }
 
+  /**
+   * Linear transformation: Y = input @ weight.T + bias
+   * Custom backward computes dW = dY.T @ X directly in weight's shape,
+   * eliminating the transpose op that generic matmul backward would produce.
+   */
+  linear(input: Tensor, weight: Tensor, bias: Tensor | null = null): Tensor {
+    this.assertUsable(input, weight);
+    if (bias) this.assertUsable(bias);
+    const [castInput, castWeight] = this._applyAutocast("matmul", [input, weight]) as [Tensor, Tensor];
+
+    // Forward: Y = input @ weight.T (+ bias)
+    const wT = this.runtime.transpose(castWeight._unwrap(), {
+      dim0: castWeight.shape.length - 2, dim1: castWeight.shape.length - 1,
+    });
+    let inner = this.runtime.matmul(castInput._unwrap(), wT);
+    wT.dispose();
+    if (bias) {
+      const added = this.runtime.add(inner, bias._unwrap());
+      inner.dispose();
+      inner = added;
+    }
+
+    const inputShape = input.shape;
+    const weightShape = weight.shape;
+    const allInputs = bias ? [input, weight, bias] : [input, weight];
+    const tensorsToSave = (input.requiresGrad || weight.requiresGrad)
+      ? (bias ? [castInput, castWeight, bias] : [castInput, castWeight]) : [];
+
+    return this.wrapWithGrad(inner, allInputs, (grad, getSaved) => {
+      if (inputShape.length < 2 || weightShape.length < 2)
+        throw new Error("linear backward requires rank >= 2");
+      const savedInput = getSaved(0)._unwrap();
+      const savedWeight = getSaved(1)._unwrap();
+
+      // dX = dY @ W  (weight is [out, in], so dY @ W = [..., out] @ [out, in] = [..., in])
+      const gradInput = this.runtime.matmul(grad, savedWeight);
+      const resultInput = this.sumToShape(gradInput, inputShape);
+
+      // dW = dY^T @ X → [out, in] = weight's shape directly (no transpose needed!)
+      const gradT = this.runtime.transpose(grad, {
+        dim0: grad.shape.length - 2, dim1: grad.shape.length - 1,
+      });
+      const gradWeight = this.runtime.matmul(gradT, savedInput);
+      const resultWeight = this.sumToShape(gradWeight, weightShape);
+
+      // dBias = sum(dY, all dims except last)
+      let resultBias: RuntimeTensor | null = null;
+      if (bias) {
+        const biasShape = getSaved(2).shape;
+        resultBias = this.sumToShape(grad, biasShape);
+      }
+
+      gradT.dispose();
+      if (resultInput !== gradInput) gradInput.dispose();
+      if (resultWeight !== gradWeight) gradWeight.dispose();
+
+      return bias ? [resultInput, resultWeight, resultBias!] : [resultInput, resultWeight];
+    }, tensorsToSave);
+  }
+
   sqrt(a: Tensor): Tensor {
     this.assertUsable(a);
     const inner = this.runtime.sqrt(a._unwrap());
@@ -1890,6 +1951,26 @@ export class Torchlette {
     const normalizedDim = dim < 0 ? dim + rank : dim;
     const lastDimSize = xShape[xShape.length - 1];
 
+    // Save inputs for backward
+    const tensorsToSave = x.requiresGrad || weight.requiresGrad || bias.requiresGrad
+      ? [x, weight, bias]
+      : [];
+
+    // Use fused forward kernel on WebGPU
+    if (x.device === "webgpu") {
+      const numRows = xShape.slice(0, rank - 1).reduce((a, b) => a * b, 1);
+      const config = { numRows, featureDim: lastDimSize, eps };
+      const result = this.runtime.fusedLayerNormForward(
+        x._unwrap(), weight._unwrap(), bias._unwrap(), config,
+      );
+
+      // Backward stays decomposed (recomputes forward from saved x, weight, bias)
+      return this.wrapWithGrad(result, [x, weight, bias], (grad, getSaved) => {
+        return this._layernormBackward(grad, getSaved, normalizedDim, lastDimSize, rank, eps);
+      }, tensorsToSave);
+    }
+
+    // CPU: decomposed forward
     // mean(x, dim=-1, keepdim=true)
     const meanResult = this.runtime.mean(x._unwrap(), { dim: normalizedDim, keepdim: true });
     if (typeof meanResult === "number") {
@@ -1918,11 +1999,6 @@ export class Torchlette {
     const result = this.runtime.add(scaled, bias._unwrap());
 
     // Dispose internal intermediates to remove them from pendingTensorsByNodeId.
-    // This allows the post-variance ops {add, sqrt, div, mul, add} to fuse into
-    // a single kernel instead of executing as 5 separate dispatches.
-    // The LazyIRNodes are NOT affected — only the pending Tensor tracking is removed.
-    // These intermediates are never accessed outside layernorm() and backward
-    // recomputes them from saved [x, weight, bias].
     meanResult.dispose();
     centered.dispose();
     centeredSq.dispose();
@@ -1932,17 +2008,44 @@ export class Torchlette {
     normalized.dispose();
     scaled.dispose();
 
-    // Save inputs for backward
-    const tensorsToSave = x.requiresGrad || weight.requiresGrad || bias.requiresGrad
-      ? [x, weight, bias]
-      : [];
-
     // Autograd - recompute intermediates from saved inputs for checkpointing support
     return this.wrapWithGrad(result, [x, weight, bias], (grad, getSaved) => {
-      const savedX = getSaved(0);
-      const savedWeight = getSaved(1);
+      return this._layernormBackward(grad, getSaved, normalizedDim, lastDimSize, rank, eps);
+    }, tensorsToSave);
+  }
 
-      // Recompute forward intermediates
+  /** Shared backward for LayerNorm. Uses fused gradX kernel on WebGPU. */
+  private _layernormBackward(
+    grad: RuntimeTensor,
+    getSaved: (i: number) => Tensor,
+    normalizedDim: number,
+    lastDimSize: number,
+    rank: number,
+    eps = 1e-5,
+  ): RuntimeTensor[] {
+    const savedX = getSaved(0);
+    const savedWeight = getSaved(1);
+
+    let gradWeight: RuntimeTensor;
+    let gradBias: RuntimeTensor;
+    let gradX: RuntimeTensor;
+
+    if (savedX.device === "webgpu") {
+      // Fully fused path: 2 dispatches total (gradX + gradWeightBias)
+      const numRows = savedX.shape.slice(0, rank - 1).reduce((a: number, b: number) => a * b, 1);
+      const config = { numRows, featureDim: lastDimSize, eps };
+
+      gradX = this.runtime.fusedLayerNormBackwardGradX(
+        grad, savedX._unwrap(), savedWeight._unwrap(), config,
+      );
+
+      const gradWeightTensor = this.runtime.fusedLayerNormBackwardGradWeightBias(
+        grad, savedX._unwrap(), config,
+      );
+      gradWeight = gradWeightTensor;
+      gradBias = this.runtime.extractLnBwdGradBias(gradWeightTensor, lastDimSize);
+    } else {
+      // CPU decomposed path
       const recomputeMean = this.runtime.mean(savedX._unwrap(), { dim: normalizedDim, keepdim: true });
       if (typeof recomputeMean === "number") {
         throw new Error("layernorm backward: mean should return tensor");
@@ -1957,36 +2060,32 @@ export class Torchlette {
       const recomputeStd = this.runtime.sqrt(recomputeVarPlusEps);
       const recomputeNormalized = this.runtime.div(recomputeCentered, recomputeStd);
 
-      // Sum over all dims except the last to match weight/bias shape
       const sumDims = Array.from({ length: rank - 1 }, (_, i) => i);
 
-      // grad_bias = sum(grad, dims except last)
-      let gradBias = grad;
+      let gradBiasReduced = grad;
       for (let i = sumDims.length - 1; i >= 0; i--) {
-        const sumResult = this.runtime.sum(gradBias, { dim: sumDims[i], keepdim: false });
+        const sumResult = this.runtime.sum(gradBiasReduced, { dim: sumDims[i], keepdim: false });
         if (typeof sumResult === "number") {
           throw new Error("layernorm backward: sum for gradBias should return tensor");
         }
-        gradBias = sumResult;
+        gradBiasReduced = sumResult;
       }
+      gradBias = gradBiasReduced;
 
-      // grad_weight = sum(grad * normalized, dims except last)
-      let gradWeight = this.runtime.mul(grad, recomputeNormalized);
+      let gradWeightReduced = this.runtime.mul(grad, recomputeNormalized);
       for (let i = sumDims.length - 1; i >= 0; i--) {
-        const sumResult = this.runtime.sum(gradWeight, { dim: sumDims[i], keepdim: false });
+        const sumResult = this.runtime.sum(gradWeightReduced, { dim: sumDims[i], keepdim: false });
         if (typeof sumResult === "number") {
           throw new Error("layernorm backward: sum for gradWeight should return tensor");
         }
-        gradWeight = sumResult;
+        gradWeightReduced = sumResult;
       }
+      gradWeight = gradWeightReduced;
 
-      // grad_normalized = grad * weight
+      // Decomposed gradX for CPU
       const gradNormalized = this.runtime.mul(grad, savedWeight._unwrap());
-
-      // grad_centered = grad_normalized / std
       const gradCentered = this.runtime.div(gradNormalized, recomputeStd);
 
-      // grad_variance = -0.5 * sum(grad_normalized * centered, dim=-1, keepdim=true) / (variance + eps)^1.5
       const gradNormCentered = this.runtime.mul(gradNormalized, recomputeCentered);
       const sumGradNormCentered = this.runtime.sum(gradNormCentered, { dim: normalizedDim, keepdim: true });
       if (typeof sumGradNormCentered === "number") {
@@ -1998,7 +2097,6 @@ export class Torchlette {
         this.runtime.div(sumGradNormCentered, varStd),
       );
 
-      // grad_centered from variance path: 2 * centered * grad_variance / n
       const gradCenteredFromVar = this.runtime.div(
         this.runtime.mul(
           this.runtime.mul(2, gradVariance),
@@ -2007,22 +2105,16 @@ export class Torchlette {
         lastDimSize,
       );
 
-      // Total grad_centered
       const totalGradCentered = this.runtime.add(gradCentered, gradCenteredFromVar);
-
-      // grad_mean = -sum(total_grad_centered, dim=-1, keepdim=true) / n
       const sumTotalGradCentered = this.runtime.sum(totalGradCentered, { dim: normalizedDim, keepdim: true });
       if (typeof sumTotalGradCentered === "number") {
         throw new Error("layernorm backward: sum should return tensor");
       }
       const gradMean = this.runtime.neg(this.runtime.div(sumTotalGradCentered, lastDimSize));
+      gradX = this.runtime.add(totalGradCentered, gradMean);
+    }
 
-      // grad_x = total_grad_centered + grad_mean
-      // Note: gradMean already has keepdim=true for broadcasting, no extra /n needed
-      const gradX = this.runtime.add(totalGradCentered, gradMean);
-
-      return [gradX, gradWeight, gradBias];
-    }, tensorsToSave);
+    return [gradX, gradWeight, gradBias];
   }
 
   async cpu(a: Tensor): Promise<number[]> {
@@ -2398,7 +2490,7 @@ export class Torchlette {
           let gradsIn: Array<RuntimeTensor | null>;
           try {
             gradsIn = node.backward(gradOutTensor, getSaved);
-          } catch (_e) {
+          } catch (_e: any) {
             this.runtime.stopIntermediateTracking();
             await this.runtime.force(gradOutTensor);
             this.runtime.startIntermediateTracking();

@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { Engine, TraceRecorder } from "../src/engine";
+import { hashIRGraph } from "../src/engine/compile-cache";
+import type { IRGraph, IRNode } from "../src/engine/ir";
 
 describe("compiled region caching", () => {
   let engine: Engine;
@@ -264,5 +266,186 @@ describe("compiled region caching", () => {
     expect(key1).not.toBeNull();
     expect(key2).not.toBeNull();
     expect(key1?.irHash).toBe(key2?.irHash);
+  });
+
+  it("different scalar values produce different cache keys", () => {
+    // Two compile calls with identical structure but different scalar constants
+    const compiled1 = engine.compile(() => {
+      const t1 = engine._debug_emitLazyOp("input", {
+        shape: [2, 3],
+        dtype: "f32",
+      });
+      const t2 = engine._debug_emitLazyOp("mul", {
+        inputs: [t1],
+        shape: [2, 3],
+        dtype: "f32",
+        scalarValues: [2.0],
+      });
+      return t2;
+    });
+
+    const compiled2 = engine.compile(() => {
+      const t1 = engine._debug_emitLazyOp("input", {
+        shape: [2, 3],
+        dtype: "f32",
+      });
+      const t2 = engine._debug_emitLazyOp("mul", {
+        inputs: [t1],
+        shape: [2, 3],
+        dtype: "f32",
+        scalarValues: [3.0],
+      });
+      return t2;
+    });
+
+    compiled1();
+    const key1 = engine._debug_getLastCacheKey();
+
+    compiled2();
+    const key2 = engine._debug_getLastCacheKey();
+
+    expect(key1).not.toBeNull();
+    expect(key2).not.toBeNull();
+    // Different scalar values → different irHash
+    expect(key1?.irHash).not.toBe(key2?.irHash);
+  });
+
+  it("same scalar values produce same cache keys", () => {
+    const compiled1 = engine.compile(() => {
+      const t1 = engine._debug_emitLazyOp("input", {
+        shape: [2, 3],
+        dtype: "f32",
+      });
+      const t2 = engine._debug_emitLazyOp("mul", {
+        inputs: [t1],
+        shape: [2, 3],
+        dtype: "f32",
+        scalarValues: [2.0],
+      });
+      return t2;
+    });
+
+    // First call
+    compiled1();
+    const key1 = engine._debug_getLastCacheKey();
+
+    // Second call with same scalar
+    compiled1();
+    const key2 = engine._debug_getLastCacheKey();
+
+    expect(key1).not.toBeNull();
+    expect(key2).not.toBeNull();
+    expect(key1?.irHash).toBe(key2?.irHash);
+    expect(engine._debug_wasLastCompileCacheHit()).toBe(true);
+  });
+});
+
+describe("scalar canonicalization in hashIRGraph (§8.2.1)", () => {
+  function makeGraph(nodes: IRNode[]): IRGraph {
+    return { epoch: 1, nodes, fusionGroups: [] };
+  }
+
+  it("different scalar values produce different hashes", () => {
+    const graph1 = makeGraph([
+      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [2, 3], dtype: "f32" },
+      { id: 1, op: "mul", epoch: 1, kind: "lazy_op", inputs: [0], shape: [2, 3], dtype: "f32", scalarValues: [2.0] },
+    ]);
+
+    const graph2 = makeGraph([
+      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [2, 3], dtype: "f32" },
+      { id: 1, op: "mul", epoch: 1, kind: "lazy_op", inputs: [0], shape: [2, 3], dtype: "f32", scalarValues: [3.0] },
+    ]);
+
+    expect(hashIRGraph(graph1)).not.toBe(hashIRGraph(graph2));
+  });
+
+  it("+0 vs -0 produces different hashes", () => {
+    const graphPos = makeGraph([
+      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [4], dtype: "f32" },
+      { id: 1, op: "add", epoch: 1, kind: "lazy_op", inputs: [0], shape: [4], dtype: "f32", scalarValues: [+0.0] },
+    ]);
+
+    const graphNeg = makeGraph([
+      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [4], dtype: "f32" },
+      { id: 1, op: "add", epoch: 1, kind: "lazy_op", inputs: [0], shape: [4], dtype: "f32", scalarValues: [-0.0] },
+    ]);
+
+    expect(hashIRGraph(graphPos)).not.toBe(hashIRGraph(graphNeg));
+  });
+
+  it("NaN canonicalization: different NaN payloads produce same hash", () => {
+    // Create different NaN values via typed array manipulation
+    const buf1 = new ArrayBuffer(8);
+    const view1 = new DataView(buf1);
+    view1.setUint32(0, 0x7ff80001, false); // quiet NaN with payload 1
+    const nan1 = view1.getFloat64(0, false);
+
+    const buf2 = new ArrayBuffer(8);
+    const view2 = new DataView(buf2);
+    view2.setUint32(0, 0x7ff80002, false); // quiet NaN with payload 2
+    const nan2 = view2.getFloat64(0, false);
+
+    // Both should be NaN but with different bit patterns
+    expect(Number.isNaN(nan1)).toBe(true);
+    expect(Number.isNaN(nan2)).toBe(true);
+
+    const graphNaN1 = makeGraph([
+      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [2], dtype: "f32" },
+      { id: 1, op: "mul", epoch: 1, kind: "lazy_op", inputs: [0], shape: [2], dtype: "f32", scalarValues: [nan1] },
+    ]);
+
+    const graphNaN2 = makeGraph([
+      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [2], dtype: "f32" },
+      { id: 1, op: "mul", epoch: 1, kind: "lazy_op", inputs: [0], shape: [2], dtype: "f32", scalarValues: [nan2] },
+    ]);
+
+    // Canonical NaN → same hash
+    expect(hashIRGraph(graphNaN1)).toBe(hashIRGraph(graphNaN2));
+  });
+
+  it("no scalars produces same hash as before (backward compatible)", () => {
+    const graph = makeGraph([
+      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [2, 3], dtype: "f32" },
+      { id: 1, op: "relu", epoch: 1, kind: "lazy_op", inputs: [0], shape: [2, 3], dtype: "f32" },
+    ]);
+
+    // Hash without scalarsByNode parameter
+    const hash1 = hashIRGraph(graph);
+    // Hash with empty scalarsByNode map
+    const hash2 = hashIRGraph(graph, new Map());
+    // Should be identical
+    expect(hash1).toBe(hash2);
+  });
+
+  it("scalarsByNode parameter overrides node.scalarValues", () => {
+    const graph = makeGraph([
+      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [2], dtype: "f32" },
+      { id: 1, op: "mul", epoch: 1, kind: "lazy_op", inputs: [0], shape: [2], dtype: "f32", scalarValues: [2.0] },
+    ]);
+
+    // Hash using node.scalarValues (2.0)
+    const hashFromNode = hashIRGraph(graph);
+
+    // Hash using scalarsByNode override (3.0)
+    const override = new Map<number, number[]>();
+    override.set(1, [3.0]);
+    const hashFromMap = hashIRGraph(graph, override);
+
+    // Should differ because scalar value is different
+    expect(hashFromNode).not.toBe(hashFromMap);
+  });
+
+  it("hash is deterministic across calls", () => {
+    const graph = makeGraph([
+      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [2, 3], dtype: "f32" },
+      { id: 1, op: "mul", epoch: 1, kind: "lazy_op", inputs: [0], shape: [2, 3], dtype: "f32", scalarValues: [42.5] },
+    ]);
+
+    const hash1 = hashIRGraph(graph);
+    const hash2 = hashIRGraph(graph);
+    const hash3 = hashIRGraph(graph);
+
+    expect(hash1).toBe(hash2);
+    expect(hash2).toBe(hash3);
   });
 });

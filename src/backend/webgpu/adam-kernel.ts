@@ -666,6 +666,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Config Buffer
 // ============================================================================
 
+// Pre-allocated typed arrays for config buffer construction.
+// Eliminates 228 short-lived allocations per step (76 calls × 3 arrays).
+const _configData32 = new ArrayBuffer(32);
+const _configF32_32 = new Float32Array(_configData32);
+const _configU32_32 = new Uint32Array(_configData32);
+const _configData48 = new ArrayBuffer(48);
+const _configF32_48 = new Float32Array(_configData48);
+const _configU32_48 = new Uint32Array(_configData48);
+
 function createConfigBuffer(
   device: GPUDevice,
   config: AdamStepConfig,
@@ -674,41 +683,33 @@ function createConfigBuffer(
 ): GPUBuffer {
   if (includeInvScale) {
     // 12 x f32/u32 = 48 bytes (padded to 16-byte alignment)
-    const data = new ArrayBuffer(48);
-    const f32 = new Float32Array(data);
-    const u32 = new Uint32Array(data);
+    _configF32_48[0] = config.beta1;
+    _configF32_48[1] = config.beta2;
+    _configF32_48[2] = config.stepSize;
+    _configF32_48[3] = config.eps;
+    _configF32_48[4] = config.weightDecay;
+    _configF32_48[5] = config.lrTimesWd;
+    _configU32_48[6] = config.decoupledWd ? 1 : 0;
+    _configU32_48[7] = numElements;
+    _configF32_48[8] = config.invScale ?? 1.0;
+    _configU32_48[9] = 0; // pad
+    _configU32_48[10] = 0; // pad
+    _configU32_48[11] = 0; // pad
 
-    f32[0] = config.beta1;
-    f32[1] = config.beta2;
-    f32[2] = config.stepSize;
-    f32[3] = config.eps;
-    f32[4] = config.weightDecay;
-    f32[5] = config.lrTimesWd;
-    u32[6] = config.decoupledWd ? 1 : 0;
-    u32[7] = numElements;
-    f32[8] = config.invScale ?? 1.0;
-    u32[9] = 0; // pad
-    u32[10] = 0; // pad
-    u32[11] = 0; // pad
-
-    return createParamsBuffer(device as any, u32);
+    return createParamsBuffer(device as any, _configU32_48);
   }
 
   // 8 x f32/u32 = 32 bytes (original layout)
-  const data = new ArrayBuffer(32);
-  const f32 = new Float32Array(data);
-  const u32 = new Uint32Array(data);
+  _configF32_32[0] = config.beta1;
+  _configF32_32[1] = config.beta2;
+  _configF32_32[2] = config.stepSize;
+  _configF32_32[3] = config.eps;
+  _configF32_32[4] = config.weightDecay;
+  _configF32_32[5] = config.lrTimesWd;
+  _configU32_32[6] = config.decoupledWd ? 1 : 0;
+  _configU32_32[7] = numElements;
 
-  f32[0] = config.beta1;
-  f32[1] = config.beta2;
-  f32[2] = config.stepSize;
-  f32[3] = config.eps;
-  f32[4] = config.weightDecay;
-  f32[5] = config.lrTimesWd;
-  u32[6] = config.decoupledWd ? 1 : 0;
-  u32[7] = numElements;
-
-  return createParamsBuffer(device as any, u32);
+  return createParamsBuffer(device as any, _configU32_32);
 }
 
 // ============================================================================

@@ -134,6 +134,18 @@ export function getDefaultConfigForShape(
         tileK: 16,
       };
 
+    case "small_k":
+      // Small K dimension with large output (e.g. lm_head backward dW: K=seq_len)
+      // tileK=32 covers K<=32 in single tile iteration; 64x64 output reduces workgroup count
+      return {
+        ...DEFAULT_CONFIG,
+        tileM: 64,
+        tileN: 64,
+        tileK: 32,
+        threadTileM: 8,
+        threadTileN: 8,
+      };
+
     case "gemv":
       // Vector operations - smaller tiles, more parallelism
       return {

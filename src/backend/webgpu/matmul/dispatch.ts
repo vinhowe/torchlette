@@ -2,13 +2,22 @@
  * Matmul dispatch: kernel selection, pipeline caching, and execution.
  */
 
-import { submitOrCollect, getSharedEncoderInstance, getCurrentOpLabel, createParamsBuffer as sharedCreateParamsBuffer, releaseParamsBuffer, cachedCreateBindGroup } from "../index";
+import { submitOrCollect, getSharedEncoderInstance, getCurrentOpLabel, createParamsBuffer as sharedCreateParamsBuffer, releaseParamsBuffer, cachedCreateBindGroup, type RecordedDispatch } from "../index";
+
+/** Module-level recording buffer (shared with index.ts recording system). */
+let matmulRecordingBuffer: RecordedDispatch[] | null = null;
+export function setMatmulRecordingBuffer(buf: RecordedDispatch[] | null): void {
+  matmulRecordingBuffer = buf;
+}
+
 import { profileApiCall, getTimestampWrites } from "../profiler";
 import {
   type CodegenOptions,
   type EpilogueConfig,
   generateTiledMatmulShader,
   getShaderCacheKey,
+  generateKSplitReductionShader,
+  getKSplitReductionCacheKey,
 } from "./codegen";
 import {
   classifyShape,
@@ -21,6 +30,7 @@ import {
   type ShapeClass,
   validateConfig,
 } from "./types";
+import { getDefaultConfigForShape } from "./autotune";
 import { autotune, type BenchmarkFn, cacheTuningResult } from "./autotune";
 
 // GPU types (matching index.ts)
@@ -148,7 +158,7 @@ export function getConfigForShape(
   if (cached) {
     return cached;
   }
-  return DEFAULT_CONFIG;
+  return getDefaultConfigForShape(shapeClass);
 }
 
 /**
@@ -194,9 +204,9 @@ async function autotuneIfNeeded(
     return cached;
   }
 
-  // Not in autotune mode - use default
+  // Not in autotune mode - use shape-specific default
   if (!isAutotuneEnabled()) {
-    return DEFAULT_CONFIG;
+    return getDefaultConfigForShape(shapeClass);
   }
 
   // Prevent recursive autotuning (autotune benchmarks call dispatchTiledMatmul)
@@ -495,6 +505,17 @@ function dispatchTiledMatmulInternal(options: DispatchMatmulOptions & { config: 
   const workgroupsY = Math.ceil(m / config.tileM);
   const workgroupsZ = batchSize;
 
+  // Record dispatch if recording is active
+  if (matmulRecordingBuffer) {
+    matmulRecordingBuffer.push({
+      pipeline: pipeline as any,
+      bindGroup: bindGroup as any,
+      workgroupsX,
+      workgroupsY,
+      workgroupsZ,
+    });
+  }
+
   // Encode and submit (batch/shared-encoder mode aware)
   const sharedEnc = getSharedEncoderInstance();
   const opLabel = getCurrentOpLabel() ?? "matmul";
@@ -520,10 +541,85 @@ function dispatchTiledMatmulInternal(options: DispatchMatmulOptions & { config: 
   releaseParamsBuffer(paramsBuffer as any);
 }
 
+// --- K-split infrastructure ---
+
+/** Cached temp buffers for K-split partial results, keyed by byte size. */
+const kSplitTempBufferCache = new Map<number, GPUBuffer>();
+
+/** Get or create a persistent temp buffer for K-split partials. */
+function getKSplitTempBuffer(device: GPUDevice, byteSize: number): GPUBuffer {
+  let buf = kSplitTempBufferCache.get(byteSize);
+  if (!buf) {
+    buf = device.createBuffer({
+      size: byteSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+    kSplitTempBufferCache.set(byteSize, buf);
+  }
+  return buf;
+}
+
+/** Pipeline cache for K-split reduction shaders. */
+const reductionPipelineCache = new Map<string, GPUComputePipeline>();
+
+/** Get or create a reduction pipeline. */
+function getOrCreateReductionPipeline(
+  device: GPUDevice,
+  kSplitCount: number,
+  outputDtype: DType,
+): GPUComputePipeline {
+  const cacheKey = getKSplitReductionCacheKey(kSplitCount, outputDtype);
+  const cached = reductionPipelineCache.get(cacheKey);
+  if (cached) return cached;
+
+  const shaderCode = generateKSplitReductionShader(kSplitCount, outputDtype);
+  const module = device.createShaderModule({ code: shaderCode });
+  const pipeline = device.createComputePipeline({
+    layout: "auto",
+    compute: { module, entryPoint: "main" },
+  });
+
+  reductionPipelineCache.set(cacheKey, pipeline);
+  return pipeline;
+}
+
+/** Minimum workgroups before considering K-split. */
+const KSPLIT_MIN_WORKGROUPS_THRESHOLD = 64;
+/** Minimum K dimension for K-split to be worthwhile. */
+const KSPLIT_MIN_K = 512;
+/** Target total workgroups after K-split. */
+const KSPLIT_TARGET_WORKGROUPS = 128;
+/** Maximum K-split factor. */
+const KSPLIT_MAX_FACTOR = 32;
+
+/**
+ * Determine K-split factor, or 0 if K-split is not beneficial.
+ */
+function computeKSplitFactor(
+  baseWorkgroups: number,
+  k: number,
+  tileK: number,
+  batchSize: number,
+  hasEpilogue: boolean,
+): number {
+  // K-split only for unbatched matmuls without epilogue
+  if (batchSize > 1 || hasEpilogue) return 0;
+  // Only when underutilizing GPU
+  if (baseWorkgroups >= KSPLIT_MIN_WORKGROUPS_THRESHOLD) return 0;
+  // Only when K is large enough to split
+  if (k < KSPLIT_MIN_K) return 0;
+
+  const desired = Math.ceil(KSPLIT_TARGET_WORKGROUPS / baseWorkgroups);
+  const maxByK = Math.floor(k / tileK); // each split needs at least tileK elements
+  return Math.min(desired, maxByK, KSPLIT_MAX_FACTOR);
+}
+
 /**
  * Dispatch a tiled matmul operation.
  *
  * This is the main entry point for executing matmul on WebGPU.
+ * Automatically uses K-split when the output tile grid is too small
+ * to saturate the GPU (e.g., small-M backward matmuls).
  */
 export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
   const {
@@ -558,17 +654,139 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
   const transposeMode = getTransposeMode(transA, transB);
 
   // Compute leading dimensions
-  // For non-transposed: lda = K (A is M x K), ldb = N (B is K x N)
-  // For transposed A: lda = M (A^T is K x M stored as M x K)
-  // For transposed B: ldb = K (B^T is N x K stored as K x N)
   const lda = transA ? m : k;
   const ldb = transB ? k : n;
   const ldc = n;
 
-  // Compute batch strides (0 means broadcast - same data for all batches)
+  // Compute batch strides
   const batchStrideA = options.batchStrideA ?? m * k;
   const batchStrideB = options.batchStrideB ?? k * n;
   const batchStrideC = options.batchStrideC ?? m * n;
+
+  // Compute base dispatch dimensions
+  const workgroupsX = Math.ceil(n / config.tileN);
+  const workgroupsY = Math.ceil(m / config.tileM);
+  const baseWorkgroups = workgroupsX * workgroupsY;
+
+  // Check if epilogue is non-trivial
+  const hasEpilogue = !!epilogue && epilogue.ops.length > 0 && epilogue.ops.some(op => op.kind !== "none");
+
+  // Determine K-split factor
+  const kSplitFactor = computeKSplitFactor(baseWorkgroups, k, config.tileK, batchSize, hasEpilogue);
+
+  if (kSplitFactor >= 2) {
+    // --- K-split path: two dispatches ---
+    const outputDtype = epilogue?.outputDtype ?? (dtype === "f32" || (dtypeB ?? dtype) === "f32" ? "f32" : dtype);
+
+    // 1. K-split matmul: partials[P * M * N] in f32
+    const totalElements = m * n;
+    const tempBytes = kSplitFactor * totalElements * 4; // always f32
+    const tempBuffer = getKSplitTempBuffer(device, tempBytes);
+
+    const kSplitCodegenOptions: CodegenOptions = {
+      config,
+      transposeMode,
+      dtype,
+      dtypeB,
+      batched: false,
+      inputCastA,
+      inputCastB,
+      kSplit: kSplitFactor,
+    };
+
+    const kSplitPipeline = getOrCreatePipeline(device, kSplitCodegenOptions);
+    const kSplitParamsData = packMatmulParams(m, n, k, lda, ldb, ldc, 1.0, 1, batchStrideA, batchStrideB, batchStrideC);
+    const kSplitParamsBuffer = sharedCreateParamsBuffer(device as any, kSplitParamsData);
+
+    const kSplitBgBuffers = [a, b, tempBuffer, kSplitParamsBuffer];
+    const kSplitBindGroup = cachedCreateBindGroup(device as any, kSplitPipeline as any, kSplitBgBuffers as any) as any;
+
+    // Record if recording
+    if (matmulRecordingBuffer) {
+      matmulRecordingBuffer.push({
+        pipeline: kSplitPipeline as any,
+        bindGroup: kSplitBindGroup as any,
+        workgroupsX,
+        workgroupsY,
+        workgroupsZ: kSplitFactor,
+      });
+    }
+
+    // Dispatch K-split matmul
+    const sharedEnc = getSharedEncoderInstance();
+    const opLabel = getCurrentOpLabel() ?? "matmul";
+    if (sharedEnc) {
+      const tsWrites = getTimestampWrites(opLabel);
+      const pass = sharedEnc.beginComputePass(tsWrites ? { timestampWrites: tsWrites } : undefined);
+      pass.setPipeline(kSplitPipeline);
+      pass.setBindGroup(0, kSplitBindGroup);
+      pass.dispatchWorkgroups(workgroupsX, workgroupsY, kSplitFactor);
+      pass.end();
+    } else {
+      const encoder = device.createCommandEncoder();
+      const tsWrites = getTimestampWrites(opLabel);
+      const pass = encoder.beginComputePass(tsWrites ? { timestampWrites: tsWrites } : undefined);
+      pass.setPipeline(kSplitPipeline);
+      pass.setBindGroup(0, kSplitBindGroup);
+      pass.dispatchWorkgroups(workgroupsX, workgroupsY, kSplitFactor);
+      pass.end();
+      submitOrCollect(encoder.finish());
+    }
+
+    releaseParamsBuffer(kSplitParamsBuffer as any);
+
+    // 2. Reduction: sum P partials → final output with alpha
+    const reductionPipeline = getOrCreateReductionPipeline(device, kSplitFactor, outputDtype as DType);
+
+    // Pack reduction params: totalElements, alpha
+    const reduceParamsBuf = new ArrayBuffer(8);
+    const reduceU32 = new Uint32Array(reduceParamsBuf);
+    const reduceF32 = new Float32Array(reduceParamsBuf);
+    reduceU32[0] = totalElements;
+    reduceF32[1] = alpha;
+    const reduceParamsBuffer = sharedCreateParamsBuffer(device as any, reduceU32);
+
+    const reduceBgBuffers = [tempBuffer, out, reduceParamsBuffer];
+    const reduceBindGroup = cachedCreateBindGroup(device as any, reductionPipeline as any, reduceBgBuffers as any) as any;
+
+    const reduceWorkgroups = Math.ceil(totalElements / 256);
+
+    // Record if recording
+    if (matmulRecordingBuffer) {
+      matmulRecordingBuffer.push({
+        pipeline: reductionPipeline as any,
+        bindGroup: reduceBindGroup as any,
+        workgroupsX: reduceWorkgroups,
+        workgroupsY: 1,
+        workgroupsZ: 1,
+      });
+    }
+
+    const reduceLabel = opLabel + "_ksplit_reduce";
+    const sharedEnc2 = getSharedEncoderInstance();
+    if (sharedEnc2) {
+      const tsWrites = getTimestampWrites(reduceLabel);
+      const pass = sharedEnc2.beginComputePass(tsWrites ? { timestampWrites: tsWrites } : undefined);
+      pass.setPipeline(reductionPipeline);
+      pass.setBindGroup(0, reduceBindGroup);
+      pass.dispatchWorkgroups(reduceWorkgroups);
+      pass.end();
+    } else {
+      const encoder = device.createCommandEncoder();
+      const tsWrites = getTimestampWrites(reduceLabel);
+      const pass = encoder.beginComputePass(tsWrites ? { timestampWrites: tsWrites } : undefined);
+      pass.setPipeline(reductionPipeline);
+      pass.setBindGroup(0, reduceBindGroup);
+      pass.dispatchWorkgroups(reduceWorkgroups);
+      pass.end();
+      submitOrCollect(encoder.finish());
+    }
+
+    releaseParamsBuffer(reduceParamsBuffer as any);
+    return;
+  }
+
+  // --- Standard path (no K-split) ---
 
   // Build codegen options
   const codegenOptions: CodegenOptions = {
@@ -593,11 +811,18 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
   const bgBuffers = [a, b, out, paramsBuffer, ...epilogueInputs];
   const bindGroup = cachedCreateBindGroup(device as any, pipeline as any, bgBuffers as any) as any;
 
-  // Compute dispatch dimensions
-  // const _wgSize = getWorkgroupSize(config);
-  const workgroupsX = Math.ceil(n / config.tileN);
-  const workgroupsY = Math.ceil(m / config.tileM);
   const workgroupsZ = batchSize;
+
+  // Record dispatch if recording is active
+  if (matmulRecordingBuffer) {
+    matmulRecordingBuffer.push({
+      pipeline: pipeline as any,
+      bindGroup: bindGroup as any,
+      workgroupsX,
+      workgroupsY,
+      workgroupsZ,
+    });
+  }
 
   // Encode and submit (batch/shared-encoder mode aware)
   const sharedEnc = getSharedEncoderInstance();

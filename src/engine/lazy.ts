@@ -17,6 +17,15 @@ import {
   endSharedEncoder,
   setCurrentOpLabel,
   setAdamBatchMode,
+  setActiveArena,
+  clearActiveArena,
+  type BufferArena,
+  startDispatchRecording,
+  stopDispatchRecording,
+  replayDispatches,
+  type RecordedDispatch,
+  setDispatchSequenceCounters,
+  getDispatchSequenceCounters,
 } from "../backend/webgpu";
 import { profileOpBegin, profileOpEnd, isProfilingEnabled, recordPlanAnalysis, type PlanAnalysis, setProfileModule, getProfileModule, recordFusionFallback } from "../backend/webgpu/profiler";
 import type { Token } from "./tokens";
@@ -38,6 +47,15 @@ import {
   findDeadTensorsAtStep,
   type TensorLifetime,
 } from "./memory-planning";
+import {
+  type LoweredPlan,
+  LoweredPlanBuilder,
+  isDataSourceOp,
+  isViewOp,
+  type DispatchReplayCache,
+  type ReplayEntry,
+  type ReplayNodeResult,
+} from "./lowered-plan";
 
 export type LazyOpCode =
   | "add"
@@ -91,7 +109,11 @@ export type LazyOpCode =
   | "adamStep"
   | "unscaleGrad"
   | "fusedCrossEntropyForward"
-  | "fusedCrossEntropyBackward";
+  | "fusedCrossEntropyBackward"
+  | "fusedLayerNormForward"
+  | "fusedLayerNormBackwardGradX"
+  | "fusedLayerNormBackwardGradWeightBias"
+  | "extractLnBwdGradBias";
 
 /** GELU approximation type matching PyTorch's nn.GELU */
 export type GeluApproximate = "none" | "tanh";
@@ -168,11 +190,23 @@ export interface ExecutionPlan {
 /**
  * Options for plan execution.
  */
+/** Ops safe to execute during tape replay fill-in: pure views + data sources. */
+const FILL_IN_OPS: ReadonlySet<string> = new Set([
+  // Pure view ops (no GPU dispatch, same buffer)
+  "reshape", "transpose", "permute", "expand", "narrow", "contiguous",
+  // Data source ops (create new buffers from host data)
+  "tensorFromArray", "zeros", "full", "arange",
+]);
+
 export interface ExecutePlanOptions {
   /** Enable early buffer release based on lifetime analysis */
   enableEarlyRelease?: boolean;
   /** Enable segmented execution at checkpoint boundaries */
   enableCheckpointSegmentation?: boolean;
+  /** Skip nodes that already have a .result (from tape replay). */
+  skipPreExecuted?: boolean;
+  /** Only execute view/data-source ops; skip all compute ops. Used by tape replay fill-in. */
+  viewOpsOnly?: boolean;
 }
 
 /**
@@ -269,6 +303,41 @@ export function buildMergedPlan(roots: LazyIRNode[], skipExecuted = false): Exec
   }
 
   return { nodes };
+}
+
+// ============================================================================
+// Lazy-initialized WebGPU imports (avoids circular deps; loaded once on first use)
+// ============================================================================
+
+let _webgpuMatmulImports: {
+  dispatchMatmulWithEpilogue: typeof import("../backend/webgpu/index").dispatchMatmulWithEpilogue;
+  dispatchMatmulDirect: typeof import("../backend/webgpu/index").dispatchMatmulDirect;
+  deferredDestroyBuffer: typeof import("../backend/webgpu/index").deferredDestroyBuffer;
+} | null = null;
+
+let _webgpuMatmulGeomImports: {
+  computeMatmulOutputShape: typeof import("../backend/webgpu/matmul/dispatch").computeMatmulOutputShape;
+  computeBatchSize: typeof import("../backend/webgpu/matmul/dispatch").computeBatchSize;
+  computeBatchStrides: typeof import("../backend/webgpu/matmul/dispatch").computeBatchStrides;
+} | null = null;
+
+async function ensureWebGPUMatmulImports() {
+  if (!_webgpuMatmulImports) {
+    const mod = await import("../backend/webgpu/index");
+    _webgpuMatmulImports = {
+      dispatchMatmulWithEpilogue: mod.dispatchMatmulWithEpilogue,
+      dispatchMatmulDirect: mod.dispatchMatmulDirect,
+      deferredDestroyBuffer: mod.deferredDestroyBuffer,
+    };
+  }
+  if (!_webgpuMatmulGeomImports) {
+    const mod = await import("../backend/webgpu/matmul/dispatch");
+    _webgpuMatmulGeomImports = {
+      computeMatmulOutputShape: mod.computeMatmulOutputShape,
+      computeBatchSize: mod.computeBatchSize,
+      computeBatchStrides: mod.computeBatchStrides,
+    };
+  }
 }
 
 let nextNodeId = 1;
@@ -885,8 +954,19 @@ export async function executePlan(
 
   try {
 
+  const skipPre = options?.skipPreExecuted === true;
+  const viewOnly = options?.viewOpsOnly === true;
+
   for (let step = 0; step < plan.nodes.length; step++) {
     const node = plan.nodes[step];
+
+    // Skip nodes that already have results (e.g., from tape replay dispatch outputs)
+    if (skipPre && node.result) continue;
+
+    // In view-only mode (tape replay fill-in), skip compute ops.
+    // Only view ops and data-source ops need execution; compute ops are
+    // either already handled by replay or are intermediate fused nodes.
+    if (viewOnly && !FILL_IN_OPS.has(node.op)) continue;
 
     // For multi-device graphs, use the node's device backend
     const nodeBackend = getBackend(node.device) ?? backend;
@@ -1323,6 +1403,50 @@ export async function executePlan(
         resultTensor = nodeBackend.ops.fusedCrossEntropyBackward(
           backendInputs[0], backendInputs[1], backendInputs[2], cePayload2,
         );
+        break;
+      }
+
+      case "fusedLayerNormForward": {
+        const lnPayload = node.payload as import("../backend/types").FusedLayerNormConfig;
+        if (!nodeBackend.ops.fusedLayerNormForward) throw new Error("fusedLayerNormForward not supported by backend");
+        resultTensor = nodeBackend.ops.fusedLayerNormForward(
+          backendInputs[0], backendInputs[1], backendInputs[2], lnPayload,
+        );
+        break;
+      }
+
+      case "fusedLayerNormBackwardGradX": {
+        const lnPayload2 = node.payload as import("../backend/types").FusedLayerNormConfig;
+        if (!nodeBackend.ops.fusedLayerNormBackwardGradX) throw new Error("fusedLayerNormBackwardGradX not supported by backend");
+        resultTensor = nodeBackend.ops.fusedLayerNormBackwardGradX(
+          backendInputs[0], backendInputs[1], backendInputs[2], lnPayload2,
+        );
+        break;
+      }
+
+      case "fusedLayerNormBackwardGradWeightBias": {
+        const lnGWBPayload = node.payload as import("../backend/types").FusedLayerNormConfig;
+        if (!nodeBackend.ops.fusedLayerNormBackwardGradWeightBias) {
+          throw new Error("fusedLayerNormBackwardGradWeightBias not supported by backend");
+        }
+        const gwResult = nodeBackend.ops.fusedLayerNormBackwardGradWeightBias(
+          backendInputs[0], backendInputs[1], lnGWBPayload,
+        );
+        resultTensor = gwResult.gradWeight;
+        // Store raw gradBias BackendTensor for extractLnBwdGradBias
+        (node as any)._lnBwdSideOutput = gwResult.gradBias;
+        break;
+      }
+
+      case "extractLnBwdGradBias": {
+        // Input[0] is the gradWeight tensor from fusedLayerNormBackwardGradWeightBias
+        const parentNode = node.inputs[0].node;
+        const sideOutputBT = (parentNode as any)._lnBwdSideOutput as BackendTensor | undefined;
+        if (!sideOutputBT) {
+          throw new Error("extractLnBwdGradBias: parent node has no _lnBwdSideOutput");
+        }
+        resultTensor = sideOutputBT;
+        (parentNode as any)._lnBwdSideOutput = undefined;
         break;
       }
 
@@ -1950,6 +2074,45 @@ async function executeOpInternal(
       );
     }
 
+    case "fusedLayerNormForward": {
+      const lnPayload3 = node.payload as import("../backend/types").FusedLayerNormConfig;
+      if (!nodeBackend.ops.fusedLayerNormForward) throw new Error("fusedLayerNormForward not supported by backend");
+      return nodeBackend.ops.fusedLayerNormForward(
+        backendInputs[0], backendInputs[1], backendInputs[2], lnPayload3,
+      );
+    }
+
+    case "fusedLayerNormBackwardGradX": {
+      const lnPayload4 = node.payload as import("../backend/types").FusedLayerNormConfig;
+      if (!nodeBackend.ops.fusedLayerNormBackwardGradX) throw new Error("fusedLayerNormBackwardGradX not supported by backend");
+      return nodeBackend.ops.fusedLayerNormBackwardGradX(
+        backendInputs[0], backendInputs[1], backendInputs[2], lnPayload4,
+      );
+    }
+
+    case "fusedLayerNormBackwardGradWeightBias": {
+      const lnGWBPayload2 = node.payload as import("../backend/types").FusedLayerNormConfig;
+      if (!nodeBackend.ops.fusedLayerNormBackwardGradWeightBias) {
+        throw new Error("fusedLayerNormBackwardGradWeightBias not supported by backend");
+      }
+      const gwResult2 = nodeBackend.ops.fusedLayerNormBackwardGradWeightBias(
+        backendInputs[0], backendInputs[1], lnGWBPayload2,
+      );
+      // Store raw gradBias BackendTensor for extractLnBwdGradBias
+      (node as any)._lnBwdSideOutput = gwResult2.gradBias;
+      return gwResult2.gradWeight;
+    }
+
+    case "extractLnBwdGradBias": {
+      const parentNode2 = node.inputs[0].node;
+      const sideOutputBT2 = (parentNode2 as any)._lnBwdSideOutput as BackendTensor | undefined;
+      if (!sideOutputBT2) {
+        throw new Error("extractLnBwdGradBias: parent node has no _lnBwdSideOutput");
+      }
+      (parentNode2 as any)._lnBwdSideOutput = undefined;
+      return sideOutputBT2;
+    }
+
     case "transfer": {
       const transferPayload = node.payload as { targetDevice: DeviceKind } | undefined;
       if (!transferPayload?.targetDevice) throw new Error("transfer requires targetDevice in payload");
@@ -2013,7 +2176,7 @@ export interface OptimizedExecutionOptions {
 const DEFAULT_RECLAIM_INTERVAL =
   typeof process !== "undefined" && process.env?.TORCHLETTE_RECLAIM_INTERVAL
     ? parseInt(process.env.TORCHLETTE_RECLAIM_INTERVAL, 10)
-    : 50;
+    : 100;
 
 /**
  * Statistics from optimized execution.
@@ -2069,6 +2232,12 @@ interface FusionAnalysisTemplate {
 
   /** Cached lifetime analysis (position-based). */
   lifetimeTemplate?: Array<{ firstUse: number; lastUse: number; isOutput: boolean; isInput: boolean; bufferSize: number }>;
+
+  /** Cached lowered execution plan (built during first execution on cache miss). */
+  loweredPlan?: LoweredPlan;
+
+  /** Per-plan buffer arena: GPUBuffers that persist across steps for bind group cache stability. */
+  bufferArena?: BufferArena;
 }
 
 type CachedSegmentDesc =
@@ -2091,6 +2260,11 @@ type CachedSegmentDesc =
  * Typically holds <10 entries (one per unique plan structure).
  */
 const fusionAnalysisCache = new Map<number, FusionAnalysisTemplate>();
+
+/** Get a cached fusion analysis template by fingerprint. */
+export function getFusionAnalysisTemplate(fingerprint: number): FusionAnalysisTemplate | undefined {
+  return fusionAnalysisCache.get(fingerprint);
+}
 
 /**
  * Execute a plan with automatic fusion optimization.
@@ -2132,12 +2306,11 @@ export async function executePlanOptimized(
     fusionEnabled: enableFusion,
   };
 
-  // Check if fusion is enabled and worth attempting.
-  // Use hasFusionPotential (relaxed check: 2+ fusible ops anywhere) instead of
-  // hasFusionOpportunities (strict: consecutive fusible ops) because reordering
-  // can cluster non-consecutive fusible ops together.
-  if (!enableFusion || !hasFusionPotential(plan.nodes)) {
-    // Fall back to standard execution with early release if enabled
+  // Fall back to simple sequential execution when fusion is disabled entirely.
+  // When fusion IS enabled, always go through the full analysis path even if
+  // no fusible ops exist — this creates lowered plan templates (for adam batching,
+  // arena allocation, bind group cache stability) that benefit all plan types.
+  if (!enableFusion) {
     const result = await executePlan(plan, backend, { enableEarlyRelease });
     stats.sequentialNodes = plan.nodes.length;
     return { result, stats };
@@ -2298,6 +2471,7 @@ export async function executePlanOptimized(
       const nodeById = new Map<number, LazyIRNode>();
       for (const n of planNodes) nodeById.set(n.id, n);
 
+
       for (let mi = 0; mi < planNodes.length; mi++) {
         const node = planNodes[mi];
         if (node.op !== "matmul") continue;
@@ -2310,21 +2484,53 @@ export async function executePlanOptimized(
         for (let depth = 0; depth < 4; depth++) {
           const cc = consumerCount.get(current.id) ?? 0;
           if (cc !== 1) break;
-          if (externalNodeIds?.has(current.id)) break;
+          // Skip external check for nodes already absorbed into the chain
+          // (e.g., reshape nodes with single-consumer). Their live pending
+          // tensors will be disposed by the caller after plan execution.
+          if (externalNodeIds?.has(current.id) && !chainIds.includes(current.id)) {
+            break;
+          }
 
           const nexts = consumers.get(current.id);
           if (!nexts || nexts.length !== 1) break;
           const next = nexts[0];
 
           if (next.inputs.length === 0) break;
+          let chainInputIdx = 0;
           const primary = next.inputs[0];
-          if (primary.kind !== "pending" || primary.node.id !== current.id) break;
+          if (primary.kind !== "pending" || primary.node.id !== current.id) {
+            // For commutative binary ops, check if the chain continues via inputs[1]
+            if ((next.op === "add" || next.op === "mul") && next.inputs.length === 2) {
+              const alt = next.inputs[1];
+              if (alt.kind === "pending" && alt.node.id === current.id) {
+                chainInputIdx = 1;
+              } else {
+                break;
+              }
+            } else {
+              break;
+            }
+          }
+
+          // Skip reshape that only removes leading size-1 dims (e.g. [1,M,N]→[M,N])
+          if (next.op === "reshape") {
+            const curShape = current.shape;
+            const nextShape = next.shape;
+            if (curShape.length === nextShape.length + 1
+                && curShape[0] === 1
+                && curShape.slice(1).every((d: number, i: number) => d === nextShape[i])) {
+              chainIds.push(next.id);
+              current = next;
+              continue; // don't increment depth — reshape is free
+            }
+            break;
+          }
 
           let ok = false;
           if (next.op === "cast") ok = true;
           else if ((next.op === "add" || next.op === "mul") && next.inputs.length === 2) {
             if (additionalInputCount >= 4) break;
-            const secondary = next.inputs[1];
+            const secondary = next.inputs[chainInputIdx === 0 ? 1 : 0];
             if (secondary.kind === "materialized") {
               ok = true;
             } else if (secondary.kind === "pending") {
@@ -2469,6 +2675,17 @@ export async function executePlanOptimized(
     fusionAnalysisCache.set(fingerprint, template);
   }
 
+  // Build a lowered plan during cache miss execution (first run).
+  // On cache hit, the lowered plan is already attached to the template.
+  let loweredPlanBuilder: LoweredPlanBuilder | null = null;
+  const nodeIdToFinalPos = new Map<number, number>();
+  for (let i = 0; i < planNodes.length; i++) {
+    nodeIdToFinalPos.set(planNodes[i].id, i);
+  }
+  if (!cachedTemplate) {
+    loweredPlanBuilder = new LoweredPlanBuilder(planNodes.length);
+  }
+
   // Set up lifetime analysis after final plan order is determined.
   // Skip if already reconstructed from cached template (cache hit path above).
   if (enableEarlyRelease && !lifetimes) {
@@ -2583,6 +2800,16 @@ export async function executePlanOptimized(
   const useTopLevelSharedEncoder = backend.name === "webgpu";
   if (useTopLevelSharedEncoder) beginSharedEncoder();
 
+  // Activate buffer arena if available from cached template.
+  // This is critical for the fallback path: when executeLoweredPlan fails and
+  // we fall back to executePlanOptimized, the arena still provides stable buffer
+  // identities for bind group cache hits.
+  const useArenaFallback = useTopLevelSharedEncoder && cachedTemplate?.bufferArena
+    && process.env.TORCHLETTE_USE_ARENA !== "0";
+  if (useArenaFallback) {
+    setActiveArena(cachedTemplate!.bufferArena!);
+  }
+
   try {
 
   // Track dispatched nodes for periodic buffer reclamation.
@@ -2605,6 +2832,18 @@ export async function executePlanOptimized(
       );
       stats.fusedNodes += segment.group.nodes.length;
       stats.fusionGroups++;
+
+      // Record fused action in lowered plan builder
+      if (loweredPlanBuilder) {
+        loweredPlanBuilder.recordFused(
+          segment.group.nodes.map(n => nodeIdToFinalPos.get(n.id)!),
+          nodeIdToFinalPos.get(segment.group.outputNode.id)!,
+          (segment.group.additionalOutputNodes ?? []).map(n => nodeIdToFinalPos.get(n.id)!),
+          (segment.group.neededIntermediates ?? []).map(n => nodeIdToFinalPos.get(n.id)!),
+          segment.recipe,
+          enableVectorization,
+        );
+      }
 
       // Track storages and release dead buffers for fused nodes
       if (enableEarlyRelease) {
@@ -2648,6 +2887,8 @@ export async function executePlanOptimized(
         matmulPrologues.size > 0 ? matmulPrologues : undefined,
         prologueClaimedIds.size > 0 ? prologueClaimedIds : undefined,
         planConsumerCount,
+        loweredPlanBuilder,
+        nodeIdToFinalPos,
       );
       stats.sequentialNodes += segment.group.nodes.length;
       overallStep += segment.group.nodes.length;
@@ -2668,6 +2909,8 @@ export async function executePlanOptimized(
         matmulPrologues.size > 0 ? matmulPrologues : undefined,
         prologueClaimedIds.size > 0 ? prologueClaimedIds : undefined,
         planConsumerCount,
+        loweredPlanBuilder,
+        nodeIdToFinalPos,
       );
       stats.sequentialNodes += segment.nodes.length;
       overallStep += segment.nodes.length;
@@ -2679,13 +2922,25 @@ export async function executePlanOptimized(
     if (useTopLevelSharedEncoder && reclaimInterval > 0 && nodesSinceReclaim >= reclaimInterval) {
       flushSharedEncoder();
       flushBufferPool();
+      if (loweredPlanBuilder) loweredPlanBuilder.recordReclaim();
       nodesSinceReclaim = 0;
     }
   }
 
   } finally {
+    if (useArenaFallback) {
+      clearActiveArena();
+    }
     if (useTopLevelSharedEncoder) {
       endSharedEncoder();
+    }
+  }
+
+  // Save the lowered plan to the fusion analysis template (first execution only).
+  if (loweredPlanBuilder) {
+    const cached = fusionAnalysisCache.get(fingerprint);
+    if (cached && !cached.loweredPlan) {
+      cached.loweredPlan = loweredPlanBuilder.build();
     }
   }
 
@@ -2696,6 +2951,842 @@ export async function executePlanOptimized(
   }
 
   // Note: Intermediate buffer cleanup is handled by tensor disposal via onDispose callbacks.
+  return { result: lastNode.result, stats };
+}
+
+/**
+ * Execute a lowered plan (cached dispatch sequence).
+ *
+ * Replaces the full executePlanOptimized() path on cache hits when the
+ * lowered plan is available. Skips fusion detection, plan reordering,
+ * segmentation, matmul epilogue detection, reduction preamble detection —
+ * all of those decisions were recorded during the first execution and are
+ * replayed here.
+ *
+ * @param plan - The original execution plan
+ * @param planNodes - Reordered plan nodes (from template.finalPerm)
+ * @param loweredPlan - The cached lowered plan from the template
+ * @param backend - The backend to use
+ * @param options - Execution options
+ * @returns The result and execution stats
+ */
+export async function executeLoweredPlan(
+  plan: ExecutionPlan,
+  planNodes: LazyIRNode[],
+  loweredPlan: LoweredPlan,
+  backend: Backend,
+  options: { enableEarlyRelease?: boolean; enableVectorization?: boolean; bufferArena?: BufferArena } = {},
+): Promise<OptimizedExecutionResult> {
+  const { enableEarlyRelease = false, enableVectorization = true } = options;
+
+  // Validate plan node count matches
+  if (planNodes.length !== loweredPlan.planNodeCount) {
+    throw new Error(
+      `Lowered plan node count mismatch: plan has ${planNodes.length}, lowered expects ${loweredPlan.planNodeCount}`,
+    );
+  }
+
+  // Pre-tune matmul shapes (same as normal path)
+  await pretunePlanMatmuls({ nodes: planNodes }, backend);
+
+  // Ensure matmul imports are loaded (cached — only first call does actual import)
+  if (backend.name === "webgpu") {
+    await ensureWebGPUMatmulImports();
+  }
+
+  // Track stats for consistency with executePlanOptimized
+  const stats: OptimizedExecutionStats = {
+    totalNodes: planNodes.length,
+    fusedNodes: 0,
+    sequentialNodes: 0,
+    fusionGroups: 0,
+    fusionEnabled: true,
+  };
+
+  const useTopLevelSharedEncoder = backend.name === "webgpu";
+  // Dispatch replay cache: disabled by default due to data source buffer
+  // identity issues (replayed bind groups reference stale data source buffers).
+  // Enable with TORCHLETTE_DISPATCH_REPLAY=1 for plans without data sources.
+  const useReplayCache = process.env.TORCHLETTE_DISPATCH_REPLAY === "1";
+
+  // =========================================================================
+  // FAST PATH: Dispatch Replay
+  // =========================================================================
+  // If we have a valid dispatch replay cache, skip all JS dispatch logic and
+  // replay recorded GPU dispatches directly. Only data sources and view ops
+  // are re-executed (their data changes per step).
+  if (useReplayCache && loweredPlan.dispatchCache?.valid && useTopLevelSharedEncoder && options.bufferArena) {
+    const cache = loweredPlan.dispatchCache;
+    if (useTopLevelSharedEncoder) beginSharedEncoder();
+    setActiveArena(options.bufferArena);
+
+    try {
+      for (const entry of cache.entries) {
+        switch (entry.kind) {
+          case "dispatch":
+            replayDispatches([entry.dispatch]);
+            break;
+          case "data-source": {
+            const dsNode = planNodes[entry.nodeIndex];
+            if (dsNode.result) break;
+            const dsBackend = getBackend(dsNode.device) ?? backend;
+            const dsInputs = dsNode.inputs.map(ref => getInputStorage(ref, dsBackend));
+            const dsBackendInputs = dsInputs.map(s => s.backendTensor);
+            const dsResult = await executeOp(dsNode, dsBackendInputs, dsBackend);
+            dsNode.result = createStorageHandle(dsNode.device, dsResult);
+            break;
+          }
+          case "view":
+          case "sequential": {
+            const node = planNodes[entry.nodeIndex];
+            if (node.result) break;
+            const nodeBackend = getBackend(node.device) ?? backend;
+            const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
+            const backendInputs = inputs.map(s => s.backendTensor);
+            let resultTensor = await executeOp(node, backendInputs, nodeBackend);
+            const aliasedInputIdx = backendInputs.findIndex(b => b === resultTensor);
+            if (aliasedInputIdx >= 0 && (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
+              resultTensor = { ...resultTensor, ownsBuffer: false } as BackendTensor;
+            }
+            const isView = (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === false;
+            const baseStorageId = isView && inputs.length > 0
+              ? inputs[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
+              : undefined;
+            node.result = createStorageHandle(node.device, resultTensor, baseStorageId);
+            break;
+          }
+          case "adam-batch": {
+            flushSharedEncoder();
+            flushBufferPool();
+            // Set sequence counters so adam dispatches hit the correct cache positions
+            setDispatchSequenceCounters(
+              entry.seqCounters.dispatch,
+              entry.seqCounters.params,
+              entry.seqCounters.output,
+            );
+            setAdamBatchMode(true);
+            try {
+              const adamBackend = backend;
+              const adamOp = adamBackend.ops.adamStep!;
+              // Profile the entire adam batch as one op
+              setCurrentOpLabel("adamStep");
+              const _adamBatchT0 = profileOpBegin("adamStep");
+              for (const nodeIdx of entry.nodeIndices) {
+                const adamNode = planNodes[nodeIdx];
+                if (adamNode.result) continue;
+                // Inline getInputStorage + backendTensor extraction
+                const inputs = adamNode.inputs;
+                const s0 = getInputStorage(inputs[0], adamBackend);
+                const s1 = getInputStorage(inputs[1], adamBackend);
+                const s2 = getInputStorage(inputs[2], adamBackend);
+                const s3 = getInputStorage(inputs[3], adamBackend);
+                // Call adamStep directly, bypassing executeOp switch dispatch
+                const adamPayload = adamNode.payload as import("../backend/types").AdamStepConfig;
+                const adamResult = await adamOp(
+                  s0.backendTensor, s1.backendTensor, s2.backendTensor, s3.backendTensor,
+                  adamPayload,
+                );
+                // Adam is in-place: param buffer is returned as result.
+                // Set ownsBuffer: false since the buffer is shared with the input.
+                const paramResult = adamResult.param;
+                const paramOwns = (paramResult as { ownsBuffer?: boolean }).ownsBuffer;
+                const finalResult = paramOwns === true
+                  ? { ...paramResult, ownsBuffer: false } as BackendTensor
+                  : paramResult;
+                // Side outputs (m, v) — create storage handles
+                const mStorage = createStorageHandle(adamNode.device, adamResult.m);
+                const vStorage = createStorageHandle(adamNode.device, adamResult.v);
+                const sideOutputs = { m: mStorage, v: vStorage };
+                storageTracker.markReachable(mStorage.id, sideOutputs);
+                storageTracker.markReachable(vStorage.id, sideOutputs);
+                (adamNode as any)._adamSideOutputs = sideOutputs;
+                // Use param input (index 1) as base storage for the view result
+                adamNode.result = createStorageHandle(adamNode.device, finalResult, s1.id);
+              }
+              profileOpEnd("adamStep", _adamBatchT0);
+            } finally {
+              setAdamBatchMode(false);
+            }
+            break;
+          }
+          case "reclaim":
+            flushSharedEncoder();
+            flushBufferPool();
+            break;
+          case "pre-adam-reclaim":
+            flushSharedEncoder();
+            flushBufferPool();
+            break;
+          case "result": {
+            // Assign node result from cached metadata (arena buffers are stable).
+            // Arena buffers persist across steps — ownsBuffer: false, no-op destroy.
+            const nr = entry.nodeResult;
+            const node = planNodes[nr.nodeIndex];
+            if (!node.result) {
+              node.result = createStorageHandle(node.device, {
+                buffer: nr.buffer,
+                shape: nr.shape,
+                dtype: nr.dtype,
+                size: nr.size,
+                strides: nr.strides,
+                offset: 0,
+                isContiguous: true,
+                ownsBuffer: false,
+                destroy() {},
+              } as BackendTensor);
+            }
+            break;
+          }
+        }
+      }
+    } finally {
+      clearActiveArena();
+      if (useTopLevelSharedEncoder) endSharedEncoder();
+    }
+
+    // Get the result from the last original plan node
+    const lastNode = plan.nodes[plan.nodes.length - 1];
+    if (!lastNode.result) {
+      throw new Error("Dispatch replay failed: no result for last node");
+    }
+    return { result: lastNode.result, stats };
+  }
+
+  // =========================================================================
+  // NORMAL PATH (with optional recording for dispatch replay cache)
+  // =========================================================================
+
+  // Shared encoder scope
+  if (useTopLevelSharedEncoder) beginSharedEncoder();
+
+  // Activate buffer arena for this plan (stabilizes buffer identities for bind group cache)
+  if (options.bufferArena && useTopLevelSharedEncoder) {
+    setActiveArena(options.bufferArena);
+  }
+
+  // Set up dispatch recording if we have an arena (needed for stable bind groups)
+  // and no replay cache yet. We only record after the first execution (arena needs
+  // to be populated first), so we check if the arena already has buffers.
+  const shouldRecord = useReplayCache && useTopLevelSharedEncoder && options.bufferArena
+    && !loweredPlan.dispatchCache
+    && options.bufferArena.resolve.length > 0; // Arena populated from prior execution
+  const recordingBuffer: RecordedDispatch[] = [];
+  const replayEntries: ReplayEntry[] = [];
+  let recordingDispatchIdx = 0;
+
+  if (shouldRecord) {
+    startDispatchRecording(recordingBuffer);
+    // Also set up matmul and fusion recording buffers (imports cached from prior calls)
+    const [matmulMod, fusionMod] = await Promise.all([
+      import("../backend/webgpu/matmul/dispatch"),
+      import("../backend/webgpu/fusion-dispatch"),
+    ]);
+    matmulMod.setMatmulRecordingBuffer(recordingBuffer);
+    fusionMod.setFusionRecordingBuffer(recordingBuffer);
+  }
+
+  try {
+    for (const action of loweredPlan.actions) {
+      switch (action.kind) {
+        case "fused": {
+          // Reconstruct FusionGroup from plan nodes
+          const groupNodes = action.coveredNodeIndices.map(i => planNodes[i]);
+          const outputNode = planNodes[action.outputNodeIndex];
+          const additionalOutputNodes = action.additionalOutputNodeIndices.map(i => planNodes[i]);
+          const neededIntermediates = action.neededIntermediateNodeIndices.map(i => planNodes[i]);
+
+          // Reconstruct external inputs using cached pattern (O(n) instead of O(n²))
+          let extInputs: LazyRef[];
+          if (action.cachedExternalInputPattern) {
+            // Fast path: use pre-computed pattern
+            extInputs = action.cachedExternalInputPattern.map(p =>
+              groupNodes[p.nodeLocalIdx].inputs[p.inputIdx],
+            );
+          } else {
+            // First execution: compute pattern with dedup, then cache it
+            const groupNodeIds = new Set(groupNodes.map(n => n.id));
+            extInputs = [];
+            const pattern: Array<{ nodeLocalIdx: number; inputIdx: number }> = [];
+            for (let ni = 0; ni < groupNodes.length; ni++) {
+              const node = groupNodes[ni];
+              for (let ii = 0; ii < node.inputs.length; ii++) {
+                const inp = node.inputs[ii];
+                if (inp.kind === "pending") {
+                  if (!groupNodeIds.has(inp.node.id) &&
+                      !extInputs.some(ei => ei.kind === "pending" && (ei as any).node.id === inp.node.id)) {
+                    extInputs.push(inp);
+                    pattern.push({ nodeLocalIdx: ni, inputIdx: ii });
+                  }
+                } else if (inp.kind === "scalar") {
+                  if (!extInputs.some(ei => ei.kind === "scalar" && ei.value === inp.value && ei.dtype === inp.dtype)) {
+                    extInputs.push(inp);
+                    pattern.push({ nodeLocalIdx: ni, inputIdx: ii });
+                  }
+                } else {
+                  if (!extInputs.some(ei => ei.kind === "materialized" && ei.storage.id === inp.storage.id)) {
+                    extInputs.push(inp);
+                    pattern.push({ nodeLocalIdx: ni, inputIdx: ii });
+                  }
+                }
+              }
+            }
+            action.cachedExternalInputPattern = pattern;
+          }
+
+          const group: FusionGroup = {
+            nodes: groupNodes,
+            planIndices: action.coveredNodeIndices,
+            externalInputs: extInputs,
+            outputNode,
+            additionalOutputNodes: additionalOutputNodes.length > 0 ? additionalOutputNodes : undefined,
+            neededIntermediates: neededIntermediates.length > 0 ? neededIntermediates : undefined,
+          };
+
+          await executeFusedSegment(
+            group,
+            action.recipe,
+            backend,
+            action.enableVectorization,
+          );
+          stats.fusedNodes += groupNodes.length;
+          stats.fusionGroups++;
+
+          // Record dispatches and node results for replay cache
+          if (shouldRecord) {
+            // Capture dispatches emitted during this action
+            while (recordingDispatchIdx < recordingBuffer.length) {
+              replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
+              recordingDispatchIdx++;
+            }
+            // Record output node result (inline for ordering)
+            if (outputNode.result) {
+              const bt = outputNode.result.backendTensor as any;
+              replayEntries.push({ kind: "result", nodeResult: {
+                nodeIndex: action.outputNodeIndex,
+                buffer: bt.buffer,
+                shape: bt.shape?.slice() ?? [],
+                dtype: bt.dtype ?? "f32",
+                size: bt.size ?? 0,
+                strides: bt.strides?.slice() ?? [],
+                isView: false,
+              }});
+            }
+            // Record additional output node results
+            for (const addIdx of action.additionalOutputNodeIndices) {
+              const addNode = planNodes[addIdx];
+              if (addNode.result) {
+                const bt = addNode.result.backendTensor as any;
+                replayEntries.push({ kind: "result", nodeResult: {
+                  nodeIndex: addIdx,
+                  buffer: bt.buffer,
+                  shape: bt.shape?.slice() ?? [],
+                  dtype: bt.dtype ?? "f32",
+                  size: bt.size ?? 0,
+                  strides: bt.strides?.slice() ?? [],
+                  isView: false,
+                }});
+              }
+            }
+          }
+          break;
+        }
+
+        case "matmul-epilogue": {
+          const matmulNode = planNodes[action.matmulNodeIndex];
+          const outputNode = planNodes[action.outputNodeIndex];
+
+          // Cache the label string (structural, same across steps)
+          let epLabel = action.cachedLabel;
+          if (!epLabel) {
+            const prologueLabel = action.prologues ? "prologue+" : "";
+            const epilogueLabel = action.epilogueOps.length > 0
+              ? "+" + action.epilogueOps.map(o => o.kind).join("+")
+              : "";
+            epLabel = `matmul+${prologueLabel}${epilogueLabel}`.replace(/\+$/, "");
+            action.cachedLabel = epLabel;
+          }
+
+          // ── FAST PATH: use cached dispatch config (2nd+ lowered plan execution) ──
+          if (action.cachedDispatchConfig) {
+            const cfg = action.cachedDispatchConfig;
+            setCurrentOpLabel(epLabel);
+            setProfileModule(matmulNode.module ?? "unknown");
+            const _profT0 = profileOpBegin(epLabel);
+            try {
+              // Resolve GPU buffers from cached paths (plan-node-relative lookups)
+              const refA = planNodes[cfg.inputAPath.planNodeIndex].inputs[cfg.inputAPath.inputIndex];
+              const refB = planNodes[cfg.inputBPath.planNodeIndex].inputs[cfg.inputBPath.inputIndex];
+              const bufA = (getInputStorage(refA).backendTensor as any).buffer;
+              const bufB = (getInputStorage(refB).backendTensor as any).buffer;
+              const epilogueBuffers: any[] = [];
+              for (const path of cfg.epilogueInputPaths) {
+                const ref = planNodes[path.planNodeIndex].inputs[path.inputIndex];
+                epilogueBuffers.push((getInputStorage(ref).backendTensor as any).buffer);
+              }
+
+              // Dispatch directly — skips shape computation, transpose detection,
+              // contiguous checks, prologue resolution, dynamic imports
+              const resultTensor = _webgpuMatmulImports!.dispatchMatmulDirect(
+                bufA, bufB, {
+                  m: cfg.m, n: cfg.n, k: cfg.k,
+                  transA: cfg.transA, transB: cfg.transB,
+                  batchSize: cfg.batchSize,
+                  batchStrideA: cfg.batchStrideA,
+                  batchStrideB: cfg.batchStrideB,
+                  batchStrideC: cfg.batchStrideC,
+                  outShape: cfg.outShape,
+                  dtypeA: cfg.dtypeA, dtypeB: cfg.dtypeB,
+                  outputDtype: cfg.outputDtype,
+                  epilogueConfig: cfg.epilogueConfig,
+                  epilogueBuffers,
+                  inputCastA: cfg.inputCastA,
+                  inputCastB: cfg.inputCastB,
+                },
+              );
+              // Fix up shape if epilogue absorbed a reshape (e.g. [1,M,N]→[M,N])
+              const fastOutShape = outputNode.shape;
+              if (!shapesEqual(resultTensor.shape, fastOutShape)) {
+                (resultTensor as any).shape = fastOutShape;
+                const newStrides = new Array(fastOutShape.length);
+                let stride = 1;
+                for (let i = fastOutShape.length - 1; i >= 0; i--) {
+                  newStrides[i] = stride;
+                  stride *= fastOutShape[i];
+                }
+                (resultTensor as any).strides = newStrides;
+              }
+              outputNode.result = createStorageHandle(outputNode.device, resultTensor);
+            } finally {
+              profileOpEnd(epLabel, _profT0);
+              setCurrentOpLabel(null);
+              setProfileModule("unknown");
+            }
+
+            // Record dispatches and node results (for replay cache)
+            if (shouldRecord) {
+              while (recordingDispatchIdx < recordingBuffer.length) {
+                replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
+                recordingDispatchIdx++;
+              }
+              if (outputNode.result) {
+                const bt = outputNode.result.backendTensor as any;
+                replayEntries.push({ kind: "result", nodeResult: {
+                  nodeIndex: action.outputNodeIndex,
+                  buffer: bt.buffer,
+                  shape: bt.shape?.slice() ?? [],
+                  dtype: bt.dtype ?? "f32",
+                  size: bt.size ?? 0,
+                  strides: bt.strides?.slice() ?? [],
+                  isView: false,
+                }});
+              }
+            }
+            break;
+          }
+
+          // ── SLOW PATH: first lowered plan execution — full reconstruction ──
+
+          // Reconstruct the epilogue input refs from the covered nodes.
+          const epilogueInputRefs: LazyRef[] = [];
+          const epilogueInputPaths: Array<{ planNodeIndex: number; inputIndex: number }> = [];
+          for (let ci = 1; ci < action.coveredNodeIndices.length; ci++) {
+            const chainNode = planNodes[action.coveredNodeIndices[ci]];
+            if ((chainNode.op === "add" || chainNode.op === "mul") && chainNode.inputs.length === 2) {
+              epilogueInputRefs.push(chainNode.inputs[1]);
+              epilogueInputPaths.push({ planNodeIndex: action.coveredNodeIndices[ci], inputIndex: 1 });
+            }
+          }
+
+          // Reconstruct prologues and resolve prologue decisions
+          let prologues: MatmulPrologueInfo[] | undefined;
+          let inputCastA: DType | undefined;
+          let inputCastB: DType | undefined;
+          let resolvedInputRefA = matmulNode.inputs[0];
+          let resolvedInputRefB = matmulNode.inputs[1];
+          // Track paths for caching (plan-node-relative, stable across steps)
+          let inputAPath = { planNodeIndex: action.matmulNodeIndex, inputIndex: 0 };
+          let inputBPath = { planNodeIndex: action.matmulNodeIndex, inputIndex: 1 };
+
+          if (action.prologues && action.prologues.length > 0) {
+            prologues = action.prologues.map(p => ({
+              inputIndex: p.inputIndex,
+              castNodeId: planNodes[p.castNodeIndex].id,
+              originalInputRef: planNodes[p.castNodeIndex].inputs[0],
+              fromDtype: p.fromDtype,
+              toDtype: p.toDtype,
+            }));
+
+            // Resolve prologue decisions (same logic as executeMatmulWithEpilogue)
+            for (const p of action.prologues) {
+              const castRef = p.inputIndex === 0 ? matmulNode.inputs[0] : matmulNode.inputs[1];
+              const castAlreadyRan = castRef.kind === "pending" && castRef.node.result != null;
+              if (!castAlreadyRan) {
+                if (p.inputIndex === 0) {
+                  resolvedInputRefA = planNodes[p.castNodeIndex].inputs[0];
+                  inputCastA = p.toDtype;
+                  inputAPath = { planNodeIndex: p.castNodeIndex, inputIndex: 0 };
+                } else {
+                  resolvedInputRefB = planNodes[p.castNodeIndex].inputs[0];
+                  inputCastB = p.toDtype;
+                  inputBPath = { planNodeIndex: p.castNodeIndex, inputIndex: 0 };
+                }
+              }
+            }
+          }
+
+          const epiloguePlan: MatmulEpiloguePlan = {
+            consumedCount: action.consumedCount,
+            epilogueOps: action.epilogueOps,
+            epilogueInputRefs,
+            outputDtype: action.outputDtype,
+            outputNode,
+            prologues,
+          };
+
+          setCurrentOpLabel(epLabel);
+          setProfileModule(matmulNode.module ?? "unknown");
+          const _profT0 = profileOpBegin(epLabel);
+          try {
+            await executeMatmulWithEpilogue(matmulNode, epiloguePlan, backend);
+          } finally {
+            profileOpEnd(epLabel, _profT0);
+            setCurrentOpLabel(null);
+            setProfileModule("unknown");
+          }
+
+          // ── Cache dispatch config for next step ──
+          // Compute matmul geometry from the resolved inputs (shapes are stable across steps).
+          // Must replicate dispatchMatmulWithEpilogue's transpose detection logic exactly.
+          {
+            const { computeMatmulOutputShape, computeBatchSize, computeBatchStrides } = _webgpuMatmulGeomImports!;
+            const { isF16Supported } = await import("../backend/webgpu/index");
+
+            const tensorA = getInputStorage(resolvedInputRefA).backendTensor as any;
+            const tensorB = getInputStorage(resolvedInputRefB).backendTensor as any;
+
+            // Detect simple last-2-dim transposes (matching detectSimpleTranspose in index.ts).
+            // If detected, use original contiguous shape and flip transpose flag.
+            const detA = _detectTransposeView(tensorA);
+            const detB = _detectTransposeView(tensorB);
+            const effectiveShapeA = detA.shape;
+            const effectiveShapeB = detB.shape;
+            const transA = detA.transposed;
+            const transB = detB.transposed;
+
+            const outShape = computeMatmulOutputShape(effectiveShapeA, effectiveShapeB, transA, transB);
+            const aRank = effectiveShapeA.length;
+            const bRank = effectiveShapeB.length;
+            const m = transA ? effectiveShapeA[aRank - 1] : effectiveShapeA[aRank - 2];
+            const k = transA ? effectiveShapeA[aRank - 2] : effectiveShapeA[aRank - 1];
+            const n = transB ? effectiveShapeB[bRank - 2] : effectiveShapeB[bRank - 1];
+
+            const batchDims = outShape.slice(0, -2);
+            const batchSize = computeBatchSize(batchDims);
+            const { strideA, strideB, strideC } = computeBatchStrides(effectiveShapeA, effectiveShapeB, batchDims, m, n, k);
+
+            // Compute dtypes (matching dispatchMatmulWithEpilogue logic)
+            const f16ok = isF16Supported();
+            const rawDtypeA = tensorA.dtype === "f16" && f16ok ? "f16" as const : "f32" as const;
+            const rawDtypeB = tensorB.dtype === "f16" && f16ok ? "f16" as const : "f32" as const;
+            const dtypeA: "f16" | "f32" = inputCastA === "f16" && f16ok ? "f16" : rawDtypeA;
+            const dtypeB: "f16" | "f32" = inputCastB === "f16" && f16ok ? "f16" : rawDtypeB;
+            const promotedDtype = (dtypeA === "f32" || dtypeB === "f32") ? "f32" as const : dtypeA;
+            const outputDtype = action.outputDtype ?? promotedDtype;
+
+            const epilogueConfig = {
+              ops: action.epilogueOps,
+              additionalInputCount: epilogueInputRefs.length,
+              outputDtype: action.outputDtype,
+            };
+
+            action.cachedDispatchConfig = {
+              inputAPath,
+              inputBPath,
+              epilogueInputPaths,
+              inputCastA,
+              inputCastB,
+              m, k, n,
+              transA, transB,
+              batchSize,
+              batchStrideA: strideA,
+              batchStrideB: strideB,
+              batchStrideC: strideC,
+              outShape,
+              dtypeA,
+              dtypeB: dtypeB !== dtypeA ? dtypeB : undefined,
+              outputDtype,
+              epilogueConfig,
+            };
+          }
+
+          // Record dispatches and node results
+          if (shouldRecord) {
+            while (recordingDispatchIdx < recordingBuffer.length) {
+              replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
+              recordingDispatchIdx++;
+            }
+            if (outputNode.result) {
+              const bt = outputNode.result.backendTensor as any;
+              replayEntries.push({ kind: "result", nodeResult: {
+                nodeIndex: action.outputNodeIndex,
+                buffer: bt.buffer,
+                shape: bt.shape?.slice() ?? [],
+                dtype: bt.dtype ?? "f32",
+                size: bt.size ?? 0,
+                strides: bt.strides?.slice() ?? [],
+                isView: false,
+              }});
+            }
+          }
+          break;
+        }
+
+        case "reduction-preamble": {
+          const preambleNode = planNodes[action.preambleNodeIndex];
+          const reductionNode = planNodes[action.reductionNodeIndex];
+          const reductionPlan: ReductionPreamblePlan = {
+            preambleNode,
+            reductionNode,
+            op: preambleNode.op,
+            arity: preambleNode.inputs.length,
+            isMean: reductionNode.op === "mean",
+          };
+          const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${reductionPlan.op}`;
+          setCurrentOpLabel(rpLabel);
+          setProfileModule(preambleNode.module ?? "unknown");
+          const _profT0 = profileOpBegin(rpLabel);
+          try {
+            await executeReductionWithPreamble(reductionPlan, backend);
+          } finally {
+            profileOpEnd(rpLabel, _profT0);
+            setCurrentOpLabel(null);
+            setProfileModule("unknown");
+          }
+
+          // Record dispatches and node results
+          if (shouldRecord) {
+            while (recordingDispatchIdx < recordingBuffer.length) {
+              replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
+              recordingDispatchIdx++;
+            }
+            // Record reduction node result
+            if (reductionNode.result) {
+              const bt = reductionNode.result.backendTensor as any;
+              replayEntries.push({ kind: "result", nodeResult: {
+                nodeIndex: action.reductionNodeIndex,
+                buffer: bt.buffer,
+                shape: bt.shape?.slice() ?? [],
+                dtype: bt.dtype ?? "f32",
+                size: bt.size ?? 0,
+                strides: bt.strides?.slice() ?? [],
+                isView: false,
+              }});
+            }
+          }
+          break;
+        }
+
+        case "adam-batch": {
+          const useSharedEncoder = backend.name === "webgpu";
+          if (useSharedEncoder) {
+            flushSharedEncoder();
+            flushBufferPool();
+          }
+
+          // Record pre-adam reclaim and capture counter positions
+          let adamSeqCountersBefore: { dispatch: number; params: number; output: number } | undefined;
+          if (shouldRecord && useSharedEncoder) {
+            replayEntries.push({ kind: "pre-adam-reclaim" });
+            adamSeqCountersBefore = getDispatchSequenceCounters();
+          }
+
+          setAdamBatchMode(true);
+          try {
+            const adamBackend = getBackend(planNodes[action.nodeIndices[0]].device) ?? backend;
+            const adamOp = adamBackend.ops.adamStep!;
+            // Single profile begin/end for entire batch (not per-node)
+            setCurrentOpLabel("adamStep");
+            setProfileModule("optimizer.step");
+            const _adamBatchT0 = profileOpBegin("adamStep");
+            for (const nodeIdx of action.nodeIndices) {
+              const adamNode = planNodes[nodeIdx];
+              if (adamNode.result) continue;
+              // Indexed getInputStorage (no .map() array allocation)
+              const inputs = adamNode.inputs;
+              const s0 = getInputStorage(inputs[0], adamBackend);
+              const s1 = getInputStorage(inputs[1], adamBackend);
+              const s2 = getInputStorage(inputs[2], adamBackend);
+              const s3 = getInputStorage(inputs[3], adamBackend);
+              // Direct adamOp call (bypasses executeOp switch)
+              const adamPayload = adamNode.payload as import("../backend/types").AdamStepConfig;
+              const adamResult = await adamOp(
+                s0.backendTensor, s1.backendTensor, s2.backendTensor, s3.backendTensor,
+                adamPayload,
+              );
+              // Adam is in-place: param buffer is returned as result.
+              // Set ownsBuffer: false since the buffer is shared with the input.
+              const paramResult = adamResult.param;
+              const paramOwns = (paramResult as { ownsBuffer?: boolean }).ownsBuffer;
+              const finalResult = paramOwns === true
+                ? { ...paramResult, ownsBuffer: false } as BackendTensor
+                : paramResult;
+              // Side outputs (m, v) — create storage handles
+              const mStorage = createStorageHandle(adamNode.device, adamResult.m);
+              const vStorage = createStorageHandle(adamNode.device, adamResult.v);
+              const sideOutputs = { m: mStorage, v: vStorage };
+              storageTracker.markReachable(mStorage.id, sideOutputs);
+              storageTracker.markReachable(vStorage.id, sideOutputs);
+              (adamNode as any)._adamSideOutputs = sideOutputs;
+              // Adam param is always input[1] — use s1.id directly (no findIndex)
+              adamNode.result = createStorageHandle(adamNode.device, finalResult, s1.id);
+            }
+            profileOpEnd("adamStep", _adamBatchT0);
+            setCurrentOpLabel(null);
+            setProfileModule("unknown");
+          } finally {
+            setAdamBatchMode(false);
+          }
+
+          // Record adam batch as a single replay entry (must re-execute each step).
+          // Capture the sequence counter positions so adam dispatches hit the correct
+          // cache positions during replay.
+          if (shouldRecord) {
+            while (recordingDispatchIdx < recordingBuffer.length) {
+              recordingDispatchIdx++;
+            }
+            replayEntries.push({
+              kind: "adam-batch",
+              nodeIndices: action.nodeIndices,
+              seqCounters: adamSeqCountersBefore!,
+            });
+          }
+          break;
+        }
+
+        case "sequential":
+        case "view":
+        case "data-source": {
+          const nodeIdx = action.nodeIndex;
+          const node = planNodes[nodeIdx];
+          if (node.result) break;
+
+          const nodeBackend = getBackend(node.device) ?? backend;
+          const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
+          const backendInputs = inputs.map(s => s.backendTensor);
+
+          let resultTensor = await executeOp(node, backendInputs, nodeBackend);
+          const aliasedInputIdx = backendInputs.findIndex(b => b === resultTensor);
+          if (aliasedInputIdx >= 0 && (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
+            resultTensor = { ...resultTensor, ownsBuffer: false } as BackendTensor;
+          }
+          const isView = (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === false;
+          const baseStorageId = isView && inputs.length > 0
+            ? inputs[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
+            : undefined;
+          node.result = createStorageHandle(node.device, resultTensor, baseStorageId);
+          stats.sequentialNodes++;
+
+          // Record for replay cache
+          if (shouldRecord) {
+            if (action.kind === "data-source" || action.kind === "view") {
+              // Data sources and views must re-execute each step
+              replayEntries.push({ kind: action.kind, nodeIndex: nodeIdx });
+              // Skip any dispatches (data sources may trigger GPU ops)
+              while (recordingDispatchIdx < recordingBuffer.length) {
+                recordingDispatchIdx++;
+              }
+            } else {
+              // Check if this sequential op consumes data source outputs
+              // (directly or through a view chain). These ops' bind groups
+              // reference data source buffers which change each step.
+              const consumesDataSource = node.inputs.some(inp => {
+                if (inp.kind !== "pending") return false;
+                const srcNode = inp.node;
+                return isDataSourceOp(srcNode.op) || isViewOp(srcNode.op);
+              });
+
+              if (consumesDataSource) {
+                // Must re-execute this op during replay (stale bind group buffers)
+                replayEntries.push({ kind: "sequential", nodeIndex: nodeIdx });
+                while (recordingDispatchIdx < recordingBuffer.length) {
+                  recordingDispatchIdx++;
+                }
+              } else {
+                // Safe to replay: capture dispatches
+                while (recordingDispatchIdx < recordingBuffer.length) {
+                  replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
+                  recordingDispatchIdx++;
+                }
+                // Record node result (inline for ordering)
+                if (node.result) {
+                  const bt = node.result.backendTensor as any;
+                  replayEntries.push({ kind: "result", nodeResult: {
+                    nodeIndex: nodeIdx,
+                    buffer: bt.buffer,
+                    shape: bt.shape?.slice() ?? [],
+                    dtype: bt.dtype ?? "f32",
+                    size: bt.size ?? 0,
+                    strides: bt.strides?.slice() ?? [],
+                    isView: isView,
+                  }});
+                }
+              }
+            }
+          }
+          break;
+        }
+
+        case "prologue-skip": {
+          // Prologue-claimed cast nodes are skipped — their work is absorbed
+          // into the matmul tile load.
+          break;
+        }
+
+        case "reclaim": {
+          if (useTopLevelSharedEncoder) {
+            flushSharedEncoder();
+            flushBufferPool();
+          }
+          if (shouldRecord) {
+            replayEntries.push({ kind: "reclaim" });
+          }
+          break;
+        }
+      }
+    }
+  } finally {
+    // Stop recording
+    if (shouldRecord) {
+      stopDispatchRecording();
+      const [matmulMod, fusionMod] = await Promise.all([
+        import("../backend/webgpu/matmul/dispatch"),
+        import("../backend/webgpu/fusion-dispatch"),
+      ]);
+      matmulMod.setMatmulRecordingBuffer(null);
+      fusionMod.setFusionRecordingBuffer(null);
+
+      // Build and store the dispatch replay cache
+      loweredPlan.dispatchCache = {
+        entries: replayEntries,
+        valid: true,
+      };
+    }
+
+    // Deactivate buffer arena before closing encoder
+    if (options.bufferArena && useTopLevelSharedEncoder) {
+      clearActiveArena();
+    }
+    if (useTopLevelSharedEncoder) {
+      endSharedEncoder();
+    }
+  }
+
+  // Get the result from the last original plan node
+  const lastNode = plan.nodes[plan.nodes.length - 1];
+  if (!lastNode.result) {
+    throw new Error("Lowered plan execution failed: no result for last node");
+  }
+
   return { result: lastNode.result, stats };
 }
 
@@ -2732,10 +3823,11 @@ async function executeFusedWebGPU(
   backend: Backend & { device?: unknown },
   enableVectorization: boolean,
 ): Promise<void> {
-  // Import fusion dispatch and buffer lifecycle helpers dynamically to avoid circular deps
+  // Import fusion dispatch and buffer lifecycle helpers (cached on first call)
   const fusionDispatch = await import("../backend/webgpu/fusion-dispatch");
   const { dispatchFusedKernel } = fusionDispatch;
-  const { deferredDestroyBuffer } = await import("../backend/webgpu/index");
+  await ensureWebGPUMatmulImports();
+  const { deferredDestroyBuffer } = _webgpuMatmulImports!;
 
   // Get WebGPU device from backend
   const device = (backend as any).device;
@@ -3021,6 +4113,8 @@ async function executeSequentialSegmentWithEarlyRelease(
   matmulPrologueMap?: Map<number, MatmulPrologueInfo[]>,
   prologueSkipIds?: Set<number>,
   prebuiltConsumerCount?: Map<number, number>,
+  loweredPlanBuilder?: LoweredPlanBuilder | null,
+  nodeIdToFinalPos?: Map<number, number>,
 ): Promise<void> {
   const useSharedEncoder = backend.name === "webgpu";
   if (useSharedEncoder) beginSharedEncoder();
@@ -3064,6 +4158,9 @@ async function executeSequentialSegmentWithEarlyRelease(
       // don't execute. No result is set since the only consumer (the matmul)
       // uses the pre-cast input via prologue info.
       if (prologueSkipIds?.has(node.id)) {
+        if (loweredPlanBuilder && nodeIdToFinalPos) {
+          loweredPlanBuilder.recordPrologueSkip(nodeIdToFinalPos.get(node.id)!);
+        }
         step++;
         continue;
       }
@@ -3138,6 +4235,29 @@ async function executeSequentialSegmentWithEarlyRelease(
             step += epiloguePlan.consumedCount;
           }
 
+          // Record matmul epilogue action in lowered plan builder
+          if (loweredPlanBuilder && nodeIdToFinalPos) {
+            const covered: number[] = [];
+            for (let skip = 0; skip < epiloguePlan.consumedCount; skip++) {
+              covered.push(nodeIdToFinalPos.get(nodes[nodeIdx + skip].id)!);
+            }
+            loweredPlanBuilder.recordMatmulEpilogue(
+              nodeIdToFinalPos.get(node.id)!,
+              covered,
+              nodeIdToFinalPos.get(epiloguePlan.outputNode.id)!,
+              epiloguePlan.epilogueOps,
+              epiloguePlan.epilogueInputRefs.length,
+              epiloguePlan.outputDtype,
+              epiloguePlan.consumedCount,
+              epiloguePlan.prologues?.map(p => ({
+                inputIndex: p.inputIndex,
+                castNodeIndex: nodeIdToFinalPos.get(p.castNodeId)!,
+                fromDtype: p.fromDtype,
+                toDtype: p.toDtype,
+              })),
+            );
+          }
+
           nodeIdx += epiloguePlan.consumedCount - 1;
           continue;
         }
@@ -3193,6 +4313,14 @@ async function executeSequentialSegmentWithEarlyRelease(
             }
           } else {
             step += 2;
+          }
+
+          // Record reduction preamble action in lowered plan builder
+          if (loweredPlanBuilder && nodeIdToFinalPos) {
+            loweredPlanBuilder.recordReductionPreamble(
+              nodeIdToFinalPos.get(node.id)!,
+              nodeIdToFinalPos.get(nodes[nodeIdx + 1].id)!,
+            );
           }
 
           nodeIdx += 1; // Skip the reduction node (consumed 2 nodes total)
@@ -3274,6 +4402,15 @@ async function executeSequentialSegmentWithEarlyRelease(
             setAdamBatchMode(false);
           }
 
+          // Record adam batch action in lowered plan builder
+          if (loweredPlanBuilder && nodeIdToFinalPos) {
+            const adamIndices: number[] = [];
+            for (let a = 0; a < adamCount; a++) {
+              adamIndices.push(nodeIdToFinalPos.get(nodes[nodeIdx + a].id)!);
+            }
+            loweredPlanBuilder.recordAdamBatch(adamIndices);
+          }
+
           nodeIdx += adamCount - 1;
           continue;
         }
@@ -3295,6 +4432,18 @@ async function executeSequentialSegmentWithEarlyRelease(
           ? inputs[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
           : undefined;
       node.result = createStorageHandle(node.device, resultTensor, baseStorageId);
+
+      // Record action in lowered plan builder
+      if (loweredPlanBuilder && nodeIdToFinalPos) {
+        const finalPos = nodeIdToFinalPos.get(node.id)!;
+        if (isDataSourceOp(node.op)) {
+          loweredPlanBuilder.recordDataSource(finalPos);
+        } else if (isViewOp(node.op)) {
+          loweredPlanBuilder.recordView(finalPos);
+        } else {
+          loweredPlanBuilder.recordSequential(finalPos);
+        }
+      }
 
       // Track storage and release dead buffers
       if (enableEarlyRelease) {
@@ -3326,6 +4475,7 @@ async function executeSequentialSegmentWithEarlyRelease(
       if (useSharedEncoder && enableEarlyRelease && nodesSinceIntraReclaim >= INTRA_SEGMENT_RECLAIM_INTERVAL) {
         flushSharedEncoder();
         flushBufferPool();
+        if (loweredPlanBuilder) loweredPlanBuilder.recordReclaim();
         nodesSinceIntraReclaim = 0;
       }
     }
@@ -3396,20 +4546,53 @@ function detectMatmulEpilogueCore(
   let outputDtype = matmulNode.dtype;
 
   // Walk forward from matmul, matching epilogue-compatible ops
+  let currentIsReshapeSkip = false;
   for (let i = startIdx + 1; i < nodes.length && chainLength < 4; i++) {
     const nextNode = nodes[i];
 
     // Check that the candidate node's primary input (input[0]) is a pending ref
     // to the current chain node
     if (nextNode.inputs.length === 0) break;
+    let chainInputIdx = 0;
     const primaryInput = nextNode.inputs[0];
-    if (primaryInput.kind !== "pending" || primaryInput.node.id !== currentNode.id) break;
+    if (primaryInput.kind !== "pending" || primaryInput.node.id !== currentNode.id) {
+      // For commutative binary ops, check if the chain continues via inputs[1]
+      if ((nextNode.op === "add" || nextNode.op === "mul") && nextNode.inputs.length === 2) {
+        const altInput = nextNode.inputs[1];
+        if (altInput.kind === "pending" && altInput.node.id === currentNode.id) {
+          chainInputIdx = 1;
+        } else {
+          break;
+        }
+      } else {
+        break;
+      }
+    }
 
     // Check that the current chain node is NOT externally referenced
-    // (must be used only by this next node)
-    if (externalNodeIds?.has(currentNode.id)) break;
+    // (must be used only by this next node).
+    // Skip this check for nodes already absorbed into the chain as reshape
+    // skips — their live pending tensors will be disposed by the caller.
+    if (externalNodeIds?.has(currentNode.id) && !currentIsReshapeSkip) break;
     const consumers = consumerCount.get(currentNode.id) ?? 0;
     if (consumers > 1) break;
+
+    // Skip reshape that only removes leading size-1 dims (e.g. [1,M,N]→[M,N])
+    if (nextNode.op === "reshape") {
+      const curShape = currentNode.shape;
+      const nextShape = nextNode.shape;
+      if (curShape.length === nextShape.length + 1
+          && curShape[0] === 1
+          && curShape.slice(1).every((d: number, i: number) => d === nextShape[i])) {
+        chainLength++;
+        currentNode = nextNode;
+        currentIsReshapeSkip = true;
+        outputDtype = nextNode.dtype || outputDtype;
+        continue;
+      }
+      break;
+    }
+    currentIsReshapeSkip = false;
 
     // Match the op type
     let matched = false;
@@ -3423,7 +4606,7 @@ function detectMatmulEpilogueCore(
       }
     } else if (nextNode.op === "add" && nextNode.inputs.length === 2) {
       // Check if second input is a 1D bias (size matches matmul N dimension)
-      const secondInput = nextNode.inputs[1];
+      const secondInput = nextNode.inputs[chainInputIdx === 0 ? 1 : 0];
       let secondShape: number[] | undefined;
       if (secondInput.kind === "materialized") {
         secondShape = secondInput.storage.backendTensor.shape;
@@ -3449,7 +4632,7 @@ function detectMatmulEpilogueCore(
     } else if (nextNode.op === "mul" && nextNode.inputs.length === 2) {
       if (additionalInputCount >= 4) break;
       epilogueOps.push({ kind: "binary", op: "mul", inputIndex: additionalInputCount });
-      epilogueInputRefs.push(nextNode.inputs[1]);
+      epilogueInputRefs.push(nextNode.inputs[chainInputIdx === 0 ? 1 : 0]);
       additionalInputCount++;
       matched = true;
     } else if (nextNode.op === "relu" || nextNode.op === "silu" || nextNode.op === "sigmoid" || nextNode.op === "tanh") {
@@ -3520,6 +4703,41 @@ function detectMatmulEpilogue(
 }
 
 /**
+ * Detect simple last-2-dim transpose views (mirrors detectSimpleTranspose in index.ts).
+ * Returns the effective contiguous shape and whether a transpose was detected.
+ * Used by the matmul epilogue cache to compute correct geometry.
+ */
+function _detectTransposeView(tensor: any): { shape: number[]; transposed: boolean } {
+  const shape = tensor.shape as number[];
+  const strides = tensor.strides as number[] | undefined;
+  const rank = shape.length;
+
+  if (tensor.isContiguous || (tensor.offset ?? 0) !== 0 || rank < 2 || !strides) {
+    return { shape: shape.slice(), transposed: false };
+  }
+
+  // Check for last-2-dim transpose: strides[-2] === 1 and strides[-1] === shape[-2]
+  if (strides[rank - 2] === 1 && strides[rank - 1] === shape[rank - 2]) {
+    // Verify batch dimensions are contiguous
+    let expectedStride = shape[rank - 1] * shape[rank - 2];
+    let valid = true;
+    for (let i = rank - 3; i >= 0; i--) {
+      if (strides[i] !== expectedStride) { valid = false; break; }
+      expectedStride *= shape[i];
+    }
+    if (valid) {
+      // Swap last 2 dims back to get original contiguous shape
+      const origShape = shape.slice();
+      origShape[rank - 2] = shape[rank - 1];
+      origShape[rank - 1] = shape[rank - 2];
+      return { shape: origShape, transposed: true };
+    }
+  }
+
+  return { shape: shape.slice(), transposed: false };
+}
+
+/**
  * Execute a matmul with fused epilogue operations.
  * Uses the existing dispatchMatmulWithEpilogue from the WebGPU backend.
  */
@@ -3528,9 +4746,9 @@ async function executeMatmulWithEpilogue(
   plan: MatmulEpiloguePlan,
   backend: Backend,
 ): Promise<void> {
-  // Dynamic import to avoid circular deps (same pattern as line 2012)
-  const { dispatchMatmulWithEpilogue, deferredDestroyBuffer } = await import("../backend/webgpu/index");
-  const { EpilogueConfig } = await import("../backend/webgpu/matmul/codegen") as any;
+  // Use cached imports (initialized once at executeLoweredPlan/executePlanOptimized entry)
+  await ensureWebGPUMatmulImports();
+  const { dispatchMatmulWithEpilogue } = _webgpuMatmulImports!;
 
   // Determine which inputs have prologue casts.
   // If the prologue cast was skipped (no result), use the original pre-cast input.
@@ -3588,7 +4806,21 @@ async function executeMatmulWithEpilogue(
     inputCastB,
   );
 
-  // Store result on the final output node
+  // Store result on the final output node.
+  // If epilogue absorbed a reshape (e.g. [1,M,N]→[M,N]), the matmul output shape
+  // may differ from outputNode.shape. Fix up by mutating the tensor's shape/strides.
+  const outNodeShape = plan.outputNode.shape;
+  if (!shapesEqual(resultTensor.shape, outNodeShape)) {
+    (resultTensor as any).shape = outNodeShape;
+    // Recompute strides for the new shape (contiguous row-major)
+    const newStrides = new Array(outNodeShape.length);
+    let stride = 1;
+    for (let i = outNodeShape.length - 1; i >= 0; i--) {
+      newStrides[i] = stride;
+      stride *= outNodeShape[i];
+    }
+    (resultTensor as any).strides = newStrides;
+  }
   plan.outputNode.result = createStorageHandle(plan.outputNode.device, resultTensor);
 }
 
@@ -4071,6 +5303,45 @@ async function executeOp(
       return backend.ops.fusedCrossEntropyBackward(
         backendInputs[0], backendInputs[1], backendInputs[2], cePayload6,
       );
+    }
+
+    case "fusedLayerNormForward": {
+      const lnPayload5 = node.payload as import("../backend/types").FusedLayerNormConfig;
+      if (!backend.ops.fusedLayerNormForward) throw new Error("fusedLayerNormForward not supported by backend");
+      return backend.ops.fusedLayerNormForward(
+        backendInputs[0], backendInputs[1], backendInputs[2], lnPayload5,
+      );
+    }
+
+    case "fusedLayerNormBackwardGradX": {
+      const lnPayload6 = node.payload as import("../backend/types").FusedLayerNormConfig;
+      if (!backend.ops.fusedLayerNormBackwardGradX) throw new Error("fusedLayerNormBackwardGradX not supported by backend");
+      return backend.ops.fusedLayerNormBackwardGradX(
+        backendInputs[0], backendInputs[1], backendInputs[2], lnPayload6,
+      );
+    }
+
+    case "fusedLayerNormBackwardGradWeightBias": {
+      const lnGWBPayload3 = node.payload as import("../backend/types").FusedLayerNormConfig;
+      if (!backend.ops.fusedLayerNormBackwardGradWeightBias) {
+        throw new Error("fusedLayerNormBackwardGradWeightBias not supported by backend");
+      }
+      const gwResult3 = backend.ops.fusedLayerNormBackwardGradWeightBias(
+        backendInputs[0], backendInputs[1], lnGWBPayload3,
+      );
+      // Store raw gradBias BackendTensor for extractLnBwdGradBias
+      (node as any)._lnBwdSideOutput = gwResult3.gradBias;
+      return gwResult3.gradWeight;
+    }
+
+    case "extractLnBwdGradBias": {
+      const parentNode3 = node.inputs[0].node;
+      const sideOutputBT3 = (parentNode3 as any)._lnBwdSideOutput as BackendTensor | undefined;
+      if (!sideOutputBT3) {
+        throw new Error("extractLnBwdGradBias: parent node has no _lnBwdSideOutput");
+      }
+      (parentNode3 as any)._lnBwdSideOutput = undefined;
+      return sideOutputBT3;
     }
 
     case "transfer": {

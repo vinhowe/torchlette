@@ -9,6 +9,7 @@ export type IRNode = {
   inputs: number[];
   shape?: number[];
   dtype?: DType;
+  scalarValues?: number[];  // §8.2.1: scalar constants for this op's scalar inputs
 };
 
 export type IRFusionGroup = {
@@ -110,6 +111,7 @@ export function buildIRFromTrace(events: TraceEvent[], epoch: number): IRGraph {
       inputs: event.inputs ? event.inputs.slice() : [],
       shape: event.shape ? event.shape.slice() : undefined,
       dtype: event.dtype,
+      scalarValues: event.scalarValues ? event.scalarValues.slice() : undefined,
     };
     nodes.push(node);
     nodeById.set(node.id, node);

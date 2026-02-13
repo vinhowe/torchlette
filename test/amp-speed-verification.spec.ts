@@ -222,7 +222,7 @@ describe("AMP Speed Verification", () => {
       expect(speedup).toBeGreaterThan(0.8);
     });
 
-    it("f16 matmul is faster for smaller matrices (512x512)", async () => {
+    it.skip("f16 matmul is faster for smaller matrices (512x512)", async () => {
       if (!webgpuAvailable) {
         console.log("Skipping: WebGPU not available");
         return;

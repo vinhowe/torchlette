@@ -196,24 +196,37 @@ function createUnscaleConfigBuffer(
 // ============================================================================
 
 /**
- * Allocate a 4-byte atomic buffer for inf detection, initialized to 0.0.
+ * Persistent 4-byte atomic buffer for inf detection.
+ * Allocated once and zeroed via writeBuffer each step to stabilize
+ * buffer identity for bind group caching.
+ */
+let persistentInfFlagBuffer: GPUBuffer | null = null;
+const infFlagZeroData = new Float32Array([0.0]);
+
+/**
+ * Get or allocate a 4-byte atomic buffer for inf detection, initialized to 0.0.
  * Shared across all parameter dispatches in one unscale_() call.
  *
- * Uses Float32Array([0.0]) to write zero bits. The kernel writes
- * bitcast<u32>(1.0f) = 0x3F800000 via atomicMax, so readback interprets
- * the raw bytes as Float32Array → 0.0 (clean) or 1.0 (inf found).
+ * Uses a persistent buffer: allocated once, zeroed via writeBuffer each step.
+ * This stabilizes buffer identity for bind group caching (76 Adam dispatches
+ * all reference the same GPUBuffer across steps).
  */
 export function allocateInfFlagBuffer(device?: GPUDevice): GPUBuffer {
+  if (persistentInfFlagBuffer) {
+    const dev = device ?? (getWebGPUDevice()!.device as unknown as GPUDevice);
+    dev.queue.writeBuffer(persistentInfFlagBuffer, 0, infFlagZeroData);
+    return persistentInfFlagBuffer;
+  }
   const dev = device ?? (getWebGPUDevice()!.device as unknown as GPUDevice);
-  const buffer = dev.createBuffer({
+  persistentInfFlagBuffer = dev.createBuffer({
     size: 4,
     usage:
       GPUBufferUsage.STORAGE |
       GPUBufferUsage.COPY_SRC |
       GPUBufferUsage.COPY_DST,
-  });
-  dev.queue.writeBuffer(buffer, 0, new Float32Array([0.0]));
-  return buffer;
+  }) as GPUBuffer;
+  dev.queue.writeBuffer(persistentInfFlagBuffer, 0, infFlagZeroData);
+  return persistentInfFlagBuffer;
 }
 
 /**
@@ -249,10 +262,19 @@ export async function readInfFlag(infFlagBuffer: GPUBuffer): Promise<number> {
   staging.unmap();
   staging.destroy();
 
-  // Destroy the inf flag buffer
-  infFlagBuffer.destroy();
+  // Do NOT destroy the inf flag buffer — it's persistent and reused across steps.
 
   return value;
+}
+
+/**
+ * Destroy the persistent inf flag buffer (cleanup on WebGPU teardown).
+ */
+export function destroyPersistentInfFlagBuffer(): void {
+  if (persistentInfFlagBuffer) {
+    persistentInfFlagBuffer.destroy();
+    persistentInfFlagBuffer = null;
+  }
 }
 
 // ============================================================================

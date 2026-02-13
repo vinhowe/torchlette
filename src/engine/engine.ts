@@ -618,6 +618,7 @@ export class Engine {
       inputs?: TraceTensor[];
       shape?: number[];
       dtype?: DType;
+      scalarValues?: number[];
     },
   ): TraceTensor {
     const inputs = options?.inputs ?? [];
@@ -636,6 +637,7 @@ export class Engine {
       inputs: inputs.length > 0 ? inputs.map((input) => input.id) : undefined,
       shape: options?.shape ? options.shape.slice() : undefined,
       dtype: options?.dtype,
+      scalarValues: options?.scalarValues ? options.scalarValues.slice() : undefined,
     });
     return tensor;
   }

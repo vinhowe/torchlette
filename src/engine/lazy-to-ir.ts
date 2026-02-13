@@ -23,6 +23,7 @@ export type LazyToIRResult = {
   graph: IRGraph;
   nodeMapping: NodeIdMapping;
   outputNodeIds: number[];
+  scalarsByNode: Map<number, number[]>;  // IRNode id → scalar input values (§8.2.1)
 };
 
 /**
@@ -61,13 +62,26 @@ export function isFusibleElementwise(op: string): boolean {
 export function lazyPlanToIR(plan: ExecutionPlan): LazyToIRResult {
   const nodes: IRNode[] = [];
   const nodeMapping: NodeIdMapping = new Map();
+  const scalarsByNode = new Map<number, number[]>();
   const epoch = Date.now(); // Use timestamp as epoch for unique identification
 
-  // First pass: create IRNodes from LazyIRNodes
+  // First pass: create IRNodes from LazyIRNodes, collecting scalar values
   for (const lazyNode of plan.nodes) {
     const irNode = lazyNodeToIRNode(lazyNode, nodeMapping, epoch);
     nodes.push(irNode);
     nodeMapping.set(lazyNode.id, irNode.id);
+
+    // Collect scalar inputs for this node (§8.2.1)
+    const scalars: number[] = [];
+    for (const inputRef of lazyNode.inputs) {
+      if (inputRef.kind === "scalar") {
+        scalars.push(inputRef.value);
+      }
+    }
+    if (scalars.length > 0) {
+      scalarsByNode.set(irNode.id, scalars);
+      irNode.scalarValues = scalars;
+    }
   }
 
   // Detect fusion groups
@@ -86,6 +100,7 @@ export function lazyPlanToIR(plan: ExecutionPlan): LazyToIRResult {
     },
     nodeMapping,
     outputNodeIds,
+    scalarsByNode,
   };
 }
 

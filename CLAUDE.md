@@ -14,12 +14,14 @@ WebGPU is auto-detected at runtime. Use `TORCHLETTE_CPU_ONLY=1` to force CPU-onl
 
 For WebGPU backend changes, also run the relevant integration test (e.g. `npx tsx examples/gpt2/finetune-demo.ts` for training-related fixes).
 
+**Zero test failures policy.** There are currently no known test failures — all 1286 tests pass (1 skipped). Never accept test failures. If a test fails after your change, fix it before moving on. Do not skip, disable, or mark tests as expected-to-fail. If a test is genuinely flaky (e.g. GPU timing), investigate and fix the flakiness rather than ignoring it.
+
 **Important:** Any standalone script or tool that uses WebGPU (Dawn) must call `process.exit(0)` at the end of `main()`. Dawn holds background threads that prevent Node from exiting naturally.
 
 ## Specification Documents
 
-- **Working Spec**: [../torchlette-working-spec.md](../torchlette-working-spec.md) - Full runtime semantics (v1.22)
-- **Testing Spec**: [../torchlette-testing-spec.md](../torchlette-testing-spec.md) - Test-driven development plan
+- **Working Spec**: [torchlette-working-spec.md](torchlette-working-spec.md) - Full runtime semantics (v1.22)
+- **Testing Spec**: [torchlette-testing-spec.md](torchlette-testing-spec.md) - Test-driven development plan
 
 ## Development Commands
 
@@ -77,15 +79,15 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
 
 1. **Wall clock** — Per-step timings from the WALL CLOCK SUMMARY table. Steady-state = avg of steps 2-4. Step 0 is pipeline warmup (expect 8-10x slower). Breakdown: forward, backward, optimizer, cleanup as % of total.
 
-2. **GPU time budget** — From the Phase table (`Phase | Ops | CPU(ms) | GPU(ms)`). Sum GPU(ms) across forward+backward+cleanup for total GPU time. **GPU utilization = total_GPU / wall_clock**. Current baseline: ~32% utilization (62ms GPU / 194ms wall).
+2. **GPU time budget** — From the Phase table (`Phase | Ops | CPU(ms) | GPU(ms)`). Sum GPU(ms) across forward+backward+cleanup for total GPU time. **GPU utilization = total_GPU / wall_clock**. Current baseline: ~35% utilization (27ms GPU / 78ms wall).
 
-3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). Current top offenders: `matmul` (28ms, 44%), `matmul++cast+bias` (8ms, 14%), `adamStep` (8ms, 13%), `mean` (6ms, 9%), `add` (5ms, 8%, one 4.8ms outlier on [50257,768]), `sum` (4ms, 7%), `fused` (2ms, 3%).
+3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). Current top offenders: `matmul` (7.3ms, 27%), `adamStep` (5.4ms, 20%), `matmul++cast+bias+binary` (4.6ms, 17%), `fusedLayerNormBackwardGradWeightBias` (1.7ms, 6%), `matmul++cast+bias` (1.7ms, 6%), `fused` (1.0ms, 4%), `sum` (0.8ms, 3%), `add` (0.8ms, 3%), `matmul++cast` (0.7ms, 3%).
 
 4. **Cross-entropy** — Fused kernel implemented. Now 0.4ms/0.6% of GPU time (down from 34ms/31%). No longer a bottleneck.
 
-5. **CPU dispatch overhead** — From `CPU API Call` table. `createBindGroup` (19ms, 10%) + `queue.submit` (13ms, 7%) + `writeBuffer` (9ms, 4%) + `createBuffer` (1ms, 0.4%). Total ~41ms/step CPU dispatch (21% wall). `createBindGroup` dominates now that buffer reservation eliminated `createBuffer` overhead.
+5. **CPU dispatch overhead** — From `CPU API Call` table. Bind group cache at 92.7% (38 misses). 12 submits/step.
 
-6. **Fusion rate** — From Plan Analysis. Forward plan: ~30% fused, backward: ~48% fused. Overall: 39.5% (591/1497 nodes). Look at "Unfused fusible by shape" for opportunities. Key gap: 13 unfused `add` ops on `[1,31,768]` (LayerNorm residuals), 43 unfused `cast` ops.
+6. **Fusion rate** — From Plan Analysis. Total: 1161 nodes, 318 fused (27.4%), 78 fusion groups, 717 sequential. Note: fused LayerNorm/cross-entropy ops replace ~9 decomposed ops each, so effective fusion is higher than the raw percentage. Key unfused ops: 69 `cast` ops (f32↔f16), 37 `add` ops, 37 `matmul` ops.
 
 7. **Memory** — From Memory Stats section. Track: current/peak MB, buffer pool reuse rate (should be ~77%+), allocation histogram. No NaN values = working correctly.
 
@@ -434,6 +436,7 @@ Lower Priority:
 |----|---------|----------|-------|
 | add/sub/mul/div | ✅ | ✅ | Full support |
 | matmul | ✅ | ✅ | Full support |
+| linear | ✅ | ✅ | Custom backward: dW = dY.T @ X (no transpose) |
 | relu | ✅ | ✅ | Full support |
 | sqrt | ✅ | ✅ | Full support |
 | sum | ✅ | ✅ | Via frontend |
@@ -473,7 +476,7 @@ Why: Within a step, multiple plan executions share the same encoder scope (forwa
 
 ## Remaining Performance Optimizations
 
-Profiled on DistilGPT-2 training (steady-state ~194ms/step, 121 submits/step, 62ms GPU, 32% GPU utilization). Targets ranked by impact:
+Profiled on DistilGPT-2 training (steady-state ~78ms/step, 12 submits/step, 27ms GPU, 35% GPU utilization). Targets ranked by impact:
 
 **Completed optimizations:**
 1. ~~**Intra-plan buffer reclamation**~~ — DONE. `createBuffer` avg cost dropped 365µs→81µs.
@@ -483,12 +486,30 @@ Profiled on DistilGPT-2 training (steady-state ~194ms/step, 121 submits/step, 62
 5. ~~**Buffer pool reclamation**~~ — DONE. Intra-segment periodic reclaim (every 25 nodes). `createBuffer` cost 92ms→66ms. Backward pass 163ms→124ms.
 6. ~~**Window-based buffer reservation**~~ — DONE. Empirical per-window demand recording computes exact per-size-class pool reservation. `createBuffer` 66ms→0.7ms (1 alloc/step). Pool reuse 59%→99.9%. Unlimited pool budget (PyTorch-like). Configurable via `setBufferPoolBudget()` or `TORCHLETTE_POOL_BUDGET_MB` env var.
 7. ~~**Adam ensureContig**~~ — DONE. 43ms→2ms/step. Params contiguous after first step.
+8. ~~**Params writeBuffer skip**~~ — DONE. Params data cached; identical data skips `writeBuffer`. 710→83 calls/step, 8.8ms→1.0ms. ~7.8ms saved.
+9. ~~**Params array pooling**~~ — DONE. Pre-allocated `Uint32Array` pool for 1-8 word params. Eliminates ~700 short-lived allocations/step.
+10. ~~**Output buffer pre-pinning**~~ — DONE. Pre-extract hinted output buffers from pool at step start. 296/454 buffers pinned (65%). Eliminates contention in pool acquire. Marginal bind group cache improvement (22% vs 21%).
+11. ~~**Pool acquire writeSet removal**~~ — DONE. WriteSet check in `acquire()` and `acquirePreferred()` was unreachable (pool buffers can't be in writeSet). Removed scan loop, `pop()` used directly.
+
+12. ~~**Per-lowered-plan buffer arena**~~ — DONE. Each cached lowered plan gets its own buffer arena: persistent GPUBuffers never returned to pool. `resolveOutputBuffer` and `allocateOutputBuffer` return arena buffers during lowered plan execution. Bind group cache hit rate 22%→63.3%. `createBindGroup` cost 20ms→11ms (259 calls vs ~700). ~9ms/step saved. Arena check in pool's `deferredDestroy` prevents arena buffer destruction from any call site. Disable with `TORCHLETTE_USE_ARENA=0`.
+13. ~~**Matmul outputs through arena**~~ — DONE. `dispatchMatmul` and `dispatchMatmulWithEpilogue` now use `resolveOutputBuffer` instead of `createTrackedBuffer`, routing matmul outputs through the arena. Bind group cache 63.3%→75.3% (531 hits / 174 misses). `createBindGroup` 11ms→9.5ms (259→174 calls). ~1.5ms/step saved.
+14. ~~**FusionGroup external input caching**~~ — DONE. Cached `(nodeLocalIdx, inputIdx)` pattern on first lowered-plan execution. Subsequent steps skip O(n²) dedup across 119 fusion groups, using O(n) cached pattern lookup instead.
+15. ~~**Matmul epilogue label caching**~~ — DONE. Label string (`matmul+prologue+cast+bias` etc.) computed once and cached on `LoweredMatmulEpilogueAction`. Skips string construction for ~30 matmul dispatches/step.
+16. ~~**Fused LayerNorm forward kernel**~~ — DONE. Single WGSL kernel per LayerNorm instance (was 9 ops: 2 reductions + 7 elementwise). 13 instances in DistilGPT-2. `mean` dispatches reduced 106→54. Forward GPU time reduced. ~80 fewer dispatches.
+17. ~~**Fused LayerNorm backward kernel**~~ — DONE. Two kernels per instance: gradX (single workgroup per row with recomputed forward stats) and gradWeight+gradBias (cross-row reduction). Uses side-output pattern for multi-tensor returns. ~20 ops per instance → 2 dispatches.
+18. ~~**Adam CPU quick wins**~~ — DONE. Persistent `infFlagBuffer` (eliminates `createBuffer`+`destroy` per step). Pre-allocated typed arrays for config buffer construction (eliminates 228 short-lived allocations/step). Inlined adam-batch dispatch bypasses `executeOp` switch. ~1-2ms saved.
+19. ~~**Optimizer plan lowered path**~~ — DONE. Removed `!hasFusionPotential` early return in `executePlanOptimized`. All plans (including the 76-node Adam optimizer plan) now get lowered plan templates, buffer arenas, and adam-batch optimization. This was the root cause of 150 bind group cache misses: the optimizer plan allocated F16 weight buffers from the pool (changing identity each step), then forward/backward plans used those as matmul inputs. Now F16 buffers are arena-managed (stable identity). Bind group cache 75.3%→96.2% (174→24 misses). `createBindGroup` 9.5ms→1.0ms. `queue.submit` 102→24 calls (optimizer plan now uses single shared encoder). ~15ms/step saved.
+20. ~~**Matmul epilogue CPU fast path**~~ — DONE. On lowered plan replay, cache all structural decisions (prologue resolution, matmul geometry, transpose detection, dtype computation, epilogue config) on first execution. Subsequent steps resolve only buffer pointers and call `dispatchTiledMatmul` directly via `dispatchMatmulDirect`, bypassing `executeMatmulWithEpilogue`, `dispatchMatmulWithEpilogue`, dynamic imports, shape computation, transpose detection, and contiguous checks. `matmul++cast+bias` CPU: 730µs→63µs avg (11.6x improvement). Total: 17.5ms→1.6ms for 24 dispatches. ~16ms/step saved.
+21. ~~**Adam batch CPU fast path**~~ — DONE. Ported tight loop from dispatch replay path to normal lowered plan path. Eliminates per-node overhead: `.map()` array allocations, `executeOp` switch dispatch, `findIndex` alias scan, per-node profiling. Single `profileOpBegin/End` for entire batch. Direct `adamOp()` call with indexed `getInputStorage`. Adam CPU: 10.7ms→5.3ms. ~5.4ms/step saved.
+22. ~~**Reclaim interval tuning**~~ — DONE. Default reclaim interval 50→100. Submits: 24→15 (−37%). `queue.submit` calls reduced. Loss trajectory unchanged. Configurable via `TORCHLETTE_RECLAIM_INTERVAL` env var.
+23. ~~**Bind group cache miss fix**~~ — DONE. Forward plan's `executeLoweredPlan` consistently failed with "Input not ready" (ordering mismatch), falling back to `executePlanOptimized` without arena — causing 76 extra bind group misses. Fix: (1) disable lowered plan after first failure (stop retrying each step), (2) activate template's buffer arena in fallback `executePlanOptimized`, (3) save/restore dispatch sequence counters on failure to maintain bind group cache alignment. Bind group cache 84.9%→96.2% (98→24 misses). `createBindGroup` 3.7ms→1.0ms. ~2.7ms/step saved.
+24. ~~**Linear op + backward `add` fusion**~~ — DONE. Added `linear(input, weight, bias?)` frontend op with custom backward computing `dW = dY.T @ X` directly in weight's shape (eliminates transpose). Taught epilogue detection to skip reshape that removes leading size-1 dims (`[1,M,N]→[M,N]`), enabling the wte gradient `add` to fuse into the preceding backward matmul. `add` GPU: 4.5ms→0.8ms (max 4380µs→621µs). ~3.7ms GPU/step saved. Submits: 15→14.
+25. ~~**Matmul shape-class config fix + small_k**~~ — DONE. Fixed dead-code bug: `getConfigForShape()` ignored shape class entirely, always returning `DEFAULT_CONFIG` (32×32×16). Shape-specific defaults in `getDefaultConfigForShape()` were never used. Added `small_k` shape class for K<64 with large output (lm_head backward dW). Max matmul GPU: 14.6ms→11ms.
+26. ~~**K-split matmul**~~ — DONE. For small-M backward matmuls (M=31) with large K, the output tile grid (12 workgroups) severely underutilizes the GPU. K-split divides K-reduction across P workgroups in the Z dimension: each Z-slice computes partial sums, then a lightweight reduction kernel sums them. Activated when `baseWorkgroups < 64 && K > 512 && batchSize == 1 && no epilogue`. 25 backward dX matmuls across all 6 transformer layers use K-split. Max matmul GPU: 11ms→1.4ms (−88%). Backward GPU: 28ms→12ms (−57%). Total GPU: 43ms→27ms (−37%). Submits: 14→12.
 
 **Open targets (ranked by estimated savings):**
-1. **CPU dispatch overhead (meta-issue)** — 68% of wall time is CPU, not GPU. `createBindGroup` (19ms, 10% wall) + `queue.submit` (13ms, 7%) + `writeBuffer` (9ms, 4%) = 41ms Dawn API overhead. Bind group caching for identical buffer+layout combos could save ~10-15ms.
-2. **LayerNorm fusion** — Forward plan only 30% fused. 13 unfused `add` ops on `[1,31,768]` and 43 unfused `cast` ops. Fuse the `mean→sub→square→mean→add→sqrt→div→mul→add` chain to push forward fusion from 30% to ~50%+. Saves GPU time + dispatch overhead.
-3. **Submit batching** — 121 submits/step at 107µs avg = 13ms. Increasing reclaim window from 25→50 nodes would halve submits. Risk: higher peak memory.
-4. **Backward matmul outlier** — One matmul at 15.3ms GPU (lm_head backward, vocabulary-sized [50257,768]). Difficult without algorithmic change (e.g., sampled softmax).
-5. **Backward `add` outlier** — One `add` on [50257,768] at 4.8ms GPU. Word embedding gradient accumulation. Could fuse with preceding op.
-6. **Pipeline cache warmup** — Step 0 is 3.4s (17.6x steady-state) due to pipeline compilation. Pre-compile pipeline variants during model load.
-7. **GC pressure** (3.4% CPU, ~41ms/step) — Object pooling for Tensor metadata to reduce garbage collection overhead.
+1. **GPU utilization gap** — 35% utilization (27ms GPU / 78ms wall). ~51ms of pure CPU overhead per step: Dawn API calls, plan management, GC. This is the meta-issue — every CPU-side ms saved directly reduces wall time.
+2. **Adam CPU overhead** — 4.4ms CPU for 5.1ms GPU work. `adam.dispatch` 1.4ms + `adam.configBuf` 0.9ms + `adam.createTensor` 0.6ms. Further reduction possible by caching config buffers.
+3. **Dispatch replay cache** — Infrastructure implemented but disabled (`TORCHLETTE_DISPATCH_REPLAY=1` to opt-in). Fundamental issue: data source nodes (`tensorFromArray`) create new GPUBuffers each step, making replayed bind groups stale. Needs data source buffer pinning or double-buffer scheme to enable.
+4. **Pipeline cache warmup** — Step 0 is 3.5s (40x steady-state) due to pipeline compilation. Pre-compile pipeline variants during model load.
+5. **GC pressure** — Object pooling for Tensor metadata to reduce garbage collection overhead. ~2-3ms/step potential.

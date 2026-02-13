@@ -65,6 +65,7 @@ export type ShapeClass =
   | "square_large" // M,N,K >= 2048
   | "tall_skinny" // M >> K or M >> N
   | "short_wide" // N >> K or N >> M
+  | "small_k" // K < 64, large output (e.g. lm_head backward dW)
   | "gemv" // M=1 or N=1
   | "batched_small"; // batch > 1, small matrices
 
@@ -178,6 +179,11 @@ export function classifyShape(
   // Batched cases
   if (batchSize > 1 && m * n < 512 * 512) {
     return "batched_small";
+  }
+
+  // Small-K: K is very small but output is large (e.g. lm_head backward dW: K=seq_len)
+  if (k < 64 && m * n > 100000) {
+    return "small_k";
   }
 
   // Tall-skinny: M is much larger than K or N

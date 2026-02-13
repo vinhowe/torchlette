@@ -34,6 +34,8 @@ import {
   isF16Supported,
   getBindGroupCacheStats,
   resetBindGroupCacheStats,
+  getBindGroupCacheMissLog,
+  getArenaResolveStats,
 } from "../src/backend/webgpu";
 import { getAndResetFlowCounters, getGPUAllocationHistogram } from "../src/backend/webgpu/memory-tracker";
 import { storageTracker } from "../src/engine/lazy";
@@ -165,7 +167,7 @@ function instrumentedForwardWithLoss(
 
   // --- LM Head ---
   setProfileModule("final.lm_head");
-  const logits = x.matmul(model.wte.weight.transpose({ dim0: 0, dim1: 1 }));
+  const logits = api.linear(x, model.wte.weight, null);
 
   // --- Loss ---
   setProfileModule("loss.cross_entropy");
@@ -381,7 +383,19 @@ async function main() {
 
       // Bind group cache stats
       const bgStats = getBindGroupCacheStats();
-      console.log(`Bind Group Cache: ${bgStats.hits} hits / ${bgStats.misses} misses (${(bgStats.hitRate * 100).toFixed(1)}%), ${bgStats.size} cached entries\n`);
+      console.log(`Bind Group Cache: ${bgStats.hits} hits / ${bgStats.misses} misses (${(bgStats.hitRate * 100).toFixed(1)}%), ${bgStats.size} cached entries`);
+      const arenaStats = getArenaResolveStats();
+      console.log(`Arena resolve: ${arenaStats.hits} hits, ${arenaStats.aliased} aliased (fallthrough), ${arenaStats.noArena} no-arena`);
+      const missLog = getBindGroupCacheMissLog();
+      if (missLog.length > 0) {
+        console.log(`\nBind Group Cache Misses (step 4):`);
+        console.log(`${"Idx".padStart(5)}  ${"Reason".padEnd(20)}  ${"Label".padEnd(28)}  Details`);
+        console.log(`${"─".repeat(5)}  ${"─".repeat(20)}  ${"─".repeat(28)}  ${"─".repeat(40)}`);
+        for (const m of missLog) {
+          console.log(`${String(m.idx).padStart(5)}  ${m.reason.padEnd(20)}  ${(m.label ?? "(null)").padEnd(28)}  ${m.details}`);
+        }
+      }
+      console.log();
 
       // Fusion stats
       if (cumulativeStats) {
