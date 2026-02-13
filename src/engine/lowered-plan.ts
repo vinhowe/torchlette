@@ -257,6 +257,8 @@ export interface DispatchReplayCache {
   entries: ReplayEntry[];
   /** Whether this cache is valid for replay. Set to false on invalidation. */
   valid: boolean;
+  /** GPUBuffers referenced by recorded bind groups that must not be destroyed between steps. */
+  pinnedBuffers?: Set<any>;
 }
 
 // ============================================================================

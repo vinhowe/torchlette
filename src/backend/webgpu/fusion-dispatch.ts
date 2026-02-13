@@ -5,7 +5,7 @@
  * Supports vectorized memory coalescing (§15.3) for improved bandwidth.
  */
 
-import { submitOrCollect, getSharedEncoderInstance, getCurrentOpLabel, createParamsBuffer, releaseParamsBuffer, allocateOutputBuffer, trackSharedEncoderWrite, cachedCreateBindGroup, type RecordedDispatch } from "./index";
+import { submitOrCollect, getSharedEncoderInstance, getCurrentOpLabel, createParamsBuffer, releaseParamsBuffer, allocateOutputBuffer, trackSharedEncoderWrite, cachedCreateBindGroup, type RecordedDispatch, getAndClearLastBindGroupBuffers } from "./index";
 
 /** Module-level recording buffer (shared with index.ts recording system). */
 let fusionRecordingBuffer: RecordedDispatch[] | null = null;
@@ -319,6 +319,7 @@ export function dispatchFusedKernel(
       workgroupsX: workgroups,
       workgroupsY: 1,
       workgroupsZ: 1,
+      buffers: getAndClearLastBindGroupBuffers(),
     });
   }
 
