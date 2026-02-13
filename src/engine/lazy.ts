@@ -26,6 +26,7 @@ import {
   type RecordedDispatch,
   setDispatchSequenceCounters,
   getDispatchSequenceCounters,
+  addReplayPinnedBuffers,
 } from "../backend/webgpu";
 import { profileOpBegin, profileOpEnd, isProfilingEnabled, recordPlanAnalysis, type PlanAnalysis, setProfileModule, getProfileModule, recordFusionFallback } from "../backend/webgpu/profiler";
 import type { Token } from "./tokens";
@@ -3016,9 +3017,11 @@ export async function executeLoweredPlan(
   };
 
   const useTopLevelSharedEncoder = backend.name === "webgpu";
-  // Dispatch replay cache: opt-in. Arena stabilizes storage buffer identities,
-  // but uniform/params buffers in recorded bind groups can be destroyed between
-  // steps (not all are sequence-pinned). Enable with TORCHLETTE_DISPATCH_REPLAY=1.
+  // Dispatch replay cache: opt-in. Arena stabilizes storage buffer identities;
+  // replay pinning prevents uniform/params buffer destruction between steps.
+  // Numerically correct for small models but shows loss divergence on large
+  // models (DistilGPT-2+) after ~5 steps — needs further investigation.
+  // Enable with TORCHLETTE_DISPATCH_REPLAY=1 for ~25% wall-clock improvement.
   const useReplayCache = process.env.TORCHLETTE_DISPATCH_REPLAY === "1";
 
   // =========================================================================
@@ -3782,10 +3785,27 @@ export async function executeLoweredPlan(
       matmulMod.setMatmulRecordingBuffer(null);
       fusionMod.setFusionRecordingBuffer(null);
 
+      // Collect all GPUBuffers referenced by recorded bind groups.
+      // These must be pinned (not destroyed) between steps so replay bind groups stay valid.
+      const pinnedBuffers = new Set<any>();
+      for (const entry of replayEntries) {
+        if (entry.kind === "dispatch" && entry.dispatch.buffers) {
+          for (const b of entry.dispatch.buffers) pinnedBuffers.add(b);
+        }
+        if (entry.kind === "result" && entry.nodeResult.buffer) {
+          pinnedBuffers.add(entry.nodeResult.buffer);
+        }
+      }
+
+      // Activate pinning globally — buffers survive across markStep() boundaries.
+      // Multiple plans accumulate into the same global set.
+      addReplayPinnedBuffers(pinnedBuffers);
+
       // Build and store the dispatch replay cache
       loweredPlan.dispatchCache = {
         entries: replayEntries,
         valid: true,
+        pinnedBuffers,
       };
     }
 

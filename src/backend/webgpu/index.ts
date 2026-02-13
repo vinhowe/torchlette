@@ -535,6 +535,8 @@ class SimpleBufferPool {
     // Arena buffers are owned by the arena — never destroy them.
     // This check covers ALL callers (direct pool calls and wrapper).
     if (arenaBufferSet.has(buffer)) return;
+    // Replay-pinned buffers are referenced by recorded bind groups — never destroy.
+    if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) return;
     // Track deallocation immediately - the memory is now "freeable"
     gpuMemoryTracker.trackDeallocation(buffer);
     // When batching or shared encoder active, defer until after submit
@@ -551,6 +553,8 @@ class SimpleBufferPool {
    * Use for tiny params buffers that are not in the memory tracker.
    */
   deferredDestroyUntracked(buffer: GPUBuffer): void {
+    // Replay-pinned buffers are referenced by recorded bind groups — never destroy.
+    if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) return;
     // When batching, command buffers haven't been submitted yet.
     // scheduleFence()'s onSubmittedWorkDone would resolve before the batch submits,
     // destroying the buffer while it's still referenced by collected command buffers.
@@ -631,6 +635,8 @@ class SimpleBufferPool {
    */
   destroyPendingBuffers(): void {
     for (const { buffer } of this.pendingDestroy) {
+      // Replay-pinned buffers must survive
+      if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) continue;
       try {
         buffer.destroy();
       } catch {
@@ -765,6 +771,11 @@ class SimpleBufferPool {
 
       while (buffers.length > 0 && bytesFreed < bytesNeeded) {
         const buffer = buffers.pop()!;
+        // Replay-pinned buffers must survive — push back and skip.
+        if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) {
+          buffers.push(buffer);
+          break; // Can't evict from this size class
+        }
         this.pooledBufferSet.delete(buffer);
         this.pooledBytes -= sizePerBuffer;
         // Track deallocation and destroy the buffer to actually free GPU memory.
@@ -1041,6 +1052,8 @@ export function deferredDestroyBuffer(buffer: GPUBuffer, size: number): void {
   // Arena buffers are owned by the arena — don't destroy them.
   // The arena will reuse the buffer on the next step.
   if (arenaBufferSet.has(buffer)) return;
+  // Replay-pinned buffers are referenced by recorded bind groups — don't destroy.
+  if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) return;
   bufferPool.deferredDestroy(buffer, size);
 }
 
@@ -1754,6 +1767,8 @@ export async function endBatchExecution(): Promise<void> {
 
   // Now safe to destroy deferred buffers (GPU is done with them)
   for (const buffer of batch.deferredDestroyBuffers) {
+    // Replay-pinned buffers must survive — referenced by recorded bind groups.
+    if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) continue;
     buffer.destroy();
   }
   // Also flush any pending pool buffers since GPU work is complete
@@ -1890,6 +1905,9 @@ export function flushSharedEncoder(): void {
   // matching the original acquisition order for bind group cache stability.
   for (let i = sharedEncoderDeferredUniformBuffers.length - 1; i >= 0; i--) {
     const buf = sharedEncoderDeferredUniformBuffers[i];
+    // Replay-pinned buffers must stay alive — referenced by recorded bind groups.
+    // Don't return them to the pool (prevents reuse and data corruption).
+    if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buf)) continue;
     const sc = paramsBufferSizeClass(buf.size);
     const pool = paramsBufferPools.get(sc);
     if (pool) {
@@ -1952,6 +1970,8 @@ export function endSharedEncoder(): void {
     // Reverse iteration for LIFO stability (see flushSharedEncoder comment).
     for (let i = sharedEncoderDeferredUniformBuffers.length - 1; i >= 0; i--) {
       const buf = sharedEncoderDeferredUniformBuffers[i];
+      // Replay-pinned buffers must stay alive — referenced by recorded bind groups.
+      if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buf)) continue;
       const sc = paramsBufferSizeClass(buf.size);
       const pool = paramsBufferPools.get(sc);
       if (pool) {
@@ -2128,14 +2148,38 @@ export interface RecordedDispatch {
   workgroupsX: number;
   workgroupsY: number;
   workgroupsZ: number;
+  /** GPUBuffers referenced by this bind group. Populated during recording for pinning. */
+  buffers?: GPUBuffer[];
 }
 
 /** Active recording buffer (null = not recording). */
 let dispatchRecordingBuffer: RecordedDispatch[] | null = null;
 
+/** Last bind group's buffer list — captured during recording for pinning. */
+let lastBindGroupBuffers: GPUBuffer[] | null = null;
+
+/** Get and clear the last bind group's buffer list. Used by matmul/fusion recording.
+ *  Also immediately pins the buffers to prevent pool recycling during recording. */
+export function getAndClearLastBindGroupBuffers(): GPUBuffer[] | undefined {
+  const bufs = lastBindGroupBuffers ?? undefined;
+  lastBindGroupBuffers = null;
+  // Immediately pin buffers during recording to prevent pool recycling.
+  // Without this, a params buffer could be released to the pool, reused by a
+  // later op, and overwritten — making the recorded bind group reference stale data.
+  if (bufs && replayPinnedBufferSet) {
+    for (const b of bufs) replayPinnedBufferSet.add(b);
+  }
+  return bufs;
+}
+
 /** Start recording dispatches into the given buffer. */
 export function startDispatchRecording(buffer: RecordedDispatch[]): void {
   dispatchRecordingBuffer = buffer;
+  // Initialize pin set at recording start so buffers are pinned immediately
+  // as they're captured (not deferred until after recording completes).
+  if (!replayPinnedBufferSet) {
+    replayPinnedBufferSet = new Set();
+  }
 }
 
 /** Stop recording dispatches. */
@@ -2181,6 +2225,7 @@ export function dispatchComputePass(
       workgroupsX,
       workgroupsY,
       workgroupsZ,
+      buffers: getAndClearLastBindGroupBuffers(),
     });
   }
 
@@ -2705,6 +2750,8 @@ export function destroyArena(arena: BufferArena): void {
         arenaBufferSet.delete(buffer);
         // Only destroy if not referenced by a live tensor
         if (!bufferPool.isLive(buffer)) {
+          // Replay-pinned buffers must survive
+          if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) continue;
           gpuMemoryTracker.trackDeallocation(buffer);
           buffer.destroy();
         }
@@ -2731,8 +2778,11 @@ function arenaAllocAt(arr: GPUBuffer[], idx: number, sizeBytes: number): GPUBuff
     // Size class changed — destroy old, allocate new below
     arenaBufferSet.delete(existing);
     if (!bufferPool.isLive(existing)) {
-      gpuMemoryTracker.trackDeallocation(existing);
-      existing.destroy();
+      // Replay-pinned buffers must survive
+      if (replayPinnedBufferSet === null || !replayPinnedBufferSet.has(existing)) {
+        gpuMemoryTracker.trackDeallocation(existing);
+        existing.destroy();
+      }
     }
   }
 
@@ -3019,6 +3069,8 @@ const paramsSequenceSet = new Set<GPUBuffer>();
 export function releaseParamsBuffer(buffer: GPUBuffer): void {
   // Sequence-cached params buffers are reused across steps — don't return to pool
   if (paramsSequenceSet.has(buffer)) return;
+  // Replay-pinned buffers must stay alive — referenced by recorded bind groups
+  if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) return;
 
   if (activeBatch) {
     activeBatch.deferredDestroyBuffers.push(buffer);
@@ -3056,7 +3108,17 @@ function profiledWriteBuffer(queue: GPUQueue, buffer: GPUBuffer, offset: number,
   profileApiCall("writeBuffer", () => queue.writeBuffer(buffer, offset, data as ArrayBufferView));
 }
 function profiledCreateBindGroup(device: GPUDevice, descriptor: any): GPUBindGroup {
-  return profileApiCall("createBindGroup", () => device.createBindGroup(descriptor));
+  const bg = profileApiCall("createBindGroup", () => device.createBindGroup(descriptor));
+  // When recording, capture buffer references from the descriptor for replay pinning
+  if (dispatchRecordingBuffer && descriptor.entries) {
+    const bufs: GPUBuffer[] = [];
+    for (const e of descriptor.entries) {
+      const r = e.resource;
+      if (r && typeof r === "object" && "buffer" in r) bufs.push(r.buffer);
+    }
+    lastBindGroupBuffers = bufs;
+  }
+  return bg;
 }
 
 
@@ -3099,6 +3161,7 @@ export function cachedCreateBindGroup(
     }
     if (match) {
       seqCacheHits++;
+      if (dispatchRecordingBuffer) lastBindGroupBuffers = entry.buffers;
       return entry.bindGroup;
     }
   }
@@ -3141,7 +3204,9 @@ export function cachedCreateBindGroup(
     })
   );
 
-  sequenceEntries[idx] = { bindGroup, pipeline, buffers: buffers.slice() };
+  const bufCopy = buffers.slice();
+  sequenceEntries[idx] = { bindGroup, pipeline, buffers: bufCopy };
+  if (dispatchRecordingBuffer) lastBindGroupBuffers = bufCopy;
   return bindGroup;
 }
 
@@ -3201,6 +3266,33 @@ export function getArenaResolveStats(): { hits: number; aliased: number; noArena
 
 export function getBindGroupCacheMissLog(): Array<{ idx: number; reason: string; label: string | null; details: string }> {
   return seqCacheMissLog;
+}
+
+/**
+ * Get the buffer list for a specific dispatch sequence index.
+ * Returns null if the index has no cached entry.
+ * Used by dispatch replay to collect buffers that need pinning.
+ */
+export function getSequenceEntryBuffers(idx: number): GPUBuffer[] | null {
+  const entry = sequenceEntries[idx];
+  return entry ? entry.buffers : null;
+}
+
+// --- Replay Buffer Pinning ---
+// When dispatch replay caches exist, buffers referenced by recorded bind groups
+// must not be destroyed between steps. This set accumulates all such buffers
+// across all plans (forward, backward, optimizer).
+// Checked in deferredDestroy/deferredDestroyUntracked/deferredDestroyBuffer.
+let replayPinnedBufferSet: Set<GPUBuffer> | null = null;
+
+
+/** Add buffers to the replay pinned set. Called when a replay cache is built. */
+export function addReplayPinnedBuffers(pins: Set<GPUBuffer>): void {
+  if (!replayPinnedBufferSet) {
+    replayPinnedBufferSet = new Set(pins);
+  } else {
+    for (const b of pins) replayPinnedBufferSet.add(b);
+  }
 }
 
 /**

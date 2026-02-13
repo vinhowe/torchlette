@@ -2,7 +2,7 @@
  * Matmul dispatch: kernel selection, pipeline caching, and execution.
  */
 
-import { submitOrCollect, getSharedEncoderInstance, getCurrentOpLabel, createParamsBuffer as sharedCreateParamsBuffer, releaseParamsBuffer, cachedCreateBindGroup, type RecordedDispatch } from "../index";
+import { submitOrCollect, getSharedEncoderInstance, getCurrentOpLabel, createParamsBuffer as sharedCreateParamsBuffer, releaseParamsBuffer, cachedCreateBindGroup, type RecordedDispatch, getAndClearLastBindGroupBuffers } from "../index";
 
 /** Module-level recording buffer (shared with index.ts recording system). */
 let matmulRecordingBuffer: RecordedDispatch[] | null = null;
@@ -513,6 +513,7 @@ function dispatchTiledMatmulInternal(options: DispatchMatmulOptions & { config: 
       workgroupsX,
       workgroupsY,
       workgroupsZ,
+      buffers: getAndClearLastBindGroupBuffers(),
     });
   }
 
@@ -709,6 +710,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
         workgroupsX,
         workgroupsY,
         workgroupsZ: kSplitFactor,
+        buffers: getAndClearLastBindGroupBuffers(),
       });
     }
 
@@ -759,6 +761,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
         workgroupsX: reduceWorkgroups,
         workgroupsY: 1,
         workgroupsZ: 1,
+        buffers: getAndClearLastBindGroupBuffers(),
       });
     }
 
@@ -821,6 +824,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
       workgroupsX,
       workgroupsY,
       workgroupsZ,
+      buffers: getAndClearLastBindGroupBuffers(),
     });
   }
 
