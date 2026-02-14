@@ -27,6 +27,8 @@ import {
   setDispatchSequenceCounters,
   getDispatchSequenceCounters,
   addReplayPinnedBuffers,
+  getArenaResolveIndex,
+  setArenaResolveIndexTo,
 } from "../backend/webgpu";
 import { profileOpBegin, profileOpEnd, isProfilingEnabled, recordPlanAnalysis, type PlanAnalysis, setProfileModule, getProfileModule, recordFusionFallback } from "../backend/webgpu/profiler";
 import type { Token } from "./tokens";
@@ -53,6 +55,7 @@ import {
   LoweredPlanBuilder,
   isDataSourceOp,
   isViewOp,
+  ENCODER_COPY_OPS,
   type DispatchReplayCache,
   type ReplayEntry,
   type ReplayNodeResult,
@@ -861,7 +864,7 @@ function getInputStorage(ref: LazyRef, backend?: Backend): StorageHandle {
   if (ref.node.result) {
     return ref.node.result;
   }
-  throw new Error(`Input not ready: node id=${ref.node.id} op=${ref.node.op} shape=[${ref.node.shape}]`);
+  throw new Error(`Input not ready: node id=${ref.node.id} op=${ref.node.op} shape=[${ref.node.shape}] caller=${new Error().stack?.split("\n")[2]?.trim()}`);
 }
 
 /**
@@ -3017,30 +3020,52 @@ export async function executeLoweredPlan(
   };
 
   const useTopLevelSharedEncoder = backend.name === "webgpu";
-  // Dispatch replay cache: opt-in. Arena stabilizes storage buffer identities;
-  // replay pinning prevents uniform/params buffer destruction between steps.
-  // Numerically correct for small models but shows loss divergence on large
-  // models (DistilGPT-2+) after ~5 steps — needs further investigation.
-  // Enable with TORCHLETTE_DISPATCH_REPLAY=1 for ~25% wall-clock improvement.
-  const useReplayCache = process.env.TORCHLETTE_DISPATCH_REPLAY === "1";
+  // Dispatch replay cache: enabled by default. Arena stabilizes storage buffer
+  // identities; replay pinning prevents buffer destruction between steps.
+  // Arena counter sync ensures data-source re-executions write to the correct
+  // arena buffers. Disable with TORCHLETTE_DISPATCH_REPLAY=0.
+  const useReplayCache = process.env.TORCHLETTE_DISPATCH_REPLAY !== "0"
+    && !process.env.TORCHLETTE_PROFILE;
 
   // =========================================================================
   // FAST PATH: Dispatch Replay
   // =========================================================================
   // If we have a valid dispatch replay cache, skip all JS dispatch logic and
-  // replay recorded GPU dispatches directly. Only data sources and view ops
-  // are re-executed (their data changes per step).
+  // replay recorded GPU dispatches directly. Only data sources, view ops, and
+  // encoder-copy ops (scatterAdd) are re-executed (their data or encoder
+  // commands change per step).
   if (useReplayCache && loweredPlan.dispatchCache?.valid && useTopLevelSharedEncoder && options.bufferArena) {
     const cache = loweredPlan.dispatchCache;
     if (useTopLevelSharedEncoder) beginSharedEncoder();
     setActiveArena(options.bufferArena);
+
+    // Compute stats from lowered plan structure (same as normal path would)
+    for (const act of loweredPlan.actions) {
+      if (act.kind === "fused") {
+        stats.fusedNodes += act.coveredNodeIndices.length;
+        stats.fusionGroups++;
+      } else if (act.kind === "sequential" || act.kind === "data-source"
+                 || act.kind === "view" || act.kind === "prologue-skip") {
+        stats.sequentialNodes++;
+      }
+    }
+
+    // Replay timing instrumentation (controlled by env var)
+    const _replayTiming = process.env.TORCHLETTE_REPLAY_TIMING === "1";
+    let _tReplayDispatch = 0, _tDataSource = 0, _tView = 0, _tSequential = 0;
+    let _tAdamBatch = 0, _tReclaim = 0, _tResult = 0, _tLoopOverhead = 0;
+    let _nDispatches = 0, _nDataSources = 0, _nViews = 0, _nSequential = 0;
+    let _nAdamNodes = 0, _nReclaims = 0, _nResults = 0;
+    const _tReplayStart = _replayTiming ? performance.now() : 0;
 
     try {
       // Batch consecutive dispatch entries for efficient replay
       const dispatchBatch: RecordedDispatch[] = [];
       const flushDispatchBatch = () => {
         if (dispatchBatch.length > 0) {
+          const _t0 = _replayTiming ? performance.now() : 0;
           replayDispatches(dispatchBatch);
+          if (_replayTiming) { _tReplayDispatch += performance.now() - _t0; _nDispatches += dispatchBatch.length; }
           dispatchBatch.length = 0;
         }
       };
@@ -3052,20 +3077,49 @@ export async function executeLoweredPlan(
             break;
           case "data-source": {
             flushDispatchBatch();
+            const _dsT0 = _replayTiming ? performance.now() : 0;
+            // Restore arena resolve index to match recording position
+            setArenaResolveIndexTo(entry.arenaResolveIdx);
             const dsNode = planNodes[entry.nodeIndex];
-            if (dsNode.result) break;
+            if (dsNode.result) { if (_replayTiming) { _tDataSource += performance.now() - _dsT0; _nDataSources++; } break; }
             const dsBackend = getBackend(dsNode.device) ?? backend;
             const dsInputs = dsNode.inputs.map(ref => getInputStorage(ref, dsBackend));
             const dsBackendInputs = dsInputs.map(s => s.backendTensor);
             const dsResult = await executeOp(dsNode, dsBackendInputs, dsBackend);
             dsNode.result = createStorageHandle(dsNode.device, dsResult);
+            if (_replayTiming) { _tDataSource += performance.now() - _dsT0; _nDataSources++; }
             break;
           }
-          case "view":
+          case "view": {
+            flushDispatchBatch();
+            const _vT0 = _replayTiming ? performance.now() : 0;
+            // Restore arena resolve index to match recording position
+            setArenaResolveIndexTo(entry.arenaResolveIdx);
+            const vNode = planNodes[entry.nodeIndex];
+            if (vNode.result) { if (_replayTiming) { _tView += performance.now() - _vT0; _nViews++; } break; }
+            const vNodeBackend = getBackend(vNode.device) ?? backend;
+            const vInputs = vNode.inputs.map(ref => getInputStorage(ref, vNodeBackend));
+            const vBackendInputs = vInputs.map(s => s.backendTensor);
+            let vResultTensor = await executeOp(vNode, vBackendInputs, vNodeBackend);
+            const vAliasedInputIdx = vBackendInputs.findIndex(b => b === vResultTensor);
+            if (vAliasedInputIdx >= 0 && (vResultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
+              vResultTensor = { ...vResultTensor, ownsBuffer: false } as BackendTensor;
+            }
+            const vIsView = (vResultTensor as { ownsBuffer?: boolean }).ownsBuffer === false;
+            const vBaseStorageId = vIsView && vInputs.length > 0
+              ? vInputs[vAliasedInputIdx >= 0 ? vAliasedInputIdx : 0].id
+              : undefined;
+            vNode.result = createStorageHandle(vNode.device, vResultTensor, vBaseStorageId);
+            if (_replayTiming) { _tView += performance.now() - _vT0; _nViews++; }
+            break;
+          }
           case "sequential": {
             flushDispatchBatch();
+            const _seqT0 = _replayTiming ? performance.now() : 0;
+            // Restore arena resolve index so re-executed op allocates the correct arena buffer
+            setArenaResolveIndexTo(entry.arenaResolveIdx);
             const node = planNodes[entry.nodeIndex];
-            if (node.result) break;
+            if (node.result) { if (_replayTiming) { _tSequential += performance.now() - _seqT0; _nSequential++; } break; }
             const nodeBackend = getBackend(node.device) ?? backend;
             const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
             const backendInputs = inputs.map(s => s.backendTensor);
@@ -3079,10 +3133,12 @@ export async function executeLoweredPlan(
               ? inputs[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
               : undefined;
             node.result = createStorageHandle(node.device, resultTensor, baseStorageId);
+            if (_replayTiming) { _tSequential += performance.now() - _seqT0; _nSequential++; }
             break;
           }
           case "adam-batch": {
             flushDispatchBatch();
+            const _adamT0 = _replayTiming ? performance.now() : 0;
             flushSharedEncoder();
             flushBufferPool();
             // Set sequence counters so adam dispatches hit the correct cache positions
@@ -3134,22 +3190,30 @@ export async function executeLoweredPlan(
             } finally {
               setAdamBatchMode(false);
             }
+            if (_replayTiming) { _tAdamBatch += performance.now() - _adamT0; _nAdamNodes += entry.nodeIndices.length; }
             break;
           }
-          case "reclaim":
+          case "reclaim": {
             // During replay, flush encoder to submit pending dispatches but
             // skip pool reclamation — arena buffers are persistent.
             flushDispatchBatch();
+            const _rclT0 = _replayTiming ? performance.now() : 0;
             flushSharedEncoder();
+            if (_replayTiming) { _tReclaim += performance.now() - _rclT0; _nReclaims++; }
             break;
-          case "pre-adam-reclaim":
+          }
+          case "pre-adam-reclaim": {
             flushDispatchBatch();
+            const _parT0 = _replayTiming ? performance.now() : 0;
             // Still need pre-adam flush for Adam's flushSharedEncoder requirement
             flushSharedEncoder();
             flushBufferPool();
+            if (_replayTiming) { _tReclaim += performance.now() - _parT0; _nReclaims++; }
             break;
+          }
           case "result": {
             flushDispatchBatch();
+            const _rsT0 = _replayTiming ? performance.now() : 0;
             // Assign node result from cached metadata (arena buffers are stable).
             // Arena buffers persist across steps — ownsBuffer: false, no-op destroy.
             const nr = entry.nodeResult;
@@ -3167,6 +3231,7 @@ export async function executeLoweredPlan(
                 destroy() {},
               } as BackendTensor);
             }
+            if (_replayTiming) { _tResult += performance.now() - _rsT0; _nResults++; }
             break;
           }
         }
@@ -3174,7 +3239,14 @@ export async function executeLoweredPlan(
       flushDispatchBatch(); // Flush remaining batched dispatches
     } finally {
       clearActiveArena();
+      const _tEndT0 = _replayTiming ? performance.now() : 0;
       if (useTopLevelSharedEncoder) endSharedEncoder();
+      const _tEnd = _replayTiming ? performance.now() - _tEndT0 : 0;
+      if (_replayTiming) {
+        const _tTotal = performance.now() - _tReplayStart;
+        const _tAccounted = _tReplayDispatch + _tDataSource + _tView + _tSequential + _tAdamBatch + _tReclaim + _tResult + _tEnd;
+        console.log(`[replay-timing] nodes=${plan.nodes.length} entries=${cache.entries.length} | total=${_tTotal.toFixed(1)}ms | dispatch=${_tReplayDispatch.toFixed(1)}ms(${_nDispatches}) dataSrc=${_tDataSource.toFixed(1)}ms(${_nDataSources}) view=${_tView.toFixed(1)}ms(${_nViews}) seq=${_tSequential.toFixed(1)}ms(${_nSequential}) adam=${_tAdamBatch.toFixed(1)}ms(${_nAdamNodes}) reclaim=${_tReclaim.toFixed(1)}ms(${_nReclaims}) result=${_tResult.toFixed(1)}ms(${_nResults}) endEnc=${_tEnd.toFixed(1)}ms | unaccounted=${(_tTotal - _tAccounted).toFixed(1)}ms`);
+      }
     }
 
     // Get the result from the last original plan node
@@ -3420,13 +3492,20 @@ export async function executeLoweredPlan(
           // ── SLOW PATH: first lowered plan execution — full reconstruction ──
 
           // Reconstruct the epilogue input refs from the covered nodes.
+          // For each add/mul in the chain, the "external" input (not from the chain)
+          // is the epilogue input. The chain may connect via inputs[0] or inputs[1]
+          // (commutative ops), so we check which input is the previous chain node.
           const epilogueInputRefs: LazyRef[] = [];
           const epilogueInputPaths: Array<{ planNodeIndex: number; inputIndex: number }> = [];
           for (let ci = 1; ci < action.coveredNodeIndices.length; ci++) {
             const chainNode = planNodes[action.coveredNodeIndices[ci]];
             if ((chainNode.op === "add" || chainNode.op === "mul") && chainNode.inputs.length === 2) {
-              epilogueInputRefs.push(chainNode.inputs[1]);
-              epilogueInputPaths.push({ planNodeIndex: action.coveredNodeIndices[ci], inputIndex: 1 });
+              const prevChainNodeId = planNodes[action.coveredNodeIndices[ci - 1]].id;
+              const inp0IsChain = chainNode.inputs[0].kind === "pending"
+                && chainNode.inputs[0].node.id === prevChainNodeId;
+              const externalIdx = inp0IsChain ? 1 : 0;
+              epilogueInputRefs.push(chainNode.inputs[externalIdx]);
+              epilogueInputPaths.push({ planNodeIndex: action.coveredNodeIndices[ci], inputIndex: externalIdx });
             }
           }
 
@@ -3703,6 +3782,9 @@ export async function executeLoweredPlan(
           const node = planNodes[nodeIdx];
           if (node.result) break;
 
+          // Capture arena resolve index BEFORE execution (op may advance it)
+          const arenaResolveIdxBefore = shouldRecord ? getArenaResolveIndex() : 0;
+
           const nodeBackend = getBackend(node.device) ?? backend;
           const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
           const backendInputs = inputs.map(s => s.backendTensor);
@@ -3722,9 +3804,18 @@ export async function executeLoweredPlan(
           // Record for replay cache
           if (shouldRecord) {
             if (action.kind === "data-source" || action.kind === "view") {
-              // Data sources and views must re-execute each step
-              replayEntries.push({ kind: action.kind, nodeIndex: nodeIdx });
+              // Data sources and views must re-execute each step.
+              // Record arena resolve index so replay can restore counter position.
+              replayEntries.push({ kind: action.kind, nodeIndex: nodeIdx, arenaResolveIdx: arenaResolveIdxBefore });
               // Skip any dispatches (data sources may trigger GPU ops)
+              while (recordingDispatchIdx < recordingBuffer.length) {
+                recordingDispatchIdx++;
+              }
+            } else if (ENCODER_COPY_OPS.has(node.op)) {
+              // Ops that use encoder copy commands (copyBufferToBuffer) alongside
+              // compute dispatches must be re-executed during replay — the copy
+              // commands are invisible to the compute dispatch recording mechanism.
+              replayEntries.push({ kind: "sequential", nodeIndex: nodeIdx, arenaResolveIdx: arenaResolveIdxBefore });
               while (recordingDispatchIdx < recordingBuffer.length) {
                 recordingDispatchIdx++;
               }

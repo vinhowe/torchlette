@@ -2734,9 +2734,22 @@ export function clearActiveArena(): void {
   arenaAllocIndex = 0;
 }
 
+/** Get the current arena resolve index (for dispatch replay recording). */
+export function getArenaResolveIndex(): number { return arenaResolveIndex; }
+
+/** Set the arena resolve index to a specific value (for dispatch replay restore). */
+export function setArenaResolveIndexTo(idx: number): void { arenaResolveIndex = idx; }
+
 /** Check if a buffer is owned by an arena (should not be released to pool). */
 export function isArenaBuffer(buffer: GPUBuffer): boolean {
   return arenaBufferSet.has(buffer);
+}
+
+/** Classify a buffer for replay debugging. */
+export function classifyBuffer(buffer: GPUBuffer): string {
+  if (arenaBufferSet.has(buffer)) return "arena";
+  if (paramsSequenceSet.has(buffer)) return "params-seq";
+  return `other(size=${buffer.size})`;
 }
 
 /**
