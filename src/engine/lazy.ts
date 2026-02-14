@@ -3093,23 +3093,36 @@ export async function executeLoweredPlan(
           case "view": {
             flushDispatchBatch();
             const _vT0 = _replayTiming ? performance.now() : 0;
-            // Restore arena resolve index to match recording position
-            setArenaResolveIndexTo(entry.arenaResolveIdx);
             const vNode = planNodes[entry.nodeIndex];
             if (vNode.result) { if (_replayTiming) { _tView += performance.now() - _vT0; _nViews++; } break; }
-            const vNodeBackend = getBackend(vNode.device) ?? backend;
-            const vInputs = vNode.inputs.map(ref => getInputStorage(ref, vNodeBackend));
-            const vBackendInputs = vInputs.map(s => s.backendTensor);
-            let vResultTensor = await executeOp(vNode, vBackendInputs, vNodeBackend);
-            const vAliasedInputIdx = vBackendInputs.findIndex(b => b === vResultTensor);
-            if (vAliasedInputIdx >= 0 && (vResultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
-              vResultTensor = { ...vResultTensor, ownsBuffer: false } as BackendTensor;
+            if (entry.cachedResult) {
+              // Fast path: reconstruct from cached metadata (arena buffers stable)
+              setArenaResolveIndexTo(entry.arenaResolveIdxAfter ?? entry.arenaResolveIdx);
+              const cr = entry.cachedResult;
+              vNode.result = createStorageHandle(vNode.device, {
+                buffer: cr.buffer,
+                shape: cr.shape,
+                dtype: cr.dtype,
+                size: cr.size,
+                strides: cr.strides,
+                offset: cr.offset,
+                isContiguous: cr.isContiguous,
+                ownsBuffer: false,
+                destroy() {},
+              } as BackendTensor);
+            } else {
+              // Slow path: re-execute (first replay before cache populated)
+              setArenaResolveIndexTo(entry.arenaResolveIdx);
+              const vNodeBackend = getBackend(vNode.device) ?? backend;
+              const vInputs = vNode.inputs.map(ref => getInputStorage(ref, vNodeBackend));
+              const vBackendInputs = vInputs.map(s => s.backendTensor);
+              let vResultTensor = await executeOp(vNode, vBackendInputs, vNodeBackend);
+              const vAliasedInputIdx = vBackendInputs.findIndex(b => b === vResultTensor);
+              if (vAliasedInputIdx >= 0 && (vResultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
+                vResultTensor = { ...vResultTensor, ownsBuffer: false } as BackendTensor;
+              }
+              vNode.result = createStorageHandle(vNode.device, vResultTensor);
             }
-            const vIsView = (vResultTensor as { ownsBuffer?: boolean }).ownsBuffer === false;
-            const vBaseStorageId = vIsView && vInputs.length > 0
-              ? vInputs[vAliasedInputIdx >= 0 ? vAliasedInputIdx : 0].id
-              : undefined;
-            vNode.result = createStorageHandle(vNode.device, vResultTensor, vBaseStorageId);
             if (_replayTiming) { _tView += performance.now() - _vT0; _nViews++; }
             break;
           }
@@ -3803,11 +3816,31 @@ export async function executeLoweredPlan(
 
           // Record for replay cache
           if (shouldRecord) {
-            if (action.kind === "data-source" || action.kind === "view") {
-              // Data sources and views must re-execute each step.
-              // Record arena resolve index so replay can restore counter position.
-              replayEntries.push({ kind: action.kind, nodeIndex: nodeIdx, arenaResolveIdx: arenaResolveIdxBefore });
-              // Skip any dispatches (data sources may trigger GPU ops)
+            if (action.kind === "data-source") {
+              // Data sources must re-execute each step (host data changes).
+              replayEntries.push({ kind: "data-source", nodeIndex: nodeIdx, arenaResolveIdx: arenaResolveIdxBefore });
+              while (recordingDispatchIdx < recordingBuffer.length) {
+                recordingDispatchIdx++;
+              }
+            } else if (action.kind === "view") {
+              // Views produce deterministic results (same arena buffer, same
+              // shape/strides/offset). Cache the result to skip re-execution.
+              const bt = node.result!.backendTensor as any;
+              replayEntries.push({
+                kind: "view",
+                nodeIndex: nodeIdx,
+                arenaResolveIdx: arenaResolveIdxBefore,
+                arenaResolveIdxAfter: getArenaResolveIndex(),
+                cachedResult: {
+                  buffer: bt.buffer,
+                  shape: bt.shape?.slice() ?? [],
+                  dtype: bt.dtype ?? "f32",
+                  size: bt.size ?? 0,
+                  strides: bt.strides?.slice() ?? [],
+                  offset: bt.offset ?? 0,
+                  isContiguous: bt.isContiguous ?? true,
+                },
+              });
               while (recordingDispatchIdx < recordingBuffer.length) {
                 recordingDispatchIdx++;
               }
