@@ -238,9 +238,9 @@ export interface ReplayNodeResult {
  */
 export type ReplayEntry =
   | { kind: "dispatch"; dispatch: ReplayDispatch }
-  | { kind: "data-source"; nodeIndex: number }
-  | { kind: "view"; nodeIndex: number }
-  | { kind: "sequential"; nodeIndex: number }
+  | { kind: "data-source"; nodeIndex: number; arenaResolveIdx: number }
+  | { kind: "view"; nodeIndex: number; arenaResolveIdx: number }
+  | { kind: "sequential"; nodeIndex: number; arenaResolveIdx: number }
   | { kind: "result"; nodeResult: ReplayNodeResult }
   | { kind: "adam-batch"; nodeIndices: number[];
       /** Sequence counter positions at adam batch start (for correct cache indexing). */
@@ -272,6 +272,15 @@ const DATA_SOURCE_OPS: ReadonlySet<string> = new Set([
 /** View ops that produce views (no GPU dispatch, metadata only). */
 const VIEW_OPS: ReadonlySet<string> = new Set([
   "reshape", "transpose", "permute", "expand", "narrow",
+]);
+
+/**
+ * Sequential ops that use encoder copy commands (copyBufferToBuffer) alongside
+ * compute dispatches. These must be re-executed during dispatch replay because
+ * the copy commands are invisible to the compute dispatch recording mechanism.
+ */
+export const ENCODER_COPY_OPS: ReadonlySet<string> = new Set([
+  "scatterAdd",
 ]);
 
 // ============================================================================

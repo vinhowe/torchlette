@@ -430,13 +430,18 @@ export class RuntimeEngine {
       return;
     }
 
+    const _forceTiming = process.env.TORCHLETTE_REPLAY_TIMING === "1";
+    const _forceT0 = _forceTiming ? performance.now() : 0;
     const plan = buildPlan(lazyRef.node);
+    const _buildT = _forceTiming ? performance.now() - _forceT0 : 0;
     const backend = this.getBackend(tensor.device);
 
     // --- Lowered Plan Fast-Path ---
     // Try cached lowered execution plan first.
     if (tensor.device === "webgpu" && this.fusionEnabled) {
+      const _lpT0 = _forceTiming ? performance.now() : 0;
       const executed = await this.tryLoweredPlanExecution(plan, [tensor], tensor.device);
+      if (_forceTiming) console.log(`[force-timing] nodes=${plan.nodes.length} buildPlan=${_buildT.toFixed(1)}ms lowered=${executed ? "HIT" : "MISS"} loweredTime=${(performance.now() - _lpT0).toFixed(1)}ms`);
       if (executed) return;
     }
 
@@ -641,6 +646,9 @@ export class RuntimeEngine {
       // Lowered plan execution failed — clean up and fall through.
       // Disable lowered plan for this fingerprint so we don't retry every step.
       // The template's bufferArena is preserved so executePlanOptimized can use it.
+      if (process.env.TORCHLETTE_REPLAY_TIMING === "1") {
+        console.log(`[lowered-plan-fail] nodes=${plan.nodes.length} fingerprint=${fingerprint} error=${err instanceof Error ? err.message : String(err)}`);
+      }
       template.loweredPlan = undefined;
 
       // Restore dispatch sequence counters so the fallback executePlanOptimized
@@ -688,7 +696,10 @@ export class RuntimeEngine {
     }
 
     // Build ONE merged plan from all pending roots
+    const _famTiming = process.env.TORCHLETTE_REPLAY_TIMING === "1";
+    const _famT0 = _famTiming ? performance.now() : 0;
     const plan = buildMergedPlan(pendingRoots);
+    const _famBuildT = _famTiming ? performance.now() - _famT0 : 0;
 
     if (plan.nodes.length === 0) {
       return;
@@ -706,7 +717,9 @@ export class RuntimeEngine {
 
     // Lowered plan fast-path for forceAllMerged
     if (device === "webgpu" && this.fusionEnabled) {
+      const _famLpT0 = _famTiming ? performance.now() : 0;
       const executed = await this.tryLoweredPlanExecution(plan, tensors, device);
+      if (_famTiming) console.log(`[forceAllMerged-timing] nodes=${plan.nodes.length} pendingRoots=${pendingRoots.length} buildPlan=${_famBuildT.toFixed(1)}ms lowered=${executed ? "HIT" : "MISS"} loweredTime=${(performance.now() - _famLpT0).toFixed(1)}ms`);
       if (executed) return;
     }
 
