@@ -50,6 +50,7 @@ import { crossEntropy } from "../src/nn";
 
 const NUM_STEPS = 5;
 const PROFILE_STEP = 4; // Which step to analyze in detail (steady-state)
+const BATCH_SIZE = parseInt(process.env.TORCHLETTE_BATCH_SIZE ?? "1", 10);
 
 // First 32 tokens of Shakespeare sonnets
 const FIXED_TOKENS: number[] = [
@@ -213,7 +214,8 @@ async function main() {
   const optimizer = new Adam(model.parameters(), { lr: 1e-4 }, api);
   const useAMP = isF16Supported();
   const scaler = useAMP ? new GradScaler(api, { initScale: 1024.0 }) : null;
-  console.log(`AMP (f16): ${useAMP ? "enabled" : "disabled (shader-f16 not available)"}\n`);
+  console.log(`AMP (f16): ${useAMP ? "enabled" : "disabled (shader-f16 not available)"}`);
+  console.log(`Batch size: ${BATCH_SIZE}, Sequence length: ${FIXED_TOKENS.length - 1}\n`);
 
   // Compiled forward with module instrumentation
   const compiledForward = api.compile((input: Tensor, target: Tensor) => {
@@ -225,8 +227,16 @@ async function main() {
     return instrumentedForwardWithLoss(model, api, input, target);
   });
 
-  const inputData = FIXED_TOKENS.slice(0, -1); // 31 tokens
-  const targetData = FIXED_TOKENS.slice(1); // 31 tokens
+  const inputTokens = FIXED_TOKENS.slice(0, -1); // 31 tokens
+  const targetTokens = FIXED_TOKENS.slice(1); // 31 tokens
+  // Tile tokens across batch dimension
+  const inputData: number[] = [];
+  const targetData: number[] = [];
+  for (let b = 0; b < BATCH_SIZE; b++) {
+    inputData.push(...inputTokens);
+    targetData.push(...targetTokens);
+  }
+  const seqLen = inputTokens.length;
 
   const allTimings: { step: number; loss: number; fwd: number; bwd: number; opt: number; cleanup: number; submits: number }[] = [];
 
@@ -248,8 +258,8 @@ async function main() {
   for (let step = 0; step < NUM_STEPS; step++) {
     if (scaler) await scaler.resolveDeferred();
     await api.beginStep();
-    const input = api.tensorFromArray(inputData, [1, inputData.length], { device: "webgpu" });
-    const target = api.tensorFromArray(targetData, [1, targetData.length], { device: "webgpu" });
+    const input = api.tensorFromArray(inputData, [BATCH_SIZE, seqLen], { device: "webgpu" });
+    const target = api.tensorFromArray(targetData, [BATCH_SIZE, seqLen], { device: "webgpu" });
 
     resetSubmitCount();
     resetProfileStats();

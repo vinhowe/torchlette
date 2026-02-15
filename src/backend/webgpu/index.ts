@@ -1304,6 +1304,20 @@ let lastInitError: string | null = null;
  */
 const f16WeightCache = new Map<GPUBuffer, GPUBuffer>();
 
+/** Set an entry in the f16 weight cache (used by packed Adam). */
+export function setF16WeightCacheEntry(paramBuffer: GPUBuffer, f16Buffer: GPUBuffer): void {
+  f16WeightCache.set(paramBuffer, f16Buffer);
+}
+
+/** Evict and optionally destroy an f16 weight cache entry (used by packed Adam). */
+export function evictF16WeightCacheEntry(paramBuffer: GPUBuffer): GPUBuffer | undefined {
+  const old = f16WeightCache.get(paramBuffer);
+  if (old) {
+    f16WeightCache.delete(paramBuffer);
+  }
+  return old;
+}
+
 /**
  * Check if we're running in a browser environment with native WebGPU.
  */
@@ -1834,9 +1848,10 @@ let stepLevelScope = false; // true between beginStep() and endStep()
 const SHARED_ENCODER_MAX_PASSES = 2000;
 
 // Auto-flush when deferred uniform buffers exceed this threshold.
-// This returns params buffers to the pool so subsequent dispatches can reuse them
-// instead of calling device.createBuffer() for every uniform buffer.
-const PARAMS_FLUSH_THRESHOLD = 256;
+// With paramsSequenceBuffers caching, most params are reused directly and never
+// deferred. Only evicted buffers enter the deferred list, which is typically <10
+// per step in steady state. Threshold matches SHARED_ENCODER_MAX_PASSES.
+const PARAMS_FLUSH_THRESHOLD = 2000;
 
 // Debug flag: set TORCHLETTE_DEBUG_SHARED_ENCODER=1 to enable verbose logging
 const DEBUG_SHARED_ENCODER = typeof process !== "undefined" && !!process.env?.TORCHLETTE_DEBUG_SHARED_ENCODER;
@@ -3536,6 +3551,8 @@ function requireShape(node: IRNode): number[] {
 function buildFusedElementwiseShader(
   graph: IRGraph,
   recipe: FusionRecipe,
+  use2D?: boolean,
+  shaderGridSizeX?: number,
 ): string {
   if (recipe.outputs.length !== 1) {
     throw new Error("fused elementwise expects a single output");
@@ -3610,7 +3627,7 @@ ${indexing.declarations}
 
 @compute @workgroup_size(${WORKGROUP_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = gid.x;
+  let idx = ${use2D ? `gid.x + gid.y * ${shaderGridSizeX}u` : "gid.x"};
   if (idx >= params.size) {
     return;
   }
@@ -4432,7 +4449,11 @@ export function runFusedElementwise(
     }
   });
 
-  const code = buildFusedElementwiseShader(graph, recipe);
+  const totalWorkgroups = Math.ceil(size / WORKGROUP_SIZE);
+  const dispatch = compute2DDispatch(totalWorkgroups);
+  const use2D = dispatch.y > 1;
+  const shaderGridSizeX = dispatch.x * WORKGROUP_SIZE;
+  const code = buildFusedElementwiseShader(graph, recipe, use2D, shaderGridSizeX);
   const pipeline = getPipeline(ctx, `fused:${code}`, code);
   const outBuffer = createTrackedBuffer(ctx.device, {
     size: size * 4,
@@ -4443,7 +4464,7 @@ export function runFusedElementwise(
   bgBuffers.push(outBuffer);
   bgBuffers.push(params);
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, bgBuffers);
-  dispatchComputePass(pipeline, bindGroup, Math.ceil(size / WORKGROUP_SIZE));
+  dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
   releaseUniformBuffer(params);
   return createTensor(outShape, outBuffer);
 }
@@ -5826,11 +5847,6 @@ function narrowBackward(grad: BackendTensor, dim: number, start: number, origina
   const dtype = gradTensor.dtype;
   const bytesPerElement = dtype === "f16" ? 2 : 4;
 
-  const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * bytesPerElement,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-  });
-
   const outerSize = outShape.slice(0, dim).reduce((a, b) => a * b, 1);
   const innerSize = outShape.slice(dim + 1).reduce((a, b) => a * b, 1);
   const gradDimSize = gradTensor.shape[dim]; // = length from narrow
@@ -5876,12 +5892,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   const key = `narrowBackward:${outDimSize}:${gradDimSize}:${start}:${outSize}:${dtype}:${use2D ? `2d:${gridSizeX}` : "1d"}`;
 
-  dispatchElementwise({
+  const outBuffer = dispatchElementwise({
     key, shader: shaderCode,
     inputs: [gradTensor.buffer],
     outputSizeBytes: outSize * bytesPerElement,
     params: params4(outerSize, innerSize, gradDimSize, start),
-    outBuffer,
     dispatchX: dispatch.x, dispatchY: dispatch.y,
   });
 
@@ -6707,6 +6722,11 @@ function sliceBColumns(
   });
 
   // Shader to copy column slice
+  const sliceTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
+  const sliceDispatch = compute2DDispatch(sliceTotalWG);
+  const sliceUse2D = sliceDispatch.y > 1;
+  const sliceGridSizeX = sliceDispatch.x * WORKGROUP_SIZE;
+
   const code = `
 struct Params {
   batch: u32,
@@ -6722,7 +6742,7 @@ struct Params {
 
 @compute @workgroup_size(${WORKGROUP_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = gid.x;
+  let idx = ${sliceUse2D ? `gid.x + gid.y * ${sliceGridSizeX}u` : "gid.x"};
   let totalSize = params.batch * params.K * params.chunkWidth;
   if (idx >= totalSize) { return; }
 
@@ -6738,15 +6758,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-  const key = `sliceBColumns:${batch}:${K}:${N}:${WORKGROUP_SIZE}`;
+  const key = `sliceBColumns:${batch}:${K}:${N}:${WORKGROUP_SIZE}:${sliceUse2D ? "2d" : "1d"}`;
   const pipeline = getPipeline(ctx, key, code);
 
   const paramsBuffer = createParamsBuffer(ctx.device, params5(batch, K, N, colStart, chunkWidth));
 
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [b.buffer, outBuffer, paramsBuffer]);
 
-  const workgroups = Math.ceil(outSize / WORKGROUP_SIZE);
-  dispatchComputePass(pipeline, bindGroup, workgroups, 1);
+  dispatchComputePass(pipeline, bindGroup, sliceDispatch.x, sliceDispatch.y);
 
   releaseParamsBuffer(paramsBuffer);
 
@@ -7576,6 +7595,11 @@ function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
   const reduceDimsArray = `array<u32, ${normalizedDims.length}>(${normalizedDims.map((d) => `${d}u`).join(", ")})`;
   const inputToOutDimArray = `array<i32, ${rank}>(${inputToOutDim.map((d) => `${d}i`).join(", ")})`;
 
+  const sumTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
+  const sumDispatch = compute2DDispatch(sumTotalWG);
+  const sumUse2D = sumDispatch.y > 1;
+  const sumGridSizeX = sumDispatch.x * WORKGROUP_SIZE;
+
   const code = `
 struct Params {
   outSize: u32,
@@ -7616,7 +7640,7 @@ fn getReduceDimIndex(d: u32) -> u32 {
 
 @compute @workgroup_size(${WORKGROUP_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let outIdx = gid.x;
+  let outIdx = ${sumUse2D ? `gid.x + gid.y * ${sumGridSizeX}u` : "gid.x"};
   if (outIdx >= params.outSize) {
     return;
   }
@@ -7687,7 +7711,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   const pipeline = getPipeline(
     ctx,
-    `sum:${inputShape.join(",")}:${normalizedDims.join(",")}:${keepdim}`,
+    `sum:${inputShape.join(",")}:${normalizedDims.join(",")}:${keepdim}:${sumUse2D ? "2d" : "1d"}`,
     code,
   );
 
@@ -7695,7 +7719,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, paramsBuffer]);
 
-  dispatchComputePass(pipeline, bindGroup, Math.ceil(outSize / WORKGROUP_SIZE));
+  dispatchComputePass(pipeline, bindGroup, sumDispatch.x, sumDispatch.y);
 
   releaseParamsBuffer(paramsBuffer);
   if (contiguousCopy) contiguousCopy.destroy();
@@ -7803,6 +7827,11 @@ export function sumDimWithPreamble(
   const reduceDimsArray = `array<u32, ${normalizedDims.length}>(${normalizedDims.map((d: number) => `${d}u`).join(", ")})`;
   const inputToOutDimArray = `array<i32, ${rank}>(${inputToOutDim.map((d: number) => `${d}i`).join(", ")})`;
 
+  const spTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
+  const spDispatch = compute2DDispatch(spTotalWG);
+  const spUse2D = spDispatch.y > 1;
+  const spGridSizeX = spDispatch.x * WORKGROUP_SIZE;
+
   const code = `
 struct Params {
   outSize: u32,
@@ -7839,7 +7868,7 @@ fn getReduceDimIndex(d: u32) -> u32 {
 
 @compute @workgroup_size(${WORKGROUP_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let outIdx = gid.x;
+  let outIdx = ${spUse2D ? `gid.x + gid.y * ${spGridSizeX}u` : "gid.x"};
   if (outIdx >= params.outSize) { return; }
 
   var outCoords: array<u32, ${Math.max(outShape.length, 1)}>;
@@ -7886,7 +7915,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-  const cacheKey = `sumPreamble:${preambleOp}:${inputShape.join(",")}:${normalizedDims.join(",")}:${keepdim}`;
+  const cacheKey = `sumPreamble:${preambleOp}:${inputShape.join(",")}:${normalizedDims.join(",")}:${keepdim}:${spUse2D ? "2d" : "1d"}`;
   const pipeline = getPipeline(ctx, cacheKey, code);
   const paramsBuffer = createParamsBuffer(ctx.device, params2(outSize, reductionSize));
 
@@ -7898,7 +7927,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   bgBuffers.push(paramsBuffer);
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, bgBuffers);
 
-  dispatchComputePass(pipeline, bindGroup, Math.ceil(outSize / WORKGROUP_SIZE));
+  dispatchComputePass(pipeline, bindGroup, spDispatch.x, spDispatch.y);
   releaseParamsBuffer(paramsBuffer);
 
   return createTensor(outShape, outBuffer);
@@ -8339,10 +8368,7 @@ function max(a: BackendTensor, options?: MaxOptions): BackendTensor {
   }
 
   const outSize = outShape.reduce((acc, d) => acc * d, 1);
-  const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-  });
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
 
   const inputStrides: number[] = [];
   for (let i = 0; i < rank; i++) {
@@ -8396,6 +8422,11 @@ function max(a: BackendTensor, options?: MaxOptions): BackendTensor {
   const reduceDimsArray = `array<u32, ${normalizedDims.length}>(${normalizedDims.map((d) => `${d}u`).join(", ")})`;
   const inputToOutDimArray = `array<i32, ${rank}>(${inputToOutDim.map((d) => `${d}i`).join(", ")})`;
 
+  const maxTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
+  const maxDispatch = compute2DDispatch(maxTotalWG);
+  const maxUse2D = maxDispatch.y > 1;
+  const maxGridSizeX = maxDispatch.x * WORKGROUP_SIZE;
+
   const code = `
 struct Params {
   outSize: u32,
@@ -8436,7 +8467,7 @@ fn getReduceDimIndex(d: u32) -> u32 {
 
 @compute @workgroup_size(${WORKGROUP_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let outIdx = gid.x;
+  let outIdx = ${maxUse2D ? `gid.x + gid.y * ${maxGridSizeX}u` : "gid.x"};
   if (outIdx >= params.outSize) {
     return;
   }
@@ -8502,7 +8533,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   const pipeline = getPipeline(
     ctx,
-    `max:${inputShape.join(",")}:${normalizedDims.join(",")}:${keepdim}`,
+    `max:${inputShape.join(",")}:${normalizedDims.join(",")}:${keepdim}:${maxUse2D ? "2d" : "1d"}`,
     code,
   );
 
@@ -8510,7 +8541,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, paramsBuffer]);
 
-  dispatchComputePass(pipeline, bindGroup, Math.ceil(outSize / WORKGROUP_SIZE));
+  dispatchComputePass(pipeline, bindGroup, maxDispatch.x, maxDispatch.y);
 
   releaseParamsBuffer(paramsBuffer);
 
@@ -8554,6 +8585,11 @@ function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
 
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [sumTensor.buffer]);
 
+  const meanTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
+  const meanDispatch = compute2DDispatch(meanTotalWG);
+  const meanUse2D = meanDispatch.y > 1;
+  const meanGridSizeX = meanDispatch.x * WORKGROUP_SIZE;
+
   const code = `
 struct Params {
   size: u32,
@@ -8566,7 +8602,7 @@ struct Params {
 
 @compute @workgroup_size(${WORKGROUP_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = gid.x;
+  let idx = ${meanUse2D ? `gid.x + gid.y * ${meanGridSizeX}u` : "gid.x"};
   if (idx >= params.size) {
     return;
   }
@@ -8574,7 +8610,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-  const pipeline = getPipeline(ctx, `meanDiv:${outSize}:${count}`, code);
+  const pipeline = getPipeline(ctx, `meanDiv:${outSize}:${count}:${meanUse2D ? "2d" : "1d"}`, code);
 
   // Pack mixed u32 + f32 params into a single Uint32Array
   const meanParamsData = new ArrayBuffer(8);
@@ -8584,7 +8620,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [sumTensor.buffer, outBuffer, paramsBuffer]);
 
-  dispatchComputePass(pipeline, bindGroup, Math.ceil(outSize / WORKGROUP_SIZE));
+  dispatchComputePass(pipeline, bindGroup, meanDispatch.x, meanDispatch.y);
 
   releaseParamsBuffer(paramsBuffer);
 
