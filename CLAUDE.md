@@ -79,13 +79,13 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
 
 1. **Wall clock** — Per-step timings from the WALL CLOCK SUMMARY table. Steady-state = avg of steps 2-4. Step 0 is pipeline warmup (expect 8-10x slower). Breakdown: forward, backward, optimizer, cleanup as % of total.
 
-2. **GPU time budget** — From the Phase table (`Phase | Ops | CPU(ms) | GPU(ms)`). Sum GPU(ms) across forward+backward+cleanup for total GPU time. **GPU utilization = total_GPU / wall_clock**. Current baseline: ~63% utilization (27ms GPU / 43ms wall with dispatch replay; profiler runs without replay at ~68ms).
+2. **GPU time budget** — From the Phase table (`Phase | Ops | CPU(ms) | GPU(ms)`). Sum GPU(ms) across forward+backward+cleanup for total GPU time. **GPU utilization = total_GPU / wall_clock**. Current baseline: ~85% utilization (27ms GPU / 32ms wall with dispatch replay; profiler runs without replay at ~75ms).
 
-3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). Current top offenders: `matmul` (7.5ms, 28%), `adamStep` (5.4ms, 20%), `matmul++cast+bias+binary` (4.5ms, 17%), `fusedLayerNormBackwardGradWeightBias` (1.7ms, 6%), `matmul++cast+bias` (1.7ms, 6%), `fused` (1.0ms, 4%), `sum` (0.8ms, 3%), `add` (0.8ms, 3%), `matmul++cast` (0.7ms, 3%).
+3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). Current top offenders: `matmul` (7.5ms, 32%), `matmul++cast+bias+binary` (4.5ms, 19%), `adamStep` (1.9ms, 8%), `fusedLayerNormBackwardGradWeightBias` (1.7ms, 7%), `matmul++cast+bias` (1.7ms, 7%), `fused` (1.0ms, 4%), `sum` (0.8ms, 3%), `add` (0.8ms, 3%), `matmul++cast` (0.7ms, 3%).
 
 4. **Cross-entropy** — Fused kernel implemented. Now 0.4ms/1.4% of GPU time (down from 34ms/31%). No longer a bottleneck.
 
-5. **CPU dispatch overhead** — From `CPU API Call` table. Bind group cache at 92.7% (38 misses). 12 submits/step.
+5. **CPU dispatch overhead** — From `CPU API Call` table. Bind group cache at 99.6% (2 misses). 12 submits/step.
 
 6. **Fusion rate** — From Plan Analysis. Total: 1031 nodes, 240 fused (23.3%), 52 fusion groups, 665 sequential. Note: fused LayerNorm/cross-entropy ops replace ~9 decomposed ops each, so effective fusion is higher than the raw percentage. Key unfused ops: 69 `cast` ops (f32↔f16), 39 `reshape` ops, 37 `add` ops, 37 `matmul` ops.
 
@@ -476,7 +476,7 @@ Why: Within a step, multiple plan executions share the same encoder scope (forwa
 
 ## Remaining Performance Optimizations
 
-Profiled on DistilGPT-2 training (steady-state ~43ms/step with dispatch replay, 27ms GPU, ~63% GPU utilization). Targets ranked by impact:
+Profiled on DistilGPT-2 training (steady-state ~32ms/step with dispatch replay, 24ms GPU, ~85% GPU utilization). Targets ranked by impact:
 
 **Completed optimizations:**
 1. ~~**Intra-plan buffer reclamation**~~ — DONE. `createBuffer` avg cost dropped 365µs→81µs.
@@ -508,9 +508,11 @@ Profiled on DistilGPT-2 training (steady-state ~43ms/step with dispatch replay, 
 26. ~~**K-split matmul**~~ — DONE. For small-M backward matmuls (M=31) with large K, the output tile grid (12 workgroups) severely underutilizes the GPU. K-split divides K-reduction across P workgroups in the Z dimension: each Z-slice computes partial sums, then a lightweight reduction kernel sums them. Activated when `baseWorkgroups < 64 && K > 512 && batchSize == 1 && no epilogue`. 25 backward dX matmuls across all 6 transformer layers use K-split. Max matmul GPU: 11ms→1.4ms (−88%). Backward GPU: 28ms→12ms (−57%). Total GPU: 43ms→27ms (−37%). Submits: 14→12.
 27. ~~**Dispatch replay cache**~~ — DONE. Enabled by default. Records full GPU dispatch sequence on first execution, replays bind groups directly on subsequent steps — bypasses all JS dispatch logic. Two fixes: (1) arena counter sync — `arenaResolveIndex` recorded before data-source/view/sequential execution and restored during replay, preventing buffer identity desync; (2) encoder-copy ops (scatterAdd) re-executed during replay — `copyBufferToBuffer` commands are invisible to compute dispatch recording, so ops using them must re-run instead of replaying stale bind groups. Loss parity verified bit-exact on DistilGPT-2 (50 steps, all losses identical). Disable with `TORCHLETTE_DISPATCH_REPLAY=0`. Auto-disabled when `TORCHLETTE_PROFILE=1`.
 28. ~~**Forward plan lowered execution fix**~~ — DONE. Forward plan (392 nodes) was permanently falling back to full JS dispatch after the first `executeLoweredPlan` attempt failed with "Input not ready". Root cause: matmul epilogue chain reconstruction in `executeLoweredPlan` always took `inputs[1]` as the external epilogue input ref, but when the chain connects via `inputs[1]` (commutative add for residual connections), the external input is actually at `inputs[0]`. Fix: detect which input is the chain node (by checking against previous chain node ID) and use the other input as the external ref. Forward plan now replays successfully. Combined with dispatch replay: steady-state 68ms→43ms/step (−37%). Finetune-demo verified stable over 60+ steps with correct loss convergence.
+29. ~~**View result caching in dispatch replay**~~ — DONE. During replay, view ops (reshape, transpose, permute, expand, narrow) produce deterministic results because arena buffers are stable across steps. Cache view metadata (buffer, shape, strides, offset) on first recording, reconstruct directly on replay bypassing `executeOp`, `getInputStorage`, and alias detection. Backward view time 2.1ms→0.1ms (95% reduction). Steady-state 43ms→32ms/step.
+30. ~~**Packed Adam dispatches**~~ — DONE. Groups same-element-count optimizer parameters into contiguous packed GPU buffers, dispatches one Adam kernel per size class instead of one per parameter. 76→8 dispatches. Adam GPU: 5.4ms→1.9ms (−65%). ~3.5ms GPU/step saved. Works during profiling (guards removed).
+31. ~~**Bind group cache: max + narrowBackward arena routing**~~ — DONE. `max()` and `narrowBackward()` used `createTrackedBuffer` directly, bypassing the buffer arena. Replaced with `resolveOutputBuffer` (max) and let `dispatchElementwise` handle allocation (narrowBackward). Bind group cache 91.0%→99.6% (40→2 misses). `createBindGroup` 1.9ms→0.1ms. ~1.8ms/step saved.
+32. ~~**Submit reduction: eliminate periodic reclamation**~~ — DONE. With arena-managed buffers (335 hits/step) and pool reservation (1 new alloc/step), intra-step buffer reclamation via periodic `flushSharedEncoder` is unnecessary. Increased `DEFAULT_RECLAIM_INTERVAL` 100→10000 (effectively disabled for plans <10k nodes). Also increased `PARAMS_FLUSH_THRESHOLD` 256→2000 to prevent auto-flush from params buffer accumulation. `queue.submit` calls: 14→7/step (profiler), ~4/step (replay). Total submit CPU: 3.9ms→3.1ms. ~0.8ms/step saved. Configurable via `TORCHLETTE_RECLAIM_INTERVAL` env var.
 
 **Open targets (ranked by estimated savings):**
-1. **GPU utilization gap** — ~63% utilization (27ms GPU / 43ms wall). ~16ms of pure CPU overhead per step: Dawn API calls, plan management, GC. This is the meta-issue — every CPU-side ms saved directly reduces wall time.
-2. **Adam CPU overhead** — 4.5ms CPU for 5.4ms GPU work. `adam.dispatch` 1.6ms + `adam.configBuf` 0.9ms + `adam.createTensor` 0.5ms. Further reduction possible by caching config buffers.
-3. **GC pressure** — 3.4% of CPU profiler self-time. Object pooling for Tensor metadata to reduce garbage collection overhead. ~2-3ms/step potential.
-4. **Pipeline cache warmup** — Step 0 is 3.3s (49x steady-state) due to pipeline compilation. Pre-compile pipeline variants during model load.
+1. **GC pressure** — 0.8% of CPU profiler self-time. Object pooling for Tensor metadata. ~2-3ms/step potential.
+2. **Pipeline cache warmup** — Step 0 is 3.5s (49x steady-state) due to pipeline compilation. Pre-compile pipeline variants during model load.

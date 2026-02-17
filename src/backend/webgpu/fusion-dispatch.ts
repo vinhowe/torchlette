@@ -320,6 +320,7 @@ export function dispatchFusedKernel(
       workgroupsY: 1,
       workgroupsZ: 1,
       buffers: getAndClearLastBindGroupBuffers(),
+      label: getCurrentOpLabel() ?? undefined,
     });
   }
 
