@@ -69,10 +69,14 @@ let gpuResolveBuffer: GPUBuffer | null = null;
 let gpuReadbackBuffer: GPUBuffer | null = null;
 let gpuPassRecords: GpuPassRecord[] = [];
 let gpuNextSlot = 0;
+let gpuStagingBuffer: GPUBuffer | null = null; // fresh staging for each readGpuTimestamps cycle
+let gpuStagingSlots = 0;
 const GPU_MAX_PASSES = 2048; // 4096 timestamp slots (Dawn limit is 4096 queries)
 let gpuMaxSlots = GPU_MAX_PASSES * 2;
 let gpuTimestampsSupported = false;
+let gpuTimestampsEnabled = true; // Can be disabled per-step to avoid V100/Dawn deadlock
 let gpuDevice: GPUDevice | null = null;
+
 
 // Accumulated GPU times per label
 const gpuLabelStats = new Map<
@@ -138,6 +142,17 @@ export function recordFusionFallback(reason: string, groupSize: number, detail?:
 
 export function isProfilingEnabled(): boolean {
   return PROFILING_ENABLED;
+}
+
+/**
+ * Enable/disable GPU timestamp writes for subsequent compute passes.
+ * When disabled, getTimestampWrites() returns undefined and resolveGpuTimestamps()
+ * is a no-op. Use this to limit timestamp queries to a single step, avoiding
+ * a V100/Dawn bug where accumulated resolveQuerySet operations corrupt Vulkan
+ * fence state and cause mapAsync deadlocks.
+ */
+export function setTimestampsEnabled(enabled: boolean): void {
+  gpuTimestampsEnabled = enabled;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,8 +276,6 @@ export function initGpuTimestamps(device: GPUDevice): void {
   // that may not be available in all environments
   const QUERY_RESOLVE = 0x0200;
   const COPY_SRC = 0x0004;
-  const COPY_DST = 0x0008;
-  const MAP_READ = 0x0001;
 
   gpuQuerySet = device.createQuerySet({
     type: "timestamp" as GPUQueryType,
@@ -275,11 +288,7 @@ export function initGpuTimestamps(device: GPUDevice): void {
     usage: QUERY_RESOLVE | COPY_SRC,
   });
 
-  // Readback buffer for mapping
-  gpuReadbackBuffer = device.createBuffer({
-    size: count * 8,
-    usage: MAP_READ | COPY_DST,
-  });
+  gpuReadbackBuffer = null;
 
   console.log(`[profiler] GPU timestamps initialized: ${count} slots`);
 
@@ -299,7 +308,7 @@ export function initGpuTimestamps(device: GPUDevice): void {
 export function getTimestampWrites(
   label: string,
 ): GPUComputePassTimestampWrites | undefined {
-  if (!PROFILING_ENABLED || !gpuTimestampsSupported || !gpuQuerySet) return undefined;
+  if (!PROFILING_ENABLED || !gpuTimestampsSupported || !gpuQuerySet || !gpuTimestampsEnabled) return undefined;
   if (gpuNextSlot + 2 > gpuMaxSlots) return undefined; // out of slots
 
   const startSlot = gpuNextSlot;
@@ -329,47 +338,23 @@ export function resolveGpuTimestamps(encoder: GPUCommandEncoder): void {
   )
     return;
 
-  encoder.resolveQuerySet(gpuQuerySet, 0, gpuNextSlot, gpuResolveBuffer, 0);
-
-  // Copy resolve buffer to readback buffer
-  if (gpuReadbackBuffer) {
-    encoder.copyBufferToBuffer(
-      gpuResolveBuffer,
-      0,
-      gpuReadbackBuffer,
-      0,
-      gpuNextSlot * 8,
-    );
-  }
+  // Don't resolve on the training encoder — defer to readGpuTimestamps()
+  // so that the resolveQuerySet + copyBufferToBuffer + mapAsync all happen
+  // in a single isolated submission after all training GPU work is complete.
+  gpuStagingSlots = gpuNextSlot;
 }
 
 // ---------------------------------------------------------------------------
 // Read back GPU timestamps (async — call after queue.submit + onSubmittedWorkDone)
 // ---------------------------------------------------------------------------
 
-export async function readGpuTimestamps(): Promise<void> {
-  if (
-    !PROFILING_ENABLED ||
-    !gpuTimestampsSupported ||
-    !gpuReadbackBuffer ||
-    !gpuDevice ||
-    gpuPassRecords.length === 0
-  )
-    return;
-
-  // Wait for GPU work to complete
-  await gpuDevice.queue.onSubmittedWorkDone();
-
-  try {
-    await gpuReadbackBuffer.mapAsync(0x0001 /* MAP_READ */);
-  } catch (e) {
-    console.warn("[profiler] Failed to map readback buffer:", e);
-    return;
-  }
-
-  const timestamps = new BigInt64Array(gpuReadbackBuffer.getMappedRange());
-
+/**
+ * Process timestamp records from a BigInt64Array of raw GPU timestamps.
+ * Accumulates per-label, per-phase, per-module stats.
+ */
+function processTimestampRecords(timestamps: BigInt64Array): void {
   for (const record of gpuPassRecords) {
+    if (record.startSlot >= timestamps.length || record.endSlot >= timestamps.length) continue;
     const startNs = timestamps[record.startSlot];
     const endNs = timestamps[record.endSlot];
     if (startNs === 0n && endNs === 0n) continue; // no data
@@ -439,8 +424,168 @@ export async function readGpuTimestamps(): Promise<void> {
       modOps.set(record.label, { count: 1, totalNs: durationNs, maxNs: durationNs });
     }
   }
+}
 
-  gpuReadbackBuffer.unmap();
+/**
+ * Flush and read GPU timestamps mid-step. Call AFTER the forward pass but
+ * BEFORE the backward pass.
+ *
+ * V100/Dawn workaround: the timestamp-query device feature corrupts Dawn's
+ * Vulkan fence mechanism after backward pass dispatches. onSubmittedWorkDone
+ * and copyBufferToBuffer+mapAsync both deadlock permanently after backward.
+ * However, they work correctly after the forward pass. This function reads
+ * all forward-phase GPU timestamps while the fence mechanism still works,
+ * then disables timestamp writes for the remainder of the step.
+ *
+ * Returns true if timestamps were successfully read, false otherwise.
+ */
+export async function flushAndReadGpuTimestamps(): Promise<boolean> {
+  if (
+    !PROFILING_ENABLED ||
+    !gpuTimestampsSupported ||
+    !gpuDevice ||
+    !gpuQuerySet ||
+    !gpuResolveBuffer ||
+    gpuPassRecords.length === 0 ||
+    gpuNextSlot === 0
+  )
+    return false;
+
+  // 1. Flush the shared encoder to submit all forward work
+  const { flushSharedEncoder } = await import("./index");
+  flushSharedEncoder();
+
+  const slotsToRead = gpuNextSlot;
+  const byteSize = slotsToRead * 8;
+  const MAP_READ = 0x0001;
+  const COPY_DST = 0x0008;
+
+  // 2. Resolve + copy timestamps in a separate submission
+  const staging = gpuDevice.createBuffer({
+    size: byteSize,
+    usage: MAP_READ | COPY_DST,
+  });
+
+  const encoder = gpuDevice.createCommandEncoder();
+  encoder.resolveQuerySet(gpuQuerySet, 0, slotsToRead, gpuResolveBuffer, 0);
+  encoder.copyBufferToBuffer(gpuResolveBuffer, 0, staging, 0, byteSize);
+  gpuDevice.queue.submit([encoder.finish()]);
+
+  // 3. Fence using onSubmittedWorkDone (works after forward pass)
+  if (typeof gpuDevice.queue.onSubmittedWorkDone === "function") {
+    const FENCE_TIMEOUT_MS = 10_000;
+    const fenceOk = await Promise.race([
+      gpuDevice.queue.onSubmittedWorkDone().then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), FENCE_TIMEOUT_MS)),
+    ]);
+    if (!fenceOk) {
+      console.warn("[profiler] onSubmittedWorkDone timed out after forward — skipping GPU timestamps");
+      staging.destroy();
+      gpuTimestampsEnabled = false;
+      return false;
+    }
+  }
+
+  // 4. Read timestamp data
+  const MAPASYNC_TIMEOUT_MS = 5_000;
+  let mapOk = false;
+  try {
+    const result = await Promise.race([
+      staging.mapAsync(MAP_READ).then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), MAPASYNC_TIMEOUT_MS)),
+    ]);
+    mapOk = result;
+  } catch (e) {
+    console.warn("[profiler] Failed to map timestamp staging buffer:", e);
+    staging.destroy();
+    gpuTimestampsEnabled = false;
+    return false;
+  }
+
+  if (!mapOk) {
+    console.warn("[profiler] mapAsync timed out after forward — skipping GPU timestamps");
+    staging.destroy();
+    gpuTimestampsEnabled = false;
+    return false;
+  }
+
+  // 5. Process timestamp records
+  const timestamps = new BigInt64Array(staging.getMappedRange());
+  processTimestampRecords(timestamps);
+  staging.unmap();
+  staging.destroy();
+
+  // 6. Disable timestamp writes for backward/optimizer to avoid corrupting
+  //    Dawn's fence state. Forward GPU timing is captured; backward uses CPU timing.
+  gpuTimestampsEnabled = false;
+  return true;
+}
+
+/**
+ * Read GPU timestamps at end of step. With the mid-step readback
+ * (flushAndReadGpuTimestamps), this is typically a no-op since forward
+ * timestamps are already read and backward timestamps are skipped.
+ */
+export async function readGpuTimestamps(): Promise<void> {
+  if (
+    !PROFILING_ENABLED ||
+    !gpuTimestampsSupported ||
+    !gpuDevice ||
+    !gpuQuerySet ||
+    !gpuResolveBuffer ||
+    gpuPassRecords.length === 0 ||
+    gpuStagingSlots === 0
+  )
+    return;
+
+  // If timestamps were already processed by flushAndReadGpuTimestamps,
+  // gpuLabelStats will be non-empty. Skip redundant readback.
+  if (gpuLabelStats.size > 0) return;
+
+  const MAP_READ = 0x0001;
+  const COPY_DST = 0x0008;
+  const slotsToRead = gpuStagingSlots;
+  const byteSize = slotsToRead * 8;
+
+  // Drain the deferred fence from markStep()
+  const { awaitDeferredFence } = await import("./index");
+  await awaitDeferredFence();
+
+  // Resolve + copy timestamps
+  const staging = gpuDevice.createBuffer({
+    size: byteSize,
+    usage: MAP_READ | COPY_DST,
+  });
+
+  const encoder = gpuDevice.createCommandEncoder();
+  encoder.resolveQuerySet(gpuQuerySet, 0, slotsToRead, gpuResolveBuffer, 0);
+  encoder.copyBufferToBuffer(gpuResolveBuffer, 0, staging, 0, byteSize);
+  gpuDevice.queue.submit([encoder.finish()]);
+
+  const MAPASYNC_TIMEOUT_MS = 5_000;
+  let mapOk = false;
+  try {
+    const result = await Promise.race([
+      staging.mapAsync(MAP_READ).then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), MAPASYNC_TIMEOUT_MS)),
+    ]);
+    mapOk = result;
+  } catch (e) {
+    console.warn("[profiler] Failed to map staging buffer:", e);
+    staging.destroy();
+    return;
+  }
+
+  if (!mapOk) {
+    console.warn("[profiler] mapAsync timed out (5s) — GPU timestamps unavailable (V100/Dawn timestamp-query bug)");
+    staging.destroy();
+    return;
+  }
+
+  const timestamps = new BigInt64Array(staging.getMappedRange());
+  processTimestampRecords(timestamps);
+  staging.unmap();
+  staging.destroy();
 }
 
 // ---------------------------------------------------------------------------
@@ -688,7 +833,7 @@ export function printProfileSummary(label: string): void {
   // Auto-write JSON if env var is set
   const jsonPath = typeof process !== "undefined" ? process.env?.TORCHLETTE_PROFILE_JSON : undefined;
   if (jsonPath) {
-    writeProfileJSON(jsonPath);
+    void writeProfileJSON(jsonPath);
   }
 }
 
@@ -803,13 +948,13 @@ export function getProfileJSON(): object {
   };
 }
 
-export function writeProfileJSON(filePath: string): void {
+export async function writeProfileJSON(filePath: string): Promise<void> {
   if (!PROFILING_ENABLED) return;
   try {
-    const fs = require("node:fs");
+    const fs = await import("node:fs");
     const json = getProfileJSON();
     fs.writeFileSync(filePath, JSON.stringify(json, null, 2));
-    console.log(`[profiler] Wrote profile JSON to ${filePath}`);
+    console.log(`Profile JSON written to ${filePath}`);
   } catch (e) {
     console.warn(`[profiler] Failed to write profile JSON to ${filePath}:`, e);
   }
@@ -834,4 +979,9 @@ export function resetProfileStats(): void {
   fusionFallbackStats.clear();
   gpuPassRecords = [];
   gpuNextSlot = 0;
+  if (gpuStagingBuffer) {
+    gpuStagingBuffer.destroy();
+    gpuStagingBuffer = null;
+  }
+  gpuStagingSlots = 0;
 }

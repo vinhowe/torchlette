@@ -22,9 +22,11 @@ import {
   setProfilePhase,
   setProfileModule,
   readGpuTimestamps,
+  flushAndReadGpuTimestamps,
   printProfileSummary,
   resetProfileStats,
   isProfilingEnabled,
+  setTimestampsEnabled,
   getProfileJSON,
   writeProfileJSON,
   getGPUMemoryStats,
@@ -52,12 +54,17 @@ const NUM_STEPS = 5;
 const PROFILE_STEP = 4; // Which step to analyze in detail (steady-state)
 const BATCH_SIZE = parseInt(process.env.TORCHLETTE_BATCH_SIZE ?? "1", 10);
 
-// First 32 tokens of Shakespeare sonnets
-const FIXED_TOKENS: number[] = [
+// Shakespeare sonnets tokens — tiled to seq_len+1 for seq_len=512 profiling
+const BASE_TOKENS: number[] = [
   2484, 439, 314, 8996, 20218, 284, 257, 3931, 338, 1110, 30,
   198, 1986, 280, 1242, 517, 8855, 290, 517, 29815, 13,
   198, 49, 619, 9985, 466, 13508, 262, 38482, 31007, 286, 1737,
 ];
+const SEQ_LEN = parseInt(process.env.TORCHLETTE_SEQ_LEN ?? "512", 10);
+const FIXED_TOKENS: number[] = [];
+for (let i = 0; i < SEQ_LEN + 1; i++) {
+  FIXED_TOKENS.push(BASE_TOKENS[i % BASE_TOKENS.length]);
+}
 
 // ============================================================================
 // Module-instrumented forward pass
@@ -196,7 +203,11 @@ async function main() {
   console.log("=== DistilGPT-2 Training Profiler ===\n");
 
   // Initialize
-  await initWebGPU();
+  const gpuOk = await initWebGPU();
+  if (!gpuOk) {
+    console.error("ERROR: WebGPU initialization failed (is the GPU available?)");
+    process.exit(1);
+  }
 
   const api = new Torchlette("webgpu", {
     enableFusion: true,
@@ -266,12 +277,27 @@ async function main() {
     resetBufferPoolDetailedStats();
     resetBindGroupCacheStats();
 
+    // V100/Dawn workaround: accumulated resolveQuerySet operations corrupt Vulkan
+    // fence state, causing mapAsync deadlocks. Only enable GPU timestamps for the
+    // step we actually want to profile.
+    setTimestampsEnabled(step === PROFILE_STEP);
+
     // --- Forward ---
     setProfilePhase("forward");
     const t0 = performance.now();
     const loss = compiledForward(input, target);
     const lossValue = await loss.item();
     const t1 = performance.now();
+
+    // V100/Dawn workaround: read GPU timestamps after forward pass, before
+    // backward. The timestamp-query feature corrupts Dawn's fence mechanism
+    // after backward dispatches, making onSubmittedWorkDone/mapAsync deadlock.
+    // Reading here captures forward GPU timing while fences still work.
+    // flushAndReadGpuTimestamps also disables timestamp writes for the rest
+    // of the step (backward/optimizer use CPU timing only).
+    if (step === PROFILE_STEP) {
+      await flushAndReadGpuTimestamps();
+    }
 
     // --- Backward ---
     setProfilePhase("backward");
@@ -285,6 +311,7 @@ async function main() {
     }
     setProfileModule("unknown");
     const t2 = performance.now();
+
 
     // --- Optimizer ---
     setProfilePhase("optimizer");
@@ -304,6 +331,7 @@ async function main() {
     setProfileModule("unknown");
     const t3 = performance.now();
 
+
     // Capture fusion stats
     const cumulativeStats = api._runtime().getCumulativeFusionStats();
     const lastStats = api._runtime().getLastFusionStats();
@@ -318,7 +346,7 @@ async function main() {
     await api.markStep();
     const t4 = performance.now();
 
-    // Read GPU timestamps
+    // Read GPU timestamps (only the profile step has timestamp data)
     await readGpuTimestamps();
 
     // Collect memory stats for leak detection
@@ -353,7 +381,7 @@ async function main() {
       console.log(`${"=".repeat(80)}\n`);
 
       printProfileSummary(`step ${step}`);
-      writeProfileJSON(`/tmp/torchlette-profile-step${step}.json`);
+      await writeProfileJSON(`/tmp/torchlette-profile-step${step}.json`);
 
       // Memory stats
       const memStats = getGPUMemoryStats();

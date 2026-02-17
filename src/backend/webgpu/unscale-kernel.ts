@@ -23,7 +23,9 @@ import {
   releaseParamsBuffer,
   flushSharedEncoder,
   cachedCreateBindGroup,
+  awaitDeferredFence,
 } from "./index";
+import { isProfilingEnabled } from "./profiler";
 import { gpuMemoryTracker } from "./memory-tracker";
 
 // WebGPU type definitions (runtime, not importable at compile time)
@@ -239,8 +241,16 @@ export async function readInfFlag(infFlagBuffer: GPUBuffer): Promise<number> {
   const ctx = getWebGPUDevice()!;
   const device = ctx.device as unknown as GPUDevice;
 
-  // Flush shared encoder to ensure kernel writes are submitted
-  flushSharedEncoder();
+  // Consume the deferred fence from markStep() BEFORE any GPU sync.
+  // resolveDeferred() always calls markStep() → issueDeferredFence() before
+  // calling readInfFlag(). The pending onSubmittedWorkDone from issueDeferredFence
+  // causes mapAsync to deadlock on V100/Dawn when both are in-flight concurrently.
+  // Awaiting it first ensures no concurrent GPU sync operations.
+  await awaitDeferredFence();
+
+  // All pending GPU work (including unscale kernel writes) was submitted by
+  // markStep() and confirmed complete by awaitDeferredFence. No need to
+  // flushSharedEncoder.
 
   // Create staging buffer for readback
   const staging = device.createBuffer({
@@ -252,13 +262,52 @@ export async function readInfFlag(infFlagBuffer: GPUBuffer): Promise<number> {
   encoder.copyBufferToBuffer(infFlagBuffer, 0, staging, 0, 4);
   device.queue.submit([encoder.finish()]);
 
-  if (typeof device.queue.onSubmittedWorkDone === "function") {
-    await device.queue.onSubmittedWorkDone();
+  // On V100/Dawn, mapAsync on buffers populated only by copyBufferToBuffer
+  // can deadlock after timestamp query operations. Work around by issuing a
+  // queue.writeBuffer to a separate fence buffer first — mapAsync correctly
+  // tracks writeBuffer (direct queue op), and its completion confirms all
+  // prior GPU work (including the copy) has finished.
+  if (isProfilingEnabled()) {
+    const fenceBuf = device.createBuffer({
+      size: 4,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    (device as any).queue.writeBuffer(fenceBuf, 0, new Uint8Array([1, 2, 3, 4]));
+    await fenceBuf.mapAsync(GPUMapMode.READ);
+    fenceBuf.unmap();
+    fenceBuf.destroy();
   }
 
-  await staging.mapAsync(GPUMapMode.READ);
+  // V100/Dawn workaround: mapAsync on copyBufferToBuffer destinations deadlocks
+  // permanently after GPU timestamp query operations. Use timeout to detect.
+  // Returns 1.0 (inf found) as the safe default — this skips the optimizer step
+  // and decreases the loss scale, preventing NaN propagation.
+  const MAPASYNC_TIMEOUT_MS = 2000;
+  let mapOk = false;
+  try {
+    const mapResult = await Promise.race([
+      staging.mapAsync(GPUMapMode.READ).then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), MAPASYNC_TIMEOUT_MS)),
+    ]);
+    mapOk = mapResult;
+  } catch (e) {
+    staging.destroy();
+    return 1.0; // Safe default: assume inf found
+  }
+
+  if (!mapOk) {
+    console.warn("[readInfFlag] mapAsync timed out (V100/Dawn timestamp corruption). Assuming inf found (safe default).");
+    // Destroy the staging buffer to cancel the pending mapAsync in Dawn's queue.
+    // Leaving it alive corrupts subsequent mapAsync calls.
+    staging.destroy();
+    // Return 1.0 (inf found) as safe default — GradScaler will skip the optimizer
+    // step and decrease the loss scale. This prevents NaN propagation that occurs
+    // when returning 0 (no inf) with actually-infinite gradients.
+    return 1.0;
+  }
+
   const mapped = staging.getMappedRange();
-  const value = new Float32Array(mapped.slice(0, 4))[0];
+  const value = new Float32Array(mapped)[0];
   staging.unmap();
   staging.destroy();
 

@@ -100,9 +100,11 @@ export {
   setProfileModule,
   getProfileModule,
   readGpuTimestamps,
+  flushAndReadGpuTimestamps,
   printProfileSummary,
   resetProfileStats,
   isProfilingEnabled,
+  setTimestampsEnabled,
   getProfileJSON,
   writeProfileJSON,
   recordPlanAnalysis,
@@ -984,15 +986,46 @@ let pendingFencePromise: Promise<void> | null = null;
 let deferredPendingRelease: boolean = false;
 
 /**
+ * Persistent fence buffer for the writeBuffer+mapAsync fence workaround.
+ * Used in profiling mode to avoid V100/Dawn onSubmittedWorkDone deadlock.
+ */
+let profilingFenceBuffer: GPUBuffer | null = null;
+const profilingFenceData = new Uint8Array([1, 2, 3, 4]);
+
+/**
  * Issue a GPU fence without awaiting it. The fence promise is stored
  * and will be awaited at the start of the next markStep.
+ *
+ * V100/Dawn workaround: when timestamp-query is enabled (profiling mode),
+ * onSubmittedWorkDone deadlocks after backward pass dispatches. Use
+ * writeBuffer+mapAsync instead — on Dawn/Vulkan, MAP_READ buffers are
+ * host-visible so writeBuffer is a CPU memcpy and mapAsync resolves
+ * immediately. This is not a real GPU fence, but works because arena
+ * buffers are stable across steps (no actual buffer recycling needed).
  */
 export function issueDeferredFence(): void {
   const ctx = context;
   if (!ctx) return;
-  if (typeof ctx.queue.onSubmittedWorkDone !== "function") return;
 
-  // Issue the fence — don't await
+  if (isProfilingEnabled()) {
+    // Profiling mode: use writeBuffer+mapAsync (CPU-only, no deadlock)
+    if (!profilingFenceBuffer) {
+      profilingFenceBuffer = ctx.device.createBuffer({
+        size: 4,
+        usage: 0x0008 | 0x0001, // COPY_DST | MAP_READ
+      });
+    }
+    ctx.queue.writeBuffer(profilingFenceBuffer, 0, profilingFenceData);
+    pendingFencePromise = profilingFenceBuffer
+      .mapAsync(0x0001 /* MAP_READ */)
+      .then(() => {
+        profilingFenceBuffer!.unmap();
+      });
+    deferredPendingRelease = true;
+    return;
+  }
+
+  if (typeof ctx.queue.onSubmittedWorkDone !== "function") return;
   pendingFencePromise = ctx.queue.onSubmittedWorkDone();
   deferredPendingRelease = true;
 }
@@ -1684,6 +1717,10 @@ export function destroyWebGPU(): void {
   f16WeightCache.clear();
   clearBindGroupCache();
   destroyPersistentInfFlagBuffer();
+  if (profilingFenceBuffer) {
+    profilingFenceBuffer.destroy();
+    profilingFenceBuffer = null;
+  }
   context.device.destroy();
   context.pipelines.clear();
   context = null;
@@ -7595,12 +7632,11 @@ function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
   const reduceDimsArray = `array<u32, ${normalizedDims.length}>(${normalizedDims.map((d) => `${d}u`).join(", ")})`;
   const inputToOutDimArray = `array<i32, ${rank}>(${inputToOutDim.map((d) => `${d}i`).join(", ")})`;
 
-  const sumTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
-  const sumDispatch = compute2DDispatch(sumTotalWG);
-  const sumUse2D = sumDispatch.y > 1;
-  const sumGridSizeX = sumDispatch.x * WORKGROUP_SIZE;
+  // Choose between parallel tree reduction (large reductionSize) and sequential (small)
+  const useParallelReduction = reductionSize > 64;
 
-  const code = `
+  // Common shader fragments for index computation
+  const shaderPreamble = `
 struct Params {
   outSize: u32,
   reductionSize: u32,
@@ -7638,13 +7674,7 @@ fn getReduceDimIndex(d: u32) -> u32 {
   return 0u;
 }
 
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let outIdx = ${sumUse2D ? `gid.x + gid.y * ${sumGridSizeX}u` : "gid.x"};
-  if (outIdx >= params.outSize) {
-    return;
-  }
-
+fn computeInputOffset(outIdx: u32, reduceIdx: u32) -> u32 {
   // Convert output index to output coordinates
   var outCoords: array<u32, ${Math.max(outShape.length, 1)}>;
   ${
@@ -7659,59 +7689,125 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       : ""
   }
 
-  // Sum over all reduction indices
+  // Convert reduceIdx to coordinates in reduced dimensions
+  var reduceCoords: array<u32, ${Math.max(normalizedDims.length, 1)}>;
+  var rRemaining = reduceIdx;
+  ${
+    normalizedDims.length > 0
+      ? normalizedDims
+          .map(
+            (_, i) => `
+  {
+    var rDimSize = 1u;
+    for (var j = ${i + 1}u; j < NUM_REDUCE_DIMS; j = j + 1u) {
+      rDimSize = rDimSize * inputShape[reduceDims[j]];
+    }
+    reduceCoords[${i}u] = rRemaining / rDimSize;
+    rRemaining = rRemaining % rDimSize;
+  }
+  `,
+          )
+          .join("")
+      : ""
+  }
+
+  // Build full input offset
+  var inputOffset = 0u;
+  for (var d = 0u; d < INPUT_RANK; d = d + 1u) {
+    var coord = 0u;
+    if (isReduceDim(d)) {
+      let rIdx = getReduceDimIndex(d);
+      coord = reduceCoords[rIdx];
+    } else {
+      let outD = inputToOutDim[d];
+      if (outD >= 0i) {
+        coord = outCoords[u32(outD)];
+      }
+    }
+    inputOffset = inputOffset + coord * inputStrides[d];
+  }
+  return inputOffset;
+}
+`;
+
+  let code: string;
+  let variant: string;
+  let dispatchX: number;
+  let dispatchY: number;
+
+  if (useParallelReduction) {
+    // Parallel tree reduction: one workgroup (256 threads) per output element
+    const parDispatch = compute2DDispatch(outSize);
+    const parUse2D = parDispatch.y > 1;
+    dispatchX = parDispatch.x;
+    dispatchY = parDispatch.y;
+    variant = "par";
+
+    code = shaderPreamble + `
+var<workgroup> sdata: array<f32, ${WORKGROUP_SIZE}>;
+
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+  let outIdx = ${parUse2D ? `wid.x + wid.y * ${parDispatch.x}u` : "wid.x"};
+  if (outIdx >= params.outSize) {
+    return;
+  }
+  let tid = lid.x;
+
+  // Phase 1: Each thread sums a strided slice of the reduction dimension
+  var local_sum = 0.0;
+  for (var r = tid; r < params.reductionSize; r = r + ${WORKGROUP_SIZE}u) {
+    local_sum = local_sum + input[computeInputOffset(outIdx, r)];
+  }
+  sdata[tid] = local_sum;
+  workgroupBarrier();
+
+  // Phase 2: Tree reduction in shared memory
+  for (var s = ${WORKGROUP_SIZE >> 1}u; s > 0u; s = s >> 1u) {
+    if (tid < s) {
+      sdata[tid] = sdata[tid] + sdata[tid + s];
+    }
+    workgroupBarrier();
+  }
+
+  // Thread 0 writes the final sum
+  if (tid == 0u) {
+    out[outIdx] = sdata[0];
+  }
+}
+`;
+  } else {
+    // Sequential reduction: each thread handles one output element
+    const sumTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
+    const sumDispatch = compute2DDispatch(sumTotalWG);
+    const sumUse2D = sumDispatch.y > 1;
+    const sumGridSizeX = sumDispatch.x * WORKGROUP_SIZE;
+    dispatchX = sumDispatch.x;
+    dispatchY = sumDispatch.y;
+    variant = "seq";
+
+    code = shaderPreamble + `
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let outIdx = ${sumUse2D ? `gid.x + gid.y * ${sumGridSizeX}u` : "gid.x"};
+  if (outIdx >= params.outSize) {
+    return;
+  }
+
   var total = 0.0;
   for (var reduceIdx = 0u; reduceIdx < params.reductionSize; reduceIdx = reduceIdx + 1u) {
-    // Convert reduceIdx to coordinates in reduced dimensions
-    var reduceCoords: array<u32, ${Math.max(normalizedDims.length, 1)}>;
-    var rRemaining = reduceIdx;
-    ${
-      normalizedDims.length > 0
-        ? normalizedDims
-            .map(
-              (_, i) => `
-    {
-      var rDimSize = 1u;
-      for (var j = ${i + 1}u; j < NUM_REDUCE_DIMS; j = j + 1u) {
-        rDimSize = rDimSize * inputShape[reduceDims[j]];
-      }
-      reduceCoords[${i}u] = rRemaining / rDimSize;
-      rRemaining = rRemaining % rDimSize;
-    }
-    `,
-            )
-            .join("")
-        : ""
-    }
-
-    // Build full input coordinates
-    var inputOffset = 0u;
-    for (var d = 0u; d < INPUT_RANK; d = d + 1u) {
-      var coord = 0u;
-      if (isReduceDim(d)) {
-        // Use the reduce coordinate
-        let rIdx = getReduceDimIndex(d);
-        coord = reduceCoords[rIdx];
-      } else {
-        // Use the output coordinate - find which output dim this maps to
-        let outD = inputToOutDim[d];
-        if (outD >= 0i) {
-          coord = outCoords[u32(outD)];
-        }
-      }
-      inputOffset = inputOffset + coord * inputStrides[d];
-    }
-
-    total = total + input[inputOffset];
+    total = total + input[computeInputOffset(outIdx, reduceIdx)];
   }
 
   out[outIdx] = total;
 }
 `;
+  }
 
   const pipeline = getPipeline(
     ctx,
-    `sum:${inputShape.join(",")}:${normalizedDims.join(",")}:${keepdim}:${sumUse2D ? "2d" : "1d"}`,
+    `sum:${variant}:${inputShape.join(",")}:${normalizedDims.join(",")}:${keepdim}:${dispatchY > 1 ? "2d" : "1d"}`,
     code,
   );
 
@@ -7719,7 +7815,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, paramsBuffer]);
 
-  dispatchComputePass(pipeline, bindGroup, sumDispatch.x, sumDispatch.y);
+  dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
 
   releaseParamsBuffer(paramsBuffer);
   if (contiguousCopy) contiguousCopy.destroy();

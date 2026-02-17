@@ -3024,6 +3024,8 @@ export async function executeLoweredPlan(
   // identities; replay pinning prevents buffer destruction between steps.
   // Arena counter sync ensures data-source re-executions write to the correct
   // arena buffers. Disable with TORCHLETTE_DISPATCH_REPLAY=0.
+  // Auto-disabled when TORCHLETTE_PROFILE=1: replay bypasses getTimestampWrites()
+  // and per-op profiling instrumentation, producing empty GPU timing data.
   const useReplayCache = process.env.TORCHLETTE_DISPATCH_REPLAY !== "0"
     && !process.env.TORCHLETTE_PROFILE;
 
