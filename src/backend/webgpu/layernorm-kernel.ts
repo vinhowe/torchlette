@@ -70,6 +70,34 @@ const GPUBufferUsage = {
 const WORKGROUP_SIZE = 256;
 
 // ============================================================================
+// Row Stats Temp Buffer Cache (persistent, keyed by numRows)
+// ============================================================================
+
+const rowStatsTempCache = new Map<number, { meanBuffer: GPUBuffer; invStdBuffer: GPUBuffer }>();
+
+function getOrCreateRowStatsTempBuffers(
+  device: GPUDevice,
+  numRows: number,
+): { meanBuffer: GPUBuffer; invStdBuffer: GPUBuffer } {
+  let entry = rowStatsTempCache.get(numRows);
+  if (!entry) {
+    const size = numRows * 4; // f32 per row
+    entry = {
+      meanBuffer: device.createBuffer({
+        size,
+        usage: GPUBufferUsage.STORAGE,
+      }),
+      invStdBuffer: device.createBuffer({
+        size,
+        usage: GPUBufferUsage.STORAGE,
+      }),
+    };
+    rowStatsTempCache.set(numRows, entry);
+  }
+  return entry;
+}
+
+// ============================================================================
 // Pipeline Cache
 // ============================================================================
 
@@ -250,6 +278,67 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 `;
 }
 
+function layerNormRowStatsShader(): string {
+  return `
+struct LNConfig {
+  num_rows: u32,
+  feature_dim: u32,
+  eps: f32,
+  _pad: u32,
+};
+
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> row_mean: array<f32>;
+@group(0) @binding(2) var<storage, read_write> row_inv_std: array<f32>;
+@group(0) @binding(3) var<uniform> config: LNConfig;
+
+var<workgroup> sdata: array<f32, ${WORKGROUP_SIZE}>;
+
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+  let row = wid.x;
+  let tid = lid.x;
+  let D = config.feature_dim;
+  let Df = f32(D);
+  let base = row * D;
+
+  // Phase 1: Parallel sum for mean
+  var local_sum = 0.0;
+  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
+    local_sum += x[base + i];
+  }
+  sdata[tid] = local_sum;
+  workgroupBarrier();
+  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
+    if (tid < s) { sdata[tid] += sdata[tid + s]; }
+    workgroupBarrier();
+  }
+  let mean = sdata[0] / Df;
+
+  // Phase 2: Parallel sum for variance → inv_std
+  var local_var = 0.0;
+  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
+    let diff = x[base + i] - mean;
+    local_var += diff * diff;
+  }
+  sdata[tid] = local_var;
+  workgroupBarrier();
+  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
+    if (tid < s) { sdata[tid] += sdata[tid + s]; }
+    workgroupBarrier();
+  }
+  let inv_std = inverseSqrt(sdata[0] / Df + config.eps);
+
+  // Write row stats (only thread 0 writes)
+  if (tid == 0u) {
+    row_mean[row] = mean;
+    row_inv_std[row] = inv_std;
+  }
+}
+`;
+}
+
 function layerNormBackwardGradWeightBiasShader(): string {
   return `
 struct LNConfig {
@@ -261,73 +350,32 @@ struct LNConfig {
 
 @group(0) @binding(0) var<storage, read> grad_output: array<f32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
-@group(0) @binding(2) var<storage, read_write> grad_weight: array<f32>;
-@group(0) @binding(3) var<storage, read_write> grad_bias: array<f32>;
-@group(0) @binding(4) var<uniform> config: LNConfig;
-
-// Shared memory for per-row mean and inv_std (computed in Phase 1)
-var<workgroup> shared_mean: f32;
-var<workgroup> shared_inv_std: f32;
-var<workgroup> sdata: array<f32, ${WORKGROUP_SIZE}>;
+@group(0) @binding(2) var<storage, read> row_mean: array<f32>;
+@group(0) @binding(3) var<storage, read> row_inv_std: array<f32>;
+@group(0) @binding(4) var<storage, read_write> grad_weight: array<f32>;
+@group(0) @binding(5) var<storage, read_write> grad_bias: array<f32>;
+@group(0) @binding(6) var<uniform> config: LNConfig;
 
 @compute @workgroup_size(${WORKGROUP_SIZE})
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>) {
-  // Each workgroup handles a slice of features across all rows
-  let feature_start = wid.x * ${WORKGROUP_SIZE}u;
-  let feature_idx = feature_start + lid.x;
-  let tid = lid.x;
+  let feature_idx = wid.x * ${WORKGROUP_SIZE}u + lid.x;
   let D = config.feature_dim;
-  let Df = f32(D);
   let N = config.num_rows;
-  let valid = feature_idx < D;
 
-  // Accumulate grad_weight and grad_bias across all rows
+  if (feature_idx >= D) { return; }
+
   var acc_gw = 0.0;
   var acc_gb = 0.0;
-
   for (var row = 0u; row < N; row++) {
     let base = row * D;
-
-    // Compute mean for this row (all threads cooperate)
-    var local_sum = 0.0;
-    for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-      local_sum += x[base + i];
-    }
-    sdata[tid] = local_sum;
-    workgroupBarrier();
-    for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-      if (tid < s) { sdata[tid] += sdata[tid + s]; }
-      workgroupBarrier();
-    }
-    let mean = sdata[0] / Df;
-
-    // Compute variance for this row
-    var local_var = 0.0;
-    for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-      let diff = x[base + i] - mean;
-      local_var += diff * diff;
-    }
-    sdata[tid] = local_var;
-    workgroupBarrier();
-    for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-      if (tid < s) { sdata[tid] += sdata[tid + s]; }
-      workgroupBarrier();
-    }
-    let inv_std = inverseSqrt(sdata[0] / Df + config.eps);
-
-    // Each thread accumulates for its feature index (guard out-of-bounds)
-    if (valid) {
-      let normalized = (x[base + feature_idx] - mean) * inv_std;
-      acc_gw += grad_output[base + feature_idx] * normalized;
-      acc_gb += grad_output[base + feature_idx];
-    }
+    let go = grad_output[base + feature_idx];
+    let normalized = (x[base + feature_idx] - row_mean[row]) * row_inv_std[row];
+    acc_gw += go * normalized;
+    acc_gb += go;
   }
-
-  if (valid) {
-    grad_weight[feature_idx] = acc_gw;
-    grad_bias[feature_idx] = acc_gb;
-  }
+  grad_weight[feature_idx] = acc_gw;
+  grad_bias[feature_idx] = acc_gb;
 }
 `;
 }
@@ -458,6 +506,10 @@ export function dispatchLayerNormBackwardGradX(
 
 /**
  * Dispatch fused LayerNorm backward gradWeight + gradBias kernel.
+ * Two-pass approach:
+ *   Pass 1: Compute row stats (mean, inv_std) for all N rows
+ *   Pass 2: Accumulate gradWeight/gradBias using precomputed stats (no barriers)
+ *
  * grad_output [N, D] + x [N, D] → grad_weight [D] + grad_bias [D]
  */
 export function dispatchLayerNormBackwardGradWeightBias(
@@ -470,31 +522,54 @@ export function dispatchLayerNormBackwardGradWeightBias(
   const ctx = getWebGPUDevice()!;
   const device = ctx.device as unknown as GPUDevice;
 
+  const configBuf = getOrCreateConfigBuffer(device, numRows, featureDim, eps);
+
+  // Pass 1: Compute row stats (mean[N], inv_std[N])
+  // Use persistent cached buffers (same pattern as K-split temp buffers)
+  const { meanBuffer, invStdBuffer } = getOrCreateRowStatsTempBuffers(device, numRows);
+
+  const statsPipeline = getOrCreatePipeline(
+    device,
+    "layerNormRowStats",
+    layerNormRowStatsShader(),
+  );
+
+  const statsBindGroup = cachedCreateBindGroup(device as any, statsPipeline as any,
+    [xBuffer, meanBuffer, invStdBuffer, configBuf] as any) as any;
+
+  trackSharedEncoderWrite(xBuffer as any);
+  trackSharedEncoderWrite(meanBuffer as any);
+  trackSharedEncoderWrite(invStdBuffer as any);
+
+  dispatchComputePass(
+    statsPipeline as any,
+    statsBindGroup as any,
+    numRows, // one workgroup per row
+  );
+
+  // Pass 2: Accumulate gradWeight/gradBias using precomputed stats
   const featureSizeBytes = featureDim * 4;
   const gradWeightBuffer = allocateOutputBuffer(featureSizeBytes) as unknown as GPUBuffer;
   const gradBiasBuffer = allocateOutputBuffer(featureSizeBytes) as unknown as GPUBuffer;
 
-  const configBuf = getOrCreateConfigBuffer(device, numRows, featureDim, eps);
-
-  const pipeline = getOrCreatePipeline(
+  const gradPipeline = getOrCreatePipeline(
     device,
-    "layerNormBwdGradWB",
+    "layerNormBwdGradWBv2",
     layerNormBackwardGradWeightBiasShader(),
   );
 
   const numWorkgroups = Math.ceil(featureDim / WORKGROUP_SIZE);
 
-  const bindGroup = cachedCreateBindGroup(device as any, pipeline as any,
-    [gradOutputBuffer, xBuffer, gradWeightBuffer, gradBiasBuffer, configBuf] as any) as any;
+  const gradBindGroup = cachedCreateBindGroup(device as any, gradPipeline as any,
+    [gradOutputBuffer, xBuffer, meanBuffer, invStdBuffer, gradWeightBuffer, gradBiasBuffer, configBuf] as any) as any;
 
   trackSharedEncoderWrite(gradOutputBuffer as any);
-  trackSharedEncoderWrite(xBuffer as any);
   trackSharedEncoderWrite(gradWeightBuffer as any);
   trackSharedEncoderWrite(gradBiasBuffer as any);
 
   dispatchComputePass(
-    pipeline as any,
-    bindGroup as any,
+    gradPipeline as any,
+    gradBindGroup as any,
     numWorkgroups,
   );
 

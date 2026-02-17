@@ -388,7 +388,7 @@ async function main() {
   console.log(`\nTraining tokens: ${trainingTokens.length}`);
 
   // Create training sequences (shorter for faster iteration)
-  const seqLen = 32;  // Reduced from 64 for faster training
+  const seqLen = 512;  // Longer sequences for realistic profiling
   const sequences: number[][] = [];
   for (let i = 0; i < trainingTokens.length - seqLen; i += seqLen / 2) {
     sequences.push(trainingTokens.slice(i, i + seqLen));

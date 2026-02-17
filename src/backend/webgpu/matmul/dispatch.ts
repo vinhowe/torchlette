@@ -505,6 +505,10 @@ function dispatchTiledMatmulInternal(options: DispatchMatmulOptions & { config: 
   const workgroupsY = Math.ceil(m / config.tileM);
   const workgroupsZ = batchSize;
 
+  // Encode and submit (batch/shared-encoder mode aware)
+  const sharedEnc = getSharedEncoderInstance();
+  const opLabel = getCurrentOpLabel() ?? "matmul";
+
   // Record dispatch if recording is active
   if (matmulRecordingBuffer) {
     matmulRecordingBuffer.push({
@@ -514,12 +518,9 @@ function dispatchTiledMatmulInternal(options: DispatchMatmulOptions & { config: 
       workgroupsY,
       workgroupsZ,
       buffers: getAndClearLastBindGroupBuffers(),
+      label: opLabel,
     });
   }
-
-  // Encode and submit (batch/shared-encoder mode aware)
-  const sharedEnc = getSharedEncoderInstance();
-  const opLabel = getCurrentOpLabel() ?? "matmul";
   if (sharedEnc) {
     const tsWrites = getTimestampWrites(opLabel);
     const pass = sharedEnc.beginComputePass(tsWrites ? { timestampWrites: tsWrites } : undefined);
@@ -702,6 +703,10 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
     const kSplitBgBuffers = [a, b, tempBuffer, kSplitParamsBuffer];
     const kSplitBindGroup = cachedCreateBindGroup(device as any, kSplitPipeline as any, kSplitBgBuffers as any) as any;
 
+    // Dispatch K-split matmul
+    const sharedEnc = getSharedEncoderInstance();
+    const opLabel = getCurrentOpLabel() ?? "matmul";
+
     // Record if recording
     if (matmulRecordingBuffer) {
       matmulRecordingBuffer.push({
@@ -711,12 +716,9 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
         workgroupsY,
         workgroupsZ: kSplitFactor,
         buffers: getAndClearLastBindGroupBuffers(),
+        label: opLabel,
       });
     }
-
-    // Dispatch K-split matmul
-    const sharedEnc = getSharedEncoderInstance();
-    const opLabel = getCurrentOpLabel() ?? "matmul";
     if (sharedEnc) {
       const tsWrites = getTimestampWrites(opLabel);
       const pass = sharedEnc.beginComputePass(tsWrites ? { timestampWrites: tsWrites } : undefined);
@@ -753,6 +755,8 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
 
     const reduceWorkgroups = Math.ceil(totalElements / 256);
 
+    const reduceLabel = opLabel + "_ksplit_reduce";
+
     // Record if recording
     if (matmulRecordingBuffer) {
       matmulRecordingBuffer.push({
@@ -762,10 +766,9 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
         workgroupsY: 1,
         workgroupsZ: 1,
         buffers: getAndClearLastBindGroupBuffers(),
+        label: reduceLabel,
       });
     }
-
-    const reduceLabel = opLabel + "_ksplit_reduce";
     const sharedEnc2 = getSharedEncoderInstance();
     if (sharedEnc2) {
       const tsWrites = getTimestampWrites(reduceLabel);
@@ -816,6 +819,10 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
 
   const workgroupsZ = batchSize;
 
+  // Encode and submit (batch/shared-encoder mode aware)
+  const sharedEnc = getSharedEncoderInstance();
+  const opLabel = getCurrentOpLabel() ?? "matmul";
+
   // Record dispatch if recording is active
   if (matmulRecordingBuffer) {
     matmulRecordingBuffer.push({
@@ -825,12 +832,9 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
       workgroupsY,
       workgroupsZ,
       buffers: getAndClearLastBindGroupBuffers(),
+      label: opLabel,
     });
   }
-
-  // Encode and submit (batch/shared-encoder mode aware)
-  const sharedEnc = getSharedEncoderInstance();
-  const opLabel = getCurrentOpLabel() ?? "matmul";
   if (sharedEnc) {
     const tsWrites = getTimestampWrites(opLabel);
     const pass = sharedEnc.beginComputePass(tsWrites ? { timestampWrites: tsWrites } : undefined);
