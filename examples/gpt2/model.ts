@@ -329,8 +329,10 @@ export class TransformerBlock extends Module {
  */
 export class GPT2 extends Module {
   readonly config: GPT2Config;
+  /** Vocab size padded to multiple of 64 for matmul tile alignment */
+  readonly paddedVocabSize: number;
 
-  readonly wte: Embedding; // Token embeddings [vocabSize, embedDim]
+  readonly wte: Embedding; // Token embeddings [paddedVocabSize, embedDim]
   readonly wpe: Embedding; // Position embeddings [blockSize, embedDim]
   readonly drop: Dropout;
   readonly h: TransformerBlock[]; // Transformer blocks
@@ -347,9 +349,14 @@ export class GPT2 extends Module {
     this.config = config;
     const device = options?.device;
 
-    this.wte = new Embedding(api, config.vocabSize, config.embedDim, {
+    // Pad vocab size to next multiple of 64 for matmul tile alignment.
+    // Eliminates partial-tile waste in lm_head forward/backward (50257 → 50304).
+    this.paddedVocabSize = Math.ceil(config.vocabSize / 64) * 64;
+
+    this.wte = new Embedding(api, this.paddedVocabSize, config.embedDim, {
       device,
     });
+    // Padding rows are zero-padded in loadGPT2Weights (or initialized by randn for from-scratch training)
     this.wpe = new Embedding(api, config.blockSize, config.embedDim, {
       device,
     });
@@ -456,13 +463,18 @@ export class GPT2 extends Module {
     let loss: Tensor | null = null;
     if (targets !== undefined) {
       // Cross-entropy loss
-      // logits: [batch, seqLen, vocabSize]
+      // logits: [batch, seqLen, paddedVocabSize]
       // targets: [batch, seqLen]
-      // Flatten for cross-entropy: logits [batch*seqLen, vocabSize], targets [batch*seqLen]
+      // Flatten for cross-entropy, then narrow to real vocabSize to exclude padding logits.
+      // The lm_head matmul uses paddedVocabSize for tile alignment, but cross-entropy
+      // must only see vocabSize classes (padding logits at 0 would dominate softmax).
       const [batch, seqLenT] = targets.shape;
-      const flatLogits = logits.reshape([batch * seqLenT, this.config.vocabSize]);
+      const flatLogits = logits.reshape([batch * seqLenT, this.paddedVocabSize]);
+      const realLogits = this.paddedVocabSize > this.config.vocabSize
+        ? flatLogits.narrow(1, 0, this.config.vocabSize)
+        : flatLogits;
       const flatTargets = targets.reshape([batch * seqLenT]);
-      loss = crossEntropy(this.api, flatLogits, flatTargets);
+      loss = crossEntropy(this.api, realLogits, flatTargets);
     }
 
     return { logits, loss };
