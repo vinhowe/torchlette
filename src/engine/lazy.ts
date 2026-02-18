@@ -967,6 +967,12 @@ export async function executePlan(
     const { nodeOrder, nodeInputs, nodeSizes } = extractPlanMetadata(plan);
     const lastNodeId = plan.nodes[plan.nodes.length - 1].id;
     outputNodeIds = new Set([lastNodeId]);
+    // Protect externally-referenced nodes (saved for backward, user-held tensors)
+    // from early release — later plans need their buffers intact.
+    try {
+      const { getPendingNodeIds } = await import("../runtime/tensor");
+      for (const id of getPendingNodeIds()) outputNodeIds.add(id);
+    } catch { /* runtime/tensor not available */ }
     lifetimes = analyzeLifetimes(nodeOrder, nodeInputs, outputNodeIds, nodeSizes);
   }
 
@@ -980,8 +986,7 @@ export async function executePlan(
   for (let step = 0; step < plan.nodes.length; step++) {
     const node = plan.nodes[step];
 
-    // Skip nodes that already have results (e.g., from tape replay dispatch outputs
-    // or preserved fusedAttentionForward results from a prior force() call).
+    // Skip nodes that already have results (from a prior plan execution within this step).
     if (node.result) continue;
 
     // In view-only mode (tape replay fill-in), skip compute ops.
@@ -1633,8 +1638,16 @@ export async function executePlan(
     throw new Error("Execution failed: no result for last node");
   }
 
-  // Note: Intermediate buffer cleanup is handled by tensor disposal via onDispose callbacks.
-  // GPU buffers are destroyed when the corresponding frontend Tensor is disposed.
+  // Clear results for nodes whose buffers were destroyed by early release.
+  // Later plans skip nodes with results (if (node.result) continue), so stale
+  // results pointing to destroyed buffers would cause silent data corruption.
+  if (alreadyReleased.size > 0) {
+    for (const node of plan.nodes) {
+      if (alreadyReleased.has(node.id)) {
+        node.result = undefined;
+      }
+    }
+  }
 
   return lastNode.result;
 }
@@ -2537,6 +2550,9 @@ export async function executePlanOptimized(
         });
       }
       outputNodeIds = new Set([planNodes[planNodes.length - 1].id]);
+      if (externalNodeIds) {
+        for (const id of externalNodeIds) outputNodeIds.add(id);
+      }
     }
 
     // Reconstruct segments from cached pattern
@@ -2838,6 +2854,9 @@ export async function executePlanOptimized(
     const { nodeOrder, nodeInputs, nodeSizes } = extractPlanMetadata(reorderedPlan);
     const lastNodeId = plan.nodes[plan.nodes.length - 1].id;
     outputNodeIds = new Set([lastNodeId]);
+    if (externalNodeIds) {
+      for (const id of externalNodeIds) outputNodeIds.add(id);
+    }
     lifetimes = analyzeLifetimes(nodeOrder, nodeInputs, outputNodeIds, nodeSizes);
 
     // Store lifetime template in the fusion analysis cache for future hits
@@ -3095,7 +3114,15 @@ export async function executePlanOptimized(
     throw new Error("Execution failed: no result for last node");
   }
 
-  // Note: Intermediate buffer cleanup is handled by tensor disposal via onDispose callbacks.
+  // Clear results for nodes whose buffers were destroyed by early release.
+  if (alreadyReleased.size > 0) {
+    for (const node of plan.nodes) {
+      if (alreadyReleased.has(node.id)) {
+        node.result = undefined;
+      }
+    }
+  }
+
   return { result: lastNode.result, stats };
 }
 
