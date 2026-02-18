@@ -2506,10 +2506,14 @@ export class Torchlette {
     }
 
     return this.runEntryPoint(async () => {
-      // Wrap the entire backward pass in an async scope to track intermediate
-      // tensors created during async operations. This prevents memory leaks
-      // from gradients and intermediates created after tidy() scopes have exited.
-      return this.engine.runWithAsyncScope(async () => {
+      // Wrap the entire backward pass in a TidyDispatchMode to auto-dispose
+      // unwrapped RuntimeTensors (gradient accumulation intermediates,
+      // non-retained grads) at scope exit. Leaf/retained grads survive via
+      // wrap() → markEscaped().
+      const tidyMode = new TidyDispatchMode();
+      this.runtime.pushDispatchMode(tidyMode);
+      try {
+        return await this.engine.runWithAsyncScope(async () => {
         const seed = grad ? grad._unwrap() : this.seedGrad(a);
 
         // Use Tensor as key for gradient accumulation
@@ -2590,7 +2594,8 @@ export class Torchlette {
 
         // Phase C: Run ALL backward functions lazily (no forcing), then force
         // all final gradients in a single forceAll() at the end.
-        const gradAccumDisposals: RuntimeTensor[] = [];
+        // Gradient accumulation intermediates (old existing + old gradIn after
+        // runtime.add) are tracked by TidyDispatchMode and disposed at scope exit.
         for (let i = ordered.length - 1; i >= 0; i -= 1) {
           const node = ordered[i];
           const gradOutTensor = gradMap.get(node.output);
@@ -2649,9 +2654,8 @@ export class Torchlette {
             if (existing) {
               const accumulated = this.runtime.add(existing, gradIn);
               gradMap.set(input, accumulated);
-              // Defer disposal: accumulated's lazy graph depends on existing and gradIn.
-              // Disposing now would orphan the pending inputs before forceAll materializes them.
-              gradAccumDisposals.push(existing, gradIn);
+              // old existing and gradIn are tracked by TidyDispatchMode (not wrapped/escaped)
+              // and will be disposed at backward scope exit.
             } else {
               gradMap.set(input, gradIn);
             }
@@ -2705,10 +2709,6 @@ export class Torchlette {
         if (allGrads.length > 0) {
           await this.runtime.forceAll(...allGrads);
         }
-        // Now safe to dispose intermediate gradient tensors from accumulation
-        for (const t of gradAccumDisposals) {
-          if (!t.disposed) t.dispose();
-        }
         storageTracker.destroyUnreachable();
 
         // Store final gradients on leaf tensors and retained non-leaf tensors
@@ -2722,9 +2722,8 @@ export class Torchlette {
             const gradWrapper = this.wrap(gradTensor, false);
             this.keep(gradWrapper);
             tensor._setGrad(gradWrapper);
-          } else {
-            gradTensor.dispose();
           }
+          // Non-retained grads: not wrapped, so TidyDispatchMode disposes them at scope exit
         }
 
         // Clean up saved tensors and autograd graph after backward
@@ -2787,6 +2786,10 @@ export class Torchlette {
         }
 
       });
+      } finally {
+        this.runtime.popDispatchMode();
+        tidyMode.disposeNonEscaped();
+      }
     });
   }
 
@@ -2956,6 +2959,44 @@ export class Torchlette {
       tidyMode.disposeNonEscaped();
     }
     return result as T;
+  }
+
+  /**
+   * Async equivalent of tidy(). Tracks RuntimeTensors across await boundaries
+   * and auto-disposes unwrapped intermediates at scope exit. Tensors that are
+   * wrap()'d (returned from frontend ops) escape and are managed by the engine's
+   * async scope instead.
+   *
+   * Use this for async training loops where intermediate tensors need cleanup
+   * across await points.
+   *
+   * @example
+   * ```ts
+   * await api.asyncTidy(async () => {
+   *   const output = model.forward(input);
+   *   const loss = output.crossEntropy(target);
+   *   await loss.backward();
+   *   optimizer.step();
+   *   // intermediate RuntimeTensors auto-disposed
+   * });
+   * ```
+   */
+  async asyncTidy<T>(fn: () => Promise<T>): Promise<T> {
+    const tidyMode = new TidyDispatchMode();
+    this.runtime.pushDispatchMode(tidyMode);
+    try {
+      return await this.engine.runWithAsyncScope(async () => {
+        const result = await fn();
+        // Keep returned tensors alive through async scope exit
+        for (const et of collectEngineTensors(result)) {
+          this.engine.keep(et);
+        }
+        return result;
+      });
+    } finally {
+      this.runtime.popDispatchMode();
+      tidyMode.disposeNonEscaped();
+    }
   }
 
   /**

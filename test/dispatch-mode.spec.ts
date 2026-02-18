@@ -228,3 +228,71 @@ describe("TidyDispatchMode", () => {
     expect(outer._unwrap().disposed).toBe(false);
   });
 });
+
+describe("asyncTidy", () => {
+  it("disposes unwrapped intermediates across awaits", async () => {
+    const api = new Torchlette();
+    const created: Tensor[] = [];
+    const mode: DispatchMode = {
+      onTensorCreated: (t) => created.push(t),
+    };
+
+    // Track at runtime level to observe what asyncTidy cleans up
+    api.runtime.pushDispatchMode(mode);
+
+    await api.asyncTidy(async () => {
+      // Create runtime tensors directly (unwrapped)
+      const rt1 = api.runtime.tensorFromArray([1, 2], [2]);
+      const rt2 = api.runtime.tensorFromArray([3, 4], [2]);
+      const rt3 = api.runtime.add(rt1, rt2);
+
+      // Simulate async boundary
+      await Promise.resolve();
+
+      // rt1, rt2, rt3 are unwrapped — should be disposed at scope exit
+    });
+
+    api.runtime.popDispatchMode();
+
+    // All 3 runtime tensors should be disposed (unwrapped, never escaped)
+    expect(created.length).toBeGreaterThanOrEqual(3);
+    for (const t of created) {
+      expect(t.disposed).toBe(true);
+    }
+  });
+
+  it("preserves wrapped (escaped) tensors", async () => {
+    const api = new Torchlette();
+
+    const result = await api.asyncTidy(async () => {
+      const a = api.tensorFromArray([1, 2, 3], [3]);
+      const b = api.tensorFromArray([4, 5, 6], [3]);
+      const c = a.add(b);
+      return c;
+    });
+
+    // Wrapped result should survive
+    expect(result).toBeDefined();
+    expect(result._unwrap().disposed).toBe(false);
+  });
+
+  it("works with nested sync tidy", async () => {
+    const api = new Torchlette();
+
+    const result = await api.asyncTidy(async () => {
+      const inner = api.tidy(() => {
+        const a = api.tensorFromArray([1, 2], [2]);
+        const b = api.tensorFromArray([3, 4], [2]);
+        return a.add(b);
+      });
+
+      await Promise.resolve();
+
+      // inner survived sync tidy, and should survive async tidy too
+      return inner;
+    });
+
+    expect(result).toBeDefined();
+    expect(result._unwrap().disposed).toBe(false);
+  });
+});

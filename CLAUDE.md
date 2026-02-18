@@ -77,19 +77,19 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
 
 **Key metrics to extract from profiler output:**
 
-1. **Wall clock** — Per-step timings from the WALL CLOCK SUMMARY table. Steady-state = avg of steps 2-4. Step 0 is pipeline warmup (expect 8-10x slower). Breakdown: forward, backward, optimizer, cleanup as % of total.
+1. **Wall clock** — Per-step timings from the WALL CLOCK SUMMARY table. Steady-state = step 4 (steps 0-2 have compilation/pool warmup). Step 0 is pipeline warmup (expect 100x+ slower). Breakdown: forward, backward, optimizer, cleanup as % of total.
 
-2. **GPU time budget** — From the Phase table (`Phase | Ops | CPU(ms) | GPU(ms)`). Sum GPU(ms) across forward+backward+cleanup for total GPU time. **GPU utilization = total_GPU / wall_clock**. Current baseline: ~85% utilization (27ms GPU / 32ms wall with dispatch replay; profiler runs without replay at ~75ms).
+2. **GPU time budget** — From the Phase table (`Phase | Ops | CPU(ms) | GPU(ms)`). Sum GPU(ms) across forward+backward+cleanup for total GPU time. At 512 tokens the workload is GPU-bound (145ms GPU vs 54ms CPU dispatch). At 31 tokens it was CPU-dispatch-bound (~85% utilization).
 
-3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). Current top offenders: `matmul` (7.5ms, 32%), `matmul++cast+bias+binary` (4.5ms, 19%), `adamStep` (1.9ms, 8%), `fusedLayerNormBackwardGradWeightBias` (1.7ms, 7%), `matmul++cast+bias` (1.7ms, 7%), `fused` (1.0ms, 4%), `sum` (0.8ms, 3%), `add` (0.8ms, 3%), `matmul++cast` (0.7ms, 3%).
+3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). At 512 tokens: `fusedAttentionBackward` (58.8ms, 40.5%), `matmul` (37.7ms, 26.0%), `fusedAttentionForward` (12.0ms, 8.3%), `matmul++cast+bias+binary` (8.4ms, 5.8%), `matmul++cast` (7.8ms, 5.4%), `matmul++cast+bias` (5.4ms, 3.7%), `adamStep` (4.9ms, 3.4%).
 
-4. **Cross-entropy** — Fused kernel implemented. Now 0.4ms/1.4% of GPU time (down from 34ms/31%). No longer a bottleneck.
+4. **Cross-entropy** — Fused kernel implemented. 1.1ms/0.7% of GPU time at 512 tokens. No longer a bottleneck.
 
-5. **CPU dispatch overhead** — From `CPU API Call` table. Bind group cache at 99.6% (2 misses). 12 submits/step.
+5. **CPU dispatch overhead** — From `CPU API Call` table. Bind group cache at 100.0% (0 misses). 10 submits/step.
 
-6. **Fusion rate** — From Plan Analysis. Total: 1031 nodes, 240 fused (23.3%), 52 fusion groups, 665 sequential. Note: fused LayerNorm/cross-entropy ops replace ~9 decomposed ops each, so effective fusion is higher than the raw percentage. Key unfused ops: 69 `cast` ops (f32↔f16), 39 `reshape` ops, 37 `add` ops, 37 `matmul` ops.
+6. **Fusion rate** — From Plan Analysis. Total: 1124 nodes, 183 fused (16.3%), 20 fusion groups, 645 sequential. Note: fused LayerNorm/cross-entropy/attention ops replace many decomposed ops each, so effective fusion is higher than the raw percentage.
 
-7. **Memory** — From Memory Stats section. Track: current/peak MB, buffer pool reuse rate (should be ~77%+), allocation histogram. No NaN values = working correctly.
+7. **Memory** — From Memory Stats section. Track: current/peak MB, buffer pool reuse rate. At 512 tokens: 4871MB current, 6194MB peak, pool reuse 56.8%, 1 new alloc/step steady-state.
 
 8. **Leak status** — From MEMORY LEAK REPORT. Storages and reachable should stabilize. PendingDestroy should not grow. CurrentMB should not monotonically increase. "LEAK STATUS: OK" = pass.
 
@@ -476,7 +476,15 @@ Why: Within a step, multiple plan executions share the same encoder scope (forwa
 
 ## Remaining Performance Optimizations
 
-Profiled on DistilGPT-2 training (steady-state ~32ms/step with dispatch replay, 24ms GPU, ~85% GPU utilization). Targets ranked by impact:
+Profiled on DistilGPT-2 training. Two baseline configurations:
+
+### Baseline A: 31 tokens (original)
+Steady-state ~32ms/step with dispatch replay, 24ms GPU, ~85% GPU utilization. CPU-dispatch-bound.
+
+### Baseline B: 512 tokens (current default)
+Steady-state ~54ms/step wall clock (profiler, no replay). GPU-bound: 145ms GPU / 54ms CPU dispatch. Top GPU kernels: `fusedAttentionBackward` 58.8ms (40.5%), `matmul` 37.7ms (26.0%), `fusedAttentionForward` 12.0ms (8.3%), `matmul++cast+bias+binary` 8.4ms (5.8%), `matmul++cast` 7.8ms (5.4%), `matmul++cast+bias` 5.4ms (3.7%), `adamStep` 4.9ms (3.4%). Cross-entropy 1.1ms (0.7%). Bind group cache 100.0% (0 misses). 10 submits/step. Fusion: 1124 nodes, 183 fused (16.3%), 20 groups. Memory: 4871MB current / 6194MB peak / 32GB limit. Pool reuse 56.8%. 1 new alloc/step. Leak status: OK (storages +0.0/step).
+
+Targets ranked by impact:
 
 **Completed optimizations:**
 1. ~~**Intra-plan buffer reclamation**~~ — DONE. `createBuffer` avg cost dropped 365µs→81µs.
@@ -513,6 +521,8 @@ Profiled on DistilGPT-2 training (steady-state ~32ms/step with dispatch replay, 
 31. ~~**Bind group cache: max + narrowBackward arena routing**~~ — DONE. `max()` and `narrowBackward()` used `createTrackedBuffer` directly, bypassing the buffer arena. Replaced with `resolveOutputBuffer` (max) and let `dispatchElementwise` handle allocation (narrowBackward). Bind group cache 91.0%→99.6% (40→2 misses). `createBindGroup` 1.9ms→0.1ms. ~1.8ms/step saved.
 32. ~~**Submit reduction: eliminate periodic reclamation**~~ — DONE. With arena-managed buffers (335 hits/step) and pool reservation (1 new alloc/step), intra-step buffer reclamation via periodic `flushSharedEncoder` is unnecessary. Increased `DEFAULT_RECLAIM_INTERVAL` 100→10000 (effectively disabled for plans <10k nodes). Also increased `PARAMS_FLUSH_THRESHOLD` 256→2000 to prevent auto-flush from params buffer accumulation. `queue.submit` calls: 14→7/step (profiler), ~4/step (replay). Total submit CPU: 3.9ms→3.1ms. ~0.8ms/step saved. Configurable via `TORCHLETTE_RECLAIM_INTERVAL` env var.
 
-**Open targets (ranked by estimated savings):**
-1. **GC pressure** — 0.8% of CPU profiler self-time. Object pooling for Tensor metadata. ~2-3ms/step potential.
-2. **Pipeline cache warmup** — Step 0 is 3.5s (49x steady-state) due to pipeline compilation. Pre-compile pipeline variants during model load.
+**Open targets (ranked by estimated savings at 512 tokens):**
+1. **fusedAttentionBackward optimization** — 58.8ms GPU (40.5%). Max single dispatch 9068µs. Memory-bandwidth-bound. Tile size tuning or algorithmic improvements could reduce this.
+2. **lm_head matmul** — 19.6ms GPU combined (forward 7.8ms + backward 8.7ms + backward dW 11.3ms max). Large vocab (50257) dominates. Single-dispatch bottleneck.
+3. **GC pressure** — 2.1% of CPU profiler self-time (156ms). Object pooling for Tensor metadata.
+4. **Pipeline cache warmup** — Step 0 is 5.5s (101x steady-state) due to pipeline compilation. Pre-compile pipeline variants during model load.
