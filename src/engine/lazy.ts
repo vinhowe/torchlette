@@ -975,14 +975,14 @@ export async function executePlan(
 
   try {
 
-  const skipPre = options?.skipPreExecuted === true;
   const viewOnly = options?.viewOpsOnly === true;
 
   for (let step = 0; step < plan.nodes.length; step++) {
     const node = plan.nodes[step];
 
-    // Skip nodes that already have results (e.g., from tape replay dispatch outputs)
-    if (skipPre && node.result) continue;
+    // Skip nodes that already have results (e.g., from tape replay dispatch outputs
+    // or preserved fusedAttentionForward results from a prior force() call).
+    if (node.result) continue;
 
     // In view-only mode (tape replay fill-in), skip compute ops.
     // Only view ops and data-source ops need execution; compute ops are
@@ -3387,6 +3387,26 @@ export async function executeLoweredPlan(
             if (_replayTiming) { _tResult += performance.now() - _rsT0; _nResults++; }
             break;
           }
+          case "side-output": {
+            // Restore _attnSideOutput on fusedAttentionForward nodes so a later
+            // plan (backward Phase B) can skip re-executing fusedAttentionForward
+            // and extractAttentionLogsumexp can read the side output directly.
+            const soNode = planNodes[entry.nodeIndex];
+            if (!(soNode as any)._attnSideOutput) {
+              (soNode as any)._attnSideOutput = createStorageHandle(soNode.device, {
+                buffer: entry.buffer,
+                shape: entry.shape,
+                dtype: entry.dtype,
+                size: entry.size,
+                strides: entry.strides,
+                offset: 0,
+                isContiguous: true,
+                ownsBuffer: false,
+                destroy() {},
+              } as BackendTensor);
+            }
+            break;
+          }
         }
       }
       flushDispatchBatch(); // Flush remaining batched dispatches
@@ -4016,6 +4036,20 @@ export async function executeLoweredPlan(
                   isView: isView,
                 }});
               }
+              // Record side output for fusedAttentionForward so replay
+              // restores _attnSideOutput (needed by extractAttentionLogsumexp
+              // in a later plan that skips re-executing this node).
+              if ((node as any)._attnSideOutput) {
+                const soSH = (node as any)._attnSideOutput as StorageHandle;
+                const sobt = soSH.backendTensor as any;
+                replayEntries.push({ kind: "side-output", nodeIndex: nodeIdx,
+                  buffer: sobt.buffer,
+                  shape: sobt.shape?.slice() ?? [],
+                  dtype: sobt.dtype ?? "f32",
+                  size: sobt.size ?? 0,
+                  strides: sobt.strides?.slice() ?? [],
+                });
+              }
             }
           }
           break;
@@ -4059,6 +4093,9 @@ export async function executeLoweredPlan(
         }
         if (entry.kind === "result" && entry.nodeResult.buffer) {
           pinnedBuffers.add(entry.nodeResult.buffer);
+        }
+        if (entry.kind === "side-output" && entry.buffer) {
+          pinnedBuffers.add(entry.buffer);
         }
       }
 
