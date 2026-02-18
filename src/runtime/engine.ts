@@ -560,14 +560,8 @@ export class RuntimeEngine {
       tensor._materialize(result);
     }
 
-    // Drop node.result references to allow GC of unclaimed intermediate storages.
-    // Preserve .result for fusedAttentionForward nodes (have _attnSideOutput) so
-    // Phase B's plan can skip re-executing them — extractAttentionLogsumexp and
-    // reshape consumers need the result via getInputStorage().
-    for (const node of plan.nodes) {
-      if ((node as any)._attnSideOutput) continue;
-      node.result = undefined;
-    }
+    // Results are preserved so later plans skip already-executed nodes.
+    // Early-released nodes have their results cleared in the executor.
 
   }
 
@@ -691,13 +685,6 @@ export class RuntimeEngine {
 
       // Cache fingerprint for this structural key on success
       this.planFingerprintCache.set(structKey, fingerprint);
-
-      // Drop node.result references to allow GC.
-      // Preserve fusedAttentionForward results (see force() comment).
-      for (const node of plan.nodes) {
-        if ((node as any)._attnSideOutput) continue;
-        node.result = undefined;
-      }
 
       return true;
     } catch (err) {
@@ -839,13 +826,6 @@ export class RuntimeEngine {
           tensor._materialize(lazyRef.node.result);
         }
       }
-    }
-
-    // Drop node.result references to allow GC of unclaimed intermediate storages.
-    // Preserve fusedAttentionForward results (see force() comment).
-    for (const node of plan.nodes) {
-      if ((node as any)._attnSideOutput) continue;
-      node.result = undefined;
     }
 
   }
