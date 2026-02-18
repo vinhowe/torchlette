@@ -22,7 +22,6 @@ import {
   setProfilePhase,
   setProfileModule,
   readGpuTimestamps,
-  flushAndReadGpuTimestamps,
   printProfileSummary,
   resetProfileStats,
   isProfilingEnabled,
@@ -71,9 +70,19 @@ for (let i = 0; i < SEQ_LEN + 1; i++) {
 // ============================================================================
 
 /**
+ * Set both the GPU profile module label and the autograd node label,
+ * so backward ops inherit the forward module name via dispatch hooks.
+ */
+function profileModule(api: Torchlette, name: string) {
+  setProfileModule(name);
+  api.setNodeLabel(name);
+}
+
+/**
  * Wraps the model's forward pass with module-level profiling labels.
- * Each sub-module call is surrounded by setProfileModule() to tag
- * the lazy IR nodes with their originating module.
+ * Each sub-module call is surrounded by profileModule() to tag
+ * the lazy IR nodes with their originating module AND capture the
+ * label on autograd nodes for backward attribution.
  */
 function instrumentedForwardWithLoss(
   model: GPT2,
@@ -85,14 +94,14 @@ function instrumentedForwardWithLoss(
   const [_batch, seqLen] = idx.shape;
 
   // --- Embedding ---
-  setProfileModule("embed.wte");
+  profileModule(api, "embed.wte");
   const tokEmb = model.wte.forward(idx);
 
-  setProfileModule("embed.wpe");
+  profileModule(api, "embed.wpe");
   const pos = api.arange(seqLen).reshape([1, seqLen]);
   const posEmb = model.wpe.forward(pos);
 
-  setProfileModule("embed.combine");
+  profileModule(api, "embed.combine");
   let x = api.add(tokEmb, posEmb);
   // skip dropout in profiling (model.drop)
 
@@ -101,14 +110,14 @@ function instrumentedForwardWithLoss(
     const block = model.h[i];
 
     // LayerNorm 1
-    setProfileModule(`block${i}.ln1`);
+    profileModule(api, `block${i}.ln1`);
     const ln1Out = block.ln1.forward(x);
 
     // Attention
-    setProfileModule(`block${i}.attn.qkv`);
+    profileModule(api, `block${i}.attn.qkv`);
     const qkv = block.attn.cAttn.forward(ln1Out);
 
-    setProfileModule(`block${i}.attn.split`);
+    profileModule(api, `block${i}.attn.split`);
     const [batch, sl, _ed] = ln1Out.shape;
     const numHeads = block.attn["numHeads"] as number;
     const headDim = block.attn["headDim"] as number;
@@ -123,69 +132,57 @@ function instrumentedForwardWithLoss(
     const k = kSlice.reshape([batch, sl, numHeads, headDim]).permute([0, 2, 1, 3]).contiguous();
     const v = vSlice.reshape([batch, sl, numHeads, headDim]).permute([0, 2, 1, 3]).contiguous();
 
-    setProfileModule(`block${i}.attn.scores`);
-    const kT = k.transpose({ dim0: 2, dim1: 3 });
+    profileModule(api, `block${i}.attn.sdpa`);
     const scale = 1.0 / Math.sqrt(headDim);
-    const scores = api.mul(q.matmul(kT), api.full([], scale));
+    const attnOutput = api.scaledDotProductAttention(q, k, v, scale, true);
 
-    setProfileModule(`block${i}.attn.mask`);
-    const causalBias = block.attn["causalBias"] as Tensor;
-    const mask = causalBias.narrow(2, 0, sl).narrow(3, 0, sl);
-    const maskedScores = api.add(scores, mask);
-
-    setProfileModule(`block${i}.attn.softmax`);
-    const attnWeights = maskedScores.softmax(-1);
-
-    setProfileModule(`block${i}.attn.value`);
-    const attnOutput = attnWeights.matmul(v);
-
-    setProfileModule(`block${i}.attn.proj`);
+    profileModule(api, `block${i}.attn.proj`);
     const attnConcat = attnOutput
       .permute([0, 2, 1, 3])
       .contiguous()
       .reshape([batch, sl, embedDim]);
     const attnProjOut = block.attn.cProj.forward(attnConcat);
 
-    setProfileModule(`block${i}.residual1`);
+    profileModule(api, `block${i}.residual1`);
     let h = api.add(x, attnProjOut);
 
     // LayerNorm 2
-    setProfileModule(`block${i}.ln2`);
+    profileModule(api, `block${i}.ln2`);
     const ln2Out = block.ln2.forward(h);
 
     // MLP
-    setProfileModule(`block${i}.mlp.fc`);
+    profileModule(api, `block${i}.mlp.fc`);
     let mlpH = block.mlp.cFc.forward(ln2Out);
 
-    setProfileModule(`block${i}.mlp.gelu`);
+    profileModule(api, `block${i}.mlp.gelu`);
     mlpH = mlpH.gelu();
 
-    setProfileModule(`block${i}.mlp.proj`);
+    profileModule(api, `block${i}.mlp.proj`);
     mlpH = block.mlp.cProj.forward(mlpH);
 
-    setProfileModule(`block${i}.residual2`);
+    profileModule(api, `block${i}.residual2`);
     h = api.add(h, mlpH);
 
     x = h;
   }
 
   // --- Final LayerNorm ---
-  setProfileModule("final.ln");
+  profileModule(api, "final.ln");
   x = model.lnF.forward(x);
 
   // --- LM Head ---
-  setProfileModule("final.lm_head");
+  profileModule(api, "final.lm_head");
   const logits = api.linear(x, model.wte.weight, null);
 
   // --- Loss ---
-  setProfileModule("loss.cross_entropy");
+  profileModule(api, "loss.cross_entropy");
   const [batch2, seqLenT] = targets.shape;
   const flatLogits = logits.reshape([batch2 * seqLenT, config.vocabSize]);
   const flatTargets = targets.reshape([batch2 * seqLenT]);
 
   const loss = crossEntropy(api, flatLogits, flatTargets);
 
-  setProfileModule("unknown");
+  profileModule(api, "unknown");
   return loss;
 }
 
@@ -236,6 +233,11 @@ async function main() {
       });
     }
     return instrumentedForwardWithLoss(model, api, input, target);
+  });
+
+  // Register backward dispatch hook: propagate forward module labels into backward phase
+  api.onBackwardDispatch(({ label }) => {
+    if (label) setProfileModule(label);
   });
 
   const inputTokens = FIXED_TOKENS.slice(0, -1); // 31 tokens
@@ -289,19 +291,8 @@ async function main() {
     const lossValue = await loss.item();
     const t1 = performance.now();
 
-    // V100/Dawn workaround: read GPU timestamps after forward pass, before
-    // backward. The timestamp-query feature corrupts Dawn's fence mechanism
-    // after backward dispatches, making onSubmittedWorkDone/mapAsync deadlock.
-    // Reading here captures forward GPU timing while fences still work.
-    // flushAndReadGpuTimestamps also disables timestamp writes for the rest
-    // of the step (backward/optimizer use CPU timing only).
-    if (step === PROFILE_STEP) {
-      await flushAndReadGpuTimestamps();
-    }
-
     // --- Backward ---
     setProfilePhase("backward");
-    setProfileModule("backward");
     let scaledLoss: Tensor | null = null;
     if (scaler) {
       scaledLoss = scaler.scale(loss);

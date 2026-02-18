@@ -13,6 +13,7 @@ import {
   type MeanOptions,
   type ScatterAddOptions,
   type StridedScatterOptions,
+  type FusedAttentionConfig,
   type FusedCrossEntropyConfig,
   type FusedLayerNormConfig,
   type SubOptions,
@@ -65,6 +66,42 @@ function castRef(input: OpInput, toDtype: DType): OpInput {
   return { lazyRef: createPendingRef(node), shape: input.shape, dtype: toDtype, device: input.device };
 }
 
+/**
+ * Dispatch mode: receives notifications when RuntimeTensors are created or escape a scope.
+ * Pushed/popped on a stack on RuntimeEngine. All active modes are notified.
+ */
+export interface DispatchMode {
+  onTensorCreated(tensor: Tensor): void;
+  onTensorEscaped?(tensor: Tensor): void;
+}
+
+/**
+ * Dispatch mode that tracks RuntimeTensors created within a tidy scope.
+ * Tensors that are wrapped (via markEscaped) are exempt from disposal.
+ * At scope exit, disposeNonEscaped() cleans up unwrapped intermediates.
+ */
+export class TidyDispatchMode implements DispatchMode {
+  readonly tracked = new Set<Tensor>();
+  readonly escaped = new Set<Tensor>();
+
+  onTensorCreated(tensor: Tensor): void {
+    this.tracked.add(tensor);
+  }
+
+  onTensorEscaped(tensor: Tensor): void {
+    this.escaped.add(tensor);
+  }
+
+  /** Dispose all RuntimeTensors that weren't wrapped (didn't escape). */
+  disposeNonEscaped(): void {
+    for (const t of this.tracked) {
+      if (!this.escaped.has(t) && !t.disposed) {
+        t.dispose();
+      }
+    }
+  }
+}
+
 export interface RuntimeEngineOptions {
   /** Enable memory planning for buffer pooling and reuse */
   enableMemoryPlanning?: boolean;
@@ -93,6 +130,14 @@ export interface RuntimeEngineOptions {
   enableTrueSegmentation?: boolean;
 }
 
+/** Internal dispatch mode used by startIntermediateTracking/stopIntermediateTracking. */
+class IntermediateTrackingMode implements DispatchMode {
+  readonly tracked = new Set<Tensor>();
+  onTensorCreated(tensor: Tensor): void {
+    this.tracked.add(tensor);
+  }
+}
+
 export class RuntimeEngine {
   private defaultDevice: DeviceKind | null = null;
   private memoryPlanningEnabled = false;
@@ -111,12 +156,8 @@ export class RuntimeEngine {
   /** Cache plan fingerprints by cheap structural key to avoid O(N) hashing. */
   private planFingerprintCache = new Map<string, number>();
 
-  /**
-   * Tracking scope for intermediate tensors created during backward pass.
-   * When non-null, all tensors created by RuntimeEngine ops are tracked here.
-   * After backward completes, we dispose all tracked tensors except returned gradients.
-   */
-  private intermediateScope: Set<Tensor> | null = null;
+  /** Stack of active dispatch modes (notified on tensor creation/escape). */
+  private dispatchModes: DispatchMode[] = [];
 
   constructor(backendName?: DeviceKind, options?: RuntimeEngineOptions) {
     if (backendName) {
@@ -291,18 +332,35 @@ export class RuntimeEngine {
   }
 
   // ============================================================================
-  // Intermediate Tensor Tracking (for backward pass memory management)
+  // Dispatch Mode Stack
+  // ============================================================================
+
+  pushDispatchMode(mode: DispatchMode): void {
+    this.dispatchModes.push(mode);
+  }
+
+  popDispatchMode(): DispatchMode {
+    const mode = this.dispatchModes.pop();
+    if (!mode) throw new Error("No dispatch mode to pop");
+    return mode;
+  }
+
+  markEscaped(tensor: Tensor): void {
+    for (const mode of this.dispatchModes) {
+      mode.onTensorEscaped?.(tensor);
+    }
+  }
+
+  // ============================================================================
+  // Intermediate Tensor Tracking (backward pass memory management)
   // ============================================================================
 
   /**
    * Start tracking intermediate tensors created during backward computations.
-   * All tensors created by RuntimeEngine ops will be added to the tracking set.
+   * Implemented as a dispatch mode — supports nesting.
    */
   startIntermediateTracking(): void {
-    if (this.intermediateScope) {
-      throw new Error("Nested intermediate tracking not supported");
-    }
-    this.intermediateScope = new Set();
+    this.pushDispatchMode(new IntermediateTrackingMode());
   }
 
   /**
@@ -310,19 +368,11 @@ export class RuntimeEngine {
    * The caller should dispose tensors that are not needed (e.g., not returned gradients).
    */
   stopIntermediateTracking(): Set<Tensor> {
-    const tracked = this.intermediateScope;
-    this.intermediateScope = null;
-    return tracked ?? new Set();
-  }
-
-  /**
-   * Track a tensor as an intermediate if tracking is active.
-   * Called internally by all ops that create tensors.
-   */
-  private trackIntermediate(tensor: Tensor): void {
-    if (this.intermediateScope) {
-      this.intermediateScope.add(tensor);
+    const mode = this.popDispatchMode();
+    if (!(mode instanceof IntermediateTrackingMode)) {
+      throw new Error("Expected IntermediateTrackingMode on dispatch mode stack");
     }
+    return mode.tracked;
   }
 
   /**
@@ -337,7 +387,9 @@ export class RuntimeEngine {
     dtype: DType = "f32",
   ): Tensor {
     const tensor = new Tensor(baseId, lazyRef, shape, device, dtype);
-    this.trackIntermediate(tensor);
+    for (let i = 0; i < this.dispatchModes.length; i++) {
+      this.dispatchModes[i].onTensorCreated(tensor);
+    }
     return tensor;
   }
 
@@ -2005,6 +2057,98 @@ export class RuntimeEngine {
       config,
     );
     return this.createAndTrack(createBaseId(), createPendingRef(node), shape, gradOutput.device);
+  }
+
+  /**
+   * Fused attention forward: Q,K,V [B,H,N,D] → O [B,H,N,D].
+   * Logsumexp is extracted via extractAttentionLogsumexp.
+   */
+  fusedAttentionForward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    config: FusedAttentionConfig,
+  ): Tensor {
+    const shape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
+    const node = createLazyIRNode(
+      "fusedAttentionForward",
+      [q.lazyRef, k.lazyRef, v.lazyRef],
+      shape,
+      "f32",
+      q.device,
+      config,
+    );
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, q.device);
+  }
+
+  /**
+   * Extract logsumexp side output [B,H,N] from fusedAttentionForward.
+   */
+  extractAttentionLogsumexp(fwdOutput: Tensor, config: FusedAttentionConfig): Tensor {
+    const shape = [config.batchSize, config.numHeads, config.seqLen];
+    const node = createLazyIRNode(
+      "extractAttentionLogsumexp",
+      [fwdOutput.lazyRef],
+      shape,
+      "f32",
+      fwdOutput.device,
+    );
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, fwdOutput.device);
+  }
+
+  /**
+   * Fused attention backward: Q,K,V,L,dO,O → dQ [B,H,N,D].
+   * dK and dV are extracted via extractAttentionDK/DV.
+   */
+  fusedAttentionBackward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    logsumexp: Tensor,
+    dO: Tensor,
+    output: Tensor,
+    config: FusedAttentionConfig,
+  ): Tensor {
+    const shape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
+    const node = createLazyIRNode(
+      "fusedAttentionBackward",
+      [q.lazyRef, k.lazyRef, v.lazyRef, logsumexp.lazyRef, dO.lazyRef, output.lazyRef],
+      shape,
+      "f32",
+      q.device,
+      config,
+    );
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, q.device);
+  }
+
+  /**
+   * Extract dK side output from fusedAttentionBackward.
+   */
+  extractAttentionDK(bwdDQ: Tensor, config: FusedAttentionConfig): Tensor {
+    const shape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
+    const node = createLazyIRNode(
+      "extractAttentionDK",
+      [bwdDQ.lazyRef],
+      shape,
+      "f32",
+      bwdDQ.device,
+    );
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, bwdDQ.device);
+  }
+
+  /**
+   * Extract dV side output from fusedAttentionBackward.
+   */
+  extractAttentionDV(bwdDQ: Tensor, config: FusedAttentionConfig): Tensor {
+    const shape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
+    const node = createLazyIRNode(
+      "extractAttentionDV",
+      [bwdDQ.lazyRef],
+      shape,
+      "f32",
+      bwdDQ.device,
+    );
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, bwdDQ.device);
   }
 
   /**

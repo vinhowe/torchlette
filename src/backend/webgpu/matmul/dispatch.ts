@@ -10,7 +10,7 @@ export function setMatmulRecordingBuffer(buf: RecordedDispatch[] | null): void {
   matmulRecordingBuffer = buf;
 }
 
-import { profileApiCall, getTimestampWrites } from "../profiler";
+import { profileApiCall, getTimestampWrites, getProfileModule } from "../profiler";
 import {
   type CodegenOptions,
   type EpilogueConfig,
@@ -519,6 +519,7 @@ function dispatchTiledMatmulInternal(options: DispatchMatmulOptions & { config: 
       workgroupsZ,
       buffers: getAndClearLastBindGroupBuffers(),
       label: opLabel,
+      module: getProfileModule(),
     });
   }
   if (sharedEnc) {
@@ -717,6 +718,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
         workgroupsZ: kSplitFactor,
         buffers: getAndClearLastBindGroupBuffers(),
         label: opLabel,
+        module: getProfileModule(),
       });
     }
     if (sharedEnc) {
@@ -767,6 +769,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
         workgroupsZ: 1,
         buffers: getAndClearLastBindGroupBuffers(),
         label: reduceLabel,
+        module: getProfileModule(),
       });
     }
     const sharedEnc2 = getSharedEncoderInstance();
@@ -833,6 +836,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
       workgroupsZ,
       buffers: getAndClearLastBindGroupBuffers(),
       label: opLabel,
+      module: getProfileModule(),
     });
   }
   if (sharedEnc) {

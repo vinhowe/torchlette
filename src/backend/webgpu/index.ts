@@ -8,6 +8,7 @@ import { getExpr as getExprFromRegistry, isUnaryOp as isUnaryOpFromRegistry, get
 import { dispatchAdamStep as dispatchAdamStepKernel } from "./adam-kernel";
 import { dispatchUnscaleGrad as dispatchUnscaleGradKernel, allocateInfFlagBuffer, readInfFlag, destroyPersistentInfFlagBuffer } from "./unscale-kernel";
 import { dispatchCrossEntropyForward as dispatchCEForwardKernel, dispatchCrossEntropyBackward as dispatchCEBackwardKernel } from "./cross-entropy-kernel";
+import { dispatchFlashAttentionForward as dispatchFAForwardKernel, dispatchFlashAttentionBackwardD as dispatchFABwdDKernel, dispatchFlashAttentionBackwardDQ as dispatchFABwdDQKernel, dispatchFlashAttentionBackwardDKV as dispatchFABwdDKVKernel } from "./attention-kernel";
 import { dispatchLayerNormForward as dispatchLNForwardKernel, dispatchLayerNormBackwardGradX as dispatchLNBwdGradXKernel, dispatchLayerNormBackwardGradWeightBias as dispatchLNBwdGradWBKernel } from "./layernorm-kernel";
 import type {
   Backend,
@@ -68,6 +69,8 @@ import {
   resolveGpuTimestamps,
   profileSubOpBegin,
   profileSubOpEnd,
+  getProfileModule,
+  setProfileModule,
 } from "./profiler";
 
 // Re-export memory tracking functions
@@ -2202,6 +2205,10 @@ export interface RecordedDispatch {
   workgroupsZ: number;
   /** GPUBuffers referenced by this bind group. Populated during recording for pinning. */
   buffers?: GPUBuffer[];
+  /** Op label for GPU timestamp profiling during replay. */
+  label?: string;
+  /** Module label for per-module GPU breakdown during replay. */
+  module?: string;
 }
 
 /** Active recording buffer (null = not recording). */
@@ -2250,7 +2257,12 @@ export function replayDispatches(dispatches: RecordedDispatch[]): void {
   }
   for (let i = 0; i < dispatches.length; i++) {
     const d = dispatches[i];
-    const pass = sharedEncoderInstance.beginComputePass(undefined);
+    // Restore module context and attach GPU timestamp queries during profiling
+    if (d.module) setProfileModule(d.module);
+    const tsWrites = getTimestampWrites(d.label ?? "unknown");
+    const pass = sharedEncoderInstance.beginComputePass(
+      tsWrites ? { timestampWrites: tsWrites } : undefined,
+    );
     pass.setPipeline(d.pipeline);
     pass.setBindGroup(0, d.bindGroup);
     pass.dispatchWorkgroups(d.workgroupsX, d.workgroupsY, d.workgroupsZ);
@@ -2278,6 +2290,8 @@ export function dispatchComputePass(
       workgroupsY,
       workgroupsZ,
       buffers: getAndClearLastBindGroupBuffers(),
+      label: currentOpLabel ?? undefined,
+      module: getProfileModule(),
     });
   }
 
@@ -5848,7 +5862,8 @@ function detectSimpleTranspose(tensor: WebGPUTensor): number[] | null {
  * Helper to ensure a tensor is contiguous, materializing if needed.
  */
 function ensureContiguous(tensor: WebGPUTensor): WebGPUTensor {
-  return (tensor.isContiguous ? tensor : contiguous(tensor)) as WebGPUTensor;
+  if (tensor.isContiguous) return tensor;
+  return contiguous(tensor) as WebGPUTensor;
 }
 
 /**
@@ -10281,6 +10296,97 @@ function fusedLayerNormBackwardGradWeightBias(
   };
 }
 
+// ============================================================================
+// Fused FlashAttention (Forward + Backward)
+// ============================================================================
+
+function fusedAttentionForward(
+  q: BackendTensor,
+  k: BackendTensor,
+  v: BackendTensor,
+  config: import("../types").FusedAttentionConfig,
+): { output: BackendTensor; logsumexp: BackendTensor } {
+  const qT = ensureContiguous(q as WebGPUTensor);
+  const kT = ensureContiguous(k as WebGPUTensor);
+  const vT = ensureContiguous(v as WebGPUTensor);
+  const { outputBuffer, logsumexpBuffer } = dispatchFAForwardKernel(
+    qT.buffer, kT.buffer, vT.buffer,
+    config.batchSize, config.numHeads, config.seqLen, config.headDim,
+    config.scale, config.isCausal,
+  );
+
+  // Destroy contiguous copies if created (deferred for GPU fence)
+  const bpe = 4; // f32
+  if (qT !== q) { bufferPool.decRef(qT.buffer); bufferPool.deferredDestroy(qT.buffer, qT.size * bpe); }
+  if (kT !== k) { bufferPool.decRef(kT.buffer); bufferPool.deferredDestroy(kT.buffer, kT.size * bpe); }
+  if (vT !== v) { bufferPool.decRef(vT.buffer); bufferPool.deferredDestroy(vT.buffer, vT.size * bpe); }
+
+  const outShape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
+  const lseShape = [config.batchSize, config.numHeads, config.seqLen];
+  return {
+    output: createTensor(outShape, outputBuffer, undefined, 0, "f32"),
+    logsumexp: createTensor(lseShape, logsumexpBuffer, undefined, 0, "f32"),
+  };
+}
+
+function fusedAttentionBackward(
+  q: BackendTensor,
+  k: BackendTensor,
+  v: BackendTensor,
+  logsumexp: BackendTensor,
+  dO: BackendTensor,
+  output: BackendTensor,
+  config: import("../types").FusedAttentionConfig,
+): { dQ: BackendTensor; dK: BackendTensor; dV: BackendTensor } {
+  const qT = ensureContiguous(q as WebGPUTensor);
+  const kT = ensureContiguous(k as WebGPUTensor);
+  const vT = ensureContiguous(v as WebGPUTensor);
+  const lseT = ensureContiguous(logsumexp as WebGPUTensor);
+  const dOT = ensureContiguous(dO as WebGPUTensor);
+  const oT = ensureContiguous(output as WebGPUTensor);
+
+  // Step 1: Compute D[i] = rowsum(dO[i,:] * O[i,:])
+  const dBuf = dispatchFABwdDKernel(
+    dOT.buffer, oT.buffer,
+    config.batchSize, config.numHeads, config.seqLen, config.headDim,
+    config.scale, config.isCausal,
+  );
+
+  // Step 2: Compute dQ
+  const dQBuf = dispatchFABwdDQKernel(
+    qT.buffer, kT.buffer, vT.buffer, lseT.buffer, dBuf, dOT.buffer,
+    config.batchSize, config.numHeads, config.seqLen, config.headDim,
+    config.scale, config.isCausal,
+  );
+
+  // Step 3: Compute dK, dV
+  const { dKBuffer, dVBuffer } = dispatchFABwdDKVKernel(
+    qT.buffer, kT.buffer, vT.buffer, lseT.buffer, dBuf, dOT.buffer,
+    config.batchSize, config.numHeads, config.seqLen, config.headDim,
+    config.scale, config.isCausal,
+  );
+
+  // D buffer is an intermediate — release it back to the pool now
+  const dBufSize = config.batchSize * config.numHeads * config.seqLen * 4;
+  bufferPool.deferredDestroy(dBuf, dBufSize);
+
+  // Destroy contiguous copies if created (deferred for GPU fence)
+  const bpe = 4; // f32
+  if (qT !== q) { bufferPool.decRef(qT.buffer); bufferPool.deferredDestroy(qT.buffer, qT.size * bpe); }
+  if (kT !== k) { bufferPool.decRef(kT.buffer); bufferPool.deferredDestroy(kT.buffer, kT.size * bpe); }
+  if (vT !== v) { bufferPool.decRef(vT.buffer); bufferPool.deferredDestroy(vT.buffer, vT.size * bpe); }
+  if (lseT !== logsumexp) { bufferPool.decRef(lseT.buffer); bufferPool.deferredDestroy(lseT.buffer, lseT.size * bpe); }
+  if (dOT !== dO) { bufferPool.decRef(dOT.buffer); bufferPool.deferredDestroy(dOT.buffer, dOT.size * bpe); }
+  if (oT !== output) { bufferPool.decRef(oT.buffer); bufferPool.deferredDestroy(oT.buffer, oT.size * bpe); }
+
+  const gradShape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
+  return {
+    dQ: createTensor(gradShape, dQBuf, undefined, 0, "f32"),
+    dK: createTensor(gradShape, dKBuffer, undefined, 0, "f32"),
+    dV: createTensor(gradShape, dVBuffer, undefined, 0, "f32"),
+  };
+}
+
 async function read(a: BackendTensor): Promise<number[]> {
   const ctx = requireContext();
   let tensor = a as WebGPUTensor;
@@ -10484,6 +10590,8 @@ export const webgpuBackend: Backend & {
     stridedScatterAdd,
     adamStep,
     unscaleGrad,
+    fusedAttentionForward,
+    fusedAttentionBackward,
     fusedCrossEntropyForward,
     fusedCrossEntropyBackward,
     fusedLayerNormForward,

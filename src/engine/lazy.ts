@@ -112,6 +112,11 @@ export type LazyOpCode =
   | "narrowBackward"
   | "adamStep"
   | "unscaleGrad"
+  | "fusedAttentionForward"
+  | "extractAttentionLogsumexp"
+  | "fusedAttentionBackward"
+  | "extractAttentionDK"
+  | "extractAttentionDV"
   | "fusedCrossEntropyForward"
   | "fusedCrossEntropyBackward"
   | "fusedLayerNormForward"
@@ -1404,6 +1409,75 @@ export async function executePlan(
         break;
       }
 
+      case "fusedAttentionForward": {
+        const faPayload = node.payload as import("../backend/types").FusedAttentionConfig;
+        if (!nodeBackend.ops.fusedAttentionForward) throw new Error("fusedAttentionForward not supported by backend");
+        const faResult = nodeBackend.ops.fusedAttentionForward(
+          backendInputs[0], backendInputs[1], backendInputs[2], faPayload,
+        );
+        resultTensor = faResult.output;
+        // Wrap logsumexp in a StorageHandle so destroyUnreachable() can clean it up
+        // if extractAttentionLogsumexp never executes (e.g., checkpoint disposes the
+        // consumer before the plan runs). Without this, the raw GPUBuffer leaks because
+        // allocateOutputBuffer called trackAllocation but nothing calls trackDeallocation.
+        const lseSH = createStorageHandle(node.device, faResult.logsumexp);
+        (node as any)._attnSideOutput = lseSH;
+        break;
+      }
+
+      case "extractAttentionLogsumexp": {
+        const parentNodeFA = node.inputs[0].node;
+        const lseSH = (parentNodeFA as any)._attnSideOutput as StorageHandle | undefined;
+        if (!lseSH) {
+          throw new Error("extractAttentionLogsumexp: parent node has no _attnSideOutput");
+        }
+        resultTensor = lseSH.backendTensor;
+        // Unregister the StorageHandle — the engine will create a new one for this node's output
+        storageTracker.unregister(lseSH.id);
+        (parentNodeFA as any)._attnSideOutput = undefined;
+        break;
+      }
+
+      case "fusedAttentionBackward": {
+        const faBwdPayload = node.payload as import("../backend/types").FusedAttentionConfig;
+        if (!nodeBackend.ops.fusedAttentionBackward) throw new Error("fusedAttentionBackward not supported by backend");
+        const faBwdResult = nodeBackend.ops.fusedAttentionBackward(
+          backendInputs[0], backendInputs[1], backendInputs[2],
+          backendInputs[3], backendInputs[4], backendInputs[5], faBwdPayload,
+        );
+        resultTensor = faBwdResult.dQ;
+        // Wrap dK/dV in StorageHandles for proper cleanup (same reason as logsumexp above)
+        const dkSH = createStorageHandle(node.device, faBwdResult.dK);
+        const dvSH = createStorageHandle(node.device, faBwdResult.dV);
+        (node as any)._attnBwdDK = dkSH;
+        (node as any)._attnBwdDV = dvSH;
+        break;
+      }
+
+      case "extractAttentionDK": {
+        const parentNodeDK = node.inputs[0].node;
+        const dkSH = (parentNodeDK as any)._attnBwdDK as StorageHandle | undefined;
+        if (!dkSH) {
+          throw new Error("extractAttentionDK: parent node has no _attnBwdDK");
+        }
+        resultTensor = dkSH.backendTensor;
+        storageTracker.unregister(dkSH.id);
+        (parentNodeDK as any)._attnBwdDK = undefined;
+        break;
+      }
+
+      case "extractAttentionDV": {
+        const parentNodeDV = node.inputs[0].node;
+        const dvSH = (parentNodeDV as any)._attnBwdDV as StorageHandle | undefined;
+        if (!dvSH) {
+          throw new Error("extractAttentionDV: parent node has no _attnBwdDV");
+        }
+        resultTensor = dvSH.backendTensor;
+        storageTracker.unregister(dvSH.id);
+        (parentNodeDV as any)._attnBwdDV = undefined;
+        break;
+      }
+
       case "fusedCrossEntropyForward": {
         const cePayload = node.payload as import("../backend/types").FusedCrossEntropyConfig;
         if (!nodeBackend.ops.fusedCrossEntropyForward) throw new Error("fusedCrossEntropyForward not supported by backend");
@@ -2072,6 +2146,61 @@ async function executeOpInternal(
       return nodeBackend.ops.unscaleGrad(
         backendInputs[0], unscalePayload2.invScale, unscalePayload2.infFlagBuffer,
       );
+    }
+
+    case "fusedAttentionForward": {
+      const faPayload2 = node.payload as import("../backend/types").FusedAttentionConfig;
+      if (!nodeBackend.ops.fusedAttentionForward) throw new Error("fusedAttentionForward not supported by backend");
+      const faResult2 = nodeBackend.ops.fusedAttentionForward(
+        backendInputs[0], backendInputs[1], backendInputs[2], faPayload2,
+      );
+      const lseSH2 = createStorageHandle(node.device, faResult2.logsumexp);
+      (node as any)._attnSideOutput = lseSH2;
+      return faResult2.output;
+    }
+
+    case "extractAttentionLogsumexp": {
+      const parentNodeFA2 = node.inputs[0].node;
+      const lseSH2 = (parentNodeFA2 as any)._attnSideOutput as StorageHandle | undefined;
+      if (!lseSH2) throw new Error("extractAttentionLogsumexp: parent has no _attnSideOutput");
+      const lseResult2 = lseSH2.backendTensor;
+      storageTracker.unregister(lseSH2.id);
+      (parentNodeFA2 as any)._attnSideOutput = undefined;
+      return lseResult2;
+    }
+
+    case "fusedAttentionBackward": {
+      const faBwdPayload2 = node.payload as import("../backend/types").FusedAttentionConfig;
+      if (!nodeBackend.ops.fusedAttentionBackward) throw new Error("fusedAttentionBackward not supported by backend");
+      const faBwdResult2 = nodeBackend.ops.fusedAttentionBackward(
+        backendInputs[0], backendInputs[1], backendInputs[2],
+        backendInputs[3], backendInputs[4], backendInputs[5], faBwdPayload2,
+      );
+      const dkSH2 = createStorageHandle(node.device, faBwdResult2.dK);
+      const dvSH2 = createStorageHandle(node.device, faBwdResult2.dV);
+      (node as any)._attnBwdDK = dkSH2;
+      (node as any)._attnBwdDV = dvSH2;
+      return faBwdResult2.dQ;
+    }
+
+    case "extractAttentionDK": {
+      const parentDK2 = node.inputs[0].node;
+      const dkSH2 = (parentDK2 as any)._attnBwdDK as StorageHandle | undefined;
+      if (!dkSH2) throw new Error("extractAttentionDK: parent has no _attnBwdDK");
+      const dkResult2 = dkSH2.backendTensor;
+      storageTracker.unregister(dkSH2.id);
+      (parentDK2 as any)._attnBwdDK = undefined;
+      return dkResult2;
+    }
+
+    case "extractAttentionDV": {
+      const parentDV2 = node.inputs[0].node;
+      const dvSH2 = (parentDV2 as any)._attnBwdDV as StorageHandle | undefined;
+      if (!dvSH2) throw new Error("extractAttentionDV: parent has no _attnBwdDV");
+      const dvResult2 = dvSH2.backendTensor;
+      storageTracker.unregister(dvSH2.id);
+      (parentDV2 as any)._attnBwdDV = undefined;
+      return dvResult2;
     }
 
     case "fusedCrossEntropyForward": {
@@ -3024,10 +3153,9 @@ export async function executeLoweredPlan(
   // identities; replay pinning prevents buffer destruction between steps.
   // Arena counter sync ensures data-source re-executions write to the correct
   // arena buffers. Disable with TORCHLETTE_DISPATCH_REPLAY=0.
-  // Auto-disabled when TORCHLETTE_PROFILE=1: replay bypasses getTimestampWrites()
-  // and per-op profiling instrumentation, producing empty GPU timing data.
-  const useReplayCache = process.env.TORCHLETTE_DISPATCH_REPLAY !== "0"
-    && !process.env.TORCHLETTE_PROFILE;
+  // GPU timestamp profiling works during replay: recorded dispatches carry
+  // label/module metadata, and replayDispatches() attaches timestampWrites.
+  const useReplayCache = process.env.TORCHLETTE_DISPATCH_REPLAY !== "0";
 
   // =========================================================================
   // FAST PATH: Dispatch Replay
@@ -3080,8 +3208,13 @@ export async function executeLoweredPlan(
           case "data-source": {
             flushDispatchBatch();
             const _dsT0 = _replayTiming ? performance.now() : 0;
-            // Restore arena resolve index to match recording position
+            // Restore arena resolve index and sequence counters to match recording position
             setArenaResolveIndexTo(entry.arenaResolveIdx);
+            setDispatchSequenceCounters(
+              entry.seqCounters.dispatch,
+              entry.seqCounters.params,
+              entry.seqCounters.output,
+            );
             const dsNode = planNodes[entry.nodeIndex];
             if (dsNode.result) { if (_replayTiming) { _tDataSource += performance.now() - _dsT0; _nDataSources++; } break; }
             const dsBackend = getBackend(dsNode.device) ?? backend;
@@ -3131,8 +3264,13 @@ export async function executeLoweredPlan(
           case "sequential": {
             flushDispatchBatch();
             const _seqT0 = _replayTiming ? performance.now() : 0;
-            // Restore arena resolve index so re-executed op allocates the correct arena buffer
+            // Restore arena resolve index and sequence counters to match recording position
             setArenaResolveIndexTo(entry.arenaResolveIdx);
+            setDispatchSequenceCounters(
+              entry.seqCounters.dispatch,
+              entry.seqCounters.params,
+              entry.seqCounters.output,
+            );
             const node = planNodes[entry.nodeIndex];
             if (node.result) { if (_replayTiming) { _tSequential += performance.now() - _seqT0; _nSequential++; } break; }
             const nodeBackend = getBackend(node.device) ?? backend;
@@ -3797,8 +3935,9 @@ export async function executeLoweredPlan(
           const node = planNodes[nodeIdx];
           if (node.result) break;
 
-          // Capture arena resolve index BEFORE execution (op may advance it)
+          // Capture arena resolve index and sequence counters BEFORE execution
           const arenaResolveIdxBefore = shouldRecord ? getArenaResolveIndex() : 0;
+          const seqCountersBefore = shouldRecord ? getDispatchSequenceCounters() : undefined;
 
           const nodeBackend = getBackend(node.device) ?? backend;
           const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
@@ -3820,7 +3959,7 @@ export async function executeLoweredPlan(
           if (shouldRecord) {
             if (action.kind === "data-source") {
               // Data sources must re-execute each step (host data changes).
-              replayEntries.push({ kind: "data-source", nodeIndex: nodeIdx, arenaResolveIdx: arenaResolveIdxBefore });
+              replayEntries.push({ kind: "data-source", nodeIndex: nodeIdx, arenaResolveIdx: arenaResolveIdxBefore, seqCounters: seqCountersBefore! });
               while (recordingDispatchIdx < recordingBuffer.length) {
                 recordingDispatchIdx++;
               }
@@ -3850,7 +3989,7 @@ export async function executeLoweredPlan(
               // Ops that use encoder copy commands (copyBufferToBuffer) alongside
               // compute dispatches must be re-executed during replay — the copy
               // commands are invisible to the compute dispatch recording mechanism.
-              replayEntries.push({ kind: "sequential", nodeIndex: nodeIdx, arenaResolveIdx: arenaResolveIdxBefore });
+              replayEntries.push({ kind: "sequential", nodeIndex: nodeIdx, arenaResolveIdx: arenaResolveIdxBefore, seqCounters: seqCountersBefore! });
               while (recordingDispatchIdx < recordingBuffer.length) {
                 recordingDispatchIdx++;
               }
@@ -5450,6 +5589,61 @@ async function executeOp(
       return backend.ops.unscaleGrad(
         backendInputs[0], unscalePayload3.invScale, unscalePayload3.infFlagBuffer,
       );
+    }
+
+    case "fusedAttentionForward": {
+      const faPayload3 = node.payload as import("../backend/types").FusedAttentionConfig;
+      if (!backend.ops.fusedAttentionForward) throw new Error("fusedAttentionForward not supported by backend");
+      const faResult3 = backend.ops.fusedAttentionForward(
+        backendInputs[0], backendInputs[1], backendInputs[2], faPayload3,
+      );
+      const lseSH3 = createStorageHandle(node.device, faResult3.logsumexp);
+      (node as any)._attnSideOutput = lseSH3;
+      return faResult3.output;
+    }
+
+    case "extractAttentionLogsumexp": {
+      const parentFA3 = node.inputs[0].node;
+      const lseSH3 = (parentFA3 as any)._attnSideOutput as StorageHandle | undefined;
+      if (!lseSH3) throw new Error("extractAttentionLogsumexp: parent has no _attnSideOutput");
+      const lseResult3 = lseSH3.backendTensor;
+      storageTracker.unregister(lseSH3.id);
+      (parentFA3 as any)._attnSideOutput = undefined;
+      return lseResult3;
+    }
+
+    case "fusedAttentionBackward": {
+      const faBwdPayload3 = node.payload as import("../backend/types").FusedAttentionConfig;
+      if (!backend.ops.fusedAttentionBackward) throw new Error("fusedAttentionBackward not supported by backend");
+      const faBwdResult3 = backend.ops.fusedAttentionBackward(
+        backendInputs[0], backendInputs[1], backendInputs[2],
+        backendInputs[3], backendInputs[4], backendInputs[5], faBwdPayload3,
+      );
+      const dkSH3 = createStorageHandle(node.device, faBwdResult3.dK);
+      const dvSH3 = createStorageHandle(node.device, faBwdResult3.dV);
+      (node as any)._attnBwdDK = dkSH3;
+      (node as any)._attnBwdDV = dvSH3;
+      return faBwdResult3.dQ;
+    }
+
+    case "extractAttentionDK": {
+      const parentDK3 = node.inputs[0].node;
+      const dkSH3 = (parentDK3 as any)._attnBwdDK as StorageHandle | undefined;
+      if (!dkSH3) throw new Error("extractAttentionDK: parent node has no _attnBwdDK");
+      const dkResult3 = dkSH3.backendTensor;
+      storageTracker.unregister(dkSH3.id);
+      (parentDK3 as any)._attnBwdDK = undefined;
+      return dkResult3;
+    }
+
+    case "extractAttentionDV": {
+      const parentDV3 = node.inputs[0].node;
+      const dvSH3 = (parentDV3 as any)._attnBwdDV as StorageHandle | undefined;
+      if (!dvSH3) throw new Error("extractAttentionDV: parent node has no _attnBwdDV");
+      const dvResult3 = dvSH3.backendTensor;
+      storageTracker.unregister(dvSH3.id);
+      (parentDV3 as any)._attnBwdDV = undefined;
+      return dvResult3;
     }
 
     case "fusedCrossEntropyForward": {
