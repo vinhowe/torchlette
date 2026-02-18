@@ -392,7 +392,7 @@ export class GPT2 extends Module {
    * @param options - Optional forward options
    * @returns Logits tensor of shape [batch, seqLen, vocabSize]
    */
-  forward(idx: Tensor, options?: { useCheckpoint?: boolean }): Tensor {
+  forward(idx: Tensor, options?: { useCheckpoint?: boolean; selectiveCheckpoint?: boolean }): Tensor {
     return this.forwardWithLoss(idx, undefined, options).logits;
   }
 
@@ -407,10 +407,11 @@ export class GPT2 extends Module {
   forwardWithLoss(
     idx: Tensor,
     targets?: Tensor,
-    options?: { useCheckpoint?: boolean },
+    options?: { useCheckpoint?: boolean; selectiveCheckpoint?: boolean },
   ): { logits: Tensor; loss: Tensor | null } {
     const [_batch, seqLen] = idx.shape;
     const useCheckpoint = options?.useCheckpoint ?? false;
+    const selectiveCheckpoint = options?.selectiveCheckpoint ?? true;
 
     if (seqLen > this.config.blockSize) {
       throw new Error(
@@ -432,16 +433,32 @@ export class GPT2 extends Module {
     x = this.drop.forward(x);
 
     // Pass through transformer blocks (with optional checkpointing)
-    if (useCheckpoint) {
-      // Checkpoint each transformer block to save memory during backward pass
-      // Activations are recomputed during backward instead of stored
+    if (useCheckpoint && selectiveCheckpoint) {
+      // Selective checkpointing: attention runs outside checkpoint (saves O
+      // and logsumexp L for backward — ~1.5MB/layer), MLP runs inside
+      // checkpoint (recomputes 4x-expanded activations — 6MB/layer).
+      // This eliminates 6 expensive fusedAttentionForward recomputes during
+      // backward while still saving the bulk of memory from MLP checkpointing.
       for (let i = 0; i < this.h.length; i++) {
         const block = this.h[i];
+        // Attention block: NOT checkpointed
+        const attnOut = block.attn.forward(block.ln1.forward(x));
+        const h = this.api.add(x, attnOut);
+        // MLP block: checkpointed
         x = checkpoint(
           this.api,
-          (input: Tensor) => block.forward(input),
-          [x],
+          (input: Tensor) => {
+            const mlpOut = block.mlp.forward(block.ln2.forward(input));
+            return this.api.add(input, mlpOut);
+          },
+          [h],
         );
+      }
+    } else if (useCheckpoint) {
+      // Full-block checkpointing: entire transformer block is checkpointed.
+      // All activations (including attention O and L) are recomputed during backward.
+      for (const block of this.h) {
+        x = checkpoint(this.api, (input: Tensor) => block.forward(input), [x]);
       }
     } else {
       // Standard forward pass - store all activations
