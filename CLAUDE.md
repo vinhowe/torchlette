@@ -81,9 +81,9 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
 
 2. **GPU time budget** — From the Phase table (`Phase | Ops | CPU(ms) | GPU(ms)`). Sum GPU(ms) across forward+backward+cleanup for total GPU time. At 512 tokens the workload is GPU-bound (145ms GPU vs 54ms CPU dispatch). At 31 tokens it was CPU-dispatch-bound (~85% utilization).
 
-3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). At 512 tokens: `fusedAttentionBackward` (58.8ms, 40.5%), `matmul` (37.7ms, 26.0%), `fusedAttentionForward` (12.0ms, 8.3%), `matmul++cast+bias+binary` (8.4ms, 5.8%), `matmul++cast` (7.8ms, 5.4%), `matmul++cast+bias` (5.4ms, 3.7%), `adamStep` (4.9ms, 3.4%).
+3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). At 512 tokens: `matmul` (37.7ms, 36.5%), `fusedAttentionBackward` (15.7ms, 15.2%), `fusedAttentionForward` (12.4ms, 12.0%), `matmul++cast+bias+binary` (8.7ms, 8.4%), `matmul++cast` (8.1ms, 7.9%), `matmul++cast+bias` (5.6ms, 5.4%), `adamStep` (4.9ms, 4.7%).
 
-4. **Cross-entropy** — Fused kernel implemented. 1.1ms/0.7% of GPU time at 512 tokens. No longer a bottleneck.
+4. **Cross-entropy** — Fused kernel implemented. 1.1ms/1.1% of GPU time at 512 tokens. No longer a bottleneck.
 
 5. **CPU dispatch overhead** — From `CPU API Call` table. Bind group cache at 100.0% (0 misses). 10 submits/step.
 
@@ -482,7 +482,7 @@ Profiled on DistilGPT-2 training. Two baseline configurations:
 Steady-state ~32ms/step with dispatch replay, 24ms GPU, ~85% GPU utilization. CPU-dispatch-bound.
 
 ### Baseline B: 512 tokens (current default)
-Steady-state ~54ms/step wall clock (profiler, no replay). GPU-bound: 145ms GPU / 54ms CPU dispatch. Top GPU kernels: `fusedAttentionBackward` 58.8ms (40.5%), `matmul` 37.7ms (26.0%), `fusedAttentionForward` 12.0ms (8.3%), `matmul++cast+bias+binary` 8.4ms (5.8%), `matmul++cast` 7.8ms (5.4%), `matmul++cast+bias` 5.4ms (3.7%), `adamStep` 4.9ms (3.4%). Cross-entropy 1.1ms (0.7%). Bind group cache 100.0% (0 misses). 10 submits/step. Fusion: 1124 nodes, 183 fused (16.3%), 20 groups. Memory: 4871MB current / 6194MB peak / 32GB limit. Pool reuse 56.8%. 1 new alloc/step. Leak status: OK (storages +0.0/step).
+Steady-state ~54ms/step wall clock (profiler, steps 3-4 avg, no replay). GPU: 103ms total. Top GPU kernels: `matmul` 37.7ms (36.5%), `fusedAttentionBackward` 15.7ms (15.2%), `fusedAttentionForward` 12.4ms (12.0%), `matmul++cast+bias+binary` 8.7ms (8.4%), `matmul++cast` 8.1ms (7.9%), `matmul++cast+bias` 5.6ms (5.4%), `adamStep` 4.9ms (4.7%). Cross-entropy 1.1ms (1.1%). Bind group cache 100.0% (0 misses). 10 submits/step. Fusion: 1124 nodes, 183 fused (16.3%), 20 groups. Memory: 4871MB current / 6194MB peak / 32GB limit. Pool reuse 56.8%. 1 new alloc/step. Leak status: OK (storages +0.0/step).
 
 Targets ranked by impact:
 
@@ -520,9 +520,11 @@ Targets ranked by impact:
 30. ~~**Packed Adam dispatches**~~ — DONE. Groups same-element-count optimizer parameters into contiguous packed GPU buffers, dispatches one Adam kernel per size class instead of one per parameter. 76→8 dispatches. Adam GPU: 5.4ms→1.9ms (−65%). ~3.5ms GPU/step saved. Works during profiling (guards removed).
 31. ~~**Bind group cache: max + narrowBackward arena routing**~~ — DONE. `max()` and `narrowBackward()` used `createTrackedBuffer` directly, bypassing the buffer arena. Replaced with `resolveOutputBuffer` (max) and let `dispatchElementwise` handle allocation (narrowBackward). Bind group cache 91.0%→99.6% (40→2 misses). `createBindGroup` 1.9ms→0.1ms. ~1.8ms/step saved.
 32. ~~**Submit reduction: eliminate periodic reclamation**~~ — DONE. With arena-managed buffers (335 hits/step) and pool reservation (1 new alloc/step), intra-step buffer reclamation via periodic `flushSharedEncoder` is unnecessary. Increased `DEFAULT_RECLAIM_INTERVAL` 100→10000 (effectively disabled for plans <10k nodes). Also increased `PARAMS_FLUSH_THRESHOLD` 256→2000 to prevent auto-flush from params buffer accumulation. `queue.submit` calls: 14→7/step (profiler), ~4/step (replay). Total submit CPU: 3.9ms→3.1ms. ~0.8ms/step saved. Configurable via `TORCHLETTE_RECLAIM_INTERVAL` env var.
+33. ~~**dKV backward Q-tiling**~~ — DONE. Replaced per-Q-row loop (512 iterations, 1024 barriers) with tiled loop (BQ=16, 32 iterations, 64 barriers). Cooperative shared memory loading: all 64 threads load Q/dO tiles in parallel (was thread-0 broadcast). Causal tile-level early exit. `fusedAttentionBackward` GPU: 58.8ms→15.7ms (−73%). Backward GPU: ~120ms→73ms. ~43ms GPU/step saved.
 
 **Open targets (ranked by estimated savings at 512 tokens):**
-1. **fusedAttentionBackward optimization** — 58.8ms GPU (40.5%). Max single dispatch 9068µs. Memory-bandwidth-bound. Tile size tuning or algorithmic improvements could reduce this.
-2. **lm_head matmul** — 19.6ms GPU combined (forward 7.8ms + backward 8.7ms + backward dW 11.3ms max). Large vocab (50257) dominates. Single-dispatch bottleneck.
-3. **GC pressure** — 2.1% of CPU profiler self-time (156ms). Object pooling for Tensor metadata.
-4. **Pipeline cache warmup** — Step 0 is 5.5s (101x steady-state) due to pipeline compilation. Pre-compile pipeline variants during model load.
+1. **lm_head matmul** — 16.9ms GPU (16.3%). Forward 8.1ms (512x768 @ 768x50257) + backward 8.7ms. Large vocab (50257) dominates. Single-dispatch bottleneck.
+2. **fusedAttentionForward recompute in backward** — 12.0ms GPU (11.6%). 6 recomputes during backward. Could cache forward O/L to avoid recompute (memory vs compute tradeoff).
+3. **fusedAttentionBackward further tuning** — 15.7ms GPU (15.2%). Max 1661µs/dispatch. BQ=32 could halve barriers but approaches 16KB shared memory limit.
+4. **GC pressure** — 2.1% of CPU profiler self-time (147ms). Object pooling for Tensor metadata.
+5. **Pipeline cache warmup** — Step 0 is 5.4s (48x steady-state) due to pipeline compilation. Pre-compile pipeline variants during model load.

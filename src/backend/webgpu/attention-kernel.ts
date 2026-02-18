@@ -65,6 +65,7 @@ const GPUBufferUsage = {
 // Tiling parameters
 const BR = 64;  // Q rows per workgroup (also workgroup size)
 const BC = 32;  // KV rows per tile
+const BQ_BW = 16; // Q rows per tile in backward dKV kernel
 
 // ============================================================================
 // Pipeline Cache
@@ -536,8 +537,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
  * FlashAttention Backward dKV Shader
  *
  * One workgroup per KV block (BC_BW=64 KV rows).
- * Each thread handles one KV row. Loop over all Q positions,
- * loading Q and dO one-at-a-time via shared memory.
+ * Each thread handles one KV row. Q and dO are loaded in tiles of BQ_BW=16
+ * rows via cooperative shared memory loading (all 64 threads participate),
+ * reducing barrier count from 2*N to 2*ceil(N/BQ_BW).
  *
  * Input: Q,K,V [B,H,N,D], L [B,H,N], D_buf [B,H,N], dO [B,H,N,D]
  * Output: dK [B,H,N,D], dV [B,H,N,D]
@@ -566,11 +568,11 @@ struct FAConfig {
 @group(0) @binding(7) var<storage, read_write> dV: array<f32>;
 @group(0) @binding(8) var<uniform> config: FAConfig;
 
-// Shared memory for broadcasting one Q row and one dO row to all threads
-var<workgroup> q_shared: array<f32, ${headDim}>;
-var<workgroup> dO_shared: array<f32, ${headDim}>;
-var<workgroup> L_shared: f32;
-var<workgroup> D_shared: f32;
+// Tiled shared memory: BQ_BW=${BQ_BW} Q rows loaded cooperatively per tile
+var<workgroup> q_tile: array<f32, ${BQ_BW * headDim}>;
+var<workgroup> dO_tile: array<f32, ${BQ_BW * headDim}>;
+var<workgroup> L_tile: array<f32, ${BQ_BW}>;
+var<workgroup> D_tile: array<f32, ${BQ_BW}>;
 
 @compute @workgroup_size(${BC_BW})
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -606,47 +608,68 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     }
   }
 
-  // Loop over all Q positions one at a time
-  for (var qi = 0u; qi < N; qi++) {
-    // Cooperatively load Q[qi] and dO[qi] into shared memory
-    if (tid < ${headDim}u) {
-      let q_base = bh_offset + qi * D;
-      q_shared[tid] = Q[q_base + tid];
-      dO_shared[tid] = dO[q_base + tid];
+  // Loop over Q positions in tiles of BQ_BW=${BQ_BW}
+  let num_q_tiles = (N + ${BQ_BW - 1}u) / ${BQ_BW}u;
+  for (var qt = 0u; qt < num_q_tiles; qt++) {
+    let q_start = qt * ${BQ_BW}u;
+
+    // Causal early exit: skip entire tile if max qi in tile < min kv_row in block
+    // Uses kv_block * BC_BW (uniform across all threads) instead of kv_row
+    if (config.is_causal != 0u && q_start + ${BQ_BW - 1}u < kv_block * ${BC_BW}u) {
+      continue;
     }
-    if (tid == 0u) {
-      L_shared = L_buf[bh_offset_L + qi];
-      D_shared = D_buf[bh_offset_L + qi];
+
+    // Cooperative load: all ${BC_BW} threads load BQ*D/${BC_BW} elements each
+    for (var idx = tid; idx < ${BQ_BW * headDim}u; idx += ${BC_BW}u) {
+      let row = idx / ${headDim}u;
+      let col = idx % ${headDim}u;
+      let qi = q_start + row;
+      if (qi < N) {
+        let base = bh_offset + qi * D + col;
+        q_tile[idx] = Q[base];
+        dO_tile[idx] = dO[base];
+      } else {
+        q_tile[idx] = 0.0;
+        dO_tile[idx] = 0.0;
+      }
     }
+    // Load L and D values (first BQ_BW threads)
+    if (tid < ${BQ_BW}u) {
+      let qi = q_start + tid;
+      if (qi < N) {
+        L_tile[tid] = L_buf[bh_offset_L + qi];
+        D_tile[tid] = D_buf[bh_offset_L + qi];
+      }
+    }
+
     workgroupBarrier();
 
+    // Inner loop over BQ_BW Q rows — shared memory is read-only, no barriers
     if (valid) {
-      // Causal mask: skip if kv_row > qi
-      if (config.is_causal == 0u || kv_row <= qi) {
-        // Compute score: Q[qi] . K[kv_row] * scale
+      let tile_end = min(${BQ_BW}u, N - q_start);
+      for (var j = 0u; j < tile_end; j++) {
+        let qi = q_start + j;
+        if (config.is_causal != 0u && kv_row > qi) { continue; }
+
+        // Recompute score: Q[qi] . K[kv_row] * scale
         var s = 0.0f;
         for (var d = 0u; d < ${headDim}u; d++) {
-          s += q_shared[d] * k_reg[d];
+          s += q_tile[j * ${headDim}u + d] * k_reg[d];
         }
         s = s * scale;
 
-        // P = exp(s - L[qi])
-        let p = exp(s - L_shared);
+        let p = exp(s - L_tile[j]);
 
-        // dO[qi] . V[kv_row]
         var dov = 0.0f;
         for (var d = 0u; d < ${headDim}u; d++) {
-          dov += dO_shared[d] * v_reg[d];
+          dov += dO_tile[j * ${headDim}u + d] * v_reg[d];
         }
 
-        // dS = P * (dO.V - D[qi])
-        let ds = p * (dov - D_shared);
+        let ds = p * (dov - D_tile[j]);
 
-        // dK[kv_row] += dS * Q[qi] * scale
-        // dV[kv_row] += P * dO[qi]
         for (var d = 0u; d < ${headDim}u; d++) {
-          dk_acc[d] += ds * q_shared[d] * scale;
-          dv_acc[d] += p * dO_shared[d];
+          dk_acc[d] += ds * q_tile[j * ${headDim}u + d] * scale;
+          dv_acc[d] += p * dO_tile[j * ${headDim}u + d];
         }
       }
     }
