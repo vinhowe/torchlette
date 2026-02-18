@@ -43,7 +43,7 @@ import { storageTracker } from "../src/engine/lazy";
 import { GPT2, type GPT2Config, DISTILGPT2_CONFIG } from "../examples/gpt2/model";
 import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
 import { Adam, GradScaler } from "../src/optim";
-import { crossEntropy } from "../src/nn";
+import { crossEntropy, checkpoint } from "../src/nn";
 
 // ============================================================================
 // Configuration
@@ -144,26 +144,25 @@ function instrumentedForwardWithLoss(
     const attnProjOut = block.attn.cProj.forward(attnConcat);
 
     profileModule(api, `block${i}.residual1`);
-    let h = api.add(x, attnProjOut);
+    const h = api.add(x, attnProjOut);
 
-    // LayerNorm 2
-    profileModule(api, `block${i}.ln2`);
-    const ln2Out = block.ln2.forward(h);
+    // MLP: checkpointed (selective checkpointing — attention saved, MLP recomputed)
+    x = checkpoint(api, (input: Tensor) => {
+      profileModule(api, `block${i}.ln2`);
+      const ln2Out = block.ln2.forward(input);
 
-    // MLP
-    profileModule(api, `block${i}.mlp.fc`);
-    let mlpH = block.mlp.cFc.forward(ln2Out);
+      profileModule(api, `block${i}.mlp.fc`);
+      let mlpH = block.mlp.cFc.forward(ln2Out);
 
-    profileModule(api, `block${i}.mlp.gelu`);
-    mlpH = mlpH.gelu();
+      profileModule(api, `block${i}.mlp.gelu`);
+      mlpH = mlpH.gelu();
 
-    profileModule(api, `block${i}.mlp.proj`);
-    mlpH = block.mlp.cProj.forward(mlpH);
+      profileModule(api, `block${i}.mlp.proj`);
+      mlpH = block.mlp.cProj.forward(mlpH);
 
-    profileModule(api, `block${i}.residual2`);
-    h = api.add(h, mlpH);
-
-    x = h;
+      profileModule(api, `block${i}.residual2`);
+      return api.add(input, mlpH);
+    }, [h]);
   }
 
   // --- Final LayerNorm ---
