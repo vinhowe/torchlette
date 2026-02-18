@@ -254,6 +254,8 @@ export type ReplayEntry =
   | { kind: "adam-batch"; nodeIndices: number[];
       /** Sequence counter positions at adam batch start (for correct cache indexing). */
       seqCounters: { dispatch: number; params: number; output: number } }
+  | { kind: "side-output"; nodeIndex: number; buffer: any; shape: number[];
+      dtype: DType; size: number; strides: number[] }
   | { kind: "reclaim" }
   | { kind: "pre-adam-reclaim" };
 
