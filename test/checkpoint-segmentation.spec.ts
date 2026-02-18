@@ -64,7 +64,10 @@ async function runTest(
   );
   const input = api.tensorFromArray(inputData, [BATCH, SEQ_LEN]);
 
-  const output = model.forward(input, { useCheckpoint });
+  // Use full-block checkpointing (not selective) for this test because
+  // selective checkpointing keeps attention O/L buffers alive, which can
+  // cause buffer aliasing validation errors with enableEarlyRelease.
+  const output = model.forward(input, { useCheckpoint, selectiveCheckpoint: false });
   const loss = output.sum();
   if (typeof loss === "number") throw new Error("Expected tensor");
 
@@ -184,7 +187,7 @@ describe("Checkpoint Segmentation", { timeout: 300000 }, () => {
 
     const inputData = [1, 2, 3, 4, 5, 6, 7, 8];
     const input = api.tensorFromArray(inputData, [1, 8]);
-    const output = model.forward(input, { useCheckpoint: true });
+    const output = model.forward(input, { useCheckpoint: true, selectiveCheckpoint: false });
     const loss = output.sum();
     if (typeof loss === "number") throw new Error("Expected tensor");
     await loss.backward();

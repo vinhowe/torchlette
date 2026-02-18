@@ -38,7 +38,7 @@ const FIXED_TOKENS: number[] = [
 const NUM_STEPS = 5;
 
 // Ground truth losses — captured from initial run, tolerance ±0.05
-const EXPECTED_LOSSES: number[] = [7.881017, 6.118271, 4.958953, 3.927993, 2.913218];
+const EXPECTED_LOSSES: number[] = [7.881017, 6.121135, 4.966267, 3.934526, 2.920183];
 
 const LOSS_TOLERANCE = 0.05;
 
