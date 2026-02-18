@@ -177,10 +177,13 @@ function instrumentedForwardWithLoss(
   // --- Loss ---
   profileModule(api, "loss.cross_entropy");
   const [batch2, seqLenT] = targets.shape;
-  const flatLogits = logits.reshape([batch2 * seqLenT, config.vocabSize]);
+  const flatLogits = logits.reshape([batch2 * seqLenT, model.paddedVocabSize]);
+  const realLogits = model.paddedVocabSize > model.config.vocabSize
+    ? flatLogits.narrow(1, 0, model.config.vocabSize)
+    : flatLogits;
   const flatTargets = targets.reshape([batch2 * seqLenT]);
 
-  const loss = crossEntropy(api, flatLogits, flatTargets);
+  const loss = crossEntropy(api, realLogits, flatTargets);
 
   profileModule(api, "unknown");
   return loss;

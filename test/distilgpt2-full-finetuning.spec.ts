@@ -417,9 +417,13 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
       // A real leak shows constant positive growth. Allow ≤1/step tolerance
       // for GC jitter (FinalizationRegistry timing is non-deterministic).
       const LEAK_THRESHOLD = 1;
+      // Allocs threshold is higher: vocab padding adds a narrow backward that
+      // creates 2 buffer allocations/step (zero tensor + copy). These are
+      // pooled, not leaked — storages/reachable at 0 confirms no storage leak.
+      const ALLOC_THRESHOLD = 3;
       expect(rate.storages).toBeLessThanOrEqual(LEAK_THRESHOLD);
       expect(rate.reachable).toBeLessThanOrEqual(LEAK_THRESHOLD);
-      expect(rate.allocs).toBeLessThanOrEqual(LEAK_THRESHOLD);
+      expect(rate.allocs).toBeLessThanOrEqual(ALLOC_THRESHOLD);
     });
   });
 

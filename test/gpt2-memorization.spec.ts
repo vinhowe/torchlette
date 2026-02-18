@@ -258,7 +258,7 @@ describe("GPT-2 Memorization Test", { skip: !hasWebGPU, timeout: 300000 }, () =>
     });
 
     // Train
-    const NUM_STEPS = 200;
+    const NUM_STEPS = 500;
     let finalLoss = Infinity;
 
     console.log(`Training on: "${sequence}"`);
@@ -276,11 +276,11 @@ describe("GPT-2 Memorization Test", { skip: !hasWebGPU, timeout: 300000 }, () =>
 
       finalLoss = lossValue;
 
-      if ((step + 1) % 50 === 0) {
+      if ((step + 1) % 100 === 0) {
         console.log(`Step ${step + 1}: loss = ${lossValue.toFixed(4)}`);
       }
 
-      if (lossValue < 0.01) {
+      if (lossValue < 0.001) {
         console.log(`Converged at step ${step + 1}`);
         break;
       }
@@ -315,10 +315,11 @@ async function generateText(
   const tokens = tokenizer.encode(prompt);
   const generated = [...tokens];
   const vocabSize = tokenizer.vocabSize;
+  const stride = model.paddedVocabSize; // logits have paddedVocabSize columns
 
   if (debug) {
     console.log(`  [gen] prompt tokens: [${tokens.join(", ")}]`);
-    console.log(`  [gen] vocabSize: ${vocabSize}`);
+    console.log(`  [gen] vocabSize: ${vocabSize}, paddedVocabSize: ${stride}`);
   }
 
   for (let i = 0; i < maxLen - prompt.length; i++) {
@@ -327,20 +328,20 @@ async function generateText(
       device: "webgpu",
     });
 
-    // Get logits - shape is [1, seqLen, vocabSize]
+    // Get logits - shape is [1, seqLen, paddedVocabSize]
     const logits = model.forward(inputTensor);
     const logitsData = await logits.cpu();
 
     if (debug && i === 0) {
-      console.log(`  [gen] logits shape: [1, ${generated.length}, ${vocabSize}]`);
+      console.log(`  [gen] logits shape: [1, ${generated.length}, ${stride}]`);
       console.log(`  [gen] logitsData length: ${logitsData.length}`);
     }
 
     // Get last position logits
-    // logits shape: [1, seqLen, vocabSize]
-    // We want logits[0, -1, :] which is at offset (seqLen-1) * vocabSize
+    // logits shape: [1, seqLen, paddedVocabSize]
+    // We want logits[0, -1, :vocabSize] at offset (seqLen-1) * paddedVocabSize
     const seqLen = generated.length;
-    const startIdx = (seqLen - 1) * vocabSize;
+    const startIdx = (seqLen - 1) * stride;
     const lastLogits = Array.from(logitsData).slice(startIdx, startIdx + vocabSize);
 
     if (debug && i === 0) {

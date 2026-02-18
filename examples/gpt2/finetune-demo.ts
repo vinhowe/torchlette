@@ -262,10 +262,11 @@ async function generateText(
 
     const logitsData = await logits.cpu();
 
-    // Get last position logits
+    // Get last position logits (stride is paddedVocabSize, take first vocabSize)
     const seqLen = contextTokens.length;
     const vocabSize = tokenizer.vocabSize;
-    const startIdx = (seqLen - 1) * vocabSize;
+    const stride = model.paddedVocabSize;
+    const startIdx = (seqLen - 1) * stride;
     const lastLogits = Array.from(logitsData).slice(startIdx, startIdx + vocabSize);
 
     // Apply temperature

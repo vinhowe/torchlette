@@ -89,8 +89,9 @@ const TINY_CONFIG: GPT2Config = {
 };
 
 function getParamShapes(config: GPT2Config): number[][] {
+  const paddedVocab = Math.ceil(config.vocabSize / 64) * 64;
   const shapes: number[][] = [];
-  shapes.push([config.vocabSize, config.embedDim]);
+  shapes.push([paddedVocab, config.embedDim]);
   shapes.push([config.blockSize, config.embedDim]);
   for (let i = 0; i < config.numLayers; i++) {
     shapes.push([config.embedDim]);

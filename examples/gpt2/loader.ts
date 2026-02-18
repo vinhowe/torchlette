@@ -276,7 +276,7 @@ function transpose2D(
 export async function loadGPT2Weights(
   api: Torchlette,
   modelPath: string,
-  options?: LoaderOptions,
+  options?: LoaderOptions & { paddedVocabSize?: number },
 ): Promise<Map<string, Tensor>> {
   const device = options?.device;
 
@@ -317,6 +317,17 @@ export async function loadGPT2Weights(
       finalShape = transposed.shape;
     }
 
+    // Pad wte weight to paddedVocabSize if specified (zero-padded rows for matmul alignment)
+    const key = mapping.path.join(".");
+    if (key === "wte.weight" && options?.paddedVocabSize && options.paddedVocabSize > finalShape[0]) {
+      const paddedRows = options.paddedVocabSize;
+      const cols = finalShape[1];
+      const paddedData = new Float32Array(paddedRows * cols); // zeros by default
+      paddedData.set(finalData); // copy vocabSize rows, rest stays zero
+      finalData = paddedData;
+      finalShape = [paddedRows, cols];
+    }
+
     // Create tensor
     const tensor = api.tensorFromArray(
       Array.from(finalData),
@@ -324,8 +335,6 @@ export async function loadGPT2Weights(
       { requiresGrad: true, device },
     );
 
-    // Store with path key
-    const key = mapping.path.join(".");
     weights.set(key, tensor);
   }
 
@@ -337,7 +346,7 @@ export async function loadGPT2Weights(
  * Apply loaded weights to a GPT2 model.
  */
 function applyWeights(model: GPT2, weights: Map<string, Tensor>): void {
-  // Token embeddings
+  // Token embeddings (already padded to paddedVocabSize in loadGPT2Weights)
   const wteWeight = weights.get("wte.weight");
   if (wteWeight) {
     copyWeight(model.wte.weight, wteWeight);
@@ -448,8 +457,11 @@ export async function loadPretrainedGPT2(
   // Create model
   const model = new GPT2(api, fullConfig, options);
 
-  // Load weights
-  const weights = await loadGPT2Weights(api, modelPath, options);
+  // Load weights (pass paddedVocabSize so wte data is zero-padded before tensor creation)
+  const weights = await loadGPT2Weights(api, modelPath, {
+    ...options,
+    paddedVocabSize: model.paddedVocabSize,
+  });
 
   // Apply weights to model
   applyWeights(model, weights);
