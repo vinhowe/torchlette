@@ -167,6 +167,15 @@ export type GeluOptions = {
   approximate?: GeluApproximate;
 };
 
+export type FusedAttentionConfig = {
+  batchSize: number;
+  numHeads: number;
+  seqLen: number;
+  headDim: number;
+  scale: number;
+  isCausal: boolean;
+};
+
 export type FusedCrossEntropyConfig = {
   batchSize: number;
   vocabSize: number;
@@ -313,6 +322,23 @@ export interface BackendOps {
     invScale: number,
     infFlagBuffer: unknown,
   ): BackendTensor;
+  /** Fused attention forward: Q,K,V [B,H,N,D] → O [B,H,N,D] + logsumexp [B,H,N]. */
+  fusedAttentionForward?(
+    q: BackendTensor,
+    k: BackendTensor,
+    v: BackendTensor,
+    config: FusedAttentionConfig,
+  ): { output: BackendTensor; logsumexp: BackendTensor };
+  /** Fused attention backward: Q,K,V,L,dO,O → dQ,dK,dV [B,H,N,D]. */
+  fusedAttentionBackward?(
+    q: BackendTensor,
+    k: BackendTensor,
+    v: BackendTensor,
+    logsumexp: BackendTensor,
+    dO: BackendTensor,
+    output: BackendTensor,
+    config: FusedAttentionConfig,
+  ): { dQ: BackendTensor; dK: BackendTensor; dV: BackendTensor };
   /** Fused cross-entropy forward: logits [B,V] + targets [B] → per-sample loss [B]. */
   fusedCrossEntropyForward?(
     logits: BackendTensor,

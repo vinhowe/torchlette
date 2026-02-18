@@ -30,7 +30,7 @@ import {
 } from "./engine/amp";
 import { OP_DTYPE_RULES, promoteDtype } from "./engine/dtype-rules";
 import type { LazyOpCode } from "./engine/lazy";
-import { RuntimeEngine, type TensorOrScalar } from "./runtime/engine";
+import { RuntimeEngine, TidyDispatchMode, type TensorOrScalar } from "./runtime/engine";
 import { setMemoryLimit } from "./engine/memory-planned-executor";
 import {
   setGPUMemoryLimit,
@@ -87,6 +87,8 @@ type AutogradNode = {
   backward: GradFn;
   /** Saved tensor slots with pack/unpack hooks support */
   savedSlots: SavedTensorSlot[];
+  /** Opaque annotation captured during forward, available to backward hooks */
+  label?: string;
 };
 
 // ============================================================================
@@ -632,6 +634,10 @@ export class Torchlette {
   private readonly memoryPlanningAvailable: boolean;
   /** Stack of saved tensor hooks for checkpointing (§10) */
   private savedTensorHooksStack: SavedTensorHooksContext[] = [];
+  /** Label to capture on subsequent autograd nodes (for backward attribution) */
+  private _currentNodeLabel: string | null = null;
+  /** Hooks fired before each backward op */
+  private _backwardDispatchHooks: Array<(info: { output: Tensor; inputs: Tensor[]; label?: string }) => void> = [];
 
   constructor(backendName?: DeviceKind, options?: TorchletteOptions) {
     this.engine = new Engine();
@@ -937,6 +943,20 @@ export class Torchlette {
     return this.savedTensorHooksStack.length > 0
       ? this.savedTensorHooksStack[this.savedTensorHooksStack.length - 1]
       : null;
+  }
+
+  /** Set an opaque label captured on subsequent autograd nodes. */
+  setNodeLabel(label: string | null): void {
+    this._currentNodeLabel = label;
+  }
+
+  /** Register a hook that fires before each backward op. Returns unregister function. */
+  onBackwardDispatch(hook: (info: { output: Tensor; inputs: Tensor[]; label?: string }) => void): () => void {
+    this._backwardDispatchHooks.push(hook);
+    return () => {
+      const idx = this._backwardDispatchHooks.indexOf(hook);
+      if (idx >= 0) this._backwardDispatchHooks.splice(idx, 1);
+    };
   }
 
   /**
@@ -1307,12 +1327,6 @@ export class Torchlette {
         // Sum to the ORIGINAL input shapes (before autocast)
         const resultA = this.sumToShape(gradA, aShape);
         const resultB = this.sumToShape(gradB, bShape);
-        // Dispose intermediate tensors to prevent memory leak
-        // Only dispose if sumToShape created a new tensor
-        aT.dispose();
-        bT.dispose();
-        if (resultA !== gradA) gradA.dispose();
-        if (resultB !== gradB) gradB.dispose();
         return [resultA, resultB];
       },
       tensorsToSave,
@@ -1334,11 +1348,8 @@ export class Torchlette {
       dim0: castWeight.shape.length - 2, dim1: castWeight.shape.length - 1,
     });
     let inner = this.runtime.matmul(castInput._unwrap(), wT);
-    wT.dispose();
     if (bias) {
-      const added = this.runtime.add(inner, bias._unwrap());
-      inner.dispose();
-      inner = added;
+      inner = this.runtime.add(inner, bias._unwrap());
     }
 
     const inputShape = input.shape;
@@ -1370,10 +1381,6 @@ export class Torchlette {
         const biasShape = getSaved(2).shape;
         resultBias = this.sumToShape(grad, biasShape);
       }
-
-      gradT.dispose();
-      if (resultInput !== gradInput) gradInput.dispose();
-      if (resultWeight !== gradWeight) gradWeight.dispose();
 
       return bias ? [resultInput, resultWeight, resultBias!] : [resultInput, resultWeight];
     }, tensorsToSave);
@@ -1862,12 +1869,6 @@ export class Torchlette {
     }
     const result = this.runtime.div(exps, sumResult);
 
-    // Dispose internal intermediates — backward recomputes from saved input.
-    maxResult.dispose();
-    shifted.dispose();
-    exps.dispose();
-    sumResult.dispose();
-
     const tensorsToSave = a.requiresGrad ? [castA] : [];
     // Softmax backward: grad_input = softmax * (grad_output - sum(softmax * grad_output, dim, keepdim=true))
     return this.wrapWithGrad(result, [a], (grad, getSaved) => {
@@ -1929,6 +1930,133 @@ export class Torchlette {
         savedLogits._unwrap(), targetsInner, grad, config,
       );
       return [gradLogits];
+    }, tensorsToSave);
+  }
+
+  /**
+   * Scaled dot-product attention with optional causal mask.
+   * q, k, v: [batch, heads, seq_len, head_dim]
+   * Returns: [batch, heads, seq_len, head_dim]
+   *
+   * On WebGPU, uses fused FlashAttention kernel (single dispatch).
+   * On CPU, falls back to decomposed matmul + softmax + matmul.
+   */
+  scaledDotProductAttention(
+    q: Tensor, k: Tensor, v: Tensor, scale?: number, isCausal = false,
+  ): Tensor {
+    this.assertUsable(q, k, v);
+    const [batch, heads, seq, hd] = q.shape;
+    const actualScale = scale ?? (1.0 / Math.sqrt(hd));
+    const config = {
+      batchSize: batch, numHeads: heads, seqLen: seq, headDim: hd,
+      scale: actualScale, isCausal,
+    };
+
+    if (q.device === "webgpu") {
+      // Fused FlashAttention path
+      const fwdResult = this.runtime.fusedAttentionForward(
+        q._unwrap(), k._unwrap(), v._unwrap(), config,
+      );
+      const logsumexp = this.runtime.extractAttentionLogsumexp(fwdResult, config);
+
+      // Save Q, K, V, logsumexp, and output O for backward.
+      // IMPORTANT: Create reshape views with independent RuntimeTensors for saved
+      // tensors. Without this, wrap(fwdResult) shares the same RuntimeTensor as the
+      // wrapWithGrad output. When checkpoint tidy disposes these wrappers, it calls
+      // dispose() on the shared RuntimeTensor BEFORE materialization, setting _disposed=true.
+      // Later disposal of the real output hits the idempotency guard and skips cleanup,
+      // leaking the GPU buffer. Similarly, disposing the logsumexp wrapper unregisters
+      // its pending node, preventing extractAttentionLogsumexp from executing and
+      // orphaning the side-output buffer. Reshape-to-same-shape creates a new
+      // RuntimeTensor that can be safely disposed without poisoning the original.
+      const logsumexpRef = this.runtime.reshape(logsumexp, [batch, heads, seq]);
+      const logsumexpTensor = this.wrap(logsumexpRef);
+      const outputRef = this.runtime.reshape(fwdResult, [batch, heads, seq, hd]);
+      const outputTensor = this.wrap(outputRef);
+
+      const tensorsToSave = (q.requiresGrad || k.requiresGrad || v.requiresGrad)
+        ? [q, k, v, logsumexpTensor, outputTensor]
+        : [];
+
+      return this.wrapWithGrad(fwdResult, [q, k, v], (dO, getSaved) => {
+        const sQ = getSaved(0);
+        const sK = getSaved(1);
+        const sV = getSaved(2);
+        const sL = getSaved(3);
+        const sO = getSaved(4);
+
+        // O is the 6th input to backward for D precomputation
+        const bwdDQ = this.runtime.fusedAttentionBackward(
+          sQ._unwrap(), sK._unwrap(), sV._unwrap(), sL._unwrap(), dO, sO._unwrap(), config,
+        );
+        const dK = this.runtime.extractAttentionDK(bwdDQ, config);
+        const dV = this.runtime.extractAttentionDV(bwdDQ, config);
+        return [bwdDQ, dK, dV]; // dQ, dK, dV for inputs [q, k, v]
+      }, tensorsToSave);
+    }
+
+    // CPU fallback: decomposed matmul + softmax + matmul
+    const kT = this.runtime.transpose(k._unwrap(), { dim0: 2, dim1: 3 });
+    const scores = this.runtime.matmul(q._unwrap(), kT);
+    const scaleTensor = this.runtime.full([], actualScale, q.device);
+    const scaledScores = this.runtime.mul(scores, scaleTensor);
+
+    let finalScores: import("./runtime/engine").Tensor;
+    if (isCausal) {
+      // Create causal mask: -inf for positions where j > i
+      const maskData: number[] = [];
+      for (let i = 0; i < seq; i++) {
+        for (let j = 0; j < seq; j++) {
+          maskData.push(j > i ? -1e9 : 0);
+        }
+      }
+      const mask = this.runtime.tensorFromArray(maskData, [1, 1, seq, seq], q.device);
+      finalScores = this.runtime.add(scaledScores, mask);
+    } else {
+      finalScores = scaledScores;
+    }
+
+    // Softmax along last dim (using the public softmax which handles autograd)
+    const softmaxResult = this.softmax(this.wrap(finalScores), -1);
+    const output = this.runtime.matmul(softmaxResult._unwrap(), v._unwrap());
+
+    // Wrap with autograd
+    const tensorsToSave = (q.requiresGrad || k.requiresGrad || v.requiresGrad)
+      ? [q, k, v, softmaxResult]
+      : [];
+
+    return this.wrapWithGrad(output, [q, k, v], (dO, getSaved) => {
+      const sQ = getSaved(0);
+      const sK = getSaved(1);
+      const sV = getSaved(2);
+      const sSoftmax = getSaved(3);
+
+      // dV = attn_weights^T @ dO
+      const attnT = this.runtime.transpose(sSoftmax._unwrap(), { dim0: 2, dim1: 3 });
+      const dV = this.runtime.matmul(attnT, dO);
+
+      // dAttn = dO @ V^T
+      const vT = this.runtime.transpose(sV._unwrap(), { dim0: 2, dim1: 3 });
+      const dAttn = this.runtime.matmul(dO, vT);
+
+      // dScores = softmax_backward(dAttn, softmax_out)
+      const dAttnTimesSoftmax = this.runtime.mul(dAttn, sSoftmax._unwrap());
+      const sumDAttnSoftmax = this.runtime.sum(dAttnTimesSoftmax, { dim: -1, keepdim: true }) as import("./runtime/engine").Tensor;
+      const dScoresSub = this.runtime.sub(dAttn, sumDAttnSoftmax);
+      const dScores = this.runtime.mul(sSoftmax._unwrap(), dScoresSub);
+
+      // Scale gradients
+      const scaleT = this.runtime.full([], actualScale, sQ.device);
+      const dScoresScaled = this.runtime.mul(dScores, scaleT);
+
+      // dQ = dScoresScaled @ K
+      const dQ = this.runtime.matmul(dScoresScaled, sK._unwrap());
+
+      // dK = dScoresScaled^T @ Q
+      const dScoresT = this.runtime.transpose(dScoresScaled, { dim0: 2, dim1: 3 });
+      const dK = this.runtime.matmul(dScoresT, sQ._unwrap());
+
+      return [dQ, dK, dV];
     }, tensorsToSave);
   }
 
@@ -1997,16 +2125,6 @@ export class Torchlette {
     // output = normalized * weight + bias
     const scaled = this.runtime.mul(normalized, weight._unwrap());
     const result = this.runtime.add(scaled, bias._unwrap());
-
-    // Dispose internal intermediates to remove them from pendingTensorsByNodeId.
-    meanResult.dispose();
-    centered.dispose();
-    centeredSq.dispose();
-    varianceResult.dispose();
-    variancePlusEps.dispose();
-    std.dispose();
-    normalized.dispose();
-    scaled.dispose();
 
     // Autograd - recompute intermediates from saved inputs for checkpointing support
     return this.wrapWithGrad(result, [x, weight, bias], (grad, getSaved) => {
@@ -2486,6 +2604,11 @@ export class Torchlette {
             return unpackedTensors[idx];
           };
 
+          // Fire backward dispatch hooks
+          for (const hook of this._backwardDispatchHooks) {
+            hook({ output: node.output, inputs: node.inputs, label: node.label });
+          }
+
           this.runtime.startIntermediateTracking();
           let gradsIn: Array<RuntimeTensor | null>;
           try {
@@ -2668,6 +2791,7 @@ export class Torchlette {
   }
 
   private wrap(inner: RuntimeTensor, requiresGrad = false): Tensor {
+    this.runtime.markEscaped(inner);
     const handle = this.engine.createTensor(inner.baseId);
     const tensor = new Tensor(this, inner, handle, { requiresGrad });
     if (this.inCompileRegion) {
@@ -2723,7 +2847,7 @@ export class Torchlette {
       if (savedSlots.length > 0) {
         this.engine._debug_publishSave(output.baseId);
       }
-      output._setGradNode({ inputs, output, backward, savedSlots });
+      output._setGradNode({ inputs, output, backward, savedSlots, label: this._currentNodeLabel ?? undefined });
     }
     return output;
   }
@@ -2819,11 +2943,18 @@ export class Torchlette {
   }
 
   tidy<T>(fn: () => T): T {
+    const tidyMode = new TidyDispatchMode();
+    this.runtime.pushDispatchMode(tidyMode);
     let result: T | undefined;
-    this.engine.tidy(() => {
-      result = fn();
-      return collectEngineTensors(result);
-    });
+    try {
+      this.engine.tidy(() => {
+        result = fn();
+        return collectEngineTensors(result);
+      });
+    } finally {
+      this.runtime.popDispatchMode();
+      tidyMode.disposeNonEscaped();
+    }
     return result as T;
   }
 

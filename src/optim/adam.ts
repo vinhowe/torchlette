@@ -251,9 +251,6 @@ export class Adam {
   private _stepElementwise(runtime: ReturnType<Torchlette["_runtime"]>): Tensor[] {
     const updated: Tensor[] = [];
 
-    // Track intermediate tensors for cleanup
-    const intermediates: RuntimeTensor[] = [];
-
     for (let i = 0; i < this.params.length; i += 1) {
       const param = this.params[i];
       const grad = param.grad?._unwrap() ?? null;
@@ -271,9 +268,7 @@ export class Adam {
       let gradAdj = grad;
       if (this.weightDecay !== 0) {
         const paramW = runtime.mul(param._unwrap(), this.weightDecay);
-        intermediates.push(paramW);
         gradAdj = runtime.add(gradAdj, paramW);
-        intermediates.push(gradAdj);
       }
 
       const prevAvg = this.expAvg[i];
@@ -284,25 +279,22 @@ export class Adam {
         const t1 = runtime.mul(prevAvg, this.beta1);
         const t2 = runtime.mul(gradAdj, 1 - this.beta1);
         avg = runtime.add(t1, t2);
-        intermediates.push(t1, t2);
       } else {
         avg = runtime.mul(gradAdj, 1 - this.beta1);
       }
 
       const gradSq = runtime.mul(gradAdj, gradAdj);
-      intermediates.push(gradSq);
 
       let avgSq: RuntimeTensor;
       if (prevAvgSq) {
         const t1 = runtime.mul(prevAvgSq, this.beta2);
         const t2 = runtime.mul(gradSq, 1 - this.beta2);
         avgSq = runtime.add(t1, t2);
-        intermediates.push(t1, t2);
       } else {
         avgSq = runtime.mul(gradSq, 1 - this.beta2);
       }
 
-      // Explicitly dispose old optimizer state tensors to avoid memory leak
+      // Dispose old optimizer state tensors (cross-step state, not tracked by dispatch modes)
       if (prevAvg) {
         prevAvg.dispose();
       }
@@ -317,16 +309,10 @@ export class Adam {
       const update = runtime.div(avg, denom);
       const scaled = runtime.mul(update, stepSize);
       const next = runtime.sub(param._unwrap(), scaled);
-      intermediates.push(sqrtAvgSq, denom, update, scaled, next);
 
       // Update parameter IN-PLACE to preserve tensor identity
       runtime.copy_(param._unwrap(), next);
       updated.push(param);
-    }
-
-    // Dispose all intermediate tensors
-    for (const t of intermediates) {
-      t.dispose();
     }
 
     return updated;
@@ -353,9 +339,6 @@ export class Adam {
         continue;
       }
 
-      // Track intermediates per-parameter for immediate cleanup
-      const intermediates: RuntimeTensor[] = [];
-
       const step = this.steps[i] + 1;
       this.steps[i] = step;
       const biasCorrection1 = 1 - this.beta1 ** step;
@@ -365,9 +348,7 @@ export class Adam {
       let gradAdj = grad;
       if (this.weightDecay !== 0) {
         const paramW = runtime.mul(param._unwrap(), this.weightDecay);
-        intermediates.push(paramW);
         gradAdj = runtime.add(gradAdj, paramW);
-        intermediates.push(gradAdj);
       }
 
       const prevAvg = this.expAvg[i];
@@ -378,20 +359,17 @@ export class Adam {
         const t1 = runtime.mul(prevAvg, this.beta1);
         const t2 = runtime.mul(gradAdj, 1 - this.beta1);
         avg = runtime.add(t1, t2);
-        intermediates.push(t1, t2);
       } else {
         avg = runtime.mul(gradAdj, 1 - this.beta1);
       }
 
       const gradSq = runtime.mul(gradAdj, gradAdj);
-      intermediates.push(gradSq);
 
       let avgSq: RuntimeTensor;
       if (prevAvgSq) {
         const t1 = runtime.mul(prevAvgSq, this.beta2);
         const t2 = runtime.mul(gradSq, 1 - this.beta2);
         avgSq = runtime.add(t1, t2);
-        intermediates.push(t1, t2);
       } else {
         avgSq = runtime.mul(gradSq, 1 - this.beta2);
       }
@@ -410,18 +388,12 @@ export class Adam {
       const update = runtime.div(avg, denom);
       const scaled = runtime.mul(update, stepSize);
       const next = runtime.sub(param._unwrap(), scaled);
-      intermediates.push(sqrtAvgSq, denom, update, scaled, next);
 
       // Update parameter IN-PLACE
       runtime.copy_(param._unwrap(), next);
 
       // Force this parameter's computation immediately to limit peak memory.
       await runtime.force(param._unwrap());
-
-      // Dispose intermediates for this parameter
-      for (const t of intermediates) {
-        t.dispose();
-      }
 
       updated.push(param);
     }

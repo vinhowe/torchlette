@@ -238,14 +238,18 @@ export interface ReplayNodeResult {
  */
 export type ReplayEntry =
   | { kind: "dispatch"; dispatch: ReplayDispatch }
-  | { kind: "data-source"; nodeIndex: number; arenaResolveIdx: number }
+  | { kind: "data-source"; nodeIndex: number; arenaResolveIdx: number;
+      /** Sequence counter positions so re-executed dispatches hit correct cache positions. */
+      seqCounters: { dispatch: number; params: number; output: number } }
   | { kind: "view"; nodeIndex: number; arenaResolveIdx: number;
       /** Cached view result for replay (arena buffers are stable, so buffer refs stay valid). */
       cachedResult?: { buffer: any; shape: number[]; dtype: DType; size: number;
         strides: number[]; offset: number; isContiguous: boolean };
       /** Arena counter position AFTER view execution (may differ if contiguous() triggered). */
       arenaResolveIdxAfter?: number }
-  | { kind: "sequential"; nodeIndex: number; arenaResolveIdx: number }
+  | { kind: "sequential"; nodeIndex: number; arenaResolveIdx: number;
+      /** Sequence counter positions so re-executed dispatches hit correct cache positions. */
+      seqCounters: { dispatch: number; params: number; output: number } }
   | { kind: "result"; nodeResult: ReplayNodeResult }
   | { kind: "adam-batch"; nodeIndices: number[];
       /** Sequence counter positions at adam batch start (for correct cache indexing). */

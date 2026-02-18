@@ -14,7 +14,7 @@ export function setFusionRecordingBuffer(buf: RecordedDispatch[] | null): void {
 }
 
 import type { DType } from "../types";
-import { profileApiCall, getTimestampWrites } from "./profiler";
+import { profileApiCall, getTimestampWrites, getProfileModule } from "./profiler";
 import {
   type FusedKernelRecipe,
   type GeneratedKernel,
@@ -321,6 +321,7 @@ export function dispatchFusedKernel(
       workgroupsZ: 1,
       buffers: getAndClearLastBindGroupBuffers(),
       label: getCurrentOpLabel() ?? undefined,
+      module: getProfileModule(),
     });
   }
 

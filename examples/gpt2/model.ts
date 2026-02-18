@@ -79,6 +79,7 @@ export class CausalSelfAttention extends Module {
   private readonly numHeads: number;
   private readonly embedDim: number;
   private readonly headDim: number;
+  private readonly dropoutRate: number;
 
   readonly cAttn: Linear; // Combined Q, K, V projection [embedDim, 3 * embedDim]
   readonly cProj: Linear; // Output projection [embedDim, embedDim]
@@ -95,6 +96,7 @@ export class CausalSelfAttention extends Module {
     this.numHeads = config.numHeads;
     this.embedDim = config.embedDim;
     this.headDim = config.embedDim / config.numHeads;
+    this.dropoutRate = config.dropoutRate;
 
     if (this.embedDim % this.numHeads !== 0) {
       throw new Error(
@@ -162,33 +164,24 @@ export class CausalSelfAttention extends Module {
       .contiguous();
 
     // Scaled dot-product attention
-    // att = (q @ k^T) / sqrt(d_k)
-    // k: [batch, numHeads, seqLen, headDim]
-    // k^T: [batch, numHeads, headDim, seqLen]
-    // Backend detects simple transpose and handles it natively (no contiguous needed)
-    const kT = k.transpose({ dim0: 2, dim1: 3 });
+    // Use fused FlashAttention when dropout is disabled (eval mode or rate=0)
+    let attnOutput: Tensor;
+    if (!this.attnDropout.training || this.dropoutRate === 0) {
+      // Fused path: single kernel for Q@K^T + scale + causal_mask + softmax + attn@V
+      const scale = 1.0 / Math.sqrt(this.headDim);
+      attnOutput = this.api.scaledDotProductAttention(q, k, v, scale, true);
+    } else {
+      // Decomposed path (needed when dropout is active)
+      const kT = k.transpose({ dim0: 2, dim1: 3 });
+      const scores = q.matmul(kT);
+      const scaledScores = scores.mul(1.0 / Math.sqrt(this.headDim));
 
-    // q @ k^T: [batch, numHeads, seqLen, seqLen]
-    const scores = q.matmul(kT);
-    const scaledScores = scores.mul(1.0 / Math.sqrt(this.headDim));
-
-    // Apply causal mask from cached buffer (zero-cost narrow views)
-    const mask = this.causalBias.narrow(2, 0, seqLen).narrow(3, 0, seqLen);
-
-    // Add mask to scores
-    const maskedScores = this.api.add(scaledScores, mask);
-
-    // Softmax over last dimension
-    const attnWeights = maskedScores.softmax(-1);
-
-    // Apply attention dropout (during training)
-    const attnDropped = this.attnDropout.forward(attnWeights);
-
-    // Weighted sum of values
-    // attnDropped: [batch, numHeads, seqLen, seqLen]
-    // v: [batch, numHeads, seqLen, headDim]
-    // output: [batch, numHeads, seqLen, headDim]
-    const attnOutput = attnDropped.matmul(v);
+      const mask = this.causalBias.narrow(2, 0, seqLen).narrow(3, 0, seqLen);
+      const maskedScores = this.api.add(scaledScores, mask);
+      const attnWeights = maskedScores.softmax(-1);
+      const attnDropped = this.attnDropout.forward(attnWeights);
+      attnOutput = attnDropped.matmul(v);
+    }
 
     // Concatenate heads: [batch, numHeads, seqLen, headDim] -> [batch, seqLen, embedDim]
     // Note: permute creates non-contiguous tensor, need contiguous before reshape

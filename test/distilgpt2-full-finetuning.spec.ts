@@ -395,7 +395,12 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
 
       // Phase 2: measure over 8 steps (long window averages out GC jitter)
       const MEASURE_STEPS = 8;
-      for (let i = 0; i < MEASURE_STEPS; i++) await trainStep();
+      for (let i = 0; i < MEASURE_STEPS; i++) {
+        const allocsBefore = getGPUMemoryStats().allocationCount;
+        await trainStep();
+        const allocsAfter = getGPUMemoryStats().allocationCount;
+        console.log(`  step ${i}: allocs delta=${allocsAfter - allocsBefore}`);
+      }
       await drainGC();
       const s2 = snapshot();
 
