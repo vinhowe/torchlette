@@ -144,6 +144,7 @@ function getOrCreateConfigBuffer(
  * Output: O [B,H,N,D], L [B,H,N] (logsumexp per row)
  */
 function flashAttentionForwardShader(headDim: number): string {
+  const HD4 = headDim / 4;
   return `
 struct FAConfig {
   batch_size: u32,
@@ -163,133 +164,124 @@ struct FAConfig {
 @group(0) @binding(4) var<storage, read_write> L: array<f32>;
 @group(0) @binding(5) var<uniform> config: FAConfig;
 
-// Shared memory for K and V tiles: [BC, HD]
-var<workgroup> k_tile: array<f32, ${BC * headDim}>;
-var<workgroup> v_tile: array<f32, ${BC * headDim}>;
+// Shared memory for K and V tiles: [BC, HD/4] as vec4
+var<workgroup> k_tile: array<vec4<f32>, ${BC * HD4}>;
+var<workgroup> v_tile: array<vec4<f32>, ${BC * HD4}>;
 
 @compute @workgroup_size(${BR})
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>) {
-  let q_block = wid.x;   // which Q block
-  let h = wid.y;          // head index
-  let b = wid.z;          // batch index
-  let tid = lid.x;        // thread = Q row within block
+  let q_block = wid.x;
+  let h = wid.y;
+  let b = wid.z;
+  let tid = lid.x;
 
   let N = config.seq_len;
   let D = config.head_dim;
   let scale = config.scale;
 
-  // Global Q row index
   let q_row = q_block * ${BR}u + tid;
   let valid = q_row < N;
 
-  // Base offset for this (batch, head) in the flattened [B,H,N,D] layout
   let bh_offset = (b * config.num_heads + h) * N * D;
   let bh_offset_L = (b * config.num_heads + h) * N;
 
-  // Load Q row into registers
-  var q_reg: array<f32, ${headDim}>;
+  // Load Q row into vec4 registers
+  var q_reg: array<vec4<f32>, ${HD4}>;
   if (valid) {
     let q_base = bh_offset + q_row * D;
-    for (var d = 0u; d < ${headDim}u; d++) {
-      q_reg[d] = Q[q_base + d];
+    for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+      let off = q_base + d4 * 4u;
+      q_reg[d4] = vec4<f32>(Q[off], Q[off+1u], Q[off+2u], Q[off+3u]);
     }
   }
 
   // Running online softmax state
-  var m_i = -3.402823e+38f;  // running max
-  var l_i = 0.0f;            // running sum of exp
-  var o_acc: array<f32, ${headDim}>;  // running output accumulator
-  for (var d = 0u; d < ${headDim}u; d++) {
-    o_acc[d] = 0.0;
+  var m_i = -3.402823e+38f;
+  var l_i = 0.0f;
+  var o_acc: array<vec4<f32>, ${HD4}>;
+  for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+    o_acc[d4] = vec4<f32>(0.0);
   }
 
-  // Number of KV tiles
   let num_kv_tiles = (N + ${BC - 1}u) / ${BC}u;
 
   for (var tile = 0u; tile < num_kv_tiles; tile++) {
     let kv_start = tile * ${BC}u;
 
-    // Cooperatively load K tile [BC, D] into shared memory
-    // Each of BR threads loads some rows
+    // Cooperatively load K tile into shared memory as vec4
     for (var row = tid; row < ${BC}u; row += ${BR}u) {
       let kv_row = kv_start + row;
       if (kv_row < N) {
         let k_base = bh_offset + kv_row * D;
-        for (var d = 0u; d < ${headDim}u; d++) {
-          k_tile[row * ${headDim}u + d] = K[k_base + d];
+        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+          let off = k_base + d4 * 4u;
+          k_tile[row * ${HD4}u + d4] = vec4<f32>(K[off], K[off+1u], K[off+2u], K[off+3u]);
         }
       } else {
-        for (var d = 0u; d < ${headDim}u; d++) {
-          k_tile[row * ${headDim}u + d] = 0.0;
+        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+          k_tile[row * ${HD4}u + d4] = vec4<f32>(0.0);
         }
       }
     }
 
-    // Cooperatively load V tile [BC, D] into shared memory
+    // Cooperatively load V tile into shared memory as vec4
     for (var row = tid; row < ${BC}u; row += ${BR}u) {
       let kv_row = kv_start + row;
       if (kv_row < N) {
         let v_base = bh_offset + kv_row * D;
-        for (var d = 0u; d < ${headDim}u; d++) {
-          v_tile[row * ${headDim}u + d] = V[v_base + d];
+        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+          let off = v_base + d4 * 4u;
+          v_tile[row * ${HD4}u + d4] = vec4<f32>(V[off], V[off+1u], V[off+2u], V[off+3u]);
         }
       } else {
-        for (var d = 0u; d < ${headDim}u; d++) {
-          v_tile[row * ${headDim}u + d] = 0.0;
+        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+          v_tile[row * ${HD4}u + d4] = vec4<f32>(0.0);
         }
       }
     }
 
     workgroupBarrier();
 
-    // Compute scores for this tile and update online softmax
     if (valid) {
-      // Determine how many KV positions are valid in this tile
       var tile_end = min(${BC}u, N - kv_start);
 
-      // Step 1: Compute scores and find tile max
       var tile_max = -3.402823e+38f;
       var scores: array<f32, ${BC}>;
 
       for (var j = 0u; j < tile_end; j++) {
-        // Causal mask: skip positions where kv_pos > q_pos
         let kv_pos = kv_start + j;
         if (config.is_causal != 0u && kv_pos > q_row) {
           scores[j] = -3.402823e+38f;
           continue;
         }
 
-        // Dot product: Q_row . K_tile[j]
-        var dot = 0.0f;
-        for (var d = 0u; d < ${headDim}u; d++) {
-          dot += q_reg[d] * k_tile[j * ${headDim}u + d];
+        // Vec4 dot product: Q_row . K_tile[j]
+        var s = 0.0f;
+        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+          s += dot(q_reg[d4], k_tile[j * ${HD4}u + d4]);
         }
-        scores[j] = dot * scale;
+        scores[j] = s * scale;
         tile_max = max(tile_max, scores[j]);
       }
 
-      // Mark invalid positions in the tile
       for (var j = tile_end; j < ${BC}u; j++) {
         scores[j] = -3.402823e+38f;
       }
 
-      // Step 2: Online softmax update
       let m_new = max(m_i, tile_max);
       let correction = exp(m_i - m_new);
 
-      // Rescale existing accumulator
       l_i = l_i * correction;
-      for (var d = 0u; d < ${headDim}u; d++) {
-        o_acc[d] = o_acc[d] * correction;
+      for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+        o_acc[d4] = o_acc[d4] * correction;
       }
 
-      // Add new tile contributions
       for (var j = 0u; j < tile_end; j++) {
         let p = exp(scores[j] - m_new);
         l_i += p;
-        for (var d = 0u; d < ${headDim}u; d++) {
-          o_acc[d] += p * v_tile[j * ${headDim}u + d];
+        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+          o_acc[d4] += p * v_tile[j * ${HD4}u + d4];
         }
       }
 
@@ -303,11 +295,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   if (valid) {
     let inv_l = select(0.0, 1.0 / l_i, l_i > 0.0);
     let o_base = bh_offset + q_row * D;
-    for (var d = 0u; d < ${headDim}u; d++) {
-      O[o_base + d] = o_acc[d] * inv_l;
+    for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+      let v = o_acc[d4] * inv_l;
+      let off = o_base + d4 * 4u;
+      O[off] = v.x;
+      O[off+1u] = v.y;
+      O[off+2u] = v.z;
+      O[off+3u] = v.w;
     }
 
-    // Save logsumexp: L = m + log(l)
     let logsumexp = m_i + log(max(l_i, 1e-10f));
     L[bh_offset_L + q_row] = logsumexp;
   }
@@ -400,6 +396,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
  * Output: dQ [B,H,N,D]
  */
 function flashAttentionBackwardDQShader(headDim: number): string {
+  const HD4 = headDim / 4;
   return `
 struct FAConfig {
   batch_size: u32,
@@ -421,8 +418,8 @@ struct FAConfig {
 @group(0) @binding(6) var<storage, read_write> dQ: array<f32>;
 @group(0) @binding(7) var<uniform> config: FAConfig;
 
-var<workgroup> k_tile: array<f32, ${BC * headDim}>;
-var<workgroup> v_tile: array<f32, ${BC * headDim}>;
+var<workgroup> k_tile: array<vec4<f32>, ${BC * HD4}>;
+var<workgroup> v_tile: array<vec4<f32>, ${BC * HD4}>;
 
 @compute @workgroup_size(${BR})
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
@@ -442,19 +439,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   let bh_offset = (b * config.num_heads + h) * N * D;
   let bh_offset_L = (b * config.num_heads + h) * N;
 
-  // Load Q row, dO row, and saved stats into registers
-  var q_reg: array<f32, ${headDim}>;
-  var dO_reg: array<f32, ${headDim}>;
-  var dq_acc: array<f32, ${headDim}>;
+  // Load Q row, dO row into vec4 registers
+  var q_reg: array<vec4<f32>, ${HD4}>;
+  var dO_reg: array<vec4<f32>, ${HD4}>;
+  var dq_acc: array<vec4<f32>, ${HD4}>;
   var L_i = 0.0f;
   var D_i = 0.0f;
 
   if (valid) {
     let base = bh_offset + q_row * D;
-    for (var d = 0u; d < ${headDim}u; d++) {
-      q_reg[d] = Q[base + d];
-      dO_reg[d] = dO[base + d];
-      dq_acc[d] = 0.0;
+    for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+      let off = base + d4 * 4u;
+      q_reg[d4] = vec4<f32>(Q[off], Q[off+1u], Q[off+2u], Q[off+3u]);
+      dO_reg[d4] = vec4<f32>(dO[off], dO[off+1u], dO[off+2u], dO[off+3u]);
+      dq_acc[d4] = vec4<f32>(0.0);
     }
     L_i = L_buf[bh_offset_L + q_row];
     D_i = D_buf[bh_offset_L + q_row];
@@ -465,19 +463,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   for (var tile = 0u; tile < num_kv_tiles; tile++) {
     let kv_start = tile * ${BC}u;
 
-    // Cooperatively load K and V tiles
+    // Cooperatively load K and V tiles as vec4
     for (var row = tid; row < ${BC}u; row += ${BR}u) {
       let kv_row = kv_start + row;
       if (kv_row < N) {
         let k_base = bh_offset + kv_row * D;
-        for (var d = 0u; d < ${headDim}u; d++) {
-          k_tile[row * ${headDim}u + d] = K[k_base + d];
-          v_tile[row * ${headDim}u + d] = V[k_base + d];
+        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+          let off = k_base + d4 * 4u;
+          k_tile[row * ${HD4}u + d4] = vec4<f32>(K[off], K[off+1u], K[off+2u], K[off+3u]);
+          v_tile[row * ${HD4}u + d4] = vec4<f32>(V[off], V[off+1u], V[off+2u], V[off+3u]);
         }
       } else {
-        for (var d = 0u; d < ${headDim}u; d++) {
-          k_tile[row * ${headDim}u + d] = 0.0;
-          v_tile[row * ${headDim}u + d] = 0.0;
+        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+          k_tile[row * ${HD4}u + d4] = vec4<f32>(0.0);
+          v_tile[row * ${HD4}u + d4] = vec4<f32>(0.0);
         }
       }
     }
@@ -493,28 +492,26 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
           continue;
         }
 
-        // Recompute score: s = Q[i] . K[j] * scale
+        // Vec4 dot product: Q[i] . K[j] * scale
         var s = 0.0f;
-        for (var d = 0u; d < ${headDim}u; d++) {
-          s += q_reg[d] * k_tile[j * ${headDim}u + d];
+        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+          s += dot(q_reg[d4], k_tile[j * ${HD4}u + d4]);
         }
         s = s * scale;
 
-        // Recompute P[i,j] = exp(s - L[i])
         let p = exp(s - L_i);
 
-        // Compute dO[i] . V[j]
+        // Vec4 dot product: dO[i] . V[j]
         var dov = 0.0f;
-        for (var d = 0u; d < ${headDim}u; d++) {
-          dov += dO_reg[d] * v_tile[j * ${headDim}u + d];
+        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+          dov += dot(dO_reg[d4], v_tile[j * ${HD4}u + d4]);
         }
 
-        // dS[i,j] = P[i,j] * (dO[i].V[j] - D[i])
         let ds = p * (dov - D_i);
 
-        // dQ[i] += dS[i,j] * K[j] * scale
-        for (var d = 0u; d < ${headDim}u; d++) {
-          dq_acc[d] += ds * k_tile[j * ${headDim}u + d];
+        // dQ[i] += dS[i,j] * K[j]
+        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+          dq_acc[d4] += ds * k_tile[j * ${HD4}u + d4];
         }
       }
     }
@@ -522,11 +519,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     workgroupBarrier();
   }
 
-  // Write dQ
+  // Write dQ (scale applied once at write)
   if (valid) {
     let base = bh_offset + q_row * D;
-    for (var d = 0u; d < ${headDim}u; d++) {
-      dQ[base + d] = dq_acc[d] * scale;
+    for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+      let v = dq_acc[d4] * scale;
+      let off = base + d4 * 4u;
+      dQ[off] = v.x;
+      dQ[off+1u] = v.y;
+      dQ[off+2u] = v.z;
+      dQ[off+3u] = v.w;
     }
   }
 }
@@ -546,6 +548,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
  */
 function flashAttentionBackwardDKVShader(headDim: number): string {
   const BC_BW = 64; // KV rows per workgroup for backward
+  const HD4 = headDim / 4;
   return `
 struct FAConfig {
   batch_size: u32,
@@ -568,9 +571,9 @@ struct FAConfig {
 @group(0) @binding(7) var<storage, read_write> dV: array<f32>;
 @group(0) @binding(8) var<uniform> config: FAConfig;
 
-// Tiled shared memory: BQ_BW=${BQ_BW} Q rows loaded cooperatively per tile
-var<workgroup> q_tile: array<f32, ${BQ_BW * headDim}>;
-var<workgroup> dO_tile: array<f32, ${BQ_BW * headDim}>;
+// Tiled shared memory as vec4: BQ_BW=${BQ_BW} Q rows, HD/4 vec4s per row
+var<workgroup> q_tile: array<vec4<f32>, ${BQ_BW * HD4}>;
+var<workgroup> dO_tile: array<vec4<f32>, ${BQ_BW * HD4}>;
 var<workgroup> L_tile: array<f32, ${BQ_BW}>;
 var<workgroup> D_tile: array<f32, ${BQ_BW}>;
 
@@ -580,7 +583,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   let kv_block = wid.x;
   let h = wid.y;
   let b = wid.z;
-  let tid = lid.x;  // this thread's KV row within the block
+  let tid = lid.x;
 
   let N = config.seq_len;
   let D = config.head_dim;
@@ -592,19 +595,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   let bh_offset = (b * config.num_heads + h) * N * D;
   let bh_offset_L = (b * config.num_heads + h) * N;
 
-  // Load this thread's K and V rows into registers
-  var k_reg: array<f32, ${headDim}>;
-  var v_reg: array<f32, ${headDim}>;
-  var dk_acc: array<f32, ${headDim}>;
-  var dv_acc: array<f32, ${headDim}>;
+  // Load this thread's K and V rows into vec4 registers
+  var k_reg: array<vec4<f32>, ${HD4}>;
+  var v_reg: array<vec4<f32>, ${HD4}>;
+  var dk_acc: array<vec4<f32>, ${HD4}>;
+  var dv_acc: array<vec4<f32>, ${HD4}>;
 
   if (valid) {
     let base = bh_offset + kv_row * D;
-    for (var d = 0u; d < ${headDim}u; d++) {
-      k_reg[d] = K[base + d];
-      v_reg[d] = V[base + d];
-      dk_acc[d] = 0.0;
-      dv_acc[d] = 0.0;
+    for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+      let off = base + d4 * 4u;
+      k_reg[d4] = vec4<f32>(K[off], K[off+1u], K[off+2u], K[off+3u]);
+      v_reg[d4] = vec4<f32>(V[off], V[off+1u], V[off+2u], V[off+3u]);
+      dk_acc[d4] = vec4<f32>(0.0);
+      dv_acc[d4] = vec4<f32>(0.0);
     }
   }
 
@@ -614,23 +618,22 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let q_start = qt * ${BQ_BW}u;
 
     // Causal early exit: skip entire tile if max qi in tile < min kv_row in block
-    // Uses kv_block * BC_BW (uniform across all threads) instead of kv_row
     if (config.is_causal != 0u && q_start + ${BQ_BW - 1}u < kv_block * ${BC_BW}u) {
       continue;
     }
 
-    // Cooperative load: all ${BC_BW} threads load BQ*D/${BC_BW} elements each
-    for (var idx = tid; idx < ${BQ_BW * headDim}u; idx += ${BC_BW}u) {
-      let row = idx / ${headDim}u;
-      let col = idx % ${headDim}u;
+    // Cooperative load: all ${BC_BW} threads load vec4s
+    for (var idx = tid; idx < ${BQ_BW * HD4}u; idx += ${BC_BW}u) {
+      let row = idx / ${HD4}u;
+      let d4 = idx % ${HD4}u;
       let qi = q_start + row;
       if (qi < N) {
-        let base = bh_offset + qi * D + col;
-        q_tile[idx] = Q[base];
-        dO_tile[idx] = dO[base];
+        let base = bh_offset + qi * D + d4 * 4u;
+        q_tile[idx] = vec4<f32>(Q[base], Q[base+1u], Q[base+2u], Q[base+3u]);
+        dO_tile[idx] = vec4<f32>(dO[base], dO[base+1u], dO[base+2u], dO[base+3u]);
       } else {
-        q_tile[idx] = 0.0;
-        dO_tile[idx] = 0.0;
+        q_tile[idx] = vec4<f32>(0.0);
+        dO_tile[idx] = vec4<f32>(0.0);
       }
     }
     // Load L and D values (first BQ_BW threads)
@@ -644,32 +647,33 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
     workgroupBarrier();
 
-    // Inner loop over BQ_BW Q rows — shared memory is read-only, no barriers
+    // Inner loop over BQ_BW Q rows
     if (valid) {
       let tile_end = min(${BQ_BW}u, N - q_start);
       for (var j = 0u; j < tile_end; j++) {
         let qi = q_start + j;
         if (config.is_causal != 0u && kv_row > qi) { continue; }
 
-        // Recompute score: Q[qi] . K[kv_row] * scale
+        // Vec4 dot product: Q[qi] . K[kv_row] * scale
         var s = 0.0f;
-        for (var d = 0u; d < ${headDim}u; d++) {
-          s += q_tile[j * ${headDim}u + d] * k_reg[d];
+        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+          s += dot(q_tile[j * ${HD4}u + d4], k_reg[d4]);
         }
         s = s * scale;
 
         let p = exp(s - L_tile[j]);
 
         var dov = 0.0f;
-        for (var d = 0u; d < ${headDim}u; d++) {
-          dov += dO_tile[j * ${headDim}u + d] * v_reg[d];
+        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+          dov += dot(dO_tile[j * ${HD4}u + d4], v_reg[d4]);
         }
 
         let ds = p * (dov - D_tile[j]);
+        let ds_scale = ds * scale;
 
-        for (var d = 0u; d < ${headDim}u; d++) {
-          dk_acc[d] += ds * q_tile[j * ${headDim}u + d] * scale;
-          dv_acc[d] += p * dO_tile[j * ${headDim}u + d];
+        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+          dk_acc[d4] += ds_scale * q_tile[j * ${HD4}u + d4];
+          dv_acc[d4] += p * dO_tile[j * ${HD4}u + d4];
         }
       }
     }
@@ -680,9 +684,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   // Write dK and dV
   if (valid) {
     let base = bh_offset + kv_row * D;
-    for (var d = 0u; d < ${headDim}u; d++) {
-      dK[base + d] = dk_acc[d];
-      dV[base + d] = dv_acc[d];
+    for (var d4 = 0u; d4 < ${HD4}u; d4++) {
+      let off = base + d4 * 4u;
+      dK[off] = dk_acc[d4].x;
+      dK[off+1u] = dk_acc[d4].y;
+      dK[off+2u] = dk_acc[d4].z;
+      dK[off+3u] = dk_acc[d4].w;
+      dV[off] = dv_acc[d4].x;
+      dV[off+1u] = dv_acc[d4].y;
+      dV[off+2u] = dv_acc[d4].z;
+      dV[off+3u] = dv_acc[d4].w;
     }
   }
 }
