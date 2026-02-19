@@ -99,12 +99,14 @@ export function getDefaultConfigForShape(
 ): MatmulKernelConfig {
   switch (shapeClass) {
     case "square_large":
-      // Large matrices benefit from larger tiles
+      // Large matrices: tileK=8 for better occupancy (half shared memory vs tileK=16)
+      // Keeps t4x4 to avoid register pressure with epilogue fused kernels
+      // Benchmarked on MLP shapes (512x3072x768, 512x768x3072): +12% to +27% vs 64x64x16
       return {
         ...DEFAULT_CONFIG,
         tileM: 64,
         tileN: 64,
-        tileK: 16,
+        tileK: 8,
       };
 
     case "square_medium":

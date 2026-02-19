@@ -81,7 +81,7 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
 
 2. **GPU time budget** — From the Phase table (`Phase | Ops | CPU(ms) | GPU(ms)`). Sum GPU(ms) across forward+backward+cleanup for total GPU time. At 512 tokens the workload is GPU-bound (145ms GPU vs 54ms CPU dispatch). At 31 tokens it was CPU-dispatch-bound (~85% utilization).
 
-3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). At 512 tokens: `matmul` (32.5ms, 37.0%), `fusedAttentionBackward` (16.6ms, 18.9%), `matmul++cast+bias+binary` (8.9ms, 10.1%), `fusedAttentionForward` (6.4ms, 7.3%), `adamStep` (5.0ms, 5.7%), `matmul++cast+bias+unary+cast` (4.5ms, 5.1%), `matmul++cast+bias` (3.2ms, 3.6%), `matmul++bias` (2.7ms, 3.1%).
+3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). At 512 tokens: `matmul` (28.1ms, 34.4%), `fusedAttentionBackward` (15.6ms, 19.1%), `matmul++cast+bias+binary` (9.1ms, 11.2%), `fusedAttentionForward` (6.1ms, 7.5%), `adamStep` (4.9ms, 6.0%), `matmul++cast+bias+unary+cast` (4.0ms, 4.9%), `matmul++cast+bias` (3.6ms, 4.4%), `matmul++bias` (2.2ms, 2.7%).
 
 4. **Cross-entropy** — Fused kernel implemented. 1.1ms/1.1% of GPU time at 512 tokens. No longer a bottleneck.
 
@@ -482,7 +482,7 @@ Profiled on DistilGPT-2 training. Two baseline configurations:
 Steady-state ~32ms/step with dispatch replay, 24ms GPU, ~85% GPU utilization. CPU-dispatch-bound.
 
 ### Baseline B: 512 tokens (current default)
-Steady-state ~57ms/step wall clock (profiler step 4, lowered plan cached, no replay). GPU: ~88ms total. Top GPU kernels: `matmul` 32.5ms (37.0%), `fusedAttentionBackward` 16.6ms (18.9%), `matmul++cast+bias+binary` 8.9ms (10.1%), `fusedAttentionForward` 6.4ms (7.3%), `adamStep` 5.0ms (5.7%), `matmul++cast+bias+unary+cast` 4.5ms (5.1%), `matmul++cast+bias` 3.2ms (3.6%), `matmul++bias` 2.7ms (3.1%). Cross-entropy fwd+bwd 1.1ms (1.3%). Bind group cache 100.0% (0 misses). 10 submits/step. Fusion: 1156 nodes, 183 fused (15.8%), 20 groups. Memory: 5489MB current / 5489MB peak / 32GB limit. Pool reuse 52.1%. 1 new alloc/step. Leak status: OK (storages +0.0/step).
+Steady-state ~57ms/step wall clock (profiler step 4, lowered plan cached, no replay). GPU: ~81ms total. Top GPU kernels: `matmul` 28.1ms (34.4%), `fusedAttentionBackward` 15.6ms (19.1%), `matmul++cast+bias+binary` 9.1ms (11.2%), `fusedAttentionForward` 6.1ms (7.5%), `adamStep` 4.9ms (6.0%), `matmul++cast+bias+unary+cast` 4.0ms (4.9%), `matmul++cast+bias` 3.6ms (4.4%), `matmul++bias` 2.2ms (2.7%). Cross-entropy fwd+bwd 1.1ms (1.3%). Bind group cache 100.0% (0 misses). 10 submits/step. Fusion: 1156 nodes, 183 fused (15.8%), 20 groups. Memory: 5489MB current / 5489MB peak / 32GB limit. Pool reuse 52.1%. 1 new alloc/step. Leak status: OK (storages +0.0/step).
 
 Targets ranked by impact:
 
@@ -524,9 +524,10 @@ Targets ranked by impact:
 34. ~~**Graph snipping: eliminate forward recompute in backward**~~ — DONE. After executing a plan, preserve `node.result` on all executed nodes and clear `node.inputs` instead. Plan builder treats result-bearing nodes as data leaves (skips them). Backward plan no longer re-includes already-executed forward nodes. Replaced attention-specific `_attnSideOutput` hacks in engine.ts with general mechanism in lifetime analysis: `getPendingNodeIds()` added to `outputNodeIds` set prevents early-release from destroying externally-referenced buffers. `fusedAttentionForward` dispatches: 12→6 (forward only, 0 in backward). `matmul++cast` (forward recompute matmuls) eliminated. ~6ms GPU/step saved.
 
 35. ~~**Matmul shape-class tile optimization**~~ — DONE. Benchmarked all 156 valid tile configs for lm_head shapes. Added `large_k` shape class (K/max(M,N) > 4) with 128×128×16 t8×8 tiles — maximizes arithmetic intensity for large-K matmuls. Updated `short_wide` to 64×128×8 t8×4 and `tall_skinny` to 64×128×8 t8×4 based on benchmark results. The `large_k` 128×128 tile reduces workgroup count enough to trigger K-split (factor 6) for lm_head backward dX (512×768×50304). `matmul` (bare) GPU: 45.2ms→32.5ms (−28%). `final.lm_head`: 15.8ms→9.4ms (−41%). Max matmul: 10,529µs→5,461µs (−48%). Total GPU: ~100ms→~88ms (−12%). Forward GPU: 24.0ms→22.6ms. Backward GPU: 71.3ms→60.1ms.
+36. ~~**square_large tileK=8 optimization**~~ — DONE. Changed `square_large` default from 64×64×16 t4×4 to 64×64×8 t4×4. Half the shared memory (4KB vs 8KB) improves GPU occupancy. Keeps t4×4 thread tiles to avoid register pressure with epilogue-fused kernels (t8×4 caused +50% regression on epilogue matmuls). Benchmarked on MLP shapes (512×3072×768, 512×768×3072): +12% to +27% improvement on bare matmul. `matmul` (bare): 32.5ms→28.1ms (−14%). `matmul++cast+bias+unary+cast`: 4.5ms→4.0ms (−11%). `matmul++bias`: 2.7ms→2.2ms (−19%). Total GPU: ~88ms→~81ms (−8%). Forward GPU: 22.6ms→22.2ms. Backward GPU: 60.1ms→54.4ms.
 
 **Open targets (ranked by estimated savings at 512 tokens):**
-1. **fusedAttentionBackward further tuning** — 16.6ms GPU (18.9%). Max 1739µs/dispatch, 24 dispatches. BQ=32 doesn't help (shared memory L/D reads faster than global; register pressure with larger tiles). Needs different algorithmic approach.
-2. **Remaining matmul tuning** — MLP backward dX matmuls (512×768×3072, 512×768×768) still use `square_large`/`square_medium` defaults. Benchmark shows 64×128×8 is optimal but these shapes are only ~0.5ms each. Per-shape autotuning at model load could capture this.
+1. **fusedAttentionBackward further tuning** — 15.6ms GPU (19.1%). Max 1742µs/dispatch, 24 dispatches. BQ=32 doesn't help (shared memory L/D reads faster than global; register pressure with larger tiles). Needs different algorithmic approach.
+2. **Epilogue-aware tile selection** — Epilogue matmuls (cast+bias+binary, cast+bias) regress with larger thread tiles due to register pressure. Currently one config per shape class regardless of epilogue. Per-shape or epilogue-aware config could recover ~1ms.
 3. **GC pressure** — Object pooling for Tensor metadata.
-4. **Pipeline cache warmup** — Step 0 is 3.1s (54× steady-state) due to pipeline compilation. Pre-compile pipeline variants during model load.
+4. **Pipeline cache warmup** — Step 0 is 3.4s (60× steady-state) due to pipeline compilation. Pre-compile pipeline variants during model load.
