@@ -81,7 +81,7 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
 
 2. **GPU time budget** — From the Phase table (`Phase | Ops | CPU(ms) | GPU(ms)`). Sum GPU(ms) across forward+backward+cleanup for total GPU time. At 512 tokens the workload is GPU-bound (145ms GPU vs 54ms CPU dispatch). At 31 tokens it was CPU-dispatch-bound (~85% utilization).
 
-3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). At 512 tokens: `matmul` (28.1ms, 34.4%), `fusedAttentionBackward` (15.6ms, 19.1%), `matmul++cast+bias+binary` (9.1ms, 11.2%), `fusedAttentionForward` (6.1ms, 7.5%), `adamStep` (4.9ms, 6.0%), `matmul++cast+bias+unary+cast` (4.0ms, 4.9%), `matmul++cast+bias` (3.6ms, 4.4%), `matmul++bias` (2.2ms, 2.7%).
+3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). At 512 tokens: `matmul` (24.8ms, 38.8%), `matmul++cast+bias+binary` (9.1ms, 14.2%), `fusedAttentionBackward` (5.4ms, 8.4%), `adamStep` (4.8ms, 7.5%), `matmul++cast+bias+unary+cast` (4.0ms, 6.3%), `matmul++cast+bias` (3.6ms, 5.6%), `fusedAttentionForward` (2.5ms, 3.9%), `matmul++bias` (2.2ms, 3.4%).
 
 4. **Cross-entropy** — Fused kernel implemented. 1.1ms/1.1% of GPU time at 512 tokens. No longer a bottleneck.
 
@@ -482,7 +482,7 @@ Profiled on DistilGPT-2 training. Two baseline configurations:
 Steady-state ~32ms/step with dispatch replay, 24ms GPU, ~85% GPU utilization. CPU-dispatch-bound.
 
 ### Baseline B: 512 tokens (current default)
-Steady-state ~50ms/step wall clock (profiler step 4, lowered plan cached, no replay). GPU: ~66ms total. Top GPU kernels: `matmul` 24.8ms (37.5%), `matmul++cast+bias+binary` 9.1ms (13.8%), `fusedAttentionBackward` 7.0ms (10.6%), `adamStep` 4.8ms (7.3%), `matmul++cast+bias+unary+cast` 4.0ms (6.1%), `matmul++cast+bias` 3.6ms (5.4%), `fusedAttentionForward` 2.5ms (3.8%), `matmul++bias` 2.2ms (3.3%). Cross-entropy fwd+bwd 1.1ms (1.7%). Bind group cache 100.0% (0 misses). 10 submits/step. Fusion: 1156 nodes, 183 fused (15.8%), 20 groups. Memory: 5489MB current / 5489MB peak / 32GB limit. Pool reuse 52.1%. 1 new alloc/step. Leak status: OK (storages +0.0/step).
+Steady-state ~49ms/step wall clock (profiler step 4, lowered plan cached, no replay). GPU: ~64ms total. Top GPU kernels: `matmul` 24.8ms (38.8%), `matmul++cast+bias+binary` 9.1ms (14.2%), `fusedAttentionBackward` 5.4ms (8.4%), `adamStep` 4.8ms (7.5%), `matmul++cast+bias+unary+cast` 4.0ms (6.3%), `matmul++cast+bias` 3.6ms (5.6%), `fusedAttentionForward` 2.5ms (3.9%), `matmul++bias` 2.2ms (3.4%). Cross-entropy fwd+bwd 1.1ms (1.7%). Bind group cache 100.0% (0 misses). 10 submits/step. Fusion: 1156 nodes, 183 fused (15.8%), 20 groups. Memory: 5489MB current / 5489MB peak / 32GB limit. Pool reuse 52.1%. 1 new alloc/step. Leak status: OK (storages +0.0/step).
 
 Targets ranked by impact:
 
@@ -530,9 +530,10 @@ Targets ranked by impact:
 
 38. ~~**Vec4 attention kernels**~~ — DONE. All three fused attention shaders (forward, backward dQ, backward dKV) converted from scalar f32 to `vec4<f32>` operations. Shared memory tiles and register arrays use vec4, inner loops iterate headDim/4 with WGSL `dot()` for score computation and vec4 FMA for accumulation. Also factored out `ds*scale` in dKV to eliminate redundant per-element multiply. Runtime assertion: headDim must be divisible by 4. `fusedAttentionBackward`: 15.5ms→7.0ms (−55%). `fusedAttentionForward`: 5.9ms→2.5ms (−58%). Combined attention: 21.4ms→9.5ms (−56%). Forward GPU: 22.0ms→18.6ms. Backward GPU: 51.2ms→42.7ms. Total GPU: ~78ms→~66ms (−15%).
 
+39. ~~**Subgroup cooperative dot products for attention**~~ — DONE. Assigns 4 threads per row (THREADS_PER_ROW=4) instead of 1, each handling 1/4 of headDim. Dot products reduced across 4 threads via `subgroupShuffleXor` tree reduction (XOR masks 1 and 2). Workgroup size 64→256. Per-thread registers cut ~4× (16 vec4 → 4 vec4 for headDim=64), improving GPU occupancy. All three shaders (forward, dQ, dKV) gain `useSubgroups` parameter. Minimum headDim=64 for subgroup path (small test models use scalar fallback). Pipeline cache key includes `:sg` suffix. `fusedAttentionBackward`: 7.0ms→5.4ms (−23%). `fusedAttentionForward`: 2.5ms→2.5ms (unchanged). Combined attention: ~9.5ms→~7.9ms (−17%). Total GPU: ~66ms→~64ms (−3%).
+
 **Open targets (ranked by estimated savings at 512 tokens):**
-1. **fusedAttentionBackward further tuning** — 7.0ms GPU (10.6%). Max 690µs/dispatch, 24 dispatches. Vec4 applied. BQ_BW=32 experimentally confirmed to regress even with vec4 (7.0ms → 9.0ms, +29%): global L/D reads cost more than halved barrier count saves. Two remaining algorithmic approaches:
-   - **Subgroup cooperative dot products** (~20-40% potential): Instead of each thread computing a full headDim=64 dot product (16 vec4 dot-accumulates), assign a subgroup (32 threads) per Q-KV pair. Each thread handles 2 elements, `subgroupAdd` reduces. 32× fewer ops/thread for score/dov. Changes parallelism from "thread per row" to "subgroup per row". Requires `subgroups` feature (supported on this GPU).
+1. **fusedAttentionBackward further tuning** — 5.4ms GPU (8.4%). Max ~540µs/dispatch, 24 dispatches. Vec4 + subgroup cooperative dots applied. BQ_BW=32 experimentally confirmed to regress even with vec4 (7.0ms → 9.0ms, +29%): global L/D reads cost more than halved barrier count saves. One remaining algorithmic approach:
    - **Fused single-pass dQ+dKV** (~30-50% potential): Current two passes each read full attention data. FlashAttention-2 style: single kernel reads Q,K,V,dO once, workgroup owns KV block, loops over Q tiles, accumulates dK/dV in registers while writing dQ via atomics or reduction pass. Halves global memory bandwidth. Complex to implement (inter-workgroup dQ accumulation).
 2. **GC pressure** — Object pooling for Tensor metadata.
 3. **Pipeline cache warmup** — Step 0 is 3.4s (68× steady-state) due to pipeline compilation. Pre-compile pipeline variants during model load.
