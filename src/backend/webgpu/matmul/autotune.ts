@@ -116,22 +116,40 @@ export function getDefaultConfigForShape(
         tileK: 16,
       };
 
+    case "large_k":
+      // Large K dimension (e.g. lm_head backward dX: M=512, N=768, K=50304)
+      // Maximize tile size for arithmetic intensity; 16KB shared memory
+      return {
+        ...DEFAULT_CONFIG,
+        tileM: 128,
+        tileN: 128,
+        tileK: 16,
+        threadTileM: 8,
+        threadTileN: 8,
+      };
+
     case "tall_skinny":
-      // Tall matrices - favor M dimension
+      // Tall matrices (e.g. lm_head backward dW: M=50304, N=768, K=512)
+      // Large output tile with tileK=8 for better occupancy; 256 threads
       return {
         ...DEFAULT_CONFIG,
         tileM: 64,
-        tileN: 32,
-        tileK: 16,
+        tileN: 128,
+        tileK: 8,
+        threadTileM: 8,
+        threadTileN: 4,
       };
 
     case "short_wide":
-      // Wide matrices - favor N dimension
+      // Wide matrices (e.g. lm_head: M=512, N=50304, K=768)
+      // Large output tile with tileK=8 for better occupancy; 256 threads
       return {
         ...DEFAULT_CONFIG,
-        tileM: 32,
-        tileN: 64,
-        tileK: 16,
+        tileM: 64,
+        tileN: 128,
+        tileK: 8,
+        threadTileM: 8,
+        threadTileN: 4,
       };
 
     case "small_k":
