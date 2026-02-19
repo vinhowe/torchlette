@@ -17,6 +17,7 @@ export {
   cacheTuningResult,
   clearTuningCache,
   exportTuningCache,
+  generateNeighborConfigs,
   generateTuningConfigs,
   getCachedTuningResult,
   getDefaultConfigForShape,
@@ -37,6 +38,7 @@ export {
 export {
   // Dispatch functions
   clearDispatchTuningCache,
+  clearPerShapeTuningCache,
   clearPipelineCache,
   computeBatchSize,
   computeBatchStrides,

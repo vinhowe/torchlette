@@ -30,7 +30,7 @@ import {
   type ShapeClass,
   validateConfig,
 } from "./types";
-import { getDefaultConfigForShape } from "./autotune";
+import { getDefaultConfigForShape, generateNeighborConfigs } from "./autotune";
 import { autotune, type BenchmarkFn, cacheTuningResult } from "./autotune";
 
 // GPU types (matching index.ts)
@@ -101,6 +101,23 @@ const pipelineCache = new Map<string, GPUComputePipeline>();
 const tuningCache = new Map<string, MatmulKernelConfig>();
 
 /**
+ * Per-shape tuning cache: exact (M,N,K,dtype) → best config.
+ * Used for bare matmuls only (epilogue matmuls use shape-class defaults).
+ */
+const perShapeTuningCache = new Map<string, MatmulKernelConfig>();
+
+function getPerShapeKey(m: number, n: number, k: number, dtype: DType): string {
+  return `${m}_${n}_${k}_${dtype}`;
+}
+
+/**
+ * Clear the per-shape tuning cache.
+ */
+export function clearPerShapeTuningCache(): void {
+  perShapeTuningCache.clear();
+}
+
+/**
  * Global autotune mode counter.
  * When > 0, matmul dispatch will run autotuning for new shapes.
  * Uses a counter to support nested compile regions and lazy execution.
@@ -148,12 +165,22 @@ function getTuningKey(shapeClass: ShapeClass, dtype: DType, hasEpilogue: boolean
 
 /**
  * Get the best kernel config for a shape class (from cache or default).
+ * For bare matmuls, also checks the per-shape tuning cache when M,N,K are provided.
  */
 export function getConfigForShape(
   shapeClass: ShapeClass,
   dtype: DType,
   hasEpilogue: boolean = false,
+  m?: number,
+  n?: number,
+  k?: number,
 ): MatmulKernelConfig {
+  // Per-shape cache (bare matmuls only)
+  if (!hasEpilogue && m !== undefined && n !== undefined && k !== undefined) {
+    const perShapeHit = perShapeTuningCache.get(getPerShapeKey(m, n, k, dtype));
+    if (perShapeHit) return perShapeHit;
+  }
+  // Fall through to shape-class cache → defaults
   const key = getTuningKey(shapeClass, dtype, hasEpilogue);
   const cached = tuningCache.get(key);
   if (cached) {
@@ -189,6 +216,84 @@ export function clearDispatchTuningCache(): void {
  *
  * This is called during matmul dispatch when autotune is enabled.
  */
+/**
+ * Self-contained benchmark dispatch that bypasses all shared caching infrastructure
+ * (params sequence, bind group cache, etc.) to avoid polluting model execution state.
+ *
+ * When kSplitFactor >= 2, dispatches the full K-split path: matmul into temp partials
+ * + reduction kernel into output buffer. This ensures the autotuner benchmarks configs
+ * under the same conditions as real execution (K-split eligibility depends on tile size).
+ */
+function benchmarkDispatch(
+  device: GPUDevice,
+  queue: GPUQueue,
+  pipeline: GPUComputePipeline,
+  a: GPUBuffer,
+  b: GPUBuffer,
+  out: GPUBuffer,
+  m: number, n: number, k: number,
+  config: MatmulKernelConfig,
+  paramsBuffer: GPUBuffer,
+  kSplitFactor: number,
+  kSplitTempBuffer?: GPUBuffer,
+  reductionPipeline?: GPUComputePipeline,
+  reduceParamsBuffer?: GPUBuffer,
+): void {
+  const workgroupsX = Math.ceil(n / config.tileN);
+  const workgroupsY = Math.ceil(m / config.tileM);
+
+  if (kSplitFactor >= 2 && kSplitTempBuffer && reductionPipeline && reduceParamsBuffer) {
+    // K-split path: matmul partials + reduction
+    const matmulBG = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: a } },
+        { binding: 1, resource: { buffer: b } },
+        { binding: 2, resource: { buffer: kSplitTempBuffer } },
+        { binding: 3, resource: { buffer: paramsBuffer } },
+      ],
+    });
+    const reduceBG = device.createBindGroup({
+      layout: reductionPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: kSplitTempBuffer } },
+        { binding: 1, resource: { buffer: out } },
+        { binding: 2, resource: { buffer: reduceParamsBuffer } },
+      ],
+    });
+    const encoder = device.createCommandEncoder();
+    const pass1 = (encoder as any).beginComputePass();
+    pass1.setPipeline(pipeline);
+    pass1.setBindGroup(0, matmulBG);
+    pass1.dispatchWorkgroups(workgroupsX, workgroupsY, kSplitFactor);
+    pass1.end();
+    const pass2 = (encoder as any).beginComputePass();
+    pass2.setPipeline(reductionPipeline);
+    pass2.setBindGroup(0, reduceBG);
+    pass2.dispatchWorkgroups(Math.ceil(m * n / 256));
+    pass2.end();
+    queue.submit([(encoder as any).finish()]);
+  } else {
+    // Standard path
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: a } },
+        { binding: 1, resource: { buffer: b } },
+        { binding: 2, resource: { buffer: out } },
+        { binding: 3, resource: { buffer: paramsBuffer } },
+      ],
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = (encoder as any).beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
+    pass.end();
+    queue.submit([(encoder as any).finish()]);
+  }
+}
+
 async function autotuneIfNeeded(
   device: GPUDevice,
   queue: GPUQueue,
@@ -197,114 +302,158 @@ async function autotuneIfNeeded(
   k: number,
   dtype: DType,
 ): Promise<MatmulKernelConfig> {
-  const shapeClass = classifyShape(m, n, k, 1);
-  const key = getTuningKey(shapeClass, dtype);
+  const perShapeKey = getPerShapeKey(m, n, k, dtype);
 
-  // Already have a tuned config
-  const cached = tuningCache.get(key);
-  if (cached) {
-    return cached;
+  // Already have a per-shape tuned config
+  const perShapeCached = perShapeTuningCache.get(perShapeKey);
+  if (perShapeCached) {
+    return perShapeCached;
   }
 
-  // Not in autotune mode - use shape-specific default
-  if (!isAutotuneEnabled()) {
-    return getDefaultConfigForShape(shapeClass);
-  }
-
-  // Prevent recursive autotuning (autotune benchmarks call dispatchTiledMatmul)
-  if (autotuningInProgress.has(key)) {
+  // Prevent recursive autotuning
+  if (autotuningInProgress.has(perShapeKey)) {
     return DEFAULT_CONFIG;
   }
 
-  // Check if subgroups are supported
   const subgroupSupport = getSubgroupSupport();
   const includeSubgroups = subgroupSupport?.supported ?? false;
 
-  // Mark as in progress
-  autotuningInProgress.add(key);
+  autotuningInProgress.add(perShapeKey);
 
   try {
-    // Create benchmark function
-    const benchmarkFn: BenchmarkFn = async (config, warmup, iters) => {
-      // Create test buffers
-      const aSize = m * k * 4;
-      const bSize = k * n * 4;
-      const outSize = m * n * 4;
+    const shapeClass = classifyShape(m, n, k, 1);
+    const baseConfig = getDefaultConfigForShape(shapeClass, false);
+    const candidates = generateNeighborConfigs(baseConfig, includeSubgroups);
+    // Add DEFAULT_CONFIG if not already included
+    const candidateKeys = new Set(candidates.map(c =>
+      `${c.tileM}_${c.tileN}_${c.tileK}_${c.threadTileM}_${c.threadTileN}_${c.vectorWidth}_${c.useSubgroups}`));
+    const defaultKey = `${DEFAULT_CONFIG.tileM}_${DEFAULT_CONFIG.tileN}_${DEFAULT_CONFIG.tileK}_${DEFAULT_CONFIG.threadTileM}_${DEFAULT_CONFIG.threadTileN}_${DEFAULT_CONFIG.vectorWidth}_${DEFAULT_CONFIG.useSubgroups}`;
+    if (!candidateKeys.has(defaultKey)) {
+      candidates.push(DEFAULT_CONFIG);
+    }
 
-      const aBuffer = device.createBuffer({
-        size: aSize,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
-      const bBuffer = device.createBuffer({
-        size: bSize,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
-      const outBuffer = device.createBuffer({
-        size: outSize,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-      });
+    // Create test buffers (reused across all candidates)
+    const aSize = m * k * 4;
+    const bSize = k * n * 4;
+    const outSize = m * n * 4;
+    const aBuffer = device.createBuffer({ size: aSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const bBuffer = device.createBuffer({ size: bSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const outBuffer = device.createBuffer({ size: outSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
 
-      try {
-        // Warmup iterations
-        for (let i = 0; i < warmup; i++) {
-          dispatchTiledMatmulInternal({
-            device,
-            queue,
-            a: aBuffer,
-            b: bBuffer,
-            out: outBuffer,
-            m,
-            n,
-            k,
-            config,
-            dtype,
-          });
-        }
-        await queue.onSubmittedWorkDone();
+    // Create params buffer (shared across all candidates — M,N,K are the same)
+    const lda = k; // NN transpose mode
+    const ldb = n;
+    const ldc = n;
+    const paramsData = packMatmulParams(m, n, k, lda, ldb, ldc, 1.0, 1, m * k, k * n, m * n);
+    const paramsBuffer = device.createBuffer({
+      size: Math.max(paramsData.byteLength, 48),
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    queue.writeBuffer(paramsBuffer, 0, paramsData);
 
-        // Timed iterations
-        const times: number[] = [];
-        for (let i = 0; i < iters; i++) {
-          const start = performance.now();
-          dispatchTiledMatmulInternal({
-            device,
-            queue,
-            a: aBuffer,
-            b: bBuffer,
-            out: outBuffer,
-            m,
-            n,
-            k,
-            config,
-            dtype,
-          });
+    // Pre-compute the max K-split temp buffer needed across all candidates,
+    // and create the reduction params buffer (shared — same totalElements/alpha for all)
+    const totalElements = m * n;
+    let maxKSplitFactor = 0;
+    for (const config of candidates) {
+      const baseWG = Math.ceil(n / config.tileN) * Math.ceil(m / config.tileM);
+      const ksf = computeKSplitFactor(baseWG, k, config.tileK, 1, false);
+      if (ksf > maxKSplitFactor) maxKSplitFactor = ksf;
+    }
+
+    let kSplitTempBuffer: GPUBuffer | undefined;
+    let reduceParamsBuffer: GPUBuffer | undefined;
+    if (maxKSplitFactor >= 2) {
+      const tempBytes = maxKSplitFactor * totalElements * 4;
+      kSplitTempBuffer = device.createBuffer({ size: tempBytes, usage: GPUBufferUsage.STORAGE });
+      const reduceParamsBuf = new ArrayBuffer(8);
+      const reduceU32 = new Uint32Array(reduceParamsBuf);
+      const reduceF32 = new Float32Array(reduceParamsBuf);
+      reduceU32[0] = totalElements;
+      reduceF32[1] = 1.0; // alpha
+      reduceParamsBuffer = device.createBuffer({
+        size: 8,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      queue.writeBuffer(reduceParamsBuffer, 0, reduceU32);
+    }
+
+    const flops = 2 * m * n * k;
+    let bestConfig = baseConfig;
+    let bestGflops = 0;
+
+    try {
+      for (const config of candidates) {
+        try {
+          const transposeMode = getTransposeMode(false, false);
+          const workgroupsX = Math.ceil(n / config.tileN);
+          const workgroupsY = Math.ceil(m / config.tileM);
+          const baseWorkgroups = workgroupsX * workgroupsY;
+          const kSplitFactor = computeKSplitFactor(baseWorkgroups, k, config.tileK, 1, false);
+
+          // Get or create pipeline (uses shared pipeline cache — this is safe,
+          // pipeline cache is content-addressed and doesn't have sequence state)
+          const pipeline = getOrCreatePipeline(device, kSplitFactor >= 2
+            ? { config, transposeMode, dtype, batched: false, kSplit: kSplitFactor }
+            : { config, transposeMode, dtype, batched: false }
+          );
+
+          // Get reduction pipeline if K-split
+          let reductionPipeline: GPUComputePipeline | undefined;
+          if (kSplitFactor >= 2) {
+            reductionPipeline = getOrCreateReductionPipeline(device, kSplitFactor, dtype);
+          }
+
+          // Warmup
+          for (let i = 0; i < 2; i++) {
+            benchmarkDispatch(device, queue, pipeline, aBuffer, bBuffer, outBuffer, m, n, k, config, paramsBuffer,
+              kSplitFactor, kSplitTempBuffer, reductionPipeline, reduceParamsBuffer);
+          }
           await queue.onSubmittedWorkDone();
-          times.push(performance.now() - start);
+
+          // Timed iterations
+          const times: number[] = [];
+          for (let i = 0; i < 3; i++) {
+            const start = performance.now();
+            benchmarkDispatch(device, queue, pipeline, aBuffer, bBuffer, outBuffer, m, n, k, config, paramsBuffer,
+              kSplitFactor, kSplitTempBuffer, reductionPipeline, reduceParamsBuffer);
+            await queue.onSubmittedWorkDone();
+            times.push(performance.now() - start);
+          }
+
+          times.sort((a, b) => a - b);
+          const medianMs = times[Math.floor(times.length / 2)];
+          const gflops = flops / (medianMs * 1e6);
+          if (gflops > bestGflops) {
+            bestGflops = gflops;
+            bestConfig = config;
+          }
+        } catch {
+          // Skip failed configs
         }
-
-        // Return median time
-        times.sort((a, b) => a - b);
-        return times[Math.floor(times.length / 2)];
-      } finally {
-        aBuffer.destroy();
-        bBuffer.destroy();
-        outBuffer.destroy();
       }
-    };
+    } finally {
+      aBuffer.destroy();
+      bBuffer.destroy();
+      outBuffer.destroy();
+      paramsBuffer.destroy();
+      kSplitTempBuffer?.destroy();
+      reduceParamsBuffer?.destroy();
+    }
 
-    // Run autotune
-    const result = await autotune(benchmarkFn, m, n, k, dtype, {
-      maxTrials: 12, // Reasonable trial count for interactive use
-      warmupIters: 2,
-      timingIters: 3,
-    }, includeSubgroups);
+    // Cache the result
+    perShapeTuningCache.set(perShapeKey, bestConfig);
+    cacheTuningResult({
+      config: bestConfig,
+      gflopsPerSec: bestGflops,
+      medianMs: bestGflops > 0 ? flops / (bestGflops * 1e6) : Infinity,
+      shapeClass,
+      dtype,
+    });
 
-    // Cache the result in both caches (dispatch cache for lookups, autotune cache for TuneResult)
-    tuningCache.set(key, result.config);
-    cacheTuningResult(result);
-    return result.config;
+    return bestConfig;
   } finally {
-    autotuningInProgress.delete(key);
+    autotuningInProgress.delete(perShapeKey);
   }
 }
 
@@ -324,18 +473,20 @@ export async function pretuneMatmulShapes(
   shapes: Array<[number, number, number]>,
   dtype: DType = "f32",
 ): Promise<void> {
-  if (!isAutotuneEnabled()) {
+  // Autotuning requires either env var TORCHLETTE_AUTOTUNE=1 or programmatic
+  // setAutotuneEnabled(true) (used by compile({ autotune: true }))
+  const envEnabled = typeof process !== "undefined" && process.env?.TORCHLETTE_AUTOTUNE === "1";
+  if (!envEnabled && !isAutotuneEnabled()) {
     return;
   }
 
-  // Autotune each unique shape
+  // Autotune each unique shape (per-shape key, not per-shape-class)
   const seenKeys = new Set<string>();
   for (const [m, n, k] of shapes) {
-    const shapeClass = classifyShape(m, n, k, 1);
-    const key = getTuningKey(shapeClass, dtype);
+    const key = getPerShapeKey(m, n, k, dtype);
 
     // Skip if already tuned or seen
-    if (tuningCache.has(key) || seenKeys.has(key)) {
+    if (perShapeTuningCache.has(key) || seenKeys.has(key)) {
       continue;
     }
     seenKeys.add(key);
@@ -653,7 +804,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
 
   // Select kernel config (epilogue-aware: bare matmuls use larger thread tiles)
   const shapeClass = classifyShape(m, n, k, batchSize);
-  const config = options.config ?? getConfigForShape(shapeClass, dtype, hasEpilogue);
+  const config = options.config ?? getConfigForShape(shapeClass, dtype, hasEpilogue, m, n, k);
 
   // Validate config
   validateConfig(config);
