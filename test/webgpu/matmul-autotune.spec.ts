@@ -146,6 +146,11 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       expect(classifyShape(512, 8192, 512, 1)).toBe("short_wide");
     });
 
+    it("classifies large-K matrices", () => {
+      expect(classifyShape(512, 768, 50304, 1)).toBe("large_k");
+      expect(classifyShape(256, 256, 4096, 1)).toBe("large_k");
+    });
+
     it("classifies batched small matrices", () => {
       expect(classifyShape(64, 64, 64, 8)).toBe("batched_small");
       expect(classifyShape(128, 128, 128, 4)).toBe("batched_small");
@@ -159,6 +164,7 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       "square_large",
       "tall_skinny",
       "short_wide",
+      "large_k",
       "gemv",
       "batched_small",
     ];
@@ -182,16 +188,27 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       expect(large.tileN).toBeGreaterThanOrEqual(small.tileN);
     });
 
-    it("tall_skinny favors M dimension", () => {
+    it("tall_skinny uses large tiles for arithmetic intensity", () => {
       const tallSkinny = getDefaultConfigForShape("tall_skinny");
 
-      expect(tallSkinny.tileM).toBeGreaterThanOrEqual(tallSkinny.tileN);
+      // Large tiles (64×128) maximize arithmetic intensity for tall matrices
+      // with moderate K (e.g. lm_head backward dW: M=50304, N=768, K=512)
+      expect(tallSkinny.tileM).toBeGreaterThanOrEqual(64);
+      expect(tallSkinny.tileN).toBeGreaterThanOrEqual(64);
     });
 
     it("short_wide favors N dimension", () => {
       const shortWide = getDefaultConfigForShape("short_wide");
 
       expect(shortWide.tileN).toBeGreaterThanOrEqual(shortWide.tileM);
+    });
+
+    it("large_k uses maximum tile size for arithmetic intensity", () => {
+      const largeK = getDefaultConfigForShape("large_k");
+
+      // 128×128 tiles maximize compute-to-memory ratio for large K
+      expect(largeK.tileM).toBe(128);
+      expect(largeK.tileN).toBe(128);
     });
   });
 

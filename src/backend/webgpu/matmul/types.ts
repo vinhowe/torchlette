@@ -65,6 +65,7 @@ export type ShapeClass =
   | "square_large" // M,N,K >= 2048
   | "tall_skinny" // M >> K or M >> N
   | "short_wide" // N >> K or N >> M
+  | "large_k" // K >> M and N (e.g. lm_head backward dX: K=50304)
   | "small_k" // K < 64, large output (e.g. lm_head backward dW)
   | "gemv" // M=1 or N=1
   | "batched_small"; // batch > 1, small matrices
@@ -184,6 +185,13 @@ export function classifyShape(
   // Small-K: K is very small but output is large (e.g. lm_head backward dW: K=seq_len)
   if (k < 64 && m * n > 100000) {
     return "small_k";
+  }
+
+  // Large-K: K is much larger than M and N (e.g. lm_head backward dX: K=50304)
+  // Maximize tile size for arithmetic intensity over parallelism
+  const largeKRatio = k / Math.max(m, n);
+  if (largeKRatio > 4) {
+    return "large_k";
   }
 
   // Tall-skinny: M is much larger than K or N
