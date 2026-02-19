@@ -144,6 +144,7 @@ function getOrCreateConfigBuffer(
  * Output: O [B,H,N,D], L [B,H,N] (logsumexp per row)
  */
 function flashAttentionForwardShader(headDim: number): string {
+  if (headDim % 4 !== 0) throw new Error(`flashAttentionForwardShader requires headDim divisible by 4, got ${headDim}`);
   const HD4 = headDim / 4;
   return `
 struct FAConfig {
@@ -396,6 +397,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
  * Output: dQ [B,H,N,D]
  */
 function flashAttentionBackwardDQShader(headDim: number): string {
+  if (headDim % 4 !== 0) throw new Error(`flashAttentionBackwardDQShader requires headDim divisible by 4, got ${headDim}`);
   const HD4 = headDim / 4;
   return `
 struct FAConfig {
@@ -547,6 +549,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
  * Output: dK [B,H,N,D], dV [B,H,N,D]
  */
 function flashAttentionBackwardDKVShader(headDim: number): string {
+  if (headDim % 4 !== 0) throw new Error(`flashAttentionBackwardDKVShader requires headDim divisible by 4, got ${headDim}`);
   const BC_BW = 64; // KV rows per workgroup for backward
   const HD4 = headDim / 4;
   return `
