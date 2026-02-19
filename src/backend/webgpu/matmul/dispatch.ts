@@ -142,8 +142,8 @@ export function clearPipelineCache(): void {
 /**
  * Get tuning cache key.
  */
-function getTuningKey(shapeClass: ShapeClass, dtype: DType): string {
-  return `${shapeClass}_${dtype}`;
+function getTuningKey(shapeClass: ShapeClass, dtype: DType, hasEpilogue: boolean = false): string {
+  return `${shapeClass}_${dtype}_${hasEpilogue ? "epilogue" : "bare"}`;
 }
 
 /**
@@ -152,13 +152,14 @@ function getTuningKey(shapeClass: ShapeClass, dtype: DType): string {
 export function getConfigForShape(
   shapeClass: ShapeClass,
   dtype: DType,
+  hasEpilogue: boolean = false,
 ): MatmulKernelConfig {
-  const key = getTuningKey(shapeClass, dtype);
+  const key = getTuningKey(shapeClass, dtype, hasEpilogue);
   const cached = tuningCache.get(key);
   if (cached) {
     return cached;
   }
-  return getDefaultConfigForShape(shapeClass);
+  return getDefaultConfigForShape(shapeClass, hasEpilogue);
 }
 
 /**
@@ -168,8 +169,9 @@ export function setTuningResult(
   shapeClass: ShapeClass,
   dtype: DType,
   config: MatmulKernelConfig,
+  hasEpilogue: boolean = false,
 ): void {
-  const key = getTuningKey(shapeClass, dtype);
+  const key = getTuningKey(shapeClass, dtype, hasEpilogue);
   tuningCache.set(key, config);
 }
 
@@ -646,9 +648,12 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
     inputCastB,
   } = options;
 
-  // Select kernel config
+  // Check if epilogue is non-trivial (needed for config selection and K-split)
+  const hasEpilogue = !!epilogue && epilogue.ops.length > 0 && epilogue.ops.some(op => op.kind !== "none");
+
+  // Select kernel config (epilogue-aware: bare matmuls use larger thread tiles)
   const shapeClass = classifyShape(m, n, k, batchSize);
-  const config = options.config ?? getConfigForShape(shapeClass, dtype);
+  const config = options.config ?? getConfigForShape(shapeClass, dtype, hasEpilogue);
 
   // Validate config
   validateConfig(config);
@@ -670,9 +675,6 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
   const workgroupsX = Math.ceil(n / config.tileN);
   const workgroupsY = Math.ceil(m / config.tileM);
   const baseWorkgroups = workgroupsX * workgroupsY;
-
-  // Check if epilogue is non-trivial
-  const hasEpilogue = !!epilogue && epilogue.ops.length > 0 && epilogue.ops.some(op => op.kind !== "none");
 
   // Determine K-split factor
   const kSplitFactor = computeKSplitFactor(baseWorkgroups, k, config.tileK, batchSize, hasEpilogue);

@@ -96,26 +96,47 @@ export function generateTuningConfigs(
  */
 export function getDefaultConfigForShape(
   shapeClass: ShapeClass,
+  hasEpilogue: boolean = false,
 ): MatmulKernelConfig {
   switch (shapeClass) {
     case "square_large":
-      // Large matrices: tileK=8 for better occupancy (half shared memory vs tileK=16)
-      // Keeps t4x4 to avoid register pressure with epilogue fused kernels
-      // Benchmarked on MLP shapes (512x3072x768, 512x768x3072): +12% to +27% vs 64x64x16
+      if (hasEpilogue) {
+        // Epilogue matmuls: t4x4 avoids register pressure from extra per-element ops
+        // Benchmarked: 64x64x8 t4x4 is +50% faster than 64x128x8 t8x4 with epilogue
+        return {
+          ...DEFAULT_CONFIG,
+          tileM: 64,
+          tileN: 64,
+          tileK: 8,
+        };
+      }
+      // Bare matmuls: larger thread tiles (t8x4) give better register reuse
+      // Benchmarked on MLP shapes (512x3072x768, 512x768x3072): +11% to +100% vs t4x4
+      return {
+        ...DEFAULT_CONFIG,
+        tileM: 64,
+        tileN: 128,
+        tileK: 8,
+        threadTileM: 8,
+        threadTileN: 4,
+      };
+
+    case "square_medium":
+      if (hasEpilogue) {
+        // Epilogue matmuls: conservative config to avoid register pressure
+        return {
+          ...DEFAULT_CONFIG,
+          tileM: 32,
+          tileN: 32,
+          tileK: 16,
+        };
+      }
+      // Bare matmuls: step up from 32x32x16 for better throughput
       return {
         ...DEFAULT_CONFIG,
         tileM: 64,
         tileN: 64,
         tileK: 8,
-      };
-
-    case "square_medium":
-      // Medium matrices - balanced config
-      return {
-        ...DEFAULT_CONFIG,
-        tileM: 32,
-        tileN: 32,
-        tileK: 16,
       };
 
     case "large_k":
