@@ -353,6 +353,49 @@ export async function autotune(
 }
 
 /**
+ * Generate neighbor configs around a base config for focused autotuning.
+ * Produces ~10-15 candidates by varying tile dimensions, thread tile sizes,
+ * and optionally subgroup usage around the known-good base config.
+ */
+export function generateNeighborConfigs(
+  baseConfig: MatmulKernelConfig,
+  includeSubgroups: boolean,
+): MatmulKernelConfig[] {
+  const configs: MatmulKernelConfig[] = [baseConfig];
+  const { tileM, tileN, tileK } = baseConfig;
+
+  // Tile dimension neighbors
+  for (const newTileM of [32, 64, 128] as const) {
+    if (newTileM !== tileM) configs.push({ ...baseConfig, tileM: newTileM });
+  }
+  for (const newTileN of [32, 64, 128] as const) {
+    if (newTileN !== tileN) configs.push({ ...baseConfig, tileN: newTileN });
+  }
+  for (const newTileK of [8, 16, 32] as const) {
+    if (newTileK !== tileK) configs.push({ ...baseConfig, tileK: newTileK });
+  }
+  // Thread tile variants
+  for (const [ttm, ttn] of [[4, 4], [8, 4], [4, 8], [8, 8]] as const) {
+    if (ttm !== baseConfig.threadTileM || ttn !== baseConfig.threadTileN) {
+      configs.push({ ...baseConfig, threadTileM: ttm, threadTileN: ttn });
+    }
+  }
+  // Subgroup variant
+  if (includeSubgroups && !baseConfig.useSubgroups) {
+    configs.push({ ...baseConfig, useSubgroups: true });
+  }
+
+  // Validate and deduplicate
+  const seen = new Set<string>();
+  return configs.filter(c => {
+    const key = `${c.tileM}_${c.tileN}_${c.tileK}_${c.threadTileM}_${c.threadTileN}_${c.vectorWidth}_${c.useSubgroups}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    try { validateConfig(c); return true; } catch { return false; }
+  });
+}
+
+/**
  * Quick autotune: try a small subset of representative configs.
  * Faster than full autotune but may not find the absolute best config.
  */
