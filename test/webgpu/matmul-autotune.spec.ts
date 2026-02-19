@@ -210,6 +210,47 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       expect(largeK.tileM).toBe(128);
       expect(largeK.tileN).toBe(128);
     });
+
+    it("square_large bare uses larger thread tiles (t8x4)", () => {
+      const config = getDefaultConfigForShape("square_large", false);
+      expect(config.tileM).toBe(64);
+      expect(config.tileN).toBe(128);
+      expect(config.tileK).toBe(8);
+      expect(config.threadTileM).toBe(8);
+      expect(config.threadTileN).toBe(4);
+    });
+
+    it("square_large epilogue uses smaller thread tiles (t4x4)", () => {
+      const config = getDefaultConfigForShape("square_large", true);
+      expect(config.tileM).toBe(64);
+      expect(config.tileN).toBe(64);
+      expect(config.tileK).toBe(8);
+      expect(config.threadTileM).toBe(4);
+      expect(config.threadTileN).toBe(4);
+    });
+
+    it("square_medium bare uses 64x64x8 config", () => {
+      const config = getDefaultConfigForShape("square_medium", false);
+      expect(config.tileM).toBe(64);
+      expect(config.tileN).toBe(64);
+      expect(config.tileK).toBe(8);
+    });
+
+    it("square_medium epilogue uses 32x32x16 config", () => {
+      const config = getDefaultConfigForShape("square_medium", true);
+      expect(config.tileM).toBe(32);
+      expect(config.tileN).toBe(32);
+      expect(config.tileK).toBe(16);
+    });
+
+    it("other shape classes return same config regardless of hasEpilogue", () => {
+      const otherClasses: ShapeClass[] = ["tall_skinny", "short_wide", "large_k", "gemv", "batched_small", "square_small"];
+      for (const sc of otherClasses) {
+        const bare = getDefaultConfigForShape(sc, false);
+        const epilogue = getDefaultConfigForShape(sc, true);
+        expect(bare).toEqual(epilogue);
+      }
+    });
   });
 
   describe("Tuning Cache", () => {
