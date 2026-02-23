@@ -4815,6 +4815,205 @@ function triu(a: WebGPUTensor, k = 0): WebGPUTensor {
   return triangularOp(a, k, true);
 }
 
+// ============================================================================
+// GPU RNG (PCG32)
+// ============================================================================
+
+const PCG32_WGSL = `
+fn pcg32(state: ptr<function, u32>) -> u32 {
+  let old = *state;
+  *state = old * 747796405u + 2891336453u;
+  let word = ((old >> ((old >> 28u) + 4u)) ^ old) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+
+fn pcg32_init(seed: u32, seq: u32) -> u32 {
+  var state = 0u;
+  state = state * 747796405u + ((seq << 1u) | 1u);
+  state = state + seed;
+  state = state * 747796405u + ((seq << 1u) | 1u);
+  return state;
+}
+`;
+
+function randShader(gridSizeX: number): string {
+  const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
+  const idxCompute = use2D
+    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
+    : `let idx = gid.x;`;
+  return `
+${PCG32_WGSL}
+
+struct Params {
+  size: u32,
+  seed: u32,
+};
+
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  ${idxCompute}
+  if (idx >= params.size) { return; }
+  var state = pcg32_init(params.seed, idx);
+  let bits = pcg32(&state);
+  out[idx] = f32(bits) / 4294967296.0;
+}
+`;
+}
+
+function randnShader(gridSizeX: number): string {
+  const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
+  const idxCompute = use2D
+    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
+    : `let idx = gid.x;`;
+  return `
+${PCG32_WGSL}
+
+const PI: f32 = 3.14159265358979323846;
+
+struct Params {
+  size: u32,
+  seed: u32,
+};
+
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  ${idxCompute}
+  // Process pairs: thread idx handles element idx*2 and idx*2+1
+  let outIdx = idx * 2u;
+  if (outIdx >= params.size) { return; }
+  var state = pcg32_init(params.seed, idx);
+  let bits1 = pcg32(&state);
+  let bits2 = pcg32(&state);
+  // Map to (0, 1] to avoid log(0)
+  let u1 = (f32(bits1) + 1.0) / 4294967297.0;
+  let u2 = f32(bits2) / 4294967296.0;
+  let r = sqrt(-2.0 * log(u1));
+  let theta = 2.0 * PI * u2;
+  out[outIdx] = r * cos(theta);
+  if (outIdx + 1u < params.size) {
+    out[outIdx + 1u] = r * sin(theta);
+  }
+}
+`;
+}
+
+function bernoulliShader(gridSizeX: number): string {
+  const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
+  const idxCompute = use2D
+    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
+    : `let idx = gid.x;`;
+  return `
+${PCG32_WGSL}
+
+struct Params {
+  size: u32,
+  seed: u32,
+  prob: f32,
+};
+
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  ${idxCompute}
+  if (idx >= params.size) { return; }
+  var state = pcg32_init(params.seed, idx);
+  let bits = pcg32(&state);
+  let u = f32(bits) / 4294967296.0;
+  out[idx] = select(0.0, 1.0, u < params.prob);
+}
+`;
+}
+
+function rand(shape: number[], seed: number): WebGPUTensor {
+  const ctx = requireContext();
+  const numElements = sizeOf(shape);
+  if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
+
+  const sizeBytes = numElements * 4;
+  const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
+  const { x: dispatchX, y: dispatchY, gridSizeX } = compute2DDispatch(totalWorkgroups);
+
+  const shaderKey = `rand_${gridSizeX}`;
+  const pipeline = getPipeline(ctx, shaderKey, randShader(gridSizeX));
+
+  const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
+
+  const paramsData = new Uint32Array(2);
+  paramsData[0] = numElements;
+  paramsData[1] = seed >>> 0;
+  const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
+
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [outBuffer, paramsBuffer]);
+  dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
+  releaseParamsBuffer(paramsBuffer);
+
+  return createTensor(shape, outBuffer, undefined, 0, "f32");
+}
+
+function randn(shape: number[], seed: number): WebGPUTensor {
+  const ctx = requireContext();
+  const numElements = sizeOf(shape);
+  if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
+
+  const sizeBytes = numElements * 4;
+  // randn processes pairs, so dispatch half the threads (rounded up)
+  const numThreads = Math.ceil(numElements / 2);
+  const totalWorkgroups = Math.ceil(numThreads / WORKGROUP_SIZE);
+  const { x: dispatchX, y: dispatchY, gridSizeX } = compute2DDispatch(totalWorkgroups);
+
+  const shaderKey = `randn_${gridSizeX}`;
+  const pipeline = getPipeline(ctx, shaderKey, randnShader(gridSizeX));
+
+  const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
+
+  const paramsData = new Uint32Array(2);
+  paramsData[0] = numElements;
+  paramsData[1] = seed >>> 0;
+  const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
+
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [outBuffer, paramsBuffer]);
+  dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
+  releaseParamsBuffer(paramsBuffer);
+
+  return createTensor(shape, outBuffer, undefined, 0, "f32");
+}
+
+function bernoulli(shape: number[], p: number, seed: number): WebGPUTensor {
+  const ctx = requireContext();
+  const numElements = sizeOf(shape);
+  if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
+
+  const sizeBytes = numElements * 4;
+  const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
+  const { x: dispatchX, y: dispatchY, gridSizeX } = compute2DDispatch(totalWorkgroups);
+
+  const shaderKey = `bernoulli_${gridSizeX}`;
+  const pipeline = getPipeline(ctx, shaderKey, bernoulliShader(gridSizeX));
+
+  const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
+
+  // Params: [size as u32, seed as u32, prob as f32]  — 3 words, padded to 4 for alignment
+  const paramsData = new Uint32Array(4);
+  paramsData[0] = numElements;
+  paramsData[1] = seed >>> 0;
+  new Float32Array(paramsData.buffer, 8, 1)[0] = p;
+  const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
+
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [outBuffer, paramsBuffer]);
+  dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
+  releaseParamsBuffer(paramsBuffer);
+
+  return createTensor(shape, outBuffer, undefined, 0, "f32");
+}
+
 /**
  * Create a tensor from an array with a specific dtype.
  * Supports f32 (default), i32, u32, and f16 (if device supports shader-f16).
@@ -10569,6 +10768,9 @@ export const webgpuBackend: Backend & {
     arange,
     tril,
     triu,
+    rand,
+    randn,
+    bernoulli,
     add,
     sub,
     div,

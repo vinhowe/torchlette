@@ -1076,6 +1076,52 @@ export async function executePlan(
         break;
       }
 
+      case "rand": {
+        const randPayload = node.payload as { seed: number };
+        if (nodeBackend.ops.rand) {
+          resultTensor = nodeBackend.ops.rand(node.shape, randPayload.seed);
+        } else {
+          const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+          const vals = new Array(n);
+          for (let i = 0; i < n; i++) vals[i] = Math.random();
+          resultTensor = nodeBackend.ops.tensorFromArray(vals, node.shape);
+        }
+        break;
+      }
+
+      case "randn": {
+        const randnPayload = node.payload as { seed: number };
+        if (nodeBackend.ops.randn) {
+          resultTensor = nodeBackend.ops.randn(node.shape, randnPayload.seed);
+        } else {
+          const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+          const vals = new Array(n);
+          for (let i = 0; i < n; i += 2) {
+            const u1 = Math.random();
+            const u2 = Math.random();
+            const r = Math.sqrt(-2 * Math.log(u1 || 1e-10));
+            const theta = 2 * Math.PI * u2;
+            vals[i] = r * Math.cos(theta);
+            if (i + 1 < n) vals[i + 1] = r * Math.sin(theta);
+          }
+          resultTensor = nodeBackend.ops.tensorFromArray(vals, node.shape);
+        }
+        break;
+      }
+
+      case "bernoulli": {
+        const bernPayload = node.payload as { seed: number; p: number };
+        if (nodeBackend.ops.bernoulli) {
+          resultTensor = nodeBackend.ops.bernoulli(node.shape, bernPayload.p, bernPayload.seed);
+        } else {
+          const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+          const vals = new Array(n);
+          for (let i = 0; i < n; i++) vals[i] = Math.random() < bernPayload.p ? 1 : 0;
+          resultTensor = nodeBackend.ops.tensorFromArray(vals, node.shape);
+        }
+        break;
+      }
+
       case "add":
         resultTensor = nodeBackend.ops.add(backendInputs[0], backendInputs[1]);
         break;
@@ -1972,6 +2018,38 @@ async function executeOpInternal(
     case "triu": {
       if (!nodeBackend.ops.triu) throw new Error("triu not supported by backend");
       return nodeBackend.ops.triu(backendInputs[0], (node.payload as { k: number })?.k ?? 0);
+    }
+
+    case "rand": {
+      const rp = node.payload as { seed: number };
+      if (nodeBackend.ops.rand) return nodeBackend.ops.rand(node.shape, rp.seed);
+      const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const vals = new Array(n);
+      for (let i = 0; i < n; i++) vals[i] = Math.random();
+      return nodeBackend.ops.tensorFromArray(vals, node.shape);
+    }
+
+    case "randn": {
+      const rp = node.payload as { seed: number };
+      if (nodeBackend.ops.randn) return nodeBackend.ops.randn(node.shape, rp.seed);
+      const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const vals = new Array(n);
+      for (let i = 0; i < n; i += 2) {
+        const u1 = Math.random(), u2 = Math.random();
+        const r = Math.sqrt(-2 * Math.log(u1 || 1e-10)), theta = 2 * Math.PI * u2;
+        vals[i] = r * Math.cos(theta);
+        if (i + 1 < n) vals[i + 1] = r * Math.sin(theta);
+      }
+      return nodeBackend.ops.tensorFromArray(vals, node.shape);
+    }
+
+    case "bernoulli": {
+      const bp = node.payload as { seed: number; p: number };
+      if (nodeBackend.ops.bernoulli) return nodeBackend.ops.bernoulli(node.shape, bp.p, bp.seed);
+      const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const vals = new Array(n);
+      for (let i = 0; i < n; i++) vals[i] = Math.random() < bp.p ? 1 : 0;
+      return nodeBackend.ops.tensorFromArray(vals, node.shape);
     }
 
     case "add":
@@ -5332,7 +5410,7 @@ async function executeReductionWithPreamble(
     // Divide by reduction size using backend mul with scalar (1/reductionSize)
     const invSize = 1.0 / reductionSize;
     const sumResult = resultTensor;
-    const invSizeTensor = backend.ops.tensorFromArray([invSize], []);
+    const invSizeTensor = backend.ops.full ? backend.ops.full([], invSize) : backend.ops.tensorFromArray([invSize], []);
     resultTensor = backend.ops.mul(sumResult, invSizeTensor);
     // Destroy intermediate backend tensors (sum output + scalar) to prevent buffer leak
     (sumResult as { destroy?: () => void }).destroy?.();
@@ -5399,6 +5477,38 @@ async function executeOp(
     case "triu": {
       if (!backend.ops.triu) throw new Error("triu not supported by backend");
       return backend.ops.triu(backendInputs[0], (node.payload as { k: number })?.k ?? 0);
+    }
+
+    case "rand": {
+      const rp = node.payload as { seed: number };
+      if (backend.ops.rand) return backend.ops.rand(node.shape, rp.seed);
+      const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const vals = new Array(n);
+      for (let i = 0; i < n; i++) vals[i] = Math.random();
+      return backend.ops.tensorFromArray(vals, node.shape);
+    }
+
+    case "randn": {
+      const rp = node.payload as { seed: number };
+      if (backend.ops.randn) return backend.ops.randn(node.shape, rp.seed);
+      const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const vals = new Array(n);
+      for (let i = 0; i < n; i += 2) {
+        const u1 = Math.random(), u2 = Math.random();
+        const r = Math.sqrt(-2 * Math.log(u1 || 1e-10)), theta = 2 * Math.PI * u2;
+        vals[i] = r * Math.cos(theta);
+        if (i + 1 < n) vals[i + 1] = r * Math.sin(theta);
+      }
+      return backend.ops.tensorFromArray(vals, node.shape);
+    }
+
+    case "bernoulli": {
+      const bp = node.payload as { seed: number; p: number };
+      if (backend.ops.bernoulli) return backend.ops.bernoulli(node.shape, bp.p, bp.seed);
+      const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const vals = new Array(n);
+      for (let i = 0; i < n; i++) vals[i] = Math.random() < bp.p ? 1 : 0;
+      return backend.ops.tensorFromArray(vals, node.shape);
     }
 
     case "add":
