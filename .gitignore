@@ -34,3 +34,5 @@ start-vin-gpu.sh
 # CPU profiler output
 CPU.*.cpuprofile
 *.cpuprofile
+
+.claude/worktrees/
