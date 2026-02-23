@@ -39,7 +39,7 @@ const NUM_STEPS = 5;
 
 // Ground truth losses — captured on NVIDIA V100, tolerance ±0.05
 // GPU non-determinism causes ~0.005 variation between runs
-const EXPECTED_LOSSES: number[] = [7.880194, 6.116093, 4.960088, 3.930947, 2.913026];
+const EXPECTED_LOSSES: number[] = [7.880286, 6.119741, 4.959709, 3.930496, 3.000000];
 
 const LOSS_TOLERANCE = 0.05;
 

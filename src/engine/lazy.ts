@@ -19,6 +19,11 @@ import {
   setAdamBatchMode,
   setActiveArena,
   clearActiveArena,
+  setArenaExternalInputBuffers,
+  clearArenaExternalInputBuffers,
+  getArenaConflictDetected,
+  clearArenaConflictDetected,
+  hasArenaExternalConflicts,
   type BufferArena,
   startDispatchRecording,
   stopDispatchRecording,
@@ -1008,7 +1013,7 @@ export async function executePlan(
 
     switch (node.op) {
       case "tensorFromArray": {
-        const payload = node.payload as { values: number[] } | undefined;
+        const payload = node.payload as { values: number[] | Float32Array } | undefined;
         if (!payload?.values) {
           throw new Error("tensorFromArray requires values in payload");
         }
@@ -1975,7 +1980,7 @@ async function executeOpInternal(
   try {
   switch (node.op) {
     case "tensorFromArray": {
-      const payload = node.payload as { values: number[] } | undefined;
+      const payload = node.payload as { values: number[] | Float32Array } | undefined;
       if (!payload?.values) {
         throw new Error("tensorFromArray requires values in payload");
       }
@@ -3062,6 +3067,20 @@ export async function executePlanOptimized(
     && process.env.TORCHLETTE_USE_ARENA !== "0";
   if (useArenaFallback) {
     setActiveArena(cachedTemplate!.bufferArena!);
+    // Register external input buffers for arena conflict detection
+    const extBufs: any[] = [];
+    for (const node of planNodes) {
+      for (const ref of node.inputs) {
+        if (ref.kind === "materialized") {
+          const buf = (ref.storage.backendTensor as any).buffer;
+          if (buf) extBufs.push(buf);
+        } else if (ref.kind === "pending" && ref.node.result) {
+          const buf = (ref.node.result.backendTensor as any).buffer;
+          if (buf) extBufs.push(buf);
+        }
+      }
+    }
+    setArenaExternalInputBuffers(extBufs);
   }
 
   try {
@@ -3184,6 +3203,7 @@ export async function executePlanOptimized(
   } finally {
     if (useArenaFallback) {
       clearActiveArena();
+      clearArenaExternalInputBuffers();
     }
     if (useTopLevelSharedEncoder) {
       endSharedEncoder();
@@ -3280,10 +3300,52 @@ export async function executeLoweredPlan(
   // replay recorded GPU dispatches directly. Only data sources, view ops, and
   // encoder-copy ops (scatterAdd) are re-executed (their data or encoder
   // commands change per step).
+  // Pre-check: collect external input buffers for arena conflict detection.
+  // If any arena buffer matches an external input, replay bind groups are stale
+  // (they reference the old buffer). We must skip replay and use normal execution
+  // which replaces the conflicting arena slot with a fresh buffer.
+  let extInputBufSet: Set<GPUBuffer> | null = null;
+  if (useReplayCache && loweredPlan.dispatchCache?.valid && options.bufferArena) {
+    extInputBufSet = new Set<GPUBuffer>();
+    for (const node of planNodes) {
+      for (const ref of node.inputs) {
+        if (ref.kind === "materialized") {
+          const buf = (ref.storage.backendTensor as any)?.buffer;
+          if (buf) extInputBufSet.add(buf);
+        } else if (ref.kind === "pending" && ref.node.result) {
+          const buf = (ref.node.result.backendTensor as any)?.buffer;
+          if (buf) extInputBufSet.add(buf);
+        }
+      }
+    }
+    if (hasArenaExternalConflicts(options.bufferArena, extInputBufSet)) {
+      // Arena buffers conflict with external inputs — invalidate replay cache.
+      // Normal execution path will replace the conflicting arena slots.
+      loweredPlan.dispatchCache.valid = false;
+    }
+  }
+
   if (useReplayCache && loweredPlan.dispatchCache?.valid && useTopLevelSharedEncoder && options.bufferArena) {
     const cache = loweredPlan.dispatchCache;
     if (useTopLevelSharedEncoder) beginSharedEncoder();
     setActiveArena(options.bufferArena);
+
+    // Register external input buffers for arena conflict detection
+    {
+      const extBufs: any[] = [];
+      for (const node of planNodes) {
+        for (const ref of node.inputs) {
+          if (ref.kind === "materialized") {
+            const buf = (ref.storage.backendTensor as any).buffer;
+            if (buf) extBufs.push(buf);
+          } else if (ref.kind === "pending" && ref.node.result) {
+            const buf = (ref.node.result.backendTensor as any).buffer;
+            if (buf) extBufs.push(buf);
+          }
+        }
+      }
+      setArenaExternalInputBuffers(extBufs);
+    }
 
     // Compute stats from lowered plan structure (same as normal path would)
     for (const act of loweredPlan.actions) {
@@ -3528,6 +3590,7 @@ export async function executeLoweredPlan(
       flushDispatchBatch(); // Flush remaining batched dispatches
     } finally {
       clearActiveArena();
+      clearArenaExternalInputBuffers();
       const _tEndT0 = _replayTiming ? performance.now() : 0;
       if (useTopLevelSharedEncoder) endSharedEncoder();
       const _tEnd = _replayTiming ? performance.now() - _tEndT0 : 0;
@@ -3556,6 +3619,28 @@ export async function executeLoweredPlan(
   // Activate buffer arena for this plan (stabilizes buffer identities for bind group cache)
   if (options.bufferArena && useTopLevelSharedEncoder) {
     setActiveArena(options.bufferArena);
+  }
+
+  // Register external input buffers so the arena can detect conflicts.
+  // When the same template is reused (e.g., same transformer block structure
+  // across layers), the previous execution's output arena buffer becomes the
+  // next execution's external input. Without this, the arena would return the
+  // same buffer for both reading (external input) and writing (fused output),
+  // causing data corruption.
+  if (options.bufferArena && useTopLevelSharedEncoder) {
+    const extBufs: any[] = [];
+    for (const node of planNodes) {
+      for (const ref of node.inputs) {
+        if (ref.kind === "materialized") {
+          const buf = (ref.storage.backendTensor as any).buffer;
+          if (buf) extBufs.push(buf);
+        } else if (ref.kind === "pending" && ref.node.result) {
+          const buf = (ref.node.result.backendTensor as any).buffer;
+          if (buf) extBufs.push(buf);
+        }
+      }
+    }
+    setArenaExternalInputBuffers(extBufs);
   }
 
   // Set up dispatch recording if we have an arena (needed for stable bind groups)
@@ -4219,17 +4304,34 @@ export async function executeLoweredPlan(
       // Multiple plans accumulate into the same global set.
       addReplayPinnedBuffers(pinnedBuffers);
 
-      // Build and store the dispatch replay cache
-      loweredPlan.dispatchCache = {
-        entries: replayEntries,
-        valid: true,
-        pinnedBuffers,
-      };
+      // Build and store the dispatch replay cache — but only if no arena
+      // conflicts were detected. Conflicts mean bind groups reference replaced
+      // buffers and cannot be replayed safely.
+      if (getArenaConflictDetected()) {
+        // Don't cache — bind groups reference stale (replaced) arena buffers
+        clearArenaConflictDetected();
+      } else {
+        loweredPlan.dispatchCache = {
+          entries: replayEntries,
+          valid: true,
+          pinnedBuffers,
+        };
+      }
+    }
+
+    // If arena conflicts were detected during non-recording execution,
+    // invalidate any existing dispatch cache.
+    if (getArenaConflictDetected()) {
+      if (loweredPlan.dispatchCache) {
+        loweredPlan.dispatchCache.valid = false;
+      }
+      clearArenaConflictDetected();
     }
 
     // Deactivate buffer arena before closing encoder
     if (options.bufferArena && useTopLevelSharedEncoder) {
       clearActiveArena();
+      clearArenaExternalInputBuffers();
     }
     if (useTopLevelSharedEncoder) {
       endSharedEncoder();
@@ -5434,7 +5536,7 @@ async function executeOp(
   try {
   switch (node.op) {
     case "tensorFromArray": {
-      const payload = node.payload as { values: number[] } | undefined;
+      const payload = node.payload as { values: number[] | Float32Array } | undefined;
       if (!payload?.values) {
         throw new Error("tensorFromArray requires values in payload");
       }
