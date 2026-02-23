@@ -1,5 +1,5 @@
 /**
- * Comprehensive GPU Training Profiler for DistilGPT-2
+ * Comprehensive GPU Training Profiler for GPT-2 models
  *
  * Runs training steps with full profiling instrumentation:
  * - Per-phase GPU timing (forward/backward/optimizer/cleanup)
@@ -10,6 +10,11 @@
  *
  * Usage:
  *   TORCHLETTE_PROFILE=1 npx tsx tools/profile-training.ts
+ *
+ * Environment variables:
+ *   TORCHLETTE_MODEL=gpt2|distilgpt2  (default: distilgpt2)
+ *   TORCHLETTE_BATCH_SIZE=N            (default: 1)
+ *   TORCHLETTE_SEQ_LEN=N              (default: 512)
  */
 
 import * as path from "node:path";
@@ -40,7 +45,7 @@ import {
 } from "../src/backend/webgpu";
 import { getAndResetFlowCounters, getGPUAllocationHistogram } from "../src/backend/webgpu/memory-tracker";
 import { storageTracker } from "../src/engine/lazy";
-import { GPT2, type GPT2Config, DISTILGPT2_CONFIG } from "../examples/gpt2/model";
+import { GPT2, type GPT2Config, DISTILGPT2_CONFIG, GPT2_SMALL_CONFIG } from "../examples/gpt2/model";
 import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
 import { Adam, GradScaler } from "../src/optim";
 import { crossEntropy, checkpoint } from "../src/nn";
@@ -52,6 +57,12 @@ import { crossEntropy, checkpoint } from "../src/nn";
 const NUM_STEPS = 5;
 const PROFILE_STEP = 4; // Which step to analyze in detail (steady-state)
 const BATCH_SIZE = parseInt(process.env.TORCHLETTE_BATCH_SIZE ?? "1", 10);
+const MODEL_NAME = process.env.TORCHLETTE_MODEL ?? "distilgpt2";
+const MODEL_CONFIG = MODEL_NAME === "gpt2" ? GPT2_SMALL_CONFIG : DISTILGPT2_CONFIG;
+const MODEL_DIR_NAME = MODEL_NAME === "gpt2" ? "gpt2" : "distilgpt2";
+const MODEL_LABEL = MODEL_NAME === "gpt2"
+  ? "GPT-2 Small (12 layers, 12 heads, 768 dim, 124M params)"
+  : "DistilGPT-2 (6 layers, 12 heads, 768 dim, 81M params)";
 
 // Shakespeare sonnets tokens — tiled to seq_len+1 for seq_len=512 profiling
 const BASE_TOKENS: number[] = [
@@ -199,7 +210,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log("=== DistilGPT-2 Training Profiler ===\n");
+  console.log(`=== ${MODEL_LABEL} Training Profiler ===\n`);
 
   // Initialize
   const gpuOk = await initWebGPU();
@@ -215,8 +226,8 @@ async function main() {
   });
 
   // Load model
-  console.log("Loading model...");
-  const modelDir = path.join(process.cwd(), "models", "distilgpt2");
+  console.log(`Loading model (${MODEL_NAME})...`);
+  const modelDir = path.join(process.cwd(), "models", MODEL_DIR_NAME);
   const model = await loadPretrainedGPT2(api, modelDir, { dropoutRate: 0.0 }, { device: "webgpu" });
   model.train();
   console.log("Model loaded.\n");
