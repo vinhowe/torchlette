@@ -3159,9 +3159,9 @@ export async function executeLoweredPlan(
   planNodes: LazyIRNode[],
   loweredPlan: LoweredPlan,
   backend: Backend,
-  options: { enableEarlyRelease?: boolean; enableVectorization?: boolean; bufferArena?: BufferArena } = {},
+  options: { enableEarlyRelease?: boolean; enableVectorization?: boolean; bufferArena?: BufferArena; enableReplay?: boolean } = {},
 ): Promise<OptimizedExecutionResult> {
-  const { enableEarlyRelease = false, enableVectorization = true } = options;
+  const { enableEarlyRelease = false, enableVectorization = true, enableReplay = true } = options;
 
   // Validate plan node count matches
   if (planNodes.length !== loweredPlan.planNodeCount) {
@@ -3188,13 +3188,12 @@ export async function executeLoweredPlan(
   };
 
   const useTopLevelSharedEncoder = backend.name === "webgpu";
-  // Dispatch replay cache: enabled by default. Arena stabilizes storage buffer
-  // identities; replay pinning prevents buffer destruction between steps.
-  // Arena counter sync ensures data-source re-executions write to the correct
-  // arena buffers. Disable with TORCHLETTE_DISPATCH_REPLAY=0.
-  // GPU timestamp profiling works during replay: recorded dispatches carry
-  // label/module metadata, and replayDispatches() attaches timestampWrites.
-  const useReplayCache = process.env.TORCHLETTE_DISPATCH_REPLAY !== "0";
+  // Dispatch replay cache: enabled by default for compiled plans where arena
+  // stabilizes buffer identities. Disabled for non-compiled plans (backward,
+  // optimizer) whose external inputs (saved-for-backward tensors, gradient
+  // seeds) may not have stable buffer identities across steps.
+  // Disable globally with TORCHLETTE_DISPATCH_REPLAY=0.
+  const useReplayCache = enableReplay && process.env.TORCHLETTE_DISPATCH_REPLAY !== "0";
 
   // =========================================================================
   // FAST PATH: Dispatch Replay
