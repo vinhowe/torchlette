@@ -968,7 +968,7 @@ export class Torchlette {
   }
 
   tensorFromArray(
-    values: number[],
+    values: number[] | Float32Array,
     shape: number[],
     options?: TensorCreateOptions,
   ): Tensor {
