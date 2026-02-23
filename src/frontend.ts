@@ -1354,36 +1354,51 @@ export class Torchlette {
 
     const inputShape = input.shape;
     const weightShape = weight.shape;
+    const needsInputGrad = input.requiresGrad;
+    const needsWeightGrad = weight.requiresGrad;
     const allInputs = bias ? [input, weight, bias] : [input, weight];
-    const tensorsToSave = (input.requiresGrad || weight.requiresGrad)
-      ? (bias ? [castInput, castWeight, bias] : [castInput, castWeight]) : [];
+    // Save only what's needed: weight for dX, input for dW, bias for dBias
+    const toSave: Tensor[] = [];
+    if (needsInputGrad || needsWeightGrad) {
+      if (needsInputGrad) toSave.push(castWeight); // saved[0] = weight (for dX)
+      if (needsWeightGrad) toSave.push(castInput);  // saved[1 or 0] = input (for dW)
+      if (bias) toSave.push(bias);
+    }
 
     return this.wrapWithGrad(inner, allInputs, (grad, getSaved) => {
       if (inputShape.length < 2 || weightShape.length < 2)
         throw new Error("linear backward requires rank >= 2");
-      const savedInput = getSaved(0)._unwrap();
-      const savedWeight = getSaved(1)._unwrap();
 
+      let savedIdx = 0;
       // dX = dY @ W  (weight is [out, in], so dY @ W = [..., out] @ [out, in] = [..., in])
-      const gradInput = this.runtime.matmul(grad, savedWeight);
-      const resultInput = this.sumToShape(gradInput, inputShape);
+      let resultInput: RuntimeTensor | null = null;
+      if (needsInputGrad) {
+        const savedWeight = getSaved(savedIdx++)._unwrap();
+        const gradInput = this.runtime.matmul(grad, savedWeight);
+        resultInput = this.sumToShape(gradInput, inputShape);
+      }
 
       // dW = dY^T @ X → [out, in] = weight's shape directly (no transpose needed!)
-      const gradT = this.runtime.transpose(grad, {
-        dim0: grad.shape.length - 2, dim1: grad.shape.length - 1,
-      });
-      const gradWeight = this.runtime.matmul(gradT, savedInput);
-      const resultWeight = this.sumToShape(gradWeight, weightShape);
+      // Skipped when weight doesn't require grad (e.g. detached weight).
+      let resultWeight: RuntimeTensor | null = null;
+      if (needsWeightGrad) {
+        const savedInput = getSaved(savedIdx++)._unwrap();
+        const gradT = this.runtime.transpose(grad, {
+          dim0: grad.shape.length - 2, dim1: grad.shape.length - 1,
+        });
+        const gradWeight = this.runtime.matmul(gradT, savedInput);
+        resultWeight = this.sumToShape(gradWeight, weightShape);
+      }
 
       // dBias = sum(dY, all dims except last)
       let resultBias: RuntimeTensor | null = null;
       if (bias) {
-        const biasShape = getSaved(2).shape;
+        const biasShape = getSaved(savedIdx).shape;
         resultBias = this.sumToShape(grad, biasShape);
       }
 
       return bias ? [resultInput, resultWeight, resultBias!] : [resultInput, resultWeight];
-    }, tensorsToSave);
+    }, toSave);
   }
 
   sqrt(a: Tensor): Tensor {
