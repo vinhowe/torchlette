@@ -186,12 +186,6 @@ export function isMaterialized(
   return ref.kind === "materialized";
 }
 
-export function isScalarRef(
-  ref: LazyRef,
-): ref is { kind: "scalar"; value: number; dtype: DType } {
-  return ref.kind === "scalar";
-}
-
 export interface ExecutionPlan {
   nodes: LazyIRNode[];
 }
@@ -377,9 +371,6 @@ export function createLazyIRNode(
   if (mod !== "unknown") node.module = mod;
   return node;
 }
-
-/** @deprecated use createLazyIRNode */
-export const createIRNode = createLazyIRNode;
 
 let nextStorageId = 1;
 

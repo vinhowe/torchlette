@@ -805,10 +805,6 @@ export class Torchlette {
     this.runtime.setBackend(name);
   }
 
-  setDevice(name: DeviceKind): void {
-    this.runtime.setBackend(name);
-  }
-
   /**
    * Execute a function with automatic mixed precision (AMP) enabled.
    *
