@@ -81,11 +81,11 @@ export function crossEntropy(
     if (reduction === "none") return perSampleLoss;
     if (reduction === "sum") {
       const s = perSampleLoss.sum();
-      if (typeof s === "number") return api.tensorFromArray([s], [], { device: logits.device });
+      if (typeof s === "number") return api.full([], s, { device: logits.device });
       return s;
     }
     const m = perSampleLoss.mean();
-    if (typeof m === "number") return api.tensorFromArray([m], [], { device: logits.device });
+    if (typeof m === "number") return api.full([], m, { device: logits.device });
     return m;
   }
 
@@ -144,14 +144,14 @@ export function crossEntropy(
   } else if (reduction === "sum") {
     const sumLoss = loss.sum();
     if (typeof sumLoss === "number") {
-      return api.tensorFromArray([sumLoss], [], { device: logits.device });
+      return api.full([], sumLoss, { device: logits.device });
     }
     return sumLoss;
   } else {
     // mean
     const meanLoss = loss.mean();
     if (typeof meanLoss === "number") {
-      return api.tensorFromArray([meanLoss], [], { device: logits.device });
+      return api.full([], meanLoss, { device: logits.device });
     }
     return meanLoss;
   }
@@ -202,13 +202,13 @@ export function nllLoss(
   } else if (reduction === "sum") {
     const sumLoss = loss.sum();
     if (typeof sumLoss === "number") {
-      return api.tensorFromArray([sumLoss], [], { device: logProbs.device });
+      return api.full([], sumLoss, { device: logProbs.device });
     }
     return sumLoss;
   } else {
     const meanLoss = loss.mean();
     if (typeof meanLoss === "number") {
-      return api.tensorFromArray([meanLoss], [], { device: logProbs.device });
+      return api.full([], meanLoss, { device: logProbs.device });
     }
     return meanLoss;
   }

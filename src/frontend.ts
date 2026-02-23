@@ -2003,14 +2003,9 @@ export class Torchlette {
 
     let finalScores: import("./runtime/engine").Tensor;
     if (isCausal) {
-      // Create causal mask: -inf for positions where j > i
-      const maskData: number[] = [];
-      for (let i = 0; i < seq; i++) {
-        for (let j = 0; j < seq; j++) {
-          maskData.push(j > i ? -1e9 : 0);
-        }
-      }
-      const mask = this.runtime.tensorFromArray(maskData, [1, 1, seq, seq], q.device);
+      // Create causal mask: -1e9 where j > i, 0 elsewhere
+      const negInf = this.runtime.full([1, 1, seq, seq], -1e9, q.device);
+      const mask = this.runtime.triu(negInf, 1);
       finalScores = this.runtime.add(scaledScores, mask);
     } else {
       finalScores = scaledScores;
@@ -2860,7 +2855,7 @@ export class Torchlette {
     if (size !== 1) {
       throw new Error("backward requires an explicit grad for non-scalars");
     }
-    return this.runtime.tensorFromArray([1], [], output.device);
+    return this.runtime.full([], 1.0, output.device);
   }
 
   private saveForBackward(tensor: Tensor): SavedTensorRecord {
@@ -2890,7 +2885,7 @@ export class Torchlette {
     if (dims.length > 0) {
       const summed = this.runtime.sum(reduced, { dim: dims, keepdim: true });
       if (typeof summed === "number") {
-        reduced = this.runtime.tensorFromArray([summed], [], grad.device);
+        reduced = this.runtime.full([], summed, grad.device);
       } else {
         reduced = summed;
       }
