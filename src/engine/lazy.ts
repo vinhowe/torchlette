@@ -1700,13 +1700,20 @@ export async function executePlanWithCheckpointSegments(
   for (let i = 0; i < segments.length; i++) {
     const segment = segments[i];
 
-    // Update inputs to use materialized storages from previous segments
+    // Clone node inputs before mutation to preserve plan immutability.
+    // Nodes are shared across steps; mutating inputs in-place would cause
+    // stale storage refs to accumulate, producing NaN after ~25 steps.
     for (const node of segment.nodes) {
+      let needsClone = false;
       for (let j = 0; j < node.inputs.length; j++) {
         const input = node.inputs[j];
         if (input.kind === "pending") {
           const materialized = materializedStorages.get(input.node.id);
           if (materialized) {
+            if (!needsClone) {
+              node.inputs = [...node.inputs];
+              needsClone = true;
+            }
             node.inputs[j] = { kind: "materialized", storage: materialized };
           }
         }
@@ -1794,13 +1801,18 @@ export async function executePlanWithTrueSegments(
       finalOutputId,
     );
 
-    // Update inputs to use materialized storages from previous segments
+    // Clone node inputs before mutation to preserve plan immutability.
     for (const node of segment.nodes) {
+      let needsClone = false;
       for (let j = 0; j < node.inputs.length; j++) {
         const input = node.inputs[j];
         if (input.kind === "pending") {
           const materialized = materializedStorages.get(input.node.id);
           if (materialized) {
+            if (!needsClone) {
+              node.inputs = [...node.inputs];
+              needsClone = true;
+            }
             node.inputs[j] = { kind: "materialized", storage: materialized };
           }
         }
