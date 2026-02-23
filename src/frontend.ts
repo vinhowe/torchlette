@@ -982,33 +982,20 @@ export class Torchlette {
    * Create a tensor filled with random values uniformly distributed in [0, 1).
    */
   rand(shape: number[], options?: TensorCreateOptions): Tensor {
-    const numElements = shape.reduce((a, b) => a * b, 1);
-    const values = new Array(numElements);
-    for (let i = 0; i < numElements; i++) {
-      values[i] = Math.random();
-    }
-    return this.tensorFromArray(values, shape, options);
+    return this.wrap(
+      this.runtime.rand(shape, options?.device),
+      options?.requiresGrad ?? false,
+    );
   }
 
   /**
    * Create a tensor filled with random values from a standard normal distribution.
-   * Uses Box-Muller transform.
    */
   randn(shape: number[], options?: TensorCreateOptions): Tensor {
-    const numElements = shape.reduce((a, b) => a * b, 1);
-    const values = new Array(numElements);
-    for (let i = 0; i < numElements; i += 2) {
-      // Box-Muller transform
-      const u1 = Math.random();
-      const u2 = Math.random();
-      const r = Math.sqrt(-2 * Math.log(u1 || 1e-10));
-      const theta = 2 * Math.PI * u2;
-      values[i] = r * Math.cos(theta);
-      if (i + 1 < numElements) {
-        values[i + 1] = r * Math.sin(theta);
-      }
-    }
-    return this.tensorFromArray(values, shape, options);
+    return this.wrap(
+      this.runtime.randn(shape, options?.device),
+      options?.requiresGrad ?? false,
+    );
   }
 
   /**
@@ -1023,12 +1010,10 @@ export class Torchlette {
     if (p < 0 || p > 1) {
       throw new Error(`Bernoulli probability must be between 0 and 1, got ${p}`);
     }
-    const numElements = shape.reduce((a, b) => a * b, 1);
-    const values = new Array(numElements);
-    for (let i = 0; i < numElements; i++) {
-      values[i] = Math.random() < p ? 1 : 0;
-    }
-    return this.tensorFromArray(values, shape, options);
+    return this.wrap(
+      this.runtime.bernoulli(shape, p, options?.device),
+      options?.requiresGrad ?? false,
+    );
   }
 
   /**

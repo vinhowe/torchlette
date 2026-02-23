@@ -214,6 +214,12 @@ export interface BackendOps {
   tril?(a: BackendTensor, k?: number): BackendTensor;
   /** Upper-triangular: zero elements below the k-th diagonal (last 2 dims). */
   triu?(a: BackendTensor, k?: number): BackendTensor;
+  /** Create a tensor filled with uniform random values in [0, 1). */
+  rand?(shape: Shape, seed: number): BackendTensor;
+  /** Create a tensor filled with standard normal random values. */
+  randn?(shape: Shape, seed: number): BackendTensor;
+  /** Create a tensor with Bernoulli-distributed values (1 with probability p, else 0). */
+  bernoulli?(shape: Shape, p: number, seed: number): BackendTensor;
   add(a: BackendTensor, b: BackendTensor): BackendTensor;
   sub(a: BackendTensor, b: BackendTensor, options?: SubOptions): BackendTensor;
   div(a: BackendTensor, b: BackendTensor, options?: DivOptions): BackendTensor;

@@ -150,6 +150,7 @@ export class RuntimeEngine {
   private cumulativeFusionStats: OptimizedExecutionStats | null = null;
   private earlyReleaseEnabled = false;
   private checkpointSegmentationEnabled = false;
+  private _rngCounter = 0;
   private trueSegmentationEnabled = false;
   private _webgpuFlushBufferPool: (() => void) | null = null;
 
@@ -1061,6 +1062,27 @@ export class RuntimeEngine {
     if (a.shape.length < 2) throw new Error("triu requires at least 2 dimensions");
     const node = createLazyIRNode("triu", [a.lazyRef], a.shape, a.dtype, a.device, { k });
     return this.createAndTrack(createBaseId(), createPendingRef(node), a.shape, a.device, a.dtype);
+  }
+
+  rand(shape: number[], device?: DeviceKind): Tensor {
+    const resolvedDevice = this.getDevice(device);
+    const seed = this._rngCounter++;
+    const node = createLazyIRNode("rand", [], shape, "f32", resolvedDevice, { seed });
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, resolvedDevice);
+  }
+
+  randn(shape: number[], device?: DeviceKind): Tensor {
+    const resolvedDevice = this.getDevice(device);
+    const seed = this._rngCounter++;
+    const node = createLazyIRNode("randn", [], shape, "f32", resolvedDevice, { seed });
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, resolvedDevice);
+  }
+
+  bernoulli(shape: number[], p: number, device?: DeviceKind): Tensor {
+    const resolvedDevice = this.getDevice(device);
+    const seed = this._rngCounter++;
+    const node = createLazyIRNode("bernoulli", [], shape, "f32", resolvedDevice, { seed, p });
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, resolvedDevice);
   }
 
   /**

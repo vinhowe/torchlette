@@ -278,6 +278,7 @@ export interface DispatchReplayCache {
 
 const DATA_SOURCE_OPS: ReadonlySet<string> = new Set([
   "tensorFromArray", "zeros", "full", "arange",
+  "rand", "randn", "bernoulli",
 ]);
 
 /** View ops that produce views (no GPU dispatch, metadata only). */
