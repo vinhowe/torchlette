@@ -41,6 +41,7 @@ import {
   getFusionAnalysisTemplate,
 } from "../engine/lazy";
 import { computePlanFingerprint } from "../engine/fusion-detect";
+import { isDataSourceOp } from "../engine/lowered-plan";
 import { OP_DTYPE_RULES, promoteDtype } from "../engine/dtype-rules";
 import {
   executeWithMemoryPlanning,
@@ -489,9 +490,14 @@ export class RuntimeEngine {
     const _buildT = _forceTiming ? performance.now() - _forceT0 : 0;
     const backend = this.getBackend(tensor.device);
 
+    // Data-source-only plans (e.g. weight loading: all tensorFromArray) skip the
+    // template/arena/lowered-plan path — they have no compute dispatches, no bind
+    // groups to cache, and their outputs persist as model weights.
+    const allDataSource = plan.nodes.every(n => isDataSourceOp(n.op));
+
     // --- Lowered Plan Fast-Path ---
     // Try cached lowered execution plan first.
-    if (tensor.device === "webgpu" && this.fusionEnabled) {
+    if (!allDataSource && tensor.device === "webgpu" && this.fusionEnabled) {
       const _lpT0 = _forceTiming ? performance.now() : 0;
       const executed = await this.tryLoweredPlanExecution(plan, [tensor], tensor.device);
       if (_forceTiming) console.log(`[force-timing] nodes=${plan.nodes.length} buildPlan=${_buildT.toFixed(1)}ms lowered=${executed ? "HIT" : "MISS"} loweredTime=${(performance.now() - _lpT0).toFixed(1)}ms`);
@@ -502,7 +508,7 @@ export class RuntimeEngine {
     const flushBufferPool = this.getBufferPoolFlushFn(tensor.device);
 
     let result;
-    if (this.fusionEnabled) {
+    if (this.fusionEnabled && !allDataSource) {
       // Use optimized execution with fusion (§15)
       // executePlanOptimized supports enableEarlyRelease for memory management
       // On non-WebGPU backends, fusion is automatically skipped inside executePlanOptimized
@@ -762,8 +768,11 @@ export class RuntimeEngine {
       }
     }
 
+    // Data-source-only plans skip the template/arena/lowered-plan path.
+    const allDataSource = plan.nodes.every(n => isDataSourceOp(n.op));
+
     // Lowered plan fast-path for forceAllMerged
-    if (device === "webgpu" && this.fusionEnabled) {
+    if (!allDataSource && device === "webgpu" && this.fusionEnabled) {
       const _famLpT0 = _famTiming ? performance.now() : 0;
       const executed = await this.tryLoweredPlanExecution(plan, tensors, device);
       if (_famTiming) console.log(`[forceAllMerged-timing] nodes=${plan.nodes.length} pendingRoots=${pendingRoots.length} buildPlan=${_famBuildT.toFixed(1)}ms lowered=${executed ? "HIT" : "MISS"} loweredTime=${(performance.now() - _famLpT0).toFixed(1)}ms`);
@@ -777,7 +786,7 @@ export class RuntimeEngine {
 
     // Use fusion when enabled and on WebGPU, regardless of segmentation settings.
     // executePlanOptimized supports enableEarlyRelease for memory management.
-    if (this.fusionEnabled) {
+    if (this.fusionEnabled && !allDataSource) {
       const optimizedResult = await executePlanOptimized(plan, backend, {
         enableFusion: true,
         enableVectorization: this.vectorizationEnabled,
