@@ -22,6 +22,7 @@ For WebGPU backend changes, also run the relevant integration test (e.g. `npx ts
 
 - **Working Spec**: [torchlette-working-spec.md](torchlette-working-spec.md) - Full runtime semantics (v1.22)
 - **Testing Spec**: [torchlette-testing-spec.md](torchlette-testing-spec.md) - Test-driven development plan
+- **Refactoring Targets**: [refactoring-targets.md](refactoring-targets.md) - Identified cleanup opportunities
 
 ## Development Commands
 
