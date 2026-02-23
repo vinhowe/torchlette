@@ -41,24 +41,10 @@ export class Linear extends Module {
     const hasBias = options?.bias ?? true;
     const device = options?.device;
 
-    // Initialize weight with scaled normal distribution (Kaiming-like)
-    // Scale by 1/sqrt(in_features) for better gradient flow
-    const scale = 1 / Math.sqrt(inFeatures);
-    const weightData = new Array(outFeatures * inFeatures);
-    for (let i = 0; i < weightData.length; i += 2) {
-      // Box-Muller for standard normal
-      const u1 = Math.random();
-      const u2 = Math.random();
-      const r = Math.sqrt(-2 * Math.log(u1 || 1e-10));
-      const theta = 2 * Math.PI * u2;
-      weightData[i] = r * Math.cos(theta) * scale;
-      if (i + 1 < weightData.length) {
-        weightData[i + 1] = r * Math.sin(theta) * scale;
-      }
-    }
-
-    // Weight shape: [outFeatures, inFeatures]
-    this.weight = api.tensorFromArray(weightData, [outFeatures, inFeatures], {
+    // Initialize weight with standard normal distribution.
+    // Uses lazy GPU-side randn to avoid allocating large JS arrays on CPU.
+    // Note: for pretrained models, weights are overwritten by copy_ during loading.
+    this.weight = api.randn([outFeatures, inFeatures], {
       requiresGrad: true,
       device,
     });
