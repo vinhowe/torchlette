@@ -452,6 +452,8 @@ export interface GeneratedKernel {
   vectorWidth: VectorWidth;
   /** Number of work items (total elements / vector width) */
   workItems: number;
+  /** X dimension of dispatch grid (for 2D dispatch when workgroups > 65535) */
+  gridSizeX: number;
 }
 
 /**
@@ -459,10 +461,13 @@ export interface GeneratedKernel {
  * generating the full WGSL source. Used by FusionKernelCache to check cache
  * before doing expensive codegen.
  */
+// Maximum workgroups per dimension in WebGPU (per spec)
+const MAX_WORKGROUPS_PER_DIM = 65535;
+
 export function computeKernelMeta(
   recipe: FusedKernelRecipe,
   options: KernelGenOptions = {},
-): { cacheKey: string; vectorWidth: VectorWidth; workItems: number; workgroupSize: number } {
+): { cacheKey: string; vectorWidth: VectorWidth; workItems: number; workgroupSize: number; gridSizeX: number } {
   const workgroupSize = options.workgroupSize ?? recipe.workgroupSize ?? 256;
   const outputShape = recipe.outputs[0].shape;
   const primaryDtype = recipe.outputs[0].dtype;
@@ -484,8 +489,14 @@ export function computeKernelMeta(
   }
 
   const workItems = Math.ceil(totalElements / vectorWidth);
-  const cacheKey = generateKernelCacheKey(recipe, vectorWidth);
-  return { cacheKey, vectorWidth, workItems, workgroupSize };
+  const totalWorkgroups = Math.ceil(workItems / workgroupSize);
+  const gridSizeX = totalWorkgroups <= MAX_WORKGROUPS_PER_DIM
+    ? totalWorkgroups
+    : MAX_WORKGROUPS_PER_DIM;
+  // Include 2D dispatch in cache key so 1D and 2D kernels are cached separately
+  const baseCacheKey = generateKernelCacheKey(recipe, vectorWidth);
+  const cacheKey = gridSizeX >= MAX_WORKGROUPS_PER_DIM ? baseCacheKey + ":2d" : baseCacheKey;
+  return { cacheKey, vectorWidth, workItems, workgroupSize, gridSizeX };
 }
 
 /**
@@ -498,7 +509,7 @@ export function generateFusedKernel(
 ): GeneratedKernel {
   // Derive vector width, workgroup size, and cache key from shared logic
   const meta = computeKernelMeta(recipe, options);
-  const { vectorWidth, workItems, workgroupSize } = meta;
+  const { vectorWidth, workItems, workgroupSize, gridSizeX } = meta;
 
   const outputShape = recipe.outputs[0].shape;
   const primaryDtype = recipe.outputs[0].dtype;
@@ -605,14 +616,19 @@ export function generateFusedKernel(
   }
   const storeCode = storeLines.join("\n  ");
 
-  // Index variable depends on vectorization
-  const idxExpr = useVec ? `gid.x * ${vectorWidth}u` : "gid.x";
+  // Index variable depends on vectorization and 2D dispatch
+  const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
+  // For 2D dispatch, compute linear invocation index from 2D workgroup grid
+  const gidExpr = use2D
+    ? `(gid.x + gid.y * ${gridSizeX}u * ${workgroupSize}u)`
+    : "gid.x";
+  const idxExpr = useVec ? `${gidExpr} * ${vectorWidth}u` : gidExpr;
   // Bounds check always uses params.total_elements to ensure params binding is used
   // For vectorized: check work items (total_elements / vectorWidth)
   // For scalar: check total elements directly
   const boundsCheck = useVec
-    ? `if (gid.x * ${vectorWidth}u >= params.total_elements) { return; }`
-    : `if (gid.x >= params.total_elements) { return; }`;
+    ? `if (${gidExpr} * ${vectorWidth}u >= params.total_elements) { return; }`
+    : `if (${gidExpr} >= params.total_elements) { return; }`;
 
   // Params binding comes after all outputs (using physical binding count)
   const paramsBinding = nextBinding + recipe.outputs.length;
@@ -661,6 +677,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     cacheKey: meta.cacheKey,
     vectorWidth,
     workItems,
+    gridSizeX,
   };
 }
 
