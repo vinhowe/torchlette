@@ -309,15 +309,19 @@ export function dispatchFusedKernel(
   const bindGroup = cachedCreateBindGroup(device as any, pipeline as any, bgBuffers as any) as any;
 
   // Dispatch (batch/shared-encoder mode aware)
-  const workgroups = Math.ceil(kernel.workItems / kernel.workgroupSize);
+  // Use 2D dispatch when workgroups exceed WebGPU per-dimension limit (65535)
+  const totalWorkgroups = Math.ceil(kernel.workItems / kernel.workgroupSize);
+  const MAX_WG_DIM = 65535;
+  const workgroupsX = Math.min(totalWorkgroups, MAX_WG_DIM);
+  const workgroupsY = totalWorkgroups <= MAX_WG_DIM ? 1 : Math.ceil(totalWorkgroups / MAX_WG_DIM);
 
   // Record dispatch if recording is active
   if (fusionRecordingBuffer) {
     fusionRecordingBuffer.push({
       pipeline: pipeline as any,
       bindGroup: bindGroup as any,
-      workgroupsX: workgroups,
-      workgroupsY: 1,
+      workgroupsX,
+      workgroupsY,
       workgroupsZ: 1,
       buffers: getAndClearLastBindGroupBuffers(),
       label: getCurrentOpLabel() ?? undefined,
@@ -332,7 +336,7 @@ export function dispatchFusedKernel(
     const pass = sharedEnc.beginComputePass(tsWrites ? { timestampWrites: tsWrites } : undefined);
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(workgroups);
+    pass.dispatchWorkgroups(workgroupsX, workgroupsY);
     pass.end();
   } else {
     const encoder = device.createCommandEncoder();
@@ -340,7 +344,7 @@ export function dispatchFusedKernel(
     const pass = encoder.beginComputePass(tsWrites ? { timestampWrites: tsWrites } : undefined);
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(workgroups);
+    pass.dispatchWorkgroups(workgroupsX, workgroupsY);
     pass.end();
     submitOrCollect(encoder.finish());
   }
