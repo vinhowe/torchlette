@@ -16,7 +16,7 @@
 # Dawn's webgpu npm package (v0.3.8, Sep 2025) predates the
 # VulkanEnableF16OnNvidia toggle (Oct 27, 2025). We build from latest source
 # to get shader-f16 support on NVIDIA Vulkan GPUs.
-FROM pytorch/pytorch:2.9.1-cuda13.0-cudnn9-runtime AS dawn-builder
+FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime AS dawn-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -86,9 +86,10 @@ RUN cd /tmp/dawn-build && ninja dawn.node -j$(nproc)
 # ============================================================================
 # Stage 2: Final image
 # ============================================================================
-# PyTorch 2.9.1 with CUDA 13.0 (latest stable, Nov 2024)
+# PyTorch 2.5.1 with CUDA 12.1 — compatible with host driver 545.x (CUDA 12.3).
+# cu121 is the newest CUDA toolkit that driver 545 supports.
 # See: https://hub.docker.com/r/pytorch/pytorch/tags
-FROM pytorch/pytorch:2.9.1-cuda13.0-cudnn9-runtime
+FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime
 
 # Prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -103,12 +104,17 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     # Editor
     neovim \
-    # Vulkan/Mesa for WebGPU
+    # Vulkan/Mesa for WebGPU (Lavapipe software fallback + loader)
     libvulkan1 \
     mesa-vulkan-drivers \
     libegl1-mesa \
     libgl1-mesa-dri \
     libgles2-mesa \
+    # NVIDIA Vulkan ICD — provides nvidia_icd.json + userspace GL/Vulkan libs.
+    # nvidia-container-toolkit mounts host driver libs (.so.VERSION) into the
+    # container. The apt-installed version may differ from the host kernel module.
+    # The entrypoint script below fixes symlinks to match the host driver version.
+    libnvidia-gl-545 \
     # X11 libs that Dawn may need
     libx11-6 \
     libx11-xcb1 \
@@ -151,10 +157,26 @@ ENV TORCH_ORACLE_PYTHON=python
 # Claude Code path (install once via: curl -fsSL https://claude.ai/install.sh | bash)
 ENV PATH="/root/.local/bin:$PATH"
 
-# NOTE: LIBGL_ALWAYS_SOFTWARE and GALLIUM_DRIVER are NOT set here.
-# When running with --gpus and NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,
-# Dawn will use the NVIDIA Vulkan ICD for hardware-accelerated WebGPU.
-# For software-only fallback, set these at runtime:
+# Fix NVIDIA Vulkan: nvidia-container-toolkit mounts host driver libs (e.g.
+# libnvidia-glcore.so.545.23.08) but libnvidia-gl-545 installs a potentially
+# different version (e.g. 545.29.06) and points symlinks at it. The userspace
+# lib version MUST match the kernel module or ioctls to /dev/nvidiactl fail
+# with EINVAL, causing Vulkan init to silently return NULL for all entry points.
+# This script detects the host kernel module version and repoints symlinks.
+RUN printf '#!/bin/bash\n\
+HOST_VER=$(cat /proc/driver/nvidia/version 2>/dev/null | grep -oP "Module\\s+\\K[0-9.]+" | head -1)\n\
+if [ -n "$HOST_VER" ] && [ -f "/usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.$HOST_VER" ]; then\n\
+  for lib in libGLX_nvidia libEGL_nvidia; do\n\
+    ln -sf "${lib}.so.${HOST_VER}" "/usr/lib/x86_64-linux-gnu/${lib}.so.0" 2>/dev/null\n\
+  done\n\
+fi\n\
+exec "$@"\n' > /usr/local/bin/fix-nvidia-vulkan.sh && chmod +x /usr/local/bin/fix-nvidia-vulkan.sh
+
+ENTRYPOINT ["/usr/local/bin/fix-nvidia-vulkan.sh"]
+
+# NOTE: When running with --gpus and NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,
+# Dawn uses the NVIDIA Vulkan ICD for hardware-accelerated WebGPU.
+# For explicit software-only fallback, set at runtime:
 #   -e LIBGL_ALWAYS_SOFTWARE=1 -e GALLIUM_DRIVER=llvmpipe
 
 CMD ["bash"]
