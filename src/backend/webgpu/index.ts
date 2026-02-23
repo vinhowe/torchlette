@@ -10216,6 +10216,9 @@ function fusedCrossEntropyForward(
   const outBuf = dispatchCEForwardKernel(
     logitsT.buffer, targetsT.buffer, config.batchSize, config.vocabSize,
   );
+  // Destroy contiguous copies if created (deferred for GPU fence)
+  if (logitsT !== logits) { bufferPool.decRef(logitsT.buffer); bufferPool.deferredDestroy(logitsT.buffer, logitsT.size * dtypeBytes(logitsT.dtype)); }
+  if (targetsT !== targets) { bufferPool.decRef(targetsT.buffer); bufferPool.deferredDestroy(targetsT.buffer, targetsT.size * dtypeBytes(targetsT.dtype)); }
   return createTensor([config.batchSize], outBuf, undefined, 0, "f32");
 }
 
@@ -10232,6 +10235,10 @@ function fusedCrossEntropyBackward(
     logitsT.buffer, targetsT.buffer, gradT.buffer,
     config.batchSize, config.vocabSize,
   );
+  // Destroy contiguous copies if created (deferred for GPU fence)
+  if (logitsT !== logits) { bufferPool.decRef(logitsT.buffer); bufferPool.deferredDestroy(logitsT.buffer, logitsT.size * dtypeBytes(logitsT.dtype)); }
+  if (targetsT !== targets) { bufferPool.decRef(targetsT.buffer); bufferPool.deferredDestroy(targetsT.buffer, targetsT.size * dtypeBytes(targetsT.dtype)); }
+  if (gradT !== gradOutput) { bufferPool.decRef(gradT.buffer); bufferPool.deferredDestroy(gradT.buffer, gradT.size * dtypeBytes(gradT.dtype)); }
   return createTensor([config.batchSize, config.vocabSize], outBuf, undefined, 0, "f32");
 }
 
@@ -10252,6 +10259,10 @@ function fusedLayerNormForward(
     xT.buffer, weightT.buffer, biasT.buffer,
     config.numRows, config.featureDim, config.eps,
   );
+  // Destroy contiguous copies if created (deferred for GPU fence)
+  if (xT !== x) { bufferPool.decRef(xT.buffer); bufferPool.deferredDestroy(xT.buffer, xT.size * dtypeBytes(xT.dtype)); }
+  if (weightT !== weight) { bufferPool.decRef(weightT.buffer); bufferPool.deferredDestroy(weightT.buffer, weightT.size * dtypeBytes(weightT.dtype)); }
+  if (biasT !== bias) { bufferPool.decRef(biasT.buffer); bufferPool.deferredDestroy(biasT.buffer, biasT.size * dtypeBytes(biasT.dtype)); }
   const outShape: number[] = [];
   // Reconstruct shape: [...batch_dims, featureDim] = same as input
   for (let i = 0; i < xT.shape.length; i++) outShape.push(xT.shape[i]);
@@ -10273,6 +10284,11 @@ function fusedLayerNormBackwardGradX(
     config.numRows, config.featureDim, config.eps,
   );
 
+  // Destroy contiguous copies if created (deferred for GPU fence)
+  if (gradT !== gradOutput) { bufferPool.decRef(gradT.buffer); bufferPool.deferredDestroy(gradT.buffer, gradT.size * dtypeBytes(gradT.dtype)); }
+  if (xT !== x) { bufferPool.decRef(xT.buffer); bufferPool.deferredDestroy(xT.buffer, xT.size * dtypeBytes(xT.dtype)); }
+  if (weightT !== weight) { bufferPool.decRef(weightT.buffer); bufferPool.deferredDestroy(weightT.buffer, weightT.size * dtypeBytes(weightT.dtype)); }
+
   const gradXShape: number[] = [];
   for (let i = 0; i < xT.shape.length; i++) gradXShape.push(xT.shape[i]);
   return createTensor(gradXShape, gradXBuf, undefined, 0, "f32");
@@ -10289,6 +10305,11 @@ function fusedLayerNormBackwardGradWeightBias(
     gradT.buffer, xT.buffer,
     config.numRows, config.featureDim, config.eps,
   );
+
+  // Destroy contiguous copies if created (deferred for GPU fence)
+  if (gradT !== gradOutput) { bufferPool.decRef(gradT.buffer); bufferPool.deferredDestroy(gradT.buffer, gradT.size * dtypeBytes(gradT.dtype)); }
+  if (xT !== x) { bufferPool.decRef(xT.buffer); bufferPool.deferredDestroy(xT.buffer, xT.size * dtypeBytes(xT.dtype)); }
+
   const shape = [config.featureDim];
   return {
     gradWeight: createTensor(shape, result.gradWeightBuffer, undefined, 0, "f32", true),
