@@ -1308,17 +1308,6 @@ function compute2DDispatch(totalWorkgroups: number): {
   return { x, y, gridSizeX: x };
 }
 
-/**
- * Generate WGSL code to compute flat index from 2D gid.
- * Use this in shaders when dispatch might use 2D workgroups.
- */
-function flatIndexFromGid(gridSizeX: number): string {
-  if (gridSizeX <= MAX_WORKGROUPS_PER_DIM) {
-    return `let idx = gid.x;`;
-  }
-  return `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`;
-}
-
 // Legacy matmul constants (kept for reference, now using tiled matmul)
 const MATMUL_WORKGROUP_X = 8;
 const MATMUL_WORKGROUP_Y = 8;
@@ -3267,10 +3256,7 @@ function releaseUniformBuffer(buffer: GPUBuffer): void {
   releaseParamsBuffer(buffer);
 }
 
-// Profiled helpers for hot-path WebGPU API calls
-function profiledWriteBuffer(queue: GPUQueue, buffer: GPUBuffer, offset: number, data: ArrayBufferView | ArrayBuffer): void {
-  profileApiCall("writeBuffer", () => queue.writeBuffer(buffer, offset, data as ArrayBufferView));
-}
+// Profiled helper for hot-path WebGPU API calls
 function profiledCreateBindGroup(device: GPUDevice, descriptor: any): GPUBindGroup {
   const bg = profileApiCall("createBindGroup", () => device.createBindGroup(descriptor));
   // When recording, capture buffer references from the descriptor for replay pinning
