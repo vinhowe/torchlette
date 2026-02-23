@@ -23,8 +23,9 @@ import { Adam, GradScaler } from "../../src/optim";
 // Configuration
 // ============================================================================
 
+const MODEL_NAME = process.env.MODEL ?? "gpt2";
 const SEQ_LEN = parseInt(process.env.SEQ_LEN ?? "256", 10);
-const BATCH_SIZE = 1;
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE ?? "1", 10);
 const LEARNING_RATE = parseFloat(process.env.LR ?? "3e-5");
 const WARMUP_STEPS = 100;
 const LOG_EVERY = parseInt(process.env.LOG_EVERY ?? "50", 10);
@@ -32,7 +33,7 @@ const MAX_STEPS = parseInt(process.env.MAX_STEPS ?? "0", 10) || Infinity;
 const GENERATE_MAX_TOKENS = 200;
 const GENERATE_TEMPERATURE = 0.8;
 
-const MODEL_DIR = path.join(process.cwd(), "models", "gpt2");
+const MODEL_DIR = path.join(process.cwd(), "models", MODEL_NAME);
 const DATA_DIR = path.join(process.cwd(), "data");
 const DATA_FILE = path.join(DATA_DIR, "tinyshakespeare.txt");
 const TINYSHAKESPEARE_URL =
@@ -45,11 +46,11 @@ const TINYSHAKESPEARE_URL =
 async function ensureModelDownloaded(): Promise<void> {
   const safetensorsPath = path.join(MODEL_DIR, "model.safetensors");
   if (fs.existsSync(safetensorsPath)) {
-    console.log("  GPT-2 Small weights already downloaded.");
+    console.log(`  ${MODEL_NAME} weights already downloaded.`);
     return;
   }
-  console.log("  Downloading GPT-2 Small weights...");
-  await downloadGPT2("gpt2", MODEL_DIR);
+  console.log(`  Downloading ${MODEL_NAME} weights...`);
+  await downloadGPT2(MODEL_NAME, MODEL_DIR);
 }
 
 async function ensureTokenizerDownloaded(): Promise<void> {
