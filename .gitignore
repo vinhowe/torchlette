@@ -19,6 +19,9 @@ yarn.lock
 # Model weights (large binary files)
 models/
 
+# Downloaded datasets
+data/
+
 # Cached training data
 .cache/
 
