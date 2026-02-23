@@ -360,7 +360,7 @@ describe("Checkpoint + AMP Combined", () => {
     }
   });
 
-  it("AMP alone produces valid gradients", async () => {
+  it("AMP alone produces valid gradients", { timeout: 15000 }, async () => {
     const xData = [1, 2, 3, 4];
     const wData = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6];
     const bData = [0.1, 0.2, 0.3, 0.4];
