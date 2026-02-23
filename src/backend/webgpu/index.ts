@@ -1115,7 +1115,26 @@ export function allocateOutputBuffer(
   if (activeArena) {
     const idx = arenaAllocIndex++;
     const arenaBuffer = arenaAllocAt(activeArena.alloc, idx, sizeBytes);
-    if (arenaBuffer) return arenaBuffer;
+    if (arenaBuffer) {
+      // Check if this arena buffer aliases with an external plan input.
+      // This happens when the same template is reused across layers: the
+      // previous execution's output (an arena buffer) becomes the next
+      // execution's external input. Without this check, the fused kernel
+      // would overwrite the input data before it's fully consumed.
+      if (arenaExternalInputBuffers && arenaExternalInputBuffers.has(arenaBuffer)) {
+        // Replace the arena slot with a fresh buffer. The old buffer stays
+        // alive (referenced by the external input tensor) but is no longer
+        // in the arena. This permanently resolves the conflict for this slot.
+        arenaBufferSet.delete(arenaBuffer);
+        activeArena.alloc[idx] = undefined as any;
+        const freshBuffer = arenaAllocAt(activeArena.alloc, idx, sizeBytes);
+        arenaConflictDetected = true;
+        return freshBuffer!;
+      }
+      return arenaBuffer;
+    }
+  } else if (activeArena) {
+    arenaAllocIndex++; // Keep counter in sync
   }
 
   const ctx = requireContext();
@@ -2781,6 +2800,50 @@ let arenaResolveNoArena = 0;
 let arenaAllocIndex = 0;
 
 /**
+ * Set of external input buffers for the current plan execution.
+ * Used to prevent arena from reusing a buffer that is also an external input
+ * (which would cause data corruption when the arena overwrites input data).
+ */
+let arenaExternalInputBuffers: Set<GPUBuffer> | null = null;
+
+/**
+ * Flag set when an arena buffer had to be replaced due to external input conflict.
+ * When true, the dispatch replay cache must be invalidated because bind groups
+ * reference the old (replaced) arena buffer.
+ */
+let arenaConflictDetected = false;
+
+/** Register external input buffers for arena conflict detection. */
+export function setArenaExternalInputBuffers(buffers: GPUBuffer[]): void {
+  arenaExternalInputBuffers = new Set(buffers);
+}
+
+/** Clear external input buffers tracking. */
+export function clearArenaExternalInputBuffers(): void {
+  arenaExternalInputBuffers = null;
+}
+
+/** Check if any arena conflict was detected during the current plan execution. */
+export function getArenaConflictDetected(): boolean { return arenaConflictDetected; }
+
+/** Clear the arena conflict flag. */
+export function clearArenaConflictDetected(): void { arenaConflictDetected = false; }
+
+/**
+ * Pre-check if any arena buffers conflict with external input buffers.
+ * Used before replay to determine if the cached bind groups are still valid.
+ */
+export function hasArenaExternalConflicts(arena: BufferArena, extBufs: Set<GPUBuffer>): boolean {
+  for (const buf of arena.resolve) {
+    if (buf && extBufs.has(buf)) return true;
+  }
+  for (const buf of arena.alloc) {
+    if (buf && extBufs.has(buf)) return true;
+  }
+  return false;
+}
+
+/**
  * Activate a buffer arena for the duration of a lowered plan execution.
  * All subsequent resolveOutputBuffer/allocateOutputBuffer calls will use
  * the arena instead of the pool, stabilizing buffer identities.
@@ -2789,6 +2852,7 @@ export function setActiveArena(arena: BufferArena): void {
   activeArena = arena;
   arenaResolveIndex = 0;
   arenaAllocIndex = 0;
+  arenaConflictDetected = false;
 }
 
 /**
@@ -2849,15 +2913,20 @@ function arenaAllocAt(arr: GPUBuffer[], idx: number, sizeBytes: number): GPUBuff
   const existing = arr[idx];
   if (existing) {
     const existingSizeClass = getSizeClass(existing.size);
-    if (existingSizeClass === neededSizeClass) {
-      // Perfect match — reuse the same GPUBuffer object
+    if (existingSizeClass === neededSizeClass && !bufferPool.isLive(existing)) {
+      // Perfect match, not referenced by any live tensor — safe to reuse
       trackSharedEncoderWrite(existing);
       return existing;
     }
-    // Size class changed — destroy old, allocate new below
+    // Either size class changed, or buffer is still live (referenced by a persistent
+    // tensor, e.g. model weight loaded by a shared plan template). In either case,
+    // remove from arena set and allocate a fresh buffer below.
     arenaBufferSet.delete(existing);
-    if (!bufferPool.isLive(existing)) {
-      // Replay-pinned buffers must survive
+    if (bufferPool.isLive(existing)) {
+      // Live buffer — don't destroy. The owning tensor still references it.
+      arenaConflictDetected = true;
+    } else {
+      // Dead buffer with wrong size class — destroy if not replay-pinned
       if (replayPinnedBufferSet === null || !replayPinnedBufferSet.has(existing)) {
         gpuMemoryTracker.trackDeallocation(existing);
         existing.destroy();
@@ -2927,14 +2996,30 @@ function resolveOutputBuffer(
     const idx = arenaResolveIndex++;
     const arenaBuffer = arenaAllocAt(activeArena.resolve, idx, sizeBytes);
     if (arenaBuffer) {
-      // Still need to check no input aliasing (WebGPU forbids same buffer as read+write)
-      if (!inputBuffers.some(b => b === arenaBuffer)) {
+      // Check for external input conflict first (structural — replace arena slot).
+      if (arenaExternalInputBuffers && arenaExternalInputBuffers.has(arenaBuffer)) {
+        // Replace the arena slot with a fresh buffer. The old buffer stays
+        // alive (referenced by the external input tensor).
+        arenaBufferSet.delete(arenaBuffer);
+        activeArena.resolve[idx] = undefined as any;
+        const freshBuffer = arenaAllocAt(activeArena.resolve, idx, sizeBytes);
+        arenaConflictDetected = true;
+        // Still need to check direct aliasing on the fresh buffer
+        if (freshBuffer && !inputBuffers.some(b => b === freshBuffer)) {
+          arenaResolveHits++;
+          return freshBuffer;
+        }
+        // Fresh buffer aliased with direct input — fall through to normal path
+        arenaResolveAliased++;
+      } else if (!inputBuffers.some(b => b === arenaBuffer)) {
+        // No conflict, no aliasing — use arena buffer directly
         arenaResolveHits++;
         return arenaBuffer;
+      } else {
+        // Direct aliasing with current op's input — fall through to normal path.
+        // Don't replace arena slot; this is a normal within-plan aliasing situation.
+        arenaResolveAliased++;
       }
-      // Aliased with input — fall through to normal path for this position.
-      // The arena buffer stays allocated for future steps; we just can't use it here.
-      arenaResolveAliased++;
     }
   } else if (!providedOutBuffer) {
     arenaResolveNoArena++;
