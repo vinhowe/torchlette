@@ -863,7 +863,7 @@ function getInputStorage(ref: LazyRef, backend?: Backend): StorageHandle {
     // Materialize scalar ref on-the-fly for non-fused execution
     const b = backend ?? getBackend("cpu");
     if (!b) throw new Error("No backend available to materialize scalar ref");
-    const bt = b.ops.tensorFromArray([ref.value], []);
+    const bt = b.ops.full ? b.ops.full([], ref.value) : b.ops.tensorFromArray([ref.value], []);
     return createStorageHandle("cpu", bt);
   }
   if (ref.node.result) {
