@@ -4520,13 +4520,13 @@ export function runFusedElementwise(
   return createTensor(outShape, outBuffer);
 }
 
-function tensorFromArray(values: number[], shape: number[]): WebGPUTensor {
+function tensorFromArray(values: number[] | Float32Array, shape: number[]): WebGPUTensor {
   const ctx = requireContext();
   const expected = sizeOf(shape);
   if (expected !== values.length) {
     throw new Error("Tensor data length does not match shape");
   }
-  const f32data = Float32Array.from(values);
+  const f32data = values instanceof Float32Array ? values : Float32Array.from(values);
   // Arena fast path: use resolveOutputBuffer for stable buffer identity across steps.
   // This eliminates bind group cache misses from data-source ops in lowered plans.
   if (activeArena) {

@@ -968,18 +968,22 @@ export class RuntimeEngine {
   }
 
   tensorFromArray(
-    values: number[],
+    values: number[] | Float32Array,
     shape: number[],
     device?: DeviceKind,
   ): Tensor {
     const resolvedDevice = this.getDevice(device);
+    // For Float32Array, skip the defensive copy — the typed array buffer will be consumed
+    // by the GPU backend at the next force boundary. Avoids doubling memory for large models.
+    // For number[], copy to prevent aliasing issues with mutable JS arrays.
+    const payload = values instanceof Float32Array ? values : values.slice();
     const node = createLazyIRNode(
       "tensorFromArray",
       [],
       shape,
       "f32",
       resolvedDevice,
-      { values: values.slice() },
+      { values: payload },
     );
     const lazyRef: LazyRef = createPendingRef(node);
     return this.createAndTrack(createBaseId(), lazyRef, shape, resolvedDevice);

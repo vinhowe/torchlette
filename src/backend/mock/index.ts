@@ -23,8 +23,8 @@ import type {
   TransposeOptions,
 } from "../types";
 
-function tensorFromArray(values: number[], shape: Shape): Tensor {
-  return new Tensor(shape, Float32Array.from(values));
+function tensorFromArray(values: number[] | Float32Array, shape: Shape): Tensor {
+  return new Tensor(shape, values instanceof Float32Array ? values.slice() : Float32Array.from(values));
 }
 
 function add(a: Tensor, _b: Tensor): Tensor {

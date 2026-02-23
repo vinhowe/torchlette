@@ -203,7 +203,7 @@ export type AdamStepConfig = {
 };
 
 export interface BackendOps {
-  tensorFromArray(values: number[], shape: Shape): BackendTensor;
+  tensorFromArray(values: number[] | Float32Array, shape: Shape): BackendTensor;
   /** Create a zero-filled tensor. More efficient than tensorFromArray with a zeros array. */
   zeros?(shape: Shape): BackendTensor;
   /** Create a tensor filled with a constant value. */
