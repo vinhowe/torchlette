@@ -37,8 +37,9 @@ const FIXED_TOKENS: number[] = [
 
 const NUM_STEPS = 5;
 
-// Ground truth losses — captured from initial run, tolerance ±0.05
-const EXPECTED_LOSSES: number[] = [7.881017, 6.121135, 4.966267, 3.934526, 2.920183];
+// Ground truth losses — captured on NVIDIA V100, tolerance ±0.05
+// GPU non-determinism causes ~0.005 variation between runs
+const EXPECTED_LOSSES: number[] = [7.880194, 6.116093, 4.960088, 3.930947, 2.913026];
 
 const LOSS_TOLERANCE = 0.05;
 
