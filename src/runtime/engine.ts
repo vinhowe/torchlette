@@ -659,11 +659,7 @@ export class RuntimeEngine {
           enableEarlyRelease: this.earlyReleaseEnabled,
           enableVectorization: this.vectorizationEnabled,
           bufferArena: useArena ? template.bufferArena : undefined,
-          // Disable dispatch replay for non-compiled plans (backward, optimizer).
-          // Their external inputs (saved-for-backward tensors, gradient seeds)
-          // may not have stable buffer identities across steps, causing the
-          // recorded bind groups to reference stale data.
-          enableReplay: false,
+          enableReplay: true,
         },
       );
 
