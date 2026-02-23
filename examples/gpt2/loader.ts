@@ -126,79 +126,65 @@ function mapWeightName(hfName: string): {
 // ============================================================================
 
 /**
- * Parse a safetensors file and extract weight tensors.
+ * Parse a safetensors file header using streaming reads (no large buffer allocation).
+ * Returns metadata and data offset for on-demand weight extraction.
  */
-async function parseSafetensors(
-  filePath: string,
-): Promise<Map<string, { dtype: string; shape: number[]; data: Float32Array }>> {
-  const buffer = await fs.promises.readFile(filePath);
-  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-
-  // Read header length (first 8 bytes, little-endian uint64)
-  const headerLength = Number(view.getBigUint64(0, true));
+function parseSafetensorsHeader(
+  fd: number,
+): { metadata: SafetensorsMetadata; dataStart: number } {
+  // Read header length (first 8 bytes)
+  const headerSizeBuf = Buffer.alloc(8);
+  fs.readSync(fd, headerSizeBuf, 0, 8, 0);
+  const headerLength = Number(new DataView(
+    headerSizeBuf.buffer, headerSizeBuf.byteOffset, 8,
+  ).getBigUint64(0, true));
 
   // Read header JSON
-  const headerBytes = buffer.subarray(8, 8 + headerLength);
-  const headerJson = new TextDecoder().decode(headerBytes);
-  const metadata: SafetensorsMetadata = JSON.parse(headerJson);
+  const headerBuf = Buffer.alloc(headerLength);
+  fs.readSync(fd, headerBuf, 0, headerLength, 8);
+  const metadata: SafetensorsMetadata = JSON.parse(
+    new TextDecoder().decode(headerBuf),
+  );
 
-  // Data starts after header
-  const dataStart = 8 + headerLength;
+  return { metadata, dataStart: 8 + headerLength };
+}
 
-  const weights = new Map<string, { dtype: string; shape: number[]; data: Float32Array }>();
+/**
+ * Read a single weight from disk and convert to Float32Array.
+ * Only allocates memory for one weight at a time — critical for large models.
+ */
+function extractWeight(
+  fd: number,
+  dataStart: number,
+  info: { dtype: string; shape: number[]; data_offsets: [number, number] },
+): Float32Array | null {
+  const [startOffset, endOffset] = info.data_offsets;
+  const byteLength = endOffset - startOffset;
 
-  for (const [name, info] of Object.entries(metadata)) {
-    if (name === "__metadata__") continue;
+  // Read this weight's raw bytes from disk
+  const rawBuf = Buffer.alloc(byteLength);
+  fs.readSync(fd, rawBuf, 0, byteLength, dataStart + startOffset);
 
-    const [startOffset, endOffset] = info.data_offsets;
-    const byteLength = endOffset - startOffset;
-
-    // Extract raw bytes
-    const rawData = buffer.subarray(
-      dataStart + startOffset,
-      dataStart + endOffset,
-    );
-
-    // Convert to Float32Array based on dtype
-    let floatData: Float32Array;
-
-    if (info.dtype === "F32") {
-      // Already float32 - copy to aligned buffer
-      const alignedBuffer = new ArrayBuffer(byteLength);
-      new Uint8Array(alignedBuffer).set(rawData);
-      floatData = new Float32Array(alignedBuffer);
-    } else if (info.dtype === "F16") {
-      // Convert float16 to float32 - copy to aligned buffer first
-      const alignedBuffer = new ArrayBuffer(byteLength);
-      new Uint8Array(alignedBuffer).set(rawData);
-      const uint16View = new Uint16Array(alignedBuffer);
-      floatData = new Float32Array(uint16View.length);
-      for (let i = 0; i < uint16View.length; i++) {
-        floatData[i] = float16ToFloat32(uint16View[i]);
-      }
-    } else if (info.dtype === "BF16") {
-      // Convert bfloat16 to float32 - copy to aligned buffer first
-      const alignedBuffer = new ArrayBuffer(byteLength);
-      new Uint8Array(alignedBuffer).set(rawData);
-      const uint16View = new Uint16Array(alignedBuffer);
-      floatData = new Float32Array(uint16View.length);
-      for (let i = 0; i < uint16View.length; i++) {
-        floatData[i] = bfloat16ToFloat32(uint16View[i]);
-      }
-    } else {
-      console.warn(`Unsupported dtype ${info.dtype} for weight ${name}, skipping`);
-      continue;
+  if (info.dtype === "F32") {
+    // F32: create Float32Array from the read buffer (aligned since Buffer.alloc is aligned)
+    return new Float32Array(rawBuf.buffer, rawBuf.byteOffset, byteLength / 4);
+  } else if (info.dtype === "F16") {
+    const uint16View = new Uint16Array(rawBuf.buffer, rawBuf.byteOffset, byteLength / 2);
+    const floatData = new Float32Array(uint16View.length);
+    for (let i = 0; i < uint16View.length; i++) {
+      floatData[i] = float16ToFloat32(uint16View[i]);
     }
-
-    // Make a copy to avoid memory issues
-    weights.set(name, {
-      dtype: info.dtype,
-      shape: info.shape,
-      data: Float32Array.from(floatData),
-    });
+    return floatData;
+  } else if (info.dtype === "BF16") {
+    const uint16View = new Uint16Array(rawBuf.buffer, rawBuf.byteOffset, byteLength / 2);
+    const floatData = new Float32Array(uint16View.length);
+    for (let i = 0; i < uint16View.length; i++) {
+      floatData[i] = bfloat16ToFloat32(uint16View[i]);
+    }
+    return floatData;
+  } else {
+    return null;
   }
-
-  return weights;
 }
 
 /**
@@ -296,50 +282,80 @@ export async function loadGPT2Weights(
   }
 
   console.log(`Loading weights from ${safetensorsPath}...`);
-  const rawWeights = await parseSafetensors(safetensorsPath);
 
-  const weights = new Map<string, Tensor>();
+  // Stream-read weights from disk one at a time to minimize JS heap usage.
+  // Peak memory: model objects + one weight's Float32Array (~260MB max for wte).
+  // Without streaming, the 3.1GB file buffer alone would exceed the 4GB heap limit.
+  const fd = fs.openSync(safetensorsPath, "r");
+  try {
+    const { metadata, dataStart } = parseSafetensorsHeader(fd);
 
-  for (const [name, { shape, data }] of rawWeights) {
-    const mapping = mapWeightName(name);
-    if (!mapping) {
-      console.warn(`Unknown weight: ${name}, skipping`);
-      continue;
+    const weights = new Map<string, Tensor>();
+    let pendingBytes = 0;
+    const FLUSH_THRESHOLD = 512 * 1024 * 1024;
+
+    for (const [name, info] of Object.entries(metadata)) {
+      if (name === "__metadata__") continue;
+
+      const mapping = mapWeightName(name);
+      if (!mapping) {
+        continue;
+      }
+
+      // Read this weight's bytes from disk (only one weight in memory at a time)
+      const data = extractWeight(fd, dataStart, info);
+      if (!data) {
+        console.warn(`Unsupported dtype ${info.dtype} for weight ${name}, skipping`);
+        continue;
+      }
+
+      let finalData = data;
+      let finalShape = info.shape;
+
+      // Transpose if needed (Conv1D weights)
+      if (mapping.needsTranspose && finalShape.length === 2) {
+        const transposed = transpose2D(data, finalShape);
+        finalData = transposed.data;
+        finalShape = transposed.shape;
+      }
+
+      // Pad wte weight to paddedVocabSize if specified
+      const key = mapping.path.join(".");
+      if (key === "wte.weight" && options?.paddedVocabSize && options.paddedVocabSize > finalShape[0]) {
+        const paddedRows = options.paddedVocabSize;
+        const cols = finalShape[1];
+        const paddedData = new Float32Array(paddedRows * cols);
+        paddedData.set(finalData);
+        finalData = paddedData;
+        finalShape = [paddedRows, cols];
+      }
+
+      const tensor = api.tensorFromArray(
+        finalData,
+        finalShape,
+        { requiresGrad: true, device },
+      );
+
+      weights.set(key, tensor);
+      pendingBytes += finalData.byteLength;
+
+      // Periodically flush lazy tensors to GPU to release payload memory
+      if (pendingBytes >= FLUSH_THRESHOLD) {
+        await api.markStep();
+        pendingBytes = 0;
+      }
     }
 
-    let finalData = data;
-    let finalShape = shape;
-
-    // Transpose if needed (Conv1D weights)
-    if (mapping.needsTranspose && shape.length === 2) {
-      const transposed = transpose2D(data, shape);
-      finalData = transposed.data;
-      finalShape = transposed.shape;
+    // Final flush for remaining weights
+    if (pendingBytes > 0) {
+      await api.markStep();
     }
 
-    // Pad wte weight to paddedVocabSize if specified (zero-padded rows for matmul alignment)
-    const key = mapping.path.join(".");
-    if (key === "wte.weight" && options?.paddedVocabSize && options.paddedVocabSize > finalShape[0]) {
-      const paddedRows = options.paddedVocabSize;
-      const cols = finalShape[1];
-      const paddedData = new Float32Array(paddedRows * cols); // zeros by default
-      paddedData.set(finalData); // copy vocabSize rows, rest stays zero
-      finalData = paddedData;
-      finalShape = [paddedRows, cols];
-    }
-
-    // Create tensor
-    const tensor = api.tensorFromArray(
-      Array.from(finalData),
-      finalShape,
-      { requiresGrad: true, device },
-    );
-
-    weights.set(key, tensor);
+    console.log(`Loaded ${weights.size} weight tensors`);
+    return weights;
+  } finally {
+    fs.closeSync(fd);
   }
-
-  console.log(`Loaded ${weights.size} weight tensors`);
-  return weights;
 }
 
 /**
