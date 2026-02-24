@@ -32,63 +32,8 @@ import {
 } from "./types";
 import { getDefaultConfigForShape, generateNeighborConfigs } from "./autotune";
 import { autotune, type BenchmarkFn, cacheTuningResult } from "./autotune";
-
-// GPU types (matching index.ts)
-type GPUBuffer = {
-  getMappedRange(): ArrayBuffer;
-  mapAsync(mode: number): Promise<void>;
-  unmap(): void;
-  destroy(): void;
-};
-
-type GPUComputePipeline = {
-  getBindGroupLayout(index: number): unknown;
-};
-
-type GPUComputePass = {
-  dispatchWorkgroups(x: number, y?: number, z?: number): void;
-  end(): void;
-  setBindGroup(index: number, group: unknown): void;
-  setPipeline(pipeline: GPUComputePipeline): void;
-};
-
-type GPUCommandEncoder = {
-  beginComputePass(descriptor?: any): GPUComputePass;
-  finish(): unknown;
-};
-
-type GPUQueue = {
-  submit(commands: unknown[]): void;
-  writeBuffer(buffer: GPUBuffer, offset: number, data: ArrayBufferView): void;
-  onSubmittedWorkDone(): Promise<void>;
-};
-
-type GPUDevice = {
-  createBindGroup(descriptor: {
-    layout: unknown;
-    entries: Array<{ binding: number; resource: { buffer: GPUBuffer } }>;
-  }): unknown;
-  createBuffer(descriptor: {
-    size: number;
-    usage: number;
-    mappedAtCreation?: boolean;
-  }): GPUBuffer;
-  createCommandEncoder(): GPUCommandEncoder;
-  createComputePipeline(descriptor: {
-    layout: "auto";
-    compute: { module: unknown; entryPoint: string };
-  }): GPUComputePipeline;
-  createShaderModule(descriptor: { code: string }): unknown;
-  queue: GPUQueue;
-};
-
-const GPUBufferUsage = {
-  MAP_READ: 0x0001,
-  COPY_SRC: 0x0004,
-  COPY_DST: 0x0008,
-  UNIFORM: 0x0040,
-  STORAGE: 0x0080,
-};
+import type { GPUBuffer, GPUDevice, GPUComputePipeline, GPUCommandEncoder, GPUQueue } from "../gpu-types";
+import { GPUBufferUsage } from "../gpu-types";
 
 /**
  * Pipeline cache for compiled matmul kernels.
@@ -647,11 +592,11 @@ function dispatchTiledMatmulInternal(options: DispatchMatmulOptions & { config: 
 
   // Create params buffer via shared pool
   const paramsData = packMatmulParams(m, n, k, lda, ldb, ldc, alpha, batchSize, batchStrideA, batchStrideB, batchStrideC);
-  const paramsBuffer = sharedCreateParamsBuffer(device as any, paramsData);
+  const paramsBuffer = sharedCreateParamsBuffer(device, paramsData);
 
   // Build flat buffer array for cached bind group
   const bgBuffers = [a, b, out, paramsBuffer, ...epilogueInputs];
-  const bindGroup = cachedCreateBindGroup(device as any, pipeline as any, bgBuffers as any) as any;
+  const bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers) as any;
 
   // Compute dispatch dimensions
   const workgroupsX = Math.ceil(n / config.tileN);
@@ -852,10 +797,10 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
 
     const kSplitPipeline = getOrCreatePipeline(device, kSplitCodegenOptions);
     const kSplitParamsData = packMatmulParams(m, n, k, lda, ldb, ldc, 1.0, 1, batchStrideA, batchStrideB, batchStrideC);
-    const kSplitParamsBuffer = sharedCreateParamsBuffer(device as any, kSplitParamsData);
+    const kSplitParamsBuffer = sharedCreateParamsBuffer(device, kSplitParamsData);
 
     const kSplitBgBuffers = [a, b, tempBuffer, kSplitParamsBuffer];
-    const kSplitBindGroup = cachedCreateBindGroup(device as any, kSplitPipeline as any, kSplitBgBuffers as any) as any;
+    const kSplitBindGroup = cachedCreateBindGroup(device, kSplitPipeline, kSplitBgBuffers) as any;
 
     // Dispatch K-split matmul
     const sharedEnc = getSharedEncoderInstance();
@@ -903,10 +848,10 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
     const reduceF32 = new Float32Array(reduceParamsBuf);
     reduceU32[0] = totalElements;
     reduceF32[1] = alpha;
-    const reduceParamsBuffer = sharedCreateParamsBuffer(device as any, reduceU32);
+    const reduceParamsBuffer = sharedCreateParamsBuffer(device, reduceU32);
 
     const reduceBgBuffers = [tempBuffer, out, reduceParamsBuffer];
-    const reduceBindGroup = cachedCreateBindGroup(device as any, reductionPipeline as any, reduceBgBuffers as any) as any;
+    const reduceBindGroup = cachedCreateBindGroup(device, reductionPipeline, reduceBgBuffers) as any;
 
     const reduceWorkgroups = Math.ceil(totalElements / 256);
 
@@ -967,11 +912,11 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
 
   // Create params buffer via shared pool
   const paramsData = packMatmulParams(m, n, k, lda, ldb, ldc, alpha, batchSize, batchStrideA, batchStrideB, batchStrideC);
-  const paramsBuffer = sharedCreateParamsBuffer(device as any, paramsData);
+  const paramsBuffer = sharedCreateParamsBuffer(device, paramsData);
 
   // Build flat buffer array for cached bind group
   const bgBuffers = [a, b, out, paramsBuffer, ...epilogueInputs];
-  const bindGroup = cachedCreateBindGroup(device as any, pipeline as any, bgBuffers as any) as any;
+  const bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers) as any;
 
   const workgroupsZ = batchSize;
 

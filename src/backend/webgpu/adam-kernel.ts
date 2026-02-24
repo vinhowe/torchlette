@@ -22,47 +22,7 @@ import {
 } from "./index";
 import type { AdamStepConfig } from "../types";
 import { profileSubOpBegin, profileSubOpEnd } from "./profiler";
-
-// WebGPU type definitions (runtime, not importable at compile time)
-type GPUBuffer = {
-  size: number;
-  usage: number;
-  destroy(): void;
-};
-
-type GPUDevice = {
-  createShaderModule(descriptor: { code: string }): GPUShaderModule;
-  createComputePipeline(descriptor: {
-    layout: "auto";
-    compute: { module: GPUShaderModule; entryPoint: string };
-  }): GPUComputePipeline;
-  createBindGroup(descriptor: {
-    layout: GPUBindGroupLayout;
-    entries: Array<{
-      binding: number;
-      resource: { buffer: GPUBuffer; offset?: number; size?: number };
-    }>;
-  }): GPUBindGroup;
-  createBuffer(descriptor: {
-    size: number;
-    usage: number;
-    mappedAtCreation?: boolean;
-  }): GPUBuffer;
-  queue: {
-    writeBuffer(
-      buffer: GPUBuffer,
-      offset: number,
-      data: ArrayBufferView,
-    ): void;
-  };
-};
-
-type GPUShaderModule = object;
-type GPUComputePipeline = {
-  getBindGroupLayout(index: number): GPUBindGroupLayout;
-};
-type GPUBindGroupLayout = object;
-type GPUBindGroup = object;
+import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
 
 const WORKGROUP_SIZE = 256;
 const MAX_WORKGROUPS_PER_DIM = 65535;
@@ -696,7 +656,7 @@ function createConfigBuffer(
     _configU32_48[10] = 0; // pad
     _configU32_48[11] = 0; // pad
 
-    return createParamsBuffer(device as any, _configU32_48);
+    return createParamsBuffer(device, _configU32_48);
   }
 
   // 8 x f32/u32 = 32 bytes (original layout)
@@ -709,7 +669,7 @@ function createConfigBuffer(
   _configU32_32[6] = config.decoupledWd ? 1 : 0;
   _configU32_32[7] = numElements;
 
-  return createParamsBuffer(device as any, _configU32_32);
+  return createParamsBuffer(device, _configU32_32);
 }
 
 // ============================================================================
@@ -754,7 +714,7 @@ export function dispatchAdamStep(
   infFlagBuffer: GPUBuffer | null = null,
 ): AdamStepResult {
   const ctx = getWebGPUDevice()!;
-  const device = ctx.device as unknown as GPUDevice;
+  const device = ctx.device;
 
   // Only emit f16 if requested AND the device actually supports shader-f16
   const doF16 = emitF16 && isF16Supported();
@@ -895,7 +855,7 @@ export function dispatchAdamStep(
       const bgBuffers: GPUBuffer[] = [gradBuffer, paramBuffer, mBuffer, vBuffer, configBuf];
       if (doF16 && paramF16Out) bgBuffers.push(paramF16Out);
       if (doUnscale) bgBuffers.push(infFlagBuffer!);
-      bindGroup = cachedCreateBindGroup(device as any, pipeline as any, bgBuffers as any);
+      bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers);
     }
     profileSubOpEnd("adam.bindGroup", _st);
 
