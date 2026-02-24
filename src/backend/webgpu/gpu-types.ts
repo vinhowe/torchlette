@@ -129,6 +129,11 @@ export type WebGPUContext = {
   f16Supported: boolean;
 };
 
+/** Extract the GPUBuffer from a generic BackendTensor (must be a WebGPUTensor). */
+export function gpuBuffer(tensor: BackendTensor): GPUBuffer {
+  return (tensor as unknown as WebGPUTensor).buffer;
+}
+
 /** Legacy matmul constants (kept for reference, now using tiled matmul) */
 export const MATMUL_WORKGROUP_X = 8;
 export const MATMUL_WORKGROUP_Y = 8;

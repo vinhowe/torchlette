@@ -1,4 +1,5 @@
 import type { Backend, BackendTensor, DType } from "../backend/types";
+import { gpuBuffer } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
 import {
   flushBufferPool,
@@ -700,10 +701,10 @@ export async function executePlanOptimized(
     for (const node of planNodes) {
       for (const ref of node.inputs) {
         if (ref.kind === "materialized") {
-          const buf = (ref.storage.backendTensor as any).buffer;
+          const buf = gpuBuffer(ref.storage.backendTensor);
           if (buf) extBufs.push(buf);
         } else if (ref.kind === "pending" && ref.node.result) {
-          const buf = (ref.node.result.backendTensor as any).buffer;
+          const buf = gpuBuffer(ref.node.result.backendTensor);
           if (buf) extBufs.push(buf);
         }
       }
