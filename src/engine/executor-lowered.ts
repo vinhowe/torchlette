@@ -1,5 +1,5 @@
 import type { Backend, BackendTensor, DType } from "../backend/types";
-import { gpuBuffer } from "../backend/webgpu/gpu-types";
+import { gpuBuffer, asGPUTensor } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
 import {
   flushBufferPool,
@@ -507,7 +507,7 @@ export async function executeLoweredPlan(
                 const inp = node.inputs[ii];
                 if (inp.kind === "pending") {
                   if (!groupNodeIds.has(inp.node.id) &&
-                      !extInputs.some(ei => ei.kind === "pending" && (ei as any).node.id === inp.node.id)) {
+                      !extInputs.some(ei => ei.kind === "pending" && ei.node.id === inp.node.id)) {
                     extInputs.push(inp);
                     pattern.push({ nodeLocalIdx: ni, inputIdx: ii });
                   }
@@ -554,14 +554,14 @@ export async function executeLoweredPlan(
             }
             // Record output node result (inline for ordering)
             if (outputNode.result) {
-              const bt = outputNode.result.backendTensor as any;
+              const bt = asGPUTensor(outputNode.result.backendTensor);
               replayEntries.push({ kind: "result", nodeResult: {
                 nodeIndex: action.outputNodeIndex,
                 buffer: bt.buffer,
-                shape: bt.shape?.slice() ?? [],
-                dtype: bt.dtype ?? "f32",
-                size: bt.size ?? 0,
-                strides: bt.strides?.slice() ?? [],
+                shape: bt.shape.slice(),
+                dtype: bt.dtype,
+                size: bt.size,
+                strides: bt.strides.slice(),
                 isView: false,
               }});
             }
@@ -569,14 +569,14 @@ export async function executeLoweredPlan(
             for (const addIdx of action.additionalOutputNodeIndices) {
               const addNode = planNodes[addIdx];
               if (addNode.result) {
-                const bt = addNode.result.backendTensor as any;
+                const bt = asGPUTensor(addNode.result.backendTensor);
                 replayEntries.push({ kind: "result", nodeResult: {
                   nodeIndex: addIdx,
                   buffer: bt.buffer,
-                  shape: bt.shape?.slice() ?? [],
-                  dtype: bt.dtype ?? "f32",
-                  size: bt.size ?? 0,
-                  strides: bt.strides?.slice() ?? [],
+                  shape: bt.shape.slice(),
+                  dtype: bt.dtype,
+                  size: bt.size,
+                  strides: bt.strides.slice(),
                   isView: false,
                 }});
               }
@@ -640,14 +640,15 @@ export async function executeLoweredPlan(
               // Fix up shape if epilogue absorbed a reshape (e.g. [1,M,N]→[M,N])
               const fastOutShape = outputNode.shape;
               if (!shapesEqual(resultTensor.shape, fastOutShape)) {
-                (resultTensor as any).shape = fastOutShape;
+                const gpuT = asGPUTensor(resultTensor);
+                gpuT.shape = fastOutShape;
                 const newStrides = new Array(fastOutShape.length);
                 let stride = 1;
                 for (let i = fastOutShape.length - 1; i >= 0; i--) {
                   newStrides[i] = stride;
                   stride *= fastOutShape[i];
                 }
-                (resultTensor as any).strides = newStrides;
+                gpuT.strides = newStrides;
               }
               outputNode.result = createStorageHandle(outputNode.device, resultTensor);
             } finally {
@@ -663,14 +664,14 @@ export async function executeLoweredPlan(
                 recordingDispatchIdx++;
               }
               if (outputNode.result) {
-                const bt = outputNode.result.backendTensor as any;
+                const bt = asGPUTensor(outputNode.result.backendTensor);
                 replayEntries.push({ kind: "result", nodeResult: {
                   nodeIndex: action.outputNodeIndex,
                   buffer: bt.buffer,
-                  shape: bt.shape?.slice() ?? [],
-                  dtype: bt.dtype ?? "f32",
-                  size: bt.size ?? 0,
-                  strides: bt.strides?.slice() ?? [],
+                  shape: bt.shape.slice(),
+                  dtype: bt.dtype,
+                  size: bt.size,
+                  strides: bt.strides.slice(),
                   isView: false,
                 }});
               }
@@ -762,8 +763,8 @@ export async function executeLoweredPlan(
             const { computeMatmulOutputShape, computeBatchSize, computeBatchStrides } = _webgpuMatmulGeomImports!;
             const { isF16Supported } = await import("../backend/webgpu/index");
 
-            const tensorA = getInputStorage(resolvedInputRefA).backendTensor as any;
-            const tensorB = getInputStorage(resolvedInputRefB).backendTensor as any;
+            const tensorA = asGPUTensor(getInputStorage(resolvedInputRefA).backendTensor);
+            const tensorB = asGPUTensor(getInputStorage(resolvedInputRefB).backendTensor);
 
             // Detect simple last-2-dim transposes (matching detectSimpleTranspose in index.ts).
             // If detected, use original contiguous shape and flip transpose flag.
@@ -827,14 +828,14 @@ export async function executeLoweredPlan(
               recordingDispatchIdx++;
             }
             if (outputNode.result) {
-              const bt = outputNode.result.backendTensor as any;
+              const bt = asGPUTensor(outputNode.result.backendTensor);
               replayEntries.push({ kind: "result", nodeResult: {
                 nodeIndex: action.outputNodeIndex,
                 buffer: bt.buffer,
-                shape: bt.shape?.slice() ?? [],
-                dtype: bt.dtype ?? "f32",
-                size: bt.size ?? 0,
-                strides: bt.strides?.slice() ?? [],
+                shape: bt.shape.slice(),
+                dtype: bt.dtype,
+                size: bt.size,
+                strides: bt.strides.slice(),
                 isView: false,
               }});
             }
@@ -872,14 +873,14 @@ export async function executeLoweredPlan(
             }
             // Record reduction node result
             if (reductionNode.result) {
-              const bt = reductionNode.result.backendTensor as any;
+              const bt = asGPUTensor(reductionNode.result.backendTensor);
               replayEntries.push({ kind: "result", nodeResult: {
                 nodeIndex: action.reductionNodeIndex,
                 buffer: bt.buffer,
-                shape: bt.shape?.slice() ?? [],
-                dtype: bt.dtype ?? "f32",
-                size: bt.size ?? 0,
-                strides: bt.strides?.slice() ?? [],
+                shape: bt.shape.slice(),
+                dtype: bt.dtype,
+                size: bt.size,
+                strides: bt.strides.slice(),
                 isView: false,
               }});
             }
@@ -1003,7 +1004,7 @@ export async function executeLoweredPlan(
             } else if (action.kind === "view") {
               // Views produce deterministic results (same arena buffer, same
               // shape/strides/offset). Cache the result to skip re-execution.
-              const bt = node.result!.backendTensor as any;
+              const bt = asGPUTensor(node.result!.backendTensor);
               replayEntries.push({
                 kind: "view",
                 nodeIndex: nodeIdx,
@@ -1011,12 +1012,12 @@ export async function executeLoweredPlan(
                 arenaResolveIdxAfter: getArenaResolveIndex(),
                 cachedResult: {
                   buffer: bt.buffer,
-                  shape: bt.shape?.slice() ?? [],
-                  dtype: bt.dtype ?? "f32",
-                  size: bt.size ?? 0,
-                  strides: bt.strides?.slice() ?? [],
-                  offset: bt.offset ?? 0,
-                  isContiguous: bt.isContiguous ?? true,
+                  shape: bt.shape.slice(),
+                  dtype: bt.dtype,
+                  size: bt.size,
+                  strides: bt.strides.slice(),
+                  offset: bt.offset,
+                  isContiguous: bt.isContiguous,
                 },
               });
               while (recordingDispatchIdx < recordingBuffer.length) {
@@ -1042,14 +1043,14 @@ export async function executeLoweredPlan(
               }
               // Record node result (inline for ordering)
               if (node.result) {
-                const bt = node.result.backendTensor as any;
+                const bt = asGPUTensor(node.result.backendTensor);
                 replayEntries.push({ kind: "result", nodeResult: {
                   nodeIndex: nodeIdx,
                   buffer: bt.buffer,
-                  shape: bt.shape?.slice() ?? [],
-                  dtype: bt.dtype ?? "f32",
-                  size: bt.size ?? 0,
-                  strides: bt.strides?.slice() ?? [],
+                  shape: bt.shape.slice(),
+                  dtype: bt.dtype,
+                  size: bt.size,
+                  strides: bt.strides.slice(),
                   isView: isView,
                 }});
               }
@@ -1058,13 +1059,13 @@ export async function executeLoweredPlan(
               // in a later plan that skips re-executing this node).
               if (node._sideOutputs?.attnLogsumexp) {
                 const soSH = node._sideOutputs.attnLogsumexp;
-                const sobt = soSH.backendTensor as any;
+                const sobt = asGPUTensor(soSH.backendTensor);
                 replayEntries.push({ kind: "side-output", nodeIndex: nodeIdx,
                   buffer: sobt.buffer,
-                  shape: sobt.shape?.slice() ?? [],
-                  dtype: sobt.dtype ?? "f32",
-                  size: sobt.size ?? 0,
-                  strides: sobt.strides?.slice() ?? [],
+                  shape: sobt.shape.slice(),
+                  dtype: sobt.dtype,
+                  size: sobt.size,
+                  strides: sobt.strides.slice(),
                 });
               }
             }

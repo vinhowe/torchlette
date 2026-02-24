@@ -1,6 +1,6 @@
 # Refactoring Targets
 
-Refactoring opportunities identified from full codebase reviews. All targets (1–5, 7–18) are complete.
+Refactoring opportunities identified from full codebase reviews. All targets (1–5, 7–19) are complete.
 
 ## Target 1: Decompose `webgpu/index.ts` — DONE
 
@@ -52,7 +52,7 @@ Added as part of Target 7.
 
 Identified from full codebase audit after completing Targets 1–11.
 
-### `as any` Cast Inventory (201→55 total; see Targets 10, 13, 14, 17)
+### `as any` Cast Inventory (201→37 total; see Targets 10, 13, 14, 17, 19)
 
 | File | Count | Pattern |
 |------|-------|---------|
@@ -111,3 +111,7 @@ Added `OpExecOptions` type (`{ outBuffer?: unknown }`) to `backend/types.ts`. Ex
 ## Target 18: Deduplicate Shape Utilities — DONE
 
 Created `src/core/shape.ts` as canonical home for pure shape functions (`sizeOf`, `broadcastShapes`, `shapesEqual`) — zero dependencies, importable from any layer. Deleted 7 duplicate copies across `frontend.ts`, `frontend-autograd.ts`, `backend/cpu/numeric.ts`, `engine/ir.ts`, `engine/matmul-epilogue.ts`. Re-export sites (`backend/webgpu/shape-utils.ts`, `runtime/shape-helpers.ts`, `engine/matmul-epilogue.ts`) import and re-export to preserve all downstream import paths.
+
+## Target 19: Typed `BackendTensor` → `WebGPUTensor` Narrowing — DONE
+
+Added `asGPUTensor(tensor)` helper in `gpu-types.ts` to narrow `BackendTensor` to `WebGPUTensor` for typed property access (shape, strides, buffer, dtype, etc.). Removed 13 `as any` casts from `executor-lowered.ts` and 5 from `matmul-epilogue.ts`. Patterns removed: `(bt as any).shape`, `(resultTensor as any).shape = ...`, `asGPUTensor(matmulInputA.backendTensor)` replacing `(matmulInputA.backendTensor as any)`. Total `as any` count: 55→37.
