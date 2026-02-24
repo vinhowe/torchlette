@@ -14,35 +14,32 @@
  */
 
 import type { GPUBuffer, GPUCommandBuffer, GPUCommandEncoder, GPUComputePipeline, GPUBindGroup, WebGPUContext } from "./gpu-types";
-import { requireContext } from "./gpu-context";
+import {
+  activeBatch, setActiveBatch,
+  sharedEncoderActive, setSharedEncoderActive,
+  sharedEncoderWriteSet, resetSharedEncoderWriteSet, trackSharedEncoderWrite,
+  replayPinnedBufferSet,
+  requireContext,
+  incrementSubmitCount,
+  paramsBufferSizeClass, paramsBufferPools, MAX_PARAMS_POOL_SIZE_PER_CLASS,
+} from "./webgpu-state";
 import { bufferPool, awaitDeferredFence } from "./buffer-pool";
 import { resolveGpuTimestamps, profileApiCall } from "./profiler";
 import { getSizeClass } from "../../engine/memory-planning";
 
-import { replayPinnedBufferSet } from "./dispatch-recording";
-import { paramsBufferSizeClass, paramsBufferPools, MAX_PARAMS_POOL_SIZE_PER_CLASS, resetDispatchSequence } from "./bind-group-cache";
+import { resetDispatchSequence } from "./bind-group-cache";
 import { prePinOutputBuffers, pinnedOutputBuffers } from "./buffer-arena";
+
+// Re-exports from webgpu-state for backward compatibility
+export type { BatchExecutionContext } from "./webgpu-state";
+export { activeBatch } from "./webgpu-state";
+export { sharedEncoderActive as sharedEncoder } from "./webgpu-state";
+export { sharedEncoderWriteSet, trackSharedEncoderWrite } from "./webgpu-state";
+export { getSubmitCount, resetSubmitCount, incrementSubmitCount, gpuSubmitCount } from "./webgpu-state";
 
 // ============================================================================
 // Batch Execution Context for True Segmented Execution
 // ============================================================================
-
-/**
- * Batch execution context - collects command buffers for deferred submission.
- *
- * Instead of using a single shared encoder (which causes validation errors
- * when ops have data dependencies), we collect separate command buffers
- * and submit them all together at the end.
- */
-export interface BatchExecutionContext {
-  /** Collected command buffers to submit together */
-  commandBuffers: GPUCommandBuffer[];
-  /** Buffers to destroy after the batch submits (deferred from mid-batch destroy calls) */
-  deferredDestroyBuffers: GPUBuffer[];
-}
-
-/** Active batch context (null when in immediate mode) */
-export let activeBatch: BatchExecutionContext | null = null;
 
 /**
  * Begin batched execution. Subsequent ops will collect command buffers
@@ -53,10 +50,10 @@ export function beginBatchExecution(): void {
   if (activeBatch) {
     throw new Error("Batch execution already active");
   }
-  activeBatch = {
+  setActiveBatch({
     commandBuffers: [],
     deferredDestroyBuffers: [],
-  };
+  });
 }
 
 /**
@@ -69,14 +66,14 @@ export async function endBatchExecution(): Promise<void> {
   }
   const ctx = requireContext();
   const batch = activeBatch;
-  activeBatch = null;
+  setActiveBatch(null);
 
   // Submit each command buffer individually to avoid synchronization scope conflicts.
   // A single queue.submit([cb1, cb2, ...]) puts all CBs in the same scope, causing
   // validation errors if a buffer transitions between read and write across CBs.
   for (const cb of batch.commandBuffers) {
     profileApiCall("queue.submit", () => ctx.queue.submit([cb]));
-    gpuSubmitCount++;
+    incrementSubmitCount();
   }
 
   // Wait for GPU to finish - this is the sync point
@@ -105,7 +102,7 @@ export function isBatchActive(): boolean {
  * Abort batch without submitting (for error recovery).
  */
 export function abortBatch(): void {
-  activeBatch = null;
+  setActiveBatch(null);
 }
 
 /**
@@ -139,13 +136,11 @@ export function getActiveBatchEncoder(): GPUCommandEncoder | null {
 // to prevent buffer pool aliasing — ensuring a buffer written by an earlier op
 // is not reused as output for a later op within the same scope.
 //
-export let sharedEncoder: boolean = false;
 let sharedEncoderEnabled = false;
 let sharedEncoderDepth = 0;
 let sharedEncoderInstance: GPUCommandEncoder | null = null;
 let sharedEncoderPassCount = 0;
 export let collectedCommandBuffers: GPUCommandBuffer[] = [];
-export let sharedEncoderWriteSet: Set<GPUBuffer> = new Set();
 let sharedEncoderDeferredUniformBuffers: GPUBuffer[] = [];
 export let stepLevelScope = false; // true between beginStep() and endStep()
 
@@ -162,10 +157,8 @@ export const PARAMS_FLUSH_THRESHOLD = 2000;
 // Debug flag: set TORCHLETTE_DEBUG_SHARED_ENCODER=1 to enable verbose logging
 export const DEBUG_SHARED_ENCODER = typeof process !== "undefined" && !!process.env?.TORCHLETTE_DEBUG_SHARED_ENCODER;
 
-// Current op label for GPU timestamp profiling (set from lazy.ts)
-let currentOpLabel: string | null = null;
-export function setCurrentOpLabel(label: string | null): void { currentOpLabel = label; }
-export function getCurrentOpLabel(): string | null { return currentOpLabel; }
+// currentOpLabel + get/set moved to webgpu-state.ts, re-exported here for backward compat.
+export { setCurrentOpLabel, getCurrentOpLabel } from "./webgpu-state";
 
 // Adam batch mode: when true, adamStep() skips its pre-dispatch flushSharedEncoder().
 // The caller (lazy.ts) is responsible for a single flush before the Adam batch.
@@ -177,11 +170,11 @@ export function beginSharedEncoder(): void {
   if (!sharedEncoderEnabled) return;
   if (sharedEncoderDepth === 0) {
     const ctx = requireContext();
-    sharedEncoder = true;
+    setSharedEncoderActive(true);
     sharedEncoderInstance = ctx.device.createCommandEncoder();
     sharedEncoderPassCount = 0;
     collectedCommandBuffers = [];
-    sharedEncoderWriteSet = new Set();
+    resetSharedEncoderWriteSet();
 
     sharedEncoderDeferredUniformBuffers = [];
   }
@@ -193,7 +186,7 @@ export function beginSharedEncoder(): void {
  * any collected CBs, submit all, then create a fresh encoder.
  */
 export function flushSharedEncoder(): void {
-  if (!sharedEncoder) return;
+  if (!sharedEncoderActive) return;
   const ctx = requireContext();
 
   // Finish the shared encoder into a command buffer
@@ -211,12 +204,12 @@ export function flushSharedEncoder(): void {
 
   if (cbs.length > 0) {
     profileApiCall("queue.submit", () => ctx.queue.submit(cbs));
-    gpuSubmitCount++;
+    incrementSubmitCount();
   }
 
   // Reset state and create fresh encoder
   collectedCommandBuffers = [];
-  sharedEncoderWriteSet = new Set();
+  resetSharedEncoderWriteSet();
   sharedEncoderInstance = ctx.device.createCommandEncoder();
   sharedEncoderPassCount = 0;
 
@@ -254,7 +247,7 @@ export function flushSharedEncoder(): void {
 export function endSharedEncoder(): void {
   if (!sharedEncoderEnabled) return;
   sharedEncoderDepth--;
-  if (sharedEncoderDepth === 0 && sharedEncoder) {
+  if (sharedEncoderDepth === 0 && sharedEncoderActive) {
     // If step-level scope is active, don't submit — keep encoder open.
     // Bump depth back to 1 so inner begin/end pairs still work.
     if (stepLevelScope) {
@@ -262,7 +255,7 @@ export function endSharedEncoder(): void {
       return;
     }
 
-    sharedEncoder = false;
+    setSharedEncoderActive(false);
     const ctx = requireContext();
 
     // Finish the shared encoder and submit everything
@@ -280,11 +273,11 @@ export function endSharedEncoder(): void {
 
     if (cbs.length > 0) {
       profileApiCall("queue.submit", () => ctx.queue.submit(cbs));
-      gpuSubmitCount++;
+      incrementSubmitCount();
     }
 
     collectedCommandBuffers = [];
-    sharedEncoderWriteSet = new Set();
+    resetSharedEncoderWriteSet();
 
     sharedEncoderPassCount = 0;
 
@@ -367,7 +360,7 @@ export function endStep(): void {
 }
 
 export function isSharedEncoderActive(): boolean {
-  return sharedEncoder;
+  return sharedEncoderActive;
 }
 
 
@@ -393,7 +386,7 @@ export function incrementSharedEncoderPassCount(): void {
  * This prevents extremely large command buffers and bounds the write/read sets.
  */
 export function autoFlushSharedEncoder(): void {
-  if (sharedEncoder && (
+  if (sharedEncoderActive && (
     sharedEncoderPassCount >= SHARED_ENCODER_MAX_PASSES ||
     sharedEncoderDeferredUniformBuffers.length >= PARAMS_FLUSH_THRESHOLD
   )) {
@@ -407,47 +400,10 @@ export function deferUniformBufferForSharedEncoder(buffer: GPUBuffer): void {
 }
 
 /**
- * Track a buffer as written during the current shared encoder scope.
- * The buffer pool must not return this buffer for the rest of the scope.
- */
-export function trackSharedEncoderWrite(buffer: GPUBuffer): void {
-  if (sharedEncoder) {
-    sharedEncoderWriteSet.add(buffer);
-  }
-}
-
-/**
  * Check if a buffer was written during the current shared encoder scope.
  */
 export function isInSharedEncoderWriteSet(buffer: GPUBuffer): boolean {
   return sharedEncoderWriteSet.has(buffer);
-}
-
-// ============================================================================
-// GPU Submit Counter (Profiling)
-// ============================================================================
-
-export let gpuSubmitCount = 0;
-
-/**
- * Get the number of queue.submit() calls since last reset.
- */
-export function getSubmitCount(): number {
-  return gpuSubmitCount;
-}
-
-/**
- * Increment the GPU submit counter (for use from modules that import gpuSubmitCount).
- */
-export function incrementSubmitCount(): void {
-  gpuSubmitCount++;
-}
-
-/**
- * Reset the GPU submit counter.
- */
-export function resetSubmitCount(): void {
-  gpuSubmitCount = 0;
 }
 
 /**
@@ -457,7 +413,7 @@ export function resetSubmitCount(): void {
  * shared encoder's CB at flush/end time.
  */
 export function submitOrCollect(commandBuffer: GPUCommandBuffer): void {
-  if (sharedEncoder) {
+  if (sharedEncoderActive) {
     // Collect for later submission at flush/end of shared encoder scope
     collectedCommandBuffers.push(commandBuffer);
   } else if (activeBatch) {
@@ -465,6 +421,6 @@ export function submitOrCollect(commandBuffer: GPUCommandBuffer): void {
   } else {
     const ctx = requireContext();
     profileApiCall("queue.submit", () => ctx.queue.submit([commandBuffer]));
-    gpuSubmitCount++;
+    incrementSubmitCount();
   }
 }
