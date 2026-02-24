@@ -6,6 +6,13 @@ import {
   type CompiledCacheKey,
   generateCacheKey,
 } from "./compile-cache";
+import {
+  collectTensorHandles,
+  collectTraceTensorIds,
+  computeRngValue,
+  isThenable,
+  isTraceTensor,
+} from "./engine-helpers";
 import { buildIRFromTrace, type IRGraph } from "./ir";
 import {
   buildPlanLinearOrder,
@@ -17,235 +24,53 @@ import {
 import { type Token, TokenStore } from "./tokens";
 import { type TraceEvent, TraceRecorder } from "./trace";
 
-export type LocId = number;
-export type BaseId = number;
-export type LocRole = "ephemeral" | "persistent";
+// Re-export all types, errors, and helpers from extracted modules
+export * from "./engine-types";
+export * from "./engine-errors";
+export * from "./engine-helpers";
 
-export interface LocDebugState {
-  locLogicalVersion: number;
-  locVersion: number;
-  role: LocRole;
-  hasValue: boolean;
-}
-
-export interface BaseDebugState {
-  baseCommitVersion: number;
-  committedMutations: number[];
-}
-
-export interface BaseBindingSnapshot {
-  kind: "ssa" | "loc" | "pending_loc";
-  locId?: number;
-  initTokId?: number;
-  initTokKind?: Token["kind"];
-}
-
-export interface TraceTensor {
-  id: number;
-  epoch: number;
-  label?: string;
-}
-
-export type TensorOrigin =
-  | { kind: "global" }
-  | { kind: "tidy"; scopeId: number };
-
-export class EngineTensor {
-  readonly id: number;
-  readonly baseId: BaseId;
-  readonly origin: TensorOrigin;
-  escapes = false;
-  disposed = false;
-  /** Optional callback to free backend resources (e.g., GPU buffers) */
-  onDispose?: () => void;
-
-  constructor(id: number, baseId: BaseId, origin: TensorOrigin) {
-    this.id = id;
-    this.baseId = baseId;
-    this.origin = origin;
-  }
-}
-
-export interface RngBasis {
-  algorithmId: number;
-  seed: number;
-}
-
-export interface RngDrawRecord {
-  opNonce: number;
-  drawNonce: number;
-  value: number;
-}
-
-export interface RngDrawResult {
-  drawNonce: number;
-  value: number;
-}
-
-export interface SavedTensorRecord {
-  id: number;
-  baseId: BaseId;
-  baseCommitVersionAtSave: number;
-}
-
-export interface CheckpointPack {
-  id: number;
-  reachableBases: BaseId[];
-}
-
-interface BaseState {
-  baseCommitVersion: number;
-  committed: Set<number>;
-}
-
-interface ExecLock {
-  held: boolean;
-  ownerId: number;
-  depth: number;
-}
-
-export interface FinalizeRecord {
-  id: number;
-}
-
-interface BaseBinding {
-  kind: "ssa" | "loc" | "pending_loc";
-  locId?: LocId;
-  initTok?: Token;
-}
-
-interface TidyScope {
-  id: number;
-  tensors: Set<EngineTensor>;
-}
-
-/**
- * Async scope context for tracking tensors across await boundaries.
- * Used by async operations like backward() to ensure cleanup of
- * intermediate tensors that would otherwise leak because they're
- * created after synchronous tidy() scopes have exited.
- */
-interface AsyncScope {
-  id: number;
-  tensors: Set<EngineTensor>;
-}
-
-type TraceTensorStatus = "staging" | "live" | "stale";
-
-export interface TokenSnapshot {
-  id: number;
-  key: string;
-  kind: Token["kind"];
-  roots: number[];
-}
-
-export interface DebugSnapshot {
-  tokGlobal: TokenSnapshot;
-  tokLoc: Record<string, TokenSnapshot>;
-  locs: Record<string, LocDebugState>;
-  bases: Record<string, BaseDebugState>;
-  bindings: Record<string, BaseBindingSnapshot>;
-}
-
-export interface DebugPlan {
-  rootTokenIds: number[];
-}
-
-export interface DebugSimulatedState {
-  tokGlobalId: number;
-  tokLocIds: Record<string, number>;
-}
-
-export interface PredictedStateDelta {
-  locLogicalVersions: Record<string, number>;
-  locVersions: Record<string, number>;
-  baseCommitVersions: Record<string, number>;
-  baseCommittedMutations: Record<string, number[]>;
-  publishSaveCount: number;
-}
-
-// ============================================================================
-// Engine Visibility Types (Phase 1)
-// ============================================================================
-
-/**
- * Memory statistics for engine visibility tooling.
- */
-export interface EngineMemoryStats {
-  // GPU buffer tracking (from external tracker if available)
-  gpuCurrentBytes: number;
-  gpuPeakBytes: number;
-  gpuLimitBytes: number;
-
-  // Buffer pool state (from external pool if available)
-  pooledBuffers: number;
-  inUseBuffers: number;
-  pendingFenceBuffers: number;
-
-  // Engine state
-  activeBases: number;
-  totalPinCount: number;
-  savedTensorCount: number;
-  pendingTensorCount: number;
-
-  // Plan state (from external manager if available)
-  activePlans: number;
-  completedPlans: number;
-}
-
-/**
- * Information about a saved tensor.
- */
-export interface SavedTensorInfo {
-  id: number;
-  baseId: number;
-  commitVersionAtSave: number;
-  savedAt: number; // timestamp
-}
-
-/**
- * Information about a base's state.
- */
-export interface BaseStateInfo {
-  baseId: number;
-  pinCount: number;
-  binding: "ssa" | "loc" | "pending_loc";
-  locId: number | null;
-  hasValue: boolean;
-  commitVersion: number;
-}
-
-/**
- * Memory snapshot for tracking memory changes over time.
- */
-export interface MemorySnapshot {
-  label: string;
-  timestamp: number;
-  stats: EngineMemoryStats;
-}
-
-/**
- * Stats provider interface for external memory tracking systems.
- * This allows the engine to query stats from the runtime's buffer pool,
- * GPU memory tracker, and plan manager.
- */
-export interface MemoryStatsProvider {
-  getGPUStats?: () => {
-    currentBytes: number;
-    peakBytes: number;
-    limitBytes: number;
-  };
-  getBufferPoolStats?: () => {
-    pooledBuffers: number;
-    inUseBuffers: number;
-    pendingFenceBuffers: number;
-  };
-  getPlanStats?: () => {
-    activePlans: number;
-    completedPlans: number;
-  };
-  getPendingTensorCount?: () => number;
-}
+// Local imports from extracted modules (used by Engine class implementation)
+import {
+  type AsyncScope,
+  type BaseBinding,
+  type BaseId,
+  type BaseState,
+  type BaseStateInfo,
+  type CheckpointPack,
+  type DebugPlan,
+  type DebugSimulatedState,
+  type DebugSnapshot,
+  type EngineMemoryStats,
+  EngineTensor,
+  type ExecLock,
+  type FinalizeRecord,
+  type LocDebugState,
+  type LocId,
+  type MemorySnapshot,
+  type MemoryStatsProvider,
+  type PredictedStateDelta,
+  type RngBasis,
+  type RngDrawRecord,
+  type SavedTensorInfo,
+  type SavedTensorRecord,
+  type TensorOrigin,
+  type TidyScope,
+  type TokenSnapshot,
+  type TraceTensor,
+  type TraceTensorStatus,
+} from "./engine-types";
+import {
+  AsyncInCompileError,
+  CheckpointImpureRegionError,
+  EngineBusyError,
+  HostReadInCompileError,
+  InvalidTraceTensorEscapeError,
+  NonReentrantBackwardError,
+  PoisonedEngineError,
+  RngReplayExhaustedError,
+  RngReplayMismatchError,
+  SavedTensorModifiedError,
+} from "./engine-errors";
 
 export class Engine {
   private readonly tokenStore: TokenStore;
@@ -1680,129 +1505,3 @@ export class Engine {
   }
 }
 
-export class EngineBusyError extends Error {
-  name = "EngineBusyError";
-}
-
-export class CheckpointImpureRegionError extends Error {
-  name = "CheckpointImpureRegionError";
-}
-
-export class HostReadInCompileError extends Error {
-  name = "HostReadInCompileError";
-}
-
-export class AsyncInCompileError extends Error {
-  name = "AsyncInCompileError";
-}
-
-export class InvalidTraceTensorEscapeError extends Error {
-  name = "InvalidTraceTensorEscapeError";
-}
-
-export class SavedTensorModifiedError extends Error {
-  name = "SavedTensorModifiedError";
-}
-
-export class NonReentrantBackwardError extends Error {
-  name = "NonReentrantBackwardError";
-}
-
-export class PoisonedEngineError extends Error {
-  name = "PoisonedEngineError";
-}
-
-function collectTensorHandles(value: unknown): EngineTensor[] {
-  const out: EngineTensor[] = [];
-  const seen = new Set<unknown>();
-
-  const visit = (current: unknown) => {
-    if (current === null || current === undefined) {
-      return;
-    }
-    if (current instanceof EngineTensor) {
-      out.push(current);
-      return;
-    }
-    if (typeof current !== "object") {
-      return;
-    }
-    if (seen.has(current)) {
-      return;
-    }
-    seen.add(current);
-    if (Array.isArray(current)) {
-      for (const entry of current) {
-        visit(entry);
-      }
-      return;
-    }
-    for (const entry of Object.values(current as Record<string, unknown>)) {
-      visit(entry);
-    }
-  };
-
-  visit(value);
-  return out;
-}
-
-export class RngReplayExhaustedError extends Error {
-  name = "RngReplayExhaustedError";
-}
-
-export class RngReplayMismatchError extends Error {
-  name = "RngReplayMismatchError";
-}
-
-function isThenable(value: unknown): value is Promise<unknown> {
-  if (!value) {
-    return false;
-  }
-  return typeof (value as Promise<unknown>).then === "function";
-}
-
-function collectTraceTensorIds(value: unknown): number[] {
-  if (!value) {
-    return [];
-  }
-  if (Array.isArray(value)) {
-    return value.flatMap((item) => collectTraceTensorIds(item));
-  }
-  if (isTraceTensor(value)) {
-    return [value.id];
-  }
-  return [];
-}
-
-function isTraceTensor(value: unknown): value is TraceTensor {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-  const record = value as TraceTensor;
-  return typeof record.id === "number" && typeof record.epoch === "number";
-}
-
-function computeRngValue(
-  basis: RngBasis,
-  opNonce: number,
-  drawNonce: number,
-): number {
-  const seed = basis.seed >>> 0;
-  const algo = basis.algorithmId >>> 0;
-  const op = opNonce >>> 0;
-  const draw = drawNonce >>> 0;
-  let state =
-    seed ^ Math.imul(algo, 0x9e3779b9) ^ op ^ Math.imul(draw, 0x85ebca6b);
-  state = mix32(state);
-  return (state >>> 0) / 2 ** 32;
-}
-
-function mix32(value: number): number {
-  let v = value >>> 0;
-  v ^= v >>> 16;
-  v = Math.imul(v, 0x7feb352d);
-  v ^= v >>> 15;
-  v = Math.imul(v, 0x846ca68b);
-  v ^= v >>> 16;
-  return v >>> 0;
-}

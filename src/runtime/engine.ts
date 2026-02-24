@@ -49,94 +49,44 @@ import {
   type MemoryPlanningStats,
 } from "../engine/memory-planned-executor";
 import { type BaseId, createBaseId, materializePendingTensors, Tensor } from "./tensor";
+import {
+  type DispatchMode,
+  IntermediateTrackingMode,
+  type OpInput,
+  type RuntimeEngineOptions,
+} from "./engine-types";
+import {
+  broadcastShapes,
+  broadcastThreeShapes,
+  matmulShape,
+  reduceShape,
+  transposeShape,
+} from "./shape-helpers";
+import {
+  extractAttentionDKOp,
+  extractAttentionDVOp,
+  extractAttentionLogsumexpOp,
+  extractLnBwdGradBiasOp,
+  fusedAttentionBackwardOp,
+  fusedAttentionForwardOp,
+  fusedCrossEntropyBackwardOp,
+  fusedCrossEntropyForwardOp,
+  fusedLayerNormBackwardGradWeightBiasOp,
+  fusedLayerNormBackwardGradXOp,
+  fusedLayerNormForwardOp,
+} from "./engine-fused";
 
-/** A tensor or a numeric scalar (will be inlined as a constant in fused kernels). */
-export type TensorOrScalar = Tensor | number;
-
-/**
- * Lightweight reference to a lazy computation with shape/dtype metadata.
- * Used internally by ensureDtypeSafety to build cast nodes without creating
- * full Tensor objects (which would register in pendingTensorsByNodeId and leak).
- * Tensor satisfies this interface, so existing Tensors can be used directly.
- */
-type OpInput = Pick<Tensor, "lazyRef" | "shape" | "dtype" | "device">;
+// Re-export types and shape helpers for backward compatibility.
+// NOTE: engine-facade.ts is NOT re-exported here to avoid circular dependencies
+// (facade imports RuntimeEngine from this file). Facade functions are re-exported
+// via src/engine/index.ts barrel instead.
+export * from "./engine-types";
+export * from "./shape-helpers";
 
 /** Build a cast LazyRef without creating a Tensor (no lifecycle, no registration). */
 function castRef(input: OpInput, toDtype: DType): OpInput {
   const node = createLazyIRNode("cast", [input.lazyRef], input.shape.slice(), toDtype, input.device, { dtype: toDtype });
   return { lazyRef: createPendingRef(node), shape: input.shape, dtype: toDtype, device: input.device };
-}
-
-/**
- * Dispatch mode: receives notifications when RuntimeTensors are created or escape a scope.
- * Pushed/popped on a stack on RuntimeEngine. All active modes are notified.
- */
-export interface DispatchMode {
-  onTensorCreated(tensor: Tensor): void;
-  onTensorEscaped?(tensor: Tensor): void;
-}
-
-/**
- * Dispatch mode that tracks RuntimeTensors created within a tidy scope.
- * Tensors that are wrapped (via markEscaped) are exempt from disposal.
- * At scope exit, disposeNonEscaped() cleans up unwrapped intermediates.
- */
-export class TidyDispatchMode implements DispatchMode {
-  readonly tracked = new Set<Tensor>();
-  readonly escaped = new Set<Tensor>();
-
-  onTensorCreated(tensor: Tensor): void {
-    this.tracked.add(tensor);
-  }
-
-  onTensorEscaped(tensor: Tensor): void {
-    this.escaped.add(tensor);
-  }
-
-  /** Dispose all RuntimeTensors that weren't wrapped (didn't escape). */
-  disposeNonEscaped(): void {
-    for (const t of this.tracked) {
-      if (!this.escaped.has(t) && !t.disposed) {
-        t.dispose();
-      }
-    }
-  }
-}
-
-export interface RuntimeEngineOptions {
-  /** Enable memory planning for buffer pooling and reuse */
-  enableMemoryPlanning?: boolean;
-  /** Enable buffer donation (reuse input buffers for outputs) */
-  enableDonation?: boolean;
-  /** Track memory planning statistics */
-  trackStats?: boolean;
-  /** Enable automatic fusion of elementwise ops (§15) */
-  enableFusion?: boolean;
-  /** Enable vectorization for fused kernels */
-  enableVectorization?: boolean;
-  /** Enable early buffer release during execution for memory savings */
-  enableEarlyRelease?: boolean;
-  /**
-   * Enable segmented execution at checkpoint boundaries.
-   * This enables memory savings for large models by executing segments
-   * separately and flushing buffers between them.
-   */
-  enableCheckpointSegmentation?: boolean;
-  /**
-   * Enable true segmented execution with GPU synchronization.
-   * Provides actual memory savings for checkpointed models at cost of
-   * increased latency due to GPU sync points between segments.
-   * This is more effective than enableCheckpointSegmentation but slower.
-   */
-  enableTrueSegmentation?: boolean;
-}
-
-/** Internal dispatch mode used by startIntermediateTracking/stopIntermediateTracking. */
-class IntermediateTrackingMode implements DispatchMode {
-  readonly tracked = new Set<Tensor>();
-  onTensorCreated(tensor: Tensor): void {
-    this.tracked.add(tensor);
-  }
 }
 
 export class RuntimeEngine {
@@ -1982,508 +1932,59 @@ export class RuntimeEngine {
     return this.createAndTrack(createBaseId(), ref, shape, device, dtype);
   }
 
-  /**
-   * Fused cross-entropy forward: logits [B,V] + targets [B] → per-sample loss [B].
-   */
-  fusedCrossEntropyForward(
-    logits: Tensor,
-    targets: Tensor,
-    config: FusedCrossEntropyConfig,
-  ): Tensor {
-    const node = createLazyIRNode(
-      "fusedCrossEntropyForward",
-      [logits.lazyRef, targets.lazyRef],
-      [config.batchSize],
-      "f32",
-      logits.device,
-      config,
-    );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), [config.batchSize], logits.device);
+  fusedCrossEntropyForward(logits: Tensor, targets: Tensor, config: FusedCrossEntropyConfig): Tensor {
+    const { ref, shape } = fusedCrossEntropyForwardOp(logits.lazyRef, targets.lazyRef, logits.device, config);
+    return this.createAndTrack(createBaseId(), ref, shape, logits.device);
   }
 
-  /**
-   * Fused cross-entropy backward: logits [B,V] + targets [B] + grad [B] → grad_logits [B,V].
-   */
-  fusedCrossEntropyBackward(
-    logits: Tensor,
-    targets: Tensor,
-    gradOutput: Tensor,
-    config: FusedCrossEntropyConfig,
-  ): Tensor {
-    const shape = [config.batchSize, config.vocabSize];
-    const node = createLazyIRNode(
-      "fusedCrossEntropyBackward",
-      [logits.lazyRef, targets.lazyRef, gradOutput.lazyRef],
-      shape,
-      "f32",
-      logits.device,
-      config,
-    );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, logits.device);
+  fusedCrossEntropyBackward(logits: Tensor, targets: Tensor, gradOutput: Tensor, config: FusedCrossEntropyConfig): Tensor {
+    const { ref, shape } = fusedCrossEntropyBackwardOp(logits.lazyRef, targets.lazyRef, gradOutput.lazyRef, logits.device, config);
+    return this.createAndTrack(createBaseId(), ref, shape, logits.device);
   }
 
-  /**
-   * Fused LayerNorm forward: x [N,D] + weight [D] + bias [D] → output [N,D].
-   */
-  fusedLayerNormForward(
-    x: Tensor,
-    weight: Tensor,
-    bias: Tensor,
-    config: FusedLayerNormConfig,
-  ): Tensor {
-    const node = createLazyIRNode(
-      "fusedLayerNormForward",
-      [x.lazyRef, weight.lazyRef, bias.lazyRef],
-      x.shape.slice(),
-      "f32",
-      x.device,
-      config,
-    );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), x.shape.slice(), x.device);
+  fusedLayerNormForward(x: Tensor, weight: Tensor, bias: Tensor, config: FusedLayerNormConfig): Tensor {
+    const { ref, shape } = fusedLayerNormForwardOp(x.lazyRef, weight.lazyRef, bias.lazyRef, x.shape, x.device, config);
+    return this.createAndTrack(createBaseId(), ref, shape, x.device);
   }
 
-  /**
-   * Fused LayerNorm backward gradX: grad [N,D] + x [N,D] + weight [D] → gradX [N,D].
-   */
-  fusedLayerNormBackwardGradX(
-    gradOutput: Tensor,
-    x: Tensor,
-    weight: Tensor,
-    config: FusedLayerNormConfig,
-  ): Tensor {
-    const node = createLazyIRNode(
-      "fusedLayerNormBackwardGradX",
-      [gradOutput.lazyRef, x.lazyRef, weight.lazyRef],
-      x.shape.slice(),
-      "f32",
-      x.device,
-      config,
-    );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), x.shape.slice(), x.device);
+  fusedLayerNormBackwardGradX(gradOutput: Tensor, x: Tensor, weight: Tensor, config: FusedLayerNormConfig): Tensor {
+    const { ref, shape } = fusedLayerNormBackwardGradXOp(gradOutput.lazyRef, x.lazyRef, weight.lazyRef, x.shape, x.device, config);
+    return this.createAndTrack(createBaseId(), ref, shape, x.device);
   }
 
-  /**
-   * Fused LayerNorm backward gradWeight+gradBias.
-   * Returns gradWeight as main output. gradBias extracted via extractLnBwdGradBias.
-   */
-  fusedLayerNormBackwardGradWeightBias(
-    gradOutput: Tensor,
-    x: Tensor,
-    config: FusedLayerNormConfig,
-  ): Tensor {
-    const shape = [config.featureDim];
-    const node = createLazyIRNode(
-      "fusedLayerNormBackwardGradWeightBias",
-      [gradOutput.lazyRef, x.lazyRef],
-      shape,
-      "f32",
-      gradOutput.device,
-      config,
-    );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, gradOutput.device);
+  fusedLayerNormBackwardGradWeightBias(gradOutput: Tensor, x: Tensor, config: FusedLayerNormConfig): Tensor {
+    const { ref, shape } = fusedLayerNormBackwardGradWeightBiasOp(gradOutput.lazyRef, x.lazyRef, gradOutput.device, config);
+    return this.createAndTrack(createBaseId(), ref, shape, gradOutput.device);
   }
 
-  /**
-   * Fused attention forward: Q,K,V [B,H,N,D] → O [B,H,N,D].
-   * Logsumexp is extracted via extractAttentionLogsumexp.
-   */
-  fusedAttentionForward(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    config: FusedAttentionConfig,
-  ): Tensor {
-    const shape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
-    const node = createLazyIRNode(
-      "fusedAttentionForward",
-      [q.lazyRef, k.lazyRef, v.lazyRef],
-      shape,
-      "f32",
-      q.device,
-      config,
-    );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, q.device);
+  fusedAttentionForward(q: Tensor, k: Tensor, v: Tensor, config: FusedAttentionConfig): Tensor {
+    const { ref, shape } = fusedAttentionForwardOp(q.lazyRef, k.lazyRef, v.lazyRef, q.device, config);
+    return this.createAndTrack(createBaseId(), ref, shape, q.device);
   }
 
-  /**
-   * Extract logsumexp side output [B,H,N] from fusedAttentionForward.
-   */
   extractAttentionLogsumexp(fwdOutput: Tensor, config: FusedAttentionConfig): Tensor {
-    const shape = [config.batchSize, config.numHeads, config.seqLen];
-    const node = createLazyIRNode(
-      "extractAttentionLogsumexp",
-      [fwdOutput.lazyRef],
-      shape,
-      "f32",
-      fwdOutput.device,
-    );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, fwdOutput.device);
+    const { ref, shape } = extractAttentionLogsumexpOp(fwdOutput.lazyRef, fwdOutput.device, config);
+    return this.createAndTrack(createBaseId(), ref, shape, fwdOutput.device);
   }
 
-  /**
-   * Fused attention backward: Q,K,V,L,dO,O → dQ [B,H,N,D].
-   * dK and dV are extracted via extractAttentionDK/DV.
-   */
-  fusedAttentionBackward(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    logsumexp: Tensor,
-    dO: Tensor,
-    output: Tensor,
-    config: FusedAttentionConfig,
-  ): Tensor {
-    const shape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
-    const node = createLazyIRNode(
-      "fusedAttentionBackward",
-      [q.lazyRef, k.lazyRef, v.lazyRef, logsumexp.lazyRef, dO.lazyRef, output.lazyRef],
-      shape,
-      "f32",
-      q.device,
-      config,
-    );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, q.device);
+  fusedAttentionBackward(q: Tensor, k: Tensor, v: Tensor, logsumexp: Tensor, dO: Tensor, output: Tensor, config: FusedAttentionConfig): Tensor {
+    const { ref, shape } = fusedAttentionBackwardOp(q.lazyRef, k.lazyRef, v.lazyRef, logsumexp.lazyRef, dO.lazyRef, output.lazyRef, q.device, config);
+    return this.createAndTrack(createBaseId(), ref, shape, q.device);
   }
 
-  /**
-   * Extract dK side output from fusedAttentionBackward.
-   */
   extractAttentionDK(bwdDQ: Tensor, config: FusedAttentionConfig): Tensor {
-    const shape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
-    const node = createLazyIRNode(
-      "extractAttentionDK",
-      [bwdDQ.lazyRef],
-      shape,
-      "f32",
-      bwdDQ.device,
-    );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, bwdDQ.device);
+    const { ref, shape } = extractAttentionDKOp(bwdDQ.lazyRef, bwdDQ.device, config);
+    return this.createAndTrack(createBaseId(), ref, shape, bwdDQ.device);
   }
 
-  /**
-   * Extract dV side output from fusedAttentionBackward.
-   */
   extractAttentionDV(bwdDQ: Tensor, config: FusedAttentionConfig): Tensor {
-    const shape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
-    const node = createLazyIRNode(
-      "extractAttentionDV",
-      [bwdDQ.lazyRef],
-      shape,
-      "f32",
-      bwdDQ.device,
-    );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, bwdDQ.device);
+    const { ref, shape } = extractAttentionDVOp(bwdDQ.lazyRef, bwdDQ.device, config);
+    return this.createAndTrack(createBaseId(), ref, shape, bwdDQ.device);
   }
 
-  /**
-   * Extract the gradBias side output from a fusedLayerNormBackwardGradWeightBias node.
-   */
   extractLnBwdGradBias(gradWeight: Tensor, featureDim: number): Tensor {
-    const shape = [featureDim];
-    const node = createLazyIRNode(
-      "extractLnBwdGradBias",
-      [gradWeight.lazyRef],
-      shape,
-      "f32",
-      gradWeight.device,
-      { featureDim },
-    );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, gradWeight.device);
+    const { ref, shape } = extractLnBwdGradBiasOp(gradWeight.lazyRef, gradWeight.device, featureDim);
+    return this.createAndTrack(createBaseId(), ref, shape, gradWeight.device);
   }
 
-}
-
-const defaultEngine = new RuntimeEngine();
-
-export function tensorFromArray(
-  values: number[],
-  shape: number[],
-  device?: DeviceKind,
-): Tensor {
-  return defaultEngine.tensorFromArray(values, shape, device);
-}
-
-export function add(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-  return defaultEngine.add(a, b);
-}
-
-export function sub(a: TensorOrScalar, b: TensorOrScalar, options?: SubOptions): Tensor {
-  return defaultEngine.sub(a, b, options);
-}
-
-export function div(a: TensorOrScalar, b: TensorOrScalar, options?: DivOptions): Tensor {
-  return defaultEngine.div(a, b, options);
-}
-
-export function mul(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-  return defaultEngine.mul(a, b);
-}
-
-export function view(a: Tensor, shape: number[]): Tensor {
-  return defaultEngine.view(a, shape);
-}
-
-export function reshape(a: Tensor, shape: number[]): Tensor {
-  return defaultEngine.reshape(a, shape);
-}
-
-export function matmul(a: Tensor, b: Tensor): Tensor {
-  return defaultEngine.matmul(a, b);
-}
-
-export function sqrt(a: Tensor): Tensor {
-  return defaultEngine.sqrt(a);
-}
-
-export function relu(a: Tensor): Tensor {
-  return defaultEngine.relu(a);
-}
-
-export function exp(a: Tensor): Tensor {
-  return defaultEngine.exp(a);
-}
-
-export function log(a: Tensor): Tensor {
-  return defaultEngine.log(a);
-}
-
-export function neg(a: Tensor): Tensor {
-  return defaultEngine.neg(a);
-}
-
-export function abs(a: Tensor): Tensor {
-  return defaultEngine.abs(a);
-}
-
-export function tanh(a: Tensor): Tensor {
-  return defaultEngine.tanh(a);
-}
-
-export function sigmoid(a: Tensor): Tensor {
-  return defaultEngine.sigmoid(a);
-}
-
-export function gelu(a: Tensor, options?: GeluOptions): Tensor {
-  return defaultEngine.gelu(a, options);
-}
-
-export function silu(a: Tensor): Tensor {
-  return defaultEngine.silu(a);
-}
-
-export function isfinite(a: Tensor): Tensor {
-  return defaultEngine.isfinite(a);
-}
-
-export function expand(a: Tensor, shape: number[]): Tensor {
-  return defaultEngine.expand(a, shape);
-}
-
-export function transpose(a: Tensor, options: TransposeOptions): Tensor {
-  return defaultEngine.transpose(a, options);
-}
-
-export function permute(a: Tensor, dims: number[]): Tensor {
-  return defaultEngine.permute(a, dims);
-}
-
-export function contiguous(a: Tensor): Tensor {
-  return defaultEngine.contiguous(a);
-}
-
-export function cast(a: Tensor, dtype: DType): Tensor {
-  return defaultEngine.cast(a, dtype);
-}
-
-export function gather(
-  a: Tensor,
-  index: Tensor,
-  options: GatherOptions,
-): Tensor {
-  return defaultEngine.gather(a, index, options);
-}
-
-export function scatterAdd(
-  a: Tensor,
-  index: Tensor,
-  src: Tensor,
-  options: ScatterAddOptions,
-): Tensor {
-  return defaultEngine.scatterAdd(a, index, src, options);
-}
-
-export function sum(a: Tensor, options?: SumOptions): number | Tensor {
-  return defaultEngine.sum(a, options);
-}
-
-export function max(a: Tensor, options?: MaxOptions): number | Tensor {
-  return defaultEngine.max(a, options);
-}
-
-export function mean(a: Tensor, options?: MeanOptions): number | Tensor {
-  return defaultEngine.mean(a, options);
-}
-
-export function argmax(a: Tensor, options: ArgReduceOptions): Tensor {
-  return defaultEngine.argmax(a, options);
-}
-
-export function argmin(a: Tensor, options: ArgReduceOptions): Tensor {
-  return defaultEngine.argmin(a, options);
-}
-
-export function gt(a: Tensor, b: Tensor): Tensor {
-  return defaultEngine.gt(a, b);
-}
-
-export function lt(a: Tensor, b: Tensor): Tensor {
-  return defaultEngine.lt(a, b);
-}
-
-export function ge(a: Tensor, b: Tensor): Tensor {
-  return defaultEngine.ge(a, b);
-}
-
-export function le(a: Tensor, b: Tensor): Tensor {
-  return defaultEngine.le(a, b);
-}
-
-export function eq(a: Tensor, b: Tensor): Tensor {
-  return defaultEngine.eq(a, b);
-}
-
-export function ne(a: Tensor, b: Tensor): Tensor {
-  return defaultEngine.ne(a, b);
-}
-
-export function where(condition: Tensor, x: Tensor, y: Tensor): Tensor {
-  return defaultEngine.where(condition, x, y);
-}
-
-export async function cpu(a: Tensor): Promise<number[]> {
-  return defaultEngine.cpu(a);
-}
-
-export async function item(a: Tensor): Promise<number> {
-  return defaultEngine.item(a);
-}
-
-// In-place operations
-
-export function copy_(dst: Tensor, src: Tensor): Tensor {
-  return defaultEngine.copy_(dst, src);
-}
-
-export function add_(dst: Tensor, src: Tensor): Tensor {
-  return defaultEngine.add_(dst, src);
-}
-
-export function zero_(dst: Tensor): Tensor {
-  return defaultEngine.zero_(dst);
-}
-
-export function fill_(dst: Tensor, value: number): Tensor {
-  return defaultEngine.fill_(dst, value);
-}
-
-export function mul_(dst: Tensor, value: number): Tensor {
-  return defaultEngine.mul_(dst, value);
-}
-
-// Helper functions for shape inference
-
-function broadcastShapes(a: number[], b: number[]): number[] {
-  const outRank = Math.max(a.length, b.length);
-  const out = new Array<number>(outRank);
-  for (let i = 0; i < outRank; i++) {
-    const aDim = a[a.length - 1 - i] ?? 1;
-    const bDim = b[b.length - 1 - i] ?? 1;
-    if (aDim !== bDim && aDim !== 1 && bDim !== 1) {
-      throw new Error(`Cannot broadcast shapes [${a}] and [${b}]`);
-    }
-    out[outRank - 1 - i] = Math.max(aDim, bDim);
-  }
-  return out;
-}
-
-function matmulShape(a: number[], b: number[]): number[] {
-  if (a.length < 1 || b.length < 1) {
-    throw new Error("matmul requires at least 1D tensors");
-  }
-
-  // Handle 1D cases
-  if (a.length === 1 && b.length === 1) {
-    // Vector dot product: [n] @ [n] -> []
-    return [];
-  }
-  if (a.length === 1) {
-    // [n] @ [..., n, m] -> [..., m]
-    return [...b.slice(0, -2), b[b.length - 1]];
-  }
-  if (b.length === 1) {
-    // [..., m, n] @ [n] -> [..., m]
-    return a.slice(0, -1);
-  }
-
-  // 2D+ matmul
-  const m = a[a.length - 2];
-  const n = b[b.length - 1];
-
-  // Broadcast batch dimensions
-  const aBatch = a.slice(0, -2);
-  const bBatch = b.slice(0, -2);
-  const batch = broadcastShapes(aBatch, bBatch);
-
-  return [...batch, m, n];
-}
-
-function transposeShape(shape: number[], options: TransposeOptions): number[] {
-  const { dim0, dim1 } = options;
-  const result = shape.slice();
-  const temp = result[dim0];
-  result[dim0] = result[dim1];
-  result[dim1] = temp;
-  return result;
-}
-
-function reduceShape(
-  shape: number[],
-  dim: number | number[] | null | undefined,
-  keepdim: boolean,
-): number[] {
-  if (dim == null) {
-    // Reduce all dimensions
-    return keepdim ? shape.map(() => 1) : [];
-  }
-
-  const dims = Array.isArray(dim) ? dim : [dim];
-  const normalizedDims = dims.map((d) => (d < 0 ? shape.length + d : d));
-
-  if (keepdim) {
-    return shape.map((s, i) => (normalizedDims.includes(i) ? 1 : s));
-  }
-
-  return shape.filter((_, i) => !normalizedDims.includes(i));
-}
-
-function broadcastThreeShapes(a: number[], b: number[], c: number[]): number[] {
-  const outRank = Math.max(a.length, b.length, c.length);
-  const out = new Array<number>(outRank);
-  for (let i = 0; i < outRank; i++) {
-    const aDim = a[a.length - 1 - i] ?? 1;
-    const bDim = b[b.length - 1 - i] ?? 1;
-    const cDim = c[c.length - 1 - i] ?? 1;
-    // Check all pairs for broadcast compatibility
-    if (aDim !== bDim && aDim !== 1 && bDim !== 1) {
-      throw new Error(`Cannot broadcast shapes [${a}], [${b}], and [${c}]`);
-    }
-    if (aDim !== cDim && aDim !== 1 && cDim !== 1) {
-      throw new Error(`Cannot broadcast shapes [${a}], [${b}], and [${c}]`);
-    }
-    if (bDim !== cDim && bDim !== 1 && cDim !== 1) {
-      throw new Error(`Cannot broadcast shapes [${a}], [${b}], and [${c}]`);
-    }
-    out[outRank - 1 - i] = Math.max(aDim, bDim, cDim);
-  }
-  return out;
 }
