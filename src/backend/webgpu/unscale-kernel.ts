@@ -401,3 +401,11 @@ function alignBufferSize(size: number): number {
   while (s < size) s <<= 1;
   return s;
 }
+
+/**
+ * Reset all module-local mutable state (pipeline cache, persistent inf flag buffer).
+ */
+export function resetUnscaleKernelState(): void {
+  pipelineCache.clear();
+  destroyPersistentInfFlagBuffer();
+}

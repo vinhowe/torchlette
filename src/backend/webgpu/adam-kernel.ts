@@ -895,3 +895,10 @@ export function dispatchAdamStep(
   return result;
 }
 
+/**
+ * Reset all module-local mutable state (pipeline cache).
+ */
+export function resetAdamKernelState(): void {
+  pipelineCache.clear();
+}
+

@@ -291,3 +291,11 @@ export function dispatchCrossEntropyBackward(
 
   return outBuffer;
 }
+
+/**
+ * Reset all module-local mutable state (pipeline cache, config buffer cache).
+ */
+export function resetCrossEntropyKernelState(): void {
+  pipelineCache.clear();
+  configCache.clear();
+}

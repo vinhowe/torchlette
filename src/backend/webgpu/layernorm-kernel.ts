@@ -529,3 +529,15 @@ export function dispatchLayerNormBackwardGradWeightBias(
 
   return { gradWeightBuffer, gradBiasBuffer };
 }
+
+/**
+ * Reset all module-local mutable state (pipeline cache, row stats temp buffers).
+ */
+export function resetLayerNormKernelState(): void {
+  pipelineCache.clear();
+  for (const entry of rowStatsTempCache.values()) {
+    entry.meanBuffer.destroy();
+    entry.invStdBuffer.destroy();
+  }
+  rowStatsTempCache.clear();
+}
