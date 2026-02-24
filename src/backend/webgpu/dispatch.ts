@@ -276,7 +276,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 `;
 }
 
-export const FUSED_UNARY_OPS = new Map<string, (value: string) => string>([
+const FUSED_UNARY_OPS = new Map<string, (value: string) => string>([
   ["neg", (value) => `-(${value})`],
   ["abs", (value) => `abs(${value})`],
   ["exp", (value) => `exp(${value})`],
@@ -285,7 +285,7 @@ export const FUSED_UNARY_OPS = new Map<string, (value: string) => string>([
   ["sqrt", (value) => `sqrt(${value})`],
 ]);
 
-export const FUSED_BINARY_OPS = new Map<
+const FUSED_BINARY_OPS = new Map<
   string,
   (left: string, right: string) => string
 >([
@@ -295,7 +295,7 @@ export const FUSED_BINARY_OPS = new Map<
   ["div", (left, right) => `(${left} / ${right})`],
 ]);
 
-export function buildFusedExpression(op: string, inputs: string[]): string {
+function buildFusedExpression(op: string, inputs: string[]): string {
   const binary = FUSED_BINARY_OPS.get(op);
   if (binary) {
     if (inputs.length !== 2) {
@@ -331,7 +331,7 @@ function requireShape(node: IRNode): number[] {
   return node.shape;
 }
 
-export function buildFusedElementwiseShader(
+function buildFusedElementwiseShader(
   graph: IRGraph,
   recipe: FusionRecipe,
   use2D?: boolean,

@@ -14,12 +14,12 @@ import type { ExecutionPlan, LazyIRNode } from "./lazy";
 /**
  * Mapping from LazyIRNode IDs to IRNode IDs.
  */
-export type NodeIdMapping = Map<number, number>;
+type NodeIdMapping = Map<number, number>;
 
 /**
  * Result of converting a lazy plan to IR.
  */
-export type LazyToIRResult = {
+type LazyToIRResult = {
   graph: IRGraph;
   nodeMapping: NodeIdMapping;
   outputNodeIds: number[];
@@ -178,91 +178,3 @@ export function detectFusionGroups(nodes: IRNode[]): IRFusionGroup[] {
   return groups;
 }
 
-/**
- * Convert an optimized IR graph back to a sequence of LazyIRNodes.
- *
- * This is used to apply IR optimizations (CSE, DCE) to lazy plans.
- *
- * @param optimizedGraph - The optimized IR graph
- * @param originalPlan - The original execution plan (for node lookup)
- * @param originalMapping - The original node ID mapping
- */
-export function irToLazyPlan(
-  optimizedGraph: IRGraph,
-  originalPlan: ExecutionPlan,
-  originalMapping: NodeIdMapping,
-): ExecutionPlan {
-  // Build reverse mapping: IR ID -> original LazyIRNode
-  const irToLazy = new Map<number, LazyIRNode>();
-  for (const lazyNode of originalPlan.nodes) {
-    const irId = originalMapping.get(lazyNode.id);
-    if (irId !== undefined) {
-      irToLazy.set(irId, lazyNode);
-    }
-  }
-
-  // Build optimized plan by keeping only nodes that remain in the optimized graph
-  const optimizedNodeIds = new Set(optimizedGraph.nodes.map((n) => n.id));
-  const optimizedNodes: LazyIRNode[] = [];
-
-  for (const lazyNode of originalPlan.nodes) {
-    const irId = originalMapping.get(lazyNode.id);
-    if (irId !== undefined && optimizedNodeIds.has(irId)) {
-      optimizedNodes.push(lazyNode);
-    }
-  }
-
-  return { nodes: optimizedNodes };
-}
-
-/**
- * Extract fusible sub-plans from an execution plan.
- *
- * Returns the original plan split into:
- * - Fusible groups (consecutive elementwise ops that can be fused)
- * - Non-fusible segments (ops that must be executed individually)
- */
-export type PlanSegment =
-  | { kind: "fusible"; nodes: LazyIRNode[] }
-  | { kind: "sequential"; nodes: LazyIRNode[] };
-
-export function segmentPlan(plan: ExecutionPlan): PlanSegment[] {
-  const segments: PlanSegment[] = [];
-  let currentFusible: LazyIRNode[] = [];
-  let currentSequential: LazyIRNode[] = [];
-
-  const flushFusible = () => {
-    if (currentFusible.length >= 2) {
-      segments.push({ kind: "fusible", nodes: currentFusible });
-    } else if (currentFusible.length === 1) {
-      // Single op: treat as sequential
-      currentSequential.push(currentFusible[0]);
-    }
-    currentFusible = [];
-  };
-
-  const flushSequential = () => {
-    if (currentSequential.length > 0) {
-      segments.push({ kind: "sequential", nodes: currentSequential });
-      currentSequential = [];
-    }
-  };
-
-  for (const node of plan.nodes) {
-    if (isFusibleElementwise(node.op)) {
-      // Flush any pending sequential nodes first
-      flushSequential();
-      currentFusible.push(node);
-    } else {
-      // Flush any pending fusible group first
-      flushFusible();
-      currentSequential.push(node);
-    }
-  }
-
-  // Flush remaining
-  flushFusible();
-  flushSequential();
-
-  return segments;
-}

@@ -162,30 +162,18 @@ const encoderState: EncoderState = {
   adamBatchMode: false,
 };
 
-/** Reset shared encoder state. For test isolation. */
-export function resetEncoderState(): void {
-  encoderState.enabled = false;
-  encoderState.depth = 0;
-  encoderState.instance = null;
-  encoderState.passCount = 0;
-  encoderState.collectedCommandBuffers = [];
-  encoderState.deferredUniformBuffers = [];
-  encoderState.stepLevelScope = false;
-  encoderState.adamBatchMode = false;
-}
-
 // Auto-flush threshold: finish current encoder and start a new one after N passes.
 // This bounds the size of individual command buffers and the write/read sets.
-export const SHARED_ENCODER_MAX_PASSES = 2000;
+const SHARED_ENCODER_MAX_PASSES = 2000;
 
 // Auto-flush when deferred uniform buffers exceed this threshold.
 // With paramsSequenceBuffers caching, most params are reused directly and never
 // deferred. Only evicted buffers enter the deferred list, which is typically <10
 // per step in steady state. Threshold matches SHARED_ENCODER_MAX_PASSES.
-export const PARAMS_FLUSH_THRESHOLD = 2000;
+const PARAMS_FLUSH_THRESHOLD = 2000;
 
 // Debug flag: set TORCHLETTE_DEBUG_SHARED_ENCODER=1 to enable verbose logging
-export const DEBUG_SHARED_ENCODER = typeof process !== "undefined" && !!process.env?.TORCHLETTE_DEBUG_SHARED_ENCODER;
+const DEBUG_SHARED_ENCODER = typeof process !== "undefined" && !!process.env?.TORCHLETTE_DEBUG_SHARED_ENCODER;
 
 // currentOpLabel + get/set moved to webgpu-state.ts, re-exported here for backward compat.
 export { setCurrentOpLabel, getCurrentOpLabel } from "./webgpu-state";

@@ -141,7 +141,7 @@ export function resetFusionCache(): void {
 /**
  * Input tensor for fused kernel dispatch.
  */
-export interface FusedInputTensor {
+interface FusedInputTensor {
   buffer: GPUBuffer;
   shape: number[];
   dtype: DType;
@@ -150,7 +150,7 @@ export interface FusedInputTensor {
 /**
  * Single output tensor from fused kernel dispatch.
  */
-export interface FusedOutputTensor {
+interface FusedOutputTensor {
   buffer: GPUBuffer;
   shape: number[];
   dtype: DType;
@@ -160,7 +160,7 @@ export interface FusedOutputTensor {
  * Result of fused kernel dispatch.
  * Supports single or multi-output fusion (§15.2).
  */
-export interface FusedDispatchResult {
+interface FusedDispatchResult {
   /** All output buffers (supports multiple for §15.2) */
   outputs: FusedOutputTensor[];
   /** Primary output (first output, for backwards compatibility) */
@@ -172,7 +172,7 @@ export interface FusedDispatchResult {
 /**
  * Options for fused kernel dispatch.
  */
-export interface FusedDispatchOptions {
+interface FusedDispatchOptions {
   /** Optional kernel cache (uses global if not provided) */
   cache?: FusionKernelCache;
   /** Enable vectorized loads/stores for memory coalescing (§15.3) */
@@ -302,60 +302,4 @@ export function dispatchFusedKernel(
     shape: primaryOutput.shape.slice(),
     dtype: primaryOutput.dtype,
   };
-}
-
-
-// ============================================================================
-// High-Level API
-// ============================================================================
-
-/**
- * Execute a chain of elementwise operations as a fused kernel.
- *
- * This is a convenience wrapper that builds the recipe and dispatches.
- */
-export function executeFusedElementwise(
-  device: GPUDevice,
-  ops: Array<{
-    op: string;
-    inputIndices: number[]; // Which previous results or external inputs to use
-  }>,
-  inputs: FusedInputTensor[],
-  outputDtype?: DType,
-  options?: { vectorize?: boolean },
-): FusedDispatchResult {
-  const effectiveOutputDtype = outputDtype ?? inputs[0].dtype;
-  const outputShape = inputs[0].shape; // TODO: compute broadcast output shape
-
-  // Build nodes from ops
-  const nodes = ops.map((op, idx) => ({
-    id: idx,
-    op: op.op,
-    inputs: op.inputIndices.map((i) => (i < 0 ? i : i)),
-    shape: outputShape,
-    dtype: effectiveOutputDtype,
-    isOutput: idx === ops.length - 1,
-  }));
-
-  // Build recipe with outputs array
-  const recipe: FusedKernelRecipe = {
-    id: `dynamic_${ops.map((o) => o.op).join("_")}`,
-    nodes,
-    inputs: inputs.map((input, i) => ({
-      id: -(i + 1),
-      index: i,
-      shape: input.shape,
-      dtype: input.dtype,
-    })),
-    outputs: [{
-      nodeId: ops.length - 1,
-      index: 0,
-      shape: outputShape,
-      dtype: effectiveOutputDtype,
-    }],
-  };
-
-  return dispatchFusedKernel(device, recipe, inputs, {
-    vectorize: options?.vectorize ?? true,
-  });
 }

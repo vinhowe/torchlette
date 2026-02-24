@@ -4,7 +4,7 @@ import type { IRGraph, IRNode } from "./ir";
 /**
  * Output descriptor for a fusion recipe.
  */
-export type FusionOutput = {
+type FusionOutput = {
   nodeId: number;
   shape: number[];
   dtype: DType;

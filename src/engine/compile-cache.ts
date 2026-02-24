@@ -113,7 +113,7 @@ function simpleHash(str: string): string {
  * Extract input signatures from an IR graph.
  * Identifies which nodes are external inputs vs computed nodes.
  */
-export function extractInputSignatures(graph: IRGraph): InputSignature[] {
+function extractInputSignatures(graph: IRGraph): InputSignature[] {
   const nodeIds = new Set(graph.nodes.map((n) => n.id));
   const signatures: InputSignature[] = [];
 

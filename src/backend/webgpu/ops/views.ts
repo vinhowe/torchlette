@@ -294,7 +294,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * Returns null if the reshape requires a contiguous copy.
  * Implements PyTorch's computeStride algorithm.
  */
-export function inferReshapeStrides(
+function inferReshapeStrides(
   oldShape: number[],
   oldStrides: number[],
   newShape: number[],

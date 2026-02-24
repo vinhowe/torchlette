@@ -5,10 +5,6 @@
  */
 
 export {
-  // Types
-  type OpDef,
-  type OpArity,
-
   // Registry
   OP_REGISTRY,
 

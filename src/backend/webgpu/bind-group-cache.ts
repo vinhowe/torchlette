@@ -109,17 +109,6 @@ const cacheState: BindGroupCacheState = {
   paramsSequenceBuffers: [],
 };
 
-/** Reset bind group cache state. For test isolation. */
-export function resetBindGroupCacheLocalState(): void {
-  cacheState.dispatchIndex = 0;
-  cacheState.sequenceEntries.length = 0;
-  cacheState.hits = 0;
-  cacheState.misses = 0;
-  cacheState.missLog = [];
-  cacheState.paramsSeqIndex = 0;
-  cacheState.paramsSequenceBuffers.length = 0;
-}
-
 export function createParamsBuffer(device: GPUDevice, data: Uint32Array): GPUBuffer {
   const sizeClass = paramsBufferSizeClass(data.byteLength);
   const idx = cacheState.paramsSeqIndex++;
@@ -168,11 +157,6 @@ export function createParamsBuffer(device: GPUDevice, data: Uint32Array): GPUBuf
   }
   return buffer;
 }
-
-// paramsSequenceSet is in webgpu-state.ts, imported above.
-
-/** Get the params sequence set (for buffer classification). */
-export function getParamsSequenceSet(): Set<GPUBuffer> { return paramsSequenceSet; }
 
 export function releaseParamsBuffer(buffer: GPUBuffer): void {
   // Sequence-cached params buffers are reused across steps — don't return to pool

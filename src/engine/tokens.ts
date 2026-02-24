@@ -8,7 +8,7 @@ export interface Token {
   key: string;
 }
 
-export interface TokenJoinResult {
+interface TokenJoinResult {
   token: Token;
   roots: number[];
 }

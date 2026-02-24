@@ -29,7 +29,7 @@ import {
   cachedCreateBindGroup,
 } from "../bind-group-cache";
 
-export function comparisonOp(
+function comparisonOp(
   opName: string,
   wgslOp: string,
   a: BackendTensor,
@@ -158,7 +158,7 @@ export function argmin(a: BackendTensor, options: ArgReduceOptions): BackendTens
   return argReduceOp("argmin", "<", a, options);
 }
 
-export function argReduceOp(
+function argReduceOp(
   opName: string,
   compareOp: string,
   a: BackendTensor,

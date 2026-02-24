@@ -330,7 +330,7 @@ export function needsBroadcast(
 /**
  * Result of generating fused expressions.
  */
-export interface GeneratedExpressions {
+interface GeneratedExpressions {
   /** Variable declarations and assignments */
   lines: string[];
   /** Map from node ID to variable name */

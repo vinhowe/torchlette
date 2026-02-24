@@ -122,7 +122,7 @@ export interface FusionGroup {
 /**
  * Result of fusion detection.
  */
-export interface FusionDetectionResult {
+interface FusionDetectionResult {
   /** Detected fusion groups */
   groups: FusionGroup[];
   /** Stats about detection */
@@ -1255,7 +1255,7 @@ export function hasFusionPotential(nodes: LazyIRNode[]): boolean {
  *
  * Materialized refs already have GPU buffers and can't be inlined without readback.
  */
-export function isInlinableScalar(ref: LazyRef): { inlinable: true; value: number } | { inlinable: false } {
+function isInlinableScalar(ref: LazyRef): { inlinable: true; value: number } | { inlinable: false } {
   // Scalar refs are trivially inlinable
   if (ref.kind === "scalar") {
     return { inlinable: true, value: ref.value };

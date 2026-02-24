@@ -908,14 +908,6 @@ const fenceState: FenceState = {
 
 const profilingFenceData = new Uint8Array([1, 2, 3, 4]);
 
-/** Reset deferred fence state. Does NOT destroy the profiling fence buffer. */
-export function resetFenceState(): void {
-  fenceState.pendingFencePromise = null;
-  fenceState.deferredPendingRelease = false;
-  // profilingFenceBuffer intentionally not reset — it's a lazy singleton.
-  // Use destroyProfilingFenceBuffer() for explicit cleanup.
-}
-
 /**
  * Issue a GPU fence without awaiting it. The fence promise is stored
  * and will be awaited at the start of the next markStep.

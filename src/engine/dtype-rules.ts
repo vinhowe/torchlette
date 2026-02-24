@@ -85,7 +85,7 @@ export const OP_DTYPE_RULES: Record<LazyOpCode, { category: OpDtypeCategory }> =
  * Supplementary op names that exist in the frontend/AMP layer but not in LazyOpCode.
  * These are composite ops implemented as combinations of lazy ops.
  */
-export const SUPPLEMENTARY_F16_ELIGIBLE = new Set([
+const SUPPLEMENTARY_F16_ELIGIBLE = new Set([
   "linear",
   "conv1d",
   "conv2d",
@@ -94,7 +94,7 @@ export const SUPPLEMENTARY_F16_ELIGIBLE = new Set([
   "addmm",
 ]);
 
-export const SUPPLEMENTARY_F32_REQUIRED = new Set([
+const SUPPLEMENTARY_F32_REQUIRED = new Set([
   "softmax",
   "log_softmax",
   "layer_norm",

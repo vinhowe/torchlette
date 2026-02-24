@@ -22,7 +22,7 @@ import { dtypeToWgsl } from "../shape-utils";
  * Epilogue operation to fuse into matmul output.
  * Supports arbitrary chains of elementwise operations from the unified op registry.
  */
-export type EpilogueOp =
+type EpilogueOp =
   | { kind: "none" }
   | { kind: "bias"; inputIndex: number } // Special case: broadcast add for bias
   | { kind: "unary"; op: string } // Any unary op from registry (relu, gelu, silu, sigmoid, tanh, etc.)
