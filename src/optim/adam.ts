@@ -115,9 +115,7 @@ export class Adam {
       if (!node) continue;
 
       // Side outputs are StorageHandles created during execution
-      const sideOutputs = (node as any)._adamSideOutputs as
-        | { m: import("../engine/lazy").StorageHandle; v: import("../engine/lazy").StorageHandle }
-        | undefined;
+      const sideOutputs = node._sideOutputs?.adamMV;
 
       if (sideOutputs) {
         // Dispose old state

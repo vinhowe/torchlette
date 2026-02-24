@@ -20,6 +20,7 @@ export type {
   LazyOpCode,
   GeluApproximate,
   StorageHandle,
+  NodeSideOutputs,
   LazyIRNode,
   LazyRef,
   ExecutionPlan,
