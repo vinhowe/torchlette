@@ -15,46 +15,21 @@
 import type { BackendTensor } from "../types";
 import type { GPUBuffer, GPUDevice, WebGPUTensor } from "./gpu-types";
 import { GPUBufferUsage, STORAGE_BUFFER_USAGE } from "./gpu-types";
+import {
+  arenaBufferSet, trackSharedEncoderWrite, requireContext,
+  replayPinnedBufferSet, paramsSequenceSet,
+  outputSeqIndex, getOutputSeqIndex, setOutputSeqIndex,
+} from "./webgpu-state";
+import { createTrackedBuffer } from "./tensor";
 import { bufferPool } from "./buffer-pool";
-import { requireContext } from "./gpu-context";
 import { alignBufferSize } from "./shape-utils";
 import { getSizeClass, getSizeForClass } from "../../engine/memory-planning";
 import { gpuMemoryTracker } from "./memory-tracker";
 import { profileApiCall } from "./profiler";
-import { trackSharedEncoderWrite } from "./shared-encoder";
 
-// ============================================================================
-// Injection callbacks for cross-module dependencies
-// ============================================================================
-// These break circular dependencies with index.ts. The host module (index.ts)
-// wires them up at import time via the _set* functions.
-
-/** Create a tracked buffer (from pool or fresh). Injected from index.ts. */
-let _createTrackedBuffer: (
-  device: GPUDevice,
-  descriptor: { size: number; usage: number; mappedAtCreation?: boolean },
-  preferredBuffer?: GPUBuffer,
-) => GPUBuffer = () => { throw new Error("buffer-arena: createTrackedBuffer not wired"); };
-
-/** Get the replay-pinned buffer set. Injected from index.ts. */
-let _getReplayPinnedBufferSet: () => Set<GPUBuffer> | null = () => null;
-
-/** Get the params sequence set. Injected from index.ts. */
-let _getParamsSequenceSet: () => Set<GPUBuffer> = () => new Set();
-
-export function _setCreateTrackedBuffer(
-  fn: (device: GPUDevice, descriptor: { size: number; usage: number; mappedAtCreation?: boolean }, preferredBuffer?: GPUBuffer) => GPUBuffer,
-): void {
-  _createTrackedBuffer = fn;
-}
-
-export function _setArenaReplayPinnedBufferSetGetter(fn: () => Set<GPUBuffer> | null): void {
-  _getReplayPinnedBufferSet = fn;
-}
-
-export function _setParamsSequenceSetGetter(fn: () => Set<GPUBuffer>): void {
-  _getParamsSequenceSet = fn;
-}
+// Re-export from webgpu-state for backward compatibility
+export { arenaBufferSet } from "./webgpu-state";
+export { outputSeqIndex, getOutputSeqIndex, setOutputSeqIndex } from "./webgpu-state";
 
 // ============================================================================
 // Output allocation functions
@@ -97,7 +72,7 @@ export function allocateOutputBuffer(
 
   const ctx = requireContext();
   const alignedSize = alignBufferSize(sizeBytes);
-  const buffer = _createTrackedBuffer(ctx.device, {
+  const buffer = createTrackedBuffer(ctx.device, {
     size: alignedSize,
     usage:
       GPUBufferUsage.STORAGE |
@@ -160,9 +135,7 @@ export function getBufferSize(
 // On the next step, try to acquire the same buffer from the pool for bind
 // group cache stability.
 
-export let outputSeqIndex = 0;
-export function getOutputSeqIndex(): number { return outputSeqIndex; }
-export function setOutputSeqIndex(v: number): void { outputSeqIndex = v; }
+// outputSeqIndex, getOutputSeqIndex, setOutputSeqIndex are in webgpu-state.ts and re-exported above.
 export const outputSequenceHints: Array<GPUBuffer | null> = [];
 
 // Pre-pinned output buffers: extracted from pool at step start before any dispatches.
@@ -195,8 +168,7 @@ export interface BufferArena {
   alloc: GPUBuffer[];
 }
 
-/** The set of all buffers owned by any active arena (for release interception). */
-export const arenaBufferSet = new Set<GPUBuffer>();
+// arenaBufferSet is in webgpu-state.ts and re-exported above.
 
 /** Currently active arena (set during lowered plan execution). */
 export let activeArena: BufferArena | null = null;
@@ -285,7 +257,7 @@ export function isArenaBuffer(buffer: GPUBuffer): boolean {
 /** Classify a buffer for replay debugging. */
 export function classifyBuffer(buffer: GPUBuffer): string {
   if (arenaBufferSet.has(buffer)) return "arena";
-  if (_getParamsSequenceSet().has(buffer)) return "params-seq";
+  if (paramsSequenceSet.has(buffer)) return "params-seq";
   return `other(size=${buffer.size})`;
 }
 
@@ -294,7 +266,6 @@ export function classifyBuffer(buffer: GPUBuffer): string {
  * Called when a lowered plan is evicted from the fusion analysis cache.
  */
 export function destroyArena(arena: BufferArena): void {
-  const replayPinnedBufferSet = _getReplayPinnedBufferSet();
   for (const arr of [arena.resolve, arena.alloc]) {
     for (const buffer of arr) {
       if (buffer) {
@@ -314,7 +285,6 @@ export function destroyArena(arena: BufferArena): void {
 
 /** Allocate or reuse an arena buffer at the given position in the given array. */
 export function arenaAllocAt(arr: GPUBuffer[], idx: number, sizeBytes: number): GPUBuffer | null {
-  const replayPinnedBufferSet = _getReplayPinnedBufferSet();
   const alignedSize = alignBufferSize(sizeBytes);
   const neededSizeClass = getSizeClass(alignedSize);
 
@@ -440,7 +410,8 @@ export function resolveOutputBuffer(
   // later be acquired by tensors needing the full size class, causing overflow.
   const pooledSize = getSizeForClass(getSizeClass(alignedSize));
   const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
-  const outIdx = outputSeqIndex++;
+  const outIdx = getOutputSeqIndex();
+  setOutputSeqIndex(outIdx + 1);
 
   // Fast path: check pre-pinned buffer (extracted from pool at step start).
   // Pre-pinning eliminates contention — each dispatch position gets its hinted
@@ -466,7 +437,7 @@ export function resolveOutputBuffer(
   }
 
   const preferredBuf = providedOutBuffer ? undefined : (outputSequenceHints[outIdx] ?? undefined);
-  let outBuffer = providedOutBuffer ?? _createTrackedBuffer(device, { size: alignedSize, usage }, preferredBuf);
+  let outBuffer = providedOutBuffer ?? createTrackedBuffer(device, { size: alignedSize, usage }, preferredBuf);
 
   if (!providedOutBuffer && inputBuffers.some(b => b === outBuffer)) {
     const released = bufferPool.release(outBuffer, alignedSize, usage);
@@ -512,7 +483,7 @@ export function resetArenaResolveStats(): void {
 export function resetArenaState(): void {
   outputSequenceHints.length = 0;
   pinnedOutputBuffers.length = 0;
-  outputSeqIndex = 0;
+  setOutputSeqIndex(0);
   activeArena = null;
   arenaResolveIndex = 0;
   arenaAllocIndex = 0;

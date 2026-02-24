@@ -1,61 +1,24 @@
 /**
  * Buffer Pool for GPU Buffer Reuse (spec section 14).
  *
- * Extracted from index.ts. Contains the SimpleBufferPool class, the global
- * bufferPool singleton, pool accessor functions, the deferred GPU fence
- * mechanism, and buffer lifecycle helpers (deferredDestroy, acquirePooledBuffer).
+ * Contains the SimpleBufferPool class, the global bufferPool singleton,
+ * pool accessor functions, the deferred GPU fence mechanism, and buffer
+ * lifecycle helpers (deferredDestroy, acquirePooledBuffer).
  *
- * Cross-module dependencies on mutable variables (activeBatch, sharedEncoder,
- * context, arenaBufferSet, replayPinnedBufferSet) that still live in index.ts
- * are resolved via injected getter callbacks to avoid circular imports.
+ * Cross-module state (activeBatch, sharedEncoderActive, gpuContext,
+ * arenaBufferSet, replayPinnedBufferSet) is accessed via direct imports
+ * from webgpu-state.ts (a zero-dependency leaf module).
  */
 
 import { getSizeClass, getSizeForClass } from "../../engine/memory-planning";
 import { gpuMemoryTracker } from "./memory-tracker";
 import { isProfilingEnabled } from "./profiler";
-import type { GPUBuffer, GPUQueue, GPUDevice, WebGPUContext } from "./gpu-types";
+import type { GPUBuffer, GPUQueue, GPUDevice } from "./gpu-types";
 import { STORAGE_BUFFER_USAGE } from "./gpu-types";
-
-// ============================================================================
-// Cross-module dependency injection
-// ============================================================================
-// These callbacks are set by index.ts at init time to break circular
-// dependency on module-level mutable variables that haven't been extracted yet.
-
-/** Whether a batch execution context is currently active. */
-let _getActiveBatch: () => { deferredDestroyBuffers: GPUBuffer[] } | null = () => null;
-
-/** Whether the shared encoder scope is currently open. */
-let _isSharedEncoderActive: () => boolean = () => false;
-
-/** Get the current WebGPU context (device, queue, etc.). */
-let _getContext: () => WebGPUContext | null = () => null;
-
-/** Get the set of all buffers owned by active arenas. */
-let _getArenaBufferSet: () => Set<GPUBuffer> = () => new Set();
-
-/** Get the set of replay-pinned buffers (null if no replay caches). */
-let _getReplayPinnedBufferSet: () => Set<GPUBuffer> | null = () => null;
-
-export function _setActiveBatchGetter(fn: () => { deferredDestroyBuffers: GPUBuffer[] } | null): void {
-  _getActiveBatch = fn;
-}
-
-export function _setSharedEncoderCheck(fn: () => boolean): void {
-  _isSharedEncoderActive = fn;
-}
-
-export function _setContextGetter(fn: () => WebGPUContext | null): void {
-  _getContext = fn;
-}
-
-export function _setArenaBufferSetGetter(fn: () => Set<GPUBuffer>): void {
-  _getArenaBufferSet = fn;
-}
-
-export function _setReplayPinnedBufferSetGetter(fn: () => Set<GPUBuffer> | null): void {
-  _getReplayPinnedBufferSet = fn;
-}
+import {
+  activeBatch, sharedEncoderActive, gpuContext,
+  arenaBufferSet, replayPinnedBufferSet,
+} from "./webgpu-state";
 
 // ============================================================================
 // Buffer Pool for GPU Buffer Reuse (section 14)
@@ -257,7 +220,7 @@ class SimpleBufferPool {
     // are from a previous step and the GPU may still be using them.
     // Also skip during shared encoder scope — pending buffers may have been
     // written by earlier passes and their command buffers not yet submitted.
-    if (!_getActiveBatch() && !pendingFencePromise && !_isSharedEncoderActive()) {
+    if (!activeBatch && !pendingFencePromise && !sharedEncoderActive) {
       const pendingIdx = this.pendingRelease.findIndex(
         (p) => p.sizeClass === sizeClass && !this.bufferLiveCount.has(p.buffer),
       );
@@ -476,16 +439,14 @@ class SimpleBufferPool {
   deferredDestroy(buffer: GPUBuffer, size: number): void {
     // Arena buffers are owned by the arena — never destroy them.
     // This check covers ALL callers (direct pool calls and wrapper).
-    if (_getArenaBufferSet().has(buffer)) return;
+    if (arenaBufferSet.has(buffer)) return;
     // Replay-pinned buffers are referenced by recorded bind groups — never destroy.
-    const rps = _getReplayPinnedBufferSet();
-    if (rps !== null && rps.has(buffer)) return;
+    if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) return;
     // Track deallocation immediately - the memory is now "freeable"
     gpuMemoryTracker.trackDeallocation(buffer);
     // When batching or shared encoder active, defer until after submit
-    const batch = _getActiveBatch();
-    if (batch) {
-      batch.deferredDestroyBuffers.push(buffer);
+    if (activeBatch) {
+      activeBatch.deferredDestroyBuffers.push(buffer);
       return;
     }
     this.pendingDestroy.push({ buffer, size });
@@ -498,14 +459,12 @@ class SimpleBufferPool {
    */
   deferredDestroyUntracked(buffer: GPUBuffer): void {
     // Replay-pinned buffers are referenced by recorded bind groups — never destroy.
-    const rps = _getReplayPinnedBufferSet();
-    if (rps !== null && rps.has(buffer)) return;
+    if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) return;
     // When batching, command buffers haven't been submitted yet.
     // scheduleFence()'s onSubmittedWorkDone would resolve before the batch submits,
     // destroying the buffer while it's still referenced by collected command buffers.
-    const batch = _getActiveBatch();
-    if (batch) {
-      batch.deferredDestroyBuffers.push(buffer);
+    if (activeBatch) {
+      activeBatch.deferredDestroyBuffers.push(buffer);
       return;
     }
     this.pendingDestroy.push({ buffer, size: 0 });
@@ -583,10 +542,9 @@ class SimpleBufferPool {
    * (queue.onSubmittedWorkDone()) to avoid "buffer destroyed while in use" errors.
    */
   destroyPendingBuffers(): void {
-    const rps = _getReplayPinnedBufferSet();
     for (const { buffer } of this.pendingDestroy) {
       // Replay-pinned buffers must survive
-      if (rps !== null && rps.has(buffer)) continue;
+      if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) continue;
       try {
         buffer.destroy();
       } catch {
@@ -722,8 +680,7 @@ class SimpleBufferPool {
       while (buffers.length > 0 && bytesFreed < bytesNeeded) {
         const buffer = buffers.pop()!;
         // Replay-pinned buffers must survive — push back and skip.
-        const rps = _getReplayPinnedBufferSet();
-        if (rps !== null && rps.has(buffer)) {
+        if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) {
           buffers.push(buffer);
           break; // Can't evict from this size class
         }
@@ -962,7 +919,7 @@ const profilingFenceData = new Uint8Array([1, 2, 3, 4]);
  * buffers are stable across steps (no actual buffer recycling needed).
  */
 export function issueDeferredFence(): void {
-  const ctx = _getContext();
+  const ctx = gpuContext;
   if (!ctx) return;
 
   if (isProfilingEnabled()) {
@@ -1046,10 +1003,9 @@ export function setBufferPoolDebugTrace(enabled: boolean): void {
 export function deferredDestroyBuffer(buffer: GPUBuffer, size: number): void {
   // Arena buffers are owned by the arena — don't destroy them.
   // The arena will reuse the buffer on the next step.
-  if (_getArenaBufferSet().has(buffer)) return;
+  if (arenaBufferSet.has(buffer)) return;
   // Replay-pinned buffers are referenced by recorded bind groups — don't destroy.
-  const rps = _getReplayPinnedBufferSet();
-  if (rps !== null && rps.has(buffer)) return;
+  if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) return;
   bufferPool.deferredDestroy(buffer, size);
 }
 

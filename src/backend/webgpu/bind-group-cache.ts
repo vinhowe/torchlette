@@ -15,73 +15,38 @@ import { bufferPool } from "./buffer-pool";
 import { profileApiCall } from "./profiler";
 import {
   activeBatch,
-  sharedEncoder as sharedEncoderFlag,
+  sharedEncoderActive as sharedEncoderFlag,
+  replayPinnedBufferSet,
+  paramsBufferPools,
+  MAX_PARAMS_POOL_SIZE_PER_CLASS,
+  paramsBufferSizeClass,
+  paramsSequenceSet,
+  getOutputSeqIndex,
+  setOutputSeqIndex,
+  getCurrentOpLabel,
+} from "./webgpu-state";
+import {
   autoFlushSharedEncoder,
   deferUniformBufferForSharedEncoder,
-  getCurrentOpLabel,
 } from "./shared-encoder";
 import {
   dispatchRecordingBuffer,
-  replayPinnedBufferSet,
   setLastBindGroupBuffers,
 } from "./dispatch-recording";
 
 import {
   isArenaBuffer,
+  resetArenaState,
+  resetArenaResolveStats,
+  outputSequenceHints,
+  pinnedOutputBuffers,
 } from "./buffer-arena";
 
 // ============================================================================
-// Injection callbacks for cross-module state that hasn't been extracted yet.
-// These are wired up by index.ts (or eventually buffer-arena.ts / output-buffer module).
+// Params Buffer Pool (state in webgpu-state.ts, re-exported for backward compat)
 // ============================================================================
 
-/** Callback to get/set the output sequence index (lives in output buffer section). */
-let _getOutputSeqIndex: () => number = () => 0;
-let _setOutputSeqIndex: (v: number) => void = () => {};
-
-/** Callback to clear arena state (lives in buffer-arena section). */
-let _clearArenaState: () => void = () => {};
-
-/** Callback to reset arena resolve stats (lives in buffer-arena section). */
-let _resetArenaStats: () => void = () => {};
-
-/** Callback to clear output buffer state (lives in output buffer section). */
-let _clearOutputState: () => void = () => {};
-
-export function _setOutputSeqIndexAccessors(get: () => number, set: (v: number) => void): void {
-  _getOutputSeqIndex = get;
-  _setOutputSeqIndex = set;
-}
-
-export function _setClearArenaStateFn(fn: () => void): void {
-  _clearArenaState = fn;
-}
-
-export function _setResetArenaStatsFn(fn: () => void): void {
-  _resetArenaStats = fn;
-}
-
-export function _setClearOutputStateFn(fn: () => void): void {
-  _clearOutputState = fn;
-}
-
-// ============================================================================
-// Params Buffer Pool
-// ============================================================================
-
-// General-purpose params buffer pool — pools uniform buffers by size class (4, 8, 16, 32, 48, 64).
-// Replaces the old 4-byte-only uniformBufferPool with support for arbitrary param sizes.
-export const paramsBufferPools: Map<number, GPUBuffer[]> = new Map();
-export const MAX_PARAMS_POOL_SIZE_PER_CLASS = 256;
-
-export function paramsBufferSizeClass(byteLength: number): number {
-  if (byteLength <= 4) return 4;
-  if (byteLength <= 8) return 8;
-  if (byteLength <= 16) return 16;
-  if (byteLength <= 32) return 32;
-  if (byteLength <= 48) return 48;
-  return 64;
-}
+export { paramsBufferPools, MAX_PARAMS_POOL_SIZE_PER_CLASS, paramsBufferSizeClass } from "./webgpu-state";
 
 // Pre-allocated Uint32Array pool to avoid ~700 short-lived allocations per step.
 // Each op dispatch creates a params array; reusing pre-allocated arrays reduces GC pressure.
@@ -164,8 +129,7 @@ export function createParamsBuffer(device: GPUDevice, data: Uint32Array): GPUBuf
   return buffer;
 }
 
-// Track which buffers are pinned to sequence positions (not returnable to pool)
-const paramsSequenceSet = new Set<GPUBuffer>();
+// paramsSequenceSet is in webgpu-state.ts, imported above.
 
 /** Get the params sequence set (for buffer classification). */
 export function getParamsSequenceSet(): Set<GPUBuffer> { return paramsSequenceSet; }
@@ -325,19 +289,19 @@ export function cachedCreateBindGroup(
 export function resetDispatchSequence(): void {
   dispatchIndex = 0;
   paramsSeqIndex = 0;
-  _setOutputSeqIndex(0);
+  setOutputSeqIndex(0);
 }
 
 /** Set dispatch sequence counters to specific positions (for replay cache). */
 export function setDispatchSequenceCounters(dispatch: number, params: number, output: number): void {
   dispatchIndex = dispatch;
   paramsSeqIndex = params;
-  _setOutputSeqIndex(output);
+  setOutputSeqIndex(output);
 }
 
 /** Get current dispatch sequence counters (for recording). */
 export function getDispatchSequenceCounters(): { dispatch: number; params: number; output: number } {
-  return { dispatch: dispatchIndex, params: paramsSeqIndex, output: _getOutputSeqIndex() };
+  return { dispatch: dispatchIndex, params: paramsSeqIndex, output: getOutputSeqIndex() };
 }
 
 // ============================================================================
@@ -353,9 +317,11 @@ export function clearBindGroupCache(): void {
   paramsSequenceSet.clear();
   paramsSeqIndex = 0;
   // Clear output buffer state (outputSequenceHints, pinnedOutputBuffers, outputSeqIndex)
-  _clearOutputState();
+  outputSequenceHints.length = 0;
+  pinnedOutputBuffers.length = 0;
+  setOutputSeqIndex(0);
   // Clear arena state (arenas themselves are cleaned up by plan cache eviction)
-  _clearArenaState();
+  resetArenaState();
 }
 
 export function getBindGroupCacheStats(): { hits: number; misses: number; size: number; hitRate: number } {
@@ -367,7 +333,7 @@ export function resetBindGroupCacheStats(): void {
   seqCacheHits = 0;
   seqCacheMisses = 0;
   seqCacheMissLog = [];
-  _resetArenaStats();
+  resetArenaResolveStats();
 }
 
 export function getBindGroupCacheMissLog(): Array<{ idx: number; reason: string; label: string | null; details: string }> {

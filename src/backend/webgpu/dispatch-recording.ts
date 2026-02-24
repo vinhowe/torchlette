@@ -7,11 +7,17 @@
 
 import type { GPUBuffer, GPUComputePipeline, GPUBindGroup } from "./gpu-types";
 import {
+  replayPinnedBufferSet, setReplayPinnedBufferSet,
+} from "./webgpu-state";
+import {
   getSharedEncoderInstance,
   autoFlushSharedEncoder,
   incrementSharedEncoderPassCount,
 } from "./shared-encoder";
 import { getTimestampWrites, setProfileModule } from "./profiler";
+
+// Re-export from webgpu-state for backward compatibility
+export { replayPinnedBufferSet } from "./webgpu-state";
 
 // ---------------------------------------------------------------------------
 // RecordedDispatch interface
@@ -51,11 +57,7 @@ export function setLastBindGroupBuffers(bufs: GPUBuffer[] | null): void {
 // Replay Buffer Pinning
 // ---------------------------------------------------------------------------
 
-// When dispatch replay caches exist, buffers referenced by recorded bind groups
-// must not be destroyed between steps. This set accumulates all such buffers
-// across all plans (forward, backward, optimizer).
-// Checked in deferredDestroy/deferredDestroyUntracked/deferredDestroyBuffer.
-export let replayPinnedBufferSet: Set<GPUBuffer> | null = null;
+// replayPinnedBufferSet is in webgpu-state.ts and re-exported above.
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -81,7 +83,7 @@ export function startDispatchRecording(buffer: RecordedDispatch[]): void {
   // Initialize pin set at recording start so buffers are pinned immediately
   // as they're captured (not deferred until after recording completes).
   if (!replayPinnedBufferSet) {
-    replayPinnedBufferSet = new Set();
+    setReplayPinnedBufferSet(new Set());
   }
 }
 
@@ -119,7 +121,7 @@ export function replayDispatches(dispatches: RecordedDispatch[]): void {
 /** Add buffers to the replay pinned set. Called when a replay cache is built. */
 export function addReplayPinnedBuffers(pins: Set<GPUBuffer>): void {
   if (!replayPinnedBufferSet) {
-    replayPinnedBufferSet = new Set(pins);
+    setReplayPinnedBufferSet(new Set(pins));
   } else {
     for (const b of pins) replayPinnedBufferSet.add(b);
   }

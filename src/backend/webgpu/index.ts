@@ -142,30 +142,15 @@ export { waitForGPU } from "./ops/fused";
 export { detectSimpleTranspose, ensureContiguous } from "./ops/views";
 
 // ============================================================================
-// Imports used locally (for injection wiring and webgpuBackend)
+// Imports used locally (for webgpuBackend object and remaining wiring)
 // ============================================================================
 import type { Backend } from "../types";
 import type { GPUDevice } from "./gpu-types";
+import { gpuContext } from "./webgpu-state";
+import { registerBackend } from "../registry";
 import { pretuneMatmulShapes as pretuneShapes } from "./matmul";
 import { dispatchFusedKernel } from "./fusion-dispatch";
-import { context } from "./gpu-context";
-import { activeBatch, sharedEncoder as sharedEncoderFlag, beginStep, endStep } from "./shared-encoder";
-import {
-  _setSharedEncoderCheck, _setActiveBatchGetter, _setContextGetter,
-  _setArenaBufferSetGetter, _setReplayPinnedBufferSetGetter,
-} from "./buffer-pool";
-import { replayPinnedBufferSet } from "./dispatch-recording";
-import {
-  arenaBufferSet, outputSequenceHints, pinnedOutputBuffers,
-  getOutputSeqIndex, setOutputSeqIndex,
-  resetArenaState, resetArenaResolveStats,
-  _setCreateTrackedBuffer, _setArenaReplayPinnedBufferSetGetter, _setParamsSequenceSetGetter,
-} from "./buffer-arena";
-import {
-  getParamsSequenceSet,
-  _setOutputSeqIndexAccessors, _setClearArenaStateFn, _setResetArenaStatsFn, _setClearOutputStateFn,
-} from "./bind-group-cache";
-import { createTrackedBuffer } from "./tensor";
+import { beginStep, endStep } from "./shared-encoder";
 
 // ============================================================================
 // Ops imports (used in webgpuBackend.ops)
@@ -181,36 +166,9 @@ import { sum, max, mean } from "./ops/reductions";
 import { stridedScatterCopy, stridedScatterAdd } from "./ops/strided-scatter";
 import { adamStep, unscaleGrad, createInfCountBuffer, readAndDestroyInfCount, fusedCrossEntropyForward, fusedCrossEntropyBackward, fusedLayerNormForward, fusedLayerNormBackwardGradX, fusedLayerNormBackwardGradWeightBias, fusedAttentionForward, fusedAttentionBackward, read, waitForGPU, mulScalarInPlace } from "./ops/fused";
 
-// ============================================================================
-// Injection callback wiring (cross-module dependency resolution)
-// ============================================================================
-
-// Wire up creation.ts contiguous injection callback
+// Wire up creation.ts contiguous injection callback (the sole remaining callback —
+// all other injection callbacks were eliminated by the webgpu-state.ts refactoring).
 _setContiguous(contiguous);
-
-// Wire up buffer-pool injection callbacks
-_setActiveBatchGetter(() => activeBatch);
-_setSharedEncoderCheck(() => sharedEncoderFlag);
-_setContextGetter(() => context);
-_setArenaBufferSetGetter(() => arenaBufferSet);
-_setReplayPinnedBufferSetGetter(() => replayPinnedBufferSet);
-
-// Wire up buffer-arena injection callbacks
-_setCreateTrackedBuffer(
-  (device, descriptor, preferredBuffer) => createTrackedBuffer(device, descriptor, preferredBuffer),
-);
-_setArenaReplayPinnedBufferSetGetter(() => replayPinnedBufferSet);
-_setParamsSequenceSetGetter(() => getParamsSequenceSet());
-
-// Wire up bind-group-cache injection callbacks
-_setOutputSeqIndexAccessors(getOutputSeqIndex, setOutputSeqIndex);
-_setClearArenaStateFn(() => resetArenaState());
-_setResetArenaStatsFn(() => resetArenaResolveStats());
-_setClearOutputStateFn(() => {
-  outputSequenceHints.length = 0;
-  pinnedOutputBuffers.length = 0;
-  setOutputSeqIndex(0);
-});
 
 // ============================================================================
 // webgpuBackend object
@@ -227,7 +185,7 @@ export const webgpuBackend: Backend & {
   waitForGPU,
   // Expose device for fusion dispatch (§15)
   get device() {
-    return context?.device ?? null;
+    return gpuContext?.device ?? null;
   },
   // Fusion dispatch (§15.1, §15.2, §15.3)
   dispatchFusedKernel,
@@ -299,10 +257,18 @@ export const webgpuBackend: Backend & {
   endStep,
   // Pretune matmul shapes for autotuning (used by compile with autotune: true)
   async pretuneMatmulShapes(shapes: Array<[number, number, number]>): Promise<void> {
-    const ctx = context;
+    const ctx = gpuContext;
     if (!ctx) {
       return; // WebGPU not initialized
     }
     await pretuneShapes(ctx.device, ctx.queue, shapes, "f32");
   },
 };
+
+// Register the WebGPU backend with the backend registry at module load time.
+// Previously this was inside initWebGPU() in gpu-context.ts, which created a
+// circular dependency (gpu-context → index). registerBackend() just adds to a
+// map — it's safe to call before initWebGPU(). The backend's ops all require
+// an initialized GPU context (via requireContext()), so calling them before
+// initWebGPU() still produces a clear error.
+registerBackend(webgpuBackend);

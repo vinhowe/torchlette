@@ -15,24 +15,20 @@ import type {
   WebGPUContext,
   WebGPUTensor,
 } from "./gpu-types";
+import { gpuContext, setGpuContext, requireContext } from "./webgpu-state";
 import { bufferPool } from "./buffer-pool";
 import { isProfilingEnabled, initGpuTimestamps } from "./profiler";
 import { setSubgroupSupport, type SubgroupSupport } from "./matmul";
 import { registerWebGPUDonation } from "../../engine/memory-planned-executor";
-import { registerBackend } from "../registry";
 import { destroyPersistentInfFlagBuffer } from "./unscale-kernel";
 import { destroyProfilingFenceBuffer } from "./buffer-pool";
 
 import { donateBuffer, getBufferSize } from "./buffer-arena";
 import { setSharedEncoderEnabled } from "./shared-encoder";
 import { clearBindGroupCache } from "./bind-group-cache";
-import { webgpuBackend } from "./index";
 
-// ============================================================================
-// GPU Context State
-// ============================================================================
-
-export let context: WebGPUContext | null = null;
+// Re-exports from webgpu-state for backward compatibility
+export { gpuContext as context, requireContext } from "./webgpu-state";
 let lastInitError: string | null = null;
 
 // ============================================================================
@@ -131,7 +127,7 @@ export function getWebGPUInitError(): string | null {
  * Returns false if WebGPU is not initialized.
  */
 export function isF16Supported(): boolean {
-  return context?.f16Supported ?? false;
+  return gpuContext?.f16Supported ?? false;
 }
 
 // ============================================================================
@@ -249,7 +245,7 @@ export function f16ArrayToF32Array(data: Uint16Array): number[] {
 // ============================================================================
 
 export async function initWebGPU(): Promise<boolean> {
-  if (context) {
+  if (gpuContext) {
     return true;
   }
   lastInitError = null;
@@ -374,13 +370,13 @@ export async function initWebGPU(): Promise<boolean> {
       }
     }
   }
-  context = {
+  setGpuContext({
     provider,
     device,
     queue: device.queue,
     pipelines: new Map(),
     f16Supported: actualF16Supported,
-  };
+  });
   // Set queue on buffer pool for fence integration (§14)
   bufferPool.setQueue(device.queue);
 
@@ -407,7 +403,6 @@ export async function initWebGPU(): Promise<boolean> {
     : undefined;
   setSharedEncoderEnabled(batchSubmits !== "0");
 
-  registerBackend(webgpuBackend);
   return true;
 }
 
@@ -446,7 +441,7 @@ export async function syncWebGPU(): Promise<void> {
  * Safe to call multiple times (no-op if already destroyed or never initialized).
  */
 export function destroyWebGPU(): void {
-  if (!context) return;
+  if (!gpuContext) return;
   // Destroy cached f16 weight buffers
   for (const buf of f16WeightCache.values()) {
     buf.destroy();
@@ -455,9 +450,9 @@ export function destroyWebGPU(): void {
   clearBindGroupCache();
   destroyPersistentInfFlagBuffer();
   destroyProfilingFenceBuffer();
-  context.device.destroy();
-  context.pipelines.clear();
-  context = null;
+  gpuContext.device.destroy();
+  gpuContext.pipelines.clear();
+  setGpuContext(null);
 }
 
 /**
@@ -468,15 +463,8 @@ export function getWebGPUDevice(): {
   device: GPUDevice;
   queue: GPUQueue;
 } | null {
-  if (!context) return null;
-  return { device: context.device, queue: context.queue };
-}
-
-export function requireContext(): WebGPUContext {
-  if (!context) {
-    throw new Error("WebGPU backend not initialized; call initWebGPU()");
-  }
-  return context;
+  if (!gpuContext) return null;
+  return { device: gpuContext.device, queue: gpuContext.queue };
 }
 
 /**
