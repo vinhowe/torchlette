@@ -46,7 +46,7 @@ export interface RecordedDispatch {
 export let dispatchRecordingBuffer: RecordedDispatch[] | null = null;
 
 /** Last bind group's buffer list — captured during recording for pinning. */
-export let lastBindGroupBuffers: GPUBuffer[] | null = null;
+let lastBindGroupBuffers: GPUBuffer[] | null = null;
 
 /** Set lastBindGroupBuffers from an external module (ESM bindings are read-only). */
 export function setLastBindGroupBuffers(bufs: GPUBuffer[] | null): void {

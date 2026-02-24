@@ -689,7 +689,7 @@ function allocateAdamOutputBuffer(sizeBytes: number): GPUBuffer {
 // Dispatch
 // ============================================================================
 
-export interface AdamStepResult {
+interface AdamStepResult {
   paramBuffer: GPUBuffer;
   mBuffer: GPUBuffer;
   vBuffer: GPUBuffer;

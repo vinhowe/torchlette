@@ -19,7 +19,7 @@ export type GPUComputePipeline = {
   getBindGroupLayout(index: number): unknown;
 };
 
-export type GPUComputePass = {
+type GPUComputePass = {
   dispatchWorkgroups(x: number, y?: number, z?: number): void;
   end(): void;
   setBindGroup(index: number, group: unknown): void;

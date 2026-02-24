@@ -1,6 +1,6 @@
 # Refactoring Targets
 
-Refactoring opportunities identified from full codebase reviews. Targets 1–5, 7–11 are complete.
+Refactoring opportunities identified from full codebase reviews. Targets 1–5, 7–12 are complete.
 
 ## Target 1: Decompose `webgpu/index.ts` — DONE
 
@@ -45,3 +45,61 @@ Replaced 7 local WebGPU type definition blocks (GPUDevice, GPUBuffer, GPUCompute
 ## Target 11: Add `rand`/`randn`/`bernoulli` to `LazyOpCode` — DONE
 
 Added as part of Target 7.
+
+---
+
+## Wave 2: Code Quality Audit Findings
+
+Identified from full codebase audit after completing Targets 1–11.
+
+### `as any` Cast Inventory (201 total across 24 files)
+
+| File | Count | Pattern |
+|------|-------|---------|
+| `attention-kernel.ts` | 35 | buffer/pipeline casts to WebGPU API |
+| `layernorm-kernel.ts` | 26 | same |
+| `executor-lowered.ts` | 22 | buffer extraction from BackendTensor |
+| `ops/fused.ts` | 17 | buffer/pipeline casts |
+| `index.ts` | 15 | WebGPU API boundary |
+| `cross-entropy-kernel.ts` | 13 | buffer/pipeline casts |
+| `adam-kernel.ts` | 12 | same |
+| `unscale-kernel.ts` | 10 | same |
+
+### Large Files (>1000 lines)
+
+| File | Lines |
+|------|-------|
+| `runtime/engine.ts` | 2,489 |
+| `engine/engine.ts` | 1,808 |
+| `frontend.ts` | 1,592 |
+| `cpu/numeric.ts` | 1,518 |
+| `fusion-detect.ts` | 1,504 |
+| `attention-kernel.ts` | 1,410 |
+
+### Other Findings
+
+- **Duplicate buffer extraction** — `(x.backendTensor as any).buffer` appears ~40 times
+- **Scattered module-local mutable globals** — 25+ pipeline caches, recording buffers, etc.
+- **Error handling inconsistency** — 349 `throw` vs 53 `return undefined/null`
+
+---
+
+## Target 12: Static Analysis for Dead Exports — DONE
+
+Removed `export` from functions, types, interfaces, and constants with zero external consumers across 37 files. Also deleted dead code: `executeFusedElementwise()` from `fusion-dispatch.ts`, `irToLazyPlan()`/`segmentPlan()`/`PlanSegment` from `lazy-to-ir.ts`, three unused token reconciliation types from `compiled-region.ts`, and unused reset functions (`resetBindGroupCacheLocalState`, `resetFenceState`, `resetEncoderState`, `resetCpuProfileState`, `resetGpuTimestampState`). Cleaned up dead re-exports from `matmul/index.ts` (`AutotuneOptions`, `EpilogueOp`, `DispatchMatmulOptions`, `clearPerShapeTuningCache`, `clearPipelineCache`, `getConfigForShape`, `setTuningResult`, `AMPConfig`, `MatmulOptions`, `MatmulParams`, `transposeModeToInt`) and `ops/index.ts` (`OpDef`, `OpArity`). Net −163 lines.
+
+## Target 13: Typed Buffer Extraction Helper
+
+Replace ~40 `(x.backendTensor as any).buffer` accesses with a typed utility function.
+
+## Target 14: Reduce `as any` Casts in Kernel Files
+
+Focus on attention-kernel.ts (35), layernorm-kernel.ts (26), and other kernel files. Most casts are at the BackendTensor↔GPUBuffer boundary.
+
+## Target 15: Decompose Large Files
+
+Split `runtime/engine.ts` (2,489 lines) and `engine/engine.ts` (1,808 lines) into focused modules.
+
+## Target 16: Consolidate Remaining Module-Local Globals
+
+Pipeline caches, recording buffers, and other mutable state scattered across kernel files.

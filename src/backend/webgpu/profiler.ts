@@ -77,7 +77,7 @@ const cpuProfile: CpuProfileState = {
 };
 
 /** Reset CPU-side profiling state. */
-export function resetCpuProfileState(): void {
+function resetCpuProfileState(): void {
   cpuProfile.apiStats.clear();
   cpuProfile.opStats.clear();
   cpuProfile.subOpStats.clear();
@@ -133,7 +133,7 @@ const gpuTs: GpuTimestampState = {
 };
 
 /** Reset GPU timestamp profiling state (not the device/querySet). */
-export function resetGpuTimestampState(): void {
+function resetGpuTimestampState(): void {
   gpuTs.passRecords = [];
   gpuTs.nextSlot = 0;
   if (gpuTs.stagingBuffer) {

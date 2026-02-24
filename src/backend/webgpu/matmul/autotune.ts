@@ -21,7 +21,7 @@ import {
 /**
  * Autotuner options.
  */
-export type AutotuneOptions = {
+type AutotuneOptions = {
   /** Maximum number of configs to try (default: 27) */
   maxTrials?: number;
   /** Warmup iterations before timing (default: 3) */

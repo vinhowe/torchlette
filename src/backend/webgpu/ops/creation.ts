@@ -53,7 +53,7 @@ export function tensorFromArray(values: number[] | Float32Array, shape: number[]
  * Generate WGSL shader for GPU-side fill.
  * Fills an output buffer with a constant value using a compute shader.
  */
-export function fillShader(gridSizeX: number): string {
+function fillShader(gridSizeX: number): string {
   const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
   const idxCompute = use2D
     ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
@@ -156,7 +156,7 @@ export function full(shape: number[], fillValue: number): WebGPUTensor {
  * Generate WGSL shader for GPU-side arange.
  * Fills output with start + idx * step.
  */
-export function arangeShader(gridSizeX: number): string {
+function arangeShader(gridSizeX: number): string {
   const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
   const idxCompute = use2D
     ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
@@ -225,7 +225,7 @@ export function arange(end: number, start = 0, step = 1): WebGPUTensor {
  * For tril: zero where col > row + k
  * For triu: zero where col < row + k
  */
-export function triangularShader(gridSizeX: number, upper: boolean): string {
+function triangularShader(gridSizeX: number, upper: boolean): string {
   const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
   const idxCompute = use2D
     ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
@@ -268,7 +268,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * Triangular operation: zero elements above (tril) or below (triu) a diagonal.
  * Operates on the last 2 dimensions; supports arbitrary batch dimensions.
  */
-export function triangularOp(a: WebGPUTensor, k: number, upper: boolean): WebGPUTensor {
+function triangularOp(a: WebGPUTensor, k: number, upper: boolean): WebGPUTensor {
   const ctx = requireContext();
   if (a.shape.length < 2) throw new Error("tril/triu requires at least 2 dimensions");
 
@@ -326,7 +326,7 @@ export function triu(a: WebGPUTensor, k = 0): WebGPUTensor {
 // GPU RNG (PCG32)
 // ============================================================================
 
-export const PCG32_WGSL = `
+const PCG32_WGSL = `
 fn pcg32(state: ptr<function, u32>) -> u32 {
   let old = *state;
   *state = old * 747796405u + 2891336453u;
@@ -343,7 +343,7 @@ fn pcg32_init(seed: u32, seq: u32) -> u32 {
 }
 `;
 
-export function randShader(gridSizeX: number): string {
+function randShader(gridSizeX: number): string {
   const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
   const idxCompute = use2D
     ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
@@ -370,7 +370,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 `;
 }
 
-export function randnShader(gridSizeX: number): string {
+function randnShader(gridSizeX: number): string {
   const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
   const idxCompute = use2D
     ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
@@ -410,7 +410,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 `;
 }
 
-export function bernoulliShader(gridSizeX: number): string {
+function bernoulliShader(gridSizeX: number): string {
   const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
   const idxCompute = use2D
     ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`

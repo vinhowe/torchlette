@@ -280,30 +280,6 @@ export function aliasPatternKey(pattern: StateSlotAliasPattern): string {
 // §8.6 CompiledCall Token ABI Reconciliation
 // ============================================================================
 
-/**
- * Token state for a compiled call entry/exit.
- */
-export type CompiledCallTokenState = {
-  tokGlobal: Token;
-  tokLocs: Map<LocId, Token>;
-};
-
-/**
- * Result of token reconciliation at compiled call entry.
- */
-export type EntryReconciliation = {
-  entryToken: Token;
-  locTokens: Map<LocId, Token>;
-};
-
-/**
- * Result of token reconciliation at compiled call exit.
- */
-export type ExitReconciliation = {
-  exitToken: Token;
-  updatedLocTokens: Map<LocId, Token>;
-};
-
 // ============================================================================
 // §8.7 Auto-Externalize
 // ============================================================================
@@ -369,7 +345,7 @@ let nextSentinelId = 1;
 /**
  * Create a stable null-state sentinel for a (compiledFn, stateSlot) pair.
  */
-export function createNullStateSentinel(
+function createNullStateSentinel(
   compiledFnId: number,
   stateSlot: number,
 ): NullStateSentinel {

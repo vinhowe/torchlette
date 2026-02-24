@@ -2193,7 +2193,7 @@ export class RuntimeEngine {
 
 }
 
-export const defaultEngine = new RuntimeEngine();
+const defaultEngine = new RuntimeEngine();
 
 export function tensorFromArray(
   values: number[],

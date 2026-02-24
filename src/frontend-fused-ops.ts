@@ -288,7 +288,7 @@ export function layernormImpl(
 }
 
 /** Shared backward for LayerNorm. Uses fused gradX kernel on WebGPU. */
-export function layernormBackwardImpl(
+function layernormBackwardImpl(
   torch: Torchlette,
   grad: RuntimeTensor,
   getSaved: (i: number) => Tensor,

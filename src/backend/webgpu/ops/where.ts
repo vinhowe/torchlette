@@ -68,7 +68,7 @@ ${indexing.offsets.join("\n")}
 /**
  * Broadcast three shapes to a common output shape.
  */
-export function broadcastThreeShapes(a: number[], b: number[], c: number[]): number[] {
+function broadcastThreeShapes(a: number[], b: number[], c: number[]): number[] {
   const outRank = Math.max(a.length, b.length, c.length);
   const out = new Array<number>(outRank);
   for (let i = 0; i < outRank; i += 1) {

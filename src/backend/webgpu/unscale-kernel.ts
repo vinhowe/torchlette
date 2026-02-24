@@ -282,7 +282,7 @@ function allocateFreshOutputBuffer(
 // Dispatch
 // ============================================================================
 
-export interface UnscaleGradResult {
+interface UnscaleGradResult {
   gradOutBuffer: GPUBuffer;
 }
 

@@ -37,7 +37,7 @@ export type TransposeMode = "NN" | "NT" | "TN" | "TT";
 /**
  * Parameters passed to the matmul shader as uniforms.
  */
-export type MatmulParams = {
+type MatmulParams = {
   m: number;
   n: number;
   k: number;
@@ -84,7 +84,7 @@ export type TuneResult = {
 /**
  * Matmul dispatch options passed by the caller.
  */
-export type MatmulOptions = {
+type MatmulOptions = {
   /** Whether A is transposed */
   transA?: boolean;
   /** Whether B is transposed */
@@ -98,7 +98,7 @@ export type MatmulOptions = {
 /**
  * AMP (Automatic Mixed Precision) configuration.
  */
-export type AMPConfig = {
+type AMPConfig = {
   /** Dtype for computation (f16 for speed, f32 for accuracy) */
   computeDtype: DType;
   /** Dtype for accumulation (always f32 for numerical stability) */
@@ -150,7 +150,7 @@ export function getTransposeMode(
 /**
  * Convert TransposeMode to integer for shader uniforms.
  */
-export function transposeModeToInt(mode: TransposeMode): number {
+function transposeModeToInt(mode: TransposeMode): number {
   switch (mode) {
     case "NN":
       return 0;

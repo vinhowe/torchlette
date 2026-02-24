@@ -9,8 +9,6 @@
  */
 
 export {
-  // Autotune types
-  type AutotuneOptions,
   // Autotune functions
   autotune,
   type BenchmarkFn,
@@ -29,7 +27,6 @@ export {
   // Codegen types
   type CodegenOptions,
   type EpilogueConfig,
-  type EpilogueOp,
   // Codegen functions
   generateTiledMatmulShader,
   getShaderCacheKey,
@@ -38,19 +35,13 @@ export {
 export {
   // Dispatch functions
   clearDispatchTuningCache,
-  clearPerShapeTuningCache,
-  clearPipelineCache,
   computeBatchSize,
   computeBatchStrides,
   computeMatmulOutputShape,
-  // Dispatch types
-  type DispatchMatmulOptions,
   dispatchTiledMatmul,
-  getConfigForShape,
   isAutotuneEnabled,
   pretuneMatmulShapes,
   setAutotuneEnabled,
-  setTuningResult,
 } from "./dispatch";
 
 export {
@@ -61,7 +52,6 @@ export {
   type SubgroupCodegenOptions,
 } from "./subgroup";
 export {
-  type AMPConfig,
   // Utilities
   classifyShape,
   clearSubgroupSupport,
@@ -73,14 +63,11 @@ export {
   getTransposeMode,
   getWorkgroupSize,
   type MatmulKernelConfig,
-  type MatmulOptions,
-  type MatmulParams,
   type ShapeClass,
   type SubgroupSupport,
   setSubgroupSupport,
   type TransposeMode,
   TUNING_SPACE,
   type TuneResult,
-  transposeModeToInt,
   validateConfig,
 } from "./types";

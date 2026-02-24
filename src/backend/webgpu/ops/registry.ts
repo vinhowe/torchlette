@@ -20,9 +20,9 @@ import type { DType } from "../../types";
 // Types
 // ============================================================================
 
-export type OpArity = 1 | 2 | 3;
+type OpArity = 1 | 2 | 3;
 
-export interface OpDef {
+interface OpDef {
   /**
    * WGSL expression generator.
    * For unary ops: (a) => expr

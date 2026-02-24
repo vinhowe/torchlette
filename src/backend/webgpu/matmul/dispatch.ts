@@ -58,7 +58,7 @@ function getPerShapeKey(m: number, n: number, k: number, dtype: DType): string {
 /**
  * Clear the per-shape tuning cache.
  */
-export function clearPerShapeTuningCache(): void {
+function clearPerShapeTuningCache(): void {
   perShapeTuningCache.clear();
 }
 
@@ -97,7 +97,7 @@ export function isAutotuneEnabled(): boolean {
 /**
  * Clear the pipeline cache.
  */
-export function clearPipelineCache(): void {
+function clearPipelineCache(): void {
   pipelineCache.clear();
 }
 
@@ -112,7 +112,7 @@ function getTuningKey(shapeClass: ShapeClass, dtype: DType, hasEpilogue: boolean
  * Get the best kernel config for a shape class (from cache or default).
  * For bare matmuls, also checks the per-shape tuning cache when M,N,K are provided.
  */
-export function getConfigForShape(
+function getConfigForShape(
   shapeClass: ShapeClass,
   dtype: DType,
   hasEpilogue: boolean = false,
@@ -137,7 +137,7 @@ export function getConfigForShape(
 /**
  * Store a tuning result.
  */
-export function setTuningResult(
+function setTuningResult(
   shapeClass: ShapeClass,
   dtype: DType,
   config: MatmulKernelConfig,
@@ -505,7 +505,7 @@ function packMatmulParams(
 /**
  * Matmul dispatch options for internal use.
  */
-export type DispatchMatmulOptions = {
+type DispatchMatmulOptions = {
   device: GPUDevice;
   queue: GPUQueue;
   a: GPUBuffer;

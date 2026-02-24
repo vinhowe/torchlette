@@ -338,7 +338,7 @@ const DEFAULT_MEMORY_LIMIT_BYTES = 10 * 1024 * 1024 * 1024;
 /**
  * Options for configuring the buffer pool.
  */
-export interface BufferPoolOptions {
+interface BufferPoolOptions {
   /**
    * Maximum memory limit in bytes.
    * Default: 10GB (10 * 1024 * 1024 * 1024)
@@ -767,7 +767,7 @@ export interface MemoryPlan {
 /**
  * Options for the memory planner.
  */
-export interface MemoryPlannerOptions {
+interface MemoryPlannerOptions {
   /**
    * Maximum memory limit in bytes.
    * Default: 10GB (10 * 1024 * 1024 * 1024)

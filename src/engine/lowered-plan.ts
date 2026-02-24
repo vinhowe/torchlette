@@ -33,7 +33,7 @@ import type { LazyIRNode, LazyRef } from "./lazy";
 // ============================================================================
 
 /** A fused elementwise kernel dispatch covering multiple plan nodes. */
-export interface LoweredFusedAction {
+interface LoweredFusedAction {
   kind: "fused";
   /** Plan-node indices covered by this fused kernel (in group order). */
   coveredNodeIndices: number[];
@@ -58,14 +58,14 @@ export interface LoweredFusedAction {
 }
 
 /** A single non-fused op dispatch. */
-export interface LoweredSequentialAction {
+interface LoweredSequentialAction {
   kind: "sequential";
   /** Plan-node index for this op. */
   nodeIndex: number;
 }
 
 /** A matmul + epilogue chain dispatch. */
-export interface LoweredMatmulEpilogueAction {
+interface LoweredMatmulEpilogueAction {
   kind: "matmul-epilogue";
   /** Plan-node index of the matmul node. */
   matmulNodeIndex: number;
@@ -133,7 +133,7 @@ export interface LoweredMatmulEpilogueAction {
 }
 
 /** A reduction with elementwise preamble fusion. */
-export interface LoweredReductionPreambleAction {
+interface LoweredReductionPreambleAction {
   kind: "reduction-preamble";
   /** Plan-node index of the preamble (elementwise) node. */
   preambleNodeIndex: number;
@@ -142,40 +142,40 @@ export interface LoweredReductionPreambleAction {
 }
 
 /** A view op (metadata only, no GPU dispatch). */
-export interface LoweredViewAction {
+interface LoweredViewAction {
   kind: "view";
   /** Plan-node index. */
   nodeIndex: number;
 }
 
 /** A data source op (tensorFromArray, zeros, full, arange). */
-export interface LoweredDataSourceAction {
+interface LoweredDataSourceAction {
   kind: "data-source";
   /** Plan-node index. */
   nodeIndex: number;
 }
 
 /** A prologue-skipped cast node (absorbed into matmul). */
-export interface LoweredPrologueSkipAction {
+interface LoweredPrologueSkipAction {
   kind: "prologue-skip";
   /** Plan-node index. */
   nodeIndex: number;
 }
 
 /** A batch of consecutive adamStep nodes. */
-export interface LoweredAdamBatchAction {
+interface LoweredAdamBatchAction {
   kind: "adam-batch";
   /** Plan-node indices for all consecutive adamStep nodes in this batch. */
   nodeIndices: number[];
 }
 
 /** A buffer reclaim point (flushSharedEncoder + flushBufferPool). */
-export interface LoweredReclaimAction {
+interface LoweredReclaimAction {
   kind: "reclaim";
 }
 
 /** Union of all lowered action types. */
-export type LoweredAction =
+type LoweredAction =
   | LoweredFusedAction
   | LoweredSequentialAction
   | LoweredMatmulEpilogueAction
@@ -208,7 +208,7 @@ export interface LoweredPlan {
  * A recorded GPU dispatch for replay. Contains everything needed to encode
  * a compute pass without any JS-level op dispatch logic.
  */
-export interface ReplayDispatch {
+interface ReplayDispatch {
   pipeline: any;  // GPUComputePipeline
   bindGroup: any; // GPUBindGroup
   workgroupsX: number;

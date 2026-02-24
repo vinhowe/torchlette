@@ -74,7 +74,7 @@ export function matmul(
  * Input: [K, N], Output: [K, colEnd - colStart]
  * Handles large input matrices by processing in row chunks.
  */
-export function sliceColumns(
+function sliceColumns(
   input: WebGPUTensor,
   colStart: number,
   colEnd: number,
@@ -207,7 +207,7 @@ export function sliceColumns(
  * partial: [M, sliceWidth], output: [M, N], writes to columns [colStart, colStart+sliceWidth)
  * Handles large output buffers by processing in row chunks.
  */
-export function scatterColumnsToOutput(
+function scatterColumnsToOutput(
   partial: WebGPUTensor,
   outBuffer: GPUBuffer,
   M: number,
@@ -360,7 +360,7 @@ export function scatterColumnsToOutput(
  * and chunk by BUFFER rows (which are contiguous), using transB=true.
  * This avoids the need to materialize a large contiguous copy.
  */
-export function matmulChunked(
+function matmulChunked(
   a: WebGPUTensor,
   b: WebGPUTensor,
   maxBindingSize: number,
@@ -448,7 +448,7 @@ export function matmulChunked(
  * B is a view [K, N] of underlying buffer [N, K].
  * We chunk the buffer by rows (= logical columns) and use transB=true.
  */
-export function matmulChunkedTransposed(
+function matmulChunkedTransposed(
   a: WebGPUTensor,
   b: WebGPUTensor,
   M: number,
@@ -563,7 +563,7 @@ export function matmulChunkedTransposed(
  * Chunked matmul for contiguous B [K, N].
  * Chunks B by columns (which requires copying column slices).
  */
-export function matmulChunkedContiguous(
+function matmulChunkedContiguous(
   a: WebGPUTensor,
   b: WebGPUTensor,
   M: number,
@@ -649,7 +649,7 @@ export function matmulChunkedContiguous(
  * This happens when A and B are small but their product is large.
  * Strategy: chunk along the N (columns) dimension of B and output.
  */
-export function matmulChunkedOutput(
+function matmulChunkedOutput(
   a: WebGPUTensor,
   b: WebGPUTensor,
   maxBindingSize: number,
@@ -740,7 +740,7 @@ export function matmulChunkedOutput(
  * Slice columns from B matrix for chunked output matmul.
  * Input shape: [batch, K, N], Output shape: [batch, K, colEnd - colStart]
  */
-export function sliceBColumns(
+function sliceBColumns(
   b: WebGPUTensor,
   colStart: number,
   colEnd: number,

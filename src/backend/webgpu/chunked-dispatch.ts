@@ -23,14 +23,14 @@ import {
 // Types
 // ============================================================================
 
-export interface FlatChunkLayout {
+interface FlatChunkLayout {
   elementsPerChunk: number;
   numChunks: number;
   use2D: boolean;
   gridSizeX: number;
 }
 
-export interface ChunkedBinding {
+interface ChunkedBinding {
   buffer: GPUBuffer;
   /** 'scalar' binds the full (small) buffer each chunk; 'chunked' binds a sub-range. */
   mode: "scalar" | "chunked";
@@ -189,7 +189,7 @@ function defaultCreateParams(
 // Dimension-specific chunking (for gather / scatterAdd)
 // ============================================================================
 
-export interface DimChunkLayout {
+interface DimChunkLayout {
   /** Maximum slices (entries along the chunked dimension) per chunk. */
   maxSlicesPerChunk: number;
   /** Total number of chunks needed to cover the dimension. */
