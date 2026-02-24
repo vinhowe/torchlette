@@ -11,18 +11,13 @@ import {
   computeEffectiveBroadcastStrides,
   buildBroadcastIndexing,
   WORKGROUP_SIZE,
-  MAX_WORKGROUPS_PER_DIM,
 } from "../shape-utils";
 import { requireContext } from "../gpu-context";
-import { dispatchElementwise, dispatchComputePass, getPipeline } from "../dispatch";
+import { dispatchElementwise } from "../dispatch";
 import { createTensor } from "../tensor";
 import { resolveOutputBuffer } from "../buffer-arena";
-import {
-  params1,
-  createUniformBuffer,
-  releaseUniformBuffer,
-  profiledCreateBindGroup,
-} from "../bind-group-cache";
+import { params1 } from "../bind-group-cache";
+import { computeFlatChunkLayout, dispatchFlatChunked } from "../chunked-dispatch";
 
 function ternaryWhereShader(
   indexShape: number[],
@@ -205,19 +200,11 @@ export function whereChunked(
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
-  // Calculate chunk size
-  const elementsPerAlignment = minAlignment / bytesPerElement;
-  const maxElementsPerChunk = Math.floor(maxBindingSize / bytesPerElement);
-  const elementsPerChunk =
-    Math.floor(maxElementsPerChunk / elementsPerAlignment) * elementsPerAlignment;
+  const layout = computeFlatChunkLayout(outSize, bytesPerElement, maxBindingSize, minAlignment);
 
-  const numChunks = Math.ceil(outSize / elementsPerChunk);
-  const outSizeBytes = outSize * bytesPerElement;
-
-  // Create output buffer
   const outBuffer = resolveOutputBuffer(
     ctx.device,
-    outSizeBytes,
+    outSize * bytesPerElement,
     [condTensor.buffer, xTensor.buffer, yTensor.buffer],
     options?.outBuffer,
   );
@@ -226,21 +213,14 @@ export function whereChunked(
   const xIsScalar = xTensor.size <= 1;
   const yIsScalar = yTensor.size <= 1;
 
-  // Determine 2D dispatch dimensions for large chunks
-  const maxWorkgroups = Math.ceil(elementsPerChunk / WORKGROUP_SIZE);
-  const use2D = maxWorkgroups > MAX_WORKGROUPS_PER_DIM;
-  const gridSizeX = use2D
-    ? Math.min(maxWorkgroups, MAX_WORKGROUPS_PER_DIM)
-    : maxWorkgroups;
-
   // Build a flat chunked shader — no broadcast indexing needed since
   // scalar inputs are read at [0] and contiguous inputs are read at [idx].
   const condAccess = condIsScalar ? "cond[0]" : "cond[idx]";
   const xAccess = xIsScalar ? "x[0]" : "x[idx]";
   const yAccess = yIsScalar ? "y[0]" : "y[idx]";
 
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
+  const idxCompute = layout.use2D
+    ? `let idx = gid.x + gid.y * ${layout.gridSizeX}u * ${WORKGROUP_SIZE}u;`
     : `let idx = gid.x;`;
 
   const code = `
@@ -265,47 +245,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-  const key = `whereChunked:${condIsScalar}:${xIsScalar}:${yIsScalar}:${use2D ? `2d:${gridSizeX}` : "1d"}`;
-  const pipeline = getPipeline(ctx, key, code);
+  const key = `whereChunked:${condIsScalar}:${xIsScalar}:${yIsScalar}:${layout.use2D ? `2d:${layout.gridSizeX}` : "1d"}`;
 
-  for (let chunk = 0; chunk < numChunks; chunk++) {
-    const chunkStart = chunk * elementsPerChunk;
-    const chunkEnd = Math.min(chunkStart + elementsPerChunk, outSize);
-    const chunkSize = chunkEnd - chunkStart;
-    const chunkByteOffset = chunkStart * bytesPerElement;
-    const chunkByteSize = chunkSize * bytesPerElement;
-
-    const paramsBuffer = createUniformBuffer(ctx.device, chunkSize);
-
-    // Scalar inputs: bind the full (small) buffer. Contiguous inputs: bind the chunk sub-range.
-    const condBinding = condIsScalar
-      ? { buffer: condTensor.buffer }
-      : { buffer: condTensor.buffer, offset: chunkByteOffset, size: chunkByteSize };
-    const xBinding = xIsScalar
-      ? { buffer: xTensor.buffer }
-      : { buffer: xTensor.buffer, offset: chunkByteOffset, size: chunkByteSize };
-    const yBinding = yIsScalar
-      ? { buffer: yTensor.buffer }
-      : { buffer: yTensor.buffer, offset: chunkByteOffset, size: chunkByteSize };
-
-    const chunkWorkgroups = Math.ceil(chunkSize / WORKGROUP_SIZE);
-    const dispatchX = use2D ? Math.min(chunkWorkgroups, MAX_WORKGROUPS_PER_DIM) : chunkWorkgroups;
-    const dispatchY = use2D ? Math.ceil(chunkWorkgroups / dispatchX) : 1;
-
-    const bindGroup = profiledCreateBindGroup(ctx.device, {
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: condBinding },
-        { binding: 1, resource: xBinding },
-        { binding: 2, resource: yBinding },
-        { binding: 3, resource: { buffer: outBuffer, offset: chunkByteOffset, size: chunkByteSize } },
-        { binding: 4, resource: { buffer: paramsBuffer } },
-      ],
-    });
-
-    dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
-    releaseUniformBuffer(paramsBuffer);
-  }
+  dispatchFlatChunked({
+    key, shader: code, layout,
+    inputs: [
+      { buffer: condTensor.buffer, mode: condIsScalar ? "scalar" : "chunked" },
+      { buffer: xTensor.buffer, mode: xIsScalar ? "scalar" : "chunked" },
+      { buffer: yTensor.buffer, mode: yIsScalar ? "scalar" : "chunked" },
+    ],
+    outBuffer, outBytesPerElement: bytesPerElement, totalElements: outSize,
+  });
 
   return createTensor(outShape, outBuffer);
 }

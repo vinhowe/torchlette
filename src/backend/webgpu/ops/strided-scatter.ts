@@ -3,7 +3,7 @@
  * Extracted from index.ts — purely structural refactoring.
  */
 import type { BackendTensor } from "../../types";
-import type { WebGPUTensor } from "../gpu-types";
+import type { GPUDevice, WebGPUTensor } from "../gpu-types";
 import { sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
@@ -12,9 +12,10 @@ import { bufferPool } from "../buffer-pool";
 import { resolveOutputBuffer } from "../buffer-arena";
 import {
   cachedCreateBindGroup, createParamsBuffer, releaseParamsBuffer,
-  profiledCreateBindGroup, params2, params3,
+  params2, params3,
 } from "../bind-group-cache";
 import { ensureContiguous } from "./views";
+import { computeFlatChunkLayout, dispatchFlatChunked } from "../chunked-dispatch";
 
 function stridedScatterCopyShader(
   baseSize: number,
@@ -236,46 +237,22 @@ export function stridedScatterCopyChunkedSimple(
 ): BackendTensor {
   const ctx = requireContext();
   const totalElements = baseTensor.size;
-  const totalBytes = totalElements * 4;
+  const bytesPerElement = 4; // f32
 
-  // Calculate chunk size (in elements) that fits within binding limit
-  // Also need to account for alignment requirements
   const limits = (ctx.device as unknown as { limits: Record<string, number> })
     .limits;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
-  // Elements per aligned chunk (must be multiple of alignment / 4 bytes)
-  const elementsPerAlignment = minAlignment / 4;
+  const layout = computeFlatChunkLayout(totalElements, bytesPerElement, maxBindingSize, minAlignment);
 
-  // Max elements that fit in binding size
-  const maxElementsPerChunk = Math.floor(maxBindingSize / 4);
-
-  // Round down to alignment boundary
-  const elementsPerChunk =
-    Math.floor(maxElementsPerChunk / elementsPerAlignment) * elementsPerAlignment;
-
-  const numChunks = Math.ceil(totalElements / elementsPerChunk);
-
-  // Create output buffer
   const outBuffer = resolveOutputBuffer(
     ctx.device,
-    totalBytes,
+    totalElements * bytesPerElement,
     [baseTensor.buffer, srcTensor.buffer],
   );
 
-  // Determine if 2D dispatch is needed (chunks can be large)
-  const maxWorkgroups = Math.ceil(elementsPerChunk / WORKGROUP_SIZE);
-  const use2D = maxWorkgroups > MAX_WORKGROUPS_PER_DIM;
-
-  // For 2D dispatch, compute grid dimensions
-  const gridSizeX = use2D
-    ? Math.min(maxWorkgroups, MAX_WORKGROUPS_PER_DIM)
-    : maxWorkgroups;
-  const gridSizeY = use2D ? Math.ceil(maxWorkgroups / gridSizeX) : 1;
-
-  // Simple copy shader with optional 2D indexing
-  const idxCompute = use2D
-    ? `let localIdx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
+  const idxCompute = layout.use2D
+    ? `let localIdx = gid.x + gid.y * ${layout.gridSizeX}u * ${WORKGROUP_SIZE}u;`
     : `let localIdx = gid.x;`;
 
   const code = `
@@ -301,52 +278,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-  const key = `stridedScatterCopyChunkedSimple:${WORKGROUP_SIZE}:${use2D ? `2d:${gridSizeX}` : "1d"}`;
-  const pipeline = getPipeline(ctx, key, code);
+  const key = `stridedScatterCopyChunkedSimple:${WORKGROUP_SIZE}:${layout.use2D ? `2d:${layout.gridSizeX}` : "1d"}`;
 
-  // Process each chunk
-  for (let chunk = 0; chunk < numChunks; chunk++) {
-    const chunkStart = chunk * elementsPerChunk;
-    const chunkEnd = Math.min(chunkStart + elementsPerChunk, totalElements);
-    const chunkSize = chunkEnd - chunkStart;
-    const chunkByteOffset = chunkStart * 4;
-    const chunkByteSize = chunkSize * 4;
-
-    const paramsBuffer = createParamsBuffer(ctx.device, params3(chunkSize, totalElements, chunkStart));
-
-    const bindGroup = profiledCreateBindGroup(ctx.device,{
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        {
-          binding: 0,
-          resource: {
-            buffer: srcTensor.buffer,
-            offset: chunkByteOffset,
-            size: chunkByteSize,
-          },
-        },
-        {
-          binding: 1,
-          resource: {
-            buffer: outBuffer,
-            offset: chunkByteOffset,
-            size: chunkByteSize,
-          },
-        },
-        { binding: 2, resource: { buffer: paramsBuffer } },
-      ],
-    });
-
-    // Calculate dispatch dimensions for this chunk
-    const chunkWorkgroups = Math.ceil(chunkSize / WORKGROUP_SIZE);
-    const dispatchX = use2D
-      ? Math.min(chunkWorkgroups, MAX_WORKGROUPS_PER_DIM)
-      : chunkWorkgroups;
-    const dispatchY = use2D ? Math.ceil(chunkWorkgroups / dispatchX) : 1;
-
-    dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
-    releaseParamsBuffer(paramsBuffer);
-  }
+  dispatchFlatChunked({
+    key, shader: code, layout,
+    inputs: [{ buffer: srcTensor.buffer, mode: "chunked" }],
+    outBuffer, outBytesPerElement: bytesPerElement, totalElements,
+    createChunkParams: (device: GPUDevice, chunkSize: number, chunkStart: number) =>
+      createParamsBuffer(device, params3(chunkSize, totalElements, chunkStart)),
+    releaseChunkParams: releaseParamsBuffer,
+  });
 
   return createTensor(baseTensor.shape, outBuffer);
 }
@@ -572,39 +513,22 @@ export function stridedScatterAddChunkedSimple(
 ): BackendTensor {
   const ctx = requireContext();
   const totalElements = baseTensor.size;
-  const totalBytes = totalElements * 4;
+  const bytesPerElement = 4; // f32
 
-  // Calculate chunk size (in elements) that fits within binding limit
   const limits = (ctx.device as unknown as { limits: Record<string, number> })
     .limits;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
-  // Elements per aligned chunk
-  const elementsPerAlignment = minAlignment / 4;
-  const maxElementsPerChunk = Math.floor(maxBindingSize / 4);
-  const elementsPerChunk =
-    Math.floor(maxElementsPerChunk / elementsPerAlignment) * elementsPerAlignment;
+  const layout = computeFlatChunkLayout(totalElements, bytesPerElement, maxBindingSize, minAlignment);
 
-  const numChunks = Math.ceil(totalElements / elementsPerChunk);
-
-  // Create output buffer
   const outBuffer = resolveOutputBuffer(
     ctx.device,
-    totalBytes,
+    totalElements * bytesPerElement,
     [baseTensor.buffer, srcTensor.buffer],
   );
 
-  // Determine if 2D dispatch is needed
-  const maxWorkgroups = Math.ceil(elementsPerChunk / WORKGROUP_SIZE);
-  const use2D = maxWorkgroups > MAX_WORKGROUPS_PER_DIM;
-
-  const gridSizeX = use2D
-    ? Math.min(maxWorkgroups, MAX_WORKGROUPS_PER_DIM)
-    : maxWorkgroups;
-
-  // Simple add shader with optional 2D indexing
-  const idxCompute = use2D
-    ? `let localIdx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
+  const idxCompute = layout.use2D
+    ? `let localIdx = gid.x + gid.y * ${layout.gridSizeX}u * ${WORKGROUP_SIZE}u;`
     : `let localIdx = gid.x;`;
 
   const code = `
@@ -631,59 +555,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-  const key = `stridedScatterAddChunkedSimple:${WORKGROUP_SIZE}:${use2D ? `2d:${gridSizeX}` : "1d"}`;
-  const pipeline = getPipeline(ctx, key, code);
+  const key = `stridedScatterAddChunkedSimple:${WORKGROUP_SIZE}:${layout.use2D ? `2d:${layout.gridSizeX}` : "1d"}`;
 
-  // Process each chunk
-  for (let chunk = 0; chunk < numChunks; chunk++) {
-    const chunkStart = chunk * elementsPerChunk;
-    const chunkEnd = Math.min(chunkStart + elementsPerChunk, totalElements);
-    const chunkSize = chunkEnd - chunkStart;
-    const chunkByteOffset = chunkStart * 4;
-    const chunkByteSize = chunkSize * 4;
-
-    const paramsBuffer = createParamsBuffer(ctx.device, params3(chunkSize, totalElements, chunkStart));
-
-    const bindGroup = profiledCreateBindGroup(ctx.device,{
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        {
-          binding: 0,
-          resource: {
-            buffer: baseTensor.buffer,
-            offset: chunkByteOffset,
-            size: chunkByteSize,
-          },
-        },
-        {
-          binding: 1,
-          resource: {
-            buffer: srcTensor.buffer,
-            offset: chunkByteOffset,
-            size: chunkByteSize,
-          },
-        },
-        {
-          binding: 2,
-          resource: {
-            buffer: outBuffer,
-            offset: chunkByteOffset,
-            size: chunkByteSize,
-          },
-        },
-        { binding: 3, resource: { buffer: paramsBuffer } },
-      ],
-    });
-
-    const chunkWorkgroups = Math.ceil(chunkSize / WORKGROUP_SIZE);
-    const dispatchX = use2D
-      ? Math.min(chunkWorkgroups, MAX_WORKGROUPS_PER_DIM)
-      : chunkWorkgroups;
-    const dispatchY = use2D ? Math.ceil(chunkWorkgroups / dispatchX) : 1;
-
-    dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
-    releaseParamsBuffer(paramsBuffer);
-  }
+  dispatchFlatChunked({
+    key, shader: code, layout,
+    inputs: [
+      { buffer: baseTensor.buffer, mode: "chunked" },
+      { buffer: srcTensor.buffer, mode: "chunked" },
+    ],
+    outBuffer, outBytesPerElement: bytesPerElement, totalElements,
+    createChunkParams: (device: GPUDevice, chunkSize: number, chunkStart: number) =>
+      createParamsBuffer(device, params3(chunkSize, totalElements, chunkStart)),
+    releaseChunkParams: releaseParamsBuffer,
+  });
 
   return createTensor(baseTensor.shape, outBuffer);
 }
