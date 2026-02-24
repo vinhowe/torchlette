@@ -145,7 +145,7 @@ export function where(
 /**
  * Direct (non-chunked) where dispatch using broadcast indexing.
  */
-export function whereDirect(
+function whereDirect(
   condTensor: WebGPUTensor,
   xTensor: WebGPUTensor,
   yTensor: WebGPUTensor,
@@ -184,7 +184,7 @@ export function whereDirect(
  * Chunked where dispatch for large contiguous tensors.
  * Each input is either scalar (bound fully each chunk) or contiguous (bound as sub-range).
  */
-export function whereChunked(
+function whereChunked(
   condTensor: WebGPUTensor,
   xTensor: WebGPUTensor,
   yTensor: WebGPUTensor,

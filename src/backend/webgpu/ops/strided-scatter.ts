@@ -163,7 +163,7 @@ export function stridedScatterCopy(
 /**
  * Direct implementation of stridedScatterCopy for small tensors.
  */
-export function stridedScatterCopyDirect(
+function stridedScatterCopyDirect(
   baseTensor: WebGPUTensor,
   srcTensor: WebGPUTensor,
   options: { offset: number; viewShape: number[]; viewStrides: number[] },
@@ -230,7 +230,7 @@ export function stridedScatterCopyDirect(
  * Used when both src and dest exceed buffer binding limit but are contiguous
  * and the copy covers all elements.
  */
-export function stridedScatterCopyChunkedSimple(
+function stridedScatterCopyChunkedSimple(
   baseTensor: WebGPUTensor,
   srcTensor: WebGPUTensor,
   maxBindingSize: number,
@@ -439,7 +439,7 @@ export function stridedScatterAdd(
 /**
  * Direct implementation of stridedScatterAdd for small tensors.
  */
-export function stridedScatterAddDirect(
+function stridedScatterAddDirect(
   baseTensor: WebGPUTensor,
   srcTensor: WebGPUTensor,
   options: { offset: number; viewShape: number[]; viewStrides: number[] },
@@ -506,7 +506,7 @@ export function stridedScatterAddDirect(
  * Used when both base and src exceed buffer binding limit but are contiguous
  * and the add covers all elements.
  */
-export function stridedScatterAddChunkedSimple(
+function stridedScatterAddChunkedSimple(
   baseTensor: WebGPUTensor,
   srcTensor: WebGPUTensor,
   maxBindingSize: number,
