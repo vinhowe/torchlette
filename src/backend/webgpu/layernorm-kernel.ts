@@ -18,54 +18,8 @@ import {
   allocateOutputBuffer,
   cachedCreateBindGroup,
 } from "./index";
-
-// WebGPU type definitions (runtime, not importable at compile time)
-type GPUBuffer = {
-  size: number;
-  usage: number;
-  destroy(): void;
-};
-
-type GPUDevice = {
-  createShaderModule(descriptor: { code: string }): GPUShaderModule;
-  createComputePipeline(descriptor: {
-    layout: "auto";
-    compute: { module: GPUShaderModule; entryPoint: string };
-  }): GPUComputePipeline;
-  createBindGroup(descriptor: {
-    layout: GPUBindGroupLayout;
-    entries: Array<{
-      binding: number;
-      resource: { buffer: GPUBuffer; offset?: number; size?: number };
-    }>;
-  }): GPUBindGroup;
-  createBuffer(descriptor: {
-    size: number;
-    usage: number;
-    mappedAtCreation?: boolean;
-  }): GPUBuffer;
-  queue: {
-    writeBuffer(
-      buffer: GPUBuffer,
-      offset: number,
-      data: ArrayBufferView,
-    ): void;
-  };
-};
-
-type GPUShaderModule = object;
-type GPUComputePipeline = {
-  getBindGroupLayout(index: number): GPUBindGroupLayout;
-};
-type GPUBindGroupLayout = object;
-type GPUBindGroup = object;
-
-const GPUBufferUsage = {
-  COPY_SRC: 0x0004,
-  COPY_DST: 0x0008,
-  UNIFORM: 0x0040,
-  STORAGE: 0x0080,
-};
+import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
+import { GPUBufferUsage } from "./gpu-types";
 
 const WORKGROUP_SIZE = 256;
 
@@ -431,7 +385,7 @@ export function dispatchLayerNormForward(
   eps: number,
 ): GPUBuffer {
   const ctx = getWebGPUDevice()!;
-  const device = ctx.device as unknown as GPUDevice;
+  const device = ctx.device;
 
   const outputSizeBytes = numRows * featureDim * 4; // f32
   const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
@@ -444,7 +398,7 @@ export function dispatchLayerNormForward(
     layerNormForwardShader(),
   );
 
-  const bindGroup = cachedCreateBindGroup(device as any, pipeline as any,
+  const bindGroup = cachedCreateBindGroup(device, pipeline,
     [xBuffer, weightBuffer, biasBuffer, outBuffer, configBuf] as any) as any;
 
   trackSharedEncoderWrite(xBuffer as any);
@@ -474,7 +428,7 @@ export function dispatchLayerNormBackwardGradX(
   eps: number,
 ): GPUBuffer {
   const ctx = getWebGPUDevice()!;
-  const device = ctx.device as unknown as GPUDevice;
+  const device = ctx.device;
 
   const outputSizeBytes = numRows * featureDim * 4;
   const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
@@ -487,7 +441,7 @@ export function dispatchLayerNormBackwardGradX(
     layerNormBackwardGradXShader(),
   );
 
-  const bindGroup = cachedCreateBindGroup(device as any, pipeline as any,
+  const bindGroup = cachedCreateBindGroup(device, pipeline,
     [gradOutputBuffer, xBuffer, weightBuffer, outBuffer, configBuf] as any) as any;
 
   trackSharedEncoderWrite(gradOutputBuffer as any);
@@ -520,7 +474,7 @@ export function dispatchLayerNormBackwardGradWeightBias(
   eps: number,
 ): { gradWeightBuffer: GPUBuffer; gradBiasBuffer: GPUBuffer } {
   const ctx = getWebGPUDevice()!;
-  const device = ctx.device as unknown as GPUDevice;
+  const device = ctx.device;
 
   const configBuf = getOrCreateConfigBuffer(device, numRows, featureDim, eps);
 
@@ -534,7 +488,7 @@ export function dispatchLayerNormBackwardGradWeightBias(
     layerNormRowStatsShader(),
   );
 
-  const statsBindGroup = cachedCreateBindGroup(device as any, statsPipeline as any,
+  const statsBindGroup = cachedCreateBindGroup(device, statsPipeline,
     [xBuffer, meanBuffer, invStdBuffer, configBuf] as any) as any;
 
   trackSharedEncoderWrite(xBuffer as any);
@@ -560,7 +514,7 @@ export function dispatchLayerNormBackwardGradWeightBias(
 
   const numWorkgroups = Math.ceil(featureDim / WORKGROUP_SIZE);
 
-  const gradBindGroup = cachedCreateBindGroup(device as any, gradPipeline as any,
+  const gradBindGroup = cachedCreateBindGroup(device, gradPipeline,
     [gradOutputBuffer, xBuffer, meanBuffer, invStdBuffer, gradWeightBuffer, gradBiasBuffer, configBuf] as any) as any;
 
   trackSharedEncoderWrite(gradOutputBuffer as any);

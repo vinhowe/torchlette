@@ -107,9 +107,9 @@ export async function adamStep(
         (enc as any).copyBufferToBuffer(src, 0, dst, 0, bufSize);
       } else {
         const ctx2 = requireContext();
-        const tmpEnc = (ctx2.device as any).createCommandEncoder();
+        const tmpEnc = ctx2.device.createCommandEncoder();
         tmpEnc.copyBufferToBuffer(src, 0, dst, 0, bufSize);
-        (ctx2.queue as any).submit([tmpEnc.finish()]);
+        ctx2.queue.submit([tmpEnc.finish()]);
       }
       return dst;
     };

@@ -18,54 +18,8 @@ import {
   allocateOutputBuffer,
   cachedCreateBindGroup,
 } from "./index";
-
-// WebGPU type definitions (runtime, not importable at compile time)
-type GPUBuffer = {
-  size: number;
-  usage: number;
-  destroy(): void;
-};
-
-type GPUDevice = {
-  createShaderModule(descriptor: { code: string }): GPUShaderModule;
-  createComputePipeline(descriptor: {
-    layout: "auto";
-    compute: { module: GPUShaderModule; entryPoint: string };
-  }): GPUComputePipeline;
-  createBindGroup(descriptor: {
-    layout: GPUBindGroupLayout;
-    entries: Array<{
-      binding: number;
-      resource: { buffer: GPUBuffer; offset?: number; size?: number };
-    }>;
-  }): GPUBindGroup;
-  createBuffer(descriptor: {
-    size: number;
-    usage: number;
-    mappedAtCreation?: boolean;
-  }): GPUBuffer;
-  queue: {
-    writeBuffer(
-      buffer: GPUBuffer,
-      offset: number,
-      data: ArrayBufferView,
-    ): void;
-  };
-};
-
-type GPUShaderModule = object;
-type GPUComputePipeline = {
-  getBindGroupLayout(index: number): GPUBindGroupLayout;
-};
-type GPUBindGroupLayout = object;
-type GPUBindGroup = object;
-
-const GPUBufferUsage = {
-  COPY_SRC: 0x0004,
-  COPY_DST: 0x0008,
-  UNIFORM: 0x0040,
-  STORAGE: 0x0080,
-};
+import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
+import { GPUBufferUsage } from "./gpu-types";
 
 const WORKGROUP_SIZE = 256;
 
@@ -267,7 +221,7 @@ export function dispatchCrossEntropyForward(
   vocabSize: number,
 ): GPUBuffer {
   const ctx = getWebGPUDevice()!;
-  const device = ctx.device as unknown as GPUDevice;
+  const device = ctx.device;
 
   const outputSizeBytes = batchSize * 4; // f32
   const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
@@ -280,7 +234,7 @@ export function dispatchCrossEntropyForward(
     crossEntropyForwardShader(),
   );
 
-  const bindGroup = cachedCreateBindGroup(device as any, pipeline as any,
+  const bindGroup = cachedCreateBindGroup(device, pipeline,
     [logitsBuffer, targetsBuffer, outBuffer, configBuf] as any) as any;
 
   trackSharedEncoderWrite(logitsBuffer as any);
@@ -308,7 +262,7 @@ export function dispatchCrossEntropyBackward(
   vocabSize: number,
 ): GPUBuffer {
   const ctx = getWebGPUDevice()!;
-  const device = ctx.device as unknown as GPUDevice;
+  const device = ctx.device;
 
   const outputSizeBytes = batchSize * vocabSize * 4; // f32
   const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
@@ -321,7 +275,7 @@ export function dispatchCrossEntropyBackward(
     crossEntropyBackwardShader(),
   );
 
-  const bindGroup = cachedCreateBindGroup(device as any, pipeline as any,
+  const bindGroup = cachedCreateBindGroup(device, pipeline,
     [logitsBuffer, targetsBuffer, gradOutputBuffer, outBuffer, configBuf] as any) as any;
 
   trackSharedEncoderWrite(logitsBuffer as any);

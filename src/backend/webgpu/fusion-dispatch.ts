@@ -23,66 +23,8 @@ import {
   computeKernelMeta,
   type KernelGenOptions,
 } from "./fusion-codegen";
-
-// WebGPU type definitions (runtime injected)
-type GPUBuffer = {
-  size: number;
-  usage: number;
-  destroy(): void;
-};
-
-type GPUDevice = {
-  createShaderModule(descriptor: { code: string }): GPUShaderModule;
-  createComputePipeline(descriptor: {
-    layout: "auto";
-    compute: { module: GPUShaderModule; entryPoint: string };
-  }): GPUComputePipeline;
-  createBindGroup(descriptor: {
-    layout: GPUBindGroupLayout;
-    entries: Array<{ binding: number; resource: { buffer: GPUBuffer } }>;
-  }): GPUBindGroup;
-  createBuffer(descriptor: {
-    size: number;
-    usage: number;
-    mappedAtCreation?: boolean;
-  }): GPUBuffer;
-  createCommandEncoder(): GPUCommandEncoder;
-  queue: {
-    submit(commandBuffers: GPUCommandBuffer[]): void;
-    writeBuffer(buffer: GPUBuffer, offset: number, data: ArrayBufferView): void;
-  };
-};
-
-type GPUShaderModule = object;
-type GPUComputePipeline = {
-  getBindGroupLayout(index: number): GPUBindGroupLayout;
-};
-type GPUBindGroupLayout = object;
-type GPUBindGroup = object;
-type GPUCommandEncoder = {
-  beginComputePass(descriptor?: any): GPUComputePassEncoder;
-  finish(): GPUCommandBuffer;
-};
-type GPUComputePassEncoder = {
-  setPipeline(pipeline: GPUComputePipeline): void;
-  setBindGroup(index: number, bindGroup: GPUBindGroup): void;
-  dispatchWorkgroups(x: number, y?: number, z?: number): void;
-  end(): void;
-};
-type GPUCommandBuffer = object;
-
-const GPUBufferUsage = {
-  MAP_READ: 0x0001,
-  MAP_WRITE: 0x0002,
-  COPY_SRC: 0x0004,
-  COPY_DST: 0x0008,
-  INDEX: 0x0010,
-  VERTEX: 0x0020,
-  UNIFORM: 0x0040,
-  STORAGE: 0x0080,
-  INDIRECT: 0x0100,
-  QUERY_RESOLVE: 0x0200,
-};
+import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
+import { GPUBufferUsage } from "./gpu-types";
 
 // ============================================================================
 // Kernel Cache
@@ -296,7 +238,7 @@ export function dispatchFusedKernel(
   }
 
   // Create uniform buffer for params via shared pool
-  const paramsBuffer = createParamsBuffer(device as any, new Uint32Array([totalElements]));
+  const paramsBuffer = createParamsBuffer(device, new Uint32Array([totalElements]));
 
   // Build flat buffer array: non-inlined inputs, then outputs, then params
   const bgBuffers: GPUBuffer[] = [];
@@ -307,7 +249,7 @@ export function dispatchFusedKernel(
     bgBuffers.push(outputBuffers[i]);
   }
   bgBuffers.push(paramsBuffer);
-  const bindGroup = cachedCreateBindGroup(device as any, pipeline as any, bgBuffers as any) as any;
+  const bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers) as any;
 
   // Dispatch (batch/shared-encoder mode aware)
   // Use 2D dispatch when workgroups exceed WebGPU per-dimension limit (65535)

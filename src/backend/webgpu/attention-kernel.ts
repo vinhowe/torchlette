@@ -25,46 +25,8 @@ import {
 } from "./index";
 
 import { getSubgroupSupport } from "./matmul/types";
-
-// WebGPU type definitions (runtime, not importable at compile time)
-type GPUBuffer = {
-  size: number;
-  usage: number;
-  destroy(): void;
-};
-
-type GPUDevice = {
-  createShaderModule(descriptor: { code: string }): GPUShaderModule;
-  createComputePipeline(descriptor: {
-    layout: "auto";
-    compute: { module: GPUShaderModule; entryPoint: string };
-  }): GPUComputePipeline;
-  createBuffer(descriptor: {
-    size: number;
-    usage: number;
-    mappedAtCreation?: boolean;
-  }): GPUBuffer;
-  queue: {
-    writeBuffer(
-      buffer: GPUBuffer,
-      offset: number,
-      data: ArrayBufferView,
-    ): void;
-  };
-};
-
-type GPUShaderModule = object;
-type GPUComputePipeline = {
-  getBindGroupLayout(index: number): GPUBindGroupLayout;
-};
-type GPUBindGroupLayout = object;
-
-const GPUBufferUsage = {
-  COPY_SRC: 0x0004,
-  COPY_DST: 0x0008,
-  UNIFORM: 0x0040,
-  STORAGE: 0x0080,
-};
+import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
+import { GPUBufferUsage } from "./gpu-types";
 
 // Tiling parameters
 const BR = 64;  // Q rows per workgroup (also workgroup size in scalar mode)
@@ -1237,7 +1199,7 @@ export function dispatchFlashAttentionForward(
   isCausal: boolean,
 ): { outputBuffer: GPUBuffer; logsumexpBuffer: GPUBuffer } {
   const ctx = getWebGPUDevice()!;
-  const device = ctx.device as unknown as GPUDevice;
+  const device = ctx.device;
 
   const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4; // f32
   const logsumexpSizeBytes = batchSize * numHeads * seqLen * 4; // f32
@@ -1256,7 +1218,7 @@ export function dispatchFlashAttentionForward(
     flashAttentionForwardShader(headDim, sg),
   );
 
-  const bindGroup = cachedCreateBindGroup(device as any, pipeline as any,
+  const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer, configBuf] as any) as any;
 
   trackSharedEncoderWrite(qBuffer as any);
@@ -1292,7 +1254,7 @@ export function dispatchFlashAttentionBackwardD(
   isCausal: boolean,
 ): GPUBuffer {
   const ctx = getWebGPUDevice()!;
-  const device = ctx.device as unknown as GPUDevice;
+  const device = ctx.device;
 
   const totalRows = batchSize * numHeads * seqLen;
   const outputSizeBytes = totalRows * 4; // f32
@@ -1310,7 +1272,7 @@ export function dispatchFlashAttentionBackwardD(
     flashAttentionBackwardDShader(headDim),
   );
 
-  const bindGroup = cachedCreateBindGroup(device as any, pipeline as any,
+  const bindGroup = cachedCreateBindGroup(device, pipeline,
     [dOBuffer, oBuffer, outBuffer, configBuf] as any) as any;
 
   trackSharedEncoderWrite(dOBuffer as any);
@@ -1345,7 +1307,7 @@ export function dispatchFlashAttentionBackwardDQ(
   isCausal: boolean,
 ): GPUBuffer {
   const ctx = getWebGPUDevice()!;
-  const device = ctx.device as unknown as GPUDevice;
+  const device = ctx.device;
 
   const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4;
 
@@ -1362,7 +1324,7 @@ export function dispatchFlashAttentionBackwardDQ(
     flashAttentionBackwardDQShader(headDim, sg),
   );
 
-  const bindGroup = cachedCreateBindGroup(device as any, pipeline as any,
+  const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer, configBuf] as any) as any;
 
   trackSharedEncoderWrite(qBuffer as any);
@@ -1404,7 +1366,7 @@ export function dispatchFlashAttentionBackwardDKV(
   isCausal: boolean,
 ): { dKBuffer: GPUBuffer; dVBuffer: GPUBuffer } {
   const ctx = getWebGPUDevice()!;
-  const device = ctx.device as unknown as GPUDevice;
+  const device = ctx.device;
 
   const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4;
 
@@ -1423,7 +1385,7 @@ export function dispatchFlashAttentionBackwardDKV(
     flashAttentionBackwardDKVShader(headDim, sg),
   );
 
-  const bindGroup = cachedCreateBindGroup(device as any, pipeline as any,
+  const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer, configBuf] as any) as any;
 
   trackSharedEncoderWrite(qBuffer as any);

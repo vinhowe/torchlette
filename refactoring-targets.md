@@ -1,6 +1,6 @@
 # Refactoring Targets
 
-Refactoring opportunities identified from full codebase reviews. Targets 1–5, 7–9, 11 are complete.
+Refactoring opportunities identified from full codebase reviews. Targets 1–5, 7–11 are complete.
 
 ## Target 1: Decompose `webgpu/index.ts` — DONE
 
@@ -38,25 +38,9 @@ Added `NodeSideOutputs` interface and `_sideOutputs` field to `LazyIRNode`. Repl
 
 Deleted duplicate `dtypeBytes` from `fusion-dispatch.ts`, duplicate `dtypeToWgsl` from `matmul/codegen.ts`, and `dtypeToWgsl` (bool→u32 variant) from `fusion-codegen.ts`. Added `dtypeToWgslStorage()` to `shape-utils.ts` for the bool→u32 case. `computeContiguousStrides` and `createStorageHandleInternal` duplicates were already removed in Target 7.
 
-## Target 10: Fix `as unknown as GPUDevice` Type Casts
+## Target 10: Fix `as unknown as GPUDevice` Type Casts — DONE
 
-**Impact:** Cleanliness, IDE support
-**Effort:** Low
-**Priority:** MEDIUM
-
-The local type alias `GPUDevice` in `gpu-types.ts` doesn't include all fields that kernel files need (e.g., `.limits`, `.queue`). This forces 12+ `as unknown as GPUDevice` casts across kernel files:
-
-```
-attention-kernel.ts     — 5 casts
-layernorm-kernel.ts     — 7 casts
-cross-entropy-kernel.ts — 4 casts
-unscale-kernel.ts       — 4 casts
-fusion-dispatch.ts      — 1 cast
-```
-
-**Approach:** Update the `GPUDevice` type alias in `gpu-types.ts` to include the missing members (`.limits`, `.queue`, `.createCommandEncoder()`, etc.), or use the real WebGPU types from `@webgpu/types`.
-
-**Files:** `src/backend/webgpu/gpu-types.ts`, plus all kernel files that use the casts
+Replaced 7 local WebGPU type definition blocks (GPUDevice, GPUBuffer, GPUComputePipeline, etc.) in kernel files with imports from `gpu-types.ts`. Eliminated 14 `as unknown as GPUDevice` casts and ~30 `device as any`/`pipeline as any` casts across attention-kernel.ts, layernorm-kernel.ts, cross-entropy-kernel.ts, adam-kernel.ts, unscale-kernel.ts, fusion-dispatch.ts, matmul/dispatch.ts, and ops/fused.ts.
 
 ## Target 11: Add `rand`/`randn`/`bernoulli` to `LazyOpCode` — DONE
 

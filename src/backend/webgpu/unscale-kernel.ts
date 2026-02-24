@@ -27,76 +27,8 @@ import {
 } from "./index";
 import { isProfilingEnabled } from "./profiler";
 import { gpuMemoryTracker } from "./memory-tracker";
-
-// WebGPU type definitions (runtime, not importable at compile time)
-type GPUBuffer = {
-  size: number;
-  usage: number;
-  destroy(): void;
-  mapAsync(mode: number): Promise<void>;
-  getMappedRange(): ArrayBuffer;
-  unmap(): void;
-};
-
-type GPUDevice = {
-  createShaderModule(descriptor: { code: string }): GPUShaderModule;
-  createComputePipeline(descriptor: {
-    layout: "auto";
-    compute: { module: GPUShaderModule; entryPoint: string };
-  }): GPUComputePipeline;
-  createBindGroup(descriptor: {
-    layout: GPUBindGroupLayout;
-    entries: Array<{
-      binding: number;
-      resource: { buffer: GPUBuffer; offset?: number; size?: number };
-    }>;
-  }): GPUBindGroup;
-  createBuffer(descriptor: {
-    size: number;
-    usage: number;
-    mappedAtCreation?: boolean;
-  }): GPUBuffer;
-  createCommandEncoder(): GPUCommandEncoder;
-  queue: {
-    writeBuffer(
-      buffer: GPUBuffer,
-      offset: number,
-      data: ArrayBufferView,
-    ): void;
-    submit(commandBuffers: GPUCommandBuffer[]): void;
-    onSubmittedWorkDone?(): Promise<void>;
-  };
-};
-
-type GPUShaderModule = object;
-type GPUComputePipeline = {
-  getBindGroupLayout(index: number): GPUBindGroupLayout;
-};
-type GPUBindGroupLayout = object;
-type GPUBindGroup = object;
-type GPUCommandEncoder = {
-  copyBufferToBuffer(
-    source: GPUBuffer,
-    sourceOffset: number,
-    destination: GPUBuffer,
-    destinationOffset: number,
-    size: number,
-  ): void;
-  finish(): GPUCommandBuffer;
-};
-type GPUCommandBuffer = object;
-
-const GPUBufferUsage = {
-  MAP_READ: 0x0001,
-  COPY_SRC: 0x0004,
-  COPY_DST: 0x0008,
-  UNIFORM: 0x0040,
-  STORAGE: 0x0080,
-};
-
-const GPUMapMode = {
-  READ: 0x0001,
-};
+import type { GPUBuffer, GPUDevice, GPUComputePipeline, GPUCommandEncoder } from "./gpu-types";
+import { GPUBufferUsage, GPUMapMode } from "./gpu-types";
 
 const WORKGROUP_SIZE = 256;
 const MAX_WORKGROUPS_PER_DIM = 65535;
@@ -190,7 +122,7 @@ function createUnscaleConfigBuffer(
   u32[2] = 0; // pad
   u32[3] = 0; // pad
 
-  return createParamsBuffer(device as any, u32);
+  return createParamsBuffer(device, u32);
 }
 
 // ============================================================================
@@ -215,11 +147,11 @@ const infFlagZeroData = new Float32Array([0.0]);
  */
 export function allocateInfFlagBuffer(device?: GPUDevice): GPUBuffer {
   if (persistentInfFlagBuffer) {
-    const dev = device ?? (getWebGPUDevice()!.device as unknown as GPUDevice);
+    const dev = device ?? (getWebGPUDevice()!.device);
     dev.queue.writeBuffer(persistentInfFlagBuffer, 0, infFlagZeroData);
     return persistentInfFlagBuffer;
   }
-  const dev = device ?? (getWebGPUDevice()!.device as unknown as GPUDevice);
+  const dev = device ?? (getWebGPUDevice()!.device);
   persistentInfFlagBuffer = dev.createBuffer({
     size: 4,
     usage:
@@ -239,7 +171,7 @@ export function allocateInfFlagBuffer(device?: GPUDevice): GPUBuffer {
  */
 export async function readInfFlag(infFlagBuffer: GPUBuffer): Promise<number> {
   const ctx = getWebGPUDevice()!;
-  const device = ctx.device as unknown as GPUDevice;
+  const device = ctx.device;
 
   // Consume the deferred fence from markStep() BEFORE any GPU sync.
   // resolveDeferred() always calls markStep() → issueDeferredFence() before
@@ -272,7 +204,7 @@ export async function readInfFlag(infFlagBuffer: GPUBuffer): Promise<number> {
       size: 4,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
-    (device as any).queue.writeBuffer(fenceBuf, 0, new Uint8Array([1, 2, 3, 4]));
+    device.queue.writeBuffer(fenceBuf, 0, new Uint8Array([1, 2, 3, 4]));
     await fenceBuf.mapAsync(GPUMapMode.READ);
     fenceBuf.unmap();
     fenceBuf.destroy();
@@ -367,7 +299,7 @@ export function dispatchUnscaleGrad(
   infFlagBuffer: GPUBuffer,
 ): UnscaleGradResult {
   const ctx = getWebGPUDevice()!;
-  const device = ctx.device as unknown as GPUDevice;
+  const device = ctx.device;
 
   const bytesPerElement = 4; // f32
   const totalBytes = numElements * bytesPerElement;
@@ -432,7 +364,7 @@ export function dispatchUnscaleGrad(
         entries,
       });
     } else {
-      bindGroup = cachedCreateBindGroup(device as any, pipeline as any,
+      bindGroup = cachedCreateBindGroup(device, pipeline,
         [gradBuffer, gradOut, infFlagBuffer, configBuf] as any);
     }
 
