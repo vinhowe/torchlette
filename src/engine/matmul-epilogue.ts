@@ -2,6 +2,8 @@ import type { Backend, BackendTensor, DType } from "../backend/types";
 import type { LazyIRNode, LazyRef, StorageHandle } from "./lazy-types";
 import { createStorageHandle, ensureWebGPUMatmulImports, _webgpuMatmulImports } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
+import { shapesEqual } from "../core/shape";
+export { shapesEqual };
 
 // ============================================================================
 // Matmul Epilogue Fusion (Phase 1)
@@ -343,10 +345,4 @@ export async function executeMatmulWithEpilogue(
   plan.outputNode.result = createStorageHandle(plan.outputNode.device, resultTensor);
 }
 
-export function shapesEqual(a: number[], b: number[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return false;
-  }
-  return true;
-}
+// shapesEqual re-exported from core/shape

@@ -374,7 +374,7 @@ export async function executeWithMemoryPlanning(
       }
 
       case "add":
-        resultTensor = (nodeBackend.ops.add as any)(
+        resultTensor = nodeBackend.ops.add(
           backendInputs[0],
           backendInputs[1],
           donationOpts,
@@ -383,7 +383,7 @@ export async function executeWithMemoryPlanning(
 
       case "sub": {
         const subPayload = node.payload as { alpha?: number } | undefined;
-        resultTensor = (nodeBackend.ops.sub as any)(
+        resultTensor = nodeBackend.ops.sub(
           backendInputs[0],
           backendInputs[1],
           { ...subPayload, ...donationOpts },
@@ -392,7 +392,7 @@ export async function executeWithMemoryPlanning(
       }
 
       case "mul":
-        resultTensor = (nodeBackend.ops.mul as any)(
+        resultTensor = nodeBackend.ops.mul(
           backendInputs[0],
           backendInputs[1],
           donationOpts,
@@ -403,7 +403,7 @@ export async function executeWithMemoryPlanning(
         const divPayload = node.payload as
           | { roundingMode?: "trunc" | "floor" }
           | undefined;
-        resultTensor = (nodeBackend.ops.div as any)(
+        resultTensor = nodeBackend.ops.div(
           backendInputs[0],
           backendInputs[1],
           { ...divPayload, ...donationOpts },
@@ -412,7 +412,7 @@ export async function executeWithMemoryPlanning(
       }
 
       case "matmul":
-        resultTensor = (nodeBackend.ops.matmul as any)(
+        resultTensor = nodeBackend.ops.matmul(
           backendInputs[0],
           backendInputs[1],
           donationOpts,
@@ -420,14 +420,14 @@ export async function executeWithMemoryPlanning(
         break;
 
       case "sqrt":
-        resultTensor = (nodeBackend.ops.sqrt as any)(
+        resultTensor = nodeBackend.ops.sqrt(
           backendInputs[0],
           donationOpts,
         );
         break;
 
       case "relu":
-        resultTensor = (nodeBackend.ops.relu as any)(
+        resultTensor = nodeBackend.ops.relu(
           backendInputs[0],
           donationOpts,
         );
@@ -436,7 +436,7 @@ export async function executeWithMemoryPlanning(
       case "exp":
         if (!nodeBackend.ops.exp)
           throw new Error("exp not supported by backend");
-        resultTensor = (nodeBackend.ops.exp as any)(
+        resultTensor = nodeBackend.ops.exp(
           backendInputs[0],
           donationOpts,
         );
@@ -445,7 +445,7 @@ export async function executeWithMemoryPlanning(
       case "log":
         if (!nodeBackend.ops.log)
           throw new Error("log not supported by backend");
-        resultTensor = (nodeBackend.ops.log as any)(
+        resultTensor = nodeBackend.ops.log(
           backendInputs[0],
           donationOpts,
         );
@@ -454,7 +454,7 @@ export async function executeWithMemoryPlanning(
       case "neg":
         if (!nodeBackend.ops.neg)
           throw new Error("neg not supported by backend");
-        resultTensor = (nodeBackend.ops.neg as any)(
+        resultTensor = nodeBackend.ops.neg(
           backendInputs[0],
           donationOpts,
         );
@@ -463,7 +463,7 @@ export async function executeWithMemoryPlanning(
       case "abs":
         if (!nodeBackend.ops.abs)
           throw new Error("abs not supported by backend");
-        resultTensor = (nodeBackend.ops.abs as any)(
+        resultTensor = nodeBackend.ops.abs(
           backendInputs[0],
           donationOpts,
         );
@@ -472,7 +472,7 @@ export async function executeWithMemoryPlanning(
       case "tanh":
         if (!nodeBackend.ops.tanh)
           throw new Error("tanh not supported by backend");
-        resultTensor = (nodeBackend.ops.tanh as any)(
+        resultTensor = nodeBackend.ops.tanh(
           backendInputs[0],
           donationOpts,
         );
@@ -481,7 +481,7 @@ export async function executeWithMemoryPlanning(
       case "sigmoid":
         if (!nodeBackend.ops.sigmoid)
           throw new Error("sigmoid not supported by backend");
-        resultTensor = (nodeBackend.ops.sigmoid as any)(
+        resultTensor = nodeBackend.ops.sigmoid(
           backendInputs[0],
           donationOpts,
         );
@@ -490,7 +490,7 @@ export async function executeWithMemoryPlanning(
       case "gelu":
         if (!nodeBackend.ops.gelu)
           throw new Error("gelu not supported by backend");
-        resultTensor = (nodeBackend.ops.gelu as any)(
+        resultTensor = nodeBackend.ops.gelu(
           backendInputs[0],
           donationOpts,
         );
@@ -499,7 +499,7 @@ export async function executeWithMemoryPlanning(
       case "silu":
         if (!nodeBackend.ops.silu)
           throw new Error("silu not supported by backend");
-        resultTensor = (nodeBackend.ops.silu as any)(
+        resultTensor = nodeBackend.ops.silu(
           backendInputs[0],
           donationOpts,
         );
@@ -623,7 +623,7 @@ export async function executeWithMemoryPlanning(
 
       case "gt":
         if (!nodeBackend.ops.gt) throw new Error("gt not supported by backend");
-        resultTensor = (nodeBackend.ops.gt as any)(
+        resultTensor = nodeBackend.ops.gt(
           backendInputs[0],
           backendInputs[1],
           donationOpts,
@@ -632,7 +632,7 @@ export async function executeWithMemoryPlanning(
 
       case "lt":
         if (!nodeBackend.ops.lt) throw new Error("lt not supported by backend");
-        resultTensor = (nodeBackend.ops.lt as any)(
+        resultTensor = nodeBackend.ops.lt(
           backendInputs[0],
           backendInputs[1],
           donationOpts,
@@ -659,7 +659,7 @@ export async function executeWithMemoryPlanning(
 
       case "eq":
         if (!nodeBackend.ops.eq) throw new Error("eq not supported by backend");
-        resultTensor = (nodeBackend.ops.eq as any)(
+        resultTensor = nodeBackend.ops.eq(
           backendInputs[0],
           backendInputs[1],
           donationOpts,
@@ -668,7 +668,7 @@ export async function executeWithMemoryPlanning(
 
       case "ne":
         if (!nodeBackend.ops.ne) throw new Error("ne not supported by backend");
-        resultTensor = (nodeBackend.ops.ne as any)(
+        resultTensor = nodeBackend.ops.ne(
           backendInputs[0],
           backendInputs[1],
           donationOpts,
@@ -676,7 +676,7 @@ export async function executeWithMemoryPlanning(
         break;
 
       case "where":
-        resultTensor = (nodeBackend.ops.where as any)(
+        resultTensor = nodeBackend.ops.where(
           backendInputs[0],
           backendInputs[1],
           backendInputs[2],

@@ -37,6 +37,7 @@ import {
   issueDeferredFence,
   awaitDeferredFence,
 } from "./backend/webgpu";
+import { sizeOf, shapesEqual } from "./core/shape";
 import { storageTracker } from "./engine/lazy";
 import type { Tensor as RuntimeTensor } from "./runtime/tensor";
 
@@ -1575,18 +1576,4 @@ function collectEngineTensors(value: unknown): EngineTensor[] {
   return out;
 }
 
-function sizeOf(shape: number[]): number {
-  return shape.reduce((acc, dim) => acc * dim, 1);
-}
-
-function shapesEqual(a: number[], b: number[]): boolean {
-  if (a.length !== b.length) {
-    return false;
-  }
-  for (let i = 0; i < a.length; i += 1) {
-    if (a[i] !== b[i]) {
-      return false;
-    }
-  }
-  return true;
-}
+// sizeOf and shapesEqual imported from core/shape
