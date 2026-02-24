@@ -62,8 +62,6 @@ export {
 export {
   getInputStorage,
   executeOp,
-  executeOpInternal,
-  computeContiguousStrides,
 } from "./op-dispatch";
 
 // ── Matmul epilogue detection and execution ───────────────────────────────────

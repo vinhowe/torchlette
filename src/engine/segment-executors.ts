@@ -26,7 +26,8 @@ import {
 import type { LazyIRNode, LazyRef, StorageHandle, ExecutionPlan } from "./lazy-types";
 import { createStorageHandle, ensureWebGPUMatmulImports, _webgpuMatmulImports } from "./node-factory";
 import { storageTracker, canSafelyRelease, releaseBufferImmediate } from "./storage-tracker";
-import { getInputStorage, executeOp, computeContiguousStrides } from "./op-dispatch";
+import { computeContiguousStrides } from "../backend/types";
+import { getInputStorage, executeOp } from "./op-dispatch";
 import type { MatmulPrologueInfo, MatmulEpiloguePlan } from "./matmul-epilogue";
 import { detectMatmulEpilogue, detectMatmulEpilogueCore, executeMatmulWithEpilogue } from "./matmul-epilogue";
 import { detectReductionPreamble, executeReductionWithPreamble } from "./reduction-preamble";
