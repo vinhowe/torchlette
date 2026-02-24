@@ -9,7 +9,7 @@ import { sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch, dtyp
 import { requireContext, f32ArrayToF16Array } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { createTensor, createTrackedBuffer, createBufferWithData } from "../tensor";
-import { resolveOutputBuffer, activeArena, arenaBufferSet } from "../buffer-arena";
+import { resolveOutputBuffer, getActiveArena, arenaBufferSet } from "../buffer-arena";
 import { cachedCreateBindGroup, createParamsBuffer, releaseParamsBuffer } from "../bind-group-cache";
 import { profileApiCall } from "../profiler";
 import { bufferPool } from "../buffer-pool";
@@ -36,7 +36,7 @@ export function tensorFromArray(values: number[] | Float32Array, shape: number[]
   const f32data = values instanceof Float32Array ? values : Float32Array.from(values);
   // Arena fast path: use resolveOutputBuffer for stable buffer identity across steps.
   // This eliminates bind group cache misses from data-source ops in lowered plans.
-  if (activeArena) {
+  if (getActiveArena()) {
     const buffer = resolveOutputBuffer(ctx.device, f32data.byteLength, []);
     profileApiCall("writeBuffer", () => ctx.queue.writeBuffer(buffer, 0, f32data));
     return createTensor(shape, buffer, undefined, 0, "f32");
@@ -561,7 +561,7 @@ export function tensorFromArrayWithDtype(
   }
 
   // Arena fast path: use resolveOutputBuffer for stable buffer identity across steps
-  if (activeArena) {
+  if (getActiveArena()) {
     const buffer = resolveOutputBuffer(ctx.device, typedData.byteLength, []);
     profileApiCall("writeBuffer", () => ctx.queue.writeBuffer(buffer, 0, typedData));
     return createTensor(shape, buffer, undefined, 0, dtype);

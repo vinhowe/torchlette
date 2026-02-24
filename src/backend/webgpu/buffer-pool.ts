@@ -220,7 +220,7 @@ class SimpleBufferPool {
     // are from a previous step and the GPU may still be using them.
     // Also skip during shared encoder scope — pending buffers may have been
     // written by earlier passes and their command buffers not yet submitted.
-    if (!activeBatch && !pendingFencePromise && !sharedEncoderActive) {
+    if (!activeBatch && !fenceState.pendingFencePromise && !sharedEncoderActive) {
       const pendingIdx = this.pendingRelease.findIndex(
         (p) => p.sizeClass === sizeClass && !this.bufferLiveCount.has(p.buffer),
       );
@@ -887,25 +887,34 @@ export function decRefBuffer(buffer: GPUBuffer): void {
 // ============================================================================
 
 /**
- * Pending fence promise from a previous markStep. When set, the GPU was still
- * working when the previous markStep returned. The next markStep must await
- * this before destroying any buffers.
+ * Deferred GPU fence state — groups the pending fence promise, pending-release
+ * flag, and profiling fence buffer into a single typed object for debuggability
+ * and explicit reset.
  */
-let pendingFencePromise: Promise<void> | null = null;
+interface FenceState {
+  /** Pending fence promise from a previous markStep. */
+  pendingFencePromise: Promise<void> | null;
+  /** Whether to flush pending-release buffers after fence resolves. */
+  deferredPendingRelease: boolean;
+  /** Persistent fence buffer for the writeBuffer+mapAsync fence workaround. */
+  profilingFenceBuffer: GPUBuffer | null;
+}
 
-/**
- * Buffers queued for destruction after the pending fence resolves.
- * These are from destroyUnreachable() — we can't destroy them until
- * the GPU is done with them.
- */
-let deferredPendingRelease: boolean = false;
+const fenceState: FenceState = {
+  pendingFencePromise: null,
+  deferredPendingRelease: false,
+  profilingFenceBuffer: null,
+};
 
-/**
- * Persistent fence buffer for the writeBuffer+mapAsync fence workaround.
- * Used in profiling mode to avoid V100/Dawn onSubmittedWorkDone deadlock.
- */
-let profilingFenceBuffer: GPUBuffer | null = null;
 const profilingFenceData = new Uint8Array([1, 2, 3, 4]);
+
+/** Reset deferred fence state. Does NOT destroy the profiling fence buffer. */
+export function resetFenceState(): void {
+  fenceState.pendingFencePromise = null;
+  fenceState.deferredPendingRelease = false;
+  // profilingFenceBuffer intentionally not reset — it's a lazy singleton.
+  // Use destroyProfilingFenceBuffer() for explicit cleanup.
+}
 
 /**
  * Issue a GPU fence without awaiting it. The fence promise is stored
@@ -924,25 +933,25 @@ export function issueDeferredFence(): void {
 
   if (isProfilingEnabled()) {
     // Profiling mode: use writeBuffer+mapAsync (CPU-only, no deadlock)
-    if (!profilingFenceBuffer) {
-      profilingFenceBuffer = ctx.device.createBuffer({
+    if (!fenceState.profilingFenceBuffer) {
+      fenceState.profilingFenceBuffer = ctx.device.createBuffer({
         size: 4,
         usage: 0x0008 | 0x0001, // COPY_DST | MAP_READ
       });
     }
-    ctx.queue.writeBuffer(profilingFenceBuffer, 0, profilingFenceData);
-    pendingFencePromise = profilingFenceBuffer
+    ctx.queue.writeBuffer(fenceState.profilingFenceBuffer, 0, profilingFenceData);
+    fenceState.pendingFencePromise = fenceState.profilingFenceBuffer
       .mapAsync(0x0001 /* MAP_READ */)
       .then(() => {
-        profilingFenceBuffer!.unmap();
+        fenceState.profilingFenceBuffer!.unmap();
       });
-    deferredPendingRelease = true;
+    fenceState.deferredPendingRelease = true;
     return;
   }
 
   if (typeof ctx.queue.onSubmittedWorkDone !== "function") return;
-  pendingFencePromise = ctx.queue.onSubmittedWorkDone();
-  deferredPendingRelease = true;
+  fenceState.pendingFencePromise = ctx.queue.onSubmittedWorkDone();
+  fenceState.deferredPendingRelease = true;
 }
 
 /**
@@ -950,14 +959,14 @@ export function issueDeferredFence(): void {
  * pending buffers. Must be called before any buffer reuse in a new step.
  */
 export async function awaitDeferredFence(): Promise<void> {
-  if (pendingFencePromise) {
-    await pendingFencePromise;
-    pendingFencePromise = null;
+  if (fenceState.pendingFencePromise) {
+    await fenceState.pendingFencePromise;
+    fenceState.pendingFencePromise = null;
   }
-  if (deferredPendingRelease) {
+  if (fenceState.deferredPendingRelease) {
     bufferPool.flushPendingToPool();
     bufferPool.destroyPendingBuffers();
-    deferredPendingRelease = false;
+    fenceState.deferredPendingRelease = false;
   }
 }
 
@@ -965,7 +974,7 @@ export async function awaitDeferredFence(): Promise<void> {
  * Check if there's a pending deferred fence.
  */
 export function hasDeferredFence(): boolean {
-  return pendingFencePromise !== null;
+  return fenceState.pendingFencePromise !== null;
 }
 
 // ============================================================================
@@ -1027,8 +1036,8 @@ export function acquirePooledBuffer(sizeBytes: number): GPUBuffer | null {
  * Called during WebGPU context teardown (destroyWebGPU).
  */
 export function destroyProfilingFenceBuffer(): void {
-  if (profilingFenceBuffer) {
-    profilingFenceBuffer.destroy();
-    profilingFenceBuffer = null;
+  if (fenceState.profilingFenceBuffer) {
+    fenceState.profilingFenceBuffer.destroy();
+    fenceState.profilingFenceBuffer = null;
   }
 }

@@ -136,13 +136,43 @@ export function getActiveBatchEncoder(): GPUCommandEncoder | null {
 // to prevent buffer pool aliasing — ensuring a buffer written by an earlier op
 // is not reused as output for a later op within the same scope.
 //
-let sharedEncoderEnabled = false;
-let sharedEncoderDepth = 0;
-let sharedEncoderInstance: GPUCommandEncoder | null = null;
-let sharedEncoderPassCount = 0;
-export let collectedCommandBuffers: GPUCommandBuffer[] = [];
-let sharedEncoderDeferredUniformBuffers: GPUBuffer[] = [];
-export let stepLevelScope = false; // true between beginStep() and endStep()
+/**
+ * Shared encoder mutable state — groups all module-level let variables
+ * into a single typed object for debuggability and explicit reset.
+ */
+interface EncoderState {
+  enabled: boolean;
+  depth: number;
+  instance: GPUCommandEncoder | null;
+  passCount: number;
+  collectedCommandBuffers: GPUCommandBuffer[];
+  deferredUniformBuffers: GPUBuffer[];
+  stepLevelScope: boolean;
+  adamBatchMode: boolean;
+}
+
+const encoderState: EncoderState = {
+  enabled: false,
+  depth: 0,
+  instance: null,
+  passCount: 0,
+  collectedCommandBuffers: [],
+  deferredUniformBuffers: [],
+  stepLevelScope: false,
+  adamBatchMode: false,
+};
+
+/** Reset shared encoder state. For test isolation. */
+export function resetEncoderState(): void {
+  encoderState.enabled = false;
+  encoderState.depth = 0;
+  encoderState.instance = null;
+  encoderState.passCount = 0;
+  encoderState.collectedCommandBuffers = [];
+  encoderState.deferredUniformBuffers = [];
+  encoderState.stepLevelScope = false;
+  encoderState.adamBatchMode = false;
+}
 
 // Auto-flush threshold: finish current encoder and start a new one after N passes.
 // This bounds the size of individual command buffers and the write/read sets.
@@ -162,23 +192,22 @@ export { setCurrentOpLabel, getCurrentOpLabel } from "./webgpu-state";
 
 // Adam batch mode: when true, adamStep() skips its pre-dispatch flushSharedEncoder().
 // The caller (lazy.ts) is responsible for a single flush before the Adam batch.
-let adamBatchMode = false;
-export function setAdamBatchMode(active: boolean): void { adamBatchMode = active; }
-export function isAdamBatchMode(): boolean { return adamBatchMode; }
+export function setAdamBatchMode(active: boolean): void { encoderState.adamBatchMode = active; }
+export function isAdamBatchMode(): boolean { return encoderState.adamBatchMode; }
 
 export function beginSharedEncoder(): void {
-  if (!sharedEncoderEnabled) return;
-  if (sharedEncoderDepth === 0) {
+  if (!encoderState.enabled) return;
+  if (encoderState.depth === 0) {
     const ctx = requireContext();
     setSharedEncoderActive(true);
-    sharedEncoderInstance = ctx.device.createCommandEncoder();
-    sharedEncoderPassCount = 0;
-    collectedCommandBuffers = [];
+    encoderState.instance = ctx.device.createCommandEncoder();
+    encoderState.passCount = 0;
+    encoderState.collectedCommandBuffers = [];
     resetSharedEncoderWriteSet();
 
-    sharedEncoderDeferredUniformBuffers = [];
+    encoderState.deferredUniformBuffers = [];
   }
-  sharedEncoderDepth++;
+  encoderState.depth++;
 }
 
 /**
@@ -191,15 +220,15 @@ export function flushSharedEncoder(): void {
 
   // Finish the shared encoder into a command buffer
   const cbs: GPUCommandBuffer[] = [];
-  if (sharedEncoderInstance) {
-    resolveGpuTimestamps(sharedEncoderInstance);
-    cbs.push(sharedEncoderInstance.finish());
+  if (encoderState.instance) {
+    resolveGpuTimestamps(encoderState.instance);
+    cbs.push(encoderState.instance.finish());
   }
   // Add any collected CBs (from ops that bypassed the shared encoder)
-  cbs.push(...collectedCommandBuffers);
+  cbs.push(...encoderState.collectedCommandBuffers);
 
   if (DEBUG_SHARED_ENCODER && cbs.length > 0) {
-    console.log(`[shared-enc] FLUSH: ${sharedEncoderPassCount} passes on encoder, ${collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`);
+    console.log(`[shared-enc] FLUSH: ${encoderState.passCount} passes on encoder, ${encoderState.collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`);
   }
 
   if (cbs.length > 0) {
@@ -208,18 +237,18 @@ export function flushSharedEncoder(): void {
   }
 
   // Reset state and create fresh encoder
-  collectedCommandBuffers = [];
+  encoderState.collectedCommandBuffers = [];
   resetSharedEncoderWriteSet();
-  sharedEncoderInstance = ctx.device.createCommandEncoder();
-  sharedEncoderPassCount = 0;
+  encoderState.instance = ctx.device.createCommandEncoder();
+  encoderState.passCount = 0;
 
   // Return deferred uniform buffers to pool so subsequent passes can reuse them.
   // This is critical for step-level scope where the encoder stays open across flushes.
   // Reverse iteration: buffers were deferred in forward order (A,B,C...), so pushing
   // them in reverse (C,B,A) means the next LIFO pop() sequence returns A,B,C —
   // matching the original acquisition order for bind group cache stability.
-  for (let i = sharedEncoderDeferredUniformBuffers.length - 1; i >= 0; i--) {
-    const buf = sharedEncoderDeferredUniformBuffers[i];
+  for (let i = encoderState.deferredUniformBuffers.length - 1; i >= 0; i--) {
+    const buf = encoderState.deferredUniformBuffers[i];
     // Replay-pinned buffers must stay alive — referenced by recorded bind groups.
     // Don't return them to the pool (prevents reuse and data corruption).
     if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buf)) continue;
@@ -235,7 +264,7 @@ export function flushSharedEncoder(): void {
       paramsBufferPools.set(sc, [buf]);
     }
   }
-  sharedEncoderDeferredUniformBuffers = [];
+  encoderState.deferredUniformBuffers = [];
 
   // NOTE: Do NOT flush pendingRelease to pool here (§14.1). Mid-step buffer
   // reclamation causes corruption — buffers released during a step (e.g.
@@ -245,13 +274,13 @@ export function flushSharedEncoder(): void {
 }
 
 export function endSharedEncoder(): void {
-  if (!sharedEncoderEnabled) return;
-  sharedEncoderDepth--;
-  if (sharedEncoderDepth === 0 && sharedEncoderActive) {
+  if (!encoderState.enabled) return;
+  encoderState.depth--;
+  if (encoderState.depth === 0 && sharedEncoderActive) {
     // If step-level scope is active, don't submit — keep encoder open.
     // Bump depth back to 1 so inner begin/end pairs still work.
-    if (stepLevelScope) {
-      sharedEncoderDepth = 1;
+    if (encoderState.stepLevelScope) {
+      encoderState.depth = 1;
       return;
     }
 
@@ -260,15 +289,15 @@ export function endSharedEncoder(): void {
 
     // Finish the shared encoder and submit everything
     const cbs: GPUCommandBuffer[] = [];
-    if (sharedEncoderInstance) {
-      resolveGpuTimestamps(sharedEncoderInstance);
-      cbs.push(sharedEncoderInstance.finish());
-      sharedEncoderInstance = null;
+    if (encoderState.instance) {
+      resolveGpuTimestamps(encoderState.instance);
+      cbs.push(encoderState.instance.finish());
+      encoderState.instance = null;
     }
-    cbs.push(...collectedCommandBuffers);
+    cbs.push(...encoderState.collectedCommandBuffers);
 
     if (DEBUG_SHARED_ENCODER && cbs.length > 0) {
-      console.log(`[shared-enc] END: ${sharedEncoderPassCount} passes on encoder, ${collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`);
+      console.log(`[shared-enc] END: ${encoderState.passCount} passes on encoder, ${encoderState.collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`);
     }
 
     if (cbs.length > 0) {
@@ -276,15 +305,15 @@ export function endSharedEncoder(): void {
       incrementSubmitCount();
     }
 
-    collectedCommandBuffers = [];
+    encoderState.collectedCommandBuffers = [];
     resetSharedEncoderWriteSet();
 
-    sharedEncoderPassCount = 0;
+    encoderState.passCount = 0;
 
     // Return deferred uniform buffers to pool now that all CBs are submitted.
     // Reverse iteration for LIFO stability (see flushSharedEncoder comment).
-    for (let i = sharedEncoderDeferredUniformBuffers.length - 1; i >= 0; i--) {
-      const buf = sharedEncoderDeferredUniformBuffers[i];
+    for (let i = encoderState.deferredUniformBuffers.length - 1; i >= 0; i--) {
+      const buf = encoderState.deferredUniformBuffers[i];
       // Replay-pinned buffers must stay alive — referenced by recorded bind groups.
       if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buf)) continue;
       const sc = paramsBufferSizeClass(buf.size);
@@ -299,7 +328,7 @@ export function endSharedEncoder(): void {
         paramsBufferPools.set(sc, [buf]);
       }
     }
-    sharedEncoderDeferredUniformBuffers = [];
+    encoderState.deferredUniformBuffers = [];
 
     // Flush storage buffer pendingRelease → main pool. The encoder was just
     // submitted, so buffers released by earlier passes are safe to reuse.
@@ -314,8 +343,8 @@ export function endSharedEncoder(): void {
  * only flushing at hard sync points (item() readback) and endStep().
  */
 export async function beginStep(): Promise<void> {
-  if (stepLevelScope) return; // already in step scope
-  stepLevelScope = true;
+  if (encoderState.stepLevelScope) return; // already in step scope
+  encoderState.stepLevelScope = true;
   // Await any deferred fence from the previous markStep BEFORE opening the
   // shared encoder.  This flushes pendingRelease buffers into the main pool
   // so the upcoming training step can reuse them, eliminating the 2-step lag
@@ -343,8 +372,8 @@ export async function beginStep(): Promise<void> {
  * Submits all remaining encoded work.
  */
 export function endStep(): void {
-  if (!stepLevelScope) return;
-  stepLevelScope = false;
+  if (!encoderState.stepLevelScope) return;
+  encoderState.stepLevelScope = false;
   // Return any unconsumed pre-pinned buffers to the pool
   for (let i = 0; i < pinnedOutputBuffers.length; i++) {
     const buf = pinnedOutputBuffers[i];
@@ -365,7 +394,7 @@ export function isSharedEncoderActive(): boolean {
 
 
 export function setSharedEncoderEnabled(enabled: boolean): void {
-  sharedEncoderEnabled = enabled;
+  encoderState.enabled = enabled;
 }
 
 /**
@@ -373,12 +402,12 @@ export function setSharedEncoderEnabled(enabled: boolean): void {
  * Returns null if no shared encoder is active.
  */
 export function getSharedEncoderInstance(): GPUCommandEncoder | null {
-  return sharedEncoderInstance;
+  return encoderState.instance;
 }
 
 /** Increment the shared encoder pass count (for use from modules that import). */
 export function incrementSharedEncoderPassCount(): void {
-  sharedEncoderPassCount++;
+  encoderState.passCount++;
 }
 
 /**
@@ -387,8 +416,8 @@ export function incrementSharedEncoderPassCount(): void {
  */
 export function autoFlushSharedEncoder(): void {
   if (sharedEncoderActive && (
-    sharedEncoderPassCount >= SHARED_ENCODER_MAX_PASSES ||
-    sharedEncoderDeferredUniformBuffers.length >= PARAMS_FLUSH_THRESHOLD
+    encoderState.passCount >= SHARED_ENCODER_MAX_PASSES ||
+    encoderState.deferredUniformBuffers.length >= PARAMS_FLUSH_THRESHOLD
   )) {
     flushSharedEncoder();
   }
@@ -396,7 +425,7 @@ export function autoFlushSharedEncoder(): void {
 
 /** Defer a uniform buffer for destruction at end of shared encoder scope. */
 export function deferUniformBufferForSharedEncoder(buffer: GPUBuffer): void {
-  sharedEncoderDeferredUniformBuffers.push(buffer);
+  encoderState.deferredUniformBuffers.push(buffer);
 }
 
 /**
@@ -415,7 +444,7 @@ export function isInSharedEncoderWriteSet(buffer: GPUBuffer): boolean {
 export function submitOrCollect(commandBuffer: GPUCommandBuffer): void {
   if (sharedEncoderActive) {
     // Collect for later submission at flush/end of shared encoder scope
-    collectedCommandBuffers.push(commandBuffer);
+    encoderState.collectedCommandBuffers.push(commandBuffer);
   } else if (activeBatch) {
     activeBatch.commandBuffers.push(commandBuffer);
   } else {

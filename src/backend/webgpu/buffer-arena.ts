@@ -45,29 +45,29 @@ export function allocateOutputBuffer(
   // Arena fast path: if a buffer arena is active, use it.
   // This path is used by fused kernels (dispatchFusedKernel) which bypass
   // resolveOutputBuffer and call allocateOutputBuffer directly.
-  if (activeArena) {
-    const idx = arenaAllocIndex++;
-    const arenaBuffer = arenaAllocAt(activeArena.alloc, idx, sizeBytes);
+  if (arenaLocal.active) {
+    const idx = arenaLocal.allocIndex++;
+    const arenaBuffer = arenaAllocAt(arenaLocal.active.alloc, idx, sizeBytes);
     if (arenaBuffer) {
       // Check if this arena buffer aliases with an external plan input.
       // This happens when the same template is reused across layers: the
       // previous execution's output (an arena buffer) becomes the next
       // execution's external input. Without this check, the fused kernel
       // would overwrite the input data before it's fully consumed.
-      if (arenaExternalInputBuffers && arenaExternalInputBuffers.has(arenaBuffer)) {
+      if (arenaLocal.externalInputBuffers && arenaLocal.externalInputBuffers.has(arenaBuffer)) {
         // Replace the arena slot with a fresh buffer. The old buffer stays
         // alive (referenced by the external input tensor) but is no longer
         // in the arena. This permanently resolves the conflict for this slot.
         arenaBufferSet.delete(arenaBuffer);
-        activeArena.alloc[idx] = undefined as any;
-        const freshBuffer = arenaAllocAt(activeArena.alloc, idx, sizeBytes);
-        arenaConflictDetected = true;
+        arenaLocal.active.alloc[idx] = undefined as any;
+        const freshBuffer = arenaAllocAt(arenaLocal.active.alloc, idx, sizeBytes);
+        arenaLocal.conflictDetected = true;
         return freshBuffer!;
       }
       return arenaBuffer;
     }
-  } else if (activeArena) {
-    arenaAllocIndex++; // Keep counter in sync
+  } else if (arenaLocal.active) {
+    arenaLocal.allocIndex++; // Keep counter in sync
   }
 
   const ctx = requireContext();
@@ -170,43 +170,58 @@ export interface BufferArena {
 
 // arenaBufferSet is in webgpu-state.ts and re-exported above.
 
-/** Currently active arena (set during lowered plan execution). */
-export let activeArena: BufferArena | null = null;
-export let arenaResolveIndex = 0;
-let arenaResolveHits = 0;
-let arenaResolveAliased = 0;
-let arenaResolveNoArena = 0;
-export let arenaAllocIndex = 0;
-
 /**
- * Set of external input buffers for the current plan execution.
- * Used to prevent arena from reusing a buffer that is also an external input
- * (which would cause data corruption when the arena overwrites input data).
+ * Arena mutable state — groups all module-level let variables into a single
+ * typed object for debuggability, testability, and explicit reset.
  */
-let arenaExternalInputBuffers: Set<GPUBuffer> | null = null;
+interface ArenaLocalState {
+  /** Currently active arena (set during lowered plan execution). */
+  active: BufferArena | null;
+  /** Resolve-path output index within the current arena. */
+  resolveIndex: number;
+  /** Alloc-path output index within the current arena. */
+  allocIndex: number;
+  /** Stats: arena resolve hits. */
+  resolveHits: number;
+  /** Stats: arena resolve aliased (fell through to pool). */
+  resolveAliased: number;
+  /** Stats: arena resolve with no arena active. */
+  resolveNoArena: number;
+  /** External input buffers for conflict detection. */
+  externalInputBuffers: Set<GPUBuffer> | null;
+  /** Flag set when an arena buffer was replaced due to external input conflict. */
+  conflictDetected: boolean;
+}
 
-/**
- * Flag set when an arena buffer had to be replaced due to external input conflict.
- * When true, the dispatch replay cache must be invalidated because bind groups
- * reference the old (replaced) arena buffer.
- */
-let arenaConflictDetected = false;
+const arenaLocal: ArenaLocalState = {
+  active: null,
+  resolveIndex: 0,
+  allocIndex: 0,
+  resolveHits: 0,
+  resolveAliased: 0,
+  resolveNoArena: 0,
+  externalInputBuffers: null,
+  conflictDetected: false,
+};
+
+/** Get the currently active arena (for cross-module access). */
+export function getActiveArena(): BufferArena | null { return arenaLocal.active; }
 
 /** Register external input buffers for arena conflict detection. */
 export function setArenaExternalInputBuffers(buffers: GPUBuffer[]): void {
-  arenaExternalInputBuffers = new Set(buffers);
+  arenaLocal.externalInputBuffers = new Set(buffers);
 }
 
 /** Clear external input buffers tracking. */
 export function clearArenaExternalInputBuffers(): void {
-  arenaExternalInputBuffers = null;
+  arenaLocal.externalInputBuffers = null;
 }
 
 /** Check if any arena conflict was detected during the current plan execution. */
-export function getArenaConflictDetected(): boolean { return arenaConflictDetected; }
+export function getArenaConflictDetected(): boolean { return arenaLocal.conflictDetected; }
 
 /** Clear the arena conflict flag. */
-export function clearArenaConflictDetected(): void { arenaConflictDetected = false; }
+export function clearArenaConflictDetected(): void { arenaLocal.conflictDetected = false; }
 
 /**
  * Pre-check if any arena buffers conflict with external input buffers.
@@ -228,26 +243,26 @@ export function hasArenaExternalConflicts(arena: BufferArena, extBufs: Set<GPUBu
  * the arena instead of the pool, stabilizing buffer identities.
  */
 export function setActiveArena(arena: BufferArena): void {
-  activeArena = arena;
-  arenaResolveIndex = 0;
-  arenaAllocIndex = 0;
-  arenaConflictDetected = false;
+  arenaLocal.active = arena;
+  arenaLocal.resolveIndex = 0;
+  arenaLocal.allocIndex = 0;
+  arenaLocal.conflictDetected = false;
 }
 
 /**
  * Deactivate the current buffer arena.
  */
 export function clearActiveArena(): void {
-  activeArena = null;
-  arenaResolveIndex = 0;
-  arenaAllocIndex = 0;
+  arenaLocal.active = null;
+  arenaLocal.resolveIndex = 0;
+  arenaLocal.allocIndex = 0;
 }
 
 /** Get the current arena resolve index (for dispatch replay recording). */
-export function getArenaResolveIndex(): number { return arenaResolveIndex; }
+export function getArenaResolveIndex(): number { return arenaLocal.resolveIndex; }
 
 /** Set the arena resolve index to a specific value (for dispatch replay restore). */
-export function setArenaResolveIndexTo(idx: number): void { arenaResolveIndex = idx; }
+export function setArenaResolveIndexTo(idx: number): void { arenaLocal.resolveIndex = idx; }
 
 /** Check if a buffer is owned by an arena (should not be released to pool). */
 export function isArenaBuffer(buffer: GPUBuffer): boolean {
@@ -303,7 +318,7 @@ export function arenaAllocAt(arr: GPUBuffer[], idx: number, sizeBytes: number): 
     arenaBufferSet.delete(existing);
     if (bufferPool.isLive(existing)) {
       // Live buffer — don't destroy. The owning tensor still references it.
-      arenaConflictDetected = true;
+      arenaLocal.conflictDetected = true;
     } else {
       // Dead buffer with wrong size class — destroy if not replay-pinned
       if (replayPinnedBufferSet === null || !replayPinnedBufferSet.has(existing)) {
@@ -371,37 +386,37 @@ export function resolveOutputBuffer(
   // Arena fast path: if a buffer arena is active, use it for output allocation.
   // Arena buffers persist across steps, giving 100% stable buffer identities
   // for bind group cache hits.
-  if (!providedOutBuffer && activeArena) {
-    const idx = arenaResolveIndex++;
-    const arenaBuffer = arenaAllocAt(activeArena.resolve, idx, sizeBytes);
+  if (!providedOutBuffer && arenaLocal.active) {
+    const idx = arenaLocal.resolveIndex++;
+    const arenaBuffer = arenaAllocAt(arenaLocal.active.resolve, idx, sizeBytes);
     if (arenaBuffer) {
       // Check for external input conflict first (structural — replace arena slot).
-      if (arenaExternalInputBuffers && arenaExternalInputBuffers.has(arenaBuffer)) {
+      if (arenaLocal.externalInputBuffers && arenaLocal.externalInputBuffers.has(arenaBuffer)) {
         // Replace the arena slot with a fresh buffer. The old buffer stays
         // alive (referenced by the external input tensor).
         arenaBufferSet.delete(arenaBuffer);
-        activeArena.resolve[idx] = undefined as any;
-        const freshBuffer = arenaAllocAt(activeArena.resolve, idx, sizeBytes);
-        arenaConflictDetected = true;
+        arenaLocal.active.resolve[idx] = undefined as any;
+        const freshBuffer = arenaAllocAt(arenaLocal.active.resolve, idx, sizeBytes);
+        arenaLocal.conflictDetected = true;
         // Still need to check direct aliasing on the fresh buffer
         if (freshBuffer && !inputBuffers.some(b => b === freshBuffer)) {
-          arenaResolveHits++;
+          arenaLocal.resolveHits++;
           return freshBuffer;
         }
         // Fresh buffer aliased with direct input — fall through to normal path
-        arenaResolveAliased++;
+        arenaLocal.resolveAliased++;
       } else if (!inputBuffers.some(b => b === arenaBuffer)) {
         // No conflict, no aliasing — use arena buffer directly
-        arenaResolveHits++;
+        arenaLocal.resolveHits++;
         return arenaBuffer;
       } else {
         // Direct aliasing with current op's input — fall through to normal path.
         // Don't replace arena slot; this is a normal within-plan aliasing situation.
-        arenaResolveAliased++;
+        arenaLocal.resolveAliased++;
       }
     }
   } else if (!providedOutBuffer) {
-    arenaResolveNoArena++;
+    arenaLocal.resolveNoArena++;
   }
 
   const alignedSize = alignBufferSize(sizeBytes);
@@ -467,13 +482,13 @@ export function resolveOutputBuffer(
 // ============================================================================
 
 export function getArenaResolveStats(): { hits: number; aliased: number; noArena: number } {
-  return { hits: arenaResolveHits, aliased: arenaResolveAliased, noArena: arenaResolveNoArena };
+  return { hits: arenaLocal.resolveHits, aliased: arenaLocal.resolveAliased, noArena: arenaLocal.resolveNoArena };
 }
 
 export function resetArenaResolveStats(): void {
-  arenaResolveHits = 0;
-  arenaResolveAliased = 0;
-  arenaResolveNoArena = 0;
+  arenaLocal.resolveHits = 0;
+  arenaLocal.resolveAliased = 0;
+  arenaLocal.resolveNoArena = 0;
 }
 
 /**
@@ -484,7 +499,7 @@ export function resetArenaState(): void {
   outputSequenceHints.length = 0;
   pinnedOutputBuffers.length = 0;
   setOutputSeqIndex(0);
-  activeArena = null;
-  arenaResolveIndex = 0;
-  arenaAllocIndex = 0;
+  arenaLocal.active = null;
+  arenaLocal.resolveIndex = 0;
+  arenaLocal.allocIndex = 0;
 }
