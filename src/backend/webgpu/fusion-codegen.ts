@@ -14,6 +14,7 @@
 
 import type { DType } from "../types";
 import type { IRNode } from "../../engine/ir";
+import { dtypeToWgslStorage as dtypeToWgsl } from "./shape-utils";
 
 // Import from unified op registry - single source of truth
 import {
@@ -848,25 +849,6 @@ function formatWgslLiteral(value: number, dtype: DType): string {
   }
 }
 
-/**
- * Convert dtype to WGSL type.
- */
-function dtypeToWgsl(dtype: DType): string {
-  switch (dtype) {
-    case "f32":
-      return "f32";
-    case "f16":
-      return "f16";
-    case "i32":
-      return "i32";
-    case "u32":
-      return "u32";
-    case "bool":
-      return "u32"; // WGSL doesn't have bool arrays
-    default:
-      return "f32";
-  }
-}
 
 /**
  * Generate a cache key for a fusion recipe.

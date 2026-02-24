@@ -1,6 +1,6 @@
 # Refactoring Targets
 
-Refactoring opportunities identified from full codebase reviews. Targets 1–5, 7, 8, 11 are complete.
+Refactoring opportunities identified from full codebase reviews. Targets 1–5, 7–9, 11 are complete.
 
 ## Target 1: Decompose `webgpu/index.ts` — DONE
 
@@ -34,24 +34,9 @@ Consolidated 4 duplicate `switch (node.op)` dispatch tables into single canonica
 
 Added `NodeSideOutputs` interface and `_sideOutputs` field to `LazyIRNode`. Replaced all 17 `(node as any)._fieldName` monkey-patching accesses across `op-dispatch.ts`, `executor-lowered.ts`, and `optim/adam.ts` with typed property access.
 
-## Target 9: Deduplicate Utility Functions
+## Target 9: Deduplicate Utility Functions — DONE
 
-**Impact:** Prevents behavioral divergence
-**Effort:** Low
-**Priority:** MEDIUM
-
-Several utility functions have multiple definitions with subtly different behavior:
-
-| Function | Copies | Issue |
-|----------|--------|-------|
-| `dtypeToWgsl()` | 3 | `shape-utils.ts` maps `bool→"bool"`, `fusion-codegen.ts` maps `bool→"u32"`, `matmul/codegen.ts` returns `"f32"` for everything except f16 |
-| `dtypeBytes()` | 2 | `shape-utils.ts` (canonical) vs `fusion-dispatch.ts` (identical copy) |
-| `computeContiguousStrides()` | 2 | `backend/types.ts` (handles 0-d tensors) vs `op-dispatch.ts` (missing that guard) |
-| `createStorageHandleInternal()` | 2 | `op-dispatch.ts` (exported, never called) vs `executor-sequential.ts` (used once) |
-
-**Approach:** Delete the duplicates and import from the canonical source. For `dtypeToWgsl`, the `bool→"u32"` variant in fusion-codegen is intentionally different (WGSL doesn't have bool arrays) — make the canonical version accept an option or add a `dtypeToWgslStorage()` variant.
-
-**Files:** `src/backend/webgpu/fusion-codegen.ts`, `src/backend/webgpu/fusion-dispatch.ts`, `src/backend/webgpu/matmul/codegen.ts`, `src/engine/op-dispatch.ts`
+Deleted duplicate `dtypeBytes` from `fusion-dispatch.ts`, duplicate `dtypeToWgsl` from `matmul/codegen.ts`, and `dtypeToWgsl` (bool→u32 variant) from `fusion-codegen.ts`. Added `dtypeToWgslStorage()` to `shape-utils.ts` for the bool→u32 case. `computeContiguousStrides` and `createStorageHandleInternal` duplicates were already removed in Target 7.
 
 ## Target 10: Fix `as unknown as GPUDevice` Type Casts
 
