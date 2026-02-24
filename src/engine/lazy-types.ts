@@ -82,6 +82,20 @@ export interface StorageHandle {
   baseStorageId?: number;
 }
 
+/** Side outputs for multi-output ops (attention, layernorm, adam). */
+export interface NodeSideOutputs {
+  /** fusedAttentionForward → logsumexp StorageHandle */
+  attnLogsumexp?: StorageHandle;
+  /** fusedAttentionBackward → dK StorageHandle */
+  attnBwdDK?: StorageHandle;
+  /** fusedAttentionBackward → dV StorageHandle */
+  attnBwdDV?: StorageHandle;
+  /** fusedLayerNormBackwardGradWeightBias → gradBias BackendTensor */
+  lnBwdGradBias?: BackendTensor;
+  /** adamStep → updated m and v StorageHandles */
+  adamMV?: { m: StorageHandle; v: StorageHandle };
+}
+
 export interface LazyIRNode {
   id: number;
   op: LazyOpCode;
@@ -102,6 +116,8 @@ export interface LazyIRNode {
    * This enables memory savings for large models that don't fit in GPU memory.
    */
   isCheckpointBoundary?: boolean;
+  /** Side outputs for multi-output ops (attention, layernorm, adam). */
+  _sideOutputs?: NodeSideOutputs;
 }
 
 export type LazyRef =

@@ -373,10 +373,11 @@ export async function executeOp(
       );
       const mStorage3 = createStorageHandle(node.device, adamResult.m);
       const vStorage3 = createStorageHandle(node.device, adamResult.v);
-      const sideOutputs3 = { m: mStorage3, v: vStorage3 };
-      storageTracker.markReachable(mStorage3.id, sideOutputs3);
-      storageTracker.markReachable(vStorage3.id, sideOutputs3);
-      (node as any)._adamSideOutputs = sideOutputs3;
+      const adamMV3 = { m: mStorage3, v: vStorage3 };
+      storageTracker.markReachable(mStorage3.id, adamMV3);
+      storageTracker.markReachable(vStorage3.id, adamMV3);
+      if (!node._sideOutputs) node._sideOutputs = {};
+      node._sideOutputs.adamMV = adamMV3;
       return adamResult.param;
     }
 
@@ -395,17 +396,18 @@ export async function executeOp(
         backendInputs[0], backendInputs[1], backendInputs[2], faPayload3,
       );
       const lseSH3 = createStorageHandle(node.device, faResult3.logsumexp);
-      (node as any)._attnSideOutput = lseSH3;
+      if (!node._sideOutputs) node._sideOutputs = {};
+      node._sideOutputs.attnLogsumexp = lseSH3;
       return faResult3.output;
     }
 
     case "extractAttentionLogsumexp": {
       const parentFA3 = node.inputs[0].node;
-      const lseSH3 = (parentFA3 as any)._attnSideOutput as StorageHandle | undefined;
-      if (!lseSH3) throw new Error("extractAttentionLogsumexp: parent has no _attnSideOutput");
+      const lseSH3 = parentFA3._sideOutputs?.attnLogsumexp;
+      if (!lseSH3) throw new Error("extractAttentionLogsumexp: parent has no attnLogsumexp side output");
       const lseResult3 = lseSH3.backendTensor;
       storageTracker.unregister(lseSH3.id);
-      (parentFA3 as any)._attnSideOutput = undefined;
+      parentFA3._sideOutputs!.attnLogsumexp = undefined;
       return lseResult3;
     }
 
@@ -418,28 +420,29 @@ export async function executeOp(
       );
       const dkSH3 = createStorageHandle(node.device, faBwdResult3.dK);
       const dvSH3 = createStorageHandle(node.device, faBwdResult3.dV);
-      (node as any)._attnBwdDK = dkSH3;
-      (node as any)._attnBwdDV = dvSH3;
+      if (!node._sideOutputs) node._sideOutputs = {};
+      node._sideOutputs.attnBwdDK = dkSH3;
+      node._sideOutputs.attnBwdDV = dvSH3;
       return faBwdResult3.dQ;
     }
 
     case "extractAttentionDK": {
       const parentDK3 = node.inputs[0].node;
-      const dkSH3 = (parentDK3 as any)._attnBwdDK as StorageHandle | undefined;
-      if (!dkSH3) throw new Error("extractAttentionDK: parent node has no _attnBwdDK");
+      const dkSH3 = parentDK3._sideOutputs?.attnBwdDK;
+      if (!dkSH3) throw new Error("extractAttentionDK: parent node has no attnBwdDK side output");
       const dkResult3 = dkSH3.backendTensor;
       storageTracker.unregister(dkSH3.id);
-      (parentDK3 as any)._attnBwdDK = undefined;
+      parentDK3._sideOutputs!.attnBwdDK = undefined;
       return dkResult3;
     }
 
     case "extractAttentionDV": {
       const parentDV3 = node.inputs[0].node;
-      const dvSH3 = (parentDV3 as any)._attnBwdDV as StorageHandle | undefined;
-      if (!dvSH3) throw new Error("extractAttentionDV: parent node has no _attnBwdDV");
+      const dvSH3 = parentDV3._sideOutputs?.attnBwdDV;
+      if (!dvSH3) throw new Error("extractAttentionDV: parent node has no attnBwdDV side output");
       const dvResult3 = dvSH3.backendTensor;
       storageTracker.unregister(dvSH3.id);
-      (parentDV3 as any)._attnBwdDV = undefined;
+      parentDV3._sideOutputs!.attnBwdDV = undefined;
       return dvResult3;
     }
 
@@ -484,17 +487,18 @@ export async function executeOp(
         backendInputs[0], backendInputs[1], lnGWBPayload3,
       );
       // Store raw gradBias BackendTensor for extractLnBwdGradBias
-      (node as any)._lnBwdSideOutput = gwResult3.gradBias;
+      if (!node._sideOutputs) node._sideOutputs = {};
+      node._sideOutputs.lnBwdGradBias = gwResult3.gradBias;
       return gwResult3.gradWeight;
     }
 
     case "extractLnBwdGradBias": {
       const parentNode3 = node.inputs[0].node;
-      const sideOutputBT3 = (parentNode3 as any)._lnBwdSideOutput as BackendTensor | undefined;
+      const sideOutputBT3 = parentNode3._sideOutputs?.lnBwdGradBias;
       if (!sideOutputBT3) {
-        throw new Error("extractLnBwdGradBias: parent node has no _lnBwdSideOutput");
+        throw new Error("extractLnBwdGradBias: parent node has no lnBwdGradBias side output");
       }
-      (parentNode3 as any)._lnBwdSideOutput = undefined;
+      parentNode3._sideOutputs!.lnBwdGradBias = undefined;
       return sideOutputBT3;
     }
 

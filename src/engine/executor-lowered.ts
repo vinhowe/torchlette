@@ -325,7 +325,8 @@ export async function executeLoweredPlan(
                 const sideOutputs = { m: mStorage, v: vStorage };
                 storageTracker.markReachable(mStorage.id, sideOutputs);
                 storageTracker.markReachable(vStorage.id, sideOutputs);
-                (adamNode as any)._adamSideOutputs = sideOutputs;
+                if (!adamNode._sideOutputs) adamNode._sideOutputs = {};
+                adamNode._sideOutputs.adamMV = sideOutputs;
                 // Use param input (index 1) as base storage for the view result
                 adamNode.result = createStorageHandle(adamNode.device, finalResult, s1.id);
               }
@@ -378,12 +379,13 @@ export async function executeLoweredPlan(
             break;
           }
           case "side-output": {
-            // Restore _attnSideOutput on fusedAttentionForward nodes so a later
+            // Restore attnLogsumexp on fusedAttentionForward nodes so a later
             // plan (backward Phase B) can skip re-executing fusedAttentionForward
             // and extractAttentionLogsumexp can read the side output directly.
             const soNode = planNodes[entry.nodeIndex];
-            if (!(soNode as any)._attnSideOutput) {
-              (soNode as any)._attnSideOutput = createStorageHandle(soNode.device, {
+            if (!soNode._sideOutputs?.attnLogsumexp) {
+              if (!soNode._sideOutputs) soNode._sideOutputs = {};
+              soNode._sideOutputs.attnLogsumexp = createStorageHandle(soNode.device, {
                 buffer: entry.buffer,
                 shape: entry.shape,
                 dtype: entry.dtype,
@@ -934,7 +936,8 @@ export async function executeLoweredPlan(
               const sideOutputs = { m: mStorage, v: vStorage };
               storageTracker.markReachable(mStorage.id, sideOutputs);
               storageTracker.markReachable(vStorage.id, sideOutputs);
-              (adamNode as any)._adamSideOutputs = sideOutputs;
+              if (!adamNode._sideOutputs) adamNode._sideOutputs = {};
+              adamNode._sideOutputs.adamMV = sideOutputs;
               // Adam param is always input[1] — use s1.id directly (no findIndex)
               adamNode.result = createStorageHandle(adamNode.device, finalResult, s1.id);
             }
@@ -1050,10 +1053,10 @@ export async function executeLoweredPlan(
                 }});
               }
               // Record side output for fusedAttentionForward so replay
-              // restores _attnSideOutput (needed by extractAttentionLogsumexp
+              // restores attnLogsumexp (needed by extractAttentionLogsumexp
               // in a later plan that skips re-executing this node).
-              if ((node as any)._attnSideOutput) {
-                const soSH = (node as any)._attnSideOutput as StorageHandle;
+              if (node._sideOutputs?.attnLogsumexp) {
+                const soSH = node._sideOutputs.attnLogsumexp;
                 const sobt = soSH.backendTensor as any;
                 replayEntries.push({ kind: "side-output", nodeIndex: nodeIdx,
                   buffer: sobt.buffer,
