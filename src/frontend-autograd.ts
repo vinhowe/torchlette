@@ -1,17 +1,10 @@
 import type { Tensor as RuntimeTensor } from "./runtime/tensor";
 import { TidyDispatchMode } from "./runtime/engine";
 import { storageTracker } from "./engine/lazy";
+import { shapesEqual } from "./core/shape";
 import type { Torchlette } from "./frontend";
 import type { Tensor } from "./frontend-tensor";
 import type { AutogradNode, GetSavedFn } from "./frontend-types";
-
-function shapesEqual(a: number[], b: number[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i += 1) {
-    if (a[i] !== b[i]) return false;
-  }
-  return true;
-}
 
 export async function backwardImpl(
   torch: Torchlette,

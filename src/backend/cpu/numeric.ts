@@ -1,4 +1,5 @@
 import type { GeluOptions } from "../types";
+import { sizeOf, broadcastShapes } from "../../core/shape";
 
 export type Shape = number[];
 
@@ -608,9 +609,7 @@ function computeStrides(shape: Shape): number[] {
   return strides;
 }
 
-function sizeOf(shape: Shape): number {
-  return shape.reduce((acc, dim) => acc * dim, 1);
-}
+// sizeOf imported from core/shape
 
 /**
  * Infer strides for a new shape given old shape/strides, without copying data.
@@ -727,19 +726,7 @@ function readAtLinear(
   return tensor.data[offset];
 }
 
-function broadcastShapes(a: Shape, b: Shape): Shape {
-  const outRank = Math.max(a.length, b.length);
-  const out = new Array<number>(outRank);
-  for (let i = 0; i < outRank; i += 1) {
-    const aDim = a[a.length - 1 - i] ?? 1;
-    const bDim = b[b.length - 1 - i] ?? 1;
-    if (aDim !== bDim && aDim !== 1 && bDim !== 1) {
-      throw new Error("shapes are not broadcastable");
-    }
-    out[outRank - 1 - i] = Math.max(aDim, bDim);
-  }
-  return out;
-}
+// broadcastShapes imported from core/shape
 
 function broadcastTo(a: Tensor, targetShape: Shape): Tensor {
   if (

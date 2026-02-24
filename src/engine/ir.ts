@@ -1,5 +1,6 @@
 import type { DType } from "../backend/types";
 import type { TraceEvent } from "./trace";
+import { broadcastShapes } from "../core/shape";
 
 export type IRNode = {
   id: number;
@@ -41,19 +42,7 @@ function isElementwise(op: string): boolean {
   return ELEMENTWISE_OPS.has(op);
 }
 
-function broadcastShapes(a: number[], b: number[]): number[] {
-  const outRank = Math.max(a.length, b.length);
-  const out = new Array<number>(outRank);
-  for (let i = 0; i < outRank; i += 1) {
-    const aDim = a[a.length - 1 - i] ?? 1;
-    const bDim = b[b.length - 1 - i] ?? 1;
-    if (aDim !== bDim && aDim !== 1 && bDim !== 1) {
-      throw new Error("compile ir shape mismatch: not broadcastable");
-    }
-    out[outRank - 1 - i] = Math.max(aDim, bDim);
-  }
-  return out;
-}
+// broadcastShapes imported from core/shape
 
 function inferShape(op: string, inputs: IRNode[]): number[] {
   if (inputs.length === 0) {
