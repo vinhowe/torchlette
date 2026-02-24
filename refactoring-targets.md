@@ -96,9 +96,9 @@ Added `gpuBuffer(tensor)` helper in `gpu-types.ts` to replace `(x.backendTensor 
 
 Removed 125 vestigial `as any` casts across 8 kernel/dispatch files. All casts were unnecessary after Target 10 unified WebGPU type definitions into `gpu-types.ts`. Patterns removed: `trackSharedEncoderWrite(buf as any)`, `cachedCreateBindGroup(...buffers as any) as any`, `dispatchComputePass(pipeline as any, bindGroup as any, ...)`, `releaseParamsBuffer(buf as any)`, `(encoder as any).beginComputePass()`. 3 casts in `ops/fused.ts` preserved (genuine `unknown`→`GPUBuffer` bridge). Total `as any` count: 201→75.
 
-## Target 15: Decompose Large Files
+## Target 15: Decompose Large Files — DONE
 
-Split `runtime/engine.ts` (2,489 lines) and `engine/engine.ts` (1,808 lines) into focused modules.
+Decomposed `runtime/engine.ts` (2,489→1,990 lines) and `engine/engine.ts` (1,808→1,507 lines) into focused modules. New files: `engine/engine-types.ts` (231 lines — types/interfaces), `engine/engine-errors.ts` (39 lines — error classes), `engine/engine-helpers.ts` (88 lines — standalone helpers), `runtime/engine-types.ts` (86 lines — types/dispatch modes/options), `runtime/shape-helpers.ts` (97 lines — pure shape computation), `runtime/engine-fused.ts` (261 lines — fused kernel op helpers), `runtime/engine-facade.ts` (216 lines — defaultEngine singleton + ~40 facade functions). Re-exports preserve all existing import paths via barrel files. 2 test files updated to import facade functions from new path.
 
 ## Target 16: Consolidate Remaining Module-Local Globals
 

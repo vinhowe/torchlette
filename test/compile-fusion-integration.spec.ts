@@ -9,7 +9,8 @@
  */
 
 import { describe, expect, it, beforeEach } from "vitest";
-import { RuntimeEngine, tensorFromArray } from "../src/runtime/engine";
+import { RuntimeEngine } from "../src/runtime/engine";
+import { tensorFromArray } from "../src/runtime/engine-facade";
 import { createBaseId, Tensor, resetBaseIdCounter } from "../src/runtime/tensor";
 import {
   buildPlan,

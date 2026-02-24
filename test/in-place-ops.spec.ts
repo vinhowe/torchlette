@@ -11,15 +11,15 @@
  */
 
 import { describe, expect, it, beforeEach } from "vitest";
+import { RuntimeEngine } from "../src/runtime/engine";
 import {
-  RuntimeEngine,
   tensorFromArray,
   copy_,
   add_,
   zero_,
   fill_,
   mul_,
-} from "../src/runtime/engine";
+} from "../src/runtime/engine-facade";
 import { resetNodeIdCounter, resetStorageIdCounter } from "../src/engine/lazy";
 import { resetBaseIdCounter } from "../src/runtime/tensor";
 

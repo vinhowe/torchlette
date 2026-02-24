@@ -27,7 +27,8 @@ export {
   withBackend,
 } from "../backend/registry";
 export type { Backend, BackendOps } from "../backend/types";
-export type { RuntimeEngineOptions } from "../runtime/engine";
+export type { RuntimeEngineOptions } from "../runtime/engine-types";
+export { RuntimeEngine } from "../runtime/engine";
 export {
   add as runtimeAdd,
   cpu as runtimeCpu,
@@ -37,7 +38,6 @@ export {
   matmul as runtimeMatmul,
   mean as runtimeMean,
   mul as runtimeMul,
-  RuntimeEngine,
   relu as runtimeRelu,
   reshape as runtimeReshape,
   scatterAdd as runtimeScatterAdd,
@@ -47,7 +47,7 @@ export {
   tensorFromArray as runtimeTensorFromArray,
   transpose as runtimeTranspose,
   view as runtimeView,
-} from "../runtime/engine";
+} from "../runtime/engine-facade";
 export type { BaseId } from "../runtime/tensor";
 export { Tensor as RuntimeTensor } from "../runtime/tensor";
 export type {
