@@ -518,7 +518,7 @@ export function contiguous(a: BackendTensor): BackendTensor {
 /**
  * Direct contiguous implementation for tensors within buffer binding limits.
  */
-export function contiguousDirect(tensor: WebGPUTensor): WebGPUTensor {
+function contiguousDirect(tensor: WebGPUTensor): WebGPUTensor {
   const ctx = requireContext();
   const shape = tensor.shape;
   const rank = shape.length;
@@ -609,7 +609,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * For transposed 2D tensors [K, N] with strides [1, K], processes by output columns.
  * Each output column reads from a contiguous section of input.
  */
-export function contiguousChunked(
+function contiguousChunked(
   tensor: WebGPUTensor,
   maxBindingSize: number,
   minAlignment: number,

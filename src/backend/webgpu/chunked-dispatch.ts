@@ -1,16 +1,16 @@
 /**
- * Generic flat-element chunking abstraction for ops that exceed
- * maxStorageBufferBindingSize. Extracts the shared scaffolding
- * (chunk layout, 2D dispatch, per-chunk bind group creation) into
- * two reusable functions.
+ * Generic chunking abstractions for ops that exceed maxStorageBufferBindingSize.
  *
- * Used by: binary, unary, where, cast, stridedScatterCopy/Add.
- * NOT used by: gather/scatterAdd (dimension-specific) or
- * contiguousChunked (2D tile chunking).
+ * Two patterns:
+ * 1. **Flat-element chunking** (`computeFlatChunkLayout` + `dispatchFlatChunked`):
+ *    Partitions flat element ranges.  Used by binary, unary, where, cast, stridedScatterCopy/Add.
+ * 2. **Dimension-specific chunking** (`computeDimChunkLayout`):
+ *    Partitions along a specific tensor dimension with aligned byte offsets.
+ *    Used by gather/scatterAdd.
  */
 
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
-import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
+import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, gcd } from "./shape-utils";
 import { requireContext } from "./gpu-context";
 import { dispatchComputePass, getPipeline } from "./dispatch";
 import {
@@ -183,4 +183,56 @@ function defaultCreateParams(
   _chunkStart: number,
 ): GPUBuffer {
   return createUniformBuffer(device, chunkSize);
+}
+
+// ============================================================================
+// Dimension-specific chunking (for gather / scatterAdd)
+// ============================================================================
+
+export interface DimChunkLayout {
+  /** Maximum slices (entries along the chunked dimension) per chunk. */
+  maxSlicesPerChunk: number;
+  /** Total number of chunks needed to cover the dimension. */
+  numChunks: number;
+  /** Bytes per slice (elements-after-dim * bytesPerElement). */
+  bytesPerSlice: number;
+}
+
+/**
+ * Compute an aligned chunk layout along a specific tensor dimension.
+ *
+ * Each "slice" is one index along the chunked dimension.  Chunk boundaries
+ * are aligned to `minAlignment` bytes so that WebGPU offset bindings are valid.
+ *
+ * @param dimSize            Size of the dimension being chunked.
+ * @param elementsPerSlice   Product of sizes after the chunked dimension.
+ * @param maxBindingSize     `device.limits.maxStorageBufferBindingSize`.
+ * @param minAlignment       `device.limits.minStorageBufferOffsetAlignment`.
+ * @param bytesPerElement    Bytes per element (default 4 for f32).
+ */
+export function computeDimChunkLayout(
+  dimSize: number,
+  elementsPerSlice: number,
+  maxBindingSize: number,
+  minAlignment: number,
+  bytesPerElement: number = 4,
+): DimChunkLayout {
+  const bytesPerSlice = elementsPerSlice * bytesPerElement;
+  let maxSlicesPerChunk = Math.floor(maxBindingSize / bytesPerSlice);
+
+  // If bytesPerSlice isn't a multiple of minAlignment, adjust so that
+  // (slicesPerChunk * bytesPerSlice) is always aligned.
+  if (bytesPerSlice % minAlignment !== 0) {
+    const slicesForAlignment = minAlignment / gcd(bytesPerSlice, minAlignment);
+    maxSlicesPerChunk = Math.floor(maxSlicesPerChunk / slicesForAlignment) * slicesForAlignment;
+    if (maxSlicesPerChunk === 0) {
+      maxSlicesPerChunk = slicesForAlignment; // At least one aligned group
+    }
+  }
+
+  return {
+    maxSlicesPerChunk,
+    numChunks: Math.ceil(dimSize / maxSlicesPerChunk),
+    bytesPerSlice,
+  };
 }
