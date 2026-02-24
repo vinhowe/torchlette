@@ -40,9 +40,9 @@ import {
   createUniformBuffer,
   releaseUniformBuffer,
   cachedCreateBindGroup,
-  profiledCreateBindGroup,
   params1,
 } from "./bind-group-cache";
+import { computeFlatChunkLayout, dispatchFlatChunked } from "./chunked-dispatch";
 import { getTimestampWrites, getProfileModule } from "./profiler";
 import {
   computeBatchSize,
@@ -582,45 +582,26 @@ export function dispatchBinaryChunked(
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
-  // Determine output shape and size
   const outShape = broadcastShapes(a.shape, b.shape);
   const outSize = sizeOf(outShape);
-  const outSizeBytes = outSize * bytesPerElement;
 
-  // Check if a or b is scalar
   const aIsScalar = a.size === 1;
   const bIsScalar = b.size === 1;
 
-  // Calculate chunk size
-  const elementsPerAlignment = minAlignment / bytesPerElement;
-  const maxElementsPerChunk = Math.floor(maxBindingSize / bytesPerElement);
-  const elementsPerChunk =
-    Math.floor(maxElementsPerChunk / elementsPerAlignment) * elementsPerAlignment;
+  const layout = computeFlatChunkLayout(outSize, bytesPerElement, maxBindingSize, minAlignment);
 
-  const numChunks = Math.ceil(outSize / elementsPerChunk);
-
-  // Create output buffer
   const outBuffer = resolveOutputBuffer(
     ctx.device,
-    outSizeBytes,
+    outSize * bytesPerElement,
     [a.buffer, b.buffer],
     options?.outBuffer,
   );
 
-  // Determine 2D dispatch dimensions
-  const maxWorkgroups = Math.ceil(elementsPerChunk / WORKGROUP_SIZE);
-  const use2D = maxWorkgroups > MAX_WORKGROUPS_PER_DIM;
-  const gridSizeX = use2D
-    ? Math.min(maxWorkgroups, MAX_WORKGROUPS_PER_DIM)
-    : maxWorkgroups;
-
   // Build shader for chunked binary op
-  const wgslType = dtype === "f16" ? "f16" : dtype === "i32" ? "i32" : dtype === "u32" ? "u32" : "f32";
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
+  const wgslType = dtypeToWgsl(dtype);
+  const idxCompute = layout.use2D
+    ? `let idx = gid.x + gid.y * ${layout.gridSizeX}u * ${WORKGROUP_SIZE}u;`
     : `let idx = gid.x;`;
-
-  // Shader handles scalar broadcast
   const aAccess = aIsScalar ? "a[0]" : "a[idx]";
   const bAccess = bIsScalar ? "b[0]" : "b[idx]";
 
@@ -642,52 +623,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-  const key = `binaryChunked:${op}:${dtype}:${aIsScalar}:${bIsScalar}:${use2D ? `2d:${gridSizeX}` : "1d"}`;
-  const pipeline = getPipeline(ctx, key, code);
+  const key = `binaryChunked:${op}:${dtype}:${aIsScalar}:${bIsScalar}:${layout.use2D ? `2d:${layout.gridSizeX}` : "1d"}`;
 
-  // Process each chunk
-  for (let chunk = 0; chunk < numChunks; chunk++) {
-    const chunkStart = chunk * elementsPerChunk;
-    const chunkEnd = Math.min(chunkStart + elementsPerChunk, outSize);
-    const chunkSize = chunkEnd - chunkStart;
-    const chunkByteOffset = chunkStart * bytesPerElement;
-    const chunkByteSize = chunkSize * bytesPerElement;
-
-    // Each chunk needs its own uniform buffer to avoid data corruption
-    // when batching (queue.writeBuffer overwrites in-place, but all command
-    // buffers reference the same GPU buffer).
-    const paramsBuffer = createUniformBuffer(ctx.device, chunkSize);
-
-    // Bind chunk regions (or full buffer for scalars)
-    const aBinding = aIsScalar
-      ? { buffer: a.buffer }
-      : { buffer: a.buffer, offset: chunkByteOffset, size: chunkByteSize };
-    const bBinding = bIsScalar
-      ? { buffer: b.buffer }
-      : { buffer: b.buffer, offset: chunkByteOffset, size: chunkByteSize };
-    const outBinding = { buffer: outBuffer, offset: chunkByteOffset, size: chunkByteSize };
-
-    const bindGroup = profiledCreateBindGroup(ctx.device,{
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: aBinding },
-        { binding: 1, resource: bBinding },
-        { binding: 2, resource: outBinding },
-        { binding: 3, resource: { buffer: paramsBuffer } },
-      ],
-    });
-
-    const chunkWorkgroups = Math.ceil(chunkSize / WORKGROUP_SIZE);
-    const dispatchX = use2D
-      ? Math.min(chunkWorkgroups, MAX_WORKGROUPS_PER_DIM)
-      : chunkWorkgroups;
-    const dispatchY = use2D ? Math.ceil(chunkWorkgroups / dispatchX) : 1;
-
-    dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
-
-    // Return uniform buffer to pool (deferred if batching)
-    releaseUniformBuffer(paramsBuffer);
-  }
+  dispatchFlatChunked({
+    key, shader: code, layout,
+    inputs: [
+      { buffer: a.buffer, mode: aIsScalar ? "scalar" : "chunked" },
+      { buffer: b.buffer, mode: bIsScalar ? "scalar" : "chunked" },
+    ],
+    outBuffer, outBytesPerElement: bytesPerElement, totalElements: outSize,
+  });
 
   const ownsBuffer = options?.outBuffer === undefined;
   return createTensor(outShape, outBuffer, undefined, 0, dtype, ownsBuffer);
@@ -774,38 +719,21 @@ export function dispatchUnaryChunked(
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   const outSize = a.size;
-  const outSizeBytes = outSize * bytesPerElement;
 
-  // Calculate chunk size
-  const elementsPerAlignment = minAlignment / bytesPerElement;
-  const maxElementsPerChunk = Math.floor(maxBindingSize / bytesPerElement);
-  const elementsPerChunk =
-    Math.floor(maxElementsPerChunk / elementsPerAlignment) * elementsPerAlignment;
+  const layout = computeFlatChunkLayout(outSize, bytesPerElement, maxBindingSize, minAlignment);
 
-  const numChunks = Math.ceil(outSize / elementsPerChunk);
-
-  // Create output buffer
   const outBuffer = resolveOutputBuffer(
     ctx.device,
-    outSizeBytes,
+    outSize * bytesPerElement,
     [a.buffer],
     options?.outBuffer,
   );
 
-  // Determine 2D dispatch dimensions
-  const maxWorkgroups = Math.ceil(elementsPerChunk / WORKGROUP_SIZE);
-  const use2D = maxWorkgroups > MAX_WORKGROUPS_PER_DIM;
-  const gridSizeX = use2D
-    ? Math.min(maxWorkgroups, MAX_WORKGROUPS_PER_DIM)
-    : maxWorkgroups;
-
   // Build shader for chunked unary op
-  const wgslType = dtype === "f16" ? "f16" : dtype === "i32" ? "i32" : dtype === "u32" ? "u32" : "f32";
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
+  const wgslType = dtypeToWgsl(dtype);
+  const idxCompute = layout.use2D
+    ? `let idx = gid.x + gid.y * ${layout.gridSizeX}u * ${WORKGROUP_SIZE}u;`
     : `let idx = gid.x;`;
-
-  // Replace 'x' in expr with array access
   const exprWithAccess = expr.replace(/\bx\b/g, "a[idx]");
 
   const code = `
@@ -825,41 +753,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-  const key = `unaryChunked:${opKey}:${dtype}:${use2D ? `2d:${gridSizeX}` : "1d"}`;
-  const pipeline = getPipeline(ctx, key, code);
+  const key = `unaryChunked:${opKey}:${dtype}:${layout.use2D ? `2d:${layout.gridSizeX}` : "1d"}`;
 
-  // Process each chunk
-  for (let chunk = 0; chunk < numChunks; chunk++) {
-    const chunkStart = chunk * elementsPerChunk;
-    const chunkEnd = Math.min(chunkStart + elementsPerChunk, outSize);
-    const chunkSize = chunkEnd - chunkStart;
-    const chunkByteOffset = chunkStart * bytesPerElement;
-    const chunkByteSize = chunkSize * bytesPerElement;
-
-    // Each chunk needs its own uniform buffer to avoid data corruption
-    // when batching (queue.writeBuffer overwrites in-place).
-    const paramsBuffer = createUniformBuffer(ctx.device, chunkSize);
-
-    const bindGroup = profiledCreateBindGroup(ctx.device,{
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: a.buffer, offset: chunkByteOffset, size: chunkByteSize } },
-        { binding: 1, resource: { buffer: outBuffer, offset: chunkByteOffset, size: chunkByteSize } },
-        { binding: 2, resource: { buffer: paramsBuffer } },
-      ],
-    });
-
-    const chunkWorkgroups = Math.ceil(chunkSize / WORKGROUP_SIZE);
-    const dispatchX = use2D
-      ? Math.min(chunkWorkgroups, MAX_WORKGROUPS_PER_DIM)
-      : chunkWorkgroups;
-    const dispatchY = use2D ? Math.ceil(chunkWorkgroups / dispatchX) : 1;
-
-    dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
-
-    // Return uniform buffer to pool (deferred if batching)
-    releaseUniformBuffer(paramsBuffer);
-  }
+  dispatchFlatChunked({
+    key, shader: code, layout,
+    inputs: [{ buffer: a.buffer, mode: "chunked" }],
+    outBuffer, outBytesPerElement: bytesPerElement, totalElements: outSize,
+  });
 
   const ownsBuffer = options?.outBuffer === undefined;
   return createTensor(a.shape, outBuffer, undefined, 0, dtype, ownsBuffer);
