@@ -235,15 +235,15 @@ export function dispatchCrossEntropyForward(
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [logitsBuffer, targetsBuffer, outBuffer, configBuf] as any) as any;
+    [logitsBuffer, targetsBuffer, outBuffer, configBuf]);
 
-  trackSharedEncoderWrite(logitsBuffer as any);
-  trackSharedEncoderWrite(targetsBuffer as any);
-  trackSharedEncoderWrite(outBuffer as any);
+  trackSharedEncoderWrite(logitsBuffer);
+  trackSharedEncoderWrite(targetsBuffer);
+  trackSharedEncoderWrite(outBuffer);
 
   dispatchComputePass(
-    pipeline as any,
-    bindGroup as any,
+    pipeline,
+    bindGroup,
     batchSize, // one workgroup per row
   );
 
@@ -276,16 +276,16 @@ export function dispatchCrossEntropyBackward(
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [logitsBuffer, targetsBuffer, gradOutputBuffer, outBuffer, configBuf] as any) as any;
+    [logitsBuffer, targetsBuffer, gradOutputBuffer, outBuffer, configBuf]);
 
-  trackSharedEncoderWrite(logitsBuffer as any);
-  trackSharedEncoderWrite(targetsBuffer as any);
-  trackSharedEncoderWrite(gradOutputBuffer as any);
-  trackSharedEncoderWrite(outBuffer as any);
+  trackSharedEncoderWrite(logitsBuffer);
+  trackSharedEncoderWrite(targetsBuffer);
+  trackSharedEncoderWrite(gradOutputBuffer);
+  trackSharedEncoderWrite(outBuffer);
 
   dispatchComputePass(
-    pipeline as any,
-    bindGroup as any,
+    pipeline,
+    bindGroup,
     batchSize, // one workgroup per row
   );
 

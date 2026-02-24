@@ -207,17 +207,17 @@ function benchmarkDispatch(
       ],
     });
     const encoder = device.createCommandEncoder();
-    const pass1 = (encoder as any).beginComputePass();
+    const pass1 = encoder.beginComputePass();
     pass1.setPipeline(pipeline);
     pass1.setBindGroup(0, matmulBG);
     pass1.dispatchWorkgroups(workgroupsX, workgroupsY, kSplitFactor);
     pass1.end();
-    const pass2 = (encoder as any).beginComputePass();
+    const pass2 = encoder.beginComputePass();
     pass2.setPipeline(reductionPipeline);
     pass2.setBindGroup(0, reduceBG);
     pass2.dispatchWorkgroups(Math.ceil(m * n / 256));
     pass2.end();
-    queue.submit([(encoder as any).finish()]);
+    queue.submit([encoder.finish()]);
   } else {
     // Standard path
     const bindGroup = device.createBindGroup({
@@ -230,12 +230,12 @@ function benchmarkDispatch(
       ],
     });
     const encoder = device.createCommandEncoder();
-    const pass = (encoder as any).beginComputePass();
+    const pass = encoder.beginComputePass();
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
     pass.end();
-    queue.submit([(encoder as any).finish()]);
+    queue.submit([encoder.finish()]);
   }
 }
 
@@ -596,7 +596,7 @@ function dispatchTiledMatmulInternal(options: DispatchMatmulOptions & { config: 
 
   // Build flat buffer array for cached bind group
   const bgBuffers = [a, b, out, paramsBuffer, ...epilogueInputs];
-  const bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers) as any;
+  const bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers);
 
   // Compute dispatch dimensions
   const workgroupsX = Math.ceil(n / config.tileN);
@@ -610,8 +610,8 @@ function dispatchTiledMatmulInternal(options: DispatchMatmulOptions & { config: 
   // Record dispatch if recording is active
   if (matmulRecordingBuffer) {
     matmulRecordingBuffer.push({
-      pipeline: pipeline as any,
-      bindGroup: bindGroup as any,
+      pipeline,
+      bindGroup,
       workgroupsX,
       workgroupsY,
       workgroupsZ,
@@ -639,7 +639,7 @@ function dispatchTiledMatmulInternal(options: DispatchMatmulOptions & { config: 
   }
 
   // Release params buffer back to shared pool
-  releaseParamsBuffer(paramsBuffer as any);
+  releaseParamsBuffer(paramsBuffer);
 }
 
 // --- K-split infrastructure ---
@@ -800,7 +800,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
     const kSplitParamsBuffer = sharedCreateParamsBuffer(device, kSplitParamsData);
 
     const kSplitBgBuffers = [a, b, tempBuffer, kSplitParamsBuffer];
-    const kSplitBindGroup = cachedCreateBindGroup(device, kSplitPipeline, kSplitBgBuffers) as any;
+    const kSplitBindGroup = cachedCreateBindGroup(device, kSplitPipeline, kSplitBgBuffers);
 
     // Dispatch K-split matmul
     const sharedEnc = getSharedEncoderInstance();
@@ -809,8 +809,8 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
     // Record if recording
     if (matmulRecordingBuffer) {
       matmulRecordingBuffer.push({
-        pipeline: kSplitPipeline as any,
-        bindGroup: kSplitBindGroup as any,
+        pipeline: kSplitPipeline,
+        bindGroup: kSplitBindGroup,
         workgroupsX,
         workgroupsY,
         workgroupsZ: kSplitFactor,
@@ -837,7 +837,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
       submitOrCollect(encoder.finish());
     }
 
-    releaseParamsBuffer(kSplitParamsBuffer as any);
+    releaseParamsBuffer(kSplitParamsBuffer);
 
     // 2. Reduction: sum P partials → final output with alpha
     const reductionPipeline = getOrCreateReductionPipeline(device, kSplitFactor, outputDtype as DType);
@@ -851,7 +851,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
     const reduceParamsBuffer = sharedCreateParamsBuffer(device, reduceU32);
 
     const reduceBgBuffers = [tempBuffer, out, reduceParamsBuffer];
-    const reduceBindGroup = cachedCreateBindGroup(device, reductionPipeline, reduceBgBuffers) as any;
+    const reduceBindGroup = cachedCreateBindGroup(device, reductionPipeline, reduceBgBuffers);
 
     const reduceWorkgroups = Math.ceil(totalElements / 256);
 
@@ -860,8 +860,8 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
     // Record if recording
     if (matmulRecordingBuffer) {
       matmulRecordingBuffer.push({
-        pipeline: reductionPipeline as any,
-        bindGroup: reduceBindGroup as any,
+        pipeline: reductionPipeline,
+        bindGroup: reduceBindGroup,
         workgroupsX: reduceWorkgroups,
         workgroupsY: 1,
         workgroupsZ: 1,
@@ -889,7 +889,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
       submitOrCollect(encoder.finish());
     }
 
-    releaseParamsBuffer(reduceParamsBuffer as any);
+    releaseParamsBuffer(reduceParamsBuffer);
     return;
   }
 
@@ -916,7 +916,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
 
   // Build flat buffer array for cached bind group
   const bgBuffers = [a, b, out, paramsBuffer, ...epilogueInputs];
-  const bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers) as any;
+  const bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers);
 
   const workgroupsZ = batchSize;
 
@@ -927,8 +927,8 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
   // Record dispatch if recording is active
   if (matmulRecordingBuffer) {
     matmulRecordingBuffer.push({
-      pipeline: pipeline as any,
-      bindGroup: bindGroup as any,
+      pipeline,
+      bindGroup,
       workgroupsX,
       workgroupsY,
       workgroupsZ,
@@ -956,7 +956,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
   }
 
   // Release params buffer back to shared pool
-  releaseParamsBuffer(paramsBuffer as any);
+  releaseParamsBuffer(paramsBuffer);
 }
 
 /**

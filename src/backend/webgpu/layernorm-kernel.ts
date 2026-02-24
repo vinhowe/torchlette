@@ -399,16 +399,16 @@ export function dispatchLayerNormForward(
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [xBuffer, weightBuffer, biasBuffer, outBuffer, configBuf] as any) as any;
+    [xBuffer, weightBuffer, biasBuffer, outBuffer, configBuf]);
 
-  trackSharedEncoderWrite(xBuffer as any);
-  trackSharedEncoderWrite(weightBuffer as any);
-  trackSharedEncoderWrite(biasBuffer as any);
-  trackSharedEncoderWrite(outBuffer as any);
+  trackSharedEncoderWrite(xBuffer);
+  trackSharedEncoderWrite(weightBuffer);
+  trackSharedEncoderWrite(biasBuffer);
+  trackSharedEncoderWrite(outBuffer);
 
   dispatchComputePass(
-    pipeline as any,
-    bindGroup as any,
+    pipeline,
+    bindGroup,
     numRows, // one workgroup per row
   );
 
@@ -442,16 +442,16 @@ export function dispatchLayerNormBackwardGradX(
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [gradOutputBuffer, xBuffer, weightBuffer, outBuffer, configBuf] as any) as any;
+    [gradOutputBuffer, xBuffer, weightBuffer, outBuffer, configBuf]);
 
-  trackSharedEncoderWrite(gradOutputBuffer as any);
-  trackSharedEncoderWrite(xBuffer as any);
-  trackSharedEncoderWrite(weightBuffer as any);
-  trackSharedEncoderWrite(outBuffer as any);
+  trackSharedEncoderWrite(gradOutputBuffer);
+  trackSharedEncoderWrite(xBuffer);
+  trackSharedEncoderWrite(weightBuffer);
+  trackSharedEncoderWrite(outBuffer);
 
   dispatchComputePass(
-    pipeline as any,
-    bindGroup as any,
+    pipeline,
+    bindGroup,
     numRows,
   );
 
@@ -489,15 +489,15 @@ export function dispatchLayerNormBackwardGradWeightBias(
   );
 
   const statsBindGroup = cachedCreateBindGroup(device, statsPipeline,
-    [xBuffer, meanBuffer, invStdBuffer, configBuf] as any) as any;
+    [xBuffer, meanBuffer, invStdBuffer, configBuf]);
 
-  trackSharedEncoderWrite(xBuffer as any);
-  trackSharedEncoderWrite(meanBuffer as any);
-  trackSharedEncoderWrite(invStdBuffer as any);
+  trackSharedEncoderWrite(xBuffer);
+  trackSharedEncoderWrite(meanBuffer);
+  trackSharedEncoderWrite(invStdBuffer);
 
   dispatchComputePass(
-    statsPipeline as any,
-    statsBindGroup as any,
+    statsPipeline,
+    statsBindGroup,
     numRows, // one workgroup per row
   );
 
@@ -515,15 +515,15 @@ export function dispatchLayerNormBackwardGradWeightBias(
   const numWorkgroups = Math.ceil(featureDim / WORKGROUP_SIZE);
 
   const gradBindGroup = cachedCreateBindGroup(device, gradPipeline,
-    [gradOutputBuffer, xBuffer, meanBuffer, invStdBuffer, gradWeightBuffer, gradBiasBuffer, configBuf] as any) as any;
+    [gradOutputBuffer, xBuffer, meanBuffer, invStdBuffer, gradWeightBuffer, gradBiasBuffer, configBuf]);
 
-  trackSharedEncoderWrite(gradOutputBuffer as any);
-  trackSharedEncoderWrite(gradWeightBuffer as any);
-  trackSharedEncoderWrite(gradBiasBuffer as any);
+  trackSharedEncoderWrite(gradOutputBuffer);
+  trackSharedEncoderWrite(gradWeightBuffer);
+  trackSharedEncoderWrite(gradBiasBuffer);
 
   dispatchComputePass(
-    gradPipeline as any,
-    gradBindGroup as any,
+    gradPipeline,
+    gradBindGroup,
     numWorkgroups,
   );
 

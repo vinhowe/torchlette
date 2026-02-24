@@ -104,7 +104,7 @@ export async function adamStep(
       // Adam compute pass in the same command buffer submission.
       const enc = getSharedEncoderInstance();
       if (enc) {
-        (enc as any).copyBufferToBuffer(src, 0, dst, 0, bufSize);
+        enc.copyBufferToBuffer(src, 0, dst, 0, bufSize);
       } else {
         const ctx2 = requireContext();
         const tmpEnc = ctx2.device.createCommandEncoder();
@@ -494,7 +494,7 @@ export async function read(a: BackendTensor): Promise<number[]> {
   readBuffer.unmap();
 
   // Destroy staging buffer to prevent memory leaks
-  bufferPool.deferredDestroy(readBuffer, (readBuffer as any).size ?? alignedBytes);
+  bufferPool.deferredDestroy(readBuffer, readBuffer.size ?? alignedBytes);
 
   // Destroy contiguous copy if we created one
   if (tensor !== originalTensor && tensor.destroy) {
