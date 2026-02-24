@@ -74,20 +74,60 @@ export function params7(a: number, b: number, c: number, d: number, e: number, f
 // Sequence-Indexed Params Buffer Cache
 // ============================================================================
 
-// Sequence-indexed params buffer cache: reuse the same GPUBuffer at each dispatch
-// position across steps. This enables bind group cache hits since the params buffer
-// pointer stays stable for a given dispatch position.
-let paramsSeqIndex = 0;
-const paramsSequenceBuffers: Array<{ buffer: GPUBuffer; sizeClass: number; data: Uint32Array } | null> = [];
+/**
+ * Bind group cache mutable state — groups dispatch index, sequence entries,
+ * hit/miss counters, and params sequence state into a single typed object.
+ */
+interface BindGroupCacheState {
+  /** Current dispatch sequence position. */
+  dispatchIndex: number;
+  /** Cached bind groups indexed by dispatch position. */
+  sequenceEntries: Array<{
+    bindGroup: GPUBindGroup;
+    pipeline: GPUComputePipeline;
+    buffers: GPUBuffer[];
+  } | null>;
+  /** Cache hit count. */
+  hits: number;
+  /** Cache miss count. */
+  misses: number;
+  /** Detailed miss log for diagnostics. */
+  missLog: Array<{ idx: number; reason: string; label: string | null; details: string }>;
+  /** Current params sequence position. */
+  paramsSeqIndex: number;
+  /** Cached params buffers indexed by dispatch position. */
+  paramsSequenceBuffers: Array<{ buffer: GPUBuffer; sizeClass: number; data: Uint32Array } | null>;
+}
+
+const cacheState: BindGroupCacheState = {
+  dispatchIndex: 0,
+  sequenceEntries: [],
+  hits: 0,
+  misses: 0,
+  missLog: [],
+  paramsSeqIndex: 0,
+  paramsSequenceBuffers: [],
+};
+
+/** Reset bind group cache state. For test isolation. */
+export function resetBindGroupCacheLocalState(): void {
+  cacheState.dispatchIndex = 0;
+  cacheState.sequenceEntries.length = 0;
+  cacheState.hits = 0;
+  cacheState.misses = 0;
+  cacheState.missLog = [];
+  cacheState.paramsSeqIndex = 0;
+  cacheState.paramsSequenceBuffers.length = 0;
+}
 
 export function createParamsBuffer(device: GPUDevice, data: Uint32Array): GPUBuffer {
   const sizeClass = paramsBufferSizeClass(data.byteLength);
-  const idx = paramsSeqIndex++;
+  const idx = cacheState.paramsSeqIndex++;
 
   // Try to reuse the buffer from the same dispatch position (previous step).
   // This keeps the GPUBuffer pointer stable so bind group caching can hit.
   if (!activeBatch) {
-    const cached = paramsSequenceBuffers[idx];
+    const cached = cacheState.paramsSequenceBuffers[idx];
     if (cached !== undefined && cached !== null && cached.sizeClass === sizeClass) {
       // Fast path: skip writeBuffer if data is identical (params derived from
       // tensor shapes which are constant across steps).
@@ -111,7 +151,7 @@ export function createParamsBuffer(device: GPUDevice, data: Uint32Array): GPUBuf
     if (pool && pool.length > 0) {
       const buffer = pool.pop()!;
       profileApiCall("writeBuffer", () => device.queue.writeBuffer(buffer, 0, data));
-      paramsSequenceBuffers[idx] = { buffer, sizeClass, data: data.slice() };
+      cacheState.paramsSequenceBuffers[idx] = { buffer, sizeClass, data: data.slice() };
       paramsSequenceSet.add(buffer);
       return buffer;
     }
@@ -123,7 +163,7 @@ export function createParamsBuffer(device: GPUDevice, data: Uint32Array): GPUBuf
   }));
   profileApiCall("writeBuffer", () => device.queue.writeBuffer(buffer, 0, data));
   if (!activeBatch) {
-    paramsSequenceBuffers[idx] = { buffer, sizeClass, data: data.slice() };
+    cacheState.paramsSequenceBuffers[idx] = { buffer, sizeClass, data: data.slice() };
     paramsSequenceSet.add(buffer);
   }
   return buffer;
@@ -198,15 +238,7 @@ export function profiledCreateBindGroup(device: GPUDevice, descriptor: any): GPU
 // corresponds to dispatch #i in step N+1. Rather than building string keys from
 // unstable buffer IDs, index the cache by dispatch sequence position and validate
 // by GPUBuffer/pipeline pointer equality.
-let dispatchIndex = 0;
-const sequenceEntries: Array<{
-  bindGroup: GPUBindGroup;
-  pipeline: GPUComputePipeline;
-  buffers: GPUBuffer[];
-} | null> = [];
-let seqCacheHits = 0;
-let seqCacheMisses = 0;
-let seqCacheMissLog: Array<{ idx: number; reason: string; label: string | null; details: string }> = [];
+// Bind group cache state is consolidated into cacheState above.
 
 /**
  * Create or retrieve a cached bind group for simple (no offset/size) buffer bindings.
@@ -220,8 +252,8 @@ export function cachedCreateBindGroup(
   pipeline: GPUComputePipeline,
   buffers: GPUBuffer[],
 ): GPUBindGroup {
-  const idx = dispatchIndex++;
-  const entry = sequenceEntries[idx];
+  const idx = cacheState.dispatchIndex++;
+  const entry = cacheState.sequenceEntries[idx];
 
   if (entry !== undefined && entry !== null
       && entry.pipeline === pipeline
@@ -231,14 +263,14 @@ export function cachedCreateBindGroup(
       if (entry.buffers[i] !== buffers[i]) { match = false; break; }
     }
     if (match) {
-      seqCacheHits++;
+      cacheState.hits++;
       if (dispatchRecordingBuffer) setLastBindGroupBuffers(entry.buffers);
       return entry.bindGroup;
     }
   }
 
-  seqCacheMisses++;
-  if (seqCacheMissLog.length < 200) {
+  cacheState.misses++;
+  if (cacheState.missLog.length < 200) {
     let reason = "new";
     let details = "";
     if (entry !== undefined && entry !== null) {
@@ -262,7 +294,7 @@ export function cachedCreateBindGroup(
         details = parts.join(" ");
       }
     }
-    seqCacheMissLog.push({ idx, reason, label: getCurrentOpLabel(), details });
+    cacheState.missLog.push({ idx, reason, label: getCurrentOpLabel(), details });
   }
   const entries: Array<{ binding: number; resource: { buffer: GPUBuffer } }> = [];
   for (let i = 0; i < buffers.length; i++) {
@@ -276,7 +308,7 @@ export function cachedCreateBindGroup(
   );
 
   const bufCopy = buffers.slice();
-  sequenceEntries[idx] = { bindGroup, pipeline, buffers: bufCopy };
+  cacheState.sequenceEntries[idx] = { bindGroup, pipeline, buffers: bufCopy };
   if (dispatchRecordingBuffer) setLastBindGroupBuffers(bufCopy);
   return bindGroup;
 }
@@ -287,21 +319,21 @@ export function cachedCreateBindGroup(
 
 /** Reset the dispatch sequence counter to 0. Call at the start of each step. */
 export function resetDispatchSequence(): void {
-  dispatchIndex = 0;
-  paramsSeqIndex = 0;
+  cacheState.dispatchIndex = 0;
+  cacheState.paramsSeqIndex = 0;
   setOutputSeqIndex(0);
 }
 
 /** Set dispatch sequence counters to specific positions (for replay cache). */
 export function setDispatchSequenceCounters(dispatch: number, params: number, output: number): void {
-  dispatchIndex = dispatch;
-  paramsSeqIndex = params;
+  cacheState.dispatchIndex = dispatch;
+  cacheState.paramsSeqIndex = params;
   setOutputSeqIndex(output);
 }
 
 /** Get current dispatch sequence counters (for recording). */
 export function getDispatchSequenceCounters(): { dispatch: number; params: number; output: number } {
-  return { dispatch: dispatchIndex, params: paramsSeqIndex, output: getOutputSeqIndex() };
+  return { dispatch: cacheState.dispatchIndex, params: cacheState.paramsSeqIndex, output: getOutputSeqIndex() };
 }
 
 // ============================================================================
@@ -309,13 +341,13 @@ export function getDispatchSequenceCounters(): { dispatch: number; params: numbe
 // ============================================================================
 
 export function clearBindGroupCache(): void {
-  sequenceEntries.length = 0;
-  dispatchIndex = 0;
-  seqCacheHits = 0;
-  seqCacheMisses = 0;
-  paramsSequenceBuffers.length = 0;
+  cacheState.sequenceEntries.length = 0;
+  cacheState.dispatchIndex = 0;
+  cacheState.hits = 0;
+  cacheState.misses = 0;
+  cacheState.paramsSequenceBuffers.length = 0;
   paramsSequenceSet.clear();
-  paramsSeqIndex = 0;
+  cacheState.paramsSeqIndex = 0;
   // Clear output buffer state (outputSequenceHints, pinnedOutputBuffers, outputSeqIndex)
   outputSequenceHints.length = 0;
   pinnedOutputBuffers.length = 0;
@@ -325,19 +357,19 @@ export function clearBindGroupCache(): void {
 }
 
 export function getBindGroupCacheStats(): { hits: number; misses: number; size: number; hitRate: number } {
-  const total = seqCacheHits + seqCacheMisses;
-  return { hits: seqCacheHits, misses: seqCacheMisses, size: sequenceEntries.length, hitRate: total > 0 ? seqCacheHits / total : 0 };
+  const total = cacheState.hits + cacheState.misses;
+  return { hits: cacheState.hits, misses: cacheState.misses, size: cacheState.sequenceEntries.length, hitRate: total > 0 ? cacheState.hits / total : 0 };
 }
 
 export function resetBindGroupCacheStats(): void {
-  seqCacheHits = 0;
-  seqCacheMisses = 0;
-  seqCacheMissLog = [];
+  cacheState.hits = 0;
+  cacheState.misses = 0;
+  cacheState.missLog = [];
   resetArenaResolveStats();
 }
 
 export function getBindGroupCacheMissLog(): Array<{ idx: number; reason: string; label: string | null; details: string }> {
-  return seqCacheMissLog;
+  return cacheState.missLog;
 }
 
 /**
@@ -346,6 +378,6 @@ export function getBindGroupCacheMissLog(): Array<{ idx: number; reason: string;
  * Used by dispatch replay to collect buffers that need pinning.
  */
 export function getSequenceEntryBuffers(idx: number): GPUBuffer[] | null {
-  const entry = sequenceEntries[idx];
+  const entry = cacheState.sequenceEntries[idx];
   return entry ? entry.buffers : null;
 }

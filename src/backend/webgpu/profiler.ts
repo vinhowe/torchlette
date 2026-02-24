@@ -9,7 +9,7 @@ const PROFILING_ENABLED =
   typeof process !== "undefined" && !!process.env?.TORCHLETTE_PROFILE;
 
 // ---------------------------------------------------------------------------
-// CPU-side API call profiling
+// Stat entry types
 // ---------------------------------------------------------------------------
 
 interface ApiStats {
@@ -17,44 +17,12 @@ interface ApiStats {
   totalMs: number;
   maxMs: number;
 }
-const apiStats = new Map<string, ApiStats>();
-
-// ---------------------------------------------------------------------------
-// Per-op CPU profiling (set from lazy.ts via setCurrentOpLabel)
-// ---------------------------------------------------------------------------
 
 interface OpStats {
   count: number;
   totalMs: number;
   maxMs: number;
 }
-const opStats = new Map<string, OpStats>();
-
-// ---------------------------------------------------------------------------
-// Phase tracking (forward / backward / optimizer / cleanup)
-// ---------------------------------------------------------------------------
-
-let currentPhase = "unknown";
-const phaseStats = new Map<string, { totalMs: number; opCount: number }>();
-
-// ---------------------------------------------------------------------------
-// Module tracking (embedding / attention / mlp / layernorm / etc.)
-// ---------------------------------------------------------------------------
-
-let currentModule = "unknown";
-
-// Per-module GPU stats
-const gpuModuleStats = new Map<string, { totalNs: bigint; opCount: number }>();
-
-// Per-module per-op GPU stats
-const gpuModuleOpStats = new Map<
-  string,
-  Map<string, { count: number; totalNs: bigint; maxNs: bigint }>
->();
-
-// ---------------------------------------------------------------------------
-// GPU timestamp profiling
-// ---------------------------------------------------------------------------
 
 interface GpuPassRecord {
   label: string;
@@ -63,37 +31,6 @@ interface GpuPassRecord {
   startSlot: number;
   endSlot: number;
 }
-
-let gpuQuerySet: GPUQuerySet | null = null;
-let gpuResolveBuffer: GPUBuffer | null = null;
-let gpuReadbackBuffer: GPUBuffer | null = null;
-let gpuPassRecords: GpuPassRecord[] = [];
-let gpuNextSlot = 0;
-let gpuStagingBuffer: GPUBuffer | null = null; // fresh staging for each readGpuTimestamps cycle
-let gpuStagingSlots = 0;
-const GPU_MAX_PASSES = 2048; // 4096 timestamp slots (Dawn limit is 4096 queries)
-let gpuMaxSlots = GPU_MAX_PASSES * 2;
-let gpuTimestampsSupported = false;
-let gpuTimestampsEnabled = true; // Can be disabled per-step to avoid V100/Dawn deadlock
-let gpuDevice: GPUDevice | null = null;
-
-
-// Accumulated GPU times per label
-const gpuLabelStats = new Map<
-  string,
-  { count: number; totalNs: bigint; maxNs: bigint }
->();
-const gpuPhaseStats = new Map<string, { totalNs: bigint; opCount: number }>();
-
-// Per-phase, per-op GPU stats
-const gpuPhaseOpStats = new Map<
-  string,
-  Map<string, { count: number; totalNs: bigint; maxNs: bigint }>
->();
-
-// ---------------------------------------------------------------------------
-// Plan analysis records
-// ---------------------------------------------------------------------------
 
 export interface PlanAnalysis {
   planIndex: number;
@@ -107,28 +44,119 @@ export interface PlanAnalysis {
   unfusedByShape: Record<string, { count: number; ops: Record<string, number> }>;
 }
 
-const planAnalyses: PlanAnalysis[] = [];
-
-// ---------------------------------------------------------------------------
-// Fusion fallback tracking
-// ---------------------------------------------------------------------------
-
 interface FusionFallbackEntry {
   count: number;
   totalNodes: number;
   details: unknown[];
 }
-const fusionFallbackStats = new Map<string, FusionFallbackEntry>();
+
+// ---------------------------------------------------------------------------
+// CPU-side profiling state
+// ---------------------------------------------------------------------------
+
+interface CpuProfileState {
+  apiStats: Map<string, ApiStats>;
+  opStats: Map<string, OpStats>;
+  subOpStats: Map<string, OpStats>;
+  currentPhase: string;
+  phaseStats: Map<string, { totalMs: number; opCount: number }>;
+  currentModule: string;
+  planAnalyses: PlanAnalysis[];
+  fusionFallbackStats: Map<string, FusionFallbackEntry>;
+}
+
+const cpuProfile: CpuProfileState = {
+  apiStats: new Map(),
+  opStats: new Map(),
+  subOpStats: new Map(),
+  currentPhase: "unknown",
+  phaseStats: new Map(),
+  currentModule: "unknown",
+  planAnalyses: [],
+  fusionFallbackStats: new Map(),
+};
+
+/** Reset CPU-side profiling state. */
+export function resetCpuProfileState(): void {
+  cpuProfile.apiStats.clear();
+  cpuProfile.opStats.clear();
+  cpuProfile.subOpStats.clear();
+  cpuProfile.currentPhase = "unknown";
+  cpuProfile.phaseStats.clear();
+  cpuProfile.currentModule = "unknown";
+  cpuProfile.planAnalyses.length = 0;
+  cpuProfile.fusionFallbackStats.clear();
+}
+
+// ---------------------------------------------------------------------------
+// GPU timestamp profiling state
+// ---------------------------------------------------------------------------
+
+const GPU_MAX_PASSES = 2048; // 4096 timestamp slots (Dawn limit is 4096 queries)
+
+interface GpuTimestampState {
+  querySet: GPUQuerySet | null;
+  resolveBuffer: GPUBuffer | null;
+  readbackBuffer: GPUBuffer | null;
+  passRecords: GpuPassRecord[];
+  nextSlot: number;
+  stagingBuffer: GPUBuffer | null;
+  stagingSlots: number;
+  maxSlots: number;
+  supported: boolean;
+  enabled: boolean;
+  device: GPUDevice | null;
+  labelStats: Map<string, { count: number; totalNs: bigint; maxNs: bigint }>;
+  phaseStats: Map<string, { totalNs: bigint; opCount: number }>;
+  phaseOpStats: Map<string, Map<string, { count: number; totalNs: bigint; maxNs: bigint }>>;
+  moduleStats: Map<string, { totalNs: bigint; opCount: number }>;
+  moduleOpStats: Map<string, Map<string, { count: number; totalNs: bigint; maxNs: bigint }>>;
+}
+
+const gpuTs: GpuTimestampState = {
+  querySet: null,
+  resolveBuffer: null,
+  readbackBuffer: null,
+  passRecords: [],
+  nextSlot: 0,
+  stagingBuffer: null,
+  stagingSlots: 0,
+  maxSlots: GPU_MAX_PASSES * 2,
+  supported: false,
+  enabled: true, // Can be disabled per-step to avoid V100/Dawn deadlock
+  device: null,
+  labelStats: new Map(),
+  phaseStats: new Map(),
+  phaseOpStats: new Map(),
+  moduleStats: new Map(),
+  moduleOpStats: new Map(),
+};
+
+/** Reset GPU timestamp profiling state (not the device/querySet). */
+export function resetGpuTimestampState(): void {
+  gpuTs.passRecords = [];
+  gpuTs.nextSlot = 0;
+  if (gpuTs.stagingBuffer) {
+    gpuTs.stagingBuffer.destroy();
+    gpuTs.stagingBuffer = null;
+  }
+  gpuTs.stagingSlots = 0;
+  gpuTs.labelStats.clear();
+  gpuTs.phaseStats.clear();
+  gpuTs.phaseOpStats.clear();
+  gpuTs.moduleStats.clear();
+  gpuTs.moduleOpStats.clear();
+}
 
 export function recordFusionFallback(reason: string, groupSize: number, detail?: unknown): void {
   if (!PROFILING_ENABLED) return;
-  const entry = fusionFallbackStats.get(reason);
+  const entry = cpuProfile.fusionFallbackStats.get(reason);
   if (entry) {
     entry.count++;
     entry.totalNodes += groupSize;
     if (detail && entry.details.length < 3) entry.details.push(detail);
   } else {
-    fusionFallbackStats.set(reason, {
+    cpuProfile.fusionFallbackStats.set(reason, {
       count: 1,
       totalNodes: groupSize,
       details: detail ? [detail] : [],
@@ -152,7 +180,7 @@ export function isProfilingEnabled(): boolean {
  * fence state and cause mapAsync deadlocks.
  */
 export function setTimestampsEnabled(enabled: boolean): void {
-  gpuTimestampsEnabled = enabled;
+  gpuTs.enabled = enabled;
 }
 
 // ---------------------------------------------------------------------------
@@ -164,13 +192,13 @@ export function profileApiCall<T>(name: string, fn: () => T): T {
   const t0 = performance.now();
   const result = fn();
   const elapsed = performance.now() - t0;
-  const entry = apiStats.get(name);
+  const entry = cpuProfile.apiStats.get(name);
   if (entry) {
     entry.count++;
     entry.totalMs += elapsed;
     if (elapsed > entry.maxMs) entry.maxMs = elapsed;
   } else {
-    apiStats.set(name, { count: 1, totalMs: elapsed, maxMs: elapsed });
+    cpuProfile.apiStats.set(name, { count: 1, totalMs: elapsed, maxMs: elapsed });
   }
   return result;
 }
@@ -189,30 +217,28 @@ export function profileOpEnd(opName: string, t0: number): void {
   const elapsed = performance.now() - t0;
 
   // Op stats
-  const entry = opStats.get(opName);
+  const entry = cpuProfile.opStats.get(opName);
   if (entry) {
     entry.count++;
     entry.totalMs += elapsed;
     if (elapsed > entry.maxMs) entry.maxMs = elapsed;
   } else {
-    opStats.set(opName, { count: 1, totalMs: elapsed, maxMs: elapsed });
+    cpuProfile.opStats.set(opName, { count: 1, totalMs: elapsed, maxMs: elapsed });
   }
 
   // Phase stats
-  const phase = phaseStats.get(currentPhase);
+  const phase = cpuProfile.phaseStats.get(cpuProfile.currentPhase);
   if (phase) {
     phase.totalMs += elapsed;
     phase.opCount++;
   } else {
-    phaseStats.set(currentPhase, { totalMs: elapsed, opCount: 1 });
+    cpuProfile.phaseStats.set(cpuProfile.currentPhase, { totalMs: elapsed, opCount: 1 });
   }
 }
 
 // ---------------------------------------------------------------------------
 // Sub-op profiling (fine-grained breakdown within a single op dispatch)
 // ---------------------------------------------------------------------------
-
-const subOpStats = new Map<string, OpStats>();
 
 export function profileSubOpBegin(): number {
   if (!PROFILING_ENABLED) return 0;
@@ -222,13 +248,13 @@ export function profileSubOpBegin(): number {
 export function profileSubOpEnd(label: string, t0: number): void {
   if (!PROFILING_ENABLED) return;
   const elapsed = performance.now() - t0;
-  const entry = subOpStats.get(label);
+  const entry = cpuProfile.subOpStats.get(label);
   if (entry) {
     entry.count++;
     entry.totalMs += elapsed;
     if (elapsed > entry.maxMs) entry.maxMs = elapsed;
   } else {
-    subOpStats.set(label, { count: 1, totalMs: elapsed, maxMs: elapsed });
+    cpuProfile.subOpStats.set(label, { count: 1, totalMs: elapsed, maxMs: elapsed });
   }
 }
 
@@ -237,15 +263,15 @@ export function profileSubOpEnd(label: string, t0: number): void {
 // ---------------------------------------------------------------------------
 
 export function setProfilePhase(phase: string): void {
-  currentPhase = phase;
+  cpuProfile.currentPhase = phase;
 }
 
 export function setProfileModule(module: string): void {
-  currentModule = module;
+  cpuProfile.currentModule = module;
 }
 
 export function getProfileModule(): string {
-  return currentModule;
+  return cpuProfile.currentModule;
 }
 
 // ---------------------------------------------------------------------------
@@ -254,8 +280,8 @@ export function getProfileModule(): string {
 
 export function recordPlanAnalysis(analysis: PlanAnalysis): void {
   if (!PROFILING_ENABLED) return;
-  analysis.planIndex = planAnalyses.length;
-  planAnalyses.push(analysis);
+  analysis.planIndex = cpuProfile.planAnalyses.length;
+  cpuProfile.planAnalyses.push(analysis);
 }
 
 // ---------------------------------------------------------------------------
@@ -264,36 +290,36 @@ export function recordPlanAnalysis(analysis: PlanAnalysis): void {
 
 export function initGpuTimestamps(device: GPUDevice): void {
   if (!PROFILING_ENABLED) return;
-  gpuDevice = device;
-  gpuTimestampsSupported = true;
+  gpuTs.device = device;
+  gpuTs.supported = true;
 
   // Check device limits for max query count
   const maxQueryCount = (device.limits as any)?.maxQueryCount ?? 4096;
   const count = Math.min(GPU_MAX_PASSES * 2, maxQueryCount);
-  gpuMaxSlots = count;
+  gpuTs.maxSlots = count;
 
   // Use numeric constants for buffer usage to avoid dependency on globals
   // that may not be available in all environments
   const QUERY_RESOLVE = 0x0200;
   const COPY_SRC = 0x0004;
 
-  gpuQuerySet = device.createQuerySet({
+  gpuTs.querySet = device.createQuerySet({
     type: "timestamp" as GPUQueryType,
     count,
   });
 
   // Resolve buffer: 8 bytes per timestamp slot
-  gpuResolveBuffer = device.createBuffer({
+  gpuTs.resolveBuffer = device.createBuffer({
     size: count * 8,
     usage: QUERY_RESOLVE | COPY_SRC,
   });
 
-  gpuReadbackBuffer = null;
+  gpuTs.readbackBuffer = null;
 
   console.log(`[profiler] GPU timestamps initialized: ${count} slots`);
 
-  gpuPassRecords = [];
-  gpuNextSlot = 0;
+  gpuTs.passRecords = [];
+  gpuTs.nextSlot = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -308,17 +334,17 @@ export function initGpuTimestamps(device: GPUDevice): void {
 export function getTimestampWrites(
   label: string,
 ): GPUComputePassTimestampWrites | undefined {
-  if (!PROFILING_ENABLED || !gpuTimestampsSupported || !gpuQuerySet || !gpuTimestampsEnabled) return undefined;
-  if (gpuNextSlot + 2 > gpuMaxSlots) return undefined; // out of slots
+  if (!PROFILING_ENABLED || !gpuTs.supported || !gpuTs.querySet || !gpuTs.enabled) return undefined;
+  if (gpuTs.nextSlot + 2 > gpuTs.maxSlots) return undefined; // out of slots
 
-  const startSlot = gpuNextSlot;
-  const endSlot = gpuNextSlot + 1;
-  gpuNextSlot += 2;
+  const startSlot = gpuTs.nextSlot;
+  const endSlot = gpuTs.nextSlot + 1;
+  gpuTs.nextSlot += 2;
 
-  gpuPassRecords.push({ label, phase: currentPhase, module: currentModule, startSlot, endSlot });
+  gpuTs.passRecords.push({ label, phase: cpuProfile.currentPhase, module: cpuProfile.currentModule, startSlot, endSlot });
 
   return {
-    querySet: gpuQuerySet,
+    querySet: gpuTs.querySet,
     beginningOfPassWriteIndex: startSlot,
     endOfPassWriteIndex: endSlot,
   };
@@ -331,17 +357,17 @@ export function getTimestampWrites(
 export function resolveGpuTimestamps(encoder: GPUCommandEncoder): void {
   if (
     !PROFILING_ENABLED ||
-    !gpuTimestampsSupported ||
-    !gpuQuerySet ||
-    !gpuResolveBuffer ||
-    gpuNextSlot === 0
+    !gpuTs.supported ||
+    !gpuTs.querySet ||
+    !gpuTs.resolveBuffer ||
+    gpuTs.nextSlot === 0
   )
     return;
 
   // Don't resolve on the training encoder — defer to readGpuTimestamps()
   // so that the resolveQuerySet + copyBufferToBuffer + mapAsync all happen
   // in a single isolated submission after all training GPU work is complete.
-  gpuStagingSlots = gpuNextSlot;
+  gpuTs.stagingSlots = gpuTs.nextSlot;
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +379,7 @@ export function resolveGpuTimestamps(encoder: GPUCommandEncoder): void {
  * Accumulates per-label, per-phase, per-module stats.
  */
 function processTimestampRecords(timestamps: BigInt64Array): void {
-  for (const record of gpuPassRecords) {
+  for (const record of gpuTs.passRecords) {
     if (record.startSlot >= timestamps.length || record.endSlot >= timestamps.length) continue;
     const startNs = timestamps[record.startSlot];
     const endNs = timestamps[record.endSlot];
@@ -363,13 +389,13 @@ function processTimestampRecords(timestamps: BigInt64Array): void {
     if (durationNs < 0n) continue; // invalid
 
     // Per-label stats
-    const entry = gpuLabelStats.get(record.label);
+    const entry = gpuTs.labelStats.get(record.label);
     if (entry) {
       entry.count++;
       entry.totalNs += durationNs;
       if (durationNs > entry.maxNs) entry.maxNs = durationNs;
     } else {
-      gpuLabelStats.set(record.label, {
+      gpuTs.labelStats.set(record.label, {
         count: 1,
         totalNs: durationNs,
         maxNs: durationNs,
@@ -377,19 +403,19 @@ function processTimestampRecords(timestamps: BigInt64Array): void {
     }
 
     // Per-phase GPU stats
-    const phase = gpuPhaseStats.get(record.phase);
+    const phase = gpuTs.phaseStats.get(record.phase);
     if (phase) {
       phase.totalNs += durationNs;
       phase.opCount++;
     } else {
-      gpuPhaseStats.set(record.phase, { totalNs: durationNs, opCount: 1 });
+      gpuTs.phaseStats.set(record.phase, { totalNs: durationNs, opCount: 1 });
     }
 
     // Per-phase per-op GPU stats
-    let phaseOps = gpuPhaseOpStats.get(record.phase);
+    let phaseOps = gpuTs.phaseOpStats.get(record.phase);
     if (!phaseOps) {
       phaseOps = new Map();
-      gpuPhaseOpStats.set(record.phase, phaseOps);
+      gpuTs.phaseOpStats.set(record.phase, phaseOps);
     }
     const poEntry = phaseOps.get(record.label);
     if (poEntry) {
@@ -401,19 +427,19 @@ function processTimestampRecords(timestamps: BigInt64Array): void {
     }
 
     // Per-module GPU stats
-    const mod = gpuModuleStats.get(record.module);
+    const mod = gpuTs.moduleStats.get(record.module);
     if (mod) {
       mod.totalNs += durationNs;
       mod.opCount++;
     } else {
-      gpuModuleStats.set(record.module, { totalNs: durationNs, opCount: 1 });
+      gpuTs.moduleStats.set(record.module, { totalNs: durationNs, opCount: 1 });
     }
 
     // Per-module per-op GPU stats
-    let modOps = gpuModuleOpStats.get(record.module);
+    let modOps = gpuTs.moduleOpStats.get(record.module);
     if (!modOps) {
       modOps = new Map();
-      gpuModuleOpStats.set(record.module, modOps);
+      gpuTs.moduleOpStats.set(record.module, modOps);
     }
     const moEntry = modOps.get(record.label);
     if (moEntry) {
@@ -442,12 +468,12 @@ function processTimestampRecords(timestamps: BigInt64Array): void {
 export async function flushAndReadGpuTimestamps(): Promise<boolean> {
   if (
     !PROFILING_ENABLED ||
-    !gpuTimestampsSupported ||
-    !gpuDevice ||
-    !gpuQuerySet ||
-    !gpuResolveBuffer ||
-    gpuPassRecords.length === 0 ||
-    gpuNextSlot === 0
+    !gpuTs.supported ||
+    !gpuTs.device ||
+    !gpuTs.querySet ||
+    !gpuTs.resolveBuffer ||
+    gpuTs.passRecords.length === 0 ||
+    gpuTs.nextSlot === 0
   )
     return false;
 
@@ -455,33 +481,33 @@ export async function flushAndReadGpuTimestamps(): Promise<boolean> {
   const { flushSharedEncoder } = await import("./index");
   flushSharedEncoder();
 
-  const slotsToRead = gpuNextSlot;
+  const slotsToRead = gpuTs.nextSlot;
   const byteSize = slotsToRead * 8;
   const MAP_READ = 0x0001;
   const COPY_DST = 0x0008;
 
   // 2. Resolve + copy timestamps in a separate submission
-  const staging = gpuDevice.createBuffer({
+  const staging = gpuTs.device.createBuffer({
     size: byteSize,
     usage: MAP_READ | COPY_DST,
   });
 
-  const encoder = gpuDevice.createCommandEncoder();
-  encoder.resolveQuerySet(gpuQuerySet, 0, slotsToRead, gpuResolveBuffer, 0);
-  encoder.copyBufferToBuffer(gpuResolveBuffer, 0, staging, 0, byteSize);
-  gpuDevice.queue.submit([encoder.finish()]);
+  const encoder = gpuTs.device.createCommandEncoder();
+  encoder.resolveQuerySet(gpuTs.querySet, 0, slotsToRead, gpuTs.resolveBuffer, 0);
+  encoder.copyBufferToBuffer(gpuTs.resolveBuffer, 0, staging, 0, byteSize);
+  gpuTs.device.queue.submit([encoder.finish()]);
 
   // 3. Fence using onSubmittedWorkDone (works after forward pass)
-  if (typeof gpuDevice.queue.onSubmittedWorkDone === "function") {
+  if (typeof gpuTs.device.queue.onSubmittedWorkDone === "function") {
     const FENCE_TIMEOUT_MS = 10_000;
     const fenceOk = await Promise.race([
-      gpuDevice.queue.onSubmittedWorkDone().then(() => true),
+      gpuTs.device.queue.onSubmittedWorkDone().then(() => true),
       new Promise<false>((resolve) => setTimeout(() => resolve(false), FENCE_TIMEOUT_MS)),
     ]);
     if (!fenceOk) {
       console.warn("[profiler] onSubmittedWorkDone timed out after forward — skipping GPU timestamps");
       staging.destroy();
-      gpuTimestampsEnabled = false;
+      gpuTs.enabled = false;
       return false;
     }
   }
@@ -498,14 +524,14 @@ export async function flushAndReadGpuTimestamps(): Promise<boolean> {
   } catch (e) {
     console.warn("[profiler] Failed to map timestamp staging buffer:", e);
     staging.destroy();
-    gpuTimestampsEnabled = false;
+    gpuTs.enabled = false;
     return false;
   }
 
   if (!mapOk) {
     console.warn("[profiler] mapAsync timed out after forward — skipping GPU timestamps");
     staging.destroy();
-    gpuTimestampsEnabled = false;
+    gpuTs.enabled = false;
     return false;
   }
 
@@ -517,7 +543,7 @@ export async function flushAndReadGpuTimestamps(): Promise<boolean> {
 
   // 6. Disable timestamp writes for backward/optimizer to avoid corrupting
   //    Dawn's fence state. Forward GPU timing is captured; backward uses CPU timing.
-  gpuTimestampsEnabled = false;
+  gpuTs.enabled = false;
   return true;
 }
 
@@ -529,22 +555,22 @@ export async function flushAndReadGpuTimestamps(): Promise<boolean> {
 export async function readGpuTimestamps(): Promise<void> {
   if (
     !PROFILING_ENABLED ||
-    !gpuTimestampsSupported ||
-    !gpuDevice ||
-    !gpuQuerySet ||
-    !gpuResolveBuffer ||
-    gpuPassRecords.length === 0 ||
-    gpuStagingSlots === 0
+    !gpuTs.supported ||
+    !gpuTs.device ||
+    !gpuTs.querySet ||
+    !gpuTs.resolveBuffer ||
+    gpuTs.passRecords.length === 0 ||
+    gpuTs.stagingSlots === 0
   )
     return;
 
   // If timestamps were already processed by flushAndReadGpuTimestamps,
-  // gpuLabelStats will be non-empty. Skip redundant readback.
-  if (gpuLabelStats.size > 0) return;
+  // labelStats will be non-empty. Skip redundant readback.
+  if (gpuTs.labelStats.size > 0) return;
 
   const MAP_READ = 0x0001;
   const COPY_DST = 0x0008;
-  const slotsToRead = gpuStagingSlots;
+  const slotsToRead = gpuTs.stagingSlots;
   const byteSize = slotsToRead * 8;
 
   // Drain the deferred fence from markStep()
@@ -552,15 +578,15 @@ export async function readGpuTimestamps(): Promise<void> {
   await awaitDeferredFence();
 
   // Resolve + copy timestamps
-  const staging = gpuDevice.createBuffer({
+  const staging = gpuTs.device.createBuffer({
     size: byteSize,
     usage: MAP_READ | COPY_DST,
   });
 
-  const encoder = gpuDevice.createCommandEncoder();
-  encoder.resolveQuerySet(gpuQuerySet, 0, slotsToRead, gpuResolveBuffer, 0);
-  encoder.copyBufferToBuffer(gpuResolveBuffer, 0, staging, 0, byteSize);
-  gpuDevice.queue.submit([encoder.finish()]);
+  const encoder = gpuTs.device.createCommandEncoder();
+  encoder.resolveQuerySet(gpuTs.querySet, 0, slotsToRead, gpuTs.resolveBuffer, 0);
+  encoder.copyBufferToBuffer(gpuTs.resolveBuffer, 0, staging, 0, byteSize);
+  gpuTs.device.queue.submit([encoder.finish()]);
 
   const MAPASYNC_TIMEOUT_MS = 5_000;
   let mapOk = false;
@@ -614,8 +640,8 @@ export function printProfileSummary(label: string): void {
   console.log(`\n=== Profiling (${label}) ===\n`);
 
   // CPU API calls
-  if (apiStats.size > 0) {
-    const sorted = [...apiStats.entries()].sort(
+  if (cpuProfile.apiStats.size > 0) {
+    const sorted = [...cpuProfile.apiStats.entries()].sort(
       (a, b) => b[1].totalMs - a[1].totalMs,
     );
     console.log(
@@ -632,8 +658,8 @@ export function printProfileSummary(label: string): void {
   }
 
   // CPU op type
-  if (opStats.size > 0) {
-    const sorted = [...opStats.entries()].sort(
+  if (cpuProfile.opStats.size > 0) {
+    const sorted = [...cpuProfile.opStats.entries()].sort(
       (a, b) => b[1].totalMs - a[1].totalMs,
     );
     console.log(
@@ -650,8 +676,8 @@ export function printProfileSummary(label: string): void {
   }
 
   // Sub-op breakdown (fine-grained timing within dispatch functions)
-  if (subOpStats.size > 0) {
-    const sorted = [...subOpStats.entries()].sort(
+  if (cpuProfile.subOpStats.size > 0) {
+    const sorted = [...cpuProfile.subOpStats.entries()].sort(
       (a, b) => b[1].totalMs - a[1].totalMs,
     );
     console.log(
@@ -668,8 +694,8 @@ export function printProfileSummary(label: string): void {
   }
 
   // GPU kernel time
-  if (gpuLabelStats.size > 0) {
-    const sorted = [...gpuLabelStats.entries()].sort(
+  if (gpuTs.labelStats.size > 0) {
+    const sorted = [...gpuTs.labelStats.entries()].sort(
       (a, b) => nsToMs(b[1].totalNs) - nsToMs(a[1].totalNs),
     );
     console.log(
@@ -688,18 +714,18 @@ export function printProfileSummary(label: string): void {
   }
 
   // Phase summary
-  if (phaseStats.size > 0 || gpuPhaseStats.size > 0) {
+  if (cpuProfile.phaseStats.size > 0 || gpuTs.phaseStats.size > 0) {
     const allPhases = new Set([
-      ...phaseStats.keys(),
-      ...gpuPhaseStats.keys(),
+      ...cpuProfile.phaseStats.keys(),
+      ...gpuTs.phaseStats.keys(),
     ]);
     console.log(
       `${padR("Phase", 16)} ${padL("Ops", 8)} ${padL("CPU(ms)", 10)} ${padL("GPU(ms)", 10)}`,
     );
     console.log("─".repeat(46));
     for (const phase of allPhases) {
-      const cpu = phaseStats.get(phase);
-      const gpu = gpuPhaseStats.get(phase);
+      const cpu = cpuProfile.phaseStats.get(phase);
+      const gpu = gpuTs.phaseStats.get(phase);
       const ops = cpu?.opCount ?? gpu?.opCount ?? 0;
       const cpuMs = cpu?.totalMs ?? 0;
       const gpuMs = gpu ? nsToMs(gpu.totalNs) : 0;
@@ -711,10 +737,10 @@ export function printProfileSummary(label: string): void {
   }
 
   // Per-phase GPU kernel breakdown
-  if (gpuPhaseOpStats.size > 0) {
+  if (gpuTs.phaseOpStats.size > 0) {
     console.log("=== Per-Phase GPU Breakdown ===\n");
-    for (const [phase, opsMap] of gpuPhaseOpStats) {
-      const gpuPhase = gpuPhaseStats.get(phase);
+    for (const [phase, opsMap] of gpuTs.phaseOpStats) {
+      const gpuPhase = gpuTs.phaseStats.get(phase);
       const phaseGpuMs = gpuPhase ? nsToMs(gpuPhase.totalNs) : 0;
       const phaseDispatches = gpuPhase?.opCount ?? 0;
       console.log(`--- ${phase} (${phaseDispatches} dispatches, ${phaseGpuMs.toFixed(0)}ms GPU) ---`);
@@ -736,9 +762,9 @@ export function printProfileSummary(label: string): void {
   }
 
   // Per-module GPU summary
-  if (gpuModuleStats.size > 0) {
-    const totalGpuNs = [...gpuModuleStats.values()].reduce((s, v) => s + v.totalNs, 0n);
-    const sortedModules = [...gpuModuleStats.entries()].sort(
+  if (gpuTs.moduleStats.size > 0) {
+    const totalGpuNs = [...gpuTs.moduleStats.values()].reduce((s, v) => s + v.totalNs, 0n);
+    const sortedModules = [...gpuTs.moduleStats.entries()].sort(
       (a, b) => nsToMs(b[1].totalNs) - nsToMs(a[1].totalNs),
     );
     console.log("=== Per-Module GPU Breakdown ===\n");
@@ -759,7 +785,7 @@ export function printProfileSummary(label: string): void {
     console.log("=== Per-Module Kernel Detail ===\n");
     for (const [mod, s] of sortedModules) {
       const modMs = nsToMs(s.totalNs);
-      const opsMap = gpuModuleOpStats.get(mod);
+      const opsMap = gpuTs.moduleOpStats.get(mod);
       if (!opsMap || opsMap.size === 0) continue;
       console.log(`--- ${mod} (${s.opCount} dispatches, ${modMs.toFixed(0)}ms GPU) ---`);
       const sorted = [...opsMap.entries()].sort(
@@ -780,8 +806,8 @@ export function printProfileSummary(label: string): void {
   }
 
   // Fusion fallback stats
-  if (fusionFallbackStats.size > 0) {
-    const sorted = [...fusionFallbackStats.entries()].sort(
+  if (cpuProfile.fusionFallbackStats.size > 0) {
+    const sorted = [...cpuProfile.fusionFallbackStats.entries()].sort(
       (a, b) => b[1].count - a[1].count,
     );
     console.log("=== Fusion Fallback Reasons ===\n");
@@ -801,9 +827,9 @@ export function printProfileSummary(label: string): void {
   }
 
   // Plan analysis
-  if (planAnalyses.length > 0) {
+  if (cpuProfile.planAnalyses.length > 0) {
     console.log("=== Plan Analysis ===\n");
-    for (const pa of planAnalyses) {
+    for (const pa of cpuProfile.planAnalyses) {
       const fusionRate = pa.totalNodes > 0 ? (pa.fusedNodes / pa.totalNodes * 100).toFixed(1) : "0.0";
       console.log(
         `Plan ${pa.planIndex}: ${pa.totalNodes} nodes (${pa.fusedNodes} fused/${pa.totalNodes - pa.fusedNodes} seq, ${pa.fusionGroups} groups, ${fusionRate}% fused)`,
@@ -845,15 +871,15 @@ export function getProfileJSON(): object {
   // Build phases object with per-op kernel breakdown
   const phases: Record<string, any> = {};
   const allPhases = new Set([
-    ...phaseStats.keys(),
-    ...gpuPhaseStats.keys(),
-    ...gpuPhaseOpStats.keys(),
+    ...cpuProfile.phaseStats.keys(),
+    ...gpuTs.phaseStats.keys(),
+    ...gpuTs.phaseOpStats.keys(),
   ]);
   for (const phase of allPhases) {
-    const cpu = phaseStats.get(phase);
-    const gpu = gpuPhaseStats.get(phase);
+    const cpu = cpuProfile.phaseStats.get(phase);
+    const gpu = gpuTs.phaseStats.get(phase);
     const kernels: Record<string, any> = {};
-    const phaseOps = gpuPhaseOpStats.get(phase);
+    const phaseOps = gpuTs.phaseOpStats.get(phase);
     if (phaseOps) {
       for (const [op, s] of phaseOps) {
         kernels[op] = {
@@ -875,7 +901,7 @@ export function getProfileJSON(): object {
 
   // GPU totals
   const gpu_totals: Record<string, any> = {};
-  for (const [op, s] of gpuLabelStats) {
+  for (const [op, s] of gpuTs.labelStats) {
     gpu_totals[op] = {
       count: s.count,
       gpu_ms: nsToMs(s.totalNs),
@@ -887,7 +913,7 @@ export function getProfileJSON(): object {
   // Compute summary
   let totalGpuMs = 0;
   let totalDispatches = 0;
-  for (const [, s] of gpuPhaseStats) {
+  for (const [, s] of gpuTs.phaseStats) {
     totalGpuMs += nsToMs(s.totalNs);
     totalDispatches += s.opCount;
   }
@@ -895,7 +921,7 @@ export function getProfileJSON(): object {
   // Fusion rate from plan analyses
   let totalNodes = 0;
   let totalFused = 0;
-  for (const pa of planAnalyses) {
+  for (const pa of cpuProfile.planAnalyses) {
     totalNodes += pa.totalNodes;
     totalFused += pa.fusedNodes;
   }
@@ -903,7 +929,7 @@ export function getProfileJSON(): object {
 
   // Top bottlenecks: (phase, op) pairs sorted by GPU time
   const bottlenecks: { phase: string; op: string; gpu_ms: number }[] = [];
-  for (const [phase, opsMap] of gpuPhaseOpStats) {
+  for (const [phase, opsMap] of gpuTs.phaseOpStats) {
     for (const [op, s] of opsMap) {
       bottlenecks.push({ phase, op, gpu_ms: nsToMs(s.totalNs) });
     }
@@ -915,9 +941,9 @@ export function getProfileJSON(): object {
 
   // Per-module breakdown
   const modules: Record<string, any> = {};
-  for (const [mod, s] of gpuModuleStats) {
+  for (const [mod, s] of gpuTs.moduleStats) {
     const kernels: Record<string, any> = {};
-    const modOps = gpuModuleOpStats.get(mod);
+    const modOps = gpuTs.moduleOpStats.get(mod);
     if (modOps) {
       for (const [op, os] of modOps) {
         kernels[op] = {
@@ -937,7 +963,7 @@ export function getProfileJSON(): object {
   return {
     phases,
     modules,
-    plans: planAnalyses,
+    plans: cpuProfile.planAnalyses,
     gpu_totals,
     summary: {
       total_gpu_ms: totalGpuMs,
@@ -966,22 +992,6 @@ export async function writeProfileJSON(filePath: string): Promise<void> {
 
 export function resetProfileStats(): void {
   if (!PROFILING_ENABLED) return;
-  apiStats.clear();
-  opStats.clear();
-  phaseStats.clear();
-  gpuLabelStats.clear();
-  gpuPhaseStats.clear();
-  gpuPhaseOpStats.clear();
-  gpuModuleStats.clear();
-  gpuModuleOpStats.clear();
-  subOpStats.clear();
-  planAnalyses.length = 0;
-  fusionFallbackStats.clear();
-  gpuPassRecords = [];
-  gpuNextSlot = 0;
-  if (gpuStagingBuffer) {
-    gpuStagingBuffer.destroy();
-    gpuStagingBuffer = null;
-  }
-  gpuStagingSlots = 0;
+  resetCpuProfileState();
+  resetGpuTimestampState();
 }
