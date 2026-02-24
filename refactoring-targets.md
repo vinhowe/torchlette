@@ -1,6 +1,6 @@
 # Refactoring Targets
 
-Refactoring opportunities identified from full codebase reviews. Targets 1–5, 7–12 are complete.
+Refactoring opportunities identified from full codebase reviews. Targets 1–5, 7–13 are complete.
 
 ## Target 1: Decompose `webgpu/index.ts` — DONE
 
@@ -88,9 +88,9 @@ Identified from full codebase audit after completing Targets 1–11.
 
 Removed `export` from functions, types, interfaces, and constants with zero external consumers across 37 files. Also deleted dead code: `executeFusedElementwise()` from `fusion-dispatch.ts`, `irToLazyPlan()`/`segmentPlan()`/`PlanSegment` from `lazy-to-ir.ts`, three unused token reconciliation types from `compiled-region.ts`, and unused reset functions (`resetBindGroupCacheLocalState`, `resetFenceState`, `resetEncoderState`, `resetCpuProfileState`, `resetGpuTimestampState`). Cleaned up dead re-exports from `matmul/index.ts` (`AutotuneOptions`, `EpilogueOp`, `DispatchMatmulOptions`, `clearPerShapeTuningCache`, `clearPipelineCache`, `getConfigForShape`, `setTuningResult`, `AMPConfig`, `MatmulOptions`, `MatmulParams`, `transposeModeToInt`) and `ops/index.ts` (`OpDef`, `OpArity`). Net −163 lines.
 
-## Target 13: Typed Buffer Extraction Helper
+## Target 13: Typed Buffer Extraction Helper — DONE
 
-Replace ~40 `(x.backendTensor as any).buffer` accesses with a typed utility function.
+Added `gpuBuffer(tensor)` helper in `gpu-types.ts` to replace `(x.backendTensor as any).buffer` casts. Applied across `executor-lowered.ts` (7 sites) and `executor-optimized.ts` (2 sites). Zero `backendTensor as any` buffer extractions remain.
 
 ## Target 14: Reduce `as any` Casts in Kernel Files
 

@@ -1,4 +1,5 @@
 import type { Backend, BackendTensor, DType } from "../backend/types";
+import { gpuBuffer } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
 import {
   flushBufferPool,
@@ -122,10 +123,10 @@ export async function executeLoweredPlan(
     for (const node of planNodes) {
       for (const ref of node.inputs) {
         if (ref.kind === "materialized") {
-          const buf = (ref.storage.backendTensor as any)?.buffer;
+          const buf = gpuBuffer(ref.storage.backendTensor);
           if (buf) extInputBufSet.add(buf);
         } else if (ref.kind === "pending" && ref.node.result) {
-          const buf = (ref.node.result.backendTensor as any)?.buffer;
+          const buf = gpuBuffer(ref.node.result.backendTensor);
           if (buf) extInputBufSet.add(buf);
         }
       }
@@ -148,10 +149,10 @@ export async function executeLoweredPlan(
       for (const node of planNodes) {
         for (const ref of node.inputs) {
           if (ref.kind === "materialized") {
-            const buf = (ref.storage.backendTensor as any).buffer;
+            const buf = gpuBuffer(ref.storage.backendTensor);
             if (buf) extBufs.push(buf);
           } else if (ref.kind === "pending" && ref.node.result) {
-            const buf = (ref.node.result.backendTensor as any).buffer;
+            const buf = gpuBuffer(ref.node.result.backendTensor);
             if (buf) extBufs.push(buf);
           }
         }
@@ -446,10 +447,10 @@ export async function executeLoweredPlan(
     for (const node of planNodes) {
       for (const ref of node.inputs) {
         if (ref.kind === "materialized") {
-          const buf = (ref.storage.backendTensor as any).buffer;
+          const buf = gpuBuffer(ref.storage.backendTensor);
           if (buf) extBufs.push(buf);
         } else if (ref.kind === "pending" && ref.node.result) {
-          const buf = (ref.node.result.backendTensor as any).buffer;
+          const buf = gpuBuffer(ref.node.result.backendTensor);
           if (buf) extBufs.push(buf);
         }
       }
@@ -609,12 +610,12 @@ export async function executeLoweredPlan(
               // Resolve GPU buffers from cached paths (plan-node-relative lookups)
               const refA = planNodes[cfg.inputAPath.planNodeIndex].inputs[cfg.inputAPath.inputIndex];
               const refB = planNodes[cfg.inputBPath.planNodeIndex].inputs[cfg.inputBPath.inputIndex];
-              const bufA = (getInputStorage(refA).backendTensor as any).buffer;
-              const bufB = (getInputStorage(refB).backendTensor as any).buffer;
+              const bufA = gpuBuffer(getInputStorage(refA).backendTensor);
+              const bufB = gpuBuffer(getInputStorage(refB).backendTensor);
               const epilogueBuffers: any[] = [];
               for (const path of cfg.epilogueInputPaths) {
                 const ref = planNodes[path.planNodeIndex].inputs[path.inputIndex];
-                epilogueBuffers.push((getInputStorage(ref).backendTensor as any).buffer);
+                epilogueBuffers.push(gpuBuffer(getInputStorage(ref).backendTensor));
               }
 
               // Dispatch directly — skips shape computation, transpose detection,
