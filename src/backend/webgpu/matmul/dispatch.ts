@@ -148,6 +148,17 @@ function setTuningResult(
 }
 
 /**
+ * Reset all module-local mutable state (pipeline cache, tuning caches, autotune state).
+ */
+export function resetMatmulState(): void {
+  pipelineCache.clear();
+  tuningCache.clear();
+  perShapeTuningCache.clear();
+  autotuneCounter = 0;
+  autotuningInProgress.clear();
+}
+
+/**
  * Clear the dispatch tuning cache.
  * Called by tests to reset state between runs.
  */

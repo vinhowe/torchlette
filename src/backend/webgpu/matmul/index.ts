@@ -41,6 +41,7 @@ export {
   dispatchTiledMatmul,
   isAutotuneEnabled,
   pretuneMatmulShapes,
+  resetMatmulState,
   setAutotuneEnabled,
 } from "./dispatch";
 

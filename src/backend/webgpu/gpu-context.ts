@@ -20,8 +20,14 @@ import { bufferPool } from "./buffer-pool";
 import { isProfilingEnabled, initGpuTimestamps } from "./profiler";
 import { setSubgroupSupport, type SubgroupSupport } from "./matmul";
 import { registerWebGPUDonation } from "../../engine/memory-planned-executor";
-import { destroyPersistentInfFlagBuffer } from "./unscale-kernel";
+import { resetUnscaleKernelState } from "./unscale-kernel";
 import { destroyProfilingFenceBuffer } from "./buffer-pool";
+import { resetAttentionKernelState } from "./attention-kernel";
+import { resetLayerNormKernelState } from "./layernorm-kernel";
+import { resetCrossEntropyKernelState } from "./cross-entropy-kernel";
+import { resetAdamKernelState } from "./adam-kernel";
+import { resetMatmulState } from "./matmul";
+import { resetFusionCache } from "./fusion-dispatch";
 
 import { donateBuffer, getBufferSize } from "./buffer-arena";
 import { setSharedEncoderEnabled } from "./shared-encoder";
@@ -424,6 +430,25 @@ function detectSubgroupSupport(adapter: GPUAdapter): SubgroupSupport {
 }
 
 // ============================================================================
+// Kernel Cache Reset
+// ============================================================================
+
+/**
+ * Reset all kernel pipeline caches and associated mutable state.
+ * Called by destroyWebGPU() for full cleanup, and can be called
+ * independently for test isolation.
+ */
+export function resetAllKernelCaches(): void {
+  resetAttentionKernelState();
+  resetLayerNormKernelState();
+  resetCrossEntropyKernelState();
+  resetAdamKernelState();
+  resetUnscaleKernelState();
+  resetMatmulState();
+  resetFusionCache();
+}
+
+// ============================================================================
 // syncWebGPU / destroyWebGPU / getWebGPUDevice / requireContext
 // ============================================================================
 
@@ -448,7 +473,7 @@ export function destroyWebGPU(): void {
   }
   f16WeightCache.clear();
   clearBindGroupCache();
-  destroyPersistentInfFlagBuffer();
+  resetAllKernelCaches();
   destroyProfilingFenceBuffer();
   gpuContext.device.destroy();
   gpuContext.pipelines.clear();

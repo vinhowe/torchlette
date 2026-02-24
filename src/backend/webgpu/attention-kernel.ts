@@ -1351,6 +1351,14 @@ export function dispatchFlashAttentionBackwardDQ(
  * Dispatch FlashAttention backward dKV kernel.
  * Q,K,V,L,D,dO → dK: [B,H,N,D], dV: [B,H,N,D]
  */
+/**
+ * Reset all module-local mutable state (pipeline cache, config buffer cache).
+ */
+export function resetAttentionKernelState(): void {
+  pipelineCache.clear();
+  configCache.clear();
+}
+
 export function dispatchFlashAttentionBackwardDKV(
   qBuffer: GPUBuffer,
   kBuffer: GPUBuffer,

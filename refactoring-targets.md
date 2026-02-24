@@ -1,6 +1,6 @@
 # Refactoring Targets
 
-Refactoring opportunities identified from full codebase reviews. Targets 1–5, 7–14 are complete.
+Refactoring opportunities identified from full codebase reviews. All targets (1–5, 7–16) are complete.
 
 ## Target 1: Decompose `webgpu/index.ts` — DONE
 
@@ -100,6 +100,6 @@ Removed 125 vestigial `as any` casts across 8 kernel/dispatch files. All casts w
 
 Decomposed `runtime/engine.ts` (2,489→1,990 lines) and `engine/engine.ts` (1,808→1,507 lines) into focused modules. New files: `engine/engine-types.ts` (231 lines — types/interfaces), `engine/engine-errors.ts` (39 lines — error classes), `engine/engine-helpers.ts` (88 lines — standalone helpers), `runtime/engine-types.ts` (86 lines — types/dispatch modes/options), `runtime/shape-helpers.ts` (97 lines — pure shape computation), `runtime/engine-fused.ts` (261 lines — fused kernel op helpers), `runtime/engine-facade.ts` (216 lines — defaultEngine singleton + ~40 facade functions). Re-exports preserve all existing import paths via barrel files. 2 test files updated to import facade functions from new path.
 
-## Target 16: Consolidate Remaining Module-Local Globals
+## Target 16: Consolidate Remaining Module-Local Globals — DONE
 
-Pipeline caches, recording buffers, and other mutable state scattered across kernel files.
+Added exported `resetKernelState()` functions to 5 kernel files (`attention-kernel.ts`, `layernorm-kernel.ts`, `cross-entropy-kernel.ts`, `adam-kernel.ts`, `unscale-kernel.ts`) and `resetMatmulState()` to `matmul/dispatch.ts` for their pipeline caches, config buffer caches, and temp buffer caches. Created master `resetAllKernelCaches()` in `gpu-context.ts` that calls all 7 reset functions (the 6 above + `resetFusionCache()` from `fusion-dispatch.ts`). Wired into `destroyWebGPU()` for full cleanup on device teardown. Exported from `index.ts` for test isolation use. Pre-existing state was already well-consolidated: `webgpu-state.ts` (11 cross-module globals), `shared-encoder.ts` (encoderState object), `bind-group-cache.ts` (cacheState object), `buffer-arena.ts` (arenaLocal object), `profiler.ts` (cpuProfile + gpuTs objects), `dispatch-recording.ts` (start/stop lifecycle), `buffer-pool.ts` (class with private state).
