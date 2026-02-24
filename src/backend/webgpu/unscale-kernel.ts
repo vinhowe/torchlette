@@ -273,8 +273,8 @@ function allocateFreshOutputBuffer(
       GPUBufferUsage.COPY_SRC |
       GPUBufferUsage.COPY_DST,
   });
-  gpuMemoryTracker.trackAllocation(buf as any, sizeBytes);
-  trackSharedEncoderWrite(buf as any);
+  gpuMemoryTracker.trackAllocation(buf, sizeBytes);
+  trackSharedEncoderWrite(buf);
   return buf;
 }
 
@@ -365,7 +365,7 @@ export function dispatchUnscaleGrad(
       });
     } else {
       bindGroup = cachedCreateBindGroup(device, pipeline,
-        [gradBuffer, gradOut, infFlagBuffer, configBuf] as any);
+        [gradBuffer, gradOut, infFlagBuffer, configBuf]);
     }
 
     const chunkWorkgroups = Math.ceil(chunkSize / WORKGROUP_SIZE);
@@ -377,14 +377,14 @@ export function dispatchUnscaleGrad(
       : 1;
 
     dispatchComputePass(
-      pipeline as any,
-      bindGroup as any,
+      pipeline,
+      bindGroup,
       dispatchX,
       dispatchY,
     );
 
     // Config buffer deferred destruction (shared encoder still active)
-    releaseParamsBuffer(configBuf as any);
+    releaseParamsBuffer(configBuf);
   }
 
   return { gradOutBuffer: gradOut };

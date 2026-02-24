@@ -1219,18 +1219,18 @@ export function dispatchFlashAttentionForward(
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer, configBuf] as any) as any;
+    [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer, configBuf]);
 
-  trackSharedEncoderWrite(qBuffer as any);
-  trackSharedEncoderWrite(kBuffer as any);
-  trackSharedEncoderWrite(vBuffer as any);
-  trackSharedEncoderWrite(outBuffer as any);
-  trackSharedEncoderWrite(lseBuffer as any);
+  trackSharedEncoderWrite(qBuffer);
+  trackSharedEncoderWrite(kBuffer);
+  trackSharedEncoderWrite(vBuffer);
+  trackSharedEncoderWrite(outBuffer);
+  trackSharedEncoderWrite(lseBuffer);
 
   const numQBlocks = Math.ceil(seqLen / BR);
   dispatchComputePass(
-    pipeline as any,
-    bindGroup as any,
+    pipeline,
+    bindGroup,
     numQBlocks,
     numHeads,
     batchSize,
@@ -1273,15 +1273,15 @@ export function dispatchFlashAttentionBackwardD(
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [dOBuffer, oBuffer, outBuffer, configBuf] as any) as any;
+    [dOBuffer, oBuffer, outBuffer, configBuf]);
 
-  trackSharedEncoderWrite(dOBuffer as any);
-  trackSharedEncoderWrite(oBuffer as any);
-  trackSharedEncoderWrite(outBuffer as any);
+  trackSharedEncoderWrite(dOBuffer);
+  trackSharedEncoderWrite(oBuffer);
+  trackSharedEncoderWrite(outBuffer);
 
   dispatchComputePass(
-    pipeline as any,
-    bindGroup as any,
+    pipeline,
+    bindGroup,
     totalRows,
   );
 
@@ -1325,20 +1325,20 @@ export function dispatchFlashAttentionBackwardDQ(
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer, configBuf] as any) as any;
+    [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer, configBuf]);
 
-  trackSharedEncoderWrite(qBuffer as any);
-  trackSharedEncoderWrite(kBuffer as any);
-  trackSharedEncoderWrite(vBuffer as any);
-  trackSharedEncoderWrite(lBuffer as any);
-  trackSharedEncoderWrite(dBuffer as any);
-  trackSharedEncoderWrite(dOBuffer as any);
-  trackSharedEncoderWrite(outBuffer as any);
+  trackSharedEncoderWrite(qBuffer);
+  trackSharedEncoderWrite(kBuffer);
+  trackSharedEncoderWrite(vBuffer);
+  trackSharedEncoderWrite(lBuffer);
+  trackSharedEncoderWrite(dBuffer);
+  trackSharedEncoderWrite(dOBuffer);
+  trackSharedEncoderWrite(outBuffer);
 
   const numQBlocks = Math.ceil(seqLen / BR);
   dispatchComputePass(
-    pipeline as any,
-    bindGroup as any,
+    pipeline,
+    bindGroup,
     numQBlocks,
     numHeads,
     batchSize,
@@ -1386,21 +1386,21 @@ export function dispatchFlashAttentionBackwardDKV(
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer, configBuf] as any) as any;
+    [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer, configBuf]);
 
-  trackSharedEncoderWrite(qBuffer as any);
-  trackSharedEncoderWrite(kBuffer as any);
-  trackSharedEncoderWrite(vBuffer as any);
-  trackSharedEncoderWrite(lBuffer as any);
-  trackSharedEncoderWrite(dBuffer as any);
-  trackSharedEncoderWrite(dOBuffer as any);
-  trackSharedEncoderWrite(dKBuffer as any);
-  trackSharedEncoderWrite(dVBuffer as any);
+  trackSharedEncoderWrite(qBuffer);
+  trackSharedEncoderWrite(kBuffer);
+  trackSharedEncoderWrite(vBuffer);
+  trackSharedEncoderWrite(lBuffer);
+  trackSharedEncoderWrite(dBuffer);
+  trackSharedEncoderWrite(dOBuffer);
+  trackSharedEncoderWrite(dKBuffer);
+  trackSharedEncoderWrite(dVBuffer);
 
   const numKVBlocks = Math.ceil(seqLen / BC_BW);
   dispatchComputePass(
-    pipeline as any,
-    bindGroup as any,
+    pipeline,
+    bindGroup,
     numKVBlocks,
     numHeads,
     batchSize,

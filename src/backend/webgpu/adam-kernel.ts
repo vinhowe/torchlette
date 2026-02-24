@@ -681,7 +681,7 @@ function createConfigBuffer(
  */
 function allocateAdamOutputBuffer(sizeBytes: number): GPUBuffer {
   const buf = allocateOutputBuffer(sizeBytes);
-  trackSharedEncoderWrite(buf as any);
+  trackSharedEncoderWrite(buf);
   return buf;
 }
 
@@ -749,10 +749,10 @@ export function dispatchAdamStep(
   // the f16 output allocation. Without this, the pool may return grad's buffer
   // for the f16 output, causing a read/read_write conflict on the same buffer.
   let _st = profileSubOpBegin();
-  trackSharedEncoderWrite(gradBuffer as any);
-  trackSharedEncoderWrite(paramBuffer as any);
-  trackSharedEncoderWrite(mBuffer as any);
-  trackSharedEncoderWrite(vBuffer as any);
+  trackSharedEncoderWrite(gradBuffer);
+  trackSharedEncoderWrite(paramBuffer);
+  trackSharedEncoderWrite(mBuffer);
+  trackSharedEncoderWrite(vBuffer);
 
   // Only allocate f16 output buffer (different size).
   const totalF16Bytes = numElements * f16BytesPerElement;
@@ -870,8 +870,8 @@ export function dispatchAdamStep(
 
     _st = profileSubOpBegin();
     dispatchComputePass(
-      pipeline as any,
-      bindGroup as any,
+      pipeline,
+      bindGroup,
       dispatchX,
       dispatchY,
     );
@@ -880,7 +880,7 @@ export function dispatchAdamStep(
     // Config buffer must NOT be destroyed while shared encoder is active,
     // because the compute pass hasn't been submitted yet.
     // Use releaseParamsBuffer for safe deferred destruction.
-    releaseParamsBuffer(configBuf as any);
+    releaseParamsBuffer(configBuf);
   }
 
   // In-place: return the same input buffers (updated in-place by the shader)

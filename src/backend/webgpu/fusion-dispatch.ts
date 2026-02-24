@@ -228,7 +228,7 @@ export function dispatchFusedKernel(
   for (const output of recipe.outputs) {
     const outputBytes = totalElements * dtypeBytes(output.dtype);
     const buffer = allocateOutputBuffer(outputBytes) as unknown as GPUBuffer;
-    trackSharedEncoderWrite(buffer as any);
+    trackSharedEncoderWrite(buffer);
     outputBuffers.push(buffer);
     outputTensors.push({
       buffer,
@@ -249,7 +249,7 @@ export function dispatchFusedKernel(
     bgBuffers.push(outputBuffers[i]);
   }
   bgBuffers.push(paramsBuffer);
-  const bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers) as any;
+  const bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers);
 
   // Dispatch (batch/shared-encoder mode aware)
   // Use 2D dispatch when workgroups exceed WebGPU per-dimension limit (65535)
@@ -261,8 +261,8 @@ export function dispatchFusedKernel(
   // Record dispatch if recording is active
   if (fusionRecordingBuffer) {
     fusionRecordingBuffer.push({
-      pipeline: pipeline as any,
-      bindGroup: bindGroup as any,
+      pipeline,
+      bindGroup,
       workgroupsX,
       workgroupsY,
       workgroupsZ: 1,

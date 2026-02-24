@@ -1,6 +1,6 @@
 # Refactoring Targets
 
-Refactoring opportunities identified from full codebase reviews. Targets 1–5, 7–13 are complete.
+Refactoring opportunities identified from full codebase reviews. Targets 1–5, 7–14 are complete.
 
 ## Target 1: Decompose `webgpu/index.ts` — DONE
 
@@ -92,9 +92,9 @@ Removed `export` from functions, types, interfaces, and constants with zero exte
 
 Added `gpuBuffer(tensor)` helper in `gpu-types.ts` to replace `(x.backendTensor as any).buffer` casts. Applied across `executor-lowered.ts` (7 sites) and `executor-optimized.ts` (2 sites). Zero `backendTensor as any` buffer extractions remain.
 
-## Target 14: Reduce `as any` Casts in Kernel Files
+## Target 14: Reduce `as any` Casts in Kernel Files — DONE
 
-Focus on attention-kernel.ts (35), layernorm-kernel.ts (26), and other kernel files. Most casts are at the BackendTensor↔GPUBuffer boundary.
+Removed 125 vestigial `as any` casts across 8 kernel/dispatch files. All casts were unnecessary after Target 10 unified WebGPU type definitions into `gpu-types.ts`. Patterns removed: `trackSharedEncoderWrite(buf as any)`, `cachedCreateBindGroup(...buffers as any) as any`, `dispatchComputePass(pipeline as any, bindGroup as any, ...)`, `releaseParamsBuffer(buf as any)`, `(encoder as any).beginComputePass()`. 3 casts in `ops/fused.ts` preserved (genuine `unknown`→`GPUBuffer` bridge). Total `as any` count: 201→75.
 
 ## Target 15: Decompose Large Files
 
