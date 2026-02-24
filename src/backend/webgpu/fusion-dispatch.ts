@@ -14,6 +14,7 @@ export function setFusionRecordingBuffer(buf: RecordedDispatch[] | null): void {
 }
 
 import type { DType } from "../types";
+import { dtypeBytes } from "./shape-utils";
 import { profileApiCall, getTimestampWrites, getProfileModule } from "./profiler";
 import {
   type FusedKernelRecipe,
@@ -361,23 +362,6 @@ export function dispatchFusedKernel(
   };
 }
 
-/**
- * Get bytes per element for a dtype.
- */
-function dtypeBytes(dtype: DType): number {
-  switch (dtype) {
-    case "f32":
-    case "i32":
-    case "u32":
-      return 4;
-    case "f16":
-      return 2;
-    case "bool":
-      return 1;
-    default:
-      return 4;
-  }
-}
 
 // ============================================================================
 // High-Level API

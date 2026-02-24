@@ -16,6 +16,7 @@ import {
   type TransposeMode,
 } from "./types";
 import { getExpr, isUnaryOp, isBinaryOp } from "../ops/registry";
+import { dtypeToWgsl } from "../shape-utils";
 
 /**
  * Epilogue operation to fuse into matmul output.
@@ -60,12 +61,6 @@ export type CodegenOptions = {
   kSplit?: number;
 };
 
-/**
- * Generate the WGSL type string for a dtype.
- */
-function dtypeToWgsl(dtype: DType): string {
-  return dtype === "f16" ? "f16" : "f32";
-}
 
 /**
  * Generate the array element type (always f32 for accumulator).
