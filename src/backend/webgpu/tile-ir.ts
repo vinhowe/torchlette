@@ -90,6 +90,7 @@ export interface LoadNode extends IRNodeBase {
   kind: "load";
   binding: string;
   offsets: IRNode; // block expression for indices
+  mask?: IRNode;   // optional mask (block expression, truthy = load, falsy = 0)
 }
 
 export interface StoreNode extends IRNodeBase {
@@ -97,6 +98,7 @@ export interface StoreNode extends IRNodeBase {
   binding: string;
   offsets: IRNode; // block expression for indices
   values: IRNode;  // block expression for data
+  mask?: IRNode;   // optional mask (block expression, truthy = store)
 }
 
 export interface ReduceNode extends IRNodeBase {
@@ -910,21 +912,23 @@ export class KernelContext {
     })));
   }
 
-  /** Load from a storage buffer at given offsets. */
-  load(binding: string, offsets: BlockExpr): BlockExpr {
+  /** Load from a storage buffer at given offsets. Optional mask for bounds. */
+  load(binding: string, offsets: BlockExpr, mask?: BlockExpr): BlockExpr {
     const bindingType = this.bindingSpecs[binding]?.type ?? "f32";
     return new BlockExpr(this.trackNode(makeNode<LoadNode>({
       kind: "load", binding, offsets: offsets.node,
+      ...(mask ? { mask: mask.node } : {}),
       valueType: "block", dataType: bindingType as DataType,
-    })));
+    } as any)));
   }
 
-  /** Store values to a storage buffer at block offsets (auto-phase mode). */
-  store(binding: string, offsets: BlockExpr, values: BlockExpr): void {
+  /** Store values to a storage buffer at block offsets (auto-phase mode). Optional mask for bounds. */
+  store(binding: string, offsets: BlockExpr, values: BlockExpr, mask?: BlockExpr): void {
     const node = this.trackNode(makeNode<StoreNode>({
       kind: "store", binding, offsets: offsets.node, values: values.node,
+      ...(mask ? { mask: mask.node } : {}),
       valueType: "block", dataType: "f32",
-    }));
+    } as any));
     this.stores.push(node);
   }
 
@@ -957,6 +961,15 @@ export class KernelContext {
       valueType: "scalar", dataType,
     })));
   }
+
+  /** Shorthand: u32 constant. */
+  u32(value: number): BlockExpr { return this.const(value, "u32"); }
+
+  /** Shorthand: i32 constant. */
+  i32(value: number): BlockExpr { return this.const(value, "i32"); }
+
+  /** Shorthand: f32 constant. */
+  f32(value: number): BlockExpr { return this.const(value, "f32"); }
 
   // ---- Imperative mode API ----
 

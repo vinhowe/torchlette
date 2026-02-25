@@ -721,3 +721,269 @@ describe.runIf(isWebGPUEnabled)("Gap 6: Auto-vectorization GPU dispatch", () => 
     outBuf.destroy();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Masked auto-phase elementwise (Triton-like)
+// ---------------------------------------------------------------------------
+
+/** Auto-phase elementwise add with masked load/store — the Triton-like way. */
+const maskedElementwiseAddSpec: TileKernelSpec = {
+  name: "maskedElementwiseAdd",
+  workgroupSize: 256,
+  bindings: {
+    a:      { storage: "read", type: "f32" },
+    b:      { storage: "read", type: "f32" },
+    output: { storage: "read_write", type: "f32" },
+  },
+  uniforms: { n: "u32" },
+  grid: (u) => [Math.ceil(u.n / 256)],
+  kernel(ctx) {
+    const WG = ctx.u32(256);
+    const idx = ctx.programId(0).mul(WG).add(ctx.blockRange(WG));
+    const n = ctx.uniform("n");
+    const mask = idx.lt(n);
+    const a = ctx.load("a", idx, mask);
+    const b = ctx.load("b", idx, mask);
+    ctx.store("output", idx, a.add(b), mask);
+  },
+};
+
+/** Auto-phase elementwise relu with masked store — demonstrates unary op. */
+const maskedElementwiseReluSpec: TileKernelSpec = {
+  name: "maskedElementwiseRelu",
+  workgroupSize: 64,
+  bindings: {
+    x:      { storage: "read", type: "f32" },
+    output: { storage: "read_write", type: "f32" },
+  },
+  uniforms: { n: "u32" },
+  grid: (u) => [Math.ceil(u.n / 64)],
+  kernel(ctx) {
+    const WG = ctx.u32(64);
+    const idx = ctx.programId(0).mul(WG).add(ctx.blockRange(WG));
+    const n = ctx.uniform("n");
+    const mask = idx.lt(n);
+    const x = ctx.load("x", idx, mask);
+    const zero = ctx.f32(0.0);
+    const result = x.gt(zero).select(x, zero);
+    ctx.store("output", idx, result, mask);
+  },
+};
+
+/** Auto-phase elementwise with vectorize=4. */
+const maskedElementwiseAddVec4Spec: TileKernelSpec = {
+  name: "maskedElementwiseAddVec4",
+  workgroupSize: 64,
+  vectorize: 4,
+  bindings: {
+    a:      { storage: "read", type: "f32" },
+    b:      { storage: "read", type: "f32" },
+    output: { storage: "read_write", type: "f32" },
+  },
+  uniforms: { n: "u32" },
+  grid: (u) => [Math.ceil(u.n / (64 * 4))],
+  kernel(ctx) {
+    const WG = ctx.u32(64);
+    const idx = ctx.programId(0).mul(WG).add(ctx.blockRange(WG));
+    const n = ctx.uniform("n");
+    const mask = idx.lt(n);
+    const a = ctx.load("a", idx, mask);
+    const b = ctx.load("b", idx, mask);
+    ctx.store("output", idx, a.add(b), mask);
+  },
+};
+
+describe("Masked auto-phase elementwise (WGSL)", () => {
+  it("emits workgroup_id + local_invocation_index, no shared memory", () => {
+    const wgsl = compileTileKernel(maskedElementwiseAddSpec);
+    expect(wgsl).toContain("workgroup_id");
+    expect(wgsl).toContain("local_invocation_index");
+    expect(wgsl).not.toContain("var<workgroup>");
+    expect(wgsl).not.toContain("global_invocation_id");
+  });
+
+  it("emits if-guard for masked store", () => {
+    const wgsl = compileTileKernel(maskedElementwiseAddSpec);
+    expect(wgsl).toContain("if (");
+    expect(wgsl).toContain("output[");
+  });
+
+  it("emits select for masked load", () => {
+    const wgsl = compileTileKernel(maskedElementwiseAddSpec);
+    expect(wgsl).toContain("select(");
+  });
+
+  it("ctx.u32/f32/i32 shortcuts work", () => {
+    const wgsl = compileTileKernel(maskedElementwiseReluSpec);
+    expect(wgsl).toContain("workgroup_id");
+    expect(wgsl).toContain("select(");
+  });
+
+  it("vectorize works with masked auto-phase", () => {
+    const wgsl = compileTileKernel(maskedElementwiseAddVec4Spec);
+    expect(wgsl).toContain("* 4u");
+    expect(wgsl).toContain("(_base + 0u)");
+    expect(wgsl).toContain("(_base + 3u)");
+  });
+});
+
+describe.runIf(isWebGPUEnabled)("Masked auto-phase elementwise GPU dispatch", () => {
+  beforeAll(async () => {
+    const ok = await initWebGPU();
+    if (!ok) throw new Error("WebGPU init failed");
+    const ctx = getWebGPUDevice();
+    if (!ctx) throw new Error("No WebGPU device");
+    device = ctx.device;
+    queue = ctx.queue;
+  });
+
+  afterAll(async () => {
+    await syncWebGPU();
+  });
+
+  it("masked add: 1000 elements", async () => {
+    const N = 1000;
+    const aData = new Float32Array(N);
+    const bData = new Float32Array(N);
+    const expected = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      aData[i] = i * 0.1;
+      bData[i] = (N - i) * 0.01;
+      expected[i] = aData[i] + bData[i];
+    }
+
+    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(N);
+
+    const kernel = createTileKernelDispatcher(maskedElementwiseAddSpec);
+    beginSharedEncoder();
+    kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, N);
+    for (let i = 0; i < N; i++) {
+      expect(result[i]).toBeCloseTo(expected[i], 3);
+    }
+
+    aBuf.destroy();
+    bBuf.destroy();
+    outBuf.destroy();
+  });
+
+  it("masked add: non-multiple of workgroup size (137)", async () => {
+    const N = 137;
+    const aData = new Float32Array(N);
+    const bData = new Float32Array(N);
+    const expected = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      aData[i] = i;
+      bData[i] = -i * 0.5;
+      expected[i] = aData[i] + bData[i];
+    }
+
+    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(N);
+
+    const kernel = createTileKernelDispatcher(maskedElementwiseAddSpec);
+    beginSharedEncoder();
+    kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, N);
+    for (let i = 0; i < N; i++) {
+      expect(result[i]).toBeCloseTo(expected[i], 3);
+    }
+
+    aBuf.destroy();
+    bBuf.destroy();
+    outBuf.destroy();
+  });
+
+  it("masked relu: correct output", async () => {
+    const N = 500;
+    const xData = new Float32Array(N);
+    const expected = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      xData[i] = (i % 7) - 3; // -3..3
+      expected[i] = Math.max(0, xData[i]);
+    }
+
+    const xBuf = makeF32Buffer(xData, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(N);
+
+    const kernel = createTileKernelDispatcher(maskedElementwiseReluSpec);
+    beginSharedEncoder();
+    kernel.dispatch({ x: xBuf, output: outBuf }, { n: N });
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, N);
+    for (let i = 0; i < N; i++) {
+      expect(result[i]).toBeCloseTo(expected[i], 3);
+    }
+
+    xBuf.destroy();
+    outBuf.destroy();
+  });
+
+  it("masked vec4 add: 1024 elements", async () => {
+    const N = 1024;
+    const aData = new Float32Array(N);
+    const bData = new Float32Array(N);
+    const expected = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      aData[i] = i * 0.01;
+      bData[i] = -i * 0.005;
+      expected[i] = aData[i] + bData[i];
+    }
+
+    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(N);
+
+    const kernel = createTileKernelDispatcher(maskedElementwiseAddVec4Spec);
+    beginSharedEncoder();
+    kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, N);
+    for (let i = 0; i < N; i++) {
+      expect(result[i]).toBeCloseTo(expected[i], 3);
+    }
+
+    aBuf.destroy();
+    bBuf.destroy();
+    outBuf.destroy();
+  });
+
+  it("masked vec4 add: non-multiple-of-4 (137)", async () => {
+    const N = 137;
+    const aData = new Float32Array(N);
+    const bData = new Float32Array(N);
+    const expected = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      aData[i] = i;
+      bData[i] = -i * 0.5;
+      expected[i] = aData[i] + bData[i];
+    }
+
+    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(Math.ceil(N / 4) * 4);
+
+    const kernel = createTileKernelDispatcher(maskedElementwiseAddVec4Spec);
+    beginSharedEncoder();
+    kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, N);
+    for (let i = 0; i < N; i++) {
+      expect(result[i]).toBeCloseTo(expected[i], 3);
+    }
+
+    aBuf.destroy();
+    bBuf.destroy();
+    outBuf.destroy();
+  });
+});
