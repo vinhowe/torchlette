@@ -6,7 +6,9 @@
  */
 
 import type { DType } from "../types";
+import { computeContiguousStrides } from "../types";
 export { sizeOf, broadcastShapes, shapesEqual } from "../../core/shape";
+export { computeContiguousStrides as contiguousStrides } from "../types";
 
 // ============================================================================
 // Constants
@@ -40,22 +42,14 @@ export function toIndexShape(shape: number[]): number[] {
   return shape.length === 0 ? [1] : shape;
 }
 
-export function contiguousStrides(shape: number[]): number[] {
-  const strides = new Array<number>(shape.length);
-  let stride = 1;
-  for (let i = shape.length - 1; i >= 0; i -= 1) {
-    strides[i] = stride;
-    stride *= shape[i];
-  }
-  return strides;
-}
+// contiguousStrides re-exported from ../types above
 
 export function broadcastStrides(shape: number[], outShape: number[]): number[] {
   if (shape.length > outShape.length) {
     throw new Error("webgpu broadcast target has fewer dimensions than input");
   }
   const pad = outShape.length - shape.length;
-  const inStrides = contiguousStrides(shape);
+  const inStrides = computeContiguousStrides(shape);
   const outStrides = new Array<number>(outShape.length);
   for (let axis = 0; axis < outShape.length; axis += 1) {
     const inAxis = axis - pad;
@@ -170,7 +164,7 @@ export function buildBroadcastIndexing(
  * Check if strides represent contiguous memory layout.
  */
 export function checkContiguousStrides(shape: number[], strides: number[]): boolean {
-  const expected = contiguousStrides(shape);
+  const expected = computeContiguousStrides(shape);
   for (let i = 0; i < shape.length; i++) {
     // Size-1 dims don't affect contiguity
     if (shape[i] <= 1) continue;

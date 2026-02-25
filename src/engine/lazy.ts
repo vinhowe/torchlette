@@ -41,13 +41,14 @@ export {
   resetStorageIdCounter,
   getNextStorageId,
   createStorageHandle,
+  wrapResultAsStorage,
   _webgpuMatmulImports,
   _webgpuMatmulGeomImports,
   ensureWebGPUMatmulImports,
 } from "./node-factory";
 
 // ── Storage tracking ──────────────────────────────────────────────────────────
-export { storageTracker, canSafelyRelease, releaseBufferImmediate } from "./storage-tracker";
+export { storageTracker, canSafelyRelease, releaseBufferImmediate, releaseDeadTensors } from "./storage-tracker";
 
 // ── Plan building ─────────────────────────────────────────────────────────────
 export {

@@ -25,6 +25,7 @@
  */
 
 import type { DType } from "../backend/types";
+import type { GPUBuffer, GPUComputePipeline, GPUBindGroup } from "../backend/webgpu/gpu-types";
 import type { FusedKernelRecipe } from "../backend/webgpu/fusion-codegen";
 import type { LazyIRNode, LazyRef } from "./lazy";
 
@@ -209,8 +210,8 @@ export interface LoweredPlan {
  * a compute pass without any JS-level op dispatch logic.
  */
 interface ReplayDispatch {
-  pipeline: any;  // GPUComputePipeline
-  bindGroup: any; // GPUBindGroup
+  pipeline: GPUComputePipeline;
+  bindGroup: GPUBindGroup;
   workgroupsX: number;
   workgroupsY: number;
   workgroupsZ: number;
@@ -222,7 +223,7 @@ interface ReplayDispatch {
  */
 export interface ReplayNodeResult {
   nodeIndex: number;
-  buffer: any;       // GPUBuffer (arena-stable)
+  buffer: GPUBuffer;
   shape: number[];
   dtype: DType;
   size: number;
@@ -243,7 +244,7 @@ export type ReplayEntry =
       seqCounters: { dispatch: number; params: number; output: number } }
   | { kind: "view"; nodeIndex: number; arenaResolveIdx: number;
       /** Cached view result for replay (arena buffers are stable, so buffer refs stay valid). */
-      cachedResult?: { buffer: any; shape: number[]; dtype: DType; size: number;
+      cachedResult?: { buffer: GPUBuffer; shape: number[]; dtype: DType; size: number;
         strides: number[]; offset: number; isContiguous: boolean };
       /** Arena counter position AFTER view execution (may differ if contiguous() triggered). */
       arenaResolveIdxAfter?: number }
@@ -254,7 +255,7 @@ export type ReplayEntry =
   | { kind: "adam-batch"; nodeIndices: number[];
       /** Sequence counter positions at adam batch start (for correct cache indexing). */
       seqCounters: { dispatch: number; params: number; output: number } }
-  | { kind: "side-output"; nodeIndex: number; buffer: any; shape: number[];
+  | { kind: "side-output"; nodeIndex: number; buffer: GPUBuffer; shape: number[];
       dtype: DType; size: number; strides: number[] }
   | { kind: "reclaim" }
   | { kind: "pre-adam-reclaim" };
@@ -269,7 +270,7 @@ export interface DispatchReplayCache {
   /** Whether this cache is valid for replay. Set to false on invalidation. */
   valid: boolean;
   /** GPUBuffers referenced by recorded bind groups that must not be destroyed between steps. */
-  pinnedBuffers?: Set<any>;
+  pinnedBuffers?: Set<GPUBuffer>;
 }
 
 // ============================================================================

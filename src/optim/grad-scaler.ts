@@ -35,6 +35,16 @@ import type { Backend, DeviceKind } from "../backend/types";
 
 export type Optimizer = Adam | SGD;
 
+/** Duck-type interface for optimizers with fused GPU kernels (e.g., Adam). */
+interface FusedOptimizer {
+  hasFusedKernel(): boolean;
+  setUnscaleConfig(invScale: number, infFlagBuffer: unknown): void;
+}
+
+function isFusedOptimizer(opt: Optimizer): opt is Optimizer & FusedOptimizer {
+  return typeof (opt as FusedOptimizer).hasFusedKernel === "function";
+}
+
 export type GradScalerOptions = {
   /** Initial scale factor. Default: 65536.0 (2^16) */
   initScale?: number;
@@ -210,12 +220,11 @@ export class GradScaler {
     // instead of two). Adam.step() will consume the pending unscale config.
     if (
       backend.ops.adamStep &&
-      "setUnscaleConfig" in optimizer &&
-      typeof (optimizer as any).hasFusedKernel === "function" &&
-      (optimizer as any).hasFusedKernel()
+      isFusedOptimizer(optimizer) &&
+      optimizer.hasFusedKernel()
     ) {
       const infFlagBuffer = backend.ops.createInfCountBuffer!();
-      (optimizer as any).setUnscaleConfig(invScale, infFlagBuffer);
+      optimizer.setUnscaleConfig(invScale, infFlagBuffer);
       this._pendingInfBuffer = infFlagBuffer;
       this._pendingInfBackend = backend;
       return;

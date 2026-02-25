@@ -1,4 +1,4 @@
-import type { Backend, BackendTensor } from "../backend/types";
+import type { Backend } from "../backend/types";
 import { getBackend } from "../backend/registry";
 import {
   beginBatchExecution,
@@ -11,12 +11,11 @@ import {
 } from "../backend/webgpu";
 import {
   analyzeLifetimes,
-  findDeadTensorsAtStep,
   type TensorLifetime,
 } from "./memory-planning";
 import type { LazyIRNode, StorageHandle, ExecutionPlan, ExecutePlanOptions } from "./lazy-types";
-import { createStorageHandle } from "./node-factory";
-import { canSafelyRelease, releaseBufferImmediate } from "./storage-tracker";
+import { wrapResultAsStorage } from "./node-factory";
+import { canSafelyRelease, releaseBufferImmediate, releaseDeadTensors } from "./storage-tracker";
 import { extractPlanMetadata, pretunePlanMatmuls, segmentPlanAtCheckpoints } from "./plan-builder";
 import { getInputStorage, executeOp } from "./op-dispatch";
 
@@ -91,47 +90,13 @@ export async function executePlan(
     const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
     const backendInputs = inputs.map((s) => s.backendTensor);
 
-    let resultTensor = await executeOp(node, backendInputs, nodeBackend);
-
-    // Safety: if a backend op returned the exact same tensor object as one of
-    // its inputs (e.g. contiguous on an already-contiguous tensor), creating a
-    // separate owning StorageHandle would double-free the underlying buffer.
-    // Detect this and wrap the result as a non-owning view.
-    const aliasedInputIdx = backendInputs.findIndex(b => b === resultTensor);
-    if (aliasedInputIdx >= 0 && (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
-      // Clone the tensor object so we don't mutate the input's ownsBuffer field.
-      // Only applies to backends with explicit ownsBuffer (e.g. WebGPU).
-      resultTensor = { ...resultTensor, ownsBuffer: false } as BackendTensor;
-    }
-    const isView =
-      (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === false;
-    const baseStorageId =
-      isView && inputs.length > 0
-        ? inputs[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
-        : undefined;
-    node.result = createStorageHandle(node.device, resultTensor, baseStorageId);
+    const resultTensor = await executeOp(node, backendInputs, nodeBackend);
+    node.result = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
 
     // Track storage for early release
     if (options?.enableEarlyRelease) {
       nodeToStorage.set(node.id, node.result);
-
-      // Release dead buffers after each step
-      if (lifetimes && outputNodeIds) {
-        const deadNodeIds = findDeadTensorsAtStep(
-          lifetimes,
-          step + 1, // We just completed this step
-          outputNodeIds,
-          alreadyReleased,
-        );
-        for (const deadId of deadNodeIds) {
-          const storage = nodeToStorage.get(deadId);
-          if (storage && canSafelyRelease(storage, nodeToStorage)) {
-            releaseBufferImmediate(storage);
-            nodeToStorage.delete(deadId);
-            alreadyReleased.add(deadId);
-          }
-        }
-      }
+      releaseDeadTensors(lifetimes, step + 1, outputNodeIds, alreadyReleased, nodeToStorage);
     }
   }
 
@@ -337,22 +302,13 @@ export async function executePlanWithTrueSegments(
         const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
         const backendInputs = inputs.map((s) => s.backendTensor);
 
-        let resultTensor = await executeOp(
+        const resultTensor = await executeOp(
           node,
           backendInputs,
           nodeBackend,
         );
 
-        // Safety: detect aliased result (e.g. contiguous on contiguous tensor)
-        const aliasedInputIdx = backendInputs.findIndex(b => b === resultTensor);
-        if (aliasedInputIdx >= 0 && (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
-          resultTensor = { ...resultTensor, ownsBuffer: false } as BackendTensor;
-        }
-        const isView = (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === false;
-        const baseStorageId = isView && inputs.length > 0
-          ? inputs[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
-          : undefined;
-        node.result = createStorageHandle(node.device, resultTensor, baseStorageId);
+        node.result = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
         nodeToStorage.set(node.id, node.result);
         materializedStorages.set(node.id, node.result);
       }

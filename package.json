@@ -27,6 +27,7 @@
     "bench": "pnpm build && node dist/bench/runner.js",
     "bench:browser": "pnpm build && echo 'Open http://localhost:8080/bench/browser/ in Chrome' && npx serve -p 8080",
     "test": "bash -c 'vitest run --project cpu & P=$!; vitest run --project webgpu; R1=$?; wait $P; R2=$?; exit $((R1 + R2))'",
+    "test:full": "bash -c 'vitest run --project cpu & P=$!; vitest run --project webgpu && vitest run --project slow; R1=$?; wait $P; R2=$?; exit $((R1 + R2))'",
     "test:coverage": "vitest run --coverage",
     "test:webgpu": "vitest run test/webgpu.spec.ts",
     "test:browser": "vitest run --config vitest.config.browser.ts",

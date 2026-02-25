@@ -16,7 +16,6 @@
 
 import {
   dispatchComputePass,
-  getWebGPUDevice,
   getMaxStorageBufferBindingSize,
   trackSharedEncoderWrite,
   createParamsBuffer,
@@ -24,17 +23,14 @@ import {
   flushSharedEncoder,
   cachedCreateBindGroup,
   awaitDeferredFence,
+  getPipeline,
 } from "./index";
+import { requireContext } from "./webgpu-state";
 import { isProfilingEnabled } from "./profiler";
 import { gpuMemoryTracker } from "./memory-tracker";
-import { defineKernel } from "./kernel-factory";
-import type { GPUBuffer, GPUDevice, GPUCommandEncoder } from "./gpu-types";
+import type { GPUBuffer, GPUBindGroup, GPUDevice, GPUCommandEncoder } from "./gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "./gpu-types";
-
-const WORKGROUP_SIZE = 256;
-const MAX_WORKGROUPS_PER_DIM = 65535;
-
-const kernel = defineKernel("unscale");
+import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 
 // ============================================================================
 // WGSL Shader
@@ -127,11 +123,11 @@ const infFlagZeroData = new Float32Array([0.0]);
  */
 export function allocateInfFlagBuffer(device?: GPUDevice): GPUBuffer {
   if (persistentInfFlagBuffer) {
-    const dev = device ?? (getWebGPUDevice()!.device);
+    const dev = device ?? (requireContext().device);
     dev.queue.writeBuffer(persistentInfFlagBuffer, 0, infFlagZeroData);
     return persistentInfFlagBuffer;
   }
-  const dev = device ?? (getWebGPUDevice()!.device);
+  const dev = device ?? (requireContext().device);
   persistentInfFlagBuffer = dev.createBuffer({
     size: 4,
     usage:
@@ -150,7 +146,7 @@ export function allocateInfFlagBuffer(device?: GPUDevice): GPUBuffer {
  * Flushes the shared encoder first to ensure all kernel writes are submitted.
  */
 export async function readInfFlag(infFlagBuffer: GPUBuffer): Promise<number> {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   // Consume the deferred fence from markStep() BEFORE any GPU sync.
@@ -278,7 +274,7 @@ export function dispatchUnscaleGrad(
   invScale: number,
   infFlagBuffer: GPUBuffer,
 ): UnscaleGradResult {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const bytesPerElement = 4; // f32
@@ -299,7 +295,7 @@ export function dispatchUnscaleGrad(
   const numChunks = Math.ceil(numElements / elementsPerChunk);
 
   // Allocate output buffer (fresh, no pool reuse)
-  const alignedBytes = alignBufferSize(totalBytes);
+  const alignedBytes = roundUpToPowerOfTwo(totalBytes);
   const gradOut = allocateFreshOutputBuffer(device, alignedBytes);
 
   // Determine dispatch dimensions
@@ -312,7 +308,7 @@ export function dispatchUnscaleGrad(
   // Get or create pipeline
   const key = `unscaleGrad:${use2D ? `2d:${gridSizeX}` : "1d"}`;
   const code = unscaleGradShader(use2D, gridSizeX);
-  const pipeline = kernel.getPipeline(device, key, () => code);
+  const pipeline = getPipeline(ctx, key, code);
 
   for (let chunk = 0; chunk < numChunks; chunk++) {
     const chunkStart = chunk * elementsPerChunk;
@@ -337,7 +333,7 @@ export function dispatchUnscaleGrad(
       { binding: 3, resource: { buffer: configBuf } },
     ];
 
-    let bindGroup: any;
+    let bindGroup: GPUBindGroup;
     if (needsChunking) {
       bindGroup = device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
@@ -375,7 +371,7 @@ export function dispatchUnscaleGrad(
 // ============================================================================
 
 /** Round up buffer size to next power of 2 (matching pool size classes) */
-function alignBufferSize(size: number): number {
+function roundUpToPowerOfTwo(size: number): number {
   if (size <= 256) return 256;
   let s = 1;
   while (s < size) s <<= 1;
@@ -386,6 +382,5 @@ function alignBufferSize(size: number): number {
  * Reset all module-local mutable state (pipeline cache, persistent inf flag buffer).
  */
 export function resetUnscaleKernelState(): void {
-  kernel.reset();
   destroyPersistentInfFlagBuffer();
 }

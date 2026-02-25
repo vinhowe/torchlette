@@ -4,6 +4,7 @@
  */
 import type { BackendTensor } from "../../types";
 import type { GPUDevice, WebGPUTensor } from "../gpu-types";
+import { asGPUTensor } from "../gpu-types";
 import { sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
@@ -92,8 +93,8 @@ export function stridedScatterCopy(
   src: BackendTensor,
   options: { offset: number; viewShape: number[]; viewStrides: number[] },
 ): BackendTensor {
-  const baseTensor = base as WebGPUTensor;
-  const srcTensor = src as WebGPUTensor;
+  const baseTensor = asGPUTensor(base);
+  const srcTensor = asGPUTensor(src);
   const { offset, viewShape, viewStrides } = options;
 
   const baseSize = sizeOf(baseTensor.shape);
@@ -104,8 +105,7 @@ export function stridedScatterCopy(
   }
 
   const ctx = requireContext();
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
 
   // Check if any buffer exceeds max binding size
@@ -239,8 +239,7 @@ function stridedScatterCopyChunkedSimple(
   const totalElements = baseTensor.size;
   const bytesPerElement = 4; // f32
 
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   const layout = computeFlatChunkLayout(totalElements, bytesPerElement, maxBindingSize, minAlignment);
@@ -371,8 +370,8 @@ export function stridedScatterAdd(
   src: BackendTensor,
   options: { offset: number; viewShape: number[]; viewStrides: number[] },
 ): BackendTensor {
-  const baseTensor = base as WebGPUTensor;
-  const srcTensor = src as WebGPUTensor;
+  const baseTensor = asGPUTensor(base);
+  const srcTensor = asGPUTensor(src);
   const { offset, viewShape, viewStrides } = options;
 
   const baseSize = sizeOf(baseTensor.shape);
@@ -383,8 +382,7 @@ export function stridedScatterAdd(
   }
 
   const ctx = requireContext();
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
 
   // Check if any buffer exceeds max binding size
@@ -515,8 +513,7 @@ function stridedScatterAddChunkedSimple(
   const totalElements = baseTensor.size;
   const bytesPerElement = 4; // f32
 
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   const layout = computeFlatChunkLayout(totalElements, bytesPerElement, maxBindingSize, minAlignment);

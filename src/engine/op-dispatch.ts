@@ -1,15 +1,64 @@
 import type {
+  AdamStepConfig,
   Backend,
   BackendTensor,
   DeviceKind,
+  DType,
+  FusedAttentionConfig,
+  FusedCrossEntropyConfig,
+  FusedLayerNormConfig,
   GeluOptions,
 } from "../backend/types";
 import { getBackend } from "../backend/registry";
 import { setCurrentOpLabel } from "../backend/webgpu";
+import { sizeOf } from "../core/shape";
 import { profileOpBegin, profileOpEnd, setProfileModule } from "../backend/webgpu/profiler";
 import type { LazyIRNode, LazyRef, StorageHandle } from "./lazy-types";
 import { createStorageHandle } from "./node-factory";
 import { storageTracker } from "./storage-tracker";
+
+/**
+ * Execute a function within a profiling context.
+ *
+ * Sets up the op label and module for profiling, times the execution,
+ * and cleans up after. Handles both sync and async functions.
+ */
+export async function withProfileContext<T>(
+  label: string,
+  module: string | undefined,
+  fn: () => T | Promise<T>,
+): Promise<T> {
+  setCurrentOpLabel(label);
+  setProfileModule(module ?? "unknown");
+  const t0 = profileOpBegin(label);
+  try {
+    return await fn();
+  } finally {
+    profileOpEnd(label, t0);
+    setCurrentOpLabel(null);
+    setProfileModule("unknown");
+  }
+}
+
+/** Extract a StorageHandle side output from a parent node, unregister it, and return the BackendTensor. */
+function extractSideOutput(node: LazyIRNode, key: string): BackendTensor {
+  const parent = node.inputs[0].node;
+  const sh = parent._sideOutputs?.[key] as StorageHandle | undefined;
+  if (!sh) throw new Error(`${node.op}: parent has no ${key} side output`);
+  const bt = sh.backendTensor;
+  storageTracker.unregister(sh.id);
+  parent._sideOutputs![key] = undefined;
+  return bt;
+}
+
+/** Extract a raw BackendTensor side output from a parent node and clear it. */
+function extractRawSideOutput(node: LazyIRNode, key: string): BackendTensor {
+  const parent = node.inputs[0].node;
+  const bt = parent._sideOutputs?.[key] as BackendTensor | undefined;
+  if (!bt) throw new Error(`${node.op}: parent has no ${key} side output`);
+  parent._sideOutputs![key] = undefined;
+  return bt;
+}
 
 export function getInputStorage(ref: LazyRef, backend?: Backend): StorageHandle {
   if (ref.kind === "materialized") {
@@ -28,21 +77,41 @@ export function getInputStorage(ref: LazyRef, backend?: Backend): StorageHandle 
   throw new Error(`Input not ready: node id=${ref.node.id} op=${ref.node.op} shape=[${ref.node.shape}] caller=${new Error().stack?.split("\n")[2]?.trim()}`);
 }
 
-/**
- * Execute a single op on the backend.
- */
-export async function executeOp(
-  node: LazyIRNode,
-  backendInputs: BackendTensor[],
-  backend: Backend,
-): Promise<BackendTensor> {
-  setCurrentOpLabel(node.op);
-  setProfileModule(node.module ?? "unknown");
-  const _profT0 = profileOpBegin(node.op);
-  try {
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Typed payload extraction — avoids repetitive inline `as` casts. */
+function getPayload<T>(node: LazyIRNode): T | undefined {
+  return node.payload as T | undefined;
+}
+
+/** Assert that an optional backend op exists, throwing a descriptive error if not. */
+function assertOpSupported(op: string, fn: unknown): asserts fn {
+  if (!fn) throw new Error(`${op} not supported by backend`);
+}
+
+/** Create a StorageHandle for a side output, optionally mark it reachable, and store it on the node. */
+function storeSideOutput(
+  node: LazyIRNode, key: string, tensor: BackendTensor, reachableAnchor?: object,
+): StorageHandle {
+  const sh = createStorageHandle(node.device, tensor);
+  if (reachableAnchor) storageTracker.markReachable(sh.id, reachableAnchor);
+  if (!node._sideOutputs) node._sideOutputs = {};
+  node._sideOutputs[key] = sh;
+  return sh;
+}
+
+// ---------------------------------------------------------------------------
+// Handler groups
+// ---------------------------------------------------------------------------
+
+function executeCreationOp(
+  node: LazyIRNode, backendInputs: BackendTensor[], backend: Backend,
+): BackendTensor {
   switch (node.op) {
     case "tensorFromArray": {
-      const payload = node.payload as { values: number[] | Float32Array } | undefined;
+      const payload = getPayload<{ values: number[] | Float32Array }>(node);
       if (!payload?.values) {
         throw new Error("tensorFromArray requires values in payload");
       }
@@ -53,21 +122,21 @@ export async function executeOp(
       if (backend.ops.zeros) {
         return backend.ops.zeros(node.shape);
       }
-      const numEl = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const numEl = sizeOf(node.shape);
       return backend.ops.tensorFromArray(new Array(numEl).fill(0), node.shape);
     }
 
     case "full": {
-      const fullPayload = node.payload as { fillValue: number };
+      const payload = getPayload<{ fillValue: number }>(node)!;
       if (backend.ops.full) {
-        return backend.ops.full(node.shape, fullPayload.fillValue);
+        return backend.ops.full(node.shape, payload.fillValue);
       }
-      const numElFull = node.shape.reduce((a: number, b: number) => a * b, 1);
-      return backend.ops.tensorFromArray(new Array(numElFull).fill(fullPayload.fillValue), node.shape);
+      const numEl = sizeOf(node.shape);
+      return backend.ops.tensorFromArray(new Array(numEl).fill(payload.fillValue), node.shape);
     }
 
     case "arange": {
-      const ap = node.payload as { end: number; start: number; step: number };
+      const ap = getPayload<{ end: number; start: number; step: number }>(node)!;
       if (backend.ops.arange) {
         return backend.ops.arange(ap.end, ap.start, ap.step);
       }
@@ -78,28 +147,28 @@ export async function executeOp(
     }
 
     case "tril": {
-      if (!backend.ops.tril) throw new Error("tril not supported by backend");
-      return backend.ops.tril(backendInputs[0], (node.payload as { k: number })?.k ?? 0);
+      assertOpSupported("tril", backend.ops.tril);
+      return backend.ops.tril(backendInputs[0], getPayload<{ k: number }>(node)?.k ?? 0);
     }
 
     case "triu": {
-      if (!backend.ops.triu) throw new Error("triu not supported by backend");
-      return backend.ops.triu(backendInputs[0], (node.payload as { k: number })?.k ?? 0);
+      assertOpSupported("triu", backend.ops.triu);
+      return backend.ops.triu(backendInputs[0], getPayload<{ k: number }>(node)?.k ?? 0);
     }
 
     case "rand": {
-      const rp = node.payload as { seed: number };
+      const rp = getPayload<{ seed: number }>(node)!;
       if (backend.ops.rand) return backend.ops.rand(node.shape, rp.seed);
-      const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const n = sizeOf(node.shape);
       const vals = new Array(n);
       for (let i = 0; i < n; i++) vals[i] = Math.random();
       return backend.ops.tensorFromArray(vals, node.shape);
     }
 
     case "randn": {
-      const rp = node.payload as { seed: number };
+      const rp = getPayload<{ seed: number }>(node)!;
       if (backend.ops.randn) return backend.ops.randn(node.shape, rp.seed);
-      const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const n = sizeOf(node.shape);
       const vals = new Array(n);
       for (let i = 0; i < n; i += 2) {
         const u1 = Math.random(), u2 = Math.random();
@@ -111,402 +180,293 @@ export async function executeOp(
     }
 
     case "bernoulli": {
-      const bp = node.payload as { seed: number; p: number };
+      const bp = getPayload<{ seed: number; p: number }>(node)!;
       if (backend.ops.bernoulli) return backend.ops.bernoulli(node.shape, bp.p, bp.seed);
-      const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const n = sizeOf(node.shape);
       const vals = new Array(n);
       for (let i = 0; i < n; i++) vals[i] = Math.random() < bp.p ? 1 : 0;
       return backend.ops.tensorFromArray(vals, node.shape);
     }
 
-    case "add":
-      return backend.ops.add(backendInputs[0], backendInputs[1]);
+    default:
+      throw new Error(`Unknown creation op: ${node.op}`);
+  }
+}
 
-    case "sub": {
-      const subPayload = node.payload as { alpha?: number } | undefined;
-      return backend.ops.sub(backendInputs[0], backendInputs[1], subPayload);
-    }
-
-    case "mul":
-      return backend.ops.mul(backendInputs[0], backendInputs[1]);
-
-    case "div": {
-      const divPayload = node.payload as
-        | { roundingMode?: "trunc" | "floor" }
-        | undefined;
-      return backend.ops.div(backendInputs[0], backendInputs[1], divPayload);
-    }
-
-    case "matmul":
-      return backend.ops.matmul(backendInputs[0], backendInputs[1]);
-
+function executeUnaryOp(
+  node: LazyIRNode, backendInputs: BackendTensor[], backend: Backend,
+  donationOpts?: { outBuffer: unknown },
+): BackendTensor {
+  const input = backendInputs[0];
+  switch (node.op) {
     case "sqrt":
-      return backend.ops.sqrt(backendInputs[0]);
-
+      return backend.ops.sqrt(input, donationOpts);
     case "relu":
-      return backend.ops.relu(backendInputs[0]);
-
+      return backend.ops.relu(input, donationOpts);
     case "exp":
-      if (!backend.ops.exp) throw new Error("exp not supported by backend");
-      return backend.ops.exp(backendInputs[0]);
-
+      assertOpSupported("exp", backend.ops.exp);
+      return backend.ops.exp(input, donationOpts);
     case "log":
-      if (!backend.ops.log) throw new Error("log not supported by backend");
-      return backend.ops.log(backendInputs[0]);
-
+      assertOpSupported("log", backend.ops.log);
+      return backend.ops.log(input, donationOpts);
     case "neg":
-      if (!backend.ops.neg) throw new Error("neg not supported by backend");
-      return backend.ops.neg(backendInputs[0]);
-
+      assertOpSupported("neg", backend.ops.neg);
+      return backend.ops.neg(input, donationOpts);
     case "abs":
-      if (!backend.ops.abs) throw new Error("abs not supported by backend");
-      return backend.ops.abs(backendInputs[0]);
-
+      assertOpSupported("abs", backend.ops.abs);
+      return backend.ops.abs(input, donationOpts);
     case "tanh":
-      if (!backend.ops.tanh) throw new Error("tanh not supported by backend");
-      return backend.ops.tanh(backendInputs[0]);
-
+      assertOpSupported("tanh", backend.ops.tanh);
+      return backend.ops.tanh(input, donationOpts);
     case "sigmoid":
-      if (!backend.ops.sigmoid)
-        throw new Error("sigmoid not supported by backend");
-      return backend.ops.sigmoid(backendInputs[0]);
-
+      assertOpSupported("sigmoid", backend.ops.sigmoid);
+      return backend.ops.sigmoid(input, donationOpts);
     case "gelu": {
-      if (!backend.ops.gelu) throw new Error("gelu not supported by backend");
-      const geluOpts = node.payload as GeluOptions | undefined;
-      return backend.ops.gelu(backendInputs[0], geluOpts);
+      assertOpSupported("gelu", backend.ops.gelu);
+      const geluOpts = getPayload<GeluOptions>(node);
+      return backend.ops.gelu(input, { ...geluOpts, ...donationOpts });
     }
-
     case "silu":
-      if (!backend.ops.silu) throw new Error("silu not supported by backend");
-      return backend.ops.silu(backendInputs[0]);
-
+      assertOpSupported("silu", backend.ops.silu);
+      return backend.ops.silu(input, donationOpts);
     case "isfinite":
-      if (!backend.ops.isfinite)
-        throw new Error("isfinite not supported by backend");
-      return backend.ops.isfinite(backendInputs[0]);
-
+      assertOpSupported("isfinite", backend.ops.isfinite);
+      return backend.ops.isfinite(input);
     case "pow":
-      if (!backend.ops.pow) throw new Error("pow not supported by backend");
-      return backend.ops.pow(backendInputs[0], backendInputs[1]);
+      assertOpSupported("pow", backend.ops.pow);
+      return backend.ops.pow(input, backendInputs[1]);
+    default:
+      throw new Error(`Unknown unary op: ${node.op}`);
+  }
+}
 
-    case "reshape": {
-      const payload = node.payload as { targetShape: number[] } | undefined;
-      const targetShape = payload?.targetShape ?? node.shape;
-      return backend.ops.reshape(backendInputs[0], targetShape);
+function executeBinaryOp(
+  node: LazyIRNode, backendInputs: BackendTensor[], backend: Backend,
+  donationOpts?: { outBuffer: unknown },
+): BackendTensor {
+  switch (node.op) {
+    case "add":
+      return backend.ops.add(backendInputs[0], backendInputs[1], donationOpts);
+    case "sub": {
+      const payload = getPayload<{ alpha?: number }>(node);
+      return backend.ops.sub(backendInputs[0], backendInputs[1], { ...payload, ...donationOpts });
     }
+    case "mul":
+      return backend.ops.mul(backendInputs[0], backendInputs[1], donationOpts);
+    case "div": {
+      const payload = getPayload<{ roundingMode?: "trunc" | "floor" }>(node);
+      return backend.ops.div(backendInputs[0], backendInputs[1], { ...payload, ...donationOpts });
+    }
+    case "matmul":
+      return backend.ops.matmul(backendInputs[0], backendInputs[1], donationOpts);
+    default:
+      throw new Error(`Unknown binary op: ${node.op}`);
+  }
+}
 
+function executeShapeOp(
+  node: LazyIRNode, backendInputs: BackendTensor[], backend: Backend,
+): BackendTensor {
+  switch (node.op) {
+    case "reshape": {
+      const payload = getPayload<{ targetShape: number[] }>(node);
+      return backend.ops.reshape(backendInputs[0], payload?.targetShape ?? node.shape);
+    }
     case "expand":
       return backend.ops.expand(backendInputs[0], node.shape);
-
     case "transpose": {
-      const payload = node.payload as
-        | { dim0: number; dim1: number }
-        | undefined;
-      if (!payload) {
-        throw new Error("transpose requires dim0 and dim1 in payload");
-      }
+      const payload = getPayload<{ dim0: number; dim1: number }>(node);
+      if (!payload) throw new Error("transpose requires dim0 and dim1 in payload");
       return backend.ops.transpose(backendInputs[0], payload);
     }
-
     case "permute": {
-      const payload = node.payload as { dims: number[] } | undefined;
-      if (!payload) {
-        throw new Error("permute requires dims in payload");
-      }
+      const payload = getPayload<{ dims: number[] }>(node);
+      if (!payload) throw new Error("permute requires dims in payload");
       return backend.ops.permute(backendInputs[0], payload.dims);
     }
-
     case "contiguous":
       return backend.ops.contiguous(backendInputs[0]);
-
     case "narrow": {
-      const p = node.payload as { dim: number; start: number; length: number };
-      if (!backend.ops.narrow) throw new Error("narrow not supported by backend");
+      const p = getPayload<{ dim: number; start: number; length: number }>(node)!;
+      assertOpSupported("narrow", backend.ops.narrow);
       return backend.ops.narrow(backendInputs[0], p.dim, p.start, p.length);
     }
-
     case "narrowBackward": {
-      const p = node.payload as { dim: number; start: number; originalLength: number };
-      if (!backend.ops.narrowBackward) throw new Error("narrowBackward not supported by backend");
+      const p = getPayload<{ dim: number; start: number; originalLength: number }>(node)!;
+      assertOpSupported("narrowBackward", backend.ops.narrowBackward);
       return backend.ops.narrowBackward(backendInputs[0], p.dim, p.start, p.originalLength);
     }
-
     case "cast": {
-      const payload = node.payload as
-        | { dtype: import("../backend/types").DType }
-        | undefined;
-      if (!payload) {
-        throw new Error("cast requires dtype in payload");
-      }
-      if (!backend.ops.cast) {
-        throw new Error("cast not supported by backend");
-      }
+      const payload = getPayload<{ dtype: DType }>(node);
+      if (!payload) throw new Error("cast requires dtype in payload");
+      assertOpSupported("cast", backend.ops.cast);
       return backend.ops.cast(backendInputs[0], payload.dtype);
     }
+    default:
+      throw new Error(`Unknown shape op: ${node.op}`);
+  }
+}
 
+function executeReductionOp(
+  node: LazyIRNode, backendInputs: BackendTensor[], backend: Backend,
+  donationOpts?: { outBuffer: unknown },
+): BackendTensor {
+  switch (node.op) {
+    case "sum":
+      return backend.ops.sum(backendInputs[0], getPayload<{ dim?: number | number[] | null; keepdim?: boolean }>(node));
+    case "max":
+      return backend.ops.max(backendInputs[0], getPayload<{ dim?: number | number[] | null; keepdim?: boolean }>(node));
+    case "mean":
+      return backend.ops.mean(backendInputs[0], getPayload<{ dim?: number | number[] | null; keepdim?: boolean }>(node));
+    case "argmax": {
+      assertOpSupported("argmax", backend.ops.argmax);
+      return backend.ops.argmax(backendInputs[0], getPayload<{ dim: number; keepdim?: boolean }>(node)!);
+    }
+    case "argmin": {
+      assertOpSupported("argmin", backend.ops.argmin);
+      return backend.ops.argmin(backendInputs[0], getPayload<{ dim: number; keepdim?: boolean }>(node)!);
+    }
     case "gather": {
-      const payload = node.payload as { dim: number } | undefined;
-      if (!payload) {
-        throw new Error("gather requires dim in payload");
-      }
+      const payload = getPayload<{ dim: number }>(node);
+      if (!payload) throw new Error("gather requires dim in payload");
       return backend.ops.gather(backendInputs[0], backendInputs[1], payload);
     }
-
     case "scatterAdd": {
-      const payload = node.payload as { dim: number } | undefined;
-      if (!payload) {
-        throw new Error("scatterAdd requires dim in payload");
-      }
-      return backend.ops.scatterAdd(
-        backendInputs[0],
-        backendInputs[1],
-        backendInputs[2],
-        payload,
-      );
+      const payload = getPayload<{ dim: number }>(node);
+      if (!payload) throw new Error("scatterAdd requires dim in payload");
+      return backend.ops.scatterAdd(backendInputs[0], backendInputs[1], backendInputs[2], payload);
     }
-
-    case "sum": {
-      const payload = node.payload as
-        | { dim?: number | number[] | null; keepdim?: boolean }
-        | undefined;
-      return backend.ops.sum(backendInputs[0], payload);
-    }
-
-    case "max": {
-      const payload = node.payload as
-        | { dim?: number | number[] | null; keepdim?: boolean }
-        | undefined;
-      return backend.ops.max(backendInputs[0], payload);
-    }
-
-    case "mean": {
-      const payload = node.payload as
-        | { dim?: number | number[] | null; keepdim?: boolean }
-        | undefined;
-      return backend.ops.mean(backendInputs[0], payload);
-    }
-
-    case "argmax": {
-      const payload = node.payload as { dim: number; keepdim?: boolean };
-      if (!backend.ops.argmax)
-        throw new Error("argmax not supported by backend");
-      return backend.ops.argmax(backendInputs[0], payload);
-    }
-
-    case "argmin": {
-      const payload = node.payload as { dim: number; keepdim?: boolean };
-      if (!backend.ops.argmin)
-        throw new Error("argmin not supported by backend");
-      return backend.ops.argmin(backendInputs[0], payload);
-    }
-
     case "gt":
-      if (!backend.ops.gt) throw new Error("gt not supported by backend");
-      return backend.ops.gt(backendInputs[0], backendInputs[1]);
-
+      assertOpSupported("gt", backend.ops.gt);
+      return backend.ops.gt(backendInputs[0], backendInputs[1], donationOpts);
     case "lt":
-      if (!backend.ops.lt) throw new Error("lt not supported by backend");
-      return backend.ops.lt(backendInputs[0], backendInputs[1]);
-
+      assertOpSupported("lt", backend.ops.lt);
+      return backend.ops.lt(backendInputs[0], backendInputs[1], donationOpts);
     case "ge":
-      if (!backend.ops.ge) throw new Error("ge not supported by backend");
-      return backend.ops.ge(backendInputs[0], backendInputs[1]);
-
+      assertOpSupported("ge", backend.ops.ge);
+      return backend.ops.ge(backendInputs[0], backendInputs[1], donationOpts);
     case "le":
-      if (!backend.ops.le) throw new Error("le not supported by backend");
-      return backend.ops.le(backendInputs[0], backendInputs[1]);
-
+      assertOpSupported("le", backend.ops.le);
+      return backend.ops.le(backendInputs[0], backendInputs[1], donationOpts);
     case "eq":
-      if (!backend.ops.eq) throw new Error("eq not supported by backend");
-      return backend.ops.eq(backendInputs[0], backendInputs[1]);
-
+      assertOpSupported("eq", backend.ops.eq);
+      return backend.ops.eq(backendInputs[0], backendInputs[1], donationOpts);
     case "ne":
-      if (!backend.ops.ne) throw new Error("ne not supported by backend");
-      return backend.ops.ne(backendInputs[0], backendInputs[1]);
-
+      assertOpSupported("ne", backend.ops.ne);
+      return backend.ops.ne(backendInputs[0], backendInputs[1], donationOpts);
     case "where":
-      return backend.ops.where(
-        backendInputs[0],
-        backendInputs[1],
-        backendInputs[2],
-      );
+      return backend.ops.where(backendInputs[0], backendInputs[1], backendInputs[2], donationOpts);
+    default:
+      throw new Error(`Unknown reduction op: ${node.op}`);
+  }
+}
 
+function executeMutationOp(
+  node: LazyIRNode, backendInputs: BackendTensor[], backend: Backend,
+): BackendTensor | Promise<BackendTensor> {
+  switch (node.op) {
     case "stridedScatterCopy": {
-      const payload = node.payload as {
-        offset: number;
-        viewShape: number[];
-        viewStrides: number[];
-      };
-      if (!payload) {
-        throw new Error("stridedScatterCopy requires options in payload");
-      }
-      return backend.ops.stridedScatterCopy(
-        backendInputs[0],
-        backendInputs[1],
-        payload,
-      );
+      const payload = getPayload<{ offset: number; viewShape: number[]; viewStrides: number[] }>(node);
+      if (!payload) throw new Error("stridedScatterCopy requires options in payload");
+      return backend.ops.stridedScatterCopy(backendInputs[0], backendInputs[1], payload);
     }
-
     case "stridedScatterAdd": {
-      const payload = node.payload as {
-        offset: number;
-        viewShape: number[];
-        viewStrides: number[];
-      };
-      if (!payload) {
-        throw new Error("stridedScatterAdd requires options in payload");
-      }
-      return backend.ops.stridedScatterAdd(
-        backendInputs[0],
-        backendInputs[1],
-        payload,
-      );
+      const payload = getPayload<{ offset: number; viewShape: number[]; viewStrides: number[] }>(node);
+      if (!payload) throw new Error("stridedScatterAdd requires options in payload");
+      return backend.ops.stridedScatterAdd(backendInputs[0], backendInputs[1], payload);
     }
-
     case "adamStep": {
-      if (!backend.ops.adamStep) throw new Error("adamStep not supported by backend");
-      const adamPayload = node.payload as import("../backend/types").AdamStepConfig;
-      const adamResult = await backend.ops.adamStep(
-        backendInputs[0], backendInputs[1], backendInputs[2], backendInputs[3],
-        adamPayload,
-      );
-      const mStorage3 = createStorageHandle(node.device, adamResult.m);
-      const vStorage3 = createStorageHandle(node.device, adamResult.v);
-      const adamMV3 = { m: mStorage3, v: vStorage3 };
-      storageTracker.markReachable(mStorage3.id, adamMV3);
-      storageTracker.markReachable(vStorage3.id, adamMV3);
-      if (!node._sideOutputs) node._sideOutputs = {};
-      node._sideOutputs.adamMV = adamMV3;
-      return adamResult.param;
+      assertOpSupported("adamStep", backend.ops.adamStep);
+      const payload = getPayload<AdamStepConfig>(node)!;
+      return (async () => {
+        const adamResult = await backend.ops.adamStep!(
+          backendInputs[0], backendInputs[1], backendInputs[2], backendInputs[3], payload,
+        );
+        const mStorage = createStorageHandle(node.device, adamResult.m);
+        const vStorage = createStorageHandle(node.device, adamResult.v);
+        const adamMV = { m: mStorage, v: vStorage };
+        storageTracker.markReachable(mStorage.id, adamMV);
+        storageTracker.markReachable(vStorage.id, adamMV);
+        if (!node._sideOutputs) node._sideOutputs = {};
+        node._sideOutputs.adamMV = adamMV;
+        return adamResult.param;
+      })();
     }
-
     case "unscaleGrad": {
-      const unscalePayload3 = node.payload as { invScale: number; infFlagBuffer: unknown };
-      if (!backend.ops.unscaleGrad) throw new Error("unscaleGrad not supported by backend");
-      return backend.ops.unscaleGrad(
-        backendInputs[0], unscalePayload3.invScale, unscalePayload3.infFlagBuffer,
-      );
+      const payload = getPayload<{ invScale: number; infFlagBuffer: unknown }>(node)!;
+      assertOpSupported("unscaleGrad", backend.ops.unscaleGrad);
+      return backend.ops.unscaleGrad(backendInputs[0], payload.invScale, payload.infFlagBuffer);
     }
+    default:
+      throw new Error(`Unknown mutation op: ${node.op}`);
+  }
+}
 
+function executeFusedOp(
+  node: LazyIRNode, backendInputs: BackendTensor[], backend: Backend,
+): BackendTensor | Promise<BackendTensor> {
+  switch (node.op) {
     case "fusedAttentionForward": {
-      const faPayload3 = node.payload as import("../backend/types").FusedAttentionConfig;
-      if (!backend.ops.fusedAttentionForward) throw new Error("fusedAttentionForward not supported by backend");
-      const faResult3 = backend.ops.fusedAttentionForward(
-        backendInputs[0], backendInputs[1], backendInputs[2], faPayload3,
+      const payload = getPayload<FusedAttentionConfig>(node)!;
+      assertOpSupported("fusedAttentionForward", backend.ops.fusedAttentionForward);
+      const result = backend.ops.fusedAttentionForward(
+        backendInputs[0], backendInputs[1], backendInputs[2], payload,
       );
-      const lseSH3 = createStorageHandle(node.device, faResult3.logsumexp);
-      if (!node._sideOutputs) node._sideOutputs = {};
-      node._sideOutputs.attnLogsumexp = lseSH3;
-      return faResult3.output;
+      storeSideOutput(node, "attnLogsumexp", result.logsumexp);
+      return result.output;
     }
-
-    case "extractAttentionLogsumexp": {
-      const parentFA3 = node.inputs[0].node;
-      const lseSH3 = parentFA3._sideOutputs?.attnLogsumexp;
-      if (!lseSH3) throw new Error("extractAttentionLogsumexp: parent has no attnLogsumexp side output");
-      const lseResult3 = lseSH3.backendTensor;
-      storageTracker.unregister(lseSH3.id);
-      parentFA3._sideOutputs!.attnLogsumexp = undefined;
-      return lseResult3;
-    }
-
+    case "extractAttentionLogsumexp":
+      return extractSideOutput(node, "attnLogsumexp");
     case "fusedAttentionBackward": {
-      const faBwdPayload3 = node.payload as import("../backend/types").FusedAttentionConfig;
-      if (!backend.ops.fusedAttentionBackward) throw new Error("fusedAttentionBackward not supported by backend");
-      const faBwdResult3 = backend.ops.fusedAttentionBackward(
+      const payload = getPayload<FusedAttentionConfig>(node)!;
+      assertOpSupported("fusedAttentionBackward", backend.ops.fusedAttentionBackward);
+      const result = backend.ops.fusedAttentionBackward(
         backendInputs[0], backendInputs[1], backendInputs[2],
-        backendInputs[3], backendInputs[4], backendInputs[5], faBwdPayload3,
+        backendInputs[3], backendInputs[4], backendInputs[5], payload,
       );
-      const dkSH3 = createStorageHandle(node.device, faBwdResult3.dK);
-      const dvSH3 = createStorageHandle(node.device, faBwdResult3.dV);
-      if (!node._sideOutputs) node._sideOutputs = {};
-      node._sideOutputs.attnBwdDK = dkSH3;
-      node._sideOutputs.attnBwdDV = dvSH3;
-      return faBwdResult3.dQ;
+      storeSideOutput(node, "attnBwdDK", result.dK);
+      storeSideOutput(node, "attnBwdDV", result.dV);
+      return result.dQ;
     }
-
-    case "extractAttentionDK": {
-      const parentDK3 = node.inputs[0].node;
-      const dkSH3 = parentDK3._sideOutputs?.attnBwdDK;
-      if (!dkSH3) throw new Error("extractAttentionDK: parent node has no attnBwdDK side output");
-      const dkResult3 = dkSH3.backendTensor;
-      storageTracker.unregister(dkSH3.id);
-      parentDK3._sideOutputs!.attnBwdDK = undefined;
-      return dkResult3;
-    }
-
-    case "extractAttentionDV": {
-      const parentDV3 = node.inputs[0].node;
-      const dvSH3 = parentDV3._sideOutputs?.attnBwdDV;
-      if (!dvSH3) throw new Error("extractAttentionDV: parent node has no attnBwdDV side output");
-      const dvResult3 = dvSH3.backendTensor;
-      storageTracker.unregister(dvSH3.id);
-      parentDV3._sideOutputs!.attnBwdDV = undefined;
-      return dvResult3;
-    }
-
+    case "extractAttentionDK":
+      return extractSideOutput(node, "attnBwdDK");
+    case "extractAttentionDV":
+      return extractSideOutput(node, "attnBwdDV");
     case "fusedCrossEntropyForward": {
-      const cePayload5 = node.payload as import("../backend/types").FusedCrossEntropyConfig;
-      if (!backend.ops.fusedCrossEntropyForward) throw new Error("fusedCrossEntropyForward not supported by backend");
-      return backend.ops.fusedCrossEntropyForward(
-        backendInputs[0], backendInputs[1], cePayload5,
-      );
+      const payload = getPayload<FusedCrossEntropyConfig>(node)!;
+      assertOpSupported("fusedCrossEntropyForward", backend.ops.fusedCrossEntropyForward);
+      return backend.ops.fusedCrossEntropyForward(backendInputs[0], backendInputs[1], payload);
     }
-
     case "fusedCrossEntropyBackward": {
-      const cePayload6 = node.payload as import("../backend/types").FusedCrossEntropyConfig;
-      if (!backend.ops.fusedCrossEntropyBackward) throw new Error("fusedCrossEntropyBackward not supported by backend");
-      return backend.ops.fusedCrossEntropyBackward(
-        backendInputs[0], backendInputs[1], backendInputs[2], cePayload6,
-      );
+      const payload = getPayload<FusedCrossEntropyConfig>(node)!;
+      assertOpSupported("fusedCrossEntropyBackward", backend.ops.fusedCrossEntropyBackward);
+      return backend.ops.fusedCrossEntropyBackward(backendInputs[0], backendInputs[1], backendInputs[2], payload);
     }
-
     case "fusedLayerNormForward": {
-      const lnPayload5 = node.payload as import("../backend/types").FusedLayerNormConfig;
-      if (!backend.ops.fusedLayerNormForward) throw new Error("fusedLayerNormForward not supported by backend");
-      return backend.ops.fusedLayerNormForward(
-        backendInputs[0], backendInputs[1], backendInputs[2], lnPayload5,
-      );
+      const payload = getPayload<FusedLayerNormConfig>(node)!;
+      assertOpSupported("fusedLayerNormForward", backend.ops.fusedLayerNormForward);
+      return backend.ops.fusedLayerNormForward(backendInputs[0], backendInputs[1], backendInputs[2], payload);
     }
-
     case "fusedLayerNormBackwardGradX": {
-      const lnPayload6 = node.payload as import("../backend/types").FusedLayerNormConfig;
-      if (!backend.ops.fusedLayerNormBackwardGradX) throw new Error("fusedLayerNormBackwardGradX not supported by backend");
-      return backend.ops.fusedLayerNormBackwardGradX(
-        backendInputs[0], backendInputs[1], backendInputs[2], lnPayload6,
-      );
+      const payload = getPayload<FusedLayerNormConfig>(node)!;
+      assertOpSupported("fusedLayerNormBackwardGradX", backend.ops.fusedLayerNormBackwardGradX);
+      return backend.ops.fusedLayerNormBackwardGradX(backendInputs[0], backendInputs[1], backendInputs[2], payload);
     }
-
     case "fusedLayerNormBackwardGradWeightBias": {
-      const lnGWBPayload3 = node.payload as import("../backend/types").FusedLayerNormConfig;
-      if (!backend.ops.fusedLayerNormBackwardGradWeightBias) {
-        throw new Error("fusedLayerNormBackwardGradWeightBias not supported by backend");
-      }
-      const gwResult3 = backend.ops.fusedLayerNormBackwardGradWeightBias(
-        backendInputs[0], backendInputs[1], lnGWBPayload3,
+      const payload = getPayload<FusedLayerNormConfig>(node)!;
+      assertOpSupported("fusedLayerNormBackwardGradWeightBias", backend.ops.fusedLayerNormBackwardGradWeightBias);
+      const result = backend.ops.fusedLayerNormBackwardGradWeightBias(
+        backendInputs[0], backendInputs[1], payload,
       );
       // Store raw gradBias BackendTensor for extractLnBwdGradBias
       if (!node._sideOutputs) node._sideOutputs = {};
-      node._sideOutputs.lnBwdGradBias = gwResult3.gradBias;
-      return gwResult3.gradWeight;
+      node._sideOutputs.lnBwdGradBias = result.gradBias;
+      return result.gradWeight;
     }
-
-    case "extractLnBwdGradBias": {
-      const parentNode3 = node.inputs[0].node;
-      const sideOutputBT3 = parentNode3._sideOutputs?.lnBwdGradBias;
-      if (!sideOutputBT3) {
-        throw new Error("extractLnBwdGradBias: parent node has no lnBwdGradBias side output");
-      }
-      parentNode3._sideOutputs!.lnBwdGradBias = undefined;
-      return sideOutputBT3;
-    }
-
+    case "extractLnBwdGradBias":
+      return extractRawSideOutput(node, "lnBwdGradBias");
     case "transfer": {
-      // node.device = target device; payload.sourceDevice or input ref's device = source
-      // backend parameter may be the target device's backend (from getBackend(node.device))
-      // so we resolve source backend from the payload or input ref
-      const transferPayload = node.payload as { sourceDevice?: DeviceKind } | undefined;
+      const transferPayload = getPayload<{ sourceDevice?: DeviceKind }>(node);
       const sourceDevice = transferPayload?.sourceDevice
         ?? (node.inputs[0]?.kind === "materialized" ? node.inputs[0].storage.device : undefined);
       const sourceBackend = sourceDevice ? getBackend(sourceDevice) : backend;
@@ -514,13 +474,60 @@ export async function executeOp(
       const targetBackend = getBackend(node.device);
       if (!targetBackend) throw new Error(`Transfer failed: backend not available for ${node.device}`);
       if (sourceDevice === node.device) return backendInputs[0]; // no-op
-      const data = await sourceBackend.ops.read(backendInputs[0]);
-      return targetBackend.ops.tensorFromArray(data, node.shape);
+      return (async () => {
+        const data = await sourceBackend.ops.read(backendInputs[0]);
+        return targetBackend.ops.tensorFromArray(data, node.shape);
+      })();
     }
-
     default:
-      throw new Error(`Unknown op: ${node.op}`);
+      throw new Error(`Unknown fused op: ${node.op}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Op category sets for fast routing
+// ---------------------------------------------------------------------------
+
+const CREATION_OPS = new Set([
+  "tensorFromArray", "zeros", "full", "arange", "tril", "triu", "rand", "randn", "bernoulli",
+]);
+const UNARY_OPS = new Set([
+  "sqrt", "relu", "exp", "log", "neg", "abs", "tanh", "sigmoid", "gelu", "silu", "isfinite", "pow",
+]);
+const BINARY_OPS = new Set(["add", "sub", "mul", "div", "matmul"]);
+const SHAPE_OPS = new Set([
+  "reshape", "expand", "transpose", "permute", "contiguous", "narrow", "narrowBackward", "cast",
+]);
+const REDUCTION_OPS = new Set([
+  "sum", "max", "mean", "argmax", "argmin", "gather", "scatterAdd",
+  "gt", "lt", "ge", "le", "eq", "ne", "where",
+]);
+const MUTATION_OPS = new Set([
+  "stridedScatterCopy", "stridedScatterAdd", "adamStep", "unscaleGrad",
+]);
+
+/**
+ * Execute a single op on the backend.
+ */
+export async function executeOp(
+  node: LazyIRNode,
+  backendInputs: BackendTensor[],
+  backend: Backend,
+  donationOpts?: { outBuffer: unknown },
+): Promise<BackendTensor> {
+  setCurrentOpLabel(node.op);
+  setProfileModule(node.module ?? "unknown");
+  const _profT0 = profileOpBegin(node.op);
+  try {
+    const op = node.op;
+    if (CREATION_OPS.has(op)) return executeCreationOp(node, backendInputs, backend);
+    if (UNARY_OPS.has(op)) return executeUnaryOp(node, backendInputs, backend, donationOpts);
+    if (BINARY_OPS.has(op)) return executeBinaryOp(node, backendInputs, backend, donationOpts);
+    if (SHAPE_OPS.has(op)) return executeShapeOp(node, backendInputs, backend);
+    if (REDUCTION_OPS.has(op)) return executeReductionOp(node, backendInputs, backend, donationOpts);
+    if (MUTATION_OPS.has(op)) return executeMutationOp(node, backendInputs, backend);
+    // Fused ops and extract ops — no set needed, they're the remainder
+    return executeFusedOp(node, backendInputs, backend);
   } finally {
     profileOpEnd(node.op, _profT0);
     setCurrentOpLabel(null);
