@@ -27,6 +27,7 @@ import {
 import { getSubgroupSupport } from "./matmul/types";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { defineKernel } from "./kernel-factory";
+import { wgslReduce } from "./wgsl-reduce";
 
 // Tiling parameters
 const BR = 64;  // Q rows per workgroup (also workgroup size in scalar mode)
@@ -470,25 +471,13 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   // Compute base offset for this row
   let base = row_idx * D_dim;
 
-  // Each thread accumulates partial dot product
-  var local_sum = 0.0f;
-  for (var d = tid; d < D_dim; d += ${WG}u) {
-    local_sum += dO[base + d] * Out[base + d];
-  }
-
-  sdata[tid] = local_sum;
-  workgroupBarrier();
-
-  // Tree reduction
-  for (var s = ${WG / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] += sdata[tid + s];
-    }
-    workgroupBarrier();
-  }
+${wgslReduce({ wgSize: WG, tid: "tid", dim: "D_dim", loopVar: "d", op: "sum",
+  smem: "sdata", init: "0.0",
+  accumExpr: "dO[base + d] * Out[base + d]", result: "dot_val",
+})}
 
   if (tid == 0u) {
-    D[row_idx] = sdata[0];
+    D[row_idx] = dot_val;
   }
 }
 `;
