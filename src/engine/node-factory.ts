@@ -62,6 +62,32 @@ export function createStorageHandle(
   return storage;
 }
 
+/**
+ * Wrap a backend op result as a StorageHandle, detecting aliased returns.
+ *
+ * Many backend ops (e.g. contiguous on a contiguous tensor) may return the
+ * exact same tensor object as one of their inputs. Creating a separate owning
+ * StorageHandle would double-free the underlying buffer. This helper detects
+ * the alias, marks the result as a non-owning view, and sets the correct
+ * baseStorageId.
+ */
+export function wrapResultAsStorage(
+  device: DeviceKind,
+  resultTensor: BackendTensor,
+  backendInputs: BackendTensor[],
+  inputStorages: StorageHandle[],
+): StorageHandle {
+  const aliasedInputIdx = backendInputs.findIndex(b => b === resultTensor);
+  if (aliasedInputIdx >= 0 && (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
+    resultTensor = { ...resultTensor, ownsBuffer: false } as BackendTensor;
+  }
+  const isView = (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === false;
+  const baseStorageId = isView && inputStorages.length > 0
+    ? inputStorages[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
+    : undefined;
+  return createStorageHandle(device, resultTensor, baseStorageId);
+}
+
 // ============================================================================
 // Lazy-initialized WebGPU imports (avoids circular deps; loaded once on first use)
 // ============================================================================

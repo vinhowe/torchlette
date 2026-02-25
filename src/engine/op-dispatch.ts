@@ -16,6 +16,29 @@ import type { LazyIRNode, LazyRef, StorageHandle } from "./lazy-types";
 import { createStorageHandle } from "./node-factory";
 import { storageTracker } from "./storage-tracker";
 
+/**
+ * Execute a function within a profiling context.
+ *
+ * Sets up the op label and module for profiling, times the execution,
+ * and cleans up after. Handles both sync and async functions.
+ */
+export async function withProfileContext<T>(
+  label: string,
+  module: string | undefined,
+  fn: () => T | Promise<T>,
+): Promise<T> {
+  setCurrentOpLabel(label);
+  setProfileModule(module ?? "unknown");
+  const t0 = profileOpBegin(label);
+  try {
+    return await fn();
+  } finally {
+    profileOpEnd(label, t0);
+    setCurrentOpLabel(null);
+    setProfileModule("unknown");
+  }
+}
+
 /** Extract a StorageHandle side output from a parent node, unregister it, and return the BackendTensor. */
 function extractSideOutput(node: LazyIRNode, key: string): BackendTensor {
   const parent = node.inputs[0].node;

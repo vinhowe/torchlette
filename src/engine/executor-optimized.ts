@@ -28,7 +28,6 @@ import {
 } from "./fusion-detect";
 import {
   analyzeLifetimes,
-  findDeadTensorsAtStep,
   type TensorLifetime,
 } from "./memory-planning";
 import {
@@ -36,8 +35,7 @@ import {
   LoweredPlanBuilder,
 } from "./lowered-plan";
 import type { LazyIRNode, LazyRef, StorageHandle, ExecutionPlan } from "./lazy-types";
-import { createStorageHandle } from "./node-factory";
-import { storageTracker, canSafelyRelease, releaseBufferImmediate } from "./storage-tracker";
+import { storageTracker, releaseDeadTensors } from "./storage-tracker";
 import { getInputStorage } from "./op-dispatch";
 import { extractPlanMetadata, pretunePlanMatmuls } from "./plan-builder";
 import { executePlan } from "./executor-sequential";
@@ -754,22 +752,7 @@ export async function executePlanOptimized(
             nodeToStorage.set(node.id, node.result);
           }
           overallStep++;
-          if (lifetimes && outputNodeIds) {
-            const deadNodeIds = findDeadTensorsAtStep(
-              lifetimes,
-              overallStep,
-              outputNodeIds,
-              alreadyReleased,
-            );
-            for (const deadId of deadNodeIds) {
-              const storage = nodeToStorage.get(deadId);
-              if (storage && canSafelyRelease(storage, nodeToStorage)) {
-                releaseBufferImmediate(storage);
-                nodeToStorage.delete(deadId);
-                alreadyReleased.add(deadId);
-              }
-            }
-          }
+          releaseDeadTensors(lifetimes, overallStep, outputNodeIds, alreadyReleased, nodeToStorage);
         }
       }
       nodesSinceReclaim += segment.group.nodes.length;
