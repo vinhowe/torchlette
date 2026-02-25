@@ -14,7 +14,7 @@
 
 import type { DType } from "../types";
 import type { IRNode } from "../../engine/ir";
-import { dtypeToWgslStorage as dtypeToWgsl } from "./shape-utils";
+import { dtypeToWgslStorage as dtypeToWgsl, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 
 // Import from unified op registry - single source of truth
 import {
@@ -462,9 +462,6 @@ export interface GeneratedKernel {
  * generating the full WGSL source. Used by FusionKernelCache to check cache
  * before doing expensive codegen.
  */
-// Maximum workgroups per dimension in WebGPU (per spec)
-const MAX_WORKGROUPS_PER_DIM = 65535;
-
 export function computeKernelMeta(
   recipe: FusedKernelRecipe,
   options: KernelGenOptions = {},

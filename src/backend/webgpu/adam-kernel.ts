@@ -23,280 +23,37 @@ import {
 import { requireContext } from "./webgpu-state";
 import type { AdamStepConfig } from "../types";
 import { profileSubOpBegin, profileSubOpEnd } from "./profiler";
-import type { GPUBuffer, GPUDevice } from "./gpu-types";
-
-const WORKGROUP_SIZE = 256;
-const MAX_WORKGROUPS_PER_DIM = 65535;
+import type { GPUBuffer, GPUBindGroup, GPUDevice } from "./gpu-types";
+import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 
 // ============================================================================
 // WGSL Shader
 // ============================================================================
 
-function adamStepShader(use2D: boolean, gridSizeX: number, useVec4 = false): string {
-  const idxCompute = use2D
-    ? `let flat_id = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let flat_id = gid.x;`;
-
-  if (useVec4) {
-    return `
-struct AdamConfig {
-  beta1: f32,
-  beta2: f32,
-  step_size: f32,
-  eps: f32,
-  weight_decay: f32,
-  lr_times_wd: f32,
-  decoupled_wd: u32,
-  num_elements: u32,
-};
-
-@group(0) @binding(0) var<storage, read> grad: array<f32>;
-@group(0) @binding(1) var<storage, read_write> param: array<f32>;
-@group(0) @binding(2) var<storage, read_write> m: array<f32>;
-@group(0) @binding(3) var<storage, read_write> v: array<f32>;
-@group(0) @binding(4) var<uniform> config: AdamConfig;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  let base = flat_id * 4u;
-  if (base >= config.num_elements) { return; }
-
-  var g = vec4<f32>(grad[base], grad[base+1u], grad[base+2u], grad[base+3u]);
-  let p = vec4<f32>(param[base], param[base+1u], param[base+2u], param[base+3u]);
-  let m_old = vec4<f32>(m[base], m[base+1u], m[base+2u], m[base+3u]);
-  let v_old = vec4<f32>(v[base], v[base+1u], v[base+2u], v[base+3u]);
-
-  // L2 weight decay (Adam): grad += wd * param
-  if (config.decoupled_wd == 0u && config.weight_decay > 0.0) {
-    g = g + config.weight_decay * p;
-  }
-
-  // Moment updates
-  let m_new = config.beta1 * m_old + (1.0 - config.beta1) * g;
-  let v_new = config.beta2 * v_old + (1.0 - config.beta2) * g * g;
-
-  // Parameter update
-  var p_new = p - config.step_size * m_new / (sqrt(v_new) + vec4<f32>(config.eps));
-
-  // Decoupled weight decay (AdamW): param -= lr * wd * param
-  if (config.decoupled_wd == 1u) {
-    p_new = p_new - config.lr_times_wd * p;
-  }
-
-  param[base] = p_new.x; param[base+1u] = p_new.y;
-  param[base+2u] = p_new.z; param[base+3u] = p_new.w;
-  m[base] = m_new.x; m[base+1u] = m_new.y;
-  m[base+2u] = m_new.z; m[base+3u] = m_new.w;
-  v[base] = v_new.x; v[base+1u] = v_new.y;
-  v[base+2u] = v_new.z; v[base+3u] = v_new.w;
-}
-`;
-  }
-
-  // Scalar path
-  const scalarIdx = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-
-  return `
-struct AdamConfig {
-  beta1: f32,
-  beta2: f32,
-  step_size: f32,
-  eps: f32,
-  weight_decay: f32,
-  lr_times_wd: f32,
-  decoupled_wd: u32,
-  num_elements: u32,
-};
-
-@group(0) @binding(0) var<storage, read> grad: array<f32>;
-@group(0) @binding(1) var<storage, read_write> param: array<f32>;
-@group(0) @binding(2) var<storage, read_write> m: array<f32>;
-@group(0) @binding(3) var<storage, read_write> v: array<f32>;
-@group(0) @binding(4) var<uniform> config: AdamConfig;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${scalarIdx}
-  if (idx >= config.num_elements) { return; }
-
-  var g = grad[idx];
-  let p = param[idx];
-
-  // L2 weight decay (Adam): grad += wd * param
-  if (config.decoupled_wd == 0u && config.weight_decay > 0.0) {
-    g = g + config.weight_decay * p;
-  }
-
-  // Moment updates
-  let m_new = config.beta1 * m[idx] + (1.0 - config.beta1) * g;
-  let v_new = config.beta2 * v[idx] + (1.0 - config.beta2) * g * g;
-
-  // Parameter update
-  var p_new = p - config.step_size * m_new / (sqrt(v_new) + config.eps);
-
-  // Decoupled weight decay (AdamW): param -= lr * wd * param
-  if (config.decoupled_wd == 1u) {
-    p_new = p_new - config.lr_times_wd * p;
-  }
-
-  param[idx] = p_new;
-  m[idx] = m_new;
-  v[idx] = v_new;
-}
-`;
-}
-
 /**
- * F16 variant of the Adam shader. Identical to adamStepShader but with an
- * additional binding 5 (param_f16) that writes the updated param as f16.
- * This allows the forward pass to skip standalone f32→f16 cast ops for AMP weights.
- */
-function adamStepShaderF16(use2D: boolean, gridSizeX: number, useVec4 = false): string {
-  const idxCompute = use2D
-    ? `let flat_id = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let flat_id = gid.x;`;
-
-  if (useVec4) {
-    return `
-enable f16;
-
-struct AdamConfig {
-  beta1: f32,
-  beta2: f32,
-  step_size: f32,
-  eps: f32,
-  weight_decay: f32,
-  lr_times_wd: f32,
-  decoupled_wd: u32,
-  num_elements: u32,
-};
-
-@group(0) @binding(0) var<storage, read> grad: array<f32>;
-@group(0) @binding(1) var<storage, read_write> param: array<f32>;
-@group(0) @binding(2) var<storage, read_write> m: array<f32>;
-@group(0) @binding(3) var<storage, read_write> v: array<f32>;
-@group(0) @binding(4) var<uniform> config: AdamConfig;
-@group(0) @binding(5) var<storage, read_write> param_f16: array<f16>;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  let base = flat_id * 4u;
-  if (base >= config.num_elements) { return; }
-
-  var g = vec4<f32>(grad[base], grad[base+1u], grad[base+2u], grad[base+3u]);
-  let p = vec4<f32>(param[base], param[base+1u], param[base+2u], param[base+3u]);
-  let m_old = vec4<f32>(m[base], m[base+1u], m[base+2u], m[base+3u]);
-  let v_old = vec4<f32>(v[base], v[base+1u], v[base+2u], v[base+3u]);
-
-  // L2 weight decay (Adam): grad += wd * param
-  if (config.decoupled_wd == 0u && config.weight_decay > 0.0) {
-    g = g + config.weight_decay * p;
-  }
-
-  // Moment updates
-  let m_new = config.beta1 * m_old + (1.0 - config.beta1) * g;
-  let v_new = config.beta2 * v_old + (1.0 - config.beta2) * g * g;
-
-  // Parameter update
-  var p_new = p - config.step_size * m_new / (sqrt(v_new) + vec4<f32>(config.eps));
-
-  // Decoupled weight decay (AdamW): param -= lr * wd * param
-  if (config.decoupled_wd == 1u) {
-    p_new = p_new - config.lr_times_wd * p;
-  }
-
-  param[base] = p_new.x; param[base+1u] = p_new.y;
-  param[base+2u] = p_new.z; param[base+3u] = p_new.w;
-  m[base] = m_new.x; m[base+1u] = m_new.y;
-  m[base+2u] = m_new.z; m[base+3u] = m_new.w;
-  v[base] = v_new.x; v[base+1u] = v_new.y;
-  v[base+2u] = v_new.z; v[base+3u] = v_new.w;
-  let p_f16 = vec4<f16>(p_new);
-  param_f16[base] = p_f16.x; param_f16[base+1u] = p_f16.y;
-  param_f16[base+2u] = p_f16.z; param_f16[base+3u] = p_f16.w;
-}
-`;
-  }
-
-  // Scalar path
-  const scalarIdx = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-
-  return `
-enable f16;
-
-struct AdamConfig {
-  beta1: f32,
-  beta2: f32,
-  step_size: f32,
-  eps: f32,
-  weight_decay: f32,
-  lr_times_wd: f32,
-  decoupled_wd: u32,
-  num_elements: u32,
-};
-
-@group(0) @binding(0) var<storage, read> grad: array<f32>;
-@group(0) @binding(1) var<storage, read_write> param: array<f32>;
-@group(0) @binding(2) var<storage, read_write> m: array<f32>;
-@group(0) @binding(3) var<storage, read_write> v: array<f32>;
-@group(0) @binding(4) var<uniform> config: AdamConfig;
-@group(0) @binding(5) var<storage, read_write> param_f16: array<f16>;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${scalarIdx}
-  if (idx >= config.num_elements) { return; }
-
-  var g = grad[idx];
-  let p = param[idx];
-
-  // L2 weight decay (Adam): grad += wd * param
-  if (config.decoupled_wd == 0u && config.weight_decay > 0.0) {
-    g = g + config.weight_decay * p;
-  }
-
-  // Moment updates
-  let m_new = config.beta1 * m[idx] + (1.0 - config.beta1) * g;
-  let v_new = config.beta2 * v[idx] + (1.0 - config.beta2) * g * g;
-
-  // Parameter update
-  var p_new = p - config.step_size * m_new / (sqrt(v_new) + config.eps);
-
-  // Decoupled weight decay (AdamW): param -= lr * wd * param
-  if (config.decoupled_wd == 1u) {
-    p_new = p_new - config.lr_times_wd * p;
-  }
-
-  param[idx] = p_new;
-  m[idx] = m_new;
-  v[idx] = v_new;
-  param_f16[idx] = f16(p_new);
-}
-`;
-}
-
-/**
- * Unscale variant of the Adam shader. Adds gradient unscaling with inv_scale
- * and inf/NaN detection via a shared atomic inf_flag buffer. Non-finite
- * gradients are zeroed before the Adam update.
+ * Unified Adam shader generator. Replaces 4 separate shader functions
+ * (adamStepShader, adamStepShaderF16, adamStepShaderUnscale, adamStepShaderF16Unscale)
+ * × 2 code paths (vec4/scalar) = 8 WGSL string literals with a single function.
  *
- * Binding layout: 0-4 same as base, 5 = inf_flag (atomic u32).
- * Config struct extended with inv_scale field (offset 32).
+ * @param use2D - Use 2D dispatch grid for large buffers
+ * @param gridSizeX - X dimension of dispatch grid
+ * @param useVec4 - Use vec4 coalescing (4 elements per thread)
+ * @param emitF16 - Add param_f16 output binding and write f16 values
+ * @param emitUnscale - Add inv_scale to config, inf_flag binding, and unscale logic
  */
-function adamStepShaderUnscale(use2D: boolean, gridSizeX: number, useVec4 = false): string {
-  const idxCompute = use2D
-    ? `let flat_id = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let flat_id = gid.x;`;
+function adamStepShaderGen(
+  use2D: boolean,
+  gridSizeX: number,
+  useVec4: boolean,
+  emitF16: boolean,
+  emitUnscale: boolean,
+): string {
+  // Preamble: enable f16 if needed
+  const preamble = emitF16 ? "enable f16;\n\n" : "";
 
-  if (useVec4) {
-    return `
-struct AdamConfig {
+  // Config struct: base 8 fields, extended with inv_scale + 3 pads for unscale
+  const configStruct = emitUnscale
+    ? `struct AdamConfig {
   beta1: f32,
   beta2: f32,
   step_size: f32,
@@ -309,22 +66,37 @@ struct AdamConfig {
   _pad0: u32,
   _pad1: u32,
   _pad2: u32,
-};
+};`
+    : `struct AdamConfig {
+  beta1: f32,
+  beta2: f32,
+  step_size: f32,
+  eps: f32,
+  weight_decay: f32,
+  lr_times_wd: f32,
+  decoupled_wd: u32,
+  num_elements: u32,
+};`;
 
-@group(0) @binding(0) var<storage, read> grad: array<f32>;
-@group(0) @binding(1) var<storage, read_write> param: array<f32>;
-@group(0) @binding(2) var<storage, read_write> m: array<f32>;
-@group(0) @binding(3) var<storage, read_write> v: array<f32>;
-@group(0) @binding(4) var<uniform> config: AdamConfig;
-@group(0) @binding(5) var<storage, read_write> inf_flag: array<atomic<u32>>;
+  // Bindings: 0-4 always present
+  let nextBinding = 5;
+  const extraBindings: string[] = [];
+  if (emitF16) {
+    extraBindings.push(`@group(0) @binding(${nextBinding++}) var<storage, read_write> param_f16: array<f16>;`);
+  }
+  if (emitUnscale) {
+    extraBindings.push(`@group(0) @binding(${nextBinding++}) var<storage, read_write> inf_flag: array<atomic<u32>>;`);
+  }
+  const extraBindingsStr = extraBindings.length > 0 ? "\n" + extraBindings.join("\n") : "";
 
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  let base = flat_id * 4u;
-  if (base >= config.num_elements) { return; }
+  if (useVec4) {
+    const idxCompute = use2D
+      ? `let flat_id = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
+      : `let flat_id = gid.x;`;
 
-  // Unscale gradient (vec4)
+    // Unscale preamble for vec4
+    const unscaleLoad = emitUnscale
+      ? `  // Unscale gradient (vec4)
   var g = vec4<f32>(grad[base], grad[base+1u], grad[base+2u], grad[base+3u]) * config.inv_scale;
 
   // Check finite via bit pattern: inf/NaN have all exponent bits set
@@ -334,8 +106,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (is_inf.x || is_inf.y || is_inf.z || is_inf.w) {
     atomicMax(&inf_flag[0], 1065353216u);
   }
-  g = select(g, vec4<f32>(0.0), is_inf);
+  g = select(g, vec4<f32>(0.0), is_inf);`
+      : `  var g = vec4<f32>(grad[base], grad[base+1u], grad[base+2u], grad[base+3u]);`;
 
+    // F16 write for vec4
+    const f16Write = emitF16
+      ? `
+  let p_f16 = vec4<f16>(p_new);
+  param_f16[base] = p_f16.x; param_f16[base+1u] = p_f16.y;
+  param_f16[base+2u] = p_f16.z; param_f16[base+3u] = p_f16.w;`
+      : "";
+
+    return `${preamble}${configStruct}
+
+@group(0) @binding(0) var<storage, read> grad: array<f32>;
+@group(0) @binding(1) var<storage, read_write> param: array<f32>;
+@group(0) @binding(2) var<storage, read_write> m: array<f32>;
+@group(0) @binding(3) var<storage, read_write> v: array<f32>;
+@group(0) @binding(4) var<uniform> config: AdamConfig;${extraBindingsStr}
+
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  ${idxCompute}
+  let base = flat_id * 4u;
+  if (base >= config.num_elements) { return; }
+
+${unscaleLoad}
   let p = vec4<f32>(param[base], param[base+1u], param[base+2u], param[base+3u]);
   let m_old = vec4<f32>(m[base], m[base+1u], m[base+2u], m[base+3u]);
   let v_old = vec4<f32>(v[base], v[base+1u], v[base+2u], v[base+3u]);
@@ -362,7 +158,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   m[base] = m_new.x; m[base+1u] = m_new.y;
   m[base+2u] = m_new.z; m[base+3u] = m_new.w;
   v[base] = v_new.x; v[base+1u] = v_new.y;
-  v[base+2u] = v_new.z; v[base+3u] = v_new.w;
+  v[base+2u] = v_new.z; v[base+3u] = v_new.w;${f16Write}
 }
 `;
   }
@@ -372,35 +168,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
     : `let idx = gid.x;`;
 
-  return `
-struct AdamConfig {
-  beta1: f32,
-  beta2: f32,
-  step_size: f32,
-  eps: f32,
-  weight_decay: f32,
-  lr_times_wd: f32,
-  decoupled_wd: u32,
-  num_elements: u32,
-  inv_scale: f32,
-  _pad0: u32,
-  _pad1: u32,
-  _pad2: u32,
-};
-
-@group(0) @binding(0) var<storage, read> grad: array<f32>;
-@group(0) @binding(1) var<storage, read_write> param: array<f32>;
-@group(0) @binding(2) var<storage, read_write> m: array<f32>;
-@group(0) @binding(3) var<storage, read_write> v: array<f32>;
-@group(0) @binding(4) var<uniform> config: AdamConfig;
-@group(0) @binding(5) var<storage, read_write> inf_flag: array<atomic<u32>>;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${scalarIdx}
-  if (idx >= config.num_elements) { return; }
-
-  // Unscale gradient
+  // Unscale preamble for scalar
+  const unscaleLoadScalar = emitUnscale
+    ? `  // Unscale gradient
   var g = grad[idx] * config.inv_scale;
 
   // Check finite via bit pattern: inf/NaN have all exponent bits set
@@ -412,168 +182,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     g = 0.0;
   }
 
-  let p = param[idx];
+  let p = param[idx];`
+    : `  var g = grad[idx];
+  let p = param[idx];`;
 
-  // L2 weight decay (Adam): grad += wd * param
-  if (config.decoupled_wd == 0u && config.weight_decay > 0.0) {
-    g = g + config.weight_decay * p;
-  }
+  // F16 write for scalar
+  const f16WriteScalar = emitF16 ? "\n  param_f16[idx] = f16(p_new);" : "";
 
-  // Moment updates
-  let m_new = config.beta1 * m[idx] + (1.0 - config.beta1) * g;
-  let v_new = config.beta2 * v[idx] + (1.0 - config.beta2) * g * g;
-
-  // Parameter update
-  var p_new = p - config.step_size * m_new / (sqrt(v_new) + config.eps);
-
-  // Decoupled weight decay (AdamW): param -= lr * wd * param
-  if (config.decoupled_wd == 1u) {
-    p_new = p_new - config.lr_times_wd * p;
-  }
-
-  param[idx] = p_new;
-  m[idx] = m_new;
-  v[idx] = v_new;
-}
-`;
-}
-
-/**
- * F16 + Unscale variant. Combines f16 output, gradient unscaling, and inf detection.
- * Binding layout: 0-4 same as base, 5 = param_f16, 6 = inf_flag.
- */
-function adamStepShaderF16Unscale(use2D: boolean, gridSizeX: number, useVec4 = false): string {
-  const idxCompute = use2D
-    ? `let flat_id = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let flat_id = gid.x;`;
-
-  if (useVec4) {
-    return `
-enable f16;
-
-struct AdamConfig {
-  beta1: f32,
-  beta2: f32,
-  step_size: f32,
-  eps: f32,
-  weight_decay: f32,
-  lr_times_wd: f32,
-  decoupled_wd: u32,
-  num_elements: u32,
-  inv_scale: f32,
-  _pad0: u32,
-  _pad1: u32,
-  _pad2: u32,
-};
+  return `${preamble}${configStruct}
 
 @group(0) @binding(0) var<storage, read> grad: array<f32>;
 @group(0) @binding(1) var<storage, read_write> param: array<f32>;
 @group(0) @binding(2) var<storage, read_write> m: array<f32>;
 @group(0) @binding(3) var<storage, read_write> v: array<f32>;
-@group(0) @binding(4) var<uniform> config: AdamConfig;
-@group(0) @binding(5) var<storage, read_write> param_f16: array<f16>;
-@group(0) @binding(6) var<storage, read_write> inf_flag: array<atomic<u32>>;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  let base = flat_id * 4u;
-  if (base >= config.num_elements) { return; }
-
-  // Unscale gradient (vec4)
-  var g = vec4<f32>(grad[base], grad[base+1u], grad[base+2u], grad[base+3u]) * config.inv_scale;
-
-  // Check finite via bit pattern
-  let bits = bitcast<vec4<u32>>(g);
-  let exponents = (bits >> vec4<u32>(23u)) & vec4<u32>(0xFFu);
-  let is_inf = exponents == vec4<u32>(0xFFu);
-  if (is_inf.x || is_inf.y || is_inf.z || is_inf.w) {
-    atomicMax(&inf_flag[0], 1065353216u);
-  }
-  g = select(g, vec4<f32>(0.0), is_inf);
-
-  let p = vec4<f32>(param[base], param[base+1u], param[base+2u], param[base+3u]);
-  let m_old = vec4<f32>(m[base], m[base+1u], m[base+2u], m[base+3u]);
-  let v_old = vec4<f32>(v[base], v[base+1u], v[base+2u], v[base+3u]);
-
-  // L2 weight decay (Adam): grad += wd * param
-  if (config.decoupled_wd == 0u && config.weight_decay > 0.0) {
-    g = g + config.weight_decay * p;
-  }
-
-  // Moment updates
-  let m_new = config.beta1 * m_old + (1.0 - config.beta1) * g;
-  let v_new = config.beta2 * v_old + (1.0 - config.beta2) * g * g;
-
-  // Parameter update
-  var p_new = p - config.step_size * m_new / (sqrt(v_new) + vec4<f32>(config.eps));
-
-  // Decoupled weight decay (AdamW): param -= lr * wd * param
-  if (config.decoupled_wd == 1u) {
-    p_new = p_new - config.lr_times_wd * p;
-  }
-
-  param[base] = p_new.x; param[base+1u] = p_new.y;
-  param[base+2u] = p_new.z; param[base+3u] = p_new.w;
-  m[base] = m_new.x; m[base+1u] = m_new.y;
-  m[base+2u] = m_new.z; m[base+3u] = m_new.w;
-  v[base] = v_new.x; v[base+1u] = v_new.y;
-  v[base+2u] = v_new.z; v[base+3u] = v_new.w;
-  let p_f16 = vec4<f16>(p_new);
-  param_f16[base] = p_f16.x; param_f16[base+1u] = p_f16.y;
-  param_f16[base+2u] = p_f16.z; param_f16[base+3u] = p_f16.w;
-}
-`;
-  }
-
-  // Scalar path
-  const scalarIdx = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-
-  return `
-enable f16;
-
-struct AdamConfig {
-  beta1: f32,
-  beta2: f32,
-  step_size: f32,
-  eps: f32,
-  weight_decay: f32,
-  lr_times_wd: f32,
-  decoupled_wd: u32,
-  num_elements: u32,
-  inv_scale: f32,
-  _pad0: u32,
-  _pad1: u32,
-  _pad2: u32,
-};
-
-@group(0) @binding(0) var<storage, read> grad: array<f32>;
-@group(0) @binding(1) var<storage, read_write> param: array<f32>;
-@group(0) @binding(2) var<storage, read_write> m: array<f32>;
-@group(0) @binding(3) var<storage, read_write> v: array<f32>;
-@group(0) @binding(4) var<uniform> config: AdamConfig;
-@group(0) @binding(5) var<storage, read_write> param_f16: array<f16>;
-@group(0) @binding(6) var<storage, read_write> inf_flag: array<atomic<u32>>;
+@group(0) @binding(4) var<uniform> config: AdamConfig;${extraBindingsStr}
 
 @compute @workgroup_size(${WORKGROUP_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   ${scalarIdx}
   if (idx >= config.num_elements) { return; }
 
-  // Unscale gradient
-  var g = grad[idx] * config.inv_scale;
-
-  // Check finite via bit pattern
-  let bits = bitcast<u32>(g);
-  let exponent = (bits >> 23u) & 0xFFu;
-  if (exponent == 0xFFu) {
-    atomicMax(&inf_flag[0], 1065353216u);
-    g = 0.0;
-  }
-
-  let p = param[idx];
+${unscaleLoadScalar}
 
   // L2 weight decay (Adam): grad += wd * param
   if (config.decoupled_wd == 0u && config.weight_decay > 0.0) {
@@ -594,8 +223,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   param[idx] = p_new;
   m[idx] = m_new;
-  v[idx] = v_new;
-  param_f16[idx] = f16(p_new);
+  v[idx] = v_new;${f16WriteScalar}
 }
 `;
 }
@@ -755,21 +383,8 @@ export function dispatchAdamStep(
   _st = profileSubOpBegin();
   const vec4Tag = useVec4 ? "Vec4" : "";
   const dimTag = use2D ? `2d:${gridSizeX}` : "1d";
-  let key: string;
-  let code: string;
-  if (doF16 && doUnscale) {
-    key = `adamStepF16Unscale${vec4Tag}:${dimTag}`;
-    code = adamStepShaderF16Unscale(use2D, gridSizeX, useVec4);
-  } else if (doF16) {
-    key = `adamStepF16${vec4Tag}:${dimTag}`;
-    code = adamStepShaderF16(use2D, gridSizeX, useVec4);
-  } else if (doUnscale) {
-    key = `adamStepUnscale${vec4Tag}:${dimTag}`;
-    code = adamStepShaderUnscale(use2D, gridSizeX, useVec4);
-  } else {
-    key = `adamStep${vec4Tag}:${dimTag}`;
-    code = adamStepShader(use2D, gridSizeX, useVec4);
-  }
+  const key = `adamStep${doF16 ? "F16" : ""}${doUnscale ? "Unscale" : ""}${vec4Tag}:${dimTag}`;
+  const code = adamStepShaderGen(use2D, gridSizeX, useVec4, doF16, doUnscale);
   const pipeline = getPipeline(ctx, key, code);
   profileSubOpEnd("adam.pipeline", _st);
 
@@ -821,7 +436,7 @@ export function dispatchAdamStep(
     profileSubOpEnd("adam.entries", _st);
 
     _st = profileSubOpBegin();
-    let bindGroup: any;
+    let bindGroup: GPUBindGroup;
     if (needsChunking) {
       // Chunked: entries have offset/size, cannot cache
       bindGroup = device.createBindGroup({
@@ -873,10 +488,4 @@ export function dispatchAdamStep(
   return result;
 }
 
-/**
- * Reset all module-local mutable state (pipeline cache).
- */
-export function resetAdamKernelState(): void {
-  // Pipelines now managed by shared context (cleared in destroyWebGPU)
-}
 

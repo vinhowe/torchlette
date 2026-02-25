@@ -18,6 +18,7 @@ import type {
   FusedNode,
   FusedOutput,
 } from "../backend/webgpu/fusion-codegen";
+import { isRandomOp } from "./ir-optimize";
 import type { LazyIRNode, LazyRef } from "./lazy";
 
 /**
@@ -72,31 +73,10 @@ const FUSIBLE_OPS = new Set([
 ]);
 
 /**
- * Random ops that break fusion (per §15: "random ops non-CSE").
- */
-const RANDOM_OPS = new Set([
-  "rand",
-  "randn",
-  "randint",
-  "bernoulli",
-  "multinomial",
-  "normal",
-  "uniform",
-  "dropout",
-]);
-
-/**
  * Check if an op can be fused.
  */
 export function isFusibleOp(op: string): boolean {
   return FUSIBLE_OPS.has(op);
-}
-
-/**
- * Check if an op is a random op (breaks fusion).
- */
-export function isRandomOp(op: string): boolean {
-  return RANDOM_OPS.has(op);
 }
 
 /**

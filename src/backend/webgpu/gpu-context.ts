@@ -25,7 +25,6 @@ import { destroyProfilingFenceBuffer } from "./buffer-pool";
 import { resetAttentionKernelState } from "./attention-kernel";
 import { resetLayerNormKernelState } from "./layernorm-kernel";
 import { resetCrossEntropyKernelState } from "./cross-entropy-kernel";
-import { resetAdamKernelState } from "./adam-kernel";
 import { resetMatmulState } from "./matmul";
 import { resetFusionCache } from "./fusion-dispatch";
 
@@ -442,7 +441,6 @@ export function resetAllKernelCaches(): void {
   resetAttentionKernelState();
   resetLayerNormKernelState();
   resetCrossEntropyKernelState();
-  resetAdamKernelState();
   resetUnscaleKernelState();
   resetMatmulState();
   resetFusionCache();

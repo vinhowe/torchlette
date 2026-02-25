@@ -21,8 +21,13 @@ import {
 import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
+import { WORKGROUP_SIZE } from "./shape-utils";
 
-const WORKGROUP_SIZE = 256;
+// Shared WGSL struct for cross-entropy config (8 bytes, 2 fields)
+const WGSL_CE_CONFIG = `struct CEConfig {
+  batch_size: u32,
+  vocab_size: u32,
+};`;
 
 // ============================================================================
 // WGSL Shaders
@@ -30,10 +35,7 @@ const WORKGROUP_SIZE = 256;
 
 function crossEntropyForwardShader(): string {
   return `
-struct CEConfig {
-  batch_size: u32,
-  vocab_size: u32,
-};
+${WGSL_CE_CONFIG}
 
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
 @group(0) @binding(1) var<storage, read> targets: array<f32>;
@@ -93,10 +95,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
 function crossEntropyBackwardShader(): string {
   return `
-struct CEConfig {
-  batch_size: u32,
-  vocab_size: u32,
-};
+${WGSL_CE_CONFIG}
 
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
 @group(0) @binding(1) var<storage, read> targets: array<f32>;
