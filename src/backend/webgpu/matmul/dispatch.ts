@@ -20,6 +20,12 @@ import {
   getKSplitReductionCacheKey,
 } from "./codegen";
 import {
+  generateTiledMatmulShaderTileIR,
+  generateKSplitReductionShaderTileIR,
+} from "./tile-matmul";
+
+const USE_TILE_IR_MATMUL = process.env.TORCHLETTE_TILE_MATMUL === "1";
+import {
   classifyShape,
   DEFAULT_CONFIG,
   type DType,
@@ -465,7 +471,9 @@ function getOrCreatePipeline(
     return cached;
   }
 
-  const shaderCode = generateTiledMatmulShader(options);
+  const shaderCode = USE_TILE_IR_MATMUL
+    ? generateTiledMatmulShaderTileIR(options)
+    : generateTiledMatmulShader(options);
   const module = device.createShaderModule({ code: shaderCode });
   const pipeline = device.createComputePipeline({
     layout: "auto",
@@ -684,7 +692,9 @@ function getOrCreateReductionPipeline(
   const cached = reductionPipelineCache.get(cacheKey);
   if (cached) return cached;
 
-  const shaderCode = generateKSplitReductionShader(kSplitCount, outputDtype);
+  const shaderCode = USE_TILE_IR_MATMUL
+    ? generateKSplitReductionShaderTileIR(kSplitCount, outputDtype)
+    : generateKSplitReductionShader(kSplitCount, outputDtype);
   const module = device.createShaderModule({ code: shaderCode });
   const pipeline = device.createComputePipeline({
     layout: "auto",
