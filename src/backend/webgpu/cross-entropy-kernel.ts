@@ -23,6 +23,10 @@ import { GPUBufferUsage } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
 import { wgslSumReduction, wgslMaxReduction, trackBuffers } from "./wgsl-helpers";
 
+// Pre-allocated typed array views for config buffer writing (avoids per-call allocation)
+const _configData = new Uint32Array(2);
+const _configBytes = new Uint8Array(_configData.buffer);
+
 // Shared WGSL struct for cross-entropy config (8 bytes, 2 fields)
 const WGSL_CE_CONFIG = `struct CEConfig {
   batch_size: u32,
@@ -158,8 +162,9 @@ function getOrCreateConfigBuffer(
     });
     configCache.set(key, buf);
   }
-  const data = new Uint32Array([batchSize, vocabSize]);
-  device.queue.writeBuffer(buf, 0, new Uint8Array(data.buffer));
+  _configData[0] = batchSize;
+  _configData[1] = vocabSize;
+  device.queue.writeBuffer(buf, 0, _configBytes);
   return buf;
 }
 
