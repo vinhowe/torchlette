@@ -291,11 +291,12 @@ class StorageTracker {
     if (!obj) return null;
     // Check if it's a RuntimeTensor (has shape and dtype fields)
     if ('shape' in obj && 'dtype' in obj) {
+      const t = obj as { shape: number[]; dtype: string; disposed?: boolean; _disposed?: boolean };
       return {
-        shape: (obj as any).shape,
-        dtype: (obj as any).dtype,
+        shape: t.shape,
+        dtype: t.dtype,
         type: 'tensor',
-        disposed: (obj as any).disposed ?? (obj as any)._disposed,
+        disposed: t.disposed ?? t._disposed,
       };
     }
     // It's a sideOutputs object or other ref

@@ -105,7 +105,7 @@ export function donateBuffer(
   }
 
   // Check buffer has pool-compatible usage (STORAGE | COPY_SRC | COPY_DST)
-  const bufferUsage = (t.buffer as any).usage ?? 0;
+  const bufferUsage = t.buffer.usage ?? 0;
   if (bufferUsage !== STORAGE_BUFFER_USAGE) {
     return null;
   }
@@ -125,7 +125,7 @@ export function getBufferSize(
   tensor: BackendTensor,
 ): number {
   const t = tensor as WebGPUTensor;
-  return (t.buffer as any).size ?? 0;
+  return t.buffer.size ?? 0;
 }
 
 // ============================================================================

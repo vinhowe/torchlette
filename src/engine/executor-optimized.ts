@@ -1,5 +1,5 @@
 import type { Backend, BackendTensor, DType } from "../backend/types";
-import { gpuBuffer } from "../backend/webgpu/gpu-types";
+import { gpuBuffer, type GPUBuffer } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
 import {
   flushBufferPool,
@@ -295,7 +295,7 @@ export async function executePlanOptimized(
         for (const inp of node.inputs) {
           if (inp.kind === "pending") {
             if (!groupNodeIds.has(inp.node.id) &&
-                !extInputs.some(ei => ei.kind === "pending" && (ei as any).node.id === inp.node.id)) {
+                !extInputs.some(ei => ei.kind === "pending" && ei.node.id === inp.node.id)) {
               extInputs.push(inp);
             }
           } else if (inp.kind === "scalar") {
@@ -458,7 +458,7 @@ export async function executePlanOptimized(
             if (castInput.kind === "pending") {
               fromDtype = castInput.node.dtype;
             } else if (castInput.kind === "materialized") {
-              fromDtype = (castInput.storage.backendTensor as any).dtype ?? "f32";
+              fromDtype = castInput.storage.backendTensor.dtype ?? "f32";
             } else {
               continue;
             }
@@ -697,7 +697,7 @@ export async function executePlanOptimized(
   if (useArenaFallback) {
     setActiveArena(cachedTemplate!.bufferArena!);
     // Register external input buffers for arena conflict detection
-    const extBufs: any[] = [];
+    const extBufs: GPUBuffer[] = [];
     for (const node of planNodes) {
       for (const ref of node.inputs) {
         if (ref.kind === "materialized") {

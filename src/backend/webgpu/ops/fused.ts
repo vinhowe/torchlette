@@ -130,7 +130,7 @@ export async function adamStep(
     }
 
     const emitF16 = config.emitF16 ?? false;
-    const infFlagBuf = (config.infFlagBuffer as any) ?? null;
+    const infFlagBuf = (config.infFlagBuffer as GPUBuffer | null) ?? null;
     const numElements = gradT.size;
 
     const result = dispatchAdamStepKernel(
@@ -204,7 +204,7 @@ export function unscaleGrad(
     gradT.buffer,
     numElements,
     invScale,
-    infFlagBuffer as any,
+    infFlagBuffer as GPUBuffer,
   );
   // Destroy contiguous copy if one was created (deferred for GPU fence)
   if (gradT !== (grad as WebGPUTensor)) {

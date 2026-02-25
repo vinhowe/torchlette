@@ -1,4 +1,5 @@
 import type { Backend, BackendTensor, DType } from "../backend/types";
+import { asGPUTensor, type GPUBuffer, type WebGPUTensor } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
 import {
   flushBufferPool,
@@ -52,7 +53,7 @@ export async function executeFusedSegment(
     await executeFusedWebGPU(
       group,
       recipe,
-      backend as any,
+      backend as Backend & { device?: { limits?: { maxStorageBuffersPerShaderStage?: number } } },
       enableVectorization,
     );
     return;
@@ -101,7 +102,7 @@ export async function executeFusedWebGPU(
   }
 
   // Prepare inputs from external refs, skipping inlined constants
-  const inputs: Array<{ buffer: unknown; shape: number[]; dtype: DType }> = [];
+  const inputs: Array<{ buffer: GPUBuffer; shape: number[]; dtype: DType }> = [];
   const tempContiguousCopies: Array<{ destroy?: () => void }> = [];
   for (let inputIdx = 0; inputIdx < group.externalInputs.length; inputIdx++) {
     // Skip inlined constants — their values are baked into the shader
@@ -127,12 +128,12 @@ export async function executeFusedWebGPU(
       return;
     }
 
-    const tensor = storage.backendTensor as any;
+    const tensor = asGPUTensor(storage.backendTensor);
     // Fusion requires contiguous inputs — strided/offset layouts not supported by codegen
     if (tensor.isContiguous === false || (tensor.offset != null && tensor.offset > 0)) {
       // Auto-materialize to contiguous rather than abandoning fusion
       if (backend.ops.contiguous) {
-        const contig = backend.ops.contiguous(tensor) as any;
+        const contig = asGPUTensor(backend.ops.contiguous(tensor));
         tempContiguousCopies.push(contig);
         inputs.push({
           buffer: contig.buffer,
@@ -158,7 +159,7 @@ export async function executeFusedWebGPU(
   // Check if any input buffer exceeds maxStorageBufferBindingSize
   const maxBindingSize = device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const hasOversizedBuffer = inputs.some(
-    (inp) => (inp.buffer as { size?: number }).size! > maxBindingSize,
+    (inp) => inp.buffer.size > maxBindingSize,
   );
   if (hasOversizedBuffer) {
     recordFusionFallback("oversized_buffer", group.nodes.length, { maxBindingSize });
@@ -170,7 +171,7 @@ export async function executeFusedWebGPU(
     // Set module context for profiling from the output node
     setProfileModule(group.outputNode.module ?? "unknown");
     // Dispatch the fused kernel
-    const result = dispatchFusedKernel(device, recipe, inputs as any, {
+    const result = dispatchFusedKernel(device, recipe, inputs, {
       vectorize: enableVectorization,
     });
 

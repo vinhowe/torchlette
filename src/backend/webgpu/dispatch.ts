@@ -847,7 +847,7 @@ export function dispatchMatmul(
   const outSize = outShape.reduce((acc, dim) => acc * dim, 1);
   const requiredSize = outSize * bytesPerElement;
   const useDonated =
-    donatedBuffer && (donatedBuffer as any).size >= requiredSize;
+    donatedBuffer && donatedBuffer.size >= requiredSize;
   const outBuffer = useDonated
     ? donatedBuffer
     : resolveOutputBuffer(ctx.device, requiredSize,
