@@ -22,33 +22,13 @@ import {
 } from "./index";
 import type { AdamStepConfig } from "../types";
 import { profileSubOpBegin, profileSubOpEnd } from "./profiler";
-import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
+import { defineKernel } from "./kernel-factory";
+import type { GPUBuffer, GPUDevice } from "./gpu-types";
 
 const WORKGROUP_SIZE = 256;
 const MAX_WORKGROUPS_PER_DIM = 65535;
 
-// ============================================================================
-// Pipeline Cache
-// ============================================================================
-
-const pipelineCache = new Map<string, GPUComputePipeline>();
-
-function getOrCreatePipeline(
-  device: GPUDevice,
-  key: string,
-  code: string,
-): GPUComputePipeline {
-  let pipeline = pipelineCache.get(key);
-  if (!pipeline) {
-    const module = device.createShaderModule({ code });
-    pipeline = device.createComputePipeline({
-      layout: "auto",
-      compute: { module, entryPoint: "main" },
-    });
-    pipelineCache.set(key, pipeline);
-  }
-  return pipeline;
-}
+const kernel = defineKernel("adam");
 
 // ============================================================================
 // WGSL Shader
@@ -792,7 +772,7 @@ export function dispatchAdamStep(
     key = `adamStep${vec4Tag}:${dimTag}`;
     code = adamStepShader(use2D, gridSizeX, useVec4);
   }
-  const pipeline = getOrCreatePipeline(device, key, code);
+  const pipeline = kernel.getPipeline(device, key, () => code);
   profileSubOpEnd("adam.pipeline", _st);
 
   for (let chunk = 0; chunk < numChunks; chunk++) {
@@ -899,6 +879,6 @@ export function dispatchAdamStep(
  * Reset all module-local mutable state (pipeline cache).
  */
 export function resetAdamKernelState(): void {
-  pipelineCache.clear();
+  kernel.reset();
 }
 
