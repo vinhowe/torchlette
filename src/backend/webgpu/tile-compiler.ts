@@ -107,6 +107,7 @@ function getChildren(node: IRNode): IRNode[] {
     case "binary": return [node.lhs, node.rhs];
     case "unary": return [node.input];
     case "cast": return [node.input];
+    case "bitcast": return [node.input];
     case "reduce": return [node.input];
     case "load": return [node.offsets];
     case "store": return [node.offsets, node.values];
@@ -115,12 +116,14 @@ function getChildren(node: IRNode): IRNode[] {
     case "cmp": return [node.lhs, node.rhs];
     case "sharedRead": return [node.idx];
     case "arrayRead": return [node.idx];
+    case "subgroupShuffleXor": return [node.value, node.mask];
     case "programId":
     case "uniform":
     case "const":
     case "threadIdx":
     case "localIndex":
     case "namedRef":
+    case "globalId":
       return [];
   }
 }
@@ -128,6 +131,9 @@ function getChildren(node: IRNode): IRNode[] {
 /** Find the first blockRange node reachable from root (not crossing reduces). */
 function findBlockRange(node: IRNode): BlockRangeNode | null {
   if (node.kind === "blockRange") return node;
+  // Don't descend into reduce nodes — they turn block→scalar,
+  // so blockRanges in their inputs don't define the store's loop.
+  if (node.kind === "reduce") return null;
   for (const child of getChildren(node)) {
     const found = findBlockRange(child);
     if (found) return found;
@@ -323,7 +329,10 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
         case "mul": return `(${lhs} * ${rhs})`;
         case "div": return `(${lhs} / ${rhs})`;
         case "mod": return `(${lhs} % ${rhs})`;
-        case "and": return `(${lhs} && ${rhs})`;
+        case "and": return `(${lhs} & ${rhs})`;
+        case "or": return `(${lhs} | ${rhs})`;
+        case "shr": return `(${lhs} >> ${rhs})`;
+        case "shl": return `(${lhs} << ${rhs})`;
         case "min": return `min(${lhs}, ${rhs})`;
         case "max": return `max(${lhs}, ${rhs})`;
       }
@@ -347,6 +356,10 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
     case "cast": {
       const input = exprFor(node.input, bindings, loopVar);
       return `${node.targetType}(${input})`;
+    }
+    case "bitcast": {
+      const input = exprFor(node.input, bindings, loopVar);
+      return `bitcast<${node.targetType}>(${input})`;
     }
     case "select": {
       const cond = exprFor(node.condition, bindings, loopVar);
@@ -373,6 +386,14 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
     }
     case "namedRef": {
       return node.name;
+    }
+    case "globalId": {
+      return `gid.${(["x", "y", "z"] as const)[node.dim]}`;
+    }
+    case "subgroupShuffleXor": {
+      const val = exprFor(node.value, bindings, loopVar);
+      const mask = exprFor(node.mask, bindings, loopVar);
+      return `subgroupShuffleXor(${val}, ${mask})`;
     }
     case "arrayRead": {
       const idx = exprFor(node.idx, bindings, loopVar);
@@ -489,9 +510,14 @@ function compileAutoPhaseKernel(spec: TileKernelSpec, ctx: KernelContext): strin
 
   const lines: string[] = [];
 
-  // f16 enable
+  // Feature enables
   if (spec.enableF16) {
     lines.push("enable f16;");
+  }
+  if (spec.enableSubgroups) {
+    lines.push("enable subgroups;");
+  }
+  if (spec.enableF16 || spec.enableSubgroups) {
     lines.push("");
   }
 
@@ -540,9 +566,14 @@ function compileAutoPhaseKernel(spec: TileKernelSpec, ctx: KernelContext): strin
 function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overrideStatements?: Statement[]): string {
   const lines: string[] = [];
 
-  // f16 enable
+  // Feature enables
   if (spec.enableF16) {
     lines.push("enable f16;");
+  }
+  if (spec.enableSubgroups) {
+    lines.push("enable subgroups;");
+  }
+  if (spec.enableF16 || spec.enableSubgroups) {
     lines.push("");
   }
 
@@ -579,18 +610,58 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
     ? [spec.workgroupSize, 1]
     : spec.workgroupSize;
 
+  // Scan nodes to determine which builtins are actually used
+  const needsGid = ctx.nodes.some(n => n.kind === "globalId");
+  const needsWid = ctx.nodes.some(n => n.kind === "programId");
+  const needsLocalId = ctx.nodes.some(n => n.kind === "threadIdx");
+  const needsLocalIdx = ctx.nodes.some(n => n.kind === "localIndex");
+  // Shared arrays and tile-level stmts require local_id/local_idx even if not explicitly referenced
+  const hasTileOps = ctx.sharedArrays.length > 0 ||
+    ctx.statements.some(s => s.kind === "tileLoad" || s.kind === "dot" || s.kind === "tileStore" || s.kind === "tileLoad1d" || s.kind === "accOp");
+  const emitWid = needsWid || hasTileOps;
+  const emitLocalId = needsLocalId || hasTileOps;
+  const emitLocalIdx = needsLocalIdx || hasTileOps;
+
   lines.push(`@compute @workgroup_size(${wgX}, ${wgY})`);
   lines.push(`fn main(`);
-  lines.push(`  @builtin(workgroup_id) wid: vec3<u32>,`);
-  lines.push(`  @builtin(local_invocation_id) local_id: vec3<u32>,`);
-  lines.push(`  @builtin(local_invocation_index) local_idx: u32,`);
+  const params: string[] = [];
+  if (needsGid)    params.push(`  @builtin(global_invocation_id) gid: vec3<u32>`);
+  if (emitWid)     params.push(`  @builtin(workgroup_id) wid: vec3<u32>`);
+  if (emitLocalId) params.push(`  @builtin(local_invocation_id) local_id: vec3<u32>`);
+  if (emitLocalIdx) params.push(`  @builtin(local_invocation_index) local_idx: u32`);
+  lines.push(params.join(",\n") + (params.length > 0 ? "," : ""));
   lines.push(`) {`);
 
   // Emit all statements
   const bindings: BindingMap = new Map();
   const stmts = overrideStatements ?? ctx.statements;
-  for (const stmt of stmts) {
-    emitStatement(stmt, bindings, lines, 1);
+
+  if (spec.vectorize && spec.vectorize > 1) {
+    // Auto-vectorization: unroll body VEC_WIDTH times
+    const vecWidth = spec.vectorize;
+
+    // Find all globalId(0) node IDs to override
+    const gidXNodes = ctx.nodes.filter(n => n.kind === "globalId" && n.dim === 0);
+
+    lines.push(`  let _base = gid.x * ${vecWidth}u;`);
+
+    for (let v = 0; v < vecWidth; v++) {
+      lines.push(`  // vec element ${v}`);
+      lines.push(`  {`);
+      // Override globalId(0) → (_base + v)
+      const vecBindings = new Map(bindings);
+      for (const n of gidXNodes) {
+        vecBindings.set(n.id, `(_base + ${v}u)`);
+      }
+      for (const stmt of stmts) {
+        emitStatement(stmt, vecBindings, lines, 2);
+      }
+      lines.push(`  }`);
+    }
+  } else {
+    for (const stmt of stmts) {
+      emitStatement(stmt, bindings, lines, 1);
+    }
   }
 
   lines.push(`}`);
@@ -697,6 +768,19 @@ function emitStatement(
       lines.push(`${indent}if (${cond}) {`);
       lines.push(`${indent}  ${stmt.binding}[${idx}] = ${val};`);
       lines.push(`${indent}}`);
+      break;
+    }
+    case "atomicOp": {
+      const idx = exprFor(stmt.idx, bindings, null);
+      const val = exprFor(stmt.value, bindings, null);
+      const fnName = {
+        max: "atomicMax",
+        min: "atomicMin",
+        add: "atomicAdd",
+        or: "atomicOr",
+        and: "atomicAnd",
+      }[stmt.op];
+      lines.push(`${indent}${fnName}(&${stmt.binding}[${idx}], ${val});`);
       break;
     }
   }
@@ -902,42 +986,72 @@ function emitStoreLoop(
   wgSize: number,
   lines: string[],
 ): void {
-  const rangeNode = findBlockRange(stores[0]);
-  if (!rangeNode) {
-    throw new Error("Store has no blockRange in dependency tree");
-  }
-  const dimExpr = exprFor(rangeNode.extent, bindings, null);
-
-  lines.push("");
-  lines.push(`  for (var i = tid; i < ${dimExpr}; i += ${wgSize}u) {`);
-
-  // Collect all block nodes needed by stores, stopping at reduce boundaries
-  const loopBindings = new Map(bindings);
+  // Partition stores: scalar (no blockRange) vs block (has blockRange)
+  const scalarStores: StoreNode[] = [];
+  const blockGroups = new Map<number, StoreNode[]>(); // grouped by blockRange extent node ID
 
   for (const store of stores) {
-    // Walk store value tree, stopping at reduces
-    const subtree = collectSubtreeStopAtReduce(store.values);
-    const blockNodes = subtree.filter(
-      n => n.valueType === "block"
-        && n.kind !== "blockRange"
-        && n.kind !== "load"
-        && !loopBindings.has(n.id),
-    );
-
-    for (const node of blockNodes) {
-      if (loopBindings.has(node.id)) continue;
-      const expr = exprFor(node, loopBindings, "i");
-      const name = freshVar("v");
-      lines.push(`    let ${name} = ${expr};`);
-      loopBindings.set(node.id, name);
+    const rangeNode = findBlockRange(store);
+    if (!rangeNode) {
+      scalarStores.push(store);
+    } else {
+      const key = rangeNode.extent.id;
+      let group = blockGroups.get(key);
+      if (!group) {
+        group = [];
+        blockGroups.set(key, group);
+      }
+      group.push(store);
     }
-
-    const offs = exprFor(store.offsets, loopBindings, "i");
-    const vals = exprFor(store.values, loopBindings, "i");
-    lines.push(`    ${store.binding}[${offs}] = ${vals};`);
   }
 
-  lines.push(`  }`);
+  // Emit scalar stores: thread 0 only
+  if (scalarStores.length > 0) {
+    lines.push("");
+    lines.push(`  if (tid == 0u) {`);
+    for (const store of scalarStores) {
+      const offs = exprFor(store.offsets, bindings, null);
+      const vals = exprFor(store.values, bindings, null);
+      lines.push(`    ${store.binding}[${offs}] = ${vals};`);
+    }
+    lines.push(`  }`);
+  }
+
+  // Emit one strided loop per block group
+  for (const [, groupStores] of blockGroups) {
+    const rangeNode = findBlockRange(groupStores[0])!;
+    const dimExpr = exprFor(rangeNode.extent, bindings, null);
+
+    lines.push("");
+    lines.push(`  for (var i = tid; i < ${dimExpr}; i += ${wgSize}u) {`);
+
+    const loopBindings = new Map(bindings);
+
+    for (const store of groupStores) {
+      // Walk store value tree, stopping at reduces
+      const subtree = collectSubtreeStopAtReduce(store.values);
+      const blockNodes = subtree.filter(
+        n => n.valueType === "block"
+          && n.kind !== "blockRange"
+          && n.kind !== "load"
+          && !loopBindings.has(n.id),
+      );
+
+      for (const node of blockNodes) {
+        if (loopBindings.has(node.id)) continue;
+        const expr = exprFor(node, loopBindings, "i");
+        const name = freshVar("v");
+        lines.push(`    let ${name} = ${expr};`);
+        loopBindings.set(node.id, name);
+      }
+
+      const offs = exprFor(store.offsets, loopBindings, "i");
+      const vals = exprFor(store.values, loopBindings, "i");
+      lines.push(`    ${store.binding}[${offs}] = ${vals};`);
+    }
+
+    lines.push(`  }`);
+  }
 }
 
 // ============================================================================
@@ -970,9 +1084,13 @@ function emitBindings(spec: TileKernelSpec): string[] {
       bindingIndex++;
     }
     const [name, binding] = entries[i];
-    const access = binding.storage === "read" ? "read" : "read_write";
-    const wgslType = binding.type;
-    lines.push(`@group(0) @binding(${bindingIndex}) var<storage, ${access}> ${name}: array<${wgslType}>;`);
+    if (binding.storage === "atomic") {
+      // Atomic bindings use array<atomic<T>>
+      lines.push(`@group(0) @binding(${bindingIndex}) var<storage, read_write> ${name}: array<atomic<${binding.type}>>;`);
+    } else {
+      const access = binding.storage === "read" ? "read" : "read_write";
+      lines.push(`@group(0) @binding(${bindingIndex}) var<storage, ${access}> ${name}: array<${binding.type}>;`);
+    }
     bindingIndex++;
   }
 

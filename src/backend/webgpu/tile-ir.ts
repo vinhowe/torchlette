@@ -55,7 +55,7 @@
 
 export type ValueType = "block" | "scalar";
 export type DataType = "f32" | "f16" | "u32" | "i32";
-export type BinaryOp = "add" | "sub" | "mul" | "div" | "mod" | "and" | "min" | "max";
+export type BinaryOp = "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "shr" | "shl" | "min" | "max";
 export type UnaryOp = "rsqrt" | "exp" | "log" | "abs" | "neg" | "sqrt" | "tanh" | "floor" | "ceil" | "not";
 export type ReduceOp = "sum" | "max";
 export type CmpOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
@@ -138,6 +138,12 @@ export interface CmpNode extends IRNodeBase {
   rhs: IRNode;
 }
 
+export interface BitcastNode extends IRNodeBase {
+  kind: "bitcast";
+  input: IRNode;
+  targetType: DataType;
+}
+
 // -- Imperative mode nodes --
 
 export interface ThreadIdxNode extends IRNodeBase {
@@ -166,6 +172,17 @@ export interface ArrayReadNode extends IRNodeBase {
   idx: IRNode;
 }
 
+export interface GlobalIdNode extends IRNodeBase {
+  kind: "globalId";
+  dim: number; // 0=x, 1=y, 2=z
+}
+
+export interface SubgroupShuffleXorNode extends IRNodeBase {
+  kind: "subgroupShuffleXor";
+  value: IRNode;
+  mask: IRNode;
+}
+
 export type IRNode =
   | ProgramIdNode
   | BlockRangeNode
@@ -179,11 +196,14 @@ export type IRNode =
   | CastNode
   | SelectNode
   | CmpNode
+  | BitcastNode
   | ThreadIdxNode
   | LocalIndexNode
   | SharedReadNode
   | NamedRefNode
-  | ArrayReadNode;
+  | ArrayReadNode
+  | GlobalIdNode
+  | SubgroupShuffleXorNode;
 
 // ============================================================================
 // Tile-Level IR Types (block-level, compiler-lowered)
@@ -286,6 +306,7 @@ export type Statement =
   | BarrierStmt
   | SharedWriteStmt
   | GuardedStoreStmt
+  | AtomicOpStmt
   // Tile-level statements (lowered by tile compiler)
   | TileLoadStmt
   | DotStmt
@@ -378,6 +399,16 @@ export interface GuardedStoreStmt {
   binding: string;
   condition: IRNode;
   idx: IRNode;
+  value: IRNode;
+}
+
+export type AtomicOp = "max" | "min" | "add" | "or" | "and";
+
+export interface AtomicOpStmt {
+  kind: "atomicOp";
+  binding: string;
+  idx: IRNode;
+  op: AtomicOp;
   value: IRNode;
 }
 
@@ -497,6 +528,36 @@ export class BlockExpr {
     }));
   }
 
+  or(other: BlockExpr | number): BlockExpr {
+    const rhs = resolveArg(other);
+    return new BlockExpr(makeNode<BinaryNode>({
+      kind: "binary", op: "or",
+      lhs: this.node, rhs,
+      valueType: promoteValueType(this.node.valueType, rhs.valueType),
+      dataType: "u32",
+    }));
+  }
+
+  shr(other: BlockExpr | number): BlockExpr {
+    const rhs = resolveArg(other);
+    return new BlockExpr(makeNode<BinaryNode>({
+      kind: "binary", op: "shr",
+      lhs: this.node, rhs,
+      valueType: promoteValueType(this.node.valueType, rhs.valueType),
+      dataType: this.node.dataType,
+    }));
+  }
+
+  shl(other: BlockExpr | number): BlockExpr {
+    const rhs = resolveArg(other);
+    return new BlockExpr(makeNode<BinaryNode>({
+      kind: "binary", op: "shl",
+      lhs: this.node, rhs,
+      valueType: promoteValueType(this.node.valueType, rhs.valueType),
+      dataType: this.node.dataType,
+    }));
+  }
+
   // -- Unary math --
   rsqrt(): BlockExpr {
     return new BlockExpr(makeNode<UnaryNode>({
@@ -591,6 +652,23 @@ export class BlockExpr {
     return new BlockExpr(makeNode<CastNode>({
       kind: "cast", input: this.node, targetType: "f16",
       valueType: this.node.valueType, dataType: "f16",
+    }));
+  }
+
+  // -- Bitcast (reinterpret bits, no conversion) --
+  bitcastTo(dtype: DataType): BlockExpr {
+    return new BlockExpr(makeNode<BitcastNode>({
+      kind: "bitcast", input: this.node, targetType: dtype,
+      valueType: this.node.valueType, dataType: dtype,
+    }));
+  }
+
+  // -- Subgroup ops --
+  subgroupShuffleXor(mask: BlockExpr | number): BlockExpr {
+    const m = resolveArg(mask);
+    return new BlockExpr(makeNode<SubgroupShuffleXorNode>({
+      kind: "subgroupShuffleXor", value: this.node, mask: m,
+      valueType: this.node.valueType, dataType: this.node.dataType,
     }));
   }
 
@@ -898,6 +976,14 @@ export class KernelContext {
     })));
   }
 
+  /** Global invocation ID (global_invocation_id.x/y/z). */
+  globalId(dim: number): BlockExpr {
+    return new BlockExpr(this.trackNode(makeNode<GlobalIdNode>({
+      kind: "globalId", dim,
+      valueType: "scalar", dataType: "u32",
+    })));
+  }
+
   /** Declare a workgroup shared memory array. Returns a handle for read/write. */
   sharedArray(name: string, size: number, elemType: DataType = "f32"): SharedArrayHandle {
     this.sharedArrays.push({ name, size, elemType });
@@ -1009,6 +1095,17 @@ export class KernelContext {
     return captured;
   }
 
+  /** Emit an atomic operation: `atomicMax(&binding[idx], val)` etc. */
+  atomicOp(binding: string, idx: BlockExpr, op: AtomicOp, val: BlockExpr): void {
+    this.pushStatement({
+      kind: "atomicOp",
+      binding,
+      idx: idx.node,
+      op,
+      value: val.node,
+    });
+  }
+
   /** Emit a guarded store: `if (cond) { binding[idx] = val; }`. */
   guardedStore(binding: string, cond: BlockExpr, idx: BlockExpr, val: BlockExpr): void {
     this.pushStatement({
@@ -1026,7 +1123,7 @@ export class KernelContext {
 // ============================================================================
 
 export interface BindingSpec {
-  storage: "read" | "read_write";
+  storage: "read" | "read_write" | "atomic";
   type: DataType;
 }
 
@@ -1042,6 +1139,13 @@ export interface TileKernelSpec {
   constants?: Record<string, number>;
   /** Whether to emit `enable f16;`. */
   enableF16?: boolean;
+  /** Whether to emit `enable subgroups;`. */
+  enableSubgroups?: boolean;
+  /** Auto-vectorization width for elementwise kernels. When set (e.g., 4),
+   *  each thread processes `vectorize` elements. GlobalId(0) is replaced with
+   *  `gid.x * vectorize + offset` and the body is unrolled. Grid must be
+   *  adjusted by the caller: `ceil(N / (workgroupSize * vectorize))`. */
+  vectorize?: number;
   /** Binding index for the uniform struct. If set, uniform is inserted at this
    *  index among the storage bindings (e.g. 3 means after 3 storage bindings).
    *  If unset, uniform is appended after all storage bindings. */
