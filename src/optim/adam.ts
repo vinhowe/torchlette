@@ -3,6 +3,7 @@ import type { RuntimeTensor } from "../engine";
 import type { LazyIRNode } from "../engine/lazy";
 import { createLazyIRNode, createPendingRef } from "../engine/lazy";
 import type { Tensor, Torchlette } from "../frontend";
+import { validateOptimizerParams } from "./validate";
 
 export type AdamOptions = {
   lr: number;
@@ -32,24 +33,7 @@ export class Adam {
   private _pendingUnscale: { invScale: number; infFlagBuffer: unknown } | null = null;
 
   constructor(params: Tensor[], options: AdamOptions, api?: Torchlette) {
-    if (params.length === 0) {
-      throw new Error("Adam requires at least one parameter");
-    }
-    const engine = api ?? params[0]._engine();
-    const device = params[0].device;
-    for (const param of params) {
-      if (param._engine() !== engine) {
-        throw new Error(
-          "Adam parameters must share the same Torchlette instance",
-        );
-      }
-      if (param.device !== device) {
-        throw new Error("Adam parameters must share the same device");
-      }
-      if (!param.requiresGrad) {
-        throw new Error("Adam parameters must have requiresGrad=true");
-      }
-    }
+    const { api: engine, device } = validateOptimizerParams("Adam", params, api);
     if (options.lr <= 0) {
       throw new Error("Adam learning rate must be > 0");
     }

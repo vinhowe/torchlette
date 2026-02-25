@@ -1,4 +1,4 @@
-import type { Backend, BackendTensor, DType } from "../backend/types";
+import type { AdamStepConfig, Backend, BackendTensor, DType } from "../backend/types";
 import { gpuBuffer, asGPUTensor, type GPUBuffer } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
 import {
@@ -48,6 +48,51 @@ import { executeMatmulWithEpilogue, _detectTransposeView, shapesEqual } from "./
 import type { ReductionPreamblePlan } from "./reduction-preamble";
 import { executeReductionWithPreamble } from "./reduction-preamble";
 import type { OptimizedExecutionStats, OptimizedExecutionResult } from "./executor-optimized";
+
+type AdamStepFn = NonNullable<import("../backend/types").Backend["ops"]["adamStep"]>;
+
+/**
+ * Execute a batch of adamStep nodes using a direct adamOp call (bypasses executeOp switch).
+ * Shared by both the lowered-plan replay path and the normal lowered plan execution path.
+ */
+async function executeAdamBatchInner(
+  planNodes: LazyIRNode[],
+  nodeIndices: number[],
+  adamOp: AdamStepFn,
+  getStorage: (ref: LazyRef) => StorageHandle,
+): Promise<void> {
+  for (const nodeIdx of nodeIndices) {
+    const adamNode = planNodes[nodeIdx];
+    if (adamNode.result) continue;
+    const inputs = adamNode.inputs;
+    const s0 = getStorage(inputs[0]);
+    const s1 = getStorage(inputs[1]);
+    const s2 = getStorage(inputs[2]);
+    const s3 = getStorage(inputs[3]);
+    const adamPayload = adamNode.payload as AdamStepConfig;
+    const adamResult = await adamOp(
+      s0.backendTensor, s1.backendTensor, s2.backendTensor, s3.backendTensor,
+      adamPayload,
+    );
+    // Adam is in-place: param buffer is returned as result.
+    // Set ownsBuffer: false since the buffer is shared with the input.
+    const paramResult = adamResult.param;
+    const paramOwns = (paramResult as { ownsBuffer?: boolean }).ownsBuffer;
+    const finalResult = paramOwns === true
+      ? { ...paramResult, ownsBuffer: false } as BackendTensor
+      : paramResult;
+    // Side outputs (m, v) — create storage handles
+    const mStorage = createStorageHandle(adamNode.device, adamResult.m);
+    const vStorage = createStorageHandle(adamNode.device, adamResult.v);
+    const sideOutputs = { m: mStorage, v: vStorage };
+    storageTracker.markReachable(mStorage.id, sideOutputs);
+    storageTracker.markReachable(vStorage.id, sideOutputs);
+    if (!adamNode._sideOutputs) adamNode._sideOutputs = {};
+    adamNode._sideOutputs.adamMV = sideOutputs;
+    // Adam param is always input[1] — use s1.id directly (no findIndex)
+    adamNode.result = createStorageHandle(adamNode.device, finalResult, s1.id);
+  }
+}
 
 /**
  * Execute a lowered plan (cached dispatch sequence).
@@ -293,44 +338,10 @@ export async function executeLoweredPlan(
             );
             setAdamBatchMode(true);
             try {
-              const adamBackend = backend;
-              const adamOp = adamBackend.ops.adamStep!;
-              // Profile the entire adam batch as one op
+              const adamOp = backend.ops.adamStep!;
               setCurrentOpLabel("adamStep");
               const _adamBatchT0 = profileOpBegin("adamStep");
-              for (const nodeIdx of entry.nodeIndices) {
-                const adamNode = planNodes[nodeIdx];
-                if (adamNode.result) continue;
-                // Inline getInputStorage + backendTensor extraction
-                const inputs = adamNode.inputs;
-                const s0 = getInputStorage(inputs[0], adamBackend);
-                const s1 = getInputStorage(inputs[1], adamBackend);
-                const s2 = getInputStorage(inputs[2], adamBackend);
-                const s3 = getInputStorage(inputs[3], adamBackend);
-                // Call adamStep directly, bypassing executeOp switch dispatch
-                const adamPayload = adamNode.payload as import("../backend/types").AdamStepConfig;
-                const adamResult = await adamOp(
-                  s0.backendTensor, s1.backendTensor, s2.backendTensor, s3.backendTensor,
-                  adamPayload,
-                );
-                // Adam is in-place: param buffer is returned as result.
-                // Set ownsBuffer: false since the buffer is shared with the input.
-                const paramResult = adamResult.param;
-                const paramOwns = (paramResult as { ownsBuffer?: boolean }).ownsBuffer;
-                const finalResult = paramOwns === true
-                  ? { ...paramResult, ownsBuffer: false } as BackendTensor
-                  : paramResult;
-                // Side outputs (m, v) — create storage handles
-                const mStorage = createStorageHandle(adamNode.device, adamResult.m);
-                const vStorage = createStorageHandle(adamNode.device, adamResult.v);
-                const sideOutputs = { m: mStorage, v: vStorage };
-                storageTracker.markReachable(mStorage.id, sideOutputs);
-                storageTracker.markReachable(vStorage.id, sideOutputs);
-                if (!adamNode._sideOutputs) adamNode._sideOutputs = {};
-                adamNode._sideOutputs.adamMV = sideOutputs;
-                // Use param input (index 1) as base storage for the view result
-                adamNode.result = createStorageHandle(adamNode.device, finalResult, s1.id);
-              }
+              await executeAdamBatchInner(planNodes, entry.nodeIndices, adamOp, (ref) => getInputStorage(ref, backend));
               profileOpEnd("adamStep", _adamBatchT0);
             } finally {
               setAdamBatchMode(false);
@@ -612,7 +623,7 @@ export async function executeLoweredPlan(
               const refB = planNodes[cfg.inputBPath.planNodeIndex].inputs[cfg.inputBPath.inputIndex];
               const bufA = gpuBuffer(getInputStorage(refA).backendTensor);
               const bufB = gpuBuffer(getInputStorage(refB).backendTensor);
-              const epilogueBuffers: any[] = [];
+              const epilogueBuffers: GPUBuffer[] = [];
               for (const path of cfg.epilogueInputPaths) {
                 const ref = planNodes[path.planNodeIndex].inputs[path.inputIndex];
                 epilogueBuffers.push(gpuBuffer(getInputStorage(ref).backendTensor));
@@ -906,43 +917,10 @@ export async function executeLoweredPlan(
           try {
             const adamBackend = getBackend(planNodes[action.nodeIndices[0]].device) ?? backend;
             const adamOp = adamBackend.ops.adamStep!;
-            // Single profile begin/end for entire batch (not per-node)
             setCurrentOpLabel("adamStep");
             setProfileModule("optimizer.step");
             const _adamBatchT0 = profileOpBegin("adamStep");
-            for (const nodeIdx of action.nodeIndices) {
-              const adamNode = planNodes[nodeIdx];
-              if (adamNode.result) continue;
-              // Indexed getInputStorage (no .map() array allocation)
-              const inputs = adamNode.inputs;
-              const s0 = getInputStorage(inputs[0], adamBackend);
-              const s1 = getInputStorage(inputs[1], adamBackend);
-              const s2 = getInputStorage(inputs[2], adamBackend);
-              const s3 = getInputStorage(inputs[3], adamBackend);
-              // Direct adamOp call (bypasses executeOp switch)
-              const adamPayload = adamNode.payload as import("../backend/types").AdamStepConfig;
-              const adamResult = await adamOp(
-                s0.backendTensor, s1.backendTensor, s2.backendTensor, s3.backendTensor,
-                adamPayload,
-              );
-              // Adam is in-place: param buffer is returned as result.
-              // Set ownsBuffer: false since the buffer is shared with the input.
-              const paramResult = adamResult.param;
-              const paramOwns = (paramResult as { ownsBuffer?: boolean }).ownsBuffer;
-              const finalResult = paramOwns === true
-                ? { ...paramResult, ownsBuffer: false } as BackendTensor
-                : paramResult;
-              // Side outputs (m, v) — create storage handles
-              const mStorage = createStorageHandle(adamNode.device, adamResult.m);
-              const vStorage = createStorageHandle(adamNode.device, adamResult.v);
-              const sideOutputs = { m: mStorage, v: vStorage };
-              storageTracker.markReachable(mStorage.id, sideOutputs);
-              storageTracker.markReachable(vStorage.id, sideOutputs);
-              if (!adamNode._sideOutputs) adamNode._sideOutputs = {};
-              adamNode._sideOutputs.adamMV = sideOutputs;
-              // Adam param is always input[1] — use s1.id directly (no findIndex)
-              adamNode.result = createStorageHandle(adamNode.device, finalResult, s1.id);
-            }
+            await executeAdamBatchInner(planNodes, action.nodeIndices, adamOp, (ref) => getInputStorage(ref, adamBackend));
             profileOpEnd("adamStep", _adamBatchT0);
             setCurrentOpLabel(null);
             setProfileModule("unknown");

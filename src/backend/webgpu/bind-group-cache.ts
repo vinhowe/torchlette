@@ -200,7 +200,7 @@ export function releaseUniformBuffer(buffer: GPUBuffer): void {
 // ============================================================================
 
 // Profiled helper for hot-path WebGPU API calls
-export function profiledCreateBindGroup(device: GPUDevice, descriptor: any): GPUBindGroup {
+export function profiledCreateBindGroup(device: GPUDevice, descriptor: { layout: unknown; entries: Array<{ binding: number; resource: { buffer: GPUBuffer; offset?: number; size?: number } }> }): GPUBindGroup {
   const bg = profileApiCall("createBindGroup", () => device.createBindGroup(descriptor));
   // When recording, capture buffer references from the descriptor for replay pinning
   if (dispatchRecordingBuffer && descriptor.entries) {
