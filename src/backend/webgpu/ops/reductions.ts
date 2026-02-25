@@ -3,7 +3,7 @@
  * Extracted from index.ts — purely structural refactoring.
  */
 
-import type { BackendTensor, SumOptions, MeanOptions, MaxOptions } from "../../types";
+import { normalizeDim, type BackendTensor, type SumOptions, type MeanOptions, type MaxOptions } from "../../types";
 import type { GPUBuffer, WebGPUTensor, WebGPUContext } from "../gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "../gpu-types";
 import {
@@ -35,6 +35,54 @@ import {
 import { getExpr as getExprFromRegistry, isUnaryOp as isUnaryOpFromRegistry } from "./registry";
 import { contiguous } from "./views";
 
+/**
+ * Compute strides, reduction size, and input→output dimension mapping
+ * shared by sum(), max(), and sumDimWithPreamble().
+ */
+function buildReductionMetadata(
+  inputShape: number[],
+  normalizedDims: number[],
+  outShape: number[],
+  keepdim: boolean,
+): {
+  inputStrides: number[];
+  outStrides: number[];
+  reductionSize: number;
+  inputToOutDim: number[];
+} {
+  const rank = inputShape.length;
+  const inputStrides: number[] = [];
+  for (let i = 0; i < rank; i++) {
+    let stride = 1;
+    for (let j = i + 1; j < rank; j++) stride *= inputShape[j];
+    inputStrides.push(stride);
+  }
+
+  const outStrides: number[] = [];
+  for (let i = 0; i < outShape.length; i++) {
+    let stride = 1;
+    for (let j = i + 1; j < outShape.length; j++) stride *= outShape[j];
+    outStrides.push(stride);
+  }
+
+  let reductionSize = 1;
+  for (const d of normalizedDims) reductionSize *= inputShape[d];
+
+  const inputToOutDim: number[] = [];
+  let outDimIdx = 0;
+  for (let i = 0; i < rank; i++) {
+    if (normalizedDims.includes(i)) {
+      if (keepdim) { inputToOutDim.push(outDimIdx); outDimIdx++; }
+      else inputToOutDim.push(-1);
+    } else {
+      inputToOutDim.push(outDimIdx);
+      outDimIdx++;
+    }
+  }
+
+  return { inputStrides, outStrides, reductionSize, inputToOutDim };
+}
+
 export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
   const ctx = requireContext();
   let tensor = a as WebGPUTensor;
@@ -65,7 +113,7 @@ export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
 
   // Normalize negative dimensions
   const rank = inputShape.length;
-  const normalizedDims = dims.map((d) => (d < 0 ? d + rank : d));
+  const normalizedDims = dims.map((d) => normalizeDim(d, rank));
 
   // Validate dimensions
   for (const d of normalizedDims) {
@@ -96,48 +144,8 @@ export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
   const outSize = outShape.reduce((acc, d) => acc * d, 1);
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
 
-  // Compute strides
-  const inputStrides: number[] = [];
-  for (let i = 0; i < rank; i++) {
-    let stride = 1;
-    for (let j = i + 1; j < rank; j++) {
-      stride *= inputShape[j];
-    }
-    inputStrides.push(stride);
-  }
-
-  const outStrides: number[] = [];
-  for (let i = 0; i < outShape.length; i++) {
-    let stride = 1;
-    for (let j = i + 1; j < outShape.length; j++) {
-      stride *= outShape[j];
-    }
-    outStrides.push(stride);
-  }
-
-  // Compute reduction size (product of reduced dimensions)
-  let reductionSize = 1;
-  for (const d of normalizedDims) {
-    reductionSize *= inputShape[d];
-  }
-
-  // Build mapping from input dimension to output dimension (or -1 if reduced without keepdim)
-  // This tells us which output coordinate corresponds to each input dimension
-  const inputToOutDim: number[] = [];
-  let outDimIdx = 0;
-  for (let i = 0; i < rank; i++) {
-    if (normalizedDims.includes(i)) {
-      if (keepdim) {
-        inputToOutDim.push(outDimIdx); // maps to a size-1 dim in output
-        outDimIdx++;
-      } else {
-        inputToOutDim.push(-1); // not in output
-      }
-    } else {
-      inputToOutDim.push(outDimIdx);
-      outDimIdx++;
-    }
-  }
+  const { inputStrides, outStrides, reductionSize, inputToOutDim } =
+    buildReductionMetadata(inputShape, normalizedDims, outShape, keepdim);
 
   const inputShapeArray = `array<u32, ${rank}>(${inputShape.map((s) => `${s}u`).join(", ")})`;
   const inputStridesArray = `array<u32, ${rank}>(${inputStrides.map((s) => `${s}u`).join(", ")})`;
@@ -371,7 +379,7 @@ export function sumDimWithPreamble(
   }
 
   const dims = Array.isArray(dim) ? dim : [dim];
-  const normalizedDims = dims.map((d: number) => (d < 0 ? d + rank : d));
+  const normalizedDims = dims.map((d: number) => normalizeDim(d, rank));
 
   // Compute output shape
   const outShape: number[] = [];
@@ -393,34 +401,8 @@ export function sumDimWithPreamble(
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
-  // Compute strides
-  const inputStrides: number[] = [];
-  for (let i = 0; i < rank; i++) {
-    let stride = 1;
-    for (let j = i + 1; j < rank; j++) stride *= inputShape[j];
-    inputStrides.push(stride);
-  }
-  const outStrides: number[] = [];
-  for (let i = 0; i < outShape.length; i++) {
-    let stride = 1;
-    for (let j = i + 1; j < outShape.length; j++) stride *= outShape[j];
-    outStrides.push(stride);
-  }
-
-  let reductionSize = 1;
-  for (const d of normalizedDims) reductionSize *= inputShape[d];
-
-  const inputToOutDim: number[] = [];
-  let outDimIdx = 0;
-  for (let i = 0; i < rank; i++) {
-    if (normalizedDims.includes(i)) {
-      if (keepdim) { inputToOutDim.push(outDimIdx); outDimIdx++; }
-      else inputToOutDim.push(-1);
-    } else {
-      inputToOutDim.push(outDimIdx);
-      outDimIdx++;
-    }
-  }
+  const { inputStrides, outStrides, reductionSize, inputToOutDim } =
+    buildReductionMetadata(inputShape, normalizedDims, outShape, keepdim);
 
   const isUnary = isUnaryOpFn(preambleOp);
   const arity = isUnary ? 1 : 2;
@@ -958,7 +940,7 @@ export function max(a: BackendTensor, options?: MaxOptions): BackendTensor {
 
   const dims = Array.isArray(dim) ? dim : [dim];
   const rank = inputShape.length;
-  const normalizedDims = dims.map((d) => (d < 0 ? d + rank : d));
+  const normalizedDims = dims.map((d) => normalizeDim(d, rank));
 
   for (const d of normalizedDims) {
     if (d < 0 || d >= rank) {
@@ -984,44 +966,8 @@ export function max(a: BackendTensor, options?: MaxOptions): BackendTensor {
   const outSize = outShape.reduce((acc, d) => acc * d, 1);
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
 
-  const inputStrides: number[] = [];
-  for (let i = 0; i < rank; i++) {
-    let stride = 1;
-    for (let j = i + 1; j < rank; j++) {
-      stride *= inputShape[j];
-    }
-    inputStrides.push(stride);
-  }
-
-  const outStrides: number[] = [];
-  for (let i = 0; i < outShape.length; i++) {
-    let stride = 1;
-    for (let j = i + 1; j < outShape.length; j++) {
-      stride *= outShape[j];
-    }
-    outStrides.push(stride);
-  }
-
-  let reductionSize = 1;
-  for (const d of normalizedDims) {
-    reductionSize *= inputShape[d];
-  }
-
-  const inputToOutDim: number[] = [];
-  let outDimIdx = 0;
-  for (let i = 0; i < rank; i++) {
-    if (normalizedDims.includes(i)) {
-      if (keepdim) {
-        inputToOutDim.push(outDimIdx);
-        outDimIdx++;
-      } else {
-        inputToOutDim.push(-1);
-      }
-    } else {
-      inputToOutDim.push(outDimIdx);
-      outDimIdx++;
-    }
-  }
+  const { inputStrides, outStrides, reductionSize, inputToOutDim } =
+    buildReductionMetadata(inputShape, normalizedDims, outShape, keepdim);
 
   const inputShapeArray = `array<u32, ${rank}>(${inputShape.map((s) => `${s}u`).join(", ")})`;
   const inputStridesArray = `array<u32, ${rank}>(${inputStrides.map((s) => `${s}u`).join(", ")})`;
@@ -1184,10 +1130,7 @@ export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
   } else {
     const dims = Array.isArray(dim) ? dim : [dim];
     const rank = inputShape.length;
-    count = dims.reduce((acc, d) => {
-      const nd = d < 0 ? d + rank : d;
-      return acc * inputShape[nd];
-    }, 1);
+    count = dims.reduce((acc, d) => acc * inputShape[normalizeDim(d, rank)], 1);
   }
 
   // Get sum result (always a tensor, possibly 0-d)

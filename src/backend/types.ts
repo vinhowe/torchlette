@@ -75,6 +75,13 @@ export function shapeSize(shape: number[]): number {
 }
 
 /**
+ * Normalize a possibly-negative dimension index to a non-negative one.
+ */
+export function normalizeDim(d: number, rank: number): number {
+  return d < 0 ? d + rank : d;
+}
+
+/**
  * Compute transposed strides given original strides and dimension swap.
  */
 export function transposeStrides(

@@ -1,4 +1,4 @@
-import type { GeluOptions } from "../types";
+import { normalizeDim as normalizeDimShared, type GeluOptions } from "../types";
 import { sizeOf, broadcastShapes } from "../../core/shape";
 
 export type Shape = number[];
@@ -307,7 +307,7 @@ export function permute(a: Tensor, dims: number[]): Tensor {
   // Check for valid permutation
   const seen = new Set<number>();
   for (const d of dims) {
-    const nd = d < 0 ? d + rank : d;
+    const nd = normalizeDimShared(d, rank);
     if (nd < 0 || nd >= rank) {
       throw new Error(`permute: dimension ${d} out of range for rank ${rank}`);
     }
@@ -318,7 +318,7 @@ export function permute(a: Tensor, dims: number[]): Tensor {
   }
 
   // Normalize dims
-  const normalizedDims = dims.map((d) => (d < 0 ? d + rank : d));
+  const normalizedDims = dims.map((d) => normalizeDimShared(d, rank));
 
   // Reorder shape and strides
   const newShape = normalizedDims.map((d) => a.shape[d]);

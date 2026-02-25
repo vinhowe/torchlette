@@ -634,227 +634,198 @@ function nsToUs(ns: bigint): number {
   return Number(ns) / 1_000;
 }
 
+function printCpuStatsTable(
+  title: string,
+  stats: Map<string, { count: number; totalMs: number; maxMs: number }>,
+): void {
+  if (stats.size === 0) return;
+  const sorted = [...stats.entries()].sort((a, b) => b[1].totalMs - a[1].totalMs);
+  console.log(
+    `${padR(title, 28)} ${padL("Count", 8)} ${padL("Total(ms)", 11)} ${padL("Avg(µs)", 10)} ${padL("Max(µs)", 10)}`,
+  );
+  console.log("─".repeat(69));
+  for (const [name, s] of sorted) {
+    const avgUs = (s.totalMs / s.count) * 1000;
+    console.log(
+      `${padR(name, 28)} ${padL(String(s.count), 8)} ${padL(s.totalMs.toFixed(1), 11)} ${padL(avgUs.toFixed(1), 10)} ${padL((s.maxMs * 1000).toFixed(1), 10)}`,
+    );
+  }
+  console.log();
+}
+
+function printGpuKernelTimeStats(): void {
+  if (gpuTs.labelStats.size === 0) return;
+  const sorted = [...gpuTs.labelStats.entries()].sort(
+    (a, b) => nsToMs(b[1].totalNs) - nsToMs(a[1].totalNs),
+  );
+  console.log(
+    `${padR("GPU Kernel Time", 28)} ${padL("Count", 8)} ${padL("Total(ms)", 11)} ${padL("Avg(µs)", 10)} ${padL("Max(µs)", 10)}`,
+  );
+  console.log("─".repeat(69));
+  for (const [name, s] of sorted) {
+    const totalMs = nsToMs(s.totalNs);
+    const avgUs = nsToUs(s.totalNs) / s.count;
+    const maxUs = nsToUs(s.maxNs);
+    console.log(
+      `${padR(name, 28)} ${padL(String(s.count), 8)} ${padL(totalMs.toFixed(1), 11)} ${padL(avgUs.toFixed(1), 10)} ${padL(maxUs.toFixed(1), 10)}`,
+    );
+  }
+  console.log();
+}
+
+function printPhaseStats(): void {
+  if (cpuProfile.phaseStats.size === 0 && gpuTs.phaseStats.size === 0) return;
+  const allPhases = new Set([
+    ...cpuProfile.phaseStats.keys(),
+    ...gpuTs.phaseStats.keys(),
+  ]);
+  console.log(
+    `${padR("Phase", 16)} ${padL("Ops", 8)} ${padL("CPU(ms)", 10)} ${padL("GPU(ms)", 10)}`,
+  );
+  console.log("─".repeat(46));
+  for (const phase of allPhases) {
+    const cpu = cpuProfile.phaseStats.get(phase);
+    const gpu = gpuTs.phaseStats.get(phase);
+    const ops = cpu?.opCount ?? gpu?.opCount ?? 0;
+    const cpuMs = cpu?.totalMs ?? 0;
+    const gpuMs = gpu ? nsToMs(gpu.totalNs) : 0;
+    console.log(
+      `${padR(phase, 16)} ${padL(String(ops), 8)} ${padL(cpuMs.toFixed(1), 10)} ${padL(gpuMs.toFixed(1), 10)}`,
+    );
+  }
+  console.log();
+}
+
+function printGpuOpsBreakdown(
+  header: string,
+  opsMap: Map<string, { count: number; totalNs: bigint; maxNs: bigint }>,
+): void {
+  const sorted = [...opsMap.entries()].sort(
+    (a, b) => nsToMs(b[1].totalNs) - nsToMs(a[1].totalNs),
+  );
+  console.log(header);
+  console.log(
+    `${padR("  Kernel", 30)} ${padL("Count", 8)} ${padL("Total(ms)", 11)} ${padL("Avg(µs)", 10)}`,
+  );
+  for (const [op, s] of sorted) {
+    const totalMs = nsToMs(s.totalNs);
+    const avgUs = nsToUs(s.totalNs) / s.count;
+    console.log(
+      `${padR("  " + op, 30)} ${padL(String(s.count), 8)} ${padL(totalMs.toFixed(1), 11)} ${padL(avgUs.toFixed(0), 10)}`,
+    );
+  }
+  console.log();
+}
+
+function printPerPhaseGpuBreakdown(): void {
+  if (gpuTs.phaseOpStats.size === 0) return;
+  console.log("=== Per-Phase GPU Breakdown ===\n");
+  for (const [phase, opsMap] of gpuTs.phaseOpStats) {
+    const gpuPhase = gpuTs.phaseStats.get(phase);
+    const phaseGpuMs = gpuPhase ? nsToMs(gpuPhase.totalNs) : 0;
+    const phaseDispatches = gpuPhase?.opCount ?? 0;
+    printGpuOpsBreakdown(
+      `--- ${phase} (${phaseDispatches} dispatches, ${phaseGpuMs.toFixed(0)}ms GPU) ---`,
+      opsMap,
+    );
+  }
+}
+
+function printPerModuleGpuStats(): void {
+  if (gpuTs.moduleStats.size === 0) return;
+  const totalGpuNs = [...gpuTs.moduleStats.values()].reduce((s, v) => s + v.totalNs, 0n);
+  const sortedModules = [...gpuTs.moduleStats.entries()].sort(
+    (a, b) => nsToMs(b[1].totalNs) - nsToMs(a[1].totalNs),
+  );
+  console.log("=== Per-Module GPU Breakdown ===\n");
+  console.log(
+    `${padR("Module", 28)} ${padL("Dispatches", 11)} ${padL("GPU(ms)", 10)} ${padL("% GPU", 8)}`,
+  );
+  console.log("─".repeat(59));
+  for (const [mod, s] of sortedModules) {
+    const ms = nsToMs(s.totalNs);
+    const pct = totalGpuNs > 0n ? (Number(s.totalNs * 10000n / totalGpuNs) / 100).toFixed(1) : "0.0";
+    console.log(
+      `${padR(mod, 28)} ${padL(String(s.opCount), 11)} ${padL(ms.toFixed(1), 10)} ${padL(pct + "%", 8)}`,
+    );
+  }
+  console.log();
+
+  console.log("=== Per-Module Kernel Detail ===\n");
+  for (const [mod, s] of sortedModules) {
+    const opsMap = gpuTs.moduleOpStats.get(mod);
+    if (!opsMap || opsMap.size === 0) continue;
+    const modMs = nsToMs(s.totalNs);
+    printGpuOpsBreakdown(
+      `--- ${mod} (${s.opCount} dispatches, ${modMs.toFixed(0)}ms GPU) ---`,
+      opsMap,
+    );
+  }
+}
+
+function printFusionFallbackStats(): void {
+  if (cpuProfile.fusionFallbackStats.size === 0) return;
+  const sorted = [...cpuProfile.fusionFallbackStats.entries()].sort(
+    (a, b) => b[1].count - a[1].count,
+  );
+  console.log("=== Fusion Fallback Reasons ===\n");
+  console.log(
+    `${padR("Reason", 24)} ${padL("Count", 8)} ${padL("Nodes Lost", 12)}`,
+  );
+  console.log("─".repeat(46));
+  for (const [reason, s] of sorted) {
+    console.log(
+      `${padR(reason, 24)} ${padL(String(s.count), 8)} ${padL(String(s.totalNodes), 12)}`,
+    );
+    for (const d of s.details) {
+      console.log(`    detail: ${JSON.stringify(d)}`);
+    }
+  }
+  console.log();
+}
+
+function printPlanAnalysis(): void {
+  if (cpuProfile.planAnalyses.length === 0) return;
+  console.log("=== Plan Analysis ===\n");
+  for (const pa of cpuProfile.planAnalyses) {
+    const fusionRate = pa.totalNodes > 0 ? (pa.fusedNodes / pa.totalNodes * 100).toFixed(1) : "0.0";
+    console.log(
+      `Plan ${pa.planIndex}: ${pa.totalNodes} nodes (${pa.fusedNodes} fused/${pa.totalNodes - pa.fusedNodes} seq, ${pa.fusionGroups} groups, ${fusionRate}% fused)`,
+    );
+    if (pa.epilogueFusions > 0 || pa.reductionFusions > 0) {
+      console.log(`  Epilogue fusions: ${pa.epilogueFusions}, Reduction fusions: ${pa.reductionFusions}`);
+    }
+    const seqEntries = Object.entries(pa.sequentialOps).sort((a, b) => b[1] - a[1]);
+    if (seqEntries.length > 0) {
+      const top = seqEntries.slice(0, 10).map(([op, n]) => `${op}:${n}`).join(", ");
+      console.log(`  Top unfused ops: ${top}`);
+    }
+    const shapeEntries = Object.entries(pa.unfusedByShape).sort((a, b) => b[1].count - a[1].count);
+    if (shapeEntries.length > 0) {
+      console.log("  Unfused fusible by shape:");
+      for (const [shape, info] of shapeEntries.slice(0, 8)) {
+        const opsStr = Object.entries(info.ops).sort((a, b) => b[1] - a[1]).map(([op, n]) => `${op}:${n}`).join(", ");
+        console.log(`    [${shape}]: ${info.count} ops (${opsStr})`);
+      }
+    }
+    console.log();
+  }
+}
+
 export function printProfileSummary(label: string): void {
   if (!PROFILING_ENABLED) return;
 
   console.log(`\n=== Profiling (${label}) ===\n`);
 
-  // CPU API calls
-  if (cpuProfile.apiStats.size > 0) {
-    const sorted = [...cpuProfile.apiStats.entries()].sort(
-      (a, b) => b[1].totalMs - a[1].totalMs,
-    );
-    console.log(
-      `${padR("CPU API Call", 28)} ${padL("Count", 8)} ${padL("Total(ms)", 11)} ${padL("Avg(µs)", 10)} ${padL("Max(µs)", 10)}`,
-    );
-    console.log("─".repeat(69));
-    for (const [name, s] of sorted) {
-      const avgUs = (s.totalMs / s.count) * 1000;
-      console.log(
-        `${padR(name, 28)} ${padL(String(s.count), 8)} ${padL(s.totalMs.toFixed(1), 11)} ${padL(avgUs.toFixed(1), 10)} ${padL((s.maxMs * 1000).toFixed(1), 10)}`,
-      );
-    }
-    console.log();
-  }
-
-  // CPU op type
-  if (cpuProfile.opStats.size > 0) {
-    const sorted = [...cpuProfile.opStats.entries()].sort(
-      (a, b) => b[1].totalMs - a[1].totalMs,
-    );
-    console.log(
-      `${padR("CPU Op Type", 28)} ${padL("Count", 8)} ${padL("Total(ms)", 11)} ${padL("Avg(µs)", 10)} ${padL("Max(µs)", 10)}`,
-    );
-    console.log("─".repeat(69));
-    for (const [name, s] of sorted) {
-      const avgUs = (s.totalMs / s.count) * 1000;
-      console.log(
-        `${padR(name, 28)} ${padL(String(s.count), 8)} ${padL(s.totalMs.toFixed(1), 11)} ${padL(avgUs.toFixed(1), 10)} ${padL((s.maxMs * 1000).toFixed(1), 10)}`,
-      );
-    }
-    console.log();
-  }
-
-  // Sub-op breakdown (fine-grained timing within dispatch functions)
-  if (cpuProfile.subOpStats.size > 0) {
-    const sorted = [...cpuProfile.subOpStats.entries()].sort(
-      (a, b) => b[1].totalMs - a[1].totalMs,
-    );
-    console.log(
-      `${padR("CPU Sub-Op", 28)} ${padL("Count", 8)} ${padL("Total(ms)", 11)} ${padL("Avg(µs)", 10)} ${padL("Max(µs)", 10)}`,
-    );
-    console.log("─".repeat(69));
-    for (const [name, s] of sorted) {
-      const avgUs = (s.totalMs / s.count) * 1000;
-      console.log(
-        `${padR(name, 28)} ${padL(String(s.count), 8)} ${padL(s.totalMs.toFixed(1), 11)} ${padL(avgUs.toFixed(1), 10)} ${padL((s.maxMs * 1000).toFixed(1), 10)}`,
-      );
-    }
-    console.log();
-  }
-
-  // GPU kernel time
-  if (gpuTs.labelStats.size > 0) {
-    const sorted = [...gpuTs.labelStats.entries()].sort(
-      (a, b) => nsToMs(b[1].totalNs) - nsToMs(a[1].totalNs),
-    );
-    console.log(
-      `${padR("GPU Kernel Time", 28)} ${padL("Count", 8)} ${padL("Total(ms)", 11)} ${padL("Avg(µs)", 10)} ${padL("Max(µs)", 10)}`,
-    );
-    console.log("─".repeat(69));
-    for (const [name, s] of sorted) {
-      const totalMs = nsToMs(s.totalNs);
-      const avgUs = nsToUs(s.totalNs) / s.count;
-      const maxUs = nsToUs(s.maxNs);
-      console.log(
-        `${padR(name, 28)} ${padL(String(s.count), 8)} ${padL(totalMs.toFixed(1), 11)} ${padL(avgUs.toFixed(1), 10)} ${padL(maxUs.toFixed(1), 10)}`,
-      );
-    }
-    console.log();
-  }
-
-  // Phase summary
-  if (cpuProfile.phaseStats.size > 0 || gpuTs.phaseStats.size > 0) {
-    const allPhases = new Set([
-      ...cpuProfile.phaseStats.keys(),
-      ...gpuTs.phaseStats.keys(),
-    ]);
-    console.log(
-      `${padR("Phase", 16)} ${padL("Ops", 8)} ${padL("CPU(ms)", 10)} ${padL("GPU(ms)", 10)}`,
-    );
-    console.log("─".repeat(46));
-    for (const phase of allPhases) {
-      const cpu = cpuProfile.phaseStats.get(phase);
-      const gpu = gpuTs.phaseStats.get(phase);
-      const ops = cpu?.opCount ?? gpu?.opCount ?? 0;
-      const cpuMs = cpu?.totalMs ?? 0;
-      const gpuMs = gpu ? nsToMs(gpu.totalNs) : 0;
-      console.log(
-        `${padR(phase, 16)} ${padL(String(ops), 8)} ${padL(cpuMs.toFixed(1), 10)} ${padL(gpuMs.toFixed(1), 10)}`,
-      );
-    }
-    console.log();
-  }
-
-  // Per-phase GPU kernel breakdown
-  if (gpuTs.phaseOpStats.size > 0) {
-    console.log("=== Per-Phase GPU Breakdown ===\n");
-    for (const [phase, opsMap] of gpuTs.phaseOpStats) {
-      const gpuPhase = gpuTs.phaseStats.get(phase);
-      const phaseGpuMs = gpuPhase ? nsToMs(gpuPhase.totalNs) : 0;
-      const phaseDispatches = gpuPhase?.opCount ?? 0;
-      console.log(`--- ${phase} (${phaseDispatches} dispatches, ${phaseGpuMs.toFixed(0)}ms GPU) ---`);
-      const sorted = [...opsMap.entries()].sort(
-        (a, b) => nsToMs(b[1].totalNs) - nsToMs(a[1].totalNs),
-      );
-      console.log(
-        `${padR("  Kernel", 30)} ${padL("Count", 8)} ${padL("Total(ms)", 11)} ${padL("Avg(µs)", 10)}`,
-      );
-      for (const [op, s] of sorted) {
-        const totalMs = nsToMs(s.totalNs);
-        const avgUs = nsToUs(s.totalNs) / s.count;
-        console.log(
-          `${padR("  " + op, 30)} ${padL(String(s.count), 8)} ${padL(totalMs.toFixed(1), 11)} ${padL(avgUs.toFixed(0), 10)}`,
-        );
-      }
-      console.log();
-    }
-  }
-
-  // Per-module GPU summary
-  if (gpuTs.moduleStats.size > 0) {
-    const totalGpuNs = [...gpuTs.moduleStats.values()].reduce((s, v) => s + v.totalNs, 0n);
-    const sortedModules = [...gpuTs.moduleStats.entries()].sort(
-      (a, b) => nsToMs(b[1].totalNs) - nsToMs(a[1].totalNs),
-    );
-    console.log("=== Per-Module GPU Breakdown ===\n");
-    console.log(
-      `${padR("Module", 28)} ${padL("Dispatches", 11)} ${padL("GPU(ms)", 10)} ${padL("% GPU", 8)}`,
-    );
-    console.log("─".repeat(59));
-    for (const [mod, s] of sortedModules) {
-      const ms = nsToMs(s.totalNs);
-      const pct = totalGpuNs > 0n ? (Number(s.totalNs * 10000n / totalGpuNs) / 100).toFixed(1) : "0.0";
-      console.log(
-        `${padR(mod, 28)} ${padL(String(s.opCount), 11)} ${padL(ms.toFixed(1), 10)} ${padL(pct + "%", 8)}`,
-      );
-    }
-    console.log();
-
-    // Detailed per-module per-op breakdown
-    console.log("=== Per-Module Kernel Detail ===\n");
-    for (const [mod, s] of sortedModules) {
-      const modMs = nsToMs(s.totalNs);
-      const opsMap = gpuTs.moduleOpStats.get(mod);
-      if (!opsMap || opsMap.size === 0) continue;
-      console.log(`--- ${mod} (${s.opCount} dispatches, ${modMs.toFixed(0)}ms GPU) ---`);
-      const sorted = [...opsMap.entries()].sort(
-        (a, b) => nsToMs(b[1].totalNs) - nsToMs(a[1].totalNs),
-      );
-      console.log(
-        `${padR("  Kernel", 30)} ${padL("Count", 8)} ${padL("Total(ms)", 11)} ${padL("Avg(µs)", 10)}`,
-      );
-      for (const [op, os] of sorted) {
-        const totalMs = nsToMs(os.totalNs);
-        const avgUs = nsToUs(os.totalNs) / os.count;
-        console.log(
-          `${padR("  " + op, 30)} ${padL(String(os.count), 8)} ${padL(totalMs.toFixed(1), 11)} ${padL(avgUs.toFixed(0), 10)}`,
-        );
-      }
-      console.log();
-    }
-  }
-
-  // Fusion fallback stats
-  if (cpuProfile.fusionFallbackStats.size > 0) {
-    const sorted = [...cpuProfile.fusionFallbackStats.entries()].sort(
-      (a, b) => b[1].count - a[1].count,
-    );
-    console.log("=== Fusion Fallback Reasons ===\n");
-    console.log(
-      `${padR("Reason", 24)} ${padL("Count", 8)} ${padL("Nodes Lost", 12)}`,
-    );
-    console.log("─".repeat(46));
-    for (const [reason, s] of sorted) {
-      console.log(
-        `${padR(reason, 24)} ${padL(String(s.count), 8)} ${padL(String(s.totalNodes), 12)}`,
-      );
-      for (const d of s.details) {
-        console.log(`    detail: ${JSON.stringify(d)}`);
-      }
-    }
-    console.log();
-  }
-
-  // Plan analysis
-  if (cpuProfile.planAnalyses.length > 0) {
-    console.log("=== Plan Analysis ===\n");
-    for (const pa of cpuProfile.planAnalyses) {
-      const fusionRate = pa.totalNodes > 0 ? (pa.fusedNodes / pa.totalNodes * 100).toFixed(1) : "0.0";
-      console.log(
-        `Plan ${pa.planIndex}: ${pa.totalNodes} nodes (${pa.fusedNodes} fused/${pa.totalNodes - pa.fusedNodes} seq, ${pa.fusionGroups} groups, ${fusionRate}% fused)`,
-      );
-      if (pa.epilogueFusions > 0 || pa.reductionFusions > 0) {
-        console.log(`  Epilogue fusions: ${pa.epilogueFusions}, Reduction fusions: ${pa.reductionFusions}`);
-      }
-      // Top unfused ops
-      const seqEntries = Object.entries(pa.sequentialOps).sort((a, b) => b[1] - a[1]);
-      if (seqEntries.length > 0) {
-        const top = seqEntries.slice(0, 10).map(([op, n]) => `${op}:${n}`).join(", ");
-        console.log(`  Top unfused ops: ${top}`);
-      }
-      // Unfused fusible by shape
-      const shapeEntries = Object.entries(pa.unfusedByShape).sort((a, b) => b[1].count - a[1].count);
-      if (shapeEntries.length > 0) {
-        console.log("  Unfused fusible by shape:");
-        for (const [shape, info] of shapeEntries.slice(0, 8)) {
-          const opsStr = Object.entries(info.ops).sort((a, b) => b[1] - a[1]).map(([op, n]) => `${op}:${n}`).join(", ");
-          console.log(`    [${shape}]: ${info.count} ops (${opsStr})`);
-        }
-      }
-      console.log();
-    }
-  }
+  printCpuStatsTable("CPU API Call", cpuProfile.apiStats);
+  printCpuStatsTable("CPU Op Type", cpuProfile.opStats);
+  printCpuStatsTable("CPU Sub-Op", cpuProfile.subOpStats);
+  printGpuKernelTimeStats();
+  printPhaseStats();
+  printPerPhaseGpuBreakdown();
+  printPerModuleGpuStats();
+  printFusionFallbackStats();
+  printPlanAnalysis();
 
   // Auto-write JSON if env var is set
   const jsonPath = typeof process !== "undefined" ? process.env?.TORCHLETTE_PROFILE_JSON : undefined;
