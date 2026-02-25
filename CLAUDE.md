@@ -28,7 +28,8 @@ For WebGPU backend changes, also run the relevant integration test (e.g. `npx ts
 
 ```bash
 npm run build          # Build the library
-npm run test           # Run unit tests
+npm run test           # Run all tests (CPU + GPU projects concurrently)
+npm run test:coverage  # Run all tests with Istanbul coverage
 npm run lint           # Run linter
 
 # WebGPU tests (auto-detected; skip with TORCHLETTE_CPU_ONLY=1)

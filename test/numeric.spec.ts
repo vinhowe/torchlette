@@ -45,7 +45,7 @@ describe("numeric ring-2: add", () => {
     const a = tensorFromArray([1, 2, 3, 4], [2, 2]);
     const b = tensorFromArray([1, 2, 3], [3]);
 
-    expect(() => add(a, b)).toThrow("shapes are not broadcastable");
+    expect(() => add(a, b)).toThrow("broadcast");
   });
 
   it("broadcasts add across dimensions", () => {

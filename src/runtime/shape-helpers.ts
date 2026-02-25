@@ -1,18 +1,6 @@
 import type { TransposeOptions } from "../backend/types";
-
-export function broadcastShapes(a: number[], b: number[]): number[] {
-  const outRank = Math.max(a.length, b.length);
-  const out = new Array<number>(outRank);
-  for (let i = 0; i < outRank; i++) {
-    const aDim = a[a.length - 1 - i] ?? 1;
-    const bDim = b[b.length - 1 - i] ?? 1;
-    if (aDim !== bDim && aDim !== 1 && bDim !== 1) {
-      throw new Error(`Cannot broadcast shapes [${a}] and [${b}]`);
-    }
-    out[outRank - 1 - i] = Math.max(aDim, bDim);
-  }
-  return out;
-}
+import { broadcastShapes } from "../core/shape";
+export { broadcastShapes };
 
 export function matmulShape(a: number[], b: number[]): number[] {
   if (a.length < 1 || b.length < 1) {
