@@ -13,12 +13,13 @@
 
 import {
   dispatchComputePass,
-  getWebGPUDevice,
   trackSharedEncoderWrite,
   allocateOutputBuffer,
   cachedCreateBindGroup,
+  getPipeline,
 } from "./index";
-import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
+import { requireContext } from "./webgpu-state";
+import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 
 const WORKGROUP_SIZE = 256;
@@ -49,29 +50,6 @@ function getOrCreateRowStatsTempBuffers(
     rowStatsTempCache.set(numRows, entry);
   }
   return entry;
-}
-
-// ============================================================================
-// Pipeline Cache
-// ============================================================================
-
-const pipelineCache = new Map<string, GPUComputePipeline>();
-
-function getOrCreatePipeline(
-  device: GPUDevice,
-  key: string,
-  code: string,
-): GPUComputePipeline {
-  let pipeline = pipelineCache.get(key);
-  if (!pipeline) {
-    const module = device.createShaderModule({ code });
-    pipeline = device.createComputePipeline({
-      layout: "auto",
-      compute: { module, entryPoint: "main" },
-    });
-    pipelineCache.set(key, pipeline);
-  }
-  return pipeline;
 }
 
 // ============================================================================
@@ -384,7 +362,7 @@ export function dispatchLayerNormForward(
   featureDim: number,
   eps: number,
 ): GPUBuffer {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const outputSizeBytes = numRows * featureDim * 4; // f32
@@ -392,8 +370,8 @@ export function dispatchLayerNormForward(
 
   const configBuf = getOrCreateConfigBuffer(device, numRows, featureDim, eps);
 
-  const pipeline = getOrCreatePipeline(
-    device,
+  const pipeline = getPipeline(
+    ctx,
     "layerNormFwd",
     layerNormForwardShader(),
   );
@@ -427,7 +405,7 @@ export function dispatchLayerNormBackwardGradX(
   featureDim: number,
   eps: number,
 ): GPUBuffer {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const outputSizeBytes = numRows * featureDim * 4;
@@ -435,8 +413,8 @@ export function dispatchLayerNormBackwardGradX(
 
   const configBuf = getOrCreateConfigBuffer(device, numRows, featureDim, eps);
 
-  const pipeline = getOrCreatePipeline(
-    device,
+  const pipeline = getPipeline(
+    ctx,
     "layerNormBwdGradX",
     layerNormBackwardGradXShader(),
   );
@@ -473,7 +451,7 @@ export function dispatchLayerNormBackwardGradWeightBias(
   featureDim: number,
   eps: number,
 ): { gradWeightBuffer: GPUBuffer; gradBiasBuffer: GPUBuffer } {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const configBuf = getOrCreateConfigBuffer(device, numRows, featureDim, eps);
@@ -482,8 +460,8 @@ export function dispatchLayerNormBackwardGradWeightBias(
   // Use persistent cached buffers (same pattern as K-split temp buffers)
   const { meanBuffer, invStdBuffer } = getOrCreateRowStatsTempBuffers(device, numRows);
 
-  const statsPipeline = getOrCreatePipeline(
-    device,
+  const statsPipeline = getPipeline(
+    ctx,
     "layerNormRowStats",
     layerNormRowStatsShader(),
   );
@@ -506,8 +484,8 @@ export function dispatchLayerNormBackwardGradWeightBias(
   const gradWeightBuffer = allocateOutputBuffer(featureSizeBytes);
   const gradBiasBuffer = allocateOutputBuffer(featureSizeBytes);
 
-  const gradPipeline = getOrCreatePipeline(
-    device,
+  const gradPipeline = getPipeline(
+    ctx,
     "layerNormBwdGradWBv2",
     layerNormBackwardGradWeightBiasShader(),
   );
@@ -534,7 +512,7 @@ export function dispatchLayerNormBackwardGradWeightBias(
  * Reset all module-local mutable state (pipeline cache, row stats temp buffers).
  */
 export function resetLayerNormKernelState(): void {
-  pipelineCache.clear();
+  configCache.clear();
   for (const entry of rowStatsTempCache.values()) {
     entry.meanBuffer.destroy();
     entry.invStdBuffer.destroy();

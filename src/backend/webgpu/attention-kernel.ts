@@ -18,14 +18,15 @@
 
 import {
   dispatchComputePass,
-  getWebGPUDevice,
   trackSharedEncoderWrite,
   allocateOutputBuffer,
   cachedCreateBindGroup,
+  getPipeline,
 } from "./index";
+import { requireContext } from "./webgpu-state";
 
 import { getSubgroupSupport } from "./matmul/types";
-import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
+import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 
 // Tiling parameters
@@ -36,29 +37,6 @@ const BQ_BW = 16; // Q rows per tile in backward dKV kernel
 // Subgroup cooperative parameters
 const THREADS_PER_ROW = 4; // threads cooperating on one row's dot product
 const WG_SG = 256;  // workgroup size in subgroup mode (BR * THREADS_PER_ROW)
-
-// ============================================================================
-// Pipeline Cache
-// ============================================================================
-
-const pipelineCache = new Map<string, GPUComputePipeline>();
-
-function getOrCreatePipeline(
-  device: GPUDevice,
-  key: string,
-  code: string,
-): GPUComputePipeline {
-  let pipeline = pipelineCache.get(key);
-  if (!pipeline) {
-    const module = device.createShaderModule({ code });
-    pipeline = device.createComputePipeline({
-      layout: "auto",
-      compute: { module, entryPoint: "main" },
-    });
-    pipelineCache.set(key, pipeline);
-  }
-  return pipeline;
-}
 
 // ============================================================================
 // Config Buffer Cache
@@ -1198,7 +1176,7 @@ export function dispatchFlashAttentionForward(
   scale: number,
   isCausal: boolean,
 ): { outputBuffer: GPUBuffer; logsumexpBuffer: GPUBuffer } {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4; // f32
@@ -1212,8 +1190,8 @@ export function dispatchFlashAttentionForward(
   );
 
   const sg = useSubgroupAttention(headDim);
-  const pipeline = getOrCreatePipeline(
-    device,
+  const pipeline = getPipeline(
+    ctx,
     `faFwd:${headDim}${sg ? ":sg" : ""}`,
     flashAttentionForwardShader(headDim, sg),
   );
@@ -1253,7 +1231,7 @@ export function dispatchFlashAttentionBackwardD(
   scale: number,
   isCausal: boolean,
 ): GPUBuffer {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const totalRows = batchSize * numHeads * seqLen;
@@ -1266,8 +1244,8 @@ export function dispatchFlashAttentionBackwardD(
   );
 
   const WG = Math.max(headDim, 32);
-  const pipeline = getOrCreatePipeline(
-    device,
+  const pipeline = getPipeline(
+    ctx,
     `faBwdD:${headDim}`,
     flashAttentionBackwardDShader(headDim),
   );
@@ -1306,7 +1284,7 @@ export function dispatchFlashAttentionBackwardDQ(
   scale: number,
   isCausal: boolean,
 ): GPUBuffer {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4;
@@ -1318,8 +1296,8 @@ export function dispatchFlashAttentionBackwardDQ(
   );
 
   const sg = useSubgroupAttention(headDim);
-  const pipeline = getOrCreatePipeline(
-    device,
+  const pipeline = getPipeline(
+    ctx,
     `faBwdDQ:${headDim}${sg ? ":sg" : ""}`,
     flashAttentionBackwardDQShader(headDim, sg),
   );
@@ -1355,7 +1333,6 @@ export function dispatchFlashAttentionBackwardDQ(
  * Reset all module-local mutable state (pipeline cache, config buffer cache).
  */
 export function resetAttentionKernelState(): void {
-  pipelineCache.clear();
   configCache.clear();
 }
 
@@ -1373,7 +1350,7 @@ export function dispatchFlashAttentionBackwardDKV(
   scale: number,
   isCausal: boolean,
 ): { dKBuffer: GPUBuffer; dVBuffer: GPUBuffer } {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4;
@@ -1387,8 +1364,8 @@ export function dispatchFlashAttentionBackwardDKV(
 
   const BC_BW = 64;
   const sg = useSubgroupAttention(headDim);
-  const pipeline = getOrCreatePipeline(
-    device,
+  const pipeline = getPipeline(
+    ctx,
     `faBwdDKV:${headDim}${sg ? ":sg" : ""}`,
     flashAttentionBackwardDKVShader(headDim, sg),
   );

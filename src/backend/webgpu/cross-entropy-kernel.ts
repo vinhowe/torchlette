@@ -13,38 +13,16 @@
 
 import {
   dispatchComputePass,
-  getWebGPUDevice,
   trackSharedEncoderWrite,
   allocateOutputBuffer,
   cachedCreateBindGroup,
+  getPipeline,
 } from "./index";
-import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
+import { requireContext } from "./webgpu-state";
+import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 
 const WORKGROUP_SIZE = 256;
-
-// ============================================================================
-// Pipeline Cache
-// ============================================================================
-
-const pipelineCache = new Map<string, GPUComputePipeline>();
-
-function getOrCreatePipeline(
-  device: GPUDevice,
-  key: string,
-  code: string,
-): GPUComputePipeline {
-  let pipeline = pipelineCache.get(key);
-  if (!pipeline) {
-    const module = device.createShaderModule({ code });
-    pipeline = device.createComputePipeline({
-      layout: "auto",
-      compute: { module, entryPoint: "main" },
-    });
-    pipelineCache.set(key, pipeline);
-  }
-  return pipeline;
-}
 
 // ============================================================================
 // WGSL Shaders
@@ -220,7 +198,7 @@ export function dispatchCrossEntropyForward(
   batchSize: number,
   vocabSize: number,
 ): GPUBuffer {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const outputSizeBytes = batchSize * 4; // f32
@@ -228,8 +206,8 @@ export function dispatchCrossEntropyForward(
 
   const configBuf = getOrCreateConfigBuffer(device, batchSize, vocabSize);
 
-  const pipeline = getOrCreatePipeline(
-    device,
+  const pipeline = getPipeline(
+    ctx,
     "crossEntropyFwd",
     crossEntropyForwardShader(),
   );
@@ -261,7 +239,7 @@ export function dispatchCrossEntropyBackward(
   batchSize: number,
   vocabSize: number,
 ): GPUBuffer {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const outputSizeBytes = batchSize * vocabSize * 4; // f32
@@ -269,8 +247,8 @@ export function dispatchCrossEntropyBackward(
 
   const configBuf = getOrCreateConfigBuffer(device, batchSize, vocabSize);
 
-  const pipeline = getOrCreatePipeline(
-    device,
+  const pipeline = getPipeline(
+    ctx,
     "crossEntropyBwd",
     crossEntropyBackwardShader(),
   );
@@ -296,6 +274,5 @@ export function dispatchCrossEntropyBackward(
  * Reset all module-local mutable state (pipeline cache, config buffer cache).
  */
 export function resetCrossEntropyKernelState(): void {
-  pipelineCache.clear();
   configCache.clear();
 }
