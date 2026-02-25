@@ -38,6 +38,18 @@ const BQ_BW = 16; // Q rows per tile in backward dKV kernel
 const THREADS_PER_ROW = 4; // threads cooperating on one row's dot product
 const WG_SG = 256;  // workgroup size in subgroup mode (BR * THREADS_PER_ROW)
 
+// Shared WGSL struct for flash attention config (32 bytes, 8 fields)
+const WGSL_FA_CONFIG = `struct FAConfig {
+  batch_size: u32,
+  num_heads: u32,
+  seq_len: u32,
+  head_dim: u32,
+  scale: f32,
+  is_causal: u32,
+  _pad0: u32,
+  _pad1: u32,
+};`;
+
 // ============================================================================
 // Config Buffer Cache
 // ============================================================================
@@ -121,16 +133,7 @@ function flashAttentionForwardShader(headDim: number, useSubgroups: boolean): st
     return `
 enable subgroups;
 
-struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+${WGSL_FA_CONFIG}
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> K: array<f32>;
@@ -286,16 +289,7 @@ fn main(@builtin(local_invocation_index) tidx: u32,
 
   // Scalar (non-subgroup) path — original implementation
   return `
-struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+${WGSL_FA_CONFIG}
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> K: array<f32>;
@@ -464,16 +458,7 @@ function flashAttentionBackwardDShader(headDim: number): string {
   // Use headDim threads per workgroup for reduction
   const WG = Math.max(headDim, 32); // at least 32 for reduction
   return `
-struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+${WGSL_FA_CONFIG}
 
 @group(0) @binding(0) var<storage, read> dO: array<f32>;
 @group(0) @binding(1) var<storage, read> Out: array<f32>;
@@ -545,16 +530,7 @@ function flashAttentionBackwardDQShader(headDim: number, useSubgroups: boolean):
     return `
 enable subgroups;
 
-struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+${WGSL_FA_CONFIG}
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> K: array<f32>;
@@ -687,16 +663,7 @@ fn main(@builtin(local_invocation_index) tidx: u32,
 
   // Scalar (non-subgroup) path
   return `
-struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+${WGSL_FA_CONFIG}
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> K: array<f32>;
@@ -845,16 +812,7 @@ function flashAttentionBackwardDKVShader(headDim: number, useSubgroups: boolean)
     return `
 enable subgroups;
 
-struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+${WGSL_FA_CONFIG}
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> K: array<f32>;
@@ -1007,16 +965,7 @@ fn main(@builtin(local_invocation_index) tidx: u32,
 
   // Scalar (non-subgroup) path
   return `
-struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+${WGSL_FA_CONFIG}
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> K: array<f32>;

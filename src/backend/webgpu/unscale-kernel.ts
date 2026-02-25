@@ -28,11 +28,9 @@ import {
 import { requireContext } from "./webgpu-state";
 import { isProfilingEnabled } from "./profiler";
 import { gpuMemoryTracker } from "./memory-tracker";
-import type { GPUBuffer, GPUDevice, GPUCommandEncoder } from "./gpu-types";
+import type { GPUBuffer, GPUBindGroup, GPUDevice, GPUCommandEncoder } from "./gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "./gpu-types";
-
-const WORKGROUP_SIZE = 256;
-const MAX_WORKGROUPS_PER_DIM = 65535;
+import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 
 // ============================================================================
 // WGSL Shader
@@ -297,7 +295,7 @@ export function dispatchUnscaleGrad(
   const numChunks = Math.ceil(numElements / elementsPerChunk);
 
   // Allocate output buffer (fresh, no pool reuse)
-  const alignedBytes = alignBufferSize(totalBytes);
+  const alignedBytes = roundUpToPowerOfTwo(totalBytes);
   const gradOut = allocateFreshOutputBuffer(device, alignedBytes);
 
   // Determine dispatch dimensions
@@ -335,7 +333,7 @@ export function dispatchUnscaleGrad(
       { binding: 3, resource: { buffer: configBuf } },
     ];
 
-    let bindGroup: any;
+    let bindGroup: GPUBindGroup;
     if (needsChunking) {
       bindGroup = device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
@@ -373,7 +371,7 @@ export function dispatchUnscaleGrad(
 // ============================================================================
 
 /** Round up buffer size to next power of 2 (matching pool size classes) */
-function alignBufferSize(size: number): number {
+function roundUpToPowerOfTwo(size: number): number {
   if (size <= 256) return 256;
   let s = 1;
   while (s < size) s <<= 1;

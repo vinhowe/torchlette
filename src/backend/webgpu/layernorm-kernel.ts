@@ -21,8 +21,15 @@ import {
 import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
+import { WORKGROUP_SIZE } from "./shape-utils";
 
-const WORKGROUP_SIZE = 256;
+// Shared WGSL struct for LayerNorm config (16 bytes, 4 fields)
+const WGSL_LN_CONFIG = `struct LNConfig {
+  num_rows: u32,
+  feature_dim: u32,
+  eps: f32,
+  _pad: u32,
+};`;
 
 // ============================================================================
 // Row Stats Temp Buffer Cache (persistent, keyed by numRows)
@@ -58,12 +65,7 @@ function getOrCreateRowStatsTempBuffers(
 
 function layerNormForwardShader(): string {
   return `
-struct LNConfig {
-  num_rows: u32,
-  feature_dim: u32,
-  eps: f32,
-  _pad: u32,
-};
+${WGSL_LN_CONFIG}
 
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> weight: array<f32>;
@@ -125,12 +127,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
 function layerNormBackwardGradXShader(): string {
   return `
-struct LNConfig {
-  num_rows: u32,
-  feature_dim: u32,
-  eps: f32,
-  _pad: u32,
-};
+${WGSL_LN_CONFIG}
 
 @group(0) @binding(0) var<storage, read> grad_output: array<f32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
@@ -212,12 +209,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
 function layerNormRowStatsShader(): string {
   return `
-struct LNConfig {
-  num_rows: u32,
-  feature_dim: u32,
-  eps: f32,
-  _pad: u32,
-};
+${WGSL_LN_CONFIG}
 
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> row_mean: array<f32>;
@@ -273,12 +265,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
 function layerNormBackwardGradWeightBiasShader(): string {
   return `
-struct LNConfig {
-  num_rows: u32,
-  feature_dim: u32,
-  eps: f32,
-  _pad: u32,
-};
+${WGSL_LN_CONFIG}
 
 @group(0) @binding(0) var<storage, read> grad_output: array<f32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;

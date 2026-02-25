@@ -120,7 +120,7 @@ function checkpointNonReentrant<T extends Tensor>(
   preserveRngState: boolean,
 ): T {
   // Get the underlying engine for checkpoint primitives
-  const engine = (api as any).engine;
+  const engine = api.engine;
 
   // Keep inputs alive for recomputation
   for (const input of inputs) {
@@ -191,7 +191,7 @@ function checkpointNonReentrant<T extends Tensor>(
       // This tells the segmented executor to flush buffers after this
       // checkpoint region, enabling memory reuse for subsequent segments.
       if (lastCapturedTensor) {
-        const lazyRef = (lastCapturedTensor as any).lazyRef;
+        const lazyRef = lastCapturedTensor._runtimeTensor().lazyRef;
         if (lazyRef?.kind === "pending" && lazyRef.node) {
           markAsCheckpointBoundary(lazyRef.node);
         }

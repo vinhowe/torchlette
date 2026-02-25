@@ -761,15 +761,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   return createTensor(a.shape, outBuffer, undefined, 0, dtype, ownsBuffer);
 }
 
-export function dispatchMatmul(
+/**
+ * Prepare matmul inputs: detect transposes, ensure contiguity,
+ * compute output shape, extract M/K/N, and compute batch strides.
+ */
+function prepareMatmulInputs(
   a: WebGPUTensor,
   b: WebGPUTensor,
-  transA = false,
-  transB = false,
-  donatedBuffer?: GPUBuffer,
-): WebGPUTensor {
-  const ctx = requireContext();
-
+  transA: boolean,
+  transB: boolean,
+) {
   // Try to detect simple last-2-dim transposes to avoid contiguous() materialization.
   // If detected, we use the original contiguous buffer and flip the transpose flag.
   let effectiveA: WebGPUTensor = a;
@@ -778,7 +779,6 @@ export function dispatchMatmul(
 
   const aOrigShape = !transA ? detectSimpleTranspose(a) : null;
   if (aOrigShape) {
-    // Use original buffer with swapped shape and flipped transpose flag
     effectiveA = createTensor(aOrigShape, a.buffer, undefined, 0, a.dtype, false);
     effectiveTransA = true;
   } else {
@@ -836,6 +836,49 @@ export function dispatchMatmul(
     n,
     k,
   );
+
+  return {
+    effectiveA, effectiveB, effectiveTransA, effectiveTransB,
+    aWasCopied, bWasCopied, outShape, m, k, n, batchDims, batchSize,
+    strideA, strideB, strideC,
+  };
+}
+
+/**
+ * Destroy contiguous copies that were created during matmul input preparation.
+ */
+function cleanupMatmulCopies(
+  aWasCopied: boolean,
+  bWasCopied: boolean,
+  effectiveA: WebGPUTensor,
+  effectiveB: WebGPUTensor,
+  a: WebGPUTensor,
+  b: WebGPUTensor,
+): void {
+  if (aWasCopied) {
+    bufferPool.decRef(effectiveA.buffer);
+    bufferPool.deferredDestroy(effectiveA.buffer, effectiveA.size * (a.dtype === "f16" ? 2 : 4));
+  }
+  if (bWasCopied) {
+    bufferPool.decRef(effectiveB.buffer);
+    bufferPool.deferredDestroy(effectiveB.buffer, effectiveB.size * (b.dtype === "f16" ? 2 : 4));
+  }
+}
+
+export function dispatchMatmul(
+  a: WebGPUTensor,
+  b: WebGPUTensor,
+  transA = false,
+  transB = false,
+  donatedBuffer?: GPUBuffer,
+): WebGPUTensor {
+  const ctx = requireContext();
+
+  const {
+    effectiveA, effectiveB, effectiveTransA, effectiveTransB,
+    aWasCopied, bWasCopied, outShape, m, k, n, batchSize,
+    strideA, strideB, strideC,
+  } = prepareMatmulInputs(a, b, transA, transB);
 
   // Derive per-input dtypes; output is always the higher-precision type
   const dtypeA = effectiveA.dtype === "f16" && isF16Supported() ? "f16" as const : "f32" as const;
@@ -873,15 +916,7 @@ export function dispatchMatmul(
     dtypeB: dtypeB !== dtypeA ? dtypeB : undefined,
   });
 
-  // Destroy contiguous copies if they were created (deferred for GPU fence)
-  if (aWasCopied) {
-    bufferPool.decRef(effectiveA.buffer);
-    bufferPool.deferredDestroy(effectiveA.buffer, effectiveA.size * (a.dtype === "f16" ? 2 : 4));
-  }
-  if (bWasCopied) {
-    bufferPool.decRef(effectiveB.buffer);
-    bufferPool.deferredDestroy(effectiveB.buffer, effectiveB.size * (b.dtype === "f16" ? 2 : 4));
-  }
+  cleanupMatmulCopies(aWasCopied, bWasCopied, effectiveA, effectiveB, a, b);
 
   // Output tensor always owns the buffer (donated or new)
   return createTensor(outShape, outBuffer, undefined, 0, outputDtype, true);
@@ -905,70 +940,11 @@ export function dispatchMatmulWithEpilogue(
 ): WebGPUTensor {
   const ctx = requireContext();
 
-  // Try to detect simple last-2-dim transposes to avoid contiguous() materialization.
-  let effectiveA: WebGPUTensor = a;
-  let effectiveTransA = transA;
-  let aWasCopied = false;
-
-  const aOrigShape = !transA ? detectSimpleTranspose(a) : null;
-  if (aOrigShape) {
-    effectiveA = createTensor(aOrigShape, a.buffer, undefined, 0, a.dtype, false);
-    effectiveTransA = true;
-  } else {
-    effectiveA = ensureContiguous(a);
-    aWasCopied = effectiveA !== a;
-  }
-
-  let effectiveB: WebGPUTensor = b;
-  let effectiveTransB = transB;
-  let bWasCopied = false;
-
-  const bOrigShape = !transB ? detectSimpleTranspose(b) : null;
-  if (bOrigShape) {
-    effectiveB = createTensor(bOrigShape, b.buffer, undefined, 0, b.dtype, false);
-    effectiveTransB = true;
-  } else {
-    effectiveB = ensureContiguous(b);
-    bWasCopied = effectiveB !== b;
-  }
-
-  // Compute output shape with transpose and batch broadcasting
-  const outShape = computeMatmulOutputShape(
-    effectiveA.shape,
-    effectiveB.shape,
-    effectiveTransA,
-    effectiveTransB,
-  );
-
-  // Extract matrix dimensions
-  const aRank = effectiveA.shape.length;
-  const bRank = effectiveB.shape.length;
-
-  let m: number, k: number, n: number;
-  if (effectiveTransA) {
-    k = effectiveA.shape[aRank - 2];
-    m = effectiveA.shape[aRank - 1];
-  } else {
-    m = effectiveA.shape[aRank - 2];
-    k = effectiveA.shape[aRank - 1];
-  }
-  if (effectiveTransB) {
-    n = effectiveB.shape[bRank - 2];
-  } else {
-    n = effectiveB.shape[bRank - 1];
-  }
-
-  // Compute batch size and strides
-  const batchDims = outShape.slice(0, -2);
-  const batchSize = computeBatchSize(batchDims);
-  const { strideA, strideB, strideC } = computeBatchStrides(
-    effectiveA.shape,
-    effectiveB.shape,
-    batchDims,
-    m,
-    n,
-    k,
-  );
+  const {
+    effectiveA, effectiveB, effectiveTransA, effectiveTransB,
+    aWasCopied, bWasCopied, outShape, m, k, n, batchSize,
+    strideA, strideB, strideC,
+  } = prepareMatmulInputs(a, b, transA, transB);
 
   // Derive per-input dtypes; output dtype from epilogue or promoted type.
   // When inputCastA/B is set, the actual buffer dtype is wider (e.g. f32) but
@@ -1014,15 +990,7 @@ export function dispatchMatmulWithEpilogue(
     inputCastB,
   });
 
-  // Destroy contiguous copies if they were created (deferred for GPU fence)
-  if (aWasCopied) {
-    bufferPool.decRef(effectiveA.buffer);
-    bufferPool.deferredDestroy(effectiveA.buffer, effectiveA.size * (a.dtype === "f16" ? 2 : 4));
-  }
-  if (bWasCopied) {
-    bufferPool.decRef(effectiveB.buffer);
-    bufferPool.deferredDestroy(effectiveB.buffer, effectiveB.size * (b.dtype === "f16" ? 2 : 4));
-  }
+  cleanupMatmulCopies(aWasCopied, bWasCopied, effectiveA, effectiveB, a, b);
 
   return createTensor(outShape, outBuffer, undefined, 0, outputDtype);
 }
@@ -1046,7 +1014,7 @@ export function dispatchMatmulDirect(
     dtypeA: "f16" | "f32";
     dtypeB?: "f16" | "f32";
     outputDtype: DType;
-    epilogueConfig: any;
+    epilogueConfig: EpilogueConfig | undefined;
     epilogueBuffers: GPUBuffer[];
     inputCastA?: DType;
     inputCastB?: DType;
