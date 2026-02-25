@@ -1,5 +1,5 @@
 import type { Backend, BackendTensor, DType } from "../backend/types";
-import { gpuBuffer, asGPUTensor } from "../backend/webgpu/gpu-types";
+import { gpuBuffer, asGPUTensor, type GPUBuffer } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
 import {
   flushBufferPool,
@@ -145,7 +145,7 @@ export async function executeLoweredPlan(
 
     // Register external input buffers for arena conflict detection
     {
-      const extBufs: any[] = [];
+      const extBufs: GPUBuffer[] = [];
       for (const node of planNodes) {
         for (const ref of node.inputs) {
           if (ref.kind === "materialized") {
@@ -443,7 +443,7 @@ export async function executeLoweredPlan(
   // same buffer for both reading (external input) and writing (fused output),
   // causing data corruption.
   if (options.bufferArena && useTopLevelSharedEncoder) {
-    const extBufs: any[] = [];
+    const extBufs: GPUBuffer[] = [];
     for (const node of planNodes) {
       for (const ref of node.inputs) {
         if (ref.kind === "materialized") {

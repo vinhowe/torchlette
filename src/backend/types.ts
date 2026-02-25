@@ -4,6 +4,8 @@ export type DeviceKind = "cpu" | "webgpu" | "mock";
 
 export type BackendTensor = {
   shape: Shape;
+  /** Element data type. Both CPU and WebGPU backends always set this. */
+  dtype?: DType;
   toArray(): number[];
   /** Optional cleanup method to release GPU resources */
   destroy?(): void;

@@ -717,8 +717,8 @@ fn main(
   readBuffer.unmap();
 
   // Destroy temporary buffers to prevent memory leaks
-  bufferPool.deferredDestroy(intermediateBuffer, (intermediateBuffer as any).size ?? numWorkgroups * 4);
-  bufferPool.deferredDestroy(readBuffer, (readBuffer as any).size ?? numWorkgroups * 4);
+  bufferPool.deferredDestroy(intermediateBuffer, intermediateBuffer.size ?? numWorkgroups * 4);
+  bufferPool.deferredDestroy(readBuffer, readBuffer.size ?? numWorkgroups * 4);
   releaseUniformBuffer(uniformBuffer);
 
   return total;

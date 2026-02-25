@@ -1056,7 +1056,7 @@ export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
         id,
         index: idx,
         shape: ref.storage.backendTensor.shape.slice(),
-        dtype: ((ref.storage.backendTensor as any).dtype as DType) ?? "f32",
+        dtype: (ref.storage.backendTensor.dtype as DType) ?? "f32",
       });
     } else {
       // Check if this pending ref is an inlinable scalar constant
@@ -1482,7 +1482,7 @@ export function computePlanFingerprint(
         const mShape = inp.storage.backendTensor.shape;
         hashInt(mShape.length);
         for (const d of mShape) hashInt(d);
-        hashStr(((inp.storage.backendTensor as any).dtype as string) ?? "f32");
+        hashStr((inp.storage.backendTensor.dtype as string) ?? "f32");
       }
     }
 
