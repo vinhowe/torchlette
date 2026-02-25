@@ -22,6 +22,8 @@ import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { defineKernel } from "./kernel-factory";
 import { wgslReduce } from "./wgsl-reduce";
+import type { TileKernelSpec } from "./tile-ir";
+import { createTileKernelDispatcher } from "./tile-dispatch";
 
 const kernel = defineKernel("layerNorm");
 
@@ -56,55 +58,54 @@ function getOrCreateRowStatsTempBuffers(
 }
 
 // ============================================================================
-// WGSL Shaders
+// Tile IR Forward Kernel
 // ============================================================================
 
-function layerNormForwardShader(): string {
-  return `
-struct LNConfig {
-  num_rows: u32,
-  feature_dim: u32,
-  eps: f32,
-  _pad: u32,
+const layerNormFwdSpec: TileKernelSpec = {
+  name: "layerNormFwd",
+  workgroupSize: WORKGROUP_SIZE,
+  bindings: {
+    x:      { storage: "read",       type: "f32" },
+    weight: { storage: "read",       type: "f32" },
+    bias:   { storage: "read",       type: "f32" },
+    output: { storage: "read_write", type: "f32" },
+  },
+  uniforms: {
+    num_rows:    "u32",
+    feature_dim: "u32",
+    eps:         "f32",
+  },
+  grid: (u) => [u.num_rows],
+
+  kernel(ctx) {
+    const row  = ctx.programId(0);
+    const D    = ctx.uniform("feature_dim");
+    const Df   = D.toF32();
+    const base = row.mul(D);
+    const offs = base.add(ctx.blockRange(D));
+
+    // Phase 0: load + reduce to mean
+    const xVals = ctx.load("x", offs);
+    const mean  = ctx.reduce(xVals, "sum").div(Df);
+
+    // Phase 1: compute variance and inv_std
+    const diff     = xVals.sub(mean);
+    const variance = ctx.reduce(diff.mul(diff), "sum").div(Df);
+    const invStd   = variance.add(ctx.uniform("eps").toF32()).rsqrt();
+
+    // Phase 2: normalize + affine + store
+    const normalized = diff.mul(invStd);
+    const w = ctx.load("weight", ctx.blockRange(D));
+    const b = ctx.load("bias", ctx.blockRange(D));
+    ctx.store("output", offs, normalized.mul(w).add(b));
+  },
 };
 
-@group(0) @binding(0) var<storage, read> x: array<f32>;
-@group(0) @binding(1) var<storage, read> weight: array<f32>;
-@group(0) @binding(2) var<storage, read> bias: array<f32>;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
-@group(0) @binding(4) var<uniform> config: LNConfig;
+const fwdTileKernel = createTileKernelDispatcher(layerNormFwdSpec);
 
-var<workgroup> sdata: array<f32, ${WORKGROUP_SIZE}>;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let row = wid.x;
-  let tid = lid.x;
-  let D = config.feature_dim;
-  let base = row * D;
-
-${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "D", op: "sum",
-  smem: "sdata", init: "0.0",
-  accumExpr: "x[base + i]", result: "mean",
-  transform: "_ / f32(D)",
-})}
-
-${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "D", op: "sum",
-  smem: "sdata", init: "0.0",
-  loopPreamble: "let diff = x[base + i] - mean;",
-  accumExpr: "diff * diff", result: "inv_std",
-  transform: "inverseSqrt(_ / f32(D) + config.eps)",
-})}
-
-  // Normalize + affine transform
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    let normalized = (x[base + i] - mean) * inv_std;
-    output[base + i] = normalized * weight[i] + bias[i];
-  }
-}
-`;
-}
+// ============================================================================
+// WGSL Shaders (backward kernels — hand-written)
+// ============================================================================
 
 function layerNormBackwardGradXShader(): string {
   return `
@@ -265,6 +266,8 @@ const configU8View = new Uint8Array(configArrayBuffer);
 /**
  * Dispatch fused LayerNorm forward kernel.
  * x [N, D] + weight [D] + bias [D] → output [N, D]
+ *
+ * Uses the tile IR compiler to generate the WGSL shader.
  */
 export function dispatchLayerNormForward(
   xBuffer: GPUBuffer,
@@ -274,32 +277,12 @@ export function dispatchLayerNormForward(
   featureDim: number,
   eps: number,
 ): GPUBuffer {
-  const ctx = getWebGPUDevice()!;
-  const device = ctx.device;
-
   const outputSizeBytes = numRows * featureDim * 4; // f32
   const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
 
-  configU32View[0] = numRows;
-  configU32View[1] = featureDim;
-  configF32View[2] = eps;
-  configU32View[3] = 0;
-  const configBuf = kernel.getConfigBuffer(device, `${numRows}:${featureDim}`, 16, configU8View);
-
-  const pipeline = kernel.getPipeline(device, "layerNormFwd", () => layerNormForwardShader());
-
-  const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [xBuffer, weightBuffer, biasBuffer, outBuffer, configBuf]);
-
-  trackSharedEncoderWrite(xBuffer);
-  trackSharedEncoderWrite(weightBuffer);
-  trackSharedEncoderWrite(biasBuffer);
-  trackSharedEncoderWrite(outBuffer);
-
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    numRows, // one workgroup per row
+  fwdTileKernel.dispatch(
+    { x: xBuffer, weight: weightBuffer, bias: biasBuffer, output: outBuffer },
+    { num_rows: numRows, feature_dim: featureDim, eps },
   );
 
   return outBuffer;
@@ -421,6 +404,7 @@ export function dispatchLayerNormBackwardGradWeightBias(
  */
 export function resetLayerNormKernelState(): void {
   kernel.reset();
+  fwdTileKernel.reset();
   for (const entry of rowStatsTempCache.values()) {
     entry.meanBuffer.destroy();
     entry.invStdBuffer.destroy();
