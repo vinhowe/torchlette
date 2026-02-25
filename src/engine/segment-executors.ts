@@ -6,17 +6,15 @@ import {
   flushSharedEncoder,
   beginSharedEncoder,
   endSharedEncoder,
-  setCurrentOpLabel,
   setAdamBatchMode,
 } from "../backend/webgpu";
-import { profileOpBegin, profileOpEnd, isProfilingEnabled, setProfileModule, recordFusionFallback } from "../backend/webgpu/profiler";
+import { isProfilingEnabled, setProfileModule, recordFusionFallback } from "../backend/webgpu/profiler";
 import {
   isFusibleOp,
   groupToRecipe,
   type FusionGroup,
 } from "./fusion-detect";
 import {
-  findDeadTensorsAtStep,
   type TensorLifetime,
 } from "./memory-planning";
 import {
@@ -25,10 +23,10 @@ import {
   isViewOp,
 } from "./lowered-plan";
 import type { LazyIRNode, LazyRef, StorageHandle, ExecutionPlan } from "./lazy-types";
-import { createStorageHandle, ensureWebGPUMatmulImports, _webgpuMatmulImports } from "./node-factory";
-import { storageTracker, canSafelyRelease, releaseBufferImmediate } from "./storage-tracker";
+import { createStorageHandle, wrapResultAsStorage, ensureWebGPUMatmulImports, _webgpuMatmulImports } from "./node-factory";
+import { storageTracker, releaseDeadTensors } from "./storage-tracker";
 import { computeContiguousStrides } from "../backend/types";
-import { getInputStorage, executeOp } from "./op-dispatch";
+import { getInputStorage, executeOp, withProfileContext } from "./op-dispatch";
 import type { MatmulPrologueInfo, MatmulEpiloguePlan } from "./matmul-epilogue";
 import { detectMatmulEpilogue, detectMatmulEpilogueCore, executeMatmulWithEpilogue } from "./matmul-epilogue";
 import { detectReductionPreamble, executeReductionWithPreamble } from "./reduction-preamble";
@@ -283,16 +281,8 @@ export async function executeSequentialSegment(
         const epiloguePlan = detectMatmulEpilogue(nodes, nodeIdx, allPlanNodes ?? nodes, externalNodeIds);
         if (epiloguePlan) {
           const epLabel = "matmul+" + epiloguePlan.epilogueOps.map(o => o.kind).join("+");
-          setCurrentOpLabel(epLabel);
-          setProfileModule(node.module ?? "unknown");
-          const _profT0 = profileOpBegin(epLabel);
-          try {
-            await executeMatmulWithEpilogue(node, epiloguePlan, backend);
-          } finally {
-            profileOpEnd(epLabel, _profT0);
-            setCurrentOpLabel(null);
-            setProfileModule("unknown");
-          }
+          await withProfileContext(epLabel, node.module, () =>
+            executeMatmulWithEpilogue(node, epiloguePlan, backend));
           nodeIdx += epiloguePlan.consumedCount - 1;
           continue;
         }
@@ -303,16 +293,8 @@ export async function executeSequentialSegment(
         const reductionPlan = detectReductionPreamble(nodes, nodeIdx, reductionConsumerCount);
         if (reductionPlan) {
           const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${reductionPlan.op}`;
-          setCurrentOpLabel(rpLabel);
-          setProfileModule(node.module ?? "unknown");
-          const _profT0 = profileOpBegin(rpLabel);
-          try {
-            await executeReductionWithPreamble(reductionPlan, backend);
-          } finally {
-            profileOpEnd(rpLabel, _profT0);
-            setCurrentOpLabel(null);
-            setProfileModule("unknown");
-          }
+          await withProfileContext(rpLabel, node.module, () =>
+            executeReductionWithPreamble(reductionPlan, backend));
           nodeIdx += 1; // Skip the reduction node (consumed 2 nodes total)
           continue;
         }
@@ -322,18 +304,8 @@ export async function executeSequentialSegment(
       const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
       const backendInputs = inputs.map((s) => s.backendTensor);
 
-      let resultTensor = await executeOp(node, backendInputs, nodeBackend);
-      const aliasedInputIdx = backendInputs.findIndex(b => b === resultTensor);
-      if (aliasedInputIdx >= 0 && (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
-        resultTensor = { ...resultTensor, ownsBuffer: false } as BackendTensor;
-      }
-      const isView =
-        (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === false;
-      const baseStorageId =
-        isView && inputs.length > 0
-          ? inputs[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
-          : undefined;
-      node.result = createStorageHandle(node.device, resultTensor, baseStorageId);
+      const resultTensor = await executeOp(node, backendInputs, nodeBackend);
+      node.result = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
     }
   } finally {
     if (useSharedEncoder) endSharedEncoder();
@@ -439,16 +411,8 @@ export async function executeSequentialSegmentWithEarlyRelease(
             ? "+" + epiloguePlan.epilogueOps.map(o => o.kind).join("+")
             : "";
           const epLabel = `matmul+${prologueLabel}${epilogueLabel}`.replace(/\+$/, "");
-          setCurrentOpLabel(epLabel);
-          setProfileModule(node.module ?? "unknown");
-          const _profT0 = profileOpBegin(epLabel);
-          try {
-            await executeMatmulWithEpilogue(node, epiloguePlan, backend);
-          } finally {
-            profileOpEnd(epLabel, _profT0);
-            setCurrentOpLabel(null);
-            setProfileModule("unknown");
-          }
+          await withProfileContext(epLabel, node.module, () =>
+            executeMatmulWithEpilogue(node, epiloguePlan, backend));
 
           // Track storages for all consumed nodes and release dead buffers
           if (enableEarlyRelease) {
@@ -458,22 +422,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
                 nodeToStorage.set(consumedNode.id, consumedNode.result);
               }
               step++;
-              if (lifetimes && outputNodeIds) {
-                const deadNodeIds = findDeadTensorsAtStep(
-                  lifetimes,
-                  step,
-                  outputNodeIds,
-                  alreadyReleased,
-                );
-                for (const deadId of deadNodeIds) {
-                  const storage = nodeToStorage.get(deadId);
-                  if (storage && canSafelyRelease(storage, nodeToStorage)) {
-                    releaseBufferImmediate(storage);
-                    nodeToStorage.delete(deadId);
-                    alreadyReleased.add(deadId);
-                  }
-                }
-              }
+              releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
             }
           } else {
             step += epiloguePlan.consumedCount;
@@ -512,49 +461,21 @@ export async function executeSequentialSegmentWithEarlyRelease(
         const reductionPlan = detectReductionPreamble(nodes, nodeIdx, reductionConsumerCount);
         if (reductionPlan) {
           const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${reductionPlan.op}`;
-          setCurrentOpLabel(rpLabel);
-          setProfileModule(node.module ?? "unknown");
-          const _profT0 = profileOpBegin(rpLabel);
-          try {
-            await executeReductionWithPreamble(reductionPlan, backend);
-          } finally {
-            profileOpEnd(rpLabel, _profT0);
-            setCurrentOpLabel(null);
-            setProfileModule("unknown");
-          }
+          await withProfileContext(rpLabel, node.module, () =>
+            executeReductionWithPreamble(reductionPlan, backend));
 
           // Track storages for both consumed nodes (preamble + reduction)
           if (enableEarlyRelease) {
             // Preamble node: no result (consumed), but step still advances
             step++;
-            if (lifetimes && outputNodeIds) {
-              const deadNodeIds = findDeadTensorsAtStep(lifetimes, step, outputNodeIds, alreadyReleased);
-              for (const deadId of deadNodeIds) {
-                const storage = nodeToStorage.get(deadId);
-                if (storage && canSafelyRelease(storage, nodeToStorage)) {
-                  releaseBufferImmediate(storage);
-                  nodeToStorage.delete(deadId);
-                  alreadyReleased.add(deadId);
-                }
-              }
-            }
+            releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
             // Reduction node: has the result
             const reductionNode = nodes[nodeIdx + 1];
             if (reductionNode.result) {
               nodeToStorage.set(reductionNode.id, reductionNode.result);
             }
             step++;
-            if (lifetimes && outputNodeIds) {
-              const deadNodeIds = findDeadTensorsAtStep(lifetimes, step, outputNodeIds, alreadyReleased);
-              for (const deadId of deadNodeIds) {
-                const storage = nodeToStorage.get(deadId);
-                if (storage && canSafelyRelease(storage, nodeToStorage)) {
-                  releaseBufferImmediate(storage);
-                  nodeToStorage.delete(deadId);
-                  alreadyReleased.add(deadId);
-                }
-              }
-            }
+            releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
           } else {
             step += 2;
           }
@@ -602,42 +523,14 @@ export async function executeSequentialSegmentWithEarlyRelease(
               const adamInputs = adamNode.inputs.map(ref => getInputStorage(ref, adamBackend));
               const adamBackendInputs = adamInputs.map((s) => s.backendTensor);
 
-              setCurrentOpLabel("adamStep");
-              setProfileModule(adamNode.module ?? "unknown");
-              const _profT0 = profileOpBegin("adamStep");
-              let adamResult: BackendTensor;
-              try {
-                adamResult = await executeOp(adamNode, adamBackendInputs, adamBackend);
-              } finally {
-                profileOpEnd("adamStep", _profT0);
-                setCurrentOpLabel(null);
-                setProfileModule("unknown");
-              }
-
-              const adamAliasedIdx = adamBackendInputs.findIndex(b => b === adamResult);
-              if (adamAliasedIdx >= 0 && (adamResult as { ownsBuffer?: boolean }).ownsBuffer === true) {
-                adamResult = { ...adamResult, ownsBuffer: false } as BackendTensor;
-              }
-              const adamIsView = (adamResult as { ownsBuffer?: boolean }).ownsBuffer === false;
-              const adamBaseId = adamIsView && adamInputs.length > 0
-                ? adamInputs[adamAliasedIdx >= 0 ? adamAliasedIdx : 0].id
-                : undefined;
-              adamNode.result = createStorageHandle(adamNode.device, adamResult, adamBaseId);
+              const adamResult = await withProfileContext("adamStep", adamNode.module, () =>
+                executeOp(adamNode, adamBackendInputs, adamBackend));
+              adamNode.result = wrapResultAsStorage(adamNode.device, adamResult, adamBackendInputs, adamInputs);
 
               if (enableEarlyRelease) {
                 nodeToStorage.set(adamNode.id, adamNode.result);
                 step++;
-                if (lifetimes && outputNodeIds) {
-                  const deadNodeIds = findDeadTensorsAtStep(lifetimes, step, outputNodeIds, alreadyReleased);
-                  for (const deadId of deadNodeIds) {
-                    const storage = nodeToStorage.get(deadId);
-                    if (storage && canSafelyRelease(storage, nodeToStorage)) {
-                      releaseBufferImmediate(storage);
-                      nodeToStorage.delete(deadId);
-                      alreadyReleased.add(deadId);
-                    }
-                  }
-                }
+                releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
               } else {
                 step++;
               }
@@ -664,18 +557,8 @@ export async function executeSequentialSegmentWithEarlyRelease(
       const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
       const backendInputs = inputs.map((s) => s.backendTensor);
 
-      let resultTensor = await executeOp(node, backendInputs, nodeBackend);
-      const aliasedInputIdx = backendInputs.findIndex(b => b === resultTensor);
-      if (aliasedInputIdx >= 0 && (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
-        resultTensor = { ...resultTensor, ownsBuffer: false } as BackendTensor;
-      }
-      const isView =
-        (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === false;
-      const baseStorageId =
-        isView && inputs.length > 0
-          ? inputs[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
-          : undefined;
-      node.result = createStorageHandle(node.device, resultTensor, baseStorageId);
+      const resultTensor = await executeOp(node, backendInputs, nodeBackend);
+      node.result = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
 
       // Record action in lowered plan builder
       if (loweredPlanBuilder && nodeIdToFinalPos) {
@@ -694,22 +577,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
         nodeToStorage.set(node.id, node.result);
         step++;
 
-        if (lifetimes && outputNodeIds) {
-          const deadNodeIds = findDeadTensorsAtStep(
-            lifetimes,
-            step,
-            outputNodeIds,
-            alreadyReleased,
-          );
-          for (const deadId of deadNodeIds) {
-            const storage = nodeToStorage.get(deadId);
-            if (storage && canSafelyRelease(storage, nodeToStorage)) {
-              releaseBufferImmediate(storage);
-              nodeToStorage.delete(deadId);
-              alreadyReleased.add(deadId);
-            }
-          }
-        }
+        releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
       } else {
         step++;
       }

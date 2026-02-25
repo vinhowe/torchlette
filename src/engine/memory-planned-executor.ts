@@ -17,16 +17,14 @@ import type {
 } from "../backend/types";
 import type { ExecutionPlan, StorageHandle } from "./lazy";
 import {
-  canSafelyRelease,
-  createStorageHandle,
+  wrapResultAsStorage,
   pretunePlanMatmuls,
-  releaseBufferImmediate,
+  releaseDeadTensors,
 } from "./lazy";
 import { executeOp, getInputStorage } from "./op-dispatch";
 import {
   analyzeLifetimes,
   computeBufferSize,
-  findDeadTensorsAtStep,
   findDonationOpportunities,
   MemoryLimitExceededError,
   type MemoryPlan,
@@ -323,41 +321,13 @@ export async function executeWithMemoryPlanning(
     // Execute the operation via canonical dispatch (with donation support)
     resultTensor = await executeOp(node, backendInputs, nodeBackend, donationOpts);
 
-    // Safety: if a backend op returned the exact same tensor object as one of
-    // its inputs (e.g. contiguous on an already-contiguous tensor), creating a
-    // separate owning StorageHandle would double-free the underlying buffer.
-    const aliasedInputIdx = backendInputs.findIndex(b => b === resultTensor);
-    if (aliasedInputIdx >= 0 && (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
-      // Clone the tensor object so we don't mutate the input's ownsBuffer field.
-      // Only applies to backends with explicit ownsBuffer (e.g. WebGPU).
-      resultTensor = { ...resultTensor, ownsBuffer: false } as BackendTensor;
-    }
-    const isView =
-      (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === false;
-    const baseStorageId =
-      isView && inputs.length > 0
-        ? inputs[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
-        : undefined;
-    const storage = createStorageHandle(node.device, resultTensor, baseStorageId);
+    const storage = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
     node.result = storage;
     nodeResults.set(node.id, storage);
 
     // Release dead buffers after each step if early release is enabled
     if (enableEarlyRelease) {
-      const deadNodeIds = findDeadTensorsAtStep(
-        lifetimes,
-        step + 1, // We just completed this step
-        outputNodeIds,
-        alreadyReleased,
-      );
-      for (const deadId of deadNodeIds) {
-        const deadStorage = nodeResults.get(deadId);
-        if (deadStorage && canSafelyRelease(deadStorage, nodeResults)) {
-          releaseBufferImmediate(deadStorage);
-          nodeResults.delete(deadId);
-          alreadyReleased.add(deadId);
-        }
-      }
+      releaseDeadTensors(lifetimes, step + 1, outputNodeIds, alreadyReleased, nodeResults);
     }
   }
 

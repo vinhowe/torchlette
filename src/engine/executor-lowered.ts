@@ -38,9 +38,9 @@ import {
   ENCODER_COPY_OPS,
 } from "./lowered-plan";
 import type { LazyIRNode, LazyRef, StorageHandle, ExecutionPlan } from "./lazy-types";
-import { createStorageHandle, ensureWebGPUMatmulImports, _webgpuMatmulImports, _webgpuMatmulGeomImports } from "./node-factory";
+import { createStorageHandle, wrapResultAsStorage, ensureWebGPUMatmulImports, _webgpuMatmulImports, _webgpuMatmulGeomImports } from "./node-factory";
 import { storageTracker } from "./storage-tracker";
-import { getInputStorage, executeOp } from "./op-dispatch";
+import { getInputStorage, executeOp, withProfileContext } from "./op-dispatch";
 import { pretunePlanMatmuls } from "./plan-builder";
 import { executeFusedSegment } from "./segment-executors";
 import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "./matmul-epilogue";
@@ -287,12 +287,8 @@ export async function executeLoweredPlan(
               const vNodeBackend = getBackend(vNode.device) ?? backend;
               const vInputs = vNode.inputs.map(ref => getInputStorage(ref, vNodeBackend));
               const vBackendInputs = vInputs.map(s => s.backendTensor);
-              let vResultTensor = await executeOp(vNode, vBackendInputs, vNodeBackend);
-              const vAliasedInputIdx = vBackendInputs.findIndex(b => b === vResultTensor);
-              if (vAliasedInputIdx >= 0 && (vResultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
-                vResultTensor = { ...vResultTensor, ownsBuffer: false } as BackendTensor;
-              }
-              vNode.result = createStorageHandle(vNode.device, vResultTensor);
+              const vResultTensor = await executeOp(vNode, vBackendInputs, vNodeBackend);
+              vNode.result = wrapResultAsStorage(vNode.device, vResultTensor, vBackendInputs, vInputs);
             }
             if (_replayTiming) { _tView += performance.now() - _vT0; _nViews++; }
             break;
@@ -312,16 +308,8 @@ export async function executeLoweredPlan(
             const nodeBackend = getBackend(node.device) ?? backend;
             const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
             const backendInputs = inputs.map(s => s.backendTensor);
-            let resultTensor = await executeOp(node, backendInputs, nodeBackend);
-            const aliasedInputIdx = backendInputs.findIndex(b => b === resultTensor);
-            if (aliasedInputIdx >= 0 && (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
-              resultTensor = { ...resultTensor, ownsBuffer: false } as BackendTensor;
-            }
-            const isView = (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === false;
-            const baseStorageId = isView && inputs.length > 0
-              ? inputs[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
-              : undefined;
-            node.result = createStorageHandle(node.device, resultTensor, baseStorageId);
+            const resultTensor = await executeOp(node, backendInputs, nodeBackend);
+            node.result = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
             if (_replayTiming) { _tSequential += performance.now() - _seqT0; _nSequential++; }
             break;
           }
@@ -756,16 +744,9 @@ export async function executeLoweredPlan(
             prologues,
           };
 
-          setCurrentOpLabel(epLabel);
-          setProfileModule(matmulNode.module ?? "unknown");
-          const _profT0 = profileOpBegin(epLabel);
-          try {
-            await executeMatmulWithEpilogue(matmulNode, epiloguePlan, backend);
-          } finally {
-            profileOpEnd(epLabel, _profT0);
-            setCurrentOpLabel(null);
-            setProfileModule("unknown");
-          }
+          await withProfileContext(epLabel, matmulNode.module, () =>
+            executeMatmulWithEpilogue(matmulNode, epiloguePlan, backend),
+          );
 
           // ── Cache dispatch config for next step ──
           // Compute matmul geometry from the resolved inputs (shapes are stable across steps).
@@ -865,16 +846,9 @@ export async function executeLoweredPlan(
             isMean: reductionNode.op === "mean",
           };
           const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${reductionPlan.op}`;
-          setCurrentOpLabel(rpLabel);
-          setProfileModule(preambleNode.module ?? "unknown");
-          const _profT0 = profileOpBegin(rpLabel);
-          try {
-            await executeReductionWithPreamble(reductionPlan, backend);
-          } finally {
-            profileOpEnd(rpLabel, _profT0);
-            setCurrentOpLabel(null);
-            setProfileModule("unknown");
-          }
+          await withProfileContext(rpLabel, preambleNode.module, () =>
+            executeReductionWithPreamble(reductionPlan, backend),
+          );
 
           // Record dispatches and node results
           if (shouldRecord) {
@@ -917,13 +891,9 @@ export async function executeLoweredPlan(
           try {
             const adamBackend = getBackend(planNodes[action.nodeIndices[0]].device) ?? backend;
             const adamOp = adamBackend.ops.adamStep!;
-            setCurrentOpLabel("adamStep");
-            setProfileModule("optimizer.step");
-            const _adamBatchT0 = profileOpBegin("adamStep");
-            await executeAdamBatchInner(planNodes, action.nodeIndices, adamOp, (ref) => getInputStorage(ref, adamBackend));
-            profileOpEnd("adamStep", _adamBatchT0);
-            setCurrentOpLabel(null);
-            setProfileModule("unknown");
+            await withProfileContext("adamStep", "optimizer.step", () =>
+              executeAdamBatchInner(planNodes, action.nodeIndices, adamOp, (ref) => getInputStorage(ref, adamBackend)),
+            );
           } finally {
             setAdamBatchMode(false);
           }
@@ -959,16 +929,8 @@ export async function executeLoweredPlan(
           const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
           const backendInputs = inputs.map(s => s.backendTensor);
 
-          let resultTensor = await executeOp(node, backendInputs, nodeBackend);
-          const aliasedInputIdx = backendInputs.findIndex(b => b === resultTensor);
-          if (aliasedInputIdx >= 0 && (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
-            resultTensor = { ...resultTensor, ownsBuffer: false } as BackendTensor;
-          }
-          const isView = (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === false;
-          const baseStorageId = isView && inputs.length > 0
-            ? inputs[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
-            : undefined;
-          node.result = createStorageHandle(node.device, resultTensor, baseStorageId);
+          const resultTensor = await executeOp(node, backendInputs, nodeBackend);
+          node.result = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
           stats.sequentialNodes++;
 
           // Record for replay cache
@@ -1029,7 +991,7 @@ export async function executeLoweredPlan(
                   dtype: bt.dtype,
                   size: bt.size,
                   strides: bt.strides.slice(),
-                  isView: isView,
+                  isView: (node.result!.backendTensor as { ownsBuffer?: boolean }).ownsBuffer === false,
                 }});
               }
               // Record side output for fusedAttentionForward so replay

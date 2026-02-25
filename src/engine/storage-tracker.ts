@@ -1,4 +1,5 @@
 import type { StorageHandle } from "./lazy-types";
+import { findDeadTensorsAtStep, type TensorLifetime } from "./memory-planning";
 import { getNextStorageId } from "./node-factory";
 
 /**
@@ -413,5 +414,30 @@ export function releaseBufferImmediate(storage: StorageHandle): void {
   // which waits for the GPU fence before actually destroying the buffer
   if (tensor.destroy) {
     tensor.destroy();
+  }
+}
+
+/**
+ * Find and release all tensors that are dead at a given execution step.
+ *
+ * Combines findDeadTensorsAtStep + canSafelyRelease + releaseBufferImmediate
+ * into a single call. No-ops if lifetimes or outputNodeIds are null.
+ */
+export function releaseDeadTensors(
+  lifetimes: Map<number, TensorLifetime> | null,
+  step: number,
+  outputNodeIds: Set<number> | null,
+  alreadyReleased: Set<number>,
+  nodeToStorage: Map<number, StorageHandle>,
+): void {
+  if (!lifetimes || !outputNodeIds) return;
+  const deadNodeIds = findDeadTensorsAtStep(lifetimes, step, outputNodeIds, alreadyReleased);
+  for (const deadId of deadNodeIds) {
+    const storage = nodeToStorage.get(deadId);
+    if (storage && canSafelyRelease(storage, nodeToStorage)) {
+      releaseBufferImmediate(storage);
+      nodeToStorage.delete(deadId);
+      alreadyReleased.add(deadId);
+    }
   }
 }
