@@ -249,78 +249,68 @@ export function f16ArrayToF32Array(data: Uint16Array): number[] {
 // initWebGPU
 // ============================================================================
 
-export async function initWebGPU(): Promise<boolean> {
-  if (gpuContext) {
-    return true;
-  }
-  lastInitError = null;
-
-  let adapter: GPUAdapter | null = null;
-  let provider: WebGPUProvider;
-
-  // Try browser-native WebGPU first
+/**
+ * Acquire a GPU adapter from the browser or Node.js WebGPU module.
+ * Returns the adapter and provider, or sets lastInitError and returns null.
+ */
+async function acquireAdapter(): Promise<{ adapter: GPUAdapter; provider: WebGPUProvider } | null> {
   if (isBrowserWithWebGPU()) {
     const gpu = (navigator as { gpu: WebGPUProvider }).gpu;
-    provider = gpu;
     try {
-      adapter = await gpu.requestAdapter();
+      const adapter = await gpu.requestAdapter();
+      if (!adapter) {
+        lastInitError = "No WebGPU adapter found";
+        return null;
+      }
+      return { adapter, provider: gpu };
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error";
-      lastInitError = `WebGPU requestAdapter failed: ${message}`;
-      return false;
+      lastInitError = `WebGPU requestAdapter failed: ${error instanceof Error ? error.message : "Unknown error"}`;
+      return null;
     }
-  } else {
-    // Fall back to Node.js webgpu module
-    const mod = await loadWebGPU();
-    if (!mod) {
-      lastInitError = "webgpu module not available";
-      return false;
-    }
-    Object.assign(globalThis, mod.globals);
-    const options = parseWebGPUOptions();
-    const nodeProvider = mod.create(options);
-    if (!nodeProvider) {
-      lastInitError = "webgpu create() returned no provider";
-      return false;
-    }
-    provider = nodeProvider;
-    try {
-      adapter = await nodeProvider.requestAdapter();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error";
-      lastInitError = `WebGPU requestAdapter failed: ${message}`;
-      return false;
-    }
+  }
+
+  // Fall back to Node.js webgpu module
+  const mod = await loadWebGPU();
+  if (!mod) {
+    lastInitError = "webgpu module not available";
+    return null;
+  }
+  Object.assign(globalThis, mod.globals);
+  const options = parseWebGPUOptions();
+  const nodeProvider = mod.create(options);
+  if (!nodeProvider) {
+    lastInitError = "webgpu create() returned no provider";
+    return null;
+  }
+  try {
+    const adapter = await nodeProvider.requestAdapter();
     if (!adapter) {
-      lastInitError =
-        `No WebGPU adapter found` +
+      lastInitError = `No WebGPU adapter found` +
         (options.length > 0 ? ` (options: ${options.join(", ")})` : "");
-      return false;
+      return null;
     }
+    return { adapter, provider: nodeProvider };
+  } catch (error) {
+    lastInitError = `WebGPU requestAdapter failed: ${error instanceof Error ? error.message : "Unknown error"}`;
+    return null;
   }
+}
 
-  if (!adapter) {
-    lastInitError = "No WebGPU adapter found";
-    return false;
-  }
-  // Check for subgroup support
-  const subgroupSupport = detectSubgroupSupport(adapter);
-  setSubgroupSupport(subgroupSupport);
-
-  // Check for shader-f16 support
-  const f16Supported = adapter.features?.has("shader-f16") ?? false;
-
-  let device: GPUDevice;
-  let actualF16Supported = f16Supported;
-
-  // Request higher maxStorageBufferBindingSize to support large model buffers
-  // Default is 128MB, but GPT-2 embeddings can be 150MB+
+/**
+ * Request a GPU device with cascading feature fallback.
+ * Tries all features first, then without f16, then without any features.
+ */
+async function requestDeviceWithFallback(
+  adapter: GPUAdapter,
+  f16Supported: boolean,
+  subgroupSupport: SubgroupSupport,
+): Promise<{ device: GPUDevice; actualF16Supported: boolean } | null> {
   const adapterMaxStorage =
     adapter.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const adapterMaxBuffer =
-    (adapter.limits as Record<string, number>)?.maxBufferSize ?? 256 * 1024 * 1024;
+    adapter.limits?.maxBufferSize ?? 256 * 1024 * 1024;
   const adapterMaxStorageBuffers =
-    (adapter.limits as Record<string, number>)?.maxStorageBuffersPerShaderStage ?? 8;
+    adapter.limits?.maxStorageBuffersPerShaderStage ?? 8;
 
   console.log(`[WebGPU] Adapter limits: maxStorageBufferBindingSize=${adapterMaxStorage}, maxBufferSize=${adapterMaxBuffer}, maxStorageBuffersPerShaderStage=${adapterMaxStorageBuffers}`);
 
@@ -330,51 +320,66 @@ export async function initWebGPU(): Promise<boolean> {
     maxStorageBuffersPerShaderStage: adapterMaxStorageBuffers,
   };
 
+  // Attempt 1: all features
   try {
-    // Request device with optional features and higher limits
     const requiredFeatures: string[] = [];
-    if (subgroupSupport.supported) {
-      requiredFeatures.push("subgroups");
-    }
-    if (f16Supported) {
-      requiredFeatures.push("shader-f16");
-    }
+    if (subgroupSupport.supported) requiredFeatures.push("subgroups");
+    if (f16Supported) requiredFeatures.push("shader-f16");
     if (isProfilingEnabled() && adapter.features?.has("timestamp-query")) {
       requiredFeatures.push("timestamp-query");
     }
-    device = await adapter.requestDevice({
-      requiredFeatures:
-        requiredFeatures.length > 0 ? requiredFeatures : undefined,
+    const device = await adapter.requestDevice({
+      requiredFeatures: requiredFeatures.length > 0 ? requiredFeatures : undefined,
       requiredLimits,
     });
-  } catch (error) {
-    // If features failed, try with fewer features
-    try {
-      // Try without f16 first
-      const fallbackFeatures: string[] = [];
-      if (subgroupSupport.supported) {
-        fallbackFeatures.push("subgroups");
-      }
-      device = await adapter.requestDevice({
-        requiredFeatures:
-          fallbackFeatures.length > 0 ? fallbackFeatures : undefined,
-        requiredLimits,
-      });
-      actualF16Supported = false;
-    } catch (retryError) {
-      // Try without any features but still with higher limits
-      try {
-        device = await adapter.requestDevice({ requiredLimits });
-        setSubgroupSupport({ supported: false });
-        actualF16Supported = false;
-      } catch (finalError) {
-        const message =
-          finalError instanceof Error ? finalError.message : "Unknown error";
-        lastInitError = `WebGPU requestDevice failed: ${message}`;
-        return false;
-      }
-    }
+    return { device, actualF16Supported: f16Supported };
+  } catch {
+    // Fall through
   }
+
+  // Attempt 2: without f16
+  try {
+    const fallbackFeatures: string[] = [];
+    if (subgroupSupport.supported) fallbackFeatures.push("subgroups");
+    const device = await adapter.requestDevice({
+      requiredFeatures: fallbackFeatures.length > 0 ? fallbackFeatures : undefined,
+      requiredLimits,
+    });
+    return { device, actualF16Supported: false };
+  } catch {
+    // Fall through
+  }
+
+  // Attempt 3: no features, just limits
+  try {
+    const device = await adapter.requestDevice({ requiredLimits });
+    setSubgroupSupport({ supported: false });
+    return { device, actualF16Supported: false };
+  } catch (finalError) {
+    lastInitError = `WebGPU requestDevice failed: ${finalError instanceof Error ? finalError.message : "Unknown error"}`;
+    return null;
+  }
+}
+
+export async function initWebGPU(): Promise<boolean> {
+  if (gpuContext) {
+    return true;
+  }
+  lastInitError = null;
+
+  const acquired = await acquireAdapter();
+  if (!acquired) return false;
+  const { adapter, provider } = acquired;
+
+  const subgroupSupport = detectSubgroupSupport(adapter);
+  setSubgroupSupport(subgroupSupport);
+
+  const f16Supported = adapter.features?.has("shader-f16") ?? false;
+
+  const deviceResult = await requestDeviceWithFallback(adapter, f16Supported, subgroupSupport);
+  if (!deviceResult) return false;
+  const { device, actualF16Supported } = deviceResult;
+
   setGpuContext({
     provider,
     device,
@@ -382,10 +387,9 @@ export async function initWebGPU(): Promise<boolean> {
     pipelines: new Map(),
     f16Supported: actualF16Supported,
   });
-  // Set queue on buffer pool for fence integration (§14)
+
   bufferPool.setQueue(device.queue);
 
-  // Apply pool budget from env var if set (e.g. TORCHLETTE_POOL_BUDGET_MB=2000)
   if (typeof process !== "undefined" && process.env?.TORCHLETTE_POOL_BUDGET_MB) {
     const mb = Number(process.env.TORCHLETTE_POOL_BUDGET_MB);
     if (Number.isFinite(mb) && mb > 0) {
@@ -393,16 +397,12 @@ export async function initWebGPU(): Promise<boolean> {
     }
   }
 
-  // Initialize GPU timestamp profiling if supported
   if (isProfilingEnabled() && device.features.has("timestamp-query")) {
     initGpuTimestamps(device);
   }
 
-  // Register donation functions for memory planning
   registerWebGPUDonation(donateBuffer, getBufferSize);
 
-  // Enable shared encoder for command buffer consolidation
-  // Set TORCHLETTE_BATCH_SUBMITS=0 to disable for debugging
   const batchSubmits = typeof process !== "undefined"
     ? process.env?.TORCHLETTE_BATCH_SUBMITS
     : undefined;

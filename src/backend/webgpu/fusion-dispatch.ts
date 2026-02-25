@@ -5,7 +5,7 @@
  * Supports vectorized memory coalescing (§15.3) for improved bandwidth.
  */
 
-import { submitOrCollect, getSharedEncoderInstance, getCurrentOpLabel, createParamsBuffer, releaseParamsBuffer, allocateOutputBuffer, trackSharedEncoderWrite, cachedCreateBindGroup, type RecordedDispatch, getAndClearLastBindGroupBuffers } from "./index";
+import { dispatchComputePass, createParamsBuffer, releaseParamsBuffer, allocateOutputBuffer, trackSharedEncoderWrite, cachedCreateBindGroup, type RecordedDispatch } from "./index";
 
 /** Module-level recording buffer (shared with index.ts recording system). */
 let fusionRecordingBuffer: RecordedDispatch[] | null = null;
@@ -15,7 +15,7 @@ export function setFusionRecordingBuffer(buf: RecordedDispatch[] | null): void {
 
 import type { DType } from "../types";
 import { dtypeBytes } from "./shape-utils";
-import { profileApiCall, getTimestampWrites, getProfileModule } from "./profiler";
+import { sizeOf } from "../../core/shape";
 import {
   type FusedKernelRecipe,
   type GeneratedKernel,
@@ -220,7 +220,7 @@ export function dispatchFusedKernel(
 
   // All outputs must have the same shape (required for elementwise fusion)
   const primaryOutput = recipe.outputs[0];
-  const totalElements = primaryOutput.shape.reduce((a, b) => a * b, 1);
+  const totalElements = sizeOf(primaryOutput.shape);
 
   // Create output buffers for all outputs (via shared buffer pool)
   const outputBuffers: GPUBuffer[] = [];
@@ -258,39 +258,7 @@ export function dispatchFusedKernel(
   const workgroupsX = Math.min(totalWorkgroups, MAX_WG_DIM);
   const workgroupsY = totalWorkgroups <= MAX_WG_DIM ? 1 : Math.ceil(totalWorkgroups / MAX_WG_DIM);
 
-  // Record dispatch if recording is active
-  if (fusionRecordingBuffer) {
-    fusionRecordingBuffer.push({
-      pipeline,
-      bindGroup,
-      workgroupsX,
-      workgroupsY,
-      workgroupsZ: 1,
-      buffers: getAndClearLastBindGroupBuffers(),
-      label: getCurrentOpLabel() ?? undefined,
-      module: getProfileModule(),
-    });
-  }
-
-  const sharedEnc = getSharedEncoderInstance();
-  const opLabel = getCurrentOpLabel() ?? "fused";
-  if (sharedEnc) {
-    const tsWrites = getTimestampWrites(opLabel);
-    const pass = sharedEnc.beginComputePass(tsWrites ? { timestampWrites: tsWrites } : undefined);
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(workgroupsX, workgroupsY);
-    pass.end();
-  } else {
-    const encoder = device.createCommandEncoder();
-    const tsWrites = getTimestampWrites(opLabel);
-    const pass = encoder.beginComputePass(tsWrites ? { timestampWrites: tsWrites } : undefined);
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(workgroupsX, workgroupsY);
-    pass.end();
-    submitOrCollect(encoder.finish());
-  }
+  dispatchComputePass(pipeline, bindGroup, workgroupsX, workgroupsY, 1, fusionRecordingBuffer);
 
   // Release the params uniform buffer via the params buffer pool (handles deferred destruction)
   releaseParamsBuffer(paramsBuffer);

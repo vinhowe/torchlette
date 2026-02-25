@@ -5,7 +5,7 @@
 
 import type { BackendTensor } from "../../types";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
-import { GPUBufferUsage } from "../gpu-types";
+import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import { WORKGROUP_SIZE, compute2DDispatch, dtypeBytes, broadcastShapes, gcd } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchComputePass, dispatchMatmul, getPipeline } from "../dispatch";
@@ -31,8 +31,8 @@ export function matmul(
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
   const ctx = requireContext();
-  const a = _a as WebGPUTensor;
-  const b = _b as WebGPUTensor;
+  const a = asGPUTensor(_a);
+  const b = asGPUTensor(_b);
 
   const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;

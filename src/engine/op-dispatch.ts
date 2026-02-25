@@ -11,6 +11,7 @@ import type {
 } from "../backend/types";
 import { getBackend } from "../backend/registry";
 import { setCurrentOpLabel } from "../backend/webgpu";
+import { sizeOf } from "../core/shape";
 import { profileOpBegin, profileOpEnd, setProfileModule } from "../backend/webgpu/profiler";
 import type { LazyIRNode, LazyRef, StorageHandle } from "./lazy-types";
 import { createStorageHandle } from "./node-factory";
@@ -121,7 +122,7 @@ function executeCreationOp(
       if (backend.ops.zeros) {
         return backend.ops.zeros(node.shape);
       }
-      const numEl = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const numEl = sizeOf(node.shape);
       return backend.ops.tensorFromArray(new Array(numEl).fill(0), node.shape);
     }
 
@@ -130,7 +131,7 @@ function executeCreationOp(
       if (backend.ops.full) {
         return backend.ops.full(node.shape, payload.fillValue);
       }
-      const numEl = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const numEl = sizeOf(node.shape);
       return backend.ops.tensorFromArray(new Array(numEl).fill(payload.fillValue), node.shape);
     }
 
@@ -158,7 +159,7 @@ function executeCreationOp(
     case "rand": {
       const rp = getPayload<{ seed: number }>(node)!;
       if (backend.ops.rand) return backend.ops.rand(node.shape, rp.seed);
-      const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const n = sizeOf(node.shape);
       const vals = new Array(n);
       for (let i = 0; i < n; i++) vals[i] = Math.random();
       return backend.ops.tensorFromArray(vals, node.shape);
@@ -167,7 +168,7 @@ function executeCreationOp(
     case "randn": {
       const rp = getPayload<{ seed: number }>(node)!;
       if (backend.ops.randn) return backend.ops.randn(node.shape, rp.seed);
-      const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const n = sizeOf(node.shape);
       const vals = new Array(n);
       for (let i = 0; i < n; i += 2) {
         const u1 = Math.random(), u2 = Math.random();
@@ -181,7 +182,7 @@ function executeCreationOp(
     case "bernoulli": {
       const bp = getPayload<{ seed: number; p: number }>(node)!;
       if (backend.ops.bernoulli) return backend.ops.bernoulli(node.shape, bp.p, bp.seed);
-      const n = node.shape.reduce((a: number, b: number) => a * b, 1);
+      const n = sizeOf(node.shape);
       const vals = new Array(n);
       for (let i = 0; i < n; i++) vals[i] = Math.random() < bp.p ? 1 : 0;
       return backend.ops.tensorFromArray(vals, node.shape);

@@ -5,6 +5,7 @@
 
 import type { BackendTensor } from "../../types";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
+import { asGPUTensor } from "../gpu-types";
 import {
   toIndexShape,
   sizeOf,
@@ -99,9 +100,9 @@ export function where(
   y: BackendTensor,
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  const condTensor = condition as WebGPUTensor;
-  const xTensor = x as WebGPUTensor;
-  const yTensor = y as WebGPUTensor;
+  const condTensor = asGPUTensor(condition);
+  const xTensor = asGPUTensor(x);
+  const yTensor = asGPUTensor(y);
 
   const outShape = broadcastThreeShapes(
     condTensor.shape,

@@ -14,7 +14,7 @@
 
 import type { BackendTensor } from "../types";
 import type { GPUBuffer, GPUDevice, WebGPUTensor } from "./gpu-types";
-import { GPUBufferUsage, STORAGE_BUFFER_USAGE } from "./gpu-types";
+import { GPUBufferUsage, STORAGE_BUFFER_USAGE, asGPUTensor } from "./gpu-types";
 import {
   arenaBufferSet, trackSharedEncoderWrite, requireContext,
   replayPinnedBufferSet, paramsSequenceSet,
@@ -97,7 +97,7 @@ export function allocateOutputBuffer(
 export function donateBuffer(
   tensor: BackendTensor,
 ): GPUBuffer | null {
-  const t = tensor as WebGPUTensor;
+  const t = asGPUTensor(tensor);
 
   // Can only donate if tensor owns the buffer
   if (!t.ownsBuffer) {
@@ -124,7 +124,7 @@ export function donateBuffer(
 export function getBufferSize(
   tensor: BackendTensor,
 ): number {
-  const t = tensor as WebGPUTensor;
+  const t = asGPUTensor(tensor);
   return t.buffer.size ?? 0;
 }
 

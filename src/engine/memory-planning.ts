@@ -10,6 +10,7 @@
  */
 
 import type { DType } from "../backend/types";
+import { sizeOf } from "../core/shape";
 
 // ============================================================================
 // Core Types
@@ -110,7 +111,7 @@ export function getSizeForClass(sizeClass: SizeClass): number {
  * Compute buffer size in bytes for a tensor.
  */
 export function computeBufferSize(shape: number[], dtype: DType): number {
-  const elements = shape.reduce((a, b) => a * b, 1);
+  const elements = sizeOf(shape);
   const bytesPerElement =
     dtype === "f32" || dtype === "i32" ? 4 : dtype === "f16" ? 2 : 1;
   return elements * bytesPerElement;

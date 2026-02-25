@@ -1,5 +1,6 @@
 import type { Backend } from "../backend/types";
 import type { ExecutionPlan, LazyIRNode, LazyRef } from "./lazy-types";
+import { sizeOf } from "../core/shape";
 
 /**
  * Mark a LazyIRNode as a checkpoint boundary.
@@ -128,7 +129,7 @@ export function extractPlanMetadata(plan: ExecutionPlan): {
         : node.dtype === "f16"
           ? 2
           : 1;
-    const numElements = node.shape.reduce((a, b) => a * b, 1);
+    const numElements = sizeOf(node.shape);
     nodeSizes.set(node.id, numElements * bytesPerElement);
   }
 

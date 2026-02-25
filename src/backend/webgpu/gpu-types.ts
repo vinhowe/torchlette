@@ -81,6 +81,7 @@ export type GPUDevice = {
 export type GPUAdapterLimits = {
   maxStorageBufferBindingSize?: number;
   maxStorageBuffersPerShaderStage?: number;
+  maxBufferSize?: number;
 };
 
 export type GPUAdapter = {

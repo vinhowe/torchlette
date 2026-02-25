@@ -8,7 +8,7 @@ import type {
   ArgReduceOptions,
 } from "../../types";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
-import { GPUBufferUsage } from "../gpu-types";
+import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import {
   broadcastShapes,
   toIndexShape,
@@ -36,8 +36,8 @@ function comparisonOp(
   b: BackendTensor,
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  const aTensor = a as WebGPUTensor;
-  const bTensor = b as WebGPUTensor;
+  const aTensor = asGPUTensor(a);
+  const bTensor = asGPUTensor(b);
 
   const outShape = broadcastShapes(aTensor.shape, bTensor.shape);
   const indexShape = toIndexShape(outShape);
@@ -165,7 +165,7 @@ function argReduceOp(
   options: ArgReduceOptions,
 ): BackendTensor {
   const ctx = requireContext();
-  const tensor = a as WebGPUTensor;
+  const tensor = asGPUTensor(a);
   const inputShape = tensor.shape;
   const rank = inputShape.length;
 

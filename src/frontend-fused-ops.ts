@@ -2,6 +2,7 @@ import type { Tensor as RuntimeTensor } from "./runtime/tensor";
 import type { Torchlette } from "./frontend";
 import type { Tensor } from "./frontend-tensor";
 import { autocastCastImpl, applyAutocastImpl } from "./frontend-autocast";
+import { sizeOf } from "./core/shape";
 
 /**
  * Softmax along a dimension.
@@ -241,7 +242,7 @@ export function layernormImpl(
 
   // Use fused forward kernel on WebGPU
   if (x.device === "webgpu") {
-    const numRows = xShape.slice(0, rank - 1).reduce((a, b) => a * b, 1);
+    const numRows = sizeOf(xShape.slice(0, rank - 1));
     const config = { numRows, featureDim: lastDimSize, eps };
     const result = torch.runtime.fusedLayerNormForward(
       x._unwrap(), weight._unwrap(), bias._unwrap(), config,
@@ -306,7 +307,7 @@ function layernormBackwardImpl(
 
   if (savedX.device === "webgpu") {
     // Fully fused path: 2 dispatches total (gradX + gradWeightBias)
-    const numRows = savedX.shape.slice(0, rank - 1).reduce((a: number, b: number) => a * b, 1);
+    const numRows = sizeOf(savedX.shape.slice(0, rank - 1));
     const config = { numRows, featureDim: lastDimSize, eps };
 
     gradX = torch.runtime.fusedLayerNormBackwardGradX(

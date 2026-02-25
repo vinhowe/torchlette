@@ -6,7 +6,7 @@
  */
 import type { BackendTensor, GatherOptions, ScatterAddOptions } from "../../types";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
-import { GPUBufferUsage } from "../gpu-types";
+import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import { WORKGROUP_SIZE, compute2DDispatch, contiguousStrides, wgslArray } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
@@ -34,8 +34,8 @@ export function gather(
   options: GatherOptions,
 ): BackendTensor {
   const ctx = requireContext();
-  const tensorA = a as WebGPUTensor;
-  const tensorIndex = index as WebGPUTensor;
+  const tensorA = asGPUTensor(a);
+  const tensorIndex = asGPUTensor(index);
   const { dim } = options;
   const inputShape = tensorA.shape;
   const indexShape = tensorIndex.shape;
@@ -186,9 +186,9 @@ export function scatterAdd(
   options: ScatterAddOptions,
 ): BackendTensor {
   const ctx = requireContext();
-  const tensorA = a as WebGPUTensor;
-  const tensorIndex = index as WebGPUTensor;
-  const tensorSrc = src as WebGPUTensor;
+  const tensorA = asGPUTensor(a);
+  const tensorIndex = asGPUTensor(index);
+  const tensorSrc = asGPUTensor(src);
   const { dim } = options;
   const inputShape = tensorA.shape;
   const rank = inputShape.length;

@@ -5,7 +5,7 @@
  */
 import type { BackendTensor, DType, TransposeOptions } from "../../types";
 import type { GPUBuffer, GPUDevice, WebGPUTensor } from "../gpu-types";
-import { GPUBufferUsage, STORAGE_BUFFER_USAGE } from "../gpu-types";
+import { GPUBufferUsage, STORAGE_BUFFER_USAGE, asGPUTensor } from "../gpu-types";
 import {
   sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch,
   contiguousStrides, checkContiguousStrides, dtypeBytes, dtypeToWgsl,
@@ -130,7 +130,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * Returns same tensor if already the target dtype.
  */
 export function cast(a: BackendTensor, dtype: DType): BackendTensor {
-  const tensor = a as WebGPUTensor;
+  const tensor = asGPUTensor(a);
   const ctx = requireContext();
 
   // No-op if already the target dtype
@@ -183,7 +183,7 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
     let src = tensor;
     let contiguousCopy: WebGPUTensor | null = null;
     if (!tensor.isContiguous || tensor.offset > 0) {
-      src = contiguous(tensor) as WebGPUTensor;
+      src = asGPUTensor(contiguous(tensor));
       contiguousCopy = src;
     }
     const result = castChunked(src, dtype, ctx, maxBindingSize, limits);
@@ -379,7 +379,7 @@ function inferReshapeStrides(
 }
 
 export function reshape(a: BackendTensor, shape: number[]): BackendTensor {
-  const tensor = a as WebGPUTensor;
+  const tensor = asGPUTensor(a);
   const expected = sizeOf(shape);
   if (expected !== tensor.size) {
     throw new Error("View shape does not match tensor size");
@@ -398,7 +398,7 @@ export function reshape(a: BackendTensor, shape: number[]): BackendTensor {
   }
 
   // Incompatible: must materialize first, transfer buffer ownership to result
-  const contig = contiguous(tensor) as WebGPUTensor;
+  const contig = asGPUTensor(contiguous(tensor));
   bufferPool.decRef(contig.buffer); // Transfer ownership to result tensor
   return createTensor(shape, contig.buffer, undefined,
     contig.offset, tensor.dtype, true);
@@ -409,7 +409,7 @@ export function reshape(a: BackendTensor, shape: number[]): BackendTensor {
  * Broadcast dimensions get stride=0 (same element repeated).
  */
 export function expand(a: BackendTensor, shape: number[]): BackendTensor {
-  const tensor = a as WebGPUTensor;
+  const tensor = asGPUTensor(a);
   const inputShape = tensor.shape;
   const inputStrides = tensor.strides;
 
@@ -469,7 +469,7 @@ export function expand(a: BackendTensor, shape: number[]): BackendTensor {
  * Handles large tensors by processing in chunks.
  */
 export function contiguous(a: BackendTensor): BackendTensor {
-  const tensor = a as WebGPUTensor;
+  const tensor = asGPUTensor(a);
 
   // Fast path: already contiguous - return a non-owning view.
   // Returning the same tensor object would cause the executor to create a
@@ -823,7 +823,7 @@ export function detectSimpleTranspose(tensor: WebGPUTensor): number[] | null {
  */
 export function ensureContiguous(tensor: WebGPUTensor): WebGPUTensor {
   if (tensor.isContiguous) return tensor;
-  return contiguous(tensor) as WebGPUTensor;
+  return asGPUTensor(contiguous(tensor));
 }
 
 /**
@@ -831,7 +831,7 @@ export function ensureContiguous(tensor: WebGPUTensor): WebGPUTensor {
  * The returned tensor shares the same buffer with an adjusted offset.
  */
 export function narrow(a: BackendTensor, dim: number, start: number, length: number): BackendTensor {
-  const tensor = a as WebGPUTensor;
+  const tensor = asGPUTensor(a);
   const rank = tensor.shape.length;
   if (dim < 0 || dim >= rank) {
     throw new Error(`narrow: dim ${dim} out of range for rank ${rank}`);
@@ -850,7 +850,7 @@ export function narrow(a: BackendTensor, dim: number, start: number, length: num
  * Writes grad into [start, start+length) along dim, zeros elsewhere.
  */
 export function narrowBackward(grad: BackendTensor, dim: number, start: number, originalLength: number): BackendTensor {
-  const gradTensor = ensureContiguous(grad as WebGPUTensor);
+  const gradTensor = ensureContiguous(asGPUTensor(grad));
   const ctx = requireContext();
 
   const outShape = gradTensor.shape.slice();
@@ -912,7 +912,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     dispatchX: dispatch.x, dispatchY: dispatch.y,
   });
 
-  if (gradTensor !== (grad as WebGPUTensor)) {
+  if (gradTensor !== asGPUTensor(grad)) {
     bufferPool.decRef(gradTensor.buffer);
     bufferPool.deferredDestroy(gradTensor.buffer, gradTensor.size * bytesPerElement);
   }
@@ -925,7 +925,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
  * The returned tensor shares the same buffer but with swapped strides.
  */
 export function transpose(a: BackendTensor, options: TransposeOptions): BackendTensor {
-  const tensor = a as WebGPUTensor;
+  const tensor = asGPUTensor(a);
   const { dim0, dim1 } = options;
   const inputShape = tensor.shape;
   const rank = inputShape.length;
@@ -964,7 +964,7 @@ export function transpose(a: BackendTensor, options: TransposeOptions): BackendT
  * Example: permute([2, 3, 4], [2, 0, 1]) -> [4, 2, 3]
  */
 export function permute(a: BackendTensor, dims: number[]): BackendTensor {
-  const tensor = a as WebGPUTensor;
+  const tensor = asGPUTensor(a);
   const inputShape = tensor.shape;
   const rank = inputShape.length;
 
