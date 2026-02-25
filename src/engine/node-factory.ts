@@ -78,10 +78,10 @@ export function wrapResultAsStorage(
   inputStorages: StorageHandle[],
 ): StorageHandle {
   const aliasedInputIdx = backendInputs.findIndex(b => b === resultTensor);
-  if (aliasedInputIdx >= 0 && (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === true) {
-    resultTensor = { ...resultTensor, ownsBuffer: false } as BackendTensor;
+  if (aliasedInputIdx >= 0 && resultTensor.ownsBuffer === true) {
+    resultTensor = { ...resultTensor, ownsBuffer: false };
   }
-  const isView = (resultTensor as { ownsBuffer?: boolean }).ownsBuffer === false;
+  const isView = resultTensor.ownsBuffer === false;
   const baseStorageId = isView && inputStorages.length > 0
     ? inputStorages[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
     : undefined;

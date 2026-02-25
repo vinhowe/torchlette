@@ -77,9 +77,9 @@ async function executeAdamBatchInner(
     // Adam is in-place: param buffer is returned as result.
     // Set ownsBuffer: false since the buffer is shared with the input.
     const paramResult = adamResult.param;
-    const paramOwns = (paramResult as { ownsBuffer?: boolean }).ownsBuffer;
+    const paramOwns = paramResult.ownsBuffer;
     const finalResult = paramOwns === true
-      ? { ...paramResult, ownsBuffer: false } as BackendTensor
+      ? { ...paramResult, ownsBuffer: false }
       : paramResult;
     // Side outputs (m, v) — create storage handles
     const mStorage = createStorageHandle(adamNode.device, adamResult.m);
@@ -991,7 +991,7 @@ export async function executeLoweredPlan(
                   dtype: bt.dtype,
                   size: bt.size,
                   strides: bt.strides.slice(),
-                  isView: (node.result!.backendTensor as { ownsBuffer?: boolean }).ownsBuffer === false,
+                  isView: node.result!.backendTensor.ownsBuffer === false,
                 }});
               }
               // Record side output for fusedAttentionForward so replay

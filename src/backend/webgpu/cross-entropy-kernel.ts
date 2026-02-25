@@ -13,7 +13,6 @@
 
 import {
   dispatchComputePass,
-  trackSharedEncoderWrite,
   allocateOutputBuffer,
   cachedCreateBindGroup,
   getPipeline,
@@ -22,6 +21,7 @@ import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
+import { wgslSumReduction, wgslMaxReduction, trackBuffers } from "./wgsl-helpers";
 
 // Shared WGSL struct for cross-entropy config (8 bytes, 2 fields)
 const WGSL_CE_CONFIG = `struct CEConfig {
@@ -60,12 +60,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   sdata[tid] = local_max;
   workgroupBarrier();
 
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] = max(sdata[tid], sdata[tid + s]);
-    }
-    workgroupBarrier();
-  }
+  ${wgslMaxReduction("sdata", WORKGROUP_SIZE / 2)}
   let row_max = sdata[0];
 
   // Phase 2: Parallel sum-exp reduction
@@ -76,12 +71,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   sdata[tid] = local_sum;
   workgroupBarrier();
 
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] += sdata[tid + s];
-    }
-    workgroupBarrier();
-  }
+  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
   let log_sum_exp = log(sdata[0]);
 
   // Phase 3: Output (thread 0 only)
@@ -121,12 +111,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   sdata[tid] = local_max;
   workgroupBarrier();
 
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] = max(sdata[tid], sdata[tid + s]);
-    }
-    workgroupBarrier();
-  }
+  ${wgslMaxReduction("sdata", WORKGROUP_SIZE / 2)}
   let row_max = sdata[0];
 
   // Phase 2: Parallel sum-exp reduction (recompute from forward)
@@ -137,12 +122,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   sdata[tid] = local_sum;
   workgroupBarrier();
 
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] += sdata[tid + s];
-    }
-    workgroupBarrier();
-  }
+  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
   let log_sum_exp = log(sdata[0]);
 
   // Phase 3: Write gradients (all threads participate)
@@ -214,9 +194,7 @@ export function dispatchCrossEntropyForward(
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [logitsBuffer, targetsBuffer, outBuffer, configBuf]);
 
-  trackSharedEncoderWrite(logitsBuffer);
-  trackSharedEncoderWrite(targetsBuffer);
-  trackSharedEncoderWrite(outBuffer);
+  trackBuffers(logitsBuffer, targetsBuffer, outBuffer);
 
   dispatchComputePass(
     pipeline,
@@ -255,10 +233,7 @@ export function dispatchCrossEntropyBackward(
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [logitsBuffer, targetsBuffer, gradOutputBuffer, outBuffer, configBuf]);
 
-  trackSharedEncoderWrite(logitsBuffer);
-  trackSharedEncoderWrite(targetsBuffer);
-  trackSharedEncoderWrite(gradOutputBuffer);
-  trackSharedEncoderWrite(outBuffer);
+  trackBuffers(logitsBuffer, targetsBuffer, gradOutputBuffer, outBuffer);
 
   dispatchComputePass(
     pipeline,

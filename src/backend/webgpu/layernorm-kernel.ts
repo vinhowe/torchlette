@@ -13,7 +13,6 @@
 
 import {
   dispatchComputePass,
-  trackSharedEncoderWrite,
   allocateOutputBuffer,
   cachedCreateBindGroup,
   getPipeline,
@@ -22,6 +21,7 @@ import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
+import { wgslSumReduction, wgslDualSumReduction, trackBuffers } from "./wgsl-helpers";
 
 // Shared WGSL struct for LayerNorm config (16 bytes, 4 fields)
 const WGSL_LN_CONFIG = `struct LNConfig {
@@ -91,12 +91,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   sdata[tid] = local_sum;
   workgroupBarrier();
 
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] += sdata[tid + s];
-    }
-    workgroupBarrier();
-  }
+  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
   let mean = sdata[0] / f32(D);
 
   // Phase 2: Parallel sum for variance
@@ -108,12 +103,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   sdata[tid] = local_var;
   workgroupBarrier();
 
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] += sdata[tid + s];
-    }
-    workgroupBarrier();
-  }
+  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
   let inv_std = inverseSqrt(sdata[0] / f32(D) + config.eps);
 
   // Phase 3: Normalize + affine transform
@@ -154,10 +144,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   }
   sdata[tid] = local_sum;
   workgroupBarrier();
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) { sdata[tid] += sdata[tid + s]; }
-    workgroupBarrier();
-  }
+  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
   let mean = sdata[0] / Df;
 
   // Recompute variance + inv_std
@@ -168,10 +155,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   }
   sdata[tid] = local_var;
   workgroupBarrier();
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) { sdata[tid] += sdata[tid + s]; }
-    workgroupBarrier();
-  }
+  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
   let inv_std = inverseSqrt(sdata[0] / Df + config.eps);
 
   // Compute grad_normalized = grad_output * weight
@@ -187,13 +171,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   sdata[tid] = local_c1;
   sdata2[tid] = local_c2;
   workgroupBarrier();
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] += sdata[tid + s];
-      sdata2[tid] += sdata2[tid + s];
-    }
-    workgroupBarrier();
-  }
+  ${wgslDualSumReduction("sdata", "sdata2", WORKGROUP_SIZE / 2)}
   let c1 = sdata[0] / Df;
   let c2 = sdata2[0] / Df;
 
@@ -234,10 +212,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   }
   sdata[tid] = local_sum;
   workgroupBarrier();
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) { sdata[tid] += sdata[tid + s]; }
-    workgroupBarrier();
-  }
+  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
   let mean = sdata[0] / Df;
 
   // Phase 2: Parallel sum for variance → inv_std
@@ -248,10 +223,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   }
   sdata[tid] = local_var;
   workgroupBarrier();
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) { sdata[tid] += sdata[tid + s]; }
-    workgroupBarrier();
-  }
+  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
   let inv_std = inverseSqrt(sdata[0] / Df + config.eps);
 
   // Write row stats (only thread 0 writes)
@@ -366,10 +338,7 @@ export function dispatchLayerNormForward(
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [xBuffer, weightBuffer, biasBuffer, outBuffer, configBuf]);
 
-  trackSharedEncoderWrite(xBuffer);
-  trackSharedEncoderWrite(weightBuffer);
-  trackSharedEncoderWrite(biasBuffer);
-  trackSharedEncoderWrite(outBuffer);
+  trackBuffers(xBuffer, weightBuffer, biasBuffer, outBuffer);
 
   dispatchComputePass(
     pipeline,
@@ -409,10 +378,7 @@ export function dispatchLayerNormBackwardGradX(
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [gradOutputBuffer, xBuffer, weightBuffer, outBuffer, configBuf]);
 
-  trackSharedEncoderWrite(gradOutputBuffer);
-  trackSharedEncoderWrite(xBuffer);
-  trackSharedEncoderWrite(weightBuffer);
-  trackSharedEncoderWrite(outBuffer);
+  trackBuffers(gradOutputBuffer, xBuffer, weightBuffer, outBuffer);
 
   dispatchComputePass(
     pipeline,
@@ -456,9 +422,7 @@ export function dispatchLayerNormBackwardGradWeightBias(
   const statsBindGroup = cachedCreateBindGroup(device, statsPipeline,
     [xBuffer, meanBuffer, invStdBuffer, configBuf]);
 
-  trackSharedEncoderWrite(xBuffer);
-  trackSharedEncoderWrite(meanBuffer);
-  trackSharedEncoderWrite(invStdBuffer);
+  trackBuffers(xBuffer, meanBuffer, invStdBuffer);
 
   dispatchComputePass(
     statsPipeline,
@@ -482,9 +446,7 @@ export function dispatchLayerNormBackwardGradWeightBias(
   const gradBindGroup = cachedCreateBindGroup(device, gradPipeline,
     [gradOutputBuffer, xBuffer, meanBuffer, invStdBuffer, gradWeightBuffer, gradBiasBuffer, configBuf]);
 
-  trackSharedEncoderWrite(gradOutputBuffer);
-  trackSharedEncoderWrite(gradWeightBuffer);
-  trackSharedEncoderWrite(gradBiasBuffer);
+  trackBuffers(gradOutputBuffer, gradWeightBuffer, gradBiasBuffer);
 
   dispatchComputePass(
     gradPipeline,

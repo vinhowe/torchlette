@@ -70,7 +70,6 @@ export {
 export type { MatmulPrologueInfo, MatmulEpiloguePlan } from "./matmul-epilogue";
 export {
   detectMatmulEpilogueCore,
-  detectMatmulEpilogueFromPlan,
   detectMatmulEpilogue,
   _detectTransposeView,
   executeMatmulWithEpilogue,

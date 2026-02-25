@@ -144,7 +144,7 @@ export type WebGPUContext = {
 
 /** Narrow a generic BackendTensor to WebGPUTensor for typed property access. */
 export function asGPUTensor(tensor: BackendTensor): WebGPUTensor {
-  return tensor as unknown as WebGPUTensor;
+  return tensor as WebGPUTensor;
 }
 
 /** Extract the GPUBuffer from a generic BackendTensor (must be a WebGPUTensor). */
