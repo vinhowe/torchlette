@@ -191,18 +191,6 @@ export function detectMatmulEpilogueCore(
 }
 
 /**
- * Pre-scan variant: detect matmul epilogue from full plan (for pre-segmentation scan).
- */
-export function detectMatmulEpilogueFromPlan(
-  planNodes: LazyIRNode[],
-  startIdx: number,
-  consumerCount: Map<number, number>,
-  externalNodeIds?: Set<number>,
-): MatmulEpiloguePlan | null {
-  return detectMatmulEpilogueCore(planNodes, startIdx, consumerCount, externalNodeIds);
-}
-
-/**
  * Segment variant: detect matmul epilogue within a segment.
  * Also checks the full plan for consumer counts.
  */
