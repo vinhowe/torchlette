@@ -11,7 +11,6 @@
 
 import {
   dispatchComputePass,
-  getWebGPUDevice,
   getMaxStorageBufferBindingSize,
   trackSharedEncoderWrite,
   createParamsBuffer,
@@ -19,36 +18,15 @@ import {
   isF16Supported,
   allocateOutputBuffer,
   cachedCreateBindGroup,
+  getPipeline,
 } from "./index";
+import { requireContext } from "./webgpu-state";
 import type { AdamStepConfig } from "../types";
 import { profileSubOpBegin, profileSubOpEnd } from "./profiler";
-import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
+import type { GPUBuffer, GPUDevice } from "./gpu-types";
 
 const WORKGROUP_SIZE = 256;
 const MAX_WORKGROUPS_PER_DIM = 65535;
-
-// ============================================================================
-// Pipeline Cache
-// ============================================================================
-
-const pipelineCache = new Map<string, GPUComputePipeline>();
-
-function getOrCreatePipeline(
-  device: GPUDevice,
-  key: string,
-  code: string,
-): GPUComputePipeline {
-  let pipeline = pipelineCache.get(key);
-  if (!pipeline) {
-    const module = device.createShaderModule({ code });
-    pipeline = device.createComputePipeline({
-      layout: "auto",
-      compute: { module, entryPoint: "main" },
-    });
-    pipelineCache.set(key, pipeline);
-  }
-  return pipeline;
-}
 
 // ============================================================================
 // WGSL Shader
@@ -713,7 +691,7 @@ export function dispatchAdamStep(
   emitF16 = false,
   infFlagBuffer: GPUBuffer | null = null,
 ): AdamStepResult {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   // Only emit f16 if requested AND the device actually supports shader-f16
@@ -792,7 +770,7 @@ export function dispatchAdamStep(
     key = `adamStep${vec4Tag}:${dimTag}`;
     code = adamStepShader(use2D, gridSizeX, useVec4);
   }
-  const pipeline = getOrCreatePipeline(device, key, code);
+  const pipeline = getPipeline(ctx, key, code);
   profileSubOpEnd("adam.pipeline", _st);
 
   for (let chunk = 0; chunk < numChunks; chunk++) {
@@ -899,6 +877,6 @@ export function dispatchAdamStep(
  * Reset all module-local mutable state (pipeline cache).
  */
 export function resetAdamKernelState(): void {
-  pipelineCache.clear();
+  // Pipelines now managed by shared context (cleared in destroyWebGPU)
 }
 

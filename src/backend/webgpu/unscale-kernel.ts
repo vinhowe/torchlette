@@ -16,7 +16,6 @@
 
 import {
   dispatchComputePass,
-  getWebGPUDevice,
   getMaxStorageBufferBindingSize,
   trackSharedEncoderWrite,
   createParamsBuffer,
@@ -24,37 +23,16 @@ import {
   flushSharedEncoder,
   cachedCreateBindGroup,
   awaitDeferredFence,
+  getPipeline,
 } from "./index";
+import { requireContext } from "./webgpu-state";
 import { isProfilingEnabled } from "./profiler";
 import { gpuMemoryTracker } from "./memory-tracker";
-import type { GPUBuffer, GPUDevice, GPUComputePipeline, GPUCommandEncoder } from "./gpu-types";
+import type { GPUBuffer, GPUDevice, GPUCommandEncoder } from "./gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "./gpu-types";
 
 const WORKGROUP_SIZE = 256;
 const MAX_WORKGROUPS_PER_DIM = 65535;
-
-// ============================================================================
-// Pipeline Cache
-// ============================================================================
-
-const pipelineCache = new Map<string, GPUComputePipeline>();
-
-function getOrCreatePipeline(
-  device: GPUDevice,
-  key: string,
-  code: string,
-): GPUComputePipeline {
-  let pipeline = pipelineCache.get(key);
-  if (!pipeline) {
-    const module = device.createShaderModule({ code });
-    pipeline = device.createComputePipeline({
-      layout: "auto",
-      compute: { module, entryPoint: "main" },
-    });
-    pipelineCache.set(key, pipeline);
-  }
-  return pipeline;
-}
 
 // ============================================================================
 // WGSL Shader
@@ -147,11 +125,11 @@ const infFlagZeroData = new Float32Array([0.0]);
  */
 export function allocateInfFlagBuffer(device?: GPUDevice): GPUBuffer {
   if (persistentInfFlagBuffer) {
-    const dev = device ?? (getWebGPUDevice()!.device);
+    const dev = device ?? (requireContext().device);
     dev.queue.writeBuffer(persistentInfFlagBuffer, 0, infFlagZeroData);
     return persistentInfFlagBuffer;
   }
-  const dev = device ?? (getWebGPUDevice()!.device);
+  const dev = device ?? (requireContext().device);
   persistentInfFlagBuffer = dev.createBuffer({
     size: 4,
     usage:
@@ -170,7 +148,7 @@ export function allocateInfFlagBuffer(device?: GPUDevice): GPUBuffer {
  * Flushes the shared encoder first to ensure all kernel writes are submitted.
  */
 export async function readInfFlag(infFlagBuffer: GPUBuffer): Promise<number> {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   // Consume the deferred fence from markStep() BEFORE any GPU sync.
@@ -298,7 +276,7 @@ export function dispatchUnscaleGrad(
   invScale: number,
   infFlagBuffer: GPUBuffer,
 ): UnscaleGradResult {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const bytesPerElement = 4; // f32
@@ -332,7 +310,7 @@ export function dispatchUnscaleGrad(
   // Get or create pipeline
   const key = `unscaleGrad:${use2D ? `2d:${gridSizeX}` : "1d"}`;
   const code = unscaleGradShader(use2D, gridSizeX);
-  const pipeline = getOrCreatePipeline(device, key, code);
+  const pipeline = getPipeline(ctx, key, code);
 
   for (let chunk = 0; chunk < numChunks; chunk++) {
     const chunkStart = chunk * elementsPerChunk;
@@ -406,6 +384,5 @@ function alignBufferSize(size: number): number {
  * Reset all module-local mutable state (pipeline cache, persistent inf flag buffer).
  */
 export function resetUnscaleKernelState(): void {
-  pipelineCache.clear();
   destroyPersistentInfFlagBuffer();
 }
