@@ -27,34 +27,14 @@ import {
 } from "./index";
 import { isProfilingEnabled } from "./profiler";
 import { gpuMemoryTracker } from "./memory-tracker";
-import type { GPUBuffer, GPUDevice, GPUComputePipeline, GPUCommandEncoder } from "./gpu-types";
+import { defineKernel } from "./kernel-factory";
+import type { GPUBuffer, GPUDevice, GPUCommandEncoder } from "./gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "./gpu-types";
 
 const WORKGROUP_SIZE = 256;
 const MAX_WORKGROUPS_PER_DIM = 65535;
 
-// ============================================================================
-// Pipeline Cache
-// ============================================================================
-
-const pipelineCache = new Map<string, GPUComputePipeline>();
-
-function getOrCreatePipeline(
-  device: GPUDevice,
-  key: string,
-  code: string,
-): GPUComputePipeline {
-  let pipeline = pipelineCache.get(key);
-  if (!pipeline) {
-    const module = device.createShaderModule({ code });
-    pipeline = device.createComputePipeline({
-      layout: "auto",
-      compute: { module, entryPoint: "main" },
-    });
-    pipelineCache.set(key, pipeline);
-  }
-  return pipeline;
-}
+const kernel = defineKernel("unscale");
 
 // ============================================================================
 // WGSL Shader
@@ -332,7 +312,7 @@ export function dispatchUnscaleGrad(
   // Get or create pipeline
   const key = `unscaleGrad:${use2D ? `2d:${gridSizeX}` : "1d"}`;
   const code = unscaleGradShader(use2D, gridSizeX);
-  const pipeline = getOrCreatePipeline(device, key, code);
+  const pipeline = kernel.getPipeline(device, key, () => code);
 
   for (let chunk = 0; chunk < numChunks; chunk++) {
     const chunkStart = chunk * elementsPerChunk;
@@ -406,6 +386,6 @@ function alignBufferSize(size: number): number {
  * Reset all module-local mutable state (pipeline cache, persistent inf flag buffer).
  */
 export function resetUnscaleKernelState(): void {
-  pipelineCache.clear();
+  kernel.reset();
   destroyPersistentInfFlagBuffer();
 }

@@ -18,8 +18,11 @@ import {
   allocateOutputBuffer,
   cachedCreateBindGroup,
 } from "./index";
-import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
+import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
+import { defineKernel } from "./kernel-factory";
+
+const kernel = defineKernel("layerNorm");
 
 const WORKGROUP_SIZE = 256;
 
@@ -49,29 +52,6 @@ function getOrCreateRowStatsTempBuffers(
     rowStatsTempCache.set(numRows, entry);
   }
   return entry;
-}
-
-// ============================================================================
-// Pipeline Cache
-// ============================================================================
-
-const pipelineCache = new Map<string, GPUComputePipeline>();
-
-function getOrCreatePipeline(
-  device: GPUDevice,
-  key: string,
-  code: string,
-): GPUComputePipeline {
-  let pipeline = pipelineCache.get(key);
-  if (!pipeline) {
-    const module = device.createShaderModule({ code });
-    pipeline = device.createComputePipeline({
-      layout: "auto",
-      compute: { module, entryPoint: "main" },
-    });
-    pipelineCache.set(key, pipeline);
-  }
-  return pipeline;
 }
 
 // ============================================================================
@@ -334,39 +314,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 `;
 }
 
-// ============================================================================
-// Config Buffer (cached per numRows x featureDim)
-// ============================================================================
-
-const configCache = new Map<string, GPUBuffer>();
-// Reusable typed arrays for config writes
+// Reusable typed arrays for config data packing
 const configArrayBuffer = new ArrayBuffer(16);
 const configU32View = new Uint32Array(configArrayBuffer);
 const configF32View = new Float32Array(configArrayBuffer);
 const configU8View = new Uint8Array(configArrayBuffer);
-
-function getOrCreateConfigBuffer(
-  device: GPUDevice,
-  numRows: number,
-  featureDim: number,
-  eps: number,
-): GPUBuffer {
-  const key = `${numRows}:${featureDim}`;
-  let buf = configCache.get(key);
-  if (!buf) {
-    buf = device.createBuffer({
-      size: 16, // { num_rows: u32, feature_dim: u32, eps: f32, _pad: u32 }
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    configCache.set(key, buf);
-  }
-  configU32View[0] = numRows;
-  configU32View[1] = featureDim;
-  configF32View[2] = eps;
-  configU32View[3] = 0; // padding
-  device.queue.writeBuffer(buf, 0, configU8View);
-  return buf;
-}
 
 // ============================================================================
 // Dispatch Functions
@@ -390,13 +342,13 @@ export function dispatchLayerNormForward(
   const outputSizeBytes = numRows * featureDim * 4; // f32
   const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
 
-  const configBuf = getOrCreateConfigBuffer(device, numRows, featureDim, eps);
+  configU32View[0] = numRows;
+  configU32View[1] = featureDim;
+  configF32View[2] = eps;
+  configU32View[3] = 0;
+  const configBuf = kernel.getConfigBuffer(device, `${numRows}:${featureDim}`, 16, configU8View);
 
-  const pipeline = getOrCreatePipeline(
-    device,
-    "layerNormFwd",
-    layerNormForwardShader(),
-  );
+  const pipeline = kernel.getPipeline(device, "layerNormFwd", () => layerNormForwardShader());
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [xBuffer, weightBuffer, biasBuffer, outBuffer, configBuf]);
@@ -433,13 +385,13 @@ export function dispatchLayerNormBackwardGradX(
   const outputSizeBytes = numRows * featureDim * 4;
   const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
 
-  const configBuf = getOrCreateConfigBuffer(device, numRows, featureDim, eps);
+  configU32View[0] = numRows;
+  configU32View[1] = featureDim;
+  configF32View[2] = eps;
+  configU32View[3] = 0;
+  const configBuf = kernel.getConfigBuffer(device, `${numRows}:${featureDim}`, 16, configU8View);
 
-  const pipeline = getOrCreatePipeline(
-    device,
-    "layerNormBwdGradX",
-    layerNormBackwardGradXShader(),
-  );
+  const pipeline = kernel.getPipeline(device, "layerNormBwdGradX", () => layerNormBackwardGradXShader());
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [gradOutputBuffer, xBuffer, weightBuffer, outBuffer, configBuf]);
@@ -476,17 +428,17 @@ export function dispatchLayerNormBackwardGradWeightBias(
   const ctx = getWebGPUDevice()!;
   const device = ctx.device;
 
-  const configBuf = getOrCreateConfigBuffer(device, numRows, featureDim, eps);
+  configU32View[0] = numRows;
+  configU32View[1] = featureDim;
+  configF32View[2] = eps;
+  configU32View[3] = 0;
+  const configBuf = kernel.getConfigBuffer(device, `${numRows}:${featureDim}`, 16, configU8View);
 
   // Pass 1: Compute row stats (mean[N], inv_std[N])
   // Use persistent cached buffers (same pattern as K-split temp buffers)
   const { meanBuffer, invStdBuffer } = getOrCreateRowStatsTempBuffers(device, numRows);
 
-  const statsPipeline = getOrCreatePipeline(
-    device,
-    "layerNormRowStats",
-    layerNormRowStatsShader(),
-  );
+  const statsPipeline = kernel.getPipeline(device, "layerNormRowStats", () => layerNormRowStatsShader());
 
   const statsBindGroup = cachedCreateBindGroup(device, statsPipeline,
     [xBuffer, meanBuffer, invStdBuffer, configBuf]);
@@ -506,11 +458,7 @@ export function dispatchLayerNormBackwardGradWeightBias(
   const gradWeightBuffer = allocateOutputBuffer(featureSizeBytes) as unknown as GPUBuffer;
   const gradBiasBuffer = allocateOutputBuffer(featureSizeBytes) as unknown as GPUBuffer;
 
-  const gradPipeline = getOrCreatePipeline(
-    device,
-    "layerNormBwdGradWBv2",
-    layerNormBackwardGradWeightBiasShader(),
-  );
+  const gradPipeline = kernel.getPipeline(device, "layerNormBwdGradWBv2", () => layerNormBackwardGradWeightBiasShader());
 
   const numWorkgroups = Math.ceil(featureDim / WORKGROUP_SIZE);
 
@@ -534,7 +482,7 @@ export function dispatchLayerNormBackwardGradWeightBias(
  * Reset all module-local mutable state (pipeline cache, row stats temp buffers).
  */
 export function resetLayerNormKernelState(): void {
-  pipelineCache.clear();
+  kernel.reset();
   for (const entry of rowStatsTempCache.values()) {
     entry.meanBuffer.destroy();
     entry.invStdBuffer.destroy();

@@ -18,33 +18,12 @@ import {
   allocateOutputBuffer,
   cachedCreateBindGroup,
 } from "./index";
-import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
-import { GPUBufferUsage } from "./gpu-types";
+import type { GPUBuffer } from "./gpu-types";
+import { defineKernel } from "./kernel-factory";
 
 const WORKGROUP_SIZE = 256;
 
-// ============================================================================
-// Pipeline Cache
-// ============================================================================
-
-const pipelineCache = new Map<string, GPUComputePipeline>();
-
-function getOrCreatePipeline(
-  device: GPUDevice,
-  key: string,
-  code: string,
-): GPUComputePipeline {
-  let pipeline = pipelineCache.get(key);
-  if (!pipeline) {
-    const module = device.createShaderModule({ code });
-    pipeline = device.createComputePipeline({
-      layout: "auto",
-      compute: { module, entryPoint: "main" },
-    });
-    pipelineCache.set(key, pipeline);
-  }
-  return pipeline;
-}
+const kernel = defineKernel("crossEntropy");
 
 // ============================================================================
 // WGSL Shaders
@@ -182,31 +161,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 
 // ============================================================================
-// Config Buffer (cached per batch_size x vocab_size)
-// ============================================================================
-
-const configCache = new Map<string, GPUBuffer>();
-
-function getOrCreateConfigBuffer(
-  device: GPUDevice,
-  batchSize: number,
-  vocabSize: number,
-): GPUBuffer {
-  const key = `${batchSize}:${vocabSize}`;
-  let buf = configCache.get(key);
-  if (!buf) {
-    buf = device.createBuffer({
-      size: 8, // 2 x u32
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    configCache.set(key, buf);
-  }
-  const data = new Uint32Array([batchSize, vocabSize]);
-  device.queue.writeBuffer(buf, 0, new Uint8Array(data.buffer));
-  return buf;
-}
-
-// ============================================================================
 // Dispatch Functions
 // ============================================================================
 
@@ -226,12 +180,13 @@ export function dispatchCrossEntropyForward(
   const outputSizeBytes = batchSize * 4; // f32
   const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
 
-  const configBuf = getOrCreateConfigBuffer(device, batchSize, vocabSize);
+  const configBuf = kernel.getConfigBuffer(
+    device, `${batchSize}:${vocabSize}`, 8,
+    new Uint8Array(new Uint32Array([batchSize, vocabSize]).buffer),
+  );
 
-  const pipeline = getOrCreatePipeline(
-    device,
-    "crossEntropyFwd",
-    crossEntropyForwardShader(),
+  const pipeline = kernel.getPipeline(
+    device, "crossEntropyFwd", crossEntropyForwardShader,
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
@@ -267,12 +222,13 @@ export function dispatchCrossEntropyBackward(
   const outputSizeBytes = batchSize * vocabSize * 4; // f32
   const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
 
-  const configBuf = getOrCreateConfigBuffer(device, batchSize, vocabSize);
+  const configBuf = kernel.getConfigBuffer(
+    device, `${batchSize}:${vocabSize}`, 8,
+    new Uint8Array(new Uint32Array([batchSize, vocabSize]).buffer),
+  );
 
-  const pipeline = getOrCreatePipeline(
-    device,
-    "crossEntropyBwd",
-    crossEntropyBackwardShader(),
+  const pipeline = kernel.getPipeline(
+    device, "crossEntropyBwd", crossEntropyBackwardShader,
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
@@ -296,6 +252,5 @@ export function dispatchCrossEntropyBackward(
  * Reset all module-local mutable state (pipeline cache, config buffer cache).
  */
 export function resetCrossEntropyKernelState(): void {
-  pipelineCache.clear();
-  configCache.clear();
+  kernel.reset();
 }
