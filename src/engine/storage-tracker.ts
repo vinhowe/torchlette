@@ -136,10 +136,7 @@ class StorageTracker {
       const storage = this.allStorages.get(id);
       if (storage) {
         // Check if the backend tensor owns its buffer (not a view)
-        const tensor = storage.backendTensor as {
-          ownsBuffer?: boolean;
-          destroy?: () => void;
-        };
+        const tensor = storage.backendTensor;
 
         // Only destroy if the tensor owns its buffer
         if (tensor.ownsBuffer !== false && tensor.destroy) {
@@ -199,10 +196,7 @@ class StorageTracker {
     for (const id of toDestroy) {
       const storage = this.allStorages.get(id);
       if (storage) {
-        const tensor = storage.backendTensor as {
-          ownsBuffer?: boolean;
-          destroy?: () => void;
-        };
+        const tensor = storage.backendTensor;
         if (tensor.ownsBuffer !== false && tensor.destroy) {
           tensor.destroy();
         }
@@ -340,9 +334,10 @@ class StorageTracker {
   getLiveOwnedBuffers(): Set<unknown> {
     const buffers = new Set<unknown>();
     for (const [, storage] of this.allStorages) {
-      const tensor = storage.backendTensor as { ownsBuffer?: boolean; buffer?: unknown };
-      if (tensor.ownsBuffer !== false && tensor.buffer) {
-        buffers.add(tensor.buffer);
+      const tensor = storage.backendTensor;
+      const buf = (tensor as { buffer?: unknown }).buffer;
+      if (tensor.ownsBuffer !== false && buf) {
+        buffers.add(buf);
       }
     }
     return buffers;
@@ -397,10 +392,7 @@ export function canSafelyRelease(
  * @param storage - The storage handle to release
  */
 export function releaseBufferImmediate(storage: StorageHandle): void {
-  const tensor = storage.backendTensor as {
-    ownsBuffer?: boolean;
-    destroy?: () => void;
-  };
+  const tensor = storage.backendTensor;
 
   // Don't release views (they don't own buffers)
   if (tensor.ownsBuffer === false) {

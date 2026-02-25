@@ -6,6 +6,8 @@ export type BackendTensor = {
   shape: Shape;
   /** Element data type. Both CPU and WebGPU backends always set this. */
   dtype?: DType;
+  /** True if this tensor owns the underlying buffer; false for views/shared tensors. */
+  ownsBuffer?: boolean;
   toArray(): number[];
   /** Optional cleanup method to release GPU resources */
   destroy?(): void;
