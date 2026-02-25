@@ -5,7 +5,7 @@
  */
 import type { BackendTensor } from "../../types";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
-import { GPUBufferUsage, GPUMapMode } from "../gpu-types";
+import { GPUBufferUsage, GPUMapMode, asGPUTensor } from "../gpu-types";
 import {
   sizeOf, WORKGROUP_SIZE, dtypeBytes, alignBufferSize,
 } from "../shape-utils";
@@ -55,10 +55,10 @@ export async function adamStep(
   gpuMemoryTracker.suppressLimitCheck();
   try {
     let _st = profileSubOpBegin();
-    const gradT = ensureContiguous(grad as WebGPUTensor);
-    const paramT = ensureContiguous(param as WebGPUTensor);
-    const mT = ensureContiguous(m as WebGPUTensor);
-    const vT = ensureContiguous(v as WebGPUTensor);
+    const gradT = ensureContiguous(asGPUTensor(grad));
+    const paramT = ensureContiguous(asGPUTensor(param));
+    const mT = ensureContiguous(asGPUTensor(m));
+    const vT = ensureContiguous(asGPUTensor(v));
     profileSubOpEnd("adam.ensureContig", _st);
 
     // Evict stale f16 cache entry for the old param buffer before dispatch.
@@ -153,7 +153,7 @@ export async function adamStep(
     }
 
     // Destroy contiguous copy for grad only (read-only input, safe to free).
-    if (gradT !== (grad as WebGPUTensor)) {
+    if (gradT !== asGPUTensor(grad)) {
       bufferPool.decRef(gradT.buffer);
       bufferPool.deferredDestroy(gradT.buffer, gradT.size * bpe(gradT));
     }
@@ -198,7 +198,7 @@ export function unscaleGrad(
   invScale: number,
   infFlagBuffer: unknown,
 ): BackendTensor {
-  const gradT = ensureContiguous(grad as WebGPUTensor);
+  const gradT = ensureContiguous(asGPUTensor(grad));
   const numElements = gradT.size;
   const result = dispatchUnscaleGradKernel(
     gradT.buffer,
@@ -207,7 +207,7 @@ export function unscaleGrad(
     infFlagBuffer as GPUBuffer,
   );
   // Destroy contiguous copy if one was created (deferred for GPU fence)
-  if (gradT !== (grad as WebGPUTensor)) {
+  if (gradT !== asGPUTensor(grad)) {
     bufferPool.decRef(gradT.buffer);
     bufferPool.deferredDestroy(gradT.buffer, gradT.size * dtypeBytes(gradT.dtype));
   }
@@ -231,8 +231,8 @@ export function fusedCrossEntropyForward(
   targets: BackendTensor,
   config: import("../../types").FusedCrossEntropyConfig,
 ): BackendTensor {
-  const logitsT = ensureContiguous(logits as WebGPUTensor);
-  const targetsT = ensureContiguous(targets as WebGPUTensor);
+  const logitsT = ensureContiguous(asGPUTensor(logits));
+  const targetsT = ensureContiguous(asGPUTensor(targets));
   const outBuf = dispatchCEForwardKernel(
     logitsT.buffer, targetsT.buffer, config.batchSize, config.vocabSize,
   );
@@ -248,9 +248,9 @@ export function fusedCrossEntropyBackward(
   gradOutput: BackendTensor,
   config: import("../../types").FusedCrossEntropyConfig,
 ): BackendTensor {
-  const logitsT = ensureContiguous(logits as WebGPUTensor);
-  const targetsT = ensureContiguous(targets as WebGPUTensor);
-  const gradT = ensureContiguous(gradOutput as WebGPUTensor);
+  const logitsT = ensureContiguous(asGPUTensor(logits));
+  const targetsT = ensureContiguous(asGPUTensor(targets));
+  const gradT = ensureContiguous(asGPUTensor(gradOutput));
   const outBuf = dispatchCEBackwardKernel(
     logitsT.buffer, targetsT.buffer, gradT.buffer,
     config.batchSize, config.vocabSize,
@@ -272,9 +272,9 @@ export function fusedLayerNormForward(
   bias: BackendTensor,
   config: import("../../types").FusedLayerNormConfig,
 ): BackendTensor {
-  const xT = ensureContiguous(x as WebGPUTensor);
-  const weightT = ensureContiguous(weight as WebGPUTensor);
-  const biasT = ensureContiguous(bias as WebGPUTensor);
+  const xT = ensureContiguous(asGPUTensor(x));
+  const weightT = ensureContiguous(asGPUTensor(weight));
+  const biasT = ensureContiguous(asGPUTensor(bias));
   const outBuf = dispatchLNForwardKernel(
     xT.buffer, weightT.buffer, biasT.buffer,
     config.numRows, config.featureDim, config.eps,
@@ -295,9 +295,9 @@ export function fusedLayerNormBackwardGradX(
   weight: BackendTensor,
   config: import("../../types").FusedLayerNormConfig,
 ): BackendTensor {
-  const gradT = ensureContiguous(gradOutput as WebGPUTensor);
-  const xT = ensureContiguous(x as WebGPUTensor);
-  const weightT = ensureContiguous(weight as WebGPUTensor);
+  const gradT = ensureContiguous(asGPUTensor(gradOutput));
+  const xT = ensureContiguous(asGPUTensor(x));
+  const weightT = ensureContiguous(asGPUTensor(weight));
 
   const gradXBuf = dispatchLNBwdGradXKernel(
     gradT.buffer, xT.buffer, weightT.buffer,
@@ -319,8 +319,8 @@ export function fusedLayerNormBackwardGradWeightBias(
   x: BackendTensor,
   config: import("../../types").FusedLayerNormConfig,
 ): { gradWeight: BackendTensor; gradBias: BackendTensor } {
-  const gradT = ensureContiguous(gradOutput as WebGPUTensor);
-  const xT = ensureContiguous(x as WebGPUTensor);
+  const gradT = ensureContiguous(asGPUTensor(gradOutput));
+  const xT = ensureContiguous(asGPUTensor(x));
   const result = dispatchLNBwdGradWBKernel(
     gradT.buffer, xT.buffer,
     config.numRows, config.featureDim, config.eps,
@@ -347,9 +347,9 @@ export function fusedAttentionForward(
   v: BackendTensor,
   config: import("../../types").FusedAttentionConfig,
 ): { output: BackendTensor; logsumexp: BackendTensor } {
-  const qT = ensureContiguous(q as WebGPUTensor);
-  const kT = ensureContiguous(k as WebGPUTensor);
-  const vT = ensureContiguous(v as WebGPUTensor);
+  const qT = ensureContiguous(asGPUTensor(q));
+  const kT = ensureContiguous(asGPUTensor(k));
+  const vT = ensureContiguous(asGPUTensor(v));
   const { outputBuffer, logsumexpBuffer } = dispatchFAForwardKernel(
     qT.buffer, kT.buffer, vT.buffer,
     config.batchSize, config.numHeads, config.seqLen, config.headDim,
@@ -379,12 +379,12 @@ export function fusedAttentionBackward(
   output: BackendTensor,
   config: import("../../types").FusedAttentionConfig,
 ): { dQ: BackendTensor; dK: BackendTensor; dV: BackendTensor } {
-  const qT = ensureContiguous(q as WebGPUTensor);
-  const kT = ensureContiguous(k as WebGPUTensor);
-  const vT = ensureContiguous(v as WebGPUTensor);
-  const lseT = ensureContiguous(logsumexp as WebGPUTensor);
-  const dOT = ensureContiguous(dO as WebGPUTensor);
-  const oT = ensureContiguous(output as WebGPUTensor);
+  const qT = ensureContiguous(asGPUTensor(q));
+  const kT = ensureContiguous(asGPUTensor(k));
+  const vT = ensureContiguous(asGPUTensor(v));
+  const lseT = ensureContiguous(asGPUTensor(logsumexp));
+  const dOT = ensureContiguous(asGPUTensor(dO));
+  const oT = ensureContiguous(asGPUTensor(output));
 
   // Step 1: Compute D[i] = rowsum(dO[i,:] * O[i,:])
   const dBuf = dispatchFABwdDKernel(
@@ -430,7 +430,7 @@ export function fusedAttentionBackward(
 
 export async function read(a: BackendTensor): Promise<number[]> {
   const ctx = requireContext();
-  let tensor = a as WebGPUTensor;
+  let tensor = asGPUTensor(a);
   if (tensor.size === 0) {
     return [];
   }
@@ -528,7 +528,7 @@ export async function waitForGPU(): Promise<void> {
  */
 export function mulScalarInPlace(tensor: BackendTensor, scalar: number): void {
   const ctx = requireContext();
-  const a = tensor as WebGPUTensor;
+  const a = asGPUTensor(tensor);
   const size = a.size;
 
   // Pack mixed f32 + u32 params

@@ -1,6 +1,7 @@
 import type { Backend, BackendTensor, DType } from "../backend/types";
 import { asGPUTensor, type GPUBuffer, type WebGPUTensor } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
+import { sizeOf } from "../core/shape";
 import {
   flushBufferPool,
   flushSharedEncoder,
@@ -182,7 +183,7 @@ export async function executeFusedWebGPU(
       buffer: result.buffer,
       shape: result.shape,
       dtype: result.dtype,
-      size: result.shape.reduce((a, b) => a * b, 1),
+      size: sizeOf(result.shape),
       strides: computeContiguousStrides(result.shape),
       offset: 0,
       isContiguous: true,
@@ -207,7 +208,7 @@ export async function executeFusedWebGPU(
             buffer: addOutput.buffer,
             shape: addOutput.shape,
             dtype: addOutput.dtype,
-            size: addOutput.shape.reduce((a, b) => a * b, 1),
+            size: sizeOf(addOutput.shape),
             strides: computeContiguousStrides(addOutput.shape),
             offset: 0,
             isContiguous: true,

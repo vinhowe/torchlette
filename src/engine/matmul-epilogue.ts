@@ -321,7 +321,7 @@ export async function executeMatmulWithEpilogue(
     asGPUTensor(matmulInputA.backendTensor),
     asGPUTensor(matmulInputB.backendTensor),
     epilogueConfig,
-    epilogueInputTensors.map(t => asGPUTensor(t)) as WebGPUTensor[],
+    epilogueInputTensors.map(t => asGPUTensor(t)),
     false, // transA
     false, // transB
     inputCastA,

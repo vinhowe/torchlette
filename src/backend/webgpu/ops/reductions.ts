@@ -4,8 +4,9 @@
  */
 
 import { normalizeDim, type BackendTensor, type SumOptions, type MeanOptions, type MaxOptions } from "../../types";
+import { sizeOf } from "../../../core/shape";
 import type { GPUBuffer, WebGPUTensor, WebGPUContext } from "../gpu-types";
-import { GPUBufferUsage, GPUMapMode } from "../gpu-types";
+import { GPUBufferUsage, GPUMapMode, asGPUTensor } from "../gpu-types";
 import {
   dtypeBytes,
   alignBufferSize,
@@ -83,15 +84,78 @@ function buildReductionMetadata(
   return { inputStrides, outStrides, reductionSize, inputToOutDim };
 }
 
+/**
+ * Shared preamble for dim-wise reductions (sum, max, sumDimWithPreamble).
+ * Normalizes dims, computes outShape, outSize, metadata, and WGSL array strings.
+ * Returns null if all dims are reduced (caller should use full-reduction path).
+ */
+interface DimReductionSetup {
+  normalizedDims: number[];
+  rank: number;
+  outShape: number[];
+  outSize: number;
+  reductionSize: number;
+  inputStrides: number[];
+  outStrides: number[];
+  inputToOutDim: number[];
+  inputShapeArray: string;
+  inputStridesArray: string;
+  outShapeArray: string;
+  outStridesArray: string;
+  reduceDimsArray: string;
+  inputToOutDimArray: string;
+}
+
+function prepareDimReduction(
+  inputShape: number[],
+  dim: number | number[],
+  keepdim: boolean,
+): DimReductionSetup | null {
+  const dims = Array.isArray(dim) ? dim : [dim];
+  const rank = inputShape.length;
+  const normalizedDims = dims.map((d) => normalizeDim(d, rank));
+
+  const outShape: number[] = [];
+  for (let i = 0; i < rank; i++) {
+    if (normalizedDims.includes(i)) {
+      if (keepdim) outShape.push(1);
+    } else {
+      outShape.push(inputShape[i]);
+    }
+  }
+
+  if (outShape.length === 0) return null;
+
+  const outSize = sizeOf(outShape);
+  const { inputStrides, outStrides, reductionSize, inputToOutDim } =
+    buildReductionMetadata(inputShape, normalizedDims, outShape, keepdim);
+
+  const inputShapeArray = `array<u32, ${rank}>(${inputShape.map((s) => `${s}u`).join(", ")})`;
+  const inputStridesArray = `array<u32, ${rank}>(${inputStrides.map((s) => `${s}u`).join(", ")})`;
+  const outShapeArray = outShape.length > 0
+    ? `array<u32, ${outShape.length}>(${outShape.map((s) => `${s}u`).join(", ")})` : "";
+  const outStridesArray = outStrides.length > 0
+    ? `array<u32, ${outStrides.length}>(${outStrides.map((s) => `${s}u`).join(", ")})` : "";
+  const reduceDimsArray = `array<u32, ${normalizedDims.length}>(${normalizedDims.map((d) => `${d}u`).join(", ")})`;
+  const inputToOutDimArray = `array<i32, ${rank}>(${inputToOutDim.map((d) => `${d}i`).join(", ")})`;
+
+  return {
+    normalizedDims, rank, outShape, outSize, reductionSize,
+    inputStrides, outStrides, inputToOutDim,
+    inputShapeArray, inputStridesArray, outShapeArray, outStridesArray,
+    reduceDimsArray, inputToOutDimArray,
+  };
+}
+
 export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
   const ctx = requireContext();
-  let tensor = a as WebGPUTensor;
+  let tensor = asGPUTensor(a);
   let contiguousCopy: WebGPUTensor | null = null;
 
   // Must materialize non-contiguous tensors first (e.g., expanded views)
   // The sum kernels assume contiguous layout for index computation
   if (!tensor.isContiguous) {
-    tensor = contiguous(tensor) as WebGPUTensor;
+    tensor = asGPUTensor(contiguous(tensor));
     contiguousCopy = tensor;
   }
 
@@ -109,56 +173,23 @@ export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
   }
 
   // Dimension-wise reduction
-  const dims = Array.isArray(dim) ? dim : [dim];
-
-  // Normalize negative dimensions
-  const rank = inputShape.length;
-  const normalizedDims = dims.map((d) => normalizeDim(d, rank));
-
-  // Validate dimensions
-  for (const d of normalizedDims) {
-    if (d < 0 || d >= rank) {
-      throw new Error(`sum: dimension ${d} out of range`);
-    }
-  }
-
-  // Compute output shape
-  const outShape: number[] = [];
-  for (let i = 0; i < rank; i++) {
-    if (normalizedDims.includes(i)) {
-      if (keepdim) {
-        outShape.push(1);
-      }
-    } else {
-      outShape.push(inputShape[i]);
-    }
-  }
-
-  // If output is scalar, handle specially
-  if (outShape.length === 0) {
+  const setup = prepareDimReduction(inputShape, dim, keepdim);
+  if (!setup) {
     const result = sumFullReduction(ctx, tensor);
     if (contiguousCopy) contiguousCopy.destroy();
     return result;
   }
 
-  const outSize = outShape.reduce((acc, d) => acc * d, 1);
+  for (const d of setup.normalizedDims) {
+    if (d < 0 || d >= setup.rank) {
+      throw new Error(`sum: dimension ${d} out of range`);
+    }
+  }
+
+  const { normalizedDims, rank, outShape, outSize, reductionSize, outStrides,
+    inputShapeArray, inputStridesArray, outShapeArray, outStridesArray,
+    reduceDimsArray, inputToOutDimArray } = setup;
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
-
-  const { inputStrides, outStrides, reductionSize, inputToOutDim } =
-    buildReductionMetadata(inputShape, normalizedDims, outShape, keepdim);
-
-  const inputShapeArray = `array<u32, ${rank}>(${inputShape.map((s) => `${s}u`).join(", ")})`;
-  const inputStridesArray = `array<u32, ${rank}>(${inputStrides.map((s) => `${s}u`).join(", ")})`;
-  const outShapeArray =
-    outShape.length > 0
-      ? `array<u32, ${outShape.length}>(${outShape.map((s) => `${s}u`).join(", ")})`
-      : "";
-  const outStridesArray =
-    outStrides.length > 0
-      ? `array<u32, ${outStrides.length}>(${outStrides.map((s) => `${s}u`).join(", ")})`
-      : "";
-  const reduceDimsArray = `array<u32, ${normalizedDims.length}>(${normalizedDims.map((d) => `${d}u`).join(", ")})`;
-  const inputToOutDimArray = `array<i32, ${rank}>(${inputToOutDim.map((d) => `${d}i`).join(", ")})`;
 
   // Choose between parallel tree reduction (large reductionSize) and sequential (small)
   const useParallelReduction = reductionSize > 64;
@@ -366,9 +397,8 @@ export function sumDimWithPreamble(
   const ctx = requireContext();
 
   // All inputs must be contiguous and same shape
-  const tensor0 = inputs[0] as WebGPUTensor;
+  const tensor0 = asGPUTensor(inputs[0]);
   const inputShape = tensor0.shape;
-  const rank = inputShape.length;
 
   const dim = sumOptions?.dim;
   const keepdim = sumOptions?.keepdim ?? false;
@@ -378,52 +408,30 @@ export function sumDimWithPreamble(
     return sumFullReductionWithPreamble(ctx, inputs, preambleOp);
   }
 
-  const dims = Array.isArray(dim) ? dim : [dim];
-  const normalizedDims = dims.map((d: number) => normalizeDim(d, rank));
-
-  // Compute output shape
-  const outShape: number[] = [];
-  for (let i = 0; i < rank; i++) {
-    if (normalizedDims.includes(i)) {
-      if (keepdim) outShape.push(1);
-    } else {
-      outShape.push(inputShape[i]);
-    }
-  }
-
-  if (outShape.length === 0) {
+  const setup = prepareDimReduction(inputShape, dim, keepdim);
+  if (!setup) {
     return sumFullReductionWithPreamble(ctx, inputs, preambleOp);
   }
 
-  const outSize = outShape.reduce((acc: number, d: number) => acc * d, 1);
+  const { normalizedDims, rank, outShape, outSize, reductionSize, outStrides,
+    inputShapeArray, inputStridesArray, outShapeArray, outStridesArray,
+    reduceDimsArray, inputToOutDimArray } = setup;
   const outBuffer = createTrackedBuffer(ctx.device, {
     size: outSize * 4,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
-  const { inputStrides, outStrides, reductionSize, inputToOutDim } =
-    buildReductionMetadata(inputShape, normalizedDims, outShape, keepdim);
-
   const isUnary = isUnaryOpFn(preambleOp);
   const arity = isUnary ? 1 : 2;
 
   // Build input bindings
-  const inputBindings = inputs.map((inp: BackendTensor, i: number) =>
+  const inputBindings = inputs.map((_inp: BackendTensor, i: number) =>
     `@group(0) @binding(${i}) var<storage, read> input${i}: array<f32>;`
   ).join("\n");
 
   // Build preamble expression
   const inputExprs = Array.from({ length: arity }, (_, i) => `input${i}[inputOffset]`);
   const preambleExpr = getExprFn(preambleOp, inputExprs);
-
-  const inputShapeArray = `array<u32, ${rank}>(${inputShape.map((s: number) => `${s}u`).join(", ")})`;
-  const inputStridesArray = `array<u32, ${rank}>(${inputStrides.map((s: number) => `${s}u`).join(", ")})`;
-  const outShapeArray = outShape.length > 0
-    ? `array<u32, ${outShape.length}>(${outShape.map((s: number) => `${s}u`).join(", ")})` : "";
-  const outStridesArray = outStrides.length > 0
-    ? `array<u32, ${outStrides.length}>(${outStrides.map((s: number) => `${s}u`).join(", ")})` : "";
-  const reduceDimsArray = `array<u32, ${normalizedDims.length}>(${normalizedDims.map((d: number) => `${d}u`).join(", ")})`;
-  const inputToOutDimArray = `array<i32, ${rank}>(${inputToOutDim.map((d: number) => `${d}i`).join(", ")})`;
 
   const spTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
   const spDispatch = compute2DDispatch(spTotalWG);
@@ -519,7 +527,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   const bgBuffers: GPUBuffer[] = [];
   for (let i = 0; i < arity; i++) {
-    bgBuffers.push((inputs[i] as WebGPUTensor).buffer);
+    bgBuffers.push(asGPUTensor(inputs[i]).buffer);
   }
   bgBuffers.push(outBuffer);
   bgBuffers.push(paramsBuffer);
@@ -541,7 +549,7 @@ function sumFullReductionWithPreamble(
 ): WebGPUTensor {
   const getExprFn = getExprFromRegistry;
   const isUnaryOpFn = isUnaryOpFromRegistry;
-  const tensor0 = inputs[0] as WebGPUTensor;
+  const tensor0 = asGPUTensor(inputs[0]);
   const inputSize = tensor0.size;
 
   const isUnary = isUnaryOpFn(preambleOp);
@@ -583,7 +591,7 @@ fn main() {
 
   const bgBuffers: GPUBuffer[] = [];
   for (let i = 0; i < arity; i++) {
-    bgBuffers.push((inputs[i] as WebGPUTensor).buffer);
+    bgBuffers.push(asGPUTensor(inputs[i]).buffer);
   }
   bgBuffers.push(outBuffer);
   bgBuffers.push(uniformBuffer);
@@ -922,11 +930,11 @@ fn main() {
 
 export function max(a: BackendTensor, options?: MaxOptions): BackendTensor {
   const ctx = requireContext();
-  let tensor = a as WebGPUTensor;
+  let tensor = asGPUTensor(a);
 
   // Must materialize non-contiguous tensors first (e.g., expanded views)
   if (!tensor.isContiguous) {
-    tensor = contiguous(tensor) as WebGPUTensor;
+    tensor = asGPUTensor(contiguous(tensor));
   }
 
   const inputShape = tensor.shape;
@@ -938,49 +946,21 @@ export function max(a: BackendTensor, options?: MaxOptions): BackendTensor {
     return maxFullReduction(ctx, tensor);
   }
 
-  const dims = Array.isArray(dim) ? dim : [dim];
-  const rank = inputShape.length;
-  const normalizedDims = dims.map((d) => normalizeDim(d, rank));
+  const setup = prepareDimReduction(inputShape, dim, keepdim);
+  if (!setup) {
+    return maxFullReduction(ctx, tensor);
+  }
 
-  for (const d of normalizedDims) {
-    if (d < 0 || d >= rank) {
+  for (const d of setup.normalizedDims) {
+    if (d < 0 || d >= setup.rank) {
       throw new Error(`max: dimension ${d} out of range`);
     }
   }
 
-  const outShape: number[] = [];
-  for (let i = 0; i < rank; i++) {
-    if (normalizedDims.includes(i)) {
-      if (keepdim) {
-        outShape.push(1);
-      }
-    } else {
-      outShape.push(inputShape[i]);
-    }
-  }
-
-  if (outShape.length === 0) {
-    return maxFullReduction(ctx, tensor);
-  }
-
-  const outSize = outShape.reduce((acc, d) => acc * d, 1);
+  const { normalizedDims, rank, outShape, outSize, reductionSize, outStrides,
+    inputShapeArray, inputStridesArray, outShapeArray, outStridesArray,
+    reduceDimsArray, inputToOutDimArray } = setup;
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
-
-  const { inputStrides, outStrides, reductionSize, inputToOutDim } =
-    buildReductionMetadata(inputShape, normalizedDims, outShape, keepdim);
-
-  const inputShapeArray = `array<u32, ${rank}>(${inputShape.map((s) => `${s}u`).join(", ")})`;
-  const inputStridesArray = `array<u32, ${rank}>(${inputStrides.map((s) => `${s}u`).join(", ")})`;
-  const outShapeArray =
-    outShape.length > 0
-      ? `array<u32, ${outShape.length}>(${outShape.map((s) => `${s}u`).join(", ")})`
-      : "";
-  const outStridesArray =
-    outStrides.length > 0
-      ? `array<u32, ${outStrides.length}>(${outStrides.map((s) => `${s}u`).join(", ")})`
-      : "";
-  const reduceDimsArray = `array<u32, ${normalizedDims.length}>(${normalizedDims.map((d) => `${d}u`).join(", ")})`;
-  const inputToOutDimArray = `array<i32, ${rank}>(${inputToOutDim.map((d) => `${d}i`).join(", ")})`;
 
   const maxTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
   const maxDispatch = compute2DDispatch(maxTotalWG);
@@ -1109,13 +1089,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
-  let tensor = a as WebGPUTensor;
+  let tensor = asGPUTensor(a);
   let contiguousCopy: WebGPUTensor | null = null;
 
   // Must materialize non-contiguous tensors first (e.g., expanded views)
   // Mean uses sum internally which requires contiguous layout
   if (!tensor.isContiguous) {
-    tensor = contiguous(tensor) as WebGPUTensor;
+    tensor = asGPUTensor(contiguous(tensor));
     contiguousCopy = tensor;
   }
 
@@ -1134,7 +1114,7 @@ export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
   }
 
   // Get sum result (always a tensor, possibly 0-d)
-  const sumTensor = sum(a, options) as WebGPUTensor;
+  const sumTensor = asGPUTensor(sum(a, options));
 
   // Divide by count
   const ctx = requireContext();

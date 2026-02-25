@@ -67,14 +67,6 @@ export function checkContiguous(shape: number[], strides: number[]): boolean {
 }
 
 /**
- * Compute the total number of elements from a shape.
- */
-export function shapeSize(shape: number[]): number {
-  if (shape.length === 0) return 1;
-  return shape.reduce((a, b) => a * b, 1);
-}
-
-/**
  * Normalize a possibly-negative dimension index to a non-negative one.
  */
 export function normalizeDim(d: number, rank: number): number {

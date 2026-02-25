@@ -22,7 +22,7 @@ import {
 } from "./shape-utils";
 import type { BackendTensor, DType } from "../types";
 import type { GPUBuffer, GPUComputePipeline, GPUBindGroup, WebGPUContext, WebGPUTensor } from "./gpu-types";
-import { GPUBufferUsage } from "./gpu-types";
+import { GPUBufferUsage, asGPUTensor } from "./gpu-types";
 import { requireContext, isF16Supported } from "./gpu-context";
 import { bufferPool } from "./buffer-pool";
 import {
@@ -32,7 +32,7 @@ import {
   submitOrCollect,
   getCurrentOpLabel,
 } from "./shared-encoder";
-import { dispatchRecordingBuffer, getAndClearLastBindGroupBuffers } from "./dispatch-recording";
+import { dispatchRecordingBuffer, getAndClearLastBindGroupBuffers, type RecordedDispatch } from "./dispatch-recording";
 import { resolveOutputBuffer } from "./buffer-arena";
 import {
   createParamsBuffer,
@@ -62,27 +62,32 @@ export function dispatchComputePass(
   workgroupsX: number,
   workgroupsY: number = 1,
   workgroupsZ: number = 1,
+  recordingBuffer?: RecordedDispatch[] | null,
+  labelOverride?: string,
 ): void {
   const ctx = requireContext();
+  const label = labelOverride ?? getCurrentOpLabel();
+  const recBuf = recordingBuffer !== undefined ? recordingBuffer : dispatchRecordingBuffer;
 
   // Record dispatch if recording is active
-  if (dispatchRecordingBuffer) {
-    dispatchRecordingBuffer.push({
+  if (recBuf) {
+    recBuf.push({
       pipeline,
       bindGroup: bindGroup as GPUBindGroup,
       workgroupsX,
       workgroupsY,
       workgroupsZ,
       buffers: getAndClearLastBindGroupBuffers(),
-      label: getCurrentOpLabel() ?? undefined,
+      label: label ?? undefined,
       module: getProfileModule(),
     });
   }
 
-  if (getSharedEncoderInstance()) {
+  const sharedEnc = getSharedEncoderInstance();
+  const tsWrites = getTimestampWrites(label ?? "unknown");
+  if (sharedEnc) {
     // Encode directly onto the shared encoder — no new encoder or CB
-    const tsWrites = getTimestampWrites(getCurrentOpLabel() ?? "unknown");
-    const pass = getSharedEncoderInstance().beginComputePass(
+    const pass = sharedEnc.beginComputePass(
       tsWrites ? { timestampWrites: tsWrites } : undefined,
     );
     pass.setPipeline(pipeline);
@@ -93,7 +98,6 @@ export function dispatchComputePass(
     autoFlushSharedEncoder();
   } else {
     const encoder = ctx.device.createCommandEncoder();
-    const tsWrites = getTimestampWrites(getCurrentOpLabel() ?? "unknown");
     const pass = encoder.beginComputePass(
       tsWrites ? { timestampWrites: tsWrites } : undefined,
     );
@@ -103,7 +107,6 @@ export function dispatchComputePass(
     pass.end();
     submitOrCollect(encoder.finish());
   }
-
 }
 
 /**
@@ -887,7 +890,7 @@ export function dispatchMatmul(
   const bytesPerElement = outputDtype === "f16" ? 2 : 4;
 
   // Create or use donated output buffer
-  const outSize = outShape.reduce((acc, dim) => acc * dim, 1);
+  const outSize = sizeOf(outShape);
   const requiredSize = outSize * bytesPerElement;
   const useDonated =
     donatedBuffer && donatedBuffer.size >= requiredSize;
@@ -962,7 +965,7 @@ export function dispatchMatmulWithEpilogue(
   const epilogueBuffers = epilogueInputs.map((t) => t.buffer);
 
   // Create output buffer (routed through arena for stable bind group cache)
-  const outSize = outShape.reduce((acc, dim) => acc * dim, 1);
+  const outSize = sizeOf(outShape);
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement,
     [effectiveA.buffer, effectiveB.buffer, ...epilogueBuffers]);
 
@@ -1022,7 +1025,7 @@ export function dispatchMatmulDirect(
 ): WebGPUTensor {
   const ctx = requireContext();
   const bytesPerElement = config.outputDtype === "f16" ? 2 : 4;
-  const outSize = config.outShape.reduce((a, b) => a * b, 1);
+  const outSize = sizeOf(config.outShape);
   const outBuffer = resolveOutputBuffer(
     ctx.device,
     outSize * bytesPerElement,
@@ -1081,7 +1084,7 @@ export function runFusedElementwise(
   if (size === 0) {
     throw new Error("fused elementwise does not support empty tensors yet");
   }
-  const inputTensors = inputs as WebGPUTensor[];
+  const inputTensors = inputs.map(asGPUTensor);
   const nodeById = new Map<number, IRNode>();
   for (const node of graph.nodes) {
     nodeById.set(node.id, node);

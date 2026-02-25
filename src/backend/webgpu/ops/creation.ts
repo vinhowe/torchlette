@@ -4,7 +4,7 @@
  */
 
 import type { WebGPUTensor } from "../gpu-types";
-import { GPUBufferUsage } from "../gpu-types";
+import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import { sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch, dtypeBytes, alignBufferSize } from "../shape-utils";
 import { requireContext, f32ArrayToF16Array } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
@@ -307,8 +307,8 @@ function triangularOp(a: WebGPUTensor, k: number, upper: boolean): WebGPUTensor 
 
   // Destroy contiguous copy if one was created (deferred for GPU fence)
   if (input !== a) {
-    bufferPool.decRef((input as WebGPUTensor).buffer);
-    bufferPool.deferredDestroy((input as WebGPUTensor).buffer, numElements * dtypeBytes(a.dtype));
+    bufferPool.decRef(asGPUTensor(input).buffer);
+    bufferPool.deferredDestroy(asGPUTensor(input).buffer, numElements * dtypeBytes(a.dtype));
   }
 
   return createTensor(a.shape.slice(), outBuffer, undefined, 0, a.dtype);

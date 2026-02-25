@@ -9,7 +9,8 @@ import type {
   GeluOptions,
   SubOptions,
 } from "../../types";
-import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
+import type { GPUBuffer } from "../gpu-types";
+import { asGPUTensor } from "../gpu-types";
 import { dispatchBinary, dispatchUnary } from "../dispatch";
 
 export function add(
@@ -17,7 +18,7 @@ export function add(
   b: BackendTensor,
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  return dispatchBinary("+", a as WebGPUTensor, b as WebGPUTensor, options);
+  return dispatchBinary("+", asGPUTensor(a), asGPUTensor(b), options);
 }
 
 export function sub(
@@ -25,7 +26,7 @@ export function sub(
   b: BackendTensor,
   options?: SubOptions & { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  return dispatchBinary("-", a as WebGPUTensor, b as WebGPUTensor, options);
+  return dispatchBinary("-", asGPUTensor(a), asGPUTensor(b), options);
 }
 
 export function div(
@@ -33,7 +34,7 @@ export function div(
   b: BackendTensor,
   options?: DivOptions & { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  return dispatchBinary("/", a as WebGPUTensor, b as WebGPUTensor, options);
+  return dispatchBinary("/", asGPUTensor(a), asGPUTensor(b), options);
 }
 
 export function mul(
@@ -41,14 +42,14 @@ export function mul(
   b: BackendTensor,
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  return dispatchBinary("*", a as WebGPUTensor, b as WebGPUTensor, options);
+  return dispatchBinary("*", asGPUTensor(a), asGPUTensor(b), options);
 }
 
 export function sqrt(
   a: BackendTensor,
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  return dispatchUnary("sqrt", "sqrt(x)", a as WebGPUTensor, options);
+  return dispatchUnary("sqrt", "sqrt(x)", asGPUTensor(a), options);
 }
 
 export function relu(
@@ -58,7 +59,7 @@ export function relu(
   return dispatchUnary(
     "relu",
     "select(0.0, x, x > 0.0)",
-    a as WebGPUTensor,
+    asGPUTensor(a),
     options,
   );
 }
@@ -67,35 +68,35 @@ export function exp(
   a: BackendTensor,
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  return dispatchUnary("exp", "exp(x)", a as WebGPUTensor, options);
+  return dispatchUnary("exp", "exp(x)", asGPUTensor(a), options);
 }
 
 export function log(
   a: BackendTensor,
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  return dispatchUnary("log", "log(x)", a as WebGPUTensor, options);
+  return dispatchUnary("log", "log(x)", asGPUTensor(a), options);
 }
 
 export function neg(
   a: BackendTensor,
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  return dispatchUnary("neg", "-x", a as WebGPUTensor, options);
+  return dispatchUnary("neg", "-x", asGPUTensor(a), options);
 }
 
 export function abs(
   a: BackendTensor,
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  return dispatchUnary("abs", "abs(x)", a as WebGPUTensor, options);
+  return dispatchUnary("abs", "abs(x)", asGPUTensor(a), options);
 }
 
 export function tanh(
   a: BackendTensor,
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  return dispatchUnary("tanh", "tanh(x)", a as WebGPUTensor, options);
+  return dispatchUnary("tanh", "tanh(x)", asGPUTensor(a), options);
 }
 
 export function sigmoid(
@@ -105,7 +106,7 @@ export function sigmoid(
   return dispatchUnary(
     "sigmoid",
     "(1.0 / (1.0 + exp(-x)))",
-    a as WebGPUTensor,
+    asGPUTensor(a),
     options,
   );
 }
@@ -122,7 +123,7 @@ export function gelu(
     return dispatchUnary(
       "gelu_tanh",
       "(x * 0.5 * (1.0 + tanh(clamp(0.7978845608 * (x + 0.044715 * x * x * x), -10.0, 10.0))))",
-      a as WebGPUTensor,
+      asGPUTensor(a),
       { outBuffer: options?.outBuffer },
     );
   } else {
@@ -133,7 +134,7 @@ export function gelu(
     return dispatchUnary(
       "gelu_erf",
       "(x * 0.5 * (1.0 + sign(x) * (1.0 - (((((1.061405429 * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) + -1.453152027) * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) + 1.421413741) * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) + -0.284496736) * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) + 0.254829592) * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) * exp(-x * x * 0.5)))))",
-      a as WebGPUTensor,
+      asGPUTensor(a),
       { outBuffer: options?.outBuffer },
     );
   }
@@ -147,7 +148,7 @@ export function silu(
   return dispatchUnary(
     "silu",
     "(x / (1.0 + exp(-x)))",
-    a as WebGPUTensor,
+    asGPUTensor(a),
     options,
   );
 }
@@ -169,7 +170,7 @@ export function isfinite(
   return dispatchUnary(
     "isfinite",
     "select(0.0, 1.0, (bitcast<u32>(x) & 0x7F800000u) != 0x7F800000u)",
-    a as WebGPUTensor,
+    asGPUTensor(a),
     options,
   );
 }

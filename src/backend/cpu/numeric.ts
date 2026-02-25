@@ -95,7 +95,7 @@ export function tensorFromArray(values: number[] | Float32Array, shape: Shape): 
 }
 
 export function full(shape: Shape, fillValue: number): Tensor {
-  const numElements = shape.reduce((a, b) => a * b, 1);
+  const numElements = sizeOf(shape);
   const data = new Float32Array(numElements);
   data.fill(fillValue);
   return new Tensor(shape, data);
@@ -227,12 +227,12 @@ export function narrow(a: Tensor, dim: number, start: number, length: number): T
 export function narrowBackward(grad: Tensor, dim: number, start: number, originalLength: number): Tensor {
   const outShape = grad.shape.slice();
   outShape[dim] = originalLength;
-  const outSize = outShape.reduce((a, b) => a * b, 1);
+  const outSize = sizeOf(outShape);
   const result = new Float32Array(outSize);
 
   // Compute indexing
-  const outerSize = outShape.slice(0, dim).reduce((a, b) => a * b, 1);
-  const innerSize = outShape.slice(dim + 1).reduce((a, b) => a * b, 1);
+  const outerSize = sizeOf(outShape.slice(0, dim));
+  const innerSize = sizeOf(outShape.slice(dim + 1));
   const gradDimSize = grad.shape[dim];
 
   // Copy grad values into the correct slice

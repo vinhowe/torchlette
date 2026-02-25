@@ -15,6 +15,7 @@
 import type { DType } from "../types";
 import type { IRNode } from "../../engine/ir";
 import { dtypeToWgslStorage as dtypeToWgsl, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
+import { sizeOf } from "../../core/shape";
 
 // Import from unified op registry - single source of truth
 import {
@@ -158,7 +159,7 @@ export function selectVectorWidth(
   const innerDim = shape[shape.length - 1];
 
   // Minimum size threshold - don't vectorize tiny tensors
-  const totalElements = shape.reduce((a, b) => a * b, 1);
+  const totalElements = sizeOf(shape);
   if (totalElements < 16) {
     return 1;
   }
@@ -193,7 +194,7 @@ export function canVectorize(
 
   // Check each input
   for (const input of inputs) {
-    const inputSize = input.shape.reduce((a, b) => a * b, 1);
+    const inputSize = sizeOf(input.shape);
 
     // Scalars are fine (splatted)
     if (inputSize === 1) continue;
@@ -260,7 +261,7 @@ export function genBroadcastIndex(
   }
 
   // If input is scalar (shape [1] or []), always index 0
-  const inputSize = inputShape.reduce((a, b) => a * b, 1);
+  const inputSize = sizeOf(inputShape);
   if (inputSize === 1) {
     return `let ${inputIdxVar} = 0u;`;
   }
@@ -298,7 +299,7 @@ export function genBroadcastIndex(
   // Compute input linear index
   let inIdxExpr = inCoords[0];
   for (let i = 1; i < inputRank; i++) {
-    const stride = inputShape.slice(i + 1).reduce((a, b) => a * b, 1);
+    const stride = sizeOf(inputShape.slice(i + 1));
     inIdxExpr = `(${inIdxExpr} * ${inputShape[i]}u + ${inCoords[i]})`;
   }
 
@@ -469,7 +470,7 @@ export function computeKernelMeta(
   const workgroupSize = options.workgroupSize ?? recipe.workgroupSize ?? 256;
   const outputShape = recipe.outputs[0].shape;
   const primaryDtype = recipe.outputs[0].dtype;
-  const totalElements = outputShape.reduce((a, b) => a * b, 1);
+  const totalElements = sizeOf(outputShape);
 
   let vectorWidth: VectorWidth = 1;
   if (options.forceVectorWidth !== undefined) {
@@ -511,7 +512,7 @@ export function generateFusedKernel(
 
   const outputShape = recipe.outputs[0].shape;
   const primaryDtype = recipe.outputs[0].dtype;
-  const totalElements = outputShape.reduce((a, b) => a * b, 1);
+  const totalElements = sizeOf(outputShape);
   const useVec = vectorWidth > 1;
   const vecType = useVec ? getVectorType(primaryDtype, vectorWidth) : dtypeToWgsl(primaryDtype);
 
@@ -565,7 +566,7 @@ export function generateFusedKernel(
       continue;
     }
 
-    const inputSize = input.shape.reduce((a, b) => a * b, 1);
+    const inputSize = sizeOf(input.shape);
     const isScalar = inputSize === 1;
 
     if (useVec) {
@@ -751,7 +752,7 @@ function genBroadcastIndexSingle(
   resultVar: string,
 ): string {
   // If input is scalar, always 0
-  const inputSize = inputShape.reduce((a, b) => a * b, 1);
+  const inputSize = sizeOf(inputShape);
   if (inputSize === 1) {
     return `let ${resultVar} = 0u;`;
   }
