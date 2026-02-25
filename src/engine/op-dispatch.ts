@@ -35,6 +35,7 @@ export async function executeOp(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
+  donationOpts?: { outBuffer: unknown },
 ): Promise<BackendTensor> {
   setCurrentOpLabel(node.op);
   setProfileModule(node.module ?? "unknown");
@@ -120,66 +121,66 @@ export async function executeOp(
     }
 
     case "add":
-      return backend.ops.add(backendInputs[0], backendInputs[1]);
+      return backend.ops.add(backendInputs[0], backendInputs[1], donationOpts);
 
     case "sub": {
       const subPayload = node.payload as { alpha?: number } | undefined;
-      return backend.ops.sub(backendInputs[0], backendInputs[1], subPayload);
+      return backend.ops.sub(backendInputs[0], backendInputs[1], { ...subPayload, ...donationOpts });
     }
 
     case "mul":
-      return backend.ops.mul(backendInputs[0], backendInputs[1]);
+      return backend.ops.mul(backendInputs[0], backendInputs[1], donationOpts);
 
     case "div": {
       const divPayload = node.payload as
         | { roundingMode?: "trunc" | "floor" }
         | undefined;
-      return backend.ops.div(backendInputs[0], backendInputs[1], divPayload);
+      return backend.ops.div(backendInputs[0], backendInputs[1], { ...divPayload, ...donationOpts });
     }
 
     case "matmul":
-      return backend.ops.matmul(backendInputs[0], backendInputs[1]);
+      return backend.ops.matmul(backendInputs[0], backendInputs[1], donationOpts);
 
     case "sqrt":
-      return backend.ops.sqrt(backendInputs[0]);
+      return backend.ops.sqrt(backendInputs[0], donationOpts);
 
     case "relu":
-      return backend.ops.relu(backendInputs[0]);
+      return backend.ops.relu(backendInputs[0], donationOpts);
 
     case "exp":
       if (!backend.ops.exp) throw new Error("exp not supported by backend");
-      return backend.ops.exp(backendInputs[0]);
+      return backend.ops.exp(backendInputs[0], donationOpts);
 
     case "log":
       if (!backend.ops.log) throw new Error("log not supported by backend");
-      return backend.ops.log(backendInputs[0]);
+      return backend.ops.log(backendInputs[0], donationOpts);
 
     case "neg":
       if (!backend.ops.neg) throw new Error("neg not supported by backend");
-      return backend.ops.neg(backendInputs[0]);
+      return backend.ops.neg(backendInputs[0], donationOpts);
 
     case "abs":
       if (!backend.ops.abs) throw new Error("abs not supported by backend");
-      return backend.ops.abs(backendInputs[0]);
+      return backend.ops.abs(backendInputs[0], donationOpts);
 
     case "tanh":
       if (!backend.ops.tanh) throw new Error("tanh not supported by backend");
-      return backend.ops.tanh(backendInputs[0]);
+      return backend.ops.tanh(backendInputs[0], donationOpts);
 
     case "sigmoid":
       if (!backend.ops.sigmoid)
         throw new Error("sigmoid not supported by backend");
-      return backend.ops.sigmoid(backendInputs[0]);
+      return backend.ops.sigmoid(backendInputs[0], donationOpts);
 
     case "gelu": {
       if (!backend.ops.gelu) throw new Error("gelu not supported by backend");
       const geluOpts = node.payload as GeluOptions | undefined;
-      return backend.ops.gelu(backendInputs[0], geluOpts);
+      return backend.ops.gelu(backendInputs[0], { ...geluOpts, ...donationOpts });
     }
 
     case "silu":
       if (!backend.ops.silu) throw new Error("silu not supported by backend");
-      return backend.ops.silu(backendInputs[0]);
+      return backend.ops.silu(backendInputs[0], donationOpts);
 
     case "isfinite":
       if (!backend.ops.isfinite)
@@ -303,33 +304,34 @@ export async function executeOp(
 
     case "gt":
       if (!backend.ops.gt) throw new Error("gt not supported by backend");
-      return backend.ops.gt(backendInputs[0], backendInputs[1]);
+      return backend.ops.gt(backendInputs[0], backendInputs[1], donationOpts);
 
     case "lt":
       if (!backend.ops.lt) throw new Error("lt not supported by backend");
-      return backend.ops.lt(backendInputs[0], backendInputs[1]);
+      return backend.ops.lt(backendInputs[0], backendInputs[1], donationOpts);
 
     case "ge":
       if (!backend.ops.ge) throw new Error("ge not supported by backend");
-      return backend.ops.ge(backendInputs[0], backendInputs[1]);
+      return backend.ops.ge(backendInputs[0], backendInputs[1], donationOpts);
 
     case "le":
       if (!backend.ops.le) throw new Error("le not supported by backend");
-      return backend.ops.le(backendInputs[0], backendInputs[1]);
+      return backend.ops.le(backendInputs[0], backendInputs[1], donationOpts);
 
     case "eq":
       if (!backend.ops.eq) throw new Error("eq not supported by backend");
-      return backend.ops.eq(backendInputs[0], backendInputs[1]);
+      return backend.ops.eq(backendInputs[0], backendInputs[1], donationOpts);
 
     case "ne":
       if (!backend.ops.ne) throw new Error("ne not supported by backend");
-      return backend.ops.ne(backendInputs[0], backendInputs[1]);
+      return backend.ops.ne(backendInputs[0], backendInputs[1], donationOpts);
 
     case "where":
       return backend.ops.where(
         backendInputs[0],
         backendInputs[1],
         backendInputs[2],
+        donationOpts,
       );
 
     case "stridedScatterCopy": {

@@ -119,8 +119,7 @@ export function where(
 
   // Check if chunking is needed for large contiguous tensors
   const bytesPerElement = 4; // f32
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const outSizeBytes = outSize * bytesPerElement;
 
@@ -195,8 +194,7 @@ function whereChunked(
   const ctx = requireContext();
   const bytesPerElement = 4; // f32
 
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 

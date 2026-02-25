@@ -498,6 +498,6 @@ export function getWebGPUDevice(): {
  */
 export function getMaxStorageBufferBindingSize(): number {
   const ctx = requireContext();
-  const limits = (ctx.device as unknown as { limits: Record<string, number> }).limits;
+  const limits = ctx.device.limits;
   return limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
 }

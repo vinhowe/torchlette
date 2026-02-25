@@ -173,7 +173,7 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
   // Check if buffer exceeds maxStorageBufferBindingSize — use chunked path
   const srcBytesPerElement = dtypeBytes(tensor.dtype);
   const dstBytesPerElement = dtypeBytes(dtype);
-  const limits = (ctx.device as unknown as { limits: Record<string, number> }).limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const inputDataBytes = tensor.size * srcBytesPerElement;
   const outputDataBytes = tensor.size * dstBytesPerElement;
@@ -499,12 +499,12 @@ export function contiguous(a: BackendTensor): BackendTensor {
   }
 
   // Check if input buffer exceeds max binding size
-  const limits = (ctx.device as unknown as { limits: Record<string, number> }).limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   // Get actual buffer size (the backing storage might be larger than the view)
-  const inputBufferSize = (tensor.buffer as { size: number }).size;
+  const inputBufferSize = tensor.buffer.size;
 
   if (inputBufferSize > maxBindingSize) {
     // Use chunked contiguous for large input buffers

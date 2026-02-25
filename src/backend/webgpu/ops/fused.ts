@@ -219,7 +219,7 @@ export function createInfCountBuffer(): unknown {
 }
 
 export async function readAndDestroyInfCount(buffer: unknown): Promise<number> {
-  return readInfFlag(buffer as any);
+  return readInfFlag(buffer as GPUBuffer);
 }
 
 // ============================================================================

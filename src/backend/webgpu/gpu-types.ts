@@ -47,6 +47,17 @@ export type GPUQueue = {
   writeBuffer(buffer: GPUBuffer, offset: number, data: ArrayBufferView): void;
 };
 
+export type GPUDeviceLimits = {
+  maxComputeWorkgroupSizeX?: number;
+  maxComputeWorkgroupSizeY?: number;
+  maxComputeWorkgroupsPerDimension?: number;
+  maxStorageBufferBindingSize?: number;
+  maxStorageBuffersPerShaderStage?: number;
+  maxComputeInvocationsPerWorkgroup?: number;
+  maxComputeWorkgroupStorageSize?: number;
+  [key: string]: number | undefined;
+};
+
 export type GPUDevice = {
   createBindGroup(descriptor: {
     layout: unknown;
@@ -64,6 +75,7 @@ export type GPUDevice = {
   }): GPUComputePipeline;
   createShaderModule(descriptor: { code: string }): unknown;
   queue: GPUQueue;
+  limits: GPUDeviceLimits;
 };
 
 export type GPUAdapterLimits = {

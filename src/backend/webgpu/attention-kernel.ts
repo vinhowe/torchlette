@@ -25,9 +25,8 @@ import {
 } from "./index";
 
 import { getSubgroupSupport } from "./matmul/types";
-import type { GPUBuffer, GPUDevice } from "./gpu-types";
-import { defineKernel } from "./kernel-factory";
-import { wgslReduce } from "./wgsl-reduce";
+import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
+import { GPUBufferUsage } from "./gpu-types";
 
 // Tiling parameters
 const BR = 64;  // Q rows per workgroup (also workgroup size in scalar mode)
@@ -39,16 +38,67 @@ const THREADS_PER_ROW = 4; // threads cooperating on one row's dot product
 const WG_SG = 256;  // workgroup size in subgroup mode (BR * THREADS_PER_ROW)
 
 // ============================================================================
-// Kernel Factory
+// Pipeline Cache
 // ============================================================================
 
-const kernel = defineKernel("attention");
+const pipelineCache = new Map<string, GPUComputePipeline>();
 
-// Reusable config buffer views (avoid per-call allocation)
-const _configData = new ArrayBuffer(32);
-const _configU32 = new Uint32Array(_configData);
-const _configF32 = new Float32Array(_configData);
-const _configU8 = new Uint8Array(_configData);
+function getOrCreatePipeline(
+  device: GPUDevice,
+  key: string,
+  code: string,
+): GPUComputePipeline {
+  let pipeline = pipelineCache.get(key);
+  if (!pipeline) {
+    const module = device.createShaderModule({ code });
+    pipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: { module, entryPoint: "main" },
+    });
+    pipelineCache.set(key, pipeline);
+  }
+  return pipeline;
+}
+
+// ============================================================================
+// Config Buffer Cache
+// ============================================================================
+
+const configCache = new Map<string, GPUBuffer>();
+
+function getOrCreateConfigBuffer(
+  device: GPUDevice,
+  batchSize: number,
+  numHeads: number,
+  seqLen: number,
+  headDim: number,
+  scale: number,
+  isCausal: number,
+): GPUBuffer {
+  const key = `fa:${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${isCausal}`;
+  let buf = configCache.get(key);
+  if (!buf) {
+    buf = device.createBuffer({
+      size: 32, // 8 x u32/f32
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    configCache.set(key, buf);
+  }
+  // Pack config: 4 u32s + 1 f32 + 1 u32 + 2 padding
+  const data = new ArrayBuffer(32);
+  const u32View = new Uint32Array(data);
+  const f32View = new Float32Array(data);
+  u32View[0] = batchSize;
+  u32View[1] = numHeads;
+  u32View[2] = seqLen;
+  u32View[3] = headDim;
+  f32View[4] = scale;
+  u32View[5] = isCausal;
+  u32View[6] = 0; // pad
+  u32View[7] = 0; // pad
+  device.queue.writeBuffer(buf, 0, new Uint8Array(data));
+  return buf;
+}
 
 // ============================================================================
 // Subgroup support detection for attention kernels
@@ -471,13 +521,25 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   // Compute base offset for this row
   let base = row_idx * D_dim;
 
-${wgslReduce({ wgSize: WG, tid: "tid", dim: "D_dim", loopVar: "d", op: "sum",
-  smem: "sdata", init: "0.0",
-  accumExpr: "dO[base + d] * Out[base + d]", result: "dot_val",
-})}
+  // Each thread accumulates partial dot product
+  var local_sum = 0.0f;
+  for (var d = tid; d < D_dim; d += ${WG}u) {
+    local_sum += dO[base + d] * Out[base + d];
+  }
+
+  sdata[tid] = local_sum;
+  workgroupBarrier();
+
+  // Tree reduction
+  for (var s = ${WG / 2}u; s > 0u; s >>= 1u) {
+    if (tid < s) {
+      sdata[tid] += sdata[tid + s];
+    }
+    workgroupBarrier();
+  }
 
   if (tid == 0u) {
-    D[row_idx] = dot_val;
+    D[row_idx] = sdata[0];
   }
 }
 `;
@@ -1142,26 +1204,18 @@ export function dispatchFlashAttentionForward(
   const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4; // f32
   const logsumexpSizeBytes = batchSize * numHeads * seqLen * 4; // f32
 
-  const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
-  const lseBuffer = allocateOutputBuffer(logsumexpSizeBytes) as unknown as GPUBuffer;
+  const outBuffer = allocateOutputBuffer(outputSizeBytes);
+  const lseBuffer = allocateOutputBuffer(logsumexpSizeBytes);
 
-  _configU32[0] = batchSize;
-  _configU32[1] = numHeads;
-  _configU32[2] = seqLen;
-  _configU32[3] = headDim;
-  _configF32[4] = scale;
-  _configU32[5] = isCausal ? 1 : 0;
-  _configU32[6] = 0;
-  _configU32[7] = 0;
-  const configBuf = kernel.getConfigBuffer(
-    device, `fa:${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${_configU32[5]}`, 32, _configU8,
+  const configBuf = getOrCreateConfigBuffer(
+    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
   );
 
   const sg = useSubgroupAttention(headDim);
-  const pipeline = kernel.getPipeline(
+  const pipeline = getOrCreatePipeline(
     device,
     `faFwd:${headDim}${sg ? ":sg" : ""}`,
-    () => flashAttentionForwardShader(headDim, sg),
+    flashAttentionForwardShader(headDim, sg),
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
@@ -1205,25 +1259,17 @@ export function dispatchFlashAttentionBackwardD(
   const totalRows = batchSize * numHeads * seqLen;
   const outputSizeBytes = totalRows * 4; // f32
 
-  const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
+  const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
-  _configU32[0] = batchSize;
-  _configU32[1] = numHeads;
-  _configU32[2] = seqLen;
-  _configU32[3] = headDim;
-  _configF32[4] = scale;
-  _configU32[5] = isCausal ? 1 : 0;
-  _configU32[6] = 0;
-  _configU32[7] = 0;
-  const configBuf = kernel.getConfigBuffer(
-    device, `fa:${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${_configU32[5]}`, 32, _configU8,
+  const configBuf = getOrCreateConfigBuffer(
+    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
   );
 
   const WG = Math.max(headDim, 32);
-  const pipeline = kernel.getPipeline(
+  const pipeline = getOrCreatePipeline(
     device,
     `faBwdD:${headDim}`,
-    () => flashAttentionBackwardDShader(headDim),
+    flashAttentionBackwardDShader(headDim),
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
@@ -1265,25 +1311,17 @@ export function dispatchFlashAttentionBackwardDQ(
 
   const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4;
 
-  const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
+  const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
-  _configU32[0] = batchSize;
-  _configU32[1] = numHeads;
-  _configU32[2] = seqLen;
-  _configU32[3] = headDim;
-  _configF32[4] = scale;
-  _configU32[5] = isCausal ? 1 : 0;
-  _configU32[6] = 0;
-  _configU32[7] = 0;
-  const configBuf = kernel.getConfigBuffer(
-    device, `fa:${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${_configU32[5]}`, 32, _configU8,
+  const configBuf = getOrCreateConfigBuffer(
+    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
   );
 
   const sg = useSubgroupAttention(headDim);
-  const pipeline = kernel.getPipeline(
+  const pipeline = getOrCreatePipeline(
     device,
     `faBwdDQ:${headDim}${sg ? ":sg" : ""}`,
-    () => flashAttentionBackwardDQShader(headDim, sg),
+    flashAttentionBackwardDQShader(headDim, sg),
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
@@ -1317,7 +1355,8 @@ export function dispatchFlashAttentionBackwardDQ(
  * Reset all module-local mutable state (pipeline cache, config buffer cache).
  */
 export function resetAttentionKernelState(): void {
-  kernel.reset();
+  pipelineCache.clear();
+  configCache.clear();
 }
 
 export function dispatchFlashAttentionBackwardDKV(
@@ -1339,27 +1378,19 @@ export function dispatchFlashAttentionBackwardDKV(
 
   const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4;
 
-  const dKBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
-  const dVBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
+  const dKBuffer = allocateOutputBuffer(outputSizeBytes);
+  const dVBuffer = allocateOutputBuffer(outputSizeBytes);
 
-  _configU32[0] = batchSize;
-  _configU32[1] = numHeads;
-  _configU32[2] = seqLen;
-  _configU32[3] = headDim;
-  _configF32[4] = scale;
-  _configU32[5] = isCausal ? 1 : 0;
-  _configU32[6] = 0;
-  _configU32[7] = 0;
-  const configBuf = kernel.getConfigBuffer(
-    device, `fa:${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${_configU32[5]}`, 32, _configU8,
+  const configBuf = getOrCreateConfigBuffer(
+    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
   );
 
   const BC_BW = 64;
   const sg = useSubgroupAttention(headDim);
-  const pipeline = kernel.getPipeline(
+  const pipeline = getOrCreatePipeline(
     device,
     `faBwdDKV:${headDim}${sg ? ":sg" : ""}`,
-    () => flashAttentionBackwardDKVShader(headDim, sg),
+    flashAttentionBackwardDKVShader(headDim, sg),
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,

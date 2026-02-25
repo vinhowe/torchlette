@@ -104,8 +104,7 @@ export function stridedScatterCopy(
   }
 
   const ctx = requireContext();
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
 
   // Check if any buffer exceeds max binding size
@@ -239,8 +238,7 @@ function stridedScatterCopyChunkedSimple(
   const totalElements = baseTensor.size;
   const bytesPerElement = 4; // f32
 
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   const layout = computeFlatChunkLayout(totalElements, bytesPerElement, maxBindingSize, minAlignment);
@@ -383,8 +381,7 @@ export function stridedScatterAdd(
   }
 
   const ctx = requireContext();
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
 
   // Check if any buffer exceeds max binding size
@@ -515,8 +512,7 @@ function stridedScatterAddChunkedSimple(
   const totalElements = baseTensor.size;
   const bytesPerElement = 4; // f32
 
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   const layout = computeFlatChunkLayout(totalElements, bytesPerElement, maxBindingSize, minAlignment);

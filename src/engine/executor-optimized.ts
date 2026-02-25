@@ -162,7 +162,7 @@ export function getFusionAnalysisTemplate(fingerprint: number): FusionAnalysisTe
  */
 export async function executePlanOptimized(
   plan: ExecutionPlan,
-  backend: Backend,
+  backend: Backend & { device?: { limits?: { maxStorageBuffersPerShaderStage?: number } } },
   options: OptimizedExecutionOptions = {},
 ): Promise<OptimizedExecutionResult> {
   if (plan.nodes.length === 0) {
@@ -217,7 +217,7 @@ export async function executePlanOptimized(
 
   // Query device storage buffer limit to constrain fusion group size.
   const maxStorageBuffers: number | undefined =
-    (backend as any).device?.limits?.maxStorageBuffersPerShaderStage;
+    backend.device?.limits?.maxStorageBuffersPerShaderStage;
 
   // Compute structural fingerprint for fusion analysis caching.
   // Plans with the same fingerprint have identical structure (ops, shapes,

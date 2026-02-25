@@ -467,8 +467,7 @@ export function dispatchBinary(
   }
 
   // Check if any buffer exceeds max binding size
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const bytesPerElement = dtypeBytes(dtype);
 
@@ -577,8 +576,7 @@ export function dispatchBinaryChunked(
   const dtype = a.dtype;
   const bytesPerElement = dtypeBytes(dtype);
 
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
@@ -653,8 +651,7 @@ export function dispatchUnary(
   const bytesPerElement = dtypeBytes(dtype);
 
   // Check if chunking is needed for large contiguous tensors
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const aSizeBytes = a.size * bytesPerElement;
 
@@ -713,8 +710,7 @@ export function dispatchUnaryChunked(
   const dtype = a.dtype;
   const bytesPerElement = dtypeBytes(dtype);
 
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 

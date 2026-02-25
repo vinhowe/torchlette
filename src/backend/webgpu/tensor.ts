@@ -45,9 +45,9 @@ export function createTensor(
   // Track if already destroyed to prevent double-destroy
   let destroyed = false;
 
-  // Get buffer size and usage for pool release (WebGPU buffers have .size and .usage properties)
-  const bufferSize = (buffer as any).size ?? sizeOf(shape) * dtypeBytes(dtype);
-  const bufferUsage = (buffer as any).usage ?? 0;
+  // Get buffer size and usage for pool release
+  const bufferSize = buffer.size;
+  const bufferUsage = buffer.usage;
 
   // Check if this buffer size matches pool expectations (power-of-2)
   const sizeClass = getSizeClass(bufferSize);
@@ -148,7 +148,7 @@ export function createTrackedBuffer(
     // Use pool size class for all storage buffers (including mappedAtCreation)
     // so they can be reused from the pool after release.
     const pooledSize = getSizeForClass(getSizeClass(alignedSize));
-    const limits = (device as unknown as { limits?: Record<string, number> }).limits;
+    const limits = device.limits;
     const maxBinding = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
     actualSize = pooledSize <= maxBinding ? pooledSize : alignedSize;
   } else {
@@ -218,7 +218,7 @@ export function createBufferWithData(
   // Pool uses power-of-2 size classes - must use the full class size
   // Cap at maxStorageBufferBindingSize to avoid oversized pooled buffers
   const rawPoolSize = getSizeForClass(getSizeClass(alignedSize));
-  const devLimits = (device as unknown as { limits?: Record<string, number> }).limits;
+  const devLimits = device.limits;
   const maxBindingSizeForPool = devLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const poolSize = rawPoolSize <= maxBindingSizeForPool ? rawPoolSize : alignedSize;
 
