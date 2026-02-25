@@ -6,6 +6,7 @@
  */
 
 import type { DType } from "../types";
+export { sizeOf, broadcastShapes, shapesEqual } from "../../core/shape";
 
 // ============================================================================
 // Constants
@@ -15,14 +16,6 @@ export const WORKGROUP_SIZE = 256;
 
 /** Maximum workgroups per dimension in WebGPU (per spec) */
 export const MAX_WORKGROUPS_PER_DIM = 65535;
-
-// ============================================================================
-// Shape & Stride Utilities
-// ============================================================================
-
-export function sizeOf(shape: number[]): number {
-  return shape.reduce((acc, dim) => acc * dim, 1);
-}
 
 /**
  * Greatest common divisor using Euclidean algorithm.
@@ -41,19 +34,7 @@ export function lcm(a: number, b: number): number {
   return (a * b) / gcd(a, b);
 }
 
-export function broadcastShapes(a: number[], b: number[]): number[] {
-  const outRank = Math.max(a.length, b.length);
-  const out = new Array<number>(outRank);
-  for (let i = 0; i < outRank; i += 1) {
-    const aDim = a[a.length - 1 - i] ?? 1;
-    const bDim = b[b.length - 1 - i] ?? 1;
-    if (aDim !== bDim && aDim !== 1 && bDim !== 1) {
-      throw new Error("webgpu shapes are not broadcastable");
-    }
-    out[outRank - 1 - i] = Math.max(aDim, bDim);
-  }
-  return out;
-}
+// broadcastShapes re-exported from core/shape
 
 export function toIndexShape(shape: number[]): number[] {
   return shape.length === 0 ? [1] : shape;
@@ -198,12 +179,7 @@ export function checkContiguousStrides(shape: number[], strides: number[]): bool
   return true;
 }
 
-export function shapesEqual(a: number[], b: number[]): boolean {
-  if (a.length !== b.length) {
-    return false;
-  }
-  return a.every((dim, index) => dim === b[index]);
-}
+// shapesEqual re-exported from core/shape
 
 // ============================================================================
 // Dtype Helpers

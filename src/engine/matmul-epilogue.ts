@@ -1,7 +1,10 @@
 import type { Backend, BackendTensor, DType } from "../backend/types";
+import { asGPUTensor, type WebGPUTensor } from "../backend/webgpu/gpu-types";
 import type { LazyIRNode, LazyRef, StorageHandle } from "./lazy-types";
 import { createStorageHandle, ensureWebGPUMatmulImports, _webgpuMatmulImports } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
+import { shapesEqual } from "../core/shape";
+export { shapesEqual };
 
 // ============================================================================
 // Matmul Epilogue Fusion (Phase 1)
@@ -315,10 +318,10 @@ export async function executeMatmulWithEpilogue(
 
   // Call dispatchMatmulWithEpilogue
   const resultTensor = dispatchMatmulWithEpilogue(
-    matmulInputA.backendTensor as any,
-    matmulInputB.backendTensor as any,
+    asGPUTensor(matmulInputA.backendTensor),
+    asGPUTensor(matmulInputB.backendTensor),
     epilogueConfig,
-    epilogueInputTensors as any[],
+    epilogueInputTensors.map(t => asGPUTensor(t)) as WebGPUTensor[],
     false, // transA
     false, // transB
     inputCastA,
@@ -330,7 +333,8 @@ export async function executeMatmulWithEpilogue(
   // may differ from outputNode.shape. Fix up by mutating the tensor's shape/strides.
   const outNodeShape = plan.outputNode.shape;
   if (!shapesEqual(resultTensor.shape, outNodeShape)) {
-    (resultTensor as any).shape = outNodeShape;
+    const gpuT = asGPUTensor(resultTensor);
+    gpuT.shape = outNodeShape;
     // Recompute strides for the new shape (contiguous row-major)
     const newStrides = new Array(outNodeShape.length);
     let stride = 1;
@@ -338,15 +342,9 @@ export async function executeMatmulWithEpilogue(
       newStrides[i] = stride;
       stride *= outNodeShape[i];
     }
-    (resultTensor as any).strides = newStrides;
+    gpuT.strides = newStrides;
   }
   plan.outputNode.result = createStorageHandle(plan.outputNode.device, resultTensor);
 }
 
-export function shapesEqual(a: number[], b: number[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return false;
-  }
-  return true;
-}
+// shapesEqual re-exported from core/shape

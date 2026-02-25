@@ -104,6 +104,12 @@ export function transposeShape(
 
 export type DType = "f16" | "f32" | "i32" | "u32" | "bool";
 
+/**
+ * Backend-agnostic execution options for output buffer donation.
+ * WebGPU backends accept `outBuffer` (a GPUBuffer); CPU backends ignore it.
+ */
+export type OpExecOptions = { outBuffer?: unknown };
+
 export type SumOptions = {
   dim?: number | number[] | null;
   keepdim?: boolean;
@@ -220,21 +226,21 @@ export interface BackendOps {
   randn?(shape: Shape, seed: number): BackendTensor;
   /** Create a tensor with Bernoulli-distributed values (1 with probability p, else 0). */
   bernoulli?(shape: Shape, p: number, seed: number): BackendTensor;
-  add(a: BackendTensor, b: BackendTensor): BackendTensor;
-  sub(a: BackendTensor, b: BackendTensor, options?: SubOptions): BackendTensor;
-  div(a: BackendTensor, b: BackendTensor, options?: DivOptions): BackendTensor;
-  mul(a: BackendTensor, b: BackendTensor): BackendTensor;
-  matmul(a: BackendTensor, b: BackendTensor): BackendTensor;
-  sqrt(a: BackendTensor): BackendTensor;
-  relu(a: BackendTensor): BackendTensor;
-  exp?(a: BackendTensor): BackendTensor;
-  log?(a: BackendTensor): BackendTensor;
-  neg?(a: BackendTensor): BackendTensor;
-  abs?(a: BackendTensor): BackendTensor;
-  tanh?(a: BackendTensor): BackendTensor;
-  sigmoid?(a: BackendTensor): BackendTensor;
-  gelu?(a: BackendTensor, options?: GeluOptions): BackendTensor;
-  silu?(a: BackendTensor): BackendTensor;
+  add(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  sub(a: BackendTensor, b: BackendTensor, options?: SubOptions & OpExecOptions): BackendTensor;
+  div(a: BackendTensor, b: BackendTensor, options?: DivOptions & OpExecOptions): BackendTensor;
+  mul(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  matmul(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  sqrt(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  relu(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  exp?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  log?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  neg?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  abs?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  tanh?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  sigmoid?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  gelu?(a: BackendTensor, options?: GeluOptions & OpExecOptions): BackendTensor;
+  silu?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
   /** Check if values are finite (not NaN and not Inf). Returns 1.0 where finite, 0.0 elsewhere. */
   isfinite?(a: BackendTensor): BackendTensor;
   expand(a: BackendTensor, shape: Shape): BackendTensor;
@@ -275,22 +281,23 @@ export interface BackendOps {
   /** Argmin reduction. Returns indices of minimum values along dimension. */
   argmin?(a: BackendTensor, options: ArgReduceOptions): BackendTensor;
   /** Greater than comparison. Returns 1.0 where a > b, 0.0 elsewhere. */
-  gt?(a: BackendTensor, b: BackendTensor): BackendTensor;
+  gt?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
   /** Less than comparison. Returns 1.0 where a < b, 0.0 elsewhere. */
-  lt?(a: BackendTensor, b: BackendTensor): BackendTensor;
+  lt?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
   /** Greater than or equal comparison. Returns 1.0 where a >= b, 0.0 elsewhere. */
-  ge?(a: BackendTensor, b: BackendTensor): BackendTensor;
+  ge?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
   /** Less than or equal comparison. Returns 1.0 where a <= b, 0.0 elsewhere. */
-  le?(a: BackendTensor, b: BackendTensor): BackendTensor;
+  le?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
   /** Equal comparison. Returns 1.0 where a == b, 0.0 elsewhere. */
-  eq?(a: BackendTensor, b: BackendTensor): BackendTensor;
+  eq?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
   /** Not equal comparison. Returns 1.0 where a != b, 0.0 elsewhere. */
-  ne?(a: BackendTensor, b: BackendTensor): BackendTensor;
+  ne?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
   /** Ternary select: where(condition, x, y) -> x if condition else y */
   where(
     condition: BackendTensor,
     x: BackendTensor,
     y: BackendTensor,
+    options?: OpExecOptions,
   ): BackendTensor;
   /**
    * Copy src values into base tensor at positions defined by view metadata.

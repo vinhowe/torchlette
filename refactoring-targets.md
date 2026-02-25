@@ -1,6 +1,6 @@
 # Refactoring Targets
 
-Refactoring opportunities identified from full codebase reviews. All targets (1–5, 7–16) are complete.
+Refactoring opportunities identified from full codebase reviews. All targets (1–5, 7–19) are complete.
 
 ## Target 1: Decompose `webgpu/index.ts` — DONE
 
@@ -52,7 +52,7 @@ Added as part of Target 7.
 
 Identified from full codebase audit after completing Targets 1–11.
 
-### `as any` Cast Inventory (201 total across 24 files)
+### `as any` Cast Inventory (201→37 total; see Targets 10, 13, 14, 17, 19)
 
 | File | Count | Pattern |
 |------|-------|---------|
@@ -103,3 +103,15 @@ Decomposed `runtime/engine.ts` (2,489→1,990 lines) and `engine/engine.ts` (1,8
 ## Target 16: Consolidate Remaining Module-Local Globals — DONE
 
 Added exported `resetKernelState()` functions to 5 kernel files (`attention-kernel.ts`, `layernorm-kernel.ts`, `cross-entropy-kernel.ts`, `adam-kernel.ts`, `unscale-kernel.ts`) and `resetMatmulState()` to `matmul/dispatch.ts` for their pipeline caches, config buffer caches, and temp buffer caches. Created master `resetAllKernelCaches()` in `gpu-context.ts` that calls all 7 reset functions (the 6 above + `resetFusionCache()` from `fusion-dispatch.ts`). Wired into `destroyWebGPU()` for full cleanup on device teardown. Exported from `index.ts` for test isolation use. Pre-existing state was already well-consolidated: `webgpu-state.ts` (11 cross-module globals), `shared-encoder.ts` (encoderState object), `bind-group-cache.ts` (cacheState object), `buffer-arena.ts` (arenaLocal object), `profiler.ts` (cpuProfile + gpuTs objects), `dispatch-recording.ts` (start/stop lifecycle), `buffer-pool.ts` (class with private state).
+
+## Target 17: Typed Backend Op Dispatch — DONE
+
+Added `OpExecOptions` type (`{ outBuffer?: unknown }`) to `backend/types.ts`. Extended `BackendOps` method signatures with optional `OpExecOptions` parameter for all ops that support output buffer donation: `add`, `sub`, `div`, `mul`, `matmul`, `sqrt`, `relu`, `exp`, `log`, `neg`, `abs`, `tanh`, `sigmoid`, `gelu`, `silu`, `gt`, `lt`, `ge`, `le`, `eq`, `ne`, `where`. Ops with existing options use intersection types (e.g., `SubOptions & OpExecOptions`). Removed 20 `as any` casts from `memory-planned-executor.ts`. Also fixed 2 pre-existing type errors in `ge`/`le` cases that passed `donationOpts` without `as any`. Total `as any` count: 75→55.
+
+## Target 18: Deduplicate Shape Utilities — DONE
+
+Created `src/core/shape.ts` as canonical home for pure shape functions (`sizeOf`, `broadcastShapes`, `shapesEqual`) — zero dependencies, importable from any layer. Deleted 7 duplicate copies across `frontend.ts`, `frontend-autograd.ts`, `backend/cpu/numeric.ts`, `engine/ir.ts`, `engine/matmul-epilogue.ts`. Re-export sites (`backend/webgpu/shape-utils.ts`, `runtime/shape-helpers.ts`, `engine/matmul-epilogue.ts`) import and re-export to preserve all downstream import paths.
+
+## Target 19: Typed `BackendTensor` → `WebGPUTensor` Narrowing — DONE
+
+Added `asGPUTensor(tensor)` helper in `gpu-types.ts` to narrow `BackendTensor` to `WebGPUTensor` for typed property access (shape, strides, buffer, dtype, etc.). Removed 13 `as any` casts from `executor-lowered.ts` and 5 from `matmul-epilogue.ts`. Patterns removed: `(bt as any).shape`, `(resultTensor as any).shape = ...`, `asGPUTensor(matmulInputA.backendTensor)` replacing `(matmulInputA.backendTensor as any)`. Total `as any` count: 55→37.

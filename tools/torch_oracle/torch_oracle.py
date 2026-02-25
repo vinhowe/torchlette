@@ -1921,12 +1921,8 @@ class MLP(nn.Module):
         return x
 
 
-def main():
-    payload = sys.stdin.read()
-    if not payload.strip():
-        raise RuntimeError("No JSON payload provided to torch oracle.")
-
-    data = json.loads(payload)
+def process_request(data):
+    """Process a batch request and return {results: [...]}."""
     cases = data.get("cases", [])
     results = []
 
@@ -1958,8 +1954,39 @@ def main():
                 {"ok": False, "error": str(exc), "caseName": case_name}
             )
 
-    print(json.dumps({"results": results}))
+    return {"results": results}
+
+
+def main():
+    payload = sys.stdin.read()
+    if not payload.strip():
+        raise RuntimeError("No JSON payload provided to torch oracle.")
+
+    data = json.loads(payload)
+    response = process_request(data)
+    print(json.dumps(response))
+
+
+def server_main():
+    """Persistent server mode: NDJSON over stdin/stdout."""
+    sys.stdout.write('{"ready":true}\n')
+    sys.stdout.flush()
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+            response = process_request(data)
+        except Exception as exc:
+            response = {"results": [{"ok": False, "error": str(exc)}]}
+        sys.stdout.write(json.dumps(response) + "\n")
+        sys.stdout.flush()
+        gc.collect()
 
 
 if __name__ == "__main__":
-    main()
+    if "--server" in sys.argv:
+        server_main()
+    else:
+        main()
