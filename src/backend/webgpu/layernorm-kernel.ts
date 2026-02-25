@@ -21,6 +21,7 @@ import {
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { defineKernel } from "./kernel-factory";
+import { wgslReduce } from "./wgsl-reduce";
 
 const kernel = defineKernel("layerNorm");
 
@@ -83,40 +84,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   let D = config.feature_dim;
   let base = row * D;
 
-  // Phase 1: Parallel sum for mean
-  var local_sum = 0.0;
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    local_sum += x[base + i];
-  }
-  sdata[tid] = local_sum;
-  workgroupBarrier();
+${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "D", op: "sum",
+  smem: "sdata", init: "0.0",
+  accumExpr: "x[base + i]", result: "mean",
+  transform: "_ / f32(D)",
+})}
 
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] += sdata[tid + s];
-    }
-    workgroupBarrier();
-  }
-  let mean = sdata[0] / f32(D);
+${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "D", op: "sum",
+  smem: "sdata", init: "0.0",
+  loopPreamble: "let diff = x[base + i] - mean;",
+  accumExpr: "diff * diff", result: "inv_std",
+  transform: "inverseSqrt(_ / f32(D) + config.eps)",
+})}
 
-  // Phase 2: Parallel sum for variance
-  var local_var = 0.0;
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    let diff = x[base + i] - mean;
-    local_var += diff * diff;
-  }
-  sdata[tid] = local_var;
-  workgroupBarrier();
-
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] += sdata[tid + s];
-    }
-    workgroupBarrier();
-  }
-  let inv_std = inverseSqrt(sdata[0] / f32(D) + config.eps);
-
-  // Phase 3: Normalize + affine transform
+  // Normalize + affine transform
   for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
     let normalized = (x[base + i] - mean) * inv_std;
     output[base + i] = normalized * weight[i] + bias[i];
@@ -152,55 +133,26 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   let Df = f32(D);
   let base = row * D;
 
-  // Recompute mean
-  var local_sum = 0.0;
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    local_sum += x[base + i];
-  }
-  sdata[tid] = local_sum;
-  workgroupBarrier();
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) { sdata[tid] += sdata[tid + s]; }
-    workgroupBarrier();
-  }
-  let mean = sdata[0] / Df;
+${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "D", op: "sum",
+  smem: "sdata", init: "0.0",
+  accumExpr: "x[base + i]", result: "mean",
+  transform: "_ / Df",
+})}
 
-  // Recompute variance + inv_std
-  var local_var = 0.0;
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    let diff = x[base + i] - mean;
-    local_var += diff * diff;
-  }
-  sdata[tid] = local_var;
-  workgroupBarrier();
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) { sdata[tid] += sdata[tid + s]; }
-    workgroupBarrier();
-  }
-  let inv_std = inverseSqrt(sdata[0] / Df + config.eps);
+${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "D", op: "sum",
+  smem: "sdata", init: "0.0",
+  loopPreamble: "let diff = x[base + i] - mean;",
+  accumExpr: "diff * diff", result: "inv_std",
+  transform: "inverseSqrt(_ / Df + config.eps)",
+})}
 
-  // Compute grad_normalized = grad_output * weight
-  // Then reduce: c1 = mean(grad_normalized), c2 = mean(grad_normalized * normalized)
-  var local_c1 = 0.0;
-  var local_c2 = 0.0;
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    let gn = grad_output[base + i] * weight[i];
-    let norm_i = (x[base + i] - mean) * inv_std;
-    local_c1 += gn;
-    local_c2 += gn * norm_i;
-  }
-  sdata[tid] = local_c1;
-  sdata2[tid] = local_c2;
-  workgroupBarrier();
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] += sdata[tid + s];
-      sdata2[tid] += sdata2[tid + s];
-    }
-    workgroupBarrier();
-  }
-  let c1 = sdata[0] / Df;
-  let c2 = sdata2[0] / Df;
+${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "D", op: "sum",
+  loopPreamble: "let gn = grad_output[base + i] * weight[i];\nlet norm_i = (x[base + i] - mean) * inv_std;",
+  channels: [
+    { smem: "sdata", init: "0.0", accumExpr: "gn", result: "c1", transform: "_ / Df" },
+    { smem: "sdata2", init: "0.0", accumExpr: "gn * norm_i", result: "c2", transform: "_ / Df" },
+  ],
+})}
 
   // Output: grad_x[i] = (grad_normalized[i] - c1 - normalized[i] * c2) * inv_std
   for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
@@ -237,32 +189,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   let Df = f32(D);
   let base = row * D;
 
-  // Phase 1: Parallel sum for mean
-  var local_sum = 0.0;
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    local_sum += x[base + i];
-  }
-  sdata[tid] = local_sum;
-  workgroupBarrier();
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) { sdata[tid] += sdata[tid + s]; }
-    workgroupBarrier();
-  }
-  let mean = sdata[0] / Df;
+${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "D", op: "sum",
+  smem: "sdata", init: "0.0",
+  accumExpr: "x[base + i]", result: "mean",
+  transform: "_ / Df",
+})}
 
-  // Phase 2: Parallel sum for variance → inv_std
-  var local_var = 0.0;
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    let diff = x[base + i] - mean;
-    local_var += diff * diff;
-  }
-  sdata[tid] = local_var;
-  workgroupBarrier();
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) { sdata[tid] += sdata[tid + s]; }
-    workgroupBarrier();
-  }
-  let inv_std = inverseSqrt(sdata[0] / Df + config.eps);
+${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "D", op: "sum",
+  smem: "sdata", init: "0.0",
+  loopPreamble: "let diff = x[base + i] - mean;",
+  accumExpr: "diff * diff", result: "inv_std",
+  transform: "inverseSqrt(_ / Df + config.eps)",
+})}
 
   // Write row stats (only thread 0 writes)
   if (tid == 0u) {

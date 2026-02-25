@@ -20,6 +20,7 @@ import {
 } from "./index";
 import type { GPUBuffer } from "./gpu-types";
 import { defineKernel } from "./kernel-factory";
+import { wgslReduce } from "./wgsl-reduce";
 
 const WORKGROUP_SIZE = 256;
 
@@ -51,39 +52,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   let V = config.vocab_size;
   let base = row * V;
 
-  // Phase 1: Parallel max reduction
-  var local_max = -3.402823e+38;
-  for (var i = tid; i < V; i += ${WORKGROUP_SIZE}u) {
-    local_max = max(local_max, logits[base + i]);
-  }
-  sdata[tid] = local_max;
-  workgroupBarrier();
+${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "V", op: "max",
+  smem: "sdata", init: "-3.402823e+38",
+  accumExpr: "logits[base + i]", result: "row_max",
+})}
 
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] = max(sdata[tid], sdata[tid + s]);
-    }
-    workgroupBarrier();
-  }
-  let row_max = sdata[0];
+${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "V", op: "sum",
+  smem: "sdata", init: "0.0",
+  accumExpr: "exp(logits[base + i] - row_max)", result: "log_sum_exp",
+  transform: "log(_)",
+})}
 
-  // Phase 2: Parallel sum-exp reduction
-  var local_sum = 0.0;
-  for (var i = tid; i < V; i += ${WORKGROUP_SIZE}u) {
-    local_sum += exp(logits[base + i] - row_max);
-  }
-  sdata[tid] = local_sum;
-  workgroupBarrier();
-
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] += sdata[tid + s];
-    }
-    workgroupBarrier();
-  }
-  let log_sum_exp = log(sdata[0]);
-
-  // Phase 3: Output (thread 0 only)
+  // Output (thread 0 only)
   if (tid == 0u) {
     let t = u32(targets[row]);
     loss[row] = -(logits[base + t] - row_max - log_sum_exp);
@@ -115,39 +95,18 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   let V = config.vocab_size;
   let base = row * V;
 
-  // Phase 1: Parallel max reduction (recompute from forward)
-  var local_max = -3.402823e+38;
-  for (var i = tid; i < V; i += ${WORKGROUP_SIZE}u) {
-    local_max = max(local_max, logits[base + i]);
-  }
-  sdata[tid] = local_max;
-  workgroupBarrier();
+${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "V", op: "max",
+  smem: "sdata", init: "-3.402823e+38",
+  accumExpr: "logits[base + i]", result: "row_max",
+})}
 
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] = max(sdata[tid], sdata[tid + s]);
-    }
-    workgroupBarrier();
-  }
-  let row_max = sdata[0];
+${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "V", op: "sum",
+  smem: "sdata", init: "0.0",
+  accumExpr: "exp(logits[base + i] - row_max)", result: "log_sum_exp",
+  transform: "log(_)",
+})}
 
-  // Phase 2: Parallel sum-exp reduction (recompute from forward)
-  var local_sum = 0.0;
-  for (var i = tid; i < V; i += ${WORKGROUP_SIZE}u) {
-    local_sum += exp(logits[base + i] - row_max);
-  }
-  sdata[tid] = local_sum;
-  workgroupBarrier();
-
-  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] += sdata[tid + s];
-    }
-    workgroupBarrier();
-  }
-  let log_sum_exp = log(sdata[0]);
-
-  // Phase 3: Write gradients (all threads participate)
+  // Write gradients (all threads participate)
   // grad_logits[b,v] = grad_output[b] * (softmax[b,v] - one_hot(target[b])[v])
   let t = u32(targets[row]);
   let g = grad_output[row];
