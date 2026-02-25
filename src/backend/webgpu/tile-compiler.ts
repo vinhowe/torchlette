@@ -22,7 +22,7 @@
 
 import type {
   IRNode, TileKernelSpec,
-  ReduceNode, StoreNode, BlockRangeNode,
+  ReduceNode, StoreNode, BlockRangeNode, LoadNode,
   Statement, DataType,
   TileLoadStmt, DotStmt, AccOpStmt, TileLoad1DStmt, TileStoreStmt,
   TilePtr2D, TileMask2D,
@@ -109,8 +109,8 @@ function getChildren(node: IRNode): IRNode[] {
     case "cast": return [node.input];
     case "bitcast": return [node.input];
     case "reduce": return [node.input];
-    case "load": return [node.offsets];
-    case "store": return [node.offsets, node.values];
+    case "load": return node.mask ? [node.offsets, node.mask] : [node.offsets];
+    case "store": return node.mask ? [node.offsets, node.values, node.mask] : [node.offsets, node.values];
     case "blockRange": return [node.extent];
     case "select": return [node.condition, node.trueVal, node.falseVal];
     case "cmp": return [node.lhs, node.rhs];
@@ -490,6 +490,11 @@ function compileAutoPhaseKernel(spec: TileKernelSpec, ctx: KernelContext): strin
     if (n.kind === "reduce") reduces.push(n);
   }
 
+  // If no reduces and any store has a mask → elementwise auto-phase
+  if (reduces.length === 0 && ctx.stores.some(s => s.mask)) {
+    return compileElementwiseAutoPhase(spec, ctx, wgSize);
+  }
+
   // Discover all nodes (including those from BlockExpr methods)
   const allNodes = discoverAllNodes(ctx.stores, reduces);
 
@@ -557,6 +562,172 @@ function compileAutoPhaseKernel(spec: TileKernelSpec, ctx: KernelContext): strin
 
   lines.push(`}`);
   return lines.join("\n");
+}
+
+// ============================================================================
+// Elementwise Auto-Phase Compiler (no reduces, masked stores)
+// ============================================================================
+
+/**
+ * Compile an elementwise kernel in auto-phase mode.
+ *
+ * When there are no reduces and stores have masks, we emit a multi-workgroup
+ * kernel using global_invocation_id. Each thread processes one element.
+ * blockRange nodes compile to `gid.x` (single element per thread).
+ *
+ * No shared memory, no strided loops — just direct indexed access with mask guards.
+ * Supports vectorize (same as imperative mode).
+ */
+function compileElementwiseAutoPhase(spec: TileKernelSpec, ctx: KernelContext, wgSize: number): string {
+  const lines: string[] = [];
+
+  // Feature enables
+  if (spec.enableF16) lines.push("enable f16;");
+  if (spec.enableSubgroups) lines.push("enable subgroups;");
+  if (spec.enableF16 || spec.enableSubgroups) lines.push("");
+
+  // Header
+  lines.push(emitUniformStruct(spec));
+  lines.push("");
+  lines.push(...emitBindings(spec));
+  lines.push("");
+
+  // Function signature — workgroup_id + local_invocation_index, no shared memory
+  // programId(0) → wid.x, blockRange(WG) → lid
+  // So idx = programId(0) * WG + blockRange(WG) → wid.x * WG + lid == gid.x
+  lines.push(`@compute @workgroup_size(${wgSize})`);
+  lines.push(`fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {`);
+
+  // Binding map: blockRange → lid
+  const bindings: BindingMap = new Map();
+
+  // Find all blockRange nodes and bind them to lid
+  const allNodes = discoverAllNodes(ctx.stores, []);
+  for (const n of allNodes) {
+    if (n.kind === "blockRange") {
+      bindings.set(n.id, "lid");
+    }
+  }
+
+  // Vectorization support
+  const vecWidth = spec.vectorize && spec.vectorize > 1 ? spec.vectorize : 1;
+
+  if (vecWidth === 1) {
+    // Non-vectorized: emit scalar preamble bindings
+    emitElementwiseScalarPreamble(allNodes, bindings, lines);
+  } else {
+    // Vectorized: emit _base, per-iteration bindings computed inside loop
+    lines.push(`  let _base = (wid.x * ${wgSize}u + lid) * ${vecWidth}u;`);
+    // Emit uniforms as let bindings (they're loop-invariant)
+    for (const n of allNodes) {
+      if (n.kind === "uniform") {
+        const expr = exprFor(n, bindings, null);
+        const name = varNameFor(n);
+        lines.push(`  let ${name} = ${expr};`);
+        bindings.set(n.id, name);
+      }
+    }
+  }
+
+  for (let v = 0; v < vecWidth; v++) {
+    const iterBindings = new Map(bindings);
+    if (vecWidth > 1) {
+      // In vec mode: blockRange → (_base + v), programId → 0u
+      // So idx = programId(0) * WG + blockRange(WG) → 0u * WG + (_base + v) = (_base + v)
+      // where _base = (wid.x * WG + lid) * vecWidth
+      for (const n of allNodes) {
+        if (n.kind === "blockRange") {
+          iterBindings.set(n.id, `(_base + ${v}u)`);
+        } else if (n.kind === "programId") {
+          iterBindings.set(n.id, "0u");
+        }
+      }
+      lines.push(`  // vec element ${v}`);
+      lines.push(`  {`);
+    }
+    const indent = vecWidth > 1 ? "    " : "  ";
+
+    // Emit each store with its mask guard
+    for (const store of ctx.stores) {
+      if (store.mask) {
+        const maskExpr = exprFor(store.mask, iterBindings, null);
+        lines.push(`${indent}if (${maskExpr}) {`);
+
+        // Emit loads + value computation inside the mask guard
+        // Walk the store's value subtree for any block loads that need masking
+        const loadNodes = collectSubtreeStopAtReduce(store.values)
+          .filter(n => n.kind === "load" && !iterBindings.has(n.id));
+        for (const loadNode of loadNodes) {
+          const load = loadNode as LoadNode;
+          // If the load also has a mask, emit masked load (select(0, val, mask))
+          if (load.mask) {
+            const offs = exprFor(load.offsets, iterBindings, null);
+            const loadMask = exprFor(load.mask, iterBindings, null);
+            const name = freshVar("v");
+            lines.push(`${indent}  let ${name} = select(${defaultZero(load.dataType)}, ${load.binding}[${offs}], ${loadMask});`);
+            iterBindings.set(load.id, name);
+          }
+        }
+
+        const offs = exprFor(store.offsets, iterBindings, null);
+        const vals = exprFor(store.values, iterBindings, null);
+        lines.push(`${indent}  ${store.binding}[${offs}] = ${vals};`);
+        lines.push(`${indent}}`);
+      } else {
+        // Unmasked store — direct write
+        const offs = exprFor(store.offsets, iterBindings, null);
+        const vals = exprFor(store.values, iterBindings, null);
+        lines.push(`${indent}${store.binding}[${offs}] = ${vals};`);
+      }
+    }
+
+    if (vecWidth > 1) {
+      lines.push(`  }`);
+    }
+  }
+
+  lines.push(`}`);
+  return lines.join("\n");
+}
+
+/** Default zero value for a given datatype. */
+function defaultZero(dt: DataType): string {
+  switch (dt) {
+    case "f32": return "0.0";
+    case "f16": return "f16(0.0)";
+    case "u32": return "0u";
+    case "i32": return "0i";
+  }
+}
+
+/** Emit scalar preamble let-bindings for elementwise auto-phase kernels. */
+function emitElementwiseScalarPreamble(allNodes: IRNode[], bindings: BindingMap, lines: string[]) {
+  const refCounts = new Map<number, number>();
+  for (const n of allNodes) {
+    refCounts.set(n.id, refCounts.get(n.id) ?? 0);
+    for (const child of getChildren(n)) {
+      refCounts.set(child.id, (refCounts.get(child.id) ?? 0) + 1);
+    }
+  }
+
+  for (const n of allNodes) {
+    if (n.valueType !== "scalar") continue;
+    if (bindings.has(n.id)) continue;
+    if (n.kind === "store") continue;
+
+    const refs = refCounts.get(n.id) ?? 0;
+    if (n.kind === "binary" || n.kind === "unary" || n.kind === "cast" || n.kind === "cmp" || n.kind === "select") {
+      const expr = exprFor(n, bindings, null);
+      const name = freshVar("s");
+      lines.push(`  let ${name} = ${expr};`);
+      bindings.set(n.id, name);
+    } else if ((n.kind === "programId" || n.kind === "uniform") && refs > 1) {
+      const expr = exprFor(n, bindings, null);
+      const name = varNameFor(n);
+      lines.push(`  let ${name} = ${expr};`);
+      bindings.set(n.id, name);
+    }
+  }
 }
 
 // ============================================================================
