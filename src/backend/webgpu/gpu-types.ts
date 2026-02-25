@@ -27,7 +27,7 @@ type GPUComputePass = {
 };
 
 export type GPUCommandEncoder = {
-  beginComputePass(descriptor?: any): GPUComputePass;
+  beginComputePass(descriptor?: { label?: string; timestampWrites?: unknown }): GPUComputePass;
   copyBufferToBuffer(
     source: GPUBuffer,
     sourceOffset: number,

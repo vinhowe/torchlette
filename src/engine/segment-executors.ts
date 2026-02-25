@@ -93,7 +93,7 @@ export async function executeFusedWebGPU(
   // If we'd exceed the device limit, skip fusion silently (no console.warn spam).
   const maxStorageBuffers = device.limits?.maxStorageBuffersPerShaderStage ?? 8;
   const numOutputs = recipe.outputs?.length ?? 1;
-  const nonInlinedInputCount = recipe.inputs.filter((inp: any) => !inp.isInlinedConstant).length;
+  const nonInlinedInputCount = recipe.inputs.filter((inp) => !inp.isInlinedConstant).length;
   const requiredBindings = nonInlinedInputCount + numOutputs;
   if (requiredBindings > maxStorageBuffers) {
     recordFusionFallback("binding_limit", group.nodes.length, { required: requiredBindings, max: maxStorageBuffers });

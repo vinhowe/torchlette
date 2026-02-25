@@ -29,6 +29,11 @@ import { getSubgroupSupport } from "./matmul/types";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 
+/** Track multiple buffers in the shared encoder write set. */
+function trackBuffers(...buffers: GPUBuffer[]): void {
+  for (const buf of buffers) trackSharedEncoderWrite(buf);
+}
+
 // Tiling parameters
 const BR = 64;  // Q rows per workgroup (also workgroup size in scalar mode)
 const BC = 32;  // KV rows per tile
@@ -1148,11 +1153,7 @@ export function dispatchFlashAttentionForward(
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer, configBuf]);
 
-  trackSharedEncoderWrite(qBuffer);
-  trackSharedEncoderWrite(kBuffer);
-  trackSharedEncoderWrite(vBuffer);
-  trackSharedEncoderWrite(outBuffer);
-  trackSharedEncoderWrite(lseBuffer);
+  trackBuffers(qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer);
 
   const numQBlocks = Math.ceil(seqLen / BR);
   dispatchComputePass(
@@ -1202,9 +1203,7 @@ export function dispatchFlashAttentionBackwardD(
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [dOBuffer, oBuffer, outBuffer, configBuf]);
 
-  trackSharedEncoderWrite(dOBuffer);
-  trackSharedEncoderWrite(oBuffer);
-  trackSharedEncoderWrite(outBuffer);
+  trackBuffers(dOBuffer, oBuffer, outBuffer);
 
   dispatchComputePass(
     pipeline,
@@ -1254,13 +1253,7 @@ export function dispatchFlashAttentionBackwardDQ(
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer, configBuf]);
 
-  trackSharedEncoderWrite(qBuffer);
-  trackSharedEncoderWrite(kBuffer);
-  trackSharedEncoderWrite(vBuffer);
-  trackSharedEncoderWrite(lBuffer);
-  trackSharedEncoderWrite(dBuffer);
-  trackSharedEncoderWrite(dOBuffer);
-  trackSharedEncoderWrite(outBuffer);
+  trackBuffers(qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer);
 
   const numQBlocks = Math.ceil(seqLen / BR);
   dispatchComputePass(
@@ -1322,14 +1315,7 @@ export function dispatchFlashAttentionBackwardDKV(
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer, configBuf]);
 
-  trackSharedEncoderWrite(qBuffer);
-  trackSharedEncoderWrite(kBuffer);
-  trackSharedEncoderWrite(vBuffer);
-  trackSharedEncoderWrite(lBuffer);
-  trackSharedEncoderWrite(dBuffer);
-  trackSharedEncoderWrite(dOBuffer);
-  trackSharedEncoderWrite(dKBuffer);
-  trackSharedEncoderWrite(dVBuffer);
+  trackBuffers(qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer);
 
   const numKVBlocks = Math.ceil(seqLen / BC_BW);
   dispatchComputePass(

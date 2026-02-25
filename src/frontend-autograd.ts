@@ -132,7 +132,7 @@ export async function backwardImpl(
         let gradsIn: Array<RuntimeTensor | null>;
         try {
           gradsIn = node.backward(gradOutTensor, getSaved);
-        } catch (_e: any) {
+        } catch (_e: unknown) {
           torch.runtime.stopIntermediateTracking();
           await torch.runtime.force(gradOutTensor);
           torch.runtime.startIntermediateTracking();

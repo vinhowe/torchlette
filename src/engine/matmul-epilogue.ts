@@ -229,9 +229,9 @@ export function detectMatmulEpilogue(
  * Returns the effective contiguous shape and whether a transpose was detected.
  * Used by the matmul epilogue cache to compute correct geometry.
  */
-export function _detectTransposeView(tensor: any): { shape: number[]; transposed: boolean } {
-  const shape = tensor.shape as number[];
-  const strides = tensor.strides as number[] | undefined;
+export function _detectTransposeView(tensor: { shape: number[]; strides?: number[]; isContiguous?: boolean; offset?: number }): { shape: number[]; transposed: boolean } {
+  const shape = tensor.shape;
+  const strides = tensor.strides;
   const rank = shape.length;
 
   if (tensor.isContiguous || (tensor.offset ?? 0) !== 0 || rank < 2 || !strides) {

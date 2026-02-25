@@ -1,6 +1,7 @@
 import type { DeviceKind } from "../backend/types";
 import type { Tensor, Torchlette } from "../frontend";
 import type { RuntimeTensor } from "../runtime/tensor";
+import { validateOptimizerParams } from "./validate";
 
 export type SGDOptions = {
   lr: number;
@@ -18,24 +19,7 @@ export class SGD {
   private velocity: Array<RuntimeTensor | null>;
 
   constructor(params: Tensor[], options: SGDOptions, api?: Torchlette) {
-    if (params.length === 0) {
-      throw new Error("SGD requires at least one parameter");
-    }
-    const engine = api ?? params[0]._engine();
-    const device = params[0].device;
-    for (const param of params) {
-      if (param._engine() !== engine) {
-        throw new Error(
-          "SGD parameters must share the same Torchlette instance",
-        );
-      }
-      if (param.device !== device) {
-        throw new Error("SGD parameters must share the same device");
-      }
-      if (!param.requiresGrad) {
-        throw new Error("SGD parameters must have requiresGrad=true");
-      }
-    }
+    const { api: engine, device } = validateOptimizerParams("SGD", params, api);
     if (options.lr <= 0) {
       throw new Error("SGD learning rate must be > 0");
     }

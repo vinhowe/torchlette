@@ -1,7 +1,12 @@
 import type {
+  AdamStepConfig,
   Backend,
   BackendTensor,
   DeviceKind,
+  DType,
+  FusedAttentionConfig,
+  FusedCrossEntropyConfig,
+  FusedLayerNormConfig,
   GeluOptions,
 } from "../backend/types";
 import { getBackend } from "../backend/registry";
@@ -10,6 +15,26 @@ import { profileOpBegin, profileOpEnd, setProfileModule } from "../backend/webgp
 import type { LazyIRNode, LazyRef, StorageHandle } from "./lazy-types";
 import { createStorageHandle } from "./node-factory";
 import { storageTracker } from "./storage-tracker";
+
+/** Extract a StorageHandle side output from a parent node, unregister it, and return the BackendTensor. */
+function extractSideOutput(node: LazyIRNode, key: string): BackendTensor {
+  const parent = node.inputs[0].node;
+  const sh = parent._sideOutputs?.[key] as StorageHandle | undefined;
+  if (!sh) throw new Error(`${node.op}: parent has no ${key} side output`);
+  const bt = sh.backendTensor;
+  storageTracker.unregister(sh.id);
+  parent._sideOutputs![key] = undefined;
+  return bt;
+}
+
+/** Extract a raw BackendTensor side output from a parent node and clear it. */
+function extractRawSideOutput(node: LazyIRNode, key: string): BackendTensor {
+  const parent = node.inputs[0].node;
+  const bt = parent._sideOutputs?.[key] as BackendTensor | undefined;
+  if (!bt) throw new Error(`${node.op}: parent has no ${key} side output`);
+  parent._sideOutputs![key] = undefined;
+  return bt;
+}
 
 export function getInputStorage(ref: LazyRef, backend?: Backend): StorageHandle {
   if (ref.kind === "materialized") {
@@ -235,7 +260,7 @@ export async function executeOp(
 
     case "cast": {
       const payload = node.payload as
-        | { dtype: import("../backend/types").DType }
+        | { dtype: DType }
         | undefined;
       if (!payload) {
         throw new Error("cast requires dtype in payload");
@@ -368,141 +393,113 @@ export async function executeOp(
 
     case "adamStep": {
       if (!backend.ops.adamStep) throw new Error("adamStep not supported by backend");
-      const adamPayload = node.payload as import("../backend/types").AdamStepConfig;
+      const payload = node.payload as AdamStepConfig;
       const adamResult = await backend.ops.adamStep(
         backendInputs[0], backendInputs[1], backendInputs[2], backendInputs[3],
-        adamPayload,
+        payload,
       );
-      const mStorage3 = createStorageHandle(node.device, adamResult.m);
-      const vStorage3 = createStorageHandle(node.device, adamResult.v);
-      const adamMV3 = { m: mStorage3, v: vStorage3 };
-      storageTracker.markReachable(mStorage3.id, adamMV3);
-      storageTracker.markReachable(vStorage3.id, adamMV3);
+      const mStorage = createStorageHandle(node.device, adamResult.m);
+      const vStorage = createStorageHandle(node.device, adamResult.v);
+      const adamMV = { m: mStorage, v: vStorage };
+      storageTracker.markReachable(mStorage.id, adamMV);
+      storageTracker.markReachable(vStorage.id, adamMV);
       if (!node._sideOutputs) node._sideOutputs = {};
-      node._sideOutputs.adamMV = adamMV3;
+      node._sideOutputs.adamMV = adamMV;
       return adamResult.param;
     }
 
     case "unscaleGrad": {
-      const unscalePayload3 = node.payload as { invScale: number; infFlagBuffer: unknown };
+      const payload = node.payload as { invScale: number; infFlagBuffer: unknown };
       if (!backend.ops.unscaleGrad) throw new Error("unscaleGrad not supported by backend");
       return backend.ops.unscaleGrad(
-        backendInputs[0], unscalePayload3.invScale, unscalePayload3.infFlagBuffer,
+        backendInputs[0], payload.invScale, payload.infFlagBuffer,
       );
     }
 
     case "fusedAttentionForward": {
-      const faPayload3 = node.payload as import("../backend/types").FusedAttentionConfig;
+      const payload = node.payload as FusedAttentionConfig;
       if (!backend.ops.fusedAttentionForward) throw new Error("fusedAttentionForward not supported by backend");
-      const faResult3 = backend.ops.fusedAttentionForward(
-        backendInputs[0], backendInputs[1], backendInputs[2], faPayload3,
+      const result = backend.ops.fusedAttentionForward(
+        backendInputs[0], backendInputs[1], backendInputs[2], payload,
       );
-      const lseSH3 = createStorageHandle(node.device, faResult3.logsumexp);
+      const lseSH = createStorageHandle(node.device, result.logsumexp);
       if (!node._sideOutputs) node._sideOutputs = {};
-      node._sideOutputs.attnLogsumexp = lseSH3;
-      return faResult3.output;
+      node._sideOutputs.attnLogsumexp = lseSH;
+      return result.output;
     }
 
-    case "extractAttentionLogsumexp": {
-      const parentFA3 = node.inputs[0].node;
-      const lseSH3 = parentFA3._sideOutputs?.attnLogsumexp;
-      if (!lseSH3) throw new Error("extractAttentionLogsumexp: parent has no attnLogsumexp side output");
-      const lseResult3 = lseSH3.backendTensor;
-      storageTracker.unregister(lseSH3.id);
-      parentFA3._sideOutputs!.attnLogsumexp = undefined;
-      return lseResult3;
-    }
+    case "extractAttentionLogsumexp":
+      return extractSideOutput(node, "attnLogsumexp");
 
     case "fusedAttentionBackward": {
-      const faBwdPayload3 = node.payload as import("../backend/types").FusedAttentionConfig;
+      const payload = node.payload as FusedAttentionConfig;
       if (!backend.ops.fusedAttentionBackward) throw new Error("fusedAttentionBackward not supported by backend");
-      const faBwdResult3 = backend.ops.fusedAttentionBackward(
+      const result = backend.ops.fusedAttentionBackward(
         backendInputs[0], backendInputs[1], backendInputs[2],
-        backendInputs[3], backendInputs[4], backendInputs[5], faBwdPayload3,
+        backendInputs[3], backendInputs[4], backendInputs[5], payload,
       );
-      const dkSH3 = createStorageHandle(node.device, faBwdResult3.dK);
-      const dvSH3 = createStorageHandle(node.device, faBwdResult3.dV);
+      const dkSH = createStorageHandle(node.device, result.dK);
+      const dvSH = createStorageHandle(node.device, result.dV);
       if (!node._sideOutputs) node._sideOutputs = {};
-      node._sideOutputs.attnBwdDK = dkSH3;
-      node._sideOutputs.attnBwdDV = dvSH3;
-      return faBwdResult3.dQ;
+      node._sideOutputs.attnBwdDK = dkSH;
+      node._sideOutputs.attnBwdDV = dvSH;
+      return result.dQ;
     }
 
-    case "extractAttentionDK": {
-      const parentDK3 = node.inputs[0].node;
-      const dkSH3 = parentDK3._sideOutputs?.attnBwdDK;
-      if (!dkSH3) throw new Error("extractAttentionDK: parent node has no attnBwdDK side output");
-      const dkResult3 = dkSH3.backendTensor;
-      storageTracker.unregister(dkSH3.id);
-      parentDK3._sideOutputs!.attnBwdDK = undefined;
-      return dkResult3;
-    }
+    case "extractAttentionDK":
+      return extractSideOutput(node, "attnBwdDK");
 
-    case "extractAttentionDV": {
-      const parentDV3 = node.inputs[0].node;
-      const dvSH3 = parentDV3._sideOutputs?.attnBwdDV;
-      if (!dvSH3) throw new Error("extractAttentionDV: parent node has no attnBwdDV side output");
-      const dvResult3 = dvSH3.backendTensor;
-      storageTracker.unregister(dvSH3.id);
-      parentDV3._sideOutputs!.attnBwdDV = undefined;
-      return dvResult3;
-    }
+    case "extractAttentionDV":
+      return extractSideOutput(node, "attnBwdDV");
 
     case "fusedCrossEntropyForward": {
-      const cePayload5 = node.payload as import("../backend/types").FusedCrossEntropyConfig;
+      const payload = node.payload as FusedCrossEntropyConfig;
       if (!backend.ops.fusedCrossEntropyForward) throw new Error("fusedCrossEntropyForward not supported by backend");
       return backend.ops.fusedCrossEntropyForward(
-        backendInputs[0], backendInputs[1], cePayload5,
+        backendInputs[0], backendInputs[1], payload,
       );
     }
 
     case "fusedCrossEntropyBackward": {
-      const cePayload6 = node.payload as import("../backend/types").FusedCrossEntropyConfig;
+      const payload = node.payload as FusedCrossEntropyConfig;
       if (!backend.ops.fusedCrossEntropyBackward) throw new Error("fusedCrossEntropyBackward not supported by backend");
       return backend.ops.fusedCrossEntropyBackward(
-        backendInputs[0], backendInputs[1], backendInputs[2], cePayload6,
+        backendInputs[0], backendInputs[1], backendInputs[2], payload,
       );
     }
 
     case "fusedLayerNormForward": {
-      const lnPayload5 = node.payload as import("../backend/types").FusedLayerNormConfig;
+      const payload = node.payload as FusedLayerNormConfig;
       if (!backend.ops.fusedLayerNormForward) throw new Error("fusedLayerNormForward not supported by backend");
       return backend.ops.fusedLayerNormForward(
-        backendInputs[0], backendInputs[1], backendInputs[2], lnPayload5,
+        backendInputs[0], backendInputs[1], backendInputs[2], payload,
       );
     }
 
     case "fusedLayerNormBackwardGradX": {
-      const lnPayload6 = node.payload as import("../backend/types").FusedLayerNormConfig;
+      const payload = node.payload as FusedLayerNormConfig;
       if (!backend.ops.fusedLayerNormBackwardGradX) throw new Error("fusedLayerNormBackwardGradX not supported by backend");
       return backend.ops.fusedLayerNormBackwardGradX(
-        backendInputs[0], backendInputs[1], backendInputs[2], lnPayload6,
+        backendInputs[0], backendInputs[1], backendInputs[2], payload,
       );
     }
 
     case "fusedLayerNormBackwardGradWeightBias": {
-      const lnGWBPayload3 = node.payload as import("../backend/types").FusedLayerNormConfig;
+      const payload = node.payload as FusedLayerNormConfig;
       if (!backend.ops.fusedLayerNormBackwardGradWeightBias) {
         throw new Error("fusedLayerNormBackwardGradWeightBias not supported by backend");
       }
-      const gwResult3 = backend.ops.fusedLayerNormBackwardGradWeightBias(
-        backendInputs[0], backendInputs[1], lnGWBPayload3,
+      const result = backend.ops.fusedLayerNormBackwardGradWeightBias(
+        backendInputs[0], backendInputs[1], payload,
       );
       // Store raw gradBias BackendTensor for extractLnBwdGradBias
       if (!node._sideOutputs) node._sideOutputs = {};
-      node._sideOutputs.lnBwdGradBias = gwResult3.gradBias;
-      return gwResult3.gradWeight;
+      node._sideOutputs.lnBwdGradBias = result.gradBias;
+      return result.gradWeight;
     }
 
-    case "extractLnBwdGradBias": {
-      const parentNode3 = node.inputs[0].node;
-      const sideOutputBT3 = parentNode3._sideOutputs?.lnBwdGradBias;
-      if (!sideOutputBT3) {
-        throw new Error("extractLnBwdGradBias: parent node has no lnBwdGradBias side output");
-      }
-      parentNode3._sideOutputs!.lnBwdGradBias = undefined;
-      return sideOutputBT3;
-    }
+    case "extractLnBwdGradBias":
+      return extractRawSideOutput(node, "lnBwdGradBias");
 
     case "transfer": {
       // node.device = target device; payload.sourceDevice or input ref's device = source
