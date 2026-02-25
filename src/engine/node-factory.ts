@@ -46,6 +46,26 @@ export function getNextStorageId(): number {
   return nextStorageId;
 }
 
+/**
+ * Create a lightweight BackendTensor for GPU dispatch results.
+ * Centralizes the type cast for object literals with GPU-specific fields
+ * (buffer, size, strides, offset, isContiguous) that satisfy BackendTensor
+ * at runtime but don't match the interface structurally.
+ */
+export function createGPUBackendTensor(fields: {
+  buffer: unknown;
+  shape: number[];
+  dtype: DType;
+  size: number;
+  strides: number[];
+  offset: number;
+  isContiguous: boolean;
+  ownsBuffer: boolean;
+  destroy: () => void;
+}): BackendTensor {
+  return fields as BackendTensor;
+}
+
 export function createStorageHandle(
   device: DeviceKind,
   backendTensor: BackendTensor,

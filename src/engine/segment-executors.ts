@@ -1,4 +1,4 @@
-import type { Backend, BackendTensor, DType } from "../backend/types";
+import type { Backend, DType } from "../backend/types";
 import { asGPUTensor, type GPUBuffer, type WebGPUTensor } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
 import { sizeOf } from "../core/shape";
@@ -23,8 +23,9 @@ import {
   isDataSourceOp,
   isViewOp,
 } from "./lowered-plan";
+import { DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE } from "../backend/webgpu/shape-utils";
 import type { LazyIRNode, LazyRef, StorageHandle, ExecutionPlan } from "./lazy-types";
-import { createStorageHandle, wrapResultAsStorage, ensureWebGPUMatmulImports, _webgpuMatmulImports } from "./node-factory";
+import { createStorageHandle, createGPUBackendTensor, wrapResultAsStorage, ensureWebGPUMatmulImports, _webgpuMatmulImports } from "./node-factory";
 import { storageTracker, releaseDeadTensors } from "./storage-tracker";
 import { computeContiguousStrides } from "../backend/types";
 import { getInputStorage, executeOp, withProfileContext } from "./op-dispatch";
@@ -156,7 +157,7 @@ export async function executeFusedWebGPU(
   }
 
   // Check if any input buffer exceeds maxStorageBufferBindingSize
-  const maxBindingSize = device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = device.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const hasOversizedBuffer = inputs.some(
     (inp) => inp.buffer.size > maxBindingSize,
   );
@@ -179,7 +180,7 @@ export async function executeFusedWebGPU(
     const fusionBuffer = result.buffer as GPUBuffer;
     const fusionBufferSize = fusionBuffer.size;
     let fusionDestroyed = false;
-    outputNode.result = createStorageHandle(outputNode.device, {
+    outputNode.result = createStorageHandle(outputNode.device, createGPUBackendTensor({
       buffer: result.buffer,
       shape: result.shape,
       dtype: result.dtype,
@@ -193,7 +194,7 @@ export async function executeFusedWebGPU(
         fusionDestroyed = true;
         deferredDestroyBuffer(fusionBuffer, fusionBufferSize);
       },
-    } as BackendTensor);
+    }));
 
     // Multi-output: store results for additional output nodes (§15.2)
     if (group.additionalOutputNodes && result.outputs) {
@@ -204,7 +205,7 @@ export async function executeFusedWebGPU(
           const addBuffer = addOutput.buffer as GPUBuffer;
           const addBufferSize = addBuffer.size;
           let addDestroyed = false;
-          addNode.result = createStorageHandle(addNode.device, {
+          addNode.result = createStorageHandle(addNode.device, createGPUBackendTensor({
             buffer: addOutput.buffer,
             shape: addOutput.shape,
             dtype: addOutput.dtype,
@@ -218,7 +219,7 @@ export async function executeFusedWebGPU(
               addDestroyed = true;
               deferredDestroyBuffer(addBuffer, addBufferSize);
             },
-          } as BackendTensor);
+          }));
         }
       }
     }

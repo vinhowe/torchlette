@@ -1,4 +1,4 @@
-import type { AdamStepConfig, Backend, BackendTensor, DType } from "../backend/types";
+import type { AdamStepConfig, Backend, DType } from "../backend/types";
 import { gpuBuffer, asGPUTensor, type GPUBuffer } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
 import {
@@ -38,7 +38,7 @@ import {
   ENCODER_COPY_OPS,
 } from "./lowered-plan";
 import type { LazyIRNode, LazyRef, StorageHandle, ExecutionPlan } from "./lazy-types";
-import { createStorageHandle, wrapResultAsStorage, ensureWebGPUMatmulImports, _webgpuMatmulImports, _webgpuMatmulGeomImports } from "./node-factory";
+import { createStorageHandle, createGPUBackendTensor, wrapResultAsStorage, ensureWebGPUMatmulImports, _webgpuMatmulImports, _webgpuMatmulGeomImports } from "./node-factory";
 import { storageTracker } from "./storage-tracker";
 import { getInputStorage, executeOp, withProfileContext } from "./op-dispatch";
 import { pretunePlanMatmuls } from "./plan-builder";
@@ -270,7 +270,7 @@ export async function executeLoweredPlan(
               // Fast path: reconstruct from cached metadata (arena buffers stable)
               setArenaResolveIndexTo(entry.arenaResolveIdxAfter ?? entry.arenaResolveIdx);
               const cr = entry.cachedResult;
-              vNode.result = createStorageHandle(vNode.device, {
+              vNode.result = createStorageHandle(vNode.device, createGPUBackendTensor({
                 buffer: cr.buffer,
                 shape: cr.shape,
                 dtype: cr.dtype,
@@ -280,7 +280,7 @@ export async function executeLoweredPlan(
                 isContiguous: cr.isContiguous,
                 ownsBuffer: false,
                 destroy() {},
-              } as BackendTensor);
+              }));
             } else {
               // Slow path: re-execute (first replay before cache populated)
               setArenaResolveIndexTo(entry.arenaResolveIdx);
@@ -363,7 +363,7 @@ export async function executeLoweredPlan(
             const nr = entry.nodeResult;
             const node = planNodes[nr.nodeIndex];
             if (!node.result) {
-              node.result = createStorageHandle(node.device, {
+              node.result = createStorageHandle(node.device, createGPUBackendTensor({
                 buffer: nr.buffer,
                 shape: nr.shape,
                 dtype: nr.dtype,
@@ -373,7 +373,7 @@ export async function executeLoweredPlan(
                 isContiguous: true,
                 ownsBuffer: false,
                 destroy() {},
-              } as BackendTensor);
+              }));
             }
             if (_replayTiming) { _tResult += performance.now() - _rsT0; _nResults++; }
             break;
@@ -385,7 +385,7 @@ export async function executeLoweredPlan(
             const soNode = planNodes[entry.nodeIndex];
             if (!soNode._sideOutputs?.attnLogsumexp) {
               if (!soNode._sideOutputs) soNode._sideOutputs = {};
-              soNode._sideOutputs.attnLogsumexp = createStorageHandle(soNode.device, {
+              soNode._sideOutputs.attnLogsumexp = createStorageHandle(soNode.device, createGPUBackendTensor({
                 buffer: entry.buffer,
                 shape: entry.shape,
                 dtype: entry.dtype,
@@ -395,7 +395,7 @@ export async function executeLoweredPlan(
                 isContiguous: true,
                 ownsBuffer: false,
                 destroy() {},
-              } as BackendTensor);
+              }));
             }
             break;
           }
