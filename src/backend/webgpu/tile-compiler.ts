@@ -1311,7 +1311,21 @@ function hasTileStatements(stmts: Statement[]): boolean {
  */
 function lowerTileStatements(stmts: Statement[], spec: TileKernelSpec): Statement[] {
   const result: Statement[] = [];
-  for (const s of stmts) {
+  let i = 0;
+  while (i < stmts.length) {
+    const s = stmts[i];
+
+    // Detect fusible chain: accOp* (with optional tileLoad1d) → tileStore
+    // Fuse into a single tm/tn loop to avoid multiple passes over the accumulator.
+    if (s.kind === "accOp" || s.kind === "tileLoad1d") {
+      const chain = collectAccStoreChain(stmts, i);
+      if (chain) {
+        result.push(...lowerFusedAccStore(chain, spec));
+        i = chain.endIdx;
+        continue;
+      }
+    }
+
     switch (s.kind) {
       case "tileLoad":
         result.push(...lowerTileLoad(s, spec));
@@ -1351,7 +1365,156 @@ function lowerTileStatements(stmts: Statement[], spec: TileKernelSpec): Statemen
         result.push(s);
         break;
     }
+    i++;
   }
+  return result;
+}
+
+/**
+ * Scan forward from `startIdx` to collect a chain of accOp/tileLoad1d ending with a tileStore
+ * on the same accumulator. Returns null if no fusible chain is found.
+ */
+function collectAccStoreChain(
+  stmts: Statement[],
+  startIdx: number,
+): { accOps: AccOpStmt[]; load1ds: TileLoad1DStmt[]; store: TileStoreStmt; endIdx: number } | null {
+  let accName: string | null = null;
+  const accOps: AccOpStmt[] = [];
+  const load1ds: TileLoad1DStmt[] = [];
+
+  let i = startIdx;
+  while (i < stmts.length) {
+    const s = stmts[i];
+    if (s.kind === "accOp") {
+      if (accName === null) accName = s.accName;
+      if (s.accName !== accName) break;
+      accOps.push(s);
+      i++;
+    } else if (s.kind === "tileLoad1d") {
+      load1ds.push(s);
+      i++;
+    } else if (s.kind === "tileStore") {
+      if (accName !== null && s.accName === accName && accOps.length > 0) {
+        return { accOps, load1ds, store: s, endIdx: i + 1 };
+      }
+      break;
+    } else {
+      break;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Fuse accOp chain + tileStore into a single tm/tn loop.
+ *
+ * Instead of generating separate loops for each accOp and the store,
+ * emit one loop that reads acc[idx], applies all transformations inline,
+ * and writes to global memory. Matches production codegen output.
+ */
+function lowerFusedAccStore(
+  chain: { accOps: AccOpStmt[]; load1ds: TileLoad1DStmt[]; store: TileStoreStmt },
+  spec: TileKernelSpec,
+): Statement[] {
+  const result: Statement[] = [];
+
+  // Emit tileLoad1d first (register loads for bias etc. — loop-invariant per row)
+  for (const ld of chain.load1ds) {
+    result.push(...lowerTileLoad1D(ld));
+  }
+
+  const { binding, ptr, mask, accName, threadTileM, threadTileN, accDtype } = chain.store;
+  const tmVar = freshVar("tm");
+  const tnVar = freshVar("tn");
+
+  const innerBody: Statement[] = [];
+
+  // Row/col computation
+  const rowName = freshVar("st_row");
+  const colName = freshVar("st_col");
+  innerBody.push({
+    kind: "let", name: rowName, dtype: "u32",
+    value: binOp("add", ptr.outerRange.base,
+      binOp("add", binOp("mul", ref("thread_row"), cU32(threadTileM)), ref(tmVar)),
+    ),
+  });
+  innerBody.push({
+    kind: "let", name: colName, dtype: "u32",
+    value: binOp("add", ptr.innerRange.base,
+      binOp("add", binOp("mul", ref("thread_col"), cU32(threadTileN)), ref(tnVar)),
+    ),
+  });
+
+  const maskCond = andOp(
+    cmpOp("lt", ref(rowName), mask.outerBound),
+    cmpOp("lt", ref(colName), mask.innerBound),
+  );
+
+  const ifBody: Statement[] = [];
+  const idxName = freshVar("st_idx");
+  ifBody.push({
+    kind: "let", name: idxName, dtype: "u32",
+    value: binOp("add",
+      binOp("add", ptr.baseOffset, mulOrSkip(ref(rowName), ptr.outerStride)),
+      mulOrSkip(ref(colName), ptr.innerStride),
+    ),
+  });
+
+  // Start with raw acc value
+  const accIdx = binOp("add", binOp("mul", ref(tmVar), cU32(threadTileN)), ref(tnVar));
+  let currentVal: IRNode = arrayRead(accName, accIdx);
+
+  // Apply all accOps inline
+  for (const op of chain.accOps) {
+    switch (op.op.kind) {
+      case "mulScalar":
+        currentVal = binOp("mul", currentVal, op.op.value, "f32");
+        break;
+      case "addRow":
+        currentVal = binOp("add", currentVal, arrayRead(op.op.valuesArray, ref(tnVar)), "f32");
+        break;
+      case "apply": {
+        // Bind current value to the apply's input variable name, emit body, use result
+        const valName = freshVar("fv");
+        ifBody.push({ kind: "let", name: valName, dtype: "f32", value: currentVal });
+        // The apply body references op.op.valName — we need to let-bind it
+        ifBody.push({ kind: "let", name: op.op.valName, dtype: "f32", value: ref(valName, "f32") });
+        ifBody.push(...op.op.body);
+        currentVal = op.op.resultNode;
+        break;
+      }
+      case "castTo":
+        currentVal = castNode(currentVal, op.op.dtype);
+        break;
+    }
+  }
+
+  // Apply store's accDtype cast if not already cast by an accOp
+  if (accDtype && accDtype !== "f32") {
+    const lastOp = chain.accOps[chain.accOps.length - 1];
+    if (!lastOp || lastOp.op.kind !== "castTo") {
+      currentVal = castNode(currentVal, accDtype);
+    }
+  }
+
+  ifBody.push({
+    kind: "indexAssign",
+    arrayName: binding,
+    idx: ref(idxName),
+    value: currentVal,
+  });
+
+  innerBody.push({ kind: "if", condition: maskCond, body: ifBody });
+
+  result.push({
+    kind: "forRange", varName: tmVar, start: cU32(0), bound: cU32(threadTileM),
+    body: [{
+      kind: "forRange", varName: tnVar, start: cU32(0), bound: cU32(threadTileN),
+      body: innerBody,
+    }],
+  });
+
   return result;
 }
 
@@ -1367,6 +1530,16 @@ function ref(name: string, dt: DataType = "u32"): IRNode {
 }
 function binOp(op: "add" | "sub" | "mul" | "div" | "mod", lhs: IRNode, rhs: IRNode, dt: DataType = "u32"): IRNode {
   return { id: -1, kind: "binary", op, lhs, rhs, valueType: "scalar", dataType: dt };
+}
+/** Check if an IR node is a constant with value 1 (for stride optimization). */
+function isConstOne(node: IRNode): boolean {
+  return node.kind === "const" && node.value === 1;
+}
+/** Multiply, but skip when one operand is const(1) — eliminates `* 1u` in generated code. */
+function mulOrSkip(a: IRNode, b: IRNode, dt: DataType = "u32"): IRNode {
+  if (isConstOne(b)) return a;
+  if (isConstOne(a)) return b;
+  return binOp("mul", a, b, dt);
 }
 function cmpOp(op: "lt" | "le" | "gt" | "ge", lhs: IRNode, rhs: IRNode): IRNode {
   return { id: -1, kind: "cmp", op, lhs, rhs, valueType: "scalar", dataType: "u32" };
@@ -1431,22 +1604,33 @@ function lowerTileLoad(stmt: TileLoadStmt, spec: TileKernelSpec): Statement[] {
     value: binOp("mod", ref(flatName), cU32(tileCols)),
   });
 
-  // globalIdx = base + (outerRange.base + row) * outerStride + (innerRange.base + col) * innerStride
-  const globalRow = binOp("add", ptr.outerRange.base, ref(rowName));
-  const globalCol = binOp("add", ptr.innerRange.base, ref(colName));
+  // Bind globalRow/globalCol to let variables to avoid recomputation in index + mask
+  const globalRowName = freshVar("gr");
+  const globalColName = freshVar("gc");
+  ifBody.push({
+    kind: "let", name: globalRowName, dtype: "u32",
+    value: binOp("add", ptr.outerRange.base, ref(rowName)),
+  });
+  ifBody.push({
+    kind: "let", name: globalColName, dtype: "u32",
+    value: binOp("add", ptr.innerRange.base, ref(colName)),
+  });
+
+  // globalIdx = base + globalRow * outerStride + globalCol * innerStride
+  // Uses mulOrSkip to eliminate `* 1u` for non-transposed strides
   const gIdxName = freshVar("gIdx");
   ifBody.push({
     kind: "let", name: gIdxName, dtype: "u32",
     value: binOp("add",
-      binOp("add", ptr.baseOffset, binOp("mul", globalRow, ptr.outerStride)),
-      binOp("mul", globalCol, ptr.innerStride),
+      binOp("add", ptr.baseOffset, mulOrSkip(ref(globalRowName), ptr.outerStride)),
+      mulOrSkip(ref(globalColName), ptr.innerStride),
     ),
   });
 
-  // Mask check: (outerRange.base + row) < outerBound && (innerRange.base + col) < innerBound
+  // Mask check: globalRow < outerBound && globalCol < innerBound
   const maskCond = andOp(
-    cmpOp("lt", globalRow, mask.outerBound),
-    cmpOp("lt", globalCol, mask.innerBound),
+    cmpOp("lt", ref(globalRowName), mask.outerBound),
+    cmpOp("lt", ref(globalColName), mask.innerBound),
   );
 
   // if (mask) { shared[flat] = f32(binding[gIdx]) } else { shared[flat] = 0.0 }
@@ -1760,8 +1944,8 @@ function lowerTileStore(stmt: TileStoreStmt, spec: TileKernelSpec): Statement[] 
   ifBody.push({
     kind: "let", name: idxName, dtype: "u32",
     value: binOp("add",
-      binOp("add", ptr.baseOffset, binOp("mul", ref(rowName), ptr.outerStride)),
-      binOp("mul", ref(colName), ptr.innerStride),
+      binOp("add", ptr.baseOffset, mulOrSkip(ref(rowName), ptr.outerStride)),
+      mulOrSkip(ref(colName), ptr.innerStride),
     ),
   });
 
