@@ -18,8 +18,6 @@ import {
   computePlanFingerprint,
   detectFusionGroups,
   groupToRecipe,
-  hasFusionOpportunities,
-  hasFusionPotential,
   isFusibleOp,
   reorderPlanForFusion,
   segmentPlanForExecution,

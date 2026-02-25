@@ -7,6 +7,7 @@ import {
   type DeviceKind,
   type DivOptions,
   type DType,
+  normalizeDim,
   type GatherOptions,
   type GeluOptions,
   type MaxOptions,
@@ -385,6 +386,21 @@ export class RuntimeEngine {
       }
     }
     return device;
+  }
+
+  private assertShapeMatch(op: string, dst: Tensor, src: Tensor): void {
+    if (dst.shape.length !== src.shape.length) {
+      throw new Error(
+        `${op}: shape mismatch - dst has rank ${dst.shape.length}, src has rank ${src.shape.length}`,
+      );
+    }
+    for (let i = 0; i < dst.shape.length; i++) {
+      if (dst.shape[i] !== src.shape[i]) {
+        throw new Error(
+          `${op}: shape mismatch at dim ${i} - dst has ${dst.shape[i]}, src has ${src.shape[i]}`,
+        );
+      }
+    }
   }
 
   /**
@@ -1416,7 +1432,7 @@ export class RuntimeEngine {
     }
     const seen = new Set<number>();
     for (const d of dims) {
-      const nd = d < 0 ? d + rank : d;
+      const nd = normalizeDim(d, rank);
       if (nd < 0 || nd >= rank) {
         throw new Error(
           `permute: dimension ${d} out of range for rank ${rank}`,
@@ -1427,7 +1443,7 @@ export class RuntimeEngine {
       }
       seen.add(nd);
     }
-    const normalizedDims = dims.map((d) => (d < 0 ? d + rank : d));
+    const normalizedDims = dims.map((d) => normalizeDim(d, rank));
     const shape = normalizedDims.map((d) => a.shape[d]);
 
     const node = createLazyIRNode(
@@ -1772,20 +1788,7 @@ export class RuntimeEngine {
    */
   copy_(dst: Tensor, src: Tensor): Tensor {
     this.assertSameDevice(dst, src);
-
-    // Validate shapes match
-    if (dst.shape.length !== src.shape.length) {
-      throw new Error(
-        `copy_: shape mismatch - dst has rank ${dst.shape.length}, src has rank ${src.shape.length}`,
-      );
-    }
-    for (let i = 0; i < dst.shape.length; i++) {
-      if (dst.shape[i] !== src.shape[i]) {
-        throw new Error(
-          `copy_: shape mismatch at dim ${i} - dst has ${dst.shape[i]}, src has ${src.shape[i]}`,
-        );
-      }
-    }
+    this.assertShapeMatch("copy_", dst, src);
 
     // Create strided scatter copy node
     // For full tensor copy: offset=0, viewShape=dst.shape, viewStrides=contiguous
@@ -1819,20 +1822,7 @@ export class RuntimeEngine {
    */
   add_(dst: Tensor, src: Tensor): Tensor {
     this.assertSameDevice(dst, src);
-
-    // Validate shapes match
-    if (dst.shape.length !== src.shape.length) {
-      throw new Error(
-        `add_: shape mismatch - dst has rank ${dst.shape.length}, src has rank ${src.shape.length}`,
-      );
-    }
-    for (let i = 0; i < dst.shape.length; i++) {
-      if (dst.shape[i] !== src.shape[i]) {
-        throw new Error(
-          `add_: shape mismatch at dim ${i} - dst has ${dst.shape[i]}, src has ${src.shape[i]}`,
-        );
-      }
-    }
+    this.assertShapeMatch("add_", dst, src);
 
     // Create strided scatter add node
     const viewStrides = computeContiguousStrides(dst.shape);

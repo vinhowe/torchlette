@@ -1,4 +1,4 @@
-import type { Backend, BackendTensor } from "../backend/types";
+import { normalizeDim, type Backend, type BackendTensor } from "../backend/types";
 import type { LazyIRNode } from "./lazy-types";
 import { createStorageHandle } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
@@ -123,7 +123,7 @@ export async function executeReductionWithPreamble(
     } else {
       const dims = Array.isArray(dim) ? dim : [dim];
       const rank = inputShape.length;
-      reductionSize = dims.reduce((acc, d) => acc * inputShape[d < 0 ? d + rank : d], 1);
+      reductionSize = dims.reduce((acc, d) => acc * inputShape[normalizeDim(d, rank)], 1);
     }
     // Divide by reduction size using backend mul with scalar (1/reductionSize)
     const invSize = 1.0 / reductionSize;

@@ -274,27 +274,18 @@ function processCandidate(
  * @param nodes - Nodes in the plan (topologically sorted)
  * @returns Detected fusion groups
  */
-export function detectFusionGroups(
+/**
+ * Phase 1: Scan for consecutive fusible ops, flush at dependency breaks.
+ * Non-fusible nodes that don't depend on the current candidate pass through.
+ */
+function buildCandidateGroups(
   nodes: LazyIRNode[],
-  externalNodeIds?: Set<number>,
-  options?: { maxStorageBuffers?: number; enableMultiOutput?: boolean; epilogueClaimedIds?: Set<number> },
-): FusionDetectionResult {
-  let fusibleCount = 0;
-  // Max storage buffer bindings per shader stage. Each fused group needs
-  // externalInputs + outputs (typically 1) bindings. Default to no limit.
-  const maxBuffers = options?.maxStorageBuffers ?? Infinity;
-  // Reserve 1 binding for the output buffer
-  const maxExternalInputs = maxBuffers - 1;
-  const enableMultiOutput = options?.enableMultiOutput ?? false;
-  const epilogueClaimedIds = options?.epilogueClaimedIds;
-
-  // Phase 1: Build candidate groups of consecutive fusible ops.
-  // Non-fusible nodes that do NOT depend on the current candidate group are
-  // allowed to pass through without flushing — they execute as prereqs before
-  // the fused kernel via segmentPlanForExecution's gap-node mechanism.
+  epilogueClaimedIds: Set<number> | undefined,
+): { candidateGroups: Array<{ nodes: LazyIRNode[]; indices: number[] }>; fusibleCount: number } {
   const candidateGroups: Array<{ nodes: LazyIRNode[]; indices: number[] }> = [];
   let currentGroup: { nodes: LazyIRNode[]; indices: number[] } | null = null;
   const candidateNodeIds = new Set<number>();
+  let fusibleCount = 0;
 
   const flushCandidate = () => {
     if (currentGroup && currentGroup.nodes.length >= 2) {
@@ -306,8 +297,6 @@ export function detectFusionGroups(
 
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i];
-    // Exclude epilogue-claimed nodes from elementwise fusion groups —
-    // they'll be fused into matmul epilogues instead
     if (isFusibleOp(node.op) && !epilogueClaimedIds?.has(node.id)) {
       fusibleCount++;
       if (!currentGroup) {
@@ -318,28 +307,27 @@ export function detectFusionGroups(
       currentGroup.indices.push(i);
       candidateNodeIds.add(node.id);
     } else if (currentGroup && !hasPendingInputIn(node, candidateNodeIds)) {
-      // Independent non-fusible node — don't flush the candidate group.
-      // It doesn't depend on any candidate node so it can execute before
-      // the fused kernel. segmentPlanForExecution emits these as prereqs.
+      // Independent non-fusible node — passes through as prereq
     } else {
       flushCandidate();
     }
   }
   flushCandidate();
 
+  return { candidateGroups, fusibleCount };
+}
 
-  // Phase 2: For each candidate group, split into independent connected components
-  // based on data dependencies. Skip 0-d (scalar) inputs when building components
-  // because scalars broadcast independently and don't create true dependencies.
-  //
-  // Then for each component, check if intermediate nodes are referenced by nodes
-  // outside the group. If so, split the group at that point so the referenced
-  // node becomes an output.
-  //
-  // After splitting, we also check for intra-group cross-boundary references:
-  // if a node in a later sub-group references an intermediate (non-output) node
-  // in an earlier sub-group, that intermediate must also become a split point.
-  // We iterate to a fixed point to handle cascading splits.
+/**
+ * Phase 2: Split candidate groups into connected components via Union-Find,
+ * process each component, and batch independent singletons (Phase 2b).
+ */
+function splitCandidatesByComponent(
+  candidateGroups: Array<{ nodes: LazyIRNode[]; indices: number[] }>,
+  nodes: LazyIRNode[],
+  externalNodeIds: Set<number> | undefined,
+  enableMultiOutput: boolean,
+  maxBuffers: number,
+): FusionGroup[] {
   const groups: FusionGroup[] = [];
 
   for (const candidate of candidateGroups) {
@@ -351,10 +339,10 @@ export function detectFusionGroups(
 
     // Union-Find for connected component decomposition
     const parent: number[] = [];
-    const rank: number[] = [];
+    const ufRank: number[] = [];
     for (let k = 0; k < candidate.nodes.length; k++) {
       parent[k] = k;
-      rank[k] = 0;
+      ufRank[k] = 0;
     }
     const find = (x: number): number => {
       if (parent[x] !== x) parent[x] = find(parent[x]);
@@ -364,13 +352,13 @@ export function detectFusionGroups(
       const ra = find(a);
       const rb = find(b);
       if (ra === rb) return;
-      if (rank[ra] < rank[rb]) {
+      if (ufRank[ra] < ufRank[rb]) {
         parent[ra] = rb;
-      } else if (rank[ra] > rank[rb]) {
+      } else if (ufRank[ra] > ufRank[rb]) {
         parent[rb] = ra;
       } else {
         parent[rb] = ra;
-        rank[ra]++;
+        ufRank[ra]++;
       }
     };
 
@@ -380,7 +368,6 @@ export function detectFusionGroups(
       for (const input of candidate.nodes[k].inputs) {
         if (input.kind === "pending") {
           const depPos = nodeIdToPos.get(input.node.id);
-          // Skip scalar (0-d) inputs — they broadcast independently
           if (depPos !== undefined && input.node.shape.length > 0) {
             union(k, depPos);
           }
@@ -389,32 +376,27 @@ export function detectFusionGroups(
     }
 
     // Group nodes by their root (connected component)
-    const componentMap = new Map<number, number[]>(); // root -> positions
+    const componentMap = new Map<number, number[]>();
     for (let k = 0; k < candidate.nodes.length; k++) {
       const root = find(k);
       if (!componentMap.has(root)) componentMap.set(root, []);
       componentMap.get(root)!.push(k);
     }
 
-
     // Process each connected component separately
-    const singletonPositions: number[] = []; // collect size-1 components
+    const singletonPositions: number[] = [];
     for (const positions of componentMap.values()) {
       if (positions.length < 2) {
-        // Collect singletons for Phase 2b batching
         singletonPositions.push(positions[0]);
         continue;
       }
 
-      // Sort positions to maintain original order
       positions.sort((a, b) => a - b);
 
-      // Create sub-candidate from this component
       const subNodes = positions.map((p) => candidate.nodes[p]);
       const subIndices = positions.map((p) => candidate.indices[p]);
       const subNodeIds = new Set(subNodes.map((n) => n.id));
 
-      // Build intra-component dependency map
       const subNodeIdToPos = new Map<number, number>();
       for (let k = 0; k < subNodes.length; k++) {
         subNodeIdToPos.set(subNodes[k].id, k);
@@ -433,27 +415,13 @@ export function detectFusionGroups(
         internalDeps.push(deps);
       }
 
-      // Process this component (sub-candidate) with the existing logic
       processCandidate(
-        subNodes,
-        subIndices,
-        subNodeIds,
-        internalDeps,
-        nodes,
-        externalNodeIds,
-        enableMultiOutput,
-        maxBuffers,
-        groups,
+        subNodes, subIndices, subNodeIds, internalDeps,
+        nodes, externalNodeIds, enableMultiOutput, maxBuffers, groups,
       );
     }
 
-    // Phase 2b: Batch independent single-node components into multi-output groups.
-    // These are independent fusible ops (e.g., where, mul, isfinite) that share
-    // scalar inputs but have no non-scalar internal dependencies. Group by
-    // output shape+dtype so the kernel writes all outputs in one dispatch.
-    //
-    // Plan indices may be non-contiguous (singletons interleaved with multi-node
-    // components). segmentPlanForExecution handles this via emittedGroups tracking.
+    // Phase 2b: Batch independent single-node components into multi-output groups
     if (enableMultiOutput && singletonPositions.length >= 2) {
       const byShapeDtype = new Map<string, number[]>();
       for (const pos of singletonPositions) {
@@ -467,8 +435,6 @@ export function detectFusionGroups(
         if (sameShapePositions.length < 2) continue;
         sameShapePositions.sort((a, b) => a - b);
 
-        // Chunk into batches that fit within the storage buffer binding limit.
-        // Each node is an output, so we need: externalInputs + N_outputs <= maxBuffers.
         let batchStart = 0;
         while (batchStart < sameShapePositions.length) {
           const batchPositions: number[] = [];
@@ -477,8 +443,6 @@ export function detectFusionGroups(
           for (let j = batchStart; j < sameShapePositions.length; j++) {
             const node = candidate.nodes[sameShapePositions[j]];
 
-            // Count NEW external inputs this node would add
-            // Scalar refs don't consume binding slots — skip them
             let newInputCount = 0;
             for (const input of node.inputs) {
               if (input.kind === "scalar") continue;
@@ -491,7 +455,7 @@ export function detectFusionGroups(
             const wouldBeOutputs = batchPositions.length + 1;
             const wouldBeInputs = seenInputs.size + newInputCount;
             if (wouldBeInputs + wouldBeOutputs > maxBuffers && batchPositions.length >= 2) {
-              break; // this node doesn't fit; flush current batch
+              break;
             }
 
             batchPositions.push(sameShapePositions[j]);
@@ -504,7 +468,7 @@ export function detectFusionGroups(
             }
           }
 
-          if (batchPositions.length < 2) break; // can't batch — not enough binding slots
+          if (batchPositions.length < 2) break;
 
           batchStart += batchPositions.length;
 
@@ -525,193 +489,188 @@ export function detectFusionGroups(
     }
   }
 
-  // Phase 3: Split groups that exceed the storage buffer limit.
-  // Each group needs externalInputs + outputs storage bindings.
-  // Multi-output groups have 1 + additionalOutputNodes.length outputs.
-  // Inlinable scalar constants don't consume binding slots.
+  return groups;
+}
+
+/**
+ * Phase 3: Split groups that exceed the storage buffer binding limit.
+ */
+function splitGroupsByBufferLimit(groups: FusionGroup[], maxBuffers: number): FusionGroup[] {
   const finalGroups: FusionGroup[] = [];
   for (const group of groups) {
     const numOutputs = 1 + (group.additionalOutputNodes?.length ?? 0);
     const maxInputsForGroup = maxBuffers - numOutputs;
-    // Count non-inlinable external inputs (scalars that can be inlined don't use bindings)
     const nonInlinableInputs = group.externalInputs.filter(ref => !isInlinableScalar(ref).inlinable).length;
     if (nonInlinableInputs <= maxInputsForGroup) {
       finalGroups.push(group);
       continue;
     }
 
-    // Need to split this group. Greedily add nodes until external input
-    // count would exceed the limit, then emit a sub-group and start fresh.
-    // Multi-output groups lose their additional outputs when split.
     const subGroups = splitGroupByInputLimit(group, maxInputsForGroup);
     for (const sub of subGroups) {
       finalGroups.push(sub);
     }
   }
+  return finalGroups;
+}
 
-  // Phase 4: Global singleton batching.
-  // Collect fusible nodes NOT in any group and batch same-shape/dtype singletons
-  // into multi-output groups, respecting ordering constraints.
-  if (enableMultiOutput) {
-    const groupedNodeIds = new Set<number>();
-    for (const g of finalGroups) {
-      for (const n of g.nodes) groupedNodeIds.add(n.id);
+/**
+ * Phase 4: Collect unfused fusible singletons and batch same-shape/dtype
+ * nodes into multi-output groups, respecting ordering constraints.
+ */
+function batchGlobalSingletons(
+  nodes: LazyIRNode[],
+  finalGroups: FusionGroup[],
+  epilogueClaimedIds: Set<number> | undefined,
+  maxBuffers: number,
+): void {
+  const groupedNodeIds = new Set<number>();
+  for (const g of finalGroups) {
+    for (const n of g.nodes) groupedNodeIds.add(n.id);
+  }
+
+  const singletons: Array<{ node: LazyIRNode; planIndex: number }> = [];
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i];
+    if (isFusibleOp(node.op) && !groupedNodeIds.has(node.id) && !epilogueClaimedIds?.has(node.id)) {
+      singletons.push({ node, planIndex: i });
     }
+  }
 
-    // Collect unfused fusible singletons
-    const singletons: Array<{ node: LazyIRNode; planIndex: number }> = [];
-    for (let i = 0; i < nodes.length; i++) {
-      const node = nodes[i];
-      if (isFusibleOp(node.op) && !groupedNodeIds.has(node.id) && !epilogueClaimedIds?.has(node.id)) {
-        singletons.push({ node, planIndex: i });
-      }
-    }
+  if (singletons.length < 2) return;
 
-    if (singletons.length >= 2) {
-      // Group by shape_dtype key
-      const byShapeDtype = new Map<string, Array<{ node: LazyIRNode; planIndex: number }>>();
-      for (const s of singletons) {
-        const key = `${(s.node.shape ?? [1]).join(",")}_${s.node.dtype ?? "f32"}`;
-        if (!byShapeDtype.has(key)) byShapeDtype.set(key, []);
-        byShapeDtype.get(key)!.push(s);
-      }
+  const byShapeDtype = new Map<string, Array<{ node: LazyIRNode; planIndex: number }>>();
+  for (const s of singletons) {
+    const key = `${(s.node.shape ?? [1]).join(",")}_${s.node.dtype ?? "f32"}`;
+    if (!byShapeDtype.has(key)) byShapeDtype.set(key, []);
+    byShapeDtype.get(key)!.push(s);
+  }
 
-      // Build earliest-consumer-position map: for each node, the earliest plan
-      // position of any node that depends on it.
-      const earliestConsumer = new Map<number, number>();
-      for (let i = 0; i < nodes.length; i++) {
-        for (const input of nodes[i].inputs) {
-          if (input.kind === "pending") {
-            const prev = earliestConsumer.get(input.node.id);
-            if (prev === undefined || i < prev) {
-              earliestConsumer.set(input.node.id, i);
-            }
-          }
-        }
-      }
-
-      for (const sameBucket of byShapeDtype.values()) {
-        if (sameBucket.length < 2) continue;
-        sameBucket.sort((a, b) => a.planIndex - b.planIndex);
-
-        // Greedily form batches with ordering safety.
-        // We iterate through the bucket in order and never skip entries —
-        // if an entry fails the ordering check, we end the current batch.
-        // This ensures batchStart correctly advances past all processed entries.
-        let batchStart = 0;
-        while (batchStart < sameBucket.length) {
-          const batchEntries: Array<{ node: LazyIRNode; planIndex: number }> = [];
-          const batchNodeIds = new Set<number>();
-          const seenInputs = new Set<string>();
-          let batchMaxPos = -1;
-          let batchMinPos = Infinity;
-          let endJ = batchStart; // track how far we got
-
-          for (let j = batchStart; j < sameBucket.length; j++) {
-            endJ = j + 1;
-            const entry = sameBucket[j];
-            const node = entry.node;
-
-            // Ordering safety: the fused segment is emitted at the first batch
-            // member's plan position. Gap nodes between batch members execute as
-            // prereqs BEFORE the fused dispatch. We must ensure:
-            // 1) All consumers of batch members come after the batch's max position
-            // 2) No gap nodes between batch members depend on any batch member
-            const candidateMaxPos = Math.max(batchMaxPos, entry.planIndex);
-            const candidateMinPos = Math.min(batchMinPos, entry.planIndex);
-
-            let orderingSafe = true;
-            // Check previously batched entries' consumers
-            for (const prev of batchEntries) {
-              const ec = earliestConsumer.get(prev.node.id);
-              if (ec !== undefined && ec <= candidateMaxPos) {
-                orderingSafe = false;
-                break;
-              }
-            }
-            // Check the candidate entry itself
-            if (orderingSafe) {
-              const ec = earliestConsumer.get(entry.node.id);
-              if (ec !== undefined && ec <= candidateMaxPos) {
-                orderingSafe = false;
-              }
-            }
-            // Check gap nodes: no node between min and max positions should
-            // depend on any batch member (they execute as prereqs BEFORE fusion)
-            if (orderingSafe && batchEntries.length > 0) {
-              for (let g = candidateMinPos + 1; g < candidateMaxPos; g++) {
-                const gapNode = nodes[g];
-                if (!gapNode) continue;
-                for (const input of gapNode.inputs) {
-                  if (input.kind === "pending" &&
-                      (batchNodeIds.has(input.node.id) || input.node.id === node.id)) {
-                    orderingSafe = false;
-                    break;
-                  }
-                }
-                if (!orderingSafe) break;
-              }
-            }
-            if (!orderingSafe) break; // end batch (don't skip)
-
-            // Count NEW external inputs this node would add
-            // Scalar refs don't consume binding slots — skip them
-            let newInputCount = 0;
-            for (const input of node.inputs) {
-              if (input.kind === "scalar") continue;
-              const inputKey = input.kind === "materialized"
-                ? `s:${input.storage.id}`
-                : `p:${input.node.id}`;
-              if (!seenInputs.has(inputKey)) newInputCount++;
-            }
-
-            const wouldBeOutputs = batchEntries.length + 1;
-            const wouldBeInputs = seenInputs.size + newInputCount;
-            if (wouldBeInputs + wouldBeOutputs > maxBuffers && batchEntries.length >= 2) {
-              break; // doesn't fit, flush current batch
-            }
-
-            batchEntries.push(entry);
-            batchNodeIds.add(node.id);
-            batchMaxPos = candidateMaxPos;
-            batchMinPos = candidateMinPos;
-            for (const input of node.inputs) {
-              if (input.kind === "scalar") continue;
-              const inputKey = input.kind === "materialized"
-                ? `s:${input.storage.id}`
-                : `p:${input.node.id}`;
-              seenInputs.add(inputKey);
-            }
-          }
-
-          if (batchEntries.length < 2) {
-            // Advance past processed entries to avoid infinite loop
-            batchStart = endJ;
-            continue;
-          }
-
-          batchStart = endJ;
-
-          const batchNodes = batchEntries.map(e => e.node);
-          const batchIndices = batchEntries.map(e => e.planIndex);
-          const externalInputs = collectExternalInputs(batchNodes, batchNodeIds);
-
-          finalGroups.push({
-            nodes: batchNodes,
-            planIndices: batchIndices,
-            externalInputs,
-            outputNode: batchNodes[batchNodes.length - 1],
-            additionalOutputNodes: batchNodes.slice(0, -1),
-          });
+  // Build earliest-consumer-position map
+  const earliestConsumer = new Map<number, number>();
+  for (let i = 0; i < nodes.length; i++) {
+    for (const input of nodes[i].inputs) {
+      if (input.kind === "pending") {
+        const prev = earliestConsumer.get(input.node.id);
+        if (prev === undefined || i < prev) {
+          earliestConsumer.set(input.node.id, i);
         }
       }
     }
   }
 
-  // Final validation: find intermediates consumed outside their group
-  // that aren't marked as additional outputs. Build reverse dependency map
-  // for O(1) lookups instead of scanning the full plan per intermediate.
-  const consumers = new Map<number, number[]>(); // nodeId -> [consumerNodeIds]
+  for (const sameBucket of byShapeDtype.values()) {
+    if (sameBucket.length < 2) continue;
+    sameBucket.sort((a, b) => a.planIndex - b.planIndex);
+
+    let batchStart = 0;
+    while (batchStart < sameBucket.length) {
+      const batchEntries: Array<{ node: LazyIRNode; planIndex: number }> = [];
+      const batchNodeIds = new Set<number>();
+      const seenInputs = new Set<string>();
+      let batchMaxPos = -1;
+      let batchMinPos = Infinity;
+      let endJ = batchStart;
+
+      for (let j = batchStart; j < sameBucket.length; j++) {
+        endJ = j + 1;
+        const entry = sameBucket[j];
+        const node = entry.node;
+
+        const candidateMaxPos = Math.max(batchMaxPos, entry.planIndex);
+        const candidateMinPos = Math.min(batchMinPos, entry.planIndex);
+
+        let orderingSafe = true;
+        for (const prev of batchEntries) {
+          const ec = earliestConsumer.get(prev.node.id);
+          if (ec !== undefined && ec <= candidateMaxPos) {
+            orderingSafe = false;
+            break;
+          }
+        }
+        if (orderingSafe) {
+          const ec = earliestConsumer.get(entry.node.id);
+          if (ec !== undefined && ec <= candidateMaxPos) {
+            orderingSafe = false;
+          }
+        }
+        if (orderingSafe && batchEntries.length > 0) {
+          for (let g = candidateMinPos + 1; g < candidateMaxPos; g++) {
+            const gapNode = nodes[g];
+            if (!gapNode) continue;
+            for (const input of gapNode.inputs) {
+              if (input.kind === "pending" &&
+                  (batchNodeIds.has(input.node.id) || input.node.id === node.id)) {
+                orderingSafe = false;
+                break;
+              }
+            }
+            if (!orderingSafe) break;
+          }
+        }
+        if (!orderingSafe) break;
+
+        let newInputCount = 0;
+        for (const input of node.inputs) {
+          if (input.kind === "scalar") continue;
+          const inputKey = input.kind === "materialized"
+            ? `s:${input.storage.id}`
+            : `p:${input.node.id}`;
+          if (!seenInputs.has(inputKey)) newInputCount++;
+        }
+
+        const wouldBeOutputs = batchEntries.length + 1;
+        const wouldBeInputs = seenInputs.size + newInputCount;
+        if (wouldBeInputs + wouldBeOutputs > maxBuffers && batchEntries.length >= 2) {
+          break;
+        }
+
+        batchEntries.push(entry);
+        batchNodeIds.add(node.id);
+        batchMaxPos = candidateMaxPos;
+        batchMinPos = candidateMinPos;
+        for (const input of node.inputs) {
+          if (input.kind === "scalar") continue;
+          const inputKey = input.kind === "materialized"
+            ? `s:${input.storage.id}`
+            : `p:${input.node.id}`;
+          seenInputs.add(inputKey);
+        }
+      }
+
+      if (batchEntries.length < 2) {
+        batchStart = endJ;
+        continue;
+      }
+
+      batchStart = endJ;
+
+      const batchNodes = batchEntries.map(e => e.node);
+      const batchIndices = batchEntries.map(e => e.planIndex);
+      const externalInputs = collectExternalInputs(batchNodes, batchNodeIds);
+
+      finalGroups.push({
+        nodes: batchNodes,
+        planIndices: batchIndices,
+        externalInputs,
+        outputNode: batchNodes[batchNodes.length - 1],
+        additionalOutputNodes: batchNodes.slice(0, -1),
+      });
+    }
+  }
+}
+
+/**
+ * Phase 5: Promote externally-referenced intermediates to additional outputs.
+ */
+function promoteIntermediates(
+  nodes: LazyIRNode[],
+  finalGroups: FusionGroup[],
+  externalNodeIds: Set<number> | undefined,
+  maxBuffers: number,
+): void {
+  // Build reverse dependency map for O(1) lookups
+  const consumers = new Map<number, number[]>();
   for (const planNode of nodes) {
     for (const input of planNode.inputs) {
       if (input.kind === "pending") {
@@ -730,7 +689,6 @@ export function detectFusionGroups(
       for (const n of group.additionalOutputNodes) outputIds.add(n.id);
     }
 
-    // Find intermediates consumed outside the group
     const neededIntermediates: LazyIRNode[] = [];
     for (const gnode of group.nodes) {
       if (outputIds.has(gnode.id)) continue;
@@ -747,7 +705,6 @@ export function detectFusionGroups(
     }
 
     if (neededIntermediates.length > 0) {
-      // Try to promote to additional outputs (requires same shape + binding slots)
       const primaryShape = group.outputNode.shape;
       const promotable = neededIntermediates.filter(
         n => n.shape.length === primaryShape.length && n.shape.every((d, i) => d === primaryShape[i]),
@@ -766,6 +723,35 @@ export function detectFusionGroups(
       }
     }
   }
+}
+
+export function detectFusionGroups(
+  nodes: LazyIRNode[],
+  externalNodeIds?: Set<number>,
+  options?: { maxStorageBuffers?: number; enableMultiOutput?: boolean; epilogueClaimedIds?: Set<number> },
+): FusionDetectionResult {
+  const maxBuffers = options?.maxStorageBuffers ?? Infinity;
+  const enableMultiOutput = options?.enableMultiOutput ?? false;
+  const epilogueClaimedIds = options?.epilogueClaimedIds;
+
+  // Phase 1: Build candidate groups of consecutive fusible ops
+  const { candidateGroups, fusibleCount } = buildCandidateGroups(nodes, epilogueClaimedIds);
+
+  // Phase 2: Split into connected components, process each, batch singletons
+  const groups = splitCandidatesByComponent(
+    candidateGroups, nodes, externalNodeIds, enableMultiOutput, maxBuffers,
+  );
+
+  // Phase 3: Split groups exceeding storage buffer limit
+  const finalGroups = splitGroupsByBufferLimit(groups, maxBuffers);
+
+  // Phase 4: Global singleton batching
+  if (enableMultiOutput) {
+    batchGlobalSingletons(nodes, finalGroups, epilogueClaimedIds, maxBuffers);
+  }
+
+  // Phase 5: Promote externally-referenced intermediates to outputs
+  promoteIntermediates(nodes, finalGroups, externalNodeIds, maxBuffers);
 
   return {
     groups: finalGroups,
