@@ -736,9 +736,9 @@ function sumFullReduction(
   const bytesPerElement = dtypeBytes(tensor.dtype);
 
   // Check if input buffer exceeds max binding size
-  const limits = (ctx.device as unknown as { limits?: Record<string, number> }).limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
-  const inputBufferSize = (tensor.buffer as { size: number }).size;
+  const inputBufferSize = tensor.buffer.size;
 
   if (inputBufferSize > maxBindingSize || inputSize * bytesPerElement > maxBindingSize) {
     return sumFullReductionChunked(ctx, tensor, maxBindingSize);
@@ -789,7 +789,7 @@ function sumFullReductionChunked(
   maxBindingSize: number,
 ): WebGPUTensor {
   const bytesPerElement = dtypeBytes(tensor.dtype);
-  const limits = (ctx.device as unknown as { limits?: Record<string, number> }).limits;
+  const limits = ctx.device.limits;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
   const elementsPerAlignment = minAlignment / bytesPerElement;
   const maxElementsPerChunk = Math.floor(maxBindingSize / bytesPerElement);

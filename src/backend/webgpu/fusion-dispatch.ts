@@ -227,7 +227,7 @@ export function dispatchFusedKernel(
   const outputTensors: FusedOutputTensor[] = [];
   for (const output of recipe.outputs) {
     const outputBytes = totalElements * dtypeBytes(output.dtype);
-    const buffer = allocateOutputBuffer(outputBytes) as unknown as GPUBuffer;
+    const buffer = allocateOutputBuffer(outputBytes);
     trackSharedEncoderWrite(buffer);
     outputBuffers.push(buffer);
     outputTensors.push({

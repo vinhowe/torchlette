@@ -47,7 +47,7 @@ export function gather(
 
   // Determine chunking
   const inputSizeBytes = tensorA.size * 4;
-  const deviceLimits = (ctx.device as unknown as { limits: Record<string, number> }).limits;
+  const deviceLimits = ctx.device.limits;
   const maxBindingSize = deviceLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const chunked = inputSizeBytes > maxBindingSize;
 
@@ -199,7 +199,7 @@ export function scatterAdd(
 
   // Determine chunking
   const outputSizeBytes = tensorA.size * 4;
-  const deviceLimits = (ctx.device as unknown as { limits: Record<string, number> }).limits;
+  const deviceLimits = ctx.device.limits;
   const maxBindingSize = deviceLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const chunked = outputSizeBytes > maxBindingSize;
 

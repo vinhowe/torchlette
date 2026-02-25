@@ -68,7 +68,7 @@ export async function executeFusedSegment(
 export async function executeFusedWebGPU(
   group: FusionGroup,
   recipe: ReturnType<typeof groupToRecipe>,
-  backend: Backend & { device?: unknown },
+  backend: Backend & { device?: { limits?: { maxStorageBuffersPerShaderStage?: number } } },
   enableVectorization: boolean,
 ): Promise<void> {
   // Import fusion dispatch and buffer lifecycle helpers (cached on first call)
@@ -78,7 +78,7 @@ export async function executeFusedWebGPU(
   const { deferredDestroyBuffer } = _webgpuMatmulImports!;
 
   // Get WebGPU device from backend
-  const device = (backend as any).device;
+  const device = backend.device;
   if (!device) {
     // No device available - fall back to sequential
     recordFusionFallback("no_device", group.nodes.length);
@@ -177,7 +177,7 @@ export async function executeFusedWebGPU(
     // Store the result in the output node
     const outputNode = group.outputNode;
     const fusionBuffer = result.buffer as GPUBuffer;
-    const fusionBufferSize = (fusionBuffer as unknown as { size: number }).size ?? 0;
+    const fusionBufferSize = fusionBuffer.size;
     let fusionDestroyed = false;
     outputNode.result = createStorageHandle(outputNode.device, {
       buffer: result.buffer,
@@ -202,7 +202,7 @@ export async function executeFusedWebGPU(
         const addOutput = result.outputs[i + 1]; // +1: primary is at index 0
         if (addOutput) {
           const addBuffer = addOutput.buffer as GPUBuffer;
-          const addBufferSize = (addBuffer as unknown as { size: number }).size ?? 0;
+          const addBufferSize = addBuffer.size;
           let addDestroyed = false;
           addNode.result = createStorageHandle(addNode.device, {
             buffer: addOutput.buffer,
