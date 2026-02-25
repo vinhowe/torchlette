@@ -29,6 +29,12 @@ import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { wgslSumReduction, trackBuffers } from "./wgsl-helpers";
 
+// Pre-allocated typed array views for attention config buffer writing (avoids per-call allocation)
+const _attnConfigBuf = new ArrayBuffer(32);
+const _attnConfigU32 = new Uint32Array(_attnConfigBuf);
+const _attnConfigF32 = new Float32Array(_attnConfigBuf);
+const _attnConfigBytes = new Uint8Array(_attnConfigBuf);
+
 // Tiling parameters
 const BR = 64;  // Q rows per workgroup (also workgroup size in scalar mode)
 const BC = 32;  // KV rows per tile
@@ -75,18 +81,15 @@ function getOrCreateConfigBuffer(
     configCache.set(key, buf);
   }
   // Pack config: 4 u32s + 1 f32 + 1 u32 + 2 padding
-  const data = new ArrayBuffer(32);
-  const u32View = new Uint32Array(data);
-  const f32View = new Float32Array(data);
-  u32View[0] = batchSize;
-  u32View[1] = numHeads;
-  u32View[2] = seqLen;
-  u32View[3] = headDim;
-  f32View[4] = scale;
-  u32View[5] = isCausal;
-  u32View[6] = 0; // pad
-  u32View[7] = 0; // pad
-  device.queue.writeBuffer(buf, 0, new Uint8Array(data));
+  _attnConfigU32[0] = batchSize;
+  _attnConfigU32[1] = numHeads;
+  _attnConfigU32[2] = seqLen;
+  _attnConfigU32[3] = headDim;
+  _attnConfigF32[4] = scale;
+  _attnConfigU32[5] = isCausal;
+  _attnConfigU32[6] = 0; // pad
+  _attnConfigU32[7] = 0; // pad
+  device.queue.writeBuffer(buf, 0, _attnConfigBytes);
   return buf;
 }
 
