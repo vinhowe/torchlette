@@ -5,6 +5,7 @@
 
 import type { Tensor, Torchlette, DeviceKind } from "../frontend";
 import { Module } from "./module";
+import { sizeOf } from "../core/shape";
 
 export type EmbeddingOptions = {
   /** Device to create parameters on */
@@ -61,7 +62,7 @@ export class Embedding extends Module {
     // output: [..., embeddingDim]
 
     const inputShape = input.shape;
-    const numElements = inputShape.reduce((a, b) => a * b, 1);
+    const numElements = sizeOf(inputShape);
 
     // Flatten input to [numElements]
     const flatInput = input.reshape([numElements]);

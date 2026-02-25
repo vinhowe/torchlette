@@ -5,7 +5,7 @@
 
 import type { BackendTensor } from "../../types";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
-import { GPUBufferUsage } from "../gpu-types";
+import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import { WORKGROUP_SIZE, compute2DDispatch, dtypeBytes, broadcastShapes, gcd } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchComputePass, dispatchMatmul, getPipeline } from "../dispatch";
@@ -31,10 +31,10 @@ export function matmul(
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
   const ctx = requireContext();
-  const a = _a as WebGPUTensor;
-  const b = _b as WebGPUTensor;
+  const a = asGPUTensor(_a);
+  const b = asGPUTensor(_b);
 
-  const limits = (ctx.device as unknown as { limits: Record<string, number> }).limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
 
   // Check if B matrix exceeds max buffer binding size
@@ -84,7 +84,7 @@ function sliceColumns(
   const sliceWidth = colEnd - colStart;
   const outSize = K * sliceWidth;
 
-  const limits = (ctx.device as unknown as { limits: Record<string, number> }).limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
@@ -218,13 +218,13 @@ function scatterColumnsToOutput(
   const sliceWidth = partial.shape[partial.shape.length - 1];
   const totalRows = partial.size / sliceWidth; // M (could be M*batch for batched)
 
-  const limits = (ctx.device as unknown as { limits: Record<string, number> }).limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   // Check if output buffer exceeds limit
-  const outputBufferSize = (outBuffer as { size: number }).size;
-  const inputBufferSize = (partial.buffer as { size: number }).size;
+  const outputBufferSize = outBuffer.size;
+  const inputBufferSize = partial.buffer.size;
 
   const needsChunking = outputBufferSize > maxBindingSize || inputBufferSize > maxBindingSize;
 
@@ -366,7 +366,7 @@ function matmulChunked(
   maxBindingSize: number,
 ): WebGPUTensor {
   const ctx = requireContext();
-  const limits = (ctx.device as unknown as { limits: Record<string, number> }).limits;
+  const limits = ctx.device.limits;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   // Ensure A is contiguous (A is typically small)
@@ -655,7 +655,7 @@ function matmulChunkedOutput(
   maxBindingSize: number,
 ): WebGPUTensor {
   const ctx = requireContext();
-  const limits = (ctx.device as unknown as { limits: Record<string, number> }).limits;
+  const limits = ctx.device.limits;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   // Get shapes

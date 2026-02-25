@@ -1,5 +1,5 @@
 import type { Backend, BackendTensor, DType } from "../backend/types";
-import { gpuBuffer } from "../backend/webgpu/gpu-types";
+import { gpuBuffer, type GPUBuffer } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
 import {
   flushBufferPool,
@@ -18,8 +18,6 @@ import {
   computePlanFingerprint,
   detectFusionGroups,
   groupToRecipe,
-  hasFusionOpportunities,
-  hasFusionPotential,
   isFusibleOp,
   reorderPlanForFusion,
   segmentPlanForExecution,
@@ -28,7 +26,6 @@ import {
 } from "./fusion-detect";
 import {
   analyzeLifetimes,
-  findDeadTensorsAtStep,
   type TensorLifetime,
 } from "./memory-planning";
 import {
@@ -36,8 +33,7 @@ import {
   LoweredPlanBuilder,
 } from "./lowered-plan";
 import type { LazyIRNode, LazyRef, StorageHandle, ExecutionPlan } from "./lazy-types";
-import { createStorageHandle } from "./node-factory";
-import { storageTracker, canSafelyRelease, releaseBufferImmediate } from "./storage-tracker";
+import { storageTracker, releaseDeadTensors } from "./storage-tracker";
 import { getInputStorage } from "./op-dispatch";
 import { extractPlanMetadata, pretunePlanMatmuls } from "./plan-builder";
 import { executePlan } from "./executor-sequential";
@@ -162,7 +158,7 @@ export function getFusionAnalysisTemplate(fingerprint: number): FusionAnalysisTe
  */
 export async function executePlanOptimized(
   plan: ExecutionPlan,
-  backend: Backend,
+  backend: Backend & { device?: { limits?: { maxStorageBuffersPerShaderStage?: number } } },
   options: OptimizedExecutionOptions = {},
 ): Promise<OptimizedExecutionResult> {
   if (plan.nodes.length === 0) {
@@ -217,7 +213,7 @@ export async function executePlanOptimized(
 
   // Query device storage buffer limit to constrain fusion group size.
   const maxStorageBuffers: number | undefined =
-    (backend as any).device?.limits?.maxStorageBuffersPerShaderStage;
+    backend.device?.limits?.maxStorageBuffersPerShaderStage;
 
   // Compute structural fingerprint for fusion analysis caching.
   // Plans with the same fingerprint have identical structure (ops, shapes,
@@ -295,7 +291,7 @@ export async function executePlanOptimized(
         for (const inp of node.inputs) {
           if (inp.kind === "pending") {
             if (!groupNodeIds.has(inp.node.id) &&
-                !extInputs.some(ei => ei.kind === "pending" && (ei as any).node.id === inp.node.id)) {
+                !extInputs.some(ei => ei.kind === "pending" && ei.node.id === inp.node.id)) {
               extInputs.push(inp);
             }
           } else if (inp.kind === "scalar") {
@@ -458,7 +454,7 @@ export async function executePlanOptimized(
             if (castInput.kind === "pending") {
               fromDtype = castInput.node.dtype;
             } else if (castInput.kind === "materialized") {
-              fromDtype = (castInput.storage.backendTensor as any).dtype ?? "f32";
+              fromDtype = castInput.storage.backendTensor.dtype ?? "f32";
             } else {
               continue;
             }
@@ -697,7 +693,7 @@ export async function executePlanOptimized(
   if (useArenaFallback) {
     setActiveArena(cachedTemplate!.bufferArena!);
     // Register external input buffers for arena conflict detection
-    const extBufs: any[] = [];
+    const extBufs: GPUBuffer[] = [];
     for (const node of planNodes) {
       for (const ref of node.inputs) {
         if (ref.kind === "materialized") {
@@ -754,22 +750,7 @@ export async function executePlanOptimized(
             nodeToStorage.set(node.id, node.result);
           }
           overallStep++;
-          if (lifetimes && outputNodeIds) {
-            const deadNodeIds = findDeadTensorsAtStep(
-              lifetimes,
-              overallStep,
-              outputNodeIds,
-              alreadyReleased,
-            );
-            for (const deadId of deadNodeIds) {
-              const storage = nodeToStorage.get(deadId);
-              if (storage && canSafelyRelease(storage, nodeToStorage)) {
-                releaseBufferImmediate(storage);
-                nodeToStorage.delete(deadId);
-                alreadyReleased.add(deadId);
-              }
-            }
-          }
+          releaseDeadTensors(lifetimes, overallStep, outputNodeIds, alreadyReleased, nodeToStorage);
         }
       }
       nodesSinceReclaim += segment.group.nodes.length;

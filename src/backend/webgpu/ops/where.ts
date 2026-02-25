@@ -5,6 +5,7 @@
 
 import type { BackendTensor } from "../../types";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
+import { asGPUTensor } from "../gpu-types";
 import {
   toIndexShape,
   sizeOf,
@@ -99,9 +100,9 @@ export function where(
   y: BackendTensor,
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  const condTensor = condition as WebGPUTensor;
-  const xTensor = x as WebGPUTensor;
-  const yTensor = y as WebGPUTensor;
+  const condTensor = asGPUTensor(condition);
+  const xTensor = asGPUTensor(x);
+  const yTensor = asGPUTensor(y);
 
   const outShape = broadcastThreeShapes(
     condTensor.shape,
@@ -119,8 +120,7 @@ export function where(
 
   // Check if chunking is needed for large contiguous tensors
   const bytesPerElement = 4; // f32
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const outSizeBytes = outSize * bytesPerElement;
 
@@ -195,8 +195,7 @@ function whereChunked(
   const ctx = requireContext();
   const bytesPerElement = 4; // f32
 
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 

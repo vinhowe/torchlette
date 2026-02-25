@@ -14,7 +14,7 @@
 
 import type { BackendTensor } from "../types";
 import type { GPUBuffer, GPUDevice, WebGPUTensor } from "./gpu-types";
-import { GPUBufferUsage, STORAGE_BUFFER_USAGE } from "./gpu-types";
+import { GPUBufferUsage, STORAGE_BUFFER_USAGE, asGPUTensor } from "./gpu-types";
 import {
   arenaBufferSet, trackSharedEncoderWrite, requireContext,
   replayPinnedBufferSet, paramsSequenceSet,
@@ -59,7 +59,7 @@ export function allocateOutputBuffer(
         // alive (referenced by the external input tensor) but is no longer
         // in the arena. This permanently resolves the conflict for this slot.
         arenaBufferSet.delete(arenaBuffer);
-        arenaLocal.active.alloc[idx] = undefined as any;
+        arenaLocal.active.alloc[idx] = undefined;
         const freshBuffer = arenaAllocAt(arenaLocal.active.alloc, idx, sizeBytes);
         arenaLocal.conflictDetected = true;
         return freshBuffer!;
@@ -97,7 +97,7 @@ export function allocateOutputBuffer(
 export function donateBuffer(
   tensor: BackendTensor,
 ): GPUBuffer | null {
-  const t = tensor as WebGPUTensor;
+  const t = asGPUTensor(tensor);
 
   // Can only donate if tensor owns the buffer
   if (!t.ownsBuffer) {
@@ -105,14 +105,14 @@ export function donateBuffer(
   }
 
   // Check buffer has pool-compatible usage (STORAGE | COPY_SRC | COPY_DST)
-  const bufferUsage = (t.buffer as any).usage ?? 0;
+  const bufferUsage = t.buffer.usage ?? 0;
   if (bufferUsage !== STORAGE_BUFFER_USAGE) {
     return null;
   }
 
   // Transfer ownership: decRef for this tensor, prevent closure from releasing
   bufferPool.decRef(t.buffer);
-  (t as any).ownsBuffer = false;
+  (t as { ownsBuffer: boolean }).ownsBuffer = false;
   t.destroy = () => {}; // Prevent closure from firing (closure captures old ownsBuffer=true)
 
   return t.buffer as GPUBuffer;
@@ -124,8 +124,8 @@ export function donateBuffer(
 export function getBufferSize(
   tensor: BackendTensor,
 ): number {
-  const t = tensor as WebGPUTensor;
-  return (t.buffer as any).size ?? 0;
+  const t = asGPUTensor(tensor);
+  return t.buffer.size ?? 0;
 }
 
 // ============================================================================
@@ -164,8 +164,8 @@ export const pinnedOutputBuffers: Array<GPUBuffer | null> = [];
  * (executeLoweredPlan).
  */
 export interface BufferArena {
-  resolve: GPUBuffer[];
-  alloc: GPUBuffer[];
+  resolve: (GPUBuffer | undefined)[];
+  alloc: (GPUBuffer | undefined)[];
 }
 
 // arenaBufferSet is in webgpu-state.ts and re-exported above.
@@ -299,7 +299,7 @@ export function destroyArena(arena: BufferArena): void {
 }
 
 /** Allocate or reuse an arena buffer at the given position in the given array. */
-export function arenaAllocAt(arr: GPUBuffer[], idx: number, sizeBytes: number): GPUBuffer | null {
+export function arenaAllocAt(arr: (GPUBuffer | undefined)[], idx: number, sizeBytes: number): GPUBuffer | null {
   const alignedSize = alignBufferSize(sizeBytes);
   const neededSizeClass = getSizeClass(alignedSize);
 
@@ -395,7 +395,7 @@ export function resolveOutputBuffer(
         // Replace the arena slot with a fresh buffer. The old buffer stays
         // alive (referenced by the external input tensor).
         arenaBufferSet.delete(arenaBuffer);
-        arenaLocal.active.resolve[idx] = undefined as any;
+        arenaLocal.active.resolve[idx] = undefined;
         const freshBuffer = arenaAllocAt(arenaLocal.active.resolve, idx, sizeBytes);
         arenaLocal.conflictDetected = true;
         // Still need to check direct aliasing on the fresh buffer

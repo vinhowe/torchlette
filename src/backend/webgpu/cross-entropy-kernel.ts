@@ -13,18 +13,21 @@
 
 import {
   dispatchComputePass,
-  getWebGPUDevice,
   trackSharedEncoderWrite,
   allocateOutputBuffer,
   cachedCreateBindGroup,
+  getPipeline,
 } from "./index";
-import type { GPUBuffer } from "./gpu-types";
-import { defineKernel } from "./kernel-factory";
-import { wgslReduce } from "./wgsl-reduce";
+import { requireContext } from "./webgpu-state";
+import type { GPUBuffer, GPUDevice } from "./gpu-types";
+import { GPUBufferUsage } from "./gpu-types";
+import { WORKGROUP_SIZE } from "./shape-utils";
 
-const WORKGROUP_SIZE = 256;
-
-const kernel = defineKernel("crossEntropy");
+// Shared WGSL struct for cross-entropy config (8 bytes, 2 fields)
+const WGSL_CE_CONFIG = `struct CEConfig {
+  batch_size: u32,
+  vocab_size: u32,
+};`;
 
 // ============================================================================
 // WGSL Shaders
@@ -32,10 +35,7 @@ const kernel = defineKernel("crossEntropy");
 
 function crossEntropyForwardShader(): string {
   return `
-struct CEConfig {
-  batch_size: u32,
-  vocab_size: u32,
-};
+${WGSL_CE_CONFIG}
 
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
 @group(0) @binding(1) var<storage, read> targets: array<f32>;
@@ -52,18 +52,39 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   let V = config.vocab_size;
   let base = row * V;
 
-${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "V", op: "max",
-  smem: "sdata", init: "-3.402823e+38",
-  accumExpr: "logits[base + i]", result: "row_max",
-})}
+  // Phase 1: Parallel max reduction
+  var local_max = -3.402823e+38;
+  for (var i = tid; i < V; i += ${WORKGROUP_SIZE}u) {
+    local_max = max(local_max, logits[base + i]);
+  }
+  sdata[tid] = local_max;
+  workgroupBarrier();
 
-${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "V", op: "sum",
-  smem: "sdata", init: "0.0",
-  accumExpr: "exp(logits[base + i] - row_max)", result: "log_sum_exp",
-  transform: "log(_)",
-})}
+  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
+    if (tid < s) {
+      sdata[tid] = max(sdata[tid], sdata[tid + s]);
+    }
+    workgroupBarrier();
+  }
+  let row_max = sdata[0];
 
-  // Output (thread 0 only)
+  // Phase 2: Parallel sum-exp reduction
+  var local_sum = 0.0;
+  for (var i = tid; i < V; i += ${WORKGROUP_SIZE}u) {
+    local_sum += exp(logits[base + i] - row_max);
+  }
+  sdata[tid] = local_sum;
+  workgroupBarrier();
+
+  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
+    if (tid < s) {
+      sdata[tid] += sdata[tid + s];
+    }
+    workgroupBarrier();
+  }
+  let log_sum_exp = log(sdata[0]);
+
+  // Phase 3: Output (thread 0 only)
   if (tid == 0u) {
     let t = u32(targets[row]);
     loss[row] = -(logits[base + t] - row_max - log_sum_exp);
@@ -74,10 +95,7 @@ ${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "V", op: "sum",
 
 function crossEntropyBackwardShader(): string {
   return `
-struct CEConfig {
-  batch_size: u32,
-  vocab_size: u32,
-};
+${WGSL_CE_CONFIG}
 
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
 @group(0) @binding(1) var<storage, read> targets: array<f32>;
@@ -95,18 +113,39 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   let V = config.vocab_size;
   let base = row * V;
 
-${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "V", op: "max",
-  smem: "sdata", init: "-3.402823e+38",
-  accumExpr: "logits[base + i]", result: "row_max",
-})}
+  // Phase 1: Parallel max reduction (recompute from forward)
+  var local_max = -3.402823e+38;
+  for (var i = tid; i < V; i += ${WORKGROUP_SIZE}u) {
+    local_max = max(local_max, logits[base + i]);
+  }
+  sdata[tid] = local_max;
+  workgroupBarrier();
 
-${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "V", op: "sum",
-  smem: "sdata", init: "0.0",
-  accumExpr: "exp(logits[base + i] - row_max)", result: "log_sum_exp",
-  transform: "log(_)",
-})}
+  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
+    if (tid < s) {
+      sdata[tid] = max(sdata[tid], sdata[tid + s]);
+    }
+    workgroupBarrier();
+  }
+  let row_max = sdata[0];
 
-  // Write gradients (all threads participate)
+  // Phase 2: Parallel sum-exp reduction (recompute from forward)
+  var local_sum = 0.0;
+  for (var i = tid; i < V; i += ${WORKGROUP_SIZE}u) {
+    local_sum += exp(logits[base + i] - row_max);
+  }
+  sdata[tid] = local_sum;
+  workgroupBarrier();
+
+  for (var s = ${WORKGROUP_SIZE / 2}u; s > 0u; s >>= 1u) {
+    if (tid < s) {
+      sdata[tid] += sdata[tid + s];
+    }
+    workgroupBarrier();
+  }
+  let log_sum_exp = log(sdata[0]);
+
+  // Phase 3: Write gradients (all threads participate)
   // grad_logits[b,v] = grad_output[b] * (softmax[b,v] - one_hot(target[b])[v])
   let t = u32(targets[row]);
   let g = grad_output[row];
@@ -117,6 +156,31 @@ ${wgslReduce({ wgSize: WORKGROUP_SIZE, tid: "tid", dim: "V", op: "sum",
   }
 }
 `;
+}
+
+// ============================================================================
+// Config Buffer (cached per batch_size x vocab_size)
+// ============================================================================
+
+const configCache = new Map<string, GPUBuffer>();
+
+function getOrCreateConfigBuffer(
+  device: GPUDevice,
+  batchSize: number,
+  vocabSize: number,
+): GPUBuffer {
+  const key = `${batchSize}:${vocabSize}`;
+  let buf = configCache.get(key);
+  if (!buf) {
+    buf = device.createBuffer({
+      size: 8, // 2 x u32
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    configCache.set(key, buf);
+  }
+  const data = new Uint32Array([batchSize, vocabSize]);
+  device.queue.writeBuffer(buf, 0, new Uint8Array(data.buffer));
+  return buf;
 }
 
 // ============================================================================
@@ -133,19 +197,18 @@ export function dispatchCrossEntropyForward(
   batchSize: number,
   vocabSize: number,
 ): GPUBuffer {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const outputSizeBytes = batchSize * 4; // f32
-  const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
+  const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
-  const configBuf = kernel.getConfigBuffer(
-    device, `${batchSize}:${vocabSize}`, 8,
-    new Uint8Array(new Uint32Array([batchSize, vocabSize]).buffer),
-  );
+  const configBuf = getOrCreateConfigBuffer(device, batchSize, vocabSize);
 
-  const pipeline = kernel.getPipeline(
-    device, "crossEntropyFwd", crossEntropyForwardShader,
+  const pipeline = getPipeline(
+    ctx,
+    "crossEntropyFwd",
+    crossEntropyForwardShader(),
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
@@ -175,19 +238,18 @@ export function dispatchCrossEntropyBackward(
   batchSize: number,
   vocabSize: number,
 ): GPUBuffer {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const outputSizeBytes = batchSize * vocabSize * 4; // f32
-  const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
+  const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
-  const configBuf = kernel.getConfigBuffer(
-    device, `${batchSize}:${vocabSize}`, 8,
-    new Uint8Array(new Uint32Array([batchSize, vocabSize]).buffer),
-  );
+  const configBuf = getOrCreateConfigBuffer(device, batchSize, vocabSize);
 
-  const pipeline = kernel.getPipeline(
-    device, "crossEntropyBwd", crossEntropyBackwardShader,
+  const pipeline = getPipeline(
+    ctx,
+    "crossEntropyBwd",
+    crossEntropyBackwardShader(),
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
@@ -211,5 +273,5 @@ export function dispatchCrossEntropyBackward(
  * Reset all module-local mutable state (pipeline cache, config buffer cache).
  */
 export function resetCrossEntropyKernelState(): void {
-  kernel.reset();
+  configCache.clear();
 }

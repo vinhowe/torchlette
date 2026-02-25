@@ -22,7 +22,7 @@ import {
 } from "./shape-utils";
 import type { BackendTensor, DType } from "../types";
 import type { GPUBuffer, GPUComputePipeline, GPUBindGroup, WebGPUContext, WebGPUTensor } from "./gpu-types";
-import { GPUBufferUsage } from "./gpu-types";
+import { GPUBufferUsage, asGPUTensor } from "./gpu-types";
 import { requireContext, isF16Supported } from "./gpu-context";
 import { bufferPool } from "./buffer-pool";
 import {
@@ -32,7 +32,7 @@ import {
   submitOrCollect,
   getCurrentOpLabel,
 } from "./shared-encoder";
-import { dispatchRecordingBuffer, getAndClearLastBindGroupBuffers } from "./dispatch-recording";
+import { dispatchRecordingBuffer, getAndClearLastBindGroupBuffers, type RecordedDispatch } from "./dispatch-recording";
 import { resolveOutputBuffer } from "./buffer-arena";
 import {
   createParamsBuffer,
@@ -62,27 +62,32 @@ export function dispatchComputePass(
   workgroupsX: number,
   workgroupsY: number = 1,
   workgroupsZ: number = 1,
+  recordingBuffer?: RecordedDispatch[] | null,
+  labelOverride?: string,
 ): void {
   const ctx = requireContext();
+  const label = labelOverride ?? getCurrentOpLabel();
+  const recBuf = recordingBuffer !== undefined ? recordingBuffer : dispatchRecordingBuffer;
 
   // Record dispatch if recording is active
-  if (dispatchRecordingBuffer) {
-    dispatchRecordingBuffer.push({
+  if (recBuf) {
+    recBuf.push({
       pipeline,
       bindGroup: bindGroup as GPUBindGroup,
       workgroupsX,
       workgroupsY,
       workgroupsZ,
       buffers: getAndClearLastBindGroupBuffers(),
-      label: getCurrentOpLabel() ?? undefined,
+      label: label ?? undefined,
       module: getProfileModule(),
     });
   }
 
-  if (getSharedEncoderInstance()) {
+  const sharedEnc = getSharedEncoderInstance();
+  const tsWrites = getTimestampWrites(label ?? "unknown");
+  if (sharedEnc) {
     // Encode directly onto the shared encoder — no new encoder or CB
-    const tsWrites = getTimestampWrites(getCurrentOpLabel() ?? "unknown");
-    const pass = getSharedEncoderInstance().beginComputePass(
+    const pass = sharedEnc.beginComputePass(
       tsWrites ? { timestampWrites: tsWrites } : undefined,
     );
     pass.setPipeline(pipeline);
@@ -93,7 +98,6 @@ export function dispatchComputePass(
     autoFlushSharedEncoder();
   } else {
     const encoder = ctx.device.createCommandEncoder();
-    const tsWrites = getTimestampWrites(getCurrentOpLabel() ?? "unknown");
     const pass = encoder.beginComputePass(
       tsWrites ? { timestampWrites: tsWrites } : undefined,
     );
@@ -103,7 +107,6 @@ export function dispatchComputePass(
     pass.end();
     submitOrCollect(encoder.finish());
   }
-
 }
 
 /**
@@ -467,8 +470,7 @@ export function dispatchBinary(
   }
 
   // Check if any buffer exceeds max binding size
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const bytesPerElement = dtypeBytes(dtype);
 
@@ -577,8 +579,7 @@ export function dispatchBinaryChunked(
   const dtype = a.dtype;
   const bytesPerElement = dtypeBytes(dtype);
 
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
@@ -653,8 +654,7 @@ export function dispatchUnary(
   const bytesPerElement = dtypeBytes(dtype);
 
   // Check if chunking is needed for large contiguous tensors
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const aSizeBytes = a.size * bytesPerElement;
 
@@ -713,8 +713,7 @@ export function dispatchUnaryChunked(
   const dtype = a.dtype;
   const bytesPerElement = dtypeBytes(dtype);
 
-  const limits = (ctx.device as unknown as { limits: Record<string, number> })
-    .limits;
+  const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
@@ -765,15 +764,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   return createTensor(a.shape, outBuffer, undefined, 0, dtype, ownsBuffer);
 }
 
-export function dispatchMatmul(
+/**
+ * Prepare matmul inputs: detect transposes, ensure contiguity,
+ * compute output shape, extract M/K/N, and compute batch strides.
+ */
+function prepareMatmulInputs(
   a: WebGPUTensor,
   b: WebGPUTensor,
-  transA = false,
-  transB = false,
-  donatedBuffer?: GPUBuffer,
-): WebGPUTensor {
-  const ctx = requireContext();
-
+  transA: boolean,
+  transB: boolean,
+) {
   // Try to detect simple last-2-dim transposes to avoid contiguous() materialization.
   // If detected, we use the original contiguous buffer and flip the transpose flag.
   let effectiveA: WebGPUTensor = a;
@@ -782,7 +782,6 @@ export function dispatchMatmul(
 
   const aOrigShape = !transA ? detectSimpleTranspose(a) : null;
   if (aOrigShape) {
-    // Use original buffer with swapped shape and flipped transpose flag
     effectiveA = createTensor(aOrigShape, a.buffer, undefined, 0, a.dtype, false);
     effectiveTransA = true;
   } else {
@@ -841,6 +840,49 @@ export function dispatchMatmul(
     k,
   );
 
+  return {
+    effectiveA, effectiveB, effectiveTransA, effectiveTransB,
+    aWasCopied, bWasCopied, outShape, m, k, n, batchDims, batchSize,
+    strideA, strideB, strideC,
+  };
+}
+
+/**
+ * Destroy contiguous copies that were created during matmul input preparation.
+ */
+function cleanupMatmulCopies(
+  aWasCopied: boolean,
+  bWasCopied: boolean,
+  effectiveA: WebGPUTensor,
+  effectiveB: WebGPUTensor,
+  a: WebGPUTensor,
+  b: WebGPUTensor,
+): void {
+  if (aWasCopied) {
+    bufferPool.decRef(effectiveA.buffer);
+    bufferPool.deferredDestroy(effectiveA.buffer, effectiveA.size * (a.dtype === "f16" ? 2 : 4));
+  }
+  if (bWasCopied) {
+    bufferPool.decRef(effectiveB.buffer);
+    bufferPool.deferredDestroy(effectiveB.buffer, effectiveB.size * (b.dtype === "f16" ? 2 : 4));
+  }
+}
+
+export function dispatchMatmul(
+  a: WebGPUTensor,
+  b: WebGPUTensor,
+  transA = false,
+  transB = false,
+  donatedBuffer?: GPUBuffer,
+): WebGPUTensor {
+  const ctx = requireContext();
+
+  const {
+    effectiveA, effectiveB, effectiveTransA, effectiveTransB,
+    aWasCopied, bWasCopied, outShape, m, k, n, batchSize,
+    strideA, strideB, strideC,
+  } = prepareMatmulInputs(a, b, transA, transB);
+
   // Derive per-input dtypes; output is always the higher-precision type
   const dtypeA = effectiveA.dtype === "f16" && isF16Supported() ? "f16" as const : "f32" as const;
   const dtypeB = effectiveB.dtype === "f16" && isF16Supported() ? "f16" as const : "f32" as const;
@@ -848,10 +890,10 @@ export function dispatchMatmul(
   const bytesPerElement = outputDtype === "f16" ? 2 : 4;
 
   // Create or use donated output buffer
-  const outSize = outShape.reduce((acc, dim) => acc * dim, 1);
+  const outSize = sizeOf(outShape);
   const requiredSize = outSize * bytesPerElement;
   const useDonated =
-    donatedBuffer && (donatedBuffer as any).size >= requiredSize;
+    donatedBuffer && donatedBuffer.size >= requiredSize;
   const outBuffer = useDonated
     ? donatedBuffer
     : resolveOutputBuffer(ctx.device, requiredSize,
@@ -877,15 +919,7 @@ export function dispatchMatmul(
     dtypeB: dtypeB !== dtypeA ? dtypeB : undefined,
   });
 
-  // Destroy contiguous copies if they were created (deferred for GPU fence)
-  if (aWasCopied) {
-    bufferPool.decRef(effectiveA.buffer);
-    bufferPool.deferredDestroy(effectiveA.buffer, effectiveA.size * (a.dtype === "f16" ? 2 : 4));
-  }
-  if (bWasCopied) {
-    bufferPool.decRef(effectiveB.buffer);
-    bufferPool.deferredDestroy(effectiveB.buffer, effectiveB.size * (b.dtype === "f16" ? 2 : 4));
-  }
+  cleanupMatmulCopies(aWasCopied, bWasCopied, effectiveA, effectiveB, a, b);
 
   // Output tensor always owns the buffer (donated or new)
   return createTensor(outShape, outBuffer, undefined, 0, outputDtype, true);
@@ -909,70 +943,11 @@ export function dispatchMatmulWithEpilogue(
 ): WebGPUTensor {
   const ctx = requireContext();
 
-  // Try to detect simple last-2-dim transposes to avoid contiguous() materialization.
-  let effectiveA: WebGPUTensor = a;
-  let effectiveTransA = transA;
-  let aWasCopied = false;
-
-  const aOrigShape = !transA ? detectSimpleTranspose(a) : null;
-  if (aOrigShape) {
-    effectiveA = createTensor(aOrigShape, a.buffer, undefined, 0, a.dtype, false);
-    effectiveTransA = true;
-  } else {
-    effectiveA = ensureContiguous(a);
-    aWasCopied = effectiveA !== a;
-  }
-
-  let effectiveB: WebGPUTensor = b;
-  let effectiveTransB = transB;
-  let bWasCopied = false;
-
-  const bOrigShape = !transB ? detectSimpleTranspose(b) : null;
-  if (bOrigShape) {
-    effectiveB = createTensor(bOrigShape, b.buffer, undefined, 0, b.dtype, false);
-    effectiveTransB = true;
-  } else {
-    effectiveB = ensureContiguous(b);
-    bWasCopied = effectiveB !== b;
-  }
-
-  // Compute output shape with transpose and batch broadcasting
-  const outShape = computeMatmulOutputShape(
-    effectiveA.shape,
-    effectiveB.shape,
-    effectiveTransA,
-    effectiveTransB,
-  );
-
-  // Extract matrix dimensions
-  const aRank = effectiveA.shape.length;
-  const bRank = effectiveB.shape.length;
-
-  let m: number, k: number, n: number;
-  if (effectiveTransA) {
-    k = effectiveA.shape[aRank - 2];
-    m = effectiveA.shape[aRank - 1];
-  } else {
-    m = effectiveA.shape[aRank - 2];
-    k = effectiveA.shape[aRank - 1];
-  }
-  if (effectiveTransB) {
-    n = effectiveB.shape[bRank - 2];
-  } else {
-    n = effectiveB.shape[bRank - 1];
-  }
-
-  // Compute batch size and strides
-  const batchDims = outShape.slice(0, -2);
-  const batchSize = computeBatchSize(batchDims);
-  const { strideA, strideB, strideC } = computeBatchStrides(
-    effectiveA.shape,
-    effectiveB.shape,
-    batchDims,
-    m,
-    n,
-    k,
-  );
+  const {
+    effectiveA, effectiveB, effectiveTransA, effectiveTransB,
+    aWasCopied, bWasCopied, outShape, m, k, n, batchSize,
+    strideA, strideB, strideC,
+  } = prepareMatmulInputs(a, b, transA, transB);
 
   // Derive per-input dtypes; output dtype from epilogue or promoted type.
   // When inputCastA/B is set, the actual buffer dtype is wider (e.g. f32) but
@@ -990,7 +965,7 @@ export function dispatchMatmulWithEpilogue(
   const epilogueBuffers = epilogueInputs.map((t) => t.buffer);
 
   // Create output buffer (routed through arena for stable bind group cache)
-  const outSize = outShape.reduce((acc, dim) => acc * dim, 1);
+  const outSize = sizeOf(outShape);
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement,
     [effectiveA.buffer, effectiveB.buffer, ...epilogueBuffers]);
 
@@ -1018,15 +993,7 @@ export function dispatchMatmulWithEpilogue(
     inputCastB,
   });
 
-  // Destroy contiguous copies if they were created (deferred for GPU fence)
-  if (aWasCopied) {
-    bufferPool.decRef(effectiveA.buffer);
-    bufferPool.deferredDestroy(effectiveA.buffer, effectiveA.size * (a.dtype === "f16" ? 2 : 4));
-  }
-  if (bWasCopied) {
-    bufferPool.decRef(effectiveB.buffer);
-    bufferPool.deferredDestroy(effectiveB.buffer, effectiveB.size * (b.dtype === "f16" ? 2 : 4));
-  }
+  cleanupMatmulCopies(aWasCopied, bWasCopied, effectiveA, effectiveB, a, b);
 
   return createTensor(outShape, outBuffer, undefined, 0, outputDtype);
 }
@@ -1050,7 +1017,7 @@ export function dispatchMatmulDirect(
     dtypeA: "f16" | "f32";
     dtypeB?: "f16" | "f32";
     outputDtype: DType;
-    epilogueConfig: any;
+    epilogueConfig: EpilogueConfig | undefined;
     epilogueBuffers: GPUBuffer[];
     inputCastA?: DType;
     inputCastB?: DType;
@@ -1058,7 +1025,7 @@ export function dispatchMatmulDirect(
 ): WebGPUTensor {
   const ctx = requireContext();
   const bytesPerElement = config.outputDtype === "f16" ? 2 : 4;
-  const outSize = config.outShape.reduce((a, b) => a * b, 1);
+  const outSize = sizeOf(config.outShape);
   const outBuffer = resolveOutputBuffer(
     ctx.device,
     outSize * bytesPerElement,
@@ -1117,7 +1084,7 @@ export function runFusedElementwise(
   if (size === 0) {
     throw new Error("fused elementwise does not support empty tensors yet");
   }
-  const inputTensors = inputs as WebGPUTensor[];
+  const inputTensors = inputs.map(asGPUTensor);
   const nodeById = new Map<number, IRNode>();
   for (const node of graph.nodes) {
     nodeById.set(node.id, node);

@@ -28,7 +28,74 @@ import type {
   TilePtr2D, TileMask2D,
 } from "./tile-ir";
 import { buildKernelIR, type KernelContext } from "./tile-ir";
-import { wgslReduce } from "./wgsl-reduce";
+// Inlined from wgsl-reduce.ts (deleted on main — tile-compiler is the only consumer)
+
+interface ReduceChannel {
+  smem: string;
+  init: string;
+  accumExpr: string;
+  result: string;
+  transform?: string;
+}
+
+interface WgslReduceOpts {
+  wgSize: number;
+  tid: string;
+  dim: string;
+  loopVar?: string;
+  op: "sum" | "max";
+  loopPreamble?: string;
+  smem: string;
+  init: string;
+  accumExpr: string;
+  result: string;
+  transform?: string;
+}
+
+function wgslReduce(opts: WgslReduceOpts): string {
+  const { wgSize, tid, dim, op } = opts;
+  const loopVar = opts.loopVar ?? "i";
+  const half = wgSize / 2;
+  const ch: ReduceChannel = { smem: opts.smem, init: opts.init, accumExpr: opts.accumExpr, result: opts.result, transform: opts.transform };
+
+  const lines: string[] = [];
+  lines.push(`  {`);
+  lines.push(`    var _acc = ${ch.init};`);
+  lines.push(`    for (var ${loopVar} = ${tid}; ${loopVar} < ${dim}; ${loopVar} += ${wgSize}u) {`);
+  if (opts.loopPreamble) {
+    for (const pLine of opts.loopPreamble.split("\n")) {
+      lines.push(`      ${pLine.trim()}`);
+    }
+  }
+  if (op === "sum") {
+    lines.push(`      _acc += ${ch.accumExpr};`);
+  } else {
+    lines.push(`      _acc = max(_acc, ${ch.accumExpr});`);
+  }
+  lines.push(`    }`);
+  lines.push(`    ${ch.smem}[${tid}] = _acc;`);
+  lines.push(`  }`);
+  lines.push(`  workgroupBarrier();`);
+  lines.push(``);
+
+  // Tree reduction
+  lines.push(`  for (var s = ${half}u; s > 0u; s >>= 1u) {`);
+  lines.push(`    if (${tid} < s) {`);
+  if (op === "sum") {
+    lines.push(`      ${ch.smem}[${tid}] += ${ch.smem}[${tid} + s];`);
+  } else {
+    lines.push(`      ${ch.smem}[${tid}] = max(${ch.smem}[${tid}], ${ch.smem}[${tid} + s]);`);
+  }
+  lines.push(`    }`);
+  lines.push(`    workgroupBarrier();`);
+  lines.push(`  }`);
+
+  const raw = `${ch.smem}[0]`;
+  const value = ch.transform ? ch.transform.replace(/_/g, raw) : raw;
+  lines.push(`  let ${ch.result} = ${value};`);
+
+  return lines.join("\n");
+}
 
 // ============================================================================
 // Node Graph Utilities

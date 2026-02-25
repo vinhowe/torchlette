@@ -18,16 +18,21 @@
 
 import {
   dispatchComputePass,
-  getWebGPUDevice,
   trackSharedEncoderWrite,
   allocateOutputBuffer,
   cachedCreateBindGroup,
+  getPipeline,
 } from "./index";
+import { requireContext } from "./webgpu-state";
 
 import { getSubgroupSupport } from "./matmul/types";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
-import { defineKernel } from "./kernel-factory";
-import { wgslReduce } from "./wgsl-reduce";
+import { GPUBufferUsage } from "./gpu-types";
+
+/** Track multiple buffers in the shared encoder write set. */
+function trackBuffers(...buffers: GPUBuffer[]): void {
+  for (const buf of buffers) trackSharedEncoderWrite(buf);
+}
 
 // Tiling parameters
 const BR = 64;  // Q rows per workgroup (also workgroup size in scalar mode)
@@ -38,17 +43,57 @@ const BQ_BW = 16; // Q rows per tile in backward dKV kernel
 const THREADS_PER_ROW = 4; // threads cooperating on one row's dot product
 const WG_SG = 256;  // workgroup size in subgroup mode (BR * THREADS_PER_ROW)
 
+// Shared WGSL struct for flash attention config (32 bytes, 8 fields)
+const WGSL_FA_CONFIG = `struct FAConfig {
+  batch_size: u32,
+  num_heads: u32,
+  seq_len: u32,
+  head_dim: u32,
+  scale: f32,
+  is_causal: u32,
+  _pad0: u32,
+  _pad1: u32,
+};`;
+
 // ============================================================================
-// Kernel Factory
+// Config Buffer Cache
 // ============================================================================
 
-const kernel = defineKernel("attention");
+const configCache = new Map<string, GPUBuffer>();
 
-// Reusable config buffer views (avoid per-call allocation)
-const _configData = new ArrayBuffer(32);
-const _configU32 = new Uint32Array(_configData);
-const _configF32 = new Float32Array(_configData);
-const _configU8 = new Uint8Array(_configData);
+function getOrCreateConfigBuffer(
+  device: GPUDevice,
+  batchSize: number,
+  numHeads: number,
+  seqLen: number,
+  headDim: number,
+  scale: number,
+  isCausal: number,
+): GPUBuffer {
+  const key = `fa:${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${isCausal}`;
+  let buf = configCache.get(key);
+  if (!buf) {
+    buf = device.createBuffer({
+      size: 32, // 8 x u32/f32
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    configCache.set(key, buf);
+  }
+  // Pack config: 4 u32s + 1 f32 + 1 u32 + 2 padding
+  const data = new ArrayBuffer(32);
+  const u32View = new Uint32Array(data);
+  const f32View = new Float32Array(data);
+  u32View[0] = batchSize;
+  u32View[1] = numHeads;
+  u32View[2] = seqLen;
+  u32View[3] = headDim;
+  f32View[4] = scale;
+  u32View[5] = isCausal;
+  u32View[6] = 0; // pad
+  u32View[7] = 0; // pad
+  device.queue.writeBuffer(buf, 0, new Uint8Array(data));
+  return buf;
+}
 
 // ============================================================================
 // Subgroup support detection for attention kernels
@@ -93,16 +138,7 @@ function flashAttentionForwardShader(headDim: number, useSubgroups: boolean): st
     return `
 enable subgroups;
 
-struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+${WGSL_FA_CONFIG}
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> K: array<f32>;
@@ -258,16 +294,7 @@ fn main(@builtin(local_invocation_index) tidx: u32,
 
   // Scalar (non-subgroup) path — original implementation
   return `
-struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+${WGSL_FA_CONFIG}
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> K: array<f32>;
@@ -436,16 +463,7 @@ function flashAttentionBackwardDShader(headDim: number): string {
   // Use headDim threads per workgroup for reduction
   const WG = Math.max(headDim, 32); // at least 32 for reduction
   return `
-struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+${WGSL_FA_CONFIG}
 
 @group(0) @binding(0) var<storage, read> dO: array<f32>;
 @group(0) @binding(1) var<storage, read> Out: array<f32>;
@@ -471,13 +489,25 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   // Compute base offset for this row
   let base = row_idx * D_dim;
 
-${wgslReduce({ wgSize: WG, tid: "tid", dim: "D_dim", loopVar: "d", op: "sum",
-  smem: "sdata", init: "0.0",
-  accumExpr: "dO[base + d] * Out[base + d]", result: "dot_val",
-})}
+  // Each thread accumulates partial dot product
+  var local_sum = 0.0f;
+  for (var d = tid; d < D_dim; d += ${WG}u) {
+    local_sum += dO[base + d] * Out[base + d];
+  }
+
+  sdata[tid] = local_sum;
+  workgroupBarrier();
+
+  // Tree reduction
+  for (var s = ${WG / 2}u; s > 0u; s >>= 1u) {
+    if (tid < s) {
+      sdata[tid] += sdata[tid + s];
+    }
+    workgroupBarrier();
+  }
 
   if (tid == 0u) {
-    D[row_idx] = dot_val;
+    D[row_idx] = sdata[0];
   }
 }
 `;
@@ -505,16 +535,7 @@ function flashAttentionBackwardDQShader(headDim: number, useSubgroups: boolean):
     return `
 enable subgroups;
 
-struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+${WGSL_FA_CONFIG}
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> K: array<f32>;
@@ -647,16 +668,7 @@ fn main(@builtin(local_invocation_index) tidx: u32,
 
   // Scalar (non-subgroup) path
   return `
-struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+${WGSL_FA_CONFIG}
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> K: array<f32>;
@@ -805,16 +817,7 @@ function flashAttentionBackwardDKVShader(headDim: number, useSubgroups: boolean)
     return `
 enable subgroups;
 
-struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+${WGSL_FA_CONFIG}
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> K: array<f32>;
@@ -967,16 +970,7 @@ fn main(@builtin(local_invocation_index) tidx: u32,
 
   // Scalar (non-subgroup) path
   return `
-struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+${WGSL_FA_CONFIG}
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> K: array<f32>;
@@ -1136,42 +1130,30 @@ export function dispatchFlashAttentionForward(
   scale: number,
   isCausal: boolean,
 ): { outputBuffer: GPUBuffer; logsumexpBuffer: GPUBuffer } {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4; // f32
   const logsumexpSizeBytes = batchSize * numHeads * seqLen * 4; // f32
 
-  const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
-  const lseBuffer = allocateOutputBuffer(logsumexpSizeBytes) as unknown as GPUBuffer;
+  const outBuffer = allocateOutputBuffer(outputSizeBytes);
+  const lseBuffer = allocateOutputBuffer(logsumexpSizeBytes);
 
-  _configU32[0] = batchSize;
-  _configU32[1] = numHeads;
-  _configU32[2] = seqLen;
-  _configU32[3] = headDim;
-  _configF32[4] = scale;
-  _configU32[5] = isCausal ? 1 : 0;
-  _configU32[6] = 0;
-  _configU32[7] = 0;
-  const configBuf = kernel.getConfigBuffer(
-    device, `fa:${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${_configU32[5]}`, 32, _configU8,
+  const configBuf = getOrCreateConfigBuffer(
+    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
   );
 
   const sg = useSubgroupAttention(headDim);
-  const pipeline = kernel.getPipeline(
-    device,
+  const pipeline = getPipeline(
+    ctx,
     `faFwd:${headDim}${sg ? ":sg" : ""}`,
-    () => flashAttentionForwardShader(headDim, sg),
+    flashAttentionForwardShader(headDim, sg),
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer, configBuf]);
 
-  trackSharedEncoderWrite(qBuffer);
-  trackSharedEncoderWrite(kBuffer);
-  trackSharedEncoderWrite(vBuffer);
-  trackSharedEncoderWrite(outBuffer);
-  trackSharedEncoderWrite(lseBuffer);
+  trackBuffers(qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer);
 
   const numQBlocks = Math.ceil(seqLen / BR);
   dispatchComputePass(
@@ -1199,39 +1181,29 @@ export function dispatchFlashAttentionBackwardD(
   scale: number,
   isCausal: boolean,
 ): GPUBuffer {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const totalRows = batchSize * numHeads * seqLen;
   const outputSizeBytes = totalRows * 4; // f32
 
-  const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
+  const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
-  _configU32[0] = batchSize;
-  _configU32[1] = numHeads;
-  _configU32[2] = seqLen;
-  _configU32[3] = headDim;
-  _configF32[4] = scale;
-  _configU32[5] = isCausal ? 1 : 0;
-  _configU32[6] = 0;
-  _configU32[7] = 0;
-  const configBuf = kernel.getConfigBuffer(
-    device, `fa:${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${_configU32[5]}`, 32, _configU8,
+  const configBuf = getOrCreateConfigBuffer(
+    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
   );
 
   const WG = Math.max(headDim, 32);
-  const pipeline = kernel.getPipeline(
-    device,
+  const pipeline = getPipeline(
+    ctx,
     `faBwdD:${headDim}`,
-    () => flashAttentionBackwardDShader(headDim),
+    flashAttentionBackwardDShader(headDim),
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [dOBuffer, oBuffer, outBuffer, configBuf]);
 
-  trackSharedEncoderWrite(dOBuffer);
-  trackSharedEncoderWrite(oBuffer);
-  trackSharedEncoderWrite(outBuffer);
+  trackBuffers(dOBuffer, oBuffer, outBuffer);
 
   dispatchComputePass(
     pipeline,
@@ -1260,42 +1232,28 @@ export function dispatchFlashAttentionBackwardDQ(
   scale: number,
   isCausal: boolean,
 ): GPUBuffer {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4;
 
-  const outBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
+  const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
-  _configU32[0] = batchSize;
-  _configU32[1] = numHeads;
-  _configU32[2] = seqLen;
-  _configU32[3] = headDim;
-  _configF32[4] = scale;
-  _configU32[5] = isCausal ? 1 : 0;
-  _configU32[6] = 0;
-  _configU32[7] = 0;
-  const configBuf = kernel.getConfigBuffer(
-    device, `fa:${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${_configU32[5]}`, 32, _configU8,
+  const configBuf = getOrCreateConfigBuffer(
+    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
   );
 
   const sg = useSubgroupAttention(headDim);
-  const pipeline = kernel.getPipeline(
-    device,
+  const pipeline = getPipeline(
+    ctx,
     `faBwdDQ:${headDim}${sg ? ":sg" : ""}`,
-    () => flashAttentionBackwardDQShader(headDim, sg),
+    flashAttentionBackwardDQShader(headDim, sg),
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer, configBuf]);
 
-  trackSharedEncoderWrite(qBuffer);
-  trackSharedEncoderWrite(kBuffer);
-  trackSharedEncoderWrite(vBuffer);
-  trackSharedEncoderWrite(lBuffer);
-  trackSharedEncoderWrite(dBuffer);
-  trackSharedEncoderWrite(dOBuffer);
-  trackSharedEncoderWrite(outBuffer);
+  trackBuffers(qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer);
 
   const numQBlocks = Math.ceil(seqLen / BR);
   dispatchComputePass(
@@ -1317,7 +1275,7 @@ export function dispatchFlashAttentionBackwardDQ(
  * Reset all module-local mutable state (pipeline cache, config buffer cache).
  */
 export function resetAttentionKernelState(): void {
-  kernel.reset();
+  configCache.clear();
 }
 
 export function dispatchFlashAttentionBackwardDKV(
@@ -1334,45 +1292,30 @@ export function dispatchFlashAttentionBackwardDKV(
   scale: number,
   isCausal: boolean,
 ): { dKBuffer: GPUBuffer; dVBuffer: GPUBuffer } {
-  const ctx = getWebGPUDevice()!;
+  const ctx = requireContext();
   const device = ctx.device;
 
   const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4;
 
-  const dKBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
-  const dVBuffer = allocateOutputBuffer(outputSizeBytes) as unknown as GPUBuffer;
+  const dKBuffer = allocateOutputBuffer(outputSizeBytes);
+  const dVBuffer = allocateOutputBuffer(outputSizeBytes);
 
-  _configU32[0] = batchSize;
-  _configU32[1] = numHeads;
-  _configU32[2] = seqLen;
-  _configU32[3] = headDim;
-  _configF32[4] = scale;
-  _configU32[5] = isCausal ? 1 : 0;
-  _configU32[6] = 0;
-  _configU32[7] = 0;
-  const configBuf = kernel.getConfigBuffer(
-    device, `fa:${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${_configU32[5]}`, 32, _configU8,
+  const configBuf = getOrCreateConfigBuffer(
+    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
   );
 
   const BC_BW = 64;
   const sg = useSubgroupAttention(headDim);
-  const pipeline = kernel.getPipeline(
-    device,
+  const pipeline = getPipeline(
+    ctx,
     `faBwdDKV:${headDim}${sg ? ":sg" : ""}`,
-    () => flashAttentionBackwardDKVShader(headDim, sg),
+    flashAttentionBackwardDKVShader(headDim, sg),
   );
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer, configBuf]);
 
-  trackSharedEncoderWrite(qBuffer);
-  trackSharedEncoderWrite(kBuffer);
-  trackSharedEncoderWrite(vBuffer);
-  trackSharedEncoderWrite(lBuffer);
-  trackSharedEncoderWrite(dBuffer);
-  trackSharedEncoderWrite(dOBuffer);
-  trackSharedEncoderWrite(dKBuffer);
-  trackSharedEncoderWrite(dVBuffer);
+  trackBuffers(qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer);
 
   const numKVBlocks = Math.ceil(seqLen / BC_BW);
   dispatchComputePass(

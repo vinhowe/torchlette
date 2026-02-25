@@ -17,12 +17,13 @@
 
 import {
   dispatchComputePass,
-  getWebGPUDevice,
   trackSharedEncoderWrite,
   cachedCreateBindGroup,
+  getPipeline,
 } from "./index";
+import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
-import { defineKernel } from "./kernel-factory";
+import { GPUBufferUsage } from "./gpu-types";
 import { compileTileKernel } from "./tile-compiler";
 import type { TileKernelSpec, UniformType } from "./tile-ir";
 
@@ -107,7 +108,8 @@ export interface TileKernelInstance {
  * Each dispatch call updates config data and encodes on the shared encoder.
  */
 export function createTileKernelDispatcher(spec: TileKernelSpec): TileKernelInstance {
-  const kernel = defineKernel(spec.name);
+  // Inline pipeline + config buffer caching (replaces defineKernel)
+  const configCache = new Map<string, GPUBuffer>();
 
   // Compile WGSL once (the spec is static)
   let cachedWGSL: string | null = null;
@@ -118,18 +120,31 @@ export function createTileKernelDispatcher(spec: TileKernelSpec): TileKernelInst
     return cachedWGSL;
   }
 
+  function getConfigBuffer(device: GPUDevice, key: string, sizeBytes: number, data: ArrayBufferView): GPUBuffer {
+    let buf = configCache.get(key);
+    if (!buf) {
+      buf = device.createBuffer({
+        size: sizeBytes,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      configCache.set(key, buf);
+    }
+    device.queue.writeBuffer(buf, 0, data);
+    return buf;
+  }
+
   return {
     dispatch(buffers: Record<string, GPUBuffer>, uniforms: Record<string, number>): void {
-      const ctx = getWebGPUDevice()!;
+      const ctx = requireContext();
       const device = ctx.device;
 
-      // Pipeline (cached by kernel factory)
-      const pipeline = kernel.getPipeline(device, spec.name, getWGSL);
+      // Pipeline (cached via context.pipelines)
+      const pipeline = getPipeline(ctx, spec.name, getWGSL());
 
       // Config uniform buffer
       const configKey = uniformCacheKey(spec, uniforms);
       const { data, sizeBytes } = packUniforms(spec, uniforms);
-      const configBuf = kernel.getConfigBuffer(device, configKey, sizeBytes, data);
+      const configBuf = getConfigBuffer(device, configKey, sizeBytes, data);
 
       // Build buffer array in binding order + config at end
       const bindingNames = Object.keys(spec.bindings);
@@ -161,7 +176,7 @@ export function createTileKernelDispatcher(spec: TileKernelSpec): TileKernelInst
     getWGSL,
 
     reset(): void {
-      kernel.reset();
+      configCache.clear();
       cachedWGSL = null;
     },
   };

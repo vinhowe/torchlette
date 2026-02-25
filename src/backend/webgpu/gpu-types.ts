@@ -27,7 +27,7 @@ type GPUComputePass = {
 };
 
 export type GPUCommandEncoder = {
-  beginComputePass(descriptor?: any): GPUComputePass;
+  beginComputePass(descriptor?: { label?: string; timestampWrites?: unknown }): GPUComputePass;
   copyBufferToBuffer(
     source: GPUBuffer,
     sourceOffset: number,
@@ -47,6 +47,17 @@ export type GPUQueue = {
   writeBuffer(buffer: GPUBuffer, offset: number, data: ArrayBufferView): void;
 };
 
+export type GPUDeviceLimits = {
+  maxComputeWorkgroupSizeX?: number;
+  maxComputeWorkgroupSizeY?: number;
+  maxComputeWorkgroupsPerDimension?: number;
+  maxStorageBufferBindingSize?: number;
+  maxStorageBuffersPerShaderStage?: number;
+  maxComputeInvocationsPerWorkgroup?: number;
+  maxComputeWorkgroupStorageSize?: number;
+  [key: string]: number | undefined;
+};
+
 export type GPUDevice = {
   createBindGroup(descriptor: {
     layout: unknown;
@@ -64,11 +75,13 @@ export type GPUDevice = {
   }): GPUComputePipeline;
   createShaderModule(descriptor: { code: string }): unknown;
   queue: GPUQueue;
+  limits: GPUDeviceLimits;
 };
 
 export type GPUAdapterLimits = {
   maxStorageBufferBindingSize?: number;
   maxStorageBuffersPerShaderStage?: number;
+  maxBufferSize?: number;
 };
 
 export type GPUAdapter = {
@@ -129,14 +142,14 @@ export type WebGPUContext = {
   f16Supported: boolean;
 };
 
-/** Extract the GPUBuffer from a generic BackendTensor (must be a WebGPUTensor). */
-export function gpuBuffer(tensor: BackendTensor): GPUBuffer {
-  return (tensor as unknown as WebGPUTensor).buffer;
-}
-
 /** Narrow a generic BackendTensor to WebGPUTensor for typed property access. */
 export function asGPUTensor(tensor: BackendTensor): WebGPUTensor {
   return tensor as unknown as WebGPUTensor;
+}
+
+/** Extract the GPUBuffer from a generic BackendTensor (must be a WebGPUTensor). */
+export function gpuBuffer(tensor: BackendTensor): GPUBuffer {
+  return asGPUTensor(tensor).buffer;
 }
 
 /** Legacy matmul constants (kept for reference, now using tiled matmul) */

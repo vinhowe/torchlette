@@ -28,7 +28,7 @@ export abstract class Module {
    */
   registerBuffer(name: string, tensor: Tensor): void {
     this._buffers.set(name, tensor);
-    (this as any)[name] = tensor;
+    (this as unknown as Record<string, Tensor>)[name] = tensor;
   }
 
   /**

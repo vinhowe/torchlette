@@ -3,11 +3,12 @@ import { describe, expect, it } from "vitest";
 import {
   computeContiguousStrides,
   checkContiguous,
-  shapeSize,
   transposeStrides,
   transposeShape,
   type ViewMeta,
 } from "../src/backend/types";
+
+import { sizeOf } from "../src/core/shape";
 
 import {
   Tensor,
@@ -65,21 +66,21 @@ describe("ViewMeta utilities (§4.2-4.4)", () => {
     });
   });
 
-  describe("shapeSize", () => {
+  describe("sizeOf", () => {
     it("computes size of 1D tensor", () => {
-      expect(shapeSize([10])).toBe(10);
+      expect(sizeOf([10])).toBe(10);
     });
 
     it("computes size of 2D tensor", () => {
-      expect(shapeSize([3, 4])).toBe(12);
+      expect(sizeOf([3, 4])).toBe(12);
     });
 
     it("computes size of 3D tensor", () => {
-      expect(shapeSize([2, 3, 4])).toBe(24);
+      expect(sizeOf([2, 3, 4])).toBe(24);
     });
 
     it("returns 1 for scalar", () => {
-      expect(shapeSize([])).toBe(1);
+      expect(sizeOf([])).toBe(1);
     });
   });
 

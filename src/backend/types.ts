@@ -4,6 +4,8 @@ export type DeviceKind = "cpu" | "webgpu" | "mock";
 
 export type BackendTensor = {
   shape: Shape;
+  /** Element data type. Both CPU and WebGPU backends always set this. */
+  dtype?: DType;
   toArray(): number[];
   /** Optional cleanup method to release GPU resources */
   destroy?(): void;
@@ -65,11 +67,10 @@ export function checkContiguous(shape: number[], strides: number[]): boolean {
 }
 
 /**
- * Compute the total number of elements from a shape.
+ * Normalize a possibly-negative dimension index to a non-negative one.
  */
-export function shapeSize(shape: number[]): number {
-  if (shape.length === 0) return 1;
-  return shape.reduce((a, b) => a * b, 1);
+export function normalizeDim(d: number, rank: number): number {
+  return d < 0 ? d + rank : d;
 }
 
 /**
