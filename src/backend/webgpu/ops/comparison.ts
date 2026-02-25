@@ -17,6 +17,7 @@ import {
   buildBroadcastIndexing,
   compute2DDispatch,
   WORKGROUP_SIZE,
+  F32_BYTES,
 } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchElementwise, dispatchComputePass, getPipeline } from "../dispatch";
@@ -89,7 +90,7 @@ ${indexing.offsets.join("\n")}
   const outBuffer = dispatchElementwise({
     key, shader: code,
     inputs: [aTensor.buffer, bTensor.buffer],
-    outputSizeBytes: outSize * 4,
+    outputSizeBytes: outSize * F32_BYTES,
     params: params1(outSize),
     outBuffer: options?.outBuffer,
     dispatchX: dispatch.x, dispatchY: dispatch.y,
@@ -190,7 +191,7 @@ function argReduceOp(
 
   const outSize = outShape.reduce((acc, d) => acc * d, 1) || 1;
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: outSize * F32_BYTES,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 

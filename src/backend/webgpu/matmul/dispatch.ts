@@ -3,6 +3,7 @@
  */
 
 import { dispatchComputePass, getCurrentOpLabel, createParamsBuffer as sharedCreateParamsBuffer, releaseParamsBuffer, cachedCreateBindGroup, type RecordedDispatch } from "../index";
+import { F32_BYTES } from "../shape-utils";
 
 /** Module-level recording buffer (shared with index.ts recording system). */
 let matmulRecordingBuffer: RecordedDispatch[] | null = null;
@@ -288,9 +289,9 @@ async function autotuneIfNeeded(
     }
 
     // Create test buffers (reused across all candidates)
-    const aSize = m * k * 4;
-    const bSize = k * n * 4;
-    const outSize = m * n * 4;
+    const aSize = m * k * F32_BYTES;
+    const bSize = k * n * F32_BYTES;
+    const outSize = m * n * F32_BYTES;
     const aBuffer = device.createBuffer({ size: aSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const bBuffer = device.createBuffer({ size: bSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const outBuffer = device.createBuffer({ size: outSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
@@ -319,7 +320,7 @@ async function autotuneIfNeeded(
     let kSplitTempBuffer: GPUBuffer | undefined;
     let reduceParamsBuffer: GPUBuffer | undefined;
     if (maxKSplitFactor >= 2) {
-      const tempBytes = maxKSplitFactor * totalElements * 4;
+      const tempBytes = maxKSplitFactor * totalElements * F32_BYTES;
       kSplitTempBuffer = device.createBuffer({ size: tempBytes, usage: GPUBufferUsage.STORAGE });
       const reduceParamsBuf = new ArrayBuffer(8);
       const reduceU32 = new Uint32Array(reduceParamsBuf);
@@ -759,7 +760,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
 
     // 1. K-split matmul: partials[P * M * N] in f32
     const totalElements = m * n;
-    const tempBytes = kSplitFactor * totalElements * 4; // always f32
+    const tempBytes = kSplitFactor * totalElements * F32_BYTES; // always f32
     const tempBuffer = getKSplitTempBuffer(device, tempBytes);
 
     const kSplitCodegenOptions: CodegenOptions = {

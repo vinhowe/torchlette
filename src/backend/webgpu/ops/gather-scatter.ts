@@ -7,7 +7,7 @@
 import type { BackendTensor, GatherOptions, ScatterAddOptions } from "../../types";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
 import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
-import { WORKGROUP_SIZE, compute2DDispatch, contiguousStrides, wgslArray } from "../shape-utils";
+import { WORKGROUP_SIZE, compute2DDispatch, contiguousStrides, wgslArray, DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE, F32_BYTES } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { createTensor, createTrackedBuffer } from "../tensor";
@@ -46,9 +46,9 @@ export function gather(
   }
 
   // Determine chunking
-  const inputSizeBytes = tensorA.size * 4;
+  const inputSizeBytes = tensorA.size * F32_BYTES;
   const deviceLimits = ctx.device.limits;
-  const maxBindingSize = deviceLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = deviceLimits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const chunked = inputSizeBytes > maxBindingSize;
 
   // Shared setup
@@ -133,7 +133,7 @@ ${shaderBody}
 
   // --- Direct path ---
   if (!chunked) {
-    const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensorA.buffer, tensorIndex.buffer]);
+    const outBuffer = resolveOutputBuffer(ctx.device, outSize * F32_BYTES, [tensorA.buffer, tensorIndex.buffer]);
     const uniformBuffer = createUniformBuffer(ctx.device, outSize);
     const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensorA.buffer, tensorIndex.buffer, outBuffer, uniformBuffer]);
     dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
@@ -148,7 +148,7 @@ ${shaderBody}
   const layout = computeDimChunkLayout(dimSize, elementsPerSlice, maxBindingSize, minAlignment);
 
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: outSize * F32_BYTES,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
@@ -198,9 +198,9 @@ export function scatterAdd(
   }
 
   // Determine chunking
-  const outputSizeBytes = tensorA.size * 4;
+  const outputSizeBytes = tensorA.size * F32_BYTES;
   const deviceLimits = ctx.device.limits;
-  const maxBindingSize = deviceLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = deviceLimits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const chunked = outputSizeBytes > maxBindingSize;
 
   // Shared setup
@@ -287,18 +287,18 @@ ${shaderBody}
   // Copy input to output (both paths need this)
   const outBuffer = chunked
     ? createTrackedBuffer(ctx.device, {
-        size: outSize * 4,
+        size: outSize * F32_BYTES,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
       })
-    : resolveOutputBuffer(ctx.device, outSize * 4, [tensorA.buffer, tensorIndex.buffer, tensorSrc.buffer]);
+    : resolveOutputBuffer(ctx.device, outSize * F32_BYTES, [tensorA.buffer, tensorIndex.buffer, tensorSrc.buffer]);
 
   {
     const enc = getSharedEncoderInstance();
     if (enc) {
-      enc.copyBufferToBuffer(tensorA.buffer, 0, outBuffer, 0, outSize * 4);
+      enc.copyBufferToBuffer(tensorA.buffer, 0, outBuffer, 0, outSize * F32_BYTES);
     } else {
       const cmdEnc = ctx.device.createCommandEncoder();
-      cmdEnc.copyBufferToBuffer(tensorA.buffer, 0, outBuffer, 0, outSize * 4);
+      cmdEnc.copyBufferToBuffer(tensorA.buffer, 0, outBuffer, 0, outSize * F32_BYTES);
       submitOrCollect(cmdEnc.finish());
     }
   }

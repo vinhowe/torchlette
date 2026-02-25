@@ -19,6 +19,12 @@ export const WORKGROUP_SIZE = 256;
 /** Maximum workgroups per dimension in WebGPU (per spec) */
 export const MAX_WORKGROUPS_PER_DIM = 65535;
 
+/** WebGPU spec default for maxStorageBufferBindingSize (128 MB). */
+export const DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE = 128 * 1024 * 1024;
+
+/** Bytes per f32 element. Use instead of magic `* 4` in buffer size calculations. */
+export const F32_BYTES = 4;
+
 /**
  * Greatest common divisor using Euclidean algorithm.
  * Used for buffer alignment calculations.

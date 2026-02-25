@@ -13,6 +13,7 @@ import {
   checkContiguousStrides,
   dtypeBytes,
   alignBufferSize,
+  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
 } from "./shape-utils";
 import { bufferPool } from "./buffer-pool";
 import { arenaBufferSet } from "./webgpu-state";
@@ -149,7 +150,7 @@ export function createTrackedBuffer(
     // so they can be reused from the pool after release.
     const pooledSize = getSizeForClass(getSizeClass(alignedSize));
     const limits = device.limits;
-    const maxBinding = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    const maxBinding = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
     actualSize = pooledSize <= maxBinding ? pooledSize : alignedSize;
   } else {
     actualSize = alignedSize;
@@ -219,7 +220,7 @@ export function createBufferWithData(
   // Cap at maxStorageBufferBindingSize to avoid oversized pooled buffers
   const rawPoolSize = getSizeForClass(getSizeClass(alignedSize));
   const devLimits = device.limits;
-  const maxBindingSizeForPool = devLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSizeForPool = devLimits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const poolSize = rawPoolSize <= maxBindingSizeForPool ? rawPoolSize : alignedSize;
 
   // Try to acquire from pool first (only if pool size is power-of-2, i.e. not capped)

@@ -12,6 +12,8 @@ import {
   alignBufferSize,
   compute2DDispatch,
   WORKGROUP_SIZE,
+  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
+  F32_BYTES,
 } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
@@ -189,7 +191,7 @@ export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
   const { normalizedDims, rank, outShape, outSize, reductionSize, outStrides,
     inputShapeArray, inputStridesArray, outShapeArray, outStridesArray,
     reduceDimsArray, inputToOutDimArray } = setup;
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * F32_BYTES, [tensor.buffer]);
 
   // Choose between parallel tree reduction (large reductionSize) and sequential (small)
   const useParallelReduction = reductionSize > 64;
@@ -417,7 +419,7 @@ export function sumDimWithPreamble(
     inputShapeArray, inputStridesArray, outShapeArray, outStridesArray,
     reduceDimsArray, inputToOutDimArray } = setup;
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: outSize * F32_BYTES,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
@@ -660,7 +662,7 @@ fn main(
   // For simplicity, do a two-pass reduction
   const numWorkgroups = Math.ceil(inputSize / WORKGROUP_SIZE);
   const intermediateBuffer = createTrackedBuffer(ctx.device, {
-    size: Math.max(numWorkgroups * 4, 4),
+    size: Math.max(numWorkgroups * F32_BYTES, F32_BYTES),
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
@@ -684,7 +686,7 @@ fn main(
 
   // Read back intermediate results and sum on CPU (for small number of workgroups)
   const readBuffer = createTrackedBuffer(ctx.device, {
-    size: numWorkgroups * 4,
+    size: numWorkgroups * F32_BYTES,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
   });
 
@@ -693,7 +695,7 @@ fn main(
     0,
     readBuffer,
     0,
-    numWorkgroups * 4,
+    numWorkgroups * F32_BYTES,
   );
   profileApiCall("queue.submit", () => ctx.queue.submit([encoder.finish()]));
   incrementSubmitCount();
@@ -707,8 +709,8 @@ fn main(
   readBuffer.unmap();
 
   // Destroy temporary buffers to prevent memory leaks
-  bufferPool.deferredDestroy(intermediateBuffer, intermediateBuffer.size ?? numWorkgroups * 4);
-  bufferPool.deferredDestroy(readBuffer, readBuffer.size ?? numWorkgroups * 4);
+  bufferPool.deferredDestroy(intermediateBuffer, intermediateBuffer.size ?? numWorkgroups * F32_BYTES);
+  bufferPool.deferredDestroy(readBuffer, readBuffer.size ?? numWorkgroups * F32_BYTES);
   releaseUniformBuffer(uniformBuffer);
 
   return total;
@@ -727,7 +729,7 @@ function sumFullReduction(
 
   // Check if input buffer exceeds max binding size
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const inputBufferSize = tensor.buffer.size;
 
   if (inputBufferSize > maxBindingSize || inputSize * bytesPerElement > maxBindingSize) {
@@ -791,7 +793,7 @@ function sumFullReductionChunked(
 
   // Create buffer for partial sums (one f32 per chunk)
   const partialsBuffer = createTrackedBuffer(ctx.device, {
-    size: alignBufferSize(numChunks * 4),
+    size: alignBufferSize(numChunks * F32_BYTES),
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
@@ -879,7 +881,7 @@ fn main() {
   releaseUniformBuffer(finalParams);
 
   // Destroy the intermediate partials buffer — it's been consumed by the final reduction
-  bufferPool.deferredDestroy(partialsBuffer, alignBufferSize(numChunks * 4));
+  bufferPool.deferredDestroy(partialsBuffer, alignBufferSize(numChunks * F32_BYTES));
 
   return createTensor([], outBuffer);
 }
@@ -960,7 +962,7 @@ export function max(a: BackendTensor, options?: MaxOptions): BackendTensor {
   const { normalizedDims, rank, outShape, outSize, reductionSize, outStrides,
     inputShapeArray, inputStridesArray, outShapeArray, outStridesArray,
     reduceDimsArray, inputToOutDimArray } = setup;
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * F32_BYTES, [tensor.buffer]);
 
   const maxTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
   const maxDispatch = compute2DDispatch(maxTotalWG);
@@ -1120,7 +1122,7 @@ export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
   const ctx = requireContext();
   const outSize = sumTensor.size;
 
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [sumTensor.buffer]);
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * F32_BYTES, [sumTensor.buffer]);
 
   const meanTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
   const meanDispatch = compute2DDispatch(meanTotalWG);

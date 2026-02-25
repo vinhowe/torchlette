@@ -2,6 +2,8 @@
  * Matmul kernel configuration and types for WebGPU tiled matrix multiplication.
  */
 
+import { F32_BYTES } from "../shape-utils";
+
 export type DType = "f16" | "f32";
 
 /**
@@ -249,7 +251,7 @@ export function validateConfig(config: MatmulKernelConfig): void {
   // Shared memory size check (rough estimate)
   // Each tile uses tileM * tileK + tileK * tileN floats
   const sharedMemFloats = tileM * tileK + tileK * tileN;
-  const sharedMemBytes = sharedMemFloats * 4;
+  const sharedMemBytes = sharedMemFloats * F32_BYTES;
   // WebGPU limit is typically 16KB for workgroup memory
   if (sharedMemBytes > 16384) {
     throw new Error(

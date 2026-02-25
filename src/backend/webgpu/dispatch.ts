@@ -19,6 +19,8 @@ import {
   compute2DDispatch,
   WORKGROUP_SIZE,
   MAX_WORKGROUPS_PER_DIM,
+  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
+  F32_BYTES,
 } from "./shape-utils";
 import type { BackendTensor, DType } from "../types";
 import type { GPUBuffer, GPUComputePipeline, GPUBindGroup, WebGPUContext, WebGPUTensor } from "./gpu-types";
@@ -471,7 +473,7 @@ export function dispatchBinary(
 
   // Check if any buffer exceeds max binding size
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const bytesPerElement = dtypeBytes(dtype);
 
   const aSizeBytes = a.size * bytesPerElement;
@@ -580,7 +582,7 @@ export function dispatchBinaryChunked(
   const bytesPerElement = dtypeBytes(dtype);
 
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   const outShape = broadcastShapes(a.shape, b.shape);
@@ -655,7 +657,7 @@ export function dispatchUnary(
 
   // Check if chunking is needed for large contiguous tensors
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const aSizeBytes = a.size * bytesPerElement;
 
   if (aSizeBytes > maxBindingSize && a.isContiguous) {
@@ -714,7 +716,7 @@ export function dispatchUnaryChunked(
   const bytesPerElement = dtypeBytes(dtype);
 
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   const outSize = a.size;
@@ -1106,7 +1108,7 @@ export function runFusedElementwise(
   const code = buildFusedElementwiseShader(graph, recipe, use2D, shaderGridSizeX);
   const pipeline = getPipeline(ctx, `fused:${code}`, code);
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: size * 4,
+    size: size * F32_BYTES,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
   const params = createUniformBuffer(ctx.device, size);
