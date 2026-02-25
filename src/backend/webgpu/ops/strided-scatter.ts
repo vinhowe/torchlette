@@ -5,7 +5,7 @@
 import type { BackendTensor } from "../../types";
 import type { GPUDevice, WebGPUTensor } from "../gpu-types";
 import { asGPUTensor } from "../gpu-types";
-import { sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch } from "../shape-utils";
+import { sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch, DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE, F32_BYTES } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { createTensor } from "../tensor";
@@ -106,11 +106,11 @@ export function stridedScatterCopy(
 
   const ctx = requireContext();
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
 
   // Check if any buffer exceeds max binding size
-  const baseSizeBytes = baseSize * 4;
-  const srcSizeBytes = srcTensor.size * 4;
+  const baseSizeBytes = baseSize * F32_BYTES;
+  const srcSizeBytes = srcTensor.size * F32_BYTES;
 
   if (baseSizeBytes > maxBindingSize || srcSizeBytes > maxBindingSize) {
     // Check for simple full copy: viewSize == baseSize, offset == 0, both contiguous
@@ -205,7 +205,7 @@ function stridedScatterCopyDirect(
 
   const outBuffer = resolveOutputBuffer(
     ctx.device,
-    baseSize * 4,
+    baseSize * F32_BYTES,
     [contiguousBase.buffer, srcTensor.buffer],
   );
 
@@ -219,7 +219,7 @@ function stridedScatterCopyDirect(
 
   if (contiguousBase !== baseTensor) {
     bufferPool.decRef(contiguousBase.buffer);
-    bufferPool.deferredDestroy(contiguousBase.buffer, contiguousBase.size * 4);
+    bufferPool.deferredDestroy(contiguousBase.buffer, contiguousBase.size * F32_BYTES);
   }
 
   return createTensor(baseTensor.shape, outBuffer);
@@ -383,11 +383,11 @@ export function stridedScatterAdd(
 
   const ctx = requireContext();
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
 
   // Check if any buffer exceeds max binding size
-  const baseSizeBytes = baseSize * 4;
-  const srcSizeBytes = srcTensor.size * 4;
+  const baseSizeBytes = baseSize * F32_BYTES;
+  const srcSizeBytes = srcTensor.size * F32_BYTES;
 
   if (baseSizeBytes > maxBindingSize || srcSizeBytes > maxBindingSize) {
     // Check for simple full add: viewSize == baseSize, offset == 0, both contiguous
@@ -479,7 +479,7 @@ function stridedScatterAddDirect(
 
   const outBuffer = resolveOutputBuffer(
     ctx.device,
-    baseSize * 4,
+    baseSize * F32_BYTES,
     [contiguousBase.buffer, srcTensor.buffer],
   );
 
@@ -493,7 +493,7 @@ function stridedScatterAddDirect(
 
   if (contiguousBase !== baseTensor) {
     bufferPool.decRef(contiguousBase.buffer);
-    bufferPool.deferredDestroy(contiguousBase.buffer, contiguousBase.size * 4);
+    bufferPool.deferredDestroy(contiguousBase.buffer, contiguousBase.size * F32_BYTES);
   }
 
   return createTensor(baseTensor.shape, outBuffer);

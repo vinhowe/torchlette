@@ -6,7 +6,7 @@
 import type { BackendTensor } from "../../types";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
 import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
-import { WORKGROUP_SIZE, compute2DDispatch, dtypeBytes, broadcastShapes, gcd } from "../shape-utils";
+import { WORKGROUP_SIZE, compute2DDispatch, dtypeBytes, broadcastShapes, gcd, DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE, F32_BYTES } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchComputePass, dispatchMatmul, getPipeline } from "../dispatch";
 import { createTensor, createTrackedBuffer } from "../tensor";
@@ -35,7 +35,7 @@ export function matmul(
   const b = asGPUTensor(_b);
 
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
 
   // Check if B matrix exceeds max buffer binding size
   const bSizeBytes = b.size * dtypeBytes(b.dtype);
@@ -85,15 +85,15 @@ function sliceColumns(
   const outSize = K * sliceWidth;
 
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   // Check if input exceeds binding limit
-  const inputSizeBytes = input.size * 4;
+  const inputSizeBytes = input.size * F32_BYTES;
   const needsChunking = inputSizeBytes > maxBindingSize;
 
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: outSize * F32_BYTES,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
@@ -148,7 +148,7 @@ function sliceColumns(
     releaseParamsBuffer(paramsBuffer);
   } else {
     // Chunked path: process rows in chunks that fit in binding limit
-    const bytesPerRow = N * 4;
+    const bytesPerRow = N * F32_BYTES;
 
     // Calculate how many rows must group together for aligned offsets
     // We need rowStart * bytesPerRow to be divisible by minAlignment
@@ -219,7 +219,7 @@ function scatterColumnsToOutput(
   const totalRows = partial.size / sliceWidth; // M (could be M*batch for batched)
 
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   // Check if output buffer exceeds limit
@@ -284,8 +284,8 @@ function scatterColumnsToOutput(
     // Chunked path: process rows in chunks
     // Output row size in bytes = N * 4
     // Input row size in bytes = sliceWidth * 4
-    const outputBytesPerRow = N * 4;
-    const inputBytesPerRow = sliceWidth * 4;
+    const outputBytesPerRow = N * F32_BYTES;
+    const inputBytesPerRow = sliceWidth * F32_BYTES;
 
     // Find row chunk size that fits both input and output in binding limit
     const maxOutputRows = Math.floor(maxBindingSize / outputBytesPerRow);
@@ -464,7 +464,7 @@ function matmulChunkedTransposed(
 
   // The underlying buffer is [N, K] = N rows of K elements each
   // Each buffer row corresponds to one logical column of B
-  const bytesPerBufferRow = K * 4;
+  const bytesPerBufferRow = K * F32_BYTES;
 
   // How many buffer rows fit in one binding?
   const maxBufferRowsPerChunk = Math.floor(maxBindingSize / bytesPerBufferRow);
@@ -494,8 +494,8 @@ function matmulChunkedTransposed(
     const chunkWidth = numBufferRows;
 
     // Create a view of the buffer chunk: [numBufferRows, K]
-    const byteOffset = (b.offset + bufferRowStart * K) * 4;
-    const chunkByteSize = numBufferRows * K * 4;
+    const byteOffset = (b.offset + bufferRowStart * K) * F32_BYTES;
+    const chunkByteSize = numBufferRows * K * F32_BYTES;
 
     // Create a temporary tensor that wraps just this chunk of the buffer
     // This is [chunkWidth, K] in buffer layout
@@ -535,7 +535,7 @@ function matmulChunkedTransposed(
   // Each partial is [batchSize * M, chunkWidth] and goes to columns [colStart, colEnd)
   const outSize = outShape.reduce((acc, d) => acc * d, 1);
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: outSize * F32_BYTES,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
@@ -580,8 +580,8 @@ function matmulChunkedContiguous(
   // For contiguous B [K, N], columns are NOT contiguous
   // We need to extract column slices to separate buffers
 
-  // Each column is K elements = K * 4 bytes
-  const bytesPerColumn = K * 4;
+  // Each column is K elements = K * F32_BYTES bytes
+  const bytesPerColumn = K * F32_BYTES;
   const maxColumnsPerChunk = Math.floor(maxBindingSize / bytesPerColumn);
 
   // Ensure alignment
@@ -621,7 +621,7 @@ function matmulChunkedContiguous(
   // Assemble final output
   const outSize = outShape.reduce((acc, d) => acc * d, 1);
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: outSize * F32_BYTES,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
@@ -675,11 +675,11 @@ function matmulChunkedOutput(
   // Calculate how many columns we can output per chunk
   // Each output column is batchSize * M elements
   const elementsPerColumn = batchSize * M;
-  const bytesPerColumn = elementsPerColumn * 4;
+  const bytesPerColumn = elementsPerColumn * F32_BYTES;
   const maxColumnsPerChunk = Math.floor(maxBindingSize / bytesPerColumn);
 
   // Ensure alignment for B slicing
-  const bBytesPerColumn = K * 4;
+  const bBytesPerColumn = K * F32_BYTES;
   const g_ = gcd(bBytesPerColumn, minAlignment);
   const colAlignment = Math.max(1, minAlignment / g_);
   const alignedColumnsPerChunk = Math.max(
@@ -692,7 +692,7 @@ function matmulChunkedOutput(
   // Create output buffer
   const outSize = outShape.reduce((acc, d) => acc * d, 1);
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: outSize * F32_BYTES,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
@@ -751,7 +751,7 @@ function sliceBColumns(
   const outSize = batch * K * chunkWidth;
 
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: outSize * F32_BYTES,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 

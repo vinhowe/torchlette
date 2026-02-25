@@ -5,7 +5,7 @@
 
 import type { WebGPUTensor } from "../gpu-types";
 import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
-import { sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch, dtypeBytes, alignBufferSize } from "../shape-utils";
+import { sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch, dtypeBytes, alignBufferSize, F32_BYTES } from "../shape-utils";
 import { requireContext, f32ArrayToF16Array } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { createTensor, createTrackedBuffer, createBufferWithData } from "../tensor";
@@ -90,7 +90,7 @@ export function zeros(shape: number[]): WebGPUTensor {
   if (numElements === 0) {
     throw new Error("webgpu tensors cannot be empty yet");
   }
-  const sizeBytes = numElements * 4; // f32
+  const sizeBytes = numElements * F32_BYTES;
   const alignedSize = alignBufferSize(sizeBytes);
   // Arena-aware output allocation for stable buffer identity across steps
   const buffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
@@ -127,7 +127,7 @@ export function full(shape: number[], fillValue: number): WebGPUTensor {
     return zeros(shape);
   }
 
-  const sizeBytes = numElements * 4; // f32
+  const sizeBytes = numElements * F32_BYTES;
   const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
   const { x: dispatchX, y: dispatchY, gridSizeX } = compute2DDispatch(totalWorkgroups);
 
@@ -193,7 +193,7 @@ export function arange(end: number, start = 0, step = 1): WebGPUTensor {
     throw new Error("webgpu tensors cannot be empty yet");
   }
 
-  const sizeBytes = numElements * 4; // f32
+  const sizeBytes = numElements * F32_BYTES;
   const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
   const { x: dispatchX, y: dispatchY, gridSizeX } = compute2DDispatch(totalWorkgroups);
 
@@ -287,7 +287,7 @@ function triangularOp(a: WebGPUTensor, k: number, upper: boolean): WebGPUTensor 
   const shader = triangularShader(gridSizeX, upper);
   const pipeline = getPipeline(ctx, shaderKey, shader);
 
-  const sizeBytes = numElements * 4;
+  const sizeBytes = numElements * F32_BYTES;
   const alignedSize = alignBufferSize(sizeBytes);
   const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
   const outBuffer = createTrackedBuffer(ctx.device, { size: alignedSize, usage });
@@ -444,7 +444,7 @@ export function rand(shape: number[], seed: number): WebGPUTensor {
   const numElements = sizeOf(shape);
   if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
 
-  const sizeBytes = numElements * 4;
+  const sizeBytes = numElements * F32_BYTES;
   const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
   const { x: dispatchX, y: dispatchY, gridSizeX } = compute2DDispatch(totalWorkgroups);
 
@@ -470,7 +470,7 @@ export function randn(shape: number[], seed: number): WebGPUTensor {
   const numElements = sizeOf(shape);
   if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
 
-  const sizeBytes = numElements * 4;
+  const sizeBytes = numElements * F32_BYTES;
   // randn processes pairs, so dispatch half the threads (rounded up)
   const numThreads = Math.ceil(numElements / 2);
   const totalWorkgroups = Math.ceil(numThreads / WORKGROUP_SIZE);
@@ -498,7 +498,7 @@ export function bernoulli(shape: number[], p: number, seed: number): WebGPUTenso
   const numElements = sizeOf(shape);
   if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
 
-  const sizeBytes = numElements * 4;
+  const sizeBytes = numElements * F32_BYTES;
   const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
   const { x: dispatchX, y: dispatchY, gridSizeX } = compute2DDispatch(totalWorkgroups);
 

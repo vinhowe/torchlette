@@ -20,7 +20,7 @@ import {
 import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
-import { WORKGROUP_SIZE } from "./shape-utils";
+import { WORKGROUP_SIZE, F32_BYTES } from "./shape-utils";
 import { wgslSumReduction, wgslDualSumReduction, trackBuffers } from "./wgsl-helpers";
 
 // Shared WGSL struct for LayerNorm config (16 bytes, 4 fields)
@@ -324,7 +324,7 @@ export function dispatchLayerNormForward(
   const ctx = requireContext();
   const device = ctx.device;
 
-  const outputSizeBytes = numRows * featureDim * 4; // f32
+  const outputSizeBytes = numRows * featureDim * F32_BYTES;
   const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
   const configBuf = getOrCreateConfigBuffer(device, numRows, featureDim, eps);
@@ -364,7 +364,7 @@ export function dispatchLayerNormBackwardGradX(
   const ctx = requireContext();
   const device = ctx.device;
 
-  const outputSizeBytes = numRows * featureDim * 4;
+  const outputSizeBytes = numRows * featureDim * F32_BYTES;
   const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
   const configBuf = getOrCreateConfigBuffer(device, numRows, featureDim, eps);
@@ -431,7 +431,7 @@ export function dispatchLayerNormBackwardGradWeightBias(
   );
 
   // Pass 2: Accumulate gradWeight/gradBias using precomputed stats
-  const featureSizeBytes = featureDim * 4;
+  const featureSizeBytes = featureDim * F32_BYTES;
   const gradWeightBuffer = allocateOutputBuffer(featureSizeBytes);
   const gradBiasBuffer = allocateOutputBuffer(featureSizeBytes);
 

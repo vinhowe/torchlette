@@ -12,6 +12,8 @@ import {
   computeEffectiveBroadcastStrides,
   buildBroadcastIndexing,
   WORKGROUP_SIZE,
+  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
+  F32_BYTES,
 } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchElementwise } from "../dispatch";
@@ -121,7 +123,7 @@ export function where(
   // Check if chunking is needed for large contiguous tensors
   const bytesPerElement = 4; // f32
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const outSizeBytes = outSize * bytesPerElement;
 
   // Use chunked dispatch when output exceeds binding limit and inputs are chunkable:
@@ -164,14 +166,14 @@ function whereDirect(
   );
   const key = `where:${indexShape.join("x")}:${condStrides.join(",")}:${xStrides.join(",")}:${yStrides.join(",")}:${condTensor.offset}:${xTensor.offset}:${yTensor.offset}`;
 
-  const providedOut = options?.outBuffer && options.outBuffer.size >= outSize * 4
+  const providedOut = options?.outBuffer && options.outBuffer.size >= outSize * F32_BYTES
     ? options.outBuffer
     : undefined;
 
   const outBuffer = dispatchElementwise({
     key, shader: code,
     inputs: [condTensor.buffer, xTensor.buffer, yTensor.buffer],
-    outputSizeBytes: outSize * 4,
+    outputSizeBytes: outSize * F32_BYTES,
     params: params1(outSize),
     outBuffer: providedOut,
     dispatchX: Math.ceil(outSize / WORKGROUP_SIZE),
@@ -196,7 +198,7 @@ function whereChunked(
   const bytesPerElement = 4; // f32
 
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   const layout = computeFlatChunkLayout(outSize, bytesPerElement, maxBindingSize, minAlignment);

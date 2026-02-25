@@ -16,6 +16,7 @@ import type {
   WebGPUTensor,
 } from "./gpu-types";
 import { gpuContext, setGpuContext, requireContext } from "./webgpu-state";
+import { DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE } from "./shape-utils";
 import { bufferPool } from "./buffer-pool";
 import { isProfilingEnabled, initGpuTimestamps } from "./profiler";
 import { setSubgroupSupport, type SubgroupSupport } from "./matmul";
@@ -306,7 +307,7 @@ async function requestDeviceWithFallback(
   subgroupSupport: SubgroupSupport,
 ): Promise<{ device: GPUDevice; actualF16Supported: boolean } | null> {
   const adapterMaxStorage =
-    adapter.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    adapter.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const adapterMaxBuffer =
     adapter.limits?.maxBufferSize ?? 256 * 1024 * 1024;
   const adapterMaxStorageBuffers =
@@ -497,5 +498,5 @@ export function getWebGPUDevice(): {
 export function getMaxStorageBufferBindingSize(): number {
   const ctx = requireContext();
   const limits = ctx.device.limits;
-  return limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  return limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
 }

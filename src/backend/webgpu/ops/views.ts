@@ -10,6 +10,7 @@ import {
   sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch,
   contiguousStrides, checkContiguousStrides, dtypeBytes, dtypeToWgsl,
   alignBufferSize, gcd, lcm,
+  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
 } from "../shape-utils";
 import { requireContext, isF16Supported, f16WeightCache, f32ArrayToF16Array, f16ArrayToF32Array, f16ToF32, f32ToF16 } from "../gpu-context";
 import { dispatchComputePass, dispatchElementwise, getPipeline } from "../dispatch";
@@ -174,7 +175,7 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
   const srcBytesPerElement = dtypeBytes(tensor.dtype);
   const dstBytesPerElement = dtypeBytes(dtype);
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const inputDataBytes = tensor.size * srcBytesPerElement;
   const outputDataBytes = tensor.size * dstBytesPerElement;
 
@@ -500,7 +501,7 @@ export function contiguous(a: BackendTensor): BackendTensor {
 
   // Check if input buffer exceeds max binding size
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   // Get actual buffer size (the backing storage might be larger than the view)
