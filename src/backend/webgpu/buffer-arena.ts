@@ -112,7 +112,7 @@ export function donateBuffer(
 
   // Transfer ownership: decRef for this tensor, prevent closure from releasing
   bufferPool.decRef(t.buffer);
-  (t as { ownsBuffer: boolean }).ownsBuffer = false;
+  t.ownsBuffer = false;
   t.destroy = () => {}; // Prevent closure from firing (closure captures old ownsBuffer=true)
 
   return t.buffer as GPUBuffer;

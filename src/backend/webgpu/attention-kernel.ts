@@ -18,7 +18,6 @@
 
 import {
   dispatchComputePass,
-  trackSharedEncoderWrite,
   allocateOutputBuffer,
   cachedCreateBindGroup,
   getPipeline,
@@ -28,11 +27,7 @@ import { requireContext } from "./webgpu-state";
 import { getSubgroupSupport } from "./matmul/types";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
-
-/** Track multiple buffers in the shared encoder write set. */
-function trackBuffers(...buffers: GPUBuffer[]): void {
-  for (const buf of buffers) trackSharedEncoderWrite(buf);
-}
+import { wgslSumReduction, trackBuffers } from "./wgsl-helpers";
 
 // Tiling parameters
 const BR = 64;  // Q rows per workgroup (also workgroup size in scalar mode)
@@ -499,12 +494,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
   workgroupBarrier();
 
   // Tree reduction
-  for (var s = ${WG / 2}u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      sdata[tid] += sdata[tid + s];
-    }
-    workgroupBarrier();
-  }
+  ${wgslSumReduction("sdata", WG / 2)}
 
   if (tid == 0u) {
     D[row_idx] = sdata[0];
