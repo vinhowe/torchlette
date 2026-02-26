@@ -148,36 +148,6 @@ const USE_TILE_IR_CROSSENTROPY = process.env.TORCHLETTE_TILE_CROSSENTROPY !== "0
 
 const WG = WORKGROUP_SIZE; // 256
 
-/** Emit tree max reduction: sdata[0] = max(sdata[0..wgSize-1]) */
-function emitTreeMaxReduction(
-  ctx: Parameters<TileKernelSpec["kernel"]>[0],
-  smem: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["sharedArray"]>,
-  tid: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["u32"]>,
-  wgSize: number,
-): void {
-  for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
-    ctx.ifThen(tid.lt(ctx.u32(stride)), () => {
-      smem.write(tid, smem.read(tid).max(smem.read(tid.add(ctx.u32(stride)))));
-    });
-    ctx.barrier();
-  }
-}
-
-/** Emit tree sum reduction: sdata[0] = sum(sdata[0..wgSize-1]) */
-function emitTreeSumReductionCE(
-  ctx: Parameters<TileKernelSpec["kernel"]>[0],
-  smem: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["sharedArray"]>,
-  tid: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["u32"]>,
-  wgSize: number,
-): void {
-  for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
-    ctx.ifThen(tid.lt(ctx.u32(stride)), () => {
-      smem.write(tid, smem.read(tid).add(smem.read(tid.add(ctx.u32(stride)))));
-    });
-    ctx.barrier();
-  }
-}
-
 /**
  * Cross-entropy forward kernel (tile-IR).
  * One workgroup per batch row: max reduction, sum-exp reduction, thread 0 writes loss.
@@ -202,36 +172,16 @@ const crossEntropyForwardSpec: TileKernelSpec = {
     const V = ctx.uniform("vocab_size");
     const base = row.mul(V);
 
-    const sdata = ctx.sharedArray("sdata", WG, "f32");
+    // Parallel max reduction
+    const rowMax = ctx.emitLet("row_max",
+      ctx.wgReduce("max", tid, V, WG, (i) => ctx.load("logits", base.add(i))));
 
-    // Phase 1: Parallel max reduction
-    const localMax = ctx.emitVar("local_max", "f32", ctx.f32(-3.402823e+38));
-    const maxIters = V.add(ctx.u32(WG - 1)).div(ctx.u32(WG));
-    ctx.forRange(ctx.u32(0), maxIters, (iter) => {
-      const i = tid.add(iter.mul(ctx.u32(WG)));
-      ctx.ifThen(i.lt(V), () => {
-        localMax.set(localMax.get().max(ctx.load("logits", base.add(i))));
-      });
-    });
-    sdata.write(tid, localMax.get());
-    ctx.barrier();
-    emitTreeMaxReduction(ctx, sdata, tid, WG);
-    const rowMax = ctx.emitLet("row_max", sdata.read(ctx.u32(0)));
+    // Parallel sum-exp reduction
+    const logSumExp = ctx.emitLet("log_sum_exp",
+      ctx.wgReduce("sum", tid, V, WG,
+        (i) => ctx.load("logits", base.add(i)).sub(rowMax).exp()).log());
 
-    // Phase 2: Parallel sum-exp reduction
-    const localSum = ctx.emitVar("local_sum", "f32", ctx.f32(0.0));
-    ctx.forRange(ctx.u32(0), maxIters, (iter) => {
-      const i = tid.add(iter.mul(ctx.u32(WG)));
-      ctx.ifThen(i.lt(V), () => {
-        localSum.addAssign(ctx.load("logits", base.add(i)).sub(rowMax).exp());
-      });
-    });
-    sdata.write(tid, localSum.get());
-    ctx.barrier();
-    emitTreeSumReductionCE(ctx, sdata, tid, WG);
-    const logSumExp = ctx.emitLet("log_sum_exp", sdata.read(ctx.u32(0)).log());
-
-    // Phase 3: Output (thread 0 only)
+    // Output (thread 0 only)
     const t = ctx.emitLet("t", ctx.load("targets", row).toU32());
     ctx.guardedStore("loss", tid.eq(ctx.u32(0)), row,
       ctx.load("logits", base.add(t)).sub(rowMax).sub(logSumExp).neg());
@@ -263,43 +213,22 @@ const crossEntropyBackwardSpec: TileKernelSpec = {
     const V = ctx.uniform("vocab_size");
     const base = row.mul(V);
 
-    const sdata = ctx.sharedArray("sdata", WG, "f32");
+    // Parallel max reduction
+    const rowMax = ctx.emitLet("row_max",
+      ctx.wgReduce("max", tid, V, WG, (i) => ctx.load("logits", base.add(i))));
 
-    // Phase 1: Parallel max reduction
-    const localMax = ctx.emitVar("local_max", "f32", ctx.f32(-3.402823e+38));
-    const maxIters = V.add(ctx.u32(WG - 1)).div(ctx.u32(WG));
-    ctx.forRange(ctx.u32(0), maxIters, (iter) => {
-      const i = tid.add(iter.mul(ctx.u32(WG)));
-      ctx.ifThen(i.lt(V), () => {
-        localMax.set(localMax.get().max(ctx.load("logits", base.add(i))));
-      });
-    });
-    sdata.write(tid, localMax.get());
-    ctx.barrier();
-    emitTreeMaxReduction(ctx, sdata, tid, WG);
-    const rowMax = ctx.emitLet("row_max", sdata.read(ctx.u32(0)));
+    // Parallel sum-exp reduction
+    const logSumExp = ctx.emitLet("log_sum_exp",
+      ctx.wgReduce("sum", tid, V, WG,
+        (i) => ctx.load("logits", base.add(i)).sub(rowMax).exp()).log());
 
-    // Phase 2: Parallel sum-exp reduction
-    const localSum = ctx.emitVar("local_sum", "f32", ctx.f32(0.0));
-    ctx.forRange(ctx.u32(0), maxIters, (iter) => {
-      const i = tid.add(iter.mul(ctx.u32(WG)));
-      ctx.ifThen(i.lt(V), () => {
-        localSum.addAssign(ctx.load("logits", base.add(i)).sub(rowMax).exp());
-      });
-    });
-    sdata.write(tid, localSum.get());
-    ctx.barrier();
-    emitTreeSumReductionCE(ctx, sdata, tid, WG);
-    const logSumExp = ctx.emitLet("log_sum_exp", sdata.read(ctx.u32(0)).log());
-
-    // Phase 3: Write gradients
+    // Write gradients
     const t = ctx.emitLet("t", ctx.load("targets", row).toU32());
     const g = ctx.emitLet("g", ctx.load("grad_output", row));
-    ctx.forRange(ctx.u32(0), maxIters, (iter) => {
-      const i = tid.add(iter.mul(ctx.u32(WG)));
+    ctx.stridedFor(tid, V, WG, (i) => {
       const softmaxI = ctx.load("logits", base.add(i)).sub(rowMax).sub(logSumExp).exp();
       const oneHotI = i.eq(t).select(ctx.f32(1.0), ctx.f32(0.0));
-      ctx.guardedStore("grad_logits", i.lt(V), base.add(i),
+      ctx.emitStore("grad_logits", base.add(i),
         g.mul(softmaxI.sub(oneHotI)));
     });
   },

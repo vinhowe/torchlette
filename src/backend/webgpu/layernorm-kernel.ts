@@ -65,9 +65,11 @@ function getOrCreateRowStatsTempBuffers(
 // Tile IR Forward Kernel
 // ============================================================================
 
+const WG = WORKGROUP_SIZE; // 256
+
 const layerNormFwdSpec: TileKernelSpec = {
   name: "layerNormFwd",
-  workgroupSize: WORKGROUP_SIZE,
+  workgroupSize: WG,
   bindings: {
     x:      { storage: "read",       type: "f32" },
     weight: { storage: "read",       type: "f32" },
@@ -83,25 +85,28 @@ const layerNormFwdSpec: TileKernelSpec = {
 
   kernel(ctx) {
     const row  = ctx.programId(0);
+    const tid  = ctx.localIndex();
     const D    = ctx.uniform("feature_dim");
     const Df   = D.toF32();
     const base = row.mul(D);
-    const offs = base.add(ctx.blockRange(D));
 
-    // Phase 0: load + reduce to mean
-    const xVals = ctx.load("x", offs);
-    const mean  = ctx.reduce(xVals, "sum").div(Df);
+    // Compute mean
+    const mean = ctx.emitLet("mean",
+      ctx.wgReduce("sum", tid, D, WG, (i) => ctx.load("x", base.add(i))).div(Df));
 
-    // Phase 1: compute variance and inv_std
-    const diff     = xVals.sub(mean);
-    const variance = ctx.reduce(diff.mul(diff), "sum").div(Df);
-    const invStd   = variance.add(ctx.uniform("eps").toF32()).rsqrt();
+    // Compute variance → inv_std
+    const invStd = ctx.emitLet("inv_std",
+      ctx.wgReduce("sum", tid, D, WG, (i) => {
+        const diff = ctx.load("x", base.add(i)).sub(mean);
+        return diff.mul(diff);
+      }).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
 
-    // Phase 2: normalize + affine + store
-    const normalized = diff.mul(invStd);
-    const w = ctx.load("weight", ctx.blockRange(D));
-    const b = ctx.load("bias", ctx.blockRange(D));
-    ctx.store("output", offs, normalized.mul(w).add(b));
+    // Normalize + affine + store
+    ctx.stridedFor(tid, D, WG, (i) => {
+      const normI = ctx.load("x", base.add(i)).sub(mean).mul(invStd);
+      const out = normI.mul(ctx.load("weight", i)).add(ctx.load("bias", i));
+      ctx.emitStore("output", base.add(i), out);
+    });
   },
 };
 
@@ -112,57 +117,6 @@ const USE_TILE_IR_LAYERNORM = process.env.TORCHLETTE_TILE_LAYERNORM !== "0";
 // ============================================================================
 // Tile IR Backward Kernels
 // ============================================================================
-
-const WG = WORKGROUP_SIZE; // 256
-
-/** Emit tree sum reduction: sdata[0] = sum(sdata[0..wgSize-1]) */
-function emitTreeSumReduction(
-  ctx: Parameters<TileKernelSpec["kernel"]>[0],
-  smem: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["sharedArray"]>,
-  tid: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["u32"]>,
-  wgSize: number,
-): void {
-  for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
-    ctx.ifThen(tid.lt(ctx.u32(stride)), () => {
-      smem.write(tid, smem.read(tid).add(smem.read(tid.add(ctx.u32(stride)))));
-    });
-    ctx.barrier();
-  }
-}
-
-/** Emit dual tree sum reduction for two shared arrays simultaneously */
-function emitDualTreeSumReduction(
-  ctx: Parameters<TileKernelSpec["kernel"]>[0],
-  smem1: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["sharedArray"]>,
-  smem2: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["sharedArray"]>,
-  tid: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["u32"]>,
-  wgSize: number,
-): void {
-  for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
-    ctx.ifThen(tid.lt(ctx.u32(stride)), () => {
-      smem1.write(tid, smem1.read(tid).add(smem1.read(tid.add(ctx.u32(stride)))));
-      smem2.write(tid, smem2.read(tid).add(smem2.read(tid.add(ctx.u32(stride)))));
-    });
-    ctx.barrier();
-  }
-}
-
-/** Emit strided loop: for (var i = tid; i < bound; i += wgSize) { body(i); } */
-function emitStridedLoop(
-  ctx: Parameters<TileKernelSpec["kernel"]>[0],
-  tid: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["u32"]>,
-  bound: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["u32"]>,
-  wgSize: number,
-  body: (i: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["u32"]>) => void,
-): void {
-  const maxIters = bound.add(ctx.u32(wgSize - 1)).div(ctx.u32(wgSize));
-  ctx.forRange(ctx.u32(0), maxIters, (iter) => {
-    const i = tid.add(iter.mul(ctx.u32(wgSize)));
-    ctx.ifThen(i.lt(bound), () => {
-      body(i);
-    });
-  });
-}
 
 /**
  * LayerNorm backward gradX kernel (tile-IR).
@@ -192,55 +146,31 @@ const layerNormBackwardGradXSpec: TileKernelSpec = {
     const Df = D.toF32();
     const base = row.mul(D);
 
-    const sdata = ctx.sharedArray("sdata", WG, "f32");
-    const sdata2 = ctx.sharedArray("sdata2", WG, "f32");
+    // Recompute mean
+    const mean = ctx.emitLet("mean",
+      ctx.wgReduce("sum", tid, D, WG, (i) => ctx.load("x", base.add(i))).div(Df));
 
-    // Phase 1: Recompute mean
-    const localSum = ctx.emitVar("local_sum", "f32", ctx.f32(0.0));
-    emitStridedLoop(ctx, tid, D, WG, (i) => {
-      localSum.addAssign(ctx.load("x", base.add(i)));
-    });
-    sdata.write(tid, localSum.get());
-    ctx.barrier();
-    emitTreeSumReduction(ctx, sdata, tid, WG);
-    const mean = ctx.emitLet("mean", sdata.read(ctx.u32(0)).div(Df));
-
-    // Phase 2: Recompute variance + inv_std
-    const localVar = ctx.emitVar("local_var", "f32", ctx.f32(0.0));
-    emitStridedLoop(ctx, tid, D, WG, (i) => {
-      const diff = ctx.load("x", base.add(i)).sub(mean);
-      localVar.addAssign(diff.mul(diff));
-    });
-    sdata.write(tid, localVar.get());
-    ctx.barrier();
-    emitTreeSumReduction(ctx, sdata, tid, WG);
+    // Recompute variance → inv_std
     const invStd = ctx.emitLet("inv_std",
-      sdata.read(ctx.u32(0)).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
+      ctx.wgReduce("sum", tid, D, WG, (i) => {
+        const diff = ctx.load("x", base.add(i)).sub(mean);
+        return diff.mul(diff);
+      }).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
 
-    // Phase 3: Dual reduction for c1, c2
-    const localC1 = ctx.emitVar("local_c1", "f32", ctx.f32(0.0));
-    const localC2 = ctx.emitVar("local_c2", "f32", ctx.f32(0.0));
-    emitStridedLoop(ctx, tid, D, WG, (i) => {
+    // Dual reduction for c1, c2
+    const [sumC1, sumC2] = ctx.dualWgReduce(tid, D, WG, (i) => {
       const gn = ctx.load("grad_output", base.add(i)).mul(ctx.load("weight", i));
       const normI = ctx.load("x", base.add(i)).sub(mean).mul(invStd);
-      localC1.addAssign(gn);
-      localC2.addAssign(gn.mul(normI));
+      return [gn, gn.mul(normI)];
     });
-    sdata.write(tid, localC1.get());
-    sdata2.write(tid, localC2.get());
-    ctx.barrier();
-    emitDualTreeSumReduction(ctx, sdata, sdata2, tid, WG);
-    const c1 = ctx.emitLet("c1", sdata.read(ctx.u32(0)).div(Df));
-    const c2 = ctx.emitLet("c2", sdata2.read(ctx.u32(0)).div(Df));
+    const c1 = ctx.emitLet("c1", sumC1.div(Df));
+    const c2 = ctx.emitLet("c2", sumC2.div(Df));
 
-    // Phase 4: Output gradX
-    const maxIters4 = D.add(ctx.u32(WG - 1)).div(ctx.u32(WG));
-    ctx.forRange(ctx.u32(0), maxIters4, (iter) => {
-      const i = tid.add(iter.mul(ctx.u32(WG)));
-      const inBounds = i.lt(D);
+    // Output gradX
+    ctx.stridedFor(tid, D, WG, (i) => {
       const gn = ctx.load("grad_output", base.add(i)).mul(ctx.load("weight", i));
       const normI = ctx.load("x", base.add(i)).sub(mean).mul(invStd);
-      ctx.guardedStore("grad_x", inBounds, base.add(i),
+      ctx.emitStore("grad_x", base.add(i),
         gn.sub(c1).sub(normI.mul(c2)).mul(invStd));
     });
   },
@@ -272,29 +202,16 @@ const layerNormRowStatsSpec: TileKernelSpec = {
     const Df = D.toF32();
     const base = row.mul(D);
 
-    const sdata = ctx.sharedArray("sdata", WG, "f32");
+    // Mean
+    const mean = ctx.emitLet("mean",
+      ctx.wgReduce("sum", tid, D, WG, (i) => ctx.load("x", base.add(i))).div(Df));
 
-    // Phase 1: Mean
-    const localSum = ctx.emitVar("local_sum", "f32", ctx.f32(0.0));
-    emitStridedLoop(ctx, tid, D, WG, (i) => {
-      localSum.addAssign(ctx.load("x", base.add(i)));
-    });
-    sdata.write(tid, localSum.get());
-    ctx.barrier();
-    emitTreeSumReduction(ctx, sdata, tid, WG);
-    const mean = ctx.emitLet("mean", sdata.read(ctx.u32(0)).div(Df));
-
-    // Phase 2: Variance + inv_std
-    const localVar = ctx.emitVar("local_var", "f32", ctx.f32(0.0));
-    emitStridedLoop(ctx, tid, D, WG, (i) => {
-      const diff = ctx.load("x", base.add(i)).sub(mean);
-      localVar.addAssign(diff.mul(diff));
-    });
-    sdata.write(tid, localVar.get());
-    ctx.barrier();
-    emitTreeSumReduction(ctx, sdata, tid, WG);
+    // Variance → inv_std
     const invStd = ctx.emitLet("inv_std",
-      sdata.read(ctx.u32(0)).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
+      ctx.wgReduce("sum", tid, D, WG, (i) => {
+        const diff = ctx.load("x", base.add(i)).sub(mean);
+        return diff.mul(diff);
+      }).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
 
     // Thread 0 writes row stats
     const isThread0 = tid.eq(ctx.u32(0));

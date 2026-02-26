@@ -3,7 +3,7 @@
  *
  * Validates the 6 feature gaps that make tile-IR the universal kernel language:
  *   Gap 1: Elementwise dispatch (globalId)
- *   Gap 2: Multiple output stores (auto-phase)
+ *   Gap 2: Multiple output stores (imperative)
  *   Gap 3: Bitcast
  *   Gap 4: Atomics
  *   Gap 5: Subgroup operations
@@ -284,35 +284,37 @@ const meanAndNormalizeSpec: TileKernelSpec = {
   grid: (u) => [u.numRows],
   kernel(ctx) {
     const row = ctx.programId(0);
+    const tid = ctx.localIndex();
     const D = ctx.uniform("featureDim");
+    const Df = D.toF32();
     const base = row.mul(D);
-    const offs = base.add(ctx.blockRange(D));
 
-    // Load row
-    const xVals = ctx.load("x", offs);
+    // Sum reduction for mean via wgReduce
+    const mean = ctx.emitLet("mean",
+      ctx.wgReduce("sum", tid, D, 256, (i) => ctx.load("x", base.add(i))).div(Df));
 
-    // Compute mean
-    const sum = ctx.reduce(xVals, "sum");
-    const mean = sum.div(D.toF32());
-
-    // Store scalar mean
-    ctx.store("mean_out", row, mean);
+    // Store scalar mean (only thread 0)
+    ctx.ifThen(tid.eq(ctx.u32(0)), () => {
+      ctx.emitStore("mean_out", row, mean);
+    });
 
     // Store normalized block values
-    ctx.store("output", offs, xVals.sub(mean));
+    ctx.stridedFor(tid, D, 256, (i) => {
+      ctx.emitStore("output", base.add(i), ctx.load("x", base.add(i)).sub(mean));
+    });
   },
 };
 
-describe("Gap 2: Multiple output stores (auto-phase)", () => {
+describe("Gap 2: Multiple output stores (imperative)", () => {
   it("compiles kernel with scalar and block stores", () => {
     const wgsl = compileTileKernel(meanAndNormalizeSpec);
     // Should have both stores
     expect(wgsl).toContain("mean_out[");
     expect(wgsl).toContain("output[");
-    // Scalar store should be guarded by tid == 0
-    expect(wgsl).toContain("tid == 0u");
-    // Block store should be in a strided loop
-    expect(wgsl).toContain("for (var i = tid;");
+    // Scalar store guarded by thread 0 check
+    expect(wgsl).toContain("local_idx == 0u");
+    // Uses shared memory for reduction
+    expect(wgsl).toContain("var<workgroup>");
   });
 });
 
@@ -726,7 +728,7 @@ describe.runIf(isWebGPUEnabled)("Gap 6: Auto-vectorization GPU dispatch", () => 
 // Masked auto-phase elementwise (Triton-like)
 // ---------------------------------------------------------------------------
 
-/** Auto-phase elementwise add with masked load/store — the Triton-like way. */
+/** Imperative elementwise add with bounds-checked store. */
 const maskedElementwiseAddSpec: TileKernelSpec = {
   name: "maskedElementwiseAdd",
   workgroupSize: 256,
@@ -738,17 +740,17 @@ const maskedElementwiseAddSpec: TileKernelSpec = {
   uniforms: { n: "u32" },
   grid: (u) => [Math.ceil(u.n / 256)],
   kernel(ctx) {
-    const WG = ctx.u32(256);
-    const idx = ctx.programId(0).mul(WG).add(ctx.blockRange(WG));
+    const idx = ctx.globalId(0);
     const n = ctx.uniform("n");
-    const mask = idx.lt(n);
-    const a = ctx.load("a", idx, mask);
-    const b = ctx.load("b", idx, mask);
-    ctx.store("output", idx, a.add(b), mask);
+    ctx.ifThen(idx.lt(n), () => {
+      const a = ctx.load("a", idx);
+      const b = ctx.load("b", idx);
+      ctx.emitStore("output", idx, a.add(b));
+    });
   },
 };
 
-/** Auto-phase elementwise relu with masked store — demonstrates unary op. */
+/** Imperative elementwise relu with bounds-checked store. */
 const maskedElementwiseReluSpec: TileKernelSpec = {
   name: "maskedElementwiseRelu",
   workgroupSize: 64,
@@ -759,18 +761,18 @@ const maskedElementwiseReluSpec: TileKernelSpec = {
   uniforms: { n: "u32" },
   grid: (u) => [Math.ceil(u.n / 64)],
   kernel(ctx) {
-    const WG = ctx.u32(64);
-    const idx = ctx.programId(0).mul(WG).add(ctx.blockRange(WG));
+    const idx = ctx.globalId(0);
     const n = ctx.uniform("n");
-    const mask = idx.lt(n);
-    const x = ctx.load("x", idx, mask);
-    const zero = ctx.f32(0.0);
-    const result = x.gt(zero).select(x, zero);
-    ctx.store("output", idx, result, mask);
+    ctx.ifThen(idx.lt(n), () => {
+      const x = ctx.load("x", idx);
+      const zero = ctx.f32(0.0);
+      const result = x.gt(zero).select(x, zero);
+      ctx.emitStore("output", idx, result);
+    });
   },
 };
 
-/** Auto-phase elementwise with vectorize=4. */
+/** Imperative elementwise add with vectorize=4. */
 const maskedElementwiseAddVec4Spec: TileKernelSpec = {
   name: "maskedElementwiseAddVec4",
   workgroupSize: 64,
@@ -783,43 +785,36 @@ const maskedElementwiseAddVec4Spec: TileKernelSpec = {
   uniforms: { n: "u32" },
   grid: (u) => [Math.ceil(u.n / (64 * 4))],
   kernel(ctx) {
-    const WG = ctx.u32(64);
-    const idx = ctx.programId(0).mul(WG).add(ctx.blockRange(WG));
+    const idx = ctx.globalId(0);
     const n = ctx.uniform("n");
-    const mask = idx.lt(n);
-    const a = ctx.load("a", idx, mask);
-    const b = ctx.load("b", idx, mask);
-    ctx.store("output", idx, a.add(b), mask);
+    ctx.ifThen(idx.lt(n), () => {
+      const a = ctx.load("a", idx);
+      const b = ctx.load("b", idx);
+      ctx.guardedStore("output", idx.lt(n), idx, a.add(b));
+    });
   },
 };
 
-describe("Masked auto-phase elementwise (WGSL)", () => {
-  it("emits workgroup_id + local_invocation_index, no shared memory", () => {
+describe("Imperative elementwise (WGSL)", () => {
+  it("emits global_invocation_id, no shared memory", () => {
     const wgsl = compileTileKernel(maskedElementwiseAddSpec);
-    expect(wgsl).toContain("workgroup_id");
-    expect(wgsl).toContain("local_invocation_index");
+    expect(wgsl).toContain("global_invocation_id");
     expect(wgsl).not.toContain("var<workgroup>");
-    expect(wgsl).not.toContain("global_invocation_id");
   });
 
-  it("emits if-guard for masked store", () => {
+  it("emits if-guard for bounds check", () => {
     const wgsl = compileTileKernel(maskedElementwiseAddSpec);
     expect(wgsl).toContain("if (");
     expect(wgsl).toContain("output[");
   });
 
-  it("emits select for masked load", () => {
-    const wgsl = compileTileKernel(maskedElementwiseAddSpec);
-    expect(wgsl).toContain("select(");
-  });
-
-  it("ctx.u32/f32/i32 shortcuts work", () => {
+  it("relu kernel emits select", () => {
     const wgsl = compileTileKernel(maskedElementwiseReluSpec);
-    expect(wgsl).toContain("workgroup_id");
+    expect(wgsl).toContain("global_invocation_id");
     expect(wgsl).toContain("select(");
   });
 
-  it("vectorize works with masked auto-phase", () => {
+  it("vectorize works with imperative kernels", () => {
     const wgsl = compileTileKernel(maskedElementwiseAddVec4Spec);
     expect(wgsl).toContain("* 4u");
     expect(wgsl).toContain("(_base + 0u)");
@@ -985,5 +980,79 @@ describe.runIf(isWebGPUEnabled)("Masked auto-phase elementwise GPU dispatch", ()
     aBuf.destroy();
     bBuf.destroy();
     outBuf.destroy();
+  });
+});
+
+// ============================================================================
+// Constant folding for guardedStore conditions
+// ============================================================================
+
+describe("Compiler: constant-fold guardedStore", () => {
+  it("const-true guard (1u == 1u) emits unconditional store", () => {
+    const spec: TileKernelSpec = {
+      name: "constTrueGuard",
+      workgroupSize: 64,
+      bindings: {
+        a: { storage: "read", type: "f32" },
+        out: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { n: "u32" },
+      grid: (u) => [Math.ceil(u.n / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const val = ctx.load("a", gid);
+        // Always-true guard: should be constant-folded to unconditional store
+        ctx.guardedStore("out", ctx.u32(1).eq(ctx.u32(1)), gid, val);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // Should NOT have an `if` guard around the store
+    expect(wgsl).not.toContain("if ((1u == 1u))");
+    // Should have the unconditional store
+    expect(wgsl).toContain("out[gid.x] =");
+  });
+
+  it("const-false guard (0u == 1u) emits guarded store", () => {
+    const spec: TileKernelSpec = {
+      name: "constFalseGuard",
+      workgroupSize: 64,
+      bindings: {
+        a: { storage: "read", type: "f32" },
+        out: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { n: "u32" },
+      grid: (u) => [Math.ceil(u.n / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const val = ctx.load("a", gid);
+        // Always-false guard: should remain guarded
+        ctx.guardedStore("out", ctx.u32(0).eq(ctx.u32(1)), gid, val);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // Should keep the `if` guard (cmp expression has wrapping parens)
+    expect(wgsl).toContain("if ((0u == 1u))");
+  });
+
+  it("dynamic guard remains conditional", () => {
+    const spec: TileKernelSpec = {
+      name: "dynGuard",
+      workgroupSize: 64,
+      bindings: {
+        a: { storage: "read", type: "f32" },
+        out: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { n: "u32" },
+      grid: (u) => [Math.ceil(u.n / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const n = ctx.uniform("n");
+        const val = ctx.load("a", gid);
+        ctx.guardedStore("out", gid.lt(n), gid, val);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // Should keep the `if` guard for dynamic condition (cmp has wrapping parens)
+    expect(wgsl).toContain("if ((gid.x < config.n))");
   });
 });

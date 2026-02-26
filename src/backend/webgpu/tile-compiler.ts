@@ -1,28 +1,21 @@
 /**
- * Tile IR Compiler: Phase Decomposition + WGSL Codegen
+ * Tile IR Compiler: Imperative WGSL Codegen
  *
- * Lowers a tile kernel's IR DAG (built by tile-ir.ts) to WGSL shader code.
+ * Lowers a tile kernel's IR (built by tile-ir.ts) to WGSL shader code.
  *
- * Two compilation modes:
+ * Single compilation model: imperative statement stream. The developer writes
+ * explicit statements (forRange, barrier, sharedArray, emitStore, etc.) for
+ * full control over compute kernel algorithms.
  *
- * **Auto-phase mode** (for 1D reductions like LayerNorm):
- * 1. Discover all nodes by walking from roots (stores).
- * 2. Assign phases: scalar preamble, reduce phases, inter-reduce scalars, store phase.
- * 3. Emit scalar `let` bindings between phases for reused expressions.
- * 4. Use wgslReduce() for reduce phases, strided loop for store phase.
+ * Walks the statement list and emits WGSL directly — forRange→for loops,
+ * barrier→workgroupBarrier(), etc. Expressions are inlined via `exprFor()`.
  *
- * **Imperative mode** (for 2D tiled algorithms like matmul):
- * Detected when `ctx.statements.length > 0`. Walks the statement list and
- * emits WGSL directly — forRange→for loops, barrier→workgroupBarrier(), etc.
- * Expressions are inlined via the same `exprFor()` function.
- *
- * Sequential reductions share a single shared memory array. The generated
- * WGSL is structurally identical to hand-written kernels.
+ * Also handles Block-ops tile statements (tileLoad, tileStore, dot, etc.)
+ * which are lowered to scalar/vec4 WGSL before imperative emission.
  */
 
 import type {
   IRNode, TileKernelSpec,
-  ReduceNode, StoreNode, BlockRangeNode, LoadNode,
   Statement, DataType,
   TileLoadStmt, DotStmt, AccOpStmt, TileLoad1DStmt, TileStoreStmt,
   TilePtr2D, TileMask2D,
@@ -30,253 +23,7 @@ import type {
   BlockReduceStmt, BlockUnaryStmt, BlockBinaryStmt,
 } from "./tile-ir";
 import { buildKernelIR, type KernelContext } from "./tile-ir";
-// Inlined from wgsl-reduce.ts (deleted on main — tile-compiler is the only consumer)
 
-interface ReduceChannel {
-  smem: string;
-  init: string;
-  accumExpr: string;
-  result: string;
-  transform?: string;
-}
-
-interface WgslReduceOpts {
-  wgSize: number;
-  tid: string;
-  dim: string;
-  loopVar?: string;
-  op: "sum" | "max";
-  loopPreamble?: string;
-  smem: string;
-  init: string;
-  accumExpr: string;
-  result: string;
-  transform?: string;
-}
-
-function wgslReduce(opts: WgslReduceOpts): string {
-  const { wgSize, tid, dim, op } = opts;
-  const loopVar = opts.loopVar ?? "i";
-  const half = wgSize / 2;
-  const ch: ReduceChannel = { smem: opts.smem, init: opts.init, accumExpr: opts.accumExpr, result: opts.result, transform: opts.transform };
-
-  const lines: string[] = [];
-  lines.push(`  {`);
-  lines.push(`    var _acc = ${ch.init};`);
-  lines.push(`    for (var ${loopVar} = ${tid}; ${loopVar} < ${dim}; ${loopVar} += ${wgSize}u) {`);
-  if (opts.loopPreamble) {
-    for (const pLine of opts.loopPreamble.split("\n")) {
-      lines.push(`      ${pLine.trim()}`);
-    }
-  }
-  if (op === "sum") {
-    lines.push(`      _acc += ${ch.accumExpr};`);
-  } else {
-    lines.push(`      _acc = max(_acc, ${ch.accumExpr});`);
-  }
-  lines.push(`    }`);
-  lines.push(`    ${ch.smem}[${tid}] = _acc;`);
-  lines.push(`  }`);
-  lines.push(`  workgroupBarrier();`);
-  lines.push(``);
-
-  // Tree reduction
-  lines.push(`  for (var s = ${half}u; s > 0u; s >>= 1u) {`);
-  lines.push(`    if (${tid} < s) {`);
-  if (op === "sum") {
-    lines.push(`      ${ch.smem}[${tid}] += ${ch.smem}[${tid} + s];`);
-  } else {
-    lines.push(`      ${ch.smem}[${tid}] = max(${ch.smem}[${tid}], ${ch.smem}[${tid} + s]);`);
-  }
-  lines.push(`    }`);
-  lines.push(`    workgroupBarrier();`);
-  lines.push(`  }`);
-
-  const raw = `${ch.smem}[0]`;
-  const value = ch.transform ? ch.transform.replace(/_/g, raw) : raw;
-  lines.push(`  let ${ch.result} = ${value};`);
-
-  return lines.join("\n");
-}
-
-// ============================================================================
-// Node Graph Utilities
-// ============================================================================
-
-/** Get direct children (inputs/dependencies) of an IR node. */
-function getChildren(node: IRNode): IRNode[] {
-  switch (node.kind) {
-    case "binary": return [node.lhs, node.rhs];
-    case "unary": return [node.input];
-    case "cast": return [node.input];
-    case "bitcast": return [node.input];
-    case "reduce": return [node.input];
-    case "load": return node.mask ? [node.offsets, node.mask] : [node.offsets];
-    case "store": return node.mask ? [node.offsets, node.values, node.mask] : [node.offsets, node.values];
-    case "blockRange": return [node.extent];
-    case "select": return [node.condition, node.trueVal, node.falseVal];
-    case "cmp": return [node.lhs, node.rhs];
-    case "sharedRead": return [node.idx];
-    case "arrayRead": return [node.idx];
-    case "subgroupShuffleXor": return [node.value, node.mask];
-    case "vec4dot": return [...node.a, ...node.b];
-    case "programId":
-    case "uniform":
-    case "const":
-    case "threadIdx":
-    case "localIndex":
-    case "namedRef":
-    case "globalId":
-      return [];
-  }
-}
-
-/** Find the first blockRange node reachable from root (not crossing reduces). */
-function findBlockRange(node: IRNode): BlockRangeNode | null {
-  if (node.kind === "blockRange") return node;
-  // Don't descend into reduce nodes — they turn block→scalar,
-  // so blockRanges in their inputs don't define the store's loop.
-  if (node.kind === "reduce") return null;
-  for (const child of getChildren(node)) {
-    const found = findBlockRange(child);
-    if (found) return found;
-  }
-  return null;
-}
-
-/**
- * Collect all nodes reachable from root, stopping at reduce nodes
- * (treat them as leaves — their inputs belong to earlier phases).
- * Returns nodes in dependency order (leaves first).
- */
-function collectSubtreeStopAtReduce(root: IRNode): IRNode[] {
-  const result: IRNode[] = [];
-  const visited = new Set<number>();
-  function walk(n: IRNode) {
-    if (visited.has(n.id)) return;
-    visited.add(n.id);
-    // Don't walk into reduce inputs — they belong to earlier phases
-    if (n.kind === "reduce") {
-      result.push(n);
-      return;
-    }
-    for (const child of getChildren(n)) {
-      walk(child);
-    }
-    result.push(n);
-  }
-  walk(root);
-  return result;
-}
-
-// ============================================================================
-// Phase Assignment
-// ============================================================================
-
-/**
- * Assign each node a phase number based on its reduce dependencies.
- *
- * - Nodes with no reduce dependency → phase 0 (scalar preamble)
- * - Reduce N's block input subtree → phase (2*N + 1) (reduce loop)
- * - Scalar nodes depending on reduce N but not N+1 → phase (2*N + 2) (post-reduce)
- * - Store phase → last phase
- *
- * Phase numbering: even = scalar, odd = reduce loop.
- * Phase 0 = preamble scalars
- * Phase 1 = reduce 0 loop
- * Phase 2 = post-reduce-0 scalars
- * Phase 3 = reduce 1 loop
- * Phase 4 = post-reduce-1 scalars
- * ...
- * Final even phase = store loop
- */
-function assignPhases(
-  reduces: ReduceNode[],
-  stores: StoreNode[],
-): Map<number, number> {
-  const phaseOf = new Map<number, number>();
-
-  // Phase assignment for reduce input subtrees: only BLOCK nodes
-  // Scalar nodes get their natural phase based on reduce dependencies (below).
-  for (let ri = 0; ri < reduces.length; ri++) {
-    const reducePhase = 2 * ri + 1;
-    const subtree = collectReduceInputTree(reduces[ri]);
-    for (const n of subtree) {
-      if (n.valueType === "block") {
-        phaseOf.set(n.id, reducePhase);
-      }
-    }
-    // The reduce node itself marks the boundary
-    phaseOf.set(reduces[ri].id, reducePhase);
-  }
-
-  // Assign ALL remaining scalar nodes by finding their latest reduce dependency.
-  // Walk from all roots (stores + reduces) to discover every node.
-  const allReachable = discoverAllNodes(stores, reduces);
-  for (const n of allReachable) {
-    if (phaseOf.has(n.id)) continue;
-    if (n.kind === "store") continue;
-    if (n.valueType !== "scalar") continue;
-    const latestReduce = findLatestReduceDep(n, reduces);
-    if (latestReduce >= 0) {
-      phaseOf.set(n.id, 2 * (latestReduce + 1));
-    } else {
-      phaseOf.set(n.id, 0);
-    }
-  }
-
-  return phaseOf;
-}
-
-/**
- * Collect nodes in a reduce's input tree, stopping at earlier reduce results.
- */
-function collectReduceInputTree(reduce: ReduceNode): IRNode[] {
-  const result: IRNode[] = [];
-  const visited = new Set<number>();
-  function walk(n: IRNode) {
-    if (visited.has(n.id)) return;
-    visited.add(n.id);
-    if (n.kind === "reduce" && n.id !== reduce.id) {
-      // Stop at other reduce results
-      return;
-    }
-    for (const child of getChildren(n)) {
-      walk(child);
-    }
-    result.push(n);
-  }
-  walk(reduce.input);
-  return result;
-}
-
-/**
- * Find the index of the latest reduce that `node` transitively depends on.
- * Returns -1 if no reduce dependency.
- */
-function findLatestReduceDep(node: IRNode, reduces: ReduceNode[]): number {
-  const reduceIds = new Map<number, number>(); // reduce node id → index
-  for (let i = 0; i < reduces.length; i++) {
-    reduceIds.set(reduces[i].id, i);
-  }
-
-  let latest = -1;
-  const visited = new Set<number>();
-  function walk(n: IRNode) {
-    if (visited.has(n.id)) return;
-    visited.add(n.id);
-    const ri = reduceIds.get(n.id);
-    if (ri !== undefined) {
-      latest = Math.max(latest, ri);
-      return; // Don't walk into reduce inputs
-    }
-    for (const child of getChildren(n)) {
-      walk(child);
-    }
-  }
-  walk(node);
-  return latest;
-}
 
 // ============================================================================
 // WGSL Expression Emission
@@ -290,7 +37,7 @@ type BindingMap = Map<number, string>;
  * If the node is in `bindings`, returns its variable name.
  * Otherwise builds the expression recursively.
  *
- * @param loopVar - When non-null, blockRange nodes become this variable.
+ * @param loopVar - Unused (kept for signature stability). Always null.
  */
 function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): string {
   const cached = bindings.get(node.id);
@@ -299,10 +46,6 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
   switch (node.kind) {
     case "programId": {
       return `wid.${(["x", "y", "z"] as const)[node.dim]}`;
-    }
-    case "blockRange": {
-      if (loopVar === null) throw new Error("blockRange outside loop context");
-      return loopVar;
     }
     case "uniform":
       return `config.${node.name}`;
@@ -408,10 +151,6 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
       const idx = exprFor(node.idx, bindings, loopVar);
       return `${node.arrayName}[${idx}]`;
     }
-    case "reduce":
-      throw new Error(`Reduce node ${node.id} not pre-bound — compiler bug`);
-    case "store":
-      throw new Error("Store nodes are not expressions");
     default:
       throw new Error(`Unknown node kind: ${(node as any).kind}`);
   }
@@ -428,43 +167,14 @@ function freshVar(hint: string): string {
 }
 
 // ============================================================================
-// Discover All Nodes
-// ============================================================================
-
-/**
- * Discover ALL nodes reachable from stores (the roots of the DAG).
- * This includes nodes created by BlockExpr methods that aren't tracked in ctx.nodes.
- */
-function discoverAllNodes(stores: StoreNode[], reduces: ReduceNode[]): IRNode[] {
-  const allNodes: IRNode[] = [];
-  const visited = new Set<number>();
-
-  function walk(n: IRNode) {
-    if (visited.has(n.id)) return;
-    visited.add(n.id);
-    for (const child of getChildren(n)) {
-      walk(child);
-    }
-    allNodes.push(n);
-  }
-
-  // Walk from all stores and reduces
-  for (const s of stores) walk(s);
-  for (const r of reduces) walk(r);
-
-  return allNodes;
-}
-
-// ============================================================================
 // Main Compiler
 // ============================================================================
 
 /**
  * Compile a tile kernel specification into a complete WGSL shader string.
  *
- * Auto-detects mode:
- * - `ctx.statements.length > 0` → imperative mode
- * - Otherwise → auto-phase mode (original)
+ * All kernels use imperative mode: the kernel function emits explicit statements
+ * (forRange, barrier, sharedArray, emitStore, guardedStore, etc.).
  */
 export function compileTileKernel(spec: TileKernelSpec): string {
   _varCounter = 0;
@@ -472,272 +182,15 @@ export function compileTileKernel(spec: TileKernelSpec): string {
   // 1. Build the IR DAG
   const ctx = buildKernelIR(spec);
 
-  // 2. Route to appropriate compiler
-  if (ctx.statements.length > 0) {
-    // Check if statements contain tile-level ops that need lowering
-    if (hasTileStatements(ctx.statements)) {
-      const lowered = lowerTileStatements(ctx.statements, spec);
-      return compileImperativeKernel(spec, ctx, lowered);
-    }
-    return compileImperativeKernel(spec, ctx);
+  // 2. Check if statements contain tile-level ops that need lowering
+  if (hasTileStatements(ctx.statements)) {
+    const lowered = lowerTileStatements(ctx.statements, spec);
+    return compileImperativeKernel(spec, ctx, lowered);
   }
-
-  return compileAutoPhaseKernel(spec, ctx);
+  return compileImperativeKernel(spec, ctx);
 }
 
-// ============================================================================
-// Auto-Phase Compiler (original)
-// ============================================================================
 
-function compileAutoPhaseKernel(spec: TileKernelSpec, ctx: KernelContext): string {
-  // workgroupSize must be a number for auto-phase mode
-  const wgSize = typeof spec.workgroupSize === "number" ? spec.workgroupSize : spec.workgroupSize[0] * spec.workgroupSize[1];
-
-  // Find reduces and stores
-  const reduces: ReduceNode[] = [];
-  for (const n of ctx.nodes) {
-    if (n.kind === "reduce") reduces.push(n);
-  }
-
-  // If no reduces and any store has a mask → elementwise auto-phase
-  if (reduces.length === 0 && ctx.stores.some(s => s.mask)) {
-    return compileElementwiseAutoPhase(spec, ctx, wgSize);
-  }
-
-  // Discover all nodes (including those from BlockExpr methods)
-  const allNodes = discoverAllNodes(ctx.stores, reduces);
-
-  // Compute reference counts
-  const refCounts = new Map<number, number>();
-  for (const n of allNodes) {
-    refCounts.set(n.id, refCounts.get(n.id) ?? 0);
-    for (const child of getChildren(n)) {
-      refCounts.set(child.id, (refCounts.get(child.id) ?? 0) + 1);
-    }
-  }
-
-  // Assign phases
-  const phaseOf = assignPhases(reduces, ctx.stores);
-
-  // Binding map: node ID → WGSL variable name
-  const bindings: BindingMap = new Map();
-
-  const lines: string[] = [];
-
-  // Feature enables
-  if (spec.enableF16) {
-    lines.push("enable f16;");
-  }
-  if (spec.enableSubgroups) {
-    lines.push("enable subgroups;");
-  }
-  if (spec.enableF16 || spec.enableSubgroups) {
-    lines.push("");
-  }
-
-  // -- Header: struct, bindings, shared memory --
-  lines.push(emitUniformStruct(spec));
-  lines.push("");
-  lines.push(...emitBindings(spec));
-  lines.push("");
-  lines.push(`var<workgroup> sdata: array<f32, ${wgSize}>;`);
-  lines.push("");
-
-  // -- Function signature --
-  lines.push(`@compute @workgroup_size(${wgSize})`);
-  lines.push(`fn main(@builtin(local_invocation_id) lid: vec3<u32>,`);
-  lines.push(`        @builtin(workgroup_id) wid: vec3<u32>) {`);
-  lines.push(`  let tid = lid.x;`);
-
-  // -- Phase 0: Scalar preamble --
-  emitScalarBindings(allNodes, phaseOf, 0, bindings, refCounts, lines);
-
-  // -- Reduce phases --
-  for (let ri = 0; ri < reduces.length; ri++) {
-    const postReducePhase = 2 * ri + 2;
-
-    // Emit reduce loop
-    lines.push("");
-    emitReduceCode(reduces[ri], bindings, spec, wgSize, lines);
-
-    // Post-reduce scalar bindings
-    emitScalarBindings(allNodes, phaseOf, postReducePhase, bindings, refCounts, lines);
-  }
-
-  // -- Store phase --
-  if (ctx.stores.length > 0) {
-    emitStoreLoop(ctx.stores, bindings, spec, wgSize, lines);
-  }
-
-  lines.push(`}`);
-  return lines.join("\n");
-}
-
-// ============================================================================
-// Elementwise Auto-Phase Compiler (no reduces, masked stores)
-// ============================================================================
-
-/**
- * Compile an elementwise kernel in auto-phase mode.
- *
- * When there are no reduces and stores have masks, we emit a multi-workgroup
- * kernel using global_invocation_id. Each thread processes one element.
- * blockRange nodes compile to `gid.x` (single element per thread).
- *
- * No shared memory, no strided loops — just direct indexed access with mask guards.
- * Supports vectorize (same as imperative mode).
- */
-function compileElementwiseAutoPhase(spec: TileKernelSpec, ctx: KernelContext, wgSize: number): string {
-  const lines: string[] = [];
-
-  // Feature enables
-  if (spec.enableF16) lines.push("enable f16;");
-  if (spec.enableSubgroups) lines.push("enable subgroups;");
-  if (spec.enableF16 || spec.enableSubgroups) lines.push("");
-
-  // Header
-  lines.push(emitUniformStruct(spec));
-  lines.push("");
-  lines.push(...emitBindings(spec));
-  lines.push("");
-
-  // Function signature — workgroup_id + local_invocation_index, no shared memory
-  // programId(0) → wid.x, blockRange(WG) → lid
-  // So idx = programId(0) * WG + blockRange(WG) → wid.x * WG + lid == gid.x
-  lines.push(`@compute @workgroup_size(${wgSize})`);
-  lines.push(`fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {`);
-
-  // Binding map: blockRange → lid
-  const bindings: BindingMap = new Map();
-
-  // Find all blockRange nodes and bind them to lid
-  const allNodes = discoverAllNodes(ctx.stores, []);
-  for (const n of allNodes) {
-    if (n.kind === "blockRange") {
-      bindings.set(n.id, "lid");
-    }
-  }
-
-  // Vectorization support
-  const vecWidth = spec.vectorize && spec.vectorize > 1 ? spec.vectorize : 1;
-
-  if (vecWidth === 1) {
-    // Non-vectorized: emit scalar preamble bindings
-    emitElementwiseScalarPreamble(allNodes, bindings, lines);
-  } else {
-    // Vectorized: emit _base, per-iteration bindings computed inside loop
-    lines.push(`  let _base = (wid.x * ${wgSize}u + lid) * ${vecWidth}u;`);
-    // Emit uniforms as let bindings (they're loop-invariant)
-    for (const n of allNodes) {
-      if (n.kind === "uniform") {
-        const expr = exprFor(n, bindings, null);
-        const name = varNameFor(n);
-        lines.push(`  let ${name} = ${expr};`);
-        bindings.set(n.id, name);
-      }
-    }
-  }
-
-  for (let v = 0; v < vecWidth; v++) {
-    const iterBindings = new Map(bindings);
-    if (vecWidth > 1) {
-      // In vec mode: blockRange → (_base + v), programId → 0u
-      // So idx = programId(0) * WG + blockRange(WG) → 0u * WG + (_base + v) = (_base + v)
-      // where _base = (wid.x * WG + lid) * vecWidth
-      for (const n of allNodes) {
-        if (n.kind === "blockRange") {
-          iterBindings.set(n.id, `(_base + ${v}u)`);
-        } else if (n.kind === "programId") {
-          iterBindings.set(n.id, "0u");
-        }
-      }
-      lines.push(`  // vec element ${v}`);
-      lines.push(`  {`);
-    }
-    const indent = vecWidth > 1 ? "    " : "  ";
-
-    // Emit each store with its mask guard
-    for (const store of ctx.stores) {
-      if (store.mask) {
-        const maskExpr = exprFor(store.mask, iterBindings, null);
-        lines.push(`${indent}if (${maskExpr}) {`);
-
-        // Emit loads + value computation inside the mask guard
-        // Walk the store's value subtree for any block loads that need masking
-        const loadNodes = collectSubtreeStopAtReduce(store.values)
-          .filter(n => n.kind === "load" && !iterBindings.has(n.id));
-        for (const loadNode of loadNodes) {
-          const load = loadNode as LoadNode;
-          // If the load also has a mask, emit masked load (select(0, val, mask))
-          if (load.mask) {
-            const offs = exprFor(load.offsets, iterBindings, null);
-            const loadMask = exprFor(load.mask, iterBindings, null);
-            const name = freshVar("v");
-            lines.push(`${indent}  let ${name} = select(${defaultZero(load.dataType)}, ${load.binding}[${offs}], ${loadMask});`);
-            iterBindings.set(load.id, name);
-          }
-        }
-
-        const offs = exprFor(store.offsets, iterBindings, null);
-        const vals = exprFor(store.values, iterBindings, null);
-        lines.push(`${indent}  ${store.binding}[${offs}] = ${vals};`);
-        lines.push(`${indent}}`);
-      } else {
-        // Unmasked store — direct write
-        const offs = exprFor(store.offsets, iterBindings, null);
-        const vals = exprFor(store.values, iterBindings, null);
-        lines.push(`${indent}${store.binding}[${offs}] = ${vals};`);
-      }
-    }
-
-    if (vecWidth > 1) {
-      lines.push(`  }`);
-    }
-  }
-
-  lines.push(`}`);
-  return lines.join("\n");
-}
-
-/** Default zero value for a given datatype. */
-function defaultZero(dt: DataType): string {
-  switch (dt) {
-    case "f32": return "0.0";
-    case "f16": return "f16(0.0)";
-    case "u32": return "0u";
-    case "i32": return "0i";
-  }
-}
-
-/** Emit scalar preamble let-bindings for elementwise auto-phase kernels. */
-function emitElementwiseScalarPreamble(allNodes: IRNode[], bindings: BindingMap, lines: string[]) {
-  const refCounts = new Map<number, number>();
-  for (const n of allNodes) {
-    refCounts.set(n.id, refCounts.get(n.id) ?? 0);
-    for (const child of getChildren(n)) {
-      refCounts.set(child.id, (refCounts.get(child.id) ?? 0) + 1);
-    }
-  }
-
-  for (const n of allNodes) {
-    if (n.valueType !== "scalar") continue;
-    if (bindings.has(n.id)) continue;
-    if (n.kind === "store") continue;
-
-    const refs = refCounts.get(n.id) ?? 0;
-    if (n.kind === "binary" || n.kind === "unary" || n.kind === "cast" || n.kind === "cmp" || n.kind === "select") {
-      const expr = exprFor(n, bindings, null);
-      const name = freshVar("s");
-      lines.push(`  let ${name} = ${expr};`);
-      bindings.set(n.id, name);
-    } else if ((n.kind === "programId" || n.kind === "uniform") && refs > 1) {
-      const expr = exprFor(n, bindings, null);
-      const name = varNameFor(n);
-      lines.push(`  let ${name} = ${expr};`);
-      bindings.set(n.id, name);
-    }
-  }
-}
 
 // ============================================================================
 // Imperative Compiler (new)
@@ -848,6 +301,28 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
   return lines.join("\n");
 }
 
+/**
+ * Detect statically-true guard conditions (e.g. `1u == 1u`).
+ * Returns true if the expression is a compile-time constant that evaluates to true.
+ */
+function isStaticTrue(node: IRNode): boolean {
+  if (node.kind === "cmp") {
+    const { op, lhs, rhs } = node;
+    if (lhs.kind === "const" && rhs.kind === "const") {
+      const l = lhs.value, r = rhs.value;
+      switch (op) {
+        case "eq": return l === r;
+        case "ne": return l !== r;
+        case "lt": return l < r;
+        case "le": return l <= r;
+        case "gt": return l > r;
+        case "ge": return l >= r;
+      }
+    }
+  }
+  return false;
+}
+
 function emitStatement(
   stmt: Statement,
   bindings: BindingMap,
@@ -941,13 +416,24 @@ function emitStatement(
       lines.push(`${indent}${stmt.arrayName}[${idx}] = ${val};`);
       break;
     }
-    case "guardedStore": {
-      const cond = exprFor(stmt.condition, bindings, null);
+    case "directStore": {
       const idx = exprFor(stmt.idx, bindings, null);
       const val = exprFor(stmt.value, bindings, null);
-      lines.push(`${indent}if (${cond}) {`);
-      lines.push(`${indent}  ${stmt.binding}[${idx}] = ${val};`);
-      lines.push(`${indent}}`);
+      lines.push(`${indent}${stmt.binding}[${idx}] = ${val};`);
+      break;
+    }
+    case "guardedStore": {
+      const idx = exprFor(stmt.idx, bindings, null);
+      const val = exprFor(stmt.value, bindings, null);
+      if (isStaticTrue(stmt.condition)) {
+        // Constant-fold: emit unconditional store
+        lines.push(`${indent}${stmt.binding}[${idx}] = ${val};`);
+      } else {
+        const cond = exprFor(stmt.condition, bindings, null);
+        lines.push(`${indent}if (${cond}) {`);
+        lines.push(`${indent}  ${stmt.binding}[${idx}] = ${val};`);
+        lines.push(`${indent}}`);
+      }
       break;
     }
     case "atomicOp": {
@@ -981,262 +467,9 @@ function emitStatement(
  * uniform, or const nodes (those are inlined).
  *
  * Additionally binds programId/uniform nodes that have refcount > 1 (used in
- * multiple places, so binding avoids redundant access in loop bodies).
  */
-function emitScalarBindings(
-  allNodes: IRNode[],
-  phaseOf: Map<number, number>,
-  targetPhase: number,
-  bindings: BindingMap,
-  refCounts: Map<number, number>,
-  lines: string[],
-): void {
-  // Collect candidate nodes for this phase
-  const candidates: IRNode[] = [];
-  for (const n of allNodes) {
-    if (n.valueType !== "scalar") continue;
-    if (bindings.has(n.id)) continue;
-    if (n.kind === "reduce" || n.kind === "store") continue;
-    if (phaseOf.get(n.id) !== targetPhase) continue;
 
-    const refs = refCounts.get(n.id) ?? 0;
 
-    // Always bind computed scalars (binary, unary, cast)
-    if (n.kind === "binary" || n.kind === "unary" || n.kind === "cast") {
-      candidates.push(n);
-      continue;
-    }
-
-    // Bind programId/uniform if they have multiple references
-    if ((n.kind === "programId" || n.kind === "uniform") && refs > 1) {
-      candidates.push(n);
-      continue;
-    }
-  }
-
-  // Topological sort to ensure dependencies are bound first
-  const sorted = topoSort(candidates);
-
-  for (const node of sorted) {
-    const expr = exprFor(node, bindings, null);
-    const name = varNameFor(node);
-    lines.push(`  let ${name} = ${expr};`);
-    bindings.set(node.id, name);
-  }
-}
-
-function varNameFor(node: IRNode): string {
-  switch (node.kind) {
-    case "programId": return freshVar("row");
-    case "uniform": return freshVar(node.name);
-    default: return freshVar("s");
-  }
-}
-
-function topoSort(nodes: IRNode[]): IRNode[] {
-  const ids = new Set(nodes.map(n => n.id));
-  const sorted: IRNode[] = [];
-  const visited = new Set<number>();
-
-  function visit(node: IRNode) {
-    if (visited.has(node.id)) return;
-    visited.add(node.id);
-    for (const child of getChildren(node)) {
-      if (ids.has(child.id)) {
-        const childNode = nodes.find(n => n.id === child.id);
-        if (childNode) visit(childNode);
-      }
-    }
-    sorted.push(node);
-  }
-
-  for (const n of nodes) visit(n);
-  return sorted;
-}
-
-// ============================================================================
-// Reduce Codegen
-// ============================================================================
-
-function emitReduceCode(
-  reduce: ReduceNode,
-  bindings: BindingMap,
-  spec: TileKernelSpec,
-  wgSize: number,
-  lines: string[],
-): void {
-  const rangeNode = findBlockRange(reduce.input);
-  if (!rangeNode) {
-    throw new Error("Reduce input has no blockRange in dependency tree");
-  }
-  const dimExpr = exprFor(rangeNode.extent, bindings, null);
-
-  // Build accumExpr + loopPreamble from the reduce's block input tree.
-  // Stop at reduce boundaries — earlier reduces are already bound as scalars.
-  const { accumExpr, loopPreamble } = buildAccumExpr(reduce.input, bindings);
-
-  const resultName = freshVar("r");
-
-  const reduceCode = wgslReduce({
-    wgSize,
-    tid: "tid",
-    dim: dimExpr,
-    op: reduce.op,
-    smem: "sdata",
-    init: reduce.op === "sum" ? "0.0" : "-3.402823e+38",
-    accumExpr,
-    result: resultName,
-    loopPreamble: loopPreamble || undefined,
-  });
-
-  lines.push(reduceCode);
-  bindings.set(reduce.id, resultName);
-}
-
-/**
- * Build accumExpr and loopPreamble for a reduce's input expression.
- *
- * Walks the reduce input's block subtree (stopping at other reduce nodes).
- * If the tree is simple (single load), inlines as accumExpr.
- * If complex, emits intermediate block computations as loopPreamble let bindings.
- */
-function buildAccumExpr(
-  input: IRNode,
-  bindings: BindingMap,
-): { accumExpr: string; loopPreamble: string | null } {
-  // Collect block nodes in the input subtree, NOT crossing reduce boundaries
-  const subtree = collectReduceInputSubtree(input);
-  const blockNodes = subtree.filter(
-    n => n.valueType === "block" && n.kind !== "blockRange",
-  );
-
-  if (blockNodes.length <= 1) {
-    // Simple: just a load or single expression. Inline as accumExpr.
-    return { accumExpr: exprFor(input, bindings, "i"), loopPreamble: null };
-  }
-
-  // Complex: emit all but the last as loopPreamble let bindings.
-  const loopBindings = new Map(bindings);
-  const preambleLines: string[] = [];
-
-  for (const node of blockNodes) {
-    if (node.id === input.id) continue; // Final expression → becomes accumExpr
-    const expr = exprFor(node, loopBindings, "i");
-    const name = freshVar("v");
-    preambleLines.push(`let ${name} = ${expr};`);
-    loopBindings.set(node.id, name);
-  }
-
-  const accumExpr = exprFor(input, loopBindings, "i");
-
-  return {
-    accumExpr,
-    loopPreamble: preambleLines.length > 0 ? preambleLines.join("\n") : null,
-  };
-}
-
-/**
- * Collect nodes in a reduce's input subtree, stopping at other reduce nodes.
- * Returns in dependency order (leaves first).
- */
-function collectReduceInputSubtree(root: IRNode): IRNode[] {
-  const result: IRNode[] = [];
-  const visited = new Set<number>();
-  function walk(n: IRNode) {
-    if (visited.has(n.id)) return;
-    visited.add(n.id);
-    if (n.kind === "reduce") {
-      // Stop: this reduce's result is already bound as a scalar
-      result.push(n);
-      return;
-    }
-    for (const child of getChildren(n)) {
-      walk(child);
-    }
-    result.push(n);
-  }
-  walk(root);
-  return result;
-}
-
-// ============================================================================
-// Store Loop Codegen
-// ============================================================================
-
-function emitStoreLoop(
-  stores: StoreNode[],
-  bindings: BindingMap,
-  spec: TileKernelSpec,
-  wgSize: number,
-  lines: string[],
-): void {
-  // Partition stores: scalar (no blockRange) vs block (has blockRange)
-  const scalarStores: StoreNode[] = [];
-  const blockGroups = new Map<number, StoreNode[]>(); // grouped by blockRange extent node ID
-
-  for (const store of stores) {
-    const rangeNode = findBlockRange(store);
-    if (!rangeNode) {
-      scalarStores.push(store);
-    } else {
-      const key = rangeNode.extent.id;
-      let group = blockGroups.get(key);
-      if (!group) {
-        group = [];
-        blockGroups.set(key, group);
-      }
-      group.push(store);
-    }
-  }
-
-  // Emit scalar stores: thread 0 only
-  if (scalarStores.length > 0) {
-    lines.push("");
-    lines.push(`  if (tid == 0u) {`);
-    for (const store of scalarStores) {
-      const offs = exprFor(store.offsets, bindings, null);
-      const vals = exprFor(store.values, bindings, null);
-      lines.push(`    ${store.binding}[${offs}] = ${vals};`);
-    }
-    lines.push(`  }`);
-  }
-
-  // Emit one strided loop per block group
-  for (const [, groupStores] of blockGroups) {
-    const rangeNode = findBlockRange(groupStores[0])!;
-    const dimExpr = exprFor(rangeNode.extent, bindings, null);
-
-    lines.push("");
-    lines.push(`  for (var i = tid; i < ${dimExpr}; i += ${wgSize}u) {`);
-
-    const loopBindings = new Map(bindings);
-
-    for (const store of groupStores) {
-      // Walk store value tree, stopping at reduces
-      const subtree = collectSubtreeStopAtReduce(store.values);
-      const blockNodes = subtree.filter(
-        n => n.valueType === "block"
-          && n.kind !== "blockRange"
-          && n.kind !== "load"
-          && !loopBindings.has(n.id),
-      );
-
-      for (const node of blockNodes) {
-        if (loopBindings.has(node.id)) continue;
-        const expr = exprFor(node, loopBindings, "i");
-        const name = freshVar("v");
-        lines.push(`    let ${name} = ${expr};`);
-        loopBindings.set(node.id, name);
-      }
-
-      const offs = exprFor(store.offsets, loopBindings, "i");
-      const vals = exprFor(store.values, loopBindings, "i");
-      lines.push(`    ${store.binding}[${offs}] = ${vals};`);
-    }
-
-    lines.push(`  }`);
-  }
-}
 
 // ============================================================================
 // Binding / Uniform Codegen
@@ -2987,7 +2220,3 @@ function emitBinaryOp(op: string, lhs: IRNode, rhs: IRNode): IRNode {
   return binOp(op as "add" | "sub" | "mul" | "div", lhs, rhs, "f32");
 }
 
-// ============================================================================
-// Exports
-// ============================================================================
-export { getChildren };
