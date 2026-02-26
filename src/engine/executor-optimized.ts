@@ -38,7 +38,7 @@ import { getInputStorage } from "./op-dispatch";
 import { extractPlanMetadata, pretunePlanMatmuls } from "./plan-builder";
 import { executePlan } from "./executor-sequential";
 import { executeFusedSegment, executeSequentialSegmentWithEarlyRelease, DEFAULT_RECLAIM_INTERVAL } from "./segment-executors";
-import type { MatmulPrologueInfo } from "./matmul-epilogue";
+import { COMMUTATIVE_BINARY_OPS, EPILOGUE_ACTIVATION_OPS, type MatmulPrologueInfo } from "./matmul-epilogue";
 
 /**
  * Options for optimized plan execution.
@@ -381,7 +381,7 @@ export async function executePlanOptimized(
           const primary = next.inputs[0];
           if (primary.kind !== "pending" || primary.node.id !== current.id) {
             // For commutative binary ops, check if the chain continues via inputs[1]
-            if ((next.op === "add" || next.op === "mul") && next.inputs.length === 2) {
+            if (COMMUTATIVE_BINARY_OPS.has(next.op) && next.inputs.length === 2) {
               const alt = next.inputs[1];
               if (alt.kind === "pending" && alt.node.id === current.id) {
                 chainInputIdx = 1;
@@ -409,7 +409,7 @@ export async function executePlanOptimized(
 
           let ok = false;
           if (next.op === "cast") ok = true;
-          else if ((next.op === "add" || next.op === "mul") && next.inputs.length === 2) {
+          else if (COMMUTATIVE_BINARY_OPS.has(next.op) && next.inputs.length === 2) {
             if (additionalInputCount >= 4) break;
             const secondary = next.inputs[chainInputIdx === 0 ? 1 : 0];
             if (secondary.kind === "materialized") {
@@ -421,7 +421,7 @@ export async function executePlanOptimized(
               }
             }
             if (ok) additionalInputCount++;
-          } else if (next.op === "relu" || next.op === "silu" || next.op === "sigmoid" || next.op === "tanh" || next.op === "gelu") {
+          } else if (EPILOGUE_ACTIVATION_OPS.has(next.op)) {
             ok = true;
           }
 
