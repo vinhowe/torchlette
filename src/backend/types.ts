@@ -107,6 +107,11 @@ export function transposeShape(
 
 export type DType = "f16" | "f32" | "i32" | "u32" | "bool";
 
+/** Extract DType from a value, defaulting to "f32". */
+export function ensureDType(value: DType | undefined): DType {
+  return value ?? "f32";
+}
+
 /**
  * Backend-agnostic execution options for output buffer donation.
  * WebGPU backends accept `outBuffer` (a GPUBuffer); CPU backends ignore it.

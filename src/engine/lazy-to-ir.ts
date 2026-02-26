@@ -7,7 +7,7 @@
  * Per spec §15: Optimization passes (CSE, DCE, fusion) operate on IRGraph.
  */
 
-import type { DType } from "../backend/types";
+import { ensureDType, type DType } from "../backend/types";
 import type { IRFusionGroup, IRGraph, IRNode } from "./ir";
 import type { ExecutionPlan, LazyIRNode } from "./lazy";
 
@@ -131,7 +131,7 @@ function lazyNodeToIRNode(
     kind: "lazy_op",
     inputs,
     shape: lazyNode.shape?.slice(),
-    dtype: lazyNode.dtype as DType,
+    dtype: ensureDType(lazyNode.dtype),
   };
 }
 
