@@ -57,6 +57,7 @@ import {
 // Tensor construction helpers (extracted to tensor.ts)
 import { createTensor, createTrackedBuffer } from "./tensor";
 import { ensureContiguous, detectSimpleTranspose } from "./ops/views";
+import { wgslArray } from "./wgsl-helpers";
 
 export function dispatchComputePass(
   pipeline: GPUComputePipeline,
@@ -238,8 +239,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 `;
   }
 
-  const shapeArray = `array<u32, ${rank}>(${shape.map((s) => `${s}u`).join(", ")})`;
-  const stridesArray = `array<u32, ${rank}>(${strides.map((s) => `${s}u`).join(", ")})`;
+  const shapeArray = wgslArray(shape, "u32", "u");
+  const stridesArray = wgslArray(strides, "u32", "u");
 
   return `${enableF16}
 struct Params {
