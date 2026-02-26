@@ -23,7 +23,10 @@ import {
   computeKernelMeta,
   type KernelGenOptions,
 } from "./fusion-codegen";
+import { generateFusedKernelTileIR } from "./fusion-tile-ir";
 import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
+
+const USE_TILE_IR_FUSION = process.env.TORCHLETTE_TILE_FUSION !== "0";
 import { GPUBufferUsage } from "./gpu-types";
 
 // ============================================================================
@@ -65,7 +68,9 @@ export class FusionKernelCache {
     }
 
     // Cache miss: do full WGSL codegen + shader compilation
-    const kernel = generateFusedKernel(recipe, options);
+    const kernel = USE_TILE_IR_FUSION
+      ? generateFusedKernelTileIR(recipe, options)
+      : generateFusedKernel(recipe, options);
 
     const module = device.createShaderModule({ code: kernel.source });
     const pipeline = device.createComputePipeline({

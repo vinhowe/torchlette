@@ -23,7 +23,7 @@ import {
   generateKSplitReductionShaderTileIR,
 } from "./tile-matmul";
 
-const USE_TILE_IR_MATMUL = process.env.TORCHLETTE_TILE_MATMUL === "1";
+const USE_TILE_IR_MATMUL = process.env.TORCHLETTE_TILE_MATMUL !== "0";
 import {
   classifyShape,
   DEFAULT_CONFIG,
