@@ -44,7 +44,7 @@ import { getInputStorage, executeOp, withProfileContext } from "./op-dispatch";
 import { pretunePlanMatmuls } from "./plan-builder";
 import { executeFusedSegment } from "./segment-executors";
 import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "./matmul-epilogue";
-import { executeMatmulWithEpilogue, _detectTransposeView, shapesEqual } from "./matmul-epilogue";
+import { COMMUTATIVE_BINARY_OPS, executeMatmulWithEpilogue, _detectTransposeView, shapesEqual } from "./matmul-epilogue";
 import type { ReductionPreamblePlan } from "./reduction-preamble";
 import { executeReductionWithPreamble } from "./reduction-preamble";
 import type { OptimizedExecutionStats, OptimizedExecutionResult } from "./executor-optimized";
@@ -688,7 +688,7 @@ export async function executeLoweredPlan(
           const epilogueInputPaths: Array<{ planNodeIndex: number; inputIndex: number }> = [];
           for (let ci = 1; ci < action.coveredNodeIndices.length; ci++) {
             const chainNode = planNodes[action.coveredNodeIndices[ci]];
-            if ((chainNode.op === "add" || chainNode.op === "mul") && chainNode.inputs.length === 2) {
+            if (COMMUTATIVE_BINARY_OPS.has(chainNode.op) && chainNode.inputs.length === 2) {
               const prevChainNodeId = planNodes[action.coveredNodeIndices[ci - 1]].id;
               const inp0IsChain = chainNode.inputs[0].kind === "pending"
                 && chainNode.inputs[0].node.id === prevChainNodeId;

@@ -12,6 +12,19 @@ export { shapesEqual };
 // dispatchMatmulWithEpilogue call, eliminating intermediate buffers.
 // ============================================================================
 
+/** Activation ops that follow the simple unary epilogue path (no payload). */
+export const EPILOGUE_UNARY_ACTIVATION_OPS: ReadonlySet<string> = new Set([
+  "relu", "silu", "sigmoid", "tanh",
+]);
+
+/** All activation ops eligible as matmul epilogue (including gelu which needs special handling). */
+export const EPILOGUE_ACTIVATION_OPS: ReadonlySet<string> = new Set([
+  "relu", "silu", "sigmoid", "tanh", "gelu",
+]);
+
+/** Commutative binary ops that can appear as matmul epilogue. */
+export const COMMUTATIVE_BINARY_OPS: ReadonlySet<string> = new Set(["add", "mul"]);
+
 export interface MatmulPrologueInfo {
   /** Which matmul input has the cast (0 = A, 1 = B) */
   inputIndex: 0 | 1;
@@ -79,7 +92,7 @@ export function detectMatmulEpilogueCore(
     const primaryInput = nextNode.inputs[0];
     if (primaryInput.kind !== "pending" || primaryInput.node.id !== currentNode.id) {
       // For commutative binary ops, check if the chain continues via inputs[1]
-      if ((nextNode.op === "add" || nextNode.op === "mul") && nextNode.inputs.length === 2) {
+      if (COMMUTATIVE_BINARY_OPS.has(nextNode.op) && nextNode.inputs.length === 2) {
         const altInput = nextNode.inputs[1];
         if (altInput.kind === "pending" && altInput.node.id === currentNode.id) {
           chainInputIdx = 1;
@@ -157,7 +170,7 @@ export function detectMatmulEpilogueCore(
       epilogueInputRefs.push(nextNode.inputs[chainInputIdx === 0 ? 1 : 0]);
       additionalInputCount++;
       matched = true;
-    } else if (nextNode.op === "relu" || nextNode.op === "silu" || nextNode.op === "sigmoid" || nextNode.op === "tanh") {
+    } else if (EPILOGUE_UNARY_ACTIVATION_OPS.has(nextNode.op)) {
       epilogueOps.push({ kind: "unary", op: nextNode.op });
       matched = true;
     } else if (nextNode.op === "gelu") {
