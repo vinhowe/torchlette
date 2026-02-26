@@ -11,7 +11,7 @@
 import type { TileKernelSpec, DataType, BlockExpr, KernelContext } from "../tile-ir";
 import type { CodegenOptions, EpilogueConfig } from "./codegen";
 import { getWorkgroupSize, type DType } from "./types";
-import { TileOps, buildPtr, buildMask, type TileConfig } from "../tile-ops";
+import { TileOps, BlockOps, Block, TileRange, buildPtr, buildMask, type TileConfig } from "../tile-ops";
 
 // ============================================================================
 // Epilogue Expression Helpers
@@ -132,6 +132,83 @@ function applyEpilogueToAcc(
   }
 }
 
+/**
+ * Apply composable epilogue ops to a Block accumulator using only Block-level operations.
+ *
+ * Binary epilogue (residual add) collapses to the same path as simple epilogue:
+ * load the binary operand as a register Block via ops.load() with thread ptr,
+ * then acc.add_(binaryBlock). WebGPU clamped reads (OOB → 0) make this safe;
+ * the storeTile mask prevents writing OOB elements.
+ */
+function applyBlockEpilogue(
+  ctx: KernelContext,
+  ops: BlockOps,
+  acc: Block,
+  epilogue: EpilogueConfig,
+  addressing: {
+    offsN: TileRange;
+    threadOutBase: BlockExpr;
+    threadOutStride: BlockExpr;
+  },
+): void {
+  const { offsN, threadOutBase, threadOutStride } = addressing;
+  for (const op of epilogue.ops) {
+    switch (op.kind) {
+      case "none": break;
+      case "bias":
+        acc.add_(ops.load1d(`epilogue_in${op.inputIndex}`, offsN));
+        break;
+      case "unary":
+        acc.apply_((x) => applyUnaryOp(ctx, op.op, x));
+        break;
+      case "binary": {
+        // Load binary operand at same indices the store will write to
+        const binBlock = ops.load(`epilogue_in${op.inputIndex}`,
+          { kind: "thread", base: threadOutBase, stride: threadOutStride },
+          { rows: acc.rows, cols: acc.cols },
+        );
+        switch (op.op) {
+          case "add": acc.add_(binBlock); break;
+          case "sub": acc.sub_(binBlock); break;
+          case "mul": acc.mul_(binBlock); break;
+          default: throw new Error(`Unsupported binary epilogue: ${op.op}`);
+        }
+        break;
+      }
+      case "cast":
+        if (op.toDtype === "f16") acc.castTo_("f16");
+        break;
+      // Backward-compat kinds
+      case "relu":
+        acc.apply_((x) => x.gt(ctx.const(0.0)).select(x, ctx.const(0.0)));
+        break;
+      case "gelu":
+        acc.apply_((x) => applyGelu(ctx, x));
+        break;
+      case "silu":
+        acc.apply_((x) => applySilu(ctx, x));
+        break;
+      case "add": {
+        const b = ops.load(`epilogue_in${op.inputIndex}`,
+          { kind: "thread", base: threadOutBase, stride: threadOutStride },
+          { rows: acc.rows, cols: acc.cols });
+        acc.add_(b);
+        break;
+      }
+      case "mul": {
+        const b = ops.load(`epilogue_in${op.inputIndex}`,
+          { kind: "thread", base: threadOutBase, stride: threadOutStride },
+          { rows: acc.rows, cols: acc.cols });
+        acc.mul_(b);
+        break;
+      }
+    }
+  }
+  if (epilogue.outputDtype === "f16" && !epilogue.ops.some(o => o.kind === "cast")) {
+    acc.castTo_("f16");
+  }
+}
+
 // ============================================================================
 // Main Kernel Builder
 // ============================================================================
@@ -139,9 +216,11 @@ function applyEpilogueToAcc(
 /**
  * Create a TileKernelSpec for tiled matrix multiplication.
  *
- * The kernel body uses TileOps: block-level loads, dot, and store.
- * The compiler lowers these to cooperative loading loops, barriers,
- * outer products, and bounds-checked stores.
+ * Two kernel body implementations:
+ * - TileOps (default): Original block-level API with Tile/Accumulator
+ * - BlockOps (TORCHLETTE_BLOCK_MATMUL=1): Unified Block API
+ *
+ * Both produce equivalent WGSL. The dispatch infrastructure is shared.
  */
 export function createTiledMatmulKernel(options: CodegenOptions): TileKernelSpec {
   const { config, transposeMode, dtype, dtypeB: dtypeBOpt, epilogue, batched, inputCastA, inputCastB, kSplit } = options;
@@ -174,10 +253,7 @@ export function createTiledMatmulKernel(options: CodegenOptions): TileKernelSpec
   const transA = transposeMode === "TN" || transposeMode === "TT";
   const transB = transposeMode === "NT" || transposeMode === "TT";
 
-  const tileConfig: TileConfig = {
-    BLOCK_M: tileM, BLOCK_N: tileN, BLOCK_K: tileK,
-    threadTileM, threadTileN, wgSizeX, wgSizeY,
-  };
+  const useBlockOps = process.env.TORCHLETTE_BLOCK_MATMUL === "1";
 
   return {
     name: "tiledMatmul",
@@ -194,156 +270,302 @@ export function createTiledMatmulKernel(options: CodegenOptions): TileKernelSpec
     },
     grid: () => [1],
 
-    kernel(ctx) {
-      const ops = new TileOps(ctx, tileConfig);
+    kernel: useBlockOps
+      ? (ctx) => matmulKernelBlockOps(ctx, options, { tileM, tileN, tileK, threadTileM, threadTileN, wgSizeX, wgSizeY, transA, transB, outputDtype })
+      : (ctx) => matmulKernelTileOps(ctx, options, { tileM, tileN, tileK, threadTileM, threadTileN, wgSizeX, wgSizeY, transA, transB, outputDtype }),
+  };
+}
 
-      // 1. Uniforms
-      const m = ctx.emitLet("m", ctx.uniform("m"));
-      const n = ctx.emitLet("n", ctx.uniform("n"));
-      const k = ctx.emitLet("k", ctx.uniform("k"));
-      const lda = ctx.emitLet("lda", ctx.uniform("lda"));
-      const ldb = ctx.emitLet("ldb", ctx.uniform("ldb"));
-      const ldc = ctx.emitLet("ldc", ctx.uniform("ldc"));
-      const alpha = ctx.emitLet("alpha", ctx.uniform("alpha"));
+interface MatmulKernelParams {
+  tileM: number; tileN: number; tileK: number;
+  threadTileM: number; threadTileN: number;
+  wgSizeX: number; wgSizeY: number;
+  transA: boolean; transB: boolean;
+  outputDtype: DType;
+}
 
-      // 2. Batch / K-split offsets
-      let batchOffA: BlockExpr;
-      let batchOffB: BlockExpr;
-      let batchOffC: BlockExpr;
-      let splitIdx: BlockExpr | undefined;
+/** Original TileOps kernel body. */
+function matmulKernelTileOps(ctx: KernelContext, options: CodegenOptions, p: MatmulKernelParams): void {
+  const { epilogue, batched, kSplit } = options;
+  const { tileM, tileN, tileK, threadTileM, threadTileN, wgSizeX, wgSizeY, transA, transB, outputDtype } = p;
 
-      if (kSplit) {
-        splitIdx = ctx.emitLet("split_idx", ctx.programId(2));
-        batchOffA = ctx.emitLet("batch_offset_a", ctx.const(0, "u32"));
-        batchOffB = ctx.emitLet("batch_offset_b", ctx.const(0, "u32"));
-        batchOffC = ctx.const(0, "u32");
-      } else if (batched) {
-        const batchIdx = ctx.emitLet("batch_idx", ctx.programId(2));
-        batchOffA = ctx.emitLet("batch_offset_a", batchIdx.mul(ctx.uniform("batchStrideA")));
-        batchOffB = ctx.emitLet("batch_offset_b", batchIdx.mul(ctx.uniform("batchStrideB")));
-        batchOffC = ctx.emitLet("batch_offset_c", batchIdx.mul(ctx.uniform("batchStrideC")));
-      } else {
-        const batchIdx = ctx.emitLet("batch_idx", ctx.const(0, "u32"));
-        batchOffA = ctx.emitLet("batch_offset_a", batchIdx.mul(ctx.uniform("batchStrideA")));
-        batchOffB = ctx.emitLet("batch_offset_b", batchIdx.mul(ctx.uniform("batchStrideB")));
-        batchOffC = ctx.emitLet("batch_offset_c", batchIdx.mul(ctx.uniform("batchStrideC")));
-      }
+  const tileConfig: TileConfig = {
+    BLOCK_M: tileM, BLOCK_N: tileN, BLOCK_K: tileK,
+    threadTileM, threadTileN, wgSizeX, wgSizeY,
+  };
+  const ops = new TileOps(ctx, tileConfig);
 
-      // 3. Workgroup + thread positions
-      const wgRow = ctx.emitLet("wg_row", ctx.programId(1).mul(ctx.const(tileM, "u32")));
-      const wgCol = ctx.emitLet("wg_col", ctx.programId(0).mul(ctx.const(tileN, "u32")));
-      const threadRow = ctx.emitLet("thread_row", ctx.threadIdx(1));
-      const threadCol = ctx.emitLet("thread_col", ctx.threadIdx(0));
+  // 1. Uniforms
+  const m = ctx.emitLet("m", ctx.uniform("m"));
+  const n = ctx.emitLet("n", ctx.uniform("n"));
+  const k = ctx.emitLet("k", ctx.uniform("k"));
+  const lda = ctx.emitLet("lda", ctx.uniform("lda"));
+  const ldb = ctx.emitLet("ldb", ctx.uniform("ldb"));
+  const ldc = ctx.emitLet("ldc", ctx.uniform("ldc"));
+  const alpha = ctx.emitLet("alpha", ctx.uniform("alpha"));
 
-      // 4. Block ranges
-      const offsM = ops.arange(wgRow, tileM);
-      const offsN = ops.arange(wgCol, tileN);
+  // 2. Batch / K-split offsets
+  let batchOffA: BlockExpr;
+  let batchOffB: BlockExpr;
+  let batchOffC: BlockExpr;
+  let splitIdx: BlockExpr | undefined;
 
-      // 5. Transpose strides — just different index math at build time
-      const cOne = ctx.const(1, "u32");
-      const strideAm = transA ? cOne : lda;
-      const strideAk = transA ? lda : cOne;
-      const strideBk = transB ? cOne : ldb;
-      const strideBn = transB ? ldb : cOne;
+  if (kSplit) {
+    splitIdx = ctx.emitLet("split_idx", ctx.programId(2));
+    batchOffA = ctx.emitLet("batch_offset_a", ctx.const(0, "u32"));
+    batchOffB = ctx.emitLet("batch_offset_b", ctx.const(0, "u32"));
+    batchOffC = ctx.const(0, "u32");
+  } else if (batched) {
+    const batchIdx = ctx.emitLet("batch_idx", ctx.programId(2));
+    batchOffA = ctx.emitLet("batch_offset_a", batchIdx.mul(ctx.uniform("batchStrideA")));
+    batchOffB = ctx.emitLet("batch_offset_b", batchIdx.mul(ctx.uniform("batchStrideB")));
+    batchOffC = ctx.emitLet("batch_offset_c", batchIdx.mul(ctx.uniform("batchStrideC")));
+  } else {
+    const batchIdx = ctx.emitLet("batch_idx", ctx.const(0, "u32"));
+    batchOffA = ctx.emitLet("batch_offset_a", batchIdx.mul(ctx.uniform("batchStrideA")));
+    batchOffB = ctx.emitLet("batch_offset_b", batchIdx.mul(ctx.uniform("batchStrideB")));
+    batchOffC = ctx.emitLet("batch_offset_c", batchIdx.mul(ctx.uniform("batchStrideC")));
+  }
 
-      // 6. Accumulator — block-sized [BLOCK_M, BLOCK_N]
-      const acc = ops.zeros(tileM, tileN);
+  // 3. Workgroup + thread positions
+  const wgRow = ctx.emitLet("wg_row", ctx.programId(1).mul(ctx.const(tileM, "u32")));
+  const wgCol = ctx.emitLet("wg_col", ctx.programId(0).mul(ctx.const(tileN, "u32")));
+  const threadRow = ctx.emitLet("thread_row", ctx.threadIdx(1));
+  const threadCol = ctx.emitLet("thread_col", ctx.threadIdx(0));
 
-      // 7. K-loop bounds
-      let kStart: BlockExpr;
-      let kEnd: BlockExpr;
-      let numKTiles: BlockExpr;
-      const cTK = ctx.const(tileK, "u32");
+  // 4. Block ranges
+  const offsM = ops.arange(wgRow, tileM);
+  const offsN = ops.arange(wgCol, tileN);
 
-      if (kSplit) {
-        const kPerSplit = ctx.emitLet("k_per_split",
-          k.add(ctx.const(kSplit - 1, "u32")).div(ctx.const(kSplit, "u32")));
-        kStart = ctx.emitLet("k_start", splitIdx!.mul(kPerSplit));
-        kEnd = ctx.emitLet("k_end", kStart.add(kPerSplit).min(k));
-        numKTiles = ctx.emitLet("num_k_tiles",
-          kEnd.sub(kStart).add(ctx.const(tileK - 1, "u32")).div(cTK));
-      } else {
-        numKTiles = ctx.emitLet("num_k_tiles",
-          k.add(ctx.const(tileK - 1, "u32")).div(cTK));
-        kStart = ctx.emitLet("k_start", ctx.const(0, "u32"));
-        kEnd = ctx.emitLet("k_end", k);
-      }
+  // 5. Transpose strides
+  const cOne = ctx.const(1, "u32");
+  const strideAm = transA ? cOne : lda;
+  const strideAk = transA ? lda : cOne;
+  const strideBk = transB ? cOne : ldb;
+  const strideBn = transB ? ldb : cOne;
 
-      // 8. K-loop — the core matmul
-      ctx.forRange(ctx.const(0, "u32"), numKTiles, (kTile) => {
-        const kOffset = ctx.emitLet("k_offset", kStart.add(kTile.mul(cTK)));
-        const offsK = ops.arange(kOffset, tileK);
+  // 6. Accumulator
+  const acc = ops.zeros(tileM, tileN);
 
-        // Cooperative tile loads — transpose is just different strides
-        const aPtr = buildPtr(batchOffA, offsM.outer(strideAm), offsK.inner(strideAk));
-        const aMask = buildMask(offsM.lt(m), offsK.lt(kEnd));
-        const a = ops.load("a", aPtr, aMask);
+  // 7. K-loop bounds
+  let kStart: BlockExpr;
+  let kEnd: BlockExpr;
+  let numKTiles: BlockExpr;
+  const cTK = ctx.const(tileK, "u32");
 
-        const bPtr = buildPtr(batchOffB, offsK.outer(strideBk), offsN.inner(strideBn));
-        const bMask = buildMask(offsK.lt(kEnd), offsN.lt(n));
-        const b = ops.load("b", bPtr, bMask);
+  if (kSplit) {
+    const kPerSplit = ctx.emitLet("k_per_split",
+      k.add(ctx.const(kSplit - 1, "u32")).div(ctx.const(kSplit, "u32")));
+    kStart = ctx.emitLet("k_start", splitIdx!.mul(kPerSplit));
+    kEnd = ctx.emitLet("k_end", kStart.add(kPerSplit).min(k));
+    numKTiles = ctx.emitLet("num_k_tiles",
+      kEnd.sub(kStart).add(ctx.const(tileK - 1, "u32")).div(cTK));
+  } else {
+    numKTiles = ctx.emitLet("num_k_tiles",
+      k.add(ctx.const(tileK - 1, "u32")).div(cTK));
+    kStart = ctx.emitLet("k_start", ctx.const(0, "u32"));
+    kEnd = ctx.emitLet("k_end", k);
+  }
 
-        // acc += a @ b — the compiler generates barriers + outer product
-        ops.dot(a, b, acc);
-      });
+  // 8. K-loop
+  ctx.forRange(ctx.const(0, "u32"), numKTiles, (kTile) => {
+    const kOffset = ctx.emitLet("k_offset", kStart.add(kTile.mul(cTK)));
+    const offsK = ops.arange(kOffset, tileK);
 
-      // 9. Epilogue + Store
-      if (kSplit) {
-        // K-split: partial sums to temp buffer (no alpha, no epilogue)
-        const splitBase = ctx.emitLet("split_base", splitIdx!.mul(m.mul(n)));
-        const outPtr = buildPtr(splitBase, offsM.outer(ldc), offsN.inner(cOne));
-        const outMask = buildMask(offsM.lt(m), offsN.lt(n));
-        ops.store("out", outPtr, acc, outMask);
-      } else if (epilogue && hasBinaryEpilogue(epilogue)) {
-        // Binary epilogue needs the full output index → imperative store path
-        acc.mul_(alpha.toF32());
-        ctx.forRange(ctx.const(0, "u32"), ctx.const(threadTileM, "u32"), (tm) => {
-          ctx.forRange(ctx.const(0, "u32"), ctx.const(threadTileN, "u32"), (tn) => {
-            const outRow = ctx.emitLet("out_row",
-              wgRow.add(threadRow.mul(ctx.const(threadTileM, "u32")).add(tm)));
-            const outCol = ctx.emitLet("out_col",
-              wgCol.add(threadCol.mul(ctx.const(threadTileN, "u32")).add(tn)));
-            const inBounds = outRow.lt(m).and(outCol.lt(n));
-            ctx.ifThen(inBounds, () => {
-              const outIdx = ctx.emitLet("out_idx", batchOffC.add(outRow.mul(ldc).add(outCol)));
-              let result = ctx.emitLet("result", acc.get(tm, tn));
-              let step = 0;
-              for (const op of epilogue.ops) {
-                result = ctx.emitLet(`result_e${step++}`, applyEpilogueOp(ctx, op, result, outIdx, outCol));
-              }
-              if (epilogue.outputDtype === "f16" && !epilogue.ops.some(o => o.kind === "cast")) {
-                result = ctx.emitLet("result_final", result.toF16());
-              }
-              ctx.pushStatement({
-                kind: "indexAssign",
-                arrayName: "out",
-                idx: outIdx.node,
-                value: result.node,
-              });
-            });
-          });
-        });
-      } else {
-        // Simple epilogue path — accumulator ops + tile store
-        acc.mul_(alpha.toF32());
+    const aPtr = buildPtr(batchOffA, offsM.outer(strideAm), offsK.inner(strideAk));
+    const aMask = buildMask(offsM.lt(m), offsK.lt(kEnd));
+    const a = ops.load("a", aPtr, aMask);
 
-        if (epilogue && epilogue.ops.length > 0) {
+    const bPtr = buildPtr(batchOffB, offsK.outer(strideBk), offsN.inner(strideBn));
+    const bMask = buildMask(offsK.lt(kEnd), offsN.lt(n));
+    const b = ops.load("b", bPtr, bMask);
+
+    ops.dot(a, b, acc);
+  });
+
+  // 9. Epilogue + Store
+  if (kSplit) {
+    const splitBase = ctx.emitLet("split_base", splitIdx!.mul(m.mul(n)));
+    const outPtr = buildPtr(splitBase, offsM.outer(ldc), offsN.inner(cOne));
+    const outMask = buildMask(offsM.lt(m), offsN.lt(n));
+    ops.store("out", outPtr, acc, outMask);
+  } else if (epilogue && hasBinaryEpilogue(epilogue)) {
+    acc.mul_(alpha.toF32());
+    ctx.forRange(ctx.const(0, "u32"), ctx.const(threadTileM, "u32"), (tm) => {
+      ctx.forRange(ctx.const(0, "u32"), ctx.const(threadTileN, "u32"), (tn) => {
+        const outRow = ctx.emitLet("out_row",
+          wgRow.add(threadRow.mul(ctx.const(threadTileM, "u32")).add(tm)));
+        const outCol = ctx.emitLet("out_col",
+          wgCol.add(threadCol.mul(ctx.const(threadTileN, "u32")).add(tn)));
+        const inBounds = outRow.lt(m).and(outCol.lt(n));
+        ctx.ifThen(inBounds, () => {
+          const outIdx = ctx.emitLet("out_idx", batchOffC.add(outRow.mul(ldc).add(outCol)));
+          let result = ctx.emitLet("result", acc.get(tm, tn));
+          let step = 0;
           for (const op of epilogue.ops) {
-            applyEpilogueToAcc(ctx, ops, acc, op, offsN);
+            result = ctx.emitLet(`result_e${step++}`, applyEpilogueOp(ctx, op, result, outIdx, outCol));
           }
           if (epilogue.outputDtype === "f16" && !epilogue.ops.some(o => o.kind === "cast")) {
-            acc.castTo_("f16");
+            result = ctx.emitLet("result_final", result.toF16());
           }
-        } else if (outputDtype === "f16") {
-          acc.castTo_("f16");
-        }
+          ctx.pushStatement({
+            kind: "indexAssign",
+            arrayName: "out",
+            idx: outIdx.node,
+            value: result.node,
+          });
+        });
+      });
+    });
+  } else {
+    acc.mul_(alpha.toF32());
 
-        const outPtr = buildPtr(batchOffC, offsM.outer(ldc), offsN.inner(cOne));
-        const outMask = buildMask(offsM.lt(m), offsN.lt(n));
-        ops.store("out", outPtr, acc, outMask);
+    if (epilogue && epilogue.ops.length > 0) {
+      for (const op of epilogue.ops) {
+        applyEpilogueToAcc(ctx, ops, acc, op, offsN);
       }
-    },
-  };
+      if (epilogue.outputDtype === "f16" && !epilogue.ops.some(o => o.kind === "cast")) {
+        acc.castTo_("f16");
+      }
+    } else if (outputDtype === "f16") {
+      acc.castTo_("f16");
+    }
+
+    const outPtr = buildPtr(batchOffC, offsM.outer(ldc), offsN.inner(cOne));
+    const outMask = buildMask(offsM.lt(m), offsN.lt(n));
+    ops.store("out", outPtr, acc, outMask);
+  }
+}
+
+/** BlockOps kernel body — unified Block API for matmul. */
+function matmulKernelBlockOps(ctx: KernelContext, options: CodegenOptions, p: MatmulKernelParams): void {
+  const { epilogue, batched, kSplit } = options;
+  const { tileM, tileN, tileK, threadTileM, threadTileN, wgSizeX, wgSizeY, transA, transB, outputDtype } = p;
+
+  const ops = new BlockOps(ctx, {
+    wgSize: [wgSizeX, wgSizeY],
+    threadTile: [threadTileM, threadTileN],
+  });
+
+  // 1. Uniforms
+  const m = ctx.emitLet("m", ctx.uniform("m"));
+  const n = ctx.emitLet("n", ctx.uniform("n"));
+  const k = ctx.emitLet("k", ctx.uniform("k"));
+  const lda = ctx.emitLet("lda", ctx.uniform("lda"));
+  const ldb = ctx.emitLet("ldb", ctx.uniform("ldb"));
+  const ldc = ctx.emitLet("ldc", ctx.uniform("ldc"));
+  const alpha = ctx.emitLet("alpha", ctx.uniform("alpha"));
+
+  // 2. Batch / K-split offsets
+  let batchOffA: BlockExpr;
+  let batchOffB: BlockExpr;
+  let batchOffC: BlockExpr;
+  let splitIdx: BlockExpr | undefined;
+
+  if (kSplit) {
+    splitIdx = ctx.emitLet("split_idx", ctx.programId(2));
+    batchOffA = ctx.emitLet("batch_offset_a", ctx.const(0, "u32"));
+    batchOffB = ctx.emitLet("batch_offset_b", ctx.const(0, "u32"));
+    batchOffC = ctx.const(0, "u32");
+  } else if (batched) {
+    const batchIdx = ctx.emitLet("batch_idx", ctx.programId(2));
+    batchOffA = ctx.emitLet("batch_offset_a", batchIdx.mul(ctx.uniform("batchStrideA")));
+    batchOffB = ctx.emitLet("batch_offset_b", batchIdx.mul(ctx.uniform("batchStrideB")));
+    batchOffC = ctx.emitLet("batch_offset_c", batchIdx.mul(ctx.uniform("batchStrideC")));
+  } else {
+    const batchIdx = ctx.emitLet("batch_idx", ctx.const(0, "u32"));
+    batchOffA = ctx.emitLet("batch_offset_a", batchIdx.mul(ctx.uniform("batchStrideA")));
+    batchOffB = ctx.emitLet("batch_offset_b", batchIdx.mul(ctx.uniform("batchStrideB")));
+    batchOffC = ctx.emitLet("batch_offset_c", batchIdx.mul(ctx.uniform("batchStrideC")));
+  }
+
+  // 3. Workgroup + thread positions
+  const wgRow = ctx.emitLet("wg_row", ctx.programId(1).mul(ctx.const(tileM, "u32")));
+  const wgCol = ctx.emitLet("wg_col", ctx.programId(0).mul(ctx.const(tileN, "u32")));
+  const threadRow = ctx.emitLet("thread_row", ctx.threadIdx(1));
+  const threadCol = ctx.emitLet("thread_col", ctx.threadIdx(0));
+
+  // 4. Block ranges
+  const offsM = ops.arange(wgRow, tileM);
+  const offsN = ops.arange(wgCol, tileN);
+
+  // 5. Transpose strides
+  const cOne = ctx.const(1, "u32");
+  const strideAm = transA ? cOne : lda;
+  const strideAk = transA ? lda : cOne;
+  const strideBk = transB ? cOne : ldb;
+  const strideBn = transB ? ldb : cOne;
+
+  // 6. Accumulator — per-thread [threadTileM × threadTileN]
+  const acc = ops.zeros(threadTileM, threadTileN);
+
+  // 7. K-loop bounds
+  let kStart: BlockExpr;
+  let kEnd: BlockExpr;
+  let numKTiles: BlockExpr;
+  const cTK = ctx.const(tileK, "u32");
+
+  if (kSplit) {
+    const kPerSplit = ctx.emitLet("k_per_split",
+      k.add(ctx.const(kSplit - 1, "u32")).div(ctx.const(kSplit, "u32")));
+    kStart = ctx.emitLet("k_start", splitIdx!.mul(kPerSplit));
+    kEnd = ctx.emitLet("k_end", kStart.add(kPerSplit).min(k));
+    numKTiles = ctx.emitLet("num_k_tiles",
+      kEnd.sub(kStart).add(ctx.const(tileK - 1, "u32")).div(cTK));
+  } else {
+    numKTiles = ctx.emitLet("num_k_tiles",
+      k.add(ctx.const(tileK - 1, "u32")).div(cTK));
+    kStart = ctx.emitLet("k_start", ctx.const(0, "u32"));
+    kEnd = ctx.emitLet("k_end", k);
+  }
+
+  // 8. K-loop — the core matmul
+  ctx.forRange(ctx.const(0, "u32"), numKTiles, (kTile) => {
+    const kOffset = ctx.emitLet("k_offset", kStart.add(kTile.mul(cTK)));
+    const offsK = ops.arange(kOffset, tileK);
+
+    // Cooperative tile loads using loadTile (→ shared memory)
+    const aPtr = buildPtr(batchOffA, offsM.outer(strideAm), offsK.inner(strideAk));
+    const aMask = buildMask(offsM.lt(m), offsK.lt(kEnd));
+    const a = ops.loadTile("a", aPtr, aMask);
+
+    const bPtr = buildPtr(batchOffB, offsK.outer(strideBk), offsN.inner(strideBn));
+    const bMask = buildMask(offsK.lt(kEnd), offsN.lt(n));
+    const b = ops.loadTile("b", bPtr, bMask);
+
+    // acc += a @ b — shared × shared outer product
+    ops.dotAccum(a, b, acc);
+  });
+
+  // 9. Epilogue + Store — two paths only (K-split vs normal)
+  if (kSplit) {
+    // K-split: partial sums to temp buffer (no alpha, no epilogue)
+    const splitBase = ctx.emitLet("split_base", splitIdx!.mul(m.mul(n)));
+    const outPtr = buildPtr(splitBase, offsM.outer(ldc), offsN.inner(cOne));
+    const outMask = buildMask(offsM.lt(m), offsN.lt(n));
+    ops.storeTile("out", acc, outPtr, outMask);
+  } else {
+    acc.mul_(alpha.toF32());
+
+    if (epilogue && epilogue.ops.length > 0) {
+      // Thread-local output addressing for binary epilogue loads
+      const threadOutBase = ctx.emitLet("thread_out_base", batchOffC.add(
+        wgRow.add(threadRow.mul(ctx.const(threadTileM, "u32"))).mul(ldc)
+          .add(wgCol.add(threadCol.mul(ctx.const(threadTileN, "u32"))))
+      ));
+      applyBlockEpilogue(ctx, ops, acc, epilogue, {
+        offsN,
+        threadOutBase,
+        threadOutStride: ldc,
+      });
+    } else if (outputDtype === "f16") {
+      acc.castTo_("f16");
+    }
+
+    const outPtr = buildPtr(batchOffC, offsM.outer(ldc), offsN.inner(cOne));
+    const outMask = buildMask(offsM.lt(m), offsN.lt(n));
+    ops.storeTile("out", acc, outPtr, outMask);
+  }
 }
 
 // ============================================================================

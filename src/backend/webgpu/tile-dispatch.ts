@@ -138,26 +138,40 @@ export function createTileKernelDispatcher(spec: TileKernelSpec): TileKernelInst
       const ctx = requireContext();
       const device = ctx.device;
 
-      // Pipeline (cached via context.pipelines)
-      const pipeline = getPipeline(ctx, spec.name, getWGSL());
+      // Pipeline (cached via context.pipelines — key by WGSL content for uniqueness)
+      const wgsl = getWGSL();
+      const pipeline = getPipeline(ctx, wgsl, wgsl);
 
-      // Build buffer array in binding order
+      // Build buffer array in binding order, respecting uniformBindingIndex
       const bindingNames = Object.keys(spec.bindings);
       const bufferArray: GPUBuffer[] = [];
-      for (const name of bindingNames) {
-        const buf = buffers[name];
-        if (!buf) {
-          throw new Error(`Missing buffer for binding: ${name}`);
-        }
-        bufferArray.push(buf);
-      }
-
-      // Config uniform buffer (only when uniforms are declared)
       const hasUniforms = Object.keys(spec.uniforms).length > 0;
+      const uniformIdx = spec.uniformBindingIndex;
+      let configBuf: GPUBuffer | null = null;
+
       if (hasUniforms) {
         const configKey = uniformCacheKey(spec, uniforms);
         const { data, sizeBytes } = packUniforms(spec, uniforms);
-        const configBuf = getConfigBuffer(device, configKey, sizeBytes, data);
+        configBuf = getConfigBuffer(device, configKey, sizeBytes, data);
+      }
+
+      let bindingIndex = 0;
+      for (let i = 0; i < bindingNames.length; i++) {
+        // Insert uniform at the specified binding index
+        if (configBuf && uniformIdx !== undefined && bindingIndex === uniformIdx) {
+          bufferArray.push(configBuf);
+          bindingIndex++;
+        }
+        const buf = buffers[bindingNames[i]];
+        if (!buf) {
+          throw new Error(`Missing buffer for binding: ${bindingNames[i]}`);
+        }
+        bufferArray.push(buf);
+        bindingIndex++;
+      }
+
+      // Append uniform at end if not already inserted
+      if (configBuf && (uniformIdx === undefined || bindingIndex <= uniformIdx)) {
         bufferArray.push(configBuf);
       }
 

@@ -28,6 +28,9 @@ import type { TileKernelSpec } from "../../src/backend/webgpu/tile-ir";
 import { BlockOps, Block } from "../../src/backend/webgpu/tile-ops";
 import type { GPUBuffer, GPUDevice, GPUQueue } from "../../src/backend/webgpu/gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "../../src/backend/webgpu/gpu-types";
+import { createTiledMatmulKernel } from "../../src/backend/webgpu/matmul/tile-matmul";
+import { DEFAULT_CONFIG } from "../../src/backend/webgpu/matmul/types";
+import type { EpilogueConfig } from "../../src/backend/webgpu/matmul/codegen";
 
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -1314,5 +1317,275 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
 
     inputBuf.destroy();
     outBuf.destroy();
+  });
+});
+
+// ============================================================================
+// Block API Matmul Epilogue Tests
+// ============================================================================
+
+describe.runIf(isWebGPUEnabled)("Block API matmul epilogue (BlockOps path)", () => {
+  const origEnv = process.env.TORCHLETTE_BLOCK_MATMUL;
+
+  beforeAll(async () => {
+    process.env.TORCHLETTE_BLOCK_MATMUL = "1";
+    if (!device) {
+      const ok = await initWebGPU();
+      if (ok) {
+        device = getWebGPUDevice() as GPUDevice;
+        queue = device.queue;
+      }
+    }
+  });
+
+  afterAll(() => {
+    if (origEnv === undefined) delete process.env.TORCHLETTE_BLOCK_MATMUL;
+    else process.env.TORCHLETTE_BLOCK_MATMUL = origEnv;
+  });
+
+  // Tile-aligned size: 32×32 fits exactly in one workgroup with DEFAULT_CONFIG
+  const M = 32, N = 32, K = 32;
+  const config = DEFAULT_CONFIG;
+  const baseUniforms = {
+    m: M, n: N, k: K,
+    lda: K, ldb: N, ldc: N,
+    alpha: 1.0,
+    batchSize: 1, batchStrideA: 0, batchStrideB: 0, batchStrideC: 0,
+  };
+
+  function cpuMatmul(aData: Float32Array, bData: Float32Array): Float32Array {
+    const out = new Float32Array(M * N);
+    for (let m = 0; m < M; m++) {
+      for (let n = 0; n < N; n++) {
+        let s = 0;
+        for (let k = 0; k < K; k++) s += aData[m * K + k] * bData[k * N + n];
+        out[m * N + n] = s;
+      }
+    }
+    return out;
+  }
+
+  function makeTestData() {
+    const aData = new Float32Array(M * K);
+    const bData = new Float32Array(K * N);
+    for (let i = 0; i < M * K; i++) aData[i] = Math.sin(i * 0.07) * 0.3;
+    for (let i = 0; i < K * N; i++) bData[i] = Math.cos(i * 0.11) * 0.3;
+    return { aData, bData, expected: cpuMatmul(aData, bData) };
+  }
+
+  function maxError(actual: Float32Array, expected: Float32Array): number {
+    let maxErr = 0;
+    for (let i = 0; i < actual.length; i++) {
+      maxErr = Math.max(maxErr, Math.abs(actual[i] - expected[i]));
+    }
+    return maxErr;
+  }
+
+  it("matmul + bias epilogue", async () => {
+    const { aData, bData, expected } = makeTestData();
+    const biasData = new Float32Array(N);
+    for (let i = 0; i < N; i++) biasData[i] = (i - N / 2) * 0.1;
+    // Apply bias to reference
+    const ref = new Float32Array(M * N);
+    for (let i = 0; i < M * N; i++) ref[i] = expected[i] + biasData[i % N];
+
+    const epilogue: EpilogueConfig = {
+      ops: [{ kind: "bias", inputIndex: 0 }],
+      additionalInputCount: 1,
+      outputDtype: "f32",
+    };
+    const spec = createTiledMatmulKernel({
+      config, transposeMode: "NN", dtype: "f32", epilogue,
+    });
+
+    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+    const biasBuf = makeF32Buffer(biasData, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(M * N);
+
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder();
+    kernel.dispatch({ a: aBuf, b: bBuf, out: outBuf, epilogue_in0: biasBuf }, baseUniforms);
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, M * N);
+    expect(maxError(result, ref)).toBeLessThan(1e-3);
+
+    aBuf.destroy(); bBuf.destroy(); biasBuf.destroy(); outBuf.destroy();
+  });
+
+  it("matmul + relu epilogue", async () => {
+    const { aData, bData, expected } = makeTestData();
+    const ref = new Float32Array(M * N);
+    for (let i = 0; i < M * N; i++) ref[i] = Math.max(0, expected[i]);
+
+    const epilogue: EpilogueConfig = {
+      ops: [{ kind: "unary", op: "relu" }],
+      additionalInputCount: 0,
+      outputDtype: "f32",
+    };
+    const spec = createTiledMatmulKernel({
+      config, transposeMode: "NN", dtype: "f32", epilogue,
+    });
+
+    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(M * N);
+
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder();
+    kernel.dispatch({ a: aBuf, b: bBuf, out: outBuf }, baseUniforms);
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, M * N);
+    expect(maxError(result, ref)).toBeLessThan(1e-3);
+
+    aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+  });
+
+  it("matmul + bias + relu chain", async () => {
+    const { aData, bData, expected } = makeTestData();
+    const biasData = new Float32Array(N);
+    for (let i = 0; i < N; i++) biasData[i] = (i - N / 2) * 0.1;
+    const ref = new Float32Array(M * N);
+    for (let i = 0; i < M * N; i++) ref[i] = Math.max(0, expected[i] + biasData[i % N]);
+
+    const epilogue: EpilogueConfig = {
+      ops: [
+        { kind: "bias", inputIndex: 0 },
+        { kind: "unary", op: "relu" },
+      ],
+      additionalInputCount: 1,
+      outputDtype: "f32",
+    };
+    const spec = createTiledMatmulKernel({
+      config, transposeMode: "NN", dtype: "f32", epilogue,
+    });
+
+    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+    const biasBuf = makeF32Buffer(biasData, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(M * N);
+
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder();
+    kernel.dispatch({ a: aBuf, b: bBuf, out: outBuf, epilogue_in0: biasBuf }, baseUniforms);
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, M * N);
+    expect(maxError(result, ref)).toBeLessThan(1e-3);
+
+    aBuf.destroy(); bBuf.destroy(); biasBuf.destroy(); outBuf.destroy();
+  });
+
+  it("matmul + binary add (residual)", async () => {
+    const { aData, bData, expected } = makeTestData();
+    // Residual tensor: same shape as output (M×N)
+    const residualData = new Float32Array(M * N);
+    for (let i = 0; i < M * N; i++) residualData[i] = Math.sin(i * 0.13) * 0.5;
+    const ref = new Float32Array(M * N);
+    for (let i = 0; i < M * N; i++) ref[i] = expected[i] + residualData[i];
+
+    const epilogue: EpilogueConfig = {
+      ops: [{ kind: "binary", op: "add", inputIndex: 0 }],
+      additionalInputCount: 1,
+      outputDtype: "f32",
+    };
+    const spec = createTiledMatmulKernel({
+      config, transposeMode: "NN", dtype: "f32", epilogue,
+    });
+
+    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+    const resBuf = makeF32Buffer(residualData, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(M * N);
+
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder();
+    kernel.dispatch({ a: aBuf, b: bBuf, out: outBuf, epilogue_in0: resBuf }, baseUniforms);
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, M * N);
+    expect(maxError(result, ref)).toBeLessThan(1e-3);
+
+    aBuf.destroy(); bBuf.destroy(); resBuf.destroy(); outBuf.destroy();
+  });
+
+  it("matmul + bias + binary add + relu chain", async () => {
+    const { aData, bData, expected } = makeTestData();
+    const biasData = new Float32Array(N);
+    for (let i = 0; i < N; i++) biasData[i] = (i - N / 2) * 0.1;
+    const residualData = new Float32Array(M * N);
+    for (let i = 0; i < M * N; i++) residualData[i] = Math.sin(i * 0.13) * 0.5;
+    // Reference: matmul → +bias → +residual → relu
+    const ref = new Float32Array(M * N);
+    for (let i = 0; i < M * N; i++) {
+      ref[i] = Math.max(0, expected[i] + biasData[i % N] + residualData[i]);
+    }
+
+    const epilogue: EpilogueConfig = {
+      ops: [
+        { kind: "bias", inputIndex: 0 },
+        { kind: "binary", op: "add", inputIndex: 1 },
+        { kind: "unary", op: "relu" },
+      ],
+      additionalInputCount: 2,
+      outputDtype: "f32",
+    };
+    const spec = createTiledMatmulKernel({
+      config, transposeMode: "NN", dtype: "f32", epilogue,
+    });
+
+    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+    const biasBuf = makeF32Buffer(biasData, GPUBufferUsage.STORAGE);
+    const resBuf = makeF32Buffer(residualData, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(M * N);
+
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder();
+    kernel.dispatch({
+      a: aBuf, b: bBuf, out: outBuf,
+      epilogue_in0: biasBuf, epilogue_in1: resBuf,
+    }, baseUniforms);
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, M * N);
+    expect(maxError(result, ref)).toBeLessThan(1e-3);
+
+    aBuf.destroy(); bBuf.destroy(); biasBuf.destroy(); resBuf.destroy(); outBuf.destroy();
+  });
+
+  it("matmul + gelu epilogue", async () => {
+    const { aData, bData, expected } = makeTestData();
+    const ref = new Float32Array(M * N);
+    for (let i = 0; i < M * N; i++) {
+      const x = expected[i];
+      const inner = 0.7978845608 * (x + 0.044715 * x * x * x);
+      ref[i] = 0.5 * x * (1 + Math.tanh(inner));
+    }
+
+    const epilogue: EpilogueConfig = {
+      ops: [{ kind: "unary", op: "gelu" }],
+      additionalInputCount: 0,
+      outputDtype: "f32",
+    };
+    const spec = createTiledMatmulKernel({
+      config, transposeMode: "NN", dtype: "f32", epilogue,
+    });
+
+    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(M * N);
+
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder();
+    kernel.dispatch({ a: aBuf, b: bBuf, out: outBuf }, baseUniforms);
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, M * N);
+    expect(maxError(result, ref)).toBeLessThan(1e-3);
+
+    aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
   });
 });
