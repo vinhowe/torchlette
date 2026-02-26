@@ -1,4 +1,4 @@
-import { normalizeDim as normalizeDimShared, type GeluOptions } from "../types";
+import { normalizeDim as normalizeDimBase, type GeluOptions } from "../types";
 import { sizeOf, broadcastShapes } from "../../core/shape";
 
 export type Shape = number[];
@@ -307,7 +307,7 @@ export function permute(a: Tensor, dims: number[]): Tensor {
   // Check for valid permutation
   const seen = new Set<number>();
   for (const d of dims) {
-    const nd = normalizeDimShared(d, rank);
+    const nd = normalizeDimBase(d, rank);
     if (nd < 0 || nd >= rank) {
       throw new Error(`permute: dimension ${d} out of range for rank ${rank}`);
     }
@@ -318,7 +318,7 @@ export function permute(a: Tensor, dims: number[]): Tensor {
   }
 
   // Normalize dims
-  const normalizedDims = dims.map((d) => normalizeDimShared(d, rank));
+  const normalizedDims = dims.map((d) => normalizeDimBase(d, rank));
 
   // Reorder shape and strides
   const newShape = normalizedDims.map((d) => a.shape[d]);
@@ -764,7 +764,7 @@ function broadcastTo(a: Tensor, targetShape: Shape): Tensor {
 }
 
 function normalizeDim(dim: number, rank: number): number {
-  const normalized = dim < 0 ? rank + dim : dim;
+  const normalized = normalizeDimBase(dim, rank);
   if (normalized < 0 || normalized >= rank) {
     throw new Error(`dim out of range: ${dim}`);
   }
@@ -910,7 +910,7 @@ function sumAll(a: Tensor): number {
 
 function normalizeDims(dim: number | number[], rank: number): number[] {
   const dims = Array.isArray(dim) ? dim.slice() : [dim];
-  const normalized = dims.map((value) => (value < 0 ? rank + value : value));
+  const normalized = dims.map((value) => normalizeDimBase(value, rank));
   const unique = new Set<number>();
   for (const value of normalized) {
     if (value < 0 || value >= rank) {
@@ -1052,7 +1052,7 @@ export function max(a: Tensor, options?: MaxOptions): Tensor {
 
 function normalizeDimsForReduce(dim: number | number[], rank: number, opName: string): number[] {
   const dims = Array.isArray(dim) ? dim.slice() : [dim];
-  const normalized = dims.map((value) => (value < 0 ? rank + value : value));
+  const normalized = dims.map((value) => normalizeDimBase(value, rank));
   const unique = new Set<number>();
   for (const value of normalized) {
     if (value < 0 || value >= rank) {
