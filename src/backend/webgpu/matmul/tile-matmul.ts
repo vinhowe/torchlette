@@ -9,205 +9,15 @@
  */
 
 import type { TileKernelSpec, DataType, BlockExpr, KernelContext } from "../tile-ir";
-import type { CodegenOptions, EpilogueConfig } from "./codegen";
+import type { CodegenOptions } from "./codegen";
 import { getWorkgroupSize, type DType } from "./types";
 import { TileOps, BlockOps, Block, TileRange, buildPtr, buildMask, type TileConfig } from "../tile-ops";
-
-// ============================================================================
-// Epilogue Expression Helpers
-// ============================================================================
-
-function applyGelu(ctx: KernelContext, x: BlockExpr): BlockExpr {
-  const inner = ctx.const(0.7978845608).mul(x.add(ctx.const(0.044715).mul(x.mul(x).mul(x))));
-  return x.mul(ctx.const(0.5)).mul(ctx.const(1.0).add(inner.tanh()));
-}
-
-function applyGeluErf(ctx: KernelContext, x: BlockExpr): BlockExpr {
-  const absX = x.abs();
-  const t = ctx.const(1.0).div(
-    ctx.const(1.0).add(ctx.const(0.3275911).mul(absX.mul(ctx.const(0.7071067811865476))))
-  );
-  const poly = ctx.const(1.061405429).mul(t)
-    .add(ctx.const(-1.453152027)).mul(t)
-    .add(ctx.const(1.421413741)).mul(t)
-    .add(ctx.const(-0.284496736)).mul(t)
-    .add(ctx.const(0.254829592)).mul(t);
-  const erfApprox = ctx.const(1.0).sub(poly.mul(x.neg().mul(x).mul(ctx.const(0.5)).exp()));
-  const signX = x.ge(ctx.const(0.0)).select(ctx.const(1.0), ctx.const(-1.0));
-  return x.mul(ctx.const(0.5)).mul(ctx.const(1.0).add(signX.mul(erfApprox)));
-}
-
-function applySilu(ctx: KernelContext, x: BlockExpr): BlockExpr {
-  return x.div(ctx.const(1.0).add(x.neg().exp()));
-}
-
-function applySigmoid(ctx: KernelContext, x: BlockExpr): BlockExpr {
-  return ctx.const(1.0).div(ctx.const(1.0).add(x.neg().exp()));
-}
-
-/** Apply a unary epilogue op to a BlockExpr value. */
-function applyUnaryOp(ctx: KernelContext, opName: string, x: BlockExpr): BlockExpr {
-  switch (opName) {
-    case "relu": return x.gt(ctx.const(0.0)).select(x, ctx.const(0.0));
-    case "gelu": case "gelu_tanh": return applyGelu(ctx, x);
-    case "gelu_erf": return applyGeluErf(ctx, x);
-    case "silu": return applySilu(ctx, x);
-    case "sigmoid": return applySigmoid(ctx, x);
-    case "tanh": return x.tanh();
-    case "neg": return x.neg();
-    case "abs": return x.abs();
-    case "exp": return x.exp();
-    case "log": return x.log();
-    case "sqrt": return x.sqrt();
-    default: throw new Error(`Unsupported unary epilogue op: ${opName}`);
-  }
-}
-
-/** Apply an epilogue op to a result expression (used for binary epilogue fallback). */
-function applyEpilogueOp(
-  ctx: KernelContext,
-  op: EpilogueConfig["ops"][number],
-  result: BlockExpr,
-  outIdx: BlockExpr,
-  outCol: BlockExpr,
-): BlockExpr {
-  switch (op.kind) {
-    case "none": return result;
-    case "bias": return result.add(ctx.load(`epilogue_in${op.inputIndex}`, outCol));
-    case "unary": return applyUnaryOp(ctx, op.op, result);
-    case "binary": {
-      const rhs = ctx.load(`epilogue_in${op.inputIndex}`, outIdx);
-      switch (op.op) {
-        case "add": return result.add(rhs);
-        case "sub": return result.sub(rhs);
-        case "mul": return result.mul(rhs);
-        case "div": return result.div(rhs);
-        default: throw new Error(`Unsupported binary epilogue op: ${op.op}`);
-      }
-    }
-    case "cast": return op.toDtype === "f16" ? result.toF16() : result.toF32();
-    case "relu": return result.gt(ctx.const(0.0)).select(result, ctx.const(0.0));
-    case "gelu": return applyGelu(ctx, result);
-    case "silu": return applySilu(ctx, result);
-    case "add": return result.add(ctx.load(`epilogue_in${op.inputIndex}`, outIdx));
-    case "mul": return result.mul(ctx.load(`epilogue_in${op.inputIndex}`, outIdx));
-  }
-}
-
-/** Check if epilogue has any binary ops that need the full output index. */
-function hasBinaryEpilogue(epilogue: EpilogueConfig): boolean {
-  return epilogue.ops.some(o => o.kind === "binary" || o.kind === "add" || o.kind === "mul");
-}
-
-/** Apply a non-binary epilogue op to the accumulator. */
-function applyEpilogueToAcc(
-  ctx: KernelContext,
-  ops: TileOps,
-  acc: InstanceType<typeof import("../tile-ops").Accumulator>,
-  op: EpilogueConfig["ops"][number],
-  offsN: InstanceType<typeof import("../tile-ops").TileRange>,
-): void {
-  switch (op.kind) {
-    case "none": break;
-    case "bias":
-      acc.add_(ops.load1d(`epilogue_in${op.inputIndex}`, offsN));
-      break;
-    case "unary":
-      acc.apply_((x) => applyUnaryOp(ctx, op.op, x));
-      break;
-    case "cast":
-      if (op.toDtype === "f16") acc.castTo_("f16");
-      // f32 cast is a no-op on the f32 accumulator
-      break;
-    case "relu":
-      acc.apply_((x) => x.gt(ctx.const(0.0)).select(x, ctx.const(0.0)));
-      break;
-    case "gelu":
-      acc.apply_((x) => applyGelu(ctx, x));
-      break;
-    case "silu":
-      acc.apply_((x) => applySilu(ctx, x));
-      break;
-    // binary/add/mul should not reach here — caller checks hasBinaryEpilogue
-  }
-}
-
-/**
- * Apply composable epilogue ops to a Block accumulator using only Block-level operations.
- *
- * Binary epilogue (residual add) collapses to the same path as simple epilogue:
- * load the binary operand as a register Block via ops.load() with thread ptr,
- * then acc.add_(binaryBlock). WebGPU clamped reads (OOB → 0) make this safe;
- * the storeTile mask prevents writing OOB elements.
- */
-function applyBlockEpilogue(
-  ctx: KernelContext,
-  ops: BlockOps,
-  acc: Block,
-  epilogue: EpilogueConfig,
-  addressing: {
-    offsN: TileRange;
-    threadOutBase: BlockExpr;
-    threadOutStride: BlockExpr;
-  },
-): void {
-  const { offsN, threadOutBase, threadOutStride } = addressing;
-  for (const op of epilogue.ops) {
-    switch (op.kind) {
-      case "none": break;
-      case "bias":
-        acc.add_(ops.load1d(`epilogue_in${op.inputIndex}`, offsN));
-        break;
-      case "unary":
-        acc.apply_((x) => applyUnaryOp(ctx, op.op, x));
-        break;
-      case "binary": {
-        // Load binary operand at same indices the store will write to
-        const binBlock = ops.load(`epilogue_in${op.inputIndex}`,
-          { kind: "thread", base: threadOutBase, stride: threadOutStride },
-          { rows: acc.rows, cols: acc.cols },
-        );
-        switch (op.op) {
-          case "add": acc.add_(binBlock); break;
-          case "sub": acc.sub_(binBlock); break;
-          case "mul": acc.mul_(binBlock); break;
-          default: throw new Error(`Unsupported binary epilogue: ${op.op}`);
-        }
-        break;
-      }
-      case "cast":
-        if (op.toDtype === "f16") acc.castTo_("f16");
-        break;
-      // Backward-compat kinds
-      case "relu":
-        acc.apply_((x) => x.gt(ctx.const(0.0)).select(x, ctx.const(0.0)));
-        break;
-      case "gelu":
-        acc.apply_((x) => applyGelu(ctx, x));
-        break;
-      case "silu":
-        acc.apply_((x) => applySilu(ctx, x));
-        break;
-      case "add": {
-        const b = ops.load(`epilogue_in${op.inputIndex}`,
-          { kind: "thread", base: threadOutBase, stride: threadOutStride },
-          { rows: acc.rows, cols: acc.cols });
-        acc.add_(b);
-        break;
-      }
-      case "mul": {
-        const b = ops.load(`epilogue_in${op.inputIndex}`,
-          { kind: "thread", base: threadOutBase, stride: threadOutStride },
-          { rows: acc.rows, cols: acc.cols });
-        acc.mul_(b);
-        break;
-      }
-    }
-  }
-  if (epilogue.outputDtype === "f16" && !epilogue.ops.some(o => o.kind === "cast")) {
-    acc.castTo_("f16");
-  }
-}
+import {
+  composeBlockOpsEpilogue,
+  composeTileOpsEpilogue,
+  type BlockOpsPostAccFn,
+  type TileOpsPostAcc,
+} from "./matmul-epilogue-compose";
 
 // ============================================================================
 // Main Kernel Builder
@@ -255,6 +65,21 @@ export function createTiledMatmulKernel(options: CodegenOptions): TileKernelSpec
 
   const useBlockOps = process.env.TORCHLETTE_BLOCK_MATMUL === "1";
 
+  // Build post-accumulate callback from epilogue config.
+  // This is the composition boundary: the kernel body receives a callback,
+  // not an EpilogueConfig, keeping it epilogue-agnostic.
+  let blockOpsPostAcc: BlockOpsPostAccFn | undefined;
+  let tileOpsPostAcc: TileOpsPostAcc | undefined;
+  if (epilogue && epilogue.ops.length > 0 && !kSplit) {
+    if (useBlockOps) {
+      blockOpsPostAcc = composeBlockOpsEpilogue(epilogue, outputDtype);
+    } else {
+      tileOpsPostAcc = composeTileOpsEpilogue(epilogue, outputDtype, threadTileM, threadTileN);
+    }
+  }
+
+  const params: MatmulKernelParams = { tileM, tileN, tileK, threadTileM, threadTileN, wgSizeX, wgSizeY, transA, transB, outputDtype };
+
   return {
     name: "tiledMatmul",
     workgroupSize: [wgSizeX, wgSizeY],
@@ -271,8 +96,8 @@ export function createTiledMatmulKernel(options: CodegenOptions): TileKernelSpec
     grid: () => [1],
 
     kernel: useBlockOps
-      ? (ctx) => matmulKernelBlockOps(ctx, options, { tileM, tileN, tileK, threadTileM, threadTileN, wgSizeX, wgSizeY, transA, transB, outputDtype })
-      : (ctx) => matmulKernelTileOps(ctx, options, { tileM, tileN, tileK, threadTileM, threadTileN, wgSizeX, wgSizeY, transA, transB, outputDtype }),
+      ? (ctx) => matmulKernelBlockOps(ctx, { batched, kSplit }, params, blockOpsPostAcc)
+      : (ctx) => matmulKernelTileOps(ctx, { batched, kSplit }, params, tileOpsPostAcc),
   };
 }
 
@@ -284,9 +109,14 @@ interface MatmulKernelParams {
   outputDtype: DType;
 }
 
-/** Original TileOps kernel body. */
-function matmulKernelTileOps(ctx: KernelContext, options: CodegenOptions, p: MatmulKernelParams): void {
-  const { epilogue, batched, kSplit } = options;
+/** TileOps kernel body — pure matmul with optional post-accumulate callback. */
+function matmulKernelTileOps(
+  ctx: KernelContext,
+  opts: { batched?: boolean; kSplit?: number },
+  p: MatmulKernelParams,
+  postAccumulate?: TileOpsPostAcc,
+): void {
+  const { batched, kSplit } = opts;
   const { tileM, tileN, tileK, threadTileM, threadTileN, wgSizeX, wgSizeY, transA, transB, outputDtype } = p;
 
   const tileConfig: TileConfig = {
@@ -367,7 +197,7 @@ function matmulKernelTileOps(ctx: KernelContext, options: CodegenOptions, p: Mat
     kEnd = ctx.emitLet("k_end", k);
   }
 
-  // 8. K-loop
+  // 8. K-loop — the core matmul
   ctx.forRange(ctx.const(0, "u32"), numKTiles, (kTile) => {
     const kOffset = ctx.emitLet("k_offset", kStart.add(kTile.mul(cTK)));
     const offsK = ops.arange(kOffset, tileK);
@@ -383,63 +213,42 @@ function matmulKernelTileOps(ctx: KernelContext, options: CodegenOptions, p: Mat
     ops.dot(a, b, acc);
   });
 
-  // 9. Epilogue + Store
+  // 9. Store — two paths: K-split (raw partials) vs normal (with optional post-accumulate)
   if (kSplit) {
     const splitBase = ctx.emitLet("split_base", splitIdx!.mul(m.mul(n)));
     const outPtr = buildPtr(splitBase, offsM.outer(ldc), offsN.inner(cOne));
     const outMask = buildMask(offsM.lt(m), offsN.lt(n));
     ops.store("out", outPtr, acc, outMask);
-  } else if (epilogue && hasBinaryEpilogue(epilogue)) {
-    acc.mul_(alpha.toF32());
-    ctx.forRange(ctx.const(0, "u32"), ctx.const(threadTileM, "u32"), (tm) => {
-      ctx.forRange(ctx.const(0, "u32"), ctx.const(threadTileN, "u32"), (tn) => {
-        const outRow = ctx.emitLet("out_row",
-          wgRow.add(threadRow.mul(ctx.const(threadTileM, "u32")).add(tm)));
-        const outCol = ctx.emitLet("out_col",
-          wgCol.add(threadCol.mul(ctx.const(threadTileN, "u32")).add(tn)));
-        const inBounds = outRow.lt(m).and(outCol.lt(n));
-        ctx.ifThen(inBounds, () => {
-          const outIdx = ctx.emitLet("out_idx", batchOffC.add(outRow.mul(ldc).add(outCol)));
-          let result = ctx.emitLet("result", acc.get(tm, tn));
-          let step = 0;
-          for (const op of epilogue.ops) {
-            result = ctx.emitLet(`result_e${step++}`, applyEpilogueOp(ctx, op, result, outIdx, outCol));
-          }
-          if (epilogue.outputDtype === "f16" && !epilogue.ops.some(o => o.kind === "cast")) {
-            result = ctx.emitLet("result_final", result.toF16());
-          }
-          ctx.pushStatement({
-            kind: "indexAssign",
-            arrayName: "out",
-            idx: outIdx.node,
-            value: result.node,
-          });
-        });
-      });
-    });
   } else {
     acc.mul_(alpha.toF32());
 
-    if (epilogue && epilogue.ops.length > 0) {
-      for (const op of epilogue.ops) {
-        applyEpilogueToAcc(ctx, ops, acc, op, offsN);
+    if (postAccumulate) {
+      const addressing = { batchOffC, wgRow, wgCol, threadRow, threadCol, m, n, ldc, offsM, offsN };
+      postAccumulate.fn(ctx, ops, acc, addressing);
+      if (!postAccumulate.handlesStore) {
+        const outPtr = buildPtr(batchOffC, offsM.outer(ldc), offsN.inner(cOne));
+        const outMask = buildMask(offsM.lt(m), offsN.lt(n));
+        ops.store("out", outPtr, acc, outMask);
       }
-      if (epilogue.outputDtype === "f16" && !epilogue.ops.some(o => o.kind === "cast")) {
+    } else {
+      if (outputDtype === "f16") {
         acc.castTo_("f16");
       }
-    } else if (outputDtype === "f16") {
-      acc.castTo_("f16");
+      const outPtr = buildPtr(batchOffC, offsM.outer(ldc), offsN.inner(cOne));
+      const outMask = buildMask(offsM.lt(m), offsN.lt(n));
+      ops.store("out", outPtr, acc, outMask);
     }
-
-    const outPtr = buildPtr(batchOffC, offsM.outer(ldc), offsN.inner(cOne));
-    const outMask = buildMask(offsM.lt(m), offsN.lt(n));
-    ops.store("out", outPtr, acc, outMask);
   }
 }
 
-/** BlockOps kernel body — unified Block API for matmul. */
-function matmulKernelBlockOps(ctx: KernelContext, options: CodegenOptions, p: MatmulKernelParams): void {
-  const { epilogue, batched, kSplit } = options;
+/** BlockOps kernel body — pure matmul with optional post-accumulate callback. */
+function matmulKernelBlockOps(
+  ctx: KernelContext,
+  opts: { batched?: boolean; kSplit?: number },
+  p: MatmulKernelParams,
+  postAccumulate?: BlockOpsPostAccFn,
+): void {
+  const { batched, kSplit } = opts;
   const { tileM, tileN, tileK, threadTileM, threadTileN, wgSizeX, wgSizeY, transA, transB, outputDtype } = p;
 
   const ops = new BlockOps(ctx, {
@@ -537,9 +346,8 @@ function matmulKernelBlockOps(ctx: KernelContext, options: CodegenOptions, p: Ma
     ops.dotAccum(a, b, acc);
   });
 
-  // 9. Epilogue + Store — two paths only (K-split vs normal)
+  // 9. Store — two paths: K-split (raw partials) vs normal (with optional post-accumulate)
   if (kSplit) {
-    // K-split: partial sums to temp buffer (no alpha, no epilogue)
     const splitBase = ctx.emitLet("split_base", splitIdx!.mul(m.mul(n)));
     const outPtr = buildPtr(splitBase, offsM.outer(ldc), offsN.inner(cOne));
     const outMask = buildMask(offsM.lt(m), offsN.lt(n));
@@ -547,17 +355,12 @@ function matmulKernelBlockOps(ctx: KernelContext, options: CodegenOptions, p: Ma
   } else {
     acc.mul_(alpha.toF32());
 
-    if (epilogue && epilogue.ops.length > 0) {
-      // Thread-local output addressing for binary epilogue loads
+    if (postAccumulate) {
       const threadOutBase = ctx.emitLet("thread_out_base", batchOffC.add(
         wgRow.add(threadRow.mul(ctx.const(threadTileM, "u32"))).mul(ldc)
           .add(wgCol.add(threadCol.mul(ctx.const(threadTileN, "u32"))))
       ));
-      applyBlockEpilogue(ctx, ops, acc, epilogue, {
-        offsN,
-        threadOutBase,
-        threadOutStride: ldc,
-      });
+      postAccumulate(ctx, ops, acc, { offsN, threadOutBase, threadOutStride: ldc });
     } else if (outputDtype === "f16") {
       acc.castTo_("f16");
     }
