@@ -141,12 +141,7 @@ export function createTileKernelDispatcher(spec: TileKernelSpec): TileKernelInst
       // Pipeline (cached via context.pipelines)
       const pipeline = getPipeline(ctx, spec.name, getWGSL());
 
-      // Config uniform buffer
-      const configKey = uniformCacheKey(spec, uniforms);
-      const { data, sizeBytes } = packUniforms(spec, uniforms);
-      const configBuf = getConfigBuffer(device, configKey, sizeBytes, data);
-
-      // Build buffer array in binding order + config at end
+      // Build buffer array in binding order
       const bindingNames = Object.keys(spec.bindings);
       const bufferArray: GPUBuffer[] = [];
       for (const name of bindingNames) {
@@ -156,7 +151,15 @@ export function createTileKernelDispatcher(spec: TileKernelSpec): TileKernelInst
         }
         bufferArray.push(buf);
       }
-      bufferArray.push(configBuf);
+
+      // Config uniform buffer (only when uniforms are declared)
+      const hasUniforms = Object.keys(spec.uniforms).length > 0;
+      if (hasUniforms) {
+        const configKey = uniformCacheKey(spec, uniforms);
+        const { data, sizeBytes } = packUniforms(spec, uniforms);
+        const configBuf = getConfigBuffer(device, configKey, sizeBytes, data);
+        bufferArray.push(configBuf);
+      }
 
       // Bind group
       const bindGroup = cachedCreateBindGroup(device, pipeline, bufferArray);

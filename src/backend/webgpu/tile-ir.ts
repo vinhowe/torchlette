@@ -185,6 +185,13 @@ export interface SubgroupShuffleXorNode extends IRNodeBase {
   mask: IRNode;
 }
 
+/** dot(vec4<f32>(a0,a1,a2,a3), vec4<f32>(b0,b1,b2,b3)) → f32 scalar */
+export interface Vec4DotNode extends IRNodeBase {
+  kind: "vec4dot";
+  a: [IRNode, IRNode, IRNode, IRNode];
+  b: [IRNode, IRNode, IRNode, IRNode];
+}
+
 export type IRNode =
   | ProgramIdNode
   | BlockRangeNode
@@ -205,7 +212,8 @@ export type IRNode =
   | NamedRefNode
   | ArrayReadNode
   | GlobalIdNode
-  | SubgroupShuffleXorNode;
+  | SubgroupShuffleXorNode
+  | Vec4DotNode;
 
 // ============================================================================
 // Tile-Level IR Types (block-level, compiler-lowered)
@@ -290,6 +298,101 @@ export interface TileStoreStmt {
   accDtype?: DataType;    // set by castTo_, affects store type conversion
 }
 
+// --- Block-level statement types (unified Block API) ---
+
+export type BlockBinaryOp = "add" | "sub" | "mul" | "div" | "max" | "copy";
+export type BlockUnaryOp = "exp" | "log" | "neg";
+export type BlockReduceOp = "max" | "sum";
+
+export interface BlockAllocStmt {
+  kind: "blockAlloc";
+  name: string;
+  rows: number;
+  cols: number;
+  elemType: DataType;
+  initValue?: number;  // undefined = zero-init, number = fill with this value
+}
+
+export interface BlockLoadStmt {
+  kind: "blockLoad";
+  binding: string;
+  name: string;
+  rows: number;
+  cols: number;
+  elemType: DataType;
+  ptrKind: "thread" | "tile";
+  // Thread ptr fields
+  threadBase?: IRNode;
+  threadStride?: IRNode;
+  // Tile ptr fields (reuses existing types)
+  tilePtr?: TilePtr2D;
+  tileMask?: TileMask2D;
+  // Thread-level guard (for thread ptr bounds checking)
+  guard?: IRNode;
+}
+
+export interface BlockStoreStmt {
+  kind: "blockStore";
+  binding: string;
+  blockName: string;
+  rows: number;
+  cols: number;
+  base: IRNode;
+  stride: IRNode;
+  guard?: IRNode;
+}
+
+export interface BlockDotStmt {
+  kind: "blockDot";
+  aName: string;
+  bName: string;
+  resultName: string;
+  accName?: string;       // if set, accumulate into existing block
+  aPlacement: "register" | "shared";
+  bPlacement: "register" | "shared";
+  bTransposed: boolean;
+  aRows: number;
+  aCols: number;
+  bRows: number;          // ORIGINAL (untransposed) rows
+  bCols: number;          // ORIGINAL (untransposed) cols
+  threadTileM?: number;   // per-thread M dim (for shared×shared outer product)
+  threadTileN?: number;   // per-thread N dim (for shared×shared outer product)
+}
+
+export interface BlockReduceStmt {
+  kind: "blockReduce";
+  inputName: string;
+  outputName: string;
+  inputRows: number;
+  inputCols: number;
+  axis: number;
+  op: BlockReduceOp;
+}
+
+export interface BlockUnaryStmt {
+  kind: "blockUnary";
+  inputName: string;
+  outputName: string;
+  rows: number;
+  cols: number;
+  op: BlockUnaryOp;
+  inPlace: boolean;
+}
+
+export interface BlockBinaryStmt {
+  kind: "blockBinary";
+  aName: string;
+  bName: string;
+  outputName: string;
+  aRows: number;
+  aCols: number;
+  bRows: number;
+  bCols: number;
+  op: BlockBinaryOp;
+  inPlace: boolean;
+  bScalarExpr?: IRNode;   // when set, B is a scalar expression (bName unused)
+}
+
 // ============================================================================
 // Statement Types (imperative mode)
 // ============================================================================
@@ -314,7 +417,15 @@ export type Statement =
   | DotStmt
   | AccOpStmt
   | TileLoad1DStmt
-  | TileStoreStmt;
+  | TileStoreStmt
+  // Block-level statements (unified Block API, lowered by tile compiler)
+  | BlockAllocStmt
+  | BlockLoadStmt
+  | BlockStoreStmt
+  | BlockDotStmt
+  | BlockReduceStmt
+  | BlockUnaryStmt
+  | BlockBinaryStmt;
 
 export interface LetStmt {
   kind: "let";
