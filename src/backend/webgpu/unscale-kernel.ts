@@ -31,6 +31,10 @@ import { gpuMemoryTracker } from "./memory-tracker";
 import type { GPUBuffer, GPUBindGroup, GPUDevice, GPUCommandEncoder } from "./gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "./gpu-types";
 import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
+import { compileTileKernel } from "./tile-compiler";
+import type { TileKernelSpec } from "./tile-ir";
+
+const USE_TILE_IR_UNSCALE = process.env.TORCHLETTE_TILE_UNSCALE !== "0";
 
 // ============================================================================
 // WGSL Shader
@@ -77,6 +81,75 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }
 `;
+}
+
+// ============================================================================
+// Tile-IR Unscale Spec Factory
+// ============================================================================
+
+/**
+ * Build a TileKernelSpec for the unscale+inf-check kernel.
+ *
+ * Only used for WGSL generation — dispatch logic in dispatchUnscaleGrad()
+ * is unchanged.
+ */
+function makeUnscaleSpec(use2D: boolean, gridSizeX: number): TileKernelSpec {
+  return {
+    name: "unscaleGrad",
+    workgroupSize: WORKGROUP_SIZE,
+    bindings: {
+      grad_in: { storage: "read", type: "f32" },
+      grad_out: { storage: "read_write", type: "f32" },
+      inf_flag: { storage: "atomic", type: "u32" },
+    },
+    uniforms: {
+      inv_scale: "f32",
+      num_elements: "u32",
+      _pad0: "u32",
+      _pad1: "u32",
+    },
+    uniformBindingIndex: 3,
+    grid: (u) => [1], // Grid handled by dispatchUnscaleGrad
+    kernel(ctx) {
+      let idx;
+      if (use2D) {
+        idx = ctx.globalId(0).add(ctx.globalId(1).mul(ctx.u32(gridSizeX * WORKGROUP_SIZE)));
+      } else {
+        idx = ctx.globalId(0);
+      }
+      idx = ctx.emitLet("idx", idx);
+      const numElements = ctx.uniform("num_elements");
+      ctx.ifThen(idx.ge(numElements), () => { ctx.emitReturn(); });
+
+      const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
+      const g = ctx.emitLet("g", ctx.load("grad_in", idx).mul(invScale));
+
+      // Check finite via bit pattern
+      const bits = g.bitcastTo("u32");
+      const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xFF));
+      const isFinite = exponent.ne(ctx.u32(0xFF));
+
+      ctx.ifThenElse(isFinite, () => {
+        ctx.guardedStore("grad_out", ctx.u32(1).eq(ctx.u32(1)), idx, g);
+      }, () => {
+        ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(1065353216));
+        ctx.guardedStore("grad_out", ctx.u32(1).eq(ctx.u32(1)), idx, ctx.f32(0.0));
+      });
+    },
+  };
+}
+
+// Cache for compiled tile-IR unscale WGSL
+const unscaleTileIRWGSLCache = new Map<string, string>();
+
+function getUnscaleTileIRWGSL(use2D: boolean, gridSizeX: number): string {
+  const key = `${use2D}:${gridSizeX}`;
+  let wgsl = unscaleTileIRWGSLCache.get(key);
+  if (!wgsl) {
+    wgsl = compileTileKernel(makeUnscaleSpec(use2D, gridSizeX));
+    unscaleTileIRWGSLCache.set(key, wgsl);
+  }
+  return wgsl;
 }
 
 // ============================================================================
@@ -306,8 +379,11 @@ export function dispatchUnscaleGrad(
     : maxWorkgroups;
 
   // Get or create pipeline
-  const key = `unscaleGrad:${use2D ? `2d:${gridSizeX}` : "1d"}`;
-  const code = unscaleGradShader(use2D, gridSizeX);
+  const tileTag = USE_TILE_IR_UNSCALE ? ":tile" : "";
+  const key = `unscaleGrad:${use2D ? `2d:${gridSizeX}` : "1d"}${tileTag}`;
+  const code = USE_TILE_IR_UNSCALE
+    ? getUnscaleTileIRWGSL(use2D, gridSizeX)
+    : unscaleGradShader(use2D, gridSizeX);
   const pipeline = getPipeline(ctx, key, code);
 
   for (let chunk = 0; chunk < numChunks; chunk++) {

@@ -25,6 +25,10 @@ import type { AdamStepConfig } from "../types";
 import { profileSubOpBegin, profileSubOpEnd } from "./profiler";
 import type { GPUBuffer, GPUBindGroup, GPUDevice } from "./gpu-types";
 import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
+import { compileTileKernel } from "./tile-compiler";
+import type { TileKernelSpec, BindingSpec, UniformType } from "./tile-ir";
+
+const USE_TILE_IR_ADAM = process.env.TORCHLETTE_TILE_ADAM !== "0";
 
 // ============================================================================
 // WGSL Shader
@@ -229,6 +233,280 @@ ${unscaleLoadScalar}
 }
 
 // ============================================================================
+// Tile-IR Adam Spec Factory
+// ============================================================================
+
+/**
+ * Build a TileKernelSpec for the Adam/AdamW optimizer kernel.
+ *
+ * Only used for WGSL generation — the dispatch logic (chunking, config buffer,
+ * bind group construction) in dispatchAdamStep() is unchanged.
+ */
+function makeAdamStepSpec(
+  use2D: boolean,
+  gridSizeX: number,
+  useVec4: boolean,
+  emitF16: boolean,
+  emitUnscale: boolean,
+): TileKernelSpec {
+  // Build bindings in the same order as the hand-written shader
+  const bindings: Record<string, BindingSpec> = {
+    grad: { storage: "read", type: "f32" },
+    param: { storage: "read_write", type: "f32" },
+    m: { storage: "read_write", type: "f32" },
+    v: { storage: "read_write", type: "f32" },
+  };
+  // config uniform goes at binding(4) — set via uniformBindingIndex
+  if (emitF16) {
+    bindings.param_f16 = { storage: "read_write", type: "f16" };
+  }
+  if (emitUnscale) {
+    bindings.inf_flag = { storage: "atomic", type: "u32" };
+  }
+
+  // Build uniforms matching the config struct layout
+  const uniforms: Record<string, UniformType> = {
+    beta1: "f32",
+    beta2: "f32",
+    step_size: "f32",
+    eps: "f32",
+    weight_decay: "f32",
+    lr_times_wd: "f32",
+    decoupled_wd: "u32",
+    num_elements: "u32",
+  };
+  if (emitUnscale) {
+    uniforms.inv_scale = "f32";
+    uniforms._pad0 = "u32";
+    uniforms._pad1 = "u32";
+    uniforms._pad2 = "u32";
+  }
+
+  return {
+    name: `adamStep${emitF16 ? "F16" : ""}${emitUnscale ? "Unscale" : ""}${useVec4 ? "Vec4" : ""}`,
+    workgroupSize: WORKGROUP_SIZE,
+    bindings,
+    uniforms,
+    uniformBindingIndex: 4,
+    enableF16: emitF16,
+    grid: (u) => {
+      // Grid is handled by dispatchAdamStep, not used via createTileKernelDispatcher
+      return [1];
+    },
+    kernel(ctx) {
+      const numElements = ctx.uniform("num_elements");
+
+      if (useVec4) {
+        // Vec4 path: 4 elements per thread
+        let flatId;
+        if (use2D) {
+          flatId = ctx.globalId(0).add(ctx.globalId(1).div(ctx.u32(WORKGROUP_SIZE)).mul(ctx.u32(gridSizeX * WORKGROUP_SIZE)));
+          // Actually the 2D formula: gid.x + gid.y * gridSizeX * WORKGROUP_SIZE
+          // globalId = (workgroup_id * workgroup_size + local_id)
+          // We need: gid.x + gid.y * gridSizeX * WORKGROUP_SIZE where gid = global_invocation_id
+          // Actually just: flat_id = gid.x + gid.y * gridSizeX * WORKGROUP_SIZE
+          flatId = ctx.globalId(0).add(ctx.globalId(1).mul(ctx.u32(gridSizeX * WORKGROUP_SIZE)));
+        } else {
+          flatId = ctx.globalId(0);
+        }
+        const base = ctx.emitLet("base", flatId.mul(ctx.u32(4)));
+        ctx.ifThen(base.ge(numElements), () => { ctx.emitReturn(); });
+
+        // Load gradient (4 elements)
+        if (emitUnscale) {
+          const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
+          // Load and unscale
+          const g0Var = ctx.emitVar("g0", "f32", ctx.load("grad", base).mul(invScale));
+          const g1Var = ctx.emitVar("g1", "f32", ctx.load("grad", base.add(ctx.u32(1))).mul(invScale));
+          const g2Var = ctx.emitVar("g2", "f32", ctx.load("grad", base.add(ctx.u32(2))).mul(invScale));
+          const g3Var = ctx.emitVar("g3", "f32", ctx.load("grad", base.add(ctx.u32(3))).mul(invScale));
+
+          // Check finite via bit pattern for each element
+          for (let e = 0; e < 4; e++) {
+            const gVar = [g0Var, g1Var, g2Var, g3Var][e];
+            const bits = gVar.get().bitcastTo("u32");
+            const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xFF));
+            ctx.ifThen(exponent.eq(ctx.u32(0xFF)), () => {
+              ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(1065353216));
+              gVar.set(ctx.f32(0.0));
+            });
+          }
+
+          // Now compute with g0..g3
+          emitAdamVec4Body(ctx, base, g0Var, g1Var, g2Var, g3Var, emitF16);
+        } else {
+          const g0Var = ctx.emitVar("g0", "f32", ctx.load("grad", base));
+          const g1Var = ctx.emitVar("g1", "f32", ctx.load("grad", base.add(ctx.u32(1))));
+          const g2Var = ctx.emitVar("g2", "f32", ctx.load("grad", base.add(ctx.u32(2))));
+          const g3Var = ctx.emitVar("g3", "f32", ctx.load("grad", base.add(ctx.u32(3))));
+
+          emitAdamVec4Body(ctx, base, g0Var, g1Var, g2Var, g3Var, emitF16);
+        }
+      } else {
+        // Scalar path
+        let idx;
+        if (use2D) {
+          idx = ctx.globalId(0).add(ctx.globalId(1).mul(ctx.u32(gridSizeX * WORKGROUP_SIZE)));
+        } else {
+          idx = ctx.globalId(0);
+        }
+        idx = ctx.emitLet("idx", idx);
+        ctx.ifThen(idx.ge(numElements), () => { ctx.emitReturn(); });
+
+        if (emitUnscale) {
+          const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
+          const gVar = ctx.emitVar("g", "f32", ctx.load("grad", idx).mul(invScale));
+
+          // Check finite
+          const bits = gVar.get().bitcastTo("u32");
+          const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xFF));
+          ctx.ifThen(exponent.eq(ctx.u32(0xFF)), () => {
+            ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(1065353216));
+            gVar.set(ctx.f32(0.0));
+          });
+
+          emitAdamScalarBody(ctx, idx, gVar, emitF16);
+        } else {
+          const gVar = ctx.emitVar("g", "f32", ctx.load("grad", idx));
+          emitAdamScalarBody(ctx, idx, gVar, emitF16);
+        }
+      }
+    },
+  };
+}
+
+import type { VarHandle, BlockExpr, KernelContext } from "./tile-ir";
+
+/** Emit the Adam update logic for the scalar path. */
+function emitAdamScalarBody(
+  ctx: KernelContext,
+  idx: BlockExpr,
+  gVar: VarHandle,
+  emitF16: boolean,
+): void {
+  const p = ctx.emitLet("p", ctx.load("param", idx));
+  const beta1 = ctx.uniform("beta1").bitcastTo("f32");
+  const beta2 = ctx.uniform("beta2").bitcastTo("f32");
+  const stepSize = ctx.uniform("step_size").bitcastTo("f32");
+  const eps = ctx.uniform("eps").bitcastTo("f32");
+  const weightDecay = ctx.uniform("weight_decay").bitcastTo("f32");
+  const lrTimesWd = ctx.uniform("lr_times_wd").bitcastTo("f32");
+  const decoupledWd = ctx.uniform("decoupled_wd");
+
+  // L2 weight decay (Adam): grad += wd * param
+  ctx.ifThen(decoupledWd.eq(ctx.u32(0)).and(weightDecay.bitcastTo("u32").gt(ctx.u32(0))), () => {
+    gVar.set(gVar.get().add(weightDecay.mul(p)));
+  });
+
+  const g = gVar.get();
+  const mNew = ctx.emitLet("m_new",
+    beta1.mul(ctx.load("m", idx)).add(ctx.f32(1.0).sub(beta1).mul(g)));
+  const vNew = ctx.emitLet("v_new",
+    beta2.mul(ctx.load("v", idx)).add(ctx.f32(1.0).sub(beta2).mul(g).mul(g)));
+
+  const pNewVar = ctx.emitVar("p_new", "f32",
+    p.sub(stepSize.mul(mNew).div(vNew.sqrt().add(eps))));
+
+  // Decoupled weight decay (AdamW)
+  ctx.ifThen(decoupledWd.eq(ctx.u32(1)), () => {
+    pNewVar.set(pNewVar.get().sub(lrTimesWd.mul(p)));
+  });
+
+  // Write outputs
+  ctx.guardedStore("param", ctx.u32(1).eq(ctx.u32(1)), idx, pNewVar.get());
+  ctx.guardedStore("m", ctx.u32(1).eq(ctx.u32(1)), idx, mNew);
+  ctx.guardedStore("v", ctx.u32(1).eq(ctx.u32(1)), idx, vNew);
+
+  if (emitF16) {
+    ctx.guardedStore("param_f16", ctx.u32(1).eq(ctx.u32(1)), idx, pNewVar.get().toF16());
+  }
+}
+
+/** Emit the Adam update logic for the vec4 path (4 separate scalars). */
+function emitAdamVec4Body(
+  ctx: KernelContext,
+  base: BlockExpr,
+  g0Var: VarHandle, g1Var: VarHandle, g2Var: VarHandle, g3Var: VarHandle,
+  emitF16: boolean,
+): void {
+  const beta1 = ctx.uniform("beta1").bitcastTo("f32");
+  const beta2 = ctx.uniform("beta2").bitcastTo("f32");
+  const stepSize = ctx.uniform("step_size").bitcastTo("f32");
+  const eps = ctx.uniform("eps").bitcastTo("f32");
+  const weightDecay = ctx.uniform("weight_decay").bitcastTo("f32");
+  const lrTimesWd = ctx.uniform("lr_times_wd").bitcastTo("f32");
+  const decoupledWd = ctx.uniform("decoupled_wd");
+
+  // Load param, m, v for all 4 elements
+  const offsets = [ctx.u32(0), ctx.u32(1), ctx.u32(2), ctx.u32(3)];
+  const pVars = offsets.map((o, i) => ctx.emitLet(`p${i}`, ctx.load("param", base.add(o))));
+  const mVars = offsets.map((o, i) => ctx.emitLet(`m_old${i}`, ctx.load("m", base.add(o))));
+  const vVars = offsets.map((o, i) => ctx.emitLet(`v_old${i}`, ctx.load("v", base.add(o))));
+  const gVars = [g0Var, g1Var, g2Var, g3Var];
+
+  // L2 weight decay
+  ctx.ifThen(decoupledWd.eq(ctx.u32(0)).and(weightDecay.bitcastTo("u32").gt(ctx.u32(0))), () => {
+    for (let i = 0; i < 4; i++) {
+      gVars[i].set(gVars[i].get().add(weightDecay.mul(pVars[i])));
+    }
+  });
+
+  // Moment updates + parameter update for each element
+  const pNewVars: VarHandle[] = [];
+  const mNewLets: BlockExpr[] = [];
+  const vNewLets: BlockExpr[] = [];
+  for (let i = 0; i < 4; i++) {
+    const g = gVars[i].get();
+    const mNew = ctx.emitLet(`m_new${i}`,
+      beta1.mul(mVars[i]).add(ctx.f32(1.0).sub(beta1).mul(g)));
+    const vNew = ctx.emitLet(`v_new${i}`,
+      beta2.mul(vVars[i]).add(ctx.f32(1.0).sub(beta2).mul(g).mul(g)));
+    mNewLets.push(mNew);
+    vNewLets.push(vNew);
+    pNewVars.push(ctx.emitVar(`p_new${i}`, "f32",
+      pVars[i].sub(stepSize.mul(mNew).div(vNew.sqrt().add(eps)))));
+  }
+
+  // Decoupled weight decay
+  ctx.ifThen(decoupledWd.eq(ctx.u32(1)), () => {
+    for (let i = 0; i < 4; i++) {
+      pNewVars[i].set(pNewVars[i].get().sub(lrTimesWd.mul(pVars[i])));
+    }
+  });
+
+  // Write outputs
+  const trueCond = ctx.u32(1).eq(ctx.u32(1));
+  for (let i = 0; i < 4; i++) {
+    const off = base.add(offsets[i]);
+    ctx.guardedStore("param", trueCond, off, pNewVars[i].get());
+    ctx.guardedStore("m", trueCond, off, mNewLets[i]);
+    ctx.guardedStore("v", trueCond, off, vNewLets[i]);
+    if (emitF16) {
+      ctx.guardedStore("param_f16", trueCond, off, pNewVars[i].get().toF16());
+    }
+  }
+}
+
+// Cache for compiled tile-IR Adam WGSL
+const adamTileIRWGSLCache = new Map<string, string>();
+
+function getAdamTileIRWGSL(
+  use2D: boolean,
+  gridSizeX: number,
+  useVec4: boolean,
+  emitF16: boolean,
+  emitUnscale: boolean,
+): string {
+  const key = `${use2D}:${gridSizeX}:${useVec4}:${emitF16}:${emitUnscale}`;
+  let wgsl = adamTileIRWGSLCache.get(key);
+  if (!wgsl) {
+    wgsl = compileTileKernel(makeAdamStepSpec(use2D, gridSizeX, useVec4, emitF16, emitUnscale));
+    adamTileIRWGSLCache.set(key, wgsl);
+  }
+  return wgsl;
+}
+
+// ============================================================================
 // Config Buffer
 // ============================================================================
 
@@ -383,8 +661,11 @@ export function dispatchAdamStep(
   _st = profileSubOpBegin();
   const vec4Tag = useVec4 ? "Vec4" : "";
   const dimTag = use2D ? `2d:${gridSizeX}` : "1d";
-  const key = `adamStep${doF16 ? "F16" : ""}${doUnscale ? "Unscale" : ""}${vec4Tag}:${dimTag}`;
-  const code = adamStepShaderGen(use2D, gridSizeX, useVec4, doF16, doUnscale);
+  const tileTag = USE_TILE_IR_ADAM ? ":tile" : "";
+  const key = `adamStep${doF16 ? "F16" : ""}${doUnscale ? "Unscale" : ""}${vec4Tag}:${dimTag}${tileTag}`;
+  const code = USE_TILE_IR_ADAM
+    ? getAdamTileIRWGSL(use2D, gridSizeX, useVec4, doF16, doUnscale)
+    : adamStepShaderGen(use2D, gridSizeX, useVec4, doF16, doUnscale);
   const pipeline = getPipeline(ctx, key, code);
   profileSubOpEnd("adam.pipeline", _st);
 
