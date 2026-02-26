@@ -55,8 +55,8 @@
 
 export type ValueType = "block" | "scalar";
 export type DataType = "f32" | "f16" | "u32" | "i32";
-export type BinaryOp = "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "shr" | "shl" | "min" | "max";
-export type UnaryOp = "rsqrt" | "exp" | "log" | "abs" | "neg" | "sqrt" | "tanh" | "floor" | "ceil" | "not";
+export type BinaryOp = "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "shr" | "shl" | "min" | "max" | "pow";
+export type UnaryOp = "rsqrt" | "exp" | "log" | "abs" | "neg" | "sqrt" | "tanh" | "floor" | "ceil" | "not" | "sin" | "cos" | "round" | "sign";
 export type ReduceOp = "sum" | "max";
 export type CmpOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
 
@@ -425,7 +425,12 @@ export type Statement =
   | BlockDotStmt
   | BlockReduceStmt
   | BlockUnaryStmt
-  | BlockBinaryStmt;
+  | BlockBinaryStmt
+  | ReturnStmt;
+
+export interface ReturnStmt {
+  kind: "return";
+}
 
 export interface LetStmt {
   kind: "let";
@@ -732,6 +737,43 @@ export class BlockExpr {
     return new BlockExpr(makeNode<UnaryNode>({
       kind: "unary", op: "ceil", input: this.node,
       valueType: this.node.valueType, dataType: this.node.dataType,
+    }));
+  }
+
+  sin(): BlockExpr {
+    return new BlockExpr(makeNode<UnaryNode>({
+      kind: "unary", op: "sin", input: this.node,
+      valueType: this.node.valueType, dataType: "f32",
+    }));
+  }
+
+  cos(): BlockExpr {
+    return new BlockExpr(makeNode<UnaryNode>({
+      kind: "unary", op: "cos", input: this.node,
+      valueType: this.node.valueType, dataType: "f32",
+    }));
+  }
+
+  round(): BlockExpr {
+    return new BlockExpr(makeNode<UnaryNode>({
+      kind: "unary", op: "round", input: this.node,
+      valueType: this.node.valueType, dataType: this.node.dataType,
+    }));
+  }
+
+  sign(): BlockExpr {
+    return new BlockExpr(makeNode<UnaryNode>({
+      kind: "unary", op: "sign", input: this.node,
+      valueType: this.node.valueType, dataType: this.node.dataType,
+    }));
+  }
+
+  pow(other: BlockExpr | number): BlockExpr {
+    const rhs = resolveArg(other);
+    return new BlockExpr(makeNode<BinaryNode>({
+      kind: "binary", op: "pow", lhs: this.node, rhs,
+      valueType: promoteValueType(this.node.valueType, rhs.valueType),
+      dataType: "f32",
     }));
   }
 
@@ -1082,6 +1124,9 @@ export class KernelContext {
   /** Shorthand: f32 constant. */
   f32(value: number): BlockExpr { return this.const(value, "f32"); }
 
+  /** Shorthand: f16 constant. */
+  f16(value: number): BlockExpr { return this.const(value, "f16"); }
+
   // ---- Imperative mode API ----
 
   /** Thread-local invocation ID for the given dimension (0=x, 1=y, 2=z). */
@@ -1231,6 +1276,11 @@ export class KernelContext {
   }
 
   /** Emit a guarded store: `if (cond) { binding[idx] = val; }`. */
+  /** Emit an early `return` statement. */
+  emitReturn(): void {
+    this.pushStatement({ kind: "return" });
+  }
+
   guardedStore(binding: string, cond: BlockExpr, idx: BlockExpr, val: BlockExpr): void {
     this.pushStatement({
       kind: "guardedStore",

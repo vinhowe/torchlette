@@ -338,6 +338,7 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
         case "shl": return `(${lhs} << ${rhs})`;
         case "min": return `min(${lhs}, ${rhs})`;
         case "max": return `max(${lhs}, ${rhs})`;
+        case "pow": return `pow(${lhs}, ${rhs})`;
       }
       break;
     }
@@ -351,7 +352,7 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
         case "ceil": return `ceil(${input})`;
         case "not": return `!(${input})`;
         default: {
-          const fn = ({ exp: "exp", log: "log", abs: "abs", sqrt: "sqrt" } as const)[node.op];
+          const fn = ({ exp: "exp", log: "log", abs: "abs", sqrt: "sqrt", sin: "sin", cos: "cos", round: "round", sign: "sign" } as const)[node.op];
           return `${fn}(${input})`;
         }
       }
@@ -960,6 +961,10 @@ function emitStatement(
         and: "atomicAnd",
       }[stmt.op];
       lines.push(`${indent}${fnName}(&${stmt.binding}[${idx}], ${val});`);
+      break;
+    }
+    case "return": {
+      lines.push(`${indent}return;`);
       break;
     }
   }
