@@ -130,10 +130,10 @@ function makeUnscaleSpec(use2D: boolean, gridSizeX: number): TileKernelSpec {
       const isFinite = exponent.ne(ctx.u32(0xFF));
 
       ctx.ifThenElse(isFinite, () => {
-        ctx.guardedStore("grad_out", ctx.u32(1).eq(ctx.u32(1)), idx, g);
+        ctx.emitStore("grad_out", idx, g);
       }, () => {
         ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(1065353216));
-        ctx.guardedStore("grad_out", ctx.u32(1).eq(ctx.u32(1)), idx, ctx.f32(0.0));
+        ctx.emitStore("grad_out", idx, ctx.f32(0.0));
       });
     },
   };

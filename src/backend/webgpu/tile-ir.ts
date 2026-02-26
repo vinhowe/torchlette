@@ -2,39 +2,16 @@
  * Tile IR: Triton-Style Block-Level Kernel DSL
  *
  * Provides a symbolic expression builder for writing WebGPU compute kernels
- * at the workgroup (block) level. Two compilation modes:
+ * at the workgroup (block) level. Single imperative compilation model.
  *
- * **Auto-phase mode** (original): The developer writes block/scalar expressions
- * with loads, reduces, and stores. The compiler discovers phases automatically
- * (scalar preamble → reduce loops → store loop).
+ * The developer writes explicit statements (forRange, barrier, sharedArray,
+ * emitStore, emitVar, treeReduceSum, etc.) for full control over compute
+ * kernel algorithms. Expressions are symbolic and inlined during codegen.
  *
- * **Imperative mode** (new): The developer writes explicit statements (forRange,
- * barrier, sharedArray, etc.) for full control over 2D tiled algorithms like
- * matmul. Detected when `ctx.statements.length > 0`.
+ * Also supports Block-ops tile statements (tileLoad, tileStore, dot, etc.)
+ * for 2D tiled algorithms like matmul, which are lowered to scalar/vec4 WGSL.
  *
- * Two expression types:
- * - Block: varies per thread (loaded data, blockRange). Compiles to loop bodies.
- * - Scalar: uniform across workgroup (programId, reduce result, uniform). Compiles to single statements.
- *
- * Usage (auto-phase):
- * ```typescript
- * const layerNormFwd = tileKernel({
- *   name: "layerNormFwd",
- *   workgroupSize: 256,
- *   bindings: { x: { storage: "read", type: "f32" }, ... },
- *   uniforms: { numRows: "u32", featureDim: "u32", eps: "f32" },
- *   kernel(ctx) {
- *     const row = ctx.programId(0);
- *     const D = ctx.uniform("featureDim");
- *     const offs = row.mul(D).add(ctx.blockRange(D));
- *     const xVals = ctx.load("x", offs);
- *     const mean = ctx.reduce(xVals, "sum").div(D.toF32());
- *     // ...
- *   },
- * });
- * ```
- *
- * Usage (imperative):
+ * Usage:
  * ```typescript
  * const matmul: TileKernelSpec = {
  *   workgroupSize: [8, 8],
@@ -57,7 +34,6 @@ export type ValueType = "block" | "scalar";
 export type DataType = "f32" | "f16" | "u32" | "i32";
 export type BinaryOp = "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "shr" | "shl" | "min" | "max" | "pow";
 export type UnaryOp = "rsqrt" | "exp" | "log" | "abs" | "neg" | "sqrt" | "tanh" | "floor" | "ceil" | "not" | "sin" | "cos" | "round" | "sign";
-export type ReduceOp = "sum" | "max";
 export type CmpOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
 
 export interface IRNodeBase {
@@ -69,11 +45,6 @@ export interface IRNodeBase {
 export interface ProgramIdNode extends IRNodeBase {
   kind: "programId";
   dim: number; // 0=x, 1=y, 2=z
-}
-
-export interface BlockRangeNode extends IRNodeBase {
-  kind: "blockRange";
-  extent: IRNode; // dimension expression (scalar)
 }
 
 export interface UniformNode extends IRNodeBase {
@@ -93,19 +64,6 @@ export interface LoadNode extends IRNodeBase {
   mask?: IRNode;   // optional mask (block expression, truthy = load, falsy = 0)
 }
 
-export interface StoreNode extends IRNodeBase {
-  kind: "store";
-  binding: string;
-  offsets: IRNode; // block expression for indices
-  values: IRNode;  // block expression for data
-  mask?: IRNode;   // optional mask (block expression, truthy = store)
-}
-
-export interface ReduceNode extends IRNodeBase {
-  kind: "reduce";
-  input: IRNode; // block expression to reduce
-  op: ReduceOp;
-}
 
 export interface BinaryNode extends IRNodeBase {
   kind: "binary";
@@ -194,12 +152,9 @@ export interface Vec4DotNode extends IRNodeBase {
 
 export type IRNode =
   | ProgramIdNode
-  | BlockRangeNode
   | UniformNode
   | ConstNode
   | LoadNode
-  | StoreNode
-  | ReduceNode
   | BinaryNode
   | UnaryNode
   | CastNode
@@ -411,6 +366,7 @@ export type Statement =
   | BarrierStmt
   | SharedWriteStmt
   | GuardedStoreStmt
+  | DirectStoreStmt
   | AtomicOpStmt
   // Tile-level statements (lowered by tile compiler)
   | TileLoadStmt
@@ -516,6 +472,13 @@ export interface GuardedStoreStmt {
   kind: "guardedStore";
   binding: string;
   condition: IRNode;
+  idx: IRNode;
+  value: IRNode;
+}
+
+export interface DirectStoreStmt {
+  kind: "directStore";
+  binding: string;
   idx: IRNode;
   value: IRNode;
 }
@@ -1013,8 +976,6 @@ export class ArrayVarHandle {
 export class KernelContext {
   /** All nodes created during kernel execution, in creation order. */
   readonly nodes: IRNode[] = [];
-  /** Store operations, in order (auto-phase mode). */
-  readonly stores: StoreNode[] = [];
   /** Statement list (imperative mode). */
   readonly statements: Statement[] = [];
   /** Shared memory arrays declared by this kernel. */
@@ -1026,6 +987,8 @@ export class KernelContext {
   private stmtStack: Statement[][] = [];
   /** Counter for unique loop variable names. */
   private loopVarCounter = 0;
+  /** Counter for unique wgReduce shared memory / accumulator names. */
+  private reduceCounter = 0;
 
   constructor(bindings?: Record<string, BindingSpec>) {
     this.bindingSpecs = bindings ?? {};
@@ -1054,17 +1017,6 @@ export class KernelContext {
     })));
   }
 
-  /**
-   * Strided block range: indices [tid, tid+WG, tid+2*WG, ...] up to extent.
-   * This is the standard parallel-for pattern used by all workgroup kernels.
-   */
-  blockRange(extent: BlockExpr): BlockExpr {
-    return new BlockExpr(this.trackNode(makeNode<BlockRangeNode>({
-      kind: "blockRange", extent: extent.node,
-      valueType: "block", dataType: "u32",
-    })));
-  }
-
   /** Load from a storage buffer at given offsets. Optional mask for bounds. */
   load(binding: string, offsets: BlockExpr, mask?: BlockExpr): BlockExpr {
     const bindingType = this.bindingSpecs[binding]?.type ?? "f32";
@@ -1073,30 +1025,6 @@ export class KernelContext {
       ...(mask ? { mask: mask.node } : {}),
       valueType: "block", dataType: bindingType as DataType,
     } as any)));
-  }
-
-  /** Store values to a storage buffer at block offsets (auto-phase mode). Optional mask for bounds. */
-  store(binding: string, offsets: BlockExpr, values: BlockExpr, mask?: BlockExpr): void {
-    const node = this.trackNode(makeNode<StoreNode>({
-      kind: "store", binding, offsets: offsets.node, values: values.node,
-      ...(mask ? { mask: mask.node } : {}),
-      valueType: "block", dataType: "f32",
-    } as any));
-    this.stores.push(node);
-  }
-
-  /**
-   * Workgroup-level parallel reduction. Takes a block expression and returns
-   * a scalar result available to all threads (via shared memory + barriers).
-   */
-  reduce(input: BlockExpr, op: ReduceOp): BlockExpr {
-    if (input.node.valueType !== "block") {
-      throw new Error("reduce() requires a block expression");
-    }
-    return new BlockExpr(this.trackNode(makeNode<ReduceNode>({
-      kind: "reduce", input: input.node, op,
-      valueType: "scalar", dataType: "f32",
-    })));
   }
 
   /** Read a uniform config value. */
@@ -1264,6 +1192,115 @@ export class KernelContext {
     return captured;
   }
 
+  // ===========================================================================
+  // Composable reduction / loop primitives
+  // ===========================================================================
+
+  /** Tree sum reduction: `smem[0] = sum(smem[0..wgSize-1])`. Emits log2(wgSize) if+barrier pairs. */
+  treeReduceSum(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number): void {
+    for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
+      this.ifThen(tid.lt(this.u32(stride)), () => {
+        smem.write(tid, smem.read(tid).add(smem.read(tid.add(this.u32(stride)))));
+      });
+      this.barrier();
+    }
+  }
+
+  /** Tree max reduction: `smem[0] = max(smem[0..wgSize-1])`. */
+  treeReduceMax(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number): void {
+    for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
+      this.ifThen(tid.lt(this.u32(stride)), () => {
+        smem.write(tid, smem.read(tid).max(smem.read(tid.add(this.u32(stride)))));
+      });
+      this.barrier();
+    }
+  }
+
+  /** Dual tree sum reduction: reduces two shared arrays in parallel. */
+  dualTreeReduceSum(
+    smem1: SharedArrayHandle, smem2: SharedArrayHandle,
+    tid: BlockExpr, wgSize: number,
+  ): void {
+    for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
+      this.ifThen(tid.lt(this.u32(stride)), () => {
+        smem1.write(tid, smem1.read(tid).add(smem1.read(tid.add(this.u32(stride)))));
+        smem2.write(tid, smem2.read(tid).add(smem2.read(tid.add(this.u32(stride)))));
+      });
+      this.barrier();
+    }
+  }
+
+  /** Strided loop: `for (var i = tid; i < bound; i += wgSize) { body(i); }` */
+  stridedFor(
+    tid: BlockExpr, bound: BlockExpr, wgSize: number,
+    body: (i: BlockExpr) => void,
+  ): void {
+    const maxIters = bound.add(this.u32(wgSize - 1)).div(this.u32(wgSize));
+    this.forRange(this.u32(0), maxIters, (iter) => {
+      const i = tid.add(iter.mul(this.u32(wgSize)));
+      this.ifThen(i.lt(bound), () => {
+        body(i);
+      });
+    });
+  }
+
+  /**
+   * Workgroup-cooperative reduction. Allocates shared memory, accumulates via
+   * stridedFor, writes to shared memory, barriers, and tree-reduces.
+   * Returns the reduced scalar (`smem[0]` after reduction).
+   */
+  wgReduce(
+    op: "sum" | "max",
+    tid: BlockExpr, count: BlockExpr, wgSize: number,
+    bodyFn: (i: BlockExpr) => BlockExpr,
+  ): BlockExpr {
+    const id = this.reduceCounter++;
+    const smem = this.sharedArray(`_wgr${id}_s`, wgSize);
+    const identity = op === "sum" ? 0.0 : -3.402823e+38;
+    const acc = this.emitVar(`_wgr${id}_a`, "f32", this.f32(identity));
+    this.stridedFor(tid, count, wgSize, (i) => {
+      if (op === "sum") {
+        acc.addAssign(bodyFn(i));
+      } else {
+        acc.set(acc.get().max(bodyFn(i)));
+      }
+    });
+    smem.write(tid, acc.get());
+    this.barrier();
+    if (op === "sum") {
+      this.treeReduceSum(smem, tid, wgSize);
+    } else {
+      this.treeReduceMax(smem, tid, wgSize);
+    }
+    return smem.read(this.u32(0));
+  }
+
+  /**
+   * Dual workgroup-cooperative sum reduction. Same as wgReduce but reduces
+   * two values in parallel using a single stridedFor pass.
+   * Returns `[smem1[0], smem2[0]]` after reduction.
+   */
+  dualWgReduce(
+    tid: BlockExpr, count: BlockExpr, wgSize: number,
+    bodyFn: (i: BlockExpr) => [BlockExpr, BlockExpr],
+  ): [BlockExpr, BlockExpr] {
+    const id = this.reduceCounter++;
+    const smem1 = this.sharedArray(`_wgr${id}_s1`, wgSize);
+    const smem2 = this.sharedArray(`_wgr${id}_s2`, wgSize);
+    const acc1 = this.emitVar(`_wgr${id}_a1`, "f32", this.f32(0.0));
+    const acc2 = this.emitVar(`_wgr${id}_a2`, "f32", this.f32(0.0));
+    this.stridedFor(tid, count, wgSize, (i) => {
+      const [v1, v2] = bodyFn(i);
+      acc1.addAssign(v1);
+      acc2.addAssign(v2);
+    });
+    smem1.write(tid, acc1.get());
+    smem2.write(tid, acc2.get());
+    this.barrier();
+    this.dualTreeReduceSum(smem1, smem2, tid, wgSize);
+    return [smem1.read(this.u32(0)), smem2.read(this.u32(0))];
+  }
+
   /** Emit an atomic operation: `atomicMax(&binding[idx], val)` etc. */
   atomicOp(binding: string, idx: BlockExpr, op: AtomicOp, val: BlockExpr): void {
     this.pushStatement({
@@ -1275,12 +1312,22 @@ export class KernelContext {
     });
   }
 
-  /** Emit a guarded store: `if (cond) { binding[idx] = val; }`. */
+  /** Emit an unconditional scalar store: `binding[idx] = val;`. */
+  emitStore(binding: string, idx: BlockExpr, val: BlockExpr): void {
+    this.pushStatement({
+      kind: "directStore",
+      binding,
+      idx: idx.node,
+      value: val.node,
+    });
+  }
+
   /** Emit an early `return` statement. */
   emitReturn(): void {
     this.pushStatement({ kind: "return" });
   }
 
+  /** Emit a guarded store: `if (cond) { binding[idx] = val; }`. */
   guardedStore(binding: string, cond: BlockExpr, idx: BlockExpr, val: BlockExpr): void {
     this.pushStatement({
       kind: "guardedStore",

@@ -413,12 +413,12 @@ function emitAdamScalarBody(
   });
 
   // Write outputs
-  ctx.guardedStore("param", ctx.u32(1).eq(ctx.u32(1)), idx, pNewVar.get());
-  ctx.guardedStore("m", ctx.u32(1).eq(ctx.u32(1)), idx, mNew);
-  ctx.guardedStore("v", ctx.u32(1).eq(ctx.u32(1)), idx, vNew);
+  ctx.emitStore("param", idx, pNewVar.get());
+  ctx.emitStore("m", idx, mNew);
+  ctx.emitStore("v", idx, vNew);
 
   if (emitF16) {
-    ctx.guardedStore("param_f16", ctx.u32(1).eq(ctx.u32(1)), idx, pNewVar.get().toF16());
+    ctx.emitStore("param_f16", idx, pNewVar.get().toF16());
   }
 }
 
@@ -475,14 +475,13 @@ function emitAdamVec4Body(
   });
 
   // Write outputs
-  const trueCond = ctx.u32(1).eq(ctx.u32(1));
   for (let i = 0; i < 4; i++) {
     const off = base.add(offsets[i]);
-    ctx.guardedStore("param", trueCond, off, pNewVars[i].get());
-    ctx.guardedStore("m", trueCond, off, mNewLets[i]);
-    ctx.guardedStore("v", trueCond, off, vNewLets[i]);
+    ctx.emitStore("param", off, pNewVars[i].get());
+    ctx.emitStore("m", off, mNewLets[i]);
+    ctx.emitStore("v", off, vNewLets[i]);
     if (emitF16) {
-      ctx.guardedStore("param_f16", trueCond, off, pNewVars[i].get().toF16());
+      ctx.emitStore("param_f16", off, pNewVars[i].get().toF16());
     }
   }
 }

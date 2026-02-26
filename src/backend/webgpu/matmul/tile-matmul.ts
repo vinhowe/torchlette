@@ -569,7 +569,7 @@ function matmulKernelBlockOps(ctx: KernelContext, options: CodegenOptions, p: Ma
 }
 
 // ============================================================================
-// K-Split Reduction Kernel (unchanged — auto-phase mode)
+// K-Split Reduction Kernel (imperative mode)
 // ============================================================================
 
 export function createKSplitReductionKernel(kSplitCount: number, outputDtype: DType): TileKernelSpec {
@@ -585,19 +585,20 @@ export function createKSplitReductionKernel(kSplitCount: number, outputDtype: DT
     uniforms: { totalElements: "u32", alpha: "f32" },
     grid: (u) => [Math.ceil(u.totalElements / 256)],
     kernel(ctx) {
-      const gid = ctx.programId(0).mul(ctx.const(256, "u32")).add(ctx.blockRange(ctx.const(256, "u32")));
+      const idx = ctx.emitLet("idx", ctx.globalId(0));
       const totalElements = ctx.uniform("totalElements");
-      const alpha = ctx.uniform("alpha").toF32();
-      const baseVal = ctx.load("partials", gid);
-      let sum = baseVal;
+      ctx.ifThen(idx.ge(totalElements), () => { ctx.emitReturn(); });
+
+      const alpha = ctx.uniform("alpha").bitcastTo("f32");
+      const sumVar = ctx.emitVar("sum", "f32", ctx.load("partials", idx));
       for (let p = 1; p < kSplitCount; p++) {
-        sum = sum.add(ctx.load("partials", gid.add(totalElements.mul(ctx.const(p, "u32")))));
+        sumVar.addAssign(ctx.load("partials", idx.add(totalElements.mul(ctx.u32(p)))));
       }
-      const result = sum.mul(alpha);
+      const result = sumVar.get().mul(alpha);
       if (outputDtype === "f16") {
-        ctx.store("out", gid, result.toF16());
+        ctx.emitStore("out", idx, result.toF16());
       } else {
-        ctx.store("out", gid, result);
+        ctx.emitStore("out", idx, result);
       }
     },
   };
