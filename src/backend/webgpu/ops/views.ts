@@ -24,6 +24,7 @@ import {
 } from "../bind-group-cache";
 import { profileApiCall } from "../profiler";
 import { computeFlatChunkLayout, dispatchFlatChunked } from "../chunked-dispatch";
+import { wgslArray } from "../wgsl-helpers";
 
 function castShader(
   srcDtype: DType,
@@ -83,8 +84,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 `;
   }
 
-  const shapeArray = `array<u32, ${rank}>(${shape.map((s) => `${s}u`).join(", ")})`;
-  const stridesArray = `array<u32, ${rank}>(${strides.map((s) => `${s}u`).join(", ")})`;
+  const shapeArray = wgslArray(shape, "u32", "u");
+  const stridesArray = wgslArray(strides, "u32", "u");
 
   return `${enableF16}
 struct Params {
@@ -541,11 +542,9 @@ function contiguousDirect(tensor: WebGPUTensor): WebGPUTensor {
   );
 
   // Generate shader that reads with strides and writes contiguous
-  const shapeArray = `array<u32, ${rank}>(${shape.map((s) => `${s}u`).join(", ")})`;
-  const inputStridesArray = `array<u32, ${rank}>(${tensor.strides.map((s) => `${s}u`).join(", ")})`;
-  const outStridesArray = `array<u32, ${rank}>(${contiguousStrides(shape)
-    .map((s) => `${s}u`)
-    .join(", ")})`;
+  const shapeArray = wgslArray(shape, "u32", "u");
+  const inputStridesArray = wgslArray(tensor.strides, "u32", "u");
+  const outStridesArray = wgslArray(contiguousStrides(shape), "u32", "u");
   const enableF16 = dtype === "f16" ? "enable f16;\n" : "";
   const idxCompute = use2D
     ? `let idx = gid.x + gid.y * ${dispatch.gridSizeX}u * ${WORKGROUP_SIZE}u;`

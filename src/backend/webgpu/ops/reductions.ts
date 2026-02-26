@@ -36,7 +36,19 @@ import {
   incrementSubmitCount,
 } from "../shared-encoder";
 import { getExpr as getExprFromRegistry, isUnaryOp as isUnaryOpFromRegistry } from "./registry";
-import { contiguous } from "./views";
+import { ensureContiguous } from "./views";
+import { wgslArray } from "../wgsl-helpers";
+
+/**
+ * Ensure a tensor is contiguous, returning the tensor and any temporary copy
+ * that the caller must destroy after the GPU work consuming it has been dispatched.
+ */
+function ensureContiguousTracked(a: BackendTensor): { tensor: WebGPUTensor; copy: WebGPUTensor | null } {
+  const tensor = asGPUTensor(a);
+  if (tensor.isContiguous) return { tensor, copy: null };
+  const copy = ensureContiguous(tensor);
+  return { tensor: copy, copy };
+}
 
 /**
  * Compute strides, reduction size, and input→output dimension mapping
@@ -132,14 +144,12 @@ function prepareDimReduction(
   const { inputStrides, outStrides, reductionSize, inputToOutDim } =
     buildReductionMetadata(inputShape, normalizedDims, outShape, keepdim);
 
-  const inputShapeArray = `array<u32, ${rank}>(${inputShape.map((s) => `${s}u`).join(", ")})`;
-  const inputStridesArray = `array<u32, ${rank}>(${inputStrides.map((s) => `${s}u`).join(", ")})`;
-  const outShapeArray = outShape.length > 0
-    ? `array<u32, ${outShape.length}>(${outShape.map((s) => `${s}u`).join(", ")})` : "";
-  const outStridesArray = outStrides.length > 0
-    ? `array<u32, ${outStrides.length}>(${outStrides.map((s) => `${s}u`).join(", ")})` : "";
-  const reduceDimsArray = `array<u32, ${normalizedDims.length}>(${normalizedDims.map((d) => `${d}u`).join(", ")})`;
-  const inputToOutDimArray = `array<i32, ${rank}>(${inputToOutDim.map((d) => `${d}i`).join(", ")})`;
+  const inputShapeArray = wgslArray(inputShape, "u32", "u");
+  const inputStridesArray = wgslArray(inputStrides, "u32", "u");
+  const outShapeArray = wgslArray(outShape, "u32", "u");
+  const outStridesArray = wgslArray(outStrides, "u32", "u");
+  const reduceDimsArray = wgslArray(normalizedDims, "u32", "u");
+  const inputToOutDimArray = wgslArray(inputToOutDim, "i32", "i");
 
   return {
     normalizedDims, rank, outShape, outSize, reductionSize,
@@ -151,15 +161,10 @@ function prepareDimReduction(
 
 export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
   const ctx = requireContext();
-  let tensor = asGPUTensor(a);
-  let contiguousCopy: WebGPUTensor | null = null;
 
   // Must materialize non-contiguous tensors first (e.g., expanded views)
   // The sum kernels assume contiguous layout for index computation
-  if (!tensor.isContiguous) {
-    tensor = asGPUTensor(contiguous(tensor));
-    contiguousCopy = tensor;
-  }
+  const { tensor, copy: contiguousCopy } = ensureContiguousTracked(a);
 
   const inputShape = tensor.shape;
 
@@ -932,12 +937,9 @@ fn main() {
 
 export function max(a: BackendTensor, options?: MaxOptions): BackendTensor {
   const ctx = requireContext();
-  let tensor = asGPUTensor(a);
 
   // Must materialize non-contiguous tensors first (e.g., expanded views)
-  if (!tensor.isContiguous) {
-    tensor = asGPUTensor(contiguous(tensor));
-  }
+  const { tensor, copy: contiguousCopy } = ensureContiguousTracked(a);
 
   const inputShape = tensor.shape;
 
@@ -945,12 +947,16 @@ export function max(a: BackendTensor, options?: MaxOptions): BackendTensor {
   const keepdim = options?.keepdim ?? false;
 
   if (dim === undefined || dim === null) {
-    return maxFullReduction(ctx, tensor);
+    const result = maxFullReduction(ctx, tensor);
+    if (contiguousCopy) contiguousCopy.destroy();
+    return result;
   }
 
   const setup = prepareDimReduction(inputShape, dim, keepdim);
   if (!setup) {
-    return maxFullReduction(ctx, tensor);
+    const result = maxFullReduction(ctx, tensor);
+    if (contiguousCopy) contiguousCopy.destroy();
+    return result;
   }
 
   for (const d of setup.normalizedDims) {
@@ -1086,20 +1092,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   dispatchComputePass(pipeline, bindGroup, maxDispatch.x, maxDispatch.y);
 
   releaseParamsBuffer(paramsBuffer);
+  if (contiguousCopy) contiguousCopy.destroy();
 
   return createTensor(outShape, outBuffer);
 }
 
 export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
-  let tensor = asGPUTensor(a);
-  let contiguousCopy: WebGPUTensor | null = null;
-
   // Must materialize non-contiguous tensors first (e.g., expanded views)
   // Mean uses sum internally which requires contiguous layout
-  if (!tensor.isContiguous) {
-    tensor = asGPUTensor(contiguous(tensor));
-    contiguousCopy = tensor;
-  }
+  const { tensor, copy: contiguousCopy } = ensureContiguousTracked(a);
 
   const inputShape = tensor.shape;
 

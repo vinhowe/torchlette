@@ -10,6 +10,16 @@ import { trackSharedEncoderWrite } from "./index";
 import type { GPUBuffer } from "./gpu-types";
 
 // ============================================================================
+// WGSL Array Literal Helper
+// ============================================================================
+
+/** Format a JS array as a WGSL typed array literal, e.g. `array<u32, 3>(1u, 2u, 3u)`. */
+export function wgslArray(arr: number[], type: string, suffix: string): string {
+  if (arr.length === 0) return "";
+  return `array<${type}, ${arr.length}>(${arr.map(v => `${v}${suffix}`).join(", ")})`;
+}
+
+// ============================================================================
 // WGSL Tree Reduction Templates
 // ============================================================================
 

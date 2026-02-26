@@ -29,6 +29,7 @@ import {
   releaseParamsBuffer,
   cachedCreateBindGroup,
 } from "../bind-group-cache";
+import { wgslArray } from "../wgsl-helpers";
 
 function comparisonOp(
   opName: string,
@@ -232,17 +233,11 @@ function argReduceOp(
     }
   }
 
-  const inputShapeArray = `array<u32, ${rank}>(${inputShape.map((s) => `${s}u`).join(", ")})`;
-  const inputStridesArray = `array<u32, ${rank}>(${inputStrides.map((s) => `${s}u`).join(", ")})`;
-  const outShapeArray =
-    outShape.length > 0
-      ? `array<u32, ${outShape.length}>(${outShape.map((s) => `${s}u`).join(", ")})`
-      : "";
-  const outStridesArray =
-    outStrides.length > 0
-      ? `array<u32, ${outStrides.length}>(${outStrides.map((s) => `${s}u`).join(", ")})`
-      : "";
-  const inputToOutDimArray = `array<i32, ${rank}>(${inputToOutDim.map((d) => `${d}i`).join(", ")})`;
+  const inputShapeArray = wgslArray(inputShape, "u32", "u");
+  const inputStridesArray = wgslArray(inputStrides, "u32", "u");
+  const outShapeArray = wgslArray(outShape, "u32", "u");
+  const outStridesArray = wgslArray(outStrides, "u32", "u");
+  const inputToOutDimArray = wgslArray(inputToOutDim, "i32", "i");
 
   const initVal = compareOp === ">" ? "-3.402823466e+38" : "3.402823466e+38";
 
