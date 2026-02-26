@@ -22,6 +22,8 @@ import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
 import { wgslSumReduction, wgslMaxReduction, trackBuffers } from "./wgsl-helpers";
+import type { TileKernelSpec } from "./tile-ir";
+import { createTileKernelDispatcher } from "./tile-dispatch";
 
 // Shared WGSL struct for cross-entropy config (8 bytes, 2 fields)
 const WGSL_CE_CONFIG = `struct CEConfig {
@@ -139,6 +141,176 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 
 // ============================================================================
+// Tile IR Kernels
+// ============================================================================
+
+const USE_TILE_IR_CROSSENTROPY = process.env.TORCHLETTE_TILE_CROSSENTROPY !== "0";
+
+const WG = WORKGROUP_SIZE; // 256
+
+/** Emit tree max reduction: sdata[0] = max(sdata[0..wgSize-1]) */
+function emitTreeMaxReduction(
+  ctx: Parameters<TileKernelSpec["kernel"]>[0],
+  smem: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["sharedArray"]>,
+  tid: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["u32"]>,
+  wgSize: number,
+): void {
+  for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
+    ctx.ifThen(tid.lt(ctx.u32(stride)), () => {
+      smem.write(tid, smem.read(tid).max(smem.read(tid.add(ctx.u32(stride)))));
+    });
+    ctx.barrier();
+  }
+}
+
+/** Emit tree sum reduction: sdata[0] = sum(sdata[0..wgSize-1]) */
+function emitTreeSumReductionCE(
+  ctx: Parameters<TileKernelSpec["kernel"]>[0],
+  smem: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["sharedArray"]>,
+  tid: ReturnType<Parameters<TileKernelSpec["kernel"]>[0]["u32"]>,
+  wgSize: number,
+): void {
+  for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
+    ctx.ifThen(tid.lt(ctx.u32(stride)), () => {
+      smem.write(tid, smem.read(tid).add(smem.read(tid.add(ctx.u32(stride)))));
+    });
+    ctx.barrier();
+  }
+}
+
+/**
+ * Cross-entropy forward kernel (tile-IR).
+ * One workgroup per batch row: max reduction, sum-exp reduction, thread 0 writes loss.
+ */
+const crossEntropyForwardSpec: TileKernelSpec = {
+  name: "ceFwd",
+  workgroupSize: WG,
+  bindings: {
+    logits:  { storage: "read", type: "f32" },
+    targets: { storage: "read", type: "f32" },
+    loss:    { storage: "read_write", type: "f32" },
+  },
+  uniforms: {
+    batch_size: "u32",
+    vocab_size: "u32",
+  },
+  grid: (u) => [u.batch_size],
+
+  kernel(ctx) {
+    const tid = ctx.localIndex();
+    const row = ctx.programId(0);
+    const V = ctx.uniform("vocab_size");
+    const base = row.mul(V);
+
+    const sdata = ctx.sharedArray("sdata", WG, "f32");
+
+    // Phase 1: Parallel max reduction
+    const localMax = ctx.emitVar("local_max", "f32", ctx.f32(-3.402823e+38));
+    const maxIters = V.add(ctx.u32(WG - 1)).div(ctx.u32(WG));
+    ctx.forRange(ctx.u32(0), maxIters, (iter) => {
+      const i = tid.add(iter.mul(ctx.u32(WG)));
+      ctx.ifThen(i.lt(V), () => {
+        localMax.set(localMax.get().max(ctx.load("logits", base.add(i))));
+      });
+    });
+    sdata.write(tid, localMax.get());
+    ctx.barrier();
+    emitTreeMaxReduction(ctx, sdata, tid, WG);
+    const rowMax = ctx.emitLet("row_max", sdata.read(ctx.u32(0)));
+
+    // Phase 2: Parallel sum-exp reduction
+    const localSum = ctx.emitVar("local_sum", "f32", ctx.f32(0.0));
+    ctx.forRange(ctx.u32(0), maxIters, (iter) => {
+      const i = tid.add(iter.mul(ctx.u32(WG)));
+      ctx.ifThen(i.lt(V), () => {
+        localSum.addAssign(ctx.load("logits", base.add(i)).sub(rowMax).exp());
+      });
+    });
+    sdata.write(tid, localSum.get());
+    ctx.barrier();
+    emitTreeSumReductionCE(ctx, sdata, tid, WG);
+    const logSumExp = ctx.emitLet("log_sum_exp", sdata.read(ctx.u32(0)).log());
+
+    // Phase 3: Output (thread 0 only)
+    const t = ctx.emitLet("t", ctx.load("targets", row).toU32());
+    ctx.guardedStore("loss", tid.eq(ctx.u32(0)), row,
+      ctx.load("logits", base.add(t)).sub(rowMax).sub(logSumExp).neg());
+  },
+};
+
+/**
+ * Cross-entropy backward kernel (tile-IR).
+ * One workgroup per batch row: recomputes max + sum-exp, writes softmax gradients.
+ */
+const crossEntropyBackwardSpec: TileKernelSpec = {
+  name: "ceBwd",
+  workgroupSize: WG,
+  bindings: {
+    logits:      { storage: "read", type: "f32" },
+    targets:     { storage: "read", type: "f32" },
+    grad_output: { storage: "read", type: "f32" },
+    grad_logits: { storage: "read_write", type: "f32" },
+  },
+  uniforms: {
+    batch_size: "u32",
+    vocab_size: "u32",
+  },
+  grid: (u) => [u.batch_size],
+
+  kernel(ctx) {
+    const tid = ctx.localIndex();
+    const row = ctx.programId(0);
+    const V = ctx.uniform("vocab_size");
+    const base = row.mul(V);
+
+    const sdata = ctx.sharedArray("sdata", WG, "f32");
+
+    // Phase 1: Parallel max reduction
+    const localMax = ctx.emitVar("local_max", "f32", ctx.f32(-3.402823e+38));
+    const maxIters = V.add(ctx.u32(WG - 1)).div(ctx.u32(WG));
+    ctx.forRange(ctx.u32(0), maxIters, (iter) => {
+      const i = tid.add(iter.mul(ctx.u32(WG)));
+      ctx.ifThen(i.lt(V), () => {
+        localMax.set(localMax.get().max(ctx.load("logits", base.add(i))));
+      });
+    });
+    sdata.write(tid, localMax.get());
+    ctx.barrier();
+    emitTreeMaxReduction(ctx, sdata, tid, WG);
+    const rowMax = ctx.emitLet("row_max", sdata.read(ctx.u32(0)));
+
+    // Phase 2: Parallel sum-exp reduction
+    const localSum = ctx.emitVar("local_sum", "f32", ctx.f32(0.0));
+    ctx.forRange(ctx.u32(0), maxIters, (iter) => {
+      const i = tid.add(iter.mul(ctx.u32(WG)));
+      ctx.ifThen(i.lt(V), () => {
+        localSum.addAssign(ctx.load("logits", base.add(i)).sub(rowMax).exp());
+      });
+    });
+    sdata.write(tid, localSum.get());
+    ctx.barrier();
+    emitTreeSumReductionCE(ctx, sdata, tid, WG);
+    const logSumExp = ctx.emitLet("log_sum_exp", sdata.read(ctx.u32(0)).log());
+
+    // Phase 3: Write gradients
+    const t = ctx.emitLet("t", ctx.load("targets", row).toU32());
+    const g = ctx.emitLet("g", ctx.load("grad_output", row));
+    ctx.forRange(ctx.u32(0), maxIters, (iter) => {
+      const i = tid.add(iter.mul(ctx.u32(WG)));
+      const softmaxI = ctx.load("logits", base.add(i)).sub(rowMax).sub(logSumExp).exp();
+      const oneHotI = i.eq(t).select(ctx.f32(1.0), ctx.f32(0.0));
+      ctx.guardedStore("grad_logits", i.lt(V), base.add(i),
+        g.mul(softmaxI.sub(oneHotI)));
+    });
+  },
+};
+
+const ceFwdTileKernel = USE_TILE_IR_CROSSENTROPY
+  ? createTileKernelDispatcher(crossEntropyForwardSpec) : null;
+const ceBwdTileKernel = USE_TILE_IR_CROSSENTROPY
+  ? createTileKernelDispatcher(crossEntropyBackwardSpec) : null;
+
+// ============================================================================
 // Config Buffer (cached per batch_size x vocab_size)
 // ============================================================================
 
@@ -177,11 +349,19 @@ export function dispatchCrossEntropyForward(
   batchSize: number,
   vocabSize: number,
 ): GPUBuffer {
-  const ctx = requireContext();
-  const device = ctx.device;
-
   const outputSizeBytes = batchSize * 4; // f32
   const outBuffer = allocateOutputBuffer(outputSizeBytes);
+
+  if (ceFwdTileKernel) {
+    ceFwdTileKernel.dispatch(
+      { logits: logitsBuffer, targets: targetsBuffer, loss: outBuffer },
+      { batch_size: batchSize, vocab_size: vocabSize },
+    );
+    return outBuffer;
+  }
+
+  const ctx = requireContext();
+  const device = ctx.device;
 
   const configBuf = getOrCreateConfigBuffer(device, batchSize, vocabSize);
 
@@ -199,7 +379,7 @@ export function dispatchCrossEntropyForward(
   dispatchComputePass(
     pipeline,
     bindGroup,
-    batchSize, // one workgroup per row
+    batchSize,
   );
 
   return outBuffer;
@@ -216,11 +396,20 @@ export function dispatchCrossEntropyBackward(
   batchSize: number,
   vocabSize: number,
 ): GPUBuffer {
-  const ctx = requireContext();
-  const device = ctx.device;
-
   const outputSizeBytes = batchSize * vocabSize * 4; // f32
   const outBuffer = allocateOutputBuffer(outputSizeBytes);
+
+  if (ceBwdTileKernel) {
+    ceBwdTileKernel.dispatch(
+      { logits: logitsBuffer, targets: targetsBuffer, grad_output: gradOutputBuffer,
+        grad_logits: outBuffer },
+      { batch_size: batchSize, vocab_size: vocabSize },
+    );
+    return outBuffer;
+  }
+
+  const ctx = requireContext();
+  const device = ctx.device;
 
   const configBuf = getOrCreateConfigBuffer(device, batchSize, vocabSize);
 
@@ -238,7 +427,7 @@ export function dispatchCrossEntropyBackward(
   dispatchComputePass(
     pipeline,
     bindGroup,
-    batchSize, // one workgroup per row
+    batchSize,
   );
 
   return outBuffer;
@@ -248,5 +437,7 @@ export function dispatchCrossEntropyBackward(
  * Reset all module-local mutable state (pipeline cache, config buffer cache).
  */
 export function resetCrossEntropyKernelState(): void {
+  ceFwdTileKernel?.reset();
+  ceBwdTileKernel?.reset();
   configCache.clear();
 }

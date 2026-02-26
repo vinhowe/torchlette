@@ -28,6 +28,26 @@ import { getSubgroupSupport } from "./matmul/types";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { wgslSumReduction, trackBuffers } from "./wgsl-helpers";
+import { compileTileKernel } from "./tile-compiler";
+import {
+  makeForwardAttentionSpec,
+  makeDPrecomputeSpec,
+  makeBackwardDQSpec,
+  makeBackwardDKVSpec,
+} from "./attention-tile-ir";
+
+const USE_TILE_IR_ATTENTION = process.env.TORCHLETTE_TILE_ATTENTION !== "0";
+
+// Cache compiled tile-IR WGSL per headDim to avoid recompilation
+const tileIRWGSLCache = new Map<string, string>();
+function getTileIRWGSL(key: string, specFactory: () => import("./tile-ir").TileKernelSpec): string {
+  let wgsl = tileIRWGSLCache.get(key);
+  if (!wgsl) {
+    wgsl = compileTileKernel(specFactory());
+    tileIRWGSLCache.set(key, wgsl);
+  }
+  return wgsl;
+}
 
 // Tiling parameters
 const BR = 64;  // Q rows per workgroup (also workgroup size in scalar mode)
@@ -1133,12 +1153,19 @@ export function dispatchFlashAttentionForward(
     device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
   );
 
-  const sg = useSubgroupAttention(headDim);
-  const pipeline = getPipeline(
-    ctx,
-    `faFwd:${headDim}${sg ? ":sg" : ""}`,
-    flashAttentionForwardShader(headDim, sg),
-  );
+  // Tile-IR specs validated at headDim >= 64; smaller heads use hand-written shaders
+  const tileIR = USE_TILE_IR_ATTENTION && headDim >= 64;
+  let wgsl: string;
+  let pipelineKey: string;
+  if (tileIR) {
+    wgsl = getTileIRWGSL(`fwd:${headDim}`, () => makeForwardAttentionSpec(headDim));
+    pipelineKey = `faFwd:tile:${headDim}`;
+  } else {
+    const sg = useSubgroupAttention(headDim);
+    wgsl = flashAttentionForwardShader(headDim, sg);
+    pipelineKey = `faFwd:${headDim}${sg ? ":sg" : ""}`;
+  }
+  const pipeline = getPipeline(ctx, pipelineKey, wgsl);
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer, configBuf]);
@@ -1183,12 +1210,17 @@ export function dispatchFlashAttentionBackwardD(
     device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
   );
 
-  const WG = Math.max(headDim, 32);
-  const pipeline = getPipeline(
-    ctx,
-    `faBwdD:${headDim}`,
-    flashAttentionBackwardDShader(headDim),
-  );
+  const tileIR = USE_TILE_IR_ATTENTION && headDim >= 64;
+  let wgsl: string;
+  let pipelineKey: string;
+  if (tileIR) {
+    wgsl = getTileIRWGSL(`bwdD:${headDim}`, () => makeDPrecomputeSpec(headDim));
+    pipelineKey = `faBwdD:tile:${headDim}`;
+  } else {
+    wgsl = flashAttentionBackwardDShader(headDim);
+    pipelineKey = `faBwdD:${headDim}`;
+  }
+  const pipeline = getPipeline(ctx, pipelineKey, wgsl);
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [dOBuffer, oBuffer, outBuffer, configBuf]);
@@ -1233,12 +1265,18 @@ export function dispatchFlashAttentionBackwardDQ(
     device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
   );
 
-  const sg = useSubgroupAttention(headDim);
-  const pipeline = getPipeline(
-    ctx,
-    `faBwdDQ:${headDim}${sg ? ":sg" : ""}`,
-    flashAttentionBackwardDQShader(headDim, sg),
-  );
+  const tileIR = USE_TILE_IR_ATTENTION && headDim >= 64;
+  let wgsl: string;
+  let pipelineKey: string;
+  if (tileIR) {
+    wgsl = getTileIRWGSL(`bwdDQ:${headDim}`, () => makeBackwardDQSpec(headDim));
+    pipelineKey = `faBwdDQ:tile:${headDim}`;
+  } else {
+    const sg = useSubgroupAttention(headDim);
+    wgsl = flashAttentionBackwardDQShader(headDim, sg);
+    pipelineKey = `faBwdDQ:${headDim}${sg ? ":sg" : ""}`;
+  }
+  const pipeline = getPipeline(ctx, pipelineKey, wgsl);
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer, configBuf]);
@@ -1266,6 +1304,7 @@ export function dispatchFlashAttentionBackwardDQ(
  */
 export function resetAttentionKernelState(): void {
   configCache.clear();
+  tileIRWGSLCache.clear();
 }
 
 export function dispatchFlashAttentionBackwardDKV(
@@ -1295,12 +1334,18 @@ export function dispatchFlashAttentionBackwardDKV(
   );
 
   const BC_BW = 64;
-  const sg = useSubgroupAttention(headDim);
-  const pipeline = getPipeline(
-    ctx,
-    `faBwdDKV:${headDim}${sg ? ":sg" : ""}`,
-    flashAttentionBackwardDKVShader(headDim, sg),
-  );
+  const tileIR = USE_TILE_IR_ATTENTION && headDim >= 64;
+  let wgsl: string;
+  let pipelineKey: string;
+  if (tileIR) {
+    wgsl = getTileIRWGSL(`bwdDKV:${headDim}`, () => makeBackwardDKVSpec(headDim));
+    pipelineKey = `faBwdDKV:tile:${headDim}`;
+  } else {
+    const sg = useSubgroupAttention(headDim);
+    wgsl = flashAttentionBackwardDKVShader(headDim, sg);
+    pipelineKey = `faBwdDKV:${headDim}${sg ? ":sg" : ""}`;
+  }
+  const pipeline = getPipeline(ctx, pipelineKey, wgsl);
 
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer, configBuf]);

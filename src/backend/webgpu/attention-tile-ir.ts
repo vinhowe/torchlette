@@ -218,15 +218,21 @@ export function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
       D_val: { storage: "read_write", type: "f32" },
     },
     uniforms: {
-      total_rows: "u32",  // B * H * N
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
       head_dim: "u32",
+      scale: "f32",       // unused but must match FAConfig layout
+      is_causal: "u32",   // unused but must match FAConfig layout
     },
-    grid: (u) => [u.total_rows],
+    grid: (u) => [u.batch_size * u.num_heads * u.seq_len],
 
     kernel(ctx) {
       const tid = ctx.localIndex();
       const rowIdx = ctx.programId(0);
       // Use uniform so config binding stays live in WGSL
+      // Note: all 6 uniform fields must be declared to match FAConfig struct layout
+      // (batch_size, num_heads, seq_len used only for grid, others unused)
       const Dim = ctx.uniform("head_dim");
 
       // Shared memory for tree reduction
