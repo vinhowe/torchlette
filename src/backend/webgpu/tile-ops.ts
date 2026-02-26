@@ -795,6 +795,82 @@ export class BlockOps {
     });
   }
 
+  /**
+   * Store a register block using tile-level 2D addressing with bounds checking.
+   * Thread-tile-aware: each thread stores its threadTileM × threadTileN slice.
+   */
+  storeTile(binding: string, block: Block, ptr: TilePtr, mask: TileMask): void {
+    if (!this.threadTileM || !this.threadTileN) {
+      throw new Error("storeTile requires threadTile in BlockOps config");
+    }
+    this.ctx.pushStatement({
+      kind: "tileStore",
+      binding,
+      ptr: ptr.data,
+      mask: mask.data,
+      accName: block.name,
+      threadTileM: this.threadTileM,
+      threadTileN: this.threadTileN,
+      accDtype: block._castDtype,
+    });
+  }
+
+  // ---- Tile-level helpers (for matmul patterns) ----
+
+  /** Create a 1D range: [base, base+1, ..., base+blockSize-1] */
+  arange(base: BlockExpr, blockSize: number): TileRange {
+    return new TileRange({ base: base.node, size: blockSize });
+  }
+
+  /**
+   * Load a 1D tile into per-thread registers (e.g., bias vector).
+   * Returns a Block of shape [1, threadTileN].
+   */
+  load1d(binding: string, range: TileRange): Block {
+    if (!this.threadTileN) {
+      throw new Error("load1d requires threadTile in BlockOps config");
+    }
+    const name = this.freshName();
+    this.ctx.pushStatement({
+      kind: "tileLoad1d",
+      binding,
+      range: range.info,
+      arrayName: name,
+      size: this.threadTileN,
+    });
+    return new Block("register", 1, this.threadTileN, name, this.ctx, this);
+  }
+
+  /**
+   * Cooperative tile load from global memory into shared memory.
+   * Uses TilePtr/TileMask for 2D bounds-checked loading.
+   */
+  loadTile(binding: string, ptr: TilePtr, mask: TileMask): Block {
+    const name = this.freshName();
+    const tileRows = ptr.data.outerRange.size;
+    const tileCols = ptr.data.innerRange.size;
+
+    // Declare shared memory
+    this.ctx.sharedArrays.push({
+      name,
+      size: tileRows * tileCols,
+      elemType: "f32",
+    });
+
+    this.ctx.pushStatement({
+      kind: "tileLoad",
+      binding,
+      ptr: ptr.data,
+      mask: mask.data,
+      sharedName: name,
+      tileRows,
+      tileCols,
+      elemType: "f32",
+    });
+
+    return new Block("shared", tileRows, tileCols, name, this.ctx, this);
+  }
+
   // ---- Internal helpers (called by Block methods) ----
 
   /** @internal */
