@@ -1,4 +1,4 @@
-import type { Backend, DType } from "../backend/types";
+import { ensureDType, type Backend, type DType } from "../backend/types";
 import { asGPUTensor, type GPUBuffer, type WebGPUTensor } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
 import { sizeOf } from "../core/shape";
@@ -138,7 +138,7 @@ export async function executeFusedWebGPU(
         inputs.push({
           buffer: contig.buffer,
           shape: contig.shape ?? tensor.shape ?? [1],
-          dtype: (contig.dtype as DType) ?? (tensor.dtype as DType) ?? "f32",
+          dtype: ensureDType(contig.dtype ?? tensor.dtype),
         });
         continue;
       }
@@ -152,7 +152,7 @@ export async function executeFusedWebGPU(
     inputs.push({
       buffer: tensor.buffer,
       shape: tensor.shape ?? [1],
-      dtype: (tensor.dtype as DType) ?? "f32",
+      dtype: ensureDType(tensor.dtype),
     });
   }
 

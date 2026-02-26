@@ -11,7 +11,7 @@
  * - Fused groups must have 2+ ops to be worthwhile
  */
 
-import type { DType } from "../backend/types";
+import { ensureDType, type DType } from "../backend/types";
 import type {
   FusedInput,
   FusedKernelRecipe,
@@ -1022,7 +1022,7 @@ export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
         id,
         index: idx,
         shape: ref.storage.backendTensor.shape.slice(),
-        dtype: (ref.storage.backendTensor.dtype as DType) ?? "f32",
+        dtype: ensureDType(ref.storage.backendTensor.dtype),
       });
     } else {
       // Check if this pending ref is an inlinable scalar constant
@@ -1031,7 +1031,7 @@ export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
         id: ref.node.id,
         index: idx,
         shape: ref.node.shape ?? [1],
-        dtype: (ref.node.dtype as DType) ?? "f32",
+        dtype: ensureDType(ref.node.dtype),
       };
       if (inlineCheck.inlinable) {
         inputEntry.isInlinedConstant = true;
@@ -1071,7 +1071,7 @@ export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
       op: fusedOp,
       inputs: mappedInputs,
       shape: node.shape ?? [1],
-      dtype: (node.dtype as DType) ?? "f32",
+      dtype: ensureDType(node.dtype),
       isOutput: node === group.outputNode || isAdditionalOutput,
     });
   }
@@ -1083,7 +1083,7 @@ export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
       nodeId: outputNode.id,
       index: 0,
       shape: outputNode.shape ?? [1],
-      dtype: (outputNode.dtype as DType) ?? "f32",
+      dtype: ensureDType(outputNode.dtype),
     },
   ];
 
@@ -1094,7 +1094,7 @@ export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
         nodeId: addNode.id,
         index: i + 1,
         shape: addNode.shape ?? [1],
-        dtype: (addNode.dtype as DType) ?? "f32",
+        dtype: ensureDType(addNode.dtype),
       });
     }
   }
