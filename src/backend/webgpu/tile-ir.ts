@@ -452,6 +452,7 @@ export type Statement =
   | IndexAssignStmt
   | IndexAddAssignStmt
   | ForRangeStmt
+  | ForStrideStmt
   | IfStmt
   | IfElseStmt
   | BarrierStmt
@@ -541,6 +542,16 @@ export interface ForRangeStmt {
   body: Statement[];
   /** When true, the compiler unrolls this loop (requires const bounds). */
   unroll?: boolean;
+}
+
+/** Strided for loop: `for (var i = start; i < bound; i += stride)` — never unrolled. */
+export interface ForStrideStmt {
+  kind: "forStride";
+  varName: string;
+  start: IRNode;
+  bound: IRNode;
+  stride: number;
+  body: Statement[];
 }
 
 export interface IfStmt {
@@ -1737,6 +1748,29 @@ export class KernelContext {
     });
   }
 
+  /** Strided for loop: `for (var i = start; i < bound; i += stride)`. Never unrolled. */
+  forStride(
+    start: BlockExpr, bound: BlockExpr, stride: number,
+    body: (i: BlockExpr) => void,
+  ): void {
+    const varName = `_lv${this.loopVarCounter++}`;
+    const bodyStmts: Statement[] = [];
+    this.stmtStack.push(bodyStmts);
+    const loopVar = new BlockExpr(makeNode<NamedRefNode>({
+      kind: "namedRef", name: varName, valueType: "scalar", dataType: "u32",
+    }));
+    body(loopVar);
+    this.stmtStack.pop();
+    this.pushStatement({
+      kind: "forStride",
+      varName,
+      start: start.node,
+      bound: bound.node,
+      stride,
+      body: bodyStmts,
+    });
+  }
+
   /** Emit a compile-time unrolled loop. Body called N times with constant index. */
   forUnrolled(count: number, body: (i: BlockExpr) => void): void {
     for (let i = 0; i < count; i++) {
@@ -1985,13 +2019,7 @@ export class KernelContext {
     tid: BlockExpr, bound: BlockExpr, wgSize: number,
     body: (i: BlockExpr) => void,
   ): void {
-    const maxIters = bound.add(this.u32(wgSize - 1)).div(this.u32(wgSize));
-    this.forRange(this.u32(0), maxIters, (iter) => {
-      const i = tid.add(iter.mul(this.u32(wgSize)));
-      this.ifThen(i.lt(bound), () => {
-        body(i);
-      });
-    });
+    this.forStride(tid, bound, wgSize, body);
   }
 
   /**
