@@ -6,6 +6,7 @@
 import type { WebGPUTensor } from "../gpu-types";
 import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import { sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch, dtypeBytes, alignBufferSize } from "../shape-utils";
+import { fillWGSL, arangeWGSL, triangularWGSL } from "./ops-tile-ir";
 import { requireContext, f32ArrayToF16Array } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { createTensor, createTrackedBuffer, createBufferWithData } from "../tensor";
@@ -49,33 +50,10 @@ export function tensorFromArray(values: number[] | Float32Array, shape: number[]
   return createTensor(shape, buffer, undefined, 0, "f32");
 }
 
-/**
- * Generate WGSL shader for GPU-side fill.
- * Fills an output buffer with a constant value using a compute shader.
- */
-function fillShader(gridSizeX: number): string {
-  const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-  return `
-struct Params {
-  size: u32,
-  value: f32,
-};
-
-@group(0) @binding(0) var<storage, read_write> out: array<f32>;
-@group(0) @binding(1) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.size) {
-    return;
-  }
-  out[idx] = params.value;
-}
-`;
+/** Cached fill WGSL generated via tile-IR. */
+let _fillWGSL: string | null = null;
+function getFillWGSL(): string {
+  return _fillWGSL ?? (_fillWGSL = fillWGSL());
 }
 
 /**
@@ -129,11 +107,10 @@ export function full(shape: number[], fillValue: number): WebGPUTensor {
 
   const sizeBytes = numElements * 4; // f32
   const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
-  const { x: dispatchX, y: dispatchY, gridSizeX } = compute2DDispatch(totalWorkgroups);
+  const { x: dispatchX, y: dispatchY } = compute2DDispatch(totalWorkgroups);
 
-  const shaderKey = `fill_${gridSizeX}`;
-  const shader = fillShader(gridSizeX);
-  const pipeline = getPipeline(ctx, shaderKey, shader);
+  const shader = getFillWGSL();
+  const pipeline = getPipeline(ctx, "fill_tile", shader);
 
   // Arena-aware output allocation for stable buffer identity across steps
   const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
@@ -152,34 +129,10 @@ export function full(shape: number[], fillValue: number): WebGPUTensor {
   return createTensor(shape, outBuffer, undefined, 0, "f32");
 }
 
-/**
- * Generate WGSL shader for GPU-side arange.
- * Fills output with start + idx * step.
- */
-function arangeShader(gridSizeX: number): string {
-  const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-  return `
-struct Params {
-  size: u32,
-  start: f32,
-  step: f32,
-};
-
-@group(0) @binding(0) var<storage, read_write> out: array<f32>;
-@group(0) @binding(1) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.size) {
-    return;
-  }
-  out[idx] = params.start + f32(idx) * params.step;
-}
-`;
+/** Cached arange WGSL generated via tile-IR. */
+let _arangeWGSL: string | null = null;
+function getArangeWGSL(): string {
+  return _arangeWGSL ?? (_arangeWGSL = arangeWGSL());
 }
 
 /**
@@ -195,11 +148,10 @@ export function arange(end: number, start = 0, step = 1): WebGPUTensor {
 
   const sizeBytes = numElements * 4; // f32
   const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
-  const { x: dispatchX, y: dispatchY, gridSizeX } = compute2DDispatch(totalWorkgroups);
+  const { x: dispatchX, y: dispatchY } = compute2DDispatch(totalWorkgroups);
 
-  const shaderKey = `arange_${gridSizeX}`;
-  const shader = arangeShader(gridSizeX);
-  const pipeline = getPipeline(ctx, shaderKey, shader);
+  const shader = getArangeWGSL();
+  const pipeline = getPipeline(ctx, "arange_tile", shader);
 
   // Arena-aware output allocation for stable buffer identity across steps
   const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
@@ -219,49 +171,12 @@ export function arange(end: number, start = 0, step = 1): WebGPUTensor {
   return createTensor([numElements], outBuffer, undefined, 0, "f32");
 }
 
-/**
- * Generate WGSL shader for tril/triu.
- * A single shader template parameterized by upper (inlined at compile time).
- * For tril: zero where col > row + k
- * For triu: zero where col < row + k
- */
-function triangularShader(gridSizeX: number, upper: boolean): string {
-  const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-  // Inlined condition: tril zeros above k-th diagonal, triu zeros below
-  const zeroCondition = upper
-    ? `col < row + k` // triu: zero below
-    : `col > row + k`; // tril: zero above
-  return `
-struct Params {
-  num_elements: u32,
-  H: u32,
-  W: u32,
-  k: i32,
-};
-
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> output: array<f32>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.num_elements) {
-    return;
-  }
-  let row = i32((idx / params.W) % params.H);
-  let col = i32(idx % params.W);
-  let k = params.k;
-  if (${zeroCondition}) {
-    output[idx] = 0.0;
-  } else {
-    output[idx] = input[idx];
-  }
-}
-`;
+/** Cached triangular WGSL (tril/triu) generated via tile-IR. */
+let _trilWGSL: string | null = null;
+let _triuWGSL: string | null = null;
+function getTriangularWGSL(upper: boolean): string {
+  if (upper) return _triuWGSL ?? (_triuWGSL = triangularWGSL(true));
+  return _trilWGSL ?? (_trilWGSL = triangularWGSL(false));
 }
 
 /**
@@ -280,12 +195,11 @@ function triangularOp(a: WebGPUTensor, k: number, upper: boolean): WebGPUTensor 
   const input = a.isContiguous ? a : getContiguous(a);
 
   const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
-  const { x: dispatchX, y: dispatchY, gridSizeX } = compute2DDispatch(totalWorkgroups);
+  const { x: dispatchX, y: dispatchY } = compute2DDispatch(totalWorkgroups);
 
   const tag = upper ? "triu" : "tril";
-  const shaderKey = `${tag}_${gridSizeX}`;
-  const shader = triangularShader(gridSizeX, upper);
-  const pipeline = getPipeline(ctx, shaderKey, shader);
+  const shader = getTriangularWGSL(upper);
+  const pipeline = getPipeline(ctx, `${tag}_tile`, shader);
 
   const sizeBytes = numElements * 4;
   const alignedSize = alignBufferSize(sizeBytes);

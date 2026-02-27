@@ -14,10 +14,10 @@ import {
   toIndexShape,
   sizeOf,
   computeEffectiveBroadcastStrides,
-  buildBroadcastIndexing,
   compute2DDispatch,
   WORKGROUP_SIZE,
 } from "../shape-utils";
+import { comparisonWGSL, argReduceWGSL } from "./ops-tile-ir";
 import { requireContext } from "../gpu-context";
 import { dispatchElementwise, dispatchComputePass, getPipeline } from "../dispatch";
 import { createTensor, createTrackedBuffer } from "../tensor";
@@ -46,45 +46,12 @@ function comparisonOp(
   const aStrides = computeEffectiveBroadcastStrides(aTensor, indexShape);
   const bStrides = computeEffectiveBroadcastStrides(bTensor, indexShape);
 
-  const indexing = buildBroadcastIndexing(indexShape, [aStrides, bStrides]);
-
   const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
-  const use2D = dispatch.y > 1;
 
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${dispatch.gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
+  const code = comparisonWGSL(wgslOp, indexShape, aStrides, bStrides, aTensor.offset, bTensor.offset);
 
-  const code = `
-struct Params {
-  size: u32,
-};
-
-@group(0) @binding(0) var<storage, read> a: array<f32>;
-@group(0) @binding(1) var<storage, read> b: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
-
-${indexing.declarations}
-const A_OFFSET: u32 = ${aTensor.offset}u;
-const B_OFFSET: u32 = ${bTensor.offset}u;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.size) {
-    return;
-  }
-${indexing.compute}
-${indexing.offsets.join("\n")}
-  let aVal = a[offset0 + A_OFFSET];
-  let bVal = b[offset1 + B_OFFSET];
-  out[idx] = select(0.0, 1.0, aVal ${wgslOp} bVal);
-}
-`;
-
-  const key = `${opName}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${aTensor.offset}:${bTensor.offset}:${use2D ? dispatch.gridSizeX : "1d"}`;
+  const key = `${opName}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${aTensor.offset}:${bTensor.offset}`;
 
   const outBuffer = dispatchElementwise({
     key, shader: code,
@@ -231,85 +198,10 @@ function argReduceOp(
     }
   }
 
-  const inputShapeArray = `array<u32, ${rank}>(${inputShape.map((s) => `${s}u`).join(", ")})`;
-  const inputStridesArray = `array<u32, ${rank}>(${inputStrides.map((s) => `${s}u`).join(", ")})`;
-  const outShapeArray =
-    outShape.length > 0
-      ? `array<u32, ${outShape.length}>(${outShape.map((s) => `${s}u`).join(", ")})`
-      : "";
-  const outStridesArray =
-    outStrides.length > 0
-      ? `array<u32, ${outStrides.length}>(${outStrides.map((s) => `${s}u`).join(", ")})`
-      : "";
-  const inputToOutDimArray = `array<i32, ${rank}>(${inputToOutDim.map((d) => `${d}i`).join(", ")})`;
-
-  const initVal = compareOp === ">" ? "-3.402823466e+38" : "3.402823466e+38";
-
-  const code = `
-struct Params {
-  outSize: u32,
-  dimSize: u32,
-  dimStride: u32,
-};
-
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-const INPUT_RANK: u32 = ${rank}u;
-const OUT_RANK: u32 = ${outShape.length}u;
-const REDUCE_DIM: u32 = ${dim}u;
-const inputShape = ${inputShapeArray};
-const inputStrides = ${inputStridesArray};
-${outShape.length > 0 ? `const outShape = ${outShapeArray};` : ""}
-${outStrides.length > 0 ? `const outStrides = ${outStridesArray};` : ""}
-const inputToOutDim = ${inputToOutDimArray};
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let outIdx = gid.x;
-  if (outIdx >= params.outSize) {
-    return;
-  }
-
-  var outCoords: array<u32, ${Math.max(outShape.length, 1)}>;
-  ${
-    outShape.length > 0
-      ? `
-  var remaining = outIdx;
-  for (var d = 0u; d < OUT_RANK; d = d + 1u) {
-    outCoords[d] = remaining / outStrides[d];
-    remaining = remaining % outStrides[d];
-  }
-  `
-      : ""
-  }
-
-  // Compute base offset in input (with reduce dim = 0)
-  var baseOffset = 0u;
-  for (var d = 0u; d < INPUT_RANK; d = d + 1u) {
-    if (d != REDUCE_DIM) {
-      let outD = inputToOutDim[d];
-      if (outD >= 0i) {
-        baseOffset = baseOffset + outCoords[u32(outD)] * inputStrides[d];
-      }
-    }
-  }
-
-  // Find argmax/argmin along the reduce dimension
-  var bestVal = ${initVal};
-  var bestIdx = 0u;
-  for (var i = 0u; i < params.dimSize; i = i + 1u) {
-    let val = input[baseOffset + i * params.dimStride];
-    if (val ${compareOp} bestVal) {
-      bestVal = val;
-      bestIdx = i;
-    }
-  }
-
-  out[outIdx] = f32(bestIdx);
-}
-`;
+  const code = argReduceWGSL(
+    compareOp, inputShape, inputStrides,
+    outShape, outStrides, dim, dimSize, dimStride, inputToOutDim,
+  );
 
   const pipeline = getPipeline(
     ctx,
