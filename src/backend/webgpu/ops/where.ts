@@ -10,61 +10,15 @@ import {
   toIndexShape,
   sizeOf,
   computeEffectiveBroadcastStrides,
-  buildBroadcastIndexing,
   WORKGROUP_SIZE,
 } from "../shape-utils";
+import { whereWGSL } from "./ops-tile-ir";
 import { requireContext } from "../gpu-context";
 import { dispatchElementwise } from "../dispatch";
 import { createTensor } from "../tensor";
 import { resolveOutputBuffer } from "../buffer-arena";
 import { params1 } from "../bind-group-cache";
 import { computeFlatChunkLayout, dispatchFlatChunked } from "../chunked-dispatch";
-
-function ternaryWhereShader(
-  indexShape: number[],
-  condStrides: number[],
-  xStrides: number[],
-  yStrides: number[],
-  condOffset: number,
-  xOffset: number,
-  yOffset: number,
-): string {
-  const indexing = buildBroadcastIndexing(indexShape, [
-    condStrides,
-    xStrides,
-    yStrides,
-  ]);
-  return `
-struct Params {
-  size: u32,
-};
-
-@group(0) @binding(0) var<storage, read> cond: array<f32>;
-@group(0) @binding(1) var<storage, read> x: array<f32>;
-@group(0) @binding(2) var<storage, read> y: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
-@group(0) @binding(4) var<uniform> params: Params;
-
-${indexing.declarations}
-const COND_OFFSET: u32 = ${condOffset}u;
-const X_OFFSET: u32 = ${xOffset}u;
-const Y_OFFSET: u32 = ${yOffset}u;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = gid.x;
-  if (idx >= params.size) {
-    return;
-  }
-${indexing.compute}
-${indexing.offsets.join("\n")}
-  let condVal = cond[offset0 + COND_OFFSET];
-  let xVal = x[offset1 + X_OFFSET];
-  let yVal = y[offset2 + Y_OFFSET];
-  out[idx] = select(yVal, xVal, condVal != 0.0);
-}
-`;
-}
 
 /**
  * Broadcast three shapes to a common output shape.
@@ -158,7 +112,7 @@ function whereDirect(
   const xStrides = computeEffectiveBroadcastStrides(xTensor, indexShape);
   const yStrides = computeEffectiveBroadcastStrides(yTensor, indexShape);
 
-  const code = ternaryWhereShader(
+  const code = whereWGSL(
     indexShape, condStrides, xStrides, yStrides,
     condTensor.offset, xTensor.offset, yTensor.offset,
   );
