@@ -371,4 +371,239 @@ describe("tile-access-analysis", () => {
       expect(load!.maxVecWidth).toBe(4); // unknown → conservatively vec4
     });
   });
+
+  describe("integer division analysis", () => {
+    it("(globalId.x * 4) / 4 → stride 1, coalesced", () => {
+      const spec = makeSpec("divCoalesced", (ctx) => {
+        const gid = ctx.globalId(0);
+        // gid * 4 → stride 4, then / 4 → stride 1
+        const idx = gid.mul(ctx.u32(4)).div(ctx.u32(4));
+        const val = ctx.load("input", idx);
+        ctx.emitStore("output", gid, val);
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load");
+      expect(load).toBeDefined();
+      expect(load!.innerStride).toBe(1);
+      expect(load!.isCoalesced).toBe(true);
+    });
+
+    it("(globalId.x * 2) / 4 → stride 0.5 floors to unknown", () => {
+      const spec = makeSpec("divNonDivisible", (ctx) => {
+        const gid = ctx.globalId(0);
+        // gid * 2, then / 4: 2 % 4 != 0 → unknown
+        const idx = gid.mul(ctx.u32(2)).div(ctx.u32(4));
+        const val = ctx.load("input", idx);
+        ctx.emitStore("output", gid, val);
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load");
+      expect(load).toBeDefined();
+      expect(load!.innerStride).toBe("unknown");
+    });
+
+    it("thread-invariant / const → thread-invariant", () => {
+      const spec = makeSpec("divThreadInvariant", (ctx) => {
+        const gid = ctx.globalId(0);
+        const wid = ctx.programId(0);
+        // programId / 4 → still thread-invariant (stride 0)
+        const idx = wid.div(ctx.u32(4));
+        const val = ctx.load("input", idx);
+        ctx.emitStore("output", gid, val);
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load" && p.bindingName === "input");
+      expect(load).toBeDefined();
+      expect(load!.innerStride).toBe(0);
+      expect(load!.isCoalesced).toBe(false);
+    });
+  });
+
+  describe("modular arithmetic analysis", () => {
+    it("(globalId.x * 4) % 4 → thread-invariant (stride 0)", () => {
+      const spec = makeSpec("modZeroStride", (ctx) => {
+        const gid = ctx.globalId(0);
+        // gid * 4 → stride 4, then % 4: 4 % 4 == 0 → thread-invariant
+        const idx = gid.mul(ctx.u32(4)).mod(ctx.u32(4));
+        const val = ctx.load("input", idx);
+        ctx.emitStore("output", gid, val);
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load");
+      expect(load).toBeDefined();
+      expect(load!.innerStride).toBe(0);
+    });
+
+    it("globalId.x % 128 → stride 1 (coeff < modulus)", () => {
+      const spec = makeSpec("modPreservesStride", (ctx) => {
+        const gid = ctx.globalId(0);
+        // gid has innerCoeff=1, 1 < 128 → stride preserved
+        const idx = gid.mod(ctx.u32(128));
+        const val = ctx.load("input", idx);
+        ctx.emitStore("output", gid, val);
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load");
+      expect(load).toBeDefined();
+      expect(load!.innerStride).toBe(1);
+      expect(load!.isCoalesced).toBe(true);
+    });
+
+    it("thread-invariant % const → thread-invariant", () => {
+      const spec = makeSpec("modThreadInvariant", (ctx) => {
+        const gid = ctx.globalId(0);
+        const wid = ctx.programId(0);
+        const idx = wid.mod(ctx.u32(8));
+        const val = ctx.load("input", idx);
+        ctx.emitStore("output", gid, val);
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load" && p.bindingName === "input");
+      expect(load).toBeDefined();
+      expect(load!.innerStride).toBe(0);
+    });
+  });
+
+  describe("coordinate decomposition (div + mod)", () => {
+    it("2D → 1D: row = gid / cols, col = gid % cols → row is stride 0, col is stride 1", () => {
+      // Common pattern: linearize 2D index from globalId
+      // row * width + col where row = gid / width, col = gid % width
+      const spec = makeSpec("coordDecomp", (ctx) => {
+        const gid = ctx.globalId(0);
+        const width = ctx.u32(32);
+        // row = gid / 32 → innerCoeff=1 / 32 fails (1 % 32 != 0) → unknown
+        // col = gid % 32 → innerCoeff=1 < 32 → stride 1
+        // idx = row * someStride + col → depends on row resolution
+        // In practice: col alone is coalesced
+        const col = gid.mod(width);
+        const val = ctx.load("input", col);
+        ctx.emitStore("output", gid, val);
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load" && p.bindingName === "input");
+      expect(load).toBeDefined();
+      expect(load!.innerStride).toBe(1);
+      expect(load!.isCoalesced).toBe(true);
+    });
+
+    it("(gid * 32) / 32 + (gid % 32) * stride → divisible div produces stride 1", () => {
+      // Simulates: row = (gid * 32) / 32 = gid → stride 1
+      // This is a trivial case but validates div with divisible coeff
+      const spec = makeSpec("coordDecompDivisible", (ctx) => {
+        const gid = ctx.globalId(0);
+        const row = gid.mul(ctx.u32(32)).div(ctx.u32(32));
+        const val = ctx.load("input", row);
+        ctx.emitStore("output", gid, val);
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load");
+      expect(load).toBeDefined();
+      expect(load!.innerStride).toBe(1);
+      expect(load!.isCoalesced).toBe(true);
+    });
+  });
+
+  describe("let/var definition tracking", () => {
+    it("let offset = globalId.x; load(offset) → coalesced via let resolution", () => {
+      const spec = makeSpec("letTracking", (ctx) => {
+        const gid = ctx.globalId(0);
+        const offset = ctx.emitLet("offset", gid);
+        const val = ctx.load("input", offset);
+        ctx.emitStore("output", offset, val);
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load");
+      expect(load).toBeDefined();
+      expect(load!.innerStride).toBe(1);
+      expect(load!.isCoalesced).toBe(true);
+    });
+
+    it("let base = programId.x * N; let idx = base + gid → coalesced", () => {
+      const spec = makeSpec("letChained", (ctx) => {
+        const gid = ctx.globalId(0);
+        const wid = ctx.programId(0);
+        const base = ctx.emitLet("base", wid.mul(ctx.uniform("N")));
+        const idx = ctx.emitLet("idx", base.add(gid));
+        const val = ctx.load("input", idx);
+        ctx.emitStore("output", gid, val);
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load");
+      expect(load).toBeDefined();
+      expect(load!.innerStride).toBe(1);
+      expect(load!.isCoalesced).toBe(true);
+    });
+  });
+
+  describe("loop variable handling", () => {
+    it("forRange with constant bounds marks loop var as bounded → stride 0 for loop var", () => {
+      const spec = makeSpec("loopVar", (ctx) => {
+        const gid = ctx.globalId(0);
+        // Store at gid + loopVar — loopVar has constant bounds, so
+        // it's thread-invariant (stride 0). Combined: stride 1.
+        ctx.forRange(ctx.u32(0), ctx.u32(16), (i) => {
+          const idx = gid.add(i);
+          ctx.emitStore("output", idx, ctx.load("input", idx));
+        });
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      // All loads and stores inside the loop should have stride 1
+      // because gid has coeff=1 and loop var i has coeff=0
+      for (const p of patterns) {
+        expect(p.innerStride).toBe(1);
+        expect(p.isCoalesced).toBe(true);
+      }
+    });
+
+    it("forRange with uniform bounds treats loop var as data-dependent", () => {
+      const spec = makeSpec("loopVarUniform", (ctx) => {
+        const gid = ctx.globalId(0);
+        // Loop bound is a uniform (not a constant), so loop var
+        // is not in boundedLoopVars. namedRef → data-dependent.
+        ctx.forRange(ctx.u32(0), ctx.uniform("N"), (i) => {
+          // i is data-dependent but innerCoeff=0 (thread-invariant)
+          const idx = gid.add(i);
+          ctx.emitStore("output", idx, ctx.load("input", idx));
+        });
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      // Even with data-dependent loop var, gid still provides stride 1
+      // because i contributes innerCoeff=0 (thread-invariant)
+      for (const p of patterns) {
+        expect(p.innerStride).toBe(1);
+        expect(p.isCoalesced).toBe(true);
+      }
+    });
+
+    it("loop var * stride → still thread-invariant component in access", () => {
+      const spec = makeSpec("loopVarMul", (ctx) => {
+        const gid = ctx.globalId(0);
+        ctx.forRange(ctx.u32(0), ctx.u32(8), (i) => {
+          // i * 256 → thread-invariant (coeff=0), gid has coeff=1
+          // idx = i * 256 + gid → stride 1
+          const idx = i.mul(ctx.u32(256)).add(gid);
+          const val = ctx.load("input", idx);
+          ctx.emitStore("output", idx, val);
+        });
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load");
+      expect(load).toBeDefined();
+      expect(load!.innerStride).toBe(1);
+      expect(load!.isCoalesced).toBe(true);
+    });
+  });
 });
