@@ -25,7 +25,9 @@ import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { compileTileKernel } from "./tile-compiler";
-import type { TileKernelSpec, UniformType } from "./tile-ir";
+import type { TileKernelSpec, UniformType, AutotuneConfig } from "./tile-ir";
+import { autotuneTileKernel, getDefaultConfig, type AutotuneOptions } from "./tile-autotune";
+import { analyzeAccessPatterns, reportAccessPatterns } from "./tile-access-analysis";
 
 // ============================================================================
 // Config Buffer Packing
@@ -195,6 +197,76 @@ export function createTileKernelDispatcher(spec: TileKernelSpec): TileKernelInst
     reset(): void {
       configCache.clear();
       cachedWGSL = null;
+    },
+  };
+}
+
+// ============================================================================
+// Auto-Tunable Tile Kernel Dispatcher
+// ============================================================================
+
+export interface AutoTileKernelInstance {
+  /** Dispatch with cached best config (or default if not yet tuned). */
+  dispatch(
+    buffers: Record<string, GPUBuffer>,
+    uniforms: Record<string, number>,
+  ): void;
+
+  /** Run autotuning for given buffers/uniforms. Caches result. */
+  tune(
+    buffers: Record<string, GPUBuffer>,
+    uniforms: Record<string, number>,
+    options?: AutotuneOptions,
+  ): Promise<void>;
+
+  /** Get the WGSL source for the current (best or default) config. */
+  getWGSL(): string;
+
+  /** Get the current config values. */
+  getConfig(): Record<string, number>;
+
+  /** Reset cached state and tuning results. */
+  reset(): void;
+}
+
+/**
+ * Create a self-tuning tile kernel dispatcher from an AutotuneConfig.
+ *
+ * - `dispatch()` uses the cached best config (or default)
+ * - `tune()` runs autotuning, caches the winner, rebuilds the dispatcher
+ */
+export function createAutoTileKernelDispatcher(
+  autoConfig: AutotuneConfig,
+): AutoTileKernelInstance {
+  let currentConfig = getDefaultConfig(autoConfig);
+  let dispatcher = createTileKernelDispatcher(autoConfig.factory(currentConfig));
+
+  return {
+    dispatch(buffers: Record<string, GPUBuffer>, uniforms: Record<string, number>): void {
+      dispatcher.dispatch(buffers, uniforms);
+    },
+
+    async tune(
+      buffers: Record<string, GPUBuffer>,
+      uniforms: Record<string, number>,
+      options?: AutotuneOptions,
+    ): Promise<void> {
+      const result = await autotuneTileKernel(autoConfig, buffers, uniforms, options);
+      currentConfig = result.config;
+      dispatcher = createTileKernelDispatcher(autoConfig.factory(currentConfig));
+    },
+
+    getWGSL(): string {
+      return dispatcher.getWGSL();
+    },
+
+    getConfig(): Record<string, number> {
+      return { ...currentConfig };
+    },
+
+    reset(): void {
+      currentConfig = getDefaultConfig(autoConfig);
+      dispatcher = createTileKernelDispatcher(autoConfig.factory(currentConfig));
     },
   };
 }

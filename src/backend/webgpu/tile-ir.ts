@@ -1557,6 +1557,29 @@ export interface TileKernelSpec {
 }
 
 // ============================================================================
+// Autotuning Types
+// ============================================================================
+
+/** Tunable parameter definition. */
+export type TuneParam = {
+  values: number[];    // Candidate values (e.g. [32, 64, 128])
+  default: number;     // Default when autotuning disabled
+};
+
+/** A factory that generates a kernel spec from tunable config values. */
+export type TileKernelSpecFactory = (config: Record<string, number>) => TileKernelSpec;
+
+/** Autotuning metadata attached to a factory. */
+export interface AutotuneConfig {
+  factory: TileKernelSpecFactory;
+  params: Record<string, TuneParam>;
+  /** Constraints: functions that return true if a config combo is valid. */
+  constraints?: Array<(config: Record<string, number>) => boolean>;
+  /** Optional: narrow param space based on runtime uniform values. */
+  pruneForShape?: (uniforms: Record<string, number>) => Record<string, TuneParam>;
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
