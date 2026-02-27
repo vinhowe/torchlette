@@ -179,15 +179,19 @@ function freshVar(hint: string): string {
 export function compileTileKernel(spec: TileKernelSpec): string {
   _varCounter = 0;
 
-  // 1. Build the IR DAG
+  // 1. Build the IR DAG (includes constant folding + CSE in makeNode)
   const ctx = buildKernelIR(spec);
 
-  // 2. Check if statements contain tile-level ops that need lowering
-  if (hasTileStatements(ctx.statements)) {
-    const lowered = lowerTileStatements(ctx.statements, spec);
-    return compileImperativeKernel(spec, ctx, lowered);
+  // 2. Lower tile-level ops if present
+  let stmts = ctx.statements;
+  if (hasTileStatements(stmts)) {
+    stmts = lowerTileStatements(stmts, spec);
   }
-  return compileImperativeKernel(spec, ctx);
+
+  // 3. Dead code elimination (remove unused let bindings)
+  stmts = eliminateDeadCode(stmts);
+
+  return compileImperativeKernel(spec, ctx, stmts);
 }
 
 
@@ -302,10 +306,13 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
 }
 
 /**
- * Detect statically-true guard conditions (e.g. `1u == 1u`).
+ * Detect statically-true guard conditions (e.g. `1u == 1u` or folded const(1)).
  * Returns true if the expression is a compile-time constant that evaluates to true.
  */
 function isStaticTrue(node: IRNode): boolean {
+  // Handle folded constant (from const-const comparison folding)
+  if (node.kind === "const") return node.value !== 0;
+  // Handle unfolded comparison (in case folding was bypassed)
   if (node.kind === "cmp") {
     const { op, lhs, rhs } = node;
     if (lhs.kind === "const" && rhs.kind === "const") {
@@ -320,6 +327,12 @@ function isStaticTrue(node: IRNode): boolean {
       }
     }
   }
+  return false;
+}
+
+/** Detect statically-false guard conditions (folded const(0) or false comparisons). */
+function isStaticFalse(node: IRNode): boolean {
+  if (node.kind === "const") return node.value === 0;
   return false;
 }
 
@@ -385,25 +398,35 @@ function emitStatement(
       break;
     }
     case "if": {
-      const cond = exprFor(stmt.condition, bindings, null);
-      lines.push(`${indent}if (${cond}) {`);
-      for (const s of stmt.body) {
-        emitStatement(s, bindings, lines, depth + 1);
+      if (isStaticTrue(stmt.condition)) {
+        for (const s of stmt.body) emitStatement(s, bindings, lines, depth);
+      } else if (!isStaticFalse(stmt.condition)) {
+        const cond = exprFor(stmt.condition, bindings, null);
+        lines.push(`${indent}if (${cond}) {`);
+        for (const s of stmt.body) {
+          emitStatement(s, bindings, lines, depth + 1);
+        }
+        lines.push(`${indent}}`);
       }
-      lines.push(`${indent}}`);
       break;
     }
     case "ifElse": {
-      const cond = exprFor(stmt.condition, bindings, null);
-      lines.push(`${indent}if (${cond}) {`);
-      for (const s of stmt.body) {
-        emitStatement(s, bindings, lines, depth + 1);
+      if (isStaticTrue(stmt.condition)) {
+        for (const s of stmt.body) emitStatement(s, bindings, lines, depth);
+      } else if (isStaticFalse(stmt.condition)) {
+        for (const s of stmt.elseBody) emitStatement(s, bindings, lines, depth);
+      } else {
+        const cond = exprFor(stmt.condition, bindings, null);
+        lines.push(`${indent}if (${cond}) {`);
+        for (const s of stmt.body) {
+          emitStatement(s, bindings, lines, depth + 1);
+        }
+        lines.push(`${indent}} else {`);
+        for (const s of stmt.elseBody) {
+          emitStatement(s, bindings, lines, depth + 1);
+        }
+        lines.push(`${indent}}`);
       }
-      lines.push(`${indent}} else {`);
-      for (const s of stmt.elseBody) {
-        emitStatement(s, bindings, lines, depth + 1);
-      }
-      lines.push(`${indent}}`);
       break;
     }
     case "barrier": {
@@ -423,6 +446,10 @@ function emitStatement(
       break;
     }
     case "guardedStore": {
+      if (isStaticFalse(stmt.condition)) {
+        // Dead store — omit entirely
+        break;
+      }
       const idx = exprFor(stmt.idx, bindings, null);
       const val = exprFor(stmt.value, bindings, null);
       if (isStaticTrue(stmt.condition)) {
@@ -454,6 +481,131 @@ function emitStatement(
       break;
     }
   }
+}
+
+// ============================================================================
+// Dead Code Elimination
+// ============================================================================
+
+/** Collect all namedRef names referenced by an IR expression tree. */
+function collectExprNames(node: IRNode, names: Set<string>): void {
+  switch (node.kind) {
+    case "namedRef": names.add(node.name); break;
+    case "binary": collectExprNames(node.lhs, names); collectExprNames(node.rhs, names); break;
+    case "unary": collectExprNames(node.input, names); break;
+    case "cast": collectExprNames(node.input, names); break;
+    case "bitcast": collectExprNames(node.input, names); break;
+    case "cmp": collectExprNames(node.lhs, names); collectExprNames(node.rhs, names); break;
+    case "select":
+      collectExprNames(node.condition, names);
+      collectExprNames(node.trueVal, names);
+      collectExprNames(node.falseVal, names);
+      break;
+    case "load":
+      collectExprNames(node.offsets, names);
+      if (node.mask) collectExprNames(node.mask, names);
+      break;
+    case "sharedRead": collectExprNames(node.idx, names); break;
+    case "arrayRead": collectExprNames(node.idx, names); break;
+    case "subgroupShuffleXor":
+      collectExprNames(node.value, names);
+      collectExprNames(node.mask, names);
+      break;
+    case "vec4dot":
+      for (const n of node.a) collectExprNames(n, names);
+      for (const n of node.b) collectExprNames(n, names);
+      break;
+    // Leaf nodes (programId, uniform, const, threadIdx, localIndex, globalId): no names
+  }
+}
+
+/** Collect all namedRef names from all expressions in a statement (recursively into bodies). */
+function collectAllStmtNames(stmt: Statement, names: Set<string>): void {
+  switch (stmt.kind) {
+    case "let":
+      collectExprNames(stmt.value, names);
+      break;
+    case "var":
+      collectExprNames(stmt.value, names);
+      break;
+    case "assign":
+    case "addAssign":
+      collectExprNames(stmt.value, names);
+      break;
+    case "indexAssign":
+    case "indexAddAssign":
+      collectExprNames(stmt.idx, names);
+      collectExprNames(stmt.value, names);
+      break;
+    case "forRange":
+      collectExprNames(stmt.start, names);
+      collectExprNames(stmt.bound, names);
+      for (const s of stmt.body) collectAllStmtNames(s, names);
+      break;
+    case "if":
+      collectExprNames(stmt.condition, names);
+      for (const s of stmt.body) collectAllStmtNames(s, names);
+      break;
+    case "ifElse":
+      collectExprNames(stmt.condition, names);
+      for (const s of stmt.body) collectAllStmtNames(s, names);
+      for (const s of stmt.elseBody) collectAllStmtNames(s, names);
+      break;
+    case "sharedWrite":
+      collectExprNames(stmt.idx, names);
+      collectExprNames(stmt.value, names);
+      break;
+    case "guardedStore":
+      collectExprNames(stmt.condition, names);
+      collectExprNames(stmt.idx, names);
+      collectExprNames(stmt.value, names);
+      break;
+    case "directStore":
+      collectExprNames(stmt.idx, names);
+      collectExprNames(stmt.value, names);
+      break;
+    case "atomicOp":
+      collectExprNames(stmt.idx, names);
+      collectExprNames(stmt.value, names);
+      break;
+    // barrier, return, varArray: no IRNode expressions to collect
+  }
+}
+
+/**
+ * Remove `let` statements whose bindings are never referenced.
+ * Applies bottom-up: inner scopes are processed first, then outer scopes
+ * propagate liveness backward through let chains.
+ */
+function eliminateDeadCode(stmts: Statement[]): Statement[] {
+  // Step 1: Recurse into nested bodies (bottom-up)
+  const processed = stmts.map(s => {
+    switch (s.kind) {
+      case "forRange": return { ...s, body: eliminateDeadCode(s.body) } as Statement;
+      case "if":       return { ...s, body: eliminateDeadCode(s.body) } as Statement;
+      case "ifElse":   return { ...s, body: eliminateDeadCode(s.body), elseBody: eliminateDeadCode(s.elseBody) } as Statement;
+      default: return s;
+    }
+  });
+
+  // Step 2: Collect names used by non-let statements (including nested bodies)
+  const usedNames = new Set<string>();
+  for (const s of processed) {
+    if (s.kind !== "let") {
+      collectAllStmtNames(s, usedNames);
+    }
+  }
+
+  // Step 3: Reverse-propagate through let statements at this scope
+  for (let i = processed.length - 1; i >= 0; i--) {
+    const s = processed[i];
+    if (s.kind === "let" && usedNames.has(s.name)) {
+      collectExprNames(s.value, usedNames);
+    }
+  }
+
+  // Step 4: Filter dead lets
+  return processed.filter(s => s.kind !== "let" || usedNames.has(s.name));
 }
 
 // ============================================================================

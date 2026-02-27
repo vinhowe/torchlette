@@ -499,8 +499,187 @@ export interface AtomicOpStmt {
 
 let nextNodeId = 0;
 
+// ---- CSE cache (cleared per kernel compilation) ----
+let cseCache = new Map<string, IRNode>();
+
+// ---- Constant folding helpers ----
+
+function isConstVal(node: IRNode, val: number): boolean {
+  return node.kind === "const" && node.value === val;
+}
+
+function evalBinaryConst(op: BinaryOp, a: number, b: number): number | null {
+  switch (op) {
+    case "add": { const r = a + b; return isFinite(r) ? r : null; }
+    case "sub": { const r = a - b; return isFinite(r) ? r : null; }
+    case "mul": { const r = a * b; return isFinite(r) ? r : null; }
+    case "div": return b !== 0 && isFinite(a / b) ? a / b : null;
+    case "mod": return b !== 0 ? a % b : null;
+    case "min": return Math.min(a, b);
+    case "max": return Math.max(a, b);
+    case "pow": { const r = Math.pow(a, b); return isFinite(r) ? r : null; }
+    case "and": return ((a >>> 0) & (b >>> 0)) >>> 0;
+    case "or":  return ((a >>> 0) | (b >>> 0)) >>> 0;
+    case "shr": return (a >>> 0) >>> (b >>> 0);
+    case "shl": return ((a >>> 0) << (b >>> 0)) >>> 0;
+    default: return null;
+  }
+}
+
+function evalUnaryConst(op: UnaryOp, x: number): number | null {
+  switch (op) {
+    case "neg":   return -x;
+    case "abs":   return Math.abs(x);
+    case "exp":   { const r = Math.exp(x); return isFinite(r) ? r : null; }
+    case "log":   return x > 0 ? Math.log(x) : null;
+    case "sqrt":  return x >= 0 ? Math.sqrt(x) : null;
+    case "rsqrt": return x > 0 ? 1 / Math.sqrt(x) : null;
+    case "floor": return Math.floor(x);
+    case "ceil":  return Math.ceil(x);
+    case "sin":   return Math.sin(x);
+    case "cos":   return Math.cos(x);
+    case "tanh":  return Math.tanh(x);
+    case "round": return Math.round(x);
+    case "sign":  return Math.sign(x);
+    case "not":   return x ? 0 : 1;
+    default: return null;
+  }
+}
+
+/**
+ * Try to fold a node at construction time. Returns:
+ * - An existing IRNode (id >= 0) for algebraic simplification (reuses operand)
+ * - A new ConstNode with id = -1 for constant folding (caller assigns real id)
+ * - null if no optimization applies
+ */
+function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
+  if (partial.kind === "binary") {
+    const { op, lhs, rhs, dataType } = partial as Omit<BinaryNode, "id">;
+    // Constant folding: both operands are const
+    if (lhs.kind === "const" && rhs.kind === "const") {
+      const result = evalBinaryConst(op, lhs.value, rhs.value);
+      if (result !== null) {
+        return { kind: "const", value: result, valueType: "scalar", dataType, id: -1 } as ConstNode;
+      }
+    }
+    // Algebraic simplifications
+    switch (op) {
+      case "add":
+        if (isConstVal(rhs, 0)) return lhs;
+        if (isConstVal(lhs, 0)) return rhs;
+        break;
+      case "sub":
+        if (isConstVal(rhs, 0)) return lhs;
+        break;
+      case "mul":
+        if (isConstVal(rhs, 1)) return lhs;
+        if (isConstVal(lhs, 1)) return rhs;
+        break;
+      case "div":
+        if (isConstVal(rhs, 1)) return lhs;
+        break;
+      case "and":
+        if (isConstVal(rhs, 0) || isConstVal(lhs, 0))
+          return { kind: "const", value: 0, valueType: "scalar", dataType: "u32", id: -1 } as ConstNode;
+        break;
+      case "or":
+        if (isConstVal(rhs, 0)) return lhs;
+        if (isConstVal(lhs, 0)) return rhs;
+        break;
+    }
+    return null;
+  }
+
+  if (partial.kind === "unary") {
+    const { op, input, dataType } = partial as Omit<UnaryNode, "id">;
+    // Constant folding
+    if (input.kind === "const") {
+      const result = evalUnaryConst(op, input.value);
+      if (result !== null) {
+        return { kind: "const", value: result, valueType: "scalar", dataType, id: -1 } as ConstNode;
+      }
+    }
+    // neg(neg(x)) → x
+    if (op === "neg" && input.kind === "unary" && input.op === "neg") {
+      return input.input;
+    }
+    return null;
+  }
+
+  if (partial.kind === "cmp") {
+    const { op, lhs, rhs } = partial as Omit<CmpNode, "id">;
+    if (lhs.kind === "const" && rhs.kind === "const") {
+      const l = lhs.value, r = rhs.value;
+      let result: boolean;
+      switch (op) {
+        case "eq": result = l === r; break;
+        case "ne": result = l !== r; break;
+        case "lt": result = l < r; break;
+        case "le": result = l <= r; break;
+        case "gt": result = l > r; break;
+        case "ge": result = l >= r; break;
+      }
+      return { kind: "const", value: result! ? 1 : 0, valueType: "scalar", dataType: "u32", id: -1 } as ConstNode;
+    }
+    return null;
+  }
+
+  if (partial.kind === "cast") {
+    const { input, targetType } = partial as Omit<CastNode, "id">;
+    if (input.kind === "const") {
+      return { kind: "const", value: input.value, valueType: "scalar", dataType: targetType, id: -1 } as ConstNode;
+    }
+    return null;
+  }
+
+  return null;
+}
+
+// ---- CSE key computation ----
+
+function cseKey(node: { kind: string;[key: string]: any }): string | null {
+  switch (node.kind) {
+    case "const":    return `K:${node.dataType}:${node.value}`;
+    case "binary":   return `B:${node.op}:${node.lhs.id}:${node.rhs.id}`;
+    case "unary":    return `U:${node.op}:${node.input.id}`;
+    case "cmp":      return `C:${node.op}:${node.lhs.id}:${node.rhs.id}`;
+    case "cast":     return `T:${node.targetType}:${node.input.id}`;
+    case "bitcast":  return `BC:${node.targetType}:${node.input.id}`;
+    case "select":   return `S:${node.condition.id}:${node.trueVal.id}:${node.falseVal.id}`;
+    case "uniform":  return `UNI:${node.name}`;
+    case "programId": return `PID:${node.dim}`;
+    case "threadIdx": return `TID:${node.dim}`;
+    case "localIndex": return "LI";
+    case "globalId": return `GID:${node.dim}`;
+    default: return null; // Not CSE-eligible (loads, sharedRead, namedRef, etc.)
+  }
+}
+
 function makeNode<T extends IRNode>(partial: Omit<T, "id">): T {
-  return { ...partial, id: nextNodeId++ } as T;
+  // Phase 1: Constant folding + algebraic simplification
+  const folded = tryFold(partial as unknown as Omit<IRNode, "id">);
+  if (folded !== null) {
+    if (folded.id >= 0) return folded as unknown as T; // existing node (algebraic simp)
+    // New const from folding — check CSE, then assign id
+    const key = cseKey(folded);
+    if (key !== null) {
+      const existing = cseCache.get(key);
+      if (existing) return existing as unknown as T;
+    }
+    (folded as any).id = nextNodeId++;
+    if (key !== null) cseCache.set(key, folded);
+    return folded as unknown as T;
+  }
+
+  // Phase 2: CSE — return cached node if structurally identical
+  const key = cseKey(partial as any);
+  if (key !== null) {
+    const existing = cseCache.get(key);
+    if (existing) return existing as T;
+  }
+  const node = { ...partial, id: nextNodeId++ } as T;
+  if (key !== null) cseCache.set(key, node);
+  return node;
 }
 
 /** Resolve a BlockExpr or number into an IRNode. Numbers become f32 constants. */
@@ -1392,6 +1571,7 @@ export function resetNodeIdCounter(): void {
  */
 export function buildKernelIR(spec: TileKernelSpec): KernelContext {
   nextNodeId = 0;
+  cseCache = new Map();
   try {
     const ctx = new KernelContext(spec.bindings);
     spec.kernel(ctx);
