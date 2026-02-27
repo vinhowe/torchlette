@@ -474,6 +474,8 @@ export interface ForRangeStmt {
   start: IRNode;
   bound: IRNode;
   body: Statement[];
+  /** When true, the compiler unrolls this loop (requires const bounds). */
+  unroll?: boolean;
 }
 
 export interface IfStmt {
@@ -1483,7 +1485,12 @@ export class KernelContext {
   }
 
   /** Emit a for loop: `for (var v = start; v < bound; v++)`. */
-  forRange(start: BlockExpr, bound: BlockExpr, body: (loopVar: BlockExpr) => void): void {
+  forRange(
+    start: BlockExpr,
+    bound: BlockExpr,
+    body: (loopVar: BlockExpr) => void,
+    opts?: { unroll?: boolean },
+  ): void {
     const varName = `_lv${this.loopVarCounter++}`;
     const bodyStmts: Statement[] = [];
     this.stmtStack.push(bodyStmts);
@@ -1499,7 +1506,15 @@ export class KernelContext {
       start: start.node,
       bound: bound.node,
       body: bodyStmts,
+      ...(opts?.unroll ? { unroll: true } : {}),
     });
+  }
+
+  /** Emit a compile-time unrolled loop. Body called N times with constant index. */
+  forUnrolled(count: number, body: (i: BlockExpr) => void): void {
+    for (let i = 0; i < count; i++) {
+      body(this.u32(i));
+    }
   }
 
   /** Emit an if-then block. */
@@ -2211,6 +2226,43 @@ export interface TileKernelSpec {
   grid: (uniforms: Record<string, number>) => [number] | [number, number] | [number, number, number];
   /** The kernel function that builds the IR DAG. */
   kernel: (ctx: KernelContext) => void;
+}
+
+// ============================================================================
+// Grid Helpers
+// ============================================================================
+
+const MAX_WG_PER_DIM = 65535;
+
+type GridFn = TileKernelSpec["grid"];
+
+/**
+ * Grid for 1-thread-per-element kernels with optional vectorization
+ * and automatic 2D overflow when workgroups exceed 65535.
+ */
+export function elementwiseGrid(
+  workgroupSize: number,
+  opts?: { vecWidth?: number; elementUniform?: string },
+): GridFn {
+  const vw = opts?.vecWidth ?? 1;
+  const uName = opts?.elementUniform ?? "total_elements";
+  return (u) => {
+    const totalWg = Math.ceil(u[uName] / (workgroupSize * vw));
+    if (totalWg <= MAX_WG_PER_DIM) return [totalWg];
+    return [Math.min(totalWg, MAX_WG_PER_DIM), Math.ceil(totalWg / MAX_WG_PER_DIM)];
+  };
+}
+
+/** Grid for 1-workgroup-per-row kernels (e.g. LayerNorm, cross-entropy). */
+export function perRowGrid(rowUniform?: string): GridFn {
+  const name = rowUniform ?? "num_rows";
+  return (u) => [u[name]];
+}
+
+/** Grid for simple 1D ceil-division dispatch. */
+export function ceilDivGrid(divisor: number, elementUniform?: string): GridFn {
+  const name = elementUniform ?? "total_elements";
+  return (u) => [Math.ceil(u[name] / divisor)];
 }
 
 // ============================================================================

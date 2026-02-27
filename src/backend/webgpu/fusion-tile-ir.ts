@@ -25,6 +25,7 @@ import {
   type DataType,
   type KernelContext,
   type BlockExpr,
+  elementwiseGrid,
 } from "./tile-ir";
 import { compileTileKernel } from "./tile-compiler";
 import { getArity } from "./ops/registry";
@@ -268,15 +269,7 @@ export function generateFusedKernelTileIR(
     uniformBindingIndex,
     enableF16: needsF16 || undefined,
     vectorize: vectorWidth > 1 ? vectorWidth : undefined,
-    grid: (u) => {
-      const totalWg = Math.ceil(
-        Math.ceil(u.total_elements / (vectorWidth as number)) / workgroupSize
-      );
-      if (!use2D) return [totalWg];
-      const x = Math.min(totalWg, MAX_WORKGROUPS_PER_DIM);
-      const y = Math.ceil(totalWg / MAX_WORKGROUPS_PER_DIM);
-      return [x, y];
-    },
+    grid: elementwiseGrid(workgroupSize, { vecWidth: vectorWidth }),
     kernel: (ctx: KernelContext) => {
       // Compute linear element index
       let gidExpr: BlockExpr;

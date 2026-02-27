@@ -21,7 +21,7 @@ import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
-import type { TileKernelSpec } from "./tile-ir";
+import { type TileKernelSpec, perRowGrid, ceilDivGrid } from "./tile-ir";
 import { createTileKernelDispatcher } from "./tile-dispatch";
 import { wgslSumReduction, wgslDualSumReduction, trackBuffers } from "./wgsl-helpers";
 
@@ -81,7 +81,7 @@ const layerNormFwdSpec: TileKernelSpec = {
     feature_dim: "u32",
     eps:         "f32",
   },
-  grid: (u) => [u.num_rows],
+  grid: perRowGrid(),
 
   kernel(ctx) {
     const row  = ctx.programId(0);
@@ -137,7 +137,7 @@ const layerNormBackwardGradXSpec: TileKernelSpec = {
     feature_dim: "u32",
     eps:         "f32",
   },
-  grid: (u) => [u.num_rows],
+  grid: perRowGrid(),
 
   kernel(ctx) {
     const tid = ctx.localIndex();
@@ -193,7 +193,7 @@ const layerNormRowStatsSpec: TileKernelSpec = {
     feature_dim: "u32",
     eps:         "f32",
   },
-  grid: (u) => [u.num_rows],
+  grid: perRowGrid(),
 
   kernel(ctx) {
     const tid = ctx.localIndex();
@@ -240,7 +240,7 @@ const layerNormBackwardGradWeightBiasSpec: TileKernelSpec = {
     feature_dim: "u32",
     eps:         "f32",
   },
-  grid: (u) => [Math.ceil(u.feature_dim / WG)],
+  grid: ceilDivGrid(WG, "feature_dim"),
 
   kernel(ctx) {
     const featureIdx = ctx.globalId(0);

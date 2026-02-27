@@ -22,7 +22,7 @@ import {
 } from "../../src/backend/webgpu";
 import { createTileKernelDispatcher } from "../../src/backend/webgpu/tile-dispatch";
 import { compileTileKernel } from "../../src/backend/webgpu/tile-compiler";
-import type { TileKernelSpec } from "../../src/backend/webgpu/tile-ir";
+import { type TileKernelSpec, elementwiseGrid, perRowGrid, ceilDivGrid } from "../../src/backend/webgpu/tile-ir";
 import { setSubgroupSupport, clearSubgroupSupport, getSubgroupSupport } from "../../src/backend/webgpu/matmul/types";
 import type { GPUBuffer, GPUDevice, GPUQueue } from "../../src/backend/webgpu/gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "../../src/backend/webgpu/gpu-types";
@@ -1532,7 +1532,7 @@ describe("Triton Gap: LICM", () => {
       grid: () => [1],
       kernel(ctx) {
         const tid = ctx.localIndex();
-        ctx.forRange(ctx.u32(0), ctx.u32(4), (_k) => {
+        ctx.forRange(ctx.u32(0), ctx.u32(32), (_k) => {
           // This let only depends on uniform N, should be hoisted
           const n = ctx.emitLet("n_val", ctx.uniform("N").toF32());
           ctx.emitStore("output", tid, n);
@@ -1557,7 +1557,7 @@ describe("Triton Gap: LICM", () => {
       grid: () => [1],
       kernel(ctx) {
         const tid = ctx.localIndex();
-        ctx.forRange(ctx.u32(0), ctx.u32(4), (k) => {
+        ctx.forRange(ctx.u32(0), ctx.u32(32), (k) => {
           // This depends on loop var k, should NOT be hoisted
           const val = ctx.emitLet("k_val", k.add(ctx.u32(1)));
           ctx.emitStore("output", tid.add(k), val.toF32());
@@ -1587,7 +1587,7 @@ describe("Triton Gap: LICM", () => {
         const smem = ctx.sharedArray("s", 64, "f32");
         smem.write(tid, ctx.f32(0.0));
         ctx.barrier();
-        ctx.forRange(ctx.u32(0), ctx.u32(4), (_k) => {
+        ctx.forRange(ctx.u32(0), ctx.u32(32), (_k) => {
           // Reads smem which is written in this loop → should NOT hoist
           const val = ctx.emitLet("s_val", smem.read(ctx.u32(0)));
           smem.write(tid, val.add(ctx.f32(1.0)));
@@ -2992,6 +2992,232 @@ describe("Tile-IR Subgroup Optimization", () => {
       }
 
       outputBuf.destroy(); readBuf.destroy();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Grid Helpers
+  // ---------------------------------------------------------------------------
+
+  describe("Grid Helpers", () => {
+    it("elementwiseGrid: 1D for small element counts", () => {
+      const grid = elementwiseGrid(64);
+      expect(grid({ total_elements: 128 })).toEqual([2]);
+      expect(grid({ total_elements: 64 })).toEqual([1]);
+      expect(grid({ total_elements: 65 })).toEqual([2]);
+    });
+
+    it("elementwiseGrid: 2D overflow for large counts", () => {
+      const grid = elementwiseGrid(64);
+      // 65535 * 64 + 1 = 4194241 elements → needs 65536 workgroups → 2D
+      const result = grid({ total_elements: 65535 * 64 + 1 });
+      expect(result.length).toBe(2);
+      expect(result[0]).toBe(65535);
+      expect(result[1]).toBe(2); // ceil(65536 / 65535)
+    });
+
+    it("elementwiseGrid: respects vecWidth", () => {
+      const grid = elementwiseGrid(64, { vecWidth: 4 });
+      // 256 elements / (64 * 4) = 1 workgroup
+      expect(grid({ total_elements: 256 })).toEqual([1]);
+      // 257 elements / (64 * 4) = ceil(257/256) = 2 workgroups
+      expect(grid({ total_elements: 257 })).toEqual([2]);
+    });
+
+    it("elementwiseGrid: custom uniform name", () => {
+      const grid = elementwiseGrid(64, { elementUniform: "numel" });
+      expect(grid({ numel: 128 })).toEqual([2]);
+    });
+
+    it("perRowGrid: defaults to num_rows", () => {
+      const grid = perRowGrid();
+      expect(grid({ num_rows: 42 })).toEqual([42]);
+    });
+
+    it("perRowGrid: custom uniform name", () => {
+      const grid = perRowGrid("batch_size");
+      expect(grid({ batch_size: 7 })).toEqual([7]);
+    });
+
+    it("ceilDivGrid: correct division", () => {
+      const grid = ceilDivGrid(256);
+      expect(grid({ total_elements: 512 })).toEqual([2]);
+      expect(grid({ total_elements: 513 })).toEqual([3]);
+      expect(grid({ total_elements: 256 })).toEqual([1]);
+    });
+
+    it("ceilDivGrid: custom uniform name", () => {
+      const grid = ceilDivGrid(64, "feature_dim");
+      expect(grid({ feature_dim: 768 })).toEqual([12]);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Loop Unrolling
+  // ---------------------------------------------------------------------------
+
+  describe("Loop Unrolling", () => {
+    it("auto-unrolls forRange with const bounds ≤ 16", () => {
+      const spec: TileKernelSpec = {
+        name: "auto_unroll",
+        workgroupSize: 64,
+        bindings: { out: { storage: "read_write", type: "f32" } },
+        uniforms: {},
+        grid: () => [1],
+        kernel(ctx) {
+          const acc = ctx.emitVar("acc", "f32", ctx.f32(0));
+          ctx.forRange(ctx.u32(0), ctx.u32(4), (i) => {
+            acc.addAssign(i.toF32());
+          });
+          ctx.emitStore("out", ctx.u32(0), acc.get());
+        },
+      };
+      const wgsl = compileTileKernel(spec);
+      // Should NOT have a for loop
+      expect(wgsl).not.toContain("for (var");
+      // Should have unrolled blocks
+      expect(wgsl).toContain("// unrolled");
+      expect(wgsl).toContain("const _lv0 = 0u;");
+      expect(wgsl).toContain("const _lv0 = 1u;");
+      expect(wgsl).toContain("const _lv0 = 2u;");
+      expect(wgsl).toContain("const _lv0 = 3u;");
+    });
+
+    it("does not auto-unroll forRange with trip count > 16", () => {
+      const spec: TileKernelSpec = {
+        name: "no_auto_unroll",
+        workgroupSize: 64,
+        bindings: { out: { storage: "read_write", type: "f32" } },
+        uniforms: {},
+        grid: () => [1],
+        kernel(ctx) {
+          const acc = ctx.emitVar("acc", "f32", ctx.f32(0));
+          ctx.forRange(ctx.u32(0), ctx.u32(17), (i) => {
+            acc.addAssign(i.toF32());
+          });
+          ctx.emitStore("out", ctx.u32(0), acc.get());
+        },
+      };
+      const wgsl = compileTileKernel(spec);
+      // Should have a regular for loop
+      expect(wgsl).toContain("for (var");
+      expect(wgsl).not.toContain("// unrolled");
+    });
+
+    it("explicit unroll flag bypasses threshold", () => {
+      const spec: TileKernelSpec = {
+        name: "explicit_unroll",
+        workgroupSize: 64,
+        bindings: { out: { storage: "read_write", type: "f32" } },
+        uniforms: {},
+        grid: () => [1],
+        kernel(ctx) {
+          const acc = ctx.emitVar("acc", "f32", ctx.f32(0));
+          ctx.forRange(ctx.u32(0), ctx.u32(32), (i) => {
+            acc.addAssign(i.toF32());
+          }, { unroll: true });
+          ctx.emitStore("out", ctx.u32(0), acc.get());
+        },
+      };
+      const wgsl = compileTileKernel(spec);
+      // Should be unrolled despite > 16 iterations
+      expect(wgsl).not.toContain("for (var");
+      expect(wgsl).toContain("const _lv0 = 31u;");
+    });
+
+    it("forRange with dynamic bounds emits regular loop", () => {
+      const spec: TileKernelSpec = {
+        name: "dynamic_loop",
+        workgroupSize: 64,
+        bindings: { out: { storage: "read_write", type: "f32" } },
+        uniforms: { N: "u32" },
+        grid: () => [1],
+        kernel(ctx) {
+          const acc = ctx.emitVar("acc", "f32", ctx.f32(0));
+          ctx.forRange(ctx.u32(0), ctx.uniform("N"), (i) => {
+            acc.addAssign(i.toF32());
+          }, { unroll: true }); // unroll ignored for dynamic bounds
+          ctx.emitStore("out", ctx.u32(0), acc.get());
+        },
+      };
+      const wgsl = compileTileKernel(spec);
+      expect(wgsl).toContain("for (var");
+    });
+
+    it("forUnrolled emits inline iterations", () => {
+      const spec: TileKernelSpec = {
+        name: "for_unrolled",
+        workgroupSize: 64,
+        bindings: { out: { storage: "read_write", type: "f32" } },
+        uniforms: {},
+        grid: () => [1],
+        kernel(ctx) {
+          // forUnrolled calls body 3 times with const indices
+          ctx.forUnrolled(3, (i) => {
+            ctx.emitStore("out", i, i.toF32());
+          });
+        },
+      };
+      const wgsl = compileTileKernel(spec);
+      // Should have 3 store statements (inline, not in a loop)
+      expect(wgsl).not.toContain("for (var");
+      // Each iteration stores at its index
+      expect(wgsl).toContain("out[0u]");
+      expect(wgsl).toContain("out[1u]");
+      expect(wgsl).toContain("out[2u]");
+    });
+
+    it("varArray zero-init is unrolled for size ≤ 16", () => {
+      const spec: TileKernelSpec = {
+        name: "var_array_unroll",
+        workgroupSize: 64,
+        bindings: { out: { storage: "read_write", type: "f32" } },
+        uniforms: {},
+        grid: () => [1],
+        kernel(ctx) {
+          const arr = ctx.emitVarArray("arr", "f32", 4);
+          ctx.emitStore("out", ctx.u32(0), arr.get(ctx.u32(0)));
+        },
+      };
+      const wgsl = compileTileKernel(spec);
+      // Should have individual assignments, not a for loop
+      expect(wgsl).toContain("arr[0u] = 0.0;");
+      expect(wgsl).toContain("arr[1u] = 0.0;");
+      expect(wgsl).toContain("arr[2u] = 0.0;");
+      expect(wgsl).toContain("arr[3u] = 0.0;");
+      // Should NOT have the for-loop zero init
+      expect(wgsl).not.toContain("for (var _zi");
+    });
+
+    it.skipIf(!isWebGPUEnabled)("GPU: unrolled loop produces correct results", async () => {
+      // Kernel: sum of 0..7 = 28, stored at out[0]
+      const spec: TileKernelSpec = {
+        name: "gpu_unroll_test",
+        workgroupSize: 64,
+        bindings: { out: { storage: "read_write", type: "f32" } },
+        uniforms: {},
+        grid: () => [1],
+        kernel(ctx) {
+          const tid = ctx.localIndex();
+          ctx.ifThen(tid.ge(ctx.u32(1)), () => { ctx.emitReturn(); });
+          const acc = ctx.emitVar("acc", "f32", ctx.f32(0));
+          ctx.forRange(ctx.u32(0), ctx.u32(8), (i) => {
+            acc.addAssign(i.toF32());
+          });
+          ctx.emitStore("out", ctx.u32(0), acc.get());
+        },
+      };
+
+      const outBuf = makeOutputBuffer(1);
+      const dispatcher = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      dispatcher.dispatch({ out: outBuf }, {});
+      flushSharedEncoder();
+      await syncWebGPU();
+
+      const result = await readF32Buffer(outBuf, 1);
+      expect(result[0]).toBeCloseTo(28, 5); // 0+1+2+3+4+5+6+7 = 28
+      outBuf.destroy();
     });
   });
 });
