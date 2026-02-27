@@ -510,6 +510,16 @@ function emitStatement(
       }
       break;
     }
+    case "forStride": {
+      const start = exprFor(stmt.start, bindings, null);
+      const bound = exprFor(stmt.bound, bindings, null);
+      lines.push(`${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + ${stmt.stride}u) {`);
+      for (const s of stmt.body) {
+        emitStatement(s, bindings, lines, depth + 1);
+      }
+      lines.push(`${indent}}`);
+      break;
+    }
     case "if": {
       if (isStaticTrue(stmt.condition)) {
         for (const s of stmt.body) emitStatement(s, bindings, lines, depth);
@@ -704,6 +714,11 @@ function collectAllStmtNames(stmt: Statement, names: Set<string>): void {
       collectExprNames(stmt.bound, names);
       for (const s of stmt.body) collectAllStmtNames(s, names);
       break;
+    case "forStride":
+      collectExprNames(stmt.start, names);
+      collectExprNames(stmt.bound, names);
+      for (const s of stmt.body) collectAllStmtNames(s, names);
+      break;
     case "if":
       collectExprNames(stmt.condition, names);
       for (const s of stmt.body) collectAllStmtNames(s, names);
@@ -866,6 +881,10 @@ function getSharedReadsFromStmt(stmt: Statement): Set<string> {
       getSharedReadsFromExpr(stmt.start, reads);
       getSharedReadsFromExpr(stmt.bound, reads);
       // Don't recurse into body — forRange is a separate scope
+      break;
+    case "forStride":
+      getSharedReadsFromExpr(stmt.start, reads);
+      getSharedReadsFromExpr(stmt.bound, reads);
       break;
     case "if":
       getSharedReadsFromExpr(stmt.condition, reads);
@@ -1095,6 +1114,10 @@ function collectModifiedNames(stmts: Statement[], names: Set<string>): void {
         names.add(stmt.varName);
         collectModifiedNames(stmt.body, names);
         break;
+      case "forStride":
+        names.add(stmt.varName);
+        collectModifiedNames(stmt.body, names);
+        break;
       case "if":
         collectModifiedNames(stmt.body, names);
         break;
@@ -1299,6 +1322,7 @@ function eliminateDeadCode(stmts: Statement[]): Statement[] {
   const processed = stmts.map(s => {
     switch (s.kind) {
       case "forRange": return { ...s, body: eliminateDeadCode(s.body) } as Statement;
+      case "forStride": return { ...s, body: eliminateDeadCode(s.body) } as Statement;
       case "if":       return { ...s, body: eliminateDeadCode(s.body) } as Statement;
       case "ifElse":   return { ...s, body: eliminateDeadCode(s.body), elseBody: eliminateDeadCode(s.elseBody) } as Statement;
       default: return s;
@@ -1415,6 +1439,9 @@ function hasTileStatements(stmts: Statement[]): boolean {
       case "forRange":
         if (hasTileStatements(s.body)) return true;
         break;
+      case "forStride":
+        if (hasTileStatements(s.body)) return true;
+        break;
       case "if":
         if (hasTileStatements(s.body)) return true;
         break;
@@ -1490,6 +1517,12 @@ function lowerTileStatements(stmts: Statement[], spec: TileKernelSpec): Statemen
         result.push(...lowerBlockBinary(s));
         break;
       case "forRange":
+        result.push({
+          ...s,
+          body: lowerTileStatements(s.body, spec),
+        });
+        break;
+      case "forStride":
         result.push({
           ...s,
           body: lowerTileStatements(s.body, spec),

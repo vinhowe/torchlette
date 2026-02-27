@@ -87,11 +87,11 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
       const isCausal = ctx.uniform("is_causal");
       const scale = ctx.uniform("scale_u32").bitcastTo("f32");
 
-      const qRow = qBlock.mul(ctx.u32(BR)).add(rowLane);
-      const valid = qRow.lt(N);
+      const qRow = ctx.emitLet("_qRow", qBlock.mul(ctx.u32(BR)).add(rowLane));
+      const valid = ctx.emitLet("_valid", qRow.lt(N));
 
-      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
-      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const bhOff = ctx.emitLet("_bhOff", bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim));
+      const bhOffL = ctx.emitLet("_bhOffL", bIdx.mul(numHeads).add(hIdx).mul(N));
 
       // Load Q row slice into vec4 registers
       const qReg = ctx.registerVec4Array("q_reg", D4_COUNT);
@@ -330,11 +330,11 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
       const isCausal = ctx.uniform("is_causal");
       const scale = ctx.uniform("scale_u32").bitcastTo("f32");
 
-      const qRow = qBlock.mul(ctx.u32(BR)).add(rowLane);
-      const valid = qRow.lt(N);
+      const qRow = ctx.emitLet("_qRow", qBlock.mul(ctx.u32(BR)).add(rowLane));
+      const valid = ctx.emitLet("_valid", qRow.lt(N));
 
-      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
-      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const bhOff = ctx.emitLet("_bhOff", bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim));
+      const bhOffL = ctx.emitLet("_bhOffL", bIdx.mul(numHeads).add(hIdx).mul(N));
 
       // Load Q row slice and dO row slice into vec4 registers
       const qReg = ctx.registerVec4Array("q_reg", D4_COUNT);
@@ -509,11 +509,11 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
       const isCausal = ctx.uniform("is_causal");
       const scale = ctx.uniform("scale_u32").bitcastTo("f32");
 
-      const kvRow = kvBlock.mul(ctx.u32(BC_BW)).add(rowLane);
-      const valid = kvRow.lt(N);
+      const kvRow = ctx.emitLet("_kvRow", kvBlock.mul(ctx.u32(BC_BW)).add(rowLane));
+      const valid = ctx.emitLet("_valid", kvRow.lt(N));
 
-      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
-      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const bhOff = ctx.emitLet("_bhOff", bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim));
+      const bhOffL = ctx.emitLet("_bhOffL", bIdx.mul(numHeads).add(hIdx).mul(N));
 
       // Load K and V row slices into vec4 registers
       const kReg = ctx.registerVec4Array("k_reg", D4_COUNT);
