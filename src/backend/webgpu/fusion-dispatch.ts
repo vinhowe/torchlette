@@ -13,6 +13,7 @@ export function setFusionRecordingBuffer(buf: RecordedDispatch[] | null): void {
   fusionRecordingBuffer = buf;
 }
 
+import { recordPipeline, getWarmupPipeline } from "./pipeline-warmup";
 import type { DType } from "../types";
 import { dtypeBytes } from "./shape-utils";
 import { sizeOf } from "../../core/shape";
@@ -72,11 +73,16 @@ export class FusionKernelCache {
       ? generateFusedKernelTileIR(recipe, options)
       : generateFusedKernel(recipe, options);
 
-    const module = device.createShaderModule({ code: kernel.source });
-    const pipeline = device.createComputePipeline({
-      layout: "auto",
-      compute: { module, entryPoint: "main" },
-    });
+    // Check warmup cache before synchronous compilation
+    let pipeline = getWarmupPipeline(meta.cacheKey);
+    if (!pipeline) {
+      recordPipeline(meta.cacheKey, kernel.source);
+      const module = device.createShaderModule({ code: kernel.source });
+      pipeline = device.createComputePipeline({
+        layout: "auto",
+        compute: { module, entryPoint: "main" },
+      });
+    }
 
     // Cache it
     if (this.cache.size >= this.maxSize) {

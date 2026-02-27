@@ -23,6 +23,7 @@ import {
 import type { BackendTensor, DType } from "../types";
 import type { GPUBuffer, GPUComputePipeline, GPUBindGroup, WebGPUContext, WebGPUTensor } from "./gpu-types";
 import { GPUBufferUsage, asGPUTensor } from "./gpu-types";
+import { recordPipeline, getWarmupPipeline } from "./pipeline-warmup";
 import { requireContext, isF16Supported } from "./gpu-context";
 import { bufferPool } from "./buffer-pool";
 import {
@@ -434,6 +435,13 @@ export function getPipeline(
   if (cached) {
     return cached;
   }
+  // Check warmup cache (pre-compiled via createComputePipelineAsync)
+  const warmed = getWarmupPipeline(key);
+  if (warmed) {
+    context.pipelines.set(key, warmed);
+    return warmed;
+  }
+  recordPipeline(key, code);
   const module = context.device.createShaderModule({ code });
   const pipeline = context.device.createComputePipeline({
     layout: "auto",

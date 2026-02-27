@@ -73,6 +73,10 @@ export type GPUDevice = {
     layout: "auto";
     compute: { module: unknown; entryPoint: string };
   }): GPUComputePipeline;
+  createComputePipelineAsync?(descriptor: {
+    layout: "auto";
+    compute: { module: unknown; entryPoint: string };
+  }): Promise<GPUComputePipeline>;
   createShaderModule(descriptor: { code: string }): unknown;
   queue: GPUQueue;
   limits: GPUDeviceLimits;
