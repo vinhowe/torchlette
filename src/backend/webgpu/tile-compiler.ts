@@ -96,7 +96,7 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
         case "ceil": return `ceil(${input})`;
         case "not": return `!(${input})`;
         default: {
-          const fn = ({ exp: "exp", log: "log", abs: "abs", sqrt: "sqrt", sin: "sin", cos: "cos", round: "round", sign: "sign" } as const)[node.op];
+          const fn = ({ exp: "exp", log: "log", abs: "abs", sqrt: "sqrt", sin: "sin", cos: "cos", round: "round", sign: "sign", exp2: "exp2", log2: "log2" } as const)[node.op];
           return `${fn}(${input})`;
         }
       }
@@ -137,6 +137,9 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
     }
     case "globalId": {
       return `gid.${(["x", "y", "z"] as const)[node.dim]}`;
+    }
+    case "numWorkgroups": {
+      return `num_wg.${(["x", "y", "z"] as const)[node.dim]}`;
     }
     case "subgroupShuffleXor": {
       const val = exprFor(node.value, bindings, loopVar);
@@ -269,6 +272,7 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
   const needsWid = ctx.nodes.some(n => n.kind === "programId");
   const needsLocalId = ctx.nodes.some(n => n.kind === "threadIdx");
   const needsLocalIdx = ctx.nodes.some(n => n.kind === "localIndex");
+  const needsNumWg = ctx.nodes.some(n => n.kind === "numWorkgroups");
   // Shared arrays and tile-level stmts require local_id/local_idx even if not explicitly referenced
   const hasTileOps = ctx.sharedArrays.length > 0 ||
     ctx.statements.some(s => s.kind === "tileLoad" || s.kind === "dot" || s.kind === "tileStore" || s.kind === "tileLoad1d" || s.kind === "accOp");
@@ -283,6 +287,7 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
   if (emitWid)     params.push(`  @builtin(workgroup_id) wid: vec3<u32>`);
   if (emitLocalId) params.push(`  @builtin(local_invocation_id) local_id: vec3<u32>`);
   if (emitLocalIdx) params.push(`  @builtin(local_invocation_index) local_idx: u32`);
+  if (needsNumWg) params.push(`  @builtin(num_workgroups) num_wg: vec3<u32>`);
   lines.push(params.join(",\n") + (params.length > 0 ? "," : ""));
   lines.push(`) {`);
 

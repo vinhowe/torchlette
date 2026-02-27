@@ -228,6 +228,10 @@ function evalSymbolic(node: IRNode, wgSizeX: number): SymbolicExpr {
       // Data-dependent — stride is unknown
       return UNKNOWN;
 
+    case "numWorkgroups":
+      // Grid dimensions — constant within a workgroup, unknown value
+      return { innerCoeff: 0, hasDataDep: false, constantTerm: null, divisibility: null };
+
     case "namedRef":
       // Named refs are typically loop variables — data-dependent
       return { innerCoeff: 0, hasDataDep: true, constantTerm: null, divisibility: null };
