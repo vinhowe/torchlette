@@ -24,6 +24,7 @@ import type {
 } from "./tile-ir";
 import { buildKernelIR, type KernelContext } from "./tile-ir";
 import { computeSafeVecWidth } from "./tile-access-analysis";
+import { getSubgroupSupport } from "./matmul/types";
 
 
 // ============================================================================
@@ -147,6 +148,18 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
       const mask = exprFor(node.mask, bindings, loopVar);
       return `subgroupShuffleXor(${val}, ${mask})`;
     }
+    case "subgroupAdd": {
+      return `subgroupAdd(${exprFor(node.value, bindings, loopVar)})`;
+    }
+    case "subgroupMax": {
+      return `subgroupMax(${exprFor(node.value, bindings, loopVar)})`;
+    }
+    case "subgroupBroadcastFirst": {
+      return `subgroupBroadcastFirst(${exprFor(node.value, bindings, loopVar)})`;
+    }
+    case "subgroupInclusiveAdd": {
+      return `subgroupInclusiveAdd(${exprFor(node.value, bindings, loopVar)})`;
+    }
     case "vec4dot": {
       const a = node.a.map(n => exprFor(n, bindings, loopVar));
       const b = node.b.map(n => exprFor(n, bindings, loopVar));
@@ -192,8 +205,20 @@ export function compileTileKernel(spec: TileKernelSpec): string {
     }
   }
 
+  // 0b. Auto-detect subgroup support
+  const sgSupport = getSubgroupSupport();
+  const sgSize = spec.enableSubgroups
+    ? (sgSupport?.subgroupSize ?? 32)
+    : (sgSupport?.supported ? (sgSupport.subgroupSize ?? 32) : 0);
+
   // 1. Build the IR DAG (includes constant folding + CSE in makeNode)
-  const ctx = buildKernelIR(spec);
+  // Pass sgSize so reduction primitives can choose subgroup-optimized paths
+  const ctx = buildKernelIR(spec, sgSize);
+
+  // Auto-enable subgroups if the kernel's reduction primitives used subgroup ops
+  if (sgSize > 0 && !spec.enableSubgroups && ctx._usesSubgroups) {
+    spec = { ...spec, enableSubgroups: true };
+  }
 
   // 2. Lower tile-level ops if present
   let stmts = ctx.statements;
@@ -545,6 +570,12 @@ function collectExprNames(node: IRNode, names: Set<string>): void {
       collectExprNames(node.value, names);
       collectExprNames(node.mask, names);
       break;
+    case "subgroupAdd":
+    case "subgroupMax":
+    case "subgroupBroadcastFirst":
+    case "subgroupInclusiveAdd":
+      collectExprNames(node.value, names);
+      break;
     case "vec4dot":
       for (const n of node.a) collectExprNames(n, names);
       for (const n of node.b) collectExprNames(n, names);
@@ -646,6 +677,16 @@ function getSharedReadsFromExpr(node: IRNode, names: Set<string>): void {
       return;
     case "arrayRead":
       getSharedReadsFromExpr(node.idx, names);
+      return;
+    case "subgroupShuffleXor":
+      getSharedReadsFromExpr(node.value, names);
+      getSharedReadsFromExpr(node.mask, names);
+      return;
+    case "subgroupAdd":
+    case "subgroupMax":
+    case "subgroupBroadcastFirst":
+    case "subgroupInclusiveAdd":
+      getSharedReadsFromExpr(node.value, names);
       return;
   }
 }
@@ -950,6 +991,13 @@ function exprDependsOn(node: IRNode, names: Set<string>): boolean {
       return names.has(node.arrayName);
     case "arrayRead":
       return names.has(node.arrayName) || exprDependsOn(node.idx, names);
+    case "subgroupShuffleXor":
+      return exprDependsOn(node.value, names) || exprDependsOn(node.mask, names);
+    case "subgroupAdd":
+    case "subgroupMax":
+    case "subgroupBroadcastFirst":
+    case "subgroupInclusiveAdd":
+      return exprDependsOn(node.value, names);
     default:
       return false;
   }
@@ -977,6 +1025,13 @@ function exprContainsLoad(node: IRNode): boolean {
       return false;
     case "arrayRead":
       return exprContainsLoad(node.idx);
+    case "subgroupShuffleXor":
+      return exprContainsLoad(node.value) || exprContainsLoad(node.mask);
+    case "subgroupAdd":
+    case "subgroupMax":
+    case "subgroupBroadcastFirst":
+    case "subgroupInclusiveAdd":
+      return exprContainsLoad(node.value);
     default:
       return false;
   }

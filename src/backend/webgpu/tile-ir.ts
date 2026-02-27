@@ -149,6 +149,26 @@ export interface SubgroupShuffleXorNode extends IRNodeBase {
   mask: IRNode;
 }
 
+export interface SubgroupAddNode extends IRNodeBase {
+  kind: "subgroupAdd";
+  value: IRNode;
+}
+
+export interface SubgroupMaxNode extends IRNodeBase {
+  kind: "subgroupMax";
+  value: IRNode;
+}
+
+export interface SubgroupBroadcastFirstNode extends IRNodeBase {
+  kind: "subgroupBroadcastFirst";
+  value: IRNode;
+}
+
+export interface SubgroupInclusiveAddNode extends IRNodeBase {
+  kind: "subgroupInclusiveAdd";
+  value: IRNode;
+}
+
 /** dot(vec4<f32>(a0,a1,a2,a3), vec4<f32>(b0,b1,b2,b3)) → f32 scalar */
 export interface Vec4DotNode extends IRNodeBase {
   kind: "vec4dot";
@@ -174,6 +194,10 @@ export type IRNode =
   | ArrayReadNode
   | GlobalIdNode
   | SubgroupShuffleXorNode
+  | SubgroupAddNode
+  | SubgroupMaxNode
+  | SubgroupBroadcastFirstNode
+  | SubgroupInclusiveAddNode
   | Vec4DotNode
   | NumWorkgroupsNode;
 
@@ -1083,6 +1107,34 @@ export class BlockExpr {
     }));
   }
 
+  subgroupAdd(): BlockExpr {
+    return new BlockExpr(makeNode<SubgroupAddNode>({
+      kind: "subgroupAdd", value: this.node,
+      valueType: this.node.valueType, dataType: this.node.dataType,
+    }));
+  }
+
+  subgroupMax(): BlockExpr {
+    return new BlockExpr(makeNode<SubgroupMaxNode>({
+      kind: "subgroupMax", value: this.node,
+      valueType: this.node.valueType, dataType: this.node.dataType,
+    }));
+  }
+
+  subgroupBroadcastFirst(): BlockExpr {
+    return new BlockExpr(makeNode<SubgroupBroadcastFirstNode>({
+      kind: "subgroupBroadcastFirst", value: this.node,
+      valueType: this.node.valueType, dataType: this.node.dataType,
+    }));
+  }
+
+  subgroupInclusiveAdd(): BlockExpr {
+    return new BlockExpr(makeNode<SubgroupInclusiveAddNode>({
+      kind: "subgroupInclusiveAdd", value: this.node,
+      valueType: this.node.valueType, dataType: this.node.dataType,
+    }));
+  }
+
   // -- Comparisons --
   eq(other: BlockExpr | number): BlockExpr {
     const rhs = resolveArg(other);
@@ -1275,6 +1327,8 @@ export class KernelContext {
   readonly sharedArrays: Array<{ name: string; size: number; elemType: DataType }> = [];
   /** Binding specs from the kernel spec (for dataType resolution in load). */
   private readonly bindingSpecs: Record<string, BindingSpec>;
+  /** Subgroup size (0 = no subgroup support). Set by compileTileKernel(). */
+  readonly subgroupSize: number;
 
   /** Statement stack for nested scopes (forRange, ifThen). */
   private stmtStack: Statement[][] = [];
@@ -1282,9 +1336,12 @@ export class KernelContext {
   private loopVarCounter = 0;
   /** Counter for unique wgReduce shared memory / accumulator names. */
   private reduceCounter = 0;
+  /** Whether this kernel's reduction primitives used subgroup operations. */
+  _usesSubgroups = false;
 
-  constructor(bindings?: Record<string, BindingSpec>) {
+  constructor(bindings?: Record<string, BindingSpec>, subgroupSize = 0) {
     this.bindingSpecs = bindings ?? {};
+    this.subgroupSize = subgroupSize;
   }
 
   private trackNode<T extends IRNode>(node: T): T {
@@ -1497,8 +1554,20 @@ export class KernelContext {
   // Composable reduction / loop primitives
   // ===========================================================================
 
+  /** Whether subgroup-optimized path should be used for the given workgroup size. */
+  private canUseSubgroups(wgSize: number): boolean {
+    const sg = this.subgroupSize;
+    const ok = sg > 0 && wgSize >= sg * 2 && wgSize % sg === 0;
+    if (ok) this._usesSubgroups = true;
+    return ok;
+  }
+
   /** Tree sum reduction: `smem[0] = sum(smem[0..wgSize-1])`. Emits log2(wgSize) if+barrier pairs. */
   treeReduceSum(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number): void {
+    if (this.canUseSubgroups(wgSize)) {
+      this._treeReduceSubgroup(smem, tid, wgSize, "sum");
+      return;
+    }
     for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
       this.ifThen(tid.lt(this.u32(stride)), () => {
         smem.write(tid, smem.read(tid).add(smem.read(tid.add(this.u32(stride)))));
@@ -1509,9 +1578,44 @@ export class KernelContext {
 
   /** Tree max reduction: `smem[0] = max(smem[0..wgSize-1])`. */
   treeReduceMax(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number): void {
+    if (this.canUseSubgroups(wgSize)) {
+      this._treeReduceSubgroup(smem, tid, wgSize, "max");
+      return;
+    }
     for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
       this.ifThen(tid.lt(this.u32(stride)), () => {
         smem.write(tid, smem.read(tid).max(smem.read(tid.add(this.u32(stride)))));
+      });
+      this.barrier();
+    }
+  }
+
+  /**
+   * Subgroup-optimized tree reduction.
+   * 1. Read from smem → subgroupAdd/Max → lane 0 of each subgroup writes back
+   * 2. Small tree reduction across numSubgroups values
+   */
+  private _treeReduceSubgroup(
+    smem: SharedArrayHandle, tid: BlockExpr, wgSize: number, op: "sum" | "max",
+  ): void {
+    const sg = this.subgroupSize;
+    const numSubgroups = wgSize / sg;
+    // Phase 1: subgroup reduction (0 barriers)
+    const val = this.emitLet("_sgr_val", smem.read(tid));
+    const sgReduced = this.emitLet("_sgr_red",
+      op === "sum" ? val.subgroupAdd() : val.subgroupMax());
+    // Write subgroup leaders to smem[subgroupId]
+    this.barrier(); // sync before smem rewrite
+    this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
+      smem.write(tid.div(this.u32(sg)), sgReduced);
+    });
+    this.barrier();
+    // Phase 2: small tree reduction on numSubgroups values
+    for (let stride = numSubgroups >> 1; stride >= 1; stride >>= 1) {
+      this.ifThen(tid.lt(this.u32(stride)), () => {
+        const a = smem.read(tid);
+        const b = smem.read(tid.add(this.u32(stride)));
+        smem.write(tid, op === "sum" ? a.add(b) : a.max(b));
       });
       this.barrier();
     }
@@ -1522,6 +1626,30 @@ export class KernelContext {
     smem1: SharedArrayHandle, smem2: SharedArrayHandle,
     tid: BlockExpr, wgSize: number,
   ): void {
+    if (this.canUseSubgroups(wgSize)) {
+      const sg = this.subgroupSize;
+      const numSubgroups = wgSize / sg;
+      // Phase 1: subgroup reduction
+      const v1 = this.emitLet("_sgrd1_v", smem1.read(tid));
+      const v2 = this.emitLet("_sgrd2_v", smem2.read(tid));
+      const r1 = this.emitLet("_sgrd1_r", v1.subgroupAdd());
+      const r2 = this.emitLet("_sgrd2_r", v2.subgroupAdd());
+      this.barrier();
+      this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
+        smem1.write(tid.div(this.u32(sg)), r1);
+        smem2.write(tid.div(this.u32(sg)), r2);
+      });
+      this.barrier();
+      // Phase 2: small tree reduction
+      for (let stride = numSubgroups >> 1; stride >= 1; stride >>= 1) {
+        this.ifThen(tid.lt(this.u32(stride)), () => {
+          smem1.write(tid, smem1.read(tid).add(smem1.read(tid.add(this.u32(stride)))));
+          smem2.write(tid, smem2.read(tid).add(smem2.read(tid.add(this.u32(stride)))));
+        });
+        this.barrier();
+      }
+      return;
+    }
     for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
       this.ifThen(tid.lt(this.u32(stride)), () => {
         smem1.write(tid, smem1.read(tid).add(smem1.read(tid.add(this.u32(stride)))));
@@ -1536,6 +1664,27 @@ export class KernelContext {
     smem: SharedArrayHandle, tid: BlockExpr, wgSize: number,
     combine: (a: BlockExpr, b: BlockExpr) => BlockExpr,
   ): void {
+    if (this.canUseSubgroups(wgSize)) {
+      // Use subgroupShuffleXor butterfly for custom combine
+      const sg = this.subgroupSize;
+      const numSubgroups = wgSize / sg;
+      let val = this.emitLet("_sgrg_val", smem.read(tid));
+      for (let mask = sg >> 1; mask >= 1; mask >>= 1) {
+        val = this.emitLet(`_sgrg_m${mask}`, combine(val, val.subgroupShuffleXor(mask)));
+      }
+      this.barrier();
+      this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
+        smem.write(tid.div(this.u32(sg)), val);
+      });
+      this.barrier();
+      for (let stride = numSubgroups >> 1; stride >= 1; stride >>= 1) {
+        this.ifThen(tid.lt(this.u32(stride)), () => {
+          smem.write(tid, combine(smem.read(tid), smem.read(tid.add(this.u32(stride)))));
+        });
+        this.barrier();
+      }
+      return;
+    }
     for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
       this.ifThen(tid.lt(this.u32(stride)), () => {
         smem.write(tid, combine(smem.read(tid), smem.read(tid.add(this.u32(stride)))));
@@ -1555,11 +1704,34 @@ export class KernelContext {
     combine: (a: BlockExpr, b: BlockExpr) => BlockExpr,
   ): BlockExpr {
     const id = this.reduceCounter++;
-    const smem = this.sharedArray(`_wgr${id}_s`, wgSize);
     const acc = this.emitVar(`_wgr${id}_a`, "f32", identity);
     this.stridedFor(tid, count, wgSize, (i) => {
       acc.set(combine(acc.get(), bodyFn(i)));
     });
+
+    if (this.canUseSubgroups(wgSize)) {
+      const sg = this.subgroupSize;
+      const numSubgroups = wgSize / sg;
+      // Butterfly subgroup reduction via shuffleXor
+      let val = this.emitLet(`_wgr${id}_sv`, acc.get());
+      for (let mask = sg >> 1; mask >= 1; mask >>= 1) {
+        val = this.emitLet(`_wgr${id}_m${mask}`, combine(val, val.subgroupShuffleXor(mask)));
+      }
+      const smem = this.sharedArray(`_wgr${id}_s`, numSubgroups);
+      this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
+        smem.write(tid.div(this.u32(sg)), val);
+      });
+      this.barrier();
+      for (let stride = numSubgroups >> 1; stride >= 1; stride >>= 1) {
+        this.ifThen(tid.lt(this.u32(stride)), () => {
+          smem.write(tid, combine(smem.read(tid), smem.read(tid.add(this.u32(stride)))));
+        });
+        this.barrier();
+      }
+      return smem.read(this.u32(0));
+    }
+
+    const smem = this.sharedArray(`_wgr${id}_s`, wgSize);
     smem.write(tid, acc.get());
     this.barrier();
     this.treeReduceGeneric(smem, tid, wgSize, combine);
@@ -1584,6 +1756,9 @@ export class KernelContext {
    * Workgroup-cooperative reduction. Allocates shared memory, accumulates via
    * stridedFor, writes to shared memory, barriers, and tree-reduces.
    * Returns the reduced scalar (`smem[0]` after reduction).
+   *
+   * With subgroups: accumulates in registers, reduces within subgroup via
+   * subgroupAdd/Max, then small tree reduction across subgroup leaders.
    */
   wgReduce(
     op: "sum" | "max",
@@ -1591,7 +1766,6 @@ export class KernelContext {
     bodyFn: (i: BlockExpr) => BlockExpr,
   ): BlockExpr {
     const id = this.reduceCounter++;
-    const smem = this.sharedArray(`_wgr${id}_s`, wgSize);
     const identity = op === "sum" ? 0.0 : -3.402823e+38;
     const acc = this.emitVar(`_wgr${id}_a`, "f32", this.f32(identity));
     this.stridedFor(tid, count, wgSize, (i) => {
@@ -1601,6 +1775,33 @@ export class KernelContext {
         acc.set(acc.get().max(bodyFn(i)));
       }
     });
+
+    if (this.canUseSubgroups(wgSize)) {
+      const sg = this.subgroupSize;
+      const numSubgroups = wgSize / sg;
+      // Phase 1: subgroup reduction from registers (0 barriers, no smem write)
+      const sgReduced = this.emitLet(`_wgr${id}_sgr`,
+        op === "sum" ? acc.get().subgroupAdd() : acc.get().subgroupMax());
+      // Phase 2: leaders write to small smem
+      const smem = this.sharedArray(`_wgr${id}_s`, numSubgroups);
+      this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
+        smem.write(tid.div(this.u32(sg)), sgReduced);
+      });
+      this.barrier();
+      // Phase 3: small tree reduction
+      for (let stride = numSubgroups >> 1; stride >= 1; stride >>= 1) {
+        this.ifThen(tid.lt(this.u32(stride)), () => {
+          const a = smem.read(tid);
+          const b = smem.read(tid.add(this.u32(stride)));
+          smem.write(tid, op === "sum" ? a.add(b) : a.max(b));
+        });
+        this.barrier();
+      }
+      return smem.read(this.u32(0));
+    }
+
+    // Fallback: full shared memory tree reduction
+    const smem = this.sharedArray(`_wgr${id}_s`, wgSize);
     smem.write(tid, acc.get());
     this.barrier();
     if (op === "sum") {
@@ -1615,14 +1816,15 @@ export class KernelContext {
    * Dual workgroup-cooperative sum reduction. Same as wgReduce but reduces
    * two values in parallel using a single stridedFor pass.
    * Returns `[smem1[0], smem2[0]]` after reduction.
+   *
+   * With subgroups: both accumulators are reduced via subgroupAdd, then
+   * leaders write to small smem arrays for final tree reduction.
    */
   dualWgReduce(
     tid: BlockExpr, count: BlockExpr, wgSize: number,
     bodyFn: (i: BlockExpr) => [BlockExpr, BlockExpr],
   ): [BlockExpr, BlockExpr] {
     const id = this.reduceCounter++;
-    const smem1 = this.sharedArray(`_wgr${id}_s1`, wgSize);
-    const smem2 = this.sharedArray(`_wgr${id}_s2`, wgSize);
     const acc1 = this.emitVar(`_wgr${id}_a1`, "f32", this.f32(0.0));
     const acc2 = this.emitVar(`_wgr${id}_a2`, "f32", this.f32(0.0));
     this.stridedFor(tid, count, wgSize, (i) => {
@@ -1630,6 +1832,32 @@ export class KernelContext {
       acc1.addAssign(v1);
       acc2.addAssign(v2);
     });
+
+    if (this.canUseSubgroups(wgSize)) {
+      const sg = this.subgroupSize;
+      const numSubgroups = wgSize / sg;
+      const sgr1 = this.emitLet(`_wgr${id}_sgr1`, acc1.get().subgroupAdd());
+      const sgr2 = this.emitLet(`_wgr${id}_sgr2`, acc2.get().subgroupAdd());
+      const smem1 = this.sharedArray(`_wgr${id}_s1`, numSubgroups);
+      const smem2 = this.sharedArray(`_wgr${id}_s2`, numSubgroups);
+      this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
+        smem1.write(tid.div(this.u32(sg)), sgr1);
+        smem2.write(tid.div(this.u32(sg)), sgr2);
+      });
+      this.barrier();
+      for (let stride = numSubgroups >> 1; stride >= 1; stride >>= 1) {
+        this.ifThen(tid.lt(this.u32(stride)), () => {
+          smem1.write(tid, smem1.read(tid).add(smem1.read(tid.add(this.u32(stride)))));
+          smem2.write(tid, smem2.read(tid).add(smem2.read(tid.add(this.u32(stride)))));
+        });
+        this.barrier();
+      }
+      return [smem1.read(this.u32(0)), smem2.read(this.u32(0))];
+    }
+
+    // Fallback
+    const smem1 = this.sharedArray(`_wgr${id}_s1`, wgSize);
+    const smem2 = this.sharedArray(`_wgr${id}_s2`, wgSize);
     smem1.write(tid, acc1.get());
     smem2.write(tid, acc2.get());
     this.barrier();
@@ -1727,8 +1955,45 @@ export class KernelContext {
 
   /** Hillis-Steele inclusive parallel prefix scan in shared memory.
    *  After the call, smem[tid] = op(smem[0], ..., smem[tid]).
-   *  Requires tid < wgSize. */
+   *  Requires tid < wgSize.
+   *
+   *  With subgroups (sum only): subgroupInclusiveAdd within each subgroup,
+   *  then cross-subgroup scan via sequential accumulation + broadcast. */
   inclusiveScan(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number, op: "sum" | "max"): void {
+    if (op === "sum" && this.canUseSubgroups(wgSize)) {
+      const sg = this.subgroupSize;
+      const numSubgroups = wgSize / sg;
+      // Phase 1: subgroup-local inclusive prefix sum
+      const val = this.emitLet("_sgs_val", smem.read(tid));
+      const sgPrefix = this.emitLet("_sgs_pfx", val.subgroupInclusiveAdd());
+      this.barrier();
+      smem.write(tid, sgPrefix);
+      this.barrier();
+      // Phase 2: cross-subgroup scan on subgroup totals (last element of each subgroup)
+      // Use a small shared memory array for subgroup totals
+      const sgTotals = this.sharedArray("_sgs_totals", numSubgroups);
+      // Lane (sgSize-1) of each subgroup has the subgroup total
+      this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(sg - 1)), () => {
+        sgTotals.write(tid.div(this.u32(sg)), sgPrefix);
+      });
+      this.barrier();
+      // Sequential scan on the small array (numSubgroups is small, e.g. 8)
+      // Only thread 0 does this
+      this.ifThen(tid.eq(this.u32(0)), () => {
+        for (let i = 1; i < numSubgroups; i++) {
+          sgTotals.write(this.u32(i), sgTotals.read(this.u32(i)).add(sgTotals.read(this.u32(i - 1))));
+        }
+      });
+      this.barrier();
+      // Phase 3: add cross-subgroup prefix to all elements
+      const sgId = this.emitLet("_sgs_sgid", tid.div(this.u32(sg)));
+      this.ifThen(sgId.gt(this.u32(0)), () => {
+        smem.write(tid, smem.read(tid).add(sgTotals.read(sgId.sub(this.u32(1)))));
+      });
+      this.barrier();
+      return;
+    }
+    // Fallback: Hillis-Steele
     for (let stride = 1; stride < wgSize; stride *= 2) {
       this.barrier();
       const prev = smem.read(tid.sub(this.u32(stride)));
@@ -1984,11 +2249,11 @@ export function resetNodeIdCounter(): void {
  * Execute a kernel spec's kernel function and return the captured context.
  * This builds the IR DAG without generating WGSL.
  */
-export function buildKernelIR(spec: TileKernelSpec): KernelContext {
+export function buildKernelIR(spec: TileKernelSpec, subgroupSize = 0): KernelContext {
   nextNodeId = 0;
   cseCache = new Map();
   try {
-    const ctx = new KernelContext(spec.bindings);
+    const ctx = new KernelContext(spec.bindings, subgroupSize);
     spec.kernel(ctx);
     return ctx;
   } finally {

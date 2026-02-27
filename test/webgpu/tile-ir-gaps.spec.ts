@@ -23,6 +23,7 @@ import {
 import { createTileKernelDispatcher } from "../../src/backend/webgpu/tile-dispatch";
 import { compileTileKernel } from "../../src/backend/webgpu/tile-compiler";
 import type { TileKernelSpec } from "../../src/backend/webgpu/tile-ir";
+import { setSubgroupSupport, clearSubgroupSupport, getSubgroupSupport } from "../../src/backend/webgpu/matmul/types";
 import type { GPUBuffer, GPUDevice, GPUQueue } from "../../src/backend/webgpu/gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "../../src/backend/webgpu/gpu-types";
 
@@ -1243,10 +1244,11 @@ describe("Triton Gap: Scan primitives (WGSL)", () => {
       },
     };
     const wgsl = compileTileKernel(spec);
-    // log2(64) = 6 strides → 6 barriers inside the scan + 1 final barrier = 7
-    // plus the initial barrier before scan = total varies
+    // Without subgroups: log2(64) = 6 strides → 6+1 = 7 barriers
+    // With subgroups: subgroupInclusiveAdd path uses ~5 barriers
+    // Either way, there should be multiple barriers
     const barrierCount = (wgsl.match(/workgroupBarrier/g) || []).length;
-    expect(barrierCount).toBeGreaterThanOrEqual(7);
+    expect(barrierCount).toBeGreaterThanOrEqual(4);
   });
 });
 
@@ -2572,5 +2574,424 @@ describe.runIf(isWebGPUEnabled)("Triton Gap Round 3: Philox RNG GPU tests", () =
     expect(diffCount).toBeGreaterThan(N / 2); // Most values should differ
 
     out1.destroy(); read1.destroy(); out2.destroy(); read2.destroy();
+  });
+});
+
+// ============================================================================
+// Automatic Subgroup Optimization Tests
+// ============================================================================
+
+describe("Tile-IR Subgroup Optimization", () => {
+  // Save and restore subgroup support state around these tests
+  let savedSupport: ReturnType<typeof getSubgroupSupport>;
+
+  beforeAll(() => {
+    savedSupport = getSubgroupSupport();
+  });
+  afterAll(() => {
+    if (savedSupport) setSubgroupSupport(savedSupport);
+    else clearSubgroupSupport();
+  });
+
+  describe("WGSL compilation with subgroups (mocked sgSize=32)", () => {
+    beforeAll(() => {
+      setSubgroupSupport({ supported: true, subgroupSize: 32 });
+    });
+
+    it("new IR nodes compile to correct WGSL builtins", () => {
+      const spec: TileKernelSpec = {
+        name: "sgNodes",
+        workgroupSize: 64,
+        bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+        uniforms: { N: "u32" },
+        enableSubgroups: true,
+        grid: (u) => [Math.ceil(u.N / 64)],
+        kernel: (ctx) => {
+          const gid = ctx.globalId(0);
+          const val = ctx.load("input", gid);
+          // Use each subgroup builtin
+          const a = ctx.emitLet("sg_add", val.subgroupAdd());
+          const b = ctx.emitLet("sg_max", val.subgroupMax());
+          const c = ctx.emitLet("sg_bcast", val.subgroupBroadcastFirst());
+          const d = ctx.emitLet("sg_pfx", val.subgroupInclusiveAdd());
+          ctx.emitStore("output", gid, a.add(b).add(c).add(d));
+        },
+      };
+      const wgsl = compileTileKernel(spec);
+      expect(wgsl).toContain("enable subgroups;");
+      expect(wgsl).toContain("subgroupAdd(");
+      expect(wgsl).toContain("subgroupMax(");
+      expect(wgsl).toContain("subgroupBroadcastFirst(");
+      expect(wgsl).toContain("subgroupInclusiveAdd(");
+    });
+
+    it("treeReduceSum emits subgroupAdd with fewer barriers", () => {
+      const spec: TileKernelSpec = {
+        name: "sgTreeReduce",
+        workgroupSize: 256,
+        bindings: { output: { storage: "read_write", type: "f32" } },
+        uniforms: {},
+        grid: () => [1],
+        kernel: (ctx) => {
+          const tid = ctx.localIndex();
+          const smem = ctx.sharedArray("s", 256);
+          smem.write(tid, tid.toF32());
+          ctx.barrier();
+          ctx.treeReduceSum(smem, tid, 256);
+          ctx.ifThen(tid.eq(ctx.u32(0)), () => {
+            ctx.emitStore("output", ctx.u32(0), smem.read(ctx.u32(0)));
+          });
+        },
+      };
+      const wgsl = compileTileKernel(spec);
+      expect(wgsl).toContain("enable subgroups;");
+      expect(wgsl).toContain("subgroupAdd(");
+      // With sgSize=32, numSubgroups=8: 2 (subgroup phase) + 3 (small tree) = 5 barriers
+      // Plus 1 initial barrier before treeReduce = 6 total
+      const barrierCount = (wgsl.match(/workgroupBarrier\(\)/g) || []).length;
+      // Without subgroups: 1 (initial) + 8 (tree) = 9
+      // With subgroups: 1 (initial) + 2 (subgroup rewrite) + 3 (small tree) = 6
+      expect(barrierCount).toBeLessThan(9);
+    });
+
+    it("wgReduce emits subgroupAdd and smaller shared memory", () => {
+      const spec: TileKernelSpec = {
+        name: "sgWgReduce",
+        workgroupSize: 256,
+        bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+        uniforms: { N: "u32" },
+        grid: () => [1],
+        kernel: (ctx) => {
+          const tid = ctx.localIndex();
+          const N = ctx.uniform("N");
+          const result = ctx.wgReduce("sum", tid, N, 256, (i) => ctx.load("input", i));
+          ctx.ifThen(tid.eq(ctx.u32(0)), () => {
+            ctx.emitStore("output", ctx.u32(0), result);
+          });
+        },
+      };
+      const wgsl = compileTileKernel(spec);
+      expect(wgsl).toContain("subgroupAdd(");
+      // Shared memory should be small (numSubgroups = 8), not 256
+      expect(wgsl).toContain("array<f32, 8>");
+      expect(wgsl).not.toContain("array<f32, 256>");
+    });
+
+    it("dualWgReduce emits subgroupAdd for both accumulators", () => {
+      const spec: TileKernelSpec = {
+        name: "sgDualWgReduce",
+        workgroupSize: 256,
+        bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+        uniforms: { N: "u32" },
+        grid: () => [1],
+        kernel: (ctx) => {
+          const tid = ctx.localIndex();
+          const N = ctx.uniform("N");
+          const [s1, s2] = ctx.dualWgReduce(tid, N, 256, (i) => {
+            const v = ctx.load("input", i);
+            return [v, v.mul(v)];
+          });
+          ctx.ifThen(tid.eq(ctx.u32(0)), () => {
+            ctx.emitStore("output", ctx.u32(0), s1.add(s2));
+          });
+        },
+      };
+      const wgsl = compileTileKernel(spec);
+      // Two subgroupAdd calls (one per accumulator)
+      const sgAddCount = (wgsl.match(/subgroupAdd\(/g) || []).length;
+      expect(sgAddCount).toBe(2);
+    });
+
+    it("inclusiveScan emits subgroupInclusiveAdd", () => {
+      const spec: TileKernelSpec = {
+        name: "sgScan",
+        workgroupSize: 256,
+        bindings: { output: { storage: "read_write", type: "f32" } },
+        uniforms: {},
+        grid: () => [1],
+        kernel: (ctx) => {
+          const tid = ctx.localIndex();
+          const smem = ctx.sharedArray("s", 256);
+          smem.write(tid, ctx.f32(1.0));
+          ctx.inclusiveScan(smem, tid, 256, "sum");
+          ctx.emitStore("output", tid, smem.read(tid));
+        },
+      };
+      const wgsl = compileTileKernel(spec);
+      expect(wgsl).toContain("subgroupInclusiveAdd(");
+    });
+
+    it("treeReduceGeneric uses subgroupShuffleXor butterfly", () => {
+      const spec: TileKernelSpec = {
+        name: "sgGeneric",
+        workgroupSize: 64,
+        bindings: { output: { storage: "read_write", type: "f32" } },
+        uniforms: {},
+        grid: () => [1],
+        kernel: (ctx) => {
+          const tid = ctx.localIndex();
+          const smem = ctx.sharedArray("s", 64);
+          smem.write(tid, tid.toF32());
+          ctx.barrier();
+          ctx.treeReduceGeneric(smem, tid, 64, (a, b) => a.mul(b));
+          ctx.ifThen(tid.eq(ctx.u32(0)), () => {
+            ctx.emitStore("output", ctx.u32(0), smem.read(ctx.u32(0)));
+          });
+        },
+      };
+      const wgsl = compileTileKernel(spec);
+      expect(wgsl).toContain("subgroupShuffleXor(");
+    });
+  });
+
+  describe("WGSL compilation without subgroups", () => {
+    beforeAll(() => {
+      clearSubgroupSupport();
+    });
+
+    it("wgReduce uses full shared memory without subgroups", () => {
+      const spec: TileKernelSpec = {
+        name: "noSgWgReduce",
+        workgroupSize: 256,
+        bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+        uniforms: { N: "u32" },
+        grid: () => [1],
+        kernel: (ctx) => {
+          const tid = ctx.localIndex();
+          const N = ctx.uniform("N");
+          const result = ctx.wgReduce("sum", tid, N, 256, (i) => ctx.load("input", i));
+          ctx.ifThen(tid.eq(ctx.u32(0)), () => {
+            ctx.emitStore("output", ctx.u32(0), result);
+          });
+        },
+      };
+      const wgsl = compileTileKernel(spec);
+      expect(wgsl).not.toContain("enable subgroups;");
+      expect(wgsl).not.toContain("subgroupAdd(");
+      expect(wgsl).toContain("array<f32, 256>");
+    });
+
+    it("treeReduceSum uses standard barriers without subgroups", () => {
+      const spec: TileKernelSpec = {
+        name: "noSgTreeReduce",
+        workgroupSize: 256,
+        bindings: { output: { storage: "read_write", type: "f32" } },
+        uniforms: {},
+        grid: () => [1],
+        kernel: (ctx) => {
+          const tid = ctx.localIndex();
+          const smem = ctx.sharedArray("s", 256);
+          smem.write(tid, tid.toF32());
+          ctx.barrier();
+          ctx.treeReduceSum(smem, tid, 256);
+          ctx.ifThen(tid.eq(ctx.u32(0)), () => {
+            ctx.emitStore("output", ctx.u32(0), smem.read(ctx.u32(0)));
+          });
+        },
+      };
+      const wgsl = compileTileKernel(spec);
+      expect(wgsl).not.toContain("subgroupAdd(");
+      // Standard path: 1 (initial) + 8 (tree) = 9 barriers
+      const barrierCount = (wgsl.match(/workgroupBarrier\(\)/g) || []).length;
+      expect(barrierCount).toBe(9);
+    });
+  });
+
+  describe.runIf(isWebGPUEnabled)("GPU correctness with subgroups", () => {
+    beforeAll(async () => {
+      // Restore actual subgroup support for GPU tests
+      if (savedSupport) setSubgroupSupport(savedSupport);
+      else clearSubgroupSupport();
+      const ok = await initWebGPU();
+      if (ok) {
+        const ctx = getWebGPUDevice();
+        device = ctx.device as any;
+        queue = ctx.queue as any;
+      }
+    });
+
+    it("wgReduce sum produces correct result", async () => {
+      const N = 1024;
+      const WG = 256;
+      const spec: TileKernelSpec = {
+        name: "sgGpuReduceSum",
+        workgroupSize: WG,
+        bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+        uniforms: { N: "u32" },
+        grid: () => [1],
+        kernel: (ctx) => {
+          const tid = ctx.localIndex();
+          const Nuni = ctx.uniform("N");
+          const result = ctx.wgReduce("sum", tid, Nuni, WG, (i) => ctx.load("input", i));
+          ctx.ifThen(tid.eq(ctx.u32(0)), () => {
+            ctx.emitStore("output", ctx.u32(0), result);
+          });
+        },
+      };
+
+      // Create input: [1, 2, 3, ..., N]
+      const inputData = new Float32Array(N);
+      for (let i = 0; i < N; i++) inputData[i] = i + 1;
+      const expectedSum = (N * (N + 1)) / 2; // 524800
+
+      const inputBuf = makeF32Buffer(inputData, GPUBufferUsage.STORAGE);
+      const outputBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+      const readBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+      const dispatcher = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      dispatcher.dispatch({ input: inputBuf, output: outputBuf }, { N });
+      flushSharedEncoder();
+      await syncWebGPU();
+
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(outputBuf, 0, readBuf, 0, 4);
+      queue.submit([enc.finish()]);
+      await readBuf.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(readBuf.getMappedRange().slice(0));
+      readBuf.unmap();
+
+      // Allow small floating point tolerance
+      expect(Math.abs(result[0] - expectedSum) / expectedSum).toBeLessThan(1e-4);
+
+      inputBuf.destroy(); outputBuf.destroy(); readBuf.destroy();
+    });
+
+    it("wgReduce max produces correct result", async () => {
+      const N = 512;
+      const WG = 256;
+      const spec: TileKernelSpec = {
+        name: "sgGpuReduceMax",
+        workgroupSize: WG,
+        bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+        uniforms: { N: "u32" },
+        grid: () => [1],
+        kernel: (ctx) => {
+          const tid = ctx.localIndex();
+          const Nuni = ctx.uniform("N");
+          const result = ctx.wgReduce("max", tid, Nuni, WG, (i) => ctx.load("input", i));
+          ctx.ifThen(tid.eq(ctx.u32(0)), () => {
+            ctx.emitStore("output", ctx.u32(0), result);
+          });
+        },
+      };
+
+      const inputData = new Float32Array(N);
+      for (let i = 0; i < N; i++) inputData[i] = Math.sin(i * 0.1) * 100;
+      const expectedMax = Math.max(...inputData);
+
+      const inputBuf = makeF32Buffer(inputData, GPUBufferUsage.STORAGE);
+      const outputBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+      const readBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+      const dispatcher = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      dispatcher.dispatch({ input: inputBuf, output: outputBuf }, { N });
+      flushSharedEncoder();
+      await syncWebGPU();
+
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(outputBuf, 0, readBuf, 0, 4);
+      queue.submit([enc.finish()]);
+      await readBuf.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(readBuf.getMappedRange().slice(0));
+      readBuf.unmap();
+
+      expect(Math.abs(result[0] - expectedMax)).toBeLessThan(0.01);
+
+      inputBuf.destroy(); outputBuf.destroy(); readBuf.destroy();
+    });
+
+    it("dualWgReduce produces correct results", async () => {
+      const N = 256;
+      const WG = 256;
+      const spec: TileKernelSpec = {
+        name: "sgGpuDualReduce",
+        workgroupSize: WG,
+        bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+        uniforms: { N: "u32" },
+        grid: () => [1],
+        kernel: (ctx) => {
+          const tid = ctx.localIndex();
+          const Nuni = ctx.uniform("N");
+          const [sumVal, sumSq] = ctx.dualWgReduce(tid, Nuni, WG, (i) => {
+            const v = ctx.load("input", i);
+            return [v, v.mul(v)];
+          });
+          ctx.ifThen(tid.eq(ctx.u32(0)), () => {
+            ctx.emitStore("output", ctx.u32(0), sumVal);
+            ctx.emitStore("output", ctx.u32(1), sumSq);
+          });
+        },
+      };
+
+      const inputData = new Float32Array(N);
+      for (let i = 0; i < N; i++) inputData[i] = i + 1;
+      let expectedSum = 0, expectedSumSq = 0;
+      for (let i = 0; i < N; i++) { expectedSum += inputData[i]; expectedSumSq += inputData[i] * inputData[i]; }
+
+      const inputBuf = makeF32Buffer(inputData, GPUBufferUsage.STORAGE);
+      const outputBuf = device.createBuffer({ size: 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+      const readBuf = device.createBuffer({ size: 8, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+      const dispatcher = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      dispatcher.dispatch({ input: inputBuf, output: outputBuf }, { N });
+      flushSharedEncoder();
+      await syncWebGPU();
+
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(outputBuf, 0, readBuf, 0, 8);
+      queue.submit([enc.finish()]);
+      await readBuf.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(readBuf.getMappedRange().slice(0));
+      readBuf.unmap();
+
+      expect(Math.abs(result[0] - expectedSum) / expectedSum).toBeLessThan(1e-4);
+      expect(Math.abs(result[1] - expectedSumSq) / expectedSumSq).toBeLessThan(1e-3);
+
+      inputBuf.destroy(); outputBuf.destroy(); readBuf.destroy();
+    });
+
+    it("inclusiveScan produces correct prefix sums", async () => {
+      const WG = 256;
+      const spec: TileKernelSpec = {
+        name: "sgGpuScan",
+        workgroupSize: WG,
+        bindings: { output: { storage: "read_write", type: "f32" } },
+        uniforms: {},
+        grid: () => [1],
+        kernel: (ctx) => {
+          const tid = ctx.localIndex();
+          const smem = ctx.sharedArray("s", WG);
+          smem.write(tid, ctx.f32(1.0));
+          ctx.inclusiveScan(smem, tid, WG, "sum");
+          ctx.emitStore("output", tid, smem.read(tid));
+        },
+      };
+
+      const outputBuf = device.createBuffer({ size: WG * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+      const readBuf = device.createBuffer({ size: WG * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+      const dispatcher = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      dispatcher.dispatch({ output: outputBuf }, {});
+      flushSharedEncoder();
+      await syncWebGPU();
+
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(outputBuf, 0, readBuf, 0, WG * 4);
+      queue.submit([enc.finish()]);
+      await readBuf.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(readBuf.getMappedRange().slice(0));
+      readBuf.unmap();
+
+      // Inclusive prefix sum of [1,1,...,1] should be [1,2,3,...,N]
+      for (let i = 0; i < WG; i++) {
+        expect(result[i]).toBeCloseTo(i + 1, 0);
+      }
+
+      outputBuf.destroy(); readBuf.destroy();
+    });
   });
 });
