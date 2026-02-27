@@ -2137,6 +2137,69 @@ describe("Triton Gap: wgReduceGeneric (WGSL)", () => {
   });
 });
 
+describe("Triton Gap: Philox RNG (WGSL)", () => {
+  it("philox2x32 generates Philox mixing rounds", () => {
+    const spec: TileKernelSpec = {
+      name: "philoxTest",
+      workgroupSize: 64,
+      bindings: { output: { storage: "read_write", type: "u32" } },
+      uniforms: { seed: "u32" },
+      grid: () => [1],
+      kernel: (ctx) => {
+        const gid = ctx.globalId(0);
+        const seed = ctx.uniform("seed");
+        const [r0] = ctx.philox2x32(seed, gid);
+        ctx.emitStore("output", gid, r0);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // Should contain Philox multiplier constant and XOR operations
+    expect(wgsl).toContain("3528905107u"); // PHILOX_M = 0xD256D193
+    expect(wgsl).toContain("^");            // XOR mixing
+    // Should have 10 rounds of mixing (10 mulhi calls)
+    expect(wgsl).toContain("_phi_r9");     // last round
+  });
+
+  it("randF32 produces f32 output with u32→f32 cast", () => {
+    const spec: TileKernelSpec = {
+      name: "randF32Test",
+      workgroupSize: 64,
+      bindings: { output: { storage: "read_write", type: "f32" } },
+      uniforms: { seed: "u32" },
+      grid: () => [1],
+      kernel: (ctx) => {
+        const gid = ctx.globalId(0);
+        const seed = ctx.uniform("seed");
+        const val = ctx.randF32(seed, gid);
+        ctx.emitStore("output", gid, val);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("f32(");  // cast to f32
+  });
+
+  it("randF32x2 produces two independent f32 values", () => {
+    const spec: TileKernelSpec = {
+      name: "randF32x2Test",
+      workgroupSize: 64,
+      bindings: { out0: { storage: "read_write", type: "f32" }, out1: { storage: "read_write", type: "f32" } },
+      uniforms: { seed: "u32" },
+      grid: () => [1],
+      kernel: (ctx) => {
+        const gid = ctx.globalId(0);
+        const seed = ctx.uniform("seed");
+        const [r0, r1] = ctx.randF32x2(seed, gid);
+        ctx.emitStore("out0", gid, r0);
+        ctx.emitStore("out1", gid, r1);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // Should write to both output bindings
+    expect(wgsl).toContain("out0[");
+    expect(wgsl).toContain("out1[");
+  });
+});
+
 // ============================================================================
 // GPU tests for Round 2 gaps
 // ============================================================================
@@ -2394,5 +2457,120 @@ describe.runIf(isWebGPUEnabled)("Triton Gap Round 2: GPU tests", () => {
     // Since input is decreasing, min-scan: output[i] = input[i] = N - i
     for (let i = 0; i < N; i++) expect(r[i]).toBeCloseTo(N - i, 5);
     readBuf.unmap(); inputBuf.destroy(); outBuf.destroy(); readBuf.destroy();
+  });
+});
+
+// ============================================================================
+// GPU tests for Round 3: Philox RNG
+// ============================================================================
+
+describe.runIf(isWebGPUEnabled)("Triton Gap Round 3: Philox RNG GPU tests", () => {
+  let device: any;
+  let queue: any;
+
+  beforeAll(async () => {
+    const ok = await initWebGPU();
+    if (!ok) throw new Error("WebGPU init failed");
+    const ctx = getWebGPUDevice();
+    if (!ctx) throw new Error("No WebGPU device");
+    device = ctx.device;
+    queue = ctx.queue;
+  });
+
+  it("randF32 produces values in [0, 1) with reasonable distribution", async () => {
+    const N = 1024;
+    const spec: TileKernelSpec = {
+      name: "randF32GPU",
+      workgroupSize: 64,
+      bindings: { output: { storage: "read_write", type: "f32" } },
+      uniforms: { seed: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel: (ctx) => {
+        const gid = ctx.globalId(0);
+        const seed = ctx.uniform("seed");
+        const val = ctx.randF32(seed, gid);
+        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, val);
+      },
+    };
+    // Need to declare N uniform too
+    spec.uniforms.N = "u32";
+
+    const outBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder(); kernel.dispatch({ output: outBuf }, { seed: 42, N }); flushSharedEncoder(); await syncWebGPU();
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, N * 4);
+    queue.submit([enc.finish()]);
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const r = new Float32Array(readBuf.getMappedRange());
+
+    // Check all values are in [0, 1)
+    let minVal = Infinity, maxVal = -Infinity, sum = 0;
+    for (let i = 0; i < N; i++) {
+      expect(r[i]).toBeGreaterThanOrEqual(0);
+      expect(r[i]).toBeLessThan(1);
+      minVal = Math.min(minVal, r[i]);
+      maxVal = Math.max(maxVal, r[i]);
+      sum += r[i];
+    }
+    // Mean should be roughly 0.5 (within reasonable tolerance for N=1024)
+    const mean = sum / N;
+    expect(mean).toBeGreaterThan(0.3);
+    expect(mean).toBeLessThan(0.7);
+    // Values should span a good range (not all clustered)
+    expect(minVal).toBeLessThan(0.1);
+    expect(maxVal).toBeGreaterThan(0.9);
+
+    readBuf.unmap(); outBuf.destroy(); readBuf.destroy();
+  });
+
+  it("different seeds produce different sequences", async () => {
+    const N = 64;
+    const spec: TileKernelSpec = {
+      name: "randSeedDiff",
+      workgroupSize: 64,
+      bindings: { output: { storage: "read_write", type: "f32" } },
+      uniforms: { seed: "u32" },
+      grid: () => [1],
+      kernel: (ctx) => {
+        const gid = ctx.globalId(0);
+        const seed = ctx.uniform("seed");
+        ctx.emitStore("output", gid, ctx.randF32(seed, gid));
+      },
+    };
+
+    // Generate with seed 1
+    const out1 = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const read1 = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const k1 = createTileKernelDispatcher(spec);
+    beginSharedEncoder(); k1.dispatch({ output: out1 }, { seed: 1 }); flushSharedEncoder(); await syncWebGPU();
+    let enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(out1, 0, read1, 0, N * 4);
+    queue.submit([enc.finish()]);
+    await read1.mapAsync(GPUMapMode.READ);
+    const r1 = new Float32Array(read1.getMappedRange().slice(0));
+    read1.unmap();
+
+    // Generate with seed 2
+    const out2 = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const read2 = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const k2 = createTileKernelDispatcher(spec);
+    beginSharedEncoder(); k2.dispatch({ output: out2 }, { seed: 2 }); flushSharedEncoder(); await syncWebGPU();
+    enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(out2, 0, read2, 0, N * 4);
+    queue.submit([enc.finish()]);
+    await read2.mapAsync(GPUMapMode.READ);
+    const r2 = new Float32Array(read2.getMappedRange().slice(0));
+    read2.unmap();
+
+    // At least some values should differ
+    let diffCount = 0;
+    for (let i = 0; i < N; i++) {
+      if (Math.abs(r1[i] - r2[i]) > 1e-7) diffCount++;
+    }
+    expect(diffCount).toBeGreaterThan(N / 2); // Most values should differ
+
+    out1.destroy(); read1.destroy(); out2.destroy(); read2.destroy();
   });
 });

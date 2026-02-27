@@ -723,6 +723,19 @@ function resolveArg(arg: BlockExpr | number): IRNode {
   return arg.node;
 }
 
+/** Like resolveArg but creates u32 constants (for bitwise ops). */
+function resolveArgU32(arg: BlockExpr | number): IRNode {
+  if (typeof arg === "number") {
+    return makeNode<ConstNode>({
+      kind: "const",
+      valueType: "scalar",
+      dataType: "u32",
+      value: arg,
+    });
+  }
+  return arg.node;
+}
+
 /** Determine the resulting valueType: block if either operand is block. */
 function promoteValueType(a: ValueType, b: ValueType): ValueType {
   return a === "block" || b === "block" ? "block" : "scalar";
@@ -787,7 +800,7 @@ export class BlockExpr {
   }
 
   and(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
+    const rhs = resolveArgU32(other);
     return new BlockExpr(makeNode<BinaryNode>({
       kind: "binary", op: "and",
       lhs: this.node, rhs,
@@ -817,7 +830,7 @@ export class BlockExpr {
   }
 
   or(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
+    const rhs = resolveArgU32(other);
     return new BlockExpr(makeNode<BinaryNode>({
       kind: "binary", op: "or",
       lhs: this.node, rhs,
@@ -827,7 +840,7 @@ export class BlockExpr {
   }
 
   xor(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
+    const rhs = resolveArgU32(other);
     return new BlockExpr(makeNode<BinaryNode>({
       kind: "binary", op: "xor",
       lhs: this.node, rhs,
@@ -837,7 +850,7 @@ export class BlockExpr {
   }
 
   shr(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
+    const rhs = resolveArgU32(other);
     return new BlockExpr(makeNode<BinaryNode>({
       kind: "binary", op: "shr",
       lhs: this.node, rhs,
@@ -847,7 +860,7 @@ export class BlockExpr {
   }
 
   shl(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
+    const rhs = resolveArgU32(other);
     return new BlockExpr(makeNode<BinaryNode>({
       kind: "binary", op: "shl",
       lhs: this.node, rhs,
@@ -1769,6 +1782,79 @@ export class KernelContext {
       });
     }
     this.barrier();
+  }
+
+  // -- In-kernel RNG (Philox 2x32-10) --
+
+  /**
+   * Compute mulhi(a, b) — high 32 bits of a*b — via 16-bit decomposition.
+   * Returns a BlockExpr for the result. Uses emitLet to keep WGSL readable.
+   */
+  private mulhi(prefix: string, a: BlockExpr, b: BlockExpr): BlockExpr {
+    const aL = this.emitLet(`${prefix}_aL`, a.and(0xFFFF));
+    const aH = this.emitLet(`${prefix}_aH`, a.shr(16));
+    const bL = this.emitLet(`${prefix}_bL`, b.and(0xFFFF));
+    const bH = this.emitLet(`${prefix}_bH`, b.shr(16));
+    const ll = this.emitLet(`${prefix}_ll`, aL.mul(bL));
+    const lh = this.emitLet(`${prefix}_lh`, aL.mul(bH));
+    const hl = this.emitLet(`${prefix}_hl`, aH.mul(bL));
+    const hh = this.emitLet(`${prefix}_hh`, aH.mul(bH));
+    const mid = this.emitLet(`${prefix}_mid`, lh.add(hl));
+    const carry = mid.lt(lh).select(this.u32(1), this.u32(0));
+    const t = this.emitLet(`${prefix}_t`, ll.shr(16).add(mid.and(0xFFFF)));
+    return hh.add(mid.shr(16)).add(carry).add(t.shr(16));
+  }
+
+  /**
+   * Philox 2x32-10 counter-based PRNG. Returns two pseudorandom u32 values.
+   *
+   * Usage: `const [r0, r1] = ctx.philox2x32(seed, offset);`
+   * - seed: a u32 key (e.g., from a uniform)
+   * - offset: a u32 counter (e.g., globalId(0))
+   *
+   * The two outputs are independent random streams.
+   */
+  philox2x32(seed: BlockExpr, offset: BlockExpr): [BlockExpr, BlockExpr] {
+    const PHILOX_M = 0xD256D193;  // Philox 2x32 multiplier
+    const PHILOX_W = 0x9E3779B9;  // Key schedule constant (golden ratio)
+
+    // Initial state
+    let ctr0 = this.emitLet("_phi_c0", offset);
+    let ctr1 = this.emitLet("_phi_c1", seed);
+    let key = this.emitLet("_phi_k", seed);
+
+    // 10 rounds of Philox mixing
+    for (let r = 0; r < 10; r++) {
+      const hi = this.mulhi(`_phi_r${r}`, this.u32(PHILOX_M), ctr0);
+      const lo = this.emitLet(`_phi_lo${r}`, this.u32(PHILOX_M).mul(ctr0));
+      ctr0 = this.emitLet(`_phi_c0_${r}`, hi.xor(key).xor(ctr1));
+      ctr1 = this.emitLet(`_phi_c1_${r}`, lo);
+      if (r < 9) {
+        key = this.emitLet(`_phi_k${r}`, key.add(this.u32(PHILOX_W)));
+      }
+    }
+
+    return [ctr0, ctr1];
+  }
+
+  /**
+   * Generate a uniform random f32 in [0, 1) from Philox 2x32-10.
+   * Convenience wrapper: `const val = ctx.randF32(seed, offset);`
+   */
+  randF32(seed: BlockExpr, offset: BlockExpr): BlockExpr {
+    const [r0] = this.philox2x32(seed, offset);
+    // Convert u32 to f32 in [0, 1): multiply by 2^-32
+    return r0.toF32().mul(this.f32(2.3283064365386963e-10)); // 1.0 / 2^32
+  }
+
+  /**
+   * Generate two uniform random f32s in [0, 1) from a single Philox call.
+   * `const [r0, r1] = ctx.randF32x2(seed, offset);`
+   */
+  randF32x2(seed: BlockExpr, offset: BlockExpr): [BlockExpr, BlockExpr] {
+    const [r0, r1] = this.philox2x32(seed, offset);
+    const scale = this.f32(2.3283064365386963e-10);
+    return [r0.toF32().mul(scale), r1.toF32().mul(scale)];
   }
 
   // -- Argmax / Argmin reductions --
