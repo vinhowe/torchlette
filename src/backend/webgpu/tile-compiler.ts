@@ -23,6 +23,7 @@ import type {
   BlockReduceStmt, BlockUnaryStmt, BlockBinaryStmt,
 } from "./tile-ir";
 import { buildKernelIR, type KernelContext } from "./tile-ir";
+import { computeSafeVecWidth } from "./tile-access-analysis";
 
 
 // ============================================================================
@@ -178,6 +179,14 @@ function freshVar(hint: string): string {
  */
 export function compileTileKernel(spec: TileKernelSpec): string {
   _varCounter = 0;
+
+  // 0. Auto vec-width selection: if vectorize is "auto", use access analysis
+  if ((spec as any).vectorize === "auto" || (spec.vectorize === undefined && (spec as any).autoVectorize)) {
+    const safeWidth = computeSafeVecWidth(spec);
+    if (safeWidth > 1) {
+      spec = { ...spec, vectorize: safeWidth };
+    }
+  }
 
   // 1. Build the IR DAG (includes constant folding + CSE in makeNode)
   const ctx = buildKernelIR(spec);
