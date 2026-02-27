@@ -494,8 +494,9 @@ function emitStatement(
           const iterVal = startConst + i;
           lines.push(`${indent}{ // unrolled ${stmt.varName}=${iterVal}`);
           lines.push(`${indent}  const ${stmt.varName} = ${iterVal}u;`);
+          const childBindings = new Map(bindings);
           for (const s of stmt.body) {
-            emitStatement(s, bindings, lines, depth + 1);
+            emitStatement(s, childBindings, lines, depth + 1);
           }
           lines.push(`${indent}}`);
         }
@@ -503,8 +504,9 @@ function emitStatement(
         const start = exprFor(stmt.start, bindings, null);
         const bound = exprFor(stmt.bound, bindings, null);
         lines.push(`${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + 1u) {`);
+        const childBindings = new Map(bindings);
         for (const s of stmt.body) {
-          emitStatement(s, bindings, lines, depth + 1);
+          emitStatement(s, childBindings, lines, depth + 1);
         }
         lines.push(`${indent}}`);
       }
@@ -514,20 +516,23 @@ function emitStatement(
       const start = exprFor(stmt.start, bindings, null);
       const bound = exprFor(stmt.bound, bindings, null);
       lines.push(`${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + ${stmt.stride}u) {`);
+      const childBindings = new Map(bindings);
       for (const s of stmt.body) {
-        emitStatement(s, bindings, lines, depth + 1);
+        emitStatement(s, childBindings, lines, depth + 1);
       }
       lines.push(`${indent}}`);
       break;
     }
     case "if": {
       if (isStaticTrue(stmt.condition)) {
+        // Static-true: body emitted at parent scope — bindings propagate up
         for (const s of stmt.body) emitStatement(s, bindings, lines, depth);
       } else if (!isStaticFalse(stmt.condition)) {
         const cond = exprFor(stmt.condition, bindings, null);
         lines.push(`${indent}if (${cond}) {`);
+        const childBindings = new Map(bindings);
         for (const s of stmt.body) {
-          emitStatement(s, bindings, lines, depth + 1);
+          emitStatement(s, childBindings, lines, depth + 1);
         }
         lines.push(`${indent}}`);
       }
@@ -541,12 +546,14 @@ function emitStatement(
       } else {
         const cond = exprFor(stmt.condition, bindings, null);
         lines.push(`${indent}if (${cond}) {`);
+        const childBindings1 = new Map(bindings);
         for (const s of stmt.body) {
-          emitStatement(s, bindings, lines, depth + 1);
+          emitStatement(s, childBindings1, lines, depth + 1);
         }
         lines.push(`${indent}} else {`);
+        const childBindings2 = new Map(bindings);
         for (const s of stmt.elseBody) {
-          emitStatement(s, bindings, lines, depth + 1);
+          emitStatement(s, childBindings2, lines, depth + 1);
         }
         lines.push(`${indent}}`);
       }
