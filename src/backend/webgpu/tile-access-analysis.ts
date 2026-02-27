@@ -81,13 +81,29 @@ const UNKNOWN: SymbolicExpr = { innerCoeff: "unknown", hasDataDep: true, constan
 const ZERO: SymbolicExpr = { innerCoeff: 0, hasDataDep: false, constantTerm: 0, divisibility: 0 };
 
 /**
+ * Analysis context tracks let/var definitions and loop variable ranges
+ * so that namedRef nodes can be resolved symbolically.
+ */
+interface AnalysisContext {
+  /** Map from variable name → defining IR node (from let/var statements). */
+  letDefs: Map<string, IRNode>;
+  /** Set of loop variable names with compile-time constant bounds.
+   *  These are "bounded" but not data-dependent w.r.t. thread index. */
+  boundedLoopVars: Set<string>;
+}
+
+function createAnalysisContext(): AnalysisContext {
+  return { letDefs: new Map(), boundedLoopVars: new Set() };
+}
+
+/**
  * Evaluate the symbolic stride of an IR expression with respect to the
  * innermost thread dimension.
  *
  * Returns the coefficient of threadIdx(0) / globalId(0) in the expression,
  * plus divisibility and constant term for alignment reasoning.
  */
-function evalSymbolic(node: IRNode, wgSizeX: number): SymbolicExpr {
+function evalSymbolic(node: IRNode, wgSizeX: number, actx?: AnalysisContext): SymbolicExpr {
   switch (node.kind) {
     case "globalId":
       // globalId(0) = programId(0) * wgSizeX + threadIdx(0)
@@ -108,10 +124,7 @@ function evalSymbolic(node: IRNode, wgSizeX: number): SymbolicExpr {
 
     case "programId":
       // Workgroup ID — constant within a workgroup, stride 0 w.r.t. threads
-      // Divisibility depends on context (wgSizeX for dim 0)
-      return node.dim === 0
-        ? { innerCoeff: 0, hasDataDep: false, constantTerm: null, divisibility: null }
-        : { innerCoeff: 0, hasDataDep: false, constantTerm: null, divisibility: null };
+      return { innerCoeff: 0, hasDataDep: false, constantTerm: null, divisibility: null };
 
     case "uniform":
       // Uniform: constant within workgroup, unknown value
@@ -123,8 +136,8 @@ function evalSymbolic(node: IRNode, wgSizeX: number): SymbolicExpr {
     }
 
     case "binary": {
-      const lhs = evalSymbolic(node.lhs, wgSizeX);
-      const rhs = evalSymbolic(node.rhs, wgSizeX);
+      const lhs = evalSymbolic(node.lhs, wgSizeX, actx);
+      const rhs = evalSymbolic(node.rhs, wgSizeX, actx);
 
       switch (node.op) {
         case "add":
@@ -181,8 +194,69 @@ function evalSymbolic(node: IRNode, wgSizeX: number): SymbolicExpr {
           return UNKNOWN;
         }
 
-        case "div":
-        case "mod":
+        case "div": {
+          // Integer division by a constant: (base + coeff*tid) / N
+          // When coeff is divisible by N: result coeff = coeff / N
+          // When coeff == 0: result is (base / N), still thread-invariant
+          const divisor = extractConstant(node.rhs);
+          if (divisor !== null && divisor !== 0) {
+            if (lhs.innerCoeff !== "unknown") {
+              if (lhs.innerCoeff === 0) {
+                // Thread-invariant / constant = thread-invariant
+                const ct = (lhs.constantTerm !== null) ? Math.floor(lhs.constantTerm / divisor) : null;
+                const div = (lhs.divisibility !== null && lhs.divisibility >= divisor)
+                  ? Math.floor(lhs.divisibility / divisor) : null;
+                return { innerCoeff: 0, hasDataDep: lhs.hasDataDep, constantTerm: ct, divisibility: div };
+              }
+              if (lhs.innerCoeff % divisor === 0) {
+                // (base + stride*tid) / N where stride % N == 0 → coeff = stride/N
+                const newCoeff = lhs.innerCoeff / divisor;
+                const ct = (lhs.constantTerm !== null) ? Math.floor(lhs.constantTerm / divisor) : null;
+                return { innerCoeff: newCoeff, hasDataDep: lhs.hasDataDep, constantTerm: ct, divisibility: null };
+              }
+            }
+          }
+          // Both sides constant → thread-invariant
+          if (lhs.innerCoeff === 0 && rhs.innerCoeff === 0 && !lhs.hasDataDep && !rhs.hasDataDep) {
+            return ZERO;
+          }
+          return UNKNOWN;
+        }
+
+        case "mod": {
+          // Modular arithmetic: (base + coeff*tid) % N
+          // When coeff is divisible by N: result is (base % N), thread-invariant
+          // When coeff == 0: result is (base % N), still thread-invariant
+          const modulus = extractConstant(node.rhs);
+          if (modulus !== null && modulus !== 0) {
+            if (lhs.innerCoeff !== "unknown") {
+              if (lhs.innerCoeff === 0) {
+                // Thread-invariant % constant = thread-invariant
+                const ct = (lhs.constantTerm !== null) ? lhs.constantTerm % modulus : null;
+                return { innerCoeff: 0, hasDataDep: lhs.hasDataDep, constantTerm: ct, divisibility: ct !== null ? (ct === 0 ? 0 : Math.abs(ct)) : null };
+              }
+              if (lhs.innerCoeff % modulus === 0) {
+                // (base + N*k*tid) % N = base % N → thread-invariant
+                const ct = (lhs.constantTerm !== null) ? lhs.constantTerm % modulus : null;
+                return { innerCoeff: 0, hasDataDep: lhs.hasDataDep, constantTerm: ct, divisibility: ct !== null ? (ct === 0 ? 0 : Math.abs(ct)) : null };
+              }
+              // General case: innerCoeff not divisible by modulus → stride preserved within [0, N)
+              // The coefficient wraps, so we can't simply say "stride = innerCoeff" — but if
+              // innerCoeff < modulus, the modular arithmetic preserves the local stride pattern
+              // for small thread indices. Mark as having the same coefficient for coalescing
+              // analysis (conservative: still works for vectorization decisions).
+              if (Math.abs(lhs.innerCoeff) < modulus) {
+                return { innerCoeff: lhs.innerCoeff, hasDataDep: lhs.hasDataDep, constantTerm: null, divisibility: null };
+              }
+            }
+          }
+          // Both sides constant → thread-invariant
+          if (lhs.innerCoeff === 0 && rhs.innerCoeff === 0 && !lhs.hasDataDep && !rhs.hasDataDep) {
+            return ZERO;
+          }
+          return UNKNOWN;
+        }
+
         case "shr":
         case "shl":
         case "and":
@@ -201,12 +275,12 @@ function evalSymbolic(node: IRNode, wgSizeX: number): SymbolicExpr {
 
     case "cast":
       // Casts preserve stride (e.g. u32→i32)
-      return evalSymbolic(node.input, wgSizeX);
+      return evalSymbolic(node.input, wgSizeX, actx);
 
     case "unary":
       // Unary ops (neg, abs, etc.) don't preserve linear stride
       if (node.op === "neg") {
-        const inner = evalSymbolic(node.input, wgSizeX);
+        const inner = evalSymbolic(node.input, wgSizeX, actx);
         if (inner.innerCoeff === "unknown") return UNKNOWN;
         return {
           innerCoeff: -inner.innerCoeff,
@@ -233,9 +307,20 @@ function evalSymbolic(node: IRNode, wgSizeX: number): SymbolicExpr {
       // Grid dimensions — constant within a workgroup, unknown value
       return { innerCoeff: 0, hasDataDep: false, constantTerm: null, divisibility: null };
 
-    case "namedRef":
-      // Named refs are typically loop variables — data-dependent
+    case "namedRef": {
+      // Try to resolve through let definitions
+      if (actx) {
+        const def = actx.letDefs.get(node.name);
+        if (def) return evalSymbolic(def, wgSizeX, actx);
+        // Loop variables with constant bounds: thread-invariant within a workgroup
+        // (they iterate the same range for all threads), but value varies per iteration
+        if (actx.boundedLoopVars.has(node.name)) {
+          return { innerCoeff: 0, hasDataDep: true, constantTerm: null, divisibility: null };
+        }
+      }
+      // Unresolved named ref — data-dependent
       return { innerCoeff: 0, hasDataDep: true, constantTerm: null, divisibility: null };
+    }
 
     default:
       return UNKNOWN;
@@ -278,15 +363,16 @@ export function analyzeAccessPatterns(spec: TileKernelSpec): AccessPattern[] {
     ? spec.workgroupSize
     : spec.workgroupSize[0];
 
+  const actx = createAnalysisContext();
   const patterns: AccessPattern[] = [];
 
-  // Walk statements for stores
-  walkStatements(ctx.statements, wgSizeX, patterns);
+  // Walk statements for stores (also populates actx with let/var/loop definitions)
+  walkStatements(ctx.statements, wgSizeX, patterns, actx);
 
   // Walk all nodes for inline loads (LoadNode in expressions)
   for (const node of ctx.nodes) {
     if (node.kind === "load") {
-      const sym = evalSymbolic(node.offsets, wgSizeX);
+      const sym = evalSymbolic(node.offsets, wgSizeX, actx);
       patterns.push(makePattern(node.binding, "load", sym, node.id));
     }
   }
@@ -294,28 +380,53 @@ export function analyzeAccessPatterns(spec: TileKernelSpec): AccessPattern[] {
   return patterns;
 }
 
-function walkStatements(stmts: Statement[], wgSizeX: number, patterns: AccessPattern[]): void {
+function walkStatements(stmts: Statement[], wgSizeX: number, patterns: AccessPattern[], actx: AnalysisContext): void {
   for (const stmt of stmts) {
     switch (stmt.kind) {
+      case "let":
+        // Track let definitions so namedRef can resolve them
+        actx.letDefs.set(stmt.name, stmt.value);
+        break;
+      case "var":
+        // Track initial var definitions (conservative: may be reassigned)
+        actx.letDefs.set(stmt.name, stmt.value);
+        break;
+      case "assign":
+      case "addAssign":
+        // Variable reassignment invalidates let tracking — remove definition
+        // so subsequent namedRef lookups won't use the stale initial value
+        actx.letDefs.delete(stmt.name);
+        break;
       case "directStore": {
-        const sym = evalSymbolic(stmt.idx, wgSizeX);
+        const sym = evalSymbolic(stmt.idx, wgSizeX, actx);
         patterns.push(makePattern(stmt.binding, "store", sym, stmt.idx.id));
         break;
       }
       case "guardedStore": {
-        const sym = evalSymbolic(stmt.idx, wgSizeX);
+        const sym = evalSymbolic(stmt.idx, wgSizeX, actx);
         patterns.push(makePattern(stmt.binding, "store", sym, stmt.idx.id));
         break;
       }
-      case "forRange":
-        walkStatements(stmt.body, wgSizeX, patterns);
+      case "forRange": {
+        // If loop has constant bounds, mark its variable as a bounded loop var
+        const hasConstBounds = extractConstant(stmt.start) !== null
+          && extractConstant(stmt.bound) !== null;
+        if (hasConstBounds) {
+          actx.boundedLoopVars.add(stmt.varName);
+        }
+        walkStatements(stmt.body, wgSizeX, patterns, actx);
+        // Clean up: remove loop var after scope exits
+        if (hasConstBounds) {
+          actx.boundedLoopVars.delete(stmt.varName);
+        }
         break;
+      }
       case "if":
-        walkStatements(stmt.body, wgSizeX, patterns);
+        walkStatements(stmt.body, wgSizeX, patterns, actx);
         break;
       case "ifElse":
-        walkStatements(stmt.body, wgSizeX, patterns);
-        walkStatements(stmt.elseBody, wgSizeX, patterns);
+        walkStatements(stmt.body, wgSizeX, patterns, actx);
+        walkStatements(stmt.elseBody, wgSizeX, patterns, actx);
         break;
     }
   }
