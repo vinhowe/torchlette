@@ -169,6 +169,42 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
       const idx = exprFor(node.idx, bindings, loopVar);
       return `${node.arrayName}[${idx}]`;
     }
+    // -- Vec4 native nodes --
+    case "vec4Construct": {
+      const x = exprFor(node.x, bindings, loopVar);
+      const y = exprFor(node.y, bindings, loopVar);
+      const z = exprFor(node.z, bindings, loopVar);
+      const w = exprFor(node.w, bindings, loopVar);
+      return `vec4<f32>(${x}, ${y}, ${z}, ${w})`;
+    }
+    case "vec4Splat": {
+      const v = exprFor(node.value, bindings, loopVar);
+      return `vec4<f32>(${v})`;
+    }
+    case "vec4NativeDot": {
+      const a = exprFor(node.a, bindings, loopVar);
+      const b = exprFor(node.b, bindings, loopVar);
+      return `dot(${a}, ${b})`;
+    }
+    case "vec4Component": {
+      const v = exprFor(node.value, bindings, loopVar);
+      const comp = ["x", "y", "z", "w"][node.comp];
+      return `${v}.${comp}`;
+    }
+    case "vec4Binary": {
+      const a = exprFor(node.a, bindings, loopVar);
+      const b = exprFor(node.b, bindings, loopVar);
+      const op = node.op === "add" ? "+" : node.op === "sub" ? "-" : "*";
+      return `(${a} ${op} ${b})`;
+    }
+    case "vec4ArrayRead": {
+      const idx = exprFor(node.idx, bindings, loopVar);
+      return `${node.arrayName}[${idx}]`;
+    }
+    case "vec4SharedRead": {
+      const idx = exprFor(node.idx, bindings, loopVar);
+      return `${node.arrayName}[${idx}]`;
+    }
     default:
       throw new Error(`Unknown node kind: ${(node as any).kind}`);
   }
@@ -271,7 +307,10 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
     const wgslType = sa.elemType;
     lines.push(`var<workgroup> ${sa.name}: array<${wgslType}, ${sa.size}>;`);
   }
-  if (ctx.sharedArrays.length > 0) lines.push("");
+  for (const sa of ctx.vec4SharedArrays) {
+    lines.push(`var<workgroup> ${sa.name}: array<vec4<f32>, ${sa.size}>;`);
+  }
+  if (ctx.sharedArrays.length > 0 || ctx.vec4SharedArrays.length > 0) lines.push("");
 
   // Constants
   if (spec.constants) {
@@ -300,7 +339,7 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
   const needsLocalIdx = ctx.nodes.some(n => n.kind === "localIndex");
   const needsNumWg = ctx.nodes.some(n => n.kind === "numWorkgroups");
   // Shared arrays and tile-level stmts require local_id/local_idx even if not explicitly referenced
-  const hasTileOps = ctx.sharedArrays.length > 0 ||
+  const hasTileOps = ctx.sharedArrays.length > 0 || ctx.vec4SharedArrays.length > 0 ||
     ctx.statements.some(s => s.kind === "tileLoad" || s.kind === "dot" || s.kind === "tileStore" || s.kind === "tileLoad1d" || s.kind === "accOp");
   const emitWid = needsWid || hasTileOps;
   const emitLocalId = needsLocalId || hasTileOps;
@@ -513,6 +552,27 @@ function emitStatement(
       lines.push(`${indent}${stmt.arrayName}[${idx}] = ${val};`);
       break;
     }
+    // Vec4 array statements
+    case "vec4VarArray": {
+      lines.push(`${indent}var ${stmt.name}: array<vec4<f32>, ${stmt.size}>;`);
+      break;
+    }
+    case "vec4SharedArray": {
+      // Handled at module scope, not inside fn
+      break;
+    }
+    case "vec4ArrayWrite": {
+      const idx = exprFor(stmt.idx, bindings, null);
+      const val = exprFor(stmt.value, bindings, null);
+      lines.push(`${indent}${stmt.arrayName}[${idx}] = ${val};`);
+      break;
+    }
+    case "vec4ArrayAddAssign": {
+      const idx = exprFor(stmt.idx, bindings, null);
+      const val = exprFor(stmt.value, bindings, null);
+      lines.push(`${indent}${stmt.arrayName}[${idx}] = ${stmt.arrayName}[${idx}] + ${val};`);
+      break;
+    }
     case "directStore": {
       const idx = exprFor(stmt.idx, bindings, null);
       const val = exprFor(stmt.value, bindings, null);
@@ -606,6 +666,17 @@ function collectExprNames(node: IRNode, names: Set<string>): void {
       for (const n of node.a) collectExprNames(n, names);
       for (const n of node.b) collectExprNames(n, names);
       break;
+    // Vec4 native nodes
+    case "vec4Construct":
+      collectExprNames(node.x, names); collectExprNames(node.y, names);
+      collectExprNames(node.z, names); collectExprNames(node.w, names);
+      break;
+    case "vec4Splat": collectExprNames(node.value, names); break;
+    case "vec4NativeDot": collectExprNames(node.a, names); collectExprNames(node.b, names); break;
+    case "vec4Component": collectExprNames(node.value, names); break;
+    case "vec4Binary": collectExprNames(node.a, names); collectExprNames(node.b, names); break;
+    case "vec4ArrayRead": collectExprNames(node.idx, names); break;
+    case "vec4SharedRead": collectExprNames(node.idx, names); break;
     // Leaf nodes (programId, uniform, const, threadIdx, localIndex, globalId): no names
   }
 }
@@ -664,7 +735,12 @@ function collectAllStmtNames(stmt: Statement, names: Set<string>): void {
       collectExprNames(stmt.expected, names);
       collectExprNames(stmt.desired, names);
       break;
-    // barrier, return, varArray: no IRNode expressions to collect
+    case "vec4ArrayWrite":
+    case "vec4ArrayAddAssign":
+      collectExprNames(stmt.idx, names);
+      collectExprNames(stmt.value, names);
+      break;
+    // barrier, return, varArray, vec4VarArray, vec4SharedArray: no IRNode expressions to collect
   }
 }
 
@@ -713,6 +789,29 @@ function getSharedReadsFromExpr(node: IRNode, names: Set<string>): void {
     case "subgroupBroadcastFirst":
     case "subgroupInclusiveAdd":
       getSharedReadsFromExpr(node.value, names);
+      return;
+    case "vec4Construct":
+      getSharedReadsFromExpr(node.x, names);
+      getSharedReadsFromExpr(node.y, names);
+      getSharedReadsFromExpr(node.z, names);
+      getSharedReadsFromExpr(node.w, names);
+      return;
+    case "vec4Splat": getSharedReadsFromExpr(node.value, names); return;
+    case "vec4NativeDot":
+      getSharedReadsFromExpr(node.a, names);
+      getSharedReadsFromExpr(node.b, names);
+      return;
+    case "vec4Component": getSharedReadsFromExpr(node.value, names); return;
+    case "vec4Binary":
+      getSharedReadsFromExpr(node.a, names);
+      getSharedReadsFromExpr(node.b, names);
+      return;
+    case "vec4SharedRead":
+      names.add(node.arrayName);
+      getSharedReadsFromExpr(node.idx, names);
+      return;
+    case "vec4ArrayRead":
+      getSharedReadsFromExpr(node.idx, names);
       return;
   }
 }
@@ -783,6 +882,14 @@ function getSharedReadsFromStmt(stmt: Statement): Set<string> {
         for (const r of getSharedReadsFromStmt(s)) reads.add(r);
       }
       break;
+    case "vec4ArrayWrite":
+    case "vec4ArrayAddAssign":
+      getSharedReadsFromExpr(stmt.idx, reads);
+      getSharedReadsFromExpr(stmt.value, reads);
+      if (stmt.isShared) {
+        // Reading from shared in the value expression
+      }
+      break;
   }
   return reads;
 }
@@ -793,6 +900,10 @@ function getSharedWritesFromStmt(stmt: Statement): Set<string> {
   switch (stmt.kind) {
     case "sharedWrite":
       writes.add(stmt.arrayName);
+      break;
+    case "vec4ArrayWrite":
+    case "vec4ArrayAddAssign":
+      if (stmt.isShared) writes.add(stmt.arrayName);
       break;
     case "if":
       for (const s of stmt.body) {
@@ -969,6 +1080,10 @@ function collectModifiedNames(stmts: Statement[], names: Set<string>): void {
       case "sharedWrite":
         names.add(stmt.arrayName);
         break;
+      case "vec4ArrayWrite":
+      case "vec4ArrayAddAssign":
+        names.add(stmt.arrayName);
+        break;
       case "var":
         names.add(stmt.name);
         break;
@@ -1024,6 +1139,15 @@ function exprDependsOn(node: IRNode, names: Set<string>): boolean {
     case "subgroupBroadcastFirst":
     case "subgroupInclusiveAdd":
       return exprDependsOn(node.value, names);
+    case "vec4Construct":
+      return exprDependsOn(node.x, names) || exprDependsOn(node.y, names) ||
+             exprDependsOn(node.z, names) || exprDependsOn(node.w, names);
+    case "vec4Splat": return exprDependsOn(node.value, names);
+    case "vec4NativeDot": return exprDependsOn(node.a, names) || exprDependsOn(node.b, names);
+    case "vec4Component": return exprDependsOn(node.value, names);
+    case "vec4Binary": return exprDependsOn(node.a, names) || exprDependsOn(node.b, names);
+    case "vec4SharedRead": return names.has(node.arrayName);
+    case "vec4ArrayRead": return names.has(node.arrayName) || exprDependsOn(node.idx, names);
     default:
       return false;
   }
@@ -1048,8 +1172,10 @@ function exprContainsLoad(node: IRNode): boolean {
              exprContainsLoad(node.trueVal) ||
              exprContainsLoad(node.falseVal);
     case "sharedRead":
+    case "vec4SharedRead":
       return false;
     case "arrayRead":
+    case "vec4ArrayRead":
       return exprContainsLoad(node.idx);
     case "subgroupShuffleXor":
       return exprContainsLoad(node.value) || exprContainsLoad(node.mask);
@@ -1058,6 +1184,13 @@ function exprContainsLoad(node: IRNode): boolean {
     case "subgroupBroadcastFirst":
     case "subgroupInclusiveAdd":
       return exprContainsLoad(node.value);
+    case "vec4Construct":
+      return exprContainsLoad(node.x) || exprContainsLoad(node.y) ||
+             exprContainsLoad(node.z) || exprContainsLoad(node.w);
+    case "vec4Splat": return exprContainsLoad(node.value);
+    case "vec4NativeDot": return exprContainsLoad(node.a) || exprContainsLoad(node.b);
+    case "vec4Component": return exprContainsLoad(node.value);
+    case "vec4Binary": return exprContainsLoad(node.a) || exprContainsLoad(node.b);
     default:
       return false;
   }
