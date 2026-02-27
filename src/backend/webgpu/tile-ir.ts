@@ -1516,6 +1516,55 @@ export class KernelContext {
       value: val.node,
     });
   }
+
+  // -- Triton-like convenience APIs --
+
+  /** Block-level where (like `tl.where`): returns trueVal where cond is true, falseVal otherwise. */
+  blockWhere(cond: BlockExpr, trueVal: BlockExpr, falseVal: BlockExpr): BlockExpr {
+    return cond.select(trueVal, falseVal);
+  }
+
+  /** Thread-distributed index range (like `tl.arange(0, BLOCK) + base`).
+   *  Returns: programId(0) * blockSize + localIndex() + base. */
+  blockRange(base: BlockExpr, blockSize: number): BlockExpr {
+    return this.programId(0).mul(this.u32(blockSize)).add(this.localIndex()).add(base);
+  }
+
+  // -- Scan primitives (like `tl.cumsum`, `tl.associative_scan`) --
+
+  /** Hillis-Steele inclusive parallel prefix scan in shared memory.
+   *  After the call, smem[tid] = op(smem[0], ..., smem[tid]).
+   *  Requires tid < wgSize. */
+  inclusiveScan(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number, op: "sum" | "max"): void {
+    for (let stride = 1; stride < wgSize; stride *= 2) {
+      this.barrier();
+      const prev = smem.read(tid.sub(this.u32(stride)));
+      const curr = smem.read(tid);
+      const merged = op === "sum" ? curr.add(prev) : curr.max(prev);
+      this.ifThen(tid.ge(this.u32(stride)), () => {
+        smem.write(tid, merged);
+      });
+    }
+    this.barrier();
+  }
+
+  /** Hillis-Steele exclusive parallel prefix scan in shared memory.
+   *  After the call, smem[tid] = op(smem[0], ..., smem[tid-1]), smem[0] = identity.
+   *  Identity: 0.0 for sum, -Infinity for max. */
+  exclusiveScan(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number, op: "sum" | "max"): void {
+    // Run inclusive scan first
+    this.inclusiveScan(smem, tid, wgSize, op);
+    // Shift right: exclusive[i] = inclusive[i-1], exclusive[0] = identity
+    const inclusive = smem.read(tid);
+    this.barrier();
+    const identity = op === "sum" ? this.f32(0.0) : this.f32(-1e38);
+    const shifted = this.blockWhere(tid.gt(this.u32(0)), smem.read(tid.sub(this.u32(1))), identity);
+    smem.write(tid, shifted);
+    // Need barrier before anyone reads the shifted values
+    this.barrier();
+    // Suppress unused variable warning — inclusive was read before barrier
+    void inclusive;
+  }
 }
 
 // ============================================================================
@@ -1550,6 +1599,10 @@ export interface TileKernelSpec {
    *  index among the storage bindings (e.g. 3 means after 3 storage bindings).
    *  If unset, uniform is appended after all storage bindings. */
   uniformBindingIndex?: number;
+  /** When true, the compiler automatically inserts workgroupBarrier() calls
+   *  between shared memory writes and subsequent reads. Opt-in to avoid
+   *  double-barriering existing kernels with manual barriers. */
+  autoBarriers?: boolean;
   /** Compute grid dimensions from uniform values. */
   grid: (uniforms: Record<string, number>) => [number] | [number, number] | [number, number, number];
   /** The kernel function that builds the IR DAG. */

@@ -6,7 +6,7 @@
  *
  * Inspired by Triton's AxisInfoAnalysis — tracks how thread indices map to
  * memory addresses to automatically detect coalesced access and select
- * optimal vector widths.
+ * optimal vector widths. Tracks divisibility and constant terms for alignment.
  */
 
 import type {
@@ -29,8 +29,12 @@ export interface AccessPattern {
   innerStride: number | "unknown";
   /** Whether consecutive threads in the x-dimension access consecutive addresses. */
   isCoalesced: boolean;
-  /** Maximum safe vector width (1, 2, or 4) based on contiguity analysis. */
+  /** Maximum safe vector width (1, 2, or 4) based on contiguity + alignment analysis. */
   maxVecWidth: 1 | 2 | 4;
+  /** GCD of the base address expression (for alignment reasoning). */
+  baseDivisibility: number | null;
+  /** Constant term in the address expression. */
+  baseConstantTerm: number | null;
   /** IR node ID of the load/store for diagnostics. */
   nodeId: number;
 }
@@ -41,52 +45,82 @@ export interface AccessPattern {
 
 /**
  * Symbolic representation of a linear expression in thread/workgroup IDs:
- *   value = constant + coefficients * variables
+ *   value = constantTerm + innerCoeff * threadIdx.x + (other terms)
  *
- * We track only the coefficient of the "inner thread dimension" (threadIdx.x,
- * localIndex % wgSizeX, or globalId.x) since that determines coalescing.
+ * We track the coefficient of the "inner thread dimension" (threadIdx.x,
+ * localIndex % wgSizeX, or globalId.x) since that determines coalescing,
+ * plus divisibility and constant term for alignment reasoning.
  */
 interface SymbolicExpr {
   /** Coefficient of the innermost thread index (threadIdx.x / globalId.x). */
   innerCoeff: number | "unknown";
   /** Whether the expression has any data-dependent terms (loop vars, loads). */
   hasDataDep: boolean;
+  /** Additive constant in the expression (null if unknown). */
+  constantTerm: number | null;
+  /** GCD divisibility of the entire expression (null if unknown).
+   *  For alignment: if divisibility >= 4, vec4 loads are safe. */
+  divisibility: number | null;
 }
 
-const UNKNOWN: SymbolicExpr = { innerCoeff: "unknown", hasDataDep: true };
-const ZERO: SymbolicExpr = { innerCoeff: 0, hasDataDep: false };
+function gcd(a: number, b: number): number {
+  a = Math.abs(a); b = Math.abs(b);
+  while (b) { [a, b] = [b, a % b]; }
+  return a;
+}
+
+function gcdN(...vals: number[]): number {
+  let result = vals[0];
+  for (let i = 1; i < vals.length; i++) {
+    result = gcd(result, vals[i]);
+  }
+  return result;
+}
+
+const UNKNOWN: SymbolicExpr = { innerCoeff: "unknown", hasDataDep: true, constantTerm: null, divisibility: null };
+const ZERO: SymbolicExpr = { innerCoeff: 0, hasDataDep: false, constantTerm: 0, divisibility: 0 };
 
 /**
  * Evaluate the symbolic stride of an IR expression with respect to the
  * innermost thread dimension.
  *
- * Returns the coefficient of threadIdx(0) / globalId(0) in the expression.
- * For example, `globalId(0) * 4 + offset` has innerCoeff = 4.
+ * Returns the coefficient of threadIdx(0) / globalId(0) in the expression,
+ * plus divisibility and constant term for alignment reasoning.
  */
 function evalSymbolic(node: IRNode, wgSizeX: number): SymbolicExpr {
   switch (node.kind) {
     case "globalId":
+      // globalId(0) = programId(0) * wgSizeX + threadIdx(0)
+      // innerCoeff = 1, constantTerm = 0, divisibility = 1
       return node.dim === 0
-        ? { innerCoeff: 1, hasDataDep: false }
+        ? { innerCoeff: 1, hasDataDep: false, constantTerm: 0, divisibility: 1 }
         : ZERO;
 
     case "threadIdx":
       return node.dim === 0
-        ? { innerCoeff: 1, hasDataDep: false }
+        ? { innerCoeff: 1, hasDataDep: false, constantTerm: 0, divisibility: 1 }
         : ZERO;
 
     case "localIndex":
       // localIndex = threadIdx.x + threadIdx.y * wgSizeX
-      // Coefficient of threadIdx.x is 1 (mod wgSizeX)
-      return { innerCoeff: 1, hasDataDep: false };
+      // Coefficient of threadIdx.x is 1
+      return { innerCoeff: 1, hasDataDep: false, constantTerm: 0, divisibility: 1 };
 
     case "programId":
       // Workgroup ID — constant within a workgroup, stride 0 w.r.t. threads
-      return ZERO;
+      // Divisibility depends on context (wgSizeX for dim 0)
+      return node.dim === 0
+        ? { innerCoeff: 0, hasDataDep: false, constantTerm: null, divisibility: null }
+        : { innerCoeff: 0, hasDataDep: false, constantTerm: null, divisibility: null };
 
     case "uniform":
-    case "const":
-      return ZERO;
+      // Uniform: constant within workgroup, unknown value
+      return { innerCoeff: 0, hasDataDep: false, constantTerm: null, divisibility: null };
+
+    case "const": {
+      const v = node.value;
+      return { innerCoeff: 0, hasDataDep: false, constantTerm: v, divisibility: v === 0 ? 0 : Math.abs(v) };
+    }
 
     case "binary": {
       const lhs = evalSymbolic(node.lhs, wgSizeX);
@@ -95,31 +129,54 @@ function evalSymbolic(node: IRNode, wgSizeX: number): SymbolicExpr {
       switch (node.op) {
         case "add":
         case "sub": {
-          if (lhs.innerCoeff === "unknown" || rhs.innerCoeff === "unknown")
-            return { innerCoeff: "unknown", hasDataDep: lhs.hasDataDep || rhs.hasDataDep };
+          if (lhs.innerCoeff === "unknown" || rhs.innerCoeff === "unknown") {
+            return { innerCoeff: "unknown", hasDataDep: lhs.hasDataDep || rhs.hasDataDep, constantTerm: null, divisibility: null };
+          }
           const coeff = node.op === "add"
             ? lhs.innerCoeff + rhs.innerCoeff
             : lhs.innerCoeff - rhs.innerCoeff;
-          return { innerCoeff: coeff, hasDataDep: lhs.hasDataDep || rhs.hasDataDep };
+          // constantTerm: add/sub of known constants
+          const ct = (lhs.constantTerm !== null && rhs.constantTerm !== null)
+            ? (node.op === "add" ? lhs.constantTerm + rhs.constantTerm : lhs.constantTerm - rhs.constantTerm)
+            : null;
+          // divisibility: gcd of both sides' divisibilities
+          const div = computeDivisibilityBinary(lhs.divisibility, rhs.divisibility, coeff);
+          return { innerCoeff: coeff, hasDataDep: lhs.hasDataDep || rhs.hasDataDep, constantTerm: ct, divisibility: div };
         }
 
         case "mul": {
           // (a + bx) * (c + dx)
           // If one side is constant (coeff=0, no data dep), multiply
           if (lhs.innerCoeff === 0 && !lhs.hasDataDep) {
-            // lhs is a constant — extract its value if possible
             const constVal = extractConstant(node.lhs);
             if (constVal !== null && rhs.innerCoeff !== "unknown") {
-              return { innerCoeff: constVal * rhs.innerCoeff, hasDataDep: rhs.hasDataDep };
+              const coeff = constVal * rhs.innerCoeff;
+              const ct = (rhs.constantTerm !== null) ? constVal * rhs.constantTerm : null;
+              const div = (rhs.divisibility !== null) ? Math.abs(constVal) * rhs.divisibility : null;
+              return { innerCoeff: coeff, hasDataDep: rhs.hasDataDep, constantTerm: ct, divisibility: div };
             }
-            if (rhs.innerCoeff === 0) return ZERO;
+            if (rhs.innerCoeff === 0) {
+              // Both constant w.r.t. threads
+              const ct = (lhs.constantTerm !== null && rhs.constantTerm !== null) ? lhs.constantTerm * rhs.constantTerm : null;
+              const div = (lhs.divisibility !== null && rhs.divisibility !== null)
+                ? lhs.divisibility * rhs.divisibility : null;
+              return { innerCoeff: 0, hasDataDep: lhs.hasDataDep || rhs.hasDataDep, constantTerm: ct, divisibility: div };
+            }
           }
           if (rhs.innerCoeff === 0 && !rhs.hasDataDep) {
             const constVal = extractConstant(node.rhs);
             if (constVal !== null && lhs.innerCoeff !== "unknown") {
-              return { innerCoeff: constVal * lhs.innerCoeff, hasDataDep: lhs.hasDataDep };
+              const coeff = constVal * lhs.innerCoeff;
+              const ct = (lhs.constantTerm !== null) ? constVal * lhs.constantTerm : null;
+              const div = (lhs.divisibility !== null) ? Math.abs(constVal) * lhs.divisibility : null;
+              return { innerCoeff: coeff, hasDataDep: lhs.hasDataDep, constantTerm: ct, divisibility: div };
             }
-            if (lhs.innerCoeff === 0) return ZERO;
+            if (lhs.innerCoeff === 0) {
+              const ct = (lhs.constantTerm !== null && rhs.constantTerm !== null) ? lhs.constantTerm * rhs.constantTerm : null;
+              const div = (lhs.divisibility !== null && rhs.divisibility !== null)
+                ? lhs.divisibility * rhs.divisibility : null;
+              return { innerCoeff: 0, hasDataDep: lhs.hasDataDep || rhs.hasDataDep, constantTerm: ct, divisibility: div };
+            }
           }
           return UNKNOWN;
         }
@@ -150,7 +207,12 @@ function evalSymbolic(node: IRNode, wgSizeX: number): SymbolicExpr {
       if (node.op === "neg") {
         const inner = evalSymbolic(node.input, wgSizeX);
         if (inner.innerCoeff === "unknown") return UNKNOWN;
-        return { innerCoeff: -inner.innerCoeff, hasDataDep: inner.hasDataDep };
+        return {
+          innerCoeff: -inner.innerCoeff,
+          hasDataDep: inner.hasDataDep,
+          constantTerm: inner.constantTerm !== null ? -inner.constantTerm : null,
+          divisibility: inner.divisibility,
+        };
       }
       return UNKNOWN;
 
@@ -168,11 +230,22 @@ function evalSymbolic(node: IRNode, wgSizeX: number): SymbolicExpr {
 
     case "namedRef":
       // Named refs are typically loop variables — data-dependent
-      return { innerCoeff: 0, hasDataDep: true };
+      return { innerCoeff: 0, hasDataDep: true, constantTerm: null, divisibility: null };
 
     default:
       return UNKNOWN;
   }
+}
+
+/**
+ * Compute divisibility for add/sub of two symbolic expressions.
+ * The divisibility of a sum is the GCD of the divisibilities.
+ */
+function computeDivisibilityBinary(lhsDiv: number | null, rhsDiv: number | null, _coeff: number): number | null {
+  if (lhsDiv === null || rhsDiv === null) return null;
+  if (lhsDiv === 0) return rhsDiv;
+  if (rhsDiv === 0) return lhsDiv;
+  return gcd(lhsDiv, rhsDiv);
 }
 
 /**
@@ -253,13 +326,34 @@ function makePattern(
   const isCoalesced = innerStride === 1;
   let maxVecWidth: 1 | 2 | 4 = 1;
   if (isCoalesced && !sym.hasDataDep) {
-    maxVecWidth = 4;
+    // Coalesced + no data deps → vec4 by default (threads access contiguous addresses).
+    // Use divisibility to *further* constrain when we know the base alignment:
+    // - If base divisibility >= 4 (or unknown/null) → vec4
+    // - If base divisibility is known but < 4 → use it to limit
+    // Note: divisibility of the entire expression (including stride*threadId) is
+    // dominated by the stride. For stride=1, the base alignment determines vec width.
+    const ct = sym.constantTerm;
+    if (ct !== null && ct % 4 !== 0) {
+      // Known constant offset that's not 4-aligned
+      if (ct % 2 === 0) {
+        maxVecWidth = 2;
+      } else {
+        maxVecWidth = 1;
+      }
+    } else {
+      // constantTerm is null (unknown but uniform) or 4-aligned → vec4 safe
+      maxVecWidth = 4;
+    }
   } else if (isCoalesced) {
     // Coalesced but with data-dependent base — vec4 may still be safe
     // if the base is aligned, but we conservatively use 1
     maxVecWidth = 1;
   }
-  return { bindingName, accessType, innerStride, isCoalesced, maxVecWidth, nodeId };
+  return {
+    bindingName, accessType, innerStride, isCoalesced, maxVecWidth,
+    baseDivisibility: sym.divisibility, baseConstantTerm: sym.constantTerm,
+    nodeId,
+  };
 }
 
 // ============================================================================
@@ -280,10 +374,11 @@ export function reportAccessPatterns(spec: TileKernelSpec): string {
       : `strided (stride=${p.innerStride})`;
 
     const vecStr = p.maxVecWidth > 1 ? `vec${p.maxVecWidth} OK` : "scalar only";
+    const divStr = p.baseDivisibility !== null ? ` div=${p.baseDivisibility}` : "";
     const prefix = (!p.isCoalesced && p.innerStride !== 0 && p.innerStride !== "unknown")
       ? "\u26A0 " : "  ";
 
-    lines.push(`${prefix}${p.accessType} ${p.bindingName} \u2014 ${strideStr}, ${vecStr}`);
+    lines.push(`${prefix}${p.accessType} ${p.bindingName} \u2014 ${strideStr}, ${vecStr}${divStr}`);
   }
 
   return lines.join("\n");
