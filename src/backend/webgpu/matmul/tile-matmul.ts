@@ -8,7 +8,7 @@
  * The dispatch infrastructure is unchanged — we just swap the WGSL generation.
  */
 
-import type { TileKernelSpec, DataType, BlockExpr, KernelContext } from "../tile-ir";
+import { type TileKernelSpec, type DataType, type BlockExpr, type KernelContext, ceilDivGrid } from "../tile-ir";
 import type { CodegenOptions } from "./codegen";
 import { getWorkgroupSize, type DType } from "./types";
 import { TileOps, BlockOps, Block, TileRange, buildPtr, buildMask, type TileConfig } from "../tile-ops";
@@ -386,7 +386,7 @@ export function createKSplitReductionKernel(kSplitCount: number, outputDtype: DT
       out: { storage: "read_write", type: outputDtype as DataType },
     },
     uniforms: { totalElements: "u32", alpha: "f32" },
-    grid: (u) => [Math.ceil(u.totalElements / 256)],
+    grid: ceilDivGrid(256, "totalElements"),
     kernel(ctx) {
       const idx = ctx.emitLet("idx", ctx.globalId(0));
       const totalElements = ctx.uniform("totalElements");

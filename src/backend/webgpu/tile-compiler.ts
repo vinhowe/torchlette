@@ -405,11 +405,17 @@ function emitStatement(
     case "varArray": {
       lines.push(`${indent}var ${stmt.name}: array<${stmt.elemType}, ${stmt.size}>;`);
       if (!stmt.skipZeroInit) {
-        // Zero-initialize
-        lines.push(`${indent}for (var _zi = 0u; _zi < ${stmt.size}u; _zi = _zi + 1u) {`);
         const zero = stmt.elemType === "f32" ? "0.0" : stmt.elemType === "f16" ? "f16(0.0)" : "0u";
-        lines.push(`${indent}  ${stmt.name}[_zi] = ${zero};`);
-        lines.push(`${indent}}`);
+        if (stmt.size <= 16) {
+          // Unroll zero-init for small arrays
+          for (let i = 0; i < stmt.size; i++) {
+            lines.push(`${indent}${stmt.name}[${i}u] = ${zero};`);
+          }
+        } else {
+          lines.push(`${indent}for (var _zi = 0u; _zi < ${stmt.size}u; _zi = _zi + 1u) {`);
+          lines.push(`${indent}  ${stmt.name}[_zi] = ${zero};`);
+          lines.push(`${indent}}`);
+        }
       }
       break;
     }
@@ -436,13 +442,33 @@ function emitStatement(
       break;
     }
     case "forRange": {
-      const start = exprFor(stmt.start, bindings, null);
-      const bound = exprFor(stmt.bound, bindings, null);
-      lines.push(`${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + 1u) {`);
-      for (const s of stmt.body) {
-        emitStatement(s, bindings, lines, depth + 1);
+      // Check if we can unroll: both start and bound must be ConstNode
+      const startConst = stmt.start.kind === "const" ? stmt.start.value : null;
+      const boundConst = stmt.bound.kind === "const" ? stmt.bound.value : null;
+      const tripCount = startConst !== null && boundConst !== null ? boundConst - startConst : null;
+      const shouldUnroll = tripCount !== null && tripCount >= 0 &&
+        (stmt.unroll === true || tripCount <= 16);
+
+      if (shouldUnroll && tripCount !== null && startConst !== null) {
+        // Emit unrolled iterations, each in its own block scope
+        for (let i = 0; i < tripCount; i++) {
+          const iterVal = startConst + i;
+          lines.push(`${indent}{ // unrolled ${stmt.varName}=${iterVal}`);
+          lines.push(`${indent}  const ${stmt.varName} = ${iterVal}u;`);
+          for (const s of stmt.body) {
+            emitStatement(s, bindings, lines, depth + 1);
+          }
+          lines.push(`${indent}}`);
+        }
+      } else {
+        const start = exprFor(stmt.start, bindings, null);
+        const bound = exprFor(stmt.bound, bindings, null);
+        lines.push(`${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + 1u) {`);
+        for (const s of stmt.body) {
+          emitStatement(s, bindings, lines, depth + 1);
+        }
+        lines.push(`${indent}}`);
       }
-      lines.push(`${indent}}`);
       break;
     }
     case "if": {

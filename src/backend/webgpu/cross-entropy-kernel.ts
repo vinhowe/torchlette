@@ -22,7 +22,7 @@ import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
 import { wgslSumReduction, wgslMaxReduction, trackBuffers } from "./wgsl-helpers";
-import type { TileKernelSpec } from "./tile-ir";
+import { type TileKernelSpec, perRowGrid } from "./tile-ir";
 import { createTileKernelDispatcher } from "./tile-dispatch";
 
 // Shared WGSL struct for cross-entropy config (8 bytes, 2 fields)
@@ -164,7 +164,7 @@ const crossEntropyForwardSpec: TileKernelSpec = {
     batch_size: "u32",
     vocab_size: "u32",
   },
-  grid: (u) => [u.batch_size],
+  grid: perRowGrid("batch_size"),
 
   kernel(ctx) {
     const tid = ctx.localIndex();
@@ -205,7 +205,7 @@ const crossEntropyBackwardSpec: TileKernelSpec = {
     batch_size: "u32",
     vocab_size: "u32",
   },
-  grid: (u) => [u.batch_size],
+  grid: perRowGrid("batch_size"),
 
   kernel(ctx) {
     const tid = ctx.localIndex();
