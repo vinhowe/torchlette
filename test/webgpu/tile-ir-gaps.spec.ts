@@ -1057,3 +1057,651 @@ describe("Compiler: constant-fold guardedStore", () => {
     expect(wgsl).toContain("if ((gid.x < config.n))");
   });
 });
+
+// ============================================================================
+// Triton Gap: blockWhere + blockRange
+// ============================================================================
+
+describe("Triton Gap: blockWhere", () => {
+  it("produces select() in WGSL output", () => {
+    const spec: TileKernelSpec = {
+      name: "blockWhereTest",
+      workgroupSize: 64,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const val = ctx.load("input", gid);
+        const zero = ctx.f32(0.0);
+        const result = ctx.blockWhere(val.gt(zero), val, zero);
+        ctx.emitStore("output", gid, result);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("select(");
+  });
+});
+
+describe("Triton Gap: blockRange", () => {
+  it("produces programId * blockSize + localIndex + base", () => {
+    const spec: TileKernelSpec = {
+      name: "blockRangeTest",
+      workgroupSize: 64,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel(ctx) {
+        const N = ctx.uniform("N");
+        const base = ctx.u32(0);
+        const idx = ctx.blockRange(base, 64);
+        const val = ctx.load("input", idx);
+        ctx.guardedStore("output", idx.lt(N), idx, val);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("workgroup_id");
+    expect(wgsl).toContain("local_invocation_index");
+    expect(wgsl).toContain("64u");
+  });
+});
+
+describe.runIf(isWebGPUEnabled)("Triton Gap: blockWhere + blockRange GPU", () => {
+  beforeAll(async () => {
+    const ok = await initWebGPU();
+    if (!ok) throw new Error("WebGPU init failed");
+    const ctx = getWebGPUDevice();
+    if (!ctx) throw new Error("No WebGPU device");
+    device = ctx.device;
+    queue = ctx.queue;
+  });
+
+  afterAll(async () => { await syncWebGPU(); });
+
+  it("blockWhere relu: x > 0 ? x : 0", async () => {
+    const N = 256;
+    const data = new Float32Array(N);
+    const expected = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      data[i] = i - 128; // -128..127
+      expected[i] = Math.max(0, data[i]);
+    }
+
+    const inBuf = makeF32Buffer(data, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(N);
+
+    const spec: TileKernelSpec = {
+      name: "blockWhereRelu",
+      workgroupSize: 64,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const N = ctx.uniform("N");
+        const val = ctx.load("input", gid);
+        const zero = ctx.f32(0.0);
+        ctx.guardedStore("output", gid.lt(N), gid, ctx.blockWhere(val.gt(zero), val, zero));
+      },
+    };
+
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder();
+    kernel.dispatch({ input: inBuf, output: outBuf }, { N });
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, N);
+    for (let i = 0; i < N; i++) {
+      expect(result[i]).toBeCloseTo(expected[i], 4);
+    }
+
+    inBuf.destroy();
+    outBuf.destroy();
+  });
+
+  it("blockRange elementwise add: matches globalId approach", async () => {
+    const N = 256;
+    const WG = 64;
+    const aData = new Float32Array(N);
+    const bData = new Float32Array(N);
+    const expected = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      aData[i] = i * 0.1;
+      bData[i] = (N - i) * 0.01;
+      expected[i] = aData[i] + bData[i];
+    }
+
+    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(N);
+
+    const spec: TileKernelSpec = {
+      name: "blockRangeAdd",
+      workgroupSize: WG,
+      bindings: {
+        a:      { storage: "read", type: "f32" },
+        b:      { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / WG)],
+      kernel(ctx) {
+        const Nval = ctx.uniform("N");
+        const idx = ctx.blockRange(ctx.u32(0), WG);
+        const val = ctx.load("a", idx).add(ctx.load("b", idx));
+        ctx.guardedStore("output", idx.lt(Nval), idx, val);
+      },
+    };
+
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder();
+    kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { N });
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, N);
+    for (let i = 0; i < N; i++) {
+      expect(result[i]).toBeCloseTo(expected[i], 3);
+    }
+
+    aBuf.destroy();
+    bBuf.destroy();
+    outBuf.destroy();
+  });
+});
+
+// ============================================================================
+// Triton Gap: Scan Primitives
+// ============================================================================
+
+describe("Triton Gap: Scan primitives (WGSL)", () => {
+  it("inclusiveScan emits correct number of barriers", () => {
+    const WG = 64;
+    const spec: TileKernelSpec = {
+      name: "inclusiveScanTest",
+      workgroupSize: WG,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const smem = ctx.sharedArray("scan", WG, "f32");
+        smem.write(tid, ctx.load("input", tid));
+        ctx.inclusiveScan(smem, tid, WG, "sum");
+        ctx.emitStore("output", tid, smem.read(tid));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // log2(64) = 6 strides → 6 barriers inside the scan + 1 final barrier = 7
+    // plus the initial barrier before scan = total varies
+    const barrierCount = (wgsl.match(/workgroupBarrier/g) || []).length;
+    expect(barrierCount).toBeGreaterThanOrEqual(7);
+  });
+});
+
+describe.runIf(isWebGPUEnabled)("Triton Gap: Scan primitives GPU", () => {
+  beforeAll(async () => {
+    const ok = await initWebGPU();
+    if (!ok) throw new Error("WebGPU init failed");
+    const ctx = getWebGPUDevice();
+    if (!ctx) throw new Error("No WebGPU device");
+    device = ctx.device;
+    queue = ctx.queue;
+  });
+
+  afterAll(async () => { await syncWebGPU(); });
+
+  it("inclusive prefix sum of [1,1,...,1] → [1,2,3,...,N]", async () => {
+    const WG = 64;
+    const data = new Float32Array(WG).fill(1.0);
+
+    const inBuf = makeF32Buffer(data, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(WG);
+
+    const spec: TileKernelSpec = {
+      name: "inclusivePrefixSum",
+      workgroupSize: WG,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const smem = ctx.sharedArray("scan", WG, "f32");
+        smem.write(tid, ctx.load("input", tid));
+        ctx.inclusiveScan(smem, tid, WG, "sum");
+        ctx.emitStore("output", tid, smem.read(tid));
+      },
+    };
+
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder();
+    kernel.dispatch({ input: inBuf, output: outBuf }, {});
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, WG);
+    for (let i = 0; i < WG; i++) {
+      expect(result[i]).toBeCloseTo(i + 1, 4);
+    }
+
+    inBuf.destroy();
+    outBuf.destroy();
+  });
+
+  it("exclusive prefix sum of [1,1,...,1] → [0,1,2,...,N-1]", async () => {
+    const WG = 64;
+    const data = new Float32Array(WG).fill(1.0);
+
+    const inBuf = makeF32Buffer(data, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(WG);
+
+    const spec: TileKernelSpec = {
+      name: "exclusivePrefixSum",
+      workgroupSize: WG,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const smem = ctx.sharedArray("scan", WG, "f32");
+        smem.write(tid, ctx.load("input", tid));
+        ctx.exclusiveScan(smem, tid, WG, "sum");
+        ctx.emitStore("output", tid, smem.read(tid));
+      },
+    };
+
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder();
+    kernel.dispatch({ input: inBuf, output: outBuf }, {});
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, WG);
+    for (let i = 0; i < WG; i++) {
+      expect(result[i]).toBeCloseTo(i, 4);
+    }
+
+    inBuf.destroy();
+    outBuf.destroy();
+  });
+
+  it("inclusive max scan", async () => {
+    const WG = 16;
+    const data = new Float32Array([3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3]);
+
+    const inBuf = makeF32Buffer(data, GPUBufferUsage.STORAGE);
+    const outBuf = makeOutputBuffer(WG);
+
+    const spec: TileKernelSpec = {
+      name: "inclusiveMaxScan",
+      workgroupSize: WG,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const smem = ctx.sharedArray("scan", WG, "f32");
+        smem.write(tid, ctx.load("input", tid));
+        ctx.inclusiveScan(smem, tid, WG, "max");
+        ctx.emitStore("output", tid, smem.read(tid));
+      },
+    };
+
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder();
+    kernel.dispatch({ input: inBuf, output: outBuf }, {});
+    flushSharedEncoder();
+
+    const result = await readF32Buffer(outBuf, WG);
+    // Expected: running max
+    let runningMax = -Infinity;
+    for (let i = 0; i < WG; i++) {
+      runningMax = Math.max(runningMax, data[i]);
+      expect(result[i]).toBeCloseTo(runningMax, 4);
+    }
+
+    inBuf.destroy();
+    outBuf.destroy();
+  });
+});
+
+// ============================================================================
+// Triton Gap: Automatic Barrier Insertion
+// ============================================================================
+
+import { insertBarriers, validateBarriers, hoistLoopInvariants } from "../../src/backend/webgpu/tile-compiler";
+import { buildKernelIR } from "../../src/backend/webgpu/tile-ir";
+
+describe("Triton Gap: Automatic barrier insertion", () => {
+  it("inserts barrier between sharedWrite and sharedRead", () => {
+    const spec: TileKernelSpec = {
+      name: "autoBarrierSimple",
+      workgroupSize: 64,
+      autoBarriers: true,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const smem = ctx.sharedArray("s", 64, "f32");
+        smem.write(tid, ctx.load("input", tid));
+        // No manual barrier — autoBarriers should insert one
+        const val = smem.read(tid);
+        ctx.emitStore("output", tid, val);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("workgroupBarrier");
+  });
+
+  it("does not double-barrier when manual barrier present", () => {
+    const spec: TileKernelSpec = {
+      name: "noDoubleBarrier",
+      workgroupSize: 64,
+      autoBarriers: true,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const smem = ctx.sharedArray("s", 64, "f32");
+        smem.write(tid, ctx.load("input", tid));
+        ctx.barrier(); // Manual barrier
+        const val = smem.read(tid);
+        ctx.emitStore("output", tid, val);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // Should have exactly 1 barrier, not 2
+    const barrierCount = (wgsl.match(/workgroupBarrier/g) || []).length;
+    expect(barrierCount).toBe(1);
+  });
+
+  it("no barriers added when no shared memory", () => {
+    const spec: TileKernelSpec = {
+      name: "noSharedMem",
+      workgroupSize: 64,
+      autoBarriers: true,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        ctx.emitStore("output", gid, ctx.load("input", gid));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).not.toContain("workgroupBarrier");
+  });
+
+  it("forRange body: barrier at loop boundary when write-then-read", () => {
+    const spec: TileKernelSpec = {
+      name: "loopBarrier",
+      workgroupSize: 64,
+      autoBarriers: true,
+      bindings: {
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const smem = ctx.sharedArray("s", 64, "f32");
+        smem.write(tid, ctx.f32(0.0));
+        ctx.forRange(ctx.u32(0), ctx.u32(4), (_k) => {
+          // Read from shared (written in previous iteration)
+          const val = smem.read(tid);
+          smem.write(tid, val.add(ctx.f32(1.0)));
+        });
+        ctx.emitStore("output", tid, smem.read(tid));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // Should have barriers inside the loop
+    expect(wgsl).toContain("workgroupBarrier");
+  });
+
+  it("validateBarriers reports missing barrier", () => {
+    const spec: TileKernelSpec = {
+      name: "validateMissing",
+      workgroupSize: 64,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const smem = ctx.sharedArray("s", 64, "f32");
+        smem.write(tid, ctx.load("input", tid));
+        // No barrier — validateBarriers should warn
+        const val = smem.read(tid);
+        ctx.emitStore("output", tid, val);
+      },
+    };
+    const ir = buildKernelIR(spec);
+    const warnings = validateBarriers(ir.statements);
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(warnings[0]).toContain("Missing barrier");
+  });
+});
+
+// ============================================================================
+// Triton Gap: LICM (Loop-Invariant Code Motion)
+// ============================================================================
+
+describe("Triton Gap: LICM", () => {
+  it("hoists uniform-dependent let out of forRange", () => {
+    const spec: TileKernelSpec = {
+      name: "licmBasic",
+      workgroupSize: 64,
+      bindings: {
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        ctx.forRange(ctx.u32(0), ctx.u32(4), (_k) => {
+          // This let only depends on uniform N, should be hoisted
+          const n = ctx.emitLet("n_val", ctx.uniform("N").toF32());
+          ctx.emitStore("output", tid, n);
+        });
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // The let should appear before the for loop, not inside it
+    const letPos = wgsl.indexOf("n_val");
+    const forPos = wgsl.indexOf("for (");
+    expect(letPos).toBeLessThan(forPos);
+  });
+
+  it("does NOT hoist loop-variable-dependent let", () => {
+    const spec: TileKernelSpec = {
+      name: "licmNoHoist",
+      workgroupSize: 64,
+      bindings: {
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        ctx.forRange(ctx.u32(0), ctx.u32(4), (k) => {
+          // This depends on loop var k, should NOT be hoisted
+          const val = ctx.emitLet("k_val", k.add(ctx.u32(1)));
+          ctx.emitStore("output", tid.add(k), val.toF32());
+        });
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // The let should be inside the for loop
+    const letPos = wgsl.indexOf("k_val");
+    const forPos = wgsl.indexOf("for (");
+    const forEnd = wgsl.indexOf("}", forPos);
+    expect(letPos).toBeGreaterThan(forPos);
+    expect(letPos).toBeLessThan(forEnd);
+  });
+
+  it("does NOT hoist sharedRead when shared array is written in loop", () => {
+    const spec: TileKernelSpec = {
+      name: "licmNoHoistSmem",
+      workgroupSize: 64,
+      bindings: {
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const smem = ctx.sharedArray("s", 64, "f32");
+        smem.write(tid, ctx.f32(0.0));
+        ctx.barrier();
+        ctx.forRange(ctx.u32(0), ctx.u32(4), (_k) => {
+          // Reads smem which is written in this loop → should NOT hoist
+          const val = ctx.emitLet("s_val", smem.read(ctx.u32(0)));
+          smem.write(tid, val.add(ctx.f32(1.0)));
+          ctx.barrier();
+        });
+        ctx.emitStore("output", tid, smem.read(tid));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // s_val should be inside the for loop
+    const letPos = wgsl.indexOf("s_val");
+    const forPos = wgsl.indexOf("for (");
+    expect(letPos).toBeGreaterThan(forPos);
+  });
+});
+
+// ============================================================================
+// Triton Gap: Richer Access Analysis (divisibility)
+// ============================================================================
+
+import { analyzeAccessPatterns } from "../../src/backend/webgpu/tile-access-analysis";
+
+describe("Triton Gap: Richer access analysis", () => {
+  it("globalId(0) * 4 has divisibility tracking", () => {
+    const spec: TileKernelSpec = {
+      name: "divTest4",
+      workgroupSize: 64,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const idx = gid.mul(ctx.u32(4));
+        const val = ctx.load("input", idx);
+        ctx.emitStore("output", idx, val);
+      },
+    };
+    const patterns = analyzeAccessPatterns(spec);
+    const load = patterns.find(p => p.accessType === "load");
+    expect(load).toBeDefined();
+    expect(load!.innerStride).toBe(4);
+    expect(load!.baseDivisibility).toBe(4);
+  });
+
+  it("globalId(0) * 2 + 1 has odd constant term", () => {
+    const spec: TileKernelSpec = {
+      name: "divTestOdd",
+      workgroupSize: 64,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const idx = gid.mul(ctx.u32(2)).add(ctx.u32(1));
+        const val = ctx.load("input", idx);
+        ctx.emitStore("output", idx, val);
+      },
+    };
+    const patterns = analyzeAccessPatterns(spec);
+    const load = patterns.find(p => p.accessType === "load");
+    expect(load).toBeDefined();
+    expect(load!.baseConstantTerm).toBe(1);
+  });
+
+  it("globalId(0) + const(0) has constantTerm 0", () => {
+    const spec: TileKernelSpec = {
+      name: "divTestZeroConst",
+      workgroupSize: 64,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const idx = gid.add(ctx.u32(0));
+        const val = ctx.load("input", idx);
+        ctx.emitStore("output", gid, val);
+      },
+    };
+    const patterns = analyzeAccessPatterns(spec);
+    const load = patterns.find(p => p.accessType === "load");
+    expect(load).toBeDefined();
+    expect(load!.baseConstantTerm).toBe(0);
+    expect(load!.maxVecWidth).toBe(4);
+  });
+
+  it("programId(0) * 128 + localIndex has divisibility tracking", () => {
+    const spec: TileKernelSpec = {
+      name: "divTestProgramId",
+      workgroupSize: 64,
+      bindings: {
+        input:  { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const wid = ctx.programId(0);
+        const tid = ctx.localIndex();
+        const idx = wid.mul(ctx.u32(128)).add(tid);
+        const val = ctx.load("input", idx);
+        ctx.emitStore("output", idx, val);
+      },
+    };
+    const patterns = analyzeAccessPatterns(spec);
+    const load = patterns.find(p => p.accessType === "load");
+    expect(load).toBeDefined();
+    expect(load!.innerStride).toBe(1);
+    expect(load!.isCoalesced).toBe(true);
+  });
+});

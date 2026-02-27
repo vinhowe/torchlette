@@ -197,7 +197,15 @@ export function compileTileKernel(spec: TileKernelSpec): string {
     stmts = lowerTileStatements(stmts, spec);
   }
 
-  // 3. Dead code elimination (remove unused let bindings)
+  // 3. Automatic barrier insertion (opt-in)
+  if (spec.autoBarriers) {
+    stmts = insertBarriers(stmts);
+  }
+
+  // 4. Loop-invariant code motion (always-on)
+  stmts = hoistLoopInvariants(stmts);
+
+  // 5. Dead code elimination (remove unused let bindings)
   stmts = eliminateDeadCode(stmts);
 
   return compileImperativeKernel(spec, ctx, stmts);
@@ -580,6 +588,458 @@ function collectAllStmtNames(stmt: Statement, names: Set<string>): void {
     // barrier, return, varArray: no IRNode expressions to collect
   }
 }
+
+// ============================================================================
+// Automatic Barrier Insertion
+// ============================================================================
+
+/**
+ * Collect shared array names read by IR nodes within a statement (non-recursive into forRange).
+ */
+function getSharedReadsFromExpr(node: IRNode, names: Set<string>): void {
+  switch (node.kind) {
+    case "sharedRead":
+      names.add(node.arrayName);
+      getSharedReadsFromExpr(node.idx, names);
+      return;
+    case "binary":
+      getSharedReadsFromExpr(node.lhs, names);
+      getSharedReadsFromExpr(node.rhs, names);
+      return;
+    case "unary":
+    case "cast":
+      getSharedReadsFromExpr(node.input, names);
+      return;
+    case "cmp":
+      getSharedReadsFromExpr(node.lhs, names);
+      getSharedReadsFromExpr(node.rhs, names);
+      return;
+    case "select":
+      getSharedReadsFromExpr(node.condition, names);
+      getSharedReadsFromExpr(node.trueVal, names);
+      getSharedReadsFromExpr(node.falseVal, names);
+      return;
+    case "load":
+      getSharedReadsFromExpr(node.offsets, names);
+      return;
+    case "arrayRead":
+      getSharedReadsFromExpr(node.idx, names);
+      return;
+  }
+}
+
+/** Get shared array names read by a statement's expressions (not recursing into forRange). */
+function getSharedReadsFromStmt(stmt: Statement): Set<string> {
+  const reads = new Set<string>();
+  switch (stmt.kind) {
+    case "let":
+      getSharedReadsFromExpr(stmt.value, reads);
+      break;
+    case "var":
+      getSharedReadsFromExpr(stmt.value, reads);
+      break;
+    case "assign":
+      getSharedReadsFromExpr(stmt.value, reads);
+      break;
+    case "addAssign":
+      getSharedReadsFromExpr(stmt.value, reads);
+      break;
+    case "indexAssign":
+      getSharedReadsFromExpr(stmt.idx, reads);
+      getSharedReadsFromExpr(stmt.value, reads);
+      break;
+    case "indexAddAssign":
+      getSharedReadsFromExpr(stmt.idx, reads);
+      getSharedReadsFromExpr(stmt.value, reads);
+      break;
+    case "sharedWrite":
+      getSharedReadsFromExpr(stmt.idx, reads);
+      getSharedReadsFromExpr(stmt.value, reads);
+      break;
+    case "guardedStore":
+      getSharedReadsFromExpr(stmt.condition, reads);
+      getSharedReadsFromExpr(stmt.idx, reads);
+      getSharedReadsFromExpr(stmt.value, reads);
+      break;
+    case "directStore":
+      getSharedReadsFromExpr(stmt.idx, reads);
+      getSharedReadsFromExpr(stmt.value, reads);
+      break;
+    case "atomicOp":
+      getSharedReadsFromExpr(stmt.idx, reads);
+      getSharedReadsFromExpr(stmt.value, reads);
+      break;
+    case "forRange":
+      getSharedReadsFromExpr(stmt.start, reads);
+      getSharedReadsFromExpr(stmt.bound, reads);
+      // Don't recurse into body — forRange is a separate scope
+      break;
+    case "if":
+      getSharedReadsFromExpr(stmt.condition, reads);
+      for (const s of stmt.body) {
+        for (const r of getSharedReadsFromStmt(s)) reads.add(r);
+      }
+      break;
+    case "ifElse":
+      getSharedReadsFromExpr(stmt.condition, reads);
+      for (const s of stmt.body) {
+        for (const r of getSharedReadsFromStmt(s)) reads.add(r);
+      }
+      for (const s of stmt.elseBody) {
+        for (const r of getSharedReadsFromStmt(s)) reads.add(r);
+      }
+      break;
+  }
+  return reads;
+}
+
+/** Get shared array names written by a statement (not recursing into forRange). */
+function getSharedWritesFromStmt(stmt: Statement): Set<string> {
+  const writes = new Set<string>();
+  switch (stmt.kind) {
+    case "sharedWrite":
+      writes.add(stmt.arrayName);
+      break;
+    case "if":
+      for (const s of stmt.body) {
+        for (const w of getSharedWritesFromStmt(s)) writes.add(w);
+      }
+      break;
+    case "ifElse":
+      for (const s of stmt.body) {
+        for (const w of getSharedWritesFromStmt(s)) writes.add(w);
+      }
+      for (const s of stmt.elseBody) {
+        for (const w of getSharedWritesFromStmt(s)) writes.add(w);
+      }
+      break;
+  }
+  return writes;
+}
+
+/**
+ * Insert workgroupBarrier() between shared memory writes and subsequent reads.
+ * Does not double-barrier: existing barriers clear the dirty set.
+ */
+export function insertBarriers(stmts: Statement[]): Statement[] {
+  const result: Statement[] = [];
+  const dirtyArrays = new Set<string>();
+
+  for (const stmt of stmts) {
+    // Recurse into forRange bodies first
+    if (stmt.kind === "forRange") {
+      const newBody = insertBarriersForLoop(stmt.body);
+      result.push({ ...stmt, body: newBody } as Statement);
+      // forRange may write shared memory — track it
+      for (const s of stmt.body) {
+        for (const w of getSharedWritesFromStmt(s)) dirtyArrays.add(w);
+      }
+      continue;
+    }
+
+    // Check if this statement reads from a dirty shared array
+    const reads = getSharedReadsFromStmt(stmt);
+    let needsBarrier = false;
+    for (const r of reads) {
+      if (dirtyArrays.has(r)) {
+        needsBarrier = true;
+        break;
+      }
+    }
+
+    if (needsBarrier) {
+      result.push({ kind: "barrier" });
+      dirtyArrays.clear();
+    }
+
+    // Existing barrier clears dirty set
+    if (stmt.kind === "barrier") {
+      dirtyArrays.clear();
+    }
+
+    result.push(stmt);
+
+    // Track writes
+    for (const w of getSharedWritesFromStmt(stmt)) {
+      dirtyArrays.add(w);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Insert barriers in a loop body, considering that the body repeats.
+ * If the body writes shared memory and a later iteration reads it,
+ * a barrier is needed at the loop boundary.
+ */
+function insertBarriersForLoop(body: Statement[]): Statement[] {
+  // First pass: insert barriers within the body
+  let result = insertBarriers(body);
+
+  // Check if the body writes then reads the same shared array across iterations
+  // i.e., writes at end feed into reads at start of next iteration
+  const allWrites = new Set<string>();
+  const allReads = new Set<string>();
+  for (const s of body) {
+    for (const w of getSharedWritesFromStmt(s)) allWrites.add(w);
+    for (const r of getSharedReadsFromStmt(s)) allReads.add(r);
+  }
+
+  // If any written array is also read, we may need a barrier at the end
+  let needsBoundaryBarrier = false;
+  for (const w of allWrites) {
+    if (allReads.has(w)) {
+      needsBoundaryBarrier = true;
+      break;
+    }
+  }
+
+  if (needsBoundaryBarrier) {
+    // Check if the last statement is already a barrier
+    const last = result[result.length - 1];
+    if (!last || last.kind !== "barrier") {
+      result = [...result, { kind: "barrier" }];
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Validate that shared memory accesses have proper barriers.
+ * Returns warning strings for missing barriers (diagnostic, doesn't modify code).
+ */
+export function validateBarriers(stmts: Statement[]): string[] {
+  const warnings: string[] = [];
+  const dirtyArrays = new Set<string>();
+
+  function walk(stmts: Statement[]): void {
+    for (const stmt of stmts) {
+      if (stmt.kind === "barrier") {
+        dirtyArrays.clear();
+        continue;
+      }
+
+      const reads = getSharedReadsFromStmt(stmt);
+      for (const r of reads) {
+        if (dirtyArrays.has(r)) {
+          warnings.push(`Missing barrier: shared array '${r}' written then read without barrier`);
+          dirtyArrays.clear();
+          break;
+        }
+      }
+
+      for (const w of getSharedWritesFromStmt(stmt)) {
+        dirtyArrays.add(w);
+      }
+
+      if (stmt.kind === "forRange") {
+        walk(stmt.body);
+      } else if (stmt.kind === "if") {
+        walk(stmt.body);
+      } else if (stmt.kind === "ifElse") {
+        walk(stmt.body);
+        walk(stmt.elseBody);
+      }
+    }
+  }
+
+  walk(stmts);
+  return warnings;
+}
+
+// ============================================================================
+// Loop-Invariant Code Motion (LICM)
+// ============================================================================
+
+/**
+ * Collect names modified inside a statement list (loop-variant names).
+ * Includes: assigned vars, loop variables, shared arrays written.
+ */
+function collectModifiedNames(stmts: Statement[], names: Set<string>): void {
+  for (const stmt of stmts) {
+    switch (stmt.kind) {
+      case "assign":
+        names.add(stmt.name);
+        break;
+      case "addAssign":
+        names.add(stmt.name);
+        break;
+      case "indexAssign":
+        names.add(stmt.arrayName);
+        break;
+      case "indexAddAssign":
+        names.add(stmt.arrayName);
+        break;
+      case "sharedWrite":
+        names.add(stmt.arrayName);
+        break;
+      case "var":
+        names.add(stmt.name);
+        break;
+      case "forRange":
+        names.add(stmt.varName);
+        collectModifiedNames(stmt.body, names);
+        break;
+      case "if":
+        collectModifiedNames(stmt.body, names);
+        break;
+      case "ifElse":
+        collectModifiedNames(stmt.body, names);
+        collectModifiedNames(stmt.elseBody, names);
+        break;
+    }
+  }
+}
+
+/**
+ * Check if an IR expression depends on any of the given names (namedRef references).
+ */
+function exprDependsOn(node: IRNode, names: Set<string>): boolean {
+  switch (node.kind) {
+    case "namedRef":
+      return names.has(node.name);
+    case "binary":
+      return exprDependsOn(node.lhs, names) || exprDependsOn(node.rhs, names);
+    case "unary":
+    case "cast":
+      return exprDependsOn(node.input, names);
+    case "cmp":
+      return exprDependsOn(node.lhs, names) || exprDependsOn(node.rhs, names);
+    case "select":
+      return exprDependsOn(node.condition, names) ||
+             exprDependsOn(node.trueVal, names) ||
+             exprDependsOn(node.falseVal, names);
+    case "load":
+      // Global loads are never hoisted (memory may change between iterations)
+      return true;
+    case "sharedRead":
+      // Only safe to hoist if no shared array is written in the loop
+      return names.has(node.arrayName);
+    case "arrayRead":
+      return names.has(node.arrayName) || exprDependsOn(node.idx, names);
+    default:
+      return false;
+  }
+}
+
+/**
+ * Check if an expression contains any global memory load.
+ */
+function exprContainsLoad(node: IRNode): boolean {
+  switch (node.kind) {
+    case "load":
+      return true;
+    case "binary":
+      return exprContainsLoad(node.lhs) || exprContainsLoad(node.rhs);
+    case "unary":
+    case "cast":
+      return exprContainsLoad(node.input);
+    case "cmp":
+      return exprContainsLoad(node.lhs) || exprContainsLoad(node.rhs);
+    case "select":
+      return exprContainsLoad(node.condition) ||
+             exprContainsLoad(node.trueVal) ||
+             exprContainsLoad(node.falseVal);
+    case "sharedRead":
+      return false;
+    case "arrayRead":
+      return exprContainsLoad(node.idx);
+    default:
+      return false;
+  }
+}
+
+/**
+ * Hoist loop-invariant `let` bindings out of `forRange` loops.
+ *
+ * Safety rules (conservative):
+ * - Only hoists `let` bindings (immutable, no side effects)
+ * - Never hoists expressions containing global `load` nodes
+ * - Never hoists expressions referencing shared arrays written in the loop
+ * - Never hoists across barriers (a let after a barrier stays after it)
+ * - Recurse inner-to-outer (inner loops hoisted first)
+ */
+export function hoistLoopInvariants(stmts: Statement[]): Statement[] {
+  const result: Statement[] = [];
+
+  for (const stmt of stmts) {
+    if (stmt.kind === "forRange") {
+      // First recurse into the body (inner-to-outer)
+      const innerHoisted = hoistLoopInvariants(stmt.body);
+
+      // Collect loop-variant names
+      const variantNames = new Set<string>();
+      variantNames.add(stmt.varName); // Loop variable is always variant
+      collectModifiedNames(innerHoisted, variantNames);
+
+      // Check if any shared array is written in the loop
+      const sharedWritten = new Set<string>();
+      collectSharedWriteNames(innerHoisted, sharedWritten);
+
+      // Add shared written names to variant set so sharedRead of them won't hoist
+      for (const sw of sharedWritten) variantNames.add(sw);
+
+      // Partition body into hoistable and non-hoistable
+      const hoisted: Statement[] = [];
+      const remaining: Statement[] = [];
+      let seenBarrier = false;
+
+      for (const s of innerHoisted) {
+        if (s.kind === "barrier") {
+          seenBarrier = true;
+          remaining.push(s);
+          continue;
+        }
+
+        if (s.kind === "let" && !seenBarrier &&
+            !exprDependsOn(s.value, variantNames) &&
+            !exprContainsLoad(s.value)) {
+          hoisted.push(s);
+        } else {
+          remaining.push(s);
+        }
+      }
+
+      // Emit hoisted lets before the loop
+      result.push(...hoisted);
+      result.push({ ...stmt, body: remaining } as Statement);
+    } else if (stmt.kind === "if") {
+      result.push({ ...stmt, body: hoistLoopInvariants(stmt.body) } as Statement);
+    } else if (stmt.kind === "ifElse") {
+      result.push({
+        ...stmt,
+        body: hoistLoopInvariants(stmt.body),
+        elseBody: hoistLoopInvariants(stmt.elseBody),
+      } as Statement);
+    } else {
+      result.push(stmt);
+    }
+  }
+
+  return result;
+}
+
+/** Collect shared array names written in a statement list. */
+function collectSharedWriteNames(stmts: Statement[], names: Set<string>): void {
+  for (const stmt of stmts) {
+    if (stmt.kind === "sharedWrite") {
+      names.add(stmt.arrayName);
+    } else if (stmt.kind === "forRange") {
+      collectSharedWriteNames(stmt.body, names);
+    } else if (stmt.kind === "if") {
+      collectSharedWriteNames(stmt.body, names);
+    } else if (stmt.kind === "ifElse") {
+      collectSharedWriteNames(stmt.body, names);
+      collectSharedWriteNames(stmt.elseBody, names);
+    }
+  }
+}
+
+// ============================================================================
+// Dead Code Elimination
+// ============================================================================
 
 /**
  * Remove `let` statements whose bindings are never referenced.

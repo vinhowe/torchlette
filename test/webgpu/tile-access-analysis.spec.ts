@@ -284,4 +284,91 @@ describe("tile-access-analysis", () => {
       expect(stores[0].isCoalesced).toBe(true);
     });
   });
+
+  describe("divisibility tracking", () => {
+    it("globalId(0) has divisibility 1 and constantTerm 0", () => {
+      const spec = makeSpec("divGlobalId", (ctx) => {
+        const gid = ctx.globalId(0);
+        const val = ctx.load("input", gid);
+        ctx.emitStore("output", gid, val);
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load");
+      expect(load).toBeDefined();
+      expect(load!.baseDivisibility).toBe(1);
+      expect(load!.baseConstantTerm).toBe(0);
+    });
+
+    it("globalId(0) * 4 has stride 4 and divisibility 4", () => {
+      const spec = makeSpec("divMul4", (ctx) => {
+        const gid = ctx.globalId(0);
+        const idx = gid.mul(ctx.u32(4));
+        ctx.emitStore("output", idx, ctx.load("input", idx));
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load");
+      expect(load).toBeDefined();
+      expect(load!.innerStride).toBe(4);
+      expect(load!.baseDivisibility).toBe(4);
+    });
+
+    it("globalId(0) + const(4) has constantTerm 4", () => {
+      const spec = makeSpec("divConst4", (ctx) => {
+        const gid = ctx.globalId(0);
+        const idx = gid.add(ctx.u32(4));
+        ctx.emitStore("output", gid, ctx.load("input", idx));
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load");
+      expect(load).toBeDefined();
+      expect(load!.baseConstantTerm).toBe(4);
+      expect(load!.maxVecWidth).toBe(4); // constantTerm 4 is 4-aligned
+    });
+
+    it("globalId(0) + const(1) limits vec width", () => {
+      const spec = makeSpec("divConst1", (ctx) => {
+        const gid = ctx.globalId(0);
+        const idx = gid.add(ctx.u32(1));
+        ctx.emitStore("output", gid, ctx.load("input", idx));
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load");
+      expect(load).toBeDefined();
+      expect(load!.baseConstantTerm).toBe(1);
+      expect(load!.maxVecWidth).toBe(1); // odd offset → scalar only
+    });
+
+    it("globalId(0) + const(2) allows vec2", () => {
+      const spec = makeSpec("divConst2", (ctx) => {
+        const gid = ctx.globalId(0);
+        const idx = gid.add(ctx.u32(2));
+        ctx.emitStore("output", gid, ctx.load("input", idx));
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load");
+      expect(load).toBeDefined();
+      expect(load!.baseConstantTerm).toBe(2);
+      expect(load!.maxVecWidth).toBe(2); // 2-aligned offset → vec2
+    });
+
+    it("globalId(0) + uniform has null constantTerm → vec4", () => {
+      const spec = makeSpec("divUniform", (ctx) => {
+        const gid = ctx.globalId(0);
+        const base = ctx.uniform("N");
+        const idx = gid.add(base);
+        ctx.emitStore("output", gid, ctx.load("input", idx));
+      });
+
+      const patterns = analyzeAccessPatterns(spec);
+      const load = patterns.find(p => p.accessType === "load");
+      expect(load).toBeDefined();
+      expect(load!.baseConstantTerm).toBeNull(); // unknown constant
+      expect(load!.maxVecWidth).toBe(4); // unknown → conservatively vec4
+    });
+  });
 });
