@@ -187,6 +187,7 @@ function evalSymbolic(node: IRNode, wgSizeX: number): SymbolicExpr {
         case "shl":
         case "and":
         case "or":
+        case "xor":
           // These break linearity — stride becomes unknown unless both sides are constant
           if (lhs.innerCoeff === 0 && rhs.innerCoeff === 0 && !lhs.hasDataDep && !rhs.hasDataDep) {
             return ZERO;

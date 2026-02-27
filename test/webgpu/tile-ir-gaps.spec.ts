@@ -1925,6 +1925,65 @@ describe("Triton Gap: generic associativeScan (WGSL)", () => {
 });
 
 // ============================================================================
+// Round 3: bitwise XOR, cdiv/floorDiv, wgReduceGeneric, atomics, RNG
+// ============================================================================
+
+describe("Triton Gap: bitwise XOR (WGSL)", () => {
+  it("a.xor(b) compiles to (a ^ b)", () => {
+    const spec: TileKernelSpec = {
+      name: "xorTest",
+      workgroupSize: 64,
+      bindings: { input: { storage: "read", type: "u32" }, output: { storage: "read_write", type: "u32" } },
+      uniforms: {},
+      grid: () => [1],
+      kernel: (ctx) => {
+        const gid = ctx.globalId(0);
+        const val = ctx.load("input", gid);
+        ctx.emitStore("output", gid, val.xor(ctx.u32(0xFF)));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("^");
+  });
+
+  it("constant folds xor(5, 3) → 6", () => {
+    const spec: TileKernelSpec = {
+      name: "xorFold",
+      workgroupSize: 64,
+      bindings: { output: { storage: "read_write", type: "u32" } },
+      uniforms: {},
+      grid: () => [1],
+      kernel: (ctx) => {
+        const gid = ctx.globalId(0);
+        ctx.emitStore("output", gid, ctx.u32(5).xor(ctx.u32(3)));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // 5 ^ 3 = 6, should be folded to constant 6
+    expect(wgsl).toContain("6u");
+    expect(wgsl).not.toContain("^");
+  });
+
+  it("x ^ 0 simplifies to x (algebraic identity)", () => {
+    const spec: TileKernelSpec = {
+      name: "xorZero",
+      workgroupSize: 64,
+      bindings: { input: { storage: "read", type: "u32" }, output: { storage: "read_write", type: "u32" } },
+      uniforms: {},
+      grid: () => [1],
+      kernel: (ctx) => {
+        const gid = ctx.globalId(0);
+        const val = ctx.load("input", gid);
+        ctx.emitStore("output", gid, val.xor(0));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // x ^ 0 should simplify to x, no ^ operator
+    expect(wgsl).not.toContain("^");
+  });
+});
+
+// ============================================================================
 // GPU tests for Round 2 gaps
 // ============================================================================
 

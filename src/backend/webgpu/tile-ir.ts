@@ -32,7 +32,7 @@
 
 export type ValueType = "block" | "scalar";
 export type DataType = "f32" | "f16" | "u32" | "i32";
-export type BinaryOp = "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "shr" | "shl" | "min" | "max" | "pow";
+export type BinaryOp = "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "xor" | "shr" | "shl" | "min" | "max" | "pow";
 export type UnaryOp = "rsqrt" | "exp" | "log" | "abs" | "neg" | "sqrt" | "tanh" | "floor" | "ceil" | "not" | "sin" | "cos" | "round" | "sign" | "exp2" | "log2";
 export type CmpOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
 
@@ -527,6 +527,7 @@ function evalBinaryConst(op: BinaryOp, a: number, b: number): number | null {
     case "pow": { const r = Math.pow(a, b); return isFinite(r) ? r : null; }
     case "and": return ((a >>> 0) & (b >>> 0)) >>> 0;
     case "or":  return ((a >>> 0) | (b >>> 0)) >>> 0;
+    case "xor": return ((a >>> 0) ^ (b >>> 0)) >>> 0;
     case "shr": return (a >>> 0) >>> (b >>> 0);
     case "shl": return ((a >>> 0) << (b >>> 0)) >>> 0;
     default: return null;
@@ -592,6 +593,10 @@ function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
           return { kind: "const", value: 0, valueType: "scalar", dataType: "u32", id: -1 } as ConstNode;
         break;
       case "or":
+        if (isConstVal(rhs, 0)) return lhs;
+        if (isConstVal(lhs, 0)) return rhs;
+        break;
+      case "xor":
         if (isConstVal(rhs, 0)) return lhs;
         if (isConstVal(lhs, 0)) return rhs;
         break;
@@ -802,6 +807,16 @@ export class BlockExpr {
     const rhs = resolveArg(other);
     return new BlockExpr(makeNode<BinaryNode>({
       kind: "binary", op: "or",
+      lhs: this.node, rhs,
+      valueType: promoteValueType(this.node.valueType, rhs.valueType),
+      dataType: "u32",
+    }));
+  }
+
+  xor(other: BlockExpr | number): BlockExpr {
+    const rhs = resolveArg(other);
+    return new BlockExpr(makeNode<BinaryNode>({
+      kind: "binary", op: "xor",
       lhs: this.node, rhs,
       valueType: promoteValueType(this.node.valueType, rhs.valueType),
       dataType: "u32",
