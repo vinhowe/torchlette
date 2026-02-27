@@ -489,14 +489,25 @@ function emitStatement(
     case "atomicOp": {
       const idx = exprFor(stmt.idx, bindings, null);
       const val = exprFor(stmt.value, bindings, null);
-      const fnName = {
+      const fnName: Record<string, string> = {
         max: "atomicMax",
         min: "atomicMin",
         add: "atomicAdd",
         or: "atomicOr",
         and: "atomicAnd",
-      }[stmt.op];
-      lines.push(`${indent}${fnName}(&${stmt.binding}[${idx}], ${val});`);
+        xor: "atomicXor",
+        exchange: "atomicExchange",
+      };
+      lines.push(`${indent}${fnName[stmt.op]}(&${stmt.binding}[${idx}], ${val});`);
+      break;
+    }
+    case "atomicCAS": {
+      const idx = exprFor(stmt.idx, bindings, null);
+      const exp = exprFor(stmt.expected, bindings, null);
+      const des = exprFor(stmt.desired, bindings, null);
+      lines.push(`${indent}let _cas_result = atomicCompareExchangeWeak(&${stmt.binding}[${idx}], ${exp}, ${des});`);
+      lines.push(`${indent}let ${stmt.oldValueVar} = _cas_result.old_value;`);
+      lines.push(`${indent}let ${stmt.exchangedVar} = select(0u, 1u, _cas_result.exchanged);`);
       break;
     }
     case "return": {
@@ -591,6 +602,11 @@ function collectAllStmtNames(stmt: Statement, names: Set<string>): void {
       collectExprNames(stmt.idx, names);
       collectExprNames(stmt.value, names);
       break;
+    case "atomicCAS":
+      collectExprNames(stmt.idx, names);
+      collectExprNames(stmt.expected, names);
+      collectExprNames(stmt.desired, names);
+      break;
     // barrier, return, varArray: no IRNode expressions to collect
   }
 }
@@ -674,6 +690,11 @@ function getSharedReadsFromStmt(stmt: Statement): Set<string> {
     case "atomicOp":
       getSharedReadsFromExpr(stmt.idx, reads);
       getSharedReadsFromExpr(stmt.value, reads);
+      break;
+    case "atomicCAS":
+      getSharedReadsFromExpr(stmt.idx, reads);
+      getSharedReadsFromExpr(stmt.expected, reads);
+      getSharedReadsFromExpr(stmt.desired, reads);
       break;
     case "forRange":
       getSharedReadsFromExpr(stmt.start, reads);
@@ -883,6 +904,10 @@ function collectModifiedNames(stmts: Statement[], names: Set<string>): void {
         break;
       case "var":
         names.add(stmt.name);
+        break;
+      case "atomicCAS":
+        names.add(stmt.oldValueVar);
+        names.add(stmt.exchangedVar);
         break;
       case "forRange":
         names.add(stmt.varName);

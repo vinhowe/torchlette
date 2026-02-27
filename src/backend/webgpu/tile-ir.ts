@@ -375,6 +375,7 @@ export type Statement =
   | GuardedStoreStmt
   | DirectStoreStmt
   | AtomicOpStmt
+  | AtomicCASStmt
   // Tile-level statements (lowered by tile compiler)
   | TileLoadStmt
   | DotStmt
@@ -490,7 +491,7 @@ export interface DirectStoreStmt {
   value: IRNode;
 }
 
-export type AtomicOp = "max" | "min" | "add" | "or" | "and";
+export type AtomicOp = "max" | "min" | "add" | "or" | "and" | "xor" | "exchange";
 
 export interface AtomicOpStmt {
   kind: "atomicOp";
@@ -498,6 +499,18 @@ export interface AtomicOpStmt {
   idx: IRNode;
   op: AtomicOp;
   value: IRNode;
+}
+
+export interface AtomicCASStmt {
+  kind: "atomicCAS";
+  binding: string;
+  idx: IRNode;
+  expected: IRNode;
+  desired: IRNode;
+  /** Variable name to store the old value. */
+  oldValueVar: string;
+  /** Variable name to store the exchanged flag (bool). */
+  exchangedVar: string;
 }
 
 // ============================================================================
@@ -1585,6 +1598,42 @@ export class KernelContext {
       op,
       value: val.node,
     });
+  }
+
+  /**
+   * Emit an atomic compare-and-swap.
+   * `atomicCompareExchangeWeak(&binding[idx], expected, desired)`
+   * Returns `{ oldValue: BlockExpr, exchanged: BlockExpr }`.
+   */
+  atomicCAS(
+    binding: string, idx: BlockExpr,
+    expected: BlockExpr, desired: BlockExpr,
+  ): { oldValue: BlockExpr; exchanged: BlockExpr } {
+    const id = this.reduceCounter++;
+    const oldVar = `_cas${id}_old`;
+    const exchVar = `_cas${id}_ok`;
+    this.pushStatement({
+      kind: "atomicCAS",
+      binding,
+      idx: idx.node,
+      expected: expected.node,
+      desired: desired.node,
+      oldValueVar: oldVar,
+      exchangedVar: exchVar,
+    });
+    // Return named refs so subsequent code can read the results
+    const oldNode = makeNode<NamedRefNode>({
+      kind: "namedRef", name: oldVar,
+      valueType: "scalar", dataType: "u32",
+    });
+    const exchNode = makeNode<NamedRefNode>({
+      kind: "namedRef", name: exchVar,
+      valueType: "scalar", dataType: "u32",
+    });
+    return {
+      oldValue: new BlockExpr(oldNode),
+      exchanged: new BlockExpr(exchNode),
+    };
   }
 
   /** Emit an unconditional scalar store: `binding[idx] = val;`. */
