@@ -1110,6 +1110,9 @@ export function hoistLoopInvariants(stmts: Statement[]): Statement[] {
             !exprContainsLoad(s.value)) {
           hoisted.push(s);
         } else {
+          // If a let is NOT hoisted, mark its name as variant so subsequent
+          // bindings that reference it won't be incorrectly hoisted either.
+          if (s.kind === "let") variantNames.add(s.name);
           remaining.push(s);
         }
       }

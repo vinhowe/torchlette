@@ -37,7 +37,7 @@ import { getArity } from "./ops/registry";
 /**
  * Apply a fused op to tile-IR BlockExpr inputs, producing a new BlockExpr.
  */
-function applyFusedOp(
+export function applyFusedOp(
   ctx: KernelContext,
   op: string,
   inputs: BlockExpr[],
