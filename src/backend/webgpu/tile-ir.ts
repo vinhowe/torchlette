@@ -176,6 +176,59 @@ export interface Vec4DotNode extends IRNodeBase {
   b: [IRNode, IRNode, IRNode, IRNode];
 }
 
+// -- Native vec4 nodes (for attention-style subgroup cooperative kernels) --
+
+/** vec4<f32>(x, y, z, w) — construct from 4 scalars */
+export interface Vec4ConstructNode extends IRNodeBase {
+  kind: "vec4Construct";
+  x: IRNode;
+  y: IRNode;
+  z: IRNode;
+  w: IRNode;
+}
+
+/** vec4<f32>(v) — splat scalar to all 4 lanes */
+export interface Vec4SplatNode extends IRNodeBase {
+  kind: "vec4Splat";
+  value: IRNode;
+}
+
+/** dot(a, b) where a and b are vec4<f32> — returns f32 */
+export interface Vec4NativeDotNode extends IRNodeBase {
+  kind: "vec4NativeDot";
+  a: IRNode;
+  b: IRNode;
+}
+
+/** v.x, v.y, v.z, v.w — extract component from vec4<f32> */
+export interface Vec4ComponentNode extends IRNodeBase {
+  kind: "vec4Component";
+  value: IRNode;
+  comp: 0 | 1 | 2 | 3;
+}
+
+/** vec4 binary: add, sub, mul between two vec4s, or vec4 * scalar */
+export interface Vec4BinaryNode extends IRNodeBase {
+  kind: "vec4Binary";
+  op: "add" | "sub" | "mul";
+  a: IRNode;
+  b: IRNode;
+}
+
+/** Read from a vec4 array: name[index] → vec4<f32> */
+export interface Vec4ArrayReadNode extends IRNodeBase {
+  kind: "vec4ArrayRead";
+  arrayName: string;
+  idx: IRNode;
+}
+
+/** Read from a vec4 shared array: name[index] → vec4<f32> */
+export interface Vec4SharedReadNode extends IRNodeBase {
+  kind: "vec4SharedRead";
+  arrayName: string;
+  idx: IRNode;
+}
+
 export type IRNode =
   | ProgramIdNode
   | UniformNode
@@ -199,7 +252,14 @@ export type IRNode =
   | SubgroupBroadcastFirstNode
   | SubgroupInclusiveAddNode
   | Vec4DotNode
-  | NumWorkgroupsNode;
+  | NumWorkgroupsNode
+  | Vec4ConstructNode
+  | Vec4SplatNode
+  | Vec4NativeDotNode
+  | Vec4ComponentNode
+  | Vec4BinaryNode
+  | Vec4ArrayReadNode
+  | Vec4SharedReadNode;
 
 // ============================================================================
 // Tile-Level IR Types (block-level, compiler-lowered)
@@ -400,6 +460,11 @@ export type Statement =
   | DirectStoreStmt
   | AtomicOpStmt
   | AtomicCASStmt
+  // Vec4 array statements
+  | Vec4VarArrayStmt
+  | Vec4SharedArrayStmt
+  | Vec4ArrayWriteStmt
+  | Vec4ArrayAddAssignStmt
   // Tile-level statements (lowered by tile compiler)
   | TileLoadStmt
   | DotStmt
@@ -537,6 +602,40 @@ export interface AtomicCASStmt {
   oldValueVar: string;
   /** Variable name to store the exchanged flag (bool). */
   exchangedVar: string;
+}
+
+// -- Vec4 array statement types --
+
+/** var name: array<vec4<f32>, size>; (register-space vec4 array) */
+export interface Vec4VarArrayStmt {
+  kind: "vec4VarArray";
+  name: string;
+  size: number;
+}
+
+/** var<workgroup> name: array<vec4<f32>, size>; */
+export interface Vec4SharedArrayStmt {
+  kind: "vec4SharedArray";
+  name: string;
+  size: number;
+}
+
+/** name[index] = value; where value is vec4<f32> */
+export interface Vec4ArrayWriteStmt {
+  kind: "vec4ArrayWrite";
+  arrayName: string;
+  idx: IRNode;
+  value: IRNode;
+  isShared: boolean;
+}
+
+/** name[index] += value; where value is vec4<f32> */
+export interface Vec4ArrayAddAssignStmt {
+  kind: "vec4ArrayAddAssign";
+  arrayName: string;
+  idx: IRNode;
+  value: IRNode;
+  isShared: boolean;
 }
 
 // ============================================================================
@@ -705,7 +804,12 @@ function cseKey(node: { kind: string;[key: string]: any }): string | null {
     case "localIndex": return "LI";
     case "globalId": return `GID:${node.dim}`;
     case "numWorkgroups": return `NWG:${node.dim}`;
-    default: return null; // Not CSE-eligible (loads, sharedRead, namedRef, etc.)
+    case "vec4Construct": return `V4C:${node.x.id}:${node.y.id}:${node.z.id}:${node.w.id}`;
+    case "vec4Splat":     return `V4S:${node.value.id}`;
+    case "vec4NativeDot": return `V4D:${node.a.id}:${node.b.id}`;
+    case "vec4Component": return `V4X:${node.value.id}:${node.comp}`;
+    case "vec4Binary":    return `V4B:${node.op}:${node.a.id}:${node.b.id}`;
+    default: return null; // Not CSE-eligible (loads, sharedRead, namedRef, vec4ArrayRead, etc.)
   }
 }
 
@@ -1102,7 +1206,7 @@ export class BlockExpr {
 
   // -- Subgroup ops --
   subgroupShuffleXor(mask: BlockExpr | number): BlockExpr {
-    const m = resolveArg(mask);
+    const m = resolveArgU32(mask);
     return new BlockExpr(makeNode<SubgroupShuffleXorNode>({
       kind: "subgroupShuffleXor", value: this.node, mask: m,
       valueType: this.node.valueType, dataType: this.node.dataType,
@@ -1134,6 +1238,56 @@ export class BlockExpr {
     return new BlockExpr(makeNode<SubgroupInclusiveAddNode>({
       kind: "subgroupInclusiveAdd", value: this.node,
       valueType: this.node.valueType, dataType: this.node.dataType,
+    }));
+  }
+
+  // -- Vec4 operations (for vec4-typed BlockExprs) --
+
+  /** dot(this, other) — both must be vec4<f32>. Returns f32 scalar. */
+  vec4Dot(other: BlockExpr): BlockExpr {
+    return new BlockExpr(makeNode<Vec4NativeDotNode>({
+      kind: "vec4NativeDot", a: this.node, b: other.node,
+      valueType: "scalar", dataType: "f32",
+    }));
+  }
+
+  /** Extract component from vec4: .x=0, .y=1, .z=2, .w=3. Returns f32 scalar. */
+  vec4Component(comp: 0 | 1 | 2 | 3): BlockExpr {
+    return new BlockExpr(makeNode<Vec4ComponentNode>({
+      kind: "vec4Component", value: this.node, comp,
+      valueType: "scalar", dataType: "f32",
+    }));
+  }
+
+  /** vec4 * scalar → vec4. */
+  vec4MulScalar(s: BlockExpr): BlockExpr {
+    return new BlockExpr(makeNode<Vec4BinaryNode>({
+      kind: "vec4Binary", op: "mul", a: this.node, b: s.node,
+      valueType: "scalar", dataType: "f32",
+    }));
+  }
+
+  /** vec4 + vec4 → vec4. */
+  vec4Add(other: BlockExpr): BlockExpr {
+    return new BlockExpr(makeNode<Vec4BinaryNode>({
+      kind: "vec4Binary", op: "add", a: this.node, b: other.node,
+      valueType: "scalar", dataType: "f32",
+    }));
+  }
+
+  /** vec4 - vec4 → vec4. */
+  vec4Sub(other: BlockExpr): BlockExpr {
+    return new BlockExpr(makeNode<Vec4BinaryNode>({
+      kind: "vec4Binary", op: "sub", a: this.node, b: other.node,
+      valueType: "scalar", dataType: "f32",
+    }));
+  }
+
+  /** vec4 * vec4 → vec4 (element-wise). */
+  vec4Mul(other: BlockExpr): BlockExpr {
+    return new BlockExpr(makeNode<Vec4BinaryNode>({
+      kind: "vec4Binary", op: "mul", a: this.node, b: other.node,
+      valueType: "scalar", dataType: "f32",
     }));
   }
 
@@ -1312,6 +1466,47 @@ export class ArrayVarHandle {
   }
 }
 
+/** Handle for a vec4 array (register or shared), returned by ctx.registerVec4Array() / ctx.sharedVec4Array(). */
+export class Vec4ArrayHandle {
+  constructor(
+    readonly name: string,
+    readonly size: number,
+    readonly isShared: boolean,
+    private readonly ctx: KernelContext,
+  ) {}
+
+  read(idx: BlockExpr): BlockExpr {
+    const nodeKind = this.isShared ? "vec4SharedRead" : "vec4ArrayRead";
+    return new BlockExpr(makeNode({
+      kind: nodeKind,
+      arrayName: this.name,
+      idx: idx.node,
+      valueType: "scalar" as ValueType,
+      dataType: "f32" as DataType,
+    } as any));
+  }
+
+  write(idx: BlockExpr, value: BlockExpr): void {
+    this.ctx.pushStatement({
+      kind: "vec4ArrayWrite",
+      arrayName: this.name,
+      idx: idx.node,
+      value: value.node,
+      isShared: this.isShared,
+    });
+  }
+
+  addAssign(idx: BlockExpr, value: BlockExpr): void {
+    this.ctx.pushStatement({
+      kind: "vec4ArrayAddAssign",
+      arrayName: this.name,
+      idx: idx.node,
+      value: value.node,
+      isShared: this.isShared,
+    });
+  }
+}
+
 // ============================================================================
 // Kernel Context
 // ============================================================================
@@ -1327,6 +1522,8 @@ export class KernelContext {
   readonly statements: Statement[] = [];
   /** Shared memory arrays declared by this kernel. */
   readonly sharedArrays: Array<{ name: string; size: number; elemType: DataType }> = [];
+  /** Vec4 shared memory arrays declared by this kernel. */
+  readonly vec4SharedArrays: Array<{ name: string; size: number }> = [];
   /** Binding specs from the kernel spec (for dataType resolution in load). */
   private readonly bindingSpecs: Record<string, BindingSpec>;
   /** Subgroup size (0 = no subgroup support). Set by compileTileKernel(). */
@@ -1482,6 +1679,36 @@ export class KernelContext {
       skipZeroInit,
     });
     return new ArrayVarHandle(name, elemType, size, this);
+  }
+
+  // ---- Vec4 array support ----
+
+  /** Declare a register-space vec4 array: `var name: array<vec4<f32>, size>;` */
+  registerVec4Array(name: string, size: number): Vec4ArrayHandle {
+    this.pushStatement({ kind: "vec4VarArray", name, size });
+    return new Vec4ArrayHandle(name, size, false, this);
+  }
+
+  /** Declare a workgroup shared vec4 array: `var<workgroup> name: array<vec4<f32>, size>;` */
+  sharedVec4Array(name: string, size: number): Vec4ArrayHandle {
+    this.vec4SharedArrays.push({ name, size });
+    return new Vec4ArrayHandle(name, size, true, this);
+  }
+
+  /** Construct vec4<f32>(x, y, z, w) from 4 scalar expressions. */
+  vec4(x: BlockExpr, y: BlockExpr, z: BlockExpr, w: BlockExpr): BlockExpr {
+    return new BlockExpr(makeNode<Vec4ConstructNode>({
+      kind: "vec4Construct", x: x.node, y: y.node, z: z.node, w: w.node,
+      valueType: "scalar", dataType: "f32",
+    }));
+  }
+
+  /** Construct vec4<f32>(v) — splat scalar to all 4 lanes. */
+  vec4Splat(v: BlockExpr): BlockExpr {
+    return new BlockExpr(makeNode<Vec4SplatNode>({
+      kind: "vec4Splat", value: v.node,
+      valueType: "scalar", dataType: "f32",
+    }));
   }
 
   /** Emit a for loop: `for (var v = start; v < bound; v++)`. */
