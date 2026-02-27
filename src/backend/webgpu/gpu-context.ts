@@ -27,6 +27,7 @@ import { resetLayerNormKernelState } from "./layernorm-kernel";
 import { resetCrossEntropyKernelState } from "./cross-entropy-kernel";
 import { resetMatmulState } from "./matmul";
 import { resetFusionCache } from "./fusion-dispatch";
+import { startPipelineRecording, stopPipelineRecording, warmupPipelines, clearWarmupCache } from "./pipeline-warmup";
 
 import { donateBuffer, getBufferSize } from "./buffer-arena";
 import { setSharedEncoderEnabled } from "./shared-encoder";
@@ -472,6 +473,7 @@ export function destroyWebGPU(): void {
   f16WeightCache.clear();
   clearBindGroupCache();
   resetAllKernelCaches();
+  clearWarmupCache();
   destroyProfilingFenceBuffer();
   gpuContext.device.destroy();
   gpuContext.pipelines.clear();
@@ -498,4 +500,34 @@ export function getMaxStorageBufferBindingSize(): number {
   const ctx = requireContext();
   const limits = ctx.device.limits;
   return limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+}
+
+// ============================================================================
+// Pipeline Warmup
+// ============================================================================
+
+/**
+ * Run fn() once (typically a full training step), recording all pipeline
+ * compilations. Then return the registry for future warmup.
+ *
+ * On the first call, pipelines compile synchronously as normal.
+ * Pass the returned registry to warmupPipelines() before step 0 on future runs.
+ */
+export async function warmupFromStep(
+  fn: () => void | Promise<void>,
+): Promise<Array<{ key: string; wgsl: string }>> {
+  startPipelineRecording();
+  await fn();
+  return stopPipelineRecording();
+}
+
+/**
+ * Pre-compile all pipelines from a registry in parallel.
+ * Convenience wrapper that calls warmupPipelines with the current device.
+ */
+export async function warmupFromRegistry(
+  entries: Array<{ key: string; wgsl: string }>,
+): Promise<{ compiled: number; skipped: number; timeMs: number }> {
+  const ctx = requireContext();
+  return warmupPipelines(ctx.device, entries);
 }

@@ -3,6 +3,7 @@
  */
 
 import { dispatchComputePass, getCurrentOpLabel, createParamsBuffer as sharedCreateParamsBuffer, releaseParamsBuffer, cachedCreateBindGroup, type RecordedDispatch } from "../index";
+import { recordPipeline, getWarmupPipeline } from "../pipeline-warmup";
 
 /** Module-level recording buffer (shared with index.ts recording system). */
 let matmulRecordingBuffer: RecordedDispatch[] | null = null;
@@ -470,9 +471,17 @@ function getOrCreatePipeline(
     return cached;
   }
 
+  // Check warmup cache (pre-compiled via createComputePipelineAsync)
+  const warmed = getWarmupPipeline(cacheKey);
+  if (warmed) {
+    pipelineCache.set(cacheKey, warmed);
+    return warmed;
+  }
+
   const shaderCode = USE_TILE_IR_MATMUL
     ? generateTiledMatmulShaderTileIR(options)
     : generateTiledMatmulShader(options);
+  recordPipeline(cacheKey, shaderCode);
   const module = device.createShaderModule({ code: shaderCode });
   const pipeline = device.createComputePipeline({
     layout: "auto",
@@ -659,9 +668,17 @@ function getOrCreateReductionPipeline(
   const cached = reductionPipelineCache.get(cacheKey);
   if (cached) return cached;
 
+  // Check warmup cache (pre-compiled via createComputePipelineAsync)
+  const warmed = getWarmupPipeline(cacheKey);
+  if (warmed) {
+    reductionPipelineCache.set(cacheKey, warmed);
+    return warmed;
+  }
+
   const shaderCode = USE_TILE_IR_MATMUL
     ? generateKSplitReductionShaderTileIR(kSplitCount, outputDtype)
     : generateKSplitReductionShader(kSplitCount, outputDtype);
+  recordPipeline(cacheKey, shaderCode);
   const module = device.createShaderModule({ code: shaderCode });
   const pipeline = device.createComputePipeline({
     layout: "auto",

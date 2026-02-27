@@ -37,8 +37,13 @@ export {
   initWebGPU, destroyWebGPU, syncWebGPU, getWebGPUDevice, isF16Supported,
   getWebGPUInitError, getMaxStorageBufferBindingSize, setF16WeightCacheEntry,
   evictF16WeightCacheEntry, f32ToF16, f16ToF32, f32ArrayToF16Array, f16ArrayToF32Array,
-  resetAllKernelCaches,
+  resetAllKernelCaches, warmupFromStep, warmupFromRegistry,
 } from "./gpu-context";
+
+export {
+  startPipelineRecording, stopPipelineRecording, warmupPipelines,
+  serializeRegistry, deserializeRegistry, clearWarmupCache,
+} from "./pipeline-warmup";
 
 export type { BatchExecutionContext } from "./shared-encoder";
 export {
