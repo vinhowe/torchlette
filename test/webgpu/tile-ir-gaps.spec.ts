@@ -2092,6 +2092,51 @@ describe("Triton Gap: atomicXor / atomicExchange / atomicCAS (WGSL)", () => {
   });
 });
 
+describe("Triton Gap: wgReduceGeneric (WGSL)", () => {
+  it("treeReduceGeneric with product generates multiplication", () => {
+    const spec: TileKernelSpec = {
+      name: "treeReduceProduct",
+      workgroupSize: 64,
+      bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+      uniforms: {},
+      grid: () => [1],
+      kernel: (ctx) => {
+        const tid = ctx.localIndex();
+        const smem = ctx.sharedArray("s", 64);
+        smem.write(tid, ctx.load("input", tid));
+        ctx.barrier();
+        ctx.treeReduceGeneric(smem, tid, 64, (a, b) => a.mul(b));
+        ctx.emitStore("output", ctx.u32(0), smem.read(ctx.u32(0)));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // Tree reduction with product should contain multiplication
+    expect(wgsl).toContain("*");
+  });
+
+  it("wgReduceGeneric with min produces min reduction", () => {
+    const spec: TileKernelSpec = {
+      name: "wgReduceMin",
+      workgroupSize: 64,
+      bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+      uniforms: {},
+      grid: () => [1],
+      kernel: (ctx) => {
+        const tid = ctx.localIndex();
+        const result = ctx.wgReduceGeneric(
+          tid, ctx.u32(64), 64,
+          ctx.f32(3.402823e+38), // +inf identity
+          (i) => ctx.load("input", i),
+          (a, b) => a.min(b),
+        );
+        ctx.emitStore("output", ctx.u32(0), result);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("min(");
+  });
+});
+
 // ============================================================================
 // GPU tests for Round 2 gaps
 // ============================================================================

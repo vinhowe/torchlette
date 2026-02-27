@@ -1518,6 +1518,41 @@ export class KernelContext {
     }
   }
 
+  /** Generic tree reduction with user-defined combine function. */
+  treeReduceGeneric(
+    smem: SharedArrayHandle, tid: BlockExpr, wgSize: number,
+    combine: (a: BlockExpr, b: BlockExpr) => BlockExpr,
+  ): void {
+    for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
+      this.ifThen(tid.lt(this.u32(stride)), () => {
+        smem.write(tid, combine(smem.read(tid), smem.read(tid.add(this.u32(stride)))));
+      });
+      this.barrier();
+    }
+  }
+
+  /**
+   * Generic workgroup-cooperative reduction with user-defined combine.
+   * Like `wgReduce` but takes a combine function and identity value.
+   */
+  wgReduceGeneric(
+    tid: BlockExpr, count: BlockExpr, wgSize: number,
+    identity: BlockExpr,
+    bodyFn: (i: BlockExpr) => BlockExpr,
+    combine: (a: BlockExpr, b: BlockExpr) => BlockExpr,
+  ): BlockExpr {
+    const id = this.reduceCounter++;
+    const smem = this.sharedArray(`_wgr${id}_s`, wgSize);
+    const acc = this.emitVar(`_wgr${id}_a`, "f32", identity);
+    this.stridedFor(tid, count, wgSize, (i) => {
+      acc.set(combine(acc.get(), bodyFn(i)));
+    });
+    smem.write(tid, acc.get());
+    this.barrier();
+    this.treeReduceGeneric(smem, tid, wgSize, combine);
+    return smem.read(this.u32(0));
+  }
+
   /** Strided loop: `for (var i = tid; i < bound; i += wgSize) { body(i); }` */
   stridedFor(
     tid: BlockExpr, bound: BlockExpr, wgSize: number,
