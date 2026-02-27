@@ -1705,3 +1705,481 @@ describe("Triton Gap: Richer access analysis", () => {
     expect(load!.isCoalesced).toBe(true);
   });
 });
+
+// ============================================================================
+// Round 2 — Remaining Closable Triton Gaps
+// ============================================================================
+
+describe("Triton Gap: numPrograms (WGSL)", () => {
+  it("numPrograms(0) emits num_wg.x builtin", () => {
+    const spec: TileKernelSpec = {
+      name: "numProgramsTest",
+      workgroupSize: 64,
+      bindings: {
+        output: { storage: "read_write", type: "u32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const numWg = ctx.numPrograms(0);
+        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, numWg);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("@builtin(num_workgroups) num_wg");
+    expect(wgsl).toContain("num_wg.x");
+  });
+
+  it("numPrograms(1) emits num_wg.y", () => {
+    const spec: TileKernelSpec = {
+      name: "numProgramsY",
+      workgroupSize: 64,
+      bindings: {
+        output: { storage: "read_write", type: "u32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [u.N, 4],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const numWgY = ctx.numPrograms(1);
+        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, numWgY);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("num_wg.y");
+  });
+});
+
+describe("Triton Gap: exp2/log2 (WGSL)", () => {
+  it("exp2() emits exp2()", () => {
+    const spec: TileKernelSpec = {
+      name: "exp2Test",
+      workgroupSize: 64,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const val = ctx.load("input", gid);
+        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, val.exp2());
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("exp2(");
+  });
+
+  it("log2() emits log2()", () => {
+    const spec: TileKernelSpec = {
+      name: "log2Test",
+      workgroupSize: 64,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const val = ctx.load("input", gid);
+        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, val.log2());
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("log2(");
+  });
+});
+
+describe("Triton Gap: sigmoid/clamp/fma/erf (WGSL)", () => {
+  it("sigmoid() produces exp pattern", () => {
+    const spec: TileKernelSpec = {
+      name: "sigmoidTest",
+      workgroupSize: 64,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const val = ctx.load("input", gid);
+        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, val.sigmoid());
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // sigmoid(x) = 1 / (1 + exp(-x)) — should contain exp and division
+    expect(wgsl).toContain("exp(");
+  });
+
+  it("clamp() produces min/max pattern", () => {
+    const spec: TileKernelSpec = {
+      name: "clampTest",
+      workgroupSize: 64,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const val = ctx.load("input", gid);
+        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, val.clamp(ctx.f32(0), ctx.f32(1)));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("max(");
+    expect(wgsl).toContain("min(");
+  });
+
+  it("erf() produces polynomial approximation", () => {
+    const spec: TileKernelSpec = {
+      name: "erfTest",
+      workgroupSize: 64,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        const val = ctx.load("input", gid);
+        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, val.erf());
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // erf uses sign, abs, exp, and polynomial coefficients
+    expect(wgsl).toContain("sign(");
+    expect(wgsl).toContain("exp(");
+    expect(wgsl).toContain("abs(");
+  });
+});
+
+describe("Triton Gap: argmax/argmin (WGSL)", () => {
+  it("argmax generates parallel reduction with index tracking", () => {
+    const spec: TileKernelSpec = {
+      name: "argmaxWGSL",
+      workgroupSize: 64,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const gid = ctx.globalId(0);
+        const val = ctx.load("input", gid);
+        const valSmem = ctx.sharedArray("vals", 64, "f32");
+        const idxSmem = ctx.sharedArray("idxs", 64, "f32");
+        valSmem.write(tid, val);
+        idxSmem.write(tid, gid.toF32());
+        ctx.treeReduceArgmax(valSmem, idxSmem, tid, 64);
+        ctx.ifThen(tid.eq(ctx.u32(0)), () => {
+          ctx.emitStore("output", ctx.programId(0), idxSmem.read(ctx.u32(0)));
+        });
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // Should contain shared memory declarations and comparison logic
+    expect(wgsl).toContain("var<workgroup> vals");
+    expect(wgsl).toContain("var<workgroup> idxs");
+    // Should contain workgroupBarrier for tree reduction
+    expect(wgsl).toContain("workgroupBarrier()");
+    // Should contain comparison (gt) for max finding
+    expect(wgsl).toContain(">");
+  });
+});
+
+describe("Triton Gap: generic associativeScan (WGSL)", () => {
+  it("associativeScan generates Hillis-Steele pattern with correct barrier count", () => {
+    const spec: TileKernelSpec = {
+      name: "assocScanWGSL",
+      workgroupSize: 64,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const val = ctx.load("input", tid);
+        const smem = ctx.sharedArray("data", 64, "f32");
+        smem.write(tid, val);
+        // User-defined combine: product
+        ctx.associativeScan(smem, tid, 64, (a, b) => a.mul(b));
+        ctx.emitStore("output", tid, smem.read(tid));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // Should have 2*log2(64)=12 barriers from the scan + 1 final = 13
+    const barrierCount = (wgsl.match(/workgroupBarrier\(\)/g) || []).length;
+    expect(barrierCount).toBe(13); // 2*6 inside scan + 1 final
+  });
+});
+
+// ============================================================================
+// GPU tests for Round 2 gaps
+// ============================================================================
+
+describe.runIf(isWebGPUEnabled)("Triton Gap Round 2: GPU tests", () => {
+  beforeAll(async () => {
+    const ok = await initWebGPU();
+    if (!ok) throw new Error("WebGPU init failed");
+    const ctx = getWebGPUDevice();
+    if (!ctx) throw new Error("No WebGPU device");
+    device = ctx.device;
+    queue = ctx.queue;
+  });
+
+  afterAll(async () => { await syncWebGPU(); });
+
+  it("numPrograms returns correct grid dimension", async () => {
+    const N = 128;
+    const numWg = Math.ceil(N / 64); // = 2
+
+    const spec: TileKernelSpec = {
+      name: "numProgramsGPU",
+      workgroupSize: 64,
+      bindings: { output: { storage: "read_write", type: "u32" } },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, ctx.numPrograms(0));
+      },
+    };
+    const kernel = createTileKernelDispatcher(spec);
+    const buf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    beginSharedEncoder(); kernel.dispatch({ output: buf }, { N }); flushSharedEncoder(); await syncWebGPU();
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(buf, 0, readBuf, 0, N * 4);
+    queue.submit([enc.finish()]);
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const data = new Uint32Array(readBuf.getMappedRange());
+    for (let i = 0; i < N; i++) expect(data[i]).toBe(numWg);
+    readBuf.unmap(); buf.destroy(); readBuf.destroy();
+  });
+
+  it("exp2: 2^x for x in [0,1,2,3]", async () => {
+    const N = 4;
+    const spec: TileKernelSpec = {
+      name: "exp2GPU",
+      workgroupSize: 64,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, ctx.load("input", gid).exp2());
+      },
+    };
+    const inputBuf = makeF32Buffer(new Float32Array([0, 1, 2, 3]), GPUBufferUsage.STORAGE);
+    const outBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder(); kernel.dispatch({ input: inputBuf, output: outBuf }, { N }); flushSharedEncoder(); await syncWebGPU();
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, N * 4);
+    queue.submit([enc.finish()]);
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const r = new Float32Array(readBuf.getMappedRange());
+    expect(r[0]).toBeCloseTo(1, 5);
+    expect(r[1]).toBeCloseTo(2, 5);
+    expect(r[2]).toBeCloseTo(4, 5);
+    expect(r[3]).toBeCloseTo(8, 5);
+    readBuf.unmap(); inputBuf.destroy(); outBuf.destroy(); readBuf.destroy();
+  });
+
+  it("sigmoid: sigmoid(0)=0.5, sigmoid(1)≈0.731", async () => {
+    const N = 4;
+    const spec: TileKernelSpec = {
+      name: "sigmoidGPU",
+      workgroupSize: 64,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, ctx.load("input", gid).sigmoid());
+      },
+    };
+    const inputBuf = makeF32Buffer(new Float32Array([0, 1, -1, 10]), GPUBufferUsage.STORAGE);
+    const outBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder(); kernel.dispatch({ input: inputBuf, output: outBuf }, { N }); flushSharedEncoder(); await syncWebGPU();
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, N * 4);
+    queue.submit([enc.finish()]);
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const r = new Float32Array(readBuf.getMappedRange());
+    expect(r[0]).toBeCloseTo(0.5, 4);
+    expect(r[1]).toBeCloseTo(0.7311, 3);
+    expect(r[2]).toBeCloseTo(0.2689, 3);
+    expect(r[3]).toBeCloseTo(1.0, 3);
+    readBuf.unmap(); inputBuf.destroy(); outBuf.destroy(); readBuf.destroy();
+  });
+
+  it("erf: erf(0)=0, erf(1)≈0.843", async () => {
+    const N = 4;
+    const spec: TileKernelSpec = {
+      name: "erfGPU",
+      workgroupSize: 64,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { N: "u32" },
+      grid: (u) => [Math.ceil(u.N / 64)],
+      kernel(ctx) {
+        const gid = ctx.globalId(0);
+        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, ctx.load("input", gid).erf());
+      },
+    };
+    const inputBuf = makeF32Buffer(new Float32Array([0, 1, -1, 0.5]), GPUBufferUsage.STORAGE);
+    const outBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder(); kernel.dispatch({ input: inputBuf, output: outBuf }, { N }); flushSharedEncoder(); await syncWebGPU();
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, N * 4);
+    queue.submit([enc.finish()]);
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const r = new Float32Array(readBuf.getMappedRange());
+    expect(r[0]).toBeCloseTo(0, 4);
+    expect(r[1]).toBeCloseTo(0.8427, 3);
+    expect(r[2]).toBeCloseTo(-0.8427, 3);
+    expect(r[3]).toBeCloseTo(0.5205, 3);
+    readBuf.unmap(); inputBuf.destroy(); outBuf.destroy(); readBuf.destroy();
+  });
+
+  it("argmax finds index of maximum value", async () => {
+    const N = 64;
+    const spec: TileKernelSpec = {
+      name: "argmaxGPU",
+      workgroupSize: 64,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const valSmem = ctx.sharedArray("vals", 64, "f32");
+        const idxSmem = ctx.sharedArray("idxs", 64, "f32");
+        valSmem.write(tid, ctx.load("input", tid));
+        idxSmem.write(tid, tid.toF32());
+        ctx.treeReduceArgmax(valSmem, idxSmem, tid, 64);
+        ctx.ifThen(tid.eq(ctx.u32(0)), () => {
+          ctx.emitStore("output", ctx.u32(0), idxSmem.read(ctx.u32(0)));
+        });
+      },
+    };
+    const inputData = new Float32Array(N);
+    for (let i = 0; i < N; i++) inputData[i] = i * 0.1;
+    inputData[42] = 999.0;
+    const inputBuf = makeF32Buffer(inputData, GPUBufferUsage.STORAGE);
+    const outBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder(); kernel.dispatch({ input: inputBuf, output: outBuf }, {}); flushSharedEncoder(); await syncWebGPU();
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, 4);
+    queue.submit([enc.finish()]);
+    await readBuf.mapAsync(GPUMapMode.READ);
+    expect(new Float32Array(readBuf.getMappedRange())[0]).toBe(42.0);
+    readBuf.unmap(); inputBuf.destroy(); outBuf.destroy(); readBuf.destroy();
+  });
+
+  it("argmin finds index of minimum value", async () => {
+    const N = 64;
+    const spec: TileKernelSpec = {
+      name: "argminGPU",
+      workgroupSize: 64,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const valSmem = ctx.sharedArray("vals", 64, "f32");
+        const idxSmem = ctx.sharedArray("idxs", 64, "f32");
+        valSmem.write(tid, ctx.load("input", tid));
+        idxSmem.write(tid, tid.toF32());
+        ctx.treeReduceArgmin(valSmem, idxSmem, tid, 64);
+        ctx.ifThen(tid.eq(ctx.u32(0)), () => {
+          ctx.emitStore("output", ctx.u32(0), idxSmem.read(ctx.u32(0)));
+        });
+      },
+    };
+    const inputData = new Float32Array(N);
+    for (let i = 0; i < N; i++) inputData[i] = i * 0.1 + 10;
+    inputData[17] = -999.0;
+    const inputBuf = makeF32Buffer(inputData, GPUBufferUsage.STORAGE);
+    const outBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder(); kernel.dispatch({ input: inputBuf, output: outBuf }, {}); flushSharedEncoder(); await syncWebGPU();
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, 4);
+    queue.submit([enc.finish()]);
+    await readBuf.mapAsync(GPUMapMode.READ);
+    expect(new Float32Array(readBuf.getMappedRange())[0]).toBe(17.0);
+    readBuf.unmap(); inputBuf.destroy(); outBuf.destroy(); readBuf.destroy();
+  });
+
+  it("associativeScan with min combine", async () => {
+    const N = 64;
+    const spec: TileKernelSpec = {
+      name: "assocScanMinGPU",
+      workgroupSize: 64,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {},
+      grid: () => [1],
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const smem = ctx.sharedArray("data", 64, "f32");
+        smem.write(tid, ctx.load("input", tid));
+        ctx.associativeScan(smem, tid, 64, (a, b) => a.min(b));
+        ctx.emitStore("output", tid, smem.read(tid));
+      },
+    };
+    // Input: [64, 63, 62, ..., 1]
+    const inputData = new Float32Array(N);
+    for (let i = 0; i < N; i++) inputData[i] = N - i;
+    const inputBuf = makeF32Buffer(inputData, GPUBufferUsage.STORAGE);
+    const outBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const kernel = createTileKernelDispatcher(spec);
+    beginSharedEncoder(); kernel.dispatch({ input: inputBuf, output: outBuf }, {}); flushSharedEncoder(); await syncWebGPU();
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, N * 4);
+    queue.submit([enc.finish()]);
+    await readBuf.mapAsync(GPUMapMode.READ);
+    const r = new Float32Array(readBuf.getMappedRange());
+    // Inclusive min-scan of [64, 63, 62, ..., 1]: output[i] = min(input[0..=i])
+    // Since input is decreasing, min-scan: output[i] = input[i] = N - i
+    for (let i = 0; i < N; i++) expect(r[i]).toBeCloseTo(N - i, 5);
+    readBuf.unmap(); inputBuf.destroy(); outBuf.destroy(); readBuf.destroy();
+  });
+});

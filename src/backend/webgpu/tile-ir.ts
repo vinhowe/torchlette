@@ -33,7 +33,7 @@
 export type ValueType = "block" | "scalar";
 export type DataType = "f32" | "f16" | "u32" | "i32";
 export type BinaryOp = "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "shr" | "shl" | "min" | "max" | "pow";
-export type UnaryOp = "rsqrt" | "exp" | "log" | "abs" | "neg" | "sqrt" | "tanh" | "floor" | "ceil" | "not" | "sin" | "cos" | "round" | "sign";
+export type UnaryOp = "rsqrt" | "exp" | "log" | "abs" | "neg" | "sqrt" | "tanh" | "floor" | "ceil" | "not" | "sin" | "cos" | "round" | "sign" | "exp2" | "log2";
 export type CmpOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
 
 export interface IRNodeBase {
@@ -137,6 +137,12 @@ export interface GlobalIdNode extends IRNodeBase {
   dim: number; // 0=x, 1=y, 2=z
 }
 
+/** Number of workgroups dispatched in a given dimension (like Triton's `tl.num_programs`). */
+export interface NumWorkgroupsNode extends IRNodeBase {
+  kind: "numWorkgroups";
+  dim: number; // 0=x, 1=y, 2=z
+}
+
 export interface SubgroupShuffleXorNode extends IRNodeBase {
   kind: "subgroupShuffleXor";
   value: IRNode;
@@ -168,7 +174,8 @@ export type IRNode =
   | ArrayReadNode
   | GlobalIdNode
   | SubgroupShuffleXorNode
-  | Vec4DotNode;
+  | Vec4DotNode
+  | NumWorkgroupsNode;
 
 // ============================================================================
 // Tile-Level IR Types (block-level, compiler-lowered)
@@ -542,6 +549,8 @@ function evalUnaryConst(op: UnaryOp, x: number): number | null {
     case "round": return Math.round(x);
     case "sign":  return Math.sign(x);
     case "not":   return x ? 0 : 1;
+    case "exp2":  { const r = Math.pow(2, x); return isFinite(r) ? r : null; }
+    case "log2":  return x > 0 ? Math.log2(x) : null;
     default: return null;
   }
 }
@@ -651,6 +660,7 @@ function cseKey(node: { kind: string;[key: string]: any }): string | null {
     case "threadIdx": return `TID:${node.dim}`;
     case "localIndex": return "LI";
     case "globalId": return `GID:${node.dim}`;
+    case "numWorkgroups": return `NWG:${node.dim}`;
     default: return null; // Not CSE-eligible (loads, sharedRead, namedRef, etc.)
   }
 }
@@ -908,6 +918,58 @@ export class BlockExpr {
       kind: "unary", op: "sign", input: this.node,
       valueType: this.node.valueType, dataType: this.node.dataType,
     }));
+  }
+
+  exp2(): BlockExpr {
+    return new BlockExpr(makeNode<UnaryNode>({
+      kind: "unary", op: "exp2", input: this.node,
+      valueType: this.node.valueType, dataType: "f32",
+    }));
+  }
+
+  log2(): BlockExpr {
+    return new BlockExpr(makeNode<UnaryNode>({
+      kind: "unary", op: "log2", input: this.node,
+      valueType: this.node.valueType, dataType: "f32",
+    }));
+  }
+
+  /** Sigmoid activation: 1 / (1 + exp(-x)). Compound — no new IR node. */
+  sigmoid(): BlockExpr {
+    const one = new BlockExpr(makeNode<ConstNode>({
+      kind: "const", value: 1.0, valueType: "scalar", dataType: "f32",
+    }));
+    return one.div(one.add(this.neg().exp()));
+  }
+
+  /** Clamp x to [lo, hi]. Compound — uses max(lo, min(x, hi)). */
+  clamp(lo: BlockExpr | number, hi: BlockExpr | number): BlockExpr {
+    return this.max(lo).min(hi);
+  }
+
+  /** Fused multiply-add: this * b + c. Compound — GPU will fuse automatically. */
+  fma(b: BlockExpr | number, c: BlockExpr | number): BlockExpr {
+    return this.mul(b).add(c);
+  }
+
+  /** Approximate erf(x) using Abramowitz & Stegun (max error ~1.5e-7). Compound. */
+  erf(): BlockExpr {
+    // erf(x) = sign(x) * (1 - poly(t) * exp(-x²))
+    // where t = 1/(1 + p*|x|), poly = a1*t + a2*t² + a3*t³ + a4*t⁴ + a5*t⁵
+    const mkOne = () => new BlockExpr(makeNode<ConstNode>({
+      kind: "const", value: 1.0, valueType: "scalar", dataType: "f32",
+    }));
+    const signX = this.sign();
+    const absX = this.abs();
+    const t = mkOne().div(mkOne().add(absX.mul(0.3275911)));
+    // Horner: ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
+    const inner = t.mul(1.061405429).add(-1.453152027)
+      .mul(t).add(1.421413741)
+      .mul(t).add(-0.284496736)
+      .mul(t).add(0.254829592);
+    const poly = inner.mul(t);
+    const expTerm = absX.neg().mul(absX).exp(); // exp(-x²)
+    return signX.mul(mkOne().sub(poly.mul(expTerm)));
   }
 
   pow(other: BlockExpr | number): BlockExpr {
@@ -1192,6 +1254,14 @@ export class KernelContext {
   programId(dim: number): BlockExpr {
     return new BlockExpr(this.trackNode(makeNode<ProgramIdNode>({
       kind: "programId", dim,
+      valueType: "scalar", dataType: "u32",
+    })));
+  }
+
+  /** Number of workgroups dispatched in given dimension (like Triton's `tl.num_programs`). */
+  numPrograms(dim: number): BlockExpr {
+    return new BlockExpr(this.trackNode(makeNode<NumWorkgroupsNode>({
+      kind: "numWorkgroups", dim,
       valueType: "scalar", dataType: "u32",
     })));
   }
@@ -1564,6 +1634,79 @@ export class KernelContext {
     this.barrier();
     // Suppress unused variable warning — inclusive was read before barrier
     void inclusive;
+  }
+
+  // -- Generic associative scan (like `tl.associative_scan`) --
+
+  /** Hillis-Steele inclusive scan with a user-defined associative combine function.
+   *  After the call, smem[tid] = combine(smem[0], combine(smem[1], ...smem[tid])).
+   *  `combine(a, b)` must be associative. */
+  associativeScan(
+    smem: SharedArrayHandle,
+    tid: BlockExpr,
+    wgSize: number,
+    combine: (a: BlockExpr, b: BlockExpr) => BlockExpr,
+  ): void {
+    for (let stride = 1; stride < wgSize; stride *= 2) {
+      this.barrier();
+      // All threads read their values into registers before any writes
+      const curr = this.emitLet(`scan_c_${stride}`, smem.read(tid));
+      const prev = this.emitLet(`scan_p_${stride}`, smem.read(tid.sub(this.u32(stride))));
+      const merged = combine(prev, curr);
+      this.barrier(); // ensure all reads complete before writes
+      this.ifThen(tid.ge(this.u32(stride)), () => {
+        smem.write(tid, merged);
+      });
+    }
+    this.barrier();
+  }
+
+  // -- Argmax / Argmin reductions --
+
+  /** Tree reduction finding the index of the maximum value.
+   *  `valSmem[tid]` holds values, `idxSmem[tid]` holds corresponding indices.
+   *  After the call, `valSmem[0]` = max value, `idxSmem[0]` = its index. */
+  treeReduceArgmax(
+    valSmem: SharedArrayHandle,
+    idxSmem: SharedArrayHandle,
+    tid: BlockExpr,
+    wgSize: number,
+  ): void {
+    for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
+      this.barrier();
+      this.ifThen(tid.lt(this.u32(stride)), () => {
+        const myVal = this.emitLet(`argmax_my_${stride}`, valSmem.read(tid));
+        const otherVal = this.emitLet(`argmax_other_${stride}`, valSmem.read(tid.add(this.u32(stride))));
+        const myIdx = this.emitLet(`argmax_myidx_${stride}`, idxSmem.read(tid));
+        const otherIdx = this.emitLet(`argmax_otheridx_${stride}`, idxSmem.read(tid.add(this.u32(stride))));
+        const cond = otherVal.gt(myVal);
+        valSmem.write(tid, cond.select(otherVal, myVal));
+        idxSmem.write(tid, cond.select(otherIdx, myIdx));
+      });
+    }
+  }
+
+  /** Tree reduction finding the index of the minimum value.
+   *  `valSmem[tid]` holds values, `idxSmem[tid]` holds corresponding indices.
+   *  After the call, `valSmem[0]` = min value, `idxSmem[0]` = its index. */
+  treeReduceArgmin(
+    valSmem: SharedArrayHandle,
+    idxSmem: SharedArrayHandle,
+    tid: BlockExpr,
+    wgSize: number,
+  ): void {
+    for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
+      this.barrier();
+      this.ifThen(tid.lt(this.u32(stride)), () => {
+        const myVal = this.emitLet(`argmin_my_${stride}`, valSmem.read(tid));
+        const otherVal = this.emitLet(`argmin_other_${stride}`, valSmem.read(tid.add(this.u32(stride))));
+        const myIdx = this.emitLet(`argmin_myidx_${stride}`, idxSmem.read(tid));
+        const otherIdx = this.emitLet(`argmin_otheridx_${stride}`, idxSmem.read(tid.add(this.u32(stride))));
+        const cond = otherVal.lt(myVal);
+        valSmem.write(tid, cond.select(otherVal, myVal));
+        idxSmem.write(tid, cond.select(otherIdx, myIdx));
+      });
+    }
   }
 }
 
