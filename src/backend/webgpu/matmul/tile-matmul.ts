@@ -8,7 +8,7 @@
  * The dispatch infrastructure is unchanged — we just swap the WGSL generation.
  */
 
-import { type TileKernelSpec, type DataType, type BlockExpr, type KernelContext, ceilDivGrid } from "../tile-ir";
+import { type TileKernelSpec, type DataType, type BlockExpr, type KernelContext, ceilDivGrid, singleWorkgroup } from "../tile-ir";
 import type { CodegenOptions } from "./codegen";
 import { getWorkgroupSize, type DType } from "./types";
 import { TileOps, BlockOps, Block, TileRange, buildPtr, buildMask, type TileConfig } from "../tile-ops";
@@ -93,7 +93,7 @@ export function createTiledMatmulKernel(options: CodegenOptions): TileKernelSpec
       batchSize: "u32",
       batchStrideA: "u32", batchStrideB: "u32", batchStrideC: "u32",
     },
-    grid: () => [1],
+    grid: singleWorkgroup(), // Actual grid computed at dispatch time in dispatch.ts
 
     kernel: useBlockOps
       ? (ctx) => matmulKernelBlockOps(ctx, { batched, kSplit }, params, blockOpsPostAcc)

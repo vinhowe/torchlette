@@ -33,6 +33,7 @@ import { GPUBufferUsage, GPUMapMode } from "./gpu-types";
 import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 import { compileTileKernel } from "./tile-compiler";
 import type { TileKernelSpec } from "./tile-ir";
+import { singleWorkgroup } from "./tile-ir";
 
 const USE_TILE_IR_UNSCALE = process.env.TORCHLETTE_TILE_UNSCALE !== "0";
 
@@ -109,7 +110,7 @@ function makeUnscaleSpec(use2D: boolean, gridSizeX: number): TileKernelSpec {
       _pad1: "u32",
     },
     uniformBindingIndex: 3,
-    grid: (u) => [1], // Grid handled by dispatchUnscaleGrad
+    grid: singleWorkgroup(), // Actual grid handled by dispatchUnscaleGrad
     kernel(ctx) {
       let idx;
       if (use2D) {

@@ -2222,8 +2222,10 @@ export interface TileKernelSpec {
    *  between shared memory writes and subsequent reads. Opt-in to avoid
    *  double-barriering existing kernels with manual barriers. */
   autoBarriers?: boolean;
-  /** Compute grid dimensions from uniform values. */
-  grid: (uniforms: Record<string, number>) => [number] | [number, number] | [number, number, number];
+  /** Compute grid dimensions from uniform values.
+   *  If omitted, auto-inferred from uniforms: a u32 uniform named "size",
+   *  "total_elements", "num_elements", or "outSize" triggers elementwiseGrid. */
+  grid?: GridFn;
   /** The kernel function that builds the IR DAG. */
   kernel: (ctx: KernelContext) => void;
 }
@@ -2234,7 +2236,7 @@ export interface TileKernelSpec {
 
 const MAX_WG_PER_DIM = 65535;
 
-type GridFn = TileKernelSpec["grid"];
+export type GridFn = (uniforms: Record<string, number>) => [number] | [number, number] | [number, number, number];
 
 /**
  * Grid for 1-thread-per-element kernels with optional vectorization
@@ -2263,6 +2265,82 @@ export function perRowGrid(rowUniform?: string): GridFn {
 export function ceilDivGrid(divisor: number, elementUniform?: string): GridFn {
   const name = elementUniform ?? "total_elements";
   return (u) => [Math.ceil(u[name] / divisor)];
+}
+
+/** Grid that dispatches a single workgroup. */
+export function singleWorkgroup(): GridFn {
+  return () => [1];
+}
+
+/**
+ * Tiled grid for multi-dimensional dispatch (e.g. attention, batched ops).
+ * Each dimension is either:
+ * - `{ uniform: string, tileSize: number }` — ceil(uniform / tileSize) workgroups
+ * - `string` — raw uniform value (1 workgroup per unit, e.g. num_heads, batch_size)
+ *
+ * Example: `tiledGrid({ x: { uniform: "seq_len", tileSize: 16 }, y: "num_heads", z: "batch_size" })`
+ * → `(u) => [ceil(seq_len/16), num_heads, batch_size]`
+ */
+export function tiledGrid(dims: {
+  x: string | { uniform: string; tileSize: number };
+  y?: string | { uniform: string; tileSize: number };
+  z?: string | { uniform: string; tileSize: number };
+}): GridFn {
+  function resolve(dim: string | { uniform: string; tileSize: number }, u: Record<string, number>): number {
+    if (typeof dim === "string") return u[dim];
+    return Math.ceil(u[dim.uniform] / dim.tileSize);
+  }
+  return (u) => {
+    const x = resolve(dims.x, u);
+    if (dims.z !== undefined) return [x, resolve(dims.y!, u), resolve(dims.z, u)];
+    if (dims.y !== undefined) return [x, resolve(dims.y, u)];
+    return [x];
+  };
+}
+
+/**
+ * Flat 1D grid from the product of multiple uniforms.
+ * Example: `productGrid("batch_size", "num_heads", "seq_len")`
+ * → `(u) => [batch_size * num_heads * seq_len]`
+ */
+export function productGrid(...uniformNames: string[]): GridFn {
+  return (u) => {
+    let total = 1;
+    for (const name of uniformNames) total *= u[name];
+    return [total];
+  };
+}
+
+// Well-known elementwise uniform names for auto-inference
+const ELEMENTWISE_UNIFORM_NAMES = new Set([
+  "size", "total_elements", "num_elements", "outSize",
+]);
+
+/**
+ * Infer a grid function from the spec's uniform declarations.
+ * Returns null if no auto-inference pattern matches.
+ */
+export function inferGrid(spec: TileKernelSpec): GridFn | null {
+  const wgSize = typeof spec.workgroupSize === "number"
+    ? spec.workgroupSize : spec.workgroupSize[0] * spec.workgroupSize[1];
+  for (const [name, type] of Object.entries(spec.uniforms)) {
+    if (type === "u32" && ELEMENTWISE_UNIFORM_NAMES.has(name)) {
+      return elementwiseGrid(wgSize, { elementUniform: name });
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve the grid function for a spec: use explicit grid, fall back to inference.
+ * Throws if neither explicit nor inferred grid is available.
+ */
+export function resolveGrid(spec: TileKernelSpec): GridFn {
+  if (spec.grid) return spec.grid;
+  const inferred = inferGrid(spec);
+  if (inferred) return inferred;
+  throw new Error(`tile-ir: no grid function for kernel "${spec.name}" and no auto-inference matched. ` +
+    `Add an explicit \`grid\` or use a well-known uniform name (${[...ELEMENTWISE_UNIFORM_NAMES].join(", ")}).`);
 }
 
 // ============================================================================
