@@ -2038,6 +2038,60 @@ describe("Triton Gap: cdiv / floorDiv (WGSL)", () => {
   });
 });
 
+describe("Triton Gap: atomicXor / atomicExchange / atomicCAS (WGSL)", () => {
+  it("atomicXor emits atomicXor WGSL", () => {
+    const spec: TileKernelSpec = {
+      name: "atomicXorTest",
+      workgroupSize: 64,
+      bindings: { flags: { storage: "atomic", type: "u32" } },
+      uniforms: {},
+      grid: () => [1],
+      kernel: (ctx) => {
+        const tid = ctx.localIndex();
+        ctx.atomicOp("flags", ctx.u32(0), "xor", tid);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("atomicXor");
+  });
+
+  it("atomicExchange emits atomicExchange WGSL", () => {
+    const spec: TileKernelSpec = {
+      name: "atomicExchTest",
+      workgroupSize: 64,
+      bindings: { flags: { storage: "atomic", type: "u32" } },
+      uniforms: {},
+      grid: () => [1],
+      kernel: (ctx) => {
+        const tid = ctx.localIndex();
+        ctx.atomicOp("flags", ctx.u32(0), "exchange", tid);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("atomicExchange");
+  });
+
+  it("atomicCAS emits atomicCompareExchangeWeak WGSL", () => {
+    const spec: TileKernelSpec = {
+      name: "atomicCASTest",
+      workgroupSize: 64,
+      bindings: { flags: { storage: "atomic", type: "u32" } },
+      uniforms: {},
+      grid: () => [1],
+      kernel: (ctx) => {
+        const tid = ctx.localIndex();
+        const result = ctx.atomicCAS("flags", ctx.u32(0), ctx.u32(0), tid);
+        // Use result to ensure it's not DCE'd
+        ctx.atomicOp("flags", ctx.u32(1), "add", result.oldValue);
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("atomicCompareExchangeWeak");
+    expect(wgsl).toContain(".old_value");
+    expect(wgsl).toContain(".exchanged");
+  });
+});
+
 // ============================================================================
 // GPU tests for Round 2 gaps
 // ============================================================================
