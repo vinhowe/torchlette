@@ -967,6 +967,17 @@ export class BlockExpr {
     return this.mul(b).add(c);
   }
 
+  /** Ceiling division: cdiv(a, b) = (a + b - 1) / b. Compound. */
+  cdiv(other: BlockExpr | number): BlockExpr {
+    const b = typeof other === "number" ? new BlockExpr(resolveArg(other)) : other;
+    return this.add(b.sub(1)).div(b);
+  }
+
+  /** Floor division (truncated toward negative infinity). For unsigned, same as div. Compound. */
+  floorDiv(other: BlockExpr | number): BlockExpr {
+    return this.div(other).floor();
+  }
+
   /** Approximate erf(x) using Abramowitz & Stegun (max error ~1.5e-7). Compound. */
   erf(): BlockExpr {
     // erf(x) = sign(x) * (1 - poly(t) * exp(-x²))
