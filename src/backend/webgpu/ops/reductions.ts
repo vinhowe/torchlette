@@ -1,16 +1,18 @@
 /**
  * Reduction ops: sum, max, mean, and supporting helpers.
- * Extracted from index.ts — purely structural refactoring.
+ *
+ * All WGSL shaders are generated via tile-IR (reduction-tile-ir.ts).
+ * This file handles shape analysis, contiguity, buffer allocation,
+ * and dispatching through the tile-IR pipeline.
  */
 
 import { normalizeDim, type BackendTensor, type SumOptions, type MeanOptions, type MaxOptions } from "../../types";
 import { sizeOf } from "../../../core/shape";
 import type { GPUBuffer, WebGPUTensor, WebGPUContext } from "../gpu-types";
-import { GPUBufferUsage, GPUMapMode, asGPUTensor } from "../gpu-types";
+import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import {
   dtypeBytes,
   alignBufferSize,
-  compute2DDispatch,
   WORKGROUP_SIZE,
 } from "../shape-utils";
 import { requireContext } from "../gpu-context";
@@ -23,18 +25,26 @@ import {
   profiledCreateBindGroup,
   createParamsBuffer,
   releaseParamsBuffer,
-  createUniformBuffer,
-  releaseUniformBuffer,
   params2,
 } from "../bind-group-cache";
-import { profileApiCall } from "../profiler";
-import {
-  sharedEncoder as sharedEncoderFlag,
-  flushSharedEncoder,
-  incrementSubmitCount,
-} from "../shared-encoder";
-import { getExpr as getExprFromRegistry, isUnaryOp as isUnaryOpFromRegistry } from "./registry";
+import { isUnaryOp as isUnaryOpFromRegistry } from "./registry";
 import { contiguous } from "./views";
+import { createTileKernelDispatcher } from "../tile-dispatch";
+import {
+  makeSumDimSpec,
+  makeSumFullSpec,
+  makeMaxDimSpec,
+  makeMaxFullSpec,
+  makeMeanDivSpec,
+  makeSumDimWithPreambleSpec,
+  makeSumFullWithPreambleSpec,
+  getChunkedSumWGSL,
+  getFinalSumWGSL,
+} from "../reduction-tile-ir";
+
+// ============================================================================
+// Shared Metadata
+// ============================================================================
 
 /**
  * Compute strides, reduction size, and input→output dimension mapping
@@ -85,8 +95,8 @@ function buildReductionMetadata(
 }
 
 /**
- * Shared preamble for dim-wise reductions (sum, max, sumDimWithPreamble).
- * Normalizes dims, computes outShape, outSize, metadata, and WGSL array strings.
+ * Shared preamble for dim-wise reductions.
+ * Normalizes dims, computes outShape, outSize, metadata.
  * Returns null if all dims are reduced (caller should use full-reduction path).
  */
 interface DimReductionSetup {
@@ -98,12 +108,6 @@ interface DimReductionSetup {
   inputStrides: number[];
   outStrides: number[];
   inputToOutDim: number[];
-  inputShapeArray: string;
-  inputStridesArray: string;
-  outShapeArray: string;
-  outStridesArray: string;
-  reduceDimsArray: string;
-  inputToOutDimArray: string;
 }
 
 function prepareDimReduction(
@@ -130,22 +134,38 @@ function prepareDimReduction(
   const { inputStrides, outStrides, reductionSize, inputToOutDim } =
     buildReductionMetadata(inputShape, normalizedDims, outShape, keepdim);
 
-  const inputShapeArray = `array<u32, ${rank}>(${inputShape.map((s) => `${s}u`).join(", ")})`;
-  const inputStridesArray = `array<u32, ${rank}>(${inputStrides.map((s) => `${s}u`).join(", ")})`;
-  const outShapeArray = outShape.length > 0
-    ? `array<u32, ${outShape.length}>(${outShape.map((s) => `${s}u`).join(", ")})` : "";
-  const outStridesArray = outStrides.length > 0
-    ? `array<u32, ${outStrides.length}>(${outStrides.map((s) => `${s}u`).join(", ")})` : "";
-  const reduceDimsArray = `array<u32, ${normalizedDims.length}>(${normalizedDims.map((d) => `${d}u`).join(", ")})`;
-  const inputToOutDimArray = `array<i32, ${rank}>(${inputToOutDim.map((d) => `${d}i`).join(", ")})`;
-
   return {
     normalizedDims, rank, outShape, outSize, reductionSize,
     inputStrides, outStrides, inputToOutDim,
-    inputShapeArray, inputStridesArray, outShapeArray, outStridesArray,
-    reduceDimsArray, inputToOutDimArray,
   };
 }
+
+// ============================================================================
+// Cached dispatchers for shape-independent kernels
+// ============================================================================
+
+let sumFullDispatcher: ReturnType<typeof createTileKernelDispatcher> | null = null;
+let maxFullDispatcher: ReturnType<typeof createTileKernelDispatcher> | null = null;
+let meanDivDispatcher: ReturnType<typeof createTileKernelDispatcher> | null = null;
+
+function getSumFullDispatcher() {
+  if (!sumFullDispatcher) sumFullDispatcher = createTileKernelDispatcher(makeSumFullSpec());
+  return sumFullDispatcher;
+}
+
+function getMaxFullDispatcher() {
+  if (!maxFullDispatcher) maxFullDispatcher = createTileKernelDispatcher(makeMaxFullSpec());
+  return maxFullDispatcher;
+}
+
+function getMeanDivDispatcher() {
+  if (!meanDivDispatcher) meanDivDispatcher = createTileKernelDispatcher(makeMeanDivSpec());
+  return meanDivDispatcher;
+}
+
+// ============================================================================
+// Sum
+// ============================================================================
 
 export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
   const ctx = requireContext();
@@ -160,19 +180,15 @@ export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
   }
 
   const inputShape = tensor.shape;
-
-  // Handle full reduction (no dim specified or dim is null)
   const dim = options?.dim;
   const keepdim = options?.keepdim ?? false;
 
   if (dim === undefined || dim === null) {
-    // Full reduction - returns 0-d tensor (shape [])
     const result = sumFullReduction(ctx, tensor);
     if (contiguousCopy) contiguousCopy.destroy();
     return result;
   }
 
-  // Dimension-wise reduction
   const setup = prepareDimReduction(inputShape, dim, keepdim);
   if (!setup) {
     const result = sumFullReduction(ctx, tensor);
@@ -186,538 +202,28 @@ export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
     }
   }
 
-  const { normalizedDims, rank, outShape, outSize, reductionSize, outStrides,
-    inputShapeArray, inputStridesArray, outShapeArray, outStridesArray,
-    reduceDimsArray, inputToOutDimArray } = setup;
+  const { normalizedDims, outShape, outSize, reductionSize,
+    inputStrides, outStrides, inputToOutDim } = setup;
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
 
-  // Choose between parallel tree reduction (large reductionSize) and sequential (small)
-  const useParallelReduction = reductionSize > 64;
+  const useParallel = reductionSize > 64;
+  const spec = makeSumDimSpec(inputShape, inputStrides, normalizedDims,
+    outShape, outStrides, inputToOutDim, useParallel);
+  const dispatcher = createTileKernelDispatcher(spec);
 
-  // Common shader fragments for index computation
-  const shaderPreamble = `
-struct Params {
-  outSize: u32,
-  reductionSize: u32,
-};
-
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-const INPUT_RANK: u32 = ${rank}u;
-const OUT_RANK: u32 = ${outShape.length}u;
-const NUM_REDUCE_DIMS: u32 = ${normalizedDims.length}u;
-const inputShape = ${inputShapeArray};
-const inputStrides = ${inputStridesArray};
-${outShape.length > 0 ? `const outShape = ${outShapeArray};` : ""}
-${outStrides.length > 0 ? `const outStrides = ${outStridesArray};` : ""}
-const reduceDims = ${reduceDimsArray};
-const inputToOutDim = ${inputToOutDimArray};
-
-fn isReduceDim(d: u32) -> bool {
-  for (var i = 0u; i < NUM_REDUCE_DIMS; i = i + 1u) {
-    if (reduceDims[i] == d) {
-      return true;
-    }
-  }
-  return false;
-}
-
-fn getReduceDimIndex(d: u32) -> u32 {
-  for (var i = 0u; i < NUM_REDUCE_DIMS; i = i + 1u) {
-    if (reduceDims[i] == d) {
-      return i;
-    }
-  }
-  return 0u;
-}
-
-fn computeInputOffset(outIdx: u32, reduceIdx: u32) -> u32 {
-  // Convert output index to output coordinates
-  var outCoords: array<u32, ${Math.max(outShape.length, 1)}>;
-  ${
-    outShape.length > 0
-      ? `
-  var remaining = outIdx;
-  for (var d = 0u; d < OUT_RANK; d = d + 1u) {
-    outCoords[d] = remaining / outStrides[d];
-    remaining = remaining % outStrides[d];
-  }
-  `
-      : ""
-  }
-
-  // Convert reduceIdx to coordinates in reduced dimensions
-  var reduceCoords: array<u32, ${Math.max(normalizedDims.length, 1)}>;
-  var rRemaining = reduceIdx;
-  ${
-    normalizedDims.length > 0
-      ? normalizedDims
-          .map(
-            (_, i) => `
-  {
-    var rDimSize = 1u;
-    for (var j = ${i + 1}u; j < NUM_REDUCE_DIMS; j = j + 1u) {
-      rDimSize = rDimSize * inputShape[reduceDims[j]];
-    }
-    reduceCoords[${i}u] = rRemaining / rDimSize;
-    rRemaining = rRemaining % rDimSize;
-  }
-  `,
-          )
-          .join("")
-      : ""
-  }
-
-  // Build full input offset
-  var inputOffset = 0u;
-  for (var d = 0u; d < INPUT_RANK; d = d + 1u) {
-    var coord = 0u;
-    if (isReduceDim(d)) {
-      let rIdx = getReduceDimIndex(d);
-      coord = reduceCoords[rIdx];
-    } else {
-      let outD = inputToOutDim[d];
-      if (outD >= 0i) {
-        coord = outCoords[u32(outD)];
-      }
-    }
-    inputOffset = inputOffset + coord * inputStrides[d];
-  }
-  return inputOffset;
-}
-`;
-
-  let code: string;
-  let variant: string;
-  let dispatchX: number;
-  let dispatchY: number;
-
-  if (useParallelReduction) {
-    // Parallel tree reduction: one workgroup (256 threads) per output element
-    const parDispatch = compute2DDispatch(outSize);
-    const parUse2D = parDispatch.y > 1;
-    dispatchX = parDispatch.x;
-    dispatchY = parDispatch.y;
-    variant = "par";
-
-    code = shaderPreamble + `
-var<workgroup> sdata: array<f32, ${WORKGROUP_SIZE}>;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let outIdx = ${parUse2D ? `wid.x + wid.y * ${parDispatch.x}u` : "wid.x"};
-  if (outIdx >= params.outSize) {
-    return;
-  }
-  let tid = lid.x;
-
-  // Phase 1: Each thread sums a strided slice of the reduction dimension
-  var local_sum = 0.0;
-  for (var r = tid; r < params.reductionSize; r = r + ${WORKGROUP_SIZE}u) {
-    local_sum = local_sum + input[computeInputOffset(outIdx, r)];
-  }
-  sdata[tid] = local_sum;
-  workgroupBarrier();
-
-  // Phase 2: Tree reduction in shared memory
-  for (var s = ${WORKGROUP_SIZE >> 1}u; s > 0u; s = s >> 1u) {
-    if (tid < s) {
-      sdata[tid] = sdata[tid] + sdata[tid + s];
-    }
-    workgroupBarrier();
-  }
-
-  // Thread 0 writes the final sum
-  if (tid == 0u) {
-    out[outIdx] = sdata[0];
-  }
-}
-`;
-  } else {
-    // Sequential reduction: each thread handles one output element
-    const sumTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
-    const sumDispatch = compute2DDispatch(sumTotalWG);
-    const sumUse2D = sumDispatch.y > 1;
-    const sumGridSizeX = sumDispatch.x * WORKGROUP_SIZE;
-    dispatchX = sumDispatch.x;
-    dispatchY = sumDispatch.y;
-    variant = "seq";
-
-    code = shaderPreamble + `
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let outIdx = ${sumUse2D ? `gid.x + gid.y * ${sumGridSizeX}u` : "gid.x"};
-  if (outIdx >= params.outSize) {
-    return;
-  }
-
-  var total = 0.0;
-  for (var reduceIdx = 0u; reduceIdx < params.reductionSize; reduceIdx = reduceIdx + 1u) {
-    total = total + input[computeInputOffset(outIdx, reduceIdx)];
-  }
-
-  out[outIdx] = total;
-}
-`;
-  }
-
-  const pipeline = getPipeline(
-    ctx,
-    `sum:${variant}:${inputShape.join(",")}:${normalizedDims.join(",")}:${keepdim}:${dispatchY > 1 ? "2d" : "1d"}`,
-    code,
+  dispatcher.dispatch(
+    { input: tensor.buffer, out: outBuffer },
+    { outSize, reductionSize },
   );
 
-  const paramsBuffer = createParamsBuffer(ctx.device, params2(outSize, reductionSize));
-
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, paramsBuffer]);
-
-  dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
-
-  releaseParamsBuffer(paramsBuffer);
   if (contiguousCopy) contiguousCopy.destroy();
-
   return createTensor(outShape, outBuffer);
 }
 
-/**
- * Dimension-wise sum with a fused elementwise preamble.
- * Instead of `total += input[offset]`, computes `total += preambleExpr(input0[offset], input1[offset])`.
- * This eliminates the need for a separate elementwise kernel before the reduction.
- */
-export function sumDimWithPreamble(
-  inputs: BackendTensor[],
-  preambleOp: string,
-  sumOptions: SumOptions,
-): BackendTensor {
-  const getExprFn = getExprFromRegistry;
-  const isUnaryOpFn = isUnaryOpFromRegistry;
-  const ctx = requireContext();
+// ============================================================================
+// Sum Full Reduction
+// ============================================================================
 
-  // All inputs must be contiguous and same shape
-  const tensor0 = asGPUTensor(inputs[0]);
-  const inputShape = tensor0.shape;
-
-  const dim = sumOptions?.dim;
-  const keepdim = sumOptions?.keepdim ?? false;
-
-  if (dim === undefined || dim === null) {
-    // Full reduction with preamble
-    return sumFullReductionWithPreamble(ctx, inputs, preambleOp);
-  }
-
-  const setup = prepareDimReduction(inputShape, dim, keepdim);
-  if (!setup) {
-    return sumFullReductionWithPreamble(ctx, inputs, preambleOp);
-  }
-
-  const { normalizedDims, rank, outShape, outSize, reductionSize, outStrides,
-    inputShapeArray, inputStridesArray, outShapeArray, outStridesArray,
-    reduceDimsArray, inputToOutDimArray } = setup;
-  const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-  });
-
-  const isUnary = isUnaryOpFn(preambleOp);
-  const arity = isUnary ? 1 : 2;
-
-  // Build input bindings
-  const inputBindings = inputs.map((_inp: BackendTensor, i: number) =>
-    `@group(0) @binding(${i}) var<storage, read> input${i}: array<f32>;`
-  ).join("\n");
-
-  // Build preamble expression
-  const inputExprs = Array.from({ length: arity }, (_, i) => `input${i}[inputOffset]`);
-  const preambleExpr = getExprFn(preambleOp, inputExprs);
-
-  const spTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
-  const spDispatch = compute2DDispatch(spTotalWG);
-  const spUse2D = spDispatch.y > 1;
-  const spGridSizeX = spDispatch.x * WORKGROUP_SIZE;
-
-  const code = `
-struct Params {
-  outSize: u32,
-  reductionSize: u32,
-};
-
-${inputBindings}
-@group(0) @binding(${arity}) var<storage, read_write> out: array<f32>;
-@group(0) @binding(${arity + 1}) var<uniform> params: Params;
-
-const INPUT_RANK: u32 = ${rank}u;
-const OUT_RANK: u32 = ${outShape.length}u;
-const NUM_REDUCE_DIMS: u32 = ${normalizedDims.length}u;
-const inputShape = ${inputShapeArray};
-const inputStrides = ${inputStridesArray};
-${outShape.length > 0 ? `const outShape = ${outShapeArray};` : ""}
-${outStrides.length > 0 ? `const outStrides = ${outStridesArray};` : ""}
-const reduceDims = ${reduceDimsArray};
-const inputToOutDim = ${inputToOutDimArray};
-
-fn isReduceDim(d: u32) -> bool {
-  for (var i = 0u; i < NUM_REDUCE_DIMS; i = i + 1u) {
-    if (reduceDims[i] == d) { return true; }
-  }
-  return false;
-}
-
-fn getReduceDimIndex(d: u32) -> u32 {
-  for (var i = 0u; i < NUM_REDUCE_DIMS; i = i + 1u) {
-    if (reduceDims[i] == d) { return i; }
-  }
-  return 0u;
-}
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let outIdx = ${spUse2D ? `gid.x + gid.y * ${spGridSizeX}u` : "gid.x"};
-  if (outIdx >= params.outSize) { return; }
-
-  var outCoords: array<u32, ${Math.max(outShape.length, 1)}>;
-  ${outShape.length > 0 ? `
-  var remaining = outIdx;
-  for (var d = 0u; d < OUT_RANK; d = d + 1u) {
-    outCoords[d] = remaining / outStrides[d];
-    remaining = remaining % outStrides[d];
-  }
-  ` : ""}
-
-  var total = 0.0;
-  for (var reduceIdx = 0u; reduceIdx < params.reductionSize; reduceIdx = reduceIdx + 1u) {
-    var reduceCoords: array<u32, ${Math.max(normalizedDims.length, 1)}>;
-    var rRemaining = reduceIdx;
-    ${normalizedDims.map((_: number, i: number) => `
-    {
-      var rDimSize = 1u;
-      for (var j = ${i + 1}u; j < NUM_REDUCE_DIMS; j = j + 1u) {
-        rDimSize = rDimSize * inputShape[reduceDims[j]];
-      }
-      reduceCoords[${i}u] = rRemaining / rDimSize;
-      rRemaining = rRemaining % rDimSize;
-    }
-    `).join("")}
-
-    var inputOffset = 0u;
-    for (var d = 0u; d < INPUT_RANK; d = d + 1u) {
-      var coord = 0u;
-      if (isReduceDim(d)) {
-        let rIdx = getReduceDimIndex(d);
-        coord = reduceCoords[rIdx];
-      } else {
-        let outD = inputToOutDim[d];
-        if (outD >= 0i) { coord = outCoords[u32(outD)]; }
-      }
-      inputOffset = inputOffset + coord * inputStrides[d];
-    }
-
-    total = total + ${preambleExpr};
-  }
-
-  out[outIdx] = total;
-}
-`;
-
-  const cacheKey = `sumPreamble:${preambleOp}:${inputShape.join(",")}:${normalizedDims.join(",")}:${keepdim}:${spUse2D ? "2d" : "1d"}`;
-  const pipeline = getPipeline(ctx, cacheKey, code);
-  const paramsBuffer = createParamsBuffer(ctx.device, params2(outSize, reductionSize));
-
-  const bgBuffers: GPUBuffer[] = [];
-  for (let i = 0; i < arity; i++) {
-    bgBuffers.push(asGPUTensor(inputs[i]).buffer);
-  }
-  bgBuffers.push(outBuffer);
-  bgBuffers.push(paramsBuffer);
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, bgBuffers);
-
-  dispatchComputePass(pipeline, bindGroup, spDispatch.x, spDispatch.y);
-  releaseParamsBuffer(paramsBuffer);
-
-  return createTensor(outShape, outBuffer);
-}
-
-/**
- * Full reduction sum with fused elementwise preamble.
- */
-function sumFullReductionWithPreamble(
-  ctx: WebGPUContext,
-  inputs: BackendTensor[],
-  preambleOp: string,
-): WebGPUTensor {
-  const getExprFn = getExprFromRegistry;
-  const isUnaryOpFn = isUnaryOpFromRegistry;
-  const tensor0 = asGPUTensor(inputs[0]);
-  const inputSize = tensor0.size;
-
-  const isUnary = isUnaryOpFn(preambleOp);
-  const arity = isUnary ? 1 : 2;
-
-  const outBuffer = createTrackedBuffer(ctx.device, {
-    size: 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-  });
-
-  const inputBindings = inputs.slice(0, arity).map((_: BackendTensor, i: number) =>
-    `@group(0) @binding(${i}) var<storage, read> input${i}: array<f32>;`
-  ).join("\n");
-  const inputExprs = Array.from({ length: arity }, (_, i) => `input${i}[i]`);
-  const preambleExpr = getExprFn(preambleOp, inputExprs);
-
-  const code = `
-struct Params {
-  size: u32,
-};
-
-${inputBindings}
-@group(0) @binding(${arity}) var<storage, read_write> out: array<f32>;
-@group(0) @binding(${arity + 1}) var<uniform> params: Params;
-
-@compute @workgroup_size(1)
-fn main() {
-  var sum = 0.0;
-  for (var i = 0u; i < params.size; i = i + 1u) {
-    sum = sum + ${preambleExpr};
-  }
-  out[0] = sum;
-}
-`;
-
-  const cacheKey = `sumFullPreamble:${preambleOp}:${inputSize}`;
-  const pipeline = getPipeline(ctx, cacheKey, code);
-  const uniformBuffer = createUniformBuffer(ctx.device, inputSize);
-
-  const bgBuffers: GPUBuffer[] = [];
-  for (let i = 0; i < arity; i++) {
-    bgBuffers.push(asGPUTensor(inputs[i]).buffer);
-  }
-  bgBuffers.push(outBuffer);
-  bgBuffers.push(uniformBuffer);
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, bgBuffers);
-
-  dispatchComputePass(pipeline, bindGroup, 1);
-  releaseUniformBuffer(uniformBuffer);
-
-  return createTensor([], outBuffer);
-}
-
-// Helper for full reduction to scalar
-async function sumFullReductionAsync(
-  ctx: WebGPUContext,
-  tensor: WebGPUTensor,
-): Promise<number> {
-  const inputSize = tensor.size;
-
-  // Simple sequential reduction for now
-  const code = `
-struct Params {
-  size: u32,
-};
-
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-var<workgroup> shared: array<f32, ${WORKGROUP_SIZE}>;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(
-  @builtin(global_invocation_id) gid: vec3<u32>,
-  @builtin(local_invocation_id) lid: vec3<u32>,
-  @builtin(workgroup_id) wid: vec3<u32>
-) {
-  let idx = gid.x;
-  let localIdx = lid.x;
-
-  // Each thread loads and sums its elements
-  var sum = 0.0;
-  var i = idx;
-  while (i < params.size) {
-    sum = sum + input[i];
-    i = i + ${WORKGROUP_SIZE}u * ${Math.ceil(inputSize / WORKGROUP_SIZE)}u;
-  }
-  shared[localIdx] = sum;
-
-  workgroupBarrier();
-
-  // Parallel reduction in shared memory
-  for (var stride = ${WORKGROUP_SIZE / 2}u; stride > 0u; stride = stride / 2u) {
-    if (localIdx < stride) {
-      shared[localIdx] = shared[localIdx] + shared[localIdx + stride];
-    }
-    workgroupBarrier();
-  }
-
-  // First thread writes result
-  if (localIdx == 0u) {
-    out[wid.x] = shared[0];
-  }
-}
-`;
-
-  // For simplicity, do a two-pass reduction
-  const numWorkgroups = Math.ceil(inputSize / WORKGROUP_SIZE);
-  const intermediateBuffer = createTrackedBuffer(ctx.device, {
-    size: Math.max(numWorkgroups * 4, 4),
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-  });
-
-  const pipeline = getPipeline(ctx, `sumFull:${inputSize}`, code);
-  const uniformBuffer = createUniformBuffer(ctx.device, inputSize);
-
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, intermediateBuffer, uniformBuffer]);
-
-  // Flush shared encoder before sync readback — we need to submit all
-  // prior work and then do a standalone encoder for the readback.
-  if (sharedEncoderFlag) {
-    flushSharedEncoder();
-  }
-
-  const encoder = ctx.device.createCommandEncoder();
-  const pass = encoder.beginComputePass();
-  pass.setPipeline(pipeline);
-  pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(numWorkgroups);
-  pass.end();
-
-  // Read back intermediate results and sum on CPU (for small number of workgroups)
-  const readBuffer = createTrackedBuffer(ctx.device, {
-    size: numWorkgroups * 4,
-    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-  });
-
-  encoder.copyBufferToBuffer(
-    intermediateBuffer,
-    0,
-    readBuffer,
-    0,
-    numWorkgroups * 4,
-  );
-  profileApiCall("queue.submit", () => ctx.queue.submit([encoder.finish()]));
-  incrementSubmitCount();
-
-  await readBuffer.mapAsync(GPUMapMode.READ);
-  const data = new Float32Array(readBuffer.getMappedRange());
-  let total = 0;
-  for (let i = 0; i < numWorkgroups; i++) {
-    total += data[i];
-  }
-  readBuffer.unmap();
-
-  // Destroy temporary buffers to prevent memory leaks
-  bufferPool.deferredDestroy(intermediateBuffer, intermediateBuffer.size ?? numWorkgroups * 4);
-  bufferPool.deferredDestroy(readBuffer, readBuffer.size ?? numWorkgroups * 4);
-  releaseUniformBuffer(uniformBuffer);
-
-  return total;
-}
-
-/**
- * Full reduction sum - returns a 0-d tensor (shape []) with the sum.
- * Use item() to extract the scalar value asynchronously.
- */
 function sumFullReduction(
   ctx: WebGPUContext,
   tensor: WebGPUTensor,
@@ -734,44 +240,26 @@ function sumFullReduction(
     return sumFullReductionChunked(ctx, tensor, maxBindingSize);
   }
 
-  // Create output buffer with single element
   const outBuffer = resolveOutputBuffer(ctx.device, 4, [tensor.buffer]);
 
-  // Use a simple sequential sum shader
-  const code = `
-struct Params {
-  size: u32,
-};
+  getSumFullDispatcher().dispatch(
+    { input: tensor.buffer, out: outBuffer },
+    { size: inputSize },
+  );
 
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-@compute @workgroup_size(1)
-fn main() {
-  var sum = 0.0;
-  for (var i = 0u; i < params.size; i = i + 1u) {
-    sum = sum + input[i];
-  }
-  out[0] = sum;
-}
-`;
-
-  const pipeline = getPipeline(ctx, `sumFullSeq:${inputSize}`, code);
-  const uniformBuffer = createUniformBuffer(ctx.device, inputSize);
-
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, uniformBuffer]);
-
-  dispatchComputePass(pipeline, bindGroup, 1);
-  releaseUniformBuffer(uniformBuffer);
-
-  // Return 0-d tensor (shape [])
   return createTensor([], outBuffer);
 }
+
+// ============================================================================
+// Sum Full Reduction Chunked
+// ============================================================================
 
 /**
  * Chunked full reduction sum for tensors exceeding maxStorageBufferBindingSize.
  * Computes partial sums per chunk, then sums the partials.
+ *
+ * Uses tile-IR generated WGSL but dispatches manually (per-chunk bind groups
+ * need buffer offset/size entries which tile-dispatch doesn't support directly).
  */
 function sumFullReductionChunked(
   ctx: WebGPUContext,
@@ -795,28 +283,9 @@ function sumFullReductionChunked(
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
-  // Shader: sequential sum of a chunk, output to out[chunkIdx]
-  const code = `
-struct Params {
-  chunkSize: u32,
-  chunkIdx: u32,
-};
-
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-@compute @workgroup_size(1)
-fn main() {
-  var sum = 0.0;
-  for (var i = 0u; i < params.chunkSize; i = i + 1u) {
-    sum = sum + input[i];
-  }
-  out[params.chunkIdx] = sum;
-}
-`;
-
-  const pipeline = getPipeline(ctx, `sumFullChunked`, code);
+  // Per-chunk kernel: tile-IR generated WGSL, manual bind groups for offset/size
+  const chunkWGSL = getChunkedSumWGSL();
+  const pipeline = getPipeline(ctx, chunkWGSL, chunkWGSL);
 
   for (let chunk = 0; chunk < numChunks; chunk++) {
     const chunkStart = chunk * elementsPerChunk;
@@ -827,7 +296,7 @@ fn main() {
 
     const paramsBuffer = createParamsBuffer(ctx.device, params2(chunkSize, chunk));
 
-    const bindGroup = profiledCreateBindGroup(ctx.device,{
+    const bindGroup = profiledCreateBindGroup(ctx.device, {
       layout: pipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: tensor.buffer, offset: chunkByteOffset, size: chunkByteSize } },
@@ -840,105 +309,132 @@ fn main() {
     releaseParamsBuffer(paramsBuffer);
   }
 
-  // Now sum the partials (small buffer, fits in one binding)
+  // Sum the partials
   if (numChunks === 1) {
     return createTensor([], partialsBuffer);
   }
 
-  // Final reduction of partials
+  // Final reduction of partials: tile-IR generated WGSL
   const outBuffer = createTrackedBuffer(ctx.device, {
     size: 4,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
-  const finalCode = `
-struct Params {
-  size: u32,
-};
+  const finalWGSL = getFinalSumWGSL();
+  const finalPipeline = getPipeline(ctx, finalWGSL, finalWGSL);
+  const finalParamsData = new Uint32Array([numChunks, 0, 0, 0]); // 16-byte aligned
+  const finalParamsBuffer = createParamsBuffer(ctx.device, finalParamsData);
 
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-@compute @workgroup_size(1)
-fn main() {
-  var sum = 0.0;
-  for (var i = 0u; i < params.size; i = i + 1u) {
-    sum = sum + input[i];
-  }
-  out[0] = sum;
-}
-`;
-
-  const finalPipeline = getPipeline(ctx, `sumFullSeq:${numChunks}`, finalCode);
-  const finalParams = createUniformBuffer(ctx.device, numChunks);
-
-  const finalBindGroup = cachedCreateBindGroup(ctx.device, finalPipeline, [partialsBuffer, outBuffer, finalParams]);
+  const finalBindGroup = cachedCreateBindGroup(ctx.device, finalPipeline, [partialsBuffer, outBuffer, finalParamsBuffer]);
 
   dispatchComputePass(finalPipeline, finalBindGroup, 1);
-  releaseUniformBuffer(finalParams);
+  releaseParamsBuffer(finalParamsBuffer);
 
-  // Destroy the intermediate partials buffer — it's been consumed by the final reduction
+  // Destroy the intermediate partials buffer
   bufferPool.deferredDestroy(partialsBuffer, alignBufferSize(numChunks * 4));
 
   return createTensor([], outBuffer);
 }
 
-/**
- * Full reduction max - returns a 0-d tensor (shape []) with the maximum.
- */
-function maxFullReduction(
-  ctx: WebGPUContext,
-  tensor: WebGPUTensor,
-): WebGPUTensor {
-  const inputSize = tensor.size;
+// ============================================================================
+// Sum Dim With Preamble (fused elementwise + reduce)
+// ============================================================================
 
-  const outBuffer = createTrackedBuffer(ctx.device, {
+/**
+ * Dimension-wise sum with a fused elementwise preamble.
+ * Instead of `total += input[offset]`, computes `total += preambleExpr(input0[offset], input1[offset])`.
+ * This eliminates the need for a separate elementwise kernel before the reduction.
+ */
+export function sumDimWithPreamble(
+  inputs: BackendTensor[],
+  preambleOp: string,
+  sumOptions: SumOptions,
+): BackendTensor {
+  const tensor0 = asGPUTensor(inputs[0]);
+  const inputShape = tensor0.shape;
+
+  const dim = sumOptions?.dim;
+  const keepdim = sumOptions?.keepdim ?? false;
+
+  if (dim === undefined || dim === null) {
+    return sumFullReductionWithPreamble(inputs, preambleOp);
+  }
+
+  const setup = prepareDimReduction(inputShape, dim, keepdim);
+  if (!setup) {
+    return sumFullReductionWithPreamble(inputs, preambleOp);
+  }
+
+  const isUnary = isUnaryOpFromRegistry(preambleOp);
+  const arity = isUnary ? 1 : 2;
+
+  const { normalizedDims, outShape, outSize, reductionSize,
+    inputStrides, outStrides, inputToOutDim } = setup;
+
+  const outBuffer = createTrackedBuffer(requireContext().device, {
+    size: outSize * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  });
+
+  const spec = makeSumDimWithPreambleSpec(
+    preambleOp, arity, inputShape, inputStrides,
+    normalizedDims, outShape, outStrides, inputToOutDim,
+  );
+  const dispatcher = createTileKernelDispatcher(spec);
+
+  const buffers: Record<string, GPUBuffer> = { out: outBuffer };
+  for (let i = 0; i < arity; i++) {
+    buffers[`in${i}`] = asGPUTensor(inputs[i]).buffer;
+  }
+
+  dispatcher.dispatch(buffers, { outSize, reductionSize });
+
+  return createTensor(outShape, outBuffer);
+}
+
+/**
+ * Full reduction sum with fused elementwise preamble.
+ */
+function sumFullReductionWithPreamble(
+  inputs: BackendTensor[],
+  preambleOp: string,
+): WebGPUTensor {
+  const isUnary = isUnaryOpFromRegistry(preambleOp);
+  const arity = isUnary ? 1 : 2;
+  const tensor0 = asGPUTensor(inputs[0]);
+  const inputSize = tensor0.size;
+
+  const outBuffer = createTrackedBuffer(requireContext().device, {
     size: 4,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
-  const code = `
-struct Params {
-  size: u32,
-};
+  const spec = makeSumFullWithPreambleSpec(preambleOp, arity);
+  const dispatcher = createTileKernelDispatcher(spec);
 
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-@compute @workgroup_size(1)
-fn main() {
-  var maxVal = input[0];
-  for (var i = 1u; i < params.size; i = i + 1u) {
-    maxVal = max(maxVal, input[i]);
+  const buffers: Record<string, GPUBuffer> = { out: outBuffer };
+  for (let i = 0; i < arity; i++) {
+    buffers[`in${i}`] = asGPUTensor(inputs[i]).buffer;
   }
-  out[0] = maxVal;
-}
-`;
 
-  const pipeline = getPipeline(ctx, `maxFullSeq:${inputSize}`, code);
-  const uniformBuffer = createUniformBuffer(ctx.device, inputSize);
-
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, uniformBuffer]);
-
-  dispatchComputePass(pipeline, bindGroup, 1);
-  releaseUniformBuffer(uniformBuffer);
+  dispatcher.dispatch(buffers, { size: inputSize });
 
   return createTensor([], outBuffer);
 }
+
+// ============================================================================
+// Max
+// ============================================================================
 
 export function max(a: BackendTensor, options?: MaxOptions): BackendTensor {
   const ctx = requireContext();
   let tensor = asGPUTensor(a);
 
-  // Must materialize non-contiguous tensors first (e.g., expanded views)
   if (!tensor.isContiguous) {
     tensor = asGPUTensor(contiguous(tensor));
   }
 
   const inputShape = tensor.shape;
-
   const dim = options?.dim;
   const keepdim = options?.keepdim ?? false;
 
@@ -957,150 +453,55 @@ export function max(a: BackendTensor, options?: MaxOptions): BackendTensor {
     }
   }
 
-  const { normalizedDims, rank, outShape, outSize, reductionSize, outStrides,
-    inputShapeArray, inputStridesArray, outShapeArray, outStridesArray,
-    reduceDimsArray, inputToOutDimArray } = setup;
+  const { normalizedDims, outShape, outSize, reductionSize,
+    inputStrides, outStrides, inputToOutDim } = setup;
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
 
-  const maxTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
-  const maxDispatch = compute2DDispatch(maxTotalWG);
-  const maxUse2D = maxDispatch.y > 1;
-  const maxGridSizeX = maxDispatch.x * WORKGROUP_SIZE;
+  // Use parallel reduction for large reduction dims (new capability from tile-IR!)
+  const useParallel = reductionSize > 64;
+  const spec = makeMaxDimSpec(inputShape, inputStrides, normalizedDims,
+    outShape, outStrides, inputToOutDim, useParallel);
+  const dispatcher = createTileKernelDispatcher(spec);
 
-  const code = `
-struct Params {
-  outSize: u32,
-  reductionSize: u32,
-};
-
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-const INPUT_RANK: u32 = ${rank}u;
-const OUT_RANK: u32 = ${outShape.length}u;
-const NUM_REDUCE_DIMS: u32 = ${normalizedDims.length}u;
-const inputShape = ${inputShapeArray};
-const inputStrides = ${inputStridesArray};
-${outShape.length > 0 ? `const outShape = ${outShapeArray};` : ""}
-${outStrides.length > 0 ? `const outStrides = ${outStridesArray};` : ""}
-const reduceDims = ${reduceDimsArray};
-const inputToOutDim = ${inputToOutDimArray};
-
-fn isReduceDim(d: u32) -> bool {
-  for (var i = 0u; i < NUM_REDUCE_DIMS; i = i + 1u) {
-    if (reduceDims[i] == d) {
-      return true;
-    }
-  }
-  return false;
-}
-
-fn getReduceDimIndex(d: u32) -> u32 {
-  for (var i = 0u; i < NUM_REDUCE_DIMS; i = i + 1u) {
-    if (reduceDims[i] == d) {
-      return i;
-    }
-  }
-  return 0u;
-}
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let outIdx = ${maxUse2D ? `gid.x + gid.y * ${maxGridSizeX}u` : "gid.x"};
-  if (outIdx >= params.outSize) {
-    return;
-  }
-
-  var outCoords: array<u32, ${Math.max(outShape.length, 1)}>;
-  ${
-    outShape.length > 0
-      ? `
-  var remaining = outIdx;
-  for (var d = 0u; d < OUT_RANK; d = d + 1u) {
-    outCoords[d] = remaining / outStrides[d];
-    remaining = remaining % outStrides[d];
-  }
-  `
-      : ""
-  }
-
-  // Find max over all reduction indices
-  var maxVal = -3.402823466e+38; // -FLT_MAX
-  for (var reduceIdx = 0u; reduceIdx < params.reductionSize; reduceIdx = reduceIdx + 1u) {
-    var reduceCoords: array<u32, ${Math.max(normalizedDims.length, 1)}>;
-    var rRemaining = reduceIdx;
-    ${
-      normalizedDims.length > 0
-        ? normalizedDims
-            .map(
-              (_, i) => `
-    {
-      var rDimSize = 1u;
-      for (var j = ${i + 1}u; j < NUM_REDUCE_DIMS; j = j + 1u) {
-        rDimSize = rDimSize * inputShape[reduceDims[j]];
-      }
-      reduceCoords[${i}u] = rRemaining / rDimSize;
-      rRemaining = rRemaining % rDimSize;
-    }
-    `,
-            )
-            .join("")
-        : ""
-    }
-
-    var inputOffset = 0u;
-    for (var d = 0u; d < INPUT_RANK; d = d + 1u) {
-      var coord = 0u;
-      if (isReduceDim(d)) {
-        let rIdx = getReduceDimIndex(d);
-        coord = reduceCoords[rIdx];
-      } else {
-        let outD = inputToOutDim[d];
-        if (outD >= 0i) {
-          coord = outCoords[u32(outD)];
-        }
-      }
-      inputOffset = inputOffset + coord * inputStrides[d];
-    }
-
-    maxVal = max(maxVal, input[inputOffset]);
-  }
-
-  out[outIdx] = maxVal;
-}
-`;
-
-  const pipeline = getPipeline(
-    ctx,
-    `max:${inputShape.join(",")}:${normalizedDims.join(",")}:${keepdim}:${maxUse2D ? "2d" : "1d"}`,
-    code,
+  dispatcher.dispatch(
+    { input: tensor.buffer, out: outBuffer },
+    { outSize, reductionSize },
   );
-
-  const paramsBuffer = createParamsBuffer(ctx.device, params2(outSize, reductionSize));
-
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, paramsBuffer]);
-
-  dispatchComputePass(pipeline, bindGroup, maxDispatch.x, maxDispatch.y);
-
-  releaseParamsBuffer(paramsBuffer);
 
   return createTensor(outShape, outBuffer);
 }
+
+function maxFullReduction(
+  ctx: WebGPUContext,
+  tensor: WebGPUTensor,
+): WebGPUTensor {
+  const outBuffer = createTrackedBuffer(ctx.device, {
+    size: 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  });
+
+  getMaxFullDispatcher().dispatch(
+    { input: tensor.buffer, out: outBuffer },
+    { size: tensor.size },
+  );
+
+  return createTensor([], outBuffer);
+}
+
+// ============================================================================
+// Mean
+// ============================================================================
 
 export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
   let tensor = asGPUTensor(a);
   let contiguousCopy: WebGPUTensor | null = null;
 
-  // Must materialize non-contiguous tensors first (e.g., expanded views)
-  // Mean uses sum internally which requires contiguous layout
   if (!tensor.isContiguous) {
     tensor = asGPUTensor(contiguous(tensor));
     contiguousCopy = tensor;
   }
 
   const inputShape = tensor.shape;
-
   const dim = options?.dim;
 
   // Compute the count of elements being averaged
@@ -1116,56 +517,19 @@ export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
   // Get sum result (always a tensor, possibly 0-d)
   const sumTensor = asGPUTensor(sum(a, options));
 
-  // Divide by count
+  // Divide by count via tile-IR
   const ctx = requireContext();
   const outSize = sumTensor.size;
-
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [sumTensor.buffer]);
 
-  const meanTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
-  const meanDispatch = compute2DDispatch(meanTotalWG);
-  const meanUse2D = meanDispatch.y > 1;
-  const meanGridSizeX = meanDispatch.x * WORKGROUP_SIZE;
+  getMeanDivDispatcher().dispatch(
+    { input: sumTensor.buffer, out: outBuffer },
+    { size: outSize, count },
+  );
 
-  const code = `
-struct Params {
-  size: u32,
-  count: f32,
-};
-
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<f32>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = ${meanUse2D ? `gid.x + gid.y * ${meanGridSizeX}u` : "gid.x"};
-  if (idx >= params.size) {
-    return;
-  }
-  out[idx] = input[idx] / params.count;
-}
-`;
-
-  const pipeline = getPipeline(ctx, `meanDiv:${outSize}:${count}:${meanUse2D ? "2d" : "1d"}`, code);
-
-  // Pack mixed u32 + f32 params into a single Uint32Array
-  const meanParamsData = new ArrayBuffer(8);
-  new Uint32Array(meanParamsData, 0, 1)[0] = outSize;
-  new Float32Array(meanParamsData, 4, 1)[0] = count;
-  const paramsBuffer = createParamsBuffer(ctx.device, new Uint32Array(meanParamsData));
-
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [sumTensor.buffer, outBuffer, paramsBuffer]);
-
-  dispatchComputePass(pipeline, bindGroup, meanDispatch.x, meanDispatch.y);
-
-  releaseParamsBuffer(paramsBuffer);
-
-  // Destroy intermediate sum tensor — its buffer was only needed as input to the
-  // division kernel above. Without this, the 256B buffer leaks every mean() call.
+  // Destroy intermediate sum tensor
   sumTensor.destroy();
 
-  // Destroy contiguous copy if one was created
   if (contiguousCopy) {
     contiguousCopy.destroy();
   }
