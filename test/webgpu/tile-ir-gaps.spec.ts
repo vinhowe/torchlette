@@ -1983,6 +1983,61 @@ describe("Triton Gap: bitwise XOR (WGSL)", () => {
   });
 });
 
+describe("Triton Gap: cdiv / floorDiv (WGSL)", () => {
+  it("cdiv(7, 3) constant folds to 3", () => {
+    const spec: TileKernelSpec = {
+      name: "cdivConst",
+      workgroupSize: 64,
+      bindings: { output: { storage: "read_write", type: "u32" } },
+      uniforms: {},
+      grid: () => [1],
+      kernel: (ctx) => {
+        const gid = ctx.globalId(0);
+        ctx.emitStore("output", gid, ctx.u32(7).cdiv(ctx.u32(3)));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // ceil(7/3) = 3
+    expect(wgsl).toContain("3u");
+  });
+
+  it("cdiv(x, 4) produces (x + 3) / 4 pattern", () => {
+    const spec: TileKernelSpec = {
+      name: "cdivExpr",
+      workgroupSize: 64,
+      bindings: { input: { storage: "read", type: "u32" }, output: { storage: "read_write", type: "u32" } },
+      uniforms: {},
+      grid: () => [1],
+      kernel: (ctx) => {
+        const gid = ctx.globalId(0);
+        const val = ctx.load("input", gid);
+        ctx.emitStore("output", gid, val.cdiv(ctx.u32(4)));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // Should produce (val + 3u) / 4u
+    expect(wgsl).toContain("3u");
+    expect(wgsl).toContain("/ 4u");
+  });
+
+  it("floorDiv produces division + floor", () => {
+    const spec: TileKernelSpec = {
+      name: "floorDivExpr",
+      workgroupSize: 64,
+      bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+      uniforms: {},
+      grid: () => [1],
+      kernel: (ctx) => {
+        const gid = ctx.globalId(0);
+        const val = ctx.load("input", gid);
+        ctx.emitStore("output", gid, val.floorDiv(ctx.f32(3.0)));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).toContain("floor");
+  });
+});
+
 // ============================================================================
 // GPU tests for Round 2 gaps
 // ============================================================================
