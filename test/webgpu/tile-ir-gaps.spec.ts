@@ -1012,7 +1012,7 @@ describe("Compiler: constant-fold guardedStore", () => {
     expect(wgsl).toContain("out[gid.x] =");
   });
 
-  it("const-false guard (0u == 1u) emits guarded store", () => {
+  it("const-false guard (0u == 1u) is eliminated entirely", () => {
     const spec: TileKernelSpec = {
       name: "constFalseGuard",
       workgroupSize: 64,
@@ -1025,13 +1025,14 @@ describe("Compiler: constant-fold guardedStore", () => {
       kernel(ctx) {
         const gid = ctx.globalId(0);
         const val = ctx.load("a", gid);
-        // Always-false guard: should remain guarded
+        // Always-false guard: should be eliminated by constant folding
         ctx.guardedStore("out", ctx.u32(0).eq(ctx.u32(1)), gid, val);
       },
     };
     const wgsl = compileTileKernel(spec);
-    // Should keep the `if` guard (cmp expression has wrapping parens)
-    expect(wgsl).toContain("if ((0u == 1u))");
+    // Constant folding folds 0u == 1u → false, guardedStore is eliminated
+    expect(wgsl).not.toContain("out[");
+    expect(wgsl).not.toContain("if (");
   });
 
   it("dynamic guard remains conditional", () => {
