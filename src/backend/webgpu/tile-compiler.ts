@@ -267,10 +267,13 @@ export function compileTileKernel(spec: TileKernelSpec): string {
     stmts = insertBarriers(stmts);
   }
 
-  // 4. Loop-invariant code motion (always-on)
+  // 4. Auto-CSE: inject let bindings for multi-use expressions
+  stmts = autoCSE(stmts);
+
+  // 5. Loop-invariant code motion (always-on)
   stmts = hoistLoopInvariants(stmts);
 
-  // 5. Dead code elimination (remove unused let bindings)
+  // 6. Dead code elimination (remove unused let bindings)
   stmts = eliminateDeadCode(stmts);
 
   return compileImperativeKernel(spec, ctx, stmts);
@@ -434,6 +437,15 @@ function emitStatement(
     case "let": {
       const val = exprFor(stmt.value, bindings, null);
       lines.push(`${indent}let ${stmt.name} = ${val};`);
+      // Register binding: subsequent exprFor calls for the same node ID
+      // will return the variable name instead of re-expanding the expression.
+      // Safe because: (1) all CSE-eligible nodes are pure, (2) scoped bindings
+      // (new Map(bindings) for child scopes) prevent inner bindings leaking out.
+      // Only bind nodes with valid IDs (>= 0) — tile lowering helpers create
+      // raw nodes with id=-1 that must NOT be cached (they're all id=-1).
+      if (stmt.value.id >= 0) {
+        bindings.set(stmt.value.id, stmt.name);
+      }
       break;
     }
     case "var": {
@@ -1354,6 +1366,289 @@ function eliminateDeadCode(stmts: Statement[]): Statement[] {
 
   // Step 4: Filter dead lets
   return processed.filter(s => s.kind !== "let" || usedNames.has(s.name));
+}
+
+// ============================================================================
+// Auto-CSE (Common Subexpression Elimination)
+// ============================================================================
+
+/**
+ * Check if a node is trivial — cheap enough to duplicate in WGSL.
+ * These nodes compile to a single token/word (variable name, literal, builtin).
+ */
+function isTrivialNode(node: IRNode): boolean {
+  switch (node.kind) {
+    case "const":
+    case "namedRef":
+    case "programId":
+    case "threadIdx":
+    case "localIndex":
+    case "globalId":
+    case "numWorkgroups":
+    case "uniform":
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
+ * Check if an expression tree contains any memory read (global load, shared read).
+ * Such expressions should not be auto-CSE'd because the memory value
+ * may change between uses (e.g., across barriers).
+ */
+function exprContainsMemoryRead(node: IRNode): boolean {
+  switch (node.kind) {
+    case "load":
+    case "sharedRead":
+    case "vec4SharedRead":
+      return true;
+    case "binary":
+      return exprContainsMemoryRead(node.lhs) || exprContainsMemoryRead(node.rhs);
+    case "unary":
+    case "cast":
+      return exprContainsMemoryRead(node.input);
+    case "bitcast":
+      return exprContainsMemoryRead(node.input);
+    case "cmp":
+      return exprContainsMemoryRead(node.lhs) || exprContainsMemoryRead(node.rhs);
+    case "select":
+      return exprContainsMemoryRead(node.condition) ||
+             exprContainsMemoryRead(node.trueVal) ||
+             exprContainsMemoryRead(node.falseVal);
+    case "arrayRead":
+    case "vec4ArrayRead":
+      return exprContainsMemoryRead(node.idx);
+    case "subgroupShuffleXor":
+      return exprContainsMemoryRead(node.value) || exprContainsMemoryRead(node.mask);
+    case "subgroupAdd":
+    case "subgroupMax":
+    case "subgroupBroadcastFirst":
+    case "subgroupInclusiveAdd":
+      return exprContainsMemoryRead(node.value);
+    case "vec4Construct":
+      return exprContainsMemoryRead(node.x) || exprContainsMemoryRead(node.y) ||
+             exprContainsMemoryRead(node.z) || exprContainsMemoryRead(node.w);
+    case "vec4Splat": return exprContainsMemoryRead(node.value);
+    case "vec4NativeDot": return exprContainsMemoryRead(node.a) || exprContainsMemoryRead(node.b);
+    case "vec4Component": return exprContainsMemoryRead(node.value);
+    case "vec4Binary": return exprContainsMemoryRead(node.a) || exprContainsMemoryRead(node.b);
+    default:
+      return false;
+  }
+}
+
+/**
+ * Walk an IR expression tree and collect non-trivial, memory-read-free candidate nodes.
+ * Only considers nodes with valid IDs (>= 0, from makeNode).
+ */
+function collectExprCSECandidates(node: IRNode, nodes: Map<number, IRNode>): void {
+  if (node.id < 0 || isTrivialNode(node)) return;
+  if (exprContainsMemoryRead(node)) return;
+  nodes.set(node.id, node);
+  // Recurse into children to find shared sub-expressions
+  switch (node.kind) {
+    case "binary":
+      collectExprCSECandidates(node.lhs, nodes);
+      collectExprCSECandidates(node.rhs, nodes);
+      break;
+    case "unary":
+    case "cast":
+      collectExprCSECandidates(node.input, nodes);
+      break;
+    case "bitcast":
+      collectExprCSECandidates(node.input, nodes);
+      break;
+    case "cmp":
+      collectExprCSECandidates(node.lhs, nodes);
+      collectExprCSECandidates(node.rhs, nodes);
+      break;
+    case "select":
+      collectExprCSECandidates(node.condition, nodes);
+      collectExprCSECandidates(node.trueVal, nodes);
+      collectExprCSECandidates(node.falseVal, nodes);
+      break;
+    case "subgroupShuffleXor":
+      collectExprCSECandidates(node.value, nodes);
+      collectExprCSECandidates(node.mask, nodes);
+      break;
+    case "subgroupAdd":
+    case "subgroupMax":
+    case "subgroupBroadcastFirst":
+    case "subgroupInclusiveAdd":
+      collectExprCSECandidates(node.value, nodes);
+      break;
+    case "vec4Construct":
+      collectExprCSECandidates(node.x, nodes);
+      collectExprCSECandidates(node.y, nodes);
+      collectExprCSECandidates(node.z, nodes);
+      collectExprCSECandidates(node.w, nodes);
+      break;
+    case "vec4Splat": collectExprCSECandidates(node.value, nodes); break;
+    case "vec4NativeDot":
+      collectExprCSECandidates(node.a, nodes);
+      collectExprCSECandidates(node.b, nodes);
+      break;
+    case "vec4Component": collectExprCSECandidates(node.value, nodes); break;
+    case "vec4Binary":
+      collectExprCSECandidates(node.a, nodes);
+      collectExprCSECandidates(node.b, nodes);
+      break;
+    case "arrayRead":
+    case "vec4ArrayRead":
+      collectExprCSECandidates(node.idx, nodes);
+      break;
+  }
+}
+
+/**
+ * Collect all CSE candidate node IDs from all expressions in a statement
+ * (including nested bodies like forRange, if, etc.).
+ */
+function collectStmtCSENodes(stmt: Statement, nodes: Map<number, IRNode>): void {
+  switch (stmt.kind) {
+    case "let":
+      collectExprCSECandidates(stmt.value, nodes);
+      break;
+    case "var":
+      collectExprCSECandidates(stmt.value, nodes);
+      break;
+    case "assign":
+    case "addAssign":
+      collectExprCSECandidates(stmt.value, nodes);
+      break;
+    case "indexAssign":
+    case "indexAddAssign":
+      collectExprCSECandidates(stmt.idx, nodes);
+      collectExprCSECandidates(stmt.value, nodes);
+      break;
+    case "forRange":
+      collectExprCSECandidates(stmt.start, nodes);
+      collectExprCSECandidates(stmt.bound, nodes);
+      for (const s of stmt.body) collectStmtCSENodes(s, nodes);
+      break;
+    case "forStride":
+      collectExprCSECandidates(stmt.start, nodes);
+      collectExprCSECandidates(stmt.bound, nodes);
+      for (const s of stmt.body) collectStmtCSENodes(s, nodes);
+      break;
+    case "if":
+      collectExprCSECandidates(stmt.condition, nodes);
+      for (const s of stmt.body) collectStmtCSENodes(s, nodes);
+      break;
+    case "ifElse":
+      collectExprCSECandidates(stmt.condition, nodes);
+      for (const s of stmt.body) collectStmtCSENodes(s, nodes);
+      for (const s of stmt.elseBody) collectStmtCSENodes(s, nodes);
+      break;
+    case "sharedWrite":
+      collectExprCSECandidates(stmt.idx, nodes);
+      collectExprCSECandidates(stmt.value, nodes);
+      break;
+    case "guardedStore":
+      collectExprCSECandidates(stmt.condition, nodes);
+      collectExprCSECandidates(stmt.idx, nodes);
+      collectExprCSECandidates(stmt.value, nodes);
+      break;
+    case "directStore":
+      collectExprCSECandidates(stmt.idx, nodes);
+      collectExprCSECandidates(stmt.value, nodes);
+      break;
+    case "atomicOp":
+      collectExprCSECandidates(stmt.idx, nodes);
+      collectExprCSECandidates(stmt.value, nodes);
+      break;
+    case "atomicCAS":
+      collectExprCSECandidates(stmt.idx, nodes);
+      collectExprCSECandidates(stmt.expected, nodes);
+      collectExprCSECandidates(stmt.desired, nodes);
+      break;
+    case "vec4ArrayWrite":
+    case "vec4ArrayAddAssign":
+      collectExprCSECandidates(stmt.idx, nodes);
+      collectExprCSECandidates(stmt.value, nodes);
+      break;
+    // barrier, return, varArray, vec4VarArray, vec4SharedArray: no candidate expressions
+  }
+}
+
+/**
+ * Auto-CSE pass: inject `let` bindings for multi-use expression nodes.
+ *
+ * Processes bottom-up (inner scopes first). At each scope, counts per-statement
+ * references and injects `let` bindings before the first statement that uses
+ * each multi-referenced non-trivial expression. The codegen's `bindings.set`
+ * mechanism then ensures subsequent references use the variable name.
+ *
+ * LICM runs after this pass and hoists loop-invariant injected bindings.
+ */
+export function autoCSE(stmts: Statement[]): Statement[] {
+  // Phase 1: Bottom-up recursion (inner scopes first)
+  const processed = stmts.map(s => {
+    switch (s.kind) {
+      case "forRange": return { ...s, body: autoCSE(s.body) } as Statement;
+      case "forStride": return { ...s, body: autoCSE(s.body) } as Statement;
+      case "if": return { ...s, body: autoCSE(s.body) } as Statement;
+      case "ifElse": return { ...s, body: autoCSE(s.body), elseBody: autoCSE(s.elseBody) } as Statement;
+      default: return s;
+    }
+  });
+
+  // Phase 2: Count per-statement references at this scope
+  // Each statement contributes at most 1 count per node ID
+  const refCounts = new Map<number, { count: number; node: IRNode; firstIdx: number }>();
+  const letValueIds = new Set<number>();
+
+  for (let i = 0; i < processed.length; i++) {
+    const stmt = processed[i];
+    // Track existing let value IDs (already bound, don't need auto-CSE)
+    if (stmt.kind === "let" && stmt.value.id >= 0) {
+      letValueIds.add(stmt.value.id);
+    }
+
+    const nodeSet = new Map<number, IRNode>();
+    collectStmtCSENodes(stmt, nodeSet);
+
+    for (const [id, node] of nodeSet) {
+      const entry = refCounts.get(id);
+      if (entry) {
+        entry.count++;
+      } else {
+        refCounts.set(id, { count: 1, node, firstIdx: i });
+      }
+    }
+  }
+
+  // Phase 3: Find multi-use candidates (not already bound by existing lets)
+  const toBind: { firstIdx: number; name: string; node: IRNode }[] = [];
+  for (const [id, { count, node, firstIdx }] of refCounts) {
+    if (count > 1 && !letValueIds.has(id)) {
+      toBind.push({ firstIdx, name: freshVar("cse"), node });
+    }
+  }
+
+  if (toBind.length === 0) return processed;
+  toBind.sort((a, b) => a.firstIdx - b.firstIdx);
+
+  // Phase 4: Inject let bindings before first use
+  const injByIdx = new Map<number, typeof toBind>();
+  for (const b of toBind) {
+    if (!injByIdx.has(b.firstIdx)) injByIdx.set(b.firstIdx, []);
+    injByIdx.get(b.firstIdx)!.push(b);
+  }
+
+  const result: Statement[] = [];
+  for (let i = 0; i < processed.length; i++) {
+    const inj = injByIdx.get(i);
+    if (inj) {
+      for (const b of inj) {
+        result.push({ kind: "let", name: b.name, value: b.node, dtype: b.node.dataType } as Statement);
+      }
+    }
+    result.push(processed[i]);
+  }
+
+  return result;
 }
 
 // ============================================================================
