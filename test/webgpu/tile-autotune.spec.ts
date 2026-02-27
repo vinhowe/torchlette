@@ -14,6 +14,16 @@ import {
 } from "../../src/backend/webgpu";
 import { createTileKernelDispatcher, createAutoTileKernelDispatcher } from "../../src/backend/webgpu/tile-dispatch";
 import type { TileKernelSpec, AutotuneConfig, TuneParam } from "../../src/backend/webgpu/tile-ir";
+import {
+  elementwiseGrid,
+  perRowGrid,
+  ceilDivGrid,
+  singleWorkgroup,
+  tiledGrid,
+  productGrid,
+  inferGrid,
+  resolveGrid,
+} from "../../src/backend/webgpu/tile-ir";
 import type { GPUBuffer, GPUDevice, GPUQueue } from "../../src/backend/webgpu/gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "../../src/backend/webgpu/gpu-types";
 import {
@@ -367,5 +377,199 @@ describe.skipIf(!isWebGPUEnabled)("tile-autotune GPU", () => {
     const autoDispatcher = createAutoTileKernelDispatcher(scaleAutoConfig);
     autoDispatcher.reset();
     expect(autoDispatcher.getConfig().wgSize).toBe(64);
+  });
+});
+
+// ============================================================================
+// Grid helper tests (no GPU needed)
+// ============================================================================
+
+describe("tile-ir grid helpers", () => {
+  describe("elementwiseGrid", () => {
+    it("returns 1D grid for small element counts", () => {
+      const grid = elementwiseGrid(256, { elementUniform: "size" });
+      expect(grid({ size: 1024 })).toEqual([4]);
+    });
+
+    it("returns 2D grid when workgroups exceed 65535", () => {
+      const grid = elementwiseGrid(256, { elementUniform: "size" });
+      // 256 * 70000 = 17.92M elements → 70000 workgroups > 65535
+      const result = grid({ size: 256 * 70000 });
+      expect(result).toHaveLength(2);
+      expect(result[0]).toBe(65535);
+      expect(result[1]).toBe(Math.ceil(70000 / 65535));
+    });
+
+    it("accounts for vectorization width", () => {
+      const grid = elementwiseGrid(256, { vecWidth: 4, elementUniform: "n" });
+      // 4096 / (256 * 4) = 4 workgroups
+      expect(grid({ n: 4096 })).toEqual([4]);
+    });
+
+    it("defaults to total_elements uniform", () => {
+      const grid = elementwiseGrid(256);
+      expect(grid({ total_elements: 512 })).toEqual([2]);
+    });
+  });
+
+  describe("perRowGrid", () => {
+    it("dispatches one workgroup per row", () => {
+      const grid = perRowGrid("num_rows");
+      expect(grid({ num_rows: 128 })).toEqual([128]);
+    });
+
+    it("defaults to num_rows uniform", () => {
+      const grid = perRowGrid();
+      expect(grid({ num_rows: 64 })).toEqual([64]);
+    });
+  });
+
+  describe("ceilDivGrid", () => {
+    it("ceil-divides element count by divisor", () => {
+      const grid = ceilDivGrid(256, "n");
+      expect(grid({ n: 1000 })).toEqual([4]); // ceil(1000/256) = 4
+    });
+  });
+
+  describe("singleWorkgroup", () => {
+    it("always returns [1]", () => {
+      const grid = singleWorkgroup();
+      expect(grid({})).toEqual([1]);
+      expect(grid({ anything: 999 })).toEqual([1]);
+    });
+  });
+
+  describe("tiledGrid", () => {
+    it("creates 1D tiled grid", () => {
+      const grid = tiledGrid({ x: { uniform: "N", tileSize: 32 } });
+      expect(grid({ N: 128 })).toEqual([4]); // ceil(128/32)
+    });
+
+    it("creates 2D tiled grid", () => {
+      const grid = tiledGrid({
+        x: { uniform: "N", tileSize: 32 },
+        y: "num_heads",
+      });
+      expect(grid({ N: 128, num_heads: 12 })).toEqual([4, 12]);
+    });
+
+    it("creates 3D tiled grid (attention pattern)", () => {
+      const grid = tiledGrid({
+        x: { uniform: "seq_len", tileSize: 64 },
+        y: "num_heads",
+        z: "batch_size",
+      });
+      expect(grid({ seq_len: 512, num_heads: 12, batch_size: 2 })).toEqual([8, 12, 2]);
+    });
+
+    it("handles non-divisible tile sizes", () => {
+      const grid = tiledGrid({ x: { uniform: "N", tileSize: 64 } });
+      expect(grid({ N: 100 })).toEqual([2]); // ceil(100/64)
+    });
+
+    it("supports raw uniform dims (tileSize=1)", () => {
+      const grid = tiledGrid({ x: "count" });
+      expect(grid({ count: 42 })).toEqual([42]);
+    });
+  });
+
+  describe("productGrid", () => {
+    it("multiplies uniform values", () => {
+      const grid = productGrid("batch", "heads", "seq");
+      expect(grid({ batch: 2, heads: 12, seq: 512 })).toEqual([12288]);
+    });
+
+    it("handles single uniform", () => {
+      const grid = productGrid("n");
+      expect(grid({ n: 100 })).toEqual([100]);
+    });
+  });
+
+  describe("inferGrid", () => {
+    it("infers elementwise grid from 'size' uniform", () => {
+      const spec: TileKernelSpec = {
+        name: "test",
+        workgroupSize: 256,
+        bindings: { out: { storage: "read_write", type: "f32" } },
+        uniforms: { size: "u32" },
+        kernel() {},
+      };
+      const grid = inferGrid(spec);
+      expect(grid).not.toBeNull();
+      expect(grid!({ size: 1024 })).toEqual([4]);
+    });
+
+    it("infers from 'outSize' uniform", () => {
+      const spec: TileKernelSpec = {
+        name: "test",
+        workgroupSize: 256,
+        bindings: { out: { storage: "read_write", type: "f32" } },
+        uniforms: { outSize: "u32", reductionSize: "u32" },
+        kernel() {},
+      };
+      const grid = inferGrid(spec);
+      expect(grid).not.toBeNull();
+      expect(grid!({ outSize: 512 })).toEqual([2]);
+    });
+
+    it("returns null when no matching uniform", () => {
+      const spec: TileKernelSpec = {
+        name: "test",
+        workgroupSize: 256,
+        bindings: { out: { storage: "read_write", type: "f32" } },
+        uniforms: { rows: "u32", cols: "u32" },
+        kernel() {},
+      };
+      expect(inferGrid(spec)).toBeNull();
+    });
+
+    it("ignores f32 uniforms named 'size'", () => {
+      const spec: TileKernelSpec = {
+        name: "test",
+        workgroupSize: 256,
+        bindings: { out: { storage: "read_write", type: "f32" } },
+        uniforms: { size: "f32" },
+        kernel() {},
+      };
+      expect(inferGrid(spec)).toBeNull();
+    });
+  });
+
+  describe("resolveGrid", () => {
+    it("returns explicit grid when provided", () => {
+      const explicitGrid = singleWorkgroup();
+      const spec: TileKernelSpec = {
+        name: "test",
+        workgroupSize: 256,
+        bindings: { out: { storage: "read_write", type: "f32" } },
+        uniforms: { size: "u32" },
+        grid: explicitGrid,
+        kernel() {},
+      };
+      expect(resolveGrid(spec)).toBe(explicitGrid);
+    });
+
+    it("falls back to inference when grid omitted", () => {
+      const spec: TileKernelSpec = {
+        name: "test",
+        workgroupSize: 256,
+        bindings: { out: { storage: "read_write", type: "f32" } },
+        uniforms: { size: "u32" },
+        kernel() {},
+      };
+      const grid = resolveGrid(spec);
+      expect(grid({ size: 1024 })).toEqual([4]);
+    });
+
+    it("throws when grid omitted and no inference matches", () => {
+      const spec: TileKernelSpec = {
+        name: "mykernel",
+        workgroupSize: 256,
+        bindings: { out: { storage: "read_write", type: "f32" } },
+        uniforms: { rows: "u32" },
+        kernel() {},
+      };
+      expect(() => resolveGrid(spec)).toThrow(/no grid function for kernel "mykernel"/);
+    });
   });
 });

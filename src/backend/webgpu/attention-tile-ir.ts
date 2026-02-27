@@ -13,6 +13,7 @@
  */
 
 import type { TileKernelSpec, TileRangeInfo } from "./tile-ir";
+import { tiledGrid, productGrid } from "./tile-ir";
 import { BlockOps, type BlockCoopPtr } from "./tile-ops";
 
 // Tiling parameters — match production kernels
@@ -83,7 +84,7 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
       scale_u32: "u32",  // bitcast to f32 at use
       is_causal: "u32",
     },
-    grid: (u) => [Math.ceil(u.seq_len / BR), u.num_heads, u.batch_size],
+    grid: tiledGrid({ x: { uniform: "seq_len", tileSize: BR }, y: "num_heads", z: "batch_size" }),
 
     kernel(ctx) {
       const ops = new BlockOps(ctx, { wgSize });
@@ -225,7 +226,7 @@ export function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
       scale: "f32",       // unused but must match FAConfig layout
       is_causal: "u32",   // unused but must match FAConfig layout
     },
-    grid: (u) => [u.batch_size * u.num_heads * u.seq_len],
+    grid: productGrid("batch_size", "num_heads", "seq_len"),
 
     kernel(ctx) {
       const tid = ctx.localIndex();
@@ -306,7 +307,7 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
       scale_u32: "u32",
       is_causal: "u32",
     },
-    grid: (u) => [Math.ceil(u.seq_len / BR), u.num_heads, u.batch_size],
+    grid: tiledGrid({ x: { uniform: "seq_len", tileSize: BR }, y: "num_heads", z: "batch_size" }),
 
     kernel(ctx) {
       const ops = new BlockOps(ctx, { wgSize });
@@ -435,7 +436,7 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
       scale_u32: "u32",
       is_causal: "u32",
     },
-    grid: (u) => [Math.ceil(u.seq_len / BC_BW), u.num_heads, u.batch_size],
+    grid: tiledGrid({ x: { uniform: "seq_len", tileSize: BC_BW }, y: "num_heads", z: "batch_size" }),
 
     kernel(ctx) {
       const ops = new BlockOps(ctx, { wgSize: wg });

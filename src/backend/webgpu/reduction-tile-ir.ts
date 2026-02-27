@@ -15,6 +15,7 @@ import {
   type BlockExpr,
   type BindingSpec,
   elementwiseGrid,
+  singleWorkgroup,
 } from "./tile-ir";
 import { compileTileKernel } from "./tile-compiler";
 import { applyFusedOp } from "./fusion-tile-ir";
@@ -210,7 +211,7 @@ export function makeSumFullSpec(): TileKernelSpec {
       out: { storage: "read_write", type: "f32" },
     },
     uniforms: { size: "u32" },
-    grid: () => [1],
+    grid: singleWorkgroup(),
     kernel(ctx) {
       const tid = ctx.localIndex();
       const result = ctx.wgReduce("sum", tid, ctx.uniform("size"), WG, (i) =>
@@ -245,7 +246,7 @@ export function getChunkedSumWGSL(): string {
       chunkSize: "u32",
       chunkIdx: "u32",
     },
-    grid: () => [1],
+    grid: singleWorkgroup(),
     kernel(ctx) {
       const acc = ctx.emitVar("sum", "f32", ctx.f32(0));
       ctx.forRange(ctx.u32(0), ctx.uniform("chunkSize"), (i) => {
@@ -269,7 +270,7 @@ export function getFinalSumWGSL(): string {
       out: { storage: "read_write", type: "f32" },
     },
     uniforms: { size: "u32" },
-    grid: () => [1],
+    grid: singleWorkgroup(),
     kernel(ctx) {
       const acc = ctx.emitVar("sum", "f32", ctx.f32(0));
       ctx.forRange(ctx.u32(0), ctx.uniform("size"), (i) => {
@@ -390,7 +391,7 @@ export function makeMaxFullSpec(): TileKernelSpec {
       out: { storage: "read_write", type: "f32" },
     },
     uniforms: { size: "u32" },
-    grid: () => [1],
+    grid: singleWorkgroup(),
     kernel(ctx) {
       const tid = ctx.localIndex();
       const result = ctx.wgReduce("max", tid, ctx.uniform("size"), WG, (i) =>
@@ -509,7 +510,7 @@ export function makeSumFullWithPreambleSpec(
     workgroupSize: 1,
     bindings,
     uniforms: { size: "u32" },
-    grid: () => [1],
+    grid: singleWorkgroup(),
     kernel(ctx) {
       const acc = ctx.emitVar("sum", "f32", ctx.f32(0));
       ctx.forRange(ctx.u32(0), ctx.uniform("size"), (i) => {

@@ -26,6 +26,7 @@ import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { compileTileKernel } from "./tile-compiler";
 import type { TileKernelSpec, UniformType, AutotuneConfig } from "./tile-ir";
+import { resolveGrid } from "./tile-ir";
 import { autotuneTileKernel, getDefaultConfig, type AutotuneOptions } from "./tile-autotune";
 import { analyzeAccessPatterns, reportAccessPatterns } from "./tile-access-analysis";
 
@@ -185,8 +186,9 @@ export function createTileKernelDispatcher(spec: TileKernelSpec): TileKernelInst
         trackSharedEncoderWrite(buf);
       }
 
-      // Compute grid dimensions
-      const grid = spec.grid(uniforms);
+      // Compute grid dimensions (explicit or auto-inferred)
+      const gridFn = resolveGrid(spec);
+      const grid = gridFn(uniforms);
 
       // Dispatch
       dispatchComputePass(pipeline, bindGroup, ...grid);
