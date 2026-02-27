@@ -78,6 +78,7 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
         case "mod": return `(${lhs} % ${rhs})`;
         case "and": return `(${lhs} & ${rhs})`;
         case "or": return `(${lhs} | ${rhs})`;
+        case "xor": return `(${lhs} ^ ${rhs})`;
         case "shr": return `(${lhs} >> ${rhs})`;
         case "shl": return `(${lhs} << ${rhs})`;
         case "min": return `min(${lhs}, ${rhs})`;
