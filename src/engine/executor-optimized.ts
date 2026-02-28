@@ -107,6 +107,9 @@ export interface FusionAnalysisTemplate {
   /** Compound pattern matches (position-based: coveredOrigPoss, outputOrigPos, dim). */
   compoundDescs?: Array<{ name: string; coveredOrigPoss: number[]; outputOrigPos: number; dim: number }>;
 
+  /** Original plan positions of graph-rewrite-bypassed nodes (identity casts, etc.). */
+  rewriteBypassedOrigPoss?: number[];
+
   /** Cached lifetime analysis (position-based). */
   lifetimeTemplate?: Array<{ firstUse: number; lastUse: number; isOutput: boolean; isInput: boolean; bufferSize: number }>;
 
@@ -407,6 +410,9 @@ export async function executePlanOptimized(
         outputOrigPos: origIdToPos.get(m.outputNodeId)!,
         dim: m.dim,
       })) : undefined,
+      rewriteBypassedOrigPoss: analysis.rewriteBypassedIds.size > 0
+        ? [...analysis.rewriteBypassedIds].map(id => origIdToPos.get(id)!).filter(p => p !== undefined)
+        : undefined,
     };
     fusionAnalysisCache.set(fingerprint, template);
   }
