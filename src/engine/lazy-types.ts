@@ -77,7 +77,8 @@ export type LazyOpCode =
   | "fusedLayerNormForward"
   | "fusedLayerNormBackwardGradX"
   | "fusedLayerNormBackwardGradWeightBias"
-  | "extractLnBwdGradBias";
+  | "extractLnBwdGradBias"
+  | "fusedRMSNormForward";
 
 /** GELU approximation type matching PyTorch's nn.GELU */
 export type GeluApproximate = "none" | "tanh";

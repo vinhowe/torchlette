@@ -99,6 +99,7 @@ import {
   crossEntropyFusedImpl,
   scaledDotProductAttentionImpl,
   layernormImpl,
+  rmsnormImpl,
 } from "./frontend-fused-ops";
 import { backwardImpl } from "./frontend-autograd";
 
@@ -1203,6 +1204,10 @@ export class Torchlette {
 
   layernorm(x: Tensor, weight: Tensor, bias: Tensor, eps = 1e-5): Tensor {
     return layernormImpl(this, x, weight, bias, eps);
+  }
+
+  rmsnorm(x: Tensor, weight: Tensor, eps = 1e-5): Tensor {
+    return rmsnormImpl(this, x, weight, eps);
   }
 
   // ============================================================================

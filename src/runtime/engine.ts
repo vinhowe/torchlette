@@ -17,6 +17,7 @@ import {
   type FusedAttentionConfig,
   type FusedCrossEntropyConfig,
   type FusedLayerNormConfig,
+  type FusedRMSNormConfig,
   type SubOptions,
   type SumOptions,
   type TransposeOptions,
@@ -75,6 +76,7 @@ import {
   fusedLayerNormBackwardGradWeightBiasOp,
   fusedLayerNormBackwardGradXOp,
   fusedLayerNormForwardOp,
+  fusedRMSNormForwardOp,
 } from "./engine-fused";
 
 // Re-export types and shape helpers for backward compatibility.
@@ -2015,6 +2017,11 @@ export class RuntimeEngine {
   fusedLayerNormBackwardGradWeightBias(gradOutput: Tensor, x: Tensor, config: FusedLayerNormConfig): Tensor {
     const { ref, shape } = fusedLayerNormBackwardGradWeightBiasOp(gradOutput.lazyRef, x.lazyRef, gradOutput.device, config);
     return this.createAndTrack(createBaseId(), ref, shape, gradOutput.device);
+  }
+
+  fusedRMSNormForward(x: Tensor, weight: Tensor, config: FusedRMSNormConfig): Tensor {
+    const { ref, shape } = fusedRMSNormForwardOp(x.lazyRef, weight.lazyRef, x.shape, x.device, config);
+    return this.createAndTrack(createBaseId(), ref, shape, x.device);
   }
 
   fusedAttentionForward(q: Tensor, k: Tensor, v: Tensor, config: FusedAttentionConfig): Tensor {

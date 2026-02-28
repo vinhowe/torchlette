@@ -397,6 +397,14 @@ export class Tensor {
     return this.engine.layernorm(this, weight, bias, eps);
   }
 
+  /**
+   * RMS normalization along the last dimension.
+   * rmsnorm(x, weight, eps) = x / rms(x) * weight
+   */
+  rmsnorm(weight: Tensor, eps = 1e-5): Tensor {
+    return this.engine.rmsnorm(this, weight, eps);
+  }
+
   gather(index: Tensor, options: GatherOptions): Tensor {
     return this.engine.gather(this, index, options);
   }

@@ -38,6 +38,7 @@ import { dispatchUnscaleGrad as dispatchUnscaleGradKernel, allocateInfFlagBuffer
 import { dispatchCrossEntropyForward as dispatchCEForwardKernel, dispatchCrossEntropyBackward as dispatchCEBackwardKernel } from "../cross-entropy-kernel";
 import { dispatchFlashAttentionForward as dispatchFAForwardKernel, dispatchFlashAttentionBackwardD as dispatchFABwdDKernel, dispatchFlashAttentionBackwardDQ as dispatchFABwdDQKernel, dispatchFlashAttentionBackwardDKV as dispatchFABwdDKVKernel } from "../attention-kernel";
 import { dispatchLayerNormForward as dispatchLNForwardKernel, dispatchLayerNormBackwardGradX as dispatchLNBwdGradXKernel, dispatchLayerNormBackwardGradWeightBias as dispatchLNBwdGradWBKernel } from "../layernorm-kernel";
+import { dispatchRMSNormForward as dispatchRMSForwardKernel } from "../rmsnorm-kernel";
 
 // ============================================================================
 // Fused Adam/AdamW Step
@@ -336,6 +337,28 @@ export function fusedLayerNormBackwardGradWeightBias(
     gradWeight: createTensor(shape, result.gradWeightBuffer, undefined, 0, "f32", true),
     gradBias: createTensor(shape, result.gradBiasBuffer, undefined, 0, "f32", true),
   };
+}
+
+// ============================================================================
+// Fused RMSNorm (Forward)
+// ============================================================================
+
+export function fusedRMSNormForward(
+  x: BackendTensor,
+  weight: BackendTensor,
+  config: import("../../types").FusedRMSNormConfig,
+): BackendTensor {
+  const xT = ensureContiguous(asGPUTensor(x));
+  const weightT = ensureContiguous(asGPUTensor(weight));
+  const outBuf = dispatchRMSForwardKernel(
+    xT.buffer, weightT.buffer,
+    config.numRows, config.featureDim, config.eps,
+  );
+  if (xT !== x) { bufferPool.decRef(xT.buffer); bufferPool.deferredDestroy(xT.buffer, xT.size * dtypeBytes(xT.dtype)); }
+  if (weightT !== weight) { bufferPool.decRef(weightT.buffer); bufferPool.deferredDestroy(weightT.buffer, weightT.size * dtypeBytes(weightT.dtype)); }
+  const outShape: number[] = [];
+  for (let i = 0; i < xT.shape.length; i++) outShape.push(xT.shape[i]);
+  return createTensor(outShape, outBuf, undefined, 0, "f32");
 }
 
 // ============================================================================
