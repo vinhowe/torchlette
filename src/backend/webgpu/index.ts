@@ -160,7 +160,7 @@ import { beginStep, endStep } from "./shared-encoder";
 import { gt, lt, ge, le, eq, ne, argmax, argmin } from "./ops/comparison";
 import { where } from "./ops/where";
 import { tensorFromArray, zeros, full, arange, tril, triu, rand, randn, bernoulli, _setContiguous } from "./ops/creation";
-import { add, sub, div, mul, sqrt, relu, exp, log, neg, abs, tanh, sigmoid, gelu, silu, isfinite } from "./ops/elementwise";
+import { add, sub, div, mul, sqrt, relu, exp, log, neg, abs, tanh, sigmoid, gelu, silu, sin, cos, rsqrt, floor, ceil, round, sign, clamp, isfinite } from "./ops/elementwise";
 import { cast, reshape, expand, contiguous, narrow, narrowBackward, transpose, permute } from "./ops/views";
 import { matmul } from "./ops/matmul-ops";
 import { gather, scatterAdd } from "./ops/gather-scatter";
@@ -216,6 +216,14 @@ export const webgpuBackend: Backend & {
     sigmoid,
     gelu,
     silu,
+    sin,
+    cos,
+    rsqrt,
+    floor,
+    ceil,
+    round,
+    sign,
+    clamp,
     isfinite,
     expand,
     reshape,

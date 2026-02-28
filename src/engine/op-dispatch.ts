@@ -232,6 +232,32 @@ function executeUnaryOp(
     case "isfinite":
       assertOpSupported("isfinite", backend.ops.isfinite);
       return backend.ops.isfinite(input);
+    case "sin":
+      assertOpSupported("sin", backend.ops.sin);
+      return backend.ops.sin(input, donationOpts);
+    case "cos":
+      assertOpSupported("cos", backend.ops.cos);
+      return backend.ops.cos(input, donationOpts);
+    case "rsqrt":
+      assertOpSupported("rsqrt", backend.ops.rsqrt);
+      return backend.ops.rsqrt(input, donationOpts);
+    case "floor":
+      assertOpSupported("floor", backend.ops.floor);
+      return backend.ops.floor(input, donationOpts);
+    case "ceil":
+      assertOpSupported("ceil", backend.ops.ceil);
+      return backend.ops.ceil(input, donationOpts);
+    case "round":
+      assertOpSupported("round", backend.ops.round);
+      return backend.ops.round(input, donationOpts);
+    case "sign":
+      assertOpSupported("sign", backend.ops.sign);
+      return backend.ops.sign(input, donationOpts);
+    case "clamp": {
+      assertOpSupported("clamp", backend.ops.clamp);
+      const clampPayload = getPayload<{ min: number | null; max: number | null }>(node);
+      return backend.ops.clamp(input, clampPayload?.min ?? null, clampPayload?.max ?? null, donationOpts);
+    }
     case "pow":
       assertOpSupported("pow", backend.ops.pow);
       return backend.ops.pow(input, backendInputs[1]);

@@ -1060,6 +1060,24 @@ export class RuntimeEngine {
     return this.createAndTrack(createBaseId(), createPendingRef(node), shape, resolvedDevice);
   }
 
+  /** Helper: create a simple unary lazy op node. */
+  private _unaryOp(op: LazyOpCode, a: Tensor): Tensor {
+    const node = createLazyIRNode(
+      op,
+      [a.lazyRef],
+      a.shape.slice(),
+      a.dtype,
+      a.device,
+    );
+    return this.createAndTrack(
+      createBaseId(),
+      createPendingRef(node),
+      a.shape.slice(),
+      a.device,
+      a.dtype,
+    );
+  }
+
   /**
    * Ensure dtype safety for an op based on the centralized Op Dtype Registry.
    * - promote_inputs: promote mismatched dtypes to f32
@@ -1365,6 +1383,52 @@ export class RuntimeEngine {
       a.shape.slice(),
       a.dtype,
       a.device,
+    );
+    return this.createAndTrack(
+      createBaseId(),
+      createPendingRef(node),
+      a.shape.slice(),
+      a.device,
+      a.dtype,
+    );
+  }
+
+  sin(a: Tensor): Tensor {
+    return this._unaryOp("sin", a);
+  }
+
+  cos(a: Tensor): Tensor {
+    return this._unaryOp("cos", a);
+  }
+
+  rsqrt(a: Tensor): Tensor {
+    return this._unaryOp("rsqrt", a);
+  }
+
+  floor(a: Tensor): Tensor {
+    return this._unaryOp("floor", a);
+  }
+
+  ceil(a: Tensor): Tensor {
+    return this._unaryOp("ceil", a);
+  }
+
+  round(a: Tensor): Tensor {
+    return this._unaryOp("round", a);
+  }
+
+  sign(a: Tensor): Tensor {
+    return this._unaryOp("sign", a);
+  }
+
+  clamp(a: Tensor, min: number | null, max: number | null): Tensor {
+    const node = createLazyIRNode(
+      "clamp",
+      [a.lazyRef],
+      a.shape.slice(),
+      a.dtype,
+      a.device,
+      { min, max },
     );
     return this.createAndTrack(
       createBaseId(),

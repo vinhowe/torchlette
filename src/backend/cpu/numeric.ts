@@ -577,6 +577,81 @@ export function silu(a: Tensor): Tensor {
   return new Tensor(a.shape, out);
 }
 
+export function sin(a: Tensor): Tensor {
+  const out = new Float32Array(a.size);
+  const shapeStrides = computeStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) {
+    out[i] = Math.sin(readAtLinear(a, i, shapeStrides));
+  }
+  return new Tensor(a.shape, out);
+}
+
+export function cos(a: Tensor): Tensor {
+  const out = new Float32Array(a.size);
+  const shapeStrides = computeStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) {
+    out[i] = Math.cos(readAtLinear(a, i, shapeStrides));
+  }
+  return new Tensor(a.shape, out);
+}
+
+export function rsqrt(a: Tensor): Tensor {
+  const out = new Float32Array(a.size);
+  const shapeStrides = computeStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) {
+    out[i] = 1.0 / Math.sqrt(readAtLinear(a, i, shapeStrides));
+  }
+  return new Tensor(a.shape, out);
+}
+
+export function floor(a: Tensor): Tensor {
+  const out = new Float32Array(a.size);
+  const shapeStrides = computeStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) {
+    out[i] = Math.floor(readAtLinear(a, i, shapeStrides));
+  }
+  return new Tensor(a.shape, out);
+}
+
+export function ceil(a: Tensor): Tensor {
+  const out = new Float32Array(a.size);
+  const shapeStrides = computeStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) {
+    out[i] = Math.ceil(readAtLinear(a, i, shapeStrides));
+  }
+  return new Tensor(a.shape, out);
+}
+
+export function round(a: Tensor): Tensor {
+  const out = new Float32Array(a.size);
+  const shapeStrides = computeStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) {
+    out[i] = Math.round(readAtLinear(a, i, shapeStrides));
+  }
+  return new Tensor(a.shape, out);
+}
+
+export function sign(a: Tensor): Tensor {
+  const out = new Float32Array(a.size);
+  const shapeStrides = computeStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) {
+    out[i] = Math.sign(readAtLinear(a, i, shapeStrides));
+  }
+  return new Tensor(a.shape, out);
+}
+
+export function clamp(a: Tensor, min: number | null, max: number | null): Tensor {
+  const out = new Float32Array(a.size);
+  const shapeStrides = computeStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) {
+    let v = readAtLinear(a, i, shapeStrides);
+    if (min !== null && v < min) v = min;
+    if (max !== null && v > max) v = max;
+    out[i] = v;
+  }
+  return new Tensor(a.shape, out);
+}
+
 /**
  * Check if values are finite (not NaN and not Inf).
  * Returns 1.0 where finite, 0.0 where NaN or Inf.
