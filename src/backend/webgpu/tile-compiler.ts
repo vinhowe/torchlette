@@ -1733,6 +1733,136 @@ function collectSubExprIds(node: IRNode, ids: Set<number>): void {
 }
 
 /**
+ * Walk an IR expression tree and push every non-trivial, memory-read-free node
+ * occurrence (NOT deduplicated). Same node appearing N times produces N entries.
+ */
+function countExprCSEOccurrences(node: IRNode, out: { id: number; node: IRNode }[]): void {
+  if (node.id < 0 || isTrivialNode(node)) return;
+  if (!exprContainsMemoryRead(node)) {
+    out.push({ id: node.id, node });
+  }
+  switch (node.kind) {
+    case "binary":
+      countExprCSEOccurrences(node.lhs, out);
+      countExprCSEOccurrences(node.rhs, out);
+      break;
+    case "unary": case "cast":
+      countExprCSEOccurrences(node.input, out);
+      break;
+    case "bitcast":
+      countExprCSEOccurrences(node.input, out);
+      break;
+    case "cmp":
+      countExprCSEOccurrences(node.lhs, out);
+      countExprCSEOccurrences(node.rhs, out);
+      break;
+    case "select":
+      countExprCSEOccurrences(node.condition, out);
+      countExprCSEOccurrences(node.trueVal, out);
+      countExprCSEOccurrences(node.falseVal, out);
+      break;
+    case "subgroupShuffleXor":
+      countExprCSEOccurrences(node.value, out);
+      countExprCSEOccurrences(node.mask, out);
+      break;
+    case "subgroupAdd": case "subgroupMax": case "subgroupMin":
+    case "subgroupBroadcastFirst": case "subgroupInclusiveAdd":
+      countExprCSEOccurrences(node.value, out);
+      break;
+    case "vec4Construct":
+      countExprCSEOccurrences(node.x, out);
+      countExprCSEOccurrences(node.y, out);
+      countExprCSEOccurrences(node.z, out);
+      countExprCSEOccurrences(node.w, out);
+      break;
+    case "vec4Splat": countExprCSEOccurrences(node.value, out); break;
+    case "vec4NativeDot":
+      countExprCSEOccurrences(node.a, out);
+      countExprCSEOccurrences(node.b, out);
+      break;
+    case "vec4Component": countExprCSEOccurrences(node.value, out); break;
+    case "vec4Binary":
+      countExprCSEOccurrences(node.a, out);
+      countExprCSEOccurrences(node.b, out);
+      break;
+    case "load":
+      countExprCSEOccurrences(node.offsets, out);
+      if (node.mask) countExprCSEOccurrences(node.mask, out);
+      break;
+    case "sharedRead":
+    case "vec4SharedRead":
+    case "arrayRead":
+    case "vec4ArrayRead":
+      countExprCSEOccurrences(node.idx, out);
+      break;
+  }
+}
+
+/**
+ * Count all CSE candidate occurrences from expressions in a single statement.
+ * Unlike collectStmtCSENodes, does NOT deduplicate — same node appearing N
+ * times produces N occurrences. Also does NOT recurse into child bodies
+ * (forRange/forStride/if/ifElse) — those are handled by autoCSE's recursive
+ * call into child scopes. Only counts expressions at this scope level (loop
+ * bounds, conditions, and leaf statement expressions).
+ */
+function countStmtCSEOccurrences(stmt: Statement, out: { id: number; node: IRNode }[]): void {
+  switch (stmt.kind) {
+    case "let": case "var":
+      countExprCSEOccurrences(stmt.value, out);
+      break;
+    case "assign": case "addAssign":
+      countExprCSEOccurrences(stmt.value, out);
+      break;
+    case "indexAssign": case "indexAddAssign":
+      countExprCSEOccurrences(stmt.idx, out);
+      countExprCSEOccurrences(stmt.value, out);
+      break;
+    case "forRange":
+      // Only count loop bounds at this scope — body handled by recursive autoCSE
+      countExprCSEOccurrences(stmt.start, out);
+      countExprCSEOccurrences(stmt.bound, out);
+      break;
+    case "forStride":
+      countExprCSEOccurrences(stmt.start, out);
+      countExprCSEOccurrences(stmt.bound, out);
+      break;
+    case "if":
+      countExprCSEOccurrences(stmt.condition, out);
+      break;
+    case "ifElse":
+      countExprCSEOccurrences(stmt.condition, out);
+      break;
+    case "sharedWrite":
+      countExprCSEOccurrences(stmt.idx, out);
+      countExprCSEOccurrences(stmt.value, out);
+      break;
+    case "guardedStore":
+      countExprCSEOccurrences(stmt.condition, out);
+      countExprCSEOccurrences(stmt.idx, out);
+      countExprCSEOccurrences(stmt.value, out);
+      break;
+    case "directStore":
+      countExprCSEOccurrences(stmt.idx, out);
+      countExprCSEOccurrences(stmt.value, out);
+      break;
+    case "atomicOp":
+      countExprCSEOccurrences(stmt.idx, out);
+      countExprCSEOccurrences(stmt.value, out);
+      break;
+    case "atomicCAS":
+      countExprCSEOccurrences(stmt.idx, out);
+      countExprCSEOccurrences(stmt.expected, out);
+      countExprCSEOccurrences(stmt.desired, out);
+      break;
+    case "vec4ArrayWrite": case "vec4ArrayAddAssign":
+      countExprCSEOccurrences(stmt.idx, out);
+      countExprCSEOccurrences(stmt.value, out);
+      break;
+  }
+}
+
+/**
  * Auto-CSE pass: inject `let` bindings for multi-use expression nodes.
  *
  * Processes bottom-up (inner scopes first). At each scope, counts per-statement
@@ -1746,8 +1876,18 @@ function collectSubExprIds(node: IRNode, ids: Set<number>): void {
  * LICM runs after this pass and hoists loop-invariant injected bindings.
  */
 export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Set()): Statement[] {
-  // Phase 1: Count per-statement references at this scope (walks into children)
-  // Each statement contributes at most 1 count per node ID
+  // Phase 1: Count references at this scope using two strategies:
+  //
+  // (a) Cross-statement sharing: per-statement dedup (walks into children).
+  //     A node in statement A and statement B gets count += 2.
+  //     This is the original behavior that correctly handles cross-scope sharing
+  //     (e.g., a node used in a loop body AND after the loop).
+  //
+  // (b) Intra-expression sharing: per-occurrence counting (no child body recursion).
+  //     A node used twice within a single leaf statement (e.g., x.mul(x)) gets
+  //     count += 2 instead of += 1. This catches the case the dedup approach missed.
+  //
+  // We take the max count from both strategies for each node.
   const refCounts = new Map<number, { count: number; node: IRNode; firstIdx: number }>();
   const letValueIds = new Set<number>();
 
@@ -1757,15 +1897,39 @@ export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Se
       letValueIds.add(stmt.value.id);
     }
 
+    // Strategy (a): deduped per-statement (walks into children for cross-scope detection)
     const nodeSet = new Map<number, IRNode>();
     collectStmtCSENodes(stmt, nodeSet);
-
     for (const [id, node] of nodeSet) {
       const entry = refCounts.get(id);
       if (entry) {
         entry.count++;
       } else {
         refCounts.set(id, { count: 1, node, firstIdx: i });
+      }
+    }
+
+    // Strategy (b): occurrence counting at this scope level (no child body recursion)
+    // Only add extra counts for nodes that appeared more than once per-occurrence
+    // but only once in the dedup set (intra-expression sharing within this statement)
+    const occurrences: { id: number; node: IRNode }[] = [];
+    countStmtCSEOccurrences(stmt, occurrences);
+    const occCounts = new Map<number, { count: number; node: IRNode }>();
+    for (const { id, node } of occurrences) {
+      const e = occCounts.get(id);
+      if (e) e.count++;
+      else occCounts.set(id, { count: 1, node });
+    }
+    for (const [id, { count: occCount, node }] of occCounts) {
+      if (occCount > 1) {
+        // This node appeared multiple times within this single statement's expressions
+        // Ensure refCounts reflects this (may already be >= occCount from cross-statement)
+        const entry = refCounts.get(id);
+        if (entry && entry.count < occCount) {
+          entry.count = occCount;
+        } else if (!entry) {
+          refCounts.set(id, { count: occCount, node, firstIdx: i });
+        }
       }
     }
   }
