@@ -1369,6 +1369,34 @@ export class Torchlette {
     ]);
   }
 
+  squeeze(a: Tensor, dim?: number): Tensor {
+    this._assertUsable(a);
+    const aShape = a.shape;
+    let newShape: number[];
+    if (dim !== undefined) {
+      const d = dim < 0 ? dim + aShape.length : dim;
+      newShape = aShape[d] === 1 ? [...aShape.slice(0, d), ...aShape.slice(d + 1)] : [...aShape];
+    } else {
+      newShape = aShape.filter(s => s !== 1);
+    }
+    if (newShape.length === aShape.length) return a; // nothing to squeeze
+    const inner = this.runtime.reshape(a._unwrap(), newShape);
+    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => [
+      this.runtime.reshape(grad, aShape),
+    ]);
+  }
+
+  unsqueeze(a: Tensor, dim: number): Tensor {
+    this._assertUsable(a);
+    const aShape = a.shape;
+    const d = dim < 0 ? dim + aShape.length + 1 : dim;
+    const newShape = [...aShape.slice(0, d), 1, ...aShape.slice(d)];
+    const inner = this.runtime.reshape(a._unwrap(), newShape);
+    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => [
+      this.runtime.reshape(grad, aShape),
+    ]);
+  }
+
   transpose(a: Tensor, options: TransposeOptions): Tensor {
     this._assertUsable(a);
     const inner = this.runtime.transpose(a._unwrap(), options);
