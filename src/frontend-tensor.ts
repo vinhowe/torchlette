@@ -227,6 +227,14 @@ export class Tensor {
     return this.engine.silu(this);
   }
 
+  softplus(): Tensor {
+    return this.engine.softplus(this);
+  }
+
+  fmod(other: Tensor): Tensor {
+    return this.engine.fmod(this, other);
+  }
+
   sin(): Tensor {
     return this.engine.sin(this);
   }
