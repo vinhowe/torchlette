@@ -8,10 +8,10 @@
  * The dispatch infrastructure is unchanged — we just swap the WGSL generation.
  */
 
-import { type TileKernelSpec, type DataType, type BlockExpr, type KernelContext, ceilDivGrid, singleWorkgroup } from "../tile-ir";
+import { type TileKernelSpec, type DataType, type BlockExpr, type KernelContext, ceilDivGrid, singleWorkgroup, buildPtr, buildMask } from "../tile-ir";
 import type { CodegenOptions } from "./types";
 import { getWorkgroupSize, type DType } from "./types";
-import { TileOps, BlockOps, Block, TileRange, buildPtr, buildMask, type TileConfig } from "../tile-ops";
+import { TileOps, type TileConfig } from "../tile-ops";
 import {
   composeBlockOpsEpilogue,
   composeTileOpsEpilogue,
@@ -251,9 +251,9 @@ function matmulKernelBlockOps(
   const { batched, kSplit } = opts;
   const { tileM, tileN, tileK, threadTileM, threadTileN, wgSizeX, wgSizeY, transA, transB, outputDtype } = p;
 
-  const ops = new BlockOps(ctx, {
-    wgSize: [wgSizeX, wgSizeY],
-    threadTile: [threadTileM, threadTileN],
+  // Initialize tile context — creates BlockOps, emits thread position bindings
+  const { threadRow, threadCol } = ctx.configureTiles({
+    tileM, tileN, threadTileM, threadTileN, wgSize: [wgSizeX, wgSizeY],
   });
 
   // 1. Uniforms
@@ -288,15 +288,13 @@ function matmulKernelBlockOps(
     batchOffC = ctx.emitLet("batch_offset_c", batchIdx.mul(ctx.uniform("batchStrideC")));
   }
 
-  // 3. Workgroup + thread positions
+  // 3. Workgroup positions
   const wgRow = ctx.emitLet("wg_row", ctx.programId(1).mul(ctx.const(tileM, "u32")));
   const wgCol = ctx.emitLet("wg_col", ctx.programId(0).mul(ctx.const(tileN, "u32")));
-  const threadRow = ctx.emitLet("thread_row", ctx.threadIdx(1));
-  const threadCol = ctx.emitLet("thread_col", ctx.threadIdx(0));
 
-  // 4. Block ranges
-  const offsM = ops.arange(wgRow, tileM);
-  const offsN = ops.arange(wgCol, tileN);
+  // 4. Block ranges — ≈ tl.arange(wgRow, wgRow + BLOCK_M)
+  const offsM = ctx.tileRange(wgRow, tileM);
+  const offsN = ctx.tileRange(wgCol, tileN);
 
   // 5. Transpose strides
   const cOne = ctx.const(1, "u32");
@@ -305,8 +303,8 @@ function matmulKernelBlockOps(
   const strideBk = transB ? cOne : ldb;
   const strideBn = transB ? ldb : cOne;
 
-  // 6. Accumulator — per-thread [threadTileM × threadTileN]
-  const acc = ops.zeros(threadTileM, threadTileN);
+  // 6. Accumulator — ≈ tl.zeros([BLOCK_M, BLOCK_N])
+  const acc = ctx.blockZeros(threadTileM, threadTileN);
 
   // 7. K-loop bounds
   let kStart: BlockExpr;
@@ -331,27 +329,27 @@ function matmulKernelBlockOps(
   // 8. K-loop — the core matmul
   ctx.forRange(ctx.const(0, "u32"), numKTiles, (kTile) => {
     const kOffset = ctx.emitLet("k_offset", kStart.add(kTile.mul(cTK)));
-    const offsK = ops.arange(kOffset, tileK);
+    const offsK = ctx.tileRange(kOffset, tileK);
 
-    // Cooperative tile loads using loadTile (→ shared memory)
-    const aPtr = buildPtr(batchOffA, offsM.outer(strideAm), offsK.inner(strideAk));
-    const aMask = buildMask(offsM.lt(m), offsK.lt(kEnd));
-    const a = ops.loadTile("a", aPtr, aMask);
+    // Cooperative tile loads — ≈ tl.load(a_ptr, mask=a_mask)
+    const aPtr = ctx.tilePtr(batchOffA, offsM.outer(strideAm), offsK.inner(strideAk));
+    const aMask = ctx.tileMask(offsM.lt(m), offsK.lt(kEnd));
+    const a = ctx.tileLoad2D("a", aPtr, aMask);
 
-    const bPtr = buildPtr(batchOffB, offsK.outer(strideBk), offsN.inner(strideBn));
-    const bMask = buildMask(offsK.lt(kEnd), offsN.lt(n));
-    const b = ops.loadTile("b", bPtr, bMask);
+    const bPtr = ctx.tilePtr(batchOffB, offsK.outer(strideBk), offsN.inner(strideBn));
+    const bMask = ctx.tileMask(offsK.lt(kEnd), offsN.lt(n));
+    const b = ctx.tileLoad2D("b", bPtr, bMask);
 
-    // acc += a @ b — shared × shared outer product
-    ops.dotAccum(a, b, acc);
+    // acc += a @ b — ≈ acc += tl.dot(a, b)
+    ctx.dotAccum(a, b, acc);
   });
 
   // 9. Store — two paths: K-split (raw partials) vs normal (with optional post-accumulate)
   if (kSplit) {
     const splitBase = ctx.emitLet("split_base", splitIdx!.mul(m.mul(n)));
-    const outPtr = buildPtr(splitBase, offsM.outer(ldc), offsN.inner(cOne));
-    const outMask = buildMask(offsM.lt(m), offsN.lt(n));
-    ops.storeTile("out", acc, outPtr, outMask);
+    const outPtr = ctx.tilePtr(splitBase, offsM.outer(ldc), offsN.inner(cOne));
+    const outMask = ctx.tileMask(offsM.lt(m), offsN.lt(n));
+    ctx.tileStore2D("out", acc, outPtr, outMask);
   } else {
     acc.mul_(alpha.toF32());
 
@@ -360,14 +358,14 @@ function matmulKernelBlockOps(
         wgRow.add(threadRow.mul(ctx.const(threadTileM, "u32"))).mul(ldc)
           .add(wgCol.add(threadCol.mul(ctx.const(threadTileN, "u32"))))
       ));
-      postAccumulate(ctx, ops, acc, { offsN, threadOutBase, threadOutStride: ldc });
+      postAccumulate(ctx, ctx.tileOps, acc, { offsN, threadOutBase, threadOutStride: ldc });
     } else if (outputDtype === "f16") {
       acc.castTo_("f16");
     }
 
-    const outPtr = buildPtr(batchOffC, offsM.outer(ldc), offsN.inner(cOne));
-    const outMask = buildMask(offsM.lt(m), offsN.lt(n));
-    ops.storeTile("out", acc, outPtr, outMask);
+    const outPtr = ctx.tilePtr(batchOffC, offsM.outer(ldc), offsN.inner(cOne));
+    const outMask = ctx.tileMask(offsM.lt(m), offsN.lt(n));
+    ctx.tileStore2D("out", acc, outPtr, outMask);
   }
 }
 
