@@ -598,9 +598,7 @@ const mulScalarInPlaceSpec: TileKernelSpec = {
   },
   grid: elementwiseGrid(WG_MUL, { elementUniform: "size" }),
   kernel(ctx) {
-    const idx = ctx.flatGlobalId(WG_MUL);
-    const size = ctx.uniform("size");
-    ctx.ifThen(idx.ge(size), () => ctx.emitReturn());
+    const idx = ctx.elementIndex(WG_MUL);
     const scalar = ctx.uniform("scalar").toF32();
     ctx.emitStore("data", idx, ctx.load("data", idx).mul(scalar));
   },
