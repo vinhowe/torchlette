@@ -1068,6 +1068,115 @@ export function flatAddSpec(): TileKernelSpec {
 }
 
 // ============================================================================
+// Matmul Column Slice / Scatter Kernels
+// ============================================================================
+
+/**
+ * Extract column slice from a 2D matrix to a contiguous buffer.
+ * Input: [numRows, N] (may be offset-bound for chunking), Output: [K, sliceWidth].
+ * Uniforms: numRows, N, colStart, sliceWidth, rowStart.
+ */
+export function sliceColumnsTileIR(): string {
+  const spec: TileKernelSpec = {
+    name: "sliceColumns",
+    workgroupSize: WG,
+    bindings: {
+      input: { storage: "read", type: "f32" },
+      output: { storage: "read_write", type: "f32" },
+    },
+    uniforms: { numRows: "u32", N: "u32", colStart: "u32", sliceWidth: "u32", rowStart: "u32" },
+    grid: elementwiseGrid(WG),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+      const totalSize = ctx.uniform("numRows").mul(ctx.uniform("sliceWidth"));
+      ctx.ifThen(idx.ge(totalSize), () => ctx.emitReturn());
+
+      const localRow = idx.div(ctx.uniform("sliceWidth"));
+      const col = idx.mod(ctx.uniform("sliceWidth"));
+      const srcCol = ctx.uniform("colStart").add(col);
+      // Input offset relative to chunk start (row 0 of bound range)
+      const srcIdx = localRow.mul(ctx.uniform("N")).add(srcCol);
+      // Output accounts for rowStart
+      const dstIdx = ctx.uniform("rowStart").add(localRow).mul(ctx.uniform("sliceWidth")).add(col);
+
+      ctx.emitStore("output", dstIdx, ctx.load("input", srcIdx));
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+/**
+ * Write partial matmul result to columns of output buffer.
+ * Input: [M, sliceWidth], Output: [M, N], writes to columns [colStart, colStart+sliceWidth).
+ * Uniforms: numRows, N, colStart, sliceWidth, rowStart (unused, kept for compat), inputRowStart.
+ */
+export function scatterColumnsTileIR(): string {
+  const spec: TileKernelSpec = {
+    name: "scatterColumns",
+    workgroupSize: WG,
+    bindings: {
+      input: { storage: "read", type: "f32" },
+      output: { storage: "read_write", type: "f32" },
+    },
+    uniforms: { numRows: "u32", N: "u32", colStart: "u32", sliceWidth: "u32", rowStart: "u32", inputRowStart: "u32" },
+    grid: elementwiseGrid(WG),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+      const totalSize = ctx.uniform("numRows").mul(ctx.uniform("sliceWidth"));
+      ctx.ifThen(idx.ge(totalSize), () => ctx.emitReturn());
+
+      const localRow = idx.div(ctx.uniform("sliceWidth"));
+      const col = idx.mod(ctx.uniform("sliceWidth"));
+
+      // Input: relative to bound chunk
+      const inputIdx = ctx.uniform("inputRowStart").add(localRow).mul(ctx.uniform("sliceWidth")).add(col);
+      // Output: write to local row, column colStart + col (relative to bound chunk)
+      const outputIdx = localRow.mul(ctx.uniform("N")).add(ctx.uniform("colStart").add(col));
+
+      ctx.emitStore("output", outputIdx, ctx.load("input", inputIdx));
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+/**
+ * Slice columns from B matrix for chunked output matmul.
+ * Input: [batch, K, N], Output: [batch, K, chunkWidth].
+ * Uniforms: batch, K, N, colStart, chunkWidth.
+ */
+export function sliceBColumnsTileIR(): string {
+  const spec: TileKernelSpec = {
+    name: "sliceBColumns",
+    workgroupSize: WG,
+    bindings: {
+      input: { storage: "read", type: "f32" },
+      output: { storage: "read_write", type: "f32" },
+    },
+    uniforms: { batch: "u32", K: "u32", N: "u32", colStart: "u32", chunkWidth: "u32" },
+    grid: elementwiseGrid(WG),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+      const totalSize = ctx.uniform("batch").mul(ctx.uniform("K")).mul(ctx.uniform("chunkWidth"));
+      ctx.ifThen(idx.ge(totalSize), () => ctx.emitReturn());
+
+      // Decompose flat idx to (batchIdx, k, c) in output space
+      const cw = ctx.uniform("chunkWidth");
+      const c = idx.mod(cw);
+      const k = idx.div(cw).mod(ctx.uniform("K"));
+      const batchIdx = idx.div(ctx.uniform("K").mul(cw));
+
+      // Input offset: (batchIdx, k, colStart + c) in [batch, K, N]
+      const inputOffset = batchIdx.mul(ctx.uniform("K").mul(ctx.uniform("N")))
+        .add(k.mul(ctx.uniform("N")))
+        .add(ctx.uniform("colStart").add(c));
+
+      ctx.emitStore("output", idx, ctx.load("input", inputOffset));
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+// ============================================================================
 // RNG Kernels (Philox 2x32-10)
 // ============================================================================
 

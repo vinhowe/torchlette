@@ -17,10 +17,10 @@ import {
   releaseParamsBuffer,
   params5,
   params6,
-  params7,
 } from "../bind-group-cache";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
 import { ensureContiguous } from "./views";
+import { sliceColumnsTileIR, scatterColumnsTileIR, sliceBColumnsTileIR } from "./ops-tile-ir";
 
 /** Local type alias for GPU buffer binding descriptors with offset/size. */
 type GPUBufferBinding = { buffer: GPUBuffer; offset?: number; size?: number };
@@ -97,49 +97,13 @@ function sliceColumns(
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
-  // Shader to copy column slice (with row offset support for chunking)
-  const shaderCode = `
-    struct Params {
-      numRows: u32,
-      N: u32,
-      colStart: u32,
-      sliceWidth: u32,
-      rowStart: u32,
-      gridStride: u32,
-    }
-
-    @group(0) @binding(0) var<storage, read> input: array<f32>;
-    @group(0) @binding(1) var<storage, read_write> output: array<f32>;
-    @group(0) @binding(2) var<uniform> params: Params;
-
-    @compute @workgroup_size(${WORKGROUP_SIZE})
-    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-      let idx = gid.y * params.gridStride + gid.x;
-      let totalSize = params.numRows * params.sliceWidth;
-      if (idx >= totalSize) { return; }
-
-      let localRow = idx / params.sliceWidth;
-      let col = idx % params.sliceWidth;
-      let srcCol = params.colStart + col;
-      // Input offset is relative to chunk start (row 0 of bound range)
-      let srcIdx = localRow * params.N + srcCol;
-      // Output offset accounts for rowStart
-      let dstIdx = (params.rowStart + localRow) * params.sliceWidth + col;
-
-      output[dstIdx] = input[srcIdx];
-    }
-  `;
-
-  const module = ctx.device.createShaderModule({ code: shaderCode });
-  const pipeline = ctx.device.createComputePipeline({
-    layout: "auto",
-    compute: { module, entryPoint: "main" },
-  });
+  const code = sliceColumnsTileIR();
+  const pipeline = getPipeline(ctx, `sliceColumns`, code);
 
   if (!needsChunking) {
     // Fast path: single dispatch
     const dispatch = compute2DDispatch(Math.ceil(outSize / WORKGROUP_SIZE));
-    const paramsBuffer = createParamsBuffer(ctx.device, params6(K, N, colStart, sliceWidth, 0, dispatch.gridSizeX * WORKGROUP_SIZE));
+    const paramsBuffer = createParamsBuffer(ctx.device, params5(K, N, colStart, sliceWidth, 0));
 
     const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [input.buffer, outBuffer, paramsBuffer]);
 
@@ -151,14 +115,11 @@ function sliceColumns(
     const bytesPerRow = N * 4;
 
     // Calculate how many rows must group together for aligned offsets
-    // We need rowStart * bytesPerRow to be divisible by minAlignment
-    // Find the smallest rowAlignment where rowAlignment * bytesPerRow % minAlignment == 0
     const g_ = gcd(bytesPerRow, minAlignment);
     const rowAlignment = minAlignment / g_;
 
     // How many rows fit in maxBindingSize?
     const maxRowsUnaligned = Math.floor(maxBindingSize / bytesPerRow);
-    // Round down to nearest multiple of rowAlignment
     const rowsPerChunk = Math.max(rowAlignment, Math.floor(maxRowsUnaligned / rowAlignment) * rowAlignment);
 
     const numRowChunks = Math.ceil(K / rowsPerChunk);
@@ -168,16 +129,15 @@ function sliceColumns(
       const rowEnd = Math.min(rowStart + rowsPerChunk, K);
       const numRows = rowEnd - rowStart;
 
-      // Calculate byte offset and size for this chunk
       const byteOffset = rowStart * bytesPerRow;
       const chunkByteSize = numRows * bytesPerRow;
 
       const chunkSize = numRows * sliceWidth;
       const dispatch = compute2DDispatch(Math.ceil(chunkSize / WORKGROUP_SIZE));
 
-      const paramsBuffer = createParamsBuffer(ctx.device, params6(numRows, N, colStart, sliceWidth, rowStart, dispatch.gridSizeX * WORKGROUP_SIZE));
+      const paramsBuffer = createParamsBuffer(ctx.device, params5(numRows, N, colStart, sliceWidth, rowStart));
 
-      const bindGroup = profiledCreateBindGroup(ctx.device,{
+      const bindGroup = profiledCreateBindGroup(ctx.device, {
         layout: pipeline.getBindGroupLayout(0),
         entries: [
           {
@@ -228,52 +188,14 @@ function scatterColumnsToOutput(
 
   const needsChunking = outputBufferSize > maxBindingSize || inputBufferSize > maxBindingSize;
 
-  const shaderCode = `
-    struct Params {
-      numRows: u32,
-      N: u32,
-      colStart: u32,
-      sliceWidth: u32,
-      rowStart: u32,
-      inputRowStart: u32,
-      gridStride: u32,
-    }
-
-    @group(0) @binding(0) var<storage, read> input: array<f32>;
-    @group(0) @binding(1) var<storage, read_write> output: array<f32>;
-    @group(0) @binding(2) var<uniform> params: Params;
-
-    @compute @workgroup_size(${WORKGROUP_SIZE})
-    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-      let idx = gid.y * params.gridStride + gid.x;
-      let totalSize = params.numRows * params.sliceWidth;
-      if (idx >= totalSize) { return; }
-
-      let localRow = idx / params.sliceWidth;
-      let col = idx % params.sliceWidth;
-
-      // Input index: relative to bound chunk
-      let inputIdx = (params.inputRowStart + localRow) * params.sliceWidth + col;
-
-      // Output: write to row (rowStart + localRow), column (colStart + col)
-      // Output offset is relative to bound chunk
-      let outputIdx = localRow * params.N + (params.colStart + col);
-
-      output[outputIdx] = input[inputIdx];
-    }
-  `;
-
-  const module = ctx.device.createShaderModule({ code: shaderCode });
-  const pipeline = ctx.device.createComputePipeline({
-    layout: "auto",
-    compute: { module, entryPoint: "main" },
-  });
+  const code = scatterColumnsTileIR();
+  const pipeline = getPipeline(ctx, `scatterColumns`, code);
 
   if (!needsChunking) {
     // Fast path: single dispatch
     const totalSize = totalRows * sliceWidth;
     const dispatch = compute2DDispatch(Math.ceil(totalSize / WORKGROUP_SIZE));
-    const paramsBuffer = createParamsBuffer(ctx.device, params7(totalRows, N, colStart, sliceWidth, 0, 0, dispatch.gridSizeX * WORKGROUP_SIZE));
+    const paramsBuffer = createParamsBuffer(ctx.device, params6(totalRows, N, colStart, sliceWidth, 0, 0));
 
     const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [partial.buffer, outBuffer, paramsBuffer]);
 
@@ -282,8 +204,6 @@ function scatterColumnsToOutput(
     releaseParamsBuffer(paramsBuffer);
   } else {
     // Chunked path: process rows in chunks
-    // Output row size in bytes = N * 4
-    // Input row size in bytes = sliceWidth * 4
     const outputBytesPerRow = N * 4;
     const inputBytesPerRow = sliceWidth * 4;
 
@@ -311,7 +231,6 @@ function scatterColumnsToOutput(
       const rowEnd = Math.min(rowStart + alignedRowsPerChunk, totalRows);
       const numRows = rowEnd - rowStart;
 
-      // Calculate byte offsets
       const outputByteOffset = rowStart * outputBytesPerRow;
       const inputByteOffset = rowStart * inputBytesPerRow;
 
@@ -321,9 +240,9 @@ function scatterColumnsToOutput(
       const chunkSize = numRows * sliceWidth;
       const dispatch = compute2DDispatch(Math.ceil(chunkSize / WORKGROUP_SIZE));
 
-      const paramsBuffer = createParamsBuffer(ctx.device, params7(numRows, N, colStart, sliceWidth, 0, 0, dispatch.gridSizeX * WORKGROUP_SIZE));
+      const paramsBuffer = createParamsBuffer(ctx.device, params6(numRows, N, colStart, sliceWidth, 0, 0));
 
-      const bindGroup = profiledCreateBindGroup(ctx.device,{
+      const bindGroup = profiledCreateBindGroup(ctx.device, {
         layout: pipeline.getBindGroupLayout(0),
         entries: [
           {
@@ -755,51 +674,15 @@ function sliceBColumns(
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
-  // Shader to copy column slice
-  const sliceTotalWG = Math.ceil(outSize / WORKGROUP_SIZE);
-  const sliceDispatch = compute2DDispatch(sliceTotalWG);
-  const sliceUse2D = sliceDispatch.y > 1;
-  const sliceGridSizeX = sliceDispatch.x * WORKGROUP_SIZE;
+  const code = sliceBColumnsTileIR();
+  const pipeline = getPipeline(ctx, `sliceBColumns`, code);
 
-  const code = `
-struct Params {
-  batch: u32,
-  K: u32,
-  N: u32,
-  colStart: u32,
-  chunkWidth: u32,
-};
-
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> output: array<f32>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = ${sliceUse2D ? `gid.x + gid.y * ${sliceGridSizeX}u` : "gid.x"};
-  let totalSize = params.batch * params.K * params.chunkWidth;
-  if (idx >= totalSize) { return; }
-
-  // Convert flat idx to (b, k, c) in output space
-  let c = idx % params.chunkWidth;
-  let k = (idx / params.chunkWidth) % params.K;
-  let batchIdx = idx / (params.K * params.chunkWidth);
-
-  // Compute input offset: (batchIdx, k, colStart + c)
-  let inputOffset = batchIdx * params.K * params.N + k * params.N + params.colStart + c;
-
-  output[idx] = input[inputOffset];
-}
-`;
-
-  const key = `sliceBColumns:${batch}:${K}:${N}:${WORKGROUP_SIZE}:${sliceUse2D ? "2d" : "1d"}`;
-  const pipeline = getPipeline(ctx, key, code);
-
+  const dispatch = compute2DDispatch(Math.ceil(outSize / WORKGROUP_SIZE));
   const paramsBuffer = createParamsBuffer(ctx.device, params5(batch, K, N, colStart, chunkWidth));
 
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [b.buffer, outBuffer, paramsBuffer]);
 
-  dispatchComputePass(pipeline, bindGroup, sliceDispatch.x, sliceDispatch.y);
+  dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
 
   releaseParamsBuffer(paramsBuffer);
 
