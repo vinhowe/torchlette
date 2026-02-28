@@ -6,7 +6,7 @@
 import type { WebGPUTensor } from "../gpu-types";
 import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import { sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch, dtypeBytes, alignBufferSize } from "../shape-utils";
-import { fillWGSL, arangeWGSL, triangularWGSL } from "./ops-tile-ir";
+import { fillWGSL, arangeWGSL, triangularWGSL, randWGSL, randnWGSL, bernoulliWGSL } from "./ops-tile-ir";
 import { requireContext, f32ArrayToF16Array } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { createTensor, createTrackedBuffer, createBufferWithData } from "../tensor";
@@ -237,121 +237,17 @@ export function triu(a: WebGPUTensor, k = 0): WebGPUTensor {
 }
 
 // ============================================================================
-// GPU RNG (PCG32)
+// GPU RNG (Philox 2x32-10 via tile-IR)
 // ============================================================================
 
-const PCG32_WGSL = `
-fn pcg32(state: ptr<function, u32>) -> u32 {
-  let old = *state;
-  *state = old * 747796405u + 2891336453u;
-  let word = ((old >> ((old >> 28u) + 4u)) ^ old) * 277803737u;
-  return (word >> 22u) ^ word;
-}
+let _randWGSL: string | null = null;
+function getRandWGSL(): string { return _randWGSL ?? (_randWGSL = randWGSL()); }
 
-fn pcg32_init(seed: u32, seq: u32) -> u32 {
-  var state = 0u;
-  state = state * 747796405u + ((seq << 1u) | 1u);
-  state = state + seed;
-  state = state * 747796405u + ((seq << 1u) | 1u);
-  return state;
-}
-`;
+let _randnWGSL: string | null = null;
+function getRandnWGSL(): string { return _randnWGSL ?? (_randnWGSL = randnWGSL()); }
 
-function randShader(gridSizeX: number): string {
-  const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-  return `
-${PCG32_WGSL}
-
-struct Params {
-  size: u32,
-  seed: u32,
-};
-
-@group(0) @binding(0) var<storage, read_write> out: array<f32>;
-@group(0) @binding(1) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.size) { return; }
-  var state = pcg32_init(params.seed, idx);
-  let bits = pcg32(&state);
-  out[idx] = f32(bits) / 4294967296.0;
-}
-`;
-}
-
-function randnShader(gridSizeX: number): string {
-  const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-  return `
-${PCG32_WGSL}
-
-const PI: f32 = 3.14159265358979323846;
-
-struct Params {
-  size: u32,
-  seed: u32,
-};
-
-@group(0) @binding(0) var<storage, read_write> out: array<f32>;
-@group(0) @binding(1) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  // Process pairs: thread idx handles element idx*2 and idx*2+1
-  let outIdx = idx * 2u;
-  if (outIdx >= params.size) { return; }
-  var state = pcg32_init(params.seed, idx);
-  let bits1 = pcg32(&state);
-  let bits2 = pcg32(&state);
-  // Map to (0, 1] to avoid log(0)
-  let u1 = (f32(bits1) + 1.0) / 4294967297.0;
-  let u2 = f32(bits2) / 4294967296.0;
-  let r = sqrt(-2.0 * log(u1));
-  let theta = 2.0 * PI * u2;
-  out[outIdx] = r * cos(theta);
-  if (outIdx + 1u < params.size) {
-    out[outIdx + 1u] = r * sin(theta);
-  }
-}
-`;
-}
-
-function bernoulliShader(gridSizeX: number): string {
-  const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-  return `
-${PCG32_WGSL}
-
-struct Params {
-  size: u32,
-  seed: u32,
-  prob: f32,
-};
-
-@group(0) @binding(0) var<storage, read_write> out: array<f32>;
-@group(0) @binding(1) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.size) { return; }
-  var state = pcg32_init(params.seed, idx);
-  let bits = pcg32(&state);
-  let u = f32(bits) / 4294967296.0;
-  out[idx] = select(0.0, 1.0, u < params.prob);
-}
-`;
-}
+let _bernoulliWGSL: string | null = null;
+function getBernoulliWGSL(): string { return _bernoulliWGSL ?? (_bernoulliWGSL = bernoulliWGSL()); }
 
 export function rand(shape: number[], seed: number): WebGPUTensor {
   const ctx = requireContext();
@@ -360,11 +256,9 @@ export function rand(shape: number[], seed: number): WebGPUTensor {
 
   const sizeBytes = numElements * 4;
   const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
-  const { x: dispatchX, y: dispatchY, gridSizeX } = compute2DDispatch(totalWorkgroups);
+  const { x: dispatchX, y: dispatchY } = compute2DDispatch(totalWorkgroups);
 
-  const shaderKey = `rand_${gridSizeX}`;
-  const pipeline = getPipeline(ctx, shaderKey, randShader(gridSizeX));
-
+  const pipeline = getPipeline(ctx, "rand_tile", getRandWGSL());
   const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
 
   const paramsData = new Uint32Array(2);
@@ -385,19 +279,18 @@ export function randn(shape: number[], seed: number): WebGPUTensor {
   if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
 
   const sizeBytes = numElements * 4;
-  // randn processes pairs, so dispatch half the threads (rounded up)
   const numThreads = Math.ceil(numElements / 2);
   const totalWorkgroups = Math.ceil(numThreads / WORKGROUP_SIZE);
-  const { x: dispatchX, y: dispatchY, gridSizeX } = compute2DDispatch(totalWorkgroups);
+  const { x: dispatchX, y: dispatchY } = compute2DDispatch(totalWorkgroups);
 
-  const shaderKey = `randn_${gridSizeX}`;
-  const pipeline = getPipeline(ctx, shaderKey, randnShader(gridSizeX));
-
+  const pipeline = getPipeline(ctx, "randn_tile", getRandnWGSL());
   const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
 
-  const paramsData = new Uint32Array(2);
-  paramsData[0] = numElements;
-  paramsData[1] = seed >>> 0;
+  // Params: [numThreads, size, seed] — 3 u32 words (padded to 4 for alignment)
+  const paramsData = new Uint32Array(4);
+  paramsData[0] = numThreads;
+  paramsData[1] = numElements;
+  paramsData[2] = seed >>> 0;
   const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
 
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [outBuffer, paramsBuffer]);
@@ -414,14 +307,12 @@ export function bernoulli(shape: number[], p: number, seed: number): WebGPUTenso
 
   const sizeBytes = numElements * 4;
   const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
-  const { x: dispatchX, y: dispatchY, gridSizeX } = compute2DDispatch(totalWorkgroups);
+  const { x: dispatchX, y: dispatchY } = compute2DDispatch(totalWorkgroups);
 
-  const shaderKey = `bernoulli_${gridSizeX}`;
-  const pipeline = getPipeline(ctx, shaderKey, bernoulliShader(gridSizeX));
-
+  const pipeline = getPipeline(ctx, "bernoulli_tile", getBernoulliWGSL());
   const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
 
-  // Params: [size as u32, seed as u32, prob as f32]  — 3 words, padded to 4 for alignment
+  // Params: [size as u32, seed as u32, prob as f32] — 3 words, padded to 4 for alignment
   const paramsData = new Uint32Array(4);
   paramsData[0] = numElements;
   paramsData[1] = seed >>> 0;
