@@ -1605,6 +1605,45 @@ function collectStmtCSENodes(stmt: Statement, nodes: Map<number, IRNode>): void 
 }
 
 /**
+ * Compute expression tree depth (0 for trivials, 1 for single op on trivials, etc.).
+ */
+function exprDepth(node: IRNode): number {
+  if (isTrivialNode(node) || node.id < 0) return 0;
+  switch (node.kind) {
+    case "binary": return 1 + Math.max(exprDepth(node.lhs), exprDepth(node.rhs));
+    case "unary": case "cast": case "bitcast": return 1 + exprDepth((node as any).input);
+    case "cmp": return 1 + Math.max(exprDepth(node.lhs), exprDepth(node.rhs));
+    case "select": return 1 + Math.max(exprDepth(node.condition), exprDepth(node.trueVal), exprDepth(node.falseVal));
+    default: return 1;
+  }
+}
+
+/**
+ * Collect all node IDs that are proper sub-expressions of a given node.
+ */
+function collectSubExprIds(node: IRNode, ids: Set<number>): void {
+  if (node.id < 0 || isTrivialNode(node)) return;
+  switch (node.kind) {
+    case "binary":
+      ids.add(node.lhs.id); collectSubExprIds(node.lhs, ids);
+      ids.add(node.rhs.id); collectSubExprIds(node.rhs, ids);
+      break;
+    case "unary": case "cast": case "bitcast":
+      ids.add((node as any).input.id); collectSubExprIds((node as any).input, ids);
+      break;
+    case "cmp":
+      ids.add(node.lhs.id); collectSubExprIds(node.lhs, ids);
+      ids.add(node.rhs.id); collectSubExprIds(node.rhs, ids);
+      break;
+    case "select":
+      ids.add(node.condition.id); collectSubExprIds(node.condition, ids);
+      ids.add(node.trueVal.id); collectSubExprIds(node.trueVal, ids);
+      ids.add(node.falseVal.id); collectSubExprIds(node.falseVal, ids);
+      break;
+  }
+}
+
+/**
  * Auto-CSE pass: inject `let` bindings for multi-use expression nodes.
  *
  * Processes bottom-up (inner scopes first). At each scope, counts per-statement
@@ -1612,28 +1651,19 @@ function collectStmtCSENodes(stmt: Statement, nodes: Map<number, IRNode>): void 
  * each multi-referenced non-trivial expression. The codegen's `bindings.set`
  * mechanism then ensures subsequent references use the variable name.
  *
+ * parentBoundIds tracks nodes already bound at ancestor scopes to avoid
+ * redundant re-binding (which produces useless alias lets).
+ *
  * LICM runs after this pass and hoists loop-invariant injected bindings.
  */
-export function autoCSE(stmts: Statement[]): Statement[] {
-  // Phase 1: Bottom-up recursion (inner scopes first)
-  const processed = stmts.map(s => {
-    switch (s.kind) {
-      case "forRange": return { ...s, body: autoCSE(s.body) } as Statement;
-      case "forStride": return { ...s, body: autoCSE(s.body) } as Statement;
-      case "if": return { ...s, body: autoCSE(s.body) } as Statement;
-      case "ifElse": return { ...s, body: autoCSE(s.body), elseBody: autoCSE(s.elseBody) } as Statement;
-      default: return s;
-    }
-  });
-
-  // Phase 2: Count per-statement references at this scope
+export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Set()): Statement[] {
+  // Phase 1: Count per-statement references at this scope (walks into children)
   // Each statement contributes at most 1 count per node ID
   const refCounts = new Map<number, { count: number; node: IRNode; firstIdx: number }>();
   const letValueIds = new Set<number>();
 
-  for (let i = 0; i < processed.length; i++) {
-    const stmt = processed[i];
-    // Track existing let value IDs (already bound, don't need auto-CSE)
+  for (let i = 0; i < stmts.length; i++) {
+    const stmt = stmts[i];
     if (stmt.kind === "let" && stmt.value.id >= 0) {
       letValueIds.add(stmt.value.id);
     }
@@ -1651,13 +1681,50 @@ export function autoCSE(stmts: Statement[]): Statement[] {
     }
   }
 
-  // Phase 3: Find multi-use candidates (not already bound by existing lets)
-  const toBind: { firstIdx: number; name: string; node: IRNode }[] = [];
+  // Phase 2: Find multi-use candidates
+  // Skip: already bound by existing let, bound at ancestor scope, or depth <= 1
+  const candidates: { firstIdx: number; node: IRNode; id: number }[] = [];
   for (const [id, { count, node, firstIdx }] of refCounts) {
-    if (count > 1 && !letValueIds.has(id)) {
-      toBind.push({ firstIdx, name: freshVar("cse"), node });
+    if (count > 1 && !letValueIds.has(id) && !parentBoundIds.has(id) && exprDepth(node) > 1) {
+      candidates.push({ firstIdx, node, id });
     }
   }
+
+  // Phase 2b: Prune sub-expressions — if both a parent expr and its sub-expr
+  // are candidates, drop the sub-expr (the parent binding already captures it)
+  const subExprIds = new Set<number>();
+  for (const c of candidates) {
+    collectSubExprIds(c.node, subExprIds);
+  }
+  const toBind: { firstIdx: number; name: string; node: IRNode }[] = [];
+  for (const c of candidates) {
+    if (!subExprIds.has(c.id)) {
+      toBind.push({ firstIdx: c.firstIdx, name: freshVar("cse"), node: c.node });
+    }
+  }
+
+  // Build the set of IDs bound at this scope + ancestors for child recursion
+  const childBoundIds = new Set(parentBoundIds);
+  for (const b of toBind) {
+    childBoundIds.add(b.node.id);
+  }
+  // Also include sub-expressions of bound nodes — once a parent expression is
+  // bound to a variable, codegen won't expand its sub-expressions, so children
+  // don't need separate bindings for them either.
+  for (const b of toBind) {
+    collectSubExprIds(b.node, childBoundIds);
+  }
+
+  // Phase 3: Recurse into child scopes (top-down: children see parent bindings)
+  const processed = stmts.map(s => {
+    switch (s.kind) {
+      case "forRange": return { ...s, body: autoCSE(s.body, childBoundIds) } as Statement;
+      case "forStride": return { ...s, body: autoCSE(s.body, childBoundIds) } as Statement;
+      case "if": return { ...s, body: autoCSE(s.body, childBoundIds) } as Statement;
+      case "ifElse": return { ...s, body: autoCSE(s.body, childBoundIds), elseBody: autoCSE(s.elseBody, childBoundIds) } as Statement;
+      default: return s;
+    }
+  });
 
   if (toBind.length === 0) return processed;
   toBind.sort((a, b) => a.firstIdx - b.firstIdx);
