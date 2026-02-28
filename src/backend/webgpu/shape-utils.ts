@@ -44,32 +44,6 @@ export function toIndexShape(shape: number[]): number[] {
 
 // contiguousStrides re-exported from ../types above
 
-export function broadcastStrides(shape: number[], outShape: number[]): number[] {
-  if (shape.length > outShape.length) {
-    throw new Error("webgpu broadcast target has fewer dimensions than input");
-  }
-  const pad = outShape.length - shape.length;
-  const inStrides = computeContiguousStrides(shape);
-  const outStrides = new Array<number>(outShape.length);
-  for (let axis = 0; axis < outShape.length; axis += 1) {
-    const inAxis = axis - pad;
-    if (inAxis < 0) {
-      outStrides[axis] = 0;
-      continue;
-    }
-    const inDim = shape[inAxis];
-    const outDim = outShape[axis];
-    if (inDim === outDim) {
-      outStrides[axis] = inStrides[inAxis];
-    } else if (inDim === 1) {
-      outStrides[axis] = 0;
-    } else {
-      throw new Error("webgpu broadcast target shape is incompatible");
-    }
-  }
-  return outStrides;
-}
-
 /**
  * Compute effective broadcast strides for a tensor with existing strides.
  * This handles non-contiguous tensors (e.g., transposed, expanded views).
@@ -116,44 +90,6 @@ export function computeEffectiveBroadcastStrides(
 
 export function wgslArray(values: number[]): string {
   return values.map((value) => `${value}u`).join(", ");
-}
-
-export function buildBroadcastIndexing(
-  indexShape: number[],
-  inputStrides: number[][],
-): {
-  declarations: string;
-  compute: string;
-  offsets: string[];
-} {
-  const rank = indexShape.length;
-  const outShapeDecl = `const OUT_SHAPE: array<u32, ${rank}> = array<u32, ${rank}>(${wgslArray(indexShape)});`;
-  const strideDecls = inputStrides.map(
-    (strides, index) =>
-      `const IN${index}_STRIDES: array<u32, ${rank}> = array<u32, ${rank}>(${wgslArray(strides)});`,
-  );
-  const compute = `
-  var remaining = idx;
-  var coords: array<u32, ${rank}>;
-  for (var axis = 0u; axis < ${rank}u; axis = axis + 1u) {
-    let rev = ${rank}u - 1u - axis;
-    let dim = OUT_SHAPE[rev];
-    let coord = remaining % dim;
-    coords[rev] = coord;
-    remaining = remaining / dim;
-  }
-`;
-  const offsets = inputStrides.map((_, index) => {
-    const terms = indexShape.map(
-      (_, axis) => `coords[${axis}u] * IN${index}_STRIDES[${axis}u]`,
-    );
-    return `  let offset${index} = ${terms.join(" + ")};`;
-  });
-  return {
-    declarations: [outShapeDecl, ...strideDecls].join("\n"),
-    compute,
-    offsets,
-  };
 }
 
 // ============================================================================
