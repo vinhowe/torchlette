@@ -11,6 +11,7 @@ import type {
   FusedAttentionConfig,
   FusedCrossEntropyConfig,
   FusedLayerNormConfig,
+  FusedRMSNormConfig,
 } from "../backend/types";
 import {
   createLazyIRNode,
@@ -236,6 +237,28 @@ export function extractAttentionDVOp(
     shape,
     "f32",
     device,
+  );
+  return { ref: createPendingRef(node), shape };
+}
+
+/**
+ * Fused RMSNorm forward: x [N,D] + weight [D] → output [N,D].
+ */
+export function fusedRMSNormForwardOp(
+  xRef: LazyRef,
+  weightRef: LazyRef,
+  xShape: number[],
+  device: DeviceKind,
+  config: FusedRMSNormConfig,
+): FusedOpResult {
+  const shape = xShape.slice();
+  const node = createLazyIRNode(
+    "fusedRMSNormForward",
+    [xRef, weightRef],
+    shape,
+    "f32",
+    device,
+    config,
   );
   return { ref: createPendingRef(node), shape };
 }

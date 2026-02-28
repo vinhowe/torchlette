@@ -196,6 +196,12 @@ export type FusedLayerNormConfig = {
   eps: number;
 };
 
+export type FusedRMSNormConfig = {
+  numRows: number;     // product of all dims except last (B*S for [B,S,D])
+  featureDim: number;  // last dim size (D)
+  eps: number;
+};
+
 export type AdamStepConfig = {
   beta1: number;
   beta2: number;
@@ -397,6 +403,12 @@ export interface BackendOps {
     x: BackendTensor,
     config: FusedLayerNormConfig,
   ): { gradWeight: BackendTensor; gradBias: BackendTensor };
+  /** Fused RMSNorm forward: x [N,D] + weight [D] → output [N,D]. */
+  fusedRMSNormForward?(
+    x: BackendTensor,
+    weight: BackendTensor,
+    config: FusedRMSNormConfig,
+  ): BackendTensor;
   /** Create a zeroed inf-flag buffer for unscaleGrad. */
   createInfCountBuffer?(): unknown;
   /** Read inf flag (0.0 or 1.0) and destroy buffer. */

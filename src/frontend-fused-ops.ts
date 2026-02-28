@@ -96,6 +96,110 @@ export function crossEntropyFusedImpl(torch: Torchlette, logits: Tensor, targets
 }
 
 /**
+ * RMS normalization along the last dimension.
+ * rmsnorm(x, weight, eps) = x * rsqrt(mean(x², dim=-1, keepdim=true) + eps) * weight
+ */
+export function rmsnormImpl(
+  torch: Torchlette,
+  x: Tensor, weight: Tensor, eps = 1e-6,
+): Tensor {
+  torch._assertUsable(x, weight);
+
+  const xShape = x.shape;
+  const rank = xShape.length;
+  const normalizedDim = rank - 1;
+  const lastDimSize = xShape[xShape.length - 1];
+
+  const tensorsToSave = x.requiresGrad || weight.requiresGrad
+    ? [x, weight]
+    : [];
+
+  // Use fused forward kernel on WebGPU
+  if (x.device === "webgpu") {
+    const numRows = sizeOf(xShape.slice(0, rank - 1));
+    const config = { numRows, featureDim: lastDimSize, eps };
+    const result = torch.runtime.fusedRMSNormForward(
+      x._unwrap(), weight._unwrap(), config,
+    );
+
+    return torch._wrapWithGrad(result, [x, weight], (grad, getSaved) => {
+      return rmsnormBackwardImpl(torch, grad, getSaved, normalizedDim, lastDimSize, rank, eps);
+    }, tensorsToSave);
+  }
+
+  // CPU: decomposed forward
+  // x_sq = x * x
+  const xSq = torch.runtime.mul(x._unwrap(), x._unwrap());
+  // mean_sq = mean(x², dim=-1, keepdim=true)
+  const meanSq = torch.runtime.mean(xSq, { dim: normalizedDim, keepdim: true });
+  if (typeof meanSq === "number") {
+    throw new Error("rmsnorm: mean with keepdim=true should return tensor");
+  }
+  // inv_rms = rsqrt(mean_sq + eps)
+  const meanSqPlusEps = torch.runtime.add(meanSq, eps);
+  const invRms = torch.runtime.rsqrt(meanSqPlusEps);
+  // normalized = x * inv_rms
+  const normalized = torch.runtime.mul(x._unwrap(), invRms);
+  // output = normalized * weight
+  const result = torch.runtime.mul(normalized, weight._unwrap());
+
+  return torch._wrapWithGrad(result, [x, weight], (grad, getSaved) => {
+    return rmsnormBackwardImpl(torch, grad, getSaved, normalizedDim, lastDimSize, rank, eps);
+  }, tensorsToSave);
+}
+
+/** Shared backward for RMSNorm. Decomposed computation. */
+function rmsnormBackwardImpl(
+  torch: Torchlette,
+  grad: RuntimeTensor,
+  getSaved: (i: number) => Tensor,
+  normalizedDim: number,
+  lastDimSize: number,
+  rank: number,
+  eps = 1e-6,
+): RuntimeTensor[] {
+  const savedX = getSaved(0);
+  const savedWeight = getSaved(1);
+
+  // Recompute inv_rms from saved x
+  const x = savedX._unwrap();
+  const xSq = torch.runtime.mul(x, x);
+  const meanSq = torch.runtime.mean(xSq, { dim: normalizedDim, keepdim: true });
+  if (typeof meanSq === "number") {
+    throw new Error("rmsnorm backward: mean should return tensor");
+  }
+  const meanSqPlusEps = torch.runtime.add(meanSq, eps);
+  const invRms = torch.runtime.rsqrt(meanSqPlusEps);
+  const normalized = torch.runtime.mul(x, invRms); // x * inv_rms
+
+  // gradWeight = sum(grad * normalized, batch dims)
+  const sumDims = Array.from({ length: rank - 1 }, (_, i) => i);
+  let gradWeightReduced = torch.runtime.mul(grad, normalized);
+  for (let i = sumDims.length - 1; i >= 0; i--) {
+    const sumResult = torch.runtime.sum(gradWeightReduced, { dim: sumDims[i], keepdim: false });
+    if (typeof sumResult === "number") {
+      throw new Error("rmsnorm backward: sum for gradWeight should return tensor");
+    }
+    gradWeightReduced = sumResult;
+  }
+
+  // gradX: d/dx (x * inv_rms * weight) where inv_rms = rsqrt(mean(x²) + eps)
+  // = weight * inv_rms * (grad - normalized * mean(grad * normalized, dim=-1, keepdim=true))
+  const gradTimesWeight = torch.runtime.mul(grad, savedWeight._unwrap());
+  const gradDotNorm = torch.runtime.mul(gradTimesWeight, normalized);
+  const meanGradDotNorm = torch.runtime.mean(gradDotNorm, { dim: normalizedDim, keepdim: true });
+  if (typeof meanGradDotNorm === "number") {
+    throw new Error("rmsnorm backward: mean should return tensor");
+  }
+  const gradX = torch.runtime.mul(
+    invRms,
+    torch.runtime.sub(gradTimesWeight, torch.runtime.mul(normalized, meanGradDotNorm)),
+  );
+
+  return [gradX, gradWeightReduced];
+}
+
+/**
  * Scaled dot-product attention with optional causal mask.
  * q, k, v: [batch, heads, seq_len, head_dim]
  * Returns: [batch, heads, seq_len, head_dim]

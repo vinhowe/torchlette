@@ -7,6 +7,7 @@ import type {
   FusedAttentionConfig,
   FusedCrossEntropyConfig,
   FusedLayerNormConfig,
+  FusedRMSNormConfig,
   GeluOptions,
 } from "../backend/types";
 import { getBackend } from "../backend/registry";
@@ -491,6 +492,11 @@ function executeFusedOp(
     }
     case "extractLnBwdGradBias":
       return extractRawSideOutput(node, "lnBwdGradBias");
+    case "fusedRMSNormForward": {
+      const payload = getPayload<FusedRMSNormConfig>(node)!;
+      assertOpSupported("fusedRMSNormForward", backend.ops.fusedRMSNormForward);
+      return backend.ops.fusedRMSNormForward(backendInputs[0], backendInputs[1], payload);
+    }
     case "transfer": {
       const transferPayload = getPayload<{ sourceDevice?: DeviceKind }>(node);
       const sourceDevice = transferPayload?.sourceDevice
