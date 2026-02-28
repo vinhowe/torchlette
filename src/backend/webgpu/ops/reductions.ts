@@ -40,6 +40,8 @@ import {
   makeSumFullWithPreambleSpec,
   makeSumDimWithPreambleChainSpec,
   makeSumFullWithPreambleChainSpec,
+  makeSumDimWithPreambleEpilogueSpec,
+  makeSumFullWithPreambleEpilogueSpec,
   makeSumDimWithEpilogueSpec,
   makeSumFullWithEpilogueSpec,
   makeMaxDimWithEpilogueSpec,
@@ -512,6 +514,152 @@ function sumFullReductionWithPreambleChain(
   dispatcher.dispatch(buffers, { size: inputSize });
 
   return createTensor([], outBuffer);
+}
+
+// ============================================================================
+// Sum With Preamble Chain + Epilogue (cross-reduction fusion)
+// ============================================================================
+
+/**
+ * Sum with both preamble chain and epilogue chain fused into one kernel.
+ * Preamble ops are applied in the accumulation loop body,
+ * epilogue ops are applied to the reduced result before storing.
+ */
+export function sumWithPreambleEpilogue(
+  preambleInputs: BackendTensor[],
+  chainOps: PreambleChainKernelOp[],
+  preambleInputDtypes: DType[],
+  epilogueOps: ReductionEpilogueOpDesc[],
+  epilogueInputs: BackendTensor[],
+  outputDtype: DType,
+  sumOptions: SumOptions,
+  isMean?: boolean,
+): BackendTensor {
+  const ctx = requireContext();
+  const tensor0 = asGPUTensor(preambleInputs[0]);
+  const inputShape = tensor0.shape;
+  const dim = sumOptions?.dim;
+  const keepdim = sumOptions?.keepdim ?? false;
+
+  // For mean: prepend mul(1/count) to epilogue chain with a scalar buffer
+  let effectiveEpilogueOps = epilogueOps;
+  let effectiveEpilogueInputs = epilogueInputs;
+  let invCountBuffer: GPUBuffer | null = null;
+  if (isMean) {
+    let count: number;
+    if (dim === undefined || dim === null) {
+      count = tensor0.size;
+    } else {
+      const dims = Array.isArray(dim) ? dim : [dim];
+      const rank = inputShape.length;
+      count = dims.reduce((acc, d) => acc * inputShape[normalizeDim(d, rank)], 1);
+    }
+    invCountBuffer = createTrackedBuffer(ctx.device, {
+      size: 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    ctx.device.queue.writeBuffer(invCountBuffer, 0, new Float32Array([1.0 / count]));
+    const divInputIndex = epilogueInputs.length;
+    effectiveEpilogueOps = [
+      { kind: "binary", op: "mul", inputIndex: divInputIndex },
+      ...epilogueOps,
+    ];
+    effectiveEpilogueInputs = [...epilogueInputs, { buffer: invCountBuffer } as unknown as BackendTensor];
+  }
+
+  const bpe = dtypeBytes(outputDtype);
+
+  let result: BackendTensor;
+  if (dim === undefined || dim === null) {
+    result = sumFullWithPreambleEpilogue(
+      preambleInputs, chainOps, preambleInputDtypes,
+      effectiveEpilogueOps, effectiveEpilogueInputs, outputDtype,
+    );
+  } else {
+    const setup = prepareDimReduction(inputShape, dim, keepdim);
+    if (!setup) {
+      result = sumFullWithPreambleEpilogue(
+        preambleInputs, chainOps, preambleInputDtypes,
+        effectiveEpilogueOps, effectiveEpilogueInputs, outputDtype,
+      );
+    } else {
+      const { normalizedDims, outShape, outSize, reductionSize,
+        inputStrides, outStrides, inputToOutDim } = setup;
+      const allInputBuffers = [
+        ...preambleInputs.map(inp => asGPUTensor(inp).buffer),
+        ...effectiveEpilogueInputs.map(inp => asGPUTensor(inp).buffer),
+      ];
+      const outBuffer = resolveOutputBuffer(ctx.device, outSize * bpe, allInputBuffers);
+
+      const useParallel = reductionSize > 64;
+      const spec = makeSumDimWithPreambleEpilogueSpec(
+        chainOps, preambleInputs.length, preambleInputDtypes,
+        effectiveEpilogueOps, outputDtype,
+        inputShape, inputStrides, normalizedDims,
+        outShape, outStrides, inputToOutDim, useParallel,
+      );
+      const dispatcher = createTileKernelDispatcher(spec);
+
+      const buffers: Record<string, GPUBuffer> = { out: outBuffer };
+      for (let i = 0; i < preambleInputs.length; i++) {
+        buffers[`in${i}`] = asGPUTensor(preambleInputs[i]).buffer;
+      }
+      for (const eop of effectiveEpilogueOps) {
+        if (eop.kind === "binary" && eop.inputIndex !== undefined) {
+          buffers[`ep_in${eop.inputIndex}`] = asGPUTensor(effectiveEpilogueInputs[eop.inputIndex]).buffer;
+        }
+      }
+
+      dispatcher.dispatch(buffers, { outSize, reductionSize });
+
+      result = createTensor(outShape, outBuffer, undefined, 0, outputDtype);
+    }
+  }
+
+  // Destroy temporary scalar buffer after dispatch
+  if (invCountBuffer) invCountBuffer.destroy();
+
+  return result;
+}
+
+function sumFullWithPreambleEpilogue(
+  preambleInputs: BackendTensor[],
+  chainOps: PreambleChainKernelOp[],
+  preambleInputDtypes: DType[],
+  epilogueOps: ReductionEpilogueOpDesc[],
+  epilogueInputs: BackendTensor[],
+  outputDtype: DType,
+): WebGPUTensor {
+  const ctx = requireContext();
+  const tensor0 = asGPUTensor(preambleInputs[0]);
+  const inputSize = tensor0.size;
+  const bpe = dtypeBytes(outputDtype);
+
+  const allInputBuffers = [
+    ...preambleInputs.map(inp => asGPUTensor(inp).buffer),
+    ...epilogueInputs.map(inp => asGPUTensor(inp).buffer),
+  ];
+  const outBuffer = resolveOutputBuffer(ctx.device, bpe, allInputBuffers);
+
+  const spec = makeSumFullWithPreambleEpilogueSpec(
+    chainOps, preambleInputs.length, preambleInputDtypes,
+    epilogueOps, outputDtype,
+  );
+  const dispatcher = createTileKernelDispatcher(spec);
+
+  const buffers: Record<string, GPUBuffer> = { out: outBuffer };
+  for (let i = 0; i < preambleInputs.length; i++) {
+    buffers[`in${i}`] = asGPUTensor(preambleInputs[i]).buffer;
+  }
+  for (const eop of epilogueOps) {
+    if (eop.kind === "binary" && eop.inputIndex !== undefined) {
+      buffers[`ep_in${eop.inputIndex}`] = asGPUTensor(epilogueInputs[eop.inputIndex]).buffer;
+    }
+  }
+
+  dispatcher.dispatch(buffers, { size: inputSize });
+
+  return createTensor([], outBuffer, undefined, 0, outputDtype);
 }
 
 // ============================================================================

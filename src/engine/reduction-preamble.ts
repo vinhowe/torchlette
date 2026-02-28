@@ -460,3 +460,159 @@ export async function executeReductionWithEpilogue(
   // Store result on the FINAL output node (not the reduction node)
   plan.outputNode.result = createStorageHandle(plan.outputNode.device, resultTensor);
 }
+
+// ============================================================================
+// Combined Preamble + Epilogue Fusion (Phase 5)
+// Detects elem → reduction → elem patterns and fuses them into a single
+// kernel that applies the preamble chain in the accumulation loop and the
+// epilogue chain on the result.
+// ============================================================================
+
+export interface ReductionFusionPlan {
+  /** All preamble nodes in chain order */
+  preambleChain: LazyIRNode[];
+  /** The reduction node (sum or mean) */
+  reductionNode: LazyIRNode;
+  /** Epilogue chain nodes (after reduction) */
+  epilogueChain: LazyIRNode[];
+  /** The final output node (last epilogue node, or reduction if no epilogue) */
+  outputNode: LazyIRNode;
+  /** Whether the reduction is a mean */
+  isMean: boolean;
+  /** Kernel op descriptors for the preamble chain */
+  preambleOps: PreambleChainKernelOp[];
+  /** External input refs for the preamble chain */
+  preambleInputRefs: LazyRef[];
+  /** Dtypes for each preamble external input */
+  preambleInputDtypes: DType[];
+  /** Epilogue operations to apply after the reduction */
+  epilogueOps: ReductionEpilogueOp[];
+  /** External input refs for the epilogue binary ops */
+  epilogueInputRefs: LazyRef[];
+  /** Output dtype after epilogue chain */
+  outputDtype: DType;
+  /** Total nodes consumed (preamble chain + reduction + epilogue chain) */
+  consumedCount: number;
+}
+
+/**
+ * Detect a combined [elem chain] → reduction → [elem chain] pattern.
+ *
+ * First calls detectReductionPreamble to find the preamble→reduction.
+ * Then, from the reduction node, walks forward to find an epilogue chain
+ * (same logic as detectReductionEpilogue but starting from the preamble's
+ * reduction node position).
+ *
+ * Returns null if:
+ * - No preamble is found (caller should try standalone epilogue)
+ * - A preamble is found but no epilogue (caller should use preamble-only)
+ */
+export function detectReductionFusion(
+  nodes: LazyIRNode[],
+  startIdx: number,
+  consumerCount: Map<number, number>,
+  externalNodeIds?: Set<number>,
+): ReductionFusionPlan | null {
+  // First, detect the preamble
+  const preamblePlan = detectReductionPreamble(nodes, startIdx, consumerCount);
+  if (!preamblePlan) return null;
+
+  // Find the reduction node's position in the node array
+  const reductionIdx = startIdx + preamblePlan.consumedCount - 1;
+  if (reductionIdx >= nodes.length) return null;
+  if (nodes[reductionIdx] !== preamblePlan.reductionNode) return null;
+
+  // Only support sum/mean for combined fusion (not max — max has different accumulator semantics)
+  if (preamblePlan.reductionNode.op !== "sum" && preamblePlan.reductionNode.op !== "mean") {
+    return null;
+  }
+
+  // Try to detect an epilogue starting from the reduction node
+  const epiloguePlan = detectReductionEpilogue(nodes, reductionIdx, consumerCount, externalNodeIds);
+  if (!epiloguePlan) return null;
+
+  // Build the preamble ops and input refs
+  let preambleOps: PreambleChainKernelOp[];
+  let preambleInputRefs: LazyRef[];
+  let preambleInputDtypes: DType[];
+  let preambleChain: LazyIRNode[];
+
+  if (preamblePlan.preambleChain && preamblePlan.chainOps && preamblePlan.chainInputRefs && preamblePlan.chainInputDtypes) {
+    // Multi-op chain
+    preambleOps = preamblePlan.chainOps;
+    preambleInputRefs = preamblePlan.chainInputRefs;
+    preambleInputDtypes = preamblePlan.chainInputDtypes;
+    preambleChain = preamblePlan.preambleChain;
+  } else {
+    // Single-op preamble — wrap into chain format
+    preambleOps = [{
+      op: getChainOpName(preamblePlan.preambleNode),
+      arity: preamblePlan.arity,
+    }];
+    preambleInputRefs = [...preamblePlan.preambleNode.inputs];
+    preambleInputDtypes = preamblePlan.preambleNode.inputs.map(getRefDtype);
+    preambleChain = [preamblePlan.preambleNode];
+  }
+
+  // Collect epilogue chain nodes
+  const epilogueChain: LazyIRNode[] = [];
+  for (let i = 1; i < epiloguePlan.consumedCount; i++) {
+    epilogueChain.push(nodes[reductionIdx + i]);
+  }
+
+  return {
+    preambleChain,
+    reductionNode: preamblePlan.reductionNode,
+    epilogueChain,
+    outputNode: epiloguePlan.outputNode,
+    isMean: preamblePlan.isMean,
+    preambleOps,
+    preambleInputRefs,
+    preambleInputDtypes,
+    epilogueOps: epiloguePlan.epilogueOps,
+    epilogueInputRefs: epiloguePlan.epilogueInputRefs,
+    outputDtype: epiloguePlan.outputDtype,
+    consumedCount: preamblePlan.consumedCount + epiloguePlan.consumedCount - 1, // -1: reduction counted in both
+  };
+}
+
+/**
+ * Execute a combined preamble + epilogue reduction fusion.
+ *
+ * For mean: the dispatch function internally prepends mul(1/count) to the
+ * epilogue chain with a scalar buffer, matching the meanWithEpilogue pattern.
+ */
+export async function executeReductionWithFusion(
+  plan: ReductionFusionPlan,
+  backend: Backend,
+): Promise<void> {
+  const { sumWithPreambleEpilogue } = await import("../backend/webgpu/index");
+
+  // Resolve preamble input storages
+  const preambleInputTensors = plan.preambleInputRefs.map(
+    ref => getInputStorage(ref, backend).backendTensor,
+  );
+
+  // Resolve epilogue input storages
+  const epilogueInputTensors = plan.epilogueInputRefs.map(
+    ref => getInputStorage(ref, backend).backendTensor,
+  );
+
+  const payload = plan.reductionNode.payload as
+    | { dim?: number | number[] | null; keepdim?: boolean }
+    | undefined;
+
+  const resultTensor = sumWithPreambleEpilogue(
+    preambleInputTensors,
+    plan.preambleOps,
+    plan.preambleInputDtypes,
+    plan.epilogueOps,
+    epilogueInputTensors,
+    plan.outputDtype,
+    payload ?? {},
+    plan.isMean,
+  );
+
+  // Store result on the FINAL output node
+  plan.outputNode.result = createStorageHandle(plan.outputNode.device, resultTensor);
+}

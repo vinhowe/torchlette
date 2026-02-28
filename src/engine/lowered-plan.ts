@@ -170,6 +170,33 @@ interface LoweredReductionEpilogueAction {
   consumedCount: number;
 }
 
+/** A combined preamble + epilogue reduction fusion (elem → sum/mean → elem in one kernel). */
+interface LoweredReductionFusionAction {
+  kind: "reduction-fusion";
+  /** Plan-node indices for all preamble chain nodes. */
+  preambleNodeIndices: number[];
+  /** Plan-node index of the reduction (sum/mean) node. */
+  reductionNodeIndex: number;
+  /** Plan-node indices for all epilogue chain nodes. */
+  epilogueNodeIndices: number[];
+  /** Index of the final output node in the plan. */
+  outputNodeIndex: number;
+  /** Kernel op descriptors for the preamble chain. */
+  preambleOps: Array<{ op: string; arity: number; chainInputPos?: 0 | 1 }>;
+  /** Dtypes for each preamble external input. */
+  preambleInputDtypes: DType[];
+  /** Epilogue operations to apply after the reduction. */
+  epilogueOps: Array<{ kind: string; toDtype?: DType; inputIndex?: number; op?: string }>;
+  /** Number of additional epilogue inputs (e.g., external tensors for binary ops). */
+  epilogueInputCount: number;
+  /** Output dtype after epilogue chain. */
+  outputDtype: DType;
+  /** Total nodes consumed (preamble chain + reduction + epilogue chain). */
+  consumedCount: number;
+  /** Whether the reduction is a mean. */
+  isMean: boolean;
+}
+
 /** A view op (metadata only, no GPU dispatch). */
 interface LoweredViewAction {
   kind: "view";
@@ -223,6 +250,7 @@ type LoweredAction =
   | LoweredMatmulEpilogueAction
   | LoweredReductionPreambleAction
   | LoweredReductionEpilogueAction
+  | LoweredReductionFusionAction
   | LoweredViewAction
   | LoweredDataSourceAction
   | LoweredPrologueSkipAction
@@ -430,6 +458,36 @@ export class LoweredPlanBuilder {
       chainOps,
       chainInputDtypes,
       consumedCount,
+    });
+  }
+
+  /** Record a combined preamble + epilogue reduction fusion. */
+  recordReductionFusion(
+    preambleNodeIndices: number[],
+    reductionNodeIndex: number,
+    epilogueNodeIndices: number[],
+    outputNodeIndex: number,
+    preambleOps: Array<{ op: string; arity: number; chainInputPos?: 0 | 1 }>,
+    preambleInputDtypes: DType[],
+    epilogueOps: Array<{ kind: string; toDtype?: DType; inputIndex?: number; op?: string }>,
+    epilogueInputCount: number,
+    outputDtype: DType,
+    consumedCount: number,
+    isMean: boolean,
+  ): void {
+    this.actions.push({
+      kind: "reduction-fusion",
+      preambleNodeIndices,
+      reductionNodeIndex,
+      epilogueNodeIndices,
+      outputNodeIndex,
+      preambleOps,
+      preambleInputDtypes,
+      epilogueOps,
+      epilogueInputCount,
+      outputDtype,
+      consumedCount,
+      isMean,
     });
   }
 

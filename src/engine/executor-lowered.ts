@@ -45,8 +45,8 @@ import { pretunePlanMatmuls } from "./plan-builder";
 import { executeFusedSegment } from "./segment-executors";
 import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "./matmul-epilogue";
 import { executeMatmulWithEpilogue, _detectTransposeView, shapesEqual } from "./matmul-epilogue";
-import type { ReductionPreamblePlan, ReductionEpiloguePlan } from "./reduction-preamble";
-import { executeReductionWithPreamble, executeReductionWithEpilogue } from "./reduction-preamble";
+import type { ReductionPreamblePlan, ReductionEpiloguePlan, ReductionFusionPlan } from "./reduction-preamble";
+import { executeReductionWithPreamble, executeReductionWithEpilogue, executeReductionWithFusion } from "./reduction-preamble";
 import { computeContiguousStrides } from "../backend/types";
 import { sizeOf } from "../core/shape";
 import type { OptimizedExecutionStats, OptimizedExecutionResult } from "./executor-optimized";
@@ -961,6 +961,96 @@ export async function executeLoweredPlan(
             }
             if (reOutputNode.result) {
               const bt = asGPUTensor(reOutputNode.result.backendTensor);
+              replayEntries.push({ kind: "result", nodeResult: {
+                nodeIndex: action.outputNodeIndex,
+                buffer: bt.buffer,
+                shape: bt.shape.slice(),
+                dtype: bt.dtype,
+                size: bt.size,
+                strides: bt.strides.slice(),
+                isView: false,
+              }});
+            }
+          }
+          break;
+        }
+
+        case "reduction-fusion": {
+          const rfOutputNode = planNodes[action.outputNodeIndex];
+
+          // Reconstruct preamble input refs by walking preamble chain nodes
+          const rfPreambleNodes = action.preambleNodeIndices.map(i => planNodes[i]);
+          const rfPreambleInputRefs: import("./lazy").LazyRef[] = [];
+
+          // First preamble node: all inputs are external
+          for (const ref of rfPreambleNodes[0].inputs) {
+            rfPreambleInputRefs.push(ref);
+          }
+          // Subsequent preamble nodes: non-chain inputs are external
+          for (let ci = 1; ci < rfPreambleNodes.length; ci++) {
+            const node = rfPreambleNodes[ci];
+            const prevNode = rfPreambleNodes[ci - 1];
+            if (node.inputs.length === 2) {
+              const inp0IsChain = node.inputs[0].kind === "pending" &&
+                node.inputs[0].node === prevNode;
+              rfPreambleInputRefs.push(node.inputs[inp0IsChain ? 1 : 0]);
+            }
+          }
+
+          // Reconstruct epilogue input refs by walking epilogue chain nodes
+          const rfReductionNode = planNodes[action.reductionNodeIndex];
+          const rfEpilogueNodes = action.epilogueNodeIndices.map(i => planNodes[i]);
+          const rfEpilogueInputRefs: import("./lazy").LazyRef[] = [];
+          const rfAllCoveredIds = [
+            ...action.preambleNodeIndices,
+            action.reductionNodeIndex,
+            ...action.epilogueNodeIndices,
+          ];
+          for (let ci = 0; ci < rfEpilogueNodes.length; ci++) {
+            const chainNode = rfEpilogueNodes[ci];
+            if ((chainNode.op === "add" || chainNode.op === "mul") && chainNode.inputs.length === 2) {
+              const prevNodeId = ci === 0
+                ? rfReductionNode.id
+                : rfEpilogueNodes[ci - 1].id;
+              const inp0IsChain = chainNode.inputs[0].kind === "pending"
+                && chainNode.inputs[0].node.id === prevNodeId;
+              const externalIdx = inp0IsChain ? 1 : 0;
+              rfEpilogueInputRefs.push(chainNode.inputs[externalIdx]);
+            }
+          }
+
+          const rfFusionPlan: ReductionFusionPlan = {
+            preambleChain: rfPreambleNodes,
+            reductionNode: rfReductionNode,
+            epilogueChain: rfEpilogueNodes,
+            outputNode: rfOutputNode,
+            isMean: action.isMean,
+            preambleOps: action.preambleOps,
+            preambleInputRefs: rfPreambleInputRefs,
+            preambleInputDtypes: action.preambleInputDtypes,
+            epilogueOps: action.epilogueOps,
+            epilogueInputRefs: rfEpilogueInputRefs,
+            outputDtype: action.outputDtype,
+            consumedCount: action.consumedCount,
+          };
+
+          const rfLabel = `${action.isMean ? "mean" : "sum"}+${
+            rfPreambleNodes.map(n => n.op).join("+")
+          }+${action.epilogueOps.map(
+            o => o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind,
+          ).join("+")}`;
+          await withProfileContext(rfLabel, rfPreambleNodes[0].module, () =>
+            executeReductionWithFusion(rfFusionPlan, backend),
+          );
+
+          // Record dispatches and output node result for replay cache
+          if (shouldRecord) {
+            while (recordingDispatchIdx < recordingBuffer.length) {
+              replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
+              recordingDispatchIdx++;
+            }
+            if (rfOutputNode.result) {
+              const bt = asGPUTensor(rfOutputNode.result.backendTensor);
               replayEntries.push({ kind: "result", nodeResult: {
                 nodeIndex: action.outputNodeIndex,
                 buffer: bt.buffer,
