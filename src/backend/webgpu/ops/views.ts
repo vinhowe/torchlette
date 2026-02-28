@@ -23,7 +23,7 @@ import {
 } from "../bind-group-cache";
 import { profileApiCall } from "../profiler";
 import { computeFlatChunkLayout, dispatchFlatChunked } from "../chunked-dispatch";
-import { castTileIR } from "./ops-tile-ir";
+import { castTileIR, contiguousTileIR, narrowBackwardTileIR } from "./ops-tile-ir";
 
 /**
  * Cast tensor to a different dtype.
@@ -414,10 +414,8 @@ export function contiguous(a: BackendTensor): BackendTensor {
 function contiguousDirect(tensor: WebGPUTensor): WebGPUTensor {
   const ctx = requireContext();
   const shape = tensor.shape;
-  const rank = shape.length;
   const outSize = sizeOf(shape);
   const dtype = tensor.dtype;
-  const wgslType = dtypeToWgsl(dtype);
   const bytesPerElement = dtypeBytes(dtype);
 
   // Compute 2D dispatch for large tensors (> 65535 workgroups)
@@ -432,64 +430,14 @@ function contiguousDirect(tensor: WebGPUTensor): WebGPUTensor {
     [tensor.buffer],
   );
 
-  // Generate shader that reads with strides and writes contiguous
-  const shapeArray = `array<u32, ${rank}>(${shape.map((s) => `${s}u`).join(", ")})`;
-  const inputStridesArray = `array<u32, ${rank}>(${tensor.strides.map((s) => `${s}u`).join(", ")})`;
-  const outStridesArray = `array<u32, ${rank}>(${contiguousStrides(shape)
-    .map((s) => `${s}u`)
-    .join(", ")})`;
-  const enableF16 = dtype === "f16" ? "enable f16;\n" : "";
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${dispatch.gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-
-  const code = `${enableF16}
-struct Params {
-  size: u32,
-  offset: u32,
-};
-
-@group(0) @binding(0) var<storage, read> input: array<${wgslType}>;
-@group(0) @binding(1) var<storage, read_write> out: array<${wgslType}>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-const RANK: u32 = ${rank}u;
-const shape = ${shapeArray};
-const inputStrides = ${inputStridesArray};
-const outStrides = ${outStridesArray};
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.size) {
-    return;
-  }
-
-  // Convert output flat index to coordinates
-  var coords: array<u32, ${rank}>;
-  var remaining = idx;
-  for (var d = 0u; d < RANK; d = d + 1u) {
-    coords[d] = remaining / outStrides[d];
-    remaining = remaining % outStrides[d];
-  }
-
-  // Compute input offset using strides
-  var inputOffset = params.offset;
-  for (var d = 0u; d < RANK; d = d + 1u) {
-    inputOffset = inputOffset + coords[d] * inputStrides[d];
-  }
-
-  out[idx] = input[inputOffset];
-}
-`;
-
+  const code = contiguousTileIR(shape, tensor.strides, tensor.offset, dtype as "f32" | "f16" | "i32" | "u32");
   const key = `contiguous:${shape.join(",")}:${tensor.strides.join(",")}:${tensor.offset}:${dtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
 
   dispatchElementwise({
     key, shader: code,
     inputs: [tensor.buffer],
     outputSizeBytes: outSize * bytesPerElement,
-    params: params2(outSize, tensor.offset),
+    params: params1(outSize),
     outBuffer,
     dispatchX: dispatch.x, dispatchY: dispatch.y,
   });
@@ -757,44 +705,12 @@ export function narrowBackward(grad: BackendTensor, dim: number, start: number, 
   const gradDimSize = gradTensor.shape[dim]; // = length from narrow
   const outDimSize = originalLength;
 
-  const wgslType = dtype === "f16" ? "f16" : "f32";
-  const WG = WORKGROUP_SIZE;
-
-  const totalWorkgroups = Math.ceil(outSize / WG);
+  const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
-  const gridSizeX = dispatch.x * WG;
+  const gridSizeX = dispatch.x * WORKGROUP_SIZE;
 
-  const shaderCode = `
-${dtype === "f16" ? "enable f16;\n" : ""}
-@group(0) @binding(0) var<storage, read> grad: array<${wgslType}>;
-@group(0) @binding(1) var<storage, read_write> out: array<${wgslType}>;
-@group(0) @binding(2) var<uniform> params: vec4<u32>; // outerSize, innerSize, gradDimSize, start
-
-@compute @workgroup_size(${WG})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = ${use2D ? `gid.x + gid.y * ${gridSizeX}u` : "gid.x"};
-  let total = ${outSize}u;
-  if (idx >= total) { return; }
-
-  let innerSize = params.y;
-  let outDimSize = ${outDimSize}u;
-  let outerIdx = idx / (outDimSize * innerSize);
-  let remainder = idx % (outDimSize * innerSize);
-  let dimIdx = remainder / innerSize;
-  let innerIdx = remainder % innerSize;
-
-  let startOffset = params.w;
-  if (dimIdx >= startOffset && dimIdx < startOffset + params.z) {
-    let gradDimIdx = dimIdx - startOffset;
-    let gradIdx = outerIdx * params.z * innerSize + gradDimIdx * innerSize + innerIdx;
-    out[idx] = grad[gradIdx];
-  } else {
-    out[idx] = ${wgslType}(0.0);
-  }
-}
-`;
-
+  const shaderCode = narrowBackwardTileIR(outDimSize, outSize, dtype as "f32" | "f16" | "i32" | "u32");
   const key = `narrowBackward:${outDimSize}:${gradDimSize}:${start}:${outSize}:${dtype}:${use2D ? `2d:${gridSizeX}` : "1d"}`;
 
   const outBuffer = dispatchElementwise({

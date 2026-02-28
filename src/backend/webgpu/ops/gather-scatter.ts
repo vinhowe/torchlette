@@ -20,6 +20,7 @@ import {
   params4,
 } from "../bind-group-cache";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
+import { gatherTileIR, scatterAddTileIR } from "./ops-tile-ir";
 
 /** Local type alias for GPU buffer binding descriptors with offset/size. */
 type GPUBufferBinding = { buffer: GPUBuffer; offset?: number; size?: number };
@@ -54,27 +55,37 @@ export function gather(
   // Shared setup
   const outShape = indexShape.slice();
   const outSize = outShape.reduce((a, b) => a * b, 1);
-  const inputStrides = contiguousStrides(inputShape);
-  const indexStrides = contiguousStrides(indexShape);
   const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
-  // WGSL constants
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${dispatch.gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
+  // Generate shader: tile-IR for direct path, hand-written for chunked
+  let code: string;
+  if (chunked) {
+    const inputStrides = contiguousStrides(inputShape);
+    const indexStrides = contiguousStrides(indexShape);
+    const idxCompute = use2D
+      ? `let idx = gid.x + gid.y * ${dispatch.gridSizeX}u * ${WORKGROUP_SIZE}u;`
+      : `let idx = gid.x;`;
 
-  const shaderConsts = `
+    code = `
+struct Params { size: u32, chunkStart: u32, chunkEnd: u32, _pad: u32, };
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> indices: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
 const RANK: u32 = ${rank}u;
 const DIM: u32 = ${dim}u;
 const inputStrides = array<u32, ${rank}>(${wgslArray(inputStrides)});
-const indexStrides = array<u32, ${rank}>(${wgslArray(indexStrides)});`;
+const indexStrides = array<u32, ${rank}>(${wgslArray(indexStrides)});
 
-  // Shader body: coords → gather index → input offset → output
-  // Chunked variant adds bounds check + local index adjustment.
-  const shaderBody = chunked
-    ? `  let gatherIdx = u32(indices[idx]);
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  ${idxCompute}
+  if (idx >= params.size) { return; }
+  let gatherIdx = u32(indices[idx]);
   if (gatherIdx < params.chunkStart || gatherIdx >= params.chunkEnd) { return; }
 
   var coords: array<u32, ${rank}>;
@@ -90,42 +101,12 @@ const indexStrides = array<u32, ${rank}>(${wgslArray(indexStrides)});`;
     if (d == DIM) { inputOffset = inputOffset + localIdx * inputStrides[d]; }
     else { inputOffset = inputOffset + coords[d] * inputStrides[d]; }
   }
-  out[idx] = input[inputOffset];`
-    : `  var coords: array<u32, ${rank}>;
-  var remaining = idx;
-  for (var d = 0u; d < RANK; d = d + 1u) {
-    coords[d] = remaining / indexStrides[d];
-    remaining = remaining % indexStrides[d];
-  }
-
-  let gatherIdx = u32(indices[idx]);
-  var inputOffset = 0u;
-  for (var d = 0u; d < RANK; d = d + 1u) {
-    if (d == DIM) { inputOffset = inputOffset + gatherIdx * inputStrides[d]; }
-    else { inputOffset = inputOffset + coords[d] * inputStrides[d]; }
-  }
-  out[idx] = input[inputOffset];`;
-
-  const paramsStruct = chunked
-    ? `struct Params { size: u32, chunkStart: u32, chunkEnd: u32, _pad: u32, };`
-    : `struct Params { size: u32, };`;
-
-  const code = `
-${paramsStruct}
-
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read> indices: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
-${shaderConsts}
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.size) { return; }
-${shaderBody}
+  out[idx] = input[inputOffset];
 }
 `;
+  } else {
+    code = gatherTileIR(inputShape, indexShape, dim);
+  }
 
   const keyPrefix = chunked ? "gatherChunked" : "gather";
   const pipelineKey = `${keyPrefix}:${inputShape.join(",")}:${indexShape.join(",")}:${dim}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
@@ -207,27 +188,37 @@ export function scatterAdd(
   const outShape = inputShape.slice();
   const outSize = outShape.reduce((a, b) => a * b, 1);
   const srcSize = tensorSrc.shape.reduce((a, b) => a * b, 1);
-  const outStrides = contiguousStrides(outShape);
-  const srcStrides = contiguousStrides(tensorSrc.shape);
   const totalWorkgroups = Math.ceil(srcSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
-  // WGSL constants
-  const idxCompute = use2D
-    ? `let srcIdx = gid.x + gid.y * ${dispatch.gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let srcIdx = gid.x;`;
+  // Generate shader: tile-IR for direct path, hand-written for chunked
+  let code: string;
+  if (chunked) {
+    const outStrides = contiguousStrides(outShape);
+    const srcStrides = contiguousStrides(tensorSrc.shape);
+    const idxCompute = use2D
+      ? `let srcIdx = gid.x + gid.y * ${dispatch.gridSizeX}u * ${WORKGROUP_SIZE}u;`
+      : `let srcIdx = gid.x;`;
 
-  const shaderConsts = `
+    code = `
+struct Params { srcSize: u32, chunkStart: u32, chunkEnd: u32, _pad: u32, };
+
+@group(0) @binding(0) var<storage, read> indices: array<f32>;
+@group(0) @binding(1) var<storage, read> src: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
 const RANK: u32 = ${rank}u;
 const DIM: u32 = ${dim}u;
 const outStrides = array<u32, ${rank}>(${wgslArray(outStrides)});
-const srcStrides = array<u32, ${rank}>(${wgslArray(srcStrides)});`;
+const srcStrides = array<u32, ${rank}>(${wgslArray(srcStrides)});
 
-  // Shader body: coords → scatter index → output offset → add
-  // Chunked variant adds bounds check + local index adjustment.
-  const shaderBody = chunked
-    ? `  let scatterIdx = u32(indices[srcIdx]);
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  ${idxCompute}
+  if (srcIdx >= params.srcSize) { return; }
+  let scatterIdx = u32(indices[srcIdx]);
   if (scatterIdx < params.chunkStart || scatterIdx >= params.chunkEnd) { return; }
 
   var coords: array<u32, ${rank}>;
@@ -243,42 +234,12 @@ const srcStrides = array<u32, ${rank}>(${wgslArray(srcStrides)});`;
     if (d == DIM) { outOffset = outOffset + localIdx * outStrides[d]; }
     else { outOffset = outOffset + coords[d] * outStrides[d]; }
   }
-  out[outOffset] = out[outOffset] + src[srcIdx];`
-    : `  var coords: array<u32, ${rank}>;
-  var remaining = srcIdx;
-  for (var d = 0u; d < RANK; d = d + 1u) {
-    coords[d] = remaining / srcStrides[d];
-    remaining = remaining % srcStrides[d];
-  }
-
-  let scatterIdx = u32(indices[srcIdx]);
-  var outOffset = 0u;
-  for (var d = 0u; d < RANK; d = d + 1u) {
-    if (d == DIM) { outOffset = outOffset + scatterIdx * outStrides[d]; }
-    else { outOffset = outOffset + coords[d] * outStrides[d]; }
-  }
-  out[outOffset] = out[outOffset] + src[srcIdx];`;
-
-  const paramsStruct = chunked
-    ? `struct Params { srcSize: u32, chunkStart: u32, chunkEnd: u32, _pad: u32, };`
-    : `struct Params { srcSize: u32, };`;
-
-  const code = `
-${paramsStruct}
-
-@group(0) @binding(0) var<storage, read> indices: array<f32>;
-@group(0) @binding(1) var<storage, read> src: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
-${shaderConsts}
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (srcIdx >= params.srcSize) { return; }
-${shaderBody}
+  out[outOffset] = out[outOffset] + src[srcIdx];
 }
 `;
+  } else {
+    code = scatterAddTileIR(inputShape, tensorSrc.shape, dim);
+  }
 
   const keyPrefix = chunked ? "scatterAddChunked" : "scatterAdd";
   const pipelineKey = `${keyPrefix}:${inputShape.join(",")}:${tensorSrc.shape.join(",")}:${dim}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
