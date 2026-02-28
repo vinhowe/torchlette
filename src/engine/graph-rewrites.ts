@@ -38,6 +38,7 @@ export function runRewritePasses(ctx: RewriteContext): Set<number> {
   const bypassed = new Set<number>();
   eliminateIdentityCasts(ctx, bypassed);
   eliminateRedundantContiguous(ctx, bypassed);
+  eliminateAlgebraicIdentities(ctx, bypassed);
   return bypassed;
 }
 
@@ -75,11 +76,16 @@ function eliminateIdentityCasts(ctx: RewriteContext, bypassed: Set<number>): voi
   }
 }
 
+/** Ops that produce non-contiguous output (views). All other ops produce contiguous output. */
+const VIEW_OPS = new Set(["reshape", "transpose", "permute", "expand", "narrow"]);
+
 /**
- * Eliminate redundant contiguous: contiguous(contiguous(x)) → contiguous(x).
+ * Eliminate redundant contiguous: contiguous(x) → x when x always produces contiguous output.
  *
- * When a contiguous node's input is itself a contiguous node (which always
- * produces contiguous output), the outer contiguous is redundant.
+ * Only view ops (reshape, transpose, permute, expand, narrow) can produce
+ * non-contiguous output. All compute ops (matmul, elementwise, reductions,
+ * data sources) always produce contiguous tensors, so contiguous after them
+ * is a no-op.
  */
 function eliminateRedundantContiguous(ctx: RewriteContext, bypassed: Set<number>): void {
   for (const node of ctx.planNodes) {
@@ -90,13 +96,8 @@ function eliminateRedundantContiguous(ctx: RewriteContext, bypassed: Set<number>
     if (!inputRef || inputRef.kind !== "pending") continue;
 
     const inputNode = inputRef.node;
-    // If input is a contiguous node, this contiguous is redundant
-    // Also if input is a data source (always contiguous output)
-    if (inputNode.op === "contiguous" ||
-        inputNode.op === "tensorFromArray" ||
-        inputNode.op === "zeros" ||
-        inputNode.op === "full" ||
-        inputNode.op === "arange") {
+    // If input op always produces contiguous output, this contiguous is redundant
+    if (!VIEW_OPS.has(inputNode.op)) {
       redirectConsumers(node, inputRef, ctx);
       bypassed.add(node.id);
     }
@@ -147,4 +148,89 @@ function redirectConsumers(
   // Clear node's consumer tracking
   ctx.consumerCount.set(node.id, 0);
   ctx.consumers.set(node.id, []);
+}
+
+/**
+ * Try to extract a constant scalar value from a LazyRef.
+ * Returns the value if the ref points to a `full` node with a single element,
+ * or null otherwise.
+ */
+function tryGetScalarValue(ref: LazyRef): number | null {
+  if (ref.kind !== "pending") return null;
+  const node = ref.node;
+  if (node.op !== "full") return null;
+  // full node must produce a scalar (0-d) or single-element tensor
+  const totalElements = node.shape.reduce((a, b) => a * b, 1);
+  if (totalElements !== 1) return null;
+  const payload = node.payload as { fillValue: number } | undefined;
+  if (!payload || typeof payload.fillValue !== "number") return null;
+  return payload.fillValue;
+}
+
+/**
+ * Eliminate algebraic identities:
+ *   mul(x, 1) → x,  mul(1, x) → x
+ *   add(x, 0) → x,  add(0, x) → x
+ *   div(x, 1) → x
+ *   sub(x, 0) → x
+ *
+ * These appear in AMP scaling paths, optimizer computations, and
+ * autograd where scalar constants flow through the graph.
+ */
+function eliminateAlgebraicIdentities(ctx: RewriteContext, bypassed: Set<number>): void {
+  for (const node of ctx.planNodes) {
+    if (node.result) continue;
+    if (node.inputs.length !== 2) continue;
+
+    const ref0 = node.inputs[0];
+    const ref1 = node.inputs[1];
+
+    if (node.op === "mul") {
+      // mul(x, 1) → x
+      const val1 = tryGetScalarValue(ref1);
+      if (val1 === 1) {
+        redirectConsumers(node, ref0, ctx);
+        bypassed.add(node.id);
+        continue;
+      }
+      // mul(1, x) → x
+      const val0 = tryGetScalarValue(ref0);
+      if (val0 === 1) {
+        redirectConsumers(node, ref1, ctx);
+        bypassed.add(node.id);
+        continue;
+      }
+    } else if (node.op === "add") {
+      // add(x, 0) → x
+      const val1 = tryGetScalarValue(ref1);
+      if (val1 === 0) {
+        redirectConsumers(node, ref0, ctx);
+        bypassed.add(node.id);
+        continue;
+      }
+      // add(0, x) → x
+      const val0 = tryGetScalarValue(ref0);
+      if (val0 === 0) {
+        redirectConsumers(node, ref1, ctx);
+        bypassed.add(node.id);
+        continue;
+      }
+    } else if (node.op === "sub") {
+      // sub(x, 0) → x
+      const val1 = tryGetScalarValue(ref1);
+      if (val1 === 0) {
+        redirectConsumers(node, ref0, ctx);
+        bypassed.add(node.id);
+        continue;
+      }
+    } else if (node.op === "div") {
+      // div(x, 1) → x
+      const val1 = tryGetScalarValue(ref1);
+      if (val1 === 1) {
+        redirectConsumers(node, ref0, ctx);
+        bypassed.add(node.id);
+        continue;
+      }
+    }
+  }
 }
