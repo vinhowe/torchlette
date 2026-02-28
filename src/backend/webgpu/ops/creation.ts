@@ -286,11 +286,10 @@ export function randn(shape: number[], seed: number): WebGPUTensor {
   const pipeline = getPipeline(ctx, "randn_tile", getRandnWGSL());
   const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
 
-  // Params: [numThreads, size, seed] — 3 u32 words (padded to 4 for alignment)
-  const paramsData = new Uint32Array(4);
-  paramsData[0] = numThreads;
-  paramsData[1] = numElements;
-  paramsData[2] = seed >>> 0;
+  // Shader uniforms: {size: u32, seed: u32}
+  const paramsData = new Uint32Array(2);
+  paramsData[0] = numElements;
+  paramsData[1] = seed >>> 0;
   const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
 
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [outBuffer, paramsBuffer]);
