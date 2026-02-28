@@ -177,15 +177,7 @@ function emitBroadcastIndex(
   const rankDiff = rank - inputRank;
 
   // Decompose output linear index into coordinates
-  let tmp = outputIdx;
-  const outCoords: BlockExpr[] = [];
-  for (let i = rank - 1; i >= 0; i--) {
-    const dim = outputShape[i];
-    outCoords.unshift(tmp.mod(ctx.u32(dim)));
-    if (i > 0) {
-      tmp = tmp.div(ctx.u32(dim));
-    }
-  }
+  const outCoords = ctx.decomposeIndex(outputIdx, outputShape);
 
   // Map to input coordinates (broadcast dims → 0)
   const inCoords: BlockExpr[] = [];
@@ -198,13 +190,14 @@ function emitBroadcastIndex(
     }
   }
 
-  // Re-linearize
-  let inIdx = inCoords[0];
-  for (let i = 1; i < inputRank; i++) {
-    inIdx = inIdx.mul(ctx.u32(inputShape[i])).add(inCoords[i]);
+  // Re-linearize: compute input strides from shape
+  const inStrides: number[] = [];
+  for (let i = 0; i < inputRank; i++) {
+    let s = 1;
+    for (let j = i + 1; j < inputRank; j++) s *= inputShape[j];
+    inStrides.push(s);
   }
-
-  return inIdx;
+  return ctx.linearizeIndex(inCoords, inStrides);
 }
 
 // ============================================================================

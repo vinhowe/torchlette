@@ -43,67 +43,42 @@ function buildInputOffset(
   inputShape: number[],
   inputStrides: number[],
   outShape: number[],
-  outStrides: number[],
+  _outStrides: number[],
   normalizedDims: number[],
   inputToOutDim: number[],
-  prefix: string,
+  _prefix: string,
 ): BlockExpr {
   const rank = inputShape.length;
 
   // Decompose outIdx into output coordinates
-  const outCoords: BlockExpr[] = [];
-  if (outShape.length > 0) {
-    let rem = outIdx;
-    for (let d = 0; d < outShape.length; d++) {
-      const stride = outStrides[d];
-      if (d < outShape.length - 1) {
-        outCoords.push(rem.div(ctx.u32(stride)));
-        rem = rem.mod(ctx.u32(stride));
-      } else {
-        outCoords.push(rem); // last coord is the remainder
-      }
-    }
-  }
+  const outCoords = outShape.length > 0
+    ? ctx.decomposeIndex(outIdx, outShape)
+    : [];
 
   // Decompose reduceIdx into reduction coordinates
-  const reduceCoords: BlockExpr[] = [];
-  if (normalizedDims.length > 0) {
-    let rrem = reduceIdx;
-    for (let i = 0; i < normalizedDims.length; i++) {
-      // Compute size of remaining reduce dims
-      let rDimSize = 1;
-      for (let j = i + 1; j < normalizedDims.length; j++) {
-        rDimSize *= inputShape[normalizedDims[j]];
-      }
-      if (i < normalizedDims.length - 1) {
-        reduceCoords.push(rrem.div(ctx.u32(rDimSize)));
-        rrem = rrem.mod(ctx.u32(rDimSize));
-      } else {
-        reduceCoords.push(rrem);
-      }
-    }
-  }
+  const reduceShape = normalizedDims.map(d => inputShape[d]);
+  const reduceCoords = reduceShape.length > 0
+    ? ctx.decomposeIndex(reduceIdx, reduceShape)
+    : [];
 
-  // Build the linear input offset from coordinates
-  let offset: BlockExpr = ctx.u32(0);
+  // Interleave output and reduction coordinates into input coordinates,
+  // then linearize with input strides
+  const inputCoords: BlockExpr[] = [];
   let reduceCoordIdx = 0;
   for (let d = 0; d < rank; d++) {
-    let coord: BlockExpr;
     if (normalizedDims.includes(d)) {
-      coord = reduceCoords[reduceCoordIdx++];
+      inputCoords.push(reduceCoords[reduceCoordIdx++]);
     } else {
       const outD = inputToOutDim[d];
       if (outD >= 0 && outD < outCoords.length) {
-        coord = outCoords[outD];
+        inputCoords.push(outCoords[outD]);
       } else {
-        coord = ctx.u32(0);
+        inputCoords.push(ctx.u32(0));
       }
     }
-    // offset += coord * inputStrides[d]
-    offset = offset.add(coord.mul(ctx.u32(inputStrides[d])));
   }
 
-  return offset;
+  return ctx.linearizeIndex(inputCoords, inputStrides);
 }
 
 // ============================================================================
