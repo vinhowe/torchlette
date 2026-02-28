@@ -26,6 +26,20 @@
  * ```
  */
 
+import {
+  BlockOps, Block, TileRange, TilePtr, TileMask, buildPtr, buildMask,
+  type TilePtrComponent, type TileMaskComponent,
+} from "./tile-ops";
+
+// Re-export tile-ops types so kernel authors only need one import
+export {
+  BlockOps, Block, TileRange, TilePtr, TileMask, buildPtr, buildMask,
+  type TilePtrComponent, type TileMaskComponent,
+  type BlockCoopPtr, type BlockThreadPtr, type BlockPtr, type BlockLoadOpts,
+  type BlockStorePtr,
+  type TileConfig,
+} from "./tile-ops";
+
 // ============================================================================
 // IR Node Types
 // ============================================================================
@@ -2712,6 +2726,86 @@ export class KernelContext {
         idxSmem.write(tid, cond.select(otherIdx, myIdx));
       });
     }
+  }
+
+  // ---- Triton-like Tile API (delegates to internal BlockOps) ----
+
+  /** Internal BlockOps instance, created by configureTiles(). */
+  private _blockOps?: BlockOps;
+
+  private _requireOps(): BlockOps {
+    if (!this._blockOps) throw new Error("Call configureTiles() first");
+    return this._blockOps;
+  }
+
+  /**
+   * Initialize tile context: create internal BlockOps, emit thread position bindings.
+   * Must be called before any other tile-level method.
+   *
+   * Equivalent to Triton's implicit thread-to-tile mapping.
+   */
+  configureTiles(config: {
+    tileM: number; tileN: number;
+    threadTileM: number; threadTileN: number;
+    wgSize: [number, number];
+  }): { threadRow: BlockExpr; threadCol: BlockExpr } {
+    this._blockOps = new BlockOps(this, {
+      wgSize: config.wgSize,
+      threadTile: [config.threadTileM, config.threadTileN],
+    });
+    const threadRow = this.emitLet("thread_row", this.threadIdx(1));
+    const threadCol = this.emitLet("thread_col", this.threadIdx(0));
+    return { threadRow, threadCol };
+  }
+
+  /** Access the underlying BlockOps (for epilogue callbacks). */
+  get tileOps(): BlockOps {
+    return this._requireOps();
+  }
+
+  /** Create a 1D offset range: [base, base+blockSize). ≈ tl.arange(base, base+size) */
+  tileRange(base: BlockExpr, blockSize: number): TileRange {
+    return this._requireOps().arange(base, blockSize);
+  }
+
+  /** Build a 2D pointer from base + outer + inner. ≈ Triton pointer arithmetic */
+  tilePtr(base: BlockExpr, outer: TilePtrComponent, inner: TilePtrComponent): TilePtr {
+    return buildPtr(base, outer, inner);
+  }
+
+  /** Build a 2D mask from outer + inner bounds. ≈ Triton mask construction */
+  tileMask(outer: TileMaskComponent, inner: TileMaskComponent): TileMask {
+    return buildMask(outer, inner);
+  }
+
+  /** Create a register block initialized to zero. ≈ tl.zeros([M, N]) */
+  blockZeros(rows: number, cols: number): Block {
+    return this._requireOps().zeros(rows, cols);
+  }
+
+  /** Create a register block filled with a constant. ≈ tl.full([M, N], val) */
+  blockFull(rows: number, cols: number, val: number): Block {
+    return this._requireOps().full(rows, cols, val);
+  }
+
+  /** Cooperative tile load into shared memory. ≈ tl.load(ptr, mask) */
+  tileLoad2D(binding: string, ptr: TilePtr, mask: TileMask): Block {
+    return this._requireOps().loadTile(binding, ptr, mask);
+  }
+
+  /** 1D register load (e.g. bias vector). ≈ tl.load(bias_ptr) */
+  tileLoad1D(binding: string, range: TileRange): Block {
+    return this._requireOps().load1d(binding, range);
+  }
+
+  /** Block dot product: acc += a @ b. ≈ acc += tl.dot(a, b) */
+  dotAccum(a: Block, b: Block, acc: Block): void {
+    this._requireOps().dotAccum(a, b, acc);
+  }
+
+  /** Store block to global memory with bounds checking. ≈ tl.store(ptr, block, mask) */
+  tileStore2D(binding: string, block: Block, ptr: TilePtr, mask: TileMask): void {
+    this._requireOps().storeTile(binding, block, ptr, mask);
   }
 }
 
