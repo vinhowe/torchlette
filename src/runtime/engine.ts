@@ -1179,6 +1179,12 @@ export class RuntimeEngine {
     return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
   }
 
+  pow(a: TensorOrScalar, b: TensorOrScalar): Tensor {
+    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp("pow", a, b);
+    const node = createLazyIRNode("pow", [refA, refB], shape, dtype, device);
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
+  }
+
   view(a: Tensor, shape: number[]): Tensor {
     const node = createLazyIRNode(
       "reshape",

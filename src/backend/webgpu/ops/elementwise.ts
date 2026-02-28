@@ -202,6 +202,14 @@ export function sign(
   return dispatchUnary("sign", "sign(x)", asGPUTensor(a), options);
 }
 
+export function pow(
+  a: BackendTensor,
+  b: BackendTensor,
+  options?: { outBuffer?: GPUBuffer },
+): BackendTensor {
+  return dispatchBinary("pow", asGPUTensor(a), asGPUTensor(b), options);
+}
+
 export function clamp(
   a: BackendTensor,
   min: number | null,
