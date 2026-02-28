@@ -11,7 +11,7 @@ import type {
   GeluOptions,
 } from "../backend/types";
 import { getBackend } from "../backend/registry";
-import { setCurrentOpLabel } from "../backend/webgpu";
+import { setCurrentOpLabel, getCurrentOpLabel } from "../backend/webgpu";
 import { sizeOf } from "../core/shape";
 import { profileOpBegin, profileOpEnd, setProfileModule } from "../backend/webgpu/profiler";
 import type { LazyIRNode, LazyRef, StorageHandle } from "./lazy-types";
@@ -69,7 +69,10 @@ export function getInputStorage(ref: LazyRef, backend?: Backend): StorageHandle 
     // Materialize scalar ref on-the-fly for non-fused execution
     const b = backend ?? getBackend("cpu");
     if (!b) throw new Error("No backend available to materialize scalar ref");
+    const prevLabel = getCurrentOpLabel();
+    setCurrentOpLabel("full");
     const bt = b.ops.full ? b.ops.full([], ref.value) : b.ops.tensorFromArray([ref.value], []);
+    setCurrentOpLabel(prevLabel);
     return createStorageHandle("cpu", bt);
   }
   if (ref.node.result) {
@@ -568,7 +571,8 @@ export async function executeOp(
   donationOpts?: { outBuffer: unknown },
 ): Promise<BackendTensor> {
   setCurrentOpLabel(node.op);
-  setProfileModule(node.module ?? "unknown");
+  const nodeModule = node.module ?? "unknown";
+  setProfileModule(nodeModule);
   const _profT0 = profileOpBegin(node.op);
   try {
     const op = node.op;

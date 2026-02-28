@@ -336,6 +336,7 @@ export async function executeSequentialSegment(
       }
 
       const nodeBackend = getBackend(node.device) ?? backend;
+      setProfileModule(node.module ?? "unknown");
       const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
       const backendInputs = inputs.map((s) => s.backendTensor);
 
@@ -769,6 +770,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
       }
 
       const nodeBackend = getBackend(node.device) ?? backend;
+      setProfileModule(node.module ?? "unknown");
       const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
       const backendInputs = inputs.map((s) => s.backendTensor);
 

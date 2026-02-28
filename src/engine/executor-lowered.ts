@@ -1118,6 +1118,7 @@ export async function executeLoweredPlan(
           const seqCountersBefore = shouldRecord ? getDispatchSequenceCounters() : undefined;
 
           const nodeBackend = getBackend(node.device) ?? backend;
+          setProfileModule(node.module ?? "unknown");
           const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
           const backendInputs = inputs.map(s => s.backendTensor);
 
