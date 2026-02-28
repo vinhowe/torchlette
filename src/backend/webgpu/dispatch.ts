@@ -10,10 +10,8 @@ import {
   toIndexShape,
   computeEffectiveBroadcastStrides,
   dtypeBytes,
-  dtypeToWgsl,
   compute2DDispatch,
   WORKGROUP_SIZE,
-  MAX_WORKGROUPS_PER_DIM,
 } from "./shape-utils";
 import type { DType } from "../types";
 import type { GPUBuffer, GPUComputePipeline, GPUBindGroup, WebGPUContext, WebGPUTensor } from "./gpu-types";
@@ -36,9 +34,9 @@ import {
   cachedCreateBindGroup,
   params1,
 } from "./bind-group-cache";
-import { computeFlatChunkLayout, dispatchFlatChunked } from "./chunked-dispatch";
 import { getTimestampWrites, getProfileModule } from "./profiler";
-import { binaryBroadcastTileIR, unaryStridedTileIR } from "./ops/ops-tile-ir";
+import { binaryBroadcastTileIR, binaryBroadcastSpec, unaryStridedTileIR, unaryStridedSpec } from "./ops/ops-tile-ir";
+import { createTileKernelDispatcher } from "./tile-dispatch";
 
 import {
   computeBatchSize,
@@ -292,6 +290,7 @@ export function dispatchBinaryDirect(
 
 /**
  * Chunked binary dispatch for large tensors.
+ * Uses tile-IR spec + dispatchChunked for tensors exceeding maxStorageBufferBindingSize.
  * Handles: same-shape contiguous tensors, or scalar + large tensor.
  */
 export function dispatchBinaryChunked(
@@ -304,17 +303,11 @@ export function dispatchBinaryChunked(
   const dtype = a.dtype;
   const bytesPerElement = dtypeBytes(dtype);
 
-  const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
-  const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
-
   const outShape = broadcastShapes(a.shape, b.shape);
   const outSize = sizeOf(outShape);
 
   const aIsScalar = a.size === 1;
   const bIsScalar = b.size === 1;
-
-  const layout = computeFlatChunkLayout(outSize, bytesPerElement, maxBindingSize, minAlignment);
 
   const outBuffer = resolveOutputBuffer(
     ctx.device,
@@ -323,42 +316,31 @@ export function dispatchBinaryChunked(
     options?.outBuffer,
   );
 
-  // Build shader for chunked binary op
-  const wgslType = dtypeToWgsl(dtype);
-  const idxCompute = layout.use2D
-    ? `let idx = gid.x + gid.y * ${layout.gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-  const aAccess = aIsScalar ? "a[0]" : "a[idx]";
-  const bAccess = bIsScalar ? "b[0]" : "b[idx]";
+  // Build a flat tile-IR spec: scalar inputs use stride 0, contiguous use stride 1
+  const spec = binaryBroadcastSpec(
+    op,
+    [outSize],                            // flat 1D indexShape
+    aIsScalar ? [0] : [1],               // aStrides: 0 for scalar, 1 for contiguous
+    bIsScalar ? [0] : [1],               // bStrides: 0 for scalar, 1 for contiguous
+    0, 0,                                 // offsets: 0 (contiguous, no offset)
+    dtype as "f32" | "f16" | "u32" | "i32",
+  );
 
-  const code = `
-@group(0) @binding(0) var<storage, read> a: array<${wgslType}>;
-@group(0) @binding(1) var<storage, read> b: array<${wgslType}>;
-@group(0) @binding(2) var<storage, read_write> out: array<${wgslType}>;
-
-struct Params {
-  chunkSize: u32,
-};
-@group(0) @binding(3) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.chunkSize) { return; }
-  out[idx] = ${aAccess} ${op} ${bAccess};
-}
-`;
-
-  const key = `binaryChunked:${op}:${dtype}:${aIsScalar}:${bIsScalar}:${layout.use2D ? `2d:${layout.gridSizeX}` : "1d"}`;
-
-  dispatchFlatChunked({
-    key, shader: code, layout,
-    inputs: [
-      { buffer: a.buffer, mode: aIsScalar ? "scalar" : "chunked" },
-      { buffer: b.buffer, mode: bIsScalar ? "scalar" : "chunked" },
-    ],
-    outBuffer, outBytesPerElement: bytesPerElement, totalElements: outSize,
-  });
+  const dispatcher = createTileKernelDispatcher(spec);
+  dispatcher.dispatchChunked(
+    { a: a.buffer, b: b.buffer, out: outBuffer },
+    { size: outSize },
+    {
+      modes: {
+        a: aIsScalar ? "scalar" : "chunked",
+        b: bIsScalar ? "scalar" : "chunked",
+        out: "chunked",
+      },
+      sizeUniform: "size",
+      totalElements: outSize,
+      maxBytesPerElement: bytesPerElement,
+    },
+  );
 
   const ownsBuffer = options?.outBuffer === undefined;
   return createTensor(outShape, outBuffer, undefined, 0, dtype, ownsBuffer);
@@ -424,6 +406,7 @@ export function dispatchUnaryDirect(
 
 /**
  * Chunked unary dispatch for large contiguous tensors.
+ * Uses tile-IR spec + dispatchChunked for tensors exceeding maxStorageBufferBindingSize.
  */
 export function dispatchUnaryChunked(
   opKey: string,
@@ -434,14 +417,7 @@ export function dispatchUnaryChunked(
   const ctx = requireContext();
   const dtype = a.dtype;
   const bytesPerElement = dtypeBytes(dtype);
-
-  const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
-  const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
-
   const outSize = a.size;
-
-  const layout = computeFlatChunkLayout(outSize, bytesPerElement, maxBindingSize, minAlignment);
 
   const outBuffer = resolveOutputBuffer(
     ctx.device,
@@ -450,37 +426,26 @@ export function dispatchUnaryChunked(
     options?.outBuffer,
   );
 
-  // Build shader for chunked unary op
-  const wgslType = dtypeToWgsl(dtype);
-  const idxCompute = layout.use2D
-    ? `let idx = gid.x + gid.y * ${layout.gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-  const exprWithAccess = expr.replace(/\bx\b/g, "a[idx]");
+  // Build a flat tile-IR spec: contiguous stride 1, offset 0
+  const spec = unaryStridedSpec(
+    opKey,
+    [outSize],                            // flat 1D shape
+    [1],                                  // contiguous stride
+    0,                                    // no offset
+    dtype as "f32" | "f16" | "u32" | "i32",
+  );
 
-  const code = `
-@group(0) @binding(0) var<storage, read> a: array<${wgslType}>;
-@group(0) @binding(1) var<storage, read_write> out: array<${wgslType}>;
-
-struct Params {
-  chunkSize: u32,
-};
-@group(0) @binding(2) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.chunkSize) { return; }
-  out[idx] = ${exprWithAccess};
-}
-`;
-
-  const key = `unaryChunked:${opKey}:${dtype}:${layout.use2D ? `2d:${layout.gridSizeX}` : "1d"}`;
-
-  dispatchFlatChunked({
-    key, shader: code, layout,
-    inputs: [{ buffer: a.buffer, mode: "chunked" }],
-    outBuffer, outBytesPerElement: bytesPerElement, totalElements: outSize,
-  });
+  const dispatcher = createTileKernelDispatcher(spec);
+  dispatcher.dispatchChunked(
+    { a: a.buffer, out: outBuffer },
+    { size: outSize },
+    {
+      modes: { a: "chunked", out: "chunked" },
+      sizeUniform: "size",
+      totalElements: outSize,
+      maxBytesPerElement: bytesPerElement,
+    },
+  );
 
   const ownsBuffer = options?.outBuffer === undefined;
   return createTensor(a.shape, outBuffer, undefined, 0, dtype, ownsBuffer);

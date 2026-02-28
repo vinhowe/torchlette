@@ -12,13 +12,13 @@ import {
   computeEffectiveBroadcastStrides,
   WORKGROUP_SIZE,
 } from "../shape-utils";
-import { whereWGSL } from "./ops-tile-ir";
+import { whereWGSL, whereSpec } from "./ops-tile-ir";
 import { requireContext } from "../gpu-context";
 import { dispatchElementwise } from "../dispatch";
 import { createTensor } from "../tensor";
 import { resolveOutputBuffer } from "../buffer-arena";
 import { params1 } from "../bind-group-cache";
-import { computeFlatChunkLayout, dispatchFlatChunked } from "../chunked-dispatch";
+import { createTileKernelDispatcher } from "../tile-dispatch";
 
 /**
  * Broadcast three shapes to a common output shape.
@@ -149,12 +149,6 @@ function whereChunked(
   const ctx = requireContext();
   const bytesPerElement = 4; // f32
 
-  const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
-  const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
-
-  const layout = computeFlatChunkLayout(outSize, bytesPerElement, maxBindingSize, minAlignment);
-
   const outBuffer = resolveOutputBuffer(
     ctx.device,
     outSize * bytesPerElement,
@@ -166,49 +160,30 @@ function whereChunked(
   const xIsScalar = xTensor.size <= 1;
   const yIsScalar = yTensor.size <= 1;
 
-  // Build a flat chunked shader — no broadcast indexing needed since
-  // scalar inputs are read at [0] and contiguous inputs are read at [idx].
-  const condAccess = condIsScalar ? "cond[0]" : "cond[idx]";
-  const xAccess = xIsScalar ? "x[0]" : "x[idx]";
-  const yAccess = yIsScalar ? "y[0]" : "y[idx]";
-
-  const idxCompute = layout.use2D
-    ? `let idx = gid.x + gid.y * ${layout.gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-
-  const code = `
-struct Params {
-  chunkSize: u32,
-};
-
-@group(0) @binding(0) var<storage, read> cond: array<f32>;
-@group(0) @binding(1) var<storage, read> x: array<f32>;
-@group(0) @binding(2) var<storage, read> y: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
-@group(0) @binding(4) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.chunkSize) { return; }
-  let condVal = ${condAccess};
-  let xVal = ${xAccess};
-  let yVal = ${yAccess};
-  out[idx] = select(yVal, xVal, condVal != 0.0);
-}
-`;
-
-  const key = `whereChunked:${condIsScalar}:${xIsScalar}:${yIsScalar}:${layout.use2D ? `2d:${layout.gridSizeX}` : "1d"}`;
-
-  dispatchFlatChunked({
-    key, shader: code, layout,
-    inputs: [
-      { buffer: condTensor.buffer, mode: condIsScalar ? "scalar" : "chunked" },
-      { buffer: xTensor.buffer, mode: xIsScalar ? "scalar" : "chunked" },
-      { buffer: yTensor.buffer, mode: yIsScalar ? "scalar" : "chunked" },
-    ],
-    outBuffer, outBytesPerElement: bytesPerElement, totalElements: outSize,
-  });
+  // Flat chunked: scalar inputs get stride 0, contiguous inputs get stride 1
+  const spec = whereSpec(
+    [outSize],
+    condIsScalar ? [0] : [1],
+    xIsScalar ? [0] : [1],
+    yIsScalar ? [0] : [1],
+    0, 0, 0,
+  );
+  const dispatcher = createTileKernelDispatcher(spec);
+  dispatcher.dispatchChunked(
+    { cond: condTensor.buffer, x: xTensor.buffer, y: yTensor.buffer, out: outBuffer },
+    { size: outSize },
+    {
+      modes: {
+        cond: condIsScalar ? "scalar" : "chunked",
+        x: xIsScalar ? "scalar" : "chunked",
+        y: yIsScalar ? "scalar" : "chunked",
+        out: "chunked",
+      },
+      sizeUniform: "size",
+      totalElements: outSize,
+      maxBytesPerElement: bytesPerElement,
+    },
+  );
 
   return createTensor(outShape, outBuffer);
 }

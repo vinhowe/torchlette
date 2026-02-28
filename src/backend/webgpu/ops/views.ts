@@ -7,7 +7,7 @@ import type { BackendTensor, DType, TransposeOptions } from "../../types";
 import type { GPUBuffer, GPUDevice, WebGPUTensor } from "../gpu-types";
 import { GPUBufferUsage, STORAGE_BUFFER_USAGE, asGPUTensor } from "../gpu-types";
 import {
-  sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch,
+  sizeOf, WORKGROUP_SIZE, compute2DDispatch,
   contiguousStrides, checkContiguousStrides, dtypeBytes, dtypeToWgsl,
   alignBufferSize, gcd, lcm,
 } from "../shape-utils";
@@ -22,8 +22,8 @@ import {
   params1, params2, params4, params7,
 } from "../bind-group-cache";
 import { profileApiCall } from "../profiler";
-import { computeFlatChunkLayout, dispatchFlatChunked } from "../chunked-dispatch";
-import { castTileIR, contiguousTileIR, narrowBackwardTileIR } from "./ops-tile-ir";
+import { castTileIR, castSpec, contiguousTileIR, narrowBackwardTileIR } from "./ops-tile-ir";
+import { createTileKernelDispatcher } from "../tile-dispatch";
 
 /**
  * Cast tensor to a different dtype.
@@ -115,7 +115,7 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
 
 /**
  * Chunked cast dispatch for tensors exceeding maxStorageBufferBindingSize.
- * Input must be contiguous with offset 0.
+ * Uses tile-IR spec + dispatchChunked. Input must be contiguous with offset 0.
  */
 function castChunked(
   tensor: WebGPUTensor,
@@ -126,7 +126,7 @@ function castChunked(
 ): BackendTensor {
   const srcBytesPerElement = dtypeBytes(tensor.dtype);
   const dstBytesPerElement = dtypeBytes(dtype);
-  const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
+  const minAlignment = (limits as Record<string, number>)?.minStorageBufferOffsetAlignment ?? 256;
 
   // Alignment must satisfy both src and dst offset alignment requirements
   const srcElemsPerAlign = minAlignment / srcBytesPerElement;
@@ -136,48 +136,28 @@ function castChunked(
   const totalElements = tensor.size;
   const maxBpe = Math.max(srcBytesPerElement, dstBytesPerElement);
 
-  const layout = computeFlatChunkLayout(
-    totalElements, maxBpe, maxBindingSize, minAlignment, elementsPerAlignment,
-  );
-
   const outBuffer = resolveOutputBuffer(
     ctx.device,
     totalElements * dstBytesPerElement,
     [tensor.buffer],
   );
 
-  // Build shader for chunked cast (contiguous, no strides/offset)
-  const srcWgslType = dtypeToWgsl(tensor.dtype);
-  const dstWgslType = dtypeToWgsl(dtype);
-  const f16Enable = (tensor.dtype === "f16" || dtype === "f16") ? "enable f16;\n" : "";
-  const idxCompute = layout.use2D
-    ? `let idx = gid.x + gid.y * ${layout.gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-
-  const code = `${f16Enable}
-@group(0) @binding(0) var<storage, read> a: array<${srcWgslType}>;
-@group(0) @binding(1) var<storage, read_write> out: array<${dstWgslType}>;
-
-struct Params {
-  chunkSize: u32,
-};
-@group(0) @binding(2) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.chunkSize) { return; }
-  out[idx] = ${dstWgslType}(a[idx]);
-}
-`;
-
-  const key = `castChunked:${tensor.dtype}->${dtype}:${layout.use2D ? `2d:${layout.gridSizeX}` : "1d"}`;
-
-  dispatchFlatChunked({
-    key, shader: code, layout,
-    inputs: [{ buffer: tensor.buffer, mode: "chunked", bytesPerElement: srcBytesPerElement }],
-    outBuffer, outBytesPerElement: dstBytesPerElement, totalElements,
-  });
+  // Build flat tile-IR spec: contiguous input, stride 1, offset 0
+  type DT = "f32" | "f16" | "i32" | "u32";
+  const spec = castSpec(tensor.dtype as DT, dtype as DT, [totalElements], [1], 0);
+  const dispatcher = createTileKernelDispatcher(spec);
+  dispatcher.dispatchChunked(
+    { a: tensor.buffer, out: outBuffer },
+    { size: totalElements },
+    {
+      modes: { a: "chunked", out: "chunked" },
+      bytesPerElement: { a: srcBytesPerElement, out: dstBytesPerElement },
+      sizeUniform: "size",
+      totalElements,
+      maxBytesPerElement: maxBpe,
+      elementsPerAlignment,
+    },
+  );
 
   return createTensor(tensor.shape, outBuffer, undefined, 0, dtype);
 }

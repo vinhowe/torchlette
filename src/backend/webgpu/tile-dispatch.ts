@@ -21,14 +21,40 @@ import {
   cachedCreateBindGroup,
   getPipeline,
 } from "./index";
+import { profiledCreateBindGroup } from "./bind-group-cache";
+import { computeFlatChunkLayout } from "./chunked-dispatch";
 import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { compileTileKernel } from "./tile-compiler";
-import type { TileKernelSpec, UniformType, AutotuneConfig } from "./tile-ir";
+import type { TileKernelSpec, UniformType, AutotuneConfig, DataType } from "./tile-ir";
 import { resolveGrid } from "./tile-ir";
 import { autotuneTileKernel, getDefaultConfig, type AutotuneOptions } from "./tile-autotune";
 import { analyzeAccessPatterns, reportAccessPatterns } from "./tile-access-analysis";
+
+// ============================================================================
+// Chunked Binding Configuration
+// ============================================================================
+
+export interface ChunkedBindingConfig {
+  /** Which bindings are chunked vs scalar. Key = binding name from spec. */
+  modes: Record<string, "scalar" | "chunked">;
+  /** Per-binding bytes-per-element override (e.g. cast source has different bpe). */
+  bytesPerElement?: Record<string, number>;
+  /** The uniform field name that holds the element count (patched per chunk). */
+  sizeUniform: string;
+  /** Total elements across all chunks. */
+  totalElements: number;
+  /** Max bytes per element across all chunked bindings (for chunk layout). */
+  maxBytesPerElement: number;
+  /** Override elements-per-alignment (for cast with mixed dtypes). */
+  elementsPerAlignment?: number;
+}
+
+/** Bytes per element for a tile-IR DataType. */
+function dataTypeBpe(dt: DataType): number {
+  return dt === "f16" ? 2 : 4;
+}
 
 // ============================================================================
 // Config Buffer Packing
@@ -95,6 +121,17 @@ export interface TileKernelInstance {
   dispatch(
     buffers: Record<string, GPUBuffer>,
     uniforms: Record<string, number>,
+  ): void;
+
+  /**
+   * Dispatch the kernel across flat element chunks for tensors exceeding
+   * maxStorageBufferBindingSize. Same WGSL kernel is used for every chunk;
+   * WebGPU offset/size on bind group entries makes index 0 map to chunk start.
+   */
+  dispatchChunked(
+    buffers: Record<string, GPUBuffer>,
+    uniforms: Record<string, number>,
+    chunking: ChunkedBindingConfig,
   ): void;
 
   /** Get the compiled WGSL source (for debugging/testing). */
@@ -192,6 +229,111 @@ export function createTileKernelDispatcher(spec: TileKernelSpec): TileKernelInst
 
       // Dispatch
       dispatchComputePass(pipeline, bindGroup, ...grid);
+    },
+
+    dispatchChunked(
+      buffers: Record<string, GPUBuffer>,
+      uniforms: Record<string, number>,
+      chunking: ChunkedBindingConfig,
+    ): void {
+      const ctx = requireContext();
+      const device = ctx.device;
+
+      const limits = device.limits;
+      const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+      const minAlignment = (limits as Record<string, number>)?.minStorageBufferOffsetAlignment ?? 256;
+
+      const layout = computeFlatChunkLayout(
+        chunking.totalElements,
+        chunking.maxBytesPerElement,
+        maxBindingSize,
+        minAlignment,
+        chunking.elementsPerAlignment,
+      );
+
+      const wgsl = getWGSL();
+      const pipeline = getPipeline(ctx, wgsl, wgsl);
+
+      const bindingNames = Object.keys(spec.bindings);
+      const hasUniforms = Object.keys(spec.uniforms).length > 0;
+      const uniformIdx = spec.uniformBindingIndex;
+      const gridFn = resolveGrid(spec);
+
+      for (let chunk = 0; chunk < layout.numChunks; chunk++) {
+        const chunkStart = chunk * layout.elementsPerChunk;
+        const chunkEnd = Math.min(chunkStart + layout.elementsPerChunk, chunking.totalElements);
+        const chunkSize = chunkEnd - chunkStart;
+
+        // Patch the size uniform for this chunk
+        const patchedUniforms = { ...uniforms, [chunking.sizeUniform]: chunkSize };
+
+        // Pack uniforms into config buffer (cached by content)
+        let configBuf: GPUBuffer | null = null;
+        if (hasUniforms) {
+          const configKey = `chunked:${uniformCacheKey(spec, patchedUniforms)}`;
+          const { data, sizeBytes } = packUniforms(spec, patchedUniforms);
+          configBuf = getConfigBuffer(device, configKey, sizeBytes, data);
+        }
+
+        // Build bind group entries with offset/size for chunked bindings
+        const entries: Array<{
+          binding: number;
+          resource: { buffer: GPUBuffer; offset?: number; size?: number };
+        }> = [];
+
+        let bindingIndex = 0;
+
+        for (let i = 0; i < bindingNames.length; i++) {
+          // Insert uniform at the specified binding index
+          if (configBuf && uniformIdx !== undefined && bindingIndex === uniformIdx) {
+            entries.push({ binding: bindingIndex, resource: { buffer: configBuf } });
+            bindingIndex++;
+          }
+
+          const name = bindingNames[i];
+          const buf = buffers[name];
+          if (!buf) {
+            throw new Error(`Missing buffer for binding: ${name}`);
+          }
+
+          const mode = chunking.modes[name] ?? "chunked";
+          if (mode === "scalar") {
+            entries.push({ binding: bindingIndex, resource: { buffer: buf } });
+          } else {
+            const bpe = chunking.bytesPerElement?.[name] ?? dataTypeBpe(spec.bindings[name].type);
+            entries.push({
+              binding: bindingIndex,
+              resource: {
+                buffer: buf,
+                offset: chunkStart * bpe,
+                size: chunkSize * bpe,
+              },
+            });
+          }
+          bindingIndex++;
+        }
+
+        // Append uniform at end if not already inserted
+        if (configBuf && (uniformIdx === undefined || bindingIndex <= uniformIdx)) {
+          entries.push({ binding: bindingIndex, resource: { buffer: configBuf } });
+        }
+
+        const bindGroup = profiledCreateBindGroup(device, {
+          layout: pipeline.getBindGroupLayout(0),
+          entries,
+        });
+
+        // Track writes
+        for (const entry of entries) {
+          trackSharedEncoderWrite(entry.resource.buffer);
+        }
+
+        // Compute grid for this chunk's element count
+        const grid = gridFn(patchedUniforms);
+
+        // Dispatch
+        dispatchComputePass(pipeline, bindGroup, ...grid);
+      }
     },
 
     getWGSL,
