@@ -1007,3 +1007,101 @@ export function flatAddSpec(): TileKernelSpec {
     },
   };
 }
+
+// ============================================================================
+// RNG Kernels (Philox 2x32-10)
+// ============================================================================
+
+/**
+ * Uniform random f32 in [0, 1).
+ * Each thread generates one value using Philox 2x32-10.
+ */
+export function randWGSL(): string {
+  const spec: TileKernelSpec = {
+    name: "rand",
+    workgroupSize: WG,
+    bindings: {
+      out: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      size: "u32",
+      seed: "u32",
+    },
+    grid: elementwiseGrid(WG, { elementUniform: "size" }),
+    kernel(ctx) {
+      const idx = ctx.globalId(0);
+      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      ctx.emitStore("out", idx, ctx.randF32(ctx.uniform("seed"), idx));
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+/**
+ * Standard normal (Gaussian) random f32 via Box-Muller transform.
+ * Each thread processes a pair of elements using two Philox outputs.
+ */
+export function randnWGSL(): string {
+  const spec: TileKernelSpec = {
+    name: "randn",
+    workgroupSize: WG,
+    bindings: {
+      out: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      size: "u32",
+      seed: "u32",
+    },
+    // Half the threads: each produces 2 values
+    grid(u) {
+      const numThreads = Math.ceil(u.size / 2);
+      const totalWg = Math.ceil(numThreads / WG);
+      if (totalWg <= MAX_WG_PER_DIM) return [totalWg];
+      return [Math.min(totalWg, MAX_WG_PER_DIM), Math.ceil(totalWg / MAX_WG_PER_DIM)];
+    },
+    kernel(ctx) {
+      const idx = ctx.globalId(0);
+      const outIdx = idx.mul(ctx.u32(2));
+      const size = ctx.uniform("size");
+      ctx.ifThen(outIdx.ge(size), () => ctx.emitReturn());
+
+      // Two uniform randoms from a single Philox call
+      const [u1raw, u2] = ctx.randF32x2(ctx.uniform("seed"), idx);
+      // Clamp u1 to (0, 1] to avoid log(0): max(u1, epsilon)
+      const u1 = u1raw.max(ctx.f32(1.1754944e-38));
+      // Box-Muller transform
+      const r = u1.log().mul(ctx.f32(-2.0)).sqrt();
+      const theta = u2.mul(ctx.f32(2.0 * Math.PI));
+      ctx.emitStore("out", outIdx, r.mul(theta.cos()));
+      // Second value with bounds check
+      ctx.guardedStore("out", outIdx.add(ctx.u32(1)).lt(size), outIdx.add(ctx.u32(1)), r.mul(theta.sin()));
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+/**
+ * Bernoulli random f32: 1.0 with probability p, 0.0 otherwise.
+ */
+export function bernoulliWGSL(): string {
+  const spec: TileKernelSpec = {
+    name: "bernoulli",
+    workgroupSize: WG,
+    bindings: {
+      out: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      size: "u32",
+      seed: "u32",
+      prob: "f32",
+    },
+    grid: elementwiseGrid(WG, { elementUniform: "size" }),
+    kernel(ctx) {
+      const idx = ctx.globalId(0);
+      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      const u = ctx.randF32(ctx.uniform("seed"), idx);
+      ctx.emitStore("out", idx, u.lt(ctx.uniform("prob")).select(ctx.f32(1.0), ctx.f32(0.0)));
+    },
+  };
+  return compileTileKernel(spec);
+}
