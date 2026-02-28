@@ -35,55 +35,6 @@ import { compileTileKernel } from "./tile-compiler";
 import type { TileKernelSpec } from "./tile-ir";
 import { singleWorkgroup } from "./tile-ir";
 
-const USE_TILE_IR_UNSCALE = process.env.TORCHLETTE_TILE_UNSCALE !== "0";
-
-// ============================================================================
-// WGSL Shader
-// ============================================================================
-
-function unscaleGradShader(use2D: boolean, gridSizeX: number): string {
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-
-  return `
-struct UnscaleConfig {
-  inv_scale: f32,
-  num_elements: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
-
-@group(0) @binding(0) var<storage, read> grad_in: array<f32>;
-@group(0) @binding(1) var<storage, read_write> grad_out: array<f32>;
-@group(0) @binding(2) var<storage, read_write> inf_flag: array<atomic<u32>>;
-@group(0) @binding(3) var<uniform> config: UnscaleConfig;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= config.num_elements) { return; }
-
-  let g = grad_in[idx] * config.inv_scale;
-
-  // Check finite via bit pattern: f32 exponent bits are [30:23].
-  // Inf and NaN have all exponent bits set (exponent = 0xFF = 255).
-  // Finite values have exponent < 255.
-  let bits = bitcast<u32>(g);
-  let exponent = (bits >> 23u) & 0xFFu;
-  let is_finite = (exponent != 0xFFu);
-  if (!is_finite) {
-    // Set flag to 1.0f bit pattern via atomicMax
-    // bitcast<u32>(1.0f) = 0x3F800000 = 1065353216
-    atomicMax(&inf_flag[0], 1065353216u);
-    grad_out[idx] = 0.0;
-  } else {
-    grad_out[idx] = g;
-  }
-}
-`;
-}
-
 // ============================================================================
 // Tile-IR Unscale Spec Factory
 // ============================================================================
@@ -380,11 +331,8 @@ export function dispatchUnscaleGrad(
     : maxWorkgroups;
 
   // Get or create pipeline
-  const tileTag = USE_TILE_IR_UNSCALE ? ":tile" : "";
-  const key = `unscaleGrad:${use2D ? `2d:${gridSizeX}` : "1d"}${tileTag}`;
-  const code = USE_TILE_IR_UNSCALE
-    ? getUnscaleTileIRWGSL(use2D, gridSizeX)
-    : unscaleGradShader(use2D, gridSizeX);
+  const key = `unscaleGrad:${use2D ? `2d:${gridSizeX}` : "1d"}:tile`;
+  const code = getUnscaleTileIRWGSL(use2D, gridSizeX);
   const pipeline = getPipeline(ctx, key, code);
 
   for (let chunk = 0; chunk < numChunks; chunk++) {

@@ -20,14 +20,11 @@ import { sizeOf } from "../../core/shape";
 import {
   type FusedKernelRecipe,
   type GeneratedKernel,
-  generateFusedKernel,
   computeKernelMeta,
   type KernelGenOptions,
 } from "./fusion-codegen";
 import { generateFusedKernelTileIR } from "./fusion-tile-ir";
 import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
-
-const USE_TILE_IR_FUSION = process.env.TORCHLETTE_TILE_FUSION !== "0";
 import { GPUBufferUsage } from "./gpu-types";
 
 // ============================================================================
@@ -69,9 +66,7 @@ export class FusionKernelCache {
     }
 
     // Cache miss: do full WGSL codegen + shader compilation
-    const kernel = USE_TILE_IR_FUSION
-      ? generateFusedKernelTileIR(recipe, options)
-      : generateFusedKernel(recipe, options);
+    const kernel = generateFusedKernelTileIR(recipe, options);
 
     // Check warmup cache before synchronous compilation
     let pipeline = getWarmupPipeline(meta.cacheKey);
