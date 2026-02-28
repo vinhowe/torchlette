@@ -1000,6 +1000,76 @@ export class Torchlette {
     }, tensorsToSave);
   }
 
+  pow(a: Tensor | number, b: Tensor | number): Tensor {
+    const tensors = [a, b].filter((x): x is Tensor => typeof x !== "number");
+    this._assertUsable(...tensors);
+    if (typeof a !== "number" && typeof b !== "number") {
+      const inner = this.runtime.pow(a._unwrap(), b._unwrap());
+      const aShape = a.shape;
+      const bShape = b.shape;
+      const tensorsToSave =
+        a.requiresGrad || b.requiresGrad ? [a, b] : [];
+      // d/da pow(a,b) = b * pow(a, b-1), d/db pow(a,b) = pow(a,b) * log(a)
+      return this._wrapWithGrad(
+        inner,
+        [a, b],
+        (grad, getSaved) => {
+          const savedA = getSaved(0);
+          const savedB = getSaved(1);
+          const gradA = this._sumToShape(
+            this.runtime.mul(
+              grad,
+              this.runtime.mul(
+                savedB._unwrap(),
+                this.runtime.pow(savedA._unwrap(), this.runtime.sub(savedB._unwrap(), 1)),
+              ),
+            ),
+            aShape,
+          );
+          const gradB = this._sumToShape(
+            this.runtime.mul(
+              grad,
+              this.runtime.mul(
+                this.runtime.pow(savedA._unwrap(), savedB._unwrap()),
+                this.runtime.log(savedA._unwrap()),
+              ),
+            ),
+            bShape,
+          );
+          return [gradA, gradB];
+        },
+        tensorsToSave,
+      );
+    }
+    // One operand is a number
+    const tensorInput = typeof a !== "number" ? a : (b as Tensor);
+    const scalarVal = typeof a === "number" ? a : (b as number);
+    const isBaseScalar = typeof a === "number";
+    const inner = this.runtime.pow(
+      typeof a === "number" ? a : a._unwrap(),
+      typeof b === "number" ? b : b._unwrap(),
+    );
+    const tensorsToSave = tensorInput.requiresGrad ? [tensorInput] : [];
+    return this._wrapWithGrad(inner, [tensorInput], (grad, getSaved) => {
+      const saved = getSaved(0);
+      if (isBaseScalar) {
+        // d/db a^b = a^b * log(a)
+        const powResult = this.runtime.pow(scalarVal, saved._unwrap());
+        return [this._sumToShape(
+          this.runtime.mul(grad, this.runtime.mul(powResult, Math.log(scalarVal))),
+          tensorInput.shape,
+        )];
+      } else {
+        // d/da a^n = n * a^(n-1)
+        const powResult = this.runtime.pow(saved._unwrap(), scalarVal - 1);
+        return [this._sumToShape(
+          this.runtime.mul(grad, this.runtime.mul(scalarVal, powResult)),
+          tensorInput.shape,
+        )];
+      }
+    }, tensorsToSave);
+  }
+
   /**
    * Check if values are finite (not NaN and not Inf).
    * Returns 1.0 where finite, 0.0 where NaN or Inf.

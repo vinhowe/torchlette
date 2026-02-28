@@ -170,6 +170,10 @@ export class Tensor {
     return this.engine.div(this, other);
   }
 
+  pow(exponent: Tensor | number): Tensor {
+    return this.engine.pow(this, exponent);
+  }
+
   matmul(other: Tensor): Tensor {
     return this.engine.matmul(this, other);
   }

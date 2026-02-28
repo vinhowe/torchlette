@@ -652,6 +652,22 @@ export function clamp(a: Tensor, min: number | null, max: number | null): Tensor
   return new Tensor(a.shape, out);
 }
 
+export function pow(a: Tensor, b: Tensor): Tensor {
+  const outShape = broadcastShapes(a.shape, b.shape);
+  const aBroadcast = broadcastTo(a, outShape);
+  const bBroadcast = broadcastTo(b, outShape);
+  const outSize = sizeOf(outShape);
+  const out = new Float32Array(outSize);
+  const shapeStrides = computeStrides(outShape);
+  for (let i = 0; i < outSize; i += 1) {
+    out[i] = Math.pow(
+      readAtLinear(aBroadcast, i, shapeStrides),
+      readAtLinear(bBroadcast, i, shapeStrides),
+    );
+  }
+  return new Tensor(outShape, out);
+}
+
 /**
  * Check if values are finite (not NaN and not Inf).
  * Returns 1.0 where finite, 0.0 where NaN or Inf.

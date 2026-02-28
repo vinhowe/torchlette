@@ -252,6 +252,7 @@ export interface BackendOps {
   round?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
   sign?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
   clamp?(a: BackendTensor, min: number | null, max: number | null, options?: OpExecOptions): BackendTensor;
+  pow?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
   /** Check if values are finite (not NaN and not Inf). Returns 1.0 where finite, 0.0 elsewhere. */
   isfinite?(a: BackendTensor): BackendTensor;
   expand(a: BackendTensor, shape: Shape): BackendTensor;
