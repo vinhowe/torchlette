@@ -249,6 +249,42 @@ export function narrowBackward(grad: Tensor, dim: number, start: number, origina
   return new Tensor(outShape, result);
 }
 
+export function cat(tensors: Tensor[], options: { dim: number }): Tensor {
+  if (tensors.length === 0) throw new Error("cat: empty tensor list");
+  const dim = options.dim < 0 ? options.dim + tensors[0].shape.length : options.dim;
+  const rank = tensors[0].shape.length;
+  // Validate shapes match on all non-cat dims
+  for (let i = 1; i < tensors.length; i++) {
+    if (tensors[i].shape.length !== rank) throw new Error("cat: rank mismatch");
+    for (let d = 0; d < rank; d++) {
+      if (d !== dim && tensors[i].shape[d] !== tensors[0].shape[d]) {
+        throw new Error(`cat: shape mismatch at dim ${d}`);
+      }
+    }
+  }
+  const outShape = tensors[0].shape.slice();
+  outShape[dim] = tensors.reduce((s, t) => s + t.shape[dim], 0);
+  const outSize = sizeOf(outShape);
+  const result = new Float32Array(outSize);
+  const outerSize = dim === 0 ? 1 : sizeOf(outShape.slice(0, dim));
+  const innerSize = dim === rank - 1 ? 1 : sizeOf(outShape.slice(dim + 1));
+  let dimOffset = 0;
+  for (const t of tensors) {
+    const tDimSize = t.shape[dim];
+    for (let o = 0; o < outerSize; o++) {
+      for (let d = 0; d < tDimSize; d++) {
+        for (let i = 0; i < innerSize; i++) {
+          const srcIdx = getStridedIndex(t, o, d, i, dim);
+          const outIdx = o * outShape[dim] * innerSize + (dimOffset + d) * innerSize + i;
+          result[outIdx] = t.data[srcIdx];
+        }
+      }
+    }
+    dimOffset += tDimSize;
+  }
+  return new Tensor(outShape, result);
+}
+
 function getStridedIndex(t: Tensor, outer: number, dimIdx: number, inner: number, dim: number): number {
   // Compute strided index for [outer, dimIdx, inner] where dim splits the dimensions
   let idx = t.offset;

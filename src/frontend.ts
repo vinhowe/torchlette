@@ -1432,6 +1432,32 @@ export class Torchlette {
     ]);
   }
 
+  cat(tensors: Tensor[], dim = 0): Tensor {
+    if (tensors.length === 0) throw new Error("cat: empty tensor list");
+    for (const t of tensors) this._assertUsable(t);
+    const d = dim < 0 ? dim + tensors[0].shape.length : dim;
+    const sizes = tensors.map(t => t.shape[d]);
+    const inner = this.runtime.cat(
+      tensors.map(t => t._unwrap()),
+      { dim: d },
+    );
+    return this._wrapWithGrad(inner, tensors, (grad, _getSaved) => {
+      const grads: ReturnType<typeof this.runtime.narrow>[] = [];
+      let offset = 0;
+      for (const size of sizes) {
+        grads.push(this.runtime.narrow(grad, d, offset, size));
+        offset += size;
+      }
+      return grads;
+    });
+  }
+
+  stack(tensors: Tensor[], dim = 0): Tensor {
+    if (tensors.length === 0) throw new Error("stack: empty tensor list");
+    const unsqueezed = tensors.map(t => this.unsqueeze(t, dim));
+    return this.cat(unsqueezed, dim);
+  }
+
   toDtype(a: Tensor, dtype: DType): Tensor {
     this._assertUsable(a);
     const inner = this.runtime.cast(a._unwrap(), dtype);

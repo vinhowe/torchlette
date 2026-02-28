@@ -363,6 +363,12 @@ function executeReductionOp(
       if (!payload) throw new Error("scatterAdd requires dim in payload");
       return backend.ops.scatterAdd(backendInputs[0], backendInputs[1], backendInputs[2], payload);
     }
+    case "cat": {
+      const payload = getPayload<{ dim: number }>(node);
+      if (!payload) throw new Error("cat requires dim in payload");
+      assertOpSupported("cat", backend.ops.cat);
+      return backend.ops.cat(backendInputs, payload);
+    }
     case "gt":
       assertOpSupported("gt", backend.ops.gt);
       return backend.ops.gt(backendInputs[0], backendInputs[1], donationOpts);
@@ -542,7 +548,7 @@ const SHAPE_OPS = new Set([
   "reshape", "expand", "transpose", "permute", "contiguous", "narrow", "narrowBackward", "cast",
 ]);
 const REDUCTION_OPS = new Set([
-  "sum", "max", "mean", "argmax", "argmin", "gather", "scatterAdd",
+  "sum", "max", "mean", "argmax", "argmin", "gather", "scatterAdd", "cat",
   "gt", "lt", "ge", "le", "eq", "ne", "where",
 ]);
 const MUTATION_OPS = new Set([
