@@ -1083,6 +1083,28 @@ export class Torchlette {
     return this._wrap(inner);
   }
 
+  softplus(a: Tensor): Tensor {
+    this._assertUsable(a);
+    // softplus(x) = log(1 + exp(x))
+    const one = this.runtime.full(a.shape, 1, a.dtype, a.device);
+    const expA = this.runtime.exp(a._unwrap());
+    const inner = this.runtime.log(this.runtime.add(one, expA));
+    // d/dx softplus(x) = sigmoid(x)
+    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => {
+      const sigA = this.runtime.sigmoid(a._unwrap());
+      return [this.runtime.mul(grad, sigA)];
+    });
+  }
+
+  fmod(a: Tensor, b: Tensor): Tensor {
+    this._assertUsable(a, b);
+    // fmod(a, b) = a - b * floor(a / b)
+    const quotient = this.runtime.div(a._unwrap(), b._unwrap());
+    const floored = this.runtime.floor(quotient);
+    const inner = this.runtime.sub(a._unwrap(), this.runtime.mul(b._unwrap(), floored));
+    return this._wrap(inner);
+  }
+
   expand(a: Tensor, shape: number[]): Tensor {
     this._assertUsable(a);
     const aShape = a.shape;
