@@ -3,8 +3,7 @@
  *
  * Produces 4 TileKernelSpec objects that the tile compiler lowers to WGSL.
  * Uses native vec4 arrays (register + shared) and subgroup cooperative dot
- * products (4 threads per row, subgroupShuffleXor reduction) to match the
- * performance of the hand-written WGSL shaders.
+ * products (4 threads per row, subgroupShuffleXor reduction).
  *
  * Forward:     Q,K,V → O,L  (online softmax)
  * D-precompute: dO,O → D    (per-row dot product)
@@ -18,7 +17,7 @@ import type { TileKernelSpec } from "./tile-ir";
 import { tiledGrid, productGrid } from "./tile-ir";
 import { getSubgroupSupport } from "./matmul/types";
 
-// Tiling parameters — match production hand-written kernels
+// Tiling parameters
 const BR = 64;     // Q rows per workgroup
 const BC = 32;     // KV rows per tile (forward, dQ)
 const BQ_BW = 16;  // Q rows per tile (backward dKV)

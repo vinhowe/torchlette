@@ -320,7 +320,8 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
 
       expect(kernel.vectorWidth).toBe(4);
       expect(kernel.workItems).toBe(64); // 256 / 4
-      expect(kernel.source).toContain("vec4");
+      // Tile-IR vectorization uses scalar unrolling (gid.x * 4u + offset), not vec4 types
+      expect(kernel.source).toContain("* 4u");
     });
 
     it("uses vec2 for 2-aligned shapes", () => {
