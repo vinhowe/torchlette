@@ -912,6 +912,94 @@ export class Torchlette {
     );
   }
 
+  sin(a: Tensor): Tensor {
+    this._assertUsable(a);
+    const inner = this.runtime.sin(a._unwrap());
+    const tensorsToSave = a.requiresGrad ? [a] : [];
+    // d/dx sin(x) = cos(x)
+    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
+      const savedA = getSaved(0);
+      const cosA = this.runtime.cos(savedA._unwrap());
+      return [this.runtime.mul(grad, cosA)];
+    }, tensorsToSave);
+  }
+
+  cos(a: Tensor): Tensor {
+    this._assertUsable(a);
+    const inner = this.runtime.cos(a._unwrap());
+    const tensorsToSave = a.requiresGrad ? [a] : [];
+    // d/dx cos(x) = -sin(x)
+    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
+      const savedA = getSaved(0);
+      const sinA = this.runtime.sin(savedA._unwrap());
+      const negSinA = this.runtime.neg(sinA);
+      return [this.runtime.mul(grad, negSinA)];
+    }, tensorsToSave);
+  }
+
+  rsqrt(a: Tensor): Tensor {
+    this._assertUsable(a);
+    const inner = this.runtime.rsqrt(a._unwrap());
+    const tensorsToSave = a.requiresGrad ? [a] : [];
+    // d/dx rsqrt(x) = -0.5 * x^(-3/2) = -0.5 * rsqrt(x)^3
+    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
+      const savedA = getSaved(0);
+      const rsqrtA = this.runtime.rsqrt(savedA._unwrap());
+      const rsqrt3 = this.runtime.mul(rsqrtA, this.runtime.mul(rsqrtA, rsqrtA));
+      return [this.runtime.mul(grad, this.runtime.mul(-0.5, rsqrt3))];
+    }, tensorsToSave);
+  }
+
+  floor(a: Tensor): Tensor {
+    this._assertUsable(a);
+    const inner = this.runtime.floor(a._unwrap());
+    // floor is piecewise constant — gradient is 0 everywhere (not differentiable at integers)
+    return this._wrap(inner);
+  }
+
+  ceil(a: Tensor): Tensor {
+    this._assertUsable(a);
+    const inner = this.runtime.ceil(a._unwrap());
+    // ceil is piecewise constant — gradient is 0
+    return this._wrap(inner);
+  }
+
+  round(a: Tensor): Tensor {
+    this._assertUsable(a);
+    const inner = this.runtime.round(a._unwrap());
+    // round is piecewise constant — gradient is 0
+    return this._wrap(inner);
+  }
+
+  sign(a: Tensor): Tensor {
+    this._assertUsable(a);
+    const inner = this.runtime.sign(a._unwrap());
+    // sign is piecewise constant — gradient is 0
+    return this._wrap(inner);
+  }
+
+  clamp(a: Tensor, min: number | null, max: number | null): Tensor {
+    this._assertUsable(a);
+    const inner = this.runtime.clamp(a._unwrap(), min, max);
+    const tensorsToSave = a.requiresGrad ? [a] : [];
+    // d/dx clamp(x, min, max) = 1 where min <= x <= max, 0 elsewhere
+    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
+      const savedA = getSaved(0);
+      const x = savedA._unwrap();
+      // Build a mask: 1.0 where x is within [min, max], 0.0 elsewhere
+      let mask = grad;
+      if (min !== null) {
+        const geMin = this.runtime.ge(x, min);
+        mask = this.runtime.mul(mask, geMin);
+      }
+      if (max !== null) {
+        const leMax = this.runtime.le(x, max);
+        mask = this.runtime.mul(mask, leMax);
+      }
+      return [mask];
+    }, tensorsToSave);
+  }
+
   /**
    * Check if values are finite (not NaN and not Inf).
    * Returns 1.0 where finite, 0.0 where NaN or Inf.

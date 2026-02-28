@@ -244,6 +244,14 @@ export interface BackendOps {
   sigmoid?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
   gelu?(a: BackendTensor, options?: GeluOptions & OpExecOptions): BackendTensor;
   silu?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  sin?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  cos?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  rsqrt?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  floor?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  ceil?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  round?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  sign?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  clamp?(a: BackendTensor, min: number | null, max: number | null, options?: OpExecOptions): BackendTensor;
   /** Check if values are finite (not NaN and not Inf). Returns 1.0 where finite, 0.0 elsewhere. */
   isfinite?(a: BackendTensor): BackendTensor;
   expand(a: BackendTensor, shape: Shape): BackendTensor;

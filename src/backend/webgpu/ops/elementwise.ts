@@ -153,6 +153,75 @@ export function silu(
   );
 }
 
+export function sin(
+  a: BackendTensor,
+  options?: { outBuffer?: GPUBuffer },
+): BackendTensor {
+  return dispatchUnary("sin", "sin(x)", asGPUTensor(a), options);
+}
+
+export function cos(
+  a: BackendTensor,
+  options?: { outBuffer?: GPUBuffer },
+): BackendTensor {
+  return dispatchUnary("cos", "cos(x)", asGPUTensor(a), options);
+}
+
+export function rsqrt(
+  a: BackendTensor,
+  options?: { outBuffer?: GPUBuffer },
+): BackendTensor {
+  return dispatchUnary("rsqrt", "inverseSqrt(x)", asGPUTensor(a), options);
+}
+
+export function floor(
+  a: BackendTensor,
+  options?: { outBuffer?: GPUBuffer },
+): BackendTensor {
+  return dispatchUnary("floor", "floor(x)", asGPUTensor(a), options);
+}
+
+export function ceil(
+  a: BackendTensor,
+  options?: { outBuffer?: GPUBuffer },
+): BackendTensor {
+  return dispatchUnary("ceil", "ceil(x)", asGPUTensor(a), options);
+}
+
+export function round(
+  a: BackendTensor,
+  options?: { outBuffer?: GPUBuffer },
+): BackendTensor {
+  return dispatchUnary("round", "round(x)", asGPUTensor(a), options);
+}
+
+export function sign(
+  a: BackendTensor,
+  options?: { outBuffer?: GPUBuffer },
+): BackendTensor {
+  return dispatchUnary("sign", "sign(x)", asGPUTensor(a), options);
+}
+
+export function clamp(
+  a: BackendTensor,
+  min: number | null,
+  max: number | null,
+  options?: { outBuffer?: GPUBuffer },
+): BackendTensor {
+  // Build clamp expression
+  let expr: string;
+  if (min !== null && max !== null) {
+    expr = `clamp(x, ${min}, ${max})`;
+  } else if (min !== null) {
+    expr = `max(x, ${min})`;
+  } else if (max !== null) {
+    expr = `min(x, ${max})`;
+  } else {
+    expr = "x"; // no-op
+  }
+  return dispatchUnary(`clamp_${min}_${max}`, expr, asGPUTensor(a), options);
+}
+
 /**
  * Check if values are finite (not NaN and not Inf).
  * Returns 1.0 where finite, 0.0 where NaN or Inf.

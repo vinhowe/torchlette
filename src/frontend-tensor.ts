@@ -214,6 +214,38 @@ export class Tensor {
     return this.engine.silu(this);
   }
 
+  sin(): Tensor {
+    return this.engine.sin(this);
+  }
+
+  cos(): Tensor {
+    return this.engine.cos(this);
+  }
+
+  rsqrt(): Tensor {
+    return this.engine.rsqrt(this);
+  }
+
+  floor(): Tensor {
+    return this.engine.floor(this);
+  }
+
+  ceil(): Tensor {
+    return this.engine.ceil(this);
+  }
+
+  round(): Tensor {
+    return this.engine.round(this);
+  }
+
+  sign(): Tensor {
+    return this.engine.sign(this);
+  }
+
+  clamp(min: number | null, max: number | null): Tensor {
+    return this.engine.clamp(this, min, max);
+  }
+
   /**
    * Check if values are finite (not NaN and not Inf).
    * Returns 1.0 where finite, 0.0 where NaN or Inf.
