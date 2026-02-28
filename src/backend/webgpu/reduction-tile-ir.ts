@@ -53,12 +53,12 @@ function buildInputOffset(
   // Decompose outIdx into output coordinates
   const outCoords: BlockExpr[] = [];
   if (outShape.length > 0) {
-    let rem = ctx.emitLet(`${prefix}_or`, outIdx);
+    let rem = outIdx;
     for (let d = 0; d < outShape.length; d++) {
       const stride = outStrides[d];
       if (d < outShape.length - 1) {
-        outCoords.push(ctx.emitLet(`${prefix}_oc${d}`, rem.div(ctx.u32(stride))));
-        rem = ctx.emitLet(`${prefix}_or${d}`, rem.mod(ctx.u32(stride)));
+        outCoords.push(rem.div(ctx.u32(stride)));
+        rem = rem.mod(ctx.u32(stride));
       } else {
         outCoords.push(rem); // last coord is the remainder
       }
@@ -68,7 +68,7 @@ function buildInputOffset(
   // Decompose reduceIdx into reduction coordinates
   const reduceCoords: BlockExpr[] = [];
   if (normalizedDims.length > 0) {
-    let rrem = ctx.emitLet(`${prefix}_rr`, reduceIdx);
+    let rrem = reduceIdx;
     for (let i = 0; i < normalizedDims.length; i++) {
       // Compute size of remaining reduce dims
       let rDimSize = 1;
@@ -76,8 +76,8 @@ function buildInputOffset(
         rDimSize *= inputShape[normalizedDims[j]];
       }
       if (i < normalizedDims.length - 1) {
-        reduceCoords.push(ctx.emitLet(`${prefix}_rc${i}`, rrem.div(ctx.u32(rDimSize))));
-        rrem = ctx.emitLet(`${prefix}_rr${i}`, rrem.mod(ctx.u32(rDimSize)));
+        reduceCoords.push(rrem.div(ctx.u32(rDimSize)));
+        rrem = rrem.mod(ctx.u32(rDimSize));
       } else {
         reduceCoords.push(rrem);
       }
@@ -103,7 +103,7 @@ function buildInputOffset(
     offset = offset.add(coord.mul(ctx.u32(inputStrides[d])));
   }
 
-  return ctx.emitLet(`${prefix}_off`, offset);
+  return offset;
 }
 
 // ============================================================================
@@ -149,7 +149,7 @@ export function makeSumDimSpec(
       kernel(ctx) {
         const tid = ctx.localIndex();
         const wid = ctx.programId(0);
-        const outIdx = ctx.emitLet("outIdx", wid);
+        const outIdx = wid;
 
         ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
 
@@ -326,7 +326,7 @@ export function makeMaxDimSpec(
       kernel(ctx) {
         const tid = ctx.localIndex();
         const wid = ctx.programId(0);
-        const outIdx = ctx.emitLet("outIdx", wid);
+        const outIdx = wid;
 
         ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
 
@@ -440,7 +440,7 @@ export function makeMinDimSpec(
       kernel(ctx) {
         const tid = ctx.localIndex();
         const wid = ctx.programId(0);
-        const outIdx = ctx.emitLet("outIdx", wid);
+        const outIdx = wid;
 
         ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
 
@@ -741,7 +741,7 @@ export function makeSumDimWithPreambleChainSpec(
       kernel(ctx) {
         const tid = ctx.localIndex();
         const wid = ctx.programId(0);
-        const outIdx = ctx.emitLet("outIdx", wid);
+        const outIdx = wid;
         ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
 
         const reductionSize = ctx.uniform("reductionSize");
@@ -930,7 +930,7 @@ export function makeSumDimWithEpilogueSpec(
       kernel(ctx) {
         const tid = ctx.localIndex();
         const wid = ctx.programId(0);
-        const outIdx = ctx.emitLet("outIdx", wid);
+        const outIdx = wid;
         ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
 
         const reductionSize = ctx.uniform("reductionSize");
@@ -1047,7 +1047,7 @@ export function makeMaxDimWithEpilogueSpec(
       kernel(ctx) {
         const tid = ctx.localIndex();
         const wid = ctx.programId(0);
-        const outIdx = ctx.emitLet("outIdx", wid);
+        const outIdx = wid;
         ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
 
         const reductionSize = ctx.uniform("reductionSize");
@@ -1177,7 +1177,7 @@ export function makeSumDimWithPreambleEpilogueSpec(
       kernel(ctx) {
         const tid = ctx.localIndex();
         const wid = ctx.programId(0);
-        const outIdx = ctx.emitLet("outIdx", wid);
+        const outIdx = wid;
         ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
 
         const reductionSize = ctx.uniform("reductionSize");
