@@ -535,6 +535,7 @@ const CREATION_OPS = new Set([
 ]);
 const UNARY_OPS = new Set([
   "sqrt", "relu", "exp", "log", "neg", "abs", "tanh", "sigmoid", "gelu", "silu", "isfinite", "pow",
+  "sin", "cos", "rsqrt", "floor", "ceil", "round", "sign", "clamp",
 ]);
 const BINARY_OPS = new Set(["add", "sub", "mul", "div", "matmul"]);
 const SHAPE_OPS = new Set([
