@@ -30,7 +30,7 @@ import { computeContiguousStrides } from "../backend/types";
 import { getInputStorage, executeOp, withProfileContext } from "./op-dispatch";
 import type { MatmulPrologueInfo, MatmulEpiloguePlan } from "./matmul-epilogue";
 import { detectMatmulEpilogue, detectMatmulEpilogueCore, executeMatmulWithEpilogue } from "./matmul-epilogue";
-import { detectReductionPreamble, executeReductionWithPreamble, detectReductionEpilogue, executeReductionWithEpilogue } from "./reduction-preamble";
+import { detectReductionPreamble, executeReductionWithPreamble, detectReductionEpilogue, executeReductionWithEpilogue, detectReductionFusion, executeReductionWithFusion } from "./reduction-preamble";
 
 /**
  * Execution descriptor for a compound pattern match.
@@ -564,19 +564,17 @@ export async function executeSequentialSegmentWithEarlyRelease(
         }
       }
 
-      // Try reduction preamble fusion (Phase 3)
+      // Try combined preamble + epilogue reduction fusion (Phase 5)
       if (isFusibleOp(node.op) && backend.name === "webgpu") {
-        const reductionPlan = detectReductionPreamble(nodes, nodeIdx, reductionConsumerCount);
-        if (reductionPlan) {
-          const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${
-            reductionPlan.preambleChain
-              ? reductionPlan.preambleChain.map(n => n.op).join("+")
-              : reductionPlan.op}`;
-          await withProfileContext(rpLabel, node.module, () =>
-            executeReductionWithPreamble(reductionPlan, backend));
+        const fusionPlan = detectReductionFusion(nodes, nodeIdx, reductionConsumerCount, externalNodeIds);
+        if (fusionPlan) {
+          const fusionLabel = `${fusionPlan.isMean ? "mean" : "sum"}+${
+            fusionPlan.preambleChain.map(n => n.op).join("+")
+          }+${fusionPlan.epilogueOps.map(o => o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind).join("+")}`;
+          await withProfileContext(fusionLabel, node.module, () =>
+            executeReductionWithFusion(fusionPlan, backend));
 
-          const consumed = reductionPlan.consumedCount;
-          // Track storages for all consumed nodes
+          const consumed = fusionPlan.consumedCount;
           if (enableEarlyRelease) {
             for (let c = 0; c < consumed; c++) {
               const consumedNode = nodes[nodeIdx + c];
@@ -590,10 +588,54 @@ export async function executeSequentialSegmentWithEarlyRelease(
             step += consumed;
           }
 
-          // Record reduction preamble action in lowered plan builder
+          if (loweredPlanBuilder && nodeIdToFinalPos) {
+            const preambleIndices = fusionPlan.preambleChain.map(n => nodeIdToFinalPos.get(n.id)!);
+            const epilogueIndices = fusionPlan.epilogueChain.map(n => nodeIdToFinalPos.get(n.id)!);
+            loweredPlanBuilder.recordReductionFusion(
+              preambleIndices,
+              nodeIdToFinalPos.get(fusionPlan.reductionNode.id)!,
+              epilogueIndices,
+              nodeIdToFinalPos.get(fusionPlan.outputNode.id)!,
+              fusionPlan.preambleOps,
+              fusionPlan.preambleInputDtypes,
+              fusionPlan.epilogueOps,
+              fusionPlan.epilogueInputRefs.length,
+              fusionPlan.outputDtype,
+              fusionPlan.consumedCount,
+              fusionPlan.isMean,
+            );
+          }
+
+          nodeIdx += consumed - 1;
+          continue;
+        }
+
+        // Fall back to preamble-only fusion (Phase 3)
+        const reductionPlan = detectReductionPreamble(nodes, nodeIdx, reductionConsumerCount);
+        if (reductionPlan) {
+          const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${
+            reductionPlan.preambleChain
+              ? reductionPlan.preambleChain.map(n => n.op).join("+")
+              : reductionPlan.op}`;
+          await withProfileContext(rpLabel, node.module, () =>
+            executeReductionWithPreamble(reductionPlan, backend));
+
+          const consumed = reductionPlan.consumedCount;
+          if (enableEarlyRelease) {
+            for (let c = 0; c < consumed; c++) {
+              const consumedNode = nodes[nodeIdx + c];
+              if (consumedNode.result) {
+                nodeToStorage.set(consumedNode.id, consumedNode.result);
+              }
+              step++;
+              releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
+            }
+          } else {
+            step += consumed;
+          }
+
           if (loweredPlanBuilder && nodeIdToFinalPos) {
             if (reductionPlan.preambleChain && reductionPlan.chainOps && reductionPlan.chainInputDtypes) {
-              // Multi-op chain
               loweredPlanBuilder.recordReductionPreamble(
                 nodeIdToFinalPos.get(node.id)!,
                 nodeIdToFinalPos.get(reductionPlan.reductionNode.id)!,
@@ -603,7 +645,6 @@ export async function executeSequentialSegmentWithEarlyRelease(
                 reductionPlan.consumedCount,
               );
             } else {
-              // Single-op preamble
               loweredPlanBuilder.recordReductionPreamble(
                 nodeIdToFinalPos.get(node.id)!,
                 nodeIdToFinalPos.get(reductionPlan.reductionNode.id)!,
@@ -611,7 +652,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
             }
           }
 
-          nodeIdx += consumed - 1; // Skip consumed - 1 nodes (loop increments by 1)
+          nodeIdx += consumed - 1;
           continue;
         }
       }

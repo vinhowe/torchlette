@@ -1014,3 +1014,141 @@ export function makeMaxFullWithEpilogueSpec(
     },
   };
 }
+
+// ============================================================================
+// Sum Dim With Preamble Chain + Epilogue (cross-reduction fusion)
+// ============================================================================
+
+/**
+ * Factory: Dimension-wise sum with both preamble chain and epilogue chain.
+ * Preamble ops are applied in the accumulation loop body,
+ * epilogue ops are applied to the reduced result before storing.
+ */
+export function makeSumDimWithPreambleEpilogueSpec(
+  chainOps: PreambleChainKernelOp[],
+  totalPreambleInputs: number,
+  preambleInputDtypes: DType[],
+  epilogueOps: ReductionEpilogueOpDesc[],
+  outputDtype: DType,
+  inputShape: number[],
+  inputStrides: number[],
+  normalizedDims: number[],
+  outShape: number[],
+  outStrides: number[],
+  inputToOutDim: number[],
+  parallel: boolean,
+): TileKernelSpec {
+  const preNames = chainOps.map(o => o.op).join("+");
+  const variant = parallel ? "par" : "seq";
+  const name = `sumPCE_${preNames}_${variant}_${inputShape.join("x")}_d${normalizedDims.join(",")}`;
+
+  const bindings: Record<string, BindingSpec> = {};
+  for (let i = 0; i < totalPreambleInputs; i++) {
+    bindings[`in${i}`] = { storage: "read", type: (preambleInputDtypes[i] || "f32") as DataType };
+  }
+  Object.assign(bindings, buildEpilogueBindings(epilogueOps));
+  bindings.out = { storage: "read_write", type: outBindingType(outputDtype) };
+
+  const needsF16 = preambleInputDtypes.some(d => d === "f16") || outputDtype === "f16";
+
+  if (parallel) {
+    return {
+      name,
+      workgroupSize: WG,
+      bindings,
+      enableF16: needsF16,
+      uniforms: { outSize: "u32", reductionSize: "u32" },
+      grid: (u) => {
+        const n = u.outSize;
+        if (n <= 65535) return [n];
+        return [Math.min(n, 65535), Math.ceil(n / 65535)];
+      },
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const wid = ctx.programId(0);
+        const outIdx = ctx.emitLet("outIdx", wid);
+        ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
+
+        const reductionSize = ctx.uniform("reductionSize");
+        const result = ctx.wgReduce("sum", tid, reductionSize, WG, (r) => {
+          const off = buildInputOffset(ctx, outIdx, r,
+            inputShape, inputStrides, outShape, outStrides,
+            normalizedDims, inputToOutDim, "spce");
+          return applyPreambleChain(ctx, chainOps, off);
+        });
+
+        const final = applyEpilogueChain(ctx, result, epilogueOps, outIdx);
+        ctx.guardedStore("out", tid.eq(ctx.u32(0)), outIdx, final);
+      },
+    };
+  }
+
+  // Sequential
+  return {
+    name,
+    workgroupSize: WG,
+    bindings,
+    enableF16: needsF16,
+    uniforms: { outSize: "u32", reductionSize: "u32" },
+    grid: elementwiseGrid(WG, { elementUniform: "outSize" }),
+    kernel(ctx) {
+      const idx = ctx.globalId(0);
+      ctx.ifThen(idx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
+
+      const acc = ctx.emitVar("total", "f32", ctx.f32(0));
+      ctx.forRange(ctx.u32(0), ctx.uniform("reductionSize"), (reduceIdx) => {
+        const off = buildInputOffset(ctx, idx, reduceIdx,
+          inputShape, inputStrides, outShape, outStrides,
+          normalizedDims, inputToOutDim, "spce");
+        acc.addAssign(applyPreambleChain(ctx, chainOps, off));
+      });
+
+      const final = applyEpilogueChain(ctx, acc.get(), epilogueOps, idx);
+      ctx.emitStore("out", idx, final);
+    },
+  };
+}
+
+// ============================================================================
+// Sum Full With Preamble Chain + Epilogue
+// ============================================================================
+
+/**
+ * Factory: Full reduction sum with both preamble chain and epilogue chain.
+ */
+export function makeSumFullWithPreambleEpilogueSpec(
+  chainOps: PreambleChainKernelOp[],
+  totalPreambleInputs: number,
+  preambleInputDtypes: DType[],
+  epilogueOps: ReductionEpilogueOpDesc[],
+  outputDtype: DType,
+): TileKernelSpec {
+  const preNames = chainOps.map(o => o.op).join("+");
+  const name = `sumFullPCE_${preNames}`;
+
+  const bindings: Record<string, BindingSpec> = {};
+  for (let i = 0; i < totalPreambleInputs; i++) {
+    bindings[`in${i}`] = { storage: "read", type: (preambleInputDtypes[i] || "f32") as DataType };
+  }
+  Object.assign(bindings, buildEpilogueBindings(epilogueOps));
+  bindings.out = { storage: "read_write", type: outBindingType(outputDtype) };
+
+  const needsF16 = preambleInputDtypes.some(d => d === "f16") || outputDtype === "f16";
+
+  return {
+    name,
+    workgroupSize: WG,
+    bindings,
+    enableF16: needsF16,
+    uniforms: { size: "u32" },
+    grid: singleWorkgroup(),
+    kernel(ctx) {
+      const tid = ctx.localIndex();
+      const result = ctx.wgReduce("sum", tid, ctx.uniform("size"), WG, (i) =>
+        applyPreambleChain(ctx, chainOps, i),
+      );
+      const final = applyEpilogueChain(ctx, result, epilogueOps, ctx.u32(0));
+      ctx.guardedStore("out", tid.eq(ctx.u32(0)), ctx.u32(0), final);
+    },
+  };
+}
