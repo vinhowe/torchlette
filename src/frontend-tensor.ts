@@ -154,6 +154,14 @@ export class Tensor {
     return this.engine.reshape(this, shape);
   }
 
+  squeeze(dim?: number): Tensor {
+    return this.engine.squeeze(this, dim);
+  }
+
+  unsqueeze(dim: number): Tensor {
+    return this.engine.unsqueeze(this, dim);
+  }
+
   add(other: Tensor | number): Tensor {
     return this.engine.add(this, other);
   }
