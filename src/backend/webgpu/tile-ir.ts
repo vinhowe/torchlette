@@ -1676,6 +1676,49 @@ export class KernelContext {
     return flatWgId.mul(this.u32(workgroupSize)).add(this.localIndex());
   }
 
+  /**
+   * Decompose a flat linear index into multi-dimensional coordinates.
+   * Given shape [D0, D1, ..., Dn], returns [c0, c1, ..., cn] where
+   * flatIdx = c0 * (D1*D2*...*Dn) + c1 * (D2*...*Dn) + ... + cn.
+   *
+   * Equivalent to numpy.unravel_index or Triton's manual `pid // cols, pid % cols`.
+   */
+  decomposeIndex(flatIdx: BlockExpr, shape: number[]): BlockExpr[] {
+    const rank = shape.length;
+    if (rank === 0) return [];
+    if (rank === 1) return [flatIdx];
+
+    const coords: BlockExpr[] = [];
+    let rem = flatIdx;
+    for (let d = 0; d < rank; d++) {
+      // Stride = product of remaining dimensions
+      let dimStride = 1;
+      for (let j = d + 1; j < rank; j++) dimStride *= shape[j];
+
+      if (d < rank - 1) {
+        coords.push(rem.div(this.u32(dimStride)));
+        rem = rem.mod(this.u32(dimStride));
+      } else {
+        coords.push(rem); // last coord is the remainder
+      }
+    }
+    return coords;
+  }
+
+  /**
+   * Linearize multi-dimensional coordinates using given strides.
+   * Returns coords[0]*strides[0] + coords[1]*strides[1] + ... + offset.
+   *
+   * Handles stride=0 (broadcast) via constant folding (coord*0 → 0).
+   */
+  linearizeIndex(coords: BlockExpr[], strides: number[], offset = 0): BlockExpr {
+    let result: BlockExpr = this.u32(offset);
+    for (let d = 0; d < coords.length; d++) {
+      result = result.add(coords[d].mul(this.u32(strides[d])));
+    }
+    return result;
+  }
+
   /** Declare a workgroup shared memory array. Returns a handle for read/write. */
   sharedArray(name: string, size: number, elemType: DataType = "f32"): SharedArrayHandle {
     this.sharedArrays.push({ name, size, elemType });

@@ -55,31 +55,13 @@ function buildStridedOffset(
   indexShape: number[],
   strides: number[],
   offset: number,
-  prefix: string,
+  _prefix: string,
 ): BlockExpr {
   const rank = indexShape.length;
   if (rank === 0) return ctx.u32(offset);
 
-  let rem: BlockExpr = flatIdx;
-  let result: BlockExpr = ctx.u32(offset);
-
-  for (let d = 0; d < rank; d++) {
-    // Compute stride for coordinate decomposition (product of remaining dims)
-    let dimStride = 1;
-    for (let j = d + 1; j < rank; j++) dimStride *= indexShape[j];
-
-    const coord = d < rank - 1 ? rem.div(ctx.u32(dimStride)) : rem;
-
-    if (d < rank - 1) {
-      rem = rem.mod(ctx.u32(dimStride));
-    }
-
-    // offset += coord * inputStride[d]
-    // When strides[d] === 0 (broadcast), constant folder eliminates: coord*0 → 0, result+0 → result
-    result = result.add(coord.mul(ctx.u32(strides[d])));
-  }
-
-  return result;
+  const coords = ctx.decomposeIndex(flatIdx, indexShape);
+  return ctx.linearizeIndex(coords, strides, offset);
 }
 
 // ============================================================================
@@ -265,22 +247,15 @@ export function argReduceWGSL(
       ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
 
       // Compute base offset in input (with reduce dim = 0)
-      // Decompose outIdx into output coordinates and compute input offset
+      // Decompose outIdx into output coordinates, map to input strides
       let baseOffset: BlockExpr = ctx.u32(0);
       if (outShape.length > 0) {
-        let rem: BlockExpr = outIdx;
+        const outCoords = ctx.decomposeIndex(outIdx, outShape);
         for (let d = 0; d < outShape.length; d++) {
-          const coord = d < outShape.length - 1
-            ? rem.div(ctx.u32(outStrides[d]))
-            : rem;
-          if (d < outShape.length - 1) {
-            rem = rem.mod(ctx.u32(outStrides[d]));
-          }
           // Map output coord back to input dimension
-          // Find which input dim this output dim corresponds to
           for (let id = 0; id < rank; id++) {
             if (inputToOutDim[id] === d && id !== dim) {
-              baseOffset = baseOffset.add(coord.mul(ctx.u32(inputStrides[id])));
+              baseOffset = baseOffset.add(outCoords[d].mul(ctx.u32(inputStrides[id])));
             }
           }
         }
@@ -658,7 +633,6 @@ export function stridedScatterCopyTileIR(
   srcStrides: number[],
   srcOffset: number,
 ): string {
-  const rank = viewShape.length;
   const viewSize = viewShape.reduce((a, b) => a * b, 1);
 
   const spec: TileKernelSpec = {
@@ -686,24 +660,9 @@ export function stridedScatterCopyTileIR(
 
       // Phase 2: scatter src values into output at view positions
       ctx.ifThen(idx.lt(ctx.uniform("viewSize")), () => {
-        let rem: BlockExpr = idx;
-        let baseOff: BlockExpr = ctx.u32(viewOffset);
-        let srcOff: BlockExpr = ctx.u32(srcOffset);
-
-        for (let d = 0; d < rank; d++) {
-          let dimStride = 1;
-          for (let j = d + 1; j < rank; j++) dimStride *= viewShape[j];
-
-          const coord = d < rank - 1 ? rem.div(ctx.u32(dimStride)) : rem;
-
-          if (d < rank - 1) {
-            rem = rem.mod(ctx.u32(dimStride));
-          }
-
-          baseOff = baseOff.add(coord.mul(ctx.u32(viewStrides[d])));
-          srcOff = srcOff.add(coord.mul(ctx.u32(srcStrides[d])));
-        }
-
+        const coords = ctx.decomposeIndex(idx, viewShape);
+        const baseOff = ctx.linearizeIndex(coords, viewStrides, viewOffset);
+        const srcOff = ctx.linearizeIndex(coords, srcStrides, srcOffset);
         ctx.emitStore("out", baseOff, ctx.load("src", srcOff));
       });
     },
@@ -727,7 +686,6 @@ export function stridedScatterAddTileIR(
   srcStrides: number[],
   srcOffset: number,
 ): string {
-  const rank = viewShape.length;
   const viewSize = viewShape.reduce((a, b) => a * b, 1);
 
   const spec: TileKernelSpec = {
@@ -755,24 +713,9 @@ export function stridedScatterAddTileIR(
 
       // Phase 2: add src values into output at view positions
       ctx.ifThen(idx.lt(ctx.uniform("viewSize")), () => {
-        let rem: BlockExpr = idx;
-        let baseOff: BlockExpr = ctx.u32(viewOffset);
-        let srcOff: BlockExpr = ctx.u32(srcOffset);
-
-        for (let d = 0; d < rank; d++) {
-          let dimStride = 1;
-          for (let j = d + 1; j < rank; j++) dimStride *= viewShape[j];
-
-          const coord = d < rank - 1 ? rem.div(ctx.u32(dimStride)) : rem;
-
-          if (d < rank - 1) {
-            rem = rem.mod(ctx.u32(dimStride));
-          }
-
-          baseOff = baseOff.add(coord.mul(ctx.u32(viewStrides[d])));
-          srcOff = srcOff.add(coord.mul(ctx.u32(srcStrides[d])));
-        }
-
+        const coords = ctx.decomposeIndex(idx, viewShape);
+        const baseOff = ctx.linearizeIndex(coords, viewStrides, viewOffset);
+        const srcOff = ctx.linearizeIndex(coords, srcStrides, srcOffset);
         const existing = ctx.load("out", baseOff);
         ctx.emitStore("out", baseOff, existing.add(ctx.load("src", srcOff)));
       });
@@ -794,9 +737,7 @@ export function gatherTileIR(
   indexShape: number[],
   dim: number,
 ): string {
-  const rank = inputShape.length;
   const inputStrides = contiguousStridesForShape(inputShape);
-  const indexStrides = contiguousStridesForShape(indexShape);
 
   const spec: TileKernelSpec = {
     name: `gather_d${dim}`,
@@ -812,29 +753,15 @@ export function gatherTileIR(
       const idx = ctx.flatGlobalId(WG);
       ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
 
-      // Decompose idx into coordinates using index strides
-      let rem: BlockExpr = idx;
-      const coords: BlockExpr[] = [];
-      for (let d = 0; d < rank; d++) {
-        const coord = d < rank - 1 ? rem.div(ctx.u32(indexStrides[d])) : rem;
-        if (d < rank - 1) {
-          rem = rem.mod(ctx.u32(indexStrides[d]));
-        }
-        coords.push(coord);
-      }
+      // Decompose flat index into multi-dimensional coordinates
+      const coords = ctx.decomposeIndex(idx, indexShape);
 
       // Get gather index from indices buffer
       const gatherIdx = ctx.emitLet("gatherIdx", ctx.load("indices", idx).toU32());
 
-      // Compute input offset
-      let inputOffset: BlockExpr = ctx.u32(0);
-      for (let d = 0; d < rank; d++) {
-        if (d === dim) {
-          inputOffset = inputOffset.add(gatherIdx.mul(ctx.u32(inputStrides[d])));
-        } else {
-          inputOffset = inputOffset.add(coords[d].mul(ctx.u32(inputStrides[d])));
-        }
-      }
+      // Compute input offset: replace dim coordinate with gather index
+      const inputCoords = coords.map((c, d) => d === dim ? gatherIdx : c);
+      const inputOffset = ctx.linearizeIndex(inputCoords, inputStrides);
 
       ctx.emitStore("out", idx, ctx.load("input", inputOffset));
     },
@@ -855,7 +782,6 @@ export function scatterAddTileIR(
   srcShape: number[],
   dim: number,
 ): string {
-  const rank = inputShape.length;
   const outStrides = contiguousStridesForShape(inputShape);
   const srcStrides = contiguousStridesForShape(srcShape);
 
@@ -873,29 +799,15 @@ export function scatterAddTileIR(
       const srcIdx = ctx.flatGlobalId(WG);
       ctx.ifThen(srcIdx.ge(ctx.uniform("srcSize")), () => ctx.emitReturn());
 
-      // Decompose srcIdx into coordinates
-      let rem: BlockExpr = srcIdx;
-      const coords: BlockExpr[] = [];
-      for (let d = 0; d < rank; d++) {
-        const coord = d < rank - 1 ? rem.div(ctx.u32(srcStrides[d])) : rem;
-        if (d < rank - 1) {
-          rem = rem.mod(ctx.u32(srcStrides[d]));
-        }
-        coords.push(coord);
-      }
+      // Decompose flat src index into multi-dimensional coordinates
+      const coords = ctx.decomposeIndex(srcIdx, srcShape);
 
       // Get scatter index from indices buffer
       const scatterIdx = ctx.emitLet("scatterIdx", ctx.load("indices", srcIdx).toU32());
 
-      // Compute output offset
-      let outOffset: BlockExpr = ctx.u32(0);
-      for (let d = 0; d < rank; d++) {
-        if (d === dim) {
-          outOffset = outOffset.add(scatterIdx.mul(ctx.u32(outStrides[d])));
-        } else {
-          outOffset = outOffset.add(coords[d].mul(ctx.u32(outStrides[d])));
-        }
-      }
+      // Compute output offset: replace dim coordinate with scatter index
+      const outCoords = coords.map((c, d) => d === dim ? scatterIdx : c);
+      const outOffset = ctx.linearizeIndex(outCoords, outStrides);
 
       const existing = ctx.load("out", outOffset);
       ctx.emitStore("out", outOffset, existing.add(ctx.load("src", srcIdx)));
