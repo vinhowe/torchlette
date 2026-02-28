@@ -2313,6 +2313,55 @@ export class KernelContext {
     return this.programId(0).mul(this.u32(blockSize)).add(this.localIndex()).add(base);
   }
 
+  /**
+   * Get the flat element index with automatic early-return bounds check.
+   * Combines `flatGlobalId` + `ifThen(idx >= size, return)` into one call.
+   *
+   * Like Triton's pattern: `offsets = pid * BLOCK + tl.arange(0, BLOCK)`
+   * followed by `mask = offsets < n` — but using early-return instead of masking
+   * since WebGPU dispatches one thread per element.
+   *
+   * @param wgSize - Workgroup size (typically 256)
+   * @param size   - Upper bound. String → uniform name; BlockExpr → direct. Default: "size"
+   */
+  elementIndex(wgSize: number, size?: BlockExpr | string): BlockExpr {
+    const idx = this.flatGlobalId(wgSize);
+    const bound = size === undefined ? this.uniform("size")
+      : typeof size === "string" ? this.uniform(size)
+      : size;
+    this.ifThen(idx.ge(bound), () => this.emitReturn());
+    return idx;
+  }
+
+  /**
+   * Masked load from storage buffer (like `tl.load(ptr + offs, mask, other)`).
+   * Returns the loaded value when idx < size, otherwise returns fallback.
+   * Safe because WebGPU robust buffer access clamps out-of-bounds reads.
+   *
+   * @param binding  - Storage buffer name
+   * @param idx      - Element index
+   * @param size     - Upper bound for valid indices
+   * @param fallback - Value for out-of-bounds (default: zero of binding's dtype)
+   */
+  blockLoad(binding: string, idx: BlockExpr, size: BlockExpr, fallback?: BlockExpr): BlockExpr {
+    const val = this.load(binding, idx);
+    const fb = fallback ?? this.const(0, this.bindingSpecs[binding]?.type as DataType ?? "f32");
+    return idx.lt(size).select(val, fb);
+  }
+
+  /**
+   * Masked store to buffer (like `tl.store(ptr + offs, val, mask)`).
+   * Only writes when idx < size; no-op for out-of-bounds threads.
+   *
+   * @param binding - Storage buffer name
+   * @param idx     - Element index
+   * @param size    - Upper bound for valid indices
+   * @param val     - Value to store
+   */
+  blockStore(binding: string, idx: BlockExpr, size: BlockExpr, val: BlockExpr): void {
+    this.guardedStore(binding, idx.lt(size), idx, val);
+  }
+
   // -- Scan primitives (like `tl.cumsum`, `tl.associative_scan`) --
 
   /** Hillis-Steele inclusive parallel prefix scan in shared memory.

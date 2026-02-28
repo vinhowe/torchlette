@@ -379,8 +379,7 @@ export function binaryBroadcastSpec(
     uniforms: { size: "u32" },
     grid: elementwiseGrid(WG, { elementUniform: "size" }),
     kernel(ctx) {
-      const idx = ctx.flatGlobalId(WG);
-      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG);
 
       const aOff = buildStridedOffset(ctx, idx, indexShape, aStrides, aOffset, "ao");
       const bOff = buildStridedOffset(ctx, idx, indexShape, bStrides, bOffset, "bo");
@@ -435,8 +434,7 @@ export function unaryStridedSpec(
     uniforms: { size: "u32" },
     grid: elementwiseGrid(WG, { elementUniform: "size" }),
     kernel(ctx) {
-      const idx = ctx.flatGlobalId(WG);
-      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG);
 
       const inputOff = buildStridedOffset(ctx, idx, shape, strides, offset, "in");
       const val = ctx.load("a", inputOff);
@@ -490,8 +488,7 @@ export function castSpec(
     uniforms: { size: "u32" },
     grid: elementwiseGrid(WG, { elementUniform: "size" }),
     kernel(ctx) {
-      const idx = ctx.flatGlobalId(WG);
-      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG);
 
       const inputOff = buildStridedOffset(ctx, idx, shape, strides, offset, "in");
       const val = ctx.load("a", inputOff);
@@ -540,8 +537,7 @@ export function contiguousTileIR(
     uniforms: { size: "u32" },
     grid: elementwiseGrid(WG, { elementUniform: "size" }),
     kernel(ctx) {
-      const idx = ctx.flatGlobalId(WG);
-      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG);
 
       const inputOff = buildStridedOffset(ctx, idx, shape, strides, offset, "in");
       ctx.emitStore("out", idx, ctx.load("input", inputOff));
@@ -579,9 +575,7 @@ export function narrowBackwardTileIR(
     },
     grid: fixedElementGrid(WG, outSize),
     kernel(ctx) {
-      const idx = ctx.flatGlobalId(WG);
-      const total = ctx.u32(outSize);
-      ctx.ifThen(idx.ge(total), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG, ctx.u32(outSize));
 
       const innerSize = ctx.uniform("innerSize");
       const dimSize = ctx.u32(outDimSize);
@@ -750,8 +744,7 @@ export function gatherTileIR(
     uniforms: { size: "u32" },
     grid: elementwiseGrid(WG, { elementUniform: "size" }),
     kernel(ctx) {
-      const idx = ctx.flatGlobalId(WG);
-      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG);
 
       // Decompose flat index into multi-dimensional coordinates
       const coords = ctx.decomposeIndex(idx, indexShape);
@@ -796,8 +789,7 @@ export function scatterAddTileIR(
     uniforms: { srcSize: "u32" },
     grid: elementwiseGrid(WG, { elementUniform: "srcSize" }),
     kernel(ctx) {
-      const srcIdx = ctx.flatGlobalId(WG);
-      ctx.ifThen(srcIdx.ge(ctx.uniform("srcSize")), () => ctx.emitReturn());
+      const srcIdx = ctx.elementIndex(WG, "srcSize");
 
       // Decompose flat src index into multi-dimensional coordinates
       const coords = ctx.decomposeIndex(srcIdx, srcShape);
@@ -844,8 +836,7 @@ export function chunkedGatherTileIR(
     uniforms: { size: "u32", chunkStart: "u32", chunkEnd: "u32" },
     grid: elementwiseGrid(WG, { elementUniform: "size" }),
     kernel(ctx) {
-      const idx = ctx.flatGlobalId(WG);
-      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG);
 
       // Get gather index and skip if outside current chunk range
       const gatherIdx = ctx.emitLet("gatherIdx", ctx.load("indices", idx).toU32());
@@ -897,8 +888,7 @@ export function chunkedScatterAddTileIR(
     uniforms: { srcSize: "u32", chunkStart: "u32", chunkEnd: "u32" },
     grid: elementwiseGrid(WG, { elementUniform: "srcSize" }),
     kernel(ctx) {
-      const srcIdx = ctx.flatGlobalId(WG);
-      ctx.ifThen(srcIdx.ge(ctx.uniform("srcSize")), () => ctx.emitReturn());
+      const srcIdx = ctx.elementIndex(WG, "srcSize");
 
       // Get scatter index and skip if outside current chunk range
       const scatterIdx = ctx.emitLet("scatterIdx", ctx.load("indices", srcIdx).toU32());
@@ -960,11 +950,9 @@ export function chunkedTransposeTileIR(dtype: DataType): string {
       gridStride: "u32",
     },
     kernel(ctx) {
-      const idx = ctx.flatGlobalId(WG);
       const numRows = ctx.uniform("rowEnd").sub(ctx.uniform("rowStart"));
       const numCols = ctx.uniform("colEnd").sub(ctx.uniform("colStart"));
-      const tileSize = numRows.mul(numCols);
-      ctx.ifThen(idx.ge(tileSize), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG, numRows.mul(numCols));
 
       const localRow = idx.div(numCols);
       const localCol = idx.mod(numCols);
@@ -1087,9 +1075,7 @@ export function sliceColumnsTileIR(): string {
     uniforms: { numRows: "u32", N: "u32", colStart: "u32", sliceWidth: "u32", rowStart: "u32" },
     grid: elementwiseGrid(WG),
     kernel(ctx) {
-      const idx = ctx.flatGlobalId(WG);
-      const totalSize = ctx.uniform("numRows").mul(ctx.uniform("sliceWidth"));
-      ctx.ifThen(idx.ge(totalSize), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG, ctx.uniform("numRows").mul(ctx.uniform("sliceWidth")));
 
       const localRow = idx.div(ctx.uniform("sliceWidth"));
       const col = idx.mod(ctx.uniform("sliceWidth"));
@@ -1121,9 +1107,7 @@ export function scatterColumnsTileIR(): string {
     uniforms: { numRows: "u32", N: "u32", colStart: "u32", sliceWidth: "u32", rowStart: "u32", inputRowStart: "u32" },
     grid: elementwiseGrid(WG),
     kernel(ctx) {
-      const idx = ctx.flatGlobalId(WG);
-      const totalSize = ctx.uniform("numRows").mul(ctx.uniform("sliceWidth"));
-      ctx.ifThen(idx.ge(totalSize), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG, ctx.uniform("numRows").mul(ctx.uniform("sliceWidth")));
 
       const localRow = idx.div(ctx.uniform("sliceWidth"));
       const col = idx.mod(ctx.uniform("sliceWidth"));
@@ -1155,9 +1139,7 @@ export function sliceBColumnsTileIR(): string {
     uniforms: { batch: "u32", K: "u32", N: "u32", colStart: "u32", chunkWidth: "u32" },
     grid: elementwiseGrid(WG),
     kernel(ctx) {
-      const idx = ctx.flatGlobalId(WG);
-      const totalSize = ctx.uniform("batch").mul(ctx.uniform("K")).mul(ctx.uniform("chunkWidth"));
-      ctx.ifThen(idx.ge(totalSize), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG, ctx.uniform("batch").mul(ctx.uniform("K")).mul(ctx.uniform("chunkWidth")));
 
       // Decompose flat idx to (batchIdx, k, c) in output space
       const cw = ctx.uniform("chunkWidth");
