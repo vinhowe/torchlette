@@ -166,7 +166,7 @@ import { matmul } from "./ops/matmul-ops";
 import { gather, scatterAdd } from "./ops/gather-scatter";
 import { sum, max, mean } from "./ops/reductions";
 import { stridedScatterCopy, stridedScatterAdd } from "./ops/strided-scatter";
-import { adamStep, unscaleGrad, createInfCountBuffer, readAndDestroyInfCount, fusedCrossEntropyForward, fusedCrossEntropyBackward, fusedLayerNormForward, fusedLayerNormBackwardGradX, fusedLayerNormBackwardGradWeightBias, fusedRMSNormForward, fusedAttentionForward, fusedAttentionBackward, read, waitForGPU, mulScalarInPlace } from "./ops/fused";
+import { adamStep, unscaleGrad, createInfCountBuffer, readAndDestroyInfCount, fusedCrossEntropyForward, fusedCrossEntropyBackward, fusedLayerNormForward, fusedLayerNormBackwardGradX, fusedLayerNormBackwardGradWeightBias, fusedRMSNormForward, fusedRMSNormBackwardGradX, fusedRMSNormBackwardGradWeight, fusedAttentionForward, fusedAttentionBackward, read, waitForGPU, mulScalarInPlace } from "./ops/fused";
 
 // Wire up creation.ts contiguous injection callback (the sole remaining callback —
 // all other injection callbacks were eliminated by the webgpu-state.ts refactoring).
@@ -260,6 +260,8 @@ export const webgpuBackend: Backend & {
     fusedLayerNormBackwardGradX,
     fusedLayerNormBackwardGradWeightBias,
     fusedRMSNormForward,
+    fusedRMSNormBackwardGradX,
+    fusedRMSNormBackwardGradWeight,
     createInfCountBuffer,
     readAndDestroyInfCount,
     read,

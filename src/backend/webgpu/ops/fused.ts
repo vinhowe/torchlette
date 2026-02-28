@@ -38,7 +38,7 @@ import { dispatchUnscaleGrad as dispatchUnscaleGradKernel, allocateInfFlagBuffer
 import { dispatchCrossEntropyForward as dispatchCEForwardKernel, dispatchCrossEntropyBackward as dispatchCEBackwardKernel } from "../cross-entropy-kernel";
 import { dispatchFlashAttentionForward as dispatchFAForwardKernel, dispatchFlashAttentionBackwardD as dispatchFABwdDKernel, dispatchFlashAttentionBackwardDQ as dispatchFABwdDQKernel, dispatchFlashAttentionBackwardDKV as dispatchFABwdDKVKernel } from "../attention-kernel";
 import { dispatchLayerNormForward as dispatchLNForwardKernel, dispatchLayerNormBackwardGradX as dispatchLNBwdGradXKernel, dispatchLayerNormBackwardGradWeightBias as dispatchLNBwdGradWBKernel } from "../layernorm-kernel";
-import { dispatchRMSNormForward as dispatchRMSForwardKernel } from "../rmsnorm-kernel";
+import { dispatchRMSNormForward as dispatchRMSForwardKernel, dispatchRMSNormBackwardGradX as dispatchRMSBwdGradXKernel, dispatchRMSNormBackwardGradWeight as dispatchRMSBwdGradWKernel } from "../rmsnorm-kernel";
 
 // ============================================================================
 // Fused Adam/AdamW Step
@@ -359,6 +359,44 @@ export function fusedRMSNormForward(
   const outShape: number[] = [];
   for (let i = 0; i < xT.shape.length; i++) outShape.push(xT.shape[i]);
   return createTensor(outShape, outBuf, undefined, 0, "f32");
+}
+
+export function fusedRMSNormBackwardGradX(
+  gradOutput: BackendTensor,
+  x: BackendTensor,
+  weight: BackendTensor,
+  config: import("../../types").FusedRMSNormConfig,
+): BackendTensor {
+  const goT = ensureContiguous(asGPUTensor(gradOutput));
+  const xT = ensureContiguous(asGPUTensor(x));
+  const wT = ensureContiguous(asGPUTensor(weight));
+  const outBuf = dispatchRMSBwdGradXKernel(
+    goT.buffer, xT.buffer, wT.buffer,
+    config.numRows, config.featureDim, config.eps,
+  );
+  if (goT !== gradOutput) { bufferPool.decRef(goT.buffer); bufferPool.deferredDestroy(goT.buffer, goT.size * dtypeBytes(goT.dtype)); }
+  if (xT !== x) { bufferPool.decRef(xT.buffer); bufferPool.deferredDestroy(xT.buffer, xT.size * dtypeBytes(xT.dtype)); }
+  if (wT !== weight) { bufferPool.decRef(wT.buffer); bufferPool.deferredDestroy(wT.buffer, wT.size * dtypeBytes(wT.dtype)); }
+  const outShape: number[] = [];
+  for (let i = 0; i < xT.shape.length; i++) outShape.push(xT.shape[i]);
+  return createTensor(outShape, outBuf, undefined, 0, "f32");
+}
+
+export function fusedRMSNormBackwardGradWeight(
+  gradOutput: BackendTensor,
+  x: BackendTensor,
+  weight: BackendTensor,
+  config: import("../../types").FusedRMSNormConfig,
+): BackendTensor {
+  const goT = ensureContiguous(asGPUTensor(gradOutput));
+  const xT = ensureContiguous(asGPUTensor(x));
+  const outBuf = dispatchRMSBwdGradWKernel(
+    goT.buffer, xT.buffer,
+    config.numRows, config.featureDim, config.eps,
+  );
+  if (goT !== gradOutput) { bufferPool.decRef(goT.buffer); bufferPool.deferredDestroy(goT.buffer, goT.size * dtypeBytes(goT.dtype)); }
+  if (xT !== x) { bufferPool.decRef(xT.buffer); bufferPool.deferredDestroy(xT.buffer, xT.size * dtypeBytes(xT.dtype)); }
+  return createTensor([config.featureDim], outBuf, undefined, 0, "f32");
 }
 
 // ============================================================================

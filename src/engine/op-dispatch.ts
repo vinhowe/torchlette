@@ -497,6 +497,16 @@ function executeFusedOp(
       assertOpSupported("fusedRMSNormForward", backend.ops.fusedRMSNormForward);
       return backend.ops.fusedRMSNormForward(backendInputs[0], backendInputs[1], payload);
     }
+    case "fusedRMSNormBackwardGradX": {
+      const payload = getPayload<FusedRMSNormConfig>(node)!;
+      assertOpSupported("fusedRMSNormBackwardGradX", backend.ops.fusedRMSNormBackwardGradX);
+      return backend.ops.fusedRMSNormBackwardGradX(backendInputs[0], backendInputs[1], backendInputs[2], payload);
+    }
+    case "fusedRMSNormBackwardGradWeight": {
+      const payload = getPayload<FusedRMSNormConfig>(node)!;
+      assertOpSupported("fusedRMSNormBackwardGradWeight", backend.ops.fusedRMSNormBackwardGradWeight);
+      return backend.ops.fusedRMSNormBackwardGradWeight(backendInputs[0], backendInputs[1], backendInputs[2], payload);
+    }
     case "transfer": {
       const transferPayload = getPayload<{ sourceDevice?: DeviceKind }>(node);
       const sourceDevice = transferPayload?.sourceDevice

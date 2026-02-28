@@ -77,6 +77,8 @@ import {
   fusedLayerNormBackwardGradXOp,
   fusedLayerNormForwardOp,
   fusedRMSNormForwardOp,
+  fusedRMSNormBackwardGradXOp,
+  fusedRMSNormBackwardGradWeightOp,
 } from "./engine-fused";
 
 // Re-export types and shape helpers for backward compatibility.
@@ -2021,6 +2023,16 @@ export class RuntimeEngine {
 
   fusedRMSNormForward(x: Tensor, weight: Tensor, config: FusedRMSNormConfig): Tensor {
     const { ref, shape } = fusedRMSNormForwardOp(x.lazyRef, weight.lazyRef, x.shape, x.device, config);
+    return this.createAndTrack(createBaseId(), ref, shape, x.device);
+  }
+
+  fusedRMSNormBackwardGradX(gradOutput: Tensor, x: Tensor, weight: Tensor, config: FusedRMSNormConfig): Tensor {
+    const { ref, shape } = fusedRMSNormBackwardGradXOp(gradOutput.lazyRef, x.lazyRef, weight.lazyRef, x.shape, x.device, config);
+    return this.createAndTrack(createBaseId(), ref, shape, x.device);
+  }
+
+  fusedRMSNormBackwardGradWeight(gradOutput: Tensor, x: Tensor, weight: Tensor, config: FusedRMSNormConfig): Tensor {
+    const { ref, shape } = fusedRMSNormBackwardGradWeightOp(gradOutput.lazyRef, x.lazyRef, weight.lazyRef, x.device, config);
     return this.createAndTrack(createBaseId(), ref, shape, x.device);
   }
 
