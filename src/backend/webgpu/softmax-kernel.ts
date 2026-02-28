@@ -1,0 +1,126 @@
+/**
+ * Fused Softmax / Log-Softmax Kernels (tile-IR)
+ *
+ * Replaces the 5-op decomposition (max → sub → exp → sum → div) with a
+ * single-dispatch kernel per reduction row. Each workgroup handles one row:
+ *   1. Parallel max reduction in shared memory
+ *   2. Parallel exp(x - max) + sum reduction
+ *   3. Parallel divide by sum (softmax) or subtract log(sum) (log_softmax)
+ *
+ * Used by compound pattern recognition when the executor detects the
+ * softmax/log_softmax decomposition pattern in the lazy IR plan.
+ */
+
+import type { GPUBuffer } from "./gpu-types";
+import { WORKGROUP_SIZE } from "./shape-utils";
+import { type TileKernelSpec, perRowGrid } from "./tile-ir";
+import { createTileKernelDispatcher, type TileKernelInstance } from "./tile-dispatch";
+import { requireContext } from "./webgpu-state";
+import { resolveOutputBuffer } from "./buffer-arena";
+
+const WG = WORKGROUP_SIZE; // 256
+
+// ============================================================================
+// Softmax Kernel Spec
+// ============================================================================
+
+function softmaxSpec(isLog: boolean): TileKernelSpec {
+  const name = isLog ? "fusedLogSoftmax" : "fusedSoftmax";
+  return {
+    name,
+    workgroupSize: WG,
+    bindings: {
+      x:      { storage: "read",       type: "f32" },
+      output: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      num_rows: "u32",
+      dim_size: "u32",
+    },
+    grid: perRowGrid(),
+
+    kernel(ctx) {
+      const row  = ctx.programId(0);
+      const tid  = ctx.localIndex();
+      const D    = ctx.uniform("dim_size");
+      const base = row.mul(D);
+
+      // Pass 1: Compute max along reduction dimension
+      const maxVal = ctx.emitLet("max_val",
+        ctx.wgReduce("max", tid, D, WG, (i) => ctx.load("x", base.add(i))));
+
+      // Pass 2: Compute exp(x - max) and sum
+      const sumExp = ctx.emitLet("sum_exp",
+        ctx.wgReduce("sum", tid, D, WG, (i) =>
+          ctx.load("x", base.add(i)).sub(maxVal).exp()));
+
+      if (isLog) {
+        // log_softmax: output = (x - max) - log(sum_exp)
+        const logSum = ctx.emitLet("log_sum", sumExp.log());
+        ctx.stridedFor(tid, D, WG, (i) => {
+          const val = ctx.load("x", base.add(i)).sub(maxVal).sub(logSum);
+          ctx.emitStore("output", base.add(i), val);
+        });
+      } else {
+        // softmax: output = exp(x - max) / sum_exp
+        ctx.stridedFor(tid, D, WG, (i) => {
+          const val = ctx.load("x", base.add(i)).sub(maxVal).exp().div(sumExp);
+          ctx.emitStore("output", base.add(i), val);
+        });
+      }
+    },
+  };
+}
+
+// ============================================================================
+// Cached Kernel Dispatchers
+// ============================================================================
+
+let softmaxKernel: TileKernelInstance | null = null;
+let logSoftmaxKernel: TileKernelInstance | null = null;
+
+function getSoftmaxKernel(): TileKernelInstance {
+  if (!softmaxKernel) softmaxKernel = createTileKernelDispatcher(softmaxSpec(false));
+  return softmaxKernel;
+}
+
+function getLogSoftmaxKernel(): TileKernelInstance {
+  if (!logSoftmaxKernel) logSoftmaxKernel = createTileKernelDispatcher(softmaxSpec(true));
+  return logSoftmaxKernel;
+}
+
+// ============================================================================
+// Dispatch Functions
+// ============================================================================
+
+/**
+ * Dispatch a fused softmax kernel.
+ *
+ * @param inputBuffer  Input tensor buffer [N, D] (read-only)
+ * @param numRows      Number of rows (product of dims before reduction dim)
+ * @param dimSize      Size of the reduction dimension
+ * @param outShape     Output tensor shape (same as input)
+ * @param isLog        If true, compute log_softmax instead
+ * @returns Output GPUBuffer
+ */
+export function dispatchFusedSoftmax(
+  inputBuffer: GPUBuffer,
+  numRows: number,
+  dimSize: number,
+  isLog: boolean,
+): GPUBuffer {
+  const ctx = requireContext();
+  const outBuffer = resolveOutputBuffer(
+    ctx.device,
+    numRows * dimSize * 4,
+    [inputBuffer],
+  );
+
+  const kernel = isLog ? getLogSoftmaxKernel() : getSoftmaxKernel();
+  kernel.dispatch(
+    { x: inputBuffer, output: outBuffer },
+    { num_rows: numRows, dim_size: dimSize },
+  );
+
+  return outBuffer;
+}

@@ -37,8 +37,9 @@ import { storageTracker, releaseDeadTensors } from "./storage-tracker";
 import { getInputStorage } from "./op-dispatch";
 import { extractPlanMetadata, pretunePlanMatmuls } from "./plan-builder";
 import { executePlan } from "./executor-sequential";
-import { executeFusedSegment, executeSequentialSegmentWithEarlyRelease, DEFAULT_RECLAIM_INTERVAL } from "./segment-executors";
+import { executeFusedSegment, executeSequentialSegmentWithEarlyRelease, DEFAULT_RECLAIM_INTERVAL, type CompoundMatchExec } from "./segment-executors";
 import type { MatmulPrologueInfo } from "./matmul-epilogue";
+import { detectCompoundPatterns, type CompoundMatch } from "./compound-patterns";
 
 /**
  * Options for optimized plan execution.
@@ -107,6 +108,9 @@ export interface FusionAnalysisTemplate {
     fromDtype: DType;
     toDtype: DType;
   }>]>;
+
+  /** Compound pattern matches (position-based: coveredOrigPoss, outputOrigPos, dim). */
+  compoundDescs?: Array<{ name: string; coveredOrigPoss: number[]; outputOrigPos: number; dim: number }>;
 
   /** Cached lifetime analysis (position-based). */
   lifetimeTemplate?: Array<{ firstUse: number; lastUse: number; isOutput: boolean; isInput: boolean; bufferSize: number }>;
@@ -227,6 +231,8 @@ export async function executePlanOptimized(
   const prologueClaimedIds = new Set<number>();
   const matmulEpilogueChains = new Map<number, number[]>();
   const matmulPrologues = new Map<number, MatmulPrologueInfo[]>();
+  const compoundClaimedIds = new Set<number>();
+  let compoundMatches: CompoundMatch[] = [];
 
   if (cachedTemplate) {
     // ── Cache hit: reconstruct from template ──
@@ -253,6 +259,22 @@ export async function executePlanOptimized(
         fromDtype: d.fromDtype,
         toDtype: d.toDtype,
       })));
+    }
+
+    // Reconstruct compound pattern matches from cached template
+    if (cachedTemplate.compoundDescs) {
+      for (const desc of cachedTemplate.compoundDescs) {
+        const coveredIds = desc.coveredOrigPoss.map(p => plan.nodes[p].id);
+        compoundMatches.push({
+          name: desc.name,
+          coveredNodeIds: coveredIds,
+          outputNodeId: plan.nodes[desc.outputOrigPos].id,
+          dim: desc.dim,
+          inputNodeId: -1, // Not needed for execution
+          inputIsMaterialized: false,
+        });
+        for (const id of coveredIds) compoundClaimedIds.add(id);
+      }
     }
 
     // Reconstruct lifetime analysis from cached template (avoids extractPlanMetadata + analyzeLifetimes)
@@ -491,12 +513,22 @@ export async function executePlanOptimized(
         }
         planNodes = relocated;
       }
+
+      // Detect compound patterns (softmax, log_softmax) from decomposed ops.
+      // Runs after matmul epilogue pre-scan to avoid claiming nodes already
+      // absorbed into matmul epilogue chains.
+      compoundMatches = detectCompoundPatterns(planNodes, consumerCount, consumers, externalNodeIds);
+      for (const match of compoundMatches) {
+        for (const id of match.coveredNodeIds) {
+          compoundClaimedIds.add(id);
+        }
+      }
     }
 
     // Segment the reordered plan into fusible and sequential parts
     let allClaimedIds: Set<number> | undefined;
-    if (epilogueClaimedIds.size > 0 || prologueClaimedIds.size > 0) {
-      allClaimedIds = new Set([...epilogueClaimedIds, ...prologueClaimedIds]);
+    if (epilogueClaimedIds.size > 0 || prologueClaimedIds.size > 0 || compoundClaimedIds.size > 0) {
+      allClaimedIds = new Set([...epilogueClaimedIds, ...prologueClaimedIds, ...compoundClaimedIds]);
     }
     segments = segmentPlanForExecution(planNodes, externalNodeIds, {
       maxStorageBuffers,
@@ -552,6 +584,12 @@ export async function executePlanOptimized(
           toDtype: p.toDtype,
         })),
       ] as [number, Array<{ inputIndex: 0 | 1; castOrigPos: number; fromDtype: DType; toDtype: DType }>]),
+      compoundDescs: compoundMatches.length > 0 ? compoundMatches.map(m => ({
+        name: m.name,
+        coveredOrigPoss: m.coveredNodeIds.map(id => origIdToPos.get(id)!),
+        outputOrigPos: origIdToPos.get(m.outputNodeId)!,
+        dim: m.dim,
+      })) : undefined,
     };
     fusionAnalysisCache.set(fingerprint, template);
   }
@@ -710,6 +748,41 @@ export async function executePlanOptimized(
 
   try {
 
+  // Build compound match map: maps the first covered node ID (in plan order)
+  // to the execution descriptor, and all other covered nodes to skip entries.
+  let compoundMatchMap: Map<number, CompoundMatchExec> | undefined;
+  if (compoundMatches.length > 0) {
+    compoundMatchMap = new Map();
+    // Build a nodeId→position map for finding first covered node in plan order
+    const idToPos = new Map<number, number>();
+    for (let i = 0; i < planNodes.length; i++) idToPos.set(planNodes[i].id, i);
+
+    for (const match of compoundMatches) {
+      // Find the first covered node in plan order
+      let firstPos = Infinity;
+      let firstId = match.coveredNodeIds[0];
+      for (const id of match.coveredNodeIds) {
+        const pos = idToPos.get(id) ?? Infinity;
+        if (pos < firstPos) { firstPos = pos; firstId = id; }
+      }
+
+      const coveredSet = new Set(match.coveredNodeIds);
+      // Map the first node to the full match descriptor
+      compoundMatchMap.set(firstId, {
+        name: match.name,
+        coveredNodeIds: coveredSet,
+        outputNodeId: match.outputNodeId,
+        dim: match.dim,
+      });
+      // Map remaining covered nodes to skip entries
+      for (const id of match.coveredNodeIds) {
+        if (id !== firstId) {
+          compoundMatchMap.set(id, { name: "", coveredNodeIds: coveredSet, outputNodeId: match.outputNodeId, dim: match.dim });
+        }
+      }
+    }
+  }
+
   // Track dispatched nodes for periodic buffer reclamation.
   // When the shared encoder is active, released buffers go to pendingRelease
   // and can't be reused. Periodically flushing moves them back to the main pool.
@@ -772,6 +845,7 @@ export async function executePlanOptimized(
         planConsumerCount,
         loweredPlanBuilder,
         nodeIdToFinalPos,
+        compoundMatchMap,
       );
       stats.sequentialNodes += segment.group.nodes.length;
       overallStep += segment.group.nodes.length;
@@ -794,6 +868,7 @@ export async function executePlanOptimized(
         planConsumerCount,
         loweredPlanBuilder,
         nodeIdToFinalPos,
+        compoundMatchMap,
       );
       stats.sequentialNodes += segment.nodes.length;
       overallStep += segment.nodes.length;

@@ -175,6 +175,19 @@ interface LoweredReclaimAction {
   kind: "reclaim";
 }
 
+/** A compound pattern (softmax, log_softmax) replacing multiple decomposed ops. */
+export interface LoweredCompoundAction {
+  kind: "compound";
+  /** Pattern name (e.g. "softmax", "log_softmax"). */
+  name: string;
+  /** Plan-node indices consumed by this pattern. */
+  coveredNodeIndices: number[];
+  /** Index of the final output node. */
+  outputNodeIndex: number;
+  /** Reduction dimension. */
+  dim: number;
+}
+
 /** Union of all lowered action types. */
 type LoweredAction =
   | LoweredFusedAction
@@ -185,7 +198,8 @@ type LoweredAction =
   | LoweredDataSourceAction
   | LoweredPrologueSkipAction
   | LoweredAdamBatchAction
-  | LoweredReclaimAction;
+  | LoweredReclaimAction
+  | LoweredCompoundAction;
 
 // ============================================================================
 // Lowered Plan
@@ -411,6 +425,22 @@ export class LoweredPlanBuilder {
     this.actions.push({
       kind: "adam-batch",
       nodeIndices,
+    });
+  }
+
+  /** Record a compound pattern (softmax, log_softmax). */
+  recordCompound(
+    name: string,
+    coveredNodeIndices: number[],
+    outputNodeIndex: number,
+    dim: number,
+  ): void {
+    this.actions.push({
+      kind: "compound",
+      name,
+      coveredNodeIndices,
+      outputNodeIndex,
+      dim,
     });
   }
 

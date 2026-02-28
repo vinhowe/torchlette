@@ -47,6 +47,8 @@ import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "./matmul-epilogue";
 import { executeMatmulWithEpilogue, _detectTransposeView, shapesEqual } from "./matmul-epilogue";
 import type { ReductionPreamblePlan } from "./reduction-preamble";
 import { executeReductionWithPreamble } from "./reduction-preamble";
+import { computeContiguousStrides } from "../backend/types";
+import { sizeOf } from "../core/shape";
 import type { OptimizedExecutionStats, OptimizedExecutionResult } from "./executor-optimized";
 
 type AdamStepFn = NonNullable<import("../backend/types").Backend["ops"]["adamStep"]>;
@@ -1016,6 +1018,59 @@ export async function executeLoweredPlan(
         case "prologue-skip": {
           // Prologue-claimed cast nodes are skipped — their work is absorbed
           // into the matmul tile load.
+          break;
+        }
+
+        case "compound": {
+          // Execute a compound pattern (softmax, log_softmax) as a single fused kernel.
+          const { dispatchFusedSoftmax } = await import("../backend/webgpu/softmax-kernel");
+
+          // The output node is where the result goes
+          const compOutNode = planNodes[action.outputNodeIndex];
+          // The first covered node's first input is the pattern's input tensor
+          const firstCoveredNode = planNodes[action.coveredNodeIndices[0]];
+          const nodeBackend = getBackend(firstCoveredNode.device) ?? backend;
+          const inputStorage = getInputStorage(firstCoveredNode.inputs[0], nodeBackend);
+          const inputBT = asGPUTensor(inputStorage.backendTensor);
+
+          // Compute reduction geometry
+          const shape = inputBT.shape;
+          const dim = action.dim < 0 ? shape.length + action.dim : action.dim;
+          const dimSize = shape[dim];
+          let numRows = 1;
+          for (let d = 0; d < dim; d++) numRows *= shape[d];
+
+          const isLog = action.name === "log_softmax";
+          const outBuffer = dispatchFusedSoftmax(inputBT.buffer, numRows, dimSize, isLog);
+
+          // Create result on the output node
+          const outShape = shape.slice();
+          const outStrides = computeContiguousStrides(outShape);
+          compOutNode.result = createStorageHandle(
+            firstCoveredNode.device,
+            { buffer: outBuffer, shape: outShape, dtype: "f32", size: sizeOf(outShape),
+              strides: outStrides, offset: 0, isContiguous: true, ownsBuffer: true },
+          );
+
+          // Record dispatches for replay
+          if (shouldRecord) {
+            while (recordingDispatchIdx < recordingBuffer.length) {
+              replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
+              recordingDispatchIdx++;
+            }
+            if (compOutNode.result) {
+              const bt = asGPUTensor(compOutNode.result.backendTensor);
+              replayEntries.push({ kind: "result", nodeResult: {
+                nodeIndex: action.outputNodeIndex,
+                buffer: bt.buffer,
+                shape: bt.shape.slice(),
+                dtype: bt.dtype,
+                size: bt.size,
+                strides: bt.strides.slice(),
+                isView: false,
+              }});
+            }
+          }
           break;
         }
 

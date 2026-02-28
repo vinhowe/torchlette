@@ -32,6 +32,21 @@ import type { MatmulPrologueInfo, MatmulEpiloguePlan } from "./matmul-epilogue";
 import { detectMatmulEpilogue, detectMatmulEpilogueCore, executeMatmulWithEpilogue } from "./matmul-epilogue";
 import { detectReductionPreamble, executeReductionWithPreamble, detectReductionEpilogue, executeReductionWithEpilogue } from "./reduction-preamble";
 
+/**
+ * Execution descriptor for a compound pattern match.
+ * Built from CompoundMatch by the executor before passing to segment executors.
+ */
+export interface CompoundMatchExec {
+  /** Pattern name: "softmax" or "log_softmax". */
+  name: string;
+  /** Set of covered node IDs (intermediates + output). */
+  coveredNodeIds: Set<number>;
+  /** Node ID of the final output. */
+  outputNodeId: number;
+  /** Reduction dimension (normalized). */
+  dim: number;
+}
+
 /** Default reclaim interval, overridable via TORCHLETTE_RECLAIM_INTERVAL env var. */
 export const DEFAULT_RECLAIM_INTERVAL =
   typeof process !== "undefined" && process.env?.TORCHLETTE_RECLAIM_INTERVAL
@@ -344,6 +359,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
   prebuiltConsumerCount?: Map<number, number>,
   loweredPlanBuilder?: LoweredPlanBuilder | null,
   nodeIdToFinalPos?: Map<number, number>,
+  compoundMatchMap?: Map<number, CompoundMatchExec>,
 ): Promise<void> {
   const useSharedEncoder = backend.name === "webgpu";
   if (useSharedEncoder) beginSharedEncoder();
@@ -391,6 +407,85 @@ export async function executeSequentialSegmentWithEarlyRelease(
           loweredPlanBuilder.recordPrologueSkip(nodeIdToFinalPos.get(node.id)!);
         }
         step++;
+        continue;
+      }
+
+      // Handle compound patterns (softmax, log_softmax). The compoundMatchMap
+      // maps the FIRST covered node ID (in topological order) to the match.
+      // When we encounter this first node, execute the fused kernel and set
+      // results on the output node. Remaining covered nodes are skipped
+      // (their IDs are also in the map as skip entries with name === "").
+      if (compoundMatchMap?.has(node.id)) {
+        const match = compoundMatchMap.get(node.id)!;
+        if (match.name === "") {
+          // This is an intermediate/non-first covered node — skip it
+          if (loweredPlanBuilder && nodeIdToFinalPos) {
+            loweredPlanBuilder.recordPrologueSkip(nodeIdToFinalPos.get(node.id)!);
+          }
+          step++;
+          continue;
+        }
+
+        // Execute compound kernel. We lazy-import to avoid circular deps.
+        const { dispatchFusedSoftmax } = await import("../backend/webgpu/softmax-kernel");
+
+        // Resolve input: the max node's input[0]
+        const nodeBackend = getBackend(node.device) ?? backend;
+        const inputStorage = getInputStorage(node.inputs[0], nodeBackend);
+        const inputBT = asGPUTensor(inputStorage.backendTensor);
+
+        // Compute reduction geometry: numRows = product of dims before dim,
+        // dimSize = shape[dim]
+        const outputNodeIdx = nodes.findIndex(n => n.id === match.outputNodeId);
+        const outputNode = nodes[outputNodeIdx];
+        const shape = inputBT.shape;
+        const dim = match.dim < 0 ? shape.length + match.dim : match.dim;
+        const dimSize = shape[dim];
+        let numRows = 1;
+        for (let d = 0; d < dim; d++) numRows *= shape[d];
+
+        const isLog = match.name === "log_softmax";
+        const outBuffer = dispatchFusedSoftmax(inputBT.buffer, numRows, dimSize, isLog);
+
+        // Create result storage on the output node
+        const outShape = shape.slice();
+        const outStrides = computeContiguousStrides(outShape);
+        outputNode.result = createStorageHandle(
+          node.device,
+          { buffer: outBuffer, shape: outShape, dtype: "f32", size: sizeOf(outShape),
+            strides: outStrides, offset: 0, isContiguous: true, ownsBuffer: true },
+        );
+
+        // Track storages and advance step for all covered nodes
+        const coveredCount = match.coveredNodeIds.size;
+        if (enableEarlyRelease) {
+          for (let c = 0; c < coveredCount; c++) {
+            const coveredNode = nodes[nodeIdx + c];
+            if (coveredNode.result) {
+              nodeToStorage.set(coveredNode.id, coveredNode.result);
+            }
+            step++;
+            releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
+          }
+        } else {
+          step += coveredCount;
+        }
+
+        // Record compound action in lowered plan builder
+        if (loweredPlanBuilder && nodeIdToFinalPos) {
+          const coveredPoss: number[] = [];
+          for (let c = 0; c < coveredCount; c++) {
+            coveredPoss.push(nodeIdToFinalPos.get(nodes[nodeIdx + c].id)!);
+          }
+          loweredPlanBuilder.recordCompound(
+            match.name,
+            coveredPoss,
+            nodeIdToFinalPos.get(match.outputNodeId)!,
+            match.dim,
+          );
+        }
+
+        nodeIdx += coveredCount - 1;
         continue;
       }
 
