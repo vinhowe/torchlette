@@ -1364,8 +1364,26 @@ function eliminateDeadCode(stmts: Statement[]): Statement[] {
     }
   }
 
-  // Step 4: Filter dead lets
-  return processed.filter(s => s.kind !== "let" || usedNames.has(s.name));
+  // Step 4: Collect all node IDs from non-let statements (for auto-CSE awareness).
+  // Auto-CSE injected `let` bindings work by node ID: codegen's bindings.set(node.id, name)
+  // connects them. If a let's value.id appears in other statements, it's effectively live.
+  const nonLetNodeIds = new Set<number>();
+  for (const s of processed) {
+    if (s.kind !== "let") {
+      const nodeMap = new Map<number, IRNode>();
+      collectStmtCSENodes(s, nodeMap);
+      for (const id of nodeMap.keys()) nonLetNodeIds.add(id);
+    }
+  }
+
+  // Step 5: Filter dead lets — keep if name is used OR if value's node ID is referenced
+  return processed.filter(s => {
+    if (s.kind !== "let") return true;
+    if (usedNames.has(s.name)) return true;
+    // Keep auto-CSE bindings: value node has valid ID and appears in other statements
+    if (s.value.id >= 0 && nonLetNodeIds.has(s.value.id)) return true;
+    return false;
+  });
 }
 
 // ============================================================================
@@ -1441,12 +1459,16 @@ function exprContainsMemoryRead(node: IRNode): boolean {
 /**
  * Walk an IR expression tree and collect non-trivial, memory-read-free candidate nodes.
  * Only considers nodes with valid IDs (>= 0, from makeNode).
+ * Always recurses into children even for memory-read nodes, so pure sub-expressions
+ * (like address calculations inside loads) can still be CSE'd.
  */
 function collectExprCSECandidates(node: IRNode, nodes: Map<number, IRNode>): void {
   if (node.id < 0 || isTrivialNode(node)) return;
-  if (exprContainsMemoryRead(node)) return;
-  nodes.set(node.id, node);
-  // Recurse into children to find shared sub-expressions
+  // Register this node as a CSE candidate only if it's memory-read-free
+  if (!exprContainsMemoryRead(node)) {
+    nodes.set(node.id, node);
+  }
+  // Always recurse into children to find shared sub-expressions
   switch (node.kind) {
     case "binary":
       collectExprCSECandidates(node.lhs, nodes);
@@ -1493,6 +1515,16 @@ function collectExprCSECandidates(node: IRNode, nodes: Map<number, IRNode>): voi
     case "vec4Binary":
       collectExprCSECandidates(node.a, nodes);
       collectExprCSECandidates(node.b, nodes);
+      break;
+    case "load":
+      collectExprCSECandidates(node.offsets, nodes);
+      if (node.mask) collectExprCSECandidates(node.mask, nodes);
+      break;
+    case "sharedRead":
+      collectExprCSECandidates(node.idx, nodes);
+      break;
+    case "vec4SharedRead":
+      collectExprCSECandidates(node.idx, nodes);
       break;
     case "arrayRead":
     case "vec4ArrayRead":
