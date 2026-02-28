@@ -98,7 +98,7 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
       const qReg = ctx.registerVec4Array("q_reg", D4_COUNT);
       ctx.ifThen(valid, () => {
         const qBase = bhOff.add(qRow.mul(Dim));
-        ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+        ctx.range(0, D4_COUNT, (d4) => {
           const off = qBase.add(d4Start.add(d4).mul(ctx.u32(4)));
           qReg.write(d4, ctx.vec4(
             ctx.load("Q", off), ctx.load("Q", off.add(ctx.u32(1))),
@@ -147,7 +147,7 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
         const tileMax = ctx.emitVar("_tMax", "f32", ctx.f32(-3.402823e+38));
         const scores = ctx.emitVarArray("_scores", "f32", BC);
 
-        ctx.forRange(ctx.u32(0), ctx.u32(BC), (j) => {
+        ctx.range(0, BC, (j) => {
           const kvPos = kvStart.add(j);
           const isActive = valid.and(kvPos.lt(N)).and(
             isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)),
@@ -155,7 +155,7 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
 
           // Partial dot product
           const sPartial = ctx.emitVar("_sp", "f32", ctx.f32(0));
-          ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+          ctx.range(0, D4_COUNT, (d4) => {
             sPartial.addAssign(
               qReg.read(d4).vec4Dot(kTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4))),
             );
@@ -177,14 +177,14 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
         const correction = mI.get().sub(mNew).exp();
 
         lI.set(lI.get().mul(correction));
-        ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+        ctx.range(0, D4_COUNT, (d4) => {
           oAcc.write(d4, oAcc.read(d4).vec4MulScalar(correction));
         });
 
-        ctx.forRange(ctx.u32(0), ctx.u32(BC), (j) => {
+        ctx.range(0, BC, (j) => {
           const p = scores.get(j).sub(mNew).exp();
           lI.addAssign(p);
-          ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+          ctx.range(0, D4_COUNT, (d4) => {
             oAcc.addAssign(d4,
               vTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4)).vec4MulScalar(p),
             );
@@ -200,7 +200,7 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
         const invL = lI.get().gt(ctx.f32(0)).select(
           ctx.f32(1).div(lI.get()), ctx.f32(0));
         const oBase = bhOff.add(qRow.mul(Dim));
-        ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+        ctx.range(0, D4_COUNT, (d4) => {
           const v = oAcc.read(d4).vec4MulScalar(invL);
           const off = oBase.add(d4Start.add(d4).mul(ctx.u32(4)));
           ctx.emitStore("O", off, v.vec4Component(0));
@@ -346,7 +346,7 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
 
       ctx.ifThen(valid, () => {
         const base = bhOff.add(qRow.mul(Dim));
-        ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+        ctx.range(0, D4_COUNT, (d4) => {
           const off = base.add(d4Start.add(d4).mul(ctx.u32(4)));
           qReg.write(d4, ctx.vec4(
             ctx.load("Q", off), ctx.load("Q", off.add(ctx.u32(1))),
@@ -392,7 +392,7 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
         ctx.barrier();
 
         // Score + gradient computation
-        ctx.forRange(ctx.u32(0), ctx.u32(BC), (j) => {
+        ctx.range(0, BC, (j) => {
           const kvPos = kvStart.add(j);
           const isActive = valid.and(kvPos.lt(N)).and(
             isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)),
@@ -400,7 +400,7 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
 
           // Partial dot: Q[i] . K[j]
           const sPartial = ctx.emitVar("_sp", "f32", ctx.f32(0));
-          ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+          ctx.range(0, D4_COUNT, (d4) => {
             sPartial.addAssign(
               qReg.read(d4).vec4Dot(kTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4))),
             );
@@ -416,7 +416,7 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
 
           // Partial dot: dO[i] . V[j]
           const dovPartial = ctx.emitVar("_dp", "f32", ctx.f32(0));
-          ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+          ctx.range(0, D4_COUNT, (d4) => {
             dovPartial.addAssign(
               dOReg.read(d4).vec4Dot(vTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4))),
             );
@@ -431,7 +431,7 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
           const ds = p.mul(dovVal.sub(dVar.get()));
 
           // dQ[i] += ds * K[j]
-          ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+          ctx.range(0, D4_COUNT, (d4) => {
             dqAcc.addAssign(d4,
               kTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4)).vec4MulScalar(ds),
             );
@@ -444,7 +444,7 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
       // Write dQ (each thread writes its slice, with scale applied at write)
       ctx.ifThen(valid, () => {
         const base = bhOff.add(qRow.mul(Dim));
-        ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+        ctx.range(0, D4_COUNT, (d4) => {
           const v = dqAcc.read(d4).vec4MulScalar(scale);
           const off = base.add(d4Start.add(d4).mul(ctx.u32(4)));
           ctx.emitStore("dQ", off, v.vec4Component(0));
@@ -524,7 +524,7 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
 
       ctx.ifThen(valid, () => {
         const base = bhOff.add(kvRow.mul(Dim));
-        ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+        ctx.range(0, D4_COUNT, (d4) => {
           const off = base.add(d4Start.add(d4).mul(ctx.u32(4)));
           kReg.write(d4, ctx.vec4(
             ctx.load("K", off), ctx.load("K", off.add(ctx.u32(1))),
@@ -585,7 +585,7 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
           ctx.barrier();
 
           // ALL threads participate in shuffle (subgroup-uniform control flow)
-          ctx.forRange(ctx.u32(0), ctx.u32(BQ_BW), (j) => {
+          ctx.range(0, BQ_BW, (j) => {
             const qi = qStart.add(j);
             const isActive = valid.and(qi.lt(N)).and(
               isCausal.eq(ctx.u32(0)).or(kvRow.le(qi)),
@@ -593,7 +593,7 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
 
             // Partial dot: Q[qi] . K[kv_row]
             const sPartial = ctx.emitVar("_sp", "f32", ctx.f32(0));
-            ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+            ctx.range(0, D4_COUNT, (d4) => {
               sPartial.addAssign(
                 qTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4)).vec4Dot(kReg.read(d4)),
               );
@@ -609,7 +609,7 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
 
             // Partial dot: dO[qi] . V[kv_row]
             const dovPartial = ctx.emitVar("_dp", "f32", ctx.f32(0));
-            ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+            ctx.range(0, D4_COUNT, (d4) => {
               dovPartial.addAssign(
                 doTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4)).vec4Dot(vReg.read(d4)),
               );
@@ -625,7 +625,7 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
             const dsScale = ds.mul(scale);
 
             // Accumulate dK and dV (each thread accumulates its vec4 slice)
-            ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+            ctx.range(0, D4_COUNT, (d4) => {
               dkAcc.addAssign(d4,
                 qTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4)).vec4MulScalar(dsScale),
               );
@@ -642,7 +642,7 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
       // Write dK and dV
       ctx.ifThen(valid, () => {
         const base = bhOff.add(kvRow.mul(Dim));
-        ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
+        ctx.range(0, D4_COUNT, (d4) => {
           const off = base.add(d4Start.add(d4).mul(ctx.u32(4)));
           const dk = dkAcc.read(d4);
           ctx.emitStore("dK", off, dk.vec4Component(0));

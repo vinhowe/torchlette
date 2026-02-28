@@ -59,9 +59,7 @@ function buildStridedOffset(
 ): BlockExpr {
   const rank = indexShape.length;
   if (rank === 0) return ctx.u32(offset);
-
-  const coords = ctx.decomposeIndex(flatIdx, indexShape);
-  return ctx.linearizeIndex(coords, strides, offset);
+  return ctx.stridedIndex(flatIdx, indexShape, strides, offset);
 }
 
 // ============================================================================

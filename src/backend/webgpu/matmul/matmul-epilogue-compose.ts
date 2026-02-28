@@ -293,8 +293,8 @@ export function composeTileOpsEpilogue(
       handlesStore: true,
       fn: (ctx, _ops, acc, addressing) => {
         const { batchOffC, wgRow, wgCol, threadRow, threadCol, m, n, ldc } = addressing;
-        ctx.forRange(ctx.const(0, "u32"), ctx.const(threadTileM, "u32"), (tm) => {
-          ctx.forRange(ctx.const(0, "u32"), ctx.const(threadTileN, "u32"), (tn) => {
+        ctx.range(0, threadTileM, (tm) => {
+          ctx.range(0, threadTileN, (tn) => {
             const outRow = ctx.emitLet("out_row",
               wgRow.add(threadRow.mul(ctx.const(threadTileM, "u32")).add(tm)));
             const outCol = ctx.emitLet("out_col",
