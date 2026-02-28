@@ -45,8 +45,8 @@ import { pretunePlanMatmuls } from "./plan-builder";
 import { executeFusedSegment } from "./segment-executors";
 import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "./matmul-epilogue";
 import { executeMatmulWithEpilogue, _detectTransposeView, shapesEqual } from "./matmul-epilogue";
-import type { ReductionPreamblePlan } from "./reduction-preamble";
-import { executeReductionWithPreamble } from "./reduction-preamble";
+import type { ReductionPreamblePlan, ReductionEpiloguePlan } from "./reduction-preamble";
+import { executeReductionWithPreamble, executeReductionWithEpilogue } from "./reduction-preamble";
 import { computeContiguousStrides } from "../backend/types";
 import { sizeOf } from "../core/shape";
 import type { OptimizedExecutionStats, OptimizedExecutionResult } from "./executor-optimized";
@@ -863,6 +863,63 @@ export async function executeLoweredPlan(
               const bt = asGPUTensor(reductionNode.result.backendTensor);
               replayEntries.push({ kind: "result", nodeResult: {
                 nodeIndex: action.reductionNodeIndex,
+                buffer: bt.buffer,
+                shape: bt.shape.slice(),
+                dtype: bt.dtype,
+                size: bt.size,
+                strides: bt.strides.slice(),
+                isView: false,
+              }});
+            }
+          }
+          break;
+        }
+
+        case "reduction-epilogue": {
+          const reNode = planNodes[action.reductionNodeIndex];
+          const reOutputNode = planNodes[action.outputNodeIndex];
+
+          // Reconstruct epilogue input refs by chain-walking covered nodes.
+          // For binary ops in the epilogue chain, the external input is the one
+          // that doesn't point to the previous chain node.
+          const reEpilogueInputRefs: import("./lazy").LazyRef[] = [];
+          for (let ci = 1; ci < action.coveredNodeIndices.length; ci++) {
+            const chainNode = planNodes[action.coveredNodeIndices[ci]];
+            if ((chainNode.op === "add" || chainNode.op === "mul") && chainNode.inputs.length === 2) {
+              const prevChainNodeId = planNodes[action.coveredNodeIndices[ci - 1]].id;
+              const inp0IsChain = chainNode.inputs[0].kind === "pending"
+                && chainNode.inputs[0].node.id === prevChainNodeId;
+              const externalIdx = inp0IsChain ? 1 : 0;
+              reEpilogueInputRefs.push(chainNode.inputs[externalIdx]);
+            }
+          }
+
+          const reEpiloguePlan: ReductionEpiloguePlan = {
+            reductionNode: reNode,
+            epilogueOps: action.epilogueOps,
+            epilogueInputRefs: reEpilogueInputRefs,
+            outputDtype: action.outputDtype,
+            outputNode: reOutputNode,
+            consumedCount: action.consumedCount,
+          };
+
+          const reLabel = reNode.op + "+" + action.epilogueOps.map(
+            o => o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind,
+          ).join("+");
+          await withProfileContext(reLabel, reNode.module, () =>
+            executeReductionWithEpilogue(reEpiloguePlan, backend),
+          );
+
+          // Record dispatches and output node result for replay cache
+          if (shouldRecord) {
+            while (recordingDispatchIdx < recordingBuffer.length) {
+              replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
+              recordingDispatchIdx++;
+            }
+            if (reOutputNode.result) {
+              const bt = asGPUTensor(reOutputNode.result.backendTensor);
+              replayEntries.push({ kind: "result", nodeResult: {
+                nodeIndex: action.outputNodeIndex,
                 buffer: bt.buffer,
                 shape: bt.shape.slice(),
                 dtype: bt.dtype,

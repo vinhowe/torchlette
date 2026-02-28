@@ -142,6 +142,25 @@ interface LoweredReductionPreambleAction {
   reductionNodeIndex: number;
 }
 
+/** A reduction with elementwise epilogue fusion (sum/mean/max → cast/add/mul/activation chain). */
+interface LoweredReductionEpilogueAction {
+  kind: "reduction-epilogue";
+  /** Plan-node index of the reduction (sum/mean/max) node. */
+  reductionNodeIndex: number;
+  /** Plan-node indices consumed by this pattern (reduction + epilogue chain). */
+  coveredNodeIndices: number[];
+  /** Index of the final output node in the plan. */
+  outputNodeIndex: number;
+  /** Epilogue operations to apply after the reduction. */
+  epilogueOps: Array<{ kind: string; toDtype?: DType; inputIndex?: number; op?: string }>;
+  /** Number of additional epilogue inputs (e.g., external tensors for binary ops). */
+  epilogueInputCount: number;
+  /** Output dtype after epilogue chain. */
+  outputDtype: DType;
+  /** Number of nodes consumed (reduction + epilogue chain). */
+  consumedCount: number;
+}
+
 /** A view op (metadata only, no GPU dispatch). */
 interface LoweredViewAction {
   kind: "view";
@@ -194,6 +213,7 @@ type LoweredAction =
   | LoweredSequentialAction
   | LoweredMatmulEpilogueAction
   | LoweredReductionPreambleAction
+  | LoweredReductionEpilogueAction
   | LoweredViewAction
   | LoweredDataSourceAction
   | LoweredPrologueSkipAction
@@ -393,6 +413,28 @@ export class LoweredPlanBuilder {
       kind: "reduction-preamble",
       preambleNodeIndex,
       reductionNodeIndex,
+    });
+  }
+
+  /** Record a reduction with elementwise epilogue. */
+  recordReductionEpilogue(
+    reductionNodeIndex: number,
+    coveredNodeIndices: number[],
+    outputNodeIndex: number,
+    epilogueOps: Array<{ kind: string; toDtype?: DType; inputIndex?: number; op?: string }>,
+    epilogueInputCount: number,
+    outputDtype: DType,
+    consumedCount: number,
+  ): void {
+    this.actions.push({
+      kind: "reduction-epilogue",
+      reductionNodeIndex,
+      coveredNodeIndices,
+      outputNodeIndex,
+      epilogueOps,
+      epilogueInputCount,
+      outputDtype,
+      consumedCount,
     });
   }
 

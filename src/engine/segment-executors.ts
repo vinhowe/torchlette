@@ -623,6 +623,23 @@ export async function executeSequentialSegmentWithEarlyRelease(
             step += epiloguePlan.consumedCount;
           }
 
+          // Record reduction epilogue action in lowered plan builder
+          if (loweredPlanBuilder && nodeIdToFinalPos) {
+            const covered: number[] = [];
+            for (let c = 0; c < epiloguePlan.consumedCount; c++) {
+              covered.push(nodeIdToFinalPos.get(nodes[nodeIdx + c].id)!);
+            }
+            loweredPlanBuilder.recordReductionEpilogue(
+              nodeIdToFinalPos.get(node.id)!,
+              covered,
+              nodeIdToFinalPos.get(epiloguePlan.outputNode.id)!,
+              epiloguePlan.epilogueOps,
+              epiloguePlan.epilogueInputRefs.length,
+              epiloguePlan.outputDtype,
+              epiloguePlan.consumedCount,
+            );
+          }
+
           nodeIdx += epiloguePlan.consumedCount - 1;
           continue;
         }
