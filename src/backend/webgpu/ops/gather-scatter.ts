@@ -8,7 +8,7 @@ import type { BackendTensor, CatOptions, GatherOptions, ScatterAddOptions } from
 import { sizeOf } from "../../../core/shape";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
 import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
-import { WORKGROUP_SIZE, compute2DDispatch, contiguousStrides, wgslArray } from "../shape-utils";
+import { WORKGROUP_SIZE, compute2DDispatch } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { createTensor, createTrackedBuffer } from "../tensor";
@@ -21,7 +21,7 @@ import {
   params4,
 } from "../bind-group-cache";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
-import { gatherTileIR, scatterAddTileIR } from "./ops-tile-ir";
+import { gatherTileIR, scatterAddTileIR, chunkedGatherTileIR, chunkedScatterAddTileIR } from "./ops-tile-ir";
 
 /** Local type alias for GPU buffer binding descriptors with offset/size. */
 type GPUBufferBinding = { buffer: GPUBuffer; offset?: number; size?: number };
@@ -60,54 +60,10 @@ export function gather(
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
-  // Generate shader: tile-IR for direct path, hand-written for chunked
-  let code: string;
-  if (chunked) {
-    const inputStrides = contiguousStrides(inputShape);
-    const indexStrides = contiguousStrides(indexShape);
-    const idxCompute = use2D
-      ? `let idx = gid.x + gid.y * ${dispatch.gridSizeX}u * ${WORKGROUP_SIZE}u;`
-      : `let idx = gid.x;`;
-
-    code = `
-struct Params { size: u32, chunkStart: u32, chunkEnd: u32, _pad: u32, };
-
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read> indices: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
-
-const RANK: u32 = ${rank}u;
-const DIM: u32 = ${dim}u;
-const inputStrides = array<u32, ${rank}>(${wgslArray(inputStrides)});
-const indexStrides = array<u32, ${rank}>(${wgslArray(indexStrides)});
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.size) { return; }
-  let gatherIdx = u32(indices[idx]);
-  if (gatherIdx < params.chunkStart || gatherIdx >= params.chunkEnd) { return; }
-
-  var coords: array<u32, ${rank}>;
-  var remaining = idx;
-  for (var d = 0u; d < RANK; d = d + 1u) {
-    coords[d] = remaining / indexStrides[d];
-    remaining = remaining % indexStrides[d];
-  }
-
-  let localIdx = gatherIdx - params.chunkStart;
-  var inputOffset = 0u;
-  for (var d = 0u; d < RANK; d = d + 1u) {
-    if (d == DIM) { inputOffset = inputOffset + localIdx * inputStrides[d]; }
-    else { inputOffset = inputOffset + coords[d] * inputStrides[d]; }
-  }
-  out[idx] = input[inputOffset];
-}
-`;
-  } else {
-    code = gatherTileIR(inputShape, indexShape, dim);
-  }
+  // Generate shader via tile-IR (both direct and chunked paths)
+  const code = chunked
+    ? chunkedGatherTileIR(inputShape, indexShape, dim)
+    : gatherTileIR(inputShape, indexShape, dim);
 
   const keyPrefix = chunked ? "gatherChunked" : "gather";
   const pipelineKey = `${keyPrefix}:${inputShape.join(",")}:${indexShape.join(",")}:${dim}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
@@ -193,54 +149,10 @@ export function scatterAdd(
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
-  // Generate shader: tile-IR for direct path, hand-written for chunked
-  let code: string;
-  if (chunked) {
-    const outStrides = contiguousStrides(outShape);
-    const srcStrides = contiguousStrides(tensorSrc.shape);
-    const idxCompute = use2D
-      ? `let srcIdx = gid.x + gid.y * ${dispatch.gridSizeX}u * ${WORKGROUP_SIZE}u;`
-      : `let srcIdx = gid.x;`;
-
-    code = `
-struct Params { srcSize: u32, chunkStart: u32, chunkEnd: u32, _pad: u32, };
-
-@group(0) @binding(0) var<storage, read> indices: array<f32>;
-@group(0) @binding(1) var<storage, read> src: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
-
-const RANK: u32 = ${rank}u;
-const DIM: u32 = ${dim}u;
-const outStrides = array<u32, ${rank}>(${wgslArray(outStrides)});
-const srcStrides = array<u32, ${rank}>(${wgslArray(srcStrides)});
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (srcIdx >= params.srcSize) { return; }
-  let scatterIdx = u32(indices[srcIdx]);
-  if (scatterIdx < params.chunkStart || scatterIdx >= params.chunkEnd) { return; }
-
-  var coords: array<u32, ${rank}>;
-  var remaining = srcIdx;
-  for (var d = 0u; d < RANK; d = d + 1u) {
-    coords[d] = remaining / srcStrides[d];
-    remaining = remaining % srcStrides[d];
-  }
-
-  let localIdx = scatterIdx - params.chunkStart;
-  var outOffset = 0u;
-  for (var d = 0u; d < RANK; d = d + 1u) {
-    if (d == DIM) { outOffset = outOffset + localIdx * outStrides[d]; }
-    else { outOffset = outOffset + coords[d] * outStrides[d]; }
-  }
-  out[outOffset] = out[outOffset] + src[srcIdx];
-}
-`;
-  } else {
-    code = scatterAddTileIR(inputShape, tensorSrc.shape, dim);
-  }
+  // Generate shader via tile-IR (both direct and chunked paths)
+  const code = chunked
+    ? chunkedScatterAddTileIR(inputShape, tensorSrc.shape, dim)
+    : scatterAddTileIR(inputShape, tensorSrc.shape, dim);
 
   const keyPrefix = chunked ? "scatterAddChunked" : "scatterAdd";
   const pipelineKey = `${keyPrefix}:${inputShape.join(",")}:${tensorSrc.shape.join(",")}:${dim}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;

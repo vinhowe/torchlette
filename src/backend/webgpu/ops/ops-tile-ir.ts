@@ -816,6 +816,112 @@ export function scatterAddTileIR(
   return compileTileKernel(spec);
 }
 
+// ============================================================================
+// Chunked Gather Kernel
+// ============================================================================
+
+/**
+ * Generate WGSL for chunked gather op via tile-IR.
+ * Each dispatch handles a chunk of the input buffer along the gather dimension.
+ * Threads whose gather index falls outside [chunkStart, chunkEnd) are skipped.
+ * The gather index is adjusted to local coordinates within the chunk.
+ */
+export function chunkedGatherTileIR(
+  inputShape: number[],
+  indexShape: number[],
+  dim: number,
+): string {
+  const inputStrides = contiguousStridesForShape(inputShape);
+
+  const spec: TileKernelSpec = {
+    name: `gather_chunked_d${dim}`,
+    workgroupSize: WG,
+    bindings: {
+      input: { storage: "read", type: "f32" },
+      indices: { storage: "read", type: "f32" },
+      out: { storage: "read_write", type: "f32" },
+    },
+    uniforms: { size: "u32", chunkStart: "u32", chunkEnd: "u32" },
+    grid: elementwiseGrid(WG, { elementUniform: "size" }),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+
+      // Get gather index and skip if outside current chunk range
+      const gatherIdx = ctx.emitLet("gatherIdx", ctx.load("indices", idx).toU32());
+      ctx.ifThen(gatherIdx.lt(ctx.uniform("chunkStart")), () => ctx.emitReturn());
+      ctx.ifThen(gatherIdx.ge(ctx.uniform("chunkEnd")), () => ctx.emitReturn());
+
+      // Adjust to chunk-local index
+      const localIdx = gatherIdx.sub(ctx.uniform("chunkStart"));
+
+      // Decompose flat index into multi-dimensional coordinates
+      const coords = ctx.decomposeIndex(idx, indexShape);
+
+      // Compute input offset: replace dim coordinate with local gather index
+      const inputCoords = coords.map((c, d) => d === dim ? localIdx : c);
+      const inputOffset = ctx.linearizeIndex(inputCoords, inputStrides);
+
+      ctx.emitStore("out", idx, ctx.load("input", inputOffset));
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+// ============================================================================
+// Chunked ScatterAdd Kernel
+// ============================================================================
+
+/**
+ * Generate WGSL for chunked scatter_add op via tile-IR.
+ * Each dispatch handles a chunk of the output buffer along the scatter dimension.
+ * Threads whose scatter index falls outside [chunkStart, chunkEnd) are skipped.
+ * The scatter index is adjusted to local coordinates within the chunk.
+ */
+export function chunkedScatterAddTileIR(
+  inputShape: number[],
+  srcShape: number[],
+  dim: number,
+): string {
+  const outStrides = contiguousStridesForShape(inputShape);
+  const srcStrides = contiguousStridesForShape(srcShape);
+
+  const spec: TileKernelSpec = {
+    name: `scatterAdd_chunked_d${dim}`,
+    workgroupSize: WG,
+    bindings: {
+      indices: { storage: "read", type: "f32" },
+      src: { storage: "read", type: "f32" },
+      out: { storage: "read_write", type: "f32" },
+    },
+    uniforms: { srcSize: "u32", chunkStart: "u32", chunkEnd: "u32" },
+    grid: elementwiseGrid(WG, { elementUniform: "srcSize" }),
+    kernel(ctx) {
+      const srcIdx = ctx.flatGlobalId(WG);
+      ctx.ifThen(srcIdx.ge(ctx.uniform("srcSize")), () => ctx.emitReturn());
+
+      // Get scatter index and skip if outside current chunk range
+      const scatterIdx = ctx.emitLet("scatterIdx", ctx.load("indices", srcIdx).toU32());
+      ctx.ifThen(scatterIdx.lt(ctx.uniform("chunkStart")), () => ctx.emitReturn());
+      ctx.ifThen(scatterIdx.ge(ctx.uniform("chunkEnd")), () => ctx.emitReturn());
+
+      // Adjust to chunk-local index
+      const localIdx = scatterIdx.sub(ctx.uniform("chunkStart"));
+
+      // Decompose flat src index into multi-dimensional coordinates
+      const coords = ctx.decomposeIndex(srcIdx, srcShape);
+
+      // Compute output offset: replace dim coordinate with local scatter index
+      const outCoords = coords.map((c, d) => d === dim ? localIdx : c);
+      const outOffset = ctx.linearizeIndex(outCoords, outStrides);
+
+      const existing = ctx.load("out", outOffset);
+      ctx.emitStore("out", outOffset, existing.add(ctx.load("src", srcIdx)));
+    },
+  };
+  return compileTileKernel(spec);
+}
+
 /** Helper: compute contiguous strides for a given shape. */
 function contiguousStridesForShape(shape: number[]): number[] {
   const strides: number[] = [];
@@ -825,6 +931,58 @@ function contiguousStridesForShape(shape: number[]): number[] {
     strides.push(stride);
   }
   return strides;
+}
+
+// ============================================================================
+// Chunked Transpose Kernel
+// ============================================================================
+
+/**
+ * Generate WGSL for chunked 2D transpose via tile-IR.
+ * Processes tiles defined by [rowStart, rowEnd) × [colStart, colEnd).
+ * For a transposed tensor [K, N] with strides [1, K]:
+ *   input[localCol * K + globalRow] → output[localRow * N + globalCol]
+ *
+ * @param dtype - Element dtype ("f32", "f16", etc.)
+ */
+export function chunkedTransposeTileIR(dtype: DataType): string {
+  const spec: TileKernelSpec = {
+    name: "contiguous_chunked_transpose",
+    workgroupSize: WG,
+    bindings: {
+      input: { storage: "read", type: dtype },
+      output: { storage: "read_write", type: dtype },
+    },
+    uniforms: {
+      K: "u32", N: "u32",
+      rowStart: "u32", rowEnd: "u32",
+      colStart: "u32", colEnd: "u32",
+      gridStride: "u32",
+    },
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+      const numRows = ctx.uniform("rowEnd").sub(ctx.uniform("rowStart"));
+      const numCols = ctx.uniform("colEnd").sub(ctx.uniform("colStart"));
+      const tileSize = numRows.mul(numCols);
+      ctx.ifThen(idx.ge(tileSize), () => ctx.emitReturn());
+
+      const localRow = idx.div(numCols);
+      const localCol = idx.mod(numCols);
+      const globalRow = ctx.uniform("rowStart").add(localRow);
+      const globalCol = ctx.uniform("colStart").add(localCol);
+
+      // Input: transposed [globalRow, globalCol] = buffer[globalCol * K + globalRow]
+      // With chunk offset at colStart * K, local index = localCol * K + globalRow
+      const inputIdx = localCol.mul(ctx.uniform("K")).add(globalRow);
+
+      // Output: row chunk is bound with offset
+      // localRow * N + globalCol
+      const outputIdx = localRow.mul(ctx.uniform("N")).add(globalCol);
+
+      ctx.emitStore("output", outputIdx, ctx.load("input", inputIdx));
+    },
+  };
+  return compileTileKernel(spec);
 }
 
 // ============================================================================
