@@ -7,20 +7,21 @@ import type { BackendTensor } from "../../types";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
 import { GPUBufferUsage, GPUMapMode, asGPUTensor } from "../gpu-types";
 import {
-  sizeOf, WORKGROUP_SIZE, dtypeBytes, alignBufferSize,
+  dtypeBytes, alignBufferSize, WORKGROUP_SIZE,
 } from "../shape-utils";
 import {
   requireContext, context, isF16Supported,
   f16WeightCache, f16ArrayToF32Array,
 } from "../gpu-context";
-import { dispatchComputePass, getPipeline } from "../dispatch";
 import { createTensor, createTrackedBuffer } from "../tensor";
 import { bufferPool } from "../buffer-pool";
 import { allocateOutputBuffer, resolveOutputBuffer } from "../buffer-arena";
 import {
-  cachedCreateBindGroup, createParamsBuffer, releaseParamsBuffer,
   profiledCreateBindGroup,
 } from "../bind-group-cache";
+import type { TileKernelSpec } from "../tile-ir";
+import { elementwiseGrid } from "../tile-ir";
+import { createTileKernelDispatcher } from "../tile-dispatch";
 import {
   sharedEncoder as sharedEncoderFlag,
   flushSharedEncoder, isSharedEncoderActive,
@@ -522,46 +523,38 @@ export async function waitForGPU(): Promise<void> {
 // In-place Scalar Operations (for optimizer updates)
 // ============================================================================
 
+const WG_MUL = WORKGROUP_SIZE;
+
+const mulScalarInPlaceSpec: TileKernelSpec = {
+  name: "mulScalarInPlace",
+  workgroupSize: WG_MUL,
+  bindings: {
+    data: { storage: "read_write", type: "f32" },
+  },
+  uniforms: {
+    scalar: "f32",
+    size: "u32",
+  },
+  grid: elementwiseGrid(WG_MUL, { elementUniform: "size" }),
+  kernel(ctx) {
+    const idx = ctx.flatGlobalId(WG_MUL);
+    const size = ctx.uniform("size");
+    ctx.ifThen(idx.ge(size), () => ctx.emitReturn());
+    const scalar = ctx.uniform("scalar").toF32();
+    ctx.emitStore("data", idx, ctx.load("data", idx).mul(scalar));
+  },
+};
+
+const mulScalarKernel = createTileKernelDispatcher(mulScalarInPlaceSpec);
+
 /**
  * Multiply tensor by a scalar in-place (for gradient unscaling).
  * This is a simple in-place multiplication without NaN checking.
  */
 export function mulScalarInPlace(tensor: BackendTensor, scalar: number): void {
-  const ctx = requireContext();
   const a = asGPUTensor(tensor);
-  const size = a.size;
-
-  // Pack mixed f32 + u32 params
-  const fillParamsData = new ArrayBuffer(8);
-  new Float32Array(fillParamsData, 0, 1)[0] = scalar;
-  new Uint32Array(fillParamsData, 4, 1)[0] = size;
-  const uniformBuffer = createParamsBuffer(ctx.device, new Uint32Array(fillParamsData));
-
-  const code = `
-struct Params {
-  scalar: f32,
-  size: u32,
-};
-
-@group(0) @binding(0) var<storage, read_write> data: array<f32>;
-@group(0) @binding(1) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = gid.x;
-  if (idx >= params.size) {
-    return;
-  }
-  data[idx] = data[idx] * params.scalar;
-}
-`;
-
-  const key = `mul_scalar_inplace:${size}`;
-  const pipeline = getPipeline(ctx, key, code);
-
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [a.buffer, uniformBuffer]);
-
-  dispatchComputePass(pipeline, bindGroup, Math.ceil(size / WORKGROUP_SIZE));
-
-  releaseParamsBuffer(uniformBuffer);
+  mulScalarKernel.dispatch(
+    { data: a.buffer },
+    { scalar, size: a.size },
+  );
 }
