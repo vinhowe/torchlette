@@ -525,27 +525,62 @@ function emitStatement(
       break;
     }
     case "forStride": {
-      // Check if we can unroll: start and bound must be const
       const startConst = stmt.start.kind === "const" ? stmt.start.value : null;
       const boundConst = stmt.bound.kind === "const" ? stmt.bound.value : null;
       const strideVal = stmt.stride;
-      const tripCount = startConst !== null && boundConst !== null && strideVal > 0
-        ? Math.ceil((boundConst - startConst) / strideVal) : null;
-      const shouldUnroll = tripCount !== null && tripCount >= 0 &&
-        (stmt.unroll === true || tripCount <= 8);
 
-      if (shouldUnroll && tripCount !== null && startConst !== null) {
-        for (let i = 0; i < tripCount; i++) {
-          const iterVal = startConst + i * strideVal;
-          lines.push(`${indent}{ // unrolled ${stmt.varName}=${iterVal}`);
-          lines.push(`${indent}  const ${stmt.varName} = ${iterVal}u;`);
-          const childBindings = new Map(bindings);
-          for (const s of stmt.body) {
-            emitStatement(s, childBindings, lines, depth + 1);
+      // Case 1: Fully const — emit JS-time unrolled iterations (no guards needed)
+      if (startConst !== null && boundConst !== null && strideVal > 0) {
+        const tripCount = Math.ceil((boundConst - startConst) / strideVal);
+        if (tripCount >= 0 && (stmt.unroll === true || tripCount <= 8)) {
+          for (let i = 0; i < tripCount; i++) {
+            const iterVal = startConst + i * strideVal;
+            lines.push(`${indent}{ // unrolled ${stmt.varName}=${iterVal}`);
+            lines.push(`${indent}  const ${stmt.varName} = ${iterVal}u;`);
+            const childBindings = new Map(bindings);
+            for (const s of stmt.body) {
+              emitStatement(s, childBindings, lines, depth + 1);
+            }
+            lines.push(`${indent}}`);
           }
-          lines.push(`${indent}}`);
+          break;
         }
-      } else {
+      }
+
+      // Case 2: Dynamic start, const bound — max trip count unrolling with guards.
+      // Common pattern: stridedFor(tid, TILE_SIZE, WG) for cooperative loading.
+      // Max trips = ceil(bound / stride) (assuming start ∈ [0, stride)).
+      if (startConst === null && boundConst !== null && strideVal > 0) {
+        const maxTrips = Math.ceil(boundConst / strideVal);
+        if (maxTrips >= 1 && (stmt.unroll === true ? maxTrips <= 16 : maxTrips <= 8)) {
+          const startExpr = exprFor(stmt.start, bindings, null);
+          for (let i = 0; i < maxTrips; i++) {
+            const ivExpr = i === 0 ? startExpr : `(${startExpr} + ${i * strideVal}u)`;
+            lines.push(`${indent}{ // unrolled iter ${i}`);
+            lines.push(`${indent}  let ${stmt.varName} = ${ivExpr};`);
+            // Guard: skip check on first iteration when bound is a multiple of stride
+            // (all threads are guaranteed valid on iter 0 in that case)
+            const needsGuard = i > 0 || boundConst % strideVal !== 0;
+            const childBindings = new Map(bindings);
+            if (needsGuard) {
+              lines.push(`${indent}  if (${stmt.varName} < ${boundConst}u) {`);
+              for (const s of stmt.body) {
+                emitStatement(s, childBindings, lines, depth + 2);
+              }
+              lines.push(`${indent}  }`);
+            } else {
+              for (const s of stmt.body) {
+                emitStatement(s, childBindings, lines, depth + 1);
+              }
+            }
+            lines.push(`${indent}}`);
+          }
+          break;
+        }
+      }
+
+      // Case 3: Fallback — emit runtime loop
+      {
         const start = exprFor(stmt.start, bindings, null);
         const bound = exprFor(stmt.bound, bindings, null);
         lines.push(`${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + ${strideVal}u) {`);
