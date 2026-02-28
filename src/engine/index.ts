@@ -131,8 +131,6 @@ export {
   RngReplayMismatchError,
   SavedTensorModifiedError,
 } from "./engine";
-export type { FusionRecipe } from "./fusion";
-export { buildFusionRecipes } from "./fusion";
 export type { IRFusionGroup, IRGraph, IRNode } from "./ir";
 export { buildIRFromTrace } from "./ir";
 export type {
