@@ -1160,6 +1160,33 @@ export class Torchlette {
     return this._wrap(result);
   }
 
+  variance(a: Tensor, options?: { dim?: number | number[] | null; correction?: number; keepdim?: boolean }): Tensor {
+    this._assertUsable(a);
+    const dim = options?.dim ?? null;
+    const correction = options?.correction ?? 1;
+    const keepdim = options?.keepdim ?? false;
+
+    const meanVal = this.mean(a, { dim, keepdim: true }) as Tensor;
+    const diff = this.sub(a, meanVal);
+    const sq = this.mul(diff, diff);
+    const sumSq = this.sum(sq, { dim, keepdim });
+
+    const aShape = a.shape;
+    const dims = this._normalizeDims(dim, aShape.length);
+    const reduceCount = dims.length === 0
+      ? aShape.reduce((acc, s) => acc * s, 1)
+      : dims.reduce((acc, d) => acc * aShape[d], 1);
+    const denom = Math.max(reduceCount - correction, 0);
+    if (denom === 0) {
+      throw new Error("variance: correction >= number of elements in reduction");
+    }
+    return this.div(sumSq, this.runtime.full([], denom, a.dtype, a.device));
+  }
+
+  std(a: Tensor, options?: { dim?: number | number[] | null; correction?: number; keepdim?: boolean }): Tensor {
+    return this.sqrt(this.variance(a, options));
+  }
+
   // ============================================================================
   // Comparison ops
   // ============================================================================

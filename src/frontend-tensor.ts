@@ -366,6 +366,14 @@ export class Tensor {
     return this.engine.argmin(this, options);
   }
 
+  variance(options?: { dim?: number | number[] | null; correction?: number; keepdim?: boolean }): Tensor {
+    return this.engine.variance(this, options);
+  }
+
+  std(options?: { dim?: number | number[] | null; correction?: number; keepdim?: boolean }): Tensor {
+    return this.engine.std(this, options);
+  }
+
   gt(other: Tensor): Tensor {
     return this.engine.gt(this, other);
   }
