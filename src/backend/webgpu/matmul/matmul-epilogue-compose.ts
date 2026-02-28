@@ -7,7 +7,7 @@
  */
 
 import type { BlockExpr, KernelContext } from "../tile-ir";
-import type { EpilogueConfig } from "./codegen";
+import type { EpilogueConfig } from "./types";
 import type { DType } from "./types";
 import { TileOps, BlockOps, Block, TileRange, type Accumulator } from "../tile-ops";
 

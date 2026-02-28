@@ -16,7 +16,7 @@ import {
   type EpilogueConfig,
   getShaderCacheKey,
   getKSplitReductionCacheKey,
-} from "./codegen";
+} from "./types";
 import {
   generateTiledMatmulShaderTileIR,
   generateKSplitReductionShaderTileIR,

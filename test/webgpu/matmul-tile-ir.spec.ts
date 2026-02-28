@@ -22,7 +22,7 @@ import {
 } from "../../src/backend/webgpu";
 import { dispatchTiledMatmul } from "../../src/backend/webgpu/matmul/dispatch";
 import { DEFAULT_CONFIG, type MatmulKernelConfig } from "../../src/backend/webgpu/matmul/types";
-import type { EpilogueConfig } from "../../src/backend/webgpu/matmul/codegen";
+import type { EpilogueConfig } from "../../src/backend/webgpu/matmul/types";
 import type { GPUBuffer, GPUDevice, GPUQueue } from "../../src/backend/webgpu/gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "../../src/backend/webgpu/gpu-types";
 

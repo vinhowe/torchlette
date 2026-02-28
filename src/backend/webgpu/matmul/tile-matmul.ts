@@ -9,7 +9,7 @@
  */
 
 import { type TileKernelSpec, type DataType, type BlockExpr, type KernelContext, ceilDivGrid, singleWorkgroup } from "../tile-ir";
-import type { CodegenOptions } from "./codegen";
+import type { CodegenOptions } from "./types";
 import { getWorkgroupSize, type DType } from "./types";
 import { TileOps, BlockOps, Block, TileRange, buildPtr, buildMask, type TileConfig } from "../tile-ops";
 import {

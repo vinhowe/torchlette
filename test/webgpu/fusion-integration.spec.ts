@@ -21,10 +21,10 @@ import {
   resetFusionCache,
 } from "../../src/backend/webgpu/fusion-dispatch";
 import {
-  generateFusedKernel,
   buildRecipeFromIR,
   type FusedKernelRecipe,
-} from "../../src/backend/webgpu/fusion-codegen";
+} from "../../src/backend/webgpu/fusion-types";
+import { generateFusedKernelTileIR } from "../../src/backend/webgpu/fusion-tile-ir";
 import type { IRNode } from "../../src/engine/ir";
 
 import { cpuOnly } from "../helpers/webgpu";
@@ -316,7 +316,7 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
         outputs: [{ nodeId: 1, index: 0, shape: [256], dtype: "f32" }],
       };
 
-      const kernel = generateFusedKernel(recipe, { vectorize: true });
+      const kernel = generateFusedKernelTileIR(recipe, { vectorize: true });
 
       expect(kernel.vectorWidth).toBe(4);
       expect(kernel.workItems).toBe(64); // 256 / 4
@@ -331,7 +331,7 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
         outputs: [{ nodeId: 1, index: 0, shape: [66], dtype: "f32" }],
       };
 
-      const kernel = generateFusedKernel(recipe, { vectorize: true });
+      const kernel = generateFusedKernelTileIR(recipe, { vectorize: true });
 
       expect(kernel.vectorWidth).toBe(2);
       expect(kernel.workItems).toBe(33); // 66 / 2
@@ -345,7 +345,7 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
         outputs: [{ nodeId: 1, index: 0, shape: [33], dtype: "f32" }],
       };
 
-      const kernel = generateFusedKernel(recipe, { vectorize: true });
+      const kernel = generateFusedKernelTileIR(recipe, { vectorize: true });
 
       expect(kernel.vectorWidth).toBe(1);
       expect(kernel.workItems).toBe(33);

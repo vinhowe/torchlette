@@ -30,7 +30,7 @@ import type { GPUBuffer, GPUDevice, GPUQueue } from "../../src/backend/webgpu/gp
 import { GPUBufferUsage, GPUMapMode } from "../../src/backend/webgpu/gpu-types";
 import { createTiledMatmulKernel } from "../../src/backend/webgpu/matmul/tile-matmul";
 import { DEFAULT_CONFIG } from "../../src/backend/webgpu/matmul/types";
-import type { EpilogueConfig } from "../../src/backend/webgpu/matmul/codegen";
+import type { EpilogueConfig } from "../../src/backend/webgpu/matmul/types";
 
 import { cpuOnly } from "../helpers/webgpu";
 
