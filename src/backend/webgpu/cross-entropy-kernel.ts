@@ -12,139 +12,16 @@
  */
 
 import {
-  dispatchComputePass,
   allocateOutputBuffer,
-  cachedCreateBindGroup,
-  getPipeline,
 } from "./index";
-import { requireContext } from "./webgpu-state";
-import type { GPUBuffer, GPUDevice } from "./gpu-types";
-import { GPUBufferUsage } from "./gpu-types";
+import type { GPUBuffer } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
-import { wgslSumReduction, wgslMaxReduction, trackBuffers } from "./wgsl-helpers";
 import { type TileKernelSpec, perRowGrid } from "./tile-ir";
 import { createTileKernelDispatcher } from "./tile-dispatch";
-
-// Shared WGSL struct for cross-entropy config (8 bytes, 2 fields)
-const WGSL_CE_CONFIG = `struct CEConfig {
-  batch_size: u32,
-  vocab_size: u32,
-};`;
-
-// ============================================================================
-// WGSL Shaders
-// ============================================================================
-
-function crossEntropyForwardShader(): string {
-  return `
-${WGSL_CE_CONFIG}
-
-@group(0) @binding(0) var<storage, read> logits: array<f32>;
-@group(0) @binding(1) var<storage, read> targets: array<f32>;
-@group(0) @binding(2) var<storage, read_write> loss: array<f32>;
-@group(0) @binding(3) var<uniform> config: CEConfig;
-
-var<workgroup> sdata: array<f32, ${WORKGROUP_SIZE}>;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let row = wid.x;
-  let tid = lid.x;
-  let V = config.vocab_size;
-  let base = row * V;
-
-  // Phase 1: Parallel max reduction
-  var local_max = -3.402823e+38;
-  for (var i = tid; i < V; i += ${WORKGROUP_SIZE}u) {
-    local_max = max(local_max, logits[base + i]);
-  }
-  sdata[tid] = local_max;
-  workgroupBarrier();
-
-  ${wgslMaxReduction("sdata", WORKGROUP_SIZE / 2)}
-  let row_max = sdata[0];
-
-  // Phase 2: Parallel sum-exp reduction
-  var local_sum = 0.0;
-  for (var i = tid; i < V; i += ${WORKGROUP_SIZE}u) {
-    local_sum += exp(logits[base + i] - row_max);
-  }
-  sdata[tid] = local_sum;
-  workgroupBarrier();
-
-  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
-  let log_sum_exp = log(sdata[0]);
-
-  // Phase 3: Output (thread 0 only)
-  if (tid == 0u) {
-    let t = u32(targets[row]);
-    loss[row] = -(logits[base + t] - row_max - log_sum_exp);
-  }
-}
-`;
-}
-
-function crossEntropyBackwardShader(): string {
-  return `
-${WGSL_CE_CONFIG}
-
-@group(0) @binding(0) var<storage, read> logits: array<f32>;
-@group(0) @binding(1) var<storage, read> targets: array<f32>;
-@group(0) @binding(2) var<storage, read> grad_output: array<f32>;
-@group(0) @binding(3) var<storage, read_write> grad_logits: array<f32>;
-@group(0) @binding(4) var<uniform> config: CEConfig;
-
-var<workgroup> sdata: array<f32, ${WORKGROUP_SIZE}>;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let row = wid.x;
-  let tid = lid.x;
-  let V = config.vocab_size;
-  let base = row * V;
-
-  // Phase 1: Parallel max reduction (recompute from forward)
-  var local_max = -3.402823e+38;
-  for (var i = tid; i < V; i += ${WORKGROUP_SIZE}u) {
-    local_max = max(local_max, logits[base + i]);
-  }
-  sdata[tid] = local_max;
-  workgroupBarrier();
-
-  ${wgslMaxReduction("sdata", WORKGROUP_SIZE / 2)}
-  let row_max = sdata[0];
-
-  // Phase 2: Parallel sum-exp reduction (recompute from forward)
-  var local_sum = 0.0;
-  for (var i = tid; i < V; i += ${WORKGROUP_SIZE}u) {
-    local_sum += exp(logits[base + i] - row_max);
-  }
-  sdata[tid] = local_sum;
-  workgroupBarrier();
-
-  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
-  let log_sum_exp = log(sdata[0]);
-
-  // Phase 3: Write gradients (all threads participate)
-  // grad_logits[b,v] = grad_output[b] * (softmax[b,v] - one_hot(target[b])[v])
-  let t = u32(targets[row]);
-  let g = grad_output[row];
-  for (var i = tid; i < V; i += ${WORKGROUP_SIZE}u) {
-    let softmax_i = exp(logits[base + i] - row_max - log_sum_exp);
-    let one_hot_i = select(0.0, 1.0, i == t);
-    grad_logits[base + i] = g * (softmax_i - one_hot_i);
-  }
-}
-`;
-}
 
 // ============================================================================
 // Tile IR Kernels
 // ============================================================================
-
-const USE_TILE_IR_CROSSENTROPY = process.env.TORCHLETTE_TILE_CROSSENTROPY !== "0";
 
 const WG = WORKGROUP_SIZE; // 256
 
@@ -234,35 +111,8 @@ const crossEntropyBackwardSpec: TileKernelSpec = {
   },
 };
 
-const ceFwdTileKernel = USE_TILE_IR_CROSSENTROPY
-  ? createTileKernelDispatcher(crossEntropyForwardSpec) : null;
-const ceBwdTileKernel = USE_TILE_IR_CROSSENTROPY
-  ? createTileKernelDispatcher(crossEntropyBackwardSpec) : null;
-
-// ============================================================================
-// Config Buffer (cached per batch_size x vocab_size)
-// ============================================================================
-
-const configCache = new Map<string, GPUBuffer>();
-
-function getOrCreateConfigBuffer(
-  device: GPUDevice,
-  batchSize: number,
-  vocabSize: number,
-): GPUBuffer {
-  const key = `${batchSize}:${vocabSize}`;
-  let buf = configCache.get(key);
-  if (!buf) {
-    buf = device.createBuffer({
-      size: 8, // 2 x u32
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    configCache.set(key, buf);
-  }
-  const data = new Uint32Array([batchSize, vocabSize]);
-  device.queue.writeBuffer(buf, 0, new Uint8Array(data.buffer));
-  return buf;
-}
+const ceFwdTileKernel = createTileKernelDispatcher(crossEntropyForwardSpec);
+const ceBwdTileKernel = createTileKernelDispatcher(crossEntropyBackwardSpec);
 
 // ============================================================================
 // Dispatch Functions
@@ -281,34 +131,9 @@ export function dispatchCrossEntropyForward(
   const outputSizeBytes = batchSize * 4; // f32
   const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
-  if (ceFwdTileKernel) {
-    ceFwdTileKernel.dispatch(
-      { logits: logitsBuffer, targets: targetsBuffer, loss: outBuffer },
-      { batch_size: batchSize, vocab_size: vocabSize },
-    );
-    return outBuffer;
-  }
-
-  const ctx = requireContext();
-  const device = ctx.device;
-
-  const configBuf = getOrCreateConfigBuffer(device, batchSize, vocabSize);
-
-  const pipeline = getPipeline(
-    ctx,
-    "crossEntropyFwd",
-    crossEntropyForwardShader(),
-  );
-
-  const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [logitsBuffer, targetsBuffer, outBuffer, configBuf]);
-
-  trackBuffers(logitsBuffer, targetsBuffer, outBuffer);
-
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    batchSize,
+  ceFwdTileKernel.dispatch(
+    { logits: logitsBuffer, targets: targetsBuffer, loss: outBuffer },
+    { batch_size: batchSize, vocab_size: vocabSize },
   );
 
   return outBuffer;
@@ -328,35 +153,10 @@ export function dispatchCrossEntropyBackward(
   const outputSizeBytes = batchSize * vocabSize * 4; // f32
   const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
-  if (ceBwdTileKernel) {
-    ceBwdTileKernel.dispatch(
-      { logits: logitsBuffer, targets: targetsBuffer, grad_output: gradOutputBuffer,
-        grad_logits: outBuffer },
-      { batch_size: batchSize, vocab_size: vocabSize },
-    );
-    return outBuffer;
-  }
-
-  const ctx = requireContext();
-  const device = ctx.device;
-
-  const configBuf = getOrCreateConfigBuffer(device, batchSize, vocabSize);
-
-  const pipeline = getPipeline(
-    ctx,
-    "crossEntropyBwd",
-    crossEntropyBackwardShader(),
-  );
-
-  const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [logitsBuffer, targetsBuffer, gradOutputBuffer, outBuffer, configBuf]);
-
-  trackBuffers(logitsBuffer, targetsBuffer, gradOutputBuffer, outBuffer);
-
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    batchSize,
+  ceBwdTileKernel.dispatch(
+    { logits: logitsBuffer, targets: targetsBuffer, grad_output: gradOutputBuffer,
+      grad_logits: outBuffer },
+    { batch_size: batchSize, vocab_size: vocabSize },
   );
 
   return outBuffer;
@@ -366,7 +166,6 @@ export function dispatchCrossEntropyBackward(
  * Reset all module-local mutable state (pipeline cache, config buffer cache).
  */
 export function resetCrossEntropyKernelState(): void {
-  ceFwdTileKernel?.reset();
-  ceBwdTileKernel?.reset();
-  configCache.clear();
+  ceFwdTileKernel.reset();
+  ceBwdTileKernel.reset();
 }

@@ -47,8 +47,6 @@ import { computeFlatChunkLayout, dispatchFlatChunked } from "./chunked-dispatch"
 import { getTimestampWrites, getProfileModule } from "./profiler";
 import { binaryBroadcastTileIR, unaryStridedTileIR } from "./ops/ops-tile-ir";
 
-const USE_TILE_IR_ELEMENTWISE = typeof process !== "undefined" &&
-  process.env?.USE_TILE_IR_ELEMENTWISE === "1";
 import {
   computeBatchSize,
   computeBatchStrides,
@@ -153,136 +151,6 @@ export function dispatchElementwise(desc: {
   return outBuffer;
 }
 
-export function binaryBroadcastShader(
-  op: string,
-  indexShape: number[],
-  aStrides: number[],
-  bStrides: number[],
-  aOffset: number,
-  bOffset: number,
-  dtype: DType = "f32",
-  gridSizeX?: number,
-): string {
-  const indexing = buildBroadcastIndexing(indexShape, [aStrides, bStrides]);
-  const wgslType = dtypeToWgsl(dtype);
-  const enableF16 = dtype === "f16" ? "enable f16;\n" : "";
-  // Support 2D dispatch for large tensors
-  const use2D = gridSizeX !== undefined && gridSizeX > 0;
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-  return `${enableF16}
-struct Params {
-  size: u32,
-};
-
-@group(0) @binding(0) var<storage, read> a: array<${wgslType}>;
-@group(0) @binding(1) var<storage, read> b: array<${wgslType}>;
-@group(0) @binding(2) var<storage, read_write> out: array<${wgslType}>;
-@group(0) @binding(3) var<uniform> params: Params;
-
-${indexing.declarations}
-const A_OFFSET: u32 = ${aOffset}u;
-const B_OFFSET: u32 = ${bOffset}u;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.size) {
-    return;
-  }
-${indexing.compute}
-${indexing.offsets.join("\n")}
-  out[idx] = a[offset0 + A_OFFSET] ${op} b[offset1 + B_OFFSET];
-}
-`;
-}
-
-/**
- * Generate unary shader with stride support for non-contiguous tensors.
- */
-export function unaryStridedShader(
-  expr: string,
-  shape: number[],
-  strides: number[],
-  offset: number,
-  dtype: DType = "f32",
-  gridSizeX?: number,
-): string {
-  const rank = shape.length;
-  const wgslType = dtypeToWgsl(dtype);
-  const enableF16 = dtype === "f16" ? "enable f16;\n" : "";
-  // Use 2D indexing when gridSizeX > MAX_WORKGROUPS_PER_DIM
-  const use2D = gridSizeX !== undefined && gridSizeX >= MAX_WORKGROUPS_PER_DIM;
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-
-  if (rank === 0) {
-    // Scalar case
-    return `${enableF16}
-struct Params {
-  size: u32,
-};
-
-@group(0) @binding(0) var<storage, read> a: array<${wgslType}>;
-@group(0) @binding(1) var<storage, read_write> out: array<${wgslType}>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.size) {
-    return;
-  }
-  let x = a[${offset}u];
-  out[idx] = ${expr};
-}
-`;
-  }
-
-  const shapeArray = `array<u32, ${rank}>(${shape.map((s) => `${s}u`).join(", ")})`;
-  const stridesArray = `array<u32, ${rank}>(${strides.map((s) => `${s}u`).join(", ")})`;
-
-  return `${enableF16}
-struct Params {
-  size: u32,
-};
-
-@group(0) @binding(0) var<storage, read> a: array<${wgslType}>;
-@group(0) @binding(1) var<storage, read_write> out: array<${wgslType}>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-const RANK: u32 = ${rank}u;
-const SHAPE = ${shapeArray};
-const STRIDES = ${stridesArray};
-const OFFSET: u32 = ${offset}u;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.size) {
-    return;
-  }
-
-  // Convert flat index to strided offset
-  var remaining = idx;
-  var inputOffset = OFFSET;
-  for (var d = 0u; d < RANK; d = d + 1u) {
-    var dimSize = 1u;
-    for (var j = d + 1u; j < RANK; j = j + 1u) {
-      dimSize = dimSize * SHAPE[j];
-    }
-    let coord = remaining / dimSize;
-    remaining = remaining % dimSize;
-    inputOffset = inputOffset + coord * STRIDES[d];
-  }
-
-  let x = a[inputOffset];
-  out[idx] = ${expr};
-}
-`;
-}
 
 const FUSED_UNARY_OPS = new Map<string, (value: string) => string>([
   ["neg", (value) => `-(${value})`],
@@ -557,12 +425,7 @@ export function dispatchBinaryDirect(
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
-  const code = USE_TILE_IR_ELEMENTWISE && (dtype === "f32" || dtype === "f16")
-    ? binaryBroadcastTileIR(op, indexShape, aStrides, bStrides, a.offset, b.offset, dtype)
-    : binaryBroadcastShader(
-        op, indexShape, aStrides, bStrides, a.offset, b.offset, dtype,
-        use2D ? dispatch.gridSizeX : undefined,
-      );
+  const code = binaryBroadcastTileIR(op, indexShape, aStrides, bStrides, a.offset, b.offset, dtype);
   const key = `binary:${op}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${a.offset}:${b.offset}:${dtype}:${use2D ? dispatch.gridSizeX : "1d"}`;
   const bytesPerElement = dtypeBytes(dtype);
 
@@ -694,12 +557,7 @@ export function dispatchUnaryDirect(
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
-  const code = USE_TILE_IR_ELEMENTWISE && (dtype === "f32" || dtype === "f16")
-    ? unaryStridedTileIR(opKey, a.shape, a.strides, a.offset, dtype)
-    : unaryStridedShader(
-        expr, a.shape, a.strides, a.offset, dtype,
-        use2D ? dispatch.gridSizeX : undefined,
-      );
+  const code = unaryStridedTileIR(opKey, a.shape, a.strides, a.offset, dtype);
   const key = `unary:${opKey}:${a.shape.join("x")}:${a.strides.join(",")}:${a.offset}:${dtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   const bytesPerElement = dtypeBytes(dtype);
 

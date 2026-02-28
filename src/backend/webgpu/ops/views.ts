@@ -25,110 +25,6 @@ import { profileApiCall } from "../profiler";
 import { computeFlatChunkLayout, dispatchFlatChunked } from "../chunked-dispatch";
 import { castTileIR } from "./ops-tile-ir";
 
-const USE_TILE_IR_CAST = typeof process !== "undefined" &&
-  process.env?.USE_TILE_IR_CAST === "1";
-
-function castShader(
-  srcDtype: DType,
-  dstDtype: DType,
-  shape: number[],
-  strides: number[],
-  offset: number,
-  gridSizeX?: number,
-): string {
-  const rank = shape.length;
-  const srcWgsl = dtypeToWgsl(srcDtype);
-  const dstWgsl = dtypeToWgsl(dstDtype);
-  const enableF16 =
-    srcDtype === "f16" || dstDtype === "f16" ? "enable f16;\n" : "";
-  // Use 2D indexing when gridSizeX > MAX_WORKGROUPS_PER_DIM
-  const use2D = gridSizeX !== undefined && gridSizeX >= MAX_WORKGROUPS_PER_DIM;
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-
-  // Generate cast expression based on dtype pair
-  let castExpr: string;
-  if (srcDtype === dstDtype) {
-    castExpr = "x";
-  } else if (dstDtype === "f32") {
-    castExpr = "f32(x)";
-  } else if (dstDtype === "f16") {
-    castExpr = "f16(x)";
-  } else if (dstDtype === "i32") {
-    castExpr = "i32(x)";
-  } else if (dstDtype === "u32") {
-    castExpr = "u32(x)";
-  } else {
-    castExpr = `${dstWgsl}(x)`;
-  }
-
-  if (rank === 0) {
-    // Scalar case
-    return `${enableF16}
-struct Params {
-  size: u32,
-};
-
-@group(0) @binding(0) var<storage, read> a: array<${srcWgsl}>;
-@group(0) @binding(1) var<storage, read_write> out: array<${dstWgsl}>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.size) {
-    return;
-  }
-  let x = a[${offset}u];
-  out[idx] = ${castExpr};
-}
-`;
-  }
-
-  const shapeArray = `array<u32, ${rank}>(${shape.map((s) => `${s}u`).join(", ")})`;
-  const stridesArray = `array<u32, ${rank}>(${strides.map((s) => `${s}u`).join(", ")})`;
-
-  return `${enableF16}
-struct Params {
-  size: u32,
-};
-
-@group(0) @binding(0) var<storage, read> a: array<${srcWgsl}>;
-@group(0) @binding(1) var<storage, read_write> out: array<${dstWgsl}>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-const RANK: u32 = ${rank}u;
-const SHAPE = ${shapeArray};
-const STRIDES = ${stridesArray};
-const OFFSET: u32 = ${offset}u;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= params.size) {
-    return;
-  }
-
-  // Convert flat index to strided offset
-  var remaining = idx;
-  var inputOffset = OFFSET;
-  for (var d = 0u; d < RANK; d = d + 1u) {
-    var dimSize = 1u;
-    for (var j = d + 1u; j < RANK; j = j + 1u) {
-      dimSize = dimSize * SHAPE[j];
-    }
-    let coord = remaining / dimSize;
-    remaining = remaining % dimSize;
-    inputOffset = inputOffset + coord * STRIDES[d];
-  }
-
-  let x = a[inputOffset];
-  out[idx] = ${castExpr};
-}
-`;
-}
-
 /**
  * Cast tensor to a different dtype.
  * Returns same tensor if already the target dtype.
@@ -200,16 +96,7 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
-  const code = USE_TILE_IR_CAST
-    ? castTileIR(tensor.dtype as "f32" | "f16" | "i32" | "u32", dtype as "f32" | "f16" | "i32" | "u32", tensor.shape, tensor.strides, tensor.offset)
-    : castShader(
-        tensor.dtype,
-        dtype,
-        tensor.shape,
-        tensor.strides,
-        tensor.offset,
-        use2D ? dispatch.gridSizeX : undefined,
-      );
+  const code = castTileIR(tensor.dtype as "f32" | "f16" | "i32" | "u32", dtype as "f32" | "f16" | "i32" | "u32", tensor.shape, tensor.strides, tensor.offset);
   const key = `cast:${tensor.dtype}->${dtype}:${tensor.shape.join("x")}:${tensor.strides.join(",")}:${tensor.offset}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   const pipeline = getPipeline(ctx, key, code);
 

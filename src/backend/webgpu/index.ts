@@ -88,7 +88,6 @@ export { createTensor, createTrackedBuffer, createBufferWithData } from "./tenso
 
 export {
   dispatchComputePass, dispatchElementwise,
-  binaryBroadcastShader, unaryStridedShader,
   getPipeline,
   dispatchBinary, dispatchBinaryDirect, dispatchBinaryChunked,
   dispatchUnary, dispatchUnaryDirect, dispatchUnaryChunked,

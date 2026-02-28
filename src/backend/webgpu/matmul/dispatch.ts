@@ -14,9 +14,7 @@ export function setMatmulRecordingBuffer(buf: RecordedDispatch[] | null): void {
 import {
   type CodegenOptions,
   type EpilogueConfig,
-  generateTiledMatmulShader,
   getShaderCacheKey,
-  generateKSplitReductionShader,
   getKSplitReductionCacheKey,
 } from "./codegen";
 import {
@@ -24,7 +22,6 @@ import {
   generateKSplitReductionShaderTileIR,
 } from "./tile-matmul";
 
-const USE_TILE_IR_MATMUL = process.env.TORCHLETTE_TILE_MATMUL !== "0";
 import {
   classifyShape,
   DEFAULT_CONFIG,
@@ -478,9 +475,7 @@ function getOrCreatePipeline(
     return warmed;
   }
 
-  const shaderCode = USE_TILE_IR_MATMUL
-    ? generateTiledMatmulShaderTileIR(options)
-    : generateTiledMatmulShader(options);
+  const shaderCode = generateTiledMatmulShaderTileIR(options);
   recordPipeline(cacheKey, shaderCode);
   const module = device.createShaderModule({ code: shaderCode });
   const pipeline = device.createComputePipeline({
@@ -675,9 +670,7 @@ function getOrCreateReductionPipeline(
     return warmed;
   }
 
-  const shaderCode = USE_TILE_IR_MATMUL
-    ? generateKSplitReductionShaderTileIR(kSplitCount, outputDtype)
-    : generateKSplitReductionShader(kSplitCount, outputDtype);
+  const shaderCode = generateKSplitReductionShaderTileIR(kSplitCount, outputDtype);
   recordPipeline(cacheKey, shaderCode);
   const module = device.createShaderModule({ code: shaderCode });
   const pipeline = device.createComputePipeline({
