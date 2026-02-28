@@ -314,9 +314,10 @@ export function argReduceWGSL(
 // ============================================================================
 
 /**
- * Generate WGSL for broadcast where: out[idx] = cond ? x : y
+ * Build a TileKernelSpec for broadcast where: out[idx] = cond ? x : y
+ * Used by both direct dispatch (compiled to WGSL) and chunked dispatch.
  */
-export function whereWGSL(
+export function whereSpec(
   indexShape: number[],
   condStrides: number[],
   xStrides: number[],
@@ -324,8 +325,8 @@ export function whereWGSL(
   condOffset: number,
   xOffset: number,
   yOffset: number,
-): string {
-  const spec: TileKernelSpec = {
+): TileKernelSpec {
+  return {
     name: "where",
     workgroupSize: WG,
     bindings: {
@@ -352,7 +353,21 @@ export function whereWGSL(
       ctx.emitStore("out", idx, result);
     },
   };
-  return compileTileKernel(spec);
+}
+
+/**
+ * Generate WGSL for broadcast where: out[idx] = cond ? x : y
+ */
+export function whereWGSL(
+  indexShape: number[],
+  condStrides: number[],
+  xStrides: number[],
+  yStrides: number[],
+  condOffset: number,
+  xOffset: number,
+  yOffset: number,
+): string {
+  return compileTileKernel(whereSpec(indexShape, condStrides, xStrides, yStrides, condOffset, xOffset, yOffset));
 }
 
 // ============================================================================
@@ -365,10 +380,10 @@ const WGSL_OP_TO_FUSION: Record<string, string> = {
 };
 
 /**
- * Generate WGSL for a binary broadcast op via tile-IR.
- * Drop-in replacement for binaryBroadcastShader() in dispatch.ts.
+ * Build a TileKernelSpec for a binary broadcast op.
+ * Used by both direct dispatch (compiled to WGSL) and chunked dispatch.
  */
-export function binaryBroadcastTileIR(
+export function binaryBroadcastSpec(
   op: string,
   indexShape: number[],
   aStrides: number[],
@@ -376,11 +391,11 @@ export function binaryBroadcastTileIR(
   aOffset: number,
   bOffset: number,
   dtype: DataType,
-): string {
+): TileKernelSpec {
   const fusionOp = WGSL_OP_TO_FUSION[op];
-  if (!fusionOp) throw new Error(`binaryBroadcastTileIR: unsupported op "${op}"`);
+  if (!fusionOp) throw new Error(`binaryBroadcastSpec: unsupported op "${op}"`);
 
-  const spec: TileKernelSpec = {
+  return {
     name: `binary_${fusionOp}`,
     workgroupSize: WG,
     enableF16: dtype === "f16",
@@ -404,7 +419,22 @@ export function binaryBroadcastTileIR(
       ctx.emitStore("out", idx, result);
     },
   };
-  return compileTileKernel(spec);
+}
+
+/**
+ * Generate WGSL for a binary broadcast op via tile-IR.
+ * Drop-in replacement for binaryBroadcastShader() in dispatch.ts.
+ */
+export function binaryBroadcastTileIR(
+  op: string,
+  indexShape: number[],
+  aStrides: number[],
+  bStrides: number[],
+  aOffset: number,
+  bOffset: number,
+  dtype: DataType,
+): string {
+  return compileTileKernel(binaryBroadcastSpec(op, indexShape, aStrides, bStrides, aOffset, bOffset, dtype));
 }
 
 // ============================================================================
@@ -412,19 +442,17 @@ export function binaryBroadcastTileIR(
 // ============================================================================
 
 /**
- * Generate WGSL for a strided unary op via tile-IR.
- * Drop-in replacement for unaryStridedShader() in dispatch.ts.
- *
- * @param opKey - Fusion op name (e.g. "sqrt", "relu", "neg", "tanh", etc.)
+ * Build a TileKernelSpec for a strided unary op.
+ * Used by both direct dispatch (compiled to WGSL) and chunked dispatch.
  */
-export function unaryStridedTileIR(
+export function unaryStridedSpec(
   opKey: string,
   shape: number[],
   strides: number[],
   offset: number,
   dtype: DataType,
-): string {
-  const spec: TileKernelSpec = {
+): TileKernelSpec {
+  return {
     name: `unary_${opKey}`,
     workgroupSize: WG,
     enableF16: dtype === "f16",
@@ -444,7 +472,22 @@ export function unaryStridedTileIR(
       ctx.emitStore("out", idx, result);
     },
   };
-  return compileTileKernel(spec);
+}
+
+/**
+ * Generate WGSL for a strided unary op via tile-IR.
+ * Drop-in replacement for unaryStridedShader() in dispatch.ts.
+ *
+ * @param opKey - Fusion op name (e.g. "sqrt", "relu", "neg", "tanh", etc.)
+ */
+export function unaryStridedTileIR(
+  opKey: string,
+  shape: number[],
+  strides: number[],
+  offset: number,
+  dtype: DataType,
+): string {
+  return compileTileKernel(unaryStridedSpec(opKey, shape, strides, offset, dtype));
 }
 
 // ============================================================================
@@ -452,20 +495,19 @@ export function unaryStridedTileIR(
 // ============================================================================
 
 /**
- * Generate WGSL for a strided dtype cast via tile-IR.
- * Drop-in replacement for castShader() in views.ts.
+ * Build a TileKernelSpec for a strided dtype cast.
+ * Used by both direct dispatch (compiled to WGSL) and chunked dispatch.
  */
-export function castTileIR(
+export function castSpec(
   srcDtype: DataType,
   dstDtype: DataType,
   shape: number[],
   strides: number[],
   offset: number,
-): string {
-  // Map dst dtype to the cast op name used by applyFusedOp
+): TileKernelSpec {
   const castOp = `cast_${dstDtype}`;
 
-  const spec: TileKernelSpec = {
+  return {
     name: `cast_${srcDtype}_${dstDtype}`,
     workgroupSize: WG,
     enableF16: srcDtype === "f16" || dstDtype === "f16",
@@ -485,7 +527,20 @@ export function castTileIR(
       ctx.emitStore("out", idx, result);
     },
   };
-  return compileTileKernel(spec);
+}
+
+/**
+ * Generate WGSL for a strided dtype cast via tile-IR.
+ * Drop-in replacement for castShader() in views.ts.
+ */
+export function castTileIR(
+  srcDtype: DataType,
+  dstDtype: DataType,
+  shape: number[],
+  strides: number[],
+  offset: number,
+): string {
+  return compileTileKernel(castSpec(srcDtype, dstDtype, shape, strides, offset));
 }
 
 // ============================================================================
@@ -869,4 +924,53 @@ function contiguousStridesForShape(shape: number[]): number[] {
     strides.push(stride);
   }
   return strides;
+}
+
+// ============================================================================
+// Flat Contiguous Copy / Add Specs (for chunked strided-scatter paths)
+// ============================================================================
+
+/**
+ * TileKernelSpec for a flat contiguous copy: out[idx] = src[idx].
+ * Used by chunked stridedScatterCopy when both src and dest are contiguous.
+ */
+export function flatCopySpec(): TileKernelSpec {
+  return {
+    name: "flatCopy",
+    workgroupSize: WG,
+    bindings: {
+      src: { storage: "read", type: "f32" },
+      out: { storage: "read_write", type: "f32" },
+    },
+    uniforms: { size: "u32" },
+    grid: elementwiseGrid(WG, { elementUniform: "size" }),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      ctx.emitStore("out", idx, ctx.load("src", idx));
+    },
+  };
+}
+
+/**
+ * TileKernelSpec for a flat contiguous add: out[idx] = base[idx] + src[idx].
+ * Used by chunked stridedScatterAdd when both base and src are contiguous.
+ */
+export function flatAddSpec(): TileKernelSpec {
+  return {
+    name: "flatAdd",
+    workgroupSize: WG,
+    bindings: {
+      base: { storage: "read", type: "f32" },
+      src: { storage: "read", type: "f32" },
+      out: { storage: "read_write", type: "f32" },
+    },
+    uniforms: { size: "u32" },
+    grid: elementwiseGrid(WG, { elementUniform: "size" }),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      ctx.emitStore("out", idx, ctx.load("base", idx).add(ctx.load("src", idx)));
+    },
+  };
 }
