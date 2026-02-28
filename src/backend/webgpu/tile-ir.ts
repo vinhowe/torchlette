@@ -2362,6 +2362,36 @@ export class KernelContext {
     this.guardedStore(binding, idx.lt(size), idx, val);
   }
 
+  /**
+   * Map a flat index through a strided layout (like Triton's pointer arithmetic).
+   * Combines `decomposeIndex` + `linearizeIndex` into one call.
+   *
+   * Common pattern it replaces:
+   *   const coords = ctx.decomposeIndex(idx, shape);
+   *   const offset = ctx.linearizeIndex(coords, strides, baseOffset);
+   *
+   * @param flatIdx     - Flat linear index to remap
+   * @param indexShape  - Shape to decompose against (the "logical" shape)
+   * @param strides     - Strides for re-linearization
+   * @param baseOffset  - Base offset (default: 0)
+   */
+  stridedIndex(flatIdx: BlockExpr, indexShape: number[], strides: number[], baseOffset = 0): BlockExpr {
+    const coords = this.decomposeIndex(flatIdx, indexShape);
+    return this.linearizeIndex(coords, strides, baseOffset);
+  }
+
+  /**
+   * Iterate over a range [start, end) with constant bounds (like `for i in range(n)`).
+   * Sugar over `forRange` that accepts numbers instead of BlockExprs.
+   *
+   * @param start - Start value (inclusive)
+   * @param end   - End value (exclusive), or the body if start=0
+   * @param body  - Loop body receiving the iteration variable
+   */
+  range(start: number, end: number, body: (i: BlockExpr) => void): void {
+    this.forRange(this.u32(start), this.u32(end), body);
+  }
+
   // -- Scan primitives (like `tl.cumsum`, `tl.associative_scan`) --
 
   /** Hillis-Steele inclusive parallel prefix scan in shared memory.
