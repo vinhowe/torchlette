@@ -8,6 +8,7 @@ import {
   beginSharedEncoder,
   endSharedEncoder,
   setAdamBatchMode,
+  setCurrentOpLabel,
 } from "../backend/webgpu";
 import { isProfilingEnabled, setProfileModule, recordFusionFallback } from "../backend/webgpu/profiler";
 import {
@@ -184,6 +185,9 @@ export async function executeFusedWebGPU(
   try {
     // Set module context for profiling from the output node
     setProfileModule(group.outputNode.module ?? "unknown");
+    // Build a label from the group's unique op names (e.g. "add+mul+relu")
+    const fusionLabel = [...new Set(group.nodes.map(n => n.op))].join("+");
+    setCurrentOpLabel(fusionLabel);
     // Dispatch the fused kernel
     const result = dispatchFusedKernel(device, recipe, inputs, {
       vectorize: enableVectorization,
@@ -242,6 +246,8 @@ export async function executeFusedWebGPU(
       if (temp.destroy) temp.destroy();
     }
 
+    setCurrentOpLabel(null);
+
     // Re-execute intermediates that are consumed outside the group but
     // couldn't be promoted to additional outputs (shape mismatch / binding limit).
     // The fused kernel computed the chain inline; we re-execute just the needed
@@ -254,6 +260,7 @@ export async function executeFusedWebGPU(
     for (const temp of tempContiguousCopies) {
       if (temp.destroy) temp.destroy();
     }
+    setCurrentOpLabel(null);
     // Fusion failed - fall back to sequential
     recordFusionFallback("exception", group.nodes.length, { error: String(e) });
     console.warn("Fusion dispatch failed, falling back to sequential:", e);
