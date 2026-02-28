@@ -4,7 +4,8 @@
  * Each op handles both the normal (direct) and chunked paths internally,
  * branching at the dispatch level after shared setup (shapes, strides, shader).
  */
-import type { BackendTensor, GatherOptions, ScatterAddOptions } from "../../types";
+import type { BackendTensor, CatOptions, GatherOptions, ScatterAddOptions } from "../../types";
+import { sizeOf } from "../../../core/shape";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
 import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import { WORKGROUP_SIZE, compute2DDispatch, contiguousStrides, wgslArray } from "../shape-utils";
@@ -300,4 +301,56 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 
   return createTensor(outShape, outBuffer);
+}
+
+/**
+ * Concatenate tensors along an existing dimension.
+ * Uses copyBufferToBuffer for efficient GPU-side data movement.
+ */
+export function cat(tensors: BackendTensor[], options: CatOptions): BackendTensor {
+  if (tensors.length === 0) throw new Error("cat: empty tensor list");
+  if (tensors.length === 1) return tensors[0];
+
+  const ctx = requireContext();
+  const gpuTensors = tensors.map(t => asGPUTensor(t));
+  const bytesPerElement = gpuTensors[0].dtype === "f16" ? 2 : 4;
+
+  // Compute output shape
+  const dim = options.dim;
+  const rank = gpuTensors[0].shape.length;
+  const outShape = gpuTensors[0].shape.slice();
+  for (let i = 1; i < gpuTensors.length; i++) {
+    outShape[dim] += gpuTensors[i].shape[dim];
+  }
+  const outSize = sizeOf(outShape);
+  const outBuffer = resolveOutputBuffer(
+    ctx.device, outSize * bytesPerElement,
+    gpuTensors.map(t => t.buffer),
+  );
+
+  // Compute outer/inner sizes for strided copy
+  const innerSize = dim === rank - 1 ? 1 : sizeOf(outShape.slice(dim + 1));
+  const outerSize = dim === 0 ? 1 : sizeOf(outShape.slice(0, dim));
+  const outDimSize = outShape[dim];
+
+  const enc = getSharedEncoderInstance();
+  let dimOffset = 0;
+  for (const t of gpuTensors) {
+    const tDimSize = t.shape[dim];
+    const copyBytes = tDimSize * innerSize * bytesPerElement;
+    for (let o = 0; o < outerSize; o++) {
+      const srcByteOffset = o * tDimSize * innerSize * bytesPerElement;
+      const dstByteOffset = (o * outDimSize + dimOffset) * innerSize * bytesPerElement;
+      if (enc) {
+        enc.copyBufferToBuffer(t.buffer, srcByteOffset, outBuffer, dstByteOffset, copyBytes);
+      } else {
+        const cmdEnc = ctx.device.createCommandEncoder();
+        cmdEnc.copyBufferToBuffer(t.buffer, srcByteOffset, outBuffer, dstByteOffset, copyBytes);
+        submitOrCollect(cmdEnc.finish());
+      }
+    }
+    dimOffset += tDimSize;
+  }
+
+  return createTensor(outShape, outBuffer, undefined, 0, gpuTensors[0].dtype as any);
 }

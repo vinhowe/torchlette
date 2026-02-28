@@ -20,6 +20,7 @@ export type LazyOpCode =
   | "contiguous"
   | "gather"
   | "scatterAdd"
+  | "cat"
   | "sum"
   | "mean"
   | "max"

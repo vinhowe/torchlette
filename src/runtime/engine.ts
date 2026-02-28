@@ -3,6 +3,7 @@ import {
   type ArgReduceOptions,
   type Backend,
   type BackendTensor,
+  type CatOptions,
   computeContiguousStrides,
   type DeviceKind,
   type DivOptions,
@@ -1646,6 +1647,29 @@ export class RuntimeEngine {
       options,
     );
     return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
+  }
+
+  cat(tensors: Tensor[], options?: CatOptions): Tensor {
+    if (tensors.length === 0) throw new Error("cat: empty tensor list");
+    const dim = options?.dim ?? 0;
+    const rank = tensors[0].shape.length;
+    const d = dim < 0 ? dim + rank : dim;
+    // Compute output shape
+    const outShape = tensors[0].shape.slice();
+    for (let i = 1; i < tensors.length; i++) {
+      outShape[d] += tensors[i].shape[d];
+    }
+    const device = tensors[0].device;
+    const dtype = tensors[0].dtype;
+    const node = createLazyIRNode(
+      "cat",
+      tensors.map(t => t.lazyRef),
+      outShape,
+      dtype,
+      device,
+      { dim: d } satisfies CatOptions,
+    );
+    return this.createAndTrack(createBaseId(), createPendingRef(node), outShape, device, dtype);
   }
 
   sum(a: Tensor, options?: SumOptions): Tensor {

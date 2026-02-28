@@ -147,6 +147,10 @@ export type ScatterAddOptions = {
   dim: number;
 };
 
+export type CatOptions = {
+  dim: number;
+};
+
 export type TransposeOptions = {
   dim0: number;
   dim1: number;
@@ -288,6 +292,8 @@ export interface BackendOps {
     src: BackendTensor,
     options: ScatterAddOptions,
   ): BackendTensor;
+  /** Concatenate tensors along an existing dimension. */
+  cat?(tensors: BackendTensor[], options: CatOptions): BackendTensor;
   /** Sum reduction. Returns 0-d tensor for full reduction (no dim). */
   sum(a: BackendTensor, options?: SumOptions): BackendTensor;
   /** Max reduction. Returns 0-d tensor for full reduction (no dim). */
