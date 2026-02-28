@@ -1,5 +1,5 @@
-import { normalizeDim, type Backend, type BackendTensor } from "../backend/types";
-import type { LazyIRNode } from "./lazy-types";
+import { normalizeDim, type Backend, type BackendTensor, type DType } from "../backend/types";
+import type { LazyIRNode, LazyRef } from "./lazy-types";
 import { createStorageHandle } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
 import { shapesEqual } from "./matmul-epilogue";
@@ -137,4 +137,191 @@ export async function executeReductionWithPreamble(
 
   // Store result on the reduction node
   plan.reductionNode.result = createStorageHandle(plan.reductionNode.device, resultTensor);
+}
+
+// ============================================================================
+// Reduction Epilogue Fusion (Phase 4)
+// Detects sum/mean/max → elementwise chain patterns and fuses them into a
+// single kernel, eliminating intermediate buffers between reduction and
+// subsequent elementwise ops. Mirrors matmul epilogue detection.
+// ============================================================================
+
+/** Describes a single epilogue op to apply after the reduction. */
+export type ReductionEpilogueOp = {
+  kind: string;
+  toDtype?: DType;
+  inputIndex?: number;
+  op?: string;
+};
+
+export interface ReductionEpiloguePlan {
+  /** The reduction node (sum, mean, or max) */
+  reductionNode: LazyIRNode;
+  /** Epilogue operations to fuse after the reduction */
+  epilogueOps: ReductionEpilogueOp[];
+  /** Additional inputs required by epilogue binary ops */
+  epilogueInputRefs: LazyRef[];
+  /** Output dtype after epilogue chain */
+  outputDtype: DType;
+  /** The final output node in the chain */
+  outputNode: LazyIRNode;
+  /** Total nodes consumed (reduction + epilogue ops) */
+  consumedCount: number;
+}
+
+/**
+ * Detect a reduction → elementwise chain pattern suitable for epilogue fusion.
+ *
+ * Starting from a sum/mean/max node, walks forward through single-consumer
+ * elementwise ops that can be applied in-register after the reduction.
+ */
+export function detectReductionEpilogue(
+  nodes: LazyIRNode[],
+  startIdx: number,
+  consumerCount: Map<number, number>,
+  externalNodeIds?: Set<number>,
+): ReductionEpiloguePlan | null {
+  const reductionNode = nodes[startIdx];
+  if (reductionNode.op !== "sum" && reductionNode.op !== "mean" && reductionNode.op !== "max") {
+    return null;
+  }
+
+  const epilogueOps: ReductionEpilogueOp[] = [];
+  const epilogueInputRefs: LazyRef[] = [];
+  let additionalInputCount = 0;
+  let chainLength = 0;
+  let currentNode = reductionNode;
+  let outputDtype = reductionNode.dtype;
+
+  for (let i = startIdx + 1; i < nodes.length && chainLength < 4; i++) {
+    const nextNode = nodes[i];
+    if (nextNode.inputs.length === 0) break;
+
+    // Check that the candidate's input is a pending ref to the current chain node
+    let chainInputIdx = 0;
+    const primaryInput = nextNode.inputs[0];
+    if (primaryInput.kind !== "pending" || primaryInput.node.id !== currentNode.id) {
+      // For commutative binary ops, check inputs[1]
+      if ((nextNode.op === "add" || nextNode.op === "mul") && nextNode.inputs.length === 2) {
+        const altInput = nextNode.inputs[1];
+        if (altInput.kind === "pending" && altInput.node.id === currentNode.id) {
+          chainInputIdx = 1;
+        } else {
+          break;
+        }
+      } else {
+        break;
+      }
+    }
+
+    // Current chain node must have exactly 1 consumer and not be external
+    if (externalNodeIds?.has(currentNode.id)) break;
+    const consumers = consumerCount.get(currentNode.id) ?? 0;
+    if (consumers > 1) break;
+
+    // Match the op type (same patterns as matmul epilogue)
+    let matched = false;
+
+    if (nextNode.op === "cast") {
+      const payload = nextNode.payload as { dtype: DType } | undefined;
+      if (payload) {
+        epilogueOps.push({ kind: "cast", toDtype: payload.dtype });
+        outputDtype = payload.dtype;
+        matched = true;
+      }
+    } else if ((nextNode.op === "add" || nextNode.op === "mul") && nextNode.inputs.length === 2) {
+      if (additionalInputCount >= 4) break;
+      const secondInput = nextNode.inputs[chainInputIdx === 0 ? 1 : 0];
+      // The external input must have the same shape as the reduction output
+      // (it gets indexed at the output position)
+      let secondShape: number[] | undefined;
+      if (secondInput.kind === "materialized") {
+        secondShape = secondInput.storage.backendTensor.shape;
+      } else if (secondInput.kind === "pending") {
+        secondShape = secondInput.node.shape;
+      }
+      if (secondShape && !shapesEqual(secondShape, currentNode.shape)) break;
+
+      epilogueOps.push({ kind: "binary", op: nextNode.op, inputIndex: additionalInputCount });
+      epilogueInputRefs.push(secondInput);
+      additionalInputCount++;
+      matched = true;
+    } else if (
+      nextNode.op === "relu" || nextNode.op === "silu" || nextNode.op === "sigmoid" ||
+      nextNode.op === "tanh" || nextNode.op === "neg" || nextNode.op === "abs" ||
+      nextNode.op === "exp" || nextNode.op === "log" || nextNode.op === "sqrt"
+    ) {
+      epilogueOps.push({ kind: "unary", op: nextNode.op });
+      matched = true;
+    } else if (nextNode.op === "gelu") {
+      const geluPayload = nextNode.payload as { approximate?: string } | undefined;
+      if (geluPayload?.approximate === "tanh") {
+        epilogueOps.push({ kind: "gelu" });
+      } else {
+        epilogueOps.push({ kind: "unary", op: "gelu_erf" });
+      }
+      matched = true;
+    }
+
+    if (!matched) break;
+
+    chainLength++;
+    currentNode = nextNode;
+    outputDtype = nextNode.dtype || outputDtype;
+  }
+
+  if (chainLength === 0) return null;
+
+  return {
+    reductionNode,
+    epilogueOps,
+    epilogueInputRefs,
+    outputDtype,
+    outputNode: currentNode,
+    consumedCount: 1 + chainLength,
+  };
+}
+
+/**
+ * Execute a fused reduction-with-epilogue operation.
+ */
+export async function executeReductionWithEpilogue(
+  plan: ReductionEpiloguePlan,
+  backend: Backend,
+): Promise<void> {
+  const { sumWithEpilogue, maxWithEpilogue, meanWithEpilogue } = await import("../backend/webgpu/index");
+
+  // Resolve reduction input
+  const reductionInputStorage = getInputStorage(plan.reductionNode.inputs[0], backend);
+  const reductionInputTensor = reductionInputStorage.backendTensor;
+
+  // Resolve epilogue external inputs
+  const epilogueInputTensors = plan.epilogueInputRefs.map(
+    ref => getInputStorage(ref, backend).backendTensor,
+  );
+
+  const payload = plan.reductionNode.payload as
+    | { dim?: number | number[] | null; keepdim?: boolean }
+    | undefined;
+
+  let resultTensor: BackendTensor;
+  if (plan.reductionNode.op === "max") {
+    resultTensor = maxWithEpilogue(
+      reductionInputTensor, payload ?? {},
+      plan.epilogueOps, epilogueInputTensors, plan.outputDtype,
+    );
+  } else if (plan.reductionNode.op === "mean") {
+    resultTensor = meanWithEpilogue(
+      reductionInputTensor, payload ?? {},
+      plan.epilogueOps, epilogueInputTensors, plan.outputDtype,
+    );
+  } else {
+    resultTensor = sumWithEpilogue(
+      reductionInputTensor, payload ?? {},
+      plan.epilogueOps, epilogueInputTensors, plan.outputDtype,
+    );
+  }
+
+  // Store result on the FINAL output node (not the reduction node)
+  plan.outputNode.result = createStorageHandle(plan.outputNode.device, resultTensor);
 }
