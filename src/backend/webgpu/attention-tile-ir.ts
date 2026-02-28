@@ -163,8 +163,8 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
 
           let sVal = sPartial.get();
           if (useSg) {
-            sVal = ctx.emitLet("_s1", sVal.add(sVal.subgroupShuffleXor(1)));
-            sVal = ctx.emitLet("_s2", sVal.add(sVal.subgroupShuffleXor(2)));
+            sVal = sVal.add(sVal.subgroupShuffleXor(1));
+            sVal = sVal.add(sVal.subgroupShuffleXor(2));
           }
           const s = sVal.mul(scale);
           const score = isActive.select(s, ctx.f32(-3.402823e+38));
@@ -408,8 +408,8 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
 
           let sVal = sPartial.get();
           if (useSg) {
-            sVal = ctx.emitLet("_s1", sVal.add(sVal.subgroupShuffleXor(1)));
-            sVal = ctx.emitLet("_s2", sVal.add(sVal.subgroupShuffleXor(2)));
+            sVal = sVal.add(sVal.subgroupShuffleXor(1));
+            sVal = sVal.add(sVal.subgroupShuffleXor(2));
           }
           const s = sVal.mul(scale);
           const p = isActive.select(s.sub(lVar.get()).exp(), ctx.f32(0));
@@ -424,8 +424,8 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
 
           let dovVal = dovPartial.get();
           if (useSg) {
-            dovVal = ctx.emitLet("_dv1", dovVal.add(dovVal.subgroupShuffleXor(1)));
-            dovVal = ctx.emitLet("_dv2", dovVal.add(dovVal.subgroupShuffleXor(2)));
+            dovVal = dovVal.add(dovVal.subgroupShuffleXor(1));
+            dovVal = dovVal.add(dovVal.subgroupShuffleXor(2));
           }
 
           const ds = p.mul(dovVal.sub(dVar.get()));
@@ -601,8 +601,8 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
 
             let sVal = sPartial.get();
             if (useSg) {
-              sVal = ctx.emitLet("_s1", sVal.add(sVal.subgroupShuffleXor(1)));
-              sVal = ctx.emitLet("_s2", sVal.add(sVal.subgroupShuffleXor(2)));
+              sVal = sVal.add(sVal.subgroupShuffleXor(1));
+              sVal = sVal.add(sVal.subgroupShuffleXor(2));
             }
             const s = sVal.mul(scale);
             const p = isActive.select(s.sub(lTile.read(j)).exp(), ctx.f32(0));
@@ -617,8 +617,8 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
 
             let dovVal = dovPartial.get();
             if (useSg) {
-              dovVal = ctx.emitLet("_dv1", dovVal.add(dovVal.subgroupShuffleXor(1)));
-              dovVal = ctx.emitLet("_dv2", dovVal.add(dovVal.subgroupShuffleXor(2)));
+              dovVal = dovVal.add(dovVal.subgroupShuffleXor(1));
+              dovVal = dovVal.add(dovVal.subgroupShuffleXor(2));
             }
 
             const ds = p.mul(dovVal.sub(dTile.read(j)));
