@@ -5,7 +5,7 @@
 import type { BackendTensor } from "../../types";
 import type { GPUDevice, WebGPUTensor } from "../gpu-types";
 import { asGPUTensor } from "../gpu-types";
-import { sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch } from "../shape-utils";
+import { sizeOf, WORKGROUP_SIZE, compute2DDispatch } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { createTensor } from "../tensor";
@@ -17,72 +17,8 @@ import {
 } from "../bind-group-cache";
 import { ensureContiguous } from "./views";
 import { computeFlatChunkLayout, dispatchFlatChunked } from "../chunked-dispatch";
+import { stridedScatterCopyTileIR, stridedScatterAddTileIR } from "./ops-tile-ir";
 
-function stridedScatterCopyShader(
-  baseSize: number,
-  viewShape: number[],
-  viewStrides: number[],
-  viewOffset: number,
-  srcStrides: number[],
-  srcOffset: number,
-  gridSizeX?: number,
-): string {
-  const rank = viewShape.length;
-  const viewSize = viewShape.reduce((a, b) => a * b, 1);
-  // Use 2D indexing when gridSizeX > MAX_WORKGROUPS_PER_DIM
-  const use2D = gridSizeX !== undefined && gridSizeX >= MAX_WORKGROUPS_PER_DIM;
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-
-  // Build coordinate calculation code
-  let coordCode = "";
-  let baseOffsetCode = `var baseOffset: u32 = ${viewOffset}u;\n`;
-  let srcOffsetCode = `var srcOffset: u32 = ${srcOffset}u;\n`;
-
-  for (let d = 0; d < rank; d++) {
-    const shapeStride = viewShape.slice(d + 1).reduce((a, b) => a * b, 1);
-    coordCode += `    let coord${d} = (remainder / ${shapeStride}u) % ${viewShape[d]}u;\n`;
-    if (d < rank - 1) {
-      coordCode += `    remainder = remainder % ${shapeStride}u;\n`;
-    }
-    baseOffsetCode += `    baseOffset += coord${d} * ${viewStrides[d]}u;\n`;
-    srcOffsetCode += `    srcOffset += coord${d} * ${srcStrides[d]}u;\n`;
-  }
-
-  return `
-struct Params {
-  baseSize: u32,
-  viewSize: u32,
-};
-
-@group(0) @binding(0) var<storage, read> base: array<f32>;
-@group(0) @binding(1) var<storage, read> src: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-
-  // First pass: copy base to output (all threads that fit in baseSize)
-  if (idx < params.baseSize) {
-    out[idx] = base[idx];
-  }
-
-  workgroupBarrier();
-
-  // Second pass: scatter src values into output at view positions
-  if (idx < params.viewSize) {
-    var remainder = idx;
-${coordCode}
-${baseOffsetCode}
-${srcOffsetCode}
-    out[baseOffset] = src[srcOffset];
-  }
-}
-`;
-}
 
 /**
  * Copy src values into base tensor at positions defined by view metadata.
@@ -190,16 +126,7 @@ function stridedScatterCopyDirect(
   const srcStrides = srcTensor.strides;
   const srcOffset = srcTensor.offset;
 
-  const code = stridedScatterCopyShader(
-    baseSize,
-    viewShape,
-    viewStrides,
-    offset,
-    srcStrides,
-    srcOffset,
-    use2D ? dispatch.gridSizeX : undefined,
-  );
-
+  const code = stridedScatterCopyTileIR(baseSize, viewShape, viewStrides, offset, srcStrides, srcOffset);
   const key = `stridedScatterCopy:${baseSize}:${viewShape.join("x")}:${viewStrides.join(",")}:${offset}:${srcStrides.join(",")}:${srcOffset}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   const pipeline = getPipeline(ctx, key, code);
 
@@ -291,75 +218,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   return createTensor(baseTensor.shape, outBuffer);
 }
 
-/**
- * Generate shader for strided scatter add.
- * Adds src values into base tensor at positions defined by view strides.
- */
-function stridedScatterAddShader(
-  baseSize: number,
-  viewShape: number[],
-  viewStrides: number[],
-  viewOffset: number,
-  srcStrides: number[],
-  srcOffset: number,
-  gridSizeX?: number,
-): string {
-  const rank = viewShape.length;
-  const viewSize = viewShape.reduce((a, b) => a * b, 1);
-  // Use 2D indexing when gridSizeX > MAX_WORKGROUPS_PER_DIM
-  const use2D = gridSizeX !== undefined && gridSizeX >= MAX_WORKGROUPS_PER_DIM;
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
-
-  // Build coordinate calculation code
-  let coordCode = "";
-  let baseOffsetCode = `var baseOffset: u32 = ${viewOffset}u;\n`;
-  let srcOffsetCode = `var srcOffset: u32 = ${srcOffset}u;\n`;
-
-  for (let d = 0; d < rank; d++) {
-    const shapeStride = viewShape.slice(d + 1).reduce((a, b) => a * b, 1);
-    coordCode += `    let coord${d} = (remainder / ${shapeStride}u) % ${viewShape[d]}u;\n`;
-    if (d < rank - 1) {
-      coordCode += `    remainder = remainder % ${shapeStride}u;\n`;
-    }
-    baseOffsetCode += `    baseOffset += coord${d} * ${viewStrides[d]}u;\n`;
-    srcOffsetCode += `    srcOffset += coord${d} * ${srcStrides[d]}u;\n`;
-  }
-
-  return `
-struct Params {
-  baseSize: u32,
-  viewSize: u32,
-};
-
-@group(0) @binding(0) var<storage, read> base: array<f32>;
-@group(0) @binding(1) var<storage, read> src: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-
-  // First pass: copy base to output
-  if (idx < params.baseSize) {
-    out[idx] = base[idx];
-  }
-
-  workgroupBarrier();
-
-  // Second pass: add src values into output at view positions
-  if (idx < params.viewSize) {
-    var remainder = idx;
-${coordCode}
-${baseOffsetCode}
-${srcOffsetCode}
-    out[baseOffset] = out[baseOffset] + src[srcOffset];
-  }
-}
-`;
-}
 
 /**
  * Add src values into base tensor at positions defined by view metadata.
@@ -464,16 +322,7 @@ function stridedScatterAddDirect(
   const srcStrides = srcTensor.strides;
   const srcOffset = srcTensor.offset;
 
-  const code = stridedScatterAddShader(
-    baseSize,
-    viewShape,
-    viewStrides,
-    offset,
-    srcStrides,
-    srcOffset,
-    use2D ? dispatch.gridSizeX : undefined,
-  );
-
+  const code = stridedScatterAddTileIR(baseSize, viewShape, viewStrides, offset, srcStrides, srcOffset);
   const key = `stridedScatterAdd:${baseSize}:${viewShape.join("x")}:${viewStrides.join(",")}:${offset}:${srcStrides.join(",")}:${srcOffset}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   const pipeline = getPipeline(ctx, key, code);
 

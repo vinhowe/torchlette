@@ -21,6 +21,14 @@ import { WORKGROUP_SIZE } from "../shape-utils";
 import { applyFusedOp } from "../fusion-tile-ir";
 
 const WG = WORKGROUP_SIZE; // 256
+const MAX_WG_PER_DIM = 65535;
+
+/** Grid for a compile-time-known element count (no uniform needed). */
+function fixedElementGrid(workgroupSize: number, elements: number): (u: Record<string, number>) => [number] | [number, number] {
+  const totalWg = Math.ceil(elements / workgroupSize);
+  if (totalWg <= MAX_WG_PER_DIM) return () => [totalWg];
+  return () => [Math.min(totalWg, MAX_WG_PER_DIM), Math.ceil(totalWg / MAX_WG_PER_DIM)];
+}
 
 // ============================================================================
 // Broadcast Index Helper
@@ -480,3 +488,385 @@ export function castTileIR(
   return compileTileKernel(spec);
 }
 
+// ============================================================================
+// Contiguous (strided copy) Kernel
+// ============================================================================
+
+/**
+ * Generate WGSL for a strided-to-contiguous copy via tile-IR.
+ * Drop-in replacement for contiguousDirect() shader in views.ts.
+ */
+export function contiguousTileIR(
+  shape: number[],
+  strides: number[],
+  offset: number,
+  dtype: DataType,
+): string {
+  const spec: TileKernelSpec = {
+    name: `contiguous_${dtype}`,
+    workgroupSize: WG,
+    enableF16: dtype === "f16",
+    bindings: {
+      input: { storage: "read", type: dtype },
+      out: { storage: "read_write", type: dtype },
+    },
+    uniforms: { size: "u32" },
+    grid: elementwiseGrid(WG, { elementUniform: "size" }),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+
+      const inputOff = buildStridedOffset(ctx, idx, shape, strides, offset, "in");
+      ctx.emitStore("out", idx, ctx.load("input", inputOff));
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+// ============================================================================
+// NarrowBackward Kernel
+// ============================================================================
+
+/**
+ * Generate WGSL for narrow backward via tile-IR.
+ * Pads gradient back to original shape along dim.
+ */
+export function narrowBackwardTileIR(
+  outDimSize: number,
+  outSize: number,
+  dtype: DataType,
+): string {
+  const spec: TileKernelSpec = {
+    name: `narrowBackward_${dtype}`,
+    workgroupSize: WG,
+    enableF16: dtype === "f16",
+    bindings: {
+      grad: { storage: "read", type: dtype },
+      out: { storage: "read_write", type: dtype },
+    },
+    uniforms: {
+      outerSize: "u32",
+      innerSize: "u32",
+      gradDimSize: "u32",
+      start: "u32",
+    },
+    grid: fixedElementGrid(WG, outSize),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+      const total = ctx.u32(outSize);
+      ctx.ifThen(idx.ge(total), () => ctx.emitReturn());
+
+      const innerSize = ctx.uniform("innerSize");
+      const dimSize = ctx.u32(outDimSize);
+      const outerIdx = ctx.emitLet("outerIdx", idx.div(dimSize.mul(innerSize)));
+      const remainder = ctx.emitLet("rem", idx.mod(dimSize.mul(innerSize)));
+      const dimIdx = ctx.emitLet("dimIdx", remainder.div(innerSize));
+      const innerIdx = ctx.emitLet("innerIdx", remainder.mod(innerSize));
+
+      const startU = ctx.uniform("start");
+      const gradDimSize = ctx.uniform("gradDimSize");
+      const endU = ctx.emitLet("endU", startU.add(gradDimSize));
+
+      // Check if dimIdx is in [start, start + gradDimSize)
+      // Use nested ifs to avoid out-of-bounds grad read
+      ctx.ifThen(dimIdx.lt(startU), () => {
+        const zero = dtype === "f16" ? ctx.f16(0) : ctx.f32(0);
+        ctx.emitStore("out", idx, zero);
+        ctx.emitReturn();
+      });
+      ctx.ifThen(dimIdx.ge(endU), () => {
+        const zero = dtype === "f16" ? ctx.f16(0) : ctx.f32(0);
+        ctx.emitStore("out", idx, zero);
+        ctx.emitReturn();
+      });
+
+      const gradDimIdx = ctx.emitLet("gradDimIdx", dimIdx.sub(startU));
+      const gradIdx = outerIdx.mul(gradDimSize).mul(innerSize)
+        .add(gradDimIdx.mul(innerSize))
+        .add(innerIdx);
+      ctx.emitStore("out", idx, ctx.load("grad", gradIdx));
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+// ============================================================================
+// StridedScatterCopy Kernel
+// ============================================================================
+
+/**
+ * Generate WGSL for strided scatter copy via tile-IR.
+ * Two-phase: copy base to output, then scatter src into view positions.
+ */
+export function stridedScatterCopyTileIR(
+  baseSize: number,
+  viewShape: number[],
+  viewStrides: number[],
+  viewOffset: number,
+  srcStrides: number[],
+  srcOffset: number,
+): string {
+  const rank = viewShape.length;
+  const viewSize = viewShape.reduce((a, b) => a * b, 1);
+
+  const spec: TileKernelSpec = {
+    name: "stridedScatterCopy",
+    workgroupSize: WG,
+    bindings: {
+      base: { storage: "read", type: "f32" },
+      src: { storage: "read", type: "f32" },
+      out: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      baseSize: "u32",
+      viewSize: "u32",
+    },
+    grid: fixedElementGrid(WG, Math.max(baseSize, viewSize)),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+
+      // Phase 1: copy base to output
+      ctx.ifThen(idx.lt(ctx.uniform("baseSize")), () => {
+        ctx.emitStore("out", idx, ctx.load("base", idx));
+      });
+
+      ctx.barrier();
+
+      // Phase 2: scatter src values into output at view positions
+      ctx.ifThen(idx.lt(ctx.uniform("viewSize")), () => {
+        let rem: BlockExpr = idx;
+        let baseOff: BlockExpr = ctx.u32(viewOffset);
+        let srcOff: BlockExpr = ctx.u32(srcOffset);
+
+        for (let d = 0; d < rank; d++) {
+          let dimStride = 1;
+          for (let j = d + 1; j < rank; j++) dimStride *= viewShape[j];
+
+          const coord = d < rank - 1
+            ? ctx.emitLet(`sc_c${d}`, rem.div(ctx.u32(dimStride)))
+            : rem;
+
+          if (d < rank - 1) {
+            rem = ctx.emitLet(`sc_r${d}`, rem.mod(ctx.u32(dimStride)));
+          }
+
+          baseOff = baseOff.add(coord.mul(ctx.u32(viewStrides[d])));
+          srcOff = srcOff.add(coord.mul(ctx.u32(srcStrides[d])));
+        }
+
+        ctx.emitStore("out", baseOff, ctx.load("src", srcOff));
+      });
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+// ============================================================================
+// StridedScatterAdd Kernel
+// ============================================================================
+
+/**
+ * Generate WGSL for strided scatter add via tile-IR.
+ * Two-phase: copy base to output, then add src values at view positions.
+ */
+export function stridedScatterAddTileIR(
+  baseSize: number,
+  viewShape: number[],
+  viewStrides: number[],
+  viewOffset: number,
+  srcStrides: number[],
+  srcOffset: number,
+): string {
+  const rank = viewShape.length;
+  const viewSize = viewShape.reduce((a, b) => a * b, 1);
+
+  const spec: TileKernelSpec = {
+    name: "stridedScatterAdd",
+    workgroupSize: WG,
+    bindings: {
+      base: { storage: "read", type: "f32" },
+      src: { storage: "read", type: "f32" },
+      out: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      baseSize: "u32",
+      viewSize: "u32",
+    },
+    grid: fixedElementGrid(WG, Math.max(baseSize, viewSize)),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+
+      // Phase 1: copy base to output
+      ctx.ifThen(idx.lt(ctx.uniform("baseSize")), () => {
+        ctx.emitStore("out", idx, ctx.load("base", idx));
+      });
+
+      ctx.barrier();
+
+      // Phase 2: add src values into output at view positions
+      ctx.ifThen(idx.lt(ctx.uniform("viewSize")), () => {
+        let rem: BlockExpr = idx;
+        let baseOff: BlockExpr = ctx.u32(viewOffset);
+        let srcOff: BlockExpr = ctx.u32(srcOffset);
+
+        for (let d = 0; d < rank; d++) {
+          let dimStride = 1;
+          for (let j = d + 1; j < rank; j++) dimStride *= viewShape[j];
+
+          const coord = d < rank - 1
+            ? ctx.emitLet(`sa_c${d}`, rem.div(ctx.u32(dimStride)))
+            : rem;
+
+          if (d < rank - 1) {
+            rem = ctx.emitLet(`sa_r${d}`, rem.mod(ctx.u32(dimStride)));
+          }
+
+          baseOff = baseOff.add(coord.mul(ctx.u32(viewStrides[d])));
+          srcOff = srcOff.add(coord.mul(ctx.u32(srcStrides[d])));
+        }
+
+        const existing = ctx.load("out", baseOff);
+        ctx.emitStore("out", baseOff, existing.add(ctx.load("src", srcOff)));
+      });
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+// ============================================================================
+// Gather Kernel
+// ============================================================================
+
+/**
+ * Generate WGSL for gather op via tile-IR.
+ * out[idx] = input[offset with gather dim replaced by indices[idx]]
+ */
+export function gatherTileIR(
+  inputShape: number[],
+  indexShape: number[],
+  dim: number,
+): string {
+  const rank = inputShape.length;
+  const inputStrides = contiguousStridesForShape(inputShape);
+  const indexStrides = contiguousStridesForShape(indexShape);
+
+  const spec: TileKernelSpec = {
+    name: `gather_d${dim}`,
+    workgroupSize: WG,
+    bindings: {
+      input: { storage: "read", type: "f32" },
+      indices: { storage: "read", type: "f32" },
+      out: { storage: "read_write", type: "f32" },
+    },
+    uniforms: { size: "u32" },
+    grid: elementwiseGrid(WG, { elementUniform: "size" }),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+
+      // Decompose idx into coordinates using index strides
+      let rem: BlockExpr = idx;
+      const coords: BlockExpr[] = [];
+      for (let d = 0; d < rank; d++) {
+        const coord = d < rank - 1
+          ? ctx.emitLet(`g_c${d}`, rem.div(ctx.u32(indexStrides[d])))
+          : rem;
+        if (d < rank - 1) {
+          rem = ctx.emitLet(`g_r${d}`, rem.mod(ctx.u32(indexStrides[d])));
+        }
+        coords.push(coord);
+      }
+
+      // Get gather index from indices buffer
+      const gatherIdx = ctx.emitLet("gatherIdx", ctx.load("indices", idx).toU32());
+
+      // Compute input offset
+      let inputOffset: BlockExpr = ctx.u32(0);
+      for (let d = 0; d < rank; d++) {
+        if (d === dim) {
+          inputOffset = inputOffset.add(gatherIdx.mul(ctx.u32(inputStrides[d])));
+        } else {
+          inputOffset = inputOffset.add(coords[d].mul(ctx.u32(inputStrides[d])));
+        }
+      }
+
+      ctx.emitStore("out", idx, ctx.load("input", inputOffset));
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+// ============================================================================
+// ScatterAdd Kernel
+// ============================================================================
+
+/**
+ * Generate WGSL for scatter_add op via tile-IR.
+ * Caller must copy input→output before dispatching this kernel.
+ */
+export function scatterAddTileIR(
+  inputShape: number[],
+  srcShape: number[],
+  dim: number,
+): string {
+  const rank = inputShape.length;
+  const outStrides = contiguousStridesForShape(inputShape);
+  const srcStrides = contiguousStridesForShape(srcShape);
+
+  const spec: TileKernelSpec = {
+    name: `scatterAdd_d${dim}`,
+    workgroupSize: WG,
+    bindings: {
+      indices: { storage: "read", type: "f32" },
+      src: { storage: "read", type: "f32" },
+      out: { storage: "read_write", type: "f32" },
+    },
+    uniforms: { srcSize: "u32" },
+    grid: elementwiseGrid(WG, { elementUniform: "srcSize" }),
+    kernel(ctx) {
+      const srcIdx = ctx.flatGlobalId(WG);
+      ctx.ifThen(srcIdx.ge(ctx.uniform("srcSize")), () => ctx.emitReturn());
+
+      // Decompose srcIdx into coordinates
+      let rem: BlockExpr = srcIdx;
+      const coords: BlockExpr[] = [];
+      for (let d = 0; d < rank; d++) {
+        const coord = d < rank - 1
+          ? ctx.emitLet(`s_c${d}`, rem.div(ctx.u32(srcStrides[d])))
+          : rem;
+        if (d < rank - 1) {
+          rem = ctx.emitLet(`s_r${d}`, rem.mod(ctx.u32(srcStrides[d])));
+        }
+        coords.push(coord);
+      }
+
+      // Get scatter index from indices buffer
+      const scatterIdx = ctx.emitLet("scatterIdx", ctx.load("indices", srcIdx).toU32());
+
+      // Compute output offset
+      let outOffset: BlockExpr = ctx.u32(0);
+      for (let d = 0; d < rank; d++) {
+        if (d === dim) {
+          outOffset = outOffset.add(scatterIdx.mul(ctx.u32(outStrides[d])));
+        } else {
+          outOffset = outOffset.add(coords[d].mul(ctx.u32(outStrides[d])));
+        }
+      }
+
+      const existing = ctx.load("out", outOffset);
+      ctx.emitStore("out", outOffset, existing.add(ctx.load("src", srcIdx)));
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+/** Helper: compute contiguous strides for a given shape. */
+function contiguousStridesForShape(shape: number[]): number[] {
+  const strides: number[] = [];
+  for (let i = 0; i < shape.length; i++) {
+    let stride = 1;
+    for (let j = i + 1; j < shape.length; j++) stride *= shape[j];
+    strides.push(stride);
+  }
+  return strides;
+}
