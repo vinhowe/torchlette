@@ -7,9 +7,14 @@
  * Run with: TORCHLETTE_WEBGPU=1 npx tsx examples/gpt2/finetune-demo.ts
  */
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Torchlette, type Tensor } from "../../src/frontend";
-import { initWebGPU, getBufferPoolStats, getGPUMemoryStats } from "../../src/backend/webgpu";
+import {
+  initWebGPU, getBufferPoolStats, getGPUMemoryStats,
+  startPipelineRecording, stopPipelineRecording,
+  warmupFromRegistry, serializeRegistry, deserializeRegistry,
+} from "../../src/backend/webgpu";
 import { storageTracker } from "../../src/engine/lazy";
 import { GPT2, DISTILGPT2_CONFIG } from "./model";
 import { GPT2Tokenizer } from "./data";
@@ -222,6 +227,19 @@ async function main() {
   }
   console.log(`Training sequences: ${sequences.length}`);
 
+  // Pipeline warmup: pre-compile cached pipelines from previous run
+  const warmupFile = "/tmp/torchlette-pipeline-registry-finetune.json";
+  if (fs.existsSync(warmupFile)) {
+    try {
+      const json = fs.readFileSync(warmupFile, "utf-8");
+      const entries = deserializeRegistry(json);
+      const result = await warmupFromRegistry(entries);
+      console.log(`Pipeline warmup: ${result.compiled} compiled, ${result.skipped} skipped (${result.timeMs.toFixed(0)}ms)`);
+    } catch {
+      console.log("Pipeline warmup failed (stale cache?)");
+    }
+  }
+
   // Training loop - just train, show loss, skip intermediate generation
   const NUM_EPOCHS = 3;
   let globalStep = 0;
@@ -230,6 +248,9 @@ async function main() {
     console.log(`\n--- Epoch ${epoch + 1}/${NUM_EPOCHS} ---`);
 
     for (let i = 0; i < sequences.length; i++) {
+      // Record pipelines during very first step for warmup cache
+      if (globalStep === 0) startPipelineRecording();
+
       const seq = sequences[i];
       const inputData = seq.slice(0, -1);
       const targetData = seq.slice(1);
@@ -264,6 +285,13 @@ async function main() {
       // Call markStep to trigger GPU buffer cleanup
       await api.markStep();
       const t4 = performance.now();
+
+      // Save pipeline registry after first step
+      if (globalStep === 0) {
+        const pipelineRegistry = stopPipelineRecording();
+        fs.writeFileSync(warmupFile, serializeRegistry(pipelineRegistry));
+        console.log(`  Pipeline registry: ${pipelineRegistry.length} pipelines saved`);
+      }
 
       // Log loss and timing every 5 steps
       if (globalStep % 5 === 0) {
