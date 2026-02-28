@@ -1,28 +1,23 @@
 /**
  * Core dispatch infrastructure: compute pass execution, pipeline caching,
- * binary/unary/matmul dispatch, fused elementwise.
+ * binary/unary/matmul dispatch.
  * Extracted from index.ts — purely structural refactoring.
  */
 
-import type { FusionRecipe } from "../../engine/fusion";
-import type { IRGraph, IRNode } from "../../engine/ir";
 import {
   sizeOf,
   broadcastShapes,
   toIndexShape,
-  broadcastStrides,
   computeEffectiveBroadcastStrides,
-  buildBroadcastIndexing,
-  shapesEqual,
   dtypeBytes,
   dtypeToWgsl,
   compute2DDispatch,
   WORKGROUP_SIZE,
   MAX_WORKGROUPS_PER_DIM,
 } from "./shape-utils";
-import type { BackendTensor, DType } from "../types";
+import type { DType } from "../types";
 import type { GPUBuffer, GPUComputePipeline, GPUBindGroup, WebGPUContext, WebGPUTensor } from "./gpu-types";
-import { GPUBufferUsage, asGPUTensor } from "./gpu-types";
+import { GPUBufferUsage } from "./gpu-types";
 import { recordPipeline, getWarmupPipeline } from "./pipeline-warmup";
 import { requireContext, isF16Supported } from "./gpu-context";
 import { bufferPool } from "./buffer-pool";
@@ -38,8 +33,6 @@ import { resolveOutputBuffer } from "./buffer-arena";
 import {
   createParamsBuffer,
   releaseParamsBuffer,
-  createUniformBuffer,
-  releaseUniformBuffer,
   cachedCreateBindGroup,
   params1,
 } from "./bind-group-cache";
@@ -56,7 +49,7 @@ import {
 } from "./matmul";
 
 // Tensor construction helpers (extracted to tensor.ts)
-import { createTensor, createTrackedBuffer } from "./tensor";
+import { createTensor } from "./tensor";
 import { ensureContiguous, detectSimpleTranspose } from "./ops/views";
 
 export function dispatchComputePass(
@@ -152,151 +145,6 @@ export function dispatchElementwise(desc: {
 }
 
 
-const FUSED_UNARY_OPS = new Map<string, (value: string) => string>([
-  ["neg", (value) => `-(${value})`],
-  ["abs", (value) => `abs(${value})`],
-  ["exp", (value) => `exp(${value})`],
-  ["log", (value) => `log(${value})`],
-  ["relu", (value) => `select(0.0, ${value}, ${value} > 0.0)`],
-  ["sqrt", (value) => `sqrt(${value})`],
-]);
-
-const FUSED_BINARY_OPS = new Map<
-  string,
-  (left: string, right: string) => string
->([
-  ["add", (left, right) => `(${left} + ${right})`],
-  ["sub", (left, right) => `(${left} - ${right})`],
-  ["mul", (left, right) => `(${left} * ${right})`],
-  ["div", (left, right) => `(${left} / ${right})`],
-]);
-
-function buildFusedExpression(op: string, inputs: string[]): string {
-  const binary = FUSED_BINARY_OPS.get(op);
-  if (binary) {
-    if (inputs.length !== 2) {
-      throw new Error(`fused op ${op} expects 2 inputs`);
-    }
-    return binary(inputs[0], inputs[1]);
-  }
-  const unary = FUSED_UNARY_OPS.get(op);
-  if (unary) {
-    if (inputs.length !== 1) {
-      throw new Error(`fused op ${op} expects 1 input`);
-    }
-    return unary(inputs[0]);
-  }
-  throw new Error(`fused op ${op} is not supported`);
-}
-
-function requireFusionNode(
-  nodeById: Map<number, IRNode>,
-  nodeId: number,
-): IRNode {
-  const node = nodeById.get(nodeId);
-  if (!node) {
-    throw new Error(`fusion recipe missing node ${nodeId}`);
-  }
-  return node;
-}
-
-function requireShape(node: IRNode): number[] {
-  if (!node.shape) {
-    throw new Error(`fusion recipe missing shape for node ${node.id}`);
-  }
-  return node.shape;
-}
-
-function buildFusedElementwiseShader(
-  graph: IRGraph,
-  recipe: FusionRecipe,
-  use2D?: boolean,
-  shaderGridSizeX?: number,
-): string {
-  if (recipe.outputs.length !== 1) {
-    throw new Error("fused elementwise expects a single output");
-  }
-  const outputDescriptor = recipe.outputDescriptors[0];
-  if (!outputDescriptor) {
-    throw new Error("fusion recipe has no output descriptors");
-  }
-  const outShape = outputDescriptor.shape.slice();
-  const indexShape = toIndexShape(outShape);
-  const nodeById = new Map<number, IRNode>();
-  for (const node of graph.nodes) {
-    nodeById.set(node.id, node);
-  }
-
-  const inputDecls: string[] = [];
-  const inputStrides: number[][] = [];
-  const valueById = new Map<number, string>();
-  for (let i = 0; i < recipe.inputs.length; i += 1) {
-    const name = `in${i}`;
-    const inputNode = requireFusionNode(nodeById, recipe.inputs[i]);
-    const inputShape = requireShape(inputNode);
-    inputStrides.push(broadcastStrides(inputShape, indexShape));
-    inputDecls.push(
-      `@group(0) @binding(${i}) var<storage, read> ${name}: array<f32>;`,
-    );
-  }
-
-  const indexing = buildBroadcastIndexing(indexShape, inputStrides);
-  for (let i = 0; i < recipe.inputs.length; i += 1) {
-    const name = `in${i}`;
-    valueById.set(recipe.inputs[i], `${name}[offset${i}]`);
-  }
-
-  const statements: string[] = [];
-  let varIndex = 0;
-  for (const nodeId of recipe.nodeIds) {
-    const node = requireFusionNode(nodeById, nodeId);
-    const inputExprs = node.inputs.map((inputId) => {
-      const expr = valueById.get(inputId);
-      if (!expr) {
-        throw new Error(`fusion recipe missing input ${inputId}`);
-      }
-      return expr;
-    });
-    const expr = buildFusedExpression(node.op, inputExprs);
-    const varName = `v${varIndex}`;
-    varIndex += 1;
-    statements.push(`  let ${varName} = ${expr};`);
-    valueById.set(nodeId, varName);
-  }
-
-  const outputExpr = valueById.get(recipe.outputs[0]);
-  if (!outputExpr) {
-    throw new Error(`fusion recipe missing output ${recipe.outputs[0]}`);
-  }
-
-  const outputBinding = recipe.inputs.length;
-  const paramsBinding = recipe.inputs.length + 1;
-  const body = statements.join("\n");
-
-  return `
-struct Params {
-  size: u32,
-};
-
-${inputDecls.join("\n")}
-@group(0) @binding(${outputBinding}) var<storage, read_write> out: array<f32>;
-@group(0) @binding(${paramsBinding}) var<uniform> params: Params;
-
-${indexing.declarations}
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = ${use2D ? `gid.x + gid.y * ${shaderGridSizeX}u` : "gid.x"};
-  if (idx >= params.size) {
-    return;
-  }
-${indexing.compute}
-${indexing.offsets.join("\n")}
-${body}
-  out[idx] = ${outputExpr};
-}
-`;
-}
 
 export function getPipeline(
   context: WebGPUContext,
@@ -930,65 +778,4 @@ export function dispatchMatmulDirect(
   });
 
   return createTensor(config.outShape, outBuffer, undefined, 0, config.outputDtype);
-}
-
-export function runFusedElementwise(
-  graph: IRGraph,
-  recipe: FusionRecipe,
-  inputs: BackendTensor[],
-): BackendTensor | null {
-  // Get output dtype from first output descriptor (single-output case)
-  const outputDescriptor = recipe.outputDescriptors[0];
-  if (!outputDescriptor) {
-    throw new Error("fusion recipe has no output descriptors");
-  }
-  if (outputDescriptor.dtype !== "f32") {
-    // Non-f32 fusion not yet supported; return null to fall back to sequential execution
-    return null;
-  }
-  if (inputs.length !== recipe.inputs.length) {
-    throw new Error(
-      `fusion recipe expects ${recipe.inputs.length} inputs, got ${inputs.length}`,
-    );
-  }
-
-  const ctx = requireContext();
-  const outShape = outputDescriptor.shape.slice();
-  const size = sizeOf(outShape);
-  if (size === 0) {
-    throw new Error("fused elementwise does not support empty tensors yet");
-  }
-  const inputTensors = inputs.map(asGPUTensor);
-  const nodeById = new Map<number, IRNode>();
-  for (const node of graph.nodes) {
-    nodeById.set(node.id, node);
-  }
-  recipe.inputs.forEach((inputId, index) => {
-    const node = requireFusionNode(nodeById, inputId);
-    const expectedShape = requireShape(node);
-    if (!shapesEqual(inputTensors[index].shape, expectedShape)) {
-      throw new Error(
-        `fused elementwise input shape mismatch for node ${inputId}`,
-      );
-    }
-  });
-
-  const totalWorkgroups = Math.ceil(size / WORKGROUP_SIZE);
-  const dispatch = compute2DDispatch(totalWorkgroups);
-  const use2D = dispatch.y > 1;
-  const shaderGridSizeX = dispatch.x * WORKGROUP_SIZE;
-  const code = buildFusedElementwiseShader(graph, recipe, use2D, shaderGridSizeX);
-  const pipeline = getPipeline(ctx, `fused:${code}`, code);
-  const outBuffer = createTrackedBuffer(ctx.device, {
-    size: size * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-  });
-  const params = createUniformBuffer(ctx.device, size);
-  const bgBuffers: GPUBuffer[] = inputTensors.map(t => t.buffer);
-  bgBuffers.push(outBuffer);
-  bgBuffers.push(params);
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, bgBuffers);
-  dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
-  releaseUniformBuffer(params);
-  return createTensor(outShape, outBuffer);
 }

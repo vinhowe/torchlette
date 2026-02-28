@@ -93,7 +93,6 @@ export {
   dispatchUnary, dispatchUnaryDirect, dispatchUnaryChunked,
   dispatchMatmul,
   dispatchMatmulWithEpilogue, dispatchMatmulDirect,
-  runFusedElementwise,
 } from "./dispatch";
 
 // Re-export memory tracking functions
