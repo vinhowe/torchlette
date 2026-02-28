@@ -155,7 +155,3 @@ export function asGPUTensor(tensor: BackendTensor): WebGPUTensor {
 export function gpuBuffer(tensor: BackendTensor): GPUBuffer {
   return asGPUTensor(tensor).buffer;
 }
-
-/** Legacy matmul constants (kept for reference, now using tiled matmul) */
-export const MATMUL_WORKGROUP_X = 8;
-export const MATMUL_WORKGROUP_Y = 8;

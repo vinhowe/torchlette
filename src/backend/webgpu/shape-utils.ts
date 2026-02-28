@@ -162,15 +162,6 @@ export function dtypeToWgsl(dtype: DType): string {
   }
 }
 
-/**
- * Convert dtype to WGSL storage type. Like dtypeToWgsl but maps bool to u32
- * since WGSL doesn't support bool in storage arrays.
- */
-export function dtypeToWgslStorage(dtype: DType): string {
-  if (dtype === "bool") return "u32";
-  return dtypeToWgsl(dtype);
-}
-
 // ============================================================================
 // Dispatch Helpers
 // ============================================================================

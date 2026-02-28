@@ -21,7 +21,7 @@ export {
 } from "./shape-utils";
 
 export type { WebGPUTensor, WebGPUContext } from "./gpu-types";
-export { GPUBufferUsage, GPUMapMode, STORAGE_BUFFER_USAGE, MATMUL_WORKGROUP_X, MATMUL_WORKGROUP_Y } from "./gpu-types";
+export { GPUBufferUsage, GPUMapMode, STORAGE_BUFFER_USAGE } from "./gpu-types";
 
 export {
   bufferPool, getBufferPoolStats, setBufferPoolEnabled, clearBufferPool,
