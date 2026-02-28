@@ -22,7 +22,7 @@ import {
   params1, params2, params4, params7,
 } from "../bind-group-cache";
 import { profileApiCall } from "../profiler";
-import { castTileIR, castSpec, contiguousTileIR, narrowBackwardTileIR } from "./ops-tile-ir";
+import { castTileIR, castSpec, contiguousTileIR, narrowBackwardTileIR, chunkedTransposeTileIR } from "./ops-tile-ir";
 import { createTileKernelDispatcher } from "../tile-dispatch";
 
 /**
@@ -492,47 +492,8 @@ function contiguousChunked(
     const numOutputRowChunks = Math.ceil(K / alignedOutputRows);
     const numInputColChunks = Math.ceil(N / alignedInputCols);
 
-    // Shader processes a tile: output rows [rowStart, rowEnd) and columns [colStart, colEnd)
-    const code = `
-struct Params {
-  K: u32,
-  N: u32,
-  rowStart: u32,
-  rowEnd: u32,
-  colStart: u32,
-  colEnd: u32,
-  gridStride: u32,
-}
-
-@group(0) @binding(0) var<storage, read> input: array<${wgslType}>;
-@group(0) @binding(1) var<storage, read_write> output: array<${wgslType}>;
-@group(0) @binding(2) var<uniform> params: Params;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = gid.y * params.gridStride + gid.x;
-  let numRows = params.rowEnd - params.rowStart;
-  let numCols = params.colEnd - params.colStart;
-  let tileSize = numRows * numCols;
-  if (idx >= tileSize) { return; }
-
-  let localRow = idx / numCols;
-  let localCol = idx % numCols;
-  let globalRow = params.rowStart + localRow;
-  let globalCol = params.colStart + localCol;
-
-  // Input: transposed view element [globalRow, globalCol] = buffer[globalCol * K + globalRow]
-  // With offset binding at colStart * K, local index is localCol * K + globalRow
-  // But we need to account for the fact that globalRow is the actual row index
-  let inputIdx = localCol * params.K + globalRow;
-
-  // Output: row chunk is bound with offset, so local row index is localRow
-  // Column index is the global column
-  let outputIdx = localRow * params.N + globalCol;
-
-  output[outputIdx] = input[inputIdx];
-}
-`;
+    // Generate shader via tile-IR
+    const code = chunkedTransposeTileIR(wgslType as any);
 
     const key = `contiguous_chunked_transpose_tiled:${K}:${N}:${dtype}`;
     const pipeline = getPipeline(ctx, key, code);
