@@ -24,15 +24,6 @@ export {
 } from "./autotune";
 
 export {
-  // Codegen types
-  type CodegenOptions,
-  type EpilogueConfig,
-  // Codegen functions
-  generateTiledMatmulShader,
-  getShaderCacheKey,
-} from "./codegen";
-
-export {
   // Dispatch functions
   clearDispatchTuningCache,
   computeBatchSize,
@@ -46,29 +37,25 @@ export {
 } from "./dispatch";
 
 export {
-  // Subgroup functions
-  generateSubgroupMatmulShader,
-  getSubgroupShaderCacheKey,
-  // Subgroup types
-  type SubgroupCodegenOptions,
-} from "./subgroup";
-export {
-  // Utilities
-  classifyShape,
-  clearSubgroupSupport,
-  // Constants
-  DEFAULT_CONFIG,
   // Types
+  type CodegenOptions,
+  type EpilogueConfig,
   type DType,
-  getSubgroupSupport,
-  getTransposeMode,
-  getWorkgroupSize,
   type MatmulKernelConfig,
   type ShapeClass,
   type SubgroupSupport,
-  setSubgroupSupport,
   type TransposeMode,
-  TUNING_SPACE,
   type TuneResult,
+  // Constants
+  DEFAULT_CONFIG,
+  TUNING_SPACE,
+  // Functions
+  classifyShape,
+  clearSubgroupSupport,
+  getShaderCacheKey,
+  getSubgroupSupport,
+  getTransposeMode,
+  getWorkgroupSize,
+  setSubgroupSupport,
   validateConfig,
 } from "./types";

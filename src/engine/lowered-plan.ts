@@ -26,7 +26,7 @@
 
 import type { DType } from "../backend/types";
 import type { GPUBuffer, GPUComputePipeline, GPUBindGroup } from "../backend/webgpu/gpu-types";
-import type { FusedKernelRecipe } from "../backend/webgpu/fusion-codegen";
+import type { FusedKernelRecipe } from "../backend/webgpu/fusion-types";
 import type { LazyIRNode, LazyRef } from "./lazy";
 
 // ============================================================================

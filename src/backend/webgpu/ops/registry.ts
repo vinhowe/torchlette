@@ -3,8 +3,8 @@
  *
  * This is the SINGLE SOURCE OF TRUTH for all fusible operations.
  * Used by:
- * - Elementwise fusion (fusion-codegen.ts)
- * - Matmul epilogue fusion (matmul/codegen.ts)
+ * - Elementwise fusion (fusion-tile-ir.ts)
+ * - Matmul epilogue fusion (matmul/tile-matmul.ts)
  * - Standalone elementwise kernels
  *
  * Each op defines:
@@ -548,7 +548,7 @@ export function getAllBinaryOps(): string[] {
 // ============================================================================
 
 /**
- * UNARY_EXPR - for backward compatibility with fusion-codegen.ts
+ * UNARY_EXPR - string expression templates for unary ops.
  * @deprecated Use getExpr() or OP_REGISTRY directly
  */
 export const UNARY_EXPR: Record<string, (input: string, zero?: string, one?: string) => string> =
@@ -559,7 +559,7 @@ export const UNARY_EXPR: Record<string, (input: string, zero?: string, one?: str
   );
 
 /**
- * BINARY_EXPR - for backward compatibility with fusion-codegen.ts
+ * BINARY_EXPR - string expression templates for binary ops.
  * @deprecated Use getExpr() or OP_REGISTRY directly
  */
 export const BINARY_EXPR: Record<string, (a: string, b: string) => string> = Object.fromEntries(

@@ -22,7 +22,7 @@ import {
   type GeneratedKernel,
   computeKernelMeta,
   type KernelGenOptions,
-} from "./fusion-codegen";
+} from "./fusion-types";
 import { generateFusedKernelTileIR } from "./fusion-tile-ir";
 import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";

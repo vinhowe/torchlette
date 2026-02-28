@@ -5,6 +5,43 @@
 export type DType = "f16" | "f32";
 
 /**
+ * Epilogue operation to fuse into matmul output.
+ * Supports arbitrary chains of elementwise operations from the unified op registry.
+ */
+type EpilogueOp =
+  | { kind: "none" }
+  | { kind: "bias"; inputIndex: number }
+  | { kind: "unary"; op: string }
+  | { kind: "binary"; op: string; inputIndex: number }
+  | { kind: "cast"; toDtype: DType }
+  | { kind: "relu" }
+  | { kind: "gelu" }
+  | { kind: "silu" }
+  | { kind: "add"; inputIndex: number }
+  | { kind: "mul"; inputIndex: number };
+
+export type EpilogueConfig = {
+  ops: EpilogueOp[];
+  additionalInputCount: number;
+  outputDtype: DType;
+};
+
+/**
+ * Options for matmul shader generation.
+ */
+export type CodegenOptions = {
+  config: MatmulKernelConfig;
+  transposeMode: TransposeMode;
+  dtype: DType;
+  dtypeB?: DType;
+  epilogue?: EpilogueConfig;
+  batched?: boolean;
+  inputCastA?: DType;
+  inputCastB?: DType;
+  kSplit?: number;
+};
+
+/**
  * Kernel configuration for tiled matrix multiplication.
  * These parameters control tiling, threading, and optimization strategies.
  */
@@ -305,4 +342,36 @@ export function getSubgroupSupport(): SubgroupSupport | null {
  */
 export function clearSubgroupSupport(): void {
   cachedSubgroupSupport = null;
+}
+
+/**
+ * Generate a cache key for a matmul shader configuration.
+ */
+export function getShaderCacheKey(options: CodegenOptions): string {
+  const { config, transposeMode, dtype, dtypeB, epilogue, batched, inputCastA, inputCastB, kSplit } = options;
+  const epilogueKey = epilogue
+    ? `${epilogue.ops.map((op) => op.kind).join(",")}_${epilogue.outputDtype}`
+    : "none";
+  return [
+    `tiled`,
+    `${config.tileM}x${config.tileN}x${config.tileK}`,
+    `t${config.threadTileM}x${config.threadTileN}`,
+    `v${config.vectorWidth}`,
+    config.useSubgroups ? "sg" : "nosg",
+    transposeMode,
+    dtype,
+    dtypeB && dtypeB !== dtype ? `dtypeB_${dtypeB}` : "",
+    batched ? "batch" : "nobatch",
+    epilogueKey,
+    inputCastA ? `castA_${inputCastA}` : "",
+    inputCastB ? `castB_${inputCastB}` : "",
+    kSplit ? `ksplit${kSplit}` : "",
+  ].filter(Boolean).join("_");
+}
+
+/**
+ * Generate a cache key for a K-split reduction shader.
+ */
+export function getKSplitReductionCacheKey(kSplitCount: number, outputDtype: DType): string {
+  return `ksplit_reduce_${kSplitCount}_${outputDtype}`;
 }

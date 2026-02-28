@@ -14,14 +14,13 @@ import {
   resetFusionCache,
 } from "../../src/backend/webgpu/fusion-dispatch";
 import {
-  generateFusedKernel,
   computeKernelMeta,
   type FusedKernelRecipe,
   type FusedNode,
   type FusedInput,
   type FusedOutput,
   type KernelGenOptions,
-} from "../../src/backend/webgpu/fusion-codegen";
+} from "../../src/backend/webgpu/fusion-types";
 import { generateFusedKernelTileIR } from "../../src/backend/webgpu/fusion-tile-ir";
 import { sizeOf } from "../../src/core/shape";
 

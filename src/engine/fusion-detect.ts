@@ -17,7 +17,7 @@ import type {
   FusedKernelRecipe,
   FusedNode,
   FusedOutput,
-} from "../backend/webgpu/fusion-codegen";
+} from "../backend/webgpu/fusion-types";
 import { isRandomOp } from "./ir-optimize";
 import type { LazyIRNode, LazyRef } from "./lazy";
 
@@ -972,7 +972,7 @@ function collectExternalInputs(
  * Convert a fusion group to a FusedKernelRecipe for codegen.
  *
  * @param group - The detected fusion group
- * @returns Recipe suitable for fusion-codegen
+ * @returns Recipe suitable for fusion-tile-ir
  */
 export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
   const nodeIds = group.nodes.map((n) => n.id);

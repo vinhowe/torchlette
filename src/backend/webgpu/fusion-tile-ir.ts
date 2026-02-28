@@ -1,7 +1,7 @@
 /**
  * Tile-IR Elementwise Fusion Codegen
  *
- * Drop-in replacement for generateFusedKernel() in fusion-codegen.ts.
+ * Tile-IR fusion kernel generator.
  * Converts FusedKernelRecipe → TileKernelSpec → compileTileKernel → WGSL.
  *
  * This puts elementwise fusion on the same tile-IR path as matmul kernels,
@@ -17,7 +17,7 @@ import {
   type VectorWidth,
   computeKernelMeta,
   needsBroadcast,
-} from "./fusion-codegen";
+} from "./fusion-types";
 import { MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 import {
   type TileKernelSpec,

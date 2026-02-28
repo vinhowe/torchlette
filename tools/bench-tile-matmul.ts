@@ -1,8 +1,7 @@
 /**
- * Benchmark: tile-IR matmul vs production codegen on DistilGPT-2 shapes.
+ * Benchmark: tile-IR matmul on DistilGPT-2 shapes.
  *
- * Compares GPU kernel time for both codegen paths on each shape,
- * using the same tile config and dispatch parameters.
+ * Measures GPU kernel time for each shape using the tile-IR codegen path.
  *
  * Usage: npx tsx tools/bench-tile-matmul.ts
  * Env: BENCH_WARMUP=N BENCH_ITERS=N
@@ -16,19 +15,11 @@ import {
 import {
   classifyShape,
   type DType,
-  dispatchTiledMatmul,
   getDefaultConfigForShape,
   getWorkgroupSize,
-  type MatmulKernelConfig,
-  type ShapeClass,
-} from "../src/backend/webgpu/matmul";
-import {
-  generateTiledMatmulShader,
-  getShaderCacheKey,
-  generateKSplitReductionShader,
-  type CodegenOptions,
   type EpilogueConfig,
-} from "../src/backend/webgpu/matmul/codegen";
+  type CodegenOptions,
+} from "../src/backend/webgpu/matmul";
 import {
   generateTiledMatmulShaderTileIR,
   generateKSplitReductionShaderTileIR,
@@ -90,7 +81,6 @@ async function benchmarkKernel(
   device: any,
   queue: any,
   shape: MatmulShape,
-  useTileIR: boolean,
   warmup: number,
   iters: number,
 ): Promise<number> {
@@ -127,9 +117,7 @@ async function benchmarkKernel(
   };
 
   // Generate WGSL
-  const shaderCode = useTileIR
-    ? generateTiledMatmulShaderTileIR(codegenOptions)
-    : generateTiledMatmulShader(codegenOptions);
+  const shaderCode = generateTiledMatmulShaderTileIR(codegenOptions);
 
   // Create pipeline
   const module = device.createShaderModule({ code: shaderCode });
@@ -142,9 +130,7 @@ async function benchmarkKernel(
   let reductionPipeline: any = null;
   if (kSplitFactor >= 2) {
     const outputDtype = epilogue?.outputDtype ?? (dtype === "f32" ? "f32" : "f32");
-    const reduceCode = useTileIR
-      ? generateKSplitReductionShaderTileIR(kSplitFactor, outputDtype as DType)
-      : generateKSplitReductionShader(kSplitFactor, outputDtype as DType);
+    const reduceCode = generateKSplitReductionShaderTileIR(kSplitFactor, outputDtype as DType);
     const reduceModule = device.createShaderModule({ code: reduceCode });
     reductionPipeline = device.createComputePipeline({
       layout: "auto",
@@ -321,15 +307,11 @@ async function main() {
   console.log("Shape".padEnd(28) +
     "Config".padEnd(22) +
     "K-split".padEnd(8) +
-    "Prod(ms)".padStart(10) +
-    "TileIR(ms)".padStart(12) +
-    "Ratio".padStart(8) +
-    "  GFLOPS(P)".padStart(12) +
-    "GFLOPS(T)".padStart(12));
-  console.log("-".repeat(112));
+    "Time(ms)".padStart(10) +
+    "GFLOPS".padStart(12));
+  console.log("-".repeat(80));
 
-  let totalProdWeighted = 0;
-  let totalTileWeighted = 0;
+  let totalWeighted = 0;
 
   for (const shape of SHAPES) {
     const { m, n, k, epilogue, batchSize = 1 } = shape;
@@ -348,30 +330,19 @@ async function main() {
     }
 
     try {
-      const prodMs = await benchmarkKernel(device, queue, shape, false, warmup, iters);
-      const tileMs = await benchmarkKernel(device, queue, shape, true, warmup, iters);
+      const ms = await benchmarkKernel(device, queue, shape, warmup, iters);
 
       const flops = 2 * m * n * k * (batchSize || 1);
-      const prodGflops = flops / (prodMs * 1e6);
-      const tileGflops = flops / (tileMs * 1e6);
-      const ratio = tileMs / prodMs;
+      const gflops = flops / (ms * 1e6);
 
-      totalProdWeighted += prodMs * shape.count;
-      totalTileWeighted += tileMs * shape.count;
-
-      const ratioStr = ratio <= 1.05 ? `${ratio.toFixed(3)}` :
-                       ratio <= 1.10 ? `${ratio.toFixed(3)}*` :
-                       `${ratio.toFixed(3)}**`;
+      totalWeighted += ms * shape.count;
 
       console.log(
         shape.name.padEnd(28) +
         configStr.padEnd(22) +
         (kSplit >= 2 ? `×${kSplit}` : "-").padEnd(8) +
-        prodMs.toFixed(3).padStart(10) +
-        tileMs.toFixed(3).padStart(12) +
-        ratioStr.padStart(8) +
-        prodGflops.toFixed(0).padStart(12) +
-        tileGflops.toFixed(0).padStart(12)
+        ms.toFixed(3).padStart(10) +
+        gflops.toFixed(0).padStart(12)
       );
     } catch (e: any) {
       console.log(
@@ -383,17 +354,13 @@ async function main() {
     }
   }
 
-  console.log("-".repeat(112));
-  const overallRatio = totalTileWeighted / totalProdWeighted;
+  console.log("-".repeat(80));
   console.log(
     `WEIGHTED TOTAL (per step)`.padEnd(28) +
     "".padEnd(22) +
     "".padEnd(8) +
-    totalProdWeighted.toFixed(3).padStart(10) +
-    totalTileWeighted.toFixed(3).padStart(12) +
-    overallRatio.toFixed(3).padStart(8)
+    totalWeighted.toFixed(3).padStart(10)
   );
-  console.log(`\n* = 5-10% slower, ** = >10% slower`);
 
   process.exit(0);
 }
