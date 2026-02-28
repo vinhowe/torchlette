@@ -930,9 +930,27 @@ function contiguousStridesForShape(shape: number[]): number[] {
 // Flat Contiguous Copy / Add Specs (for chunked strided-scatter paths)
 // ============================================================================
 
+/** Vec4 unroll factor for flat specs. Each thread processes VEC consecutive elements. */
+const VEC = 4;
+
+/**
+ * Helper: compute a vec4-unrolled flat thread base index.
+ * Each thread processes VEC consecutive elements starting at this base.
+ * Handles 2D dispatch overflow via programId(1) * numPrograms(0).
+ */
+function flatVec4Base(ctx: KernelContext): BlockExpr {
+  const flatWgId = ctx.programId(0).add(
+    ctx.programId(1).mul(ctx.numPrograms(0)),
+  );
+  return ctx.emitLet("base",
+    flatWgId.mul(ctx.u32(WG * VEC)).add(ctx.localIndex().mul(ctx.u32(VEC))),
+  );
+}
+
 /**
  * TileKernelSpec for a flat contiguous copy: out[idx] = src[idx].
  * Used by chunked stridedScatterCopy when both src and dest are contiguous.
+ * Vec4 unrolled: each thread copies VEC consecutive elements.
  */
 export function flatCopySpec(): TileKernelSpec {
   return {
@@ -943,11 +961,18 @@ export function flatCopySpec(): TileKernelSpec {
       out: { storage: "read_write", type: "f32" },
     },
     uniforms: { size: "u32" },
-    grid: elementwiseGrid(WG, { elementUniform: "size" }),
+    grid: elementwiseGrid(WG, { elementUniform: "size", vecWidth: VEC }),
     kernel(ctx) {
-      const idx = ctx.flatGlobalId(WG);
-      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
-      ctx.emitStore("out", idx, ctx.load("src", idx));
+      const base = flatVec4Base(ctx);
+      const size = ctx.uniform("size");
+      // Early exit: if base >= size, all VEC elements are out of bounds
+      ctx.ifThen(base.ge(size), () => ctx.emitReturn());
+      for (let v = 0; v < VEC; v++) {
+        const idx = base.add(ctx.u32(v));
+        ctx.ifThen(idx.lt(size), () => {
+          ctx.emitStore("out", idx, ctx.load("src", idx));
+        });
+      }
     },
   };
 }
@@ -955,6 +980,7 @@ export function flatCopySpec(): TileKernelSpec {
 /**
  * TileKernelSpec for a flat contiguous add: out[idx] = base[idx] + src[idx].
  * Used by chunked stridedScatterAdd when both base and src are contiguous.
+ * Vec4 unrolled: each thread adds VEC consecutive elements.
  */
 export function flatAddSpec(): TileKernelSpec {
   return {
@@ -966,11 +992,18 @@ export function flatAddSpec(): TileKernelSpec {
       out: { storage: "read_write", type: "f32" },
     },
     uniforms: { size: "u32" },
-    grid: elementwiseGrid(WG, { elementUniform: "size" }),
+    grid: elementwiseGrid(WG, { elementUniform: "size", vecWidth: VEC }),
     kernel(ctx) {
-      const idx = ctx.flatGlobalId(WG);
-      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
-      ctx.emitStore("out", idx, ctx.load("base", idx).add(ctx.load("src", idx)));
+      const b = flatVec4Base(ctx);
+      const size = ctx.uniform("size");
+      // Early exit: if base >= size, all VEC elements are out of bounds
+      ctx.ifThen(b.ge(size), () => ctx.emitReturn());
+      for (let v = 0; v < VEC; v++) {
+        const idx = b.add(ctx.u32(v));
+        ctx.ifThen(idx.lt(size), () => {
+          ctx.emitStore("out", idx, ctx.load("base", idx).add(ctx.load("src", idx)));
+        });
+      }
     },
   };
 }
