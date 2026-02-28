@@ -1943,16 +1943,28 @@ export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Se
     }
   }
 
-  // Phase 2b: Prune sub-expressions — if both a parent expr and its sub-expr
-  // are candidates, drop the sub-expr (the parent binding already captures it)
-  const subExprIds = new Set<number>();
+  // Phase 2b: Prune sub-expressions that are FULLY captured by parent candidates.
+  // A sub-expression S of parent candidate P can be pruned only if ALL of S's
+  // references are through parent candidates (no external references). Otherwise
+  // S must get its own binding because codegen would inline it at external sites.
+  const candidateSubExprs = new Map<number, Set<number>>(); // candidate id → sub-expr ids
   for (const c of candidates) {
-    collectSubExprIds(c.node, subExprIds);
+    const subs = new Set<number>();
+    collectSubExprIds(c.node, subs);
+    candidateSubExprs.set(c.id, subs);
   }
-  const toBind: { firstIdx: number; name: string; node: IRNode }[] = [];
+  const toBind: { firstIdx: number; name: string; node: IRNode; id: number }[] = [];
   for (const c of candidates) {
-    if (!subExprIds.has(c.id)) {
-      toBind.push({ firstIdx: c.firstIdx, name: freshVar("cse"), node: c.node });
+    // Count how many parent candidate usages "cover" this candidate's references
+    let parentCoverage = 0;
+    for (const other of candidates) {
+      if (other.id !== c.id && candidateSubExprs.get(other.id)!.has(c.id)) {
+        parentCoverage += refCounts.get(other.id)!.count;
+      }
+    }
+    // Keep if not a sub-expression of any candidate, or has external references
+    if (parentCoverage === 0 || refCounts.get(c.id)!.count > parentCoverage) {
+      toBind.push({ firstIdx: c.firstIdx, name: freshVar("cse"), node: c.node, id: c.id });
     }
   }
 
@@ -1987,6 +1999,26 @@ export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Se
   for (const b of toBind) {
     if (!injByIdx.has(b.firstIdx)) injByIdx.set(b.firstIdx, []);
     injByIdx.get(b.firstIdx)!.push(b);
+  }
+
+  // Topological sort bindings within each firstIdx group so that if binding B's
+  // expression tree references binding A's node, A is emitted before B.
+  for (const [, group] of injByIdx) {
+    if (group.length > 1) {
+      // Build sub-expression sets per binding
+      const subSets = new Map<number, Set<number>>();
+      for (const b of group) {
+        subSets.set(b.id, candidateSubExprs.get(b.id) ?? new Set());
+      }
+      // Stable topological sort: binding A before B if B's sub-exprs contain A's id
+      group.sort((a, b) => {
+        const bDepsA = subSets.get(b.id)!.has(a.id);
+        const aDepsB = subSets.get(a.id)!.has(b.id);
+        if (bDepsA && !aDepsB) return -1; // A before B
+        if (aDepsB && !bDepsA) return 1;  // B before A
+        return 0; // no dependency — preserve order
+      });
+    }
   }
 
   const result: Statement[] = [];

@@ -177,14 +177,13 @@ function emitBroadcastIndex(
   const rankDiff = rank - inputRank;
 
   // Decompose output linear index into coordinates
-  let tmp = ctx.emitLet(`_tmp_${inputName}`, outputIdx);
+  let tmp = outputIdx;
   const outCoords: BlockExpr[] = [];
   for (let i = rank - 1; i >= 0; i--) {
     const dim = outputShape[i];
-    const coord = ctx.emitLet(`_c${i}_${inputName}`, tmp.mod(ctx.u32(dim)));
-    outCoords.unshift(coord);
+    outCoords.unshift(tmp.mod(ctx.u32(dim)));
     if (i > 0) {
-      tmp = ctx.emitLet(`_t${i}_${inputName}`, tmp.div(ctx.u32(dim)));
+      tmp = tmp.div(ctx.u32(dim));
     }
   }
 
@@ -205,7 +204,7 @@ function emitBroadcastIndex(
     inIdx = inIdx.mul(ctx.u32(inputShape[i])).add(inCoords[i]);
   }
 
-  return ctx.emitLet(`idx_${inputName}`, inIdx);
+  return inIdx;
 }
 
 // ============================================================================

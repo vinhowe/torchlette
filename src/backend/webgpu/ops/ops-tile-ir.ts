@@ -68,12 +68,10 @@ function buildStridedOffset(
     let dimStride = 1;
     for (let j = d + 1; j < rank; j++) dimStride *= indexShape[j];
 
-    const coord = d < rank - 1
-      ? ctx.emitLet(`${prefix}_c${d}`, rem.div(ctx.u32(dimStride)))
-      : rem;
+    const coord = d < rank - 1 ? rem.div(ctx.u32(dimStride)) : rem;
 
     if (d < rank - 1) {
-      rem = ctx.emitLet(`${prefix}_r${d}`, rem.mod(ctx.u32(dimStride)));
+      rem = rem.mod(ctx.u32(dimStride));
     }
 
     // offset += coord * inputStride[d]
@@ -81,7 +79,7 @@ function buildStridedOffset(
     result = result.add(coord.mul(ctx.u32(strides[d])));
   }
 
-  return ctx.emitLet(`${prefix}_off`, result);
+  return result;
 }
 
 // ============================================================================
@@ -270,13 +268,13 @@ export function argReduceWGSL(
       // Decompose outIdx into output coordinates and compute input offset
       let baseOffset: BlockExpr = ctx.u32(0);
       if (outShape.length > 0) {
-        let rem = ctx.emitLet("ar_rem", outIdx);
+        let rem: BlockExpr = outIdx;
         for (let d = 0; d < outShape.length; d++) {
           const coord = d < outShape.length - 1
-            ? ctx.emitLet(`ar_c${d}`, rem.div(ctx.u32(outStrides[d])))
+            ? rem.div(ctx.u32(outStrides[d]))
             : rem;
           if (d < outShape.length - 1) {
-            rem = ctx.emitLet(`ar_r${d}`, rem.mod(ctx.u32(outStrides[d])));
+            rem = rem.mod(ctx.u32(outStrides[d]));
           }
           // Map output coord back to input dimension
           // Find which input dim this output dim corresponds to
@@ -287,7 +285,6 @@ export function argReduceWGSL(
           }
         }
       }
-      baseOffset = ctx.emitLet("ar_base", baseOffset);
 
       // Sequential search for max/min
       const initVal = isMax ? -3.402823466e+38 : 3.402823466e+38;
@@ -697,12 +694,10 @@ export function stridedScatterCopyTileIR(
           let dimStride = 1;
           for (let j = d + 1; j < rank; j++) dimStride *= viewShape[j];
 
-          const coord = d < rank - 1
-            ? ctx.emitLet(`sc_c${d}`, rem.div(ctx.u32(dimStride)))
-            : rem;
+          const coord = d < rank - 1 ? rem.div(ctx.u32(dimStride)) : rem;
 
           if (d < rank - 1) {
-            rem = ctx.emitLet(`sc_r${d}`, rem.mod(ctx.u32(dimStride)));
+            rem = rem.mod(ctx.u32(dimStride));
           }
 
           baseOff = baseOff.add(coord.mul(ctx.u32(viewStrides[d])));
@@ -768,12 +763,10 @@ export function stridedScatterAddTileIR(
           let dimStride = 1;
           for (let j = d + 1; j < rank; j++) dimStride *= viewShape[j];
 
-          const coord = d < rank - 1
-            ? ctx.emitLet(`sa_c${d}`, rem.div(ctx.u32(dimStride)))
-            : rem;
+          const coord = d < rank - 1 ? rem.div(ctx.u32(dimStride)) : rem;
 
           if (d < rank - 1) {
-            rem = ctx.emitLet(`sa_r${d}`, rem.mod(ctx.u32(dimStride)));
+            rem = rem.mod(ctx.u32(dimStride));
           }
 
           baseOff = baseOff.add(coord.mul(ctx.u32(viewStrides[d])));
@@ -823,11 +816,9 @@ export function gatherTileIR(
       let rem: BlockExpr = idx;
       const coords: BlockExpr[] = [];
       for (let d = 0; d < rank; d++) {
-        const coord = d < rank - 1
-          ? ctx.emitLet(`g_c${d}`, rem.div(ctx.u32(indexStrides[d])))
-          : rem;
+        const coord = d < rank - 1 ? rem.div(ctx.u32(indexStrides[d])) : rem;
         if (d < rank - 1) {
-          rem = ctx.emitLet(`g_r${d}`, rem.mod(ctx.u32(indexStrides[d])));
+          rem = rem.mod(ctx.u32(indexStrides[d]));
         }
         coords.push(coord);
       }
@@ -886,11 +877,9 @@ export function scatterAddTileIR(
       let rem: BlockExpr = srcIdx;
       const coords: BlockExpr[] = [];
       for (let d = 0; d < rank; d++) {
-        const coord = d < rank - 1
-          ? ctx.emitLet(`s_c${d}`, rem.div(ctx.u32(srcStrides[d])))
-          : rem;
+        const coord = d < rank - 1 ? rem.div(ctx.u32(srcStrides[d])) : rem;
         if (d < rank - 1) {
-          rem = ctx.emitLet(`s_r${d}`, rem.mod(ctx.u32(srcStrides[d])));
+          rem = rem.mod(ctx.u32(srcStrides[d]));
         }
         coords.push(coord);
       }
