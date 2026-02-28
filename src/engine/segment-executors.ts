@@ -568,35 +568,50 @@ export async function executeSequentialSegmentWithEarlyRelease(
       if (isFusibleOp(node.op) && backend.name === "webgpu") {
         const reductionPlan = detectReductionPreamble(nodes, nodeIdx, reductionConsumerCount);
         if (reductionPlan) {
-          const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${reductionPlan.op}`;
+          const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${
+            reductionPlan.preambleChain
+              ? reductionPlan.preambleChain.map(n => n.op).join("+")
+              : reductionPlan.op}`;
           await withProfileContext(rpLabel, node.module, () =>
             executeReductionWithPreamble(reductionPlan, backend));
 
-          // Track storages for both consumed nodes (preamble + reduction)
+          const consumed = reductionPlan.consumedCount;
+          // Track storages for all consumed nodes
           if (enableEarlyRelease) {
-            // Preamble node: no result (consumed), but step still advances
-            step++;
-            releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
-            // Reduction node: has the result
-            const reductionNode = nodes[nodeIdx + 1];
-            if (reductionNode.result) {
-              nodeToStorage.set(reductionNode.id, reductionNode.result);
+            for (let c = 0; c < consumed; c++) {
+              const consumedNode = nodes[nodeIdx + c];
+              if (consumedNode.result) {
+                nodeToStorage.set(consumedNode.id, consumedNode.result);
+              }
+              step++;
+              releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
             }
-            step++;
-            releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
           } else {
-            step += 2;
+            step += consumed;
           }
 
           // Record reduction preamble action in lowered plan builder
           if (loweredPlanBuilder && nodeIdToFinalPos) {
-            loweredPlanBuilder.recordReductionPreamble(
-              nodeIdToFinalPos.get(node.id)!,
-              nodeIdToFinalPos.get(nodes[nodeIdx + 1].id)!,
-            );
+            if (reductionPlan.preambleChain && reductionPlan.chainOps && reductionPlan.chainInputDtypes) {
+              // Multi-op chain
+              loweredPlanBuilder.recordReductionPreamble(
+                nodeIdToFinalPos.get(node.id)!,
+                nodeIdToFinalPos.get(reductionPlan.reductionNode.id)!,
+                reductionPlan.preambleChain.map(n => nodeIdToFinalPos.get(n.id)!),
+                reductionPlan.chainOps,
+                reductionPlan.chainInputDtypes,
+                reductionPlan.consumedCount,
+              );
+            } else {
+              // Single-op preamble
+              loweredPlanBuilder.recordReductionPreamble(
+                nodeIdToFinalPos.get(node.id)!,
+                nodeIdToFinalPos.get(reductionPlan.reductionNode.id)!,
+              );
+            }
           }
 
-          nodeIdx += 1; // Skip the reduction node (consumed 2 nodes total)
+          nodeIdx += consumed - 1; // Skip consumed - 1 nodes (loop increments by 1)
           continue;
         }
       }

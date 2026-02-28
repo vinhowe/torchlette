@@ -528,6 +528,190 @@ export function makeSumFullWithPreambleSpec(
 }
 
 // ============================================================================
+// Preamble Chain Types & Helper
+// ============================================================================
+
+/** Describes a single preamble chain op for kernel generation. */
+export type PreambleChainKernelOp = {
+  /** applyFusedOp-compatible op name (e.g., "mul", "cast_f32", "relu") */
+  op: string;
+  /** Number of inputs: 1 for unary, 2 for binary */
+  arity: number;
+  /** For non-first binary ops: which input position has the chain result (0 or 1) */
+  chainInputPos?: 0 | 1;
+};
+
+/**
+ * Apply a chain of preamble ops in-register within the reduction loop body.
+ * External inputs are loaded from in0, in1, ... bindings at the given offset.
+ *
+ * First op: all inputs are external bindings.
+ * Subsequent ops: chain result is one input, optional external is the other.
+ */
+function applyPreambleChain(
+  ctx: KernelContext,
+  chainOps: PreambleChainKernelOp[],
+  offset: BlockExpr,
+): BlockExpr {
+  let externalIdx = 0;
+  let result: BlockExpr;
+
+  // First op: all inputs are external
+  const firstInput = ctx.load(`in${externalIdx++}`, offset);
+  if (chainOps[0].arity === 1) {
+    result = applyFusedOp(ctx, chainOps[0].op, [firstInput]);
+  } else {
+    const secondInput = ctx.load(`in${externalIdx++}`, offset);
+    result = applyFusedOp(ctx, chainOps[0].op, [firstInput, secondInput]);
+  }
+
+  // Remaining ops: chain result + optional external input
+  for (let i = 1; i < chainOps.length; i++) {
+    const op = chainOps[i];
+    if (op.arity === 1) {
+      result = applyFusedOp(ctx, op.op, [result]);
+    } else {
+      const ext = ctx.load(`in${externalIdx++}`, offset);
+      if (op.chainInputPos === 1) {
+        result = applyFusedOp(ctx, op.op, [ext, result]);
+      } else {
+        result = applyFusedOp(ctx, op.op, [result, ext]);
+      }
+    }
+  }
+
+  return result;
+}
+
+// ============================================================================
+// Sum Dim With Preamble Chain
+// ============================================================================
+
+/**
+ * Factory: Dimension-wise sum with fused multi-op preamble chain.
+ * Applies a chain of elementwise ops in the accumulation loop body.
+ */
+export function makeSumDimWithPreambleChainSpec(
+  chainOps: PreambleChainKernelOp[],
+  totalExternalInputs: number,
+  inputDtypes: DType[],
+  inputShape: number[],
+  inputStrides: number[],
+  normalizedDims: number[],
+  outShape: number[],
+  outStrides: number[],
+  inputToOutDim: number[],
+  parallel: boolean,
+): TileKernelSpec {
+  const opNames = chainOps.map(o => o.op).join("+");
+  const variant = parallel ? "par" : "seq";
+  const name = `sumPC_${opNames}_${variant}_${inputShape.join("x")}_d${normalizedDims.join(",")}`;
+
+  const bindings: Record<string, BindingSpec> = {};
+  for (let i = 0; i < totalExternalInputs; i++) {
+    bindings[`in${i}`] = { storage: "read", type: (inputDtypes[i] || "f32") as DataType };
+  }
+  bindings.out = { storage: "read_write", type: "f32" };
+
+  const needsF16 = inputDtypes.some(d => d === "f16");
+
+  if (parallel) {
+    return {
+      name,
+      workgroupSize: WG,
+      bindings,
+      enableF16: needsF16,
+      uniforms: { outSize: "u32", reductionSize: "u32" },
+      grid: (u) => {
+        const n = u.outSize;
+        if (n <= 65535) return [n];
+        return [Math.min(n, 65535), Math.ceil(n / 65535)];
+      },
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const wid = ctx.programId(0);
+        const outIdx = ctx.emitLet("outIdx", wid);
+        ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
+
+        const reductionSize = ctx.uniform("reductionSize");
+        const result = ctx.wgReduce("sum", tid, reductionSize, WG, (r) => {
+          const off = buildInputOffset(ctx, outIdx, r,
+            inputShape, inputStrides, outShape, outStrides,
+            normalizedDims, inputToOutDim, "spc");
+          return applyPreambleChain(ctx, chainOps, off);
+        });
+
+        ctx.guardedStore("out", tid.eq(ctx.u32(0)), outIdx, result);
+      },
+    };
+  }
+
+  // Sequential
+  return {
+    name,
+    workgroupSize: WG,
+    bindings,
+    enableF16: needsF16,
+    uniforms: { outSize: "u32", reductionSize: "u32" },
+    grid: elementwiseGrid(WG, { elementUniform: "outSize" }),
+    kernel(ctx) {
+      const idx = ctx.globalId(0);
+      ctx.ifThen(idx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
+
+      const acc = ctx.emitVar("total", "f32", ctx.f32(0));
+      ctx.forRange(ctx.u32(0), ctx.uniform("reductionSize"), (reduceIdx) => {
+        const off = buildInputOffset(ctx, idx, reduceIdx,
+          inputShape, inputStrides, outShape, outStrides,
+          normalizedDims, inputToOutDim, "spc");
+        acc.addAssign(applyPreambleChain(ctx, chainOps, off));
+      });
+      ctx.emitStore("out", idx, acc.get());
+    },
+  };
+}
+
+// ============================================================================
+// Sum Full With Preamble Chain
+// ============================================================================
+
+/**
+ * Factory: Full reduction sum with fused multi-op preamble chain.
+ * Single workgroup with wgReduce.
+ */
+export function makeSumFullWithPreambleChainSpec(
+  chainOps: PreambleChainKernelOp[],
+  totalExternalInputs: number,
+  inputDtypes: DType[],
+): TileKernelSpec {
+  const opNames = chainOps.map(o => o.op).join("+");
+  const name = `sumFullPC_${opNames}`;
+
+  const bindings: Record<string, BindingSpec> = {};
+  for (let i = 0; i < totalExternalInputs; i++) {
+    bindings[`in${i}`] = { storage: "read", type: (inputDtypes[i] || "f32") as DataType };
+  }
+  bindings.out = { storage: "read_write", type: "f32" };
+
+  const needsF16 = inputDtypes.some(d => d === "f16");
+
+  return {
+    name,
+    workgroupSize: WG,
+    bindings,
+    enableF16: needsF16,
+    uniforms: { size: "u32" },
+    grid: singleWorkgroup(),
+    kernel(ctx) {
+      const tid = ctx.localIndex();
+      const result = ctx.wgReduce("sum", tid, ctx.uniform("size"), WG, (i) =>
+        applyPreambleChain(ctx, chainOps, i),
+      );
+      ctx.guardedStore("out", tid.eq(ctx.u32(0)), ctx.u32(0), result);
+    },
+  };
+}
+
+// ============================================================================
 // Epilogue Chain Helper
 // ============================================================================
 
