@@ -17,6 +17,7 @@
  *   TORCHLETTE_SEQ_LEN=N              (default: 512)
  */
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Torchlette, type Tensor } from "../src/frontend";
 import {
@@ -42,6 +43,11 @@ import {
   resetBindGroupCacheStats,
   getBindGroupCacheMissLog,
   getArenaResolveStats,
+  startPipelineRecording,
+  stopPipelineRecording,
+  warmupFromRegistry,
+  serializeRegistry,
+  deserializeRegistry,
 } from "../src/backend/webgpu";
 import { getAndResetFlowCounters, getGPUAllocationHistogram } from "../src/backend/webgpu/memory-tracker";
 import { storageTracker } from "../src/engine/lazy";
@@ -253,6 +259,21 @@ async function main() {
     if (label) setProfileModule(label);
   });
 
+  // Pipeline warmup: pre-compile cached pipelines from previous run
+  const warmupFile = `/tmp/torchlette-pipeline-registry-${MODEL_NAME}-${SEQ_LEN}.json`;
+  if (fs.existsSync(warmupFile)) {
+    try {
+      const json = fs.readFileSync(warmupFile, "utf-8");
+      const entries = deserializeRegistry(json);
+      const result = await warmupFromRegistry(entries);
+      console.log(`Pipeline warmup: ${result.compiled} compiled, ${result.skipped} skipped (${result.timeMs.toFixed(0)}ms)\n`);
+    } catch (e) {
+      console.log(`Pipeline warmup failed (stale cache?): ${e}\n`);
+    }
+  } else {
+    console.log("No pipeline cache found — step 0 will compile all pipelines.\n");
+  }
+
   const inputTokens = FIXED_TOKENS.slice(0, -1); // 31 tokens
   const targetTokens = FIXED_TOKENS.slice(1); // 31 tokens
   // Tile tokens across batch dimension
@@ -282,6 +303,9 @@ async function main() {
   storageTracker.debugCounters();
 
   for (let step = 0; step < NUM_STEPS; step++) {
+    // Record pipelines during step 0 for warmup cache
+    if (step === 0) startPipelineRecording();
+
     if (scaler) await scaler.resolveDeferred();
     await api.beginStep();
     const input = api.tensorFromArray(inputData, [BATCH_SIZE, seqLen], { device: "webgpu" });
@@ -349,6 +373,13 @@ async function main() {
     api.endStep();
     await api.markStep();
     const t4 = performance.now();
+
+    // Save pipeline registry after step 0
+    if (step === 0) {
+      const pipelineRegistry = stopPipelineRecording();
+      fs.writeFileSync(warmupFile, serializeRegistry(pipelineRegistry));
+      console.log(`  Pipeline registry: ${pipelineRegistry.length} pipelines saved to ${warmupFile}`);
+    }
 
     // Read GPU timestamps (only the profile step has timestamp data)
     await readGpuTimestamps();
