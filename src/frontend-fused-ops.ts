@@ -114,7 +114,7 @@ export function rmsnormImpl(
     ? [x, weight]
     : [];
 
-  // Use fused forward kernel on WebGPU
+  // Use fused forward + backward kernels on WebGPU
   if (x.device === "webgpu") {
     const numRows = sizeOf(xShape.slice(0, rank - 1));
     const config = { numRows, featureDim: lastDimSize, eps };
@@ -123,7 +123,15 @@ export function rmsnormImpl(
     );
 
     return torch._wrapWithGrad(result, [x, weight], (grad, getSaved) => {
-      return rmsnormBackwardImpl(torch, grad, getSaved, normalizedDim, lastDimSize, rank, eps);
+      const savedX = getSaved(0);
+      const savedWeight = getSaved(1);
+      const gradX = torch.runtime.fusedRMSNormBackwardGradX(
+        grad, savedX._unwrap(), savedWeight._unwrap(), config,
+      );
+      const gradWeight = torch.runtime.fusedRMSNormBackwardGradWeight(
+        grad, savedX._unwrap(), savedWeight._unwrap(), config,
+      );
+      return [gradX, gradWeight];
     }, tensorsToSave);
   }
 

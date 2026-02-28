@@ -409,6 +409,20 @@ export interface BackendOps {
     weight: BackendTensor,
     config: FusedRMSNormConfig,
   ): BackendTensor;
+  /** Fused RMSNorm backward gradX: grad [N,D] + x [N,D] + weight [D] → gradX [N,D]. */
+  fusedRMSNormBackwardGradX?(
+    gradOutput: BackendTensor,
+    x: BackendTensor,
+    weight: BackendTensor,
+    config: FusedRMSNormConfig,
+  ): BackendTensor;
+  /** Fused RMSNorm backward gradWeight: grad [N,D] + x [N,D] + weight [D] → gradWeight [D]. */
+  fusedRMSNormBackwardGradWeight?(
+    gradOutput: BackendTensor,
+    x: BackendTensor,
+    weight: BackendTensor,
+    config: FusedRMSNormConfig,
+  ): BackendTensor;
   /** Create a zeroed inf-flag buffer for unscaleGrad. */
   createInfCountBuffer?(): unknown;
   /** Read inf flag (0.0 or 1.0) and destroy buffer. */

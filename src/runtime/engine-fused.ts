@@ -264,6 +264,51 @@ export function fusedRMSNormForwardOp(
 }
 
 /**
+ * Fused RMSNorm backward gradX: grad [N,D] + x [N,D] + weight [D] → gradX [N,D].
+ */
+export function fusedRMSNormBackwardGradXOp(
+  gradOutputRef: LazyRef,
+  xRef: LazyRef,
+  weightRef: LazyRef,
+  xShape: number[],
+  device: DeviceKind,
+  config: FusedRMSNormConfig,
+): FusedOpResult {
+  const shape = xShape.slice();
+  const node = createLazyIRNode(
+    "fusedRMSNormBackwardGradX",
+    [gradOutputRef, xRef, weightRef],
+    shape,
+    "f32",
+    device,
+    config,
+  );
+  return { ref: createPendingRef(node), shape };
+}
+
+/**
+ * Fused RMSNorm backward gradWeight: grad [N,D] + x [N,D] + weight [D] → gradWeight [D].
+ */
+export function fusedRMSNormBackwardGradWeightOp(
+  gradOutputRef: LazyRef,
+  xRef: LazyRef,
+  weightRef: LazyRef,
+  device: DeviceKind,
+  config: FusedRMSNormConfig,
+): FusedOpResult {
+  const shape = [config.featureDim];
+  const node = createLazyIRNode(
+    "fusedRMSNormBackwardGradWeight",
+    [gradOutputRef, xRef, weightRef],
+    shape,
+    "f32",
+    device,
+    config,
+  );
+  return { ref: createPendingRef(node), shape };
+}
+
+/**
  * Extract the gradBias side output from a fusedLayerNormBackwardGradWeightBias node.
  */
 export function extractLnBwdGradBiasOp(
