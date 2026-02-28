@@ -126,6 +126,11 @@ export type MaxOptions = {
   keepdim?: boolean;
 };
 
+export type MinOptions = {
+  dim?: number | number[] | null;
+  keepdim?: boolean;
+};
+
 export type ArgReduceOptions = {
   dim: number;
   keepdim?: boolean;
@@ -298,6 +303,8 @@ export interface BackendOps {
   sum(a: BackendTensor, options?: SumOptions): BackendTensor;
   /** Max reduction. Returns 0-d tensor for full reduction (no dim). */
   max(a: BackendTensor, options?: MaxOptions): BackendTensor;
+  /** Min reduction. Returns 0-d tensor for full reduction (no dim). */
+  min?(a: BackendTensor, options?: MaxOptions): BackendTensor;
   /** Mean reduction. Returns 0-d tensor for full reduction (no dim). */
   mean(a: BackendTensor, options?: MeanOptions): BackendTensor;
   /** Argmax reduction. Returns indices of maximum values along dimension. */

@@ -5,6 +5,7 @@ import type {
   GeluOptions,
   MaxOptions,
   MeanOptions,
+  MinOptions,
   ScatterAddOptions,
   SubOptions,
   SumOptions,
@@ -347,6 +348,10 @@ export class Tensor {
 
   max(options?: MaxOptions): number | Tensor {
     return this.engine.max(this, options);
+  }
+
+  min(options?: MinOptions): number | Tensor {
+    return this.engine.min(this, options);
   }
 
   mean(options?: MeanOptions): number | Tensor {

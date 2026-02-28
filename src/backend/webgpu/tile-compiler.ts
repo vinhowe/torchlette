@@ -165,6 +165,9 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
     case "subgroupMax": {
       return `subgroupMax(${exprFor(node.value, bindings, loopVar)})`;
     }
+    case "subgroupMin": {
+      return `subgroupMin(${exprFor(node.value, bindings, loopVar)})`;
+    }
     case "subgroupBroadcastFirst": {
       return `subgroupBroadcastFirst(${exprFor(node.value, bindings, loopVar)})`;
     }
@@ -767,6 +770,7 @@ function collectExprNames(node: IRNode, names: Set<string>): void {
       break;
     case "subgroupAdd":
     case "subgroupMax":
+    case "subgroupMin":
     case "subgroupBroadcastFirst":
     case "subgroupInclusiveAdd":
       collectExprNames(node.value, names);
@@ -900,6 +904,7 @@ function getSharedReadsFromExpr(node: IRNode, names: Set<string>): void {
       return;
     case "subgroupAdd":
     case "subgroupMax":
+    case "subgroupMin":
     case "subgroupBroadcastFirst":
     case "subgroupInclusiveAdd":
       getSharedReadsFromExpr(node.value, names);
@@ -1258,6 +1263,7 @@ function exprDependsOn(node: IRNode, names: Set<string>): boolean {
       return exprDependsOn(node.value, names) || exprDependsOn(node.mask, names);
     case "subgroupAdd":
     case "subgroupMax":
+    case "subgroupMin":
     case "subgroupBroadcastFirst":
     case "subgroupInclusiveAdd":
       return exprDependsOn(node.value, names);
@@ -1303,6 +1309,7 @@ function exprContainsLoad(node: IRNode): boolean {
       return exprContainsLoad(node.value) || exprContainsLoad(node.mask);
     case "subgroupAdd":
     case "subgroupMax":
+    case "subgroupMin":
     case "subgroupBroadcastFirst":
     case "subgroupInclusiveAdd":
       return exprContainsLoad(node.value);
@@ -1521,6 +1528,7 @@ function exprContainsMemoryRead(node: IRNode): boolean {
       return exprContainsMemoryRead(node.value) || exprContainsMemoryRead(node.mask);
     case "subgroupAdd":
     case "subgroupMax":
+    case "subgroupMin":
     case "subgroupBroadcastFirst":
     case "subgroupInclusiveAdd":
       return exprContainsMemoryRead(node.value);
@@ -1576,6 +1584,7 @@ function collectExprCSECandidates(node: IRNode, nodes: Map<number, IRNode>): voi
       break;
     case "subgroupAdd":
     case "subgroupMax":
+    case "subgroupMin":
     case "subgroupBroadcastFirst":
     case "subgroupInclusiveAdd":
       collectExprCSECandidates(node.value, nodes);

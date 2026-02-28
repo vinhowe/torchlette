@@ -24,6 +24,7 @@ export type LazyOpCode =
   | "sum"
   | "mean"
   | "max"
+  | "min"
   | "argmax"
   | "argmin"
   | "gt"

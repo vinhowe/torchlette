@@ -1710,6 +1710,23 @@ export class RuntimeEngine {
     return this.createAndTrack(createBaseId(), createPendingRef(node), shape, op.device, dtype);
   }
 
+  min(a: Tensor, options?: MaxOptions): number | Tensor {
+    const [op] = this.ensureDtypeSafety("min", [a]);
+    const shape = reduceShape(op.shape, options?.dim, options?.keepdim ?? false);
+    const dtype = op.dtype;
+
+    const node = createLazyIRNode(
+      "min",
+      [op.lazyRef],
+      shape,
+      dtype,
+      op.device,
+      options,
+    );
+
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, op.device, dtype);
+  }
+
   mean(a: Tensor, options?: MeanOptions): number | Tensor {
     const [op] = this.ensureDtypeSafety("mean", [a]);
     const shape = reduceShape(op.shape, options?.dim, options?.keepdim ?? false);

@@ -159,6 +159,11 @@ export interface SubgroupMaxNode extends IRNodeBase {
   value: IRNode;
 }
 
+export interface SubgroupMinNode extends IRNodeBase {
+  kind: "subgroupMin";
+  value: IRNode;
+}
+
 export interface SubgroupBroadcastFirstNode extends IRNodeBase {
   kind: "subgroupBroadcastFirst";
   value: IRNode;
@@ -249,6 +254,7 @@ export type IRNode =
   | SubgroupShuffleXorNode
   | SubgroupAddNode
   | SubgroupMaxNode
+  | SubgroupMinNode
   | SubgroupBroadcastFirstNode
   | SubgroupInclusiveAddNode
   | Vec4DotNode
@@ -1240,6 +1246,13 @@ export class BlockExpr {
     }));
   }
 
+  subgroupMin(): BlockExpr {
+    return new BlockExpr(makeNode<SubgroupMinNode>({
+      kind: "subgroupMin", value: this.node,
+      valueType: this.node.valueType, dataType: this.node.dataType,
+    }));
+  }
+
   subgroupBroadcastFirst(): BlockExpr {
     return new BlockExpr(makeNode<SubgroupBroadcastFirstNode>({
       kind: "subgroupBroadcastFirst", value: this.node,
@@ -1884,20 +1897,34 @@ export class KernelContext {
     }
   }
 
+  /** Tree min reduction: `smem[0] = min(smem[0..wgSize-1])`. */
+  treeReduceMin(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number): void {
+    if (this.canUseSubgroups(wgSize)) {
+      this._treeReduceSubgroup(smem, tid, wgSize, "min");
+      return;
+    }
+    for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
+      this.ifThen(tid.lt(this.u32(stride)), () => {
+        smem.write(tid, smem.read(tid).min(smem.read(tid.add(this.u32(stride)))));
+      });
+      this.barrier();
+    }
+  }
+
   /**
    * Subgroup-optimized tree reduction.
    * 1. Read from smem → subgroupAdd/Max → lane 0 of each subgroup writes back
    * 2. Small tree reduction across numSubgroups values
    */
   private _treeReduceSubgroup(
-    smem: SharedArrayHandle, tid: BlockExpr, wgSize: number, op: "sum" | "max",
+    smem: SharedArrayHandle, tid: BlockExpr, wgSize: number, op: "sum" | "max" | "min",
   ): void {
     const sg = this.subgroupSize;
     const numSubgroups = wgSize / sg;
     // Phase 1: subgroup reduction (0 barriers)
     const val = this.emitLet("_sgr_val", smem.read(tid));
     const sgReduced = this.emitLet("_sgr_red",
-      op === "sum" ? val.subgroupAdd() : val.subgroupMax());
+      op === "sum" ? val.subgroupAdd() : op === "max" ? val.subgroupMax() : val.subgroupMin());
     // Write subgroup leaders to smem[subgroupId]
     this.barrier(); // sync before smem rewrite
     this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
@@ -1909,7 +1936,7 @@ export class KernelContext {
       this.ifThen(tid.lt(this.u32(stride)), () => {
         const a = smem.read(tid);
         const b = smem.read(tid.add(this.u32(stride)));
-        smem.write(tid, op === "sum" ? a.add(b) : a.max(b));
+        smem.write(tid, op === "sum" ? a.add(b) : op === "max" ? a.max(b) : a.min(b));
       });
       this.barrier();
     }
@@ -2049,18 +2076,20 @@ export class KernelContext {
    * subgroupAdd/Max, then small tree reduction across subgroup leaders.
    */
   wgReduce(
-    op: "sum" | "max",
+    op: "sum" | "max" | "min",
     tid: BlockExpr, count: BlockExpr, wgSize: number,
     bodyFn: (i: BlockExpr) => BlockExpr,
   ): BlockExpr {
     const id = this.reduceCounter++;
-    const identity = op === "sum" ? 0.0 : -3.402823e+38;
+    const identity = op === "sum" ? 0.0 : op === "max" ? -3.402823e+38 : 3.402823e+38;
     const acc = this.emitVar(`_wgr${id}_a`, "f32", this.f32(identity));
     this.stridedFor(tid, count, wgSize, (i) => {
       if (op === "sum") {
         acc.addAssign(bodyFn(i));
-      } else {
+      } else if (op === "max") {
         acc.set(acc.get().max(bodyFn(i)));
+      } else {
+        acc.set(acc.get().min(bodyFn(i)));
       }
     });
 
@@ -2069,7 +2098,7 @@ export class KernelContext {
       const numSubgroups = wgSize / sg;
       // Phase 1: subgroup reduction from registers (0 barriers, no smem write)
       const sgReduced = this.emitLet(`_wgr${id}_sgr`,
-        op === "sum" ? acc.get().subgroupAdd() : acc.get().subgroupMax());
+        op === "sum" ? acc.get().subgroupAdd() : op === "max" ? acc.get().subgroupMax() : acc.get().subgroupMin());
       // Phase 2: leaders write to small smem
       const smem = this.sharedArray(`_wgr${id}_s`, numSubgroups);
       this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
@@ -2081,7 +2110,7 @@ export class KernelContext {
         this.ifThen(tid.lt(this.u32(stride)), () => {
           const a = smem.read(tid);
           const b = smem.read(tid.add(this.u32(stride)));
-          smem.write(tid, op === "sum" ? a.add(b) : a.max(b));
+          smem.write(tid, op === "sum" ? a.add(b) : op === "max" ? a.max(b) : a.min(b));
         });
         this.barrier();
       }
@@ -2094,8 +2123,10 @@ export class KernelContext {
     this.barrier();
     if (op === "sum") {
       this.treeReduceSum(smem, tid, wgSize);
-    } else {
+    } else if (op === "max") {
       this.treeReduceMax(smem, tid, wgSize);
+    } else {
+      this.treeReduceMin(smem, tid, wgSize);
     }
     return smem.read(this.u32(0));
   }

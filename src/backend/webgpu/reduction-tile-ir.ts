@@ -405,6 +405,117 @@ export function makeMaxFullSpec(): TileKernelSpec {
 }
 
 // ============================================================================
+// Min Dim Reduction
+// ============================================================================
+
+export function makeMinDimSpec(
+  inputShape: number[],
+  inputStrides: number[],
+  normalizedDims: number[],
+  outShape: number[],
+  outStrides: number[],
+  inputToOutDim: number[],
+  parallel: boolean,
+): TileKernelSpec {
+  const variant = parallel ? "par" : "seq";
+  const name = `minDim_${variant}_${inputShape.join("x")}_d${normalizedDims.join(",")}`;
+
+  if (parallel) {
+    return {
+      name,
+      workgroupSize: WG,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        out: { storage: "read_write", type: "f32" },
+      },
+      uniforms: {
+        outSize: "u32",
+        reductionSize: "u32",
+      },
+      grid: (u) => {
+        const n = u.outSize;
+        if (n <= 65535) return [n];
+        return [Math.min(n, 65535), Math.ceil(n / 65535)];
+      },
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const wid = ctx.programId(0);
+        const outIdx = ctx.emitLet("outIdx", wid);
+
+        ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
+
+        const reductionSize = ctx.uniform("reductionSize");
+        const result = ctx.wgReduce("min", tid, reductionSize, WG, (r) => {
+          const off = buildInputOffset(ctx, outIdx, r,
+            inputShape, inputStrides, outShape, outStrides,
+            normalizedDims, inputToOutDim, "mp");
+          return ctx.load("input", off);
+        });
+
+        ctx.guardedStore("out", tid.eq(ctx.u32(0)), outIdx, result);
+      },
+    };
+  }
+
+  // Sequential
+  return {
+    name,
+    workgroupSize: WG,
+    bindings: {
+      input: { storage: "read", type: "f32" },
+      out: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      outSize: "u32",
+      reductionSize: "u32",
+    },
+    grid: elementwiseGrid(WG, { elementUniform: "outSize" }),
+    kernel(ctx) {
+      const idx = ctx.globalId(0);
+      ctx.ifThen(idx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
+
+      // First element as initial min value
+      const firstOff = buildInputOffset(ctx, idx, ctx.u32(0),
+        inputShape, inputStrides, outShape, outStrides,
+        normalizedDims, inputToOutDim, "ms0");
+      const minVal = ctx.emitVar("minVal", "f32", ctx.load("input", firstOff));
+
+      ctx.forRange(ctx.u32(1), ctx.uniform("reductionSize"), (r) => {
+        const off = buildInputOffset(ctx, idx, r,
+          inputShape, inputStrides, outShape, outStrides,
+          normalizedDims, inputToOutDim, "ms");
+        minVal.set(minVal.get().min(ctx.load("input", off)));
+      });
+      ctx.emitStore("out", idx, minVal.get());
+    },
+  };
+}
+
+// ============================================================================
+// Min Full Reduction
+// ============================================================================
+
+export function makeMinFullSpec(): TileKernelSpec {
+  return {
+    name: "minFull",
+    workgroupSize: WG,
+    bindings: {
+      input: { storage: "read", type: "f32" },
+      out: { storage: "read_write", type: "f32" },
+    },
+    uniforms: { size: "u32" },
+    grid: singleWorkgroup(),
+    kernel(ctx) {
+      const tid = ctx.localIndex();
+      const result = ctx.wgReduce("min", tid, ctx.uniform("size"), WG, (i) =>
+        ctx.load("input", i),
+      );
+      ctx.guardedStore("out", tid.eq(ctx.u32(0)), ctx.u32(0), result);
+    },
+  };
+}
+
+// ============================================================================
 // Mean Division
 // ============================================================================
 

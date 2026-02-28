@@ -164,7 +164,7 @@ import { add, sub, div, mul, sqrt, relu, exp, log, neg, abs, tanh, sigmoid, gelu
 import { cast, reshape, expand, contiguous, narrow, narrowBackward, transpose, permute } from "./ops/views";
 import { matmul } from "./ops/matmul-ops";
 import { gather, scatterAdd, cat } from "./ops/gather-scatter";
-import { sum, max, mean } from "./ops/reductions";
+import { sum, max, min, mean } from "./ops/reductions";
 import { stridedScatterCopy, stridedScatterAdd } from "./ops/strided-scatter";
 import { adamStep, unscaleGrad, createInfCountBuffer, readAndDestroyInfCount, fusedCrossEntropyForward, fusedCrossEntropyBackward, fusedLayerNormForward, fusedLayerNormBackwardGradX, fusedLayerNormBackwardGradWeightBias, fusedRMSNormForward, fusedRMSNormBackwardGradX, fusedRMSNormBackwardGradWeight, fusedAttentionForward, fusedAttentionBackward, read, waitForGPU, mulScalarInPlace } from "./ops/fused";
 
@@ -239,6 +239,7 @@ export const webgpuBackend: Backend & {
     cat,
     sum,
     max,
+    min,
     mean,
     argmax,
     argmin,
