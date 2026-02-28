@@ -10,6 +10,8 @@
  * D-precompute: dO,O → D    (per-row dot product)
  * Backward dQ: Q,K,V,L,D,dO → dQ
  * Backward dKV: Q,K,V,L,D,dO → dK,dV
+ *
+ * Auto-CSE handles all sub-expression sharing — no manual emitLet needed.
  */
 
 import type { TileKernelSpec } from "./tile-ir";
@@ -87,18 +89,18 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
       const isCausal = ctx.uniform("is_causal");
       const scale = ctx.uniform("scale_u32").bitcastTo("f32");
 
-      const qRow = ctx.emitLet("_qRow", qBlock.mul(ctx.u32(BR)).add(rowLane));
-      const valid = ctx.emitLet("_valid", qRow.lt(N));
+      const qRow = qBlock.mul(ctx.u32(BR)).add(rowLane);
+      const valid = qRow.lt(N);
 
-      const bhOff = ctx.emitLet("_bhOff", bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim));
-      const bhOffL = ctx.emitLet("_bhOffL", bIdx.mul(numHeads).add(hIdx).mul(N));
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
 
       // Load Q row slice into vec4 registers
       const qReg = ctx.registerVec4Array("q_reg", D4_COUNT);
       ctx.ifThen(valid, () => {
-        const qBase = ctx.emitLet("_qBase", bhOff.add(qRow.mul(Dim)));
+        const qBase = bhOff.add(qRow.mul(Dim));
         ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
-          const off = ctx.emitLet("_qOff", qBase.add(d4Start.add(d4).mul(ctx.u32(4))));
+          const off = qBase.add(d4Start.add(d4).mul(ctx.u32(4)));
           qReg.write(d4, ctx.vec4(
             ctx.load("Q", off), ctx.load("Q", off.add(ctx.u32(1))),
             ctx.load("Q", off.add(ctx.u32(2))), ctx.load("Q", off.add(ctx.u32(3))),
@@ -119,7 +121,7 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
       const numKVTiles = N.add(ctx.u32(BC - 1)).div(ctx.u32(BC));
 
       ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
-        const kvStart = ctx.emitLet("_kvStart", tile.mul(ctx.u32(BC)));
+        const kvStart = tile.mul(ctx.u32(BC));
 
         // Cooperative load K and V tiles (strided: each thread handles WG-strided elements)
         ctx.stridedFor(tidx, ctx.u32(BC * HD4), WG, (idx) => {
@@ -127,7 +129,7 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
           const d4 = idx.mod(ctx.u32(HD4));
           const kvRow = kvStart.add(row);
           const inBounds = kvRow.lt(N);
-          const off = ctx.emitLet("_kvOff", bhOff.add(kvRow.mul(Dim)).add(d4.mul(ctx.u32(4))));
+          const off = bhOff.add(kvRow.mul(Dim)).add(d4.mul(ctx.u32(4)));
           kTile.write(idx, inBounds.select(
             ctx.vec4(ctx.load("K", off), ctx.load("K", off.add(ctx.u32(1))),
                      ctx.load("K", off.add(ctx.u32(2))), ctx.load("K", off.add(ctx.u32(3)))),
@@ -165,15 +167,15 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
             sVal = ctx.emitLet("_s1", sVal.add(sVal.subgroupShuffleXor(1)));
             sVal = ctx.emitLet("_s2", sVal.add(sVal.subgroupShuffleXor(2)));
           }
-          const s = ctx.emitLet("_s", sVal.mul(scale));
+          const s = sVal.mul(scale);
           const score = isActive.select(s, ctx.f32(-3.402823e+38));
           scores.set(j, score);
           tileMax.set(isActive.select(tileMax.get().max(s), tileMax.get()));
         });
 
         // Online softmax update
-        const mNew = ctx.emitLet("_mNew", mI.get().max(tileMax.get()));
-        const correction = ctx.emitLet("_corr", mI.get().sub(mNew).exp());
+        const mNew = mI.get().max(tileMax.get());
+        const correction = mI.get().sub(mNew).exp();
 
         lI.set(lI.get().mul(correction));
         ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
@@ -181,7 +183,7 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
         });
 
         ctx.forRange(ctx.u32(0), ctx.u32(BC), (j) => {
-          const p = ctx.emitLet("_p", scores.get(j).sub(mNew).exp());
+          const p = scores.get(j).sub(mNew).exp();
           lI.addAssign(p);
           ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
             oAcc.addAssign(d4,
@@ -198,10 +200,10 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
       ctx.ifThen(valid, () => {
         const invL = lI.get().gt(ctx.f32(0)).select(
           ctx.f32(1).div(lI.get()), ctx.f32(0));
-        const oBase = ctx.emitLet("_oBase", bhOff.add(qRow.mul(Dim)));
+        const oBase = bhOff.add(qRow.mul(Dim));
         ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
           const v = oAcc.read(d4).vec4MulScalar(invL);
-          const off = ctx.emitLet("_oOff", oBase.add(d4Start.add(d4).mul(ctx.u32(4))));
+          const off = oBase.add(d4Start.add(d4).mul(ctx.u32(4)));
           ctx.emitStore("O", off, v.vec4Component(0));
           ctx.emitStore("O", off.add(ctx.u32(1)), v.vec4Component(1));
           ctx.emitStore("O", off.add(ctx.u32(2)), v.vec4Component(2));
@@ -330,11 +332,11 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
       const isCausal = ctx.uniform("is_causal");
       const scale = ctx.uniform("scale_u32").bitcastTo("f32");
 
-      const qRow = ctx.emitLet("_qRow", qBlock.mul(ctx.u32(BR)).add(rowLane));
-      const valid = ctx.emitLet("_valid", qRow.lt(N));
+      const qRow = qBlock.mul(ctx.u32(BR)).add(rowLane);
+      const valid = qRow.lt(N);
 
-      const bhOff = ctx.emitLet("_bhOff", bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim));
-      const bhOffL = ctx.emitLet("_bhOffL", bIdx.mul(numHeads).add(hIdx).mul(N));
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
 
       // Load Q row slice and dO row slice into vec4 registers
       const qReg = ctx.registerVec4Array("q_reg", D4_COUNT);
@@ -344,9 +346,9 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
       const dVar = ctx.emitVar("_Di", "f32", ctx.f32(0));
 
       ctx.ifThen(valid, () => {
-        const base = ctx.emitLet("_qBase", bhOff.add(qRow.mul(Dim)));
+        const base = bhOff.add(qRow.mul(Dim));
         ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
-          const off = ctx.emitLet("_ld", base.add(d4Start.add(d4).mul(ctx.u32(4))));
+          const off = base.add(d4Start.add(d4).mul(ctx.u32(4)));
           qReg.write(d4, ctx.vec4(
             ctx.load("Q", off), ctx.load("Q", off.add(ctx.u32(1))),
             ctx.load("Q", off.add(ctx.u32(2))), ctx.load("Q", off.add(ctx.u32(3))),
@@ -367,7 +369,7 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
       const numKVTiles = N.add(ctx.u32(BC - 1)).div(ctx.u32(BC));
 
       ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
-        const kvStart = ctx.emitLet("_kvStart", tile.mul(ctx.u32(BC)));
+        const kvStart = tile.mul(ctx.u32(BC));
 
         // Cooperative load K and V tiles (strided)
         ctx.stridedFor(tidx, ctx.u32(BC * HD4), WG, (idx) => {
@@ -375,7 +377,7 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
           const d4 = idx.mod(ctx.u32(HD4));
           const kvRow = kvStart.add(row);
           const inBounds = kvRow.lt(N);
-          const off = ctx.emitLet("_kvOff", bhOff.add(kvRow.mul(Dim)).add(d4.mul(ctx.u32(4))));
+          const off = bhOff.add(kvRow.mul(Dim)).add(d4.mul(ctx.u32(4)));
           kTile.write(idx, inBounds.select(
             ctx.vec4(ctx.load("K", off), ctx.load("K", off.add(ctx.u32(1))),
                      ctx.load("K", off.add(ctx.u32(2))), ctx.load("K", off.add(ctx.u32(3)))),
@@ -410,7 +412,7 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
             sVal = ctx.emitLet("_s1", sVal.add(sVal.subgroupShuffleXor(1)));
             sVal = ctx.emitLet("_s2", sVal.add(sVal.subgroupShuffleXor(2)));
           }
-          const s = ctx.emitLet("_s", sVal.mul(scale));
+          const s = sVal.mul(scale);
           const p = isActive.select(s.sub(lVar.get()).exp(), ctx.f32(0));
 
           // Partial dot: dO[i] . V[j]
@@ -427,7 +429,7 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
             dovVal = ctx.emitLet("_dv2", dovVal.add(dovVal.subgroupShuffleXor(2)));
           }
 
-          const ds = ctx.emitLet("_ds", p.mul(dovVal.sub(dVar.get())));
+          const ds = p.mul(dovVal.sub(dVar.get()));
 
           // dQ[i] += ds * K[j]
           ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
@@ -442,10 +444,10 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
 
       // Write dQ (each thread writes its slice, with scale applied at write)
       ctx.ifThen(valid, () => {
-        const base = ctx.emitLet("_dqBase", bhOff.add(qRow.mul(Dim)));
+        const base = bhOff.add(qRow.mul(Dim));
         ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
           const v = dqAcc.read(d4).vec4MulScalar(scale);
-          const off = ctx.emitLet("_dqOff", base.add(d4Start.add(d4).mul(ctx.u32(4))));
+          const off = base.add(d4Start.add(d4).mul(ctx.u32(4)));
           ctx.emitStore("dQ", off, v.vec4Component(0));
           ctx.emitStore("dQ", off.add(ctx.u32(1)), v.vec4Component(1));
           ctx.emitStore("dQ", off.add(ctx.u32(2)), v.vec4Component(2));
@@ -509,11 +511,11 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
       const isCausal = ctx.uniform("is_causal");
       const scale = ctx.uniform("scale_u32").bitcastTo("f32");
 
-      const kvRow = ctx.emitLet("_kvRow", kvBlock.mul(ctx.u32(BC_BW)).add(rowLane));
-      const valid = ctx.emitLet("_valid", kvRow.lt(N));
+      const kvRow = kvBlock.mul(ctx.u32(BC_BW)).add(rowLane);
+      const valid = kvRow.lt(N);
 
-      const bhOff = ctx.emitLet("_bhOff", bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim));
-      const bhOffL = ctx.emitLet("_bhOffL", bIdx.mul(numHeads).add(hIdx).mul(N));
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
 
       // Load K and V row slices into vec4 registers
       const kReg = ctx.registerVec4Array("k_reg", D4_COUNT);
@@ -522,9 +524,9 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
       const dvAcc = ctx.registerVec4Array("dv_acc", D4_COUNT);
 
       ctx.ifThen(valid, () => {
-        const base = ctx.emitLet("_kvBase", bhOff.add(kvRow.mul(Dim)));
+        const base = bhOff.add(kvRow.mul(Dim));
         ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
-          const off = ctx.emitLet("_kvOff", base.add(d4Start.add(d4).mul(ctx.u32(4))));
+          const off = base.add(d4Start.add(d4).mul(ctx.u32(4)));
           kReg.write(d4, ctx.vec4(
             ctx.load("K", off), ctx.load("K", off.add(ctx.u32(1))),
             ctx.load("K", off.add(ctx.u32(2))), ctx.load("K", off.add(ctx.u32(3))),
@@ -545,7 +547,7 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
       const numQTiles = N.add(ctx.u32(BQ_BW - 1)).div(ctx.u32(BQ_BW));
 
       ctx.forRange(ctx.u32(0), numQTiles, (qt) => {
-        const qStart = ctx.emitLet("_qStart", qt.mul(ctx.u32(BQ_BW)));
+        const qStart = qt.mul(ctx.u32(BQ_BW));
 
         // Causal tile skip: guard body so we skip tiles where max qi < min kv_row
         const skipTile = isCausal.ne(ctx.u32(0)).and(
@@ -559,7 +561,7 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
             const d4 = idx.mod(ctx.u32(HD4));
             const qi = qStart.add(row);
             const inBounds = qi.lt(N);
-            const base = ctx.emitLet("_qOff", bhOff.add(qi.mul(Dim)).add(d4.mul(ctx.u32(4))));
+            const base = bhOff.add(qi.mul(Dim)).add(d4.mul(ctx.u32(4)));
             qTile.write(idx, inBounds.select(
               ctx.vec4(ctx.load("Q", base), ctx.load("Q", base.add(ctx.u32(1))),
                        ctx.load("Q", base.add(ctx.u32(2))), ctx.load("Q", base.add(ctx.u32(3)))),
@@ -603,7 +605,7 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
               sVal = ctx.emitLet("_s1", sVal.add(sVal.subgroupShuffleXor(1)));
               sVal = ctx.emitLet("_s2", sVal.add(sVal.subgroupShuffleXor(2)));
             }
-            const s = ctx.emitLet("_s", sVal.mul(scale));
+            const s = sVal.mul(scale);
             const p = isActive.select(s.sub(lTile.read(j)).exp(), ctx.f32(0));
 
             // Partial dot: dO[qi] . V[kv_row]
@@ -620,8 +622,8 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
               dovVal = ctx.emitLet("_dv2", dovVal.add(dovVal.subgroupShuffleXor(2)));
             }
 
-            const ds = ctx.emitLet("_ds", p.mul(dovVal.sub(dTile.read(j))));
-            const dsScale = ctx.emitLet("_dss", ds.mul(scale));
+            const ds = p.mul(dovVal.sub(dTile.read(j)));
+            const dsScale = ds.mul(scale);
 
             // Accumulate dK and dV (each thread accumulates its vec4 slice)
             ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
@@ -640,9 +642,9 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
 
       // Write dK and dV
       ctx.ifThen(valid, () => {
-        const base = ctx.emitLet("_dkvBase", bhOff.add(kvRow.mul(Dim)));
+        const base = bhOff.add(kvRow.mul(Dim));
         ctx.forRange(ctx.u32(0), ctx.u32(D4_COUNT), (d4) => {
-          const off = ctx.emitLet("_dkvOff", base.add(d4Start.add(d4).mul(ctx.u32(4))));
+          const off = base.add(d4Start.add(d4).mul(ctx.u32(4)));
           const dk = dkAcc.read(d4);
           ctx.emitStore("dK", off, dk.vec4Component(0));
           ctx.emitStore("dK", off.add(ctx.u32(1)), dk.vec4Component(1));
