@@ -30,7 +30,7 @@ import { computeContiguousStrides } from "../backend/types";
 import { getInputStorage, executeOp, withProfileContext } from "./op-dispatch";
 import type { MatmulPrologueInfo, MatmulEpiloguePlan } from "./matmul-epilogue";
 import { detectMatmulEpilogue, detectMatmulEpilogueCore, executeMatmulWithEpilogue } from "./matmul-epilogue";
-import { detectReductionPreamble, executeReductionWithPreamble } from "./reduction-preamble";
+import { detectReductionPreamble, executeReductionWithPreamble, detectReductionEpilogue, executeReductionWithEpilogue } from "./reduction-preamble";
 
 /** Default reclaim interval, overridable via TORCHLETTE_RECLAIM_INTERVAL env var. */
 export const DEFAULT_RECLAIM_INTERVAL =
@@ -301,6 +301,18 @@ export async function executeSequentialSegment(
         }
       }
 
+      // Try reduction epilogue fusion (Phase 4)
+      if ((node.op === "sum" || node.op === "mean" || node.op === "max") && backend.name === "webgpu") {
+        const epiloguePlan = detectReductionEpilogue(nodes, nodeIdx, reductionConsumerCount, externalNodeIds);
+        if (epiloguePlan) {
+          const reLabel = node.op + "+" + epiloguePlan.epilogueOps.map(o => o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind).join("+");
+          await withProfileContext(reLabel, node.module, () =>
+            executeReductionWithEpilogue(epiloguePlan, backend));
+          nodeIdx += epiloguePlan.consumedCount - 1;
+          continue;
+        }
+      }
+
       const nodeBackend = getBackend(node.device) ?? backend;
       const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
       const backendInputs = inputs.map((s) => s.backendTensor);
@@ -490,6 +502,33 @@ export async function executeSequentialSegmentWithEarlyRelease(
           }
 
           nodeIdx += 1; // Skip the reduction node (consumed 2 nodes total)
+          continue;
+        }
+      }
+
+      // Try reduction epilogue fusion (Phase 4)
+      if ((node.op === "sum" || node.op === "mean" || node.op === "max") && backend.name === "webgpu") {
+        const epiloguePlan = detectReductionEpilogue(nodes, nodeIdx, reductionConsumerCount, externalNodeIds);
+        if (epiloguePlan) {
+          const reLabel = node.op + "+" + epiloguePlan.epilogueOps.map(o => o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind).join("+");
+          await withProfileContext(reLabel, node.module, () =>
+            executeReductionWithEpilogue(epiloguePlan, backend));
+
+          // Track storages for consumed nodes
+          if (enableEarlyRelease) {
+            for (let c = 0; c < epiloguePlan.consumedCount; c++) {
+              const consumedNode = nodes[nodeIdx + c];
+              if (consumedNode.result) {
+                nodeToStorage.set(consumedNode.id, consumedNode.result);
+              }
+              step++;
+              releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
+            }
+          } else {
+            step += epiloguePlan.consumedCount;
+          }
+
+          nodeIdx += epiloguePlan.consumedCount - 1;
           continue;
         }
       }

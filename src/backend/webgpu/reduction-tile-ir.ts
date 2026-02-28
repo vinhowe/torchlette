@@ -14,12 +14,14 @@ import {
   type KernelContext,
   type BlockExpr,
   type BindingSpec,
+  type DataType,
   elementwiseGrid,
   singleWorkgroup,
 } from "./tile-ir";
 import { compileTileKernel } from "./tile-compiler";
 import { applyFusedOp } from "./fusion-tile-ir";
 import { WORKGROUP_SIZE } from "./shape-utils";
+import type { DType } from "../types";
 
 const WG = WORKGROUP_SIZE; // 256
 
@@ -521,6 +523,310 @@ export function makeSumFullWithPreambleSpec(
         acc.addAssign(applyFusedOp(ctx, preambleOp, inputs));
       });
       ctx.emitStore("out", ctx.u32(0), acc.get());
+    },
+  };
+}
+
+// ============================================================================
+// Epilogue Chain Helper
+// ============================================================================
+
+/** Describes a single epilogue op to apply after a reduction. */
+export type ReductionEpilogueOpDesc = {
+  kind: string;
+  toDtype?: DType;
+  inputIndex?: number;
+  op?: string;
+};
+
+/**
+ * Apply a chain of epilogue ops to a reduced value in-register.
+ * Binary ops load external inputs from ep_inN bindings at the output index.
+ */
+function applyEpilogueChain(
+  ctx: KernelContext,
+  value: BlockExpr,
+  epilogueOps: ReductionEpilogueOpDesc[],
+  outIdx: BlockExpr,
+): BlockExpr {
+  let result = value;
+  for (const eop of epilogueOps) {
+    if (eop.kind === "cast") {
+      if (eop.toDtype === "f16") result = result.toF16();
+      else if (eop.toDtype === "i32") result = result.toI32();
+      else if (eop.toDtype === "u32") result = result.toU32();
+      else result = result.toF32();
+    } else if (eop.kind === "binary" && eop.op && eop.inputIndex !== undefined) {
+      const epInput = ctx.load(`ep_in${eop.inputIndex}`, outIdx);
+      result = applyFusedOp(ctx, eop.op, [result, epInput]);
+    } else if (eop.kind === "unary" && eop.op) {
+      result = applyFusedOp(ctx, eop.op, [result]);
+    } else if (eop.kind === "gelu") {
+      result = applyFusedOp(ctx, "gelu_tanh", [result]);
+    }
+  }
+  return result;
+}
+
+/**
+ * Build epilogue bindings for external inputs.
+ */
+function buildEpilogueBindings(
+  epilogueOps: ReductionEpilogueOpDesc[],
+): Record<string, BindingSpec> {
+  const bindings: Record<string, BindingSpec> = {};
+  for (const eop of epilogueOps) {
+    if (eop.kind === "binary" && eop.inputIndex !== undefined) {
+      bindings[`ep_in${eop.inputIndex}`] = { storage: "read", type: "f32" as DataType };
+    }
+  }
+  return bindings;
+}
+
+/**
+ * Determine the output DataType for bindings from the final DType.
+ */
+function outBindingType(dtype: DType): DataType {
+  if (dtype === "f16") return "f16";
+  if (dtype === "i32") return "i32";
+  if (dtype === "u32") return "u32";
+  return "f32";
+}
+
+// ============================================================================
+// Sum Dim With Epilogue
+// ============================================================================
+
+/**
+ * Factory: Dimension-wise sum with fused epilogue chain.
+ * After reducing, applies epilogue ops (cast, add, mul, activations) in-register.
+ */
+export function makeSumDimWithEpilogueSpec(
+  inputShape: number[],
+  inputStrides: number[],
+  normalizedDims: number[],
+  outShape: number[],
+  outStrides: number[],
+  inputToOutDim: number[],
+  parallel: boolean,
+  epilogueOps: ReductionEpilogueOpDesc[],
+  outputDtype: DType,
+): TileKernelSpec {
+  const variant = parallel ? "par" : "seq";
+  const name = `sumDimEp_${variant}_${inputShape.join("x")}_d${normalizedDims.join(",")}`;
+
+  const bindings: Record<string, BindingSpec> = {
+    input: { storage: "read", type: "f32" },
+    ...buildEpilogueBindings(epilogueOps),
+    out: { storage: "read_write", type: outBindingType(outputDtype) },
+  };
+
+  if (parallel) {
+    return {
+      name,
+      workgroupSize: WG,
+      bindings,
+      uniforms: { outSize: "u32", reductionSize: "u32" },
+      grid: (u) => {
+        const n = u.outSize;
+        if (n <= 65535) return [n];
+        return [Math.min(n, 65535), Math.ceil(n / 65535)];
+      },
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const wid = ctx.programId(0);
+        const outIdx = ctx.emitLet("outIdx", wid);
+        ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
+
+        const reductionSize = ctx.uniform("reductionSize");
+        const result = ctx.wgReduce("sum", tid, reductionSize, WG, (r) => {
+          const off = buildInputOffset(ctx, outIdx, r,
+            inputShape, inputStrides, outShape, outStrides,
+            normalizedDims, inputToOutDim, "sep");
+          return ctx.load("input", off);
+        });
+
+        const final = applyEpilogueChain(ctx, result, epilogueOps, outIdx);
+        ctx.guardedStore("out", tid.eq(ctx.u32(0)), outIdx, final);
+      },
+    };
+  }
+
+  return {
+    name,
+    workgroupSize: WG,
+    bindings,
+    uniforms: { outSize: "u32", reductionSize: "u32" },
+    grid: elementwiseGrid(WG, { elementUniform: "outSize" }),
+    kernel(ctx) {
+      const idx = ctx.globalId(0);
+      ctx.ifThen(idx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
+
+      const reductionSize = ctx.uniform("reductionSize");
+      const acc = ctx.emitVar("total", "f32", ctx.f32(0));
+      ctx.forRange(ctx.u32(0), reductionSize, (r) => {
+        const off = buildInputOffset(ctx, idx, r,
+          inputShape, inputStrides, outShape, outStrides,
+          normalizedDims, inputToOutDim, "ses");
+        acc.addAssign(ctx.load("input", off));
+      });
+
+      const final = applyEpilogueChain(ctx, acc.get(), epilogueOps, idx);
+      ctx.emitStore("out", idx, final);
+    },
+  };
+}
+
+// ============================================================================
+// Sum Full With Epilogue
+// ============================================================================
+
+/**
+ * Factory: Full reduction sum with fused epilogue chain.
+ */
+export function makeSumFullWithEpilogueSpec(
+  epilogueOps: ReductionEpilogueOpDesc[],
+  outputDtype: DType,
+): TileKernelSpec {
+  const bindings: Record<string, BindingSpec> = {
+    input: { storage: "read", type: "f32" },
+    ...buildEpilogueBindings(epilogueOps),
+    out: { storage: "read_write", type: outBindingType(outputDtype) },
+  };
+
+  return {
+    name: "sumFullEp",
+    workgroupSize: WG,
+    bindings,
+    uniforms: { size: "u32" },
+    grid: singleWorkgroup(),
+    kernel(ctx) {
+      const tid = ctx.localIndex();
+      const result = ctx.wgReduce("sum", tid, ctx.uniform("size"), WG, (i) =>
+        ctx.load("input", i),
+      );
+      const final = applyEpilogueChain(ctx, result, epilogueOps, ctx.u32(0));
+      ctx.guardedStore("out", tid.eq(ctx.u32(0)), ctx.u32(0), final);
+    },
+  };
+}
+
+// ============================================================================
+// Max Dim With Epilogue
+// ============================================================================
+
+/**
+ * Factory: Dimension-wise max with fused epilogue chain.
+ */
+export function makeMaxDimWithEpilogueSpec(
+  inputShape: number[],
+  inputStrides: number[],
+  normalizedDims: number[],
+  outShape: number[],
+  outStrides: number[],
+  inputToOutDim: number[],
+  parallel: boolean,
+  epilogueOps: ReductionEpilogueOpDesc[],
+  outputDtype: DType,
+): TileKernelSpec {
+  const variant = parallel ? "par" : "seq";
+  const name = `maxDimEp_${variant}_${inputShape.join("x")}_d${normalizedDims.join(",")}`;
+
+  const bindings: Record<string, BindingSpec> = {
+    input: { storage: "read", type: "f32" },
+    ...buildEpilogueBindings(epilogueOps),
+    out: { storage: "read_write", type: outBindingType(outputDtype) },
+  };
+
+  if (parallel) {
+    return {
+      name,
+      workgroupSize: WG,
+      bindings,
+      uniforms: { outSize: "u32", reductionSize: "u32" },
+      grid: (u) => {
+        const n = u.outSize;
+        if (n <= 65535) return [n];
+        return [Math.min(n, 65535), Math.ceil(n / 65535)];
+      },
+      kernel(ctx) {
+        const tid = ctx.localIndex();
+        const wid = ctx.programId(0);
+        const outIdx = ctx.emitLet("outIdx", wid);
+        ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
+
+        const reductionSize = ctx.uniform("reductionSize");
+        const result = ctx.wgReduce("max", tid, reductionSize, WG, (r) => {
+          const off = buildInputOffset(ctx, outIdx, r,
+            inputShape, inputStrides, outShape, outStrides,
+            normalizedDims, inputToOutDim, "mep");
+          return ctx.load("input", off);
+        });
+
+        const final = applyEpilogueChain(ctx, result, epilogueOps, outIdx);
+        ctx.guardedStore("out", tid.eq(ctx.u32(0)), outIdx, final);
+      },
+    };
+  }
+
+  return {
+    name,
+    workgroupSize: WG,
+    bindings,
+    uniforms: { outSize: "u32", reductionSize: "u32" },
+    grid: elementwiseGrid(WG, { elementUniform: "outSize" }),
+    kernel(ctx) {
+      const idx = ctx.globalId(0);
+      ctx.ifThen(idx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
+
+      const firstOff = buildInputOffset(ctx, idx, ctx.u32(0),
+        inputShape, inputStrides, outShape, outStrides,
+        normalizedDims, inputToOutDim, "mes0");
+      const maxVal = ctx.emitVar("maxVal", "f32", ctx.load("input", firstOff));
+
+      ctx.forRange(ctx.u32(1), ctx.uniform("reductionSize"), (r) => {
+        const off = buildInputOffset(ctx, idx, r,
+          inputShape, inputStrides, outShape, outStrides,
+          normalizedDims, inputToOutDim, "mes");
+        maxVal.set(maxVal.get().max(ctx.load("input", off)));
+      });
+
+      const final = applyEpilogueChain(ctx, maxVal.get(), epilogueOps, idx);
+      ctx.emitStore("out", idx, final);
+    },
+  };
+}
+
+// ============================================================================
+// Max Full With Epilogue
+// ============================================================================
+
+/**
+ * Factory: Full reduction max with fused epilogue chain.
+ */
+export function makeMaxFullWithEpilogueSpec(
+  epilogueOps: ReductionEpilogueOpDesc[],
+  outputDtype: DType,
+): TileKernelSpec {
+  const bindings: Record<string, BindingSpec> = {
+    input: { storage: "read", type: "f32" },
+    ...buildEpilogueBindings(epilogueOps),
+    out: { storage: "read_write", type: outBindingType(outputDtype) },
+  };
+
+  return {
+    name: "maxFullEp",
+    workgroupSize: WG,
+    bindings,
+    uniforms: { size: "u32" },
+    grid: singleWorkgroup(),
+    kernel(ctx) {
+      const tid = ctx.localIndex();
+      const result = ctx.wgReduce("max", tid, ctx.uniform("size"), WG, (i) =>
+        ctx.load("input", i),
+      );
+      const final = applyEpilogueChain(ctx, result, epilogueOps, ctx.u32(0));
+      ctx.guardedStore("out", tid.eq(ctx.u32(0)), ctx.u32(0), final);
     },
   };
 }

@@ -143,7 +143,7 @@ export { isAutotuneEnabled, pretuneMatmulShapes, setAutotuneEnabled } from "./ma
 
 // Re-export public functions from ops modules
 export { tensorFromArrayWithDtype } from "./ops/creation";
-export { sumDimWithPreamble } from "./ops/reductions";
+export { sumDimWithPreamble, sumWithEpilogue, maxWithEpilogue, meanWithEpilogue } from "./ops/reductions";
 export { waitForGPU } from "./ops/fused";
 export { detectSimpleTranspose, ensureContiguous } from "./ops/views";
 
