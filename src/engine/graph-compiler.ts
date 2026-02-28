@@ -19,6 +19,7 @@ import type { LazyIRNode, LazyRef } from "./lazy-types";
 import type { MatmulPrologueInfo } from "./matmul-epilogue";
 import type { CompoundMatch } from "./compound-patterns";
 import { detectCompoundPatterns } from "./compound-patterns";
+import { runRewritePasses } from "./graph-rewrites";
 import {
   reorderPlanForFusion,
   segmentPlanForExecution,
@@ -57,6 +58,9 @@ export interface GraphAnalysisResult {
 
   /** Consumer count map (nodeId → number of consumers in the plan). */
   consumerCount: Map<number, number>;
+
+  /** Node IDs bypassed by graph rewrites (identity casts, redundant contiguous). */
+  rewriteBypassedIds: Set<number>;
 }
 
 // ============================================================================
@@ -282,6 +286,13 @@ export function analyzeGraph(
   const nodeById = new Map<number, LazyIRNode>();
   for (const n of reorderedNodes) nodeById.set(n.id, n);
 
+  // --- Graph rewrites: simplify before pattern detection ---
+  const rewriteBypassedIds = runRewritePasses({
+    planNodes: reorderedNodes,
+    consumers,
+    consumerCount,
+  });
+
   // --- Priority 100: Matmul epilogue chains ---
   const {
     epilogueClaimedIds,
@@ -311,9 +322,14 @@ export function analyzeGraph(
   }
 
   // --- Priority 40: Elementwise fusion (via segmentPlanForExecution) ---
+  // Bypassed nodes are excluded from fusion (they become view-like pass-throughs)
   let allClaimedIds: Set<number> | undefined;
-  if (epilogueClaimedIds.size > 0 || prologueClaimedIds.size > 0 || compoundClaimedIds.size > 0) {
-    allClaimedIds = new Set([...epilogueClaimedIds, ...prologueClaimedIds, ...compoundClaimedIds]);
+  if (epilogueClaimedIds.size > 0 || prologueClaimedIds.size > 0 ||
+      compoundClaimedIds.size > 0 || rewriteBypassedIds.size > 0) {
+    allClaimedIds = new Set([
+      ...epilogueClaimedIds, ...prologueClaimedIds,
+      ...compoundClaimedIds, ...rewriteBypassedIds,
+    ]);
   }
   const segments = segmentPlanForExecution(reorderedNodes, externalNodeIds, {
     maxStorageBuffers,
@@ -331,5 +347,6 @@ export function analyzeGraph(
     matmulPrologues,
     compoundMatches,
     consumerCount,
+    rewriteBypassedIds,
   };
 }
