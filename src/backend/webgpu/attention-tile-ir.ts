@@ -122,26 +122,20 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
       ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
         const kvStart = tile.mul(ctx.u32(BC));
 
-        // Cooperative load K and V tiles (strided: each thread handles WG-strided elements)
-        ctx.stridedFor(tidx, ctx.u32(BC * HD4), WG, (idx) => {
+        // Cooperative load K and V tiles
+        ctx.tileLoadPairVec4(tidx, WG, kTile, vTile, BC * HD4, (idx) => {
           const row = idx.div(ctx.u32(HD4));
           const d4 = idx.mod(ctx.u32(HD4));
           const kvRow = kvStart.add(row);
           const inBounds = kvRow.lt(N);
           const off = bhOff.add(kvRow.mul(Dim)).add(d4.mul(ctx.u32(4)));
-          kTile.write(idx, inBounds.select(
-            ctx.vec4(ctx.load("K", off), ctx.load("K", off.add(ctx.u32(1))),
-                     ctx.load("K", off.add(ctx.u32(2))), ctx.load("K", off.add(ctx.u32(3)))),
+          const vec = (buf: string) => inBounds.select(
+            ctx.vec4(ctx.load(buf, off), ctx.load(buf, off.add(ctx.u32(1))),
+                     ctx.load(buf, off.add(ctx.u32(2))), ctx.load(buf, off.add(ctx.u32(3)))),
             ctx.vec4Splat(ctx.f32(0)),
-          ));
-          vTile.write(idx, inBounds.select(
-            ctx.vec4(ctx.load("V", off), ctx.load("V", off.add(ctx.u32(1))),
-                     ctx.load("V", off.add(ctx.u32(2))), ctx.load("V", off.add(ctx.u32(3)))),
-            ctx.vec4Splat(ctx.f32(0)),
-          ));
+          );
+          return [vec("K"), vec("V")];
         });
-
-        ctx.barrier();
 
         // Score computation + online softmax
         const tileMax = ctx.emitVar("_tMax", "f32", ctx.f32(-3.402823e+38));
@@ -370,26 +364,20 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
       ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
         const kvStart = tile.mul(ctx.u32(BC));
 
-        // Cooperative load K and V tiles (strided)
-        ctx.stridedFor(tidx, ctx.u32(BC * HD4), WG, (idx) => {
+        // Cooperative load K and V tiles
+        ctx.tileLoadPairVec4(tidx, WG, kTile, vTile, BC * HD4, (idx) => {
           const row = idx.div(ctx.u32(HD4));
           const d4 = idx.mod(ctx.u32(HD4));
           const kvRow = kvStart.add(row);
           const inBounds = kvRow.lt(N);
           const off = bhOff.add(kvRow.mul(Dim)).add(d4.mul(ctx.u32(4)));
-          kTile.write(idx, inBounds.select(
-            ctx.vec4(ctx.load("K", off), ctx.load("K", off.add(ctx.u32(1))),
-                     ctx.load("K", off.add(ctx.u32(2))), ctx.load("K", off.add(ctx.u32(3)))),
+          const vec = (buf: string) => inBounds.select(
+            ctx.vec4(ctx.load(buf, off), ctx.load(buf, off.add(ctx.u32(1))),
+                     ctx.load(buf, off.add(ctx.u32(2))), ctx.load(buf, off.add(ctx.u32(3)))),
             ctx.vec4Splat(ctx.f32(0)),
-          ));
-          vTile.write(idx, inBounds.select(
-            ctx.vec4(ctx.load("V", off), ctx.load("V", off.add(ctx.u32(1))),
-                     ctx.load("V", off.add(ctx.u32(2))), ctx.load("V", off.add(ctx.u32(3)))),
-            ctx.vec4Splat(ctx.f32(0)),
-          ));
+          );
+          return [vec("K"), vec("V")];
         });
-
-        ctx.barrier();
 
         // Score + gradient computation
         ctx.range(0, BC, (j) => {
@@ -554,23 +542,20 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
         );
 
         ctx.ifThen(skipTile.not(), () => {
-          // Cooperative load Q and dO tiles (strided)
+          // Cooperative load Q and dO tiles (no trailing barrier — deferred to after L/D load)
           ctx.stridedFor(tidx, ctx.u32(BQ_BW * HD4), WG, (idx) => {
             const row = idx.div(ctx.u32(HD4));
             const d4 = idx.mod(ctx.u32(HD4));
             const qi = qStart.add(row);
             const inBounds = qi.lt(N);
             const base = bhOff.add(qi.mul(Dim)).add(d4.mul(ctx.u32(4)));
-            qTile.write(idx, inBounds.select(
-              ctx.vec4(ctx.load("Q", base), ctx.load("Q", base.add(ctx.u32(1))),
-                       ctx.load("Q", base.add(ctx.u32(2))), ctx.load("Q", base.add(ctx.u32(3)))),
+            const vec = (buf: string) => inBounds.select(
+              ctx.vec4(ctx.load(buf, base), ctx.load(buf, base.add(ctx.u32(1))),
+                       ctx.load(buf, base.add(ctx.u32(2))), ctx.load(buf, base.add(ctx.u32(3)))),
               ctx.vec4Splat(ctx.f32(0)),
-            ));
-            doTile.write(idx, inBounds.select(
-              ctx.vec4(ctx.load("dO", base), ctx.load("dO", base.add(ctx.u32(1))),
-                       ctx.load("dO", base.add(ctx.u32(2))), ctx.load("dO", base.add(ctx.u32(3)))),
-              ctx.vec4Splat(ctx.f32(0)),
-            ));
+            );
+            qTile.write(idx, vec("Q"));
+            doTile.write(idx, vec("dO"));
           });
 
           // Load L and D values

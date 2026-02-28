@@ -2392,6 +2392,109 @@ export class KernelContext {
     this.forRange(this.u32(start), this.u32(end), body);
   }
 
+  /**
+   * Cooperatively load a 1D tile from a global buffer into shared memory.
+   * Each thread loads WG-strided elements with automatic bounds checking.
+   * Includes a trailing workgroupBarrier() so the shared memory is ready to read.
+   *
+   * Like Triton's `tl.load` for shared memory tiles:
+   *   smem[i] = buffer[baseOffset + i]  if baseOffset + i is in bounds
+   *   smem[i] = fallback               otherwise
+   *
+   * @param tid        - Thread index within workgroup (localIndex)
+   * @param wgSize     - Workgroup size
+   * @param smem       - Shared memory array to write into
+   * @param count      - Number of elements to load
+   * @param loadFn     - Function mapping tile-local index → value to store
+   */
+  tileLoad(
+    tid: BlockExpr, wgSize: number,
+    smem: SharedArrayHandle,
+    count: BlockExpr | number,
+    loadFn: (i: BlockExpr) => BlockExpr,
+  ): void {
+    const bound = typeof count === "number" ? this.u32(count) : count;
+    this.stridedFor(tid, bound, wgSize, (i) => {
+      smem.write(i, loadFn(i));
+    });
+    this.barrier();
+  }
+
+  /**
+   * Cooperatively store a 1D tile from shared memory back to a global buffer.
+   * Each thread writes WG-strided elements with automatic bounds checking.
+   * Includes a leading workgroupBarrier() to ensure shared memory reads are consistent.
+   *
+   * @param tid       - Thread index within workgroup (localIndex)
+   * @param wgSize    - Workgroup size
+   * @param smem      - Shared memory array to read from
+   * @param count     - Number of elements to store
+   * @param storeFn   - Function mapping (index, value) → void. Should emit a store.
+   */
+  tileStore(
+    tid: BlockExpr, wgSize: number,
+    smem: SharedArrayHandle,
+    count: BlockExpr | number,
+    storeFn: (i: BlockExpr, val: BlockExpr) => void,
+  ): void {
+    this.barrier();
+    const bound = typeof count === "number" ? this.u32(count) : count;
+    this.stridedFor(tid, bound, wgSize, (i) => {
+      storeFn(i, smem.read(i));
+    });
+  }
+
+  /**
+   * Cooperatively load a 1D tile from a global buffer into a vec4 shared memory array.
+   * Each thread loads WG-strided vec4 elements with automatic bounds checking.
+   * Includes a trailing workgroupBarrier().
+   *
+   * @param tid        - Thread index within workgroup (localIndex)
+   * @param wgSize     - Workgroup size
+   * @param smem       - Vec4 shared memory array
+   * @param count      - Number of vec4 elements to load
+   * @param loadFn     - Function mapping tile-local index → vec4 value
+   */
+  tileLoadVec4(
+    tid: BlockExpr, wgSize: number,
+    smem: Vec4ArrayHandle,
+    count: BlockExpr | number,
+    loadFn: (i: BlockExpr) => BlockExpr,
+  ): void {
+    const bound = typeof count === "number" ? this.u32(count) : count;
+    this.stridedFor(tid, bound, wgSize, (i) => {
+      smem.write(i, loadFn(i));
+    });
+    this.barrier();
+  }
+
+  /**
+   * Cooperatively load two vec4 shared memory tiles in a single strided loop.
+   * Uses one loop and one barrier instead of two, saving one barrier per tile pair.
+   * Common pattern in attention kernels (load K and V simultaneously).
+   *
+   * @param tid        - Thread index within workgroup
+   * @param wgSize     - Workgroup size
+   * @param smemA      - First vec4 shared memory array
+   * @param smemB      - Second vec4 shared memory array
+   * @param count      - Number of vec4 elements per tile
+   * @param loadFn     - Function mapping tile-local index → [valueA, valueB]
+   */
+  tileLoadPairVec4(
+    tid: BlockExpr, wgSize: number,
+    smemA: Vec4ArrayHandle, smemB: Vec4ArrayHandle,
+    count: BlockExpr | number,
+    loadFn: (i: BlockExpr) => [BlockExpr, BlockExpr],
+  ): void {
+    const bound = typeof count === "number" ? this.u32(count) : count;
+    this.stridedFor(tid, bound, wgSize, (i) => {
+      const [a, b] = loadFn(i);
+      smemA.write(i, a);
+      smemB.write(i, b);
+    });
+    this.barrier();
+  }
+
   // -- Scan primitives (like `tl.cumsum`, `tl.associative_scan`) --
 
   /** Hillis-Steele inclusive parallel prefix scan in shared memory.
