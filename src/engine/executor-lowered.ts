@@ -840,14 +840,57 @@ export async function executeLoweredPlan(
         case "reduction-preamble": {
           const preambleNode = planNodes[action.preambleNodeIndex];
           const reductionNode = planNodes[action.reductionNodeIndex];
-          const reductionPlan: ReductionPreamblePlan = {
-            preambleNode,
-            reductionNode,
-            op: preambleNode.op,
-            arity: preambleNode.inputs.length,
-            isMean: reductionNode.op === "mean",
-          };
-          const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${reductionPlan.op}`;
+
+          let reductionPlan: ReductionPreamblePlan;
+
+          if (action.chainNodeIndices && action.chainOps && action.chainInputDtypes) {
+            // Multi-op chain replay: reconstruct external input refs
+            const chainNodes = action.chainNodeIndices.map(i => planNodes[i]);
+            const externalInputRefs: import("./lazy").LazyRef[] = [];
+
+            // First chain node: all inputs are external
+            for (const ref of chainNodes[0].inputs) {
+              externalInputRefs.push(ref);
+            }
+            // Subsequent chain nodes: non-chain inputs are external
+            for (let ci = 1; ci < chainNodes.length; ci++) {
+              const node = chainNodes[ci];
+              const prevNode = chainNodes[ci - 1];
+              if (node.inputs.length === 2) {
+                const inp0IsChain = node.inputs[0].kind === "pending" &&
+                  node.inputs[0].node === prevNode;
+                externalInputRefs.push(node.inputs[inp0IsChain ? 1 : 0]);
+              }
+            }
+
+            reductionPlan = {
+              preambleNode,
+              reductionNode,
+              op: preambleNode.op,
+              arity: preambleNode.inputs.length,
+              isMean: reductionNode.op === "mean",
+              consumedCount: action.consumedCount!,
+              preambleChain: chainNodes,
+              chainOps: action.chainOps,
+              chainInputRefs: externalInputRefs,
+              chainInputDtypes: action.chainInputDtypes,
+            };
+          } else {
+            // Single-op preamble replay (existing path)
+            reductionPlan = {
+              preambleNode,
+              reductionNode,
+              op: preambleNode.op,
+              arity: preambleNode.inputs.length,
+              isMean: reductionNode.op === "mean",
+              consumedCount: 2,
+            };
+          }
+
+          const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${
+            reductionPlan.preambleChain
+              ? reductionPlan.preambleChain.map(n => n.op).join("+")
+              : reductionPlan.op}`;
           await withProfileContext(rpLabel, preambleNode.module, () =>
             executeReductionWithPreamble(reductionPlan, backend),
           );

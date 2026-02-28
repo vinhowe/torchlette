@@ -38,6 +38,8 @@ import {
   makeMeanDivSpec,
   makeSumDimWithPreambleSpec,
   makeSumFullWithPreambleSpec,
+  makeSumDimWithPreambleChainSpec,
+  makeSumFullWithPreambleChainSpec,
   makeSumDimWithEpilogueSpec,
   makeSumFullWithEpilogueSpec,
   makeMaxDimWithEpilogueSpec,
@@ -45,6 +47,7 @@ import {
   getChunkedSumWGSL,
   getFinalSumWGSL,
   type ReductionEpilogueOpDesc,
+  type PreambleChainKernelOp,
 } from "../reduction-tile-ir";
 
 // ============================================================================
@@ -376,10 +379,11 @@ export function sumDimWithPreamble(
   const { normalizedDims, outShape, outSize, reductionSize,
     inputStrides, outStrides, inputToOutDim } = setup;
 
-  const outBuffer = createTrackedBuffer(requireContext().device, {
-    size: outSize * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-  });
+  const inputBuffers = [];
+  for (let i = 0; i < arity; i++) {
+    inputBuffers.push(asGPUTensor(inputs[i]).buffer);
+  }
+  const outBuffer = resolveOutputBuffer(requireContext().device, outSize * 4, inputBuffers);
 
   const spec = makeSumDimWithPreambleSpec(
     preambleOp, arity, inputShape, inputStrides,
@@ -409,16 +413,99 @@ function sumFullReductionWithPreamble(
   const tensor0 = asGPUTensor(inputs[0]);
   const inputSize = tensor0.size;
 
-  const outBuffer = createTrackedBuffer(requireContext().device, {
-    size: 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-  });
+  const inputBuffers = [];
+  for (let i = 0; i < arity; i++) {
+    inputBuffers.push(asGPUTensor(inputs[i]).buffer);
+  }
+  const outBuffer = resolveOutputBuffer(requireContext().device, 4, inputBuffers);
 
   const spec = makeSumFullWithPreambleSpec(preambleOp, arity);
   const dispatcher = createTileKernelDispatcher(spec);
 
   const buffers: Record<string, GPUBuffer> = { out: outBuffer };
   for (let i = 0; i < arity; i++) {
+    buffers[`in${i}`] = asGPUTensor(inputs[i]).buffer;
+  }
+
+  dispatcher.dispatch(buffers, { size: inputSize });
+
+  return createTensor([], outBuffer);
+}
+
+// ============================================================================
+// Sum Dim With Preamble Chain (multi-op fused elementwise + reduce)
+// ============================================================================
+
+/**
+ * Dimension-wise sum with a fused multi-op preamble chain.
+ * Applies a chain of elementwise ops (cast → mul → ...) in the accumulation
+ * loop body, eliminating intermediate buffers between all preamble ops.
+ */
+export function sumDimWithPreambleChain(
+  inputs: BackendTensor[],
+  chainOps: PreambleChainKernelOp[],
+  inputDtypes: DType[],
+  sumOptions: SumOptions,
+): BackendTensor {
+  const ctx = requireContext();
+  const tensor0 = asGPUTensor(inputs[0]);
+  const inputShape = tensor0.shape;
+
+  const dim = sumOptions?.dim;
+  const keepdim = sumOptions?.keepdim ?? false;
+
+  if (dim === undefined || dim === null) {
+    return sumFullReductionWithPreambleChain(inputs, chainOps, inputDtypes);
+  }
+
+  const setup = prepareDimReduction(inputShape, dim, keepdim);
+  if (!setup) {
+    return sumFullReductionWithPreambleChain(inputs, chainOps, inputDtypes);
+  }
+
+  const { normalizedDims, outShape, outSize, reductionSize,
+    inputStrides, outStrides, inputToOutDim } = setup;
+  const inputBuffers = inputs.map(inp => asGPUTensor(inp).buffer);
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, inputBuffers);
+
+  const useParallel = reductionSize > 64;
+  const spec = makeSumDimWithPreambleChainSpec(
+    chainOps, inputs.length, inputDtypes,
+    inputShape, inputStrides, normalizedDims,
+    outShape, outStrides, inputToOutDim, useParallel,
+  );
+  const dispatcher = createTileKernelDispatcher(spec);
+
+  const buffers: Record<string, GPUBuffer> = { out: outBuffer };
+  for (let i = 0; i < inputs.length; i++) {
+    buffers[`in${i}`] = asGPUTensor(inputs[i]).buffer;
+  }
+
+  dispatcher.dispatch(buffers, { outSize, reductionSize });
+
+  return createTensor(outShape, outBuffer);
+}
+
+/**
+ * Full reduction sum with fused multi-op preamble chain.
+ */
+function sumFullReductionWithPreambleChain(
+  inputs: BackendTensor[],
+  chainOps: PreambleChainKernelOp[],
+  inputDtypes: DType[],
+): WebGPUTensor {
+  const ctx = requireContext();
+  const tensor0 = asGPUTensor(inputs[0]);
+  const inputSize = tensor0.size;
+
+  const inputBuffers = inputs.map(inp => asGPUTensor(inp).buffer);
+  const outBuffer = resolveOutputBuffer(ctx.device, 4, inputBuffers);
+
+  const spec = makeSumFullWithPreambleChainSpec(chainOps, inputs.length, inputDtypes);
+  const dispatcher = createTileKernelDispatcher(spec);
+
+  const buffers: Record<string, GPUBuffer> = { out: outBuffer };
+  for (let i = 0; i < inputs.length; i++) {
     buffers[`in${i}`] = asGPUTensor(inputs[i]).buffer;
   }
 

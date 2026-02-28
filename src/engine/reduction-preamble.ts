@@ -4,6 +4,7 @@ import { createStorageHandle } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
 import { shapesEqual } from "./matmul-epilogue";
 import { isFusibleOp } from "./fusion-detect";
+import type { PreambleChainKernelOp } from "../backend/webgpu/reduction-tile-ir";
 
 // ============================================================================
 // Reduction Preamble Fusion (Phase 3)
@@ -12,28 +13,69 @@ import { isFusibleOp } from "./fusion-detect";
 // ============================================================================
 
 export interface ReductionPreamblePlan {
-  /** The elementwise preamble node */
+  /** The elementwise preamble node (first in chain) */
   preambleNode: LazyIRNode;
   /** The sum or mean reduction node */
   reductionNode: LazyIRNode;
-  /** The elementwise op name (e.g., "mul", "exp", "add") */
+  /** The first elementwise op name (e.g., "mul", "exp", "add") */
   op: string;
-  /** Number of inputs to the elementwise op (1=unary, 2=binary) */
+  /** Number of inputs to the first elementwise op (1=unary, 2=binary) */
   arity: number;
   /** Whether the reduction is a mean (divide by count after sum) */
   isMean: boolean;
+  /** Total nodes consumed (chain length + 1 for reduction) */
+  consumedCount: number;
+  // Multi-op chain fields (set only for chains with length > 1):
+  /** All preamble nodes in chain order */
+  preambleChain?: LazyIRNode[];
+  /** Kernel op descriptors for the chain */
+  chainOps?: PreambleChainKernelOp[];
+  /** External input refs for the entire chain */
+  chainInputRefs?: LazyRef[];
+  /** Dtypes for each external input */
+  chainInputDtypes?: DType[];
 }
 
 /**
- * Detect an elementwise → sum/mean pattern suitable for reduction preamble fusion.
+ * Convert a LazyIRNode op name to applyFusedOp-compatible name.
+ * Handles cast (needs dtype suffix) and gelu (needs variant suffix).
+ */
+function getChainOpName(node: LazyIRNode): string {
+  if (node.op === "cast") {
+    const payload = node.payload as { dtype: DType } | undefined;
+    return `cast_${payload?.dtype || "f32"}`;
+  }
+  if (node.op === "gelu") {
+    const payload = node.payload as { approximate?: string } | undefined;
+    return payload?.approximate === "tanh" ? "gelu_tanh" : "gelu_erf";
+  }
+  return node.op;
+}
+
+/** Get the dtype of a LazyRef's backing tensor. */
+function getRefDtype(ref: LazyRef): DType {
+  if (ref.kind === "pending") return ref.node.dtype;
+  if (ref.kind === "materialized") {
+    return (ref.storage.backendTensor as { dtype?: DType }).dtype || "f32";
+  }
+  return "f32";
+}
+
+/**
+ * Detect an elementwise chain → sum/mean pattern suitable for reduction preamble fusion.
+ *
+ * Walks forward from startIdx collecting fusible elementwise ops (max depth 4)
+ * until a sum/mean reduction is found that consumes the last chain node.
+ *
+ * Single-op chains use the existing fast path. Multi-op chains (e.g., cast → mul → sum)
+ * generate a fused kernel that applies the entire chain in the accumulation loop body.
  *
  * Constraints:
- * - nodes[startIdx] must be a fusible elementwise op (unary or binary, not ternary)
- * - nodes[startIdx + 1] must be "sum" or "mean"
- * - The reduction's input must be a pending ref to the elementwise node
- * - The elementwise node must not be referenced by anything else
- * - All elementwise inputs must have the same shape as the elementwise output
- * - All inputs must be f32 dtype (preamble shader hardcodes f32)
+ * - All chain nodes must be fusible, unary/binary (not ternary), no existing result
+ * - Each intermediate node must have exactly 1 consumer (the next chain/reduction node)
+ * - All external inputs must have the same shape as the first node's output
+ * - The final chain output dtype must be f32 (for accumulator)
+ * - Single-op chains exclude standalone cast (no benefit)
  */
 export function detectReductionPreamble(
   nodes: LazyIRNode[],
@@ -42,76 +84,171 @@ export function detectReductionPreamble(
 ): ReductionPreamblePlan | null {
   if (startIdx + 1 >= nodes.length) return null;
 
-  const elemNode = nodes[startIdx];
-  const nextNode = nodes[startIdx + 1];
+  const firstNode = nodes[startIdx];
+  if (!isFusibleOp(firstNode.op)) return null;
+  if (firstNode.inputs.length > 2) return null;
+  if (firstNode.result) return null;
 
-  // 1. Check elementwise op is fusible and unary/binary (not ternary)
-  if (!isFusibleOp(elemNode.op)) return null;
-  if (elemNode.inputs.length > 2) return null; // Skip ternary (where)
-  if (elemNode.op === "cast") return null; // Cast doesn't benefit from fusion here
+  // Build chain of fusible elem ops ending at a sum/mean
+  const chain: LazyIRNode[] = [firstNode];
+  let reductionNode: LazyIRNode | null = null;
+  const MAX_CHAIN = 4;
 
-  // 2. Check next node is sum or mean
-  if (nextNode.op !== "sum" && nextNode.op !== "mean") return null;
+  for (let idx = startIdx + 1; idx < nodes.length && chain.length <= MAX_CHAIN; idx++) {
+    const nextNode = nodes[idx];
+    const lastChainNode = chain[chain.length - 1];
 
-  // 3. Check the reduction's primary input is a pending ref to the elementwise node
-  if (nextNode.inputs.length < 1) return null;
-  const reductionInput = nextNode.inputs[0];
-  if (reductionInput.kind !== "pending" || reductionInput.node !== elemNode) return null;
+    // Check if nextNode is a reduction consuming the last chain node
+    if (nextNode.op === "sum" || nextNode.op === "mean") {
+      if (nextNode.inputs.length >= 1 &&
+          nextNode.inputs[0].kind === "pending" &&
+          nextNode.inputs[0].node === lastChainNode) {
+        // Validate last chain node has exactly 1 consumer
+        if ((consumerCount.get(lastChainNode.id) ?? 0) !== 1) return null;
+        reductionNode = nextNode;
+        break;
+      }
+      break; // Reduction doesn't consume our chain
+    }
 
-  // 4. Check the elementwise output is only consumed by the reduction
-  const consumers = consumerCount.get(elemNode.id) ?? 0;
-  if (consumers !== 1) return null;
+    // Check if nextNode can extend the chain
+    if (!isFusibleOp(nextNode.op)) break;
+    if (nextNode.inputs.length > 2) break;
+    if (nextNode.result) break;
 
-  // 5. All elementwise inputs must have the same shape as the elementwise output
-  const elemShape = elemNode.shape;
-  for (const ref of elemNode.inputs) {
-    const inputNode = ref.kind === "pending" ? ref.node : null;
-    if (inputNode && !shapesEqual(inputNode.shape, elemShape)) return null;
-    // For materialized refs, we can't easily check shape at detection time.
-    // The backend tensor will have the correct shape, so we rely on the
-    // constraint that the lazy engine produces correct shapes.
+    // Check that nextNode consumes the last chain node
+    const consumesLast = nextNode.inputs.some(
+      inp => inp.kind === "pending" && inp.node === lastChainNode,
+    );
+    if (!consumesLast) break;
+
+    // Check single consumer on last chain node
+    if ((consumerCount.get(lastChainNode.id) ?? 0) !== 1) break;
+
+    chain.push(nextNode);
   }
 
-  // 6. All inputs must be f32 dtype (preamble shader hardcodes f32)
-  if (elemNode.dtype !== "f32") return null;
-  for (const ref of elemNode.inputs) {
-    if (ref.kind === "pending" && ref.node.dtype !== "f32") return null;
+  if (!reductionNode) return null;
+
+  // Single-op chain: use existing single-op constraints
+  if (chain.length === 1) {
+    if (firstNode.op === "cast") return null; // Cast alone doesn't benefit
+
+    const elemShape = firstNode.shape;
+    for (const ref of firstNode.inputs) {
+      const inputNode = ref.kind === "pending" ? ref.node : null;
+      if (inputNode && !shapesEqual(inputNode.shape, elemShape)) return null;
+    }
+    if (firstNode.dtype !== "f32") return null;
+    for (const ref of firstNode.inputs) {
+      if (ref.kind === "pending" && ref.node.dtype !== "f32") return null;
+    }
+
+    return {
+      preambleNode: firstNode,
+      reductionNode,
+      op: firstNode.op,
+      arity: firstNode.inputs.length,
+      isMean: reductionNode.op === "mean",
+      consumedCount: 2,
+    };
   }
 
-  // 7. The elementwise node must not already have a result
-  if (elemNode.result) return null;
+  // Multi-op chain: collect external input refs and build chain descriptors
+  const externalInputRefs: LazyRef[] = [];
+  const externalInputDtypes: DType[] = [];
+  const chainOps: PreambleChainKernelOp[] = [];
+  const firstShape = firstNode.shape;
 
-  const arity = elemNode.inputs.length;
+  // First node: all inputs are external
+  for (const ref of firstNode.inputs) {
+    const refShape = ref.kind === "pending" ? ref.node.shape
+      : ref.kind === "materialized" ? ref.storage.backendTensor.shape : undefined;
+    if (refShape && !shapesEqual(refShape, firstShape)) return null;
+    externalInputRefs.push(ref);
+    externalInputDtypes.push(getRefDtype(ref));
+  }
+  chainOps.push({
+    op: getChainOpName(firstNode),
+    arity: firstNode.inputs.length,
+  });
+
+  // Subsequent nodes: identify chain input vs external input
+  for (let i = 1; i < chain.length; i++) {
+    const node = chain[i];
+    const prevNode = chain[i - 1];
+
+    if (node.inputs.length === 1) {
+      chainOps.push({ op: getChainOpName(node), arity: 1 });
+    } else {
+      const inp0IsChain = node.inputs[0].kind === "pending" &&
+        node.inputs[0].node === prevNode;
+      const externalPos = inp0IsChain ? 1 : 0;
+      const chainPos: 0 | 1 = inp0IsChain ? 0 : 1;
+
+      const extRef = node.inputs[externalPos];
+      const refShape = extRef.kind === "pending" ? extRef.node.shape
+        : extRef.kind === "materialized" ? extRef.storage.backendTensor.shape : undefined;
+      if (refShape && !shapesEqual(refShape, firstShape)) return null;
+
+      externalInputRefs.push(extRef);
+      externalInputDtypes.push(getRefDtype(extRef));
+      chainOps.push({
+        op: getChainOpName(node),
+        arity: 2,
+        chainInputPos: chainPos,
+      });
+    }
+  }
+
+  // Validate: chain output must be f32 (for accumulator)
+  const lastChainNode = chain[chain.length - 1];
+  if (lastChainNode.dtype !== "f32") return null;
 
   return {
-    preambleNode: elemNode,
-    reductionNode: nextNode,
-    op: elemNode.op,
-    arity,
-    isMean: nextNode.op === "mean",
+    preambleNode: firstNode,
+    reductionNode,
+    op: firstNode.op,
+    arity: firstNode.inputs.length,
+    isMean: reductionNode.op === "mean",
+    consumedCount: chain.length + 1,
+    preambleChain: chain,
+    chainOps,
+    chainInputRefs: externalInputRefs,
+    chainInputDtypes: externalInputDtypes,
   };
 }
 
 /**
  * Execute a fused reduction-with-preamble operation.
+ * Handles both single-op preambles (existing path) and multi-op chains.
  */
 export async function executeReductionWithPreamble(
   plan: ReductionPreamblePlan,
   backend: Backend,
 ): Promise<void> {
-  const { sumDimWithPreamble } = await import("../backend/webgpu/index");
-
-  // Resolve all elementwise inputs
-  const elemInputStorages = plan.preambleNode.inputs.map(ref => getInputStorage(ref, backend));
-  const elemInputTensors = elemInputStorages.map(s => s.backendTensor);
-
   // Get sum options from the reduction node's payload
   const payload = plan.reductionNode.payload as
     | { dim?: number | number[] | null; keepdim?: boolean }
     | undefined;
 
-  // Call sumDimWithPreamble
-  let resultTensor = sumDimWithPreamble(elemInputTensors, plan.op, payload ?? {});
+  let resultTensor: BackendTensor;
+
+  if (plan.preambleChain && plan.chainOps && plan.chainInputRefs && plan.chainInputDtypes) {
+    // Multi-op chain path
+    const { sumDimWithPreambleChain } = await import("../backend/webgpu/index");
+    const inputStorages = plan.chainInputRefs.map(ref => getInputStorage(ref, backend));
+    const inputTensors = inputStorages.map(s => s.backendTensor);
+    resultTensor = sumDimWithPreambleChain(
+      inputTensors, plan.chainOps, plan.chainInputDtypes, payload ?? {},
+    );
+  } else {
+    // Single-op path
+    const { sumDimWithPreamble } = await import("../backend/webgpu/index");
+    const elemInputStorages = plan.preambleNode.inputs.map(ref => getInputStorage(ref, backend));
+    const elemInputTensors = elemInputStorages.map(s => s.backendTensor);
+    resultTensor = sumDimWithPreamble(elemInputTensors, plan.op, payload ?? {});
+  }
 
   // If this is a mean, divide by reduction size
   if (plan.isMean) {
@@ -125,12 +262,10 @@ export async function executeReductionWithPreamble(
       const rank = inputShape.length;
       reductionSize = dims.reduce((acc, d) => acc * inputShape[normalizeDim(d, rank)], 1);
     }
-    // Divide by reduction size using backend mul with scalar (1/reductionSize)
     const invSize = 1.0 / reductionSize;
     const sumResult = resultTensor;
     const invSizeTensor = backend.ops.full ? backend.ops.full([], invSize) : backend.ops.tensorFromArray([invSize], []);
     resultTensor = backend.ops.mul(sumResult, invSizeTensor);
-    // Destroy intermediate backend tensors (sum output + scalar) to prevent buffer leak
     (sumResult as { destroy?: () => void }).destroy?.();
     (invSizeTensor as { destroy?: () => void }).destroy?.();
   }
