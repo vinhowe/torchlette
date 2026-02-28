@@ -201,7 +201,7 @@ function instrumentedForwardWithLoss(
 
   const loss = crossEntropy(api, realLogits, flatTargets);
 
-  profileModule(api, "unknown");
+  setProfileModule("loss.cross_entropy");
   return loss;
 }
 
@@ -330,6 +330,7 @@ async function main() {
 
     // --- Backward ---
     setProfilePhase("backward");
+    setProfileModule("loss.cross_entropy");  // Module for gradient seed
     let scaledLoss: Tensor | null = null;
     if (scaler) {
       scaledLoss = scaler.scale(loss);
@@ -337,7 +338,6 @@ async function main() {
     } else {
       await loss.backward();
     }
-    setProfileModule("unknown");
     const t2 = performance.now();
 
 
@@ -356,7 +356,6 @@ async function main() {
     }
     setProfileModule("optimizer.zero_grad");
     optimizer.zeroGrad();
-    setProfileModule("unknown");
     const t3 = performance.now();
 
 
