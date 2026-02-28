@@ -544,7 +544,7 @@ export interface ForRangeStmt {
   unroll?: boolean;
 }
 
-/** Strided for loop: `for (var i = start; i < bound; i += stride)` — never unrolled. */
+/** Strided for loop: `for (var i = start; i < bound; i += stride)`. */
 export interface ForStrideStmt {
   kind: "forStride";
   varName: string;
@@ -552,6 +552,8 @@ export interface ForStrideStmt {
   bound: IRNode;
   stride: number;
   body: Statement[];
+  /** When true, the compiler unrolls this loop (requires const start/bound). */
+  unroll?: boolean;
 }
 
 export interface IfStmt {
@@ -1649,6 +1651,18 @@ export class KernelContext {
     })));
   }
 
+  /**
+   * Flat global thread index, correct for both 1D and 2D dispatch.
+   * For 1D dispatch: gid.x (same as globalId(0)).
+   * For 2D dispatch: (wg.x + wg.y * num_wg.x) * workgroupSize + local_index.
+   */
+  flatGlobalId(workgroupSize: number): BlockExpr {
+    const flatWgId = this.programId(0).add(
+      this.programId(1).mul(this.numPrograms(0)),
+    );
+    return flatWgId.mul(this.u32(workgroupSize)).add(this.localIndex());
+  }
+
   /** Declare a workgroup shared memory array. Returns a handle for read/write. */
   sharedArray(name: string, size: number, elemType: DataType = "f32"): SharedArrayHandle {
     this.sharedArrays.push({ name, size, elemType });
@@ -1748,10 +1762,13 @@ export class KernelContext {
     });
   }
 
-  /** Strided for loop: `for (var i = start; i < bound; i += stride)`. Never unrolled. */
+  /** Strided for loop: `for (var i = start; i < bound; i += stride)`.
+   *  Auto-unrolled when start/bound are const and trip count ≤ 8.
+   *  Set opts.unroll to force unrolling up to trip count 16. */
   forStride(
     start: BlockExpr, bound: BlockExpr, stride: number,
     body: (i: BlockExpr) => void,
+    opts?: { unroll?: boolean },
   ): void {
     const varName = `_lv${this.loopVarCounter++}`;
     const bodyStmts: Statement[] = [];
@@ -1768,6 +1785,7 @@ export class KernelContext {
       bound: bound.node,
       stride,
       body: bodyStmts,
+      unroll: opts?.unroll,
     });
   }
 

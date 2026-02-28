@@ -13,10 +13,12 @@ import {
   type TileKernelSpec,
   type KernelContext,
   type BlockExpr,
+  type DataType,
   elementwiseGrid,
 } from "../tile-ir";
 import { compileTileKernel } from "../tile-compiler";
 import { WORKGROUP_SIZE } from "../shape-utils";
+import { applyFusedOp } from "../fusion-tile-ir";
 
 const WG = WORKGROUP_SIZE; // 256
 
@@ -339,6 +341,139 @@ export function whereWGSL(
       const yVal = ctx.load("y", yOff);
       // select(falseVal, trueVal, condition) in WGSL
       const result = condVal.ne(ctx.f32(0)).select(xVal, yVal);
+      ctx.emitStore("out", idx, result);
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+// ============================================================================
+// Binary Broadcast Kernel (tile-IR)
+// ============================================================================
+
+/** WGSL infix operator → fusion op name */
+const WGSL_OP_TO_FUSION: Record<string, string> = {
+  "+": "add", "-": "sub", "*": "mul", "/": "div",
+};
+
+/**
+ * Generate WGSL for a binary broadcast op via tile-IR.
+ * Drop-in replacement for binaryBroadcastShader() in dispatch.ts.
+ */
+export function binaryBroadcastTileIR(
+  op: string,
+  indexShape: number[],
+  aStrides: number[],
+  bStrides: number[],
+  aOffset: number,
+  bOffset: number,
+  dtype: DataType,
+): string {
+  const fusionOp = WGSL_OP_TO_FUSION[op];
+  if (!fusionOp) throw new Error(`binaryBroadcastTileIR: unsupported op "${op}"`);
+
+  const spec: TileKernelSpec = {
+    name: `binary_${fusionOp}`,
+    workgroupSize: WG,
+    enableF16: dtype === "f16",
+    bindings: {
+      a: { storage: "read", type: dtype },
+      b: { storage: "read", type: dtype },
+      out: { storage: "read_write", type: dtype },
+    },
+    uniforms: { size: "u32" },
+    grid: elementwiseGrid(WG, { elementUniform: "size" }),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+
+      const aOff = buildStridedOffset(ctx, idx, indexShape, aStrides, aOffset, "ao");
+      const bOff = buildStridedOffset(ctx, idx, indexShape, bStrides, bOffset, "bo");
+
+      const aVal = ctx.load("a", aOff);
+      const bVal = ctx.load("b", bOff);
+      const result = applyFusedOp(ctx, fusionOp, [aVal, bVal]);
+      ctx.emitStore("out", idx, result);
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+// ============================================================================
+// Unary Strided Kernel (tile-IR)
+// ============================================================================
+
+/**
+ * Generate WGSL for a strided unary op via tile-IR.
+ * Drop-in replacement for unaryStridedShader() in dispatch.ts.
+ *
+ * @param opKey - Fusion op name (e.g. "sqrt", "relu", "neg", "tanh", etc.)
+ */
+export function unaryStridedTileIR(
+  opKey: string,
+  shape: number[],
+  strides: number[],
+  offset: number,
+  dtype: DataType,
+): string {
+  const spec: TileKernelSpec = {
+    name: `unary_${opKey}`,
+    workgroupSize: WG,
+    enableF16: dtype === "f16",
+    bindings: {
+      a: { storage: "read", type: dtype },
+      out: { storage: "read_write", type: dtype },
+    },
+    uniforms: { size: "u32" },
+    grid: elementwiseGrid(WG, { elementUniform: "size" }),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+
+      const inputOff = buildStridedOffset(ctx, idx, shape, strides, offset, "in");
+      const val = ctx.load("a", inputOff);
+      const result = applyFusedOp(ctx, opKey, [val]);
+      ctx.emitStore("out", idx, result);
+    },
+  };
+  return compileTileKernel(spec);
+}
+
+// ============================================================================
+// Cast Kernel (tile-IR)
+// ============================================================================
+
+/**
+ * Generate WGSL for a strided dtype cast via tile-IR.
+ * Drop-in replacement for castShader() in views.ts.
+ */
+export function castTileIR(
+  srcDtype: DataType,
+  dstDtype: DataType,
+  shape: number[],
+  strides: number[],
+  offset: number,
+): string {
+  // Map dst dtype to the cast op name used by applyFusedOp
+  const castOp = `cast_${dstDtype}`;
+
+  const spec: TileKernelSpec = {
+    name: `cast_${srcDtype}_${dstDtype}`,
+    workgroupSize: WG,
+    enableF16: srcDtype === "f16" || dstDtype === "f16",
+    bindings: {
+      a: { storage: "read", type: srcDtype },
+      out: { storage: "read_write", type: dstDtype },
+    },
+    uniforms: { size: "u32" },
+    grid: elementwiseGrid(WG, { elementUniform: "size" }),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG);
+      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+
+      const inputOff = buildStridedOffset(ctx, idx, shape, strides, offset, "in");
+      const val = ctx.load("a", inputOff);
+      const result = srcDtype === dstDtype ? val : applyFusedOp(ctx, castOp, [val]);
       ctx.emitStore("out", idx, result);
     },
   };

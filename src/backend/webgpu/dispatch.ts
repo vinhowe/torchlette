@@ -45,6 +45,10 @@ import {
 } from "./bind-group-cache";
 import { computeFlatChunkLayout, dispatchFlatChunked } from "./chunked-dispatch";
 import { getTimestampWrites, getProfileModule } from "./profiler";
+import { binaryBroadcastTileIR, unaryStridedTileIR } from "./ops/ops-tile-ir";
+
+const USE_TILE_IR_ELEMENTWISE = typeof process !== "undefined" &&
+  process.env?.USE_TILE_IR_ELEMENTWISE === "1";
 import {
   computeBatchSize,
   computeBatchStrides,
@@ -553,10 +557,12 @@ export function dispatchBinaryDirect(
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
-  const code = binaryBroadcastShader(
-    op, indexShape, aStrides, bStrides, a.offset, b.offset, dtype,
-    use2D ? dispatch.gridSizeX : undefined,
-  );
+  const code = USE_TILE_IR_ELEMENTWISE && (dtype === "f32" || dtype === "f16")
+    ? binaryBroadcastTileIR(op, indexShape, aStrides, bStrides, a.offset, b.offset, dtype)
+    : binaryBroadcastShader(
+        op, indexShape, aStrides, bStrides, a.offset, b.offset, dtype,
+        use2D ? dispatch.gridSizeX : undefined,
+      );
   const key = `binary:${op}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${a.offset}:${b.offset}:${dtype}:${use2D ? dispatch.gridSizeX : "1d"}`;
   const bytesPerElement = dtypeBytes(dtype);
 
@@ -688,10 +694,12 @@ export function dispatchUnaryDirect(
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
-  const code = unaryStridedShader(
-    expr, a.shape, a.strides, a.offset, dtype,
-    use2D ? dispatch.gridSizeX : undefined,
-  );
+  const code = USE_TILE_IR_ELEMENTWISE && (dtype === "f32" || dtype === "f16")
+    ? unaryStridedTileIR(opKey, a.shape, a.strides, a.offset, dtype)
+    : unaryStridedShader(
+        expr, a.shape, a.strides, a.offset, dtype,
+        use2D ? dispatch.gridSizeX : undefined,
+      );
   const key = `unary:${opKey}:${a.shape.join("x")}:${a.strides.join(",")}:${a.offset}:${dtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   const bytesPerElement = dtypeBytes(dtype);
 
