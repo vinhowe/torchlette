@@ -525,14 +525,36 @@ function emitStatement(
       break;
     }
     case "forStride": {
-      const start = exprFor(stmt.start, bindings, null);
-      const bound = exprFor(stmt.bound, bindings, null);
-      lines.push(`${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + ${stmt.stride}u) {`);
-      const childBindings = new Map(bindings);
-      for (const s of stmt.body) {
-        emitStatement(s, childBindings, lines, depth + 1);
+      // Check if we can unroll: start and bound must be const
+      const startConst = stmt.start.kind === "const" ? stmt.start.value : null;
+      const boundConst = stmt.bound.kind === "const" ? stmt.bound.value : null;
+      const strideVal = stmt.stride;
+      const tripCount = startConst !== null && boundConst !== null && strideVal > 0
+        ? Math.ceil((boundConst - startConst) / strideVal) : null;
+      const shouldUnroll = tripCount !== null && tripCount >= 0 &&
+        (stmt.unroll === true || tripCount <= 8);
+
+      if (shouldUnroll && tripCount !== null && startConst !== null) {
+        for (let i = 0; i < tripCount; i++) {
+          const iterVal = startConst + i * strideVal;
+          lines.push(`${indent}{ // unrolled ${stmt.varName}=${iterVal}`);
+          lines.push(`${indent}  const ${stmt.varName} = ${iterVal}u;`);
+          const childBindings = new Map(bindings);
+          for (const s of stmt.body) {
+            emitStatement(s, childBindings, lines, depth + 1);
+          }
+          lines.push(`${indent}}`);
+        }
+      } else {
+        const start = exprFor(stmt.start, bindings, null);
+        const bound = exprFor(stmt.bound, bindings, null);
+        lines.push(`${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + ${strideVal}u) {`);
+        const childBindings = new Map(bindings);
+        for (const s of stmt.body) {
+          emitStatement(s, childBindings, lines, depth + 1);
+        }
+        lines.push(`${indent}}`);
       }
-      lines.push(`${indent}}`);
       break;
     }
     case "if": {

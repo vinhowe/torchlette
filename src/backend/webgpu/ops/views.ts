@@ -23,6 +23,10 @@ import {
 } from "../bind-group-cache";
 import { profileApiCall } from "../profiler";
 import { computeFlatChunkLayout, dispatchFlatChunked } from "../chunked-dispatch";
+import { castTileIR } from "./ops-tile-ir";
+
+const USE_TILE_IR_CAST = typeof process !== "undefined" &&
+  process.env?.USE_TILE_IR_CAST === "1";
 
 function castShader(
   srcDtype: DType,
@@ -196,14 +200,16 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
-  const code = castShader(
-    tensor.dtype,
-    dtype,
-    tensor.shape,
-    tensor.strides,
-    tensor.offset,
-    use2D ? dispatch.gridSizeX : undefined,
-  );
+  const code = USE_TILE_IR_CAST
+    ? castTileIR(tensor.dtype as "f32" | "f16" | "i32" | "u32", dtype as "f32" | "f16" | "i32" | "u32", tensor.shape, tensor.strides, tensor.offset)
+    : castShader(
+        tensor.dtype,
+        dtype,
+        tensor.shape,
+        tensor.strides,
+        tensor.offset,
+        use2D ? dispatch.gridSizeX : undefined,
+      );
   const key = `cast:${tensor.dtype}->${dtype}:${tensor.shape.join("x")}:${tensor.strides.join(",")}:${tensor.offset}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   const pipeline = getPipeline(ctx, key, code);
 
