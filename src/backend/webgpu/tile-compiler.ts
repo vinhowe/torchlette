@@ -1332,7 +1332,7 @@ export function hoistLoopInvariants(stmts: Statement[]): Statement[] {
   const result: Statement[] = [];
 
   for (const stmt of stmts) {
-    if (stmt.kind === "forRange") {
+    if (stmt.kind === "forRange" || stmt.kind === "forStride") {
       // First recurse into the body (inner-to-outer)
       const innerHoisted = hoistLoopInvariants(stmt.body);
 
@@ -1396,7 +1396,7 @@ function collectSharedWriteNames(stmts: Statement[], names: Set<string>): void {
   for (const stmt of stmts) {
     if (stmt.kind === "sharedWrite") {
       names.add(stmt.arrayName);
-    } else if (stmt.kind === "forRange") {
+    } else if (stmt.kind === "forRange" || stmt.kind === "forStride") {
       collectSharedWriteNames(stmt.body, names);
     } else if (stmt.kind === "if") {
       collectSharedWriteNames(stmt.body, names);
