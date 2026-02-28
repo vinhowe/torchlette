@@ -1177,6 +1177,73 @@ export function max(a: Tensor, options?: MaxOptions): Tensor {
   return new Tensor(outShape, out);
 }
 
+function minAll(a: Tensor): number {
+  let minVal = Infinity;
+  const shapeStrides = computeStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) {
+    const val = readAtLinear(a, i, shapeStrides);
+    if (val < minVal) {
+      minVal = val;
+    }
+  }
+  return minVal;
+}
+
+export function min(a: Tensor, options?: MaxOptions): Tensor {
+  if (!options || options.dim == null) {
+    return new Tensor([], new Float32Array([minAll(a)]));
+  }
+
+  const rank = a.shape.length;
+  const dims = normalizeDimsForReduce(options.dim, rank, "min");
+  const keepdim = options.keepdim ?? false;
+  const reduceSet = new Set(dims);
+
+  const outShape = keepdim
+    ? a.shape.map((dim, index) => (reduceSet.has(index) ? 1 : dim))
+    : a.shape.filter((_, index) => !reduceSet.has(index));
+
+  const outSize = outShape.reduce((acc, dim) => acc * dim, 1) || 1;
+  const out = new Float32Array(outSize);
+  out.fill(Infinity);
+  const inShapeStrides = computeStrides(a.shape);
+  const outStrides = computeStrides(outShape);
+
+  for (let linear = 0; linear < a.size; linear += 1) {
+    let remainder = linear;
+    let outOffset = 0;
+
+    if (keepdim) {
+      for (let dim = 0; dim < rank; dim += 1) {
+        const stride = inShapeStrides[dim];
+        const coord = Math.floor(remainder / stride);
+        remainder -= coord * stride;
+        if (!reduceSet.has(dim)) {
+          outOffset += coord * outStrides[dim];
+        }
+      }
+    } else {
+      let outDim = 0;
+      for (let dim = 0; dim < rank; dim += 1) {
+        const stride = inShapeStrides[dim];
+        const coord = Math.floor(remainder / stride);
+        remainder -= coord * stride;
+        if (!reduceSet.has(dim)) {
+          outOffset += coord * outStrides[outDim];
+          outDim += 1;
+        }
+      }
+    }
+
+    const val = readAtLinear(a, linear, inShapeStrides);
+    if (val < out[outOffset]) {
+      out[outOffset] = val;
+    }
+  }
+
+  return new Tensor(outShape, out);
+}
+
 function normalizeDimsForReduce(dim: number | number[], rank: number, opName: string): number[] {
   const dims = Array.isArray(dim) ? dim.slice() : [dim];
   const normalized = dims.map((value) => (value < 0 ? rank + value : value));

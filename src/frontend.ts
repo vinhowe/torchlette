@@ -6,6 +6,7 @@ import type {
   GeluOptions,
   MaxOptions,
   MeanOptions,
+  MinOptions,
   ScatterAddOptions,
   SubOptions,
   SumOptions,
@@ -1109,6 +1110,15 @@ export class Torchlette {
   max(a: Tensor, options?: MaxOptions): number | Tensor {
     this._assertUsable(a);
     const result = this.runtime.max(a._unwrap(), options);
+    if (typeof result === "number") {
+      return result;
+    }
+    return this._wrap(result);
+  }
+
+  min(a: Tensor, options?: MinOptions): number | Tensor {
+    this._assertUsable(a);
+    const result = this.runtime.min(a._unwrap(), options);
     if (typeof result === "number") {
       return result;
     }

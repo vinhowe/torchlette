@@ -343,6 +343,9 @@ function executeReductionOp(
       return backend.ops.sum(backendInputs[0], getPayload<{ dim?: number | number[] | null; keepdim?: boolean }>(node));
     case "max":
       return backend.ops.max(backendInputs[0], getPayload<{ dim?: number | number[] | null; keepdim?: boolean }>(node));
+    case "min":
+      assertOpSupported("min", backend.ops.min);
+      return backend.ops.min(backendInputs[0], getPayload<{ dim?: number | number[] | null; keepdim?: boolean }>(node));
     case "mean":
       return backend.ops.mean(backendInputs[0], getPayload<{ dim?: number | number[] | null; keepdim?: boolean }>(node));
     case "argmax": {
@@ -548,7 +551,7 @@ const SHAPE_OPS = new Set([
   "reshape", "expand", "transpose", "permute", "contiguous", "narrow", "narrowBackward", "cast",
 ]);
 const REDUCTION_OPS = new Set([
-  "sum", "max", "mean", "argmax", "argmin", "gather", "scatterAdd", "cat",
+  "sum", "max", "min", "mean", "argmax", "argmin", "gather", "scatterAdd", "cat",
   "gt", "lt", "ge", "le", "eq", "ne", "where",
 ]);
 const MUTATION_OPS = new Set([

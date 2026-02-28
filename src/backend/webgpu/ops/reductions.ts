@@ -35,6 +35,8 @@ import {
   makeSumFullSpec,
   makeMaxDimSpec,
   makeMaxFullSpec,
+  makeMinDimSpec,
+  makeMinFullSpec,
   makeMeanDivSpec,
   makeSumDimWithPreambleSpec,
   makeSumFullWithPreambleSpec,
@@ -156,6 +158,7 @@ function prepareDimReduction(
 
 let sumFullDispatcher: ReturnType<typeof createTileKernelDispatcher> | null = null;
 let maxFullDispatcher: ReturnType<typeof createTileKernelDispatcher> | null = null;
+let minFullDispatcher: ReturnType<typeof createTileKernelDispatcher> | null = null;
 let meanDivDispatcher: ReturnType<typeof createTileKernelDispatcher> | null = null;
 
 function getSumFullDispatcher() {
@@ -166,6 +169,11 @@ function getSumFullDispatcher() {
 function getMaxFullDispatcher() {
   if (!maxFullDispatcher) maxFullDispatcher = createTileKernelDispatcher(makeMaxFullSpec());
   return maxFullDispatcher;
+}
+
+function getMinFullDispatcher() {
+  if (!minFullDispatcher) minFullDispatcher = createTileKernelDispatcher(makeMinFullSpec());
+  return minFullDispatcher;
 }
 
 function getMeanDivDispatcher() {
@@ -721,6 +729,71 @@ function maxFullReduction(
   });
 
   getMaxFullDispatcher().dispatch(
+    { input: tensor.buffer, out: outBuffer },
+    { size: tensor.size },
+  );
+
+  return createTensor([], outBuffer);
+}
+
+// ============================================================================
+// Min
+// ============================================================================
+
+export function min(a: BackendTensor, options?: MaxOptions): BackendTensor {
+  const ctx = requireContext();
+  let tensor = asGPUTensor(a);
+
+  if (!tensor.isContiguous) {
+    tensor = asGPUTensor(contiguous(tensor));
+  }
+
+  const inputShape = tensor.shape;
+  const dim = options?.dim;
+  const keepdim = options?.keepdim ?? false;
+
+  if (dim === undefined || dim === null) {
+    return minFullReduction(ctx, tensor);
+  }
+
+  const setup = prepareDimReduction(inputShape, dim, keepdim);
+  if (!setup) {
+    return minFullReduction(ctx, tensor);
+  }
+
+  for (const d of setup.normalizedDims) {
+    if (d < 0 || d >= setup.rank) {
+      throw new Error(`min: dimension ${d} out of range`);
+    }
+  }
+
+  const { normalizedDims, outShape, outSize, reductionSize,
+    inputStrides, outStrides, inputToOutDim } = setup;
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
+
+  const useParallel = reductionSize > 64;
+  const spec = makeMinDimSpec(inputShape, inputStrides, normalizedDims,
+    outShape, outStrides, inputToOutDim, useParallel);
+  const dispatcher = createTileKernelDispatcher(spec);
+
+  dispatcher.dispatch(
+    { input: tensor.buffer, out: outBuffer },
+    { outSize, reductionSize },
+  );
+
+  return createTensor(outShape, outBuffer);
+}
+
+function minFullReduction(
+  ctx: WebGPUContext,
+  tensor: WebGPUTensor,
+): WebGPUTensor {
+  const outBuffer = createTrackedBuffer(ctx.device, {
+    size: 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  });
+
+  getMinFullDispatcher().dispatch(
     { input: tensor.buffer, out: outBuffer },
     { size: tensor.size },
   );
