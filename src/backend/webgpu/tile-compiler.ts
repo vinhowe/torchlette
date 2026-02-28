@@ -22,9 +22,20 @@ import type {
   BlockAllocStmt, BlockLoadStmt, BlockStoreStmt, BlockDotStmt,
   BlockReduceStmt, BlockUnaryStmt, BlockBinaryStmt,
 } from "./tile-ir";
-import { buildKernelIR, type KernelContext } from "./tile-ir";
+import { buildKernelIR, type KernelContext, elementwiseGrid } from "./tile-ir";
 import { computeSafeVecWidth } from "./tile-access-analysis";
 import { getSubgroupSupport } from "./matmul/types";
+
+/** Well-known uniform names that represent element counts for elementwise kernels. */
+const ELEMENTWISE_UNIFORMS = new Set(["size", "total_elements", "num_elements", "outSize"]);
+
+/** Find a u32 uniform that represents the element count, if any. */
+function findElementwiseUniform(spec: TileKernelSpec): string | null {
+  for (const [name, type] of Object.entries(spec.uniforms)) {
+    if (type === "u32" && ELEMENTWISE_UNIFORMS.has(name)) return name;
+  }
+  return null;
+}
 
 
 // ============================================================================
@@ -233,11 +244,23 @@ function freshVar(hint: string): string {
 export function compileTileKernel(spec: TileKernelSpec): string {
   _varCounter = 0;
 
-  // 0. Auto vec-width selection: if vectorize is "auto", use access analysis
+  // 0. Auto vec-width selection: if vectorize is "auto", use access analysis.
+  //    NOTE: autoVectorize only works with kernels using globalId(0) for their
+  //    thread index. Kernels using flatGlobalId() (programId + localIndex)
+  //    must implement manual vec4 unrolling (see flatCopySpec, flatAddSpec).
   if ((spec as any).vectorize === "auto" || (spec.vectorize === undefined && (spec as any).autoVectorize)) {
     const safeWidth = computeSafeVecWidth(spec);
     if (safeWidth > 1) {
-      spec = { ...spec, vectorize: safeWidth };
+      // Also adjust the grid to account for vecWidth (each thread processes
+      // safeWidth elements, so we need fewer workgroups).
+      const wgSize = typeof spec.workgroupSize === "number"
+        ? spec.workgroupSize : spec.workgroupSize[0] * spec.workgroupSize[1];
+      const elementUniform = findElementwiseUniform(spec);
+      spec = {
+        ...spec,
+        vectorize: safeWidth,
+        ...(elementUniform ? { grid: elementwiseGrid(wgSize, { vecWidth: safeWidth, elementUniform }) } : {}),
+      };
     }
   }
 
