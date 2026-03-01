@@ -142,6 +142,8 @@ export {
   KernelContext,
   Block,
   elementwiseGrid,
+  ceilDivGrid,
+  singleWorkgroup,
   perRowGrid,
   elementwiseKernel,
   perRowKernel,
