@@ -207,6 +207,8 @@ export class Block {
   readonly _origRows: number;
   /** @internal Original cols before any T() call (for storage indexing) */
   readonly _origCols: number;
+  /** @internal Padded column stride for shared memory (cols + pad). Register blocks use cols. */
+  readonly smemStride: number;
 
   constructor(
     readonly placement: "register" | "shared",
@@ -217,9 +219,11 @@ export class Block {
     private readonly ops: BlockOps,
     origRows?: number,
     origCols?: number,
+    smemStride?: number,
   ) {
     this._origRows = origRows ?? rows;
     this._origCols = origCols ?? cols;
+    this.smemStride = smemStride ?? cols;
   }
 
   get transposed(): boolean { return this._transposed; }
@@ -228,7 +232,7 @@ export class Block {
   T(): Block {
     const b = new Block(
       this.placement, this.cols, this.rows, this.name,
-      this.ctx, this.ops, this._origRows, this._origCols,
+      this.ctx, this.ops, this._origRows, this._origCols, this.smemStride,
     );
     b._transposed = !this._transposed;
     return b;
@@ -453,9 +457,13 @@ export class BlockOps {
       return new Block("register", rows, cols, name, this.ctx, this);
     } else {
       // Cooperative load → shared memory placement
+      // Pad column stride by 1 to avoid shared memory bank conflicts.
+      // For stride S, rows differing by 32/S map to the same bank. The +1
+      // breaks this alignment (e.g. tileK=8 → stride 9, no 4-way conflict).
+      const smemStride = cols + 1;
       this.ctx.sharedArrays.push({
         name,
-        size: rows * cols,
+        size: rows * smemStride,
         elemType: "f32",
       });
       this.ctx.pushStatement({
@@ -480,7 +488,7 @@ export class BlockOps {
           innerBound: ptr.innerBound.node,
         },
       });
-      return new Block("shared", rows, cols, name, this.ctx, this);
+      return new Block("shared", rows, cols, name, this.ctx, this, undefined, undefined, smemStride);
     }
   }
 
@@ -525,6 +533,8 @@ export class BlockOps {
       bCols: b._origCols,
       threadTileM: this.threadTileM,
       threadTileN: this.threadTileN,
+      aSmemStride: a.placement === "shared" ? a.smemStride : undefined,
+      bSmemStride: b.placement === "shared" ? b.smemStride : undefined,
     });
     return new Block("register", outRows, outCols, name, this.ctx, this);
   }
@@ -546,6 +556,8 @@ export class BlockOps {
       bCols: b._origCols,
       threadTileM: this.threadTileM,
       threadTileN: this.threadTileN,
+      aSmemStride: a.placement === "shared" ? a.smemStride : undefined,
+      bSmemStride: b.placement === "shared" ? b.smemStride : undefined,
     });
   }
 
@@ -619,11 +631,12 @@ export class BlockOps {
     const name = this.freshName();
     const tileRows = ptr.data.outerRange.size;
     const tileCols = ptr.data.innerRange.size;
+    const smemStride = tileCols + 1;
 
-    // Declare shared memory
+    // Declare shared memory (padded by 1 column to avoid bank conflicts)
     this.ctx.sharedArrays.push({
       name,
-      size: tileRows * tileCols,
+      size: tileRows * smemStride,
       elemType: "f32",
     });
 
@@ -636,9 +649,10 @@ export class BlockOps {
       tileRows,
       tileCols,
       elemType: "f32",
+      smemStride,
     });
 
-    return new Block("shared", tileRows, tileCols, name, this.ctx, this);
+    return new Block("shared", tileRows, tileCols, name, this.ctx, this, undefined, undefined, smemStride);
   }
 
   // ---- Internal helpers (called by Block methods) ----
