@@ -1486,39 +1486,11 @@ export class KernelContext {
     }));
   }
 
-  /** Emit a for loop: `for (var v = start; v < bound; v++)`. */
-  forRange(
-    start: BlockExpr,
-    bound: BlockExpr,
+  /** Shared loop emission for forRange/forStride. */
+  private _emitLoop(
+    kind: "forRange" | "forStride", start: BlockExpr, bound: BlockExpr,
     body: (loopVar: BlockExpr) => void,
-    opts?: { unroll?: boolean },
-  ): void {
-    const varName = `_lv${this.loopVarCounter++}`;
-    const bodyStmts: Statement[] = [];
-    this.stmtStack.push(bodyStmts);
-    const loopVar = new BlockExpr(makeNode<NamedRefNode>({
-      kind: "namedRef", name: varName,
-      valueType: "scalar", dataType: "u32",
-    }));
-    body(loopVar);
-    this.stmtStack.pop();
-    this.pushStatement({
-      kind: "forRange",
-      varName,
-      start: start.node,
-      bound: bound.node,
-      body: bodyStmts,
-      ...(opts?.unroll ? { unroll: true } : {}),
-    });
-  }
-
-  /** Strided for loop: `for (var i = start; i < bound; i += stride)`.
-   *  Auto-unrolled when start/bound are const and trip count ≤ 8.
-   *  Set opts.unroll to force unrolling up to trip count 16. */
-  forStride(
-    start: BlockExpr, bound: BlockExpr, stride: number,
-    body: (i: BlockExpr) => void,
-    opts?: { unroll?: boolean },
+    extra?: { stride?: number; unroll?: boolean },
   ): void {
     const varName = `_lv${this.loopVarCounter++}`;
     const bodyStmts: Statement[] = [];
@@ -1528,15 +1500,26 @@ export class KernelContext {
     }));
     body(loopVar);
     this.stmtStack.pop();
-    this.pushStatement({
-      kind: "forStride",
-      varName,
-      start: start.node,
-      bound: bound.node,
-      stride,
-      body: bodyStmts,
-      unroll: opts?.unroll,
-    });
+    const stmt: any = {
+      kind, varName, start: start.node, bound: bound.node, body: bodyStmts,
+    };
+    if (extra?.stride != null) stmt.stride = extra.stride;
+    if (extra?.unroll != null) stmt.unroll = extra.unroll;
+    this.pushStatement(stmt);
+  }
+
+  /** Emit a for loop: `for (var v = start; v < bound; v++)`. */
+  forRange(start: BlockExpr, bound: BlockExpr, body: (loopVar: BlockExpr) => void,
+    opts?: { unroll?: boolean }): void {
+    this._emitLoop("forRange", start, bound, body, opts?.unroll ? { unroll: true } : undefined);
+  }
+
+  /** Strided for loop: `for (var i = start; i < bound; i += stride)`.
+   *  Auto-unrolled when start/bound are const and trip count ≤ 8.
+   *  Set opts.unroll to force unrolling up to trip count 16. */
+  forStride(start: BlockExpr, bound: BlockExpr, stride: number,
+    body: (i: BlockExpr) => void, opts?: { unroll?: boolean }): void {
+    this._emitLoop("forStride", start, bound, body, { stride, unroll: opts?.unroll });
   }
 
   /** Emit a compile-time unrolled loop. Body called N times with constant index. */
@@ -2215,23 +2198,15 @@ export class KernelContext {
     return [ctr0, ctr1];
   }
 
-  /**
-   * Generate a uniform random f32 in [0, 1) from Philox 2x32-10.
-   * Convenience wrapper: `const val = ctx.randF32(seed, offset);`
-   */
+  /** Generate a uniform random f32 in [0, 1) from Philox 2x32-10. */
   randF32(seed: BlockExpr, offset: BlockExpr): BlockExpr {
-    const [r0] = this.philox2x32(seed, offset);
-    // Convert u32 to f32 in [0, 1): multiply by 2^-32
-    return r0.toF32().mul(this.f32(2.3283064365386963e-10)); // 1.0 / 2^32
+    return this.randF32x2(seed, offset)[0];
   }
 
-  /**
-   * Generate two uniform random f32s in [0, 1) from a single Philox call.
-   * `const [r0, r1] = ctx.randF32x2(seed, offset);`
-   */
+  /** Generate two uniform random f32s in [0, 1) from a single Philox call. */
   randF32x2(seed: BlockExpr, offset: BlockExpr): [BlockExpr, BlockExpr] {
     const [r0, r1] = this.philox2x32(seed, offset);
-    const scale = this.f32(2.3283064365386963e-10);
+    const scale = this.f32(2.3283064365386963e-10); // 1.0 / 2^32
     return [r0.toF32().mul(scale), r1.toF32().mul(scale)];
   }
 

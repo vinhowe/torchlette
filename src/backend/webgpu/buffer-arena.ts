@@ -13,7 +13,7 @@
  */
 
 import type { BackendTensor } from "../types";
-import type { GPUBuffer, GPUDevice, WebGPUTensor } from "./gpu-types";
+import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage, STORAGE_BUFFER_USAGE, asGPUTensor } from "./gpu-types";
 import {
   arenaBufferSet, trackSharedEncoderWrite, requireContext,

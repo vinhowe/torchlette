@@ -25,8 +25,6 @@ import {
 } from "./fusion-types";
 import { generateFusedKernelTileIR } from "./fusion-tile-ir";
 import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
-import { GPUBufferUsage } from "./gpu-types";
-
 // ============================================================================
 // Kernel Cache
 // ============================================================================

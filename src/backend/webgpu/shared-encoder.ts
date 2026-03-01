@@ -13,7 +13,7 @@
  * step-level scope management (beginStep/endStep).
  */
 
-import type { GPUBuffer, GPUCommandBuffer, GPUCommandEncoder, GPUComputePipeline, GPUBindGroup, WebGPUContext } from "./gpu-types";
+import type { GPUBuffer, GPUCommandBuffer, GPUCommandEncoder } from "./gpu-types";
 import {
   activeBatch, setActiveBatch,
   sharedEncoderActive, setSharedEncoderActive,

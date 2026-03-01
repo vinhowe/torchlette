@@ -20,7 +20,6 @@ import {
   trackSharedEncoderWrite,
   createParamsBuffer,
   releaseParamsBuffer,
-  flushSharedEncoder,
   cachedCreateBindGroup,
   awaitDeferredFence,
   getPipeline,
@@ -28,7 +27,7 @@ import {
 import { requireContext } from "./webgpu-state";
 import { isProfilingEnabled } from "./profiler";
 import { gpuMemoryTracker } from "./memory-tracker";
-import type { GPUBuffer, GPUBindGroup, GPUDevice, GPUCommandEncoder } from "./gpu-types";
+import type { GPUBuffer, GPUBindGroup, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "./gpu-types";
 import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, F32_ONE_BITS } from "./shape-utils";
 import { compileTileKernel } from "./tile-compiler";

@@ -15,7 +15,7 @@ import {
 } from "../gpu-context";
 import { createTensor, createTrackedBuffer } from "../tensor";
 import { bufferPool } from "../buffer-pool";
-import { allocateOutputBuffer, resolveOutputBuffer } from "../buffer-arena";
+import { allocateOutputBuffer } from "../buffer-arena";
 import {
   profiledCreateBindGroup,
 } from "../bind-group-cache";

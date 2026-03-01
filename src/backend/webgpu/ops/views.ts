@@ -5,7 +5,7 @@
  */
 import type { BackendTensor, DType, TransposeOptions } from "../../types";
 import type { GPUBuffer, GPUDevice, WebGPUTensor } from "../gpu-types";
-import { GPUBufferUsage, STORAGE_BUFFER_USAGE, asGPUTensor } from "../gpu-types";
+import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import {
   sizeOf, WORKGROUP_SIZE, compute2DDispatch,
   contiguousStrides, checkContiguousStrides, dtypeBytes, dtypeToWgsl,
@@ -21,7 +21,6 @@ import {
   createUniformBuffer, releaseUniformBuffer, profiledCreateBindGroup,
   params1, params2, params4, params7,
 } from "../bind-group-cache";
-import { profileApiCall } from "../profiler";
 import { castTileIR, castSpec, contiguousTileIR, narrowBackwardTileIR, chunkedTransposeTileIR } from "./ops-tile-ir";
 import { createTileKernelDispatcher } from "../tile-dispatch";
 

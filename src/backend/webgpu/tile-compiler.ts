@@ -141,9 +141,8 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
     case "localIndex": {
       return "local_idx";
     }
-    case "sharedRead": {
-      const idx = exprFor(node.idx, bindings);
-      return `${node.arrayName}[${idx}]`;
+    case "sharedRead": case "arrayRead": case "vec4ArrayRead": case "vec4SharedRead": {
+      return `${node.arrayName}[${exprFor(node.idx, bindings)}]`;
     }
     case "namedRef": {
       return node.name;
@@ -159,29 +158,14 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
       const mask = exprFor(node.mask, bindings);
       return `subgroupShuffleXor(${val}, ${mask})`;
     }
-    case "subgroupAdd": {
-      return `subgroupAdd(${exprFor(node.value, bindings)})`;
-    }
-    case "subgroupMax": {
-      return `subgroupMax(${exprFor(node.value, bindings)})`;
-    }
-    case "subgroupMin": {
-      return `subgroupMin(${exprFor(node.value, bindings)})`;
-    }
-    case "subgroupBroadcastFirst": {
-      return `subgroupBroadcastFirst(${exprFor(node.value, bindings)})`;
-    }
-    case "subgroupInclusiveAdd": {
-      return `subgroupInclusiveAdd(${exprFor(node.value, bindings)})`;
+    case "subgroupAdd": case "subgroupMax": case "subgroupMin":
+    case "subgroupBroadcastFirst": case "subgroupInclusiveAdd": {
+      return `${node.kind}(${exprFor(node.value, bindings)})`;
     }
     case "vec4dot": {
       const a = node.a.map(n => exprFor(n, bindings));
       const b = node.b.map(n => exprFor(n, bindings));
       return `dot(vec4<f32>(${a.join(", ")}), vec4<f32>(${b.join(", ")}))`;
-    }
-    case "arrayRead": {
-      const idx = exprFor(node.idx, bindings);
-      return `${node.arrayName}[${idx}]`;
     }
     // -- Vec4 native nodes --
     case "vec4Construct": {
@@ -210,14 +194,6 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
       const b = exprFor(node.b, bindings);
       const op = node.op === "add" ? "+" : node.op === "sub" ? "-" : "*";
       return `(${a} ${op} ${b})`;
-    }
-    case "vec4ArrayRead": {
-      const idx = exprFor(node.idx, bindings);
-      return `${node.arrayName}[${idx}]`;
-    }
-    case "vec4SharedRead": {
-      const idx = exprFor(node.idx, bindings);
-      return `${node.arrayName}[${idx}]`;
     }
     default:
       throw new Error(`Unknown node kind: ${(node as any).kind}`);
@@ -536,13 +512,13 @@ function emitStatement(
       lines.push(`${indent}${stmt.name} = ${stmt.name} + ${val};`);
       break;
     }
-    case "indexAssign": {
+    case "indexAssign": case "sharedWrite": case "vec4ArrayWrite": {
       const idx = exprFor(stmt.idx, bindings);
       const val = exprFor(stmt.value, bindings);
       lines.push(`${indent}${stmt.arrayName}[${idx}] = ${val};`);
       break;
     }
-    case "indexAddAssign": {
+    case "indexAddAssign": case "vec4ArrayAddAssign": {
       const idx = exprFor(stmt.idx, bindings);
       const val = exprFor(stmt.value, bindings);
       lines.push(`${indent}${stmt.arrayName}[${idx}] = ${stmt.arrayName}[${idx}] + ${val};`);
@@ -688,12 +664,6 @@ function emitStatement(
       lines.push(`${indent}workgroupBarrier();`);
       break;
     }
-    case "sharedWrite": {
-      const idx = exprFor(stmt.idx, bindings);
-      const val = exprFor(stmt.value, bindings);
-      lines.push(`${indent}${stmt.arrayName}[${idx}] = ${val};`);
-      break;
-    }
     // Vec4 array statements
     case "vec4VarArray": {
       lines.push(`${indent}var ${stmt.name}: array<vec4<f32>, ${stmt.size}>;`);
@@ -701,18 +671,6 @@ function emitStatement(
     }
     case "vec4SharedArray": {
       // Handled at module scope, not inside fn
-      break;
-    }
-    case "vec4ArrayWrite": {
-      const idx = exprFor(stmt.idx, bindings);
-      const val = exprFor(stmt.value, bindings);
-      lines.push(`${indent}${stmt.arrayName}[${idx}] = ${val};`);
-      break;
-    }
-    case "vec4ArrayAddAssign": {
-      const idx = exprFor(stmt.idx, bindings);
-      const val = exprFor(stmt.value, bindings);
-      lines.push(`${indent}${stmt.arrayName}[${idx}] = ${stmt.arrayName}[${idx}] + ${val};`);
       break;
     }
     case "directStore": {
@@ -1551,21 +1509,6 @@ export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Se
 }
 
 // ============================================================================
-// Scalar Binding Emission
-// ============================================================================
-
-/**
- * Emit `let` bindings for all scalar nodes assigned to `targetPhase`.
- *
- * Only binds "interesting" scalars (binary, unary, cast) — not raw programId,
- * uniform, or const nodes (those are inlined).
- *
- * Additionally binds programId/uniform nodes that have refcount > 1 (used in
- */
-
-
-
-// ============================================================================
 // Binding / Uniform Codegen
 // ============================================================================
 
@@ -1742,7 +1685,7 @@ function cF32(value: number): IRNode {
 function ref(name: string, dt: DataType = "u32"): IRNode {
   return { id: -1, kind: "namedRef", valueType: "scalar", dataType: dt, name };
 }
-function binOp(op: "add" | "sub" | "mul" | "div" | "mod", lhs: IRNode, rhs: IRNode, dt: DataType = "u32"): IRNode {
+function binOp(op: "add" | "sub" | "mul" | "div" | "mod" | "max" | "min", lhs: IRNode, rhs: IRNode, dt: DataType = "u32"): IRNode {
   return { id: -1, kind: "binary", op, lhs, rhs, valueType: "scalar", dataType: dt };
 }
 /** Check if an IR node is a constant with value 1 (for stride optimization). */
@@ -2714,98 +2657,37 @@ function lowerBlockReduce(stmt: BlockReduceStmt): Statement[] {
   const { inputName, outputName, inputRows, inputCols, axis, op } = stmt;
   const result: Statement[] = [];
 
-  if (axis === 1) {
-    // Reduce across columns: [R×C] → [R×1]
-    const outSize = inputRows;
-    result.push({
-      kind: "varArray", name: outputName, elemType: "f32", size: outSize, skipZeroInit: true,
-    });
+  // Unified axis reduction: axis=1 reduces columns [R×C]→[R×1], axis=0 reduces rows [R×C]→[1×C]
+  const outerDim = axis === 1 ? inputRows : inputCols;
+  const innerDim = axis === 1 ? inputCols : inputRows;
+  result.push({
+    kind: "varArray", name: outputName, elemType: "f32", size: outerDim, skipZeroInit: true,
+  });
 
-    const rVar = freshVar("rr");
-    const cVar = freshVar("rc");
-    const initVal = op === "max" ? cF32(F32_NEG_MAX) : cF32(0);
+  const outerVar = freshVar("ro");
+  const innerVar = freshVar("ri");
+  const initVal = op === "max" ? cF32(F32_NEG_MAX) : cF32(0);
 
-    const rBody: Statement[] = [];
-    // Initialize result[r] = init
-    rBody.push({
-      kind: "indexAssign", arrayName: outputName, idx: ref(rVar),
-      value: initVal,
-    });
-    // for c in 0..inputCols: result[r] = op(result[r], input[r*C + c])
-    const inputIdx = binOp("add", binOp("mul", ref(rVar), cU32(inputCols)), ref(cVar));
-    let accumExpr: IRNode;
-    if (op === "sum") {
-      accumExpr = binOp("add",
-        arrayRead(outputName, ref(rVar)),
-        arrayRead(inputName, inputIdx),
-        "f32",
-      );
-    } else {
-      // max
-      accumExpr = {
-        id: -1, kind: "binary", op: "max",
-        lhs: arrayRead(outputName, ref(rVar)),
-        rhs: arrayRead(inputName, inputIdx),
-        valueType: "scalar", dataType: "f32",
-      };
-    }
-    rBody.push({
-      kind: "forRange", varName: cVar, start: cU32(0), bound: cU32(inputCols),
-      body: [{
-        kind: "indexAssign", arrayName: outputName, idx: ref(rVar),
-        value: accumExpr,
-      }],
-    });
+  // Input index: always row * cols + col
+  const rowRef = axis === 1 ? ref(outerVar) : ref(innerVar);
+  const colRef = axis === 1 ? ref(innerVar) : ref(outerVar);
+  const inputIdx = binOp("add", binOp("mul", rowRef, cU32(inputCols)), colRef);
+  const accumExpr = binOp(op === "sum" ? "add" : "max",
+    arrayRead(outputName, ref(outerVar)),
+    arrayRead(inputName, inputIdx),
+    "f32",
+  );
 
-    result.push({
-      kind: "forRange", varName: rVar, start: cU32(0), bound: cU32(inputRows),
-      body: rBody,
-    });
-  } else {
-    // axis === 0: Reduce across rows: [R×C] → [1×C]
-    const outSize = inputCols;
-    result.push({
-      kind: "varArray", name: outputName, elemType: "f32", size: outSize, skipZeroInit: true,
-    });
-
-    const cVar = freshVar("rc");
-    const rVar = freshVar("rr");
-    const initVal = op === "max" ? cF32(F32_NEG_MAX) : cF32(0);
-
-    const cBody: Statement[] = [];
-    cBody.push({
-      kind: "indexAssign", arrayName: outputName, idx: ref(cVar),
-      value: initVal,
-    });
-    const inputIdx = binOp("add", binOp("mul", ref(rVar), cU32(inputCols)), ref(cVar));
-    let accumExpr: IRNode;
-    if (op === "sum") {
-      accumExpr = binOp("add",
-        arrayRead(outputName, ref(cVar)),
-        arrayRead(inputName, inputIdx),
-        "f32",
-      );
-    } else {
-      accumExpr = {
-        id: -1, kind: "binary", op: "max",
-        lhs: arrayRead(outputName, ref(cVar)),
-        rhs: arrayRead(inputName, inputIdx),
-        valueType: "scalar", dataType: "f32",
-      };
-    }
-    cBody.push({
-      kind: "forRange", varName: rVar, start: cU32(0), bound: cU32(inputRows),
-      body: [{
-        kind: "indexAssign", arrayName: outputName, idx: ref(cVar),
-        value: accumExpr,
-      }],
-    });
-
-    result.push({
-      kind: "forRange", varName: cVar, start: cU32(0), bound: cU32(inputCols),
-      body: cBody,
-    });
-  }
+  const outerBody: Statement[] = [];
+  outerBody.push({ kind: "indexAssign", arrayName: outputName, idx: ref(outerVar), value: initVal });
+  outerBody.push({
+    kind: "forRange", varName: innerVar, start: cU32(0), bound: cU32(innerDim),
+    body: [{ kind: "indexAssign", arrayName: outputName, idx: ref(outerVar), value: accumExpr }],
+  });
+  result.push({
+    kind: "forRange", varName: outerVar, start: cU32(0), bound: cU32(outerDim),
+    body: outerBody,
+  });
 
   return result;
 }
@@ -2827,18 +2709,7 @@ function lowerBlockUnary(stmt: BlockUnaryStmt): Statement[] {
 
   const iVar = freshVar("ui");
   const inputVal = arrayRead(inputName, ref(iVar));
-  let outputVal: IRNode;
-  switch (op) {
-    case "exp":
-      outputVal = { id: -1, kind: "unary", op: "exp", input: inputVal, valueType: "scalar", dataType: "f32" };
-      break;
-    case "log":
-      outputVal = { id: -1, kind: "unary", op: "log", input: inputVal, valueType: "scalar", dataType: "f32" };
-      break;
-    case "neg":
-      outputVal = { id: -1, kind: "unary", op: "neg", input: inputVal, valueType: "scalar", dataType: "f32" };
-      break;
-  }
+  const outputVal: IRNode = { id: -1, kind: "unary", op, input: inputVal, valueType: "scalar", dataType: "f32" };
 
   result.push({
     kind: "forRange", varName: iVar, start: cU32(0), bound: cU32(size),
@@ -2966,13 +2837,7 @@ function lowerBlockBinary(stmt: BlockBinaryStmt): Statement[] {
 
 /** Emit a binary operation IR node. */
 function emitBinaryOp(op: string, lhs: IRNode, rhs: IRNode): IRNode {
-  if (op === "copy") {
-    return rhs; // Just use the RHS value
-  }
-  if (op === "max" || op === "min") {
-    // max/min are WGSL built-in functions handled by the binary node emitter
-    return { id: -1, kind: "binary", op, lhs, rhs, valueType: "scalar", dataType: "f32" } as IRNode;
-  }
-  return binOp(op as "add" | "sub" | "mul" | "div", lhs, rhs, "f32");
+  if (op === "copy") return rhs;
+  return binOp(op as any, lhs, rhs, "f32");
 }
 
