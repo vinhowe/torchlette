@@ -2289,9 +2289,11 @@ function getTotalThreads(spec: TileKernelSpec): number {
  */
 function lowerTileLoad(stmt: TileLoadStmt, spec: TileKernelSpec): Statement[] {
   const { binding, ptr, mask, sharedName, tileRows, tileCols, elemType } = stmt;
+  const smemStride = stmt.smemStride ?? tileCols;
   const totalElems = tileRows * tileCols;
   const totalThreads = getTotalThreads(spec);
   const elemsPerThread = Math.ceil(totalElems / totalThreads);
+  const isPadded = smemStride !== tileCols;
 
   const result: Statement[] = [];
   const iVar = `_ld_i`;
@@ -2349,7 +2351,12 @@ function lowerTileLoad(stmt: TileLoadStmt, spec: TileKernelSpec): Statement[] {
     cmpOp("lt", ref(globalColName), mask.innerBound),
   );
 
-  // if (mask) { shared[flat] = f32(binding[gIdx]) } else { shared[flat] = 0.0 }
+  // Shared memory write index: row * smemStride + col (padded) or flat (unpadded)
+  const smemIdx = isPadded
+    ? binOp("add", binOp("mul", ref(rowName), cU32(smemStride)), ref(colName))
+    : ref(flatName);
+
+  // if (mask) { shared[idx] = f32(binding[gIdx]) } else { shared[idx] = 0.0 }
   // Use the actual binding dtype (e.g., f16) for the load, then cast to f32 for shared memory
   const bindingDtype = spec.bindings[binding]?.type ?? elemType;
   const loadExpr = loadBinding(binding, ref(gIdxName), bindingDtype);
@@ -2360,13 +2367,13 @@ function lowerTileLoad(stmt: TileLoadStmt, spec: TileKernelSpec): Statement[] {
     body: [{
       kind: "sharedWrite",
       arrayName: sharedName,
-      idx: ref(flatName),
+      idx: smemIdx,
       value: loadAsF32,
     }],
     elseBody: [{
       kind: "sharedWrite",
       arrayName: sharedName,
-      idx: ref(flatName),
+      idx: smemIdx,
       value: cF32(0),
     }],
   });
@@ -2691,7 +2698,8 @@ function lowerBlockLoadTile(stmt: BlockLoadStmt, spec: TileKernelSpec): Statemen
   if (!stmt.tilePtr || !stmt.tileMask) {
     throw new Error("blockLoad with ptrKind=tile requires tilePtr and tileMask");
   }
-  // Delegate to existing tile load lowering
+  // Delegate to existing tile load lowering, with padded smemStride
+  const smemStride = stmt.cols + 1;
   return lowerTileLoad({
     kind: "tileLoad",
     binding: stmt.binding,
@@ -2701,6 +2709,7 @@ function lowerBlockLoadTile(stmt: BlockLoadStmt, spec: TileKernelSpec): Statemen
     tileRows: stmt.rows,
     tileCols: stmt.cols,
     elemType: stmt.elemType,
+    smemStride,
   }, spec);
 }
 
@@ -2829,8 +2838,9 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
     throw new Error("shared×shared blockDot requires threadTileM and threadTileN");
   }
 
+  const aSmemStride = stmt.aSmemStride ?? aCols;  // padded stride for A in shared memory
+  const bSmemStride = stmt.bSmemStride ?? bCols;  // padded stride for B in shared memory
   const innerDim = aCols;         // K dimension (A cols = B rows for non-transposed)
-  const bColStride = bCols;       // B's column count for indexing
   const isAccumulate = !!accName; // dotAccum vs dot
 
   const result: Statement[] = [];
@@ -2841,7 +2851,7 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
   const kkVar = freshVar("kk");
   const kkLoop: Statement[] = [];
 
-  // Load a_vals from shared A: a_vals[tm] = A[(thread_row*ttM + tm) * innerDim + kk]
+  // Load a_vals from shared A: a_vals[tm] = A[(thread_row*ttM + tm) * aSmemStride + kk]
   const aValsName = freshVar("a_vals");
   kkLoop.push({
     kind: "varArray", name: aValsName, elemType: "f32",
@@ -2858,7 +2868,7 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
         binOp("add",
           binOp("mul",
             binOp("add", binOp("mul", ref("thread_row"), cU32(threadTileM)), ref(tmVar1)),
-            cU32(innerDim),
+            cU32(aSmemStride),
           ),
           ref(kkVar),
         ),
@@ -2866,7 +2876,7 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
     }],
   });
 
-  // Load b_vals from shared B: b_vals[tn] = B[kk * bCols + thread_col*ttN + tn]
+  // Load b_vals from shared B: b_vals[tn] = B[kk * bSmemStride + thread_col*ttN + tn]
   const bValsName = freshVar("b_vals");
   kkLoop.push({
     kind: "varArray", name: bValsName, elemType: "f32",
@@ -2881,7 +2891,7 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
       idx: ref(tnVar1),
       value: sharedRead(bName,
         binOp("add",
-          binOp("mul", ref(kkVar), cU32(bColStride)),
+          binOp("mul", ref(kkVar), cU32(bSmemStride)),
           binOp("add", binOp("mul", ref("thread_col"), cU32(threadTileN)), ref(tnVar1)),
         ),
       ),
@@ -2934,6 +2944,7 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
  */
 function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
   const { aName, bName, resultName, accName, aRows, aCols, bRows, bCols } = stmt;
+  const bStride = stmt.bSmemStride ?? bCols;  // padded stride for B in shared memory
   const result: Statement[] = [];
   const innerDim = aCols; // = bCols (dimension being contracted)
   const outCols = bRows;  // B^T has bRows columns
@@ -2949,7 +2960,7 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
     jBody.push({ kind: "var", name: sVar, dtype: "f32", value: cF32(0) });
 
     if (useVec4) {
-      // Vec4 path: s += dot(vec4(a[d4*4..+3]), vec4(b[j*bCols+d4*4..+3]))
+      // Vec4 path: s += dot(vec4(a[d4*4..+3]), vec4(b[j*bStride+d4*4..+3]))
       const d4Var = freshVar("d4");
       jBody.push({
         kind: "forRange", varName: d4Var, start: cU32(0), bound: cU32(innerDim / 4),
@@ -2962,7 +2973,7 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
             ) as [IRNode, IRNode, IRNode, IRNode],
             [0, 1, 2, 3].map(k =>
               sharedRead(bName, binOp("add",
-                binOp("add", binOp("mul", ref(jVar), cU32(bCols)), binOp("mul", ref(d4Var), cU32(4))),
+                binOp("add", binOp("mul", ref(jVar), cU32(bStride)), binOp("mul", ref(d4Var), cU32(4))),
                 cU32(k),
               )),
             ) as [IRNode, IRNode, IRNode, IRNode],
@@ -2970,7 +2981,7 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
         }],
       });
     } else {
-      // Scalar path: for d in 0..innerDim: s += a[d] * b_smem[j*bCols + d]
+      // Scalar path: for d in 0..innerDim: s += a[d] * b_smem[j*bStride + d]
       const dVar = freshVar("d");
       jBody.push({
         kind: "forRange", varName: dVar, start: cU32(0), bound: cU32(innerDim),
@@ -2979,7 +2990,7 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
           name: sVar,
           value: binOp("mul",
             arrayRead(aName, ref(dVar)),
-            sharedRead(bName, binOp("add", binOp("mul", ref(jVar), cU32(bCols)), ref(dVar))),
+            sharedRead(bName, binOp("add", binOp("mul", ref(jVar), cU32(bStride)), ref(dVar))),
             "f32",
           ),
         }],
@@ -3033,7 +3044,7 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
             ) as [IRNode, IRNode, IRNode, IRNode],
             [0, 1, 2, 3].map(k =>
               sharedRead(bName, binOp("add",
-                binOp("add", binOp("mul", ref(jVar), cU32(bCols)), binOp("mul", ref(d4Var), cU32(4))),
+                binOp("add", binOp("mul", ref(jVar), cU32(bStride)), binOp("mul", ref(d4Var), cU32(4))),
                 cU32(k),
               )),
             ) as [IRNode, IRNode, IRNode, IRNode],
@@ -3049,7 +3060,7 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
           name: sVar,
           value: binOp("mul",
             arrayRead(aName, binOp("add", binOp("mul", ref(rVar), cU32(aCols)), ref(dVar))),
-            sharedRead(bName, binOp("add", binOp("mul", ref(jVar), cU32(bCols)), ref(dVar))),
+            sharedRead(bName, binOp("add", binOp("mul", ref(jVar), cU32(bStride)), ref(dVar))),
             "f32",
           ),
         }],
@@ -3088,6 +3099,7 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
  */
 function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
   const { aName, bName, resultName, accName, aRows, aCols, bRows, bCols } = stmt;
+  const bStride = stmt.bSmemStride ?? bCols;  // padded stride for B in shared memory
   const result: Statement[] = [];
   const outCols = bCols;
   const useVec4 = outCols % 4 === 0;
@@ -3104,13 +3116,13 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
     });
 
     if (useVec4) {
-      // Vec4 path: for d4 in 0..outCols/4: result[d4*4+k] += p * b_smem[j*bCols+d4*4+k]
+      // Vec4 path: for d4 in 0..outCols/4: result[d4*4+k] += p * b_smem[j*bStride+d4*4+k]
       const d4Var = freshVar("d4");
       const d4Body: Statement[] = [];
       for (let k = 0; k < 4; k++) {
         const regIdx = binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k));
         const smemIdx = binOp("add",
-          binOp("add", binOp("mul", ref(jVar), cU32(bCols)), binOp("mul", ref(d4Var), cU32(4))),
+          binOp("add", binOp("mul", ref(jVar), cU32(bStride)), binOp("mul", ref(d4Var), cU32(4))),
           cU32(k),
         );
         d4Body.push({
@@ -3125,7 +3137,7 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
         body: d4Body,
       });
     } else {
-      // Scalar path: for d in 0..bCols: result[d] += p * b_smem[j*bCols + d]
+      // Scalar path: for d in 0..bCols: result[d] += p * b_smem[j*bStride + d]
       const dVar = freshVar("d");
       jBody.push({
         kind: "forRange", varName: dVar, start: cU32(0), bound: cU32(outCols),
@@ -3135,7 +3147,7 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
           idx: ref(dVar),
           value: binOp("mul",
             ref(pVar, "f32"),
-            sharedRead(bName, binOp("add", binOp("mul", ref(jVar), cU32(bCols)), ref(dVar))),
+            sharedRead(bName, binOp("add", binOp("mul", ref(jVar), cU32(bStride)), ref(dVar))),
             "f32",
           ),
         }],
@@ -3167,7 +3179,7 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
         idx: binOp("add", binOp("mul", ref(rVar), cU32(outCols)), ref(dVar)),
         value: binOp("mul",
           ref(pVar, "f32"),
-          sharedRead(bName, binOp("add", binOp("mul", ref(jVar), cU32(bCols)), ref(dVar))),
+          sharedRead(bName, binOp("add", binOp("mul", ref(jVar), cU32(bStride)), ref(dVar))),
           "f32",
         ),
       }],

@@ -318,6 +318,7 @@ export interface TileLoadStmt {
   tileRows: number;       // BLOCK dimension (not thread tile)
   tileCols: number;
   elemType: DataType;
+  smemStride?: number;    // padded column stride for shared memory (default: tileCols)
 }
 
 export interface TileLoad1DStmt {
@@ -398,6 +399,8 @@ export interface BlockDotStmt {
   bCols: number;          // ORIGINAL (untransposed) cols
   threadTileM?: number;   // per-thread M dim (for shared×shared outer product)
   threadTileN?: number;   // per-thread N dim (for shared×shared outer product)
+  aSmemStride?: number;   // padded stride for A in shared memory (default: aCols)
+  bSmemStride?: number;   // padded stride for B in shared memory (default: bCols)
 }
 
 export interface BlockReduceStmt {
