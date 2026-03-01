@@ -10,8 +10,9 @@
  * Forward:  Q,K,V [B,H,N,D] → O [B,H,N,D] + L [B,H,N] (logsumexp)
  * Backward: Q,K,V,L,dO → dQ,dK,dV
  *
- * All WGSL generation is handled by tile-IR (attention-tile-ir.ts).
- * Uses vec4 register/shared arrays and subgroup cooperative dot products.
+ * Kernel specs use the tile-IR block API: cooperative loads, block dot products
+ * (auto-vec4), block reductions, and block stores. No manual vec4 or shared
+ * memory code. Auto-CSE handles all sub-expression sharing.
  */
 
 import {
@@ -26,16 +27,25 @@ import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { trackSharedEncoderWrite } from "./index";
 import { compileTileKernel } from "./tile-compiler";
-import {
-  makeForwardAttentionSpec,
-  makeDPrecomputeSpec,
-  makeBackwardDQSpec,
-  makeBackwardDKVSpec,
-} from "./attention-tile-ir";
+import type { TileKernelSpec } from "./tile-ir";
+import { tiledGrid } from "./tile-ir";
+import { F32_NEG_MAX, WORKGROUP_SIZE } from "./shape-utils";
 
-// Cache compiled tile-IR WGSL per headDim to avoid recompilation
+// ============================================================================
+// Tiling Parameters
+// ============================================================================
+
+const BR = 64;     // Q rows per workgroup (forward, dQ)
+const BC = 32;     // KV rows per tile (forward, dQ)
+const BQ_BW = 16;  // Q rows per tile (backward dKV)
+const BC_BW = 64;  // KV rows per workgroup (backward dKV)
+
+// ============================================================================
+// WGSL Cache & Config Buffer Cache
+// ============================================================================
+
 const tileIRWGSLCache = new Map<string, string>();
-function getTileIRWGSL(key: string, specFactory: () => import("./tile-ir").TileKernelSpec): string {
+function getTileIRWGSL(key: string, specFactory: () => TileKernelSpec): string {
   let wgsl = tileIRWGSLCache.get(key);
   if (!wgsl) {
     wgsl = compileTileKernel(specFactory());
@@ -43,13 +53,6 @@ function getTileIRWGSL(key: string, specFactory: () => import("./tile-ir").TileK
   }
   return wgsl;
 }
-
-// Tiling parameters (must match attention-tile-ir.ts)
-const BR = 64;  // Q rows per workgroup
-
-// ============================================================================
-// Config Buffer Cache
-// ============================================================================
 
 const configCache = new Map<string, GPUBuffer>();
 
@@ -88,6 +91,369 @@ function getOrCreateConfigBuffer(
 }
 
 // ============================================================================
+// Kernel Specs (tile-IR)
+// ============================================================================
+
+function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
+  if (headDim % 4 !== 0) throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  const D = headDim;
+  const WG = BR;
+
+  return {
+    name: `tileAttnFwd_D${D}`,
+    workgroupSize: WG,
+    bindings: {
+      Q: { storage: "read", type: "f32" },
+      K: { storage: "read", type: "f32" },
+      V: { storage: "read", type: "f32" },
+      O: { storage: "read_write", type: "f32" },
+      L: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      is_causal: "u32",
+    },
+    grid: tiledGrid({ x: { uniform: "seq_len", tileSize: BR }, y: "num_heads", z: "batch_size" }),
+
+    kernel(ctx) {
+      const tidx = ctx.localIndex();
+      const qBlock = ctx.programId(0);
+      const hIdx = ctx.programId(1);
+      const bIdx = ctx.programId(2);
+
+      const N = ctx.uniform("seq_len");
+      const Dim = ctx.u32(D);
+      const numHeads = ctx.uniform("num_heads");
+      const isCausal = ctx.uniform("is_causal");
+      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
+
+      const qRow = qBlock.mul(ctx.u32(BR)).add(tidx);
+      const valid = qRow.lt(N);
+
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const qBase = bhOff.add(qRow.mul(Dim));
+
+      const Q = ctx.tileLoad("Q", {
+        kind: "thread", base: qBase, stride: ctx.u32(1),
+      }, { rows: 1, cols: D, guard: valid });
+
+      const mPrev = ctx.full(1, 1, F32_NEG_MAX);
+      const lPrev = ctx.full(1, 1, 0);
+      const oAcc = ctx.zeros(1, D);
+
+      const numKVTiles = N.add(ctx.u32(BC - 1)).div(ctx.u32(BC));
+
+      ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
+        const kvStart = tile.mul(ctx.u32(BC));
+
+        const offsR = ctx.arange(kvStart, BC);
+        const offsD = ctx.arange(ctx.u32(0), D);
+        const tilePtr = ctx.tilePtr(bhOff, offsR.outer(Dim), offsD.inner(ctx.u32(1)));
+        const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+        const K = ctx.load2D("K", tilePtr, tileMask);
+
+        const scores = ctx.dot(Q, K.T());
+
+        ctx.range(0, BC, (j) => {
+          const kvPos = kvStart.add(j);
+          const isActive = valid.and(kvPos.lt(N)).and(
+            isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)),
+          );
+          scores.set(j, isActive.select(scores.get(j).mul(scale), ctx.f32(F32_NEG_MAX)));
+        });
+
+        const mNew = scores.max(1);
+        const mMax = mNew.max(mPrev);
+        const correction = mPrev.sub(mMax).exp();
+
+        oAcc.mul_(correction);
+        lPrev.mul_(correction);
+
+        scores.sub_(mMax);
+        scores.exp_();
+        lPrev.add_(scores.sum(1));
+        mPrev.assign(mMax);
+
+        const V = ctx.load2D("V", tilePtr, tileMask);
+        ctx.dotAccum(scores, V, oAcc);
+      });
+
+      ctx.ifThen(valid, () => {
+        const l = lPrev.get(ctx.u32(0));
+        const invL = l.gt(ctx.f32(0)).select(ctx.f32(1).div(l), ctx.f32(0));
+        oAcc.mul_(invL);
+        ctx.tileStore("O", oAcc, { base: qBase, stride: ctx.u32(1) });
+
+        const m = mPrev.get(ctx.u32(0));
+        const lse = m.add(l.max(ctx.f32(1e-10)).log());
+        ctx.emitStore("L", bhOffL.add(qRow), lse);
+      });
+    },
+  };
+}
+
+function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
+  const D = headDim;
+  const WG = WORKGROUP_SIZE;
+
+  return {
+    name: `tileAttnDPrecompute_D${D}`,
+    workgroupSize: WG,
+    bindings: {
+      dO:    { storage: "read", type: "f32" },
+      Out:   { storage: "read", type: "f32" },
+      D_val: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      is_causal: "u32",
+    },
+    grid: (u) => [u.batch_size * u.num_heads * u.seq_len],
+
+    kernel(ctx) {
+      const row = ctx.programId(0);
+      const tid = ctx.localIndex();
+      const Dim = ctx.uniform("head_dim");
+      const base = row.mul(Dim);
+
+      const dotProd = ctx.wgReduce("sum", tid, Dim, WG, (i) =>
+        ctx.load("dO", base.add(i)).mul(ctx.load("Out", base.add(i))),
+      );
+      ctx.guardedStore("D_val", tid.eq(ctx.u32(0)), row, dotProd);
+    },
+  };
+}
+
+function makeBackwardDQSpec(headDim: number): TileKernelSpec {
+  if (headDim % 4 !== 0) throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  const D = headDim;
+  const WG = BR;
+
+  return {
+    name: `tileAttnBwdDQ_D${D}`,
+    workgroupSize: WG,
+    bindings: {
+      Q:     { storage: "read", type: "f32" },
+      K:     { storage: "read", type: "f32" },
+      V:     { storage: "read", type: "f32" },
+      L_buf: { storage: "read", type: "f32" },
+      D_buf: { storage: "read", type: "f32" },
+      dO:    { storage: "read", type: "f32" },
+      dQ:    { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      is_causal: "u32",
+    },
+    grid: tiledGrid({ x: { uniform: "seq_len", tileSize: BR }, y: "num_heads", z: "batch_size" }),
+
+    kernel(ctx) {
+      const tidx = ctx.localIndex();
+      const qBlock = ctx.programId(0);
+      const hIdx = ctx.programId(1);
+      const bIdx = ctx.programId(2);
+
+      const N = ctx.uniform("seq_len");
+      const Dim = ctx.u32(D);
+      const numHeads = ctx.uniform("num_heads");
+      const isCausal = ctx.uniform("is_causal");
+      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
+
+      const qRow = qBlock.mul(ctx.u32(BR)).add(tidx);
+      const valid = qRow.lt(N);
+
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const rowBase = bhOff.add(qRow.mul(Dim));
+
+      const Q = ctx.tileLoad("Q", {
+        kind: "thread", base: rowBase, stride: ctx.u32(1),
+      }, { rows: 1, cols: D, guard: valid });
+
+      const dO = ctx.tileLoad("dO", {
+        kind: "thread", base: rowBase, stride: ctx.u32(1),
+      }, { rows: 1, cols: D, guard: valid });
+
+      const lVar = ctx.emitVar("_Li", "f32", ctx.f32(0));
+      const dVar = ctx.emitVar("_Di", "f32", ctx.f32(0));
+      ctx.ifThen(valid, () => {
+        lVar.set(ctx.load("L_buf", bhOffL.add(qRow)));
+        dVar.set(ctx.load("D_buf", bhOffL.add(qRow)));
+      });
+
+      const dqAcc = ctx.zeros(1, D);
+
+      const numKVTiles = N.add(ctx.u32(BC - 1)).div(ctx.u32(BC));
+
+      ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
+        const kvStart = tile.mul(ctx.u32(BC));
+
+        const offsR = ctx.arange(kvStart, BC);
+        const offsD = ctx.arange(ctx.u32(0), D);
+        const tilePtr = ctx.tilePtr(bhOff, offsR.outer(Dim), offsD.inner(ctx.u32(1)));
+        const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+        const K = ctx.load2D("K", tilePtr, tileMask);
+        const V = ctx.load2D("V", tilePtr, tileMask);
+
+        const scores = ctx.dot(Q, K.T());
+        const dovs = ctx.dot(dO, V.T());
+
+        const ds = ctx.zeros(1, BC);
+        ctx.range(0, BC, (j) => {
+          const kvPos = kvStart.add(j);
+          const isActive = valid.and(kvPos.lt(N)).and(
+            isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)),
+          );
+          const s = scores.get(j).mul(scale);
+          const p = isActive.select(s.sub(lVar.get()).exp(), ctx.f32(0));
+          ds.set(j, p.mul(dovs.get(j).sub(dVar.get())));
+        });
+
+        ctx.dotAccum(ds, K, dqAcc);
+      });
+
+      ctx.ifThen(valid, () => {
+        dqAcc.mul_(scale);
+        ctx.tileStore("dQ", dqAcc, { base: rowBase, stride: ctx.u32(1) });
+      });
+    },
+  };
+}
+
+function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
+  if (headDim % 4 !== 0) throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  const D = headDim;
+  const WG = BC_BW;
+
+  return {
+    name: `tileAttnBwdDKV_D${D}`,
+    workgroupSize: WG,
+    bindings: {
+      Q:     { storage: "read", type: "f32" },
+      K:     { storage: "read", type: "f32" },
+      V:     { storage: "read", type: "f32" },
+      L_buf: { storage: "read", type: "f32" },
+      D_buf: { storage: "read", type: "f32" },
+      dO:    { storage: "read", type: "f32" },
+      dK:    { storage: "read_write", type: "f32" },
+      dV:    { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      is_causal: "u32",
+    },
+    grid: tiledGrid({ x: { uniform: "seq_len", tileSize: BC_BW }, y: "num_heads", z: "batch_size" }),
+
+    kernel(ctx) {
+      const tidx = ctx.localIndex();
+      const kvBlock = ctx.programId(0);
+      const hIdx = ctx.programId(1);
+      const bIdx = ctx.programId(2);
+
+      const N = ctx.uniform("seq_len");
+      const Dim = ctx.u32(D);
+      const numHeads = ctx.uniform("num_heads");
+      const isCausal = ctx.uniform("is_causal");
+      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
+
+      const kvRow = kvBlock.mul(ctx.u32(BC_BW)).add(tidx);
+      const valid = kvRow.lt(N);
+
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const rowBase = bhOff.add(kvRow.mul(Dim));
+
+      const K = ctx.tileLoad("K", {
+        kind: "thread", base: rowBase, stride: ctx.u32(1),
+      }, { rows: 1, cols: D, guard: valid });
+
+      const V = ctx.tileLoad("V", {
+        kind: "thread", base: rowBase, stride: ctx.u32(1),
+      }, { rows: 1, cols: D, guard: valid });
+
+      const dkAcc = ctx.zeros(1, D);
+      const dvAcc = ctx.zeros(1, D);
+
+      const lTile = ctx.sharedArray("L_tile", BQ_BW, "f32");
+      const dTile = ctx.sharedArray("D_tile", BQ_BW, "f32");
+
+      const numQTiles = N.add(ctx.u32(BQ_BW - 1)).div(ctx.u32(BQ_BW));
+
+      ctx.forRange(ctx.u32(0), numQTiles, (qt) => {
+        const qStart = qt.mul(ctx.u32(BQ_BW));
+
+        const skipTile = isCausal.ne(ctx.u32(0)).and(
+          qStart.add(ctx.u32(BQ_BW - 1)).lt(kvBlock.mul(ctx.u32(BC_BW))),
+        );
+
+        ctx.ifThen(skipTile.not(), () => {
+          const offsR = ctx.arange(qStart, BQ_BW);
+          const offsD = ctx.arange(ctx.u32(0), D);
+          const tilePtr = ctx.tilePtr(bhOff, offsR.outer(Dim), offsD.inner(ctx.u32(1)));
+          const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+          const QTile = ctx.load2D("Q", tilePtr, tileMask);
+          const dOTile = ctx.load2D("dO", tilePtr, tileMask);
+
+          ctx.ifThen(tidx.lt(ctx.u32(BQ_BW)), () => {
+            const qi = qStart.add(tidx);
+            const inBounds = qi.lt(N);
+            const lIdx = bhOffL.add(qi);
+            lTile.write(tidx, inBounds.select(ctx.load("L_buf", lIdx), ctx.f32(0)));
+            dTile.write(tidx, inBounds.select(ctx.load("D_buf", lIdx), ctx.f32(0)));
+          });
+
+          ctx.barrier();
+
+          const scores = ctx.dot(K, QTile.T());
+          const dovs = ctx.dot(V, dOTile.T());
+
+          const dsBlk = ctx.zeros(1, BQ_BW);
+          const pBlk = ctx.zeros(1, BQ_BW);
+          ctx.range(0, BQ_BW, (j) => {
+            const qi = qStart.add(j);
+            const isActive = valid.and(qi.lt(N)).and(
+              isCausal.eq(ctx.u32(0)).or(kvRow.le(qi)),
+            );
+            const s = scores.get(j).mul(scale);
+            const p = isActive.select(s.sub(lTile.read(j)).exp(), ctx.f32(0));
+            const ds = p.mul(dovs.get(j).sub(dTile.read(j)));
+            dsBlk.set(j, ds.mul(scale));
+            pBlk.set(j, p);
+          });
+
+          ctx.dotAccum(dsBlk, QTile, dkAcc);
+          ctx.dotAccum(pBlk, dOTile, dvAcc);
+
+          ctx.barrier();
+        });
+      });
+
+      ctx.ifThen(valid, () => {
+        ctx.tileStore("dK", dkAcc, { base: rowBase, stride: ctx.u32(1) });
+        ctx.tileStore("dV", dvAcc, { base: rowBase, stride: ctx.u32(1) });
+      });
+    },
+  };
+}
+
+// ============================================================================
 // Dispatch Functions
 // ============================================================================
 
@@ -109,8 +475,8 @@ export function dispatchFlashAttentionForward(
   const ctx = requireContext();
   const device = ctx.device;
 
-  const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4; // f32
-  const logsumexpSizeBytes = batchSize * numHeads * seqLen * 4; // f32
+  const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4;
+  const logsumexpSizeBytes = batchSize * numHeads * seqLen * 4;
 
   const outBuffer = allocateOutputBuffer(outputSizeBytes);
   const lseBuffer = allocateOutputBuffer(logsumexpSizeBytes);
@@ -129,13 +495,7 @@ export function dispatchFlashAttentionForward(
   for (const b of [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer]) trackSharedEncoderWrite(b);
 
   const numQBlocks = Math.ceil(seqLen / BR);
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    numQBlocks,
-    numHeads,
-    batchSize,
-  );
+  dispatchComputePass(pipeline, bindGroup, numQBlocks, numHeads, batchSize);
 
   return { outputBuffer: outBuffer, logsumexpBuffer: lseBuffer };
 }
@@ -158,7 +518,7 @@ export function dispatchFlashAttentionBackwardD(
   const device = ctx.device;
 
   const totalRows = batchSize * numHeads * seqLen;
-  const outputSizeBytes = totalRows * 4; // f32
+  const outputSizeBytes = totalRows * 4;
 
   const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
@@ -175,11 +535,7 @@ export function dispatchFlashAttentionBackwardD(
 
   for (const b of [dOBuffer, oBuffer, outBuffer]) trackSharedEncoderWrite(b);
 
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    totalRows,
-  );
+  dispatchComputePass(pipeline, bindGroup, totalRows);
 
   return outBuffer;
 }
@@ -223,13 +579,7 @@ export function dispatchFlashAttentionBackwardDQ(
   for (const b of [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer]) trackSharedEncoderWrite(b);
 
   const numQBlocks = Math.ceil(seqLen / BR);
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    numQBlocks,
-    numHeads,
-    batchSize,
-  );
+  dispatchComputePass(pipeline, bindGroup, numQBlocks, numHeads, batchSize);
 
   return outBuffer;
 }
@@ -272,7 +622,6 @@ export function dispatchFlashAttentionBackwardDKV(
     device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
   );
 
-  const BC_BW = 64;
   const wgsl = getTileIRWGSL(`bwdDKV:${headDim}`, () => makeBackwardDKVSpec(headDim));
   const pipelineKey = `faBwdDKV:tile:${headDim}`;
   const pipeline = getPipeline(ctx, pipelineKey, wgsl);
@@ -283,13 +632,7 @@ export function dispatchFlashAttentionBackwardDKV(
   for (const b of [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer]) trackSharedEncoderWrite(b);
 
   const numKVBlocks = Math.ceil(seqLen / BC_BW);
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    numKVBlocks,
-    numHeads,
-    batchSize,
-  );
+  dispatchComputePass(pipeline, bindGroup, numKVBlocks, numHeads, batchSize);
 
   return { dKBuffer, dVBuffer };
 }
