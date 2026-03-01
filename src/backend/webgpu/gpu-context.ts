@@ -48,19 +48,6 @@ let lastInitError: string | null = null;
  */
 export const f16WeightCache = new Map<GPUBuffer, GPUBuffer>();
 
-/** Set an entry in the f16 weight cache (used by packed Adam). */
-export function setF16WeightCacheEntry(paramBuffer: GPUBuffer, f16Buffer: GPUBuffer): void {
-  f16WeightCache.set(paramBuffer, f16Buffer);
-}
-
-/** Evict and optionally destroy an f16 weight cache entry (used by packed Adam). */
-export function evictF16WeightCacheEntry(paramBuffer: GPUBuffer): GPUBuffer | undefined {
-  const old = f16WeightCache.get(paramBuffer);
-  if (old) {
-    f16WeightCache.delete(paramBuffer);
-  }
-  return old;
-}
 
 // ============================================================================
 // Internal Helpers
