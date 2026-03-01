@@ -340,12 +340,13 @@ export function generateFusedKernelTileIR(
         nodeExprs.set(node.id, named);
       }
 
-      // Store outputs
+      // Store outputs (masked store — like tl.store with mask)
+      const totalElements = ctx.uniform("total_elements");
       for (let i = 0; i < recipe.outputs.length; i++) {
         const output = recipe.outputs[i];
         const val = nodeExprs.get(output.nodeId);
         if (!val) throw new Error(`Missing output expr for node ${output.nodeId}`);
-        ctx.guardedStore(`out${i}`, idx.lt(ctx.uniform("total_elements")), idx, val);
+        ctx.blockStore(`out${i}`, idx, totalElements, val);
       }
     },
   };

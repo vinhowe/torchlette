@@ -1014,9 +1014,7 @@ export function flatCopySpec(): TileKernelSpec {
       ctx.ifThen(base.ge(size), () => ctx.emitReturn());
       for (let v = 0; v < VEC; v++) {
         const idx = base.add(ctx.u32(v));
-        ctx.ifThen(idx.lt(size), () => {
-          ctx.emitStore("out", idx, ctx.load("src", idx));
-        });
+        ctx.blockStore("out", idx, size, ctx.blockLoad("src", idx, size));
       }
     },
   };
@@ -1045,9 +1043,7 @@ export function flatAddSpec(): TileKernelSpec {
       ctx.ifThen(b.ge(size), () => ctx.emitReturn());
       for (let v = 0; v < VEC; v++) {
         const idx = b.add(ctx.u32(v));
-        ctx.ifThen(idx.lt(size), () => {
-          ctx.emitStore("out", idx, ctx.load("base", idx).add(ctx.load("src", idx)));
-        });
+        ctx.blockStore("out", idx, size, ctx.blockLoad("base", idx, size).add(ctx.blockLoad("src", idx, size)));
       }
     },
   };
@@ -1221,8 +1217,9 @@ export function randnWGSL(): string {
       const r = u1.log().mul(ctx.f32(-2.0)).sqrt();
       const theta = u2.mul(ctx.f32(2.0 * Math.PI));
       ctx.emitStore("out", outIdx, r.mul(theta.cos()));
-      // Second value with bounds check
-      ctx.guardedStore("out", outIdx.add(ctx.u32(1)).lt(size), outIdx.add(ctx.u32(1)), r.mul(theta.sin()));
+      // Second value with masked store (like tl.store with mask)
+      const outIdx2 = outIdx.add(ctx.u32(1));
+      ctx.blockStore("out", outIdx2, size, r.mul(theta.sin()));
     },
   };
   return compileTileKernel(spec);
