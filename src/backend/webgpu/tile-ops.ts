@@ -370,8 +370,8 @@ export class Block {
 export class BlockOps {
   private blockCounter = 0;
   /** @internal */ readonly wgSize: number;
-  /** @internal */ readonly threadTileM?: number;
-  /** @internal */ readonly threadTileN?: number;
+  /** @internal */ threadTileM?: number;
+  /** @internal */ threadTileN?: number;
 
   constructor(
     private readonly ctx: KernelContext,
@@ -387,6 +387,12 @@ export class BlockOps {
       this.threadTileM = config.threadTile[0];
       this.threadTileN = config.threadTile[1];
     }
+  }
+
+  /** Set thread tile dimensions (can be called after construction). */
+  setThreadTile(m: number, n: number): void {
+    this.threadTileM = m;
+    this.threadTileN = n;
   }
 
   private freshName(): string {
