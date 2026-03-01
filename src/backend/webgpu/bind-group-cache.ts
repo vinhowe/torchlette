@@ -356,12 +356,3 @@ export function getBindGroupCacheMissLog(): Array<{ idx: number; reason: string;
   return cacheState.missLog;
 }
 
-/**
- * Get the buffer list for a specific dispatch sequence index.
- * Returns null if the index has no cached entry.
- * Used by dispatch replay to collect buffers that need pinning.
- */
-export function getSequenceEntryBuffers(idx: number): GPUBuffer[] | null {
-  const entry = cacheState.sequenceEntries[idx];
-  return entry ? entry.buffers : null;
-}

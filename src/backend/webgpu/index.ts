@@ -79,7 +79,7 @@ export {
   profiledCreateBindGroup, cachedCreateBindGroup,
   resetDispatchSequence, setDispatchSequenceCounters, getDispatchSequenceCounters,
   clearBindGroupCache, getBindGroupCacheStats, resetBindGroupCacheStats,
-  getBindGroupCacheMissLog, getSequenceEntryBuffers,
+  getBindGroupCacheMissLog,
 } from "./bind-group-cache";
 
 export { createTensor, createTrackedBuffer, createBufferWithData } from "./tensor";
@@ -87,8 +87,8 @@ export { createTensor, createTrackedBuffer, createBufferWithData } from "./tenso
 export {
   dispatchComputePass, dispatchElementwise,
   getPipeline,
-  dispatchBinary, dispatchBinaryDirect, dispatchBinaryChunked,
-  dispatchUnary, dispatchUnaryDirect, dispatchUnaryChunked,
+  dispatchBinary,
+  dispatchUnary,
   dispatchMatmul,
   dispatchMatmulWithEpilogue, dispatchMatmulDirect,
 } from "./dispatch";

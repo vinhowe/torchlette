@@ -253,7 +253,7 @@ export function dispatchBinary(
 /**
  * Direct binary dispatch for small tensors (no chunking).
  */
-export function dispatchBinaryDirect(
+function dispatchBinaryDirect(
   op: string,
   a: WebGPUTensor,
   b: WebGPUTensor,
@@ -293,7 +293,7 @@ export function dispatchBinaryDirect(
  * Uses tile-IR spec + dispatchChunked for tensors exceeding maxStorageBufferBindingSize.
  * Handles: same-shape contiguous tensors, or scalar + large tensor.
  */
-export function dispatchBinaryChunked(
+function dispatchBinaryChunked(
   op: string,
   a: WebGPUTensor,
   b: WebGPUTensor,
@@ -375,7 +375,7 @@ export function dispatchUnary(
 /**
  * Direct unary dispatch for small tensors.
  */
-export function dispatchUnaryDirect(
+function dispatchUnaryDirect(
   opKey: string,
   expr: string,
   a: WebGPUTensor,
@@ -408,7 +408,7 @@ export function dispatchUnaryDirect(
  * Chunked unary dispatch for large contiguous tensors.
  * Uses tile-IR spec + dispatchChunked for tensors exceeding maxStorageBufferBindingSize.
  */
-export function dispatchUnaryChunked(
+function dispatchUnaryChunked(
   opKey: string,
   expr: string,
   a: WebGPUTensor,
