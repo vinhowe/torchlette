@@ -707,14 +707,7 @@ export function min(a: BackendTensor, options?: MaxOptions): BackendTensor {
 // ============================================================================
 
 export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
-  let tensor = asGPUTensor(a);
-  let contiguousCopy: WebGPUTensor | null = null;
-
-  if (!tensor.isContiguous) {
-    tensor = asGPUTensor(contiguous(tensor));
-    contiguousCopy = tensor;
-  }
-
+  const tensor = asGPUTensor(a);
   const inputShape = tensor.shape;
   const dim = options?.dim;
 
@@ -728,7 +721,7 @@ export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
     count = dims.reduce((acc, d) => acc * inputShape[normalizeDim(d, rank)], 1);
   }
 
-  // Get sum result (always a tensor, possibly 0-d)
+  // sum() handles contiguity internally
   const sumTensor = asGPUTensor(sum(a, options));
 
   // Divide by count via tile-IR
@@ -741,13 +734,7 @@ export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
     { size: outSize, count },
   );
 
-  // Destroy intermediate sum tensor
   sumTensor.destroy();
-
-  if (contiguousCopy) {
-    contiguousCopy.destroy();
-  }
-
   return createTensor(sumTensor.shape, outBuffer);
 }
 
