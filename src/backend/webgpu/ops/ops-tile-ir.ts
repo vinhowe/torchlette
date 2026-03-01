@@ -579,7 +579,12 @@ export function narrowBackwardTileIR(
  * Generate WGSL for strided scatter copy via tile-IR.
  * Two-phase: copy base to output, then scatter src into view positions.
  */
-export function stridedScatterCopyTileIR(
+/**
+ * Unified strided scatter kernel: copy or add.
+ * Two-phase: copy base to output, then scatter src values at view positions.
+ */
+function stridedScatterTileIR(
+  op: "copy" | "add",
   baseSize: number,
   viewShape: number[],
   viewStrides: number[],
@@ -590,17 +595,14 @@ export function stridedScatterCopyTileIR(
   const viewSize = viewShape.reduce((a, b) => a * b, 1);
 
   const spec: TileKernelSpec = {
-    name: "stridedScatterCopy",
+    name: op === "copy" ? "stridedScatterCopy" : "stridedScatterAdd",
     workgroupSize: WG,
     bindings: {
       base: { storage: "read", type: "f32" },
       src: { storage: "read", type: "f32" },
       out: { storage: "read_write", type: "f32" },
     },
-    uniforms: {
-      baseSize: "u32",
-      viewSize: "u32",
-    },
+    uniforms: { baseSize: "u32", viewSize: "u32" },
     grid: fixedElementGrid(WG, Math.max(baseSize, viewSize)),
     kernel(ctx) {
       const idx = ctx.flatGlobalId(WG);
@@ -609,7 +611,6 @@ export function stridedScatterCopyTileIR(
       ctx.ifThen(idx.lt(ctx.uniform("baseSize")), () => {
         ctx.emitStore("out", idx, ctx.load("base", idx));
       });
-
       ctx.barrier();
 
       // Phase 2: scatter src values into output at view positions
@@ -617,65 +618,26 @@ export function stridedScatterCopyTileIR(
         const coords = ctx.decomposeIndex(idx, viewShape);
         const baseOff = ctx.linearizeIndex(coords, viewStrides, viewOffset);
         const srcOff = ctx.linearizeIndex(coords, srcStrides, srcOffset);
-        ctx.emitStore("out", baseOff, ctx.load("src", srcOff));
+        const srcVal = ctx.load("src", srcOff);
+        ctx.emitStore("out", baseOff, op === "add" ? ctx.load("out", baseOff).add(srcVal) : srcVal);
       });
     },
   };
   return compileTileKernel(spec);
 }
 
-// ============================================================================
-// StridedScatterAdd Kernel
-// ============================================================================
-
-/**
- * Generate WGSL for strided scatter add via tile-IR.
- * Two-phase: copy base to output, then add src values at view positions.
- */
-export function stridedScatterAddTileIR(
-  baseSize: number,
-  viewShape: number[],
-  viewStrides: number[],
-  viewOffset: number,
-  srcStrides: number[],
-  srcOffset: number,
+export function stridedScatterCopyTileIR(
+  baseSize: number, viewShape: number[], viewStrides: number[],
+  viewOffset: number, srcStrides: number[], srcOffset: number,
 ): string {
-  const viewSize = viewShape.reduce((a, b) => a * b, 1);
+  return stridedScatterTileIR("copy", baseSize, viewShape, viewStrides, viewOffset, srcStrides, srcOffset);
+}
 
-  const spec: TileKernelSpec = {
-    name: "stridedScatterAdd",
-    workgroupSize: WG,
-    bindings: {
-      base: { storage: "read", type: "f32" },
-      src: { storage: "read", type: "f32" },
-      out: { storage: "read_write", type: "f32" },
-    },
-    uniforms: {
-      baseSize: "u32",
-      viewSize: "u32",
-    },
-    grid: fixedElementGrid(WG, Math.max(baseSize, viewSize)),
-    kernel(ctx) {
-      const idx = ctx.flatGlobalId(WG);
-
-      // Phase 1: copy base to output
-      ctx.ifThen(idx.lt(ctx.uniform("baseSize")), () => {
-        ctx.emitStore("out", idx, ctx.load("base", idx));
-      });
-
-      ctx.barrier();
-
-      // Phase 2: add src values into output at view positions
-      ctx.ifThen(idx.lt(ctx.uniform("viewSize")), () => {
-        const coords = ctx.decomposeIndex(idx, viewShape);
-        const baseOff = ctx.linearizeIndex(coords, viewStrides, viewOffset);
-        const srcOff = ctx.linearizeIndex(coords, srcStrides, srcOffset);
-        const existing = ctx.load("out", baseOff);
-        ctx.emitStore("out", baseOff, existing.add(ctx.load("src", srcOff)));
-      });
-    },
-  };
-  return compileTileKernel(spec);
+export function stridedScatterAddTileIR(
+  baseSize: number, viewShape: number[], viewStrides: number[],
+  viewOffset: number, srcStrides: number[], srcOffset: number,
+): string {
+  return stridedScatterTileIR("add", baseSize, viewShape, viewStrides, viewOffset, srcStrides, srcOffset);
 }
 
 // ============================================================================
@@ -686,190 +648,101 @@ export function stridedScatterAddTileIR(
  * Generate WGSL for gather op via tile-IR.
  * out[idx] = input[offset with gather dim replaced by indices[idx]]
  */
-export function gatherTileIR(
-  inputShape: number[],
-  indexShape: number[],
-  dim: number,
+/**
+ * Unified gather kernel: regular or chunked.
+ * Chunked mode adds chunk range guards and adjusts indices to chunk-local coordinates.
+ */
+function gatherTileIRImpl(
+  inputShape: number[], indexShape: number[], dim: number, chunked: boolean,
 ): string {
   const inputStrides = contiguousStridesForShape(inputShape);
+  const uniforms: Record<string, "u32"> = { size: "u32" };
+  if (chunked) { uniforms.chunkStart = "u32"; uniforms.chunkEnd = "u32"; }
 
   const spec: TileKernelSpec = {
-    name: `gather_d${dim}`,
+    name: chunked ? `gather_chunked_d${dim}` : `gather_d${dim}`,
     workgroupSize: WG,
     bindings: {
       input: { storage: "read", type: "f32" },
       indices: { storage: "read", type: "f32" },
       out: { storage: "read_write", type: "f32" },
     },
-    uniforms: { size: "u32" },
+    uniforms,
     grid: elementwiseGrid(WG, { elementUniform: "size" }),
     kernel(ctx) {
       const idx = ctx.elementIndex(WG);
-
-      // Decompose flat index into multi-dimensional coordinates
-      const coords = ctx.decomposeIndex(idx, indexShape);
-
-      // Get gather index from indices buffer
       const gatherIdx = ctx.emitLet("gatherIdx", ctx.load("indices", idx).toU32());
 
-      // Compute input offset: replace dim coordinate with gather index
-      const inputCoords = coords.map((c, d) => d === dim ? gatherIdx : c);
-      const inputOffset = ctx.linearizeIndex(inputCoords, inputStrides);
+      let dimIdx: BlockExpr = gatherIdx;
+      if (chunked) {
+        ctx.ifThen(gatherIdx.lt(ctx.uniform("chunkStart")), () => ctx.emitReturn());
+        ctx.ifThen(gatherIdx.ge(ctx.uniform("chunkEnd")), () => ctx.emitReturn());
+        dimIdx = gatherIdx.sub(ctx.uniform("chunkStart"));
+      }
 
-      ctx.emitStore("out", idx, ctx.load("input", inputOffset));
+      const coords = ctx.decomposeIndex(idx, indexShape);
+      const inputCoords = coords.map((c, d) => d === dim ? dimIdx : c);
+      ctx.emitStore("out", idx, ctx.load("input", ctx.linearizeIndex(inputCoords, inputStrides)));
     },
   };
   return compileTileKernel(spec);
 }
 
-// ============================================================================
-// ScatterAdd Kernel
-// ============================================================================
+export function gatherTileIR(inputShape: number[], indexShape: number[], dim: number): string {
+  return gatherTileIRImpl(inputShape, indexShape, dim, false);
+}
+
+export function chunkedGatherTileIR(inputShape: number[], indexShape: number[], dim: number): string {
+  return gatherTileIRImpl(inputShape, indexShape, dim, true);
+}
 
 /**
- * Generate WGSL for scatter_add op via tile-IR.
+ * Unified scatter_add kernel: regular or chunked.
  * Caller must copy input→output before dispatching this kernel.
  */
-export function scatterAddTileIR(
-  inputShape: number[],
-  srcShape: number[],
-  dim: number,
+function scatterAddTileIRImpl(
+  inputShape: number[], srcShape: number[], dim: number, chunked: boolean,
 ): string {
   const outStrides = contiguousStridesForShape(inputShape);
-  const srcStrides = contiguousStridesForShape(srcShape);
+  const uniforms: Record<string, "u32"> = { srcSize: "u32" };
+  if (chunked) { uniforms.chunkStart = "u32"; uniforms.chunkEnd = "u32"; }
 
   const spec: TileKernelSpec = {
-    name: `scatterAdd_d${dim}`,
+    name: chunked ? `scatterAdd_chunked_d${dim}` : `scatterAdd_d${dim}`,
     workgroupSize: WG,
     bindings: {
       indices: { storage: "read", type: "f32" },
       src: { storage: "read", type: "f32" },
       out: { storage: "read_write", type: "f32" },
     },
-    uniforms: { srcSize: "u32" },
+    uniforms,
     grid: elementwiseGrid(WG, { elementUniform: "srcSize" }),
     kernel(ctx) {
       const srcIdx = ctx.elementIndex(WG, "srcSize");
-
-      // Decompose flat src index into multi-dimensional coordinates
-      const coords = ctx.decomposeIndex(srcIdx, srcShape);
-
-      // Get scatter index from indices buffer
       const scatterIdx = ctx.emitLet("scatterIdx", ctx.load("indices", srcIdx).toU32());
 
-      // Compute output offset: replace dim coordinate with scatter index
-      const outCoords = coords.map((c, d) => d === dim ? scatterIdx : c);
-      const outOffset = ctx.linearizeIndex(outCoords, outStrides);
+      let dimIdx: BlockExpr = scatterIdx;
+      if (chunked) {
+        ctx.ifThen(scatterIdx.lt(ctx.uniform("chunkStart")), () => ctx.emitReturn());
+        ctx.ifThen(scatterIdx.ge(ctx.uniform("chunkEnd")), () => ctx.emitReturn());
+        dimIdx = scatterIdx.sub(ctx.uniform("chunkStart"));
+      }
 
-      const existing = ctx.load("out", outOffset);
-      ctx.emitStore("out", outOffset, existing.add(ctx.load("src", srcIdx)));
+      const coords = ctx.decomposeIndex(srcIdx, srcShape);
+      const outCoords = coords.map((c, d) => d === dim ? dimIdx : c);
+      const outOffset = ctx.linearizeIndex(outCoords, outStrides);
+      ctx.emitStore("out", outOffset, ctx.load("out", outOffset).add(ctx.load("src", srcIdx)));
     },
   };
   return compileTileKernel(spec);
 }
 
-// ============================================================================
-// Chunked Gather Kernel
-// ============================================================================
-
-/**
- * Generate WGSL for chunked gather op via tile-IR.
- * Each dispatch handles a chunk of the input buffer along the gather dimension.
- * Threads whose gather index falls outside [chunkStart, chunkEnd) are skipped.
- * The gather index is adjusted to local coordinates within the chunk.
- */
-export function chunkedGatherTileIR(
-  inputShape: number[],
-  indexShape: number[],
-  dim: number,
-): string {
-  const inputStrides = contiguousStridesForShape(inputShape);
-
-  const spec: TileKernelSpec = {
-    name: `gather_chunked_d${dim}`,
-    workgroupSize: WG,
-    bindings: {
-      input: { storage: "read", type: "f32" },
-      indices: { storage: "read", type: "f32" },
-      out: { storage: "read_write", type: "f32" },
-    },
-    uniforms: { size: "u32", chunkStart: "u32", chunkEnd: "u32" },
-    grid: elementwiseGrid(WG, { elementUniform: "size" }),
-    kernel(ctx) {
-      const idx = ctx.elementIndex(WG);
-
-      // Get gather index and skip if outside current chunk range
-      const gatherIdx = ctx.emitLet("gatherIdx", ctx.load("indices", idx).toU32());
-      ctx.ifThen(gatherIdx.lt(ctx.uniform("chunkStart")), () => ctx.emitReturn());
-      ctx.ifThen(gatherIdx.ge(ctx.uniform("chunkEnd")), () => ctx.emitReturn());
-
-      // Adjust to chunk-local index
-      const localIdx = gatherIdx.sub(ctx.uniform("chunkStart"));
-
-      // Decompose flat index into multi-dimensional coordinates
-      const coords = ctx.decomposeIndex(idx, indexShape);
-
-      // Compute input offset: replace dim coordinate with local gather index
-      const inputCoords = coords.map((c, d) => d === dim ? localIdx : c);
-      const inputOffset = ctx.linearizeIndex(inputCoords, inputStrides);
-
-      ctx.emitStore("out", idx, ctx.load("input", inputOffset));
-    },
-  };
-  return compileTileKernel(spec);
+export function scatterAddTileIR(inputShape: number[], srcShape: number[], dim: number): string {
+  return scatterAddTileIRImpl(inputShape, srcShape, dim, false);
 }
 
-// ============================================================================
-// Chunked ScatterAdd Kernel
-// ============================================================================
-
-/**
- * Generate WGSL for chunked scatter_add op via tile-IR.
- * Each dispatch handles a chunk of the output buffer along the scatter dimension.
- * Threads whose scatter index falls outside [chunkStart, chunkEnd) are skipped.
- * The scatter index is adjusted to local coordinates within the chunk.
- */
-export function chunkedScatterAddTileIR(
-  inputShape: number[],
-  srcShape: number[],
-  dim: number,
-): string {
-  const outStrides = contiguousStridesForShape(inputShape);
-  const srcStrides = contiguousStridesForShape(srcShape);
-
-  const spec: TileKernelSpec = {
-    name: `scatterAdd_chunked_d${dim}`,
-    workgroupSize: WG,
-    bindings: {
-      indices: { storage: "read", type: "f32" },
-      src: { storage: "read", type: "f32" },
-      out: { storage: "read_write", type: "f32" },
-    },
-    uniforms: { srcSize: "u32", chunkStart: "u32", chunkEnd: "u32" },
-    grid: elementwiseGrid(WG, { elementUniform: "srcSize" }),
-    kernel(ctx) {
-      const srcIdx = ctx.elementIndex(WG, "srcSize");
-
-      // Get scatter index and skip if outside current chunk range
-      const scatterIdx = ctx.emitLet("scatterIdx", ctx.load("indices", srcIdx).toU32());
-      ctx.ifThen(scatterIdx.lt(ctx.uniform("chunkStart")), () => ctx.emitReturn());
-      ctx.ifThen(scatterIdx.ge(ctx.uniform("chunkEnd")), () => ctx.emitReturn());
-
-      // Adjust to chunk-local index
-      const localIdx = scatterIdx.sub(ctx.uniform("chunkStart"));
-
-      // Decompose flat src index into multi-dimensional coordinates
-      const coords = ctx.decomposeIndex(srcIdx, srcShape);
-
-      // Compute output offset: replace dim coordinate with local scatter index
-      const outCoords = coords.map((c, d) => d === dim ? localIdx : c);
-      const outOffset = ctx.linearizeIndex(outCoords, outStrides);
-
-      const existing = ctx.load("out", outOffset);
-      ctx.emitStore("out", outOffset, existing.add(ctx.load("src", srcIdx)));
-    },
-  };
-  return compileTileKernel(spec);
+export function chunkedScatterAddTileIR(inputShape: number[], srcShape: number[], dim: number): string {
+  return scatterAddTileIRImpl(inputShape, srcShape, dim, true);
 }
 
 /** Helper: compute contiguous strides for a given shape. */
@@ -955,61 +828,38 @@ function flatVec4Base(ctx: KernelContext): BlockExpr {
 }
 
 /**
- * TileKernelSpec for a flat contiguous copy: out[idx] = src[idx].
- * Used by chunked stridedScatterCopy when both src and dest are contiguous.
- * Vec4 unrolled: each thread copies VEC consecutive elements.
+ * Unified flat contiguous spec: copy (out=src) or add (out=base+src).
+ * Vec4 unrolled: each thread processes VEC consecutive elements.
  */
-export function flatCopySpec(): TileKernelSpec {
-  return {
-    name: "flatCopy",
-    workgroupSize: WG,
-    bindings: {
-      src: { storage: "read", type: "f32" },
-      out: { storage: "read_write", type: "f32" },
-    },
-    uniforms: { size: "u32" },
-    grid: elementwiseGrid(WG, { elementUniform: "size", vecWidth: VEC }),
-    kernel(ctx) {
-      const base = flatVec4Base(ctx);
-      const size = ctx.uniform("size");
-      // Early exit: if base >= size, all VEC elements are out of bounds
-      ctx.ifThen(base.ge(size), () => ctx.emitReturn());
-      for (let v = 0; v < VEC; v++) {
-        const idx = base.add(ctx.u32(v));
-        ctx.blockStore("out", idx, size, ctx.blockLoad("src", idx, size));
-      }
-    },
-  };
-}
+function flatOpSpec(op: "copy" | "add"): TileKernelSpec {
+  const bindings: Record<string, { storage: "read" | "read_write"; type: "f32" }> =
+    op === "copy"
+      ? { src: { storage: "read", type: "f32" }, out: { storage: "read_write", type: "f32" } }
+      : { base: { storage: "read", type: "f32" }, src: { storage: "read", type: "f32" }, out: { storage: "read_write", type: "f32" } };
 
-/**
- * TileKernelSpec for a flat contiguous add: out[idx] = base[idx] + src[idx].
- * Used by chunked stridedScatterAdd when both base and src are contiguous.
- * Vec4 unrolled: each thread adds VEC consecutive elements.
- */
-export function flatAddSpec(): TileKernelSpec {
   return {
-    name: "flatAdd",
+    name: op === "copy" ? "flatCopy" : "flatAdd",
     workgroupSize: WG,
-    bindings: {
-      base: { storage: "read", type: "f32" },
-      src: { storage: "read", type: "f32" },
-      out: { storage: "read_write", type: "f32" },
-    },
+    bindings,
     uniforms: { size: "u32" },
     grid: elementwiseGrid(WG, { elementUniform: "size", vecWidth: VEC }),
     kernel(ctx) {
       const b = flatVec4Base(ctx);
       const size = ctx.uniform("size");
-      // Early exit: if base >= size, all VEC elements are out of bounds
       ctx.ifThen(b.ge(size), () => ctx.emitReturn());
       for (let v = 0; v < VEC; v++) {
         const idx = b.add(ctx.u32(v));
-        ctx.blockStore("out", idx, size, ctx.blockLoad("base", idx, size).add(ctx.blockLoad("src", idx, size)));
+        const val = op === "copy"
+          ? ctx.blockLoad("src", idx, size)
+          : ctx.blockLoad("base", idx, size).add(ctx.blockLoad("src", idx, size));
+        ctx.blockStore("out", idx, size, val);
       }
     },
   };
 }
+
+export function flatCopySpec(): TileKernelSpec { return flatOpSpec("copy"); }
+export function flatAddSpec(): TileKernelSpec { return flatOpSpec("add"); }
 
 // ============================================================================
 // Matmul Column Slice / Scatter Kernels

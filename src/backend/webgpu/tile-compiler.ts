@@ -51,10 +51,8 @@ type BindingMap = Map<number, string>;
  *
  * If the node is in `bindings`, returns its variable name.
  * Otherwise builds the expression recursively.
- *
- * @param loopVar - Unused (kept for signature stability). Always null.
  */
-function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): string {
+function exprFor(node: IRNode, bindings: BindingMap): string {
   const cached = bindings.get(node.id);
   if (cached !== undefined) return cached;
 
@@ -78,12 +76,12 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
       return `i32(${node.value})`;
     }
     case "load": {
-      const offs = exprFor(node.offsets, bindings, loopVar);
+      const offs = exprFor(node.offsets, bindings);
       return `${node.binding}[${offs}]`;
     }
     case "binary": {
-      const lhs = exprFor(node.lhs, bindings, loopVar);
-      const rhs = exprFor(node.rhs, bindings, loopVar);
+      const lhs = exprFor(node.lhs, bindings);
+      const rhs = exprFor(node.rhs, bindings);
       switch (node.op) {
         case "add": return `(${lhs} + ${rhs})`;
         case "sub": return `(${lhs} - ${rhs})`;
@@ -102,7 +100,7 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
       break;
     }
     case "unary": {
-      const input = exprFor(node.input, bindings, loopVar);
+      const input = exprFor(node.input, bindings);
       switch (node.op) {
         case "neg": return `(-${input})`;
         case "rsqrt": return `inverseSqrt(${input})`;
@@ -117,22 +115,22 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
       }
     }
     case "cast": {
-      const input = exprFor(node.input, bindings, loopVar);
+      const input = exprFor(node.input, bindings);
       return `${node.targetType}(${input})`;
     }
     case "bitcast": {
-      const input = exprFor(node.input, bindings, loopVar);
+      const input = exprFor(node.input, bindings);
       return `bitcast<${node.targetType}>(${input})`;
     }
     case "select": {
-      const cond = exprFor(node.condition, bindings, loopVar);
-      const t = exprFor(node.trueVal, bindings, loopVar);
-      const f = exprFor(node.falseVal, bindings, loopVar);
+      const cond = exprFor(node.condition, bindings);
+      const t = exprFor(node.trueVal, bindings);
+      const f = exprFor(node.falseVal, bindings);
       return `select(${f}, ${t}, ${cond})`;
     }
     case "cmp": {
-      const lhs = exprFor(node.lhs, bindings, loopVar);
-      const rhs = exprFor(node.rhs, bindings, loopVar);
+      const lhs = exprFor(node.lhs, bindings);
+      const rhs = exprFor(node.rhs, bindings);
       const op = ({ eq: "==", ne: "!=", lt: "<", le: "<=", gt: ">", ge: ">=" } as const)[node.op];
       return `(${lhs} ${op} ${rhs})`;
     }
@@ -144,7 +142,7 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
       return "local_idx";
     }
     case "sharedRead": {
-      const idx = exprFor(node.idx, bindings, loopVar);
+      const idx = exprFor(node.idx, bindings);
       return `${node.arrayName}[${idx}]`;
     }
     case "namedRef": {
@@ -157,68 +155,68 @@ function exprFor(node: IRNode, bindings: BindingMap, loopVar: string | null): st
       return `num_wg.${(["x", "y", "z"] as const)[node.dim]}`;
     }
     case "subgroupShuffleXor": {
-      const val = exprFor(node.value, bindings, loopVar);
-      const mask = exprFor(node.mask, bindings, loopVar);
+      const val = exprFor(node.value, bindings);
+      const mask = exprFor(node.mask, bindings);
       return `subgroupShuffleXor(${val}, ${mask})`;
     }
     case "subgroupAdd": {
-      return `subgroupAdd(${exprFor(node.value, bindings, loopVar)})`;
+      return `subgroupAdd(${exprFor(node.value, bindings)})`;
     }
     case "subgroupMax": {
-      return `subgroupMax(${exprFor(node.value, bindings, loopVar)})`;
+      return `subgroupMax(${exprFor(node.value, bindings)})`;
     }
     case "subgroupMin": {
-      return `subgroupMin(${exprFor(node.value, bindings, loopVar)})`;
+      return `subgroupMin(${exprFor(node.value, bindings)})`;
     }
     case "subgroupBroadcastFirst": {
-      return `subgroupBroadcastFirst(${exprFor(node.value, bindings, loopVar)})`;
+      return `subgroupBroadcastFirst(${exprFor(node.value, bindings)})`;
     }
     case "subgroupInclusiveAdd": {
-      return `subgroupInclusiveAdd(${exprFor(node.value, bindings, loopVar)})`;
+      return `subgroupInclusiveAdd(${exprFor(node.value, bindings)})`;
     }
     case "vec4dot": {
-      const a = node.a.map(n => exprFor(n, bindings, loopVar));
-      const b = node.b.map(n => exprFor(n, bindings, loopVar));
+      const a = node.a.map(n => exprFor(n, bindings));
+      const b = node.b.map(n => exprFor(n, bindings));
       return `dot(vec4<f32>(${a.join(", ")}), vec4<f32>(${b.join(", ")}))`;
     }
     case "arrayRead": {
-      const idx = exprFor(node.idx, bindings, loopVar);
+      const idx = exprFor(node.idx, bindings);
       return `${node.arrayName}[${idx}]`;
     }
     // -- Vec4 native nodes --
     case "vec4Construct": {
-      const x = exprFor(node.x, bindings, loopVar);
-      const y = exprFor(node.y, bindings, loopVar);
-      const z = exprFor(node.z, bindings, loopVar);
-      const w = exprFor(node.w, bindings, loopVar);
+      const x = exprFor(node.x, bindings);
+      const y = exprFor(node.y, bindings);
+      const z = exprFor(node.z, bindings);
+      const w = exprFor(node.w, bindings);
       return `vec4<f32>(${x}, ${y}, ${z}, ${w})`;
     }
     case "vec4Splat": {
-      const v = exprFor(node.value, bindings, loopVar);
+      const v = exprFor(node.value, bindings);
       return `vec4<f32>(${v})`;
     }
     case "vec4NativeDot": {
-      const a = exprFor(node.a, bindings, loopVar);
-      const b = exprFor(node.b, bindings, loopVar);
+      const a = exprFor(node.a, bindings);
+      const b = exprFor(node.b, bindings);
       return `dot(${a}, ${b})`;
     }
     case "vec4Component": {
-      const v = exprFor(node.value, bindings, loopVar);
+      const v = exprFor(node.value, bindings);
       const comp = ["x", "y", "z", "w"][node.comp];
       return `${v}.${comp}`;
     }
     case "vec4Binary": {
-      const a = exprFor(node.a, bindings, loopVar);
-      const b = exprFor(node.b, bindings, loopVar);
+      const a = exprFor(node.a, bindings);
+      const b = exprFor(node.b, bindings);
       const op = node.op === "add" ? "+" : node.op === "sub" ? "-" : "*";
       return `(${a} ${op} ${b})`;
     }
     case "vec4ArrayRead": {
-      const idx = exprFor(node.idx, bindings, loopVar);
+      const idx = exprFor(node.idx, bindings);
       return `${node.arrayName}[${idx}]`;
     }
     case "vec4SharedRead": {
-      const idx = exprFor(node.idx, bindings, loopVar);
+      const idx = exprFor(node.idx, bindings);
       return `${node.arrayName}[${idx}]`;
     }
     default:
@@ -493,7 +491,7 @@ function emitStatement(
   const indent = "  ".repeat(depth);
   switch (stmt.kind) {
     case "let": {
-      const val = exprFor(stmt.value, bindings, null);
+      const val = exprFor(stmt.value, bindings);
       lines.push(`${indent}let ${stmt.name} = ${val};`);
       // Register binding: subsequent exprFor calls for the same node ID
       // will return the variable name instead of re-expanding the expression.
@@ -507,7 +505,7 @@ function emitStatement(
       break;
     }
     case "var": {
-      const val = exprFor(stmt.value, bindings, null);
+      const val = exprFor(stmt.value, bindings);
       lines.push(`${indent}var ${stmt.name}: ${stmt.dtype} = ${val};`);
       break;
     }
@@ -529,24 +527,24 @@ function emitStatement(
       break;
     }
     case "assign": {
-      const val = exprFor(stmt.value, bindings, null);
+      const val = exprFor(stmt.value, bindings);
       lines.push(`${indent}${stmt.name} = ${val};`);
       break;
     }
     case "addAssign": {
-      const val = exprFor(stmt.value, bindings, null);
+      const val = exprFor(stmt.value, bindings);
       lines.push(`${indent}${stmt.name} = ${stmt.name} + ${val};`);
       break;
     }
     case "indexAssign": {
-      const idx = exprFor(stmt.idx, bindings, null);
-      const val = exprFor(stmt.value, bindings, null);
+      const idx = exprFor(stmt.idx, bindings);
+      const val = exprFor(stmt.value, bindings);
       lines.push(`${indent}${stmt.arrayName}[${idx}] = ${val};`);
       break;
     }
     case "indexAddAssign": {
-      const idx = exprFor(stmt.idx, bindings, null);
-      const val = exprFor(stmt.value, bindings, null);
+      const idx = exprFor(stmt.idx, bindings);
+      const val = exprFor(stmt.value, bindings);
       lines.push(`${indent}${stmt.arrayName}[${idx}] = ${stmt.arrayName}[${idx}] + ${val};`);
       break;
     }
@@ -571,8 +569,8 @@ function emitStatement(
           lines.push(`${indent}}`);
         }
       } else {
-        const start = exprFor(stmt.start, bindings, null);
-        const bound = exprFor(stmt.bound, bindings, null);
+        const start = exprFor(stmt.start, bindings);
+        const bound = exprFor(stmt.bound, bindings);
         lines.push(`${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + 1u) {`);
         const childBindings = new Map(bindings);
         for (const s of stmt.body) {
@@ -611,7 +609,7 @@ function emitStatement(
       if (startConst === null && boundConst !== null && strideVal > 0) {
         const maxTrips = Math.ceil(boundConst / strideVal);
         if (maxTrips >= 1 && (stmt.unroll === true ? maxTrips <= 16 : maxTrips <= 8)) {
-          const startExpr = exprFor(stmt.start, bindings, null);
+          const startExpr = exprFor(stmt.start, bindings);
           for (let i = 0; i < maxTrips; i++) {
             const ivExpr = i === 0 ? startExpr : `(${startExpr} + ${i * strideVal}u)`;
             lines.push(`${indent}{ // unrolled iter ${i}`);
@@ -639,8 +637,8 @@ function emitStatement(
 
       // Case 3: Fallback — emit runtime loop
       {
-        const start = exprFor(stmt.start, bindings, null);
-        const bound = exprFor(stmt.bound, bindings, null);
+        const start = exprFor(stmt.start, bindings);
+        const bound = exprFor(stmt.bound, bindings);
         lines.push(`${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + ${strideVal}u) {`);
         const childBindings = new Map(bindings);
         for (const s of stmt.body) {
@@ -655,7 +653,7 @@ function emitStatement(
         // Static-true: body emitted at parent scope — bindings propagate up
         for (const s of stmt.body) emitStatement(s, bindings, lines, depth);
       } else if (!isStaticFalse(stmt.condition)) {
-        const cond = exprFor(stmt.condition, bindings, null);
+        const cond = exprFor(stmt.condition, bindings);
         lines.push(`${indent}if (${cond}) {`);
         const childBindings = new Map(bindings);
         for (const s of stmt.body) {
@@ -671,7 +669,7 @@ function emitStatement(
       } else if (isStaticFalse(stmt.condition)) {
         for (const s of stmt.elseBody) emitStatement(s, bindings, lines, depth);
       } else {
-        const cond = exprFor(stmt.condition, bindings, null);
+        const cond = exprFor(stmt.condition, bindings);
         lines.push(`${indent}if (${cond}) {`);
         const childBindings1 = new Map(bindings);
         for (const s of stmt.body) {
@@ -691,8 +689,8 @@ function emitStatement(
       break;
     }
     case "sharedWrite": {
-      const idx = exprFor(stmt.idx, bindings, null);
-      const val = exprFor(stmt.value, bindings, null);
+      const idx = exprFor(stmt.idx, bindings);
+      const val = exprFor(stmt.value, bindings);
       lines.push(`${indent}${stmt.arrayName}[${idx}] = ${val};`);
       break;
     }
@@ -706,20 +704,20 @@ function emitStatement(
       break;
     }
     case "vec4ArrayWrite": {
-      const idx = exprFor(stmt.idx, bindings, null);
-      const val = exprFor(stmt.value, bindings, null);
+      const idx = exprFor(stmt.idx, bindings);
+      const val = exprFor(stmt.value, bindings);
       lines.push(`${indent}${stmt.arrayName}[${idx}] = ${val};`);
       break;
     }
     case "vec4ArrayAddAssign": {
-      const idx = exprFor(stmt.idx, bindings, null);
-      const val = exprFor(stmt.value, bindings, null);
+      const idx = exprFor(stmt.idx, bindings);
+      const val = exprFor(stmt.value, bindings);
       lines.push(`${indent}${stmt.arrayName}[${idx}] = ${stmt.arrayName}[${idx}] + ${val};`);
       break;
     }
     case "directStore": {
-      const idx = exprFor(stmt.idx, bindings, null);
-      const val = exprFor(stmt.value, bindings, null);
+      const idx = exprFor(stmt.idx, bindings);
+      const val = exprFor(stmt.value, bindings);
       lines.push(`${indent}${stmt.binding}[${idx}] = ${val};`);
       break;
     }
@@ -728,13 +726,13 @@ function emitStatement(
         // Dead store — omit entirely
         break;
       }
-      const idx = exprFor(stmt.idx, bindings, null);
-      const val = exprFor(stmt.value, bindings, null);
+      const idx = exprFor(stmt.idx, bindings);
+      const val = exprFor(stmt.value, bindings);
       if (isStaticTrue(stmt.condition)) {
         // Constant-fold: emit unconditional store
         lines.push(`${indent}${stmt.binding}[${idx}] = ${val};`);
       } else {
-        const cond = exprFor(stmt.condition, bindings, null);
+        const cond = exprFor(stmt.condition, bindings);
         lines.push(`${indent}if (${cond}) {`);
         lines.push(`${indent}  ${stmt.binding}[${idx}] = ${val};`);
         lines.push(`${indent}}`);
@@ -742,8 +740,8 @@ function emitStatement(
       break;
     }
     case "atomicOp": {
-      const idx = exprFor(stmt.idx, bindings, null);
-      const val = exprFor(stmt.value, bindings, null);
+      const idx = exprFor(stmt.idx, bindings);
+      const val = exprFor(stmt.value, bindings);
       const fnName: Record<string, string> = {
         max: "atomicMax",
         min: "atomicMin",
@@ -757,9 +755,9 @@ function emitStatement(
       break;
     }
     case "atomicCAS": {
-      const idx = exprFor(stmt.idx, bindings, null);
-      const exp = exprFor(stmt.expected, bindings, null);
-      const des = exprFor(stmt.desired, bindings, null);
+      const idx = exprFor(stmt.idx, bindings);
+      const exp = exprFor(stmt.expected, bindings);
+      const des = exprFor(stmt.desired, bindings);
       lines.push(`${indent}let _cas_result = atomicCompareExchangeWeak(&${stmt.binding}[${idx}], ${exp}, ${des});`);
       lines.push(`${indent}let ${stmt.oldValueVar} = _cas_result.old_value;`);
       lines.push(`${indent}let ${stmt.exchangedVar} = select(0u, 1u, _cas_result.exchanged);`);
@@ -773,124 +771,82 @@ function emitStatement(
 }
 
 // ============================================================================
+// Generic Expression Tree Walkers
+// ============================================================================
+
+/**
+ * Short-circuit visitor over child expressions of an IR node.
+ * Returns true if fn returns true for any child (enables early exit).
+ */
+function someExprChild(node: IRNode, fn: (child: IRNode) => boolean): boolean {
+  switch (node.kind) {
+    case "binary": case "cmp":
+      return fn(node.lhs) || fn(node.rhs);
+    case "unary": case "cast": case "bitcast":
+      return fn((node as any).input);
+    case "select":
+      return fn(node.condition) || fn(node.trueVal) || fn(node.falseVal);
+    case "load":
+      return fn(node.offsets) || (node.mask ? fn(node.mask) : false);
+    case "sharedRead": case "arrayRead": case "vec4ArrayRead": case "vec4SharedRead":
+      return fn(node.idx);
+    case "subgroupShuffleXor":
+      return fn(node.value) || fn(node.mask);
+    case "subgroupAdd": case "subgroupMax": case "subgroupMin":
+    case "subgroupBroadcastFirst": case "subgroupInclusiveAdd":
+    case "vec4Splat": case "vec4Component":
+      return fn(node.value);
+    case "vec4Construct":
+      return fn(node.x) || fn(node.y) || fn(node.z) || fn(node.w);
+    case "vec4NativeDot": case "vec4Binary":
+      return fn(node.a) || fn(node.b);
+    case "vec4dot":
+      return node.a.some(fn) || node.b.some(fn);
+    default: return false; // leaves: programId, uniform, const, threadIdx, localIndex, globalId, namedRef, numPrograms
+  }
+}
+
+/** Call fn on each child expression of an IR node. */
+function forEachExprChild(node: IRNode, fn: (child: IRNode) => void): void {
+  someExprChild(node, child => { fn(child); return false; });
+}
+
+/** Call fn on each IR expression field of a statement (not recursing into bodies). */
+function forEachStmtExpr(stmt: Statement, fn: (expr: IRNode) => void): void {
+  switch (stmt.kind) {
+    case "let": case "var": fn(stmt.value); break;
+    case "assign": case "addAssign": fn(stmt.value); break;
+    case "indexAssign": case "indexAddAssign": fn(stmt.idx); fn(stmt.value); break;
+    case "sharedWrite": fn(stmt.idx); fn(stmt.value); break;
+    case "guardedStore": fn(stmt.condition); fn(stmt.idx); fn(stmt.value); break;
+    case "directStore": fn(stmt.idx); fn(stmt.value); break;
+    case "atomicOp": fn(stmt.idx); fn(stmt.value); break;
+    case "atomicCAS": fn(stmt.idx); fn(stmt.expected); fn(stmt.desired); break;
+    case "vec4ArrayWrite": case "vec4ArrayAddAssign": fn(stmt.idx); fn(stmt.value); break;
+    case "forRange": case "forStride": fn(stmt.start); fn(stmt.bound); break;
+    case "if": case "ifElse": fn(stmt.condition); break;
+    // barrier, return, varArray, vec4VarArray, vec4SharedArray: no expressions
+  }
+}
+
+// ============================================================================
 // Dead Code Elimination
 // ============================================================================
 
 /** Collect all namedRef names referenced by an IR expression tree. */
 function collectExprNames(node: IRNode, names: Set<string>): void {
-  switch (node.kind) {
-    case "namedRef": names.add(node.name); break;
-    case "binary": collectExprNames(node.lhs, names); collectExprNames(node.rhs, names); break;
-    case "unary": collectExprNames(node.input, names); break;
-    case "cast": collectExprNames(node.input, names); break;
-    case "bitcast": collectExprNames(node.input, names); break;
-    case "cmp": collectExprNames(node.lhs, names); collectExprNames(node.rhs, names); break;
-    case "select":
-      collectExprNames(node.condition, names);
-      collectExprNames(node.trueVal, names);
-      collectExprNames(node.falseVal, names);
-      break;
-    case "load":
-      collectExprNames(node.offsets, names);
-      if (node.mask) collectExprNames(node.mask, names);
-      break;
-    case "sharedRead": collectExprNames(node.idx, names); break;
-    case "arrayRead": collectExprNames(node.idx, names); break;
-    case "subgroupShuffleXor":
-      collectExprNames(node.value, names);
-      collectExprNames(node.mask, names);
-      break;
-    case "subgroupAdd":
-    case "subgroupMax":
-    case "subgroupMin":
-    case "subgroupBroadcastFirst":
-    case "subgroupInclusiveAdd":
-      collectExprNames(node.value, names);
-      break;
-    case "vec4dot":
-      for (const n of node.a) collectExprNames(n, names);
-      for (const n of node.b) collectExprNames(n, names);
-      break;
-    // Vec4 native nodes
-    case "vec4Construct":
-      collectExprNames(node.x, names); collectExprNames(node.y, names);
-      collectExprNames(node.z, names); collectExprNames(node.w, names);
-      break;
-    case "vec4Splat": collectExprNames(node.value, names); break;
-    case "vec4NativeDot": collectExprNames(node.a, names); collectExprNames(node.b, names); break;
-    case "vec4Component": collectExprNames(node.value, names); break;
-    case "vec4Binary": collectExprNames(node.a, names); collectExprNames(node.b, names); break;
-    case "vec4ArrayRead": collectExprNames(node.idx, names); break;
-    case "vec4SharedRead": collectExprNames(node.idx, names); break;
-    // Leaf nodes (programId, uniform, const, threadIdx, localIndex, globalId): no names
-  }
+  if (node.kind === "namedRef") names.add(node.name);
+  forEachExprChild(node, child => collectExprNames(child, names));
 }
 
 /** Collect all namedRef names from all expressions in a statement (recursively into bodies). */
 function collectAllStmtNames(stmt: Statement, names: Set<string>): void {
-  switch (stmt.kind) {
-    case "let":
-      collectExprNames(stmt.value, names);
-      break;
-    case "var":
-      collectExprNames(stmt.value, names);
-      break;
-    case "assign":
-    case "addAssign":
-      collectExprNames(stmt.value, names);
-      break;
-    case "indexAssign":
-    case "indexAddAssign":
-      collectExprNames(stmt.idx, names);
-      collectExprNames(stmt.value, names);
-      break;
-    case "forRange":
-      collectExprNames(stmt.start, names);
-      collectExprNames(stmt.bound, names);
-      for (const s of stmt.body) collectAllStmtNames(s, names);
-      break;
-    case "forStride":
-      collectExprNames(stmt.start, names);
-      collectExprNames(stmt.bound, names);
-      for (const s of stmt.body) collectAllStmtNames(s, names);
-      break;
-    case "if":
-      collectExprNames(stmt.condition, names);
-      for (const s of stmt.body) collectAllStmtNames(s, names);
-      break;
-    case "ifElse":
-      collectExprNames(stmt.condition, names);
-      for (const s of stmt.body) collectAllStmtNames(s, names);
-      for (const s of stmt.elseBody) collectAllStmtNames(s, names);
-      break;
-    case "sharedWrite":
-      collectExprNames(stmt.idx, names);
-      collectExprNames(stmt.value, names);
-      break;
-    case "guardedStore":
-      collectExprNames(stmt.condition, names);
-      collectExprNames(stmt.idx, names);
-      collectExprNames(stmt.value, names);
-      break;
-    case "directStore":
-      collectExprNames(stmt.idx, names);
-      collectExprNames(stmt.value, names);
-      break;
-    case "atomicOp":
-      collectExprNames(stmt.idx, names);
-      collectExprNames(stmt.value, names);
-      break;
-    case "atomicCAS":
-      collectExprNames(stmt.idx, names);
-      collectExprNames(stmt.expected, names);
-      collectExprNames(stmt.desired, names);
-      break;
-    case "vec4ArrayWrite":
-    case "vec4ArrayAddAssign":
-      collectExprNames(stmt.idx, names);
-      collectExprNames(stmt.value, names);
-      break;
-    // barrier, return, varArray, vec4VarArray, vec4SharedArray: no IRNode expressions to collect
+  forEachStmtExpr(stmt, e => collectExprNames(e, names));
+  if (stmt.kind === "forRange" || stmt.kind === "forStride" || stmt.kind === "if") {
+    for (const s of stmt.body) collectAllStmtNames(s, names);
+  } else if (stmt.kind === "ifElse") {
+    for (const s of stmt.body) collectAllStmtNames(s, names);
+    for (const s of stmt.elseBody) collectAllStmtNames(s, names);
   }
 }
 
@@ -898,153 +854,22 @@ function collectAllStmtNames(stmt: Statement, names: Set<string>): void {
 // Automatic Barrier Insertion
 // ============================================================================
 
-/**
- * Collect shared array names read by IR nodes within a statement (non-recursive into forRange).
- */
+/** Collect shared array names read by IR nodes within a statement. */
 function getSharedReadsFromExpr(node: IRNode, names: Set<string>): void {
-  switch (node.kind) {
-    case "sharedRead":
-      names.add(node.arrayName);
-      getSharedReadsFromExpr(node.idx, names);
-      return;
-    case "binary":
-      getSharedReadsFromExpr(node.lhs, names);
-      getSharedReadsFromExpr(node.rhs, names);
-      return;
-    case "unary":
-    case "cast":
-      getSharedReadsFromExpr(node.input, names);
-      return;
-    case "cmp":
-      getSharedReadsFromExpr(node.lhs, names);
-      getSharedReadsFromExpr(node.rhs, names);
-      return;
-    case "select":
-      getSharedReadsFromExpr(node.condition, names);
-      getSharedReadsFromExpr(node.trueVal, names);
-      getSharedReadsFromExpr(node.falseVal, names);
-      return;
-    case "load":
-      getSharedReadsFromExpr(node.offsets, names);
-      return;
-    case "arrayRead":
-      getSharedReadsFromExpr(node.idx, names);
-      return;
-    case "subgroupShuffleXor":
-      getSharedReadsFromExpr(node.value, names);
-      getSharedReadsFromExpr(node.mask, names);
-      return;
-    case "subgroupAdd":
-    case "subgroupMax":
-    case "subgroupMin":
-    case "subgroupBroadcastFirst":
-    case "subgroupInclusiveAdd":
-      getSharedReadsFromExpr(node.value, names);
-      return;
-    case "vec4Construct":
-      getSharedReadsFromExpr(node.x, names);
-      getSharedReadsFromExpr(node.y, names);
-      getSharedReadsFromExpr(node.z, names);
-      getSharedReadsFromExpr(node.w, names);
-      return;
-    case "vec4Splat": getSharedReadsFromExpr(node.value, names); return;
-    case "vec4NativeDot":
-      getSharedReadsFromExpr(node.a, names);
-      getSharedReadsFromExpr(node.b, names);
-      return;
-    case "vec4Component": getSharedReadsFromExpr(node.value, names); return;
-    case "vec4Binary":
-      getSharedReadsFromExpr(node.a, names);
-      getSharedReadsFromExpr(node.b, names);
-      return;
-    case "vec4SharedRead":
-      names.add(node.arrayName);
-      getSharedReadsFromExpr(node.idx, names);
-      return;
-    case "vec4ArrayRead":
-      getSharedReadsFromExpr(node.idx, names);
-      return;
-  }
+  if (node.kind === "sharedRead" || node.kind === "vec4SharedRead") names.add(node.arrayName);
+  forEachExprChild(node, child => getSharedReadsFromExpr(child, names));
 }
 
 /** Get shared array names read by a statement's expressions (not recursing into forRange). */
 function getSharedReadsFromStmt(stmt: Statement): Set<string> {
   const reads = new Set<string>();
-  switch (stmt.kind) {
-    case "let":
-      getSharedReadsFromExpr(stmt.value, reads);
-      break;
-    case "var":
-      getSharedReadsFromExpr(stmt.value, reads);
-      break;
-    case "assign":
-      getSharedReadsFromExpr(stmt.value, reads);
-      break;
-    case "addAssign":
-      getSharedReadsFromExpr(stmt.value, reads);
-      break;
-    case "indexAssign":
-      getSharedReadsFromExpr(stmt.idx, reads);
-      getSharedReadsFromExpr(stmt.value, reads);
-      break;
-    case "indexAddAssign":
-      getSharedReadsFromExpr(stmt.idx, reads);
-      getSharedReadsFromExpr(stmt.value, reads);
-      break;
-    case "sharedWrite":
-      getSharedReadsFromExpr(stmt.idx, reads);
-      getSharedReadsFromExpr(stmt.value, reads);
-      break;
-    case "guardedStore":
-      getSharedReadsFromExpr(stmt.condition, reads);
-      getSharedReadsFromExpr(stmt.idx, reads);
-      getSharedReadsFromExpr(stmt.value, reads);
-      break;
-    case "directStore":
-      getSharedReadsFromExpr(stmt.idx, reads);
-      getSharedReadsFromExpr(stmt.value, reads);
-      break;
-    case "atomicOp":
-      getSharedReadsFromExpr(stmt.idx, reads);
-      getSharedReadsFromExpr(stmt.value, reads);
-      break;
-    case "atomicCAS":
-      getSharedReadsFromExpr(stmt.idx, reads);
-      getSharedReadsFromExpr(stmt.expected, reads);
-      getSharedReadsFromExpr(stmt.desired, reads);
-      break;
-    case "forRange":
-      getSharedReadsFromExpr(stmt.start, reads);
-      getSharedReadsFromExpr(stmt.bound, reads);
-      // Don't recurse into body — forRange is a separate scope
-      break;
-    case "forStride":
-      getSharedReadsFromExpr(stmt.start, reads);
-      getSharedReadsFromExpr(stmt.bound, reads);
-      break;
-    case "if":
-      getSharedReadsFromExpr(stmt.condition, reads);
-      for (const s of stmt.body) {
-        for (const r of getSharedReadsFromStmt(s)) reads.add(r);
-      }
-      break;
-    case "ifElse":
-      getSharedReadsFromExpr(stmt.condition, reads);
-      for (const s of stmt.body) {
-        for (const r of getSharedReadsFromStmt(s)) reads.add(r);
-      }
-      for (const s of stmt.elseBody) {
-        for (const r of getSharedReadsFromStmt(s)) reads.add(r);
-      }
-      break;
-    case "vec4ArrayWrite":
-    case "vec4ArrayAddAssign":
-      getSharedReadsFromExpr(stmt.idx, reads);
-      getSharedReadsFromExpr(stmt.value, reads);
-      if (stmt.isShared) {
-        // Reading from shared in the value expression
-      }
-      break;
+  forEachStmtExpr(stmt, e => getSharedReadsFromExpr(e, reads));
+  // Recurse into if/ifElse bodies but not forRange/forStride (separate scope for barrier insertion)
+  if (stmt.kind === "if") {
+    for (const s of stmt.body) for (const r of getSharedReadsFromStmt(s)) reads.add(r);
+  } else if (stmt.kind === "ifElse") {
+    for (const s of stmt.body) for (const r of getSharedReadsFromStmt(s)) reads.add(r);
+    for (const s of stmt.elseBody) for (const r of getSharedReadsFromStmt(s)) reads.add(r);
   }
   return reads;
 }
@@ -1265,96 +1090,24 @@ function collectModifiedNames(stmts: Statement[], names: Set<string>): void {
   }
 }
 
-/**
- * Check if an IR expression depends on any of the given names (namedRef references).
- */
+/** Check if an IR expression depends on any of the given names (namedRef references). */
 function exprDependsOn(node: IRNode, names: Set<string>): boolean {
   switch (node.kind) {
-    case "namedRef":
-      return names.has(node.name);
-    case "binary":
-      return exprDependsOn(node.lhs, names) || exprDependsOn(node.rhs, names);
-    case "unary":
-    case "cast":
-      return exprDependsOn(node.input, names);
-    case "cmp":
-      return exprDependsOn(node.lhs, names) || exprDependsOn(node.rhs, names);
-    case "select":
-      return exprDependsOn(node.condition, names) ||
-             exprDependsOn(node.trueVal, names) ||
-             exprDependsOn(node.falseVal, names);
-    case "load":
-      // Global loads are never hoisted (memory may change between iterations)
-      return true;
-    case "sharedRead":
-      // Only safe to hoist if no shared array is written in the loop
-      return names.has(node.arrayName);
-    case "arrayRead":
-      return names.has(node.arrayName) || exprDependsOn(node.idx, names);
-    case "subgroupShuffleXor":
-      return exprDependsOn(node.value, names) || exprDependsOn(node.mask, names);
-    case "subgroupAdd":
-    case "subgroupMax":
-    case "subgroupMin":
-    case "subgroupBroadcastFirst":
-    case "subgroupInclusiveAdd":
-      return exprDependsOn(node.value, names);
-    case "vec4Construct":
-      return exprDependsOn(node.x, names) || exprDependsOn(node.y, names) ||
-             exprDependsOn(node.z, names) || exprDependsOn(node.w, names);
-    case "vec4Splat": return exprDependsOn(node.value, names);
-    case "vec4NativeDot": return exprDependsOn(node.a, names) || exprDependsOn(node.b, names);
-    case "vec4Component": return exprDependsOn(node.value, names);
-    case "vec4Binary": return exprDependsOn(node.a, names) || exprDependsOn(node.b, names);
-    case "vec4SharedRead": return names.has(node.arrayName);
-    case "vec4ArrayRead": return names.has(node.arrayName) || exprDependsOn(node.idx, names);
+    case "namedRef": return names.has(node.name);
+    case "load": return true; // global loads always variant
+    case "sharedRead": case "vec4SharedRead":
+      return names.has(node.arrayName) || someExprChild(node, c => exprDependsOn(c, names));
+    case "arrayRead": case "vec4ArrayRead":
+      return names.has(node.arrayName) || someExprChild(node, c => exprDependsOn(c, names));
     default:
-      return false;
+      return someExprChild(node, c => exprDependsOn(c, names));
   }
 }
 
-/**
- * Check if an expression contains any global memory load.
- */
+/** Check if an expression contains any global memory load. */
 function exprContainsLoad(node: IRNode): boolean {
-  switch (node.kind) {
-    case "load":
-      return true;
-    case "binary":
-      return exprContainsLoad(node.lhs) || exprContainsLoad(node.rhs);
-    case "unary":
-    case "cast":
-      return exprContainsLoad(node.input);
-    case "cmp":
-      return exprContainsLoad(node.lhs) || exprContainsLoad(node.rhs);
-    case "select":
-      return exprContainsLoad(node.condition) ||
-             exprContainsLoad(node.trueVal) ||
-             exprContainsLoad(node.falseVal);
-    case "sharedRead":
-    case "vec4SharedRead":
-      return false;
-    case "arrayRead":
-    case "vec4ArrayRead":
-      return exprContainsLoad(node.idx);
-    case "subgroupShuffleXor":
-      return exprContainsLoad(node.value) || exprContainsLoad(node.mask);
-    case "subgroupAdd":
-    case "subgroupMax":
-    case "subgroupMin":
-    case "subgroupBroadcastFirst":
-    case "subgroupInclusiveAdd":
-      return exprContainsLoad(node.value);
-    case "vec4Construct":
-      return exprContainsLoad(node.x) || exprContainsLoad(node.y) ||
-             exprContainsLoad(node.z) || exprContainsLoad(node.w);
-    case "vec4Splat": return exprContainsLoad(node.value);
-    case "vec4NativeDot": return exprContainsLoad(node.a) || exprContainsLoad(node.b);
-    case "vec4Component": return exprContainsLoad(node.value);
-    case "vec4Binary": return exprContainsLoad(node.a) || exprContainsLoad(node.b);
-    default:
-      return false;
-  }
+  if (node.kind === "load") return true;
+  return someExprChild(node, exprContainsLoad);
 }
 
 /**
@@ -1535,45 +1288,8 @@ function isTrivialNode(node: IRNode): boolean {
  * may change between uses (e.g., across barriers).
  */
 function exprContainsMemoryRead(node: IRNode): boolean {
-  switch (node.kind) {
-    case "load":
-    case "sharedRead":
-    case "vec4SharedRead":
-      return true;
-    case "binary":
-      return exprContainsMemoryRead(node.lhs) || exprContainsMemoryRead(node.rhs);
-    case "unary":
-    case "cast":
-      return exprContainsMemoryRead(node.input);
-    case "bitcast":
-      return exprContainsMemoryRead(node.input);
-    case "cmp":
-      return exprContainsMemoryRead(node.lhs) || exprContainsMemoryRead(node.rhs);
-    case "select":
-      return exprContainsMemoryRead(node.condition) ||
-             exprContainsMemoryRead(node.trueVal) ||
-             exprContainsMemoryRead(node.falseVal);
-    case "arrayRead":
-    case "vec4ArrayRead":
-      return exprContainsMemoryRead(node.idx);
-    case "subgroupShuffleXor":
-      return exprContainsMemoryRead(node.value) || exprContainsMemoryRead(node.mask);
-    case "subgroupAdd":
-    case "subgroupMax":
-    case "subgroupMin":
-    case "subgroupBroadcastFirst":
-    case "subgroupInclusiveAdd":
-      return exprContainsMemoryRead(node.value);
-    case "vec4Construct":
-      return exprContainsMemoryRead(node.x) || exprContainsMemoryRead(node.y) ||
-             exprContainsMemoryRead(node.z) || exprContainsMemoryRead(node.w);
-    case "vec4Splat": return exprContainsMemoryRead(node.value);
-    case "vec4NativeDot": return exprContainsMemoryRead(node.a) || exprContainsMemoryRead(node.b);
-    case "vec4Component": return exprContainsMemoryRead(node.value);
-    case "vec4Binary": return exprContainsMemoryRead(node.a) || exprContainsMemoryRead(node.b);
-    default:
-      return false;
-  }
+  if (node.kind === "load" || node.kind === "sharedRead" || node.kind === "vec4SharedRead") return true;
+  return someExprChild(node, exprContainsMemoryRead);
 }
 
 /**
@@ -1584,144 +1300,18 @@ function exprContainsMemoryRead(node: IRNode): boolean {
  */
 function collectExprCSECandidates(node: IRNode, nodes: Map<number, IRNode>): void {
   if (node.id < 0 || isTrivialNode(node)) return;
-  // Register this node as a CSE candidate only if it's memory-read-free
-  if (!exprContainsMemoryRead(node)) {
-    nodes.set(node.id, node);
-  }
-  // Always recurse into children to find shared sub-expressions
-  switch (node.kind) {
-    case "binary":
-      collectExprCSECandidates(node.lhs, nodes);
-      collectExprCSECandidates(node.rhs, nodes);
-      break;
-    case "unary":
-    case "cast":
-      collectExprCSECandidates(node.input, nodes);
-      break;
-    case "bitcast":
-      collectExprCSECandidates(node.input, nodes);
-      break;
-    case "cmp":
-      collectExprCSECandidates(node.lhs, nodes);
-      collectExprCSECandidates(node.rhs, nodes);
-      break;
-    case "select":
-      collectExprCSECandidates(node.condition, nodes);
-      collectExprCSECandidates(node.trueVal, nodes);
-      collectExprCSECandidates(node.falseVal, nodes);
-      break;
-    case "subgroupShuffleXor":
-      collectExprCSECandidates(node.value, nodes);
-      collectExprCSECandidates(node.mask, nodes);
-      break;
-    case "subgroupAdd":
-    case "subgroupMax":
-    case "subgroupMin":
-    case "subgroupBroadcastFirst":
-    case "subgroupInclusiveAdd":
-      collectExprCSECandidates(node.value, nodes);
-      break;
-    case "vec4Construct":
-      collectExprCSECandidates(node.x, nodes);
-      collectExprCSECandidates(node.y, nodes);
-      collectExprCSECandidates(node.z, nodes);
-      collectExprCSECandidates(node.w, nodes);
-      break;
-    case "vec4Splat": collectExprCSECandidates(node.value, nodes); break;
-    case "vec4NativeDot":
-      collectExprCSECandidates(node.a, nodes);
-      collectExprCSECandidates(node.b, nodes);
-      break;
-    case "vec4Component": collectExprCSECandidates(node.value, nodes); break;
-    case "vec4Binary":
-      collectExprCSECandidates(node.a, nodes);
-      collectExprCSECandidates(node.b, nodes);
-      break;
-    case "load":
-      collectExprCSECandidates(node.offsets, nodes);
-      if (node.mask) collectExprCSECandidates(node.mask, nodes);
-      break;
-    case "sharedRead":
-      collectExprCSECandidates(node.idx, nodes);
-      break;
-    case "vec4SharedRead":
-      collectExprCSECandidates(node.idx, nodes);
-      break;
-    case "arrayRead":
-    case "vec4ArrayRead":
-      collectExprCSECandidates(node.idx, nodes);
-      break;
-  }
+  if (!exprContainsMemoryRead(node)) nodes.set(node.id, node);
+  forEachExprChild(node, child => collectExprCSECandidates(child, nodes));
 }
 
-/**
- * Collect all CSE candidate node IDs from all expressions in a statement
- * (including nested bodies like forRange, if, etc.).
- */
+/** Collect all CSE candidate node IDs from all expressions in a statement (recursing into all bodies). */
 function collectStmtCSENodes(stmt: Statement, nodes: Map<number, IRNode>): void {
-  switch (stmt.kind) {
-    case "let":
-      collectExprCSECandidates(stmt.value, nodes);
-      break;
-    case "var":
-      collectExprCSECandidates(stmt.value, nodes);
-      break;
-    case "assign":
-    case "addAssign":
-      collectExprCSECandidates(stmt.value, nodes);
-      break;
-    case "indexAssign":
-    case "indexAddAssign":
-      collectExprCSECandidates(stmt.idx, nodes);
-      collectExprCSECandidates(stmt.value, nodes);
-      break;
-    case "forRange":
-      collectExprCSECandidates(stmt.start, nodes);
-      collectExprCSECandidates(stmt.bound, nodes);
-      for (const s of stmt.body) collectStmtCSENodes(s, nodes);
-      break;
-    case "forStride":
-      collectExprCSECandidates(stmt.start, nodes);
-      collectExprCSECandidates(stmt.bound, nodes);
-      for (const s of stmt.body) collectStmtCSENodes(s, nodes);
-      break;
-    case "if":
-      collectExprCSECandidates(stmt.condition, nodes);
-      for (const s of stmt.body) collectStmtCSENodes(s, nodes);
-      break;
-    case "ifElse":
-      collectExprCSECandidates(stmt.condition, nodes);
-      for (const s of stmt.body) collectStmtCSENodes(s, nodes);
-      for (const s of stmt.elseBody) collectStmtCSENodes(s, nodes);
-      break;
-    case "sharedWrite":
-      collectExprCSECandidates(stmt.idx, nodes);
-      collectExprCSECandidates(stmt.value, nodes);
-      break;
-    case "guardedStore":
-      collectExprCSECandidates(stmt.condition, nodes);
-      collectExprCSECandidates(stmt.idx, nodes);
-      collectExprCSECandidates(stmt.value, nodes);
-      break;
-    case "directStore":
-      collectExprCSECandidates(stmt.idx, nodes);
-      collectExprCSECandidates(stmt.value, nodes);
-      break;
-    case "atomicOp":
-      collectExprCSECandidates(stmt.idx, nodes);
-      collectExprCSECandidates(stmt.value, nodes);
-      break;
-    case "atomicCAS":
-      collectExprCSECandidates(stmt.idx, nodes);
-      collectExprCSECandidates(stmt.expected, nodes);
-      collectExprCSECandidates(stmt.desired, nodes);
-      break;
-    case "vec4ArrayWrite":
-    case "vec4ArrayAddAssign":
-      collectExprCSECandidates(stmt.idx, nodes);
-      collectExprCSECandidates(stmt.value, nodes);
-      break;
-    // barrier, return, varArray, vec4VarArray, vec4SharedArray: no candidate expressions
+  forEachStmtExpr(stmt, e => collectExprCSECandidates(e, nodes));
+  if (stmt.kind === "forRange" || stmt.kind === "forStride" || stmt.kind === "if") {
+    for (const s of stmt.body) collectStmtCSENodes(s, nodes);
+  } else if (stmt.kind === "ifElse") {
+    for (const s of stmt.body) collectStmtCSENodes(s, nodes);
+    for (const s of stmt.elseBody) collectStmtCSENodes(s, nodes);
   }
 }
 
@@ -1770,64 +1360,8 @@ function collectSubExprIds(node: IRNode, ids: Set<number>): void {
  */
 function countExprCSEOccurrences(node: IRNode, out: { id: number; node: IRNode }[]): void {
   if (node.id < 0 || isTrivialNode(node)) return;
-  if (!exprContainsMemoryRead(node)) {
-    out.push({ id: node.id, node });
-  }
-  switch (node.kind) {
-    case "binary":
-      countExprCSEOccurrences(node.lhs, out);
-      countExprCSEOccurrences(node.rhs, out);
-      break;
-    case "unary": case "cast":
-      countExprCSEOccurrences(node.input, out);
-      break;
-    case "bitcast":
-      countExprCSEOccurrences(node.input, out);
-      break;
-    case "cmp":
-      countExprCSEOccurrences(node.lhs, out);
-      countExprCSEOccurrences(node.rhs, out);
-      break;
-    case "select":
-      countExprCSEOccurrences(node.condition, out);
-      countExprCSEOccurrences(node.trueVal, out);
-      countExprCSEOccurrences(node.falseVal, out);
-      break;
-    case "subgroupShuffleXor":
-      countExprCSEOccurrences(node.value, out);
-      countExprCSEOccurrences(node.mask, out);
-      break;
-    case "subgroupAdd": case "subgroupMax": case "subgroupMin":
-    case "subgroupBroadcastFirst": case "subgroupInclusiveAdd":
-      countExprCSEOccurrences(node.value, out);
-      break;
-    case "vec4Construct":
-      countExprCSEOccurrences(node.x, out);
-      countExprCSEOccurrences(node.y, out);
-      countExprCSEOccurrences(node.z, out);
-      countExprCSEOccurrences(node.w, out);
-      break;
-    case "vec4Splat": countExprCSEOccurrences(node.value, out); break;
-    case "vec4NativeDot":
-      countExprCSEOccurrences(node.a, out);
-      countExprCSEOccurrences(node.b, out);
-      break;
-    case "vec4Component": countExprCSEOccurrences(node.value, out); break;
-    case "vec4Binary":
-      countExprCSEOccurrences(node.a, out);
-      countExprCSEOccurrences(node.b, out);
-      break;
-    case "load":
-      countExprCSEOccurrences(node.offsets, out);
-      if (node.mask) countExprCSEOccurrences(node.mask, out);
-      break;
-    case "sharedRead":
-    case "vec4SharedRead":
-    case "arrayRead":
-    case "vec4ArrayRead":
-      countExprCSEOccurrences(node.idx, out);
-      break;
-  }
+  if (!exprContainsMemoryRead(node)) out.push({ id: node.id, node });
+  forEachExprChild(node, child => countExprCSEOccurrences(child, out));
 }
 
 /**
@@ -1838,60 +1372,9 @@ function countExprCSEOccurrences(node: IRNode, out: { id: number; node: IRNode }
  * call into child scopes. Only counts expressions at this scope level (loop
  * bounds, conditions, and leaf statement expressions).
  */
+/** Count CSE occurrences at this scope level only (no body recursion — handled by autoCSE). */
 function countStmtCSEOccurrences(stmt: Statement, out: { id: number; node: IRNode }[]): void {
-  switch (stmt.kind) {
-    case "let": case "var":
-      countExprCSEOccurrences(stmt.value, out);
-      break;
-    case "assign": case "addAssign":
-      countExprCSEOccurrences(stmt.value, out);
-      break;
-    case "indexAssign": case "indexAddAssign":
-      countExprCSEOccurrences(stmt.idx, out);
-      countExprCSEOccurrences(stmt.value, out);
-      break;
-    case "forRange":
-      // Only count loop bounds at this scope — body handled by recursive autoCSE
-      countExprCSEOccurrences(stmt.start, out);
-      countExprCSEOccurrences(stmt.bound, out);
-      break;
-    case "forStride":
-      countExprCSEOccurrences(stmt.start, out);
-      countExprCSEOccurrences(stmt.bound, out);
-      break;
-    case "if":
-      countExprCSEOccurrences(stmt.condition, out);
-      break;
-    case "ifElse":
-      countExprCSEOccurrences(stmt.condition, out);
-      break;
-    case "sharedWrite":
-      countExprCSEOccurrences(stmt.idx, out);
-      countExprCSEOccurrences(stmt.value, out);
-      break;
-    case "guardedStore":
-      countExprCSEOccurrences(stmt.condition, out);
-      countExprCSEOccurrences(stmt.idx, out);
-      countExprCSEOccurrences(stmt.value, out);
-      break;
-    case "directStore":
-      countExprCSEOccurrences(stmt.idx, out);
-      countExprCSEOccurrences(stmt.value, out);
-      break;
-    case "atomicOp":
-      countExprCSEOccurrences(stmt.idx, out);
-      countExprCSEOccurrences(stmt.value, out);
-      break;
-    case "atomicCAS":
-      countExprCSEOccurrences(stmt.idx, out);
-      countExprCSEOccurrences(stmt.expected, out);
-      countExprCSEOccurrences(stmt.desired, out);
-      break;
-    case "vec4ArrayWrite": case "vec4ArrayAddAssign":
-      countExprCSEOccurrences(stmt.idx, out);
-      countExprCSEOccurrences(stmt.value, out);
-      break;
-  }
+  forEachStmtExpr(stmt, e => countExprCSEOccurrences(e, out));
 }
 
 /**
