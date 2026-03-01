@@ -37,7 +37,6 @@ export {
   type TilePtrComponent, type TileMaskComponent,
   type BlockCoopPtr, type BlockThreadPtr, type BlockPtr, type BlockLoadOpts,
   type BlockStorePtr,
-  type TileConfig,
 } from "./tile-ops";
 
 // ============================================================================
@@ -308,13 +307,6 @@ export interface TileMask2D {
   innerBound: IRNode;
 }
 
-/** Accumulator operation kind. */
-export type AccOpKind =
-  | { kind: "mulScalar"; value: IRNode }
-  | { kind: "addRow"; valuesArray: string; size: number }
-  | { kind: "apply"; body: Statement[]; resultNode: IRNode; valName: string }
-  | { kind: "castTo"; dtype: DataType };
-
 // --- Tile-level statement types ---
 
 export interface TileLoadStmt {
@@ -326,23 +318,6 @@ export interface TileLoadStmt {
   tileRows: number;       // BLOCK dimension (not thread tile)
   tileCols: number;
   elemType: DataType;
-}
-
-export interface DotStmt {
-  kind: "dot";
-  aTile: { sharedName: string; rows: number; innerDim: number };
-  bTile: { sharedName: string; innerDim: number; cols: number };
-  accName: string;
-  threadTileM: number;
-  threadTileN: number;
-}
-
-export interface AccOpStmt {
-  kind: "accOp";
-  accName: string;
-  threadTileM: number;
-  threadTileN: number;
-  op: AccOpKind;
 }
 
 export interface TileLoad1DStmt {
@@ -488,8 +463,6 @@ export type Statement =
   | Vec4ArrayAddAssignStmt
   // Tile-level statements (lowered by tile compiler)
   | TileLoadStmt
-  | DotStmt
-  | AccOpStmt
   | TileLoad1DStmt
   | TileStoreStmt
   // Block-level statements (unified Block API, lowered by tile compiler)
