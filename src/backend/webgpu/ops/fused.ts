@@ -10,24 +10,22 @@ import {
   dtypeBytes, alignBufferSize, WORKGROUP_SIZE,
 } from "../shape-utils";
 import {
-  requireContext, context, isF16Supported,
+  requireContext, isF16Supported,
   f16WeightCache, f16ArrayToF32Array,
 } from "../gpu-context";
+import { gpuContext } from "../webgpu-state";
 import { createTensor, createTrackedBuffer } from "../tensor";
 import { bufferPool } from "../buffer-pool";
 import { allocateOutputBuffer } from "../buffer-arena";
-import {
-  profiledCreateBindGroup,
-} from "../bind-group-cache";
 import type { TileKernelSpec } from "../tile-ir";
 import { elementwiseGrid } from "../tile-ir";
 import { createTileKernelDispatcher } from "../tile-dispatch";
 import {
-  sharedEncoder as sharedEncoderFlag,
   flushSharedEncoder, isSharedEncoderActive,
   getSharedEncoderInstance, trackSharedEncoderWrite,
   isAdamBatchMode, incrementSubmitCount,
 } from "../shared-encoder";
+import { sharedEncoderActive } from "../webgpu-state";
 import {
   profileApiCall, profileSubOpBegin, profileSubOpEnd,
 } from "../profiler";
@@ -498,7 +496,7 @@ export async function read(a: BackendTensor): Promise<number[]> {
   }
 
   // Flush shared encoder before readback — all prior GPU work must be submitted.
-  if (sharedEncoderFlag) {
+  if (sharedEncoderActive) {
     flushSharedEncoder();
   }
 
@@ -571,7 +569,7 @@ export async function read(a: BackendTensor): Promise<number[]> {
  * Call this before destroying buffers to ensure GPU is done using them.
  */
 export async function waitForGPU(): Promise<void> {
-  const ctx = context;
+  const ctx = gpuContext;
   if (!ctx) return;
   if (typeof ctx.queue.onSubmittedWorkDone === "function") {
     await ctx.queue.onSubmittedWorkDone();
