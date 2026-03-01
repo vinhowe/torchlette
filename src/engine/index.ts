@@ -174,13 +174,13 @@ export type {
   PlanEvent,
   SemanticSubevent,
   SemanticSubeventSchedule,
-} from "./planner";
+} from "./engine";
 export {
   buildPlanLinearOrder,
   compareEventKey,
   expandSemanticSubeventSchedule,
-} from "./planner";
-export { CANONICAL_NAN_BITS, canonicalizeF64Bits, encodeF64LE } from "./scalar";
+} from "./engine";
+export { CANONICAL_NAN_BITS, canonicalizeF64Bits, encodeF64LE } from "./compile-cache";
 export type { Token, TokenId, TokenKind } from "./tokens";
 export type { TraceEvent } from "./trace";
 export { TraceRecorder } from "./trace";

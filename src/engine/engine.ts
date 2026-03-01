@@ -6,28 +6,78 @@ import {
   type CompiledCacheKey,
   generateCacheKey,
 } from "./compile-cache";
-import {
-  collectTensorHandles,
-  collectTraceTensorIds,
-  computeRngValue,
-  isThenable,
-  isTraceTensor,
-} from "./engine-helpers";
 import { buildIRFromTrace, type IRGraph } from "./ir";
-import {
-  buildPlanLinearOrder,
-  type DebugPlanLinearOrder,
-  expandSemanticSubeventSchedule,
-  type PlanEvent,
-  type SemanticSubeventSchedule,
-} from "./planner";
 import { type Token, TokenStore } from "./tokens";
 import { type TraceEvent, TraceRecorder } from "./trace";
 
 // Re-export all types, errors, and helpers from extracted modules
 export * from "./engine-types";
-export * from "./engine-errors";
-export * from "./engine-helpers";
+// ── Engine helpers (merged from engine-helpers.ts) ──────────────────────────
+export function collectTensorHandles(value: unknown): EngineTensor[] {
+  const out: EngineTensor[] = [];
+  const seen = new Set<unknown>();
+  const visit = (current: unknown) => {
+    if (current === null || current === undefined) return;
+    if (current instanceof EngineTensor) { out.push(current); return; }
+    if (typeof current !== "object") return;
+    if (seen.has(current)) return;
+    seen.add(current);
+    if (Array.isArray(current)) { for (const entry of current) visit(entry); return; }
+    for (const entry of Object.values(current as Record<string, unknown>)) visit(entry);
+  };
+  visit(value);
+  return out;
+}
+
+export function isThenable(value: unknown): value is Promise<unknown> {
+  if (!value) return false;
+  return typeof (value as Promise<unknown>).then === "function";
+}
+
+export function collectTraceTensorIds(value: unknown): number[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.flatMap((item) => collectTraceTensorIds(item));
+  if (isTraceTensor(value)) return [value.id];
+  return [];
+}
+
+export function isTraceTensor(value: unknown): value is TraceTensor {
+  if (!value || typeof value !== "object") return false;
+  const record = value as TraceTensor;
+  return typeof record.id === "number" && typeof record.epoch === "number";
+}
+
+export function computeRngValue(basis: RngBasis, opNonce: number, drawNonce: number): number {
+  const seed = basis.seed >>> 0;
+  const algo = basis.algorithmId >>> 0;
+  const op = opNonce >>> 0;
+  const draw = drawNonce >>> 0;
+  let state = seed ^ Math.imul(algo, 0x9e3779b9) ^ op ^ Math.imul(draw, 0x85ebca6b);
+  state = mix32(state);
+  return (state >>> 0) / 2 ** 32;
+}
+
+export function mix32(value: number): number {
+  let v = value >>> 0;
+  v ^= v >>> 16;
+  v = Math.imul(v, 0x7feb352d);
+  v ^= v >>> 15;
+  v = Math.imul(v, 0x846ca68b);
+  v ^= v >>> 16;
+  return v >>> 0;
+}
+
+// ── Error classes (merged from engine-errors.ts) ────────────────────────────
+export class EngineBusyError extends Error { name = "EngineBusyError"; }
+export class CheckpointImpureRegionError extends Error { name = "CheckpointImpureRegionError"; }
+export class HostReadInCompileError extends Error { name = "HostReadInCompileError"; }
+export class AsyncInCompileError extends Error { name = "AsyncInCompileError"; }
+export class InvalidTraceTensorEscapeError extends Error { name = "InvalidTraceTensorEscapeError"; }
+export class SavedTensorModifiedError extends Error { name = "SavedTensorModifiedError"; }
+export class NonReentrantBackwardError extends Error { name = "NonReentrantBackwardError"; }
+export class PoisonedEngineError extends Error { name = "PoisonedEngineError"; }
+export class RngReplayExhaustedError extends Error { name = "RngReplayExhaustedError"; }
+export class RngReplayMismatchError extends Error { name = "RngReplayMismatchError"; }
 
 // Local imports from extracted modules (used by Engine class implementation)
 import {
@@ -36,41 +86,35 @@ import {
   type BaseId,
   type BaseState,
   type BaseStateInfo,
+  buildPlanLinearOrder,
   type CheckpointPack,
   type DebugPlan,
+  type DebugPlanLinearOrder,
   type DebugSimulatedState,
   type DebugSnapshot,
   type EngineMemoryStats,
   EngineTensor,
+  type EventKey,
   type ExecLock,
+  expandSemanticSubeventSchedule,
   type FinalizeRecord,
   type LocDebugState,
   type LocId,
   type MemorySnapshot,
   type MemoryStatsProvider,
+  type PlanEvent,
   type PredictedStateDelta,
   type RngBasis,
   type RngDrawRecord,
   type SavedTensorInfo,
   type SavedTensorRecord,
+  type SemanticSubeventSchedule,
   type TensorOrigin,
   type TidyScope,
   type TokenSnapshot,
   type TraceTensor,
   type TraceTensorStatus,
 } from "./engine-types";
-import {
-  AsyncInCompileError,
-  CheckpointImpureRegionError,
-  EngineBusyError,
-  HostReadInCompileError,
-  InvalidTraceTensorEscapeError,
-  NonReentrantBackwardError,
-  PoisonedEngineError,
-  RngReplayExhaustedError,
-  RngReplayMismatchError,
-  SavedTensorModifiedError,
-} from "./engine-errors";
 
 export class Engine {
   private readonly tokenStore: TokenStore;
