@@ -8,7 +8,7 @@
  * emitStore, emitVar, treeReduceSum, etc.) for full control over compute
  * kernel algorithms. Expressions are symbolic and inlined during codegen.
  *
- * Also supports Block-ops tile statements (tileLoad, tileStore, dot, etc.)
+ * Also supports Block-ops tile statements (blockLoad, blockStore, dot, etc.)
  * for 2D tiled algorithms like matmul, which are lowered to scalar/vec4 WGSL.
  *
  * Usage:
@@ -1032,37 +1032,16 @@ export class BlockExpr {
     }));
   }
 
-  /** vec4 * scalar → vec4. */
-  vec4MulScalar(s: BlockExpr): BlockExpr {
+  private _vec4BinOp(op: "add" | "sub" | "mul", other: BlockExpr): BlockExpr {
     return new BlockExpr(makeNode<Vec4BinaryNode>({
-      kind: "vec4Binary", op: "mul", a: this.node, b: s.node,
+      kind: "vec4Binary", op, a: this.node, b: other.node,
       valueType: "scalar", dataType: "f32",
     }));
   }
-
-  /** vec4 + vec4 → vec4. */
-  vec4Add(other: BlockExpr): BlockExpr {
-    return new BlockExpr(makeNode<Vec4BinaryNode>({
-      kind: "vec4Binary", op: "add", a: this.node, b: other.node,
-      valueType: "scalar", dataType: "f32",
-    }));
-  }
-
-  /** vec4 - vec4 → vec4. */
-  vec4Sub(other: BlockExpr): BlockExpr {
-    return new BlockExpr(makeNode<Vec4BinaryNode>({
-      kind: "vec4Binary", op: "sub", a: this.node, b: other.node,
-      valueType: "scalar", dataType: "f32",
-    }));
-  }
-
-  /** vec4 * vec4 → vec4 (element-wise). */
-  vec4Mul(other: BlockExpr): BlockExpr {
-    return new BlockExpr(makeNode<Vec4BinaryNode>({
-      kind: "vec4Binary", op: "mul", a: this.node, b: other.node,
-      valueType: "scalar", dataType: "f32",
-    }));
-  }
+  vec4MulScalar(s: BlockExpr) { return this._vec4BinOp("mul", s); }
+  vec4Add(other: BlockExpr) { return this._vec4BinOp("add", other); }
+  vec4Sub(other: BlockExpr) { return this._vec4BinOp("sub", other); }
+  vec4Mul(other: BlockExpr) { return this._vec4BinOp("mul", other); }
 
   // -- Comparisons --
   private _cmpOp(op: CmpOp, other: BlockExpr | number): BlockExpr {
@@ -2535,11 +2514,6 @@ export interface AutotuneConfig {
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/** Reset node ID counter (for testing). */
-export function resetNodeIdCounter(): void {
-  nextNodeId = 0;
-}
 
 /**
  * Execute a kernel spec's kernel function and return the captured context.
