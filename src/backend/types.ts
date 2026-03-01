@@ -286,6 +286,13 @@ export interface BackendOps {
   contiguous(a: BackendTensor): BackendTensor;
   /** Cast tensor to a different dtype. Returns same tensor if already target dtype. */
   cast?(a: BackendTensor, dtype: DType): BackendTensor;
+  /** 2D convolution. Input: [N,C,H,W], Weight: [Cout,Cin,kH,kW], Bias: [Cout]. */
+  conv2d?(
+    input: BackendTensor,
+    weight: BackendTensor,
+    bias: BackendTensor | undefined,
+    options?: { stride?: number | [number, number]; padding?: number | [number, number]; outBuffer?: unknown },
+  ): BackendTensor;
   gather(
     a: BackendTensor,
     index: BackendTensor,

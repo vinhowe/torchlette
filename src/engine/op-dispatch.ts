@@ -359,6 +359,11 @@ function executeReductionOp(
       assertOpSupported("argmin", backend.ops.argmin);
       return backend.ops.argmin(backendInputs[0], getPayload<{ dim: number; keepdim?: boolean }>(node)!);
     }
+    case "conv2d": {
+      assertOpSupported("conv2d", backend.ops.conv2d);
+      const payload = getPayload<{ stride?: number | [number, number]; padding?: number | [number, number] }>(node);
+      return backend.ops.conv2d(backendInputs[0], backendInputs[1], backendInputs[2], { ...payload, ...donationOpts });
+    }
     case "gather": {
       const payload = getPayload<{ dim: number }>(node);
       if (!payload) throw new Error("gather requires dim in payload");
@@ -555,7 +560,7 @@ const SHAPE_OPS = new Set([
 ]);
 const REDUCTION_OPS = new Set([
   "sum", "max", "min", "mean", "argmax", "argmin", "gather", "scatterAdd", "cat",
-  "gt", "lt", "ge", "le", "eq", "ne", "where",
+  "gt", "lt", "ge", "le", "eq", "ne", "where", "conv2d",
 ]);
 const MUTATION_OPS = new Set([
   "stridedScatterCopy", "stridedScatterAdd", "adamStep", "unscaleGrad",
