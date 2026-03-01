@@ -13,7 +13,7 @@
 
 import type { GPUBuffer } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
-import { type TileKernelSpec, perRowGrid } from "./tile-ir";
+import { type TileKernelSpec, perRowGrid, perRowKernel } from "./tile-ir";
 import { createTileKernelDispatcher, type TileKernelInstance } from "./tile-dispatch";
 import { requireContext } from "./webgpu-state";
 import { resolveOutputBuffer } from "./buffer-arena";
@@ -25,26 +25,15 @@ const WG = WORKGROUP_SIZE; // 256
 // ============================================================================
 
 function softmaxSpec(isLog: boolean): TileKernelSpec {
-  const name = isLog ? "fusedLogSoftmax" : "fusedSoftmax";
-  return {
-    name,
-    workgroupSize: WG,
+  return perRowKernel({
+    name: isLog ? "fusedLogSoftmax" : "fusedSoftmax",
     bindings: {
       x:      { storage: "read",       type: "f32" },
       output: { storage: "read_write", type: "f32" },
     },
-    uniforms: {
-      num_rows: "u32",
-      dim_size: "u32",
-    },
-    grid: perRowGrid(),
+    dimUniform: "dim_size",
 
-    kernel(ctx) {
-      const row  = ctx.programId(0);
-      const tid  = ctx.localIndex();
-      const D    = ctx.uniform("dim_size");
-      const base = row.mul(D);
-
+    kernel(ctx, _row, tid, D, base) {
       // Pass 1: Compute max along reduction dimension
       const maxVal = ctx.emitLet("max_val",
         ctx.wgReduce("max", tid, D, WG, (i) => ctx.load("x", base.add(i))));
@@ -55,21 +44,19 @@ function softmaxSpec(isLog: boolean): TileKernelSpec {
           ctx.load("x", base.add(i)).sub(maxVal).exp()));
 
       if (isLog) {
-        // log_softmax: output = (x - max) - log(sum_exp)
         const logSum = ctx.emitLet("log_sum", sumExp.log());
         ctx.stridedFor(tid, D, WG, (i) => {
-          const val = ctx.load("x", base.add(i)).sub(maxVal).sub(logSum);
-          ctx.emitStore("output", base.add(i), val);
+          ctx.emitStore("output", base.add(i),
+            ctx.load("x", base.add(i)).sub(maxVal).sub(logSum));
         });
       } else {
-        // softmax: output = exp(x - max) / sum_exp
         ctx.stridedFor(tid, D, WG, (i) => {
-          const val = ctx.load("x", base.add(i)).sub(maxVal).exp().div(sumExp);
-          ctx.emitStore("output", base.add(i), val);
+          ctx.emitStore("output", base.add(i),
+            ctx.load("x", base.add(i)).sub(maxVal).exp().div(sumExp));
         });
       }
     },
-  };
+  });
 }
 
 // ============================================================================

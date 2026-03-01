@@ -16,7 +16,7 @@ import {
 } from "./index";
 import type { GPUBuffer } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
-import { type TileKernelSpec, perRowGrid } from "./tile-ir";
+import { type TileKernelSpec, perRowGrid, perRowKernel } from "./tile-ir";
 import { createTileKernelDispatcher } from "./tile-dispatch";
 
 // ============================================================================
@@ -29,26 +29,17 @@ const WG = WORKGROUP_SIZE; // 256
  * Cross-entropy forward kernel (tile-IR).
  * One workgroup per batch row: max reduction, sum-exp reduction, thread 0 writes loss.
  */
-const crossEntropyForwardSpec: TileKernelSpec = {
+const crossEntropyForwardSpec = perRowKernel({
   name: "ceFwd",
-  workgroupSize: WG,
   bindings: {
     logits:  { storage: "read", type: "f32" },
     targets: { storage: "read", type: "f32" },
     loss:    { storage: "read_write", type: "f32" },
   },
-  uniforms: {
-    batch_size: "u32",
-    vocab_size: "u32",
-  },
-  grid: perRowGrid("batch_size"),
+  rowUniform: "batch_size",
+  dimUniform: "vocab_size",
 
-  kernel(ctx) {
-    const tid = ctx.localIndex();
-    const row = ctx.programId(0);
-    const V = ctx.uniform("vocab_size");
-    const base = row.mul(V);
-
+  kernel(ctx, row, tid, V, base) {
     // Parallel max reduction
     const rowMax = ctx.emitLet("row_max",
       ctx.wgReduce("max", tid, V, WG, (i) => ctx.load("logits", base.add(i))));
@@ -63,33 +54,24 @@ const crossEntropyForwardSpec: TileKernelSpec = {
     ctx.guardedStore("loss", tid.eq(ctx.u32(0)), row,
       ctx.load("logits", base.add(t)).sub(rowMax).sub(logSumExp).neg());
   },
-};
+});
 
 /**
  * Cross-entropy backward kernel (tile-IR).
  * One workgroup per batch row: recomputes max + sum-exp, writes softmax gradients.
  */
-const crossEntropyBackwardSpec: TileKernelSpec = {
+const crossEntropyBackwardSpec = perRowKernel({
   name: "ceBwd",
-  workgroupSize: WG,
   bindings: {
     logits:      { storage: "read", type: "f32" },
     targets:     { storage: "read", type: "f32" },
     grad_output: { storage: "read", type: "f32" },
     grad_logits: { storage: "read_write", type: "f32" },
   },
-  uniforms: {
-    batch_size: "u32",
-    vocab_size: "u32",
-  },
-  grid: perRowGrid("batch_size"),
+  rowUniform: "batch_size",
+  dimUniform: "vocab_size",
 
-  kernel(ctx) {
-    const tid = ctx.localIndex();
-    const row = ctx.programId(0);
-    const V = ctx.uniform("vocab_size");
-    const base = row.mul(V);
-
+  kernel(ctx, row, tid, V, base) {
     // Parallel max reduction
     const rowMax = ctx.emitLet("row_max",
       ctx.wgReduce("max", tid, V, WG, (i) => ctx.load("logits", base.add(i))));
@@ -109,7 +91,7 @@ const crossEntropyBackwardSpec: TileKernelSpec = {
         g.mul(softmaxI.sub(oneHotI)));
     });
   },
-};
+});
 
 const ceFwdTileKernel = createTileKernelDispatcher(crossEntropyForwardSpec);
 const ceBwdTileKernel = createTileKernelDispatcher(crossEntropyBackwardSpec);

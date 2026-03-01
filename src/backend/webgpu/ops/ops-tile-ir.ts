@@ -15,6 +15,7 @@ import {
   type BlockExpr,
   type DataType,
   elementwiseGrid,
+  elementwiseKernel,
 } from "../tile-ir";
 import { compileTileKernel } from "../tile-compiler";
 import { WORKGROUP_SIZE, F32_NEG_MAX, F32_POS_MAX, MAX_WORKGROUPS_PER_DIM } from "../shape-utils";
@@ -33,23 +34,14 @@ function fixedElementGrid(workgroupSize: number, elements: number): (u: Record<s
 // ============================================================================
 
 export function fillWGSL(): string {
-  const spec: TileKernelSpec = {
+  return compileTileKernel(elementwiseKernel({
     name: "fill",
-    workgroupSize: WG,
-    bindings: {
-      out: { storage: "read_write", type: "f32" },
-    },
-    uniforms: {
-      size: "u32",
-      value: "f32",
-    },
-    grid: elementwiseGrid(WG, { elementUniform: "size" }),
-    kernel(ctx) {
-      const idx = ctx.elementIndex(WG);
+    bindings: { out: { storage: "read_write", type: "f32" } },
+    uniforms: { value: "f32" },
+    kernel(ctx, idx) {
       ctx.emitStore("out", idx, ctx.uniform("value"));
     },
-  };
-  return compileTileKernel(spec);
+  }));
 }
 
 // ============================================================================
@@ -57,25 +49,14 @@ export function fillWGSL(): string {
 // ============================================================================
 
 export function arangeWGSL(): string {
-  const spec: TileKernelSpec = {
+  return compileTileKernel(elementwiseKernel({
     name: "arange",
-    workgroupSize: WG,
-    bindings: {
-      out: { storage: "read_write", type: "f32" },
+    bindings: { out: { storage: "read_write", type: "f32" } },
+    uniforms: { start: "f32", step: "f32" },
+    kernel(ctx, idx) {
+      ctx.emitStore("out", idx, ctx.uniform("start").add(idx.toF32().mul(ctx.uniform("step"))));
     },
-    uniforms: {
-      size: "u32",
-      start: "f32",
-      step: "f32",
-    },
-    grid: elementwiseGrid(WG, { elementUniform: "size" }),
-    kernel(ctx) {
-      const idx = ctx.elementIndex(WG);
-      const val = ctx.uniform("start").add(idx.toF32().mul(ctx.uniform("step")));
-      ctx.emitStore("out", idx, val);
-    },
-  };
-  return compileTileKernel(spec);
+  }));
 }
 
 // ============================================================================
@@ -83,35 +64,26 @@ export function arangeWGSL(): string {
 // ============================================================================
 
 export function triangularWGSL(upper: boolean): string {
-  const spec: TileKernelSpec = {
+  return compileTileKernel(elementwiseKernel({
     name: upper ? "triu" : "tril",
-    workgroupSize: WG,
     bindings: {
       input: { storage: "read", type: "f32" },
       output: { storage: "read_write", type: "f32" },
     },
-    uniforms: {
-      num_elements: "u32",
-      H: "u32",
-      W: "u32",
-      k: "i32",
-    },
-    grid: elementwiseGrid(WG, { elementUniform: "num_elements" }),
-    kernel(ctx) {
-      const idx = ctx.elementIndex(WG, "num_elements");
+    uniforms: { H: "u32", W: "u32", k: "i32" },
+    sizeUniform: "num_elements",
+    kernel(ctx, idx) {
       const W = ctx.uniform("W");
       const row = idx.div(W).mod(ctx.uniform("H")).toI32();
       const col = idx.mod(W).toI32();
       const k = ctx.uniform("k");
-      // tril: zero where col > row + k; triu: zero where col < row + k
       const cond = upper ? col.lt(row.add(k)) : col.gt(row.add(k));
       ctx.ifThenElse(cond,
         () => ctx.emitStore("output", idx, ctx.f32(0)),
         () => ctx.emitStore("output", idx, ctx.load("input", idx)),
       );
     },
-  };
-  return compileTileKernel(spec);
+  }));
 }
 
 // ============================================================================
@@ -141,29 +113,19 @@ export function comparisonWGSL(
   const cmpFn = opToMethod[wgslOp];
   if (!cmpFn) throw new Error(`Unknown comparison op: ${wgslOp}`);
 
-  const spec: TileKernelSpec = {
+  return compileTileKernel(elementwiseKernel({
     name: `cmp_${wgslOp}`,
-    workgroupSize: WG,
     bindings: {
       a: { storage: "read", type: "f32" },
       b: { storage: "read", type: "f32" },
       out: { storage: "read_write", type: "f32" },
     },
-    uniforms: { size: "u32" },
-    grid: elementwiseGrid(WG, { elementUniform: "size" }),
-    kernel(ctx) {
-      const idx = ctx.elementIndex(WG);
-
-      const aOff = ctx.stridedIndex(idx, indexShape, aStrides, aOffset);
-      const bOff = ctx.stridedIndex(idx, indexShape, bStrides, bOffset);
-
-      const aVal = ctx.load("a", aOff);
-      const bVal = ctx.load("b", bOff);
-      const result = cmpFn(aVal, bVal).select(ctx.f32(1), ctx.f32(0));
-      ctx.emitStore("out", idx, result);
+    kernel(ctx, idx) {
+      const aVal = ctx.stridedLoad("a", idx, indexShape, aStrides, aOffset);
+      const bVal = ctx.stridedLoad("b", idx, indexShape, bStrides, bOffset);
+      ctx.emitStore("out", idx, cmpFn(aVal, bVal).select(ctx.f32(1), ctx.f32(0)));
     },
-  };
-  return compileTileKernel(spec);
+  }));
 }
 
 // ============================================================================
@@ -189,21 +151,15 @@ export function argReduceWGSL(
   const isMax = compareOp === ">";
   const name = isMax ? "argmax" : "argmin";
 
-  const spec: TileKernelSpec = {
+  const spec = elementwiseKernel({
     name: `${name}_d${dim}_${inputShape.join("x")}`,
-    workgroupSize: WG,
     bindings: {
       input: { storage: "read", type: "f32" },
       out: { storage: "read_write", type: "f32" },
     },
-    uniforms: {
-      outSize: "u32",
-      dimSize: "u32",
-      dimStride: "u32",
-    },
-    grid: elementwiseGrid(WG, { elementUniform: "outSize" }),
-    kernel(ctx) {
-      const outIdx = ctx.elementIndex(WG, "outSize");
+    uniforms: { dimSize: "u32", dimStride: "u32" },
+    sizeUniform: "outSize",
+    kernel(ctx, outIdx) {
 
       // Compute base offset in input (with reduce dim = 0)
       // Decompose outIdx into output coordinates, map to input strides
@@ -236,7 +192,7 @@ export function argReduceWGSL(
 
       ctx.emitStore("out", outIdx, bestIdx.get().toF32());
     },
-  };
+  });
   return compileTileKernel(spec);
 }
 
@@ -257,32 +213,21 @@ export function whereSpec(
   xOffset: number,
   yOffset: number,
 ): TileKernelSpec {
-  return {
+  return elementwiseKernel({
     name: "where",
-    workgroupSize: WG,
     bindings: {
       cond: { storage: "read", type: "f32" },
       x: { storage: "read", type: "f32" },
       y: { storage: "read", type: "f32" },
       out: { storage: "read_write", type: "f32" },
     },
-    uniforms: { size: "u32" },
-    grid: elementwiseGrid(WG, { elementUniform: "size" }),
-    kernel(ctx) {
-      const idx = ctx.elementIndex(WG);
-
-      const condOff = ctx.stridedIndex(idx, indexShape, condStrides, condOffset);
-      const xOff = ctx.stridedIndex(idx, indexShape, xStrides, xOffset);
-      const yOff = ctx.stridedIndex(idx, indexShape, yStrides, yOffset);
-
-      const condVal = ctx.load("cond", condOff);
-      const xVal = ctx.load("x", xOff);
-      const yVal = ctx.load("y", yOff);
-      // select(falseVal, trueVal, condition) in WGSL
-      const result = condVal.ne(ctx.f32(0)).select(xVal, yVal);
-      ctx.emitStore("out", idx, result);
+    kernel(ctx, idx) {
+      const condVal = ctx.stridedLoad("cond", idx, indexShape, condStrides, condOffset);
+      const xVal = ctx.stridedLoad("x", idx, indexShape, xStrides, xOffset);
+      const yVal = ctx.stridedLoad("y", idx, indexShape, yStrides, yOffset);
+      ctx.emitStore("out", idx, condVal.ne(ctx.f32(0)).select(xVal, yVal));
     },
-  };
+  });
 }
 
 /**
@@ -325,29 +270,20 @@ export function binaryBroadcastSpec(
   const fusionOp = WGSL_OP_TO_FUSION[op];
   if (!fusionOp) throw new Error(`binaryBroadcastSpec: unsupported op "${op}"`);
 
-  return {
+  return elementwiseKernel({
     name: `binary_${fusionOp}`,
-    workgroupSize: WG,
     enableF16: dtype === "f16",
     bindings: {
       a: { storage: "read", type: dtype },
       b: { storage: "read", type: dtype },
       out: { storage: "read_write", type: dtype },
     },
-    uniforms: { size: "u32" },
-    grid: elementwiseGrid(WG, { elementUniform: "size" }),
-    kernel(ctx) {
-      const idx = ctx.elementIndex(WG);
-
-      const aOff = ctx.stridedIndex(idx, indexShape, aStrides, aOffset);
-      const bOff = ctx.stridedIndex(idx, indexShape, bStrides, bOffset);
-
-      const aVal = ctx.load("a", aOff);
-      const bVal = ctx.load("b", bOff);
-      const result = applyFusedOp(ctx, fusionOp, [aVal, bVal]);
-      ctx.emitStore("out", idx, result);
+    kernel(ctx, idx) {
+      const aVal = ctx.stridedLoad("a", idx, indexShape, aStrides, aOffset);
+      const bVal = ctx.stridedLoad("b", idx, indexShape, bStrides, bOffset);
+      ctx.emitStore("out", idx, applyFusedOp(ctx, fusionOp, [aVal, bVal]));
     },
-  };
+  });
 }
 
 /**
@@ -381,25 +317,17 @@ export function unaryStridedSpec(
   offset: number,
   dtype: DataType,
 ): TileKernelSpec {
-  return {
+  return elementwiseKernel({
     name: `unary_${opKey}`,
-    workgroupSize: WG,
     enableF16: dtype === "f16",
     bindings: {
       a: { storage: "read", type: dtype },
       out: { storage: "read_write", type: dtype },
     },
-    uniforms: { size: "u32" },
-    grid: elementwiseGrid(WG, { elementUniform: "size" }),
-    kernel(ctx) {
-      const idx = ctx.elementIndex(WG);
-
-      const inputOff = ctx.stridedIndex(idx, shape, strides, offset);
-      const val = ctx.load("a", inputOff);
-      const result = applyFusedOp(ctx, opKey, [val]);
-      ctx.emitStore("out", idx, result);
+    kernel(ctx, idx) {
+      ctx.emitStore("out", idx, applyFusedOp(ctx, opKey, [ctx.stridedLoad("a", idx, shape, strides, offset)]));
     },
-  };
+  });
 }
 
 /**
@@ -435,25 +363,18 @@ export function castSpec(
 ): TileKernelSpec {
   const castOp = `cast_${dstDtype}`;
 
-  return {
+  return elementwiseKernel({
     name: `cast_${srcDtype}_${dstDtype}`,
-    workgroupSize: WG,
     enableF16: srcDtype === "f16" || dstDtype === "f16",
     bindings: {
       a: { storage: "read", type: srcDtype },
       out: { storage: "read_write", type: dstDtype },
     },
-    uniforms: { size: "u32" },
-    grid: elementwiseGrid(WG, { elementUniform: "size" }),
-    kernel(ctx) {
-      const idx = ctx.elementIndex(WG);
-
-      const inputOff = ctx.stridedIndex(idx, shape, strides, offset);
-      const val = ctx.load("a", inputOff);
-      const result = srcDtype === dstDtype ? val : applyFusedOp(ctx, castOp, [val]);
-      ctx.emitStore("out", idx, result);
+    kernel(ctx, idx) {
+      const val = ctx.stridedLoad("a", idx, shape, strides, offset);
+      ctx.emitStore("out", idx, srcDtype === dstDtype ? val : applyFusedOp(ctx, castOp, [val]));
     },
-  };
+  });
 }
 
 /**
@@ -484,24 +405,17 @@ export function contiguousTileIR(
   offset: number,
   dtype: DataType,
 ): string {
-  const spec: TileKernelSpec = {
+  return compileTileKernel(elementwiseKernel({
     name: `contiguous_${dtype}`,
-    workgroupSize: WG,
     enableF16: dtype === "f16",
     bindings: {
       input: { storage: "read", type: dtype },
       out: { storage: "read_write", type: dtype },
     },
-    uniforms: { size: "u32" },
-    grid: elementwiseGrid(WG, { elementUniform: "size" }),
-    kernel(ctx) {
-      const idx = ctx.elementIndex(WG);
-
-      const inputOff = ctx.stridedIndex(idx, shape, strides, offset);
-      ctx.emitStore("out", idx, ctx.load("input", inputOff));
+    kernel(ctx, idx) {
+      ctx.emitStore("out", idx, ctx.stridedLoad("input", idx, shape, strides, offset));
     },
-  };
-  return compileTileKernel(spec);
+  }));
 }
 
 // ============================================================================
@@ -654,21 +568,18 @@ function gatherTileIRImpl(
   inputShape: number[], indexShape: number[], dim: number, chunked: boolean,
 ): string {
   const inputStrides = contiguousStridesForShape(inputShape);
-  const uniforms: Record<string, "u32"> = { size: "u32" };
+  const uniforms: Record<string, "u32"> = {};
   if (chunked) { uniforms.chunkStart = "u32"; uniforms.chunkEnd = "u32"; }
 
-  const spec: TileKernelSpec = {
+  return compileTileKernel(elementwiseKernel({
     name: chunked ? `gather_chunked_d${dim}` : `gather_d${dim}`,
-    workgroupSize: WG,
     bindings: {
       input: { storage: "read", type: "f32" },
       indices: { storage: "read", type: "f32" },
       out: { storage: "read_write", type: "f32" },
     },
     uniforms,
-    grid: elementwiseGrid(WG, { elementUniform: "size" }),
-    kernel(ctx) {
-      const idx = ctx.elementIndex(WG);
+    kernel(ctx, idx) {
       const gatherIdx = ctx.emitLet("gatherIdx", ctx.load("indices", idx).toU32());
 
       let dimIdx: BlockExpr = gatherIdx;
@@ -682,8 +593,7 @@ function gatherTileIRImpl(
       const inputCoords = coords.map((c, d) => d === dim ? dimIdx : c);
       ctx.emitStore("out", idx, ctx.load("input", ctx.linearizeIndex(inputCoords, inputStrides)));
     },
-  };
-  return compileTileKernel(spec);
+  }));
 }
 
 export function gatherTileIR(inputShape: number[], indexShape: number[], dim: number): string {
@@ -702,21 +612,19 @@ function scatterAddTileIRImpl(
   inputShape: number[], srcShape: number[], dim: number, chunked: boolean,
 ): string {
   const outStrides = contiguousStridesForShape(inputShape);
-  const uniforms: Record<string, "u32"> = { srcSize: "u32" };
+  const uniforms: Record<string, "u32"> = {};
   if (chunked) { uniforms.chunkStart = "u32"; uniforms.chunkEnd = "u32"; }
 
-  const spec: TileKernelSpec = {
+  return compileTileKernel(elementwiseKernel({
     name: chunked ? `scatterAdd_chunked_d${dim}` : `scatterAdd_d${dim}`,
-    workgroupSize: WG,
     bindings: {
       indices: { storage: "read", type: "f32" },
       src: { storage: "read", type: "f32" },
       out: { storage: "read_write", type: "f32" },
     },
     uniforms,
-    grid: elementwiseGrid(WG, { elementUniform: "srcSize" }),
-    kernel(ctx) {
-      const srcIdx = ctx.elementIndex(WG, "srcSize");
+    sizeUniform: "srcSize",
+    kernel(ctx, srcIdx) {
       const scatterIdx = ctx.emitLet("scatterIdx", ctx.load("indices", srcIdx).toU32());
 
       let dimIdx: BlockExpr = scatterIdx;
@@ -731,8 +639,7 @@ function scatterAddTileIRImpl(
       const outOffset = ctx.linearizeIndex(outCoords, outStrides);
       ctx.emitStore("out", outOffset, ctx.load("out", outOffset).add(ctx.load("src", srcIdx)));
     },
-  };
-  return compileTileKernel(spec);
+  }));
 }
 
 export function scatterAddTileIR(inputShape: number[], srcShape: number[], dim: number): string {
@@ -971,23 +878,14 @@ export function sliceBColumnsTileIR(): string {
  * Each thread generates one value using Philox 2x32-10.
  */
 export function randWGSL(): string {
-  const spec: TileKernelSpec = {
+  return compileTileKernel(elementwiseKernel({
     name: "rand",
-    workgroupSize: WG,
-    bindings: {
-      out: { storage: "read_write", type: "f32" },
-    },
-    uniforms: {
-      size: "u32",
-      seed: "u32",
-    },
-    grid: elementwiseGrid(WG, { elementUniform: "size" }),
-    kernel(ctx) {
-      const idx = ctx.elementIndex(WG);
+    bindings: { out: { storage: "read_write", type: "f32" } },
+    uniforms: { seed: "u32" },
+    kernel(ctx, idx) {
       ctx.emitStore("out", idx, ctx.randF32(ctx.uniform("seed"), idx));
     },
-  };
-  return compileTileKernel(spec);
+  }));
 }
 
 /**
@@ -1038,23 +936,13 @@ export function randnWGSL(): string {
  * Bernoulli random f32: 1.0 with probability p, 0.0 otherwise.
  */
 export function bernoulliWGSL(): string {
-  const spec: TileKernelSpec = {
+  return compileTileKernel(elementwiseKernel({
     name: "bernoulli",
-    workgroupSize: WG,
-    bindings: {
-      out: { storage: "read_write", type: "f32" },
-    },
-    uniforms: {
-      size: "u32",
-      seed: "u32",
-      prob: "f32",
-    },
-    grid: elementwiseGrid(WG, { elementUniform: "size" }),
-    kernel(ctx) {
-      const idx = ctx.elementIndex(WG);
+    bindings: { out: { storage: "read_write", type: "f32" } },
+    uniforms: { seed: "u32", prob: "f32" },
+    kernel(ctx, idx) {
       const u = ctx.randF32(ctx.uniform("seed"), idx);
       ctx.emitStore("out", idx, u.lt(ctx.uniform("prob")).select(ctx.f32(1.0), ctx.f32(0.0)));
     },
-  };
-  return compileTileKernel(spec);
+  }));
 }
