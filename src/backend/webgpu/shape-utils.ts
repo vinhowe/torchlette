@@ -19,6 +19,15 @@ export const WORKGROUP_SIZE = 256;
 /** Maximum workgroups per dimension in WebGPU (per spec) */
 export const MAX_WORKGROUPS_PER_DIM = 65535;
 
+/** IEEE 754 negative float max — used as -infinity identity for max reduction. */
+export const F32_NEG_MAX = -3.402823e+38;
+
+/** IEEE 754 positive float max — used as +infinity identity for min reduction. */
+export const F32_POS_MAX = 3.402823e+38;
+
+/** IEEE 754 bit pattern of 1.0f as u32 — for atomicMax-based infinity detection. */
+export const F32_ONE_BITS = 1065353216; // bitcast<u32>(1.0f) = 0x3F800000
+
 /**
  * Greatest common divisor using Euclidean algorithm.
  * Used for buffer alignment calculations.

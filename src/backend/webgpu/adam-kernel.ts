@@ -24,7 +24,7 @@ import { requireContext } from "./webgpu-state";
 import type { AdamStepConfig } from "../types";
 import { profileSubOpBegin, profileSubOpEnd } from "./profiler";
 import type { GPUBuffer, GPUBindGroup, GPUDevice } from "./gpu-types";
-import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
+import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, F32_ONE_BITS } from "./shape-utils";
 import { compileTileKernel } from "./tile-compiler";
 import type { TileKernelSpec, BindingSpec, UniformType } from "./tile-ir";
 
@@ -123,7 +123,7 @@ function makeAdamStepSpec(
             const bits = gVar.get().bitcastTo("u32");
             const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xFF));
             ctx.ifThen(exponent.eq(ctx.u32(0xFF)), () => {
-              ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(1065353216));
+              ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(F32_ONE_BITS));
               gVar.set(ctx.f32(0.0));
             });
           }
@@ -157,7 +157,7 @@ function makeAdamStepSpec(
           const bits = gVar.get().bitcastTo("u32");
           const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xFF));
           ctx.ifThen(exponent.eq(ctx.u32(0xFF)), () => {
-            ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(1065353216));
+            ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(F32_ONE_BITS));
             gVar.set(ctx.f32(0.0));
           });
 

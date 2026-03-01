@@ -26,6 +26,7 @@ import type {
 import { buildKernelIR, type KernelContext, elementwiseGrid } from "./tile-ir";
 import { computeSafeVecWidth } from "./tile-access-analysis";
 import { getSubgroupSupport } from "./matmul/types";
+import { F32_NEG_MAX } from "./shape-utils";
 
 /** Well-known uniform names that represent element counts for elementwise kernels. */
 const ELEMENTWISE_UNIFORMS = new Set(["size", "total_elements", "num_elements", "outSize"]);
@@ -3239,7 +3240,7 @@ function lowerBlockReduce(stmt: BlockReduceStmt): Statement[] {
 
     const rVar = freshVar("rr");
     const cVar = freshVar("rc");
-    const initVal = op === "max" ? cF32(-3.402823e+38) : cF32(0);
+    const initVal = op === "max" ? cF32(F32_NEG_MAX) : cF32(0);
 
     const rBody: Statement[] = [];
     // Initialize result[r] = init
@@ -3286,7 +3287,7 @@ function lowerBlockReduce(stmt: BlockReduceStmt): Statement[] {
 
     const cVar = freshVar("rc");
     const rVar = freshVar("rr");
-    const initVal = op === "max" ? cF32(-3.402823e+38) : cF32(0);
+    const initVal = op === "max" ? cF32(F32_NEG_MAX) : cF32(0);
 
     const cBody: Statement[] = [];
     cBody.push({

@@ -3,7 +3,7 @@
  *
  * Implements:
  * - CSE (Common Subexpression Elimination) for pure ops
- * - tok_after insertion for redundant ordered loads
+ * - (tok_after reserved for future use per §15)
  * - RNG non-CSE enforcement (random ops are never CSE'd)
  * - Dead code elimination
  */
@@ -95,13 +95,6 @@ export function isRandomOp(op: string): boolean {
  */
 export function isCSEable(op: string): boolean {
   return isPureOp(op) && !isRandomOp(op);
-}
-
-/**
- * Check if an op is an ordered load (requires tok_after handling).
- */
-export function isOrderedLoad(op: string): boolean {
-  return op === "loc_load" || op === "state_load";
 }
 
 /**
@@ -320,85 +313,6 @@ export function performDCE(graph: IRGraph, outputNodeIds: number[]): DCEResult {
 }
 
 // ============================================================================
-// tok_after Optimization
-// ============================================================================
-
-/**
- * A tok_after node that replaces a redundant ordered load.
- */
-export type TokAfterNode = {
-  id: number;
-  originalLoadId: number;
-  inputTokenId: number;
-  outputTokenId: number;
-};
-
-/**
- * Result of tok_after optimization.
- */
-export type TokAfterResult = {
-  optimizedGraph: IRGraph;
-  tokAfterNodes: TokAfterNode[];
-  replacedLoads: number[];
-};
-
-/**
- * Identify opportunities for tok_after optimization.
- *
- * Per spec §15: "redundant ordered-load replacement with tok_after
- * only if throw behavior cannot change"
- *
- * A load is redundant if:
- * 1. The same loc was loaded earlier in the same region
- * 2. No store to that loc occurred between the loads
- * 3. The throw behavior is identical (same potential exceptions)
- */
-export function analyzeTokAfterOpportunities(
-  graph: IRGraph,
-  locLoads: Map<number, number[]>, // locId -> [nodeIds that load from it]
-  locStores: Map<number, number[]>, // locId -> [nodeIds that store to it]
-): { redundantLoads: number[]; firstLoadMap: Map<number, number> } {
-  const redundantLoads: number[] = [];
-  const firstLoadMap = new Map<number, number>(); // redundant load -> first load
-
-  const nodeOrder = new Map(graph.nodes.map((n, i) => [n.id, i]));
-
-  for (const [locId, loadNodeIds] of locLoads) {
-    if (loadNodeIds.length <= 1) continue;
-
-    // Sort by order in graph
-    const sortedLoads = loadNodeIds.slice().sort((a, b) => {
-      return (nodeOrder.get(a) ?? 0) - (nodeOrder.get(b) ?? 0);
-    });
-
-    const storeNodeIds = locStores.get(locId) ?? [];
-    const storeOrders = storeNodeIds.map((id) => nodeOrder.get(id) ?? Infinity);
-
-    // First load is the canonical one
-    const firstLoad = sortedLoads[0];
-    const firstLoadOrder = nodeOrder.get(firstLoad) ?? 0;
-
-    // Check subsequent loads
-    for (let i = 1; i < sortedLoads.length; i++) {
-      const loadId = sortedLoads[i];
-      const loadOrder = nodeOrder.get(loadId) ?? 0;
-
-      // Check if any store happened between first load and this load
-      const hasInterveningStore = storeOrders.some(
-        (storeOrder) => storeOrder > firstLoadOrder && storeOrder < loadOrder,
-      );
-
-      if (!hasInterveningStore) {
-        redundantLoads.push(loadId);
-        firstLoadMap.set(loadId, firstLoad);
-      }
-    }
-  }
-
-  return { redundantLoads, firstLoadMap };
-}
-
-// ============================================================================
 // Full IR Optimization Pipeline
 // ============================================================================
 
@@ -408,7 +322,6 @@ export function analyzeTokAfterOpportunities(
 export type OptimizeOptions = {
   enableCSE?: boolean;
   enableDCE?: boolean;
-  enableTokAfter?: boolean;
   outputNodeIds?: number[];
 };
 

@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import type { IRGraph, IRNode } from "../src/engine/ir";
 import {
-  analyzeTokAfterOpportunities,
   generateCSEKey,
   isCSEable,
   isEffectful,
@@ -257,62 +256,6 @@ describe("§15 Dead Code Elimination", () => {
 
     expect(result.eliminatedNodes).toContain(4);
     expect(result.optimizedGraph.nodes.length).toBe(3);
-  });
-});
-
-describe("§15 tok_after Optimization", () => {
-  it("identifies redundant loads from same loc", () => {
-    const graph = makeGraph([
-      makeNode(1, "loc_load", []), // First load from loc 0
-      makeNode(2, "relu", [1]),
-      makeNode(3, "loc_load", []), // Second load from loc 0 (redundant)
-      makeNode(4, "add", [2, 3]),
-    ]);
-
-    // Both nodes 1 and 3 load from loc 0
-    const locLoads = new Map([[0, [1, 3]]]);
-    const locStores = new Map<number, number[]>();
-
-    const result = analyzeTokAfterOpportunities(graph, locLoads, locStores);
-
-    expect(result.redundantLoads).toContain(3);
-    expect(result.firstLoadMap.get(3)).toBe(1);
-  });
-
-  it("does not mark load as redundant if store intervenes", () => {
-    const graph = makeGraph([
-      makeNode(1, "loc_load", []), // Load
-      makeNode(2, "loc_store", [1]), // Store between loads
-      makeNode(3, "loc_load", []), // Load (not redundant due to store)
-    ]);
-
-    const locLoads = new Map([[0, [1, 3]]]);
-    const locStores = new Map([[0, [2]]]);
-
-    const result = analyzeTokAfterOpportunities(graph, locLoads, locStores);
-
-    expect(result.redundantLoads).toEqual([]);
-  });
-
-  it("handles multiple locs independently", () => {
-    const graph = makeGraph([
-      makeNode(1, "loc_load", []), // Load from loc 0
-      makeNode(2, "loc_load", []), // Load from loc 1
-      makeNode(3, "loc_load", []), // Second load from loc 0 (redundant)
-      makeNode(4, "loc_load", []), // Second load from loc 1 (redundant)
-    ]);
-
-    const locLoads = new Map([
-      [0, [1, 3]],
-      [1, [2, 4]],
-    ]);
-    const locStores = new Map<number, number[]>();
-
-    const result = analyzeTokAfterOpportunities(graph, locLoads, locStores);
-
-    expect(result.redundantLoads.length).toBe(2);
-    expect(result.redundantLoads).toContain(3);
-    expect(result.redundantLoads).toContain(4);
   });
 });
 
