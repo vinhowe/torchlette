@@ -180,14 +180,11 @@ export function dispatchBinary(
   options?: { outBuffer?: GPUBuffer },
 ): WebGPUTensor {
   const outShape = broadcastShapes(a.shape, b.shape);
-  const indexShape = toIndexShape(outShape);
   const outSize = sizeOf(outShape);
   if (outSize === 0) {
     throw new Error("webgpu ops do not support empty tensors yet");
   }
   const ctx = requireContext();
-
-  // Determine output dtype - both inputs must have same dtype
   const dtype = a.dtype;
   if (b.dtype !== dtype) {
     throw new Error(
@@ -195,18 +192,14 @@ export function dispatchBinary(
     );
   }
 
-  // Check if any buffer exceeds max binding size
-  const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const bytesPerElement = dtypeBytes(dtype);
-
+  const maxBindingSize = ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const aSizeBytes = a.size * bytesPerElement;
   const bSizeBytes = b.size * bytesPerElement;
   const outSizeBytes = outSize * bytesPerElement;
 
-  // Check if chunking is needed
+  // Large tensor chunked dispatch path
   if (aSizeBytes > maxBindingSize || bSizeBytes > maxBindingSize || outSizeBytes > maxBindingSize) {
-    // Check for simple case: same shape, both contiguous, or one is scalar
     const aIsScalar = a.size === 1;
     const bIsScalar = b.size === 1;
     const sameShape = a.shape.length === b.shape.length &&
@@ -215,65 +208,42 @@ export function dispatchBinary(
     if ((sameShape && a.isContiguous && b.isContiguous) ||
         (aIsScalar && b.isContiguous) ||
         (bIsScalar && a.isContiguous)) {
-      return dispatchBinaryChunked(op, a, b, options);
+      return binaryChunked(op, a, b, aIsScalar, bIsScalar, outShape, outSize, dtype, bytesPerElement, options);
     }
 
-    // Handle case where one or both tensors are non-contiguous
-    // Materialize them to contiguous first, then use chunked path
     if (sameShape) {
-      const aContiguous = a.isContiguous ? a : ensureContiguous(a);
-      const bContiguous = b.isContiguous ? b : ensureContiguous(b);
-      const result = dispatchBinaryChunked(op, aContiguous, bContiguous, options);
-      // Destroy contiguous copies to prevent memory leaks
-      if (aContiguous !== a) aContiguous.destroy?.();
-      if (bContiguous !== b) bContiguous.destroy?.();
+      const aC = a.isContiguous ? a : ensureContiguous(a);
+      const bC = b.isContiguous ? b : ensureContiguous(b);
+      const result = binaryChunked(op, aC, bC, aC.size === 1, bC.size === 1, outShape, outSize, dtype, bytesPerElement, options);
+      if (aC !== a) aC.destroy?.();
+      if (bC !== b) bC.destroy?.();
       return result;
     }
 
-    // For broadcast cases with non-contiguous tensors, materialize the large non-contiguous one
     if (!a.isContiguous && aSizeBytes > maxBindingSize) {
-      const aContiguous = ensureContiguous(a);
-      const result = dispatchBinary(op, aContiguous, b, options);
-      aContiguous.destroy?.();
+      const aC = ensureContiguous(a);
+      const result = dispatchBinary(op, aC, b, options);
+      aC.destroy?.();
       return result;
     }
     if (!b.isContiguous && bSizeBytes > maxBindingSize) {
-      const bContiguous = ensureContiguous(b);
-      const result = dispatchBinary(op, a, bContiguous, options);
-      bContiguous.destroy?.();
+      const bC = ensureContiguous(b);
+      const result = dispatchBinary(op, a, bC, options);
+      bC.destroy?.();
       return result;
     }
-
-    // Fall through to direct dispatch - may fail for complex cases
+    // Fall through to direct dispatch
   }
 
-  return dispatchBinaryDirect(op, a, b, options);
-}
-
-/**
- * Direct binary dispatch for small tensors (no chunking).
- */
-function dispatchBinaryDirect(
-  op: string,
-  a: WebGPUTensor,
-  b: WebGPUTensor,
-  options?: { outBuffer?: GPUBuffer },
-): WebGPUTensor {
-  const outShape = broadcastShapes(a.shape, b.shape);
+  // Direct dispatch
   const indexShape = toIndexShape(outShape);
-  const outSize = sizeOf(outShape);
-  const dtype = a.dtype;
-
   const aStrides = computeEffectiveBroadcastStrides(a, indexShape);
   const bStrides = computeEffectiveBroadcastStrides(b, indexShape);
-
   const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
-
   const code = binaryBroadcastTileIR(op, indexShape, aStrides, bStrides, a.offset, b.offset, dtype);
   const key = `binary:${op}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${a.offset}:${b.offset}:${dtype}:${use2D ? dispatch.gridSizeX : "1d"}`;
-  const bytesPerElement = dtypeBytes(dtype);
 
   const outBuffer = dispatchElementwise({
     key, shader: code,
@@ -288,60 +258,29 @@ function dispatchBinaryDirect(
   return createTensor(outShape, outBuffer, undefined, 0, dtype, ownsBuffer);
 }
 
-/**
- * Chunked binary dispatch for large tensors.
- * Uses tile-IR spec + dispatchChunked for tensors exceeding maxStorageBufferBindingSize.
- * Handles: same-shape contiguous tensors, or scalar + large tensor.
- */
-function dispatchBinaryChunked(
-  op: string,
-  a: WebGPUTensor,
-  b: WebGPUTensor,
+/** Chunked binary dispatch for large contiguous tensors exceeding maxStorageBufferBindingSize. */
+function binaryChunked(
+  op: string, a: WebGPUTensor, b: WebGPUTensor,
+  aIsScalar: boolean, bIsScalar: boolean,
+  outShape: number[], outSize: number, dtype: DType, bytesPerElement: number,
   options?: { outBuffer?: GPUBuffer },
 ): WebGPUTensor {
   const ctx = requireContext();
-  const dtype = a.dtype;
-  const bytesPerElement = dtypeBytes(dtype);
-
-  const outShape = broadcastShapes(a.shape, b.shape);
-  const outSize = sizeOf(outShape);
-
-  const aIsScalar = a.size === 1;
-  const bIsScalar = b.size === 1;
-
-  const outBuffer = resolveOutputBuffer(
-    ctx.device,
-    outSize * bytesPerElement,
-    [a.buffer, b.buffer],
-    options?.outBuffer,
-  );
-
-  // Build a flat tile-IR spec: scalar inputs use stride 0, contiguous use stride 1
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement, [a.buffer, b.buffer], options?.outBuffer);
   const spec = binaryBroadcastSpec(
-    op,
-    [outSize],                            // flat 1D indexShape
-    aIsScalar ? [0] : [1],               // aStrides: 0 for scalar, 1 for contiguous
-    bIsScalar ? [0] : [1],               // bStrides: 0 for scalar, 1 for contiguous
-    0, 0,                                 // offsets: 0 (contiguous, no offset)
-    dtype as "f32" | "f16" | "u32" | "i32",
+    op, [outSize],
+    aIsScalar ? [0] : [1], bIsScalar ? [0] : [1],
+    0, 0, dtype as "f32" | "f16" | "u32" | "i32",
   );
-
   const dispatcher = createTileKernelDispatcher(spec);
   dispatcher.dispatchChunked(
     { a: a.buffer, b: b.buffer, out: outBuffer },
     { size: outSize },
     {
-      modes: {
-        a: aIsScalar ? "scalar" : "chunked",
-        b: bIsScalar ? "scalar" : "chunked",
-        out: "chunked",
-      },
-      sizeUniform: "size",
-      totalElements: outSize,
-      maxBytesPerElement: bytesPerElement,
+      modes: { a: aIsScalar ? "scalar" : "chunked", b: bIsScalar ? "scalar" : "chunked", out: "chunked" },
+      sizeUniform: "size", totalElements: outSize, maxBytesPerElement: bytesPerElement,
     },
   );
-
   const ownsBuffer = options?.outBuffer === undefined;
   return createTensor(outShape, outBuffer, undefined, 0, dtype, ownsBuffer);
 }
@@ -359,37 +298,29 @@ export function dispatchUnary(
   const ctx = requireContext();
   const dtype = a.dtype;
   const bytesPerElement = dtypeBytes(dtype);
+  const maxBindingSize = ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
 
-  // Check if chunking is needed for large contiguous tensors
-  const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
-  const aSizeBytes = a.size * bytesPerElement;
-
-  if (aSizeBytes > maxBindingSize && a.isContiguous) {
-    return dispatchUnaryChunked(opKey, expr, a, options);
+  // Chunked dispatch for large contiguous tensors
+  if (a.size * bytesPerElement > maxBindingSize && a.isContiguous) {
+    const outSize = a.size;
+    const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement, [a.buffer], options?.outBuffer);
+    const spec = unaryStridedSpec(opKey, [outSize], [1], 0, dtype as "f32" | "f16" | "u32" | "i32");
+    const dispatcher = createTileKernelDispatcher(spec);
+    dispatcher.dispatchChunked(
+      { a: a.buffer, out: outBuffer },
+      { size: outSize },
+      { modes: { a: "chunked", out: "chunked" }, sizeUniform: "size", totalElements: outSize, maxBytesPerElement: bytesPerElement },
+    );
+    const ownsBuffer = options?.outBuffer === undefined;
+    return createTensor(a.shape, outBuffer, undefined, 0, dtype, ownsBuffer);
   }
 
-  return dispatchUnaryDirect(opKey, expr, a, options);
-}
-
-/**
- * Direct unary dispatch for small tensors.
- */
-function dispatchUnaryDirect(
-  opKey: string,
-  expr: string,
-  a: WebGPUTensor,
-  options?: { outBuffer?: GPUBuffer },
-): WebGPUTensor {
-  const dtype = a.dtype;
-
+  // Direct dispatch
   const totalWorkgroups = Math.ceil(a.size / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
-
   const code = unaryStridedTileIR(opKey, a.shape, a.strides, a.offset, dtype);
   const key = `unary:${opKey}:${a.shape.join("x")}:${a.strides.join(",")}:${a.offset}:${dtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
-  const bytesPerElement = dtypeBytes(dtype);
 
   const outBuffer = dispatchElementwise({
     key, shader: code,
@@ -399,53 +330,6 @@ function dispatchUnaryDirect(
     outBuffer: options?.outBuffer,
     dispatchX: dispatch.x, dispatchY: dispatch.y,
   });
-
-  const ownsBuffer = options?.outBuffer === undefined;
-  return createTensor(a.shape, outBuffer, undefined, 0, dtype, ownsBuffer);
-}
-
-/**
- * Chunked unary dispatch for large contiguous tensors.
- * Uses tile-IR spec + dispatchChunked for tensors exceeding maxStorageBufferBindingSize.
- */
-function dispatchUnaryChunked(
-  opKey: string,
-  expr: string,
-  a: WebGPUTensor,
-  options?: { outBuffer?: GPUBuffer },
-): WebGPUTensor {
-  const ctx = requireContext();
-  const dtype = a.dtype;
-  const bytesPerElement = dtypeBytes(dtype);
-  const outSize = a.size;
-
-  const outBuffer = resolveOutputBuffer(
-    ctx.device,
-    outSize * bytesPerElement,
-    [a.buffer],
-    options?.outBuffer,
-  );
-
-  // Build a flat tile-IR spec: contiguous stride 1, offset 0
-  const spec = unaryStridedSpec(
-    opKey,
-    [outSize],                            // flat 1D shape
-    [1],                                  // contiguous stride
-    0,                                    // no offset
-    dtype as "f32" | "f16" | "u32" | "i32",
-  );
-
-  const dispatcher = createTileKernelDispatcher(spec);
-  dispatcher.dispatchChunked(
-    { a: a.buffer, out: outBuffer },
-    { size: outSize },
-    {
-      modes: { a: "chunked", out: "chunked" },
-      sizeUniform: "size",
-      totalElements: outSize,
-      maxBytesPerElement: bytesPerElement,
-    },
-  );
 
   const ownsBuffer = options?.outBuffer === undefined;
   return createTensor(a.shape, outBuffer, undefined, 0, dtype, ownsBuffer);

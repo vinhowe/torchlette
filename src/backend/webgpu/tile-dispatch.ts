@@ -27,8 +27,10 @@ import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { compileTileKernel } from "./tile-compiler";
-import type { TileKernelSpec, DataType } from "./tile-ir";
+import type { TileKernelSpec, DataType, AutotuneConfig } from "./tile-ir";
 import { resolveGrid } from "./tile-ir";
+import { getDefaultConfig, autotuneTileKernel } from "./tile-autotune";
+import type { AutotuneOptions } from "./tile-autotune";
 
 // ============================================================================
 // Chunked Binding Configuration
@@ -292,6 +294,48 @@ export function createTileKernelDispatcher(spec: TileKernelSpec): TileKernelInst
     reset(): void {
       configCache.clear();
       cachedWGSL = null;
+    },
+  };
+}
+
+// ============================================================================
+// Auto-Tuning Dispatcher
+// ============================================================================
+
+export interface AutoTileKernelInstance {
+  dispatch(buffers: Record<string, GPUBuffer>, uniforms: Record<string, number>): void;
+  getConfig(): Record<string, number>;
+  tune(
+    buffers: Record<string, GPUBuffer>,
+    uniforms: Record<string, number>,
+    options?: AutotuneOptions,
+  ): Promise<void>;
+  reset(): void;
+}
+
+/**
+ * Create a tile kernel dispatcher with autotuning support.
+ * Starts with default config; call `tune()` to benchmark and select the best.
+ */
+export function createAutoTileKernelDispatcher(autoConfig: AutotuneConfig): AutoTileKernelInstance {
+  let currentConfig = getDefaultConfig(autoConfig);
+  let dispatcher = createTileKernelDispatcher(autoConfig.factory(currentConfig));
+
+  return {
+    dispatch(buffers, uniforms) {
+      dispatcher.dispatch(buffers, uniforms);
+    },
+    getConfig() {
+      return { ...currentConfig };
+    },
+    async tune(buffers, uniforms, options) {
+      const result = await autotuneTileKernel(autoConfig, buffers, uniforms, options);
+      currentConfig = result.config;
+      dispatcher = createTileKernelDispatcher(autoConfig.factory(currentConfig));
+    },
+    reset() {
+      currentConfig = getDefaultConfig(autoConfig);
+      dispatcher = createTileKernelDispatcher(autoConfig.factory(currentConfig));
     },
   };
 }

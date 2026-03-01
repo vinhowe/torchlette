@@ -86,12 +86,12 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
       ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
         const kvStart = tile.mul(ctx.u32(BC));
 
-        // Cooperative load K tile → shared [BC × D] (noPad: 2 tiles must fit in 16KB)
+        // Cooperative load K tile → shared [BC × D]
         const offsR = ctx.arange(kvStart, BC);
         const offsD = ctx.arange(ctx.u32(0), D);
         const tilePtr = ctx.tilePtr(bhOff, offsR.outer(Dim), offsD.inner(ctx.u32(1)));
         const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
-        const K = ctx.load2D("K", tilePtr, tileMask, { noPad: true });
+        const K = ctx.load2D("K", tilePtr, tileMask);
 
         // Scores = Q @ K^T → register [1 × BC]  (compiler generates vec4 dot)
         const scores = ctx.dot(Q, K.T());
@@ -119,7 +119,7 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
         mPrev.assign(mMax);
 
         // Cooperative load V tile → shared [BC × D]
-        const V = ctx.load2D("V", tilePtr, tileMask, { noPad: true });
+        const V = ctx.load2D("V", tilePtr, tileMask);
 
         // oAcc += scores @ V  (compiler generates vec4 FMA)
         ctx.dotAccum(scores, V, oAcc);
@@ -261,8 +261,8 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
         const offsD = ctx.arange(ctx.u32(0), D);
         const tilePtr = ctx.tilePtr(bhOff, offsR.outer(Dim), offsD.inner(ctx.u32(1)));
         const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
-        const K = ctx.load2D("K", tilePtr, tileMask, { noPad: true });
-        const V = ctx.load2D("V", tilePtr, tileMask, { noPad: true });
+        const K = ctx.load2D("K", tilePtr, tileMask);
+        const V = ctx.load2D("V", tilePtr, tileMask);
 
         // Scores = Q @ K^T → [1 × BC]   (compiler auto-vec4)
         const scores = ctx.dot(Q, K.T());

@@ -24,7 +24,7 @@ import { requireContext } from "./webgpu-state";
 
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
-import { trackBuffers } from "./wgsl-helpers";
+import { trackSharedEncoderWrite } from "./index";
 import { compileTileKernel } from "./tile-compiler";
 import {
   makeForwardAttentionSpec,
@@ -126,7 +126,7 @@ export function dispatchFlashAttentionForward(
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer, configBuf]);
 
-  trackBuffers(qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer);
+  for (const b of [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer]) trackSharedEncoderWrite(b);
 
   const numQBlocks = Math.ceil(seqLen / BR);
   dispatchComputePass(
@@ -173,7 +173,7 @@ export function dispatchFlashAttentionBackwardD(
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [dOBuffer, oBuffer, outBuffer, configBuf]);
 
-  trackBuffers(dOBuffer, oBuffer, outBuffer);
+  for (const b of [dOBuffer, oBuffer, outBuffer]) trackSharedEncoderWrite(b);
 
   dispatchComputePass(
     pipeline,
@@ -220,7 +220,7 @@ export function dispatchFlashAttentionBackwardDQ(
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer, configBuf]);
 
-  trackBuffers(qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer);
+  for (const b of [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer]) trackSharedEncoderWrite(b);
 
   const numQBlocks = Math.ceil(seqLen / BR);
   dispatchComputePass(
@@ -280,7 +280,7 @@ export function dispatchFlashAttentionBackwardDKV(
   const bindGroup = cachedCreateBindGroup(device, pipeline,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer, configBuf]);
 
-  trackBuffers(qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer);
+  for (const b of [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer]) trackSharedEncoderWrite(b);
 
   const numKVBlocks = Math.ceil(seqLen / BC_BW);
   dispatchComputePass(
