@@ -27,16 +27,12 @@
  */
 
 import {
-  BlockOps, Block, TileRange, TilePtr, TileMask, buildPtr, buildMask,
-  type TilePtrComponent, type TileMaskComponent,
+  BlockOps, Block, TileRange, buildPtr, buildMask,
 } from "./tile-ops";
 
 // Re-export tile-ops types so kernel authors only need one import
 export {
-  BlockOps, Block, TileRange, TilePtr, TileMask, buildPtr, buildMask,
-  type TilePtrComponent, type TileMaskComponent,
-  type BlockCoopPtr, type BlockThreadPtr, type BlockPtr, type BlockLoadOpts,
-  type BlockStorePtr,
+  BlockOps, Block, TileRange, buildPtr, buildMask,
 } from "./tile-ops";
 import { F32_NEG_MAX, F32_POS_MAX, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 

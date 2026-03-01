@@ -5,7 +5,7 @@
  * The compiler handles thread mapping, shared memory, barriers, and cooperative loading.
  */
 
-import { type TileKernelSpec, type DataType, type BlockExpr, type KernelContext, ceilDivGrid, singleWorkgroup, buildPtr, buildMask } from "../tile-ir";
+import { type TileKernelSpec, type DataType, type BlockExpr, type KernelContext, ceilDivGrid, singleWorkgroup } from "../tile-ir";
 import type { CodegenOptions } from "./types";
 import { getWorkgroupSize, type DType } from "./types";
 import {
