@@ -7,7 +7,7 @@
 
 import type { DType } from "../types";
 import { computeContiguousStrides } from "../types";
-export { sizeOf, broadcastShapes, shapesEqual } from "../../core/shape";
+export { sizeOf, broadcastShapes } from "../../core/shape";
 export { computeContiguousStrides as contiguousStrides } from "../types";
 
 // ============================================================================
@@ -91,14 +91,6 @@ export function computeEffectiveBroadcastStrides(
     }
   }
   return outStrides;
-}
-
-// ============================================================================
-// WGSL Code Generation Helpers
-// ============================================================================
-
-export function wgslArray(values: number[]): string {
-  return values.map((value) => `${value}u`).join(", ");
 }
 
 // ============================================================================

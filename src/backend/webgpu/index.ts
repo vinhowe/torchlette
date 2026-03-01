@@ -9,9 +9,7 @@ export {
   toIndexShape,
   contiguousStrides,
   computeEffectiveBroadcastStrides,
-  wgslArray,
   checkContiguousStrides,
-  shapesEqual,
   dtypeBytes,
   alignBufferSize,
   dtypeToWgsl,
@@ -43,7 +41,6 @@ export {
   serializeRegistry, deserializeRegistry, clearWarmupCache,
 } from "./pipeline-warmup";
 
-export type { BatchExecutionContext } from "./shared-encoder";
 export {
   beginBatchExecution, endBatchExecution, isBatchActive, abortBatch,
   beginSharedEncoder, flushSharedEncoder, endSharedEncoder,
@@ -53,14 +50,12 @@ export {
   setCurrentOpLabel, getCurrentOpLabel, setAdamBatchMode,
 } from "./shared-encoder";
 
-export type { RecordedDispatch } from "./dispatch-recording";
 export {
   replayPinnedBufferSet, getAndClearLastBindGroupBuffers,
   startDispatchRecording, stopDispatchRecording, replayDispatches,
   addReplayPinnedBuffers,
 } from "./dispatch-recording";
 
-export type { BufferArena } from "./buffer-arena";
 export {
   arenaBufferSet, pinnedOutputBuffers,
   allocateOutputBuffer, donateBuffer, getBufferSize,
@@ -164,7 +159,6 @@ export { createTileKernelDispatcher, type TileKernelInstance } from "./tile-disp
 export { tensorFromArrayWithDtype } from "./ops/creation";
 export { sumDimWithPreamble, sumDimWithPreambleChain, sumWithPreambleEpilogue, sumWithEpilogue, maxWithEpilogue, meanWithEpilogue } from "./ops/reductions";
 export { waitForGPU } from "./ops/fused";
-export { detectSimpleTranspose, ensureContiguous } from "./ops/views";
 
 // ============================================================================
 // Imports used locally (for webgpuBackend object and remaining wiring)
