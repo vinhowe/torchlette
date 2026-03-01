@@ -137,6 +137,20 @@ export {
 // Re-export autotune control functions
 export { isAutotuneEnabled, pretuneMatmulShapes, setAutotuneEnabled } from "./matmul";
 
+// Re-export tile-IR public API for custom kernels
+export {
+  type TileKernelSpec,
+  type BindingSpec,
+  type DataType,
+  type UniformType,
+  KernelContext,
+  elementwiseGrid,
+  ceilDivGrid,
+  singleWorkgroup,
+} from "./tile-ir";
+export { compileTileKernel } from "./tile-compiler";
+export { createTileKernelDispatcher, type TileKernelInstance } from "./tile-dispatch";
+
 // Re-export public functions from ops modules
 export { tensorFromArrayWithDtype } from "./ops/creation";
 export { sumDimWithPreamble, sumDimWithPreambleChain, sumWithPreambleEpilogue, sumWithEpilogue, maxWithEpilogue, meanWithEpilogue } from "./ops/reductions";
