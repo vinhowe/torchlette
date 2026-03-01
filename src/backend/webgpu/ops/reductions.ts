@@ -24,7 +24,7 @@ import {
   profiledCreateBindGroup,
   createParamsBuffer,
   releaseParamsBuffer,
-  params2,
+  params,
 } from "../bind-group-cache";
 import { isUnaryOp as isUnaryOpFromRegistry } from "./registry";
 import { contiguous } from "./views";
@@ -293,7 +293,7 @@ function sumFullReductionChunked(
     const chunkByteOffset = chunkStart * bytesPerElement;
     const chunkByteSize = chunkSize * bytesPerElement;
 
-    const paramsBuffer = createParamsBuffer(ctx.device, params2(chunkSize, chunk));
+    const paramsBuffer = createParamsBuffer(ctx.device, params(chunkSize, chunk));
 
     const bindGroup = profiledCreateBindGroup(ctx.device, {
       layout: pipeline.getBindGroupLayout(0),

@@ -16,10 +16,10 @@ import {
 } from "../src/backend/webgpu";
 import { canUseWebGPU } from "./helpers/webgpu";
 import {
-  dispatchTiledMatmul,
   DEFAULT_CONFIG,
   type MatmulKernelConfig,
-} from "../src/backend/webgpu/matmul";
+} from "../src/backend/webgpu/matmul/types";
+import { dispatchTiledMatmul } from "../src/backend/webgpu/matmul/dispatch";
 
 const GPUBufferUsage = {
   STORAGE: 0x0080,

@@ -91,13 +91,6 @@ export function isAutotuneEnabled(): boolean {
 }
 
 /**
- * Clear the pipeline cache.
- */
-function clearPipelineCache(): void {
-  pipelineCache.clear();
-}
-
-/**
  * Get tuning cache key.
  */
 function getTuningKey(shapeClass: ShapeClass, dtype: DType, hasEpilogue: boolean = false): string {
@@ -550,80 +543,6 @@ type DispatchMatmulOptions = {
   /** Cast input B from this wider dtype during tile load (e.g. read f32, cast to f16) */
   inputCastB?: DType;
 };
-
-/**
- * Internal matmul dispatch that requires a config.
- * Used by autotuning benchmarks to avoid recursive autotuning.
- */
-function dispatchTiledMatmulInternal(options: DispatchMatmulOptions & { config: MatmulKernelConfig }): void {
-  const {
-    device,
-    queue,
-    a,
-    b,
-    out,
-    m,
-    n,
-    k,
-    batchSize = 1,
-    transA = false,
-    transB = false,
-    alpha = 1.0,
-    dtype = "f32",
-    dtypeB,
-    config,
-    epilogue,
-    epilogueInputs = [],
-  } = options;
-
-  // Validate config
-  validateConfig(config);
-
-  // Get transpose mode
-  const transposeMode = getTransposeMode(transA, transB);
-
-  // Compute leading dimensions
-  const lda = transA ? m : k;
-  const ldb = transB ? k : n;
-  const ldc = n;
-
-  // Compute batch strides
-  const batchStrideA = options.batchStrideA ?? m * k;
-  const batchStrideB = options.batchStrideB ?? k * n;
-  const batchStrideC = options.batchStrideC ?? m * n;
-
-  // Build codegen options
-  const codegenOptions: CodegenOptions = {
-    config,
-    transposeMode,
-    dtype,
-    dtypeB,
-    epilogue,
-    batched: batchSize > 1,
-  };
-
-  // Get or create pipeline
-  const pipeline = getOrCreatePipeline(device, codegenOptions);
-
-  // Create params buffer via shared pool
-  const paramsData = packMatmulParams(m, n, k, lda, ldb, ldc, alpha, batchSize, batchStrideA, batchStrideB, batchStrideC);
-  const paramsBuffer = sharedCreateParamsBuffer(device, paramsData);
-
-  // Build flat buffer array for cached bind group
-  const bgBuffers = [a, b, out, paramsBuffer, ...epilogueInputs];
-  const bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers);
-
-  // Compute dispatch dimensions
-  const workgroupsX = Math.ceil(n / config.tileN);
-  const workgroupsY = Math.ceil(m / config.tileM);
-  const workgroupsZ = batchSize;
-
-  // Encode and submit
-  dispatchComputePass(pipeline, bindGroup, workgroupsX, workgroupsY, workgroupsZ, matmulRecordingBuffer);
-
-  // Release params buffer back to shared pool
-  releaseParamsBuffer(paramsBuffer);
-}
 
 // --- K-split infrastructure ---
 

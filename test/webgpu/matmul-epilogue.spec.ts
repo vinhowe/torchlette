@@ -12,7 +12,7 @@ import {
   syncWebGPU,
   webgpuBackend,
 } from "../../src/backend/webgpu";
-import type { EpilogueConfig } from "../../src/backend/webgpu/matmul";
+import type { EpilogueConfig } from "../../src/backend/webgpu/matmul/types";
 
 import { cpuOnly } from "../helpers/webgpu";
 

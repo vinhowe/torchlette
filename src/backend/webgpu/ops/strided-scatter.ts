@@ -13,7 +13,7 @@ import { bufferPool } from "../buffer-pool";
 import { resolveOutputBuffer } from "../buffer-arena";
 import {
   cachedCreateBindGroup, createParamsBuffer, releaseParamsBuffer,
-  params2,
+  params,
 } from "../bind-group-cache";
 import { ensureContiguous } from "./views";
 import { stridedScatterCopyTileIR, stridedScatterAddTileIR, flatCopySpec, flatAddSpec } from "./ops-tile-ir";
@@ -136,7 +136,7 @@ function stridedScatterCopyDirect(
     [contiguousBase.buffer, srcTensor.buffer],
   );
 
-  const paramsBuffer = createParamsBuffer(ctx.device, params2(baseSize, viewSize));
+  const paramsBuffer = createParamsBuffer(ctx.device, params(baseSize, viewSize));
 
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [contiguousBase.buffer, srcTensor.buffer, outBuffer, paramsBuffer]);
 
@@ -301,7 +301,7 @@ function stridedScatterAddDirect(
     [contiguousBase.buffer, srcTensor.buffer],
   );
 
-  const paramsBuffer = createParamsBuffer(ctx.device, params2(baseSize, viewSize));
+  const paramsBuffer = createParamsBuffer(ctx.device, params(baseSize, viewSize));
 
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [contiguousBase.buffer, srcTensor.buffer, outBuffer, paramsBuffer]);
 

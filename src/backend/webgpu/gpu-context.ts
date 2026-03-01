@@ -18,14 +18,14 @@ import type {
 import { gpuContext, setGpuContext, requireContext } from "./webgpu-state";
 import { bufferPool } from "./buffer-pool";
 import { isProfilingEnabled, initGpuTimestamps } from "./profiler";
-import { setSubgroupSupport, type SubgroupSupport } from "./matmul";
+import { setSubgroupSupport, type SubgroupSupport } from "./matmul/types";
 import { registerWebGPUDonation } from "../../engine/memory-planned-executor";
 import { resetUnscaleKernelState } from "./unscale-kernel";
 import { destroyProfilingFenceBuffer } from "./buffer-pool";
 import { resetAttentionKernelState } from "./attention-kernel";
 import { resetLayerNormKernelState } from "./layernorm-kernel";
 import { resetCrossEntropyKernelState } from "./cross-entropy-kernel";
-import { resetMatmulState } from "./matmul";
+import { resetMatmulState } from "./matmul/dispatch";
 import { resetFusionCache } from "./fusion-dispatch";
 import { startPipelineRecording, stopPipelineRecording, warmupPipelines, clearWarmupCache } from "./pipeline-warmup";
 

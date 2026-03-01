@@ -61,14 +61,13 @@ export function getParamsArray(wordCount: number): Uint32Array {
   return new Uint32Array(wordCount); // rare: allocate for large params
 }
 
-// Convenience helpers that fill and return pooled arrays (avoids new Uint32Array([...]) allocations)
-export function params1(a: number): Uint32Array { const p = paramsArrayPool[1]; p[0] = a; return p; }
-export function params2(a: number, b: number): Uint32Array { const p = paramsArrayPool[2]; p[0] = a; p[1] = b; return p; }
-export function params3(a: number, b: number, c: number): Uint32Array { const p = paramsArrayPool[3]; p[0] = a; p[1] = b; p[2] = c; return p; }
-export function params4(a: number, b: number, c: number, d: number): Uint32Array { const p = paramsArrayPool[4]; p[0] = a; p[1] = b; p[2] = c; p[3] = d; return p; }
-export function params5(a: number, b: number, c: number, d: number, e: number): Uint32Array { const p = paramsArrayPool[5]; p[0] = a; p[1] = b; p[2] = c; p[3] = d; p[4] = e; return p; }
-export function params6(a: number, b: number, c: number, d: number, e: number, f: number): Uint32Array { const p = paramsArrayPool[6]; p[0] = a; p[1] = b; p[2] = c; p[3] = d; p[4] = e; p[5] = f; return p; }
-export function params7(a: number, b: number, c: number, d: number, e: number, f: number, g: number): Uint32Array { const p = paramsArrayPool[7]; p[0] = a; p[1] = b; p[2] = c; p[3] = d; p[4] = e; p[5] = f; p[6] = g; return p; }
+/** Fill and return a pooled Uint32Array. Avoids allocations on the hot dispatch path. */
+export function params(...values: number[]): Uint32Array {
+  const n = values.length;
+  const p = n <= 8 ? paramsArrayPool[n] : new Uint32Array(n);
+  for (let i = 0; i < n; i++) p[i] = values[i];
+  return p;
+}
 
 // ============================================================================
 // Sequence-Indexed Params Buffer Cache
@@ -188,7 +187,7 @@ export function releaseParamsBuffer(buffer: GPUBuffer): void {
 
 // Backward-compatible wrappers for existing callsites
 export function createUniformBuffer(device: GPUDevice, size: number): GPUBuffer {
-  return createParamsBuffer(device, params1(size));
+  return createParamsBuffer(device, params(size));
 }
 
 export function releaseUniformBuffer(buffer: GPUBuffer): void {

@@ -18,7 +18,7 @@ import {
   cachedCreateBindGroup, profiledCreateBindGroup,
   createParamsBuffer, releaseParamsBuffer,
   createUniformBuffer, releaseUniformBuffer,
-  params4,
+  params,
 } from "../bind-group-cache";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
 import { gatherTileIR, scatterAddTileIR, chunkedGatherTileIR, chunkedScatterAddTileIR } from "./ops-tile-ir";
@@ -96,7 +96,7 @@ export function gather(
     const chunkByteOffset = chunkStart * layout.bytesPerSlice;
     const chunkByteSize = (chunkEnd - chunkStart) * layout.bytesPerSlice;
 
-    const uniformBuffer = createParamsBuffer(ctx.device, params4(outSize, chunkStart, chunkEnd, 0));
+    const uniformBuffer = createParamsBuffer(ctx.device, params(outSize, chunkStart, chunkEnd, 0));
     const bindGroup = profiledCreateBindGroup(ctx.device, {
       layout: pipeline.getBindGroupLayout(0),
       entries: [
@@ -198,7 +198,7 @@ export function scatterAdd(
     const chunkByteOffset = chunkStart * layout.bytesPerSlice;
     const chunkByteSize = (chunkEnd - chunkStart) * layout.bytesPerSlice;
 
-    const uniformBuffer = createParamsBuffer(ctx.device, params4(srcSize, chunkStart, chunkEnd, 0));
+    const uniformBuffer = createParamsBuffer(ctx.device, params(srcSize, chunkStart, chunkEnd, 0));
     const bindGroup = profiledCreateBindGroup(ctx.device, {
       layout: pipeline.getBindGroupLayout(0),
       entries: [

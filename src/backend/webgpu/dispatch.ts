@@ -32,7 +32,7 @@ import {
   createParamsBuffer,
   releaseParamsBuffer,
   cachedCreateBindGroup,
-  params1,
+  params,
 } from "./bind-group-cache";
 import { getTimestampWrites, getProfileModule } from "./profiler";
 import { binaryBroadcastTileIR, binaryBroadcastSpec, unaryStridedTileIR, unaryStridedSpec } from "./ops/ops-tile-ir";
@@ -43,8 +43,8 @@ import {
   computeBatchStrides,
   computeMatmulOutputShape,
   dispatchTiledMatmul,
-  type EpilogueConfig,
-} from "./matmul";
+} from "./matmul/dispatch";
+import type { EpilogueConfig } from "./matmul/types";
 
 // Tensor construction helpers (extracted to tensor.ts)
 import { createTensor } from "./tensor";
@@ -249,7 +249,7 @@ export function dispatchBinary(
     key, shader: code,
     inputs: [a.buffer, b.buffer],
     outputSizeBytes: outSize * bytesPerElement,
-    params: params1(outSize),
+    params: params(outSize),
     outBuffer: options?.outBuffer,
     dispatchX: dispatch.x, dispatchY: dispatch.y,
   });
@@ -326,7 +326,7 @@ export function dispatchUnary(
     key, shader: code,
     inputs: [a.buffer],
     outputSizeBytes: a.size * bytesPerElement,
-    params: params1(a.size),
+    params: params(a.size),
     outBuffer: options?.outBuffer,
     dispatchX: dispatch.x, dispatchY: dispatch.y,
   });
@@ -418,27 +418,6 @@ function prepareMatmulInputs(
   };
 }
 
-/**
- * Destroy contiguous copies that were created during matmul input preparation.
- */
-function cleanupMatmulCopies(
-  aWasCopied: boolean,
-  bWasCopied: boolean,
-  effectiveA: WebGPUTensor,
-  effectiveB: WebGPUTensor,
-  a: WebGPUTensor,
-  b: WebGPUTensor,
-): void {
-  if (aWasCopied) {
-    bufferPool.decRef(effectiveA.buffer);
-    bufferPool.deferredDestroy(effectiveA.buffer, effectiveA.size * (a.dtype === "f16" ? 2 : 4));
-  }
-  if (bWasCopied) {
-    bufferPool.decRef(effectiveB.buffer);
-    bufferPool.deferredDestroy(effectiveB.buffer, effectiveB.size * (b.dtype === "f16" ? 2 : 4));
-  }
-}
-
 export function dispatchMatmul(
   a: WebGPUTensor,
   b: WebGPUTensor,
@@ -490,7 +469,8 @@ export function dispatchMatmul(
     dtypeB: dtypeB !== dtypeA ? dtypeB : undefined,
   });
 
-  cleanupMatmulCopies(aWasCopied, bWasCopied, effectiveA, effectiveB, a, b);
+  if (aWasCopied) { bufferPool.decRef(effectiveA.buffer); bufferPool.deferredDestroy(effectiveA.buffer, effectiveA.size * (a.dtype === "f16" ? 2 : 4)); }
+  if (bWasCopied) { bufferPool.decRef(effectiveB.buffer); bufferPool.deferredDestroy(effectiveB.buffer, effectiveB.size * (b.dtype === "f16" ? 2 : 4)); }
 
   // Output tensor always owns the buffer (donated or new)
   return createTensor(outShape, outBuffer, undefined, 0, outputDtype, true);
@@ -564,7 +544,8 @@ export function dispatchMatmulWithEpilogue(
     inputCastB,
   });
 
-  cleanupMatmulCopies(aWasCopied, bWasCopied, effectiveA, effectiveB, a, b);
+  if (aWasCopied) { bufferPool.decRef(effectiveA.buffer); bufferPool.deferredDestroy(effectiveA.buffer, effectiveA.size * (a.dtype === "f16" ? 2 : 4)); }
+  if (bWasCopied) { bufferPool.decRef(effectiveB.buffer); bufferPool.deferredDestroy(effectiveB.buffer, effectiveB.size * (b.dtype === "f16" ? 2 : 4)); }
 
   return createTensor(outShape, outBuffer, undefined, 0, outputDtype);
 }
