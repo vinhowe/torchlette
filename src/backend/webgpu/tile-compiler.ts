@@ -249,9 +249,8 @@ export function compileTileKernel(spec: TileKernelSpec): string {
   _varCounter = 0;
 
   // 0. Auto vec-width selection: if vectorize is "auto", use access analysis.
-  //    NOTE: autoVectorize only works with kernels using globalId(0) for their
-  //    thread index. Kernels using flatGlobalId() (programId + localIndex)
-  //    must implement manual vec4 unrolling (see flatCopySpec, flatAddSpec).
+  //    Works with both globalId(0) and flatGlobalId() kernels. The access
+  //    analysis recognizes tagged flatGlobalId nodes as stride-1 coalesced.
   if ((spec as any).vectorize === "auto" || (spec.vectorize === undefined && (spec as any).autoVectorize)) {
     const safeWidth = computeSafeVecWidth(spec);
     if (safeWidth > 1) {
@@ -373,11 +372,12 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
     : spec.workgroupSize;
 
   // Scan nodes to determine which builtins are actually used
+  const hasFlatGidVec = (spec.vectorize ?? 0) > 1 && ctx.flatGlobalIdNodeIds.length > 0;
   const needsGid = ctx.nodes.some(n => n.kind === "globalId");
-  const needsWid = ctx.nodes.some(n => n.kind === "programId");
+  const needsWid = ctx.nodes.some(n => n.kind === "programId") || hasFlatGidVec;
   const needsLocalId = ctx.nodes.some(n => n.kind === "threadIdx");
-  const needsLocalIdx = ctx.nodes.some(n => n.kind === "localIndex");
-  const needsNumWg = ctx.nodes.some(n => n.kind === "numWorkgroups");
+  const needsLocalIdx = ctx.nodes.some(n => n.kind === "localIndex") || hasFlatGidVec;
+  const needsNumWg = ctx.nodes.some(n => n.kind === "numWorkgroups") || hasFlatGidVec;
   // Shared arrays and tile-level stmts require local_id/local_idx even if not explicitly referenced
   const hasTileOps = ctx.sharedArrays.length > 0 || ctx.vec4SharedArrays.length > 0 ||
     ctx.statements.some(s => s.kind === "tileLoad" || s.kind === "tileStore" || s.kind === "tileLoad1d");
@@ -403,24 +403,44 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
   if (spec.vectorize && spec.vectorize > 1) {
     // Auto-vectorization: unroll body VEC_WIDTH times
     const vecWidth = spec.vectorize;
+    const flatGidNodeIds = ctx.flatGlobalIdNodeIds;
 
-    // Find all globalId(0) node IDs to override
-    const gidXNodes = ctx.nodes.filter(n => n.kind === "globalId" && n.dim === 0);
+    if (flatGidNodeIds.length > 0) {
+      // flatGlobalId path: compute base from workgroup + local index
+      // _flatBase = (wid.x + wid.y * num_wg.x) * (WG * VEC) + local_idx * VEC
+      const wgTotal = typeof spec.workgroupSize === "number"
+        ? spec.workgroupSize : spec.workgroupSize[0] * spec.workgroupSize[1];
+      lines.push(`  let _flatBase = (wid.x + wid.y * num_wg.x) * ${wgTotal * vecWidth}u + local_idx * ${vecWidth}u;`);
 
-    lines.push(`  let _base = gid.x * ${vecWidth}u;`);
-
-    for (let v = 0; v < vecWidth; v++) {
-      lines.push(`  // vec element ${v}`);
-      lines.push(`  {`);
-      // Override globalId(0) → (_base + v)
-      const vecBindings = new Map(bindings);
-      for (const n of gidXNodes) {
-        vecBindings.set(n.id, `(_base + ${v}u)`);
+      for (let v = 0; v < vecWidth; v++) {
+        lines.push(`  // vec element ${v}`);
+        lines.push(`  {`);
+        const vecBindings = new Map(bindings);
+        for (const nodeId of flatGidNodeIds) {
+          vecBindings.set(nodeId, `(_flatBase + ${v}u)`);
+        }
+        for (const stmt of stmts) {
+          emitStatement(stmt, vecBindings, lines, 2);
+        }
+        lines.push(`  }`);
       }
-      for (const stmt of stmts) {
-        emitStatement(stmt, vecBindings, lines, 2);
+    } else {
+      // globalId(0) path: compute base from gid.x
+      const gidXNodes = ctx.nodes.filter(n => n.kind === "globalId" && n.dim === 0);
+      lines.push(`  let _base = gid.x * ${vecWidth}u;`);
+
+      for (let v = 0; v < vecWidth; v++) {
+        lines.push(`  // vec element ${v}`);
+        lines.push(`  {`);
+        const vecBindings = new Map(bindings);
+        for (const n of gidXNodes) {
+          vecBindings.set(n.id, `(_base + ${v}u)`);
+        }
+        for (const stmt of stmts) {
+          emitStatement(stmt, vecBindings, lines, 2);
+        }
+        lines.push(`  }`);
       }
-      lines.push(`  }`);
     }
   } else {
     for (const stmt of stmts) {

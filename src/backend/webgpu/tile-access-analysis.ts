@@ -90,10 +90,16 @@ interface AnalysisContext {
   /** Set of loop variable names with compile-time constant bounds.
    *  These are "bounded" but not data-dependent w.r.t. thread index. */
   boundedLoopVars: Set<string>;
+  /** Node IDs of flatGlobalId() results — treated as stride-1 coalesced. */
+  flatGlobalIdNodes?: Set<number>;
 }
 
-function createAnalysisContext(): AnalysisContext {
-  return { letDefs: new Map(), boundedLoopVars: new Set() };
+function createAnalysisContext(flatGlobalIdNodeIds?: number[]): AnalysisContext {
+  return {
+    letDefs: new Map(),
+    boundedLoopVars: new Set(),
+    flatGlobalIdNodes: flatGlobalIdNodeIds?.length ? new Set(flatGlobalIdNodeIds) : undefined,
+  };
 }
 
 /**
@@ -104,6 +110,11 @@ function createAnalysisContext(): AnalysisContext {
  * plus divisibility and constant term for alignment reasoning.
  */
 function evalSymbolic(node: IRNode, wgSizeX: number, actx?: AnalysisContext): SymbolicExpr {
+  // flatGlobalId() nodes are tagged as stride-1 coalesced (same as globalId(0))
+  if (actx?.flatGlobalIdNodes?.has(node.id)) {
+    return { innerCoeff: 1, hasDataDep: false, constantTerm: 0, divisibility: 1 };
+  }
+
   switch (node.kind) {
     case "globalId":
       // globalId(0) = programId(0) * wgSizeX + threadIdx(0)
@@ -363,7 +374,7 @@ export function analyzeAccessPatterns(spec: TileKernelSpec): AccessPattern[] {
     ? spec.workgroupSize
     : spec.workgroupSize[0];
 
-  const actx = createAnalysisContext();
+  const actx = createAnalysisContext(ctx.flatGlobalIdNodeIds);
   const patterns: AccessPattern[] = [];
 
   // Walk statements for stores (also populates actx with let/var/loop definitions)

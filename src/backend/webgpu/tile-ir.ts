@@ -1553,6 +1553,8 @@ export class KernelContext {
   private reduceCounter = 0;
   /** Whether this kernel's reduction primitives used subgroup operations. */
   _usesSubgroups = false;
+  /** Node IDs of flatGlobalId() results (for auto-vectorization override). */
+  readonly flatGlobalIdNodeIds: number[] = [];
 
   /** Workgroup size (product if 2D), set by buildKernelIR from spec.workgroupSize. */
   private _wgSize: number | [number, number] = 0;
@@ -1671,7 +1673,9 @@ export class KernelContext {
     const flatWgId = this.programId(0).add(
       this.programId(1).mul(this.numPrograms(0)),
     );
-    return flatWgId.mul(this.u32(workgroupSize)).add(this.localIndex());
+    const result = flatWgId.mul(this.u32(workgroupSize)).add(this.localIndex());
+    this.flatGlobalIdNodeIds.push(result.node.id);
+    return result;
   }
 
   /**
