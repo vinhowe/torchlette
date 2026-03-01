@@ -393,45 +393,32 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
 
           ctx.barrier();
 
-          // For each Q row in the tile
+          // Block dot: scores = K @ QTile^T → [1 × BQ_BW]  (auto-vec4)
+          const scores = ctx.dot(K, QTile.T());
+
+          // Block dot: dovs = V @ dOTile^T → [1 × BQ_BW]  (auto-vec4)
+          const dovs = ctx.dot(V, dOTile.T());
+
+          // Element-wise: compute ds*scale and p blocks for accumulation
+          const dsBlk = ctx.zeros(1, BQ_BW);
+          const pBlk = ctx.zeros(1, BQ_BW);
           ctx.range(0, BQ_BW, (j) => {
             const qi = qStart.add(j);
             const isActive = valid.and(qi.lt(N)).and(
               isCausal.eq(ctx.u32(0)).or(kvRow.le(qi)),
             );
-
-            // Scores: K[kvRow] @ Q[qi]^T → scalar dot product
-            // K is register [1×D], QTile is shared [BQ×D]
-            // Compute: score = Σ_d K[d] * QTile[j * smemStride + d]
-            const smemStr = ctx.u32(QTile.smemStride);
-            const sPartial = ctx.emitVar("_sp", "f32", ctx.f32(0));
-            ctx.range(0, D, (d) => {
-              sPartial.addAssign(
-                K.get(d).mul(QTile.get(j.mul(smemStr).add(d))),
-              );
-            });
-            const s = sPartial.get().mul(scale);
+            const s = scores.get(j).mul(scale);
             const p = isActive.select(s.sub(lTile.read(j)).exp(), ctx.f32(0));
-
-            // dO·V dot product for element j
-            const dovPartial = ctx.emitVar("_dp", "f32", ctx.f32(0));
-            ctx.range(0, D, (d) => {
-              dovPartial.addAssign(
-                V.get(d).mul(dOTile.get(j.mul(smemStr).add(d))),
-              );
-            });
-
-            const ds = p.mul(dovPartial.get().sub(dTile.read(j)));
-            const dsScale = ds.mul(scale);
-
-            // Accumulate dK and dV using scalar FMA (per-element over D)
-            ctx.range(0, D, (d) => {
-              const qVal = QTile.get(j.mul(smemStr).add(d));
-              const doVal = dOTile.get(j.mul(smemStr).add(d));
-              dkAcc.set(d, dkAcc.get(d).add(qVal.mul(dsScale)));
-              dvAcc.set(d, dvAcc.get(d).add(doVal.mul(p)));
-            });
+            const ds = p.mul(dovs.get(j).sub(dTile.read(j)));
+            dsBlk.set(j, ds.mul(scale));
+            pBlk.set(j, p);
           });
+
+          // Block dot: dkAcc += dsBlk @ QTile → [1×BQ_BW] @ [BQ_BW×D] → [1×D]  (auto-vec4 FMA)
+          ctx.dotAccum(dsBlk, QTile, dkAcc);
+
+          // Block dot: dvAcc += pBlk @ dOTile → [1×BQ_BW] @ [BQ_BW×D] → [1×D]  (auto-vec4 FMA)
+          ctx.dotAccum(pBlk, dOTile, dvAcc);
 
           ctx.barrier();
         });

@@ -139,7 +139,7 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
       return `local_id.${(["x", "y", "z"] as const)[node.dim]}`;
     }
     case "localIndex": {
-      return "local_idx";
+      return _activeTPR > 1 ? "_logical_idx" : "local_idx";
     }
     case "sharedRead": case "arrayRead": case "vec4ArrayRead": case "vec4SharedRead": {
       return `${node.arrayName}[${exprFor(node.idx, bindings)}]`;
@@ -211,6 +211,115 @@ function freshVar(hint: string): string {
 }
 
 // ============================================================================
+// Automatic Subgroup Cooperative Optimization (TPR = Threads Per Row)
+// ============================================================================
+
+/** Block layout for TPR-aware lowering. */
+type BlockLayout = "full" | "distributed" | "replicated";
+
+/** Module-level TPR state — set during compilation, reset after. */
+let _activeTPR = 1;
+let _blockLayouts: Map<string, BlockLayout> = new Map();
+
+/** Get the physical column count for a named block, accounting for TPR distribution. */
+function getPhysCols(name: string, logicalCols: number): number {
+  if (_activeTPR <= 1) return logicalCols;
+  const layout = _blockLayouts.get(name);
+  return layout === "distributed" ? logicalCols / _activeTPR : logicalCols;
+}
+
+/** Recursively collect all BlockDotStmt from a statement tree. */
+function collectBlockDots(stmts: Statement[]): BlockDotStmt[] {
+  const dots: BlockDotStmt[] = [];
+  function scan(ss: Statement[]) {
+    for (const s of ss) {
+      if (s.kind === "blockDot") dots.push(s);
+      if ("body" in s && Array.isArray((s as any).body)) scan((s as any).body);
+      if ("elseBody" in s && Array.isArray((s as any).elseBody)) scan((s as any).elseBody);
+    }
+  }
+  scan(stmts);
+  return dots;
+}
+
+/**
+ * Auto-detect whether this kernel benefits from TPR > 1 (threads-per-row).
+ * Returns 4 if register×shared block dots with wide register operands are found,
+ * otherwise returns 1 (no optimization).
+ */
+function autoDetectTPR(stmts: Statement[], sgSupported: boolean): number {
+  if (!sgSupported) return 1;
+
+  const dots = collectBlockDots(stmts);
+  if (dots.length === 0) return 1;
+
+  // Don't enable TPR if kernel has shared×shared dots (uses 2D thread tiles)
+  if (dots.some(d => d.aPlacement === "shared" && d.bPlacement === "shared")) return 1;
+
+  // Need at least one register×shared dot with single-row register operand
+  const hasRegSharedDot = dots.some(d =>
+    d.aPlacement === "register" && d.bPlacement === "shared" && d.aRows === 1);
+  if (!hasRegSharedDot) return 1;
+
+  // Verify all distributed dimensions are compatible with TPR=4
+  const layouts = new Map<string, BlockLayout>();
+  for (const dot of dots) {
+    if (dot.aPlacement === "register" && dot.bPlacement === "shared") {
+      if (dot.bTransposed) {
+        // RegSharedT: A is distributed (inner dim), result is replicated
+        if (dot.aCols < 16 || dot.aCols % 4 !== 0) return 1;
+        if (layouts.get(dot.aName) === "replicated") return 1;
+        layouts.set(dot.aName, "distributed");
+        layouts.set(dot.resultName, "replicated");
+        if (dot.accName) {
+          if (layouts.get(dot.accName) === "distributed") return 1;
+          layouts.set(dot.accName, "replicated");
+        }
+      } else {
+        // RegSharedNN: A is replicated, result is distributed (output cols)
+        if (dot.bCols < 16 || dot.bCols % 4 !== 0) return 1;
+        if (layouts.get(dot.aName) === "distributed") return 1;
+        layouts.set(dot.aName, "replicated");
+        if (layouts.get(dot.resultName) === "replicated") return 1;
+        layouts.set(dot.resultName, "distributed");
+        if (dot.accName) {
+          if (layouts.get(dot.accName) === "replicated") return 1;
+          layouts.set(dot.accName, "distributed");
+        }
+      }
+    }
+  }
+
+  return 4;
+}
+
+/**
+ * Compute block layouts for TPR-aware lowering.
+ * Scans all block dot statements to determine which blocks are distributed/replicated.
+ */
+function computeBlockLayouts(stmts: Statement[], tpr: number): Map<string, BlockLayout> {
+  const layouts = new Map<string, BlockLayout>();
+  if (tpr <= 1) return layouts;
+
+  const dots = collectBlockDots(stmts);
+  for (const dot of dots) {
+    if (dot.aPlacement === "register" && dot.bPlacement === "shared") {
+      if (dot.bTransposed) {
+        layouts.set(dot.aName, "distributed");
+        layouts.set(dot.resultName, "replicated");
+        if (dot.accName) layouts.set(dot.accName, "replicated");
+      } else {
+        layouts.set(dot.aName, "replicated");
+        layouts.set(dot.resultName, "distributed");
+        if (dot.accName) layouts.set(dot.accName, "distributed");
+      }
+    }
+  }
+
+  return layouts;
+}
+
+// ============================================================================
 // Main Compiler
 // ============================================================================
 
@@ -260,6 +369,14 @@ export function compileTileKernel(spec: TileKernelSpec): string {
   // 2. Lower tile-level ops if present
   let stmts = ctx.statements;
   if (hasTileStatements(stmts)) {
+    // Auto-detect subgroup cooperative TPR before lowering
+    const tpr = autoDetectTPR(stmts, sgSize > 0);
+    _activeTPR = tpr;
+    _blockLayouts = computeBlockLayouts(stmts, tpr);
+    if (tpr > 1) {
+      spec = { ...spec, enableSubgroups: true };
+    }
+
     // Auto-emit thread_row/thread_col if not present (tile lowering needs them)
     if (!stmts.some(s => s.kind === "let" && s.name === "thread_row")) {
       const threadRowNode: ThreadIdxNode = { id: -1, kind: "threadIdx", dim: 1, valueType: "scalar", dataType: "u32" };
@@ -273,8 +390,8 @@ export function compileTileKernel(spec: TileKernelSpec): string {
     stmts = lowerTileStatements(stmts, spec);
   }
 
-  // 3. Automatic barrier insertion (opt-in)
-  if (spec.autoBarriers) {
+  // 3. Automatic barrier insertion (opt-in, or forced when TPR > 1 increases WG size)
+  if (spec.autoBarriers || _activeTPR > 1) {
     stmts = insertBarriers(stmts);
   }
 
@@ -287,7 +404,13 @@ export function compileTileKernel(spec: TileKernelSpec): string {
   // 6. Dead code elimination (remove unused let bindings)
   stmts = eliminateDeadCode(stmts);
 
-  return compileImperativeKernel(spec, ctx, stmts);
+  try {
+    return compileImperativeKernel(spec, ctx, stmts);
+  } finally {
+    // Reset module-level TPR state after compilation
+    _activeTPR = 1;
+    _blockLayouts = new Map();
+  }
 }
 
 
@@ -341,10 +464,11 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
     lines.push("");
   }
 
-  // Function signature
-  const [wgX, wgY] = typeof spec.workgroupSize === "number"
+  // Function signature — physical WG size = logical × TPR
+  const [logicalWgX, wgY] = typeof spec.workgroupSize === "number"
     ? [spec.workgroupSize, 1]
     : spec.workgroupSize;
+  const wgX = logicalWgX * _activeTPR;
 
   // Scan nodes to determine which builtins are actually used
   const hasFlatGidVec = (spec.vectorize ?? 0) > 1 && ctx.flatGlobalIdNodeIds.length > 0;
@@ -418,6 +542,11 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
       }
     }
   } else {
+    // Emit TPR (threads-per-row) helper variables for subgroup cooperative mode
+    if (_activeTPR > 1) {
+      lines.push(`  let _logical_idx = local_idx / ${_activeTPR}u;`);
+      lines.push(`  let _sub_idx = local_idx % ${_activeTPR}u;`);
+    }
     for (const stmt of stmts) {
       emitStatement(stmt, bindings, lines, 1);
     }
@@ -860,6 +989,32 @@ function getSharedWritesFromStmt(stmt: Statement): Set<string> {
   return writes;
 }
 
+/** Deeply collect all shared reads from statements, recursing into ALL bodies (including forRange/forStride). */
+function collectAllSharedReads(stmts: Statement[], names: Set<string>): void {
+  for (const stmt of stmts) {
+    forEachStmtExpr(stmt, e => getSharedReadsFromExpr(e, names));
+    if (stmt.kind === "if") {
+      collectAllSharedReads(stmt.body, names);
+    } else if (stmt.kind === "ifElse") {
+      collectAllSharedReads(stmt.body, names);
+      collectAllSharedReads(stmt.elseBody, names);
+    } else if (stmt.kind === "forRange" || stmt.kind === "forStride") {
+      collectAllSharedReads(stmt.body, names);
+    }
+  }
+}
+
+/** Deeply collect all shared writes from statements, recursing into ALL bodies (including forRange/forStride). */
+function collectAllSharedWrites(stmts: Statement[], names: Set<string>): void {
+  for (const stmt of stmts) {
+    for (const w of getSharedWritesFromStmt(stmt)) names.add(w);
+    if (stmt.kind === "forRange" || stmt.kind === "forStride") {
+      collectAllSharedWrites(stmt.body, names);
+    }
+    // if/ifElse already handled by getSharedWritesFromStmt
+  }
+}
+
 /**
  * Insert workgroupBarrier() between shared memory writes and subsequent reads.
  * Does not double-barrier: existing barriers clear the dirty set.
@@ -869,14 +1024,26 @@ export function insertBarriers(stmts: Statement[]): Statement[] {
   const dirtyArrays = new Set<string>();
 
   for (const stmt of stmts) {
-    // Recurse into forRange bodies first
-    if (stmt.kind === "forRange") {
+    // Recurse into forRange/forStride bodies
+    if (stmt.kind === "forRange" || stmt.kind === "forStride") {
+      // Check if this loop reads from dirty shared arrays (deep scan)
+      const loopReads = new Set<string>();
+      collectAllSharedReads(stmt.body, loopReads);
+      let loopNeedsBarrier = false;
+      for (const r of loopReads) {
+        if (dirtyArrays.has(r)) { loopNeedsBarrier = true; break; }
+      }
+      if (loopNeedsBarrier) {
+        result.push({ kind: "barrier" });
+        dirtyArrays.clear();
+      }
+
       const newBody = insertBarriersForLoop(stmt.body);
       result.push({ ...stmt, body: newBody } as Statement);
-      // forRange may write shared memory — track it
-      for (const s of stmt.body) {
-        for (const w of getSharedWritesFromStmt(s)) dirtyArrays.add(w);
-      }
+      // forRange may write shared memory — track it (deep scan)
+      const loopWrites = new Set<string>();
+      collectAllSharedWrites(stmt.body, loopWrites);
+      for (const w of loopWrites) dirtyArrays.add(w);
       continue;
     }
 
@@ -924,10 +1091,8 @@ function insertBarriersForLoop(body: Statement[]): Statement[] {
   // i.e., writes at end feed into reads at start of next iteration
   const allWrites = new Set<string>();
   const allReads = new Set<string>();
-  for (const s of body) {
-    for (const w of getSharedWritesFromStmt(s)) allWrites.add(w);
-    for (const r of getSharedReadsFromStmt(s)) allReads.add(r);
-  }
+  collectAllSharedWrites(body, allWrites);
+  collectAllSharedReads(body, allReads);
 
   // If any written array is also read, we may need a barrier at the end
   let needsBoundaryBarrier = false;
@@ -1605,6 +1770,7 @@ function hasTileStatements(stmts: Statement[]): boolean {
  */
 function lowerTileStatements(stmts: Statement[], spec: TileKernelSpec): Statement[] {
   const result: Statement[] = [];
+
   let i = 0;
   while (i < stmts.length) {
     const s = stmts[i];
@@ -1707,6 +1873,32 @@ function andOp(lhs: IRNode, rhs: IRNode): IRNode {
 function castNode(input: IRNode, targetType: DataType): IRNode {
   return { id: -1, kind: "cast", input, targetType, valueType: input.valueType, dataType: targetType };
 }
+/** Create a subgroupShuffleXor IR node for butterfly reduction. */
+function shuffleXorNode(value: IRNode, mask: number): IRNode {
+  return {
+    id: -1, kind: "subgroupShuffleXor",
+    value, mask: cU32(mask),
+    valueType: "scalar", dataType: "f32",
+  } as IRNode;
+}
+
+/** Emit butterfly reduction statements for TPR threads (sum or max). */
+function emitButterflyReduce(sVar: string, tpr: number, op: "sum" | "max"): Statement[] {
+  const stmts: Statement[] = [];
+  for (let mask = 1; mask < tpr; mask *= 2) {
+    const shuffled = shuffleXorNode(ref(sVar, "f32"), mask);
+    if (op === "sum") {
+      stmts.push({ kind: "addAssign", name: sVar, value: shuffled });
+    } else {
+      stmts.push({
+        kind: "assign", name: sVar,
+        value: binOp("max", ref(sVar, "f32"), shuffled, "f32"),
+      });
+    }
+  }
+  return stmts;
+}
+
 function sharedRead(arrayName: string, idx: IRNode, dt: DataType = "f32"): IRNode {
   return { id: -1, kind: "sharedRead", arrayName, idx, valueType: "scalar", dataType: dt };
 }
@@ -1724,8 +1916,9 @@ function vec4DotExpr(
 }
 
 function getTotalThreads(spec: TileKernelSpec): number {
-  if (typeof spec.workgroupSize === "number") return spec.workgroupSize;
-  return spec.workgroupSize[0] * spec.workgroupSize[1];
+  const logical = typeof spec.workgroupSize === "number"
+    ? spec.workgroupSize : spec.workgroupSize[0] * spec.workgroupSize[1];
+  return logical * _activeTPR;
 }
 
 /**
@@ -1967,7 +2160,8 @@ function lowerTileStore(stmt: TileStoreStmt, spec: TileKernelSpec): Statement[] 
  */
 function lowerBlockAlloc(stmt: BlockAllocStmt): Statement[] {
   const { name, rows, cols, elemType, initValue } = stmt;
-  const size = rows * cols;
+  const pCols = getPhysCols(name, cols);
+  const size = rows * pCols;
   const result: Statement[] = [];
 
   if (initValue !== undefined) {
@@ -2019,12 +2213,14 @@ function lowerBlockLoad(stmt: BlockLoadStmt, spec: TileKernelSpec): Statement[] 
  */
 function lowerBlockLoadThread(stmt: BlockLoadStmt, spec: TileKernelSpec): Statement[] {
   const { binding, name, rows, cols, elemType, threadBase, threadStride, guard } = stmt;
-  const size = rows * cols;
+  const pCols = getPhysCols(name, cols);
+  const size = rows * pCols;
+  const isDistributed = _activeTPR > 1 && pCols !== cols;
   const result: Statement[] = [];
   const bindingDtype = spec.bindings[binding]?.type ?? elemType;
-  const useVec4 = cols % 4 === 0 && bindingDtype === "f32";
+  const useVec4 = pCols % 4 === 0 && bindingDtype === "f32";
 
-  // Allocate register array
+  // Allocate register array (physical size)
   result.push({
     kind: "varArray", name, elemType: "f32", size, skipZeroInit: true,
   });
@@ -2032,16 +2228,21 @@ function lowerBlockLoadThread(stmt: BlockLoadStmt, spec: TileKernelSpec): Statem
   // Build loading loop
   const loadBody: Statement[] = [];
 
+  // For distributed blocks: shift base by _sub_idx * physCols
+  const effectiveBase = isDistributed
+    ? binOp("add", threadBase!, binOp("mul", ref("_sub_idx"), cU32(pCols)))
+    : threadBase!;
+
   if (rows === 1) {
     if (useVec4) {
-      // Vec4 path: for (d4 = 0; d4 < cols/4; d4++) { 4× unrolled loads }
+      // Vec4 path: for (d4 = 0; d4 < pCols/4; d4++) { 4× unrolled loads }
       const d4Var = freshVar("d4");
       const offVar = freshVar("off");
       const innerBody: Statement[] = [];
 
       innerBody.push({
         kind: "let", name: offVar, dtype: "u32",
-        value: binOp("add", threadBase!, binOp("mul", ref(d4Var), cU32(4))),
+        value: binOp("add", effectiveBase, binOp("mul", ref(d4Var), cU32(4))),
       });
       for (let k = 0; k < 4; k++) {
         const loadIdx = k === 0 ? ref(offVar) : binOp("add", ref(offVar), cU32(k));
@@ -2055,15 +2256,15 @@ function lowerBlockLoadThread(stmt: BlockLoadStmt, spec: TileKernelSpec): Statem
       }
 
       loadBody.push({
-        kind: "forRange", varName: d4Var, start: cU32(0), bound: cU32(cols / 4),
+        kind: "forRange", varName: d4Var, start: cU32(0), bound: cU32(pCols / 4),
         body: innerBody,
       });
     } else {
-      // Scalar path: for (d = 0; d < cols; d++) { reg[d] = buf[base + d]; }
+      // Scalar path: for (d = 0; d < pCols; d++) { reg[d] = buf[base + d]; }
       const dVar = freshVar("d");
       const innerBody: Statement[] = [];
 
-      const loadIdx = binOp("add", threadBase!, ref(dVar));
+      const loadIdx = binOp("add", effectiveBase, ref(dVar));
       let loadExpr: IRNode = loadBinding(binding, loadIdx, bindingDtype);
       if (bindingDtype !== "f32") {
         loadExpr = castNode(loadExpr, "f32");
@@ -2077,23 +2278,27 @@ function lowerBlockLoadThread(stmt: BlockLoadStmt, spec: TileKernelSpec): Statem
       });
 
       loadBody.push({
-        kind: "forRange", varName: dVar, start: cU32(0), bound: cU32(cols),
+        kind: "forRange", varName: dVar, start: cU32(0), bound: cU32(pCols),
         body: innerBody,
       });
     }
   } else {
-    // Multiple rows: for (r = 0; r < rows; r++) for (d = 0; d < cols; d++)
+    // Multiple rows: for (r = 0; r < rows; r++) for (d = 0; d < pCols; d++)
     const rVar = freshVar("r");
     const dVar = freshVar("d");
     const innerBody: Statement[] = [];
 
     const rowBase = binOp("add", threadBase!, binOp("mul", ref(rVar), threadStride!));
-    const loadIdx = binOp("add", rowBase, ref(dVar));
+    // For distributed: each row also offset by _sub_idx * physCols
+    const effRowBase = isDistributed
+      ? binOp("add", rowBase, binOp("mul", ref("_sub_idx"), cU32(pCols)))
+      : rowBase;
+    const loadIdx = binOp("add", effRowBase, ref(dVar));
     let loadExpr: IRNode = loadBinding(binding, loadIdx, bindingDtype);
     if (bindingDtype !== "f32") {
       loadExpr = castNode(loadExpr, "f32");
     }
-    const regIdx = binOp("add", binOp("mul", ref(rVar), cU32(cols)), ref(dVar));
+    const regIdx = binOp("add", binOp("mul", ref(rVar), cU32(pCols)), ref(dVar));
 
     innerBody.push({
       kind: "indexAssign",
@@ -2105,7 +2310,7 @@ function lowerBlockLoadThread(stmt: BlockLoadStmt, spec: TileKernelSpec): Statem
     loadBody.push({
       kind: "forRange", varName: rVar, start: cU32(0), bound: cU32(rows),
       body: [{
-        kind: "forRange", varName: dVar, start: cU32(0), bound: cU32(cols),
+        kind: "forRange", varName: dVar, start: cU32(0), bound: cU32(pCols),
         body: innerBody,
       }],
     });
@@ -2169,19 +2374,26 @@ function lowerBlockLoadTile(stmt: BlockLoadStmt, spec: TileKernelSpec): Statemen
  */
 function lowerBlockStore(stmt: BlockStoreStmt): Statement[] {
   const { binding, blockName, rows, cols, base, stride, guard } = stmt;
+  const pCols = getPhysCols(blockName, cols);
+  const isDistributed = _activeTPR > 1 && pCols !== cols;
   const result: Statement[] = [];
-  const useVec4 = rows === 1 && cols % 4 === 0;
+  const useVec4 = rows === 1 && pCols % 4 === 0;
 
   const storeBody: Statement[] = [];
 
+  // For distributed blocks: shift base by _sub_idx * physCols
+  const effectiveBase = isDistributed
+    ? binOp("add", base, binOp("mul", ref("_sub_idx"), cU32(pCols)))
+    : base;
+
   if (rows === 1 && useVec4) {
-    // Vec4 path: for (d4 = 0; d4 < cols/4; d4++) { 4× unrolled stores }
+    // Vec4 path: for (d4 = 0; d4 < pCols/4; d4++) { 4× unrolled stores }
     const d4Var = freshVar("sd4");
     const offVar = freshVar("soff");
     const innerBody: Statement[] = [];
     innerBody.push({
       kind: "let", name: offVar, dtype: "u32",
-      value: binOp("add", base, binOp("mul", ref(d4Var), cU32(4))),
+      value: binOp("add", effectiveBase, binOp("mul", ref(d4Var), cU32(4))),
     });
     for (let k = 0; k < 4; k++) {
       const storeIdx = k === 0 ? ref(offVar) : binOp("add", ref(offVar), cU32(k));
@@ -2193,18 +2405,18 @@ function lowerBlockStore(stmt: BlockStoreStmt): Statement[] {
       });
     }
     storeBody.push({
-      kind: "forRange", varName: d4Var, start: cU32(0), bound: cU32(cols / 4),
+      kind: "forRange", varName: d4Var, start: cU32(0), bound: cU32(pCols / 4),
       body: innerBody,
     });
   } else if (rows === 1) {
-    // Scalar single row: for (d = 0; d < cols; d++) { buf[base + d] = reg[d]; }
+    // Scalar single row: for (d = 0; d < pCols; d++) { buf[base + d] = reg[d]; }
     const dVar = freshVar("sd");
     storeBody.push({
-      kind: "forRange", varName: dVar, start: cU32(0), bound: cU32(cols),
+      kind: "forRange", varName: dVar, start: cU32(0), bound: cU32(pCols),
       body: [{
         kind: "indexAssign",
         arrayName: binding,
-        idx: binOp("add", base, ref(dVar)),
+        idx: binOp("add", effectiveBase, ref(dVar)),
         value: arrayRead(blockName, ref(dVar)),
       }],
     });
@@ -2212,15 +2424,19 @@ function lowerBlockStore(stmt: BlockStoreStmt): Statement[] {
     // Multiple rows
     const rVar = freshVar("sr");
     const dVar = freshVar("sd");
+    const rowBase = binOp("add", base, binOp("mul", ref(rVar), stride));
+    const effRowBase = isDistributed
+      ? binOp("add", rowBase, binOp("mul", ref("_sub_idx"), cU32(pCols)))
+      : rowBase;
     storeBody.push({
       kind: "forRange", varName: rVar, start: cU32(0), bound: cU32(rows),
       body: [{
-        kind: "forRange", varName: dVar, start: cU32(0), bound: cU32(cols),
+        kind: "forRange", varName: dVar, start: cU32(0), bound: cU32(pCols),
         body: [{
           kind: "indexAssign",
           arrayName: binding,
-          idx: binOp("add", binOp("add", base, binOp("mul", ref(rVar), stride)), ref(dVar)),
-          value: arrayRead(blockName, binOp("add", binOp("mul", ref(rVar), cU32(cols)), ref(dVar))),
+          idx: binOp("add", effRowBase, ref(dVar)),
+          value: arrayRead(blockName, binOp("add", binOp("mul", ref(rVar), cU32(pCols)), ref(dVar))),
         }],
       }],
     });
@@ -2395,7 +2611,10 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
   const result: Statement[] = [];
   const innerDim = aCols; // = bCols (dimension being contracted)
   const outCols = bRows;  // B^T has bRows columns
-  const useVec4 = innerDim % 4 === 0;
+
+  // With TPR: A is distributed, each thread has physInnerDim elements
+  const physInnerDim = _activeTPR > 1 ? innerDim / _activeTPR : innerDim;
+  const useVec4 = physInnerDim % 4 === 0;
 
   if (aRows === 1) {
     // Scalar mode: single row of A
@@ -2406,11 +2625,19 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
     // var s: f32 = 0.0;
     jBody.push({ kind: "var", name: sVar, dtype: "f32", value: cF32(0) });
 
+    // B access base: j*bStride (+ _sub_idx*physInnerDim for TPR)
+    const bRowBase = (d: IRNode) => {
+      const base = binOp("add", binOp("mul", ref(jVar), cU32(bStride)), d);
+      return _activeTPR > 1
+        ? binOp("add", binOp("mul", ref("_sub_idx"), cU32(physInnerDim)), base)
+        : base;
+    };
+
     if (useVec4) {
-      // Vec4 path: s += dot(vec4(a[d4*4..+3]), vec4(b[j*bStride+d4*4..+3]))
+      // Vec4 path: partial inner loop over physInnerDim/4 vec4 dots
       const d4Var = freshVar("d4");
       jBody.push({
-        kind: "forRange", varName: d4Var, start: cU32(0), bound: cU32(innerDim / 4),
+        kind: "forRange", varName: d4Var, start: cU32(0), bound: cU32(physInnerDim / 4),
         body: [{
           kind: "addAssign",
           name: sVar,
@@ -2419,32 +2646,34 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
               arrayRead(aName, binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k))),
             ) as [IRNode, IRNode, IRNode, IRNode],
             [0, 1, 2, 3].map(k =>
-              sharedRead(bName, binOp("add",
-                binOp("add", binOp("mul", ref(jVar), cU32(bStride)), binOp("mul", ref(d4Var), cU32(4))),
-                cU32(k),
-              )),
+              sharedRead(bName, bRowBase(binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k)))),
             ) as [IRNode, IRNode, IRNode, IRNode],
           ),
         }],
       });
     } else {
-      // Scalar path: for d in 0..innerDim: s += a[d] * b_smem[j*bStride + d]
+      // Scalar path: for d in 0..physInnerDim
       const dVar = freshVar("d");
       jBody.push({
-        kind: "forRange", varName: dVar, start: cU32(0), bound: cU32(innerDim),
+        kind: "forRange", varName: dVar, start: cU32(0), bound: cU32(physInnerDim),
         body: [{
           kind: "addAssign",
           name: sVar,
           value: binOp("mul",
             arrayRead(aName, ref(dVar)),
-            sharedRead(bName, binOp("add", binOp("mul", ref(jVar), cU32(bStride)), ref(dVar))),
+            sharedRead(bName, bRowBase(ref(dVar))),
             "f32",
           ),
         }],
       });
     }
 
-    // Store to result
+    // Butterfly reduction across TPR threads (result becomes replicated)
+    if (_activeTPR > 1) {
+      jBody.push(...emitButterflyReduce(sVar, _activeTPR, "sum"));
+    }
+
+    // Store to result (replicated — all TPR threads write same value)
     if (accName) {
       jBody.push({
         kind: "indexAddAssign",
@@ -2466,7 +2695,7 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
       body: jBody,
     });
   } else {
-    // Multi-row mode (general case)
+    // Multi-row mode (general case — no TPR for multi-row)
     const rVar = freshVar("r");
     const jVar = freshVar("j");
     const sVar = freshVar("s");
@@ -2549,29 +2778,37 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
   const bStride = stmt.bSmemStride ?? bCols;  // padded stride for B in shared memory
   const result: Statement[] = [];
   const outCols = bCols;
-  const useVec4 = outCols % 4 === 0;
+
+  // With TPR: result is distributed, each thread handles physOutCols columns
+  const physOutCols = _activeTPR > 1 ? outCols / _activeTPR : outCols;
+  const useVec4 = physOutCols % 4 === 0;
 
   if (aRows === 1) {
     const jVar = freshVar("j");
     const pVar = freshVar("p");
 
     const jBody: Statement[] = [];
-    // let p = a[j];
+    // let p = a[j];  (A is replicated — all threads read same value)
     jBody.push({
       kind: "let", name: pVar, dtype: "f32",
       value: arrayRead(aName, ref(jVar)),
     });
 
+    // B access: j*bStride + (sub_idx*physOutCols + d) for distributed output
+    const bColBase = (d: IRNode) => {
+      const colIdx = _activeTPR > 1
+        ? binOp("add", binOp("mul", ref("_sub_idx"), cU32(physOutCols)), d)
+        : d;
+      return binOp("add", binOp("mul", ref(jVar), cU32(bStride)), colIdx);
+    };
+
     if (useVec4) {
-      // Vec4 path: for d4 in 0..outCols/4: result[d4*4+k] += p * b_smem[j*bStride+d4*4+k]
+      // Vec4 path: for d4 in 0..physOutCols/4
       const d4Var = freshVar("d4");
       const d4Body: Statement[] = [];
       for (let k = 0; k < 4; k++) {
         const regIdx = binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k));
-        const smemIdx = binOp("add",
-          binOp("add", binOp("mul", ref(jVar), cU32(bStride)), binOp("mul", ref(d4Var), cU32(4))),
-          cU32(k),
-        );
+        const smemIdx = bColBase(binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k)));
         d4Body.push({
           kind: "indexAddAssign",
           arrayName: resultName,
@@ -2580,21 +2817,21 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
         });
       }
       jBody.push({
-        kind: "forRange", varName: d4Var, start: cU32(0), bound: cU32(outCols / 4),
+        kind: "forRange", varName: d4Var, start: cU32(0), bound: cU32(physOutCols / 4),
         body: d4Body,
       });
     } else {
-      // Scalar path: for d in 0..bCols: result[d] += p * b_smem[j*bStride + d]
+      // Scalar path: for d in 0..physOutCols
       const dVar = freshVar("d");
       jBody.push({
-        kind: "forRange", varName: dVar, start: cU32(0), bound: cU32(outCols),
+        kind: "forRange", varName: dVar, start: cU32(0), bound: cU32(physOutCols),
         body: [{
           kind: "indexAddAssign",
           arrayName: resultName,
           idx: ref(dVar),
           value: binOp("mul",
             ref(pVar, "f32"),
-            sharedRead(bName, binOp("add", binOp("mul", ref(jVar), cU32(bStride)), ref(dVar))),
+            sharedRead(bName, bColBase(ref(dVar))),
             "f32",
           ),
         }],
@@ -2606,7 +2843,7 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
       body: jBody,
     });
   } else {
-    // Multi-row general case
+    // Multi-row general case (no TPR for multi-row)
     const rVar = freshVar("r");
     const jVar = freshVar("j");
     const dVar = freshVar("d");
@@ -2656,10 +2893,13 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
 function lowerBlockReduce(stmt: BlockReduceStmt): Statement[] {
   const { inputName, outputName, inputRows, inputCols, axis, op } = stmt;
   const result: Statement[] = [];
+  const inputLayout = _blockLayouts.get(inputName);
+  const isDistributed = _activeTPR > 1 && inputLayout === "distributed";
+  const physInputCols = isDistributed ? inputCols / _activeTPR : inputCols;
 
   // Unified axis reduction: axis=1 reduces columns [R×C]→[R×1], axis=0 reduces rows [R×C]→[1×C]
-  const outerDim = axis === 1 ? inputRows : inputCols;
-  const innerDim = axis === 1 ? inputCols : inputRows;
+  const outerDim = axis === 1 ? inputRows : (isDistributed ? physInputCols : inputCols);
+  const innerDim = axis === 1 ? physInputCols : inputRows;
   result.push({
     kind: "varArray", name: outputName, elemType: "f32", size: outerDim, skipZeroInit: true,
   });
@@ -2668,10 +2908,10 @@ function lowerBlockReduce(stmt: BlockReduceStmt): Statement[] {
   const innerVar = freshVar("ri");
   const initVal = op === "max" ? cF32(F32_NEG_MAX) : cF32(0);
 
-  // Input index: always row * cols + col
+  // Input index: row * physCols + col
   const rowRef = axis === 1 ? ref(outerVar) : ref(innerVar);
   const colRef = axis === 1 ? ref(innerVar) : ref(outerVar);
-  const inputIdx = binOp("add", binOp("mul", rowRef, cU32(inputCols)), colRef);
+  const inputIdx = binOp("add", binOp("mul", rowRef, cU32(physInputCols)), colRef);
   const accumExpr = binOp(op === "sum" ? "add" : "max",
     arrayRead(outputName, ref(outerVar)),
     arrayRead(inputName, inputIdx),
@@ -2684,6 +2924,23 @@ function lowerBlockReduce(stmt: BlockReduceStmt): Statement[] {
     kind: "forRange", varName: innerVar, start: cU32(0), bound: cU32(innerDim),
     body: [{ kind: "indexAssign", arrayName: outputName, idx: ref(outerVar), value: accumExpr }],
   });
+
+  // For distributed blocks with axis=1: cross-thread butterfly reduction
+  if (isDistributed && axis === 1) {
+    // After local reduce, output[r] has the partial sum/max for this thread's portion.
+    // Need to combine across TPR threads.
+    const tmpVar = freshVar("rv");
+    outerBody.push({
+      kind: "var", name: tmpVar, dtype: "f32",
+      value: arrayRead(outputName, ref(outerVar)),
+    });
+    outerBody.push(...emitButterflyReduce(tmpVar, _activeTPR, op === "sum" ? "sum" : "max"));
+    outerBody.push({
+      kind: "indexAssign", arrayName: outputName, idx: ref(outerVar),
+      value: ref(tmpVar, "f32"),
+    });
+  }
+
   result.push({
     kind: "forRange", varName: outerVar, start: cU32(0), bound: cU32(outerDim),
     body: outerBody,
@@ -2697,7 +2954,8 @@ function lowerBlockReduce(stmt: BlockReduceStmt): Statement[] {
  */
 function lowerBlockUnary(stmt: BlockUnaryStmt): Statement[] {
   const { inputName, outputName, rows, cols, op, inPlace } = stmt;
-  const size = rows * cols;
+  const pCols = getPhysCols(inPlace ? outputName : inputName, cols);
+  const size = rows * pCols;
   const result: Statement[] = [];
 
   // Allocate output if not in-place
@@ -2737,7 +2995,9 @@ function lowerBlockBinary(stmt: BlockBinaryStmt): Statement[] {
   const { aName, bName, outputName, aRows, aCols, bRows, bCols, op, inPlace, bScalarExpr } = stmt;
   const outRows = Math.max(aRows, bRows);
   const outCols = Math.max(aCols, bCols);
-  const outSize = outRows * outCols;
+  // Use physical size for distributed output blocks
+  const physOutCols = getPhysCols(outputName, outCols);
+  const outSize = outRows * physOutCols;
   const result: Statement[] = [];
 
   // Allocate output if not in-place
