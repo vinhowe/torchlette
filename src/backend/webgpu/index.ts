@@ -143,10 +143,19 @@ export {
   type BindingSpec,
   type DataType,
   type UniformType,
+  type BlockPtr,
+  type BlockCoopPtr,
+  type BlockThreadPtr,
+  type BlockLoadOpts,
+  type BlockStorePtr,
   KernelContext,
+  Block,
   elementwiseGrid,
+  perRowGrid,
   ceilDivGrid,
   singleWorkgroup,
+  elementwiseKernel,
+  perRowKernel,
 } from "./tile-ir";
 export { compileTileKernel } from "./tile-compiler";
 export { createTileKernelDispatcher, type TileKernelInstance } from "./tile-dispatch";

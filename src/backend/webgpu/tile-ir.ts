@@ -28,11 +28,15 @@
 
 import {
   BlockOps, Block, TileRange, buildPtr, buildMask,
+  type BlockPtr, type BlockThreadPtr, type BlockCoopPtr,
+  type BlockLoadOpts, type BlockStorePtr,
 } from "./tile-ops";
 
 // Re-export tile-ops types so kernel authors only need one import
 export {
   BlockOps, Block, TileRange, buildPtr, buildMask,
+  type BlockPtr, type BlockThreadPtr, type BlockCoopPtr,
+  type BlockLoadOpts, type BlockStorePtr,
 } from "./tile-ops";
 import { F32_NEG_MAX, F32_POS_MAX, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 
@@ -2300,6 +2304,28 @@ export class KernelContext {
     this._requireOps().storeTile(binding, block, ptr, mask);
   }
 
+  // ---- Unified Block API (delegates to BlockOps) ----
+
+  /** Block dot product: returns new result block. ≈ tl.dot(a, b) */
+  dot(a: Block, b: Block): Block {
+    return this._requireOps().dot(a, b);
+  }
+
+  /** Unified tile load: ptr type determines register vs shared placement. ≈ tl.load(ptr, mask) */
+  tileLoad(binding: string, ptr: BlockPtr, opts: BlockLoadOpts): Block {
+    return this._requireOps().load(binding, ptr, opts);
+  }
+
+  /** Store register tile to global memory. ≈ tl.store(ptr, block, mask) */
+  tileStore(binding: string, block: Block, ptr: BlockStorePtr, opts?: { guard?: BlockExpr }): void {
+    this._requireOps().store(binding, block, ptr, opts);
+  }
+
+  /** Load from strided layout: combined stridedIndex + load. */
+  stridedLoad(binding: string, flatIdx: BlockExpr, indexShape: number[], strides: number[], baseOffset = 0): BlockExpr {
+    return this.load(binding, this.stridedIndex(flatIdx, indexShape, strides, baseOffset));
+  }
+
 }
 
 // ============================================================================
@@ -2422,6 +2448,107 @@ export function productGrid(...uniformNames: string[]): GridFn {
     let total = 1;
     for (const name of uniformNames) total *= u[name];
     return [total];
+  };
+}
+
+// ============================================================================
+// Kernel Factories
+// ============================================================================
+
+const DEFAULT_WG = 256;
+
+/**
+ * Factory for elementwise 1-thread-per-element kernels.
+ * Absorbs the workgroupSize + elementwiseGrid + elementIndex boilerplate.
+ *
+ * Automatically provides: workgroupSize (256), `size` uniform (u32),
+ * elementwiseGrid, and bounds-checked element index.
+ *
+ * ```typescript
+ * const spec = elementwiseKernel({
+ *   name: "fill",
+ *   bindings: { out: { storage: "read_write", type: "f32" } },
+ *   uniforms: { value: "f32" },
+ *   kernel(ctx, idx) {
+ *     ctx.emitStore("out", idx, ctx.uniform("value"));
+ *   },
+ * });
+ * ```
+ */
+export function elementwiseKernel(config: {
+  name: string;
+  bindings: Record<string, BindingSpec>;
+  uniforms?: Record<string, UniformType>;
+  enableF16?: boolean;
+  constants?: Record<string, number>;
+  /** Override the element count uniform name (default: "size"). */
+  sizeUniform?: string;
+  kernel: (ctx: KernelContext, idx: BlockExpr) => void;
+}): TileKernelSpec {
+  const sizeU = config.sizeUniform ?? "size";
+  return {
+    name: config.name,
+    workgroupSize: DEFAULT_WG,
+    bindings: config.bindings,
+    uniforms: { [sizeU]: "u32" as UniformType, ...config.uniforms },
+    enableF16: config.enableF16,
+    constants: config.constants,
+    grid: elementwiseGrid(DEFAULT_WG, { elementUniform: sizeU }),
+    kernel(ctx) {
+      const idx = ctx.elementIndex(DEFAULT_WG, sizeU);
+      config.kernel(ctx, idx);
+    },
+  };
+}
+
+/**
+ * Factory for per-row reduction kernels (1 workgroup per row).
+ * Absorbs the perRowGrid + row/tid/D/base setup boilerplate.
+ *
+ * Automatically provides: workgroupSize (256), `num_rows` + `feature_dim` uniforms,
+ * perRowGrid, and computed row/tid/D/base values.
+ *
+ * ```typescript
+ * const spec = perRowKernel({
+ *   name: "softmax",
+ *   bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+ *   kernel(ctx, row, tid, D, base) {
+ *     const maxVal = ctx.wgReduce("max", tid, D, 256, (i) => ctx.load("input", base.add(i)));
+ *     // ...
+ *   },
+ * });
+ * ```
+ */
+export function perRowKernel(config: {
+  name: string;
+  bindings: Record<string, BindingSpec>;
+  uniforms?: Record<string, UniformType>;
+  enableF16?: boolean;
+  constants?: Record<string, number>;
+  /** Override the row count uniform name (default: "num_rows"). */
+  rowUniform?: string;
+  /** Override the feature dim uniform name (default: "feature_dim"). */
+  dimUniform?: string;
+  kernel: (ctx: KernelContext, row: BlockExpr, tid: BlockExpr,
+           D: BlockExpr, base: BlockExpr) => void;
+}): TileKernelSpec {
+  const rowU = config.rowUniform ?? "num_rows";
+  const dimU = config.dimUniform ?? "feature_dim";
+  return {
+    name: config.name,
+    workgroupSize: DEFAULT_WG,
+    bindings: config.bindings,
+    uniforms: { [rowU]: "u32" as UniformType, [dimU]: "u32" as UniformType, ...config.uniforms },
+    enableF16: config.enableF16,
+    constants: config.constants,
+    grid: perRowGrid(rowU),
+    kernel(ctx) {
+      const row  = ctx.programId(0);
+      const tid  = ctx.localIndex();
+      const D    = ctx.uniform(dimU);
+      const base = row.mul(D);
+      config.kernel(ctx, row, tid, D, base);
+    },
   };
 }
 
