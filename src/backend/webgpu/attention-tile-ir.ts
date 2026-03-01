@@ -196,11 +196,7 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
         const oBase = bhOff.add(qRow.mul(Dim));
         ctx.range(0, D4_COUNT, (d4) => {
           const v = oAcc.read(d4).vec4MulScalar(invL);
-          const off = oBase.add(d4Start.add(d4).mul(ctx.u32(4)));
-          ctx.emitStore("O", off, v.vec4Component(0));
-          ctx.emitStore("O", off.add(ctx.u32(1)), v.vec4Component(1));
-          ctx.emitStore("O", off.add(ctx.u32(2)), v.vec4Component(2));
-          ctx.emitStore("O", off.add(ctx.u32(3)), v.vec4Component(3));
+          ctx.vec4Store("O", oBase.add(d4Start.add(d4).mul(ctx.u32(4))), v);
         });
 
         // Only one thread per row writes L
@@ -434,11 +430,7 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
         const base = bhOff.add(qRow.mul(Dim));
         ctx.range(0, D4_COUNT, (d4) => {
           const v = dqAcc.read(d4).vec4MulScalar(scale);
-          const off = base.add(d4Start.add(d4).mul(ctx.u32(4)));
-          ctx.emitStore("dQ", off, v.vec4Component(0));
-          ctx.emitStore("dQ", off.add(ctx.u32(1)), v.vec4Component(1));
-          ctx.emitStore("dQ", off.add(ctx.u32(2)), v.vec4Component(2));
-          ctx.emitStore("dQ", off.add(ctx.u32(3)), v.vec4Component(3));
+          ctx.vec4Store("dQ", base.add(d4Start.add(d4).mul(ctx.u32(4))), v);
         });
       });
     },
@@ -629,16 +621,8 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
         const base = bhOff.add(kvRow.mul(Dim));
         ctx.range(0, D4_COUNT, (d4) => {
           const off = base.add(d4Start.add(d4).mul(ctx.u32(4)));
-          const dk = dkAcc.read(d4);
-          ctx.emitStore("dK", off, dk.vec4Component(0));
-          ctx.emitStore("dK", off.add(ctx.u32(1)), dk.vec4Component(1));
-          ctx.emitStore("dK", off.add(ctx.u32(2)), dk.vec4Component(2));
-          ctx.emitStore("dK", off.add(ctx.u32(3)), dk.vec4Component(3));
-          const dv = dvAcc.read(d4);
-          ctx.emitStore("dV", off, dv.vec4Component(0));
-          ctx.emitStore("dV", off.add(ctx.u32(1)), dv.vec4Component(1));
-          ctx.emitStore("dV", off.add(ctx.u32(2)), dv.vec4Component(2));
-          ctx.emitStore("dV", off.add(ctx.u32(3)), dv.vec4Component(3));
+          ctx.vec4Store("dK", off, dkAcc.read(d4));
+          ctx.vec4Store("dV", off, dvAcc.read(d4));
         });
       });
     },

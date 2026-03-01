@@ -31,38 +31,6 @@ function fixedElementGrid(workgroupSize: number, elements: number): (u: Record<s
 }
 
 // ============================================================================
-// Broadcast Index Helper
-// ============================================================================
-
-/**
- * Compute the linear offset into a storage buffer given a flat output index
- * and effective broadcast strides. Coordinates are decomposed from the flat
- * index using indexShape, then each coordinate is multiplied by its stride.
- *
- * Broadcast dimensions have stride=0, and the constant folder eliminates
- * the coord*0 term automatically.
- *
- * @param ctx        - KernelContext
- * @param flatIdx    - The flat output index
- * @param indexShape - Broadcast output shape (with leading 1s removed)
- * @param strides    - Effective broadcast strides for this input
- * @param offset     - Buffer offset for this input
- * @param prefix     - Prefix for let binding names (must be unique per input)
- */
-function buildStridedOffset(
-  ctx: KernelContext,
-  flatIdx: BlockExpr,
-  indexShape: number[],
-  strides: number[],
-  offset: number,
-  _prefix: string,
-): BlockExpr {
-  const rank = indexShape.length;
-  if (rank === 0) return ctx.u32(offset);
-  return ctx.stridedIndex(flatIdx, indexShape, strides, offset);
-}
-
-// ============================================================================
 // Fill Kernel
 // ============================================================================
 
@@ -79,8 +47,7 @@ export function fillWGSL(): string {
     },
     grid: elementwiseGrid(WG, { elementUniform: "size" }),
     kernel(ctx) {
-      const idx = ctx.globalId(0);
-      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG);
       ctx.emitStore("out", idx, ctx.uniform("value"));
     },
   };
@@ -105,8 +72,7 @@ export function arangeWGSL(): string {
     },
     grid: elementwiseGrid(WG, { elementUniform: "size" }),
     kernel(ctx) {
-      const idx = ctx.globalId(0);
-      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG);
       const val = ctx.uniform("start").add(idx.toF32().mul(ctx.uniform("step")));
       ctx.emitStore("out", idx, val);
     },
@@ -134,8 +100,7 @@ export function triangularWGSL(upper: boolean): string {
     },
     grid: elementwiseGrid(WG, { elementUniform: "num_elements" }),
     kernel(ctx) {
-      const idx = ctx.globalId(0);
-      ctx.ifThen(idx.ge(ctx.uniform("num_elements")), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG, "num_elements");
       const W = ctx.uniform("W");
       const row = idx.div(W).mod(ctx.uniform("H")).toI32();
       const col = idx.mod(W).toI32();
@@ -189,11 +154,10 @@ export function comparisonWGSL(
     uniforms: { size: "u32" },
     grid: elementwiseGrid(WG, { elementUniform: "size" }),
     kernel(ctx) {
-      const idx = ctx.globalId(0);
-      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG);
 
-      const aOff = buildStridedOffset(ctx, idx, indexShape, aStrides, aOffset, "ao");
-      const bOff = buildStridedOffset(ctx, idx, indexShape, bStrides, bOffset, "bo");
+      const aOff = ctx.stridedIndex(idx, indexShape, aStrides, aOffset);
+      const bOff = ctx.stridedIndex(idx, indexShape, bStrides, bOffset);
 
       const aVal = ctx.load("a", aOff);
       const bVal = ctx.load("b", bOff);
@@ -241,8 +205,7 @@ export function argReduceWGSL(
     },
     grid: elementwiseGrid(WG, { elementUniform: "outSize" }),
     kernel(ctx) {
-      const outIdx = ctx.globalId(0);
-      ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
+      const outIdx = ctx.elementIndex(WG, "outSize");
 
       // Compute base offset in input (with reduce dim = 0)
       // Decompose outIdx into output coordinates, map to input strides
@@ -308,12 +271,11 @@ export function whereSpec(
     uniforms: { size: "u32" },
     grid: elementwiseGrid(WG, { elementUniform: "size" }),
     kernel(ctx) {
-      const idx = ctx.globalId(0);
-      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG);
 
-      const condOff = buildStridedOffset(ctx, idx, indexShape, condStrides, condOffset, "co");
-      const xOff = buildStridedOffset(ctx, idx, indexShape, xStrides, xOffset, "xo");
-      const yOff = buildStridedOffset(ctx, idx, indexShape, yStrides, yOffset, "yo");
+      const condOff = ctx.stridedIndex(idx, indexShape, condStrides, condOffset);
+      const xOff = ctx.stridedIndex(idx, indexShape, xStrides, xOffset);
+      const yOff = ctx.stridedIndex(idx, indexShape, yStrides, yOffset);
 
       const condVal = ctx.load("cond", condOff);
       const xVal = ctx.load("x", xOff);
@@ -379,8 +341,8 @@ export function binaryBroadcastSpec(
     kernel(ctx) {
       const idx = ctx.elementIndex(WG);
 
-      const aOff = buildStridedOffset(ctx, idx, indexShape, aStrides, aOffset, "ao");
-      const bOff = buildStridedOffset(ctx, idx, indexShape, bStrides, bOffset, "bo");
+      const aOff = ctx.stridedIndex(idx, indexShape, aStrides, aOffset);
+      const bOff = ctx.stridedIndex(idx, indexShape, bStrides, bOffset);
 
       const aVal = ctx.load("a", aOff);
       const bVal = ctx.load("b", bOff);
@@ -434,7 +396,7 @@ export function unaryStridedSpec(
     kernel(ctx) {
       const idx = ctx.elementIndex(WG);
 
-      const inputOff = buildStridedOffset(ctx, idx, shape, strides, offset, "in");
+      const inputOff = ctx.stridedIndex(idx, shape, strides, offset);
       const val = ctx.load("a", inputOff);
       const result = applyFusedOp(ctx, opKey, [val]);
       ctx.emitStore("out", idx, result);
@@ -488,7 +450,7 @@ export function castSpec(
     kernel(ctx) {
       const idx = ctx.elementIndex(WG);
 
-      const inputOff = buildStridedOffset(ctx, idx, shape, strides, offset, "in");
+      const inputOff = ctx.stridedIndex(idx, shape, strides, offset);
       const val = ctx.load("a", inputOff);
       const result = srcDtype === dstDtype ? val : applyFusedOp(ctx, castOp, [val]);
       ctx.emitStore("out", idx, result);
@@ -537,7 +499,7 @@ export function contiguousTileIR(
     kernel(ctx) {
       const idx = ctx.elementIndex(WG);
 
-      const inputOff = buildStridedOffset(ctx, idx, shape, strides, offset, "in");
+      const inputOff = ctx.stridedIndex(idx, shape, strides, offset);
       ctx.emitStore("out", idx, ctx.load("input", inputOff));
     },
   };
@@ -1173,8 +1135,7 @@ export function randWGSL(): string {
     },
     grid: elementwiseGrid(WG, { elementUniform: "size" }),
     kernel(ctx) {
-      const idx = ctx.globalId(0);
-      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG);
       ctx.emitStore("out", idx, ctx.randF32(ctx.uniform("seed"), idx));
     },
   };
@@ -1242,8 +1203,7 @@ export function bernoulliWGSL(): string {
     },
     grid: elementwiseGrid(WG, { elementUniform: "size" }),
     kernel(ctx) {
-      const idx = ctx.globalId(0);
-      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      const idx = ctx.elementIndex(WG);
       const u = ctx.randF32(ctx.uniform("seed"), idx);
       ctx.emitStore("out", idx, u.lt(ctx.uniform("prob")).select(ctx.f32(1.0), ctx.f32(0.0)));
     },
