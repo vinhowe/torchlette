@@ -16,3 +16,19 @@ export {
   type GradScalerOptions,
 } from "./optim";
 export * as nn from "./nn";
+
+// Tile-IR custom kernel API
+export {
+  type TileKernelSpec,
+  type BindingSpec,
+  type DataType,
+  type UniformType,
+  KernelContext,
+  elementwiseGrid,
+  ceilDivGrid,
+  singleWorkgroup,
+  compileTileKernel,
+  createTileKernelDispatcher,
+  type TileKernelInstance,
+} from "./backend/webgpu";
+

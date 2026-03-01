@@ -23,3 +23,18 @@ export {
   torch,
 } from "./frontend";
 export { Adam, type AdamOptions, SGD, type SGDOptions } from "./optim";
+
+// Tile-IR custom kernel API
+export {
+  type TileKernelSpec,
+  type BindingSpec,
+  type DataType,
+  type UniformType,
+  KernelContext,
+  elementwiseGrid,
+  ceilDivGrid,
+  singleWorkgroup,
+  compileTileKernel,
+  createTileKernelDispatcher,
+  type TileKernelInstance,
+} from "./backend/webgpu";
