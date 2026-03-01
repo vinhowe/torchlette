@@ -32,8 +32,6 @@ export {
   type UniformType,
   KernelContext,
   elementwiseGrid,
-  ceilDivGrid,
-  singleWorkgroup,
   compileTileKernel,
   createTileKernelDispatcher,
   type TileKernelInstance,
