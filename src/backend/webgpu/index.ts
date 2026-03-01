@@ -56,6 +56,7 @@ export {
   addReplayPinnedBuffers,
 } from "./dispatch-recording";
 
+export type { BufferArena } from "./buffer-arena";
 export {
   arenaBufferSet, pinnedOutputBuffers,
   allocateOutputBuffer, donateBuffer, getBufferSize,
