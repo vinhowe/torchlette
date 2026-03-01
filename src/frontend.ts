@@ -77,18 +77,6 @@ export type {
 
 // Import extracted modules
 import {
-  tensorFromArrayImpl,
-  randImpl,
-  randnImpl,
-  bernoulliImpl,
-  zerosImpl,
-  onesImpl,
-  fullImpl,
-  arangeImpl,
-  trilImpl,
-  triuImpl,
-} from "./frontend-creation";
-import {
   autocastImpl,
   autocastAsyncImpl,
   savedTensorHooksImpl,
@@ -342,7 +330,7 @@ export class Torchlette {
   }
 
   // ============================================================================
-  // Creation ops — delegated to frontend-creation.ts
+  // Creation ops
   // ============================================================================
 
   tensorFromArray(
@@ -350,43 +338,48 @@ export class Torchlette {
     shape: number[],
     options?: TensorCreateOptions,
   ): Tensor {
-    return tensorFromArrayImpl(this, values, shape, options);
+    return this._wrap(this.runtime.tensorFromArray(values, shape, options?.device), options?.requiresGrad ?? false);
   }
 
   rand(shape: number[], options?: TensorCreateOptions): Tensor {
-    return randImpl(this, shape, options);
+    return this._wrap(this.runtime.rand(shape, options?.device), options?.requiresGrad ?? false);
   }
 
   randn(shape: number[], options?: TensorCreateOptions): Tensor {
-    return randnImpl(this, shape, options);
+    return this._wrap(this.runtime.randn(shape, options?.device), options?.requiresGrad ?? false);
   }
 
   bernoulli(shape: number[], p = 0.5, options?: TensorCreateOptions): Tensor {
-    return bernoulliImpl(this, shape, p, options);
+    if (p < 0 || p > 1) throw new Error(`Bernoulli probability must be between 0 and 1, got ${p}`);
+    return this._wrap(this.runtime.bernoulli(shape, p, options?.device), options?.requiresGrad ?? false);
   }
 
   zeros(shape: number[], options?: TensorCreateOptions): Tensor {
-    return zerosImpl(this, shape, options);
+    return this._wrap(this.runtime.zeros(shape, options?.device), options?.requiresGrad ?? false);
   }
 
   ones(shape: number[], options?: TensorCreateOptions): Tensor {
-    return onesImpl(this, shape, options);
+    return this.full(shape, 1, options);
   }
 
   full(shape: number[], fillValue: number, options?: TensorCreateOptions): Tensor {
-    return fullImpl(this, shape, fillValue, options);
+    return this._wrap(this.runtime.full(shape, fillValue, options?.device), options?.requiresGrad ?? false);
   }
 
   arange(end: number, options?: { start?: number; step?: number; device?: DeviceKind; requiresGrad?: boolean }): Tensor {
-    return arangeImpl(this, end, options);
+    const start = options?.start ?? 0;
+    const step = options?.step ?? 1;
+    return this._wrap(this.runtime.arange(end, start, step, options?.device), options?.requiresGrad ?? false);
   }
 
   tril(a: Tensor, k = 0): Tensor {
-    return trilImpl(this, a, k);
+    this._assertUsable(a);
+    return this._wrap(this.runtime.tril(a._unwrap(), k), false);
   }
 
   triu(a: Tensor, k = 0): Tensor {
-    return triuImpl(this, a, k);
+    this._assertUsable(a);
+    return this._wrap(this.runtime.triu(a._unwrap(), k), false);
   }
 
   // ============================================================================

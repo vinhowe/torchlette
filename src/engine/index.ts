@@ -27,7 +27,7 @@ export {
   withBackend,
 } from "../backend/registry";
 export type { Backend, BackendOps } from "../backend/types";
-export type { RuntimeEngineOptions } from "../runtime/engine-types";
+export type { RuntimeEngineOptions } from "../runtime/engine";
 export { RuntimeEngine } from "../runtime/engine";
 export {
   add as runtimeAdd,
@@ -46,7 +46,6 @@ export {
   sum as runtimeSum,
   tensorFromArray as runtimeTensorFromArray,
   transpose as runtimeTranspose,
-  view as runtimeView,
 } from "../runtime/engine-facade";
 export type { BaseId } from "../runtime/tensor";
 export { Tensor as RuntimeTensor } from "../runtime/tensor";

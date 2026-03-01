@@ -52,19 +52,7 @@ import {
   type MemoryPlanningStats,
 } from "../engine/memory-planned-executor";
 import { type BaseId, createBaseId, materializePendingTensors, Tensor } from "./tensor";
-import {
-  type DispatchMode,
-  IntermediateTrackingMode,
-  type OpInput,
-  type RuntimeEngineOptions,
-} from "./engine-types";
-import {
-  broadcastShapes,
-  broadcastThreeShapes,
-  matmulShape,
-  reduceShape,
-  transposeShape,
-} from "./shape-helpers";
+import { broadcastShapes } from "../core/shape";
 import {
   extractAttentionDKOp,
   extractAttentionDVOp,
@@ -82,12 +70,93 @@ import {
   fusedRMSNormBackwardGradWeightOp,
 } from "./engine-fused";
 
-// Re-export types and shape helpers for backward compatibility.
-// NOTE: engine-facade.ts is NOT re-exported here to avoid circular dependencies
-// (facade imports RuntimeEngine from this file). Facade functions are re-exported
-// via src/engine/index.ts barrel instead.
-export * from "./engine-types";
-export * from "./shape-helpers";
+// ── Engine types (merged from engine-types.ts) ─────────────────────────────
+/** A tensor or a numeric scalar (will be inlined as a constant in fused kernels). */
+export type TensorOrScalar = Tensor | number;
+
+/** Lightweight reference to a lazy computation with shape/dtype metadata. */
+export type OpInput = Pick<Tensor, "lazyRef" | "shape" | "dtype" | "device">;
+
+/** Dispatch mode: receives notifications when RuntimeTensors are created or escape a scope. */
+export interface DispatchMode {
+  onTensorCreated(tensor: Tensor): void;
+  onTensorEscaped?(tensor: Tensor): void;
+}
+
+/** Dispatch mode that tracks RuntimeTensors created within a tidy scope. */
+export class TidyDispatchMode implements DispatchMode {
+  readonly tracked = new Set<Tensor>();
+  readonly escaped = new Set<Tensor>();
+  onTensorCreated(tensor: Tensor): void { this.tracked.add(tensor); }
+  onTensorEscaped(tensor: Tensor): void { this.escaped.add(tensor); }
+  disposeNonEscaped(): void {
+    for (const t of this.tracked) {
+      if (!this.escaped.has(t) && !t.disposed) t.dispose();
+    }
+  }
+}
+
+export interface RuntimeEngineOptions {
+  enableMemoryPlanning?: boolean;
+  enableDonation?: boolean;
+  trackStats?: boolean;
+  enableFusion?: boolean;
+  enableVectorization?: boolean;
+  enableEarlyRelease?: boolean;
+  enableCheckpointSegmentation?: boolean;
+  enableTrueSegmentation?: boolean;
+}
+
+/** Internal dispatch mode used by startIntermediateTracking/stopIntermediateTracking. */
+export class IntermediateTrackingMode implements DispatchMode {
+  readonly tracked = new Set<Tensor>();
+  onTensorCreated(tensor: Tensor): void { this.tracked.add(tensor); }
+}
+
+// ── Shape helpers (merged from shape-helpers.ts) ────────────────────────────
+export { broadcastShapes };
+
+export function matmulShape(a: number[], b: number[]): number[] {
+  if (a.length < 1 || b.length < 1) throw new Error("matmul requires at least 1D tensors");
+  if (a.length === 1 && b.length === 1) return [];
+  if (a.length === 1) return [...b.slice(0, -2), b[b.length - 1]];
+  if (b.length === 1) return a.slice(0, -1);
+  const m = a[a.length - 2];
+  const n = b[b.length - 1];
+  const batch = broadcastShapes(a.slice(0, -2), b.slice(0, -2));
+  return [...batch, m, n];
+}
+
+export function transposeShape(shape: number[], options: TransposeOptions): number[] {
+  const result = shape.slice();
+  const temp = result[options.dim0];
+  result[options.dim0] = result[options.dim1];
+  result[options.dim1] = temp;
+  return result;
+}
+
+export function reduceShape(shape: number[], dim: number | number[] | null | undefined, keepdim: boolean): number[] {
+  if (dim == null) return keepdim ? shape.map(() => 1) : [];
+  const dims = Array.isArray(dim) ? dim : [dim];
+  const normalizedDims = dims.map((d) => (d < 0 ? shape.length + d : d));
+  if (keepdim) return shape.map((s, i) => (normalizedDims.includes(i) ? 1 : s));
+  return shape.filter((_, i) => !normalizedDims.includes(i));
+}
+
+export function broadcastThreeShapes(a: number[], b: number[], c: number[]): number[] {
+  const outRank = Math.max(a.length, b.length, c.length);
+  const out = new Array<number>(outRank);
+  for (let i = 0; i < outRank; i++) {
+    const aDim = a[a.length - 1 - i] ?? 1;
+    const bDim = b[b.length - 1 - i] ?? 1;
+    const cDim = c[c.length - 1 - i] ?? 1;
+    if (aDim !== bDim && aDim !== 1 && bDim !== 1) throw new Error(`Cannot broadcast shapes [${a}], [${b}], and [${c}]`);
+    if (aDim !== cDim && aDim !== 1 && cDim !== 1) throw new Error(`Cannot broadcast shapes [${a}], [${b}], and [${c}]`);
+    if (bDim !== cDim && bDim !== 1 && cDim !== 1) throw new Error(`Cannot broadcast shapes [${a}], [${b}], and [${c}]`);
+    out[outRank - 1 - i] = Math.max(aDim, bDim, cDim);
+  }
+  return out;
+}
 
 /** Build a cast LazyRef without creating a Tensor (no lifecycle, no registration). */
 function castRef(input: OpInput, toDtype: DType): OpInput {
