@@ -64,7 +64,7 @@ export type ReductionEpilogueOpDesc = {
 };
 
 /** Config for the unified reduction spec factory. */
-interface ReductionConfig {
+export interface ReductionConfig {
   reduceOp: ReduceOp;
   /** undefined = full reduction (single scalar output). */
   dim?: DimInfo;
@@ -245,7 +245,7 @@ function outBindingType(dtype: DType): DataType {
  *
  * All preamble/epilogue/reduce-op combinations compose cleanly.
  */
-function makeReductionSpec(config: ReductionConfig): TileKernelSpec {
+export function makeReductionSpec(config: ReductionConfig): TileKernelSpec {
   const { reduceOp, dim, preamble, epilogue } = config;
 
   // --- Name ---
@@ -395,7 +395,7 @@ function makeReductionSpec(config: ReductionConfig): TileKernelSpec {
 // Helper: build DimInfo from positional args
 // ============================================================================
 
-function dimInfo(
+export function dimInfo(
   inputShape: number[], inputStrides: number[],
   normalizedDims: number[], outShape: number[],
   outStrides: number[], inputToOutDim: number[],
@@ -403,60 +403,6 @@ function dimInfo(
 ): DimInfo {
   return { inputShape, inputStrides, normalizedDims, outShape,
     outStrides, inputToOutDim, parallel };
-}
-
-// ============================================================================
-// Public Exports: Thin Wrappers
-// ============================================================================
-
-// --- Basic reductions ---
-
-export function makeSumDimSpec(
-  inputShape: number[], inputStrides: number[],
-  normalizedDims: number[], outShape: number[], outStrides: number[],
-  inputToOutDim: number[], parallel: boolean,
-): TileKernelSpec {
-  return makeReductionSpec({
-    reduceOp: "sum",
-    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape,
-      outStrides, inputToOutDim, parallel),
-  });
-}
-
-export function makeSumFullSpec(): TileKernelSpec {
-  return makeReductionSpec({ reduceOp: "sum" });
-}
-
-export function makeMaxDimSpec(
-  inputShape: number[], inputStrides: number[],
-  normalizedDims: number[], outShape: number[], outStrides: number[],
-  inputToOutDim: number[], parallel: boolean,
-): TileKernelSpec {
-  return makeReductionSpec({
-    reduceOp: "max",
-    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape,
-      outStrides, inputToOutDim, parallel),
-  });
-}
-
-export function makeMaxFullSpec(): TileKernelSpec {
-  return makeReductionSpec({ reduceOp: "max" });
-}
-
-export function makeMinDimSpec(
-  inputShape: number[], inputStrides: number[],
-  normalizedDims: number[], outShape: number[], outStrides: number[],
-  inputToOutDim: number[], parallel: boolean,
-): TileKernelSpec {
-  return makeReductionSpec({
-    reduceOp: "min",
-    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape,
-      outStrides, inputToOutDim, parallel),
-  });
-}
-
-export function makeMinFullSpec(): TileKernelSpec {
-  return makeReductionSpec({ reduceOp: "min" });
 }
 
 // --- Mean division (elementwise, not a reduction) ---
@@ -477,145 +423,6 @@ export function makeMeanDivSpec(): TileKernelSpec {
       ctx.emitStore("out", idx, ctx.load("input", idx).div(ctx.uniform("count")));
     },
   };
-}
-
-// --- Sum with preamble (single op) ---
-
-export function makeSumDimWithPreambleSpec(
-  preambleOp: string, arity: number,
-  inputShape: number[], inputStrides: number[],
-  normalizedDims: number[], outShape: number[], outStrides: number[],
-  inputToOutDim: number[],
-): TileKernelSpec {
-  return makeReductionSpec({
-    reduceOp: "sum",
-    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape,
-      outStrides, inputToOutDim, false),
-    preamble: {
-      chainOps: [{ op: preambleOp, arity }],
-      totalInputs: arity,
-      inputDtypes: [],
-    },
-  });
-}
-
-export function makeSumFullWithPreambleSpec(
-  preambleOp: string, arity: number,
-): TileKernelSpec {
-  return makeReductionSpec({
-    reduceOp: "sum",
-    preamble: {
-      chainOps: [{ op: preambleOp, arity }],
-      totalInputs: arity,
-      inputDtypes: [],
-    },
-  });
-}
-
-// --- Sum with preamble chain ---
-
-export function makeSumDimWithPreambleChainSpec(
-  chainOps: PreambleChainKernelOp[], totalExternalInputs: number,
-  inputDtypes: DType[],
-  inputShape: number[], inputStrides: number[],
-  normalizedDims: number[], outShape: number[], outStrides: number[],
-  inputToOutDim: number[], parallel: boolean,
-): TileKernelSpec {
-  return makeReductionSpec({
-    reduceOp: "sum",
-    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape,
-      outStrides, inputToOutDim, parallel),
-    preamble: { chainOps, totalInputs: totalExternalInputs, inputDtypes },
-  });
-}
-
-export function makeSumFullWithPreambleChainSpec(
-  chainOps: PreambleChainKernelOp[], totalExternalInputs: number,
-  inputDtypes: DType[],
-): TileKernelSpec {
-  return makeReductionSpec({
-    reduceOp: "sum",
-    preamble: { chainOps, totalInputs: totalExternalInputs, inputDtypes },
-  });
-}
-
-// --- Reduction with epilogue ---
-
-export function makeSumDimWithEpilogueSpec(
-  inputShape: number[], inputStrides: number[],
-  normalizedDims: number[], outShape: number[], outStrides: number[],
-  inputToOutDim: number[], parallel: boolean,
-  epilogueOps: ReductionEpilogueOpDesc[], outputDtype: DType,
-): TileKernelSpec {
-  return makeReductionSpec({
-    reduceOp: "sum",
-    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape,
-      outStrides, inputToOutDim, parallel),
-    epilogue: { ops: epilogueOps, outputDtype },
-  });
-}
-
-export function makeSumFullWithEpilogueSpec(
-  epilogueOps: ReductionEpilogueOpDesc[], outputDtype: DType,
-): TileKernelSpec {
-  return makeReductionSpec({
-    reduceOp: "sum",
-    epilogue: { ops: epilogueOps, outputDtype },
-  });
-}
-
-export function makeMaxDimWithEpilogueSpec(
-  inputShape: number[], inputStrides: number[],
-  normalizedDims: number[], outShape: number[], outStrides: number[],
-  inputToOutDim: number[], parallel: boolean,
-  epilogueOps: ReductionEpilogueOpDesc[], outputDtype: DType,
-): TileKernelSpec {
-  return makeReductionSpec({
-    reduceOp: "max",
-    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape,
-      outStrides, inputToOutDim, parallel),
-    epilogue: { ops: epilogueOps, outputDtype },
-  });
-}
-
-export function makeMaxFullWithEpilogueSpec(
-  epilogueOps: ReductionEpilogueOpDesc[], outputDtype: DType,
-): TileKernelSpec {
-  return makeReductionSpec({
-    reduceOp: "max",
-    epilogue: { ops: epilogueOps, outputDtype },
-  });
-}
-
-// --- Sum with preamble chain + epilogue ---
-
-export function makeSumDimWithPreambleEpilogueSpec(
-  chainOps: PreambleChainKernelOp[], totalPreambleInputs: number,
-  preambleInputDtypes: DType[],
-  epilogueOps: ReductionEpilogueOpDesc[], outputDtype: DType,
-  inputShape: number[], inputStrides: number[],
-  normalizedDims: number[], outShape: number[], outStrides: number[],
-  inputToOutDim: number[], parallel: boolean,
-): TileKernelSpec {
-  return makeReductionSpec({
-    reduceOp: "sum",
-    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape,
-      outStrides, inputToOutDim, parallel),
-    preamble: { chainOps, totalInputs: totalPreambleInputs, inputDtypes: preambleInputDtypes },
-    epilogue: { ops: epilogueOps, outputDtype },
-  });
-}
-
-export function makeSumFullWithPreambleEpilogueSpec(
-  chainOps: PreambleChainKernelOp[], totalPreambleInputs: number,
-  preambleInputDtypes: DType[],
-  epilogueOps: ReductionEpilogueOpDesc[], outputDtype: DType,
-): TileKernelSpec {
-  return makeReductionSpec({
-    reduceOp: "sum",
-    preamble: { chainOps, totalInputs: totalPreambleInputs, inputDtypes: preambleInputDtypes },
-    epilogue: { ops: epilogueOps, outputDtype },
-  });
 }
 
 // ============================================================================
