@@ -2145,8 +2145,8 @@ function lowerBlockLoadTile(stmt: BlockLoadStmt, spec: TileKernelSpec): Statemen
   if (!stmt.tilePtr || !stmt.tileMask) {
     throw new Error("blockLoad with ptrKind=tile requires tilePtr and tileMask");
   }
-  // Delegate to existing tile load lowering, with padded smemStride
-  const smemStride = stmt.cols + 1;
+  // Delegate to existing tile load lowering, with padded smemStride (unless noPad)
+  const smemStride = stmt.noPad ? stmt.cols : stmt.cols + 1;
   return lowerTileLoad({
     kind: "tileLoad",
     binding: stmt.binding,

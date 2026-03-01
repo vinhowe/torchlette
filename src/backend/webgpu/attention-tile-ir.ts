@@ -1,43 +1,27 @@
 /**
- * FlashAttention kernels expressed via tile-IR vec4 + subgroup primitives.
+ * FlashAttention kernels expressed via tile-IR block API.
  *
  * Produces 4 TileKernelSpec objects that the tile compiler lowers to WGSL.
- * Uses native vec4 arrays (register + shared) and subgroup cooperative dot
- * products (4 threads per row, subgroupShuffleXor reduction).
+ * Uses the block-level API: cooperative loads, block dot products (auto-vec4),
+ * block reductions, and block stores. No manual vec4 or shared memory code.
  *
- * Forward:     Q,K,V → O,L  (online softmax)
- * D-precompute: dO,O → D    (per-row dot product)
- * Backward dQ: Q,K,V,L,D,dO → dQ
+ * Forward:      Q,K,V → O,L  (online softmax)
+ * D-precompute: dO,O → D     (per-row dot product via wgReduce)
+ * Backward dQ:  Q,K,V,L,D,dO → dQ
  * Backward dKV: Q,K,V,L,D,dO → dK,dV
  *
  * Auto-CSE handles all sub-expression sharing — no manual emitLet needed.
  */
 
 import type { TileKernelSpec } from "./tile-ir";
-import { tiledGrid, productGrid } from "./tile-ir";
-import { getSubgroupSupport } from "./matmul/types";
-import { F32_NEG_MAX } from "./shape-utils";
+import { tiledGrid } from "./tile-ir";
+import { F32_NEG_MAX, WORKGROUP_SIZE } from "./shape-utils";
 
 // Tiling parameters
-const BR = 64;     // Q rows per workgroup
+const BR = 64;     // Q rows per workgroup (forward, dQ)
 const BC = 32;     // KV rows per tile (forward, dQ)
 const BQ_BW = 16;  // Q rows per tile (backward dKV)
-
-// Subgroup cooperative parameters
-const THREADS_PER_ROW = 4;
-
-/**
- * Check if subgroup cooperative attention is usable for given headDim.
- * Requires: subgroups feature supported AND headDim/4 divisible by THREADS_PER_ROW
- * AND at least 4 vec4 elements per thread.
- */
-function useSubgroupAttention(headDim: number): boolean {
-  const sg = getSubgroupSupport();
-  if (!sg?.supported) return false;
-  const HD4 = headDim / 4;
-  const D4_COUNT = HD4 / THREADS_PER_ROW;
-  return HD4 % THREADS_PER_ROW === 0 && D4_COUNT >= 4;
-}
+const BC_BW = 64;  // KV rows per workgroup (backward dKV)
 
 // ============================================================================
 // Forward Attention Kernel
@@ -46,15 +30,11 @@ function useSubgroupAttention(headDim: number): boolean {
 export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
   if (headDim % 4 !== 0) throw new Error(`headDim must be divisible by 4, got ${headDim}`);
   const D = headDim;
-  const HD4 = D / 4;
-  const useSg = useSubgroupAttention(D);
-  const D4_COUNT = useSg ? HD4 / THREADS_PER_ROW : HD4;
-  const WG = useSg ? BR * THREADS_PER_ROW : BR; // 256 or 64
+  const WG = BR; // One thread per Q row
 
   return {
-    name: `tileAttnFwd_D${D}${useSg ? "_sg" : ""}`,
+    name: `tileAttnFwd_D${D}`,
     workgroupSize: WG,
-    enableSubgroups: useSg,
     bindings: {
       Q: { storage: "read", type: "f32" },
       K: { storage: "read", type: "f32" },
@@ -78,160 +58,100 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
       const hIdx = ctx.programId(1);
       const bIdx = ctx.programId(2);
 
-      // Thread mapping
-      const rowLane = useSg ? tidx.div(ctx.u32(THREADS_PER_ROW)) : tidx;
-      const d4Lane = useSg ? tidx.mod(ctx.u32(THREADS_PER_ROW)) : ctx.u32(0);
-      const d4Start = useSg ? d4Lane.mul(ctx.u32(D4_COUNT)) : ctx.u32(0);
-
       const N = ctx.uniform("seq_len");
       const Dim = ctx.u32(D);
       const numHeads = ctx.uniform("num_heads");
       const isCausal = ctx.uniform("is_causal");
       const scale = ctx.uniform("scale_u32").bitcastTo("f32");
 
-      const qRow = qBlock.mul(ctx.u32(BR)).add(rowLane);
+      const qRow = qBlock.mul(ctx.u32(BR)).add(tidx);
       const valid = qRow.lt(N);
 
       const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
       const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const qBase = bhOff.add(qRow.mul(Dim));
 
-      // Load Q row slice into vec4 registers
-      const qReg = ctx.registerVec4Array("q_reg", D4_COUNT);
-      ctx.ifThen(valid, () => {
-        const qBase = bhOff.add(qRow.mul(Dim));
-        ctx.range(0, D4_COUNT, (d4) => {
-          const off = qBase.add(d4Start.add(d4).mul(ctx.u32(4)));
-          qReg.write(d4, ctx.vec4(
-            ctx.load("Q", off), ctx.load("Q", off.add(ctx.u32(1))),
-            ctx.load("Q", off.add(ctx.u32(2))), ctx.load("Q", off.add(ctx.u32(3))),
-          ));
-        });
-      });
+      // Load Q row → register [1 × D]
+      const Q = ctx.tileLoad("Q", {
+        kind: "thread", base: qBase, stride: ctx.u32(1),
+      }, { rows: 1, cols: D, guard: valid });
 
       // Online softmax state
-      const mI = ctx.emitVar("m_i", "f32", ctx.f32(F32_NEG_MAX));
-      const lI = ctx.emitVar("l_i", "f32", ctx.f32(0));
-      const oAcc = ctx.registerVec4Array("o_acc", D4_COUNT);
-      // o_acc is zero-initialized by WGSL default
-
-      // Shared K and V tiles
-      const kTile = ctx.sharedVec4Array("k_tile", BC * HD4);
-      const vTile = ctx.sharedVec4Array("v_tile", BC * HD4);
+      const mPrev = ctx.full(1, 1, F32_NEG_MAX);
+      const lPrev = ctx.full(1, 1, 0);
+      const oAcc = ctx.zeros(1, D);
 
       const numKVTiles = N.add(ctx.u32(BC - 1)).div(ctx.u32(BC));
 
       ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
         const kvStart = tile.mul(ctx.u32(BC));
 
-        // Cooperative load K and V tiles
-        ctx.tileLoadPairVec4(tidx, WG, kTile, vTile, BC * HD4, (idx) => {
-          const row = idx.div(ctx.u32(HD4));
-          const d4 = idx.mod(ctx.u32(HD4));
-          const kvRow = kvStart.add(row);
-          const inBounds = kvRow.lt(N);
-          const off = bhOff.add(kvRow.mul(Dim)).add(d4.mul(ctx.u32(4)));
-          const vec = (buf: string) => inBounds.select(
-            ctx.vec4(ctx.load(buf, off), ctx.load(buf, off.add(ctx.u32(1))),
-                     ctx.load(buf, off.add(ctx.u32(2))), ctx.load(buf, off.add(ctx.u32(3)))),
-            ctx.vec4Splat(ctx.f32(0)),
-          );
-          return [vec("K"), vec("V")];
-        });
+        // Cooperative load K tile → shared [BC × D] (noPad: 2 tiles must fit in 16KB)
+        const offsR = ctx.arange(kvStart, BC);
+        const offsD = ctx.arange(ctx.u32(0), D);
+        const tilePtr = ctx.tilePtr(bhOff, offsR.outer(Dim), offsD.inner(ctx.u32(1)));
+        const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+        const K = ctx.load2D("K", tilePtr, tileMask, { noPad: true });
 
-        // Score computation + online softmax
-        const tileMax = ctx.emitVar("_tMax", "f32", ctx.f32(F32_NEG_MAX));
-        const scores = ctx.emitVarArray("_scores", "f32", BC);
+        // Scores = Q @ K^T → register [1 × BC]  (compiler generates vec4 dot)
+        const scores = ctx.dot(Q, K.T());
 
+        // Scale and apply causal mask
         ctx.range(0, BC, (j) => {
           const kvPos = kvStart.add(j);
           const isActive = valid.and(kvPos.lt(N)).and(
             isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)),
           );
-
-          // Partial dot product
-          const sPartial = ctx.emitVar("_sp", "f32", ctx.f32(0));
-          ctx.range(0, D4_COUNT, (d4) => {
-            sPartial.addAssign(
-              qReg.read(d4).vec4Dot(kTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4))),
-            );
-          });
-
-          let sVal = sPartial.get();
-          if (useSg) {
-            sVal = sVal.add(sVal.subgroupShuffleXor(1));
-            sVal = sVal.add(sVal.subgroupShuffleXor(2));
-          }
-          const s = sVal.mul(scale);
-          const score = isActive.select(s, ctx.f32(F32_NEG_MAX));
-          scores.set(j, score);
-          tileMax.set(isActive.select(tileMax.get().max(s), tileMax.get()));
+          scores.set(j, isActive.select(scores.get(j).mul(scale), ctx.f32(F32_NEG_MAX)));
         });
 
         // Online softmax update
-        const mNew = mI.get().max(tileMax.get());
-        const correction = mI.get().sub(mNew).exp();
+        const mNew = scores.max(1);          // [1×1]
+        const mMax = mNew.max(mPrev);        // [1×1]
+        const correction = mPrev.sub(mMax).exp(); // [1×1]
 
-        lI.set(lI.get().mul(correction));
-        ctx.range(0, D4_COUNT, (d4) => {
-          oAcc.write(d4, oAcc.read(d4).vec4MulScalar(correction));
-        });
+        oAcc.mul_(correction);               // broadcasts [1×1] over [1×D]
+        lPrev.mul_(correction);
 
-        ctx.range(0, BC, (j) => {
-          const p = scores.get(j).sub(mNew).exp();
-          lI.addAssign(p);
-          ctx.range(0, D4_COUNT, (d4) => {
-            oAcc.addAssign(d4,
-              vTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4)).vec4MulScalar(p),
-            );
-          });
-        });
+        scores.sub_(mMax);                   // broadcasts [1×1] over [1×BC]
+        scores.exp_();
+        lPrev.add_(scores.sum(1));
+        mPrev.assign(mMax);
 
-        mI.set(mNew);
-        ctx.barrier();
+        // Cooperative load V tile → shared [BC × D]
+        const V = ctx.load2D("V", tilePtr, tileMask, { noPad: true });
+
+        // oAcc += scores @ V  (compiler generates vec4 FMA)
+        ctx.dotAccum(scores, V, oAcc);
       });
 
       // Final normalization and write output
       ctx.ifThen(valid, () => {
-        const invL = lI.get().gt(ctx.f32(0)).select(
-          ctx.f32(1).div(lI.get()), ctx.f32(0));
-        const oBase = bhOff.add(qRow.mul(Dim));
-        ctx.range(0, D4_COUNT, (d4) => {
-          const v = oAcc.read(d4).vec4MulScalar(invL);
-          ctx.vec4Store("O", oBase.add(d4Start.add(d4).mul(ctx.u32(4))), v);
-        });
+        const l = lPrev.get(ctx.u32(0));
+        const invL = l.gt(ctx.f32(0)).select(ctx.f32(1).div(l), ctx.f32(0));
+        oAcc.mul_(invL);
+        ctx.tileStore("O", oAcc, { base: qBase, stride: ctx.u32(1) });
 
-        // Only one thread per row writes L
-        if (useSg) {
-          ctx.ifThen(d4Lane.eq(ctx.u32(0)), () => {
-            const lse = mI.get().add(lI.get().max(ctx.f32(1e-10)).log());
-            ctx.emitStore("L", bhOffL.add(qRow), lse);
-          });
-        } else {
-          const lse = mI.get().add(lI.get().max(ctx.f32(1e-10)).log());
-          ctx.emitStore("L", bhOffL.add(qRow), lse);
-        }
+        // Write logsumexp
+        const m = mPrev.get(ctx.u32(0));
+        const lse = m.add(l.max(ctx.f32(1e-10)).log());
+        ctx.emitStore("L", bhOffL.add(qRow), lse);
       });
     },
   };
 }
 
 // ============================================================================
-// D-Precompute Kernel
+// D-Precompute Kernel (per-row dot product via wgReduce)
 // ============================================================================
-
-function nextPow2(n: number): number {
-  let v = n - 1;
-  v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
-  return v + 1;
-}
 
 export function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
   const D = headDim;
-  const wgSize = nextPow2(Math.max(D, 32));
+  const WG = WORKGROUP_SIZE; // 256
 
   return {
     name: `tileAttnDPrecompute_D${D}`,
-    workgroupSize: wgSize,
+    workgroupSize: WG,
     bindings: {
       dO:    { storage: "read", type: "f32" },
       Out:   { storage: "read", type: "f32" },
@@ -242,31 +162,21 @@ export function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
       num_heads: "u32",
       seq_len: "u32",
       head_dim: "u32",
-      scale: "f32",
+      scale_u32: "u32",
       is_causal: "u32",
     },
-    grid: productGrid("batch_size", "num_heads", "seq_len"),
+    grid: (u) => [u.batch_size * u.num_heads * u.seq_len],
 
     kernel(ctx) {
+      const row = ctx.programId(0);
       const tid = ctx.localIndex();
-      const rowIdx = ctx.programId(0);
       const Dim = ctx.uniform("head_dim");
+      const base = row.mul(Dim);
 
-      const smem = ctx.sharedArray("_d_smem", wgSize, "f32");
-      const base = rowIdx.mul(Dim);
-      const inRange = tid.lt(Dim);
-
-      const dOVal = ctx.load("dO", base.add(tid));
-      const oVal = ctx.load("Out", base.add(tid));
-      const product = dOVal.mul(oVal);
-
-      smem.write(tid, inRange.select(product, ctx.f32(0.0)));
-      ctx.barrier();
-
-      // Tree reduction
-      ctx.treeReduceSum(smem, tid, wgSize);
-
-      ctx.guardedStore("D_val", tid.eq(ctx.u32(0)), rowIdx, smem.read(ctx.u32(0)));
+      const dotProd = ctx.wgReduce("sum", tid, Dim, WG, (i) =>
+        ctx.load("dO", base.add(i)).mul(ctx.load("Out", base.add(i))),
+      );
+      ctx.guardedStore("D_val", tid.eq(ctx.u32(0)), row, dotProd);
     },
   };
 }
@@ -278,15 +188,11 @@ export function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
 export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
   if (headDim % 4 !== 0) throw new Error(`headDim must be divisible by 4, got ${headDim}`);
   const D = headDim;
-  const HD4 = D / 4;
-  const useSg = useSubgroupAttention(D);
-  const D4_COUNT = useSg ? HD4 / THREADS_PER_ROW : HD4;
-  const WG = useSg ? BR * THREADS_PER_ROW : BR;
+  const WG = BR;
 
   return {
-    name: `tileAttnBwdDQ_D${D}${useSg ? "_sg" : ""}`,
+    name: `tileAttnBwdDQ_D${D}`,
     workgroupSize: WG,
-    enableSubgroups: useSg,
     bindings: {
       Q:     { storage: "read", type: "f32" },
       K:     { storage: "read", type: "f32" },
@@ -312,127 +218,78 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
       const hIdx = ctx.programId(1);
       const bIdx = ctx.programId(2);
 
-      const rowLane = useSg ? tidx.div(ctx.u32(THREADS_PER_ROW)) : tidx;
-      const d4Lane = useSg ? tidx.mod(ctx.u32(THREADS_PER_ROW)) : ctx.u32(0);
-      const d4Start = useSg ? d4Lane.mul(ctx.u32(D4_COUNT)) : ctx.u32(0);
-
       const N = ctx.uniform("seq_len");
       const Dim = ctx.u32(D);
       const numHeads = ctx.uniform("num_heads");
       const isCausal = ctx.uniform("is_causal");
       const scale = ctx.uniform("scale_u32").bitcastTo("f32");
 
-      const qRow = qBlock.mul(ctx.u32(BR)).add(rowLane);
+      const qRow = qBlock.mul(ctx.u32(BR)).add(tidx);
       const valid = qRow.lt(N);
 
       const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
       const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const rowBase = bhOff.add(qRow.mul(Dim));
 
-      // Load Q row slice and dO row slice into vec4 registers
-      const qReg = ctx.registerVec4Array("q_reg", D4_COUNT);
-      const dOReg = ctx.registerVec4Array("dO_reg", D4_COUNT);
-      const dqAcc = ctx.registerVec4Array("dq_acc", D4_COUNT);
+      // Load Q and dO rows → register [1 × D]
+      const Q = ctx.tileLoad("Q", {
+        kind: "thread", base: rowBase, stride: ctx.u32(1),
+      }, { rows: 1, cols: D, guard: valid });
+
+      const dO = ctx.tileLoad("dO", {
+        kind: "thread", base: rowBase, stride: ctx.u32(1),
+      }, { rows: 1, cols: D, guard: valid });
+
+      // Load per-row L and D values
       const lVar = ctx.emitVar("_Li", "f32", ctx.f32(0));
       const dVar = ctx.emitVar("_Di", "f32", ctx.f32(0));
-
       ctx.ifThen(valid, () => {
-        const base = bhOff.add(qRow.mul(Dim));
-        ctx.range(0, D4_COUNT, (d4) => {
-          const off = base.add(d4Start.add(d4).mul(ctx.u32(4)));
-          qReg.write(d4, ctx.vec4(
-            ctx.load("Q", off), ctx.load("Q", off.add(ctx.u32(1))),
-            ctx.load("Q", off.add(ctx.u32(2))), ctx.load("Q", off.add(ctx.u32(3))),
-          ));
-          dOReg.write(d4, ctx.vec4(
-            ctx.load("dO", off), ctx.load("dO", off.add(ctx.u32(1))),
-            ctx.load("dO", off.add(ctx.u32(2))), ctx.load("dO", off.add(ctx.u32(3))),
-          ));
-        });
         lVar.set(ctx.load("L_buf", bhOffL.add(qRow)));
         dVar.set(ctx.load("D_buf", bhOffL.add(qRow)));
       });
 
-      // K and V shared tiles
-      const kTile = ctx.sharedVec4Array("k_tile", BC * HD4);
-      const vTile = ctx.sharedVec4Array("v_tile", BC * HD4);
+      // Accumulator
+      const dqAcc = ctx.zeros(1, D);
 
       const numKVTiles = N.add(ctx.u32(BC - 1)).div(ctx.u32(BC));
 
       ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
         const kvStart = tile.mul(ctx.u32(BC));
 
-        // Cooperative load K and V tiles
-        ctx.tileLoadPairVec4(tidx, WG, kTile, vTile, BC * HD4, (idx) => {
-          const row = idx.div(ctx.u32(HD4));
-          const d4 = idx.mod(ctx.u32(HD4));
-          const kvRow = kvStart.add(row);
-          const inBounds = kvRow.lt(N);
-          const off = bhOff.add(kvRow.mul(Dim)).add(d4.mul(ctx.u32(4)));
-          const vec = (buf: string) => inBounds.select(
-            ctx.vec4(ctx.load(buf, off), ctx.load(buf, off.add(ctx.u32(1))),
-                     ctx.load(buf, off.add(ctx.u32(2))), ctx.load(buf, off.add(ctx.u32(3)))),
-            ctx.vec4Splat(ctx.f32(0)),
-          );
-          return [vec("K"), vec("V")];
-        });
+        // Cooperative load K and V tiles → shared [BC × D]
+        const offsR = ctx.arange(kvStart, BC);
+        const offsD = ctx.arange(ctx.u32(0), D);
+        const tilePtr = ctx.tilePtr(bhOff, offsR.outer(Dim), offsD.inner(ctx.u32(1)));
+        const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+        const K = ctx.load2D("K", tilePtr, tileMask, { noPad: true });
+        const V = ctx.load2D("V", tilePtr, tileMask, { noPad: true });
 
-        // Score + gradient computation
+        // Scores = Q @ K^T → [1 × BC]   (compiler auto-vec4)
+        const scores = ctx.dot(Q, K.T());
+
+        // dO · V^T → [1 × BC]  (compiler auto-vec4)
+        const dovs = ctx.dot(dO, V.T());
+
+        // Compute dS per element and apply causal mask
+        const ds = ctx.zeros(1, BC);
         ctx.range(0, BC, (j) => {
           const kvPos = kvStart.add(j);
           const isActive = valid.and(kvPos.lt(N)).and(
             isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)),
           );
-
-          // Partial dot: Q[i] . K[j]
-          const sPartial = ctx.emitVar("_sp", "f32", ctx.f32(0));
-          ctx.range(0, D4_COUNT, (d4) => {
-            sPartial.addAssign(
-              qReg.read(d4).vec4Dot(kTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4))),
-            );
-          });
-
-          let sVal = sPartial.get();
-          if (useSg) {
-            sVal = sVal.add(sVal.subgroupShuffleXor(1));
-            sVal = sVal.add(sVal.subgroupShuffleXor(2));
-          }
-          const s = sVal.mul(scale);
+          const s = scores.get(j).mul(scale);
           const p = isActive.select(s.sub(lVar.get()).exp(), ctx.f32(0));
-
-          // Partial dot: dO[i] . V[j]
-          const dovPartial = ctx.emitVar("_dp", "f32", ctx.f32(0));
-          ctx.range(0, D4_COUNT, (d4) => {
-            dovPartial.addAssign(
-              dOReg.read(d4).vec4Dot(vTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4))),
-            );
-          });
-
-          let dovVal = dovPartial.get();
-          if (useSg) {
-            dovVal = dovVal.add(dovVal.subgroupShuffleXor(1));
-            dovVal = dovVal.add(dovVal.subgroupShuffleXor(2));
-          }
-
-          const ds = p.mul(dovVal.sub(dVar.get()));
-
-          // dQ[i] += ds * K[j]
-          ctx.range(0, D4_COUNT, (d4) => {
-            dqAcc.addAssign(d4,
-              kTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4)).vec4MulScalar(ds),
-            );
-          });
+          ds.set(j, p.mul(dovs.get(j).sub(dVar.get())));
         });
 
-        ctx.barrier();
+        // dqAcc += ds @ K → [1×BC] @ [BC×D] → [1×D]  (compiler auto-vec4 FMA)
+        ctx.dotAccum(ds, K, dqAcc);
       });
 
-      // Write dQ (each thread writes its slice, with scale applied at write)
+      // Write dQ (with scale applied)
       ctx.ifThen(valid, () => {
-        const base = bhOff.add(qRow.mul(Dim));
-        ctx.range(0, D4_COUNT, (d4) => {
-          const v = dqAcc.read(d4).vec4MulScalar(scale);
-          ctx.vec4Store("dQ", base.add(d4Start.add(d4).mul(ctx.u32(4))), v);
-        });
+        dqAcc.mul_(scale);
+        ctx.tileStore("dQ", dqAcc, { base: rowBase, stride: ctx.u32(1) });
       });
     },
   };
@@ -445,16 +302,11 @@ export function makeBackwardDQSpec(headDim: number): TileKernelSpec {
 export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
   if (headDim % 4 !== 0) throw new Error(`headDim must be divisible by 4, got ${headDim}`);
   const D = headDim;
-  const HD4 = D / 4;
-  const BC_BW = 64;
-  const useSg = useSubgroupAttention(D);
-  const D4_COUNT = useSg ? HD4 / THREADS_PER_ROW : HD4;
-  const WG = useSg ? BC_BW * THREADS_PER_ROW : BC_BW; // 256 or 64
+  const WG = BC_BW; // One thread per KV row
 
   return {
-    name: `tileAttnBwdDKV_D${D}${useSg ? "_sg" : ""}`,
+    name: `tileAttnBwdDKV_D${D}`,
     workgroupSize: WG,
-    enableSubgroups: useSg,
     bindings: {
       Q:     { storage: "read", type: "f32" },
       K:     { storage: "read", type: "f32" },
@@ -481,46 +333,33 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
       const hIdx = ctx.programId(1);
       const bIdx = ctx.programId(2);
 
-      const rowLane = useSg ? tidx.div(ctx.u32(THREADS_PER_ROW)) : tidx;
-      const d4Lane = useSg ? tidx.mod(ctx.u32(THREADS_PER_ROW)) : ctx.u32(0);
-      const d4Start = useSg ? d4Lane.mul(ctx.u32(D4_COUNT)) : ctx.u32(0);
-
       const N = ctx.uniform("seq_len");
       const Dim = ctx.u32(D);
       const numHeads = ctx.uniform("num_heads");
       const isCausal = ctx.uniform("is_causal");
       const scale = ctx.uniform("scale_u32").bitcastTo("f32");
 
-      const kvRow = kvBlock.mul(ctx.u32(BC_BW)).add(rowLane);
+      const kvRow = kvBlock.mul(ctx.u32(BC_BW)).add(tidx);
       const valid = kvRow.lt(N);
 
       const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
       const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const rowBase = bhOff.add(kvRow.mul(Dim));
 
-      // Load K and V row slices into vec4 registers
-      const kReg = ctx.registerVec4Array("k_reg", D4_COUNT);
-      const vReg = ctx.registerVec4Array("v_reg", D4_COUNT);
-      const dkAcc = ctx.registerVec4Array("dk_acc", D4_COUNT);
-      const dvAcc = ctx.registerVec4Array("dv_acc", D4_COUNT);
+      // Load K and V rows → register [1 × D]
+      const K = ctx.tileLoad("K", {
+        kind: "thread", base: rowBase, stride: ctx.u32(1),
+      }, { rows: 1, cols: D, guard: valid });
 
-      ctx.ifThen(valid, () => {
-        const base = bhOff.add(kvRow.mul(Dim));
-        ctx.range(0, D4_COUNT, (d4) => {
-          const off = base.add(d4Start.add(d4).mul(ctx.u32(4)));
-          kReg.write(d4, ctx.vec4(
-            ctx.load("K", off), ctx.load("K", off.add(ctx.u32(1))),
-            ctx.load("K", off.add(ctx.u32(2))), ctx.load("K", off.add(ctx.u32(3))),
-          ));
-          vReg.write(d4, ctx.vec4(
-            ctx.load("V", off), ctx.load("V", off.add(ctx.u32(1))),
-            ctx.load("V", off.add(ctx.u32(2))), ctx.load("V", off.add(ctx.u32(3))),
-          ));
-        });
-      });
+      const V = ctx.tileLoad("V", {
+        kind: "thread", base: rowBase, stride: ctx.u32(1),
+      }, { rows: 1, cols: D, guard: valid });
 
-      // Shared arrays for Q, dO tiles and L, D values
-      const qTile = ctx.sharedVec4Array("q_tile", BQ_BW * HD4);
-      const doTile = ctx.sharedVec4Array("dO_tile", BQ_BW * HD4);
+      // Accumulators
+      const dkAcc = ctx.zeros(1, D);
+      const dvAcc = ctx.zeros(1, D);
+
+      // Shared arrays for L and D values within Q tiles
       const lTile = ctx.sharedArray("L_tile", BQ_BW, "f32");
       const dTile = ctx.sharedArray("D_tile", BQ_BW, "f32");
 
@@ -529,29 +368,21 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
       ctx.forRange(ctx.u32(0), numQTiles, (qt) => {
         const qStart = qt.mul(ctx.u32(BQ_BW));
 
-        // Causal tile skip: guard body so we skip tiles where max qi < min kv_row
+        // Causal tile skip
         const skipTile = isCausal.ne(ctx.u32(0)).and(
           qStart.add(ctx.u32(BQ_BW - 1)).lt(kvBlock.mul(ctx.u32(BC_BW))),
         );
 
         ctx.ifThen(skipTile.not(), () => {
-          // Cooperative load Q and dO tiles (no trailing barrier — deferred to after L/D load)
-          ctx.stridedFor(tidx, ctx.u32(BQ_BW * HD4), WG, (idx) => {
-            const row = idx.div(ctx.u32(HD4));
-            const d4 = idx.mod(ctx.u32(HD4));
-            const qi = qStart.add(row);
-            const inBounds = qi.lt(N);
-            const base = bhOff.add(qi.mul(Dim)).add(d4.mul(ctx.u32(4)));
-            const vec = (buf: string) => inBounds.select(
-              ctx.vec4(ctx.load(buf, base), ctx.load(buf, base.add(ctx.u32(1))),
-                       ctx.load(buf, base.add(ctx.u32(2))), ctx.load(buf, base.add(ctx.u32(3)))),
-              ctx.vec4Splat(ctx.f32(0)),
-            );
-            qTile.write(idx, vec("Q"));
-            doTile.write(idx, vec("dO"));
-          });
+          // Cooperative load Q and dO tiles → shared [BQ_BW × D]
+          const offsR = ctx.arange(qStart, BQ_BW);
+          const offsD = ctx.arange(ctx.u32(0), D);
+          const tilePtr = ctx.tilePtr(bhOff, offsR.outer(Dim), offsD.inner(ctx.u32(1)));
+          const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+          const QTile = ctx.load2D("Q", tilePtr, tileMask);
+          const dOTile = ctx.load2D("dO", tilePtr, tileMask);
 
-          // Load L and D values
+          // Load L and D values into shared memory
           ctx.ifThen(tidx.lt(ctx.u32(BQ_BW)), () => {
             const qi = qStart.add(tidx);
             const inBounds = qi.lt(N);
@@ -562,54 +393,43 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
 
           ctx.barrier();
 
-          // ALL threads participate in shuffle (subgroup-uniform control flow)
+          // For each Q row in the tile
           ctx.range(0, BQ_BW, (j) => {
             const qi = qStart.add(j);
             const isActive = valid.and(qi.lt(N)).and(
               isCausal.eq(ctx.u32(0)).or(kvRow.le(qi)),
             );
 
-            // Partial dot: Q[qi] . K[kv_row]
+            // Scores: K[kvRow] @ Q[qi]^T → scalar dot product
+            // K is register [1×D], QTile is shared [BQ×D]
+            // Compute: score = Σ_d K[d] * QTile[j * smemStride + d]
+            const smemStr = ctx.u32(QTile.smemStride);
             const sPartial = ctx.emitVar("_sp", "f32", ctx.f32(0));
-            ctx.range(0, D4_COUNT, (d4) => {
+            ctx.range(0, D, (d) => {
               sPartial.addAssign(
-                qTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4)).vec4Dot(kReg.read(d4)),
+                K.get(d).mul(QTile.get(j.mul(smemStr).add(d))),
               );
             });
-
-            let sVal = sPartial.get();
-            if (useSg) {
-              sVal = sVal.add(sVal.subgroupShuffleXor(1));
-              sVal = sVal.add(sVal.subgroupShuffleXor(2));
-            }
-            const s = sVal.mul(scale);
+            const s = sPartial.get().mul(scale);
             const p = isActive.select(s.sub(lTile.read(j)).exp(), ctx.f32(0));
 
-            // Partial dot: dO[qi] . V[kv_row]
+            // dO·V dot product for element j
             const dovPartial = ctx.emitVar("_dp", "f32", ctx.f32(0));
-            ctx.range(0, D4_COUNT, (d4) => {
+            ctx.range(0, D, (d) => {
               dovPartial.addAssign(
-                doTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4)).vec4Dot(vReg.read(d4)),
+                V.get(d).mul(dOTile.get(j.mul(smemStr).add(d))),
               );
             });
 
-            let dovVal = dovPartial.get();
-            if (useSg) {
-              dovVal = dovVal.add(dovVal.subgroupShuffleXor(1));
-              dovVal = dovVal.add(dovVal.subgroupShuffleXor(2));
-            }
-
-            const ds = p.mul(dovVal.sub(dTile.read(j)));
+            const ds = p.mul(dovPartial.get().sub(dTile.read(j)));
             const dsScale = ds.mul(scale);
 
-            // Accumulate dK and dV (each thread accumulates its vec4 slice)
-            ctx.range(0, D4_COUNT, (d4) => {
-              dkAcc.addAssign(d4,
-                qTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4)).vec4MulScalar(dsScale),
-              );
-              dvAcc.addAssign(d4,
-                doTile.read(j.mul(ctx.u32(HD4)).add(d4Start).add(d4)).vec4MulScalar(p),
-              );
+            // Accumulate dK and dV using scalar FMA (per-element over D)
+            ctx.range(0, D, (d) => {
+              const qVal = QTile.get(j.mul(smemStr).add(d));
+              const doVal = dOTile.get(j.mul(smemStr).add(d));
+              dkAcc.set(d, dkAcc.get(d).add(qVal.mul(dsScale)));
+              dvAcc.set(d, dvAcc.get(d).add(doVal.mul(p)));
             });
           });
 
@@ -619,12 +439,8 @@ export function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
 
       // Write dK and dV
       ctx.ifThen(valid, () => {
-        const base = bhOff.add(kvRow.mul(Dim));
-        ctx.range(0, D4_COUNT, (d4) => {
-          const off = base.add(d4Start.add(d4).mul(ctx.u32(4)));
-          ctx.vec4Store("dK", off, dkAcc.read(d4));
-          ctx.vec4Store("dV", off, dvAcc.read(d4));
-        });
+        ctx.tileStore("dK", dkAcc, { base: rowBase, stride: ctx.u32(1) });
+        ctx.tileStore("dV", dvAcc, { base: rowBase, stride: ctx.u32(1) });
       });
     },
   };
