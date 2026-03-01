@@ -257,16 +257,16 @@ export class Block {
   }
 
   // ---- In-place variants ----
-  mul_(other: Block | BlockExpr): void { this.ops._binaryInPlace(this, other, "mul"); }
-  add_(other: Block | BlockExpr): void { this.ops._binaryInPlace(this, other, "add"); }
-  sub_(other: Block | BlockExpr): void { this.ops._binaryInPlace(this, other, "sub"); }
-  exp_(): void { this.ops._unaryInPlace(this, "exp"); }
+  mul_(other: Block | BlockExpr): void { this.ops._binary(this, other, "mul", true); }
+  add_(other: Block | BlockExpr): void { this.ops._binary(this, other, "add", true); }
+  sub_(other: Block | BlockExpr): void { this.ops._binary(this, other, "sub", true); }
+  exp_(): void { this.ops._unary(this, "exp", true); }
 
   /** Copy values from other into this block (with broadcasting). */
-  assign(other: Block): void { this.ops._binaryInPlace(this, other, "copy"); }
+  assign(other: Block): void { this.ops._binary(this, other, "copy", true); }
 
   /** Accumulate: this += other (with broadcasting). */
-  addAssign(other: Block): void { this.ops._binaryInPlace(this, other, "add"); }
+  addAssign(other: Block): void { this.ops._binary(this, other, "add", true); }
 
   // ---- Unary (returns new register Block) ----
   exp(): Block { return this.ops._unary(this, "exp"); }
@@ -331,36 +331,6 @@ export class Block {
   }
   /** @internal */ _castDtype?: DataType;
 
-  // ---- Element access ----
-  /** Compute flat index accounting for transpose: logical (row,col) → physical storage index. */
-  private _flatIdx(row: BlockExpr, col: BlockExpr): BlockExpr {
-    if (this._transposed) {
-      // Physical layout is _origRows × _origCols; logical (row,col) maps to physical (col,row)
-      const stride = this.ctx.u32(this._origCols);
-      return col.mul(stride).add(row);
-    } else {
-      const stride = this.ctx.u32(this.cols);
-      return row.mul(stride).add(col);
-    }
-  }
-
-  get(row: BlockExpr, col: BlockExpr): BlockExpr {
-    const idx = this._flatIdx(row, col);
-    return new BlockExpr({
-      id: -1, kind: "arrayRead", arrayName: this.name, idx: idx.node,
-      valueType: "scalar", dataType: "f32",
-    } as any);
-  }
-
-  set(row: BlockExpr, col: BlockExpr, val: BlockExpr): void {
-    const idx = this._flatIdx(row, col);
-    this.ctx.pushStatement({
-      kind: "indexAssign",
-      arrayName: this.name,
-      idx: idx.node,
-      value: val.node,
-    });
-  }
 }
 
 /**
@@ -658,101 +628,35 @@ export class BlockOps {
   // ---- Internal helpers (called by Block methods) ----
 
   /** @internal */
-  _binary(a: Block, b: Block | BlockExpr, op: BlockBinaryOp): Block {
-    const name = this.freshName();
-    if (b instanceof Block) {
-      const outRows = Math.max(a.rows, b.rows);
-      const outCols = Math.max(a.cols, b.cols);
-      this.ctx.pushStatement({
-        kind: "blockBinary",
-        aName: a.name,
-        bName: b.name,
-        outputName: name,
-        aRows: a.rows,
-        aCols: a.cols,
-        bRows: b.rows,
-        bCols: b.cols,
-        op,
-        inPlace: false,
-      });
-      return new Block("register", outRows, outCols, name, this.ctx, this);
-    } else {
-      // BlockExpr (scalar) — treat as [1×1] broadcast
-      this.ctx.pushStatement({
-        kind: "blockBinary",
-        aName: a.name,
-        bName: "",
-        outputName: name,
-        aRows: a.rows,
-        aCols: a.cols,
-        bRows: 1,
-        bCols: 1,
-        op,
-        inPlace: false,
-        bScalarExpr: b.node,
-      });
-      return new Block("register", a.rows, a.cols, name, this.ctx, this);
-    }
+  _binary(a: Block, b: Block | BlockExpr, op: BlockBinaryOp, inPlace = false): Block {
+    const outputName = inPlace ? a.name : this.freshName();
+    const isBlock = b instanceof Block;
+    this.ctx.pushStatement({
+      kind: "blockBinary",
+      aName: a.name,
+      bName: isBlock ? b.name : "",
+      outputName,
+      aRows: a.rows, aCols: a.cols,
+      bRows: isBlock ? b.rows : 1,
+      bCols: isBlock ? b.cols : 1,
+      op, inPlace,
+      ...(isBlock ? {} : { bScalarExpr: b.node }),
+    });
+    if (inPlace) return a;
+    const outRows = isBlock ? Math.max(a.rows, b.rows) : a.rows;
+    const outCols = isBlock ? Math.max(a.cols, b.cols) : a.cols;
+    return new Block("register", outRows, outCols, outputName, this.ctx, this);
   }
 
   /** @internal */
-  _binaryInPlace(a: Block, b: Block | BlockExpr, op: BlockBinaryOp): void {
-    if (b instanceof Block) {
-      this.ctx.pushStatement({
-        kind: "blockBinary",
-        aName: a.name,
-        bName: b.name,
-        outputName: a.name,
-        aRows: a.rows,
-        aCols: a.cols,
-        bRows: b.rows,
-        bCols: b.cols,
-        op,
-        inPlace: true,
-      });
-    } else {
-      this.ctx.pushStatement({
-        kind: "blockBinary",
-        aName: a.name,
-        bName: "",
-        outputName: a.name,
-        aRows: a.rows,
-        aCols: a.cols,
-        bRows: 1,
-        bCols: 1,
-        op,
-        inPlace: true,
-        bScalarExpr: b.node,
-      });
-    }
-  }
-
-  /** @internal */
-  _unary(a: Block, op: BlockUnaryOp): Block {
-    const name = this.freshName();
+  _unary(a: Block, op: BlockUnaryOp, inPlace = false): Block {
+    const outputName = inPlace ? a.name : this.freshName();
     this.ctx.pushStatement({
       kind: "blockUnary",
-      inputName: a.name,
-      outputName: name,
-      rows: a.rows,
-      cols: a.cols,
-      op,
-      inPlace: false,
+      inputName: a.name, outputName,
+      rows: a.rows, cols: a.cols, op, inPlace,
     });
-    return new Block("register", a.rows, a.cols, name, this.ctx, this);
-  }
-
-  /** @internal */
-  _unaryInPlace(a: Block, op: BlockUnaryOp): void {
-    this.ctx.pushStatement({
-      kind: "blockUnary",
-      inputName: a.name,
-      outputName: a.name,
-      rows: a.rows,
-      cols: a.cols,
-      op,
-      inPlace: true,
-    });
+    return inPlace ? a : new Block("register", a.rows, a.cols, outputName, this.ctx, this);
   }
 
   /** @internal */
