@@ -28,7 +28,6 @@ import {
   elementwiseGrid,
 } from "./tile-ir";
 import { compileTileKernel } from "./tile-compiler";
-import { getArity } from "./ops/registry";
 
 // ============================================================================
 // Op mapping: OP_REGISTRY op name → tile-IR BlockExpr operations
@@ -368,7 +367,7 @@ export function generateFusedKernelTileIR(
 // Helpers
 // ============================================================================
 
-function dtypeToTileIR(dtype: DType): DataType {
+export function dtypeToTileIR(dtype: DType): DataType {
   switch (dtype) {
     case "f32": return "f32";
     case "f16": return "f16";

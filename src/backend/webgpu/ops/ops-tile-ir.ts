@@ -17,17 +17,15 @@ import {
   elementwiseGrid,
 } from "../tile-ir";
 import { compileTileKernel } from "../tile-compiler";
-import { WORKGROUP_SIZE, F32_NEG_MAX, F32_POS_MAX } from "../shape-utils";
+import { WORKGROUP_SIZE, F32_NEG_MAX, F32_POS_MAX, MAX_WORKGROUPS_PER_DIM } from "../shape-utils";
 import { applyFusedOp } from "../fusion-tile-ir";
 
 const WG = WORKGROUP_SIZE; // 256
-const MAX_WG_PER_DIM = 65535;
-
 /** Grid for a compile-time-known element count (no uniform needed). */
 function fixedElementGrid(workgroupSize: number, elements: number): (u: Record<string, number>) => [number] | [number, number] {
   const totalWg = Math.ceil(elements / workgroupSize);
-  if (totalWg <= MAX_WG_PER_DIM) return () => [totalWg];
-  return () => [Math.min(totalWg, MAX_WG_PER_DIM), Math.ceil(totalWg / MAX_WG_PER_DIM)];
+  if (totalWg <= MAX_WORKGROUPS_PER_DIM) return () => [totalWg];
+  return () => [Math.min(totalWg, MAX_WORKGROUPS_PER_DIM), Math.ceil(totalWg / MAX_WORKGROUPS_PER_DIM)];
 }
 
 // ============================================================================
@@ -1011,8 +1009,8 @@ export function randnWGSL(): string {
     grid(u) {
       const numThreads = Math.ceil(u.size / 2);
       const totalWg = Math.ceil(numThreads / WG);
-      if (totalWg <= MAX_WG_PER_DIM) return [totalWg];
-      return [Math.min(totalWg, MAX_WG_PER_DIM), Math.ceil(totalWg / MAX_WG_PER_DIM)];
+      if (totalWg <= MAX_WORKGROUPS_PER_DIM) return [totalWg];
+      return [Math.min(totalWg, MAX_WORKGROUPS_PER_DIM), Math.ceil(totalWg / MAX_WORKGROUPS_PER_DIM)];
     },
     kernel(ctx) {
       const idx = ctx.globalId(0);

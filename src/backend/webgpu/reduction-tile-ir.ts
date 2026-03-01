@@ -22,7 +22,7 @@ import {
   singleWorkgroup,
 } from "./tile-ir";
 import { compileTileKernel } from "./tile-compiler";
-import { applyFusedOp } from "./fusion-tile-ir";
+import { applyFusedOp, dtypeToTileIR } from "./fusion-tile-ir";
 import { WORKGROUP_SIZE } from "./shape-utils";
 import type { DType } from "../types";
 
@@ -223,14 +223,6 @@ function buildEpilogueBindings(
   return bindings;
 }
 
-/** Map DType to binding DataType. */
-function outBindingType(dtype: DType): DataType {
-  if (dtype === "f16") return "f16";
-  if (dtype === "i32") return "i32";
-  if (dtype === "u32") return "u32";
-  return "f32";
-}
-
 // ============================================================================
 // Unified Reduction Spec Factory
 // ============================================================================
@@ -274,7 +266,7 @@ export function makeReductionSpec(config: ReductionConfig): TileKernelSpec {
     bindings.input = { storage: "read", type: "f32" };
   }
   if (epilogue) Object.assign(bindings, buildEpilogueBindings(epilogue.ops));
-  const outType = epilogue ? outBindingType(epilogue.outputDtype) : "f32";
+  const outType = epilogue ? dtypeToTileIR(epilogue.outputDtype) : "f32";
   bindings.out = { storage: "read_write", type: outType };
 
   const needsF16 =

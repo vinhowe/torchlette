@@ -27,7 +27,7 @@ import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { compileTileKernel } from "./tile-compiler";
-import type { TileKernelSpec, UniformType, DataType } from "./tile-ir";
+import type { TileKernelSpec, DataType } from "./tile-ir";
 import { resolveGrid } from "./tile-ir";
 
 // ============================================================================
@@ -171,61 +171,60 @@ export function createTileKernelDispatcher(spec: TileKernelSpec): TileKernelInst
     return buf;
   }
 
+  // Shared binding assembly: iterates bindings in declaration order,
+  // inserting the uniform config buffer at uniformBindingIndex.
+  function buildBindings(
+    bindingNames: string[],
+    buffers: Record<string, GPUBuffer>,
+    configBuf: GPUBuffer | null,
+    visitor: (bindingIndex: number, name: string, buf: GPUBuffer) => void,
+    visitUniform: (bindingIndex: number, buf: GPUBuffer) => void,
+  ): void {
+    const uniformIdx = spec.uniformBindingIndex;
+    let bindingIndex = 0;
+    for (let i = 0; i < bindingNames.length; i++) {
+      if (configBuf && uniformIdx !== undefined && bindingIndex === uniformIdx) {
+        visitUniform(bindingIndex, configBuf);
+        bindingIndex++;
+      }
+      const name = bindingNames[i];
+      const buf = buffers[name];
+      if (!buf) throw new Error(`Missing buffer for binding: ${name}`);
+      visitor(bindingIndex, name, buf);
+      bindingIndex++;
+    }
+    if (configBuf && (uniformIdx === undefined || bindingIndex <= uniformIdx)) {
+      visitUniform(bindingIndex, configBuf);
+    }
+  }
+
+  function prepareConfigBuffer(device: GPUDevice, uniforms: Record<string, number>, keyPrefix = ""): GPUBuffer | null {
+    if (Object.keys(spec.uniforms).length === 0) return null;
+    const configKey = keyPrefix + uniformCacheKey(spec, uniforms);
+    const { data, sizeBytes } = packUniforms(spec, uniforms);
+    return getConfigBuffer(device, configKey, sizeBytes, data);
+  }
+
   return {
     dispatch(buffers: Record<string, GPUBuffer>, uniforms: Record<string, number>): void {
       const ctx = requireContext();
       const device = ctx.device;
-
-      // Pipeline (cached via context.pipelines — key by WGSL content for uniqueness)
       const wgsl = getWGSL();
       const pipeline = getPipeline(ctx, wgsl, wgsl);
 
-      // Build buffer array in binding order, respecting uniformBindingIndex
+      const configBuf = prepareConfigBuffer(device, uniforms);
       const bindingNames = Object.keys(spec.bindings);
       const bufferArray: GPUBuffer[] = [];
-      const hasUniforms = Object.keys(spec.uniforms).length > 0;
-      const uniformIdx = spec.uniformBindingIndex;
-      let configBuf: GPUBuffer | null = null;
 
-      if (hasUniforms) {
-        const configKey = uniformCacheKey(spec, uniforms);
-        const { data, sizeBytes } = packUniforms(spec, uniforms);
-        configBuf = getConfigBuffer(device, configKey, sizeBytes, data);
-      }
+      buildBindings(bindingNames, buffers, configBuf,
+        (_idx, _name, buf) => bufferArray.push(buf),
+        (_idx, buf) => bufferArray.push(buf),
+      );
 
-      let bindingIndex = 0;
-      for (let i = 0; i < bindingNames.length; i++) {
-        // Insert uniform at the specified binding index
-        if (configBuf && uniformIdx !== undefined && bindingIndex === uniformIdx) {
-          bufferArray.push(configBuf);
-          bindingIndex++;
-        }
-        const buf = buffers[bindingNames[i]];
-        if (!buf) {
-          throw new Error(`Missing buffer for binding: ${bindingNames[i]}`);
-        }
-        bufferArray.push(buf);
-        bindingIndex++;
-      }
-
-      // Append uniform at end if not already inserted
-      if (configBuf && (uniformIdx === undefined || bindingIndex <= uniformIdx)) {
-        bufferArray.push(configBuf);
-      }
-
-      // Bind group
       const bindGroup = cachedCreateBindGroup(device, pipeline, bufferArray);
+      for (const buf of bufferArray) trackSharedEncoderWrite(buf);
 
-      // Track writes
-      for (const buf of bufferArray) {
-        trackSharedEncoderWrite(buf);
-      }
-
-      // Compute grid dimensions (explicit or auto-inferred)
-      const gridFn = resolveGrid(spec);
-      const grid = gridFn(uniforms);
-
-      // Dispatch
+      const grid = resolveGrid(spec)(uniforms);
       dispatchComputePass(pipeline, bindGroup, ...grid);
     },
 
@@ -251,10 +250,7 @@ export function createTileKernelDispatcher(spec: TileKernelSpec): TileKernelInst
 
       const wgsl = getWGSL();
       const pipeline = getPipeline(ctx, wgsl, wgsl);
-
       const bindingNames = Object.keys(spec.bindings);
-      const hasUniforms = Object.keys(spec.uniforms).length > 0;
-      const uniformIdx = spec.uniformBindingIndex;
       const gridFn = resolveGrid(spec);
 
       for (let chunk = 0; chunk < layout.numChunks; chunk++) {
@@ -262,75 +258,32 @@ export function createTileKernelDispatcher(spec: TileKernelSpec): TileKernelInst
         const chunkEnd = Math.min(chunkStart + layout.elementsPerChunk, chunking.totalElements);
         const chunkSize = chunkEnd - chunkStart;
 
-        // Patch the size uniform for this chunk
         const patchedUniforms = { ...uniforms, [chunking.sizeUniform]: chunkSize };
+        const configBuf = prepareConfigBuffer(device, patchedUniforms, "chunked:");
 
-        // Pack uniforms into config buffer (cached by content)
-        let configBuf: GPUBuffer | null = null;
-        if (hasUniforms) {
-          const configKey = `chunked:${uniformCacheKey(spec, patchedUniforms)}`;
-          const { data, sizeBytes } = packUniforms(spec, patchedUniforms);
-          configBuf = getConfigBuffer(device, configKey, sizeBytes, data);
-        }
+        type Entry = { binding: number; resource: { buffer: GPUBuffer; offset?: number; size?: number } };
+        const entries: Entry[] = [];
 
-        // Build bind group entries with offset/size for chunked bindings
-        const entries: Array<{
-          binding: number;
-          resource: { buffer: GPUBuffer; offset?: number; size?: number };
-        }> = [];
-
-        let bindingIndex = 0;
-
-        for (let i = 0; i < bindingNames.length; i++) {
-          // Insert uniform at the specified binding index
-          if (configBuf && uniformIdx !== undefined && bindingIndex === uniformIdx) {
-            entries.push({ binding: bindingIndex, resource: { buffer: configBuf } });
-            bindingIndex++;
-          }
-
-          const name = bindingNames[i];
-          const buf = buffers[name];
-          if (!buf) {
-            throw new Error(`Missing buffer for binding: ${name}`);
-          }
-
-          const mode = chunking.modes[name] ?? "chunked";
-          if (mode === "scalar") {
-            entries.push({ binding: bindingIndex, resource: { buffer: buf } });
-          } else {
-            const bpe = chunking.bytesPerElement?.[name] ?? dataTypeBpe(spec.bindings[name].type);
-            entries.push({
-              binding: bindingIndex,
-              resource: {
-                buffer: buf,
-                offset: chunkStart * bpe,
-                size: chunkSize * bpe,
-              },
-            });
-          }
-          bindingIndex++;
-        }
-
-        // Append uniform at end if not already inserted
-        if (configBuf && (uniformIdx === undefined || bindingIndex <= uniformIdx)) {
-          entries.push({ binding: bindingIndex, resource: { buffer: configBuf } });
-        }
+        buildBindings(bindingNames, buffers, configBuf,
+          (idx, name, buf) => {
+            const mode = chunking.modes[name] ?? "chunked";
+            if (mode === "scalar") {
+              entries.push({ binding: idx, resource: { buffer: buf } });
+            } else {
+              const bpe = chunking.bytesPerElement?.[name] ?? dataTypeBpe(spec.bindings[name].type);
+              entries.push({ binding: idx, resource: { buffer: buf, offset: chunkStart * bpe, size: chunkSize * bpe } });
+            }
+          },
+          (idx, buf) => entries.push({ binding: idx, resource: { buffer: buf } }),
+        );
 
         const bindGroup = profiledCreateBindGroup(device, {
           layout: pipeline.getBindGroupLayout(0),
           entries,
         });
+        for (const entry of entries) trackSharedEncoderWrite(entry.resource.buffer);
 
-        // Track writes
-        for (const entry of entries) {
-          trackSharedEncoderWrite(entry.resource.buffer);
-        }
-
-        // Compute grid for this chunk's element count
-        const grid = gridFn(patchedUniforms);
-
-        // Dispatch
-        dispatchComputePass(pipeline, bindGroup, ...grid);
+        dispatchComputePass(pipeline, bindGroup, ...gridFn(patchedUniforms));
       }
     },
 
