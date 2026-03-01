@@ -15,7 +15,7 @@ import {
 } from "../gpu-context";
 import { gpuContext } from "../webgpu-state";
 import { createTensor, createTrackedBuffer } from "../tensor";
-import { bufferPool } from "../buffer-pool";
+import { bufferPool, destroyCopy } from "../buffer-pool";
 import { allocateOutputBuffer } from "../buffer-arena";
 import type { TileKernelSpec } from "../tile-ir";
 import { elementwiseGrid } from "../tile-ir";
@@ -237,8 +237,8 @@ export function fusedCrossEntropyForward(
     logitsT.buffer, targetsT.buffer, config.batchSize, config.vocabSize,
   );
   // Destroy contiguous copies if created (deferred for GPU fence)
-  if (logitsT !== logits) { bufferPool.decRef(logitsT.buffer); bufferPool.deferredDestroy(logitsT.buffer, logitsT.size * dtypeBytes(logitsT.dtype)); }
-  if (targetsT !== targets) { bufferPool.decRef(targetsT.buffer); bufferPool.deferredDestroy(targetsT.buffer, targetsT.size * dtypeBytes(targetsT.dtype)); }
+  if (logitsT !== logits) destroyCopy(logitsT);
+  if (targetsT !== targets) destroyCopy(targetsT);
   return createTensor([config.batchSize], outBuf, undefined, 0, "f32");
 }
 
@@ -256,9 +256,9 @@ export function fusedCrossEntropyBackward(
     config.batchSize, config.vocabSize,
   );
   // Destroy contiguous copies if created (deferred for GPU fence)
-  if (logitsT !== logits) { bufferPool.decRef(logitsT.buffer); bufferPool.deferredDestroy(logitsT.buffer, logitsT.size * dtypeBytes(logitsT.dtype)); }
-  if (targetsT !== targets) { bufferPool.decRef(targetsT.buffer); bufferPool.deferredDestroy(targetsT.buffer, targetsT.size * dtypeBytes(targetsT.dtype)); }
-  if (gradT !== gradOutput) { bufferPool.decRef(gradT.buffer); bufferPool.deferredDestroy(gradT.buffer, gradT.size * dtypeBytes(gradT.dtype)); }
+  if (logitsT !== logits) destroyCopy(logitsT);
+  if (targetsT !== targets) destroyCopy(targetsT);
+  if (gradT !== gradOutput) destroyCopy(gradT);
   return createTensor([config.batchSize, config.vocabSize], outBuf, undefined, 0, "f32");
 }
 
@@ -280,9 +280,9 @@ export function fusedLayerNormForward(
     config.numRows, config.featureDim, config.eps,
   );
   // Destroy contiguous copies if created (deferred for GPU fence)
-  if (xT !== x) { bufferPool.decRef(xT.buffer); bufferPool.deferredDestroy(xT.buffer, xT.size * dtypeBytes(xT.dtype)); }
-  if (weightT !== weight) { bufferPool.decRef(weightT.buffer); bufferPool.deferredDestroy(weightT.buffer, weightT.size * dtypeBytes(weightT.dtype)); }
-  if (biasT !== bias) { bufferPool.decRef(biasT.buffer); bufferPool.deferredDestroy(biasT.buffer, biasT.size * dtypeBytes(biasT.dtype)); }
+  if (xT !== x) destroyCopy(xT);
+  if (weightT !== weight) destroyCopy(weightT);
+  if (biasT !== bias) destroyCopy(biasT);
   const outShape: number[] = [];
   // Reconstruct shape: [...batch_dims, featureDim] = same as input
   for (let i = 0; i < xT.shape.length; i++) outShape.push(xT.shape[i]);
@@ -305,9 +305,9 @@ export function fusedLayerNormBackwardGradX(
   );
 
   // Destroy contiguous copies if created (deferred for GPU fence)
-  if (gradT !== gradOutput) { bufferPool.decRef(gradT.buffer); bufferPool.deferredDestroy(gradT.buffer, gradT.size * dtypeBytes(gradT.dtype)); }
-  if (xT !== x) { bufferPool.decRef(xT.buffer); bufferPool.deferredDestroy(xT.buffer, xT.size * dtypeBytes(xT.dtype)); }
-  if (weightT !== weight) { bufferPool.decRef(weightT.buffer); bufferPool.deferredDestroy(weightT.buffer, weightT.size * dtypeBytes(weightT.dtype)); }
+  if (gradT !== gradOutput) destroyCopy(gradT);
+  if (xT !== x) destroyCopy(xT);
+  if (weightT !== weight) destroyCopy(weightT);
 
   const gradXShape: number[] = [];
   for (let i = 0; i < xT.shape.length; i++) gradXShape.push(xT.shape[i]);
@@ -327,8 +327,8 @@ export function fusedLayerNormBackwardGradWeightBias(
   );
 
   // Destroy contiguous copies if created (deferred for GPU fence)
-  if (gradT !== gradOutput) { bufferPool.decRef(gradT.buffer); bufferPool.deferredDestroy(gradT.buffer, gradT.size * dtypeBytes(gradT.dtype)); }
-  if (xT !== x) { bufferPool.decRef(xT.buffer); bufferPool.deferredDestroy(xT.buffer, xT.size * dtypeBytes(xT.dtype)); }
+  if (gradT !== gradOutput) destroyCopy(gradT);
+  if (xT !== x) destroyCopy(xT);
 
   const shape = [config.featureDim];
   return {
@@ -352,8 +352,8 @@ export function fusedRMSNormForward(
     xT.buffer, weightT.buffer,
     config.numRows, config.featureDim, config.eps,
   );
-  if (xT !== x) { bufferPool.decRef(xT.buffer); bufferPool.deferredDestroy(xT.buffer, xT.size * dtypeBytes(xT.dtype)); }
-  if (weightT !== weight) { bufferPool.decRef(weightT.buffer); bufferPool.deferredDestroy(weightT.buffer, weightT.size * dtypeBytes(weightT.dtype)); }
+  if (xT !== x) destroyCopy(xT);
+  if (weightT !== weight) destroyCopy(weightT);
   const outShape: number[] = [];
   for (let i = 0; i < xT.shape.length; i++) outShape.push(xT.shape[i]);
   return createTensor(outShape, outBuf, undefined, 0, "f32");
@@ -372,9 +372,9 @@ export function fusedRMSNormBackwardGradX(
     goT.buffer, xT.buffer, wT.buffer,
     config.numRows, config.featureDim, config.eps,
   );
-  if (goT !== gradOutput) { bufferPool.decRef(goT.buffer); bufferPool.deferredDestroy(goT.buffer, goT.size * dtypeBytes(goT.dtype)); }
-  if (xT !== x) { bufferPool.decRef(xT.buffer); bufferPool.deferredDestroy(xT.buffer, xT.size * dtypeBytes(xT.dtype)); }
-  if (wT !== weight) { bufferPool.decRef(wT.buffer); bufferPool.deferredDestroy(wT.buffer, wT.size * dtypeBytes(wT.dtype)); }
+  if (goT !== gradOutput) destroyCopy(goT);
+  if (xT !== x) destroyCopy(xT);
+  if (wT !== weight) destroyCopy(wT);
   const outShape: number[] = [];
   for (let i = 0; i < xT.shape.length; i++) outShape.push(xT.shape[i]);
   return createTensor(outShape, outBuf, undefined, 0, "f32");
@@ -392,8 +392,8 @@ export function fusedRMSNormBackwardGradWeight(
     goT.buffer, xT.buffer,
     config.numRows, config.featureDim, config.eps,
   );
-  if (goT !== gradOutput) { bufferPool.decRef(goT.buffer); bufferPool.deferredDestroy(goT.buffer, goT.size * dtypeBytes(goT.dtype)); }
-  if (xT !== x) { bufferPool.decRef(xT.buffer); bufferPool.deferredDestroy(xT.buffer, xT.size * dtypeBytes(xT.dtype)); }
+  if (goT !== gradOutput) destroyCopy(goT);
+  if (xT !== x) destroyCopy(xT);
   return createTensor([config.featureDim], outBuf, undefined, 0, "f32");
 }
 
@@ -417,10 +417,9 @@ export function fusedAttentionForward(
   );
 
   // Destroy contiguous copies if created (deferred for GPU fence)
-  const bpe = 4; // f32
-  if (qT !== q) { bufferPool.decRef(qT.buffer); bufferPool.deferredDestroy(qT.buffer, qT.size * bpe); }
-  if (kT !== k) { bufferPool.decRef(kT.buffer); bufferPool.deferredDestroy(kT.buffer, kT.size * bpe); }
-  if (vT !== v) { bufferPool.decRef(vT.buffer); bufferPool.deferredDestroy(vT.buffer, vT.size * bpe); }
+  if (qT !== q) destroyCopy(qT);
+  if (kT !== k) destroyCopy(kT);
+  if (vT !== v) destroyCopy(vT);
 
   const outShape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
   const lseShape = [config.batchSize, config.numHeads, config.seqLen];
@@ -472,13 +471,12 @@ export function fusedAttentionBackward(
   bufferPool.deferredDestroy(dBuf, dBufSize);
 
   // Destroy contiguous copies if created (deferred for GPU fence)
-  const bpe = 4; // f32
-  if (qT !== q) { bufferPool.decRef(qT.buffer); bufferPool.deferredDestroy(qT.buffer, qT.size * bpe); }
-  if (kT !== k) { bufferPool.decRef(kT.buffer); bufferPool.deferredDestroy(kT.buffer, kT.size * bpe); }
-  if (vT !== v) { bufferPool.decRef(vT.buffer); bufferPool.deferredDestroy(vT.buffer, vT.size * bpe); }
-  if (lseT !== logsumexp) { bufferPool.decRef(lseT.buffer); bufferPool.deferredDestroy(lseT.buffer, lseT.size * bpe); }
-  if (dOT !== dO) { bufferPool.decRef(dOT.buffer); bufferPool.deferredDestroy(dOT.buffer, dOT.size * bpe); }
-  if (oT !== output) { bufferPool.decRef(oT.buffer); bufferPool.deferredDestroy(oT.buffer, oT.size * bpe); }
+  if (qT !== q) destroyCopy(qT);
+  if (kT !== k) destroyCopy(kT);
+  if (vT !== v) destroyCopy(vT);
+  if (lseT !== logsumexp) destroyCopy(lseT);
+  if (dOT !== dO) destroyCopy(dOT);
+  if (oT !== output) destroyCopy(oT);
 
   const gradShape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
   return {

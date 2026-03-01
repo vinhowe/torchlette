@@ -882,6 +882,16 @@ export function decRefBuffer(buffer: GPUBuffer): void {
   bufferPool.decRef(buffer);
 }
 
+/**
+ * Release a contiguous copy's buffer if one was created.
+ * Common pattern: `if (copy !== original) destroyCopy(copy)`.
+ */
+export function destroyCopy(tensor: { buffer: GPUBuffer; size: number; dtype: string }): void {
+  const bytes = tensor.size * (tensor.dtype === "f16" ? 2 : 4);
+  bufferPool.decRef(tensor.buffer);
+  bufferPool.deferredDestroy(tensor.buffer, bytes);
+}
+
 // ============================================================================
 // Deferred GPU Fence (Phase 2: Async markStep)
 // ============================================================================
