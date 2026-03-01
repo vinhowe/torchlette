@@ -67,7 +67,7 @@ export {
   setArenaExternalInputBuffers, clearArenaExternalInputBuffers,
   getArenaConflictDetected, clearArenaConflictDetected,
   hasArenaExternalConflicts, setActiveArena, clearActiveArena,
-  getArenaResolveIndex, setArenaResolveIndexTo, isArenaBuffer, classifyBuffer,
+  getArenaResolveIndex, setArenaResolveIndexTo, isArenaBuffer,
   destroyArena, arenaAllocAt, prePinOutputBuffers, resolveOutputBuffer,
   getArenaResolveStats,
 } from "./buffer-arena";

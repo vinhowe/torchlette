@@ -17,7 +17,7 @@ import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage, STORAGE_BUFFER_USAGE, asGPUTensor } from "./gpu-types";
 import {
   arenaBufferSet, trackSharedEncoderWrite, requireContext,
-  replayPinnedBufferSet, paramsSequenceSet,
+  replayPinnedBufferSet,
   outputSeqIndex, getOutputSeqIndex, setOutputSeqIndex,
 } from "./webgpu-state";
 import { createTrackedBuffer } from "./tensor";
@@ -269,12 +269,6 @@ export function isArenaBuffer(buffer: GPUBuffer): boolean {
   return arenaBufferSet.has(buffer);
 }
 
-/** Classify a buffer for replay debugging. */
-export function classifyBuffer(buffer: GPUBuffer): string {
-  if (arenaBufferSet.has(buffer)) return "arena";
-  if (paramsSequenceSet.has(buffer)) return "params-seq";
-  return `other(size=${buffer.size})`;
-}
 
 /**
  * Destroy all buffers in an arena and remove them from the arena set.
