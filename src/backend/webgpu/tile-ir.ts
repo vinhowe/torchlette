@@ -1627,46 +1627,31 @@ export class KernelContext {
     return ok;
   }
 
-  /** Tree sum reduction: `smem[0] = sum(smem[0..wgSize-1])`. Emits log2(wgSize) if+barrier pairs. */
+  /** Tree reduction: `smem[0] = op(smem[0..wgSize-1])`. Emits log2(wgSize) if+barrier pairs. */
+  private _treeReduce(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number,
+      op: "sum" | "max" | "min", combine: (a: BlockExpr, b: BlockExpr) => BlockExpr): void {
+    if (this.canUseSubgroups(wgSize)) {
+      this._treeReduceSubgroup(smem, tid, wgSize, op);
+      return;
+    }
+    for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
+      this.ifThen(tid.lt(this.u32(stride)), () => {
+        smem.write(tid, combine(smem.read(tid), smem.read(tid.add(this.u32(stride)))));
+      });
+      this.barrier();
+    }
+  }
+
   treeReduceSum(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number): void {
-    if (this.canUseSubgroups(wgSize)) {
-      this._treeReduceSubgroup(smem, tid, wgSize, "sum");
-      return;
-    }
-    for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
-      this.ifThen(tid.lt(this.u32(stride)), () => {
-        smem.write(tid, smem.read(tid).add(smem.read(tid.add(this.u32(stride)))));
-      });
-      this.barrier();
-    }
+    this._treeReduce(smem, tid, wgSize, "sum", (a, b) => a.add(b));
   }
 
-  /** Tree max reduction: `smem[0] = max(smem[0..wgSize-1])`. */
   treeReduceMax(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number): void {
-    if (this.canUseSubgroups(wgSize)) {
-      this._treeReduceSubgroup(smem, tid, wgSize, "max");
-      return;
-    }
-    for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
-      this.ifThen(tid.lt(this.u32(stride)), () => {
-        smem.write(tid, smem.read(tid).max(smem.read(tid.add(this.u32(stride)))));
-      });
-      this.barrier();
-    }
+    this._treeReduce(smem, tid, wgSize, "max", (a, b) => a.max(b));
   }
 
-  /** Tree min reduction: `smem[0] = min(smem[0..wgSize-1])`. */
   treeReduceMin(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number): void {
-    if (this.canUseSubgroups(wgSize)) {
-      this._treeReduceSubgroup(smem, tid, wgSize, "min");
-      return;
-    }
-    for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
-      this.ifThen(tid.lt(this.u32(stride)), () => {
-        smem.write(tid, smem.read(tid).min(smem.read(tid.add(this.u32(stride)))));
-      });
-      this.barrier();
-    }
+    this._treeReduce(smem, tid, wgSize, "min", (a, b) => a.min(b));
   }
 
   /**
@@ -2117,82 +2102,6 @@ export class KernelContext {
   }
 
   /**
-   * Cooperatively load a 1D tile from a global buffer into shared memory.
-   * Each thread loads WG-strided elements with automatic bounds checking.
-   * Includes a trailing workgroupBarrier() so the shared memory is ready to read.
-   *
-   * Like Triton's `tl.load` for shared memory tiles:
-   *   smem[i] = buffer[baseOffset + i]  if baseOffset + i is in bounds
-   *   smem[i] = fallback               otherwise
-   *
-   * @param tid        - Thread index within workgroup (localIndex)
-   * @param wgSize     - Workgroup size
-   * @param smem       - Shared memory array to write into
-   * @param count      - Number of elements to load
-   * @param loadFn     - Function mapping tile-local index → value to store
-   */
-  tileLoad(
-    tid: BlockExpr, wgSize: number,
-    smem: SharedArrayHandle,
-    count: BlockExpr | number,
-    loadFn: (i: BlockExpr) => BlockExpr,
-  ): void {
-    const bound = typeof count === "number" ? this.u32(count) : count;
-    this.stridedFor(tid, bound, wgSize, (i) => {
-      smem.write(i, loadFn(i));
-    });
-    this.barrier();
-  }
-
-  /**
-   * Cooperatively store a 1D tile from shared memory back to a global buffer.
-   * Each thread writes WG-strided elements with automatic bounds checking.
-   * Includes a leading workgroupBarrier() to ensure shared memory reads are consistent.
-   *
-   * @param tid       - Thread index within workgroup (localIndex)
-   * @param wgSize    - Workgroup size
-   * @param smem      - Shared memory array to read from
-   * @param count     - Number of elements to store
-   * @param storeFn   - Function mapping (index, value) → void. Should emit a store.
-   */
-  tileStore(
-    tid: BlockExpr, wgSize: number,
-    smem: SharedArrayHandle,
-    count: BlockExpr | number,
-    storeFn: (i: BlockExpr, val: BlockExpr) => void,
-  ): void {
-    this.barrier();
-    const bound = typeof count === "number" ? this.u32(count) : count;
-    this.stridedFor(tid, bound, wgSize, (i) => {
-      storeFn(i, smem.read(i));
-    });
-  }
-
-  /**
-   * Cooperatively load a 1D tile from a global buffer into a vec4 shared memory array.
-   * Each thread loads WG-strided vec4 elements with automatic bounds checking.
-   * Includes a trailing workgroupBarrier().
-   *
-   * @param tid        - Thread index within workgroup (localIndex)
-   * @param wgSize     - Workgroup size
-   * @param smem       - Vec4 shared memory array
-   * @param count      - Number of vec4 elements to load
-   * @param loadFn     - Function mapping tile-local index → vec4 value
-   */
-  tileLoadVec4(
-    tid: BlockExpr, wgSize: number,
-    smem: Vec4ArrayHandle,
-    count: BlockExpr | number,
-    loadFn: (i: BlockExpr) => BlockExpr,
-  ): void {
-    const bound = typeof count === "number" ? this.u32(count) : count;
-    this.stridedFor(tid, bound, wgSize, (i) => {
-      smem.write(i, loadFn(i));
-    });
-    this.barrier();
-  }
-
-  /**
    * Cooperatively load two vec4 shared memory tiles in a single strided loop.
    * Uses one loop and one barrier instead of two, saving one barrier per tile pair.
    * Common pattern in attention kernels (load K and V simultaneously).
@@ -2274,49 +2183,6 @@ export class KernelContext {
     this.barrier();
   }
 
-  /** Hillis-Steele exclusive parallel prefix scan in shared memory.
-   *  After the call, smem[tid] = op(smem[0], ..., smem[tid-1]), smem[0] = identity.
-   *  Identity: 0.0 for sum, -Infinity for max. */
-  exclusiveScan(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number, op: "sum" | "max"): void {
-    // Run inclusive scan first
-    this.inclusiveScan(smem, tid, wgSize, op);
-    // Shift right: exclusive[i] = inclusive[i-1], exclusive[0] = identity
-    const inclusive = smem.read(tid);
-    this.barrier();
-    const identity = op === "sum" ? this.f32(0.0) : this.f32(-1e38);
-    const shifted = this.blockWhere(tid.gt(this.u32(0)), smem.read(tid.sub(this.u32(1))), identity);
-    smem.write(tid, shifted);
-    // Need barrier before anyone reads the shifted values
-    this.barrier();
-    // Suppress unused variable warning — inclusive was read before barrier
-    void inclusive;
-  }
-
-  // -- Generic associative scan (like `tl.associative_scan`) --
-
-  /** Hillis-Steele inclusive scan with a user-defined associative combine function.
-   *  After the call, smem[tid] = combine(smem[0], combine(smem[1], ...smem[tid])).
-   *  `combine(a, b)` must be associative. */
-  associativeScan(
-    smem: SharedArrayHandle,
-    tid: BlockExpr,
-    wgSize: number,
-    combine: (a: BlockExpr, b: BlockExpr) => BlockExpr,
-  ): void {
-    for (let stride = 1; stride < wgSize; stride *= 2) {
-      this.barrier();
-      // All threads read their values into registers before any writes
-      const curr = this.emitLet(`scan_c_${stride}`, smem.read(tid));
-      const prev = this.emitLet(`scan_p_${stride}`, smem.read(tid.sub(this.u32(stride))));
-      const merged = combine(prev, curr);
-      this.barrier(); // ensure all reads complete before writes
-      this.ifThen(tid.ge(this.u32(stride)), () => {
-        smem.write(tid, merged);
-      });
-    }
-    this.barrier();
-  }
-
   // -- In-kernel RNG (Philox 2x32-10) --
 
   /**
@@ -2388,54 +2254,6 @@ export class KernelContext {
     const [r0, r1] = this.philox2x32(seed, offset);
     const scale = this.f32(2.3283064365386963e-10);
     return [r0.toF32().mul(scale), r1.toF32().mul(scale)];
-  }
-
-  // -- Argmax / Argmin reductions --
-
-  /** Tree reduction finding the index of the maximum value.
-   *  `valSmem[tid]` holds values, `idxSmem[tid]` holds corresponding indices.
-   *  After the call, `valSmem[0]` = max value, `idxSmem[0]` = its index. */
-  treeReduceArgmax(
-    valSmem: SharedArrayHandle,
-    idxSmem: SharedArrayHandle,
-    tid: BlockExpr,
-    wgSize: number,
-  ): void {
-    for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
-      this.barrier();
-      this.ifThen(tid.lt(this.u32(stride)), () => {
-        const myVal = this.emitLet(`argmax_my_${stride}`, valSmem.read(tid));
-        const otherVal = this.emitLet(`argmax_other_${stride}`, valSmem.read(tid.add(this.u32(stride))));
-        const myIdx = this.emitLet(`argmax_myidx_${stride}`, idxSmem.read(tid));
-        const otherIdx = this.emitLet(`argmax_otheridx_${stride}`, idxSmem.read(tid.add(this.u32(stride))));
-        const cond = otherVal.gt(myVal);
-        valSmem.write(tid, cond.select(otherVal, myVal));
-        idxSmem.write(tid, cond.select(otherIdx, myIdx));
-      });
-    }
-  }
-
-  /** Tree reduction finding the index of the minimum value.
-   *  `valSmem[tid]` holds values, `idxSmem[tid]` holds corresponding indices.
-   *  After the call, `valSmem[0]` = min value, `idxSmem[0]` = its index. */
-  treeReduceArgmin(
-    valSmem: SharedArrayHandle,
-    idxSmem: SharedArrayHandle,
-    tid: BlockExpr,
-    wgSize: number,
-  ): void {
-    for (let stride = wgSize >> 1; stride >= 1; stride >>= 1) {
-      this.barrier();
-      this.ifThen(tid.lt(this.u32(stride)), () => {
-        const myVal = this.emitLet(`argmin_my_${stride}`, valSmem.read(tid));
-        const otherVal = this.emitLet(`argmin_other_${stride}`, valSmem.read(tid.add(this.u32(stride))));
-        const myIdx = this.emitLet(`argmin_myidx_${stride}`, idxSmem.read(tid));
-        const otherIdx = this.emitLet(`argmin_otheridx_${stride}`, idxSmem.read(tid.add(this.u32(stride))));
-        const cond = otherVal.lt(myVal);
-        valSmem.write(tid, cond.select(otherVal, myVal));
-        idxSmem.write(tid, cond.select(otherIdx, myIdx));
-      });
-    }
   }
 
   // ---- Triton-like Tile API (delegates to internal BlockOps) ----
