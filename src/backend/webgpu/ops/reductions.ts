@@ -31,23 +31,9 @@ import { isUnaryOp as isUnaryOpFromRegistry } from "./registry";
 import { contiguous } from "./views";
 import { createTileKernelDispatcher } from "../tile-dispatch";
 import {
-  makeSumDimSpec,
-  makeSumFullSpec,
-  makeMaxDimSpec,
-  makeMaxFullSpec,
-  makeMinDimSpec,
-  makeMinFullSpec,
+  makeReductionSpec,
+  dimInfo,
   makeMeanDivSpec,
-  makeSumDimWithPreambleSpec,
-  makeSumFullWithPreambleSpec,
-  makeSumDimWithPreambleChainSpec,
-  makeSumFullWithPreambleChainSpec,
-  makeSumDimWithPreambleEpilogueSpec,
-  makeSumFullWithPreambleEpilogueSpec,
-  makeSumDimWithEpilogueSpec,
-  makeSumFullWithEpilogueSpec,
-  makeMaxDimWithEpilogueSpec,
-  makeMaxFullWithEpilogueSpec,
   getChunkedSumWGSL,
   getFinalSumWGSL,
   type ReductionEpilogueOpDesc,
@@ -157,7 +143,7 @@ function prepareDimReduction(
 // ============================================================================
 
 const dispatcherCache = new Map<string, ReturnType<typeof createTileKernelDispatcher>>();
-function getCachedDispatcher(key: string, specFactory: () => ReturnType<typeof makeSumFullSpec>) {
+function getCachedDispatcher(key: string, specFactory: () => ReturnType<typeof makeReductionSpec>) {
   let d = dispatcherCache.get(key);
   if (!d) { d = createTileKernelDispatcher(specFactory()); dispatcherCache.set(key, d); }
   return d;
@@ -220,8 +206,9 @@ export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
 
   const useParallel = reductionSize > 64;
-  const spec = makeSumDimSpec(inputShape, inputStrides, normalizedDims,
-    outShape, outStrides, inputToOutDim, useParallel);
+  const spec = makeReductionSpec({ reduceOp: "sum",
+    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, useParallel),
+  });
   const dispatcher = createTileKernelDispatcher(spec);
 
   dispatcher.dispatch(
@@ -255,7 +242,7 @@ function sumFullReduction(
 
   const outBuffer = resolveOutputBuffer(ctx.device, 4, [tensor.buffer]);
 
-  getCachedDispatcher("sumFull", makeSumFullSpec).dispatch(
+  getCachedDispatcher("sumFull", () => makeReductionSpec({ reduceOp: "sum" })).dispatch(
     { input: tensor.buffer, out: outBuffer },
     { size: inputSize },
   );
@@ -390,10 +377,10 @@ export function sumDimWithPreamble(
   }
   const outBuffer = resolveOutputBuffer(requireContext().device, outSize * 4, inputBuffers);
 
-  const spec = makeSumDimWithPreambleSpec(
-    preambleOp, arity, inputShape, inputStrides,
-    normalizedDims, outShape, outStrides, inputToOutDim,
-  );
+  const spec = makeReductionSpec({ reduceOp: "sum",
+    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, false),
+    preamble: { chainOps: [{ op: preambleOp, arity }], totalInputs: arity, inputDtypes: [] },
+  });
   const dispatcher = createTileKernelDispatcher(spec);
 
   const buffers: Record<string, GPUBuffer> = { out: outBuffer };
@@ -424,7 +411,9 @@ function sumFullReductionWithPreamble(
   }
   const outBuffer = resolveOutputBuffer(requireContext().device, 4, inputBuffers);
 
-  const spec = makeSumFullWithPreambleSpec(preambleOp, arity);
+  const spec = makeReductionSpec({ reduceOp: "sum",
+    preamble: { chainOps: [{ op: preambleOp, arity }], totalInputs: arity, inputDtypes: [] },
+  });
   const dispatcher = createTileKernelDispatcher(spec);
 
   const buffers: Record<string, GPUBuffer> = { out: outBuffer };
@@ -474,11 +463,10 @@ export function sumDimWithPreambleChain(
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, inputBuffers);
 
   const useParallel = reductionSize > 64;
-  const spec = makeSumDimWithPreambleChainSpec(
-    chainOps, inputs.length, inputDtypes,
-    inputShape, inputStrides, normalizedDims,
-    outShape, outStrides, inputToOutDim, useParallel,
-  );
+  const spec = makeReductionSpec({ reduceOp: "sum",
+    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, useParallel),
+    preamble: { chainOps, totalInputs: inputs.length, inputDtypes },
+  });
   const dispatcher = createTileKernelDispatcher(spec);
 
   const buffers: Record<string, GPUBuffer> = { out: outBuffer };
@@ -506,7 +494,9 @@ function sumFullReductionWithPreambleChain(
   const inputBuffers = inputs.map(inp => asGPUTensor(inp).buffer);
   const outBuffer = resolveOutputBuffer(ctx.device, 4, inputBuffers);
 
-  const spec = makeSumFullWithPreambleChainSpec(chainOps, inputs.length, inputDtypes);
+  const spec = makeReductionSpec({ reduceOp: "sum",
+    preamble: { chainOps, totalInputs: inputs.length, inputDtypes },
+  });
   const dispatcher = createTileKernelDispatcher(spec);
 
   const buffers: Record<string, GPUBuffer> = { out: outBuffer };
@@ -595,12 +585,11 @@ export function sumWithPreambleEpilogue(
       const outBuffer = resolveOutputBuffer(ctx.device, outSize * bpe, allInputBuffers);
 
       const useParallel = reductionSize > 64;
-      const spec = makeSumDimWithPreambleEpilogueSpec(
-        chainOps, preambleInputs.length, preambleInputDtypes,
-        effectiveEpilogueOps, outputDtype,
-        inputShape, inputStrides, normalizedDims,
-        outShape, outStrides, inputToOutDim, useParallel,
-      );
+      const spec = makeReductionSpec({ reduceOp: "sum",
+        dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, useParallel),
+        preamble: { chainOps, totalInputs: preambleInputs.length, inputDtypes: preambleInputDtypes },
+        epilogue: { ops: effectiveEpilogueOps, outputDtype },
+      });
       const dispatcher = createTileKernelDispatcher(spec);
 
       const buffers: Record<string, GPUBuffer> = { out: outBuffer };
@@ -640,10 +629,10 @@ function sumFullWithPreambleEpilogue(
   ];
   const outBuffer = resolveOutputBuffer(ctx.device, bpe, allInputBuffers);
 
-  const spec = makeSumFullWithPreambleEpilogueSpec(
-    chainOps, preambleInputs.length, preambleInputDtypes,
-    epilogueOps, outputDtype,
-  );
+  const spec = makeReductionSpec({ reduceOp: "sum",
+    preamble: { chainOps, totalInputs: preambleInputs.length, inputDtypes: preambleInputDtypes },
+    epilogue: { ops: epilogueOps, outputDtype },
+  });
   const dispatcher = createTileKernelDispatcher(spec);
 
   const buffers: Record<string, GPUBuffer> = { out: outBuffer };
@@ -662,9 +651,6 @@ function sumFullWithPreambleEpilogue(
 // ============================================================================
 
 type MaxMinOp = "max" | "min";
-const maxMinDimSpecFactory = { max: makeMaxDimSpec, min: makeMinDimSpec };
-const maxMinFullSpecKey = { max: "maxFull" as const, min: "minFull" as const };
-const maxMinFullSpecFactory = { max: makeMaxFullSpec, min: makeMinFullSpec };
 
 function maxMinReduction(op: MaxMinOp, a: BackendTensor, options?: MaxOptions): BackendTensor {
   const ctx = requireContext();
@@ -691,8 +677,9 @@ function maxMinReduction(op: MaxMinOp, a: BackendTensor, options?: MaxOptions): 
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
 
   const useParallel = reductionSize > 64;
-  const spec = maxMinDimSpecFactory[op](inputShape, inputStrides, normalizedDims,
-    outShape, outStrides, inputToOutDim, useParallel);
+  const spec = makeReductionSpec({ reduceOp: op,
+    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, useParallel),
+  });
   const dispatcher = createTileKernelDispatcher(spec);
   dispatcher.dispatch({ input: tensor.buffer, out: outBuffer }, { outSize, reductionSize });
 
@@ -704,7 +691,7 @@ function maxMinFullReduction(op: MaxMinOp, ctx: WebGPUContext, tensor: WebGPUTen
     size: 4,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
-  getCachedDispatcher(maxMinFullSpecKey[op], maxMinFullSpecFactory[op]).dispatch(
+  getCachedDispatcher(`${op}Full`, () => makeReductionSpec({ reduceOp: op })).dispatch(
     { input: tensor.buffer, out: outBuffer },
     { size: tensor.size },
   );
@@ -799,7 +786,7 @@ export function sumWithEpilogue(
   if (!setup) {
     // Full reduction with epilogue
     const outBuffer = resolveOutputBuffer(ctx.device, bpe, [tensor.buffer]);
-    const spec = makeSumFullWithEpilogueSpec(epilogueOps, outputDtype);
+    const spec = makeReductionSpec({ reduceOp: "sum", epilogue: { ops: epilogueOps, outputDtype } });
     const dispatcher = createTileKernelDispatcher(spec);
     const buffers: Record<string, GPUBuffer> = { input: tensor.buffer, out: outBuffer };
     addEpilogueBindings(buffers, epilogueOps, epilogueInputs);
@@ -813,8 +800,10 @@ export function sumWithEpilogue(
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * bpe, [tensor.buffer]);
 
   const useParallel = reductionSize > 64;
-  const spec = makeSumDimWithEpilogueSpec(inputShape, inputStrides, normalizedDims,
-    outShape, outStrides, inputToOutDim, useParallel, epilogueOps, outputDtype);
+  const spec = makeReductionSpec({ reduceOp: "sum",
+    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, useParallel),
+    epilogue: { ops: epilogueOps, outputDtype },
+  });
   const dispatcher = createTileKernelDispatcher(spec);
 
   const buffers: Record<string, GPUBuffer> = { input: tensor.buffer, out: outBuffer };
@@ -853,7 +842,7 @@ export function maxWithEpilogue(
 
   if (!setup) {
     const outBuffer = resolveOutputBuffer(ctx.device, bpe, [tensor.buffer]);
-    const spec = makeMaxFullWithEpilogueSpec(epilogueOps, outputDtype);
+    const spec = makeReductionSpec({ reduceOp: "max", epilogue: { ops: epilogueOps, outputDtype } });
     const dispatcher = createTileKernelDispatcher(spec);
     const buffers: Record<string, GPUBuffer> = { input: tensor.buffer, out: outBuffer };
     addEpilogueBindings(buffers, epilogueOps, epilogueInputs);
@@ -866,8 +855,10 @@ export function maxWithEpilogue(
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * bpe, [tensor.buffer]);
 
   const useParallel = reductionSize > 64;
-  const spec = makeMaxDimWithEpilogueSpec(inputShape, inputStrides, normalizedDims,
-    outShape, outStrides, inputToOutDim, useParallel, epilogueOps, outputDtype);
+  const spec = makeReductionSpec({ reduceOp: "max",
+    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, useParallel),
+    epilogue: { ops: epilogueOps, outputDtype },
+  });
   const dispatcher = createTileKernelDispatcher(spec);
 
   const buffers: Record<string, GPUBuffer> = { input: tensor.buffer, out: outBuffer };

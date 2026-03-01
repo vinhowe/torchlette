@@ -850,31 +850,15 @@ function makeNode<T extends IRNode>(partial: Omit<T, "id">): T {
   return node;
 }
 
-/** Resolve a BlockExpr or number into an IRNode. Numbers become f32 constants. */
-function resolveArg(arg: BlockExpr | number): IRNode {
+/** Resolve a BlockExpr or number into an IRNode. Numbers become constants of the given type. */
+function resolveArgAs(arg: BlockExpr | number, dtype: DataType = "f32"): IRNode {
   if (typeof arg === "number") {
-    return makeNode<ConstNode>({
-      kind: "const",
-      valueType: "scalar",
-      dataType: "f32",
-      value: arg,
-    });
+    return makeNode<ConstNode>({ kind: "const", valueType: "scalar", dataType: dtype, value: arg });
   }
   return arg.node;
 }
-
-/** Like resolveArg but creates u32 constants (for bitwise ops). */
-function resolveArgU32(arg: BlockExpr | number): IRNode {
-  if (typeof arg === "number") {
-    return makeNode<ConstNode>({
-      kind: "const",
-      valueType: "scalar",
-      dataType: "u32",
-      value: arg,
-    });
-  }
-  return arg.node;
-}
+const resolveArg = (arg: BlockExpr | number) => resolveArgAs(arg, "f32");
+const resolveArgU32 = (arg: BlockExpr | number) => resolveArgAs(arg, "u32");
 
 /** Determine the resulting valueType: block if either operand is block. */
 function promoteValueType(a: ValueType, b: ValueType): ValueType {
@@ -888,232 +872,52 @@ function promoteValueType(a: ValueType, b: ValueType): ValueType {
 export class BlockExpr {
   constructor(readonly node: IRNode) {}
 
+  // -- Private helpers for node construction --
+  private _binOp(op: BinaryOp, other: BlockExpr | number, u32Rhs: boolean, dt: DataType): BlockExpr {
+    const rhs = u32Rhs ? resolveArgU32(other) : resolveArg(other);
+    return new BlockExpr(makeNode<BinaryNode>({
+      kind: "binary", op, lhs: this.node, rhs,
+      valueType: promoteValueType(this.node.valueType, rhs.valueType), dataType: dt,
+    }));
+  }
+
+  private _unaryOp(op: UnaryOp, dt?: DataType): BlockExpr {
+    return new BlockExpr(makeNode<UnaryNode>({
+      kind: "unary", op, input: this.node,
+      valueType: this.node.valueType, dataType: dt ?? this.node.dataType,
+    }));
+  }
+
   // -- Arithmetic --
-  add(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
-    return new BlockExpr(makeNode<BinaryNode>({
-      kind: "binary", op: "add",
-      lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: this.node.dataType,
-    }));
-  }
-
-  sub(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
-    return new BlockExpr(makeNode<BinaryNode>({
-      kind: "binary", op: "sub",
-      lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: this.node.dataType,
-    }));
-  }
-
-  mul(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
-    return new BlockExpr(makeNode<BinaryNode>({
-      kind: "binary", op: "mul",
-      lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: this.node.dataType,
-    }));
-  }
-
-  div(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
-    return new BlockExpr(makeNode<BinaryNode>({
-      kind: "binary", op: "div",
-      lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: this.node.dataType,
-    }));
-  }
-
-  mod(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
-    return new BlockExpr(makeNode<BinaryNode>({
-      kind: "binary", op: "mod",
-      lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: this.node.dataType,
-    }));
-  }
-
-  and(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArgU32(other);
-    return new BlockExpr(makeNode<BinaryNode>({
-      kind: "binary", op: "and",
-      lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: "u32",
-    }));
-  }
-
-  min(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
-    return new BlockExpr(makeNode<BinaryNode>({
-      kind: "binary", op: "min",
-      lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: this.node.dataType,
-    }));
-  }
-
-  max(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
-    return new BlockExpr(makeNode<BinaryNode>({
-      kind: "binary", op: "max",
-      lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: this.node.dataType,
-    }));
-  }
-
-  or(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArgU32(other);
-    return new BlockExpr(makeNode<BinaryNode>({
-      kind: "binary", op: "or",
-      lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: "u32",
-    }));
-  }
-
-  xor(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArgU32(other);
-    return new BlockExpr(makeNode<BinaryNode>({
-      kind: "binary", op: "xor",
-      lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: "u32",
-    }));
-  }
-
-  shr(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArgU32(other);
-    return new BlockExpr(makeNode<BinaryNode>({
-      kind: "binary", op: "shr",
-      lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: this.node.dataType,
-    }));
-  }
-
-  shl(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArgU32(other);
-    return new BlockExpr(makeNode<BinaryNode>({
-      kind: "binary", op: "shl",
-      lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: this.node.dataType,
-    }));
-  }
+  add(other: BlockExpr | number) { return this._binOp("add", other, false, this.node.dataType); }
+  sub(other: BlockExpr | number) { return this._binOp("sub", other, false, this.node.dataType); }
+  mul(other: BlockExpr | number) { return this._binOp("mul", other, false, this.node.dataType); }
+  div(other: BlockExpr | number) { return this._binOp("div", other, false, this.node.dataType); }
+  mod(other: BlockExpr | number) { return this._binOp("mod", other, false, this.node.dataType); }
+  min(other: BlockExpr | number) { return this._binOp("min", other, false, this.node.dataType); }
+  max(other: BlockExpr | number) { return this._binOp("max", other, false, this.node.dataType); }
+  and(other: BlockExpr | number) { return this._binOp("and", other, true, "u32"); }
+  or(other: BlockExpr | number) { return this._binOp("or", other, true, "u32"); }
+  xor(other: BlockExpr | number) { return this._binOp("xor", other, true, "u32"); }
+  shr(other: BlockExpr | number) { return this._binOp("shr", other, true, this.node.dataType); }
+  shl(other: BlockExpr | number) { return this._binOp("shl", other, true, this.node.dataType); }
 
   // -- Unary math --
-  rsqrt(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "rsqrt", input: this.node,
-      valueType: this.node.valueType, dataType: "f32",
-    }));
-  }
-
-  exp(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "exp", input: this.node,
-      valueType: this.node.valueType, dataType: "f32",
-    }));
-  }
-
-  log(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "log", input: this.node,
-      valueType: this.node.valueType, dataType: "f32",
-    }));
-  }
-
-  sqrt(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "sqrt", input: this.node,
-      valueType: this.node.valueType, dataType: "f32",
-    }));
-  }
-
-  abs(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "abs", input: this.node,
-      valueType: this.node.valueType, dataType: this.node.dataType,
-    }));
-  }
-
-  neg(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "neg", input: this.node,
-      valueType: this.node.valueType, dataType: this.node.dataType,
-    }));
-  }
-
-  tanh(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "tanh", input: this.node,
-      valueType: this.node.valueType, dataType: "f32",
-    }));
-  }
-
-  floor(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "floor", input: this.node,
-      valueType: this.node.valueType, dataType: this.node.dataType,
-    }));
-  }
-
-  ceil(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "ceil", input: this.node,
-      valueType: this.node.valueType, dataType: this.node.dataType,
-    }));
-  }
-
-  sin(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "sin", input: this.node,
-      valueType: this.node.valueType, dataType: "f32",
-    }));
-  }
-
-  cos(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "cos", input: this.node,
-      valueType: this.node.valueType, dataType: "f32",
-    }));
-  }
-
-  round(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "round", input: this.node,
-      valueType: this.node.valueType, dataType: this.node.dataType,
-    }));
-  }
-
-  sign(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "sign", input: this.node,
-      valueType: this.node.valueType, dataType: this.node.dataType,
-    }));
-  }
-
-  exp2(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "exp2", input: this.node,
-      valueType: this.node.valueType, dataType: "f32",
-    }));
-  }
-
-  log2(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "log2", input: this.node,
-      valueType: this.node.valueType, dataType: "f32",
-    }));
-  }
+  rsqrt() { return this._unaryOp("rsqrt", "f32"); }
+  exp()   { return this._unaryOp("exp", "f32"); }
+  log()   { return this._unaryOp("log", "f32"); }
+  sqrt()  { return this._unaryOp("sqrt", "f32"); }
+  tanh()  { return this._unaryOp("tanh", "f32"); }
+  sin()   { return this._unaryOp("sin", "f32"); }
+  cos()   { return this._unaryOp("cos", "f32"); }
+  exp2()  { return this._unaryOp("exp2", "f32"); }
+  log2()  { return this._unaryOp("log2", "f32"); }
+  abs()   { return this._unaryOp("abs"); }
+  neg()   { return this._unaryOp("neg"); }
+  floor() { return this._unaryOp("floor"); }
+  ceil()  { return this._unaryOp("ceil"); }
+  round() { return this._unaryOp("round"); }
+  sign()  { return this._unaryOp("sign"); }
 
   /** Sigmoid activation: 1 / (1 + exp(-x)). Compound — no new IR node. */
   sigmoid(): BlockExpr {
@@ -1164,47 +968,21 @@ export class BlockExpr {
     return signX.mul(mkOne().sub(poly.mul(expTerm)));
   }
 
-  pow(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
-    return new BlockExpr(makeNode<BinaryNode>({
-      kind: "binary", op: "pow", lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: "f32",
-    }));
-  }
+  pow(other: BlockExpr | number) { return this._binOp("pow", other, false, "f32"); }
 
   // -- Type casts --
-  toF32(): BlockExpr {
-    if (this.node.dataType === "f32") return this;
+  private _castTo(dt: DataType): BlockExpr {
+    if (this.node.dataType === dt) return this;
     return new BlockExpr(makeNode<CastNode>({
-      kind: "cast", input: this.node, targetType: "f32",
-      valueType: this.node.valueType, dataType: "f32",
+      kind: "cast", input: this.node, targetType: dt,
+      valueType: this.node.valueType, dataType: dt,
     }));
   }
 
-  toU32(): BlockExpr {
-    if (this.node.dataType === "u32") return this;
-    return new BlockExpr(makeNode<CastNode>({
-      kind: "cast", input: this.node, targetType: "u32",
-      valueType: this.node.valueType, dataType: "u32",
-    }));
-  }
-
-  toI32(): BlockExpr {
-    if (this.node.dataType === "i32") return this;
-    return new BlockExpr(makeNode<CastNode>({
-      kind: "cast", input: this.node, targetType: "i32",
-      valueType: this.node.valueType, dataType: "i32",
-    }));
-  }
-
-  toF16(): BlockExpr {
-    if (this.node.dataType === "f16") return this;
-    return new BlockExpr(makeNode<CastNode>({
-      kind: "cast", input: this.node, targetType: "f16",
-      valueType: this.node.valueType, dataType: "f16",
-    }));
-  }
+  toF32() { return this._castTo("f32"); }
+  toU32() { return this._castTo("u32"); }
+  toI32() { return this._castTo("i32"); }
+  toF16() { return this._castTo("f16"); }
 
   // -- Bitcast (reinterpret bits, no conversion) --
   bitcastTo(dtype: DataType): BlockExpr {
@@ -1215,6 +993,13 @@ export class BlockExpr {
   }
 
   // -- Subgroup ops --
+  private _subgroupOp(kind: string): BlockExpr {
+    return new BlockExpr(makeNode({
+      kind, value: this.node,
+      valueType: this.node.valueType, dataType: this.node.dataType,
+    } as any));
+  }
+
   subgroupShuffleXor(mask: BlockExpr | number): BlockExpr {
     const m = resolveArgU32(mask);
     return new BlockExpr(makeNode<SubgroupShuffleXorNode>({
@@ -1223,40 +1008,11 @@ export class BlockExpr {
     }));
   }
 
-  subgroupAdd(): BlockExpr {
-    return new BlockExpr(makeNode<SubgroupAddNode>({
-      kind: "subgroupAdd", value: this.node,
-      valueType: this.node.valueType, dataType: this.node.dataType,
-    }));
-  }
-
-  subgroupMax(): BlockExpr {
-    return new BlockExpr(makeNode<SubgroupMaxNode>({
-      kind: "subgroupMax", value: this.node,
-      valueType: this.node.valueType, dataType: this.node.dataType,
-    }));
-  }
-
-  subgroupMin(): BlockExpr {
-    return new BlockExpr(makeNode<SubgroupMinNode>({
-      kind: "subgroupMin", value: this.node,
-      valueType: this.node.valueType, dataType: this.node.dataType,
-    }));
-  }
-
-  subgroupBroadcastFirst(): BlockExpr {
-    return new BlockExpr(makeNode<SubgroupBroadcastFirstNode>({
-      kind: "subgroupBroadcastFirst", value: this.node,
-      valueType: this.node.valueType, dataType: this.node.dataType,
-    }));
-  }
-
-  subgroupInclusiveAdd(): BlockExpr {
-    return new BlockExpr(makeNode<SubgroupInclusiveAddNode>({
-      kind: "subgroupInclusiveAdd", value: this.node,
-      valueType: this.node.valueType, dataType: this.node.dataType,
-    }));
-  }
+  subgroupAdd() { return this._subgroupOp("subgroupAdd"); }
+  subgroupMax() { return this._subgroupOp("subgroupMax"); }
+  subgroupMin() { return this._subgroupOp("subgroupMin"); }
+  subgroupBroadcastFirst() { return this._subgroupOp("subgroupBroadcastFirst"); }
+  subgroupInclusiveAdd() { return this._subgroupOp("subgroupInclusiveAdd"); }
 
   // -- Vec4 operations (for vec4-typed BlockExprs) --
 
@@ -1309,67 +1065,23 @@ export class BlockExpr {
   }
 
   // -- Comparisons --
-  eq(other: BlockExpr | number): BlockExpr {
+  private _cmpOp(op: CmpOp, other: BlockExpr | number): BlockExpr {
     const rhs = resolveArg(other);
     return new BlockExpr(makeNode<CmpNode>({
-      kind: "cmp", op: "eq", lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: "u32",
+      kind: "cmp", op, lhs: this.node, rhs,
+      valueType: promoteValueType(this.node.valueType, rhs.valueType), dataType: "u32",
     }));
   }
 
-  ne(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
-    return new BlockExpr(makeNode<CmpNode>({
-      kind: "cmp", op: "ne", lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: "u32",
-    }));
-  }
-
-  lt(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
-    return new BlockExpr(makeNode<CmpNode>({
-      kind: "cmp", op: "lt", lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: "u32",
-    }));
-  }
-
-  le(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
-    return new BlockExpr(makeNode<CmpNode>({
-      kind: "cmp", op: "le", lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: "u32",
-    }));
-  }
-
-  gt(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
-    return new BlockExpr(makeNode<CmpNode>({
-      kind: "cmp", op: "gt", lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: "u32",
-    }));
-  }
-
-  ge(other: BlockExpr | number): BlockExpr {
-    const rhs = resolveArg(other);
-    return new BlockExpr(makeNode<CmpNode>({
-      kind: "cmp", op: "ge", lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType),
-      dataType: "u32",
-    }));
-  }
+  eq(other: BlockExpr | number) { return this._cmpOp("eq", other); }
+  ne(other: BlockExpr | number) { return this._cmpOp("ne", other); }
+  lt(other: BlockExpr | number) { return this._cmpOp("lt", other); }
+  le(other: BlockExpr | number) { return this._cmpOp("le", other); }
+  gt(other: BlockExpr | number) { return this._cmpOp("gt", other); }
+  ge(other: BlockExpr | number) { return this._cmpOp("ge", other); }
 
   // -- Logical NOT --
-  not(): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op: "not", input: this.node,
-      valueType: this.node.valueType, dataType: this.node.dataType,
-    }));
-  }
+  not() { return this._unaryOp("not"); }
 
   // -- Select (ternary) --
   select(trueVal: BlockExpr | number, falseVal: BlockExpr | number): BlockExpr {
