@@ -72,7 +72,7 @@ export type VectorWidth = 1 | 2 | 4;
 /**
  * Determine the best vector width for a given shape and dtype.
  */
-export function selectVectorWidth(
+function selectVectorWidth(
   shape: number[],
   dtype: DType,
 ): VectorWidth {
@@ -91,7 +91,7 @@ export function selectVectorWidth(
 /**
  * Check if all inputs are compatible with vectorization at the given width.
  */
-export function canVectorize(
+function canVectorize(
   outputShape: number[],
   inputs: { shape: number[]; dtype: DType }[],
   vectorWidth: VectorWidth,
@@ -159,7 +159,7 @@ export interface GeneratedKernel {
  * Generate a cache key for a fusion recipe.
  * Supports multi-output fusion (§15.2).
  */
-export function generateKernelCacheKey(
+function generateKernelCacheKey(
   recipe: FusedKernelRecipe,
   vectorWidth: VectorWidth = 1,
 ): string {

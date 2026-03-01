@@ -30,12 +30,10 @@ import { getSizeClass } from "../../engine/memory-planning";
 import { resetDispatchSequence } from "./bind-group-cache";
 import { prePinOutputBuffers, pinnedOutputBuffers } from "./buffer-arena";
 
-// Re-exports from webgpu-state for backward compatibility
+// Re-exports from webgpu-state
 export type { BatchExecutionContext } from "./webgpu-state";
-export { activeBatch } from "./webgpu-state";
-export { sharedEncoderActive as sharedEncoder } from "./webgpu-state";
-export { sharedEncoderWriteSet, trackSharedEncoderWrite } from "./webgpu-state";
-export { getSubmitCount, resetSubmitCount, incrementSubmitCount, gpuSubmitCount } from "./webgpu-state";
+export { trackSharedEncoderWrite } from "./webgpu-state";
+export { getSubmitCount, resetSubmitCount, incrementSubmitCount } from "./webgpu-state";
 
 // ============================================================================
 // Batch Execution Context for True Segmented Execution

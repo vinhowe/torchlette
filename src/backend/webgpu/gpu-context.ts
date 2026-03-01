@@ -33,8 +33,8 @@ import { donateBuffer, getBufferSize } from "./buffer-arena";
 import { setSharedEncoderEnabled } from "./shared-encoder";
 import { clearBindGroupCache } from "./bind-group-cache";
 
-// Re-exports from webgpu-state for backward compatibility
-export { gpuContext as context, requireContext } from "./webgpu-state";
+// Re-export from webgpu-state
+export { requireContext } from "./webgpu-state";
 let lastInitError: string | null = null;
 
 // ============================================================================
