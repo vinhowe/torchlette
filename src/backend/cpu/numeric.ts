@@ -908,6 +908,69 @@ function readIndexValue(value: number, limit: number): number {
   return value;
 }
 
+// ============================================================================
+// Conv2d
+// ============================================================================
+
+export function conv2d(
+  input: Tensor,
+  weight: Tensor,
+  bias: Tensor | undefined,
+  options?: { stride?: number | [number, number]; padding?: number | [number, number] },
+): Tensor {
+  const [N, Cin, H, W] = input.shape;
+  const [Cout, CinK, KH, KW] = weight.shape;
+  if (Cin !== CinK) throw new Error(`conv2d: input channels ${Cin} != weight channels ${CinK}`);
+
+  const stride = normalizePair(options?.stride, 1);
+  const padding = normalizePair(options?.padding, 0);
+  const [sH, sW] = stride;
+  const [pH, pW] = padding;
+
+  const outH = Math.floor((H + 2 * pH - KH) / sH + 1);
+  const outW = Math.floor((W + 2 * pW - KW) / sW + 1);
+  const out = new Float32Array(N * Cout * outH * outW);
+
+  for (let n = 0; n < N; n++) {
+    for (let co = 0; co < Cout; co++) {
+      for (let oh = 0; oh < outH; oh++) {
+        for (let ow = 0; ow < outW; ow++) {
+          let acc = bias ? readElement(bias, [co]) : 0;
+          for (let ci = 0; ci < Cin; ci++) {
+            for (let ky = 0; ky < KH; ky++) {
+              for (let kx = 0; kx < KW; kx++) {
+                const ih = oh * sH - pH + ky;
+                const iw = ow * sW - pW + kx;
+                if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                  acc += readElement(input, [n, ci, ih, iw]) *
+                         readElement(weight, [co, ci, ky, kx]);
+                }
+              }
+            }
+          }
+          out[n * Cout * outH * outW + co * outH * outW + oh * outW + ow] = acc;
+        }
+      }
+    }
+  }
+
+  return new Tensor([N, Cout, outH, outW], out);
+}
+
+function normalizePair(p: number | [number, number] | undefined, fallback: number): [number, number] {
+  if (p === undefined) return [fallback, fallback];
+  if (typeof p === "number") return [p, p];
+  return p;
+}
+
+function readElement(t: Tensor, indices: number[]): number {
+  let offset = t.offset;
+  for (let i = 0; i < indices.length; i++) {
+    offset += indices[i] * t.strides[i];
+  }
+  return t.data[offset];
+}
+
 export type GatherOptions = {
   dim: number;
 };

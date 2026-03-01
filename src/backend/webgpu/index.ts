@@ -163,6 +163,7 @@ import { tensorFromArray, zeros, full, arange, tril, triu, rand, randn, bernoull
 import { add, sub, div, mul, sqrt, relu, exp, log, neg, abs, tanh, sigmoid, gelu, silu, sin, cos, rsqrt, floor, ceil, round, sign, clamp, pow, isfinite } from "./ops/elementwise";
 import { cast, reshape, expand, contiguous, narrow, narrowBackward, transpose, permute } from "./ops/views";
 import { matmul } from "./ops/matmul-ops";
+import { conv2d } from "./ops/conv2d";
 import { gather, scatterAdd, cat } from "./ops/gather-scatter";
 import { sum, max, min, mean } from "./ops/reductions";
 import { stridedScatterCopy, stridedScatterAdd } from "./ops/strided-scatter";
@@ -234,6 +235,7 @@ export const webgpuBackend: Backend & {
     narrowBackward,
     contiguous,
     cast,
+    conv2d,
     gather,
     scatterAdd,
     cat,
