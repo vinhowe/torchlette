@@ -40,11 +40,11 @@ import { F32_NEG_MAX, F32_POS_MAX, MAX_WORKGROUPS_PER_DIM } from "./shape-utils"
 // IR Node Types
 // ============================================================================
 
-export type ValueType = "block" | "scalar";
+type ValueType = "block" | "scalar";
 export type DataType = "f32" | "f16" | "u32" | "i32";
-export type BinaryOp = "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "xor" | "shr" | "shl" | "min" | "max" | "pow";
-export type UnaryOp = "rsqrt" | "exp" | "log" | "abs" | "neg" | "sqrt" | "tanh" | "floor" | "ceil" | "not" | "sin" | "cos" | "round" | "sign" | "exp2" | "log2";
-export type CmpOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
+type BinaryOp = "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "xor" | "shr" | "shl" | "min" | "max" | "pow";
+type UnaryOp = "rsqrt" | "exp" | "log" | "abs" | "neg" | "sqrt" | "tanh" | "floor" | "ceil" | "not" | "sin" | "cos" | "round" | "sign" | "exp2" | "log2";
+type CmpOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
 
 export interface IRNodeBase {
   id: number;
@@ -52,22 +52,22 @@ export interface IRNodeBase {
   dataType: DataType;
 }
 
-export interface ProgramIdNode extends IRNodeBase {
+interface ProgramIdNode extends IRNodeBase {
   kind: "programId";
   dim: number; // 0=x, 1=y, 2=z
 }
 
-export interface UniformNode extends IRNodeBase {
+interface UniformNode extends IRNodeBase {
   kind: "uniform";
   name: string;
 }
 
-export interface ConstNode extends IRNodeBase {
+interface ConstNode extends IRNodeBase {
   kind: "const";
   value: number;
 }
 
-export interface LoadNode extends IRNodeBase {
+interface LoadNode extends IRNodeBase {
   kind: "load";
   binding: string;
   offsets: IRNode; // block expression for indices
@@ -75,40 +75,40 @@ export interface LoadNode extends IRNodeBase {
 }
 
 
-export interface BinaryNode extends IRNodeBase {
+interface BinaryNode extends IRNodeBase {
   kind: "binary";
   op: BinaryOp;
   lhs: IRNode;
   rhs: IRNode;
 }
 
-export interface UnaryNode extends IRNodeBase {
+interface UnaryNode extends IRNodeBase {
   kind: "unary";
   op: UnaryOp;
   input: IRNode;
 }
 
-export interface CastNode extends IRNodeBase {
+interface CastNode extends IRNodeBase {
   kind: "cast";
   input: IRNode;
   targetType: DataType;
 }
 
-export interface SelectNode extends IRNodeBase {
+interface SelectNode extends IRNodeBase {
   kind: "select";
   condition: IRNode;
   trueVal: IRNode;
   falseVal: IRNode;
 }
 
-export interface CmpNode extends IRNodeBase {
+interface CmpNode extends IRNodeBase {
   kind: "cmp";
   op: CmpOp;
   lhs: IRNode;
   rhs: IRNode;
 }
 
-export interface BitcastNode extends IRNodeBase {
+interface BitcastNode extends IRNodeBase {
   kind: "bitcast";
   input: IRNode;
   targetType: DataType;
@@ -121,71 +121,71 @@ export interface ThreadIdxNode extends IRNodeBase {
   dim: number; // 0=x, 1=y, 2=z
 }
 
-export interface LocalIndexNode extends IRNodeBase {
+interface LocalIndexNode extends IRNodeBase {
   kind: "localIndex";
 }
 
-export interface SharedReadNode extends IRNodeBase {
+interface SharedReadNode extends IRNodeBase {
   kind: "sharedRead";
   arrayName: string;
   idx: IRNode;
 }
 
-export interface NamedRefNode extends IRNodeBase {
+interface NamedRefNode extends IRNodeBase {
   kind: "namedRef";
   name: string;
 }
 
-export interface ArrayReadNode extends IRNodeBase {
+interface ArrayReadNode extends IRNodeBase {
   kind: "arrayRead";
   arrayName: string;
   idx: IRNode;
 }
 
-export interface GlobalIdNode extends IRNodeBase {
+interface GlobalIdNode extends IRNodeBase {
   kind: "globalId";
   dim: number; // 0=x, 1=y, 2=z
 }
 
 /** Number of workgroups dispatched in a given dimension (like Triton's `tl.num_programs`). */
-export interface NumWorkgroupsNode extends IRNodeBase {
+interface NumWorkgroupsNode extends IRNodeBase {
   kind: "numWorkgroups";
   dim: number; // 0=x, 1=y, 2=z
 }
 
-export interface SubgroupShuffleXorNode extends IRNodeBase {
+interface SubgroupShuffleXorNode extends IRNodeBase {
   kind: "subgroupShuffleXor";
   value: IRNode;
   mask: IRNode;
 }
 
-export interface SubgroupAddNode extends IRNodeBase {
+interface SubgroupAddNode extends IRNodeBase {
   kind: "subgroupAdd";
   value: IRNode;
 }
 
-export interface SubgroupMaxNode extends IRNodeBase {
+interface SubgroupMaxNode extends IRNodeBase {
   kind: "subgroupMax";
   value: IRNode;
 }
 
-export interface SubgroupMinNode extends IRNodeBase {
+interface SubgroupMinNode extends IRNodeBase {
   kind: "subgroupMin";
   value: IRNode;
 }
 
-export interface SubgroupBroadcastFirstNode extends IRNodeBase {
+interface SubgroupBroadcastFirstNode extends IRNodeBase {
   kind: "subgroupBroadcastFirst";
   value: IRNode;
 }
 
-export interface SubgroupInclusiveAddNode extends IRNodeBase {
+interface SubgroupInclusiveAddNode extends IRNodeBase {
   kind: "subgroupInclusiveAdd";
   value: IRNode;
 }
 
 /** dot(vec4<f32>(a0,a1,a2,a3), vec4<f32>(b0,b1,b2,b3)) → f32 scalar */
-export interface Vec4DotNode extends IRNodeBase {
+interface Vec4DotNode extends IRNodeBase {
   kind: "vec4dot";
   a: [IRNode, IRNode, IRNode, IRNode];
   b: [IRNode, IRNode, IRNode, IRNode];
@@ -194,7 +194,7 @@ export interface Vec4DotNode extends IRNodeBase {
 // -- Native vec4 nodes (for attention-style subgroup cooperative kernels) --
 
 /** vec4<f32>(x, y, z, w) — construct from 4 scalars */
-export interface Vec4ConstructNode extends IRNodeBase {
+interface Vec4ConstructNode extends IRNodeBase {
   kind: "vec4Construct";
   x: IRNode;
   y: IRNode;
@@ -203,27 +203,27 @@ export interface Vec4ConstructNode extends IRNodeBase {
 }
 
 /** vec4<f32>(v) — splat scalar to all 4 lanes */
-export interface Vec4SplatNode extends IRNodeBase {
+interface Vec4SplatNode extends IRNodeBase {
   kind: "vec4Splat";
   value: IRNode;
 }
 
 /** dot(a, b) where a and b are vec4<f32> — returns f32 */
-export interface Vec4NativeDotNode extends IRNodeBase {
+interface Vec4NativeDotNode extends IRNodeBase {
   kind: "vec4NativeDot";
   a: IRNode;
   b: IRNode;
 }
 
 /** v.x, v.y, v.z, v.w — extract component from vec4<f32> */
-export interface Vec4ComponentNode extends IRNodeBase {
+interface Vec4ComponentNode extends IRNodeBase {
   kind: "vec4Component";
   value: IRNode;
   comp: 0 | 1 | 2 | 3;
 }
 
 /** vec4 binary: add, sub, mul between two vec4s, or vec4 * scalar */
-export interface Vec4BinaryNode extends IRNodeBase {
+interface Vec4BinaryNode extends IRNodeBase {
   kind: "vec4Binary";
   op: "add" | "sub" | "mul";
   a: IRNode;
@@ -231,14 +231,14 @@ export interface Vec4BinaryNode extends IRNodeBase {
 }
 
 /** Read from a vec4 array: name[index] → vec4<f32> */
-export interface Vec4ArrayReadNode extends IRNodeBase {
+interface Vec4ArrayReadNode extends IRNodeBase {
   kind: "vec4ArrayRead";
   arrayName: string;
   idx: IRNode;
 }
 
 /** Read from a vec4 shared array: name[index] → vec4<f32> */
-export interface Vec4SharedReadNode extends IRNodeBase {
+interface Vec4SharedReadNode extends IRNodeBase {
   kind: "vec4SharedRead";
   arrayName: string;
   idx: IRNode;
@@ -475,25 +475,25 @@ export type Statement =
   | BlockBinaryStmt
   | ReturnStmt;
 
-export interface ReturnStmt {
+interface ReturnStmt {
   kind: "return";
 }
 
-export interface LetStmt {
+interface LetStmt {
   kind: "let";
   name: string;
   value: IRNode;
   dtype: DataType;
 }
 
-export interface VarStmt {
+interface VarStmt {
   kind: "var";
   name: string;
   value: IRNode;
   dtype: DataType;
 }
 
-export interface VarArrayStmt {
+interface VarArrayStmt {
   kind: "varArray";
   name: string;
   elemType: DataType;
@@ -501,33 +501,33 @@ export interface VarArrayStmt {
   skipZeroInit?: boolean;
 }
 
-export interface AssignStmt {
+interface AssignStmt {
   kind: "assign";
   name: string;
   value: IRNode;
 }
 
-export interface AddAssignStmt {
+interface AddAssignStmt {
   kind: "addAssign";
   name: string;
   value: IRNode;
 }
 
-export interface IndexAssignStmt {
+interface IndexAssignStmt {
   kind: "indexAssign";
   arrayName: string;
   idx: IRNode;
   value: IRNode;
 }
 
-export interface IndexAddAssignStmt {
+interface IndexAddAssignStmt {
   kind: "indexAddAssign";
   arrayName: string;
   idx: IRNode;
   value: IRNode;
 }
 
-export interface ForRangeStmt {
+interface ForRangeStmt {
   kind: "forRange";
   varName: string;
   start: IRNode;
@@ -538,7 +538,7 @@ export interface ForRangeStmt {
 }
 
 /** Strided for loop: `for (var i = start; i < bound; i += stride)`. */
-export interface ForStrideStmt {
+interface ForStrideStmt {
   kind: "forStride";
   varName: string;
   start: IRNode;
@@ -549,31 +549,31 @@ export interface ForStrideStmt {
   unroll?: boolean;
 }
 
-export interface IfStmt {
+interface IfStmt {
   kind: "if";
   condition: IRNode;
   body: Statement[];
 }
 
-export interface IfElseStmt {
+interface IfElseStmt {
   kind: "ifElse";
   condition: IRNode;
   body: Statement[];
   elseBody: Statement[];
 }
 
-export interface BarrierStmt {
+interface BarrierStmt {
   kind: "barrier";
 }
 
-export interface SharedWriteStmt {
+interface SharedWriteStmt {
   kind: "sharedWrite";
   arrayName: string;
   idx: IRNode;
   value: IRNode;
 }
 
-export interface GuardedStoreStmt {
+interface GuardedStoreStmt {
   kind: "guardedStore";
   binding: string;
   condition: IRNode;
@@ -581,16 +581,16 @@ export interface GuardedStoreStmt {
   value: IRNode;
 }
 
-export interface DirectStoreStmt {
+interface DirectStoreStmt {
   kind: "directStore";
   binding: string;
   idx: IRNode;
   value: IRNode;
 }
 
-export type AtomicOp = "max" | "min" | "add" | "or" | "and" | "xor" | "exchange";
+type AtomicOp = "max" | "min" | "add" | "or" | "and" | "xor" | "exchange";
 
-export interface AtomicOpStmt {
+interface AtomicOpStmt {
   kind: "atomicOp";
   binding: string;
   idx: IRNode;
@@ -598,7 +598,7 @@ export interface AtomicOpStmt {
   value: IRNode;
 }
 
-export interface AtomicCASStmt {
+interface AtomicCASStmt {
   kind: "atomicCAS";
   binding: string;
   idx: IRNode;
@@ -613,21 +613,21 @@ export interface AtomicCASStmt {
 // -- Vec4 array statement types --
 
 /** var name: array<vec4<f32>, size>; (register-space vec4 array) */
-export interface Vec4VarArrayStmt {
+interface Vec4VarArrayStmt {
   kind: "vec4VarArray";
   name: string;
   size: number;
 }
 
 /** var<workgroup> name: array<vec4<f32>, size>; */
-export interface Vec4SharedArrayStmt {
+interface Vec4SharedArrayStmt {
   kind: "vec4SharedArray";
   name: string;
   size: number;
 }
 
 /** name[index] = value; where value is vec4<f32> */
-export interface Vec4ArrayWriteStmt {
+interface Vec4ArrayWriteStmt {
   kind: "vec4ArrayWrite";
   arrayName: string;
   idx: IRNode;
@@ -636,7 +636,7 @@ export interface Vec4ArrayWriteStmt {
 }
 
 /** name[index] += value; where value is vec4<f32> */
-export interface Vec4ArrayAddAssignStmt {
+interface Vec4ArrayAddAssignStmt {
   kind: "vec4ArrayAddAssign";
   arrayName: string;
   idx: IRNode;
