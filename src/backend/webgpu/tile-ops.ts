@@ -182,8 +182,6 @@ export interface BlockLoadOpts {
   rows: number;
   cols: number;
   guard?: BlockExpr;
-  /** Skip +1 shared memory padding (default: false). Use when memory is tight. */
-  noPad?: boolean;
 }
 
 /** Pointer for storing register data back to global memory. */
@@ -209,7 +207,7 @@ export class Block {
   readonly _origRows: number;
   /** @internal Original cols before any T() call (for storage indexing) */
   readonly _origCols: number;
-  /** @internal Padded column stride for shared memory (cols + pad). Register blocks use cols. */
+  /** @internal Column stride for shared memory indexing. Always equals cols (no padding). */
   readonly smemStride: number;
 
   constructor(
@@ -232,8 +230,11 @@ export class Block {
 
   // ---- Element access (for hybrid scalar/block patterns like attention masking) ----
 
-  /** Read a scalar from the block at flat index. */
-  get(idx: BlockExpr): BlockExpr {
+  /** Read a scalar from the block at flat index, or 2D (row, col). */
+  get(row: BlockExpr, col?: BlockExpr): BlockExpr {
+    const idx = col !== undefined
+      ? row.mul(this.ctx.u32(this.cols)).add(col)
+      : row;
     if (this.placement === "shared") {
       return this.ctx._makeSharedRead(this.name, idx);
     }
@@ -448,8 +449,7 @@ export class BlockOps {
       return new Block("register", rows, cols, name, this.ctx, this);
     } else {
       // Cooperative load → shared memory placement
-      // Pad column stride by 1 to avoid shared memory bank conflicts (unless noPad).
-      const smemStride = opts.noPad ? cols : cols + 1;
+      const smemStride = cols;
       this.ctx.sharedArrays.push({
         name,
         size: rows * smemStride,
@@ -476,7 +476,6 @@ export class BlockOps {
           innerRange: ptr.innerRange,
           innerBound: ptr.innerBound.node,
         },
-        noPad: opts.noPad,
       });
       return new Block("shared", rows, cols, name, this.ctx, this, undefined, undefined, smemStride);
     }
@@ -617,13 +616,13 @@ export class BlockOps {
    * Cooperative tile load from global memory into shared memory.
    * Uses TilePtr/TileMask for 2D bounds-checked loading.
    */
-  loadTile(binding: string, ptr: TilePtr, mask: TileMask, opts?: { noPad?: boolean }): Block {
+  loadTile(binding: string, ptr: TilePtr, mask: TileMask): Block {
     const name = this.freshName();
     const tileRows = ptr.data.outerRange.size;
     const tileCols = ptr.data.innerRange.size;
-    const smemStride = opts?.noPad ? tileCols : tileCols + 1;
+    const smemStride = tileCols;
 
-    // Declare shared memory (padded by 1 column unless noPad)
+    // Declare shared memory
     this.ctx.sharedArrays.push({
       name,
       size: tileRows * smemStride,
@@ -639,7 +638,6 @@ export class BlockOps {
       tileRows,
       tileCols,
       elemType: "f32",
-      smemStride,
     });
 
     return new Block("shared", tileRows, tileCols, name, this.ctx, this, undefined, undefined, smemStride);

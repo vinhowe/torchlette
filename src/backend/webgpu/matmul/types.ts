@@ -185,22 +185,6 @@ export function getTransposeMode(
 }
 
 /**
- * Convert TransposeMode to integer for shader uniforms.
- */
-function transposeModeToInt(mode: TransposeMode): number {
-  switch (mode) {
-    case "NN":
-      return 0;
-    case "NT":
-      return 1;
-    case "TN":
-      return 2;
-    case "TT":
-      return 3;
-  }
-}
-
-/**
  * Classify matrix dimensions into a shape class for autotuning.
  */
 export function classifyShape(

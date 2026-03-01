@@ -12,16 +12,6 @@ import { sizeOf } from "../../core/shape";
 import { MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 import { canVectorize as canVectorizeOp } from "./ops/registry";
 
-// Re-export registry functions for backward compatibility
-export {
-  isUnaryOp,
-  isBinaryOp,
-  isFusible as isFusibleOp,
-  getExpr,
-  UNARY_EXPR,
-  BINARY_EXPR,
-} from "./ops/registry";
-
 // ============================================================================
 // Fusion Recipe Types
 // ============================================================================

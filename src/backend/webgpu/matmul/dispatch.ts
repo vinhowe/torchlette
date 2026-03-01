@@ -59,13 +59,6 @@ function getPerShapeKey(m: number, n: number, k: number, dtype: DType): string {
 }
 
 /**
- * Clear the per-shape tuning cache.
- */
-function clearPerShapeTuningCache(): void {
-  perShapeTuningCache.clear();
-}
-
-/**
  * Global autotune mode counter.
  * When > 0, matmul dispatch will run autotuning for new shapes.
  * Uses a counter to support nested compile regions and lazy execution.
