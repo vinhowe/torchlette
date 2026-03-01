@@ -30,7 +30,7 @@ import { isProfilingEnabled } from "./profiler";
 import { gpuMemoryTracker } from "./memory-tracker";
 import type { GPUBuffer, GPUBindGroup, GPUDevice, GPUCommandEncoder } from "./gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "./gpu-types";
-import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
+import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, F32_ONE_BITS } from "./shape-utils";
 import { compileTileKernel } from "./tile-compiler";
 import type { TileKernelSpec } from "./tile-ir";
 import { singleWorkgroup } from "./tile-ir";
@@ -84,7 +84,7 @@ function makeUnscaleSpec(use2D: boolean, gridSizeX: number): TileKernelSpec {
       ctx.ifThenElse(isFinite, () => {
         ctx.emitStore("grad_out", idx, g);
       }, () => {
-        ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(1065353216));
+        ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(F32_ONE_BITS));
         ctx.emitStore("grad_out", idx, ctx.f32(0.0));
       });
     },

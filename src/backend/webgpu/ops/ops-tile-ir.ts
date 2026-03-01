@@ -17,7 +17,7 @@ import {
   elementwiseGrid,
 } from "../tile-ir";
 import { compileTileKernel } from "../tile-compiler";
-import { WORKGROUP_SIZE } from "../shape-utils";
+import { WORKGROUP_SIZE, F32_NEG_MAX, F32_POS_MAX } from "../shape-utils";
 import { applyFusedOp } from "../fusion-tile-ir";
 
 const WG = WORKGROUP_SIZE; // 256
@@ -223,7 +223,7 @@ export function argReduceWGSL(
       }
 
       // Sequential search for max/min
-      const initVal = isMax ? -3.402823466e+38 : 3.402823466e+38;
+      const initVal = isMax ? F32_NEG_MAX : F32_POS_MAX;
       const bestVal = ctx.emitVar("bestVal", "f32", ctx.f32(initVal));
       const bestIdx = ctx.emitVar("bestIdx", "u32", ctx.u32(0));
 

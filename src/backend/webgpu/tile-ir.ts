@@ -38,6 +38,7 @@ export {
   type BlockCoopPtr, type BlockThreadPtr, type BlockPtr, type BlockLoadOpts,
   type BlockStorePtr,
 } from "./tile-ops";
+import { F32_NEG_MAX, F32_POS_MAX } from "./shape-utils";
 
 // ============================================================================
 // IR Node Types
@@ -2126,7 +2127,7 @@ export class KernelContext {
     bodyFn: (i: BlockExpr) => BlockExpr,
   ): BlockExpr {
     const id = this.reduceCounter++;
-    const identity = op === "sum" ? 0.0 : op === "max" ? -3.402823e+38 : 3.402823e+38;
+    const identity = op === "sum" ? 0.0 : op === "max" ? F32_NEG_MAX : F32_POS_MAX;
     const acc = this.emitVar(`_wgr${id}_a`, "f32", this.f32(identity));
     this.stridedFor(tid, count, wgSize, (i) => {
       if (op === "sum") {

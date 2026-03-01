@@ -16,6 +16,7 @@
 import type { TileKernelSpec } from "./tile-ir";
 import { tiledGrid, productGrid } from "./tile-ir";
 import { getSubgroupSupport } from "./matmul/types";
+import { F32_NEG_MAX } from "./shape-utils";
 
 // Tiling parameters
 const BR = 64;     // Q rows per workgroup
@@ -108,7 +109,7 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
       });
 
       // Online softmax state
-      const mI = ctx.emitVar("m_i", "f32", ctx.f32(-3.402823e+38));
+      const mI = ctx.emitVar("m_i", "f32", ctx.f32(F32_NEG_MAX));
       const lI = ctx.emitVar("l_i", "f32", ctx.f32(0));
       const oAcc = ctx.registerVec4Array("o_acc", D4_COUNT);
       // o_acc is zero-initialized by WGSL default
@@ -138,7 +139,7 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
         });
 
         // Score computation + online softmax
-        const tileMax = ctx.emitVar("_tMax", "f32", ctx.f32(-3.402823e+38));
+        const tileMax = ctx.emitVar("_tMax", "f32", ctx.f32(F32_NEG_MAX));
         const scores = ctx.emitVarArray("_scores", "f32", BC);
 
         ctx.range(0, BC, (j) => {
@@ -161,7 +162,7 @@ export function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
             sVal = sVal.add(sVal.subgroupShuffleXor(2));
           }
           const s = sVal.mul(scale);
-          const score = isActive.select(s, ctx.f32(-3.402823e+38));
+          const score = isActive.select(s, ctx.f32(F32_NEG_MAX));
           scores.set(j, score);
           tileMax.set(isActive.select(tileMax.get().max(s), tileMax.get()));
         });

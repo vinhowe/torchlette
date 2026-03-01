@@ -138,15 +138,11 @@ export type {
   DCEResult,
   OptimizeOptions,
   OptimizeResult,
-  TokAfterNode,
-  TokAfterResult,
 } from "./ir-optimize";
 export {
-  analyzeTokAfterOpportunities,
   generateCSEKey,
   isCSEable,
   isEffectful,
-  isOrderedLoad,
   isPureOp,
   isRandomOp,
   optimizeIR,
