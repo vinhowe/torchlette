@@ -46,7 +46,7 @@ export {
 export type { BatchExecutionContext } from "./shared-encoder";
 export {
   beginBatchExecution, endBatchExecution, isBatchActive, abortBatch,
-  getActiveBatchEncoder, beginSharedEncoder, flushSharedEncoder, endSharedEncoder,
+  beginSharedEncoder, flushSharedEncoder, endSharedEncoder,
   beginStep, endStep, isSharedEncoderActive, setSharedEncoderEnabled,
   getSharedEncoderInstance, trackSharedEncoderWrite, isInSharedEncoderWriteSet,
   getSubmitCount, resetSubmitCount, submitOrCollect,
