@@ -1081,7 +1081,7 @@ export class BlockExpr {
 // ============================================================================
 
 /** Handle for a shared memory array, returned by `ctx.sharedArray()`. */
-export class SharedArrayHandle {
+class SharedArrayHandle {
   constructor(
     readonly name: string,
     readonly size: number,
@@ -1139,7 +1139,7 @@ export class VarHandle {
 }
 
 /** Handle for a `var` array binding, returned by `ctx.emitVarArray()`. */
-export class ArrayVarHandle {
+class ArrayVarHandle {
   constructor(
     readonly name: string,
     readonly elemType: DataType,
@@ -1174,7 +1174,7 @@ export class ArrayVarHandle {
 }
 
 /** Handle for a vec4 array (register or shared), returned by ctx.registerVec4Array() / ctx.sharedVec4Array(). */
-export class Vec4ArrayHandle {
+class Vec4ArrayHandle {
   constructor(
     readonly name: string,
     readonly size: number,
