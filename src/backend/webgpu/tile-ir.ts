@@ -2286,6 +2286,15 @@ export class KernelContext {
     });
   }
 
+  /** Store a vec4 value as 4 consecutive scalar elements.
+   *  Expands to: store(binding, base+0, v.x); store(binding, base+1, v.y); ... */
+  vec4Store(binding: string, baseIdx: BlockExpr, vec: BlockExpr): void {
+    for (let c = 0; c < 4; c++) {
+      const idx = c === 0 ? baseIdx : baseIdx.add(this.u32(c));
+      this.emitStore(binding, idx, vec.vec4Component(c as 0 | 1 | 2 | 3));
+    }
+  }
+
   /** Emit an early `return` statement. */
   emitReturn(): void {
     this.pushStatement({ kind: "return" });
