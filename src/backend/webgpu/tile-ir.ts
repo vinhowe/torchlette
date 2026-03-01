@@ -372,6 +372,8 @@ export interface BlockLoadStmt {
   tileMask?: TileMask2D;
   // Thread-level guard (for thread ptr bounds checking)
   guard?: IRNode;
+  /** Skip +1 shared memory padding (for tight shared memory budgets). */
+  noPad?: boolean;
 }
 
 export interface BlockStoreStmt {
@@ -2285,8 +2287,8 @@ export class KernelContext {
   }
 
   /** Cooperative tile load into shared memory. ≈ tl.load(ptr, mask) */
-  load2D(binding: string, ptr: TilePtr, mask: TileMask): Block {
-    return this._requireOps().loadTile(binding, ptr, mask);
+  load2D(binding: string, ptr: TilePtr, mask: TileMask, opts?: { noPad?: boolean }): Block {
+    return this._requireOps().loadTile(binding, ptr, mask, opts);
   }
 
   /** 1D register load (e.g. bias vector). ≈ tl.load(bias_ptr) */
@@ -2324,6 +2326,24 @@ export class KernelContext {
   /** Load from strided layout: combined stridedIndex + load. */
   stridedLoad(binding: string, flatIdx: BlockExpr, indexShape: number[], strides: number[], baseOffset = 0): BlockExpr {
     return this.load(binding, this.stridedIndex(flatIdx, indexShape, strides, baseOffset));
+  }
+
+  // ---- Internal node creation helpers (for Block.get/set with proper node IDs) ----
+
+  /** @internal Create a properly ID'd arrayRead node. */
+  _makeArrayRead(arrayName: string, idx: BlockExpr): BlockExpr {
+    return new BlockExpr(makeNode<ArrayReadNode>({
+      kind: "arrayRead", arrayName, idx: idx.node,
+      valueType: "scalar", dataType: "f32",
+    }));
+  }
+
+  /** @internal Create a properly ID'd sharedRead node. */
+  _makeSharedRead(arrayName: string, idx: BlockExpr): BlockExpr {
+    return new BlockExpr(makeNode<SharedReadNode>({
+      kind: "sharedRead", arrayName, idx: idx.node,
+      valueType: "scalar", dataType: "f32",
+    }));
   }
 
 }

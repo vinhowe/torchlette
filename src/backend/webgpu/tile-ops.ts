@@ -182,6 +182,8 @@ export interface BlockLoadOpts {
   rows: number;
   cols: number;
   guard?: BlockExpr;
+  /** Skip +1 shared memory padding (default: false). Use when memory is tight. */
+  noPad?: boolean;
 }
 
 /** Pointer for storing register data back to global memory. */
@@ -227,6 +229,25 @@ export class Block {
   }
 
   get transposed(): boolean { return this._transposed; }
+
+  // ---- Element access (for hybrid scalar/block patterns like attention masking) ----
+
+  /** Read a scalar from the block at flat index. */
+  get(idx: BlockExpr): BlockExpr {
+    if (this.placement === "shared") {
+      return this.ctx._makeSharedRead(this.name, idx);
+    }
+    return this.ctx._makeArrayRead(this.name, idx);
+  }
+
+  /** Write a scalar to the block at flat index. */
+  set(idx: BlockExpr, value: BlockExpr): void {
+    const kind = this.placement === "shared" ? "sharedWrite" : "indexAssign";
+    this.ctx.pushStatement({
+      kind, arrayName: this.name,
+      idx: idx.node, value: value.node,
+    });
+  }
 
   // ---- Transpose (metadata only, no data movement) ----
   T(): Block {
@@ -427,10 +448,8 @@ export class BlockOps {
       return new Block("register", rows, cols, name, this.ctx, this);
     } else {
       // Cooperative load → shared memory placement
-      // Pad column stride by 1 to avoid shared memory bank conflicts.
-      // For stride S, rows differing by 32/S map to the same bank. The +1
-      // breaks this alignment (e.g. tileK=8 → stride 9, no 4-way conflict).
-      const smemStride = cols + 1;
+      // Pad column stride by 1 to avoid shared memory bank conflicts (unless noPad).
+      const smemStride = opts.noPad ? cols : cols + 1;
       this.ctx.sharedArrays.push({
         name,
         size: rows * smemStride,
@@ -457,6 +476,7 @@ export class BlockOps {
           innerRange: ptr.innerRange,
           innerBound: ptr.innerBound.node,
         },
+        noPad: opts.noPad,
       });
       return new Block("shared", rows, cols, name, this.ctx, this, undefined, undefined, smemStride);
     }
@@ -597,13 +617,13 @@ export class BlockOps {
    * Cooperative tile load from global memory into shared memory.
    * Uses TilePtr/TileMask for 2D bounds-checked loading.
    */
-  loadTile(binding: string, ptr: TilePtr, mask: TileMask): Block {
+  loadTile(binding: string, ptr: TilePtr, mask: TileMask, opts?: { noPad?: boolean }): Block {
     const name = this.freshName();
     const tileRows = ptr.data.outerRange.size;
     const tileCols = ptr.data.innerRange.size;
-    const smemStride = tileCols + 1;
+    const smemStride = opts?.noPad ? tileCols : tileCols + 1;
 
-    // Declare shared memory (padded by 1 column to avoid bank conflicts)
+    // Declare shared memory (padded by 1 column unless noPad)
     this.ctx.sharedArrays.push({
       name,
       size: tileRows * smemStride,
