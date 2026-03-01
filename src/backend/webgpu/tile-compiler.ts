@@ -17,7 +17,7 @@
 import type {
   IRNode, TileKernelSpec,
   Statement, DataType,
-  TileLoadStmt, DotStmt, AccOpStmt, TileLoad1DStmt, TileStoreStmt,
+  TileLoadStmt, TileLoad1DStmt, TileStoreStmt,
   TilePtr2D, TileMask2D,
   BlockAllocStmt, BlockLoadStmt, BlockStoreStmt, BlockDotStmt,
   BlockReduceStmt, BlockUnaryStmt, BlockBinaryStmt,
@@ -369,7 +369,7 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
   const needsNumWg = ctx.nodes.some(n => n.kind === "numWorkgroups");
   // Shared arrays and tile-level stmts require local_id/local_idx even if not explicitly referenced
   const hasTileOps = ctx.sharedArrays.length > 0 || ctx.vec4SharedArrays.length > 0 ||
-    ctx.statements.some(s => s.kind === "tileLoad" || s.kind === "dot" || s.kind === "tileStore" || s.kind === "tileLoad1d" || s.kind === "accOp");
+    ctx.statements.some(s => s.kind === "tileLoad" || s.kind === "tileStore" || s.kind === "tileLoad1d");
   const emitWid = needsWid || hasTileOps;
   const emitLocalId = needsLocalId || hasTileOps;
   const emitLocalIdx = needsLocalIdx || hasTileOps;
@@ -2110,8 +2110,6 @@ function hasTileStatements(stmts: Statement[]): boolean {
   for (const s of stmts) {
     switch (s.kind) {
       case "tileLoad":
-      case "dot":
-      case "accOp":
       case "tileLoad1d":
       case "tileStore":
       case "blockAlloc":
@@ -2141,8 +2139,8 @@ function hasTileStatements(stmts: Statement[]): boolean {
 
 /**
  * Lower tile-level statements to imperative statements.
- * Tile ops (tileLoad, dot, accOp, tileStore) are expanded into
- * cooperative loading loops, barrier + outer product, per-element loops, etc.
+ * Tile ops (tileLoad, tileStore) are expanded into cooperative loading loops,
+ * per-element loops, etc.
  *
  * Non-tile statements are passed through unchanged (with recursive lowering
  * of any nested bodies).
@@ -2153,26 +2151,9 @@ function lowerTileStatements(stmts: Statement[], spec: TileKernelSpec): Statemen
   while (i < stmts.length) {
     const s = stmts[i];
 
-    // Detect fusible chain: accOp* (with optional tileLoad1d) → tileStore
-    // Fuse into a single tm/tn loop to avoid multiple passes over the accumulator.
-    if (s.kind === "accOp" || s.kind === "tileLoad1d") {
-      const chain = collectAccStoreChain(stmts, i);
-      if (chain) {
-        result.push(...lowerFusedAccStore(chain, spec));
-        i = chain.endIdx;
-        continue;
-      }
-    }
-
     switch (s.kind) {
       case "tileLoad":
         result.push(...lowerTileLoad(s, spec));
-        break;
-      case "dot":
-        result.push(...lowerDot(s));
-        break;
-      case "accOp":
-        result.push(...lowerAccOp(s));
         break;
       case "tileLoad1d":
         result.push(...lowerTileLoad1D(s));
@@ -2233,154 +2214,6 @@ function lowerTileStatements(stmts: Statement[], spec: TileKernelSpec): Statemen
     }
     i++;
   }
-  return result;
-}
-
-/**
- * Scan forward from `startIdx` to collect a chain of accOp/tileLoad1d ending with a tileStore
- * on the same accumulator. Returns null if no fusible chain is found.
- */
-function collectAccStoreChain(
-  stmts: Statement[],
-  startIdx: number,
-): { accOps: AccOpStmt[]; load1ds: TileLoad1DStmt[]; store: TileStoreStmt; endIdx: number } | null {
-  let accName: string | null = null;
-  const accOps: AccOpStmt[] = [];
-  const load1ds: TileLoad1DStmt[] = [];
-
-  let i = startIdx;
-  while (i < stmts.length) {
-    const s = stmts[i];
-    if (s.kind === "accOp") {
-      if (accName === null) accName = s.accName;
-      if (s.accName !== accName) break;
-      accOps.push(s);
-      i++;
-    } else if (s.kind === "tileLoad1d") {
-      load1ds.push(s);
-      i++;
-    } else if (s.kind === "tileStore") {
-      if (accName !== null && s.accName === accName && accOps.length > 0) {
-        return { accOps, load1ds, store: s, endIdx: i + 1 };
-      }
-      break;
-    } else {
-      break;
-    }
-  }
-
-  return null;
-}
-
-/**
- * Fuse accOp chain + tileStore into a single tm/tn loop.
- *
- * Instead of generating separate loops for each accOp and the store,
- * emit one loop that reads acc[idx], applies all transformations inline,
- * and writes to global memory. Matches production codegen output.
- */
-function lowerFusedAccStore(
-  chain: { accOps: AccOpStmt[]; load1ds: TileLoad1DStmt[]; store: TileStoreStmt },
-  spec: TileKernelSpec,
-): Statement[] {
-  const result: Statement[] = [];
-
-  // Emit tileLoad1d first (register loads for bias etc. — loop-invariant per row)
-  for (const ld of chain.load1ds) {
-    result.push(...lowerTileLoad1D(ld));
-  }
-
-  const { binding, ptr, mask, accName, threadTileM, threadTileN, accDtype } = chain.store;
-  const tmVar = freshVar("tm");
-  const tnVar = freshVar("tn");
-
-  const innerBody: Statement[] = [];
-
-  // Row/col computation
-  const rowName = freshVar("st_row");
-  const colName = freshVar("st_col");
-  innerBody.push({
-    kind: "let", name: rowName, dtype: "u32",
-    value: binOp("add", ptr.outerRange.base,
-      binOp("add", binOp("mul", ref("thread_row"), cU32(threadTileM)), ref(tmVar)),
-    ),
-  });
-  innerBody.push({
-    kind: "let", name: colName, dtype: "u32",
-    value: binOp("add", ptr.innerRange.base,
-      binOp("add", binOp("mul", ref("thread_col"), cU32(threadTileN)), ref(tnVar)),
-    ),
-  });
-
-  const maskCond = andOp(
-    cmpOp("lt", ref(rowName), mask.outerBound),
-    cmpOp("lt", ref(colName), mask.innerBound),
-  );
-
-  const ifBody: Statement[] = [];
-  const idxName = freshVar("st_idx");
-  ifBody.push({
-    kind: "let", name: idxName, dtype: "u32",
-    value: binOp("add",
-      binOp("add", ptr.baseOffset, mulOrSkip(ref(rowName), ptr.outerStride)),
-      mulOrSkip(ref(colName), ptr.innerStride),
-    ),
-  });
-
-  // Start with raw acc value
-  const accIdx = binOp("add", binOp("mul", ref(tmVar), cU32(threadTileN)), ref(tnVar));
-  let currentVal: IRNode = arrayRead(accName, accIdx);
-
-  // Apply all accOps inline
-  for (const op of chain.accOps) {
-    switch (op.op.kind) {
-      case "mulScalar":
-        currentVal = binOp("mul", currentVal, op.op.value, "f32");
-        break;
-      case "addRow":
-        currentVal = binOp("add", currentVal, arrayRead(op.op.valuesArray, ref(tnVar)), "f32");
-        break;
-      case "apply": {
-        // Bind current value to the apply's input variable name, emit body, use result
-        const valName = freshVar("fv");
-        ifBody.push({ kind: "let", name: valName, dtype: "f32", value: currentVal });
-        // The apply body references op.op.valName — we need to let-bind it
-        ifBody.push({ kind: "let", name: op.op.valName, dtype: "f32", value: ref(valName, "f32") });
-        ifBody.push(...op.op.body);
-        currentVal = op.op.resultNode;
-        break;
-      }
-      case "castTo":
-        currentVal = castNode(currentVal, op.op.dtype);
-        break;
-    }
-  }
-
-  // Apply store's accDtype cast if not already cast by an accOp
-  if (accDtype && accDtype !== "f32") {
-    const lastOp = chain.accOps[chain.accOps.length - 1];
-    if (!lastOp || lastOp.op.kind !== "castTo") {
-      currentVal = castNode(currentVal, accDtype);
-    }
-  }
-
-  ifBody.push({
-    kind: "indexAssign",
-    arrayName: binding,
-    idx: ref(idxName),
-    value: currentVal,
-  });
-
-  innerBody.push({ kind: "if", condition: maskCond, body: ifBody });
-
-  result.push({
-    kind: "forRange", varName: tmVar, start: cU32(0), bound: cU32(threadTileM),
-    body: [{
-      kind: "forRange", varName: tnVar, start: cU32(0), bound: cU32(threadTileN),
-      body: innerBody,
-    }],
-  });
-
   return result;
 }
 
@@ -2541,198 +2374,6 @@ function lowerTileLoad(stmt: TileLoadStmt, spec: TileKernelSpec): Statement[] {
     body: loopBody,
   });
 
-  return result;
-}
-
-/**
- * Lower dot → barrier + outer product loop.
- *
- * barrier()
- * for kk in 0..innerDim:
- *   load a_vals[threadTileM] from shared A
- *   load b_vals[threadTileN] from shared B
- *   outer product: acc[tm*N+tn] += a_vals[tm] * b_vals[tn]
- * barrier()
- */
-function lowerDot(stmt: DotStmt): Statement[] {
-  const { aTile, bTile, accName, threadTileM, threadTileN } = stmt;
-  const innerDim = aTile.innerDim;
-  const result: Statement[] = [];
-
-  // barrier() before reading shared memory
-  result.push({ kind: "barrier" });
-
-  const kkVar = freshVar("kk");
-  const kkLoop: Statement[] = [];
-
-  // Load a_vals from shared A
-  const aValsName = freshVar("a_vals");
-  kkLoop.push({
-    kind: "varArray", name: aValsName, elemType: "f32",
-    size: threadTileM, skipZeroInit: true,
-  });
-  const tmVar1 = freshVar("tm");
-  kkLoop.push({
-    kind: "forRange", varName: tmVar1, start: cU32(0), bound: cU32(threadTileM),
-    body: [{
-      kind: "indexAssign",
-      arrayName: aValsName,
-      idx: ref(tmVar1),
-      // tileA[(thread_row * threadTileM + tm) * innerDim + kk]
-      value: sharedRead(aTile.sharedName,
-        binOp("add",
-          binOp("mul",
-            binOp("add", binOp("mul", ref("thread_row"), cU32(threadTileM)), ref(tmVar1)),
-            cU32(innerDim),
-          ),
-          ref(kkVar),
-        ),
-      ),
-    }],
-  });
-
-  // Load b_vals from shared B
-  const bValsName = freshVar("b_vals");
-  kkLoop.push({
-    kind: "varArray", name: bValsName, elemType: "f32",
-    size: threadTileN, skipZeroInit: true,
-  });
-  const tnVar1 = freshVar("tn");
-  kkLoop.push({
-    kind: "forRange", varName: tnVar1, start: cU32(0), bound: cU32(threadTileN),
-    body: [{
-      kind: "indexAssign",
-      arrayName: bValsName,
-      idx: ref(tnVar1),
-      // tileB[kk * bCols + thread_col * threadTileN + tn]
-      value: sharedRead(bTile.sharedName,
-        binOp("add",
-          binOp("mul", ref(kkVar), cU32(bTile.cols)),
-          binOp("add", binOp("mul", ref("thread_col"), cU32(threadTileN)), ref(tnVar1)),
-        ),
-      ),
-    }],
-  });
-
-  // Outer product: acc[tm*N+tn] += a_vals[tm] * b_vals[tn]
-  const tmVar2 = freshVar("tm");
-  const tnVar2 = freshVar("tn");
-  kkLoop.push({
-    kind: "forRange", varName: tmVar2, start: cU32(0), bound: cU32(threadTileM),
-    body: [{
-      kind: "forRange", varName: tnVar2, start: cU32(0), bound: cU32(threadTileN),
-      body: [{
-        kind: "indexAddAssign",
-        arrayName: accName,
-        idx: binOp("add", binOp("mul", ref(tmVar2), cU32(threadTileN)), ref(tnVar2)),
-        value: binOp("mul",
-          arrayRead(aValsName, ref(tmVar2)),
-          arrayRead(bValsName, ref(tnVar2)),
-          "f32",
-        ),
-      }],
-    }],
-  });
-
-  result.push({
-    kind: "forRange",
-    varName: kkVar,
-    start: cU32(0),
-    bound: cU32(innerDim),
-    body: kkLoop,
-  });
-
-  // barrier() after shared memory use
-  result.push({ kind: "barrier" });
-
-  return result;
-}
-
-/**
- * Lower accOp → per-element loops on thread tile.
- */
-function lowerAccOp(stmt: AccOpStmt): Statement[] {
-  const { accName, threadTileM, threadTileN, op } = stmt;
-  const result: Statement[] = [];
-
-  switch (op.kind) {
-    case "mulScalar": {
-      // acc[tm*N+tn] *= value
-      const tmVar = freshVar("tm");
-      const tnVar = freshVar("tn");
-      const accIdx = binOp("add", binOp("mul", ref(tmVar), cU32(threadTileN)), ref(tnVar));
-      result.push({
-        kind: "forRange", varName: tmVar, start: cU32(0), bound: cU32(threadTileM),
-        body: [{
-          kind: "forRange", varName: tnVar, start: cU32(0), bound: cU32(threadTileN),
-          body: [{
-            kind: "indexAssign",
-            arrayName: accName,
-            idx: accIdx,
-            value: binOp("mul", arrayRead(accName, accIdx), op.value, "f32"),
-          }],
-        }],
-      });
-      break;
-    }
-    case "addRow": {
-      // acc[tm*N+tn] += vals[tn]
-      const tmVar = freshVar("tm");
-      const tnVar = freshVar("tn");
-      result.push({
-        kind: "forRange", varName: tmVar, start: cU32(0), bound: cU32(threadTileM),
-        body: [{
-          kind: "forRange", varName: tnVar, start: cU32(0), bound: cU32(threadTileN),
-          body: [{
-            kind: "indexAddAssign",
-            arrayName: accName,
-            idx: binOp("add", binOp("mul", ref(tmVar), cU32(threadTileN)), ref(tnVar)),
-            value: arrayRead(op.valuesArray, ref(tnVar)),
-          }],
-        }],
-      });
-      break;
-    }
-    case "apply": {
-      // For each element: acc[i] = fn(acc[i])
-      // The body captured by apply_ contains statements that compute the result.
-      // We substitute the placeholder variable with acc[idx] reads.
-      const tmVar = freshVar("tm");
-      const tnVar = freshVar("tn");
-      const accIdx = binOp("add", binOp("mul", ref(tmVar), cU32(threadTileN)), ref(tnVar));
-
-      // Build inner body:
-      // let _acc_val = acc[idx];
-      // ... captured body statements ...
-      // acc[idx] = resultNode;
-      const innerBody: Statement[] = [];
-      innerBody.push({
-        kind: "let", name: op.valName, dtype: "f32",
-        value: arrayRead(accName, accIdx),
-      });
-      innerBody.push(...op.body);
-      innerBody.push({
-        kind: "indexAssign",
-        arrayName: accName,
-        idx: accIdx,
-        value: op.resultNode,
-      });
-
-      result.push({
-        kind: "forRange", varName: tmVar, start: cU32(0), bound: cU32(threadTileM),
-        body: [{
-          kind: "forRange", varName: tnVar, start: cU32(0), bound: cU32(threadTileN),
-          body: innerBody,
-        }],
-      });
-      break;
-    }
-    case "castTo": {
-      // No-op at the statement level — the cast is tracked on the Accumulator
-      // and applied during tileStore lowering.
-      break;
-    }
-  }
   return result;
 }
 
@@ -3163,7 +2804,7 @@ function lowerBlockDot(stmt: BlockDotStmt): Statement[] {
  * Each thread computes a [threadTileM × threadTileN] tile of the result.
  * Thread position: (thread_row, thread_col) from 2D workgroup layout.
  *
- * Lowering mirrors the existing lowerDot() (tile-compiler.ts DotStmt handler):
+ * Lowering pattern (barrier + outer product):
  *   barrier()
  *   for kk in 0..innerDim:
  *     a_vals[tm] = A[(thread_row*ttM + tm) * innerDim + kk]
