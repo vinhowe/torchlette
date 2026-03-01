@@ -24,11 +24,11 @@ describe("compileTileKernel", () => {
     const spec: TileKernelSpec = {
       name: "vecadd",
       workgroupSize: WG,
-      bindings: [
-        { name: "a", direction: "in" },
-        { name: "b", direction: "in" },
-        { name: "out", direction: "out" },
-      ],
+      bindings: {
+        a: { storage: "read", type: "f32" },
+        b: { storage: "read", type: "f32" },
+        out: { storage: "read_write", type: "f32" },
+      },
       uniforms: { size: "u32" as const },
       grid: elementwiseGrid(WG),
       kernel(ctx: KernelContext) {
@@ -53,10 +53,10 @@ describe("compileTileKernel", () => {
     const spec: TileKernelSpec = {
       name: "masked_scale",
       workgroupSize: WG,
-      bindings: [
-        { name: "src", direction: "in" },
-        { name: "out", direction: "out" },
-      ],
+      bindings: {
+        src: { storage: "read", type: "f32" },
+        out: { storage: "read_write", type: "f32" },
+      },
       uniforms: { size: "u32" as const, scale: "f32" as const },
       grid: elementwiseGrid(WG),
       kernel(ctx: KernelContext) {
@@ -97,6 +97,62 @@ describe("grid helpers", () => {
   });
 });
 
+describe("autoVectorize with elementIndex", () => {
+  it("auto-vectorizes a kernel using elementIndex (flatGlobalId)", () => {
+    const WG = 64;
+    const spec: TileKernelSpec = {
+      name: "autovec_elemidx",
+      workgroupSize: WG,
+      bindings: {
+        src: { storage: "read", type: "f32" },
+        out: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { size: "u32" as const },
+      grid: elementwiseGrid(WG),
+      autoVectorize: true,
+      kernel(ctx: KernelContext) {
+        const idx = ctx.elementIndex(WG);
+        const val = ctx.load("src", idx);
+        ctx.emitStore("out", idx, val.mul(ctx.f32(2.0)));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // Should have vec4 unrolling with _flatBase
+    expect(wgsl).toContain("_flatBase");
+    expect(wgsl).toContain("vec element 0");
+    expect(wgsl).toContain("vec element 3");
+    // Should use num_wg for flat workgroup calculation
+    expect(wgsl).toContain("num_wg");
+  });
+
+  it("auto-vectorizes a globalId(0) kernel with _base", () => {
+    const WG = 64;
+    const spec: TileKernelSpec = {
+      name: "autovec_gid",
+      workgroupSize: WG,
+      bindings: {
+        src: { storage: "read", type: "f32" },
+        out: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { size: "u32" as const },
+      grid: elementwiseGrid(WG),
+      autoVectorize: true,
+      kernel(ctx: KernelContext) {
+        const idx = ctx.globalId(0);
+        ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+        const val = ctx.load("src", idx);
+        ctx.emitStore("out", idx, val.mul(ctx.f32(2.0)));
+      },
+    };
+    const wgsl = compileTileKernel(spec);
+    // Should use _base (not _flatBase) for globalId(0) path
+    expect(wgsl).toContain("_base");
+    expect(wgsl).not.toContain("_flatBase");
+    expect(wgsl).toContain("vec element 0");
+    expect(wgsl).toContain("vec element 3");
+  });
+});
+
 describe.skipIf(cpuOnly)("createTileKernelDispatcher", () => {
   beforeAll(async () => {
     const ready = await initWebGPU();
@@ -108,13 +164,13 @@ describe.skipIf(cpuOnly)("createTileKernelDispatcher", () => {
     const spec: TileKernelSpec = {
       name: "custom_vecadd",
       workgroupSize: WG,
-      bindings: [
-        { name: "a", direction: "in" },
-        { name: "b", direction: "in" },
-        { name: "out", direction: "out" },
-      ],
+      bindings: {
+        a: { storage: "read", type: "f32" },
+        b: { storage: "read", type: "f32" },
+        out: { storage: "read_write", type: "f32" },
+      },
       uniforms: { size: "u32" as const },
-      grid: elementwiseGrid(WG),
+      grid: elementwiseGrid(WG, { elementUniform: "size" }),
       kernel(ctx: KernelContext) {
         const idx = ctx.globalId(0);
         ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
@@ -132,21 +188,15 @@ describe.skipIf(cpuOnly)("createTileKernelDispatcher", () => {
 
     const aTensor = webgpuBackend.ops.tensorFromArray(aData, [N]);
     const bTensor = webgpuBackend.ops.tensorFromArray(bData, [N]);
+    const outTensor = webgpuBackend.ops.tensorFromArray(new Array(N).fill(0), [N]);
 
-    const outBuf = dispatcher.dispatch(
-      { a: (aTensor as any).buffer, b: (bTensor as any).buffer },
+    dispatcher.dispatch(
+      { a: (aTensor as any).buffer, b: (bTensor as any).buffer, out: (outTensor as any).buffer },
       { size: N },
     );
 
     // Read result back
-    const result = await webgpuBackend.ops.read({
-      buffer: outBuf,
-      shape: [N],
-      strides: [1],
-      offset: 0,
-      dtype: "f32",
-      isContiguous: true,
-    });
+    const result = await webgpuBackend.ops.read(outTensor);
 
     const expected = aData.map((a, i) => a + bData[i]);
     expect(result.length).toBe(N);
