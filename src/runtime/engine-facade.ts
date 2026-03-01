@@ -14,7 +14,7 @@ import type {
 } from "../backend/types";
 import type { Tensor } from "./tensor";
 import { RuntimeEngine } from "./engine";
-import type { TensorOrScalar } from "./engine-types";
+import type { TensorOrScalar } from "./engine";
 
 const defaultEngine = new RuntimeEngine();
 
