@@ -1551,9 +1551,17 @@ export class KernelContext {
   /** Whether this kernel's reduction primitives used subgroup operations. */
   _usesSubgroups = false;
 
+  /** Workgroup size (product if 2D), set by buildKernelIR from spec.workgroupSize. */
+  private _wgSize: number | [number, number] = 0;
+
   constructor(bindings?: Record<string, BindingSpec>, subgroupSize = 0) {
     this.bindingSpecs = bindings ?? {};
     this.subgroupSize = subgroupSize;
+  }
+
+  /** @internal Set workgroup size from spec. Called by buildKernelIR(). */
+  _setWgSize(wgSize: number | [number, number]): void {
+    this._wgSize = wgSize;
   }
 
   private trackNode<T extends IRNode>(node: T): T {
@@ -2703,29 +2711,43 @@ export class KernelContext {
 
   // ---- Triton-like Tile API (delegates to internal BlockOps) ----
 
-  /** Internal BlockOps instance, created by configureTiles(). */
+  /** Internal BlockOps instance, lazily created on first use. */
   private _blockOps?: BlockOps;
+  /** Thread tile config, set by setThreadTile() or configureTiles(). */
+  private _threadTile?: [number, number];
 
   private _requireOps(): BlockOps {
-    if (!this._blockOps) throw new Error("Call configureTiles() first");
+    if (!this._blockOps) {
+      if (!this._wgSize) throw new Error("Kernel spec must have workgroupSize for tile operations");
+      this._blockOps = new BlockOps(this, {
+        wgSize: this._wgSize,
+        ...(this._threadTile ? { threadTile: this._threadTile } : {}),
+      });
+    }
     return this._blockOps;
   }
 
   /**
-   * Initialize tile context: create internal BlockOps, emit thread position bindings.
-   * Must be called before any other tile-level method.
+   * Set thread tile dimensions for dot/store operations.
+   * Call this before dotAccum() or tileStore2D() if not using configureTiles().
+   */
+  setThreadTile(threadTileM: number, threadTileN: number): void {
+    this._threadTile = [threadTileM, threadTileN];
+    if (this._blockOps) {
+      this._blockOps.setThreadTile(threadTileM, threadTileN);
+    }
+  }
+
+  /**
+   * Initialize tile context: set thread tile, emit thread position bindings.
+   * Returns threadRow/threadCol for use in epilogue addressing.
    *
-   * Equivalent to Triton's implicit thread-to-tile mapping.
+   * Sugar for setThreadTile() + emitLet("thread_row"/thread_col").
    */
   configureTiles(config: {
-    tileM: number; tileN: number;
     threadTileM: number; threadTileN: number;
-    wgSize: [number, number];
   }): { threadRow: BlockExpr; threadCol: BlockExpr } {
-    this._blockOps = new BlockOps(this, {
-      wgSize: config.wgSize,
-      threadTile: [config.threadTileM, config.threadTileN],
-    });
+    this.setThreadTile(config.threadTileM, config.threadTileN);
     const threadRow = this.emitLet("thread_row", this.threadIdx(1));
     const threadCol = this.emitLet("thread_col", this.threadIdx(0));
     return { threadRow, threadCol };
@@ -2980,6 +3002,7 @@ export function buildKernelIR(spec: TileKernelSpec, subgroupSize = 0): KernelCon
   cseCache = new Map();
   try {
     const ctx = new KernelContext(spec.bindings, subgroupSize);
+    ctx._setWgSize(spec.workgroupSize);
     spec.kernel(ctx);
     return ctx;
   } finally {

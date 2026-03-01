@@ -94,9 +94,9 @@ function matmulKernelBlockOps(
   const { batched, kSplit } = opts;
   const { tileM, tileN, tileK, threadTileM, threadTileN, wgSizeX, wgSizeY, transA, transB, outputDtype } = p;
 
-  // Initialize tile context — creates BlockOps, emits thread position bindings
+  // Initialize tile context — set thread tile, emit thread position bindings
   const { threadRow, threadCol } = ctx.configureTiles({
-    tileM, tileN, threadTileM, threadTileN, wgSize: [wgSizeX, wgSizeY],
+    threadTileM, threadTileN,
   });
 
   // 1. Uniforms

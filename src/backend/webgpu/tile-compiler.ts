@@ -21,6 +21,7 @@ import type {
   TilePtr2D, TileMask2D,
   BlockAllocStmt, BlockLoadStmt, BlockStoreStmt, BlockDotStmt,
   BlockReduceStmt, BlockUnaryStmt, BlockBinaryStmt,
+  ThreadIdxNode,
 } from "./tile-ir";
 import { buildKernelIR, type KernelContext, elementwiseGrid } from "./tile-ir";
 import { computeSafeVecWidth } from "./tile-access-analysis";
@@ -285,6 +286,16 @@ export function compileTileKernel(spec: TileKernelSpec): string {
   // 2. Lower tile-level ops if present
   let stmts = ctx.statements;
   if (hasTileStatements(stmts)) {
+    // Auto-emit thread_row/thread_col if not present (tile lowering needs them)
+    if (!stmts.some(s => s.kind === "let" && s.name === "thread_row")) {
+      const threadRowNode: ThreadIdxNode = { id: -1, kind: "threadIdx", dim: 1, valueType: "scalar", dataType: "u32" };
+      const threadColNode: ThreadIdxNode = { id: -1, kind: "threadIdx", dim: 0, valueType: "scalar", dataType: "u32" };
+      stmts = [
+        { kind: "let", name: "thread_row", dtype: "u32", value: threadRowNode },
+        { kind: "let", name: "thread_col", dtype: "u32", value: threadColNode },
+        ...stmts,
+      ];
+    }
     stmts = lowerTileStatements(stmts, spec);
   }
 
