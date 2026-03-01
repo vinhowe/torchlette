@@ -13,7 +13,6 @@ import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import {
   dtypeBytes,
   alignBufferSize,
-  WORKGROUP_SIZE,
 } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";

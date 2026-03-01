@@ -69,14 +69,6 @@ function gcd(a: number, b: number): number {
   return a;
 }
 
-function gcdN(...vals: number[]): number {
-  let result = vals[0];
-  for (let i = 1; i < vals.length; i++) {
-    result = gcd(result, vals[i]);
-  }
-  return result;
-}
-
 const UNKNOWN: SymbolicExpr = { innerCoeff: "unknown", hasDataDep: true, constantTerm: null, divisibility: null };
 const ZERO: SymbolicExpr = { innerCoeff: 0, hasDataDep: false, constantTerm: 0, divisibility: 0 };
 

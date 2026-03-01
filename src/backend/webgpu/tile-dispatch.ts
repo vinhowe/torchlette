@@ -30,7 +30,6 @@ import { compileTileKernel } from "./tile-compiler";
 import type { TileKernelSpec, UniformType, AutotuneConfig, DataType } from "./tile-ir";
 import { resolveGrid } from "./tile-ir";
 import { autotuneTileKernel, getDefaultConfig, type AutotuneOptions } from "./tile-autotune";
-import { analyzeAccessPatterns, reportAccessPatterns } from "./tile-access-analysis";
 
 // ============================================================================
 // Chunked Binding Configuration

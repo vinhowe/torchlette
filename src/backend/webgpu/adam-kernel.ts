@@ -96,11 +96,6 @@ function makeAdamStepSpec(
         // Vec4 path: 4 elements per thread
         let flatId;
         if (use2D) {
-          flatId = ctx.globalId(0).add(ctx.globalId(1).div(ctx.u32(WORKGROUP_SIZE)).mul(ctx.u32(gridSizeX * WORKGROUP_SIZE)));
-          // Actually the 2D formula: gid.x + gid.y * gridSizeX * WORKGROUP_SIZE
-          // globalId = (workgroup_id * workgroup_size + local_id)
-          // We need: gid.x + gid.y * gridSizeX * WORKGROUP_SIZE where gid = global_invocation_id
-          // Actually just: flat_id = gid.x + gid.y * gridSizeX * WORKGROUP_SIZE
           flatId = ctx.globalId(0).add(ctx.globalId(1).mul(ctx.u32(gridSizeX * WORKGROUP_SIZE)));
         } else {
           flatId = ctx.globalId(0);
@@ -173,6 +168,18 @@ function makeAdamStepSpec(
 
 import type { VarHandle, BlockExpr, KernelContext } from "./tile-ir";
 
+function loadAdamUniforms(ctx: KernelContext) {
+  return {
+    beta1: ctx.uniform("beta1").bitcastTo("f32"),
+    beta2: ctx.uniform("beta2").bitcastTo("f32"),
+    stepSize: ctx.uniform("step_size").bitcastTo("f32"),
+    eps: ctx.uniform("eps").bitcastTo("f32"),
+    weightDecay: ctx.uniform("weight_decay").bitcastTo("f32"),
+    lrTimesWd: ctx.uniform("lr_times_wd").bitcastTo("f32"),
+    decoupledWd: ctx.uniform("decoupled_wd"),
+  };
+}
+
 /** Emit the Adam update logic for the scalar path. */
 function emitAdamScalarBody(
   ctx: KernelContext,
@@ -181,13 +188,7 @@ function emitAdamScalarBody(
   emitF16: boolean,
 ): void {
   const p = ctx.emitLet("p", ctx.load("param", idx));
-  const beta1 = ctx.uniform("beta1").bitcastTo("f32");
-  const beta2 = ctx.uniform("beta2").bitcastTo("f32");
-  const stepSize = ctx.uniform("step_size").bitcastTo("f32");
-  const eps = ctx.uniform("eps").bitcastTo("f32");
-  const weightDecay = ctx.uniform("weight_decay").bitcastTo("f32");
-  const lrTimesWd = ctx.uniform("lr_times_wd").bitcastTo("f32");
-  const decoupledWd = ctx.uniform("decoupled_wd");
+  const { beta1, beta2, stepSize, eps, weightDecay, lrTimesWd, decoupledWd } = loadAdamUniforms(ctx);
 
   // L2 weight decay (Adam): grad += wd * param
   ctx.ifThen(decoupledWd.eq(ctx.u32(0)).and(weightDecay.bitcastTo("u32").gt(ctx.u32(0))), () => {
@@ -225,13 +226,7 @@ function emitAdamVec4Body(
   g0Var: VarHandle, g1Var: VarHandle, g2Var: VarHandle, g3Var: VarHandle,
   emitF16: boolean,
 ): void {
-  const beta1 = ctx.uniform("beta1").bitcastTo("f32");
-  const beta2 = ctx.uniform("beta2").bitcastTo("f32");
-  const stepSize = ctx.uniform("step_size").bitcastTo("f32");
-  const eps = ctx.uniform("eps").bitcastTo("f32");
-  const weightDecay = ctx.uniform("weight_decay").bitcastTo("f32");
-  const lrTimesWd = ctx.uniform("lr_times_wd").bitcastTo("f32");
-  const decoupledWd = ctx.uniform("decoupled_wd");
+  const { beta1, beta2, stepSize, eps, weightDecay, lrTimesWd, decoupledWd } = loadAdamUniforms(ctx);
 
   // Load param, m, v for all 4 elements
   const offsets = [ctx.u32(0), ctx.u32(1), ctx.u32(2), ctx.u32(3)];
@@ -352,19 +347,6 @@ function createConfigBuffer(
 }
 
 // ============================================================================
-// Output Buffer Allocation
-// ============================================================================
-
-/**
- * Allocate an output buffer for Adam via the buffer pool.
- */
-function allocateAdamOutputBuffer(sizeBytes: number): GPUBuffer {
-  const buf = allocateOutputBuffer(sizeBytes);
-  trackSharedEncoderWrite(buf);
-  return buf;
-}
-
-// ============================================================================
 // Dispatch
 // ============================================================================
 
@@ -435,9 +417,11 @@ export function dispatchAdamStep(
 
   // Only allocate f16 output buffer (different size).
   const totalF16Bytes = numElements * f16BytesPerElement;
-  const paramF16Out = doF16
-    ? allocateAdamOutputBuffer(totalF16Bytes)
-    : null;
+  let paramF16Out: GPUBuffer | null = null;
+  if (doF16) {
+    paramF16Out = allocateOutputBuffer(totalF16Bytes);
+    trackSharedEncoderWrite(paramF16Out);
+  }
   profileSubOpEnd("adam.allocBufs", _st);
 
   // Vec4 coalescing: use when total elements divisible by 4
