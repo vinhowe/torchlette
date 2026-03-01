@@ -2729,7 +2729,7 @@ export class KernelContext {
 
   /**
    * Set thread tile dimensions for dot/store operations.
-   * Call this before dotAccum() or tileStore2D() if not using configureTiles().
+   * Call this before dotAccum() or tileStore() if not using configureTiles().
    */
   setThreadTile(threadTileM: number, threadTileN: number): void {
     this._threadTile = [threadTileM, threadTileN];
@@ -2759,7 +2759,7 @@ export class KernelContext {
   }
 
   /** Create a 1D offset range: [base, base+blockSize). ≈ tl.arange(base, base+size) */
-  tileRange(base: BlockExpr, blockSize: number): TileRange {
+  arange(base: BlockExpr, blockSize: number): TileRange {
     return this._requireOps().arange(base, blockSize);
   }
 
@@ -2774,22 +2774,22 @@ export class KernelContext {
   }
 
   /** Create a register block initialized to zero. ≈ tl.zeros([M, N]) */
-  blockZeros(rows: number, cols: number): Block {
+  zeros(rows: number, cols: number): Block {
     return this._requireOps().zeros(rows, cols);
   }
 
   /** Create a register block filled with a constant. ≈ tl.full([M, N], val) */
-  blockFull(rows: number, cols: number, val: number): Block {
+  full(rows: number, cols: number, val: number): Block {
     return this._requireOps().full(rows, cols, val);
   }
 
   /** Cooperative tile load into shared memory. ≈ tl.load(ptr, mask) */
-  tileLoad2D(binding: string, ptr: TilePtr, mask: TileMask): Block {
+  load2D(binding: string, ptr: TilePtr, mask: TileMask): Block {
     return this._requireOps().loadTile(binding, ptr, mask);
   }
 
   /** 1D register load (e.g. bias vector). ≈ tl.load(bias_ptr) */
-  tileLoad1D(binding: string, range: TileRange): Block {
+  load1D(binding: string, range: TileRange): Block {
     return this._requireOps().load1d(binding, range);
   }
 
@@ -2799,9 +2799,10 @@ export class KernelContext {
   }
 
   /** Store block to global memory with bounds checking. ≈ tl.store(ptr, block, mask) */
-  tileStore2D(binding: string, block: Block, ptr: TilePtr, mask: TileMask): void {
+  store2D(binding: string, block: Block, ptr: TilePtr, mask: TileMask): void {
     this._requireOps().storeTile(binding, block, ptr, mask);
   }
+
 }
 
 // ============================================================================
