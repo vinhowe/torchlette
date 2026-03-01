@@ -15,12 +15,9 @@ import {
   isAutotuneEnabled,
   setAutotuneEnabled,
 } from "../../src/backend/webgpu";
-import {
-  clearDispatchTuningCache,
-  clearTuningCache,
-  getCachedTuningResult,
-  getSubgroupSupport,
-} from "../../src/backend/webgpu/matmul";
+import { getSubgroupSupport } from "../../src/backend/webgpu/matmul/types";
+import { clearDispatchTuningCache } from "../../src/backend/webgpu/matmul/dispatch";
+import { clearTuningCache, getCachedTuningResult } from "../../src/backend/webgpu/matmul/autotune";
 
 import { cpuOnly } from "../helpers/webgpu";
 

@@ -17,7 +17,7 @@ import { requireContext } from "../gpu-context";
 import { dispatchElementwise } from "../dispatch";
 import { createTensor } from "../tensor";
 import { resolveOutputBuffer } from "../buffer-arena";
-import { params1 } from "../bind-group-cache";
+import { params } from "../bind-group-cache";
 import { createTileKernelDispatcher } from "../tile-dispatch";
 
 /**
@@ -126,7 +126,7 @@ function whereDirect(
     key, shader: code,
     inputs: [condTensor.buffer, xTensor.buffer, yTensor.buffer],
     outputSizeBytes: outSize * 4,
-    params: params1(outSize),
+    params: params(outSize),
     outBuffer: providedOut,
     dispatchX: Math.ceil(outSize / WORKGROUP_SIZE),
   });

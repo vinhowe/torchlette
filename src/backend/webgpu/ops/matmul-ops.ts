@@ -15,8 +15,7 @@ import {
   profiledCreateBindGroup,
   createParamsBuffer,
   releaseParamsBuffer,
-  params5,
-  params6,
+  params,
 } from "../bind-group-cache";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
 import { ensureContiguous } from "./views";
@@ -103,7 +102,7 @@ function sliceColumns(
   if (!needsChunking) {
     // Fast path: single dispatch
     const dispatch = compute2DDispatch(Math.ceil(outSize / WORKGROUP_SIZE));
-    const paramsBuffer = createParamsBuffer(ctx.device, params5(K, N, colStart, sliceWidth, 0));
+    const paramsBuffer = createParamsBuffer(ctx.device, params(K, N, colStart, sliceWidth, 0));
 
     const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [input.buffer, outBuffer, paramsBuffer]);
 
@@ -135,7 +134,7 @@ function sliceColumns(
       const chunkSize = numRows * sliceWidth;
       const dispatch = compute2DDispatch(Math.ceil(chunkSize / WORKGROUP_SIZE));
 
-      const paramsBuffer = createParamsBuffer(ctx.device, params5(numRows, N, colStart, sliceWidth, rowStart));
+      const paramsBuffer = createParamsBuffer(ctx.device, params(numRows, N, colStart, sliceWidth, rowStart));
 
       const bindGroup = profiledCreateBindGroup(ctx.device, {
         layout: pipeline.getBindGroupLayout(0),
@@ -195,7 +194,7 @@ function scatterColumnsToOutput(
     // Fast path: single dispatch
     const totalSize = totalRows * sliceWidth;
     const dispatch = compute2DDispatch(Math.ceil(totalSize / WORKGROUP_SIZE));
-    const paramsBuffer = createParamsBuffer(ctx.device, params6(totalRows, N, colStart, sliceWidth, 0, 0));
+    const paramsBuffer = createParamsBuffer(ctx.device, params(totalRows, N, colStart, sliceWidth, 0, 0));
 
     const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [partial.buffer, outBuffer, paramsBuffer]);
 
@@ -240,7 +239,7 @@ function scatterColumnsToOutput(
       const chunkSize = numRows * sliceWidth;
       const dispatch = compute2DDispatch(Math.ceil(chunkSize / WORKGROUP_SIZE));
 
-      const paramsBuffer = createParamsBuffer(ctx.device, params6(numRows, N, colStart, sliceWidth, 0, 0));
+      const paramsBuffer = createParamsBuffer(ctx.device, params(numRows, N, colStart, sliceWidth, 0, 0));
 
       const bindGroup = profiledCreateBindGroup(ctx.device, {
         layout: pipeline.getBindGroupLayout(0),
@@ -678,7 +677,7 @@ function sliceBColumns(
   const pipeline = getPipeline(ctx, `sliceBColumns`, code);
 
   const dispatch = compute2DDispatch(Math.ceil(outSize / WORKGROUP_SIZE));
-  const paramsBuffer = createParamsBuffer(ctx.device, params5(batch, K, N, colStart, chunkWidth));
+  const paramsBuffer = createParamsBuffer(ctx.device, params(batch, K, N, colStart, chunkWidth));
 
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [b.buffer, outBuffer, paramsBuffer]);
 

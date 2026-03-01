@@ -22,8 +22,7 @@ import { requireContext } from "../gpu-context";
 import { dispatchElementwise, dispatchComputePass, getPipeline } from "../dispatch";
 import { createTensor, createTrackedBuffer } from "../tensor";
 import {
-  params1,
-  params3,
+  params,
   createParamsBuffer,
   releaseParamsBuffer,
   cachedCreateBindGroup,
@@ -57,7 +56,7 @@ function comparisonOp(
     key, shader: code,
     inputs: [aTensor.buffer, bTensor.buffer],
     outputSizeBytes: outSize * 4,
-    params: params1(outSize),
+    params: params(outSize),
     outBuffer: options?.outBuffer,
     dispatchX: dispatch.x, dispatchY: dispatch.y,
   });
@@ -209,7 +208,7 @@ function argReduceOp(
     code,
   );
 
-  const paramsBuffer = createParamsBuffer(ctx.device, params3(outSize, dimSize, dimStride));
+  const paramsBuffer = createParamsBuffer(ctx.device, params(outSize, dimSize, dimStride));
 
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, paramsBuffer]);
 

@@ -543,27 +543,3 @@ export function getAllBinaryOps(): string[] {
     .map(([name, _]) => name);
 }
 
-// ============================================================================
-// Backward Compatibility Exports
-// ============================================================================
-
-/**
- * UNARY_EXPR - string expression templates for unary ops.
- * @deprecated Use getExpr() or OP_REGISTRY directly
- */
-export const UNARY_EXPR: Record<string, (input: string, zero?: string, one?: string) => string> =
-  Object.fromEntries(
-    Object.entries(OP_REGISTRY)
-      .filter(([_, def]) => def.arity === 1)
-      .map(([name, def]) => [name, def.expr as (input: string, zero?: string, one?: string) => string]),
-  );
-
-/**
- * BINARY_EXPR - string expression templates for binary ops.
- * @deprecated Use getExpr() or OP_REGISTRY directly
- */
-export const BINARY_EXPR: Record<string, (a: string, b: string) => string> = Object.fromEntries(
-  Object.entries(OP_REGISTRY)
-    .filter(([_, def]) => def.arity === 2)
-    .map(([name, def]) => [name, def.expr as (a: string, b: string) => string]),
-);

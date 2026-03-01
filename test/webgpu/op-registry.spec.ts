@@ -19,8 +19,6 @@ import {
   getAllFusibleOps,
   getAllUnaryOps,
   getAllBinaryOps,
-  UNARY_EXPR,
-  BINARY_EXPR,
 } from "../../src/backend/webgpu/ops/registry";
 
 describe("Op Registry", () => {
@@ -328,38 +326,6 @@ describe("Op Registry", () => {
       expect(binary).toContain("add");
       expect(binary).toContain("mul");
       expect(binary).not.toContain("relu");
-    });
-  });
-
-  describe("backward compatibility exports", () => {
-    it("UNARY_EXPR contains all unary ops", () => {
-      expect(UNARY_EXPR.relu).toBeDefined();
-      expect(UNARY_EXPR.gelu).toBeDefined();
-      expect(UNARY_EXPR.silu).toBeDefined();
-      expect(UNARY_EXPR.neg).toBeDefined();
-      expect(UNARY_EXPR.sqrt).toBeDefined();
-      expect(UNARY_EXPR.cast_f16).toBeDefined();
-    });
-
-    it("BINARY_EXPR contains all binary ops", () => {
-      expect(BINARY_EXPR.add).toBeDefined();
-      expect(BINARY_EXPR.sub).toBeDefined();
-      expect(BINARY_EXPR.mul).toBeDefined();
-      expect(BINARY_EXPR.div).toBeDefined();
-      expect(BINARY_EXPR.eq).toBeDefined();
-      expect(BINARY_EXPR.lt).toBeDefined();
-    });
-
-    it("UNARY_EXPR generates same output as getExpr", () => {
-      expect(UNARY_EXPR.relu("x")).toBe(getExpr("relu", ["x"]));
-      expect(UNARY_EXPR.neg("x")).toBe(getExpr("neg", ["x"]));
-      expect(UNARY_EXPR.sqrt("x")).toBe(getExpr("sqrt", ["x"]));
-    });
-
-    it("BINARY_EXPR generates same output as getExpr", () => {
-      expect(BINARY_EXPR.add("a", "b")).toBe(getExpr("add", ["a", "b"]));
-      expect(BINARY_EXPR.mul("a", "b")).toBe(getExpr("mul", ["a", "b"]));
-      expect(BINARY_EXPR.eq("a", "b")).toBe(getExpr("eq", ["a", "b"]));
     });
   });
 

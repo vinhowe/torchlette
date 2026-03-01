@@ -19,7 +19,7 @@ import { resolveOutputBuffer } from "../buffer-arena";
 import {
   cachedCreateBindGroup, createParamsBuffer, releaseParamsBuffer,
   createUniformBuffer, releaseUniformBuffer, profiledCreateBindGroup,
-  params1, params2, params4, params7,
+  params,
 } from "../bind-group-cache";
 import { castTileIR, castSpec, contiguousTileIR, narrowBackwardTileIR, chunkedTransposeTileIR } from "./ops-tile-ir";
 import { createTileKernelDispatcher } from "../tile-dispatch";
@@ -416,7 +416,7 @@ function contiguousDirect(tensor: WebGPUTensor): WebGPUTensor {
     key, shader: code,
     inputs: [tensor.buffer],
     outputSizeBytes: outSize * bytesPerElement,
-    params: params1(outSize),
+    params: params(outSize),
     outBuffer,
     dispatchX: dispatch.x, dispatchY: dispatch.y,
   });
@@ -518,7 +518,7 @@ function contiguousChunked(
         const tileSize = numRows * numCols;
         const dispatch = compute2DDispatch(Math.ceil(tileSize / WORKGROUP_SIZE));
 
-        const paramsBuffer = createParamsBuffer(ctx.device, params7(K, N, rowStart, rowEnd, colStart, colEnd, dispatch.gridSizeX * WORKGROUP_SIZE));
+        const paramsBuffer = createParamsBuffer(ctx.device, params(K, N, rowStart, rowEnd, colStart, colEnd, dispatch.gridSizeX * WORKGROUP_SIZE));
 
         const bindGroup = profiledCreateBindGroup(ctx.device,{
           layout: pipeline.getBindGroupLayout(0),
@@ -657,7 +657,7 @@ export function narrowBackward(grad: BackendTensor, dim: number, start: number, 
     key, shader: shaderCode,
     inputs: [gradTensor.buffer],
     outputSizeBytes: outSize * bytesPerElement,
-    params: params4(outerSize, innerSize, gradDimSize, start),
+    params: params(outerSize, innerSize, gradDimSize, start),
     dispatchX: dispatch.x, dispatchY: dispatch.y,
   });
 

@@ -135,7 +135,7 @@ export {
 } from "./profiler";
 
 // Re-export autotune control functions
-export { isAutotuneEnabled, pretuneMatmulShapes, setAutotuneEnabled } from "./matmul";
+export { isAutotuneEnabled, pretuneMatmulShapes, setAutotuneEnabled } from "./matmul/dispatch";
 
 // Re-export tile-IR public API for custom kernels
 export {
@@ -173,7 +173,7 @@ import type { Backend } from "../types";
 import type { GPUDevice } from "./gpu-types";
 import { gpuContext } from "./webgpu-state";
 import { registerBackend } from "../registry";
-import { pretuneMatmulShapes as pretuneShapes } from "./matmul";
+import { pretuneMatmulShapes as pretuneShapes } from "./matmul/dispatch";
 import { dispatchFusedKernel } from "./fusion-dispatch";
 import { beginStep, endStep } from "./shared-encoder";
 

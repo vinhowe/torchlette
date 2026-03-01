@@ -9,10 +9,10 @@ export {
 } from "./backend/webgpu";
 export {
   DEFAULT_CONFIG,
-  dispatchTiledMatmul,
   getSubgroupSupport,
   type MatmulKernelConfig,
-} from "./backend/webgpu/matmul";
+} from "./backend/webgpu/matmul/types";
+export { dispatchTiledMatmul } from "./backend/webgpu/matmul/dispatch";
 export * from "./engine";
 export {
   type DeviceKind,
