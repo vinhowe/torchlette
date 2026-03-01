@@ -18,7 +18,7 @@ import type { GPUBuffer, GPUComputePipeline, GPUBindGroup, WebGPUContext, WebGPU
 import { GPUBufferUsage } from "./gpu-types";
 import { recordPipeline, getWarmupPipeline } from "./pipeline-warmup";
 import { requireContext, isF16Supported } from "./gpu-context";
-import { bufferPool } from "./buffer-pool";
+import { destroyCopy } from "./buffer-pool";
 import {
   getSharedEncoderInstance,
   autoFlushSharedEncoder,
@@ -424,6 +424,12 @@ export function dispatchMatmul(
   transA = false,
   transB = false,
   donatedBuffer?: GPUBuffer,
+  epilogueOpts?: {
+    epilogue: EpilogueConfig;
+    epilogueInputs: WebGPUTensor[];
+    inputCastA?: DType;
+    inputCastB?: DType;
+  },
 ): WebGPUTensor {
   const ctx = requireContext();
 
@@ -433,33 +439,34 @@ export function dispatchMatmul(
     strideA, strideB, strideC,
   } = prepareMatmulInputs(a, b, transA, transB);
 
-  // Derive per-input dtypes; output is always the higher-precision type
-  const dtypeA = effectiveA.dtype === "f16" && isF16Supported() ? "f16" as const : "f32" as const;
-  const dtypeB = effectiveB.dtype === "f16" && isF16Supported() ? "f16" as const : "f32" as const;
-  const outputDtype = (dtypeA === "f32" || dtypeB === "f32") ? "f32" as const : dtypeA;
+  // Derive per-input dtypes.
+  // When inputCast is set, buffer is wider (e.g. f32) but matmul computes in target (e.g. f16).
+  const rawDtypeA = effectiveA.dtype === "f16" && isF16Supported() ? "f16" as const : "f32" as const;
+  const rawDtypeB = effectiveB.dtype === "f16" && isF16Supported() ? "f16" as const : "f32" as const;
+  const dtypeA: "f16" | "f32" = epilogueOpts?.inputCastA === "f16" && isF16Supported() ? "f16" : rawDtypeA;
+  const dtypeB: "f16" | "f32" = epilogueOpts?.inputCastB === "f16" && isF16Supported() ? "f16" : rawDtypeB;
+  const promotedDtype = (dtypeA === "f32" || dtypeB === "f32") ? "f32" as const : dtypeA;
+  const outputDtype = epilogueOpts?.epilogue.outputDtype ?? promotedDtype;
   const bytesPerElement = outputDtype === "f16" ? 2 : 4;
+
+  const epilogueBuffers = epilogueOpts?.epilogueInputs.map((t) => t.buffer) ?? [];
 
   // Create or use donated output buffer
   const outSize = sizeOf(outShape);
   const requiredSize = outSize * bytesPerElement;
-  const useDonated =
-    donatedBuffer && donatedBuffer.size >= requiredSize;
+  const useDonated = donatedBuffer && donatedBuffer.size >= requiredSize;
   const outBuffer = useDonated
     ? donatedBuffer
     : resolveOutputBuffer(ctx.device, requiredSize,
-        [effectiveA.buffer, effectiveB.buffer]);
+        [effectiveA.buffer, effectiveB.buffer, ...epilogueBuffers]);
 
-  // Dispatch tiled matmul
   dispatchTiledMatmul({
     device: ctx.device,
     queue: ctx.queue,
     a: effectiveA.buffer,
     b: effectiveB.buffer,
     out: outBuffer,
-    m,
-    n,
-    k,
-    batchSize,
+    m, n, k, batchSize,
     batchStrideA: strideA,
     batchStrideB: strideB,
     batchStrideC: strideC,
@@ -467,21 +474,19 @@ export function dispatchMatmul(
     transB: effectiveTransB,
     dtype: dtypeA,
     dtypeB: dtypeB !== dtypeA ? dtypeB : undefined,
+    epilogue: epilogueOpts?.epilogue,
+    epilogueInputs: epilogueBuffers.length > 0 ? epilogueBuffers : undefined,
+    inputCastA: epilogueOpts?.inputCastA,
+    inputCastB: epilogueOpts?.inputCastB,
   });
 
-  if (aWasCopied) { bufferPool.decRef(effectiveA.buffer); bufferPool.deferredDestroy(effectiveA.buffer, effectiveA.size * (a.dtype === "f16" ? 2 : 4)); }
-  if (bWasCopied) { bufferPool.decRef(effectiveB.buffer); bufferPool.deferredDestroy(effectiveB.buffer, effectiveB.size * (b.dtype === "f16" ? 2 : 4)); }
+  if (aWasCopied) destroyCopy(effectiveA);
+  if (bWasCopied) destroyCopy(effectiveB);
 
-  // Output tensor always owns the buffer (donated or new)
-  return createTensor(outShape, outBuffer, undefined, 0, outputDtype, true);
+  return createTensor(outShape, outBuffer, undefined, 0, outputDtype, useDonated || !epilogueOpts);
 }
 
-/**
- * Dispatch matmul with fused epilogue operations.
- *
- * This function runs matmul with additional elementwise operations
- * (like bias, relu, gelu) fused into the output write loop for better performance.
- */
+/** @deprecated Use dispatchMatmul with epilogueOpts parameter instead. */
 export function dispatchMatmulWithEpilogue(
   a: WebGPUTensor,
   b: WebGPUTensor,
@@ -492,62 +497,9 @@ export function dispatchMatmulWithEpilogue(
   inputCastA?: DType,
   inputCastB?: DType,
 ): WebGPUTensor {
-  const ctx = requireContext();
-
-  const {
-    effectiveA, effectiveB, effectiveTransA, effectiveTransB,
-    aWasCopied, bWasCopied, outShape, m, k, n, batchSize,
-    strideA, strideB, strideC,
-  } = prepareMatmulInputs(a, b, transA, transB);
-
-  // Derive per-input dtypes; output dtype from epilogue or promoted type.
-  // When inputCastA/B is set, the actual buffer dtype is wider (e.g. f32) but
-  // the matmul computes in the target dtype (e.g. f16) by casting during tile load.
-  // The "compute dtype" for codegen is the post-cast dtype.
-  const rawDtypeA = effectiveA.dtype === "f16" && isF16Supported() ? "f16" as const : "f32" as const;
-  const rawDtypeB = effectiveB.dtype === "f16" && isF16Supported() ? "f16" as const : "f32" as const;
-  const dtypeA: "f16" | "f32" = inputCastA === "f16" && isF16Supported() ? "f16" : rawDtypeA;
-  const dtypeB: "f16" | "f32" = inputCastB === "f16" && isF16Supported() ? "f16" : rawDtypeB;
-  const promotedDtype = (dtypeA === "f32" || dtypeB === "f32") ? "f32" as const : dtypeA;
-  const outputDtype = epilogue.outputDtype ?? promotedDtype;
-  const bytesPerElement = outputDtype === "f16" ? 2 : 4;
-
-  // Extract GPU buffers from epilogue input tensors
-  const epilogueBuffers = epilogueInputs.map((t) => t.buffer);
-
-  // Create output buffer (routed through arena for stable bind group cache)
-  const outSize = sizeOf(outShape);
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement,
-    [effectiveA.buffer, effectiveB.buffer, ...epilogueBuffers]);
-
-  // Dispatch tiled matmul with epilogue
-  dispatchTiledMatmul({
-    device: ctx.device,
-    queue: ctx.queue,
-    a: effectiveA.buffer,
-    b: effectiveB.buffer,
-    out: outBuffer,
-    m,
-    n,
-    k,
-    batchSize,
-    batchStrideA: strideA,
-    batchStrideB: strideB,
-    batchStrideC: strideC,
-    transA: effectiveTransA,
-    transB: effectiveTransB,
-    dtype: dtypeA,
-    dtypeB: dtypeB !== dtypeA ? dtypeB : undefined,
-    epilogue,
-    epilogueInputs: epilogueBuffers,
-    inputCastA,
-    inputCastB,
+  return dispatchMatmul(a, b, transA, transB, undefined, {
+    epilogue, epilogueInputs, inputCastA, inputCastB,
   });
-
-  if (aWasCopied) { bufferPool.decRef(effectiveA.buffer); bufferPool.deferredDestroy(effectiveA.buffer, effectiveA.size * (a.dtype === "f16" ? 2 : 4)); }
-  if (bWasCopied) { bufferPool.decRef(effectiveB.buffer); bufferPool.deferredDestroy(effectiveB.buffer, effectiveB.size * (b.dtype === "f16" ? 2 : 4)); }
-
-  return createTensor(outShape, outBuffer, undefined, 0, outputDtype);
 }
 
 /**
