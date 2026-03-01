@@ -3,23 +3,18 @@
 // ============================================================================
 export {
   sizeOf,
-  gcd,
-  lcm,
   broadcastShapes,
-  toIndexShape,
   contiguousStrides,
   computeEffectiveBroadcastStrides,
-  checkContiguousStrides,
   dtypeBytes,
   alignBufferSize,
-  dtypeToWgsl,
   compute2DDispatch,
   WORKGROUP_SIZE,
   MAX_WORKGROUPS_PER_DIM,
 } from "./shape-utils";
 
 export type { WebGPUTensor, WebGPUContext } from "./gpu-types";
-export { GPUBufferUsage, GPUMapMode, STORAGE_BUFFER_USAGE } from "./gpu-types";
+export { GPUBufferUsage, GPUMapMode } from "./gpu-types";
 
 export {
   bufferPool, getBufferPoolStats, setBufferPoolEnabled, clearBufferPool,
@@ -45,8 +40,8 @@ export {
   beginBatchExecution, endBatchExecution, isBatchActive, abortBatch,
   beginSharedEncoder, flushSharedEncoder, endSharedEncoder,
   beginStep, endStep, isSharedEncoderActive, setSharedEncoderEnabled,
-  getSharedEncoderInstance, trackSharedEncoderWrite, isInSharedEncoderWriteSet,
-  getSubmitCount, resetSubmitCount, submitOrCollect,
+  getSharedEncoderInstance, trackSharedEncoderWrite,
+  getSubmitCount, resetSubmitCount,
   setCurrentOpLabel, getCurrentOpLabel, setAdamBatchMode,
 } from "./shared-encoder";
 
@@ -70,7 +65,7 @@ export {
 
 export {
   paramsBufferPools, MAX_PARAMS_POOL_SIZE_PER_CLASS, paramsBufferSizeClass,
-  getParamsArray, createParamsBuffer, releaseParamsBuffer,
+  createParamsBuffer, releaseParamsBuffer,
   createUniformBuffer, releaseUniformBuffer,
   profiledCreateBindGroup, cachedCreateBindGroup,
   resetDispatchSequence, setDispatchSequenceCounters, getDispatchSequenceCounters,
@@ -78,7 +73,7 @@ export {
   getBindGroupCacheMissLog,
 } from "./bind-group-cache";
 
-export { createTensor, createTrackedBuffer, createBufferWithData } from "./tensor";
+export { createTensor, createTrackedBuffer } from "./tensor";
 
 export {
   dispatchComputePass, dispatchElementwise,
@@ -148,8 +143,6 @@ export {
   Block,
   elementwiseGrid,
   perRowGrid,
-  ceilDivGrid,
-  singleWorkgroup,
   elementwiseKernel,
   perRowKernel,
 } from "./tile-ir";
