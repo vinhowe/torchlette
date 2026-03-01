@@ -18,7 +18,7 @@ import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
-import { type TileKernelSpec, perRowGrid, ceilDivGrid } from "./tile-ir";
+import { type TileKernelSpec, perRowGrid, ceilDivGrid, perRowKernel } from "./tile-ir";
 import { createTileKernelDispatcher } from "./tile-dispatch";
 
 // ============================================================================
@@ -55,28 +55,18 @@ function getOrCreateRowStatsTempBuffers(
 
 const WG = WORKGROUP_SIZE; // 256
 
-const layerNormFwdSpec: TileKernelSpec = {
+const layerNormFwdSpec = perRowKernel({
   name: "layerNormFwd",
-  workgroupSize: WG,
   bindings: {
     x:      { storage: "read",       type: "f32" },
     weight: { storage: "read",       type: "f32" },
     bias:   { storage: "read",       type: "f32" },
     output: { storage: "read_write", type: "f32" },
   },
-  uniforms: {
-    num_rows:    "u32",
-    feature_dim: "u32",
-    eps:         "f32",
-  },
-  grid: perRowGrid(),
+  uniforms: { eps: "f32" },
 
-  kernel(ctx) {
-    const row  = ctx.programId(0);
-    const tid  = ctx.localIndex();
-    const D    = ctx.uniform("feature_dim");
-    const Df   = D.toF32();
-    const base = row.mul(D);
+  kernel(ctx, row, tid, D, base) {
+    const Df = D.toF32();
 
     // Compute mean
     const mean = ctx.emitLet("mean",
@@ -96,7 +86,7 @@ const layerNormFwdSpec: TileKernelSpec = {
       ctx.emitStore("output", base.add(i), out);
     });
   },
-};
+});
 
 const fwdTileKernel = createTileKernelDispatcher(layerNormFwdSpec);
 
@@ -109,28 +99,18 @@ const fwdTileKernel = createTileKernelDispatcher(layerNormFwdSpec);
  * One workgroup per row. Recomputes mean/variance in shared memory,
  * then computes gradX with dual reduction coefficients.
  */
-const layerNormBackwardGradXSpec: TileKernelSpec = {
+const layerNormBackwardGradXSpec = perRowKernel({
   name: "lnBwdGradX",
-  workgroupSize: WG,
   bindings: {
     grad_output: { storage: "read", type: "f32" },
     x:           { storage: "read", type: "f32" },
     weight:      { storage: "read", type: "f32" },
     grad_x:      { storage: "read_write", type: "f32" },
   },
-  uniforms: {
-    num_rows:    "u32",
-    feature_dim: "u32",
-    eps:         "f32",
-  },
-  grid: perRowGrid(),
+  uniforms: { eps: "f32" },
 
-  kernel(ctx) {
-    const tid = ctx.localIndex();
-    const row = ctx.programId(0);
-    const D = ctx.uniform("feature_dim");
+  kernel(ctx, _row, tid, D, base) {
     const Df = D.toF32();
-    const base = row.mul(D);
 
     // Recompute mean
     const mean = ctx.emitLet("mean",
@@ -160,33 +140,23 @@ const layerNormBackwardGradXSpec: TileKernelSpec = {
         gn.sub(c1).sub(normI.mul(c2)).mul(invStd));
     });
   },
-};
+});
 
 /**
  * LayerNorm row stats kernel (tile-IR).
  * Computes per-row mean and inv_std for use by gradWeight/gradBias pass.
  */
-const layerNormRowStatsSpec: TileKernelSpec = {
+const layerNormRowStatsSpec = perRowKernel({
   name: "lnRowStats",
-  workgroupSize: WG,
   bindings: {
     x:           { storage: "read", type: "f32" },
     row_mean:    { storage: "read_write", type: "f32" },
     row_inv_std: { storage: "read_write", type: "f32" },
   },
-  uniforms: {
-    num_rows:    "u32",
-    feature_dim: "u32",
-    eps:         "f32",
-  },
-  grid: perRowGrid(),
+  uniforms: { eps: "f32" },
 
-  kernel(ctx) {
-    const tid = ctx.localIndex();
-    const row = ctx.programId(0);
-    const D = ctx.uniform("feature_dim");
+  kernel(ctx, row, tid, D, base) {
     const Df = D.toF32();
-    const base = row.mul(D);
 
     // Mean
     const mean = ctx.emitLet("mean",
@@ -204,7 +174,7 @@ const layerNormRowStatsSpec: TileKernelSpec = {
     ctx.guardedStore("row_mean", isThread0, row, mean);
     ctx.guardedStore("row_inv_std", isThread0, row, invStd);
   },
-};
+});
 
 /**
  * LayerNorm backward gradWeight + gradBias kernel (tile-IR).

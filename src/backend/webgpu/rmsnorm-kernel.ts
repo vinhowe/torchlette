@@ -14,7 +14,7 @@ import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
-import { type TileKernelSpec, perRowGrid, ceilDivGrid } from "./tile-ir";
+import { type TileKernelSpec, perRowGrid, ceilDivGrid, perRowKernel } from "./tile-ir";
 import { createTileKernelDispatcher } from "./tile-dispatch";
 
 const WG = WORKGROUP_SIZE; // 256
@@ -23,27 +23,17 @@ const WG = WORKGROUP_SIZE; // 256
 // Tile IR Forward Kernel
 // ============================================================================
 
-const rmsNormFwdSpec: TileKernelSpec = {
+const rmsNormFwdSpec = perRowKernel({
   name: "rmsNormFwd",
-  workgroupSize: WG,
   bindings: {
     x:      { storage: "read",       type: "f32" },
     weight: { storage: "read",       type: "f32" },
     output: { storage: "read_write", type: "f32" },
   },
-  uniforms: {
-    num_rows:    "u32",
-    feature_dim: "u32",
-    eps:         "f32",
-  },
-  grid: perRowGrid(),
+  uniforms: { eps: "f32" },
 
-  kernel(ctx) {
-    const row  = ctx.programId(0);
-    const tid  = ctx.localIndex();
-    const D    = ctx.uniform("feature_dim");
-    const Df   = D.toF32();
-    const base = row.mul(D);
+  kernel(ctx, _row, tid, D, base) {
+    const Df = D.toF32();
 
     // Compute mean(x²) → inv_rms = rsqrt(mean(x²) + eps)
     const invRms = ctx.emitLet("inv_rms",
@@ -58,7 +48,7 @@ const rmsNormFwdSpec: TileKernelSpec = {
       ctx.emitStore("output", base.add(i), out);
     });
   },
-};
+});
 
 const fwdTileKernel = createTileKernelDispatcher(rmsNormFwdSpec);
 
@@ -75,28 +65,18 @@ const fwdTileKernel = createTileKernelDispatcher(rmsNormFwdSpec);
  * c = mean(grad * weight * normalized, dim=-1)
  * gradX = inv_rms * (grad * weight - normalized * c)
  */
-const rmsNormBackwardGradXSpec: TileKernelSpec = {
+const rmsNormBackwardGradXSpec = perRowKernel({
   name: "rmsNormBwdGradX",
-  workgroupSize: WG,
   bindings: {
     grad_output: { storage: "read", type: "f32" },
     x:           { storage: "read", type: "f32" },
     weight:      { storage: "read", type: "f32" },
     grad_x:      { storage: "read_write", type: "f32" },
   },
-  uniforms: {
-    num_rows:    "u32",
-    feature_dim: "u32",
-    eps:         "f32",
-  },
-  grid: perRowGrid(),
+  uniforms: { eps: "f32" },
 
-  kernel(ctx) {
-    const tid = ctx.localIndex();
-    const row = ctx.programId(0);
-    const D = ctx.uniform("feature_dim");
+  kernel(ctx, _row, tid, D, base) {
     const Df = D.toF32();
-    const base = row.mul(D);
 
     // Recompute inv_rms = rsqrt(mean(x²) + eps)
     const invRms = ctx.emitLet("inv_rms",
@@ -106,7 +86,6 @@ const rmsNormBackwardGradXSpec: TileKernelSpec = {
       }).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
 
     // c = mean(grad * weight * normalized, dim=-1)
-    // where normalized = x * inv_rms
     const c = ctx.emitLet("c",
       ctx.wgReduce("sum", tid, D, WG, (i) => {
         const gw = ctx.load("grad_output", base.add(i)).mul(ctx.load("weight", i));
@@ -121,32 +100,22 @@ const rmsNormBackwardGradXSpec: TileKernelSpec = {
       ctx.emitStore("grad_x", base.add(i), gw.sub(normI.mul(c)).mul(invRms));
     });
   },
-};
+});
 
 /**
  * RMSNorm row inv_rms kernel (tile-IR).
  * Computes per-row inv_rms = rsqrt(mean(x²) + eps) for use by gradWeight pass.
  */
-const rmsNormRowStatsSpec: TileKernelSpec = {
+const rmsNormRowStatsSpec = perRowKernel({
   name: "rmsNormRowStats",
-  workgroupSize: WG,
   bindings: {
     x:           { storage: "read", type: "f32" },
     row_inv_rms: { storage: "read_write", type: "f32" },
   },
-  uniforms: {
-    num_rows:    "u32",
-    feature_dim: "u32",
-    eps:         "f32",
-  },
-  grid: perRowGrid(),
+  uniforms: { eps: "f32" },
 
-  kernel(ctx) {
-    const tid = ctx.localIndex();
-    const row = ctx.programId(0);
-    const D = ctx.uniform("feature_dim");
+  kernel(ctx, row, tid, D, base) {
     const Df = D.toF32();
-    const base = row.mul(D);
 
     const invRms = ctx.emitLet("inv_rms",
       ctx.wgReduce("sum", tid, D, WG, (i) => {
@@ -157,7 +126,7 @@ const rmsNormRowStatsSpec: TileKernelSpec = {
     const isThread0 = tid.eq(ctx.u32(0));
     ctx.guardedStore("row_inv_rms", isThread0, row, invRms);
   },
-};
+});
 
 /**
  * RMSNorm backward gradWeight kernel (tile-IR).
