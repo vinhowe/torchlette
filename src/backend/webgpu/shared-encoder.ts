@@ -105,15 +105,6 @@ export function abortBatch(): void {
   setActiveBatch(null);
 }
 
-/**
- * Get the current batch encoder if active, otherwise null.
- * DEPRECATED: Use dispatchComputePass or submitOrCollect instead.
- */
-export function getActiveBatchEncoder(): GPUCommandEncoder | null {
-  // Return null to indicate batch mode uses collected buffers, not shared encoder
-  return null;
-}
-
 // ============================================================================
 // Shared Encoder — Command Buffer Consolidation
 // ============================================================================
