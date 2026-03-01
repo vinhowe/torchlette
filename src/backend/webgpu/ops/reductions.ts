@@ -759,9 +759,11 @@ export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
 // Sum With Epilogue
 // ============================================================================
 
-export function sumWithEpilogue(
+/** Shared implementation for sumWithEpilogue / maxWithEpilogue. */
+function reductionWithEpilogue(
+  reduceOp: "sum" | "max",
   a: BackendTensor,
-  options: SumOptions,
+  options: SumOptions | MaxOptions,
   epilogueOps: ReductionEpilogueOpDesc[],
   epilogueInputs: BackendTensor[],
   outputDtype: DType,
@@ -784,9 +786,8 @@ export function sumWithEpilogue(
     ? prepareDimReduction(inputShape, dim, keepdim) : null;
 
   if (!setup) {
-    // Full reduction with epilogue
     const outBuffer = resolveOutputBuffer(ctx.device, bpe, [tensor.buffer]);
-    const spec = makeReductionSpec({ reduceOp: "sum", epilogue: { ops: epilogueOps, outputDtype } });
+    const spec = makeReductionSpec({ reduceOp, epilogue: { ops: epilogueOps, outputDtype } });
     const dispatcher = createTileKernelDispatcher(spec);
     const buffers: Record<string, GPUBuffer> = { input: tensor.buffer, out: outBuffer };
     addEpilogueBindings(buffers, epilogueOps, epilogueInputs);
@@ -800,7 +801,7 @@ export function sumWithEpilogue(
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * bpe, [tensor.buffer]);
 
   const useParallel = reductionSize > 64;
-  const spec = makeReductionSpec({ reduceOp: "sum",
+  const spec = makeReductionSpec({ reduceOp,
     dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, useParallel),
     epilogue: { ops: epilogueOps, outputDtype },
   });
@@ -814,58 +815,18 @@ export function sumWithEpilogue(
   return createTensor(outShape, outBuffer, undefined, 0, outputDtype);
 }
 
-// ============================================================================
-// Max With Epilogue
-// ============================================================================
+export function sumWithEpilogue(
+  a: BackendTensor, options: SumOptions, epilogueOps: ReductionEpilogueOpDesc[],
+  epilogueInputs: BackendTensor[], outputDtype: DType,
+): BackendTensor {
+  return reductionWithEpilogue("sum", a, options, epilogueOps, epilogueInputs, outputDtype);
+}
 
 export function maxWithEpilogue(
-  a: BackendTensor,
-  options: MaxOptions,
-  epilogueOps: ReductionEpilogueOpDesc[],
-  epilogueInputs: BackendTensor[],
-  outputDtype: DType,
+  a: BackendTensor, options: MaxOptions, epilogueOps: ReductionEpilogueOpDesc[],
+  epilogueInputs: BackendTensor[], outputDtype: DType,
 ): BackendTensor {
-  const ctx = requireContext();
-  let tensor = asGPUTensor(a);
-
-  if (!tensor.isContiguous) {
-    tensor = asGPUTensor(contiguous(tensor));
-  }
-
-  const inputShape = tensor.shape;
-  const dim = options?.dim;
-  const keepdim = options?.keepdim ?? false;
-  const bpe = dtypeBytes(outputDtype);
-
-  const setup = (dim !== undefined && dim !== null)
-    ? prepareDimReduction(inputShape, dim, keepdim) : null;
-
-  if (!setup) {
-    const outBuffer = resolveOutputBuffer(ctx.device, bpe, [tensor.buffer]);
-    const spec = makeReductionSpec({ reduceOp: "max", epilogue: { ops: epilogueOps, outputDtype } });
-    const dispatcher = createTileKernelDispatcher(spec);
-    const buffers: Record<string, GPUBuffer> = { input: tensor.buffer, out: outBuffer };
-    addEpilogueBindings(buffers, epilogueOps, epilogueInputs);
-    dispatcher.dispatch(buffers, { size: tensor.size });
-    return createTensor([], outBuffer, undefined, 0, outputDtype);
-  }
-
-  const { normalizedDims, outShape, outSize, reductionSize,
-    inputStrides, outStrides, inputToOutDim } = setup;
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bpe, [tensor.buffer]);
-
-  const useParallel = reductionSize > 64;
-  const spec = makeReductionSpec({ reduceOp: "max",
-    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, useParallel),
-    epilogue: { ops: epilogueOps, outputDtype },
-  });
-  const dispatcher = createTileKernelDispatcher(spec);
-
-  const buffers: Record<string, GPUBuffer> = { input: tensor.buffer, out: outBuffer };
-  addEpilogueBindings(buffers, epilogueOps, epilogueInputs);
-  dispatcher.dispatch(buffers, { outSize, reductionSize });
-
-  return createTensor(outShape, outBuffer, undefined, 0, outputDtype);
+  return reductionWithEpilogue("max", a, options, epilogueOps, epilogueInputs, outputDtype);
 }
 
 // ============================================================================
