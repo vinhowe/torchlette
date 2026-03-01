@@ -8,7 +8,7 @@
  * Equivalent to Triton's @triton.autotune decorator but for our tile-IR.
  */
 
-import type { AutotuneConfig, TuneParam } from "./tile-ir";
+import type { AutotuneConfig } from "./tile-ir";
 import { createTileKernelDispatcher } from "./tile-dispatch";
 import { requireContext } from "./webgpu-state";
 import { beginSharedEncoder, flushSharedEncoder } from "./shared-encoder";

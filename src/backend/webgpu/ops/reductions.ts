@@ -686,10 +686,7 @@ function maxMinReduction(op: MaxMinOp, a: BackendTensor, options?: MaxOptions): 
 }
 
 function maxMinFullReduction(op: MaxMinOp, ctx: WebGPUContext, tensor: WebGPUTensor): WebGPUTensor {
-  const outBuffer = createTrackedBuffer(ctx.device, {
-    size: 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-  });
+  const outBuffer = resolveOutputBuffer(ctx.device, 4, [tensor.buffer]);
   getCachedDispatcher(`${op}Full`, () => makeReductionSpec({ reduceOp: op })).dispatch(
     { input: tensor.buffer, out: outBuffer },
     { size: tensor.size },

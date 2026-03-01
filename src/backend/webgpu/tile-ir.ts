@@ -38,7 +38,7 @@ export {
   type BlockCoopPtr, type BlockThreadPtr, type BlockPtr, type BlockLoadOpts,
   type BlockStorePtr,
 } from "./tile-ops";
-import { F32_NEG_MAX, F32_POS_MAX } from "./shape-utils";
+import { F32_NEG_MAX, F32_POS_MAX, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 
 // ============================================================================
 // IR Node Types
@@ -2354,8 +2354,6 @@ export interface TileKernelSpec {
 // Grid Helpers
 // ============================================================================
 
-const MAX_WG_PER_DIM = 65535;
-
 export type GridFn = (uniforms: Record<string, number>) => [number] | [number, number] | [number, number, number];
 
 /**
@@ -2370,8 +2368,8 @@ export function elementwiseGrid(
   const uName = opts?.elementUniform ?? "total_elements";
   return (u) => {
     const totalWg = Math.ceil(u[uName] / (workgroupSize * vw));
-    if (totalWg <= MAX_WG_PER_DIM) return [totalWg];
-    return [Math.min(totalWg, MAX_WG_PER_DIM), Math.ceil(totalWg / MAX_WG_PER_DIM)];
+    if (totalWg <= MAX_WORKGROUPS_PER_DIM) return [totalWg];
+    return [Math.min(totalWg, MAX_WORKGROUPS_PER_DIM), Math.ceil(totalWg / MAX_WORKGROUPS_PER_DIM)];
   };
 }
 
