@@ -38,20 +38,10 @@ export type ViewMeta = {
   isContiguous: boolean;
 };
 
-/**
- * Compute strides in elements for a contiguous tensor.
- * Returns row-major (C-style) strides: last dimension is contiguous.
- */
-export function computeContiguousStrides(shape: number[]): number[] {
-  if (shape.length === 0) return [];
-  const strides = new Array<number>(shape.length);
-  let stride = 1;
-  for (let i = shape.length - 1; i >= 0; i--) {
-    strides[i] = stride;
-    stride *= shape[i];
-  }
-  return strides;
-}
+import { contiguousStrides } from "../core/shape";
+
+/** @deprecated Use `contiguousStrides` from `core/shape` directly. */
+export const computeContiguousStrides = contiguousStrides;
 
 /**
  * Check if strides represent a contiguous layout for the given shape.
@@ -59,9 +49,8 @@ export function computeContiguousStrides(shape: number[]): number[] {
  */
 export function checkContiguous(shape: number[], strides: number[]): boolean {
   if (shape.length !== strides.length) return false;
-  const expected = computeContiguousStrides(shape);
+  const expected = contiguousStrides(shape);
   for (let i = 0; i < shape.length; i++) {
-    // Size-1 dims don't matter for contiguity
     if (shape[i] <= 1) continue;
     if (strides[i] !== expected[i]) return false;
   }

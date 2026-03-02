@@ -5,11 +5,10 @@
  * Zero mutable state. No GPU context dependency.
  */
 
+import { contiguousStrides } from "../../core/shape";
 import type { DType } from "../types";
-import { computeContiguousStrides } from "../types";
 
-export { broadcastShapes, sizeOf } from "../../core/shape";
-export { computeContiguousStrides as contiguousStrides } from "../types";
+export { broadcastShapes, contiguousStrides, sizeOf } from "../../core/shape";
 
 // ============================================================================
 // Constants
@@ -121,7 +120,7 @@ export function checkContiguousStrides(
   shape: number[],
   strides: number[],
 ): boolean {
-  const expected = computeContiguousStrides(shape);
+  const expected = contiguousStrides(shape);
   for (let i = 0; i < shape.length; i++) {
     // Size-1 dims don't affect contiguity
     if (shape[i] <= 1) continue;
