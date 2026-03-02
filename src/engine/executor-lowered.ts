@@ -427,6 +427,24 @@ export async function executeLoweredPlan(
   const replayEntries: ReplayEntry[] = [];
   let recordingDispatchIdx = 0;
 
+  /** Capture all new dispatches since last call and push to replay entries. */
+  const captureDispatches = () => {
+    while (recordingDispatchIdx < recordingBuffer.length) {
+      replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx++] });
+    }
+  };
+  /** Skip all new dispatches since last call (for ops that must re-execute). */
+  const skipDispatches = () => {
+    recordingDispatchIdx = recordingBuffer.length;
+  };
+  /** Record a node result for replay. */
+  const recordResult = (nodeIndex: number, bt: { buffer: GPUBuffer; shape: number[]; dtype: DType; size: number; strides: number[] }, isView = false) => {
+    replayEntries.push({ kind: "result", nodeResult: {
+      nodeIndex, buffer: bt.buffer, shape: bt.shape.slice(), dtype: bt.dtype,
+      size: bt.size, strides: bt.strides.slice(), isView,
+    }});
+  };
+
   if (shouldRecord) {
     startDispatchRecording(recordingBuffer);
     // Also set up matmul and fusion recording buffers (imports cached from prior calls)
@@ -507,37 +525,16 @@ export async function executeLoweredPlan(
           // Record dispatches and node results for replay cache
           if (shouldRecord) {
             // Capture dispatches emitted during this action
-            while (recordingDispatchIdx < recordingBuffer.length) {
-              replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
-              recordingDispatchIdx++;
-            }
+            captureDispatches();
             // Record output node result (inline for ordering)
             if (outputNode.result) {
-              const bt = asGPUTensor(outputNode.result.backendTensor);
-              replayEntries.push({ kind: "result", nodeResult: {
-                nodeIndex: action.outputNodeIndex,
-                buffer: bt.buffer,
-                shape: bt.shape.slice(),
-                dtype: bt.dtype,
-                size: bt.size,
-                strides: bt.strides.slice(),
-                isView: false,
-              }});
+              recordResult(action.outputNodeIndex, asGPUTensor(outputNode.result.backendTensor));
             }
             // Record additional output node results
             for (const addIdx of action.additionalOutputNodeIndices) {
               const addNode = planNodes[addIdx];
               if (addNode.result) {
-                const bt = asGPUTensor(addNode.result.backendTensor);
-                replayEntries.push({ kind: "result", nodeResult: {
-                  nodeIndex: addIdx,
-                  buffer: bt.buffer,
-                  shape: bt.shape.slice(),
-                  dtype: bt.dtype,
-                  size: bt.size,
-                  strides: bt.strides.slice(),
-                  isView: false,
-                }});
+                recordResult(addIdx, asGPUTensor(addNode.result.backendTensor));
               }
             }
           }
@@ -618,21 +615,9 @@ export async function executeLoweredPlan(
 
             // Record dispatches and node results (for replay cache)
             if (shouldRecord) {
-              while (recordingDispatchIdx < recordingBuffer.length) {
-                replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
-                recordingDispatchIdx++;
-              }
+              captureDispatches();
               if (outputNode.result) {
-                const bt = asGPUTensor(outputNode.result.backendTensor);
-                replayEntries.push({ kind: "result", nodeResult: {
-                  nodeIndex: action.outputNodeIndex,
-                  buffer: bt.buffer,
-                  shape: bt.shape.slice(),
-                  dtype: bt.dtype,
-                  size: bt.size,
-                  strides: bt.strides.slice(),
-                  isView: false,
-                }});
+                recordResult(action.outputNodeIndex, asGPUTensor(outputNode.result.backendTensor));
               }
             }
             break;
@@ -775,21 +760,9 @@ export async function executeLoweredPlan(
 
           // Record dispatches and node results
           if (shouldRecord) {
-            while (recordingDispatchIdx < recordingBuffer.length) {
-              replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
-              recordingDispatchIdx++;
-            }
+            captureDispatches();
             if (outputNode.result) {
-              const bt = asGPUTensor(outputNode.result.backendTensor);
-              replayEntries.push({ kind: "result", nodeResult: {
-                nodeIndex: action.outputNodeIndex,
-                buffer: bt.buffer,
-                shape: bt.shape.slice(),
-                dtype: bt.dtype,
-                size: bt.size,
-                strides: bt.strides.slice(),
-                isView: false,
-              }});
+              recordResult(action.outputNodeIndex, asGPUTensor(outputNode.result.backendTensor));
             }
           }
           break;
@@ -855,22 +828,10 @@ export async function executeLoweredPlan(
 
           // Record dispatches and node results
           if (shouldRecord) {
-            while (recordingDispatchIdx < recordingBuffer.length) {
-              replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
-              recordingDispatchIdx++;
-            }
+            captureDispatches();
             // Record reduction node result
             if (reductionNode.result) {
-              const bt = asGPUTensor(reductionNode.result.backendTensor);
-              replayEntries.push({ kind: "result", nodeResult: {
-                nodeIndex: action.reductionNodeIndex,
-                buffer: bt.buffer,
-                shape: bt.shape.slice(),
-                dtype: bt.dtype,
-                size: bt.size,
-                strides: bt.strides.slice(),
-                isView: false,
-              }});
+              recordResult(action.reductionNodeIndex, asGPUTensor(reductionNode.result.backendTensor));
             }
           }
           break;
@@ -913,21 +874,9 @@ export async function executeLoweredPlan(
 
           // Record dispatches and output node result for replay cache
           if (shouldRecord) {
-            while (recordingDispatchIdx < recordingBuffer.length) {
-              replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
-              recordingDispatchIdx++;
-            }
+            captureDispatches();
             if (reOutputNode.result) {
-              const bt = asGPUTensor(reOutputNode.result.backendTensor);
-              replayEntries.push({ kind: "result", nodeResult: {
-                nodeIndex: action.outputNodeIndex,
-                buffer: bt.buffer,
-                shape: bt.shape.slice(),
-                dtype: bt.dtype,
-                size: bt.size,
-                strides: bt.strides.slice(),
-                isView: false,
-              }});
+              recordResult(action.outputNodeIndex, asGPUTensor(reOutputNode.result.backendTensor));
             }
           }
           break;
@@ -998,21 +947,9 @@ export async function executeLoweredPlan(
 
           // Record dispatches and output node result for replay cache
           if (shouldRecord) {
-            while (recordingDispatchIdx < recordingBuffer.length) {
-              replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
-              recordingDispatchIdx++;
-            }
+            captureDispatches();
             if (rfOutputNode.result) {
-              const bt = asGPUTensor(rfOutputNode.result.backendTensor);
-              replayEntries.push({ kind: "result", nodeResult: {
-                nodeIndex: action.outputNodeIndex,
-                buffer: bt.buffer,
-                shape: bt.shape.slice(),
-                dtype: bt.dtype,
-                size: bt.size,
-                strides: bt.strides.slice(),
-                isView: false,
-              }});
+              recordResult(action.outputNodeIndex, asGPUTensor(rfOutputNode.result.backendTensor));
             }
           }
           break;
@@ -1047,9 +984,7 @@ export async function executeLoweredPlan(
           // Capture the sequence counter positions so adam dispatches hit the correct
           // cache positions during replay.
           if (shouldRecord) {
-            while (recordingDispatchIdx < recordingBuffer.length) {
-              recordingDispatchIdx++;
-            }
+            skipDispatches();
             replayEntries.push({
               kind: "adam-batch",
               nodeIndices: action.nodeIndices,
@@ -1084,9 +1019,7 @@ export async function executeLoweredPlan(
             if (action.kind === "data-source") {
               // Data sources must re-execute each step (host data changes).
               replayEntries.push({ kind: "data-source", nodeIndex: nodeIdx, arenaResolveIdx: arenaResolveIdxBefore, seqCounters: seqCountersBefore! });
-              while (recordingDispatchIdx < recordingBuffer.length) {
-                recordingDispatchIdx++;
-              }
+              skipDispatches();
             } else if (action.kind === "view") {
               // Views produce deterministic results (same arena buffer, same
               // shape/strides/offset). Cache the result to skip re-execution.
@@ -1106,39 +1039,23 @@ export async function executeLoweredPlan(
                   isContiguous: bt.isContiguous,
                 },
               });
-              while (recordingDispatchIdx < recordingBuffer.length) {
-                recordingDispatchIdx++;
-              }
+              skipDispatches();
             } else if (ENCODER_COPY_OPS.has(node.op)) {
               // Ops that use encoder copy commands (copyBufferToBuffer) alongside
               // compute dispatches must be re-executed during replay — the copy
               // commands are invisible to the compute dispatch recording mechanism.
               replayEntries.push({ kind: "sequential", nodeIndex: nodeIdx, arenaResolveIdx: arenaResolveIdxBefore, seqCounters: seqCountersBefore! });
-              while (recordingDispatchIdx < recordingBuffer.length) {
-                recordingDispatchIdx++;
-              }
+              skipDispatches();
             } else {
               // With arena active, all buffer identities are stable (arena returns
               // same GPUBuffer object on subsequent steps). Data-source-consuming
               // ops can be safely replayed — their bind groups reference arena
               // buffers that don't change identity.
               // Safe to replay: capture dispatches
-              while (recordingDispatchIdx < recordingBuffer.length) {
-                replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
-                recordingDispatchIdx++;
-              }
+              captureDispatches();
               // Record node result (inline for ordering)
               if (node.result) {
-                const bt = asGPUTensor(node.result.backendTensor);
-                replayEntries.push({ kind: "result", nodeResult: {
-                  nodeIndex: nodeIdx,
-                  buffer: bt.buffer,
-                  shape: bt.shape.slice(),
-                  dtype: bt.dtype,
-                  size: bt.size,
-                  strides: bt.strides.slice(),
-                  isView: node.result!.backendTensor.ownsBuffer === false,
-                }});
+                recordResult(nodeIdx, asGPUTensor(node.result.backendTensor), node.result.backendTensor.ownsBuffer === false);
               }
               // Record side output for fusedAttentionForward so replay
               // restores attnLogsumexp (needed by extractAttentionLogsumexp
@@ -1198,21 +1115,9 @@ export async function executeLoweredPlan(
 
           // Record dispatches for replay
           if (shouldRecord) {
-            while (recordingDispatchIdx < recordingBuffer.length) {
-              replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx] });
-              recordingDispatchIdx++;
-            }
+            captureDispatches();
             if (compOutNode.result) {
-              const bt = asGPUTensor(compOutNode.result.backendTensor);
-              replayEntries.push({ kind: "result", nodeResult: {
-                nodeIndex: action.outputNodeIndex,
-                buffer: bt.buffer,
-                shape: bt.shape.slice(),
-                dtype: bt.dtype,
-                size: bt.size,
-                strides: bt.strides.slice(),
-                isView: false,
-              }});
+              recordResult(action.outputNodeIndex, asGPUTensor(compOutNode.result.backendTensor));
             }
           }
           break;
