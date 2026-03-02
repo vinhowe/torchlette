@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildPlanLinearOrder, type EventKey, type PlanEvent } from "../src";
+import {
+  buildPlanLinearOrder,
+  type EventKey,
+  type PlanEvent,
+} from "../src/engine";
 
 function key(
   graphInstanceId: number,

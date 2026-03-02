@@ -18,7 +18,7 @@ import {
   runtimeSum,
   runtimeTensorFromArray,
   runtimeTranspose,
-} from "../../src";
+} from "../../src/engine";
 import { runTorchOracleBatch } from "./torch-oracle";
 
 type OutputPayload = { shape: number[]; values: number[] };

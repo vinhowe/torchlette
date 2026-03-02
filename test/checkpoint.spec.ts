@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CheckpointImpureRegionError, Engine } from "../src";
+import { CheckpointImpureRegionError, Engine } from "../src/engine";
 
 describe("checkpoint recompute fences", () => {
   it("forbids pending-loc initialization during recompute", () => {

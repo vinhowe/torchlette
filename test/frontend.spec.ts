@@ -1,12 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  DisposedTensorError,
-  FrontendTensor,
-  SavedTensorModifiedError,
-  Torchlette,
-  torch,
-} from "../src";
+import { DisposedTensorError, FrontendTensor, Torchlette, torch } from "../src";
+import { SavedTensorModifiedError } from "../src/engine";
 
 describe("frontend api: Tensor wrapper", () => {
   it("creates tensors and runs elementwise ops", async () => {

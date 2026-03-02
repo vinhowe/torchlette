@@ -28,7 +28,7 @@ import {
   tensorFromArray,
   transpose,
   withBackend,
-} from "../src";
+} from "../src/engine";
 
 describe("numeric ring-2: add", () => {
   it("adds two tensors elementwise", () => {

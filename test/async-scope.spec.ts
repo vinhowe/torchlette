@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { Engine, type EngineTensor } from "../src";
+import { Engine, type EngineTensor } from "../src/engine";
 import { Torchlette } from "../src/frontend";
 
 describe("Engine: async scope context", () => {

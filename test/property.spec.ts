@@ -1,6 +1,6 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { add, Engine, mul, sum, tensorFromArray } from "../src";
+import { add, Engine, mul, sum, tensorFromArray } from "../src/engine";
 
 type RawOp =
   | { kind: "scheduleLoc"; locId: number }

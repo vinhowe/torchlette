@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { Engine } from "../src";
+import { Engine } from "../src/engine";
 
 describe("host reads", () => {
   it("records a host_read effect", () => {

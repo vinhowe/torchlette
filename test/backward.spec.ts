@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Engine, NonReentrantBackwardError } from "../src";
+import { Engine, NonReentrantBackwardError } from "../src/engine";
 
 describe("backward rooting", () => {
   it("advances tokGlobal when backward is scheduled", () => {

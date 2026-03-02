@@ -82,7 +82,7 @@ export interface CompoundMatchExec {
 export const DEFAULT_RECLAIM_INTERVAL =
   typeof process !== "undefined" && process.env?.TORCHLETTE_RECLAIM_INTERVAL
     ? parseInt(process.env.TORCHLETTE_RECLAIM_INTERVAL, 10)
-    : 100;
+    : 10000;
 
 /**
  * Execute a fused segment using a fused kernel.
