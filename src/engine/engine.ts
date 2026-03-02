@@ -799,48 +799,30 @@ export class Engine {
     });
   }
 
-  _debug_runEntryPoint<T>(fn: () => T): T {
-    if (this.execLock.held) {
-      throw new EngineBusyError("Engine is busy");
-    }
-    const ownerId = this.nextOwnerId++;
+  private acquireExecLock(): void {
+    if (this.execLock.held) throw new EngineBusyError("Engine is busy");
     this.execLock.held = true;
-    this.execLock.ownerId = ownerId;
+    this.execLock.ownerId = this.nextOwnerId++;
     this.execLock.depth = 1;
-
     this._debug_drainFinalizeQueueCleanupOnly();
+    this.ensureNotPoisoned();
+  }
 
-    try {
-      this.ensureNotPoisoned();
-      return fn();
-    } finally {
-      this._debug_drainFinalizeQueueCleanupOnly();
-      this.execLock.held = false;
-      this.execLock.ownerId = 0;
-      this.execLock.depth = 0;
-    }
+  private releaseExecLock(): void {
+    this._debug_drainFinalizeQueueCleanupOnly();
+    this.execLock.held = false;
+    this.execLock.ownerId = 0;
+    this.execLock.depth = 0;
+  }
+
+  _debug_runEntryPoint<T>(fn: () => T): T {
+    this.acquireExecLock();
+    try { return fn(); } finally { this.releaseExecLock(); }
   }
 
   async runEntryPoint<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.execLock.held) {
-      throw new EngineBusyError("Engine is busy");
-    }
-    const ownerId = this.nextOwnerId++;
-    this.execLock.held = true;
-    this.execLock.ownerId = ownerId;
-    this.execLock.depth = 1;
-
-    this._debug_drainFinalizeQueueCleanupOnly();
-
-    try {
-      this.ensureNotPoisoned();
-      return await fn();
-    } finally {
-      this._debug_drainFinalizeQueueCleanupOnly();
-      this.execLock.held = false;
-      this.execLock.ownerId = 0;
-      this.execLock.depth = 0;
-    }
+    this.acquireExecLock();
+    try { return await fn(); } finally { this.releaseExecLock(); }
   }
 
   /**
@@ -887,57 +869,20 @@ export class Engine {
   }
 
   _debugSnapshot(): DebugSnapshot {
-    const tokLocEntries = Array.from(this.tokLoc.entries()).sort(
-      ([a], [b]) => a - b,
-    );
-    const tokLoc: Record<string, TokenSnapshot> = {};
-    for (const [locId, token] of tokLocEntries) {
-      tokLoc[locId.toString()] = this.snapshotToken(token);
-    }
-
-    const locEntries = Array.from(this.locState.entries()).sort(
-      ([a], [b]) => a - b,
-    );
-    const locs: Record<string, LocDebugState> = {};
-    for (const [locId, state] of locEntries) {
-      locs[locId.toString()] = {
-        locLogicalVersion: state.locLogicalVersion,
-        locVersion: state.locVersion,
-        role: state.role,
-        hasValue: state.hasValue,
-      };
-    }
-
-    const baseEntries = Array.from(this.baseState.entries()).sort(
-      ([a], [b]) => a - b,
-    );
-    const bases: Record<string, BaseDebugState> = {};
-    for (const [baseId, state] of baseEntries) {
-      bases[baseId.toString()] = {
-        baseCommitVersion: state.baseCommitVersion,
-        committedMutations: Array.from(state.committed).sort((a, b) => a - b),
-      };
-    }
-
-    const bindingEntries = Array.from(this.baseBindings.entries()).sort(
-      ([a], [b]) => a - b,
-    );
-    const bindings: Record<string, BaseBindingSnapshot> = {};
-    for (const [baseId, binding] of bindingEntries) {
-      bindings[baseId.toString()] = {
-        kind: binding.kind,
-        locId: binding.locId,
-        initTokId: binding.initTok?.id,
-        initTokKind: binding.initTok?.kind,
-      };
-    }
+    const collect = <K, V, R>(map: Map<K, V>, transform: (v: V) => R): Record<string, R> => {
+      const result: Record<string, R> = {};
+      for (const [k, v] of Array.from(map.entries()).sort(([a], [b]) => (a as number) - (b as number))) {
+        result[String(k)] = transform(v);
+      }
+      return result;
+    };
 
     return {
       tokGlobal: this.snapshotToken(this.tokGlobal),
-      tokLoc,
-      locs,
-      bases,
-      bindings,
+      tokLoc: collect(this.tokLoc, t => this.snapshotToken(t)),
+      locs: collect(this.locState, s => ({ locLogicalVersion: s.locLogicalVersion, locVersion: s.locVersion, role: s.role, hasValue: s.hasValue })),
+      bases: collect(this.baseState, s => ({ baseCommitVersion: s.baseCommitVersion, committedMutations: Array.from(s.committed).sort((a, b) => a - b) })),
+      bindings: collect(this.baseBindings, b => ({ kind: b.kind, locId: b.locId, initTokId: b.initTok?.id, initTokKind: b.initTok?.kind })),
     };
   }
 
@@ -959,127 +904,41 @@ export class Engine {
     let opNonce = 0;
     const events: PlanEvent[] = [];
 
+    const emit = (kind: string, overrides?: { opNonce?: number; drawNonce?: number; mutId?: number }, payload?: Record<string, unknown>) => {
+      events.push({
+        name: kind,
+        key: { graphInstanceId: 0, callInstanceId: 0, planInstanceId: 0, opNonce: overrides?.opNonce ?? opNonce, drawNonce: overrides?.drawNonce ?? 0, mutId: overrides?.mutId ?? 0, kind },
+        ...(payload ? { payload } : {}),
+      });
+    };
+
     for (const event of traceEvents) {
       if (event.type === "rng_basis") {
         opNonce += 1;
-        events.push({
-          name: "rng_basis",
-          key: {
-            graphInstanceId: 0,
-            callInstanceId: 0,
-            planInstanceId: 0,
-            opNonce,
-            drawNonce: 0,
-            mutId: 0,
-            kind: "rng_basis",
-          },
-          payload: { algorithmId: event.algorithmId, seed: event.seed },
-        });
-      }
-
-      if (
+        emit("rng_basis", undefined, { algorithmId: event.algorithmId, seed: event.seed });
+      } else if (
         event.type === "rng_checkpoint_record_start" ||
         event.type === "rng_checkpoint_record_finish" ||
         event.type === "rng_checkpoint_replay_start" ||
         event.type === "rng_checkpoint_replay_finish"
       ) {
         opNonce += 1;
-        events.push({
-          name: event.type,
-          key: {
-            graphInstanceId: 0,
-            callInstanceId: 0,
-            planInstanceId: 0,
-            opNonce,
-            drawNonce: 0,
-            mutId: 0,
-            kind: event.type,
-          },
-        });
-      }
-
-      if (event.type === "publish_save") {
+        emit(event.type);
+      } else if (event.type === "publish_save") {
         opNonce += 1;
-        events.push({
-          name: "publish_save",
-          key: {
-            graphInstanceId: 0,
-            callInstanceId: 0,
-            planInstanceId: 0,
-            opNonce,
-            drawNonce: 0,
-            mutId: 0,
-            kind: "publish_save",
-          },
-        });
-      }
-
-      if (event.type === "rng_draw") {
+        emit("publish_save");
+      } else if (event.type === "rng_draw") {
         opNonce = Math.max(opNonce, event.opNonce);
-        events.push({
-          name: "rng_draw",
-          key: {
-            graphInstanceId: 0,
-            callInstanceId: 0,
-            planInstanceId: 0,
-            opNonce: event.opNonce,
-            drawNonce: event.drawNonce,
-            mutId: 0,
-            kind: "rng_draw",
-          },
-          payload: { drawNonce: event.drawNonce, opNonce: event.opNonce },
-        });
-      }
-
-      if (event.type === "loc_schedule") {
+        emit("rng_draw", { opNonce: event.opNonce, drawNonce: event.drawNonce }, { drawNonce: event.drawNonce, opNonce: event.opNonce });
+      } else if (event.type === "loc_schedule") {
         opNonce += 1;
-        events.push({
-          name: "loc_schedule",
-          key: {
-            graphInstanceId: 0,
-            callInstanceId: 0,
-            planInstanceId: 0,
-            opNonce,
-            drawNonce: 0,
-            mutId: 0,
-            kind: "loc_schedule",
-          },
-          payload: { locId: event.locId },
-        });
-      }
-
-      if (event.type === "loc_commit") {
+        emit("loc_schedule", undefined, { locId: event.locId });
+      } else if (event.type === "loc_commit") {
         opNonce += 1;
-        events.push({
-          name: "loc_commit",
-          key: {
-            graphInstanceId: 0,
-            callInstanceId: 0,
-            planInstanceId: 0,
-            opNonce,
-            drawNonce: 0,
-            mutId: 0,
-            kind: "loc_commit",
-          },
-          payload: { locId: event.locId },
-        });
-      }
-
-      if (event.type === "base_commit") {
+        emit("loc_commit", undefined, { locId: event.locId });
+      } else if (event.type === "base_commit") {
         opNonce += 1;
-        events.push({
-          name: "base_commit",
-          key: {
-            graphInstanceId: 0,
-            callInstanceId: 0,
-            planInstanceId: 0,
-            opNonce,
-            drawNonce: 0,
-            mutId: event.mutId,
-            kind: "base_commit",
-          },
-          payload: { baseId: event.baseId, mutId: event.mutId },
-        });
+        emit("base_commit", { mutId: event.mutId }, { baseId: event.baseId, mutId: event.mutId });
       }
     }
 
@@ -1436,49 +1295,19 @@ export class Engine {
    * Get comprehensive memory statistics.
    */
   _debug_getMemoryStats(): EngineMemoryStats {
-    // Get GPU stats from provider if available
-    const gpuStats = this.memoryStatsProvider?.getGPUStats?.() ?? {
-      currentBytes: 0,
-      peakBytes: 0,
-      limitBytes: 0,
-    };
-
-    // Get buffer pool stats from provider if available
-    const poolStats = this.memoryStatsProvider?.getBufferPoolStats?.() ?? {
-      pooledBuffers: 0,
-      inUseBuffers: 0,
-      pendingFenceBuffers: 0,
-    };
-
-    // Get plan stats from provider if available
-    const planStats = this.memoryStatsProvider?.getPlanStats?.() ?? {
-      activePlans: 0,
-      completedPlans: 0,
-    };
-
-    // Get pending tensor count from provider if available
-    const pendingTensorCount =
-      this.memoryStatsProvider?.getPendingTensorCount?.() ?? 0;
-
-    // Compute total pin count
+    const p = this.memoryStatsProvider;
+    const gpu = p?.getGPUStats?.() ?? { currentBytes: 0, peakBytes: 0, limitBytes: 0 };
+    const pool = p?.getBufferPoolStats?.() ?? { pooledBuffers: 0, inUseBuffers: 0, pendingFenceBuffers: 0 };
+    const plan = p?.getPlanStats?.() ?? { activePlans: 0, completedPlans: 0 };
     let totalPinCount = 0;
-    for (const count of this.basePinCount.values()) {
-      totalPinCount += count;
-    }
+    for (const count of this.basePinCount.values()) totalPinCount += count;
 
     return {
-      gpuCurrentBytes: gpuStats.currentBytes,
-      gpuPeakBytes: gpuStats.peakBytes,
-      gpuLimitBytes: gpuStats.limitBytes,
-      pooledBuffers: poolStats.pooledBuffers,
-      inUseBuffers: poolStats.inUseBuffers,
-      pendingFenceBuffers: poolStats.pendingFenceBuffers,
-      activeBases: this.basePinCount.size,
-      totalPinCount,
-      savedTensorCount: this.savedTensors.size,
-      pendingTensorCount,
-      activePlans: planStats.activePlans,
-      completedPlans: planStats.completedPlans,
+      gpuCurrentBytes: gpu.currentBytes, gpuPeakBytes: gpu.peakBytes, gpuLimitBytes: gpu.limitBytes,
+      pooledBuffers: pool.pooledBuffers, inUseBuffers: pool.inUseBuffers, pendingFenceBuffers: pool.pendingFenceBuffers,
+      activeBases: this.basePinCount.size, totalPinCount,
+      savedTensorCount: this.savedTensors.size, pendingTensorCount: p?.getPendingTensorCount?.() ?? 0,
+      activePlans: plan.activePlans, completedPlans: plan.completedPlans,
     };
   }
 
