@@ -170,8 +170,4 @@ export interface ExecutePlanOptions {
   enableEarlyRelease?: boolean;
   /** Enable segmented execution at checkpoint boundaries */
   enableCheckpointSegmentation?: boolean;
-  /** Skip nodes that already have a .result (from tape replay). */
-  skipPreExecuted?: boolean;
-  /** Only execute view/data-source ops; skip all compute ops. Used by tape replay fill-in. */
-  viewOpsOnly?: boolean;
 }

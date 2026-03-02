@@ -34,8 +34,7 @@ import {
   executeLoweredPlan,
   executePlan,
   executePlanOptimized,
-  executePlanWithCheckpointSegments,
-  executePlanWithTrueSegments,
+  executePlanSegmented,
   getFusionAnalysisTemplate,
   type LazyIRNode,
   type LazyOpCode,
@@ -677,18 +676,16 @@ export class RuntimeEngine {
       device === "webgpu"
     ) {
       // True segmentation with GPU sync between segments
-      await executePlanWithTrueSegments(plan, backend, {
+      await executePlanSegmented(plan, backend, {
         enableEarlyRelease: this.earlyReleaseEnabled,
+        gpuSync: true,
       });
     } else if (this.checkpointSegmentationEnabled && hasCheckpointBoundaries) {
-      // Use checkpoint segmentation (buffer pool flush only, no GPU sync)
-      const flushBufferPool = this.getBufferPoolFlushFn(device);
-      await executePlanWithCheckpointSegments(
-        plan,
-        backend,
-        { enableEarlyRelease: this.earlyReleaseEnabled },
-        flushBufferPool,
-      );
+      // Checkpoint segmentation (buffer pool flush only, no GPU sync)
+      await executePlanSegmented(plan, backend, {
+        enableEarlyRelease: this.earlyReleaseEnabled,
+        flushBufferPoolFn: this.getBufferPoolFlushFn(device),
+      });
     } else {
       // Standard execution - no segmentation overhead
       await executePlan(plan, backend, {

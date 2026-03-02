@@ -804,24 +804,24 @@ export async function executePlanOptimized(
         // Execute sequentially (too-small fusion groups or sequential segments)
         const seqNodes =
           segment.kind === "fused" ? segment.group.nodes : segment.nodes;
-        await executeSequentialSegmentWithEarlyRelease(
-          seqNodes,
-          backend,
+        await executeSequentialSegmentWithEarlyRelease(seqNodes, backend, {
           enableEarlyRelease,
           lifetimes,
           outputNodeIds,
           alreadyReleased,
           nodeToStorage,
-          overallStep,
+          startStep: overallStep,
           externalNodeIds,
-          planNodes,
-          matmulPrologues.size > 0 ? matmulPrologues : undefined,
-          prologueClaimedIds.size > 0 ? prologueClaimedIds : undefined,
-          planConsumerCount,
+          allPlanNodes: planNodes,
+          matmulPrologueMap:
+            matmulPrologues.size > 0 ? matmulPrologues : undefined,
+          prologueSkipIds:
+            prologueClaimedIds.size > 0 ? prologueClaimedIds : undefined,
+          prebuiltConsumerCount: planConsumerCount,
           loweredPlanBuilder,
           nodeIdToFinalPos,
           compoundMatchMap,
-        );
+        });
         stats.sequentialNodes += seqNodes.length;
         overallStep += seqNodes.length;
         nodesSinceReclaim += seqNodes.length;

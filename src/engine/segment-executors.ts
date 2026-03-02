@@ -307,95 +307,20 @@ export async function executeFusedWebGPU(
 
 /**
  * Execute nodes sequentially (standard execution).
+ * Used as a fallback by fusion dispatch when fused execution can't proceed
+ * (e.g., binding limits, non-contiguous inputs, oversized buffers).
+ * Fusion groups contain only elementwise ops, so no pattern matching needed.
  */
 export async function executeSequentialSegment(
   nodes: LazyIRNode[],
   backend: Backend,
-  externalNodeIds?: Set<number>,
-  allPlanNodes?: LazyIRNode[],
 ): Promise<void> {
   const useSharedEncoder = backend.name === "webgpu";
   if (useSharedEncoder) beginSharedEncoder();
 
   try {
-    const reductionConsumerCount =
-      backend.name === "webgpu"
-        ? buildConsumerCount(allPlanNodes ?? nodes)
-        : new Map<number, number>();
-
-    for (let nodeIdx = 0; nodeIdx < nodes.length; nodeIdx++) {
-      const node = nodes[nodeIdx];
-      if (node.result) {
-        continue;
-      }
-
-      // Try matmul epilogue fusion (Phase 1)
-      if (node.op === "matmul" && backend.name === "webgpu") {
-        const epiloguePlan = detectMatmulEpilogue(
-          nodes,
-          nodeIdx,
-          allPlanNodes ?? nodes,
-          externalNodeIds,
-        );
-        if (epiloguePlan) {
-          const epLabel =
-            "matmul+" + epiloguePlan.epilogueOps.map((o) => o.kind).join("+");
-          await withProfileContext(epLabel, node.module, () =>
-            executeMatmulWithEpilogue(node, epiloguePlan, backend),
-          );
-          nodeIdx += epiloguePlan.consumedCount - 1;
-          continue;
-        }
-      }
-
-      // Try reduction preamble fusion (Phase 3)
-      if (isFusibleOp(node.op) && backend.name === "webgpu") {
-        const reductionPlan = detectReductionPreamble(
-          nodes,
-          nodeIdx,
-          reductionConsumerCount,
-        );
-        if (reductionPlan) {
-          const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${reductionPlan.op}`;
-          await withProfileContext(rpLabel, node.module, () =>
-            executeReductionWithPreamble(reductionPlan, backend),
-          );
-          nodeIdx += 1; // Skip the reduction node (consumed 2 nodes total)
-          continue;
-        }
-      }
-
-      // Try reduction epilogue fusion (Phase 4)
-      if (
-        (node.op === "sum" || node.op === "mean" || node.op === "max") &&
-        backend.name === "webgpu"
-      ) {
-        const epiloguePlan = detectReductionEpilogue(
-          nodes,
-          nodeIdx,
-          reductionConsumerCount,
-          externalNodeIds,
-        );
-        if (epiloguePlan) {
-          const reLabel =
-            node.op +
-            "+" +
-            epiloguePlan.epilogueOps
-              .map((o) =>
-                o.kind === "binary"
-                  ? o.op
-                  : o.kind === "cast"
-                    ? "cast"
-                    : o.op || o.kind,
-              )
-              .join("+");
-          await withProfileContext(reLabel, node.module, () =>
-            executeReductionWithEpilogue(epiloguePlan, backend),
-          );
-          nodeIdx += epiloguePlan.consumedCount - 1;
-          continue;
-        }
-      }
+    for (const node of nodes) {
+      if (node.result) continue;
 
       const nodeBackend = getBackend(node.device) ?? backend;
       setProfileModule(node.module ?? "unknown");
@@ -418,26 +343,49 @@ export async function executeSequentialSegment(
 }
 
 /**
+ * Options for sequential segment execution with early release and lowered plan recording.
+ */
+export interface SegmentExecOptions {
+  enableEarlyRelease: boolean;
+  lifetimes: Map<number, TensorLifetime> | null;
+  outputNodeIds: Set<number> | null;
+  alreadyReleased: Set<number>;
+  nodeToStorage: Map<number, StorageHandle>;
+  startStep: number;
+  externalNodeIds?: Set<number>;
+  allPlanNodes?: LazyIRNode[];
+  matmulPrologueMap?: Map<number, MatmulPrologueInfo[]>;
+  prologueSkipIds?: Set<number>;
+  prebuiltConsumerCount?: Map<number, number>;
+  loweredPlanBuilder?: LoweredPlanBuilder | null;
+  nodeIdToFinalPos?: Map<number, number>;
+  compoundMatchMap?: Map<number, CompoundMatchExec>;
+}
+
+/**
  * Execute nodes sequentially with early buffer release support.
  */
 export async function executeSequentialSegmentWithEarlyRelease(
   nodes: LazyIRNode[],
   backend: Backend,
-  enableEarlyRelease: boolean,
-  lifetimes: Map<number, TensorLifetime> | null,
-  outputNodeIds: Set<number> | null,
-  alreadyReleased: Set<number>,
-  nodeToStorage: Map<number, StorageHandle>,
-  startStep: number,
-  externalNodeIds?: Set<number>,
-  allPlanNodes?: LazyIRNode[],
-  matmulPrologueMap?: Map<number, MatmulPrologueInfo[]>,
-  prologueSkipIds?: Set<number>,
-  prebuiltConsumerCount?: Map<number, number>,
-  loweredPlanBuilder?: LoweredPlanBuilder | null,
-  nodeIdToFinalPos?: Map<number, number>,
-  compoundMatchMap?: Map<number, CompoundMatchExec>,
+  options: SegmentExecOptions,
 ): Promise<void> {
+  const {
+    enableEarlyRelease,
+    lifetimes,
+    outputNodeIds,
+    alreadyReleased,
+    nodeToStorage,
+    startStep,
+    externalNodeIds,
+    allPlanNodes,
+    matmulPrologueMap,
+    prologueSkipIds,
+    prebuiltConsumerCount,
+    loweredPlanBuilder,
+    nodeIdToFinalPos,
+    compoundMatchMap,
+  } = options;
   const useSharedEncoder = backend.name === "webgpu";
   if (useSharedEncoder) beginSharedEncoder();
 
