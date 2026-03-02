@@ -496,16 +496,6 @@ class SimpleBufferPool {
   }
 
   /**
-   * Move all pending buffers to the available pool and destroy deferred buffers.
-   * Only used when fence support is unavailable (synchronous fallback).
-   */
-  private flushPending(): void {
-    this.flushPendingToPool();
-    // Note: pendingDestroy is NOT processed here. Use destroyPendingBuffers()
-    // after GPU sync to safely destroy those buffers.
-  }
-
-  /**
    * Move pending-release buffers into the available pool.
    * Always safe to call — these buffers are reusable after WebGPU submission ordering.
    *
@@ -741,7 +731,7 @@ class SimpleBufferPool {
    * for recomputation before the async onSubmittedWorkDone() callback runs.
    */
   flushPendingToAvailable(): void {
-    this.flushPending();
+    this.flushPendingToPool();
   }
 
   /**
@@ -749,26 +739,7 @@ class SimpleBufferPool {
    * after awaiting GPU sync. Safe to call from any context.
    */
   async flushAndDestroyPending(): Promise<void> {
-    if (!this.queue) {
-      // No queue — just flush pool, skip destroy (can't sync)
-      this.flushPendingToPool();
-      return;
-    }
-    await this.queue.onSubmittedWorkDone();
-    this.flushPendingToPool();
-    this.destroyPendingBuffers();
-  }
-
-  /**
-   * Wait for GPU work to complete and then flush pending buffers.
-   * This is a synchronous wait - use sparingly when memory pressure is critical.
-   * After this, evictBuffers() can be called to free more memory.
-   */
-  async waitAndFlushPending(): Promise<void> {
-    if (!this.queue) return;
-    // Wait for all GPU work to complete
-    await this.queue.onSubmittedWorkDone();
-    // Now safe to flush pending buffers and destroy deferred buffers
+    if (this.queue) await this.queue.onSubmittedWorkDone();
     this.flushPendingToPool();
     this.destroyPendingBuffers();
   }
@@ -1011,12 +982,7 @@ export function setBufferPoolDebugTrace(enabled: boolean): void {
  * Used by engine layer for buffers not managed by WebGPUTensor.destroy().
  */
 export function deferredDestroyBuffer(buffer: GPUBuffer, size: number): void {
-  // Arena buffers are owned by the arena — don't destroy them.
-  // The arena will reuse the buffer on the next step.
-  if (arenaBufferSet.has(buffer)) return;
-  // Replay-pinned buffers are referenced by recorded bind groups — don't destroy.
-  if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) return;
-  bufferPool.deferredDestroy(buffer, size);
+  bufferPool.deferredDestroy(buffer, size); // arena/replay guards are inside deferredDestroy
 }
 
 /**
