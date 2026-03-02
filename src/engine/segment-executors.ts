@@ -396,6 +396,21 @@ export async function executeSequentialSegmentWithEarlyRelease(
     let nodesSinceIntraReclaim = 0;
 
     let step = startStep;
+
+    /** Track storages for consumed nodes and release dead buffers. */
+    const advanceConsumed = (nodeIdx: number, count: number) => {
+      if (enableEarlyRelease) {
+        for (let c = 0; c < count; c++) {
+          const n = nodes[nodeIdx + c];
+          if (n.result) nodeToStorage.set(n.id, n.result);
+          step++;
+          releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
+        }
+      } else {
+        step += count;
+      }
+    };
+
     for (let nodeIdx = 0; nodeIdx < nodes.length; nodeIdx++) {
       const node = nodes[nodeIdx];
       if (node.result) {
@@ -464,20 +479,8 @@ export async function executeSequentialSegmentWithEarlyRelease(
             strides: outStrides, offset: 0, isContiguous: true, ownsBuffer: true },
         );
 
-        // Track storages and advance step for all covered nodes
         const coveredCount = match.coveredNodeIds.size;
-        if (enableEarlyRelease) {
-          for (let c = 0; c < coveredCount; c++) {
-            const coveredNode = nodes[nodeIdx + c];
-            if (coveredNode.result) {
-              nodeToStorage.set(coveredNode.id, coveredNode.result);
-            }
-            step++;
-            releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
-          }
-        } else {
-          step += coveredCount;
-        }
+        advanceConsumed(nodeIdx, coveredCount);
 
         // Record compound action in lowered plan builder
         if (loweredPlanBuilder && nodeIdToFinalPos) {
@@ -530,19 +533,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
           await withProfileContext(epLabel, node.module, () =>
             executeMatmulWithEpilogue(node, epiloguePlan, backend));
 
-          // Track storages for all consumed nodes and release dead buffers
-          if (enableEarlyRelease) {
-            for (let skip = 0; skip < epiloguePlan.consumedCount; skip++) {
-              const consumedNode = nodes[nodeIdx + skip];
-              if (consumedNode.result) {
-                nodeToStorage.set(consumedNode.id, consumedNode.result);
-              }
-              step++;
-              releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
-            }
-          } else {
-            step += epiloguePlan.consumedCount;
-          }
+          advanceConsumed(nodeIdx, epiloguePlan.consumedCount);
 
           // Record matmul epilogue action in lowered plan builder
           if (loweredPlanBuilder && nodeIdToFinalPos) {
@@ -583,18 +574,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
             executeReductionWithFusion(fusionPlan, backend));
 
           const consumed = fusionPlan.consumedCount;
-          if (enableEarlyRelease) {
-            for (let c = 0; c < consumed; c++) {
-              const consumedNode = nodes[nodeIdx + c];
-              if (consumedNode.result) {
-                nodeToStorage.set(consumedNode.id, consumedNode.result);
-              }
-              step++;
-              releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
-            }
-          } else {
-            step += consumed;
-          }
+          advanceConsumed(nodeIdx, consumed);
 
           if (loweredPlanBuilder && nodeIdToFinalPos) {
             const preambleIndices = fusionPlan.preambleChain.map(n => nodeIdToFinalPos.get(n.id)!);
@@ -629,18 +609,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
             executeReductionWithPreamble(reductionPlan, backend));
 
           const consumed = reductionPlan.consumedCount;
-          if (enableEarlyRelease) {
-            for (let c = 0; c < consumed; c++) {
-              const consumedNode = nodes[nodeIdx + c];
-              if (consumedNode.result) {
-                nodeToStorage.set(consumedNode.id, consumedNode.result);
-              }
-              step++;
-              releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
-            }
-          } else {
-            step += consumed;
-          }
+          advanceConsumed(nodeIdx, consumed);
 
           if (loweredPlanBuilder && nodeIdToFinalPos) {
             if (reductionPlan.preambleChain && reductionPlan.chainOps && reductionPlan.chainInputDtypes) {
@@ -673,19 +642,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
           await withProfileContext(reLabel, node.module, () =>
             executeReductionWithEpilogue(epiloguePlan, backend));
 
-          // Track storages for consumed nodes
-          if (enableEarlyRelease) {
-            for (let c = 0; c < epiloguePlan.consumedCount; c++) {
-              const consumedNode = nodes[nodeIdx + c];
-              if (consumedNode.result) {
-                nodeToStorage.set(consumedNode.id, consumedNode.result);
-              }
-              step++;
-              releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
-            }
-          } else {
-            step += epiloguePlan.consumedCount;
-          }
+          advanceConsumed(nodeIdx, epiloguePlan.consumedCount);
 
           // Record reduction epilogue action in lowered plan builder
           if (loweredPlanBuilder && nodeIdToFinalPos) {
@@ -743,13 +700,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
                 executeOp(adamNode, adamBackendInputs, adamBackend));
               adamNode.result = wrapResultAsStorage(adamNode.device, adamResult, adamBackendInputs, adamInputs);
 
-              if (enableEarlyRelease) {
-                nodeToStorage.set(adamNode.id, adamNode.result);
-                step++;
-                releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
-              } else {
-                step++;
-              }
+              advanceConsumed(nodeIdx + a, 1);
             }
           } finally {
             setAdamBatchMode(false);
@@ -789,15 +740,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
         }
       }
 
-      // Track storage and release dead buffers
-      if (enableEarlyRelease) {
-        nodeToStorage.set(node.id, node.result);
-        step++;
-
-        releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
-      } else {
-        step++;
-      }
+      advanceConsumed(nodeIdx, 1);
 
       // Periodic intra-segment reclamation
       nodesSinceIntraReclaim++;
