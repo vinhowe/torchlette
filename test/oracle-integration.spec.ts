@@ -167,7 +167,8 @@ describe("AMP Oracle Validation", () => {
     expect(result.grads?.length).toBe(3); // x, w, b
 
     // All gradients should be finite
-    for (const grad of result.grads!) {
+    expect(result.grads).toBeDefined();
+    for (const grad of result.grads ?? []) {
       if (grad) {
         for (const val of grad.values) {
           expect(Number.isFinite(val)).toBe(true);
@@ -207,7 +208,8 @@ describe("AMP Oracle Validation", () => {
     expect(result.foundInf).toBe(false);
 
     // Gradients should be finite (not null which represents NaN/Inf)
-    for (const grad of result.grads!) {
+    expect(result.grads).toBeDefined();
+    for (const grad of result.grads ?? []) {
       if (grad) {
         for (const val of grad.values) {
           expect(val).not.toBeNull();

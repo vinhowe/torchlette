@@ -87,7 +87,11 @@ async function main() {
     process.exit(1);
   }
 
-  const dev = getWebGPUDevice()!;
+  const dev = getWebGPUDevice();
+  if (!dev) {
+    console.error("No WebGPU device");
+    process.exit(1);
+  }
   console.log(
     `Device features: ${[...dev.device.features].sort().join(", ")}\n`,
   );

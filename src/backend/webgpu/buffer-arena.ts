@@ -71,7 +71,7 @@ export function allocateOutputBuffer(sizeBytes: number): GPUBuffer {
           sizeBytes,
         );
         arenaLocal.conflictDetected = true;
-        return freshBuffer!;
+        return freshBuffer as GPUBuffer;
       }
       return arenaBuffer;
     }

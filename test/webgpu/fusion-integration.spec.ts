@@ -24,6 +24,7 @@ import {
   buildRecipeFromIR,
   type FusedKernelRecipe,
 } from "../../src/backend/webgpu/fusion-types";
+import type { GPUDevice } from "../../src/backend/webgpu/gpu-types";
 import type { IRNode } from "../../src/engine/ir";
 import { Torchlette } from "../../src/frontend";
 
@@ -73,7 +74,7 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
   describe("FusionKernelCache", () => {
     it("caches pipelines by key", () => {
       const cache = new FusionKernelCache();
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
       const recipe: FusedKernelRecipe = {
         id: "test_cache",
@@ -101,7 +102,7 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
 
     it("evicts oldest on overflow", () => {
       const cache = new FusionKernelCache(2); // max 2 entries
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
       const makeRecipe = (id: number): FusedKernelRecipe => ({
         id: `test_${id}`,
@@ -136,7 +137,7 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
 
   describe("§15.1 Elementwise Fusion", () => {
     it("fuses add + relu into single kernel", async () => {
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
       // Create input tensors using backend directly
       const a = webgpuBackend.ops.tensorFromArray(
@@ -197,7 +198,7 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
     });
 
     it("fuses chain of 3+ ops", async () => {
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
       const a = webgpuBackend.ops.tensorFromArray(
         [1, 2, 3, 4],
@@ -249,7 +250,7 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
     });
 
     it("handles broadcasting in fused kernels", async () => {
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
       // [2, 4] + [4] with broadcast
       const a = webgpuBackend.ops.tensorFromArray(
@@ -309,7 +310,7 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
 
   describe("§15.2 Multi-Output Fusion", () => {
     it("generates kernel with multiple outputs", async () => {
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
       const a = webgpuBackend.ops.tensorFromArray(
         [1, 2, 3, 4],
@@ -451,7 +452,7 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
     });
 
     it("vectorized dispatch produces correct results", async () => {
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
       // Use 256 elements to ensure vec4
       const inputData = new Array(256).fill(0).map((_, i) => i - 128);
@@ -610,7 +611,7 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
 
   describe("End-to-End Fusion", () => {
     it("fusion produces same results as sequential execution", async () => {
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
       // Input data
       const aData = [1, -2, 3, -4, 5, -6, 7, -8];

@@ -102,7 +102,7 @@ import {
 type UnaryGradFn = (
   rt: RuntimeEngine,
   grad: RuntimeTensor,
-  savedA: Tensor,
+  savedA: Tensor | undefined,
 ) => RuntimeTensor;
 
 interface UnaryOpSpec {
@@ -490,12 +490,17 @@ export class Torchlette {
 
   /** Generic dispatcher for table-driven unary ops. */
   private _dispatchUnary(opName: string, a: Tensor): Tensor {
-    const spec = UNARY_OPS[opName]!;
+    const spec = UNARY_OPS[opName];
     this._assertUsable(a);
     const castA = spec.autocast
       ? this._applyAutocast(spec.autocast, [a])[0]
       : a;
-    const inner = (this.runtime as any)[opName](castA._unwrap());
+    const inner = (
+      this.runtime as unknown as Record<
+        string,
+        (a: RuntimeTensor) => RuntimeTensor
+      >
+    )[opName](castA._unwrap());
     if (!spec.grad) return this._wrap(inner);
     const needsSave = spec.needsSave !== false;
     const tensorsToSave = needsSave && a.requiresGrad ? [castA] : [];
@@ -504,11 +509,7 @@ export class Torchlette {
       [a],
       (grad, getSaved) => {
         return [
-          spec.grad?.(
-            this.runtime,
-            grad,
-            needsSave ? getSaved(0) : (undefined as any),
-          ),
+          spec.grad?.(this.runtime, grad, needsSave ? getSaved(0) : undefined),
         ];
       },
       tensorsToSave,
@@ -778,7 +779,7 @@ export class Torchlette {
         }
 
         return bias
-          ? [resultInput, resultWeight, resultBias!]
+          ? [resultInput, resultWeight, resultBias as RuntimeTensor]
           : [resultInput, resultWeight];
       },
       toSave,

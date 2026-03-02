@@ -314,7 +314,9 @@ export async function executeMatmulWithEpilogue(
 ): Promise<void> {
   // Use cached imports (initialized once at executeLoweredPlan/executePlanOptimized entry)
   await ensureWebGPUMatmulImports();
-  const { dispatchMatmul } = _webgpuMatmulImports!;
+  const { dispatchMatmul } = _webgpuMatmulImports as NonNullable<
+    typeof _webgpuMatmulImports
+  >;
 
   // Determine which inputs have prologue casts.
   // If the prologue cast was skipped (no result), use the original pre-cast input.

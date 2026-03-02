@@ -555,7 +555,7 @@ function contiguousChunked(
     const numInputColChunks = Math.ceil(N / alignedInputCols);
 
     // Generate shader via tile-IR
-    const code = chunkedTransposeTileIR(wgslType as any);
+    const code = chunkedTransposeTileIR(wgslType as "f32" | "u32" | "i32");
 
     const key = `contiguous_chunked_transpose_tiled:${K}:${N}:${dtype}`;
     const pipeline = getPipeline(ctx, key, code);

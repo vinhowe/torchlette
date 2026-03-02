@@ -66,10 +66,11 @@ export function analyzeLifetimes(
   });
 
   for (const nodeId of nodeOrder) {
+    const step = stepIndex.get(nodeId) as number;
     lifetimes.set(nodeId, {
       nodeId,
-      firstUse: stepIndex.get(nodeId)!,
-      lastUse: stepIndex.get(nodeId)!,
+      firstUse: step,
+      lastUse: step,
       isOutput: nodeOutputs.has(nodeId),
       isInput: !nodeInputs.has(nodeId) || nodeInputs.get(nodeId)?.length === 0,
       bufferSize: nodeSizes.get(nodeId) ?? 0,
@@ -77,7 +78,7 @@ export function analyzeLifetimes(
   }
 
   for (const [nodeId, inputs] of nodeInputs) {
-    const nodeStep = stepIndex.get(nodeId)!;
+    const nodeStep = stepIndex.get(nodeId) as number;
     for (const inputId of inputs) {
       const lifetime = lifetimes.get(inputId);
       if (lifetime && nodeStep > lifetime.lastUse) {

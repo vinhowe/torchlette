@@ -418,7 +418,7 @@ export async function executePlanOptimized(
     for (let i = 0; i < plan.nodes.length; i++) {
       origIdToPos.set(plan.nodes[i].id, i);
     }
-    const finalPerm = planNodes.map((n) => origIdToPos.get(n.id)!);
+    const finalPerm = planNodes.map((n) => origIdToPos.get(n.id) as number);
 
     const finalIdToPos = new Map<number, number>();
     for (let i = 0; i < planNodes.length; i++) {
@@ -429,18 +429,18 @@ export async function executePlanOptimized(
       if (seg.kind === "sequential") {
         return {
           kind: "sequential" as const,
-          finalPoss: seg.nodes.map((n) => finalIdToPos.get(n.id)!),
+          finalPoss: seg.nodes.map((n) => finalIdToPos.get(n.id) as number),
         };
       }
       return {
         kind: "fused" as const,
-        finalPoss: seg.group.nodes.map((n) => finalIdToPos.get(n.id)!),
-        outputFinalPos: finalIdToPos.get(seg.group.outputNode.id)!,
+        finalPoss: seg.group.nodes.map((n) => finalIdToPos.get(n.id) as number),
+        outputFinalPos: finalIdToPos.get(seg.group.outputNode.id) as number,
         additionalOutputFinalPoss: (seg.group.additionalOutputNodes ?? []).map(
-          (n) => finalIdToPos.get(n.id)!,
+          (n) => finalIdToPos.get(n.id) as number,
         ),
         neededIntermediateFinalPoss: (seg.group.neededIntermediates ?? []).map(
-          (n) => finalIdToPos.get(n.id)!,
+          (n) => finalIdToPos.get(n.id) as number,
         ),
       };
     });
@@ -449,25 +449,25 @@ export async function executePlanOptimized(
       finalPerm,
       segments: cachedSegments,
       epilogueClaimedOrigPoss: [...epilogueClaimedIds].map(
-        (id) => origIdToPos.get(id)!,
+        (id) => origIdToPos.get(id) as number,
       ),
       prologueClaimedOrigPoss: [...prologueClaimedIds].map(
-        (id) => origIdToPos.get(id)!,
+        (id) => origIdToPos.get(id) as number,
       ),
       epilogueChains: [...matmulEpilogueChains].map(
         ([mmId, epilogueIds]) =>
           [
-            origIdToPos.get(mmId)!,
-            epilogueIds.map((id) => origIdToPos.get(id)!),
+            origIdToPos.get(mmId) as number,
+            epilogueIds.map((id) => origIdToPos.get(id) as number),
           ] as [number, number[]],
       ),
       prologueDescs: [...matmulPrologues].map(
         ([mmId, prologues]) =>
           [
-            origIdToPos.get(mmId)!,
+            origIdToPos.get(mmId) as number,
             prologues.map((p) => ({
               inputIndex: p.inputIndex,
-              castOrigPos: origIdToPos.get(p.castNodeId)!,
+              castOrigPos: origIdToPos.get(p.castNodeId) as number,
               fromDtype: p.fromDtype,
               toDtype: p.toDtype,
             })),
@@ -486,16 +486,16 @@ export async function executePlanOptimized(
           ? compoundMatches.map((m) => ({
               name: m.name,
               coveredOrigPoss: m.coveredNodeIds.map(
-                (id) => origIdToPos.get(id)!,
+                (id) => origIdToPos.get(id) as number,
               ),
-              outputOrigPos: origIdToPos.get(m.outputNodeId)!,
+              outputOrigPos: origIdToPos.get(m.outputNodeId) as number,
               dim: m.dim,
             }))
           : undefined,
       rewriteBypassedOrigPoss:
         analysis.rewriteBypassedIds.size > 0
           ? [...analysis.rewriteBypassedIds]
-              .map((id) => origIdToPos.get(id)!)
+              .map((id) => origIdToPos.get(id) as number)
               .filter((p) => p !== undefined)
           : undefined,
     };
@@ -535,7 +535,9 @@ export async function executePlanOptimized(
     const cached = fusionAnalysisCache.get(fingerprint);
     if (cached && !cached.lifetimeTemplate) {
       cached.lifetimeTemplate = planNodes.map((node) => {
-        const lt = lifetimes?.get(node.id)!;
+        const lt = (lifetimes as Map<number, TensorLifetime>).get(
+          node.id,
+        ) as TensorLifetime;
         return {
           firstUse: lt.firstUse,
           lastUse: lt.lastUse,
@@ -678,7 +680,9 @@ export async function executePlanOptimized(
     cachedTemplate?.bufferArena &&
     process.env.TORCHLETTE_USE_ARENA !== "0";
   if (useArenaFallback) {
-    setActiveArena(cachedTemplate?.bufferArena!);
+    setActiveArena(
+      (cachedTemplate as FusionAnalysisTemplate).bufferArena as BufferArena,
+    );
     // Register external input buffers for arena conflict detection
     const extBufs: GPUBuffer[] = [];
     for (const node of planNodes) {
@@ -764,13 +768,15 @@ export async function executePlanOptimized(
         // Record fused action in lowered plan builder
         if (loweredPlanBuilder) {
           loweredPlanBuilder.recordFused(
-            segment.group.nodes.map((n) => nodeIdToFinalPos.get(n.id)!),
-            nodeIdToFinalPos.get(segment.group.outputNode.id)!,
+            segment.group.nodes.map(
+              (n) => nodeIdToFinalPos.get(n.id) as number,
+            ),
+            nodeIdToFinalPos.get(segment.group.outputNode.id) as number,
             (segment.group.additionalOutputNodes ?? []).map(
-              (n) => nodeIdToFinalPos.get(n.id)!,
+              (n) => nodeIdToFinalPos.get(n.id) as number,
             ),
             (segment.group.neededIntermediates ?? []).map(
-              (n) => nodeIdToFinalPos.get(n.id)!,
+              (n) => nodeIdToFinalPos.get(n.id) as number,
             ),
             segment.recipe,
             enableVectorization,

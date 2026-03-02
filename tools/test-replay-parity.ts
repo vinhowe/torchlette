@@ -75,10 +75,10 @@ async function main() {
     if (
       process.env.DUMP_GRADS === "1" &&
       firstParam &&
-      (firstParam as any).grad &&
+      firstParam.grad &&
       step >= 3
     ) {
-      const grad = (firstParam as any).grad as Tensor;
+      const grad = firstParam.grad;
       const gradData = await grad.cpu();
       const vals = gradData.slice(0, 8);
       console.log(

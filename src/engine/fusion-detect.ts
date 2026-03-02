@@ -1019,7 +1019,7 @@ export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
       id = ref.kind === "materialized" ? -ref.storage.id : ref.node.id;
     }
     if (inputMap.has(id)) {
-      return inputMap.get(id)!;
+      return inputMap.get(id) as number;
     }
     const idx = inputs.length;
     inputMap.set(id, -(idx + 1));
@@ -1355,7 +1355,7 @@ function selectBestForFusion(
   let bestPos = Infinity;
 
   for (const id of ready) {
-    const node = nodeById.get(id)!;
+    const node = nodeById.get(id) as LazyIRNode;
     const fusible = isFusibleOp(node.op);
     let priority: number;
 
@@ -1371,7 +1371,7 @@ function selectBestForFusion(
       priority = 2; // Non-fusible
     }
 
-    const pos = originalPos.get(id)!;
+    const pos = originalPos.get(id) as number;
     if (
       priority < bestPriority ||
       (priority === bestPriority && pos < bestPos)
@@ -1413,7 +1413,7 @@ export function reorderPlanForFusion(nodes: LazyIRNode[]): LazyIRNode[] {
   for (const node of nodes) {
     for (const input of node.inputs) {
       if (input.kind === "pending" && nodeById.has(input.node.id)) {
-        inDegree.set(node.id, inDegree.get(node.id)! + 1);
+        inDegree.set(node.id, (inDegree.get(node.id) as number) + 1);
         successors.get(input.node.id)?.push(node.id);
       }
     }
@@ -1438,17 +1438,16 @@ export function reorderPlanForFusion(nodes: LazyIRNode[]): LazyIRNode[] {
       originalPos,
     );
     ready.delete(best);
-    result.push(nodeById.get(best)!);
-
-    const bestNode = nodeById.get(best)!;
+    const bestNode = nodeById.get(best) as LazyIRNode;
+    result.push(bestNode);
     if (isFusibleOp(bestNode.op)) {
       chainNodeIds.add(best);
     } else {
       chainNodeIds = new Set();
     }
 
-    for (const succId of successors.get(best)!) {
-      const newDeg = inDegree.get(succId)! - 1;
+    for (const succId of successors.get(best) as number[]) {
+      const newDeg = (inDegree.get(succId) as number) - 1;
       inDegree.set(succId, newDeg);
       if (newDeg === 0) ready.add(succId);
     }

@@ -464,7 +464,9 @@ export async function executeLoweredPlan(
             );
             setAdamBatchMode(true);
             try {
-              const adamOp = backend.ops.adamStep!;
+              const adamOp = backend.ops.adamStep as NonNullable<
+                typeof backend.ops.adamStep
+              >;
               setCurrentOpLabel("adamStep");
               const _adamBatchT0 = profileOpBegin("adamStep");
               await executeAdamBatchInner(
@@ -983,7 +985,9 @@ export async function executeLoweredPlan(
               computeMatmulOutputShape,
               computeBatchSize,
               computeBatchStrides,
-            } = _webgpuMatmulGeomImports!;
+            } = _webgpuMatmulGeomImports as NonNullable<
+              typeof _webgpuMatmulGeomImports
+            >;
             const { isF16Supported } = await import("../backend/webgpu/index");
 
             const tensorA = asGPUTensor(
@@ -1128,7 +1132,7 @@ export async function executeLoweredPlan(
               op: preambleNode.op,
               arity: preambleNode.inputs.length,
               isMean: reductionNode.op === "mean",
-              consumedCount: action.consumedCount!,
+              consumedCount: action.consumedCount as number,
               preambleChain: chainNodes,
               chainOps: action.chainOps,
               chainInputRefs: externalInputRefs,
@@ -1341,7 +1345,9 @@ export async function executeLoweredPlan(
           try {
             const adamBackend =
               getBackend(planNodes[action.nodeIndices[0]].device) ?? backend;
-            const adamOp = adamBackend.ops.adamStep!;
+            const adamOp = adamBackend.ops.adamStep as NonNullable<
+              typeof adamBackend.ops.adamStep
+            >;
             await withProfileContext("adamStep", "optimizer.step", () =>
               executeAdamBatchInner(
                 planNodes,
@@ -1362,7 +1368,11 @@ export async function executeLoweredPlan(
             replayEntries.push({
               kind: "adam-batch",
               nodeIndices: action.nodeIndices,
-              seqCounters: adamSeqCountersBefore!,
+              seqCounters: adamSeqCountersBefore as {
+                dispatch: number;
+                params: number;
+                output: number;
+              },
             });
           }
           break;
@@ -1411,7 +1421,11 @@ export async function executeLoweredPlan(
                 kind: "data-source",
                 nodeIndex: nodeIdx,
                 arenaResolveIdx: arenaResolveIdxBefore,
-                seqCounters: seqCountersBefore!,
+                seqCounters: seqCountersBefore as {
+                  dispatch: number;
+                  params: number;
+                  output: number;
+                },
               });
               skipDispatches();
             } else if (action.kind === "view") {
@@ -1442,7 +1456,11 @@ export async function executeLoweredPlan(
                 kind: "sequential",
                 nodeIndex: nodeIdx,
                 arenaResolveIdx: arenaResolveIdxBefore,
-                seqCounters: seqCountersBefore!,
+                seqCounters: seqCountersBefore as {
+                  dispatch: number;
+                  params: number;
+                  output: number;
+                },
               });
               skipDispatches();
             } else {
@@ -1571,7 +1589,7 @@ export async function executeLoweredPlan(
 
       // Collect all GPUBuffers referenced by recorded bind groups.
       // These must be pinned (not destroyed) between steps so replay bind groups stay valid.
-      const pinnedBuffers = new Set<any>();
+      const pinnedBuffers = new Set<GPUBuffer>();
       for (const entry of replayEntries) {
         if (entry.kind === "dispatch" && entry.dispatch.buffers) {
           for (const b of entry.dispatch.buffers) pinnedBuffers.add(b);

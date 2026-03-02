@@ -10,6 +10,7 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { getBackend } from "../src/backend/registry";
+import type { Backend } from "../src/backend/types";
 import {
   detectFusionGroups,
   groupToRecipe,
@@ -27,11 +28,17 @@ import {
   createPendingRef,
   executePlanOptimized,
   type LazyIRNode,
+  type LazyRef,
   resetNodeIdCounter,
   resetStorageIdCounter,
 } from "../src/engine/lazy";
 import { RuntimeEngine } from "../src/runtime/engine";
 import { resetBaseIdCounter, type Tensor } from "../src/runtime/tensor";
+
+function getPendingNode(ref: LazyRef): LazyIRNode {
+  if (ref.kind !== "pending") throw new Error("Expected pending LazyRef");
+  return ref.node;
+}
 
 describe("§15 Fusion Detection", () => {
   beforeEach(() => {
@@ -608,10 +615,8 @@ describe("§15 Optimized Execution", () => {
       const b = engine.tensorFromArray([5, 6, 7, 8], [4]);
       const c = engine.add(a, b);
 
-      const plan = buildPlan(
-        c.lazyRef.kind === "pending" ? c.lazyRef.node : (null as any),
-      );
-      const backend = getBackend("cpu")!;
+      const plan = buildPlan(getPendingNode(c.lazyRef));
+      const backend = getBackend("cpu") as Backend;
 
       const result = await executePlanOptimized(plan, backend, {
         enableFusion: false,
@@ -627,10 +632,8 @@ describe("§15 Optimized Execution", () => {
       const c = engine.add(a, b);
       const d = engine.mul(c, b);
 
-      const plan = buildPlan(
-        d.lazyRef.kind === "pending" ? d.lazyRef.node : (null as any),
-      );
-      const backend = getBackend("cpu")!;
+      const plan = buildPlan(getPendingNode(d.lazyRef));
+      const backend = getBackend("cpu") as Backend;
 
       // CPU backend doesn't support fusion, but should detect the opportunity
       const result = await executePlanOptimized(plan, backend, {
@@ -648,19 +651,14 @@ describe("§15 Optimized Execution", () => {
       const c = engine.add(a, b); // [3, 4, 5, 6]
       const d = engine.mul(c, b); // [6, 8, 10, 12]
 
-      const plan = buildPlan(
-        d.lazyRef.kind === "pending" ? d.lazyRef.node : (null as any),
-      );
-      const backend = getBackend("cpu")!;
+      const plan = buildPlan(getPendingNode(d.lazyRef));
+      const backend = getBackend("cpu") as Backend;
 
       await executePlanOptimized(plan, backend, { enableFusion: true });
 
       // Verify result
-      const result = await backend.ops.read(
-        d.lazyRef.kind === "pending"
-          ? d.lazyRef.node.result?.backendTensor
-          : (d.lazyRef as any).storage.backendTensor,
-      );
+      const node = getPendingNode(d.lazyRef);
+      const result = await backend.ops.read(node.result?.backendTensor);
       expect(result).toEqual([6, 8, 10, 12]);
     });
   });
@@ -834,10 +832,10 @@ describe("§15 reorderPlanForFusion", () => {
     }
 
     // All dependencies come before dependents
-    expect(pos.get(a.id)!).toBeLessThan(pos.get(b.id)!);
-    expect(pos.get(a.id)!).toBeLessThan(pos.get(c.id)!);
-    expect(pos.get(b.id)!).toBeLessThan(pos.get(d.id)!);
-    expect(pos.get(c.id)!).toBeLessThan(pos.get(d.id)!);
+    expect(pos.get(a.id) as number).toBeLessThan(pos.get(b.id) as number);
+    expect(pos.get(a.id) as number).toBeLessThan(pos.get(c.id) as number);
+    expect(pos.get(b.id) as number).toBeLessThan(pos.get(d.id) as number);
+    expect(pos.get(c.id) as number).toBeLessThan(pos.get(d.id) as number);
   });
 
   it("returns unchanged plan when no fusible ops", () => {

@@ -878,7 +878,7 @@ function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
     if (lhs.kind === "const" && rhs.kind === "const") {
       const l = lhs.value,
         r = rhs.value;
-      let result: boolean;
+      let result: boolean = false;
       switch (op) {
         case "eq":
           result = l === r;
@@ -901,7 +901,7 @@ function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
       }
       return {
         kind: "const",
-        value: result! ? 1 : 0,
+        value: result ? 1 : 0,
         valueType: "scalar",
         dataType: "u32",
         id: -1,
@@ -929,22 +929,26 @@ function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
 
 // ---- CSE key computation ----
 
-function cseKey(node: { kind: string; [key: string]: any }): string | null {
+type CSEableNode = IRNode | Omit<IRNode, "id">;
+
+function cseKey(node: CSEableNode): string | null {
+  // Access id safely — folded nodes from tryFold() have id, partial nodes don't yet
+  const getId = (n: IRNode | Omit<IRNode, "id">): number => (n as IRNode).id;
   switch (node.kind) {
     case "const":
       return `K:${node.dataType}:${node.value}`;
     case "binary":
-      return `B:${node.op}:${node.lhs.id}:${node.rhs.id}`;
+      return `B:${node.op}:${getId(node.lhs)}:${getId(node.rhs)}`;
     case "unary":
-      return `U:${node.op}:${node.input.id}`;
+      return `U:${node.op}:${getId(node.input)}`;
     case "cmp":
-      return `C:${node.op}:${node.lhs.id}:${node.rhs.id}`;
+      return `C:${node.op}:${getId(node.lhs)}:${getId(node.rhs)}`;
     case "cast":
-      return `T:${node.targetType}:${node.input.id}`;
+      return `T:${node.targetType}:${getId(node.input)}`;
     case "bitcast":
-      return `BC:${node.targetType}:${node.input.id}`;
+      return `BC:${node.targetType}:${getId(node.input)}`;
     case "select":
-      return `S:${node.condition.id}:${node.trueVal.id}:${node.falseVal.id}`;
+      return `S:${getId(node.condition)}:${getId(node.trueVal)}:${getId(node.falseVal)}`;
     case "uniform":
       return `UNI:${node.name}`;
     case "programId":
@@ -958,15 +962,15 @@ function cseKey(node: { kind: string; [key: string]: any }): string | null {
     case "numWorkgroups":
       return `NWG:${node.dim}`;
     case "vec4Construct":
-      return `V4C:${node.x.id}:${node.y.id}:${node.z.id}:${node.w.id}`;
+      return `V4C:${getId(node.x)}:${getId(node.y)}:${getId(node.z)}:${getId(node.w)}`;
     case "vec4Splat":
-      return `V4S:${node.value.id}`;
+      return `V4S:${getId(node.value)}`;
     case "vec4NativeDot":
-      return `V4D:${node.a.id}:${node.b.id}`;
+      return `V4D:${getId(node.a)}:${getId(node.b)}`;
     case "vec4Component":
-      return `V4X:${node.value.id}:${node.comp}`;
+      return `V4X:${getId(node.value)}:${node.comp}`;
     case "vec4Binary":
-      return `V4B:${node.op}:${node.a.id}:${node.b.id}`;
+      return `V4B:${node.op}:${getId(node.a)}:${getId(node.b)}`;
     default:
       return null; // Not CSE-eligible (loads, sharedRead, namedRef, vec4ArrayRead, etc.)
   }
@@ -983,13 +987,13 @@ function makeNode<T extends IRNode>(partial: Omit<T, "id">): T {
       const existing = cseCache.get(key);
       if (existing) return existing as unknown as T;
     }
-    (folded as any).id = nextNodeId++;
+    (folded as IRNodeBase).id = nextNodeId++;
     if (key !== null) cseCache.set(key, folded);
     return folded as unknown as T;
   }
 
   // Phase 2: CSE — return cached node if structurally identical
-  const key = cseKey(partial as any);
+  const key = cseKey(partial);
   if (key !== null) {
     const existing = cseCache.get(key);
     if (existing) return existing as T;
@@ -1257,14 +1261,27 @@ export class BlockExpr {
   }
 
   // -- Subgroup ops --
-  private _subgroupOp(kind: string): BlockExpr {
+  private _subgroupOp(
+    kind:
+      | SubgroupAddNode["kind"]
+      | SubgroupMaxNode["kind"]
+      | SubgroupMinNode["kind"]
+      | SubgroupBroadcastFirstNode["kind"]
+      | SubgroupInclusiveAddNode["kind"],
+  ): BlockExpr {
     return new BlockExpr(
-      makeNode({
+      makeNode<
+        | SubgroupAddNode
+        | SubgroupMaxNode
+        | SubgroupMinNode
+        | SubgroupBroadcastFirstNode
+        | SubgroupInclusiveAddNode
+      >({
         kind,
         value: this.node,
         valueType: this.node.valueType,
         dataType: this.node.dataType,
-      } as any),
+      }),
     );
   }
 
@@ -1530,15 +1547,17 @@ class Vec4ArrayHandle {
   ) {}
 
   read(idx: BlockExpr): BlockExpr {
-    const nodeKind = this.isShared ? "vec4SharedRead" : "vec4ArrayRead";
+    const nodeKind: "vec4SharedRead" | "vec4ArrayRead" = this.isShared
+      ? "vec4SharedRead"
+      : "vec4ArrayRead";
     return new BlockExpr(
-      makeNode({
+      makeNode<Vec4SharedReadNode | Vec4ArrayReadNode>({
         kind: nodeKind,
         arrayName: this.name,
         idx: idx.node,
         valueType: "scalar" as ValueType,
         dataType: "f32" as DataType,
-      } as any),
+      }),
     );
   }
 
@@ -1608,6 +1627,11 @@ export class KernelContext {
     this.subgroupSize = subgroupSize;
   }
 
+  /** Get the DataType for a named binding, defaulting to "f32". */
+  getBindingType(binding: string): DataType {
+    return this.bindingSpecs[binding]?.type ?? "f32";
+  }
+
   /** @internal Set workgroup size from spec. Called by buildKernelIR(). */
   _setWgSize(wgSize: number | [number, number]): void {
     this._wgSize = wgSize;
@@ -1660,18 +1684,15 @@ export class KernelContext {
   /** Load from a storage buffer at given offsets. Optional mask for bounds. */
   load(binding: string, offsets: BlockExpr, mask?: BlockExpr): BlockExpr {
     const bindingType = this.bindingSpecs[binding]?.type ?? "f32";
-    return new BlockExpr(
-      this.trackNode(
-        makeNode<LoadNode>({
-          kind: "load",
-          binding,
-          offsets: offsets.node,
-          ...(mask ? { mask: mask.node } : {}),
-          valueType: "block",
-          dataType: bindingType as DataType,
-        } as any),
-      ),
-    );
+    const partial: Omit<LoadNode, "id"> = {
+      kind: "load",
+      binding,
+      offsets: offsets.node,
+      valueType: "block",
+      dataType: bindingType as DataType,
+    };
+    if (mask) partial.mask = mask.node;
+    return new BlockExpr(this.trackNode(makeNode<LoadNode>(partial)));
   }
 
   /** Read a uniform config value. */
@@ -1941,16 +1962,28 @@ export class KernelContext {
       }),
     );
     const bodyStmts = this.captureScope(() => body(loopVar));
-    const stmt: any = {
-      kind,
-      varName,
-      start: start.node,
-      bound: bound.node,
-      body: bodyStmts,
-    };
-    if (extra?.stride != null) stmt.stride = extra.stride;
-    if (extra?.unroll != null) stmt.unroll = extra.unroll;
-    this.pushStatement(stmt);
+    if (kind === "forStride") {
+      const stmt: ForStrideStmt = {
+        kind,
+        varName,
+        start: start.node,
+        bound: bound.node,
+        stride: extra?.stride ?? 1,
+        body: bodyStmts,
+      };
+      if (extra?.unroll != null) stmt.unroll = extra.unroll;
+      this.pushStatement(stmt);
+    } else {
+      const stmt: ForRangeStmt = {
+        kind,
+        varName,
+        start: start.node,
+        bound: bound.node,
+        body: bodyStmts,
+      };
+      if (extra?.unroll != null) stmt.unroll = extra.unroll;
+      this.pushStatement(stmt);
+    }
   }
 
   /** Emit a for loop: `for (var v = start; v < bound; v++)`. */
@@ -2905,6 +2938,8 @@ export interface TileKernelSpec {
    *  `gid.x * vectorize + offset` and the body is unrolled. Grid must be
    *  adjusted by the caller: `ceil(N / (workgroupSize * vectorize))`. */
   vectorize?: number;
+  /** When true, the compiler auto-selects vectorization width via access analysis. */
+  autoVectorize?: boolean;
   /** Binding index for the uniform struct. If set, uniform is inserted at this
    *  index among the storage bindings (e.g. 3 means after 3 storage bindings).
    *  If unset, uniform is appended after all storage bindings. */
@@ -2989,8 +3024,8 @@ export function tiledGrid(dims: {
   }
   return (u) => {
     const x = resolve(dims.x, u);
-    if (dims.z !== undefined)
-      return [x, resolve(dims.y!, u), resolve(dims.z, u)];
+    if (dims.z !== undefined && dims.y !== undefined)
+      return [x, resolve(dims.y, u), resolve(dims.z, u)];
     if (dims.y !== undefined) return [x, resolve(dims.y, u)];
     return [x];
   };

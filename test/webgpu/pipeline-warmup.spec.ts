@@ -83,7 +83,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   describe("Warmup", () => {
     it("compiles pipelines and populates warmup cache", async () => {
-      const devInfo = getWebGPUDevice()!;
+      const devInfo = getWebGPUDevice();
+      if (!devInfo) throw new Error("WebGPU device not available");
       clearWarmupCache();
 
       const entries = [
@@ -103,7 +104,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     });
 
     it("skips already-cached entries", async () => {
-      const devInfo = getWebGPUDevice()!;
+      const devInfo = getWebGPUDevice();
+      if (!devInfo) throw new Error("WebGPU device not available");
       clearWarmupCache();
 
       const entries = [{ key: "warmup_skip_1", wgsl: trivialShader(30) }];
@@ -119,7 +121,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     });
 
     it("dispatch paths find warmed-up pipelines", async () => {
-      const devInfo = getWebGPUDevice()!;
+      const devInfo = getWebGPUDevice();
+      if (!devInfo) throw new Error("WebGPU device not available");
       const ctx = requireContext();
       clearWarmupCache();
 
@@ -190,7 +193,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   describe("clearWarmupCache", () => {
     it("clears all warmed-up pipelines", async () => {
-      const devInfo = getWebGPUDevice()!;
+      const devInfo = getWebGPUDevice();
+      if (!devInfo) throw new Error("WebGPU device not available");
       clearWarmupCache();
 
       await warmupPipelines(devInfo.device, [

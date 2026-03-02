@@ -250,7 +250,7 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
       return `(${a} ${op} ${b})`;
     }
     default:
-      throw new Error(`Unknown node kind: ${(node as any).kind}`);
+      throw new Error(`Unknown node kind: ${(node as { kind: string }).kind}`);
   }
 }
 
@@ -270,10 +270,7 @@ export function compileTileKernel(spec: TileKernelSpec): string {
   // 0. Auto vec-width selection: if vectorize is "auto", use access analysis.
   //    Works with both globalId(0) and flatGlobalId() kernels. The access
   //    analysis recognizes tagged flatGlobalId nodes as stride-1 coalesced.
-  if (
-    (spec as any).vectorize === "auto" ||
-    (spec.vectorize === undefined && (spec as any).autoVectorize)
-  ) {
+  if (spec.vectorize === undefined && spec.autoVectorize) {
     const safeWidth = computeSafeVecWidth(spec);
     if (safeWidth > 1) {
       const wgSize =
@@ -892,7 +889,7 @@ function someExprChild(node: IRNode, fn: (child: IRNode) => boolean): boolean {
     case "unary":
     case "cast":
     case "bitcast":
-      return fn((node as any).input);
+      return fn(node.input);
     case "select":
       return fn(node.condition) || fn(node.trueVal) || fn(node.falseVal);
     case "load":
@@ -1544,7 +1541,7 @@ function exprDepth(node: IRNode): number {
     case "unary":
     case "cast":
     case "bitcast":
-      return 1 + exprDepth((node as any).input);
+      return 1 + exprDepth(node.input);
     case "cmp":
       return 1 + Math.max(exprDepth(node.lhs), exprDepth(node.rhs));
     case "select":

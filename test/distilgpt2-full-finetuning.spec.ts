@@ -224,11 +224,12 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
             useCheckpoint: true,
           });
 
-          const lossVal = await result.loss?.item();
+          if (!result.loss) throw new Error("Loss is null");
+          const lossVal = await result.loss.item();
           losses.push(lossVal);
 
           // Backward with gradient scaling
-          const scaledLoss = scaler.scale(result.loss!);
+          const scaledLoss = scaler.scale(result.loss);
           await scaledLoss.backward();
 
           // Optimizer step
@@ -298,10 +299,11 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
             useCheckpoint: true,
           });
 
-          const lossVal = await result.loss?.item();
+          if (!result.loss) throw new Error("Loss is null");
+          const lossVal = await result.loss.item();
           losses.push(lossVal);
 
-          const scaledLoss = scaler.scale(result.loss!);
+          const scaledLoss = scaler.scale(result.loss);
           await scaledLoss.backward();
 
           scaler.unscale_(optimizer);
@@ -380,7 +382,8 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
             const result = model.forwardWithLoss(input, target, {
               useCheckpoint: true,
             });
-            return result.loss!;
+            if (!result.loss) throw new Error("Loss is null");
+            return result.loss;
           });
 
           const scaledLoss = scaler.scale(loss);
@@ -416,7 +419,9 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
         gpuMemoryTracker.reset();
 
         // Force GC if available (via --expose-gc) for deterministic measurement
-        const gc = (globalThis as any).gc as (() => void) | undefined;
+        const gc = (globalThis as Record<string, unknown>).gc as
+          | (() => void)
+          | undefined;
 
         // Drain FinalizationRegistry callbacks by running GC + yielding
         async function drainGC() {
@@ -511,11 +516,12 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
         });
 
         expect(result.loss).not.toBeNull();
-        const lossVal = await result.loss?.item();
+        if (!result.loss) throw new Error("Loss is null");
+        const lossVal = await result.loss.item();
         expect(Number.isFinite(lossVal)).toBe(true);
 
         // Backward with scaling
-        const scaledLoss = scaler.scale(result.loss!);
+        const scaledLoss = scaler.scale(result.loss);
         await scaledLoss.backward();
 
         // Unscale and step — fully lazy, no GPU stall

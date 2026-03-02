@@ -11,6 +11,13 @@ import {
   makeDPrecomputeSpec,
   makeForwardAttentionSpec,
 } from "../src/backend/webgpu/attention-tile-ir";
+import type {
+  GPUBindGroup,
+  GPUBuffer,
+  GPUComputePipeline,
+  GPUDevice,
+  GPUQueue,
+} from "../src/backend/webgpu/gpu-types";
 import { compileTileKernel } from "../src/backend/webgpu/tile-compiler";
 
 const BUF = {
@@ -245,7 +252,7 @@ function cpuBackwardDKV(
 // GPU Dispatch Helpers
 // ============================================================================
 
-function createPipeline(device: any, wgsl: string) {
+function createPipeline(device: GPUDevice, wgsl: string) {
   const mod = device.createShaderModule({ code: wgsl });
   return device.createComputePipeline({
     layout: "auto",
@@ -254,11 +261,11 @@ function createPipeline(device: any, wgsl: string) {
 }
 
 function createBuffer(
-  device: any,
+  device: GPUDevice,
   size: number,
   usage: number,
   data?: ArrayBufferView,
-): any {
+): GPUBuffer {
   const buf = device.createBuffer({
     size: Math.max(16, size),
     usage,
@@ -285,10 +292,10 @@ function packUniforms(
 }
 
 function dispatch(
-  device: any,
-  queue: any,
-  pipeline: any,
-  bindGroup: any,
+  device: GPUDevice,
+  queue: GPUQueue,
+  pipeline: GPUComputePipeline,
+  bindGroup: GPUBindGroup,
   grid: number[],
 ): void {
   const enc = device.createCommandEncoder();
@@ -301,9 +308,9 @@ function dispatch(
 }
 
 async function readBuffer(
-  device: any,
-  queue: any,
-  buf: any,
+  device: GPUDevice,
+  queue: GPUQueue,
+  buf: GPUBuffer,
   size: number,
 ): Promise<Float32Array> {
   const staging = device.createBuffer({
@@ -335,8 +342,8 @@ function f32ToU32Bits(val: number): number {
 // ============================================================================
 
 async function testForwardCorrectness(
-  device: any,
-  queue: any,
+  device: GPUDevice,
+  queue: GPUQueue,
   B: number,
   H: number,
   N: number,
@@ -461,8 +468,8 @@ async function testForwardCorrectness(
 }
 
 async function testDPrecomputeCorrectness(
-  device: any,
-  queue: any,
+  device: GPUDevice,
+  queue: GPUQueue,
   totalRows: number,
   D: number,
 ): Promise<{ pass: boolean; maxErr: number }> {
@@ -535,8 +542,8 @@ async function testDPrecomputeCorrectness(
 }
 
 async function testBackwardDQCorrectness(
-  device: any,
-  queue: any,
+  device: GPUDevice,
+  queue: GPUQueue,
   B: number,
   H: number,
   N: number,
@@ -691,8 +698,8 @@ async function testBackwardDQCorrectness(
 }
 
 async function testBackwardDKVCorrectness(
-  device: any,
-  queue: any,
+  device: GPUDevice,
+  queue: GPUQueue,
   B: number,
   H: number,
   N: number,
@@ -857,8 +864,8 @@ async function testBackwardDKVCorrectness(
 // ============================================================================
 
 async function benchKernel(
-  device: any,
-  queue: any,
+  device: GPUDevice,
+  queue: GPUQueue,
   _label: string,
   wgsl: string,
   bufferSizes: Record<string, number>,
@@ -870,8 +877,11 @@ async function benchKernel(
   const pipeline = createPipeline(device, wgsl);
 
   // Create storage buffers
-  const buffers: Record<string, any> = {};
-  const entries: any[] = [];
+  const buffers: Record<string, GPUBuffer> = {};
+  const entries: Array<{
+    binding: number;
+    resource: { buffer: GPUBuffer };
+  }> = [];
   let binding = 0;
   for (const [name, size] of Object.entries(bufferSizes)) {
     const buf = device.createBuffer({

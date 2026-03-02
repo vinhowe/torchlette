@@ -886,7 +886,7 @@ export function printProfileSummary(label: string): void {
 
 export function getProfileJSON(): object {
   // Build phases object with per-op kernel breakdown
-  const phases: Record<string, any> = {};
+  const phases: Record<string, unknown> = {};
   const allPhases = new Set([
     ...cpuProfile.phaseStats.keys(),
     ...gpuTs.phaseStats.keys(),
@@ -895,7 +895,7 @@ export function getProfileJSON(): object {
   for (const phase of allPhases) {
     const cpu = cpuProfile.phaseStats.get(phase);
     const gpu = gpuTs.phaseStats.get(phase);
-    const kernels: Record<string, any> = {};
+    const kernels: Record<string, unknown> = {};
     const phaseOps = gpuTs.phaseOpStats.get(phase);
     if (phaseOps) {
       for (const [op, s] of phaseOps) {
@@ -917,7 +917,7 @@ export function getProfileJSON(): object {
   }
 
   // GPU totals
-  const gpu_totals: Record<string, any> = {};
+  const gpu_totals: Record<string, unknown> = {};
   for (const [op, s] of gpuTs.labelStats) {
     gpu_totals[op] = {
       count: s.count,
@@ -957,9 +957,9 @@ export function getProfileJSON(): object {
     .map((b) => `${b.phase}/${b.op} (${b.gpu_ms.toFixed(1)}ms)`);
 
   // Per-module breakdown
-  const modules: Record<string, any> = {};
+  const modules: Record<string, unknown> = {};
   for (const [mod, s] of gpuTs.moduleStats) {
-    const kernels: Record<string, any> = {};
+    const kernels: Record<string, unknown> = {};
     const modOps = gpuTs.moduleOpStats.get(mod);
     if (modOps) {
       for (const [op, os] of modOps) {

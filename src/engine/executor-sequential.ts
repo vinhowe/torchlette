@@ -369,7 +369,8 @@ export async function executePlanWithTrueSegments(
         flushBufferPool();
       }
 
-      lastResult = segment.nodes[segment.nodes.length - 1].result!;
+      const lastNode = segment.nodes[segment.nodes.length - 1];
+      lastResult = lastNode.result ?? undefined;
     } catch (error) {
       // Clean up batch on error
       if (isBatchActive()) {

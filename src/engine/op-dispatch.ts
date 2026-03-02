@@ -52,7 +52,7 @@ function extractSideOutput(node: LazyIRNode, key: string): BackendTensor {
   if (!sh) throw new Error(`${node.op}: parent has no ${key} side output`);
   const bt = sh.backendTensor;
   storageTracker.unregister(sh.id);
-  parent._sideOutputs![key] = undefined;
+  if (parent._sideOutputs) parent._sideOutputs[key] = undefined;
   return bt;
 }
 
@@ -61,7 +61,7 @@ function extractRawSideOutput(node: LazyIRNode, key: string): BackendTensor {
   const parent = node.inputs[0].node;
   const bt = parent._sideOutputs?.[key] as BackendTensor | undefined;
   if (!bt) throw new Error(`${node.op}: parent has no ${key} side output`);
-  parent._sideOutputs![key] = undefined;
+  if (parent._sideOutputs) parent._sideOutputs[key] = undefined;
   return bt;
 }
 
@@ -154,7 +154,7 @@ function executeCreationOp(
     }
 
     case "full": {
-      const payload = getPayload<{ fillValue: number }>(node)!;
+      const payload = requirePayload<{ fillValue: number }>(node);
       if (backend.ops.full) {
         return backend.ops.full(node.shape, payload.fillValue);
       }
@@ -166,9 +166,9 @@ function executeCreationOp(
     }
 
     case "arange": {
-      const ap = getPayload<{ end: number; start: number; step: number }>(
+      const ap = requirePayload<{ end: number; start: number; step: number }>(
         node,
-      )!;
+      );
       if (backend.ops.arange) {
         return backend.ops.arange(ap.end, ap.start, ap.step);
       }
@@ -195,7 +195,7 @@ function executeCreationOp(
     }
 
     case "rand": {
-      const rp = getPayload<{ seed: number }>(node)!;
+      const rp = requirePayload<{ seed: number }>(node);
       if (backend.ops.rand) return backend.ops.rand(node.shape, rp.seed);
       const n = sizeOf(node.shape);
       const vals = new Array(n);
@@ -204,7 +204,7 @@ function executeCreationOp(
     }
 
     case "randn": {
-      const rp = getPayload<{ seed: number }>(node)!;
+      const rp = requirePayload<{ seed: number }>(node);
       if (backend.ops.randn) return backend.ops.randn(node.shape, rp.seed);
       const n = sizeOf(node.shape);
       const vals = new Array(n);
@@ -220,7 +220,7 @@ function executeCreationOp(
     }
 
     case "bernoulli": {
-      const bp = getPayload<{ seed: number; p: number }>(node)!;
+      const bp = requirePayload<{ seed: number; p: number }>(node);
       if (backend.ops.bernoulli)
         return backend.ops.bernoulli(node.shape, bp.p, bp.seed);
       const n = sizeOf(node.shape);
@@ -342,18 +342,18 @@ function executeShapeOp(
     case "contiguous":
       return backend.ops.contiguous(backendInputs[0]);
     case "narrow": {
-      const p = getPayload<{ dim: number; start: number; length: number }>(
+      const p = requirePayload<{ dim: number; start: number; length: number }>(
         node,
-      )!;
+      );
       assertOpSupported("narrow", backend.ops.narrow);
       return backend.ops.narrow(backendInputs[0], p.dim, p.start, p.length);
     }
     case "narrowBackward": {
-      const p = getPayload<{
+      const p = requirePayload<{
         dim: number;
         start: number;
         originalLength: number;
-      }>(node)!;
+      }>(node);
       assertOpSupported("narrowBackward", backend.ops.narrowBackward);
       return backend.ops.narrowBackward(
         backendInputs[0],
@@ -403,14 +403,14 @@ function executeReductionOp(
       assertOpSupported("argmax", backend.ops.argmax);
       return backend.ops.argmax(
         backendInputs[0],
-        getPayload<{ dim: number; keepdim?: boolean }>(node)!,
+        requirePayload<{ dim: number; keepdim?: boolean }>(node),
       );
     }
     case "argmin": {
       assertOpSupported("argmin", backend.ops.argmin);
       return backend.ops.argmin(
         backendInputs[0],
-        getPayload<{ dim: number; keepdim?: boolean }>(node)!,
+        requirePayload<{ dim: number; keepdim?: boolean }>(node),
       );
     }
     case "conv2d": {
@@ -497,7 +497,7 @@ function executeMutationOp(
     }
     case "adamStep": {
       assertOpSupported("adamStep", backend.ops.adamStep);
-      const payload = getPayload<AdamStepConfig>(node)!;
+      const payload = requirePayload<AdamStepConfig>(node);
       return (async () => {
         const adamResult = await backend.ops.adamStep?.(
           backendInputs[0],
@@ -517,9 +517,10 @@ function executeMutationOp(
       })();
     }
     case "unscaleGrad": {
-      const payload = getPayload<{ invScale: number; infFlagBuffer: unknown }>(
-        node,
-      )!;
+      const payload = requirePayload<{
+        invScale: number;
+        infFlagBuffer: unknown;
+      }>(node);
       assertOpSupported("unscaleGrad", backend.ops.unscaleGrad);
       return backend.ops.unscaleGrad(
         backendInputs[0],
@@ -539,7 +540,7 @@ function executeFusedOp(
 ): BackendTensor | Promise<BackendTensor> {
   switch (node.op) {
     case "fusedAttentionForward": {
-      const payload = getPayload<FusedAttentionConfig>(node)!;
+      const payload = requirePayload<FusedAttentionConfig>(node);
       assertOpSupported(
         "fusedAttentionForward",
         backend.ops.fusedAttentionForward,
@@ -556,7 +557,7 @@ function executeFusedOp(
     case "extractAttentionLogsumexp":
       return extractSideOutput(node, "attnLogsumexp");
     case "fusedAttentionBackward": {
-      const payload = getPayload<FusedAttentionConfig>(node)!;
+      const payload = requirePayload<FusedAttentionConfig>(node);
       assertOpSupported(
         "fusedAttentionBackward",
         backend.ops.fusedAttentionBackward,
@@ -579,7 +580,7 @@ function executeFusedOp(
     case "extractAttentionDV":
       return extractSideOutput(node, "attnBwdDV");
     case "fusedCrossEntropyForward": {
-      const payload = getPayload<FusedCrossEntropyConfig>(node)!;
+      const payload = requirePayload<FusedCrossEntropyConfig>(node);
       assertOpSupported(
         "fusedCrossEntropyForward",
         backend.ops.fusedCrossEntropyForward,
@@ -591,7 +592,7 @@ function executeFusedOp(
       );
     }
     case "fusedCrossEntropyBackward": {
-      const payload = getPayload<FusedCrossEntropyConfig>(node)!;
+      const payload = requirePayload<FusedCrossEntropyConfig>(node);
       assertOpSupported(
         "fusedCrossEntropyBackward",
         backend.ops.fusedCrossEntropyBackward,
@@ -604,7 +605,7 @@ function executeFusedOp(
       );
     }
     case "fusedLayerNormForward": {
-      const payload = getPayload<FusedLayerNormConfig>(node)!;
+      const payload = requirePayload<FusedLayerNormConfig>(node);
       assertOpSupported(
         "fusedLayerNormForward",
         backend.ops.fusedLayerNormForward,
@@ -617,7 +618,7 @@ function executeFusedOp(
       );
     }
     case "fusedLayerNormBackwardGradX": {
-      const payload = getPayload<FusedLayerNormConfig>(node)!;
+      const payload = requirePayload<FusedLayerNormConfig>(node);
       assertOpSupported(
         "fusedLayerNormBackwardGradX",
         backend.ops.fusedLayerNormBackwardGradX,
@@ -630,7 +631,7 @@ function executeFusedOp(
       );
     }
     case "fusedLayerNormBackwardGradWeightBias": {
-      const payload = getPayload<FusedLayerNormConfig>(node)!;
+      const payload = requirePayload<FusedLayerNormConfig>(node);
       assertOpSupported(
         "fusedLayerNormBackwardGradWeightBias",
         backend.ops.fusedLayerNormBackwardGradWeightBias,
@@ -648,7 +649,7 @@ function executeFusedOp(
     case "extractLnBwdGradBias":
       return extractRawSideOutput(node, "lnBwdGradBias");
     case "fusedRMSNormForward": {
-      const payload = getPayload<FusedRMSNormConfig>(node)!;
+      const payload = requirePayload<FusedRMSNormConfig>(node);
       assertOpSupported("fusedRMSNormForward", backend.ops.fusedRMSNormForward);
       return backend.ops.fusedRMSNormForward(
         backendInputs[0],
@@ -657,7 +658,7 @@ function executeFusedOp(
       );
     }
     case "fusedRMSNormBackwardGradX": {
-      const payload = getPayload<FusedRMSNormConfig>(node)!;
+      const payload = requirePayload<FusedRMSNormConfig>(node);
       assertOpSupported(
         "fusedRMSNormBackwardGradX",
         backend.ops.fusedRMSNormBackwardGradX,
@@ -670,7 +671,7 @@ function executeFusedOp(
       );
     }
     case "fusedRMSNormBackwardGradWeight": {
-      const payload = getPayload<FusedRMSNormConfig>(node)!;
+      const payload = requirePayload<FusedRMSNormConfig>(node);
       assertOpSupported(
         "fusedRMSNormBackwardGradWeight",
         backend.ops.fusedRMSNormBackwardGradWeight,

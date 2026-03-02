@@ -246,7 +246,8 @@ function relocateEpilogueNodes(
     const chain = matmulEpilogueChains.get(n.id);
     if (chain) {
       for (const id of chain) {
-        relocated.push(nodeById.get(id)!);
+        const chainNode = nodeById.get(id);
+        if (chainNode) relocated.push(chainNode);
       }
     }
   }

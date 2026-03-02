@@ -115,7 +115,7 @@ class StorageTracker {
     const neededByViews = new Set<number>();
     const worklist = [...this.externallyReachable];
     while (worklist.length > 0) {
-      const id = worklist.pop()!;
+      const id = worklist.pop() as number;
       const storage = this.allStorages.get(id);
       if (
         storage?.baseStorageId !== undefined &&
@@ -179,7 +179,7 @@ class StorageTracker {
     const neededByViews = new Set<number>();
     const worklist = [...this.externallyReachable];
     while (worklist.length > 0) {
-      const id = worklist.pop()!;
+      const id = worklist.pop() as number;
       const storage = this.allStorages.get(id);
       if (
         storage?.baseStorageId !== undefined &&

@@ -16,6 +16,7 @@ import {
   type TileKernelSpec,
   webgpuBackend,
 } from "../../src/backend/webgpu";
+import type { WebGPUTensor } from "../../src/backend/webgpu/gpu-types";
 import { cpuOnly } from "../helpers/webgpu";
 
 describe("compileTileKernel", () => {
@@ -194,9 +195,9 @@ describe.skipIf(cpuOnly)("createTileKernelDispatcher", () => {
 
     dispatcher.dispatch(
       {
-        a: (aTensor as any).buffer,
-        b: (bTensor as any).buffer,
-        out: (outTensor as any).buffer,
+        a: (aTensor as WebGPUTensor).buffer,
+        b: (bTensor as WebGPUTensor).buffer,
+        out: (outTensor as WebGPUTensor).buffer,
       },
       { size: N },
     );

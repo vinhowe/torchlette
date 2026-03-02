@@ -102,11 +102,14 @@ describe("Checkpoint Parity with PyTorch", () => {
       };
 
       const [oracleResult] = await runTorchOracleFullBatch([oracleCase]);
+      const grads = oracleResult.grads;
+      expect(grads).toBeDefined();
+      if (!grads) throw new Error("grads is undefined");
 
       // Compare gradients
-      assertClose(torchletteGrads.x, oracleResult.grads?.[0]!);
-      assertClose(torchletteGrads.w, oracleResult.grads?.[1]!);
-      assertClose(torchletteGrads.b, oracleResult.grads?.[2]!);
+      assertClose(torchletteGrads.x, grads[0]);
+      assertClose(torchletteGrads.w, grads[1]);
+      assertClose(torchletteGrads.b, grads[2]);
     },
   );
 
@@ -211,26 +214,14 @@ describe("AMP Parity with PyTorch", () => {
     };
 
     const [oracleResult] = await runTorchOracleFullBatch([oracleCase]);
+    const grads = oracleResult.grads;
+    expect(grads).toBeDefined();
+    if (!grads) throw new Error("grads is undefined");
 
     // Compare gradients (with looser tolerance for AMP)
-    assertClose(
-      torchletteGrads.x,
-      oracleResult.grads?.[0]!,
-      AMP_ATOL,
-      AMP_RTOL,
-    );
-    assertClose(
-      torchletteGrads.w,
-      oracleResult.grads?.[1]!,
-      AMP_ATOL,
-      AMP_RTOL,
-    );
-    assertClose(
-      torchletteGrads.b,
-      oracleResult.grads?.[2]!,
-      AMP_ATOL,
-      AMP_RTOL,
-    );
+    assertClose(torchletteGrads.x, grads[0], AMP_ATOL, AMP_RTOL);
+    assertClose(torchletteGrads.w, grads[1], AMP_ATOL, AMP_RTOL);
+    assertClose(torchletteGrads.b, grads[2], AMP_ATOL, AMP_RTOL);
   });
 });
 
@@ -285,26 +276,14 @@ describe("Checkpoint + AMP Combined Parity", () => {
     };
 
     const [oracleResult] = await runTorchOracleFullBatch([oracleCase]);
+    const grads = oracleResult.grads;
+    expect(grads).toBeDefined();
+    if (!grads) throw new Error("grads is undefined");
 
     // Compare gradients (with looser tolerance for AMP)
-    assertClose(
-      torchletteGrads.x,
-      oracleResult.grads?.[0]!,
-      AMP_ATOL,
-      AMP_RTOL,
-    );
-    assertClose(
-      torchletteGrads.w,
-      oracleResult.grads?.[1]!,
-      AMP_ATOL,
-      AMP_RTOL,
-    );
-    assertClose(
-      torchletteGrads.b,
-      oracleResult.grads?.[2]!,
-      AMP_ATOL,
-      AMP_RTOL,
-    );
+    assertClose(torchletteGrads.x, grads[0], AMP_ATOL, AMP_RTOL);
+    assertClose(torchletteGrads.w, grads[1], AMP_ATOL, AMP_RTOL);
+    assertClose(torchletteGrads.b, grads[2], AMP_ATOL, AMP_RTOL);
   });
 });
 
@@ -372,27 +351,30 @@ describe("Multi-layer MLP Parity", () => {
     };
 
     const [oracleResult] = await runTorchOracleFullBatch([oracleCase]);
+    const grads = oracleResult.grads;
+    expect(grads).toBeDefined();
+    if (!grads) throw new Error("grads is undefined");
 
     // Compare x gradient
     const xGrad = { shape: x.grad?.shape, values: await x.grad?.cpu() };
-    assertClose(xGrad, oracleResult.grads?.[0]!);
+    assertClose(xGrad, grads[0]);
 
     // Compare w1, b1
     const w1Grad = { shape: w1.grad?.shape, values: await w1.grad?.cpu() };
     const b1Grad = { shape: b1.grad?.shape, values: await b1.grad?.cpu() };
-    assertClose(w1Grad, oracleResult.grads?.[1]!);
-    assertClose(b1Grad, oracleResult.grads?.[2]!);
+    assertClose(w1Grad, grads[1]);
+    assertClose(b1Grad, grads[2]);
 
     // Compare w2, b2
     const w2Grad = { shape: w2.grad?.shape, values: await w2.grad?.cpu() };
     const b2Grad = { shape: b2.grad?.shape, values: await b2.grad?.cpu() };
-    assertClose(w2Grad, oracleResult.grads?.[3]!);
-    assertClose(b2Grad, oracleResult.grads?.[4]!);
+    assertClose(w2Grad, grads[3]);
+    assertClose(b2Grad, grads[4]);
 
     // Compare w3, b3
     const w3Grad = { shape: w3.grad?.shape, values: await w3.grad?.cpu() };
     const b3Grad = { shape: b3.grad?.shape, values: await b3.grad?.cpu() };
-    assertClose(w3Grad, oracleResult.grads?.[5]!);
-    assertClose(b3Grad, oracleResult.grads?.[6]!);
+    assertClose(w3Grad, grads[5]);
+    assertClose(b3Grad, grads[6]);
   });
 });

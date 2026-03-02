@@ -11,6 +11,7 @@
 import { F32_NEG_MAX } from "./shape-utils";
 import type {
   BlockAllocStmt,
+  BlockBinaryOp,
   BlockBinaryStmt,
   BlockDotStmt,
   BlockLoadStmt,
@@ -86,9 +87,14 @@ function collectBlockDots(stmts: Statement[]): BlockDotStmt[] {
   function scan(ss: Statement[]) {
     for (const s of ss) {
       if (s.kind === "blockDot") dots.push(s);
-      if ("body" in s && Array.isArray((s as any).body)) scan((s as any).body);
-      if ("elseBody" in s && Array.isArray((s as any).elseBody))
-        scan((s as any).elseBody);
+      if (
+        s.kind === "forRange" ||
+        s.kind === "forStride" ||
+        s.kind === "if" ||
+        s.kind === "ifElse"
+      )
+        scan(s.body);
+      if (s.kind === "ifElse") scan(s.elseBody);
     }
   }
   scan(stmts);
@@ -868,16 +874,9 @@ function lowerBlockLoadThread(
   stmt: BlockLoadStmt,
   spec: TileKernelSpec,
 ): Statement[] {
-  const {
-    binding,
-    name,
-    rows,
-    cols,
-    elemType,
-    threadBase,
-    threadStride,
-    guard,
-  } = stmt;
+  const { binding, name, rows, cols, elemType, guard } = stmt;
+  const threadBase = stmt.threadBase as IRNode;
+  const threadStride = stmt.threadStride as IRNode | undefined;
   const pCols = getPhysCols(name, cols);
   const size = rows * pCols;
   const isDistributed = _activeTPR > 1 && pCols !== cols;
@@ -899,8 +898,8 @@ function lowerBlockLoadThread(
 
   // For distributed blocks: shift base by _sub_idx * physCols
   const effectiveBase = isDistributed
-    ? binOp("add", threadBase!, binOp("mul", ref("_sub_idx"), cU32(pCols)))
-    : threadBase!;
+    ? binOp("add", threadBase, binOp("mul", ref("_sub_idx"), cU32(pCols)))
+    : threadBase;
 
   if (rows === 1) {
     if (useVec4) {
@@ -966,11 +965,8 @@ function lowerBlockLoadThread(
     const dVar = freshVar("d");
     const innerBody: Statement[] = [];
 
-    const rowBase = binOp(
-      "add",
-      threadBase!,
-      binOp("mul", ref(rVar), threadStride!),
-    );
+    const stride = threadStride as IRNode;
+    const rowBase = binOp("add", threadBase, binOp("mul", ref(rVar), stride));
     // For distributed: each row also offset by _sub_idx * physCols
     const effRowBase = isDistributed
       ? binOp("add", rowBase, binOp("mul", ref("_sub_idx"), cU32(pCols)))
@@ -2133,7 +2129,7 @@ function lowerBlockBinary(stmt: BlockBinaryStmt): Statement[] {
 }
 
 /** Emit a binary operation IR node. */
-function emitBinaryOp(op: string, lhs: IRNode, rhs: IRNode): IRNode {
+function emitBinaryOp(op: BlockBinaryOp, lhs: IRNode, rhs: IRNode): IRNode {
   if (op === "copy") return rhs;
-  return binOp(op as any, lhs, rhs, "f32");
+  return binOp(op, lhs, rhs, "f32");
 }

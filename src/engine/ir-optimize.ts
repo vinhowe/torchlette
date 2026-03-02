@@ -182,7 +182,7 @@ export function performCSE(graph: IRGraph): CSEResult {
 
     if (cseKeyToNodeId.has(key)) {
       // This is a duplicate - map to existing node
-      const existingId = cseKeyToNodeId.get(key)!;
+      const existingId = cseKeyToNodeId.get(key) as number;
       nodeIdToCSEId.set(node.id, existingId);
       eliminatedNodes.push(node.id);
     } else {
