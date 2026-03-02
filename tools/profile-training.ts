@@ -37,18 +37,13 @@ import {
   getGPUMemoryStats,
   getBufferPoolStats,
   getBufferPoolDetailedStats,
-  resetBufferPoolDetailedStats,
   isF16Supported,
-  getBindGroupCacheStats,
-  resetBindGroupCacheStats,
-  getBindGroupCacheMissLog,
-  getArenaResolveStats,
-  startPipelineRecording,
-  stopPipelineRecording,
-  warmupFromRegistry,
-  serializeRegistry,
-  deserializeRegistry,
 } from "../src/backend/webgpu";
+import { getBufferPoolDetailedStats, resetBufferPoolDetailedStats } from "../src/backend/webgpu/buffer-pool";
+import { getBindGroupCacheStats, resetBindGroupCacheStats, getBindGroupCacheMissLog } from "../src/backend/webgpu/bind-group-cache";
+import { getArenaResolveStats } from "../src/backend/webgpu/buffer-arena";
+import { startPipelineRecording, stopPipelineRecording, serializeRegistry, deserializeRegistry } from "../src/backend/webgpu/pipeline-warmup";
+import { warmupFromRegistry } from "../src/backend/webgpu/gpu-context";
 import { getAndResetFlowCounters, getGPUAllocationHistogram } from "../src/backend/webgpu/memory-tracker";
 import { storageTracker } from "../src/engine/lazy";
 import { GPT2, type GPT2Config, DISTILGPT2_CONFIG, GPT2_SMALL_CONFIG } from "../examples/gpt2/model";
