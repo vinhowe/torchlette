@@ -1,5 +1,5 @@
 import type { StorageHandle } from "./lazy-types";
-import { findDeadTensorsAtStep, type TensorLifetime } from "./memory-planning";
+import { findDeadTensorsAtStep, type TensorLifetime } from "./lifetime-analysis";
 import { getNextStorageId } from "./node-factory";
 
 /**

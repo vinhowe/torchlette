@@ -46,11 +46,6 @@ import {
 import { computePlanFingerprint } from "../engine/fusion-detect";
 import { isDataSourceOp } from "../engine/lowered-plan";
 import { OP_DTYPE_RULES, promoteDtype } from "../engine/dtype-rules";
-import {
-  executeWithMemoryPlanning,
-  getMemoryPlannerStats,
-  type MemoryPlanningStats,
-} from "../engine/memory-planned-executor";
 import { type BaseId, createBaseId, materializePendingTensors, Tensor } from "./tensor";
 import { broadcastShapes } from "../core/shape";
 import {
@@ -97,7 +92,6 @@ export class TidyDispatchMode implements DispatchMode {
 }
 
 export interface RuntimeEngineOptions {
-  enableMemoryPlanning?: boolean;
   enableDonation?: boolean;
   trackStats?: boolean;
   enableFusion?: boolean;
@@ -166,10 +160,8 @@ function castRef(input: OpInput, toDtype: DType): OpInput {
 
 export class RuntimeEngine {
   private defaultDevice: DeviceKind | null = null;
-  private memoryPlanningEnabled = false;
   private donationEnabled = true;
   private trackStats = false;
-  private lastStats: MemoryPlanningStats | null = null;
   private fusionEnabled = false;
   private vectorizationEnabled = false;
   private lastFusionStats: OptimizedExecutionStats | null = null;
@@ -189,9 +181,6 @@ export class RuntimeEngine {
   constructor(backendName?: DeviceKind, options?: RuntimeEngineOptions) {
     if (backendName) {
       this.defaultDevice = backendName;
-    }
-    if (options?.enableMemoryPlanning) {
-      this.memoryPlanningEnabled = true;
     }
     if (options?.enableDonation !== undefined) {
       this.donationEnabled = options.enableDonation;
@@ -216,33 +205,6 @@ export class RuntimeEngine {
     }
   }
 
-  /**
-   * Enable or disable memory planning.
-   */
-  setMemoryPlanning(enabled: boolean): void {
-    this.memoryPlanningEnabled = enabled;
-  }
-
-  /**
-   * Check if memory planning is enabled.
-   */
-  isMemoryPlanningEnabled(): boolean {
-    return this.memoryPlanningEnabled;
-  }
-
-  /**
-   * Get statistics from the last memory-planned execution.
-   */
-  getLastMemoryStats(): MemoryPlanningStats | null {
-    return this.lastStats;
-  }
-
-  /**
-   * Get overall memory planner statistics.
-   */
-  getMemoryPlannerStats(): ReturnType<typeof getMemoryPlannerStats> {
-    return getMemoryPlannerStats();
-  }
 
   /**
    * Enable or disable fusion optimization (§15).
@@ -527,15 +489,6 @@ export class RuntimeEngine {
       result = optimizedResult.result;
       this.lastFusionStats = optimizedResult.stats;
       this.accumulateFusionStats(optimizedResult.stats);
-    } else if (this.memoryPlanningEnabled) {
-      // Use memory-planned execution (for non-fusion or CPU)
-      const memResult = await executeWithMemoryPlanning(plan, backend, {
-        enableDonation: this.donationEnabled,
-        trackStats: this.trackStats,
-        enableEarlyRelease: this.earlyReleaseEnabled,
-      });
-      result = memResult.result;
-      this.lastStats = memResult.stats;
     } else if (this.trueSegmentationEnabled && tensor.device === "webgpu") {
       // Use true segmented execution with GPU synchronization
       // This provides actual memory savings by waiting for GPU completion

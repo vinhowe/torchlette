@@ -15,7 +15,7 @@ import {
 import { bufferPool } from "./buffer-pool";
 import { arenaBufferSet } from "./webgpu-state";
 import { profileApiCall } from "./profiler";
-import { getSizeClass, getSizeForClass } from "../../engine/memory-planning";
+import { getSizeClass, getSizeForClass } from "../../engine/lifetime-analysis";
 import { gpuMemoryTracker } from "./memory-tracker";
 
 function toArrayUnsupported(): number[] {

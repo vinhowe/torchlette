@@ -184,27 +184,15 @@ export type { Token, TokenId, TokenKind } from "./tokens";
 export type { TraceEvent } from "./trace";
 export { TraceRecorder } from "./trace";
 export type {
-  BufferId,
-  BufferInfo,
-  DonationDecision,
-  InFlightPlan,
-  MemoryPlan,
-  PlanId,
-  SizeClass,
   TensorLifetime,
-} from "./memory-planning";
+} from "./lifetime-analysis";
 export {
   analyzeLifetimes,
-  BufferPool,
-  canDonateBuffer,
   computeBufferSize,
-  findDeadTensors,
-  findDonationOpportunities,
+  findDeadTensorsAtStep,
   getSizeClass,
   getSizeForClass,
-  InFlightPlanManager,
-  MemoryPlanner,
-} from "./memory-planning";
+} from "./lifetime-analysis";
 export type {
   CrossDeviceAnalysis,
   TransferPath,
@@ -251,17 +239,3 @@ export {
   getAMPStats,
   isAMPTransformed,
 } from "./amp-ir-transform";
-export type {
-  MemoryPlanningStats,
-  MemoryPlannedResult,
-} from "./memory-planned-executor";
-export {
-  createMemoryPlanForExecution,
-  executeWithMemoryPlanning,
-  getMemoryPlanner,
-  getMemoryPlannerStats,
-  resetMemoryPlanner,
-  setMemoryLimit,
-  getMemoryLimit,
-  MemoryLimitExceededError,
-} from "./memory-planned-executor";

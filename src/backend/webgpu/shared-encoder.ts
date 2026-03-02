@@ -25,7 +25,7 @@ import {
 } from "./webgpu-state";
 import { bufferPool, awaitDeferredFence } from "./buffer-pool";
 import { resolveGpuTimestamps, profileApiCall } from "./profiler";
-import { getSizeClass } from "../../engine/memory-planning";
+import { getSizeClass } from "../../engine/lifetime-analysis";
 
 import { resetDispatchSequence } from "./bind-group-cache";
 import { prePinOutputBuffers, pinnedOutputBuffers } from "./buffer-arena";

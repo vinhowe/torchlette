@@ -18,7 +18,7 @@ import {
 } from "./fusion-detect";
 import {
   type TensorLifetime,
-} from "./memory-planning";
+} from "./lifetime-analysis";
 import {
   LoweredPlanBuilder,
   isDataSourceOp,
