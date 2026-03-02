@@ -1234,40 +1234,18 @@ export class Torchlette {
   // In-place operations (§4.3-4.4)
   // ============================================================================
 
-  copy_(dst: Tensor, src: Tensor): Tensor {
-    this._assertUsable(dst, src);
-    this.runtime.copy_(dst._unwrap(), src._unwrap());
+  private _inPlace(dst: Tensor, fn: () => void, ...extra: Tensor[]): Tensor {
+    this._assertUsable(dst, ...extra);
+    fn();
     this._debug_baseCommit(dst.baseId, this.engine.nextMutId());
     return dst;
   }
 
-  add_(dst: Tensor, src: Tensor): Tensor {
-    this._assertUsable(dst, src);
-    this.runtime.add_(dst._unwrap(), src._unwrap());
-    this._debug_baseCommit(dst.baseId, this.engine.nextMutId());
-    return dst;
-  }
-
-  zero_(dst: Tensor): Tensor {
-    this._assertUsable(dst);
-    this.runtime.zero_(dst._unwrap());
-    this._debug_baseCommit(dst.baseId, this.engine.nextMutId());
-    return dst;
-  }
-
-  fill_(dst: Tensor, value: number): Tensor {
-    this._assertUsable(dst);
-    this.runtime.fill_(dst._unwrap(), value);
-    this._debug_baseCommit(dst.baseId, this.engine.nextMutId());
-    return dst;
-  }
-
-  mul_(dst: Tensor, value: number): Tensor {
-    this._assertUsable(dst);
-    this.runtime.mul_(dst._unwrap(), value);
-    this._debug_baseCommit(dst.baseId, this.engine.nextMutId());
-    return dst;
-  }
+  copy_(dst: Tensor, src: Tensor): Tensor { return this._inPlace(dst, () => this.runtime.copy_(dst._unwrap(), src._unwrap()), src); }
+  add_(dst: Tensor, src: Tensor): Tensor { return this._inPlace(dst, () => this.runtime.add_(dst._unwrap(), src._unwrap()), src); }
+  zero_(dst: Tensor): Tensor { return this._inPlace(dst, () => this.runtime.zero_(dst._unwrap())); }
+  fill_(dst: Tensor, value: number): Tensor { return this._inPlace(dst, () => this.runtime.fill_(dst._unwrap(), value)); }
+  mul_(dst: Tensor, value: number): Tensor { return this._inPlace(dst, () => this.runtime.mul_(dst._unwrap(), value)); }
 
   // ============================================================================
   // Gather/scatter/where
@@ -1329,14 +1307,7 @@ export class Torchlette {
   // View/reshape/transpose ops
   // ============================================================================
 
-  view(a: Tensor, shape: number[]): Tensor {
-    this._assertUsable(a);
-    const aShape = a.shape;
-    const inner = this.runtime.view(a._unwrap(), shape);
-    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => [
-      this.runtime.reshape(grad, aShape),
-    ]);
-  }
+  view(a: Tensor, shape: number[]): Tensor { return this.reshape(a, shape); }
 
   reshape(a: Tensor, shape: number[]): Tensor {
     this._assertUsable(a);
