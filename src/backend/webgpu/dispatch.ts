@@ -14,7 +14,6 @@ import {
 } from "./shape-utils";
 import type { DType } from "../types";
 import type { GPUBuffer, GPUComputePipeline, GPUBindGroup, WebGPUContext, WebGPUTensor } from "./gpu-types";
-import { GPUBufferUsage } from "./gpu-types";
 import { recordPipeline, getWarmupPipeline } from "./pipeline-warmup";
 import { requireContext, isF16Supported } from "./gpu-context";
 import { destroyCopy } from "./buffer-pool";
