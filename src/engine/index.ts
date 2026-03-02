@@ -61,37 +61,6 @@ export {
   serializeCacheKey,
 } from "./compile-cache";
 export type {
-  AccessTarget,
-  AliasGroup,
-  ExtendedCompiledCacheKey,
-  ExternalizeRequest,
-  FunctionalizationResult,
-  FunctionalizedMutation,
-  NullStateSentinel,
-  RegionExitCommit,
-  RegionExitPlan,
-  SSAWriteback,
-  StateAccess,
-  StateIfaceSig,
-  StateSlotAliasPattern,
-} from "./compiled-region";
-export {
-  aliasGroupsKey,
-  aliasPatternKey,
-  analyzeExternalizeNeeds,
-  analyzeRegionExit,
-  buildStateIfaceSig,
-  computeAliasGroups,
-  computeStateSlotAliasPattern,
-  generateExtendedCacheKey,
-  getNullStateSentinel,
-  isInPlaceMutation,
-  resetNullStateSentinels,
-  serializeExtendedCacheKey,
-  stateIfaceSigKey,
-  toOutOfPlaceOp,
-} from "./compiled-region";
-export type {
   BaseBindingSnapshot,
   BaseDebugState,
   BaseStateInfo,
