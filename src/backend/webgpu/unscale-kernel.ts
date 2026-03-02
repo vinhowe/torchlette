@@ -251,7 +251,7 @@ export async function readInfFlag(infFlagBuffer: GPUBuffer): Promise<number> {
 /**
  * Destroy the persistent inf flag buffer (cleanup on WebGPU teardown).
  */
-export function destroyPersistentInfFlagBuffer(): void {
+function destroyPersistentInfFlagBuffer(): void {
   if (persistentInfFlagBuffer) {
     persistentInfFlagBuffer.destroy();
     persistentInfFlagBuffer = null;

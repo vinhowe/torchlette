@@ -1000,7 +1000,7 @@ function insertBarriersForLoop(body: Statement[]): Statement[] {
  * Validate that shared memory accesses have proper barriers.
  * Returns warning strings for missing barriers (diagnostic, doesn't modify code).
  */
-export function validateBarriers(stmts: Statement[]): string[] {
+function validateBarriers(stmts: Statement[]): string[] {
   const warnings: string[] = [];
   const dirtyArrays = new Set<string>();
 

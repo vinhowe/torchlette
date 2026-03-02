@@ -1,7 +1,6 @@
 /**
  * Fused kernel wrappers and I/O ops: adamStep, unscaleGrad, fusedCrossEntropy,
  * fusedLayerNorm, fusedAttention, read, waitForGPU, mulScalarInPlace.
- * Extracted from index.ts — purely structural refactoring.
  */
 import type { BackendTensor } from "../../types";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
@@ -72,8 +71,6 @@ export async function adamStep(
     }
     profileSubOpEnd("adam.f16evict", _st);
 
-    const bpe = (t: WebGPUTensor) => dtypeBytes(t.dtype);
-
     // Flush shared encoder before dispatching the in-place Adam kernel.
     // The forward/backward pass may have used param/m/v buffers as read-only
     // inputs in compute passes. The Adam kernel binds them as read_write,
@@ -97,7 +94,7 @@ export async function adamStep(
     let mBuf = mT.buffer;
     let vBuf = vT.buffer;
     const gradBuf = gradT.buffer;
-    const bufSize = gradT.size * bpe(gradT);
+    const bufSize = gradT.size * dtypeBytes(gradT.dtype);
     const copyToFresh = (src: GPUBuffer): GPUBuffer => {
       const dst = allocateOutputBuffer(bufSize);
       // Use the shared encoder for the copy so it's ordered before the
@@ -153,10 +150,7 @@ export async function adamStep(
     }
 
     // Destroy contiguous copy for grad only (read-only input, safe to free).
-    if (gradT !== asGPUTensor(grad)) {
-      bufferPool.decRef(gradT.buffer);
-      bufferPool.deferredDestroy(gradT.buffer, gradT.size * bpe(gradT));
-    }
+    if (gradT !== asGPUTensor(grad)) destroyCopy(gradT);
 
     // Cache the f16 param buffer (keyed by the param buffer, same as before)
     if (result.paramF16Buffer) {
@@ -207,10 +201,7 @@ export function unscaleGrad(
     infFlagBuffer as GPUBuffer,
   );
   // Destroy contiguous copy if one was created (deferred for GPU fence)
-  if (gradT !== asGPUTensor(grad)) {
-    bufferPool.decRef(gradT.buffer);
-    bufferPool.deferredDestroy(gradT.buffer, gradT.size * dtypeBytes(gradT.dtype));
-  }
+  if (gradT !== asGPUTensor(grad)) destroyCopy(gradT);
   return createTensor(gradT.shape, result.gradOutBuffer);
 }
 
@@ -283,10 +274,7 @@ export function fusedLayerNormForward(
   if (xT !== x) destroyCopy(xT);
   if (weightT !== weight) destroyCopy(weightT);
   if (biasT !== bias) destroyCopy(biasT);
-  const outShape: number[] = [];
-  // Reconstruct shape: [...batch_dims, featureDim] = same as input
-  for (let i = 0; i < xT.shape.length; i++) outShape.push(xT.shape[i]);
-  return createTensor(outShape, outBuf, undefined, 0, "f32");
+  return createTensor(xT.shape.slice(), outBuf, undefined, 0, "f32");
 }
 
 export function fusedLayerNormBackwardGradX(
@@ -309,9 +297,7 @@ export function fusedLayerNormBackwardGradX(
   if (xT !== x) destroyCopy(xT);
   if (weightT !== weight) destroyCopy(weightT);
 
-  const gradXShape: number[] = [];
-  for (let i = 0; i < xT.shape.length; i++) gradXShape.push(xT.shape[i]);
-  return createTensor(gradXShape, gradXBuf, undefined, 0, "f32");
+  return createTensor(xT.shape.slice(), gradXBuf, undefined, 0, "f32");
 }
 
 export function fusedLayerNormBackwardGradWeightBias(
@@ -354,9 +340,7 @@ export function fusedRMSNormForward(
   );
   if (xT !== x) destroyCopy(xT);
   if (weightT !== weight) destroyCopy(weightT);
-  const outShape: number[] = [];
-  for (let i = 0; i < xT.shape.length; i++) outShape.push(xT.shape[i]);
-  return createTensor(outShape, outBuf, undefined, 0, "f32");
+  return createTensor(xT.shape.slice(), outBuf, undefined, 0, "f32");
 }
 
 export function fusedRMSNormBackwardGradX(
@@ -375,9 +359,7 @@ export function fusedRMSNormBackwardGradX(
   if (goT !== gradOutput) destroyCopy(goT);
   if (xT !== x) destroyCopy(xT);
   if (wT !== weight) destroyCopy(wT);
-  const outShape: number[] = [];
-  for (let i = 0; i < xT.shape.length; i++) outShape.push(xT.shape[i]);
-  return createTensor(outShape, outBuf, undefined, 0, "f32");
+  return createTensor(xT.shape.slice(), outBuf, undefined, 0, "f32");
 }
 
 export function fusedRMSNormBackwardGradWeight(

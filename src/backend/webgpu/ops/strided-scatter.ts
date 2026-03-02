@@ -1,6 +1,5 @@
 /**
  * Strided scatter ops: stridedScatterCopy (+ chunked), stridedScatterAdd (+ chunked).
- * Extracted from index.ts — purely structural refactoring.
  */
 import type { BackendTensor } from "../../types";
 import type { WebGPUTensor } from "../gpu-types";
@@ -9,7 +8,7 @@ import { sizeOf, WORKGROUP_SIZE, compute2DDispatch } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { createTensor } from "../tensor";
-import { bufferPool } from "../buffer-pool";
+import { destroyCopy } from "../buffer-pool";
 import { resolveOutputBuffer } from "../buffer-arena";
 import {
   cachedCreateBindGroup, createParamsBuffer, releaseParamsBuffer,
@@ -144,10 +143,7 @@ function stridedScatterCopyDirect(
 
   releaseParamsBuffer(paramsBuffer);
 
-  if (contiguousBase !== baseTensor) {
-    bufferPool.decRef(contiguousBase.buffer);
-    bufferPool.deferredDestroy(contiguousBase.buffer, contiguousBase.size * 4);
-  }
+  if (contiguousBase !== baseTensor) destroyCopy(contiguousBase);
 
   return createTensor(baseTensor.shape, outBuffer);
 }
@@ -309,10 +305,7 @@ function stridedScatterAddDirect(
 
   releaseParamsBuffer(paramsBuffer);
 
-  if (contiguousBase !== baseTensor) {
-    bufferPool.decRef(contiguousBase.buffer);
-    bufferPool.deferredDestroy(contiguousBase.buffer, contiguousBase.size * 4);
-  }
+  if (contiguousBase !== baseTensor) destroyCopy(contiguousBase);
 
   return createTensor(baseTensor.shape, outBuffer);
 }

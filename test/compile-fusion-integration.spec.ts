@@ -30,11 +30,7 @@ import {
   segmentPlanForExecution,
   isFusibleOp,
 } from "../src/engine/fusion-detect";
-import {
-  lazyPlanToIR,
-  detectFusionGroups as detectFusionGroupsIR,
-  isFusibleElementwise,
-} from "../src/engine/lazy-to-ir";
+
 import { performCSE, performDCE, optimizeIR } from "../src/engine/ir-optimize";
 import type { IRGraph, IRNode } from "../src/engine/ir";
 import { getBackend } from "../src/backend/registry";
@@ -306,55 +302,6 @@ describe("§15 IR Optimization", () => {
       expect(result.stats.cseEliminated).toBe(1);
       expect(result.stats.dceEliminated).toBe(1);
       expect(result.stats.finalNodeCount).toBe(2);
-    });
-  });
-});
-
-describe("§15 Lazy Plan to IR Conversion", () => {
-  beforeEach(() => {
-    resetNodeIdCounter();
-    resetStorageIdCounter();
-  });
-
-  describe("lazyPlanToIR", () => {
-    it("converts lazy plan nodes to IR graph", () => {
-      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const b = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [5, 6, 7, 8] });
-      const add = createLazyIRNode("add", [createPendingRef(a), createPendingRef(b)], [4], "f32", "cpu");
-
-      const plan = { nodes: [a, b, add] };
-      const result = lazyPlanToIR(plan);
-
-      expect(result.graph.nodes.length).toBe(3);
-      expect(result.outputNodeIds).toEqual([add.id]);
-    });
-
-    it("detects fusion groups in converted IR", () => {
-      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const add = createLazyIRNode("add", [createPendingRef(a), createPendingRef(a)], [4], "f32", "cpu");
-      const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(a)], [4], "f32", "cpu");
-
-      const plan = { nodes: [a, add, mul] };
-      const result = lazyPlanToIR(plan);
-
-      expect(result.graph.fusionGroups.length).toBe(1);
-      expect(result.graph.fusionGroups[0].nodeIds).toContain(add.id);
-      expect(result.graph.fusionGroups[0].nodeIds).toContain(mul.id);
-    });
-  });
-
-  describe("isFusibleElementwise", () => {
-    it("identifies fusible ops", () => {
-      expect(isFusibleElementwise("add")).toBe(true);
-      expect(isFusibleElementwise("mul")).toBe(true);
-      expect(isFusibleElementwise("sqrt")).toBe(true);
-      expect(isFusibleElementwise("relu")).toBe(true);
-    });
-
-    it("rejects non-fusible ops", () => {
-      expect(isFusibleElementwise("matmul")).toBe(false);
-      expect(isFusibleElementwise("sum")).toBe(false);
-      expect(isFusibleElementwise("reshape")).toBe(false);
     });
   });
 });

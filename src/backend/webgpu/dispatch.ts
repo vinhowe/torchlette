@@ -1,7 +1,6 @@
 /**
  * Core dispatch infrastructure: compute pass execution, pipeline caching,
  * binary/unary/matmul dispatch.
- * Extracted from index.ts — purely structural refactoring.
  */
 
 import {
