@@ -13,7 +13,7 @@ import { type TraceEvent, TraceRecorder } from "./trace";
 // Re-export all types, errors, and helpers from extracted modules
 export * from "./engine-types";
 // ── Engine helpers (merged from engine-helpers.ts) ──────────────────────────
-export function collectTensorHandles(value: unknown): EngineTensor[] {
+function collectTensorHandles(value: unknown): EngineTensor[] {
   const out: EngineTensor[] = [];
   const seen = new Set<unknown>();
   const visit = (current: unknown) => {

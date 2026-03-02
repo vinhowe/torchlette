@@ -206,25 +206,24 @@ function executeCreationOp(
 
 function executeUnaryOp(
   node: LazyIRNode, backendInputs: BackendTensor[], backend: Backend,
-  donationOpts?: { outBuffer: unknown },
 ): BackendTensor {
   const input = backendInputs[0];
   switch (node.op) {
     case "sqrt":
-      return backend.ops.sqrt(input, donationOpts);
+      return backend.ops.sqrt(input);
     case "relu":
-      return backend.ops.relu(input, donationOpts);
+      return backend.ops.relu(input);
     case "exp": case "log": case "neg": case "abs": case "tanh": case "sigmoid":
     case "silu": case "sin": case "cos": case "rsqrt": case "floor": case "ceil":
     case "round": case "sign": {
       const fn = backend.ops[node.op as "exp"];
       assertOpSupported(node.op, fn);
-      return fn(input, donationOpts);
+      return fn(input);
     }
     case "gelu": {
       assertOpSupported("gelu", backend.ops.gelu);
       const geluOpts = getPayload<GeluOptions>(node);
-      return backend.ops.gelu(input, { ...geluOpts, ...donationOpts });
+      return backend.ops.gelu(input, geluOpts);
     }
     case "isfinite":
       assertOpSupported("isfinite", backend.ops.isfinite);
@@ -232,7 +231,7 @@ function executeUnaryOp(
     case "clamp": {
       assertOpSupported("clamp", backend.ops.clamp);
       const clampPayload = getPayload<{ min: number | null; max: number | null }>(node);
-      return backend.ops.clamp(input, clampPayload?.min ?? null, clampPayload?.max ?? null, donationOpts);
+      return backend.ops.clamp(input, clampPayload?.min ?? null, clampPayload?.max ?? null);
     }
     case "pow":
       assertOpSupported("pow", backend.ops.pow);
@@ -244,23 +243,22 @@ function executeUnaryOp(
 
 function executeBinaryOp(
   node: LazyIRNode, backendInputs: BackendTensor[], backend: Backend,
-  donationOpts?: { outBuffer: unknown },
 ): BackendTensor {
   switch (node.op) {
     case "add":
-      return backend.ops.add(backendInputs[0], backendInputs[1], donationOpts);
+      return backend.ops.add(backendInputs[0], backendInputs[1]);
     case "sub": {
       const payload = getPayload<{ alpha?: number }>(node);
-      return backend.ops.sub(backendInputs[0], backendInputs[1], { ...payload, ...donationOpts });
+      return backend.ops.sub(backendInputs[0], backendInputs[1], payload);
     }
     case "mul":
-      return backend.ops.mul(backendInputs[0], backendInputs[1], donationOpts);
+      return backend.ops.mul(backendInputs[0], backendInputs[1]);
     case "div": {
       const payload = getPayload<{ roundingMode?: "trunc" | "floor" }>(node);
-      return backend.ops.div(backendInputs[0], backendInputs[1], { ...payload, ...donationOpts });
+      return backend.ops.div(backendInputs[0], backendInputs[1], payload);
     }
     case "matmul":
-      return backend.ops.matmul(backendInputs[0], backendInputs[1], donationOpts);
+      return backend.ops.matmul(backendInputs[0], backendInputs[1]);
     default:
       throw new Error(`Unknown binary op: ${node.op}`);
   }
@@ -308,7 +306,6 @@ function executeShapeOp(
 
 function executeReductionOp(
   node: LazyIRNode, backendInputs: BackendTensor[], backend: Backend,
-  donationOpts?: { outBuffer: unknown },
 ): BackendTensor {
   switch (node.op) {
     case "sum":
@@ -331,7 +328,7 @@ function executeReductionOp(
     case "conv2d": {
       assertOpSupported("conv2d", backend.ops.conv2d);
       const payload = getPayload<{ stride?: number | [number, number]; padding?: number | [number, number] }>(node);
-      return backend.ops.conv2d(backendInputs[0], backendInputs[1], backendInputs[2], { ...payload, ...donationOpts });
+      return backend.ops.conv2d(backendInputs[0], backendInputs[1], backendInputs[2], payload);
     }
     case "gather": {
       const payload = requirePayload<{ dim: number }>(node);
@@ -349,10 +346,10 @@ function executeReductionOp(
     case "gt": case "lt": case "ge": case "le": case "eq": case "ne": {
       const fn = backend.ops[node.op as "gt"];
       assertOpSupported(node.op, fn);
-      return fn(backendInputs[0], backendInputs[1], donationOpts);
+      return fn(backendInputs[0], backendInputs[1]);
     }
     case "where":
-      return backend.ops.where(backendInputs[0], backendInputs[1], backendInputs[2], donationOpts);
+      return backend.ops.where(backendInputs[0], backendInputs[1], backendInputs[2]);
     default:
       throw new Error(`Unknown reduction op: ${node.op}`);
   }
@@ -524,7 +521,6 @@ export async function executeOp(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
-  donationOpts?: { outBuffer: unknown },
 ): Promise<BackendTensor> {
   setCurrentOpLabel(node.op);
   const nodeModule = node.module ?? "unknown";
@@ -533,10 +529,10 @@ export async function executeOp(
   try {
     const op = node.op;
     if (CREATION_OPS.has(op)) return executeCreationOp(node, backendInputs, backend);
-    if (UNARY_OPS.has(op)) return executeUnaryOp(node, backendInputs, backend, donationOpts);
-    if (BINARY_OPS.has(op)) return executeBinaryOp(node, backendInputs, backend, donationOpts);
+    if (UNARY_OPS.has(op)) return executeUnaryOp(node, backendInputs, backend);
+    if (BINARY_OPS.has(op)) return executeBinaryOp(node, backendInputs, backend);
     if (SHAPE_OPS.has(op)) return executeShapeOp(node, backendInputs, backend);
-    if (REDUCTION_OPS.has(op)) return executeReductionOp(node, backendInputs, backend, donationOpts);
+    if (REDUCTION_OPS.has(op)) return executeReductionOp(node, backendInputs, backend);
     if (MUTATION_OPS.has(op)) return executeMutationOp(node, backendInputs, backend);
     // Fused ops and extract ops — no set needed, they're the remainder
     return executeFusedOp(node, backendInputs, backend);
