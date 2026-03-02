@@ -647,25 +647,18 @@ export class InFlightPlanManager {
     plan.completedAt = Date.now();
     plan.fenceId = fenceId ?? null;
 
-    // Release intermediate buffers (they're no longer needed)
-    for (const bufferId of plan.intermediateBuffers) {
+    const releaseOrFence = (bufferId: BufferId) => {
       if (fenceId !== undefined) {
         this.bufferPool.markPendingFence(bufferId, fenceId);
       } else {
         this.bufferPool.release(bufferId);
       }
-    }
+    };
 
-    // Input buffers can be released if not outputs
+    for (const bufferId of plan.intermediateBuffers) releaseOrFence(bufferId);
     const outputSet = new Set(plan.outputBuffers);
     for (const bufferId of plan.inputBuffers) {
-      if (!outputSet.has(bufferId)) {
-        if (fenceId !== undefined) {
-          this.bufferPool.markPendingFence(bufferId, fenceId);
-        } else {
-          this.bufferPool.release(bufferId);
-        }
-      }
+      if (!outputSet.has(bufferId)) releaseOrFence(bufferId);
     }
   }
 

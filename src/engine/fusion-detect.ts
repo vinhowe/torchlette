@@ -18,6 +18,7 @@ import type {
   FusedNode,
   FusedOutput,
 } from "../backend/webgpu/fusion-types";
+import { shapesEqual } from "../core/shape";
 import type { LazyIRNode, LazyRef } from "./lazy";
 
 /**
@@ -159,10 +160,7 @@ function processCandidate(
     let shapesMatch = true;
     for (const pos of externallyReferenced) {
       const node = subNodes[pos];
-      if (
-        node.shape.length !== primaryShape.length ||
-        !node.shape.every((d, i) => d === primaryShape[i])
-      ) {
+      if (!shapesEqual(node.shape, primaryShape)) {
         shapesMatch = false;
         break;
       }
@@ -441,48 +439,17 @@ function splitCandidatesByComponent(
 
           for (let j = batchStart; j < sameShapePositions.length; j++) {
             const node = candidate.nodes[sameShapePositions[j]];
-
-            let newInputCount = 0;
-            for (const input of node.inputs) {
-              if (input.kind === "scalar") continue;
-              const inputKey = input.kind === "materialized"
-                ? `s:${input.storage.id}`
-                : `p:${input.node.id}`;
-              if (!seenInputs.has(inputKey)) newInputCount++;
-            }
-
-            const wouldBeOutputs = batchPositions.length + 1;
-            const wouldBeInputs = seenInputs.size + newInputCount;
-            if (wouldBeInputs + wouldBeOutputs > maxBuffers && batchPositions.length >= 2) {
+            const newCount = countNewInputKeys(node, seenInputs);
+            if (seenInputs.size + newCount + batchPositions.length + 1 > maxBuffers && batchPositions.length >= 2) {
               break;
             }
-
             batchPositions.push(sameShapePositions[j]);
-            for (const input of node.inputs) {
-              if (input.kind === "scalar") continue;
-              const inputKey = input.kind === "materialized"
-                ? `s:${input.storage.id}`
-                : `p:${input.node.id}`;
-              seenInputs.add(inputKey);
-            }
+            addInputKeys(node, seenInputs);
           }
 
           if (batchPositions.length < 2) break;
-
           batchStart += batchPositions.length;
-
-          const batchNodes = batchPositions.map(p => candidate.nodes[p]);
-          const batchIndices = batchPositions.map(p => candidate.indices[p]);
-          const batchNodeIds = new Set(batchNodes.map(n => n.id));
-          const externalInputs = collectExternalInputs(batchNodes, batchNodeIds);
-
-          groups.push({
-            nodes: batchNodes,
-            planIndices: batchIndices,
-            externalInputs,
-            outputNode: batchNodes[batchNodes.length - 1],
-            additionalOutputNodes: batchNodes.slice(0, -1),
-          });
+          groups.push(makeBatchGroup(batchPositions, candidate.nodes, candidate.indices));
         }
       }
     }
@@ -609,18 +576,8 @@ function batchGlobalSingletons(
         }
         if (!orderingSafe) break;
 
-        let newInputCount = 0;
-        for (const input of node.inputs) {
-          if (input.kind === "scalar") continue;
-          const inputKey = input.kind === "materialized"
-            ? `s:${input.storage.id}`
-            : `p:${input.node.id}`;
-          if (!seenInputs.has(inputKey)) newInputCount++;
-        }
-
-        const wouldBeOutputs = batchEntries.length + 1;
-        const wouldBeInputs = seenInputs.size + newInputCount;
-        if (wouldBeInputs + wouldBeOutputs > maxBuffers && batchEntries.length >= 2) {
+        const newCount = countNewInputKeys(node, seenInputs);
+        if (seenInputs.size + newCount + batchEntries.length + 1 > maxBuffers && batchEntries.length >= 2) {
           break;
         }
 
@@ -628,13 +585,7 @@ function batchGlobalSingletons(
         batchNodeIds.add(node.id);
         batchMaxPos = candidateMaxPos;
         batchMinPos = candidateMinPos;
-        for (const input of node.inputs) {
-          if (input.kind === "scalar") continue;
-          const inputKey = input.kind === "materialized"
-            ? `s:${input.storage.id}`
-            : `p:${input.node.id}`;
-          seenInputs.add(inputKey);
-        }
+        addInputKeys(node, seenInputs);
       }
 
       if (batchEntries.length < 2) {
@@ -646,12 +597,10 @@ function batchGlobalSingletons(
 
       const batchNodes = batchEntries.map(e => e.node);
       const batchIndices = batchEntries.map(e => e.planIndex);
-      const externalInputs = collectExternalInputs(batchNodes, batchNodeIds);
-
       finalGroups.push({
         nodes: batchNodes,
         planIndices: batchIndices,
-        externalInputs,
+        externalInputs: collectExternalInputs(batchNodes, batchNodeIds),
         outputNode: batchNodes[batchNodes.length - 1],
         additionalOutputNodes: batchNodes.slice(0, -1),
       });
@@ -706,7 +655,7 @@ function promoteIntermediates(
     if (neededIntermediates.length > 0) {
       const primaryShape = group.outputNode.shape;
       const promotable = neededIntermediates.filter(
-        n => n.shape.length === primaryShape.length && n.shape.every((d, i) => d === primaryShape[i]),
+        n => shapesEqual(n.shape, primaryShape),
       );
       const currentOutputs = 1 + (group.additionalOutputNodes?.length ?? 0);
       const nonInlinedExtInputs = group.externalInputs.filter(ref => !isInlinableScalar(ref).inlinable).length;
@@ -899,11 +848,7 @@ function splitGroupByInputLimit(
           const depNode = earlier.nodes.find(n => n.id === depId);
           if (!depNode) continue;
 
-          const primaryShape = earlier.outputNode.shape;
-          const shapeMatch = depNode.shape.length === primaryShape.length &&
-            depNode.shape.every((d, i) => d === primaryShape[i]);
-
-          if (shapeMatch) {
+          if (shapesEqual(depNode.shape, earlier.outputNode.shape)) {
             // Check binding limit: externalInputs + currentOutputs + 1 <= maxExternalInputs + currentOutputs
             const currentOutputs = 1 + (earlier.additionalOutputNodes?.length ?? 0);
             const availableSlots = (maxExternalInputs + currentOutputs) - earlier.externalInputs.length - currentOutputs;
@@ -1204,6 +1149,48 @@ export function hasFusionPotential(nodes: LazyIRNode[]): boolean {
     if (isFusibleOp(node.op) && ++count >= 2) return true;
   }
   return false;
+}
+
+/** Stable key for a non-scalar LazyRef (for input dedup tracking). */
+function inputKey(input: LazyRef): string | null {
+  if (input.kind === "scalar") return null;
+  return input.kind === "materialized" ? `s:${input.storage.id}` : `p:${input.node.id}`;
+}
+
+/** Count new non-scalar input keys a node would add to an existing set. */
+function countNewInputKeys(node: LazyIRNode, seenInputs: Set<string>): number {
+  let count = 0;
+  for (const input of node.inputs) {
+    const k = inputKey(input);
+    if (k !== null && !seenInputs.has(k)) count++;
+  }
+  return count;
+}
+
+/** Add a node's non-scalar input keys to a tracking set. */
+function addInputKeys(node: LazyIRNode, seenInputs: Set<string>): void {
+  for (const input of node.inputs) {
+    const k = inputKey(input);
+    if (k !== null) seenInputs.add(k);
+  }
+}
+
+/** Build a multi-output FusionGroup from a batch of nodes at given positions. */
+function makeBatchGroup(
+  batchPositions: number[],
+  sourceNodes: LazyIRNode[],
+  sourceIndices: number[],
+): FusionGroup {
+  const batchNodes = batchPositions.map(p => sourceNodes[p]);
+  const batchIndices = batchPositions.map(p => sourceIndices[p]);
+  const batchNodeIds = new Set(batchNodes.map(n => n.id));
+  return {
+    nodes: batchNodes,
+    planIndices: batchIndices,
+    externalInputs: collectExternalInputs(batchNodes, batchNodeIds),
+    outputNode: batchNodes[batchNodes.length - 1],
+    additionalOutputNodes: batchNodes.slice(0, -1),
+  };
 }
 
 /**

@@ -12,13 +12,7 @@ const PROFILING_ENABLED =
 // Stat entry types
 // ---------------------------------------------------------------------------
 
-interface ApiStats {
-  count: number;
-  totalMs: number;
-  maxMs: number;
-}
-
-interface OpStats {
+interface MsStats {
   count: number;
   totalMs: number;
   maxMs: number;
@@ -55,9 +49,9 @@ interface FusionFallbackEntry {
 // ---------------------------------------------------------------------------
 
 interface CpuProfileState {
-  apiStats: Map<string, ApiStats>;
-  opStats: Map<string, OpStats>;
-  subOpStats: Map<string, OpStats>;
+  apiStats: Map<string, MsStats>;
+  opStats: Map<string, MsStats>;
+  subOpStats: Map<string, MsStats>;
   currentPhase: string;
   phaseStats: Map<string, { totalMs: number; opCount: number }>;
   currentModule: string;
@@ -148,6 +142,24 @@ function resetGpuTimestampState(): void {
   gpuTs.moduleOpStats.clear();
 }
 
+// Stat accumulation helpers — eliminate 8 duplicated if/else patterns
+function recordMs(map: Map<string, MsStats>, key: string, ms: number): void {
+  const e = map.get(key);
+  if (e) { e.count++; e.totalMs += ms; if (ms > e.maxMs) e.maxMs = ms; }
+  else map.set(key, { count: 1, totalMs: ms, maxMs: ms });
+}
+type NsStats = { count: number; totalNs: bigint; maxNs: bigint };
+function recordNs(map: Map<string, NsStats>, key: string, ns: bigint): void {
+  const e = map.get(key);
+  if (e) { e.count++; e.totalNs += ns; if (ns > e.maxNs) e.maxNs = ns; }
+  else map.set(key, { count: 1, totalNs: ns, maxNs: ns });
+}
+function getOrCreateMap<K, V>(outer: Map<K, Map<string, V>>, key: K): Map<string, V> {
+  let m = outer.get(key);
+  if (!m) { m = new Map(); outer.set(key, m); }
+  return m;
+}
+
 export function recordFusionFallback(reason: string, groupSize: number, detail?: unknown): void {
   if (!PROFILING_ENABLED) return;
   const entry = cpuProfile.fusionFallbackStats.get(reason);
@@ -191,15 +203,7 @@ export function profileApiCall<T>(name: string, fn: () => T): T {
   if (!PROFILING_ENABLED) return fn();
   const t0 = performance.now();
   const result = fn();
-  const elapsed = performance.now() - t0;
-  const entry = cpuProfile.apiStats.get(name);
-  if (entry) {
-    entry.count++;
-    entry.totalMs += elapsed;
-    if (elapsed > entry.maxMs) entry.maxMs = elapsed;
-  } else {
-    cpuProfile.apiStats.set(name, { count: 1, totalMs: elapsed, maxMs: elapsed });
-  }
+  recordMs(cpuProfile.apiStats, name, performance.now() - t0);
   return result;
 }
 
@@ -215,25 +219,10 @@ export function profileOpBegin(opName: string): number {
 export function profileOpEnd(opName: string, t0: number): void {
   if (!PROFILING_ENABLED) return;
   const elapsed = performance.now() - t0;
-
-  // Op stats
-  const entry = cpuProfile.opStats.get(opName);
-  if (entry) {
-    entry.count++;
-    entry.totalMs += elapsed;
-    if (elapsed > entry.maxMs) entry.maxMs = elapsed;
-  } else {
-    cpuProfile.opStats.set(opName, { count: 1, totalMs: elapsed, maxMs: elapsed });
-  }
-
-  // Phase stats
+  recordMs(cpuProfile.opStats, opName, elapsed);
   const phase = cpuProfile.phaseStats.get(cpuProfile.currentPhase);
-  if (phase) {
-    phase.totalMs += elapsed;
-    phase.opCount++;
-  } else {
-    cpuProfile.phaseStats.set(cpuProfile.currentPhase, { totalMs: elapsed, opCount: 1 });
-  }
+  if (phase) { phase.totalMs += elapsed; phase.opCount++; }
+  else cpuProfile.phaseStats.set(cpuProfile.currentPhase, { totalMs: elapsed, opCount: 1 });
 }
 
 // ---------------------------------------------------------------------------
@@ -247,15 +236,7 @@ export function profileSubOpBegin(): number {
 
 export function profileSubOpEnd(label: string, t0: number): void {
   if (!PROFILING_ENABLED) return;
-  const elapsed = performance.now() - t0;
-  const entry = cpuProfile.subOpStats.get(label);
-  if (entry) {
-    entry.count++;
-    entry.totalMs += elapsed;
-    if (elapsed > entry.maxMs) entry.maxMs = elapsed;
-  } else {
-    cpuProfile.subOpStats.set(label, { count: 1, totalMs: elapsed, maxMs: elapsed });
-  }
+  recordMs(cpuProfile.subOpStats, label, performance.now() - t0);
 }
 
 // ---------------------------------------------------------------------------
@@ -388,67 +369,21 @@ function processTimestampRecords(timestamps: BigInt64Array): void {
     const durationNs = endNs - startNs;
     if (durationNs < 0n) continue; // invalid
 
-    // Per-label stats
-    const entry = gpuTs.labelStats.get(record.label);
-    if (entry) {
-      entry.count++;
-      entry.totalNs += durationNs;
-      if (durationNs > entry.maxNs) entry.maxNs = durationNs;
-    } else {
-      gpuTs.labelStats.set(record.label, {
-        count: 1,
-        totalNs: durationNs,
-        maxNs: durationNs,
-      });
-    }
+    recordNs(gpuTs.labelStats, record.label, durationNs);
 
     // Per-phase GPU stats
     const phase = gpuTs.phaseStats.get(record.phase);
-    if (phase) {
-      phase.totalNs += durationNs;
-      phase.opCount++;
-    } else {
-      gpuTs.phaseStats.set(record.phase, { totalNs: durationNs, opCount: 1 });
-    }
+    if (phase) { phase.totalNs += durationNs; phase.opCount++; }
+    else gpuTs.phaseStats.set(record.phase, { totalNs: durationNs, opCount: 1 });
 
-    // Per-phase per-op GPU stats
-    let phaseOps = gpuTs.phaseOpStats.get(record.phase);
-    if (!phaseOps) {
-      phaseOps = new Map();
-      gpuTs.phaseOpStats.set(record.phase, phaseOps);
-    }
-    const poEntry = phaseOps.get(record.label);
-    if (poEntry) {
-      poEntry.count++;
-      poEntry.totalNs += durationNs;
-      if (durationNs > poEntry.maxNs) poEntry.maxNs = durationNs;
-    } else {
-      phaseOps.set(record.label, { count: 1, totalNs: durationNs, maxNs: durationNs });
-    }
+    recordNs(getOrCreateMap(gpuTs.phaseOpStats, record.phase), record.label, durationNs);
 
     // Per-module GPU stats
     const mod = gpuTs.moduleStats.get(record.module);
-    if (mod) {
-      mod.totalNs += durationNs;
-      mod.opCount++;
-    } else {
-      gpuTs.moduleStats.set(record.module, { totalNs: durationNs, opCount: 1 });
-    }
+    if (mod) { mod.totalNs += durationNs; mod.opCount++; }
+    else gpuTs.moduleStats.set(record.module, { totalNs: durationNs, opCount: 1 });
 
-    // Per-module per-op GPU stats
-    let modOps = gpuTs.moduleOpStats.get(record.module);
-    if (!modOps) {
-      modOps = new Map();
-      gpuTs.moduleOpStats.set(record.module, modOps);
-    }
-    const moEntry = modOps.get(record.label);
-    if (moEntry) {
-      moEntry.count++;
-      moEntry.totalNs += durationNs;
-      if (durationNs > moEntry.maxNs) moEntry.maxNs = durationNs;
-    } else {
-      modOps.set(record.label, { count: 1, totalNs: durationNs, maxNs: durationNs });
-    }
+    recordNs(getOrCreateMap(gpuTs.moduleOpStats, record.module), record.label, durationNs);
   }
 }
 
