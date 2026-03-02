@@ -1,6 +1,7 @@
 import type { AdamStepConfig, DeviceKind } from "../backend/types";
-import type { LazyIRNode } from "../engine/lazy";
-import { createLazyIRNode, createPendingRef } from "../engine/lazy";
+import type { LazyIRNode } from "../engine/lazy-types";
+import { createPendingRef } from "../engine/lazy-types";
+import { createLazyIRNode } from "../engine/node-factory";
 import type { Tensor, Torchlette } from "../frontend";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import { validateOptimizerParams } from "./validate";

@@ -11,7 +11,10 @@
  */
 
 import { beforeEach, describe, expect, it } from "vitest";
-import { resetNodeIdCounter, resetStorageIdCounter } from "../src/engine/lazy";
+import {
+  resetNodeIdCounter,
+  resetStorageIdCounter,
+} from "../src/engine/node-factory";
 import { Torchlette } from "../src/frontend";
 import { RuntimeEngine } from "../src/runtime/engine";
 import { resetBaseIdCounter } from "../src/runtime/tensor";

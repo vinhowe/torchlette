@@ -1,17 +1,19 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { cpuBackend } from "../src/backend/cpu";
+import { executePlan } from "../src/engine/executor-sequential";
 import {
-  buildPlan,
-  createLazyIRNode,
   createMaterializedRef,
   createPendingRef,
-  createStorageHandle,
-  executePlan,
   isMaterialized,
   isPending,
+} from "../src/engine/lazy-types";
+import {
+  createLazyIRNode,
+  createStorageHandle,
   resetNodeIdCounter,
   resetStorageIdCounter,
-} from "../src/engine/lazy";
+} from "../src/engine/node-factory";
+import { buildPlan } from "../src/engine/plan-builder";
 
 describe("lazy value system", () => {
   beforeEach(() => {

@@ -1,7 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { registerBackend } from "../../src/backend/registry";
-import { resetNodeIdCounter } from "../../src/engine/lazy";
+import { resetNodeIdCounter } from "../../src/engine/node-factory";
 import { RuntimeEngine } from "../../src/runtime/engine";
 import { resetBaseIdCounter } from "../../src/runtime/tensor";
 

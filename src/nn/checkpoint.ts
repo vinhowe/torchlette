@@ -24,7 +24,7 @@
  * linearly with sequence length and layer count.
  */
 
-import { markAsCheckpointBoundary } from "../engine/lazy";
+import { markAsCheckpointBoundary } from "../engine/plan-builder";
 import type { PackHook, Tensor, Torchlette, UnpackHook } from "../frontend";
 
 // ============================================================================

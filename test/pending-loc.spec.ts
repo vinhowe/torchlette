@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CheckpointImpureRegionError, Engine } from "../src/engine";
+import { CheckpointImpureRegionError, Engine } from "../src/engine/engine";
 
 describe("pending loc initialization", () => {
   it("creates initTok via materialize store on first access", () => {

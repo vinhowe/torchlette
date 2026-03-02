@@ -11,6 +11,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { getBackend } from "../src/backend/registry";
 import type { Backend } from "../src/backend/types";
+import { executePlanOptimized } from "../src/engine/executor-optimized";
 import {
   detectFusionGroups,
   groupToRecipe,
@@ -22,16 +23,14 @@ import {
 } from "../src/engine/fusion-detect";
 import type { IRGraph } from "../src/engine/ir";
 import { optimizeIR, performCSE, performDCE } from "../src/engine/ir-optimize";
+import type { LazyIRNode, LazyRef } from "../src/engine/lazy-types";
+import { createPendingRef } from "../src/engine/lazy-types";
 import {
-  buildPlan,
   createLazyIRNode,
-  createPendingRef,
-  executePlanOptimized,
-  type LazyIRNode,
-  type LazyRef,
   resetNodeIdCounter,
   resetStorageIdCounter,
-} from "../src/engine/lazy";
+} from "../src/engine/node-factory";
+import { buildPlan } from "../src/engine/plan-builder";
 import { RuntimeEngine } from "../src/runtime/engine";
 import { resetBaseIdCounter, type Tensor } from "../src/runtime/tensor";
 

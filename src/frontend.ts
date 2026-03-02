@@ -29,7 +29,7 @@ import {
   createAutocastContext,
 } from "./engine/amp";
 import { Engine, type EngineTensor } from "./engine/engine";
-import { storageTracker } from "./engine/lazy";
+import { storageTracker } from "./engine/storage-tracker";
 import {
   RuntimeEngine,
   type TensorOrScalar,

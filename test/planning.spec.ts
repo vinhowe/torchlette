@@ -3,7 +3,7 @@ import {
   buildPlanLinearOrder,
   type EventKey,
   type PlanEvent,
-} from "../src/engine";
+} from "../src/engine/engine";
 
 function key(
   graphInstanceId: number,

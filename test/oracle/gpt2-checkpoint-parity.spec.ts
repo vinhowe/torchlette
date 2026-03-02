@@ -20,7 +20,7 @@ import { gpuMemoryTracker } from "../../src/backend/webgpu/memory-tracker";
 import {
   resetNodeIdCounter,
   resetStorageIdCounter,
-} from "../../src/engine/lazy";
+} from "../../src/engine/node-factory";
 import { resetBaseIdCounter } from "../../src/runtime/tensor";
 import { canUseWebGPU } from "../helpers/webgpu";
 import { type OracleCase, runTorchOracleFullBatch } from "./torch-oracle";

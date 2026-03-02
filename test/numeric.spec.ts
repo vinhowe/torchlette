@@ -3,24 +3,26 @@ import {
   add,
   cpuBackend,
   gather,
-  getActiveBackend,
   matmul,
   mean,
-  mockBackend,
   mul,
-  ops,
-  RuntimeEngine,
-  RuntimeTensor,
   relu,
   scatterAdd,
-  setBackend,
   sqrt,
   sub,
   sum,
   tensorFromArray,
   transpose,
+} from "../src/backend/cpu";
+import { mockBackend } from "../src/backend/mock";
+import {
+  getActiveBackend,
+  ops,
+  setBackend,
   withBackend,
-} from "../src/engine";
+} from "../src/backend/registry";
+import { RuntimeEngine } from "../src/runtime/engine";
+import { Tensor as RuntimeTensor } from "../src/runtime/tensor";
 import { rt } from "./helpers/runtime";
 
 describe("numeric ring-2: add", () => {

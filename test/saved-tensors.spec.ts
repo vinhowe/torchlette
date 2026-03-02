@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Engine, SavedTensorModifiedError } from "../src/engine";
+import { Engine, SavedTensorModifiedError } from "../src/engine/engine";
 
 describe("saved-for-backward guards", () => {
   it("throws if base is mutated after save", () => {
