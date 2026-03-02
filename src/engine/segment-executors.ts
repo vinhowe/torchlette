@@ -1,6 +1,5 @@
 import { getBackend } from "../backend/registry";
 import type { Backend, BackendTensor, DType } from "../backend/types";
-import { computeContiguousStrides } from "../backend/types";
 import {
   beginSharedEncoder,
   endSharedEncoder,
@@ -14,7 +13,7 @@ import {
   recordFusionFallback,
   setProfileModule,
 } from "../backend/webgpu/profiler";
-import { sizeOf } from "../core/shape";
+import { contiguousStrides, sizeOf } from "../core/shape";
 import {
   type FusionGroup,
   type groupToRecipe,
@@ -142,7 +141,7 @@ export async function executeFusedWebGPU(
       shape: output.shape,
       dtype: output.dtype,
       size: sizeOf(output.shape),
-      strides: computeContiguousStrides(output.shape),
+      strides: contiguousStrides(output.shape),
       offset: 0,
       isContiguous: true,
       ownsBuffer: true,
@@ -501,7 +500,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
         // Create result storage on the output node
         const outShape = shape.slice();
-        const outStrides = computeContiguousStrides(outShape);
+        const outStrides = contiguousStrides(outShape);
         outputNode.result = createStorageHandle(node.device, {
           buffer: outBuffer,
           shape: outShape,

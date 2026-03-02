@@ -40,9 +40,6 @@ export type ViewMeta = {
 
 import { contiguousStrides } from "../core/shape";
 
-/** @deprecated Use `contiguousStrides` from `core/shape` directly. */
-export const computeContiguousStrides = contiguousStrides;
-
 /**
  * Check if strides represent a contiguous layout for the given shape.
  * Size-1 dimensions don't affect contiguity since stride doesn't matter.

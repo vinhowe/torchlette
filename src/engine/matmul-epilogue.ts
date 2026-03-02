@@ -8,7 +8,6 @@ import {
   ensureWebGPUMatmulImports,
 } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
-export { shapesEqual };
 
 // ============================================================================
 // Matmul Epilogue Fusion (Phase 1)

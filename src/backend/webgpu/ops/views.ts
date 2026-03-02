@@ -27,7 +27,6 @@ import {
   alignBufferSize,
   alignedChunkSize,
   compute2DDispatch,
-  contiguousStrides,
   dtypeBytes,
   dtypeToWgsl,
   lcm,

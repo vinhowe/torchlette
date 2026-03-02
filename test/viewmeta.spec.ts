@@ -6,37 +6,36 @@ import {
 } from "../src/backend/cpu/numeric";
 import {
   checkContiguous,
-  computeContiguousStrides,
   transposeShape,
   transposeStrides,
   type ViewMeta,
 } from "../src/backend/types";
-import { sizeOf } from "../src/core/shape";
+import { contiguousStrides, sizeOf } from "../src/core/shape";
 
 describe("ViewMeta utilities (§4.2-4.4)", () => {
-  describe("computeContiguousStrides", () => {
+  describe("contiguousStrides", () => {
     it("computes strides for 1D tensor", () => {
-      expect(computeContiguousStrides([10])).toEqual([1]);
+      expect(contiguousStrides([10])).toEqual([1]);
     });
 
     it("computes strides for 2D tensor", () => {
       // For [3, 4]: strides should be [4, 1] (row-major)
-      expect(computeContiguousStrides([3, 4])).toEqual([4, 1]);
+      expect(contiguousStrides([3, 4])).toEqual([4, 1]);
     });
 
     it("computes strides for 3D tensor", () => {
       // For [2, 3, 4]: strides should be [12, 4, 1]
-      expect(computeContiguousStrides([2, 3, 4])).toEqual([12, 4, 1]);
+      expect(contiguousStrides([2, 3, 4])).toEqual([12, 4, 1]);
     });
 
     it("handles scalar (empty shape)", () => {
-      expect(computeContiguousStrides([])).toEqual([]);
+      expect(contiguousStrides([])).toEqual([]);
     });
 
     it("handles size-1 dimensions", () => {
-      expect(computeContiguousStrides([1, 4])).toEqual([4, 1]);
-      expect(computeContiguousStrides([3, 1])).toEqual([1, 1]);
-      expect(computeContiguousStrides([1, 1, 4])).toEqual([4, 4, 1]);
+      expect(contiguousStrides([1, 4])).toEqual([4, 1]);
+      expect(contiguousStrides([3, 1])).toEqual([1, 1]);
+      expect(contiguousStrides([1, 1, 4])).toEqual([4, 4, 1]);
     });
   });
 
@@ -113,7 +112,7 @@ describe("ViewMeta utilities (§4.2-4.4)", () => {
         baseId: 1,
         offset: 0,
         shape,
-        strides: computeContiguousStrides(shape),
+        strides: contiguousStrides(shape),
         isContiguous: true,
       };
 
@@ -123,7 +122,7 @@ describe("ViewMeta utilities (§4.2-4.4)", () => {
 
     it("can create a transposed view", () => {
       const originalShape = [3, 4];
-      const originalStrides = computeContiguousStrides(originalShape);
+      const originalStrides = contiguousStrides(originalShape);
 
       // Transpose dims 0 and 1
       const transposedShape = transposeShape(originalShape, 0, 1);

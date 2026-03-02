@@ -12,13 +12,38 @@ import { dispatchBinary, dispatchUnary } from "../dispatch";
 import type { GPUBuffer } from "../gpu-types";
 import { asGPUTensor } from "../gpu-types";
 
-export function add(
+// ---------------------------------------------------------------------------
+// Factory helpers
+// ---------------------------------------------------------------------------
+
+type UnaryOp = (
+  a: BackendTensor,
+  options?: { outBuffer?: GPUBuffer },
+) => BackendTensor;
+
+type BinaryOp = (
   a: BackendTensor,
   b: BackendTensor,
   options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchBinary("+", asGPUTensor(a), asGPUTensor(b), options);
-}
+) => BackendTensor;
+
+const unary =
+  (name: string, expr: string): UnaryOp =>
+  (a, options) =>
+    dispatchUnary(name, expr, asGPUTensor(a), options);
+
+const binary =
+  (op: string): BinaryOp =>
+  (a, b, options) =>
+    dispatchBinary(op, asGPUTensor(a), asGPUTensor(b), options);
+
+// ---------------------------------------------------------------------------
+// Simple binary ops
+// ---------------------------------------------------------------------------
+
+export const add: BinaryOp = binary("+");
+export const mul: BinaryOp = binary("*");
+export const pow: BinaryOp = binary("pow");
 
 export function sub(
   a: BackendTensor,
@@ -36,79 +61,30 @@ export function div(
   return dispatchBinary("/", asGPUTensor(a), asGPUTensor(b), options);
 }
 
-export function mul(
-  a: BackendTensor,
-  b: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchBinary("*", asGPUTensor(a), asGPUTensor(b), options);
-}
+// ---------------------------------------------------------------------------
+// Simple unary ops
+// ---------------------------------------------------------------------------
 
-export function sqrt(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary("sqrt", "sqrt(x)", asGPUTensor(a), options);
-}
+export const sqrt: UnaryOp = unary("sqrt", "sqrt(x)");
+export const relu: UnaryOp = unary("relu", "select(0.0, x, x > 0.0)");
+export const exp: UnaryOp = unary("exp", "exp(x)");
+export const log: UnaryOp = unary("log", "log(x)");
+export const neg: UnaryOp = unary("neg", "-x");
+export const abs: UnaryOp = unary("abs", "abs(x)");
+export const tanh: UnaryOp = unary("tanh", "tanh(x)");
+export const sigmoid: UnaryOp = unary("sigmoid", "(1.0 / (1.0 + exp(-x)))");
+export const silu: UnaryOp = unary("silu", "(x / (1.0 + exp(-x)))");
+export const sin: UnaryOp = unary("sin", "sin(x)");
+export const cos: UnaryOp = unary("cos", "cos(x)");
+export const rsqrt: UnaryOp = unary("rsqrt", "inverseSqrt(x)");
+export const floor: UnaryOp = unary("floor", "floor(x)");
+export const ceil: UnaryOp = unary("ceil", "ceil(x)");
+export const round: UnaryOp = unary("round", "round(x)");
+export const sign: UnaryOp = unary("sign", "sign(x)");
 
-export function relu(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary(
-    "relu",
-    "select(0.0, x, x > 0.0)",
-    asGPUTensor(a),
-    options,
-  );
-}
-
-export function exp(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary("exp", "exp(x)", asGPUTensor(a), options);
-}
-
-export function log(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary("log", "log(x)", asGPUTensor(a), options);
-}
-
-export function neg(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary("neg", "-x", asGPUTensor(a), options);
-}
-
-export function abs(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary("abs", "abs(x)", asGPUTensor(a), options);
-}
-
-export function tanh(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary("tanh", "tanh(x)", asGPUTensor(a), options);
-}
-
-export function sigmoid(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary(
-    "sigmoid",
-    "(1.0 / (1.0 + exp(-x)))",
-    asGPUTensor(a),
-    options,
-  );
-}
+// ---------------------------------------------------------------------------
+// Complex ops (not table-driven)
+// ---------------------------------------------------------------------------
 
 export function gelu(
   a: BackendTensor,
@@ -117,8 +93,6 @@ export function gelu(
   const approximate = options?.approximate ?? "tanh";
 
   if (approximate === "tanh") {
-    // Tanh approximation (GPT-2 "new GELU"): 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    // Clamp tanh input to [-10, 10] to avoid overflow (tanh saturates to ±1 beyond this)
     return dispatchUnary(
       "gelu_tanh",
       "(x * 0.5 * (1.0 + tanh(clamp(0.7978845608 * (x + 0.044715 * x * x * x), -10.0, 10.0))))",
@@ -126,10 +100,6 @@ export function gelu(
       { outBuffer: options?.outBuffer },
     );
   } else {
-    // Exact formula using erf: x * 0.5 * (1 + erf(x / sqrt(2)))
-    // WGSL doesn't have erf, so we use a polynomial approximation
-    // Abramowitz and Stegun approximation 7.1.26 (max error ~1.5e-7)
-    // Single expression with all computations inlined
     return dispatchUnary(
       "gelu_erf",
       "(x * 0.5 * (1.0 + sign(x) * (1.0 - (((((1.061405429 * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) + -1.453152027) * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) + 1.421413741) * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) + -0.284496736) * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) + 0.254829592) * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) * exp(-x * x * 0.5)))))",
@@ -139,83 +109,12 @@ export function gelu(
   }
 }
 
-export function silu(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  // SiLU/Swish: x * sigmoid(x) = x / (1 + exp(-x))
-  return dispatchUnary(
-    "silu",
-    "(x / (1.0 + exp(-x)))",
-    asGPUTensor(a),
-    options,
-  );
-}
-
-export function sin(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary("sin", "sin(x)", asGPUTensor(a), options);
-}
-
-export function cos(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary("cos", "cos(x)", asGPUTensor(a), options);
-}
-
-export function rsqrt(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary("rsqrt", "inverseSqrt(x)", asGPUTensor(a), options);
-}
-
-export function floor(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary("floor", "floor(x)", asGPUTensor(a), options);
-}
-
-export function ceil(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary("ceil", "ceil(x)", asGPUTensor(a), options);
-}
-
-export function round(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary("round", "round(x)", asGPUTensor(a), options);
-}
-
-export function sign(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchUnary("sign", "sign(x)", asGPUTensor(a), options);
-}
-
-export function pow(
-  a: BackendTensor,
-  b: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return dispatchBinary("pow", asGPUTensor(a), asGPUTensor(b), options);
-}
-
 export function clamp(
   a: BackendTensor,
   min: number | null,
   max: number | null,
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  // Build clamp expression
   let expr: string;
   if (min !== null && max !== null) {
     expr = `clamp(x, ${min}, ${max})`;
@@ -224,29 +123,16 @@ export function clamp(
   } else if (max !== null) {
     expr = `min(x, ${max})`;
   } else {
-    expr = "x"; // no-op
+    expr = "x";
   }
   return dispatchUnary(`clamp_${min}_${max}`, expr, asGPUTensor(a), options);
 }
 
 /**
  * Check if values are finite (not NaN and not Inf).
- * Returns 1.0 where finite, 0.0 where NaN or Inf.
- * Uses arithmetic checks since not all WGSL implementations support isinf/isnan.
+ * Uses bitcast to check IEEE 754 exponent bits directly.
  */
-export function isfinite(
-  a: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  // Use bitcast to check IEEE 754 exponent bits directly.
-  // A f32 is Inf or NaN when all exponent bits (bits 23-30) are set.
-  // Exponent mask: 0x7F800000. If (bits & mask) == mask, value is non-finite.
-  // This is robust against GPU compiler optimizations that may fold
-  // arithmetic checks like x * 0.0 == 0.0 or x - x == 0.0.
-  return dispatchUnary(
-    "isfinite",
-    "select(0.0, 1.0, (bitcast<u32>(x) & 0x7F800000u) != 0x7F800000u)",
-    asGPUTensor(a),
-    options,
-  );
-}
+export const isfinite: UnaryOp = unary(
+  "isfinite",
+  "select(0.0, 1.0, (bitcast<u32>(x) & 0x7F800000u) != 0x7F800000u)",
+);
