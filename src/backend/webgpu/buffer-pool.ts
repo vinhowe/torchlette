@@ -106,6 +106,13 @@ class SimpleBufferPool {
     this.releaseToDestroy = 0;
   }
 
+  /** Get or create a pool bucket for a size class. */
+  private getBucket(sizeClass: number): GPUBuffer[] {
+    let bucket = this.pool.get(sizeClass);
+    if (!bucket) { bucket = []; this.pool.set(sizeClass, bucket); }
+    return bucket;
+  }
+
   /** Increment reference count for a buffer (called when an owning tensor is created). */
   incRef(buffer: GPUBuffer): void {
     this.bufferLiveCount.set(buffer, (this.bufferLiveCount.get(buffer) ?? 0) + 1);
@@ -164,7 +171,7 @@ class SimpleBufferPool {
     this.pooledBytes -= actualSize;
     this.reuseCount++;
     this.acquireFromPool++;
-    this.recordAcquire(sizeClass);
+    this.recordWindowDemand(sizeClass, "acquires");
     this.pooledBufferSet.add(preferred);
     gpuMemoryTracker.trackAllocation(preferred, actualSize);
     return preferred;
@@ -200,7 +207,7 @@ class SimpleBufferPool {
       this.pooledBytes -= actualSize;
       this.reuseCount++;
       this.acquireFromPool++;
-      this.recordAcquire(sizeClass);
+      this.recordWindowDemand(sizeClass, "acquires");
       // Track that this buffer is from pool for release
       this.pooledBufferSet.add(buffer);
       // Re-track allocation (was deallocated when released to pool)
@@ -228,7 +235,7 @@ class SimpleBufferPool {
         this.pendingReleaseBytes -= size;
         this.reuseCount++;
         this.acquireFromPending++;
-        this.recordAcquire(sizeClass);
+        this.recordWindowDemand(sizeClass, "acquires");
         this.pooledBufferSet.add(buffer);
         // Re-track allocation (was deallocated when added to pending)
         gpuMemoryTracker.trackAllocation(buffer, size);
@@ -249,7 +256,7 @@ class SimpleBufferPool {
     this.acquireNew++;
     const sc = getSizeClass(sizeBytes);
     this.newAllocsByClass.set(sc, (this.newAllocsByClass.get(sc) ?? 0) + 1);
-    this.recordAcquire(sc);
+    this.recordWindowDemand(sc, "acquires");
     if (this.debugTrace) {
       console.log(`[pool] NEW allocation: ${(sizeBytes / 1e6).toFixed(2)} MB`);
     }
@@ -265,9 +272,7 @@ class SimpleBufferPool {
       for (let i = 0; i < count; i++) {
         if (this.pooledBytes + this.pendingReleaseBytes + size > this.maxPoolBytes) break;
         const buf = device.createBuffer({ size, usage: STORAGE_BUFFER_USAGE });
-        let bucket = this.pool.get(sizeClass);
-        if (!bucket) { bucket = []; this.pool.set(sizeClass, bucket); }
-        bucket.push(buf);
+        this.getBucket(sizeClass).push(buf);
         this.pooledBytes += size;
       }
     }
@@ -297,21 +302,12 @@ class SimpleBufferPool {
     this.computeReservation();
   }
 
-  private recordAcquire(sizeClass: number): void {
+  private recordWindowDemand(sizeClass: number, field: "acquires" | "releases"): void {
     if (!this.windowTracking) return;
     const wm = this.windowDemand[this.currentWindowId];
     if (!wm) return;
     const e = wm.get(sizeClass) ?? { acquires: 0, releases: 0 };
-    e.acquires++;
-    wm.set(sizeClass, e);
-  }
-
-  private recordRelease(sizeClass: number): void {
-    if (!this.windowTracking) return;
-    const wm = this.windowDemand[this.currentWindowId];
-    if (!wm) return;
-    const e = wm.get(sizeClass) ?? { acquires: 0, releases: 0 };
-    e.releases++;
+    e[field]++;
     wm.set(sizeClass, e);
   }
 
@@ -358,9 +354,7 @@ class SimpleBufferPool {
       for (let i = 0; i < deficit; i++) {
         if (this.pooledBytes + this.pendingReleaseBytes + size > this.maxPoolBytes) break;
         const buf = device.createBuffer({ size, usage: STORAGE_BUFFER_USAGE });
-        let b = this.pool.get(sizeClass);
-        if (!b) { b = []; this.pool.set(sizeClass, b); }
-        b.push(buf);
+        this.getBucket(sizeClass).push(buf);
         this.pooledBytes += size;
       }
     }
@@ -514,13 +508,11 @@ class SimpleBufferPool {
         remainingBytes += entry.size;
         continue;
       }
-      let bucket = this.pool.get(entry.sizeClass);
-      if (!bucket) { bucket = []; this.pool.set(entry.sizeClass, bucket); }
-      bucket.push(entry.buffer);
+      this.getBucket(entry.sizeClass).push(entry.buffer);
       this.pooledBytes += entry.size;
       // Record at promotion time (not release time) so the reservation formula
       // only counts buffers that actually become pool-available.
-      this.recordRelease(entry.sizeClass);
+      this.recordWindowDemand(entry.sizeClass, "releases");
     }
     this.pendingRelease = remaining;
     this.pendingReleaseBytes = remainingBytes;
@@ -587,9 +579,7 @@ class SimpleBufferPool {
    * Used when a pre-pinned buffer wasn't consumed and needs to go back.
    */
   returnToPool(buffer: GPUBuffer, sizeClass: number): void {
-    let bucket = this.pool.get(sizeClass);
-    if (!bucket) { bucket = []; this.pool.set(sizeClass, bucket); }
-    bucket.push(buffer);
+    this.getBucket(sizeClass).push(buffer);
     this.pooledBytes += getSizeForClass(sizeClass);
   }
 
@@ -599,7 +589,7 @@ class SimpleBufferPool {
   recordAcquireForPin(sizeClass: number): void {
     this.reuseCount++;
     this.acquireFromPool++;
-    this.recordAcquire(sizeClass);
+    this.recordWindowDemand(sizeClass, "acquires");
   }
 
   /**
