@@ -294,9 +294,7 @@ class StorageTracker {
    * Get debug info about the tensor ref holding a storage reachable.
    * Returns shape/dtype if the ref is a RuntimeTensor, or a description otherwise.
    */
-  getTensorRefDebugInfo(
-    storageId: number,
-  ): {
+  getTensorRefDebugInfo(storageId: number): {
     shape?: number[];
     dtype?: string;
     type: string;

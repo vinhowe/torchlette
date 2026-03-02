@@ -78,10 +78,10 @@ function makeUnscaleSpec(): TileKernelSpec {
       // Check finite via bit pattern
       const bits = g.bitcastTo("u32");
       const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xff));
-      const isFinite = exponent.ne(ctx.u32(0xff));
+      const isFiniteVal = exponent.ne(ctx.u32(0xff));
 
       ctx.ifThenElse(
-        isFinite,
+        isFiniteVal,
         () => {
           ctx.emitStore("grad_out", idx, g);
         },

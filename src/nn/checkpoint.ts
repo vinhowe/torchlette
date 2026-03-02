@@ -181,7 +181,7 @@ function checkpointNonReentrant<T extends Tensor>(
           },
         );
         // Keep captured tensors so they survive tidy disposal
-        for (const t of recomputedTensors?.values()) {
+        for (const t of recomputedTensors?.values() ?? []) {
           api.keep(t);
         }
       });
