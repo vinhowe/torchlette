@@ -29,26 +29,6 @@ import {
   releaseDeadTensors,
 } from "./storage-tracker";
 
-// ============================================================================
-// Constants
-// ============================================================================
-
-/** Ops safe to execute during tape replay fill-in: pure views + data sources. */
-const FILL_IN_OPS: ReadonlySet<string> = new Set([
-  // Pure view ops (no GPU dispatch, same buffer)
-  "reshape",
-  "transpose",
-  "permute",
-  "expand",
-  "narrow",
-  "contiguous",
-  // Data source ops (create new buffers from host data)
-  "tensorFromArray",
-  "zeros",
-  "full",
-  "arange",
-]);
-
 /**
  * Replace pending input refs with materialized storages from previous segments.
  * Clone-on-write: only copies the inputs array if a substitution is needed,
@@ -122,18 +102,11 @@ export async function executePlan(
   if (useSharedEncoder) beginSharedEncoder();
 
   try {
-    const viewOnly = options?.viewOpsOnly === true;
-
     for (let step = 0; step < plan.nodes.length; step++) {
       const node = plan.nodes[step];
 
       // Skip nodes that already have results (from a prior plan execution within this step).
       if (node.result) continue;
-
-      // In view-only mode (tape replay fill-in), skip compute ops.
-      // Only view ops and data-source ops need execution; compute ops are
-      // either already handled by replay or are intermediate fused nodes.
-      if (viewOnly && !FILL_IN_OPS.has(node.op)) continue;
 
       // For multi-device graphs, use the node's device backend
       const nodeBackend = getBackend(node.device) ?? backend;
@@ -190,24 +163,32 @@ export async function executePlan(
 // Segmented Execution for Checkpointing
 // ============================================================================
 
+/** Options for segmented plan execution at checkpoint boundaries. */
+export interface SegmentedPlanOptions extends ExecutePlanOptions {
+  /**
+   * When true, uses GPU synchronization between segments: batches all ops
+   * into a single command buffer, submits and waits for GPU completion,
+   * then frees dead buffers before the next segment. Enables running models
+   * that wouldn't fit in GPU memory.
+   *
+   * When false (default), just flushes the buffer pool between segments
+   * without GPU sync — lighter weight but doesn't actually free GPU memory.
+   */
+  gpuSync?: boolean;
+  /** Callback to flush the buffer pool between segments. Required when gpuSync is false. */
+  flushBufferPoolFn?: () => void;
+}
+
 /**
  * Execute a plan with segmentation at checkpoint boundaries.
  *
- * This enables memory savings for large models by:
- * 1. Executing each segment (up to a checkpoint boundary)
- * 2. Flushing the buffer pool after each segment
- * 3. Making released buffers available for subsequent segments
- *
- * @param plan - The execution plan
- * @param backend - The backend to use
- * @param options - Execution options
- * @param flushBufferPool - Callback to flush the buffer pool (backend-specific)
+ * Splits the plan at checkpoint boundaries and executes each segment,
+ * freeing buffers between segments for memory savings.
  */
-export async function executePlanWithCheckpointSegments(
+export async function executePlanSegmented(
   plan: ExecutionPlan,
   backend: Backend,
-  options: ExecutePlanOptions | undefined,
-  flushBufferPool: () => void,
+  options?: SegmentedPlanOptions,
 ): Promise<StorageHandle> {
   // Check if plan has any checkpoint boundaries
   const hasCheckpointBoundaries = plan.nodes.some(
@@ -215,173 +196,103 @@ export async function executePlanWithCheckpointSegments(
   );
 
   if (!hasCheckpointBoundaries) {
-    // No segmentation needed - use regular execution
     return executePlan(plan, backend, options);
   }
 
-  // Segment the plan at checkpoint boundaries
   const segments = segmentPlanAtCheckpoints(plan);
 
   if (segments.length === 1) {
-    // Only one segment - use regular execution
     return executePlan(plan, backend, options);
   }
 
-  // Execute each segment, flushing buffers between them
-  let lastResult: StorageHandle | null = null;
-
-  // Track all materialized storages across segments
-  const materializedStorages = new Map<number, StorageHandle>();
-
-  for (let i = 0; i < segments.length; i++) {
-    const segment = segments[i];
-
-    materializeSegmentInputs(segment.nodes, materializedStorages);
-
-    // Execute this segment
-    lastResult = await executePlan(segment, backend, options);
-
-    // Track all materialized results from this segment
-    for (const node of segment.nodes) {
-      if (node.result) {
-        materializedStorages.set(node.id, node.result);
-      }
-    }
-
-    // Flush buffer pool after each segment (except the last)
-    // This makes released buffers available for the next segment
-    if (i < segments.length - 1) {
-      flushBufferPool();
-    }
-  }
-
-  if (!lastResult) {
-    throw new Error("Segmented execution failed: no result");
-  }
-
-  return lastResult;
-}
-
-// ============================================================================
-// True Segmented Execution with GPU Synchronization
-// ============================================================================
-
-/**
- * Execute a plan with true segmented execution using GPU synchronization.
- *
- * Unlike executePlanWithCheckpointSegments which just flushes the buffer pool,
- * this version:
- * 1. Batches all ops in a segment into a single command buffer
- * 2. Submits and waits for GPU completion between segments
- * 3. Actually frees GPU memory before next segment starts
- *
- * This enables running models that wouldn't fit in GPU memory when using
- * checkpoint-based training.
- *
- * @param plan - The execution plan
- * @param backend - The backend to use
- * @param options - Execution options
- */
-export async function executePlanWithTrueSegments(
-  plan: ExecutionPlan,
-  backend: Backend,
-  options?: ExecutePlanOptions,
-): Promise<StorageHandle> {
-  // Check if plan has any checkpoint boundaries
-  const hasCheckpointBoundaries = plan.nodes.some(
-    (n) => n.isCheckpointBoundary,
-  );
-
-  if (!hasCheckpointBoundaries) {
-    // No segmentation needed - use regular execution
-    return executePlan(plan, backend, options);
-  }
-
-  // Segment the plan at checkpoint boundaries
-  const segments = segmentPlanAtCheckpoints(plan);
-
-  if (segments.length === 1) {
-    // Only one segment - use regular execution
-    return executePlan(plan, backend, options);
-  }
-
-  // Track cross-segment data flow
+  const gpuSync = options?.gpuSync ?? false;
   const materializedStorages = new Map<number, StorageHandle>();
   let lastResult: StorageHandle | null = null;
-  const finalOutputId = plan.nodes[plan.nodes.length - 1].id;
+  const finalOutputId = gpuSync ? plan.nodes[plan.nodes.length - 1].id : 0;
 
   for (let segIdx = 0; segIdx < segments.length; segIdx++) {
     const segment = segments[segIdx];
     const isLastSegment = segIdx === segments.length - 1;
 
-    // Find outputs needed by later segments
-    const survivingNodeIds = findSurvivingOutputs(
-      segment,
-      segments.slice(segIdx + 1),
-      finalOutputId,
-    );
-
     materializeSegmentInputs(segment.nodes, materializedStorages);
 
-    // Begin batched execution - all ops encode to shared command buffer
-    beginBatchExecution();
+    if (gpuSync) {
+      // GPU sync path: batch ops, submit, wait, then release dead buffers
+      const survivingNodeIds = findSurvivingOutputs(
+        segment,
+        segments.slice(segIdx + 1),
+        finalOutputId,
+      );
 
-    try {
-      const nodeToStorage = new Map<number, StorageHandle>();
+      beginBatchExecution();
 
-      // Execute all ops in segment (encode to shared encoder, no GPU submit yet)
-      for (const node of segment.nodes) {
-        const nodeBackend = getBackend(node.device) ?? backend;
-        const inputs = node.inputs.map((ref) =>
-          getInputStorage(ref, nodeBackend),
-        );
-        const backendInputs = inputs.map((s) => s.backendTensor);
+      try {
+        const nodeToStorage = new Map<number, StorageHandle>();
 
-        const resultTensor = await executeOp(node, backendInputs, nodeBackend);
-
-        node.result = wrapResultAsStorage(
-          node.device,
-          resultTensor,
-          backendInputs,
-          inputs,
-        );
-        nodeToStorage.set(node.id, node.result);
-        materializedStorages.set(node.id, node.result);
-      }
-
-      // End batch - submits command buffer and WAITS for GPU completion
-      await endBatchExecution();
-
-      // NOW safe to release dead buffers (GPU work is complete)
-      if (!isLastSegment) {
         for (const node of segment.nodes) {
-          if (!survivingNodeIds.has(node.id)) {
-            const storage = nodeToStorage.get(node.id);
-            if (storage && canSafelyRelease(storage, nodeToStorage)) {
-              releaseBufferImmediate(storage);
-              nodeToStorage.delete(node.id);
-              materializedStorages.delete(node.id);
-            }
-          }
+          const nodeBackend = getBackend(node.device) ?? backend;
+          const inputs = node.inputs.map((ref) =>
+            getInputStorage(ref, nodeBackend),
+          );
+          const backendInputs = inputs.map((s) => s.backendTensor);
+
+          const resultTensor = await executeOp(
+            node,
+            backendInputs,
+            nodeBackend,
+          );
+          node.result = wrapResultAsStorage(
+            node.device,
+            resultTensor,
+            backendInputs,
+            inputs,
+          );
+          nodeToStorage.set(node.id, node.result);
+          materializedStorages.set(node.id, node.result);
         }
 
-        // Flush buffer pool - buffers now available for next segment
-        flushBufferPool();
+        await endBatchExecution();
+
+        if (!isLastSegment) {
+          for (const node of segment.nodes) {
+            if (!survivingNodeIds.has(node.id)) {
+              const storage = nodeToStorage.get(node.id);
+              if (storage && canSafelyRelease(storage, nodeToStorage)) {
+                releaseBufferImmediate(storage);
+                nodeToStorage.delete(node.id);
+                materializedStorages.delete(node.id);
+              }
+            }
+          }
+          flushBufferPool();
+        }
+
+        const lastNode = segment.nodes[segment.nodes.length - 1];
+        lastResult = lastNode.result ?? undefined;
+      } catch (error) {
+        if (isBatchActive()) {
+          abortBatch();
+        }
+        throw error;
+      }
+    } else {
+      // Lightweight path: execute via executePlan, flush pool between segments
+      lastResult = await executePlan(segment, backend, options);
+
+      for (const node of segment.nodes) {
+        if (node.result) {
+          materializedStorages.set(node.id, node.result);
+        }
       }
 
-      const lastNode = segment.nodes[segment.nodes.length - 1];
-      lastResult = lastNode.result ?? undefined;
-    } catch (error) {
-      // Clean up batch on error
-      if (isBatchActive()) {
-        abortBatch();
+      if (!isLastSegment && options?.flushBufferPoolFn) {
+        options.flushBufferPoolFn();
       }
-      throw error;
     }
   }
 
   if (!lastResult) {
-    throw new Error("True segmented execution failed: no result");
+    throw new Error("Segmented execution failed: no result");
   }
 
   return lastResult;

@@ -16,8 +16,7 @@ export {
 // ── Sequential executor ───────────────────────────────────────────────────────
 export {
   executePlan,
-  executePlanWithCheckpointSegments,
-  executePlanWithTrueSegments,
+  executePlanSegmented,
 } from "./executor-sequential";
 // ── Types, interfaces, ref constructors, type guards ──────────────────────────
 export type {
