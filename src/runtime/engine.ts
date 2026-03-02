@@ -1191,59 +1191,22 @@ export class RuntimeEngine {
     return { refA: resA.ref, refB: resB.ref, shape, dtype: ref.dtype, device: ref.device };
   }
 
-  add(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp("add", a, b);
-    const node = createLazyIRNode("add", [refA, refB], shape, dtype, device);
+  private _binaryOp(op: LazyOpCode, a: TensorOrScalar, b: TensorOrScalar, payload?: unknown): Tensor {
+    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp(op, a, b);
+    const node = createLazyIRNode(op, [refA, refB], shape, dtype, device, payload);
     return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
   }
 
-  sub(a: TensorOrScalar, b: TensorOrScalar, options?: SubOptions): Tensor {
-    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp("sub", a, b);
-    const node = createLazyIRNode("sub", [refA, refB], shape, dtype, device, options);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
-  }
+  add(a: TensorOrScalar, b: TensorOrScalar): Tensor { return this._binaryOp("add", a, b); }
+  sub(a: TensorOrScalar, b: TensorOrScalar, options?: SubOptions): Tensor { return this._binaryOp("sub", a, b, options); }
+  div(a: TensorOrScalar, b: TensorOrScalar, options?: DivOptions): Tensor { return this._binaryOp("div", a, b, options); }
+  mul(a: TensorOrScalar, b: TensorOrScalar): Tensor { return this._binaryOp("mul", a, b); }
+  pow(a: TensorOrScalar, b: TensorOrScalar): Tensor { return this._binaryOp("pow", a, b); }
 
-  div(a: TensorOrScalar, b: TensorOrScalar, options?: DivOptions): Tensor {
-    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp("div", a, b);
-    const node = createLazyIRNode("div", [refA, refB], shape, dtype, device, options);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
-  }
-
-  mul(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp("mul", a, b);
-    const node = createLazyIRNode("mul", [refA, refB], shape, dtype, device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
-  }
-
-  pow(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp("pow", a, b);
-    const node = createLazyIRNode("pow", [refA, refB], shape, dtype, device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
-  }
-
-  view(a: Tensor, shape: number[]): Tensor {
-    const node = createLazyIRNode(
-      "reshape",
-      [a.lazyRef],
-      shape,
-      a.dtype,
-      a.device,
-      { targetShape: shape },
-    );
-    // View shares baseId with input
-    return this.createAndTrack(a.baseId, createPendingRef(node), shape, a.device, a.dtype);
-  }
+  view(a: Tensor, shape: number[]): Tensor { return this.reshape(a, shape); }
 
   reshape(a: Tensor, shape: number[]): Tensor {
-    const node = createLazyIRNode(
-      "reshape",
-      [a.lazyRef],
-      shape,
-      a.dtype,
-      a.device,
-      { targetShape: shape },
-    );
-    // Reshape shares baseId with input
+    const node = createLazyIRNode("reshape", [a.lazyRef], shape, a.dtype, a.device, { targetShape: shape });
     return this.createAndTrack(a.baseId, createPendingRef(node), shape, a.device, a.dtype);
   }
 
@@ -1302,29 +1265,13 @@ export class RuntimeEngine {
   }
 
   expand(a: Tensor, shape: number[]): Tensor {
-    const node = createLazyIRNode(
-      "expand",
-      [a.lazyRef],
-      shape,
-      a.dtype,
-      a.device,
-      { targetShape: shape },
-    );
-    // Expand shares baseId with input
+    const node = createLazyIRNode("expand", [a.lazyRef], shape, a.dtype, a.device, { targetShape: shape });
     return this.createAndTrack(a.baseId, createPendingRef(node), shape, a.device, a.dtype);
   }
 
   transpose(a: Tensor, options: TransposeOptions): Tensor {
     const shape = transposeShape(a.shape, options);
-    const node = createLazyIRNode(
-      "transpose",
-      [a.lazyRef],
-      shape,
-      a.dtype,
-      a.device,
-      options,
-    );
-    // Transpose shares baseId with input
+    const node = createLazyIRNode("transpose", [a.lazyRef], shape, a.dtype, a.device, options);
     return this.createAndTrack(a.baseId, createPendingRef(node), shape, a.device, a.dtype);
   }
 
@@ -1365,23 +1312,7 @@ export class RuntimeEngine {
   }
 
   contiguous(a: Tensor): Tensor {
-    // contiguous materializes non-contiguous tensors to new contiguous buffer
-    const node = createLazyIRNode(
-      "contiguous",
-      [a.lazyRef],
-      a.shape,
-      a.dtype,
-      a.device,
-      undefined,
-    );
-    // contiguous may create new storage, so gets new baseId
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape,
-      a.device,
-      a.dtype,
-    );
+    return this._unaryOp("contiguous", a);
   }
 
   narrow(a: Tensor, dim: number, start: number, length: number): Tensor {
@@ -1407,56 +1338,21 @@ export class RuntimeEngine {
   }
 
   narrowBackward(grad: Tensor, dim: number, start: number, originalLength: number): Tensor {
-    const shape = grad.shape.slice();
-    shape[dim] = originalLength;
-    const node = createLazyIRNode(
-      "narrowBackward",
-      [grad.lazyRef],
-      shape,
-      grad.dtype,
-      grad.device,
-      { dim, start, originalLength },
-    );
+    const shape = grad.shape.slice(); shape[dim] = originalLength;
+    const node = createLazyIRNode("narrowBackward", [grad.lazyRef], shape, grad.dtype, grad.device, { dim, start, originalLength });
     return this.createAndTrack(createBaseId(), createPendingRef(node), shape, grad.device, grad.dtype);
   }
 
-  /**
-   * Cast tensor to a different dtype.
-   * Returns a new tensor with the specified dtype.
-   */
   cast(a: Tensor, dtype: DType): Tensor {
-    const node = createLazyIRNode(
-      "cast",
-      [a.lazyRef],
-      a.shape,
-      dtype,
-      a.device,
-      { dtype },
-    );
-    // cast creates new storage with different dtype
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape,
-      a.device,
-      dtype,
-    );
+    const node = createLazyIRNode("cast", [a.lazyRef], a.shape.slice(), dtype, a.device, { dtype });
+    return this.createAndTrack(createBaseId(), createPendingRef(node), a.shape.slice(), a.device, dtype);
   }
 
   gather(a: Tensor, index: Tensor, options: GatherOptions): Tensor {
     const device = this.assertSameDevice(a, index);
-    // Gather output shape matches index shape
     const shape = index.shape.slice();
-    const dtype = a.dtype;
-    const node = createLazyIRNode(
-      "gather",
-      [a.lazyRef, index.lazyRef],
-      shape,
-      dtype,
-      device,
-      options,
-    );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
+    const node = createLazyIRNode("gather", [a.lazyRef, index.lazyRef], shape, a.dtype, device, options);
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, a.dtype);
   }
 
   scatterAdd(
@@ -1503,115 +1399,29 @@ export class RuntimeEngine {
     return this.createAndTrack(createBaseId(), createPendingRef(node), outShape, device, dtype);
   }
 
-  sum(a: Tensor, options?: SumOptions): Tensor {
-    const [op] = this.ensureDtypeSafety("sum", [a]);
-    const shape = reduceShape(op.shape, options?.dim, options?.keepdim ?? false);
-
-    // If reducing to scalar and no keepdim, return number
-    // But we can't know the actual value without forcing - return a tensor
-    const dtype = op.dtype;
-    const node = createLazyIRNode(
-      "sum",
-      [op.lazyRef],
-      shape,
-      dtype,
-      op.device,
-      options,
-    );
-
-    // If output is scalar [], we still return a Tensor for lazy evaluation
-    // The frontend will handle scalar conversion at force time
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, op.device, dtype);
+  private _reductionOp(op: LazyOpCode, a: Tensor, options?: { dim?: number | number[]; keepdim?: boolean }): Tensor {
+    const [safe] = this.ensureDtypeSafety(op, [a]);
+    const shape = reduceShape(safe.shape, options?.dim, options?.keepdim ?? false);
+    const node = createLazyIRNode(op, [safe.lazyRef], shape, safe.dtype, safe.device, options);
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, safe.device, safe.dtype);
   }
 
-  max(a: Tensor, options?: MaxOptions): number | Tensor {
-    const [op] = this.ensureDtypeSafety("max", [a]);
-    const shape = reduceShape(op.shape, options?.dim, options?.keepdim ?? false);
-    const dtype = op.dtype;
+  sum(a: Tensor, options?: SumOptions): Tensor { return this._reductionOp("sum", a, options); }
+  max(a: Tensor, options?: MaxOptions): number | Tensor { return this._reductionOp("max", a, options); }
+  min(a: Tensor, options?: MaxOptions): number | Tensor { return this._reductionOp("min", a, options); }
+  mean(a: Tensor, options?: MeanOptions): number | Tensor { return this._reductionOp("mean", a, options); }
 
-    const node = createLazyIRNode(
-      "max",
-      [op.lazyRef],
-      shape,
-      dtype,
-      op.device,
-      options,
-    );
-
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, op.device, dtype);
-  }
-
-  min(a: Tensor, options?: MaxOptions): number | Tensor {
-    const [op] = this.ensureDtypeSafety("min", [a]);
-    const shape = reduceShape(op.shape, options?.dim, options?.keepdim ?? false);
-    const dtype = op.dtype;
-
-    const node = createLazyIRNode(
-      "min",
-      [op.lazyRef],
-      shape,
-      dtype,
-      op.device,
-      options,
-    );
-
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, op.device, dtype);
-  }
-
-  mean(a: Tensor, options?: MeanOptions): number | Tensor {
-    const [op] = this.ensureDtypeSafety("mean", [a]);
-    const shape = reduceShape(op.shape, options?.dim, options?.keepdim ?? false);
-    const dtype = op.dtype;
-
-    const node = createLazyIRNode(
-      "mean",
-      [op.lazyRef],
-      shape,
-      dtype,
-      op.device,
-      options,
-    );
-
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, op.device, dtype);
-  }
-
-  argmax(a: Tensor, options: ArgReduceOptions): Tensor {
-    const normalizedDim =
-      options.dim < 0 ? a.shape.length + options.dim : options.dim;
+  private _argReduceOp(op: LazyOpCode, a: Tensor, options: ArgReduceOptions): Tensor {
+    const dim = options.dim < 0 ? a.shape.length + options.dim : options.dim;
     const shape = options.keepdim
-      ? a.shape.map((s, i) => (i === normalizedDim ? 1 : s))
-      : a.shape.filter((_, i) => i !== normalizedDim);
-
-    const node = createLazyIRNode(
-      "argmax",
-      [a.lazyRef],
-      shape,
-      "f32",
-      a.device,
-      { dim: normalizedDim, keepdim: options.keepdim },
-    );
-
+      ? a.shape.map((s, i) => (i === dim ? 1 : s))
+      : a.shape.filter((_, i) => i !== dim);
+    const node = createLazyIRNode(op, [a.lazyRef], shape, "f32", a.device, { dim, keepdim: options.keepdim });
     return this.createAndTrack(createBaseId(), createPendingRef(node), shape, a.device);
   }
 
-  argmin(a: Tensor, options: ArgReduceOptions): Tensor {
-    const normalizedDim =
-      options.dim < 0 ? a.shape.length + options.dim : options.dim;
-    const shape = options.keepdim
-      ? a.shape.map((s, i) => (i === normalizedDim ? 1 : s))
-      : a.shape.filter((_, i) => i !== normalizedDim);
-
-    const node = createLazyIRNode(
-      "argmin",
-      [a.lazyRef],
-      shape,
-      "f32",
-      a.device,
-      { dim: normalizedDim, keepdim: options.keepdim },
-    );
-
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, a.device);
-  }
+  argmax(a: Tensor, options: ArgReduceOptions): Tensor { return this._argReduceOp("argmax", a, options); }
+  argmin(a: Tensor, options: ArgReduceOptions): Tensor { return this._argReduceOp("argmin", a, options); }
 
   gt(a: TensorOrScalar, b: TensorOrScalar): Tensor { return this._comparisonOp("gt", a, b); }
   lt(a: TensorOrScalar, b: TensorOrScalar): Tensor { return this._comparisonOp("lt", a, b); }
@@ -1697,117 +1507,27 @@ export class RuntimeEngine {
   // In-place operations (§4.3-4.4)
   // ============================================================================
 
-  /**
-   * Copy src values into dst tensor in-place.
-   * Returns dst (same tensor object) with updated lazyRef.
-   *
-   * Per spec §4.4, this uses strided_scatter_copy to copy src into dst.
-   */
-  copy_(dst: Tensor, src: Tensor): Tensor {
+  /** Shared logic for in-place scatter ops (copy_, add_). */
+  private _scatterInPlace(op: "stridedScatterCopy" | "stridedScatterAdd", label: string, dst: Tensor, src: Tensor): Tensor {
     this.assertSameDevice(dst, src);
-    this.assertShapeMatch("copy_", dst, src);
-
-    // Create strided scatter copy node
-    // For full tensor copy: offset=0, viewShape=dst.shape, viewStrides=contiguous
-    const viewStrides = computeContiguousStrides(dst.shape);
+    this.assertShapeMatch(label, dst, src);
     const payload: StridedScatterOptions = {
-      offset: 0,
-      viewShape: dst.shape.slice(),
-      viewStrides,
+      offset: 0, viewShape: dst.shape.slice(), viewStrides: computeContiguousStrides(dst.shape),
     };
-
-    const node = createLazyIRNode(
-      "stridedScatterCopy",
-      [dst.lazyRef, src.lazyRef],
-      dst.shape,
-      dst.dtype,
-      dst.device,
-      payload,
-    );
-
-    // Update dst's lazyRef to the new node
+    const node = createLazyIRNode(op, [dst.lazyRef, src.lazyRef], dst.shape, dst.dtype, dst.device, payload);
     dst._updateLazyRef(createPendingRef(node));
-
     return dst;
   }
 
-  /**
-   * Add src values to dst tensor in-place.
-   * Returns dst (same tensor object) with updated lazyRef.
-   *
-   * Per spec §4.4, this uses strided_scatter_add to add src into dst.
-   */
-  add_(dst: Tensor, src: Tensor): Tensor {
-    this.assertSameDevice(dst, src);
-    this.assertShapeMatch("add_", dst, src);
+  copy_(dst: Tensor, src: Tensor): Tensor { return this._scatterInPlace("stridedScatterCopy", "copy_", dst, src); }
+  add_(dst: Tensor, src: Tensor): Tensor { return this._scatterInPlace("stridedScatterAdd", "add_", dst, src); }
 
-    // Create strided scatter add node
-    const viewStrides = computeContiguousStrides(dst.shape);
-    const payload: StridedScatterOptions = {
-      offset: 0,
-      viewShape: dst.shape.slice(),
-      viewStrides,
-    };
+  zero_(dst: Tensor): Tensor { return this.copy_(dst, this.zeros(dst.shape, dst.device)); }
+  fill_(dst: Tensor, value: number): Tensor { return this.copy_(dst, this.full(dst.shape, value, dst.device)); }
+  mul_(dst: Tensor, value: number): Tensor { return this.copy_(dst, this.mul(dst, value)); }
 
-    const node = createLazyIRNode(
-      "stridedScatterAdd",
-      [dst.lazyRef, src.lazyRef],
-      dst.shape,
-      dst.dtype,
-      dst.device,
-      payload,
-    );
-
-    // Update dst's lazyRef to the new node
-    dst._updateLazyRef(createPendingRef(node));
-
-    return dst;
-  }
-
-  /**
-   * Zero out a tensor in-place.
-   * Returns dst (same tensor object) with updated lazyRef.
-   */
-  zero_(dst: Tensor): Tensor {
-    // Create a zeros tensor and copy it into dst
-    const zerosTensor = this.zeros(dst.shape, dst.device);
-    return this.copy_(dst, zerosTensor);
-  }
-
-  /**
-   * Fill a tensor with a scalar value in-place.
-   * Returns dst (same tensor object) with updated lazyRef.
-   */
-  fill_(dst: Tensor, value: number): Tensor {
-    const valuesTensor = this.full(dst.shape, value, dst.device);
-    return this.copy_(dst, valuesTensor);
-  }
-
-  /**
-   * Multiply tensor by scalar in-place.
-   * Returns dst (same tensor object) with updated lazyRef.
-   */
-  mul_(dst: Tensor, value: number): Tensor {
-    // Multiply by scalar and copy result back to dst
-    const scaledTensor = this.mul(dst, value);
-    return this.copy_(dst, scaledTensor);
-  }
-
-  /**
-   * Begin step-level shared encoder scope.
-   * Keeps GPU command encoder open across force() boundaries.
-   */
-  async beginStep(): Promise<void> {
-    await this.getBackend().beginStep?.();
-  }
-
-  /**
-   * End step-level shared encoder scope.
-   * Submits all remaining encoded GPU work.
-   */
-  endStep(): void {
-    this.getBackend().endStep?.();
-  }
+  async beginStep(): Promise<void> { await this.getBackend().beginStep?.(); }
+  endStep(): void { this.getBackend().endStep?.(); }
 
   /**
    * Wrap a raw BackendTensor into a tracked RuntimeTensor.
