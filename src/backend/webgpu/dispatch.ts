@@ -126,13 +126,7 @@ export function dispatchElementwise(desc: {
 
   const paramsBuffer = createParamsBuffer(ctx.device, desc.params);
 
-  const bgBuffers: GPUBuffer[] = [];
-  for (let i = 0; i < desc.inputs.length; i++) {
-    bgBuffers.push(desc.inputs[i]);
-  }
-  bgBuffers.push(outBuffer);
-  bgBuffers.push(paramsBuffer);
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, bgBuffers);
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [...desc.inputs, outBuffer, paramsBuffer]);
 
   dispatchComputePass(pipeline, bindGroup, desc.dispatchX, desc.dispatchY ?? 1);
 

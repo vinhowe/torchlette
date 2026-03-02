@@ -23,7 +23,7 @@ import {
 } from "./tile-ir";
 import { compileTileKernel } from "./tile-compiler";
 import { applyFusedOp, dtypeToTileIR } from "./fusion-tile-ir";
-import { WORKGROUP_SIZE } from "./shape-utils";
+import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 import type { DType } from "../types";
 
 const WG = WORKGROUP_SIZE; // 256
@@ -320,8 +320,8 @@ export function makeReductionSpec(config: ReductionConfig): TileKernelSpec {
       uniforms: { outSize: "u32", reductionSize: "u32" },
       grid: (u) => {
         const n = u.outSize;
-        if (n <= 65535) return [n];
-        return [Math.min(n, 65535), Math.ceil(n / 65535)];
+        if (n <= MAX_WORKGROUPS_PER_DIM) return [n];
+        return [Math.min(n, MAX_WORKGROUPS_PER_DIM), Math.ceil(n / MAX_WORKGROUPS_PER_DIM)];
       },
       kernel(ctx) {
         const tid = ctx.localIndex();

@@ -8,7 +8,7 @@ import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import {
   sizeOf, WORKGROUP_SIZE, compute2DDispatch,
   contiguousStrides, checkContiguousStrides, dtypeBytes, dtypeToWgsl,
-  alignBufferSize, gcd, lcm,
+  alignBufferSize, lcm, alignedChunkSize,
 } from "../shape-utils";
 import { requireContext, isF16Supported, f16WeightCache, f32ArrayToF16Array, f16ArrayToF32Array, f16ToF32, f32ToF16 } from "../gpu-context";
 import { dispatchComputePass, dispatchElementwise, getPipeline } from "../dispatch";
@@ -473,18 +473,8 @@ function contiguousChunked(
     // How many input columns (= K elements each) fit in binding limit?
     const maxInputCols = Math.floor(maxBindingSize / bytesPerInputRow);
 
-    // Align row counts for buffer offsets
-    const outputRowAlignment = minAlignment / gcd(bytesPerOutputRow, minAlignment);
-    const inputColAlignment = minAlignment / gcd(bytesPerInputRow, minAlignment);
-
-    const alignedOutputRows = Math.max(
-      outputRowAlignment,
-      Math.floor(maxOutputRows / outputRowAlignment) * outputRowAlignment
-    );
-    const alignedInputCols = Math.max(
-      inputColAlignment,
-      Math.floor(maxInputCols / inputColAlignment) * inputColAlignment
-    );
+    const alignedOutputRows = alignedChunkSize(bytesPerOutputRow, maxOutputRows, minAlignment);
+    const alignedInputCols = alignedChunkSize(bytesPerInputRow, maxInputCols, minAlignment);
 
     // Process output in row chunks, and within each row chunk, process input in column chunks
     const numOutputRowChunks = Math.ceil(K / alignedOutputRows);
@@ -635,12 +625,12 @@ export function narrowBackward(grad: BackendTensor, dim: number, start: number, 
 
   const outShape = gradTensor.shape.slice();
   outShape[dim] = originalLength;
-  const outSize = outShape.reduce((a, b) => a * b, 1);
+  const outSize = sizeOf(outShape);
   const dtype = gradTensor.dtype;
   const bytesPerElement = dtype === "f16" ? 2 : 4;
 
-  const outerSize = outShape.slice(0, dim).reduce((a, b) => a * b, 1);
-  const innerSize = outShape.slice(dim + 1).reduce((a, b) => a * b, 1);
+  const outerSize = sizeOf(outShape.slice(0, dim));
+  const innerSize = sizeOf(outShape.slice(dim + 1));
   const gradDimSize = gradTensor.shape[dim]; // = length from narrow
   const outDimSize = originalLength;
 
