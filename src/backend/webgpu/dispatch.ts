@@ -77,26 +77,18 @@ export function dispatchComputePass(
 
   const sharedEnc = getSharedEncoderInstance();
   const tsWrites = getTimestampWrites(label ?? "unknown");
+  const encoder = sharedEnc ?? ctx.device.createCommandEncoder();
+  const pass = encoder.beginComputePass(
+    tsWrites ? { timestampWrites: tsWrites } : undefined,
+  );
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup as GPUBindGroup);
+  pass.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
+  pass.end();
   if (sharedEnc) {
-    // Encode directly onto the shared encoder — no new encoder or CB
-    const pass = sharedEnc.beginComputePass(
-      tsWrites ? { timestampWrites: tsWrites } : undefined,
-    );
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup as GPUBindGroup);
-    pass.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
-    pass.end();
     incrementSharedEncoderPassCount();
     autoFlushSharedEncoder();
   } else {
-    const encoder = ctx.device.createCommandEncoder();
-    const pass = encoder.beginComputePass(
-      tsWrites ? { timestampWrites: tsWrites } : undefined,
-    );
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup as GPUBindGroup);
-    pass.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
-    pass.end();
     submitOrCollect(encoder.finish());
   }
 }

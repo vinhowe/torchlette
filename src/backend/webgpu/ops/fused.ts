@@ -30,6 +30,15 @@ import {
 } from "../profiler";
 import { gpuMemoryTracker } from "../memory-tracker";
 import { asContiguous, ensureContiguous } from "./views";
+import type { WebGPUTensor } from "../gpu-types";
+
+/** Destroy contiguous copies that differ from their originals. */
+function cleanupContiguous(...pairs: [BackendTensor, WebGPUTensor][]) {
+  for (const [orig, copy] of pairs) {
+    if (copy !== orig) destroyCopy(copy);
+  }
+}
+
 import { dispatchAdamStep as dispatchAdamStepKernel } from "../adam-kernel";
 import { dispatchUnscaleGrad as dispatchUnscaleGradKernel, allocateInfFlagBuffer, readInfFlag } from "../unscale-kernel";
 import { dispatchCrossEntropyForward as dispatchCEForwardKernel, dispatchCrossEntropyBackward as dispatchCEBackwardKernel } from "../cross-entropy-kernel";
@@ -149,8 +158,7 @@ export async function adamStep(
       flushSharedEncoder();
     }
 
-    // Destroy contiguous copy for grad only (read-only input, safe to free).
-    if (gradT !== asGPUTensor(grad)) destroyCopy(gradT);
+    cleanupContiguous([grad, gradT]);
 
     // Cache the f16 param buffer (keyed by the param buffer, same as before)
     if (result.paramF16Buffer) {
@@ -200,8 +208,7 @@ export function unscaleGrad(
     invScale,
     infFlagBuffer as GPUBuffer,
   );
-  // Destroy contiguous copy if one was created (deferred for GPU fence)
-  if (gradT !== asGPUTensor(grad)) destroyCopy(gradT);
+  cleanupContiguous([grad, gradT]);
   return createTensor(gradT.shape, result.gradOutBuffer);
 }
 
@@ -227,9 +234,7 @@ export function fusedCrossEntropyForward(
   const outBuf = dispatchCEForwardKernel(
     logitsT.buffer, targetsT.buffer, config.batchSize, config.vocabSize,
   );
-  // Destroy contiguous copies if created (deferred for GPU fence)
-  if (logitsT !== logits) destroyCopy(logitsT);
-  if (targetsT !== targets) destroyCopy(targetsT);
+  cleanupContiguous([logits, logitsT], [targets, targetsT]);
   return createTensor([config.batchSize], outBuf);
 }
 
@@ -246,10 +251,7 @@ export function fusedCrossEntropyBackward(
     logitsT.buffer, targetsT.buffer, gradT.buffer,
     config.batchSize, config.vocabSize,
   );
-  // Destroy contiguous copies if created (deferred for GPU fence)
-  if (logitsT !== logits) destroyCopy(logitsT);
-  if (targetsT !== targets) destroyCopy(targetsT);
-  if (gradT !== gradOutput) destroyCopy(gradT);
+  cleanupContiguous([logits, logitsT], [targets, targetsT], [gradOutput, gradT]);
   return createTensor([config.batchSize, config.vocabSize], outBuf);
 }
 
@@ -270,10 +272,7 @@ export function fusedLayerNormForward(
     xT.buffer, weightT.buffer, biasT.buffer,
     config.numRows, config.featureDim, config.eps,
   );
-  // Destroy contiguous copies if created (deferred for GPU fence)
-  if (xT !== x) destroyCopy(xT);
-  if (weightT !== weight) destroyCopy(weightT);
-  if (biasT !== bias) destroyCopy(biasT);
+  cleanupContiguous([x, xT], [weight, weightT], [bias, biasT]);
   return createTensor(xT.shape.slice(), outBuf);
 }
 
@@ -291,12 +290,7 @@ export function fusedLayerNormBackwardGradX(
     gradT.buffer, xT.buffer, weightT.buffer,
     config.numRows, config.featureDim, config.eps,
   );
-
-  // Destroy contiguous copies if created (deferred for GPU fence)
-  if (gradT !== gradOutput) destroyCopy(gradT);
-  if (xT !== x) destroyCopy(xT);
-  if (weightT !== weight) destroyCopy(weightT);
-
+  cleanupContiguous([gradOutput, gradT], [x, xT], [weight, weightT]);
   return createTensor(xT.shape.slice(), gradXBuf);
 }
 
@@ -311,11 +305,7 @@ export function fusedLayerNormBackwardGradWeightBias(
     gradT.buffer, xT.buffer,
     config.numRows, config.featureDim, config.eps,
   );
-
-  // Destroy contiguous copies if created (deferred for GPU fence)
-  if (gradT !== gradOutput) destroyCopy(gradT);
-  if (xT !== x) destroyCopy(xT);
-
+  cleanupContiguous([gradOutput, gradT], [x, xT]);
   const shape = [config.featureDim];
   return {
     gradWeight: createTensor(shape, result.gradWeightBuffer),
@@ -338,8 +328,7 @@ export function fusedRMSNormForward(
     xT.buffer, weightT.buffer,
     config.numRows, config.featureDim, config.eps,
   );
-  if (xT !== x) destroyCopy(xT);
-  if (weightT !== weight) destroyCopy(weightT);
+  cleanupContiguous([x, xT], [weight, weightT]);
   return createTensor(xT.shape.slice(), outBuf);
 }
 
@@ -356,9 +345,7 @@ export function fusedRMSNormBackwardGradX(
     goT.buffer, xT.buffer, wT.buffer,
     config.numRows, config.featureDim, config.eps,
   );
-  if (goT !== gradOutput) destroyCopy(goT);
-  if (xT !== x) destroyCopy(xT);
-  if (wT !== weight) destroyCopy(wT);
+  cleanupContiguous([gradOutput, goT], [x, xT], [weight, wT]);
   return createTensor(xT.shape.slice(), outBuf);
 }
 
@@ -374,8 +361,7 @@ export function fusedRMSNormBackwardGradWeight(
     goT.buffer, xT.buffer,
     config.numRows, config.featureDim, config.eps,
   );
-  if (goT !== gradOutput) destroyCopy(goT);
-  if (xT !== x) destroyCopy(xT);
+  cleanupContiguous([gradOutput, goT], [x, xT]);
   return createTensor([config.featureDim], outBuf);
 }
 
@@ -398,11 +384,7 @@ export function fusedAttentionForward(
     config.scale, config.isCausal,
   );
 
-  // Destroy contiguous copies if created (deferred for GPU fence)
-  if (qT !== q) destroyCopy(qT);
-  if (kT !== k) destroyCopy(kT);
-  if (vT !== v) destroyCopy(vT);
-
+  cleanupContiguous([q, qT], [k, kT], [v, vT]);
   const outShape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
   const lseShape = [config.batchSize, config.numHeads, config.seqLen];
   return {
@@ -452,14 +434,7 @@ export function fusedAttentionBackward(
   const dBufSize = config.batchSize * config.numHeads * config.seqLen * 4;
   bufferPool.deferredDestroy(dBuf, dBufSize);
 
-  // Destroy contiguous copies if created (deferred for GPU fence)
-  if (qT !== q) destroyCopy(qT);
-  if (kT !== k) destroyCopy(kT);
-  if (vT !== v) destroyCopy(vT);
-  if (lseT !== logsumexp) destroyCopy(lseT);
-  if (dOT !== dO) destroyCopy(dOT);
-  if (oT !== output) destroyCopy(oT);
-
+  cleanupContiguous([q, qT], [k, kT], [v, vT], [logsumexp, lseT], [dO, dOT], [output, oT]);
   const gradShape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
   return {
     dQ: createTensor(gradShape, dQBuf),

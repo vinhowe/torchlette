@@ -655,33 +655,11 @@ export async function executePlanOptimized(
         }
       }
       nodesSinceReclaim += segment.group.nodes.length;
-    } else if (segment.kind === "fused") {
-      // Too small for fusion - execute sequentially
-      await executeSequentialSegmentWithEarlyRelease(
-        segment.group.nodes,
-        backend,
-        enableEarlyRelease,
-        lifetimes,
-        outputNodeIds,
-        alreadyReleased,
-        nodeToStorage,
-        overallStep,
-        externalNodeIds,
-        planNodes,
-        matmulPrologues.size > 0 ? matmulPrologues : undefined,
-        prologueClaimedIds.size > 0 ? prologueClaimedIds : undefined,
-        planConsumerCount,
-        loweredPlanBuilder,
-        nodeIdToFinalPos,
-        compoundMatchMap,
-      );
-      stats.sequentialNodes += segment.group.nodes.length;
-      overallStep += segment.group.nodes.length;
-      nodesSinceReclaim += segment.group.nodes.length;
     } else {
-      // Execute sequential segment
+      // Execute sequentially (too-small fusion groups or sequential segments)
+      const seqNodes = segment.kind === "fused" ? segment.group.nodes : segment.nodes;
       await executeSequentialSegmentWithEarlyRelease(
-        segment.nodes,
+        seqNodes,
         backend,
         enableEarlyRelease,
         lifetimes,
@@ -698,9 +676,9 @@ export async function executePlanOptimized(
         nodeIdToFinalPos,
         compoundMatchMap,
       );
-      stats.sequentialNodes += segment.nodes.length;
-      overallStep += segment.nodes.length;
-      nodesSinceReclaim += segment.nodes.length;
+      stats.sequentialNodes += seqNodes.length;
+      overallStep += seqNodes.length;
+      nodesSinceReclaim += seqNodes.length;
     }
 
     // Periodic buffer reclamation: flush the shared encoder and buffer pool
