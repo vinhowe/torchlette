@@ -6,19 +6,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   OP_REGISTRY,
-  getOpDef,
-  hasOp,
-  getExpr,
-  isFusible,
   canVectorize,
-  getArity,
   isUnaryOp,
-  isBinaryOp,
-  isTernaryOp,
-  getOpsByCategory,
-  getAllFusibleOps,
-  getAllUnaryOps,
-  getAllBinaryOps,
 } from "../../src/backend/webgpu/ops/registry";
 
 describe("Op Registry", () => {
@@ -26,200 +15,114 @@ describe("Op Registry", () => {
     it("contains all expected activation ops", () => {
       const activations = ["relu", "gelu", "gelu_tanh", "gelu_erf", "silu", "sigmoid", "tanh", "softplus"];
       for (const op of activations) {
-        expect(hasOp(op), `Missing activation op: ${op}`).toBe(true);
-        expect(getOpDef(op)?.category).toBe("activation");
+        expect(op in OP_REGISTRY, `Missing activation op: ${op}`).toBe(true);
+        expect(OP_REGISTRY[op].category).toBe("activation");
       }
     });
 
     it("contains all expected math ops", () => {
       const math = ["neg", "abs", "exp", "log", "sqrt", "rsqrt", "sin", "cos", "floor", "ceil", "round", "sign"];
       for (const op of math) {
-        expect(hasOp(op), `Missing math op: ${op}`).toBe(true);
-        expect(getOpDef(op)?.category).toBe("math");
+        expect(op in OP_REGISTRY, `Missing math op: ${op}`).toBe(true);
+        expect(OP_REGISTRY[op].category).toBe("math");
       }
     });
 
     it("contains all expected arithmetic ops", () => {
       const arithmetic = ["add", "sub", "mul", "div", "pow", "min", "max", "mod"];
       for (const op of arithmetic) {
-        expect(hasOp(op), `Missing arithmetic op: ${op}`).toBe(true);
-        expect(getOpDef(op)?.category).toBe("arithmetic");
+        expect(op in OP_REGISTRY, `Missing arithmetic op: ${op}`).toBe(true);
+        expect(OP_REGISTRY[op].category).toBe("arithmetic");
       }
     });
 
     it("contains all expected comparison ops", () => {
       const comparisons = ["eq", "ne", "lt", "le", "gt", "ge"];
       for (const op of comparisons) {
-        expect(hasOp(op), `Missing comparison op: ${op}`).toBe(true);
-        expect(getOpDef(op)?.category).toBe("comparison");
-        expect(getOpDef(op)?.outputDtype).toBe("f32"); // Comparisons return f32
+        expect(op in OP_REGISTRY, `Missing comparison op: ${op}`).toBe(true);
+        expect(OP_REGISTRY[op].category).toBe("comparison");
+        expect(OP_REGISTRY[op].outputDtype).toBe("f32");
       }
     });
 
-    it("contains all expected ternary ops", () => {
-      expect(hasOp("where")).toBe(true);
-      expect(getOpDef("where")?.category).toBe("ternary");
-      expect(getOpDef("where")?.arity).toBe(3);
+    it("contains ternary where op", () => {
+      expect("where" in OP_REGISTRY).toBe(true);
+      expect(OP_REGISTRY.where.category).toBe("ternary");
+      expect(OP_REGISTRY.where.arity).toBe(3);
     });
 
     it("contains all expected cast ops", () => {
       const casts = ["cast_f16", "cast_f32", "cast_i32", "cast_u32"];
       for (const op of casts) {
-        expect(hasOp(op), `Missing cast op: ${op}`).toBe(true);
-        expect(getOpDef(op)?.category).toBe("cast");
-        expect(getOpDef(op)?.vectorizable).toBe(true); // Casts use vectorExpr for vector mode
+        expect(op in OP_REGISTRY, `Missing cast op: ${op}`).toBe(true);
+        expect(OP_REGISTRY[op].category).toBe("cast");
+        expect(OP_REGISTRY[op].vectorizable).toBe(true);
       }
     });
   });
 
-  describe("getOpDef", () => {
-    it("returns definition for known ops", () => {
-      const def = getOpDef("relu");
-      expect(def).not.toBeNull();
-      expect(def?.arity).toBe(1);
-      expect(def?.fusible).toBe(true);
+  describe("expression generation", () => {
+    it("generates unary expressions", () => {
+      expect(OP_REGISTRY.relu.expr("x")).toBe("select(0.0, x, x > 0.0)");
+      expect(OP_REGISTRY.neg.expr("x")).toBe("(-x)");
+      expect(OP_REGISTRY.sqrt.expr("x")).toBe("sqrt(x)");
+      expect(OP_REGISTRY.exp.expr("x")).toBe("exp(x)");
+      expect(OP_REGISTRY.log.expr("x")).toBe("log(x)");
+      expect(OP_REGISTRY.tanh.expr("x")).toBe("tanh(x)");
+      expect(OP_REGISTRY.rsqrt.expr("x")).toBe("inverseSqrt(x)");
+      expect(OP_REGISTRY.sin.expr("x")).toBe("sin(x)");
+      expect(OP_REGISTRY.cos.expr("x")).toBe("cos(x)");
+      expect(OP_REGISTRY.floor.expr("x")).toBe("floor(x)");
+      expect(OP_REGISTRY.ceil.expr("x")).toBe("ceil(x)");
+      expect(OP_REGISTRY.round.expr("x")).toBe("round(x)");
     });
 
-    it("returns null for unknown ops", () => {
-      expect(getOpDef("unknown_op")).toBeNull();
-      expect(getOpDef("matmul")).toBeNull();
-      expect(getOpDef("conv2d")).toBeNull();
-    });
-  });
-
-  describe("hasOp", () => {
-    it("returns true for known ops", () => {
-      expect(hasOp("relu")).toBe(true);
-      expect(hasOp("add")).toBe(true);
-      expect(hasOp("where")).toBe(true);
+    it("generates gelu expression with tanh", () => {
+      const expr = OP_REGISTRY.gelu.expr("x");
+      expect(expr).toContain("tanh");
+      expect(expr).toContain("0.5");
+      expect(expr).toContain("clamp");
     });
 
-    it("returns false for unknown ops", () => {
-      expect(hasOp("unknown")).toBe(false);
-      expect(hasOp("matmul")).toBe(false);
-    });
-  });
-
-  describe("getExpr", () => {
-    describe("unary ops", () => {
-      it("generates relu expression", () => {
-        expect(getExpr("relu", ["x"])).toBe("select(0.0, x, x > 0.0)");
-      });
-
-      it("generates neg expression", () => {
-        expect(getExpr("neg", ["x"])).toBe("(-x)");
-      });
-
-      it("generates sqrt expression", () => {
-        expect(getExpr("sqrt", ["x"])).toBe("sqrt(x)");
-      });
-
-      it("generates exp expression", () => {
-        expect(getExpr("exp", ["x"])).toBe("exp(x)");
-      });
-
-      it("generates log expression", () => {
-        expect(getExpr("log", ["x"])).toBe("log(x)");
-      });
-
-      it("generates gelu expression with tanh", () => {
-        const expr = getExpr("gelu", ["x"]);
-        expect(expr).toContain("tanh");
-        expect(expr).toContain("0.5");
-        expect(expr).toContain("clamp"); // Overflow protection
-      });
-
-      it("generates silu expression", () => {
-        const expr = getExpr("silu", ["x"]);
-        expect(expr).toContain("exp");
-        expect(expr).toContain("1.0");
-      });
-
-      it("generates sigmoid expression", () => {
-        const expr = getExpr("sigmoid", ["x"]);
-        expect(expr).toContain("exp");
-        expect(expr).toContain("1.0");
-      });
-
-      it("generates tanh expression", () => {
-        expect(getExpr("tanh", ["x"])).toBe("tanh(x)");
-      });
-
-      it("generates rsqrt expression", () => {
-        expect(getExpr("rsqrt", ["x"])).toBe("inverseSqrt(x)");
-      });
-
-      it("generates trig expressions", () => {
-        expect(getExpr("sin", ["x"])).toBe("sin(x)");
-        expect(getExpr("cos", ["x"])).toBe("cos(x)");
-      });
-
-      it("generates rounding expressions", () => {
-        expect(getExpr("floor", ["x"])).toBe("floor(x)");
-        expect(getExpr("ceil", ["x"])).toBe("ceil(x)");
-        expect(getExpr("round", ["x"])).toBe("round(x)");
-      });
+    it("generates silu/sigmoid expressions", () => {
+      expect(OP_REGISTRY.silu.expr("x")).toContain("exp");
+      expect(OP_REGISTRY.sigmoid.expr("x")).toContain("exp");
     });
 
-    describe("binary ops", () => {
-      it("generates arithmetic expressions", () => {
-        expect(getExpr("add", ["a", "b"])).toBe("(a + b)");
-        expect(getExpr("sub", ["a", "b"])).toBe("(a - b)");
-        expect(getExpr("mul", ["a", "b"])).toBe("(a * b)");
-        expect(getExpr("div", ["a", "b"])).toBe("(a / b)");
-        expect(getExpr("mod", ["a", "b"])).toBe("(a % b)");
-      });
-
-      it("generates pow expression", () => {
-        expect(getExpr("pow", ["a", "b"])).toBe("pow(a, b)");
-      });
-
-      it("generates min/max expressions", () => {
-        expect(getExpr("min", ["a", "b"])).toBe("min(a, b)");
-        expect(getExpr("max", ["a", "b"])).toBe("max(a, b)");
-      });
-
-      it("generates comparison expressions with select", () => {
-        expect(getExpr("eq", ["a", "b"])).toBe("select(0.0, 1.0, a == b)");
-        expect(getExpr("ne", ["a", "b"])).toBe("select(0.0, 1.0, a != b)");
-        expect(getExpr("lt", ["a", "b"])).toBe("select(0.0, 1.0, a < b)");
-        expect(getExpr("le", ["a", "b"])).toBe("select(0.0, 1.0, a <= b)");
-        expect(getExpr("gt", ["a", "b"])).toBe("select(0.0, 1.0, a > b)");
-        expect(getExpr("ge", ["a", "b"])).toBe("select(0.0, 1.0, a >= b)");
-      });
+    it("generates binary arithmetic expressions", () => {
+      expect(OP_REGISTRY.add.expr("a", "b")).toBe("(a + b)");
+      expect(OP_REGISTRY.sub.expr("a", "b")).toBe("(a - b)");
+      expect(OP_REGISTRY.mul.expr("a", "b")).toBe("(a * b)");
+      expect(OP_REGISTRY.div.expr("a", "b")).toBe("(a / b)");
+      expect(OP_REGISTRY.mod.expr("a", "b")).toBe("(a % b)");
+      expect(OP_REGISTRY.pow.expr("a", "b")).toBe("pow(a, b)");
+      expect(OP_REGISTRY.min.expr("a", "b")).toBe("min(a, b)");
+      expect(OP_REGISTRY.max.expr("a", "b")).toBe("max(a, b)");
     });
 
-    describe("ternary ops", () => {
-      it("generates where expression", () => {
-        expect(getExpr("where", ["cond", "a", "b"])).toBe("select(b, a, cond > 0.0)");
-      });
+    it("generates comparison expressions with select", () => {
+      expect(OP_REGISTRY.eq.expr("a", "b")).toBe("select(0.0, 1.0, a == b)");
+      expect(OP_REGISTRY.ne.expr("a", "b")).toBe("select(0.0, 1.0, a != b)");
+      expect(OP_REGISTRY.lt.expr("a", "b")).toBe("select(0.0, 1.0, a < b)");
+      expect(OP_REGISTRY.le.expr("a", "b")).toBe("select(0.0, 1.0, a <= b)");
+      expect(OP_REGISTRY.gt.expr("a", "b")).toBe("select(0.0, 1.0, a > b)");
+      expect(OP_REGISTRY.ge.expr("a", "b")).toBe("select(0.0, 1.0, a >= b)");
     });
 
-    describe("cast ops", () => {
-      it("generates cast expressions", () => {
-        expect(getExpr("cast_f16", ["x"])).toBe("f16(x)");
-        expect(getExpr("cast_f32", ["x"])).toBe("f32(x)");
-        expect(getExpr("cast_i32", ["x"])).toBe("i32(x)");
-        expect(getExpr("cast_u32", ["x"])).toBe("u32(x)");
-      });
+    it("generates where expression", () => {
+      expect(OP_REGISTRY.where.expr("cond", "a", "b")).toBe("select(b, a, cond > 0.0)");
     });
 
-    describe("vector constants", () => {
-      it("uses custom zero for relu when provided", () => {
-        const expr = getExpr("relu", ["v"], { zero: "vec4<f32>(0.0)", one: "vec4<f32>(1.0)" });
-        expect(expr).toContain("vec4<f32>(0.0)");
-      });
+    it("generates cast expressions", () => {
+      expect(OP_REGISTRY.cast_f16.expr("x")).toBe("f16(x)");
+      expect(OP_REGISTRY.cast_f32.expr("x")).toBe("f32(x)");
+      expect(OP_REGISTRY.cast_i32.expr("x")).toBe("i32(x)");
+      expect(OP_REGISTRY.cast_u32.expr("x")).toBe("u32(x)");
     });
 
-    describe("error handling", () => {
-      it("throws for unknown ops", () => {
-        expect(() => getExpr("unknown", ["x"])).toThrow("Unknown op in registry: unknown");
-      });
-
-      it("throws for insufficient inputs", () => {
-        expect(() => getExpr("add", ["a"])).toThrow("requires 2 inputs");
-        expect(() => getExpr("where", ["a", "b"])).toThrow("requires 3 inputs");
-      });
+    it("uses custom zero for relu when provided", () => {
+      const expr = OP_REGISTRY.relu.expr("v", "vec4<f32>(0.0)", "vec4<f32>(1.0)");
+      expect(expr).toContain("vec4<f32>(0.0)");
     });
   });
 
@@ -234,40 +137,11 @@ describe("Op Registry", () => {
       expect(isUnaryOp("where")).toBe(false);
     });
 
-    it("correctly classifies binary ops", () => {
-      expect(isBinaryOp("add")).toBe(true);
-      expect(isBinaryOp("mul")).toBe(true);
-      expect(isBinaryOp("lt")).toBe(true);
-      expect(isBinaryOp("pow")).toBe(true);
-      expect(isBinaryOp("relu")).toBe(false);
-      expect(isBinaryOp("where")).toBe(false);
-    });
-
-    it("correctly classifies ternary ops", () => {
-      expect(isTernaryOp("where")).toBe(true);
-      expect(isTernaryOp("relu")).toBe(false);
-      expect(isTernaryOp("add")).toBe(false);
-    });
-
-    it("returns correct arity values", () => {
-      expect(getArity("relu")).toBe(1);
-      expect(getArity("add")).toBe(2);
-      expect(getArity("where")).toBe(3);
-      expect(getArity("unknown")).toBeNull();
-    });
-  });
-
-  describe("fusibility", () => {
-    it("all registered ops are fusible", () => {
-      for (const op of Object.keys(OP_REGISTRY)) {
-        expect(isFusible(op), `Op ${op} should be fusible`).toBe(true);
-      }
-    });
-
-    it("unknown ops are not fusible", () => {
-      expect(isFusible("matmul")).toBe(false);
-      expect(isFusible("conv2d")).toBe(false);
-      expect(isFusible("unknown")).toBe(false);
+    it("correctly classifies binary and ternary ops", () => {
+      expect(OP_REGISTRY.add.arity).toBe(2);
+      expect(OP_REGISTRY.mul.arity).toBe(2);
+      expect(OP_REGISTRY.lt.arity).toBe(2);
+      expect(OP_REGISTRY.where.arity).toBe(3);
     });
   });
 
@@ -289,71 +163,20 @@ describe("Op Registry", () => {
     });
   });
 
-  describe("listing functions", () => {
-    it("getOpsByCategory returns correct ops", () => {
-      const activations = getOpsByCategory("activation");
-      expect(activations).toContain("relu");
-      expect(activations).toContain("gelu");
-      expect(activations).toContain("silu");
-      expect(activations).not.toContain("add");
-
-      const arithmetic = getOpsByCategory("arithmetic");
-      expect(arithmetic).toContain("add");
-      expect(arithmetic).toContain("mul");
-      expect(arithmetic).not.toContain("relu");
-    });
-
-    it("getAllFusibleOps returns all ops", () => {
-      const fusible = getAllFusibleOps();
-      expect(fusible.length).toBe(Object.keys(OP_REGISTRY).length);
-    });
-
-    it("getAllUnaryOps returns only unary ops", () => {
-      const unary = getAllUnaryOps();
-      for (const op of unary) {
-        expect(getArity(op)).toBe(1);
-      }
-      expect(unary).toContain("relu");
-      expect(unary).toContain("sqrt");
-      expect(unary).not.toContain("add");
-    });
-
-    it("getAllBinaryOps returns only binary ops", () => {
-      const binary = getAllBinaryOps();
-      for (const op of binary) {
-        expect(getArity(op)).toBe(2);
-      }
-      expect(binary).toContain("add");
-      expect(binary).toContain("mul");
-      expect(binary).not.toContain("relu");
-    });
-  });
-
   describe("consistency checks", () => {
-    it("all ops have valid arity values", () => {
-      for (const [name, def] of Object.entries(OP_REGISTRY)) {
-        expect([1, 2, 3]).toContain(def.arity);
-      }
-    });
-
-    it("all ops have valid category", () => {
+    it("all ops have valid arity, category, and fusible/vectorizable flags", () => {
       const validCategories = ["activation", "math", "arithmetic", "comparison", "ternary", "cast"];
       for (const [name, def] of Object.entries(OP_REGISTRY)) {
+        expect([1, 2, 3]).toContain(def.arity);
         expect(validCategories).toContain(def.category);
-      }
-    });
-
-    it("all ops have boolean fusible and vectorizable flags", () => {
-      for (const [name, def] of Object.entries(OP_REGISTRY)) {
         expect(typeof def.fusible).toBe("boolean");
         expect(typeof def.vectorizable).toBe("boolean");
       }
     });
 
-    it("all comparison ops have outputDtype = f32", () => {
-      const comparisons = getOpsByCategory("comparison");
-      for (const op of comparisons) {
-        expect(getOpDef(op)?.outputDtype).toBe("f32");
+    it("all registered ops are fusible", () => {
+      for (const [name, def] of Object.entries(OP_REGISTRY)) {
+        expect(def.fusible, `Op ${name} should be fusible`).toBe(true);
       }
     });
   });

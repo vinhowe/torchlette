@@ -1,6 +1,5 @@
 /**
  * GPU context management: initialization, device lifecycle, f16 support.
- * Extracted from index.ts — purely structural refactoring.
  */
 
 import type {

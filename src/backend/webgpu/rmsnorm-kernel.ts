@@ -282,16 +282,3 @@ export function dispatchRMSNormBackwardGradWeight(
   return gradWeightBuffer;
 }
 
-/**
- * Reset module-local mutable state (pipeline cache, temp buffers).
- */
-export function resetRMSNormKernelState(): void {
-  fwdTileKernel.reset();
-  gradXTileKernel.reset();
-  rowStatsTileKernel.reset();
-  gradWTileKernel.reset();
-  for (const buf of rowStatsTempCache.values()) {
-    buf.destroy();
-  }
-  rowStatsTempCache.clear();
-}

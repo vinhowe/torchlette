@@ -1,7 +1,7 @@
 /**
  * Buffer Arena — per-lowered-plan persistent GPU buffer management.
  *
- * Extracted from index.ts. Each cached lowered plan gets its own buffer arena:
+ * Each cached lowered plan gets its own buffer arena:
  * a set of GPUBuffers that persist across steps (never returned to pool). This
  * stabilizes buffer object identities so that bind group cache keys match across
  * steps (~100% hit rate).

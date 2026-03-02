@@ -64,7 +64,7 @@ export type ReductionEpilogueOpDesc = {
 };
 
 /** Config for the unified reduction spec factory. */
-export interface ReductionConfig {
+interface ReductionConfig {
   reduceOp: ReduceOp;
   /** undefined = full reduction (single scalar output). */
   dim?: DimInfo;

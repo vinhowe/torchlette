@@ -1,6 +1,5 @@
 /**
  * Where (ternary select) ops: where, whereDirect, whereChunked.
- * Extracted from index.ts — purely structural refactoring.
  */
 
 import type { BackendTensor } from "../../types";

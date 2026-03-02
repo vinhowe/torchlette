@@ -1,6 +1,5 @@
 /**
  * Matrix multiplication ops: matmul (wrapper + chunked variants), sliceColumns, scatterColumnsToOutput.
- * Extracted from index.ts — purely structural refactoring.
  */
 
 import type { BackendTensor } from "../../types";

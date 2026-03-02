@@ -1,7 +1,6 @@
 /**
  * View and cast ops: cast, reshape, expand, contiguous, narrow, transpose, permute,
  * detectSimpleTranspose, ensureContiguous.
- * Extracted from index.ts — purely structural refactoring.
  */
 import type { BackendTensor, DType, TransposeOptions } from "../../types";
 import type { GPUBuffer, GPUDevice, WebGPUTensor } from "../gpu-types";
@@ -14,7 +13,7 @@ import {
 import { requireContext, isF16Supported, f16WeightCache, f32ArrayToF16Array, f16ArrayToF32Array, f16ToF32, f32ToF16 } from "../gpu-context";
 import { dispatchComputePass, dispatchElementwise, getPipeline } from "../dispatch";
 import { createTensor, createTrackedBuffer } from "../tensor";
-import { bufferPool } from "../buffer-pool";
+import { bufferPool, destroyCopy } from "../buffer-pool";
 import { resolveOutputBuffer } from "../buffer-arena";
 import {
   cachedCreateBindGroup, createParamsBuffer, releaseParamsBuffer,
@@ -661,10 +660,7 @@ export function narrowBackward(grad: BackendTensor, dim: number, start: number, 
     dispatchX: dispatch.x, dispatchY: dispatch.y,
   });
 
-  if (gradTensor !== asGPUTensor(grad)) {
-    bufferPool.decRef(gradTensor.buffer);
-    bufferPool.deferredDestroy(gradTensor.buffer, gradTensor.size * bytesPerElement);
-  }
+  if (gradTensor !== asGPUTensor(grad)) destroyCopy(gradTensor);
 
   return createTensor(outShape, outBuffer, undefined, 0, dtype);
 }

@@ -1,6 +1,5 @@
 /**
  * Tensor construction helpers: createTensor, createTrackedBuffer, createBufferWithData.
- * Extracted from index.ts — purely structural refactoring.
  */
 
 import type { DType } from "../types";

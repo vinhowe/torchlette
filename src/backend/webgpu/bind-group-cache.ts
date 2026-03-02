@@ -55,12 +55,6 @@ for (let i = 0; i <= 8; i++) {
   paramsArrayPool.push(new Uint32Array(i));
 }
 
-/** Get a reusable Uint32Array of the given word count. Caller must set values before use. */
-export function getParamsArray(wordCount: number): Uint32Array {
-  if (wordCount <= 8) return paramsArrayPool[wordCount];
-  return new Uint32Array(wordCount); // rare: allocate for large params
-}
-
 /** Fill and return a pooled Uint32Array. Avoids allocations on the hot dispatch path. */
 export function params(...values: number[]): Uint32Array {
   const n = values.length;

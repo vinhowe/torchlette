@@ -1,11 +1,10 @@
 /**
  * Tensor creation ops: tensorFromArray, zeros, full, arange, tril/triu, rand/randn/bernoulli.
- * Extracted from index.ts — purely structural refactoring.
  */
 
 import type { WebGPUTensor } from "../gpu-types";
-import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
-import { sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch, dtypeBytes, alignBufferSize } from "../shape-utils";
+import { GPUBufferUsage } from "../gpu-types";
+import { sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch, alignBufferSize } from "../shape-utils";
 import { fillWGSL, arangeWGSL, triangularWGSL, randWGSL, randnWGSL, bernoulliWGSL } from "./ops-tile-ir";
 import { requireContext, f32ArrayToF16Array } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
@@ -13,7 +12,7 @@ import { createTensor, createTrackedBuffer, createBufferWithData } from "../tens
 import { resolveOutputBuffer, getActiveArena, arenaBufferSet } from "../buffer-arena";
 import { cachedCreateBindGroup, createParamsBuffer, releaseParamsBuffer } from "../bind-group-cache";
 import { profileApiCall } from "../profiler";
-import { bufferPool } from "../buffer-pool";
+import { bufferPool, destroyCopy } from "../buffer-pool";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
 import type { DType } from "../../types";
 
@@ -220,10 +219,7 @@ function triangularOp(a: WebGPUTensor, k: number, upper: boolean): WebGPUTensor 
   releaseParamsBuffer(paramsBuffer);
 
   // Destroy contiguous copy if one was created (deferred for GPU fence)
-  if (input !== a) {
-    bufferPool.decRef(asGPUTensor(input).buffer);
-    bufferPool.deferredDestroy(asGPUTensor(input).buffer, numElements * dtypeBytes(a.dtype));
-  }
+  if (input !== a) destroyCopy(input);
 
   return createTensor(a.shape.slice(), outBuffer, undefined, 0, a.dtype);
 }

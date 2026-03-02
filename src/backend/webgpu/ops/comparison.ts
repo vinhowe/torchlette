@@ -1,6 +1,5 @@
 /**
  * Comparison ops: gt, lt, ge, le, eq, ne, and argmax/argmin.
- * Extracted from index.ts — purely structural refactoring.
  */
 
 import type {

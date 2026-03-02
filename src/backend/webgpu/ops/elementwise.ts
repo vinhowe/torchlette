@@ -1,6 +1,5 @@
 /**
  * Elementwise ops: add, sub, mul, div, sqrt, relu, exp, log, neg, abs, tanh, sigmoid, gelu, silu, isfinite.
- * Extracted from index.ts — purely structural refactoring.
  */
 
 import type {

@@ -406,13 +406,6 @@ export function deferUniformBufferForSharedEncoder(buffer: GPUBuffer): void {
 }
 
 /**
- * Check if a buffer was written during the current shared encoder scope.
- */
-export function isInSharedEncoderWriteSet(buffer: GPUBuffer): boolean {
-  return sharedEncoderWriteSet.has(buffer);
-}
-
-/**
  * Submit a command buffer immediately or collect it for batch submission.
  * Use this for ops that bypass the shared encoder (e.g., ops needing custom encoder logic).
  * When shared encoder is active, these CBs are collected and submitted alongside the

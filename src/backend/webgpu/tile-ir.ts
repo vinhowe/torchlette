@@ -50,7 +50,7 @@ type BinaryOp = "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "xor" | "
 type UnaryOp = "rsqrt" | "exp" | "log" | "abs" | "neg" | "sqrt" | "tanh" | "floor" | "ceil" | "not" | "sin" | "cos" | "round" | "sign" | "exp2" | "log2";
 type CmpOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
 
-export interface IRNodeBase {
+interface IRNodeBase {
   id: number;
   valueType: ValueType;
   dataType: DataType;

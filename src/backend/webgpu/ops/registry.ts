@@ -409,137 +409,16 @@ export const OP_REGISTRY: Record<string, OpDef> = {
 };
 
 // ============================================================================
-// Helper Functions
+// Helper Functions (only those used in production)
 // ============================================================================
 
-/**
- * Get the op definition, or null if not found.
- */
-export function getOpDef(op: string): OpDef | null {
-  return OP_REGISTRY[op] ?? null;
-}
-
-/**
- * Check if an op exists in the registry.
- */
-export function hasOp(op: string): boolean {
-  return op in OP_REGISTRY;
-}
-
-/**
- * Get WGSL expression for an op.
- *
- * @param op - Operation name
- * @param inputs - Input expressions
- * @param vectorConstants - Optional vector-compatible zero/one for vectorized code
- * @throws Error if op is not found
- */
-export function getExpr(
-  op: string,
-  inputs: string[],
-  vectorConstants?: { zero: string; one: string },
-): string {
-  const def = OP_REGISTRY[op];
-  if (!def) {
-    throw new Error(`Unknown op in registry: ${op}`);
-  }
-
-  // Validate arity
-  if (inputs.length < def.arity) {
-    throw new Error(`Op ${op} requires ${def.arity} inputs, got ${inputs.length}`);
-  }
-
-  // Handle ops that need vector constants
-  if (def.needsVectorConstants && vectorConstants) {
-    return def.expr(inputs[0], vectorConstants.zero, vectorConstants.one);
-  }
-
-  // Standard expression generation
-  return def.expr(...inputs.slice(0, def.arity));
-}
-
-/**
- * Check if an op can be fused into elementwise kernels.
- */
-export function isFusible(op: string): boolean {
-  return OP_REGISTRY[op]?.fusible ?? false;
-}
-
-/**
- * Check if an op can be vectorized.
- */
+/** Check if an op can be vectorized. */
 export function canVectorize(op: string): boolean {
   return OP_REGISTRY[op]?.vectorizable ?? false;
 }
 
-/**
- * Get the vectorized expression generator for an op, if it has one.
- */
-export function getVectorExpr(op: string): ((a: string, w: number) => string) | undefined {
-  return OP_REGISTRY[op]?.vectorExpr;
-}
-
-/**
- * Get op arity (number of inputs).
- */
-export function getArity(op: string): OpArity | null {
-  return OP_REGISTRY[op]?.arity ?? null;
-}
-
-/**
- * Check if an op is a unary operation.
- */
+/** Check if an op is a unary operation. */
 export function isUnaryOp(op: string): boolean {
   return OP_REGISTRY[op]?.arity === 1;
-}
-
-/**
- * Check if an op is a binary operation.
- */
-export function isBinaryOp(op: string): boolean {
-  return OP_REGISTRY[op]?.arity === 2;
-}
-
-/**
- * Check if an op is a ternary operation.
- */
-export function isTernaryOp(op: string): boolean {
-  return OP_REGISTRY[op]?.arity === 3;
-}
-
-/**
- * Get all ops in a category.
- */
-export function getOpsByCategory(category: OpDef["category"]): string[] {
-  return Object.entries(OP_REGISTRY)
-    .filter(([_, def]) => def.category === category)
-    .map(([name, _]) => name);
-}
-
-/**
- * Get all fusible ops.
- */
-export function getAllFusibleOps(): string[] {
-  return Object.entries(OP_REGISTRY)
-    .filter(([_, def]) => def.fusible)
-    .map(([name, _]) => name);
-}
-
-/**
- * Get all unary ops.
- */
-export function getAllUnaryOps(): string[] {
-  return Object.entries(OP_REGISTRY)
-    .filter(([_, def]) => def.arity === 1)
-    .map(([name, _]) => name);
-}
-
-/**
- * Get all binary ops.
- */
-export function getAllBinaryOps(): string[] {
-  return Object.entries(OP_REGISTRY)
-    .filter(([_, def]) => def.arity === 2)
-    .map(([name, _]) => name);
 }
 
