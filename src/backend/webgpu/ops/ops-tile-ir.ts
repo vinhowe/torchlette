@@ -18,7 +18,7 @@ import {
   elementwiseKernel,
 } from "../tile-ir";
 import { compileTileKernel } from "../tile-compiler";
-import { WORKGROUP_SIZE, F32_NEG_MAX, F32_POS_MAX, MAX_WORKGROUPS_PER_DIM, contiguousStrides } from "../shape-utils";
+import { WORKGROUP_SIZE, F32_NEG_MAX, F32_POS_MAX, MAX_WORKGROUPS_PER_DIM, contiguousStrides, sizeOf } from "../shape-utils";
 import { applyFusedOp } from "../fusion-tile-ir";
 
 const WG = WORKGROUP_SIZE; // 256
@@ -504,7 +504,7 @@ function stridedScatterTileIR(
   srcStrides: number[],
   srcOffset: number,
 ): string {
-  const viewSize = viewShape.reduce((a, b) => a * b, 1);
+  const viewSize = sizeOf(viewShape);
 
   const spec: TileKernelSpec = {
     name: op === "copy" ? "stridedScatterCopy" : "stridedScatterAdd",

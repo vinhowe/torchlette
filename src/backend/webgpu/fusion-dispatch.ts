@@ -17,7 +17,7 @@ export function setFusionRecordingBuffer(buf: RecordedDispatch[] | null): void {
 
 import { recordPipeline, getWarmupPipeline } from "./pipeline-warmup";
 import type { DType } from "../types";
-import { dtypeBytes } from "./shape-utils";
+import { dtypeBytes, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 import { sizeOf } from "../../core/shape";
 import {
   type FusedKernelRecipe,
@@ -260,9 +260,8 @@ export function dispatchFusedKernel(
   // Dispatch (batch/shared-encoder mode aware)
   // Use 2D dispatch when workgroups exceed WebGPU per-dimension limit (65535)
   const totalWorkgroups = Math.ceil(kernel.workItems / kernel.workgroupSize);
-  const MAX_WG_DIM = 65535;
-  const workgroupsX = Math.min(totalWorkgroups, MAX_WG_DIM);
-  const workgroupsY = totalWorkgroups <= MAX_WG_DIM ? 1 : Math.ceil(totalWorkgroups / MAX_WG_DIM);
+  const workgroupsX = Math.min(totalWorkgroups, MAX_WORKGROUPS_PER_DIM);
+  const workgroupsY = totalWorkgroups <= MAX_WORKGROUPS_PER_DIM ? 1 : Math.ceil(totalWorkgroups / MAX_WORKGROUPS_PER_DIM);
 
   dispatchComputePass(pipeline, bindGroup, workgroupsX, workgroupsY, 1, fusionRecordingBuffer);
 

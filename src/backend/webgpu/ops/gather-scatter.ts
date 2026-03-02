@@ -55,7 +55,7 @@ export function gather(
 
   // Shared setup
   const outShape = indexShape.slice();
-  const outSize = outShape.reduce((a, b) => a * b, 1);
+  const outSize = sizeOf(outShape);
   const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
@@ -81,7 +81,7 @@ export function gather(
 
   // --- Chunked path ---
   const dimSize = inputShape[dim];
-  const elementsPerSlice = inputShape.slice(dim + 1).reduce((a, b) => a * b, 1);
+  const elementsPerSlice = sizeOf(inputShape.slice(dim + 1));
   const minAlignment = deviceLimits?.minStorageBufferOffsetAlignment ?? 256;
   const layout = computeDimChunkLayout(dimSize, elementsPerSlice, maxBindingSize, minAlignment);
 
@@ -143,8 +143,8 @@ export function scatterAdd(
 
   // Shared setup
   const outShape = inputShape.slice();
-  const outSize = outShape.reduce((a, b) => a * b, 1);
-  const srcSize = tensorSrc.shape.reduce((a, b) => a * b, 1);
+  const outSize = sizeOf(outShape);
+  const srcSize = sizeOf(tensorSrc.shape);
   const totalWorkgroups = Math.ceil(srcSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
@@ -188,7 +188,7 @@ export function scatterAdd(
 
   // --- Chunked path ---
   const dimSize = inputShape[dim];
-  const elementsPerSlice = inputShape.slice(dim + 1).reduce((a, b) => a * b, 1);
+  const elementsPerSlice = sizeOf(inputShape.slice(dim + 1));
   const minAlignment = deviceLimits?.minStorageBufferOffsetAlignment ?? 256;
   const layout = computeDimChunkLayout(dimSize, elementsPerSlice, maxBindingSize, minAlignment);
 

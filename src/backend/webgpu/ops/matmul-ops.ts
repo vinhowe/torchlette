@@ -5,7 +5,7 @@
 import type { BackendTensor } from "../../types";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
 import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
-import { WORKGROUP_SIZE, compute2DDispatch, dtypeBytes, broadcastShapes, gcd } from "../shape-utils";
+import { WORKGROUP_SIZE, compute2DDispatch, dtypeBytes, broadcastShapes, sizeOf, gcd, alignedChunkSize } from "../shape-utils";
 import { requireContext } from "../gpu-context";
 import { dispatchComputePass, dispatchMatmul, getPipeline } from "../dispatch";
 import { createTensor, createTrackedBuffer } from "../tensor";
@@ -54,7 +54,7 @@ export function matmul(
   const bBatch = bShape.slice(0, -2);
   const batchShape = broadcastShapes(aBatch.length > 0 ? aBatch : [1], bBatch.length > 0 ? bBatch : [1]);
   const outShape = [...batchShape, M, N];
-  const outSize = outShape.reduce((acc, d) => acc * d, 1);
+  const outSize = sizeOf(outShape);
   const outputDtype = (a.dtype === "f32" || b.dtype === "f32") ? "f32" as const : a.dtype;
   const outSizeBytes = outSize * dtypeBytes(outputDtype);
 
@@ -112,13 +112,7 @@ function sliceColumns(
     // Chunked path: process rows in chunks that fit in binding limit
     const bytesPerRow = N * 4;
 
-    // Calculate how many rows must group together for aligned offsets
-    const g_ = gcd(bytesPerRow, minAlignment);
-    const rowAlignment = minAlignment / g_;
-
-    // How many rows fit in maxBindingSize?
-    const maxRowsUnaligned = Math.floor(maxBindingSize / bytesPerRow);
-    const rowsPerChunk = Math.max(rowAlignment, Math.floor(maxRowsUnaligned / rowAlignment) * rowAlignment);
+    const rowsPerChunk = alignedChunkSize(bytesPerRow, Math.floor(maxBindingSize / bytesPerRow), minAlignment);
 
     const numRowChunks = Math.ceil(K / rowsPerChunk);
 
@@ -206,17 +200,15 @@ function scatterColumnsToOutput(
     const inputBytesPerRow = sliceWidth * 4;
 
     // Find row chunk size that fits both input and output in binding limit
-    const maxOutputRows = Math.floor(maxBindingSize / outputBytesPerRow);
-    const maxInputRows = Math.floor(maxBindingSize / inputBytesPerRow);
-    const maxRowsPerChunk = Math.min(maxOutputRows, maxInputRows);
+    const maxRowsPerChunk = Math.min(
+      Math.floor(maxBindingSize / outputBytesPerRow),
+      Math.floor(maxBindingSize / inputBytesPerRow),
+    );
 
-    // Align for buffer offsets
-    const outputG = gcd(outputBytesPerRow, minAlignment);
-    const inputG = gcd(inputBytesPerRow, minAlignment);
-    const outputRowAlignment = minAlignment / outputG;
-    const inputRowAlignment = minAlignment / inputG;
-    const rowAlignment = Math.max(outputRowAlignment, inputRowAlignment);
-
+    // Align for buffer offsets (use stricter of the two alignments)
+    const outputAlign = minAlignment / gcd(outputBytesPerRow, minAlignment);
+    const inputAlign = minAlignment / gcd(inputBytesPerRow, minAlignment);
+    const rowAlignment = Math.max(outputAlign, inputAlign);
     const alignedRowsPerChunk = Math.max(
       rowAlignment,
       Math.floor(maxRowsPerChunk / rowAlignment) * rowAlignment
@@ -311,7 +303,7 @@ function matmulChunked(
 
   // Compute batch dimensions from A
   const batchDims = aContiguous.shape.slice(0, -2);
-  const batchSize = batchDims.reduce((acc, d) => acc * d, 1) || 1;
+  const batchSize = sizeOf(batchDims) || 1;
 
   // Output shape: [...batchDims, M, N]
   const outShape = [...batchDims, M, N];
@@ -386,13 +378,7 @@ function matmulChunkedTransposed(
   // How many buffer rows fit in one binding?
   const maxBufferRowsPerChunk = Math.floor(maxBindingSize / bytesPerBufferRow);
 
-  // Ensure chunk boundaries are alignment-friendly
-  const g_ = gcd(bytesPerBufferRow, minAlignment);
-  const rowAlignment = minAlignment / g_;
-  const alignedRowsPerChunk = Math.max(
-    rowAlignment,
-    Math.floor(maxBufferRowsPerChunk / rowAlignment) * rowAlignment
-  );
+  const alignedRowsPerChunk = alignedChunkSize(bytesPerBufferRow, maxBufferRowsPerChunk, minAlignment);
 
   const numChunks = Math.ceil(N / alignedRowsPerChunk);
 
@@ -450,7 +436,7 @@ function matmulChunkedTransposed(
 
   // Now assemble the final output from partial results
   // Each partial is [batchSize * M, chunkWidth] and goes to columns [colStart, colEnd)
-  const outSize = outShape.reduce((acc, d) => acc * d, 1);
+  const outSize = sizeOf(outShape);
   const outBuffer = createTrackedBuffer(ctx.device, {
     size: outSize * 4,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
@@ -501,13 +487,7 @@ function matmulChunkedContiguous(
   const bytesPerColumn = K * 4;
   const maxColumnsPerChunk = Math.floor(maxBindingSize / bytesPerColumn);
 
-  // Ensure alignment
-  const g_ = gcd(bytesPerColumn, minAlignment);
-  const colAlignment = minAlignment / g_;
-  const alignedColumnsPerChunk = Math.max(
-    colAlignment,
-    Math.floor(maxColumnsPerChunk / colAlignment) * colAlignment
-  );
+  const alignedColumnsPerChunk = alignedChunkSize(bytesPerColumn, maxColumnsPerChunk, minAlignment);
 
   const numChunks = Math.ceil(N / alignedColumnsPerChunk);
 
@@ -536,7 +516,7 @@ function matmulChunkedContiguous(
   }
 
   // Assemble final output
-  const outSize = outShape.reduce((acc, d) => acc * d, 1);
+  const outSize = sizeOf(outShape);
   const outBuffer = createTrackedBuffer(ctx.device, {
     size: outSize * 4,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
@@ -586,7 +566,7 @@ function matmulChunkedOutput(
   const aBatch = aShape.slice(0, -2);
   const bBatch = bShape.slice(0, -2);
   const batchShape = broadcastShapes(aBatch.length > 0 ? aBatch : [1], bBatch.length > 0 ? bBatch : [1]);
-  const batchSize = batchShape.reduce((acc, d) => acc * d, 1);
+  const batchSize = sizeOf(batchShape);
   const outShape = [...batchShape, M, N];
 
   // Calculate how many columns we can output per chunk
@@ -595,19 +575,12 @@ function matmulChunkedOutput(
   const bytesPerColumn = elementsPerColumn * 4;
   const maxColumnsPerChunk = Math.floor(maxBindingSize / bytesPerColumn);
 
-  // Ensure alignment for B slicing
-  const bBytesPerColumn = K * 4;
-  const g_ = gcd(bBytesPerColumn, minAlignment);
-  const colAlignment = Math.max(1, minAlignment / g_);
-  const alignedColumnsPerChunk = Math.max(
-    colAlignment,
-    Math.floor(maxColumnsPerChunk / colAlignment) * colAlignment
-  );
+  const alignedColumnsPerChunk = alignedChunkSize(K * 4, maxColumnsPerChunk, minAlignment);
 
   const numChunks = Math.ceil(N / alignedColumnsPerChunk);
 
   // Create output buffer
-  const outSize = outShape.reduce((acc, d) => acc * d, 1);
+  const outSize = sizeOf(outShape);
   const outBuffer = createTrackedBuffer(ctx.device, {
     size: outSize * 4,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,

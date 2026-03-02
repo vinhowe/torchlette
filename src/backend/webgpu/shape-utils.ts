@@ -45,6 +45,15 @@ export function lcm(a: number, b: number): number {
   return (a * b) / gcd(a, b);
 }
 
+/**
+ * Compute the largest chunk size ≤ maxUnits that satisfies GPU buffer offset alignment.
+ * Used for chunked dispatch when tensors exceed maxStorageBufferBindingSize.
+ */
+export function alignedChunkSize(bytesPerUnit: number, maxUnits: number, minAlignment: number): number {
+  const unitAlignment = minAlignment / gcd(bytesPerUnit, minAlignment);
+  return Math.max(unitAlignment, Math.floor(maxUnits / unitAlignment) * unitAlignment);
+}
+
 // broadcastShapes re-exported from core/shape
 
 export function toIndexShape(shape: number[]): number[] {

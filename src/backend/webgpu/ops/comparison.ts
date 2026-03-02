@@ -154,7 +154,7 @@ function argReduceOp(
     }
   }
 
-  const outSize = outShape.reduce((acc, d) => acc * d, 1) || 1;
+  const outSize = sizeOf(outShape) || 1;
   const outBuffer = createTrackedBuffer(ctx.device, {
     size: outSize * 4,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
