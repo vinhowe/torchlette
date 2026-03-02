@@ -457,182 +457,88 @@ function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
 // Dispatch Functions
 // ============================================================================
 
-/**
- * Dispatch FlashAttention forward kernel.
- * Q,K,V: [B, H, N, D] → O: [B, H, N, D], L: [B, H, N]
- */
-export function dispatchFlashAttentionForward(
-  qBuffer: GPUBuffer,
-  kBuffer: GPUBuffer,
-  vBuffer: GPUBuffer,
-  batchSize: number,
-  numHeads: number,
-  seqLen: number,
-  headDim: number,
-  scale: number,
-  isCausal: boolean,
-): { outputBuffer: GPUBuffer; logsumexpBuffer: GPUBuffer } {
+/** Shared attention dispatch: config buffer + WGSL cache + pipeline + bind group + tracking. */
+function dispatchAttention(
+  wgslKey: string, pipelinePrefix: string,
+  specFactory: () => TileKernelSpec, headDim: number,
+  batchSize: number, numHeads: number, seqLen: number,
+  scale: number, isCausal: boolean,
+  buffers: GPUBuffer[], // all data buffers (config appended automatically)
+  ...grid: number[]
+): void {
   const ctx = requireContext();
-  const device = ctx.device;
-
-  const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4;
-  const logsumexpSizeBytes = batchSize * numHeads * seqLen * 4;
-
-  const outBuffer = allocateOutputBuffer(outputSizeBytes);
-  const lseBuffer = allocateOutputBuffer(logsumexpSizeBytes);
-
   const configBuf = getOrCreateConfigBuffer(
-    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
+    ctx.device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
   );
+  const wgsl = getTileIRWGSL(wgslKey, specFactory);
+  const pipeline = getPipeline(ctx, `${pipelinePrefix}:tile:${headDim}`, wgsl);
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [...buffers, configBuf]);
+  for (const b of buffers) trackSharedEncoderWrite(b);
+  dispatchComputePass(pipeline, bindGroup, ...grid);
+}
 
-  const wgsl = getTileIRWGSL(`fwd:${headDim}`, () => makeForwardAttentionSpec(headDim));
-  const pipelineKey = `faFwd:tile:${headDim}`;
-  const pipeline = getPipeline(ctx, pipelineKey, wgsl);
-
-  const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer, configBuf]);
-
-  for (const b of [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer]) trackSharedEncoderWrite(b);
-
-  const numQBlocks = Math.ceil(seqLen / BR);
-  dispatchComputePass(pipeline, bindGroup, numQBlocks, numHeads, batchSize);
-
+/** Q,K,V: [B, H, N, D] → O: [B, H, N, D], L: [B, H, N] */
+export function dispatchFlashAttentionForward(
+  qBuffer: GPUBuffer, kBuffer: GPUBuffer, vBuffer: GPUBuffer,
+  batchSize: number, numHeads: number, seqLen: number, headDim: number,
+  scale: number, isCausal: boolean,
+): { outputBuffer: GPUBuffer; logsumexpBuffer: GPUBuffer } {
+  const outBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * headDim * 4);
+  const lseBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * 4);
+  dispatchAttention(`fwd:${headDim}`, "faFwd", () => makeForwardAttentionSpec(headDim), headDim,
+    batchSize, numHeads, seqLen, scale, isCausal,
+    [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer],
+    Math.ceil(seqLen / BR), numHeads, batchSize);
   return { outputBuffer: outBuffer, logsumexpBuffer: lseBuffer };
 }
 
-/**
- * Dispatch FlashAttention backward D precompute kernel.
- * dO,O: [B,H,N,D] → D: [B,H,N]
- */
+/** dO,O: [B,H,N,D] → D: [B,H,N] */
 export function dispatchFlashAttentionBackwardD(
-  dOBuffer: GPUBuffer,
-  oBuffer: GPUBuffer,
-  batchSize: number,
-  numHeads: number,
-  seqLen: number,
-  headDim: number,
-  scale: number,
-  isCausal: boolean,
+  dOBuffer: GPUBuffer, oBuffer: GPUBuffer,
+  batchSize: number, numHeads: number, seqLen: number, headDim: number,
+  scale: number, isCausal: boolean,
 ): GPUBuffer {
-  const ctx = requireContext();
-  const device = ctx.device;
-
-  const totalRows = batchSize * numHeads * seqLen;
-  const outputSizeBytes = totalRows * 4;
-
-  const outBuffer = allocateOutputBuffer(outputSizeBytes);
-
-  const configBuf = getOrCreateConfigBuffer(
-    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
-  );
-
-  const wgsl = getTileIRWGSL(`bwdD:${headDim}`, () => makeDPrecomputeSpec(headDim));
-  const pipelineKey = `faBwdD:tile:${headDim}`;
-  const pipeline = getPipeline(ctx, pipelineKey, wgsl);
-
-  const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [dOBuffer, oBuffer, outBuffer, configBuf]);
-
-  for (const b of [dOBuffer, oBuffer, outBuffer]) trackSharedEncoderWrite(b);
-
-  dispatchComputePass(pipeline, bindGroup, totalRows);
-
+  const outBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * 4);
+  dispatchAttention(`bwdD:${headDim}`, "faBwdD", () => makeDPrecomputeSpec(headDim), headDim,
+    batchSize, numHeads, seqLen, scale, isCausal,
+    [dOBuffer, oBuffer, outBuffer],
+    batchSize * numHeads * seqLen);
   return outBuffer;
 }
 
-/**
- * Dispatch FlashAttention backward dQ kernel.
- * Q,K,V,L,D,dO → dQ: [B,H,N,D]
- */
+/** Q,K,V,L,D,dO → dQ: [B,H,N,D] */
 export function dispatchFlashAttentionBackwardDQ(
-  qBuffer: GPUBuffer,
-  kBuffer: GPUBuffer,
-  vBuffer: GPUBuffer,
-  lBuffer: GPUBuffer,
-  dBuffer: GPUBuffer,
-  dOBuffer: GPUBuffer,
-  batchSize: number,
-  numHeads: number,
-  seqLen: number,
-  headDim: number,
-  scale: number,
-  isCausal: boolean,
+  qBuffer: GPUBuffer, kBuffer: GPUBuffer, vBuffer: GPUBuffer,
+  lBuffer: GPUBuffer, dBuffer: GPUBuffer, dOBuffer: GPUBuffer,
+  batchSize: number, numHeads: number, seqLen: number, headDim: number,
+  scale: number, isCausal: boolean,
 ): GPUBuffer {
-  const ctx = requireContext();
-  const device = ctx.device;
-
-  const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4;
-
-  const outBuffer = allocateOutputBuffer(outputSizeBytes);
-
-  const configBuf = getOrCreateConfigBuffer(
-    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
-  );
-
-  const wgsl = getTileIRWGSL(`bwdDQ:${headDim}`, () => makeBackwardDQSpec(headDim));
-  const pipelineKey = `faBwdDQ:tile:${headDim}`;
-  const pipeline = getPipeline(ctx, pipelineKey, wgsl);
-
-  const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer, configBuf]);
-
-  for (const b of [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer]) trackSharedEncoderWrite(b);
-
-  const numQBlocks = Math.ceil(seqLen / BR);
-  dispatchComputePass(pipeline, bindGroup, numQBlocks, numHeads, batchSize);
-
+  const outBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * headDim * 4);
+  dispatchAttention(`bwdDQ:${headDim}`, "faBwdDQ", () => makeBackwardDQSpec(headDim), headDim,
+    batchSize, numHeads, seqLen, scale, isCausal,
+    [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer],
+    Math.ceil(seqLen / BR), numHeads, batchSize);
   return outBuffer;
 }
 
-/**
- * Reset all module-local mutable state (pipeline cache, config buffer cache).
- */
+/** Q,K,V,L,D,dO → dK: [B,H,N,D], dV: [B,H,N,D] */
+export function dispatchFlashAttentionBackwardDKV(
+  qBuffer: GPUBuffer, kBuffer: GPUBuffer, vBuffer: GPUBuffer,
+  lBuffer: GPUBuffer, dBuffer: GPUBuffer, dOBuffer: GPUBuffer,
+  batchSize: number, numHeads: number, seqLen: number, headDim: number,
+  scale: number, isCausal: boolean,
+): { dKBuffer: GPUBuffer; dVBuffer: GPUBuffer } {
+  const dKBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * headDim * 4);
+  const dVBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * headDim * 4);
+  dispatchAttention(`bwdDKV:${headDim}`, "faBwdDKV", () => makeBackwardDKVSpec(headDim), headDim,
+    batchSize, numHeads, seqLen, scale, isCausal,
+    [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer],
+    Math.ceil(seqLen / BC_BW), numHeads, batchSize);
+  return { dKBuffer, dVBuffer };
+}
+
+/** Reset all module-local mutable state (pipeline cache, config buffer cache). */
 export function resetAttentionKernelState(): void {
   configCache.clear();
   tileIRWGSLCache.clear();
-}
-
-/**
- * Dispatch FlashAttention backward dKV kernel.
- * Q,K,V,L,D,dO → dK: [B,H,N,D], dV: [B,H,N,D]
- */
-export function dispatchFlashAttentionBackwardDKV(
-  qBuffer: GPUBuffer,
-  kBuffer: GPUBuffer,
-  vBuffer: GPUBuffer,
-  lBuffer: GPUBuffer,
-  dBuffer: GPUBuffer,
-  dOBuffer: GPUBuffer,
-  batchSize: number,
-  numHeads: number,
-  seqLen: number,
-  headDim: number,
-  scale: number,
-  isCausal: boolean,
-): { dKBuffer: GPUBuffer; dVBuffer: GPUBuffer } {
-  const ctx = requireContext();
-  const device = ctx.device;
-
-  const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4;
-
-  const dKBuffer = allocateOutputBuffer(outputSizeBytes);
-  const dVBuffer = allocateOutputBuffer(outputSizeBytes);
-
-  const configBuf = getOrCreateConfigBuffer(
-    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
-  );
-
-  const wgsl = getTileIRWGSL(`bwdDKV:${headDim}`, () => makeBackwardDKVSpec(headDim));
-  const pipelineKey = `faBwdDKV:tile:${headDim}`;
-  const pipeline = getPipeline(ctx, pipelineKey, wgsl);
-
-  const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer, configBuf]);
-
-  for (const b of [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer]) trackSharedEncoderWrite(b);
-
-  const numKVBlocks = Math.ceil(seqLen / BC_BW);
-  dispatchComputePass(pipeline, bindGroup, numKVBlocks, numHeads, batchSize);
-
-  return { dKBuffer, dVBuffer };
 }
