@@ -39,7 +39,7 @@ async function collectAndForceSavedTensors(
     }
   }
   if (allPending.length > 0) {
-    await torch.runtime.forceAll(...allPending);
+    await torch.runtime.forceAllMerged(...allPending);
   }
 
   return allUnpackedTensors;
@@ -292,7 +292,7 @@ export async function backwardImpl(
         }
       }
       if (tensorsToForce.length > 0) {
-        await torch.runtime.forceAll(...tensorsToForce);
+        await torch.runtime.forceAllMerged(...tensorsToForce);
       }
 
       // ========================================================================
@@ -307,7 +307,7 @@ export async function backwardImpl(
         (g) => !g.isMaterialized() && !g.disposed
       );
       if (allGrads.length > 0) {
-        await torch.runtime.forceAll(...allGrads);
+        await torch.runtime.forceAllMerged(...allGrads);
       }
       storageTracker.destroyUnreachable();
 

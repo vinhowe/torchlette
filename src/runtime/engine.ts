@@ -2,7 +2,6 @@ import { getActiveBackend, getBackend } from "../backend/registry";
 import {
   type ArgReduceOptions,
   type Backend,
-  type BackendTensor,
   type CatOptions,
   computeContiguousStrides,
   type DeviceKind,
@@ -25,12 +24,10 @@ import {
 } from "../backend/types";
 import {
   buildMergedPlan,
-  buildPlan,
   createLazyIRNode,
   createMaterializedRef,
   createPendingRef,
   createScalarRef,
-  createStorageHandle,
   executePlan,
   executePlanOptimized,
   executePlanWithCheckpointSegments,
@@ -221,20 +218,6 @@ export class RuntimeEngine {
   }
 
   /**
-   * Enable or disable vectorization for fused kernels.
-   */
-  setVectorizationEnabled(enabled: boolean): void {
-    this.vectorizationEnabled = enabled;
-  }
-
-  /**
-   * Check if vectorization is enabled.
-   */
-  isVectorizationEnabled(): boolean {
-    return this.vectorizationEnabled;
-  }
-
-  /**
    * Get statistics from the last optimized execution.
    */
   getLastFusionStats(): OptimizedExecutionStats | null {
@@ -286,38 +269,6 @@ export class RuntimeEngine {
    */
   isEarlyReleaseEnabled(): boolean {
     return this.earlyReleaseEnabled;
-  }
-
-  /**
-   * Enable or disable segmented execution at checkpoint boundaries.
-   * When enabled, the executor will flush buffers between checkpoint segments,
-   * enabling memory savings for large models that don't fit in GPU memory.
-   */
-  setCheckpointSegmentationEnabled(enabled: boolean): void {
-    this.checkpointSegmentationEnabled = enabled;
-  }
-
-  /**
-   * Check if checkpoint segmentation is enabled.
-   */
-  isCheckpointSegmentationEnabled(): boolean {
-    return this.checkpointSegmentationEnabled;
-  }
-
-  /**
-   * Enable or disable true segmented execution with GPU synchronization.
-   * This provides actual memory savings for checkpointed models by waiting
-   * for GPU completion between segments before releasing buffers.
-   */
-  setTrueSegmentationEnabled(enabled: boolean): void {
-    this.trueSegmentationEnabled = enabled;
-  }
-
-  /**
-   * Check if true segmentation is enabled.
-   */
-  isTrueSegmentationEnabled(): boolean {
-    return this.trueSegmentationEnabled;
   }
 
   // ============================================================================
@@ -444,92 +395,9 @@ export class RuntimeEngine {
    * Force a tensor to materialize by executing its computation graph.
    */
   async force(tensor: Tensor): Promise<void> {
-    if (tensor.isMaterialized() || tensor.disposed) {
-      return;
-    }
-
-    const lazyRef = tensor.lazyRef;
-    if (lazyRef.kind !== "pending") {
-      return;
-    }
-
-    const _forceTiming = process.env.TORCHLETTE_REPLAY_TIMING === "1";
-    const _forceT0 = _forceTiming ? performance.now() : 0;
-    const plan = buildPlan(lazyRef.node);
-    const _buildT = _forceTiming ? performance.now() - _forceT0 : 0;
-    const backend = this.getBackend(tensor.device);
-
-    // Data-source-only plans (e.g. weight loading: all tensorFromArray) skip the
-    // template/arena/lowered-plan path — they have no compute dispatches, no bind
-    // groups to cache, and their outputs persist as model weights.
-    const allDataSource = plan.nodes.every(n => isDataSourceOp(n.op));
-
-    // --- Lowered Plan Fast-Path ---
-    // Try cached lowered execution plan first.
-    if (!allDataSource && tensor.device === "webgpu" && this.fusionEnabled) {
-      const _lpT0 = _forceTiming ? performance.now() : 0;
-      const executed = await this.tryLoweredPlanExecution(plan, [tensor], tensor.device);
-      if (_forceTiming) console.log(`[force-timing] nodes=${plan.nodes.length} buildPlan=${_buildT.toFixed(1)}ms lowered=${executed ? "HIT" : "MISS"} loweredTime=${(performance.now() - _lpT0).toFixed(1)}ms`);
-      if (executed) return;
-    }
-
-    // Get buffer pool flush function for checkpoint segmentation
-    const flushBufferPool = this.getBufferPoolFlushFn(tensor.device);
-
-    let result;
-    if (this.fusionEnabled && !allDataSource) {
-      // Use optimized execution with fusion (§15)
-      // executePlanOptimized supports enableEarlyRelease for memory management
-      // On non-WebGPU backends, fusion is automatically skipped inside executePlanOptimized
-      const optimizedResult = await executePlanOptimized(plan, backend, {
-        enableFusion: true,
-        enableVectorization: this.vectorizationEnabled,
-        enableEarlyRelease: this.earlyReleaseEnabled,
-      });
-      result = optimizedResult.result;
-      this.lastFusionStats = optimizedResult.stats;
-      this.accumulateFusionStats(optimizedResult.stats);
-    } else if (this.trueSegmentationEnabled && tensor.device === "webgpu") {
-      // Use true segmented execution with GPU synchronization
-      // This provides actual memory savings by waiting for GPU completion
-      // between segments before releasing buffers
-      result = await executePlanWithTrueSegments(
-        plan,
-        backend,
-        { enableEarlyRelease: this.earlyReleaseEnabled },
-      );
-    } else if (this.checkpointSegmentationEnabled) {
-      // Use segmented execution at checkpoint boundaries
-      result = await executePlanWithCheckpointSegments(
-        plan,
-        backend,
-        { enableEarlyRelease: this.earlyReleaseEnabled },
-        flushBufferPool,
-      );
-    } else {
-      // Use standard execution
-      result = await executePlan(plan, backend, {
-        enableEarlyRelease: this.earlyReleaseEnabled,
-      });
-    }
-
-    // Materialize ALL tensors that were pending on executed nodes.
-    // This ensures model parameters and other user-held tensors get their
-    // storages marked as externally reachable.
-    for (const node of plan.nodes) {
-      if (node.result) {
-        materializePendingTensors(node.id, node.result);
-      }
-    }
-
-    // Materialize this tensor (in case it wasn't already handled above)
-    if (!tensor.isMaterialized()) {
-      tensor._materialize(result);
-    }
-
-    // Results are preserved so later plans skip already-executed nodes.
-    // Early-released nodes have their results cleared in the executor.
-
+    if (tensor.isMaterialized() || tensor.disposed) return;
+    if (tensor.lazyRef.kind !== "pending") return;
+    await this.forceAllMerged(tensor);
   }
 
   /**
@@ -799,15 +667,6 @@ export class RuntimeEngine {
       }
     }
 
-  }
-
-  /**
-   * Force multiple tensors to materialize using a single merged execution plan.
-   * This is always more efficient than forcing individually, and enables proper
-   * checkpoint segmentation when checkpoint boundaries are present.
-   */
-  async forceAll(...tensors: Tensor[]): Promise<void> {
-    await this.forceAllMerged(...tensors);
   }
 
   /**
@@ -1481,21 +1340,6 @@ export class RuntimeEngine {
 
   async beginStep(): Promise<void> { await this.getBackend().beginStep?.(); }
   endStep(): void { this.getBackend().endStep?.(); }
-
-  /**
-   * Wrap a raw BackendTensor into a tracked RuntimeTensor.
-   * Creates a new StorageHandle for tracking.
-   */
-  createFromBackendTensor(
-    bt: BackendTensor,
-    shape: number[],
-    device: DeviceKind,
-    dtype: DType = "f32",
-  ): Tensor {
-    const storage = createStorageHandle(device, bt);
-    const ref: LazyRef = createMaterializedRef(storage);
-    return this.createAndTrack(createBaseId(), ref, shape, device, dtype);
-  }
 
   /**
    * Wrap an existing StorageHandle into a tracked RuntimeTensor.

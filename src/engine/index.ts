@@ -163,22 +163,6 @@ export {
   getSizeForClass,
 } from "./lifetime-analysis";
 export type {
-  CrossDeviceAnalysis,
-  TransferPath,
-  TransferResult,
-  TransferStats,
-} from "./cross-device";
-export {
-  analyzeCrossDeviceOps,
-  createTransferStats,
-  executeTransfer,
-  inferOperationDevice,
-  needsTransfer,
-  recordTransfer,
-  resolveTransferPath,
-  shouldAutoTransfer,
-} from "./cross-device";
-export type {
   AMPCastNode,
   AMPPolicy,
   AutocastConfig,
