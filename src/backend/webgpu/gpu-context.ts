@@ -15,6 +15,7 @@ import { bufferPool } from "./buffer-pool";
 import { isProfilingEnabled, initGpuTimestamps } from "./profiler";
 import { setSubgroupSupport, type SubgroupSupport } from "./matmul/types";
 import { resetUnscaleKernelState } from "./unscale-kernel";
+import { resetAdamKernelState } from "./adam-kernel";
 import { destroyProfilingFenceBuffer } from "./buffer-pool";
 import { resetAttentionKernelState } from "./attention-kernel";
 import { resetLayerNormKernelState } from "./layernorm-kernel";
@@ -421,6 +422,7 @@ export function resetAllKernelCaches(): void {
   resetAttentionKernelState();
   resetLayerNormKernelState();
   resetCrossEntropyKernelState();
+  resetAdamKernelState();
   resetUnscaleKernelState();
   resetMatmulState();
   resetFusionCache();

@@ -9,7 +9,7 @@ export { shapesEqual };
 // ============================================================================
 // Matmul Epilogue Fusion (Phase 1)
 // Detects matmul → cast/bias/activation chains and fuses them into a single
-// dispatchMatmulWithEpilogue call, eliminating intermediate buffers.
+// dispatchMatmul call with epilogue options, eliminating intermediate buffers.
 // ============================================================================
 
 export interface MatmulPrologueInfo {
@@ -249,7 +249,7 @@ export function _detectTransposeView(tensor: { shape: number[]; strides?: number
 
 /**
  * Execute a matmul with fused epilogue operations.
- * Uses the existing dispatchMatmulWithEpilogue from the WebGPU backend.
+ * Uses dispatchMatmul from the WebGPU backend with epilogue options.
  */
 export async function executeMatmulWithEpilogue(
   matmulNode: LazyIRNode,
@@ -258,7 +258,7 @@ export async function executeMatmulWithEpilogue(
 ): Promise<void> {
   // Use cached imports (initialized once at executeLoweredPlan/executePlanOptimized entry)
   await ensureWebGPUMatmulImports();
-  const { dispatchMatmulWithEpilogue } = _webgpuMatmulImports!;
+  const { dispatchMatmul } = _webgpuMatmulImports!;
 
   // Determine which inputs have prologue casts.
   // If the prologue cast was skipped (no result), use the original pre-cast input.
@@ -304,16 +304,19 @@ export async function executeMatmulWithEpilogue(
     outputDtype: plan.outputDtype,
   };
 
-  // Call dispatchMatmulWithEpilogue
-  const resultTensor = dispatchMatmulWithEpilogue(
+  // Call dispatchMatmul with epilogue options
+  const resultTensor = dispatchMatmul(
     asGPUTensor(matmulInputA.backendTensor),
     asGPUTensor(matmulInputB.backendTensor),
-    epilogueConfig,
-    epilogueInputTensors.map(t => asGPUTensor(t)),
     false, // transA
     false, // transB
-    inputCastA,
-    inputCastB,
+    undefined, // donatedBuffer
+    {
+      epilogue: epilogueConfig,
+      epilogueInputs: epilogueInputTensors.map(t => asGPUTensor(t)),
+      inputCastA,
+      inputCastB,
+    },
   );
 
   // Store result on the final output node.

@@ -461,22 +461,6 @@ export function dispatchMatmul(
   return createTensor(outShape, outBuffer, undefined, 0, outputDtype, useDonated || !epilogueOpts);
 }
 
-/** @deprecated Use dispatchMatmul with epilogueOpts parameter instead. */
-export function dispatchMatmulWithEpilogue(
-  a: WebGPUTensor,
-  b: WebGPUTensor,
-  epilogue: EpilogueConfig,
-  epilogueInputs: WebGPUTensor[],
-  transA = false,
-  transB = false,
-  inputCastA?: DType,
-  inputCastB?: DType,
-): WebGPUTensor {
-  return dispatchMatmul(a, b, transA, transB, undefined, {
-    epilogue, epilogueInputs, inputCastA, inputCastB,
-  });
-}
-
 /**
  * Direct matmul dispatch with pre-computed geometry.
  *

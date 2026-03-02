@@ -6,7 +6,7 @@
  */
 
 import {
-  dispatchMatmulWithEpilogue,
+  dispatchMatmul,
   getWebGPUDevice,
   initWebGPU,
   syncWebGPU,
@@ -482,7 +482,7 @@ async function runFusedVsUnfusedBenchmark(
   };
   const fusedMs = await benchmark(
     "fused",
-    () => dispatchMatmulWithEpilogue(a, b, epilogue, [bias]),
+    () => dispatchMatmul(a, b, false, false, undefined, { epilogue, epilogueInputs: [bias] }),
     warmup,
     iters,
   );
@@ -505,7 +505,7 @@ async function runFusedVsUnfusedBenchmark(
   };
   const fusedReluMs = await benchmark(
     "fused-relu",
-    () => dispatchMatmulWithEpilogue(a, b, epilogueRelu, [bias]),
+    () => dispatchMatmul(a, b, false, false, undefined, { epilogue: epilogueRelu, epilogueInputs: [bias] }),
     warmup,
     iters,
   );
@@ -528,7 +528,7 @@ async function runFusedVsUnfusedBenchmark(
   };
   const fusedGeluMs = await benchmark(
     "fused-gelu",
-    () => dispatchMatmulWithEpilogue(a, b, epilogueGelu, [bias]),
+    () => dispatchMatmul(a, b, false, false, undefined, { epilogue: epilogueGelu, epilogueInputs: [bias] }),
     warmup,
     iters,
   );
