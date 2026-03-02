@@ -92,6 +92,35 @@ async function executeAdamBatchInner(
   }
 }
 
+/** Create a StorageHandle from arena buffer metadata (ownsBuffer: false, no-op destroy). */
+function arenaStorage(
+  device: string,
+  meta: { buffer: GPUBuffer; shape: number[]; dtype: DType; size: number; strides: number[]; offset?: number; isContiguous?: boolean },
+): StorageHandle {
+  return createStorageHandle(device, {
+    buffer: meta.buffer, shape: meta.shape, dtype: meta.dtype, size: meta.size,
+    strides: meta.strides, offset: meta.offset ?? 0, isContiguous: meta.isContiguous ?? true,
+    ownsBuffer: false, destroy() {},
+  } as BackendTensor);
+}
+
+/** Collect GPU buffers from all external (materialized/already-resolved) plan inputs. */
+function collectExternalInputBuffers(planNodes: LazyIRNode[]): GPUBuffer[] {
+  const bufs: GPUBuffer[] = [];
+  for (const node of planNodes) {
+    for (const ref of node.inputs) {
+      if (ref.kind === "materialized") {
+        const buf = gpuBuffer(ref.storage.backendTensor);
+        if (buf) bufs.push(buf);
+      } else if (ref.kind === "pending" && ref.node.result) {
+        const buf = gpuBuffer(ref.node.result.backendTensor);
+        if (buf) bufs.push(buf);
+      }
+    }
+  }
+  return bufs;
+}
+
 /**
  * Execute a lowered plan (cached dispatch sequence).
  *
@@ -162,18 +191,7 @@ export async function executeLoweredPlan(
   // which replaces the conflicting arena slot with a fresh buffer.
   let extInputBufSet: Set<GPUBuffer> | null = null;
   if (useReplayCache && loweredPlan.dispatchCache?.valid && options.bufferArena) {
-    extInputBufSet = new Set<GPUBuffer>();
-    for (const node of planNodes) {
-      for (const ref of node.inputs) {
-        if (ref.kind === "materialized") {
-          const buf = gpuBuffer(ref.storage.backendTensor);
-          if (buf) extInputBufSet.add(buf);
-        } else if (ref.kind === "pending" && ref.node.result) {
-          const buf = gpuBuffer(ref.node.result.backendTensor);
-          if (buf) extInputBufSet.add(buf);
-        }
-      }
-    }
+    extInputBufSet = new Set(collectExternalInputBuffers(planNodes));
     if (hasArenaExternalConflicts(options.bufferArena, extInputBufSet)) {
       // Arena buffers conflict with external inputs — invalidate replay cache.
       // Normal execution path will replace the conflicting arena slots.
@@ -187,21 +205,7 @@ export async function executeLoweredPlan(
     setActiveArena(options.bufferArena);
 
     // Register external input buffers for arena conflict detection
-    {
-      const extBufs: GPUBuffer[] = [];
-      for (const node of planNodes) {
-        for (const ref of node.inputs) {
-          if (ref.kind === "materialized") {
-            const buf = gpuBuffer(ref.storage.backendTensor);
-            if (buf) extBufs.push(buf);
-          } else if (ref.kind === "pending" && ref.node.result) {
-            const buf = gpuBuffer(ref.node.result.backendTensor);
-            if (buf) extBufs.push(buf);
-          }
-        }
-      }
-      setArenaExternalInputBuffers(extBufs);
-    }
+    setArenaExternalInputBuffers(collectExternalInputBuffers(planNodes));
 
     // Compute stats from lowered plan structure (same as normal path would)
     for (const act of loweredPlan.actions) {
@@ -268,17 +272,7 @@ export async function executeLoweredPlan(
               // Fast path: reconstruct from cached metadata (arena buffers stable)
               setArenaResolveIndexTo(entry.arenaResolveIdxAfter ?? entry.arenaResolveIdx);
               const cr = entry.cachedResult;
-              vNode.result = createStorageHandle(vNode.device, {
-                buffer: cr.buffer,
-                shape: cr.shape,
-                dtype: cr.dtype,
-                size: cr.size,
-                strides: cr.strides,
-                offset: cr.offset,
-                isContiguous: cr.isContiguous,
-                ownsBuffer: false,
-                destroy() {},
-              } as BackendTensor);
+              vNode.result = arenaStorage(vNode.device, cr);
             } else {
               // Slow path: re-execute (first replay before cache populated)
               setArenaResolveIndexTo(entry.arenaResolveIdx);
@@ -361,17 +355,7 @@ export async function executeLoweredPlan(
             const nr = entry.nodeResult;
             const node = planNodes[nr.nodeIndex];
             if (!node.result) {
-              node.result = createStorageHandle(node.device, {
-                buffer: nr.buffer,
-                shape: nr.shape,
-                dtype: nr.dtype,
-                size: nr.size,
-                strides: nr.strides,
-                offset: 0,
-                isContiguous: true,
-                ownsBuffer: false,
-                destroy() {},
-              } as BackendTensor);
+              node.result = arenaStorage(node.device, nr);
             }
             if (_replayTiming) { _tResult += performance.now() - _rsT0; _nResults++; }
             break;
@@ -383,17 +367,7 @@ export async function executeLoweredPlan(
             const soNode = planNodes[entry.nodeIndex];
             if (!soNode._sideOutputs?.attnLogsumexp) {
               if (!soNode._sideOutputs) soNode._sideOutputs = {};
-              soNode._sideOutputs.attnLogsumexp = createStorageHandle(soNode.device, {
-                buffer: entry.buffer,
-                shape: entry.shape,
-                dtype: entry.dtype,
-                size: entry.size,
-                strides: entry.strides,
-                offset: 0,
-                isContiguous: true,
-                ownsBuffer: false,
-                destroy() {},
-              } as BackendTensor);
+              soNode._sideOutputs.attnLogsumexp = arenaStorage(soNode.device, entry);
             }
             break;
           }
@@ -440,19 +414,7 @@ export async function executeLoweredPlan(
   // same buffer for both reading (external input) and writing (fused output),
   // causing data corruption.
   if (options.bufferArena && useTopLevelSharedEncoder) {
-    const extBufs: GPUBuffer[] = [];
-    for (const node of planNodes) {
-      for (const ref of node.inputs) {
-        if (ref.kind === "materialized") {
-          const buf = gpuBuffer(ref.storage.backendTensor);
-          if (buf) extBufs.push(buf);
-        } else if (ref.kind === "pending" && ref.node.result) {
-          const buf = gpuBuffer(ref.node.result.backendTensor);
-          if (buf) extBufs.push(buf);
-        }
-      }
-    }
-    setArenaExternalInputBuffers(extBufs);
+    setArenaExternalInputBuffers(collectExternalInputBuffers(planNodes));
   }
 
   // Set up dispatch recording if we have an arena (needed for stable bind groups)
