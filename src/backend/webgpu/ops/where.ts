@@ -2,6 +2,7 @@
  * Where (ternary select) ops: where, whereDirect, whereChunked.
  */
 
+import { broadcastThreeShapes } from "../../../core/shape";
 import type { BackendTensor } from "../../types";
 import { params } from "../bind-group-cache";
 import { resolveOutputBuffer } from "../buffer-arena";
@@ -18,31 +19,6 @@ import {
 import { createTensor } from "../tensor";
 import { createTileKernelDispatcher } from "../tile-dispatch";
 import { whereSpec, whereWGSL } from "./ops-tile-ir";
-
-/**
- * Broadcast three shapes to a common output shape.
- */
-function broadcastThreeShapes(a: number[], b: number[], c: number[]): number[] {
-  const outRank = Math.max(a.length, b.length, c.length);
-  const out = new Array<number>(outRank);
-  for (let i = 0; i < outRank; i += 1) {
-    const aDim = a[a.length - 1 - i] ?? 1;
-    const bDim = b[b.length - 1 - i] ?? 1;
-    const cDim = c[c.length - 1 - i] ?? 1;
-    // Check all pairs for broadcast compatibility
-    if (aDim !== bDim && aDim !== 1 && bDim !== 1) {
-      throw new Error("webgpu shapes are not broadcastable");
-    }
-    if (aDim !== cDim && aDim !== 1 && cDim !== 1) {
-      throw new Error("webgpu shapes are not broadcastable");
-    }
-    if (bDim !== cDim && bDim !== 1 && cDim !== 1) {
-      throw new Error("webgpu shapes are not broadcastable");
-    }
-    out[outRank - 1 - i] = Math.max(aDim, bDim, cDim);
-  }
-  return out;
-}
 
 /**
  * where(condition, x, y): returns x where condition is true (non-zero), else y.

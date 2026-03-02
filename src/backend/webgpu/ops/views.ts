@@ -2,6 +2,7 @@
  * View and cast ops: cast, reshape, expand, contiguous, narrow, transpose, permute,
  * detectSimpleTranspose, ensureContiguous.
  */
+import { inferReshapeStrides } from "../../../core/shape";
 import type { BackendTensor, DType, TransposeOptions } from "../../types";
 import {
   cachedCreateBindGroup,
@@ -196,97 +197,6 @@ function castChunked(
   );
 
   return createTensor(tensor.shape, outBuffer, undefined, 0, dtype);
-}
-
-/**
- * Infer strides for a new shape given old shape/strides, without copying data.
- * Returns null if the reshape requires a contiguous copy.
- * Implements PyTorch's computeStride algorithm.
- */
-function inferReshapeStrides(
-  oldShape: number[],
-  oldStrides: number[],
-  newShape: number[],
-): number[] | null {
-  if (newShape.length === 0) return [];
-  if (oldShape.length === 0) return contiguousStrides(newShape);
-
-  const newStrides = new Array<number>(newShape.length);
-
-  // Work through old and new dims left-to-right, grouping contiguous chunks
-  let oldIdx = 0;
-  let newIdx = 0;
-  const oldN = oldShape.length;
-  const newN = newShape.length;
-
-  while (newIdx < newN) {
-    // Skip size-1 dims in new shape (stride is irrelevant)
-    if (newShape[newIdx] === 1) {
-      // Use a sensible stride for size-1 dims
-      newStrides[newIdx] = newIdx + 1 < newN ? newStrides[newIdx + 1] || 1 : 1;
-      newIdx++;
-      continue;
-    }
-
-    // Skip size-1 dims in old shape
-    while (oldIdx < oldN && oldShape[oldIdx] === 1) oldIdx++;
-    if (oldIdx >= oldN) return null;
-
-    // Accumulate a group of old dims and match to new dims
-    let oldProduct = oldShape[oldIdx];
-    let newProduct = newShape[newIdx];
-
-    // Collect old dims until oldProduct >= newProduct
-    while (oldProduct < newProduct && oldIdx + 1 < oldN) {
-      // Check contiguity between consecutive old dims
-      if (
-        oldStrides[oldIdx] !==
-        oldStrides[oldIdx + 1] * oldShape[oldIdx + 1]
-      ) {
-        return null; // Non-contiguous boundary
-      }
-      oldIdx++;
-      // Skip size-1 old dims within group
-      if (oldShape[oldIdx] === 1) continue;
-      oldProduct *= oldShape[oldIdx];
-    }
-
-    // Collect new dims until newProduct >= oldProduct
-    const newGroupStart = newIdx;
-    while (newProduct < oldProduct && newIdx + 1 < newN) {
-      newIdx++;
-      if (newShape[newIdx] === 1) {
-        newStrides[newIdx] = 1;
-        continue;
-      }
-      newProduct *= newShape[newIdx];
-    }
-
-    if (oldProduct !== newProduct) return null;
-
-    // Assign strides for the new dims in this group (right-to-left)
-    // The rightmost new dim gets the stride of the rightmost old dim
-    let stride = oldStrides[oldIdx];
-    for (let i = newIdx; i >= newGroupStart; i--) {
-      if (newShape[i] === 1) {
-        newStrides[i] = stride;
-        continue;
-      }
-      newStrides[i] = stride;
-      stride *= newShape[i];
-    }
-
-    oldIdx++;
-    newIdx++;
-  }
-
-  // Check remaining old dims are all size 1
-  while (oldIdx < oldN) {
-    if (oldShape[oldIdx] !== 1) return null;
-    oldIdx++;
-  }
-
-  return newStrides;
 }
 
 export function reshape(a: BackendTensor, shape: number[]): BackendTensor {

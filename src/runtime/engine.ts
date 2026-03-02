@@ -22,7 +22,7 @@ import {
   type SumOptions,
   type TransposeOptions,
 } from "../backend/types";
-import { broadcastShapes } from "../core/shape";
+import { broadcastShapes, broadcastThreeShapes } from "../core/shape";
 import { OP_DTYPE_RULES, promoteDtype } from "../engine/dtype-rules";
 import { computePlanFingerprint } from "../engine/fusion-detect";
 import {
@@ -143,28 +143,6 @@ export function reduceShape(
   const normalizedDims = dims.map((d) => (d < 0 ? shape.length + d : d));
   if (keepdim) return shape.map((s, i) => (normalizedDims.includes(i) ? 1 : s));
   return shape.filter((_, i) => !normalizedDims.includes(i));
-}
-
-export function broadcastThreeShapes(
-  a: number[],
-  b: number[],
-  c: number[],
-): number[] {
-  const outRank = Math.max(a.length, b.length, c.length);
-  const out = new Array<number>(outRank);
-  for (let i = 0; i < outRank; i++) {
-    const aDim = a[a.length - 1 - i] ?? 1;
-    const bDim = b[b.length - 1 - i] ?? 1;
-    const cDim = c[c.length - 1 - i] ?? 1;
-    if (aDim !== bDim && aDim !== 1 && bDim !== 1)
-      throw new Error(`Cannot broadcast shapes [${a}], [${b}], and [${c}]`);
-    if (aDim !== cDim && aDim !== 1 && cDim !== 1)
-      throw new Error(`Cannot broadcast shapes [${a}], [${b}], and [${c}]`);
-    if (bDim !== cDim && bDim !== 1 && cDim !== 1)
-      throw new Error(`Cannot broadcast shapes [${a}], [${b}], and [${c}]`);
-    out[outRank - 1 - i] = Math.max(aDim, bDim, cDim);
-  }
-  return out;
 }
 
 /** Build a cast LazyRef without creating a Tensor (no lifecycle, no registration). */
