@@ -14,7 +14,6 @@ import { gpuContext, setGpuContext, requireContext } from "./webgpu-state";
 import { bufferPool } from "./buffer-pool";
 import { isProfilingEnabled, initGpuTimestamps } from "./profiler";
 import { setSubgroupSupport, type SubgroupSupport } from "./matmul/types";
-import { registerWebGPUDonation } from "../../engine/memory-planned-executor";
 import { resetUnscaleKernelState } from "./unscale-kernel";
 import { destroyProfilingFenceBuffer } from "./buffer-pool";
 import { resetAttentionKernelState } from "./attention-kernel";
@@ -383,8 +382,6 @@ export async function initWebGPU(): Promise<boolean> {
   if (isProfilingEnabled() && device.features.has("timestamp-query")) {
     initGpuTimestamps(device);
   }
-
-  registerWebGPUDonation(donateBuffer, getBufferSize);
 
   const batchSubmits = typeof process !== "undefined"
     ? process.env?.TORCHLETTE_BATCH_SUBMITS

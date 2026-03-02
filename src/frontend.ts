@@ -22,7 +22,6 @@ import {
   createAutocastContext,
 } from "./engine/amp";
 import { RuntimeEngine, TidyDispatchMode, type TensorOrScalar } from "./runtime/engine";
-import { setMemoryLimit } from "./engine/memory-planned-executor";
 import {
   setGPUMemoryLimit,
   getGPUMemoryLimit,
@@ -136,8 +135,6 @@ export class Torchlette {
   private inCompileRegion = false;
   /** Tensors created inside compile regions — eligible for disposal after backward */
   readonly _compileCreatedTensors = new WeakSet<Tensor>();
-  /** Whether memory planning is available for compile regions (§0.1 goal #2) */
-  private readonly memoryPlanningAvailable: boolean;
   /** Stack of saved tensor hooks for checkpointing (§10) */
   readonly _savedTensorHooksStack: SavedTensorHooksContext[] = [];
   /** Label to capture on subsequent autograd nodes (for backward attribution) */
@@ -147,18 +144,12 @@ export class Torchlette {
 
   constructor(backendName?: DeviceKind, options?: TorchletteOptions) {
     this.engine = new Engine();
-    // Configure memory limit if provided (applies to both BufferPool and GPU memory tracker)
+    // Configure memory limit if provided (applies to GPU memory tracker)
     if (options?.memoryLimitBytes !== undefined) {
-      setMemoryLimit(options.memoryLimitBytes);
       setGPUMemoryLimit(options.memoryLimitBytes);
     }
-    // Per spec §0.1 goal #2: memory planning runs ONLY inside compiled regions
-    // Store whether it's available, but don't enable it globally
-    this.memoryPlanningAvailable = options?.enableMemoryPlanning ?? false;
     this.runtime = new RuntimeEngine(backendName, {
       enableFusion: options?.enableFusion ?? false,
-      // Memory planning starts disabled; enabled only during compile()
-      enableMemoryPlanning: false,
       // Early release can be enabled globally for memory savings
       enableEarlyRelease: options?.enableEarlyRelease ?? false,
       // Checkpoint segmentation for large model memory savings
@@ -249,14 +240,10 @@ export class Torchlette {
       // Signal we're in a compile region
       this.inCompileRegion = true;
       const wasFusionEnabled = this.runtime.isFusionEnabled();
-      const wasMemoryPlanningEnabled = this.runtime.isMemoryPlanningEnabled();
       const wasAutotuneEnabled = isAutotuneEnabled();
 
-      // Per spec §0.1 goal #2: fusion and memory planning run ONLY inside compiled regions
+      // Per spec §0.1 goal #2: fusion runs ONLY inside compiled regions
       this.runtime.setFusionEnabled(true);
-      if (this.memoryPlanningAvailable) {
-        this.runtime.setMemoryPlanning(true);
-      }
 
       // Enable autotune if requested
       if (enableAutotune) {
@@ -279,7 +266,6 @@ export class Torchlette {
       } finally {
         // Restore previous states
         this.runtime.setFusionEnabled(wasFusionEnabled);
-        this.runtime.setMemoryPlanning(wasMemoryPlanningEnabled);
         // NOTE: Don't reset autotune here. Lazy execution happens AFTER this
         // finally block returns, so we need to keep autotune enabled.
         // The flag is reset via setAutotuneEnabled(false) in tests or by

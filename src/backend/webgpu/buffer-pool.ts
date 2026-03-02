@@ -10,7 +10,7 @@
  * from webgpu-state.ts (a zero-dependency leaf module).
  */
 
-import { getSizeClass, getSizeForClass } from "../../engine/memory-planning";
+import { getSizeClass, getSizeForClass } from "../../engine/lifetime-analysis";
 import { gpuMemoryTracker } from "./memory-tracker";
 import { isProfilingEnabled } from "./profiler";
 import type { GPUBuffer, GPUQueue, GPUDevice } from "./gpu-types";

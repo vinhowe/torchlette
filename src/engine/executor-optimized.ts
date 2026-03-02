@@ -22,7 +22,7 @@ import {
 import {
   analyzeLifetimes,
   type TensorLifetime,
-} from "./memory-planning";
+} from "./lifetime-analysis";
 import {
   type LoweredPlan,
   LoweredPlanBuilder,

@@ -13,7 +13,7 @@ import {
   analyzeLifetimes,
   findDeadTensorsAtStep,
   computeBufferSize,
-} from "../src/engine/memory-planning";
+} from "../src/engine/lifetime-analysis";
 
 describe("Memory-Aware Scheduler", () => {
   beforeEach(() => {
@@ -270,7 +270,7 @@ describe("Memory-Aware Scheduler with Fusion", () => {
 describe("Memory-Aware Scheduler with Memory Planning", () => {
   it("should work correctly with memory planning and early release", async () => {
     const engine = new RuntimeEngine("cpu", {
-      enableMemoryPlanning: true,
+
       enableDonation: true,
       enableEarlyRelease: true,
     });
@@ -345,7 +345,7 @@ describe("Memory-Aware Scheduler with WebGPU", { skip: cpuOnly }, () => {
 
   it("should work with memory planning and early release on WebGPU", async () => {
     const engine = new RuntimeEngine("webgpu", {
-      enableMemoryPlanning: true,
+
       enableDonation: true,
       enableEarlyRelease: true,
     });

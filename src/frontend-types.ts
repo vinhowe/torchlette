@@ -87,8 +87,6 @@ export type AutocastOptions = {
 export type TorchletteOptions = {
   /** Enable fusion optimizations (§15). Default: false */
   enableFusion?: boolean;
-  /** Enable memory planning for buffer reuse. Default: false */
-  enableMemoryPlanning?: boolean;
   /** Maximum memory limit in bytes. Default: 10GB */
   memoryLimitBytes?: number;
   /** Enable early buffer release during execution for memory savings. Default: false */

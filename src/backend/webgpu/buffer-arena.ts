@@ -23,7 +23,7 @@ import {
 import { createTrackedBuffer } from "./tensor";
 import { bufferPool } from "./buffer-pool";
 import { alignBufferSize } from "./shape-utils";
-import { getSizeClass, getSizeForClass } from "../../engine/memory-planning";
+import { getSizeClass, getSizeForClass } from "../../engine/lifetime-analysis";
 import { gpuMemoryTracker } from "./memory-tracker";
 import { profileApiCall } from "./profiler";
 

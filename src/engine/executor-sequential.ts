@@ -12,7 +12,7 @@ import {
 import {
   analyzeLifetimes,
   type TensorLifetime,
-} from "./memory-planning";
+} from "./lifetime-analysis";
 import type { LazyIRNode, StorageHandle, ExecutionPlan, ExecutePlanOptions } from "./lazy-types";
 import { wrapResultAsStorage } from "./node-factory";
 import { canSafelyRelease, releaseBufferImmediate, releaseDeadTensors } from "./storage-tracker";
