@@ -152,18 +152,7 @@ export type SubOptions = {
 
 export function sub(a: Tensor, b: Tensor, options?: SubOptions): Tensor {
   const alpha = options?.alpha ?? 1;
-  const outShape = broadcastShapes(a.shape, b.shape);
-  const aBroadcast = broadcastTo(a, outShape);
-  const bBroadcast = broadcastTo(b, outShape);
-  const outSize = sizeOf(outShape);
-  const out = new Float32Array(outSize);
-  const shapeStrides = computeStrides(outShape);
-  for (let i = 0; i < outSize; i += 1) {
-    out[i] =
-      readAtLinear(aBroadcast, i, shapeStrides) -
-      alpha * readAtLinear(bBroadcast, i, shapeStrides);
-  }
-  return new Tensor(outShape, out);
+  return applyBinaryOp(a, b, (x, y) => x - alpha * y);
 }
 
 export type DivOptions = {
@@ -172,24 +161,12 @@ export type DivOptions = {
 
 export function div(a: Tensor, b: Tensor, options?: DivOptions): Tensor {
   const rounding = options?.roundingMode ?? null;
-  const outShape = broadcastShapes(a.shape, b.shape);
-  const aBroadcast = broadcastTo(a, outShape);
-  const bBroadcast = broadcastTo(b, outShape);
-  const outSize = sizeOf(outShape);
-  const out = new Float32Array(outSize);
-  const shapeStrides = computeStrides(outShape);
-  for (let i = 0; i < outSize; i += 1) {
-    let value =
-      readAtLinear(aBroadcast, i, shapeStrides) /
-      readAtLinear(bBroadcast, i, shapeStrides);
-    if (rounding === "floor") {
-      value = Math.floor(value);
-    } else if (rounding === "trunc") {
-      value = Math.trunc(value);
-    }
-    out[i] = value;
-  }
-  return new Tensor(outShape, out);
+  return applyBinaryOp(a, b, (x, y) => {
+    let v = x / y;
+    if (rounding === "floor") v = Math.floor(v);
+    else if (rounding === "trunc") v = Math.trunc(v);
+    return v;
+  });
 }
 
 export function reshape(a: Tensor, shape: Shape): Tensor {
@@ -363,45 +340,31 @@ export function permute(a: Tensor, dims: number[]): Tensor {
   return new Tensor(newShape, a.data, newStrides, a.offset, false);
 }
 
-export function add(a: Tensor, b: Tensor): Tensor {
-  const outShape = broadcastShapes(a.shape, b.shape);
-  const aBroadcast = broadcastTo(a, outShape);
-  const bBroadcast = broadcastTo(b, outShape);
-  const outSize = sizeOf(outShape);
-  const out = new Float32Array(outSize);
-  const shapeStrides = computeStrides(outShape);
-  for (let i = 0; i < outSize; i += 1) {
-    out[i] =
-      readAtLinear(aBroadcast, i, shapeStrides) +
-      readAtLinear(bBroadcast, i, shapeStrides);
-  }
-  return new Tensor(outShape, out);
-}
-
-export function mul(a: Tensor, b: Tensor): Tensor {
-  const outShape = broadcastShapes(a.shape, b.shape);
-  const aBroadcast = broadcastTo(a, outShape);
-  const bBroadcast = broadcastTo(b, outShape);
-  const outSize = sizeOf(outShape);
-  const out = new Float32Array(outSize);
-  const shapeStrides = computeStrides(outShape);
-  for (let i = 0; i < outSize; i += 1) {
-    out[i] =
-      readAtLinear(aBroadcast, i, shapeStrides) *
-      readAtLinear(bBroadcast, i, shapeStrides);
-  }
-  return new Tensor(outShape, out);
-}
-
-export function relu(a: Tensor): Tensor {
+function applyUnaryOp(a: Tensor, fn: (x: number) => number): Tensor {
   const out = new Float32Array(a.size);
   const shapeStrides = computeStrides(a.shape);
   for (let i = 0; i < a.size; i += 1) {
-    const value = readAtLinear(a, i, shapeStrides);
-    out[i] = value > 0 ? value : 0;
+    out[i] = fn(readAtLinear(a, i, shapeStrides));
   }
   return new Tensor(a.shape, out);
 }
+
+function applyBinaryOp(a: Tensor, b: Tensor, fn: (x: number, y: number) => number): Tensor {
+  const outShape = broadcastShapes(a.shape, b.shape);
+  const aBroadcast = broadcastTo(a, outShape);
+  const bBroadcast = broadcastTo(b, outShape);
+  const outSize = sizeOf(outShape);
+  const out = new Float32Array(outSize);
+  const shapeStrides = computeStrides(outShape);
+  for (let i = 0; i < outSize; i += 1) {
+    out[i] = fn(readAtLinear(aBroadcast, i, shapeStrides), readAtLinear(bBroadcast, i, shapeStrides));
+  }
+  return new Tensor(outShape, out);
+}
+
+export function add(a: Tensor, b: Tensor): Tensor { return applyBinaryOp(a, b, (x, y) => x + y); }
+export function mul(a: Tensor, b: Tensor): Tensor { return applyBinaryOp(a, b, (x, y) => x * y); }
+export function relu(a: Tensor): Tensor { return applyUnaryOp(a, x => x > 0 ? x : 0); }
 
 export function matmul(a: Tensor, b: Tensor): Tensor {
   const aRank = a.shape.length;
@@ -490,69 +453,13 @@ export function matmul(a: Tensor, b: Tensor): Tensor {
   return new Tensor(outShape, out);
 }
 
-export function sqrt(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.sqrt(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
-}
-
-export function exp(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.exp(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
-}
-
-export function log(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.log(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
-}
-
-export function neg(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = -readAtLinear(a, i, shapeStrides);
-  }
-  return new Tensor(a.shape, out);
-}
-
-export function abs(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.abs(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
-}
-
-export function tanh(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.tanh(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
-}
-
-export function sigmoid(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    const x = readAtLinear(a, i, shapeStrides);
-    out[i] = 1.0 / (1.0 + Math.exp(-x));
-  }
-  return new Tensor(a.shape, out);
-}
+export function sqrt(a: Tensor): Tensor { return applyUnaryOp(a, Math.sqrt); }
+export function exp(a: Tensor): Tensor { return applyUnaryOp(a, Math.exp); }
+export function log(a: Tensor): Tensor { return applyUnaryOp(a, Math.log); }
+export function neg(a: Tensor): Tensor { return applyUnaryOp(a, x => -x); }
+export function abs(a: Tensor): Tensor { return applyUnaryOp(a, Math.abs); }
+export function tanh(a: Tensor): Tensor { return applyUnaryOp(a, Math.tanh); }
+export function sigmoid(a: Tensor): Tensor { return applyUnaryOp(a, x => 1.0 / (1.0 + Math.exp(-x))); }
 
 /**
  * Error function approximation using Horner's method.
@@ -602,121 +509,25 @@ export function gelu(a: Tensor, options?: GeluOptions): Tensor {
   return new Tensor(a.shape, out);
 }
 
-export function silu(a: Tensor): Tensor {
-  // SiLU/Swish: x * sigmoid(x) = x / (1 + exp(-x))
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    const x = readAtLinear(a, i, shapeStrides);
-    out[i] = x / (1.0 + Math.exp(-x));
-  }
-  return new Tensor(a.shape, out);
-}
-
-export function sin(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.sin(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
-}
-
-export function cos(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.cos(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
-}
-
-export function rsqrt(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = 1.0 / Math.sqrt(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
-}
-
-export function floor(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.floor(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
-}
-
-export function ceil(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.ceil(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
-}
-
-export function round(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.round(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
-}
-
-export function sign(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.sign(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
-}
+export function silu(a: Tensor): Tensor { return applyUnaryOp(a, x => x / (1.0 + Math.exp(-x))); }
+export function sin(a: Tensor): Tensor { return applyUnaryOp(a, Math.sin); }
+export function cos(a: Tensor): Tensor { return applyUnaryOp(a, Math.cos); }
+export function rsqrt(a: Tensor): Tensor { return applyUnaryOp(a, x => 1.0 / Math.sqrt(x)); }
+export function floor(a: Tensor): Tensor { return applyUnaryOp(a, Math.floor); }
+export function ceil(a: Tensor): Tensor { return applyUnaryOp(a, Math.ceil); }
+export function round(a: Tensor): Tensor { return applyUnaryOp(a, Math.round); }
+export function sign(a: Tensor): Tensor { return applyUnaryOp(a, Math.sign); }
+export function isfinite(a: Tensor): Tensor { return applyUnaryOp(a, x => Number.isFinite(x) ? 1.0 : 0.0); }
 
 export function clamp(a: Tensor, min: number | null, max: number | null): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    let v = readAtLinear(a, i, shapeStrides);
+  return applyUnaryOp(a, v => {
     if (min !== null && v < min) v = min;
     if (max !== null && v > max) v = max;
-    out[i] = v;
-  }
-  return new Tensor(a.shape, out);
+    return v;
+  });
 }
 
-export function pow(a: Tensor, b: Tensor): Tensor {
-  const outShape = broadcastShapes(a.shape, b.shape);
-  const aBroadcast = broadcastTo(a, outShape);
-  const bBroadcast = broadcastTo(b, outShape);
-  const outSize = sizeOf(outShape);
-  const out = new Float32Array(outSize);
-  const shapeStrides = computeStrides(outShape);
-  for (let i = 0; i < outSize; i += 1) {
-    out[i] = Math.pow(
-      readAtLinear(aBroadcast, i, shapeStrides),
-      readAtLinear(bBroadcast, i, shapeStrides),
-    );
-  }
-  return new Tensor(outShape, out);
-}
-
-/**
- * Check if values are finite (not NaN and not Inf).
- * Returns 1.0 where finite, 0.0 where NaN or Inf.
- */
-export function isfinite(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    const x = readAtLinear(a, i, shapeStrides);
-    out[i] = Number.isFinite(x) ? 1.0 : 0.0;
-  }
-  return new Tensor(a.shape, out);
-}
+export function pow(a: Tensor, b: Tensor): Tensor { return applyBinaryOp(a, b, Math.pow); }
 
 export type SumOptions = {
   dim?: number | number[] | null;
@@ -1450,81 +1261,16 @@ export function argmin(a: Tensor, options: ArgReduceOptions): Tensor {
 // Comparison ops - return 1.0 for true, 0.0 for false
 // ============================================================================
 
-export function gt(a: Tensor, b: Tensor): Tensor {
-  const { aBroadcast, bBroadcast, outShape, outSize, shapeStrides } = broadcastBinary(a, b);
-  const out = new Float32Array(outSize);
-  for (let i = 0; i < outSize; i += 1) {
-    const aVal = readAtLinear(aBroadcast, i, shapeStrides);
-    const bVal = readAtLinear(bBroadcast, i, shapeStrides);
-    out[i] = aVal > bVal ? 1.0 : 0.0;
-  }
-  return new Tensor(outShape, out);
+function comparisonOp(a: Tensor, b: Tensor, cmp: (x: number, y: number) => boolean): Tensor {
+  return applyBinaryOp(a, b, (x, y) => cmp(x, y) ? 1.0 : 0.0);
 }
 
-export function lt(a: Tensor, b: Tensor): Tensor {
-  const { aBroadcast, bBroadcast, outShape, outSize, shapeStrides } = broadcastBinary(a, b);
-  const out = new Float32Array(outSize);
-  for (let i = 0; i < outSize; i += 1) {
-    const aVal = readAtLinear(aBroadcast, i, shapeStrides);
-    const bVal = readAtLinear(bBroadcast, i, shapeStrides);
-    out[i] = aVal < bVal ? 1.0 : 0.0;
-  }
-  return new Tensor(outShape, out);
-}
-
-export function ge(a: Tensor, b: Tensor): Tensor {
-  const { aBroadcast, bBroadcast, outShape, outSize, shapeStrides } = broadcastBinary(a, b);
-  const out = new Float32Array(outSize);
-  for (let i = 0; i < outSize; i += 1) {
-    const aVal = readAtLinear(aBroadcast, i, shapeStrides);
-    const bVal = readAtLinear(bBroadcast, i, shapeStrides);
-    out[i] = aVal >= bVal ? 1.0 : 0.0;
-  }
-  return new Tensor(outShape, out);
-}
-
-export function le(a: Tensor, b: Tensor): Tensor {
-  const { aBroadcast, bBroadcast, outShape, outSize, shapeStrides } = broadcastBinary(a, b);
-  const out = new Float32Array(outSize);
-  for (let i = 0; i < outSize; i += 1) {
-    const aVal = readAtLinear(aBroadcast, i, shapeStrides);
-    const bVal = readAtLinear(bBroadcast, i, shapeStrides);
-    out[i] = aVal <= bVal ? 1.0 : 0.0;
-  }
-  return new Tensor(outShape, out);
-}
-
-export function eq(a: Tensor, b: Tensor): Tensor {
-  const { aBroadcast, bBroadcast, outShape, outSize, shapeStrides } = broadcastBinary(a, b);
-  const out = new Float32Array(outSize);
-  for (let i = 0; i < outSize; i += 1) {
-    const aVal = readAtLinear(aBroadcast, i, shapeStrides);
-    const bVal = readAtLinear(bBroadcast, i, shapeStrides);
-    out[i] = aVal === bVal ? 1.0 : 0.0;
-  }
-  return new Tensor(outShape, out);
-}
-
-export function ne(a: Tensor, b: Tensor): Tensor {
-  const { aBroadcast, bBroadcast, outShape, outSize, shapeStrides } = broadcastBinary(a, b);
-  const out = new Float32Array(outSize);
-  for (let i = 0; i < outSize; i += 1) {
-    const aVal = readAtLinear(aBroadcast, i, shapeStrides);
-    const bVal = readAtLinear(bBroadcast, i, shapeStrides);
-    out[i] = aVal !== bVal ? 1.0 : 0.0;
-  }
-  return new Tensor(outShape, out);
-}
-
-/** Helper for binary broadcast */
-function broadcastBinary(a: Tensor, b: Tensor) {
-  const outShape = broadcastShapes(a.shape, b.shape);
-  const aBroadcast = broadcastTo(a, outShape);
-  const bBroadcast = broadcastTo(b, outShape);
-  const outSize = sizeOf(outShape);
-  const shapeStrides = computeStrides(outShape);
-  return { aBroadcast, bBroadcast, outShape, outSize, shapeStrides };
-}
+export function gt(a: Tensor, b: Tensor): Tensor { return comparisonOp(a, b, (x, y) => x > y); }
+export function lt(a: Tensor, b: Tensor): Tensor { return comparisonOp(a, b, (x, y) => x < y); }
+export function ge(a: Tensor, b: Tensor): Tensor { return comparisonOp(a, b, (x, y) => x >= y); }
+export function le(a: Tensor, b: Tensor): Tensor { return comparisonOp(a, b, (x, y) => x <= y); }
+export function eq(a: Tensor, b: Tensor): Tensor { return comparisonOp(a, b, (x, y) => x === y); }
+export function ne(a: Tensor, b: Tensor): Tensor { return comparisonOp(a, b, (x, y) => x !== y); }
 
 /**
  * where(condition, x, y): returns x where condition is true (non-zero), else y.
