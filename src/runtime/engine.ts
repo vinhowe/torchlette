@@ -1101,22 +1101,17 @@ export class RuntimeEngine {
     return this.createAndTrack(createBaseId(), createPendingRef(node), shape, resolvedDevice);
   }
 
+  /** Helper: create a simple binary lazy op node (comparison ops output f32). */
+  private _comparisonOp(op: LazyOpCode, a: TensorOrScalar, b: TensorOrScalar): Tensor {
+    const { refA, refB, shape, device } = this.resolveBinaryOp(op, a, b);
+    const node = createLazyIRNode(op, [refA, refB], shape, "f32", device);
+    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device);
+  }
+
   /** Helper: create a simple unary lazy op node. */
-  private _unaryOp(op: LazyOpCode, a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      op,
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
+  private _unaryOp(op: LazyOpCode, a: OpInput, payload?: unknown): Tensor {
+    const node = createLazyIRNode(op, [a.lazyRef], a.shape.slice(), a.dtype, a.device, payload);
+    return this.createAndTrack(createBaseId(), createPendingRef(node), a.shape.slice(), a.device, a.dtype);
   }
 
   /**
@@ -1267,243 +1262,43 @@ export class RuntimeEngine {
     return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
   }
 
-  sqrt(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "sqrt",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
-  }
-
-  relu(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "relu",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
-  }
+  sqrt(a: Tensor): Tensor { return this._unaryOp("sqrt", a); }
+  relu(a: Tensor): Tensor { return this._unaryOp("relu", a); }
 
   exp(a: Tensor): Tensor {
     const [op] = this.ensureDtypeSafety("exp", [a]);
-    const node = createLazyIRNode(
-      "exp",
-      [op.lazyRef],
-      op.shape.slice(),
-      op.dtype,
-      op.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      op.shape.slice(),
-      op.device,
-      op.dtype,
-    );
+    return this._unaryOp("exp", op);
   }
 
   log(a: Tensor): Tensor {
     const [op] = this.ensureDtypeSafety("log", [a]);
-    const node = createLazyIRNode(
-      "log",
-      [op.lazyRef],
-      op.shape.slice(),
-      op.dtype,
-      op.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      op.shape.slice(),
-      op.device,
-      op.dtype,
-    );
+    return this._unaryOp("log", op);
   }
 
-  neg(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "neg",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
-  }
+  neg(a: Tensor): Tensor { return this._unaryOp("neg", a); }
+  abs(a: Tensor): Tensor { return this._unaryOp("abs", a); }
+  tanh(a: Tensor): Tensor { return this._unaryOp("tanh", a); }
+  sigmoid(a: Tensor): Tensor { return this._unaryOp("sigmoid", a); }
 
-  abs(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "abs",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
-  }
+  gelu(a: Tensor, options?: GeluOptions): Tensor { return this._unaryOp("gelu", a, options); }
+  silu(a: Tensor): Tensor { return this._unaryOp("silu", a); }
 
-  tanh(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "tanh",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
-  }
-
-  sigmoid(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "sigmoid",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
-  }
-
-  gelu(a: Tensor, options?: GeluOptions): Tensor {
-    const node = createLazyIRNode(
-      "gelu",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-      options, // Pass options as payload
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
-  }
-
-  silu(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "silu",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
-  }
-
-  sin(a: Tensor): Tensor {
-    return this._unaryOp("sin", a);
-  }
-
-  cos(a: Tensor): Tensor {
-    return this._unaryOp("cos", a);
-  }
-
-  rsqrt(a: Tensor): Tensor {
-    return this._unaryOp("rsqrt", a);
-  }
-
-  floor(a: Tensor): Tensor {
-    return this._unaryOp("floor", a);
-  }
-
-  ceil(a: Tensor): Tensor {
-    return this._unaryOp("ceil", a);
-  }
-
-  round(a: Tensor): Tensor {
-    return this._unaryOp("round", a);
-  }
-
-  sign(a: Tensor): Tensor {
-    return this._unaryOp("sign", a);
-  }
+  sin(a: Tensor): Tensor { return this._unaryOp("sin", a); }
+  cos(a: Tensor): Tensor { return this._unaryOp("cos", a); }
+  rsqrt(a: Tensor): Tensor { return this._unaryOp("rsqrt", a); }
+  floor(a: Tensor): Tensor { return this._unaryOp("floor", a); }
+  ceil(a: Tensor): Tensor { return this._unaryOp("ceil", a); }
+  round(a: Tensor): Tensor { return this._unaryOp("round", a); }
+  sign(a: Tensor): Tensor { return this._unaryOp("sign", a); }
 
   clamp(a: Tensor, min: number | null, max: number | null): Tensor {
-    const node = createLazyIRNode(
-      "clamp",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-      { min, max },
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
+    return this._unaryOp("clamp", a, { min, max });
   }
 
-  /**
-   * Check if values are finite (not NaN and not Inf).
-   * Returns 1.0 where finite, 0.0 where NaN or Inf.
-   */
+  /** Returns 1.0 where finite, 0.0 where NaN or Inf. */
   isfinite(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "isfinite",
-      [a.lazyRef],
-      a.shape.slice(),
-      "f32",
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-    );
+    const node = createLazyIRNode("isfinite", [a.lazyRef], a.shape.slice(), "f32", a.device);
+    return this.createAndTrack(createBaseId(), createPendingRef(node), a.shape.slice(), a.device);
   }
 
   expand(a: Tensor, shape: number[]): Tensor {
@@ -1818,41 +1613,12 @@ export class RuntimeEngine {
     return this.createAndTrack(createBaseId(), createPendingRef(node), shape, a.device);
   }
 
-  gt(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, device } = this.resolveBinaryOp("gt", a, b);
-    const node = createLazyIRNode("gt", [refA, refB], shape, "f32", device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device);
-  }
-
-  lt(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, device } = this.resolveBinaryOp("lt", a, b);
-    const node = createLazyIRNode("lt", [refA, refB], shape, "f32", device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device);
-  }
-
-  ge(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, device } = this.resolveBinaryOp("ge", a, b);
-    const node = createLazyIRNode("ge", [refA, refB], shape, "f32", device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device);
-  }
-
-  le(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, device } = this.resolveBinaryOp("le", a, b);
-    const node = createLazyIRNode("le", [refA, refB], shape, "f32", device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device);
-  }
-
-  eq(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, device } = this.resolveBinaryOp("eq", a, b);
-    const node = createLazyIRNode("eq", [refA, refB], shape, "f32", device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device);
-  }
-
-  ne(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, device } = this.resolveBinaryOp("ne", a, b);
-    const node = createLazyIRNode("ne", [refA, refB], shape, "f32", device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device);
-  }
+  gt(a: TensorOrScalar, b: TensorOrScalar): Tensor { return this._comparisonOp("gt", a, b); }
+  lt(a: TensorOrScalar, b: TensorOrScalar): Tensor { return this._comparisonOp("lt", a, b); }
+  ge(a: TensorOrScalar, b: TensorOrScalar): Tensor { return this._comparisonOp("ge", a, b); }
+  le(a: TensorOrScalar, b: TensorOrScalar): Tensor { return this._comparisonOp("le", a, b); }
+  eq(a: TensorOrScalar, b: TensorOrScalar): Tensor { return this._comparisonOp("eq", a, b); }
+  ne(a: TensorOrScalar, b: TensorOrScalar): Tensor { return this._comparisonOp("ne", a, b); }
 
   where(condition: Tensor, x: TensorOrScalar, y: TensorOrScalar): Tensor {
     const refT = typeof x !== "number" ? x : typeof y !== "number" ? y : condition;
