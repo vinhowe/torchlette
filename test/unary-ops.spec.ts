@@ -105,10 +105,10 @@ describe("Unary ops (CPU)", () => {
 
       expect(a.grad).not.toBeNull();
       const grad = await a.grad?.cpu();
-      // d/dx |x| = sign(x)
+      // d/dx |x| = sign(x), with sign(0) = 0 (PyTorch convention)
       expect(grad?.[0]).toBe(1); // positive
       expect(grad?.[1]).toBe(-1); // negative
-      expect(grad?.[2]).toBe(1); // zero (we use >= 0)
+      expect(grad?.[2]).toBe(0); // zero: subgradient = 0
     });
   });
 

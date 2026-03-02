@@ -112,6 +112,11 @@ const UNARY_OPS: Record<string, UnaryOpSpec> = {
   exp:      { autocast: "exp", grad: (rt, g, s) => rt.mul(g, rt.exp(s._unwrap())) },
   log:      { autocast: "log", grad: (rt, g, s) => rt.div(g, rt.add(s._unwrap(), 1e-8)) },
   neg:      { needsSave: false, grad: (rt, g) => rt.neg(g) },
+  abs:      { grad: (rt, g, s) => rt.mul(g, rt.sign(s._unwrap())) },
+  silu:     { grad: (rt, g, s) => {
+    const sig = rt.sigmoid(s._unwrap());
+    return rt.mul(g, rt.add(sig, rt.mul(s._unwrap(), rt.mul(sig, rt.sub(1, sig)))));
+  }},
   tanh:     { grad: (rt, g, s) => { const t = rt.tanh(s._unwrap()); return rt.mul(rt.sub(1, rt.mul(t, t)), g); } },
   sigmoid:  { grad: (rt, g, s) => { const sig = rt.sigmoid(s._unwrap()); return rt.mul(rt.mul(sig, rt.sub(1, sig)), g); } },
   sin:      { grad: (rt, g, s) => rt.mul(g, rt.cos(s._unwrap())) },
@@ -735,28 +740,7 @@ export class Torchlette {
   log(a: Tensor): Tensor { return this._dispatchUnary("log", a); }
   neg(a: Tensor): Tensor { return this._dispatchUnary("neg", a); }
 
-  abs(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.abs(a._unwrap());
-    const aShape = a.shape;
-    const aDevice = a.device;
-    const tensorsToSave = a.requiresGrad ? [a] : [];
-    // Gradient of abs(x) is sign(x)
-    return this._wrapWithGrad(
-      inner,
-      [a],
-      (grad, getSaved) => {
-        const savedA = getSaved(0);
-        const inputValues = savedA._unwrap().toArray();
-        const gradValues = grad.toArray();
-        const outValues = gradValues.map((g, i) =>
-          inputValues[i] >= 0 ? g : -g,
-        );
-        return [this.runtime.tensorFromArray(outValues, aShape, aDevice)];
-      },
-      tensorsToSave,
-    );
-  }
+  abs(a: Tensor): Tensor { return this._dispatchUnary("abs", a); }
 
   tanh(a: Tensor): Tensor { return this._dispatchUnary("tanh", a); }
   sigmoid(a: Tensor): Tensor { return this._dispatchUnary("sigmoid", a); }
@@ -856,29 +840,7 @@ export class Torchlette {
     }
   }
 
-  silu(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.silu(a._unwrap());
-    const aShape = a.shape;
-    const aDevice = a.device;
-    const tensorsToSave = a.requiresGrad ? [a] : [];
-    return this._wrapWithGrad(
-      inner,
-      [a],
-      (grad, getSaved) => {
-        const savedA = getSaved(0);
-        const inputValues = savedA._unwrap().toArray();
-        const gradValues = grad.toArray();
-        const outValues = gradValues.map((g, i) => {
-          const x = inputValues[i];
-          const sig = 1 / (1 + Math.exp(-x));
-          return g * (sig + x * sig * (1 - sig));
-        });
-        return [this.runtime.tensorFromArray(outValues, aShape, aDevice)];
-      },
-      tensorsToSave,
-    );
-  }
+  silu(a: Tensor): Tensor { return this._dispatchUnary("silu", a); }
 
   sin(a: Tensor): Tensor { return this._dispatchUnary("sin", a); }
   cos(a: Tensor): Tensor { return this._dispatchUnary("cos", a); }
