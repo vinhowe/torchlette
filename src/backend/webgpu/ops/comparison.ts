@@ -12,6 +12,7 @@ import {
   broadcastShapes,
   toIndexShape,
   sizeOf,
+  contiguousStrides,
   computeEffectiveBroadcastStrides,
   compute2DDispatch,
   WORKGROUP_SIZE,
@@ -159,23 +160,8 @@ function argReduceOp(
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
 
-  const inputStrides: number[] = [];
-  for (let i = 0; i < rank; i++) {
-    let stride = 1;
-    for (let j = i + 1; j < rank; j++) {
-      stride *= inputShape[j];
-    }
-    inputStrides.push(stride);
-  }
-
-  const outStrides: number[] = [];
-  for (let i = 0; i < outShape.length; i++) {
-    let stride = 1;
-    for (let j = i + 1; j < outShape.length; j++) {
-      stride *= outShape[j];
-    }
-    outStrides.push(stride);
-  }
+  const inputStrides = contiguousStrides(inputShape);
+  const outStrides = contiguousStrides(outShape);
 
   const dimSize = inputShape[dim];
   const dimStride = inputStrides[dim];

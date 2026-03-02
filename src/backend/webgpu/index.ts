@@ -19,9 +19,8 @@ export { GPUBufferUsage, GPUMapMode } from "./gpu-types";
 export {
   bufferPool, getBufferPoolStats, setBufferPoolEnabled, clearBufferPool,
   setBufferPoolBudget, getBufferPoolBudget, flushBufferPool, flushBufferPoolWithSync,
-  decRefBuffer, issueDeferredFence, awaitDeferredFence, hasDeferredFence,
-  getBufferPoolDetailedStats, resetBufferPoolDetailedStats, setBufferPoolDebugTrace,
-  deferredDestroyBuffer, acquirePooledBuffer,
+  getBufferPoolDetailedStats, resetBufferPoolDetailedStats,
+  deferredDestroyBuffer,
 } from "./buffer-pool";
 
 export {
@@ -40,33 +39,29 @@ export {
   beginBatchExecution, endBatchExecution, isBatchActive, abortBatch,
   beginSharedEncoder, flushSharedEncoder, endSharedEncoder,
   beginStep, endStep, isSharedEncoderActive, setSharedEncoderEnabled,
-  getSharedEncoderInstance, trackSharedEncoderWrite,
   getSubmitCount, resetSubmitCount,
   setCurrentOpLabel, getCurrentOpLabel, setAdamBatchMode,
 } from "./shared-encoder";
 
+export { replayPinnedBufferSet } from "./webgpu-state";
 export {
-  replayPinnedBufferSet, getAndClearLastBindGroupBuffers,
+  getAndClearLastBindGroupBuffers,
   startDispatchRecording, stopDispatchRecording, replayDispatches,
   addReplayPinnedBuffers,
 } from "./dispatch-recording";
 
 export type { BufferArena } from "./buffer-arena";
 export {
-  arenaBufferSet, pinnedOutputBuffers,
   allocateOutputBuffer, donateBuffer, getBufferSize,
   setArenaExternalInputBuffers, clearArenaExternalInputBuffers,
   getArenaConflictDetected, clearArenaConflictDetected,
   hasArenaExternalConflicts, setActiveArena, clearActiveArena,
   getArenaResolveIndex, setArenaResolveIndexTo, isArenaBuffer,
-  destroyArena, arenaAllocAt, prePinOutputBuffers, resolveOutputBuffer,
-  getArenaResolveStats,
+  destroyArena, resolveOutputBuffer,
 } from "./buffer-arena";
 
 export {
-  paramsBufferPools, MAX_PARAMS_POOL_SIZE_PER_CLASS, paramsBufferSizeClass,
   createParamsBuffer, releaseParamsBuffer,
-  createUniformBuffer, releaseUniformBuffer,
   profiledCreateBindGroup, cachedCreateBindGroup,
   resetDispatchSequence, setDispatchSequenceCounters, getDispatchSequenceCounters,
   clearBindGroupCache, getBindGroupCacheStats, resetBindGroupCacheStats,
