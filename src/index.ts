@@ -12,7 +12,6 @@ export {
   type TileKernelSpec,
   type UniformType,
 } from "./backend/webgpu";
-export * from "./engine";
 export {
   type DeviceKind,
   DisposedTensorError,

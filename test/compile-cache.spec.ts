@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
-
-import { Engine, TraceRecorder } from "../src/engine";
 import { hashIRGraph } from "../src/engine/compile-cache";
+import { Engine } from "../src/engine/engine";
 import type { IRGraph, IRNode } from "../src/engine/ir";
+import { TraceRecorder } from "../src/engine/trace";
 
 describe("compiled region caching", () => {
   let engine: Engine;

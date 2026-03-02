@@ -3,7 +3,7 @@ import {
   Engine,
   RngReplayExhaustedError,
   RngReplayMismatchError,
-} from "../src";
+} from "../src/engine";
 
 describe("rng semantics", () => {
   it("assigns unique draw nonces for repeated random ops", () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Engine } from "../src";
+import { Engine } from "../src/engine";
 
 describe("compile ir scaffolding", () => {
   it("records lazy ops into a compiled graph", () => {

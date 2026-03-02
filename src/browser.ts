@@ -22,7 +22,6 @@ export {
   getSubgroupSupport,
   type MatmulKernelConfig,
 } from "./backend/webgpu/matmul/types";
-export * from "./engine";
 export {
   type DeviceKind,
   DisposedTensorError,

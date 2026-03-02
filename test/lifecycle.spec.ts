@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { Engine, type EngineTensor, PoisonedEngineError } from "../src";
+import { Engine, type EngineTensor, PoisonedEngineError } from "../src/engine";
 
 describe("lifecycle: tidy/keep/dispose", () => {
   it("disposes tensors created in tidy unless kept or returned", () => {

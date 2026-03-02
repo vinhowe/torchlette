@@ -5,7 +5,7 @@ import {
   HostReadInCompileError,
   InvalidTraceTensorEscapeError,
   type TraceTensor,
-} from "../src";
+} from "../src/engine";
 
 describe("compile staging restrictions", () => {
   it("throws on host reads during compile", () => {
