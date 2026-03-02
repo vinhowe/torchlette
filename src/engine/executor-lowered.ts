@@ -5,7 +5,6 @@ import type {
   BackendTensor,
   DType,
 } from "../backend/types";
-import { computeContiguousStrides } from "../backend/types";
 import {
   addReplayPinnedBuffers,
   type BufferArena,
@@ -41,7 +40,7 @@ import {
   profileOpEnd,
   setProfileModule,
 } from "../backend/webgpu/profiler";
-import { sizeOf } from "../core/shape";
+import { contiguousStrides, shapesEqual, sizeOf } from "../core/shape";
 import type {
   OptimizedExecutionResult,
   OptimizedExecutionStats,
@@ -62,7 +61,6 @@ import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "./matmul-epilogue";
 import {
   _detectTransposeView,
   executeMatmulWithEpilogue,
-  shapesEqual,
 } from "./matmul-epilogue";
 import {
   _webgpuMatmulGeomImports,
@@ -294,35 +292,12 @@ export async function executeLoweredPlan(
       }
     }
 
-    // Replay timing instrumentation (controlled by env var)
-    const _replayTiming = process.env.TORCHLETTE_REPLAY_TIMING === "1";
-    let _tReplayDispatch = 0,
-      _tDataSource = 0,
-      _tView = 0,
-      _tSequential = 0;
-    let _tAdamBatch = 0,
-      _tReclaim = 0,
-      _tResult = 0;
-    let _nDispatches = 0,
-      _nDataSources = 0,
-      _nViews = 0,
-      _nSequential = 0;
-    let _nAdamNodes = 0,
-      _nReclaims = 0,
-      _nResults = 0;
-    const _tReplayStart = _replayTiming ? performance.now() : 0;
-
     try {
       // Batch consecutive dispatch entries for efficient replay
       const dispatchBatch: RecordedDispatch[] = [];
       const flushDispatchBatch = () => {
         if (dispatchBatch.length > 0) {
-          const _t0 = _replayTiming ? performance.now() : 0;
           replayDispatches(dispatchBatch);
-          if (_replayTiming) {
-            _tReplayDispatch += performance.now() - _t0;
-            _nDispatches += dispatchBatch.length;
-          }
           dispatchBatch.length = 0;
         }
       };
@@ -334,8 +309,6 @@ export async function executeLoweredPlan(
             break;
           case "data-source": {
             flushDispatchBatch();
-            const _dsT0 = _replayTiming ? performance.now() : 0;
-            // Restore arena resolve index and sequence counters to match recording position
             setArenaResolveIndexTo(entry.arenaResolveIdx);
             setDispatchSequenceCounters(
               entry.seqCounters.dispatch,
@@ -343,13 +316,7 @@ export async function executeLoweredPlan(
               entry.seqCounters.output,
             );
             const dsNode = planNodes[entry.nodeIndex];
-            if (dsNode.result) {
-              if (_replayTiming) {
-                _tDataSource += performance.now() - _dsT0;
-                _nDataSources++;
-              }
-              break;
-            }
+            if (dsNode.result) break;
             const dsBackend = getBackend(dsNode.device) ?? backend;
             const dsInputs = dsNode.inputs.map((ref) =>
               getInputStorage(ref, dsBackend),
@@ -361,30 +328,18 @@ export async function executeLoweredPlan(
               dsBackend,
             );
             dsNode.result = createStorageHandle(dsNode.device, dsResult);
-            if (_replayTiming) {
-              _tDataSource += performance.now() - _dsT0;
-              _nDataSources++;
-            }
             break;
           }
           case "view": {
             flushDispatchBatch();
-            const _vT0 = _replayTiming ? performance.now() : 0;
             const vNode = planNodes[entry.nodeIndex];
-            if (vNode.result) {
-              if (_replayTiming) {
-                _tView += performance.now() - _vT0;
-                _nViews++;
-              }
-              break;
-            }
+            if (vNode.result) break;
             if (entry.cachedResult) {
               // Fast path: reconstruct from cached metadata (arena buffers stable)
               setArenaResolveIndexTo(
                 entry.arenaResolveIdxAfter ?? entry.arenaResolveIdx,
               );
-              const cr = entry.cachedResult;
-              vNode.result = arenaStorage(vNode.device, cr);
+              vNode.result = arenaStorage(vNode.device, entry.cachedResult);
             } else {
               // Slow path: re-execute (first replay before cache populated)
               setArenaResolveIndexTo(entry.arenaResolveIdx);
@@ -405,16 +360,10 @@ export async function executeLoweredPlan(
                 vInputs,
               );
             }
-            if (_replayTiming) {
-              _tView += performance.now() - _vT0;
-              _nViews++;
-            }
             break;
           }
           case "sequential": {
             flushDispatchBatch();
-            const _seqT0 = _replayTiming ? performance.now() : 0;
-            // Restore arena resolve index and sequence counters to match recording position
             setArenaResolveIndexTo(entry.arenaResolveIdx);
             setDispatchSequenceCounters(
               entry.seqCounters.dispatch,
@@ -422,13 +371,7 @@ export async function executeLoweredPlan(
               entry.seqCounters.output,
             );
             const node = planNodes[entry.nodeIndex];
-            if (node.result) {
-              if (_replayTiming) {
-                _tSequential += performance.now() - _seqT0;
-                _nSequential++;
-              }
-              break;
-            }
+            if (node.result) break;
             const nodeBackend = getBackend(node.device) ?? backend;
             const inputs = node.inputs.map((ref) =>
               getInputStorage(ref, nodeBackend),
@@ -445,18 +388,12 @@ export async function executeLoweredPlan(
               backendInputs,
               inputs,
             );
-            if (_replayTiming) {
-              _tSequential += performance.now() - _seqT0;
-              _nSequential++;
-            }
             break;
           }
           case "adam-batch": {
             flushDispatchBatch();
-            const _adamT0 = _replayTiming ? performance.now() : 0;
             flushSharedEncoder();
             flushBufferPool();
-            // Set sequence counters so adam dispatches hit the correct cache positions
             setDispatchSequenceCounters(
               entry.seqCounters.dispatch,
               entry.seqCounters.params,
@@ -479,49 +416,25 @@ export async function executeLoweredPlan(
             } finally {
               setAdamBatchMode(false);
             }
-            if (_replayTiming) {
-              _tAdamBatch += performance.now() - _adamT0;
-              _nAdamNodes += entry.nodeIndices.length;
-            }
             break;
           }
           case "reclaim": {
-            // During replay, flush encoder to submit pending dispatches but
-            // skip pool reclamation — arena buffers are persistent.
             flushDispatchBatch();
-            const _rclT0 = _replayTiming ? performance.now() : 0;
             flushSharedEncoder();
-            if (_replayTiming) {
-              _tReclaim += performance.now() - _rclT0;
-              _nReclaims++;
-            }
             break;
           }
           case "pre-adam-reclaim": {
             flushDispatchBatch();
-            const _parT0 = _replayTiming ? performance.now() : 0;
-            // Still need pre-adam flush for Adam's flushSharedEncoder requirement
             flushSharedEncoder();
             flushBufferPool();
-            if (_replayTiming) {
-              _tReclaim += performance.now() - _parT0;
-              _nReclaims++;
-            }
             break;
           }
           case "result": {
             flushDispatchBatch();
-            const _rsT0 = _replayTiming ? performance.now() : 0;
-            // Assign node result from cached metadata (arena buffers are stable).
-            // Arena buffers persist across steps — ownsBuffer: false, no-op destroy.
             const nr = entry.nodeResult;
             const node = planNodes[nr.nodeIndex];
             if (!node.result) {
               node.result = arenaStorage(node.device, nr);
-            }
-            if (_replayTiming) {
-              _tResult += performance.now() - _rsT0;
-              _nResults++;
             }
             break;
           }
@@ -545,24 +458,7 @@ export async function executeLoweredPlan(
     } finally {
       clearActiveArena();
       clearArenaExternalInputBuffers();
-      const _tEndT0 = _replayTiming ? performance.now() : 0;
       if (useTopLevelSharedEncoder) endSharedEncoder();
-      const _tEnd = _replayTiming ? performance.now() - _tEndT0 : 0;
-      if (_replayTiming) {
-        const _tTotal = performance.now() - _tReplayStart;
-        const _tAccounted =
-          _tReplayDispatch +
-          _tDataSource +
-          _tView +
-          _tSequential +
-          _tAdamBatch +
-          _tReclaim +
-          _tResult +
-          _tEnd;
-        console.log(
-          `[replay-timing] nodes=${plan.nodes.length} entries=${cache.entries.length} | total=${_tTotal.toFixed(1)}ms | dispatch=${_tReplayDispatch.toFixed(1)}ms(${_nDispatches}) dataSrc=${_tDataSource.toFixed(1)}ms(${_nDataSources}) view=${_tView.toFixed(1)}ms(${_nViews}) seq=${_tSequential.toFixed(1)}ms(${_nSequential}) adam=${_tAdamBatch.toFixed(1)}ms(${_nAdamNodes}) reclaim=${_tReclaim.toFixed(1)}ms(${_nReclaims}) result=${_tResult.toFixed(1)}ms(${_nResults}) endEnc=${_tEnd.toFixed(1)}ms | unaccounted=${(_tTotal - _tAccounted).toFixed(1)}ms`,
-        );
-      }
     }
 
     // Get the result from the last original plan node
@@ -1539,7 +1435,7 @@ export async function executeLoweredPlan(
 
           // Create result on the output node
           const outShape = shape.slice();
-          const outStrides = computeContiguousStrides(outShape);
+          const outStrides = contiguousStrides(outShape);
           compOutNode.result = createStorageHandle(firstCoveredNode.device, {
             buffer: outBuffer,
             shape: outShape,

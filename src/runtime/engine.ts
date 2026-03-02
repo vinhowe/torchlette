@@ -3,7 +3,6 @@ import {
   type ArgReduceOptions,
   type Backend,
   type CatOptions,
-  computeContiguousStrides,
   type DeviceKind,
   type DivOptions,
   type DType,
@@ -22,7 +21,11 @@ import {
   type SumOptions,
   type TransposeOptions,
 } from "../backend/types";
-import { broadcastShapes, broadcastThreeShapes } from "../core/shape";
+import {
+  broadcastShapes,
+  broadcastThreeShapes,
+  contiguousStrides,
+} from "../core/shape";
 import { OP_DTYPE_RULES, promoteDtype } from "../engine/dtype-rules";
 import { computePlanFingerprint } from "../engine/fusion-detect";
 import {
@@ -531,15 +534,10 @@ export class RuntimeEngine {
       this.planFingerprintCache.set(structKey, fingerprint);
 
       return true;
-    } catch (err) {
+    } catch {
       // Lowered plan execution failed — clean up and fall through.
       // Disable lowered plan for this fingerprint so we don't retry every step.
       // The template's bufferArena is preserved so executePlanOptimized can use it.
-      if (process.env.TORCHLETTE_REPLAY_TIMING === "1") {
-        console.log(
-          `[lowered-plan-fail] nodes=${plan.nodes.length} fingerprint=${fingerprint} error=${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
       template.loweredPlan = undefined;
 
       // Restore dispatch sequence counters so the fallback executePlanOptimized
@@ -595,10 +593,7 @@ export class RuntimeEngine {
     }
 
     // Build ONE merged plan from all pending roots
-    const _famTiming = process.env.TORCHLETTE_REPLAY_TIMING === "1";
-    const _famT0 = _famTiming ? performance.now() : 0;
     const plan = buildMergedPlan(pendingRoots);
-    const _famBuildT = _famTiming ? performance.now() - _famT0 : 0;
 
     if (plan.nodes.length === 0) {
       return;
@@ -618,16 +613,11 @@ export class RuntimeEngine {
 
     // Lowered plan fast-path for forceAllMerged
     if (!allDataSource && device === "webgpu" && this.fusionEnabled) {
-      const _famLpT0 = _famTiming ? performance.now() : 0;
       const executed = await this.tryLoweredPlanExecution(
         plan,
         tensors,
         device,
       );
-      if (_famTiming)
-        console.log(
-          `[forceAllMerged-timing] nodes=${plan.nodes.length} pendingRoots=${pendingRoots.length} buildPlan=${_famBuildT.toFixed(1)}ms lowered=${executed ? "HIT" : "MISS"} loweredTime=${(performance.now() - _famLpT0).toFixed(1)}ms`,
-        );
       if (executed) return;
     }
 
@@ -1692,7 +1682,7 @@ export class RuntimeEngine {
     const payload: StridedScatterOptions = {
       offset: 0,
       viewShape: dst.shape.slice(),
-      viewStrides: computeContiguousStrides(dst.shape),
+      viewStrides: contiguousStrides(dst.shape),
     };
     const node = createLazyIRNode(
       op,

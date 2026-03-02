@@ -5,9 +5,9 @@ import {
   normalizeDim,
 } from "../backend/types";
 import type { PreambleChainKernelOp } from "../backend/webgpu/reduction-tile-ir";
+import { shapesEqual } from "../core/shape";
 import { isFusibleOp } from "./fusion-detect";
 import type { LazyIRNode, LazyRef } from "./lazy-types";
-import { shapesEqual } from "./matmul-epilogue";
 import { createStorageHandle } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
 
