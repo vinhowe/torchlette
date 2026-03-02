@@ -75,8 +75,6 @@ export function allocateOutputBuffer(sizeBytes: number): GPUBuffer {
       }
       return arenaBuffer;
     }
-  } else if (arenaLocal.active) {
-    arenaLocal.allocIndex++; // Keep counter in sync
   }
 
   const ctx = requireContext();

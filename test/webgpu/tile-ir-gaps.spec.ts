@@ -2822,6 +2822,7 @@ describe("Tile-IR Subgroup Optimization", () => {
   });
 
   describe.runIf(isWebGPUEnabled)("GPU correctness with subgroups", () => {
+    // biome-ignore lint/suspicious/noDuplicateTestHooks: nested describe needs different setup (restore real subgroup support)
     beforeAll(async () => {
       // Restore actual subgroup support for GPU tests
       if (savedSupport) setSubgroupSupport(savedSupport);

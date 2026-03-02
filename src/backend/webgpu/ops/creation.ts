@@ -79,7 +79,10 @@ export function tensorFromArray(
 /** Lazy WGSL cache: generates once on first call. */
 function cachedWGSL(gen: () => string): () => string {
   let wgsl: string | null = null;
-  return () => wgsl ?? (wgsl = gen());
+  return () => {
+    if (wgsl === null) wgsl = gen();
+    return wgsl;
+  };
 }
 
 const getFillWGSL = cachedWGSL(fillWGSL);

@@ -7,8 +7,6 @@ import {
 } from "../../src/backend/webgpu";
 import { cpuOnly } from "../helpers/webgpu";
 
-type WebGPUTensor = ReturnType<typeof webgpuBackend.ops.tensorFromArray>;
-
 describe.skipIf(cpuOnly)("Chunked gather for large tensors", () => {
   let maxBindingSize: number;
 
