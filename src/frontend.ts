@@ -31,9 +31,11 @@ import {
 import {
   isAutotuneEnabled,
   setAutotuneEnabled,
+} from "./backend/webgpu";
+import {
   issueDeferredFence,
   awaitDeferredFence,
-} from "./backend/webgpu";
+} from "./backend/webgpu/buffer-pool";
 import { sizeOf, shapesEqual } from "./core/shape";
 import { storageTracker } from "./engine/lazy";
 import type { Tensor as RuntimeTensor } from "./runtime/tensor";
@@ -87,6 +89,40 @@ import {
   rmsnormImpl,
 } from "./frontend-fused-ops";
 import { backwardImpl } from "./frontend-autograd";
+
+// ============================================================================
+// Table-driven unary op autograd (§9)
+// ============================================================================
+
+/**
+ * Gradient function for a unary op.
+ * @param rt - RuntimeEngine for tensor ops
+ * @param grad - Upstream gradient (RuntimeTensor)
+ * @param savedA - Saved input tensor (frontend Tensor), null if needsSave=false
+ */
+type UnaryGradFn = (rt: RuntimeEngine, grad: RuntimeTensor, savedA: Tensor) => RuntimeTensor;
+
+interface UnaryOpSpec {
+  autocast?: string;       // autocast category (omit = no cast)
+  needsSave?: boolean;     // save input for backward? (default true for grad ops)
+  grad: UnaryGradFn | null; // null = no grad (floor, ceil, etc.)
+}
+
+const UNARY_OPS: Record<string, UnaryOpSpec> = {
+  exp:      { autocast: "exp", grad: (rt, g, s) => rt.mul(g, rt.exp(s._unwrap())) },
+  log:      { autocast: "log", grad: (rt, g, s) => rt.div(g, rt.add(s._unwrap(), 1e-8)) },
+  neg:      { needsSave: false, grad: (rt, g) => rt.neg(g) },
+  tanh:     { grad: (rt, g, s) => { const t = rt.tanh(s._unwrap()); return rt.mul(rt.sub(1, rt.mul(t, t)), g); } },
+  sigmoid:  { grad: (rt, g, s) => { const sig = rt.sigmoid(s._unwrap()); return rt.mul(rt.mul(sig, rt.sub(1, sig)), g); } },
+  sin:      { grad: (rt, g, s) => rt.mul(g, rt.cos(s._unwrap())) },
+  cos:      { grad: (rt, g, s) => rt.mul(g, rt.neg(rt.sin(s._unwrap()))) },
+  rsqrt:    { grad: (rt, g, s) => { const r = rt.rsqrt(s._unwrap()); return rt.mul(g, rt.mul(-0.5, rt.mul(r, rt.mul(r, r)))); } },
+  floor:    { grad: null },
+  ceil:     { grad: null },
+  round:    { grad: null },
+  sign:     { grad: null },
+  isfinite: { grad: null },
+};
 
 export class Torchlette {
   readonly engine: Engine;
@@ -394,6 +430,20 @@ export class Torchlette {
   // Math ops (binary, unary, reductions — stay in hub)
   // ============================================================================
 
+  /** Generic dispatcher for table-driven unary ops. */
+  private _dispatchUnary(opName: string, a: Tensor): Tensor {
+    const spec = UNARY_OPS[opName]!;
+    this._assertUsable(a);
+    const castA = spec.autocast ? this._applyAutocast(spec.autocast, [a])[0] : a;
+    const inner = (this.runtime as any)[opName](castA._unwrap());
+    if (!spec.grad) return this._wrap(inner);
+    const needsSave = spec.needsSave !== false;
+    const tensorsToSave = needsSave && a.requiresGrad ? [castA] : [];
+    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
+      return [spec.grad!(this.runtime, grad, needsSave ? getSaved(0) : undefined as any)];
+    }, tensorsToSave);
+  }
+
   add(a: Tensor | number, b: Tensor | number): Tensor {
     // Unwrap: numbers go directly to RuntimeEngine as scalars
     const aUnwrap: TensorOrScalar = typeof a === "number" ? a : a._unwrap();
@@ -681,52 +731,9 @@ export class Torchlette {
     );
   }
 
-  exp(a: Tensor): Tensor {
-    this._assertUsable(a);
-    // Autocast: exp is F32-required for numerical stability
-    const [castA] = this._applyAutocast("exp", [a]);
-    const inner = this.runtime.exp(castA._unwrap());
-    const tensorsToSave = a.requiresGrad ? [castA] : [];
-    // Gradient of exp(x) is exp(x) = output
-    // grad_input = grad_output * exp(input) = grad_output * output
-    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
-      // Recompute exp from saved input for checkpointing support
-      const savedA = getSaved(0);
-      const expA = this.runtime.exp(savedA._unwrap());
-      const gradInput = this.runtime.mul(grad, expA);
-      return [gradInput];
-    }, tensorsToSave);
-  }
-
-  log(a: Tensor): Tensor {
-    this._assertUsable(a);
-    // Autocast: log is F32-required for numerical stability
-    const [castA] = this._applyAutocast("log", [a]);
-    const inner = this.runtime.log(castA._unwrap());
-    const tensorsToSave = a.requiresGrad ? [castA] : [];
-    // Gradient of log(x) is 1/x
-    // grad_input = grad_output / (input + eps)
-    return this._wrapWithGrad(
-      inner,
-      [a],
-      (grad, getSaved) => {
-        const savedA = getSaved(0);
-        const denominator = this.runtime.add(savedA._unwrap(), 1e-8);
-        const gradInput = this.runtime.div(grad, denominator);
-        return [gradInput];
-      },
-      tensorsToSave,
-    );
-  }
-
-  neg(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.neg(a._unwrap());
-    // Gradient of -x is -1, no tensors need to be saved
-    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => {
-      return [this.runtime.neg(grad)];
-    });
-  }
+  exp(a: Tensor): Tensor { return this._dispatchUnary("exp", a); }
+  log(a: Tensor): Tensor { return this._dispatchUnary("log", a); }
+  neg(a: Tensor): Tensor { return this._dispatchUnary("neg", a); }
 
   abs(a: Tensor): Tensor {
     this._assertUsable(a);
@@ -751,37 +758,8 @@ export class Torchlette {
     );
   }
 
-  tanh(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.tanh(a._unwrap());
-    const tensorsToSave = a.requiresGrad ? [a] : [];
-    // Gradient of tanh(x) is (1 - tanh(x)^2) * grad
-    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
-      // Recompute tanh from saved input for checkpointing support
-      const savedA = getSaved(0);
-      const tanhA = this.runtime.tanh(savedA._unwrap());
-      // Use tensor ops instead of toArray for lazy execution
-      const tanhSquared = this.runtime.mul(tanhA, tanhA);
-      const oneMinusTanhSquared = this.runtime.sub(1, tanhSquared);
-      return [this.runtime.mul(oneMinusTanhSquared, grad)];
-    }, tensorsToSave);
-  }
-
-  sigmoid(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.sigmoid(a._unwrap());
-    const tensorsToSave = a.requiresGrad ? [a] : [];
-    // Gradient of sigmoid(x) is sigmoid(x) * (1 - sigmoid(x)) * grad
-    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
-      // Recompute sigmoid from saved input for checkpointing support
-      const savedA = getSaved(0);
-      const sigmoidA = this.runtime.sigmoid(savedA._unwrap());
-      // Use tensor ops instead of toArray for lazy execution
-      const oneMinusSigmoid = this.runtime.sub(1, sigmoidA);
-      const sigmoidGrad = this.runtime.mul(sigmoidA, oneMinusSigmoid);
-      return [this.runtime.mul(sigmoidGrad, grad)];
-    }, tensorsToSave);
-  }
+  tanh(a: Tensor): Tensor { return this._dispatchUnary("tanh", a); }
+  sigmoid(a: Tensor): Tensor { return this._dispatchUnary("sigmoid", a); }
 
   gelu(a: Tensor, options?: GeluOptions): Tensor {
     this._assertUsable(a);
@@ -902,49 +880,14 @@ export class Torchlette {
     );
   }
 
-  sin(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.sin(a._unwrap());
-    const tensorsToSave = a.requiresGrad ? [a] : [];
-    // d/dx sin(x) = cos(x)
-    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
-      const savedA = getSaved(0);
-      const cosA = this.runtime.cos(savedA._unwrap());
-      return [this.runtime.mul(grad, cosA)];
-    }, tensorsToSave);
-  }
+  sin(a: Tensor): Tensor { return this._dispatchUnary("sin", a); }
+  cos(a: Tensor): Tensor { return this._dispatchUnary("cos", a); }
 
-  cos(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.cos(a._unwrap());
-    const tensorsToSave = a.requiresGrad ? [a] : [];
-    // d/dx cos(x) = -sin(x)
-    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
-      const savedA = getSaved(0);
-      const sinA = this.runtime.sin(savedA._unwrap());
-      const negSinA = this.runtime.neg(sinA);
-      return [this.runtime.mul(grad, negSinA)];
-    }, tensorsToSave);
-  }
-
-  rsqrt(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.rsqrt(a._unwrap());
-    const tensorsToSave = a.requiresGrad ? [a] : [];
-    // d/dx rsqrt(x) = -0.5 * x^(-3/2) = -0.5 * rsqrt(x)^3
-    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
-      const savedA = getSaved(0);
-      const rsqrtA = this.runtime.rsqrt(savedA._unwrap());
-      const rsqrt3 = this.runtime.mul(rsqrtA, this.runtime.mul(rsqrtA, rsqrtA));
-      return [this.runtime.mul(grad, this.runtime.mul(-0.5, rsqrt3))];
-    }, tensorsToSave);
-  }
-
-  // Piecewise constant ops — gradient is 0, no autograd needed
-  floor(a: Tensor): Tensor { this._assertUsable(a); return this._wrap(this.runtime.floor(a._unwrap())); }
-  ceil(a: Tensor): Tensor { this._assertUsable(a); return this._wrap(this.runtime.ceil(a._unwrap())); }
-  round(a: Tensor): Tensor { this._assertUsable(a); return this._wrap(this.runtime.round(a._unwrap())); }
-  sign(a: Tensor): Tensor { this._assertUsable(a); return this._wrap(this.runtime.sign(a._unwrap())); }
+  rsqrt(a: Tensor): Tensor { return this._dispatchUnary("rsqrt", a); }
+  floor(a: Tensor): Tensor { return this._dispatchUnary("floor", a); }
+  ceil(a: Tensor): Tensor { return this._dispatchUnary("ceil", a); }
+  round(a: Tensor): Tensor { return this._dispatchUnary("round", a); }
+  sign(a: Tensor): Tensor { return this._dispatchUnary("sign", a); }
 
   clamp(a: Tensor, min: number | null, max: number | null): Tensor {
     this._assertUsable(a);
@@ -1038,7 +981,7 @@ export class Torchlette {
     }, tensorsToSave);
   }
 
-  isfinite(a: Tensor): Tensor { this._assertUsable(a); return this._wrap(this.runtime.isfinite(a._unwrap())); }
+  isfinite(a: Tensor): Tensor { return this._dispatchUnary("isfinite", a); }
 
   softplus(a: Tensor): Tensor {
     this._assertUsable(a);
