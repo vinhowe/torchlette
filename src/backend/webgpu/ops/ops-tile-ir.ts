@@ -22,6 +22,14 @@ import { WORKGROUP_SIZE, F32_NEG_MAX, F32_POS_MAX, MAX_WORKGROUPS_PER_DIM, conti
 import { applyFusedOp } from "../fusion-tile-ir";
 
 const WG = WORKGROUP_SIZE; // 256
+/** Apply chunked index guard: early-return if index outside [chunkStart, chunkEnd), adjust to chunk-local. */
+function applyChunkedGuard(ctx: KernelContext, rawIdx: BlockExpr, chunked: boolean): BlockExpr {
+  if (!chunked) return rawIdx;
+  ctx.ifThen(rawIdx.lt(ctx.uniform("chunkStart")), () => ctx.emitReturn());
+  ctx.ifThen(rawIdx.ge(ctx.uniform("chunkEnd")), () => ctx.emitReturn());
+  return rawIdx.sub(ctx.uniform("chunkStart"));
+}
+
 /** Grid for a compile-time-known element count (no uniform needed). */
 function fixedElementGrid(workgroupSize: number, elements: number): (u: Record<string, number>) => [number] | [number, number] {
   const totalWg = Math.ceil(elements / workgroupSize);
@@ -462,13 +470,12 @@ export function narrowBackwardTileIR(
 
       // Check if dimIdx is in [start, start + gradDimSize)
       // Use nested ifs to avoid out-of-bounds grad read
+      const zero = dtype === "f16" ? ctx.f16(0) : ctx.f32(0);
       ctx.ifThen(dimIdx.lt(startU), () => {
-        const zero = dtype === "f16" ? ctx.f16(0) : ctx.f32(0);
         ctx.emitStore("out", idx, zero);
         ctx.emitReturn();
       });
       ctx.ifThen(dimIdx.ge(endU), () => {
-        const zero = dtype === "f16" ? ctx.f16(0) : ctx.f32(0);
         ctx.emitStore("out", idx, zero);
         ctx.emitReturn();
       });
@@ -581,13 +588,7 @@ function gatherTileIRImpl(
     uniforms,
     kernel(ctx, idx) {
       const gatherIdx = ctx.emitLet("gatherIdx", ctx.load("indices", idx).toU32());
-
-      let dimIdx: BlockExpr = gatherIdx;
-      if (chunked) {
-        ctx.ifThen(gatherIdx.lt(ctx.uniform("chunkStart")), () => ctx.emitReturn());
-        ctx.ifThen(gatherIdx.ge(ctx.uniform("chunkEnd")), () => ctx.emitReturn());
-        dimIdx = gatherIdx.sub(ctx.uniform("chunkStart"));
-      }
+      const dimIdx = applyChunkedGuard(ctx, gatherIdx, chunked);
 
       const coords = ctx.decomposeIndex(idx, indexShape);
       const inputCoords = coords.map((c, d) => d === dim ? dimIdx : c);
@@ -626,13 +627,7 @@ function scatterAddTileIRImpl(
     sizeUniform: "srcSize",
     kernel(ctx, srcIdx) {
       const scatterIdx = ctx.emitLet("scatterIdx", ctx.load("indices", srcIdx).toU32());
-
-      let dimIdx: BlockExpr = scatterIdx;
-      if (chunked) {
-        ctx.ifThen(scatterIdx.lt(ctx.uniform("chunkStart")), () => ctx.emitReturn());
-        ctx.ifThen(scatterIdx.ge(ctx.uniform("chunkEnd")), () => ctx.emitReturn());
-        dimIdx = scatterIdx.sub(ctx.uniform("chunkStart"));
-      }
+      const dimIdx = applyChunkedGuard(ctx, scatterIdx, chunked);
 
       const coords = ctx.decomposeIndex(srcIdx, srcShape);
       const outCoords = coords.map((c, d) => d === dim ? dimIdx : c);

@@ -49,10 +49,30 @@ export function tensorFromArray(values: number[] | Float32Array, shape: number[]
   return createTensor(shape, buffer);
 }
 
-/** Cached fill WGSL generated via tile-IR. */
-let _fillWGSL: string | null = null;
-function getFillWGSL(): string {
-  return _fillWGSL ?? (_fillWGSL = fillWGSL());
+/** Lazy WGSL cache: generates once on first call. */
+function cachedWGSL(gen: () => string): () => string {
+  let wgsl: string | null = null;
+  return () => wgsl ?? (wgsl = gen());
+}
+
+const getFillWGSL = cachedWGSL(fillWGSL);
+
+/** Dispatch a creation kernel: pipeline + params + bind group + dispatch + release. */
+function dispatchCreationKernel(
+  cacheKey: string, shader: string, numElements: number,
+  paramsData: Uint32Array, workgroupThreads?: number,
+): GPUBuffer {
+  const ctx = requireContext();
+  const threads = workgroupThreads ?? numElements;
+  const totalWorkgroups = Math.ceil(threads / WORKGROUP_SIZE);
+  const { x, y } = compute2DDispatch(totalWorkgroups);
+  const pipeline = getPipeline(ctx, cacheKey, shader);
+  const outBuffer = resolveOutputBuffer(ctx.device, numElements * 4, []);
+  const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [outBuffer, paramsBuffer]);
+  dispatchComputePass(pipeline, bindGroup, x, y);
+  releaseParamsBuffer(paramsBuffer);
+  return outBuffer;
 }
 
 /**
@@ -93,90 +113,35 @@ export function zeros(shape: number[]): WebGPUTensor {
  * fillValue === 0 is special-cased to use the zero-cost zeros() path.
  */
 export function full(shape: number[], fillValue: number): WebGPUTensor {
-  const ctx = requireContext();
   const numElements = sizeOf(shape);
-  if (numElements === 0) {
-    throw new Error("webgpu tensors cannot be empty yet");
-  }
+  if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
+  if (fillValue === 0) return zeros(shape);
 
-  // Special case: fillValue === 0 → use zeros path (WebGPU auto-zeros or clearBuffer)
-  if (fillValue === 0) {
-    return zeros(shape);
-  }
-
-  const sizeBytes = numElements * 4; // f32
-  const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
-  const { x: dispatchX, y: dispatchY } = compute2DDispatch(totalWorkgroups);
-
-  const shader = getFillWGSL();
-  const pipeline = getPipeline(ctx, "fill_tile", shader);
-
-  // Arena-aware output allocation for stable buffer identity across steps
-  const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
-
-  // Params: [numElements as u32, fillValue as f32 (reinterpreted as u32 bits)]
   const paramsData = new Uint32Array(2);
   paramsData[0] = numElements;
   new Float32Array(paramsData.buffer, 4, 1)[0] = fillValue;
-  const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
-
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [outBuffer, paramsBuffer]);
-
-  dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
-  releaseParamsBuffer(paramsBuffer);
-
-  return createTensor(shape, outBuffer);
+  return createTensor(shape, dispatchCreationKernel("fill_tile", getFillWGSL(), numElements, paramsData));
 }
 
-/** Cached arange WGSL generated via tile-IR. */
-let _arangeWGSL: string | null = null;
-function getArangeWGSL(): string {
-  return _arangeWGSL ?? (_arangeWGSL = arangeWGSL());
-}
+const getArangeWGSL = cachedWGSL(arangeWGSL);
 
 /**
  * Create a 1-D tensor of evenly spaced values on the GPU.
  * No JS array allocation — values are computed directly by the GPU.
  */
 export function arange(end: number, start = 0, step = 1): WebGPUTensor {
-  const ctx = requireContext();
   const numElements = Math.max(0, Math.ceil((end - start) / step));
-  if (numElements === 0) {
-    throw new Error("webgpu tensors cannot be empty yet");
-  }
+  if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
 
-  const sizeBytes = numElements * 4; // f32
-  const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
-  const { x: dispatchX, y: dispatchY } = compute2DDispatch(totalWorkgroups);
-
-  const shader = getArangeWGSL();
-  const pipeline = getPipeline(ctx, "arange_tile", shader);
-
-  // Arena-aware output allocation for stable buffer identity across steps
-  const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
-
-  // Params: [numElements as u32, start as f32, step as f32]
   const paramsData = new Uint32Array(3);
   paramsData[0] = numElements;
   new Float32Array(paramsData.buffer, 4, 1)[0] = start;
   new Float32Array(paramsData.buffer, 8, 1)[0] = step;
-  const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
-
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [outBuffer, paramsBuffer]);
-
-  dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
-  releaseParamsBuffer(paramsBuffer);
-
-  return createTensor([numElements], outBuffer);
+  return createTensor([numElements], dispatchCreationKernel("arange_tile", getArangeWGSL(), numElements, paramsData));
 }
 
-/** Cached triangular WGSL (tril/triu) generated via tile-IR. */
-let _trilWGSL: string | null = null;
-let _triuWGSL: string | null = null;
-function getTriangularWGSL(upper: boolean): string {
-  if (upper) return _triuWGSL ?? (_triuWGSL = triangularWGSL(true));
-  return _trilWGSL ?? (_trilWGSL = triangularWGSL(false));
-}
+const getTrilWGSL = cachedWGSL(() => triangularWGSL(false));
+const getTriuWGSL = cachedWGSL(() => triangularWGSL(true));
 
 /**
  * Triangular operation: zero elements above (tril) or below (triu) a diagonal.
@@ -196,9 +161,8 @@ function triangularOp(a: WebGPUTensor, k: number, upper: boolean): WebGPUTensor 
   const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
   const { x: dispatchX, y: dispatchY } = compute2DDispatch(totalWorkgroups);
 
-  const tag = upper ? "triu" : "tril";
-  const shader = getTriangularWGSL(upper);
-  const pipeline = getPipeline(ctx, `${tag}_tile`, shader);
+  const shader = upper ? getTriuWGSL() : getTrilWGSL();
+  const pipeline = getPipeline(ctx, upper ? "triu_tile" : "tril_tile", shader);
 
   const sizeBytes = numElements * 4;
   const alignedSize = alignBufferSize(sizeBytes);
@@ -236,89 +200,39 @@ export function triu(a: WebGPUTensor, k = 0): WebGPUTensor {
 // GPU RNG (Philox 2x32-10 via tile-IR)
 // ============================================================================
 
-let _randWGSL: string | null = null;
-function getRandWGSL(): string { return _randWGSL ?? (_randWGSL = randWGSL()); }
+const getRandWGSL = cachedWGSL(randWGSL);
+const getRandnWGSL = cachedWGSL(randnWGSL);
+const getBernoulliWGSL = cachedWGSL(bernoulliWGSL);
 
-let _randnWGSL: string | null = null;
-function getRandnWGSL(): string { return _randnWGSL ?? (_randnWGSL = randnWGSL()); }
-
-let _bernoulliWGSL: string | null = null;
-function getBernoulliWGSL(): string { return _bernoulliWGSL ?? (_bernoulliWGSL = bernoulliWGSL()); }
+/** Pack seed params: [numElements, seed]. */
+function seedParams(numElements: number, seed: number): Uint32Array {
+  const p = new Uint32Array(2);
+  p[0] = numElements;
+  p[1] = seed >>> 0;
+  return p;
+}
 
 export function rand(shape: number[], seed: number): WebGPUTensor {
-  const ctx = requireContext();
   const numElements = sizeOf(shape);
   if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
-
-  const sizeBytes = numElements * 4;
-  const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
-  const { x: dispatchX, y: dispatchY } = compute2DDispatch(totalWorkgroups);
-
-  const pipeline = getPipeline(ctx, "rand_tile", getRandWGSL());
-  const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
-
-  const paramsData = new Uint32Array(2);
-  paramsData[0] = numElements;
-  paramsData[1] = seed >>> 0;
-  const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
-
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [outBuffer, paramsBuffer]);
-  dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
-  releaseParamsBuffer(paramsBuffer);
-
-  return createTensor(shape, outBuffer);
+  return createTensor(shape, dispatchCreationKernel("rand_tile", getRandWGSL(), numElements, seedParams(numElements, seed)));
 }
 
 export function randn(shape: number[], seed: number): WebGPUTensor {
-  const ctx = requireContext();
   const numElements = sizeOf(shape);
   if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
-
-  const sizeBytes = numElements * 4;
-  const numThreads = Math.ceil(numElements / 2);
-  const totalWorkgroups = Math.ceil(numThreads / WORKGROUP_SIZE);
-  const { x: dispatchX, y: dispatchY } = compute2DDispatch(totalWorkgroups);
-
-  const pipeline = getPipeline(ctx, "randn_tile", getRandnWGSL());
-  const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
-
-  // Shader uniforms: {size: u32, seed: u32}
-  const paramsData = new Uint32Array(2);
-  paramsData[0] = numElements;
-  paramsData[1] = seed >>> 0;
-  const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
-
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [outBuffer, paramsBuffer]);
-  dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
-  releaseParamsBuffer(paramsBuffer);
-
-  return createTensor(shape, outBuffer);
+  // randn uses numElements/2 threads (each produces 2 values via Box-Muller)
+  return createTensor(shape, dispatchCreationKernel("randn_tile", getRandnWGSL(), numElements, seedParams(numElements, seed), Math.ceil(numElements / 2)));
 }
 
 export function bernoulli(shape: number[], p: number, seed: number): WebGPUTensor {
-  const ctx = requireContext();
   const numElements = sizeOf(shape);
   if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
-
-  const sizeBytes = numElements * 4;
-  const totalWorkgroups = Math.ceil(numElements / WORKGROUP_SIZE);
-  const { x: dispatchX, y: dispatchY } = compute2DDispatch(totalWorkgroups);
-
-  const pipeline = getPipeline(ctx, "bernoulli_tile", getBernoulliWGSL());
-  const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
-
-  // Params: [size as u32, seed as u32, prob as f32] — 3 words, padded to 4 for alignment
   const paramsData = new Uint32Array(4);
   paramsData[0] = numElements;
   paramsData[1] = seed >>> 0;
   new Float32Array(paramsData.buffer, 8, 1)[0] = p;
-  const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
-
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [outBuffer, paramsBuffer]);
-  dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
-  releaseParamsBuffer(paramsBuffer);
-
-  return createTensor(shape, outBuffer);
+  return createTensor(shape, dispatchCreationKernel("bernoulli_tile", getBernoulliWGSL(), numElements, paramsData));
 }
 
 /**
