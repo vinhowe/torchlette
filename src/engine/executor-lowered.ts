@@ -695,7 +695,7 @@ export async function executeLoweredPlan(
 
           // ── Cache dispatch config for next step ──
           // Compute matmul geometry from the resolved inputs (shapes are stable across steps).
-          // Must replicate dispatchMatmulWithEpilogue's transpose detection logic exactly.
+          // Must replicate dispatchMatmul's transpose detection logic exactly.
           {
             const { computeMatmulOutputShape, computeBatchSize, computeBatchStrides } = _webgpuMatmulGeomImports!;
             const { isF16Supported } = await import("../backend/webgpu/index");
@@ -723,7 +723,7 @@ export async function executeLoweredPlan(
             const batchSize = computeBatchSize(batchDims);
             const { strideA, strideB, strideC } = computeBatchStrides(effectiveShapeA, effectiveShapeB, batchDims, m, n, k);
 
-            // Compute dtypes (matching dispatchMatmulWithEpilogue logic)
+            // Compute dtypes (matching dispatchMatmul logic)
             const f16ok = isF16Supported();
             const rawDtypeA = tensorA.dtype === "f16" && f16ok ? "f16" as const : "f32" as const;
             const rawDtypeB = tensorB.dtype === "f16" && f16ok ? "f16" as const : "f32" as const;

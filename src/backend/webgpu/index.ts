@@ -76,7 +76,7 @@ export {
   dispatchBinary,
   dispatchUnary,
   dispatchMatmul,
-  dispatchMatmulWithEpilogue, dispatchMatmulDirect,
+  dispatchMatmulDirect,
 } from "./dispatch";
 
 // Re-export memory tracking functions

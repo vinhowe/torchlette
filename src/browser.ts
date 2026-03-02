@@ -1,6 +1,5 @@
 // WebGPU backend exports for browser benchmarking
 export {
-  dispatchMatmulWithEpilogue,
   getWebGPUDevice,
   getWebGPUInitError,
   initWebGPU,

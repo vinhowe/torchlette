@@ -6,45 +6,32 @@
  * AdamW (decoupled decay on parameter). grad is read-only; param/m/v are
  * read_write (no separate output buffers needed).
  *
- * Handles large buffers (>maxStorageBufferBindingSize) via chunked dispatch.
+ * Handles large buffers (>maxStorageBufferBindingSize) via tile-IR dispatchChunked.
  */
 
 import {
-  dispatchComputePass,
   getMaxStorageBufferBindingSize,
-  createParamsBuffer,
-  releaseParamsBuffer,
   isF16Supported,
   allocateOutputBuffer,
-  cachedCreateBindGroup,
-  getPipeline,
 } from "./index";
 import { requireContext, trackSharedEncoderWrite } from "./webgpu-state";
 import type { AdamStepConfig } from "../types";
 import { profileSubOpBegin, profileSubOpEnd } from "./profiler";
-import type { GPUBuffer, GPUBindGroup, GPUDevice } from "./gpu-types";
+import type { GPUBuffer } from "./gpu-types";
 import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, F32_ONE_BITS } from "./shape-utils";
-import { compileTileKernel } from "./tile-compiler";
-import type { TileKernelSpec, BindingSpec, UniformType } from "./tile-ir";
+import { createTileKernelDispatcher, type TileKernelInstance } from "./tile-dispatch";
+import { computeFlatChunkLayout } from "./chunked-dispatch";
+import type { TileKernelSpec, BindingSpec, UniformType, VarHandle, BlockExpr, KernelContext } from "./tile-ir";
 
 // ============================================================================
 // Tile-IR Adam Spec Factory
 // ============================================================================
 
-/**
- * Build a TileKernelSpec for the Adam/AdamW optimizer kernel.
- *
- * Only used for WGSL generation — the dispatch logic (chunking, config buffer,
- * bind group construction) in dispatchAdamStep() is unchanged.
- */
 function makeAdamStepSpec(
-  use2D: boolean,
-  gridSizeX: number,
   useVec4: boolean,
   emitF16: boolean,
   emitUnscale: boolean,
 ): TileKernelSpec {
-  // Build bindings in the same order as the hand-written shader
   const bindings: Record<string, BindingSpec> = {
     grad: { storage: "read", type: "f32" },
     param: { storage: "read_write", type: "f32" },
@@ -59,7 +46,7 @@ function makeAdamStepSpec(
     bindings.inf_flag = { storage: "atomic", type: "u32" };
   }
 
-  // Build uniforms matching the config struct layout
+  // Build uniforms. grid_stride replaces the compile-time gridSizeX constant.
   const uniforms: Record<string, UniformType> = {
     beta1: "f32",
     beta2: "f32",
@@ -69,9 +56,13 @@ function makeAdamStepSpec(
     lr_times_wd: "f32",
     decoupled_wd: "u32",
     num_elements: "u32",
+    grid_stride: "u32",
   };
   if (emitUnscale) {
     uniforms.inv_scale = "f32";
+    uniforms._pad0 = "u32";
+    uniforms._pad1 = "u32";
+  } else {
     uniforms._pad0 = "u32";
     uniforms._pad1 = "u32";
     uniforms._pad2 = "u32";
@@ -85,33 +76,30 @@ function makeAdamStepSpec(
     uniformBindingIndex: 4,
     enableF16: emitF16,
     grid: (u) => {
-      // Grid is handled by dispatchAdamStep, not used via createTileKernelDispatcher
-      return [1];
+      const workItems = useVec4 ? Math.ceil(u.num_elements / 4) : u.num_elements;
+      const wg = Math.ceil(workItems / WORKGROUP_SIZE);
+      if (wg <= MAX_WORKGROUPS_PER_DIM) return [wg];
+      const x = Math.min(wg, MAX_WORKGROUPS_PER_DIM);
+      return [x, Math.ceil(wg / x)];
     },
     kernel(ctx) {
       const numElements = ctx.uniform("num_elements");
+      const gridStride = ctx.uniform("grid_stride");
 
       if (useVec4) {
-        // Vec4 path: 4 elements per thread
-        let flatId;
-        if (use2D) {
-          flatId = ctx.globalId(0).add(ctx.globalId(1).mul(ctx.u32(gridSizeX * WORKGROUP_SIZE)));
-        } else {
-          flatId = ctx.globalId(0);
-        }
+        // Vec4 path: 4 elements per thread.
+        // 2D-safe: grid_stride = gridSizeX * WG. For 1D, globalId(1)=0.
+        const flatId = ctx.emitLet("flatId", ctx.globalId(0).add(ctx.globalId(1).mul(gridStride)));
         const base = ctx.emitLet("base", flatId.mul(ctx.u32(4)));
         ctx.ifThen(base.ge(numElements), () => { ctx.emitReturn(); });
 
-        // Load gradient (4 elements)
         if (emitUnscale) {
           const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
-          // Load and unscale
           const g0Var = ctx.emitVar("g0", "f32", ctx.load("grad", base).mul(invScale));
           const g1Var = ctx.emitVar("g1", "f32", ctx.load("grad", base.add(ctx.u32(1))).mul(invScale));
           const g2Var = ctx.emitVar("g2", "f32", ctx.load("grad", base.add(ctx.u32(2))).mul(invScale));
           const g3Var = ctx.emitVar("g3", "f32", ctx.load("grad", base.add(ctx.u32(3))).mul(invScale));
 
-          // Check finite via bit pattern for each element
           for (let e = 0; e < 4; e++) {
             const gVar = [g0Var, g1Var, g2Var, g3Var][e];
             const bits = gVar.get().bitcastTo("u32");
@@ -122,7 +110,6 @@ function makeAdamStepSpec(
             });
           }
 
-          // Now compute with g0..g3
           emitAdamVec4Body(ctx, base, g0Var, g1Var, g2Var, g3Var, emitF16);
         } else {
           const g0Var = ctx.emitVar("g0", "f32", ctx.load("grad", base));
@@ -134,20 +121,13 @@ function makeAdamStepSpec(
         }
       } else {
         // Scalar path
-        let idx;
-        if (use2D) {
-          idx = ctx.globalId(0).add(ctx.globalId(1).mul(ctx.u32(gridSizeX * WORKGROUP_SIZE)));
-        } else {
-          idx = ctx.globalId(0);
-        }
-        idx = ctx.emitLet("idx", idx);
+        const idx = ctx.emitLet("idx", ctx.globalId(0).add(ctx.globalId(1).mul(gridStride)));
         ctx.ifThen(idx.ge(numElements), () => { ctx.emitReturn(); });
 
         if (emitUnscale) {
           const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
           const gVar = ctx.emitVar("g", "f32", ctx.load("grad", idx).mul(invScale));
 
-          // Check finite
           const bits = gVar.get().bitcastTo("u32");
           const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xFF));
           ctx.ifThen(exponent.eq(ctx.u32(0xFF)), () => {
@@ -165,7 +145,9 @@ function makeAdamStepSpec(
   };
 }
 
-import type { VarHandle, BlockExpr, KernelContext } from "./tile-ir";
+// ============================================================================
+// Adam Update Logic (shared between scalar and vec4 paths)
+// ============================================================================
 
 function loadAdamUniforms(ctx: KernelContext) {
   return {
@@ -276,73 +258,20 @@ function emitAdamVec4Body(
   }
 }
 
-// Cache for compiled tile-IR Adam WGSL
-const adamTileIRWGSLCache = new Map<string, string>();
-
-function getAdamTileIRWGSL(
-  use2D: boolean,
-  gridSizeX: number,
-  useVec4: boolean,
-  emitF16: boolean,
-  emitUnscale: boolean,
-): string {
-  const key = `${use2D}:${gridSizeX}:${useVec4}:${emitF16}:${emitUnscale}`;
-  let wgsl = adamTileIRWGSLCache.get(key);
-  if (!wgsl) {
-    wgsl = compileTileKernel(makeAdamStepSpec(use2D, gridSizeX, useVec4, emitF16, emitUnscale));
-    adamTileIRWGSLCache.set(key, wgsl);
-  }
-  return wgsl;
-}
-
 // ============================================================================
-// Config Buffer
+// Dispatcher Cache (keyed by variant: vec4 × f16 × unscale)
 // ============================================================================
 
-// Pre-allocated typed arrays for config buffer construction.
-// Eliminates 228 short-lived allocations per step (76 calls × 3 arrays).
-const _configData32 = new ArrayBuffer(32);
-const _configF32_32 = new Float32Array(_configData32);
-const _configU32_32 = new Uint32Array(_configData32);
-const _configData48 = new ArrayBuffer(48);
-const _configF32_48 = new Float32Array(_configData48);
-const _configU32_48 = new Uint32Array(_configData48);
+const adamDispatchers = new Map<string, TileKernelInstance>();
 
-function createConfigBuffer(
-  device: GPUDevice,
-  config: AdamStepConfig,
-  numElements: number,
-  includeInvScale: boolean,
-): GPUBuffer {
-  if (includeInvScale) {
-    // 12 x f32/u32 = 48 bytes (padded to 16-byte alignment)
-    _configF32_48[0] = config.beta1;
-    _configF32_48[1] = config.beta2;
-    _configF32_48[2] = config.stepSize;
-    _configF32_48[3] = config.eps;
-    _configF32_48[4] = config.weightDecay;
-    _configF32_48[5] = config.lrTimesWd;
-    _configU32_48[6] = config.decoupledWd ? 1 : 0;
-    _configU32_48[7] = numElements;
-    _configF32_48[8] = config.invScale ?? 1.0;
-    _configU32_48[9] = 0; // pad
-    _configU32_48[10] = 0; // pad
-    _configU32_48[11] = 0; // pad
-
-    return createParamsBuffer(device, _configU32_48);
+function getAdamDispatcher(useVec4: boolean, emitF16: boolean, emitUnscale: boolean): TileKernelInstance {
+  const key = `${useVec4}:${emitF16}:${emitUnscale}`;
+  let d = adamDispatchers.get(key);
+  if (!d) {
+    d = createTileKernelDispatcher(makeAdamStepSpec(useVec4, emitF16, emitUnscale));
+    adamDispatchers.set(key, d);
   }
-
-  // 8 x f32/u32 = 32 bytes (original layout)
-  _configF32_32[0] = config.beta1;
-  _configF32_32[1] = config.beta2;
-  _configF32_32[2] = config.stepSize;
-  _configF32_32[3] = config.eps;
-  _configF32_32[4] = config.weightDecay;
-  _configF32_32[5] = config.lrTimesWd;
-  _configU32_32[6] = config.decoupledWd ? 1 : 0;
-  _configU32_32[7] = numElements;
-
-  return createParamsBuffer(device, _configU32_32);
+  return d;
 }
 
 // ============================================================================
@@ -359,7 +288,7 @@ interface AdamStepResult {
 /**
  * Dispatch the fused Adam/AdamW kernel.
  *
- * Handles chunking for buffers larger than maxStorageBufferBindingSize.
+ * Uses tile-IR dispatchChunked for buffers exceeding maxStorageBufferBindingSize.
  * When infFlagBuffer is provided, uses fused unscale+inf-check variants
  * that multiply grad by invScale and detect non-finite values.
  */
@@ -373,9 +302,6 @@ export function dispatchAdamStep(
   emitF16 = false,
   infFlagBuffer: GPUBuffer | null = null,
 ): AdamStepResult {
-  const ctx = requireContext();
-  const device = ctx.device;
-
   // Only emit f16 if requested AND the device actually supports shader-f16
   const doF16 = emitF16 && isF16Supported();
   const doUnscale = infFlagBuffer !== null;
@@ -384,24 +310,7 @@ export function dispatchAdamStep(
   const f16BytesPerElement = 2;
   const totalBytes = numElements * bytesPerElement;
   const maxBindingSize = getMaxStorageBufferBindingSize();
-
-  // Determine if chunking is needed
   const needsChunking = totalBytes > maxBindingSize;
-
-  // Align chunk size for sub-range bindings.
-  // When emitting f16, chunk alignment must satisfy both f32 (4B) and f16 (2B)
-  // offset alignment requirements: offset must be a multiple of minAlignment (256).
-  // For f32: 256/4 = 64 elements. For f16: 256/2 = 128 elements. Use the larger.
-  const minAlignment = 256; // minStorageBufferOffsetAlignment
-  const elementsPerAlignment = doF16
-    ? minAlignment / f16BytesPerElement  // 128 — ensures f16 offsets are 256-aligned
-    : minAlignment / bytesPerElement;    // 64
-  const maxElementsPerChunk = Math.floor(maxBindingSize / bytesPerElement);
-  const elementsPerChunk = needsChunking
-    ? Math.floor(maxElementsPerChunk / elementsPerAlignment) *
-      elementsPerAlignment
-    : numElements;
-  const numChunks = Math.ceil(numElements / elementsPerChunk);
 
   // In-place: param/m/v are read_write, no output buffer allocation needed.
   // Track ALL input buffers (including grad, which is read-only) in the write
@@ -415,10 +324,9 @@ export function dispatchAdamStep(
   trackSharedEncoderWrite(vBuffer);
 
   // Only allocate f16 output buffer (different size).
-  const totalF16Bytes = numElements * f16BytesPerElement;
   let paramF16Out: GPUBuffer | null = null;
   if (doF16) {
-    paramF16Out = allocateOutputBuffer(totalF16Bytes);
+    paramF16Out = allocateOutputBuffer(numElements * f16BytesPerElement);
     trackSharedEncoderWrite(paramF16Out);
   }
   profileSubOpEnd("adam.allocBufs", _st);
@@ -427,110 +335,70 @@ export function dispatchAdamStep(
   // (elementsPerChunk is aligned to 64 or 128 elements, both multiples of 4)
   const useVec4 = numElements % 4 === 0;
 
-  // Determine dispatch dimensions (vec4 processes 4 elements per thread)
-  const workItemsPerChunk = useVec4 ? elementsPerChunk / 4 : elementsPerChunk;
-  const maxWorkgroups = Math.ceil(workItemsPerChunk / WORKGROUP_SIZE);
-  const use2D = maxWorkgroups > MAX_WORKGROUPS_PER_DIM;
-  const gridSizeX = use2D
-    ? Math.min(maxWorkgroups, MAX_WORKGROUPS_PER_DIM)
-    : maxWorkgroups;
+  // Compute grid_stride based on per-chunk element count for 2D-safe indexing
+  const epa = doF16 ? 128 : 64; // f16 needs 128-element alignment
+  const elemPerChunk = needsChunking
+    ? computeFlatChunkLayout(numElements, bytesPerElement, maxBindingSize, 256, epa).elementsPerChunk
+    : numElements;
+  const workItems = useVec4 ? Math.ceil(elemPerChunk / 4) : elemPerChunk;
+  const wg = Math.ceil(workItems / WORKGROUP_SIZE);
+  const gridSizeX = Math.min(wg, MAX_WORKGROUPS_PER_DIM);
+  const gridStride = gridSizeX * WORKGROUP_SIZE;
 
-  // Select shader variant based on f16, unscale, and vec4 flags
-  _st = profileSubOpBegin();
-  const vec4Tag = useVec4 ? "Vec4" : "";
-  const dimTag = use2D ? `2d:${gridSizeX}` : "1d";
-  const key = `adamStep${doF16 ? "F16" : ""}${doUnscale ? "Unscale" : ""}${vec4Tag}:${dimTag}:tile`;
-  const code = getAdamTileIRWGSL(use2D, gridSizeX, useVec4, doF16, doUnscale);
-  const pipeline = getPipeline(ctx, key, code);
-  profileSubOpEnd("adam.pipeline", _st);
+  const dispatcher = getAdamDispatcher(useVec4, doF16, doUnscale);
 
-  for (let chunk = 0; chunk < numChunks; chunk++) {
-    const chunkStart = chunk * elementsPerChunk;
-    const chunkEnd = Math.min(chunkStart + elementsPerChunk, numElements);
-    const chunkSize = chunkEnd - chunkStart;
+  // Build buffers map
+  const buffers: Record<string, GPUBuffer> = {
+    grad: gradBuffer, param: paramBuffer, m: mBuffer, v: vBuffer,
+  };
+  if (doF16 && paramF16Out) buffers.param_f16 = paramF16Out;
+  if (doUnscale) buffers.inf_flag = infFlagBuffer!;
 
-    // Create config buffer for this chunk
-    _st = profileSubOpBegin();
-    const configBuf = createConfigBuffer(device, config, chunkSize, doUnscale);
-    profileSubOpEnd("adam.configBuf", _st);
-
-    // Build bind group entries with sub-range bindings for chunked access
-    _st = profileSubOpBegin();
-    const mkBinding = (buf: GPUBuffer, bpe = bytesPerElement) =>
-      needsChunking
-        ? { buffer: buf, offset: chunkStart * bpe, size: chunkSize * bpe }
-        : { buffer: buf };
-
-    // In-place layout: grad(read), param(rw), m(rw), v(rw), config(uniform)
-    // Optional: param_f16(rw), inf_flag(rw)
-    const entries: Array<{
-      binding: number;
-      resource: { buffer: GPUBuffer; offset?: number; size?: number };
-    }> = [
-      { binding: 0, resource: mkBinding(gradBuffer) },
-      { binding: 1, resource: mkBinding(paramBuffer) },
-      { binding: 2, resource: mkBinding(mBuffer) },
-      { binding: 3, resource: mkBinding(vBuffer) },
-      { binding: 4, resource: { buffer: configBuf } },
-    ];
-
-    let nextBinding = 5;
-    if (doF16 && paramF16Out) {
-      entries.push({
-        binding: nextBinding++,
-        resource: mkBinding(paramF16Out, f16BytesPerElement),
-      });
-    }
-
-    if (doUnscale) {
-      entries.push({
-        binding: nextBinding++,
-        resource: { buffer: infFlagBuffer! }, // always full 4 bytes, not chunked
-      });
-    }
-
-    profileSubOpEnd("adam.entries", _st);
-
-    _st = profileSubOpBegin();
-    let bindGroup: GPUBindGroup;
-    if (needsChunking) {
-      // Chunked: entries have offset/size, cannot cache
-      bindGroup = device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries,
-      });
-    } else {
-      // Simple bindings: use cache
-      const bgBuffers: GPUBuffer[] = [gradBuffer, paramBuffer, mBuffer, vBuffer, configBuf];
-      if (doF16 && paramF16Out) bgBuffers.push(paramF16Out);
-      if (doUnscale) bgBuffers.push(infFlagBuffer!);
-      bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers);
-    }
-    profileSubOpEnd("adam.bindGroup", _st);
-
-    const chunkWorkItems = useVec4 ? chunkSize / 4 : chunkSize;
-    const chunkWorkgroups = Math.ceil(chunkWorkItems / WORKGROUP_SIZE);
-    const dispatchX = use2D
-      ? Math.min(chunkWorkgroups, MAX_WORKGROUPS_PER_DIM)
-      : chunkWorkgroups;
-    const dispatchY = use2D
-      ? Math.ceil(chunkWorkgroups / dispatchX)
-      : 1;
-
-    _st = profileSubOpBegin();
-    dispatchComputePass(
-      pipeline,
-      bindGroup,
-      dispatchX,
-      dispatchY,
-    );
-    profileSubOpEnd("adam.dispatch", _st);
-
-    // Config buffer must NOT be destroyed while shared encoder is active,
-    // because the compute pass hasn't been submitted yet.
-    // Use releaseParamsBuffer for safe deferred destruction.
-    releaseParamsBuffer(configBuf);
+  // Build uniforms
+  const uniforms: Record<string, number> = {
+    beta1: config.beta1,
+    beta2: config.beta2,
+    step_size: config.stepSize,
+    eps: config.eps,
+    weight_decay: config.weightDecay,
+    lr_times_wd: config.lrTimesWd,
+    decoupled_wd: config.decoupledWd ? 1 : 0,
+    num_elements: numElements,
+    grid_stride: gridStride,
+  };
+  if (doUnscale) {
+    uniforms.inv_scale = config.invScale ?? 1.0;
+    uniforms._pad0 = 0;
+    uniforms._pad1 = 0;
+  } else {
+    uniforms._pad0 = 0;
+    uniforms._pad1 = 0;
+    uniforms._pad2 = 0;
   }
+
+  _st = profileSubOpBegin();
+  if (needsChunking) {
+    const modes: Record<string, "scalar" | "chunked"> = {
+      grad: "chunked", param: "chunked", m: "chunked", v: "chunked",
+    };
+    if (doF16) modes.param_f16 = "chunked";
+    if (doUnscale) modes.inf_flag = "scalar";
+
+    const bpe: Record<string, number> | undefined =
+      doF16 ? { param_f16: f16BytesPerElement } : undefined;
+
+    dispatcher.dispatchChunked(buffers, uniforms, {
+      modes,
+      bytesPerElement: bpe,
+      sizeUniform: "num_elements",
+      totalElements: numElements,
+      maxBytesPerElement: bytesPerElement,
+      elementsPerAlignment: epa,
+    });
+  } else {
+    dispatcher.dispatch(buffers, uniforms);
+  }
+  profileSubOpEnd("adam.dispatch", _st);
 
   // In-place: return the same input buffers (updated in-place by the shader)
   const result: AdamStepResult = {
@@ -544,4 +412,10 @@ export function dispatchAdamStep(
   return result;
 }
 
-
+/**
+ * Reset all module-local mutable state (dispatcher cache).
+ */
+export function resetAdamKernelState(): void {
+  for (const d of adamDispatchers.values()) d.reset();
+  adamDispatchers.clear();
+}

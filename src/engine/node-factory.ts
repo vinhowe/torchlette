@@ -93,7 +93,7 @@ export function wrapResultAsStorage(
 // ============================================================================
 
 export let _webgpuMatmulImports: {
-  dispatchMatmulWithEpilogue: typeof import("../backend/webgpu/index").dispatchMatmulWithEpilogue;
+  dispatchMatmul: typeof import("../backend/webgpu/index").dispatchMatmul;
   dispatchMatmulDirect: typeof import("../backend/webgpu/index").dispatchMatmulDirect;
   deferredDestroyBuffer: typeof import("../backend/webgpu/index").deferredDestroyBuffer;
 } | null = null;
@@ -108,7 +108,7 @@ export async function ensureWebGPUMatmulImports() {
   if (!_webgpuMatmulImports) {
     const mod = await import("../backend/webgpu/index");
     _webgpuMatmulImports = {
-      dispatchMatmulWithEpilogue: mod.dispatchMatmulWithEpilogue,
+      dispatchMatmul: mod.dispatchMatmul,
       dispatchMatmulDirect: mod.dispatchMatmulDirect,
       deferredDestroyBuffer: mod.deferredDestroyBuffer,
     };
