@@ -9,13 +9,13 @@
  * Each workgroup handles one row (one sample/position in the batch).
  */
 
-import { allocateOutputBuffer } from "./index";
-import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
+import { allocateOutputBuffer } from "./index";
 import { WORKGROUP_SIZE } from "./shape-utils";
-import { type TileKernelSpec, ceilDivGrid, perRowKernel } from "./tile-ir";
 import { createTileKernelDispatcher } from "./tile-dispatch";
+import { ceilDivGrid, perRowKernel, type TileKernelSpec } from "./tile-ir";
+import { requireContext } from "./webgpu-state";
 
 const WG = WORKGROUP_SIZE; // 256
 
@@ -26,8 +26,8 @@ const WG = WORKGROUP_SIZE; // 256
 const rmsNormFwdSpec = perRowKernel({
   name: "rmsNormFwd",
   bindings: {
-    x:      { storage: "read",       type: "f32" },
-    weight: { storage: "read",       type: "f32" },
+    x: { storage: "read", type: "f32" },
+    weight: { storage: "read", type: "f32" },
     output: { storage: "read_write", type: "f32" },
   },
   uniforms: { eps: "f32" },
@@ -36,15 +36,24 @@ const rmsNormFwdSpec = perRowKernel({
     const Df = D.toF32();
 
     // Compute mean(x²) → inv_rms = rsqrt(mean(x²) + eps)
-    const invRms = ctx.emitLet("inv_rms",
-      ctx.wgReduce("sum", tid, D, WG, (i) => {
-        const xi = ctx.load("x", base.add(i));
-        return xi.mul(xi);
-      }).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
+    const invRms = ctx.emitLet(
+      "inv_rms",
+      ctx
+        .wgReduce("sum", tid, D, WG, (i) => {
+          const xi = ctx.load("x", base.add(i));
+          return xi.mul(xi);
+        })
+        .div(Df)
+        .add(ctx.uniform("eps").toF32())
+        .rsqrt(),
+    );
 
     // Normalize + scale + store: output = x * inv_rms * weight
     ctx.stridedFor(tid, D, WG, (i) => {
-      const out = ctx.load("x", base.add(i)).mul(invRms).mul(ctx.load("weight", i));
+      const out = ctx
+        .load("x", base.add(i))
+        .mul(invRms)
+        .mul(ctx.load("weight", i));
       ctx.emitStore("output", base.add(i), out);
     });
   },
@@ -69,9 +78,9 @@ const rmsNormBackwardGradXSpec = perRowKernel({
   name: "rmsNormBwdGradX",
   bindings: {
     grad_output: { storage: "read", type: "f32" },
-    x:           { storage: "read", type: "f32" },
-    weight:      { storage: "read", type: "f32" },
-    grad_x:      { storage: "read_write", type: "f32" },
+    x: { storage: "read", type: "f32" },
+    weight: { storage: "read", type: "f32" },
+    grad_x: { storage: "read_write", type: "f32" },
   },
   uniforms: { eps: "f32" },
 
@@ -79,23 +88,37 @@ const rmsNormBackwardGradXSpec = perRowKernel({
     const Df = D.toF32();
 
     // Recompute inv_rms = rsqrt(mean(x²) + eps)
-    const invRms = ctx.emitLet("inv_rms",
-      ctx.wgReduce("sum", tid, D, WG, (i) => {
-        const xi = ctx.load("x", base.add(i));
-        return xi.mul(xi);
-      }).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
+    const invRms = ctx.emitLet(
+      "inv_rms",
+      ctx
+        .wgReduce("sum", tid, D, WG, (i) => {
+          const xi = ctx.load("x", base.add(i));
+          return xi.mul(xi);
+        })
+        .div(Df)
+        .add(ctx.uniform("eps").toF32())
+        .rsqrt(),
+    );
 
     // c = mean(grad * weight * normalized, dim=-1)
-    const c = ctx.emitLet("c",
-      ctx.wgReduce("sum", tid, D, WG, (i) => {
-        const gw = ctx.load("grad_output", base.add(i)).mul(ctx.load("weight", i));
-        const normI = ctx.load("x", base.add(i)).mul(invRms);
-        return gw.mul(normI);
-      }).div(Df));
+    const c = ctx.emitLet(
+      "c",
+      ctx
+        .wgReduce("sum", tid, D, WG, (i) => {
+          const gw = ctx
+            .load("grad_output", base.add(i))
+            .mul(ctx.load("weight", i));
+          const normI = ctx.load("x", base.add(i)).mul(invRms);
+          return gw.mul(normI);
+        })
+        .div(Df),
+    );
 
     // gradX = inv_rms * (grad * weight - normalized * c)
     ctx.stridedFor(tid, D, WG, (i) => {
-      const gw = ctx.load("grad_output", base.add(i)).mul(ctx.load("weight", i));
+      const gw = ctx
+        .load("grad_output", base.add(i))
+        .mul(ctx.load("weight", i));
       const normI = ctx.load("x", base.add(i)).mul(invRms);
       ctx.emitStore("grad_x", base.add(i), gw.sub(normI.mul(c)).mul(invRms));
     });
@@ -109,7 +132,7 @@ const rmsNormBackwardGradXSpec = perRowKernel({
 const rmsNormRowStatsSpec = perRowKernel({
   name: "rmsNormRowStats",
   bindings: {
-    x:           { storage: "read", type: "f32" },
+    x: { storage: "read", type: "f32" },
     row_inv_rms: { storage: "read_write", type: "f32" },
   },
   uniforms: { eps: "f32" },
@@ -117,11 +140,17 @@ const rmsNormRowStatsSpec = perRowKernel({
   kernel(ctx, row, tid, D, base) {
     const Df = D.toF32();
 
-    const invRms = ctx.emitLet("inv_rms",
-      ctx.wgReduce("sum", tid, D, WG, (i) => {
-        const xi = ctx.load("x", base.add(i));
-        return xi.mul(xi);
-      }).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
+    const invRms = ctx.emitLet(
+      "inv_rms",
+      ctx
+        .wgReduce("sum", tid, D, WG, (i) => {
+          const xi = ctx.load("x", base.add(i));
+          return xi.mul(xi);
+        })
+        .div(Df)
+        .add(ctx.uniform("eps").toF32())
+        .rsqrt(),
+    );
 
     const isThread0 = tid.eq(ctx.u32(0));
     ctx.guardedStore("row_inv_rms", isThread0, row, invRms);
@@ -138,14 +167,14 @@ const rmsNormBackwardGradWeightSpec: TileKernelSpec = {
   workgroupSize: WG,
   bindings: {
     grad_output: { storage: "read", type: "f32" },
-    x:           { storage: "read", type: "f32" },
+    x: { storage: "read", type: "f32" },
     row_inv_rms: { storage: "read", type: "f32" },
     grad_weight: { storage: "read_write", type: "f32" },
   },
   uniforms: {
-    num_rows:    "u32",
+    num_rows: "u32",
     feature_dim: "u32",
-    eps:         "f32",
+    eps: "f32",
   },
   grid: ceilDivGrid(WG, "feature_dim"),
 
@@ -163,7 +192,8 @@ const rmsNormBackwardGradWeightSpec: TileKernelSpec = {
     ctx.forRange(ctx.u32(0), N, (row) => {
       const base = row.mul(D);
       const go = ctx.load("grad_output", base.add(featureIdx));
-      const normalized = ctx.load("x", base.add(featureIdx))
+      const normalized = ctx
+        .load("x", base.add(featureIdx))
         .mul(ctx.load("row_inv_rms", row));
       acc.addAssign(go.mul(normalized));
     });
@@ -175,7 +205,9 @@ const rmsNormBackwardGradWeightSpec: TileKernelSpec = {
 
 const gradXTileKernel = createTileKernelDispatcher(rmsNormBackwardGradXSpec);
 const rowStatsTileKernel = createTileKernelDispatcher(rmsNormRowStatsSpec);
-const gradWTileKernel = createTileKernelDispatcher(rmsNormBackwardGradWeightSpec);
+const gradWTileKernel = createTileKernelDispatcher(
+  rmsNormBackwardGradWeightSpec,
+);
 
 // ============================================================================
 // Row Stats Temp Buffer Cache (persistent, keyed by numRows)
@@ -240,7 +272,12 @@ export function dispatchRMSNormBackwardGradX(
   const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
   gradXTileKernel.dispatch(
-    { grad_output: gradOutputBuffer, x: xBuffer, weight: weightBuffer, grad_x: outBuffer },
+    {
+      grad_output: gradOutputBuffer,
+      x: xBuffer,
+      weight: weightBuffer,
+      grad_x: outBuffer,
+    },
     { num_rows: numRows, feature_dim: featureDim, eps },
   );
 
@@ -275,10 +312,14 @@ export function dispatchRMSNormBackwardGradWeight(
   const gradWeightBuffer = allocateOutputBuffer(featureSizeBytes);
 
   gradWTileKernel.dispatch(
-    { grad_output: gradOutputBuffer, x: xBuffer, row_inv_rms: invRmsBuffer, grad_weight: gradWeightBuffer },
+    {
+      grad_output: gradOutputBuffer,
+      x: xBuffer,
+      row_inv_rms: invRmsBuffer,
+      grad_weight: gradWeightBuffer,
+    },
     { num_rows: numRows, feature_dim: featureDim, eps },
   );
 
   return gradWeightBuffer;
 }
-

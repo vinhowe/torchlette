@@ -361,7 +361,7 @@ export function optimizeIR(
   if (enableDCE && outputNodeIds.length > 0) {
     // Remap output IDs if CSE was performed
     const remappedOutputs = cseResult
-      ? outputNodeIds.map((id) => cseResult!.cseMapping.get(id) ?? id)
+      ? outputNodeIds.map((id) => cseResult?.cseMapping.get(id) ?? id)
       : outputNodeIds;
 
     dceResult = performDCE(currentGraph, remappedOutputs);

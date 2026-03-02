@@ -174,7 +174,10 @@ describe("Unary ops (CPU)", () => {
       // GELU(0) ≈ 0
       expect(data[0]).toBeCloseTo(0, 3);
       // GELU(x) ≈ x for large positive x
-      expect(data[3]).toBeCloseTo(2 * 0.5 * (1 + Math.tanh(0.7978845608 * (2 + 0.044715 * 8))), 3);
+      expect(data[3]).toBeCloseTo(
+        2 * 0.5 * (1 + Math.tanh(0.7978845608 * (2 + 0.044715 * 8))),
+        3,
+      );
     });
 
     it("gelu backward pass", async () => {

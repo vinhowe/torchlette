@@ -36,7 +36,7 @@ async function main() {
   console.log("max dim=1 [2,3]:", r6, "(expected [3, 6])");
 
   // Test 7: sum of ones (like expand backward)
-  const t2 = ops.tensorFromArray([1,1,1,1,1,1], [2, 3], "f32");
+  const t2 = ops.tensorFromArray([1, 1, 1, 1, 1, 1], [2, 3], "f32");
   const s7 = ops.sum(t2, { dim: 1 });
   const r7 = await ops.read(s7);
   console.log("sum ones dim=1 [2,3]:", r7, "(expected [3, 3])");
@@ -44,4 +44,7 @@ async function main() {
   process.exit(0);
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

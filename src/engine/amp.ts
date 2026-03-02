@@ -314,7 +314,7 @@ export function computeInputCasts(
  * @returns Cast info if needed, null otherwise
  */
 export function computeOutputCast(
-  op: string,
+  _op: string,
   computeDtype: DType,
   targetDtype: DType,
   ctx: AutocastContext,

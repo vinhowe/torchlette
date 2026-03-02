@@ -8,25 +8,25 @@
  * creating a unified kernel representation for future optimization passes.
  */
 
-import type { DType } from "../types";
 import { sizeOf } from "../../core/shape";
+import type { DType } from "../types";
 import {
+  computeKernelMeta,
   type FusedKernelRecipe,
   type GeneratedKernel,
   type KernelGenOptions,
-  computeKernelMeta,
   needsBroadcast,
 } from "./fusion-types";
 import { MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
-import {
-  type TileKernelSpec,
-  type BindingSpec,
-  type DataType,
-  type KernelContext,
-  type BlockExpr,
-  elementwiseGrid,
-} from "./tile-ir";
 import { compileTileKernel } from "./tile-compiler";
+import {
+  type BindingSpec,
+  type BlockExpr,
+  type DataType,
+  elementwiseGrid,
+  type KernelContext,
+  type TileKernelSpec,
+} from "./tile-ir";
 
 // ============================================================================
 // Op mapping: OP_REGISTRY op name → tile-IR BlockExpr operations
@@ -44,29 +44,50 @@ export function applyFusedOp(
 
   switch (op) {
     // -- Direct unary (1:1 with tile-IR) --
-    case "neg": return a.neg();
-    case "abs": return a.abs();
-    case "exp": return a.exp();
-    case "log": return a.log();
-    case "sqrt": return a.sqrt();
-    case "rsqrt": return a.rsqrt();
-    case "tanh": return a.tanh();
-    case "floor": return a.floor();
-    case "ceil": return a.ceil();
-    case "sin": return a.sin();
-    case "cos": return a.cos();
-    case "round": return a.round();
-    case "sign": return a.sign();
+    case "neg":
+      return a.neg();
+    case "abs":
+      return a.abs();
+    case "exp":
+      return a.exp();
+    case "log":
+      return a.log();
+    case "sqrt":
+      return a.sqrt();
+    case "rsqrt":
+      return a.rsqrt();
+    case "tanh":
+      return a.tanh();
+    case "floor":
+      return a.floor();
+    case "ceil":
+      return a.ceil();
+    case "sin":
+      return a.sin();
+    case "cos":
+      return a.cos();
+    case "round":
+      return a.round();
+    case "sign":
+      return a.sign();
 
     // -- Direct binary (1:1 with tile-IR) --
-    case "add": return a.add(inputs[1]);
-    case "sub": return a.sub(inputs[1]);
-    case "mul": return a.mul(inputs[1]);
-    case "div": return a.div(inputs[1]);
-    case "pow": return a.pow(inputs[1]);
-    case "min": return a.min(inputs[1]);
-    case "max": return a.max(inputs[1]);
-    case "mod": return a.mod(inputs[1]);
+    case "add":
+      return a.add(inputs[1]);
+    case "sub":
+      return a.sub(inputs[1]);
+    case "mul":
+      return a.mul(inputs[1]);
+    case "div":
+      return a.div(inputs[1]);
+    case "pow":
+      return a.pow(inputs[1]);
+    case "min":
+      return a.min(inputs[1]);
+    case "max":
+      return a.max(inputs[1]);
+    case "mod":
+      return a.mod(inputs[1]);
 
     // -- Composite activations (built from primitives) --
     case "relu":
@@ -97,12 +118,18 @@ export function applyFusedOp(
     case "gelu_erf": {
       // x * 0.5 * (1 + erf(x / sqrt(2)))
       // Abramowitz & Stegun polynomial approximation for erf
-      const ax = a.abs().mul(ctx.f32(0.7071067811865476)); // |x| / sqrt(2)
+      const ax = a.abs().mul(ctx.f32(Math.SQRT1_2)); // |x| / sqrt(2)
       const t = ctx.f32(1).div(ctx.f32(1).add(ctx.f32(0.3275911).mul(ax)));
-      const poly = ctx.f32(1.061405429).mul(t).add(ctx.f32(-1.453152027))
-        .mul(t).add(ctx.f32(1.421413741))
-        .mul(t).add(ctx.f32(-0.284496736))
-        .mul(t).add(ctx.f32(0.254829592))
+      const poly = ctx
+        .f32(1.061405429)
+        .mul(t)
+        .add(ctx.f32(-1.453152027))
+        .mul(t)
+        .add(ctx.f32(1.421413741))
+        .mul(t)
+        .add(ctx.f32(-0.284496736))
+        .mul(t)
+        .add(ctx.f32(0.254829592))
         .mul(t);
       const erfAbs = ctx.f32(1).sub(poly.mul(ax.neg().mul(ax).exp()));
       const erf = a.sign().mul(erfAbs);
@@ -110,12 +137,18 @@ export function applyFusedOp(
     }
 
     // -- Comparisons (return f32 0.0/1.0) --
-    case "eq": return a.eq(inputs[1]).select(ctx.f32(1), ctx.f32(0));
-    case "ne": return a.ne(inputs[1]).select(ctx.f32(1), ctx.f32(0));
-    case "lt": return a.lt(inputs[1]).select(ctx.f32(1), ctx.f32(0));
-    case "le": return a.le(inputs[1]).select(ctx.f32(1), ctx.f32(0));
-    case "gt": return a.gt(inputs[1]).select(ctx.f32(1), ctx.f32(0));
-    case "ge": return a.ge(inputs[1]).select(ctx.f32(1), ctx.f32(0));
+    case "eq":
+      return a.eq(inputs[1]).select(ctx.f32(1), ctx.f32(0));
+    case "ne":
+      return a.ne(inputs[1]).select(ctx.f32(1), ctx.f32(0));
+    case "lt":
+      return a.lt(inputs[1]).select(ctx.f32(1), ctx.f32(0));
+    case "le":
+      return a.le(inputs[1]).select(ctx.f32(1), ctx.f32(0));
+    case "gt":
+      return a.gt(inputs[1]).select(ctx.f32(1), ctx.f32(0));
+    case "ge":
+      return a.ge(inputs[1]).select(ctx.f32(1), ctx.f32(0));
 
     // -- Ternary --
     case "where":
@@ -123,15 +156,19 @@ export function applyFusedOp(
       return inputs[0].gt(ctx.f32(0)).select(inputs[1], inputs[2]);
 
     // -- Casts --
-    case "cast_f32": return a.toF32();
-    case "cast_f16": return a.toF16();
-    case "cast_i32": return a.toI32();
-    case "cast_u32": return a.toU32();
+    case "cast_f32":
+      return a.toF32();
+    case "cast_f16":
+      return a.toF16();
+    case "cast_i32":
+      return a.toI32();
+    case "cast_u32":
+      return a.toU32();
 
     // -- isfinite: (bits & 0x7F800000) != 0x7F800000 → 1.0, else 0.0 --
     case "isfinite": {
       const bits = a.bitcastTo("u32");
-      const exponentMask = ctx.u32(0x7F800000);
+      const exponentMask = ctx.u32(0x7f800000);
       const masked = bits.and(exponentMask);
       return masked.ne(exponentMask).select(ctx.f32(1), ctx.f32(0));
     }
@@ -155,7 +192,7 @@ function emitBroadcastIndex(
   outputShape: number[],
   inputShape: number[],
   outputIdx: BlockExpr,
-  inputName: string,
+  _inputName: string,
 ): BlockExpr {
   const inputSize = sizeOf(inputShape);
   if (inputSize === 1) {
@@ -237,7 +274,10 @@ export function generateFusedKernelTileIR(
   }
   for (let i = 0; i < recipe.outputs.length; i++) {
     const output = recipe.outputs[i];
-    bindings[`out${i}`] = { storage: "read_write", type: dtypeToTileIR(output.dtype) };
+    bindings[`out${i}`] = {
+      storage: "read_write",
+      type: dtypeToTileIR(output.dtype),
+    };
   }
 
   // Uniform binding index: after all storage bindings
@@ -245,9 +285,9 @@ export function generateFusedKernelTileIR(
 
   // Check if f16 is needed
   const needsF16 =
-    recipe.inputs.some(inp => inp.dtype === "f16") ||
-    recipe.outputs.some(o => o.dtype === "f16") ||
-    recipe.nodes.some(n => n.dtype === "f16");
+    recipe.inputs.some((inp) => inp.dtype === "f16") ||
+    recipe.outputs.some((o) => o.dtype === "f16") ||
+    recipe.nodes.some((n) => n.dtype === "f16");
 
   const spec: TileKernelSpec = {
     name: `fused_${recipe.id}`,
@@ -286,7 +326,10 @@ export function generateFusedKernelTileIR(
 
         if (input.isInlinedConstant && input.inlinedValue !== undefined) {
           // Inlined constant: emit as tile-IR constant
-          inputExprs.set(i, constForDtype(ctx, input.inlinedValue, input.dtype));
+          inputExprs.set(
+            i,
+            constForDtype(ctx, input.inlinedValue, input.dtype),
+          );
           continue;
         }
 
@@ -299,7 +342,13 @@ export function generateFusedKernelTileIR(
           inputExprs.set(i, val);
         } else if (needsBroadcast(outputShape, input.shape)) {
           // Broadcast: compute mapped index
-          const broadIdx = emitBroadcastIndex(ctx, outputShape, input.shape, idx, `in${i}`);
+          const broadIdx = emitBroadcastIndex(
+            ctx,
+            outputShape,
+            input.shape,
+            idx,
+            `in${i}`,
+          );
           const val = ctx.emitLet(`v${i}`, ctx.load(`in${i}`, broadIdx));
           inputExprs.set(i, val);
         } else {
@@ -319,7 +368,10 @@ export function generateFusedKernelTileIR(
             // External input
             const inputIdx = -inputId - 1;
             const expr = inputExprs.get(inputIdx);
-            if (!expr) throw new Error(`Missing input expr for external input ${inputIdx}`);
+            if (!expr)
+              throw new Error(
+                `Missing input expr for external input ${inputIdx}`,
+              );
             nodeInputs.push(expr);
           } else {
             // Internal node reference
@@ -341,7 +393,8 @@ export function generateFusedKernelTileIR(
       for (let i = 0; i < recipe.outputs.length; i++) {
         const output = recipe.outputs[i];
         const val = nodeExprs.get(output.nodeId);
-        if (!val) throw new Error(`Missing output expr for node ${output.nodeId}`);
+        if (!val)
+          throw new Error(`Missing output expr for node ${output.nodeId}`);
         ctx.blockStore(`out${i}`, idx, totalElements, val);
       }
     },
@@ -366,20 +419,34 @@ export function generateFusedKernelTileIR(
 
 export function dtypeToTileIR(dtype: DType): DataType {
   switch (dtype) {
-    case "f32": return "f32";
-    case "f16": return "f16";
-    case "i32": return "i32";
-    case "u32": return "u32";
-    default: return "f32";
+    case "f32":
+      return "f32";
+    case "f16":
+      return "f16";
+    case "i32":
+      return "i32";
+    case "u32":
+      return "u32";
+    default:
+      return "f32";
   }
 }
 
-function constForDtype(ctx: KernelContext, value: number, dtype: DType): BlockExpr {
+function constForDtype(
+  ctx: KernelContext,
+  value: number,
+  dtype: DType,
+): BlockExpr {
   switch (dtype) {
-    case "f32": return ctx.f32(value);
-    case "f16": return ctx.f16(value);
-    case "i32": return ctx.i32(value);
-    case "u32": return ctx.u32(value);
-    default: return ctx.f32(value);
+    case "f32":
+      return ctx.f32(value);
+    case "f16":
+      return ctx.f16(value);
+    case "i32":
+      return ctx.i32(value);
+    case "u32":
+      return ctx.u32(value);
+    default:
+      return ctx.f32(value);
   }
 }

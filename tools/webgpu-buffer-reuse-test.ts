@@ -53,7 +53,10 @@ const BYTES = N * 4;
 function sbuf(): GPUBuffer {
   return device.createBuffer({
     size: BYTES,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    usage:
+      GPUBufferUsage.STORAGE |
+      GPUBufferUsage.COPY_SRC |
+      GPUBufferUsage.COPY_DST,
   });
 }
 
@@ -61,7 +64,11 @@ function fill(b: GPUBuffer, val: number): void {
   queue.writeBuffer(b, 0, new Float32Array(N).fill(val));
 }
 
-function computeCopy(enc: GPUCommandEncoder, src: GPUBuffer, dst: GPUBuffer): void {
+function computeCopy(
+  enc: GPUCommandEncoder,
+  src: GPUBuffer,
+  dst: GPUBuffer,
+): void {
   const bg = device.createBindGroup({
     layout: copyPL.getBindGroupLayout(0),
     entries: [
@@ -106,7 +113,8 @@ function checkAll(data: Float32Array, expected: number): number {
 
 /** submit(B→C), writeBuffer(B,999), C should still be 1 */
 async function t1(): Promise<boolean> {
-  const B = sbuf(), C = sbuf();
+  const B = sbuf(),
+    C = sbuf();
   fill(B, 1);
   const e = device.createCommandEncoder();
   computeCopy(e, B, C);
@@ -114,14 +122,19 @@ async function t1(): Promise<boolean> {
   fill(B, 999); // overwrite source immediately
   const data = await readBuf(C);
   const bad = checkAll(data, 1);
-  console.log(`  1. WAR writeBuffer:            ${bad === 0 ? "PASS" : `FAIL ${bad}/${N}`}`);
+  console.log(
+    `  1. WAR writeBuffer:            ${bad === 0 ? "PASS" : `FAIL ${bad}/${N}`}`,
+  );
   return bad === 0;
 }
 
 /** submit(B→C), submit(D→B), C==1, B==2 */
 async function t2(): Promise<boolean> {
-  const B = sbuf(), C = sbuf(), D = sbuf();
-  fill(B, 1); fill(D, 2);
+  const B = sbuf(),
+    C = sbuf(),
+    D = sbuf();
+  fill(B, 1);
+  fill(D, 2);
   let e = device.createCommandEncoder();
   computeCopy(e, B, C);
   queue.submit([e.finish()]);
@@ -133,7 +146,9 @@ async function t2(): Promise<boolean> {
   const badC = checkAll(dataC, 1);
   const badB = checkAll(dataB, 2);
   const p = badC === 0 && badB === 0;
-  console.log(`  2. WAR compute:                ${p ? "PASS" : `FAIL C:${badC} B:${badB}`}`);
+  console.log(
+    `  2. WAR compute:                ${p ? "PASS" : `FAIL C:${badC} B:${badB}`}`,
+  );
   return p;
 }
 
@@ -154,19 +169,29 @@ async function t3(): Promise<boolean> {
   for (let c = 0; c < CYCLES; c++) {
     const data = await readBuf(outs[c]);
     const bad = checkAll(data, c + 1);
-    if (bad > 0) { fails++; console.log(`    cycle ${c}: ${bad}/${N} bad`); }
+    if (bad > 0) {
+      fails++;
+      console.log(`    cycle ${c}: ${bad}/${N} bad`);
+    }
   }
-  console.log(`  3. Rapid chain (${CYCLES} cycles):    ${fails === 0 ? "PASS" : `FAIL ${fails}/${CYCLES}`}`);
+  console.log(
+    `  3. Rapid chain (${CYCLES} cycles):    ${fails === 0 ? "PASS" : `FAIL ${fails}/${CYCLES}`}`,
+  );
   return fails === 0;
 }
 
 /** Shared encoder fwd+bwd, submit, reuse intermediates in optimizer */
 async function t4(): Promise<boolean> {
   const L = 4;
-  const ps: GPUBuffer[] = [], is_: GPUBuffer[] = [],
-        os: GPUBuffer[] = [], gs: GPUBuffer[] = [];
+  const ps: GPUBuffer[] = [],
+    is_: GPUBuffer[] = [],
+    os: GPUBuffer[] = [],
+    gs: GPUBuffer[] = [];
   for (let i = 0; i < L; i++) {
-    ps.push(sbuf()); is_.push(sbuf()); os.push(sbuf()); gs.push(sbuf());
+    ps.push(sbuf());
+    is_.push(sbuf());
+    os.push(sbuf());
+    gs.push(sbuf());
     fill(ps[i], i + 1);
   }
   const se = device.createCommandEncoder();
@@ -183,7 +208,10 @@ async function t4(): Promise<boolean> {
     const dataG = await readBuf(gs[i]);
     const badO = checkAll(dataO, i + 1);
     const badG = checkAll(dataG, i + 1);
-    if (badO > 0 || badG > 0) { p = false; console.log(`    L${i} o:${badO} g:${badG}`); }
+    if (badO > 0 || badG > 0) {
+      p = false;
+      console.log(`    L${i} o:${badO} g:${badG}`);
+    }
   }
   console.log(`  4. Shared encoder (${L} layers):  ${p ? "PASS" : "FAIL"}`);
   return p;
@@ -191,7 +219,8 @@ async function t4(): Promise<boolean> {
 
 /** Pool cycling — 3 rounds × 2 bufs */
 async function t5(): Promise<boolean> {
-  const ROUNDS = 3, PER = 2;
+  const ROUNDS = 3,
+    PER = 2;
   const pool: GPUBuffer[] = [];
   const dsts: { b: GPUBuffer; v: number }[] = [];
   for (let f = 0; f < ROUNDS; f++) {
@@ -212,20 +241,29 @@ async function t5(): Promise<boolean> {
     const data = await readBuf(b);
     if (checkAll(data, v) > 0) fails++;
   }
-  console.log(`  5. Multi-flush cycling (${ROUNDS}x${PER}):  ${fails === 0 ? "PASS" : `FAIL ${fails}/${dsts.length}`}`);
+  console.log(
+    `  5. Multi-flush cycling (${ROUNDS}x${PER}):  ${fails === 0 ? "PASS" : `FAIL ${fails}/${dsts.length}`}`,
+  );
   return fails === 0;
 }
 
 /** Adam-loop: backward submit, reclaim intermediates, per-param opt submit */
 async function t6(): Promise<boolean> {
   const NP = 5;
-  const ps: GPUBuffer[] = [], gs: GPUBuffer[] = [], is_: GPUBuffer[] = [];
+  const ps: GPUBuffer[] = [],
+    gs: GPUBuffer[] = [],
+    is_: GPUBuffer[] = [];
   for (let i = 0; i < NP; i++) {
-    ps.push(sbuf()); gs.push(sbuf()); is_.push(sbuf());
+    ps.push(sbuf());
+    gs.push(sbuf());
+    is_.push(sbuf());
     fill(ps[i], i + 1);
   }
   const be = device.createCommandEncoder();
-  for (let i = 0; i < NP; i++) { computeCopy(be, ps[i], is_[i]); computeCopy(be, is_[i], gs[i]); }
+  for (let i = 0; i < NP; i++) {
+    computeCopy(be, ps[i], is_[i]);
+    computeCopy(be, is_[i], gs[i]);
+  }
   queue.submit([be.finish()]);
   const pool = [...is_];
   for (let i = 0; i < NP; i++) {
@@ -241,7 +279,10 @@ async function t6(): Promise<boolean> {
     const dataG = await readBuf(gs[i]);
     const dataP = await readBuf(ps[i]);
     if (checkAll(dataG, i + 1) > 0 || checkAll(dataP, i + 1) > 0) {
-      p = false; console.log(`    P${i} g:${checkAll(dataG, i + 1)} p:${checkAll(dataP, i + 1)}`);
+      p = false;
+      console.log(
+        `    P${i} g:${checkAll(dataG, i + 1)} p:${checkAll(dataP, i + 1)}`,
+      );
     }
   }
   console.log(`  6. Adam-loop (${NP} params):       ${p ? "PASS" : "FAIL"}`);
@@ -251,27 +292,40 @@ async function t6(): Promise<boolean> {
 /** Intra-encoder A→B→C + cross-submit R+W */
 async function t7t8(): Promise<boolean[]> {
   // Test 7
-  const A7 = sbuf(), B7 = sbuf(), C7 = sbuf();
+  const A7 = sbuf(),
+    B7 = sbuf(),
+    C7 = sbuf();
   fill(A7, 42);
   let e = device.createCommandEncoder();
-  computeCopy(e, A7, B7); computeCopy(e, B7, C7);
+  computeCopy(e, A7, B7);
+  computeCopy(e, B7, C7);
   queue.submit([e.finish()]);
   const d7 = await readBuf(C7);
   const p7 = checkAll(d7, 42) === 0;
-  console.log(`  7. Intra-encoder A->B->C:      ${p7 ? "PASS" : `FAIL ${checkAll(d7, 42)}/${N}`}`);
+  console.log(
+    `  7. Intra-encoder A->B->C:      ${p7 ? "PASS" : `FAIL ${checkAll(d7, 42)}/${N}`}`,
+  );
 
   // Test 8
-  const A8 = sbuf(), B8 = sbuf(), C8 = sbuf(), D8 = sbuf();
-  fill(A8, 7); fill(D8, 99);
+  const A8 = sbuf(),
+    B8 = sbuf(),
+    C8 = sbuf(),
+    D8 = sbuf();
+  fill(A8, 7);
+  fill(D8, 99);
   e = device.createCommandEncoder();
-  computeCopy(e, A8, B8); queue.submit([e.finish()]);
+  computeCopy(e, A8, B8);
+  queue.submit([e.finish()]);
   e = device.createCommandEncoder();
-  computeCopy(e, B8, C8); computeCopy(e, D8, B8);
+  computeCopy(e, B8, C8);
+  computeCopy(e, D8, B8);
   queue.submit([e.finish()]);
   const dC = await readBuf(C8);
   const dB = await readBuf(B8);
   const p8 = checkAll(dC, 7) === 0 && checkAll(dB, 99) === 0;
-  console.log(`  8. Cross-submit R+W same buf:  ${p8 ? "PASS" : `FAIL C:${checkAll(dC, 7)} B:${checkAll(dB, 99)}`}`);
+  console.log(
+    `  8. Cross-submit R+W same buf:  ${p8 ? "PASS" : `FAIL C:${checkAll(dC, 7)} B:${checkAll(dB, 99)}`}`,
+  );
 
   return [p7, p8];
 }
@@ -296,7 +350,7 @@ async function main(): Promise<void> {
   r.push(await t6());
 
   console.log("\n--- Intra-encoder ---");
-  r.push(...await t7t8());
+  r.push(...(await t7t8()));
 
   const passed = r.filter(Boolean).length;
   console.log(`\n${"=".repeat(48)}`);
@@ -314,4 +368,7 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

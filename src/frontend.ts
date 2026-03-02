@@ -12,52 +12,52 @@ import type {
   SumOptions,
   TransposeOptions,
 } from "./backend/types";
+import { isAutotuneEnabled, setAutotuneEnabled } from "./backend/webgpu";
 import {
-  Engine,
-  type EngineTensor,
-} from "./engine/engine";
+  awaitDeferredFence,
+  issueDeferredFence,
+} from "./backend/webgpu/buffer-pool";
+import {
+  getGPUMemoryLimit,
+  getGPUMemoryStats,
+  setGPUMemoryLimit,
+} from "./backend/webgpu/memory-tracker";
+import { shapesEqual, sizeOf } from "./core/shape";
 import {
   type AutocastConfig,
   type AutocastContext,
   createAutocastContext,
 } from "./engine/amp";
-import { RuntimeEngine, TidyDispatchMode, type TensorOrScalar } from "./runtime/engine";
-import {
-  setGPUMemoryLimit,
-  getGPUMemoryLimit,
-  getGPUMemoryStats,
-} from "./backend/webgpu/memory-tracker";
-import {
-  isAutotuneEnabled,
-  setAutotuneEnabled,
-} from "./backend/webgpu";
-import {
-  issueDeferredFence,
-  awaitDeferredFence,
-} from "./backend/webgpu/buffer-pool";
-import { sizeOf, shapesEqual } from "./core/shape";
+import { Engine, type EngineTensor } from "./engine/engine";
 import { storageTracker } from "./engine/lazy";
+import {
+  RuntimeEngine,
+  type TensorOrScalar,
+  TidyDispatchMode,
+} from "./runtime/engine";
 import type { Tensor as RuntimeTensor } from "./runtime/tensor";
 
 // Re-export the Tensor class and DisposedTensorError from their new home
-export { Tensor, DisposedTensorError } from "./frontend-tensor";
+export { DisposedTensorError, Tensor } from "./frontend-tensor";
+
 import { Tensor } from "./frontend-tensor";
 
 // Re-export types from frontend-types
 export type {
-  TensorCreateOptions,
   AutocastOptions,
-  TorchletteOptions,
   PackHook,
+  TensorCreateOptions,
+  TorchletteOptions,
   UnpackHook,
 } from "./frontend-types";
+
 import type {
-  TensorCreateOptions,
   AutocastOptions,
-  TorchletteOptions,
   GradFn,
   SavedTensorHooksContext,
   SavedTensorSlot,
+  TensorCreateOptions,
+  TorchletteOptions,
 } from "./frontend-types";
 
 // Re-export backend types
@@ -74,20 +74,20 @@ export type {
 
 // Import extracted modules
 import {
-  autocastImpl,
-  autocastAsyncImpl,
-  savedTensorHooksImpl,
-  autocastCastImpl,
   applyAutocastImpl,
+  autocastAsyncImpl,
+  autocastCastImpl,
+  autocastImpl,
+  savedTensorHooksImpl,
 } from "./frontend-autocast";
+import { backwardImpl } from "./frontend-autograd";
 import {
-  softmaxImpl,
   crossEntropyFusedImpl,
-  scaledDotProductAttentionImpl,
   layernormImpl,
   rmsnormImpl,
+  scaledDotProductAttentionImpl,
+  softmaxImpl,
 } from "./frontend-fused-ops";
-import { backwardImpl } from "./frontend-autograd";
 
 // ============================================================================
 // Table-driven unary op autograd (§9)
@@ -99,32 +99,59 @@ import { backwardImpl } from "./frontend-autograd";
  * @param grad - Upstream gradient (RuntimeTensor)
  * @param savedA - Saved input tensor (frontend Tensor), null if needsSave=false
  */
-type UnaryGradFn = (rt: RuntimeEngine, grad: RuntimeTensor, savedA: Tensor) => RuntimeTensor;
+type UnaryGradFn = (
+  rt: RuntimeEngine,
+  grad: RuntimeTensor,
+  savedA: Tensor,
+) => RuntimeTensor;
 
 interface UnaryOpSpec {
-  autocast?: string;       // autocast category (omit = no cast)
-  needsSave?: boolean;     // save input for backward? (default true for grad ops)
+  autocast?: string; // autocast category (omit = no cast)
+  needsSave?: boolean; // save input for backward? (default true for grad ops)
   grad: UnaryGradFn | null; // null = no grad (floor, ceil, etc.)
 }
 
 const UNARY_OPS: Record<string, UnaryOpSpec> = {
-  exp:      { autocast: "exp", grad: (rt, g, s) => rt.mul(g, rt.exp(s._unwrap())) },
-  log:      { autocast: "log", grad: (rt, g, s) => rt.div(g, rt.add(s._unwrap(), 1e-8)) },
-  neg:      { needsSave: false, grad: (rt, g) => rt.neg(g) },
-  abs:      { grad: (rt, g, s) => rt.mul(g, rt.sign(s._unwrap())) },
-  silu:     { grad: (rt, g, s) => {
-    const sig = rt.sigmoid(s._unwrap());
-    return rt.mul(g, rt.add(sig, rt.mul(s._unwrap(), rt.mul(sig, rt.sub(1, sig)))));
-  }},
-  tanh:     { grad: (rt, g, s) => { const t = rt.tanh(s._unwrap()); return rt.mul(rt.sub(1, rt.mul(t, t)), g); } },
-  sigmoid:  { grad: (rt, g, s) => { const sig = rt.sigmoid(s._unwrap()); return rt.mul(rt.mul(sig, rt.sub(1, sig)), g); } },
-  sin:      { grad: (rt, g, s) => rt.mul(g, rt.cos(s._unwrap())) },
-  cos:      { grad: (rt, g, s) => rt.mul(g, rt.neg(rt.sin(s._unwrap()))) },
-  rsqrt:    { grad: (rt, g, s) => { const r = rt.rsqrt(s._unwrap()); return rt.mul(g, rt.mul(-0.5, rt.mul(r, rt.mul(r, r)))); } },
-  floor:    { grad: null },
-  ceil:     { grad: null },
-  round:    { grad: null },
-  sign:     { grad: null },
+  exp: { autocast: "exp", grad: (rt, g, s) => rt.mul(g, rt.exp(s._unwrap())) },
+  log: {
+    autocast: "log",
+    grad: (rt, g, s) => rt.div(g, rt.add(s._unwrap(), 1e-8)),
+  },
+  neg: { needsSave: false, grad: (rt, g) => rt.neg(g) },
+  abs: { grad: (rt, g, s) => rt.mul(g, rt.sign(s._unwrap())) },
+  silu: {
+    grad: (rt, g, s) => {
+      const sig = rt.sigmoid(s._unwrap());
+      return rt.mul(
+        g,
+        rt.add(sig, rt.mul(s._unwrap(), rt.mul(sig, rt.sub(1, sig)))),
+      );
+    },
+  },
+  tanh: {
+    grad: (rt, g, s) => {
+      const t = rt.tanh(s._unwrap());
+      return rt.mul(rt.sub(1, rt.mul(t, t)), g);
+    },
+  },
+  sigmoid: {
+    grad: (rt, g, s) => {
+      const sig = rt.sigmoid(s._unwrap());
+      return rt.mul(rt.mul(sig, rt.sub(1, sig)), g);
+    },
+  },
+  sin: { grad: (rt, g, s) => rt.mul(g, rt.cos(s._unwrap())) },
+  cos: { grad: (rt, g, s) => rt.mul(g, rt.neg(rt.sin(s._unwrap()))) },
+  rsqrt: {
+    grad: (rt, g, s) => {
+      const r = rt.rsqrt(s._unwrap());
+      return rt.mul(g, rt.mul(-0.5, rt.mul(r, rt.mul(r, r))));
+    },
+  },
+  floor: { grad: null },
+  ceil: { grad: null },
+  round: { grad: null },
+  sign: { grad: null },
   isfinite: { grad: null },
 };
 
@@ -140,7 +167,9 @@ export class Torchlette {
   /** Label to capture on subsequent autograd nodes (for backward attribution) */
   private _currentNodeLabel: string | null = null;
   /** Hooks fired before each backward op */
-  readonly _backwardDispatchHooks: Array<(info: { output: Tensor; inputs: Tensor[]; label?: string }) => void> = [];
+  readonly _backwardDispatchHooks: Array<
+    (info: { output: Tensor; inputs: Tensor[]; label?: string }) => void
+  > = [];
 
   constructor(backendName?: DeviceKind, options?: TorchletteOptions) {
     this.engine = new Engine();
@@ -153,12 +182,12 @@ export class Torchlette {
       // Early release can be enabled globally for memory savings
       enableEarlyRelease: options?.enableEarlyRelease ?? false,
       // Checkpoint segmentation for large model memory savings
-      enableCheckpointSegmentation: options?.enableCheckpointSegmentation ?? false,
+      enableCheckpointSegmentation:
+        options?.enableCheckpointSegmentation ?? false,
       // True segmentation with GPU sync for actual memory savings
       enableTrueSegmentation: options?.enableTrueSegmentation ?? false,
     });
     this.autocastContext = createAutocastContext();
-
   }
 
   /**
@@ -336,7 +365,9 @@ export class Torchlette {
   }
 
   /** Register a hook that fires before each backward op. Returns unregister function. */
-  onBackwardDispatch(hook: (info: { output: Tensor; inputs: Tensor[]; label?: string }) => void): () => void {
+  onBackwardDispatch(
+    hook: (info: { output: Tensor; inputs: Tensor[]; label?: string }) => void,
+  ): () => void {
     this._backwardDispatchHooks.push(hook);
     return () => {
       const idx = this._backwardDispatchHooks.indexOf(hook);
@@ -361,38 +392,74 @@ export class Torchlette {
     shape: number[],
     options?: TensorCreateOptions,
   ): Tensor {
-    return this._wrap(this.runtime.tensorFromArray(values, shape, options?.device), options?.requiresGrad ?? false);
+    return this._wrap(
+      this.runtime.tensorFromArray(values, shape, options?.device),
+      options?.requiresGrad ?? false,
+    );
   }
 
   rand(shape: number[], options?: TensorCreateOptions): Tensor {
-    return this._wrap(this.runtime.rand(shape, options?.device), options?.requiresGrad ?? false);
+    return this._wrap(
+      this.runtime.rand(shape, options?.device),
+      options?.requiresGrad ?? false,
+    );
   }
 
   randn(shape: number[], options?: TensorCreateOptions): Tensor {
-    return this._wrap(this.runtime.randn(shape, options?.device), options?.requiresGrad ?? false);
+    return this._wrap(
+      this.runtime.randn(shape, options?.device),
+      options?.requiresGrad ?? false,
+    );
   }
 
   bernoulli(shape: number[], p = 0.5, options?: TensorCreateOptions): Tensor {
-    if (p < 0 || p > 1) throw new Error(`Bernoulli probability must be between 0 and 1, got ${p}`);
-    return this._wrap(this.runtime.bernoulli(shape, p, options?.device), options?.requiresGrad ?? false);
+    if (p < 0 || p > 1)
+      throw new Error(
+        `Bernoulli probability must be between 0 and 1, got ${p}`,
+      );
+    return this._wrap(
+      this.runtime.bernoulli(shape, p, options?.device),
+      options?.requiresGrad ?? false,
+    );
   }
 
   zeros(shape: number[], options?: TensorCreateOptions): Tensor {
-    return this._wrap(this.runtime.zeros(shape, options?.device), options?.requiresGrad ?? false);
+    return this._wrap(
+      this.runtime.zeros(shape, options?.device),
+      options?.requiresGrad ?? false,
+    );
   }
 
   ones(shape: number[], options?: TensorCreateOptions): Tensor {
     return this.full(shape, 1, options);
   }
 
-  full(shape: number[], fillValue: number, options?: TensorCreateOptions): Tensor {
-    return this._wrap(this.runtime.full(shape, fillValue, options?.device), options?.requiresGrad ?? false);
+  full(
+    shape: number[],
+    fillValue: number,
+    options?: TensorCreateOptions,
+  ): Tensor {
+    return this._wrap(
+      this.runtime.full(shape, fillValue, options?.device),
+      options?.requiresGrad ?? false,
+    );
   }
 
-  arange(end: number, options?: { start?: number; step?: number; device?: DeviceKind; requiresGrad?: boolean }): Tensor {
+  arange(
+    end: number,
+    options?: {
+      start?: number;
+      step?: number;
+      device?: DeviceKind;
+      requiresGrad?: boolean;
+    },
+  ): Tensor {
     const start = options?.start ?? 0;
     const step = options?.step ?? 1;
-    return this._wrap(this.runtime.arange(end, start, step, options?.device), options?.requiresGrad ?? false);
+    return this._wrap(
+      this.runtime.arange(end, start, step, options?.device),
+      options?.requiresGrad ?? false,
+    );
   }
 
   tril(a: Tensor, k = 0): Tensor {
@@ -425,14 +492,27 @@ export class Torchlette {
   private _dispatchUnary(opName: string, a: Tensor): Tensor {
     const spec = UNARY_OPS[opName]!;
     this._assertUsable(a);
-    const castA = spec.autocast ? this._applyAutocast(spec.autocast, [a])[0] : a;
+    const castA = spec.autocast
+      ? this._applyAutocast(spec.autocast, [a])[0]
+      : a;
     const inner = (this.runtime as any)[opName](castA._unwrap());
     if (!spec.grad) return this._wrap(inner);
     const needsSave = spec.needsSave !== false;
     const tensorsToSave = needsSave && a.requiresGrad ? [castA] : [];
-    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
-      return [spec.grad!(this.runtime, grad, needsSave ? getSaved(0) : undefined as any)];
-    }, tensorsToSave);
+    return this._wrapWithGrad(
+      inner,
+      [a],
+      (grad, getSaved) => {
+        return [
+          spec.grad?.(
+            this.runtime,
+            grad,
+            needsSave ? getSaved(0) : (undefined as any),
+          ),
+        ];
+      },
+      tensorsToSave,
+    );
   }
 
   add(a: Tensor | number, b: Tensor | number): Tensor {
@@ -482,8 +562,7 @@ export class Torchlette {
       const inner = this.runtime.mul(a._unwrap(), b._unwrap());
       const aShape = a.shape;
       const bShape = b.shape;
-      const tensorsToSave =
-        a.requiresGrad || b.requiresGrad ? [a, b] : [];
+      const tensorsToSave = a.requiresGrad || b.requiresGrad ? [a, b] : [];
       return this._wrapWithGrad(
         inner,
         [a, b],
@@ -523,8 +602,7 @@ export class Torchlette {
       const inner = this.runtime.div(a._unwrap(), b._unwrap());
       const aShape = a.shape;
       const bShape = b.shape;
-      const tensorsToSave =
-        a.requiresGrad || b.requiresGrad ? [a, b] : [];
+      const tensorsToSave = a.requiresGrad || b.requiresGrad ? [a, b] : [];
       return this._wrapWithGrad(
         inner,
         [a, b],
@@ -560,17 +638,30 @@ export class Torchlette {
       ]);
     }
     // scalar / b → grad_b = -scalar / b^2 * grad
-    return this._wrapWithGrad(inner, [tensorInput], (grad, getSaved) => {
-      const savedB = getSaved(0);
-      const bSq = this.runtime.mul(savedB._unwrap(), savedB._unwrap());
-      return [this._sumToShape(this.runtime.mul(grad, this.runtime.div(-scalarVal, bSq)), tensorInput.shape)];
-    }, [tensorInput]);
+    return this._wrapWithGrad(
+      inner,
+      [tensorInput],
+      (grad, getSaved) => {
+        const savedB = getSaved(0);
+        const bSq = this.runtime.mul(savedB._unwrap(), savedB._unwrap());
+        return [
+          this._sumToShape(
+            this.runtime.mul(grad, this.runtime.div(-scalarVal, bSq)),
+            tensorInput.shape,
+          ),
+        ];
+      },
+      [tensorInput],
+    );
   }
 
   matmul(a: Tensor, b: Tensor): Tensor {
     this._assertUsable(a, b);
     // Apply autocast: cast f32 inputs to f16 for compute-bound matmul
-    const [castA, castB] = this._applyAutocast("matmul", [a, b]) as [Tensor, Tensor];
+    const [castA, castB] = this._applyAutocast("matmul", [a, b]) as [
+      Tensor,
+      Tensor,
+    ];
     const inner = this.runtime.matmul(castA._unwrap(), castB._unwrap());
     // Capture shapes of the ORIGINAL inputs for backward gradient shapes
     const aShape = a.shape;
@@ -622,11 +713,15 @@ export class Torchlette {
   linear(input: Tensor, weight: Tensor, bias: Tensor | null = null): Tensor {
     this._assertUsable(input, weight);
     if (bias) this._assertUsable(bias);
-    const [castInput, castWeight] = this._applyAutocast("matmul", [input, weight]) as [Tensor, Tensor];
+    const [castInput, castWeight] = this._applyAutocast("matmul", [
+      input,
+      weight,
+    ]) as [Tensor, Tensor];
 
     // Forward: Y = input @ weight.T (+ bias)
     const wT = this.runtime.transpose(castWeight._unwrap(), {
-      dim0: castWeight.shape.length - 2, dim1: castWeight.shape.length - 1,
+      dim0: castWeight.shape.length - 2,
+      dim1: castWeight.shape.length - 1,
     });
     let inner = this.runtime.matmul(castInput._unwrap(), wT);
     if (bias) {
@@ -642,44 +737,52 @@ export class Torchlette {
     const toSave: Tensor[] = [];
     if (needsInputGrad || needsWeightGrad) {
       if (needsInputGrad) toSave.push(castWeight); // saved[0] = weight (for dX)
-      if (needsWeightGrad) toSave.push(castInput);  // saved[1 or 0] = input (for dW)
+      if (needsWeightGrad) toSave.push(castInput); // saved[1 or 0] = input (for dW)
       if (bias) toSave.push(bias);
     }
 
-    return this._wrapWithGrad(inner, allInputs, (grad, getSaved) => {
-      if (inputShape.length < 2 || weightShape.length < 2)
-        throw new Error("linear backward requires rank >= 2");
+    return this._wrapWithGrad(
+      inner,
+      allInputs,
+      (grad, getSaved) => {
+        if (inputShape.length < 2 || weightShape.length < 2)
+          throw new Error("linear backward requires rank >= 2");
 
-      let savedIdx = 0;
-      // dX = dY @ W  (weight is [out, in], so dY @ W = [..., out] @ [out, in] = [..., in])
-      let resultInput: RuntimeTensor | null = null;
-      if (needsInputGrad) {
-        const savedWeight = getSaved(savedIdx++)._unwrap();
-        const gradInput = this.runtime.matmul(grad, savedWeight);
-        resultInput = this._sumToShape(gradInput, inputShape);
-      }
+        let savedIdx = 0;
+        // dX = dY @ W  (weight is [out, in], so dY @ W = [..., out] @ [out, in] = [..., in])
+        let resultInput: RuntimeTensor | null = null;
+        if (needsInputGrad) {
+          const savedWeight = getSaved(savedIdx++)._unwrap();
+          const gradInput = this.runtime.matmul(grad, savedWeight);
+          resultInput = this._sumToShape(gradInput, inputShape);
+        }
 
-      // dW = dY^T @ X → [out, in] = weight's shape directly (no transpose needed!)
-      // Skipped when weight doesn't require grad (e.g. detached weight).
-      let resultWeight: RuntimeTensor | null = null;
-      if (needsWeightGrad) {
-        const savedInput = getSaved(savedIdx++)._unwrap();
-        const gradT = this.runtime.transpose(grad, {
-          dim0: grad.shape.length - 2, dim1: grad.shape.length - 1,
-        });
-        const gradWeight = this.runtime.matmul(gradT, savedInput);
-        resultWeight = this._sumToShape(gradWeight, weightShape);
-      }
+        // dW = dY^T @ X → [out, in] = weight's shape directly (no transpose needed!)
+        // Skipped when weight doesn't require grad (e.g. detached weight).
+        let resultWeight: RuntimeTensor | null = null;
+        if (needsWeightGrad) {
+          const savedInput = getSaved(savedIdx++)._unwrap();
+          const gradT = this.runtime.transpose(grad, {
+            dim0: grad.shape.length - 2,
+            dim1: grad.shape.length - 1,
+          });
+          const gradWeight = this.runtime.matmul(gradT, savedInput);
+          resultWeight = this._sumToShape(gradWeight, weightShape);
+        }
 
-      // dBias = sum(dY, all dims except last)
-      let resultBias: RuntimeTensor | null = null;
-      if (bias) {
-        const biasShape = getSaved(savedIdx).shape;
-        resultBias = this._sumToShape(grad, biasShape);
-      }
+        // dBias = sum(dY, all dims except last)
+        let resultBias: RuntimeTensor | null = null;
+        if (bias) {
+          const biasShape = getSaved(savedIdx).shape;
+          resultBias = this._sumToShape(grad, biasShape);
+        }
 
-      return bias ? [resultInput, resultWeight, resultBias!] : [resultInput, resultWeight];
-    }, toSave);
+        return bias
+          ? [resultInput, resultWeight, resultBias!]
+          : [resultInput, resultWeight];
+      },
+      toSave,
+    );
   }
 
   sqrt(a: Tensor): Tensor {
@@ -722,14 +825,26 @@ export class Torchlette {
     );
   }
 
-  exp(a: Tensor): Tensor { return this._dispatchUnary("exp", a); }
-  log(a: Tensor): Tensor { return this._dispatchUnary("log", a); }
-  neg(a: Tensor): Tensor { return this._dispatchUnary("neg", a); }
+  exp(a: Tensor): Tensor {
+    return this._dispatchUnary("exp", a);
+  }
+  log(a: Tensor): Tensor {
+    return this._dispatchUnary("log", a);
+  }
+  neg(a: Tensor): Tensor {
+    return this._dispatchUnary("neg", a);
+  }
 
-  abs(a: Tensor): Tensor { return this._dispatchUnary("abs", a); }
+  abs(a: Tensor): Tensor {
+    return this._dispatchUnary("abs", a);
+  }
 
-  tanh(a: Tensor): Tensor { return this._dispatchUnary("tanh", a); }
-  sigmoid(a: Tensor): Tensor { return this._dispatchUnary("sigmoid", a); }
+  tanh(a: Tensor): Tensor {
+    return this._dispatchUnary("tanh", a);
+  }
+  sigmoid(a: Tensor): Tensor {
+    return this._dispatchUnary("sigmoid", a);
+  }
 
   gelu(a: Tensor, options?: GeluOptions): Tensor {
     this._assertUsable(a);
@@ -753,11 +868,7 @@ export class Torchlette {
           const clampedInner = this.runtime.where(
             this.runtime.lt(innerVal, -10),
             -10,
-            this.runtime.where(
-              this.runtime.gt(innerVal, 10),
-              10,
-              innerVal,
-            ),
+            this.runtime.where(this.runtime.gt(innerVal, 10), 10, innerVal),
           );
 
           const tanhInner = this.runtime.tanh(clampedInner);
@@ -766,7 +877,10 @@ export class Torchlette {
           const sech2 = this.runtime.sub(1, tanh2);
 
           const pdfTerm = this.runtime.add(1, this.runtime.mul(0.134145, x2));
-          const pdf = this.runtime.mul(this.runtime.mul(0.7978845608, pdfTerm), sech2);
+          const pdf = this.runtime.mul(
+            this.runtime.mul(0.7978845608, pdfTerm),
+            sech2,
+          );
 
           const xPdfHalf = this.runtime.mul(this.runtime.mul(x, pdf), 0.5);
           const geluGrad = this.runtime.add(cdf, xPdfHalf);
@@ -784,10 +898,13 @@ export class Torchlette {
           const savedA = getSaved(0);
           const x = savedA._unwrap();
 
-          const z = this.runtime.mul(x, 0.7071067811865476);
+          const z = this.runtime.mul(x, Math.SQRT1_2);
           const absZ = this.runtime.abs(z);
 
-          const t = this.runtime.div(1, this.runtime.add(1, this.runtime.mul(0.3275911, absZ)));
+          const t = this.runtime.div(
+            1,
+            this.runtime.add(1, this.runtime.mul(0.3275911, absZ)),
+          );
           const t2 = this.runtime.mul(t, t);
           const t3 = this.runtime.mul(t2, t);
           const t4 = this.runtime.mul(t3, t);
@@ -799,7 +916,10 @@ export class Torchlette {
               this.runtime.mul(-0.284496736, t2),
               this.runtime.add(
                 this.runtime.mul(1.421413741, t3),
-                this.runtime.add(this.runtime.mul(-1.453152027, t4), this.runtime.mul(1.061405429, t5)),
+                this.runtime.add(
+                  this.runtime.mul(-1.453152027, t4),
+                  this.runtime.mul(1.061405429, t5),
+                ),
               ),
             ),
           );
@@ -826,37 +946,58 @@ export class Torchlette {
     }
   }
 
-  silu(a: Tensor): Tensor { return this._dispatchUnary("silu", a); }
+  silu(a: Tensor): Tensor {
+    return this._dispatchUnary("silu", a);
+  }
 
-  sin(a: Tensor): Tensor { return this._dispatchUnary("sin", a); }
-  cos(a: Tensor): Tensor { return this._dispatchUnary("cos", a); }
+  sin(a: Tensor): Tensor {
+    return this._dispatchUnary("sin", a);
+  }
+  cos(a: Tensor): Tensor {
+    return this._dispatchUnary("cos", a);
+  }
 
-  rsqrt(a: Tensor): Tensor { return this._dispatchUnary("rsqrt", a); }
-  floor(a: Tensor): Tensor { return this._dispatchUnary("floor", a); }
-  ceil(a: Tensor): Tensor { return this._dispatchUnary("ceil", a); }
-  round(a: Tensor): Tensor { return this._dispatchUnary("round", a); }
-  sign(a: Tensor): Tensor { return this._dispatchUnary("sign", a); }
+  rsqrt(a: Tensor): Tensor {
+    return this._dispatchUnary("rsqrt", a);
+  }
+  floor(a: Tensor): Tensor {
+    return this._dispatchUnary("floor", a);
+  }
+  ceil(a: Tensor): Tensor {
+    return this._dispatchUnary("ceil", a);
+  }
+  round(a: Tensor): Tensor {
+    return this._dispatchUnary("round", a);
+  }
+  sign(a: Tensor): Tensor {
+    return this._dispatchUnary("sign", a);
+  }
 
   clamp(a: Tensor, min: number | null, max: number | null): Tensor {
     this._assertUsable(a);
     const inner = this.runtime.clamp(a._unwrap(), min, max);
     const tensorsToSave = a.requiresGrad ? [a] : [];
     // d/dx clamp(x, min, max) = 1 where min <= x <= max, 0 elsewhere
-    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
-      const savedA = getSaved(0);
-      const x = savedA._unwrap();
-      // Build a mask: 1.0 where x is within [min, max], 0.0 elsewhere
-      let mask = grad;
-      if (min !== null) {
-        const geMin = this.runtime.ge(x, min);
-        mask = this.runtime.mul(mask, geMin);
-      }
-      if (max !== null) {
-        const leMax = this.runtime.le(x, max);
-        mask = this.runtime.mul(mask, leMax);
-      }
-      return [mask];
-    }, tensorsToSave);
+    return this._wrapWithGrad(
+      inner,
+      [a],
+      (grad, getSaved) => {
+        const savedA = getSaved(0);
+        const x = savedA._unwrap();
+        // Build a mask: 1.0 where x is within [min, max], 0.0 elsewhere
+        let mask = grad;
+        if (min !== null) {
+          const geMin = this.runtime.ge(x, min);
+          mask = this.runtime.mul(mask, geMin);
+        }
+        if (max !== null) {
+          const leMax = this.runtime.le(x, max);
+          mask = this.runtime.mul(mask, leMax);
+        }
+        return [mask];
+      },
+      tensorsToSave,
+    );
   }
 
   pow(a: Tensor | number, b: Tensor | number): Tensor {
@@ -866,8 +1007,7 @@ export class Torchlette {
       const inner = this.runtime.pow(a._unwrap(), b._unwrap());
       const aShape = a.shape;
       const bShape = b.shape;
-      const tensorsToSave =
-        a.requiresGrad || b.requiresGrad ? [a, b] : [];
+      const tensorsToSave = a.requiresGrad || b.requiresGrad ? [a, b] : [];
       // d/da pow(a,b) = b * pow(a, b-1), d/db pow(a,b) = pow(a,b) * log(a)
       return this._wrapWithGrad(
         inner,
@@ -880,7 +1020,10 @@ export class Torchlette {
               grad,
               this.runtime.mul(
                 savedB._unwrap(),
-                this.runtime.pow(savedA._unwrap(), this.runtime.sub(savedB._unwrap(), 1)),
+                this.runtime.pow(
+                  savedA._unwrap(),
+                  this.runtime.sub(savedB._unwrap(), 1),
+                ),
               ),
             ),
             aShape,
@@ -909,27 +1052,41 @@ export class Torchlette {
       typeof b === "number" ? b : b._unwrap(),
     );
     const tensorsToSave = tensorInput.requiresGrad ? [tensorInput] : [];
-    return this._wrapWithGrad(inner, [tensorInput], (grad, getSaved) => {
-      const saved = getSaved(0);
-      if (isBaseScalar) {
-        // d/db a^b = a^b * log(a)
-        const powResult = this.runtime.pow(scalarVal, saved._unwrap());
-        return [this._sumToShape(
-          this.runtime.mul(grad, this.runtime.mul(powResult, Math.log(scalarVal))),
-          tensorInput.shape,
-        )];
-      } else {
-        // d/da a^n = n * a^(n-1)
-        const powResult = this.runtime.pow(saved._unwrap(), scalarVal - 1);
-        return [this._sumToShape(
-          this.runtime.mul(grad, this.runtime.mul(scalarVal, powResult)),
-          tensorInput.shape,
-        )];
-      }
-    }, tensorsToSave);
+    return this._wrapWithGrad(
+      inner,
+      [tensorInput],
+      (grad, getSaved) => {
+        const saved = getSaved(0);
+        if (isBaseScalar) {
+          // d/db a^b = a^b * log(a)
+          const powResult = this.runtime.pow(scalarVal, saved._unwrap());
+          return [
+            this._sumToShape(
+              this.runtime.mul(
+                grad,
+                this.runtime.mul(powResult, Math.log(scalarVal)),
+              ),
+              tensorInput.shape,
+            ),
+          ];
+        } else {
+          // d/da a^n = n * a^(n-1)
+          const powResult = this.runtime.pow(saved._unwrap(), scalarVal - 1);
+          return [
+            this._sumToShape(
+              this.runtime.mul(grad, this.runtime.mul(scalarVal, powResult)),
+              tensorInput.shape,
+            ),
+          ];
+        }
+      },
+      tensorsToSave,
+    );
   }
 
-  isfinite(a: Tensor): Tensor { return this._dispatchUnary("isfinite", a); }
+  isfinite(a: Tensor): Tensor {
+    return this._dispatchUnary("isfinite", a);
+  }
 
   softplus(a: Tensor): Tensor {
     this._assertUsable(a);
@@ -949,7 +1106,10 @@ export class Torchlette {
     // fmod(a, b) = a - b * floor(a / b)
     const quotient = this.runtime.div(a._unwrap(), b._unwrap());
     const floored = this.runtime.floor(quotient);
-    const inner = this.runtime.sub(a._unwrap(), this.runtime.mul(b._unwrap(), floored));
+    const inner = this.runtime.sub(
+      a._unwrap(),
+      this.runtime.mul(b._unwrap(), floored),
+    );
     return this._wrap(inner);
   }
 
@@ -977,13 +1137,21 @@ export class Torchlette {
     });
   }
 
-  private _maxMinOp(op: "max" | "min", a: Tensor, options?: MaxOptions): number | Tensor {
+  private _maxMinOp(
+    op: "max" | "min",
+    a: Tensor,
+    options?: MaxOptions,
+  ): number | Tensor {
     this._assertUsable(a);
     const result = this.runtime[op](a._unwrap(), options);
     return typeof result === "number" ? result : this._wrap(result);
   }
-  max(a: Tensor, options?: MaxOptions): number | Tensor { return this._maxMinOp("max", a, options); }
-  min(a: Tensor, options?: MinOptions): number | Tensor { return this._maxMinOp("min", a, options); }
+  max(a: Tensor, options?: MaxOptions): number | Tensor {
+    return this._maxMinOp("max", a, options);
+  }
+  min(a: Tensor, options?: MinOptions): number | Tensor {
+    return this._maxMinOp("min", a, options);
+  }
 
   mean(a: Tensor, options?: MeanOptions): number | Tensor {
     this._assertUsable(a);
@@ -1008,10 +1176,23 @@ export class Torchlette {
     });
   }
 
-  argmax(a: Tensor, options: ArgReduceOptions): Tensor { this._assertUsable(a); return this._wrap(this.runtime.argmax(a._unwrap(), options)); }
-  argmin(a: Tensor, options: ArgReduceOptions): Tensor { this._assertUsable(a); return this._wrap(this.runtime.argmin(a._unwrap(), options)); }
+  argmax(a: Tensor, options: ArgReduceOptions): Tensor {
+    this._assertUsable(a);
+    return this._wrap(this.runtime.argmax(a._unwrap(), options));
+  }
+  argmin(a: Tensor, options: ArgReduceOptions): Tensor {
+    this._assertUsable(a);
+    return this._wrap(this.runtime.argmin(a._unwrap(), options));
+  }
 
-  variance(a: Tensor, options?: { dim?: number | number[] | null; correction?: number; keepdim?: boolean }): Tensor {
+  variance(
+    a: Tensor,
+    options?: {
+      dim?: number | number[] | null;
+      correction?: number;
+      keepdim?: boolean;
+    },
+  ): Tensor {
     this._assertUsable(a);
     const dim = options?.dim ?? null;
     const correction = options?.correction ?? 1;
@@ -1024,17 +1205,27 @@ export class Torchlette {
 
     const aShape = a.shape;
     const dims = this._normalizeDims(dim, aShape.length);
-    const reduceCount = dims.length === 0
-      ? aShape.reduce((acc, s) => acc * s, 1)
-      : dims.reduce((acc, d) => acc * aShape[d], 1);
+    const reduceCount =
+      dims.length === 0
+        ? aShape.reduce((acc, s) => acc * s, 1)
+        : dims.reduce((acc, d) => acc * aShape[d], 1);
     const denom = Math.max(reduceCount - correction, 0);
     if (denom === 0) {
-      throw new Error("variance: correction >= number of elements in reduction");
+      throw new Error(
+        "variance: correction >= number of elements in reduction",
+      );
     }
     return this.div(sumSq, this.runtime.full([], denom, a.dtype, a.device));
   }
 
-  std(a: Tensor, options?: { dim?: number | number[] | null; correction?: number; keepdim?: boolean }): Tensor {
+  std(
+    a: Tensor,
+    options?: {
+      dim?: number | number[] | null;
+      correction?: number;
+      keepdim?: boolean;
+    },
+  ): Tensor {
     return this.sqrt(this.variance(a, options));
   }
 
@@ -1042,16 +1233,32 @@ export class Torchlette {
   // Comparison ops
   // ============================================================================
 
-  private _cmpOp(op: "gt" | "lt" | "ge" | "le" | "eq" | "ne", a: Tensor, b: Tensor): Tensor {
+  private _cmpOp(
+    op: "gt" | "lt" | "ge" | "le" | "eq" | "ne",
+    a: Tensor,
+    b: Tensor,
+  ): Tensor {
     this._assertUsable(a, b);
     return this._wrap(this.runtime[op](a._unwrap(), b._unwrap()));
   }
-  gt(a: Tensor, b: Tensor): Tensor { return this._cmpOp("gt", a, b); }
-  lt(a: Tensor, b: Tensor): Tensor { return this._cmpOp("lt", a, b); }
-  ge(a: Tensor, b: Tensor): Tensor { return this._cmpOp("ge", a, b); }
-  le(a: Tensor, b: Tensor): Tensor { return this._cmpOp("le", a, b); }
-  eq(a: Tensor, b: Tensor): Tensor { return this._cmpOp("eq", a, b); }
-  ne(a: Tensor, b: Tensor): Tensor { return this._cmpOp("ne", a, b); }
+  gt(a: Tensor, b: Tensor): Tensor {
+    return this._cmpOp("gt", a, b);
+  }
+  lt(a: Tensor, b: Tensor): Tensor {
+    return this._cmpOp("lt", a, b);
+  }
+  ge(a: Tensor, b: Tensor): Tensor {
+    return this._cmpOp("ge", a, b);
+  }
+  le(a: Tensor, b: Tensor): Tensor {
+    return this._cmpOp("le", a, b);
+  }
+  eq(a: Tensor, b: Tensor): Tensor {
+    return this._cmpOp("eq", a, b);
+  }
+  ne(a: Tensor, b: Tensor): Tensor {
+    return this._cmpOp("ne", a, b);
+  }
 
   // ============================================================================
   // Fused ops — delegated to frontend-fused-ops.ts
@@ -1066,7 +1273,11 @@ export class Torchlette {
   }
 
   scaledDotProductAttention(
-    q: Tensor, k: Tensor, v: Tensor, scale?: number, isCausal = false,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    scale?: number,
+    isCausal = false,
   ): Tensor {
     return scaledDotProductAttentionImpl(this, q, k, v, scale, isCausal);
   }
@@ -1132,11 +1343,29 @@ export class Torchlette {
     return dst;
   }
 
-  copy_(dst: Tensor, src: Tensor): Tensor { return this._inPlace(dst, () => this.runtime.copy_(dst._unwrap(), src._unwrap()), src); }
-  add_(dst: Tensor, src: Tensor): Tensor { return this._inPlace(dst, () => this.runtime.add_(dst._unwrap(), src._unwrap()), src); }
-  zero_(dst: Tensor): Tensor { return this._inPlace(dst, () => this.runtime.zero_(dst._unwrap())); }
-  fill_(dst: Tensor, value: number): Tensor { return this._inPlace(dst, () => this.runtime.fill_(dst._unwrap(), value)); }
-  mul_(dst: Tensor, value: number): Tensor { return this._inPlace(dst, () => this.runtime.mul_(dst._unwrap(), value)); }
+  copy_(dst: Tensor, src: Tensor): Tensor {
+    return this._inPlace(
+      dst,
+      () => this.runtime.copy_(dst._unwrap(), src._unwrap()),
+      src,
+    );
+  }
+  add_(dst: Tensor, src: Tensor): Tensor {
+    return this._inPlace(
+      dst,
+      () => this.runtime.add_(dst._unwrap(), src._unwrap()),
+      src,
+    );
+  }
+  zero_(dst: Tensor): Tensor {
+    return this._inPlace(dst, () => this.runtime.zero_(dst._unwrap()));
+  }
+  fill_(dst: Tensor, value: number): Tensor {
+    return this._inPlace(dst, () => this.runtime.fill_(dst._unwrap(), value));
+  }
+  mul_(dst: Tensor, value: number): Tensor {
+    return this._inPlace(dst, () => this.runtime.mul_(dst._unwrap(), value));
+  }
 
   // ============================================================================
   // Gather/scatter/where
@@ -1149,9 +1378,7 @@ export class Torchlette {
     const indexInner = index._unwrap();
     return this._wrapWithGrad(inner, [a], (grad, _getSaved) => {
       const z = this.runtime.zeros(aShape);
-      return [
-        this.runtime.scatterAdd(z, indexInner, grad, options),
-      ];
+      return [this.runtime.scatterAdd(z, indexInner, grad, options)];
     });
   }
 
@@ -1190,7 +1417,10 @@ export class Torchlette {
       const zerosTensor = this.runtime.zeros(grad.shape, grad.device);
       const grad_x = this.runtime.where(conditionInner, grad, zerosTensor);
       const grad_y = this.runtime.where(conditionInner, zerosTensor, grad);
-      return [this._sumToShape(grad_x, xShape), this._sumToShape(grad_y, yShape)];
+      return [
+        this._sumToShape(grad_x, xShape),
+        this._sumToShape(grad_y, yShape),
+      ];
     });
   }
 
@@ -1198,7 +1428,9 @@ export class Torchlette {
   // View/reshape/transpose ops
   // ============================================================================
 
-  view(a: Tensor, shape: number[]): Tensor { return this.reshape(a, shape); }
+  view(a: Tensor, shape: number[]): Tensor {
+    return this.reshape(a, shape);
+  }
 
   reshape(a: Tensor, shape: number[]): Tensor {
     this._assertUsable(a);
@@ -1215,9 +1447,12 @@ export class Torchlette {
     let newShape: number[];
     if (dim !== undefined) {
       const d = dim < 0 ? dim + aShape.length : dim;
-      newShape = aShape[d] === 1 ? [...aShape.slice(0, d), ...aShape.slice(d + 1)] : [...aShape];
+      newShape =
+        aShape[d] === 1
+          ? [...aShape.slice(0, d), ...aShape.slice(d + 1)]
+          : [...aShape];
     } else {
-      newShape = aShape.filter(s => s !== 1);
+      newShape = aShape.filter((s) => s !== 1);
     }
     if (newShape.length === aShape.length) return a; // nothing to squeeze
     const inner = this.runtime.reshape(a._unwrap(), newShape);
@@ -1276,9 +1511,9 @@ export class Torchlette {
     if (tensors.length === 0) throw new Error("cat: empty tensor list");
     for (const t of tensors) this._assertUsable(t);
     const d = dim < 0 ? dim + tensors[0].shape.length : dim;
-    const sizes = tensors.map(t => t.shape[d]);
+    const sizes = tensors.map((t) => t.shape[d]);
     const inner = this.runtime.cat(
-      tensors.map(t => t._unwrap()),
+      tensors.map((t) => t._unwrap()),
       { dim: d },
     );
     return this._wrapWithGrad(inner, tensors, (grad, _getSaved) => {
@@ -1294,7 +1529,7 @@ export class Torchlette {
 
   stack(tensors: Tensor[], dim = 0): Tensor {
     if (tensors.length === 0) throw new Error("stack: empty tensor list");
-    const unsqueezed = tensors.map(t => this.unsqueeze(t, dim));
+    const unsqueezed = tensors.map((t) => this.unsqueeze(t, dim));
     return this.cat(unsqueezed, dim);
   }
 
@@ -1367,7 +1602,13 @@ export class Torchlette {
       if (savedSlots.length > 0) {
         this.engine._debug_publishSave(output.baseId);
       }
-      output._setGradNode({ inputs, output, backward, savedSlots, label: this._currentNodeLabel ?? undefined });
+      output._setGradNode({
+        inputs,
+        output,
+        backward,
+        savedSlots,
+        label: this._currentNodeLabel ?? undefined,
+      });
     }
     return output;
   }

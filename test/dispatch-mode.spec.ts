@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { Torchlette } from "../src/frontend";
 import {
   type DispatchMode,
   RuntimeEngine,
   TidyDispatchMode,
 } from "../src/runtime/engine";
 import type { Tensor } from "../src/runtime/tensor";
-import { Torchlette } from "../src/frontend";
 
 describe("dispatch mode infrastructure", () => {
   it("push/pop basic stack operation", () => {
@@ -244,7 +244,7 @@ describe("asyncTidy", () => {
       // Create runtime tensors directly (unwrapped)
       const rt1 = api.runtime.tensorFromArray([1, 2], [2]);
       const rt2 = api.runtime.tensorFromArray([3, 4], [2]);
-      const rt3 = api.runtime.add(rt1, rt2);
+      const _rt3 = api.runtime.add(rt1, rt2);
 
       // Simulate async boundary
       await Promise.resolve();

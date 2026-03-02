@@ -50,16 +50,54 @@ export {
 export type { BaseId } from "../runtime/tensor";
 export { Tensor as RuntimeTensor } from "../runtime/tensor";
 export type {
+  AMPCastNode,
+  AMPPolicy,
+  AutocastConfig,
+  AutocastContext,
+  CompiledRegionAMPState,
+  SelectGatedResult,
+} from "./amp";
+export {
+  captureRegionAMPState,
+  computeInputCasts,
+  computeOutputCast,
+  computeSelectGatedDtype,
+  createAutocastContext,
+  DEFAULT_AMP_POLICY,
+  DISABLED_AMP_POLICY,
+  F16_ELIGIBLE_OPS,
+  F32_REQUIRED_OPS,
+  hashAMPPolicy,
+  popAutocast,
+  pushAutocast,
+} from "./amp";
+export type { AMPTransformResult } from "./amp-ir-transform";
+export {
+  applyAMPTransform,
+  getAMPStats,
+  isAMPTransformed,
+} from "./amp-ir-transform";
+export type {
   CompiledCacheEntry,
   CompiledCacheKey,
   InputSignature,
 } from "./compile-cache";
 export {
+  CANONICAL_NAN_BITS,
   CompiledCache,
+  canonicalizeF64Bits,
+  encodeF64LE,
   generateCacheKey,
   hashIRGraph,
   serializeCacheKey,
 } from "./compile-cache";
+export type { OpDtypeCategory } from "./dtype-rules";
+export {
+  F16_ELIGIBLE,
+  F32_REQUIRED,
+  OP_DTYPE_RULES,
+  promoteDtype,
+} from "./dtype-rules";
 export type {
   BaseBindingSnapshot,
   BaseDebugState,
@@ -69,28 +107,36 @@ export type {
   DebugSimulatedState,
   DebugSnapshot,
   EngineMemoryStats,
+  EventKey,
+  EventKind,
   FinalizeRecord,
   LocDebugState,
   LocId,
   LocRole,
   MemorySnapshot,
   MemoryStatsProvider,
+  PlanEvent,
   PredictedStateDelta,
   RngBasis,
   RngDrawRecord,
   RngDrawResult,
   SavedTensorInfo,
   SavedTensorRecord,
+  SemanticSubevent,
+  SemanticSubeventSchedule,
   TensorOrigin,
   TokenSnapshot,
   TraceTensor,
 } from "./engine";
 export {
   AsyncInCompileError,
+  buildPlanLinearOrder,
   CheckpointImpureRegionError,
+  compareEventKey,
   Engine,
   EngineBusyError,
   EngineTensor,
+  expandSemanticSubeventSchedule,
   HostReadInCompileError,
   InvalidTraceTensorEscapeError,
   NonReentrantBackwardError,
@@ -136,25 +182,7 @@ export {
   resetNodeIdCounter,
   resetStorageIdCounter,
 } from "./lazy";
-export type {
-  EventKey,
-  EventKind,
-  PlanEvent,
-  SemanticSubevent,
-  SemanticSubeventSchedule,
-} from "./engine";
-export {
-  buildPlanLinearOrder,
-  compareEventKey,
-  expandSemanticSubeventSchedule,
-} from "./engine";
-export { CANONICAL_NAN_BITS, canonicalizeF64Bits, encodeF64LE } from "./compile-cache";
-export type { Token, TokenId, TokenKind } from "./tokens";
-export type { TraceEvent } from "./trace";
-export { TraceRecorder } from "./trace";
-export type {
-  TensorLifetime,
-} from "./lifetime-analysis";
+export type { TensorLifetime } from "./lifetime-analysis";
 export {
   analyzeLifetimes,
   computeBufferSize,
@@ -162,33 +190,6 @@ export {
   getSizeClass,
   getSizeForClass,
 } from "./lifetime-analysis";
-export type {
-  AMPCastNode,
-  AMPPolicy,
-  AutocastConfig,
-  AutocastContext,
-  CompiledRegionAMPState,
-  SelectGatedResult,
-} from "./amp";
-export {
-  captureRegionAMPState,
-  computeInputCasts,
-  computeOutputCast,
-  computeSelectGatedDtype,
-  createAutocastContext,
-  DEFAULT_AMP_POLICY,
-  DISABLED_AMP_POLICY,
-  F16_ELIGIBLE_OPS,
-  F32_REQUIRED_OPS,
-  hashAMPPolicy,
-  popAutocast,
-  pushAutocast,
-} from "./amp";
-export type { OpDtypeCategory } from "./dtype-rules";
-export { OP_DTYPE_RULES, promoteDtype, F16_ELIGIBLE, F32_REQUIRED } from "./dtype-rules";
-export type { AMPTransformResult } from "./amp-ir-transform";
-export {
-  applyAMPTransform,
-  getAMPStats,
-  isAMPTransformed,
-} from "./amp-ir-transform";
+export type { Token, TokenId, TokenKind } from "./tokens";
+export type { TraceEvent } from "./trace";
+export { TraceRecorder } from "./trace";

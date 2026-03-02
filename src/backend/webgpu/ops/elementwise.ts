@@ -8,9 +8,9 @@ import type {
   GeluOptions,
   SubOptions,
 } from "../../types";
+import { dispatchBinary, dispatchUnary } from "../dispatch";
 import type { GPUBuffer } from "../gpu-types";
 import { asGPUTensor } from "../gpu-types";
-import { dispatchBinary, dispatchUnary } from "../dispatch";
 
 export function add(
   a: BackendTensor,

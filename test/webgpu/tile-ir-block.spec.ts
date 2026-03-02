@@ -16,21 +16,25 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  beginSharedEncoder,
+  flushSharedEncoder,
   getWebGPUDevice,
   initWebGPU,
   syncWebGPU,
-  beginSharedEncoder,
-  flushSharedEncoder,
 } from "../../src/backend/webgpu";
-import { createTileKernelDispatcher } from "../../src/backend/webgpu/tile-dispatch";
-import { compileTileKernel } from "../../src/backend/webgpu/tile-compiler";
-import type { TileKernelSpec } from "../../src/backend/webgpu/tile-ir";
-import { BlockOps, Block } from "../../src/backend/webgpu/tile-ops";
-import type { GPUBuffer, GPUDevice, GPUQueue } from "../../src/backend/webgpu/gpu-types";
+import type {
+  GPUBuffer,
+  GPUDevice,
+  GPUQueue,
+} from "../../src/backend/webgpu/gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "../../src/backend/webgpu/gpu-types";
 import { createTiledMatmulKernel } from "../../src/backend/webgpu/matmul/tile-matmul";
-import { DEFAULT_CONFIG } from "../../src/backend/webgpu/matmul/types";
 import type { EpilogueConfig } from "../../src/backend/webgpu/matmul/types";
+import { DEFAULT_CONFIG } from "../../src/backend/webgpu/matmul/types";
+import { compileTileKernel } from "../../src/backend/webgpu/tile-compiler";
+import { createTileKernelDispatcher } from "../../src/backend/webgpu/tile-dispatch";
+import type { TileKernelSpec } from "../../src/backend/webgpu/tile-ir";
+import { BlockOps } from "../../src/backend/webgpu/tile-ops";
 
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -61,7 +65,10 @@ function makeOutputBuffer(numElements: number): GPUBuffer {
   });
 }
 
-async function readF32Buffer(buf: GPUBuffer, count: number): Promise<Float32Array> {
+async function readF32Buffer(
+  buf: GPUBuffer,
+  count: number,
+): Promise<Float32Array> {
   const staging = device.createBuffer({
     size: count * 4,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -89,7 +96,7 @@ function makeLoadStoreSpec(D: number): TileKernelSpec {
     name: `blockLoadStore_D${D}`,
     workgroupSize: 64,
     bindings: {
-      input:  { storage: "read", type: "f32" },
+      input: { storage: "read", type: "f32" },
       output: { storage: "read_write", type: "f32" },
     },
     uniforms: { N: "u32", D: "u32" },
@@ -105,7 +112,8 @@ function makeLoadStoreSpec(D: number): TileKernelSpec {
       const base = row.mul(Dim);
 
       // Load one row per thread
-      const data = ops.load("input",
+      const data = ops.load(
+        "input",
         { kind: "thread", base, stride: Dim },
         { rows: 1, cols: D, guard: valid },
       );
@@ -125,8 +133,8 @@ function makeDotQKTSpec(D: number, BC: number): TileKernelSpec {
     name: "blockDotQKT",
     workgroupSize: 64,
     bindings: {
-      Q:      { storage: "read", type: "f32" },
-      K:      { storage: "read", type: "f32" },
+      Q: { storage: "read", type: "f32" },
+      K: { storage: "read", type: "f32" },
       output: { storage: "read_write", type: "f32" },
     },
     uniforms: { N: "u32", D: "u32", BC: "u32" },
@@ -141,7 +149,8 @@ function makeDotQKTSpec(D: number, BC: number): TileKernelSpec {
       const valid = row.lt(N);
 
       // Q row in registers [1×D]
-      const q = ops.load("Q",
+      const q = ops.load(
+        "Q",
         { kind: "thread", base: row.mul(Dim), stride: Dim },
         { rows: 1, cols: D, guard: valid },
       );
@@ -155,7 +164,8 @@ function makeDotQKTSpec(D: number, BC: number): TileKernelSpec {
         base: ctx.u32(0).node,
         size: D,
       };
-      const k = ops.load("K",
+      const k = ops.load(
+        "K",
         {
           kind: "tile",
           baseOffset: ctx.u32(0),
@@ -174,7 +184,9 @@ function makeDotQKTSpec(D: number, BC: number): TileKernelSpec {
       const scores = ops.dot(q, k.T());
 
       // Store scores
-      ops.store("output", scores,
+      ops.store(
+        "output",
+        scores,
         { base: row.mul(ctx.u32(BC)), stride: ctx.u32(BC) },
         { guard: valid },
       );
@@ -191,8 +203,8 @@ function makeDotPVSpec(D: number, BC: number): TileKernelSpec {
     name: "blockDotPV",
     workgroupSize: 64,
     bindings: {
-      P:      { storage: "read", type: "f32" },
-      V:      { storage: "read", type: "f32" },
+      P: { storage: "read", type: "f32" },
+      V: { storage: "read", type: "f32" },
       output: { storage: "read_write", type: "f32" },
     },
     uniforms: { N: "u32", D: "u32", BC: "u32" },
@@ -208,7 +220,8 @@ function makeDotPVSpec(D: number, BC: number): TileKernelSpec {
       const valid = row.lt(N);
 
       // P row in registers [1×BC]
-      const p = ops.load("P",
+      const p = ops.load(
+        "P",
         { kind: "thread", base: row.mul(BCu), stride: BCu },
         { rows: 1, cols: BC, guard: valid },
       );
@@ -222,7 +235,8 @@ function makeDotPVSpec(D: number, BC: number): TileKernelSpec {
         base: ctx.u32(0).node,
         size: D,
       };
-      const v = ops.load("V",
+      const v = ops.load(
+        "V",
         {
           kind: "tile",
           baseOffset: ctx.u32(0),
@@ -241,7 +255,9 @@ function makeDotPVSpec(D: number, BC: number): TileKernelSpec {
       const out = ops.dot(p, v);
 
       // Store output
-      ops.store("output", out,
+      ops.store(
+        "output",
+        out,
         { base: row.mul(Dim), stride: Dim },
         { guard: valid },
       );
@@ -258,7 +274,7 @@ function makeSoftmaxSpec(D: number): TileKernelSpec {
     name: "blockSoftmax",
     workgroupSize: 64,
     bindings: {
-      input:  { storage: "read", type: "f32" },
+      input: { storage: "read", type: "f32" },
       output: { storage: "read_write", type: "f32" },
     },
     uniforms: { N: "u32", D: "u32" },
@@ -274,19 +290,20 @@ function makeSoftmaxSpec(D: number): TileKernelSpec {
       const base = row.mul(Dim);
 
       // Load row [1×D]
-      const x = ops.load("input",
+      const x = ops.load(
+        "input",
         { kind: "thread", base, stride: Dim },
         { rows: 1, cols: D, guard: valid },
       );
 
       // Softmax: max → subtract → exp → sum → divide
-      const maxVal = x.max(1);           // [1×1]
-      const shifted = x.sub(maxVal);     // [1×D] - [1×1] broadcasts
-      const exped = shifted.exp();       // [1×D] exp (not in-place, returns new)
+      const maxVal = x.max(1); // [1×1]
+      const shifted = x.sub(maxVal); // [1×D] - [1×1] broadcasts
+      const exped = shifted.exp(); // [1×D] exp (not in-place, returns new)
       // Wait, .exp() returns new Block, but we need in-place for plan matching.
       // Actually for this test both work. Let's use the functional style.
-      const sumVal = exped.sum(1);       // [1×1]
-      const result = exped.div(sumVal);  // [1×D] / [1×1] broadcasts
+      const sumVal = exped.sum(1); // [1×1]
+      const result = exped.div(sumVal); // [1×D] / [1×1] broadcasts
 
       ops.store("output", result, { base, stride: Dim }, { guard: valid });
     },
@@ -311,14 +328,14 @@ describe("Block API WGSL compilation", () => {
     // Should have shared memory for K tile
     expect(wgsl).toContain("var<workgroup>");
     // Should have the dot inner product accumulation
-    expect(wgsl).toContain("_s");  // accumulator variable
+    expect(wgsl).toContain("_s"); // accumulator variable
   });
 
   it("dot PV compiles", () => {
     const wgsl = compileTileKernel(makeDotPVSpec(8, 4));
     expect(wgsl).toContain("var<workgroup>");
     // Should have the PV inner product loop reading p
-    expect(wgsl).toContain("_p");  // p scalar read
+    expect(wgsl).toContain("_p"); // p scalar read
   });
 
   it("softmax compiles with reduce + broadcast", () => {
@@ -406,7 +423,7 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
     const kData = new Float32Array(BC * D);
     for (let r = 0; r < BC; r++) {
       for (let d = 0; d < D; d++) {
-        kData[r * D + d] = (r === d % BC) ? 1.0 : 0.0;
+        kData[r * D + d] = r === d % BC ? 1.0 : 0.0;
       }
     }
 
@@ -507,7 +524,8 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
     const expected = new Float32Array(N * D);
     for (let n = 0; n < N; n++) {
       let maxVal = -Infinity;
-      for (let d = 0; d < D; d++) maxVal = Math.max(maxVal, inputData[n * D + d]);
+      for (let d = 0; d < D; d++)
+        maxVal = Math.max(maxVal, inputData[n * D + d]);
       let sum = 0;
       for (let d = 0; d < D; d++) {
         expected[n * D + d] = Math.exp(inputData[n * D + d] - maxVal);
@@ -546,7 +564,7 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
       name: "blockInPlace",
       workgroupSize: 64,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: { N: "u32" },
@@ -560,14 +578,15 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
         const valid = row.lt(N_);
         const base = row.mul(ctx.u32(D));
 
-        const x = ops.load("input",
+        const x = ops.load(
+          "input",
           { kind: "thread", base, stride: ctx.u32(D) },
           { rows: 1, cols: D, guard: valid },
         );
 
-        x.mul_(ctx.f32(2.0));  // x *= 2.0
-        x.sub_(ctx.f32(0.5));  // x -= 0.5
-        x.exp_();              // x = exp(x)
+        x.mul_(ctx.f32(2.0)); // x *= 2.0
+        x.sub_(ctx.f32(0.5)); // x -= 0.5
+        x.exp_(); // x = exp(x)
 
         ops.store("output", x, { base, stride: ctx.u32(D) }, { guard: valid });
       },
@@ -612,8 +631,8 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
       name: "blockAssign",
       workgroupSize: 64,
       bindings: {
-        a:      { storage: "read", type: "f32" },
-        b:      { storage: "read", type: "f32" },
+        a: { storage: "read", type: "f32" },
+        b: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: { N: "u32" },
@@ -628,17 +647,19 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
         const Dim = ctx.u32(D);
         const base = row.mul(Dim);
 
-        const aBlock = ops.load("a",
+        const aBlock = ops.load(
+          "a",
           { kind: "thread", base, stride: Dim },
           { rows: 1, cols: D, guard: valid },
         );
-        const bBlock = ops.load("b",
+        const bBlock = ops.load(
+          "b",
           { kind: "thread", base, stride: Dim },
           { rows: 1, cols: D, guard: valid },
         );
 
-        aBlock.assign(bBlock);     // a = b
-        aBlock.addAssign(bBlock);  // a += b → a = 2*b
+        aBlock.assign(bBlock); // a = b
+        aBlock.addAssign(bBlock); // a += b → a = 2*b
 
         ops.store("output", aBlock, { base, stride: Dim }, { guard: valid });
       },
@@ -705,10 +726,10 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
       name: "blockDotAccum",
       workgroupSize: 64,
       bindings: {
-        P1:     { storage: "read", type: "f32" },
-        V1:     { storage: "read", type: "f32" },
-        P2:     { storage: "read", type: "f32" },
-        V2:     { storage: "read", type: "f32" },
+        P1: { storage: "read", type: "f32" },
+        V1: { storage: "read", type: "f32" },
+        P2: { storage: "read", type: "f32" },
+        V2: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: { N: "u32" },
@@ -724,28 +745,42 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
         const Dim = ctx.u32(D);
 
         // Load P1, P2 per-thread
-        const p1 = ops.load("P1",
+        const p1 = ops.load(
+          "P1",
           { kind: "thread", base: row.mul(BCu), stride: BCu },
           { rows: 1, cols: BC, guard: valid },
         );
-        const p2 = ops.load("P2",
+        const p2 = ops.load(
+          "P2",
           { kind: "thread", base: row.mul(BCu), stride: BCu },
           { rows: 1, cols: BC, guard: valid },
         );
 
         // V1 tile
-        const bRange: import("../../src/backend/webgpu/tile-ir").TileRangeInfo = {
-          base: ctx.u32(0).node, size: BC,
-        };
-        const dRange: import("../../src/backend/webgpu/tile-ir").TileRangeInfo = {
-          base: ctx.u32(0).node, size: D,
-        };
-        const v1 = ops.load("V1", {
-          kind: "tile", baseOffset: ctx.u32(0),
-          outerRange: bRange, innerRange: dRange,
-          outerStride: Dim, innerStride: ctx.u32(1),
-          outerBound: ctx.u32(BC), innerBound: Dim,
-        }, { rows: BC, cols: D });
+        const bRange: import("../../src/backend/webgpu/tile-ir").TileRangeInfo =
+          {
+            base: ctx.u32(0).node,
+            size: BC,
+          };
+        const dRange: import("../../src/backend/webgpu/tile-ir").TileRangeInfo =
+          {
+            base: ctx.u32(0).node,
+            size: D,
+          };
+        const v1 = ops.load(
+          "V1",
+          {
+            kind: "tile",
+            baseOffset: ctx.u32(0),
+            outerRange: bRange,
+            innerRange: dRange,
+            outerStride: Dim,
+            innerStride: ctx.u32(1),
+            outerBound: ctx.u32(BC),
+            innerBound: Dim,
+          },
+          { rows: BC, cols: D },
+        );
         ctx.barrier();
 
         // acc = P1 @ V1
@@ -753,19 +788,28 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
         ctx.barrier();
 
         // Load V2
-        const v2 = ops.load("V2", {
-          kind: "tile", baseOffset: ctx.u32(0),
-          outerRange: { base: ctx.u32(0).node, size: BC },
-          innerRange: { base: ctx.u32(0).node, size: D },
-          outerStride: Dim, innerStride: ctx.u32(1),
-          outerBound: ctx.u32(BC), innerBound: Dim,
-        }, { rows: BC, cols: D });
+        const v2 = ops.load(
+          "V2",
+          {
+            kind: "tile",
+            baseOffset: ctx.u32(0),
+            outerRange: { base: ctx.u32(0).node, size: BC },
+            innerRange: { base: ctx.u32(0).node, size: D },
+            outerStride: Dim,
+            innerStride: ctx.u32(1),
+            outerBound: ctx.u32(BC),
+            innerBound: Dim,
+          },
+          { rows: BC, cols: D },
+        );
         ctx.barrier();
 
         // acc += P2 @ V2
         ops.dotAccum(p2, v2, acc);
 
-        ops.store("output", acc,
+        ops.store(
+          "output",
+          acc,
           { base: row.mul(Dim), stride: Dim },
           { guard: valid },
         );
@@ -780,7 +824,10 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
 
     const kernel = createTileKernelDispatcher(spec);
     beginSharedEncoder();
-    kernel.dispatch({ P1: p1Buf, V1: v1Buf, P2: p2Buf, V2: v2Buf, output: outBuf }, { N });
+    kernel.dispatch(
+      { P1: p1Buf, V1: v1Buf, P2: p2Buf, V2: v2Buf, output: outBuf },
+      { N },
+    );
     flushSharedEncoder();
 
     const result = await readF32Buffer(outBuf, N * D);
@@ -796,11 +843,16 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
   });
 
   it("shared×shared dot: 32×32×16 outer product (t4×4)", async () => {
-    const tileM = 32, tileN = 32, tileK = 16;
-    const ttM = 4, ttN = 4;
+    const tileM = 32,
+      tileN = 32,
+      tileK = 16;
+    const ttM = 4,
+      ttN = 4;
     const wgX = tileN / ttN; // 8
     const wgY = tileM / ttM; // 8
-    const M = tileM, N = tileN, K = tileK;
+    const M = tileM,
+      N = tileN,
+      K = tileK;
 
     const aData = new Float32Array(M * K);
     const bData = new Float32Array(K * N);
@@ -821,8 +873,8 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
       name: "blockSharedDot",
       workgroupSize: [wgX, wgY],
       bindings: {
-        A:   { storage: "read", type: "f32" },
-        B:   { storage: "read", type: "f32" },
+        A: { storage: "read", type: "f32" },
+        B: { storage: "read", type: "f32" },
         out: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
@@ -837,32 +889,56 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
         const threadCol = ctx.emitLet("thread_col", ctx.threadIdx(0));
 
         // Cooperative load A [tileM × tileK] → shared
-        const aRange: import("../../src/backend/webgpu/tile-ir").TileRangeInfo = {
-          base: ctx.u32(0).node, size: tileM,
-        };
-        const kRange: import("../../src/backend/webgpu/tile-ir").TileRangeInfo = {
-          base: ctx.u32(0).node, size: tileK,
-        };
-        const a = ops.load("A", {
-          kind: "tile", baseOffset: ctx.u32(0),
-          outerRange: aRange, innerRange: kRange,
-          outerStride: ctx.u32(K), innerStride: ctx.u32(1),
-          outerBound: ctx.u32(M), innerBound: ctx.u32(K),
-        }, { rows: tileM, cols: tileK });
+        const aRange: import("../../src/backend/webgpu/tile-ir").TileRangeInfo =
+          {
+            base: ctx.u32(0).node,
+            size: tileM,
+          };
+        const kRange: import("../../src/backend/webgpu/tile-ir").TileRangeInfo =
+          {
+            base: ctx.u32(0).node,
+            size: tileK,
+          };
+        const a = ops.load(
+          "A",
+          {
+            kind: "tile",
+            baseOffset: ctx.u32(0),
+            outerRange: aRange,
+            innerRange: kRange,
+            outerStride: ctx.u32(K),
+            innerStride: ctx.u32(1),
+            outerBound: ctx.u32(M),
+            innerBound: ctx.u32(K),
+          },
+          { rows: tileM, cols: tileK },
+        );
 
         // Cooperative load B [tileK × tileN] → shared
-        const bRange: import("../../src/backend/webgpu/tile-ir").TileRangeInfo = {
-          base: ctx.u32(0).node, size: tileK,
-        };
-        const nRange: import("../../src/backend/webgpu/tile-ir").TileRangeInfo = {
-          base: ctx.u32(0).node, size: tileN,
-        };
-        const b = ops.load("B", {
-          kind: "tile", baseOffset: ctx.u32(0),
-          outerRange: bRange, innerRange: nRange,
-          outerStride: ctx.u32(N), innerStride: ctx.u32(1),
-          outerBound: ctx.u32(K), innerBound: ctx.u32(N),
-        }, { rows: tileK, cols: tileN });
+        const bRange: import("../../src/backend/webgpu/tile-ir").TileRangeInfo =
+          {
+            base: ctx.u32(0).node,
+            size: tileK,
+          };
+        const nRange: import("../../src/backend/webgpu/tile-ir").TileRangeInfo =
+          {
+            base: ctx.u32(0).node,
+            size: tileN,
+          };
+        const b = ops.load(
+          "B",
+          {
+            kind: "tile",
+            baseOffset: ctx.u32(0),
+            outerRange: bRange,
+            innerRange: nRange,
+            outerStride: ctx.u32(N),
+            innerStride: ctx.u32(1),
+            outerBound: ctx.u32(K),
+            innerBound: ctx.u32(N),
+          },
+          { rows: tileK, cols: tileN },
+        );
 
         // Outer product: acc = A @ B
         const acc = ops.dot(a, b);
@@ -907,11 +983,16 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
   });
 
   it("shared×shared dotAccum: K-loop over multiple tiles", async () => {
-    const tileM = 32, tileN = 32, tileK = 16;
-    const ttM = 4, ttN = 4;
+    const tileM = 32,
+      tileN = 32,
+      tileK = 16;
+    const ttM = 4,
+      ttN = 4;
     const wgX = tileN / ttN; // 8
     const wgY = tileM / ttM; // 8
-    const M = tileM, N = tileN, K = 48; // K > tileK, needs multiple tiles
+    const M = tileM,
+      N = tileN,
+      K = 48; // K > tileK, needs multiple tiles
 
     const aData = new Float32Array(M * K);
     const bData = new Float32Array(K * N);
@@ -932,8 +1013,8 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
       name: "blockSharedDotAccum",
       workgroupSize: [wgX, wgY],
       bindings: {
-        A:   { storage: "read", type: "f32" },
-        B:   { storage: "read", type: "f32" },
+        A: { storage: "read", type: "f32" },
+        B: { storage: "read", type: "f32" },
         out: { storage: "read_write", type: "f32" },
       },
       uniforms: { M: "u32", N: "u32", K: "u32" },
@@ -946,28 +1027,44 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
         const threadRow = ctx.emitLet("thread_row", ctx.threadIdx(1));
         const threadCol = ctx.emitLet("thread_col", ctx.threadIdx(0));
         const Ku = ctx.uniform("K");
-        const numTiles = ctx.emitLet("num_tiles",
-          Ku.add(ctx.u32(tileK - 1)).div(ctx.u32(tileK)));
+        const numTiles = ctx.emitLet(
+          "num_tiles",
+          Ku.add(ctx.u32(tileK - 1)).div(ctx.u32(tileK)),
+        );
 
         const acc = ops.zeros(ttM, ttN);
 
         ctx.forRange(ctx.u32(0), numTiles, (kTile) => {
           const kOff = kTile.mul(ctx.u32(tileK));
-          const a = ops.load("A", {
-            kind: "tile", baseOffset: ctx.u32(0),
-            outerRange: { base: ctx.u32(0).node, size: tileM },
-            innerRange: { base: kOff.node, size: tileK },
-            outerStride: Ku, innerStride: ctx.u32(1),
-            outerBound: ctx.u32(M), innerBound: Ku,
-          }, { rows: tileM, cols: tileK });
+          const a = ops.load(
+            "A",
+            {
+              kind: "tile",
+              baseOffset: ctx.u32(0),
+              outerRange: { base: ctx.u32(0).node, size: tileM },
+              innerRange: { base: kOff.node, size: tileK },
+              outerStride: Ku,
+              innerStride: ctx.u32(1),
+              outerBound: ctx.u32(M),
+              innerBound: Ku,
+            },
+            { rows: tileM, cols: tileK },
+          );
 
-          const b = ops.load("B", {
-            kind: "tile", baseOffset: ctx.u32(0),
-            outerRange: { base: kOff.node, size: tileK },
-            innerRange: { base: ctx.u32(0).node, size: tileN },
-            outerStride: ctx.u32(N), innerStride: ctx.u32(1),
-            outerBound: Ku, innerBound: ctx.u32(N),
-          }, { rows: tileK, cols: tileN });
+          const b = ops.load(
+            "B",
+            {
+              kind: "tile",
+              baseOffset: ctx.u32(0),
+              outerRange: { base: kOff.node, size: tileK },
+              innerRange: { base: ctx.u32(0).node, size: tileN },
+              outerStride: ctx.u32(N),
+              innerStride: ctx.u32(1),
+              outerBound: Ku,
+              innerBound: ctx.u32(N),
+            },
+            { rows: tileK, cols: tileN },
+          );
 
           ops.dotAccum(a, b, acc);
         });
@@ -1023,7 +1120,8 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
     // Let's test with a small block that fits in registers
 
     // Simpler test: load a [4×8] block per thread, reduce axis=0 → [1×8]
-    const ROWS = 4, COLS = 8;
+    const ROWS = 4,
+      COLS = 8;
     const data = new Float32Array(ROWS * COLS);
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
@@ -1041,7 +1139,7 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
       name: "blockReduceAxis0",
       workgroupSize: 1,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
@@ -1049,13 +1147,16 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
       kernel(ctx) {
         const ops = new BlockOps(ctx, { wgSize: 1 });
         // Load all ROWS×COLS into a register block
-        const block = ops.load("input",
+        const block = ops.load(
+          "input",
           { kind: "thread", base: ctx.u32(0), stride: ctx.u32(COLS) },
           { rows: ROWS, cols: COLS },
         );
         const reduced = block.sum(0); // [1×COLS]
-        ops.store("output", reduced,
-          { base: ctx.u32(0), stride: ctx.u32(COLS) });
+        ops.store("output", reduced, {
+          base: ctx.u32(0),
+          stride: ctx.u32(COLS),
+        });
       },
     };
 
@@ -1077,7 +1178,8 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
   });
 
   it("axis=0 reduce (max columns)", async () => {
-    const ROWS = 4, COLS = 8;
+    const ROWS = 4,
+      COLS = 8;
     const data = new Float32Array(ROWS * COLS);
     for (let r = 0; r < ROWS; r++) {
       for (let c = 0; c < COLS; c++) {
@@ -1095,20 +1197,23 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
       name: "blockReduceAxis0Max",
       workgroupSize: 1,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
       grid: () => [1],
       kernel(ctx) {
         const ops = new BlockOps(ctx, { wgSize: 1 });
-        const block = ops.load("input",
+        const block = ops.load(
+          "input",
           { kind: "thread", base: ctx.u32(0), stride: ctx.u32(COLS) },
           { rows: ROWS, cols: COLS },
         );
         const reduced = block.max(0); // [1×COLS]
-        ops.store("output", reduced,
-          { base: ctx.u32(0), stride: ctx.u32(COLS) });
+        ops.store("output", reduced, {
+          base: ctx.u32(0),
+          stride: ctx.u32(COLS),
+        });
       },
     };
 
@@ -1145,15 +1250,16 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
       name: "blockNegLog",
       workgroupSize: 1,
       bindings: {
-        input:    { storage: "read", type: "f32" },
-        outNeg:   { storage: "read_write", type: "f32" },
-        outLog:   { storage: "read_write", type: "f32" },
+        input: { storage: "read", type: "f32" },
+        outNeg: { storage: "read_write", type: "f32" },
+        outLog: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
       grid: () => [1],
       kernel(ctx) {
         const ops = new BlockOps(ctx, { wgSize: 1 });
-        const x = ops.load("input",
+        const x = ops.load(
+          "input",
           { kind: "thread", base: ctx.u32(0), stride: ctx.u32(D) },
           { rows: 1, cols: D },
         );
@@ -1200,19 +1306,21 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
       name: "blockElemMax",
       workgroupSize: 1,
       bindings: {
-        a:      { storage: "read", type: "f32" },
-        b:      { storage: "read", type: "f32" },
+        a: { storage: "read", type: "f32" },
+        b: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
       grid: () => [1],
       kernel(ctx) {
         const ops = new BlockOps(ctx, { wgSize: 1 });
-        const aBlock = ops.load("a",
+        const aBlock = ops.load(
+          "a",
           { kind: "thread", base: ctx.u32(0), stride: ctx.u32(D) },
           { rows: 1, cols: D },
         );
-        const bBlock = ops.load("b",
+        const bBlock = ops.load(
+          "b",
           { kind: "thread", base: ctx.u32(0), stride: ctx.u32(D) },
           { rows: 1, cols: D },
         );
@@ -1286,14 +1394,15 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
       name: "blockApplyRelu",
       workgroupSize: 1,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
       grid: () => [1],
       kernel(ctx) {
         const ops = new BlockOps(ctx, { wgSize: 1 });
-        const x = ops.load("input",
+        const x = ops.load(
+          "input",
           { kind: "thread", base: ctx.u32(0), stride: ctx.u32(D) },
           { rows: 1, cols: D },
         );
@@ -1324,268 +1433,333 @@ describe.runIf(isWebGPUEnabled)("Block API GPU dispatch", () => {
 // Block API Matmul Epilogue Tests
 // ============================================================================
 
-describe.runIf(isWebGPUEnabled)("Block API matmul epilogue (BlockOps path)", () => {
-  const origEnv = process.env.TORCHLETTE_BLOCK_MATMUL;
+describe.runIf(isWebGPUEnabled)(
+  "Block API matmul epilogue (BlockOps path)",
+  () => {
+    const origEnv = process.env.TORCHLETTE_BLOCK_MATMUL;
 
-  beforeAll(async () => {
-    process.env.TORCHLETTE_BLOCK_MATMUL = "1";
-    if (!device) {
-      const ok = await initWebGPU();
-      if (ok) {
-        device = getWebGPUDevice() as GPUDevice;
-        queue = device.queue;
+    beforeAll(async () => {
+      process.env.TORCHLETTE_BLOCK_MATMUL = "1";
+      if (!device) {
+        const ok = await initWebGPU();
+        if (ok) {
+          device = getWebGPUDevice() as GPUDevice;
+          queue = device.queue;
+        }
       }
-    }
-  });
+    });
 
-  afterAll(() => {
-    if (origEnv === undefined) delete process.env.TORCHLETTE_BLOCK_MATMUL;
-    else process.env.TORCHLETTE_BLOCK_MATMUL = origEnv;
-  });
+    afterAll(() => {
+      if (origEnv === undefined) delete process.env.TORCHLETTE_BLOCK_MATMUL;
+      else process.env.TORCHLETTE_BLOCK_MATMUL = origEnv;
+    });
 
-  // Tile-aligned size: 32×32 fits exactly in one workgroup with DEFAULT_CONFIG
-  const M = 32, N = 32, K = 32;
-  const config = DEFAULT_CONFIG;
-  const baseUniforms = {
-    m: M, n: N, k: K,
-    lda: K, ldb: N, ldc: N,
-    alpha: 1.0,
-    batchSize: 1, batchStrideA: 0, batchStrideB: 0, batchStrideC: 0,
-  };
+    // Tile-aligned size: 32×32 fits exactly in one workgroup with DEFAULT_CONFIG
+    const M = 32,
+      N = 32,
+      K = 32;
+    const config = DEFAULT_CONFIG;
+    const baseUniforms = {
+      m: M,
+      n: N,
+      k: K,
+      lda: K,
+      ldb: N,
+      ldc: N,
+      alpha: 1.0,
+      batchSize: 1,
+      batchStrideA: 0,
+      batchStrideB: 0,
+      batchStrideC: 0,
+    };
 
-  function cpuMatmul(aData: Float32Array, bData: Float32Array): Float32Array {
-    const out = new Float32Array(M * N);
-    for (let m = 0; m < M; m++) {
-      for (let n = 0; n < N; n++) {
-        let s = 0;
-        for (let k = 0; k < K; k++) s += aData[m * K + k] * bData[k * N + n];
-        out[m * N + n] = s;
+    function cpuMatmul(aData: Float32Array, bData: Float32Array): Float32Array {
+      const out = new Float32Array(M * N);
+      for (let m = 0; m < M; m++) {
+        for (let n = 0; n < N; n++) {
+          let s = 0;
+          for (let k = 0; k < K; k++) s += aData[m * K + k] * bData[k * N + n];
+          out[m * N + n] = s;
+        }
       }
-    }
-    return out;
-  }
-
-  function makeTestData() {
-    const aData = new Float32Array(M * K);
-    const bData = new Float32Array(K * N);
-    for (let i = 0; i < M * K; i++) aData[i] = Math.sin(i * 0.07) * 0.3;
-    for (let i = 0; i < K * N; i++) bData[i] = Math.cos(i * 0.11) * 0.3;
-    return { aData, bData, expected: cpuMatmul(aData, bData) };
-  }
-
-  function maxError(actual: Float32Array, expected: Float32Array): number {
-    let maxErr = 0;
-    for (let i = 0; i < actual.length; i++) {
-      maxErr = Math.max(maxErr, Math.abs(actual[i] - expected[i]));
-    }
-    return maxErr;
-  }
-
-  it("matmul + bias epilogue", async () => {
-    const { aData, bData, expected } = makeTestData();
-    const biasData = new Float32Array(N);
-    for (let i = 0; i < N; i++) biasData[i] = (i - N / 2) * 0.1;
-    // Apply bias to reference
-    const ref = new Float32Array(M * N);
-    for (let i = 0; i < M * N; i++) ref[i] = expected[i] + biasData[i % N];
-
-    const epilogue: EpilogueConfig = {
-      ops: [{ kind: "bias", inputIndex: 0 }],
-      additionalInputCount: 1,
-      outputDtype: "f32",
-    };
-    const spec = createTiledMatmulKernel({
-      config, transposeMode: "NN", dtype: "f32", epilogue,
-    });
-
-    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
-    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
-    const biasBuf = makeF32Buffer(biasData, GPUBufferUsage.STORAGE);
-    const outBuf = makeOutputBuffer(M * N);
-
-    const kernel = createTileKernelDispatcher(spec);
-    beginSharedEncoder();
-    kernel.dispatch({ a: aBuf, b: bBuf, out: outBuf, epilogue_in0: biasBuf }, baseUniforms);
-    flushSharedEncoder();
-
-    const result = await readF32Buffer(outBuf, M * N);
-    expect(maxError(result, ref)).toBeLessThan(1e-3);
-
-    aBuf.destroy(); bBuf.destroy(); biasBuf.destroy(); outBuf.destroy();
-  });
-
-  it("matmul + relu epilogue", async () => {
-    const { aData, bData, expected } = makeTestData();
-    const ref = new Float32Array(M * N);
-    for (let i = 0; i < M * N; i++) ref[i] = Math.max(0, expected[i]);
-
-    const epilogue: EpilogueConfig = {
-      ops: [{ kind: "unary", op: "relu" }],
-      additionalInputCount: 0,
-      outputDtype: "f32",
-    };
-    const spec = createTiledMatmulKernel({
-      config, transposeMode: "NN", dtype: "f32", epilogue,
-    });
-
-    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
-    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
-    const outBuf = makeOutputBuffer(M * N);
-
-    const kernel = createTileKernelDispatcher(spec);
-    beginSharedEncoder();
-    kernel.dispatch({ a: aBuf, b: bBuf, out: outBuf }, baseUniforms);
-    flushSharedEncoder();
-
-    const result = await readF32Buffer(outBuf, M * N);
-    expect(maxError(result, ref)).toBeLessThan(1e-3);
-
-    aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
-  });
-
-  it("matmul + bias + relu chain", async () => {
-    const { aData, bData, expected } = makeTestData();
-    const biasData = new Float32Array(N);
-    for (let i = 0; i < N; i++) biasData[i] = (i - N / 2) * 0.1;
-    const ref = new Float32Array(M * N);
-    for (let i = 0; i < M * N; i++) ref[i] = Math.max(0, expected[i] + biasData[i % N]);
-
-    const epilogue: EpilogueConfig = {
-      ops: [
-        { kind: "bias", inputIndex: 0 },
-        { kind: "unary", op: "relu" },
-      ],
-      additionalInputCount: 1,
-      outputDtype: "f32",
-    };
-    const spec = createTiledMatmulKernel({
-      config, transposeMode: "NN", dtype: "f32", epilogue,
-    });
-
-    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
-    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
-    const biasBuf = makeF32Buffer(biasData, GPUBufferUsage.STORAGE);
-    const outBuf = makeOutputBuffer(M * N);
-
-    const kernel = createTileKernelDispatcher(spec);
-    beginSharedEncoder();
-    kernel.dispatch({ a: aBuf, b: bBuf, out: outBuf, epilogue_in0: biasBuf }, baseUniforms);
-    flushSharedEncoder();
-
-    const result = await readF32Buffer(outBuf, M * N);
-    expect(maxError(result, ref)).toBeLessThan(1e-3);
-
-    aBuf.destroy(); bBuf.destroy(); biasBuf.destroy(); outBuf.destroy();
-  });
-
-  it("matmul + binary add (residual)", async () => {
-    const { aData, bData, expected } = makeTestData();
-    // Residual tensor: same shape as output (M×N)
-    const residualData = new Float32Array(M * N);
-    for (let i = 0; i < M * N; i++) residualData[i] = Math.sin(i * 0.13) * 0.5;
-    const ref = new Float32Array(M * N);
-    for (let i = 0; i < M * N; i++) ref[i] = expected[i] + residualData[i];
-
-    const epilogue: EpilogueConfig = {
-      ops: [{ kind: "binary", op: "add", inputIndex: 0 }],
-      additionalInputCount: 1,
-      outputDtype: "f32",
-    };
-    const spec = createTiledMatmulKernel({
-      config, transposeMode: "NN", dtype: "f32", epilogue,
-    });
-
-    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
-    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
-    const resBuf = makeF32Buffer(residualData, GPUBufferUsage.STORAGE);
-    const outBuf = makeOutputBuffer(M * N);
-
-    const kernel = createTileKernelDispatcher(spec);
-    beginSharedEncoder();
-    kernel.dispatch({ a: aBuf, b: bBuf, out: outBuf, epilogue_in0: resBuf }, baseUniforms);
-    flushSharedEncoder();
-
-    const result = await readF32Buffer(outBuf, M * N);
-    expect(maxError(result, ref)).toBeLessThan(1e-3);
-
-    aBuf.destroy(); bBuf.destroy(); resBuf.destroy(); outBuf.destroy();
-  });
-
-  it("matmul + bias + binary add + relu chain", async () => {
-    const { aData, bData, expected } = makeTestData();
-    const biasData = new Float32Array(N);
-    for (let i = 0; i < N; i++) biasData[i] = (i - N / 2) * 0.1;
-    const residualData = new Float32Array(M * N);
-    for (let i = 0; i < M * N; i++) residualData[i] = Math.sin(i * 0.13) * 0.5;
-    // Reference: matmul → +bias → +residual → relu
-    const ref = new Float32Array(M * N);
-    for (let i = 0; i < M * N; i++) {
-      ref[i] = Math.max(0, expected[i] + biasData[i % N] + residualData[i]);
+      return out;
     }
 
-    const epilogue: EpilogueConfig = {
-      ops: [
-        { kind: "bias", inputIndex: 0 },
-        { kind: "binary", op: "add", inputIndex: 1 },
-        { kind: "unary", op: "relu" },
-      ],
-      additionalInputCount: 2,
-      outputDtype: "f32",
-    };
-    const spec = createTiledMatmulKernel({
-      config, transposeMode: "NN", dtype: "f32", epilogue,
-    });
-
-    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
-    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
-    const biasBuf = makeF32Buffer(biasData, GPUBufferUsage.STORAGE);
-    const resBuf = makeF32Buffer(residualData, GPUBufferUsage.STORAGE);
-    const outBuf = makeOutputBuffer(M * N);
-
-    const kernel = createTileKernelDispatcher(spec);
-    beginSharedEncoder();
-    kernel.dispatch({
-      a: aBuf, b: bBuf, out: outBuf,
-      epilogue_in0: biasBuf, epilogue_in1: resBuf,
-    }, baseUniforms);
-    flushSharedEncoder();
-
-    const result = await readF32Buffer(outBuf, M * N);
-    expect(maxError(result, ref)).toBeLessThan(1e-3);
-
-    aBuf.destroy(); bBuf.destroy(); biasBuf.destroy(); resBuf.destroy(); outBuf.destroy();
-  });
-
-  it("matmul + gelu epilogue", async () => {
-    const { aData, bData, expected } = makeTestData();
-    const ref = new Float32Array(M * N);
-    for (let i = 0; i < M * N; i++) {
-      const x = expected[i];
-      const inner = 0.7978845608 * (x + 0.044715 * x * x * x);
-      ref[i] = 0.5 * x * (1 + Math.tanh(inner));
+    function makeTestData() {
+      const aData = new Float32Array(M * K);
+      const bData = new Float32Array(K * N);
+      for (let i = 0; i < M * K; i++) aData[i] = Math.sin(i * 0.07) * 0.3;
+      for (let i = 0; i < K * N; i++) bData[i] = Math.cos(i * 0.11) * 0.3;
+      return { aData, bData, expected: cpuMatmul(aData, bData) };
     }
 
-    const epilogue: EpilogueConfig = {
-      ops: [{ kind: "unary", op: "gelu" }],
-      additionalInputCount: 0,
-      outputDtype: "f32",
-    };
-    const spec = createTiledMatmulKernel({
-      config, transposeMode: "NN", dtype: "f32", epilogue,
+    function maxError(actual: Float32Array, expected: Float32Array): number {
+      let maxErr = 0;
+      for (let i = 0; i < actual.length; i++) {
+        maxErr = Math.max(maxErr, Math.abs(actual[i] - expected[i]));
+      }
+      return maxErr;
+    }
+
+    it("matmul + bias epilogue", async () => {
+      const { aData, bData, expected } = makeTestData();
+      const biasData = new Float32Array(N);
+      for (let i = 0; i < N; i++) biasData[i] = (i - N / 2) * 0.1;
+      // Apply bias to reference
+      const ref = new Float32Array(M * N);
+      for (let i = 0; i < M * N; i++) ref[i] = expected[i] + biasData[i % N];
+
+      const epilogue: EpilogueConfig = {
+        ops: [{ kind: "bias", inputIndex: 0 }],
+        additionalInputCount: 1,
+        outputDtype: "f32",
+      };
+      const spec = createTiledMatmulKernel({
+        config,
+        transposeMode: "NN",
+        dtype: "f32",
+        epilogue,
+      });
+
+      const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+      const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+      const biasBuf = makeF32Buffer(biasData, GPUBufferUsage.STORAGE);
+      const outBuf = makeOutputBuffer(M * N);
+
+      const kernel = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      kernel.dispatch(
+        { a: aBuf, b: bBuf, out: outBuf, epilogue_in0: biasBuf },
+        baseUniforms,
+      );
+      flushSharedEncoder();
+
+      const result = await readF32Buffer(outBuf, M * N);
+      expect(maxError(result, ref)).toBeLessThan(1e-3);
+
+      aBuf.destroy();
+      bBuf.destroy();
+      biasBuf.destroy();
+      outBuf.destroy();
     });
 
-    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
-    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
-    const outBuf = makeOutputBuffer(M * N);
+    it("matmul + relu epilogue", async () => {
+      const { aData, bData, expected } = makeTestData();
+      const ref = new Float32Array(M * N);
+      for (let i = 0; i < M * N; i++) ref[i] = Math.max(0, expected[i]);
 
-    const kernel = createTileKernelDispatcher(spec);
-    beginSharedEncoder();
-    kernel.dispatch({ a: aBuf, b: bBuf, out: outBuf }, baseUniforms);
-    flushSharedEncoder();
+      const epilogue: EpilogueConfig = {
+        ops: [{ kind: "unary", op: "relu" }],
+        additionalInputCount: 0,
+        outputDtype: "f32",
+      };
+      const spec = createTiledMatmulKernel({
+        config,
+        transposeMode: "NN",
+        dtype: "f32",
+        epilogue,
+      });
 
-    const result = await readF32Buffer(outBuf, M * N);
-    expect(maxError(result, ref)).toBeLessThan(1e-3);
+      const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+      const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+      const outBuf = makeOutputBuffer(M * N);
 
-    aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
-  });
-});
+      const kernel = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      kernel.dispatch({ a: aBuf, b: bBuf, out: outBuf }, baseUniforms);
+      flushSharedEncoder();
+
+      const result = await readF32Buffer(outBuf, M * N);
+      expect(maxError(result, ref)).toBeLessThan(1e-3);
+
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
+    });
+
+    it("matmul + bias + relu chain", async () => {
+      const { aData, bData, expected } = makeTestData();
+      const biasData = new Float32Array(N);
+      for (let i = 0; i < N; i++) biasData[i] = (i - N / 2) * 0.1;
+      const ref = new Float32Array(M * N);
+      for (let i = 0; i < M * N; i++)
+        ref[i] = Math.max(0, expected[i] + biasData[i % N]);
+
+      const epilogue: EpilogueConfig = {
+        ops: [
+          { kind: "bias", inputIndex: 0 },
+          { kind: "unary", op: "relu" },
+        ],
+        additionalInputCount: 1,
+        outputDtype: "f32",
+      };
+      const spec = createTiledMatmulKernel({
+        config,
+        transposeMode: "NN",
+        dtype: "f32",
+        epilogue,
+      });
+
+      const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+      const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+      const biasBuf = makeF32Buffer(biasData, GPUBufferUsage.STORAGE);
+      const outBuf = makeOutputBuffer(M * N);
+
+      const kernel = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      kernel.dispatch(
+        { a: aBuf, b: bBuf, out: outBuf, epilogue_in0: biasBuf },
+        baseUniforms,
+      );
+      flushSharedEncoder();
+
+      const result = await readF32Buffer(outBuf, M * N);
+      expect(maxError(result, ref)).toBeLessThan(1e-3);
+
+      aBuf.destroy();
+      bBuf.destroy();
+      biasBuf.destroy();
+      outBuf.destroy();
+    });
+
+    it("matmul + binary add (residual)", async () => {
+      const { aData, bData, expected } = makeTestData();
+      // Residual tensor: same shape as output (M×N)
+      const residualData = new Float32Array(M * N);
+      for (let i = 0; i < M * N; i++)
+        residualData[i] = Math.sin(i * 0.13) * 0.5;
+      const ref = new Float32Array(M * N);
+      for (let i = 0; i < M * N; i++) ref[i] = expected[i] + residualData[i];
+
+      const epilogue: EpilogueConfig = {
+        ops: [{ kind: "binary", op: "add", inputIndex: 0 }],
+        additionalInputCount: 1,
+        outputDtype: "f32",
+      };
+      const spec = createTiledMatmulKernel({
+        config,
+        transposeMode: "NN",
+        dtype: "f32",
+        epilogue,
+      });
+
+      const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+      const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+      const resBuf = makeF32Buffer(residualData, GPUBufferUsage.STORAGE);
+      const outBuf = makeOutputBuffer(M * N);
+
+      const kernel = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      kernel.dispatch(
+        { a: aBuf, b: bBuf, out: outBuf, epilogue_in0: resBuf },
+        baseUniforms,
+      );
+      flushSharedEncoder();
+
+      const result = await readF32Buffer(outBuf, M * N);
+      expect(maxError(result, ref)).toBeLessThan(1e-3);
+
+      aBuf.destroy();
+      bBuf.destroy();
+      resBuf.destroy();
+      outBuf.destroy();
+    });
+
+    it("matmul + bias + binary add + relu chain", async () => {
+      const { aData, bData, expected } = makeTestData();
+      const biasData = new Float32Array(N);
+      for (let i = 0; i < N; i++) biasData[i] = (i - N / 2) * 0.1;
+      const residualData = new Float32Array(M * N);
+      for (let i = 0; i < M * N; i++)
+        residualData[i] = Math.sin(i * 0.13) * 0.5;
+      // Reference: matmul → +bias → +residual → relu
+      const ref = new Float32Array(M * N);
+      for (let i = 0; i < M * N; i++) {
+        ref[i] = Math.max(0, expected[i] + biasData[i % N] + residualData[i]);
+      }
+
+      const epilogue: EpilogueConfig = {
+        ops: [
+          { kind: "bias", inputIndex: 0 },
+          { kind: "binary", op: "add", inputIndex: 1 },
+          { kind: "unary", op: "relu" },
+        ],
+        additionalInputCount: 2,
+        outputDtype: "f32",
+      };
+      const spec = createTiledMatmulKernel({
+        config,
+        transposeMode: "NN",
+        dtype: "f32",
+        epilogue,
+      });
+
+      const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+      const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+      const biasBuf = makeF32Buffer(biasData, GPUBufferUsage.STORAGE);
+      const resBuf = makeF32Buffer(residualData, GPUBufferUsage.STORAGE);
+      const outBuf = makeOutputBuffer(M * N);
+
+      const kernel = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      kernel.dispatch(
+        {
+          a: aBuf,
+          b: bBuf,
+          out: outBuf,
+          epilogue_in0: biasBuf,
+          epilogue_in1: resBuf,
+        },
+        baseUniforms,
+      );
+      flushSharedEncoder();
+
+      const result = await readF32Buffer(outBuf, M * N);
+      expect(maxError(result, ref)).toBeLessThan(1e-3);
+
+      aBuf.destroy();
+      bBuf.destroy();
+      biasBuf.destroy();
+      resBuf.destroy();
+      outBuf.destroy();
+    });
+
+    it("matmul + gelu epilogue", async () => {
+      const { aData, bData, expected } = makeTestData();
+      const ref = new Float32Array(M * N);
+      for (let i = 0; i < M * N; i++) {
+        const x = expected[i];
+        const inner = 0.7978845608 * (x + 0.044715 * x * x * x);
+        ref[i] = 0.5 * x * (1 + Math.tanh(inner));
+      }
+
+      const epilogue: EpilogueConfig = {
+        ops: [{ kind: "unary", op: "gelu" }],
+        additionalInputCount: 0,
+        outputDtype: "f32",
+      };
+      const spec = createTiledMatmulKernel({
+        config,
+        transposeMode: "NN",
+        dtype: "f32",
+        epilogue,
+      });
+
+      const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+      const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+      const outBuf = makeOutputBuffer(M * N);
+
+      const kernel = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      kernel.dispatch({ a: aBuf, b: bBuf, out: outBuf }, baseUniforms);
+      flushSharedEncoder();
+
+      const result = await readF32Buffer(outBuf, M * N);
+      expect(maxError(result, ref)).toBeLessThan(1e-3);
+
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
+    });
+  },
+);

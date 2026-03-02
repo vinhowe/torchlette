@@ -8,10 +8,17 @@
  * callbacks that the matmul kernel body can call without knowing about epilogues.
  */
 
-import { type TileKernelSpec, type DataType, type BlockExpr, type KernelContext, ceilDivGrid, singleWorkgroup } from "../tile-ir";
+import {
+  type BlockExpr,
+  ceilDivGrid,
+  type DataType,
+  type KernelContext,
+  singleWorkgroup,
+  type TileKernelSpec,
+} from "../tile-ir";
+import type { Block, BlockOps, TileRange } from "../tile-ops";
 import type { CodegenOptions, EpilogueConfig } from "./types";
-import { getWorkgroupSize, type DType } from "./types";
-import { BlockOps, Block, TileRange } from "../tile-ops";
+import { type DType, getWorkgroupSize } from "./types";
 
 // ============================================================================
 // Epilogue Composition
@@ -35,21 +42,35 @@ type BlockOpsPostAccFn = (
 // ---- Epilogue expression helpers ----
 
 function applyGelu(ctx: KernelContext, x: BlockExpr): BlockExpr {
-  const inner = ctx.const(0.7978845608).mul(x.add(ctx.const(0.044715).mul(x.mul(x).mul(x))));
+  const inner = ctx
+    .const(0.7978845608)
+    .mul(x.add(ctx.const(0.044715).mul(x.mul(x).mul(x))));
   return x.mul(ctx.const(0.5)).mul(ctx.const(1.0).add(inner.tanh()));
 }
 
 function applyGeluErf(ctx: KernelContext, x: BlockExpr): BlockExpr {
   const absX = x.abs();
-  const t = ctx.const(1.0).div(
-    ctx.const(1.0).add(ctx.const(0.3275911).mul(absX.mul(ctx.const(0.7071067811865476))))
-  );
-  const poly = ctx.const(1.061405429).mul(t)
-    .add(ctx.const(-1.453152027)).mul(t)
-    .add(ctx.const(1.421413741)).mul(t)
-    .add(ctx.const(-0.284496736)).mul(t)
-    .add(ctx.const(0.254829592)).mul(t);
-  const erfApprox = ctx.const(1.0).sub(poly.mul(x.neg().mul(x).mul(ctx.const(0.5)).exp()));
+  const t = ctx
+    .const(1.0)
+    .div(
+      ctx
+        .const(1.0)
+        .add(ctx.const(0.3275911).mul(absX.mul(ctx.const(Math.SQRT1_2)))),
+    );
+  const poly = ctx
+    .const(1.061405429)
+    .mul(t)
+    .add(ctx.const(-1.453152027))
+    .mul(t)
+    .add(ctx.const(1.421413741))
+    .mul(t)
+    .add(ctx.const(-0.284496736))
+    .mul(t)
+    .add(ctx.const(0.254829592))
+    .mul(t);
+  const erfApprox = ctx
+    .const(1.0)
+    .sub(poly.mul(x.neg().mul(x).mul(ctx.const(0.5)).exp()));
   const signX = x.ge(ctx.const(0.0)).select(ctx.const(1.0), ctx.const(-1.0));
   return x.mul(ctx.const(0.5)).mul(ctx.const(1.0).add(signX.mul(erfApprox)));
 }
@@ -62,20 +83,37 @@ function applySigmoid(ctx: KernelContext, x: BlockExpr): BlockExpr {
   return ctx.const(1.0).div(ctx.const(1.0).add(x.neg().exp()));
 }
 
-function applyUnaryOp(ctx: KernelContext, opName: string, x: BlockExpr): BlockExpr {
+function applyUnaryOp(
+  ctx: KernelContext,
+  opName: string,
+  x: BlockExpr,
+): BlockExpr {
   switch (opName) {
-    case "relu": return x.gt(ctx.const(0.0)).select(x, ctx.const(0.0));
-    case "gelu": case "gelu_tanh": return applyGelu(ctx, x);
-    case "gelu_erf": return applyGeluErf(ctx, x);
-    case "silu": return applySilu(ctx, x);
-    case "sigmoid": return applySigmoid(ctx, x);
-    case "tanh": return x.tanh();
-    case "neg": return x.neg();
-    case "abs": return x.abs();
-    case "exp": return x.exp();
-    case "log": return x.log();
-    case "sqrt": return x.sqrt();
-    default: throw new Error(`Unsupported unary epilogue op: ${opName}`);
+    case "relu":
+      return x.gt(ctx.const(0.0)).select(x, ctx.const(0.0));
+    case "gelu":
+    case "gelu_tanh":
+      return applyGelu(ctx, x);
+    case "gelu_erf":
+      return applyGeluErf(ctx, x);
+    case "silu":
+      return applySilu(ctx, x);
+    case "sigmoid":
+      return applySigmoid(ctx, x);
+    case "tanh":
+      return x.tanh();
+    case "neg":
+      return x.neg();
+    case "abs":
+      return x.abs();
+    case "exp":
+      return x.exp();
+    case "log":
+      return x.log();
+    case "sqrt":
+      return x.sqrt();
+    default:
+      throw new Error(`Unsupported unary epilogue op: ${opName}`);
   }
 }
 
@@ -97,7 +135,8 @@ function applyBlockEpilogue(
   const { offsN, threadOutBase, threadOutStride } = addressing;
   for (const op of epilogue.ops) {
     switch (op.kind) {
-      case "none": break;
+      case "none":
+        break;
       case "bias":
         acc.add_(ops.load1d(`epilogue_in${op.inputIndex}`, offsN));
         break;
@@ -105,15 +144,23 @@ function applyBlockEpilogue(
         acc.apply_((x) => applyUnaryOp(ctx, op.op, x));
         break;
       case "binary": {
-        const binBlock = ops.load(`epilogue_in${op.inputIndex}`,
+        const binBlock = ops.load(
+          `epilogue_in${op.inputIndex}`,
           { kind: "thread", base: threadOutBase, stride: threadOutStride },
           { rows: acc.rows, cols: acc.cols },
         );
         switch (op.op) {
-          case "add": acc.add_(binBlock); break;
-          case "sub": acc.sub_(binBlock); break;
-          case "mul": acc.mul_(binBlock); break;
-          default: throw new Error(`Unsupported binary epilogue: ${op.op}`);
+          case "add":
+            acc.add_(binBlock);
+            break;
+          case "sub":
+            acc.sub_(binBlock);
+            break;
+          case "mul":
+            acc.mul_(binBlock);
+            break;
+          default:
+            throw new Error(`Unsupported binary epilogue: ${op.op}`);
         }
         break;
       }
@@ -131,22 +178,29 @@ function applyBlockEpilogue(
         acc.apply_((x) => applySilu(ctx, x));
         break;
       case "add": {
-        const b = ops.load(`epilogue_in${op.inputIndex}`,
+        const b = ops.load(
+          `epilogue_in${op.inputIndex}`,
           { kind: "thread", base: threadOutBase, stride: threadOutStride },
-          { rows: acc.rows, cols: acc.cols });
+          { rows: acc.rows, cols: acc.cols },
+        );
         acc.add_(b);
         break;
       }
       case "mul": {
-        const b = ops.load(`epilogue_in${op.inputIndex}`,
+        const b = ops.load(
+          `epilogue_in${op.inputIndex}`,
           { kind: "thread", base: threadOutBase, stride: threadOutStride },
-          { rows: acc.rows, cols: acc.cols });
+          { rows: acc.rows, cols: acc.cols },
+        );
         acc.mul_(b);
         break;
       }
     }
   }
-  if (epilogue.outputDtype === "f16" && !epilogue.ops.some(o => o.kind === "cast")) {
+  if (
+    epilogue.outputDtype === "f16" &&
+    !epilogue.ops.some((o) => o.kind === "cast")
+  ) {
     acc.castTo_("f16");
   }
 }
@@ -165,8 +219,20 @@ function composeBlockOpsEpilogue(
 // ============================================================================
 
 /** Create a TileKernelSpec for tiled matrix multiplication. */
-export function createTiledMatmulKernel(options: CodegenOptions): TileKernelSpec {
-  const { config, transposeMode, dtype, dtypeB: dtypeBOpt, epilogue, batched, inputCastA, inputCastB, kSplit } = options;
+export function createTiledMatmulKernel(
+  options: CodegenOptions,
+): TileKernelSpec {
+  const {
+    config,
+    transposeMode,
+    dtype,
+    dtypeB: dtypeBOpt,
+    epilogue,
+    batched,
+    inputCastA,
+    inputCastB,
+    kSplit,
+  } = options;
   const { tileM, tileN, tileK, threadTileM, threadTileN } = config;
 
   const wgSize = getWorkgroupSize(config);
@@ -177,14 +243,24 @@ export function createTiledMatmulKernel(options: CodegenOptions): TileKernelSpec
   const wgslDtypeA: DataType = (inputCastA ? "f32" : dtype) as DataType;
   const wgslDtypeB: DataType = (inputCastB ? "f32" : dtypeB) as DataType;
 
-  const outputDtype: DType = kSplit ? "f32" : (epilogue?.outputDtype ?? (dtype === "f32" || dtypeB === "f32" ? "f32" : dtype));
-  const needsF16 = wgslDtypeA === "f16" || wgslDtypeB === "f16" || outputDtype === "f16";
+  const outputDtype: DType = kSplit
+    ? "f32"
+    : (epilogue?.outputDtype ??
+      (dtype === "f32" || dtypeB === "f32" ? "f32" : dtype));
+  const needsF16 =
+    wgslDtypeA === "f16" || wgslDtypeB === "f16" || outputDtype === "f16";
 
   // Build bindings
-  const bindings: Record<string, { storage: "read" | "read_write"; type: DataType }> = {
+  const bindings: Record<
+    string,
+    { storage: "read" | "read_write"; type: DataType }
+  > = {
     a: { storage: "read", type: wgslDtypeA },
     b: { storage: "read", type: wgslDtypeB },
-    out: { storage: "read_write", type: (epilogue?.outputDtype ?? outputDtype) as DataType },
+    out: {
+      storage: "read_write",
+      type: (epilogue?.outputDtype ?? outputDtype) as DataType,
+    },
   };
   if (epilogue) {
     for (let i = 0; i < epilogue.additionalInputCount; i++) {
@@ -202,7 +278,18 @@ export function createTiledMatmulKernel(options: CodegenOptions): TileKernelSpec
     postAcc = composeBlockOpsEpilogue(epilogue, outputDtype);
   }
 
-  const params: MatmulKernelParams = { tileM, tileN, tileK, threadTileM, threadTileN, wgSizeX, wgSizeY, transA, transB, outputDtype };
+  const params: MatmulKernelParams = {
+    tileM,
+    tileN,
+    tileK,
+    threadTileM,
+    threadTileN,
+    wgSizeX,
+    wgSizeY,
+    transA,
+    transB,
+    outputDtype,
+  };
 
   return {
     name: "tiledMatmul",
@@ -211,23 +298,35 @@ export function createTiledMatmulKernel(options: CodegenOptions): TileKernelSpec
     uniformBindingIndex: 3,
     bindings,
     uniforms: {
-      m: "u32", n: "u32", k: "u32",
-      lda: "u32", ldb: "u32", ldc: "u32",
+      m: "u32",
+      n: "u32",
+      k: "u32",
+      lda: "u32",
+      ldb: "u32",
+      ldc: "u32",
       alpha: "f32",
       batchSize: "u32",
-      batchStrideA: "u32", batchStrideB: "u32", batchStrideC: "u32",
+      batchStrideA: "u32",
+      batchStrideB: "u32",
+      batchStrideC: "u32",
     },
     grid: singleWorkgroup(), // Actual grid computed at dispatch time in dispatch.ts
 
-    kernel: (ctx) => matmulKernelBlockOps(ctx, { batched, kSplit }, params, postAcc),
+    kernel: (ctx) =>
+      matmulKernelBlockOps(ctx, { batched, kSplit }, params, postAcc),
   };
 }
 
 interface MatmulKernelParams {
-  tileM: number; tileN: number; tileK: number;
-  threadTileM: number; threadTileN: number;
-  wgSizeX: number; wgSizeY: number;
-  transA: boolean; transB: boolean;
+  tileM: number;
+  tileN: number;
+  tileK: number;
+  threadTileM: number;
+  threadTileN: number;
+  wgSizeX: number;
+  wgSizeY: number;
+  transA: boolean;
+  transB: boolean;
   outputDtype: DType;
 }
 
@@ -239,11 +338,21 @@ function matmulKernelBlockOps(
   postAccumulate?: BlockOpsPostAccFn,
 ): void {
   const { batched, kSplit } = opts;
-  const { tileM, tileN, tileK, threadTileM, threadTileN, transA, transB, outputDtype } = p;
+  const {
+    tileM,
+    tileN,
+    tileK,
+    threadTileM,
+    threadTileN,
+    transA,
+    transB,
+    outputDtype,
+  } = p;
 
   // Initialize tile context — set thread tile, emit thread position bindings
   const { threadRow, threadCol } = ctx.configureTiles({
-    threadTileM, threadTileN,
+    threadTileM,
+    threadTileN,
   });
 
   // 1. Uniforms
@@ -268,19 +377,43 @@ function matmulKernelBlockOps(
     batchOffC = ctx.const(0, "u32");
   } else if (batched) {
     const batchIdx = ctx.emitLet("batch_idx", ctx.programId(2));
-    batchOffA = ctx.emitLet("batch_offset_a", batchIdx.mul(ctx.uniform("batchStrideA")));
-    batchOffB = ctx.emitLet("batch_offset_b", batchIdx.mul(ctx.uniform("batchStrideB")));
-    batchOffC = ctx.emitLet("batch_offset_c", batchIdx.mul(ctx.uniform("batchStrideC")));
+    batchOffA = ctx.emitLet(
+      "batch_offset_a",
+      batchIdx.mul(ctx.uniform("batchStrideA")),
+    );
+    batchOffB = ctx.emitLet(
+      "batch_offset_b",
+      batchIdx.mul(ctx.uniform("batchStrideB")),
+    );
+    batchOffC = ctx.emitLet(
+      "batch_offset_c",
+      batchIdx.mul(ctx.uniform("batchStrideC")),
+    );
   } else {
     const batchIdx = ctx.emitLet("batch_idx", ctx.const(0, "u32"));
-    batchOffA = ctx.emitLet("batch_offset_a", batchIdx.mul(ctx.uniform("batchStrideA")));
-    batchOffB = ctx.emitLet("batch_offset_b", batchIdx.mul(ctx.uniform("batchStrideB")));
-    batchOffC = ctx.emitLet("batch_offset_c", batchIdx.mul(ctx.uniform("batchStrideC")));
+    batchOffA = ctx.emitLet(
+      "batch_offset_a",
+      batchIdx.mul(ctx.uniform("batchStrideA")),
+    );
+    batchOffB = ctx.emitLet(
+      "batch_offset_b",
+      batchIdx.mul(ctx.uniform("batchStrideB")),
+    );
+    batchOffC = ctx.emitLet(
+      "batch_offset_c",
+      batchIdx.mul(ctx.uniform("batchStrideC")),
+    );
   }
 
   // 3. Workgroup positions
-  const wgRow = ctx.emitLet("wg_row", ctx.programId(1).mul(ctx.const(tileM, "u32")));
-  const wgCol = ctx.emitLet("wg_col", ctx.programId(0).mul(ctx.const(tileN, "u32")));
+  const wgRow = ctx.emitLet(
+    "wg_row",
+    ctx.programId(1).mul(ctx.const(tileM, "u32")),
+  );
+  const wgCol = ctx.emitLet(
+    "wg_col",
+    ctx.programId(0).mul(ctx.const(tileN, "u32")),
+  );
 
   // 4. Block ranges — ≈ tl.arange(wgRow, wgRow + BLOCK_M)
   const offsM = ctx.arange(wgRow, tileM);
@@ -303,15 +436,24 @@ function matmulKernelBlockOps(
   const cTK = ctx.const(tileK, "u32");
 
   if (kSplit) {
-    const kPerSplit = ctx.emitLet("k_per_split",
-      k.add(ctx.const(kSplit - 1, "u32")).div(ctx.const(kSplit, "u32")));
-    kStart = ctx.emitLet("k_start", splitIdx!.mul(kPerSplit));
+    const kPerSplit = ctx.emitLet(
+      "k_per_split",
+      k.add(ctx.const(kSplit - 1, "u32")).div(ctx.const(kSplit, "u32")),
+    );
+    kStart = ctx.emitLet("k_start", splitIdx?.mul(kPerSplit));
     kEnd = ctx.emitLet("k_end", kStart.add(kPerSplit).min(k));
-    numKTiles = ctx.emitLet("num_k_tiles",
-      kEnd.sub(kStart).add(ctx.const(tileK - 1, "u32")).div(cTK));
+    numKTiles = ctx.emitLet(
+      "num_k_tiles",
+      kEnd
+        .sub(kStart)
+        .add(ctx.const(tileK - 1, "u32"))
+        .div(cTK),
+    );
   } else {
-    numKTiles = ctx.emitLet("num_k_tiles",
-      k.add(ctx.const(tileK - 1, "u32")).div(cTK));
+    numKTiles = ctx.emitLet(
+      "num_k_tiles",
+      k.add(ctx.const(tileK - 1, "u32")).div(cTK),
+    );
     kStart = ctx.emitLet("k_start", ctx.const(0, "u32"));
     kEnd = ctx.emitLet("k_end", k);
   }
@@ -322,11 +464,19 @@ function matmulKernelBlockOps(
     const offsK = ctx.arange(kOffset, tileK);
 
     // Cooperative tile loads — ≈ tl.load(a_ptr, mask=a_mask)
-    const aPtr = ctx.tilePtr(batchOffA, offsM.outer(strideAm), offsK.inner(strideAk));
+    const aPtr = ctx.tilePtr(
+      batchOffA,
+      offsM.outer(strideAm),
+      offsK.inner(strideAk),
+    );
     const aMask = ctx.tileMask(offsM.lt(m), offsK.lt(kEnd));
     const a = ctx.load2D("a", aPtr, aMask);
 
-    const bPtr = ctx.tilePtr(batchOffB, offsK.outer(strideBk), offsN.inner(strideBn));
+    const bPtr = ctx.tilePtr(
+      batchOffB,
+      offsK.outer(strideBk),
+      offsN.inner(strideBn),
+    );
     const bMask = ctx.tileMask(offsK.lt(kEnd), offsN.lt(n));
     const b = ctx.load2D("b", bPtr, bMask);
 
@@ -336,7 +486,7 @@ function matmulKernelBlockOps(
 
   // 9. Store — two paths: K-split (raw partials) vs normal (with optional post-accumulate)
   if (kSplit) {
-    const splitBase = ctx.emitLet("split_base", splitIdx!.mul(m.mul(n)));
+    const splitBase = ctx.emitLet("split_base", splitIdx?.mul(m.mul(n)));
     const outPtr = ctx.tilePtr(splitBase, offsM.outer(ldc), offsN.inner(cOne));
     const outMask = ctx.tileMask(offsM.lt(m), offsN.lt(n));
     ctx.store2D("out", acc, outPtr, outMask);
@@ -344,11 +494,20 @@ function matmulKernelBlockOps(
     acc.mul_(alpha.toF32());
 
     if (postAccumulate) {
-      const threadOutBase = ctx.emitLet("thread_out_base", batchOffC.add(
-        wgRow.add(threadRow.mul(ctx.const(threadTileM, "u32"))).mul(ldc)
-          .add(wgCol.add(threadCol.mul(ctx.const(threadTileN, "u32"))))
-      ));
-      postAccumulate(ctx, ctx.tileOps, acc, { offsN, threadOutBase, threadOutStride: ldc });
+      const threadOutBase = ctx.emitLet(
+        "thread_out_base",
+        batchOffC.add(
+          wgRow
+            .add(threadRow.mul(ctx.const(threadTileM, "u32")))
+            .mul(ldc)
+            .add(wgCol.add(threadCol.mul(ctx.const(threadTileN, "u32")))),
+        ),
+      );
+      postAccumulate(ctx, ctx.tileOps, acc, {
+        offsN,
+        threadOutBase,
+        threadOutStride: ldc,
+      });
     } else if (outputDtype === "f16") {
       acc.castTo_("f16");
     }
@@ -363,7 +522,10 @@ function matmulKernelBlockOps(
 // K-Split Reduction Kernel (imperative mode)
 // ============================================================================
 
-export function createKSplitReductionKernel(kSplitCount: number, outputDtype: DType): TileKernelSpec {
+export function createKSplitReductionKernel(
+  kSplitCount: number,
+  outputDtype: DType,
+): TileKernelSpec {
   const needsF16 = outputDtype === "f16";
   return {
     name: "kSplitReduce",
@@ -378,12 +540,16 @@ export function createKSplitReductionKernel(kSplitCount: number, outputDtype: DT
     kernel(ctx) {
       const idx = ctx.emitLet("idx", ctx.globalId(0));
       const totalElements = ctx.uniform("totalElements");
-      ctx.ifThen(idx.ge(totalElements), () => { ctx.emitReturn(); });
+      ctx.ifThen(idx.ge(totalElements), () => {
+        ctx.emitReturn();
+      });
 
       const alpha = ctx.uniform("alpha").bitcastTo("f32");
       const sumVar = ctx.emitVar("sum", "f32", ctx.load("partials", idx));
       for (let p = 1; p < kSplitCount; p++) {
-        sumVar.addAssign(ctx.load("partials", idx.add(totalElements.mul(ctx.u32(p)))));
+        sumVar.addAssign(
+          ctx.load("partials", idx.add(totalElements.mul(ctx.u32(p)))),
+        );
       }
       const result = sumVar.get().mul(alpha);
       if (outputDtype === "f16") {
@@ -401,10 +567,17 @@ export function createKSplitReductionKernel(kSplitCount: number, outputDtype: DT
 
 import { compileTileKernel } from "../tile-compiler";
 
-export function generateTiledMatmulShaderTileIR(options: CodegenOptions): string {
+export function generateTiledMatmulShaderTileIR(
+  options: CodegenOptions,
+): string {
   return compileTileKernel(createTiledMatmulKernel(options));
 }
 
-export function generateKSplitReductionShaderTileIR(kSplitCount: number, outputDtype: DType): string {
-  return compileTileKernel(createKSplitReductionKernel(kSplitCount, outputDtype));
+export function generateKSplitReductionShaderTileIR(
+  kSplitCount: number,
+  outputDtype: DType,
+): string {
+  return compileTileKernel(
+    createKSplitReductionKernel(kSplitCount, outputDtype),
+  );
 }

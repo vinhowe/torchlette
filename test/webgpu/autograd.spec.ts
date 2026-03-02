@@ -5,10 +5,13 @@
  * when using the WebGPU backend for GPU-accelerated computation.
  */
 
-import { describe, expect, it, beforeAll } from "vitest";
-import { Torchlette } from "../../src/frontend";
+import { beforeAll, describe, expect, it } from "vitest";
 import { initWebGPU } from "../../src/backend/webgpu/index";
-import { resetNodeIdCounter, resetStorageIdCounter } from "../../src/engine/lazy";
+import {
+  resetNodeIdCounter,
+  resetStorageIdCounter,
+} from "../../src/engine/lazy";
+import { Torchlette } from "../../src/frontend";
 import { resetBaseIdCounter } from "../../src/runtime/tensor";
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -68,8 +71,12 @@ describe.skipIf(cpuOnly)("WebGPU Backend Autograd", () => {
       resetBaseIdCounter();
       const api = new Torchlette("webgpu");
 
-      const a = api.tensorFromArray([1, 2, 3, 4], [2, 2], { requiresGrad: true });
-      const b = api.tensorFromArray([5, 6, 7, 8], [2, 2], { requiresGrad: true });
+      const a = api.tensorFromArray([1, 2, 3, 4], [2, 2], {
+        requiresGrad: true,
+      });
+      const b = api.tensorFromArray([5, 6, 7, 8], [2, 2], {
+        requiresGrad: true,
+      });
       const c = a.matmul(b);
       const loss = c.sum();
       if (typeof loss === "number") throw new Error("Expected tensor");
@@ -89,7 +96,9 @@ describe.skipIf(cpuOnly)("WebGPU Backend Autograd", () => {
       resetBaseIdCounter();
       const api = new Torchlette("webgpu");
 
-      const a = api.tensorFromArray([1, -1, 2, -2], [4], { requiresGrad: true });
+      const a = api.tensorFromArray([1, -1, 2, -2], [4], {
+        requiresGrad: true,
+      });
       const b = a.relu();
       const loss = b.sum();
       if (typeof loss === "number") throw new Error("Expected tensor");
@@ -110,9 +119,15 @@ describe.skipIf(cpuOnly)("WebGPU Backend Autograd", () => {
       const api = new Torchlette("webgpu");
 
       // Simulate a simple 2-layer MLP: input -> W1 -> relu -> W2 -> output
-      const input = api.tensorFromArray([1, 2, 3, 4], [2, 2], { requiresGrad: false });
-      const W1 = api.tensorFromArray([0.5, -0.5, 0.3, 0.7], [2, 2], { requiresGrad: true });
-      const W2 = api.tensorFromArray([0.1, 0.2, -0.1, 0.3], [2, 2], { requiresGrad: true });
+      const input = api.tensorFromArray([1, 2, 3, 4], [2, 2], {
+        requiresGrad: false,
+      });
+      const W1 = api.tensorFromArray([0.5, -0.5, 0.3, 0.7], [2, 2], {
+        requiresGrad: true,
+      });
+      const W2 = api.tensorFromArray([0.1, 0.2, -0.1, 0.3], [2, 2], {
+        requiresGrad: true,
+      });
 
       // Forward pass
       const h1 = input.matmul(W1);
@@ -139,7 +154,9 @@ describe.skipIf(cpuOnly)("WebGPU Backend Autograd", () => {
 
       // ResNet-style residual: output = x + f(x)
       const x = api.tensorFromArray([1, 2, 3, 4], [4], { requiresGrad: true });
-      const w = api.tensorFromArray([0.5, 0.5, 0.5, 0.5], [4], { requiresGrad: true });
+      const w = api.tensorFromArray([0.5, 0.5, 0.5, 0.5], [4], {
+        requiresGrad: true,
+      });
 
       // f(x) = w * x
       const fx = x.mul(w);
@@ -165,7 +182,9 @@ describe.skipIf(cpuOnly)("WebGPU Backend Autograd", () => {
       resetBaseIdCounter();
       const api = new Torchlette("webgpu");
 
-      const a = api.tensorFromArray([1, 2, 3, 4, 5, 6], [2, 3], { requiresGrad: true });
+      const a = api.tensorFromArray([1, 2, 3, 4, 5, 6], [2, 3], {
+        requiresGrad: true,
+      });
       const b = a.transpose({ dim0: 0, dim1: 1 });
       const loss = b.sum();
       if (typeof loss === "number") throw new Error("Expected tensor");
@@ -205,7 +224,9 @@ describe.skipIf(cpuOnly)("WebGPU Backend Autograd", () => {
       const api = new Torchlette("webgpu");
       const { SGD } = await import("../../src/optim");
 
-      const w = api.tensorFromArray([10, 10, 10, 10], [4], { requiresGrad: true });
+      const w = api.tensorFromArray([10, 10, 10, 10], [4], {
+        requiresGrad: true,
+      });
       const optimizer = new SGD([w], { lr: 1.0 }, api);
 
       // Multiple training steps

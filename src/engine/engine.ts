@@ -12,18 +12,26 @@ import { type TraceEvent, TraceRecorder } from "./trace";
 
 // Re-export all types, errors, and helpers from extracted modules
 export * from "./engine-types";
+
 // ── Engine helpers (merged from engine-helpers.ts) ──────────────────────────
 function collectTensorHandles(value: unknown): EngineTensor[] {
   const out: EngineTensor[] = [];
   const seen = new Set<unknown>();
   const visit = (current: unknown) => {
     if (current === null || current === undefined) return;
-    if (current instanceof EngineTensor) { out.push(current); return; }
+    if (current instanceof EngineTensor) {
+      out.push(current);
+      return;
+    }
     if (typeof current !== "object") return;
     if (seen.has(current)) return;
     seen.add(current);
-    if (Array.isArray(current)) { for (const entry of current) visit(entry); return; }
-    for (const entry of Object.values(current as Record<string, unknown>)) visit(entry);
+    if (Array.isArray(current)) {
+      for (const entry of current) visit(entry);
+      return;
+    }
+    for (const entry of Object.values(current as Record<string, unknown>))
+      visit(entry);
   };
   visit(value);
   return out;
@@ -36,7 +44,8 @@ function isThenable(value: unknown): value is Promise<unknown> {
 
 function collectTraceTensorIds(value: unknown): number[] {
   if (!value) return [];
-  if (Array.isArray(value)) return value.flatMap((item) => collectTraceTensorIds(item));
+  if (Array.isArray(value))
+    return value.flatMap((item) => collectTraceTensorIds(item));
   if (isTraceTensor(value)) return [value.id];
   return [];
 }
@@ -47,12 +56,17 @@ function isTraceTensor(value: unknown): value is TraceTensor {
   return typeof record.id === "number" && typeof record.epoch === "number";
 }
 
-function computeRngValue(basis: RngBasis, opNonce: number, drawNonce: number): number {
+function computeRngValue(
+  basis: RngBasis,
+  opNonce: number,
+  drawNonce: number,
+): number {
   const seed = basis.seed >>> 0;
   const algo = basis.algorithmId >>> 0;
   const op = opNonce >>> 0;
   const draw = drawNonce >>> 0;
-  let state = seed ^ Math.imul(algo, 0x9e3779b9) ^ op ^ Math.imul(draw, 0x85ebca6b);
+  let state =
+    seed ^ Math.imul(algo, 0x9e3779b9) ^ op ^ Math.imul(draw, 0x85ebca6b);
   state = mix32(state);
   return (state >>> 0) / 2 ** 32;
 }
@@ -68,16 +82,36 @@ function mix32(value: number): number {
 }
 
 // ── Error classes (merged from engine-errors.ts) ────────────────────────────
-export class EngineBusyError extends Error { name = "EngineBusyError"; }
-export class CheckpointImpureRegionError extends Error { name = "CheckpointImpureRegionError"; }
-export class HostReadInCompileError extends Error { name = "HostReadInCompileError"; }
-export class AsyncInCompileError extends Error { name = "AsyncInCompileError"; }
-export class InvalidTraceTensorEscapeError extends Error { name = "InvalidTraceTensorEscapeError"; }
-export class SavedTensorModifiedError extends Error { name = "SavedTensorModifiedError"; }
-export class NonReentrantBackwardError extends Error { name = "NonReentrantBackwardError"; }
-export class PoisonedEngineError extends Error { name = "PoisonedEngineError"; }
-export class RngReplayExhaustedError extends Error { name = "RngReplayExhaustedError"; }
-export class RngReplayMismatchError extends Error { name = "RngReplayMismatchError"; }
+export class EngineBusyError extends Error {
+  name = "EngineBusyError";
+}
+export class CheckpointImpureRegionError extends Error {
+  name = "CheckpointImpureRegionError";
+}
+export class HostReadInCompileError extends Error {
+  name = "HostReadInCompileError";
+}
+export class AsyncInCompileError extends Error {
+  name = "AsyncInCompileError";
+}
+export class InvalidTraceTensorEscapeError extends Error {
+  name = "InvalidTraceTensorEscapeError";
+}
+export class SavedTensorModifiedError extends Error {
+  name = "SavedTensorModifiedError";
+}
+export class NonReentrantBackwardError extends Error {
+  name = "NonReentrantBackwardError";
+}
+export class PoisonedEngineError extends Error {
+  name = "PoisonedEngineError";
+}
+export class RngReplayExhaustedError extends Error {
+  name = "RngReplayExhaustedError";
+}
+export class RngReplayMismatchError extends Error {
+  name = "RngReplayMismatchError";
+}
 
 // Local imports from extracted modules (used by Engine class implementation)
 import {
@@ -504,7 +538,9 @@ export class Engine {
       inputs: inputs.length > 0 ? inputs.map((input) => input.id) : undefined,
       shape: options?.shape ? options.shape.slice() : undefined,
       dtype: options?.dtype,
-      scalarValues: options?.scalarValues ? options.scalarValues.slice() : undefined,
+      scalarValues: options?.scalarValues
+        ? options.scalarValues.slice()
+        : undefined,
     });
     return tensor;
   }
@@ -817,12 +853,20 @@ export class Engine {
 
   _debug_runEntryPoint<T>(fn: () => T): T {
     this.acquireExecLock();
-    try { return fn(); } finally { this.releaseExecLock(); }
+    try {
+      return fn();
+    } finally {
+      this.releaseExecLock();
+    }
   }
 
   async runEntryPoint<T>(fn: () => Promise<T>): Promise<T> {
     this.acquireExecLock();
-    try { return await fn(); } finally { this.releaseExecLock(); }
+    try {
+      return await fn();
+    } finally {
+      this.releaseExecLock();
+    }
   }
 
   /**
@@ -869,9 +913,14 @@ export class Engine {
   }
 
   _debugSnapshot(): DebugSnapshot {
-    const collect = <K, V, R>(map: Map<K, V>, transform: (v: V) => R): Record<string, R> => {
+    const collect = <K, V, R>(
+      map: Map<K, V>,
+      transform: (v: V) => R,
+    ): Record<string, R> => {
       const result: Record<string, R> = {};
-      for (const [k, v] of Array.from(map.entries()).sort(([a], [b]) => (a as number) - (b as number))) {
+      for (const [k, v] of Array.from(map.entries()).sort(
+        ([a], [b]) => (a as number) - (b as number),
+      )) {
         result[String(k)] = transform(v);
       }
       return result;
@@ -879,10 +928,23 @@ export class Engine {
 
     return {
       tokGlobal: this.snapshotToken(this.tokGlobal),
-      tokLoc: collect(this.tokLoc, t => this.snapshotToken(t)),
-      locs: collect(this.locState, s => ({ locLogicalVersion: s.locLogicalVersion, locVersion: s.locVersion, role: s.role, hasValue: s.hasValue })),
-      bases: collect(this.baseState, s => ({ baseCommitVersion: s.baseCommitVersion, committedMutations: Array.from(s.committed).sort((a, b) => a - b) })),
-      bindings: collect(this.baseBindings, b => ({ kind: b.kind, locId: b.locId, initTokId: b.initTok?.id, initTokKind: b.initTok?.kind })),
+      tokLoc: collect(this.tokLoc, (t) => this.snapshotToken(t)),
+      locs: collect(this.locState, (s) => ({
+        locLogicalVersion: s.locLogicalVersion,
+        locVersion: s.locVersion,
+        role: s.role,
+        hasValue: s.hasValue,
+      })),
+      bases: collect(this.baseState, (s) => ({
+        baseCommitVersion: s.baseCommitVersion,
+        committedMutations: Array.from(s.committed).sort((a, b) => a - b),
+      })),
+      bindings: collect(this.baseBindings, (b) => ({
+        kind: b.kind,
+        locId: b.locId,
+        initTokId: b.initTok?.id,
+        initTokKind: b.initTok?.kind,
+      })),
     };
   }
 
@@ -904,10 +966,22 @@ export class Engine {
     let opNonce = 0;
     const events: PlanEvent[] = [];
 
-    const emit = (kind: string, overrides?: { opNonce?: number; drawNonce?: number; mutId?: number }, payload?: Record<string, unknown>) => {
+    const emit = (
+      kind: string,
+      overrides?: { opNonce?: number; drawNonce?: number; mutId?: number },
+      payload?: Record<string, unknown>,
+    ) => {
       events.push({
         name: kind,
-        key: { graphInstanceId: 0, callInstanceId: 0, planInstanceId: 0, opNonce: overrides?.opNonce ?? opNonce, drawNonce: overrides?.drawNonce ?? 0, mutId: overrides?.mutId ?? 0, kind },
+        key: {
+          graphInstanceId: 0,
+          callInstanceId: 0,
+          planInstanceId: 0,
+          opNonce: overrides?.opNonce ?? opNonce,
+          drawNonce: overrides?.drawNonce ?? 0,
+          mutId: overrides?.mutId ?? 0,
+          kind,
+        },
         ...(payload ? { payload } : {}),
       });
     };
@@ -915,7 +989,10 @@ export class Engine {
     for (const event of traceEvents) {
       if (event.type === "rng_basis") {
         opNonce += 1;
-        emit("rng_basis", undefined, { algorithmId: event.algorithmId, seed: event.seed });
+        emit("rng_basis", undefined, {
+          algorithmId: event.algorithmId,
+          seed: event.seed,
+        });
       } else if (
         event.type === "rng_checkpoint_record_start" ||
         event.type === "rng_checkpoint_record_finish" ||
@@ -929,7 +1006,11 @@ export class Engine {
         emit("publish_save");
       } else if (event.type === "rng_draw") {
         opNonce = Math.max(opNonce, event.opNonce);
-        emit("rng_draw", { opNonce: event.opNonce, drawNonce: event.drawNonce }, { drawNonce: event.drawNonce, opNonce: event.opNonce });
+        emit(
+          "rng_draw",
+          { opNonce: event.opNonce, drawNonce: event.drawNonce },
+          { drawNonce: event.drawNonce, opNonce: event.opNonce },
+        );
       } else if (event.type === "loc_schedule") {
         opNonce += 1;
         emit("loc_schedule", undefined, { locId: event.locId });
@@ -938,7 +1019,11 @@ export class Engine {
         emit("loc_commit", undefined, { locId: event.locId });
       } else if (event.type === "base_commit") {
         opNonce += 1;
-        emit("base_commit", { mutId: event.mutId }, { baseId: event.baseId, mutId: event.mutId });
+        emit(
+          "base_commit",
+          { mutId: event.mutId },
+          { baseId: event.baseId, mutId: event.mutId },
+        );
       }
     }
 
@@ -1296,18 +1381,33 @@ export class Engine {
    */
   _debug_getMemoryStats(): EngineMemoryStats {
     const p = this.memoryStatsProvider;
-    const gpu = p?.getGPUStats?.() ?? { currentBytes: 0, peakBytes: 0, limitBytes: 0 };
-    const pool = p?.getBufferPoolStats?.() ?? { pooledBuffers: 0, inUseBuffers: 0, pendingFenceBuffers: 0 };
+    const gpu = p?.getGPUStats?.() ?? {
+      currentBytes: 0,
+      peakBytes: 0,
+      limitBytes: 0,
+    };
+    const pool = p?.getBufferPoolStats?.() ?? {
+      pooledBuffers: 0,
+      inUseBuffers: 0,
+      pendingFenceBuffers: 0,
+    };
     const plan = p?.getPlanStats?.() ?? { activePlans: 0, completedPlans: 0 };
     let totalPinCount = 0;
     for (const count of this.basePinCount.values()) totalPinCount += count;
 
     return {
-      gpuCurrentBytes: gpu.currentBytes, gpuPeakBytes: gpu.peakBytes, gpuLimitBytes: gpu.limitBytes,
-      pooledBuffers: pool.pooledBuffers, inUseBuffers: pool.inUseBuffers, pendingFenceBuffers: pool.pendingFenceBuffers,
-      activeBases: this.basePinCount.size, totalPinCount,
-      savedTensorCount: this.savedTensors.size, pendingTensorCount: p?.getPendingTensorCount?.() ?? 0,
-      activePlans: plan.activePlans, completedPlans: plan.completedPlans,
+      gpuCurrentBytes: gpu.currentBytes,
+      gpuPeakBytes: gpu.peakBytes,
+      gpuLimitBytes: gpu.limitBytes,
+      pooledBuffers: pool.pooledBuffers,
+      inUseBuffers: pool.inUseBuffers,
+      pendingFenceBuffers: pool.pendingFenceBuffers,
+      activeBases: this.basePinCount.size,
+      totalPinCount,
+      savedTensorCount: this.savedTensors.size,
+      pendingTensorCount: p?.getPendingTensorCount?.() ?? 0,
+      activePlans: plan.activePlans,
+      completedPlans: plan.completedPlans,
     };
   }
 
@@ -1375,4 +1475,3 @@ export class Engine {
     this.memorySnapshots.length = 0;
   }
 }
-

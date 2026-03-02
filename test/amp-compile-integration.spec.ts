@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
-
-import { Engine } from "../src/engine/engine";
 import { createAutocastContext, pushAutocast } from "../src/engine/amp";
+import { Engine } from "../src/engine/engine";
 
 describe("AMP Compile Integration (§12)", () => {
   it("engine has setAutocastContext method", () => {
@@ -147,11 +146,11 @@ describe("AMP Compile Integration (§12)", () => {
       expect(graph).not.toBeNull();
 
       // Should have cast nodes inserted
-      const castNodes = graph!.nodes.filter((n) => n.op === "cast");
+      const castNodes = graph?.nodes.filter((n) => n.op === "cast");
       expect(castNodes.length).toBeGreaterThan(0);
 
       // Matmul should output f16 (per AMP policy)
-      const matmulNode = graph!.nodes.find((n) => n.op === "matmul");
+      const matmulNode = graph?.nodes.find((n) => n.op === "matmul");
       expect(matmulNode?.dtype).toBe("f16");
     });
 
@@ -183,7 +182,7 @@ describe("AMP Compile Integration (§12)", () => {
       expect(graph).not.toBeNull();
 
       // No cast nodes needed for add (not f16-eligible)
-      const castNodes = graph!.nodes.filter((n) => n.op === "cast");
+      const castNodes = graph?.nodes.filter((n) => n.op === "cast");
       expect(castNodes.length).toBe(0);
     });
   });

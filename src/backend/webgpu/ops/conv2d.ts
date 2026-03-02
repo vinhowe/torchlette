@@ -9,15 +9,18 @@
  */
 
 import type { BackendTensor } from "../../types";
+import { resolveOutputBuffer } from "../buffer-arena";
+import { requireContext } from "../gpu-context";
 import type { GPUBuffer } from "../gpu-types";
 import { asGPUTensor } from "../gpu-types";
-import { requireContext } from "../gpu-context";
-import { resolveOutputBuffer } from "../buffer-arena";
-import { createTensor } from "../tensor";
-import { createTileKernelDispatcher, type TileKernelInstance } from "../tile-dispatch";
-import type { TileKernelSpec, DataType } from "../tile-ir";
-import { elementwiseGrid } from "../tile-ir";
 import { WORKGROUP_SIZE } from "../shape-utils";
+import { createTensor } from "../tensor";
+import {
+  createTileKernelDispatcher,
+  type TileKernelInstance,
+} from "../tile-dispatch";
+import type { DataType, TileKernelSpec } from "../tile-ir";
+import { elementwiseGrid } from "../tile-ir";
 
 const WG = WORKGROUP_SIZE; // 256
 
@@ -45,7 +48,10 @@ function conv2dOutputShape(
   return [N, Cout, outH, outW];
 }
 
-function normalizeParam(p: number | [number, number] | undefined, fallback: number): [number, number] {
+function normalizeParam(
+  p: number | [number, number] | undefined,
+  fallback: number,
+): [number, number] {
   if (p === undefined) return [fallback, fallback];
   if (typeof p === "number") return [p, p];
   return p;
@@ -56,11 +62,16 @@ function normalizeParam(p: number | [number, number] | undefined, fallback: numb
 // ============================================================================
 
 function makeConv2dSpec(
-  kH: number, kW: number, Cin: number,
+  kH: number,
+  kW: number,
+  Cin: number,
   hasBias: boolean,
   dtype: DataType = "f32",
 ): TileKernelSpec {
-  const bindings: Record<string, { storage: "read" | "read_write"; type: DataType }> = {
+  const bindings: Record<
+    string,
+    { storage: "read" | "read_write"; type: DataType }
+  > = {
     input: { storage: "read", type: dtype },
     weight: { storage: "read", type: dtype },
     out: { storage: "read_write", type: dtype },
@@ -74,10 +85,17 @@ function makeConv2dSpec(
     workgroupSize: WG,
     bindings,
     uniforms: {
-      N: "u32", Cin: "u32", H: "u32", W: "u32",
-      Cout: "u32", outH: "u32", outW: "u32",
-      strideH: "u32", strideW: "u32",
-      padH: "u32", padW: "u32",
+      N: "u32",
+      Cin: "u32",
+      H: "u32",
+      W: "u32",
+      Cout: "u32",
+      outH: "u32",
+      outW: "u32",
+      strideH: "u32",
+      strideW: "u32",
+      padH: "u32",
+      padW: "u32",
       totalOut: "u32",
     },
     grid: elementwiseGrid(WG, { elementUniform: "totalOut" }),
@@ -99,9 +117,11 @@ function makeConv2dSpec(
       const n = rest2.div(Cout);
 
       // Initialize accumulator
-      const acc = ctx.emitVar("acc", "f32", hasBias
-        ? ctx.load("bias", co)
-        : ctx.f32(0));
+      const acc = ctx.emitVar(
+        "acc",
+        "f32",
+        hasBias ? ctx.load("bias", co) : ctx.f32(0),
+      );
 
       // Base input spatial positions (before kernel offset)
       const baseH = oh.mul(ctx.uniform("strideH"));
@@ -136,7 +156,10 @@ function makeConv2dSpec(
             const inBounds = ih.lt(H).and(iw.lt(W));
 
             const inputIdx = inputCBase.add(ih.mul(W)).add(iw);
-            const inputVal = inBounds.select(ctx.load("input", inputIdx), ctx.f32(0));
+            const inputVal = inBounds.select(
+              ctx.load("input", inputIdx),
+              ctx.f32(0),
+            );
 
             const weightIdx = weightCBase.add(ctx.u32(ky * kW + kx));
             const weightVal = ctx.load("weight", weightIdx);
@@ -157,7 +180,12 @@ function makeConv2dSpec(
 
 const dispatcherCache = new Map<string, TileKernelInstance>();
 
-function getDispatcher(kH: number, kW: number, Cin: number, hasBias: boolean): TileKernelInstance {
+function getDispatcher(
+  kH: number,
+  kW: number,
+  Cin: number,
+  hasBias: boolean,
+): TileKernelInstance {
   const key = `conv2d_${kH}x${kW}_c${Cin}${hasBias ? "_b" : ""}`;
   let d = dispatcherCache.get(key);
   if (!d) {
@@ -181,29 +209,42 @@ export function conv2d(
   const weight = asGPUTensor(_weight);
   const bias = _bias ? asGPUTensor(_bias) : undefined;
 
-  if (input.shape.length !== 4) throw new Error(`conv2d: input must be 4D [N,C,H,W], got ${input.shape}`);
-  if (weight.shape.length !== 4) throw new Error(`conv2d: weight must be 4D [Cout,Cin,kH,kW], got ${weight.shape}`);
+  if (input.shape.length !== 4)
+    throw new Error(`conv2d: input must be 4D [N,C,H,W], got ${input.shape}`);
+  if (weight.shape.length !== 4)
+    throw new Error(
+      `conv2d: weight must be 4D [Cout,Cin,kH,kW], got ${weight.shape}`,
+    );
 
   const [N, Cin, H, W] = input.shape;
   const [Cout, CinK, kH, kW] = weight.shape;
-  if (Cin !== CinK) throw new Error(`conv2d: input channels ${Cin} != weight channels ${CinK}`);
+  if (Cin !== CinK)
+    throw new Error(`conv2d: input channels ${Cin} != weight channels ${CinK}`);
 
   const stride = normalizeParam(options?.stride, 1);
   const padding = normalizeParam(options?.padding, 0);
   const hasBias = !!bias;
 
-  if (hasBias && (bias!.shape.length !== 1 || bias!.shape[0] !== Cout)) {
-    throw new Error(`conv2d: bias must be [Cout=${Cout}], got ${bias!.shape}`);
+  if (hasBias && (bias?.shape.length !== 1 || bias?.shape[0] !== Cout)) {
+    throw new Error(`conv2d: bias must be [Cout=${Cout}], got ${bias?.shape}`);
   }
 
-  const outShape = conv2dOutputShape(input.shape, weight.shape, stride, padding);
+  const outShape = conv2dOutputShape(
+    input.shape,
+    weight.shape,
+    stride,
+    padding,
+  );
   const [, , outH, outW] = outShape;
   const totalOut = N * Cout * outH * outW;
 
   const ctx = requireContext();
   const outBuffer = options?.outBuffer
     ? options.outBuffer
-    : resolveOutputBuffer(ctx.device, totalOut * 4, [input.buffer, weight.buffer]);
+    : resolveOutputBuffer(ctx.device, totalOut * 4, [
+        input.buffer,
+        weight.buffer,
+      ]);
 
   const dispatcher = getDispatcher(kH, kW, Cin, hasBias);
 
@@ -213,14 +254,21 @@ export function conv2d(
     out: outBuffer,
   };
   if (hasBias) {
-    buffers.bias = bias!.buffer;
+    buffers.bias = bias?.buffer;
   }
 
   dispatcher.dispatch(buffers, {
-    N, Cin, H, W,
-    Cout, outH, outW,
-    strideH: stride[0], strideW: stride[1],
-    padH: padding[0], padW: padding[1],
+    N,
+    Cin,
+    H,
+    W,
+    Cout,
+    outH,
+    outW,
+    strideH: stride[0],
+    strideW: stride[1],
+    padH: padding[0],
+    padW: padding[1],
     totalOut,
   });
 

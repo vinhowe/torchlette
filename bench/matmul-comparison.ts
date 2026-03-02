@@ -482,7 +482,11 @@ async function runFusedVsUnfusedBenchmark(
   };
   const fusedMs = await benchmark(
     "fused",
-    () => dispatchMatmul(a, b, false, false, undefined, { epilogue, epilogueInputs: [bias] }),
+    () =>
+      dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [bias],
+      }),
     warmup,
     iters,
   );
@@ -505,7 +509,11 @@ async function runFusedVsUnfusedBenchmark(
   };
   const fusedReluMs = await benchmark(
     "fused-relu",
-    () => dispatchMatmul(a, b, false, false, undefined, { epilogue: epilogueRelu, epilogueInputs: [bias] }),
+    () =>
+      dispatchMatmul(a, b, false, false, undefined, {
+        epilogue: epilogueRelu,
+        epilogueInputs: [bias],
+      }),
     warmup,
     iters,
   );
@@ -528,7 +536,11 @@ async function runFusedVsUnfusedBenchmark(
   };
   const fusedGeluMs = await benchmark(
     "fused-gelu",
-    () => dispatchMatmul(a, b, false, false, undefined, { epilogue: epilogueGelu, epilogueInputs: [bias] }),
+    () =>
+      dispatchMatmul(a, b, false, false, undefined, {
+        epilogue: epilogueGelu,
+        epilogueInputs: [bias],
+      }),
     warmup,
     iters,
   );

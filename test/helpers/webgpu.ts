@@ -6,7 +6,7 @@
  * Use `TORCHLETTE_CPU_ONLY=1` to force-skip all WebGPU tests.
  */
 
-import { initWebGPU, getWebGPUInitError } from "../../src/backend/webgpu";
+import { getWebGPUInitError, initWebGPU } from "../../src/backend/webgpu";
 
 /** If true, WebGPU tests are forcibly skipped. */
 export const cpuOnly = process.env.TORCHLETTE_CPU_ONLY === "1";

@@ -128,11 +128,17 @@ describe.skipIf(cpuOnly)("reduction fusion", { timeout: 30000 }, () => {
     const shape = [2, 3];
 
     const xGpu = gpu.tensorFromArray(data, shape);
-    const gpuResult = xGpu.mul(xGpu).add(xGpu).sum({ dim: [1] });
+    const gpuResult = xGpu
+      .mul(xGpu)
+      .add(xGpu)
+      .sum({ dim: [1] });
     const gpuArr = await gpuResult.cpu();
 
     const xCpu = cpu.tensorFromArray(data, shape);
-    const cpuResult = xCpu.mul(xCpu).add(xCpu).sum({ dim: [1] });
+    const cpuResult = xCpu
+      .mul(xCpu)
+      .add(xCpu)
+      .sum({ dim: [1] });
     const cpuArr = await cpuResult.cpu();
 
     expect(gpuArr.length).toBe(cpuArr.length);

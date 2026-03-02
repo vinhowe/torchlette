@@ -20,11 +20,18 @@ import {
   isF16Supported,
   syncWebGPU,
 } from "../../src/backend/webgpu";
-import { dispatchTiledMatmul } from "../../src/backend/webgpu/matmul/dispatch";
-import { DEFAULT_CONFIG, type MatmulKernelConfig } from "../../src/backend/webgpu/matmul/types";
-import type { EpilogueConfig } from "../../src/backend/webgpu/matmul/types";
-import type { GPUBuffer, GPUDevice, GPUQueue } from "../../src/backend/webgpu/gpu-types";
+import type {
+  GPUBuffer,
+  GPUDevice,
+  GPUQueue,
+} from "../../src/backend/webgpu/gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "../../src/backend/webgpu/gpu-types";
+import { dispatchTiledMatmul } from "../../src/backend/webgpu/matmul/dispatch";
+import type { EpilogueConfig } from "../../src/backend/webgpu/matmul/types";
+import {
+  DEFAULT_CONFIG,
+  type MatmulKernelConfig,
+} from "../../src/backend/webgpu/matmul/types";
 
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -35,9 +42,13 @@ const isWebGPUEnabled = !cpuOnly;
 // ---------------------------------------------------------------------------
 
 function matmulReference(
-  a: number[], b: number[],
-  m: number, n: number, k: number,
-  transA = false, transB = false,
+  a: number[],
+  b: number[],
+  m: number,
+  n: number,
+  k: number,
+  transA = false,
+  transB = false,
 ): number[] {
   const out = new Array<number>(m * n).fill(0);
   for (let i = 0; i < m; i++) {
@@ -86,7 +97,7 @@ function makeF16Buffer(data: Float32Array, usage: number): GPUBuffer {
     const man = bits32 & 0x7fffff;
     let h: number;
     if (exp === 0) {
-      h = (sign << 15); // zero / denorm → zero
+      h = sign << 15; // zero / denorm → zero
     } else if (exp === 0xff) {
       h = (sign << 15) | 0x7c00 | (man ? 1 : 0); // inf / nan
     } else {
@@ -94,7 +105,7 @@ function makeF16Buffer(data: Float32Array, usage: number): GPUBuffer {
       if (newExp >= 31) {
         h = (sign << 15) | 0x7c00; // overflow → inf
       } else if (newExp <= 0) {
-        h = (sign << 15); // underflow → zero
+        h = sign << 15; // underflow → zero
       } else {
         h = (sign << 15) | (newExp << 10) | (man >> 13);
       }
@@ -111,14 +122,20 @@ function makeF16Buffer(data: Float32Array, usage: number): GPUBuffer {
   return buf;
 }
 
-function makeOutputBuffer(numElements: number, bytesPerElement: number): GPUBuffer {
+function makeOutputBuffer(
+  numElements: number,
+  bytesPerElement: number,
+): GPUBuffer {
   return device.createBuffer({
     size: numElements * bytesPerElement,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
   });
 }
 
-async function readF32Buffer(buf: GPUBuffer, count: number): Promise<Float32Array> {
+async function readF32Buffer(
+  buf: GPUBuffer,
+  count: number,
+): Promise<Float32Array> {
   const staging = device.createBuffer({
     size: count * 4,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -133,7 +150,10 @@ async function readF32Buffer(buf: GPUBuffer, count: number): Promise<Float32Arra
   return data;
 }
 
-async function readF16Buffer(buf: GPUBuffer, count: number): Promise<Float32Array> {
+async function readF16Buffer(
+  buf: GPUBuffer,
+  count: number,
+): Promise<Float32Array> {
   const staging = device.createBuffer({
     size: count * 2,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -155,11 +175,11 @@ async function readF16Buffer(buf: GPUBuffer, count: number): Promise<Float32Arra
     const man = h & 0x3ff;
     let val: number;
     if (exp === 0) {
-      val = (sign ? -1 : 1) * Math.pow(2, -14) * (man / 1024);
+      val = (sign ? -1 : 1) * 2 ** -14 * (man / 1024);
     } else if (exp === 31) {
-      val = man ? NaN : (sign ? -Infinity : Infinity);
+      val = man ? NaN : sign ? -Infinity : Infinity;
     } else {
-      val = (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + man / 1024);
+      val = (sign ? -1 : 1) * 2 ** (exp - 15) * (1 + man / 1024);
     }
     f32[i] = val;
   }
@@ -173,7 +193,9 @@ function arraysClose(
   atol = 1e-3,
 ): boolean {
   if (actual.length !== expected.length) {
-    console.log(`Length mismatch: actual=${actual.length}, expected=${expected.length}`);
+    console.log(
+      `Length mismatch: actual=${actual.length}, expected=${expected.length}`,
+    );
     return false;
   }
   let worstDiff = 0;
@@ -182,13 +204,16 @@ function arraysClose(
     const diff = Math.abs(actual[i] - expected[i]);
     const bound = atol + rtol * Math.abs(expected[i]);
     if (diff > bound) {
-      if (diff > worstDiff) { worstDiff = diff; worstIdx = i; }
+      if (diff > worstDiff) {
+        worstDiff = diff;
+        worstIdx = i;
+      }
     }
   }
   if (worstIdx >= 0) {
     console.log(
       `Worst mismatch at ${worstIdx}: actual=${actual[worstIdx]}, expected=${expected[worstIdx]}, ` +
-      `diff=${worstDiff}, bound=${atol + rtol * Math.abs(expected[worstIdx])}`,
+        `diff=${worstDiff}, bound=${atol + rtol * Math.abs(expected[worstIdx])}`,
     );
     return false;
   }
@@ -228,87 +253,159 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
     it("computes f16 @ f16 → f16 correctly (64x64)", async () => {
       if (!isF16Supported()) return;
 
-      const m = 64, n = 64, k = 64;
+      const m = 64,
+        n = 64,
+        k = 64;
       const aVals = makeValues(m * k, 0);
       const bVals = makeValues(k * n, 1);
       const expected = matmulReference(aVals, bVals, m, n, k);
 
-      const aBuf = makeF16Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF16Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF16Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF16Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 2); // f16 = 2 bytes
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         dtype: "f16",
-        config: { ...DEFAULT_CONFIG, tileM: 32, tileN: 32, tileK: 16, threadTileM: 4, threadTileN: 4 },
+        config: {
+          ...DEFAULT_CONFIG,
+          tileM: 32,
+          tileN: 32,
+          tileK: 16,
+          threadTileM: 4,
+          threadTileN: 4,
+        },
       });
 
       const result = await readF16Buffer(outBuf, m * n);
       // f16 has limited precision — use wider tolerances
-      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1.0)).toBe(true);
+      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1.0)).toBe(
+        true,
+      );
 
-      aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
     });
 
     it("computes f16 @ f16 → f32 (mixed output) correctly (64x64)", async () => {
       if (!isF16Supported()) return;
 
-      const m = 64, n = 64, k = 64;
+      const m = 64,
+        n = 64,
+        k = 64;
       const aVals = makeValues(m * k, 0);
       const bVals = makeValues(k * n, 1);
       const expected = matmulReference(aVals, bVals, m, n, k);
 
-      const aBuf = makeF16Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF16Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF16Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF16Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 4); // f32 = 4 bytes
 
       // f16 inputs but f32 output: matches the AMP matmul pattern
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         dtype: "f16",
         epilogue: {
           ops: [{ kind: "cast", toDtype: "f32" }],
           additionalInputCount: 0,
           outputDtype: "f32",
         },
-        config: { ...DEFAULT_CONFIG, tileM: 32, tileN: 32, tileK: 16, threadTileM: 4, threadTileN: 4 },
+        config: {
+          ...DEFAULT_CONFIG,
+          tileM: 32,
+          tileN: 32,
+          tileK: 16,
+          threadTileM: 4,
+          threadTileN: 4,
+        },
       });
 
       const result = await readF32Buffer(outBuf, m * n);
       // f16 input quantization limits precision even with f32 output
-      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1.0)).toBe(true);
+      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1.0)).toBe(
+        true,
+      );
 
-      aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
     });
 
     it("computes non-tile-aligned f16 matmul (50x70x60)", async () => {
       if (!isF16Supported()) return;
 
-      const m = 50, n = 70, k = 60;
+      const m = 50,
+        n = 70,
+        k = 60;
       const aVals = makeValues(m * k, 5);
       const bVals = makeValues(k * n, 3);
       const expected = matmulReference(aVals, bVals, m, n, k);
 
-      const aBuf = makeF16Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF16Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF16Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF16Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 2);
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         dtype: "f16",
-        config: { ...DEFAULT_CONFIG, tileM: 32, tileN: 32, tileK: 16, threadTileM: 4, threadTileN: 4 },
+        config: {
+          ...DEFAULT_CONFIG,
+          tileM: 32,
+          tileN: 32,
+          tileK: 16,
+          threadTileM: 4,
+          threadTileN: 4,
+        },
       });
 
       const result = await readF16Buffer(outBuf, m * n);
-      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1.0)).toBe(true);
+      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1.0)).toBe(
+        true,
+      );
 
-      aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
     });
   });
 
@@ -318,25 +415,41 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
   describe("transpose modes", () => {
     const config: MatmulKernelConfig = {
       ...DEFAULT_CONFIG,
-      tileM: 32, tileN: 32, tileK: 16,
-      threadTileM: 4, threadTileN: 4,
+      tileM: 32,
+      tileN: 32,
+      tileK: 16,
+      threadTileM: 4,
+      threadTileN: 4,
     };
 
     it("TN: transposed A (64x64)", async () => {
-      const m = 64, n = 64, k = 64;
+      const m = 64,
+        n = 64,
+        k = 64;
       // A is stored as [K, M] (transposed)
       const aVals = makeValues(k * m, 0);
       const bVals = makeValues(k * n, 1);
       const expected = matmulReference(aVals, bVals, m, n, k, true, false);
 
-      const aBuf = makeF32Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF32Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF32Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF32Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 4);
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         transA: true,
         dtype: "f32",
         config,
@@ -345,24 +458,39 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
       const result = await readF32Buffer(outBuf, m * n);
       expect(arraysClose(result, new Float32Array(expected))).toBe(true);
 
-      aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
     });
 
     it("NT: transposed B (64x64)", async () => {
-      const m = 64, n = 64, k = 64;
+      const m = 64,
+        n = 64,
+        k = 64;
       const aVals = makeValues(m * k, 0);
       // B is stored as [N, K] (transposed)
       const bVals = makeValues(n * k, 1);
       const expected = matmulReference(aVals, bVals, m, n, k, false, true);
 
-      const aBuf = makeF32Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF32Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF32Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF32Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 4);
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         transB: true,
         dtype: "f32",
         config,
@@ -371,23 +499,38 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
       const result = await readF32Buffer(outBuf, m * n);
       expect(arraysClose(result, new Float32Array(expected))).toBe(true);
 
-      aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
     });
 
     it("TT: both transposed (64x64)", async () => {
-      const m = 64, n = 64, k = 64;
+      const m = 64,
+        n = 64,
+        k = 64;
       const aVals = makeValues(k * m, 0);
       const bVals = makeValues(n * k, 1);
       const expected = matmulReference(aVals, bVals, m, n, k, true, true);
 
-      const aBuf = makeF32Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF32Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF32Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF32Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 4);
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         transA: true,
         transB: true,
         dtype: "f32",
@@ -397,50 +540,82 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
       const result = await readF32Buffer(outBuf, m * n);
       expect(arraysClose(result, new Float32Array(expected))).toBe(true);
 
-      aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
     });
 
     it("TN with f16 inputs (64x64)", async () => {
       if (!isF16Supported()) return;
 
-      const m = 64, n = 64, k = 64;
+      const m = 64,
+        n = 64,
+        k = 64;
       const aVals = makeValues(k * m, 0);
       const bVals = makeValues(k * n, 1);
       const expected = matmulReference(aVals, bVals, m, n, k, true, false);
 
-      const aBuf = makeF16Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF16Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF16Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF16Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 2);
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         transA: true,
         dtype: "f16",
         config,
       });
 
       const result = await readF16Buffer(outBuf, m * n);
-      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1.0)).toBe(true);
+      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1.0)).toBe(
+        true,
+      );
 
-      aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
     });
 
     it("non-tile-aligned TN (50x70x60)", async () => {
-      const m = 50, n = 70, k = 60;
+      const m = 50,
+        n = 70,
+        k = 60;
       const aVals = makeValues(k * m, 2);
       const bVals = makeValues(k * n, 3);
       const expected = matmulReference(aVals, bVals, m, n, k, true, false);
 
-      const aBuf = makeF32Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF32Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF32Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF32Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 4);
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         transA: true,
         dtype: "f32",
         config,
@@ -449,7 +624,9 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
       const result = await readF32Buffer(outBuf, m * n);
       expect(arraysClose(result, new Float32Array(expected))).toBe(true);
 
-      aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
     });
   });
 
@@ -458,55 +635,103 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
   // -------------------------------------------------------------------------
   describe("K-split", () => {
     it("K-split f32: small M, large K (8x64x512)", async () => {
-      const m = 8, n = 64, k = 512;
-      const aVals = makeValues(m * k, 0).map(v => v * 0.1);
-      const bVals = makeValues(k * n, 1).map(v => v * 0.1);
+      const m = 8,
+        n = 64,
+        k = 512;
+      const aVals = makeValues(m * k, 0).map((v) => v * 0.1);
+      const bVals = makeValues(k * n, 1).map((v) => v * 0.1);
       const expected = matmulReference(aVals, bVals, m, n, k);
 
-      const aBuf = makeF32Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF32Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF32Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF32Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 4);
 
       // Use a config with small tiles to trigger K-split
       // (baseWorkgroups = ceil(64/32)*ceil(8/32) = 2*1 = 2, which is < 64 and K > 512)
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         dtype: "f32",
-        config: { ...DEFAULT_CONFIG, tileM: 32, tileN: 32, tileK: 16, threadTileM: 4, threadTileN: 4 },
+        config: {
+          ...DEFAULT_CONFIG,
+          tileM: 32,
+          tileN: 32,
+          tileK: 16,
+          threadTileM: 4,
+          threadTileN: 4,
+        },
       });
 
       const result = await readF32Buffer(outBuf, m * n);
-      expect(arraysClose(result, new Float32Array(expected), 1e-3, 1e-2)).toBe(true);
+      expect(arraysClose(result, new Float32Array(expected), 1e-3, 1e-2)).toBe(
+        true,
+      );
 
-      aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
     });
 
     it("K-split f16: small M, large K (8x64x512)", async () => {
       if (!isF16Supported()) return;
 
-      const m = 8, n = 64, k = 512;
-      const aVals = makeValues(m * k, 0).map(v => v * 0.1);
-      const bVals = makeValues(k * n, 1).map(v => v * 0.1);
+      const m = 8,
+        n = 64,
+        k = 512;
+      const aVals = makeValues(m * k, 0).map((v) => v * 0.1);
+      const bVals = makeValues(k * n, 1).map((v) => v * 0.1);
       const expected = matmulReference(aVals, bVals, m, n, k);
 
-      const aBuf = makeF16Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF16Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF16Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF16Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 2);
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         dtype: "f16",
-        config: { ...DEFAULT_CONFIG, tileM: 32, tileN: 32, tileK: 16, threadTileM: 4, threadTileN: 4 },
+        config: {
+          ...DEFAULT_CONFIG,
+          tileM: 32,
+          tileN: 32,
+          tileK: 16,
+          threadTileM: 4,
+          threadTileN: 4,
+        },
       });
 
       const result = await readF16Buffer(outBuf, m * n);
-      expect(arraysClose(result, new Float32Array(expected), 0.1, 1.0)).toBe(true);
+      expect(arraysClose(result, new Float32Array(expected), 0.1, 1.0)).toBe(
+        true,
+      );
 
-      aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
     });
   });
 
@@ -518,18 +743,34 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
     it("cast + bias + binary add (f16 input, f32 output)", async () => {
       if (!isF16Supported()) return;
 
-      const m = 32, n = 32, k = 32;
-      const aVals = makeValues(m * k, 0).map(v => v * 0.5);
-      const bVals = makeValues(k * n, 1).map(v => v * 0.5);
-      const biasVals = makeValues(n, 2).map(v => v * 0.1);
-      const residualVals = makeValues(m * n, 3).map(v => v * 0.2);
+      const m = 32,
+        n = 32,
+        k = 32;
+      const aVals = makeValues(m * k, 0).map((v) => v * 0.5);
+      const bVals = makeValues(k * n, 1).map((v) => v * 0.5);
+      const biasVals = makeValues(n, 2).map((v) => v * 0.1);
+      const residualVals = makeValues(m * n, 3).map((v) => v * 0.2);
       const mmRef = matmulReference(aVals, bVals, m, n, k);
-      const expected = mmRef.map((v, i) => v + biasVals[i % n] + residualVals[i]);
+      const expected = mmRef.map(
+        (v, i) => v + biasVals[i % n] + residualVals[i],
+      );
 
-      const aBuf = makeF16Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF16Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
-      const biasBuf = makeF32Buffer(new Float32Array(biasVals), GPUBufferUsage.STORAGE);
-      const residualBuf = makeF32Buffer(new Float32Array(residualVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF16Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF16Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const biasBuf = makeF32Buffer(
+        new Float32Array(biasVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const residualBuf = makeF32Buffer(
+        new Float32Array(residualVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 4);
 
       const epilogue: EpilogueConfig = {
@@ -543,34 +784,68 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
       };
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         dtype: "f16",
         epilogue,
         epilogueInputs: [biasBuf, residualBuf],
-        config: { ...DEFAULT_CONFIG, tileM: 32, tileN: 32, tileK: 16, threadTileM: 4, threadTileN: 4 },
+        config: {
+          ...DEFAULT_CONFIG,
+          tileM: 32,
+          tileN: 32,
+          tileK: 16,
+          threadTileM: 4,
+          threadTileN: 4,
+        },
       });
 
       const result = await readF32Buffer(outBuf, m * n);
-      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1.0)).toBe(true);
+      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1.0)).toBe(
+        true,
+      );
 
-      aBuf.destroy(); bBuf.destroy(); biasBuf.destroy(); residualBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      biasBuf.destroy();
+      residualBuf.destroy();
+      outBuf.destroy();
     });
 
     it("bias + binary add (f32 throughout)", async () => {
-      const m = 64, n = 64, k = 32;
+      const m = 64,
+        n = 64,
+        k = 32;
       const aVals = makeValues(m * k, 0);
       const bVals = makeValues(k * n, 1);
       const biasVals = makeValues(n, 2);
       const residualVals = makeValues(m * n, 3);
       const mmRef = matmulReference(aVals, bVals, m, n, k);
-      const expected = mmRef.map((v, i) => v + biasVals[i % n] + residualVals[i]);
+      const expected = mmRef.map(
+        (v, i) => v + biasVals[i % n] + residualVals[i],
+      );
 
-      const aBuf = makeF32Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF32Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
-      const biasBuf = makeF32Buffer(new Float32Array(biasVals), GPUBufferUsage.STORAGE);
-      const residualBuf = makeF32Buffer(new Float32Array(residualVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF32Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF32Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const biasBuf = makeF32Buffer(
+        new Float32Array(biasVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const residualBuf = makeF32Buffer(
+        new Float32Array(residualVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 4);
 
       const epilogue: EpilogueConfig = {
@@ -583,19 +858,35 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
       };
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         dtype: "f32",
         epilogue,
         epilogueInputs: [biasBuf, residualBuf],
-        config: { ...DEFAULT_CONFIG, tileM: 32, tileN: 32, tileK: 16, threadTileM: 4, threadTileN: 4 },
+        config: {
+          ...DEFAULT_CONFIG,
+          tileM: 32,
+          tileN: 32,
+          tileK: 16,
+          threadTileM: 4,
+          threadTileN: 4,
+        },
       });
 
       const result = await readF32Buffer(outBuf, m * n);
       expect(arraysClose(result, new Float32Array(expected))).toBe(true);
 
-      aBuf.destroy(); bBuf.destroy(); biasBuf.destroy(); residualBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      biasBuf.destroy();
+      residualBuf.destroy();
+      outBuf.destroy();
     });
   });
 
@@ -606,56 +897,104 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
     it("f16 @ f32 → f32 (64x64)", async () => {
       if (!isF16Supported()) return;
 
-      const m = 64, n = 64, k = 64;
+      const m = 64,
+        n = 64,
+        k = 64;
       const aVals = makeValues(m * k, 0);
       const bVals = makeValues(k * n, 1);
       const expected = matmulReference(aVals, bVals, m, n, k);
 
-      const aBuf = makeF16Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF32Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF16Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF32Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 4);
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         dtype: "f16",
         dtypeB: "f32",
-        config: { ...DEFAULT_CONFIG, tileM: 32, tileN: 32, tileK: 16, threadTileM: 4, threadTileN: 4 },
+        config: {
+          ...DEFAULT_CONFIG,
+          tileM: 32,
+          tileN: 32,
+          tileK: 16,
+          threadTileM: 4,
+          threadTileN: 4,
+        },
       });
 
       const result = await readF32Buffer(outBuf, m * n);
       // A is quantized to f16, so limited precision
-      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1.0)).toBe(true);
+      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1.0)).toBe(
+        true,
+      );
 
-      aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
     });
 
     it("f32 @ f16 → f32 (64x64)", async () => {
       if (!isF16Supported()) return;
 
-      const m = 64, n = 64, k = 64;
+      const m = 64,
+        n = 64,
+        k = 64;
       const aVals = makeValues(m * k, 0);
       const bVals = makeValues(k * n, 1);
       const expected = matmulReference(aVals, bVals, m, n, k);
 
-      const aBuf = makeF32Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF16Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF32Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF16Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 4);
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         dtype: "f32",
         dtypeB: "f16",
-        config: { ...DEFAULT_CONFIG, tileM: 32, tileN: 32, tileK: 16, threadTileM: 4, threadTileN: 4 },
+        config: {
+          ...DEFAULT_CONFIG,
+          tileM: 32,
+          tileN: 32,
+          tileK: 16,
+          threadTileM: 4,
+          threadTileN: 4,
+        },
       });
 
       const result = await readF32Buffer(outBuf, m * n);
-      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1.0)).toBe(true);
+      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1.0)).toBe(
+        true,
+      );
 
-      aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
     });
   });
 
@@ -664,51 +1003,95 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
   // -------------------------------------------------------------------------
   describe("larger tile configs", () => {
     it("64x64 tile (128x128 matmul)", async () => {
-      const m = 128, n = 128, k = 64;
+      const m = 128,
+        n = 128,
+        k = 64;
       const aVals = makeValues(m * k, 0);
       const bVals = makeValues(k * n, 1);
       const expected = matmulReference(aVals, bVals, m, n, k);
 
-      const aBuf = makeF32Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF32Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF32Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF32Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 4);
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         dtype: "f32",
-        config: { ...DEFAULT_CONFIG, tileM: 64, tileN: 64, tileK: 8, threadTileM: 4, threadTileN: 4 },
+        config: {
+          ...DEFAULT_CONFIG,
+          tileM: 64,
+          tileN: 64,
+          tileK: 8,
+          threadTileM: 4,
+          threadTileN: 4,
+        },
       });
 
       const result = await readF32Buffer(outBuf, m * n);
       expect(arraysClose(result, new Float32Array(expected))).toBe(true);
 
-      aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
     });
 
     it("64x64 tile with 8x4 thread tiles (128x128 matmul)", async () => {
-      const m = 128, n = 128, k = 64;
+      const m = 128,
+        n = 128,
+        k = 64;
       const aVals = makeValues(m * k, 0);
       const bVals = makeValues(k * n, 1);
       const expected = matmulReference(aVals, bVals, m, n, k);
 
-      const aBuf = makeF32Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF32Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF32Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF32Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 4);
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         dtype: "f32",
-        config: { ...DEFAULT_CONFIG, tileM: 64, tileN: 64, tileK: 8, threadTileM: 8, threadTileN: 4 },
+        config: {
+          ...DEFAULT_CONFIG,
+          tileM: 64,
+          tileN: 64,
+          tileK: 8,
+          threadTileM: 8,
+          threadTileN: 4,
+        },
       });
 
       const result = await readF32Buffer(outBuf, m * n);
       expect(arraysClose(result, new Float32Array(expected))).toBe(true);
 
-      aBuf.destroy(); bBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
     });
   });
 
@@ -719,21 +1102,32 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
     it("cast + bias + gelu (f16 → f32)", async () => {
       if (!isF16Supported()) return;
 
-      const m = 32, n = 32, k = 32;
-      const aVals = makeValues(m * k, 0).map(v => v * 0.1);
-      const bVals = makeValues(k * n, 1).map(v => v * 0.1);
-      const biasVals = makeValues(n, 2).map(v => v * 0.1);
+      const m = 32,
+        n = 32,
+        k = 32;
+      const aVals = makeValues(m * k, 0).map((v) => v * 0.1);
+      const bVals = makeValues(k * n, 1).map((v) => v * 0.1);
+      const biasVals = makeValues(n, 2).map((v) => v * 0.1);
       const mmRef = matmulReference(aVals, bVals, m, n, k);
       // cast(f16→f32) + bias + gelu
       const biased = mmRef.map((v, i) => v + biasVals[i % n]);
-      const expected = biased.map(x => {
+      const expected = biased.map((x) => {
         const inner = 0.7978845608 * (x + 0.044715 * x * x * x);
         return 0.5 * x * (1 + Math.tanh(inner));
       });
 
-      const aBuf = makeF16Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF16Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
-      const biasBuf = makeF32Buffer(new Float32Array(biasVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF16Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF16Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const biasBuf = makeF32Buffer(
+        new Float32Array(biasVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 4);
 
       const epilogue: EpilogueConfig = {
@@ -747,38 +1141,66 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
       };
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         dtype: "f16",
         epilogue,
         epilogueInputs: [biasBuf],
-        config: { ...DEFAULT_CONFIG, tileM: 32, tileN: 32, tileK: 16, threadTileM: 4, threadTileN: 4 },
+        config: {
+          ...DEFAULT_CONFIG,
+          tileM: 32,
+          tileN: 32,
+          tileK: 16,
+          threadTileM: 4,
+          threadTileN: 4,
+        },
       });
 
       const result = await readF32Buffer(outBuf, m * n);
-      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1e-1)).toBe(true);
+      expect(arraysClose(result, new Float32Array(expected), 5e-2, 1e-1)).toBe(
+        true,
+      );
 
-      aBuf.destroy(); bBuf.destroy(); biasBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      biasBuf.destroy();
+      outBuf.destroy();
     });
 
     it("cast + bias + gelu + cast (f16 → f32 → gelu → f16)", async () => {
       if (!isF16Supported()) return;
 
-      const m = 32, n = 32, k = 32;
-      const aVals = makeValues(m * k, 0).map(v => v * 0.1);
-      const bVals = makeValues(k * n, 1).map(v => v * 0.1);
-      const biasVals = makeValues(n, 2).map(v => v * 0.1);
+      const m = 32,
+        n = 32,
+        k = 32;
+      const aVals = makeValues(m * k, 0).map((v) => v * 0.1);
+      const bVals = makeValues(k * n, 1).map((v) => v * 0.1);
+      const biasVals = makeValues(n, 2).map((v) => v * 0.1);
       const mmRef = matmulReference(aVals, bVals, m, n, k);
       const biased = mmRef.map((v, i) => v + biasVals[i % n]);
-      const expected = biased.map(x => {
+      const expected = biased.map((x) => {
         const inner = 0.7978845608 * (x + 0.044715 * x * x * x);
         return 0.5 * x * (1 + Math.tanh(inner));
       });
 
-      const aBuf = makeF16Buffer(new Float32Array(aVals), GPUBufferUsage.STORAGE);
-      const bBuf = makeF16Buffer(new Float32Array(bVals), GPUBufferUsage.STORAGE);
-      const biasBuf = makeF32Buffer(new Float32Array(biasVals), GPUBufferUsage.STORAGE);
+      const aBuf = makeF16Buffer(
+        new Float32Array(aVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const bBuf = makeF16Buffer(
+        new Float32Array(bVals),
+        GPUBufferUsage.STORAGE,
+      );
+      const biasBuf = makeF32Buffer(
+        new Float32Array(biasVals),
+        GPUBufferUsage.STORAGE,
+      );
       const outBuf = makeOutputBuffer(m * n, 2); // output is f16
 
       const epilogue: EpilogueConfig = {
@@ -793,19 +1215,36 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
       };
 
       dispatchTiledMatmul({
-        device, queue,
-        a: aBuf, b: bBuf, out: outBuf,
-        m, n, k,
+        device,
+        queue,
+        a: aBuf,
+        b: bBuf,
+        out: outBuf,
+        m,
+        n,
+        k,
         dtype: "f16",
         epilogue,
         epilogueInputs: [biasBuf],
-        config: { ...DEFAULT_CONFIG, tileM: 32, tileN: 32, tileK: 16, threadTileM: 4, threadTileN: 4 },
+        config: {
+          ...DEFAULT_CONFIG,
+          tileM: 32,
+          tileN: 32,
+          tileK: 16,
+          threadTileM: 4,
+          threadTileN: 4,
+        },
       });
 
       const result = await readF16Buffer(outBuf, m * n);
-      expect(arraysClose(result, new Float32Array(expected), 0.1, 0.5)).toBe(true);
+      expect(arraysClose(result, new Float32Array(expected), 0.1, 0.5)).toBe(
+        true,
+      );
 
-      aBuf.destroy(); bBuf.destroy(); biasBuf.destroy(); outBuf.destroy();
+      aBuf.destroy();
+      bBuf.destroy();
+      biasBuf.destroy();
+      outBuf.destroy();
     });
   });
 });

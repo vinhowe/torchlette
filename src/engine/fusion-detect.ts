@@ -169,7 +169,9 @@ function processCandidate(
 
     // Check binding limit: non-inlined externalInputs + 1 (primary) + N (additional) <= maxBuffers
     const externalInputs = collectExternalInputs(subNodes, subNodeIds);
-    const nonInlinedInputs = externalInputs.filter(ref => !isInlinableScalar(ref).inlinable).length;
+    const nonInlinedInputs = externalInputs.filter(
+      (ref) => !isInlinableScalar(ref).inlinable,
+    ).length;
     const totalBindings = nonInlinedInputs + 1 + additionalNodes.length;
 
     if (shapesMatch && totalBindings <= maxBuffers) {
@@ -179,7 +181,8 @@ function processCandidate(
         planIndices: subIndices,
         externalInputs,
         outputNode: primaryOutputNode,
-        additionalOutputNodes: additionalNodes.length > 0 ? additionalNodes : undefined,
+        additionalOutputNodes:
+          additionalNodes.length > 0 ? additionalNodes : undefined,
       });
       return; // Skip split logic
     }
@@ -278,7 +281,10 @@ function processCandidate(
 function buildCandidateGroups(
   nodes: LazyIRNode[],
   epilogueClaimedIds: Set<number> | undefined,
-): { candidateGroups: Array<{ nodes: LazyIRNode[]; indices: number[] }>; fusibleCount: number } {
+): {
+  candidateGroups: Array<{ nodes: LazyIRNode[]; indices: number[] }>;
+  fusibleCount: number;
+} {
   const candidateGroups: Array<{ nodes: LazyIRNode[]; indices: number[] }> = [];
   let currentGroup: { nodes: LazyIRNode[]; indices: number[] } | null = null;
   const candidateNodeIds = new Set<number>();
@@ -377,7 +383,7 @@ function splitCandidatesByComponent(
     for (let k = 0; k < candidate.nodes.length; k++) {
       const root = find(k);
       if (!componentMap.has(root)) componentMap.set(root, []);
-      componentMap.get(root)!.push(k);
+      componentMap.get(root)?.push(k);
     }
 
     // Process each connected component separately
@@ -413,8 +419,15 @@ function splitCandidatesByComponent(
       }
 
       processCandidate(
-        subNodes, subIndices, subNodeIds, internalDeps,
-        nodes, externalNodeIds, enableMultiOutput, maxBuffers, groups,
+        subNodes,
+        subIndices,
+        subNodeIds,
+        internalDeps,
+        nodes,
+        externalNodeIds,
+        enableMultiOutput,
+        maxBuffers,
+        groups,
       );
     }
 
@@ -425,7 +438,7 @@ function splitCandidatesByComponent(
         const node = candidate.nodes[pos];
         const key = `${(node.shape ?? [1]).join(",")}_${node.dtype ?? "f32"}`;
         if (!byShapeDtype.has(key)) byShapeDtype.set(key, []);
-        byShapeDtype.get(key)!.push(pos);
+        byShapeDtype.get(key)?.push(pos);
       }
 
       for (const sameShapePositions of byShapeDtype.values()) {
@@ -440,7 +453,11 @@ function splitCandidatesByComponent(
           for (let j = batchStart; j < sameShapePositions.length; j++) {
             const node = candidate.nodes[sameShapePositions[j]];
             const newCount = countNewInputKeys(node, seenInputs);
-            if (seenInputs.size + newCount + batchPositions.length + 1 > maxBuffers && batchPositions.length >= 2) {
+            if (
+              seenInputs.size + newCount + batchPositions.length + 1 >
+                maxBuffers &&
+              batchPositions.length >= 2
+            ) {
               break;
             }
             batchPositions.push(sameShapePositions[j]);
@@ -449,7 +466,9 @@ function splitCandidatesByComponent(
 
           if (batchPositions.length < 2) break;
           batchStart += batchPositions.length;
-          groups.push(makeBatchGroup(batchPositions, candidate.nodes, candidate.indices));
+          groups.push(
+            makeBatchGroup(batchPositions, candidate.nodes, candidate.indices),
+          );
         }
       }
     }
@@ -461,12 +480,17 @@ function splitCandidatesByComponent(
 /**
  * Phase 3: Split groups that exceed the storage buffer binding limit.
  */
-function splitGroupsByBufferLimit(groups: FusionGroup[], maxBuffers: number): FusionGroup[] {
+function splitGroupsByBufferLimit(
+  groups: FusionGroup[],
+  maxBuffers: number,
+): FusionGroup[] {
   const finalGroups: FusionGroup[] = [];
   for (const group of groups) {
     const numOutputs = 1 + (group.additionalOutputNodes?.length ?? 0);
     const maxInputsForGroup = maxBuffers - numOutputs;
-    const nonInlinableInputs = group.externalInputs.filter(ref => !isInlinableScalar(ref).inlinable).length;
+    const nonInlinableInputs = group.externalInputs.filter(
+      (ref) => !isInlinableScalar(ref).inlinable,
+    ).length;
     if (nonInlinableInputs <= maxInputsForGroup) {
       finalGroups.push(group);
       continue;
@@ -498,18 +522,25 @@ function batchGlobalSingletons(
   const singletons: Array<{ node: LazyIRNode; planIndex: number }> = [];
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i];
-    if (isFusibleOp(node.op) && !groupedNodeIds.has(node.id) && !epilogueClaimedIds?.has(node.id)) {
+    if (
+      isFusibleOp(node.op) &&
+      !groupedNodeIds.has(node.id) &&
+      !epilogueClaimedIds?.has(node.id)
+    ) {
       singletons.push({ node, planIndex: i });
     }
   }
 
   if (singletons.length < 2) return;
 
-  const byShapeDtype = new Map<string, Array<{ node: LazyIRNode; planIndex: number }>>();
+  const byShapeDtype = new Map<
+    string,
+    Array<{ node: LazyIRNode; planIndex: number }>
+  >();
   for (const s of singletons) {
     const key = `${(s.node.shape ?? [1]).join(",")}_${s.node.dtype ?? "f32"}`;
     if (!byShapeDtype.has(key)) byShapeDtype.set(key, []);
-    byShapeDtype.get(key)!.push(s);
+    byShapeDtype.get(key)?.push(s);
   }
 
   // Build earliest-consumer-position map
@@ -565,8 +596,10 @@ function batchGlobalSingletons(
             const gapNode = nodes[g];
             if (!gapNode) continue;
             for (const input of gapNode.inputs) {
-              if (input.kind === "pending" &&
-                  (batchNodeIds.has(input.node.id) || input.node.id === node.id)) {
+              if (
+                input.kind === "pending" &&
+                (batchNodeIds.has(input.node.id) || input.node.id === node.id)
+              ) {
                 orderingSafe = false;
                 break;
               }
@@ -577,7 +610,10 @@ function batchGlobalSingletons(
         if (!orderingSafe) break;
 
         const newCount = countNewInputKeys(node, seenInputs);
-        if (seenInputs.size + newCount + batchEntries.length + 1 > maxBuffers && batchEntries.length >= 2) {
+        if (
+          seenInputs.size + newCount + batchEntries.length + 1 > maxBuffers &&
+          batchEntries.length >= 2
+        ) {
           break;
         }
 
@@ -595,8 +631,8 @@ function batchGlobalSingletons(
 
       batchStart = endJ;
 
-      const batchNodes = batchEntries.map(e => e.node);
-      const batchIndices = batchEntries.map(e => e.planIndex);
+      const batchNodes = batchEntries.map((e) => e.node);
+      const batchIndices = batchEntries.map((e) => e.planIndex);
       finalGroups.push({
         nodes: batchNodes,
         planIndices: batchIndices,
@@ -623,14 +659,17 @@ function promoteIntermediates(
     for (const input of planNode.inputs) {
       if (input.kind === "pending") {
         let arr = consumers.get(input.node.id);
-        if (!arr) { arr = []; consumers.set(input.node.id, arr); }
+        if (!arr) {
+          arr = [];
+          consumers.set(input.node.id, arr);
+        }
         arr.push(planNode.id);
       }
     }
   }
 
   for (const group of finalGroups) {
-    const groupNodeIds = new Set(group.nodes.map(n => n.id));
+    const groupNodeIds = new Set(group.nodes.map((n) => n.id));
     const outputIds = new Set<number>();
     outputIds.add(group.outputNode.id);
     if (group.additionalOutputNodes) {
@@ -645,7 +684,10 @@ function promoteIntermediates(
         const cons = consumers.get(gnode.id);
         if (cons) {
           for (const cid of cons) {
-            if (!groupNodeIds.has(cid)) { isExternal = true; break; }
+            if (!groupNodeIds.has(cid)) {
+              isExternal = true;
+              break;
+            }
           }
         }
       }
@@ -654,14 +696,19 @@ function promoteIntermediates(
 
     if (neededIntermediates.length > 0) {
       const primaryShape = group.outputNode.shape;
-      const promotable = neededIntermediates.filter(
-        n => shapesEqual(n.shape, primaryShape),
+      const promotable = neededIntermediates.filter((n) =>
+        shapesEqual(n.shape, primaryShape),
       );
       const currentOutputs = 1 + (group.additionalOutputNodes?.length ?? 0);
-      const nonInlinedExtInputs = group.externalInputs.filter(ref => !isInlinableScalar(ref).inlinable).length;
+      const nonInlinedExtInputs = group.externalInputs.filter(
+        (ref) => !isInlinableScalar(ref).inlinable,
+      ).length;
       const availableSlots = maxBuffers - nonInlinedExtInputs - currentOutputs;
 
-      if (promotable.length === neededIntermediates.length && promotable.length <= availableSlots) {
+      if (
+        promotable.length === neededIntermediates.length &&
+        promotable.length <= availableSlots
+      ) {
         group.additionalOutputNodes = [
           ...(group.additionalOutputNodes ?? []),
           ...promotable,
@@ -676,18 +723,29 @@ function promoteIntermediates(
 export function detectFusionGroups(
   nodes: LazyIRNode[],
   externalNodeIds?: Set<number>,
-  options?: { maxStorageBuffers?: number; enableMultiOutput?: boolean; epilogueClaimedIds?: Set<number> },
+  options?: {
+    maxStorageBuffers?: number;
+    enableMultiOutput?: boolean;
+    epilogueClaimedIds?: Set<number>;
+  },
 ): FusionDetectionResult {
   const maxBuffers = options?.maxStorageBuffers ?? Infinity;
   const enableMultiOutput = options?.enableMultiOutput ?? false;
   const epilogueClaimedIds = options?.epilogueClaimedIds;
 
   // Phase 1: Build candidate groups of consecutive fusible ops
-  const { candidateGroups, fusibleCount } = buildCandidateGroups(nodes, epilogueClaimedIds);
+  const { candidateGroups, fusibleCount } = buildCandidateGroups(
+    nodes,
+    epilogueClaimedIds,
+  );
 
   // Phase 2: Split into connected components, process each, batch singletons
   const groups = splitCandidatesByComponent(
-    candidateGroups, nodes, externalNodeIds, enableMultiOutput, maxBuffers,
+    candidateGroups,
+    nodes,
+    externalNodeIds,
+    enableMultiOutput,
+    maxBuffers,
   );
 
   // Phase 3: Split groups exceeding storage buffer limit
@@ -730,7 +788,8 @@ function splitGroupByInputLimit(
   // Track which nodes were additional outputs in the original group
   const originalAdditionalIds = new Set<number>();
   if (group.additionalOutputNodes) {
-    for (const n of group.additionalOutputNodes) originalAdditionalIds.add(n.id);
+    for (const n of group.additionalOutputNodes)
+      originalAdditionalIds.add(n.id);
   }
 
   let subNodes: LazyIRNode[] = [];
@@ -758,7 +817,8 @@ function splitGroupByInputLimit(
         planIndices: subIndices,
         externalInputs,
         outputNode,
-        additionalOutputNodes: additionalOutputNodes.length > 0 ? additionalOutputNodes : undefined,
+        additionalOutputNodes:
+          additionalOutputNodes.length > 0 ? additionalOutputNodes : undefined,
       });
     }
     subNodes = [];
@@ -781,7 +841,10 @@ function splitGroupByInputLimit(
           newExternalCount++;
         }
       } else if (input.kind === "pending") {
-        if (!subNodeIds.has(input.node.id) && !externalPendingIds.has(input.node.id)) {
+        if (
+          !subNodeIds.has(input.node.id) &&
+          !externalPendingIds.has(input.node.id)
+        ) {
           // Skip inlinable scalar constants — they won't consume a binding
           const check = isInlinableScalar(input);
           if (!check.inlinable) {
@@ -791,8 +854,12 @@ function splitGroupByInputLimit(
       }
     }
 
-    const currentExternalCount = externalStorageIds.size + externalPendingIds.size;
-    if (currentExternalCount + newExternalCount > maxExternalInputs && subNodes.length >= 2) {
+    const currentExternalCount =
+      externalStorageIds.size + externalPendingIds.size;
+    if (
+      currentExternalCount + newExternalCount > maxExternalInputs &&
+      subNodes.length >= 2
+    ) {
       // Adding this node would exceed the limit — flush current sub-group
       flushSubGroup();
       // Re-count this node's externals against the fresh sub-group
@@ -828,11 +895,12 @@ function splitGroupByInputLimit(
     for (let g = 0; g < result.length - 1; g++) {
       const earlier = result[g];
       const later = result[g + 1];
-      const earlierNodeIds = new Set(earlier.nodes.map(n => n.id));
+      const earlierNodeIds = new Set(earlier.nodes.map((n) => n.id));
       const earlierOutputIds = new Set<number>();
       earlierOutputIds.add(earlier.outputNode.id);
       if (earlier.additionalOutputNodes) {
-        for (const n of earlier.additionalOutputNodes) earlierOutputIds.add(n.id);
+        for (const n of earlier.additionalOutputNodes)
+          earlierOutputIds.add(n.id);
       }
 
       // Find nodes in the later group that depend on intermediates of the earlier group
@@ -845,15 +913,21 @@ function splitGroupByInputLimit(
 
           // depId is an intermediate of the earlier group consumed by the later group
           // Check if it can be promoted as an additional output
-          const depNode = earlier.nodes.find(n => n.id === depId);
+          const depNode = earlier.nodes.find((n) => n.id === depId);
           if (!depNode) continue;
 
           if (shapesEqual(depNode.shape, earlier.outputNode.shape)) {
             // Check binding limit: externalInputs + currentOutputs + 1 <= maxExternalInputs + currentOutputs
-            const currentOutputs = 1 + (earlier.additionalOutputNodes?.length ?? 0);
-            const availableSlots = (maxExternalInputs + currentOutputs) - earlier.externalInputs.length - currentOutputs;
+            const currentOutputs =
+              1 + (earlier.additionalOutputNodes?.length ?? 0);
+            const availableSlots =
+              maxExternalInputs +
+              currentOutputs -
+              earlier.externalInputs.length -
+              currentOutputs;
             if (availableSlots > 0) {
-              if (!earlier.additionalOutputNodes) earlier.additionalOutputNodes = [];
+              if (!earlier.additionalOutputNodes)
+                earlier.additionalOutputNodes = [];
               earlier.additionalOutputNodes.push(depNode);
               earlierOutputIds.add(depId);
             }
@@ -1008,7 +1082,8 @@ export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
     }
 
     // Check if node is any output (primary or additional)
-    const isAdditionalOutput = group.additionalOutputNodes?.some((n) => n.id === node.id) ?? false;
+    const isAdditionalOutput =
+      group.additionalOutputNodes?.some((n) => n.id === node.id) ?? false;
     fusedNodes.push({
       id: node.id,
       op: fusedOp,
@@ -1066,7 +1141,11 @@ export type ExecutionSegment =
 export function segmentPlanForExecution(
   nodes: LazyIRNode[],
   externalNodeIds?: Set<number>,
-  options?: { maxStorageBuffers?: number; enableMultiOutput?: boolean; epilogueClaimedIds?: Set<number> },
+  options?: {
+    maxStorageBuffers?: number;
+    enableMultiOutput?: boolean;
+    epilogueClaimedIds?: Set<number>;
+  },
 ): ExecutionSegment[] {
   const { groups } = detectFusionGroups(nodes, externalNodeIds, options);
   const segments: ExecutionSegment[] = [];
@@ -1154,7 +1233,9 @@ export function hasFusionPotential(nodes: LazyIRNode[]): boolean {
 /** Stable key for a non-scalar LazyRef (for input dedup tracking). */
 function inputKey(input: LazyRef): string | null {
   if (input.kind === "scalar") return null;
-  return input.kind === "materialized" ? `s:${input.storage.id}` : `p:${input.node.id}`;
+  return input.kind === "materialized"
+    ? `s:${input.storage.id}`
+    : `p:${input.node.id}`;
 }
 
 /** Count new non-scalar input keys a node would add to an existing set. */
@@ -1181,9 +1262,9 @@ function makeBatchGroup(
   sourceNodes: LazyIRNode[],
   sourceIndices: number[],
 ): FusionGroup {
-  const batchNodes = batchPositions.map(p => sourceNodes[p]);
-  const batchIndices = batchPositions.map(p => sourceIndices[p]);
-  const batchNodeIds = new Set(batchNodes.map(n => n.id));
+  const batchNodes = batchPositions.map((p) => sourceNodes[p]);
+  const batchIndices = batchPositions.map((p) => sourceIndices[p]);
+  const batchNodeIds = new Set(batchNodes.map((n) => n.id));
   return {
     nodes: batchNodes,
     planIndices: batchIndices,
@@ -1206,14 +1287,19 @@ function makeBatchGroup(
  *
  * Materialized refs already have GPU buffers and can't be inlined without readback.
  */
-function isInlinableScalar(ref: LazyRef): { inlinable: true; value: number } | { inlinable: false } {
+function isInlinableScalar(
+  ref: LazyRef,
+): { inlinable: true; value: number } | { inlinable: false } {
   // Scalar refs are trivially inlinable
   if (ref.kind === "scalar") {
     return { inlinable: true, value: ref.value };
   }
   if (ref.kind !== "pending") return { inlinable: false };
   const node = ref.node;
-  const totalElements = (node.shape ?? [1]).reduce((a: number, b: number) => a * b, 1);
+  const totalElements = (node.shape ?? [1]).reduce(
+    (a: number, b: number) => a * b,
+    1,
+  );
   if (totalElements !== 1) return { inlinable: false };
   // Don't inline if the node already has a result (it's been materialized)
   if (node.result) return { inlinable: false };
@@ -1273,7 +1359,11 @@ function selectBestForFusion(
     const fusible = isFusibleOp(node.op);
     let priority: number;
 
-    if (fusible && chainNodeIds.size > 0 && hasPendingInputIn(node, chainNodeIds)) {
+    if (
+      fusible &&
+      chainNodeIds.size > 0 &&
+      hasPendingInputIn(node, chainNodeIds)
+    ) {
       priority = 0; // Chain continuation
     } else if (fusible) {
       priority = 1; // New chain
@@ -1282,7 +1372,10 @@ function selectBestForFusion(
     }
 
     const pos = originalPos.get(id)!;
-    if (priority < bestPriority || (priority === bestPriority && pos < bestPos)) {
+    if (
+      priority < bestPriority ||
+      (priority === bestPriority && pos < bestPos)
+    ) {
       bestId = id;
       bestPriority = priority;
       bestPos = pos;
@@ -1321,7 +1414,7 @@ export function reorderPlanForFusion(nodes: LazyIRNode[]): LazyIRNode[] {
     for (const input of node.inputs) {
       if (input.kind === "pending" && nodeById.has(input.node.id)) {
         inDegree.set(node.id, inDegree.get(node.id)! + 1);
-        successors.get(input.node.id)!.push(node.id);
+        successors.get(input.node.id)?.push(node.id);
       }
     }
   }
@@ -1338,7 +1431,12 @@ export function reorderPlanForFusion(nodes: LazyIRNode[]): LazyIRNode[] {
   let chainNodeIds = new Set<number>();
 
   while (ready.size > 0) {
-    const best = selectBestForFusion(ready, chainNodeIds, nodeById, originalPos);
+    const best = selectBestForFusion(
+      ready,
+      chainNodeIds,
+      nodeById,
+      originalPos,
+    );
     ready.delete(best);
     result.push(nodeById.get(best)!);
 
@@ -1439,7 +1537,7 @@ export function computePlanFingerprint(
 
     // External status
     if (externalNodeIds?.has(node.id)) {
-      hashByte(0xEE);
+      hashByte(0xee);
     }
 
     // Payload: for ops with structural payload (cast dtype, etc.)

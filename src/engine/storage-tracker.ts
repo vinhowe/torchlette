@@ -1,5 +1,8 @@
 import type { StorageHandle } from "./lazy-types";
-import { findDeadTensorsAtStep, type TensorLifetime } from "./lifetime-analysis";
+import {
+  findDeadTensorsAtStep,
+  type TensorLifetime,
+} from "./lifetime-analysis";
 import { getNextStorageId } from "./node-factory";
 
 /**
@@ -100,7 +103,10 @@ class StorageTracker {
     }
 
     // Early exit: if all storages are reachable and none recently unreachable, skip scan
-    if (this.recentlyUnreachable.size === 0 && this.allStorages.size === this.externallyReachable.size) {
+    if (
+      this.recentlyUnreachable.size === 0 &&
+      this.allStorages.size === this.externallyReachable.size
+    ) {
       return 0;
     }
 
@@ -187,7 +193,11 @@ class StorageTracker {
     // Step 2: Collect storages to destroy (unreachable, not needed by views, created since sinceId)
     const toDestroy: number[] = [];
     for (const [id] of this.allStorages) {
-      if (id >= sinceId && !this.externallyReachable.has(id) && !neededByViews.has(id)) {
+      if (
+        id >= sinceId &&
+        !this.externallyReachable.has(id) &&
+        !neededByViews.has(id)
+      ) {
         toDestroy.push(id);
       }
     }
@@ -228,7 +238,12 @@ class StorageTracker {
   /**
    * Get and reset debug counters.
    */
-  debugCounters(): { registered: number; reachable: number; unreachable: number; destroyed: number } {
+  debugCounters(): {
+    registered: number;
+    reachable: number;
+    unreachable: number;
+    destroyed: number;
+  } {
     const result = {
       registered: this._debugRegisterCount,
       reachable: this._debugReachableCount,
@@ -279,24 +294,36 @@ class StorageTracker {
    * Get debug info about the tensor ref holding a storage reachable.
    * Returns shape/dtype if the ref is a RuntimeTensor, or a description otherwise.
    */
-  getTensorRefDebugInfo(storageId: number): { shape?: number[]; dtype?: string; type: string; disposed?: boolean } | null {
+  getTensorRefDebugInfo(
+    storageId: number,
+  ): {
+    shape?: number[];
+    dtype?: string;
+    type: string;
+    disposed?: boolean;
+  } | null {
     const ref = this.tensorWeakRefs.get(storageId);
     if (!ref) return null;
     const obj = ref.deref();
     if (!obj) return null;
     // Check if it's a RuntimeTensor (has shape and dtype fields)
-    if ('shape' in obj && 'dtype' in obj) {
-      const t = obj as { shape: number[]; dtype: string; disposed?: boolean; _disposed?: boolean };
+    if ("shape" in obj && "dtype" in obj) {
+      const t = obj as {
+        shape: number[];
+        dtype: string;
+        disposed?: boolean;
+        _disposed?: boolean;
+      };
       return {
         shape: t.shape,
         dtype: t.dtype,
-        type: 'tensor',
+        type: "tensor",
         disposed: t.disposed ?? t._disposed,
       };
     }
     // It's a sideOutputs object or other ref
-    if ('m' in obj && 'v' in obj) {
-      return { type: 'adamSideOutputs' };
+    if ("m" in obj && "v" in obj) {
+      return { type: "adamSideOutputs" };
     }
     return { type: typeof obj };
   }
@@ -423,7 +450,12 @@ export function releaseDeadTensors(
   nodeToStorage: Map<number, StorageHandle>,
 ): void {
   if (!lifetimes || !outputNodeIds) return;
-  const deadNodeIds = findDeadTensorsAtStep(lifetimes, step, outputNodeIds, alreadyReleased);
+  const deadNodeIds = findDeadTensorsAtStep(
+    lifetimes,
+    step,
+    outputNodeIds,
+    alreadyReleased,
+  );
   for (const deadId of deadNodeIds) {
     const storage = nodeToStorage.get(deadId);
     if (storage && canSafelyRelease(storage, nodeToStorage)) {

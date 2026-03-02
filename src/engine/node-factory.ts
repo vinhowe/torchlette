@@ -1,6 +1,11 @@
 import type { BackendTensor, DeviceKind, DType } from "../backend/types";
 import { getProfileModule } from "../backend/webgpu/profiler";
-import type { LazyOpCode, LazyIRNode, LazyRef, StorageHandle } from "./lazy-types";
+import type {
+  LazyIRNode,
+  LazyOpCode,
+  LazyRef,
+  StorageHandle,
+} from "./lazy-types";
 import { storageTracker } from "./storage-tracker";
 
 // ============================================================================
@@ -77,14 +82,15 @@ export function wrapResultAsStorage(
   backendInputs: BackendTensor[],
   inputStorages: StorageHandle[],
 ): StorageHandle {
-  const aliasedInputIdx = backendInputs.findIndex(b => b === resultTensor);
+  const aliasedInputIdx = backendInputs.indexOf(resultTensor);
   if (aliasedInputIdx >= 0 && resultTensor.ownsBuffer === true) {
     resultTensor = { ...resultTensor, ownsBuffer: false };
   }
   const isView = resultTensor.ownsBuffer === false;
-  const baseStorageId = isView && inputStorages.length > 0
-    ? inputStorages[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
-    : undefined;
+  const baseStorageId =
+    isView && inputStorages.length > 0
+      ? inputStorages[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
+      : undefined;
   return createStorageHandle(device, resultTensor, baseStorageId);
 }
 

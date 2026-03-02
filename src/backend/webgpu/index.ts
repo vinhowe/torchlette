@@ -1,181 +1,295 @@
 // ============================================================================
 // Re-exports from extracted utility modules
 // ============================================================================
-export {
-  sizeOf,
-  broadcastShapes,
-  contiguousStrides,
-  computeEffectiveBroadcastStrides,
-  dtypeBytes,
-  alignBufferSize,
-  compute2DDispatch,
-  WORKGROUP_SIZE,
-  MAX_WORKGROUPS_PER_DIM,
-} from "./shape-utils";
-
-export type { WebGPUTensor, WebGPUContext } from "./gpu-types";
-export { GPUBufferUsage, GPUMapMode } from "./gpu-types";
 
 export {
-  bufferPool, getBufferPoolStats, setBufferPoolEnabled, clearBufferPool,
-  setBufferPoolBudget, getBufferPoolBudget, flushBufferPool, flushBufferPoolWithSync,
-  getBufferPoolDetailedStats, resetBufferPoolDetailedStats,
-  deferredDestroyBuffer,
-} from "./buffer-pool";
-
-export {
-  initWebGPU, destroyWebGPU, syncWebGPU, getWebGPUDevice, isF16Supported,
-  getWebGPUInitError, getMaxStorageBufferBindingSize,
-  f32ToF16, f16ToF32, f32ArrayToF16Array, f16ArrayToF32Array,
-  resetAllKernelCaches, warmupFromStep, warmupFromRegistry,
-} from "./gpu-context";
-
-export {
-  startPipelineRecording, stopPipelineRecording, warmupPipelines,
-  serializeRegistry, deserializeRegistry, clearWarmupCache,
-} from "./pipeline-warmup";
-
-export {
-  beginBatchExecution, endBatchExecution, isBatchActive, abortBatch,
-  beginSharedEncoder, flushSharedEncoder, endSharedEncoder,
-  beginStep, endStep, isSharedEncoderActive, setSharedEncoderEnabled,
-  getSubmitCount, resetSubmitCount,
-  setCurrentOpLabel, getCurrentOpLabel, setAdamBatchMode,
-} from "./shared-encoder";
-
-export { replayPinnedBufferSet } from "./webgpu-state";
-export {
-  getAndClearLastBindGroupBuffers,
-  startDispatchRecording, stopDispatchRecording, replayDispatches,
-  addReplayPinnedBuffers,
-} from "./dispatch-recording";
-
+  cachedCreateBindGroup,
+  clearBindGroupCache,
+  createParamsBuffer,
+  getBindGroupCacheMissLog,
+  getBindGroupCacheStats,
+  getDispatchSequenceCounters,
+  profiledCreateBindGroup,
+  releaseParamsBuffer,
+  resetBindGroupCacheStats,
+  resetDispatchSequence,
+  setDispatchSequenceCounters,
+} from "./bind-group-cache";
 export type { BufferArena } from "./buffer-arena";
 export {
-  allocateOutputBuffer, donateBuffer, getBufferSize,
-  setArenaExternalInputBuffers, clearArenaExternalInputBuffers,
-  getArenaConflictDetected, clearArenaConflictDetected,
-  hasArenaExternalConflicts, setActiveArena, clearActiveArena,
-  getArenaResolveIndex, setArenaResolveIndexTo, isArenaBuffer,
-  destroyArena, resolveOutputBuffer,
+  allocateOutputBuffer,
+  clearActiveArena,
+  clearArenaConflictDetected,
+  clearArenaExternalInputBuffers,
+  destroyArena,
+  donateBuffer,
+  getArenaConflictDetected,
+  getArenaResolveIndex,
+  getBufferSize,
+  hasArenaExternalConflicts,
+  isArenaBuffer,
+  resolveOutputBuffer,
+  setActiveArena,
+  setArenaExternalInputBuffers,
+  setArenaResolveIndexTo,
 } from "./buffer-arena";
 
 export {
-  createParamsBuffer, releaseParamsBuffer,
-  profiledCreateBindGroup, cachedCreateBindGroup,
-  resetDispatchSequence, setDispatchSequenceCounters, getDispatchSequenceCounters,
-  clearBindGroupCache, getBindGroupCacheStats, resetBindGroupCacheStats,
-  getBindGroupCacheMissLog,
-} from "./bind-group-cache";
-
-export { createTensor, createTrackedBuffer } from "./tensor";
-
+  bufferPool,
+  clearBufferPool,
+  deferredDestroyBuffer,
+  flushBufferPool,
+  flushBufferPoolWithSync,
+  getBufferPoolBudget,
+  getBufferPoolDetailedStats,
+  getBufferPoolStats,
+  resetBufferPoolDetailedStats,
+  setBufferPoolBudget,
+  setBufferPoolEnabled,
+} from "./buffer-pool";
 export {
-  dispatchComputePass, dispatchElementwise,
-  getPipeline,
   dispatchBinary,
-  dispatchUnary,
+  dispatchComputePass,
+  dispatchElementwise,
   dispatchMatmul,
   dispatchMatmulDirect,
+  dispatchUnary,
+  getPipeline,
 } from "./dispatch";
-
+export {
+  addReplayPinnedBuffers,
+  getAndClearLastBindGroupBuffers,
+  replayDispatches,
+  startDispatchRecording,
+  stopDispatchRecording,
+} from "./dispatch-recording";
+export {
+  destroyWebGPU,
+  f16ArrayToF32Array,
+  f16ToF32,
+  f32ArrayToF16Array,
+  f32ToF16,
+  getMaxStorageBufferBindingSize,
+  getWebGPUDevice,
+  getWebGPUInitError,
+  initWebGPU,
+  isF16Supported,
+  resetAllKernelCaches,
+  syncWebGPU,
+  warmupFromRegistry,
+  warmupFromStep,
+} from "./gpu-context";
+export type { WebGPUContext, WebGPUTensor } from "./gpu-types";
+export { GPUBufferUsage, GPUMapMode } from "./gpu-types";
+// Re-export autotune control functions
+export {
+  isAutotuneEnabled,
+  pretuneMatmulShapes,
+  setAutotuneEnabled,
+} from "./matmul/dispatch";
 // Re-export memory tracking functions
 export {
-  gpuMemoryTracker,
+  clearAllocStacks,
+  clearLargeAllocLog,
+  disableAllAllocDebug,
+  enableAllAllocDebug,
+  enableLargeAllocDebug,
   GPUMemoryLimitExceededError,
-  setGPUMemoryLimit,
+  getAndResetFlowCounters,
+  getGPUAllocationHistogram,
   getGPUMemoryLimit,
   getGPUMemoryStats,
-  getGPUAllocationHistogram,
-  enableLargeAllocDebug,
   getLargeAllocLog,
-  clearLargeAllocLog,
-  enableAllAllocDebug,
-  disableAllAllocDebug,
-  clearAllocStacks,
-  setAllocStep,
-  snapshotLeakedAllocs,
-  snapshotLeakedAllocsForStep,
   getLeakedAllocCount,
   getLeakedAllocCountForStep,
-  getAndResetFlowCounters,
-  getTrackedBuffers,
   getLeakedSizeHistogramForStep,
+  getTrackedBuffers,
+  gpuMemoryTracker,
+  setAllocStep,
+  setGPUMemoryLimit,
+  snapshotLeakedAllocs,
+  snapshotLeakedAllocsForStep,
 } from "./memory-tracker";
+// Re-export public functions from ops modules
+export { tensorFromArrayWithDtype } from "./ops/creation";
+export { waitForGPU } from "./ops/fused";
+export {
+  maxWithEpilogue,
+  meanWithEpilogue,
+  sumDimWithPreamble,
+  sumDimWithPreambleChain,
+  sumWithEpilogue,
+  sumWithPreambleEpilogue,
+} from "./ops/reductions";
+export {
+  clearWarmupCache,
+  deserializeRegistry,
+  serializeRegistry,
+  startPipelineRecording,
+  stopPipelineRecording,
+  warmupPipelines,
+} from "./pipeline-warmup";
 
 // Re-export profiler functions for use in tests
 export {
-  setProfilePhase,
-  setProfileModule,
-  getProfileModule,
-  readGpuTimestamps,
   flushAndReadGpuTimestamps,
-  printProfileSummary,
-  resetProfileStats,
-  isProfilingEnabled,
-  setTimestampsEnabled,
   getProfileJSON,
-  writeProfileJSON,
-  recordPlanAnalysis,
+  getProfileModule,
+  isProfilingEnabled,
   type PlanAnalysis,
+  printProfileSummary,
+  readGpuTimestamps,
+  recordPlanAnalysis,
+  resetProfileStats,
+  setProfileModule,
+  setProfilePhase,
+  setTimestampsEnabled,
+  writeProfileJSON,
 } from "./profiler";
-
-// Re-export autotune control functions
-export { isAutotuneEnabled, pretuneMatmulShapes, setAutotuneEnabled } from "./matmul/dispatch";
-
+export {
+  alignBufferSize,
+  broadcastShapes,
+  compute2DDispatch,
+  computeEffectiveBroadcastStrides,
+  contiguousStrides,
+  dtypeBytes,
+  MAX_WORKGROUPS_PER_DIM,
+  sizeOf,
+  WORKGROUP_SIZE,
+} from "./shape-utils";
+export {
+  abortBatch,
+  beginBatchExecution,
+  beginSharedEncoder,
+  beginStep,
+  endBatchExecution,
+  endSharedEncoder,
+  endStep,
+  flushSharedEncoder,
+  getCurrentOpLabel,
+  getSubmitCount,
+  isBatchActive,
+  isSharedEncoderActive,
+  resetSubmitCount,
+  setAdamBatchMode,
+  setCurrentOpLabel,
+  setSharedEncoderEnabled,
+} from "./shared-encoder";
+export { createTensor, createTrackedBuffer } from "./tensor";
+export { compileTileKernel } from "./tile-compiler";
+export {
+  createTileKernelDispatcher,
+  type TileKernelInstance,
+} from "./tile-dispatch";
 // Re-export tile-IR public API for custom kernels
 export {
-  type TileKernelSpec,
   type BindingSpec,
-  type DataType,
-  type UniformType,
-  type BlockPtr,
-  type BlockCoopPtr,
-  type BlockThreadPtr,
-  type BlockLoadOpts,
-  type BlockStorePtr,
-  KernelContext,
   Block,
-  elementwiseGrid,
+  type BlockCoopPtr,
+  type BlockLoadOpts,
+  type BlockPtr,
+  type BlockStorePtr,
+  type BlockThreadPtr,
   ceilDivGrid,
-  singleWorkgroup,
-  perRowGrid,
+  type DataType,
+  elementwiseGrid,
   elementwiseKernel,
+  KernelContext,
+  perRowGrid,
   perRowKernel,
+  singleWorkgroup,
+  type TileKernelSpec,
+  type UniformType,
 } from "./tile-ir";
-export { compileTileKernel } from "./tile-compiler";
-export { createTileKernelDispatcher, type TileKernelInstance } from "./tile-dispatch";
+export { replayPinnedBufferSet } from "./webgpu-state";
 
-// Re-export public functions from ops modules
-export { tensorFromArrayWithDtype } from "./ops/creation";
-export { sumDimWithPreamble, sumDimWithPreambleChain, sumWithPreambleEpilogue, sumWithEpilogue, maxWithEpilogue, meanWithEpilogue } from "./ops/reductions";
-export { waitForGPU } from "./ops/fused";
-
+import { registerBackend } from "../registry";
 // ============================================================================
 // Imports used locally (for webgpuBackend object and remaining wiring)
 // ============================================================================
 import type { Backend } from "../types";
-import type { GPUDevice } from "./gpu-types";
-import { gpuContext } from "./webgpu-state";
-import { registerBackend } from "../registry";
-import { pretuneMatmulShapes as pretuneShapes } from "./matmul/dispatch";
 import { dispatchFusedKernel } from "./fusion-dispatch";
-import { beginStep, endStep } from "./shared-encoder";
-
+import type { GPUDevice } from "./gpu-types";
+import { pretuneMatmulShapes as pretuneShapes } from "./matmul/dispatch";
 // ============================================================================
 // Ops imports (used in webgpuBackend.ops)
 // ============================================================================
-import { gt, lt, ge, le, eq, ne, argmax, argmin } from "./ops/comparison";
-import { where } from "./ops/where";
-import { tensorFromArray, zeros, full, arange, tril, triu, rand, randn, bernoulli, _setContiguous } from "./ops/creation";
-import { add, sub, div, mul, sqrt, relu, exp, log, neg, abs, tanh, sigmoid, gelu, silu, sin, cos, rsqrt, floor, ceil, round, sign, clamp, pow, isfinite } from "./ops/elementwise";
-import { cast, reshape, expand, contiguous, narrow, narrowBackward, transpose, permute } from "./ops/views";
-import { matmul } from "./ops/matmul-ops";
+import { argmax, argmin, eq, ge, gt, le, lt, ne } from "./ops/comparison";
 import { conv2d } from "./ops/conv2d";
-import { gather, scatterAdd, cat } from "./ops/gather-scatter";
-import { sum, max, min, mean } from "./ops/reductions";
-import { stridedScatterCopy, stridedScatterAdd } from "./ops/strided-scatter";
-import { adamStep, unscaleGrad, createInfCountBuffer, readAndDestroyInfCount, fusedCrossEntropyForward, fusedCrossEntropyBackward, fusedLayerNormForward, fusedLayerNormBackwardGradX, fusedLayerNormBackwardGradWeightBias, fusedRMSNormForward, fusedRMSNormBackwardGradX, fusedRMSNormBackwardGradWeight, fusedAttentionForward, fusedAttentionBackward, read, waitForGPU, mulScalarInPlace } from "./ops/fused";
+import {
+  _setContiguous,
+  arange,
+  bernoulli,
+  full,
+  rand,
+  randn,
+  tensorFromArray,
+  tril,
+  triu,
+  zeros,
+} from "./ops/creation";
+import {
+  abs,
+  add,
+  ceil,
+  clamp,
+  cos,
+  div,
+  exp,
+  floor,
+  gelu,
+  isfinite,
+  log,
+  mul,
+  neg,
+  pow,
+  relu,
+  round,
+  rsqrt,
+  sigmoid,
+  sign,
+  silu,
+  sin,
+  sqrt,
+  sub,
+  tanh,
+} from "./ops/elementwise";
+import {
+  adamStep,
+  createInfCountBuffer,
+  fusedAttentionBackward,
+  fusedAttentionForward,
+  fusedCrossEntropyBackward,
+  fusedCrossEntropyForward,
+  fusedLayerNormBackwardGradWeightBias,
+  fusedLayerNormBackwardGradX,
+  fusedLayerNormForward,
+  fusedRMSNormBackwardGradWeight,
+  fusedRMSNormBackwardGradX,
+  fusedRMSNormForward,
+  mulScalarInPlace,
+  read,
+  readAndDestroyInfCount,
+  unscaleGrad,
+  waitForGPU,
+} from "./ops/fused";
+import { cat, gather, scatterAdd } from "./ops/gather-scatter";
+import { matmul } from "./ops/matmul-ops";
+import { max, mean, min, sum } from "./ops/reductions";
+import { stridedScatterAdd, stridedScatterCopy } from "./ops/strided-scatter";
+import {
+  cast,
+  contiguous,
+  expand,
+  narrow,
+  narrowBackward,
+  permute,
+  reshape,
+  transpose,
+} from "./ops/views";
+import { where } from "./ops/where";
+import { beginStep, endStep } from "./shared-encoder";
+import { gpuContext } from "./webgpu-state";
 
 // Wire up creation.ts contiguous injection callback (the sole remaining callback —
 // all other injection callbacks were eliminated by the webgpu-state.ts refactoring).
@@ -282,7 +396,9 @@ export const webgpuBackend: Backend & {
   beginStep,
   endStep,
   // Pretune matmul shapes for autotuning (used by compile with autotune: true)
-  async pretuneMatmulShapes(shapes: Array<[number, number, number]>): Promise<void> {
+  async pretuneMatmulShapes(
+    shapes: Array<[number, number, number]>,
+  ): Promise<void> {
     const ctx = gpuContext;
     if (!ctx) {
       return; // WebGPU not initialized

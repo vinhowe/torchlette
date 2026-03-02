@@ -1,10 +1,10 @@
-import type { Tensor as RuntimeTensor } from "./runtime/tensor";
-import { TidyDispatchMode } from "./runtime/engine";
-import { storageTracker } from "./engine/lazy";
 import { shapesEqual } from "./core/shape";
+import { storageTracker } from "./engine/lazy";
 import type { Torchlette } from "./frontend";
 import type { Tensor } from "./frontend-tensor";
 import type { AutogradNode, GetSavedFn } from "./frontend-types";
+import { TidyDispatchMode } from "./runtime/engine";
+import type { Tensor as RuntimeTensor } from "./runtime/tensor";
 
 /**
  * Collect saved tensors from all autograd nodes (triggers lazy recompute
@@ -86,7 +86,9 @@ async function runBackwardFunctions(
 
     const trackedIntermediates = torch.runtime.stopIntermediateTracking();
 
-    const keepSet = new Set(gradsIn.filter((g): g is RuntimeTensor => g !== null));
+    const keepSet = new Set(
+      gradsIn.filter((g): g is RuntimeTensor => g !== null),
+    );
     for (const tensor of trackedIntermediates) {
       if (!keepSet.has(tensor) && !tensor.disposed) {
         tensor.dispose();
@@ -193,7 +195,10 @@ function cleanupAutogradGraph(
   }
   for (const node of ordered) {
     for (const input of node.inputs) {
-      if (!forwardIntermediates.has(input) && !torch._compileCreatedTensors.has(input)) {
+      if (
+        !forwardIntermediates.has(input) &&
+        !torch._compileCreatedTensors.has(input)
+      ) {
         preserved.add(input);
       }
     }
@@ -254,81 +259,83 @@ export async function backwardImpl(
     torch.runtime.pushDispatchMode(tidyMode);
     try {
       return await torch.engine.runWithAsyncScope(async () => {
-      const seed = grad ? grad._unwrap() : torch._seedGrad(a);
+        const seed = grad ? grad._unwrap() : torch._seedGrad(a);
 
-      // Use Tensor as key for gradient accumulation
-      const gradMap = new Map<Tensor, RuntimeTensor>();
-      gradMap.set(a, seed);
+        // Use Tensor as key for gradient accumulation
+        const gradMap = new Map<Tensor, RuntimeTensor>();
+        gradMap.set(a, seed);
 
-      const ordered: AutogradNode[] = [];
-      const visited = new Set<AutogradNode>();
+        const ordered: AutogradNode[] = [];
+        const visited = new Set<AutogradNode>();
 
-      // Graph traversal uses inputs array
-      const visit = (node: AutogradNode) => {
-        if (visited.has(node)) return;
-        for (const input of node.inputs) {
-          const inputNode = input._gradNode();
-          if (inputNode) {
-            visit(inputNode);
+        // Graph traversal uses inputs array
+        const visit = (node: AutogradNode) => {
+          if (visited.has(node)) return;
+          for (const input of node.inputs) {
+            const inputNode = input._gradNode();
+            if (inputNode) {
+              visit(inputNode);
+            }
+          }
+          visited.add(node);
+          ordered.push(node);
+        };
+
+        const rootNode = a._gradNode();
+        if (rootNode) visit(rootNode);
+
+        // Force all tensors needed for backward
+        // Skip disposed/materialized tensors to avoid redundant plan building
+        const tensorsToForce: RuntimeTensor[] = [];
+        if (!seed.isMaterialized()) tensorsToForce.push(seed);
+        for (const node of ordered) {
+          for (const input of node.inputs) {
+            const rt = input._unwrap();
+            if (!rt.disposed && !rt.isMaterialized()) {
+              tensorsToForce.push(rt);
+            }
           }
         }
-        visited.add(node);
-        ordered.push(node);
-      };
+        if (tensorsToForce.length > 0) {
+          await torch.runtime.forceAllMerged(...tensorsToForce);
+        }
 
-      const rootNode = a._gradNode();
-      if (rootNode) visit(rootNode);
+        // ========================================================================
+        // UNIFIED BACKWARD EXECUTION
+        // ========================================================================
+        const allUnpackedTensors = await collectAndForceSavedTensors(
+          torch,
+          ordered,
+        );
+        await runBackwardFunctions(torch, ordered, gradMap, allUnpackedTensors);
+        disposeCheckpointTensors(ordered, allUnpackedTensors);
 
-      // Force all tensors needed for backward
-      // Skip disposed/materialized tensors to avoid redundant plan building
-      const tensorsToForce: RuntimeTensor[] = [];
-      if (!seed.isMaterialized()) tensorsToForce.push(seed);
-      for (const node of ordered) {
-        for (const input of node.inputs) {
-          const rt = input._unwrap();
-          if (!rt.disposed && !rt.isMaterialized()) {
-            tensorsToForce.push(rt);
+        // Force ALL final gradients in one merged plan.
+        const allGrads = [...gradMap.values()].filter(
+          (g) => !g.isMaterialized() && !g.disposed,
+        );
+        if (allGrads.length > 0) {
+          await torch.runtime.forceAllMerged(...allGrads);
+        }
+        storageTracker.destroyUnreachable();
+
+        // Store final gradients on leaf tensors and retained non-leaf tensors
+        // Mark these tensors as "kept" so they survive async scope cleanup
+        for (const [tensor, gradTensor] of gradMap) {
+          const isLeaf = tensor.requiresGrad && !tensor._gradNode();
+          const shouldRetain = tensor.isRetainGrad;
+
+          if (isLeaf || shouldRetain) {
+            // Wrap and keep the gradient tensor before async scope exits
+            const gradWrapper = torch._wrap(gradTensor, false);
+            torch.keep(gradWrapper);
+            tensor._setGrad(gradWrapper);
           }
+          // Non-retained grads: not wrapped, so TidyDispatchMode disposes them at scope exit
         }
-      }
-      if (tensorsToForce.length > 0) {
-        await torch.runtime.forceAllMerged(...tensorsToForce);
-      }
 
-      // ========================================================================
-      // UNIFIED BACKWARD EXECUTION
-      // ========================================================================
-      const allUnpackedTensors = await collectAndForceSavedTensors(torch, ordered);
-      await runBackwardFunctions(torch, ordered, gradMap, allUnpackedTensors);
-      disposeCheckpointTensors(ordered, allUnpackedTensors);
-
-      // Force ALL final gradients in one merged plan.
-      const allGrads = [...gradMap.values()].filter(
-        (g) => !g.isMaterialized() && !g.disposed
-      );
-      if (allGrads.length > 0) {
-        await torch.runtime.forceAllMerged(...allGrads);
-      }
-      storageTracker.destroyUnreachable();
-
-      // Store final gradients on leaf tensors and retained non-leaf tensors
-      // Mark these tensors as "kept" so they survive async scope cleanup
-      for (const [tensor, gradTensor] of gradMap) {
-        const isLeaf = tensor.requiresGrad && !tensor._gradNode();
-        const shouldRetain = tensor.isRetainGrad;
-
-        if (isLeaf || shouldRetain) {
-          // Wrap and keep the gradient tensor before async scope exits
-          const gradWrapper = torch._wrap(gradTensor, false);
-          torch.keep(gradWrapper);
-          tensor._setGrad(gradWrapper);
-        }
-        // Non-retained grads: not wrapped, so TidyDispatchMode disposes them at scope exit
-      }
-
-      cleanupAutogradGraph(torch, ordered, gradMap);
-
-    });
+        cleanupAutogradGraph(torch, ordered, gradMap);
+      });
     } finally {
       torch.runtime.popDispatchMode();
       tidyMode.disposeNonEscaped();

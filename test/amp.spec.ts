@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
+  type AutocastContext,
   captureRegionAMPState,
   computeInputCasts,
   computeOutputCast,
@@ -13,7 +14,6 @@ import {
   hashAMPPolicy,
   popAutocast,
   pushAutocast,
-  type AutocastContext,
 } from "../src/engine/amp";
 
 describe("AMP Policy", () => {

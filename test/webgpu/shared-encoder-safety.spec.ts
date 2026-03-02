@@ -1,10 +1,9 @@
-import { describe, expect, it, beforeAll } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
-  initWebGPU,
   getWebGPUInitError,
-  webgpuBackend,
-  getSubmitCount,
+  initWebGPU,
   resetSubmitCount,
+  webgpuBackend,
 } from "../../src/backend/webgpu";
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -26,10 +25,10 @@ describe.skipIf(cpuOnly)("Shared encoder safety", () => {
     const b = webgpuBackend.ops.tensorFromArray([10, 20, 30, 40], [2, 2]);
 
     // Chain: (a + b) * a - b + a
-    const sum = webgpuBackend.ops.add(a, b);       // [11, 22, 33, 44]
-    const prod = webgpuBackend.ops.mul(sum, a);     // [11, 44, 99, 176]
-    const diff = webgpuBackend.ops.sub(prod, b);    // [1, 24, 69, 136]
-    const result = webgpuBackend.ops.add(diff, a);  // [2, 26, 72, 140]
+    const sum = webgpuBackend.ops.add(a, b); // [11, 22, 33, 44]
+    const prod = webgpuBackend.ops.mul(sum, a); // [11, 44, 99, 176]
+    const diff = webgpuBackend.ops.sub(prod, b); // [1, 24, 69, 136]
+    const result = webgpuBackend.ops.add(diff, a); // [2, 26, 72, 140]
 
     const values = await webgpuBackend.ops.read(result);
     expect(values).toEqual([2, 26, 72, 140]);
@@ -63,10 +62,10 @@ describe.skipIf(cpuOnly)("Shared encoder safety", () => {
     // read() forces a submit
     const values = await webgpuBackend.ops.read(f);
     expect(values).toEqual([
-      1 * (1 + 5) - 5 + 1,  // 2
-      2 * (2 + 6) - 6 + 2,  // 12
-      3 * (3 + 7) - 7 + 3,  // 26
-      4 * (4 + 8) - 8 + 4,  // 44
+      1 * (1 + 5) - 5 + 1, // 2
+      2 * (2 + 6) - 6 + 2, // 12
+      3 * (3 + 7) - 7 + 3, // 26
+      4 * (4 + 8) - 8 + 4, // 44
     ]);
 
     // Without shared encoder: 4 op submits + 1 read submit = 5+

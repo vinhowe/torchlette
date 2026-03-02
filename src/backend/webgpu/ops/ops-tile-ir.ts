@@ -9,21 +9,32 @@
  * CSE deduplicates common subexpressions, LICM hoists loop-invariant code.
  */
 
+import { applyFusedOp } from "../fusion-tile-ir";
 import {
-  type TileKernelSpec,
-  type KernelContext,
+  contiguousStrides,
+  F32_NEG_MAX,
+  F32_POS_MAX,
+  MAX_WORKGROUPS_PER_DIM,
+  sizeOf,
+  WORKGROUP_SIZE,
+} from "../shape-utils";
+import { compileTileKernel } from "../tile-compiler";
+import {
   type BlockExpr,
   type DataType,
   elementwiseGrid,
   elementwiseKernel,
+  type KernelContext,
+  type TileKernelSpec,
 } from "../tile-ir";
-import { compileTileKernel } from "../tile-compiler";
-import { WORKGROUP_SIZE, F32_NEG_MAX, F32_POS_MAX, MAX_WORKGROUPS_PER_DIM, contiguousStrides, sizeOf } from "../shape-utils";
-import { applyFusedOp } from "../fusion-tile-ir";
 
 const WG = WORKGROUP_SIZE; // 256
 /** Apply chunked index guard: early-return if index outside [chunkStart, chunkEnd), adjust to chunk-local. */
-function applyChunkedGuard(ctx: KernelContext, rawIdx: BlockExpr, chunked: boolean): BlockExpr {
+function applyChunkedGuard(
+  ctx: KernelContext,
+  rawIdx: BlockExpr,
+  chunked: boolean,
+): BlockExpr {
   if (!chunked) return rawIdx;
   ctx.ifThen(rawIdx.lt(ctx.uniform("chunkStart")), () => ctx.emitReturn());
   ctx.ifThen(rawIdx.ge(ctx.uniform("chunkEnd")), () => ctx.emitReturn());
@@ -31,10 +42,16 @@ function applyChunkedGuard(ctx: KernelContext, rawIdx: BlockExpr, chunked: boole
 }
 
 /** Grid for a compile-time-known element count (no uniform needed). */
-function fixedElementGrid(workgroupSize: number, elements: number): (u: Record<string, number>) => [number] | [number, number] {
+function fixedElementGrid(
+  workgroupSize: number,
+  elements: number,
+): (u: Record<string, number>) => [number] | [number, number] {
   const totalWg = Math.ceil(elements / workgroupSize);
   if (totalWg <= MAX_WORKGROUPS_PER_DIM) return () => [totalWg];
-  return () => [Math.min(totalWg, MAX_WORKGROUPS_PER_DIM), Math.ceil(totalWg / MAX_WORKGROUPS_PER_DIM)];
+  return () => [
+    Math.min(totalWg, MAX_WORKGROUPS_PER_DIM),
+    Math.ceil(totalWg / MAX_WORKGROUPS_PER_DIM),
+  ];
 }
 
 // ============================================================================
@@ -42,14 +59,16 @@ function fixedElementGrid(workgroupSize: number, elements: number): (u: Record<s
 // ============================================================================
 
 export function fillWGSL(): string {
-  return compileTileKernel(elementwiseKernel({
-    name: "fill",
-    bindings: { out: { storage: "read_write", type: "f32" } },
-    uniforms: { value: "f32" },
-    kernel(ctx, idx) {
-      ctx.emitStore("out", idx, ctx.uniform("value"));
-    },
-  }));
+  return compileTileKernel(
+    elementwiseKernel({
+      name: "fill",
+      bindings: { out: { storage: "read_write", type: "f32" } },
+      uniforms: { value: "f32" },
+      kernel(ctx, idx) {
+        ctx.emitStore("out", idx, ctx.uniform("value"));
+      },
+    }),
+  );
 }
 
 // ============================================================================
@@ -57,14 +76,20 @@ export function fillWGSL(): string {
 // ============================================================================
 
 export function arangeWGSL(): string {
-  return compileTileKernel(elementwiseKernel({
-    name: "arange",
-    bindings: { out: { storage: "read_write", type: "f32" } },
-    uniforms: { start: "f32", step: "f32" },
-    kernel(ctx, idx) {
-      ctx.emitStore("out", idx, ctx.uniform("start").add(idx.toF32().mul(ctx.uniform("step"))));
-    },
-  }));
+  return compileTileKernel(
+    elementwiseKernel({
+      name: "arange",
+      bindings: { out: { storage: "read_write", type: "f32" } },
+      uniforms: { start: "f32", step: "f32" },
+      kernel(ctx, idx) {
+        ctx.emitStore(
+          "out",
+          idx,
+          ctx.uniform("start").add(idx.toF32().mul(ctx.uniform("step"))),
+        );
+      },
+    }),
+  );
 }
 
 // ============================================================================
@@ -72,26 +97,29 @@ export function arangeWGSL(): string {
 // ============================================================================
 
 export function triangularWGSL(upper: boolean): string {
-  return compileTileKernel(elementwiseKernel({
-    name: upper ? "triu" : "tril",
-    bindings: {
-      input: { storage: "read", type: "f32" },
-      output: { storage: "read_write", type: "f32" },
-    },
-    uniforms: { H: "u32", W: "u32", k: "i32" },
-    sizeUniform: "num_elements",
-    kernel(ctx, idx) {
-      const W = ctx.uniform("W");
-      const row = idx.div(W).mod(ctx.uniform("H")).toI32();
-      const col = idx.mod(W).toI32();
-      const k = ctx.uniform("k");
-      const cond = upper ? col.lt(row.add(k)) : col.gt(row.add(k));
-      ctx.ifThenElse(cond,
-        () => ctx.emitStore("output", idx, ctx.f32(0)),
-        () => ctx.emitStore("output", idx, ctx.load("input", idx)),
-      );
-    },
-  }));
+  return compileTileKernel(
+    elementwiseKernel({
+      name: upper ? "triu" : "tril",
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
+      uniforms: { H: "u32", W: "u32", k: "i32" },
+      sizeUniform: "num_elements",
+      kernel(ctx, idx) {
+        const W = ctx.uniform("W");
+        const row = idx.div(W).mod(ctx.uniform("H")).toI32();
+        const col = idx.mod(W).toI32();
+        const k = ctx.uniform("k");
+        const cond = upper ? col.lt(row.add(k)) : col.gt(row.add(k));
+        ctx.ifThenElse(
+          cond,
+          () => ctx.emitStore("output", idx, ctx.f32(0)),
+          () => ctx.emitStore("output", idx, ctx.load("input", idx)),
+        );
+      },
+    }),
+  );
 }
 
 // ============================================================================
@@ -110,30 +138,37 @@ export function comparisonWGSL(
   aOffset: number,
   bOffset: number,
 ): string {
-  const opToMethod: Record<string, (a: BlockExpr, b: BlockExpr) => BlockExpr> = {
-    ">": (a, b) => a.gt(b),
-    "<": (a, b) => a.lt(b),
-    ">=": (a, b) => a.ge(b),
-    "<=": (a, b) => a.le(b),
-    "==": (a, b) => a.eq(b),
-    "!=": (a, b) => a.ne(b),
-  };
+  const opToMethod: Record<string, (a: BlockExpr, b: BlockExpr) => BlockExpr> =
+    {
+      ">": (a, b) => a.gt(b),
+      "<": (a, b) => a.lt(b),
+      ">=": (a, b) => a.ge(b),
+      "<=": (a, b) => a.le(b),
+      "==": (a, b) => a.eq(b),
+      "!=": (a, b) => a.ne(b),
+    };
   const cmpFn = opToMethod[wgslOp];
   if (!cmpFn) throw new Error(`Unknown comparison op: ${wgslOp}`);
 
-  return compileTileKernel(elementwiseKernel({
-    name: `cmp_${wgslOp}`,
-    bindings: {
-      a: { storage: "read", type: "f32" },
-      b: { storage: "read", type: "f32" },
-      out: { storage: "read_write", type: "f32" },
-    },
-    kernel(ctx, idx) {
-      const aVal = ctx.stridedLoad("a", idx, indexShape, aStrides, aOffset);
-      const bVal = ctx.stridedLoad("b", idx, indexShape, bStrides, bOffset);
-      ctx.emitStore("out", idx, cmpFn(aVal, bVal).select(ctx.f32(1), ctx.f32(0)));
-    },
-  }));
+  return compileTileKernel(
+    elementwiseKernel({
+      name: `cmp_${wgslOp}`,
+      bindings: {
+        a: { storage: "read", type: "f32" },
+        b: { storage: "read", type: "f32" },
+        out: { storage: "read_write", type: "f32" },
+      },
+      kernel(ctx, idx) {
+        const aVal = ctx.stridedLoad("a", idx, indexShape, aStrides, aOffset);
+        const bVal = ctx.stridedLoad("b", idx, indexShape, bStrides, bOffset);
+        ctx.emitStore(
+          "out",
+          idx,
+          cmpFn(aVal, bVal).select(ctx.f32(1), ctx.f32(0)),
+        );
+      },
+    }),
+  );
 }
 
 // ============================================================================
@@ -149,10 +184,10 @@ export function argReduceWGSL(
   inputShape: number[],
   inputStrides: number[],
   outShape: number[],
-  outStrides: number[],
+  _outStrides: number[],
   dim: number,
-  dimSize: number,
-  dimStride: number,
+  _dimSize: number,
+  _dimStride: number,
   inputToOutDim: number[],
 ): string {
   const rank = inputShape.length;
@@ -168,7 +203,6 @@ export function argReduceWGSL(
     uniforms: { dimSize: "u32", dimStride: "u32" },
     sizeUniform: "outSize",
     kernel(ctx, outIdx) {
-
       // Compute base offset in input (with reduce dim = 0)
       // Decompose outIdx into output coordinates, map to input strides
       let baseOffset: BlockExpr = ctx.u32(0);
@@ -178,7 +212,9 @@ export function argReduceWGSL(
           // Map output coord back to input dimension
           for (let id = 0; id < rank; id++) {
             if (inputToOutDim[id] === d && id !== dim) {
-              baseOffset = baseOffset.add(outCoords[d].mul(ctx.u32(inputStrides[id])));
+              baseOffset = baseOffset.add(
+                outCoords[d].mul(ctx.u32(inputStrides[id])),
+              );
             }
           }
         }
@@ -190,7 +226,10 @@ export function argReduceWGSL(
       const bestIdx = ctx.emitVar("bestIdx", "u32", ctx.u32(0));
 
       ctx.forRange(ctx.u32(0), ctx.uniform("dimSize"), (i) => {
-        const val = ctx.load("input", baseOffset.add(i.mul(ctx.uniform("dimStride"))));
+        const val = ctx.load(
+          "input",
+          baseOffset.add(i.mul(ctx.uniform("dimStride"))),
+        );
         const cond = isMax ? val.gt(bestVal.get()) : val.lt(bestVal.get());
         ctx.ifThen(cond, () => {
           bestVal.set(val);
@@ -230,7 +269,13 @@ export function whereSpec(
       out: { storage: "read_write", type: "f32" },
     },
     kernel(ctx, idx) {
-      const condVal = ctx.stridedLoad("cond", idx, indexShape, condStrides, condOffset);
+      const condVal = ctx.stridedLoad(
+        "cond",
+        idx,
+        indexShape,
+        condStrides,
+        condOffset,
+      );
       const xVal = ctx.stridedLoad("x", idx, indexShape, xStrides, xOffset);
       const yVal = ctx.stridedLoad("y", idx, indexShape, yStrides, yOffset);
       ctx.emitStore("out", idx, condVal.ne(ctx.f32(0)).select(xVal, yVal));
@@ -250,7 +295,17 @@ export function whereWGSL(
   xOffset: number,
   yOffset: number,
 ): string {
-  return compileTileKernel(whereSpec(indexShape, condStrides, xStrides, yStrides, condOffset, xOffset, yOffset));
+  return compileTileKernel(
+    whereSpec(
+      indexShape,
+      condStrides,
+      xStrides,
+      yStrides,
+      condOffset,
+      xOffset,
+      yOffset,
+    ),
+  );
 }
 
 // ============================================================================
@@ -259,7 +314,10 @@ export function whereWGSL(
 
 /** WGSL infix operator → fusion op name */
 const WGSL_OP_TO_FUSION: Record<string, string> = {
-  "+": "add", "-": "sub", "*": "mul", "/": "div",
+  "+": "add",
+  "-": "sub",
+  "*": "mul",
+  "/": "div",
 };
 
 /**
@@ -307,7 +365,17 @@ export function binaryBroadcastTileIR(
   bOffset: number,
   dtype: DataType,
 ): string {
-  return compileTileKernel(binaryBroadcastSpec(op, indexShape, aStrides, bStrides, aOffset, bOffset, dtype));
+  return compileTileKernel(
+    binaryBroadcastSpec(
+      op,
+      indexShape,
+      aStrides,
+      bStrides,
+      aOffset,
+      bOffset,
+      dtype,
+    ),
+  );
 }
 
 // ============================================================================
@@ -333,7 +401,13 @@ export function unaryStridedSpec(
       out: { storage: "read_write", type: dtype },
     },
     kernel(ctx, idx) {
-      ctx.emitStore("out", idx, applyFusedOp(ctx, opKey, [ctx.stridedLoad("a", idx, shape, strides, offset)]));
+      ctx.emitStore(
+        "out",
+        idx,
+        applyFusedOp(ctx, opKey, [
+          ctx.stridedLoad("a", idx, shape, strides, offset),
+        ]),
+      );
     },
   });
 }
@@ -351,7 +425,9 @@ export function unaryStridedTileIR(
   offset: number,
   dtype: DataType,
 ): string {
-  return compileTileKernel(unaryStridedSpec(opKey, shape, strides, offset, dtype));
+  return compileTileKernel(
+    unaryStridedSpec(opKey, shape, strides, offset, dtype),
+  );
 }
 
 // ============================================================================
@@ -380,7 +456,11 @@ export function castSpec(
     },
     kernel(ctx, idx) {
       const val = ctx.stridedLoad("a", idx, shape, strides, offset);
-      ctx.emitStore("out", idx, srcDtype === dstDtype ? val : applyFusedOp(ctx, castOp, [val]));
+      ctx.emitStore(
+        "out",
+        idx,
+        srcDtype === dstDtype ? val : applyFusedOp(ctx, castOp, [val]),
+      );
     },
   });
 }
@@ -396,7 +476,9 @@ export function castTileIR(
   strides: number[],
   offset: number,
 ): string {
-  return compileTileKernel(castSpec(srcDtype, dstDtype, shape, strides, offset));
+  return compileTileKernel(
+    castSpec(srcDtype, dstDtype, shape, strides, offset),
+  );
 }
 
 // ============================================================================
@@ -413,17 +495,23 @@ export function contiguousTileIR(
   offset: number,
   dtype: DataType,
 ): string {
-  return compileTileKernel(elementwiseKernel({
-    name: `contiguous_${dtype}`,
-    enableF16: dtype === "f16",
-    bindings: {
-      input: { storage: "read", type: dtype },
-      out: { storage: "read_write", type: dtype },
-    },
-    kernel(ctx, idx) {
-      ctx.emitStore("out", idx, ctx.stridedLoad("input", idx, shape, strides, offset));
-    },
-  }));
+  return compileTileKernel(
+    elementwiseKernel({
+      name: `contiguous_${dtype}`,
+      enableF16: dtype === "f16",
+      bindings: {
+        input: { storage: "read", type: dtype },
+        out: { storage: "read_write", type: dtype },
+      },
+      kernel(ctx, idx) {
+        ctx.emitStore(
+          "out",
+          idx,
+          ctx.stridedLoad("input", idx, shape, strides, offset),
+        );
+      },
+    }),
+  );
 }
 
 // ============================================================================
@@ -481,7 +569,9 @@ export function narrowBackwardTileIR(
       });
 
       const gradDimIdx = ctx.emitLet("gradDimIdx", dimIdx.sub(startU));
-      const gradIdx = outerIdx.mul(gradDimSize).mul(innerSize)
+      const gradIdx = outerIdx
+        .mul(gradDimSize)
+        .mul(innerSize)
         .add(gradDimIdx.mul(innerSize))
         .add(innerIdx);
       ctx.emitStore("out", idx, ctx.load("grad", gradIdx));
@@ -538,7 +628,11 @@ function stridedScatterTileIR(
         const baseOff = ctx.linearizeIndex(coords, viewStrides, viewOffset);
         const srcOff = ctx.linearizeIndex(coords, srcStrides, srcOffset);
         const srcVal = ctx.load("src", srcOff);
-        ctx.emitStore("out", baseOff, op === "add" ? ctx.load("out", baseOff).add(srcVal) : srcVal);
+        ctx.emitStore(
+          "out",
+          baseOff,
+          op === "add" ? ctx.load("out", baseOff).add(srcVal) : srcVal,
+        );
       });
     },
   };
@@ -546,17 +640,41 @@ function stridedScatterTileIR(
 }
 
 export function stridedScatterCopyTileIR(
-  baseSize: number, viewShape: number[], viewStrides: number[],
-  viewOffset: number, srcStrides: number[], srcOffset: number,
+  baseSize: number,
+  viewShape: number[],
+  viewStrides: number[],
+  viewOffset: number,
+  srcStrides: number[],
+  srcOffset: number,
 ): string {
-  return stridedScatterTileIR("copy", baseSize, viewShape, viewStrides, viewOffset, srcStrides, srcOffset);
+  return stridedScatterTileIR(
+    "copy",
+    baseSize,
+    viewShape,
+    viewStrides,
+    viewOffset,
+    srcStrides,
+    srcOffset,
+  );
 }
 
 export function stridedScatterAddTileIR(
-  baseSize: number, viewShape: number[], viewStrides: number[],
-  viewOffset: number, srcStrides: number[], srcOffset: number,
+  baseSize: number,
+  viewShape: number[],
+  viewStrides: number[],
+  viewOffset: number,
+  srcStrides: number[],
+  srcOffset: number,
 ): string {
-  return stridedScatterTileIR("add", baseSize, viewShape, viewStrides, viewOffset, srcStrides, srcOffset);
+  return stridedScatterTileIR(
+    "add",
+    baseSize,
+    viewShape,
+    viewStrides,
+    viewOffset,
+    srcStrides,
+    srcOffset,
+  );
 }
 
 // ============================================================================
@@ -572,36 +690,59 @@ export function stridedScatterAddTileIR(
  * Chunked mode adds chunk range guards and adjusts indices to chunk-local coordinates.
  */
 function gatherTileIRImpl(
-  inputShape: number[], indexShape: number[], dim: number, chunked: boolean,
+  inputShape: number[],
+  indexShape: number[],
+  dim: number,
+  chunked: boolean,
 ): string {
   const inputStrides = contiguousStrides(inputShape);
   const uniforms: Record<string, "u32"> = {};
-  if (chunked) { uniforms.chunkStart = "u32"; uniforms.chunkEnd = "u32"; }
+  if (chunked) {
+    uniforms.chunkStart = "u32";
+    uniforms.chunkEnd = "u32";
+  }
 
-  return compileTileKernel(elementwiseKernel({
-    name: chunked ? `gather_chunked_d${dim}` : `gather_d${dim}`,
-    bindings: {
-      input: { storage: "read", type: "f32" },
-      indices: { storage: "read", type: "f32" },
-      out: { storage: "read_write", type: "f32" },
-    },
-    uniforms,
-    kernel(ctx, idx) {
-      const gatherIdx = ctx.emitLet("gatherIdx", ctx.load("indices", idx).toU32());
-      const dimIdx = applyChunkedGuard(ctx, gatherIdx, chunked);
+  return compileTileKernel(
+    elementwiseKernel({
+      name: chunked ? `gather_chunked_d${dim}` : `gather_d${dim}`,
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        indices: { storage: "read", type: "f32" },
+        out: { storage: "read_write", type: "f32" },
+      },
+      uniforms,
+      kernel(ctx, idx) {
+        const gatherIdx = ctx.emitLet(
+          "gatherIdx",
+          ctx.load("indices", idx).toU32(),
+        );
+        const dimIdx = applyChunkedGuard(ctx, gatherIdx, chunked);
 
-      const coords = ctx.decomposeIndex(idx, indexShape);
-      const inputCoords = coords.map((c, d) => d === dim ? dimIdx : c);
-      ctx.emitStore("out", idx, ctx.load("input", ctx.linearizeIndex(inputCoords, inputStrides)));
-    },
-  }));
+        const coords = ctx.decomposeIndex(idx, indexShape);
+        const inputCoords = coords.map((c, d) => (d === dim ? dimIdx : c));
+        ctx.emitStore(
+          "out",
+          idx,
+          ctx.load("input", ctx.linearizeIndex(inputCoords, inputStrides)),
+        );
+      },
+    }),
+  );
 }
 
-export function gatherTileIR(inputShape: number[], indexShape: number[], dim: number): string {
+export function gatherTileIR(
+  inputShape: number[],
+  indexShape: number[],
+  dim: number,
+): string {
   return gatherTileIRImpl(inputShape, indexShape, dim, false);
 }
 
-export function chunkedGatherTileIR(inputShape: number[], indexShape: number[], dim: number): string {
+export function chunkedGatherTileIR(
+  inputShape: number[],
+  indexShape: number[],
+  dim: number,
+): string {
   return gatherTileIRImpl(inputShape, indexShape, dim, true);
 }
 
@@ -610,38 +751,61 @@ export function chunkedGatherTileIR(inputShape: number[], indexShape: number[], 
  * Caller must copy input→output before dispatching this kernel.
  */
 function scatterAddTileIRImpl(
-  inputShape: number[], srcShape: number[], dim: number, chunked: boolean,
+  inputShape: number[],
+  srcShape: number[],
+  dim: number,
+  chunked: boolean,
 ): string {
   const outStrides = contiguousStrides(inputShape);
   const uniforms: Record<string, "u32"> = {};
-  if (chunked) { uniforms.chunkStart = "u32"; uniforms.chunkEnd = "u32"; }
+  if (chunked) {
+    uniforms.chunkStart = "u32";
+    uniforms.chunkEnd = "u32";
+  }
 
-  return compileTileKernel(elementwiseKernel({
-    name: chunked ? `scatterAdd_chunked_d${dim}` : `scatterAdd_d${dim}`,
-    bindings: {
-      indices: { storage: "read", type: "f32" },
-      src: { storage: "read", type: "f32" },
-      out: { storage: "read_write", type: "f32" },
-    },
-    uniforms,
-    sizeUniform: "srcSize",
-    kernel(ctx, srcIdx) {
-      const scatterIdx = ctx.emitLet("scatterIdx", ctx.load("indices", srcIdx).toU32());
-      const dimIdx = applyChunkedGuard(ctx, scatterIdx, chunked);
+  return compileTileKernel(
+    elementwiseKernel({
+      name: chunked ? `scatterAdd_chunked_d${dim}` : `scatterAdd_d${dim}`,
+      bindings: {
+        indices: { storage: "read", type: "f32" },
+        src: { storage: "read", type: "f32" },
+        out: { storage: "read_write", type: "f32" },
+      },
+      uniforms,
+      sizeUniform: "srcSize",
+      kernel(ctx, srcIdx) {
+        const scatterIdx = ctx.emitLet(
+          "scatterIdx",
+          ctx.load("indices", srcIdx).toU32(),
+        );
+        const dimIdx = applyChunkedGuard(ctx, scatterIdx, chunked);
 
-      const coords = ctx.decomposeIndex(srcIdx, srcShape);
-      const outCoords = coords.map((c, d) => d === dim ? dimIdx : c);
-      const outOffset = ctx.linearizeIndex(outCoords, outStrides);
-      ctx.emitStore("out", outOffset, ctx.load("out", outOffset).add(ctx.load("src", srcIdx)));
-    },
-  }));
+        const coords = ctx.decomposeIndex(srcIdx, srcShape);
+        const outCoords = coords.map((c, d) => (d === dim ? dimIdx : c));
+        const outOffset = ctx.linearizeIndex(outCoords, outStrides);
+        ctx.emitStore(
+          "out",
+          outOffset,
+          ctx.load("out", outOffset).add(ctx.load("src", srcIdx)),
+        );
+      },
+    }),
+  );
 }
 
-export function scatterAddTileIR(inputShape: number[], srcShape: number[], dim: number): string {
+export function scatterAddTileIR(
+  inputShape: number[],
+  srcShape: number[],
+  dim: number,
+): string {
   return scatterAddTileIRImpl(inputShape, srcShape, dim, false);
 }
 
-export function chunkedScatterAddTileIR(inputShape: number[], srcShape: number[], dim: number): string {
+export function chunkedScatterAddTileIR(
+  inputShape: number[],
+  srcShape: number[],
+  dim: number,
+): string {
   return scatterAddTileIRImpl(inputShape, srcShape, dim, true);
 }
 
@@ -666,9 +830,12 @@ export function chunkedTransposeTileIR(dtype: DataType): string {
       output: { storage: "read_write", type: dtype },
     },
     uniforms: {
-      K: "u32", N: "u32",
-      rowStart: "u32", rowEnd: "u32",
-      colStart: "u32", colEnd: "u32",
+      K: "u32",
+      N: "u32",
+      rowStart: "u32",
+      rowEnd: "u32",
+      colStart: "u32",
+      colEnd: "u32",
       gridStride: "u32",
     },
     kernel(ctx) {
@@ -708,10 +875,11 @@ const VEC = 4;
  * Handles 2D dispatch overflow via programId(1) * numPrograms(0).
  */
 function flatVec4Base(ctx: KernelContext): BlockExpr {
-  const flatWgId = ctx.programId(0).add(
-    ctx.programId(1).mul(ctx.numPrograms(0)),
-  );
-  return ctx.emitLet("base",
+  const flatWgId = ctx
+    .programId(0)
+    .add(ctx.programId(1).mul(ctx.numPrograms(0)));
+  return ctx.emitLet(
+    "base",
     flatWgId.mul(ctx.u32(WG * VEC)).add(ctx.localIndex().mul(ctx.u32(VEC))),
   );
 }
@@ -721,10 +889,20 @@ function flatVec4Base(ctx: KernelContext): BlockExpr {
  * Vec4 unrolled: each thread processes VEC consecutive elements.
  */
 function flatOpSpec(op: "copy" | "add"): TileKernelSpec {
-  const bindings: Record<string, { storage: "read" | "read_write"; type: "f32" }> =
+  const bindings: Record<
+    string,
+    { storage: "read" | "read_write"; type: "f32" }
+  > =
     op === "copy"
-      ? { src: { storage: "read", type: "f32" }, out: { storage: "read_write", type: "f32" } }
-      : { base: { storage: "read", type: "f32" }, src: { storage: "read", type: "f32" }, out: { storage: "read_write", type: "f32" } };
+      ? {
+          src: { storage: "read", type: "f32" },
+          out: { storage: "read_write", type: "f32" },
+        }
+      : {
+          base: { storage: "read", type: "f32" },
+          src: { storage: "read", type: "f32" },
+          out: { storage: "read_write", type: "f32" },
+        };
 
   return {
     name: op === "copy" ? "flatCopy" : "flatAdd",
@@ -738,17 +916,24 @@ function flatOpSpec(op: "copy" | "add"): TileKernelSpec {
       ctx.ifThen(b.ge(size), () => ctx.emitReturn());
       for (let v = 0; v < VEC; v++) {
         const idx = b.add(ctx.u32(v));
-        const val = op === "copy"
-          ? ctx.blockLoad("src", idx, size)
-          : ctx.blockLoad("base", idx, size).add(ctx.blockLoad("src", idx, size));
+        const val =
+          op === "copy"
+            ? ctx.blockLoad("src", idx, size)
+            : ctx
+                .blockLoad("base", idx, size)
+                .add(ctx.blockLoad("src", idx, size));
         ctx.blockStore("out", idx, size, val);
       }
     },
   };
 }
 
-export function flatCopySpec(): TileKernelSpec { return flatOpSpec("copy"); }
-export function flatAddSpec(): TileKernelSpec { return flatOpSpec("add"); }
+export function flatCopySpec(): TileKernelSpec {
+  return flatOpSpec("copy");
+}
+export function flatAddSpec(): TileKernelSpec {
+  return flatOpSpec("add");
+}
 
 // ============================================================================
 // Matmul Column Slice / Scatter Kernels
@@ -767,10 +952,19 @@ export function sliceColumnsTileIR(): string {
       input: { storage: "read", type: "f32" },
       output: { storage: "read_write", type: "f32" },
     },
-    uniforms: { numRows: "u32", N: "u32", colStart: "u32", sliceWidth: "u32", rowStart: "u32" },
+    uniforms: {
+      numRows: "u32",
+      N: "u32",
+      colStart: "u32",
+      sliceWidth: "u32",
+      rowStart: "u32",
+    },
     grid: elementwiseGrid(WG),
     kernel(ctx) {
-      const idx = ctx.elementIndex(WG, ctx.uniform("numRows").mul(ctx.uniform("sliceWidth")));
+      const idx = ctx.elementIndex(
+        WG,
+        ctx.uniform("numRows").mul(ctx.uniform("sliceWidth")),
+      );
 
       const localRow = idx.div(ctx.uniform("sliceWidth"));
       const col = idx.mod(ctx.uniform("sliceWidth"));
@@ -778,7 +972,11 @@ export function sliceColumnsTileIR(): string {
       // Input offset relative to chunk start (row 0 of bound range)
       const srcIdx = localRow.mul(ctx.uniform("N")).add(srcCol);
       // Output accounts for rowStart
-      const dstIdx = ctx.uniform("rowStart").add(localRow).mul(ctx.uniform("sliceWidth")).add(col);
+      const dstIdx = ctx
+        .uniform("rowStart")
+        .add(localRow)
+        .mul(ctx.uniform("sliceWidth"))
+        .add(col);
 
       ctx.emitStore("output", dstIdx, ctx.load("input", srcIdx));
     },
@@ -799,18 +997,34 @@ export function scatterColumnsTileIR(): string {
       input: { storage: "read", type: "f32" },
       output: { storage: "read_write", type: "f32" },
     },
-    uniforms: { numRows: "u32", N: "u32", colStart: "u32", sliceWidth: "u32", rowStart: "u32", inputRowStart: "u32" },
+    uniforms: {
+      numRows: "u32",
+      N: "u32",
+      colStart: "u32",
+      sliceWidth: "u32",
+      rowStart: "u32",
+      inputRowStart: "u32",
+    },
     grid: elementwiseGrid(WG),
     kernel(ctx) {
-      const idx = ctx.elementIndex(WG, ctx.uniform("numRows").mul(ctx.uniform("sliceWidth")));
+      const idx = ctx.elementIndex(
+        WG,
+        ctx.uniform("numRows").mul(ctx.uniform("sliceWidth")),
+      );
 
       const localRow = idx.div(ctx.uniform("sliceWidth"));
       const col = idx.mod(ctx.uniform("sliceWidth"));
 
       // Input: relative to bound chunk
-      const inputIdx = ctx.uniform("inputRowStart").add(localRow).mul(ctx.uniform("sliceWidth")).add(col);
+      const inputIdx = ctx
+        .uniform("inputRowStart")
+        .add(localRow)
+        .mul(ctx.uniform("sliceWidth"))
+        .add(col);
       // Output: write to local row, column colStart + col (relative to bound chunk)
-      const outputIdx = localRow.mul(ctx.uniform("N")).add(ctx.uniform("colStart").add(col));
+      const outputIdx = localRow
+        .mul(ctx.uniform("N"))
+        .add(ctx.uniform("colStart").add(col));
 
       ctx.emitStore("output", outputIdx, ctx.load("input", inputIdx));
     },
@@ -831,10 +1045,22 @@ export function sliceBColumnsTileIR(): string {
       input: { storage: "read", type: "f32" },
       output: { storage: "read_write", type: "f32" },
     },
-    uniforms: { batch: "u32", K: "u32", N: "u32", colStart: "u32", chunkWidth: "u32" },
+    uniforms: {
+      batch: "u32",
+      K: "u32",
+      N: "u32",
+      colStart: "u32",
+      chunkWidth: "u32",
+    },
     grid: elementwiseGrid(WG),
     kernel(ctx) {
-      const idx = ctx.elementIndex(WG, ctx.uniform("batch").mul(ctx.uniform("K")).mul(ctx.uniform("chunkWidth")));
+      const idx = ctx.elementIndex(
+        WG,
+        ctx
+          .uniform("batch")
+          .mul(ctx.uniform("K"))
+          .mul(ctx.uniform("chunkWidth")),
+      );
 
       // Decompose flat idx to (batchIdx, k, c) in output space
       const cw = ctx.uniform("chunkWidth");
@@ -843,7 +1069,8 @@ export function sliceBColumnsTileIR(): string {
       const batchIdx = idx.div(ctx.uniform("K").mul(cw));
 
       // Input offset: (batchIdx, k, colStart + c) in [batch, K, N]
-      const inputOffset = batchIdx.mul(ctx.uniform("K").mul(ctx.uniform("N")))
+      const inputOffset = batchIdx
+        .mul(ctx.uniform("K").mul(ctx.uniform("N")))
         .add(k.mul(ctx.uniform("N")))
         .add(ctx.uniform("colStart").add(c));
 
@@ -862,14 +1089,16 @@ export function sliceBColumnsTileIR(): string {
  * Each thread generates one value using Philox 2x32-10.
  */
 export function randWGSL(): string {
-  return compileTileKernel(elementwiseKernel({
-    name: "rand",
-    bindings: { out: { storage: "read_write", type: "f32" } },
-    uniforms: { seed: "u32" },
-    kernel(ctx, idx) {
-      ctx.emitStore("out", idx, ctx.randF32(ctx.uniform("seed"), idx));
-    },
-  }));
+  return compileTileKernel(
+    elementwiseKernel({
+      name: "rand",
+      bindings: { out: { storage: "read_write", type: "f32" } },
+      uniforms: { seed: "u32" },
+      kernel(ctx, idx) {
+        ctx.emitStore("out", idx, ctx.randF32(ctx.uniform("seed"), idx));
+      },
+    }),
+  );
 }
 
 /**
@@ -892,7 +1121,10 @@ export function randnWGSL(): string {
       const numThreads = Math.ceil(u.size / 2);
       const totalWg = Math.ceil(numThreads / WG);
       if (totalWg <= MAX_WORKGROUPS_PER_DIM) return [totalWg];
-      return [Math.min(totalWg, MAX_WORKGROUPS_PER_DIM), Math.ceil(totalWg / MAX_WORKGROUPS_PER_DIM)];
+      return [
+        Math.min(totalWg, MAX_WORKGROUPS_PER_DIM),
+        Math.ceil(totalWg / MAX_WORKGROUPS_PER_DIM),
+      ];
     },
     kernel(ctx) {
       const idx = ctx.globalId(0);
@@ -920,13 +1152,19 @@ export function randnWGSL(): string {
  * Bernoulli random f32: 1.0 with probability p, 0.0 otherwise.
  */
 export function bernoulliWGSL(): string {
-  return compileTileKernel(elementwiseKernel({
-    name: "bernoulli",
-    bindings: { out: { storage: "read_write", type: "f32" } },
-    uniforms: { seed: "u32", prob: "f32" },
-    kernel(ctx, idx) {
-      const u = ctx.randF32(ctx.uniform("seed"), idx);
-      ctx.emitStore("out", idx, u.lt(ctx.uniform("prob")).select(ctx.f32(1.0), ctx.f32(0.0)));
-    },
-  }));
+  return compileTileKernel(
+    elementwiseKernel({
+      name: "bernoulli",
+      bindings: { out: { storage: "read_write", type: "f32" } },
+      uniforms: { seed: "u32", prob: "f32" },
+      kernel(ctx, idx) {
+        const u = ctx.randF32(ctx.uniform("seed"), idx);
+        ctx.emitStore(
+          "out",
+          idx,
+          u.lt(ctx.uniform("prob")).select(ctx.f32(1.0), ctx.f32(0.0)),
+        );
+      },
+    }),
+  );
 }

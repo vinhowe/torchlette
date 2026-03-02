@@ -1,6 +1,6 @@
+import type { DeviceKind } from "./backend/types";
 import type { AMPPolicy } from "./engine/amp";
 import type { SavedTensorRecord } from "./engine/engine";
-import type { DeviceKind } from "./backend/types";
 import type { Tensor as RuntimeTensor } from "./runtime/tensor";
 
 export type TensorCreateOptions = {
@@ -49,7 +49,9 @@ export type PackHook = (tensor: import("./frontend-tensor").Tensor) => unknown;
  * Unpack hook: restores a tensor from its packed representation during backward.
  * For checkpointing, this triggers recomputation to reconstruct the tensor.
  */
-export type UnpackHook = (packed: unknown) => import("./frontend-tensor").Tensor;
+export type UnpackHook = (
+  packed: unknown,
+) => import("./frontend-tensor").Tensor;
 
 /**
  * Context for saved tensor hooks.

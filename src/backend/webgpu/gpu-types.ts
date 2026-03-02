@@ -4,7 +4,7 @@
  * original definitions in index.ts.
  */
 
-import type { DType, BackendTensor } from "../types";
+import type { BackendTensor, DType } from "../types";
 
 export type GPUBuffer = {
   getMappedRange(): ArrayBuffer;
@@ -27,7 +27,10 @@ type GPUComputePass = {
 };
 
 export type GPUCommandEncoder = {
-  beginComputePass(descriptor?: { label?: string; timestampWrites?: unknown }): GPUComputePass;
+  beginComputePass(descriptor?: {
+    label?: string;
+    timestampWrites?: unknown;
+  }): GPUComputePass;
   copyBufferToBuffer(
     source: GPUBuffer,
     sourceOffset: number,
@@ -61,7 +64,10 @@ export type GPUDeviceLimits = {
 export type GPUDevice = {
   createBindGroup(descriptor: {
     layout: unknown;
-    entries: Array<{ binding: number; resource: { buffer: GPUBuffer; offset?: number; size?: number } }>;
+    entries: Array<{
+      binding: number;
+      resource: { buffer: GPUBuffer; offset?: number; size?: number };
+    }>;
   }): GPUBindGroup;
   createBuffer(descriptor: {
     size: number;

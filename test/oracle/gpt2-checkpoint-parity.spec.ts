@@ -13,15 +13,17 @@
  * Run with: npm test -- test/oracle/gpt2-checkpoint-parity.spec.ts
  */
 
-import { describe, expect, test, beforeAll, afterEach } from "vitest";
-import { Torchlette } from "../../src";
-import { initWebGPU } from "../../src/backend/webgpu";
-import { gpuMemoryTracker } from "../../src/backend/webgpu/memory-tracker";
-import { canUseWebGPU } from "../helpers/webgpu";
+import { afterEach, beforeAll, describe, expect, test } from "vitest";
 import { GPT2, type GPT2Config } from "../../examples/gpt2/model";
-import { runTorchOracleFullBatch, type OracleCase } from "./torch-oracle";
-import { resetNodeIdCounter, resetStorageIdCounter } from "../../src/engine/lazy";
+import { Torchlette } from "../../src";
+import { gpuMemoryTracker } from "../../src/backend/webgpu/memory-tracker";
+import {
+  resetNodeIdCounter,
+  resetStorageIdCounter,
+} from "../../src/engine/lazy";
 import { resetBaseIdCounter } from "../../src/runtime/tensor";
+import { canUseWebGPU } from "../helpers/webgpu";
+import { type OracleCase, runTorchOracleFullBatch } from "./torch-oracle";
 
 type Payload = { shape: number[]; values: number[] };
 
@@ -31,10 +33,11 @@ const SAME_DEVICE_RTOL = 1e-5;
 
 // Cross-device (GPU vs CPU) has known limitations - use very loose tolerance
 // This only verifies gross correctness, not bit-exact parity
-const CROSS_DEVICE_ATOL = 0.5; // 50% absolute tolerance
-const CROSS_DEVICE_RTOL = 0.5; // 50% relative tolerance
+const _CROSS_DEVICE_ATOL = 0.5; // 50% absolute tolerance
+const _CROSS_DEVICE_RTOL = 0.5; // 50% relative tolerance
 
 import { cpuOnly } from "../helpers/webgpu";
+
 const hasWebGPU = !cpuOnly;
 
 function assertClose(
@@ -42,7 +45,7 @@ function assertClose(
   expected: Payload,
   atol: number,
   rtol: number,
-  label = ""
+  label = "",
 ): void {
   expect(actual.shape).toEqual(expected.shape);
   expect(actual.values.length).toBe(expected.values.length);
@@ -66,7 +69,7 @@ function assertClose(
     if (diff > tol) {
       const context = `at index ${maxIndex}: actual=${a}, expected=${b}`;
       throw new Error(
-        `Mismatch ${label}: max diff=${maxDiff.toExponential(2)}, ${context}`
+        `Mismatch ${label}: max diff=${maxDiff.toExponential(2)}, ${context}`,
       );
     }
   }
@@ -74,8 +77,9 @@ function assertClose(
 
 function deterministicInit(shape: number[], seed: number): number[] {
   const size = shape.reduce((a, b) => a * b, 1);
-  return Array.from({ length: size }, (_, i) =>
-    Math.sin(seed * 1000 + i) * 0.02
+  return Array.from(
+    { length: size },
+    (_, i) => Math.sin(seed * 1000 + i) * 0.02,
   );
 }
 
@@ -152,226 +156,147 @@ describe("GPT-2 Checkpoint (WebGPU)", { skip: !hasWebGPU }, () => {
     }
   });
 
-  test("checkpoint vs non-checkpoint produces identical gradients (same device)", { timeout: 60000 }, async () => {
-    if (!webgpuAvailable) return;
+  test(
+    "checkpoint vs non-checkpoint produces identical gradients (same device)",
+    { timeout: 60000 },
+    async () => {
+      if (!webgpuAvailable) return;
 
-    const config = TINY_CONFIG;
-    const shapes = getParamShapes(config);
-    const names = getParamNames(config);
+      const config = TINY_CONFIG;
+      const shapes = getParamShapes(config);
+      const names = getParamNames(config);
 
-    const weights: number[][] = [];
-    for (let i = 0; i < shapes.length; i++) {
-      weights.push(deterministicInit(shapes[i], i + 100));
-    }
-
-    const batchSize = 2;
-    const seqLen = 8;
-    const inputData: number[] = [];
-    const targetData: number[] = [];
-    for (let i = 0; i < batchSize * seqLen; i++) {
-      inputData.push(i % config.vocabSize);
-      targetData.push((i + 1) % config.vocabSize);
-    }
-
-    async function runModel(useCheckpoint: boolean) {
-      resetNodeIdCounter();
-      resetStorageIdCounter();
-      resetBaseIdCounter();
-
-      const api = new Torchlette("webgpu", {
-        enableFusion: false,
-        enableMemoryPlanning: true,
-      });
-      const model = new GPT2(api, config, { device: "webgpu" });
-      model.eval();
-
-      const params = model.parameters();
-      for (let i = 0; i < params.length; i++) {
-        const weightTensor = api.tensorFromArray(weights[i], shapes[i], { device: "webgpu" });
-        const runtime = api._runtime();
-        runtime.copy_(params[i]._unwrap(), weightTensor._unwrap());
+      const weights: number[][] = [];
+      for (let i = 0; i < shapes.length; i++) {
+        weights.push(deterministicInit(shapes[i], i + 100));
       }
 
-      const inputTensor = api.tensorFromArray(inputData, [batchSize, seqLen], { device: "webgpu" });
-      const targetTensor = api.tensorFromArray(targetData, [batchSize, seqLen], { device: "webgpu" });
-
-      const { loss } = model.forwardWithLoss(inputTensor, targetTensor, {
-        useCheckpoint,
-      });
-
-      if (!loss) throw new Error("Loss is null");
-      const lossValue = await loss.item();
-
-      await loss.backward();
-
-      const grads: Payload[] = [];
-      for (const p of params) {
-        const grad = p.grad;
-        if (!grad) throw new Error("No gradient");
-        grads.push({ shape: grad.shape, values: Array.from(await grad.cpu()) });
-      }
-
-      return { lossValue, grads };
-    }
-
-    // Run without checkpoint
-    const withoutCp = await runModel(false);
-
-    // Run with checkpoint
-    const withCp = await runModel(true);
-
-    // Compare loss - should be EXACTLY the same
-    const lossDiff = Math.abs(withoutCp.lossValue - withCp.lossValue);
-    console.log(`Loss diff (checkpoint vs non-checkpoint): ${lossDiff.toExponential(2)}`);
-    expect(lossDiff).toBeLessThan(1e-6);
-
-    // Compare gradients - should be identical within floating point tolerance
-    for (let i = 0; i < withoutCp.grads.length; i++) {
-      assertClose(withCp.grads[i], withoutCp.grads[i], SAME_DEVICE_ATOL, SAME_DEVICE_RTOL, names[i]);
-    }
-
-    console.log("PASS: Checkpoint produces identical gradients to non-checkpoint on WebGPU");
-  });
-
-  test("checkpoint reduces peak memory vs non-checkpoint", { timeout: 120000 }, async () => {
-    if (!webgpuAvailable) return;
-
-    // Use larger config to see memory difference
-    const config: GPT2Config = {
-      vocabSize: 500,
-      blockSize: 32,
-      numLayers: 4,
-      numHeads: 4,
-      embedDim: 64,
-      dropoutRate: 0.0,
-    };
-
-    const shapes = getParamShapes(config);
-    const weights: number[][] = [];
-    for (let i = 0; i < shapes.length; i++) {
-      weights.push(deterministicInit(shapes[i], i + 1000));
-    }
-
-    const batchSize = 2;
-    const seqLen = 16;
-    const inputData: number[] = [];
-    const targetData: number[] = [];
-    for (let i = 0; i < batchSize * seqLen; i++) {
-      inputData.push(i % config.vocabSize);
-      targetData.push((i + 1) % config.vocabSize);
-    }
-
-    // Run WITHOUT checkpoint
-    gpuMemoryTracker.reset();
-    resetNodeIdCounter();
-    resetStorageIdCounter();
-    resetBaseIdCounter();
-
-    const api1 = new Torchlette("webgpu", {
-      enableFusion: false,
-      enableMemoryPlanning: true,
-    });
-    const model1 = new GPT2(api1, config, { device: "webgpu" });
-    model1.eval();
-
-    const params1 = model1.parameters();
-    for (let i = 0; i < params1.length; i++) {
-      const weightTensor = api1.tensorFromArray(weights[i], shapes[i], { device: "webgpu" });
-      const runtime = api1._runtime();
-      runtime.copy_(params1[i]._unwrap(), weightTensor._unwrap());
-    }
-
-    const input1 = api1.tensorFromArray(inputData, [batchSize, seqLen], { device: "webgpu" });
-    const target1 = api1.tensorFromArray(targetData, [batchSize, seqLen], { device: "webgpu" });
-
-    const { loss: loss1 } = model1.forwardWithLoss(input1, target1, {
-      useCheckpoint: false,
-    });
-    if (!loss1) throw new Error("Loss is null");
-
-    await loss1.backward();
-    await api1.markStep();
-
-    const peakNoCheckpoint = gpuMemoryTracker.getPeakUsageBytes();
-
-    // Run WITH checkpoint
-    gpuMemoryTracker.reset();
-    resetNodeIdCounter();
-    resetStorageIdCounter();
-    resetBaseIdCounter();
-
-    const api2 = new Torchlette("webgpu", {
-      enableFusion: false,
-      enableMemoryPlanning: true,
-      enableTrueSegmentation: true,
-      enableEarlyRelease: true,
-    });
-    const model2 = new GPT2(api2, config, { device: "webgpu" });
-    model2.eval();
-
-    const params2 = model2.parameters();
-    for (let i = 0; i < params2.length; i++) {
-      const weightTensor = api2.tensorFromArray(weights[i], shapes[i], { device: "webgpu" });
-      const runtime = api2._runtime();
-      runtime.copy_(params2[i]._unwrap(), weightTensor._unwrap());
-    }
-
-    const input2 = api2.tensorFromArray(inputData, [batchSize, seqLen], { device: "webgpu" });
-    const target2 = api2.tensorFromArray(targetData, [batchSize, seqLen], { device: "webgpu" });
-
-    const { loss: loss2 } = model2.forwardWithLoss(input2, target2, {
-      useCheckpoint: true,
-    });
-    if (!loss2) throw new Error("Loss is null");
-
-    await loss2.backward();
-    await api2.markStep();
-
-    const peakWithCheckpoint = gpuMemoryTracker.getPeakUsageBytes();
-
-    // Compare memory usage
-    const reduction = (1 - peakWithCheckpoint / peakNoCheckpoint) * 100;
-
-    console.log("\n=== Memory Usage Comparison ===");
-    console.log(`Without checkpoint: ${(peakNoCheckpoint / 1e6).toFixed(2)} MB`);
-    console.log(`With checkpoint:    ${(peakWithCheckpoint / 1e6).toFixed(2)} MB`);
-    console.log(`Reduction:          ${reduction.toFixed(1)}%`);
-
-    // Checkpointing should reduce memory
-    expect(peakWithCheckpoint).toBeLessThan(peakNoCheckpoint);
-    expect(reduction).toBeGreaterThan(20); // Expect at least 20% reduction
-
-    console.log("\nPASS: Checkpoint reduces peak memory usage");
-  });
-
-  test("multiple training steps with checkpoint (same device)", { timeout: 120000 }, async () => {
-    if (!webgpuAvailable) return;
-
-    const config = TINY_CONFIG;
-    const shapes = getParamShapes(config);
-    const names = getParamNames(config);
-    const NUM_STEPS = 3;
-    const LR = 0.01;
-
-    let weights: number[][] = [];
-    for (let i = 0; i < shapes.length; i++) {
-      weights.push(deterministicInit(shapes[i], i + 500));
-    }
-
-    const batchSize = 2;
-    const seqLen = 8;
-
-    console.log(`\nRunning ${NUM_STEPS} training steps, comparing checkpoint vs non-checkpoint...\n`);
-
-    for (let step = 0; step < NUM_STEPS; step++) {
+      const batchSize = 2;
+      const seqLen = 8;
       const inputData: number[] = [];
       const targetData: number[] = [];
       for (let i = 0; i < batchSize * seqLen; i++) {
-        inputData.push((i + step * 17) % config.vocabSize);
-        targetData.push((i + step * 17 + 1) % config.vocabSize);
+        inputData.push(i % config.vocabSize);
+        targetData.push((i + 1) % config.vocabSize);
+      }
+
+      async function runModel(useCheckpoint: boolean) {
+        resetNodeIdCounter();
+        resetStorageIdCounter();
+        resetBaseIdCounter();
+
+        const api = new Torchlette("webgpu", {
+          enableFusion: false,
+          enableMemoryPlanning: true,
+        });
+        const model = new GPT2(api, config, { device: "webgpu" });
+        model.eval();
+
+        const params = model.parameters();
+        for (let i = 0; i < params.length; i++) {
+          const weightTensor = api.tensorFromArray(weights[i], shapes[i], {
+            device: "webgpu",
+          });
+          const runtime = api._runtime();
+          runtime.copy_(params[i]._unwrap(), weightTensor._unwrap());
+        }
+
+        const inputTensor = api.tensorFromArray(
+          inputData,
+          [batchSize, seqLen],
+          { device: "webgpu" },
+        );
+        const targetTensor = api.tensorFromArray(
+          targetData,
+          [batchSize, seqLen],
+          { device: "webgpu" },
+        );
+
+        const { loss } = model.forwardWithLoss(inputTensor, targetTensor, {
+          useCheckpoint,
+        });
+
+        if (!loss) throw new Error("Loss is null");
+        const lossValue = await loss.item();
+
+        await loss.backward();
+
+        const grads: Payload[] = [];
+        for (const p of params) {
+          const grad = p.grad;
+          if (!grad) throw new Error("No gradient");
+          grads.push({
+            shape: grad.shape,
+            values: Array.from(await grad.cpu()),
+          });
+        }
+
+        return { lossValue, grads };
       }
 
       // Run without checkpoint
+      const withoutCp = await runModel(false);
+
+      // Run with checkpoint
+      const withCp = await runModel(true);
+
+      // Compare loss - should be EXACTLY the same
+      const lossDiff = Math.abs(withoutCp.lossValue - withCp.lossValue);
+      console.log(
+        `Loss diff (checkpoint vs non-checkpoint): ${lossDiff.toExponential(2)}`,
+      );
+      expect(lossDiff).toBeLessThan(1e-6);
+
+      // Compare gradients - should be identical within floating point tolerance
+      for (let i = 0; i < withoutCp.grads.length; i++) {
+        assertClose(
+          withCp.grads[i],
+          withoutCp.grads[i],
+          SAME_DEVICE_ATOL,
+          SAME_DEVICE_RTOL,
+          names[i],
+        );
+      }
+
+      console.log(
+        "PASS: Checkpoint produces identical gradients to non-checkpoint on WebGPU",
+      );
+    },
+  );
+
+  test(
+    "checkpoint reduces peak memory vs non-checkpoint",
+    { timeout: 120000 },
+    async () => {
+      if (!webgpuAvailable) return;
+
+      // Use larger config to see memory difference
+      const config: GPT2Config = {
+        vocabSize: 500,
+        blockSize: 32,
+        numLayers: 4,
+        numHeads: 4,
+        embedDim: 64,
+        dropoutRate: 0.0,
+      };
+
+      const shapes = getParamShapes(config);
+      const weights: number[][] = [];
+      for (let i = 0; i < shapes.length; i++) {
+        weights.push(deterministicInit(shapes[i], i + 1000));
+      }
+
+      const batchSize = 2;
+      const seqLen = 16;
+      const inputData: number[] = [];
+      const targetData: number[] = [];
+      for (let i = 0; i < batchSize * seqLen; i++) {
+        inputData.push(i % config.vocabSize);
+        targetData.push((i + 1) % config.vocabSize);
+      }
+
+      // Run WITHOUT checkpoint
+      gpuMemoryTracker.reset();
       resetNodeIdCounter();
       resetStorageIdCounter();
       resetBaseIdCounter();
@@ -385,29 +310,32 @@ describe("GPT-2 Checkpoint (WebGPU)", { skip: !hasWebGPU }, () => {
 
       const params1 = model1.parameters();
       for (let i = 0; i < params1.length; i++) {
-        const weightTensor = api1.tensorFromArray(weights[i], shapes[i], { device: "webgpu" });
+        const weightTensor = api1.tensorFromArray(weights[i], shapes[i], {
+          device: "webgpu",
+        });
         const runtime = api1._runtime();
         runtime.copy_(params1[i]._unwrap(), weightTensor._unwrap());
       }
 
-      const inputTensor1 = api1.tensorFromArray(inputData, [batchSize, seqLen], { device: "webgpu" });
-      const targetTensor1 = api1.tensorFromArray(targetData, [batchSize, seqLen], { device: "webgpu" });
+      const input1 = api1.tensorFromArray(inputData, [batchSize, seqLen], {
+        device: "webgpu",
+      });
+      const target1 = api1.tensorFromArray(targetData, [batchSize, seqLen], {
+        device: "webgpu",
+      });
 
-      const { loss: loss1 } = model1.forwardWithLoss(inputTensor1, targetTensor1, {
+      const { loss: loss1 } = model1.forwardWithLoss(input1, target1, {
         useCheckpoint: false,
       });
       if (!loss1) throw new Error("Loss is null");
-      const lossVal1 = await loss1.item();
+
       await loss1.backward();
+      await api1.markStep();
 
-      const grads1: Payload[] = [];
-      for (const p of params1) {
-        const grad = p.grad;
-        if (!grad) throw new Error("No gradient");
-        grads1.push({ shape: grad.shape, values: Array.from(await grad.cpu()) });
-      }
+      const peakNoCheckpoint = gpuMemoryTracker.getPeakUsageBytes();
 
-      // Run with checkpoint
+      // Run WITH checkpoint
+      gpuMemoryTracker.reset();
       resetNodeIdCounter();
       resetStorageIdCounter();
       resetBaseIdCounter();
@@ -415,152 +343,341 @@ describe("GPT-2 Checkpoint (WebGPU)", { skip: !hasWebGPU }, () => {
       const api2 = new Torchlette("webgpu", {
         enableFusion: false,
         enableMemoryPlanning: true,
+        enableTrueSegmentation: true,
+        enableEarlyRelease: true,
       });
       const model2 = new GPT2(api2, config, { device: "webgpu" });
       model2.eval();
 
       const params2 = model2.parameters();
       for (let i = 0; i < params2.length; i++) {
-        const weightTensor = api2.tensorFromArray(weights[i], shapes[i], { device: "webgpu" });
+        const weightTensor = api2.tensorFromArray(weights[i], shapes[i], {
+          device: "webgpu",
+        });
         const runtime = api2._runtime();
         runtime.copy_(params2[i]._unwrap(), weightTensor._unwrap());
       }
 
-      const inputTensor2 = api2.tensorFromArray(inputData, [batchSize, seqLen], { device: "webgpu" });
-      const targetTensor2 = api2.tensorFromArray(targetData, [batchSize, seqLen], { device: "webgpu" });
+      const input2 = api2.tensorFromArray(inputData, [batchSize, seqLen], {
+        device: "webgpu",
+      });
+      const target2 = api2.tensorFromArray(targetData, [batchSize, seqLen], {
+        device: "webgpu",
+      });
 
-      const { loss: loss2 } = model2.forwardWithLoss(inputTensor2, targetTensor2, {
+      const { loss: loss2 } = model2.forwardWithLoss(input2, target2, {
         useCheckpoint: true,
       });
       if (!loss2) throw new Error("Loss is null");
-      const lossVal2 = await loss2.item();
+
       await loss2.backward();
+      await api2.markStep();
 
-      const grads2: Payload[] = [];
-      for (const p of params2) {
-        const grad = p.grad;
-        if (!grad) throw new Error("No gradient");
-        grads2.push({ shape: grad.shape, values: Array.from(await grad.cpu()) });
+      const peakWithCheckpoint = gpuMemoryTracker.getPeakUsageBytes();
+
+      // Compare memory usage
+      const reduction = (1 - peakWithCheckpoint / peakNoCheckpoint) * 100;
+
+      console.log("\n=== Memory Usage Comparison ===");
+      console.log(
+        `Without checkpoint: ${(peakNoCheckpoint / 1e6).toFixed(2)} MB`,
+      );
+      console.log(
+        `With checkpoint:    ${(peakWithCheckpoint / 1e6).toFixed(2)} MB`,
+      );
+      console.log(`Reduction:          ${reduction.toFixed(1)}%`);
+
+      // Checkpointing should reduce memory
+      expect(peakWithCheckpoint).toBeLessThan(peakNoCheckpoint);
+      expect(reduction).toBeGreaterThan(20); // Expect at least 20% reduction
+
+      console.log("\nPASS: Checkpoint reduces peak memory usage");
+    },
+  );
+
+  test(
+    "multiple training steps with checkpoint (same device)",
+    { timeout: 120000 },
+    async () => {
+      if (!webgpuAvailable) return;
+
+      const config = TINY_CONFIG;
+      const shapes = getParamShapes(config);
+      const names = getParamNames(config);
+      const NUM_STEPS = 3;
+      const LR = 0.01;
+
+      let weights: number[][] = [];
+      for (let i = 0; i < shapes.length; i++) {
+        weights.push(deterministicInit(shapes[i], i + 500));
       }
 
-      // Compare loss
-      const lossDiff = Math.abs(lossVal1 - lossVal2);
-      console.log(`Step ${step + 1}: loss=${lossVal1.toFixed(4)}, diff=${lossDiff.toExponential(2)}`);
-      expect(lossDiff).toBeLessThan(1e-6);
+      const batchSize = 2;
+      const seqLen = 8;
 
-      // Compare gradients
-      for (let i = 0; i < grads1.length; i++) {
-        assertClose(grads2[i], grads1[i], SAME_DEVICE_ATOL, SAME_DEVICE_RTOL, `step${step}_${names[i]}`);
+      console.log(
+        `\nRunning ${NUM_STEPS} training steps, comparing checkpoint vs non-checkpoint...\n`,
+      );
+
+      for (let step = 0; step < NUM_STEPS; step++) {
+        const inputData: number[] = [];
+        const targetData: number[] = [];
+        for (let i = 0; i < batchSize * seqLen; i++) {
+          inputData.push((i + step * 17) % config.vocabSize);
+          targetData.push((i + step * 17 + 1) % config.vocabSize);
+        }
+
+        // Run without checkpoint
+        resetNodeIdCounter();
+        resetStorageIdCounter();
+        resetBaseIdCounter();
+
+        const api1 = new Torchlette("webgpu", {
+          enableFusion: false,
+          enableMemoryPlanning: true,
+        });
+        const model1 = new GPT2(api1, config, { device: "webgpu" });
+        model1.eval();
+
+        const params1 = model1.parameters();
+        for (let i = 0; i < params1.length; i++) {
+          const weightTensor = api1.tensorFromArray(weights[i], shapes[i], {
+            device: "webgpu",
+          });
+          const runtime = api1._runtime();
+          runtime.copy_(params1[i]._unwrap(), weightTensor._unwrap());
+        }
+
+        const inputTensor1 = api1.tensorFromArray(
+          inputData,
+          [batchSize, seqLen],
+          { device: "webgpu" },
+        );
+        const targetTensor1 = api1.tensorFromArray(
+          targetData,
+          [batchSize, seqLen],
+          { device: "webgpu" },
+        );
+
+        const { loss: loss1 } = model1.forwardWithLoss(
+          inputTensor1,
+          targetTensor1,
+          {
+            useCheckpoint: false,
+          },
+        );
+        if (!loss1) throw new Error("Loss is null");
+        const lossVal1 = await loss1.item();
+        await loss1.backward();
+
+        const grads1: Payload[] = [];
+        for (const p of params1) {
+          const grad = p.grad;
+          if (!grad) throw new Error("No gradient");
+          grads1.push({
+            shape: grad.shape,
+            values: Array.from(await grad.cpu()),
+          });
+        }
+
+        // Run with checkpoint
+        resetNodeIdCounter();
+        resetStorageIdCounter();
+        resetBaseIdCounter();
+
+        const api2 = new Torchlette("webgpu", {
+          enableFusion: false,
+          enableMemoryPlanning: true,
+        });
+        const model2 = new GPT2(api2, config, { device: "webgpu" });
+        model2.eval();
+
+        const params2 = model2.parameters();
+        for (let i = 0; i < params2.length; i++) {
+          const weightTensor = api2.tensorFromArray(weights[i], shapes[i], {
+            device: "webgpu",
+          });
+          const runtime = api2._runtime();
+          runtime.copy_(params2[i]._unwrap(), weightTensor._unwrap());
+        }
+
+        const inputTensor2 = api2.tensorFromArray(
+          inputData,
+          [batchSize, seqLen],
+          { device: "webgpu" },
+        );
+        const targetTensor2 = api2.tensorFromArray(
+          targetData,
+          [batchSize, seqLen],
+          { device: "webgpu" },
+        );
+
+        const { loss: loss2 } = model2.forwardWithLoss(
+          inputTensor2,
+          targetTensor2,
+          {
+            useCheckpoint: true,
+          },
+        );
+        if (!loss2) throw new Error("Loss is null");
+        const lossVal2 = await loss2.item();
+        await loss2.backward();
+
+        const grads2: Payload[] = [];
+        for (const p of params2) {
+          const grad = p.grad;
+          if (!grad) throw new Error("No gradient");
+          grads2.push({
+            shape: grad.shape,
+            values: Array.from(await grad.cpu()),
+          });
+        }
+
+        // Compare loss
+        const lossDiff = Math.abs(lossVal1 - lossVal2);
+        console.log(
+          `Step ${step + 1}: loss=${lossVal1.toFixed(4)}, diff=${lossDiff.toExponential(2)}`,
+        );
+        expect(lossDiff).toBeLessThan(1e-6);
+
+        // Compare gradients
+        for (let i = 0; i < grads1.length; i++) {
+          assertClose(
+            grads2[i],
+            grads1[i],
+            SAME_DEVICE_ATOL,
+            SAME_DEVICE_RTOL,
+            `step${step}_${names[i]}`,
+          );
+        }
+
+        // Apply SGD update using non-checkpoint gradients
+        const newWeights: number[][] = [];
+        for (let i = 0; i < weights.length; i++) {
+          const w = weights[i];
+          const g = grads1[i].values;
+          const updated = w.map((val, idx) => val - LR * g[idx]);
+          newWeights.push(updated);
+        }
+        weights = newWeights;
       }
 
-      // Apply SGD update using non-checkpoint gradients
-      const newWeights: number[][] = [];
-      for (let i = 0; i < weights.length; i++) {
-        const w = weights[i];
-        const g = grads1[i].values;
-        const updated = w.map((val, idx) => val - LR * g[idx]);
-        newWeights.push(updated);
+      console.log(`\nAll ${NUM_STEPS} steps passed!`);
+    },
+  );
+
+  test(
+    "cross-device sanity check: loss values are in same ballpark",
+    { timeout: 60000 },
+    async () => {
+      if (!webgpuAvailable) return;
+
+      // This test only verifies that WebGPU and PyTorch produce similar (not identical) results
+      // Full parity is not expected due to parallel reduction ordering differences
+
+      const config = TINY_CONFIG;
+      const shapes = getParamShapes(config);
+
+      const weights: number[][] = [];
+      for (let i = 0; i < shapes.length; i++) {
+        weights.push(deterministicInit(shapes[i], i + 1));
       }
-      weights = newWeights;
-    }
 
-    console.log(`\nAll ${NUM_STEPS} steps passed!`);
-  });
+      const batchSize = 2;
+      const seqLen = 8;
+      const inputData: number[] = [];
+      const targetData: number[] = [];
+      for (let i = 0; i < batchSize * seqLen; i++) {
+        inputData.push(i % config.vocabSize);
+        targetData.push((i + 1) % config.vocabSize);
+      }
 
-  test("cross-device sanity check: loss values are in same ballpark", { timeout: 60000 }, async () => {
-    if (!webgpuAvailable) return;
+      // Run torchlette
+      resetNodeIdCounter();
+      resetStorageIdCounter();
+      resetBaseIdCounter();
 
-    // This test only verifies that WebGPU and PyTorch produce similar (not identical) results
-    // Full parity is not expected due to parallel reduction ordering differences
+      const api = new Torchlette("webgpu", {
+        enableFusion: false,
+        enableMemoryPlanning: true,
+      });
+      const model = new GPT2(api, config, { device: "webgpu" });
+      model.eval();
 
-    const config = TINY_CONFIG;
-    const shapes = getParamShapes(config);
+      const params = model.parameters();
+      for (let i = 0; i < params.length; i++) {
+        const weightTensor = api.tensorFromArray(weights[i], shapes[i], {
+          device: "webgpu",
+        });
+        const runtime = api._runtime();
+        runtime.copy_(params[i]._unwrap(), weightTensor._unwrap());
+      }
 
-    const weights: number[][] = [];
-    for (let i = 0; i < shapes.length; i++) {
-      weights.push(deterministicInit(shapes[i], i + 1));
-    }
+      const inputTensor = api.tensorFromArray(inputData, [batchSize, seqLen], {
+        device: "webgpu",
+      });
+      const targetTensor = api.tensorFromArray(
+        targetData,
+        [batchSize, seqLen],
+        { device: "webgpu" },
+      );
 
-    const batchSize = 2;
-    const seqLen = 8;
-    const inputData: number[] = [];
-    const targetData: number[] = [];
-    for (let i = 0; i < batchSize * seqLen; i++) {
-      inputData.push(i % config.vocabSize);
-      targetData.push((i + 1) % config.vocabSize);
-    }
-
-    // Run torchlette
-    resetNodeIdCounter();
-    resetStorageIdCounter();
-    resetBaseIdCounter();
-
-    const api = new Torchlette("webgpu", {
-      enableFusion: false,
-      enableMemoryPlanning: true,
-    });
-    const model = new GPT2(api, config, { device: "webgpu" });
-    model.eval();
-
-    const params = model.parameters();
-    for (let i = 0; i < params.length; i++) {
-      const weightTensor = api.tensorFromArray(weights[i], shapes[i], { device: "webgpu" });
-      const runtime = api._runtime();
-      runtime.copy_(params[i]._unwrap(), weightTensor._unwrap());
-    }
-
-    const inputTensor = api.tensorFromArray(inputData, [batchSize, seqLen], { device: "webgpu" });
-    const targetTensor = api.tensorFromArray(targetData, [batchSize, seqLen], { device: "webgpu" });
-
-    const { loss } = model.forwardWithLoss(inputTensor, targetTensor, {
-      useCheckpoint: true,
-    });
-    if (!loss) throw new Error("Loss is null");
-    const torchletteL = await loss.item();
-
-    // Run PyTorch oracle
-    const oracleInputs: { values: number[]; shape: number[] }[] = [
-      { values: inputData, shape: [batchSize, seqLen] },
-      { values: targetData, shape: [batchSize, seqLen] },
-    ];
-    for (let i = 0; i < weights.length; i++) {
-      oracleInputs.push({ values: weights[i], shape: shapes[i] });
-    }
-
-    const oracleCase: OracleCase = {
-      op: "gpt2_checkpoint_parity",
-      caseName: "gpt2_sanity",
-      inputs: oracleInputs,
-      options: {
-        vocabSize: config.vocabSize,
-        blockSize: config.blockSize,
-        embedDim: config.embedDim,
-        numLayers: config.numLayers,
-        numHeads: config.numHeads,
+      const { loss } = model.forwardWithLoss(inputTensor, targetTensor, {
         useCheckpoint: true,
-      },
-    };
+      });
+      if (!loss) throw new Error("Loss is null");
+      const torchletteL = await loss.item();
 
-    const [oracleResult] = await runTorchOracleFullBatch([oracleCase]);
-    if (!oracleResult.output) throw new Error("Oracle returned no output");
-    const pytorchL = oracleResult.output.values[0];
+      // Run PyTorch oracle
+      const oracleInputs: { values: number[]; shape: number[] }[] = [
+        { values: inputData, shape: [batchSize, seqLen] },
+        { values: targetData, shape: [batchSize, seqLen] },
+      ];
+      for (let i = 0; i < weights.length; i++) {
+        oracleInputs.push({ values: weights[i], shape: shapes[i] });
+      }
 
-    console.log(`\n=== Cross-Device Sanity Check ===`);
-    console.log(`Torchlette (WebGPU): loss=${torchletteL.toFixed(4)}`);
-    console.log(`PyTorch (CPU):       loss=${pytorchL.toFixed(4)}`);
-    console.log(`Difference:          ${Math.abs(torchletteL - pytorchL).toExponential(2)}`);
+      const oracleCase: OracleCase = {
+        op: "gpt2_checkpoint_parity",
+        caseName: "gpt2_sanity",
+        inputs: oracleInputs,
+        options: {
+          vocabSize: config.vocabSize,
+          blockSize: config.blockSize,
+          embedDim: config.embedDim,
+          numLayers: config.numLayers,
+          numHeads: config.numHeads,
+          useCheckpoint: true,
+        },
+      };
 
-    // Both losses should be reasonable cross-entropy values (positive, finite)
-    expect(torchletteL).toBeGreaterThan(0);
-    expect(torchletteL).toBeLessThan(100);
-    expect(pytorchL).toBeGreaterThan(0);
-    expect(pytorchL).toBeLessThan(100);
+      const [oracleResult] = await runTorchOracleFullBatch([oracleCase]);
+      if (!oracleResult.output) throw new Error("Oracle returned no output");
+      const pytorchL = oracleResult.output.values[0];
 
-    // They should be in the same general ballpark (within 50%)
-    const relDiff = Math.abs(torchletteL - pytorchL) / pytorchL;
-    expect(relDiff).toBeLessThan(0.5);
+      console.log(`\n=== Cross-Device Sanity Check ===`);
+      console.log(`Torchlette (WebGPU): loss=${torchletteL.toFixed(4)}`);
+      console.log(`PyTorch (CPU):       loss=${pytorchL.toFixed(4)}`);
+      console.log(
+        `Difference:          ${Math.abs(torchletteL - pytorchL).toExponential(2)}`,
+      );
 
-    console.log(`Relative difference: ${(relDiff * 100).toFixed(1)}% (< 50% threshold)`);
-    console.log("\nNote: Exact parity not expected due to GPU parallel reduction ordering");
-  });
+      // Both losses should be reasonable cross-entropy values (positive, finite)
+      expect(torchletteL).toBeGreaterThan(0);
+      expect(torchletteL).toBeLessThan(100);
+      expect(pytorchL).toBeGreaterThan(0);
+      expect(pytorchL).toBeLessThan(100);
+
+      // They should be in the same general ballpark (within 50%)
+      const relDiff = Math.abs(torchletteL - pytorchL) / pytorchL;
+      expect(relDiff).toBeLessThan(0.5);
+
+      console.log(
+        `Relative difference: ${(relDiff * 100).toFixed(1)}% (< 50% threshold)`,
+      );
+      console.log(
+        "\nNote: Exact parity not expected due to GPU parallel reduction ordering",
+      );
+    },
+  );
 });

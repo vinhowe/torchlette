@@ -6,46 +6,52 @@
  * and dispatching through the tile-IR pipeline.
  */
 
-import { normalizeDim, type BackendTensor, type DType, type SumOptions, type MeanOptions, type MaxOptions } from "../../types";
 import { sizeOf } from "../../../core/shape";
-import type { GPUBuffer, WebGPUTensor, WebGPUContext } from "../gpu-types";
-import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import {
-  contiguousStrides,
-  dtypeBytes,
-  alignBufferSize,
-} from "../shape-utils";
-import { requireContext } from "../gpu-context";
-import { dispatchComputePass, getPipeline } from "../dispatch";
-import { createTensor, createTrackedBuffer } from "../tensor";
-import { bufferPool } from "../buffer-pool";
-import { resolveOutputBuffer } from "../buffer-arena";
+  type BackendTensor,
+  type DType,
+  type MaxOptions,
+  type MeanOptions,
+  normalizeDim,
+  type SumOptions,
+} from "../../types";
 import {
   cachedCreateBindGroup,
-  profiledCreateBindGroup,
   createParamsBuffer,
-  releaseParamsBuffer,
   params,
+  profiledCreateBindGroup,
+  releaseParamsBuffer,
 } from "../bind-group-cache";
-import { isUnaryOp as isUnaryOpFromRegistry } from "./registry";
-import { contiguous } from "./views";
-import { createTileKernelDispatcher } from "../tile-dispatch";
+import { resolveOutputBuffer } from "../buffer-arena";
+import { bufferPool } from "../buffer-pool";
+import { dispatchComputePass, getPipeline } from "../dispatch";
+import { requireContext } from "../gpu-context";
+import type { GPUBuffer, WebGPUContext, WebGPUTensor } from "../gpu-types";
+import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
 import {
-  makeReductionSpec,
   dimInfo,
-  makeMeanDivSpec,
   getChunkedSumWGSL,
   getFinalSumWGSL,
-  type ReductionEpilogueOpDesc,
+  makeMeanDivSpec,
+  makeReductionSpec,
   type PreambleChainKernelOp,
+  type ReductionEpilogueOpDesc,
 } from "../reduction-tile-ir";
+import { alignBufferSize, contiguousStrides, dtypeBytes } from "../shape-utils";
+import { createTensor, createTrackedBuffer } from "../tensor";
+import { createTileKernelDispatcher } from "../tile-dispatch";
+import { isUnaryOp as isUnaryOpFromRegistry } from "./registry";
+import { contiguous } from "./views";
 
 // ============================================================================
 // Shared Metadata
 // ============================================================================
 
 /** Compute the count of elements being reduced across given dims. */
-function reductionCount(inputShape: number[], dim: number | number[] | undefined | null): number {
+function reductionCount(
+  inputShape: number[],
+  dim: number | number[] | undefined | null,
+): number {
   if (dim === undefined || dim === null) return sizeOf(inputShape);
   const dims = Array.isArray(dim) ? dim : [dim];
   const rank = inputShape.length;
@@ -96,8 +102,10 @@ function prepareDimReduction(
   let outDimIdx = 0;
   for (let i = 0; i < rank; i++) {
     if (normalizedDims.includes(i)) {
-      if (keepdim) { inputToOutDim.push(outDimIdx); outDimIdx++; }
-      else inputToOutDim.push(-1);
+      if (keepdim) {
+        inputToOutDim.push(outDimIdx);
+        outDimIdx++;
+      } else inputToOutDim.push(-1);
     } else {
       inputToOutDim.push(outDimIdx);
       outDimIdx++;
@@ -105,8 +113,14 @@ function prepareDimReduction(
   }
 
   return {
-    normalizedDims, rank, outShape, outSize: sizeOf(outShape), reductionSize,
-    inputStrides, outStrides, inputToOutDim,
+    normalizedDims,
+    rank,
+    outShape,
+    outSize: sizeOf(outShape),
+    reductionSize,
+    inputStrides,
+    outStrides,
+    inputToOutDim,
   };
 }
 
@@ -114,33 +128,62 @@ function prepareDimReduction(
 // Cached dispatchers + helpers
 // ============================================================================
 
-const dispatcherCache = new Map<string, ReturnType<typeof createTileKernelDispatcher>>();
-function getCachedDispatcher(key: string, specFactory: () => ReturnType<typeof makeReductionSpec>) {
+const dispatcherCache = new Map<
+  string,
+  ReturnType<typeof createTileKernelDispatcher>
+>();
+function getCachedDispatcher(
+  key: string,
+  specFactory: () => ReturnType<typeof makeReductionSpec>,
+) {
   let d = dispatcherCache.get(key);
-  if (!d) { d = createTileKernelDispatcher(specFactory()); dispatcherCache.set(key, d); }
+  if (!d) {
+    d = createTileKernelDispatcher(specFactory());
+    dispatcherCache.set(key, d);
+  }
   return d;
 }
 
 /** Build `{ in0: buf0, in1: buf1, ... }` map for preamble input buffers. */
 function inputBufferMap(inputs: BackendTensor[]): Record<string, GPUBuffer> {
   const m: Record<string, GPUBuffer> = {};
-  for (let i = 0; i < inputs.length; i++) m[`in${i}`] = asGPUTensor(inputs[i]).buffer;
+  for (let i = 0; i < inputs.length; i++)
+    m[`in${i}`] = asGPUTensor(inputs[i]).buffer;
   return m;
 }
 
 /** Create a 1/count scalar buffer and prepend mul(1/count) to an epilogue chain (for mean). */
 function createInvCountEpilogue(
-  ctx: WebGPUContext, count: number,
-  epilogueOps: ReductionEpilogueOpDesc[], epilogueInputs: BackendTensor[],
-): { ops: ReductionEpilogueOpDesc[]; inputs: BackendTensor[]; invCountBuffer: GPUBuffer } {
+  ctx: WebGPUContext,
+  count: number,
+  epilogueOps: ReductionEpilogueOpDesc[],
+  epilogueInputs: BackendTensor[],
+): {
+  ops: ReductionEpilogueOpDesc[];
+  inputs: BackendTensor[];
+  invCountBuffer: GPUBuffer;
+} {
   const invCountBuffer = createTrackedBuffer(ctx.device, {
     size: 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    usage:
+      GPUBufferUsage.STORAGE |
+      GPUBufferUsage.COPY_SRC |
+      GPUBufferUsage.COPY_DST,
   });
-  ctx.device.queue.writeBuffer(invCountBuffer, 0, new Float32Array([1.0 / count]));
+  ctx.device.queue.writeBuffer(
+    invCountBuffer,
+    0,
+    new Float32Array([1.0 / count]),
+  );
   return {
-    ops: [{ kind: "binary", op: "mul", inputIndex: epilogueInputs.length }, ...epilogueOps],
-    inputs: [...epilogueInputs, { buffer: invCountBuffer } as unknown as BackendTensor],
+    ops: [
+      { kind: "binary", op: "mul", inputIndex: epilogueInputs.length },
+      ...epilogueOps,
+    ],
+    inputs: [
+      ...epilogueInputs,
+      { buffer: invCountBuffer } as unknown as BackendTensor,
+    ],
     invCountBuffer,
   };
 }
@@ -153,7 +196,9 @@ function addEpilogueBindings(
 ): void {
   for (const eop of epilogueOps) {
     if (eop.kind === "binary" && eop.inputIndex !== undefined) {
-      buffers[`ep_in${eop.inputIndex}`] = asGPUTensor(epilogueInputs[eop.inputIndex]).buffer;
+      buffers[`ep_in${eop.inputIndex}`] = asGPUTensor(
+        epilogueInputs[eop.inputIndex],
+      ).buffer;
     }
   }
 }
@@ -197,13 +242,31 @@ export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
     }
   }
 
-  const { normalizedDims, outShape, outSize, reductionSize,
-    inputStrides, outStrides, inputToOutDim } = setup;
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
+  const {
+    normalizedDims,
+    outShape,
+    outSize,
+    reductionSize,
+    inputStrides,
+    outStrides,
+    inputToOutDim,
+  } = setup;
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [
+    tensor.buffer,
+  ]);
 
   const useParallel = reductionSize > 64;
-  const spec = makeReductionSpec({ reduceOp: "sum",
-    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, useParallel),
+  const spec = makeReductionSpec({
+    reduceOp: "sum",
+    dim: dimInfo(
+      inputShape,
+      inputStrides,
+      normalizedDims,
+      outShape,
+      outStrides,
+      inputToOutDim,
+      useParallel,
+    ),
   });
   const dispatcher = createTileKernelDispatcher(spec);
 
@@ -229,19 +292,22 @@ function sumFullReduction(
 
   // Check if input buffer exceeds max binding size
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize =
+    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const inputBufferSize = tensor.buffer.size;
 
-  if (inputBufferSize > maxBindingSize || inputSize * bytesPerElement > maxBindingSize) {
+  if (
+    inputBufferSize > maxBindingSize ||
+    inputSize * bytesPerElement > maxBindingSize
+  ) {
     return sumFullReductionChunked(ctx, tensor, maxBindingSize);
   }
 
   const outBuffer = resolveOutputBuffer(ctx.device, 4, [tensor.buffer]);
 
-  getCachedDispatcher("sumFull", () => makeReductionSpec({ reduceOp: "sum" })).dispatch(
-    { input: tensor.buffer, out: outBuffer },
-    { size: inputSize },
-  );
+  getCachedDispatcher("sumFull", () =>
+    makeReductionSpec({ reduceOp: "sum" }),
+  ).dispatch({ input: tensor.buffer, out: outBuffer }, { size: inputSize });
 
   return createTensor([], outBuffer);
 }
@@ -268,7 +334,8 @@ function sumFullReductionChunked(
   const elementsPerAlignment = minAlignment / bytesPerElement;
   const maxElementsPerChunk = Math.floor(maxBindingSize / bytesPerElement);
   const elementsPerChunk =
-    Math.floor(maxElementsPerChunk / elementsPerAlignment) * elementsPerAlignment;
+    Math.floor(maxElementsPerChunk / elementsPerAlignment) *
+    elementsPerAlignment;
 
   const totalElements = tensor.size;
   const numChunks = Math.ceil(totalElements / elementsPerChunk);
@@ -276,7 +343,10 @@ function sumFullReductionChunked(
   // Create buffer for partial sums (one f32 per chunk)
   const partialsBuffer = createTrackedBuffer(ctx.device, {
     size: alignBufferSize(numChunks * 4),
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    usage:
+      GPUBufferUsage.STORAGE |
+      GPUBufferUsage.COPY_SRC |
+      GPUBufferUsage.COPY_DST,
   });
 
   // Per-chunk kernel: tile-IR generated WGSL, manual bind groups for offset/size
@@ -290,12 +360,22 @@ function sumFullReductionChunked(
     const chunkByteOffset = chunkStart * bytesPerElement;
     const chunkByteSize = chunkSize * bytesPerElement;
 
-    const paramsBuffer = createParamsBuffer(ctx.device, params(chunkSize, chunk));
+    const paramsBuffer = createParamsBuffer(
+      ctx.device,
+      params(chunkSize, chunk),
+    );
 
     const bindGroup = profiledCreateBindGroup(ctx.device, {
       layout: pipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: tensor.buffer, offset: chunkByteOffset, size: chunkByteSize } },
+        {
+          binding: 0,
+          resource: {
+            buffer: tensor.buffer,
+            offset: chunkByteOffset,
+            size: chunkByteSize,
+          },
+        },
         { binding: 1, resource: { buffer: partialsBuffer } },
         { binding: 2, resource: { buffer: paramsBuffer } },
       ],
@@ -313,7 +393,10 @@ function sumFullReductionChunked(
   // Final reduction of partials: tile-IR generated WGSL
   const outBuffer = createTrackedBuffer(ctx.device, {
     size: 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    usage:
+      GPUBufferUsage.STORAGE |
+      GPUBufferUsage.COPY_SRC |
+      GPUBufferUsage.COPY_DST,
   });
 
   const finalWGSL = getFinalSumWGSL();
@@ -321,7 +404,11 @@ function sumFullReductionChunked(
   const finalParamsData = new Uint32Array([numChunks, 0, 0, 0]); // 16-byte aligned
   const finalParamsBuffer = createParamsBuffer(ctx.device, finalParamsData);
 
-  const finalBindGroup = cachedCreateBindGroup(ctx.device, finalPipeline, [partialsBuffer, outBuffer, finalParamsBuffer]);
+  const finalBindGroup = cachedCreateBindGroup(ctx.device, finalPipeline, [
+    partialsBuffer,
+    outBuffer,
+    finalParamsBuffer,
+  ]);
 
   dispatchComputePass(finalPipeline, finalBindGroup, 1);
   releaseParamsBuffer(finalParamsBuffer);
@@ -346,7 +433,12 @@ export function sumDimWithPreamble(
   sumOptions: SumOptions,
 ): BackendTensor {
   const arity = isUnaryOpFromRegistry(preambleOp) ? 1 : 2;
-  return sumDimWithPreambleChain(inputs, [{ op: preambleOp, arity }], [], sumOptions);
+  return sumDimWithPreambleChain(
+    inputs,
+    [{ op: preambleOp, arity }],
+    [],
+    sumOptions,
+  );
 }
 
 /**
@@ -366,10 +458,12 @@ export function sumDimWithPreambleChain(
   const dim = sumOptions?.dim;
   const keepdim = sumOptions?.keepdim ?? false;
 
-  const setup = (dim !== undefined && dim !== null)
-    ? prepareDimReduction(inputShape, dim, keepdim) : null;
+  const setup =
+    dim !== undefined && dim !== null
+      ? prepareDimReduction(inputShape, dim, keepdim)
+      : null;
 
-  const inputBuffers = inputs.map(inp => asGPUTensor(inp).buffer);
+  const inputBuffers = inputs.map((inp) => asGPUTensor(inp).buffer);
   const preamble = { chainOps, totalInputs: inputs.length, inputDtypes };
 
   if (!setup) {
@@ -382,12 +476,28 @@ export function sumDimWithPreambleChain(
     return createTensor([], outBuffer);
   }
 
-  const { normalizedDims, outShape, outSize, reductionSize,
-    inputStrides, outStrides, inputToOutDim } = setup;
+  const {
+    normalizedDims,
+    outShape,
+    outSize,
+    reductionSize,
+    inputStrides,
+    outStrides,
+    inputToOutDim,
+  } = setup;
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, inputBuffers);
   const useParallel = reductionSize > 64;
-  const spec = makeReductionSpec({ reduceOp: "sum",
-    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, useParallel),
+  const spec = makeReductionSpec({
+    reduceOp: "sum",
+    dim: dimInfo(
+      inputShape,
+      inputStrides,
+      normalizedDims,
+      outShape,
+      outStrides,
+      inputToOutDim,
+      useParallel,
+    ),
     preamble,
   });
   createTileKernelDispatcher(spec).dispatch(
@@ -428,41 +538,78 @@ export function sumWithPreambleEpilogue(
   let invCountBuffer: GPUBuffer | null = null;
   if (isMean) {
     const count = reductionCount(inputShape, dim);
-    const mean = createInvCountEpilogue(ctx, count, epilogueOps, epilogueInputs);
+    const mean = createInvCountEpilogue(
+      ctx,
+      count,
+      epilogueOps,
+      epilogueInputs,
+    );
     effectiveEpilogueOps = mean.ops;
     effectiveEpilogueInputs = mean.inputs;
     invCountBuffer = mean.invCountBuffer;
   }
 
   const bpe = dtypeBytes(outputDtype);
-  const setup = (dim !== undefined && dim !== null)
-    ? prepareDimReduction(inputShape, dim, keepdim) : null;
-  const preamble = { chainOps, totalInputs: preambleInputs.length, inputDtypes: preambleInputDtypes };
+  const setup =
+    dim !== undefined && dim !== null
+      ? prepareDimReduction(inputShape, dim, keepdim)
+      : null;
+  const preamble = {
+    chainOps,
+    totalInputs: preambleInputs.length,
+    inputDtypes: preambleInputDtypes,
+  };
   const epilogue = { ops: effectiveEpilogueOps, outputDtype };
   const allInputBuffers = [
-    ...preambleInputs.map(inp => asGPUTensor(inp).buffer),
-    ...effectiveEpilogueInputs.map(inp => asGPUTensor(inp).buffer),
+    ...preambleInputs.map((inp) => asGPUTensor(inp).buffer),
+    ...effectiveEpilogueInputs.map((inp) => asGPUTensor(inp).buffer),
   ];
-  const buffers: Record<string, GPUBuffer> = { ...inputBufferMap(preambleInputs) };
+  const buffers: Record<string, GPUBuffer> = {
+    ...inputBufferMap(preambleInputs),
+  };
   addEpilogueBindings(buffers, effectiveEpilogueOps, effectiveEpilogueInputs);
 
   let result: BackendTensor;
   if (!setup) {
     const outBuffer = resolveOutputBuffer(ctx.device, bpe, allInputBuffers);
     buffers.out = outBuffer;
-    createTileKernelDispatcher(makeReductionSpec({ reduceOp: "sum", preamble, epilogue }))
-      .dispatch(buffers, { size: tensor0.size });
+    createTileKernelDispatcher(
+      makeReductionSpec({ reduceOp: "sum", preamble, epilogue }),
+    ).dispatch(buffers, { size: tensor0.size });
     result = createTensor([], outBuffer, undefined, 0, outputDtype);
   } else {
-    const { normalizedDims, outShape, outSize, reductionSize,
-      inputStrides, outStrides, inputToOutDim } = setup;
-    const outBuffer = resolveOutputBuffer(ctx.device, outSize * bpe, allInputBuffers);
+    const {
+      normalizedDims,
+      outShape,
+      outSize,
+      reductionSize,
+      inputStrides,
+      outStrides,
+      inputToOutDim,
+    } = setup;
+    const outBuffer = resolveOutputBuffer(
+      ctx.device,
+      outSize * bpe,
+      allInputBuffers,
+    );
     buffers.out = outBuffer;
     const useParallel = reductionSize > 64;
-    createTileKernelDispatcher(makeReductionSpec({ reduceOp: "sum",
-      dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, useParallel),
-      preamble, epilogue,
-    })).dispatch(buffers, { outSize, reductionSize });
+    createTileKernelDispatcher(
+      makeReductionSpec({
+        reduceOp: "sum",
+        dim: dimInfo(
+          inputShape,
+          inputStrides,
+          normalizedDims,
+          outShape,
+          outStrides,
+          inputToOutDim,
+          useParallel,
+        ),
+        preamble,
+        epilogue,
+      }),
+    ).dispatch(buffers, { outSize, reductionSize });
     result = createTensor(outShape, outBuffer, undefined, 0, outputDtype);
   }
 
@@ -476,7 +623,11 @@ export function sumWithPreambleEpilogue(
 
 type MaxMinOp = "max" | "min";
 
-function maxMinReduction(op: MaxMinOp, a: BackendTensor, options?: MaxOptions): BackendTensor {
+function maxMinReduction(
+  op: MaxMinOp,
+  a: BackendTensor,
+  options?: MaxOptions,
+): BackendTensor {
   const ctx = requireContext();
   let tensor = asGPUTensor(a);
   if (!tensor.isContiguous) tensor = asGPUTensor(contiguous(tensor));
@@ -493,29 +644,54 @@ function maxMinReduction(op: MaxMinOp, a: BackendTensor, options?: MaxOptions): 
   if (!setup) return maxMinFullReduction(op, ctx, tensor);
 
   for (const d of setup.normalizedDims) {
-    if (d < 0 || d >= setup.rank) throw new Error(`${op}: dimension ${d} out of range`);
+    if (d < 0 || d >= setup.rank)
+      throw new Error(`${op}: dimension ${d} out of range`);
   }
 
-  const { normalizedDims, outShape, outSize, reductionSize,
-    inputStrides, outStrides, inputToOutDim } = setup;
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensor.buffer]);
+  const {
+    normalizedDims,
+    outShape,
+    outSize,
+    reductionSize,
+    inputStrides,
+    outStrides,
+    inputToOutDim,
+  } = setup;
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [
+    tensor.buffer,
+  ]);
 
   const useParallel = reductionSize > 64;
-  const spec = makeReductionSpec({ reduceOp: op,
-    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, useParallel),
+  const spec = makeReductionSpec({
+    reduceOp: op,
+    dim: dimInfo(
+      inputShape,
+      inputStrides,
+      normalizedDims,
+      outShape,
+      outStrides,
+      inputToOutDim,
+      useParallel,
+    ),
   });
   const dispatcher = createTileKernelDispatcher(spec);
-  dispatcher.dispatch({ input: tensor.buffer, out: outBuffer }, { outSize, reductionSize });
+  dispatcher.dispatch(
+    { input: tensor.buffer, out: outBuffer },
+    { outSize, reductionSize },
+  );
 
   return createTensor(outShape, outBuffer);
 }
 
-function maxMinFullReduction(op: MaxMinOp, ctx: WebGPUContext, tensor: WebGPUTensor): WebGPUTensor {
+function maxMinFullReduction(
+  op: MaxMinOp,
+  ctx: WebGPUContext,
+  tensor: WebGPUTensor,
+): WebGPUTensor {
   const outBuffer = resolveOutputBuffer(ctx.device, 4, [tensor.buffer]);
-  getCachedDispatcher(`${op}Full`, () => makeReductionSpec({ reduceOp: op })).dispatch(
-    { input: tensor.buffer, out: outBuffer },
-    { size: tensor.size },
-  );
+  getCachedDispatcher(`${op}Full`, () =>
+    makeReductionSpec({ reduceOp: op }),
+  ).dispatch({ input: tensor.buffer, out: outBuffer }, { size: tensor.size });
   return createTensor([], outBuffer);
 }
 
@@ -541,7 +717,9 @@ export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
   // Divide by count via tile-IR
   const ctx = requireContext();
   const outSize = sumTensor.size;
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [sumTensor.buffer]);
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [
+    sumTensor.buffer,
+  ]);
 
   getCachedDispatcher("meanDiv", makeMeanDivSpec).dispatch(
     { input: sumTensor.buffer, out: outBuffer },
@@ -579,32 +757,61 @@ function reductionWithEpilogue(
   const keepdim = options?.keepdim ?? false;
   const bpe = dtypeBytes(outputDtype);
 
-  const setup = (dim !== undefined && dim !== null)
-    ? prepareDimReduction(inputShape, dim, keepdim) : null;
+  const setup =
+    dim !== undefined && dim !== null
+      ? prepareDimReduction(inputShape, dim, keepdim)
+      : null;
 
   if (!setup) {
     const outBuffer = resolveOutputBuffer(ctx.device, bpe, [tensor.buffer]);
-    const spec = makeReductionSpec({ reduceOp, epilogue: { ops: epilogueOps, outputDtype } });
+    const spec = makeReductionSpec({
+      reduceOp,
+      epilogue: { ops: epilogueOps, outputDtype },
+    });
     const dispatcher = createTileKernelDispatcher(spec);
-    const buffers: Record<string, GPUBuffer> = { input: tensor.buffer, out: outBuffer };
+    const buffers: Record<string, GPUBuffer> = {
+      input: tensor.buffer,
+      out: outBuffer,
+    };
     addEpilogueBindings(buffers, epilogueOps, epilogueInputs);
     dispatcher.dispatch(buffers, { size: tensor.size });
     if (contiguousCopy) contiguousCopy.destroy();
     return createTensor([], outBuffer, undefined, 0, outputDtype);
   }
 
-  const { normalizedDims, outShape, outSize, reductionSize,
-    inputStrides, outStrides, inputToOutDim } = setup;
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bpe, [tensor.buffer]);
+  const {
+    normalizedDims,
+    outShape,
+    outSize,
+    reductionSize,
+    inputStrides,
+    outStrides,
+    inputToOutDim,
+  } = setup;
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bpe, [
+    tensor.buffer,
+  ]);
 
   const useParallel = reductionSize > 64;
-  const spec = makeReductionSpec({ reduceOp,
-    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, useParallel),
+  const spec = makeReductionSpec({
+    reduceOp,
+    dim: dimInfo(
+      inputShape,
+      inputStrides,
+      normalizedDims,
+      outShape,
+      outStrides,
+      inputToOutDim,
+      useParallel,
+    ),
     epilogue: { ops: epilogueOps, outputDtype },
   });
   const dispatcher = createTileKernelDispatcher(spec);
 
-  const buffers: Record<string, GPUBuffer> = { input: tensor.buffer, out: outBuffer };
+  const buffers: Record<string, GPUBuffer> = {
+    input: tensor.buffer,
+    out: outBuffer,
+  };
   addEpilogueBindings(buffers, epilogueOps, epilogueInputs);
   dispatcher.dispatch(buffers, { outSize, reductionSize });
 
@@ -613,17 +820,37 @@ function reductionWithEpilogue(
 }
 
 export function sumWithEpilogue(
-  a: BackendTensor, options: SumOptions, epilogueOps: ReductionEpilogueOpDesc[],
-  epilogueInputs: BackendTensor[], outputDtype: DType,
+  a: BackendTensor,
+  options: SumOptions,
+  epilogueOps: ReductionEpilogueOpDesc[],
+  epilogueInputs: BackendTensor[],
+  outputDtype: DType,
 ): BackendTensor {
-  return reductionWithEpilogue("sum", a, options, epilogueOps, epilogueInputs, outputDtype);
+  return reductionWithEpilogue(
+    "sum",
+    a,
+    options,
+    epilogueOps,
+    epilogueInputs,
+    outputDtype,
+  );
 }
 
 export function maxWithEpilogue(
-  a: BackendTensor, options: MaxOptions, epilogueOps: ReductionEpilogueOpDesc[],
-  epilogueInputs: BackendTensor[], outputDtype: DType,
+  a: BackendTensor,
+  options: MaxOptions,
+  epilogueOps: ReductionEpilogueOpDesc[],
+  epilogueInputs: BackendTensor[],
+  outputDtype: DType,
 ): BackendTensor {
-  return reductionWithEpilogue("max", a, options, epilogueOps, epilogueInputs, outputDtype);
+  return reductionWithEpilogue(
+    "max",
+    a,
+    options,
+    epilogueOps,
+    epilogueInputs,
+    outputDtype,
+  );
 }
 
 // ============================================================================
@@ -644,8 +871,19 @@ export function meanWithEpilogue(
 ): BackendTensor {
   const tensor = asGPUTensor(a);
   const count = reductionCount(tensor.shape, options?.dim);
-  const mean = createInvCountEpilogue(requireContext(), count, epilogueOps, epilogueInputs);
-  const result = sumWithEpilogue(a, options, mean.ops, mean.inputs, outputDtype);
+  const mean = createInvCountEpilogue(
+    requireContext(),
+    count,
+    epilogueOps,
+    epilogueInputs,
+  );
+  const result = sumWithEpilogue(
+    a,
+    options,
+    mean.ops,
+    mean.inputs,
+    outputDtype,
+  );
   mean.invCountBuffer.destroy();
   return result;
 }

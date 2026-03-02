@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
+  type AutocastContext,
   createAutocastContext,
   pushAutocast,
-  type AutocastContext,
 } from "../src/engine/amp";
 import {
   applyAMPTransform,

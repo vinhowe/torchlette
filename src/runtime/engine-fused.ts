@@ -146,7 +146,12 @@ export function fusedAttentionForwardOp(
   device: DeviceKind,
   config: FusedAttentionConfig,
 ): FusedOpResult {
-  const shape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
+  const shape = [
+    config.batchSize,
+    config.numHeads,
+    config.seqLen,
+    config.headDim,
+  ];
   const node = createLazyIRNode(
     "fusedAttentionForward",
     [qRef, kRef, vRef],
@@ -191,7 +196,12 @@ export function fusedAttentionBackwardOp(
   device: DeviceKind,
   config: FusedAttentionConfig,
 ): FusedOpResult {
-  const shape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
+  const shape = [
+    config.batchSize,
+    config.numHeads,
+    config.seqLen,
+    config.headDim,
+  ];
   const node = createLazyIRNode(
     "fusedAttentionBackward",
     [qRef, kRef, vRef, logsumexpRef, dORef, outputRef],
@@ -211,7 +221,12 @@ export function extractAttentionDKOp(
   device: DeviceKind,
   config: FusedAttentionConfig,
 ): FusedOpResult {
-  const shape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
+  const shape = [
+    config.batchSize,
+    config.numHeads,
+    config.seqLen,
+    config.headDim,
+  ];
   const node = createLazyIRNode(
     "extractAttentionDK",
     [bwdDQRef],
@@ -230,7 +245,12 @@ export function extractAttentionDVOp(
   device: DeviceKind,
   config: FusedAttentionConfig,
 ): FusedOpResult {
-  const shape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
+  const shape = [
+    config.batchSize,
+    config.numHeads,
+    config.seqLen,
+    config.headDim,
+  ];
   const node = createLazyIRNode(
     "extractAttentionDV",
     [bwdDQRef],

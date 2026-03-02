@@ -173,10 +173,7 @@ function dispatchRW(
   pass.end();
 }
 
-async function readBuf(
-  buf: GPUBuffer,
-  bytes: number,
-): Promise<Float32Array> {
+async function readBuf(buf: GPUBuffer, bytes: number): Promise<Float32Array> {
   const staging = device.createBuffer({
     size: bytes,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -224,10 +221,7 @@ function checkSample(
 // ---------------------------------------------------------------------------
 // Level 0: Simple copy chain (matches existing test)
 // ---------------------------------------------------------------------------
-async function level0(
-  bytes: number,
-  fence: boolean,
-): Promise<boolean> {
+async function level0(bytes: number, fence: boolean): Promise<boolean> {
   const N = bytes / 4;
   const A = sbuf(bytes);
   const B = sbuf(bytes);
@@ -252,18 +246,23 @@ async function level0(
   const data = await readBuf(C, bytes);
   const ok = checkSample(data, 999, "L0 C");
 
-  A.destroy(); B.destroy(); C.destroy();
+  A.destroy();
+  B.destroy();
+  C.destroy();
   return ok;
 }
 
 // ---------------------------------------------------------------------------
 // Level 1: Size escalation
 // ---------------------------------------------------------------------------
-async function level1(
-  _baseBytes: number,
-  fence: boolean,
-): Promise<boolean> {
-  const sizes = [64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024];
+async function level1(_baseBytes: number, fence: boolean): Promise<boolean> {
+  const sizes = [
+    64 * 1024,
+    256 * 1024,
+    1024 * 1024,
+    4 * 1024 * 1024,
+    16 * 1024 * 1024,
+  ];
   let allOk = true;
 
   for (const bytes of sizes) {
@@ -290,7 +289,9 @@ async function level1(
     const ok = checkSample(data, 13, `L1 ${(bytes / 1024).toFixed(0)}KB`);
     if (!ok) allOk = false;
 
-    src.destroy(); mid.destroy(); dst.destroy();
+    src.destroy();
+    mid.destroy();
+    dst.destroy();
   }
   return allOk;
 }
@@ -298,10 +299,7 @@ async function level1(
 // ---------------------------------------------------------------------------
 // Level 2: Batch dispatches (N compute passes on one encoder)
 // ---------------------------------------------------------------------------
-async function level2(
-  bytes: number,
-  fence: boolean,
-): Promise<boolean> {
+async function level2(bytes: number, fence: boolean): Promise<boolean> {
   const N = bytes / 4;
   const PASSES = 20;
 
@@ -339,10 +337,7 @@ async function level2(
 // ---------------------------------------------------------------------------
 // Level 3: Read-then-write (read buffer X in N passes, flush, bind X as RW)
 // ---------------------------------------------------------------------------
-async function level3(
-  bytes: number,
-  fence: boolean,
-): Promise<boolean> {
+async function level3(bytes: number, fence: boolean): Promise<boolean> {
   const N = bytes / 4;
   const READERS = 10;
 
@@ -383,10 +378,7 @@ async function level3(
 // ---------------------------------------------------------------------------
 // Level 4: Pool simulation (pendingRelease→pool→acquire cycle)
 // ---------------------------------------------------------------------------
-async function level4(
-  bytes: number,
-  fence: boolean,
-): Promise<boolean> {
+async function level4(bytes: number, fence: boolean): Promise<boolean> {
   const N = bytes / 4;
   const ROUNDS = 5;
   const BUFS_PER_ROUND = 4;
@@ -397,7 +389,9 @@ async function level4(
   const results: { buf: GPUBuffer; expected: number }[] = [];
 
   const acquire = (): GPUBuffer => pool.pop() ?? sbuf(bytes);
-  const release = (b: GPUBuffer): void => { pendingRelease.push(b); };
+  const release = (b: GPUBuffer): void => {
+    pendingRelease.push(b);
+  };
   const flushPending = (): void => {
     while (pendingRelease.length > 0) pool.push(pendingRelease.pop()!);
   };
@@ -447,13 +441,10 @@ async function level4(
 // ---------------------------------------------------------------------------
 // Level 5: Framework integration (Torchlette buffer pool + shared encoder)
 // ---------------------------------------------------------------------------
-async function level5(
-  bytes: number,
-  fence: boolean,
-): Promise<boolean> {
+async function level5(bytes: number, fence: boolean): Promise<boolean> {
   // This level uses the actual Torchlette infrastructure
   const { initWebGPU } = await import("../src/backend/webgpu/index.js");
-  const webgpu = await import("../src/backend/webgpu/index.js");
+  const _webgpu = await import("../src/backend/webgpu/index.js");
 
   await initWebGPU();
 
@@ -555,7 +546,12 @@ async function main(): Promise<void> {
   console.log(`Base buffer size: ${(baseBytes / 1024).toFixed(0)}KB`);
   console.log();
 
-  const results: { level: number; name: string; noFence: boolean; fence: boolean }[] = [];
+  const results: {
+    level: number;
+    name: string;
+    noFence: boolean;
+    fence: boolean;
+  }[] = [];
 
   const levelsToRun =
     targetLevel >= 0
@@ -590,17 +586,14 @@ async function main(): Promise<void> {
   for (const r of results) {
     const nf = r.noFence ? "PASS" : "FAIL";
     const f = r.fence ? "PASS" : "FAIL";
-    console.log(
-      `  ${r.level}   | ${r.name.padEnd(38)}| ${nf.padEnd(9)}| ${f}`,
-    );
+    console.log(`  ${r.level}   | ${r.name.padEnd(38)}| ${nf.padEnd(9)}| ${f}`);
   }
   console.log("=".repeat(60));
 
   // Interpretation
   const anyNoFenceFail = results.some((r) => !r.noFence);
   const anyFenceFail = results.some((r) => !r.fence);
-  const fenceFixesAll =
-    anyNoFenceFail && !anyFenceFail;
+  const fenceFixesAll = anyNoFenceFail && !anyFenceFail;
 
   if (!anyNoFenceFail && !anyFenceFail) {
     console.log(

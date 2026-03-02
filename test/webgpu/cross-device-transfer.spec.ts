@@ -1,11 +1,12 @@
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { registerBackend } from "../../src/backend/registry";
+import { resetNodeIdCounter } from "../../src/engine/lazy";
 import { RuntimeEngine } from "../../src/runtime/engine";
 import { resetBaseIdCounter } from "../../src/runtime/tensor";
-import { resetNodeIdCounter } from "../../src/engine/lazy";
 
 import { cpuOnly } from "../helpers/webgpu";
+
 const hasWebGPU = !cpuOnly;
 
 describe.skipIf(!hasWebGPU)("Cross-Device Transfer (CPU <-> WebGPU)", () => {
@@ -13,7 +14,9 @@ describe.skipIf(!hasWebGPU)("Cross-Device Transfer (CPU <-> WebGPU)", () => {
 
   beforeAll(async () => {
     // Initialize and register WebGPU backend
-    const { initWebGPU, webgpuBackend } = await import("../../src/backend/webgpu");
+    const { initWebGPU, webgpuBackend } = await import(
+      "../../src/backend/webgpu"
+    );
     await initWebGPU();
     registerBackend(webgpuBackend);
   });
@@ -135,7 +138,9 @@ describe.skipIf(!hasWebGPU)("Cross-Device Transfer (CPU <-> WebGPU)", () => {
 
 describe.skipIf(!hasWebGPU)("Frontend Cross-Device Transfer (WebGPU)", () => {
   beforeAll(async () => {
-    const { initWebGPU, webgpuBackend } = await import("../../src/backend/webgpu");
+    const { initWebGPU, webgpuBackend } = await import(
+      "../../src/backend/webgpu"
+    );
     await initWebGPU();
     registerBackend(webgpuBackend);
   });

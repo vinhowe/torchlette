@@ -9,17 +9,17 @@
  */
 
 import type {
+  BlockBinaryOp,
+  BlockReduceOp,
+  BlockUnaryOp,
   DataType,
   IRNode,
   Statement,
-  TileRangeInfo,
-  TilePtr2D,
   TileMask2D,
-  BlockBinaryOp,
-  BlockUnaryOp,
-  BlockReduceOp,
+  TilePtr2D,
+  TileRangeInfo,
 } from "./tile-ir";
-import { BlockExpr, KernelContext } from "./tile-ir";
+import { BlockExpr, type KernelContext } from "./tile-ir";
 
 // ============================================================================
 // TileRange: 1D range of block offsets [base, base+size)
@@ -39,14 +39,16 @@ export interface TileMaskComponent {
 }
 
 export class TileRange {
-  constructor(
-    readonly info: TileRangeInfo,
-  ) {}
+  constructor(readonly info: TileRangeInfo) {}
 
   /** Broadcast to outer (row) dimension: [:, None] * stride */
   outer(stride?: BlockExpr): TilePtrComponent {
     const defaultStride: IRNode = {
-      id: -1, kind: "const", valueType: "scalar", dataType: "u32", value: 1,
+      id: -1,
+      kind: "const",
+      valueType: "scalar",
+      dataType: "u32",
+      value: 1,
     };
     return {
       range: this.info,
@@ -58,7 +60,11 @@ export class TileRange {
   /** Broadcast to inner (col) dimension: [None, :] * stride (default stride=1) */
   inner(stride?: BlockExpr): TilePtrComponent {
     const defaultStride: IRNode = {
-      id: -1, kind: "const", valueType: "scalar", dataType: "u32", value: 1,
+      id: -1,
+      kind: "const",
+      valueType: "scalar",
+      dataType: "u32",
+      value: 1,
     };
     return {
       range: this.info,
@@ -87,15 +93,27 @@ export class TilePtr {
   advance(blockDim: number, stride: BlockExpr): TilePtr {
     // new base = old base + blockDim * stride
     const advanceNode: IRNode = {
-      id: -1, kind: "binary", op: "add",
+      id: -1,
+      kind: "binary",
+      op: "add",
       lhs: this.data.baseOffset,
       rhs: {
-        id: -1, kind: "binary", op: "mul",
-        lhs: { id: -1, kind: "const", valueType: "scalar", dataType: "u32", value: blockDim },
+        id: -1,
+        kind: "binary",
+        op: "mul",
+        lhs: {
+          id: -1,
+          kind: "const",
+          valueType: "scalar",
+          dataType: "u32",
+          value: blockDim,
+        },
         rhs: stride.node,
-        valueType: "scalar", dataType: "u32",
+        valueType: "scalar",
+        dataType: "u32",
       },
-      valueType: "scalar", dataType: "u32",
+      valueType: "scalar",
+      dataType: "u32",
     };
     return new TilePtr({
       ...this.data,
@@ -160,8 +178,8 @@ export function buildMask(
 /** Per-thread pointer: each thread loads its own rows → register placement */
 export interface BlockThreadPtr {
   kind: "thread";
-  base: BlockExpr;       // starting global offset for this thread
-  stride: BlockExpr;     // row stride in global buffer
+  base: BlockExpr; // starting global offset for this thread
+  stride: BlockExpr; // row stride in global buffer
 }
 
 /** Cooperative pointer: all threads share the load → shared memory placement */
@@ -226,15 +244,16 @@ export class Block {
     this.smemStride = smemStride ?? cols;
   }
 
-  get transposed(): boolean { return this._transposed; }
+  get transposed(): boolean {
+    return this._transposed;
+  }
 
   // ---- Element access (for hybrid scalar/block patterns like attention masking) ----
 
   /** Read a scalar from the block at flat index, or 2D (row, col). */
   get(row: BlockExpr, col?: BlockExpr): BlockExpr {
-    const idx = col !== undefined
-      ? row.mul(this.ctx.u32(this.cols)).add(col)
-      : row;
+    const idx =
+      col !== undefined ? row.mul(this.ctx.u32(this.cols)).add(col) : row;
     if (this.placement === "shared") {
       return this.ctx._makeSharedRead(this.name, idx);
     }
@@ -245,26 +264,43 @@ export class Block {
   set(idx: BlockExpr, value: BlockExpr): void {
     const kind = this.placement === "shared" ? "sharedWrite" : "indexAssign";
     this.ctx.pushStatement({
-      kind, arrayName: this.name,
-      idx: idx.node, value: value.node,
+      kind,
+      arrayName: this.name,
+      idx: idx.node,
+      value: value.node,
     });
   }
 
   // ---- Transpose (metadata only, no data movement) ----
   T(): Block {
     const b = new Block(
-      this.placement, this.cols, this.rows, this.name,
-      this.ctx, this.ops, this._origRows, this._origCols, this.smemStride,
+      this.placement,
+      this.cols,
+      this.rows,
+      this.name,
+      this.ctx,
+      this.ops,
+      this._origRows,
+      this._origCols,
+      this.smemStride,
     );
     b._transposed = !this._transposed;
     return b;
   }
 
   // ---- Arithmetic (returns new register Block) ----
-  add(other: Block | BlockExpr): Block { return this.ops._binary(this, other, "add"); }
-  sub(other: Block | BlockExpr): Block { return this.ops._binary(this, other, "sub"); }
-  mul(other: Block | BlockExpr): Block { return this.ops._binary(this, other, "mul"); }
-  div(other: Block | BlockExpr): Block { return this.ops._binary(this, other, "div"); }
+  add(other: Block | BlockExpr): Block {
+    return this.ops._binary(this, other, "add");
+  }
+  sub(other: Block | BlockExpr): Block {
+    return this.ops._binary(this, other, "sub");
+  }
+  mul(other: Block | BlockExpr): Block {
+    return this.ops._binary(this, other, "mul");
+  }
+  div(other: Block | BlockExpr): Block {
+    return this.ops._binary(this, other, "div");
+  }
 
   // ---- Elementwise max (Block) or Reduction (axis number) ----
   max(arg: number | Block): Block {
@@ -279,21 +315,39 @@ export class Block {
   }
 
   // ---- In-place variants ----
-  mul_(other: Block | BlockExpr): void { this.ops._binary(this, other, "mul", true); }
-  add_(other: Block | BlockExpr): void { this.ops._binary(this, other, "add", true); }
-  sub_(other: Block | BlockExpr): void { this.ops._binary(this, other, "sub", true); }
-  exp_(): void { this.ops._unary(this, "exp", true); }
+  mul_(other: Block | BlockExpr): void {
+    this.ops._binary(this, other, "mul", true);
+  }
+  add_(other: Block | BlockExpr): void {
+    this.ops._binary(this, other, "add", true);
+  }
+  sub_(other: Block | BlockExpr): void {
+    this.ops._binary(this, other, "sub", true);
+  }
+  exp_(): void {
+    this.ops._unary(this, "exp", true);
+  }
 
   /** Copy values from other into this block (with broadcasting). */
-  assign(other: Block): void { this.ops._binary(this, other, "copy", true); }
+  assign(other: Block): void {
+    this.ops._binary(this, other, "copy", true);
+  }
 
   /** Accumulate: this += other (with broadcasting). */
-  addAssign(other: Block): void { this.ops._binary(this, other, "add", true); }
+  addAssign(other: Block): void {
+    this.ops._binary(this, other, "add", true);
+  }
 
   // ---- Unary (returns new register Block) ----
-  exp(): Block { return this.ops._unary(this, "exp"); }
-  log(): Block { return this.ops._unary(this, "log"); }
-  neg(): Block { return this.ops._unary(this, "neg"); }
+  exp(): Block {
+    return this.ops._unary(this, "exp");
+  }
+  log(): Block {
+    return this.ops._unary(this, "log");
+  }
+  neg(): Block {
+    return this.ops._unary(this, "neg");
+  }
 
   /**
    * Apply an elementwise function in-place: block[i] = fn(block[i]).
@@ -303,20 +357,32 @@ export class Block {
     const size = this.rows * this.cols;
     const valName = `_apply_val_${this.name}`;
     const valRef = new BlockExpr({
-      id: -1, kind: "namedRef", name: valName,
-      valueType: "scalar", dataType: "f32",
+      id: -1,
+      kind: "namedRef",
+      name: valName,
+      valueType: "scalar",
+      dataType: "f32",
     } as any);
     // Capture the function body as IR statements
     const body = this.ctx.captureScope(() => {
       const result = fn(valRef);
       this.ctx.pushStatement({
-        kind: "assign", name: `_apply_result_${this.name}`, value: result.node,
+        kind: "assign",
+        name: `_apply_result_${this.name}`,
+        value: result.node,
       } as any);
     });
     // Extract result node from the synthetic assign
     const lastStmt = body[body.length - 1];
-    const resultNode = lastStmt && lastStmt.kind === "assign" ? (lastStmt as any).value : valRef.node;
-    if (lastStmt && lastStmt.kind === "assign" && (lastStmt as any).name === `_apply_result_${this.name}`) {
+    const resultNode =
+      lastStmt && lastStmt.kind === "assign"
+        ? (lastStmt as any).value
+        : valRef.node;
+    if (
+      lastStmt &&
+      lastStmt.kind === "assign" &&
+      (lastStmt as any).name === `_apply_result_${this.name}`
+    ) {
       body.pop();
     }
     // Emit forRange over all elements
@@ -324,22 +390,55 @@ export class Block {
     const innerBody: Statement[] = [];
     // let valName = block[i]
     innerBody.push({
-      kind: "let", name: valName, dtype: "f32" as any,
-      value: { id: -1, kind: "arrayRead", arrayName: this.name, idx: { id: -1, kind: "namedRef", name: iVar, valueType: "scalar", dataType: "u32" }, valueType: "scalar", dataType: "f32" } as any,
+      kind: "let",
+      name: valName,
+      dtype: "f32" as any,
+      value: {
+        id: -1,
+        kind: "arrayRead",
+        arrayName: this.name,
+        idx: {
+          id: -1,
+          kind: "namedRef",
+          name: iVar,
+          valueType: "scalar",
+          dataType: "u32",
+        },
+        valueType: "scalar",
+        dataType: "f32",
+      } as any,
     });
     innerBody.push(...body);
     // block[i] = result
     innerBody.push({
       kind: "indexAssign",
       arrayName: this.name,
-      idx: { id: -1, kind: "namedRef", name: iVar, valueType: "scalar", dataType: "u32" } as any,
+      idx: {
+        id: -1,
+        kind: "namedRef",
+        name: iVar,
+        valueType: "scalar",
+        dataType: "u32",
+      } as any,
       value: resultNode,
     });
     this.ctx.pushStatement({
       kind: "forRange",
       varName: iVar,
-      start: { id: -1, kind: "const", valueType: "scalar", dataType: "u32", value: 0 } as any,
-      bound: { id: -1, kind: "const", valueType: "scalar", dataType: "u32", value: size } as any,
+      start: {
+        id: -1,
+        kind: "const",
+        valueType: "scalar",
+        dataType: "u32",
+        value: 0,
+      } as any,
+      bound: {
+        id: -1,
+        kind: "const",
+        valueType: "scalar",
+        dataType: "u32",
+        value: size,
+      } as any,
       body: innerBody,
     });
   }
@@ -352,7 +451,6 @@ export class Block {
     this._castDtype = dtype;
   }
   /** @internal */ _castDtype?: DataType;
-
 }
 
 /**
@@ -376,9 +474,10 @@ export class BlockOps {
       threadTile?: [number, number];
     },
   ) {
-    this.wgSize = typeof config.wgSize === "number"
-      ? config.wgSize
-      : config.wgSize[0] * config.wgSize[1];
+    this.wgSize =
+      typeof config.wgSize === "number"
+        ? config.wgSize
+        : config.wgSize[0] * config.wgSize[1];
     if (config.threadTile) {
       this.threadTileM = config.threadTile[0];
       this.threadTileN = config.threadTile[1];
@@ -430,7 +529,8 @@ export class BlockOps {
   load(binding: string, ptr: BlockPtr, opts: BlockLoadOpts): Block {
     const name = this.freshName();
     const { rows, cols, guard } = opts;
-    const bindingType = (this.ctx as any).bindingSpecs?.[binding]?.type ?? "f32";
+    const bindingType =
+      (this.ctx as any).bindingSpecs?.[binding]?.type ?? "f32";
 
     if (ptr.kind === "thread") {
       // Per-thread load → register placement
@@ -477,23 +577,44 @@ export class BlockOps {
           innerBound: ptr.innerBound.node,
         },
       });
-      return new Block("shared", rows, cols, name, this.ctx, this, undefined, undefined, smemStride);
+      return new Block(
+        "shared",
+        rows,
+        cols,
+        name,
+        this.ctx,
+        this,
+        undefined,
+        undefined,
+        smemStride,
+      );
     }
   }
 
   // ---- Dot ----
 
   /** Push a blockDot statement with common fields derived from a and b. */
-  private _pushBlockDot(a: Block, b: Block, resultName: string, accName?: string): void {
+  private _pushBlockDot(
+    a: Block,
+    b: Block,
+    resultName: string,
+    accName?: string,
+  ): void {
     this.ctx.pushStatement({
       kind: "blockDot",
-      aName: a.name, bName: b.name, resultName,
+      aName: a.name,
+      bName: b.name,
+      resultName,
       ...(accName !== undefined && { accName }),
-      aPlacement: a.placement, bPlacement: b.placement,
+      aPlacement: a.placement,
+      bPlacement: b.placement,
       bTransposed: b._transposed,
-      aRows: a.rows, aCols: a.cols,
-      bRows: b._origRows, bCols: b._origCols,
-      threadTileM: this.threadTileM, threadTileN: this.threadTileN,
+      aRows: a.rows,
+      aCols: a.cols,
+      bRows: b._origRows,
+      bCols: b._origCols,
+      threadTileM: this.threadTileM,
+      threadTileN: this.threadTileN,
       aSmemStride: a.placement === "shared" ? a.smemStride : undefined,
       bSmemStride: b.placement === "shared" ? b.smemStride : undefined,
     });
@@ -505,7 +626,9 @@ export class BlockOps {
     let outRows: number, outCols: number;
     if (a.placement === "shared" && b.placement === "shared") {
       if (!this.threadTileM || !this.threadTileN) {
-        throw new Error("shared×shared dot requires threadTile in BlockOps config");
+        throw new Error(
+          "shared×shared dot requires threadTile in BlockOps config",
+        );
       }
       outRows = this.threadTileM;
       outCols = this.threadTileN;
@@ -513,7 +636,13 @@ export class BlockOps {
       outRows = a.rows;
       outCols = b._transposed ? b._origRows : b.cols;
     }
-    this.ctx.pushStatement({ kind: "blockAlloc", name, rows: outRows, cols: outCols, elemType: "f32" });
+    this.ctx.pushStatement({
+      kind: "blockAlloc",
+      name,
+      rows: outRows,
+      cols: outCols,
+      elemType: "f32",
+    });
     this._pushBlockDot(a, b, name);
     return new Block("register", outRows, outCols, name, this.ctx, this);
   }
@@ -526,7 +655,12 @@ export class BlockOps {
   // ---- Store ----
 
   /** Store register block to global memory. */
-  store(binding: string, block: Block, ptr: BlockStorePtr, opts?: { guard?: BlockExpr }): void {
+  store(
+    binding: string,
+    block: Block,
+    ptr: BlockStorePtr,
+    opts?: { guard?: BlockExpr },
+  ): void {
     this.ctx.pushStatement({
       kind: "blockStore",
       binding,
@@ -613,13 +747,28 @@ export class BlockOps {
       elemType: "f32",
     });
 
-    return new Block("shared", tileRows, tileCols, name, this.ctx, this, undefined, undefined, smemStride);
+    return new Block(
+      "shared",
+      tileRows,
+      tileCols,
+      name,
+      this.ctx,
+      this,
+      undefined,
+      undefined,
+      smemStride,
+    );
   }
 
   // ---- Internal helpers (called by Block methods) ----
 
   /** @internal */
-  _binary(a: Block, b: Block | BlockExpr, op: BlockBinaryOp, inPlace = false): Block {
+  _binary(
+    a: Block,
+    b: Block | BlockExpr,
+    op: BlockBinaryOp,
+    inPlace = false,
+  ): Block {
     const outputName = inPlace ? a.name : this.freshName();
     const isBlock = b instanceof Block;
     this.ctx.pushStatement({
@@ -627,10 +776,12 @@ export class BlockOps {
       aName: a.name,
       bName: isBlock ? b.name : "",
       outputName,
-      aRows: a.rows, aCols: a.cols,
+      aRows: a.rows,
+      aCols: a.cols,
       bRows: isBlock ? b.rows : 1,
       bCols: isBlock ? b.cols : 1,
-      op, inPlace,
+      op,
+      inPlace,
       ...(isBlock ? {} : { bScalarExpr: b.node }),
     });
     if (inPlace) return a;
@@ -644,10 +795,16 @@ export class BlockOps {
     const outputName = inPlace ? a.name : this.freshName();
     this.ctx.pushStatement({
       kind: "blockUnary",
-      inputName: a.name, outputName,
-      rows: a.rows, cols: a.cols, op, inPlace,
+      inputName: a.name,
+      outputName,
+      rows: a.rows,
+      cols: a.cols,
+      op,
+      inPlace,
     });
-    return inPlace ? a : new Block("register", a.rows, a.cols, outputName, this.ctx, this);
+    return inPlace
+      ? a
+      : new Block("register", a.rows, a.cols, outputName, this.ctx, this);
   }
 
   /** @internal */

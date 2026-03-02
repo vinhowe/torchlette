@@ -1,4 +1,5 @@
 import type {
+  ArgReduceOptions,
   DeviceKind,
   DType,
   GatherOptions,
@@ -10,12 +11,11 @@ import type {
   SubOptions,
   SumOptions,
   TransposeOptions,
-  ArgReduceOptions,
 } from "./backend/types";
 import type { EngineTensor } from "./engine/engine";
-import type { Tensor as RuntimeTensor } from "./runtime/tensor";
 import type { Torchlette } from "./frontend";
-import type { TensorCreateOptions, AutogradNode } from "./frontend-types";
+import type { AutogradNode, TensorCreateOptions } from "./frontend-types";
+import type { Tensor as RuntimeTensor } from "./runtime/tensor";
 
 export class DisposedTensorError extends Error {
   name = "DisposedTensorError";
@@ -183,28 +183,72 @@ export class Tensor {
     return this.engine.pow(this, exponent);
   }
 
-  matmul(other: Tensor): Tensor { return this.engine.matmul(this, other); }
-  sqrt(): Tensor { return this.engine.sqrt(this); }
-  relu(): Tensor { return this.engine.relu(this); }
-  exp(): Tensor { return this.engine.exp(this); }
-  log(): Tensor { return this.engine.log(this); }
-  neg(): Tensor { return this.engine.neg(this); }
-  abs(): Tensor { return this.engine.abs(this); }
-  tanh(): Tensor { return this.engine.tanh(this); }
-  sigmoid(): Tensor { return this.engine.sigmoid(this); }
-  gelu(options?: GeluOptions): Tensor { return this.engine.gelu(this, options); }
-  silu(): Tensor { return this.engine.silu(this); }
-  softplus(): Tensor { return this.engine.softplus(this); }
-  fmod(other: Tensor): Tensor { return this.engine.fmod(this, other); }
-  sin(): Tensor { return this.engine.sin(this); }
-  cos(): Tensor { return this.engine.cos(this); }
-  rsqrt(): Tensor { return this.engine.rsqrt(this); }
-  floor(): Tensor { return this.engine.floor(this); }
-  ceil(): Tensor { return this.engine.ceil(this); }
-  round(): Tensor { return this.engine.round(this); }
-  sign(): Tensor { return this.engine.sign(this); }
-  clamp(min: number | null, max: number | null): Tensor { return this.engine.clamp(this, min, max); }
-  isfinite(): Tensor { return this.engine.isfinite(this); }
+  matmul(other: Tensor): Tensor {
+    return this.engine.matmul(this, other);
+  }
+  sqrt(): Tensor {
+    return this.engine.sqrt(this);
+  }
+  relu(): Tensor {
+    return this.engine.relu(this);
+  }
+  exp(): Tensor {
+    return this.engine.exp(this);
+  }
+  log(): Tensor {
+    return this.engine.log(this);
+  }
+  neg(): Tensor {
+    return this.engine.neg(this);
+  }
+  abs(): Tensor {
+    return this.engine.abs(this);
+  }
+  tanh(): Tensor {
+    return this.engine.tanh(this);
+  }
+  sigmoid(): Tensor {
+    return this.engine.sigmoid(this);
+  }
+  gelu(options?: GeluOptions): Tensor {
+    return this.engine.gelu(this, options);
+  }
+  silu(): Tensor {
+    return this.engine.silu(this);
+  }
+  softplus(): Tensor {
+    return this.engine.softplus(this);
+  }
+  fmod(other: Tensor): Tensor {
+    return this.engine.fmod(this, other);
+  }
+  sin(): Tensor {
+    return this.engine.sin(this);
+  }
+  cos(): Tensor {
+    return this.engine.cos(this);
+  }
+  rsqrt(): Tensor {
+    return this.engine.rsqrt(this);
+  }
+  floor(): Tensor {
+    return this.engine.floor(this);
+  }
+  ceil(): Tensor {
+    return this.engine.ceil(this);
+  }
+  round(): Tensor {
+    return this.engine.round(this);
+  }
+  sign(): Tensor {
+    return this.engine.sign(this);
+  }
+  clamp(min: number | null, max: number | null): Tensor {
+    return this.engine.clamp(this, min, max);
+  }
+  isfinite(): Tensor {
+    return this.engine.isfinite(this);
+  }
 
   expand(shape: number[]): Tensor {
     return this.engine.expand(this, shape);
@@ -305,11 +349,19 @@ export class Tensor {
     return this.engine.argmin(this, options);
   }
 
-  variance(options?: { dim?: number | number[] | null; correction?: number; keepdim?: boolean }): Tensor {
+  variance(options?: {
+    dim?: number | number[] | null;
+    correction?: number;
+    keepdim?: boolean;
+  }): Tensor {
     return this.engine.variance(this, options);
   }
 
-  std(options?: { dim?: number | number[] | null; correction?: number; keepdim?: boolean }): Tensor {
+  std(options?: {
+    dim?: number | number[] | null;
+    correction?: number;
+    keepdim?: boolean;
+  }): Tensor {
     return this.engine.std(this, options);
   }
 

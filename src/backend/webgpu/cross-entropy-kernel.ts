@@ -11,13 +11,11 @@
  * Backward: logits [B, V] + targets [B] + grad_output [B] → grad_logits [B, V]
  */
 
-import {
-  allocateOutputBuffer,
-} from "./index";
 import type { GPUBuffer } from "./gpu-types";
+import { allocateOutputBuffer } from "./index";
 import { WORKGROUP_SIZE } from "./shape-utils";
-import { perRowKernel } from "./tile-ir";
 import { createTileKernelDispatcher } from "./tile-dispatch";
+import { perRowKernel } from "./tile-ir";
 
 // ============================================================================
 // Tile IR Kernels
@@ -32,27 +30,38 @@ const WG = WORKGROUP_SIZE; // 256
 const crossEntropyForwardSpec = perRowKernel({
   name: "ceFwd",
   bindings: {
-    logits:  { storage: "read", type: "f32" },
+    logits: { storage: "read", type: "f32" },
     targets: { storage: "read", type: "f32" },
-    loss:    { storage: "read_write", type: "f32" },
+    loss: { storage: "read_write", type: "f32" },
   },
   rowUniform: "batch_size",
   dimUniform: "vocab_size",
 
   kernel(ctx, row, tid, V, base) {
     // Parallel max reduction
-    const rowMax = ctx.emitLet("row_max",
-      ctx.wgReduce("max", tid, V, WG, (i) => ctx.load("logits", base.add(i))));
+    const rowMax = ctx.emitLet(
+      "row_max",
+      ctx.wgReduce("max", tid, V, WG, (i) => ctx.load("logits", base.add(i))),
+    );
 
     // Parallel sum-exp reduction
-    const logSumExp = ctx.emitLet("log_sum_exp",
-      ctx.wgReduce("sum", tid, V, WG,
-        (i) => ctx.load("logits", base.add(i)).sub(rowMax).exp()).log());
+    const logSumExp = ctx.emitLet(
+      "log_sum_exp",
+      ctx
+        .wgReduce("sum", tid, V, WG, (i) =>
+          ctx.load("logits", base.add(i)).sub(rowMax).exp(),
+        )
+        .log(),
+    );
 
     // Output (thread 0 only)
     const t = ctx.emitLet("t", ctx.load("targets", row).toU32());
-    ctx.guardedStore("loss", tid.eq(ctx.u32(0)), row,
-      ctx.load("logits", base.add(t)).sub(rowMax).sub(logSumExp).neg());
+    ctx.guardedStore(
+      "loss",
+      tid.eq(ctx.u32(0)),
+      row,
+      ctx.load("logits", base.add(t)).sub(rowMax).sub(logSumExp).neg(),
+    );
   },
 });
 
@@ -63,8 +72,8 @@ const crossEntropyForwardSpec = perRowKernel({
 const crossEntropyBackwardSpec = perRowKernel({
   name: "ceBwd",
   bindings: {
-    logits:      { storage: "read", type: "f32" },
-    targets:     { storage: "read", type: "f32" },
+    logits: { storage: "read", type: "f32" },
+    targets: { storage: "read", type: "f32" },
     grad_output: { storage: "read", type: "f32" },
     grad_logits: { storage: "read_write", type: "f32" },
   },
@@ -73,22 +82,32 @@ const crossEntropyBackwardSpec = perRowKernel({
 
   kernel(ctx, row, tid, V, base) {
     // Parallel max reduction
-    const rowMax = ctx.emitLet("row_max",
-      ctx.wgReduce("max", tid, V, WG, (i) => ctx.load("logits", base.add(i))));
+    const rowMax = ctx.emitLet(
+      "row_max",
+      ctx.wgReduce("max", tid, V, WG, (i) => ctx.load("logits", base.add(i))),
+    );
 
     // Parallel sum-exp reduction
-    const logSumExp = ctx.emitLet("log_sum_exp",
-      ctx.wgReduce("sum", tid, V, WG,
-        (i) => ctx.load("logits", base.add(i)).sub(rowMax).exp()).log());
+    const logSumExp = ctx.emitLet(
+      "log_sum_exp",
+      ctx
+        .wgReduce("sum", tid, V, WG, (i) =>
+          ctx.load("logits", base.add(i)).sub(rowMax).exp(),
+        )
+        .log(),
+    );
 
     // Write gradients
     const t = ctx.emitLet("t", ctx.load("targets", row).toU32());
     const g = ctx.emitLet("g", ctx.load("grad_output", row));
     ctx.stridedFor(tid, V, WG, (i) => {
-      const softmaxI = ctx.load("logits", base.add(i)).sub(rowMax).sub(logSumExp).exp();
+      const softmaxI = ctx
+        .load("logits", base.add(i))
+        .sub(rowMax)
+        .sub(logSumExp)
+        .exp();
       const oneHotI = i.eq(t).select(ctx.f32(1.0), ctx.f32(0.0));
-      ctx.emitStore("grad_logits", base.add(i),
-        g.mul(softmaxI.sub(oneHotI)));
+      ctx.emitStore("grad_logits", base.add(i), g.mul(softmaxI.sub(oneHotI)));
     });
   },
 });
@@ -136,8 +155,12 @@ export function dispatchCrossEntropyBackward(
   const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
   ceBwdTileKernel.dispatch(
-    { logits: logitsBuffer, targets: targetsBuffer, grad_output: gradOutputBuffer,
-      grad_logits: outBuffer },
+    {
+      logits: logitsBuffer,
+      targets: targetsBuffer,
+      grad_output: gradOutputBuffer,
+      grad_logits: outBuffer,
+    },
     { batch_size: batchSize, vocab_size: vocabSize },
   );
 

@@ -132,11 +132,11 @@ describe("Engine: async scope context", () => {
 describe("Torchlette: runWithAsyncScope", () => {
   it("tracks frontend tensors created during async operation", async () => {
     const api = new Torchlette("cpu");
-    let wasDisposed = false;
+    let _wasDisposed = false;
 
     await api.runWithAsyncScope(async () => {
       const t = api.tensorFromArray([1, 2, 3, 4], [2, 2]);
-      wasDisposed = t._engineTensor().disposed;
+      _wasDisposed = t._engineTensor().disposed;
       await Promise.resolve();
       // Check it's not disposed yet inside scope
       expect(t._engineTensor().disposed).toBe(false);

@@ -15,30 +15,28 @@
  * memory code. Auto-CSE handles all sub-expression sharing.
  */
 
-import {
-  dispatchComputePass,
-  allocateOutputBuffer,
-  cachedCreateBindGroup,
-  getPipeline,
-} from "./index";
-import { requireContext } from "./webgpu-state";
-
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
-import { trackSharedEncoderWrite } from "./webgpu-state";
+import {
+  allocateOutputBuffer,
+  cachedCreateBindGroup,
+  dispatchComputePass,
+  getPipeline,
+} from "./index";
+import { F32_NEG_MAX, WORKGROUP_SIZE } from "./shape-utils";
 import { compileTileKernel } from "./tile-compiler";
 import type { TileKernelSpec } from "./tile-ir";
 import { tiledGrid } from "./tile-ir";
-import { F32_NEG_MAX, WORKGROUP_SIZE } from "./shape-utils";
+import { requireContext, trackSharedEncoderWrite } from "./webgpu-state";
 
 // ============================================================================
 // Tiling Parameters
 // ============================================================================
 
-const BR = 64;     // Q rows per workgroup (forward, dQ)
-const BC = 32;     // KV rows per tile (forward, dQ)
-const BQ_BW = 16;  // Q rows per tile (backward dKV)
-const BC_BW = 64;  // KV rows per workgroup (backward dKV)
+const BR = 64; // Q rows per workgroup (forward, dQ)
+const BC = 32; // KV rows per tile (forward, dQ)
+const BQ_BW = 16; // Q rows per tile (backward dKV)
+const BC_BW = 64; // KV rows per workgroup (backward dKV)
 
 // ============================================================================
 // WGSL Cache & Config Buffer Cache
@@ -95,7 +93,8 @@ function getOrCreateConfigBuffer(
 // ============================================================================
 
 function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
-  if (headDim % 4 !== 0) throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  if (headDim % 4 !== 0)
+    throw new Error(`headDim must be divisible by 4, got ${headDim}`);
   const D = headDim;
   const WG = BR;
 
@@ -117,7 +116,11 @@ function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
       scale_u32: "u32",
       is_causal: "u32",
     },
-    grid: tiledGrid({ x: { uniform: "seq_len", tileSize: BR }, y: "num_heads", z: "batch_size" }),
+    grid: tiledGrid({
+      x: { uniform: "seq_len", tileSize: BR },
+      y: "num_heads",
+      z: "batch_size",
+    }),
 
     kernel(ctx) {
       const tidx = ctx.localIndex();
@@ -138,9 +141,15 @@ function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
       const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
       const qBase = bhOff.add(qRow.mul(Dim));
 
-      const Q = ctx.tileLoad("Q", {
-        kind: "thread", base: qBase, stride: ctx.u32(1),
-      }, { rows: 1, cols: D, guard: valid });
+      const Q = ctx.tileLoad(
+        "Q",
+        {
+          kind: "thread",
+          base: qBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
 
       const mPrev = ctx.full(1, 1, F32_NEG_MAX);
       const lPrev = ctx.full(1, 1, 0);
@@ -153,7 +162,11 @@ function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
 
         const offsR = ctx.arange(kvStart, BC);
         const offsD = ctx.arange(ctx.u32(0), D);
-        const tilePtr = ctx.tilePtr(bhOff, offsR.outer(Dim), offsD.inner(ctx.u32(1)));
+        const tilePtr = ctx.tilePtr(
+          bhOff,
+          offsR.outer(Dim),
+          offsD.inner(ctx.u32(1)),
+        );
         const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
         const K = ctx.load2D("K", tilePtr, tileMask);
 
@@ -161,10 +174,13 @@ function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
 
         ctx.range(0, BC, (j) => {
           const kvPos = kvStart.add(j);
-          const isActive = valid.and(kvPos.lt(N)).and(
-            isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)),
+          const isActive = valid
+            .and(kvPos.lt(N))
+            .and(isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)));
+          scores.set(
+            j,
+            isActive.select(scores.get(j).mul(scale), ctx.f32(F32_NEG_MAX)),
           );
-          scores.set(j, isActive.select(scores.get(j).mul(scale), ctx.f32(F32_NEG_MAX)));
         });
 
         const mNew = scores.max(1);
@@ -205,8 +221,8 @@ function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
     name: `tileAttnDPrecompute_D${D}`,
     workgroupSize: WG,
     bindings: {
-      dO:    { storage: "read", type: "f32" },
-      Out:   { storage: "read", type: "f32" },
+      dO: { storage: "read", type: "f32" },
+      Out: { storage: "read", type: "f32" },
       D_val: { storage: "read_write", type: "f32" },
     },
     uniforms: {
@@ -234,7 +250,8 @@ function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
 }
 
 function makeBackwardDQSpec(headDim: number): TileKernelSpec {
-  if (headDim % 4 !== 0) throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  if (headDim % 4 !== 0)
+    throw new Error(`headDim must be divisible by 4, got ${headDim}`);
   const D = headDim;
   const WG = BR;
 
@@ -242,13 +259,13 @@ function makeBackwardDQSpec(headDim: number): TileKernelSpec {
     name: `tileAttnBwdDQ_D${D}`,
     workgroupSize: WG,
     bindings: {
-      Q:     { storage: "read", type: "f32" },
-      K:     { storage: "read", type: "f32" },
-      V:     { storage: "read", type: "f32" },
+      Q: { storage: "read", type: "f32" },
+      K: { storage: "read", type: "f32" },
+      V: { storage: "read", type: "f32" },
       L_buf: { storage: "read", type: "f32" },
       D_buf: { storage: "read", type: "f32" },
-      dO:    { storage: "read", type: "f32" },
-      dQ:    { storage: "read_write", type: "f32" },
+      dO: { storage: "read", type: "f32" },
+      dQ: { storage: "read_write", type: "f32" },
     },
     uniforms: {
       batch_size: "u32",
@@ -258,7 +275,11 @@ function makeBackwardDQSpec(headDim: number): TileKernelSpec {
       scale_u32: "u32",
       is_causal: "u32",
     },
-    grid: tiledGrid({ x: { uniform: "seq_len", tileSize: BR }, y: "num_heads", z: "batch_size" }),
+    grid: tiledGrid({
+      x: { uniform: "seq_len", tileSize: BR },
+      y: "num_heads",
+      z: "batch_size",
+    }),
 
     kernel(ctx) {
       const tidx = ctx.localIndex();
@@ -279,13 +300,25 @@ function makeBackwardDQSpec(headDim: number): TileKernelSpec {
       const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
       const rowBase = bhOff.add(qRow.mul(Dim));
 
-      const Q = ctx.tileLoad("Q", {
-        kind: "thread", base: rowBase, stride: ctx.u32(1),
-      }, { rows: 1, cols: D, guard: valid });
+      const Q = ctx.tileLoad(
+        "Q",
+        {
+          kind: "thread",
+          base: rowBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
 
-      const dO = ctx.tileLoad("dO", {
-        kind: "thread", base: rowBase, stride: ctx.u32(1),
-      }, { rows: 1, cols: D, guard: valid });
+      const dO = ctx.tileLoad(
+        "dO",
+        {
+          kind: "thread",
+          base: rowBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
 
       const lVar = ctx.emitVar("_Li", "f32", ctx.f32(0));
       const dVar = ctx.emitVar("_Di", "f32", ctx.f32(0));
@@ -303,7 +336,11 @@ function makeBackwardDQSpec(headDim: number): TileKernelSpec {
 
         const offsR = ctx.arange(kvStart, BC);
         const offsD = ctx.arange(ctx.u32(0), D);
-        const tilePtr = ctx.tilePtr(bhOff, offsR.outer(Dim), offsD.inner(ctx.u32(1)));
+        const tilePtr = ctx.tilePtr(
+          bhOff,
+          offsR.outer(Dim),
+          offsD.inner(ctx.u32(1)),
+        );
         const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
         const K = ctx.load2D("K", tilePtr, tileMask);
         const V = ctx.load2D("V", tilePtr, tileMask);
@@ -314,9 +351,9 @@ function makeBackwardDQSpec(headDim: number): TileKernelSpec {
         const ds = ctx.zeros(1, BC);
         ctx.range(0, BC, (j) => {
           const kvPos = kvStart.add(j);
-          const isActive = valid.and(kvPos.lt(N)).and(
-            isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)),
-          );
+          const isActive = valid
+            .and(kvPos.lt(N))
+            .and(isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)));
           const s = scores.get(j).mul(scale);
           const p = isActive.select(s.sub(lVar.get()).exp(), ctx.f32(0));
           ds.set(j, p.mul(dovs.get(j).sub(dVar.get())));
@@ -334,7 +371,8 @@ function makeBackwardDQSpec(headDim: number): TileKernelSpec {
 }
 
 function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
-  if (headDim % 4 !== 0) throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  if (headDim % 4 !== 0)
+    throw new Error(`headDim must be divisible by 4, got ${headDim}`);
   const D = headDim;
   const WG = BC_BW;
 
@@ -342,14 +380,14 @@ function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
     name: `tileAttnBwdDKV_D${D}`,
     workgroupSize: WG,
     bindings: {
-      Q:     { storage: "read", type: "f32" },
-      K:     { storage: "read", type: "f32" },
-      V:     { storage: "read", type: "f32" },
+      Q: { storage: "read", type: "f32" },
+      K: { storage: "read", type: "f32" },
+      V: { storage: "read", type: "f32" },
       L_buf: { storage: "read", type: "f32" },
       D_buf: { storage: "read", type: "f32" },
-      dO:    { storage: "read", type: "f32" },
-      dK:    { storage: "read_write", type: "f32" },
-      dV:    { storage: "read_write", type: "f32" },
+      dO: { storage: "read", type: "f32" },
+      dK: { storage: "read_write", type: "f32" },
+      dV: { storage: "read_write", type: "f32" },
     },
     uniforms: {
       batch_size: "u32",
@@ -359,7 +397,11 @@ function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
       scale_u32: "u32",
       is_causal: "u32",
     },
-    grid: tiledGrid({ x: { uniform: "seq_len", tileSize: BC_BW }, y: "num_heads", z: "batch_size" }),
+    grid: tiledGrid({
+      x: { uniform: "seq_len", tileSize: BC_BW },
+      y: "num_heads",
+      z: "batch_size",
+    }),
 
     kernel(ctx) {
       const tidx = ctx.localIndex();
@@ -380,13 +422,25 @@ function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
       const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
       const rowBase = bhOff.add(kvRow.mul(Dim));
 
-      const K = ctx.tileLoad("K", {
-        kind: "thread", base: rowBase, stride: ctx.u32(1),
-      }, { rows: 1, cols: D, guard: valid });
+      const K = ctx.tileLoad(
+        "K",
+        {
+          kind: "thread",
+          base: rowBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
 
-      const V = ctx.tileLoad("V", {
-        kind: "thread", base: rowBase, stride: ctx.u32(1),
-      }, { rows: 1, cols: D, guard: valid });
+      const V = ctx.tileLoad(
+        "V",
+        {
+          kind: "thread",
+          base: rowBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
 
       const dkAcc = ctx.zeros(1, D);
       const dvAcc = ctx.zeros(1, D);
@@ -399,14 +453,18 @@ function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
       ctx.forRange(ctx.u32(0), numQTiles, (qt) => {
         const qStart = qt.mul(ctx.u32(BQ_BW));
 
-        const skipTile = isCausal.ne(ctx.u32(0)).and(
-          qStart.add(ctx.u32(BQ_BW - 1)).lt(kvBlock.mul(ctx.u32(BC_BW))),
-        );
+        const skipTile = isCausal
+          .ne(ctx.u32(0))
+          .and(qStart.add(ctx.u32(BQ_BW - 1)).lt(kvBlock.mul(ctx.u32(BC_BW))));
 
         ctx.ifThen(skipTile.not(), () => {
           const offsR = ctx.arange(qStart, BQ_BW);
           const offsD = ctx.arange(ctx.u32(0), D);
-          const tilePtr = ctx.tilePtr(bhOff, offsR.outer(Dim), offsD.inner(ctx.u32(1)));
+          const tilePtr = ctx.tilePtr(
+            bhOff,
+            offsR.outer(Dim),
+            offsD.inner(ctx.u32(1)),
+          );
           const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
           const QTile = ctx.load2D("Q", tilePtr, tileMask);
           const dOTile = ctx.load2D("dO", tilePtr, tileMask);
@@ -415,8 +473,14 @@ function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
             const qi = qStart.add(tidx);
             const inBounds = qi.lt(N);
             const lIdx = bhOffL.add(qi);
-            lTile.write(tidx, inBounds.select(ctx.load("L_buf", lIdx), ctx.f32(0)));
-            dTile.write(tidx, inBounds.select(ctx.load("D_buf", lIdx), ctx.f32(0)));
+            lTile.write(
+              tidx,
+              inBounds.select(ctx.load("L_buf", lIdx), ctx.f32(0)),
+            );
+            dTile.write(
+              tidx,
+              inBounds.select(ctx.load("D_buf", lIdx), ctx.f32(0)),
+            );
           });
 
           ctx.barrier();
@@ -428,9 +492,9 @@ function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
           const pBlk = ctx.zeros(1, BQ_BW);
           ctx.range(0, BQ_BW, (j) => {
             const qi = qStart.add(j);
-            const isActive = valid.and(qi.lt(N)).and(
-              isCausal.eq(ctx.u32(0)).or(kvRow.le(qi)),
-            );
+            const isActive = valid
+              .and(qi.lt(N))
+              .and(isCausal.eq(ctx.u32(0)).or(kvRow.le(qi)));
             const s = scores.get(j).mul(scale);
             const p = isActive.select(s.sub(lTile.read(j)).exp(), ctx.f32(0));
             const ds = p.mul(dovs.get(j).sub(dTile.read(j)));
@@ -459,81 +523,172 @@ function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
 
 /** Shared attention dispatch: config buffer + WGSL cache + pipeline + bind group + tracking. */
 function dispatchAttention(
-  wgslKey: string, pipelinePrefix: string,
-  specFactory: () => TileKernelSpec, headDim: number,
-  batchSize: number, numHeads: number, seqLen: number,
-  scale: number, isCausal: boolean,
+  wgslKey: string,
+  pipelinePrefix: string,
+  specFactory: () => TileKernelSpec,
+  headDim: number,
+  batchSize: number,
+  numHeads: number,
+  seqLen: number,
+  scale: number,
+  isCausal: boolean,
   buffers: GPUBuffer[], // all data buffers (config appended automatically)
   ...grid: number[]
 ): void {
   const ctx = requireContext();
   const configBuf = getOrCreateConfigBuffer(
-    ctx.device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
+    ctx.device,
+    batchSize,
+    numHeads,
+    seqLen,
+    headDim,
+    scale,
+    isCausal ? 1 : 0,
   );
   const wgsl = getTileIRWGSL(wgslKey, specFactory);
   const pipeline = getPipeline(ctx, `${pipelinePrefix}:tile:${headDim}`, wgsl);
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [...buffers, configBuf]);
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
+    ...buffers,
+    configBuf,
+  ]);
   for (const b of buffers) trackSharedEncoderWrite(b);
   dispatchComputePass(pipeline, bindGroup, ...grid);
 }
 
 /** Q,K,V: [B, H, N, D] → O: [B, H, N, D], L: [B, H, N] */
 export function dispatchFlashAttentionForward(
-  qBuffer: GPUBuffer, kBuffer: GPUBuffer, vBuffer: GPUBuffer,
-  batchSize: number, numHeads: number, seqLen: number, headDim: number,
-  scale: number, isCausal: boolean,
+  qBuffer: GPUBuffer,
+  kBuffer: GPUBuffer,
+  vBuffer: GPUBuffer,
+  batchSize: number,
+  numHeads: number,
+  seqLen: number,
+  headDim: number,
+  scale: number,
+  isCausal: boolean,
 ): { outputBuffer: GPUBuffer; logsumexpBuffer: GPUBuffer } {
-  const outBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * headDim * 4);
+  const outBuffer = allocateOutputBuffer(
+    batchSize * numHeads * seqLen * headDim * 4,
+  );
   const lseBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * 4);
-  dispatchAttention(`fwd:${headDim}`, "faFwd", () => makeForwardAttentionSpec(headDim), headDim,
-    batchSize, numHeads, seqLen, scale, isCausal,
+  dispatchAttention(
+    `fwd:${headDim}`,
+    "faFwd",
+    () => makeForwardAttentionSpec(headDim),
+    headDim,
+    batchSize,
+    numHeads,
+    seqLen,
+    scale,
+    isCausal,
     [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer],
-    Math.ceil(seqLen / BR), numHeads, batchSize);
+    Math.ceil(seqLen / BR),
+    numHeads,
+    batchSize,
+  );
   return { outputBuffer: outBuffer, logsumexpBuffer: lseBuffer };
 }
 
 /** dO,O: [B,H,N,D] → D: [B,H,N] */
 export function dispatchFlashAttentionBackwardD(
-  dOBuffer: GPUBuffer, oBuffer: GPUBuffer,
-  batchSize: number, numHeads: number, seqLen: number, headDim: number,
-  scale: number, isCausal: boolean,
+  dOBuffer: GPUBuffer,
+  oBuffer: GPUBuffer,
+  batchSize: number,
+  numHeads: number,
+  seqLen: number,
+  headDim: number,
+  scale: number,
+  isCausal: boolean,
 ): GPUBuffer {
   const outBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * 4);
-  dispatchAttention(`bwdD:${headDim}`, "faBwdD", () => makeDPrecomputeSpec(headDim), headDim,
-    batchSize, numHeads, seqLen, scale, isCausal,
+  dispatchAttention(
+    `bwdD:${headDim}`,
+    "faBwdD",
+    () => makeDPrecomputeSpec(headDim),
+    headDim,
+    batchSize,
+    numHeads,
+    seqLen,
+    scale,
+    isCausal,
     [dOBuffer, oBuffer, outBuffer],
-    batchSize * numHeads * seqLen);
+    batchSize * numHeads * seqLen,
+  );
   return outBuffer;
 }
 
 /** Q,K,V,L,D,dO → dQ: [B,H,N,D] */
 export function dispatchFlashAttentionBackwardDQ(
-  qBuffer: GPUBuffer, kBuffer: GPUBuffer, vBuffer: GPUBuffer,
-  lBuffer: GPUBuffer, dBuffer: GPUBuffer, dOBuffer: GPUBuffer,
-  batchSize: number, numHeads: number, seqLen: number, headDim: number,
-  scale: number, isCausal: boolean,
+  qBuffer: GPUBuffer,
+  kBuffer: GPUBuffer,
+  vBuffer: GPUBuffer,
+  lBuffer: GPUBuffer,
+  dBuffer: GPUBuffer,
+  dOBuffer: GPUBuffer,
+  batchSize: number,
+  numHeads: number,
+  seqLen: number,
+  headDim: number,
+  scale: number,
+  isCausal: boolean,
 ): GPUBuffer {
-  const outBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * headDim * 4);
-  dispatchAttention(`bwdDQ:${headDim}`, "faBwdDQ", () => makeBackwardDQSpec(headDim), headDim,
-    batchSize, numHeads, seqLen, scale, isCausal,
+  const outBuffer = allocateOutputBuffer(
+    batchSize * numHeads * seqLen * headDim * 4,
+  );
+  dispatchAttention(
+    `bwdDQ:${headDim}`,
+    "faBwdDQ",
+    () => makeBackwardDQSpec(headDim),
+    headDim,
+    batchSize,
+    numHeads,
+    seqLen,
+    scale,
+    isCausal,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer],
-    Math.ceil(seqLen / BR), numHeads, batchSize);
+    Math.ceil(seqLen / BR),
+    numHeads,
+    batchSize,
+  );
   return outBuffer;
 }
 
 /** Q,K,V,L,D,dO → dK: [B,H,N,D], dV: [B,H,N,D] */
 export function dispatchFlashAttentionBackwardDKV(
-  qBuffer: GPUBuffer, kBuffer: GPUBuffer, vBuffer: GPUBuffer,
-  lBuffer: GPUBuffer, dBuffer: GPUBuffer, dOBuffer: GPUBuffer,
-  batchSize: number, numHeads: number, seqLen: number, headDim: number,
-  scale: number, isCausal: boolean,
+  qBuffer: GPUBuffer,
+  kBuffer: GPUBuffer,
+  vBuffer: GPUBuffer,
+  lBuffer: GPUBuffer,
+  dBuffer: GPUBuffer,
+  dOBuffer: GPUBuffer,
+  batchSize: number,
+  numHeads: number,
+  seqLen: number,
+  headDim: number,
+  scale: number,
+  isCausal: boolean,
 ): { dKBuffer: GPUBuffer; dVBuffer: GPUBuffer } {
-  const dKBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * headDim * 4);
-  const dVBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * headDim * 4);
-  dispatchAttention(`bwdDKV:${headDim}`, "faBwdDKV", () => makeBackwardDKVSpec(headDim), headDim,
-    batchSize, numHeads, seqLen, scale, isCausal,
+  const dKBuffer = allocateOutputBuffer(
+    batchSize * numHeads * seqLen * headDim * 4,
+  );
+  const dVBuffer = allocateOutputBuffer(
+    batchSize * numHeads * seqLen * headDim * 4,
+  );
+  dispatchAttention(
+    `bwdDKV:${headDim}`,
+    "faBwdDKV",
+    () => makeBackwardDKVSpec(headDim),
+    headDim,
+    batchSize,
+    numHeads,
+    seqLen,
+    scale,
+    isCausal,
     [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer],
-    Math.ceil(seqLen / BC_BW), numHeads, batchSize);
+    Math.ceil(seqLen / BC_BW),
+    numHeads,
+    batchSize,
+  );
   return { dKBuffer, dVBuffer };
 }
 

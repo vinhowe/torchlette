@@ -25,9 +25,12 @@
  */
 
 import type { DType } from "../backend/types";
-import type { GPUBuffer, GPUComputePipeline, GPUBindGroup } from "../backend/webgpu/gpu-types";
 import type { FusedKernelRecipe } from "../backend/webgpu/fusion-types";
-import type { LazyIRNode, LazyRef } from "./lazy";
+import type {
+  GPUBindGroup,
+  GPUBuffer,
+  GPUComputePipeline,
+} from "../backend/webgpu/gpu-types";
 
 // ============================================================================
 // Lowered Action Types
@@ -55,7 +58,10 @@ interface LoweredFusedAction {
    * Format: Array of { nodeLocalIdx, inputIdx, kind } where nodeLocalIdx
    * indexes into coveredNodeIndices.
    */
-  cachedExternalInputPattern?: Array<{ nodeLocalIdx: number; inputIdx: number }>;
+  cachedExternalInputPattern?: Array<{
+    nodeLocalIdx: number;
+    inputIdx: number;
+  }>;
 }
 
 /** A single non-fused op dispatch. */
@@ -75,7 +81,12 @@ interface LoweredMatmulEpilogueAction {
   /** Index of the final output node. */
   outputNodeIndex: number;
   /** Cached epilogue operations (structural, same across steps). */
-  epilogueOps: Array<{ kind: string; toDtype?: DType; inputIndex?: number; op?: string }>;
+  epilogueOps: Array<{
+    kind: string;
+    toDtype?: DType;
+    inputIndex?: number;
+    op?: string;
+  }>;
   /** Number of additional epilogue inputs (e.g., bias tensors). */
   epilogueInputCount: number;
   /** Output dtype after epilogue chain. */
@@ -85,7 +96,7 @@ interface LoweredMatmulEpilogueAction {
   /** Prologue info: which matmul inputs have absorbed casts. */
   prologues?: Array<{
     inputIndex: 0 | 1;
-    castNodeIndex: number;  // Plan-node index of the cast node
+    castNodeIndex: number; // Plan-node index of the cast node
     fromDtype: DType;
     toDtype: DType;
   }>;
@@ -129,7 +140,16 @@ interface LoweredMatmulEpilogueAction {
     /** Output dtype after epilogue chain. */
     outputDtype: DType;
     /** Pre-computed epilogue config (structural, same across steps). */
-    epilogueConfig: { ops: Array<{ kind: string; toDtype?: DType; inputIndex?: number; op?: string }>; additionalInputCount: number; outputDtype?: DType };
+    epilogueConfig: {
+      ops: Array<{
+        kind: string;
+        toDtype?: DType;
+        inputIndex?: number;
+        op?: string;
+      }>;
+      additionalInputCount: number;
+      outputDtype?: DType;
+    };
   };
 }
 
@@ -161,7 +181,12 @@ interface LoweredReductionEpilogueAction {
   /** Index of the final output node in the plan. */
   outputNodeIndex: number;
   /** Epilogue operations to apply after the reduction. */
-  epilogueOps: Array<{ kind: string; toDtype?: DType; inputIndex?: number; op?: string }>;
+  epilogueOps: Array<{
+    kind: string;
+    toDtype?: DType;
+    inputIndex?: number;
+    op?: string;
+  }>;
   /** Number of additional epilogue inputs (e.g., external tensors for binary ops). */
   epilogueInputCount: number;
   /** Output dtype after epilogue chain. */
@@ -186,7 +211,12 @@ interface LoweredReductionFusionAction {
   /** Dtypes for each preamble external input. */
   preambleInputDtypes: DType[];
   /** Epilogue operations to apply after the reduction. */
-  epilogueOps: Array<{ kind: string; toDtype?: DType; inputIndex?: number; op?: string }>;
+  epilogueOps: Array<{
+    kind: string;
+    toDtype?: DType;
+    inputIndex?: number;
+    op?: string;
+  }>;
   /** Number of additional epilogue inputs (e.g., external tensors for binary ops). */
   epilogueInputCount: number;
   /** Output dtype after epilogue chain. */
@@ -310,24 +340,53 @@ export interface ReplayNodeResult {
  */
 export type ReplayEntry =
   | { kind: "dispatch"; dispatch: ReplayDispatch }
-  | { kind: "data-source"; nodeIndex: number; arenaResolveIdx: number;
+  | {
+      kind: "data-source";
+      nodeIndex: number;
+      arenaResolveIdx: number;
       /** Sequence counter positions so re-executed dispatches hit correct cache positions. */
-      seqCounters: { dispatch: number; params: number; output: number } }
-  | { kind: "view"; nodeIndex: number; arenaResolveIdx: number;
+      seqCounters: { dispatch: number; params: number; output: number };
+    }
+  | {
+      kind: "view";
+      nodeIndex: number;
+      arenaResolveIdx: number;
       /** Cached view result for replay (arena buffers are stable, so buffer refs stay valid). */
-      cachedResult?: { buffer: GPUBuffer; shape: number[]; dtype: DType; size: number;
-        strides: number[]; offset: number; isContiguous: boolean };
+      cachedResult?: {
+        buffer: GPUBuffer;
+        shape: number[];
+        dtype: DType;
+        size: number;
+        strides: number[];
+        offset: number;
+        isContiguous: boolean;
+      };
       /** Arena counter position AFTER view execution (may differ if contiguous() triggered). */
-      arenaResolveIdxAfter?: number }
-  | { kind: "sequential"; nodeIndex: number; arenaResolveIdx: number;
+      arenaResolveIdxAfter?: number;
+    }
+  | {
+      kind: "sequential";
+      nodeIndex: number;
+      arenaResolveIdx: number;
       /** Sequence counter positions so re-executed dispatches hit correct cache positions. */
-      seqCounters: { dispatch: number; params: number; output: number } }
+      seqCounters: { dispatch: number; params: number; output: number };
+    }
   | { kind: "result"; nodeResult: ReplayNodeResult }
-  | { kind: "adam-batch"; nodeIndices: number[];
+  | {
+      kind: "adam-batch";
+      nodeIndices: number[];
       /** Sequence counter positions at adam batch start (for correct cache indexing). */
-      seqCounters: { dispatch: number; params: number; output: number } }
-  | { kind: "side-output"; nodeIndex: number; buffer: GPUBuffer; shape: number[];
-      dtype: DType; size: number; strides: number[] }
+      seqCounters: { dispatch: number; params: number; output: number };
+    }
+  | {
+      kind: "side-output";
+      nodeIndex: number;
+      buffer: GPUBuffer;
+      shape: number[];
+      dtype: DType;
+      size: number;
+      strides: number[];
+    }
   | { kind: "reclaim" }
   | { kind: "pre-adam-reclaim" };
 
@@ -349,13 +408,22 @@ export interface DispatchReplayCache {
 // ============================================================================
 
 const DATA_SOURCE_OPS: ReadonlySet<string> = new Set([
-  "tensorFromArray", "zeros", "full", "arange",
-  "rand", "randn", "bernoulli",
+  "tensorFromArray",
+  "zeros",
+  "full",
+  "arange",
+  "rand",
+  "randn",
+  "bernoulli",
 ]);
 
 /** View ops that produce views (no GPU dispatch, metadata only). */
 const VIEW_OPS: ReadonlySet<string> = new Set([
-  "reshape", "transpose", "permute", "expand", "narrow",
+  "reshape",
+  "transpose",
+  "permute",
+  "expand",
+  "narrow",
 ]);
 
 /**
@@ -363,9 +431,7 @@ const VIEW_OPS: ReadonlySet<string> = new Set([
  * compute dispatches. These must be re-executed during dispatch replay because
  * the copy commands are invisible to the compute dispatch recording mechanism.
  */
-export const ENCODER_COPY_OPS: ReadonlySet<string> = new Set([
-  "scatterAdd",
-]);
+export const ENCODER_COPY_OPS: ReadonlySet<string> = new Set(["scatterAdd"]);
 
 // ============================================================================
 // Lowered Plan Builder
@@ -417,7 +483,12 @@ export class LoweredPlanBuilder {
     matmulNodeIndex: number,
     coveredNodeIndices: number[],
     outputNodeIndex: number,
-    epilogueOps: Array<{ kind: string; toDtype?: DType; inputIndex?: number; op?: string }>,
+    epilogueOps: Array<{
+      kind: string;
+      toDtype?: DType;
+      inputIndex?: number;
+      op?: string;
+    }>,
     epilogueInputCount: number,
     outputDtype: DType,
     consumedCount: number,
@@ -469,7 +540,12 @@ export class LoweredPlanBuilder {
     outputNodeIndex: number,
     preambleOps: Array<{ op: string; arity: number; chainInputPos?: 0 | 1 }>,
     preambleInputDtypes: DType[],
-    epilogueOps: Array<{ kind: string; toDtype?: DType; inputIndex?: number; op?: string }>,
+    epilogueOps: Array<{
+      kind: string;
+      toDtype?: DType;
+      inputIndex?: number;
+      op?: string;
+    }>,
     epilogueInputCount: number,
     outputDtype: DType,
     consumedCount: number,
@@ -496,7 +572,12 @@ export class LoweredPlanBuilder {
     reductionNodeIndex: number,
     coveredNodeIndices: number[],
     outputNodeIndex: number,
-    epilogueOps: Array<{ kind: string; toDtype?: DType; inputIndex?: number; op?: string }>,
+    epilogueOps: Array<{
+      kind: string;
+      toDtype?: DType;
+      inputIndex?: number;
+      op?: string;
+    }>,
     epilogueInputCount: number,
     outputDtype: DType,
     consumedCount: number,

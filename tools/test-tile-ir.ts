@@ -3,39 +3,39 @@
  * and print the generated WGSL.
  */
 
-import type { TileKernelSpec } from "../src/backend/webgpu/tile-ir";
 import { compileTileKernel } from "../src/backend/webgpu/tile-compiler";
+import type { TileKernelSpec } from "../src/backend/webgpu/tile-ir";
 
 const layerNormFwd: TileKernelSpec = {
   name: "layerNormFwd",
   workgroupSize: 256,
   bindings: {
-    x:      { storage: "read",       type: "f32" },
-    weight: { storage: "read",       type: "f32" },
-    bias:   { storage: "read",       type: "f32" },
+    x: { storage: "read", type: "f32" },
+    weight: { storage: "read", type: "f32" },
+    bias: { storage: "read", type: "f32" },
     output: { storage: "read_write", type: "f32" },
   },
   uniforms: {
-    num_rows:    "u32",
+    num_rows: "u32",
     feature_dim: "u32",
-    eps:         "f32",
+    eps: "f32",
   },
   grid: (u) => [u.num_rows],
 
   kernel(ctx) {
     const row = ctx.programId(0);
-    const D   = ctx.uniform("feature_dim");
+    const D = ctx.uniform("feature_dim");
     const base = row.mul(D);
     const offs = base.add(ctx.blockRange(D));
 
     // Phase 0: load + reduce to mean
     const xVals = ctx.load("x", offs);
-    const mean  = ctx.reduce(xVals, "sum").div(D.toF32());
+    const mean = ctx.reduce(xVals, "sum").div(D.toF32());
 
     // Phase 1: compute variance and inv_std
-    const diff    = xVals.sub(mean);
+    const diff = xVals.sub(mean);
     const variance = ctx.reduce(diff.mul(diff), "sum").div(D.toF32());
-    const invStd  = variance.add(ctx.uniform("eps").toF32()).rsqrt();
+    const invStd = variance.add(ctx.uniform("eps").toF32()).rsqrt();
 
     // Phase 2: normalize + affine + store
     const normalized = diff.mul(invStd);

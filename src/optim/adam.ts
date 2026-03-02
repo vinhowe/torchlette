@@ -30,10 +30,15 @@ export class Adam {
   /** Pending adamStep nodes from the last step, for side output extraction */
   private _pendingNodes: Array<LazyIRNode | null>;
   /** Pending unscale config from GradScaler (fused unscale+Adam path) */
-  private _pendingUnscale: { invScale: number; infFlagBuffer: unknown } | null = null;
+  private _pendingUnscale: { invScale: number; infFlagBuffer: unknown } | null =
+    null;
 
   constructor(params: Tensor[], options: AdamOptions, api?: Torchlette) {
-    const { api: engine, device } = validateOptimizerParams("Adam", params, api);
+    const { api: engine, device } = validateOptimizerParams(
+      "Adam",
+      params,
+      api,
+    );
     if (options.lr <= 0) {
       throw new Error("Adam learning rate must be > 0");
     }
@@ -103,8 +108,8 @@ export class Adam {
 
       if (sideOutputs) {
         // Dispose old state
-        if (this.expAvg[i]) this.expAvg[i]!.dispose();
-        if (this.expAvgSq[i]) this.expAvgSq[i]!.dispose();
+        if (this.expAvg[i]) this.expAvg[i]?.dispose();
+        if (this.expAvgSq[i]) this.expAvgSq[i]?.dispose();
 
         // Wrap existing StorageHandles into tracked RuntimeTensors
         this.expAvg[i] = runtime.createFromStorageHandle(
@@ -159,8 +164,7 @@ export class Adam {
       this.steps[i] = step;
       const biasCorrection1 = 1 - this.beta1 ** step;
       const biasCorrection2 = 1 - this.beta2 ** step;
-      const stepSize =
-        (this.lr * Math.sqrt(biasCorrection2)) / biasCorrection1;
+      const stepSize = (this.lr * Math.sqrt(biasCorrection2)) / biasCorrection1;
 
       // Initialize m, v as zeros on first step
       if (!this.expAvg[i]) {
@@ -189,8 +193,8 @@ export class Adam {
         [
           grad.lazyRef,
           param._unwrap().lazyRef,
-          this.expAvg[i]!.lazyRef,
-          this.expAvgSq[i]!.lazyRef,
+          this.expAvg[i]?.lazyRef,
+          this.expAvgSq[i]?.lazyRef,
         ],
         param.shape,
         "f32",
@@ -230,7 +234,9 @@ export class Adam {
   /**
    * Elementwise Adam step: fallback for backends without fused kernel (e.g., CPU).
    */
-  private _stepElementwise(runtime: ReturnType<Torchlette["_runtime"]>): Tensor[] {
+  private _stepElementwise(
+    runtime: ReturnType<Torchlette["_runtime"]>,
+  ): Tensor[] {
     const updated: Tensor[] = [];
 
     for (let i = 0; i < this.params.length; i += 1) {

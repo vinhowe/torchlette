@@ -6,34 +6,41 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  beginSharedEncoder,
+  flushSharedEncoder,
   getWebGPUDevice,
   initWebGPU,
   syncWebGPU,
-  beginSharedEncoder,
-  flushSharedEncoder,
 } from "../../src/backend/webgpu";
-import { createTileKernelDispatcher, createAutoTileKernelDispatcher } from "../../src/backend/webgpu/tile-dispatch";
-import type { TileKernelSpec, AutotuneConfig, TuneParam } from "../../src/backend/webgpu/tile-ir";
-import {
-  elementwiseGrid,
-  perRowGrid,
-  ceilDivGrid,
-  singleWorkgroup,
-  tiledGrid,
-  productGrid,
-  inferGrid,
-  resolveGrid,
-} from "../../src/backend/webgpu/tile-ir";
-import type { GPUBuffer, GPUDevice, GPUQueue } from "../../src/backend/webgpu/gpu-types";
+import type {
+  GPUBuffer,
+  GPUDevice,
+  GPUQueue,
+} from "../../src/backend/webgpu/gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "../../src/backend/webgpu/gpu-types";
 import {
-  generateTileConfigs,
-  getDefaultConfig,
   autotuneTileKernel,
   clearTileAutotuneCache,
   exportTileAutotuneCache,
+  generateTileConfigs,
+  getDefaultConfig,
   importTileAutotuneCache,
 } from "../../src/backend/webgpu/tile-autotune";
+import { createAutoTileKernelDispatcher } from "../../src/backend/webgpu/tile-dispatch";
+import type {
+  AutotuneConfig,
+  TileKernelSpec,
+} from "../../src/backend/webgpu/tile-ir";
+import {
+  ceilDivGrid,
+  elementwiseGrid,
+  inferGrid,
+  perRowGrid,
+  productGrid,
+  resolveGrid,
+  singleWorkgroup,
+  tiledGrid,
+} from "../../src/backend/webgpu/tile-ir";
 
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -64,7 +71,10 @@ function makeOutputBuffer(numElements: number): GPUBuffer {
   });
 }
 
-async function readF32Buffer(buf: GPUBuffer, count: number): Promise<Float32Array> {
+async function readF32Buffer(
+  buf: GPUBuffer,
+  count: number,
+): Promise<Float32Array> {
   const staging = device.createBuffer({
     size: count * 4,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -88,7 +98,7 @@ function makeScaleSpec(wgSize: number): TileKernelSpec {
     name: `scale_wg${wgSize}`,
     workgroupSize: wgSize,
     bindings: {
-      input:  { storage: "read", type: "f32" },
+      input: { storage: "read", type: "f32" },
       output: { storage: "read_write", type: "f32" },
     },
     uniforms: { N: "u32", scale: "f32" },
@@ -126,7 +136,7 @@ describe("tile-autotune config generation", () => {
 
     const configs = generateTileConfigs(autoConfig);
     expect(configs).toHaveLength(3);
-    expect(configs.map(c => c.wgSize)).toEqual([32, 64, 128]);
+    expect(configs.map((c) => c.wgSize)).toEqual([32, 64, 128]);
   });
 
   it("applies constraints to filter invalid configs", () => {
@@ -142,7 +152,7 @@ describe("tile-autotune config generation", () => {
 
     const configs = generateTileConfigs(autoConfig);
     expect(configs).toHaveLength(4);
-    expect(configs.every(c => c.wgSize <= 256)).toBe(true);
+    expect(configs.every((c) => c.wgSize <= 256)).toBe(true);
   });
 
   it("handles multi-param Cartesian product", () => {
@@ -171,15 +181,13 @@ describe("tile-autotune config generation", () => {
         wgSize: { values: [32, 64, 128], default: 64 },
         vecWidth: { values: [1, 2, 4], default: 1 },
       },
-      constraints: [
-        (c) => c.wgSize * c.vecWidth <= 256,
-      ],
+      constraints: [(c) => c.wgSize * c.vecWidth <= 256],
     };
 
     const configs = generateTileConfigs(autoConfig);
     // 32*1=32, 32*2=64, 32*4=128, 64*1=64, 64*2=128, 64*4=256, 128*1=128, 128*2=256, 128*4=512 (excluded)
     expect(configs).toHaveLength(8);
-    expect(configs.every(c => c.wgSize * c.vecWidth <= 256)).toBe(true);
+    expect(configs.every((c) => c.wgSize * c.vecWidth <= 256)).toBe(true);
   });
 
   it("returns empty array when all configs are filtered", () => {
@@ -459,7 +467,9 @@ describe("tile-ir grid helpers", () => {
         y: "num_heads",
         z: "batch_size",
       });
-      expect(grid({ seq_len: 512, num_heads: 12, batch_size: 2 })).toEqual([8, 12, 2]);
+      expect(grid({ seq_len: 512, num_heads: 12, batch_size: 2 })).toEqual([
+        8, 12, 2,
+      ]);
     });
 
     it("handles non-divisible tile sizes", () => {
@@ -496,7 +506,7 @@ describe("tile-ir grid helpers", () => {
       };
       const grid = inferGrid(spec);
       expect(grid).not.toBeNull();
-      expect(grid!({ size: 1024 })).toEqual([4]);
+      expect(grid?.({ size: 1024 })).toEqual([4]);
     });
 
     it("infers from 'outSize' uniform", () => {
@@ -509,7 +519,7 @@ describe("tile-ir grid helpers", () => {
       };
       const grid = inferGrid(spec);
       expect(grid).not.toBeNull();
-      expect(grid!({ outSize: 512 })).toEqual([2]);
+      expect(grid?.({ outSize: 512 })).toEqual([2]);
     });
 
     it("returns null when no matching uniform", () => {
@@ -569,7 +579,9 @@ describe("tile-ir grid helpers", () => {
         uniforms: { rows: "u32" },
         kernel() {},
       };
-      expect(() => resolveGrid(spec)).toThrow(/no grid function for kernel "mykernel"/);
+      expect(() => resolveGrid(spec)).toThrow(
+        /no grid function for kernel "mykernel"/,
+      );
     });
   });
 });

@@ -1,7 +1,7 @@
-import { describe, expect, it, beforeAll } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
-  initWebGPU,
   getWebGPUInitError,
+  initWebGPU,
   webgpuBackend,
 } from "../../src/backend/webgpu";
 import { cpuOnly } from "../helpers/webgpu";
@@ -204,7 +204,10 @@ describe.skipIf(cpuOnly)("WebGPU ops", () => {
     it("returns view sharing same buffer", async () => {
       const data = Array.from({ length: 12 }, (_, i) => i);
       const a = webgpuBackend.ops.tensorFromArray(data, [3, 4]) as WebGPUTensor;
-      const t = webgpuBackend.ops.transpose(a, { dim0: 0, dim1: 1 }) as WebGPUTensor;
+      const t = webgpuBackend.ops.transpose(a, {
+        dim0: 0,
+        dim1: 1,
+      }) as WebGPUTensor;
 
       // Same underlying buffer
       expect(t.buffer).toBe(a.buffer);
@@ -213,12 +216,18 @@ describe.skipIf(cpuOnly)("WebGPU ops", () => {
     });
 
     it("has non-contiguous strides after transpose", async () => {
-      const a = webgpuBackend.ops.tensorFromArray([1, 2, 3, 4, 5, 6], [2, 3]) as WebGPUTensor;
+      const a = webgpuBackend.ops.tensorFromArray(
+        [1, 2, 3, 4, 5, 6],
+        [2, 3],
+      ) as WebGPUTensor;
 
       expect(a.isContiguous).toBe(true);
       expect(a.strides).toEqual([3, 1]);
 
-      const t = webgpuBackend.ops.transpose(a, { dim0: 0, dim1: 1 }) as WebGPUTensor;
+      const t = webgpuBackend.ops.transpose(a, {
+        dim0: 0,
+        dim1: 1,
+      }) as WebGPUTensor;
 
       expect(t.isContiguous).toBe(false);
       expect(t.strides).toEqual([1, 3]); // Strides swapped
@@ -239,8 +248,14 @@ describe.skipIf(cpuOnly)("WebGPU ops", () => {
     it("double transpose gives equivalent data", async () => {
       const data = Array.from({ length: 12 }, (_, i) => i);
       const a = webgpuBackend.ops.tensorFromArray(data, [3, 4]) as WebGPUTensor;
-      const t1 = webgpuBackend.ops.transpose(a, { dim0: 0, dim1: 1 }) as WebGPUTensor;
-      const t2 = webgpuBackend.ops.transpose(t1, { dim0: 0, dim1: 1 }) as WebGPUTensor;
+      const t1 = webgpuBackend.ops.transpose(a, {
+        dim0: 0,
+        dim1: 1,
+      }) as WebGPUTensor;
+      const t2 = webgpuBackend.ops.transpose(t1, {
+        dim0: 0,
+        dim1: 1,
+      }) as WebGPUTensor;
 
       // Shape restored
       expect(t2.shape).toEqual([3, 4]);
@@ -256,7 +271,10 @@ describe.skipIf(cpuOnly)("WebGPU ops", () => {
 
   describe("contiguous", () => {
     it("returns a non-owning view if already contiguous", async () => {
-      const a = webgpuBackend.ops.tensorFromArray([1, 2, 3, 4], [2, 2]) as WebGPUTensor;
+      const a = webgpuBackend.ops.tensorFromArray(
+        [1, 2, 3, 4],
+        [2, 2],
+      ) as WebGPUTensor;
       const c = webgpuBackend.ops.contiguous(a) as WebGPUTensor;
 
       // contiguous returns a view sharing the same buffer (ownsBuffer=false)
@@ -270,7 +288,10 @@ describe.skipIf(cpuOnly)("WebGPU ops", () => {
     it("materializes transposed view to new buffer", async () => {
       const data = Array.from({ length: 12 }, (_, i) => i);
       const a = webgpuBackend.ops.tensorFromArray(data, [3, 4]) as WebGPUTensor;
-      const t = webgpuBackend.ops.transpose(a, { dim0: 0, dim1: 1 }) as WebGPUTensor;
+      const t = webgpuBackend.ops.transpose(a, {
+        dim0: 0,
+        dim1: 1,
+      }) as WebGPUTensor;
 
       expect(t.isContiguous).toBe(false);
 
@@ -286,8 +307,14 @@ describe.skipIf(cpuOnly)("WebGPU ops", () => {
     });
 
     it("contiguous result has correct strides", async () => {
-      const a = webgpuBackend.ops.tensorFromArray([1, 2, 3, 4, 5, 6], [2, 3]) as WebGPUTensor;
-      const t = webgpuBackend.ops.transpose(a, { dim0: 0, dim1: 1 }) as WebGPUTensor;
+      const a = webgpuBackend.ops.tensorFromArray(
+        [1, 2, 3, 4, 5, 6],
+        [2, 3],
+      ) as WebGPUTensor;
+      const t = webgpuBackend.ops.transpose(a, {
+        dim0: 0,
+        dim1: 1,
+      }) as WebGPUTensor;
       const c = webgpuBackend.ops.contiguous(t) as WebGPUTensor;
 
       // Contiguous strides for [3, 2] should be [2, 1]
@@ -297,7 +324,10 @@ describe.skipIf(cpuOnly)("WebGPU ops", () => {
 
   describe("view-based expand", () => {
     it("returns view sharing same buffer", async () => {
-      const a = webgpuBackend.ops.tensorFromArray([1, 2, 3], [1, 3]) as WebGPUTensor;
+      const a = webgpuBackend.ops.tensorFromArray(
+        [1, 2, 3],
+        [1, 3],
+      ) as WebGPUTensor;
       const e = webgpuBackend.ops.expand(a, [4, 3]) as WebGPUTensor;
 
       // Same underlying buffer
@@ -306,7 +336,10 @@ describe.skipIf(cpuOnly)("WebGPU ops", () => {
     });
 
     it("has stride=0 for broadcast dimensions", async () => {
-      const a = webgpuBackend.ops.tensorFromArray([1, 2, 3], [1, 3]) as WebGPUTensor;
+      const a = webgpuBackend.ops.tensorFromArray(
+        [1, 2, 3],
+        [1, 3],
+      ) as WebGPUTensor;
       const e = webgpuBackend.ops.expand(a, [4, 3]) as WebGPUTensor;
 
       // First dimension (broadcast from 1 to 4) should have stride 0
@@ -344,7 +377,10 @@ describe.skipIf(cpuOnly)("WebGPU ops", () => {
       const a = webgpuBackend.ops.tensorFromArray([1, 2, 3, 4, 5, 6], [2, 3]);
       const aT = webgpuBackend.ops.transpose(a, { dim0: 0, dim1: 1 }); // [3, 2]
 
-      const b = webgpuBackend.ops.tensorFromArray([10, 20, 30, 40, 50, 60], [3, 2]);
+      const b = webgpuBackend.ops.tensorFromArray(
+        [10, 20, 30, 40, 50, 60],
+        [3, 2],
+      );
 
       const result = webgpuBackend.ops.add(aT, b);
       const values = await webgpuBackend.ops.read(result);
@@ -360,7 +396,10 @@ describe.skipIf(cpuOnly)("WebGPU ops", () => {
       const a = webgpuBackend.ops.tensorFromArray([1, 2, 3], [1, 3]);
       const aE = webgpuBackend.ops.expand(a, [2, 3]); // Broadcast first dim
 
-      const b = webgpuBackend.ops.tensorFromArray([10, 10, 10, 20, 20, 20], [2, 3]);
+      const b = webgpuBackend.ops.tensorFromArray(
+        [10, 10, 10, 20, 20, 20],
+        [2, 3],
+      );
 
       const result = webgpuBackend.ops.mul(aE, b);
       const values = await webgpuBackend.ops.read(result);
@@ -428,10 +467,10 @@ describe.skipIf(cpuOnly)("WebGPU ops", () => {
       // Verify a few values match expected permutation
       // Original [0,0,0]=0, [0,0,1]=1, [0,0,2]=2, [0,0,3]=3
       // After permute [2,0,1]: [0,0,0]->original[0,0,0]=0, [1,0,0]->original[0,0,1]=1
-      expect(values[0]).toBe(0);   // [0,0,0] -> orig[0,0,0]
-      expect(values[6]).toBe(1);   // [1,0,0] -> orig[0,0,1]
-      expect(values[12]).toBe(2);  // [2,0,0] -> orig[0,0,2]
-      expect(values[18]).toBe(3);  // [3,0,0] -> orig[0,0,3]
+      expect(values[0]).toBe(0); // [0,0,0] -> orig[0,0,0]
+      expect(values[6]).toBe(1); // [1,0,0] -> orig[0,0,1]
+      expect(values[12]).toBe(2); // [2,0,0] -> orig[0,0,2]
+      expect(values[18]).toBe(3); // [3,0,0] -> orig[0,0,3]
     });
 
     it("permute returns view (shares buffer)", async () => {
@@ -488,7 +527,9 @@ describe.skipIf(cpuOnly)("WebGPU ops", () => {
 
     it("throws for out of range dims", () => {
       const a = webgpuBackend.ops.tensorFromArray([1, 2, 3, 4], [2, 2]);
-      expect(() => webgpuBackend.ops.permute(a, [0, 3])).toThrow("out of range");
+      expect(() => webgpuBackend.ops.permute(a, [0, 3])).toThrow(
+        "out of range",
+      );
     });
   });
 

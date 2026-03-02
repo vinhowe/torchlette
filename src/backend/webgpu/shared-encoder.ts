@@ -13,27 +13,39 @@
  * step-level scope management (beginStep/endStep).
  */
 
-import type { GPUBuffer, GPUCommandBuffer, GPUCommandEncoder } from "./gpu-types";
+import { getSizeClass } from "../../engine/lifetime-analysis";
+import { resetDispatchSequence } from "./bind-group-cache";
+import { pinnedOutputBuffers, prePinOutputBuffers } from "./buffer-arena";
+import { awaitDeferredFence, bufferPool } from "./buffer-pool";
+import type {
+  GPUBuffer,
+  GPUCommandBuffer,
+  GPUCommandEncoder,
+} from "./gpu-types";
+import { profileApiCall, resolveGpuTimestamps } from "./profiler";
 import {
-  activeBatch, setActiveBatch,
-  sharedEncoderActive, setSharedEncoderActive,
-  sharedEncoderWriteSet, resetSharedEncoderWriteSet,
+  activeBatch,
+  incrementSubmitCount,
+  MAX_PARAMS_POOL_SIZE_PER_CLASS,
+  paramsBufferPools,
+  paramsBufferSizeClass,
   replayPinnedBufferSet,
   requireContext,
-  incrementSubmitCount,
-  paramsBufferSizeClass, paramsBufferPools, MAX_PARAMS_POOL_SIZE_PER_CLASS,
+  resetSharedEncoderWriteSet,
+  setActiveBatch,
+  setSharedEncoderActive,
+  sharedEncoderActive,
+  sharedEncoderWriteSet,
 } from "./webgpu-state";
-import { bufferPool, awaitDeferredFence } from "./buffer-pool";
-import { resolveGpuTimestamps, profileApiCall } from "./profiler";
-import { getSizeClass } from "../../engine/lifetime-analysis";
-
-import { resetDispatchSequence } from "./bind-group-cache";
-import { prePinOutputBuffers, pinnedOutputBuffers } from "./buffer-arena";
 
 // Re-exports from webgpu-state
 export type { BatchExecutionContext } from "./webgpu-state";
-export { trackSharedEncoderWrite } from "./webgpu-state";
-export { getSubmitCount, resetSubmitCount, incrementSubmitCount } from "./webgpu-state";
+export {
+  getSubmitCount,
+  incrementSubmitCount,
+  resetSubmitCount,
+  trackSharedEncoderWrite,
+} from "./webgpu-state";
 
 // ============================================================================
 // Batch Execution Context for True Segmented Execution
@@ -82,7 +94,7 @@ export async function endBatchExecution(): Promise<void> {
   // Now safe to destroy deferred buffers (GPU is done with them)
   for (const buffer of batch.deferredDestroyBuffers) {
     // Replay-pinned buffers must survive — referenced by recorded bind groups.
-    if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) continue;
+    if (replayPinnedBufferSet?.has(buffer)) continue;
     buffer.destroy();
   }
   // Also flush any pending pool buffers since GPU work is complete
@@ -162,15 +174,21 @@ const SHARED_ENCODER_MAX_PASSES = 2000;
 const PARAMS_FLUSH_THRESHOLD = 2000;
 
 // Debug flag: set TORCHLETTE_DEBUG_SHARED_ENCODER=1 to enable verbose logging
-const DEBUG_SHARED_ENCODER = typeof process !== "undefined" && !!process.env?.TORCHLETTE_DEBUG_SHARED_ENCODER;
+const DEBUG_SHARED_ENCODER =
+  typeof process !== "undefined" &&
+  !!process.env?.TORCHLETTE_DEBUG_SHARED_ENCODER;
 
 // currentOpLabel + get/set moved to webgpu-state.ts, re-exported here for backward compat.
-export { setCurrentOpLabel, getCurrentOpLabel } from "./webgpu-state";
+export { getCurrentOpLabel, setCurrentOpLabel } from "./webgpu-state";
 
 // Adam batch mode: when true, adamStep() skips its pre-dispatch flushSharedEncoder().
 // The caller (lazy.ts) is responsible for a single flush before the Adam batch.
-export function setAdamBatchMode(active: boolean): void { encoderState.adamBatchMode = active; }
-export function isAdamBatchMode(): boolean { return encoderState.adamBatchMode; }
+export function setAdamBatchMode(active: boolean): void {
+  encoderState.adamBatchMode = active;
+}
+export function isAdamBatchMode(): boolean {
+  return encoderState.adamBatchMode;
+}
 
 export function beginSharedEncoder(): void {
   if (!encoderState.enabled) return;
@@ -205,7 +223,9 @@ export function flushSharedEncoder(): void {
   cbs.push(...encoderState.collectedCommandBuffers);
 
   if (DEBUG_SHARED_ENCODER && cbs.length > 0) {
-    console.log(`[shared-enc] FLUSH: ${encoderState.passCount} passes on encoder, ${encoderState.collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`);
+    console.log(
+      `[shared-enc] FLUSH: ${encoderState.passCount} passes on encoder, ${encoderState.collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`,
+    );
   }
 
   if (cbs.length > 0) {
@@ -228,7 +248,7 @@ export function flushSharedEncoder(): void {
     const buf = encoderState.deferredUniformBuffers[i];
     // Replay-pinned buffers must stay alive — referenced by recorded bind groups.
     // Don't return them to the pool (prevents reuse and data corruption).
-    if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buf)) continue;
+    if (replayPinnedBufferSet?.has(buf)) continue;
     const sc = paramsBufferSizeClass(buf.size);
     const pool = paramsBufferPools.get(sc);
     if (pool) {
@@ -274,7 +294,9 @@ export function endSharedEncoder(): void {
     cbs.push(...encoderState.collectedCommandBuffers);
 
     if (DEBUG_SHARED_ENCODER && cbs.length > 0) {
-      console.log(`[shared-enc] END: ${encoderState.passCount} passes on encoder, ${encoderState.collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`);
+      console.log(
+        `[shared-enc] END: ${encoderState.passCount} passes on encoder, ${encoderState.collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`,
+      );
     }
 
     if (cbs.length > 0) {
@@ -292,7 +314,7 @@ export function endSharedEncoder(): void {
     for (let i = encoderState.deferredUniformBuffers.length - 1; i >= 0; i--) {
       const buf = encoderState.deferredUniformBuffers[i];
       // Replay-pinned buffers must stay alive — referenced by recorded bind groups.
-      if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buf)) continue;
+      if (replayPinnedBufferSet?.has(buf)) continue;
       const sc = paramsBufferSizeClass(buf.size);
       const pool = paramsBufferPools.get(sc);
       if (pool) {
@@ -310,7 +332,7 @@ export function endSharedEncoder(): void {
     // Flush storage buffer pendingRelease → main pool. The encoder was just
     // submitted, so buffers released by earlier passes are safe to reuse.
     bufferPool.flushPendingToAvailable();
-    bufferPool.beginWindow();  // End-of-step is also a window boundary
+    bufferPool.beginWindow(); // End-of-step is also a window boundary
   }
 }
 
@@ -339,7 +361,7 @@ export async function beginStep(): Promise<void> {
   bufferPool.reserve(requireContext().device);
   bufferPool.sortPoolBuckets(); // deterministic acquire order for bind group cache
   prePinOutputBuffers(); // pre-extract hinted output buffers before any dispatches
-  bufferPool.beginWindowTracking();  // Start recording this step's demand
+  bufferPool.beginWindowTracking(); // Start recording this step's demand
   beginSharedEncoder(); // open the shared encoder for the whole step
   resetDispatchSequence(); // reset bind group cache sequence counter for this step
 }
@@ -369,7 +391,6 @@ export function isSharedEncoderActive(): boolean {
   return sharedEncoderActive;
 }
 
-
 export function setSharedEncoderEnabled(enabled: boolean): void {
   encoderState.enabled = enabled;
 }
@@ -392,10 +413,11 @@ export function incrementSharedEncoderPassCount(): void {
  * This prevents extremely large command buffers and bounds the write/read sets.
  */
 export function autoFlushSharedEncoder(): void {
-  if (sharedEncoderActive && (
-    encoderState.passCount >= SHARED_ENCODER_MAX_PASSES ||
-    encoderState.deferredUniformBuffers.length >= PARAMS_FLUSH_THRESHOLD
-  )) {
+  if (
+    sharedEncoderActive &&
+    (encoderState.passCount >= SHARED_ENCODER_MAX_PASSES ||
+      encoderState.deferredUniformBuffers.length >= PARAMS_FLUSH_THRESHOLD)
+  ) {
     flushSharedEncoder();
   }
 }

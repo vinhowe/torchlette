@@ -1,21 +1,17 @@
 import { describe, expect, it } from "vitest";
-
 import {
-  computeContiguousStrides,
-  checkContiguous,
-  transposeStrides,
-  transposeShape,
-  type ViewMeta,
-} from "../src/backend/types";
-
-import { sizeOf } from "../src/core/shape";
-
-import {
-  Tensor,
+  contiguous,
   tensorFromArray,
   transpose,
-  contiguous,
 } from "../src/backend/cpu/numeric";
+import {
+  checkContiguous,
+  computeContiguousStrides,
+  transposeShape,
+  transposeStrides,
+  type ViewMeta,
+} from "../src/backend/types";
+import { sizeOf } from "../src/core/shape";
 
 describe("ViewMeta utilities (§4.2-4.4)", () => {
   describe("computeContiguousStrides", () => {

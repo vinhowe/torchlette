@@ -12,24 +12,31 @@
  * per step each have their own arena).
  */
 
-import type { BackendTensor } from "../types";
-import type { GPUBuffer, GPUDevice } from "./gpu-types";
-import { GPUBufferUsage, STORAGE_BUFFER_USAGE, asGPUTensor } from "./gpu-types";
-import {
-  arenaBufferSet, trackSharedEncoderWrite, requireContext,
-  replayPinnedBufferSet,
-  getOutputSeqIndex, setOutputSeqIndex,
-} from "./webgpu-state";
-import { createTrackedBuffer } from "./tensor";
-import { bufferPool } from "./buffer-pool";
-import { alignBufferSize } from "./shape-utils";
 import { getSizeClass, getSizeForClass } from "../../engine/lifetime-analysis";
+import type { BackendTensor } from "../types";
+import { bufferPool } from "./buffer-pool";
+import type { GPUBuffer, GPUDevice } from "./gpu-types";
+import { asGPUTensor, GPUBufferUsage, STORAGE_BUFFER_USAGE } from "./gpu-types";
 import { gpuMemoryTracker } from "./memory-tracker";
 import { profileApiCall } from "./profiler";
+import { alignBufferSize } from "./shape-utils";
+import { createTrackedBuffer } from "./tensor";
+import {
+  arenaBufferSet,
+  getOutputSeqIndex,
+  replayPinnedBufferSet,
+  requireContext,
+  setOutputSeqIndex,
+  trackSharedEncoderWrite,
+} from "./webgpu-state";
 
 // Re-export from webgpu-state for backward compatibility
-export { arenaBufferSet } from "./webgpu-state";
-export { outputSeqIndex, getOutputSeqIndex, setOutputSeqIndex } from "./webgpu-state";
+export {
+  arenaBufferSet,
+  getOutputSeqIndex,
+  outputSeqIndex,
+  setOutputSeqIndex,
+} from "./webgpu-state";
 
 // ============================================================================
 // Output allocation functions
@@ -39,9 +46,7 @@ export { outputSeqIndex, getOutputSeqIndex, setOutputSeqIndex } from "./webgpu-s
  * Allocate a new tracked buffer (from pool or fresh).
  * Use this for op output allocation when pool-based reuse is desired.
  */
-export function allocateOutputBuffer(
-  sizeBytes: number,
-): GPUBuffer {
+export function allocateOutputBuffer(sizeBytes: number): GPUBuffer {
   // Arena fast path: if a buffer arena is active, use it.
   // This path is used by fused kernels (dispatchFusedKernel) which bypass
   // resolveOutputBuffer and call allocateOutputBuffer directly.
@@ -54,13 +59,17 @@ export function allocateOutputBuffer(
       // previous execution's output (an arena buffer) becomes the next
       // execution's external input. Without this check, the fused kernel
       // would overwrite the input data before it's fully consumed.
-      if (arenaLocal.externalInputBuffers && arenaLocal.externalInputBuffers.has(arenaBuffer)) {
+      if (arenaLocal.externalInputBuffers?.has(arenaBuffer)) {
         // Replace the arena slot with a fresh buffer. The old buffer stays
         // alive (referenced by the external input tensor) but is no longer
         // in the arena. This permanently resolves the conflict for this slot.
         arenaBufferSet.delete(arenaBuffer);
         arenaLocal.active.alloc[idx] = undefined;
-        const freshBuffer = arenaAllocAt(arenaLocal.active.alloc, idx, sizeBytes);
+        const freshBuffer = arenaAllocAt(
+          arenaLocal.active.alloc,
+          idx,
+          sizeBytes,
+        );
         arenaLocal.conflictDetected = true;
         return freshBuffer!;
       }
@@ -94,9 +103,7 @@ export function allocateOutputBuffer(
  * @param tensor The tensor to donate from
  * @returns The GPU buffer if donation succeeded, null otherwise
  */
-export function donateBuffer(
-  tensor: BackendTensor,
-): GPUBuffer | null {
+export function donateBuffer(tensor: BackendTensor): GPUBuffer | null {
   const t = asGPUTensor(tensor);
 
   // Can only donate if tensor owns the buffer
@@ -121,9 +128,7 @@ export function donateBuffer(
 /**
  * Get the size of a tensor's underlying buffer in bytes.
  */
-export function getBufferSize(
-  tensor: BackendTensor,
-): number {
+export function getBufferSize(tensor: BackendTensor): number {
   const t = asGPUTensor(tensor);
   return t.buffer.size ?? 0;
 }
@@ -205,7 +210,9 @@ const arenaLocal: ArenaLocalState = {
 };
 
 /** Get the currently active arena (for cross-module access). */
-export function getActiveArena(): BufferArena | null { return arenaLocal.active; }
+export function getActiveArena(): BufferArena | null {
+  return arenaLocal.active;
+}
 
 /** Register external input buffers for arena conflict detection. */
 export function setArenaExternalInputBuffers(buffers: GPUBuffer[]): void {
@@ -218,16 +225,23 @@ export function clearArenaExternalInputBuffers(): void {
 }
 
 /** Check if any arena conflict was detected during the current plan execution. */
-export function getArenaConflictDetected(): boolean { return arenaLocal.conflictDetected; }
+export function getArenaConflictDetected(): boolean {
+  return arenaLocal.conflictDetected;
+}
 
 /** Clear the arena conflict flag. */
-export function clearArenaConflictDetected(): void { arenaLocal.conflictDetected = false; }
+export function clearArenaConflictDetected(): void {
+  arenaLocal.conflictDetected = false;
+}
 
 /**
  * Pre-check if any arena buffers conflict with external input buffers.
  * Used before replay to determine if the cached bind groups are still valid.
  */
-export function hasArenaExternalConflicts(arena: BufferArena, extBufs: Set<GPUBuffer>): boolean {
+export function hasArenaExternalConflicts(
+  arena: BufferArena,
+  extBufs: Set<GPUBuffer>,
+): boolean {
   for (const buf of arena.resolve) {
     if (buf && extBufs.has(buf)) return true;
   }
@@ -259,16 +273,19 @@ export function clearActiveArena(): void {
 }
 
 /** Get the current arena resolve index (for dispatch replay recording). */
-export function getArenaResolveIndex(): number { return arenaLocal.resolveIndex; }
+export function getArenaResolveIndex(): number {
+  return arenaLocal.resolveIndex;
+}
 
 /** Set the arena resolve index to a specific value (for dispatch replay restore). */
-export function setArenaResolveIndexTo(idx: number): void { arenaLocal.resolveIndex = idx; }
+export function setArenaResolveIndexTo(idx: number): void {
+  arenaLocal.resolveIndex = idx;
+}
 
 /** Check if a buffer is owned by an arena (should not be released to pool). */
 export function isArenaBuffer(buffer: GPUBuffer): boolean {
   return arenaBufferSet.has(buffer);
 }
-
 
 /**
  * Destroy all buffers in an arena and remove them from the arena set.
@@ -282,7 +299,7 @@ export function destroyArena(arena: BufferArena): void {
         // Only destroy if not referenced by a live tensor
         if (!bufferPool.isLive(buffer)) {
           // Replay-pinned buffers must survive
-          if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) continue;
+          if (replayPinnedBufferSet?.has(buffer)) continue;
           gpuMemoryTracker.trackDeallocation(buffer);
           buffer.destroy();
         }
@@ -293,7 +310,11 @@ export function destroyArena(arena: BufferArena): void {
 }
 
 /** Allocate or reuse an arena buffer at the given position in the given array. */
-export function arenaAllocAt(arr: (GPUBuffer | undefined)[], idx: number, sizeBytes: number): GPUBuffer | null {
+export function arenaAllocAt(
+  arr: (GPUBuffer | undefined)[],
+  idx: number,
+  sizeBytes: number,
+): GPUBuffer | null {
   const alignedSize = alignBufferSize(sizeBytes);
   const neededSizeClass = getSizeClass(alignedSize);
 
@@ -315,7 +336,10 @@ export function arenaAllocAt(arr: (GPUBuffer | undefined)[], idx: number, sizeBy
       arenaLocal.conflictDetected = true;
     } else {
       // Dead buffer with wrong size class — destroy if not replay-pinned
-      if (replayPinnedBufferSet === null || !replayPinnedBufferSet.has(existing)) {
+      if (
+        replayPinnedBufferSet === null ||
+        !replayPinnedBufferSet.has(existing)
+      ) {
         gpuMemoryTracker.trackDeallocation(existing);
         existing.destroy();
       }
@@ -327,7 +351,7 @@ export function arenaAllocAt(arr: (GPUBuffer | undefined)[], idx: number, sizeBy
   const pooledSize = getSizeForClass(neededSizeClass);
   const usage = STORAGE_BUFFER_USAGE;
   const buffer = profileApiCall("createBuffer", () =>
-    ctx.device.createBuffer({ size: pooledSize, usage })
+    ctx.device.createBuffer({ size: pooledSize, usage }),
   );
   gpuMemoryTracker.trackAllocation(buffer, pooledSize);
   // Track in pool's allocation tracking for proper refcounting
@@ -385,21 +409,25 @@ export function resolveOutputBuffer(
     const arenaBuffer = arenaAllocAt(arenaLocal.active.resolve, idx, sizeBytes);
     if (arenaBuffer) {
       // Check for external input conflict first (structural — replace arena slot).
-      if (arenaLocal.externalInputBuffers && arenaLocal.externalInputBuffers.has(arenaBuffer)) {
+      if (arenaLocal.externalInputBuffers?.has(arenaBuffer)) {
         // Replace the arena slot with a fresh buffer. The old buffer stays
         // alive (referenced by the external input tensor).
         arenaBufferSet.delete(arenaBuffer);
         arenaLocal.active.resolve[idx] = undefined;
-        const freshBuffer = arenaAllocAt(arenaLocal.active.resolve, idx, sizeBytes);
+        const freshBuffer = arenaAllocAt(
+          arenaLocal.active.resolve,
+          idx,
+          sizeBytes,
+        );
         arenaLocal.conflictDetected = true;
         // Still need to check direct aliasing on the fresh buffer
-        if (freshBuffer && !inputBuffers.some(b => b === freshBuffer)) {
+        if (freshBuffer && !inputBuffers.some((b) => b === freshBuffer)) {
           arenaLocal.resolveHits++;
           return freshBuffer;
         }
         // Fresh buffer aliased with direct input — fall through to normal path
         arenaLocal.resolveAliased++;
-      } else if (!inputBuffers.some(b => b === arenaBuffer)) {
+      } else if (!inputBuffers.some((b) => b === arenaBuffer)) {
         // No conflict, no aliasing — use arena buffer directly
         arenaLocal.resolveHits++;
         return arenaBuffer;
@@ -418,7 +446,8 @@ export function resolveOutputBuffer(
   // class exactly. Without this, undersized buffers enter the pool and can
   // later be acquired by tensors needing the full size class, causing overflow.
   const pooledSize = getSizeForClass(getSizeClass(alignedSize));
-  const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+  const usage =
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
   const outIdx = getOutputSeqIndex();
   setOutputSeqIndex(outIdx + 1);
 
@@ -430,10 +459,16 @@ export function resolveOutputBuffer(
     if (pinned !== null && pinned !== undefined) {
       const neededSizeClass = getSizeClass(alignedSize);
       const pinnedSizeClass = getSizeClass(pinned.size);
-      if (pinnedSizeClass === neededSizeClass && !inputBuffers.some(b => b === pinned)) {
+      if (
+        pinnedSizeClass === neededSizeClass &&
+        !inputBuffers.some((b) => b === pinned)
+      ) {
         // Use pre-pinned buffer directly (already extracted from pool)
         trackSharedEncoderWrite(pinned);
-        gpuMemoryTracker.trackAllocation(pinned, getSizeForClass(pinnedSizeClass));
+        gpuMemoryTracker.trackAllocation(
+          pinned,
+          getSizeForClass(pinnedSizeClass),
+        );
         bufferPool.markAsFromPool(pinned);
         outputSequenceHints[outIdx] = pinned;
         pinnedOutputBuffers[outIdx] = null; // consumed
@@ -445,10 +480,14 @@ export function resolveOutputBuffer(
     }
   }
 
-  const preferredBuf = providedOutBuffer ? undefined : (outputSequenceHints[outIdx] ?? undefined);
-  let outBuffer = providedOutBuffer ?? createTrackedBuffer(device, { size: alignedSize, usage }, preferredBuf);
+  const preferredBuf = providedOutBuffer
+    ? undefined
+    : (outputSequenceHints[outIdx] ?? undefined);
+  let outBuffer =
+    providedOutBuffer ??
+    createTrackedBuffer(device, { size: alignedSize, usage }, preferredBuf);
 
-  if (!providedOutBuffer && inputBuffers.some(b => b === outBuffer)) {
+  if (!providedOutBuffer && inputBuffers.some((b) => b === outBuffer)) {
     const released = bufferPool.release(outBuffer, alignedSize, usage);
     if (!released) {
       bufferPool.deferredDestroy(outBuffer, alignedSize);
@@ -475,8 +514,16 @@ export function resolveOutputBuffer(
 // Arena stats (accessed by bind-group-cache reset)
 // ============================================================================
 
-export function getArenaResolveStats(): { hits: number; aliased: number; noArena: number } {
-  return { hits: arenaLocal.resolveHits, aliased: arenaLocal.resolveAliased, noArena: arenaLocal.resolveNoArena };
+export function getArenaResolveStats(): {
+  hits: number;
+  aliased: number;
+  noArena: number;
+} {
+  return {
+    hits: arenaLocal.resolveHits,
+    aliased: arenaLocal.resolveAliased,
+    noArena: arenaLocal.resolveNoArena,
+  };
 }
 
 export function resetArenaResolveStats(): void {

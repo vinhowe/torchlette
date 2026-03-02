@@ -24,8 +24,8 @@
  * linearly with sequence length and layer count.
  */
 
-import type { PackHook, Tensor, Torchlette, UnpackHook } from "../frontend";
 import { markAsCheckpointBoundary } from "../engine/lazy";
+import type { PackHook, Tensor, Torchlette, UnpackHook } from "../frontend";
 
 // ============================================================================
 // Types
@@ -163,7 +163,7 @@ function checkpointNonReentrant<T extends Tensor>(
 
       // Capture tensors during recomputation
       const captureHook: PackHook = (t: Tensor): Tensor => {
-        recomputedTensors!.set(captureIndex++, t);
+        recomputedTensors?.set(captureIndex++, t);
         lastCapturedTensor = t;
         return t; // Return tensor directly during recompute (no placeholder)
       };
@@ -173,11 +173,15 @@ function checkpointNonReentrant<T extends Tensor>(
       // whose autograd graph chains keep RuntimeTensors alive until GC,
       // causing ~150 StorageHandle leaks per training step.
       api.tidy(() => {
-        api.saved_tensors_hooks(captureHook, (t) => t as Tensor, () => {
-          fn(...inputs);
-        });
+        api.saved_tensors_hooks(
+          captureHook,
+          (t) => t as Tensor,
+          () => {
+            fn(...inputs);
+          },
+        );
         // Keep captured tensors so they survive tidy disposal
-        for (const t of recomputedTensors!.values()) {
+        for (const t of recomputedTensors?.values()) {
           api.keep(t);
         }
       });
@@ -200,7 +204,9 @@ function checkpointNonReentrant<T extends Tensor>(
 
     const result = recomputedTensors.get(checkpointIndex);
     if (!result) {
-      throw new Error(`Checkpoint: no tensor at index ${checkpointIndex} after recomputation`);
+      throw new Error(
+        `Checkpoint: no tensor at index ${checkpointIndex} after recomputation`,
+      );
     }
     return result;
   };

@@ -2,9 +2,17 @@
  * Tests for conv2d op — tile-IR direct convolution kernel.
  * Validates WebGPU results against CPU reference implementation.
  */
-import { describe, it, expect, beforeAll } from "vitest";
-import { webgpuBackend, initWebGPU, getWebGPUInitError } from "../../src/backend/webgpu";
-import { cpuBackend, Tensor as CPUTensor, tensorFromArray } from "../../src/backend/cpu";
+import { beforeAll, describe, expect, it } from "vitest";
+import {
+  type Tensor as CPUTensor,
+  cpuBackend,
+  tensorFromArray,
+} from "../../src/backend/cpu";
+import {
+  getWebGPUInitError,
+  initWebGPU,
+  webgpuBackend,
+} from "../../src/backend/webgpu";
 import { cpuOnly } from "../helpers/webgpu";
 
 // Helper: create a WebGPU tensor from data
@@ -55,8 +63,12 @@ describe.skipIf(cpuOnly)("Conv2d", () => {
     const cpuInput = tensorFromArray(input, [1, 2, 3, 3]);
     const cpuWeight = tensorFromArray(weight, [4, 2, 1, 1]);
 
-    const gpuOut = webgpuBackend.ops.conv2d!(gpuInput, gpuWeight, undefined);
-    const cpuOut = cpuBackend.ops.conv2d!(cpuInput, cpuWeight, undefined) as CPUTensor;
+    const gpuOut = webgpuBackend.ops.conv2d?.(gpuInput, gpuWeight, undefined);
+    const cpuOut = cpuBackend.ops.conv2d?.(
+      cpuInput,
+      cpuWeight,
+      undefined,
+    ) as CPUTensor;
 
     const gpuData = await readGPU(gpuOut);
     const cpuData = cpuOut.toArray();
@@ -76,8 +88,12 @@ describe.skipIf(cpuOnly)("Conv2d", () => {
     const cpuInput = tensorFromArray(input, [1, 1, 4, 4]);
     const cpuWeight = tensorFromArray(weight, [1, 1, 3, 3]);
 
-    const gpuOut = webgpuBackend.ops.conv2d!(gpuInput, gpuWeight, undefined, { padding: 1 });
-    const cpuOut = cpuBackend.ops.conv2d!(cpuInput, cpuWeight, undefined, { padding: 1 }) as CPUTensor;
+    const gpuOut = webgpuBackend.ops.conv2d?.(gpuInput, gpuWeight, undefined, {
+      padding: 1,
+    });
+    const cpuOut = cpuBackend.ops.conv2d?.(cpuInput, cpuWeight, undefined, {
+      padding: 1,
+    }) as CPUTensor;
 
     const gpuData = await readGPU(gpuOut);
     const cpuData = cpuOut.toArray();
@@ -97,8 +113,12 @@ describe.skipIf(cpuOnly)("Conv2d", () => {
     const cpuInput = tensorFromArray(input, [1, 1, 6, 6]);
     const cpuWeight = tensorFromArray(weight, [1, 1, 3, 3]);
 
-    const gpuOut = webgpuBackend.ops.conv2d!(gpuInput, gpuWeight, undefined, { stride: 2 });
-    const cpuOut = cpuBackend.ops.conv2d!(cpuInput, cpuWeight, undefined, { stride: 2 }) as CPUTensor;
+    const gpuOut = webgpuBackend.ops.conv2d?.(gpuInput, gpuWeight, undefined, {
+      stride: 2,
+    });
+    const cpuOut = cpuBackend.ops.conv2d?.(cpuInput, cpuWeight, undefined, {
+      stride: 2,
+    }) as CPUTensor;
 
     const gpuData = await readGPU(gpuOut);
     const cpuData = cpuOut.toArray();
@@ -121,8 +141,12 @@ describe.skipIf(cpuOnly)("Conv2d", () => {
     const cpuWeight = tensorFromArray(weight, [2, 1, 1, 1]);
     const cpuBias = tensorFromArray(bias, [2]);
 
-    const gpuOut = webgpuBackend.ops.conv2d!(gpuInput, gpuWeight, gpuBias);
-    const cpuOut = cpuBackend.ops.conv2d!(cpuInput, cpuWeight, cpuBias) as CPUTensor;
+    const gpuOut = webgpuBackend.ops.conv2d?.(gpuInput, gpuWeight, gpuBias);
+    const cpuOut = cpuBackend.ops.conv2d?.(
+      cpuInput,
+      cpuWeight,
+      cpuBias,
+    ) as CPUTensor;
 
     const gpuData = await readGPU(gpuOut);
     const cpuData = cpuOut.toArray();
@@ -149,8 +173,12 @@ describe.skipIf(cpuOnly)("Conv2d", () => {
     const cpuInput = tensorFromArray(input, [2, 1, 3, 3]);
     const cpuWeight = tensorFromArray(weight, [1, 1, 2, 2]);
 
-    const gpuOut = webgpuBackend.ops.conv2d!(gpuInput, gpuWeight, undefined);
-    const cpuOut = cpuBackend.ops.conv2d!(cpuInput, cpuWeight, undefined) as CPUTensor;
+    const gpuOut = webgpuBackend.ops.conv2d?.(gpuInput, gpuWeight, undefined);
+    const cpuOut = cpuBackend.ops.conv2d?.(
+      cpuInput,
+      cpuWeight,
+      undefined,
+    ) as CPUTensor;
 
     const gpuData = await readGPU(gpuOut);
     const cpuData = cpuOut.toArray();
@@ -162,7 +190,9 @@ describe.skipIf(cpuOnly)("Conv2d", () => {
   it("multi-channel input and output", async () => {
     // input: [1, 3, 4, 4], weight: [2, 3, 3, 3], bias: [2]
     const input = Array.from({ length: 3 * 16 }, (_, i) => Math.sin(i * 0.5));
-    const weight = Array.from({ length: 2 * 3 * 9 }, (_, i) => Math.cos(i * 0.3));
+    const weight = Array.from({ length: 2 * 3 * 9 }, (_, i) =>
+      Math.cos(i * 0.3),
+    );
     const bias = [0.5, -0.5];
 
     const gpuInput = gpuTensor(input, [1, 3, 4, 4]);
@@ -173,8 +203,12 @@ describe.skipIf(cpuOnly)("Conv2d", () => {
     const cpuWeight = tensorFromArray(weight, [2, 3, 3, 3]);
     const cpuBias = tensorFromArray(bias, [2]);
 
-    const gpuOut = webgpuBackend.ops.conv2d!(gpuInput, gpuWeight, gpuBias, { padding: 1 });
-    const cpuOut = cpuBackend.ops.conv2d!(cpuInput, cpuWeight, cpuBias, { padding: 1 }) as CPUTensor;
+    const gpuOut = webgpuBackend.ops.conv2d?.(gpuInput, gpuWeight, gpuBias, {
+      padding: 1,
+    });
+    const cpuOut = cpuBackend.ops.conv2d?.(cpuInput, cpuWeight, cpuBias, {
+      padding: 1,
+    }) as CPUTensor;
 
     const gpuData = await readGPU(gpuOut);
     const cpuData = cpuOut.toArray();

@@ -1,10 +1,15 @@
-import { normalizeDim, type Backend, type BackendTensor, type DType } from "../backend/types";
+import {
+  type Backend,
+  type BackendTensor,
+  type DType,
+  normalizeDim,
+} from "../backend/types";
+import type { PreambleChainKernelOp } from "../backend/webgpu/reduction-tile-ir";
+import { isFusibleOp } from "./fusion-detect";
 import type { LazyIRNode, LazyRef } from "./lazy-types";
+import { shapesEqual } from "./matmul-epilogue";
 import { createStorageHandle } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
-import { shapesEqual } from "./matmul-epilogue";
-import { isFusibleOp } from "./fusion-detect";
-import type { PreambleChainKernelOp } from "../backend/webgpu/reduction-tile-ir";
 
 // ============================================================================
 // Reduction Preamble Fusion (Phase 3)
@@ -94,15 +99,21 @@ export function detectReductionPreamble(
   let reductionNode: LazyIRNode | null = null;
   const MAX_CHAIN = 4;
 
-  for (let idx = startIdx + 1; idx < nodes.length && chain.length <= MAX_CHAIN; idx++) {
+  for (
+    let idx = startIdx + 1;
+    idx < nodes.length && chain.length <= MAX_CHAIN;
+    idx++
+  ) {
     const nextNode = nodes[idx];
     const lastChainNode = chain[chain.length - 1];
 
     // Check if nextNode is a reduction consuming the last chain node
     if (nextNode.op === "sum" || nextNode.op === "mean") {
-      if (nextNode.inputs.length >= 1 &&
-          nextNode.inputs[0].kind === "pending" &&
-          nextNode.inputs[0].node === lastChainNode) {
+      if (
+        nextNode.inputs.length >= 1 &&
+        nextNode.inputs[0].kind === "pending" &&
+        nextNode.inputs[0].node === lastChainNode
+      ) {
         // Validate last chain node has exactly 1 consumer
         if ((consumerCount.get(lastChainNode.id) ?? 0) !== 1) return null;
         reductionNode = nextNode;
@@ -118,7 +129,7 @@ export function detectReductionPreamble(
 
     // Check that nextNode consumes the last chain node
     const consumesLast = nextNode.inputs.some(
-      inp => inp.kind === "pending" && inp.node === lastChainNode,
+      (inp) => inp.kind === "pending" && inp.node === lastChainNode,
     );
     if (!consumesLast) break;
 
@@ -162,8 +173,12 @@ export function detectReductionPreamble(
 
   // First node: all inputs are external
   for (const ref of firstNode.inputs) {
-    const refShape = ref.kind === "pending" ? ref.node.shape
-      : ref.kind === "materialized" ? ref.storage.backendTensor.shape : undefined;
+    const refShape =
+      ref.kind === "pending"
+        ? ref.node.shape
+        : ref.kind === "materialized"
+          ? ref.storage.backendTensor.shape
+          : undefined;
     if (refShape && !shapesEqual(refShape, firstShape)) return null;
     externalInputRefs.push(ref);
     externalInputDtypes.push(getRefDtype(ref));
@@ -181,14 +196,18 @@ export function detectReductionPreamble(
     if (node.inputs.length === 1) {
       chainOps.push({ op: getChainOpName(node), arity: 1 });
     } else {
-      const inp0IsChain = node.inputs[0].kind === "pending" &&
-        node.inputs[0].node === prevNode;
+      const inp0IsChain =
+        node.inputs[0].kind === "pending" && node.inputs[0].node === prevNode;
       const externalPos = inp0IsChain ? 1 : 0;
       const chainPos: 0 | 1 = inp0IsChain ? 0 : 1;
 
       const extRef = node.inputs[externalPos];
-      const refShape = extRef.kind === "pending" ? extRef.node.shape
-        : extRef.kind === "materialized" ? extRef.storage.backendTensor.shape : undefined;
+      const refShape =
+        extRef.kind === "pending"
+          ? extRef.node.shape
+          : extRef.kind === "materialized"
+            ? extRef.storage.backendTensor.shape
+            : undefined;
       if (refShape && !shapesEqual(refShape, firstShape)) return null;
 
       externalInputRefs.push(extRef);
@@ -234,19 +253,31 @@ export async function executeReductionWithPreamble(
 
   let resultTensor: BackendTensor;
 
-  if (plan.preambleChain && plan.chainOps && plan.chainInputRefs && plan.chainInputDtypes) {
+  if (
+    plan.preambleChain &&
+    plan.chainOps &&
+    plan.chainInputRefs &&
+    plan.chainInputDtypes
+  ) {
     // Multi-op chain path
     const { sumDimWithPreambleChain } = await import("../backend/webgpu/index");
-    const inputStorages = plan.chainInputRefs.map(ref => getInputStorage(ref, backend));
-    const inputTensors = inputStorages.map(s => s.backendTensor);
+    const inputStorages = plan.chainInputRefs.map((ref) =>
+      getInputStorage(ref, backend),
+    );
+    const inputTensors = inputStorages.map((s) => s.backendTensor);
     resultTensor = sumDimWithPreambleChain(
-      inputTensors, plan.chainOps, plan.chainInputDtypes, payload ?? {},
+      inputTensors,
+      plan.chainOps,
+      plan.chainInputDtypes,
+      payload ?? {},
     );
   } else {
     // Single-op path
     const { sumDimWithPreamble } = await import("../backend/webgpu/index");
-    const elemInputStorages = plan.preambleNode.inputs.map(ref => getInputStorage(ref, backend));
-    const elemInputTensors = elemInputStorages.map(s => s.backendTensor);
+    const elemInputStorages = plan.preambleNode.inputs.map((ref) =>
+      getInputStorage(ref, backend),
+    );
+    const elemInputTensors = elemInputStorages.map((s) => s.backendTensor);
     resultTensor = sumDimWithPreamble(elemInputTensors, plan.op, payload ?? {});
   }
 
@@ -260,18 +291,26 @@ export async function executeReductionWithPreamble(
     } else {
       const dims = Array.isArray(dim) ? dim : [dim];
       const rank = inputShape.length;
-      reductionSize = dims.reduce((acc, d) => acc * inputShape[normalizeDim(d, rank)], 1);
+      reductionSize = dims.reduce(
+        (acc, d) => acc * inputShape[normalizeDim(d, rank)],
+        1,
+      );
     }
     const invSize = 1.0 / reductionSize;
     const sumResult = resultTensor;
-    const invSizeTensor = backend.ops.full ? backend.ops.full([], invSize) : backend.ops.tensorFromArray([invSize], []);
+    const invSizeTensor = backend.ops.full
+      ? backend.ops.full([], invSize)
+      : backend.ops.tensorFromArray([invSize], []);
     resultTensor = backend.ops.mul(sumResult, invSizeTensor);
     (sumResult as { destroy?: () => void }).destroy?.();
     (invSizeTensor as { destroy?: () => void }).destroy?.();
   }
 
   // Store result on the reduction node
-  plan.reductionNode.result = createStorageHandle(plan.reductionNode.device, resultTensor);
+  plan.reductionNode.result = createStorageHandle(
+    plan.reductionNode.device,
+    resultTensor,
+  );
 }
 
 // ============================================================================
@@ -317,7 +356,11 @@ export function detectReductionEpilogue(
   externalNodeIds?: Set<number>,
 ): ReductionEpiloguePlan | null {
   const reductionNode = nodes[startIdx];
-  if (reductionNode.op !== "sum" && reductionNode.op !== "mean" && reductionNode.op !== "max") {
+  if (
+    reductionNode.op !== "sum" &&
+    reductionNode.op !== "mean" &&
+    reductionNode.op !== "max"
+  ) {
     return null;
   }
 
@@ -335,11 +378,20 @@ export function detectReductionEpilogue(
     // Check that the candidate's input is a pending ref to the current chain node
     let chainInputIdx = 0;
     const primaryInput = nextNode.inputs[0];
-    if (primaryInput.kind !== "pending" || primaryInput.node.id !== currentNode.id) {
+    if (
+      primaryInput.kind !== "pending" ||
+      primaryInput.node.id !== currentNode.id
+    ) {
       // For commutative binary ops, check inputs[1]
-      if ((nextNode.op === "add" || nextNode.op === "mul") && nextNode.inputs.length === 2) {
+      if (
+        (nextNode.op === "add" || nextNode.op === "mul") &&
+        nextNode.inputs.length === 2
+      ) {
         const altInput = nextNode.inputs[1];
-        if (altInput.kind === "pending" && altInput.node.id === currentNode.id) {
+        if (
+          altInput.kind === "pending" &&
+          altInput.node.id === currentNode.id
+        ) {
           chainInputIdx = 1;
         } else {
           break;
@@ -364,7 +416,10 @@ export function detectReductionEpilogue(
         outputDtype = payload.dtype;
         matched = true;
       }
-    } else if ((nextNode.op === "add" || nextNode.op === "mul") && nextNode.inputs.length === 2) {
+    } else if (
+      (nextNode.op === "add" || nextNode.op === "mul") &&
+      nextNode.inputs.length === 2
+    ) {
       if (additionalInputCount >= 4) break;
       const secondInput = nextNode.inputs[chainInputIdx === 0 ? 1 : 0];
       // The external input must have the same shape as the reduction output
@@ -377,19 +432,31 @@ export function detectReductionEpilogue(
       }
       if (secondShape && !shapesEqual(secondShape, currentNode.shape)) break;
 
-      epilogueOps.push({ kind: "binary", op: nextNode.op, inputIndex: additionalInputCount });
+      epilogueOps.push({
+        kind: "binary",
+        op: nextNode.op,
+        inputIndex: additionalInputCount,
+      });
       epilogueInputRefs.push(secondInput);
       additionalInputCount++;
       matched = true;
     } else if (
-      nextNode.op === "relu" || nextNode.op === "silu" || nextNode.op === "sigmoid" ||
-      nextNode.op === "tanh" || nextNode.op === "neg" || nextNode.op === "abs" ||
-      nextNode.op === "exp" || nextNode.op === "log" || nextNode.op === "sqrt"
+      nextNode.op === "relu" ||
+      nextNode.op === "silu" ||
+      nextNode.op === "sigmoid" ||
+      nextNode.op === "tanh" ||
+      nextNode.op === "neg" ||
+      nextNode.op === "abs" ||
+      nextNode.op === "exp" ||
+      nextNode.op === "log" ||
+      nextNode.op === "sqrt"
     ) {
       epilogueOps.push({ kind: "unary", op: nextNode.op });
       matched = true;
     } else if (nextNode.op === "gelu") {
-      const geluPayload = nextNode.payload as { approximate?: string } | undefined;
+      const geluPayload = nextNode.payload as
+        | { approximate?: string }
+        | undefined;
       if (geluPayload?.approximate === "tanh") {
         epilogueOps.push({ kind: "gelu" });
       } else {
@@ -424,15 +491,20 @@ export async function executeReductionWithEpilogue(
   plan: ReductionEpiloguePlan,
   backend: Backend,
 ): Promise<void> {
-  const { sumWithEpilogue, maxWithEpilogue, meanWithEpilogue } = await import("../backend/webgpu/index");
+  const { sumWithEpilogue, maxWithEpilogue, meanWithEpilogue } = await import(
+    "../backend/webgpu/index"
+  );
 
   // Resolve reduction input
-  const reductionInputStorage = getInputStorage(plan.reductionNode.inputs[0], backend);
+  const reductionInputStorage = getInputStorage(
+    plan.reductionNode.inputs[0],
+    backend,
+  );
   const reductionInputTensor = reductionInputStorage.backendTensor;
 
   // Resolve epilogue external inputs
   const epilogueInputTensors = plan.epilogueInputRefs.map(
-    ref => getInputStorage(ref, backend).backendTensor,
+    (ref) => getInputStorage(ref, backend).backendTensor,
   );
 
   const payload = plan.reductionNode.payload as
@@ -442,23 +514,35 @@ export async function executeReductionWithEpilogue(
   let resultTensor: BackendTensor;
   if (plan.reductionNode.op === "max") {
     resultTensor = maxWithEpilogue(
-      reductionInputTensor, payload ?? {},
-      plan.epilogueOps, epilogueInputTensors, plan.outputDtype,
+      reductionInputTensor,
+      payload ?? {},
+      plan.epilogueOps,
+      epilogueInputTensors,
+      plan.outputDtype,
     );
   } else if (plan.reductionNode.op === "mean") {
     resultTensor = meanWithEpilogue(
-      reductionInputTensor, payload ?? {},
-      plan.epilogueOps, epilogueInputTensors, plan.outputDtype,
+      reductionInputTensor,
+      payload ?? {},
+      plan.epilogueOps,
+      epilogueInputTensors,
+      plan.outputDtype,
     );
   } else {
     resultTensor = sumWithEpilogue(
-      reductionInputTensor, payload ?? {},
-      plan.epilogueOps, epilogueInputTensors, plan.outputDtype,
+      reductionInputTensor,
+      payload ?? {},
+      plan.epilogueOps,
+      epilogueInputTensors,
+      plan.outputDtype,
     );
   }
 
   // Store result on the FINAL output node (not the reduction node)
-  plan.outputNode.result = createStorageHandle(plan.outputNode.device, resultTensor);
+  plan.outputNode.result = createStorageHandle(
+    plan.outputNode.device,
+    resultTensor,
+  );
 }
 
 // ============================================================================
@@ -523,12 +607,20 @@ export function detectReductionFusion(
   if (nodes[reductionIdx] !== preamblePlan.reductionNode) return null;
 
   // Only support sum/mean for combined fusion (not max — max has different accumulator semantics)
-  if (preamblePlan.reductionNode.op !== "sum" && preamblePlan.reductionNode.op !== "mean") {
+  if (
+    preamblePlan.reductionNode.op !== "sum" &&
+    preamblePlan.reductionNode.op !== "mean"
+  ) {
     return null;
   }
 
   // Try to detect an epilogue starting from the reduction node
-  const epiloguePlan = detectReductionEpilogue(nodes, reductionIdx, consumerCount, externalNodeIds);
+  const epiloguePlan = detectReductionEpilogue(
+    nodes,
+    reductionIdx,
+    consumerCount,
+    externalNodeIds,
+  );
   if (!epiloguePlan) return null;
 
   // Build the preamble ops and input refs
@@ -537,7 +629,12 @@ export function detectReductionFusion(
   let preambleInputDtypes: DType[];
   let preambleChain: LazyIRNode[];
 
-  if (preamblePlan.preambleChain && preamblePlan.chainOps && preamblePlan.chainInputRefs && preamblePlan.chainInputDtypes) {
+  if (
+    preamblePlan.preambleChain &&
+    preamblePlan.chainOps &&
+    preamblePlan.chainInputRefs &&
+    preamblePlan.chainInputDtypes
+  ) {
     // Multi-op chain
     preambleOps = preamblePlan.chainOps;
     preambleInputRefs = preamblePlan.chainInputRefs;
@@ -545,10 +642,12 @@ export function detectReductionFusion(
     preambleChain = preamblePlan.preambleChain;
   } else {
     // Single-op preamble — wrap into chain format
-    preambleOps = [{
-      op: getChainOpName(preamblePlan.preambleNode),
-      arity: preamblePlan.arity,
-    }];
+    preambleOps = [
+      {
+        op: getChainOpName(preamblePlan.preambleNode),
+        arity: preamblePlan.arity,
+      },
+    ];
     preambleInputRefs = [...preamblePlan.preambleNode.inputs];
     preambleInputDtypes = preamblePlan.preambleNode.inputs.map(getRefDtype);
     preambleChain = [preamblePlan.preambleNode];
@@ -590,12 +689,12 @@ export async function executeReductionWithFusion(
 
   // Resolve preamble input storages
   const preambleInputTensors = plan.preambleInputRefs.map(
-    ref => getInputStorage(ref, backend).backendTensor,
+    (ref) => getInputStorage(ref, backend).backendTensor,
   );
 
   // Resolve epilogue input storages
   const epilogueInputTensors = plan.epilogueInputRefs.map(
-    ref => getInputStorage(ref, backend).backendTensor,
+    (ref) => getInputStorage(ref, backend).backendTensor,
   );
 
   const payload = plan.reductionNode.payload as
@@ -614,5 +713,8 @@ export async function executeReductionWithFusion(
   );
 
   // Store result on the FINAL output node
-  plan.outputNode.result = createStorageHandle(plan.outputNode.device, resultTensor);
+  plan.outputNode.result = createStorageHandle(
+    plan.outputNode.device,
+    resultTensor,
+  );
 }

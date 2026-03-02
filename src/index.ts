@@ -1,3 +1,17 @@
+// Tile-IR custom kernel API
+export {
+  type BindingSpec,
+  ceilDivGrid,
+  compileTileKernel,
+  createTileKernelDispatcher,
+  type DataType,
+  elementwiseGrid,
+  KernelContext,
+  singleWorkgroup,
+  type TileKernelInstance,
+  type TileKernelSpec,
+  type UniformType,
+} from "./backend/webgpu";
 export * from "./engine";
 export {
   type DeviceKind,
@@ -7,28 +21,12 @@ export {
   Torchlette,
   torch,
 } from "./frontend";
+export * as nn from "./nn";
 export {
   Adam,
   type AdamOptions,
-  SGD,
-  type SGDOptions,
   GradScaler,
   type GradScalerOptions,
+  SGD,
+  type SGDOptions,
 } from "./optim";
-export * as nn from "./nn";
-
-// Tile-IR custom kernel API
-export {
-  type TileKernelSpec,
-  type BindingSpec,
-  type DataType,
-  type UniformType,
-  KernelContext,
-  elementwiseGrid,
-  ceilDivGrid,
-  singleWorkgroup,
-  compileTileKernel,
-  createTileKernelDispatcher,
-  type TileKernelInstance,
-} from "./backend/webgpu";
-

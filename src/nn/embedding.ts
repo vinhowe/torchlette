@@ -3,9 +3,9 @@
  * Similar to PyTorch's nn.Embedding.
  */
 
-import type { Tensor, Torchlette, DeviceKind } from "../frontend";
-import { Module } from "./module";
 import { sizeOf } from "../core/shape";
+import type { DeviceKind, Tensor, Torchlette } from "../frontend";
+import { Module } from "./module";
 
 export type EmbeddingOptions = {
   /** Device to create parameters on */

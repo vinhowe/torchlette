@@ -1,10 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { Torchlette } from "../src";
-import {
-  getWebGPUInitError,
-  initWebGPU,
-} from "../src/backend/webgpu";
+import { getWebGPUInitError, initWebGPU } from "../src/backend/webgpu";
 import { cpuOnly } from "./helpers/webgpu";
 
 describe.skipIf(cpuOnly)("webgpu backend", () => {

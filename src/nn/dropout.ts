@@ -36,7 +36,9 @@ export class Dropout extends Module {
     super(api);
     this.p = options?.p ?? 0.5;
     if (this.p < 0 || this.p > 1) {
-      throw new Error(`Dropout probability must be between 0 and 1, got ${this.p}`);
+      throw new Error(
+        `Dropout probability must be between 0 and 1, got ${this.p}`,
+      );
     }
   }
 

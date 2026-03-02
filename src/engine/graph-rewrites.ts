@@ -49,7 +49,10 @@ export function runRewritePasses(ctx: RewriteContext): Set<number> {
  * is a no-op. Redirect all consumers to use the cast's input directly.
  * This can enable fusion chains that were previously broken by the cast.
  */
-function eliminateIdentityCasts(ctx: RewriteContext, bypassed: Set<number>): void {
+function eliminateIdentityCasts(
+  ctx: RewriteContext,
+  bypassed: Set<number>,
+): void {
   for (const node of ctx.planNodes) {
     if (node.op !== "cast") continue;
     if (node.result) continue; // Already computed
@@ -77,7 +80,13 @@ function eliminateIdentityCasts(ctx: RewriteContext, bypassed: Set<number>): voi
 }
 
 /** Ops that produce non-contiguous output (views). All other ops produce contiguous output. */
-const VIEW_OPS = new Set(["reshape", "transpose", "permute", "expand", "narrow"]);
+const VIEW_OPS = new Set([
+  "reshape",
+  "transpose",
+  "permute",
+  "expand",
+  "narrow",
+]);
 
 /**
  * Eliminate redundant contiguous: contiguous(x) → x when x always produces contiguous output.
@@ -87,7 +96,10 @@ const VIEW_OPS = new Set(["reshape", "transpose", "permute", "expand", "narrow"]
  * data sources) always produce contiguous tensors, so contiguous after them
  * is a no-op.
  */
-function eliminateRedundantContiguous(ctx: RewriteContext, bypassed: Set<number>): void {
+function eliminateRedundantContiguous(
+  ctx: RewriteContext,
+  bypassed: Set<number>,
+): void {
   for (const node of ctx.planNodes) {
     if (node.op !== "contiguous") continue;
     if (node.result) continue;
@@ -135,10 +147,10 @@ function redirectConsumers(
     // Also update the consumers list
     const inputConsumers = ctx.consumers.get(inputId) ?? [];
     // Remove node from input's consumers
-    const filtered = inputConsumers.filter(c => c.id !== node.id);
+    const filtered = inputConsumers.filter((c) => c.id !== node.id);
     // Add node's consumers to input's consumers
     for (const consumer of nodeConsumers) {
-      if (!filtered.some(c => c.id === consumer.id)) {
+      if (!filtered.some((c) => c.id === consumer.id)) {
         filtered.push(consumer);
       }
     }
@@ -177,7 +189,10 @@ function tryGetScalarValue(ref: LazyRef): number | null {
  * These appear in AMP scaling paths, optimizer computations, and
  * autograd where scalar constants flow through the graph.
  */
-function eliminateAlgebraicIdentities(ctx: RewriteContext, bypassed: Set<number>): void {
+function eliminateAlgebraicIdentities(
+  ctx: RewriteContext,
+  bypassed: Set<number>,
+): void {
   for (const node of ctx.planNodes) {
     if (node.result) continue;
     if (node.inputs.length !== 2) continue;
@@ -198,7 +213,6 @@ function eliminateAlgebraicIdentities(ctx: RewriteContext, bypassed: Set<number>
       if (val0 === 1) {
         redirectConsumers(node, ref1, ctx);
         bypassed.add(node.id);
-        continue;
       }
     } else if (node.op === "add") {
       // add(x, 0) → x
@@ -213,7 +227,6 @@ function eliminateAlgebraicIdentities(ctx: RewriteContext, bypassed: Set<number>
       if (val0 === 0) {
         redirectConsumers(node, ref1, ctx);
         bypassed.add(node.id);
-        continue;
       }
     } else if (node.op === "sub") {
       // sub(x, 0) → x
@@ -221,7 +234,6 @@ function eliminateAlgebraicIdentities(ctx: RewriteContext, bypassed: Set<number>
       if (val1 === 0) {
         redirectConsumers(node, ref0, ctx);
         bypassed.add(node.id);
-        continue;
       }
     } else if (node.op === "div") {
       // div(x, 1) → x
@@ -229,7 +241,6 @@ function eliminateAlgebraicIdentities(ctx: RewriteContext, bypassed: Set<number>
       if (val1 === 1) {
         redirectConsumers(node, ref0, ctx);
         bypassed.add(node.id);
-        continue;
       }
     }
   }

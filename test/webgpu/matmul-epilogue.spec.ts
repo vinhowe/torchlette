@@ -130,7 +130,10 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmul(a, b, false, false, undefined, { epilogue, epilogueInputs: [bias] });
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [bias],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);
@@ -160,7 +163,10 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmul(a, b, false, false, undefined, { epilogue, epilogueInputs: [bias] });
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [bias],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);
@@ -189,7 +195,10 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmul(a, b, false, false, undefined, { epilogue, epilogueInputs: [] });
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);
@@ -217,7 +226,10 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmul(a, b, false, false, undefined, { epilogue, epilogueInputs: [] });
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);
@@ -245,7 +257,10 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmul(a, b, false, false, undefined, { epilogue, epilogueInputs: [] });
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);
@@ -276,7 +291,10 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmul(a, b, false, false, undefined, { epilogue, epilogueInputs: [bias] });
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [bias],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);
@@ -307,7 +325,10 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmul(a, b, false, false, undefined, { epilogue, epilogueInputs: [bias] });
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [bias],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);
@@ -339,7 +360,10 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmul(a, b, false, false, undefined, { epilogue, epilogueInputs: [bias] });
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [bias],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);

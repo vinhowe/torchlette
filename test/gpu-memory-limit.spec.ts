@@ -4,11 +4,11 @@
  */
 import { beforeEach, describe, expect, it } from "vitest";
 import {
-  gpuMemoryTracker,
   GPUMemoryLimitExceededError,
-  setGPUMemoryLimit,
   getGPUMemoryLimit,
   getGPUMemoryStats,
+  gpuMemoryTracker,
+  setGPUMemoryLimit,
 } from "../src/backend/webgpu/memory-tracker";
 
 describe("GPU Memory Tracker", () => {
@@ -31,7 +31,9 @@ describe("GPU Memory Tracker", () => {
 
   it("throws when setting invalid memory limit", () => {
     expect(() => setGPUMemoryLimit(0)).toThrow("Memory limit must be positive");
-    expect(() => setGPUMemoryLimit(-100)).toThrow("Memory limit must be positive");
+    expect(() => setGPUMemoryLimit(-100)).toThrow(
+      "Memory limit must be positive",
+    );
   });
 
   it("tracks allocations correctly", () => {
