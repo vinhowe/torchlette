@@ -251,8 +251,6 @@ export type DCEResult = {
  * 3. Keep all effectful nodes
  */
 export function performDCE(graph: IRGraph, outputNodeIds: number[]): DCEResult {
-  const outputSet = new Set(outputNodeIds);
-  const nodeById = new Map(graph.nodes.map((n) => [n.id, n]));
   const reachable = new Set<number>();
 
   // Mark effectful nodes as always reachable

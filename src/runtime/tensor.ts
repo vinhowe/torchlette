@@ -73,17 +73,6 @@ export function materializePendingTensors(
 }
 
 /**
- * Get the number of pending tensors (for debugging/testing).
- */
-function getPendingTensorCount(): number {
-  let count = 0;
-  for (const tensors of pendingTensorsByNodeId.values()) {
-    count += tensors.size;
-  }
-  return count;
-}
-
-/**
  * Get all pending tensors (for forcing before cleanup).
  */
 export function getAllPendingTensors(): Tensor[] {

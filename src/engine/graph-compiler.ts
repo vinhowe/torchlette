@@ -15,7 +15,7 @@
  */
 
 import type { DType } from "../backend/types";
-import type { LazyIRNode, LazyRef } from "./lazy-types";
+import type { LazyIRNode } from "./lazy-types";
 import type { MatmulPrologueInfo } from "./matmul-epilogue";
 import type { CompoundMatch } from "./compound-patterns";
 import { detectCompoundPatterns } from "./compound-patterns";

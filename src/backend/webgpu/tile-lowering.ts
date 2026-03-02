@@ -952,7 +952,6 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
   const aSmemStride = stmt.aSmemStride ?? aCols;  // stride for A in shared memory
   const bSmemStride = stmt.bSmemStride ?? bCols;  // stride for B in shared memory
   const innerDim = aCols;         // K dimension (A cols = B rows for non-transposed)
-  const isAccumulate = !!accName; // dotAccum vs dot
 
   const result: Statement[] = [];
 
@@ -1222,7 +1221,7 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
  *   for j in 0..aCols: p = a[j]; for d in 0..bCols: result[d] += p * b_smem[j*bCols + d];
  */
 function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
-  const { aName, bName, resultName, accName, aRows, aCols, bRows, bCols } = stmt;
+  const { aName, bName, resultName, aRows, aCols, bCols } = stmt;
   const bStride = stmt.bSmemStride ?? bCols;  // stride for B in shared memory
   const result: Statement[] = [];
   const outCols = bCols;
