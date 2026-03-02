@@ -29,24 +29,6 @@ export {
 export type { Backend, BackendOps } from "../backend/types";
 export type { RuntimeEngineOptions } from "../runtime/engine";
 export { RuntimeEngine } from "../runtime/engine";
-export {
-  add as runtimeAdd,
-  cpu as runtimeCpu,
-  expand as runtimeExpand,
-  gather as runtimeGather,
-  item as runtimeItem,
-  matmul as runtimeMatmul,
-  mean as runtimeMean,
-  mul as runtimeMul,
-  relu as runtimeRelu,
-  reshape as runtimeReshape,
-  scatterAdd as runtimeScatterAdd,
-  sqrt as runtimeSqrt,
-  sub as runtimeSub,
-  sum as runtimeSum,
-  tensorFromArray as runtimeTensorFromArray,
-  transpose as runtimeTranspose,
-} from "../runtime/engine-facade";
 export type { BaseId } from "../runtime/tensor";
 export { Tensor as RuntimeTensor } from "../runtime/tensor";
 export type {
