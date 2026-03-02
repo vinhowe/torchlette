@@ -320,6 +320,20 @@ export function dispatchUnary(
 }
 
 /**
+ * Resolve a matmul input: detect simple transpose to avoid materialization,
+ * or ensure contiguity.  Returns the effective tensor, transpose flag, and
+ * whether a contiguous copy was allocated.
+ */
+function resolveMatmulInput(t: WebGPUTensor, trans: boolean) {
+  const origShape = !trans ? detectSimpleTranspose(t) : null;
+  if (origShape) {
+    return { tensor: createTensor(origShape, t.buffer, undefined, 0, t.dtype, false), trans: true, wasCopied: false };
+  }
+  const contig = ensureContiguous(t);
+  return { tensor: contig, trans, wasCopied: contig !== t };
+}
+
+/**
  * Prepare matmul inputs: detect transposes, ensure contiguity,
  * compute output shape, extract M/K/N, and compute batch strides.
  */
@@ -329,33 +343,10 @@ function prepareMatmulInputs(
   transA: boolean,
   transB: boolean,
 ) {
-  // Try to detect simple last-2-dim transposes to avoid contiguous() materialization.
-  // If detected, we use the original contiguous buffer and flip the transpose flag.
-  let effectiveA: WebGPUTensor = a;
-  let effectiveTransA = transA;
-  let aWasCopied = false;
-
-  const aOrigShape = !transA ? detectSimpleTranspose(a) : null;
-  if (aOrigShape) {
-    effectiveA = createTensor(aOrigShape, a.buffer, undefined, 0, a.dtype, false);
-    effectiveTransA = true;
-  } else {
-    effectiveA = ensureContiguous(a);
-    aWasCopied = effectiveA !== a;
-  }
-
-  let effectiveB: WebGPUTensor = b;
-  let effectiveTransB = transB;
-  let bWasCopied = false;
-
-  const bOrigShape = !transB ? detectSimpleTranspose(b) : null;
-  if (bOrigShape) {
-    effectiveB = createTensor(bOrigShape, b.buffer, undefined, 0, b.dtype, false);
-    effectiveTransB = true;
-  } else {
-    effectiveB = ensureContiguous(b);
-    bWasCopied = effectiveB !== b;
-  }
+  const rA = resolveMatmulInput(a, transA);
+  const rB = resolveMatmulInput(b, transB);
+  const effectiveA = rA.tensor, effectiveTransA = rA.trans, aWasCopied = rA.wasCopied;
+  const effectiveB = rB.tensor, effectiveTransB = rB.trans, bWasCopied = rB.wasCopied;
 
   // Compute output shape with transpose and batch broadcasting
   const outShape = computeMatmulOutputShape(

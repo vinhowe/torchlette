@@ -1156,6 +1156,17 @@ export function hoistLoopInvariants(stmts: Statement[]): Statement[] {
 // Dead Code Elimination
 // ============================================================================
 
+/** Map a function over all nested bodies (forRange, forStride, if, ifElse). */
+function mapStmtBodies(stmts: Statement[], fn: (body: Statement[]) => Statement[]): Statement[] {
+  return stmts.map(s => {
+    switch (s.kind) {
+      case "forRange": case "forStride": case "if": return { ...s, body: fn(s.body) } as Statement;
+      case "ifElse": return { ...s, body: fn(s.body), elseBody: fn(s.elseBody) } as Statement;
+      default: return s;
+    }
+  });
+}
+
 /**
  * Remove `let` statements whose bindings are never referenced.
  * Applies bottom-up: inner scopes are processed first, then outer scopes
@@ -1163,15 +1174,7 @@ export function hoistLoopInvariants(stmts: Statement[]): Statement[] {
  */
 function eliminateDeadCode(stmts: Statement[]): Statement[] {
   // Step 1: Recurse into nested bodies (bottom-up)
-  const processed = stmts.map(s => {
-    switch (s.kind) {
-      case "forRange": return { ...s, body: eliminateDeadCode(s.body) } as Statement;
-      case "forStride": return { ...s, body: eliminateDeadCode(s.body) } as Statement;
-      case "if":       return { ...s, body: eliminateDeadCode(s.body) } as Statement;
-      case "ifElse":   return { ...s, body: eliminateDeadCode(s.body), elseBody: eliminateDeadCode(s.elseBody) } as Statement;
-      default: return s;
-    }
-  });
+  const processed = mapStmtBodies(stmts, eliminateDeadCode);
 
   // Step 2: Collect names used by non-let statements (including nested bodies)
   const usedNames = new Set<string>();
@@ -1430,15 +1433,7 @@ export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Se
   }
 
   // Phase 3: Recurse into child scopes (top-down: children see parent bindings)
-  const processed = stmts.map(s => {
-    switch (s.kind) {
-      case "forRange": return { ...s, body: autoCSE(s.body, childBoundIds) } as Statement;
-      case "forStride": return { ...s, body: autoCSE(s.body, childBoundIds) } as Statement;
-      case "if": return { ...s, body: autoCSE(s.body, childBoundIds) } as Statement;
-      case "ifElse": return { ...s, body: autoCSE(s.body, childBoundIds), elseBody: autoCSE(s.elseBody, childBoundIds) } as Statement;
-      default: return s;
-    }
-  });
+  const processed = mapStmtBodies(stmts, body => autoCSE(body, childBoundIds));
 
   if (toBind.length === 0) return processed;
   toBind.sort((a, b) => a.firstIdx - b.firstIdx);

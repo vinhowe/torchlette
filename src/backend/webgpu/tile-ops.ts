@@ -483,14 +483,27 @@ export class BlockOps {
 
   // ---- Dot ----
 
+  /** Push a blockDot statement with common fields derived from a and b. */
+  private _pushBlockDot(a: Block, b: Block, resultName: string, accName?: string): void {
+    this.ctx.pushStatement({
+      kind: "blockDot",
+      aName: a.name, bName: b.name, resultName,
+      ...(accName !== undefined && { accName }),
+      aPlacement: a.placement, bPlacement: b.placement,
+      bTransposed: b._transposed,
+      aRows: a.rows, aCols: a.cols,
+      bRows: b._origRows, bCols: b._origCols,
+      threadTileM: this.threadTileM, threadTileN: this.threadTileN,
+      aSmemStride: a.placement === "shared" ? a.smemStride : undefined,
+      bSmemStride: b.placement === "shared" ? b.smemStride : undefined,
+    });
+  }
+
   /** Unified dot product: operand placements determine lowering. */
   dot(a: Block, b: Block): Block {
     const name = this.freshName();
-    // Result shape depends on the dot pattern
-    let outRows: number;
-    let outCols: number;
+    let outRows: number, outCols: number;
     if (a.placement === "shared" && b.placement === "shared") {
-      // Outer product: result is per-thread [threadTileM × threadTileN]
       if (!this.threadTileM || !this.threadTileN) {
         throw new Error("shared×shared dot requires threadTile in BlockOps config");
       }
@@ -500,54 +513,14 @@ export class BlockOps {
       outRows = a.rows;
       outCols = b._transposed ? b._origRows : b.cols;
     }
-    // Allocate result block
-    this.ctx.pushStatement({
-      kind: "blockAlloc",
-      name,
-      rows: outRows,
-      cols: outCols,
-      elemType: "f32",
-    });
-    this.ctx.pushStatement({
-      kind: "blockDot",
-      aName: a.name,
-      bName: b.name,
-      resultName: name,
-      aPlacement: a.placement,
-      bPlacement: b.placement,
-      bTransposed: b._transposed,
-      aRows: a.rows,
-      aCols: a.cols,
-      bRows: b._origRows,
-      bCols: b._origCols,
-      threadTileM: this.threadTileM,
-      threadTileN: this.threadTileN,
-      aSmemStride: a.placement === "shared" ? a.smemStride : undefined,
-      bSmemStride: b.placement === "shared" ? b.smemStride : undefined,
-    });
+    this.ctx.pushStatement({ kind: "blockAlloc", name, rows: outRows, cols: outCols, elemType: "f32" });
+    this._pushBlockDot(a, b, name);
     return new Block("register", outRows, outCols, name, this.ctx, this);
   }
 
   /** Dot with accumulation: acc += a @ b. */
   dotAccum(a: Block, b: Block, acc: Block): void {
-    this.ctx.pushStatement({
-      kind: "blockDot",
-      aName: a.name,
-      bName: b.name,
-      resultName: acc.name,
-      accName: acc.name,
-      aPlacement: a.placement,
-      bPlacement: b.placement,
-      bTransposed: b._transposed,
-      aRows: a.rows,
-      aCols: a.cols,
-      bRows: b._origRows,
-      bCols: b._origCols,
-      threadTileM: this.threadTileM,
-      threadTileN: this.threadTileN,
-      aSmemStride: a.placement === "shared" ? a.smemStride : undefined,
-      bSmemStride: b.placement === "shared" ? b.smemStride : undefined,
-    });
+    this._pushBlockDot(a, b, acc.name, acc.name);
   }
 
   // ---- Store ----
