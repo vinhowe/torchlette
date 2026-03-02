@@ -1049,47 +1049,19 @@ export function validateBarriers(stmts: Statement[]): string[] {
 function collectModifiedNames(stmts: Statement[], names: Set<string>): void {
   for (const stmt of stmts) {
     switch (stmt.kind) {
-      case "assign":
-        names.add(stmt.name);
-        break;
-      case "addAssign":
-        names.add(stmt.name);
-        break;
-      case "indexAssign":
-        names.add(stmt.arrayName);
-        break;
-      case "indexAddAssign":
-        names.add(stmt.arrayName);
-        break;
-      case "sharedWrite":
-        names.add(stmt.arrayName);
-        break;
-      case "vec4ArrayWrite":
-      case "vec4ArrayAddAssign":
-        names.add(stmt.arrayName);
-        break;
-      case "var":
-        names.add(stmt.name);
-        break;
+      case "assign": case "addAssign": case "var":
+        names.add(stmt.name); break;
+      case "indexAssign": case "indexAddAssign":
+      case "sharedWrite": case "vec4ArrayWrite": case "vec4ArrayAddAssign":
+        names.add(stmt.arrayName); break;
       case "atomicCAS":
-        names.add(stmt.oldValueVar);
-        names.add(stmt.exchangedVar);
-        break;
-      case "forRange":
-        names.add(stmt.varName);
-        collectModifiedNames(stmt.body, names);
-        break;
-      case "forStride":
-        names.add(stmt.varName);
-        collectModifiedNames(stmt.body, names);
-        break;
+        names.add(stmt.oldValueVar); names.add(stmt.exchangedVar); break;
+      case "forRange": case "forStride":
+        names.add(stmt.varName); collectModifiedNames(stmt.body, names); break;
       case "if":
-        collectModifiedNames(stmt.body, names);
-        break;
+        collectModifiedNames(stmt.body, names); break;
       case "ifElse":
-        collectModifiedNames(stmt.body, names);
-        collectModifiedNames(stmt.elseBody, names);
-        break;
+        collectModifiedNames(stmt.body, names); collectModifiedNames(stmt.elseBody, names); break;
     }
   }
 }
@@ -1137,13 +1109,6 @@ export function hoistLoopInvariants(stmts: Statement[]): Statement[] {
       variantNames.add(stmt.varName); // Loop variable is always variant
       collectModifiedNames(innerHoisted, variantNames);
 
-      // Check if any shared array is written in the loop
-      const sharedWritten = new Set<string>();
-      collectSharedWriteNames(innerHoisted, sharedWritten);
-
-      // Add shared written names to variant set so sharedRead of them won't hoist
-      for (const sw of sharedWritten) variantNames.add(sw);
-
       // Partition body into hoistable and non-hoistable
       const hoisted: Statement[] = [];
       const remaining: Statement[] = [];
@@ -1185,22 +1150,6 @@ export function hoistLoopInvariants(stmts: Statement[]): Statement[] {
   }
 
   return result;
-}
-
-/** Collect shared array names written in a statement list. */
-function collectSharedWriteNames(stmts: Statement[], names: Set<string>): void {
-  for (const stmt of stmts) {
-    if (stmt.kind === "sharedWrite") {
-      names.add(stmt.arrayName);
-    } else if (stmt.kind === "forRange" || stmt.kind === "forStride") {
-      collectSharedWriteNames(stmt.body, names);
-    } else if (stmt.kind === "if") {
-      collectSharedWriteNames(stmt.body, names);
-    } else if (stmt.kind === "ifElse") {
-      collectSharedWriteNames(stmt.body, names);
-      collectSharedWriteNames(stmt.elseBody, names);
-    }
-  }
 }
 
 // ============================================================================
@@ -1333,29 +1282,10 @@ function exprDepth(node: IRNode): number {
   }
 }
 
-/**
- * Collect all node IDs that are proper sub-expressions of a given node.
- */
+/** Collect all node IDs that are proper sub-expressions of a given node. */
 function collectSubExprIds(node: IRNode, ids: Set<number>): void {
   if (node.id < 0 || isTrivialNode(node)) return;
-  switch (node.kind) {
-    case "binary":
-      ids.add(node.lhs.id); collectSubExprIds(node.lhs, ids);
-      ids.add(node.rhs.id); collectSubExprIds(node.rhs, ids);
-      break;
-    case "unary": case "cast": case "bitcast":
-      ids.add((node as any).input.id); collectSubExprIds((node as any).input, ids);
-      break;
-    case "cmp":
-      ids.add(node.lhs.id); collectSubExprIds(node.lhs, ids);
-      ids.add(node.rhs.id); collectSubExprIds(node.rhs, ids);
-      break;
-    case "select":
-      ids.add(node.condition.id); collectSubExprIds(node.condition, ids);
-      ids.add(node.trueVal.id); collectSubExprIds(node.trueVal, ids);
-      ids.add(node.falseVal.id); collectSubExprIds(node.falseVal, ids);
-      break;
-  }
+  forEachExprChild(node, child => { ids.add(child.id); collectSubExprIds(child, ids); });
 }
 
 /**
