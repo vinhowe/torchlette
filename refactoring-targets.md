@@ -115,3 +115,74 @@ Created `src/core/shape.ts` as canonical home for pure shape functions (`sizeOf`
 ## Target 19: Typed `BackendTensor` → `WebGPUTensor` Narrowing — DONE
 
 Added `asGPUTensor(tensor)` helper in `gpu-types.ts` to narrow `BackendTensor` to `WebGPUTensor` for typed property access (shape, strides, buffer, dtype, etc.). Removed 13 `as any` casts from `executor-lowered.ts` and 5 from `matmul-epilogue.ts`. Patterns removed: `(bt as any).shape`, `(resultTensor as any).shape = ...`, `asGPUTensor(matmulInputA.backendTensor)` replacing `(matmulInputA.backendTensor as any)`. Total `as any` count: 55→37.
+
+---
+
+## Future Work: Removed Subsystems and When to Revive Them
+
+These subsystems were removed during the op-streamlining refactoring (total −4,680 lines)
+because they had zero production callers. Notes on when they'd be needed again.
+
+### Cross-Device Transfers (§13, was `engine/cross-device.ts`)
+
+**What it was:** Lazy `tensor.to(device)` that deferred transfers until plan execution,
+transfer path resolution (direct / via-cpu / noop), multi-device graph analysis that
+auto-inserted transfer nodes, and `ensureSameDevice()` for mixed-device ops.
+
+**Current state:** A simple inline `to()` in `op-dispatch.ts` does eager CPU-readback +
+writeBuffer. Works fine for explicit user-requested transfers.
+
+**When you'd want the full subsystem back:**
+
+1. **Optimizer state offloading to CPU.** At scale (GPT-2 Medium+), Adam's momentum and
+   variance tensors (2× parameter count, f32) can exhaust GPU memory. The pattern: forward/
+   backward on GPU, then `grad.to("cpu")`, Adam step on CPU, `param.to("webgpu")` back.
+   Lazy transfers would let these batch into the plan graph instead of being eager round-trips.
+
+2. **Multi-GPU / multi-adapter.** If WebGPU ever exposes multiple adapters (or if we add a
+   second GPU backend), you'd need transfer path resolution to figure out optimal routes
+   between devices, and graph analysis to auto-insert transfers at device boundaries.
+
+3. **Compute/transfer overlap (prefetching).** A lazy `to()` scheduled early in the graph
+   could overlap data transfer with unrelated compute. The eager inline version blocks.
+
+4. **Quantized inference with CPU dequantization.** Weights stored on CPU in int4/int8,
+   dequantized to f16/f32 on GPU on demand. Needs lazy transfers to avoid eager copies
+   of the full weight set.
+
+**Complexity to re-implement:** Low-medium. The core is ~100 lines (lazy transfer node +
+path resolution). The deleted version was over-engineered with transfer statistics tracking,
+multi-hop path resolution, and graph rewriting that had no callers.
+
+### Memory Planning / Buffer Donation (§14, was `engine/memory-planning.ts`)
+
+**What it was:** Lifetime analysis to determine when intermediate buffers could be freed,
+buffer donation (reusing a dead input's buffer for an op's output), and a memory-planned
+executor that pre-allocated all buffers before execution.
+
+**Current state:** The buffer arena system + pool reservation fully replaced this. Arenas
+give stable buffer identity (critical for bind group caching and dispatch replay). Pool
+reservation pre-allocates by size class based on empirical demand. Early-release in
+`executeSequentialSegmentWithEarlyRelease` handles intra-plan buffer reclamation.
+
+**When you'd want donation back:** If GPU memory becomes scarce (larger models, longer
+sequences) and the pool reservation over-allocates. Donation would let an add op reuse
+its dead input buffer as output, reducing peak memory. But the arena system's stable
+identity is more valuable for performance than donation's memory savings — they conflict
+(donated buffers change identity each step, breaking bind group cache).
+
+### Compiled Regions (§8, was `engine/compiled-region.ts`)
+
+**What it was:** A staging system where `compile(() => { ... })` would trace a region,
+build an IR graph, cache the compiled result, and replay it on subsequent calls with
+new inputs. Included arg alias groups, state interface signatures, auto-externalize,
+functionalization, and region-exit persistence.
+
+**Current state:** The Engine class still has all the trace/staging infrastructure
+(used extensively by tests). The `CompiledRegion` class and its executor were the dead
+parts — no frontend path ever created one.
+
+**When you'd want it back:** If torch.compile()-style JIT compilation becomes a goal,
+where user code is traced once and replayed with optimized kernels. Currently, all
+optimization happens at the op level (fusion detection in plan execution, matmul epilogue
+chains, reduction preambles) rather than at the region level.
