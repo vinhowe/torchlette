@@ -442,6 +442,30 @@ export async function pretuneMatmulShapes(
   }
 }
 
+/** Shared pipeline-cache-or-compile logic for matmul and K-split reduction. */
+function cachedPipeline(
+  device: GPUDevice,
+  cache: Map<string, GPUComputePipeline>,
+  cacheKey: string,
+  generateShader: () => string,
+): GPUComputePipeline {
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+
+  const warmed = getWarmupPipeline(cacheKey);
+  if (warmed) { cache.set(cacheKey, warmed); return warmed; }
+
+  const shaderCode = generateShader();
+  recordPipeline(cacheKey, shaderCode);
+  const module = device.createShaderModule({ code: shaderCode });
+  const pipeline = device.createComputePipeline({
+    layout: "auto",
+    compute: { module, entryPoint: "main" },
+  });
+  cache.set(cacheKey, pipeline);
+  return pipeline;
+}
+
 /**
  * Get or create a compute pipeline for the given options.
  */
@@ -449,29 +473,11 @@ function getOrCreatePipeline(
   device: GPUDevice,
   options: CodegenOptions,
 ): GPUComputePipeline {
-  const cacheKey = getShaderCacheKey(options);
-  const cached = pipelineCache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  // Check warmup cache (pre-compiled via createComputePipelineAsync)
-  const warmed = getWarmupPipeline(cacheKey);
-  if (warmed) {
-    pipelineCache.set(cacheKey, warmed);
-    return warmed;
-  }
-
-  const shaderCode = generateTiledMatmulShaderTileIR(options);
-  recordPipeline(cacheKey, shaderCode);
-  const module = device.createShaderModule({ code: shaderCode });
-  const pipeline = device.createComputePipeline({
-    layout: "auto",
-    compute: { module, entryPoint: "main" },
-  });
-
-  pipelineCache.set(cacheKey, pipeline);
-  return pipeline;
+  return cachedPipeline(
+    device, pipelineCache,
+    getShaderCacheKey(options),
+    () => generateTiledMatmulShaderTileIR(options),
+  );
 }
 
 /**
@@ -572,27 +578,11 @@ function getOrCreateReductionPipeline(
   kSplitCount: number,
   outputDtype: DType,
 ): GPUComputePipeline {
-  const cacheKey = getKSplitReductionCacheKey(kSplitCount, outputDtype);
-  const cached = reductionPipelineCache.get(cacheKey);
-  if (cached) return cached;
-
-  // Check warmup cache (pre-compiled via createComputePipelineAsync)
-  const warmed = getWarmupPipeline(cacheKey);
-  if (warmed) {
-    reductionPipelineCache.set(cacheKey, warmed);
-    return warmed;
-  }
-
-  const shaderCode = generateKSplitReductionShaderTileIR(kSplitCount, outputDtype);
-  recordPipeline(cacheKey, shaderCode);
-  const module = device.createShaderModule({ code: shaderCode });
-  const pipeline = device.createComputePipeline({
-    layout: "auto",
-    compute: { module, entryPoint: "main" },
-  });
-
-  reductionPipelineCache.set(cacheKey, pipeline);
-  return pipeline;
+  return cachedPipeline(
+    device, reductionPipelineCache,
+    getKSplitReductionCacheKey(kSplitCount, outputDtype),
+    () => generateKSplitReductionShaderTileIR(kSplitCount, outputDtype),
+  );
 }
 
 /** Minimum workgroups before considering K-split. */

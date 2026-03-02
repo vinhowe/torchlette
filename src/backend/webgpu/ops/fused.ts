@@ -230,7 +230,7 @@ export function fusedCrossEntropyForward(
   // Destroy contiguous copies if created (deferred for GPU fence)
   if (logitsT !== logits) destroyCopy(logitsT);
   if (targetsT !== targets) destroyCopy(targetsT);
-  return createTensor([config.batchSize], outBuf, undefined, 0, "f32");
+  return createTensor([config.batchSize], outBuf);
 }
 
 export function fusedCrossEntropyBackward(
@@ -250,7 +250,7 @@ export function fusedCrossEntropyBackward(
   if (logitsT !== logits) destroyCopy(logitsT);
   if (targetsT !== targets) destroyCopy(targetsT);
   if (gradT !== gradOutput) destroyCopy(gradT);
-  return createTensor([config.batchSize, config.vocabSize], outBuf, undefined, 0, "f32");
+  return createTensor([config.batchSize, config.vocabSize], outBuf);
 }
 
 // ============================================================================
@@ -274,7 +274,7 @@ export function fusedLayerNormForward(
   if (xT !== x) destroyCopy(xT);
   if (weightT !== weight) destroyCopy(weightT);
   if (biasT !== bias) destroyCopy(biasT);
-  return createTensor(xT.shape.slice(), outBuf, undefined, 0, "f32");
+  return createTensor(xT.shape.slice(), outBuf);
 }
 
 export function fusedLayerNormBackwardGradX(
@@ -297,7 +297,7 @@ export function fusedLayerNormBackwardGradX(
   if (xT !== x) destroyCopy(xT);
   if (weightT !== weight) destroyCopy(weightT);
 
-  return createTensor(xT.shape.slice(), gradXBuf, undefined, 0, "f32");
+  return createTensor(xT.shape.slice(), gradXBuf);
 }
 
 export function fusedLayerNormBackwardGradWeightBias(
@@ -318,8 +318,8 @@ export function fusedLayerNormBackwardGradWeightBias(
 
   const shape = [config.featureDim];
   return {
-    gradWeight: createTensor(shape, result.gradWeightBuffer, undefined, 0, "f32", true),
-    gradBias: createTensor(shape, result.gradBiasBuffer, undefined, 0, "f32", true),
+    gradWeight: createTensor(shape, result.gradWeightBuffer),
+    gradBias: createTensor(shape, result.gradBiasBuffer),
   };
 }
 
@@ -340,7 +340,7 @@ export function fusedRMSNormForward(
   );
   if (xT !== x) destroyCopy(xT);
   if (weightT !== weight) destroyCopy(weightT);
-  return createTensor(xT.shape.slice(), outBuf, undefined, 0, "f32");
+  return createTensor(xT.shape.slice(), outBuf);
 }
 
 export function fusedRMSNormBackwardGradX(
@@ -359,7 +359,7 @@ export function fusedRMSNormBackwardGradX(
   if (goT !== gradOutput) destroyCopy(goT);
   if (xT !== x) destroyCopy(xT);
   if (wT !== weight) destroyCopy(wT);
-  return createTensor(xT.shape.slice(), outBuf, undefined, 0, "f32");
+  return createTensor(xT.shape.slice(), outBuf);
 }
 
 export function fusedRMSNormBackwardGradWeight(
@@ -376,7 +376,7 @@ export function fusedRMSNormBackwardGradWeight(
   );
   if (goT !== gradOutput) destroyCopy(goT);
   if (xT !== x) destroyCopy(xT);
-  return createTensor([config.featureDim], outBuf, undefined, 0, "f32");
+  return createTensor([config.featureDim], outBuf);
 }
 
 // ============================================================================
@@ -406,8 +406,8 @@ export function fusedAttentionForward(
   const outShape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
   const lseShape = [config.batchSize, config.numHeads, config.seqLen];
   return {
-    output: createTensor(outShape, outputBuffer, undefined, 0, "f32"),
-    logsumexp: createTensor(lseShape, logsumexpBuffer, undefined, 0, "f32"),
+    output: createTensor(outShape, outputBuffer),
+    logsumexp: createTensor(lseShape, logsumexpBuffer),
   };
 }
 
@@ -462,9 +462,9 @@ export function fusedAttentionBackward(
 
   const gradShape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
   return {
-    dQ: createTensor(gradShape, dQBuf, undefined, 0, "f32"),
-    dK: createTensor(gradShape, dKBuffer, undefined, 0, "f32"),
-    dV: createTensor(gradShape, dVBuffer, undefined, 0, "f32"),
+    dQ: createTensor(gradShape, dQBuf),
+    dK: createTensor(gradShape, dKBuffer),
+    dV: createTensor(gradShape, dVBuffer),
   };
 }
 

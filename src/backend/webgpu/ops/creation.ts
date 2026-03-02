@@ -39,14 +39,14 @@ export function tensorFromArray(values: number[] | Float32Array, shape: number[]
   if (getActiveArena()) {
     const buffer = resolveOutputBuffer(ctx.device, f32data.byteLength, []);
     profileApiCall("writeBuffer", () => ctx.queue.writeBuffer(buffer, 0, f32data));
-    return createTensor(shape, buffer, undefined, 0, "f32");
+    return createTensor(shape, buffer);
   }
   const buffer = createBufferWithData(
     ctx.device,
     f32data,
     ctx.queue,
   );
-  return createTensor(shape, buffer, undefined, 0, "f32");
+  return createTensor(shape, buffer);
 }
 
 /** Cached fill WGSL generated via tile-IR. */
@@ -84,7 +84,7 @@ export function zeros(shape: number[]): WebGPUTensor {
     }
   }
 
-  return createTensor(shape, buffer, undefined, 0, "f32");
+  return createTensor(shape, buffer);
 }
 
 /**
@@ -125,7 +125,7 @@ export function full(shape: number[], fillValue: number): WebGPUTensor {
   dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
   releaseParamsBuffer(paramsBuffer);
 
-  return createTensor(shape, outBuffer, undefined, 0, "f32");
+  return createTensor(shape, outBuffer);
 }
 
 /** Cached arange WGSL generated via tile-IR. */
@@ -167,7 +167,7 @@ export function arange(end: number, start = 0, step = 1): WebGPUTensor {
   dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
   releaseParamsBuffer(paramsBuffer);
 
-  return createTensor([numElements], outBuffer, undefined, 0, "f32");
+  return createTensor([numElements], outBuffer);
 }
 
 /** Cached triangular WGSL (tril/triu) generated via tile-IR. */
@@ -266,7 +266,7 @@ export function rand(shape: number[], seed: number): WebGPUTensor {
   dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
   releaseParamsBuffer(paramsBuffer);
 
-  return createTensor(shape, outBuffer, undefined, 0, "f32");
+  return createTensor(shape, outBuffer);
 }
 
 export function randn(shape: number[], seed: number): WebGPUTensor {
@@ -292,7 +292,7 @@ export function randn(shape: number[], seed: number): WebGPUTensor {
   dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
   releaseParamsBuffer(paramsBuffer);
 
-  return createTensor(shape, outBuffer, undefined, 0, "f32");
+  return createTensor(shape, outBuffer);
 }
 
 export function bernoulli(shape: number[], p: number, seed: number): WebGPUTensor {
@@ -318,7 +318,7 @@ export function bernoulli(shape: number[], p: number, seed: number): WebGPUTenso
   dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY);
   releaseParamsBuffer(paramsBuffer);
 
-  return createTensor(shape, outBuffer, undefined, 0, "f32");
+  return createTensor(shape, outBuffer);
 }
 
 /**
