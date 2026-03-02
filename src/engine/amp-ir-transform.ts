@@ -15,7 +15,6 @@ import type { DType } from "../backend/types";
 import {
   type AMPPolicy,
   type AutocastContext,
-  computeInputCasts,
   computeSelectGatedDtype,
   F16_ELIGIBLE_OPS,
   F32_REQUIRED_OPS,
