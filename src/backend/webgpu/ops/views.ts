@@ -592,6 +592,11 @@ export function ensureContiguous(tensor: WebGPUTensor): WebGPUTensor {
   return asGPUTensor(contiguous(tensor));
 }
 
+/** Shorthand: cast to WebGPUTensor + ensure contiguous in one call. */
+export function asContiguous(bt: import("../../types").BackendTensor): WebGPUTensor {
+  return ensureContiguous(asGPUTensor(bt));
+}
+
 /**
  * Select a contiguous sub-range along one dimension. Returns a view (zero GPU cost).
  * The returned tensor shares the same buffer with an adjusted offset.

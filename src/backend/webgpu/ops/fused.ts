@@ -29,7 +29,7 @@ import {
   profileApiCall, profileSubOpBegin, profileSubOpEnd,
 } from "../profiler";
 import { gpuMemoryTracker } from "../memory-tracker";
-import { ensureContiguous } from "./views";
+import { asContiguous, ensureContiguous } from "./views";
 import { dispatchAdamStep as dispatchAdamStepKernel } from "../adam-kernel";
 import { dispatchUnscaleGrad as dispatchUnscaleGradKernel, allocateInfFlagBuffer, readInfFlag } from "../unscale-kernel";
 import { dispatchCrossEntropyForward as dispatchCEForwardKernel, dispatchCrossEntropyBackward as dispatchCEBackwardKernel } from "../cross-entropy-kernel";
@@ -54,10 +54,10 @@ export async function adamStep(
   gpuMemoryTracker.suppressLimitCheck();
   try {
     let _st = profileSubOpBegin();
-    const gradT = ensureContiguous(asGPUTensor(grad));
-    const paramT = ensureContiguous(asGPUTensor(param));
-    const mT = ensureContiguous(asGPUTensor(m));
-    const vT = ensureContiguous(asGPUTensor(v));
+    const gradT = asContiguous(grad);
+    const paramT = asContiguous(param);
+    const mT = asContiguous(m);
+    const vT = asContiguous(v);
     profileSubOpEnd("adam.ensureContig", _st);
 
     // Evict stale f16 cache entry for the old param buffer before dispatch.
@@ -192,7 +192,7 @@ export function unscaleGrad(
   invScale: number,
   infFlagBuffer: unknown,
 ): BackendTensor {
-  const gradT = ensureContiguous(asGPUTensor(grad));
+  const gradT = asContiguous(grad);
   const numElements = gradT.size;
   const result = dispatchUnscaleGradKernel(
     gradT.buffer,
@@ -222,8 +222,8 @@ export function fusedCrossEntropyForward(
   targets: BackendTensor,
   config: import("../../types").FusedCrossEntropyConfig,
 ): BackendTensor {
-  const logitsT = ensureContiguous(asGPUTensor(logits));
-  const targetsT = ensureContiguous(asGPUTensor(targets));
+  const logitsT = asContiguous(logits);
+  const targetsT = asContiguous(targets);
   const outBuf = dispatchCEForwardKernel(
     logitsT.buffer, targetsT.buffer, config.batchSize, config.vocabSize,
   );
@@ -239,9 +239,9 @@ export function fusedCrossEntropyBackward(
   gradOutput: BackendTensor,
   config: import("../../types").FusedCrossEntropyConfig,
 ): BackendTensor {
-  const logitsT = ensureContiguous(asGPUTensor(logits));
-  const targetsT = ensureContiguous(asGPUTensor(targets));
-  const gradT = ensureContiguous(asGPUTensor(gradOutput));
+  const logitsT = asContiguous(logits);
+  const targetsT = asContiguous(targets);
+  const gradT = asContiguous(gradOutput);
   const outBuf = dispatchCEBackwardKernel(
     logitsT.buffer, targetsT.buffer, gradT.buffer,
     config.batchSize, config.vocabSize,
@@ -263,9 +263,9 @@ export function fusedLayerNormForward(
   bias: BackendTensor,
   config: import("../../types").FusedLayerNormConfig,
 ): BackendTensor {
-  const xT = ensureContiguous(asGPUTensor(x));
-  const weightT = ensureContiguous(asGPUTensor(weight));
-  const biasT = ensureContiguous(asGPUTensor(bias));
+  const xT = asContiguous(x);
+  const weightT = asContiguous(weight);
+  const biasT = asContiguous(bias);
   const outBuf = dispatchLNForwardKernel(
     xT.buffer, weightT.buffer, biasT.buffer,
     config.numRows, config.featureDim, config.eps,
@@ -283,9 +283,9 @@ export function fusedLayerNormBackwardGradX(
   weight: BackendTensor,
   config: import("../../types").FusedLayerNormConfig,
 ): BackendTensor {
-  const gradT = ensureContiguous(asGPUTensor(gradOutput));
-  const xT = ensureContiguous(asGPUTensor(x));
-  const weightT = ensureContiguous(asGPUTensor(weight));
+  const gradT = asContiguous(gradOutput);
+  const xT = asContiguous(x);
+  const weightT = asContiguous(weight);
 
   const gradXBuf = dispatchLNBwdGradXKernel(
     gradT.buffer, xT.buffer, weightT.buffer,
@@ -305,8 +305,8 @@ export function fusedLayerNormBackwardGradWeightBias(
   x: BackendTensor,
   config: import("../../types").FusedLayerNormConfig,
 ): { gradWeight: BackendTensor; gradBias: BackendTensor } {
-  const gradT = ensureContiguous(asGPUTensor(gradOutput));
-  const xT = ensureContiguous(asGPUTensor(x));
+  const gradT = asContiguous(gradOutput);
+  const xT = asContiguous(x);
   const result = dispatchLNBwdGradWBKernel(
     gradT.buffer, xT.buffer,
     config.numRows, config.featureDim, config.eps,
@@ -332,8 +332,8 @@ export function fusedRMSNormForward(
   weight: BackendTensor,
   config: import("../../types").FusedRMSNormConfig,
 ): BackendTensor {
-  const xT = ensureContiguous(asGPUTensor(x));
-  const weightT = ensureContiguous(asGPUTensor(weight));
+  const xT = asContiguous(x);
+  const weightT = asContiguous(weight);
   const outBuf = dispatchRMSForwardKernel(
     xT.buffer, weightT.buffer,
     config.numRows, config.featureDim, config.eps,
@@ -349,9 +349,9 @@ export function fusedRMSNormBackwardGradX(
   weight: BackendTensor,
   config: import("../../types").FusedRMSNormConfig,
 ): BackendTensor {
-  const goT = ensureContiguous(asGPUTensor(gradOutput));
-  const xT = ensureContiguous(asGPUTensor(x));
-  const wT = ensureContiguous(asGPUTensor(weight));
+  const goT = asContiguous(gradOutput);
+  const xT = asContiguous(x);
+  const wT = asContiguous(weight);
   const outBuf = dispatchRMSBwdGradXKernel(
     goT.buffer, xT.buffer, wT.buffer,
     config.numRows, config.featureDim, config.eps,
@@ -368,8 +368,8 @@ export function fusedRMSNormBackwardGradWeight(
   weight: BackendTensor,
   config: import("../../types").FusedRMSNormConfig,
 ): BackendTensor {
-  const goT = ensureContiguous(asGPUTensor(gradOutput));
-  const xT = ensureContiguous(asGPUTensor(x));
+  const goT = asContiguous(gradOutput);
+  const xT = asContiguous(x);
   const outBuf = dispatchRMSBwdGradWKernel(
     goT.buffer, xT.buffer,
     config.numRows, config.featureDim, config.eps,
@@ -389,9 +389,9 @@ export function fusedAttentionForward(
   v: BackendTensor,
   config: import("../../types").FusedAttentionConfig,
 ): { output: BackendTensor; logsumexp: BackendTensor } {
-  const qT = ensureContiguous(asGPUTensor(q));
-  const kT = ensureContiguous(asGPUTensor(k));
-  const vT = ensureContiguous(asGPUTensor(v));
+  const qT = asContiguous(q);
+  const kT = asContiguous(k);
+  const vT = asContiguous(v);
   const { outputBuffer, logsumexpBuffer } = dispatchFAForwardKernel(
     qT.buffer, kT.buffer, vT.buffer,
     config.batchSize, config.numHeads, config.seqLen, config.headDim,
@@ -420,12 +420,12 @@ export function fusedAttentionBackward(
   output: BackendTensor,
   config: import("../../types").FusedAttentionConfig,
 ): { dQ: BackendTensor; dK: BackendTensor; dV: BackendTensor } {
-  const qT = ensureContiguous(asGPUTensor(q));
-  const kT = ensureContiguous(asGPUTensor(k));
-  const vT = ensureContiguous(asGPUTensor(v));
-  const lseT = ensureContiguous(asGPUTensor(logsumexp));
-  const dOT = ensureContiguous(asGPUTensor(dO));
-  const oT = ensureContiguous(asGPUTensor(output));
+  const qT = asContiguous(q);
+  const kT = asContiguous(k);
+  const vT = asContiguous(v);
+  const lseT = asContiguous(logsumexp);
+  const dOT = asContiguous(dO);
+  const oT = asContiguous(output);
 
   // Step 1: Compute D[i] = rowsum(dO[i,:] * O[i,:])
   const dBuf = dispatchFABwdDKernel(
