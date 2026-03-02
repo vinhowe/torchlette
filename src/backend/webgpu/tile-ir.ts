@@ -1492,13 +1492,10 @@ export class KernelContext {
     extra?: { stride?: number; unroll?: boolean },
   ): void {
     const varName = `_lv${this.loopVarCounter++}`;
-    const bodyStmts: Statement[] = [];
-    this.stmtStack.push(bodyStmts);
     const loopVar = new BlockExpr(makeNode<NamedRefNode>({
       kind: "namedRef", name: varName, valueType: "scalar", dataType: "u32",
     }));
-    body(loopVar);
-    this.stmtStack.pop();
+    const bodyStmts = this.captureScope(() => body(loopVar));
     const stmt: any = {
       kind, varName, start: start.node, bound: bound.node, body: bodyStmts,
     };
@@ -1530,33 +1527,14 @@ export class KernelContext {
 
   /** Emit an if-then block. */
   ifThen(cond: BlockExpr, body: () => void): void {
-    const bodyStmts: Statement[] = [];
-    this.stmtStack.push(bodyStmts);
-    body();
-    this.stmtStack.pop();
-    this.pushStatement({
-      kind: "if",
-      condition: cond.node,
-      body: bodyStmts,
-    });
+    this.pushStatement({ kind: "if", condition: cond.node, body: this.captureScope(body) });
   }
 
   /** Emit an if-then-else block. */
   ifThenElse(cond: BlockExpr, body: () => void, elseBody: () => void): void {
-    const bodyStmts: Statement[] = [];
-    this.stmtStack.push(bodyStmts);
-    body();
-    this.stmtStack.pop();
-    const elseStmts: Statement[] = [];
-    this.stmtStack.push(elseStmts);
-    elseBody();
-    this.stmtStack.pop();
-    this.pushStatement({
-      kind: "ifElse",
-      condition: cond.node,
-      body: bodyStmts,
-      elseBody: elseStmts,
-    });
+    const bodyStmts = this.captureScope(body);
+    const elseStmts = this.captureScope(elseBody);
+    this.pushStatement({ kind: "ifElse", condition: cond.node, body: bodyStmts, elseBody: elseStmts });
   }
 
   /** Emit a workgroupBarrier(). */
