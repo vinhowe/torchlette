@@ -1,6 +1,6 @@
 import type { Backend, BackendTensor, DType } from "../backend/types";
-import { asGPUTensor, type WebGPUTensor } from "../backend/webgpu/gpu-types";
-import type { LazyIRNode, LazyRef, StorageHandle } from "./lazy-types";
+import { asGPUTensor } from "../backend/webgpu/gpu-types";
+import type { LazyIRNode, LazyRef } from "./lazy-types";
 import { createStorageHandle, ensureWebGPUMatmulImports, _webgpuMatmulImports } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
 import { shapesEqual } from "../core/shape";

@@ -1,5 +1,5 @@
 import type { Backend, BackendTensor, DType } from "../backend/types";
-import { asGPUTensor, type GPUBuffer, type WebGPUTensor } from "../backend/webgpu/gpu-types";
+import { asGPUTensor, type GPUBuffer } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
 import { sizeOf } from "../core/shape";
 import {
@@ -10,7 +10,7 @@ import {
   setAdamBatchMode,
   setCurrentOpLabel,
 } from "../backend/webgpu";
-import { isProfilingEnabled, setProfileModule, recordFusionFallback } from "../backend/webgpu/profiler";
+import { setProfileModule, recordFusionFallback } from "../backend/webgpu/profiler";
 import {
   isFusibleOp,
   groupToRecipe,
@@ -24,12 +24,12 @@ import {
   isDataSourceOp,
   isViewOp,
 } from "./lowered-plan";
-import type { LazyIRNode, LazyRef, StorageHandle, ExecutionPlan } from "./lazy-types";
+import type { LazyIRNode, StorageHandle } from "./lazy-types";
 import { createStorageHandle, wrapResultAsStorage, ensureWebGPUMatmulImports, _webgpuMatmulImports } from "./node-factory";
-import { storageTracker, releaseDeadTensors } from "./storage-tracker";
+import { releaseDeadTensors } from "./storage-tracker";
 import { computeContiguousStrides } from "../backend/types";
 import { getInputStorage, executeOp, withProfileContext } from "./op-dispatch";
-import type { MatmulPrologueInfo, MatmulEpiloguePlan } from "./matmul-epilogue";
+import type { MatmulPrologueInfo } from "./matmul-epilogue";
 import { detectMatmulEpilogue, detectMatmulEpilogueCore, executeMatmulWithEpilogue } from "./matmul-epilogue";
 import { detectReductionPreamble, executeReductionWithPreamble, detectReductionEpilogue, executeReductionWithEpilogue, detectReductionFusion, executeReductionWithFusion } from "./reduction-preamble";
 

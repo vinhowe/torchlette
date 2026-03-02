@@ -15,14 +15,12 @@ import type {
 import {
   Engine,
   type EngineTensor,
-  type SavedTensorRecord,
 } from "./engine/engine";
 import {
   type AutocastConfig,
   type AutocastContext,
   createAutocastContext,
 } from "./engine/amp";
-import { promoteDtype } from "./engine/dtype-rules";
 import { RuntimeEngine, TidyDispatchMode, type TensorOrScalar } from "./runtime/engine";
 import { setMemoryLimit } from "./engine/memory-planned-executor";
 import {
@@ -31,8 +29,6 @@ import {
   getGPUMemoryStats,
 } from "./backend/webgpu/memory-tracker";
 import {
-  flushBufferPool,
-  flushBufferPoolWithSync,
   isAutotuneEnabled,
   setAutotuneEnabled,
   issueDeferredFence,
@@ -860,7 +856,6 @@ export class Torchlette {
             ),
           );
 
-          const z2 = this.runtime.mul(z, z);
           const negZ2 = this.runtime.mul(-0.5, this.runtime.mul(x, x));
           const expNegZ2 = this.runtime.exp(negZ2);
 

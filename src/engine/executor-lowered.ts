@@ -31,10 +31,7 @@ import type { FusionGroup } from "./fusion-detect";
 import { groupToRecipe } from "./fusion-detect";
 import {
   type LoweredPlan,
-  type DispatchReplayCache,
   type ReplayEntry,
-  type ReplayNodeResult,
-  type RecordedDispatch as LPRecordedDispatch,
   ENCODER_COPY_OPS,
 } from "./lowered-plan";
 import type { LazyIRNode, LazyRef, StorageHandle, ExecutionPlan } from "./lazy-types";
@@ -119,7 +116,7 @@ export async function executeLoweredPlan(
   backend: Backend,
   options: { enableEarlyRelease?: boolean; enableVectorization?: boolean; bufferArena?: BufferArena; enableReplay?: boolean } = {},
 ): Promise<OptimizedExecutionResult> {
-  const { enableEarlyRelease = false, enableVectorization = true, enableReplay = true } = options;
+  const { enableReplay = true } = options;
 
   // Validate plan node count matches
   if (planNodes.length !== loweredPlan.planNodeCount) {
@@ -221,7 +218,7 @@ export async function executeLoweredPlan(
     // Replay timing instrumentation (controlled by env var)
     const _replayTiming = process.env.TORCHLETTE_REPLAY_TIMING === "1";
     let _tReplayDispatch = 0, _tDataSource = 0, _tView = 0, _tSequential = 0;
-    let _tAdamBatch = 0, _tReclaim = 0, _tResult = 0, _tLoopOverhead = 0;
+    let _tAdamBatch = 0, _tReclaim = 0, _tResult = 0;
     let _nDispatches = 0, _nDataSources = 0, _nViews = 0, _nSequential = 0;
     let _nAdamNodes = 0, _nReclaims = 0, _nResults = 0;
     const _tReplayStart = _replayTiming ? performance.now() : 0;
@@ -1001,11 +998,6 @@ export async function executeLoweredPlan(
           const rfReductionNode = planNodes[action.reductionNodeIndex];
           const rfEpilogueNodes = action.epilogueNodeIndices.map(i => planNodes[i]);
           const rfEpilogueInputRefs: import("./lazy").LazyRef[] = [];
-          const rfAllCoveredIds = [
-            ...action.preambleNodeIndices,
-            action.reductionNodeIndex,
-            ...action.epilogueNodeIndices,
-          ];
           for (let ci = 0; ci < rfEpilogueNodes.length; ci++) {
             const chainNode = rfEpilogueNodes[ci];
             if ((chainNode.op === "add" || chainNode.op === "mul") && chainNode.inputs.length === 2) {

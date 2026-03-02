@@ -18,7 +18,6 @@ import type {
   FusedNode,
   FusedOutput,
 } from "../backend/webgpu/fusion-types";
-import { isRandomOp } from "./ir-optimize";
 import type { LazyIRNode, LazyRef } from "./lazy";
 
 /**

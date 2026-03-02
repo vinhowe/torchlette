@@ -14,8 +14,7 @@
 
 import type { DType } from "../backend/types";
 import type { BaseId, LocId } from "./engine";
-import type { IRGraph, IRNode } from "./ir";
-import type { Token } from "./tokens";
+import type { IRGraph } from "./ir";
 
 // ============================================================================
 // §8.3 Canonical Arg Alias Groups
