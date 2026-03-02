@@ -18,7 +18,7 @@ import {
   elementwiseKernel,
 } from "../tile-ir";
 import { compileTileKernel } from "../tile-compiler";
-import { WORKGROUP_SIZE, F32_NEG_MAX, F32_POS_MAX, MAX_WORKGROUPS_PER_DIM } from "../shape-utils";
+import { WORKGROUP_SIZE, F32_NEG_MAX, F32_POS_MAX, MAX_WORKGROUPS_PER_DIM, contiguousStrides } from "../shape-utils";
 import { applyFusedOp } from "../fusion-tile-ir";
 
 const WG = WORKGROUP_SIZE; // 256
@@ -567,7 +567,7 @@ export function stridedScatterAddTileIR(
 function gatherTileIRImpl(
   inputShape: number[], indexShape: number[], dim: number, chunked: boolean,
 ): string {
-  const inputStrides = contiguousStridesForShape(inputShape);
+  const inputStrides = contiguousStrides(inputShape);
   const uniforms: Record<string, "u32"> = {};
   if (chunked) { uniforms.chunkStart = "u32"; uniforms.chunkEnd = "u32"; }
 
@@ -611,7 +611,7 @@ export function chunkedGatherTileIR(inputShape: number[], indexShape: number[], 
 function scatterAddTileIRImpl(
   inputShape: number[], srcShape: number[], dim: number, chunked: boolean,
 ): string {
-  const outStrides = contiguousStridesForShape(inputShape);
+  const outStrides = contiguousStrides(inputShape);
   const uniforms: Record<string, "u32"> = {};
   if (chunked) { uniforms.chunkStart = "u32"; uniforms.chunkEnd = "u32"; }
 
@@ -648,17 +648,6 @@ export function scatterAddTileIR(inputShape: number[], srcShape: number[], dim: 
 
 export function chunkedScatterAddTileIR(inputShape: number[], srcShape: number[], dim: number): string {
   return scatterAddTileIRImpl(inputShape, srcShape, dim, true);
-}
-
-/** Helper: compute contiguous strides for a given shape. */
-function contiguousStridesForShape(shape: number[]): number[] {
-  const strides: number[] = [];
-  for (let i = 0; i < shape.length; i++) {
-    let stride = 1;
-    for (let j = i + 1; j < shape.length; j++) stride *= shape[j];
-    strides.push(stride);
-  }
-  return strides;
 }
 
 // ============================================================================

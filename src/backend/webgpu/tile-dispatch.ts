@@ -17,10 +17,10 @@
 
 import {
   dispatchComputePass,
-  trackSharedEncoderWrite,
   cachedCreateBindGroup,
   getPipeline,
 } from "./index";
+import { trackSharedEncoderWrite } from "./webgpu-state";
 import { profiledCreateBindGroup } from "./bind-group-cache";
 import { computeFlatChunkLayout } from "./chunked-dispatch";
 import { requireContext } from "./webgpu-state";

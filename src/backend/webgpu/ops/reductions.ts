@@ -11,6 +11,7 @@ import { sizeOf } from "../../../core/shape";
 import type { GPUBuffer, WebGPUTensor, WebGPUContext } from "../gpu-types";
 import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import {
+  contiguousStrides,
   dtypeBytes,
   alignBufferSize,
 } from "../shape-utils";
@@ -59,19 +60,8 @@ function buildReductionMetadata(
   inputToOutDim: number[];
 } {
   const rank = inputShape.length;
-  const inputStrides: number[] = [];
-  for (let i = 0; i < rank; i++) {
-    let stride = 1;
-    for (let j = i + 1; j < rank; j++) stride *= inputShape[j];
-    inputStrides.push(stride);
-  }
-
-  const outStrides: number[] = [];
-  for (let i = 0; i < outShape.length; i++) {
-    let stride = 1;
-    for (let j = i + 1; j < outShape.length; j++) stride *= outShape[j];
-    outStrides.push(stride);
-  }
+  const inputStrides = contiguousStrides(inputShape);
+  const outStrides = contiguousStrides(outShape);
 
   let reductionSize = 1;
   for (const d of normalizedDims) reductionSize *= inputShape[d];

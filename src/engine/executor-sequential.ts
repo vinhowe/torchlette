@@ -31,6 +31,33 @@ export const FILL_IN_OPS: ReadonlySet<string> = new Set([
   "tensorFromArray", "zeros", "full", "arange",
 ]);
 
+/**
+ * Replace pending input refs with materialized storages from previous segments.
+ * Clone-on-write: only copies the inputs array if a substitution is needed,
+ * preserving plan immutability across steps.
+ */
+function materializeSegmentInputs(
+  nodes: LazyIRNode[],
+  materializedStorages: Map<number, StorageHandle>,
+): void {
+  for (const node of nodes) {
+    let needsClone = false;
+    for (let j = 0; j < node.inputs.length; j++) {
+      const input = node.inputs[j];
+      if (input.kind === "pending") {
+        const materialized = materializedStorages.get(input.node.id);
+        if (materialized) {
+          if (!needsClone) {
+            node.inputs = [...node.inputs];
+            needsClone = true;
+          }
+          node.inputs[j] = { kind: "materialized", storage: materialized };
+        }
+      }
+    }
+  }
+}
+
 // ============================================================================
 // Sequential Plan Execution
 // ============================================================================
@@ -171,25 +198,7 @@ export async function executePlanWithCheckpointSegments(
   for (let i = 0; i < segments.length; i++) {
     const segment = segments[i];
 
-    // Clone node inputs before mutation to preserve plan immutability.
-    // Nodes are shared across steps; mutating inputs in-place would cause
-    // stale storage refs to accumulate, producing NaN after ~25 steps.
-    for (const node of segment.nodes) {
-      let needsClone = false;
-      for (let j = 0; j < node.inputs.length; j++) {
-        const input = node.inputs[j];
-        if (input.kind === "pending") {
-          const materialized = materializedStorages.get(input.node.id);
-          if (materialized) {
-            if (!needsClone) {
-              node.inputs = [...node.inputs];
-              needsClone = true;
-            }
-            node.inputs[j] = { kind: "materialized", storage: materialized };
-          }
-        }
-      }
-    }
+    materializeSegmentInputs(segment.nodes, materializedStorages);
 
     // Execute this segment
     lastResult = await executePlan(segment, backend, options);
@@ -272,23 +281,7 @@ export async function executePlanWithTrueSegments(
       finalOutputId,
     );
 
-    // Clone node inputs before mutation to preserve plan immutability.
-    for (const node of segment.nodes) {
-      let needsClone = false;
-      for (let j = 0; j < node.inputs.length; j++) {
-        const input = node.inputs[j];
-        if (input.kind === "pending") {
-          const materialized = materializedStorages.get(input.node.id);
-          if (materialized) {
-            if (!needsClone) {
-              node.inputs = [...node.inputs];
-              needsClone = true;
-            }
-            node.inputs[j] = { kind: "materialized", storage: materialized };
-          }
-        }
-      }
-    }
+    materializeSegmentInputs(segment.nodes, materializedStorages);
 
     // Begin batched execution - all ops encode to shared command buffer
     beginBatchExecution();

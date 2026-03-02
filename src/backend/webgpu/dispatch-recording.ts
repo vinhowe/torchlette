@@ -16,9 +16,6 @@ import {
 } from "./shared-encoder";
 import { getTimestampWrites, setProfileModule } from "./profiler";
 
-// Re-export from webgpu-state for backward compatibility
-export { replayPinnedBufferSet } from "./webgpu-state";
-
 // ---------------------------------------------------------------------------
 // RecordedDispatch interface
 // ---------------------------------------------------------------------------
@@ -57,7 +54,6 @@ export function setLastBindGroupBuffers(bufs: GPUBuffer[] | null): void {
 // Replay Buffer Pinning
 // ---------------------------------------------------------------------------
 
-// replayPinnedBufferSet is in webgpu-state.ts and re-exported above.
 
 // ---------------------------------------------------------------------------
 // Public API

@@ -25,7 +25,7 @@ import { requireContext } from "./webgpu-state";
 
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
-import { trackSharedEncoderWrite } from "./index";
+import { trackSharedEncoderWrite } from "./webgpu-state";
 import { compileTileKernel } from "./tile-compiler";
 import type { TileKernelSpec } from "./tile-ir";
 import { tiledGrid } from "./tile-ir";
