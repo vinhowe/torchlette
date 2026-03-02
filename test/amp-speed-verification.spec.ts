@@ -109,11 +109,11 @@ describe("AMP Speed Verification", () => {
         // Warmup f32
         for (let i = 0; i < warmup; i++) {
           dispatchTiledMatmul({
-            device: device as any,
-            queue: queue as any,
-            a: aF32 as any,
-            b: bF32 as any,
-            out: outF32 as any,
+            device,
+            queue,
+            a: aF32,
+            b: bF32,
+            out: outF32,
             m: M,
             n: N,
             k: K,
@@ -128,11 +128,11 @@ describe("AMP Speed Verification", () => {
         for (let i = 0; i < iters; i++) {
           const start = performance.now();
           dispatchTiledMatmul({
-            device: device as any,
-            queue: queue as any,
-            a: aF32 as any,
-            b: bF32 as any,
-            out: outF32 as any,
+            device,
+            queue,
+            a: aF32,
+            b: bF32,
+            out: outF32,
             m: M,
             n: N,
             k: K,
@@ -170,11 +170,11 @@ describe("AMP Speed Verification", () => {
         // Warmup f16
         for (let i = 0; i < warmup; i++) {
           dispatchTiledMatmul({
-            device: device as any,
-            queue: queue as any,
-            a: aF16 as any,
-            b: bF16 as any,
-            out: outF16 as any,
+            device,
+            queue,
+            a: aF16,
+            b: bF16,
+            out: outF16,
             m: M,
             n: N,
             k: K,
@@ -189,11 +189,11 @@ describe("AMP Speed Verification", () => {
         for (let i = 0; i < iters; i++) {
           const start = performance.now();
           dispatchTiledMatmul({
-            device: device as any,
-            queue: queue as any,
-            a: aF16 as any,
-            b: bF16 as any,
-            out: outF16 as any,
+            device,
+            queue,
+            a: aF16,
+            b: bF16,
+            out: outF16,
             m: M,
             n: N,
             k: K,
@@ -288,11 +288,11 @@ describe("AMP Speed Verification", () => {
       // Warmup + benchmark f32
       for (let i = 0; i < warmup; i++) {
         dispatchTiledMatmul({
-          device: device as any,
-          queue: queue as any,
-          a: aF32 as any,
-          b: bF32 as any,
-          out: outF32 as any,
+          device,
+          queue,
+          a: aF32,
+          b: bF32,
+          out: outF32,
           m: M,
           n: N,
           k: K,
@@ -306,11 +306,11 @@ describe("AMP Speed Verification", () => {
       for (let i = 0; i < iters; i++) {
         const start = performance.now();
         dispatchTiledMatmul({
-          device: device as any,
-          queue: queue as any,
-          a: aF32 as any,
-          b: bF32 as any,
-          out: outF32 as any,
+          device,
+          queue,
+          a: aF32,
+          b: bF32,
+          out: outF32,
           m: M,
           n: N,
           k: K,
@@ -346,11 +346,11 @@ describe("AMP Speed Verification", () => {
 
       for (let i = 0; i < warmup; i++) {
         dispatchTiledMatmul({
-          device: device as any,
-          queue: queue as any,
-          a: aF16 as any,
-          b: bF16 as any,
-          out: outF16 as any,
+          device,
+          queue,
+          a: aF16,
+          b: bF16,
+          out: outF16,
           m: M,
           n: N,
           k: K,
@@ -364,11 +364,11 @@ describe("AMP Speed Verification", () => {
       for (let i = 0; i < iters; i++) {
         const start = performance.now();
         dispatchTiledMatmul({
-          device: device as any,
-          queue: queue as any,
-          a: aF16 as any,
-          b: bF16 as any,
-          out: outF16 as any,
+          device,
+          queue,
+          a: aF16,
+          b: bF16,
+          out: outF16,
           m: M,
           n: N,
           k: K,

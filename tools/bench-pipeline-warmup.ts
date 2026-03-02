@@ -152,7 +152,11 @@ async function main() {
     process.exit(1);
   }
 
-  const devInfo = getWebGPUDevice()!;
+  const devInfo = getWebGPUDevice();
+  if (!devInfo) {
+    console.error("No WebGPU device");
+    process.exit(1);
+  }
   const hasAsync = !!devInfo.device.createComputePipelineAsync;
   console.log(
     `createComputePipelineAsync: ${hasAsync ? "available" : "NOT available (will use sync fallback)"}`,

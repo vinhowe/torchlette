@@ -393,7 +393,10 @@ async function level4(bytes: number, fence: boolean): Promise<boolean> {
     pendingRelease.push(b);
   };
   const flushPending = (): void => {
-    while (pendingRelease.length > 0) pool.push(pendingRelease.pop()!);
+    while (pendingRelease.length > 0) {
+      const buf = pendingRelease.pop();
+      if (buf) pool.push(buf);
+    }
   };
 
   for (let round = 0; round < ROUNDS; round++) {

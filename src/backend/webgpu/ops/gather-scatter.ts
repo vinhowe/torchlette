@@ -350,11 +350,5 @@ export function cat(
     dimOffset += tDimSize;
   }
 
-  return createTensor(
-    outShape,
-    outBuffer,
-    undefined,
-    0,
-    gpuTensors[0].dtype as any,
-  );
+  return createTensor(outShape, outBuffer, undefined, 0, gpuTensors[0].dtype);
 }

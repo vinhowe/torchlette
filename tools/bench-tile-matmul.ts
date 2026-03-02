@@ -8,6 +8,13 @@
  */
 
 import { getWebGPUDevice, initWebGPU, syncWebGPU } from "../src/backend/webgpu";
+import type {
+  GPUBindGroup,
+  GPUBuffer,
+  GPUComputePipeline,
+  GPUDevice,
+  GPUQueue,
+} from "../src/backend/webgpu/gpu-types";
 import {
   type CodegenOptions,
   classifyShape,
@@ -216,8 +223,8 @@ const SHAPES: MatmulShape[] = [
 // ---------------------------------------------------------------------------
 
 async function benchmarkKernel(
-  device: any,
-  queue: any,
+  device: GPUDevice,
+  queue: GPUQueue,
   shape: MatmulShape,
   warmup: number,
   iters: number,
@@ -265,7 +272,7 @@ async function benchmarkKernel(
   });
 
   // K-split reduction pipeline (if needed)
-  let reductionPipeline: any = null;
+  let reductionPipeline: GPUComputePipeline | null = null;
   if (kSplitFactor >= 2) {
     const outputDtype =
       epilogue?.outputDtype ?? (dtype === "f32" ? "f32" : "f32");
@@ -297,7 +304,7 @@ async function benchmarkKernel(
   });
 
   // Epilogue extra input buffers
-  const epilogueBuffers: any[] = [];
+  const epilogueBuffers: GPUBuffer[] = [];
   if (epilogue) {
     for (let i = 0; i < epilogue.additionalInputCount; i++) {
       // Bias is 1D (column count), binary epilogue is full M×N
@@ -321,7 +328,7 @@ async function benchmarkKernel(
   }
 
   // K-split temp buffer
-  let kSplitBuffer: any = null;
+  let kSplitBuffer: GPUBuffer | null = null;
   if (kSplitFactor >= 2) {
     kSplitBuffer = device.createBuffer({
       size: Math.max(16, kSplitFactor * m * n * 4),
@@ -355,12 +362,17 @@ async function benchmarkKernel(
   queue.writeBuffer(paramsBuffer, 0, new Uint8Array(paramsData));
 
   // Build bind group entries
-  const entries: any[] = [
+  const entries: Array<{
+    binding: number;
+    resource: { buffer: GPUBuffer };
+  }> = [
     { binding: 0, resource: { buffer: aBuffer } },
     { binding: 1, resource: { buffer: bBuffer } },
     {
       binding: 2,
-      resource: { buffer: kSplitFactor >= 2 ? kSplitBuffer : outBuffer },
+      resource: {
+        buffer: kSplitFactor >= 2 ? (kSplitBuffer as GPUBuffer) : outBuffer,
+      },
     },
     { binding: 3, resource: { buffer: paramsBuffer } },
   ];
@@ -374,7 +386,7 @@ async function benchmarkKernel(
   });
 
   // K-split reduction bind group
-  let reductionBindGroup: any = null;
+  let reductionBindGroup: GPUBindGroup | null = null;
   if (kSplitFactor >= 2 && reductionPipeline) {
     const reduceParamsData = new ArrayBuffer(8);
     const ru32 = new Uint32Array(reduceParamsData);
@@ -390,7 +402,7 @@ async function benchmarkKernel(
     reductionBindGroup = device.createBindGroup({
       layout: reductionPipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: kSplitBuffer } },
+        { binding: 0, resource: { buffer: kSplitBuffer as GPUBuffer } },
         { binding: 1, resource: { buffer: outBuffer } },
         { binding: 2, resource: { buffer: reduceParamsBuffer } },
       ],
@@ -513,12 +525,12 @@ async function main() {
           ms.toFixed(3).padStart(10) +
           gflops.toFixed(0).padStart(12),
       );
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.log(
         shape.name.padEnd(28) +
           configStr.padEnd(22) +
           (kSplit >= 2 ? `×${kSplit}` : "-").padEnd(8) +
-          `ERROR: ${e.message}`,
+          `ERROR: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
   }

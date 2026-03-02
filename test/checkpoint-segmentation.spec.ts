@@ -225,8 +225,9 @@ describe("Checkpoint Segmentation", { timeout: 300000 }, () => {
 
     const grad = params[0].grad;
     expect(grad).toBeDefined();
+    if (!grad) throw new Error("grad is undefined");
 
-    const gradValue = await api.cpu(grad!);
+    const gradValue = await api.cpu(grad);
     expect(gradValue.length).toBeGreaterThan(0);
 
     // Verify gradients are not all zeros (actual computation happened)

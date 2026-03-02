@@ -326,7 +326,8 @@ describe("Tile-IR Fusion Codegen", () => {
       buffer: GPUBuffer,
       size: number,
     ): Promise<Float32Array> {
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device;
+      if (!device) throw new Error("WebGPU device not available");
       const staging = device.createBuffer({
         size,
         usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -346,7 +347,8 @@ describe("Tile-IR Fusion Codegen", () => {
       inputArrays: Float32Array[],
       options: { vectorize?: boolean } = {},
     ): Promise<Float32Array[]> {
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device;
+      if (!device) throw new Error("WebGPU device not available");
       const inputs = inputArrays.map((arr, i) => {
         const recipeInput = recipe.inputs.filter(
           (inp) => !inp.isInlinedConstant,

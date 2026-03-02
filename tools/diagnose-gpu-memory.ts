@@ -115,7 +115,12 @@ async function main() {
 
     // Collect stats
     const mem = getGPUMemoryStats();
-    const pool = getBufferPoolStats() as any;
+    const pool = getBufferPoolStats() as ReturnType<
+      typeof getBufferPoolStats
+    > & {
+      pendingRelease?: number;
+      pendingDestroy?: number;
+    };
     const flow = getAndResetFlowCounters();
     const storageStats = storageTracker.stats();
 

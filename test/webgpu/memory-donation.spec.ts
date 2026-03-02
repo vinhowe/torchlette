@@ -13,6 +13,7 @@ import {
   initWebGPU,
   webgpuBackend,
 } from "../../src/backend/webgpu";
+import { add, relu } from "../../src/backend/webgpu/ops/elementwise";
 import { cpuOnly } from "../helpers/webgpu";
 
 describe("WebGPU memory donation", { skip: cpuOnly }, () => {
@@ -104,7 +105,7 @@ describe("WebGPU memory donation", { skip: cpuOnly }, () => {
       expect(donatedBuf).not.toBeNull();
 
       // Second add using donated buffer
-      const d = (webgpuBackend.ops.add as any)(a, b, { outBuffer: donatedBuf });
+      const d = add(a, b, { outBuffer: donatedBuf });
 
       // Verify result is correct
       const result = await webgpuBackend.ops.read(d);
@@ -130,7 +131,7 @@ describe("WebGPU memory donation", { skip: cpuOnly }, () => {
       expect(donatedBuf).not.toBeNull();
 
       // Use donated buffer for relu
-      const d = (webgpuBackend.ops.relu as any)(a, { outBuffer: donatedBuf });
+      const d = relu(a, { outBuffer: donatedBuf });
 
       // Verify result
       const result = await webgpuBackend.ops.read(d);

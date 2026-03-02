@@ -14,6 +14,12 @@ import {
 } from "../../src/backend/webgpu";
 import { cpuOnly } from "../helpers/webgpu";
 
+function requireDevice() {
+  const ctx = getWebGPUDevice();
+  if (!ctx) throw new Error("WebGPU device not available");
+  return ctx;
+}
+
 function makeArena(resolveSlots: number, allocSlots: number): BufferArena {
   return {
     resolve: new Array(resolveSlots).fill(undefined),
@@ -24,7 +30,7 @@ function makeArena(resolveSlots: number, allocSlots: number): BufferArena {
 describe.skipIf(cpuOnly)("buffer arena", { timeout: 30000 }, () => {
   it("allocates buffer from arena and marks it as arena buffer", async () => {
     await initWebGPU();
-    const device = getWebGPUDevice()!;
+    const device = requireDevice();
     const arena = makeArena(5, 5);
 
     setActiveArena(arena);
@@ -38,7 +44,7 @@ describe.skipIf(cpuOnly)("buffer arena", { timeout: 30000 }, () => {
 
   it("reuses same buffer across multiple activations", async () => {
     await initWebGPU();
-    const device = getWebGPUDevice()!;
+    const device = requireDevice();
     const arena = makeArena(5, 5);
 
     // First activation: allocate buffer at slot 0
@@ -58,7 +64,7 @@ describe.skipIf(cpuOnly)("buffer arena", { timeout: 30000 }, () => {
 
   it("tracks resolve index correctly", async () => {
     await initWebGPU();
-    const device = getWebGPUDevice()!;
+    const device = requireDevice();
     const arena = makeArena(5, 5);
 
     setActiveArena(arena);
@@ -80,7 +86,7 @@ describe.skipIf(cpuOnly)("buffer arena", { timeout: 30000 }, () => {
 
   it("multiple arenas have independent buffer sets", async () => {
     await initWebGPU();
-    const device = getWebGPUDevice()!;
+    const device = requireDevice();
     const arena1 = makeArena(3, 3);
     const arena2 = makeArena(3, 3);
 
@@ -110,7 +116,7 @@ describe.skipIf(cpuOnly)("buffer arena", { timeout: 30000 }, () => {
 
   it("allocateOutputBuffer uses separate alloc index from resolveOutputBuffer", async () => {
     await initWebGPU();
-    const device = getWebGPUDevice()!;
+    const device = requireDevice();
     const arena = makeArena(5, 5);
 
     setActiveArena(arena);
@@ -134,7 +140,7 @@ describe.skipIf(cpuOnly)("buffer arena", { timeout: 30000 }, () => {
 
   it("destroyArena removes buffers from arena buffer set", async () => {
     await initWebGPU();
-    const device = getWebGPUDevice()!;
+    const device = requireDevice();
     const arena = makeArena(3, 3);
 
     setActiveArena(arena);

@@ -157,13 +157,17 @@ async function main() {
     const poolStats = getBufferPoolStats();
     const flowCounters = getAndResetFlowCounters();
 
+    const poolStatsExt = poolStats as typeof poolStats & {
+      pendingDestroy?: number;
+      pendingRelease?: number;
+    };
     stepData.push({
       storages: stats.totalStorages,
       reachable: stats.reachableStorages,
       trackerBytes: memStats.currentBytes,
       allocCount: memStats.allocationCount,
-      pendingDestroy: (poolStats as any).pendingDestroy ?? 0,
-      pendingRelease: (poolStats as any).pendingRelease ?? 0,
+      pendingDestroy: poolStatsExt.pendingDestroy ?? 0,
+      pendingRelease: poolStatsExt.pendingRelease ?? 0,
     });
 
     console.log(`Step ${step}: loss=${lossValue.toFixed(4)}`);
@@ -180,7 +184,7 @@ async function main() {
       `  Memory: ${(memStats.currentBytes / 1e9).toFixed(3)}GB, tracked buffers=${memStats.bufferSizesCount}`,
     );
     console.log(
-      `  Pool: pooled=${poolStats.pooledBuffers} (${(poolStats.pooledBytes / 1e6).toFixed(1)}MB), pending-release=${(poolStats as any).pendingRelease}, pending-destroy=${(poolStats as any).pendingDestroy}`,
+      `  Pool: pooled=${poolStats.pooledBuffers} (${(poolStats.pooledBytes / 1e6).toFixed(1)}MB), pending-release=${poolStatsExt.pendingRelease}, pending-destroy=${poolStatsExt.pendingDestroy}`,
     );
     console.log(
       `  Flow: +${flowCounters.allocs} allocs, -${flowCounters.deallocs} deallocs, net=${flowCounters.allocs - flowCounters.deallocs}`,
@@ -233,7 +237,10 @@ async function main() {
         const storage = storageTracker.getStorage(entry.id);
         let sizeBytes = 0;
         if (storage) {
-          const bt = storage.backendTensor as any;
+          const bt = storage.backendTensor as {
+            size?: number;
+            buffer?: { size?: number };
+          };
           sizeBytes = bt.size ?? bt.buffer?.size ?? 0;
         }
         const shapeKey = info?.shape ? `[${info.shape.join(",")}]` : "unknown";
@@ -390,10 +397,14 @@ async function main() {
     const { gpuMemoryTracker } = await import(
       "../src/backend/webgpu/memory-tracker"
     );
-    const allocStacks = (gpuMemoryTracker as any)._allocStacks as Map<
-      unknown,
-      { size: number; stack: string; step: number }
-    >;
+    const allocStacks = (
+      gpuMemoryTracker as unknown as {
+        _allocStacks: Map<
+          unknown,
+          { size: number; stack: string; step: number }
+        >;
+      }
+    )._allocStacks;
     if (allocStacks && allocStacks.size > 0) {
       // Group orphaned buffer alloc stacks by call site
       const orphanedByCallSite = new Map<

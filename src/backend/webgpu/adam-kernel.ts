@@ -463,7 +463,7 @@ export function dispatchAdamStep(
     v: vBuffer,
   };
   if (doF16 && paramF16Out) buffers.param_f16 = paramF16Out;
-  if (doUnscale) buffers.inf_flag = infFlagBuffer!;
+  if (doUnscale && infFlagBuffer) buffers.inf_flag = infFlagBuffer;
 
   // Build uniforms
   const uniforms: Record<string, number> = {

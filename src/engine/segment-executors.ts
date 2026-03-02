@@ -125,7 +125,9 @@ export async function executeFusedWebGPU(
   const fusionDispatch = await import("../backend/webgpu/fusion-dispatch");
   const { dispatchFusedKernel } = fusionDispatch;
   await ensureWebGPUMatmulImports();
-  const { deferredDestroyBuffer } = _webgpuMatmulImports!;
+  const { deferredDestroyBuffer } = _webgpuMatmulImports as NonNullable<
+    typeof _webgpuMatmulImports
+  >;
 
   /** Wrap a fusion output buffer into a StorageHandle with deferred destroy. */
   const wrapFusionOutput = (
@@ -493,7 +495,9 @@ export async function executeSequentialSegmentWithEarlyRelease(
       // uses the pre-cast input via prologue info.
       if (prologueSkipIds?.has(node.id)) {
         if (loweredPlanBuilder && nodeIdToFinalPos) {
-          loweredPlanBuilder.recordPrologueSkip(nodeIdToFinalPos.get(node.id)!);
+          loweredPlanBuilder.recordPrologueSkip(
+            nodeIdToFinalPos.get(node.id) as number,
+          );
         }
         step++;
         continue;
@@ -505,12 +509,12 @@ export async function executeSequentialSegmentWithEarlyRelease(
       // results on the output node. Remaining covered nodes are skipped
       // (their IDs are also in the map as skip entries with name === "").
       if (compoundMatchMap?.has(node.id)) {
-        const match = compoundMatchMap.get(node.id)!;
+        const match = compoundMatchMap.get(node.id) as CompoundMatchExec;
         if (match.name === "") {
           // This is an intermediate/non-first covered node — skip it
           if (loweredPlanBuilder && nodeIdToFinalPos) {
             loweredPlanBuilder.recordPrologueSkip(
-              nodeIdToFinalPos.get(node.id)!,
+              nodeIdToFinalPos.get(node.id) as number,
             );
           }
           step++;
@@ -568,12 +572,14 @@ export async function executeSequentialSegmentWithEarlyRelease(
         if (loweredPlanBuilder && nodeIdToFinalPos) {
           const coveredPoss: number[] = [];
           for (let c = 0; c < coveredCount; c++) {
-            coveredPoss.push(nodeIdToFinalPos.get(nodes[nodeIdx + c].id)!);
+            coveredPoss.push(
+              nodeIdToFinalPos.get(nodes[nodeIdx + c].id) as number,
+            );
           }
           loweredPlanBuilder.recordCompound(
             match.name,
             coveredPoss,
-            nodeIdToFinalPos.get(match.outputNodeId)!,
+            nodeIdToFinalPos.get(match.outputNodeId) as number,
             match.dim,
           );
         }
@@ -636,19 +642,21 @@ export async function executeSequentialSegmentWithEarlyRelease(
           if (loweredPlanBuilder && nodeIdToFinalPos) {
             const covered: number[] = [];
             for (let skip = 0; skip < epiloguePlan.consumedCount; skip++) {
-              covered.push(nodeIdToFinalPos.get(nodes[nodeIdx + skip].id)!);
+              covered.push(
+                nodeIdToFinalPos.get(nodes[nodeIdx + skip].id) as number,
+              );
             }
             loweredPlanBuilder.recordMatmulEpilogue(
-              nodeIdToFinalPos.get(node.id)!,
+              nodeIdToFinalPos.get(node.id) as number,
               covered,
-              nodeIdToFinalPos.get(epiloguePlan.outputNode.id)!,
+              nodeIdToFinalPos.get(epiloguePlan.outputNode.id) as number,
               epiloguePlan.epilogueOps,
               epiloguePlan.epilogueInputRefs.length,
               epiloguePlan.outputDtype,
               epiloguePlan.consumedCount,
               epiloguePlan.prologues?.map((p) => ({
                 inputIndex: p.inputIndex,
-                castNodeIndex: nodeIdToFinalPos.get(p.castNodeId)!,
+                castNodeIndex: nodeIdToFinalPos.get(p.castNodeId) as number,
                 fromDtype: p.fromDtype,
                 toDtype: p.toDtype,
               })),
@@ -683,16 +691,16 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
           if (loweredPlanBuilder && nodeIdToFinalPos) {
             const preambleIndices = fusionPlan.preambleChain.map(
-              (n) => nodeIdToFinalPos.get(n.id)!,
+              (n) => nodeIdToFinalPos.get(n.id) as number,
             );
             const epilogueIndices = fusionPlan.epilogueChain.map(
-              (n) => nodeIdToFinalPos.get(n.id)!,
+              (n) => nodeIdToFinalPos.get(n.id) as number,
             );
             loweredPlanBuilder.recordReductionFusion(
               preambleIndices,
-              nodeIdToFinalPos.get(fusionPlan.reductionNode.id)!,
+              nodeIdToFinalPos.get(fusionPlan.reductionNode.id) as number,
               epilogueIndices,
-              nodeIdToFinalPos.get(fusionPlan.outputNode.id)!,
+              nodeIdToFinalPos.get(fusionPlan.outputNode.id) as number,
               fusionPlan.preambleOps,
               fusionPlan.preambleInputDtypes,
               fusionPlan.epilogueOps,
@@ -733,10 +741,10 @@ export async function executeSequentialSegmentWithEarlyRelease(
               reductionPlan.chainInputDtypes
             ) {
               loweredPlanBuilder.recordReductionPreamble(
-                nodeIdToFinalPos.get(node.id)!,
-                nodeIdToFinalPos.get(reductionPlan.reductionNode.id)!,
+                nodeIdToFinalPos.get(node.id) as number,
+                nodeIdToFinalPos.get(reductionPlan.reductionNode.id) as number,
                 reductionPlan.preambleChain.map(
-                  (n) => nodeIdToFinalPos.get(n.id)!,
+                  (n) => nodeIdToFinalPos.get(n.id) as number,
                 ),
                 reductionPlan.chainOps,
                 reductionPlan.chainInputDtypes,
@@ -744,8 +752,8 @@ export async function executeSequentialSegmentWithEarlyRelease(
               );
             } else {
               loweredPlanBuilder.recordReductionPreamble(
-                nodeIdToFinalPos.get(node.id)!,
-                nodeIdToFinalPos.get(reductionPlan.reductionNode.id)!,
+                nodeIdToFinalPos.get(node.id) as number,
+                nodeIdToFinalPos.get(reductionPlan.reductionNode.id) as number,
               );
             }
           }
@@ -789,12 +797,14 @@ export async function executeSequentialSegmentWithEarlyRelease(
           if (loweredPlanBuilder && nodeIdToFinalPos) {
             const covered: number[] = [];
             for (let c = 0; c < epiloguePlan.consumedCount; c++) {
-              covered.push(nodeIdToFinalPos.get(nodes[nodeIdx + c].id)!);
+              covered.push(
+                nodeIdToFinalPos.get(nodes[nodeIdx + c].id) as number,
+              );
             }
             loweredPlanBuilder.recordReductionEpilogue(
-              nodeIdToFinalPos.get(node.id)!,
+              nodeIdToFinalPos.get(node.id) as number,
               covered,
-              nodeIdToFinalPos.get(epiloguePlan.outputNode.id)!,
+              nodeIdToFinalPos.get(epiloguePlan.outputNode.id) as number,
               epiloguePlan.epilogueOps,
               epiloguePlan.epilogueInputRefs.length,
               epiloguePlan.outputDtype,
@@ -862,7 +872,9 @@ export async function executeSequentialSegmentWithEarlyRelease(
           if (loweredPlanBuilder && nodeIdToFinalPos) {
             const adamIndices: number[] = [];
             for (let a = 0; a < adamCount; a++) {
-              adamIndices.push(nodeIdToFinalPos.get(nodes[nodeIdx + a].id)!);
+              adamIndices.push(
+                nodeIdToFinalPos.get(nodes[nodeIdx + a].id) as number,
+              );
             }
             loweredPlanBuilder.recordAdamBatch(adamIndices);
           }
@@ -889,7 +901,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
       // Record action in lowered plan builder
       if (loweredPlanBuilder && nodeIdToFinalPos) {
-        const finalPos = nodeIdToFinalPos.get(node.id)!;
+        const finalPos = nodeIdToFinalPos.get(node.id) as number;
         if (isDataSourceOp(node.op)) {
           loweredPlanBuilder.recordDataSource(finalPos);
         } else if (isViewOp(node.op)) {

@@ -18,8 +18,11 @@ async function main() {
     device = await adapter.requestDevice({
       requiredFeatures: ["timestamp-query"],
     });
-  } catch (e: any) {
-    console.error("Device creation failed:", e.message);
+  } catch (e: unknown) {
+    console.error(
+      "Device creation failed:",
+      e instanceof Error ? e.message : String(e),
+    );
     process.exit(1);
   }
   console.log("Device created with timestamp-query");

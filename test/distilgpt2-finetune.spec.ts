@@ -23,6 +23,7 @@ import {
   setProfilePhase,
   writeProfileJSON,
 } from "../src/backend/webgpu";
+import type { OptimizedExecutionStats } from "../src/engine/lazy";
 import { type Tensor, Torchlette } from "../src/frontend";
 import { Adam, GradScaler } from "../src/optim";
 
@@ -108,7 +109,7 @@ describe("DistilGPT-2 Finetuning Regression", { timeout: 300_000 }, () => {
       cleanup: number;
       submits: number;
     }[] = [];
-    let lastCumulativeFusionStats: any = null;
+    let lastCumulativeFusionStats: OptimizedExecutionStats | null = null;
 
     for (let step = 0; step < NUM_STEPS; step++) {
       await scaler.resolveDeferred();

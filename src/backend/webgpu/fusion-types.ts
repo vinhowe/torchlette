@@ -287,7 +287,7 @@ export function buildRecipeFromIR(
       if (nodeSet.has(inputId)) {
         mappedInputs.push(inputId);
       } else if (inputMap.has(inputId)) {
-        mappedInputs.push(inputMap.get(inputId)!);
+        mappedInputs.push(inputMap.get(inputId) ?? inputId);
       } else {
         const newIdx = inputs.length;
         inputMap.set(inputId, -(newIdx + 1));

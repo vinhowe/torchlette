@@ -160,7 +160,7 @@ export function createParamsBuffer(
     // Fallback: try pool
     const pool = paramsBufferPools.get(sizeClass);
     if (pool && pool.length > 0) {
-      const buffer = pool.pop()!;
+      const buffer = pool.pop() as GPUBuffer;
       profileApiCall("writeBuffer", () =>
         device.queue.writeBuffer(buffer, 0, data),
       );

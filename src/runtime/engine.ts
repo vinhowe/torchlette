@@ -434,7 +434,7 @@ export class RuntimeEngine {
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const webgpu = require("../backend/webgpu");
         this._webgpuFlushBufferPool = webgpu.flushBufferPool ?? (() => {});
-        return this._webgpuFlushBufferPool!;
+        return this._webgpuFlushBufferPool;
       } catch {
         return () => {};
       }

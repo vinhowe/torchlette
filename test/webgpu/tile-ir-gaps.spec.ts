@@ -2440,8 +2440,8 @@ describe.runIf(isWebGPUEnabled)("Triton Gap Round 2: GPU tests", () => {
 describe.runIf(isWebGPUEnabled)(
   "Triton Gap Round 3: Philox RNG GPU tests",
   () => {
-    let device: any;
-    let queue: any;
+    let device: GPUDevice;
+    let queue: GPUQueue;
 
     beforeAll(async () => {
       const ok = await initWebGPU();
@@ -2830,8 +2830,10 @@ describe("Tile-IR Subgroup Optimization", () => {
       const ok = await initWebGPU();
       if (ok) {
         const ctx = getWebGPUDevice();
-        device = ctx.device as any;
-        queue = ctx.queue as any;
+        if (ctx) {
+          device = ctx.device;
+          queue = ctx.queue;
+        }
       }
     });
 

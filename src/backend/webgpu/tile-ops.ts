@@ -362,7 +362,7 @@ export class Block {
       name: valName,
       valueType: "scalar",
       dataType: "f32",
-    } as any);
+    } as IRNode);
     // Capture the function body as IR statements
     const body = this.ctx.captureScope(() => {
       const result = fn(valRef);
@@ -370,18 +370,16 @@ export class Block {
         kind: "assign",
         name: `_apply_result_${this.name}`,
         value: result.node,
-      } as any);
+      });
     });
     // Extract result node from the synthetic assign
     const lastStmt = body[body.length - 1];
     const resultNode =
-      lastStmt && lastStmt.kind === "assign"
-        ? (lastStmt as any).value
-        : valRef.node;
+      lastStmt && lastStmt.kind === "assign" ? lastStmt.value : valRef.node;
     if (
       lastStmt &&
       lastStmt.kind === "assign" &&
-      (lastStmt as any).name === `_apply_result_${this.name}`
+      lastStmt.name === `_apply_result_${this.name}`
     ) {
       body.pop();
     }
@@ -392,7 +390,7 @@ export class Block {
     innerBody.push({
       kind: "let",
       name: valName,
-      dtype: "f32" as any,
+      dtype: "f32" satisfies DataType,
       value: {
         id: -1,
         kind: "arrayRead",
@@ -403,10 +401,10 @@ export class Block {
           name: iVar,
           valueType: "scalar",
           dataType: "u32",
-        },
+        } as IRNode,
         valueType: "scalar",
         dataType: "f32",
-      } as any,
+      } as IRNode,
     });
     innerBody.push(...body);
     // block[i] = result
@@ -419,7 +417,7 @@ export class Block {
         name: iVar,
         valueType: "scalar",
         dataType: "u32",
-      } as any,
+      } as IRNode,
       value: resultNode,
     });
     this.ctx.pushStatement({
@@ -431,14 +429,14 @@ export class Block {
         valueType: "scalar",
         dataType: "u32",
         value: 0,
-      } as any,
+      } as IRNode,
       bound: {
         id: -1,
         kind: "const",
         valueType: "scalar",
         dataType: "u32",
         value: size,
-      } as any,
+      } as IRNode,
       body: innerBody,
     });
   }
@@ -529,8 +527,7 @@ export class BlockOps {
   load(binding: string, ptr: BlockPtr, opts: BlockLoadOpts): Block {
     const name = this.freshName();
     const { rows, cols, guard } = opts;
-    const bindingType =
-      (this.ctx as any).bindingSpecs?.[binding]?.type ?? "f32";
+    const bindingType = this.ctx.getBindingType(binding);
 
     if (ptr.kind === "thread") {
       // Per-thread load → register placement

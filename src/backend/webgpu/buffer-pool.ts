@@ -216,7 +216,7 @@ class SimpleBufferPool {
     const pooledBuffers = this.pool.get(sizeClass);
     if (pooledBuffers && pooledBuffers.length > 0) {
       // Take from end (LIFO) for deterministic order after sortPoolBuckets()
-      const buffer = pooledBuffers.pop()!;
+      const buffer = pooledBuffers.pop() as GPUBuffer;
       const actualSize = getSizeForClass(sizeClass);
       this.pooledBytes -= actualSize;
       this.reuseCount++;
@@ -701,7 +701,7 @@ class SimpleBufferPool {
       const sizePerBuffer = getSizeForClass(sizeClass);
 
       while (buffers.length > 0 && bytesFreed < bytesNeeded) {
-        const buffer = buffers.pop()!;
+        const buffer = buffers.pop() as GPUBuffer;
         // Replay-pinned buffers must survive — push back and skip.
         if (replayPinnedBufferSet?.has(buffer)) {
           buffers.push(buffer);
