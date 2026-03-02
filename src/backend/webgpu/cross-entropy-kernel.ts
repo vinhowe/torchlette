@@ -16,7 +16,7 @@ import {
 } from "./index";
 import type { GPUBuffer } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
-import { type TileKernelSpec, perRowGrid, perRowKernel } from "./tile-ir";
+import { perRowKernel } from "./tile-ir";
 import { createTileKernelDispatcher } from "./tile-dispatch";
 
 // ============================================================================

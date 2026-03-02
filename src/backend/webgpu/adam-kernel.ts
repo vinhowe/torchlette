@@ -12,7 +12,6 @@
 import {
   dispatchComputePass,
   getMaxStorageBufferBindingSize,
-  trackSharedEncoderWrite,
   createParamsBuffer,
   releaseParamsBuffer,
   isF16Supported,
@@ -20,7 +19,7 @@ import {
   cachedCreateBindGroup,
   getPipeline,
 } from "./index";
-import { requireContext } from "./webgpu-state";
+import { requireContext, trackSharedEncoderWrite } from "./webgpu-state";
 import type { AdamStepConfig } from "../types";
 import { profileSubOpBegin, profileSubOpEnd } from "./profiler";
 import type { GPUBuffer, GPUBindGroup, GPUDevice } from "./gpu-types";

@@ -29,25 +29,25 @@ export function collectTensorHandles(value: unknown): EngineTensor[] {
   return out;
 }
 
-export function isThenable(value: unknown): value is Promise<unknown> {
+function isThenable(value: unknown): value is Promise<unknown> {
   if (!value) return false;
   return typeof (value as Promise<unknown>).then === "function";
 }
 
-export function collectTraceTensorIds(value: unknown): number[] {
+function collectTraceTensorIds(value: unknown): number[] {
   if (!value) return [];
   if (Array.isArray(value)) return value.flatMap((item) => collectTraceTensorIds(item));
   if (isTraceTensor(value)) return [value.id];
   return [];
 }
 
-export function isTraceTensor(value: unknown): value is TraceTensor {
+function isTraceTensor(value: unknown): value is TraceTensor {
   if (!value || typeof value !== "object") return false;
   const record = value as TraceTensor;
   return typeof record.id === "number" && typeof record.epoch === "number";
 }
 
-export function computeRngValue(basis: RngBasis, opNonce: number, drawNonce: number): number {
+function computeRngValue(basis: RngBasis, opNonce: number, drawNonce: number): number {
   const seed = basis.seed >>> 0;
   const algo = basis.algorithmId >>> 0;
   const op = opNonce >>> 0;
@@ -57,7 +57,7 @@ export function computeRngValue(basis: RngBasis, opNonce: number, drawNonce: num
   return (state >>> 0) / 2 ** 32;
 }
 
-export function mix32(value: number): number {
+function mix32(value: number): number {
   let v = value >>> 0;
   v ^= v >>> 16;
   v = Math.imul(v, 0x7feb352d);
