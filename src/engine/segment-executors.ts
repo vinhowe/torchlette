@@ -33,6 +33,19 @@ import type { MatmulPrologueInfo } from "./matmul-epilogue";
 import { detectMatmulEpilogue, detectMatmulEpilogueCore, executeMatmulWithEpilogue } from "./matmul-epilogue";
 import { detectReductionPreamble, executeReductionWithPreamble, detectReductionEpilogue, executeReductionWithEpilogue, detectReductionFusion, executeReductionWithFusion } from "./reduction-preamble";
 
+/** Build a map of nodeId → consumer count from plan nodes. */
+function buildConsumerCount(nodes: LazyIRNode[]): Map<number, number> {
+  const counts = new Map<number, number>();
+  for (const n of nodes) {
+    for (const ref of n.inputs) {
+      if (ref.kind === "pending") {
+        counts.set(ref.node.id, (counts.get(ref.node.id) ?? 0) + 1);
+      }
+    }
+  }
+  return counts;
+}
+
 /**
  * Execution descriptor for a compound pattern match.
  * Built from CompoundMatch by the executor before passing to segment executors.
@@ -92,6 +105,22 @@ export async function executeFusedWebGPU(
   const { dispatchFusedKernel } = fusionDispatch;
   await ensureWebGPUMatmulImports();
   const { deferredDestroyBuffer } = _webgpuMatmulImports!;
+
+  /** Wrap a fusion output buffer into a StorageHandle with deferred destroy. */
+  const wrapFusionOutput = (
+    device: string,
+    output: { buffer: unknown; shape: number[]; dtype: DType },
+  ): StorageHandle => {
+    const buf = output.buffer as GPUBuffer;
+    const bufSize = buf.size;
+    let destroyed = false;
+    return createStorageHandle(device, {
+      buffer: output.buffer, shape: output.shape, dtype: output.dtype,
+      size: sizeOf(output.shape), strides: computeContiguousStrides(output.shape),
+      offset: 0, isContiguous: true, ownsBuffer: true,
+      destroy() { if (destroyed) return; destroyed = true; deferredDestroyBuffer(buf, bufSize); },
+    } as BackendTensor);
+  };
 
   // Get WebGPU device from backend
   const device = backend.device;
@@ -193,52 +222,13 @@ export async function executeFusedWebGPU(
       vectorize: enableVectorization,
     });
 
-    // Store the result in the output node
-    const outputNode = group.outputNode;
-    const fusionBuffer = result.buffer as GPUBuffer;
-    const fusionBufferSize = fusionBuffer.size;
-    let fusionDestroyed = false;
-    outputNode.result = createStorageHandle(outputNode.device, {
-      buffer: result.buffer,
-      shape: result.shape,
-      dtype: result.dtype,
-      size: sizeOf(result.shape),
-      strides: computeContiguousStrides(result.shape),
-      offset: 0,
-      isContiguous: true,
-      ownsBuffer: true,
-      destroy() {
-        if (fusionDestroyed) return;
-        fusionDestroyed = true;
-        deferredDestroyBuffer(fusionBuffer, fusionBufferSize);
-      },
-    } as BackendTensor);
-
-    // Multi-output: store results for additional output nodes (§15.2)
+    // Store results on output nodes
+    group.outputNode.result = wrapFusionOutput(group.outputNode.device, result);
     if (group.additionalOutputNodes && result.outputs) {
       for (let i = 0; i < group.additionalOutputNodes.length; i++) {
         const addNode = group.additionalOutputNodes[i];
         const addOutput = result.outputs[i + 1]; // +1: primary is at index 0
-        if (addOutput) {
-          const addBuffer = addOutput.buffer as GPUBuffer;
-          const addBufferSize = addBuffer.size;
-          let addDestroyed = false;
-          addNode.result = createStorageHandle(addNode.device, {
-            buffer: addOutput.buffer,
-            shape: addOutput.shape,
-            dtype: addOutput.dtype,
-            size: sizeOf(addOutput.shape),
-            strides: computeContiguousStrides(addOutput.shape),
-            offset: 0,
-            isContiguous: true,
-            ownsBuffer: true,
-            destroy() {
-              if (addDestroyed) return;
-              addDestroyed = true;
-              deferredDestroyBuffer(addBuffer, addBufferSize);
-            },
-          } as BackendTensor);
-        }
+        if (addOutput) addNode.result = wrapFusionOutput(addNode.device, addOutput);
       }
     }
     // Clean up temporary contiguous copies (deferred destroy for GPU fence)
@@ -281,17 +271,8 @@ export async function executeSequentialSegment(
   if (useSharedEncoder) beginSharedEncoder();
 
   try {
-    // Build consumer count map for reduction preamble detection
-    const reductionConsumerCount = new Map<number, number>();
-    if (backend.name === "webgpu") {
-      for (const n of (allPlanNodes ?? nodes)) {
-        for (const ref of n.inputs) {
-          if (ref.kind === "pending") {
-            reductionConsumerCount.set(ref.node.id, (reductionConsumerCount.get(ref.node.id) ?? 0) + 1);
-          }
-        }
-      }
-    }
+    const reductionConsumerCount = backend.name === "webgpu"
+      ? buildConsumerCount(allPlanNodes ?? nodes) : new Map<number, number>();
 
     for (let nodeIdx = 0; nodeIdx < nodes.length; nodeIdx++) {
       const node = nodes[nodeIdx];
@@ -374,18 +355,8 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
   try {
     // Use pre-built consumer count if provided, otherwise build it.
-    // The consumer count is used for both reduction preamble and matmul epilogue detection.
-    // Building it once per plan (in the caller) instead of once per segment saves ~15ms.
-    const reductionConsumerCount = prebuiltConsumerCount ?? new Map<number, number>();
-    if (!prebuiltConsumerCount && backend.name === "webgpu") {
-      for (const n of (allPlanNodes ?? nodes)) {
-        for (const ref of n.inputs) {
-          if (ref.kind === "pending") {
-            reductionConsumerCount.set(ref.node.id, (reductionConsumerCount.get(ref.node.id) ?? 0) + 1);
-          }
-        }
-      }
-    }
+    const reductionConsumerCount = prebuiltConsumerCount
+      ?? (backend.name === "webgpu" ? buildConsumerCount(allPlanNodes ?? nodes) : new Map<number, number>());
 
     // Intra-segment periodic reclamation: flush pending buffers to main pool
     // every N nodes so freed intermediates can be reused within the same segment.
