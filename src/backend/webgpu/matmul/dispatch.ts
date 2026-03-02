@@ -29,14 +29,13 @@ import {
   type DType,
   getSubgroupSupport,
   getTransposeMode,
-  getWorkgroupSize,
   type MatmulKernelConfig,
   type ShapeClass,
   validateConfig,
 } from "./types";
 import { getDefaultConfigForShape, generateNeighborConfigs } from "./autotune";
-import { autotune, type BenchmarkFn, cacheTuningResult } from "./autotune";
-import type { GPUBuffer, GPUDevice, GPUComputePipeline, GPUCommandEncoder, GPUQueue } from "../gpu-types";
+import { cacheTuningResult } from "./autotune";
+import type { GPUBuffer, GPUDevice, GPUComputePipeline, GPUQueue } from "../gpu-types";
 import { GPUBufferUsage } from "../gpu-types";
 
 /**
@@ -122,19 +121,6 @@ function getConfigForShape(
     return cached;
   }
   return getDefaultConfigForShape(shapeClass, hasEpilogue);
-}
-
-/**
- * Store a tuning result.
- */
-function setTuningResult(
-  shapeClass: ShapeClass,
-  dtype: DType,
-  config: MatmulKernelConfig,
-  hasEpilogue: boolean = false,
-): void {
-  const key = getTuningKey(shapeClass, dtype, hasEpilogue);
-  tuningCache.set(key, config);
 }
 
 /**
@@ -626,7 +612,6 @@ function computeKSplitFactor(
 export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
   const {
     device,
-    queue,
     a,
     b,
     out,

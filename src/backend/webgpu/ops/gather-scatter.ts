@@ -6,7 +6,7 @@
  */
 import type { BackendTensor, CatOptions, GatherOptions, ScatterAddOptions } from "../../types";
 import { sizeOf } from "../../../core/shape";
-import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
+import type { GPUBuffer } from "../gpu-types";
 import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import { WORKGROUP_SIZE, compute2DDispatch } from "../shape-utils";
 import { requireContext } from "../gpu-context";

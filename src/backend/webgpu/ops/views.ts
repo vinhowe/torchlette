@@ -3,14 +3,14 @@
  * detectSimpleTranspose, ensureContiguous.
  */
 import type { BackendTensor, DType, TransposeOptions } from "../../types";
-import type { GPUBuffer, GPUDevice, WebGPUTensor } from "../gpu-types";
+import type { WebGPUTensor } from "../gpu-types";
 import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import {
   sizeOf, WORKGROUP_SIZE, compute2DDispatch,
-  contiguousStrides, checkContiguousStrides, dtypeBytes, dtypeToWgsl,
+  contiguousStrides, dtypeBytes, dtypeToWgsl,
   alignBufferSize, lcm, alignedChunkSize,
 } from "../shape-utils";
-import { requireContext, isF16Supported, f16WeightCache, f32ArrayToF16Array, f16ArrayToF32Array, f16ToF32, f32ToF16 } from "../gpu-context";
+import { requireContext, f16WeightCache } from "../gpu-context";
 import { dispatchComputePass, dispatchElementwise, getPipeline } from "../dispatch";
 import { createTensor, createTrackedBuffer } from "../tensor";
 import { bufferPool, destroyCopy } from "../buffer-pool";
@@ -199,7 +199,6 @@ function inferReshapeStrides(
     let newProduct = newShape[newIdx];
 
     // Collect old dims until oldProduct >= newProduct
-    const groupStart = oldIdx;
     while (oldProduct < newProduct && oldIdx + 1 < oldN) {
       // Check contiguity between consecutive old dims
       if (oldStrides[oldIdx] !== oldStrides[oldIdx + 1] * oldShape[oldIdx + 1]) {
@@ -358,18 +357,15 @@ export function contiguous(a: BackendTensor): BackendTensor {
     );
   }
 
-  const ctx = requireContext();
   const shape = tensor.shape;
-  const rank = shape.length;
   const outSize = sizeOf(shape);
-  const dtype = tensor.dtype;
-  const bytesPerElement = dtypeBytes(dtype);
 
   if (outSize === 0) {
     throw new Error("contiguous: empty tensors not supported");
   }
 
   // Check if input buffer exceeds max binding size
+  const ctx = requireContext();
   const limits = ctx.device.limits;
   const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
@@ -621,7 +617,6 @@ export function narrow(a: BackendTensor, dim: number, start: number, length: num
  */
 export function narrowBackward(grad: BackendTensor, dim: number, start: number, originalLength: number): BackendTensor {
   const gradTensor = ensureContiguous(asGPUTensor(grad));
-  const ctx = requireContext();
 
   const outShape = gradTensor.shape.slice();
   outShape[dim] = originalLength;

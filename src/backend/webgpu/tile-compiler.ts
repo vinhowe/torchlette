@@ -16,13 +16,12 @@
 
 import type {
   IRNode, TileKernelSpec,
-  Statement, DataType,
+  Statement,
   ThreadIdxNode,
 } from "./tile-ir";
 import { buildKernelIR, type KernelContext, elementwiseGrid } from "./tile-ir";
 import { computeSafeVecWidth } from "./tile-access-analysis";
 import { getSubgroupSupport } from "./matmul/types";
-import { F32_NEG_MAX } from "./shape-utils";
 import {
   freshVar,
   resetLoweringState,

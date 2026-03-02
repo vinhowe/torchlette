@@ -17,7 +17,7 @@ import type { GPUBuffer, GPUCommandBuffer, GPUCommandEncoder } from "./gpu-types
 import {
   activeBatch, setActiveBatch,
   sharedEncoderActive, setSharedEncoderActive,
-  sharedEncoderWriteSet, resetSharedEncoderWriteSet, trackSharedEncoderWrite,
+  sharedEncoderWriteSet, resetSharedEncoderWriteSet,
   replayPinnedBufferSet,
   requireContext,
   incrementSubmitCount,
