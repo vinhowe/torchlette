@@ -13,7 +13,7 @@
 
 import type { GPUBuffer } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
-import { type TileKernelSpec, perRowGrid, perRowKernel } from "./tile-ir";
+import { type TileKernelSpec, perRowKernel } from "./tile-ir";
 import { createTileKernelDispatcher, type TileKernelInstance } from "./tile-dispatch";
 import { requireContext } from "./webgpu-state";
 import { resolveOutputBuffer } from "./buffer-arena";

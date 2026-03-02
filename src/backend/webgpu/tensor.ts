@@ -10,7 +10,6 @@ import {
   sizeOf,
   contiguousStrides,
   checkContiguousStrides,
-  dtypeBytes,
   alignBufferSize,
 } from "./shape-utils";
 import { bufferPool } from "./buffer-pool";

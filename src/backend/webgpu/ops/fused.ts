@@ -3,13 +3,13 @@
  * fusedLayerNorm, fusedAttention, read, waitForGPU, mulScalarInPlace.
  */
 import type { BackendTensor } from "../../types";
-import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
+import type { GPUBuffer } from "../gpu-types";
 import { GPUBufferUsage, GPUMapMode, asGPUTensor } from "../gpu-types";
 import {
   dtypeBytes, alignBufferSize, WORKGROUP_SIZE,
 } from "../shape-utils";
 import {
-  requireContext, isF16Supported,
+  requireContext,
   f16WeightCache, f16ArrayToF32Array,
 } from "../gpu-context";
 import { gpuContext } from "../webgpu-state";

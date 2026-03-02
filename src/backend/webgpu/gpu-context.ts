@@ -7,12 +7,8 @@ import type {
   GPUDevice,
   GPUQueue,
   GPUAdapter,
-  GPUAdapterLimits,
-  GPUComputePipeline,
   WebGPUProvider,
   WebGPUModule,
-  WebGPUContext,
-  WebGPUTensor,
 } from "./gpu-types";
 import { gpuContext, setGpuContext, requireContext } from "./webgpu-state";
 import { bufferPool } from "./buffer-pool";

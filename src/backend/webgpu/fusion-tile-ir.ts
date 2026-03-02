@@ -14,7 +14,6 @@ import {
   type FusedKernelRecipe,
   type GeneratedKernel,
   type KernelGenOptions,
-  type VectorWidth,
   computeKernelMeta,
   needsBroadcast,
 } from "./fusion-types";
@@ -215,8 +214,6 @@ export function generateFusedKernelTileIR(
   const meta = computeKernelMeta(recipe, options);
   const { vectorWidth, workItems, workgroupSize, gridSizeX } = meta;
 
-  const outputShape = recipe.outputs[0].shape;
-  const totalElements = sizeOf(outputShape);
   const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
 
   // Build physical binding map (skip inlined constants)

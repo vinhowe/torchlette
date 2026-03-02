@@ -18,7 +18,7 @@ import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
-import { type TileKernelSpec, perRowGrid, ceilDivGrid, perRowKernel } from "./tile-ir";
+import { type TileKernelSpec, ceilDivGrid, perRowKernel } from "./tile-ir";
 import { createTileKernelDispatcher } from "./tile-dispatch";
 
 // ============================================================================
@@ -232,40 +232,6 @@ const rowStatsTileKernel = createTileKernelDispatcher(layerNormRowStatsSpec);
 const gradWBTileKernel = createTileKernelDispatcher(layerNormBackwardGradWeightBiasSpec);
 
 // ============================================================================
-// Config Buffer (cached per numRows x featureDim)
-// ============================================================================
-
-const configCache = new Map<string, GPUBuffer>();
-// Reusable typed arrays for config writes
-const configArrayBuffer = new ArrayBuffer(16);
-const configU32View = new Uint32Array(configArrayBuffer);
-const configF32View = new Float32Array(configArrayBuffer);
-const configU8View = new Uint8Array(configArrayBuffer);
-
-function getOrCreateConfigBuffer(
-  device: GPUDevice,
-  numRows: number,
-  featureDim: number,
-  eps: number,
-): GPUBuffer {
-  const key = `${numRows}:${featureDim}`;
-  let buf = configCache.get(key);
-  if (!buf) {
-    buf = device.createBuffer({
-      size: 16, // { num_rows: u32, feature_dim: u32, eps: f32, _pad: u32 }
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    configCache.set(key, buf);
-  }
-  configU32View[0] = numRows;
-  configU32View[1] = featureDim;
-  configF32View[2] = eps;
-  configU32View[3] = 0; // padding
-  device.queue.writeBuffer(buf, 0, configU8View);
-  return buf;
-}
-
-// ============================================================================
 // Dispatch Functions
 // ============================================================================
 
@@ -365,7 +331,6 @@ export function resetLayerNormKernelState(): void {
   gradXTileKernel.reset();
   rowStatsTileKernel.reset();
   gradWBTileKernel.reset();
-  configCache.clear();
   for (const entry of rowStatsTempCache.values()) {
     entry.meanBuffer.destroy();
     entry.invStdBuffer.destroy();

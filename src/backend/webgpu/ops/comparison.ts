@@ -6,7 +6,7 @@ import type {
   BackendTensor,
   ArgReduceOptions,
 } from "../../types";
-import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
+import type { GPUBuffer } from "../gpu-types";
 import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import {
   broadcastShapes,

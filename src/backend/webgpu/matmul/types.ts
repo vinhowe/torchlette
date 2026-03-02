@@ -72,27 +72,6 @@ export type MatmulKernelConfig = {
 export type TransposeMode = "NN" | "NT" | "TN" | "TT";
 
 /**
- * Parameters passed to the matmul shader as uniforms.
- */
-type MatmulParams = {
-  m: number;
-  n: number;
-  k: number;
-  /** Transpose mode encoded as integer: 0=NN, 1=NT, 2=TN, 3=TT */
-  transposeMode: number;
-  /** Batch size (total number of batch elements after broadcasting) */
-  batchSize: number;
-  /** Leading dimension of A (stride between rows) */
-  lda: number;
-  /** Leading dimension of B (stride between rows) */
-  ldb: number;
-  /** Leading dimension of output (stride between rows) */
-  ldc: number;
-  /** Alpha scaling factor (output = alpha * A @ B) */
-  alpha: number;
-};
-
-/**
  * Shape class for autotuning cache keys.
  * Different shape classes may have different optimal configurations.
  */
@@ -121,29 +100,6 @@ export type TuneResult = {
 /**
  * Matmul dispatch options passed by the caller.
  */
-type MatmulOptions = {
-  /** Whether A is transposed */
-  transA?: boolean;
-  /** Whether B is transposed */
-  transB?: boolean;
-  /** Alpha scaling factor */
-  alpha?: number;
-  /** Specific kernel config (overrides autotuning) */
-  config?: MatmulKernelConfig;
-};
-
-/**
- * AMP (Automatic Mixed Precision) configuration.
- */
-type AMPConfig = {
-  /** Dtype for computation (f16 for speed, f32 for accuracy) */
-  computeDtype: DType;
-  /** Dtype for accumulation (always f32 for numerical stability) */
-  accumulateDtype: "f32";
-  /** Dtype for output */
-  outputDtype: DType;
-};
-
 /**
  * Default kernel configuration optimized for broad compatibility.
  * Conservative tile sizes (32x32) work across most devices.

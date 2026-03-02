@@ -28,7 +28,7 @@
 
 import {
   BlockOps, Block, TileRange, buildPtr, buildMask,
-  type BlockPtr, type BlockThreadPtr, type BlockCoopPtr,
+  type BlockPtr,
   type BlockLoadOpts, type BlockStorePtr,
 } from "./tile-ops";
 

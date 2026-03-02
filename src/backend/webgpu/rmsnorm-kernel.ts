@@ -14,7 +14,7 @@ import { requireContext } from "./webgpu-state";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
-import { type TileKernelSpec, perRowGrid, ceilDivGrid, perRowKernel } from "./tile-ir";
+import { type TileKernelSpec, ceilDivGrid, perRowKernel } from "./tile-ir";
 import { createTileKernelDispatcher } from "./tile-dispatch";
 
 const WG = WORKGROUP_SIZE; // 256

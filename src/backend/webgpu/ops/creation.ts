@@ -4,7 +4,7 @@
 
 import type { WebGPUTensor } from "../gpu-types";
 import { GPUBufferUsage } from "../gpu-types";
-import { sizeOf, WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, compute2DDispatch, alignBufferSize } from "../shape-utils";
+import { sizeOf, WORKGROUP_SIZE, compute2DDispatch, alignBufferSize } from "../shape-utils";
 import { fillWGSL, arangeWGSL, triangularWGSL, randWGSL, randnWGSL, bernoulliWGSL } from "./ops-tile-ir";
 import { requireContext, f32ArrayToF16Array } from "../gpu-context";
 import { dispatchComputePass, getPipeline } from "../dispatch";
