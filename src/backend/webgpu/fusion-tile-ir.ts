@@ -289,6 +289,9 @@ export function generateFusedKernelTileIR(
     recipe.outputs.some((o) => o.dtype === "f16") ||
     recipe.nodes.some((n) => n.dtype === "f16");
 
+  // Output shape for broadcast index computation (all outputs share the same shape)
+  const outputShape = recipe.outputs[0].shape;
+
   const spec: TileKernelSpec = {
     name: `fused_${recipe.id}`,
     workgroupSize,
