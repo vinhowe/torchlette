@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Engine } from "../src/engine";
+import { Engine } from "../src/engine/engine";
 
 describe("token algebra", () => {
   it("afterAll is commutative, associative, and idempotent", () => {

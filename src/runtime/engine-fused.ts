@@ -13,11 +13,8 @@ import type {
   FusedLayerNormConfig,
   FusedRMSNormConfig,
 } from "../backend/types";
-import {
-  createLazyIRNode,
-  createPendingRef,
-  type LazyRef,
-} from "../engine/lazy";
+import { createPendingRef, type LazyRef } from "../engine/lazy-types";
+import { createLazyIRNode } from "../engine/node-factory";
 
 interface FusedOpResult {
   ref: LazyRef;

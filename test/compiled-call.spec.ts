@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Engine, type SemanticSubeventSchedule } from "../src/engine";
+import { Engine, type SemanticSubeventSchedule } from "../src/engine/engine";
 
 describe("compiled-call schedule expansion", () => {
   it("sets planInstanceId to callInstanceId for subevents", () => {

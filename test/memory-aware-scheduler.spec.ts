@@ -8,14 +8,14 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-  resetNodeIdCounter,
-  resetStorageIdCounter,
-  storageTracker,
-} from "../src/engine/lazy";
-import {
   analyzeLifetimes,
   findDeadTensorsAtStep,
 } from "../src/engine/lifetime-analysis";
+import {
+  resetNodeIdCounter,
+  resetStorageIdCounter,
+} from "../src/engine/node-factory";
+import { storageTracker } from "../src/engine/storage-tracker";
 import { RuntimeEngine } from "../src/runtime/engine";
 
 describe("Memory-Aware Scheduler", () => {

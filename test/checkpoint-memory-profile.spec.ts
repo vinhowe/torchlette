@@ -10,7 +10,10 @@
 import { afterEach, beforeAll, describe, it } from "vitest";
 import { GPT2, type GPT2Config } from "../examples/gpt2/model";
 import { gpuMemoryTracker } from "../src/backend/webgpu/memory-tracker";
-import { resetNodeIdCounter, resetStorageIdCounter } from "../src/engine/lazy";
+import {
+  resetNodeIdCounter,
+  resetStorageIdCounter,
+} from "../src/engine/node-factory";
 import { Torchlette } from "../src/frontend";
 import { resetBaseIdCounter } from "../src/runtime/tensor";
 import { canUseWebGPU } from "./helpers/webgpu";

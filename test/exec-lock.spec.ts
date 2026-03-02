@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Engine, EngineBusyError } from "../src/engine";
+import { Engine, EngineBusyError } from "../src/engine/engine";
 
 describe("exec lock", () => {
   it("throws on overlapping entrypoints and releases the lock", () => {

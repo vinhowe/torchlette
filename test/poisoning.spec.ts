@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Engine, PoisonedEngineError } from "../src/engine";
+import { Engine, PoisonedEngineError } from "../src/engine/engine";
 
 describe("poisoning", () => {
   it("throws on execution-affecting ops after poison", () => {

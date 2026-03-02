@@ -1,5 +1,5 @@
 import { shapesEqual } from "./core/shape";
-import { storageTracker } from "./engine/lazy";
+import { storageTracker } from "./engine/storage-tracker";
 import type { Torchlette } from "./frontend";
 import type { Tensor } from "./frontend-tensor";
 import type { AutogradNode, GetSavedFn } from "./frontend-types";

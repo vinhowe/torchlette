@@ -7,7 +7,7 @@ import {
   pushAutocast,
 } from "./engine/amp";
 import { OP_DTYPE_RULES, promoteDtype } from "./engine/dtype-rules";
-import type { LazyOpCode } from "./engine/lazy";
+import type { LazyOpCode } from "./engine/lazy-types";
 import type { Torchlette } from "./frontend";
 import type { Tensor } from "./frontend-tensor";
 import type { AutocastOptions, PackHook, UnpackHook } from "./frontend-types";

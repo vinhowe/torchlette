@@ -27,25 +27,29 @@ import {
   contiguousStrides,
 } from "../core/shape";
 import { OP_DTYPE_RULES, promoteDtype } from "../engine/dtype-rules";
+import { executeLoweredPlan } from "../engine/executor-lowered";
+import {
+  executePlanOptimized,
+  getFusionAnalysisTemplate,
+  type OptimizedExecutionStats,
+} from "../engine/executor-optimized";
+import {
+  executePlan,
+  executePlanSegmented,
+} from "../engine/executor-sequential";
 import { computePlanFingerprint } from "../engine/fusion-detect";
 import {
-  buildMergedPlan,
-  createLazyIRNode,
   createMaterializedRef,
   createPendingRef,
   createScalarRef,
-  executeLoweredPlan,
-  executePlan,
-  executePlanOptimized,
-  executePlanSegmented,
-  getFusionAnalysisTemplate,
   type LazyIRNode,
   type LazyOpCode,
   type LazyRef,
-  type OptimizedExecutionStats,
-  storageTracker,
-} from "../engine/lazy";
+} from "../engine/lazy-types";
 import { isDataSourceOp } from "../engine/lowered-plan";
+import { createLazyIRNode } from "../engine/node-factory";
+import { buildMergedPlan } from "../engine/plan-builder";
+import { storageTracker } from "../engine/storage-tracker";
 import {
   extractAttentionDKOp,
   extractAttentionDVOp,
@@ -1726,7 +1730,7 @@ export class RuntimeEngine {
    * Used by the fused Adam kernel to create tensors for side outputs (m, v).
    */
   createFromStorageHandle(
-    storage: import("../engine/lazy").StorageHandle,
+    storage: import("../engine/lazy-types").StorageHandle,
     shape: number[],
     device: DeviceKind,
     dtype: DType = "f32",

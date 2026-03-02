@@ -29,7 +29,8 @@
  */
 
 import type { Backend, DeviceKind } from "../backend/types";
-import { createLazyIRNode, createPendingRef } from "../engine/lazy";
+import { createPendingRef } from "../engine/lazy-types";
+import { createLazyIRNode } from "../engine/node-factory";
 import type { Tensor, Torchlette } from "../frontend";
 import type { Adam } from "./adam";
 import type { SGD } from "./sgd";
