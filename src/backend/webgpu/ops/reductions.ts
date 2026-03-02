@@ -44,46 +44,17 @@ import {
 // Shared Metadata
 // ============================================================================
 
-/**
- * Compute strides, reduction size, and input→output dimension mapping
- * shared by sum(), max(), and sumDimWithPreamble().
- */
-function buildReductionMetadata(
-  inputShape: number[],
-  normalizedDims: number[],
-  outShape: number[],
-  keepdim: boolean,
-): {
-  inputStrides: number[];
-  outStrides: number[];
-  reductionSize: number;
-  inputToOutDim: number[];
-} {
+/** Compute the count of elements being reduced across given dims. */
+function reductionCount(inputShape: number[], dim: number | number[] | undefined | null): number {
+  if (dim === undefined || dim === null) return sizeOf(inputShape);
+  const dims = Array.isArray(dim) ? dim : [dim];
   const rank = inputShape.length;
-  const inputStrides = contiguousStrides(inputShape);
-  const outStrides = contiguousStrides(outShape);
-
-  let reductionSize = 1;
-  for (const d of normalizedDims) reductionSize *= inputShape[d];
-
-  const inputToOutDim: number[] = [];
-  let outDimIdx = 0;
-  for (let i = 0; i < rank; i++) {
-    if (normalizedDims.includes(i)) {
-      if (keepdim) { inputToOutDim.push(outDimIdx); outDimIdx++; }
-      else inputToOutDim.push(-1);
-    } else {
-      inputToOutDim.push(outDimIdx);
-      outDimIdx++;
-    }
-  }
-
-  return { inputStrides, outStrides, reductionSize, inputToOutDim };
+  return dims.reduce((acc, d) => acc * inputShape[normalizeDim(d, rank)], 1);
 }
 
 /**
  * Shared preamble for dim-wise reductions.
- * Normalizes dims, computes outShape, outSize, metadata.
+ * Normalizes dims, computes outShape, outSize, strides, inputToOutDim.
  * Returns null if all dims are reduced (caller should use full-reduction path).
  */
 interface DimReductionSetup {
@@ -114,15 +85,27 @@ function prepareDimReduction(
       outShape.push(inputShape[i]);
     }
   }
-
   if (outShape.length === 0) return null;
 
-  const outSize = sizeOf(outShape);
-  const { inputStrides, outStrides, reductionSize, inputToOutDim } =
-    buildReductionMetadata(inputShape, normalizedDims, outShape, keepdim);
+  const inputStrides = contiguousStrides(inputShape);
+  const outStrides = contiguousStrides(outShape);
+  let reductionSize = 1;
+  for (const d of normalizedDims) reductionSize *= inputShape[d];
+
+  const inputToOutDim: number[] = [];
+  let outDimIdx = 0;
+  for (let i = 0; i < rank; i++) {
+    if (normalizedDims.includes(i)) {
+      if (keepdim) { inputToOutDim.push(outDimIdx); outDimIdx++; }
+      else inputToOutDim.push(-1);
+    } else {
+      inputToOutDim.push(outDimIdx);
+      outDimIdx++;
+    }
+  }
 
   return {
-    normalizedDims, rank, outShape, outSize, reductionSize,
+    normalizedDims, rank, outShape, outSize: sizeOf(outShape), reductionSize,
     inputStrides, outStrides, inputToOutDim,
   };
 }
@@ -143,6 +126,23 @@ function inputBufferMap(inputs: BackendTensor[]): Record<string, GPUBuffer> {
   const m: Record<string, GPUBuffer> = {};
   for (let i = 0; i < inputs.length; i++) m[`in${i}`] = asGPUTensor(inputs[i]).buffer;
   return m;
+}
+
+/** Create a 1/count scalar buffer and prepend mul(1/count) to an epilogue chain (for mean). */
+function createInvCountEpilogue(
+  ctx: WebGPUContext, count: number,
+  epilogueOps: ReductionEpilogueOpDesc[], epilogueInputs: BackendTensor[],
+): { ops: ReductionEpilogueOpDesc[]; inputs: BackendTensor[]; invCountBuffer: GPUBuffer } {
+  const invCountBuffer = createTrackedBuffer(ctx.device, {
+    size: 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  });
+  ctx.device.queue.writeBuffer(invCountBuffer, 0, new Float32Array([1.0 / count]));
+  return {
+    ops: [{ kind: "binary", op: "mul", inputIndex: epilogueInputs.length }, ...epilogueOps],
+    inputs: [...epilogueInputs, { buffer: invCountBuffer } as unknown as BackendTensor],
+    invCountBuffer,
+  };
 }
 
 /** Add epilogue binary input buffers to a bindings map. */
@@ -427,25 +427,11 @@ export function sumWithPreambleEpilogue(
   let effectiveEpilogueInputs = epilogueInputs;
   let invCountBuffer: GPUBuffer | null = null;
   if (isMean) {
-    let count: number;
-    if (dim === undefined || dim === null) {
-      count = tensor0.size;
-    } else {
-      const dims = Array.isArray(dim) ? dim : [dim];
-      const rank = inputShape.length;
-      count = dims.reduce((acc, d) => acc * inputShape[normalizeDim(d, rank)], 1);
-    }
-    invCountBuffer = createTrackedBuffer(ctx.device, {
-      size: 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-    ctx.device.queue.writeBuffer(invCountBuffer, 0, new Float32Array([1.0 / count]));
-    const divInputIndex = epilogueInputs.length;
-    effectiveEpilogueOps = [
-      { kind: "binary", op: "mul", inputIndex: divInputIndex },
-      ...epilogueOps,
-    ];
-    effectiveEpilogueInputs = [...epilogueInputs, { buffer: invCountBuffer } as unknown as BackendTensor];
+    const count = reductionCount(inputShape, dim);
+    const mean = createInvCountEpilogue(ctx, count, epilogueOps, epilogueInputs);
+    effectiveEpilogueOps = mean.ops;
+    effectiveEpilogueInputs = mean.inputs;
+    invCountBuffer = mean.invCountBuffer;
   }
 
   const bpe = dtypeBytes(outputDtype);
@@ -547,18 +533,7 @@ export function min(a: BackendTensor, options?: MaxOptions): BackendTensor {
 
 export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
   const tensor = asGPUTensor(a);
-  const inputShape = tensor.shape;
-  const dim = options?.dim;
-
-  // Compute the count of elements being averaged
-  let count: number;
-  if (dim === undefined || dim === null) {
-    count = tensor.size;
-  } else {
-    const dims = Array.isArray(dim) ? dim : [dim];
-    const rank = inputShape.length;
-    count = dims.reduce((acc, d) => acc * inputShape[normalizeDim(d, rank)], 1);
-  }
+  const count = reductionCount(tensor.shape, options?.dim);
 
   // sum() handles contiguity internally
   const sumTensor = asGPUTensor(sum(a, options));
@@ -667,40 +642,10 @@ export function meanWithEpilogue(
   epilogueInputs: BackendTensor[],
   outputDtype: DType,
 ): BackendTensor {
-  const ctx = requireContext();
   const tensor = asGPUTensor(a);
-  const inputShape = tensor.shape;
-  const dim = options?.dim;
-
-  // Compute the count of elements being averaged
-  let count: number;
-  if (dim === undefined || dim === null) {
-    count = tensor.size;
-  } else {
-    const dims = Array.isArray(dim) ? dim : [dim];
-    const rank = inputShape.length;
-    count = dims.reduce((acc, d) => acc * inputShape[normalizeDim(d, rank)], 1);
-  }
-
-  // Create a scalar buffer with 1/count for the division
-  const invCountBuffer = createTrackedBuffer(ctx.device, {
-    size: 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-  });
-  ctx.device.queue.writeBuffer(invCountBuffer, 0, new Float32Array([1.0 / count]));
-
-  // Prepend mul(1/count) to the epilogue chain
-  const divInputIndex = epilogueInputs.length;
-  const meanEpilogueOps: ReductionEpilogueOpDesc[] = [
-    { kind: "binary", op: "mul", inputIndex: divInputIndex },
-    ...epilogueOps,
-  ];
-  const allEpilogueInputs = [...epilogueInputs, { buffer: invCountBuffer } as unknown as BackendTensor];
-
-  const result = sumWithEpilogue(a, options, meanEpilogueOps, allEpilogueInputs, outputDtype);
-
-  // Destroy the scalar buffer (already dispatched, safe to destroy)
-  invCountBuffer.destroy();
-
+  const count = reductionCount(tensor.shape, options?.dim);
+  const mean = createInvCountEpilogue(requireContext(), count, epilogueOps, epilogueInputs);
+  const result = sumWithEpilogue(a, options, mean.ops, mean.inputs, outputDtype);
+  mean.invCountBuffer.destroy();
   return result;
 }
