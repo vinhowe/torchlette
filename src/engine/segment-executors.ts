@@ -1,37 +1,54 @@
-import type { Backend, BackendTensor, DType } from "../backend/types";
-import { asGPUTensor, type GPUBuffer } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
-import { sizeOf } from "../core/shape";
+import type { Backend, BackendTensor, DType } from "../backend/types";
+import { computeContiguousStrides } from "../backend/types";
 import {
-  flushBufferPool,
-  flushSharedEncoder,
   beginSharedEncoder,
   endSharedEncoder,
+  flushBufferPool,
+  flushSharedEncoder,
   setAdamBatchMode,
   setCurrentOpLabel,
 } from "../backend/webgpu";
-import { setProfileModule, recordFusionFallback } from "../backend/webgpu/profiler";
+import { asGPUTensor, type GPUBuffer } from "../backend/webgpu/gpu-types";
 import {
-  isFusibleOp,
-  groupToRecipe,
+  recordFusionFallback,
+  setProfileModule,
+} from "../backend/webgpu/profiler";
+import { sizeOf } from "../core/shape";
+import {
   type FusionGroup,
+  type groupToRecipe,
+  isFusibleOp,
 } from "./fusion-detect";
+import type { LazyIRNode, StorageHandle } from "./lazy-types";
+import type { TensorLifetime } from "./lifetime-analysis";
 import {
-  type TensorLifetime,
-} from "./lifetime-analysis";
-import {
-  LoweredPlanBuilder,
   isDataSourceOp,
   isViewOp,
+  type LoweredPlanBuilder,
 } from "./lowered-plan";
-import type { LazyIRNode, StorageHandle } from "./lazy-types";
-import { createStorageHandle, wrapResultAsStorage, ensureWebGPUMatmulImports, _webgpuMatmulImports } from "./node-factory";
-import { releaseDeadTensors } from "./storage-tracker";
-import { computeContiguousStrides } from "../backend/types";
-import { getInputStorage, executeOp, withProfileContext } from "./op-dispatch";
 import type { MatmulPrologueInfo } from "./matmul-epilogue";
-import { detectMatmulEpilogue, detectMatmulEpilogueCore, executeMatmulWithEpilogue } from "./matmul-epilogue";
-import { detectReductionPreamble, executeReductionWithPreamble, detectReductionEpilogue, executeReductionWithEpilogue, detectReductionFusion, executeReductionWithFusion } from "./reduction-preamble";
+import {
+  detectMatmulEpilogue,
+  detectMatmulEpilogueCore,
+  executeMatmulWithEpilogue,
+} from "./matmul-epilogue";
+import {
+  _webgpuMatmulImports,
+  createStorageHandle,
+  ensureWebGPUMatmulImports,
+  wrapResultAsStorage,
+} from "./node-factory";
+import { executeOp, getInputStorage, withProfileContext } from "./op-dispatch";
+import {
+  detectReductionEpilogue,
+  detectReductionFusion,
+  detectReductionPreamble,
+  executeReductionWithEpilogue,
+  executeReductionWithFusion,
+  executeReductionWithPreamble,
+} from "./reduction-preamble";
+import { releaseDeadTensors } from "./storage-tracker";
 
 /** Build a map of nodeId → consumer count from plan nodes. */
 function buildConsumerCount(nodes: LazyIRNode[]): Map<number, number> {
@@ -81,7 +98,9 @@ export async function executeFusedSegment(
     await executeFusedWebGPU(
       group,
       recipe,
-      backend as Backend & { device?: { limits?: { maxStorageBuffersPerShaderStage?: number } } },
+      backend as Backend & {
+        device?: { limits?: { maxStorageBuffersPerShaderStage?: number } };
+      },
       enableVectorization,
     );
     return;
@@ -97,7 +116,9 @@ export async function executeFusedSegment(
 export async function executeFusedWebGPU(
   group: FusionGroup,
   recipe: ReturnType<typeof groupToRecipe>,
-  backend: Backend & { device?: { limits?: { maxStorageBuffersPerShaderStage?: number } } },
+  backend: Backend & {
+    device?: { limits?: { maxStorageBuffersPerShaderStage?: number } };
+  },
   enableVectorization: boolean,
 ): Promise<void> {
   // Import fusion dispatch and buffer lifecycle helpers (cached on first call)
@@ -115,10 +136,19 @@ export async function executeFusedWebGPU(
     const bufSize = buf.size;
     let destroyed = false;
     return createStorageHandle(device, {
-      buffer: output.buffer, shape: output.shape, dtype: output.dtype,
-      size: sizeOf(output.shape), strides: computeContiguousStrides(output.shape),
-      offset: 0, isContiguous: true, ownsBuffer: true,
-      destroy() { if (destroyed) return; destroyed = true; deferredDestroyBuffer(buf, bufSize); },
+      buffer: output.buffer,
+      shape: output.shape,
+      dtype: output.dtype,
+      size: sizeOf(output.shape),
+      strides: computeContiguousStrides(output.shape),
+      offset: 0,
+      isContiguous: true,
+      ownsBuffer: true,
+      destroy() {
+        if (destroyed) return;
+        destroyed = true;
+        deferredDestroyBuffer(buf, bufSize);
+      },
     } as BackendTensor);
   };
 
@@ -137,16 +167,22 @@ export async function executeFusedWebGPU(
   // If we'd exceed the device limit, skip fusion silently (no console.warn spam).
   const maxStorageBuffers = device.limits?.maxStorageBuffersPerShaderStage ?? 8;
   const numOutputs = recipe.outputs?.length ?? 1;
-  const nonInlinedInputCount = recipe.inputs.filter((inp) => !inp.isInlinedConstant).length;
+  const nonInlinedInputCount = recipe.inputs.filter(
+    (inp) => !inp.isInlinedConstant,
+  ).length;
   const requiredBindings = nonInlinedInputCount + numOutputs;
   if (requiredBindings > maxStorageBuffers) {
-    recordFusionFallback("binding_limit", group.nodes.length, { required: requiredBindings, max: maxStorageBuffers });
+    recordFusionFallback("binding_limit", group.nodes.length, {
+      required: requiredBindings,
+      max: maxStorageBuffers,
+    });
     await executeSequentialSegment(group.nodes, backend);
     return;
   }
 
   // Prepare inputs from external refs, skipping inlined constants
-  const inputs: Array<{ buffer: GPUBuffer; shape: number[]; dtype: DType }> = [];
+  const inputs: Array<{ buffer: GPUBuffer; shape: number[]; dtype: DType }> =
+    [];
   const tempContiguousCopies: Array<{ destroy?: () => void }> = [];
   for (let inputIdx = 0; inputIdx < group.externalInputs.length; inputIdx++) {
     // Skip inlined constants — their values are baked into the shader
@@ -174,7 +210,10 @@ export async function executeFusedWebGPU(
 
     const tensor = asGPUTensor(storage.backendTensor);
     // Fusion requires contiguous inputs — strided/offset layouts not supported by codegen
-    if (tensor.isContiguous === false || (tensor.offset != null && tensor.offset > 0)) {
+    if (
+      tensor.isContiguous === false ||
+      (tensor.offset != null && tensor.offset > 0)
+    ) {
       // Auto-materialize to contiguous rather than abandoning fusion
       if (backend.ops.contiguous) {
         const contig = asGPUTensor(backend.ops.contiguous(tensor));
@@ -188,7 +227,9 @@ export async function executeFusedWebGPU(
       }
       // No contiguous op — fall back
       recordFusionFallback("non_contiguous", group.nodes.length, {
-        shape: tensor.shape, isContiguous: tensor.isContiguous, offset: tensor.offset,
+        shape: tensor.shape,
+        isContiguous: tensor.isContiguous,
+        offset: tensor.offset,
       });
       await executeSequentialSegment(group.nodes, backend);
       return;
@@ -201,12 +242,15 @@ export async function executeFusedWebGPU(
   }
 
   // Check if any input buffer exceeds maxStorageBufferBindingSize
-  const maxBindingSize = device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize =
+    device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const hasOversizedBuffer = inputs.some(
     (inp) => inp.buffer.size > maxBindingSize,
   );
   if (hasOversizedBuffer) {
-    recordFusionFallback("oversized_buffer", group.nodes.length, { maxBindingSize });
+    recordFusionFallback("oversized_buffer", group.nodes.length, {
+      maxBindingSize,
+    });
     await executeSequentialSegment(group.nodes, backend);
     return;
   }
@@ -215,7 +259,7 @@ export async function executeFusedWebGPU(
     // Set module context for profiling from the output node
     setProfileModule(group.outputNode.module ?? "unknown");
     // Build a label from the group's unique op names (e.g. "add+mul+relu")
-    const fusionLabel = [...new Set(group.nodes.map(n => n.op))].join("+");
+    const fusionLabel = [...new Set(group.nodes.map((n) => n.op))].join("+");
     setCurrentOpLabel(fusionLabel);
     // Dispatch the fused kernel
     const result = dispatchFusedKernel(device, recipe, inputs, {
@@ -228,7 +272,8 @@ export async function executeFusedWebGPU(
       for (let i = 0; i < group.additionalOutputNodes.length; i++) {
         const addNode = group.additionalOutputNodes[i];
         const addOutput = result.outputs[i + 1]; // +1: primary is at index 0
-        if (addOutput) addNode.result = wrapFusionOutput(addNode.device, addOutput);
+        if (addOutput)
+          addNode.result = wrapFusionOutput(addNode.device, addOutput);
       }
     }
     // Clean up temporary contiguous copies (deferred destroy for GPU fence)
@@ -271,8 +316,10 @@ export async function executeSequentialSegment(
   if (useSharedEncoder) beginSharedEncoder();
 
   try {
-    const reductionConsumerCount = backend.name === "webgpu"
-      ? buildConsumerCount(allPlanNodes ?? nodes) : new Map<number, number>();
+    const reductionConsumerCount =
+      backend.name === "webgpu"
+        ? buildConsumerCount(allPlanNodes ?? nodes)
+        : new Map<number, number>();
 
     for (let nodeIdx = 0; nodeIdx < nodes.length; nodeIdx++) {
       const node = nodes[nodeIdx];
@@ -282,11 +329,18 @@ export async function executeSequentialSegment(
 
       // Try matmul epilogue fusion (Phase 1)
       if (node.op === "matmul" && backend.name === "webgpu") {
-        const epiloguePlan = detectMatmulEpilogue(nodes, nodeIdx, allPlanNodes ?? nodes, externalNodeIds);
+        const epiloguePlan = detectMatmulEpilogue(
+          nodes,
+          nodeIdx,
+          allPlanNodes ?? nodes,
+          externalNodeIds,
+        );
         if (epiloguePlan) {
-          const epLabel = "matmul+" + epiloguePlan.epilogueOps.map(o => o.kind).join("+");
+          const epLabel =
+            "matmul+" + epiloguePlan.epilogueOps.map((o) => o.kind).join("+");
           await withProfileContext(epLabel, node.module, () =>
-            executeMatmulWithEpilogue(node, epiloguePlan, backend));
+            executeMatmulWithEpilogue(node, epiloguePlan, backend),
+          );
           nodeIdx += epiloguePlan.consumedCount - 1;
           continue;
         }
@@ -294,23 +348,48 @@ export async function executeSequentialSegment(
 
       // Try reduction preamble fusion (Phase 3)
       if (isFusibleOp(node.op) && backend.name === "webgpu") {
-        const reductionPlan = detectReductionPreamble(nodes, nodeIdx, reductionConsumerCount);
+        const reductionPlan = detectReductionPreamble(
+          nodes,
+          nodeIdx,
+          reductionConsumerCount,
+        );
         if (reductionPlan) {
           const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${reductionPlan.op}`;
           await withProfileContext(rpLabel, node.module, () =>
-            executeReductionWithPreamble(reductionPlan, backend));
+            executeReductionWithPreamble(reductionPlan, backend),
+          );
           nodeIdx += 1; // Skip the reduction node (consumed 2 nodes total)
           continue;
         }
       }
 
       // Try reduction epilogue fusion (Phase 4)
-      if ((node.op === "sum" || node.op === "mean" || node.op === "max") && backend.name === "webgpu") {
-        const epiloguePlan = detectReductionEpilogue(nodes, nodeIdx, reductionConsumerCount, externalNodeIds);
+      if (
+        (node.op === "sum" || node.op === "mean" || node.op === "max") &&
+        backend.name === "webgpu"
+      ) {
+        const epiloguePlan = detectReductionEpilogue(
+          nodes,
+          nodeIdx,
+          reductionConsumerCount,
+          externalNodeIds,
+        );
         if (epiloguePlan) {
-          const reLabel = node.op + "+" + epiloguePlan.epilogueOps.map(o => o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind).join("+");
+          const reLabel =
+            node.op +
+            "+" +
+            epiloguePlan.epilogueOps
+              .map((o) =>
+                o.kind === "binary"
+                  ? o.op
+                  : o.kind === "cast"
+                    ? "cast"
+                    : o.op || o.kind,
+              )
+              .join("+");
           await withProfileContext(reLabel, node.module, () =>
-            executeReductionWithEpilogue(epiloguePlan, backend));
+            executeReductionWithEpilogue(epiloguePlan, backend),
+          );
           nodeIdx += epiloguePlan.consumedCount - 1;
           continue;
         }
@@ -318,11 +397,18 @@ export async function executeSequentialSegment(
 
       const nodeBackend = getBackend(node.device) ?? backend;
       setProfileModule(node.module ?? "unknown");
-      const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
+      const inputs = node.inputs.map((ref) =>
+        getInputStorage(ref, nodeBackend),
+      );
       const backendInputs = inputs.map((s) => s.backendTensor);
 
       const resultTensor = await executeOp(node, backendInputs, nodeBackend);
-      node.result = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
+      node.result = wrapResultAsStorage(
+        node.device,
+        resultTensor,
+        backendInputs,
+        inputs,
+      );
     }
   } finally {
     if (useSharedEncoder) endSharedEncoder();
@@ -355,8 +441,11 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
   try {
     // Use pre-built consumer count if provided, otherwise build it.
-    const reductionConsumerCount = prebuiltConsumerCount
-      ?? (backend.name === "webgpu" ? buildConsumerCount(allPlanNodes ?? nodes) : new Map<number, number>());
+    const reductionConsumerCount =
+      prebuiltConsumerCount ??
+      (backend.name === "webgpu"
+        ? buildConsumerCount(allPlanNodes ?? nodes)
+        : new Map<number, number>());
 
     // Intra-segment periodic reclamation: flush pending buffers to main pool
     // every N nodes so freed intermediates can be reused within the same segment.
@@ -375,7 +464,13 @@ export async function executeSequentialSegmentWithEarlyRelease(
           const n = nodes[nodeIdx + c];
           if (n.result) nodeToStorage.set(n.id, n.result);
           step++;
-          releaseDeadTensors(lifetimes, step, outputNodeIds, alreadyReleased, nodeToStorage);
+          releaseDeadTensors(
+            lifetimes,
+            step,
+            outputNodeIds,
+            alreadyReleased,
+            nodeToStorage,
+          );
         }
       } else {
         step += count;
@@ -414,14 +509,18 @@ export async function executeSequentialSegmentWithEarlyRelease(
         if (match.name === "") {
           // This is an intermediate/non-first covered node — skip it
           if (loweredPlanBuilder && nodeIdToFinalPos) {
-            loweredPlanBuilder.recordPrologueSkip(nodeIdToFinalPos.get(node.id)!);
+            loweredPlanBuilder.recordPrologueSkip(
+              nodeIdToFinalPos.get(node.id)!,
+            );
           }
           step++;
           continue;
         }
 
         // Execute compound kernel. We lazy-import to avoid circular deps.
-        const { dispatchFusedSoftmax } = await import("../backend/webgpu/softmax-kernel");
+        const { dispatchFusedSoftmax } = await import(
+          "../backend/webgpu/softmax-kernel"
+        );
 
         // Resolve input: the max node's input[0]
         const nodeBackend = getBackend(node.device) ?? backend;
@@ -430,7 +529,9 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
         // Compute reduction geometry: numRows = product of dims before dim,
         // dimSize = shape[dim]
-        const outputNodeIdx = nodes.findIndex(n => n.id === match.outputNodeId);
+        const outputNodeIdx = nodes.findIndex(
+          (n) => n.id === match.outputNodeId,
+        );
         const outputNode = nodes[outputNodeIdx];
         const shape = inputBT.shape;
         const dim = match.dim < 0 ? shape.length + match.dim : match.dim;
@@ -439,16 +540,26 @@ export async function executeSequentialSegmentWithEarlyRelease(
         for (let d = 0; d < dim; d++) numRows *= shape[d];
 
         const isLog = match.name === "log_softmax";
-        const outBuffer = dispatchFusedSoftmax(inputBT.buffer, numRows, dimSize, isLog);
+        const outBuffer = dispatchFusedSoftmax(
+          inputBT.buffer,
+          numRows,
+          dimSize,
+          isLog,
+        );
 
         // Create result storage on the output node
         const outShape = shape.slice();
         const outStrides = computeContiguousStrides(outShape);
-        outputNode.result = createStorageHandle(
-          node.device,
-          { buffer: outBuffer, shape: outShape, dtype: "f32", size: sizeOf(outShape),
-            strides: outStrides, offset: 0, isContiguous: true, ownsBuffer: true },
-        );
+        outputNode.result = createStorageHandle(node.device, {
+          buffer: outBuffer,
+          shape: outShape,
+          dtype: "f32",
+          size: sizeOf(outShape),
+          strides: outStrides,
+          offset: 0,
+          isContiguous: true,
+          ownsBuffer: true,
+        });
 
         const coveredCount = match.coveredNodeIds.size;
         advanceConsumed(nodeIdx, coveredCount);
@@ -474,8 +585,18 @@ export async function executeSequentialSegmentWithEarlyRelease(
       // Try matmul epilogue/prologue fusion (Phase 1)
       if (node.op === "matmul" && backend.name === "webgpu") {
         let epiloguePlan = prebuiltConsumerCount
-          ? detectMatmulEpilogueCore(nodes, nodeIdx, prebuiltConsumerCount, externalNodeIds)
-          : detectMatmulEpilogue(nodes, nodeIdx, allPlanNodes ?? nodes, externalNodeIds);
+          ? detectMatmulEpilogueCore(
+              nodes,
+              nodeIdx,
+              prebuiltConsumerCount,
+              externalNodeIds,
+            )
+          : detectMatmulEpilogue(
+              nodes,
+              nodeIdx,
+              allPlanNodes ?? nodes,
+              externalNodeIds,
+            );
         const prologues = matmulPrologueMap?.get(node.id);
 
         // If we have prologues but no epilogue, create a minimal (empty) epilogue plan
@@ -497,12 +618,17 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
         if (epiloguePlan) {
           const prologueLabel = epiloguePlan.prologues ? "prologue+" : "";
-          const epilogueLabel = epiloguePlan.epilogueOps.length > 0
-            ? "+" + epiloguePlan.epilogueOps.map(o => o.kind).join("+")
-            : "";
-          const epLabel = `matmul+${prologueLabel}${epilogueLabel}`.replace(/\+$/, "");
+          const epilogueLabel =
+            epiloguePlan.epilogueOps.length > 0
+              ? "+" + epiloguePlan.epilogueOps.map((o) => o.kind).join("+")
+              : "";
+          const epLabel = `matmul+${prologueLabel}${epilogueLabel}`.replace(
+            /\+$/,
+            "",
+          );
           await withProfileContext(epLabel, node.module, () =>
-            executeMatmulWithEpilogue(node, epiloguePlan, backend));
+            executeMatmulWithEpilogue(node, epiloguePlan, backend),
+          );
 
           advanceConsumed(nodeIdx, epiloguePlan.consumedCount);
 
@@ -520,7 +646,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
               epiloguePlan.epilogueInputRefs.length,
               epiloguePlan.outputDtype,
               epiloguePlan.consumedCount,
-              epiloguePlan.prologues?.map(p => ({
+              epiloguePlan.prologues?.map((p) => ({
                 inputIndex: p.inputIndex,
                 castNodeIndex: nodeIdToFinalPos.get(p.castNodeId)!,
                 fromDtype: p.fromDtype,
@@ -536,20 +662,32 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
       // Try combined preamble + epilogue reduction fusion (Phase 5)
       if (isFusibleOp(node.op) && backend.name === "webgpu") {
-        const fusionPlan = detectReductionFusion(nodes, nodeIdx, reductionConsumerCount, externalNodeIds);
+        const fusionPlan = detectReductionFusion(
+          nodes,
+          nodeIdx,
+          reductionConsumerCount,
+          externalNodeIds,
+        );
         if (fusionPlan) {
-          const fusionLabel = `${fusionPlan.isMean ? "mean" : "sum"}+${
-            fusionPlan.preambleChain.map(n => n.op).join("+")
-          }+${fusionPlan.epilogueOps.map(o => o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind).join("+")}`;
+          const fusionLabel = `${fusionPlan.isMean ? "mean" : "sum"}+${fusionPlan.preambleChain
+            .map((n) => n.op)
+            .join(
+              "+",
+            )}+${fusionPlan.epilogueOps.map((o) => (o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind)).join("+")}`;
           await withProfileContext(fusionLabel, node.module, () =>
-            executeReductionWithFusion(fusionPlan, backend));
+            executeReductionWithFusion(fusionPlan, backend),
+          );
 
           const consumed = fusionPlan.consumedCount;
           advanceConsumed(nodeIdx, consumed);
 
           if (loweredPlanBuilder && nodeIdToFinalPos) {
-            const preambleIndices = fusionPlan.preambleChain.map(n => nodeIdToFinalPos.get(n.id)!);
-            const epilogueIndices = fusionPlan.epilogueChain.map(n => nodeIdToFinalPos.get(n.id)!);
+            const preambleIndices = fusionPlan.preambleChain.map(
+              (n) => nodeIdToFinalPos.get(n.id)!,
+            );
+            const epilogueIndices = fusionPlan.epilogueChain.map(
+              (n) => nodeIdToFinalPos.get(n.id)!,
+            );
             loweredPlanBuilder.recordReductionFusion(
               preambleIndices,
               nodeIdToFinalPos.get(fusionPlan.reductionNode.id)!,
@@ -570,24 +708,36 @@ export async function executeSequentialSegmentWithEarlyRelease(
         }
 
         // Fall back to preamble-only fusion (Phase 3)
-        const reductionPlan = detectReductionPreamble(nodes, nodeIdx, reductionConsumerCount);
+        const reductionPlan = detectReductionPreamble(
+          nodes,
+          nodeIdx,
+          reductionConsumerCount,
+        );
         if (reductionPlan) {
           const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${
             reductionPlan.preambleChain
-              ? reductionPlan.preambleChain.map(n => n.op).join("+")
-              : reductionPlan.op}`;
+              ? reductionPlan.preambleChain.map((n) => n.op).join("+")
+              : reductionPlan.op
+          }`;
           await withProfileContext(rpLabel, node.module, () =>
-            executeReductionWithPreamble(reductionPlan, backend));
+            executeReductionWithPreamble(reductionPlan, backend),
+          );
 
           const consumed = reductionPlan.consumedCount;
           advanceConsumed(nodeIdx, consumed);
 
           if (loweredPlanBuilder && nodeIdToFinalPos) {
-            if (reductionPlan.preambleChain && reductionPlan.chainOps && reductionPlan.chainInputDtypes) {
+            if (
+              reductionPlan.preambleChain &&
+              reductionPlan.chainOps &&
+              reductionPlan.chainInputDtypes
+            ) {
               loweredPlanBuilder.recordReductionPreamble(
                 nodeIdToFinalPos.get(node.id)!,
                 nodeIdToFinalPos.get(reductionPlan.reductionNode.id)!,
-                reductionPlan.preambleChain.map(n => nodeIdToFinalPos.get(n.id)!),
+                reductionPlan.preambleChain.map(
+                  (n) => nodeIdToFinalPos.get(n.id)!,
+                ),
                 reductionPlan.chainOps,
                 reductionPlan.chainInputDtypes,
                 reductionPlan.consumedCount,
@@ -606,12 +756,32 @@ export async function executeSequentialSegmentWithEarlyRelease(
       }
 
       // Try reduction epilogue fusion (Phase 4)
-      if ((node.op === "sum" || node.op === "mean" || node.op === "max") && backend.name === "webgpu") {
-        const epiloguePlan = detectReductionEpilogue(nodes, nodeIdx, reductionConsumerCount, externalNodeIds);
+      if (
+        (node.op === "sum" || node.op === "mean" || node.op === "max") &&
+        backend.name === "webgpu"
+      ) {
+        const epiloguePlan = detectReductionEpilogue(
+          nodes,
+          nodeIdx,
+          reductionConsumerCount,
+          externalNodeIds,
+        );
         if (epiloguePlan) {
-          const reLabel = node.op + "+" + epiloguePlan.epilogueOps.map(o => o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind).join("+");
+          const reLabel =
+            node.op +
+            "+" +
+            epiloguePlan.epilogueOps
+              .map((o) =>
+                o.kind === "binary"
+                  ? o.op
+                  : o.kind === "cast"
+                    ? "cast"
+                    : o.op || o.kind,
+              )
+              .join("+");
           await withProfileContext(reLabel, node.module, () =>
-            executeReductionWithEpilogue(epiloguePlan, backend));
+            executeReductionWithEpilogue(epiloguePlan, backend),
+          );
 
           advanceConsumed(nodeIdx, epiloguePlan.consumedCount);
 
@@ -658,18 +828,29 @@ export async function executeSequentialSegmentWithEarlyRelease(
             for (let a = 0; a < adamCount; a++) {
               const adamNode = nodes[nodeIdx + a];
               if (adamNode.result) {
-                if (enableEarlyRelease) nodeToStorage.set(adamNode.id, adamNode.result);
+                if (enableEarlyRelease)
+                  nodeToStorage.set(adamNode.id, adamNode.result);
                 step++;
                 continue;
               }
 
               const adamBackend = getBackend(adamNode.device) ?? backend;
-              const adamInputs = adamNode.inputs.map(ref => getInputStorage(ref, adamBackend));
+              const adamInputs = adamNode.inputs.map((ref) =>
+                getInputStorage(ref, adamBackend),
+              );
               const adamBackendInputs = adamInputs.map((s) => s.backendTensor);
 
-              const adamResult = await withProfileContext("adamStep", adamNode.module, () =>
-                executeOp(adamNode, adamBackendInputs, adamBackend));
-              adamNode.result = wrapResultAsStorage(adamNode.device, adamResult, adamBackendInputs, adamInputs);
+              const adamResult = await withProfileContext(
+                "adamStep",
+                adamNode.module,
+                () => executeOp(adamNode, adamBackendInputs, adamBackend),
+              );
+              adamNode.result = wrapResultAsStorage(
+                adamNode.device,
+                adamResult,
+                adamBackendInputs,
+                adamInputs,
+              );
 
               advanceConsumed(nodeIdx + a, 1);
             }
@@ -693,11 +874,18 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
       const nodeBackend = getBackend(node.device) ?? backend;
       setProfileModule(node.module ?? "unknown");
-      const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
+      const inputs = node.inputs.map((ref) =>
+        getInputStorage(ref, nodeBackend),
+      );
       const backendInputs = inputs.map((s) => s.backendTensor);
 
       const resultTensor = await executeOp(node, backendInputs, nodeBackend);
-      node.result = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
+      node.result = wrapResultAsStorage(
+        node.device,
+        resultTensor,
+        backendInputs,
+        inputs,
+      );
 
       // Record action in lowered plan builder
       if (loweredPlanBuilder && nodeIdToFinalPos) {
@@ -715,7 +903,11 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
       // Periodic intra-segment reclamation
       nodesSinceIntraReclaim++;
-      if (useSharedEncoder && enableEarlyRelease && nodesSinceIntraReclaim >= INTRA_SEGMENT_RECLAIM_INTERVAL) {
+      if (
+        useSharedEncoder &&
+        enableEarlyRelease &&
+        nodesSinceIntraReclaim >= INTRA_SEGMENT_RECLAIM_INTERVAL
+      ) {
         flushSharedEncoder();
         flushBufferPool();
         if (loweredPlanBuilder) loweredPlanBuilder.recordReclaim();

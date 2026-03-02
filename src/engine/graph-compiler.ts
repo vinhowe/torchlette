@@ -15,16 +15,16 @@
  */
 
 import type { DType } from "../backend/types";
-import type { LazyIRNode } from "./lazy-types";
-import type { MatmulPrologueInfo } from "./matmul-epilogue";
 import type { CompoundMatch } from "./compound-patterns";
 import { detectCompoundPatterns } from "./compound-patterns";
-import { runRewritePasses } from "./graph-rewrites";
 import {
+  type ExecutionSegment,
   reorderPlanForFusion,
   segmentPlanForExecution,
-  type ExecutionSegment,
 } from "./fusion-detect";
+import { runRewritePasses } from "./graph-rewrites";
+import type { LazyIRNode } from "./lazy-types";
+import type { MatmulPrologueInfo } from "./matmul-epilogue";
 
 // ============================================================================
 // Types
@@ -114,7 +114,10 @@ function detectMatmulEpilogueChains(
       let chainInputIdx = 0;
       const primary = next.inputs[0];
       if (primary.kind !== "pending" || primary.node.id !== current.id) {
-        if ((next.op === "add" || next.op === "mul") && next.inputs.length === 2) {
+        if (
+          (next.op === "add" || next.op === "mul") &&
+          next.inputs.length === 2
+        ) {
           const alt = next.inputs[1];
           if (alt.kind === "pending" && alt.node.id === current.id) {
             chainInputIdx = 1;
@@ -130,9 +133,11 @@ function detectMatmulEpilogueChains(
       if (next.op === "reshape") {
         const curShape = current.shape;
         const nextShape = next.shape;
-        if (curShape.length === nextShape.length + 1
-            && curShape[0] === 1
-            && curShape.slice(1).every((d: number, i: number) => d === nextShape[i])) {
+        if (
+          curShape.length === nextShape.length + 1 &&
+          curShape[0] === 1 &&
+          curShape.slice(1).every((d: number, i: number) => d === nextShape[i])
+        ) {
           chainIds.push(next.id);
           current = next;
           continue;
@@ -142,7 +147,10 @@ function detectMatmulEpilogueChains(
 
       let ok = false;
       if (next.op === "cast") ok = true;
-      else if ((next.op === "add" || next.op === "mul") && next.inputs.length === 2) {
+      else if (
+        (next.op === "add" || next.op === "mul") &&
+        next.inputs.length === 2
+      ) {
         if (additionalInputCount >= 4) break;
         const secondary = next.inputs[chainInputIdx === 0 ? 1 : 0];
         if (secondary.kind === "materialized") {
@@ -154,7 +162,13 @@ function detectMatmulEpilogueChains(
           }
         }
         if (ok) additionalInputCount++;
-      } else if (next.op === "relu" || next.op === "silu" || next.op === "sigmoid" || next.op === "tanh" || next.op === "gelu") {
+      } else if (
+        next.op === "relu" ||
+        next.op === "silu" ||
+        next.op === "sigmoid" ||
+        next.op === "tanh" ||
+        next.op === "gelu"
+      ) {
         ok = true;
       }
 
@@ -208,7 +222,12 @@ function detectMatmulEpilogueChains(
     }
   }
 
-  return { epilogueClaimedIds, prologueClaimedIds, matmulEpilogueChains, matmulPrologues };
+  return {
+    epilogueClaimedIds,
+    prologueClaimedIds,
+    matmulEpilogueChains,
+    matmulPrologues,
+  };
 }
 
 /**
@@ -220,7 +239,7 @@ function relocateEpilogueNodes(
   matmulEpilogueChains: Map<number, number[]>,
   nodeById: Map<number, LazyIRNode>,
 ): LazyIRNode[] {
-  const unclaimed = planNodes.filter(n => !epilogueClaimedIds.has(n.id));
+  const unclaimed = planNodes.filter((n) => !epilogueClaimedIds.has(n.id));
   const relocated: LazyIRNode[] = [];
   for (const n of unclaimed) {
     relocated.push(n);
@@ -273,7 +292,7 @@ export function analyzeGraph(
         const producerId = input.node.id;
         consumerCount.set(producerId, (consumerCount.get(producerId) ?? 0) + 1);
         if (!consumers.has(producerId)) consumers.set(producerId, []);
-        consumers.get(producerId)!.push(node);
+        consumers.get(producerId)?.push(node);
       }
     }
   }
@@ -300,19 +319,29 @@ export function analyzeGraph(
     matmulEpilogueChains,
     matmulPrologues,
   } = detectMatmulEpilogueChains(
-    reorderedNodes, consumers, consumerCount, nodePosition, externalNodeIds,
+    reorderedNodes,
+    consumers,
+    consumerCount,
+    nodePosition,
+    externalNodeIds,
   );
 
   // Relocate epilogue chain nodes after their matmul
   if (epilogueClaimedIds.size > 0) {
     reorderedNodes = relocateEpilogueNodes(
-      reorderedNodes, epilogueClaimedIds, matmulEpilogueChains, nodeById,
+      reorderedNodes,
+      epilogueClaimedIds,
+      matmulEpilogueChains,
+      nodeById,
     );
   }
 
   // --- Priority 80: Compound patterns (softmax, log_softmax) ---
   const compoundMatches = detectCompoundPatterns(
-    reorderedNodes, consumerCount, consumers, externalNodeIds,
+    reorderedNodes,
+    consumerCount,
+    consumers,
+    externalNodeIds,
   );
   const compoundClaimedIds = new Set<number>();
   for (const match of compoundMatches) {
@@ -324,11 +353,17 @@ export function analyzeGraph(
   // --- Priority 40: Elementwise fusion (via segmentPlanForExecution) ---
   // Bypassed nodes are excluded from fusion (they become view-like pass-throughs)
   let allClaimedIds: Set<number> | undefined;
-  if (epilogueClaimedIds.size > 0 || prologueClaimedIds.size > 0 ||
-      compoundClaimedIds.size > 0 || rewriteBypassedIds.size > 0) {
+  if (
+    epilogueClaimedIds.size > 0 ||
+    prologueClaimedIds.size > 0 ||
+    compoundClaimedIds.size > 0 ||
+    rewriteBypassedIds.size > 0
+  ) {
     allClaimedIds = new Set([
-      ...epilogueClaimedIds, ...prologueClaimedIds,
-      ...compoundClaimedIds, ...rewriteBypassedIds,
+      ...epilogueClaimedIds,
+      ...prologueClaimedIds,
+      ...compoundClaimedIds,
+      ...rewriteBypassedIds,
     ]);
   }
   const segments = segmentPlanForExecution(reorderedNodes, externalNodeIds, {

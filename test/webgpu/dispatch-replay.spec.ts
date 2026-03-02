@@ -25,7 +25,10 @@ describe.skipIf(cpuOnly)("dispatch replay", { timeout: 60000 }, () => {
     const results: number[][] = [];
     for (let step = 0; step < 4; step++) {
       const x = gpu.tensorFromArray(data, shape);
-      const y = gpu.tensorFromArray([0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0], shape);
+      const y = gpu.tensorFromArray(
+        [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+        shape,
+      );
       const z = x.add(y).relu().mul(x);
       results.push(await z.cpu());
       await gpu.markStep();
@@ -65,7 +68,9 @@ describe.skipIf(cpuOnly)("dispatch replay", { timeout: 60000 }, () => {
     await initWebGPU();
 
     const gpu = new Torchlette("webgpu");
-    const M = 4, K = 8, N = 6;
+    const M = 4,
+      K = 8,
+      N = 6;
     const aData = Array.from({ length: M * K }, (_, i) => (i + 1) * 0.01);
     const bData = Array.from({ length: K * N }, (_, i) => (i + 1) * 0.01);
 
@@ -89,7 +94,9 @@ describe.skipIf(cpuOnly)("dispatch replay", { timeout: 60000 }, () => {
     await initWebGPU();
 
     const gpu = new Torchlette("webgpu");
-    const M = 4, K = 8, N = 6;
+    const M = 4,
+      K = 8,
+      N = 6;
     const aData = Array.from({ length: M * K }, (_, i) => (i + 1) * 0.01);
     const bData = Array.from({ length: K * N }, (_, i) => (i + 1) * 0.01);
     const biasData = Array.from({ length: N }, (_, i) => (i + 1) * 0.1);

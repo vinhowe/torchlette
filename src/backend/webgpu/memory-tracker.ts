@@ -105,13 +105,22 @@ class GPUMemoryTracker {
   private _debugLargeAllocLog: string[] = [];
   private _debugLargeAllocEnabled = false;
 
-  enableLargeAllocDebug(): void { this._debugLargeAllocEnabled = true; }
-  getLargeAllocLog(): string[] { return this._debugLargeAllocLog; }
-  clearLargeAllocLog(): void { this._debugLargeAllocLog = []; }
+  enableLargeAllocDebug(): void {
+    this._debugLargeAllocEnabled = true;
+  }
+  getLargeAllocLog(): string[] {
+    return this._debugLargeAllocLog;
+  }
+  clearLargeAllocLog(): void {
+    this._debugLargeAllocLog = [];
+  }
 
   // Debug: track ALL allocation stack traces for leak detection
   private _debugAllAllocEnabled = false;
-  private _allocStacks = new Map<unknown, { size: number; stack: string; timestamp: number; step: number }>();
+  private _allocStacks = new Map<
+    unknown,
+    { size: number; stack: string; timestamp: number; step: number }
+  >();
   private _currentStep = 0;
 
   // Debug: per-step allocation/deallocation flow counters
@@ -120,19 +129,37 @@ class GPUMemoryTracker {
   private _debugDeallocMissCount = 0; // trackDeallocation called but buffer not in bufferSizes
   private _debugDoubleTrackCount = 0; // trackAllocation called for already-tracked buffer
 
-  enableAllAllocDebug(): void { this._debugAllAllocEnabled = true; }
-  disableAllAllocDebug(): void { this._debugAllAllocEnabled = false; }
-  clearAllocStacks(): void { this._allocStacks.clear(); }
-  setAllocStep(step: number): void { this._currentStep = step; }
+  enableAllAllocDebug(): void {
+    this._debugAllAllocEnabled = true;
+  }
+  disableAllAllocDebug(): void {
+    this._debugAllAllocEnabled = false;
+  }
+  clearAllocStacks(): void {
+    this._allocStacks.clear();
+  }
+  setAllocStep(step: number): void {
+    this._currentStep = step;
+  }
 
   /**
    * Snapshot current unmatched allocations, grouped by call site.
    */
-  snapshotLeakedAllocs(): Map<string, { count: number; totalBytes: number; exampleStack: string }> {
-    const grouped = new Map<string, { count: number; totalBytes: number; exampleStack: string }>();
+  snapshotLeakedAllocs(): Map<
+    string,
+    { count: number; totalBytes: number; exampleStack: string }
+  > {
+    const grouped = new Map<
+      string,
+      { count: number; totalBytes: number; exampleStack: string }
+    >();
     for (const [, info] of this._allocStacks) {
-      const key = info.stack.split('\n').slice(0, 3).join('\n');
-      const existing = grouped.get(key) || { count: 0, totalBytes: 0, exampleStack: info.stack };
+      const key = info.stack.split("\n").slice(0, 3).join("\n");
+      const existing = grouped.get(key) || {
+        count: 0,
+        totalBytes: 0,
+        exampleStack: info.stack,
+      };
       existing.count++;
       existing.totalBytes += info.size;
       grouped.set(key, existing);
@@ -143,12 +170,21 @@ class GPUMemoryTracker {
   /**
    * Snapshot unmatched allocations from a specific step only.
    */
-  snapshotLeakedAllocsForStep(step: number): Map<string, { count: number; totalBytes: number; exampleStack: string }> {
-    const grouped = new Map<string, { count: number; totalBytes: number; exampleStack: string }>();
+  snapshotLeakedAllocsForStep(
+    step: number,
+  ): Map<string, { count: number; totalBytes: number; exampleStack: string }> {
+    const grouped = new Map<
+      string,
+      { count: number; totalBytes: number; exampleStack: string }
+    >();
     for (const [, info] of this._allocStacks) {
       if (info.step !== step) continue;
-      const key = info.stack.split('\n').slice(0, 3).join('\n');
-      const existing = grouped.get(key) || { count: 0, totalBytes: 0, exampleStack: info.stack };
+      const key = info.stack.split("\n").slice(0, 3).join("\n");
+      const existing = grouped.get(key) || {
+        count: 0,
+        totalBytes: 0,
+        exampleStack: info.stack,
+      };
       existing.count++;
       existing.totalBytes += info.size;
       grouped.set(key, existing);
@@ -197,7 +233,12 @@ class GPUMemoryTracker {
   /**
    * Get and reset per-step allocation/deallocation flow counters.
    */
-  getAndResetFlowCounters(): { allocs: number; deallocs: number; deallocMisses: number; doubleTracked: number } {
+  getAndResetFlowCounters(): {
+    allocs: number;
+    deallocs: number;
+    deallocMisses: number;
+    doubleTracked: number;
+  } {
     const result = {
       allocs: this._debugAllocCount,
       deallocs: this._debugDeallocCount,
@@ -218,11 +259,21 @@ class GPUMemoryTracker {
    */
   private _suppressLimitCheckDepth = 0;
 
-  suppressLimitCheck(): void { this._suppressLimitCheckDepth++; }
-  unsuppressLimitCheck(): void { this._suppressLimitCheckDepth = Math.max(0, this._suppressLimitCheckDepth - 1); }
+  suppressLimitCheck(): void {
+    this._suppressLimitCheckDepth++;
+  }
+  unsuppressLimitCheck(): void {
+    this._suppressLimitCheckDepth = Math.max(
+      0,
+      this._suppressLimitCheckDepth - 1,
+    );
+  }
 
   trackAllocation(buffer: unknown, sizeBytes: number): void {
-    if (this._suppressLimitCheckDepth === 0 && this.currentAllocatedBytes + sizeBytes > this.memoryLimitBytes) {
+    if (
+      this._suppressLimitCheckDepth === 0 &&
+      this.currentAllocatedBytes + sizeBytes > this.memoryLimitBytes
+    ) {
       throw new GPUMemoryLimitExceededError(
         sizeBytes,
         this.currentAllocatedBytes,
@@ -242,21 +293,38 @@ class GPUMemoryTracker {
   }
 
   private _trackAllocationInner(buffer: unknown, sizeBytes: number): void {
-    if (this._debugAllAllocEnabled && buffer !== null && this.bufferSizes.has(buffer)) {
+    if (
+      this._debugAllAllocEnabled &&
+      buffer !== null &&
+      this.bufferSizes.has(buffer)
+    ) {
       this._debugDoubleTrackCount++;
     }
     this.bufferSizes.set(buffer, sizeBytes);
     this.currentAllocatedBytes += sizeBytes;
     this.allocationCount++;
 
-    if (this._debugLargeAllocEnabled && buffer !== null && sizeBytes > 16 * 1024 * 1024) {
-      const stack = new Error().stack?.split('\n').slice(1, 6).join('\n') ?? 'no stack';
-      this._debugLargeAllocLog.push(`ALLOC ${(sizeBytes / 1e6).toFixed(2)}MB:\n${stack}`);
+    if (
+      this._debugLargeAllocEnabled &&
+      buffer !== null &&
+      sizeBytes > 16 * 1024 * 1024
+    ) {
+      const stack =
+        new Error().stack?.split("\n").slice(1, 6).join("\n") ?? "no stack";
+      this._debugLargeAllocLog.push(
+        `ALLOC ${(sizeBytes / 1e6).toFixed(2)}MB:\n${stack}`,
+      );
     }
 
     if (this._debugAllAllocEnabled && buffer !== null) {
-      const stack = new Error().stack?.split('\n').slice(1, 15).join('\n') ?? 'no stack';
-      this._allocStacks.set(buffer, { size: sizeBytes, stack, timestamp: Date.now(), step: this._currentStep });
+      const stack =
+        new Error().stack?.split("\n").slice(1, 15).join("\n") ?? "no stack";
+      this._allocStacks.set(buffer, {
+        size: sizeBytes,
+        stack,
+        timestamp: Date.now(),
+        step: this._currentStep,
+      });
     }
 
     if (this.currentAllocatedBytes > this.peakUsageBytes) {
@@ -291,8 +359,11 @@ class GPUMemoryTracker {
     }
 
     if (size === undefined && this._debugLargeAllocEnabled && buffer !== null) {
-      const stack = new Error().stack?.split('\n').slice(1, 4).join('\n') ?? 'no stack';
-      this._debugLargeAllocLog.push(`DEALLOC_MISS (buffer not found):\n${stack}`);
+      const stack =
+        new Error().stack?.split("\n").slice(1, 4).join("\n") ?? "no stack";
+      this._debugLargeAllocLog.push(
+        `DEALLOC_MISS (buffer not found):\n${stack}`,
+      );
     }
   }
 
@@ -342,7 +413,10 @@ class GPUMemoryTracker {
    * Get a histogram of allocation sizes for diagnostics.
    * Returns a map of size bucket labels to counts.
    */
-  getAllocationSizeHistogram(): Map<string, { count: number; totalBytes: number }> {
+  getAllocationSizeHistogram(): Map<
+    string,
+    { count: number; totalBytes: number }
+  > {
     const buckets = new Map<string, { count: number; totalBytes: number }>();
     for (const [, size] of this.bufferSizes) {
       let label: string;
@@ -396,7 +470,10 @@ export function getGPUMemoryStats(): ReturnType<GPUMemoryTracker["stats"]> {
 /**
  * Get allocation size histogram for diagnostics.
  */
-export function getGPUAllocationHistogram(): Map<string, { count: number; totalBytes: number }> {
+export function getGPUAllocationHistogram(): Map<
+  string,
+  { count: number; totalBytes: number }
+> {
   return gpuMemoryTracker.getAllocationSizeHistogram();
 }
 
@@ -428,11 +505,16 @@ export function setAllocStep(step: number): void {
   gpuMemoryTracker.setAllocStep(step);
 }
 
-export function snapshotLeakedAllocs(): Map<string, { count: number; totalBytes: number; exampleStack: string }> {
+export function snapshotLeakedAllocs(): Map<
+  string,
+  { count: number; totalBytes: number; exampleStack: string }
+> {
   return gpuMemoryTracker.snapshotLeakedAllocs();
 }
 
-export function snapshotLeakedAllocsForStep(step: number): Map<string, { count: number; totalBytes: number; exampleStack: string }> {
+export function snapshotLeakedAllocsForStep(
+  step: number,
+): Map<string, { count: number; totalBytes: number; exampleStack: string }> {
   return gpuMemoryTracker.snapshotLeakedAllocsForStep(step);
 }
 
@@ -444,7 +526,9 @@ export function getLeakedAllocCountForStep(step: number): number {
   return gpuMemoryTracker.getLeakedAllocCountForStep(step);
 }
 
-export function getAndResetFlowCounters(): ReturnType<GPUMemoryTracker["getAndResetFlowCounters"]> {
+export function getAndResetFlowCounters(): ReturnType<
+  GPUMemoryTracker["getAndResetFlowCounters"]
+> {
   return gpuMemoryTracker.getAndResetFlowCounters();
 }
 
@@ -452,6 +536,8 @@ export function getTrackedBuffers(): Set<unknown> {
   return gpuMemoryTracker.getTrackedBuffers();
 }
 
-export function getLeakedSizeHistogramForStep(step: number): Map<number, number> {
+export function getLeakedSizeHistogramForStep(
+  step: number,
+): Map<number, number> {
   return gpuMemoryTracker.getLeakedSizeHistogramForStep(step);
 }

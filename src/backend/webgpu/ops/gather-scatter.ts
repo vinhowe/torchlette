@@ -4,24 +4,38 @@
  * Each op handles both the normal (direct) and chunked paths internally,
  * branching at the dispatch level after shared setup (shapes, strides, shader).
  */
-import type { BackendTensor, CatOptions, GatherOptions, ScatterAddOptions } from "../../types";
+
 import { sizeOf } from "../../../core/shape";
-import type { GPUBuffer } from "../gpu-types";
-import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
-import { WORKGROUP_SIZE, compute2DDispatch } from "../shape-utils";
-import { requireContext } from "../gpu-context";
-import { dispatchComputePass, getPipeline } from "../dispatch";
-import { createTensor, createTrackedBuffer } from "../tensor";
+import type {
+  BackendTensor,
+  CatOptions,
+  GatherOptions,
+  ScatterAddOptions,
+} from "../../types";
+import {
+  cachedCreateBindGroup,
+  createParamsBuffer,
+  createUniformBuffer,
+  params,
+  profiledCreateBindGroup,
+  releaseParamsBuffer,
+  releaseUniformBuffer,
+} from "../bind-group-cache";
 import { resolveOutputBuffer } from "../buffer-arena";
 import { computeDimChunkLayout } from "../chunked-dispatch";
-import {
-  cachedCreateBindGroup, profiledCreateBindGroup,
-  createParamsBuffer, releaseParamsBuffer,
-  createUniformBuffer, releaseUniformBuffer,
-  params,
-} from "../bind-group-cache";
+import { dispatchComputePass, getPipeline } from "../dispatch";
+import { requireContext } from "../gpu-context";
+import type { GPUBuffer } from "../gpu-types";
+import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
+import { compute2DDispatch, WORKGROUP_SIZE } from "../shape-utils";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
-import { gatherTileIR, scatterAddTileIR, chunkedGatherTileIR, chunkedScatterAddTileIR } from "./ops-tile-ir";
+import { createTensor, createTrackedBuffer } from "../tensor";
+import {
+  chunkedGatherTileIR,
+  chunkedScatterAddTileIR,
+  gatherTileIR,
+  scatterAddTileIR,
+} from "./ops-tile-ir";
 
 /** Local type alias for GPU buffer binding descriptors with offset/size. */
 type GPUBufferBinding = { buffer: GPUBuffer; offset?: number; size?: number };
@@ -50,7 +64,8 @@ export function gather(
   // Determine chunking
   const inputSizeBytes = tensorA.size * 4;
   const deviceLimits = ctx.device.limits;
-  const maxBindingSize = deviceLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize =
+    deviceLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const chunked = inputSizeBytes > maxBindingSize;
 
   // Shared setup
@@ -71,9 +86,17 @@ export function gather(
 
   // --- Direct path ---
   if (!chunked) {
-    const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [tensorA.buffer, tensorIndex.buffer]);
+    const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [
+      tensorA.buffer,
+      tensorIndex.buffer,
+    ]);
     const uniformBuffer = createUniformBuffer(ctx.device, outSize);
-    const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensorA.buffer, tensorIndex.buffer, outBuffer, uniformBuffer]);
+    const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
+      tensorA.buffer,
+      tensorIndex.buffer,
+      outBuffer,
+      uniformBuffer,
+    ]);
     dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
     releaseUniformBuffer(uniformBuffer);
     return createTensor(outShape, outBuffer);
@@ -83,11 +106,19 @@ export function gather(
   const dimSize = inputShape[dim];
   const elementsPerSlice = sizeOf(inputShape.slice(dim + 1));
   const minAlignment = deviceLimits?.minStorageBufferOffsetAlignment ?? 256;
-  const layout = computeDimChunkLayout(dimSize, elementsPerSlice, maxBindingSize, minAlignment);
+  const layout = computeDimChunkLayout(
+    dimSize,
+    elementsPerSlice,
+    maxBindingSize,
+    minAlignment,
+  );
 
   const outBuffer = createTrackedBuffer(ctx.device, {
     size: outSize * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    usage:
+      GPUBufferUsage.STORAGE |
+      GPUBufferUsage.COPY_SRC |
+      GPUBufferUsage.COPY_DST,
   });
 
   for (let chunk = 0; chunk < layout.numChunks; chunk++) {
@@ -96,11 +127,21 @@ export function gather(
     const chunkByteOffset = chunkStart * layout.bytesPerSlice;
     const chunkByteSize = (chunkEnd - chunkStart) * layout.bytesPerSlice;
 
-    const uniformBuffer = createParamsBuffer(ctx.device, params(outSize, chunkStart, chunkEnd, 0));
+    const uniformBuffer = createParamsBuffer(
+      ctx.device,
+      params(outSize, chunkStart, chunkEnd, 0),
+    );
     const bindGroup = profiledCreateBindGroup(ctx.device, {
       layout: pipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: tensorA.buffer, offset: chunkByteOffset, size: chunkByteSize } as GPUBufferBinding },
+        {
+          binding: 0,
+          resource: {
+            buffer: tensorA.buffer,
+            offset: chunkByteOffset,
+            size: chunkByteSize,
+          } as GPUBufferBinding,
+        },
         { binding: 1, resource: { buffer: tensorIndex.buffer } },
         { binding: 2, resource: { buffer: outBuffer } },
         { binding: 3, resource: { buffer: uniformBuffer } },
@@ -138,7 +179,8 @@ export function scatterAdd(
   // Determine chunking
   const outputSizeBytes = tensorA.size * 4;
   const deviceLimits = ctx.device.limits;
-  const maxBindingSize = deviceLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize =
+    deviceLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const chunked = outputSizeBytes > maxBindingSize;
 
   // Shared setup
@@ -162,9 +204,16 @@ export function scatterAdd(
   const outBuffer = chunked
     ? createTrackedBuffer(ctx.device, {
         size: outSize * 4,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+        usage:
+          GPUBufferUsage.STORAGE |
+          GPUBufferUsage.COPY_SRC |
+          GPUBufferUsage.COPY_DST,
       })
-    : resolveOutputBuffer(ctx.device, outSize * 4, [tensorA.buffer, tensorIndex.buffer, tensorSrc.buffer]);
+    : resolveOutputBuffer(ctx.device, outSize * 4, [
+        tensorA.buffer,
+        tensorIndex.buffer,
+        tensorSrc.buffer,
+      ]);
 
   {
     const enc = getSharedEncoderInstance();
@@ -180,7 +229,12 @@ export function scatterAdd(
   // --- Direct path ---
   if (!chunked) {
     const uniformBuffer = createUniformBuffer(ctx.device, srcSize);
-    const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensorIndex.buffer, tensorSrc.buffer, outBuffer, uniformBuffer]);
+    const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
+      tensorIndex.buffer,
+      tensorSrc.buffer,
+      outBuffer,
+      uniformBuffer,
+    ]);
     dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
     releaseUniformBuffer(uniformBuffer);
     return createTensor(outShape, outBuffer);
@@ -190,7 +244,12 @@ export function scatterAdd(
   const dimSize = inputShape[dim];
   const elementsPerSlice = sizeOf(inputShape.slice(dim + 1));
   const minAlignment = deviceLimits?.minStorageBufferOffsetAlignment ?? 256;
-  const layout = computeDimChunkLayout(dimSize, elementsPerSlice, maxBindingSize, minAlignment);
+  const layout = computeDimChunkLayout(
+    dimSize,
+    elementsPerSlice,
+    maxBindingSize,
+    minAlignment,
+  );
 
   for (let chunk = 0; chunk < layout.numChunks; chunk++) {
     const chunkStart = chunk * layout.maxSlicesPerChunk;
@@ -198,13 +257,23 @@ export function scatterAdd(
     const chunkByteOffset = chunkStart * layout.bytesPerSlice;
     const chunkByteSize = (chunkEnd - chunkStart) * layout.bytesPerSlice;
 
-    const uniformBuffer = createParamsBuffer(ctx.device, params(srcSize, chunkStart, chunkEnd, 0));
+    const uniformBuffer = createParamsBuffer(
+      ctx.device,
+      params(srcSize, chunkStart, chunkEnd, 0),
+    );
     const bindGroup = profiledCreateBindGroup(ctx.device, {
       layout: pipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: tensorIndex.buffer } },
         { binding: 1, resource: { buffer: tensorSrc.buffer } },
-        { binding: 2, resource: { buffer: outBuffer, offset: chunkByteOffset, size: chunkByteSize } as GPUBufferBinding },
+        {
+          binding: 2,
+          resource: {
+            buffer: outBuffer,
+            offset: chunkByteOffset,
+            size: chunkByteSize,
+          } as GPUBufferBinding,
+        },
         { binding: 3, resource: { buffer: uniformBuffer } },
       ],
     });
@@ -219,12 +288,15 @@ export function scatterAdd(
  * Concatenate tensors along an existing dimension.
  * Uses copyBufferToBuffer for efficient GPU-side data movement.
  */
-export function cat(tensors: BackendTensor[], options: CatOptions): BackendTensor {
+export function cat(
+  tensors: BackendTensor[],
+  options: CatOptions,
+): BackendTensor {
   if (tensors.length === 0) throw new Error("cat: empty tensor list");
   if (tensors.length === 1) return tensors[0];
 
   const ctx = requireContext();
-  const gpuTensors = tensors.map(t => asGPUTensor(t));
+  const gpuTensors = tensors.map((t) => asGPUTensor(t));
   const bytesPerElement = gpuTensors[0].dtype === "f16" ? 2 : 4;
 
   // Compute output shape
@@ -236,8 +308,9 @@ export function cat(tensors: BackendTensor[], options: CatOptions): BackendTenso
   }
   const outSize = sizeOf(outShape);
   const outBuffer = resolveOutputBuffer(
-    ctx.device, outSize * bytesPerElement,
-    gpuTensors.map(t => t.buffer),
+    ctx.device,
+    outSize * bytesPerElement,
+    gpuTensors.map((t) => t.buffer),
   );
 
   // Compute outer/inner sizes for strided copy
@@ -252,17 +325,36 @@ export function cat(tensors: BackendTensor[], options: CatOptions): BackendTenso
     const copyBytes = tDimSize * innerSize * bytesPerElement;
     for (let o = 0; o < outerSize; o++) {
       const srcByteOffset = o * tDimSize * innerSize * bytesPerElement;
-      const dstByteOffset = (o * outDimSize + dimOffset) * innerSize * bytesPerElement;
+      const dstByteOffset =
+        (o * outDimSize + dimOffset) * innerSize * bytesPerElement;
       if (enc) {
-        enc.copyBufferToBuffer(t.buffer, srcByteOffset, outBuffer, dstByteOffset, copyBytes);
+        enc.copyBufferToBuffer(
+          t.buffer,
+          srcByteOffset,
+          outBuffer,
+          dstByteOffset,
+          copyBytes,
+        );
       } else {
         const cmdEnc = ctx.device.createCommandEncoder();
-        cmdEnc.copyBufferToBuffer(t.buffer, srcByteOffset, outBuffer, dstByteOffset, copyBytes);
+        cmdEnc.copyBufferToBuffer(
+          t.buffer,
+          srcByteOffset,
+          outBuffer,
+          dstByteOffset,
+          copyBytes,
+        );
         submitOrCollect(cmdEnc.finish());
       }
     }
     dimOffset += tDimSize;
   }
 
-  return createTensor(outShape, outBuffer, undefined, 0, gpuTensors[0].dtype as any);
+  return createTensor(
+    outShape,
+    outBuffer,
+    undefined,
+    0,
+    gpuTensors[0].dtype as any,
+  );
 }

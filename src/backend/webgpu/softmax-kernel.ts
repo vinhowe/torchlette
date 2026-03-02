@@ -11,12 +11,15 @@
  * softmax/log_softmax decomposition pattern in the lazy IR plan.
  */
 
+import { resolveOutputBuffer } from "./buffer-arena";
 import type { GPUBuffer } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
-import { type TileKernelSpec, perRowKernel } from "./tile-ir";
-import { createTileKernelDispatcher, type TileKernelInstance } from "./tile-dispatch";
+import {
+  createTileKernelDispatcher,
+  type TileKernelInstance,
+} from "./tile-dispatch";
+import { perRowKernel, type TileKernelSpec } from "./tile-ir";
 import { requireContext } from "./webgpu-state";
-import { resolveOutputBuffer } from "./buffer-arena";
 
 const WG = WORKGROUP_SIZE; // 256
 
@@ -28,31 +31,42 @@ function softmaxSpec(isLog: boolean): TileKernelSpec {
   return perRowKernel({
     name: isLog ? "fusedLogSoftmax" : "fusedSoftmax",
     bindings: {
-      x:      { storage: "read",       type: "f32" },
+      x: { storage: "read", type: "f32" },
       output: { storage: "read_write", type: "f32" },
     },
     dimUniform: "dim_size",
 
     kernel(ctx, _row, tid, D, base) {
       // Pass 1: Compute max along reduction dimension
-      const maxVal = ctx.emitLet("max_val",
-        ctx.wgReduce("max", tid, D, WG, (i) => ctx.load("x", base.add(i))));
+      const maxVal = ctx.emitLet(
+        "max_val",
+        ctx.wgReduce("max", tid, D, WG, (i) => ctx.load("x", base.add(i))),
+      );
 
       // Pass 2: Compute exp(x - max) and sum
-      const sumExp = ctx.emitLet("sum_exp",
+      const sumExp = ctx.emitLet(
+        "sum_exp",
         ctx.wgReduce("sum", tid, D, WG, (i) =>
-          ctx.load("x", base.add(i)).sub(maxVal).exp()));
+          ctx.load("x", base.add(i)).sub(maxVal).exp(),
+        ),
+      );
 
       if (isLog) {
         const logSum = ctx.emitLet("log_sum", sumExp.log());
         ctx.stridedFor(tid, D, WG, (i) => {
-          ctx.emitStore("output", base.add(i),
-            ctx.load("x", base.add(i)).sub(maxVal).sub(logSum));
+          ctx.emitStore(
+            "output",
+            base.add(i),
+            ctx.load("x", base.add(i)).sub(maxVal).sub(logSum),
+          );
         });
       } else {
         ctx.stridedFor(tid, D, WG, (i) => {
-          ctx.emitStore("output", base.add(i),
-            ctx.load("x", base.add(i)).sub(maxVal).exp().div(sumExp));
+          ctx.emitStore(
+            "output",
+            base.add(i),
+            ctx.load("x", base.add(i)).sub(maxVal).exp().div(sumExp),
+          );
         });
       }
     },
@@ -67,12 +81,14 @@ let softmaxKernel: TileKernelInstance | null = null;
 let logSoftmaxKernel: TileKernelInstance | null = null;
 
 function getSoftmaxKernel(): TileKernelInstance {
-  if (!softmaxKernel) softmaxKernel = createTileKernelDispatcher(softmaxSpec(false));
+  if (!softmaxKernel)
+    softmaxKernel = createTileKernelDispatcher(softmaxSpec(false));
   return softmaxKernel;
 }
 
 function getLogSoftmaxKernel(): TileKernelInstance {
-  if (!logSoftmaxKernel) logSoftmaxKernel = createTileKernelDispatcher(softmaxSpec(true));
+  if (!logSoftmaxKernel)
+    logSoftmaxKernel = createTileKernelDispatcher(softmaxSpec(true));
   return logSoftmaxKernel;
 }
 
@@ -97,11 +113,9 @@ export function dispatchFusedSoftmax(
   isLog: boolean,
 ): GPUBuffer {
   const ctx = requireContext();
-  const outBuffer = resolveOutputBuffer(
-    ctx.device,
-    numRows * dimSize * 4,
-    [inputBuffer],
-  );
+  const outBuffer = resolveOutputBuffer(ctx.device, numRows * dimSize * 4, [
+    inputBuffer,
+  ]);
 
   const kernel = isLog ? getLogSoftmaxKernel() : getSoftmaxKernel();
   kernel.dispatch(

@@ -21,7 +21,8 @@ export function autocastImpl<T>(
   options?: AutocastOptions,
 ): T {
   const deviceType =
-    options?.deviceType ?? (torch.runtime.currentDefaultDevice === "webgpu" ? "webgpu" : "cpu");
+    options?.deviceType ??
+    (torch.runtime.currentDefaultDevice === "webgpu" ? "webgpu" : "cpu");
 
   pushAutocast(torch._getAutocastContext(), {
     enabled: options?.enabled ?? true,
@@ -38,7 +39,9 @@ export function autocastImpl<T>(
     popAutocast(torch._getAutocastContext());
     // Update engine's context to reflect the popped state
     torch.engine.setAutocastContext(
-      torch._getAutocastContext().configStack.length > 0 ? torch._getAutocastContext() : null,
+      torch._getAutocastContext().configStack.length > 0
+        ? torch._getAutocastContext()
+        : null,
     );
   }
 }
@@ -52,7 +55,8 @@ export async function autocastAsyncImpl<T>(
   options?: AutocastOptions,
 ): Promise<T> {
   const deviceType =
-    options?.deviceType ?? (torch.runtime.currentDefaultDevice === "webgpu" ? "webgpu" : "cpu");
+    options?.deviceType ??
+    (torch.runtime.currentDefaultDevice === "webgpu" ? "webgpu" : "cpu");
 
   pushAutocast(torch._getAutocastContext(), {
     enabled: options?.enabled ?? true,
@@ -69,7 +73,9 @@ export async function autocastAsyncImpl<T>(
     popAutocast(torch._getAutocastContext());
     // Update engine's context to reflect the popped state
     torch.engine.setAutocastContext(
-      torch._getAutocastContext().configStack.length > 0 ? torch._getAutocastContext() : null,
+      torch._getAutocastContext().configStack.length > 0
+        ? torch._getAutocastContext()
+        : null,
     );
   }
 }
@@ -97,7 +103,11 @@ export function savedTensorHooksImpl<T>(
  * Backward only upcasts gradients (e.g., f16→f32), never downcasts,
  * to preserve gradient precision during mixed-precision training.
  */
-export function autocastCastImpl(torch: Torchlette, a: Tensor, targetDtype: DType): Tensor {
+export function autocastCastImpl(
+  torch: Torchlette,
+  a: Tensor,
+  targetDtype: DType,
+): Tensor {
   if (a.dtype === targetDtype) return a;
   const originalDtype = a.dtype;
   const inner = torch.runtime.cast(a._unwrap(), targetDtype);
@@ -114,21 +124,31 @@ export function autocastCastImpl(torch: Torchlette, a: Tensor, targetDtype: DTyp
  * Unified autocast dispatch: applies autocast policy AND dtype promotion
  * based on the centralized Op Dtype Registry.
  */
-export function applyAutocastImpl(torch: Torchlette, op: string, inputs: Tensor[]): Tensor[] {
+export function applyAutocastImpl(
+  torch: Torchlette,
+  op: string,
+  inputs: Tensor[],
+): Tensor[] {
   const rule = OP_DTYPE_RULES[op as LazyOpCode];
 
   // Autocast policy (only when active)
   if (torch._getAutocastContext().current.enabled) {
     const policy = torch._getAutocastContext().current.policy;
     // Check both the registry rule and the supplementary sets
-    const isF16Eligible = (rule && rule.category === "f16_eligible") || F16_ELIGIBLE_OPS.has(op);
-    const isF32Required = (rule && rule.category === "f32_required") || F32_REQUIRED_OPS.has(op);
+    const isF16Eligible =
+      (rule && rule.category === "f16_eligible") || F16_ELIGIBLE_OPS.has(op);
+    const isF32Required =
+      (rule && rule.category === "f32_required") || F32_REQUIRED_OPS.has(op);
 
     if (isF16Eligible && policy.computeDtype === "f16") {
-      inputs = inputs.map(t => t.dtype === "f32" ? autocastCastImpl(torch, t, "f16") : t);
+      inputs = inputs.map((t) =>
+        t.dtype === "f32" ? autocastCastImpl(torch, t, "f16") : t,
+      );
     }
     if (isF32Required) {
-      inputs = inputs.map(t => t.dtype === "f16" ? autocastCastImpl(torch, t, "f32") : t);
+      inputs = inputs.map((t) =>
+        t.dtype === "f16" ? autocastCastImpl(torch, t, "f32") : t,
+      );
     }
   }
 

@@ -127,11 +127,7 @@ describe("Reduction ops (CPU)", () => {
     });
 
     it("handles batched softmax", async () => {
-      const a = api.tensorFromArray([
-        1, 2, 3,
-        4, 5, 6,
-        7, 8, 9,
-      ], [3, 3]);
+      const a = api.tensorFromArray([1, 2, 3, 4, 5, 6, 7, 8, 9], [3, 3]);
       const result = a.softmax(-1);
       expect(result.shape).toEqual([3, 3]);
 

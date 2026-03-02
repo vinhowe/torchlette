@@ -3,21 +3,21 @@
  */
 
 import type { BackendTensor } from "../../types";
+import { params } from "../bind-group-cache";
+import { resolveOutputBuffer } from "../buffer-arena";
+import { dispatchElementwise } from "../dispatch";
+import { requireContext } from "../gpu-context";
 import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
 import { asGPUTensor } from "../gpu-types";
 import {
-  toIndexShape,
-  sizeOf,
   computeEffectiveBroadcastStrides,
+  sizeOf,
+  toIndexShape,
   WORKGROUP_SIZE,
 } from "../shape-utils";
-import { whereWGSL, whereSpec } from "./ops-tile-ir";
-import { requireContext } from "../gpu-context";
-import { dispatchElementwise } from "../dispatch";
 import { createTensor } from "../tensor";
-import { resolveOutputBuffer } from "../buffer-arena";
-import { params } from "../bind-group-cache";
 import { createTileKernelDispatcher } from "../tile-dispatch";
+import { whereSpec, whereWGSL } from "./ops-tile-ir";
 
 /**
  * Broadcast three shapes to a common output shape.
@@ -74,7 +74,8 @@ export function where(
   // Check if chunking is needed for large contiguous tensors
   const bytesPerElement = 4; // f32
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize =
+    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const outSizeBytes = outSize * bytesPerElement;
 
   // Use chunked dispatch when output exceeds binding limit and inputs are chunkable:
@@ -88,11 +89,26 @@ export function where(
     const yChunkable = yIsScalar || yTensor.isContiguous;
 
     if (condChunkable && xChunkable && yChunkable) {
-      return whereChunked(condTensor, xTensor, yTensor, outShape, outSize, options);
+      return whereChunked(
+        condTensor,
+        xTensor,
+        yTensor,
+        outShape,
+        outSize,
+        options,
+      );
     }
   }
 
-  return whereDirect(condTensor, xTensor, yTensor, outShape, indexShape, outSize, options);
+  return whereDirect(
+    condTensor,
+    xTensor,
+    yTensor,
+    outShape,
+    indexShape,
+    outSize,
+    options,
+  );
 }
 
 /**
@@ -112,17 +128,24 @@ function whereDirect(
   const yStrides = computeEffectiveBroadcastStrides(yTensor, indexShape);
 
   const code = whereWGSL(
-    indexShape, condStrides, xStrides, yStrides,
-    condTensor.offset, xTensor.offset, yTensor.offset,
+    indexShape,
+    condStrides,
+    xStrides,
+    yStrides,
+    condTensor.offset,
+    xTensor.offset,
+    yTensor.offset,
   );
   const key = `where:${indexShape.join("x")}:${condStrides.join(",")}:${xStrides.join(",")}:${yStrides.join(",")}:${condTensor.offset}:${xTensor.offset}:${yTensor.offset}`;
 
-  const providedOut = options?.outBuffer && options.outBuffer.size >= outSize * 4
-    ? options.outBuffer
-    : undefined;
+  const providedOut =
+    options?.outBuffer && options.outBuffer.size >= outSize * 4
+      ? options.outBuffer
+      : undefined;
 
   const outBuffer = dispatchElementwise({
-    key, shader: code,
+    key,
+    shader: code,
     inputs: [condTensor.buffer, xTensor.buffer, yTensor.buffer],
     outputSizeBytes: outSize * 4,
     params: params(outSize),
@@ -165,11 +188,18 @@ function whereChunked(
     condIsScalar ? [0] : [1],
     xIsScalar ? [0] : [1],
     yIsScalar ? [0] : [1],
-    0, 0, 0,
+    0,
+    0,
+    0,
   );
   const dispatcher = createTileKernelDispatcher(spec);
   dispatcher.dispatchChunked(
-    { cond: condTensor.buffer, x: xTensor.buffer, y: yTensor.buffer, out: outBuffer },
+    {
+      cond: condTensor.buffer,
+      x: xTensor.buffer,
+      y: yTensor.buffer,
+      out: outBuffer,
+    },
     { size: outSize },
     {
       modes: {

@@ -64,7 +64,13 @@ interface OpDef {
   /**
    * Category for documentation/organization
    */
-  category: "activation" | "math" | "arithmetic" | "comparison" | "ternary" | "cast";
+  category:
+    | "activation"
+    | "math"
+    | "arithmetic"
+    | "comparison"
+    | "ternary"
+    | "cast";
 }
 
 // ============================================================================
@@ -362,7 +368,8 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   where: {
     // where(cond, a, b) -> select(b, a, cond > 0)
     // Note: cond is treated as boolean (> 0 means true)
-    expr: (cond: string, a: string, b: string) => `select(${b}, ${a}, ${cond} > 0.0)`,
+    expr: (cond: string, a: string, b: string) =>
+      `select(${b}, ${a}, ${cond} > 0.0)`,
     arity: 3,
     fusible: true,
     vectorizable: true,
@@ -419,4 +426,3 @@ export function canVectorize(op: string): boolean {
 export function isUnaryOp(op: string): boolean {
   return OP_REGISTRY[op]?.arity === 1;
 }
-

@@ -10,10 +10,10 @@
  * - Saved-for-backward correctness
  */
 
-import { describe, expect, it, beforeEach } from "vitest";
-import { Torchlette, torch, Tensor } from "../src/frontend";
-import { RuntimeEngine } from "../src/runtime/engine";
+import { beforeEach, describe, expect, it } from "vitest";
 import { resetNodeIdCounter, resetStorageIdCounter } from "../src/engine/lazy";
+import { Torchlette } from "../src/frontend";
+import { RuntimeEngine } from "../src/runtime/engine";
 import { resetBaseIdCounter } from "../src/runtime/tensor";
 
 describe("AOT Autograd: Basic Forward+Backward", () => {
@@ -97,10 +97,10 @@ describe("AOT Autograd: Basic Forward+Backward", () => {
     expect(a.grad).not.toBeNull();
     // d(sqrt(x))/dx = 0.5 / sqrt(x)
     const grad = await a.grad?.cpu();
-    expect(grad?.[0]).toBeCloseTo(0.25, 5);  // 0.5/2
+    expect(grad?.[0]).toBeCloseTo(0.25, 5); // 0.5/2
     expect(grad?.[1]).toBeCloseTo(0.5 / 3, 5);
     expect(grad?.[2]).toBeCloseTo(0.125, 5); // 0.5/4
-    expect(grad?.[3]).toBeCloseTo(0.1, 5);   // 0.5/5
+    expect(grad?.[3]).toBeCloseTo(0.1, 5); // 0.5/5
   });
 });
 
@@ -124,7 +124,9 @@ describe("AOT Autograd: Complex Chains", () => {
     const c = a.add(b);
     const d = c.mul(b);
     // Add small constant to avoid sqrt(0)
-    const dSafe = d.add(api.tensorFromArray([0.0001, 0.0001, 0.0001, 0.0001], [4]));
+    const dSafe = d.add(
+      api.tensorFromArray([0.0001, 0.0001, 0.0001, 0.0001], [4]),
+    );
     const e = dSafe.sqrt();
     const loss = e.sum();
     if (typeof loss === "number") throw new Error("Expected tensor");
@@ -139,12 +141,16 @@ describe("AOT Autograd: Complex Chains", () => {
   });
 
   it("backward through matmul -> add -> relu -> mean", async () => {
-    const x = api.tensorFromArray([1, 2, 3, 4, 5, 6], [2, 3], { requiresGrad: true });
-    const w = api.tensorFromArray([0.5, -1, 2, 1.5, -0.5, 0.25], [3, 2], { requiresGrad: true });
+    const x = api.tensorFromArray([1, 2, 3, 4, 5, 6], [2, 3], {
+      requiresGrad: true,
+    });
+    const w = api.tensorFromArray([0.5, -1, 2, 1.5, -0.5, 0.25], [3, 2], {
+      requiresGrad: true,
+    });
     const bias = api.tensorFromArray([0.1, -0.2], [2], { requiresGrad: true });
 
-    const h = x.matmul(w);        // [2, 2]
-    const hBias = h.add(bias);    // [2, 2] with broadcast
+    const h = x.matmul(w); // [2, 2]
+    const hBias = h.add(bias); // [2, 2] with broadcast
     const activated = hBias.relu();
     const loss = activated.mean({ dim: [0, 1], keepdim: true });
     if (typeof loss === "number") throw new Error("Expected tensor");
@@ -219,7 +225,7 @@ describe("AOT Autograd: Gradient Accumulation", () => {
 });
 
 describe("AOT Autograd: Fusion-Enabled Execution", () => {
-  let engine: RuntimeEngine;
+  let _engine: RuntimeEngine;
   let api: Torchlette;
 
   beforeEach(() => {
@@ -227,7 +233,7 @@ describe("AOT Autograd: Fusion-Enabled Execution", () => {
     resetStorageIdCounter();
     resetBaseIdCounter();
     // Use fusion-enabled engine for these tests
-    engine = new RuntimeEngine("cpu", { enableFusion: true });
+    _engine = new RuntimeEngine("cpu", { enableFusion: true });
     api = new Torchlette("cpu");
   });
 
@@ -250,18 +256,18 @@ describe("AOT Autograd: Fusion-Enabled Execution", () => {
     // d/db = a + 2*b
     expect(await a.grad?.cpu()).toEqual([5, 6, 7, 8]);
     const bGrad = await b.grad?.cpu();
-    expect(bGrad?.[0]).toBeCloseTo(1 + 2*5, 5);  // 11
-    expect(bGrad?.[1]).toBeCloseTo(2 + 2*6, 5);  // 14
-    expect(bGrad?.[2]).toBeCloseTo(3 + 2*7, 5);  // 17
-    expect(bGrad?.[3]).toBeCloseTo(4 + 2*8, 5);  // 20
+    expect(bGrad?.[0]).toBeCloseTo(1 + 2 * 5, 5); // 11
+    expect(bGrad?.[1]).toBeCloseTo(2 + 2 * 6, 5); // 14
+    expect(bGrad?.[2]).toBeCloseTo(3 + 2 * 7, 5); // 17
+    expect(bGrad?.[3]).toBeCloseTo(4 + 2 * 8, 5); // 20
   });
 
   it("gradients correct with non-fusible ops in chain", async () => {
     const a = api.tensorFromArray([1, 2, 3, 4], [4], { requiresGrad: true });
 
     // Chain: fusible -> non-fusible -> fusible
-    const b = a.mul(api.tensorFromArray([2, 2, 2, 2], [4]));  // fusible
-    const c = b.sum();  // non-fusible (reduction)
+    const b = a.mul(api.tensorFromArray([2, 2, 2, 2], [4])); // fusible
+    const c = b.sum(); // non-fusible (reduction)
     if (typeof c === "number") throw new Error("Expected tensor");
 
     await c.backward();
@@ -296,10 +302,10 @@ describe("AOT Autograd: Saved-for-Backward", () => {
     expect(a.grad).not.toBeNull();
     const grad = await a.grad?.cpu();
     // d(sqrt(x))/dx = 0.5 / sqrt(x)
-    expect(grad?.[0]).toBeCloseTo(0.5 / 2, 5);   // 0.25
-    expect(grad?.[1]).toBeCloseTo(0.5 / 3, 5);   // ~0.167
-    expect(grad?.[2]).toBeCloseTo(0.5 / 4, 5);   // 0.125
-    expect(grad?.[3]).toBeCloseTo(0.5 / 5, 5);   // 0.1
+    expect(grad?.[0]).toBeCloseTo(0.5 / 2, 5); // 0.25
+    expect(grad?.[1]).toBeCloseTo(0.5 / 3, 5); // ~0.167
+    expect(grad?.[2]).toBeCloseTo(0.5 / 4, 5); // 0.125
+    expect(grad?.[3]).toBeCloseTo(0.5 / 5, 5); // 0.1
   });
 
   it("relu saves input for backward", async () => {
@@ -330,7 +336,7 @@ describe("AOT Autograd: Broadcasting", () => {
     const a = api.tensorFromArray([1, 2, 3, 4], [2, 2], { requiresGrad: true });
     const b = api.tensorFromArray([10, 20], [2], { requiresGrad: true });
 
-    const c = a.add(b);  // b broadcasts to [2, 2]
+    const c = a.add(b); // b broadcasts to [2, 2]
     const loss = c.sum();
     if (typeof loss === "number") throw new Error("Expected tensor");
 
@@ -349,7 +355,7 @@ describe("AOT Autograd: Broadcasting", () => {
     const a = api.tensorFromArray([1, 2, 3, 4], [2, 2], { requiresGrad: true });
     const b = api.tensorFromArray([2], [1], { requiresGrad: true });
 
-    const c = a.mul(b);  // b broadcasts to [2, 2]
+    const c = a.mul(b); // b broadcasts to [2, 2]
     const loss = c.sum();
     if (typeof loss === "number") throw new Error("Expected tensor");
 
@@ -390,7 +396,9 @@ describe("AOT Autograd: View Operations", () => {
   });
 
   it("backward through transpose", async () => {
-    const a = api.tensorFromArray([1, 2, 3, 4, 5, 6], [2, 3], { requiresGrad: true });
+    const a = api.tensorFromArray([1, 2, 3, 4, 5, 6], [2, 3], {
+      requiresGrad: true,
+    });
     const b = a.transpose({ dim0: 0, dim1: 1 });
     const loss = b.sum();
     if (typeof loss === "number") throw new Error("Expected tensor");
@@ -429,7 +437,7 @@ describe("AOT Autograd: Edge Cases", () => {
 
   it("backward with 0-d tensor (scalar) output", async () => {
     const a = api.tensorFromArray([1, 2, 3, 4], [4], { requiresGrad: true });
-    const loss = a.sum();  // Returns 0-d tensor
+    const loss = a.sum(); // Returns 0-d tensor
     if (typeof loss === "number") throw new Error("Expected tensor");
 
     expect(loss.shape).toEqual([]);
@@ -525,8 +533,10 @@ describe("AOT Autograd: Multiple Backward Passes", () => {
 
   it("training loop simulation: multiple iterations", async () => {
     // Simulate a simple training loop
-    const weights = api.tensorFromArray([0.5, 0.5, 0.5, 0.5], [4], { requiresGrad: true });
-    const target = api.tensorFromArray([1, 2, 3, 4], [4]);
+    const weights = api.tensorFromArray([0.5, 0.5, 0.5, 0.5], [4], {
+      requiresGrad: true,
+    });
+    const _target = api.tensorFromArray([1, 2, 3, 4], [4]);
 
     for (let i = 0; i < 3; i++) {
       // Forward: prediction = weights * input
@@ -613,7 +623,9 @@ describe("AOT Autograd: Optimizer Integration", () => {
   it("multiple optimizer steps in training loop", async () => {
     const { SGD } = await import("../src/optim");
 
-    const w = api.tensorFromArray([10, 10, 10, 10], [4], { requiresGrad: true });
+    const w = api.tensorFromArray([10, 10, 10, 10], [4], {
+      requiresGrad: true,
+    });
     const optimizer = new SGD([w], { lr: 1.0 }, api); // Large lr for visible changes
 
     // Multiple training steps - use optimizer.getParams() to get current params
@@ -650,9 +662,15 @@ describe("AOT Autograd: Complex Training Scenarios", () => {
 
   it("MLP-like forward backward", async () => {
     // Simulate a simple 2-layer MLP: input -> W1 -> relu -> W2 -> output
-    const input = api.tensorFromArray([1, 2, 3, 4], [2, 2], { requiresGrad: false });
-    const W1 = api.tensorFromArray([0.5, -0.5, 0.3, 0.7], [2, 2], { requiresGrad: true });
-    const W2 = api.tensorFromArray([0.1, 0.2, -0.1, 0.3], [2, 2], { requiresGrad: true });
+    const input = api.tensorFromArray([1, 2, 3, 4], [2, 2], {
+      requiresGrad: false,
+    });
+    const W1 = api.tensorFromArray([0.5, -0.5, 0.3, 0.7], [2, 2], {
+      requiresGrad: true,
+    });
+    const W2 = api.tensorFromArray([0.1, 0.2, -0.1, 0.3], [2, 2], {
+      requiresGrad: true,
+    });
 
     // Forward pass
     const h1 = input.matmul(W1);
@@ -692,7 +710,9 @@ describe("AOT Autograd: Complex Training Scenarios", () => {
   it("residual connection backward", async () => {
     // ResNet-style residual: output = x + f(x)
     const x = api.tensorFromArray([1, 2, 3, 4], [4], { requiresGrad: true });
-    const w = api.tensorFromArray([0.5, 0.5, 0.5, 0.5], [4], { requiresGrad: true });
+    const w = api.tensorFromArray([0.5, 0.5, 0.5, 0.5], [4], {
+      requiresGrad: true,
+    });
 
     // f(x) = w * x
     const fx = x.mul(w);

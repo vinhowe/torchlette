@@ -3,17 +3,17 @@
  * Verifies that users can write, compile, and dispatch custom GPU kernels
  * using the exported TileKernelSpec / compileTileKernel / createTileKernelDispatcher.
  */
-import { describe, it, expect, beforeAll } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
-  type TileKernelSpec,
-  KernelContext,
+  ceilDivGrid,
   compileTileKernel,
   createTileKernelDispatcher,
   elementwiseGrid,
-  ceilDivGrid,
-  singleWorkgroup,
-  initWebGPU,
   getWebGPUInitError,
+  initWebGPU,
+  type KernelContext,
+  singleWorkgroup,
+  type TileKernelSpec,
   webgpuBackend,
 } from "../../src/backend/webgpu";
 import { cpuOnly } from "../helpers/webgpu";
@@ -45,7 +45,7 @@ describe("compileTileKernel", () => {
     expect(wgsl).toContain("@group(0)");
     // Should have 3 storage bindings + 1 uniform
     const bindingMatches = wgsl.match(/@binding\(\d+\)/g);
-    expect(bindingMatches!.length).toBe(4); // a, b, out, uniforms
+    expect(bindingMatches?.length).toBe(4); // a, b, out, uniforms
   });
 
   it("compiles a masked kernel using blockLoad/blockStore", () => {
@@ -188,10 +188,16 @@ describe.skipIf(cpuOnly)("createTileKernelDispatcher", () => {
 
     const aTensor = webgpuBackend.ops.tensorFromArray(aData, [N]);
     const bTensor = webgpuBackend.ops.tensorFromArray(bData, [N]);
-    const outTensor = webgpuBackend.ops.tensorFromArray(new Array(N).fill(0), [N]);
+    const outTensor = webgpuBackend.ops.tensorFromArray(new Array(N).fill(0), [
+      N,
+    ]);
 
     dispatcher.dispatch(
-      { a: (aTensor as any).buffer, b: (bTensor as any).buffer, out: (outTensor as any).buffer },
+      {
+        a: (aTensor as any).buffer,
+        b: (bTensor as any).buffer,
+        out: (outTensor as any).buffer,
+      },
       { size: N },
     );
 

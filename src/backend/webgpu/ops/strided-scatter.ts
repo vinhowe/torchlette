@@ -2,21 +2,28 @@
  * Strided scatter ops: stridedScatterCopy (+ chunked), stridedScatterAdd (+ chunked).
  */
 import type { BackendTensor } from "../../types";
+import {
+  cachedCreateBindGroup,
+  createParamsBuffer,
+  params,
+  releaseParamsBuffer,
+} from "../bind-group-cache";
+import { resolveOutputBuffer } from "../buffer-arena";
+import { destroyCopy } from "../buffer-pool";
+import { dispatchComputePass, getPipeline } from "../dispatch";
+import { requireContext } from "../gpu-context";
 import type { WebGPUTensor } from "../gpu-types";
 import { asGPUTensor } from "../gpu-types";
-import { sizeOf, WORKGROUP_SIZE, compute2DDispatch } from "../shape-utils";
-import { requireContext } from "../gpu-context";
-import { dispatchComputePass, getPipeline } from "../dispatch";
+import { compute2DDispatch, sizeOf, WORKGROUP_SIZE } from "../shape-utils";
 import { createTensor } from "../tensor";
-import { destroyCopy } from "../buffer-pool";
-import { resolveOutputBuffer } from "../buffer-arena";
-import {
-  cachedCreateBindGroup, createParamsBuffer, releaseParamsBuffer,
-  params,
-} from "../bind-group-cache";
-import { ensureContiguous } from "./views";
-import { stridedScatterCopyTileIR, stridedScatterAddTileIR, flatCopySpec, flatAddSpec } from "./ops-tile-ir";
 import { createTileKernelDispatcher } from "../tile-dispatch";
+import {
+  flatAddSpec,
+  flatCopySpec,
+  stridedScatterAddTileIR,
+  stridedScatterCopyTileIR,
+} from "./ops-tile-ir";
+import { ensureContiguous } from "./views";
 
 type ScatterOp = "copy" | "add";
 
@@ -47,19 +54,40 @@ function stridedScatterDirect(
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
-  const contiguousBase = baseTensor.isContiguous ? baseTensor : ensureContiguous(baseTensor);
+  const contiguousBase = baseTensor.isContiguous
+    ? baseTensor
+    : ensureContiguous(baseTensor);
   const srcStrides = srcTensor.strides;
   const srcOffset = srcTensor.offset;
 
-  const tileIR = op === "copy" ? stridedScatterCopyTileIR : stridedScatterAddTileIR;
-  const code = tileIR(baseSize, viewShape, viewStrides, offset, srcStrides, srcOffset);
+  const tileIR =
+    op === "copy" ? stridedScatterCopyTileIR : stridedScatterAddTileIR;
+  const code = tileIR(
+    baseSize,
+    viewShape,
+    viewStrides,
+    offset,
+    srcStrides,
+    srcOffset,
+  );
   const opName = op === "copy" ? "Copy" : "Add";
   const key = `stridedScatter${opName}:${baseSize}:${viewShape.join("x")}:${viewStrides.join(",")}:${offset}:${srcStrides.join(",")}:${srcOffset}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   const pipeline = getPipeline(ctx, key, code);
 
-  const outBuffer = resolveOutputBuffer(ctx.device, baseSize * 4, [contiguousBase.buffer, srcTensor.buffer]);
-  const paramsBuffer = createParamsBuffer(ctx.device, params(baseSize, viewSize));
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [contiguousBase.buffer, srcTensor.buffer, outBuffer, paramsBuffer]);
+  const outBuffer = resolveOutputBuffer(ctx.device, baseSize * 4, [
+    contiguousBase.buffer,
+    srcTensor.buffer,
+  ]);
+  const paramsBuffer = createParamsBuffer(
+    ctx.device,
+    params(baseSize, viewSize),
+  );
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
+    contiguousBase.buffer,
+    srcTensor.buffer,
+    outBuffer,
+    paramsBuffer,
+  ]);
   dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
   releaseParamsBuffer(paramsBuffer);
 
@@ -82,18 +110,23 @@ function stridedScatterImpl(
   const viewSize = sizeOf(viewShape);
 
   if (baseSize === 0) {
-    throw new Error(`stridedScatter${op === "copy" ? "Copy" : "Add"}: empty base tensor`);
+    throw new Error(
+      `stridedScatter${op === "copy" ? "Copy" : "Add"}: empty base tensor`,
+    );
   }
 
   const ctx = requireContext();
-  const maxBindingSize = ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize =
+    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const baseSizeBytes = baseSize * 4;
   const srcSizeBytes = srcTensor.size * 4;
 
   if (baseSizeBytes > maxBindingSize || srcSizeBytes > maxBindingSize) {
     const isFull = viewSize === baseSize && offset === 0;
     const viewContiguous = isContiguousStrides(viewShape, viewStrides);
-    const srcContiguous = srcTensor.isContiguous || isContiguousStrides(srcTensor.shape, srcTensor.strides);
+    const srcContiguous =
+      srcTensor.isContiguous ||
+      isContiguousStrides(srcTensor.shape, srcTensor.strides);
 
     if (isFull && baseTensor.isContiguous && srcContiguous && viewContiguous) {
       return op === "copy"
@@ -112,7 +145,8 @@ function stridedScatterImpl(
  * Returns a new tensor (does not mutate base).
  */
 export function stridedScatterCopy(
-  base: BackendTensor, src: BackendTensor,
+  base: BackendTensor,
+  src: BackendTensor,
   options: { offset: number; viewShape: number[]; viewStrides: number[] },
 ): BackendTensor {
   return stridedScatterImpl("copy", base, src, options);
@@ -123,7 +157,8 @@ export function stridedScatterCopy(
  * Returns a new tensor (does not mutate base).
  */
 export function stridedScatterAdd(
-  base: BackendTensor, src: BackendTensor,
+  base: BackendTensor,
+  src: BackendTensor,
   options: { offset: number; viewShape: number[]; viewStrides: number[] },
 ): BackendTensor {
   return stridedScatterImpl("add", base, src, options);

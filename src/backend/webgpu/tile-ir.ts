@@ -27,18 +27,35 @@
  */
 
 import {
-  BlockOps, Block, TileRange, buildPtr, buildMask,
+  type Block,
+  type BlockLoadOpts,
+  BlockOps,
   type BlockPtr,
-  type BlockLoadOpts, type BlockStorePtr,
+  type BlockStorePtr,
+  buildMask,
+  buildPtr,
+  type TileRange,
 } from "./tile-ops";
 
 // Re-export tile-ops types so kernel authors only need one import
 export {
-  BlockOps, Block, TileRange, buildPtr, buildMask,
-  type BlockPtr, type BlockThreadPtr, type BlockCoopPtr,
-  type BlockLoadOpts, type BlockStorePtr,
+  Block,
+  type BlockCoopPtr,
+  type BlockLoadOpts,
+  BlockOps,
+  type BlockPtr,
+  type BlockStorePtr,
+  type BlockThreadPtr,
+  buildMask,
+  buildPtr,
+  TileRange,
 } from "./tile-ops";
-import { F32_NEG_MAX, F32_POS_MAX, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
+
+import {
+  F32_NEG_MAX,
+  F32_POS_MAX,
+  MAX_WORKGROUPS_PER_DIM,
+} from "./shape-utils";
 
 // ============================================================================
 // IR Node Types
@@ -46,8 +63,37 @@ import { F32_NEG_MAX, F32_POS_MAX, MAX_WORKGROUPS_PER_DIM } from "./shape-utils"
 
 type ValueType = "block" | "scalar";
 export type DataType = "f32" | "f16" | "u32" | "i32";
-type BinaryOp = "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "xor" | "shr" | "shl" | "min" | "max" | "pow";
-type UnaryOp = "rsqrt" | "exp" | "log" | "abs" | "neg" | "sqrt" | "tanh" | "floor" | "ceil" | "not" | "sin" | "cos" | "round" | "sign" | "exp2" | "log2";
+type BinaryOp =
+  | "add"
+  | "sub"
+  | "mul"
+  | "div"
+  | "mod"
+  | "and"
+  | "or"
+  | "xor"
+  | "shr"
+  | "shl"
+  | "min"
+  | "max"
+  | "pow";
+type UnaryOp =
+  | "rsqrt"
+  | "exp"
+  | "log"
+  | "abs"
+  | "neg"
+  | "sqrt"
+  | "tanh"
+  | "floor"
+  | "ceil"
+  | "not"
+  | "sin"
+  | "cos"
+  | "round"
+  | "sign"
+  | "exp2"
+  | "log2";
 type CmpOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
 
 interface IRNodeBase {
@@ -75,9 +121,8 @@ interface LoadNode extends IRNodeBase {
   kind: "load";
   binding: string;
   offsets: IRNode; // block expression for indices
-  mask?: IRNode;   // optional mask (block expression, truthy = load, falsy = 0)
+  mask?: IRNode; // optional mask (block expression, truthy = load, falsy = 0)
 }
-
 
 interface BinaryNode extends IRNodeBase {
   kind: "binary";
@@ -288,7 +333,7 @@ export type IRNode =
 /** 1D range of tile offsets: [base, base+1, ..., base+size-1] */
 export interface TileRangeInfo {
   base: IRNode;
-  size: number;         // compile-time block dimension
+  size: number; // compile-time block dimension
 }
 
 /** 2D pointer block: base + outer * outerStride + inner * innerStride */
@@ -297,7 +342,7 @@ export interface TilePtr2D {
   outerRange: TileRangeInfo;
   outerStride: IRNode;
   innerRange: TileRangeInfo;
-  innerStride: IRNode;  // const(1) for contiguous
+  innerStride: IRNode; // const(1) for contiguous
 }
 
 /** 2D mask: outer_cond & inner_cond */
@@ -315,8 +360,8 @@ export interface TileLoadStmt {
   binding: string;
   ptr: TilePtr2D;
   mask: TileMask2D;
-  sharedName: string;     // compiler-assigned
-  tileRows: number;       // BLOCK dimension (not thread tile)
+  sharedName: string; // compiler-assigned
+  tileRows: number; // BLOCK dimension (not thread tile)
   tileCols: number;
   elemType: DataType;
 }
@@ -326,7 +371,7 @@ export interface TileLoad1DStmt {
   binding: string;
   range: TileRangeInfo;
   arrayName: string;
-  size: number;           // = threadTileN (derived by compiler)
+  size: number; // = threadTileN (derived by compiler)
 }
 
 export interface TileStoreStmt {
@@ -337,7 +382,7 @@ export interface TileStoreStmt {
   accName: string;
   threadTileM: number;
   threadTileN: number;
-  accDtype?: DataType;    // set by castTo_, affects store type conversion
+  accDtype?: DataType; // set by castTo_, affects store type conversion
 }
 
 // --- Block-level statement types (unified Block API) ---
@@ -352,7 +397,7 @@ export interface BlockAllocStmt {
   rows: number;
   cols: number;
   elemType: DataType;
-  initValue?: number;  // undefined = zero-init, number = fill with this value
+  initValue?: number; // undefined = zero-init, number = fill with this value
 }
 
 export interface BlockLoadStmt {
@@ -389,18 +434,18 @@ export interface BlockDotStmt {
   aName: string;
   bName: string;
   resultName: string;
-  accName?: string;       // if set, accumulate into existing block
+  accName?: string; // if set, accumulate into existing block
   aPlacement: "register" | "shared";
   bPlacement: "register" | "shared";
   bTransposed: boolean;
   aRows: number;
   aCols: number;
-  bRows: number;          // ORIGINAL (untransposed) rows
-  bCols: number;          // ORIGINAL (untransposed) cols
-  threadTileM?: number;   // per-thread M dim (for shared×shared outer product)
-  threadTileN?: number;   // per-thread N dim (for shared×shared outer product)
-  aSmemStride?: number;   // stride for A in shared memory (default: aCols)
-  bSmemStride?: number;   // stride for B in shared memory (default: bCols)
+  bRows: number; // ORIGINAL (untransposed) rows
+  bCols: number; // ORIGINAL (untransposed) cols
+  threadTileM?: number; // per-thread M dim (for shared×shared outer product)
+  threadTileN?: number; // per-thread N dim (for shared×shared outer product)
+  aSmemStride?: number; // stride for A in shared memory (default: aCols)
+  bSmemStride?: number; // stride for B in shared memory (default: bCols)
 }
 
 export interface BlockReduceStmt {
@@ -434,7 +479,7 @@ export interface BlockBinaryStmt {
   bCols: number;
   op: BlockBinaryOp;
   inPlace: boolean;
-  bScalarExpr?: IRNode;   // when set, B is a scalar expression (bName unused)
+  bScalarExpr?: IRNode; // when set, B is a scalar expression (bName unused)
 }
 
 // ============================================================================
@@ -664,42 +709,85 @@ function isConstVal(node: IRNode, val: number): boolean {
 
 function evalBinaryConst(op: BinaryOp, a: number, b: number): number | null {
   switch (op) {
-    case "add": { const r = a + b; return isFinite(r) ? r : null; }
-    case "sub": { const r = a - b; return isFinite(r) ? r : null; }
-    case "mul": { const r = a * b; return isFinite(r) ? r : null; }
-    case "div": return b !== 0 && isFinite(a / b) ? a / b : null;
-    case "mod": return b !== 0 ? a % b : null;
-    case "min": return Math.min(a, b);
-    case "max": return Math.max(a, b);
-    case "pow": { const r = Math.pow(a, b); return isFinite(r) ? r : null; }
-    case "and": return ((a >>> 0) & (b >>> 0)) >>> 0;
-    case "or":  return ((a >>> 0) | (b >>> 0)) >>> 0;
-    case "xor": return ((a >>> 0) ^ (b >>> 0)) >>> 0;
-    case "shr": return (a >>> 0) >>> (b >>> 0);
-    case "shl": return ((a >>> 0) << (b >>> 0)) >>> 0;
-    default: return null;
+    case "add": {
+      const r = a + b;
+      return Number.isFinite(r) ? r : null;
+    }
+    case "sub": {
+      const r = a - b;
+      return Number.isFinite(r) ? r : null;
+    }
+    case "mul": {
+      const r = a * b;
+      return Number.isFinite(r) ? r : null;
+    }
+    case "div":
+      return b !== 0 && Number.isFinite(a / b) ? a / b : null;
+    case "mod":
+      return b !== 0 ? a % b : null;
+    case "min":
+      return Math.min(a, b);
+    case "max":
+      return Math.max(a, b);
+    case "pow": {
+      const r = a ** b;
+      return Number.isFinite(r) ? r : null;
+    }
+    case "and":
+      return ((a >>> 0) & (b >>> 0)) >>> 0;
+    case "or":
+      return ((a >>> 0) | (b >>> 0)) >>> 0;
+    case "xor":
+      return ((a >>> 0) ^ (b >>> 0)) >>> 0;
+    case "shr":
+      return (a >>> 0) >>> (b >>> 0);
+    case "shl":
+      return ((a >>> 0) << (b >>> 0)) >>> 0;
+    default:
+      return null;
   }
 }
 
 function evalUnaryConst(op: UnaryOp, x: number): number | null {
   switch (op) {
-    case "neg":   return -x;
-    case "abs":   return Math.abs(x);
-    case "exp":   { const r = Math.exp(x); return isFinite(r) ? r : null; }
-    case "log":   return x > 0 ? Math.log(x) : null;
-    case "sqrt":  return x >= 0 ? Math.sqrt(x) : null;
-    case "rsqrt": return x > 0 ? 1 / Math.sqrt(x) : null;
-    case "floor": return Math.floor(x);
-    case "ceil":  return Math.ceil(x);
-    case "sin":   return Math.sin(x);
-    case "cos":   return Math.cos(x);
-    case "tanh":  return Math.tanh(x);
-    case "round": return Math.round(x);
-    case "sign":  return Math.sign(x);
-    case "not":   return x ? 0 : 1;
-    case "exp2":  { const r = Math.pow(2, x); return isFinite(r) ? r : null; }
-    case "log2":  return x > 0 ? Math.log2(x) : null;
-    default: return null;
+    case "neg":
+      return -x;
+    case "abs":
+      return Math.abs(x);
+    case "exp": {
+      const r = Math.exp(x);
+      return Number.isFinite(r) ? r : null;
+    }
+    case "log":
+      return x > 0 ? Math.log(x) : null;
+    case "sqrt":
+      return x >= 0 ? Math.sqrt(x) : null;
+    case "rsqrt":
+      return x > 0 ? 1 / Math.sqrt(x) : null;
+    case "floor":
+      return Math.floor(x);
+    case "ceil":
+      return Math.ceil(x);
+    case "sin":
+      return Math.sin(x);
+    case "cos":
+      return Math.cos(x);
+    case "tanh":
+      return Math.tanh(x);
+    case "round":
+      return Math.round(x);
+    case "sign":
+      return Math.sign(x);
+    case "not":
+      return x ? 0 : 1;
+    case "exp2": {
+      const r = 2 ** x;
+      return Number.isFinite(r) ? r : null;
+    }
+    case "log2":
+      return x > 0 ? Math.log2(x) : null;
+    default:
+      return null;
   }
 }
 
@@ -716,7 +804,13 @@ function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
     if (lhs.kind === "const" && rhs.kind === "const") {
       const result = evalBinaryConst(op, lhs.value, rhs.value);
       if (result !== null) {
-        return { kind: "const", value: result, valueType: "scalar", dataType, id: -1 } as ConstNode;
+        return {
+          kind: "const",
+          value: result,
+          valueType: "scalar",
+          dataType,
+          id: -1,
+        } as ConstNode;
       }
     }
     // Algebraic simplifications
@@ -737,7 +831,13 @@ function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
         break;
       case "and":
         if (isConstVal(rhs, 0) || isConstVal(lhs, 0))
-          return { kind: "const", value: 0, valueType: "scalar", dataType: "u32", id: -1 } as ConstNode;
+          return {
+            kind: "const",
+            value: 0,
+            valueType: "scalar",
+            dataType: "u32",
+            id: -1,
+          } as ConstNode;
         break;
       case "or":
         if (isConstVal(rhs, 0)) return lhs;
@@ -757,7 +857,13 @@ function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
     if (input.kind === "const") {
       const result = evalUnaryConst(op, input.value);
       if (result !== null) {
-        return { kind: "const", value: result, valueType: "scalar", dataType, id: -1 } as ConstNode;
+        return {
+          kind: "const",
+          value: result,
+          valueType: "scalar",
+          dataType,
+          id: -1,
+        } as ConstNode;
       }
     }
     // neg(neg(x)) → x
@@ -770,17 +876,36 @@ function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
   if (partial.kind === "cmp") {
     const { op, lhs, rhs } = partial as Omit<CmpNode, "id">;
     if (lhs.kind === "const" && rhs.kind === "const") {
-      const l = lhs.value, r = rhs.value;
+      const l = lhs.value,
+        r = rhs.value;
       let result: boolean;
       switch (op) {
-        case "eq": result = l === r; break;
-        case "ne": result = l !== r; break;
-        case "lt": result = l < r; break;
-        case "le": result = l <= r; break;
-        case "gt": result = l > r; break;
-        case "ge": result = l >= r; break;
+        case "eq":
+          result = l === r;
+          break;
+        case "ne":
+          result = l !== r;
+          break;
+        case "lt":
+          result = l < r;
+          break;
+        case "le":
+          result = l <= r;
+          break;
+        case "gt":
+          result = l > r;
+          break;
+        case "ge":
+          result = l >= r;
+          break;
       }
-      return { kind: "const", value: result! ? 1 : 0, valueType: "scalar", dataType: "u32", id: -1 } as ConstNode;
+      return {
+        kind: "const",
+        value: result! ? 1 : 0,
+        valueType: "scalar",
+        dataType: "u32",
+        id: -1,
+      } as ConstNode;
     }
     return null;
   }
@@ -788,7 +913,13 @@ function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
   if (partial.kind === "cast") {
     const { input, targetType } = partial as Omit<CastNode, "id">;
     if (input.kind === "const") {
-      return { kind: "const", value: input.value, valueType: "scalar", dataType: targetType, id: -1 } as ConstNode;
+      return {
+        kind: "const",
+        value: input.value,
+        valueType: "scalar",
+        dataType: targetType,
+        id: -1,
+      } as ConstNode;
     }
     return null;
   }
@@ -798,27 +929,46 @@ function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
 
 // ---- CSE key computation ----
 
-function cseKey(node: { kind: string;[key: string]: any }): string | null {
+function cseKey(node: { kind: string; [key: string]: any }): string | null {
   switch (node.kind) {
-    case "const":    return `K:${node.dataType}:${node.value}`;
-    case "binary":   return `B:${node.op}:${node.lhs.id}:${node.rhs.id}`;
-    case "unary":    return `U:${node.op}:${node.input.id}`;
-    case "cmp":      return `C:${node.op}:${node.lhs.id}:${node.rhs.id}`;
-    case "cast":     return `T:${node.targetType}:${node.input.id}`;
-    case "bitcast":  return `BC:${node.targetType}:${node.input.id}`;
-    case "select":   return `S:${node.condition.id}:${node.trueVal.id}:${node.falseVal.id}`;
-    case "uniform":  return `UNI:${node.name}`;
-    case "programId": return `PID:${node.dim}`;
-    case "threadIdx": return `TID:${node.dim}`;
-    case "localIndex": return "LI";
-    case "globalId": return `GID:${node.dim}`;
-    case "numWorkgroups": return `NWG:${node.dim}`;
-    case "vec4Construct": return `V4C:${node.x.id}:${node.y.id}:${node.z.id}:${node.w.id}`;
-    case "vec4Splat":     return `V4S:${node.value.id}`;
-    case "vec4NativeDot": return `V4D:${node.a.id}:${node.b.id}`;
-    case "vec4Component": return `V4X:${node.value.id}:${node.comp}`;
-    case "vec4Binary":    return `V4B:${node.op}:${node.a.id}:${node.b.id}`;
-    default: return null; // Not CSE-eligible (loads, sharedRead, namedRef, vec4ArrayRead, etc.)
+    case "const":
+      return `K:${node.dataType}:${node.value}`;
+    case "binary":
+      return `B:${node.op}:${node.lhs.id}:${node.rhs.id}`;
+    case "unary":
+      return `U:${node.op}:${node.input.id}`;
+    case "cmp":
+      return `C:${node.op}:${node.lhs.id}:${node.rhs.id}`;
+    case "cast":
+      return `T:${node.targetType}:${node.input.id}`;
+    case "bitcast":
+      return `BC:${node.targetType}:${node.input.id}`;
+    case "select":
+      return `S:${node.condition.id}:${node.trueVal.id}:${node.falseVal.id}`;
+    case "uniform":
+      return `UNI:${node.name}`;
+    case "programId":
+      return `PID:${node.dim}`;
+    case "threadIdx":
+      return `TID:${node.dim}`;
+    case "localIndex":
+      return "LI";
+    case "globalId":
+      return `GID:${node.dim}`;
+    case "numWorkgroups":
+      return `NWG:${node.dim}`;
+    case "vec4Construct":
+      return `V4C:${node.x.id}:${node.y.id}:${node.z.id}:${node.w.id}`;
+    case "vec4Splat":
+      return `V4S:${node.value.id}`;
+    case "vec4NativeDot":
+      return `V4D:${node.a.id}:${node.b.id}`;
+    case "vec4Component":
+      return `V4X:${node.value.id}:${node.comp}`;
+    case "vec4Binary":
+      return `V4B:${node.op}:${node.a.id}:${node.b.id}`;
+    default:
+      return null; // Not CSE-eligible (loads, sharedRead, namedRef, vec4ArrayRead, etc.)
   }
 }
 
@@ -850,9 +1000,17 @@ function makeNode<T extends IRNode>(partial: Omit<T, "id">): T {
 }
 
 /** Resolve a BlockExpr or number into an IRNode. Numbers become constants of the given type. */
-function resolveArgAs(arg: BlockExpr | number, dtype: DataType = "f32"): IRNode {
+function resolveArgAs(
+  arg: BlockExpr | number,
+  dtype: DataType = "f32",
+): IRNode {
   if (typeof arg === "number") {
-    return makeNode<ConstNode>({ kind: "const", valueType: "scalar", dataType: dtype, value: arg });
+    return makeNode<ConstNode>({
+      kind: "const",
+      valueType: "scalar",
+      dataType: dtype,
+      value: arg,
+    });
   }
   return arg.node;
 }
@@ -872,57 +1030,132 @@ export class BlockExpr {
   constructor(readonly node: IRNode) {}
 
   // -- Private helpers for node construction --
-  private _binOp(op: BinaryOp, other: BlockExpr | number, u32Rhs: boolean, dt: DataType): BlockExpr {
+  private _binOp(
+    op: BinaryOp,
+    other: BlockExpr | number,
+    u32Rhs: boolean,
+    dt: DataType,
+  ): BlockExpr {
     const rhs = u32Rhs ? resolveArgU32(other) : resolveArg(other);
-    return new BlockExpr(makeNode<BinaryNode>({
-      kind: "binary", op, lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType), dataType: dt,
-    }));
+    return new BlockExpr(
+      makeNode<BinaryNode>({
+        kind: "binary",
+        op,
+        lhs: this.node,
+        rhs,
+        valueType: promoteValueType(this.node.valueType, rhs.valueType),
+        dataType: dt,
+      }),
+    );
   }
 
   private _unaryOp(op: UnaryOp, dt?: DataType): BlockExpr {
-    return new BlockExpr(makeNode<UnaryNode>({
-      kind: "unary", op, input: this.node,
-      valueType: this.node.valueType, dataType: dt ?? this.node.dataType,
-    }));
+    return new BlockExpr(
+      makeNode<UnaryNode>({
+        kind: "unary",
+        op,
+        input: this.node,
+        valueType: this.node.valueType,
+        dataType: dt ?? this.node.dataType,
+      }),
+    );
   }
 
   // -- Arithmetic --
-  add(other: BlockExpr | number) { return this._binOp("add", other, false, this.node.dataType); }
-  sub(other: BlockExpr | number) { return this._binOp("sub", other, false, this.node.dataType); }
-  mul(other: BlockExpr | number) { return this._binOp("mul", other, false, this.node.dataType); }
-  div(other: BlockExpr | number) { return this._binOp("div", other, false, this.node.dataType); }
-  mod(other: BlockExpr | number) { return this._binOp("mod", other, false, this.node.dataType); }
-  min(other: BlockExpr | number) { return this._binOp("min", other, false, this.node.dataType); }
-  max(other: BlockExpr | number) { return this._binOp("max", other, false, this.node.dataType); }
-  and(other: BlockExpr | number) { return this._binOp("and", other, true, "u32"); }
-  or(other: BlockExpr | number) { return this._binOp("or", other, true, "u32"); }
-  xor(other: BlockExpr | number) { return this._binOp("xor", other, true, "u32"); }
-  shr(other: BlockExpr | number) { return this._binOp("shr", other, true, this.node.dataType); }
-  shl(other: BlockExpr | number) { return this._binOp("shl", other, true, this.node.dataType); }
+  add(other: BlockExpr | number) {
+    return this._binOp("add", other, false, this.node.dataType);
+  }
+  sub(other: BlockExpr | number) {
+    return this._binOp("sub", other, false, this.node.dataType);
+  }
+  mul(other: BlockExpr | number) {
+    return this._binOp("mul", other, false, this.node.dataType);
+  }
+  div(other: BlockExpr | number) {
+    return this._binOp("div", other, false, this.node.dataType);
+  }
+  mod(other: BlockExpr | number) {
+    return this._binOp("mod", other, false, this.node.dataType);
+  }
+  min(other: BlockExpr | number) {
+    return this._binOp("min", other, false, this.node.dataType);
+  }
+  max(other: BlockExpr | number) {
+    return this._binOp("max", other, false, this.node.dataType);
+  }
+  and(other: BlockExpr | number) {
+    return this._binOp("and", other, true, "u32");
+  }
+  or(other: BlockExpr | number) {
+    return this._binOp("or", other, true, "u32");
+  }
+  xor(other: BlockExpr | number) {
+    return this._binOp("xor", other, true, "u32");
+  }
+  shr(other: BlockExpr | number) {
+    return this._binOp("shr", other, true, this.node.dataType);
+  }
+  shl(other: BlockExpr | number) {
+    return this._binOp("shl", other, true, this.node.dataType);
+  }
 
   // -- Unary math --
-  rsqrt() { return this._unaryOp("rsqrt", "f32"); }
-  exp()   { return this._unaryOp("exp", "f32"); }
-  log()   { return this._unaryOp("log", "f32"); }
-  sqrt()  { return this._unaryOp("sqrt", "f32"); }
-  tanh()  { return this._unaryOp("tanh", "f32"); }
-  sin()   { return this._unaryOp("sin", "f32"); }
-  cos()   { return this._unaryOp("cos", "f32"); }
-  exp2()  { return this._unaryOp("exp2", "f32"); }
-  log2()  { return this._unaryOp("log2", "f32"); }
-  abs()   { return this._unaryOp("abs"); }
-  neg()   { return this._unaryOp("neg"); }
-  floor() { return this._unaryOp("floor"); }
-  ceil()  { return this._unaryOp("ceil"); }
-  round() { return this._unaryOp("round"); }
-  sign()  { return this._unaryOp("sign"); }
+  rsqrt() {
+    return this._unaryOp("rsqrt", "f32");
+  }
+  exp() {
+    return this._unaryOp("exp", "f32");
+  }
+  log() {
+    return this._unaryOp("log", "f32");
+  }
+  sqrt() {
+    return this._unaryOp("sqrt", "f32");
+  }
+  tanh() {
+    return this._unaryOp("tanh", "f32");
+  }
+  sin() {
+    return this._unaryOp("sin", "f32");
+  }
+  cos() {
+    return this._unaryOp("cos", "f32");
+  }
+  exp2() {
+    return this._unaryOp("exp2", "f32");
+  }
+  log2() {
+    return this._unaryOp("log2", "f32");
+  }
+  abs() {
+    return this._unaryOp("abs");
+  }
+  neg() {
+    return this._unaryOp("neg");
+  }
+  floor() {
+    return this._unaryOp("floor");
+  }
+  ceil() {
+    return this._unaryOp("ceil");
+  }
+  round() {
+    return this._unaryOp("round");
+  }
+  sign() {
+    return this._unaryOp("sign");
+  }
 
   /** Sigmoid activation: 1 / (1 + exp(-x)). Compound — no new IR node. */
   sigmoid(): BlockExpr {
-    const one = new BlockExpr(makeNode<ConstNode>({
-      kind: "const", value: 1.0, valueType: "scalar", dataType: "f32",
-    }));
+    const one = new BlockExpr(
+      makeNode<ConstNode>({
+        kind: "const",
+        value: 1.0,
+        valueType: "scalar",
+        dataType: "f32",
+      }),
+    );
     return one.div(one.add(this.neg().exp()));
   }
 
@@ -938,7 +1171,8 @@ export class BlockExpr {
 
   /** Ceiling division: cdiv(a, b) = (a + b - 1) / b. Compound. */
   cdiv(other: BlockExpr | number): BlockExpr {
-    const b = typeof other === "number" ? new BlockExpr(resolveArg(other)) : other;
+    const b =
+      typeof other === "number" ? new BlockExpr(resolveArg(other)) : other;
     return this.add(b.sub(1)).div(b);
   }
 
@@ -951,128 +1185,227 @@ export class BlockExpr {
   erf(): BlockExpr {
     // erf(x) = sign(x) * (1 - poly(t) * exp(-x²))
     // where t = 1/(1 + p*|x|), poly = a1*t + a2*t² + a3*t³ + a4*t⁴ + a5*t⁵
-    const mkOne = () => new BlockExpr(makeNode<ConstNode>({
-      kind: "const", value: 1.0, valueType: "scalar", dataType: "f32",
-    }));
+    const mkOne = () =>
+      new BlockExpr(
+        makeNode<ConstNode>({
+          kind: "const",
+          value: 1.0,
+          valueType: "scalar",
+          dataType: "f32",
+        }),
+      );
     const signX = this.sign();
     const absX = this.abs();
     const t = mkOne().div(mkOne().add(absX.mul(0.3275911)));
     // Horner: ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
-    const inner = t.mul(1.061405429).add(-1.453152027)
-      .mul(t).add(1.421413741)
-      .mul(t).add(-0.284496736)
-      .mul(t).add(0.254829592);
+    const inner = t
+      .mul(1.061405429)
+      .add(-1.453152027)
+      .mul(t)
+      .add(1.421413741)
+      .mul(t)
+      .add(-0.284496736)
+      .mul(t)
+      .add(0.254829592);
     const poly = inner.mul(t);
     const expTerm = absX.neg().mul(absX).exp(); // exp(-x²)
     return signX.mul(mkOne().sub(poly.mul(expTerm)));
   }
 
-  pow(other: BlockExpr | number) { return this._binOp("pow", other, false, "f32"); }
+  pow(other: BlockExpr | number) {
+    return this._binOp("pow", other, false, "f32");
+  }
 
   // -- Type casts --
   private _castTo(dt: DataType): BlockExpr {
     if (this.node.dataType === dt) return this;
-    return new BlockExpr(makeNode<CastNode>({
-      kind: "cast", input: this.node, targetType: dt,
-      valueType: this.node.valueType, dataType: dt,
-    }));
+    return new BlockExpr(
+      makeNode<CastNode>({
+        kind: "cast",
+        input: this.node,
+        targetType: dt,
+        valueType: this.node.valueType,
+        dataType: dt,
+      }),
+    );
   }
 
-  toF32() { return this._castTo("f32"); }
-  toU32() { return this._castTo("u32"); }
-  toI32() { return this._castTo("i32"); }
-  toF16() { return this._castTo("f16"); }
+  toF32() {
+    return this._castTo("f32");
+  }
+  toU32() {
+    return this._castTo("u32");
+  }
+  toI32() {
+    return this._castTo("i32");
+  }
+  toF16() {
+    return this._castTo("f16");
+  }
 
   // -- Bitcast (reinterpret bits, no conversion) --
   bitcastTo(dtype: DataType): BlockExpr {
-    return new BlockExpr(makeNode<BitcastNode>({
-      kind: "bitcast", input: this.node, targetType: dtype,
-      valueType: this.node.valueType, dataType: dtype,
-    }));
+    return new BlockExpr(
+      makeNode<BitcastNode>({
+        kind: "bitcast",
+        input: this.node,
+        targetType: dtype,
+        valueType: this.node.valueType,
+        dataType: dtype,
+      }),
+    );
   }
 
   // -- Subgroup ops --
   private _subgroupOp(kind: string): BlockExpr {
-    return new BlockExpr(makeNode({
-      kind, value: this.node,
-      valueType: this.node.valueType, dataType: this.node.dataType,
-    } as any));
+    return new BlockExpr(
+      makeNode({
+        kind,
+        value: this.node,
+        valueType: this.node.valueType,
+        dataType: this.node.dataType,
+      } as any),
+    );
   }
 
   subgroupShuffleXor(mask: BlockExpr | number): BlockExpr {
     const m = resolveArgU32(mask);
-    return new BlockExpr(makeNode<SubgroupShuffleXorNode>({
-      kind: "subgroupShuffleXor", value: this.node, mask: m,
-      valueType: this.node.valueType, dataType: this.node.dataType,
-    }));
+    return new BlockExpr(
+      makeNode<SubgroupShuffleXorNode>({
+        kind: "subgroupShuffleXor",
+        value: this.node,
+        mask: m,
+        valueType: this.node.valueType,
+        dataType: this.node.dataType,
+      }),
+    );
   }
 
-  subgroupAdd() { return this._subgroupOp("subgroupAdd"); }
-  subgroupMax() { return this._subgroupOp("subgroupMax"); }
-  subgroupMin() { return this._subgroupOp("subgroupMin"); }
-  subgroupBroadcastFirst() { return this._subgroupOp("subgroupBroadcastFirst"); }
-  subgroupInclusiveAdd() { return this._subgroupOp("subgroupInclusiveAdd"); }
+  subgroupAdd() {
+    return this._subgroupOp("subgroupAdd");
+  }
+  subgroupMax() {
+    return this._subgroupOp("subgroupMax");
+  }
+  subgroupMin() {
+    return this._subgroupOp("subgroupMin");
+  }
+  subgroupBroadcastFirst() {
+    return this._subgroupOp("subgroupBroadcastFirst");
+  }
+  subgroupInclusiveAdd() {
+    return this._subgroupOp("subgroupInclusiveAdd");
+  }
 
   // -- Vec4 operations (for vec4-typed BlockExprs) --
 
   /** dot(this, other) — both must be vec4<f32>. Returns f32 scalar. */
   vec4Dot(other: BlockExpr): BlockExpr {
-    return new BlockExpr(makeNode<Vec4NativeDotNode>({
-      kind: "vec4NativeDot", a: this.node, b: other.node,
-      valueType: "scalar", dataType: "f32",
-    }));
+    return new BlockExpr(
+      makeNode<Vec4NativeDotNode>({
+        kind: "vec4NativeDot",
+        a: this.node,
+        b: other.node,
+        valueType: "scalar",
+        dataType: "f32",
+      }),
+    );
   }
 
   /** Extract component from vec4: .x=0, .y=1, .z=2, .w=3. Returns f32 scalar. */
   vec4Component(comp: 0 | 1 | 2 | 3): BlockExpr {
-    return new BlockExpr(makeNode<Vec4ComponentNode>({
-      kind: "vec4Component", value: this.node, comp,
-      valueType: "scalar", dataType: "f32",
-    }));
+    return new BlockExpr(
+      makeNode<Vec4ComponentNode>({
+        kind: "vec4Component",
+        value: this.node,
+        comp,
+        valueType: "scalar",
+        dataType: "f32",
+      }),
+    );
   }
 
   private _vec4BinOp(op: "add" | "sub" | "mul", other: BlockExpr): BlockExpr {
-    return new BlockExpr(makeNode<Vec4BinaryNode>({
-      kind: "vec4Binary", op, a: this.node, b: other.node,
-      valueType: "scalar", dataType: "f32",
-    }));
+    return new BlockExpr(
+      makeNode<Vec4BinaryNode>({
+        kind: "vec4Binary",
+        op,
+        a: this.node,
+        b: other.node,
+        valueType: "scalar",
+        dataType: "f32",
+      }),
+    );
   }
-  vec4MulScalar(s: BlockExpr) { return this._vec4BinOp("mul", s); }
-  vec4Add(other: BlockExpr) { return this._vec4BinOp("add", other); }
-  vec4Sub(other: BlockExpr) { return this._vec4BinOp("sub", other); }
-  vec4Mul(other: BlockExpr) { return this._vec4BinOp("mul", other); }
+  vec4MulScalar(s: BlockExpr) {
+    return this._vec4BinOp("mul", s);
+  }
+  vec4Add(other: BlockExpr) {
+    return this._vec4BinOp("add", other);
+  }
+  vec4Sub(other: BlockExpr) {
+    return this._vec4BinOp("sub", other);
+  }
+  vec4Mul(other: BlockExpr) {
+    return this._vec4BinOp("mul", other);
+  }
 
   // -- Comparisons --
   private _cmpOp(op: CmpOp, other: BlockExpr | number): BlockExpr {
     const rhs = resolveArg(other);
-    return new BlockExpr(makeNode<CmpNode>({
-      kind: "cmp", op, lhs: this.node, rhs,
-      valueType: promoteValueType(this.node.valueType, rhs.valueType), dataType: "u32",
-    }));
+    return new BlockExpr(
+      makeNode<CmpNode>({
+        kind: "cmp",
+        op,
+        lhs: this.node,
+        rhs,
+        valueType: promoteValueType(this.node.valueType, rhs.valueType),
+        dataType: "u32",
+      }),
+    );
   }
 
-  eq(other: BlockExpr | number) { return this._cmpOp("eq", other); }
-  ne(other: BlockExpr | number) { return this._cmpOp("ne", other); }
-  lt(other: BlockExpr | number) { return this._cmpOp("lt", other); }
-  le(other: BlockExpr | number) { return this._cmpOp("le", other); }
-  gt(other: BlockExpr | number) { return this._cmpOp("gt", other); }
-  ge(other: BlockExpr | number) { return this._cmpOp("ge", other); }
+  eq(other: BlockExpr | number) {
+    return this._cmpOp("eq", other);
+  }
+  ne(other: BlockExpr | number) {
+    return this._cmpOp("ne", other);
+  }
+  lt(other: BlockExpr | number) {
+    return this._cmpOp("lt", other);
+  }
+  le(other: BlockExpr | number) {
+    return this._cmpOp("le", other);
+  }
+  gt(other: BlockExpr | number) {
+    return this._cmpOp("gt", other);
+  }
+  ge(other: BlockExpr | number) {
+    return this._cmpOp("ge", other);
+  }
 
   // -- Logical NOT --
-  not() { return this._unaryOp("not"); }
+  not() {
+    return this._unaryOp("not");
+  }
 
   // -- Select (ternary) --
   select(trueVal: BlockExpr | number, falseVal: BlockExpr | number): BlockExpr {
     const t = resolveArg(trueVal);
     const f = resolveArg(falseVal);
-    return new BlockExpr(makeNode<SelectNode>({
-      kind: "select", condition: this.node, trueVal: t, falseVal: f,
-      valueType: promoteValueType(
-        promoteValueType(this.node.valueType, t.valueType),
-        f.valueType,
-      ),
-      dataType: t.dataType,
-    }));
+    return new BlockExpr(
+      makeNode<SelectNode>({
+        kind: "select",
+        condition: this.node,
+        trueVal: t,
+        falseVal: f,
+        valueType: promoteValueType(
+          promoteValueType(this.node.valueType, t.valueType),
+          f.valueType,
+        ),
+        dataType: t.dataType,
+      }),
+    );
   }
 }
 
@@ -1090,10 +1423,15 @@ class SharedArrayHandle {
   ) {}
 
   read(idx: BlockExpr): BlockExpr {
-    return new BlockExpr(makeNode<SharedReadNode>({
-      kind: "sharedRead", arrayName: this.name, idx: idx.node,
-      valueType: "scalar", dataType: this.elemType,
-    }));
+    return new BlockExpr(
+      makeNode<SharedReadNode>({
+        kind: "sharedRead",
+        arrayName: this.name,
+        idx: idx.node,
+        valueType: "scalar",
+        dataType: this.elemType,
+      }),
+    );
   }
 
   write(idx: BlockExpr, value: BlockExpr): void {
@@ -1115,10 +1453,14 @@ export class VarHandle {
   ) {}
 
   get(): BlockExpr {
-    return new BlockExpr(makeNode<NamedRefNode>({
-      kind: "namedRef", name: this.name,
-      valueType: "scalar", dataType: this.dtype,
-    }));
+    return new BlockExpr(
+      makeNode<NamedRefNode>({
+        kind: "namedRef",
+        name: this.name,
+        valueType: "scalar",
+        dataType: this.dtype,
+      }),
+    );
   }
 
   set(value: BlockExpr): void {
@@ -1148,10 +1490,15 @@ class ArrayVarHandle {
   ) {}
 
   get(idx: BlockExpr): BlockExpr {
-    return new BlockExpr(makeNode<ArrayReadNode>({
-      kind: "arrayRead", arrayName: this.name, idx: idx.node,
-      valueType: "scalar", dataType: this.elemType,
-    }));
+    return new BlockExpr(
+      makeNode<ArrayReadNode>({
+        kind: "arrayRead",
+        arrayName: this.name,
+        idx: idx.node,
+        valueType: "scalar",
+        dataType: this.elemType,
+      }),
+    );
   }
 
   set(idx: BlockExpr, value: BlockExpr): void {
@@ -1184,13 +1531,15 @@ class Vec4ArrayHandle {
 
   read(idx: BlockExpr): BlockExpr {
     const nodeKind = this.isShared ? "vec4SharedRead" : "vec4ArrayRead";
-    return new BlockExpr(makeNode({
-      kind: nodeKind,
-      arrayName: this.name,
-      idx: idx.node,
-      valueType: "scalar" as ValueType,
-      dataType: "f32" as DataType,
-    } as any));
+    return new BlockExpr(
+      makeNode({
+        kind: nodeKind,
+        arrayName: this.name,
+        idx: idx.node,
+        valueType: "scalar" as ValueType,
+        dataType: "f32" as DataType,
+      } as any),
+    );
   }
 
   write(idx: BlockExpr, value: BlockExpr): void {
@@ -1228,7 +1577,11 @@ export class KernelContext {
   /** Statement list (imperative mode). */
   readonly statements: Statement[] = [];
   /** Shared memory arrays declared by this kernel. */
-  readonly sharedArrays: Array<{ name: string; size: number; elemType: DataType }> = [];
+  readonly sharedArrays: Array<{
+    name: string;
+    size: number;
+    elemType: DataType;
+  }> = [];
   /** Vec4 shared memory arrays declared by this kernel. */
   readonly vec4SharedArrays: Array<{ name: string; size: number }> = [];
   /** Binding specs from the kernel spec (for dataType resolution in load). */
@@ -1267,9 +1620,10 @@ export class KernelContext {
 
   /** Push a statement to the current scope (top of stack or root). */
   pushStatement(stmt: Statement): void {
-    const target = this.stmtStack.length > 0
-      ? this.stmtStack[this.stmtStack.length - 1]
-      : this.statements;
+    const target =
+      this.stmtStack.length > 0
+        ? this.stmtStack[this.stmtStack.length - 1]
+        : this.statements;
     target.push(stmt);
   }
 
@@ -1277,82 +1631,138 @@ export class KernelContext {
 
   /** Workgroup ID for the given dimension (0=x, 1=y, 2=z). */
   programId(dim: number): BlockExpr {
-    return new BlockExpr(this.trackNode(makeNode<ProgramIdNode>({
-      kind: "programId", dim,
-      valueType: "scalar", dataType: "u32",
-    })));
+    return new BlockExpr(
+      this.trackNode(
+        makeNode<ProgramIdNode>({
+          kind: "programId",
+          dim,
+          valueType: "scalar",
+          dataType: "u32",
+        }),
+      ),
+    );
   }
 
   /** Number of workgroups dispatched in given dimension (like Triton's `tl.num_programs`). */
   numPrograms(dim: number): BlockExpr {
-    return new BlockExpr(this.trackNode(makeNode<NumWorkgroupsNode>({
-      kind: "numWorkgroups", dim,
-      valueType: "scalar", dataType: "u32",
-    })));
+    return new BlockExpr(
+      this.trackNode(
+        makeNode<NumWorkgroupsNode>({
+          kind: "numWorkgroups",
+          dim,
+          valueType: "scalar",
+          dataType: "u32",
+        }),
+      ),
+    );
   }
 
   /** Load from a storage buffer at given offsets. Optional mask for bounds. */
   load(binding: string, offsets: BlockExpr, mask?: BlockExpr): BlockExpr {
     const bindingType = this.bindingSpecs[binding]?.type ?? "f32";
-    return new BlockExpr(this.trackNode(makeNode<LoadNode>({
-      kind: "load", binding, offsets: offsets.node,
-      ...(mask ? { mask: mask.node } : {}),
-      valueType: "block", dataType: bindingType as DataType,
-    } as any)));
+    return new BlockExpr(
+      this.trackNode(
+        makeNode<LoadNode>({
+          kind: "load",
+          binding,
+          offsets: offsets.node,
+          ...(mask ? { mask: mask.node } : {}),
+          valueType: "block",
+          dataType: bindingType as DataType,
+        } as any),
+      ),
+    );
   }
 
   /** Read a uniform config value. */
   uniform(name: string): BlockExpr {
-    return new BlockExpr(this.trackNode(makeNode<UniformNode>({
-      kind: "uniform", name,
-      valueType: "scalar", dataType: "u32",
-    })));
+    return new BlockExpr(
+      this.trackNode(
+        makeNode<UniformNode>({
+          kind: "uniform",
+          name,
+          valueType: "scalar",
+          dataType: "u32",
+        }),
+      ),
+    );
   }
 
   /** Create a scalar constant. */
   const(value: number, dataType: DataType = "f32"): BlockExpr {
-    return new BlockExpr(this.trackNode(makeNode<ConstNode>({
-      kind: "const", value,
-      valueType: "scalar", dataType,
-    })));
+    return new BlockExpr(
+      this.trackNode(
+        makeNode<ConstNode>({
+          kind: "const",
+          value,
+          valueType: "scalar",
+          dataType,
+        }),
+      ),
+    );
   }
 
   /** Shorthand: u32 constant. */
-  u32(value: number): BlockExpr { return this.const(value, "u32"); }
+  u32(value: number): BlockExpr {
+    return this.const(value, "u32");
+  }
 
   /** Shorthand: i32 constant. */
-  i32(value: number): BlockExpr { return this.const(value, "i32"); }
+  i32(value: number): BlockExpr {
+    return this.const(value, "i32");
+  }
 
   /** Shorthand: f32 constant. */
-  f32(value: number): BlockExpr { return this.const(value, "f32"); }
+  f32(value: number): BlockExpr {
+    return this.const(value, "f32");
+  }
 
   /** Shorthand: f16 constant. */
-  f16(value: number): BlockExpr { return this.const(value, "f16"); }
+  f16(value: number): BlockExpr {
+    return this.const(value, "f16");
+  }
 
   // ---- Imperative mode API ----
 
   /** Thread-local invocation ID for the given dimension (0=x, 1=y, 2=z). */
   threadIdx(dim: number): BlockExpr {
-    return new BlockExpr(this.trackNode(makeNode<ThreadIdxNode>({
-      kind: "threadIdx", dim,
-      valueType: "scalar", dataType: "u32",
-    })));
+    return new BlockExpr(
+      this.trackNode(
+        makeNode<ThreadIdxNode>({
+          kind: "threadIdx",
+          dim,
+          valueType: "scalar",
+          dataType: "u32",
+        }),
+      ),
+    );
   }
 
   /** Flat local invocation index (local_invocation_index). */
   localIndex(): BlockExpr {
-    return new BlockExpr(this.trackNode(makeNode<LocalIndexNode>({
-      kind: "localIndex",
-      valueType: "scalar", dataType: "u32",
-    })));
+    return new BlockExpr(
+      this.trackNode(
+        makeNode<LocalIndexNode>({
+          kind: "localIndex",
+          valueType: "scalar",
+          dataType: "u32",
+        }),
+      ),
+    );
   }
 
   /** Global invocation ID (global_invocation_id.x/y/z). */
   globalId(dim: number): BlockExpr {
-    return new BlockExpr(this.trackNode(makeNode<GlobalIdNode>({
-      kind: "globalId", dim,
-      valueType: "scalar", dataType: "u32",
-    })));
+    return new BlockExpr(
+      this.trackNode(
+        makeNode<GlobalIdNode>({
+          kind: "globalId",
+          dim,
+          valueType: "scalar",
+          dataType: "u32",
+        }),
+      ),
+    );
   }
 
   /**
@@ -1404,7 +1814,11 @@ export class KernelContext {
    *
    * Handles stride=0 (broadcast) via constant folding (coord*0 → 0).
    */
-  linearizeIndex(coords: BlockExpr[], strides: number[], offset = 0): BlockExpr {
+  linearizeIndex(
+    coords: BlockExpr[],
+    strides: number[],
+    offset = 0,
+  ): BlockExpr {
     let result: BlockExpr = this.u32(offset);
     for (let d = 0; d < coords.length; d++) {
       result = result.add(coords[d].mul(this.u32(strides[d])));
@@ -1413,7 +1827,11 @@ export class KernelContext {
   }
 
   /** Declare a workgroup shared memory array. Returns a handle for read/write. */
-  sharedArray(name: string, size: number, elemType: DataType = "f32"): SharedArrayHandle {
+  sharedArray(
+    name: string,
+    size: number,
+    elemType: DataType = "f32",
+  ): SharedArrayHandle {
     this.sharedArrays.push({ name, size, elemType });
     return new SharedArrayHandle(name, size, elemType, this);
   }
@@ -1426,10 +1844,14 @@ export class KernelContext {
       value: expr.node,
       dtype: expr.node.dataType,
     });
-    return new BlockExpr(makeNode<NamedRefNode>({
-      kind: "namedRef", name,
-      valueType: "scalar", dataType: expr.node.dataType,
-    }));
+    return new BlockExpr(
+      makeNode<NamedRefNode>({
+        kind: "namedRef",
+        name,
+        valueType: "scalar",
+        dataType: expr.node.dataType,
+      }),
+    );
   }
 
   /** Emit a `var` binding and return a handle for get/set/addAssign. */
@@ -1444,7 +1866,12 @@ export class KernelContext {
   }
 
   /** Emit a `var` array and return a handle. Zero-initialized by default. */
-  emitVarArray(name: string, elemType: DataType, size: number, skipZeroInit?: boolean): ArrayVarHandle {
+  emitVarArray(
+    name: string,
+    elemType: DataType,
+    size: number,
+    skipZeroInit?: boolean,
+  ): ArrayVarHandle {
     this.pushStatement({
       kind: "varArray",
       name,
@@ -1471,33 +1898,55 @@ export class KernelContext {
 
   /** Construct vec4<f32>(x, y, z, w) from 4 scalar expressions. */
   vec4(x: BlockExpr, y: BlockExpr, z: BlockExpr, w: BlockExpr): BlockExpr {
-    return new BlockExpr(makeNode<Vec4ConstructNode>({
-      kind: "vec4Construct", x: x.node, y: y.node, z: z.node, w: w.node,
-      valueType: "scalar", dataType: "f32",
-    }));
+    return new BlockExpr(
+      makeNode<Vec4ConstructNode>({
+        kind: "vec4Construct",
+        x: x.node,
+        y: y.node,
+        z: z.node,
+        w: w.node,
+        valueType: "scalar",
+        dataType: "f32",
+      }),
+    );
   }
 
   /** Construct vec4<f32>(v) — splat scalar to all 4 lanes. */
   vec4Splat(v: BlockExpr): BlockExpr {
-    return new BlockExpr(makeNode<Vec4SplatNode>({
-      kind: "vec4Splat", value: v.node,
-      valueType: "scalar", dataType: "f32",
-    }));
+    return new BlockExpr(
+      makeNode<Vec4SplatNode>({
+        kind: "vec4Splat",
+        value: v.node,
+        valueType: "scalar",
+        dataType: "f32",
+      }),
+    );
   }
 
   /** Shared loop emission for forRange/forStride. */
   private _emitLoop(
-    kind: "forRange" | "forStride", start: BlockExpr, bound: BlockExpr,
+    kind: "forRange" | "forStride",
+    start: BlockExpr,
+    bound: BlockExpr,
     body: (loopVar: BlockExpr) => void,
     extra?: { stride?: number; unroll?: boolean },
   ): void {
     const varName = `_lv${this.loopVarCounter++}`;
-    const loopVar = new BlockExpr(makeNode<NamedRefNode>({
-      kind: "namedRef", name: varName, valueType: "scalar", dataType: "u32",
-    }));
+    const loopVar = new BlockExpr(
+      makeNode<NamedRefNode>({
+        kind: "namedRef",
+        name: varName,
+        valueType: "scalar",
+        dataType: "u32",
+      }),
+    );
     const bodyStmts = this.captureScope(() => body(loopVar));
     const stmt: any = {
-      kind, varName, start: start.node, bound: bound.node, body: bodyStmts,
+      kind,
+      varName,
+      start: start.node,
+      bound: bound.node,
+      body: bodyStmts,
     };
     if (extra?.stride != null) stmt.stride = extra.stride;
     if (extra?.unroll != null) stmt.unroll = extra.unroll;
@@ -1505,17 +1954,35 @@ export class KernelContext {
   }
 
   /** Emit a for loop: `for (var v = start; v < bound; v++)`. */
-  forRange(start: BlockExpr, bound: BlockExpr, body: (loopVar: BlockExpr) => void,
-    opts?: { unroll?: boolean }): void {
-    this._emitLoop("forRange", start, bound, body, opts?.unroll ? { unroll: true } : undefined);
+  forRange(
+    start: BlockExpr,
+    bound: BlockExpr,
+    body: (loopVar: BlockExpr) => void,
+    opts?: { unroll?: boolean },
+  ): void {
+    this._emitLoop(
+      "forRange",
+      start,
+      bound,
+      body,
+      opts?.unroll ? { unroll: true } : undefined,
+    );
   }
 
   /** Strided for loop: `for (var i = start; i < bound; i += stride)`.
    *  Auto-unrolled when start/bound are const and trip count ≤ 8.
    *  Set opts.unroll to force unrolling up to trip count 16. */
-  forStride(start: BlockExpr, bound: BlockExpr, stride: number,
-    body: (i: BlockExpr) => void, opts?: { unroll?: boolean }): void {
-    this._emitLoop("forStride", start, bound, body, { stride, unroll: opts?.unroll });
+  forStride(
+    start: BlockExpr,
+    bound: BlockExpr,
+    stride: number,
+    body: (i: BlockExpr) => void,
+    opts?: { unroll?: boolean },
+  ): void {
+    this._emitLoop("forStride", start, bound, body, {
+      stride,
+      unroll: opts?.unroll,
+    });
   }
 
   /** Emit a compile-time unrolled loop. Body called N times with constant index. */
@@ -1527,14 +1994,23 @@ export class KernelContext {
 
   /** Emit an if-then block. */
   ifThen(cond: BlockExpr, body: () => void): void {
-    this.pushStatement({ kind: "if", condition: cond.node, body: this.captureScope(body) });
+    this.pushStatement({
+      kind: "if",
+      condition: cond.node,
+      body: this.captureScope(body),
+    });
   }
 
   /** Emit an if-then-else block. */
   ifThenElse(cond: BlockExpr, body: () => void, elseBody: () => void): void {
     const bodyStmts = this.captureScope(body);
     const elseStmts = this.captureScope(elseBody);
-    this.pushStatement({ kind: "ifElse", condition: cond.node, body: bodyStmts, elseBody: elseStmts });
+    this.pushStatement({
+      kind: "ifElse",
+      condition: cond.node,
+      body: bodyStmts,
+      elseBody: elseStmts,
+    });
   }
 
   /** Emit a workgroupBarrier(). */
@@ -1567,7 +2043,11 @@ export class KernelContext {
   }
 
   /** Stride-halving barrier loop: for each stride from count/2 to 1, ifThen(tid < stride) body, barrier. */
-  private _treeLoop(tid: BlockExpr, count: number, body: (off: BlockExpr) => void): void {
+  private _treeLoop(
+    tid: BlockExpr,
+    count: number,
+    body: (off: BlockExpr) => void,
+  ): void {
     for (let stride = count >> 1; stride >= 1; stride >>= 1) {
       this.ifThen(tid.lt(this.u32(stride)), () => body(this.u32(stride)));
       this.barrier();
@@ -1575,9 +2055,13 @@ export class KernelContext {
   }
 
   /** Tree reduction: `smem[0] = op(smem[0..wgSize-1])`. Uses subgroup intrinsics when available. */
-  private _treeReduce(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number,
-      combine: (a: BlockExpr, b: BlockExpr) => BlockExpr,
-      subgroupOp?: "sum" | "max" | "min"): void {
+  private _treeReduce(
+    smem: SharedArrayHandle,
+    tid: BlockExpr,
+    wgSize: number,
+    combine: (a: BlockExpr, b: BlockExpr) => BlockExpr,
+    subgroupOp?: "sum" | "max" | "min",
+  ): void {
     const smemCombine = (off: BlockExpr) => {
       smem.write(tid, combine(smem.read(tid), smem.read(tid.add(off))));
     };
@@ -1588,12 +2072,21 @@ export class KernelContext {
       let reduced: BlockExpr;
       if (subgroupOp) {
         const val = this.emitLet("_sgr_val", smem.read(tid));
-        reduced = this.emitLet("_sgr_red",
-          subgroupOp === "sum" ? val.subgroupAdd() : subgroupOp === "max" ? val.subgroupMax() : val.subgroupMin());
+        reduced = this.emitLet(
+          "_sgr_red",
+          subgroupOp === "sum"
+            ? val.subgroupAdd()
+            : subgroupOp === "max"
+              ? val.subgroupMax()
+              : val.subgroupMin(),
+        );
       } else {
         let val = this.emitLet("_sgrg_val", smem.read(tid));
         for (let mask = sg >> 1; mask >= 1; mask >>= 1) {
-          val = this.emitLet(`_sgrg_m${mask}`, combine(val, val.subgroupShuffleXor(mask)));
+          val = this.emitLet(
+            `_sgrg_m${mask}`,
+            combine(val, val.subgroupShuffleXor(mask)),
+          );
         }
         reduced = val;
       }
@@ -1623,7 +2116,9 @@ export class KernelContext {
 
   /** Generic tree reduction with user-defined combine function. */
   treeReduceGeneric(
-    smem: SharedArrayHandle, tid: BlockExpr, wgSize: number,
+    smem: SharedArrayHandle,
+    tid: BlockExpr,
+    wgSize: number,
     combine: (a: BlockExpr, b: BlockExpr) => BlockExpr,
   ): void {
     this._treeReduce(smem, tid, wgSize, combine);
@@ -1631,8 +2126,10 @@ export class KernelContext {
 
   /** Dual tree sum reduction: reduces two shared arrays in parallel. */
   dualTreeReduceSum(
-    smem1: SharedArrayHandle, smem2: SharedArrayHandle,
-    tid: BlockExpr, wgSize: number,
+    smem1: SharedArrayHandle,
+    smem2: SharedArrayHandle,
+    tid: BlockExpr,
+    wgSize: number,
   ): void {
     const dualAdd = (off: BlockExpr) => {
       smem1.write(tid, smem1.read(tid).add(smem1.read(tid.add(off))));
@@ -1662,7 +2159,9 @@ export class KernelContext {
    * Like `wgReduce` but takes a combine function and identity value.
    */
   wgReduceGeneric(
-    tid: BlockExpr, count: BlockExpr, wgSize: number,
+    tid: BlockExpr,
+    count: BlockExpr,
+    wgSize: number,
     identity: BlockExpr,
     bodyFn: (i: BlockExpr) => BlockExpr,
     combine: (a: BlockExpr, b: BlockExpr) => BlockExpr,
@@ -1679,7 +2178,10 @@ export class KernelContext {
       // Butterfly subgroup reduction via shuffleXor
       let val = this.emitLet(`_wgr${id}_sv`, acc.get());
       for (let mask = sg >> 1; mask >= 1; mask >>= 1) {
-        val = this.emitLet(`_wgr${id}_m${mask}`, combine(val, val.subgroupShuffleXor(mask)));
+        val = this.emitLet(
+          `_wgr${id}_m${mask}`,
+          combine(val, val.subgroupShuffleXor(mask)),
+        );
       }
       const smem = this.sharedArray(`_wgr${id}_s`, numSubgroups);
       this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
@@ -1701,7 +2203,9 @@ export class KernelContext {
 
   /** Strided loop: `for (var i = tid; i < bound; i += wgSize) { body(i); }` */
   stridedFor(
-    tid: BlockExpr, bound: BlockExpr, wgSize: number,
+    tid: BlockExpr,
+    bound: BlockExpr,
+    wgSize: number,
     body: (i: BlockExpr) => void,
   ): void {
     this.forStride(tid, bound, wgSize, body);
@@ -1717,11 +2221,14 @@ export class KernelContext {
    */
   wgReduce(
     op: "sum" | "max" | "min",
-    tid: BlockExpr, count: BlockExpr, wgSize: number,
+    tid: BlockExpr,
+    count: BlockExpr,
+    wgSize: number,
     bodyFn: (i: BlockExpr) => BlockExpr,
   ): BlockExpr {
     const id = this.reduceCounter++;
-    const identity = op === "sum" ? 0.0 : op === "max" ? F32_NEG_MAX : F32_POS_MAX;
+    const identity =
+      op === "sum" ? 0.0 : op === "max" ? F32_NEG_MAX : F32_POS_MAX;
     const acc = this.emitVar(`_wgr${id}_a`, "f32", this.f32(identity));
     this.stridedFor(tid, count, wgSize, (i) => {
       if (op === "sum") {
@@ -1737,8 +2244,14 @@ export class KernelContext {
       const sg = this.subgroupSize;
       const numSubgroups = wgSize / sg;
       // Phase 1: subgroup reduction from registers (0 barriers, no smem write)
-      const sgReduced = this.emitLet(`_wgr${id}_sgr`,
-        op === "sum" ? acc.get().subgroupAdd() : op === "max" ? acc.get().subgroupMax() : acc.get().subgroupMin());
+      const sgReduced = this.emitLet(
+        `_wgr${id}_sgr`,
+        op === "sum"
+          ? acc.get().subgroupAdd()
+          : op === "max"
+            ? acc.get().subgroupMax()
+            : acc.get().subgroupMin(),
+      );
       // Phase 2: leaders write to small smem
       const smem = this.sharedArray(`_wgr${id}_s`, numSubgroups);
       this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
@@ -1758,8 +2271,13 @@ export class KernelContext {
     const smem = this.sharedArray(`_wgr${id}_s`, wgSize);
     smem.write(tid, acc.get());
     this.barrier();
-    this._treeReduce(smem, tid, wgSize,
-      (a, b) => op === "sum" ? a.add(b) : op === "max" ? a.max(b) : a.min(b), op);
+    this._treeReduce(
+      smem,
+      tid,
+      wgSize,
+      (a, b) => (op === "sum" ? a.add(b) : op === "max" ? a.max(b) : a.min(b)),
+      op,
+    );
     return smem.read(this.u32(0));
   }
 
@@ -1772,7 +2290,9 @@ export class KernelContext {
    * leaders write to small smem arrays for final tree reduction.
    */
   dualWgReduce(
-    tid: BlockExpr, count: BlockExpr, wgSize: number,
+    tid: BlockExpr,
+    count: BlockExpr,
+    wgSize: number,
     bodyFn: (i: BlockExpr) => [BlockExpr, BlockExpr],
   ): [BlockExpr, BlockExpr] {
     const id = this.reduceCounter++;
@@ -1814,7 +2334,12 @@ export class KernelContext {
   }
 
   /** Emit an atomic operation: `atomicMax(&binding[idx], val)` etc. */
-  atomicOp(binding: string, idx: BlockExpr, op: AtomicOp, val: BlockExpr): void {
+  atomicOp(
+    binding: string,
+    idx: BlockExpr,
+    op: AtomicOp,
+    val: BlockExpr,
+  ): void {
     this.pushStatement({
       kind: "atomicOp",
       binding,
@@ -1830,8 +2355,10 @@ export class KernelContext {
    * Returns `{ oldValue: BlockExpr, exchanged: BlockExpr }`.
    */
   atomicCAS(
-    binding: string, idx: BlockExpr,
-    expected: BlockExpr, desired: BlockExpr,
+    binding: string,
+    idx: BlockExpr,
+    expected: BlockExpr,
+    desired: BlockExpr,
   ): { oldValue: BlockExpr; exchanged: BlockExpr } {
     const id = this.reduceCounter++;
     const oldVar = `_cas${id}_old`;
@@ -1847,12 +2374,16 @@ export class KernelContext {
     });
     // Return named refs so subsequent code can read the results
     const oldNode = makeNode<NamedRefNode>({
-      kind: "namedRef", name: oldVar,
-      valueType: "scalar", dataType: "u32",
+      kind: "namedRef",
+      name: oldVar,
+      valueType: "scalar",
+      dataType: "u32",
     });
     const exchNode = makeNode<NamedRefNode>({
-      kind: "namedRef", name: exchVar,
-      valueType: "scalar", dataType: "u32",
+      kind: "namedRef",
+      name: exchVar,
+      valueType: "scalar",
+      dataType: "u32",
     });
     return {
       oldValue: new BlockExpr(oldNode),
@@ -1885,7 +2416,12 @@ export class KernelContext {
   }
 
   /** Emit a guarded store: `if (cond) { binding[idx] = val; }`. */
-  guardedStore(binding: string, cond: BlockExpr, idx: BlockExpr, val: BlockExpr): void {
+  guardedStore(
+    binding: string,
+    cond: BlockExpr,
+    idx: BlockExpr,
+    val: BlockExpr,
+  ): void {
     this.pushStatement({
       kind: "guardedStore",
       binding,
@@ -1898,14 +2434,21 @@ export class KernelContext {
   // -- Triton-like convenience APIs --
 
   /** Block-level where (like `tl.where`): returns trueVal where cond is true, falseVal otherwise. */
-  blockWhere(cond: BlockExpr, trueVal: BlockExpr, falseVal: BlockExpr): BlockExpr {
+  blockWhere(
+    cond: BlockExpr,
+    trueVal: BlockExpr,
+    falseVal: BlockExpr,
+  ): BlockExpr {
     return cond.select(trueVal, falseVal);
   }
 
   /** Thread-distributed index range (like `tl.arange(0, BLOCK) + base`).
    *  Returns: programId(0) * blockSize + localIndex() + base. */
   blockRange(base: BlockExpr, blockSize: number): BlockExpr {
-    return this.programId(0).mul(this.u32(blockSize)).add(this.localIndex()).add(base);
+    return this.programId(0)
+      .mul(this.u32(blockSize))
+      .add(this.localIndex())
+      .add(base);
   }
 
   /**
@@ -1921,9 +2464,12 @@ export class KernelContext {
    */
   elementIndex(wgSize: number, size?: BlockExpr | string): BlockExpr {
     const idx = this.flatGlobalId(wgSize);
-    const bound = size === undefined ? this.uniform("size")
-      : typeof size === "string" ? this.uniform(size)
-      : size;
+    const bound =
+      size === undefined
+        ? this.uniform("size")
+        : typeof size === "string"
+          ? this.uniform(size)
+          : size;
     this.ifThen(idx.ge(bound), () => this.emitReturn());
     return idx;
   }
@@ -1938,9 +2484,16 @@ export class KernelContext {
    * @param size     - Upper bound for valid indices
    * @param fallback - Value for out-of-bounds (default: zero of binding's dtype)
    */
-  blockLoad(binding: string, idx: BlockExpr, size: BlockExpr, fallback?: BlockExpr): BlockExpr {
+  blockLoad(
+    binding: string,
+    idx: BlockExpr,
+    size: BlockExpr,
+    fallback?: BlockExpr,
+  ): BlockExpr {
     const val = this.load(binding, idx);
-    const fb = fallback ?? this.const(0, this.bindingSpecs[binding]?.type as DataType ?? "f32");
+    const fb =
+      fallback ??
+      this.const(0, (this.bindingSpecs[binding]?.type as DataType) ?? "f32");
     return idx.lt(size).select(val, fb);
   }
 
@@ -1953,7 +2506,12 @@ export class KernelContext {
    * @param size    - Upper bound for valid indices
    * @param val     - Value to store
    */
-  blockStore(binding: string, idx: BlockExpr, size: BlockExpr, val: BlockExpr): void {
+  blockStore(
+    binding: string,
+    idx: BlockExpr,
+    size: BlockExpr,
+    val: BlockExpr,
+  ): void {
     this.guardedStore(binding, idx.lt(size), idx, val);
   }
 
@@ -1970,7 +2528,12 @@ export class KernelContext {
    * @param strides     - Strides for re-linearization
    * @param baseOffset  - Base offset (default: 0)
    */
-  stridedIndex(flatIdx: BlockExpr, indexShape: number[], strides: number[], baseOffset = 0): BlockExpr {
+  stridedIndex(
+    flatIdx: BlockExpr,
+    indexShape: number[],
+    strides: number[],
+    baseOffset = 0,
+  ): BlockExpr {
     const coords = this.decomposeIndex(flatIdx, indexShape);
     return this.linearizeIndex(coords, strides, baseOffset);
   }
@@ -2000,8 +2563,10 @@ export class KernelContext {
    * @param loadFn     - Function mapping tile-local index → [valueA, valueB]
    */
   tileLoadPairVec4(
-    tid: BlockExpr, wgSize: number,
-    smemA: Vec4ArrayHandle, smemB: Vec4ArrayHandle,
+    tid: BlockExpr,
+    wgSize: number,
+    smemA: Vec4ArrayHandle,
+    smemB: Vec4ArrayHandle,
     count: BlockExpr | number,
     loadFn: (i: BlockExpr) => [BlockExpr, BlockExpr],
   ): void {
@@ -2022,7 +2587,12 @@ export class KernelContext {
    *
    *  With subgroups (sum only): subgroupInclusiveAdd within each subgroup,
    *  then cross-subgroup scan via sequential accumulation + broadcast. */
-  inclusiveScan(smem: SharedArrayHandle, tid: BlockExpr, wgSize: number, op: "sum" | "max"): void {
+  inclusiveScan(
+    smem: SharedArrayHandle,
+    tid: BlockExpr,
+    wgSize: number,
+    op: "sum" | "max",
+  ): void {
     if (op === "sum" && this.canUseSubgroups(wgSize)) {
       const sg = this.subgroupSize;
       const numSubgroups = wgSize / sg;
@@ -2044,14 +2614,20 @@ export class KernelContext {
       // Only thread 0 does this
       this.ifThen(tid.eq(this.u32(0)), () => {
         for (let i = 1; i < numSubgroups; i++) {
-          sgTotals.write(this.u32(i), sgTotals.read(this.u32(i)).add(sgTotals.read(this.u32(i - 1))));
+          sgTotals.write(
+            this.u32(i),
+            sgTotals.read(this.u32(i)).add(sgTotals.read(this.u32(i - 1))),
+          );
         }
       });
       this.barrier();
       // Phase 3: add cross-subgroup prefix to all elements
       const sgId = this.emitLet("_sgs_sgid", tid.div(this.u32(sg)));
       this.ifThen(sgId.gt(this.u32(0)), () => {
-        smem.write(tid, smem.read(tid).add(sgTotals.read(sgId.sub(this.u32(1)))));
+        smem.write(
+          tid,
+          smem.read(tid).add(sgTotals.read(sgId.sub(this.u32(1)))),
+        );
       });
       this.barrier();
       return;
@@ -2076,9 +2652,9 @@ export class KernelContext {
    * Returns a BlockExpr for the result. Uses emitLet to keep WGSL readable.
    */
   private mulhi(prefix: string, a: BlockExpr, b: BlockExpr): BlockExpr {
-    const aL = this.emitLet(`${prefix}_aL`, a.and(0xFFFF));
+    const aL = this.emitLet(`${prefix}_aL`, a.and(0xffff));
     const aH = this.emitLet(`${prefix}_aH`, a.shr(16));
-    const bL = this.emitLet(`${prefix}_bL`, b.and(0xFFFF));
+    const bL = this.emitLet(`${prefix}_bL`, b.and(0xffff));
     const bH = this.emitLet(`${prefix}_bH`, b.shr(16));
     const ll = this.emitLet(`${prefix}_ll`, aL.mul(bL));
     const lh = this.emitLet(`${prefix}_lh`, aL.mul(bH));
@@ -2086,7 +2662,7 @@ export class KernelContext {
     const hh = this.emitLet(`${prefix}_hh`, aH.mul(bH));
     const mid = this.emitLet(`${prefix}_mid`, lh.add(hl));
     const carry = mid.lt(lh).select(this.u32(1), this.u32(0));
-    const t = this.emitLet(`${prefix}_t`, ll.shr(16).add(mid.and(0xFFFF)));
+    const t = this.emitLet(`${prefix}_t`, ll.shr(16).add(mid.and(0xffff)));
     return hh.add(mid.shr(16)).add(carry).add(t.shr(16));
   }
 
@@ -2100,8 +2676,8 @@ export class KernelContext {
    * The two outputs are independent random streams.
    */
   philox2x32(seed: BlockExpr, offset: BlockExpr): [BlockExpr, BlockExpr] {
-    const PHILOX_M = 0xD256D193;  // Philox 2x32 multiplier
-    const PHILOX_W = 0x9E3779B9;  // Key schedule constant (golden ratio)
+    const PHILOX_M = 0xd256d193; // Philox 2x32 multiplier
+    const PHILOX_W = 0x9e3779b9; // Key schedule constant (golden ratio)
 
     // Initial state
     let ctr0 = this.emitLet("_phi_c0", offset);
@@ -2143,7 +2719,10 @@ export class KernelContext {
 
   private _requireOps(): BlockOps {
     if (!this._blockOps) {
-      if (!this._wgSize) throw new Error("Kernel spec must have workgroupSize for tile operations");
+      if (!this._wgSize)
+        throw new Error(
+          "Kernel spec must have workgroupSize for tile operations",
+        );
       this._blockOps = new BlockOps(this, {
         wgSize: this._wgSize,
         ...(this._threadTile ? { threadTile: this._threadTile } : {}),
@@ -2169,9 +2748,10 @@ export class KernelContext {
    *
    * Sugar for setThreadTile() + emitLet("thread_row"/thread_col").
    */
-  configureTiles(config: {
-    threadTileM: number; threadTileN: number;
-  }): { threadRow: BlockExpr; threadCol: BlockExpr } {
+  configureTiles(config: { threadTileM: number; threadTileN: number }): {
+    threadRow: BlockExpr;
+    threadCol: BlockExpr;
+  } {
     this.setThreadTile(config.threadTileM, config.threadTileN);
     const threadRow = this.emitLet("thread_row", this.threadIdx(1));
     const threadCol = this.emitLet("thread_col", this.threadIdx(0));
@@ -2189,7 +2769,11 @@ export class KernelContext {
   }
 
   /** Build a 2D pointer from base + outer + inner. ≈ Triton pointer arithmetic */
-  tilePtr(base: BlockExpr, outer: TilePtrComponent, inner: TilePtrComponent): TilePtr {
+  tilePtr(
+    base: BlockExpr,
+    outer: TilePtrComponent,
+    inner: TilePtrComponent,
+  ): TilePtr {
     return buildPtr(base, outer, inner);
   }
 
@@ -2241,33 +2825,56 @@ export class KernelContext {
   }
 
   /** Store register tile to global memory. ≈ tl.store(ptr, block, mask) */
-  tileStore(binding: string, block: Block, ptr: BlockStorePtr, opts?: { guard?: BlockExpr }): void {
+  tileStore(
+    binding: string,
+    block: Block,
+    ptr: BlockStorePtr,
+    opts?: { guard?: BlockExpr },
+  ): void {
     this._requireOps().store(binding, block, ptr, opts);
   }
 
   /** Load from strided layout: combined stridedIndex + load. */
-  stridedLoad(binding: string, flatIdx: BlockExpr, indexShape: number[], strides: number[], baseOffset = 0): BlockExpr {
-    return this.load(binding, this.stridedIndex(flatIdx, indexShape, strides, baseOffset));
+  stridedLoad(
+    binding: string,
+    flatIdx: BlockExpr,
+    indexShape: number[],
+    strides: number[],
+    baseOffset = 0,
+  ): BlockExpr {
+    return this.load(
+      binding,
+      this.stridedIndex(flatIdx, indexShape, strides, baseOffset),
+    );
   }
 
   // ---- Internal node creation helpers (for Block.get/set with proper node IDs) ----
 
   /** @internal Create a properly ID'd arrayRead node. */
   _makeArrayRead(arrayName: string, idx: BlockExpr): BlockExpr {
-    return new BlockExpr(makeNode<ArrayReadNode>({
-      kind: "arrayRead", arrayName, idx: idx.node,
-      valueType: "scalar", dataType: "f32",
-    }));
+    return new BlockExpr(
+      makeNode<ArrayReadNode>({
+        kind: "arrayRead",
+        arrayName,
+        idx: idx.node,
+        valueType: "scalar",
+        dataType: "f32",
+      }),
+    );
   }
 
   /** @internal Create a properly ID'd sharedRead node. */
   _makeSharedRead(arrayName: string, idx: BlockExpr): BlockExpr {
-    return new BlockExpr(makeNode<SharedReadNode>({
-      kind: "sharedRead", arrayName, idx: idx.node,
-      valueType: "scalar", dataType: "f32",
-    }));
+    return new BlockExpr(
+      makeNode<SharedReadNode>({
+        kind: "sharedRead",
+        arrayName,
+        idx: idx.node,
+        valueType: "scalar",
+        dataType: "f32",
+      }),
+    );
   }
-
 }
 
 // ============================================================================
@@ -2318,7 +2925,9 @@ export interface TileKernelSpec {
 // Grid Helpers
 // ============================================================================
 
-export type GridFn = (uniforms: Record<string, number>) => [number] | [number, number] | [number, number, number];
+export type GridFn = (
+  uniforms: Record<string, number>,
+) => [number] | [number, number] | [number, number, number];
 
 /**
  * Grid for 1-thread-per-element kernels with optional vectorization
@@ -2333,7 +2942,10 @@ export function elementwiseGrid(
   return (u) => {
     const totalWg = Math.ceil(u[uName] / (workgroupSize * vw));
     if (totalWg <= MAX_WORKGROUPS_PER_DIM) return [totalWg];
-    return [Math.min(totalWg, MAX_WORKGROUPS_PER_DIM), Math.ceil(totalWg / MAX_WORKGROUPS_PER_DIM)];
+    return [
+      Math.min(totalWg, MAX_WORKGROUPS_PER_DIM),
+      Math.ceil(totalWg / MAX_WORKGROUPS_PER_DIM),
+    ];
   };
 }
 
@@ -2368,13 +2980,17 @@ export function tiledGrid(dims: {
   y?: string | { uniform: string; tileSize: number };
   z?: string | { uniform: string; tileSize: number };
 }): GridFn {
-  function resolve(dim: string | { uniform: string; tileSize: number }, u: Record<string, number>): number {
+  function resolve(
+    dim: string | { uniform: string; tileSize: number },
+    u: Record<string, number>,
+  ): number {
     if (typeof dim === "string") return u[dim];
     return Math.ceil(u[dim.uniform] / dim.tileSize);
   }
   return (u) => {
     const x = resolve(dims.x, u);
-    if (dims.z !== undefined) return [x, resolve(dims.y!, u), resolve(dims.z, u)];
+    if (dims.z !== undefined)
+      return [x, resolve(dims.y!, u), resolve(dims.z, u)];
     if (dims.y !== undefined) return [x, resolve(dims.y, u)];
     return [x];
   };
@@ -2471,8 +3087,13 @@ export function perRowKernel(config: {
   rowUniform?: string;
   /** Override the feature dim uniform name (default: "feature_dim"). */
   dimUniform?: string;
-  kernel: (ctx: KernelContext, row: BlockExpr, tid: BlockExpr,
-           D: BlockExpr, base: BlockExpr) => void;
+  kernel: (
+    ctx: KernelContext,
+    row: BlockExpr,
+    tid: BlockExpr,
+    D: BlockExpr,
+    base: BlockExpr,
+  ) => void;
 }): TileKernelSpec {
   const rowU = config.rowUniform ?? "num_rows";
   const dimU = config.dimUniform ?? "feature_dim";
@@ -2480,14 +3101,18 @@ export function perRowKernel(config: {
     name: config.name,
     workgroupSize: DEFAULT_WG,
     bindings: config.bindings,
-    uniforms: { [rowU]: "u32" as UniformType, [dimU]: "u32" as UniformType, ...config.uniforms },
+    uniforms: {
+      [rowU]: "u32" as UniformType,
+      [dimU]: "u32" as UniformType,
+      ...config.uniforms,
+    },
     enableF16: config.enableF16,
     constants: config.constants,
     grid: perRowGrid(rowU),
     kernel(ctx) {
-      const row  = ctx.programId(0);
-      const tid  = ctx.localIndex();
-      const D    = ctx.uniform(dimU);
+      const row = ctx.programId(0);
+      const tid = ctx.localIndex();
+      const D = ctx.uniform(dimU);
       const base = row.mul(D);
       config.kernel(ctx, row, tid, D, base);
     },
@@ -2496,7 +3121,10 @@ export function perRowKernel(config: {
 
 // Well-known elementwise uniform names for auto-inference
 const ELEMENTWISE_UNIFORM_NAMES = new Set([
-  "size", "total_elements", "num_elements", "outSize",
+  "size",
+  "total_elements",
+  "num_elements",
+  "outSize",
 ]);
 
 /**
@@ -2504,8 +3132,10 @@ const ELEMENTWISE_UNIFORM_NAMES = new Set([
  * Returns null if no auto-inference pattern matches.
  */
 export function inferGrid(spec: TileKernelSpec): GridFn | null {
-  const wgSize = typeof spec.workgroupSize === "number"
-    ? spec.workgroupSize : spec.workgroupSize[0] * spec.workgroupSize[1];
+  const wgSize =
+    typeof spec.workgroupSize === "number"
+      ? spec.workgroupSize
+      : spec.workgroupSize[0] * spec.workgroupSize[1];
   for (const [name, type] of Object.entries(spec.uniforms)) {
     if (type === "u32" && ELEMENTWISE_UNIFORM_NAMES.has(name)) {
       return elementwiseGrid(wgSize, { elementUniform: name });
@@ -2522,8 +3152,10 @@ export function resolveGrid(spec: TileKernelSpec): GridFn {
   if (spec.grid) return spec.grid;
   const inferred = inferGrid(spec);
   if (inferred) return inferred;
-  throw new Error(`tile-ir: no grid function for kernel "${spec.name}" and no auto-inference matched. ` +
-    `Add an explicit \`grid\` or use a well-known uniform name (${[...ELEMENTWISE_UNIFORM_NAMES].join(", ")}).`);
+  throw new Error(
+    `tile-ir: no grid function for kernel "${spec.name}" and no auto-inference matched. ` +
+      `Add an explicit \`grid\` or use a well-known uniform name (${[...ELEMENTWISE_UNIFORM_NAMES].join(", ")}).`,
+  );
 }
 
 // ============================================================================
@@ -2532,12 +3164,14 @@ export function resolveGrid(spec: TileKernelSpec): GridFn {
 
 /** Tunable parameter definition. */
 export type TuneParam = {
-  values: number[];    // Candidate values (e.g. [32, 64, 128])
-  default: number;     // Default when autotuning disabled
+  values: number[]; // Candidate values (e.g. [32, 64, 128])
+  default: number; // Default when autotuning disabled
 };
 
 /** A factory that generates a kernel spec from tunable config values. */
-export type TileKernelSpecFactory = (config: Record<string, number>) => TileKernelSpec;
+export type TileKernelSpecFactory = (
+  config: Record<string, number>,
+) => TileKernelSpec;
 
 /** Autotuning metadata attached to a factory. */
 export interface AutotuneConfig {
@@ -2546,7 +3180,9 @@ export interface AutotuneConfig {
   /** Constraints: functions that return true if a config combo is valid. */
   constraints?: Array<(config: Record<string, number>) => boolean>;
   /** Optional: narrow param space based on runtime uniform values. */
-  pruneForShape?: (uniforms: Record<string, number>) => Record<string, TuneParam>;
+  pruneForShape?: (
+    uniforms: Record<string, number>,
+  ) => Record<string, TuneParam>;
 }
 
 // ============================================================================
@@ -2557,7 +3193,10 @@ export interface AutotuneConfig {
  * Execute a kernel spec's kernel function and return the captured context.
  * This builds the IR DAG without generating WGSL.
  */
-export function buildKernelIR(spec: TileKernelSpec, subgroupSize = 0): KernelContext {
+export function buildKernelIR(
+  spec: TileKernelSpec,
+  subgroupSize = 0,
+): KernelContext {
   nextNodeId = 0;
   cseCache = new Map();
   try {

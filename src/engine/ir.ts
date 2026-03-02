@@ -1,6 +1,6 @@
 import type { DType } from "../backend/types";
-import type { TraceEvent } from "./trace";
 import { broadcastShapes } from "../core/shape";
+import type { TraceEvent } from "./trace";
 
 export type IRNode = {
   id: number;
@@ -10,7 +10,7 @@ export type IRNode = {
   inputs: number[];
   shape?: number[];
   dtype?: DType;
-  scalarValues?: number[];  // §8.2.1: scalar constants for this op's scalar inputs
+  scalarValues?: number[]; // §8.2.1: scalar constants for this op's scalar inputs
 };
 
 export type IRFusionGroup = {

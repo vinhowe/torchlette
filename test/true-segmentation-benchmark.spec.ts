@@ -7,19 +7,18 @@
  * - True segmentation (GPU sync between segments)
  */
 
-import { describe, expect, it, beforeAll, afterEach } from "vitest";
-import { Torchlette } from "../src/frontend";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { GPT2, type GPT2Config } from "../examples/gpt2/model";
 import {
-  initWebGPU,
   getBufferPoolDetailedStats,
   resetBufferPoolDetailedStats,
   syncWebGPU,
 } from "../src/backend/webgpu";
 import { gpuMemoryTracker } from "../src/backend/webgpu/memory-tracker";
-import { GPT2, type GPT2Config } from "../examples/gpt2/model";
-import { canUseWebGPU } from "./helpers/webgpu";
 import { resetNodeIdCounter, resetStorageIdCounter } from "../src/engine/lazy";
+import { Torchlette } from "../src/frontend";
 import { resetBaseIdCounter } from "../src/runtime/tensor";
+import { canUseWebGPU } from "./helpers/webgpu";
 
 // Config for benchmarking - smaller for faster tests
 const TEST_CONFIG: GPT2Config = {
@@ -73,7 +72,7 @@ async function runBenchmark(
     model.train();
 
     const inputData = Array.from({ length: BATCH * SEQ_LEN }, () =>
-      Math.floor(Math.random() * TEST_CONFIG.vocabSize)
+      Math.floor(Math.random() * TEST_CONFIG.vocabSize),
     );
     const input = api.tensorFromArray(inputData, [BATCH, SEQ_LEN]);
 
@@ -134,14 +133,16 @@ describe("True Segmentation Benchmark", { timeout: 600000 }, () => {
     }
 
     console.log("\n=== True Segmentation Benchmark ===\n");
-    console.log(`Config: ${TEST_CONFIG.numLayers} layers, ${TEST_CONFIG.embedDim} embed, ${BATCH}x${SEQ_LEN} batch`);
+    console.log(
+      `Config: ${TEST_CONFIG.numLayers} layers, ${TEST_CONFIG.embedDim} embed, ${BATCH}x${SEQ_LEN} batch`,
+    );
     console.log(`Warmup: ${WARMUP_RUNS}, Timed runs: ${TIMED_RUNS}\n`);
 
     const results: Record<string, BenchmarkResult> = {};
 
     // 1. Baseline: no checkpoint, no early release
     console.log("Running baseline...");
-    results["baseline"] = await runBenchmark(false, false, false, false);
+    results.baseline = await runBenchmark(false, false, false, false);
 
     // 2. Early release only (no checkpoint)
     console.log("Running early release...");
@@ -160,36 +161,50 @@ describe("True Segmentation Benchmark", { timeout: 600000 }, () => {
     results["ckpt+seg-true"] = await runBenchmark(true, true, false, true);
 
     // Print timing results
-    console.log("\n| Configuration      | Avg (ms) | Min (ms) | Max (ms) | Peak MB | Allocs |");
-    console.log("|--------------------|----------|----------|----------|---------|--------|");
+    console.log(
+      "\n| Configuration      | Avg (ms) | Min (ms) | Max (ms) | Peak MB | Allocs |",
+    );
+    console.log(
+      "|--------------------|----------|----------|----------|---------|--------|",
+    );
 
     for (const [name, r] of Object.entries(results)) {
       console.log(
-        `| ${name.padEnd(18)} | ${r.avgTimeMs.toFixed(1).padStart(8)} | ${r.minTimeMs.toFixed(1).padStart(8)} | ${r.maxTimeMs.toFixed(1).padStart(8)} | ${(r.peakBytes / 1e6).toFixed(2).padStart(7)} | ${String(r.newAllocations).padStart(6)} |`
+        `| ${name.padEnd(18)} | ${r.avgTimeMs.toFixed(1).padStart(8)} | ${r.minTimeMs.toFixed(1).padStart(8)} | ${r.maxTimeMs.toFixed(1).padStart(8)} | ${(r.peakBytes / 1e6).toFixed(2).padStart(7)} | ${String(r.newAllocations).padStart(6)} |`,
       );
     }
 
     // Calculate slowdowns
-    const baselineTime = results["baseline"].avgTimeMs;
+    const baselineTime = results.baseline.avgTimeMs;
     const earlyReleaseTime = results["early-release"].avgTimeMs;
     const ckptEarlyTime = results["ckpt+early"].avgTimeMs;
     const oldSegTime = results["ckpt+seg-old"].avgTimeMs;
     const trueSegTime = results["ckpt+seg-true"].avgTimeMs;
 
     console.log("\n=== Speed Analysis (vs baseline) ===");
-    console.log(`Early release: ${((earlyReleaseTime / baselineTime - 1) * 100).toFixed(1)}% overhead`);
-    console.log(`Checkpoint + early: ${((ckptEarlyTime / baselineTime - 1) * 100).toFixed(1)}% overhead`);
-    console.log(`Old segmentation: ${((oldSegTime / baselineTime - 1) * 100).toFixed(1)}% overhead`);
-    console.log(`True segmentation: ${((trueSegTime / baselineTime - 1) * 100).toFixed(1)}% overhead`);
+    console.log(
+      `Early release: ${((earlyReleaseTime / baselineTime - 1) * 100).toFixed(1)}% overhead`,
+    );
+    console.log(
+      `Checkpoint + early: ${((ckptEarlyTime / baselineTime - 1) * 100).toFixed(1)}% overhead`,
+    );
+    console.log(
+      `Old segmentation: ${((oldSegTime / baselineTime - 1) * 100).toFixed(1)}% overhead`,
+    );
+    console.log(
+      `True segmentation: ${((trueSegTime / baselineTime - 1) * 100).toFixed(1)}% overhead`,
+    );
 
     // Memory analysis
-    const baselineMem = results["baseline"].peakBytes;
+    const baselineMem = results.baseline.peakBytes;
     const trueSegMem = results["ckpt+seg-true"].peakBytes;
 
     console.log("\n=== Memory Analysis ===");
     console.log(`Baseline peak: ${(baselineMem / 1e6).toFixed(2)} MB`);
     console.log(`True segmentation peak: ${(trueSegMem / 1e6).toFixed(2)} MB`);
-    console.log(`Memory reduction: ${((1 - trueSegMem / baselineMem) * 100).toFixed(1)}%`);
+    console.log(
+      `Memory reduction: ${((1 - trueSegMem / baselineMem) * 100).toFixed(1)}%`,
+    );
 
     // Trade-off analysis
     const speedOverhead = (trueSegTime / ckptEarlyTime - 1) * 100;
@@ -200,7 +215,7 @@ describe("True Segmentation Benchmark", { timeout: 600000 }, () => {
     console.log(`Memory savings vs ckpt+early: ${memSavings.toFixed(1)}%`);
 
     // Verify tests complete without error
-    expect(results["baseline"].avgTimeMs).toBeGreaterThan(0);
+    expect(results.baseline.avgTimeMs).toBeGreaterThan(0);
     expect(results["ckpt+seg-true"].avgTimeMs).toBeGreaterThan(0);
   });
 });

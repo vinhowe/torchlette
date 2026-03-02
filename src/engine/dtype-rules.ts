@@ -21,65 +21,66 @@ export type OpDtypeCategory =
   | "always_f32"
   | "cast";
 
-export const OP_DTYPE_RULES: Record<LazyOpCode, { category: OpDtypeCategory }> = {
-  // F16-eligible (compute-bound)
-  matmul: { category: "f16_eligible" },
+export const OP_DTYPE_RULES: Record<LazyOpCode, { category: OpDtypeCategory }> =
+  {
+    // F16-eligible (compute-bound)
+    matmul: { category: "f16_eligible" },
 
-  // F32-required (numerically sensitive)
-  sum:  { category: "f32_required" },
-  mean: { category: "f32_required" },
-  max:  { category: "f32_required" },
-  exp:  { category: "f32_required" },
-  log:  { category: "f32_required" },
-  pow:  { category: "f32_required" },
+    // F32-required (numerically sensitive)
+    sum: { category: "f32_required" },
+    mean: { category: "f32_required" },
+    max: { category: "f32_required" },
+    exp: { category: "f32_required" },
+    log: { category: "f32_required" },
+    pow: { category: "f32_required" },
 
-  // Binary (promote mismatched dtypes)
-  add: { category: "promote_inputs" },
-  sub: { category: "promote_inputs" },
-  mul: { category: "promote_inputs" },
-  div: { category: "promote_inputs" },
+    // Binary (promote mismatched dtypes)
+    add: { category: "promote_inputs" },
+    sub: { category: "promote_inputs" },
+    mul: { category: "promote_inputs" },
+    div: { category: "promote_inputs" },
 
-  // Preserve input dtype
-  sqrt:      { category: "preserve" },
-  relu:      { category: "preserve" },
-  neg:       { category: "preserve" },
-  abs:       { category: "preserve" },
-  tanh:      { category: "preserve" },
-  sigmoid:   { category: "preserve" },
-  gelu:      { category: "preserve" },
-  silu:      { category: "preserve" },
-  reshape:   { category: "preserve" },
-  expand:    { category: "preserve" },
-  transpose: { category: "preserve" },
-  permute:   { category: "preserve" },
-  contiguous:{ category: "preserve" },
-  gather:    { category: "preserve" },
-  scatterAdd:{ category: "preserve" },
-  where:     { category: "preserve" },
-  transfer:  { category: "preserve" },
-  stridedScatterCopy: { category: "preserve" },
-  stridedScatterAdd:  { category: "preserve" },
-  tril:  { category: "preserve" },
-  triu:  { category: "preserve" },
+    // Preserve input dtype
+    sqrt: { category: "preserve" },
+    relu: { category: "preserve" },
+    neg: { category: "preserve" },
+    abs: { category: "preserve" },
+    tanh: { category: "preserve" },
+    sigmoid: { category: "preserve" },
+    gelu: { category: "preserve" },
+    silu: { category: "preserve" },
+    reshape: { category: "preserve" },
+    expand: { category: "preserve" },
+    transpose: { category: "preserve" },
+    permute: { category: "preserve" },
+    contiguous: { category: "preserve" },
+    gather: { category: "preserve" },
+    scatterAdd: { category: "preserve" },
+    where: { category: "preserve" },
+    transfer: { category: "preserve" },
+    stridedScatterCopy: { category: "preserve" },
+    stridedScatterAdd: { category: "preserve" },
+    tril: { category: "preserve" },
+    triu: { category: "preserve" },
 
-  // Always f32
-  gt:    { category: "always_f32" },
-  lt:    { category: "always_f32" },
-  ge:    { category: "always_f32" },
-  le:    { category: "always_f32" },
-  eq:    { category: "always_f32" },
-  ne:    { category: "always_f32" },
-  argmax:{ category: "always_f32" },
-  argmin:{ category: "always_f32" },
-  isfinite:      { category: "always_f32" },
-  tensorFromArray:{ category: "always_f32" },
-  zeros: { category: "always_f32" },
-  full:  { category: "always_f32" },
-  arange:{ category: "always_f32" },
+    // Always f32
+    gt: { category: "always_f32" },
+    lt: { category: "always_f32" },
+    ge: { category: "always_f32" },
+    le: { category: "always_f32" },
+    eq: { category: "always_f32" },
+    ne: { category: "always_f32" },
+    argmax: { category: "always_f32" },
+    argmin: { category: "always_f32" },
+    isfinite: { category: "always_f32" },
+    tensorFromArray: { category: "always_f32" },
+    zeros: { category: "always_f32" },
+    full: { category: "always_f32" },
+    arange: { category: "always_f32" },
 
-  // Explicit cast
-  cast: { category: "cast" },
-};
+    // Explicit cast
+    cast: { category: "cast" },
+  };
 
 /**
  * Supplementary op names that exist in the frontend/AMP layer but not in LazyOpCode.
@@ -135,6 +136,7 @@ export const F32_REQUIRED: ReadonlySet<string> = new Set([
  */
 export function promoteDtype(a: DType, b: DType): DType {
   if (a === b) return a;
-  if ((a === "f16" && b === "f32") || (a === "f32" && b === "f16")) return "f32";
+  if ((a === "f16" && b === "f32") || (a === "f32" && b === "f16"))
+    return "f32";
   return a;
 }

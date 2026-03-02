@@ -22,7 +22,7 @@ export type TraceEvent =
       inputs?: number[];
       shape?: number[];
       dtype?: DType;
-      scalarValues?: number[];  // §8.2.1: scalar constants for cache key differentiation
+      scalarValues?: number[]; // §8.2.1: scalar constants for cache key differentiation
     }
   | {
       type: "checkpoint_pack";

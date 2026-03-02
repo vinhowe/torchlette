@@ -375,7 +375,12 @@ export function generateNeighborConfigs(
     if (newTileK !== tileK) configs.push({ ...baseConfig, tileK: newTileK });
   }
   // Thread tile variants
-  for (const [ttm, ttn] of [[4, 4], [8, 4], [4, 8], [8, 8]] as const) {
+  for (const [ttm, ttn] of [
+    [4, 4],
+    [8, 4],
+    [4, 8],
+    [8, 8],
+  ] as const) {
     if (ttm !== baseConfig.threadTileM || ttn !== baseConfig.threadTileN) {
       configs.push({ ...baseConfig, threadTileM: ttm, threadTileN: ttn });
     }
@@ -387,11 +392,16 @@ export function generateNeighborConfigs(
 
   // Validate and deduplicate
   const seen = new Set<string>();
-  return configs.filter(c => {
+  return configs.filter((c) => {
     const key = `${c.tileM}_${c.tileN}_${c.tileK}_${c.threadTileM}_${c.threadTileN}_${c.vectorWidth}_${c.useSubgroups}`;
     if (seen.has(key)) return false;
     seen.add(key);
-    try { validateConfig(c); return true; } catch { return false; }
+    try {
+      validateConfig(c);
+      return true;
+    } catch {
+      return false;
+    }
   });
 }
 

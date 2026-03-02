@@ -72,7 +72,10 @@ export type CompiledCacheEntry = {
  *   node.scalarValues if present. Backward compatible: omitting produces
  *   the same hash as before for graphs without scalarValues.
  */
-export function hashIRGraph(graph: IRGraph, scalarsByNode?: Map<number, number[]>): string {
+export function hashIRGraph(
+  graph: IRGraph,
+  scalarsByNode?: Map<number, number[]>,
+): string {
   // Build a normalized representation
   // Map original node IDs to canonical indices (0, 1, 2, ...)
   const idToIndex = new Map<number, number>();
@@ -99,7 +102,9 @@ export function hashIRGraph(graph: IRGraph, scalarsByNode?: Map<number, number[]
     // Prefer explicit scalarsByNode map, fall back to node.scalarValues
     const nodeScalars = scalarsByNode?.get(node.id) ?? node.scalarValues;
     if (nodeScalars && nodeScalars.length > 0) {
-      const scalarParts = nodeScalars.map(v => canonicalizeF64Bits(v).toString(16));
+      const scalarParts = nodeScalars.map((v) =>
+        canonicalizeF64Bits(v).toString(16),
+      );
       nodeSig += `{${scalarParts.join(",")}}`;
     }
 
@@ -158,7 +163,10 @@ function extractInputSignatures(graph: IRGraph): InputSignature[] {
  * @param graph - The IR graph
  * @param scalarsByNode - Optional map of node ID → scalar input values (§8.2.1)
  */
-export function generateCacheKey(graph: IRGraph, scalarsByNode?: Map<number, number[]>): CompiledCacheKey {
+export function generateCacheKey(
+  graph: IRGraph,
+  scalarsByNode?: Map<number, number[]>,
+): CompiledCacheKey {
   return {
     irHash: hashIRGraph(graph, scalarsByNode),
     inputSignatures: extractInputSignatures(graph),

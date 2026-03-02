@@ -156,8 +156,12 @@ export const paramsSequenceSet = new Set<GPUBuffer>();
 // ============================================================================
 
 export let outputSeqIndex = 0;
-export function getOutputSeqIndex(): number { return outputSeqIndex; }
-export function setOutputSeqIndex(v: number): void { outputSeqIndex = v; }
+export function getOutputSeqIndex(): number {
+  return outputSeqIndex;
+}
+export function setOutputSeqIndex(v: number): void {
+  outputSeqIndex = v;
+}
 
 // ============================================================================
 // Current Op Label (moved from shared-encoder.ts)
@@ -165,5 +169,9 @@ export function setOutputSeqIndex(v: number): void { outputSeqIndex = v; }
 
 /** Current op label for GPU timestamp profiling (set from lazy.ts). */
 let currentOpLabel: string | null = null;
-export function setCurrentOpLabel(label: string | null): void { currentOpLabel = label; }
-export function getCurrentOpLabel(): string | null { return currentOpLabel; }
+export function setCurrentOpLabel(label: string | null): void {
+  currentOpLabel = label;
+}
+export function getCurrentOpLabel(): string | null {
+  return currentOpLabel;
+}

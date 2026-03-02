@@ -35,7 +35,7 @@ export function getSizeClass(sizeBytes: number): number {
 }
 
 export function getSizeForClass(sizeClass: number): number {
-  return Math.pow(2, sizeClass);
+  return 2 ** sizeClass;
 }
 
 export function computeBufferSize(shape: number[], dtype: DType): number {
@@ -71,7 +71,7 @@ export function analyzeLifetimes(
       firstUse: stepIndex.get(nodeId)!,
       lastUse: stepIndex.get(nodeId)!,
       isOutput: nodeOutputs.has(nodeId),
-      isInput: !nodeInputs.has(nodeId) || nodeInputs.get(nodeId)!.length === 0,
+      isInput: !nodeInputs.has(nodeId) || nodeInputs.get(nodeId)?.length === 0,
       bufferSize: nodeSizes.get(nodeId) ?? 0,
     });
   }

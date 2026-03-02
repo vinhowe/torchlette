@@ -3,25 +3,45 @@
  * detectSimpleTranspose, ensureContiguous.
  */
 import type { BackendTensor, DType, TransposeOptions } from "../../types";
-import type { WebGPUTensor } from "../gpu-types";
-import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
 import {
-  sizeOf, WORKGROUP_SIZE, compute2DDispatch,
-  contiguousStrides, dtypeBytes, dtypeToWgsl,
-  alignBufferSize, lcm, alignedChunkSize,
-} from "../shape-utils";
-import { requireContext, f16WeightCache } from "../gpu-context";
-import { dispatchComputePass, dispatchElementwise, getPipeline } from "../dispatch";
-import { createTensor, createTrackedBuffer } from "../tensor";
-import { bufferPool, destroyCopy } from "../buffer-pool";
-import { resolveOutputBuffer } from "../buffer-arena";
-import {
-  cachedCreateBindGroup, createParamsBuffer, releaseParamsBuffer,
-  createUniformBuffer, releaseUniformBuffer, profiledCreateBindGroup,
+  cachedCreateBindGroup,
+  createParamsBuffer,
+  createUniformBuffer,
   params,
+  profiledCreateBindGroup,
+  releaseParamsBuffer,
+  releaseUniformBuffer,
 } from "../bind-group-cache";
-import { castTileIR, castSpec, contiguousTileIR, narrowBackwardTileIR, chunkedTransposeTileIR } from "./ops-tile-ir";
+import { resolveOutputBuffer } from "../buffer-arena";
+import { bufferPool, destroyCopy } from "../buffer-pool";
+import {
+  dispatchComputePass,
+  dispatchElementwise,
+  getPipeline,
+} from "../dispatch";
+import { f16WeightCache, requireContext } from "../gpu-context";
+import type { WebGPUTensor } from "../gpu-types";
+import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
+import {
+  alignBufferSize,
+  alignedChunkSize,
+  compute2DDispatch,
+  contiguousStrides,
+  dtypeBytes,
+  dtypeToWgsl,
+  lcm,
+  sizeOf,
+  WORKGROUP_SIZE,
+} from "../shape-utils";
+import { createTensor, createTrackedBuffer } from "../tensor";
 import { createTileKernelDispatcher } from "../tile-dispatch";
+import {
+  castSpec,
+  castTileIR,
+  chunkedTransposeTileIR,
+  contiguousTileIR,
+  narrowBackwardTileIR,
+} from "./ops-tile-ir";
 
 /**
  * Cast tensor to a different dtype.
@@ -72,7 +92,8 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
   const srcBytesPerElement = dtypeBytes(tensor.dtype);
   const dstBytesPerElement = dtypeBytes(dtype);
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize =
+    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const inputDataBytes = tensor.size * srcBytesPerElement;
   const outputDataBytes = tensor.size * dstBytesPerElement;
 
@@ -94,7 +115,13 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
-  const code = castTileIR(tensor.dtype as "f32" | "f16" | "i32" | "u32", dtype as "f32" | "f16" | "i32" | "u32", tensor.shape, tensor.strides, tensor.offset);
+  const code = castTileIR(
+    tensor.dtype as "f32" | "f16" | "i32" | "u32",
+    dtype as "f32" | "f16" | "i32" | "u32",
+    tensor.shape,
+    tensor.strides,
+    tensor.offset,
+  );
   const key = `cast:${tensor.dtype}->${dtype}:${tensor.shape.join("x")}:${tensor.strides.join(",")}:${tensor.offset}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   const pipeline = getPipeline(ctx, key, code);
 
@@ -105,7 +132,11 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
     [tensor.buffer],
   );
   const params = createUniformBuffer(ctx.device, tensor.size);
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, params]);
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
+    tensor.buffer,
+    outBuffer,
+    params,
+  ]);
   dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
   releaseUniformBuffer(params);
   return createTensor(tensor.shape, outBuffer, undefined, 0, dtype);
@@ -119,12 +150,13 @@ function castChunked(
   tensor: WebGPUTensor,
   dtype: DType,
   ctx: ReturnType<typeof requireContext>,
-  maxBindingSize: number,
+  _maxBindingSize: number,
   limits: Record<string, number>,
 ): BackendTensor {
   const srcBytesPerElement = dtypeBytes(tensor.dtype);
   const dstBytesPerElement = dtypeBytes(dtype);
-  const minAlignment = (limits as Record<string, number>)?.minStorageBufferOffsetAlignment ?? 256;
+  const minAlignment =
+    (limits as Record<string, number>)?.minStorageBufferOffsetAlignment ?? 256;
 
   // Alignment must satisfy both src and dst offset alignment requirements
   const srcElemsPerAlign = minAlignment / srcBytesPerElement;
@@ -142,7 +174,13 @@ function castChunked(
 
   // Build flat tile-IR spec: contiguous input, stride 1, offset 0
   type DT = "f32" | "f16" | "i32" | "u32";
-  const spec = castSpec(tensor.dtype as DT, dtype as DT, [totalElements], [1], 0);
+  const spec = castSpec(
+    tensor.dtype as DT,
+    dtype as DT,
+    [totalElements],
+    [1],
+    0,
+  );
   const dispatcher = createTileKernelDispatcher(spec);
   dispatcher.dispatchChunked(
     { a: tensor.buffer, out: outBuffer },
@@ -201,7 +239,10 @@ function inferReshapeStrides(
     // Collect old dims until oldProduct >= newProduct
     while (oldProduct < newProduct && oldIdx + 1 < oldN) {
       // Check contiguity between consecutive old dims
-      if (oldStrides[oldIdx] !== oldStrides[oldIdx + 1] * oldShape[oldIdx + 1]) {
+      if (
+        oldStrides[oldIdx] !==
+        oldStrides[oldIdx + 1] * oldShape[oldIdx + 1]
+      ) {
         return null; // Non-contiguous boundary
       }
       oldIdx++;
@@ -257,21 +298,41 @@ export function reshape(a: BackendTensor, shape: number[]): BackendTensor {
 
   if (tensor.isContiguous) {
     // Fast path: contiguous input → contiguous output view
-    return createTensor(shape, tensor.buffer, undefined, tensor.offset, tensor.dtype, false);
+    return createTensor(
+      shape,
+      tensor.buffer,
+      undefined,
+      tensor.offset,
+      tensor.dtype,
+      false,
+    );
   }
 
   // Non-contiguous: try to compute valid strides for new shape
   const newStrides = inferReshapeStrides(tensor.shape, tensor.strides, shape);
   if (newStrides !== null) {
     // Compatible layout: return view with computed strides (zero-cost)
-    return createTensor(shape, tensor.buffer, newStrides, tensor.offset, tensor.dtype, false);
+    return createTensor(
+      shape,
+      tensor.buffer,
+      newStrides,
+      tensor.offset,
+      tensor.dtype,
+      false,
+    );
   }
 
   // Incompatible: must materialize first, transfer buffer ownership to result
   const contig = asGPUTensor(contiguous(tensor));
   bufferPool.decRef(contig.buffer); // Transfer ownership to result tensor
-  return createTensor(shape, contig.buffer, undefined,
-    contig.offset, tensor.dtype, true);
+  return createTensor(
+    shape,
+    contig.buffer,
+    undefined,
+    contig.offset,
+    tensor.dtype,
+    true,
+  );
 }
 
 /**
@@ -367,7 +428,8 @@ export function contiguous(a: BackendTensor): BackendTensor {
   // Check if input buffer exceeds max binding size
   const ctx = requireContext();
   const limits = ctx.device.limits;
-  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize =
+    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
 
   // Get actual buffer size (the backing storage might be larger than the view)
@@ -398,22 +460,27 @@ function contiguousDirect(tensor: WebGPUTensor): WebGPUTensor {
   const use2D = dispatch.y > 1;
 
   // Create new contiguous buffer
-  const outBuffer = resolveOutputBuffer(
-    ctx.device,
-    outSize * bytesPerElement,
-    [tensor.buffer],
-  );
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement, [
+    tensor.buffer,
+  ]);
 
-  const code = contiguousTileIR(shape, tensor.strides, tensor.offset, dtype as "f32" | "f16" | "i32" | "u32");
+  const code = contiguousTileIR(
+    shape,
+    tensor.strides,
+    tensor.offset,
+    dtype as "f32" | "f16" | "i32" | "u32",
+  );
   const key = `contiguous:${shape.join(",")}:${tensor.strides.join(",")}:${tensor.offset}:${dtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
 
   dispatchElementwise({
-    key, shader: code,
+    key,
+    shader: code,
     inputs: [tensor.buffer],
     outputSizeBytes: outSize * bytesPerElement,
     params: params(outSize),
     outBuffer,
-    dispatchX: dispatch.x, dispatchY: dispatch.y,
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y,
   });
 
   return createTensor(shape, outBuffer, undefined, 0, dtype);
@@ -449,7 +516,10 @@ function contiguousChunked(
   // Create new contiguous buffer
   const outBuffer = createTrackedBuffer(ctx.device, {
     size: alignBufferSize(outSize * bytesPerElement),
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    usage:
+      GPUBufferUsage.STORAGE |
+      GPUBufferUsage.COPY_SRC |
+      GPUBufferUsage.COPY_DST,
   });
 
   // For transposed tensor [K, N] with strides [1, K]:
@@ -461,7 +531,7 @@ function contiguousChunked(
     // Strategy: process in row chunks where each row chunk handles all columns in sub-chunks
 
     const bytesPerOutputRow = N * bytesPerElement; // Output row [K elements across N columns for one K-row]
-    const bytesPerInputRow = K * bytesPerElement;  // One column of input (K elements)
+    const bytesPerInputRow = K * bytesPerElement; // One column of input (K elements)
 
     // How many output rows fit in binding limit?
     const maxOutputRows = Math.floor(maxBindingSize / bytesPerOutputRow);
@@ -469,8 +539,16 @@ function contiguousChunked(
     // How many input columns (= K elements each) fit in binding limit?
     const maxInputCols = Math.floor(maxBindingSize / bytesPerInputRow);
 
-    const alignedOutputRows = alignedChunkSize(bytesPerOutputRow, maxOutputRows, minAlignment);
-    const alignedInputCols = alignedChunkSize(bytesPerInputRow, maxInputCols, minAlignment);
+    const alignedOutputRows = alignedChunkSize(
+      bytesPerOutputRow,
+      maxOutputRows,
+      minAlignment,
+    );
+    const alignedInputCols = alignedChunkSize(
+      bytesPerInputRow,
+      maxInputCols,
+      minAlignment,
+    );
 
     // Process output in row chunks, and within each row chunk, process input in column chunks
     const numOutputRowChunks = Math.ceil(K / alignedOutputRows);
@@ -497,15 +575,29 @@ function contiguousChunked(
         const numCols = colEnd - colStart;
 
         // Input column chunk binding: columns [colStart, colEnd) means buffer positions [colStart*K, colEnd*K)
-        const inputByteOffset = (tensor.offset + colStart * K) * bytesPerElement;
+        const inputByteOffset =
+          (tensor.offset + colStart * K) * bytesPerElement;
         const inputChunkSize = numCols * K * bytesPerElement;
 
         const tileSize = numRows * numCols;
-        const dispatch = compute2DDispatch(Math.ceil(tileSize / WORKGROUP_SIZE));
+        const dispatch = compute2DDispatch(
+          Math.ceil(tileSize / WORKGROUP_SIZE),
+        );
 
-        const paramsBuffer = createParamsBuffer(ctx.device, params(K, N, rowStart, rowEnd, colStart, colEnd, dispatch.gridSizeX * WORKGROUP_SIZE));
+        const paramsBuffer = createParamsBuffer(
+          ctx.device,
+          params(
+            K,
+            N,
+            rowStart,
+            rowEnd,
+            colStart,
+            colEnd,
+            dispatch.gridSizeX * WORKGROUP_SIZE,
+          ),
+        );
 
-        const bindGroup = profiledCreateBindGroup(ctx.device,{
+        const bindGroup = profiledCreateBindGroup(ctx.device, {
           layout: pipeline.getBindGroupLayout(0),
           entries: [
             {
@@ -541,7 +633,7 @@ function contiguousChunked(
   // Process output in chunks and bind input sections as needed
   // This is a fallback that may not be optimal for all patterns
   throw new Error(
-    `Chunked contiguous not yet implemented for stride pattern [${tensor.strides.join(", ")}]`
+    `Chunked contiguous not yet implemented for stride pattern [${tensor.strides.join(", ")}]`,
   );
 }
 
@@ -593,7 +685,9 @@ export function ensureContiguous(tensor: WebGPUTensor): WebGPUTensor {
 }
 
 /** Shorthand: cast to WebGPUTensor + ensure contiguous in one call. */
-export function asContiguous(bt: import("../../types").BackendTensor): WebGPUTensor {
+export function asContiguous(
+  bt: import("../../types").BackendTensor,
+): WebGPUTensor {
   return ensureContiguous(asGPUTensor(bt));
 }
 
@@ -601,26 +695,45 @@ export function asContiguous(bt: import("../../types").BackendTensor): WebGPUTen
  * Select a contiguous sub-range along one dimension. Returns a view (zero GPU cost).
  * The returned tensor shares the same buffer with an adjusted offset.
  */
-export function narrow(a: BackendTensor, dim: number, start: number, length: number): BackendTensor {
+export function narrow(
+  a: BackendTensor,
+  dim: number,
+  start: number,
+  length: number,
+): BackendTensor {
   const tensor = asGPUTensor(a);
   const rank = tensor.shape.length;
   if (dim < 0 || dim >= rank) {
     throw new Error(`narrow: dim ${dim} out of range for rank ${rank}`);
   }
   if (start < 0 || start + length > tensor.shape[dim]) {
-    throw new Error(`narrow: range [${start}, ${start + length}) out of bounds for dim size ${tensor.shape[dim]}`);
+    throw new Error(
+      `narrow: range [${start}, ${start + length}) out of bounds for dim size ${tensor.shape[dim]}`,
+    );
   }
   const newShape = tensor.shape.slice();
   newShape[dim] = length;
   const newOffset = tensor.offset + start * tensor.strides[dim];
-  return createTensor(newShape, tensor.buffer, tensor.strides.slice(), newOffset, tensor.dtype, false);
+  return createTensor(
+    newShape,
+    tensor.buffer,
+    tensor.strides.slice(),
+    newOffset,
+    tensor.dtype,
+    false,
+  );
 }
 
 /**
  * Backward for narrow: pad gradient back to original shape.
  * Writes grad into [start, start+length) along dim, zeros elsewhere.
  */
-export function narrowBackward(grad: BackendTensor, dim: number, start: number, originalLength: number): BackendTensor {
+export function narrowBackward(
+  grad: BackendTensor,
+  dim: number,
+  start: number,
+  originalLength: number,
+): BackendTensor {
   const gradTensor = ensureContiguous(asGPUTensor(grad));
 
   const outShape = gradTensor.shape.slice();
@@ -639,15 +752,21 @@ export function narrowBackward(grad: BackendTensor, dim: number, start: number, 
   const use2D = dispatch.y > 1;
   const gridSizeX = dispatch.x * WORKGROUP_SIZE;
 
-  const shaderCode = narrowBackwardTileIR(outDimSize, outSize, dtype as "f32" | "f16" | "i32" | "u32");
+  const shaderCode = narrowBackwardTileIR(
+    outDimSize,
+    outSize,
+    dtype as "f32" | "f16" | "i32" | "u32",
+  );
   const key = `narrowBackward:${outDimSize}:${gradDimSize}:${start}:${outSize}:${dtype}:${use2D ? `2d:${gridSizeX}` : "1d"}`;
 
   const outBuffer = dispatchElementwise({
-    key, shader: shaderCode,
+    key,
+    shader: shaderCode,
     inputs: [gradTensor.buffer],
     outputSizeBytes: outSize * bytesPerElement,
     params: params(outerSize, innerSize, gradDimSize, start),
-    dispatchX: dispatch.x, dispatchY: dispatch.y,
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y,
   });
 
   if (gradTensor !== asGPUTensor(grad)) destroyCopy(gradTensor);
@@ -659,7 +778,10 @@ export function narrowBackward(grad: BackendTensor, dim: number, start: number, 
  * Transpose returns a VIEW - no data copy, just metadata change.
  * The returned tensor shares the same buffer but with swapped strides.
  */
-export function transpose(a: BackendTensor, options: TransposeOptions): BackendTensor {
+export function transpose(
+  a: BackendTensor,
+  options: TransposeOptions,
+): BackendTensor {
   const tensor = asGPUTensor(a);
   const { dim0, dim1 } = options;
   const inputShape = tensor.shape;

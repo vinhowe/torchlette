@@ -16,7 +16,7 @@
  * ```
  */
 
-import type { GPUDevice, GPUComputePipeline } from "./gpu-types";
+import type { GPUComputePipeline, GPUDevice } from "./gpu-types";
 
 // ============================================================================
 // Warmup Cache
@@ -102,7 +102,7 @@ export async function warmupPipelines(
     // Parallel async compilation
     const promises = toCompile.map(async (entry) => {
       const module = device.createShaderModule({ code: entry.wgsl });
-      const pipeline = await device.createComputePipelineAsync!({
+      const pipeline = await device.createComputePipelineAsync?.({
         layout: "auto",
         compute: { module, entryPoint: "main" },
       });
@@ -121,7 +121,11 @@ export async function warmupPipelines(
     }
   }
 
-  return { compiled: toCompile.length, skipped, timeMs: performance.now() - t0 };
+  return {
+    compiled: toCompile.length,
+    skipped,
+    timeMs: performance.now() - t0,
+  };
 }
 
 // ============================================================================
@@ -129,11 +133,15 @@ export async function warmupPipelines(
 // ============================================================================
 
 /** Serialize a pipeline registry to JSON for cross-session persistence. */
-export function serializeRegistry(entries: Array<{ key: string; wgsl: string }>): string {
+export function serializeRegistry(
+  entries: Array<{ key: string; wgsl: string }>,
+): string {
   return JSON.stringify(entries);
 }
 
 /** Deserialize a pipeline registry from JSON. */
-export function deserializeRegistry(json: string): Array<{ key: string; wgsl: string }> {
+export function deserializeRegistry(
+  json: string,
+): Array<{ key: string; wgsl: string }> {
   return JSON.parse(json) as Array<{ key: string; wgsl: string }>;
 }

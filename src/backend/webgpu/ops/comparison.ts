@@ -2,31 +2,32 @@
  * Comparison ops: gt, lt, ge, le, eq, ne, and argmax/argmin.
  */
 
-import type {
-  BackendTensor,
-  ArgReduceOptions,
-} from "../../types";
+import type { ArgReduceOptions, BackendTensor } from "../../types";
+import {
+  cachedCreateBindGroup,
+  createParamsBuffer,
+  params,
+  releaseParamsBuffer,
+} from "../bind-group-cache";
+import {
+  dispatchComputePass,
+  dispatchElementwise,
+  getPipeline,
+} from "../dispatch";
+import { requireContext } from "../gpu-context";
 import type { GPUBuffer } from "../gpu-types";
-import { GPUBufferUsage, asGPUTensor } from "../gpu-types";
+import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
 import {
   broadcastShapes,
-  toIndexShape,
-  sizeOf,
-  contiguousStrides,
-  computeEffectiveBroadcastStrides,
   compute2DDispatch,
+  computeEffectiveBroadcastStrides,
+  contiguousStrides,
+  sizeOf,
+  toIndexShape,
   WORKGROUP_SIZE,
 } from "../shape-utils";
-import { comparisonWGSL, argReduceWGSL } from "./ops-tile-ir";
-import { requireContext } from "../gpu-context";
-import { dispatchElementwise, dispatchComputePass, getPipeline } from "../dispatch";
 import { createTensor, createTrackedBuffer } from "../tensor";
-import {
-  params,
-  createParamsBuffer,
-  releaseParamsBuffer,
-  cachedCreateBindGroup,
-} from "../bind-group-cache";
+import { argReduceWGSL, comparisonWGSL } from "./ops-tile-ir";
 
 function comparisonOp(
   opName: string,
@@ -48,17 +49,26 @@ function comparisonOp(
   const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
 
-  const code = comparisonWGSL(wgslOp, indexShape, aStrides, bStrides, aTensor.offset, bTensor.offset);
+  const code = comparisonWGSL(
+    wgslOp,
+    indexShape,
+    aStrides,
+    bStrides,
+    aTensor.offset,
+    bTensor.offset,
+  );
 
   const key = `${opName}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${aTensor.offset}:${bTensor.offset}`;
 
   const outBuffer = dispatchElementwise({
-    key, shader: code,
+    key,
+    shader: code,
     inputs: [aTensor.buffer, bTensor.buffer],
     outputSizeBytes: outSize * 4,
     params: params(outSize),
     outBuffer: options?.outBuffer,
-    dispatchX: dispatch.x, dispatchY: dispatch.y,
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y,
   });
 
   return createTensor(outShape, outBuffer);
@@ -116,11 +126,17 @@ export function ne(
 // ArgMax/ArgMin - return indices of max/min values
 // ============================================================================
 
-export function argmax(a: BackendTensor, options: ArgReduceOptions): BackendTensor {
+export function argmax(
+  a: BackendTensor,
+  options: ArgReduceOptions,
+): BackendTensor {
   return argReduceOp("argmax", ">", a, options);
 }
 
-export function argmin(a: BackendTensor, options: ArgReduceOptions): BackendTensor {
+export function argmin(
+  a: BackendTensor,
+  options: ArgReduceOptions,
+): BackendTensor {
   return argReduceOp("argmin", "<", a, options);
 }
 
@@ -157,7 +173,10 @@ function argReduceOp(
   const outSize = sizeOf(outShape) || 1;
   const outBuffer = createTrackedBuffer(ctx.device, {
     size: outSize * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    usage:
+      GPUBufferUsage.STORAGE |
+      GPUBufferUsage.COPY_SRC |
+      GPUBufferUsage.COPY_DST,
   });
 
   const inputStrides = contiguousStrides(inputShape);
@@ -183,8 +202,15 @@ function argReduceOp(
   }
 
   const code = argReduceWGSL(
-    compareOp, inputShape, inputStrides,
-    outShape, outStrides, dim, dimSize, dimStride, inputToOutDim,
+    compareOp,
+    inputShape,
+    inputStrides,
+    outShape,
+    outStrides,
+    dim,
+    dimSize,
+    dimStride,
+    inputToOutDim,
   );
 
   const pipeline = getPipeline(
@@ -193,9 +219,16 @@ function argReduceOp(
     code,
   );
 
-  const paramsBuffer = createParamsBuffer(ctx.device, params(outSize, dimSize, dimStride));
+  const paramsBuffer = createParamsBuffer(
+    ctx.device,
+    params(outSize, dimSize, dimStride),
+  );
 
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [tensor.buffer, outBuffer, paramsBuffer]);
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
+    tensor.buffer,
+    outBuffer,
+    paramsBuffer,
+  ]);
 
   dispatchComputePass(pipeline, bindGroup, Math.ceil(outSize / WORKGROUP_SIZE));
 

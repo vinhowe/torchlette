@@ -12,9 +12,9 @@ import type {
   SumOptions,
   TransposeOptions,
 } from "../backend/types";
-import type { Tensor } from "./tensor";
-import { RuntimeEngine } from "./engine";
 import type { TensorOrScalar } from "./engine";
+import { RuntimeEngine } from "./engine";
+import type { Tensor } from "./tensor";
 
 const defaultEngine = new RuntimeEngine();
 
@@ -32,11 +32,19 @@ export function add(a: TensorOrScalar, b: TensorOrScalar): Tensor {
   return defaultEngine.add(a, b);
 }
 
-export function sub(a: TensorOrScalar, b: TensorOrScalar, options?: SubOptions): Tensor {
+export function sub(
+  a: TensorOrScalar,
+  b: TensorOrScalar,
+  options?: SubOptions,
+): Tensor {
   return defaultEngine.sub(a, b, options);
 }
 
-export function div(a: TensorOrScalar, b: TensorOrScalar, options?: DivOptions): Tensor {
+export function div(
+  a: TensorOrScalar,
+  b: TensorOrScalar,
+  options?: DivOptions,
+): Tensor {
   return defaultEngine.div(a, b, options);
 }
 

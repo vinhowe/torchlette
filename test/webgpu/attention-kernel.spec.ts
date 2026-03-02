@@ -9,9 +9,15 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
    * q, k, v: [B, H, N, D] as flat arrays
    */
   function decomposedAttention(
-    qData: number[], kData: number[], vData: number[],
-    B: number, H: number, N: number, D: number,
-    scale: number, isCausal: boolean,
+    qData: number[],
+    kData: number[],
+    vData: number[],
+    B: number,
+    H: number,
+    N: number,
+    D: number,
+    scale: number,
+    isCausal: boolean,
   ): number[] {
     const output = new Float32Array(B * H * N * D);
     for (let b = 0; b < B; b++) {
@@ -35,9 +41,9 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
 
           // Softmax
           const maxScore = Math.max(...scores);
-          const expScores = scores.map(s => Math.exp(s - maxScore));
+          const expScores = scores.map((s) => Math.exp(s - maxScore));
           const sumExp = expScores.reduce((a, b) => a + b, 0);
-          const attnWeights = expScores.map(e => e / sumExp);
+          const attnWeights = expScores.map((e) => e / sumExp);
 
           // Weighted sum of V
           for (let d = 0; d < D; d++) {
@@ -57,7 +63,10 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
   it("forward matches CPU decomposed path (small, non-causal)", async () => {
     await initWebGPU();
 
-    const B = 1, H = 1, N = 4, D = 8;
+    const B = 1,
+      H = 1,
+      N = 4,
+      D = 8;
     const scale = 1.0 / Math.sqrt(D);
 
     // Generate deterministic test data
@@ -80,7 +89,17 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
     const gpuArr = await result.cpu();
 
     // CPU reference
-    const cpuArr = decomposedAttention(qData, kData, vData, B, H, N, D, scale, false);
+    const cpuArr = decomposedAttention(
+      qData,
+      kData,
+      vData,
+      B,
+      H,
+      N,
+      D,
+      scale,
+      false,
+    );
 
     console.log("GPU (non-causal):", gpuArr.slice(0, 8));
     console.log("CPU (non-causal):", cpuArr.slice(0, 8));
@@ -95,7 +114,10 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
   it("forward matches CPU decomposed path (causal)", async () => {
     await initWebGPU();
 
-    const B = 1, H = 2, N = 8, D = 16;
+    const B = 1,
+      H = 2,
+      N = 8,
+      D = 16;
     const scale = 1.0 / Math.sqrt(D);
 
     const qData: number[] = [];
@@ -115,7 +137,17 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
     const result = gpu.scaledDotProductAttention(q, k, v, scale, true);
     const gpuArr = await result.cpu();
 
-    const cpuArr = decomposedAttention(qData, kData, vData, B, H, N, D, scale, true);
+    const cpuArr = decomposedAttention(
+      qData,
+      kData,
+      vData,
+      B,
+      H,
+      N,
+      D,
+      scale,
+      true,
+    );
 
     console.log("GPU (causal):", gpuArr.slice(0, 8));
     console.log("CPU (causal):", cpuArr.slice(0, 8));
@@ -130,7 +162,10 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
   it("forward works with multi-batch, multi-head", async () => {
     await initWebGPU();
 
-    const B = 2, H = 4, N = 16, D = 16;
+    const B = 2,
+      H = 4,
+      N = 16,
+      D = 16;
     const scale = 1.0 / Math.sqrt(D);
 
     const qData: number[] = [];
@@ -150,7 +185,17 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
     const result = gpu.scaledDotProductAttention(q, k, v, scale, true);
     const gpuArr = await result.cpu();
 
-    const cpuArr = decomposedAttention(qData, kData, vData, B, H, N, D, scale, true);
+    const cpuArr = decomposedAttention(
+      qData,
+      kData,
+      vData,
+      B,
+      H,
+      N,
+      D,
+      scale,
+      true,
+    );
 
     let maxError = 0;
     for (let i = 0; i < gpuArr.length; i++) {
@@ -165,7 +210,10 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
   it("forward works with seq_len=64 (full tile)", async () => {
     await initWebGPU();
 
-    const B = 1, H = 1, N = 64, D = 16;
+    const B = 1,
+      H = 1,
+      N = 64,
+      D = 16;
     const scale = 1.0 / Math.sqrt(D);
 
     const qData: number[] = [];
@@ -185,7 +233,17 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
     const result = gpu.scaledDotProductAttention(q, k, v, scale, true);
     const gpuArr = await result.cpu();
 
-    const cpuArr = decomposedAttention(qData, kData, vData, B, H, N, D, scale, true);
+    const cpuArr = decomposedAttention(
+      qData,
+      kData,
+      vData,
+      B,
+      H,
+      N,
+      D,
+      scale,
+      true,
+    );
 
     let maxError = 0;
     for (let i = 0; i < gpuArr.length; i++) {
@@ -200,7 +258,10 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
   it("forward works with seq_len=128 (multiple tiles)", async () => {
     await initWebGPU();
 
-    const B = 1, H = 2, N = 128, D = 32;
+    const B = 1,
+      H = 2,
+      N = 128,
+      D = 32;
     const scale = 1.0 / Math.sqrt(D);
 
     const qData: number[] = [];
@@ -220,7 +281,17 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
     const result = gpu.scaledDotProductAttention(q, k, v, scale, true);
     const gpuArr = await result.cpu();
 
-    const cpuArr = decomposedAttention(qData, kData, vData, B, H, N, D, scale, true);
+    const cpuArr = decomposedAttention(
+      qData,
+      kData,
+      vData,
+      B,
+      H,
+      N,
+      D,
+      scale,
+      true,
+    );
 
     let maxError = 0;
     for (let i = 0; i < gpuArr.length; i++) {
@@ -235,7 +306,10 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
   it("backward produces correct gradients", async () => {
     await initWebGPU();
 
-    const B = 1, H = 1, N = 4, D = 8;
+    const B = 1,
+      H = 1,
+      N = 4,
+      D = 8;
     const scale = 1.0 / Math.sqrt(D);
 
     const qData: number[] = [];
@@ -249,31 +323,55 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
 
     // GPU backward
     const gpu = new Torchlette("webgpu");
-    const qGpu = gpu.tensorFromArray(qData, [B, H, N, D], { requiresGrad: true });
-    const kGpu = gpu.tensorFromArray(kData, [B, H, N, D], { requiresGrad: true });
-    const vGpu = gpu.tensorFromArray(vData, [B, H, N, D], { requiresGrad: true });
+    const qGpu = gpu.tensorFromArray(qData, [B, H, N, D], {
+      requiresGrad: true,
+    });
+    const kGpu = gpu.tensorFromArray(kData, [B, H, N, D], {
+      requiresGrad: true,
+    });
+    const vGpu = gpu.tensorFromArray(vData, [B, H, N, D], {
+      requiresGrad: true,
+    });
 
-    const gpuResult = gpu.scaledDotProductAttention(qGpu, kGpu, vGpu, scale, true);
+    const gpuResult = gpu.scaledDotProductAttention(
+      qGpu,
+      kGpu,
+      vGpu,
+      scale,
+      true,
+    );
     const gpuLoss = gpuResult.sum();
     await gpuLoss.backward();
 
-    const gpuDQ = await qGpu.grad!.cpu();
-    const gpuDK = await kGpu.grad!.cpu();
-    const gpuDV = await vGpu.grad!.cpu();
+    const gpuDQ = await qGpu.grad?.cpu();
+    const gpuDK = await kGpu.grad?.cpu();
+    const gpuDV = await vGpu.grad?.cpu();
 
     // CPU backward (decomposed) for reference
     const cpu = new Torchlette("cpu");
-    const qCpu = cpu.tensorFromArray(qData, [B, H, N, D], { requiresGrad: true });
-    const kCpu = cpu.tensorFromArray(kData, [B, H, N, D], { requiresGrad: true });
-    const vCpu = cpu.tensorFromArray(vData, [B, H, N, D], { requiresGrad: true });
+    const qCpu = cpu.tensorFromArray(qData, [B, H, N, D], {
+      requiresGrad: true,
+    });
+    const kCpu = cpu.tensorFromArray(kData, [B, H, N, D], {
+      requiresGrad: true,
+    });
+    const vCpu = cpu.tensorFromArray(vData, [B, H, N, D], {
+      requiresGrad: true,
+    });
 
-    const cpuResult = cpu.scaledDotProductAttention(qCpu, kCpu, vCpu, scale, true);
+    const cpuResult = cpu.scaledDotProductAttention(
+      qCpu,
+      kCpu,
+      vCpu,
+      scale,
+      true,
+    );
     const cpuLoss = cpuResult.sum();
     await cpuLoss.backward();
 
-    const cpuDQ = await qCpu.grad!.cpu();
-    const cpuDK = await kCpu.grad!.cpu();
-    const cpuDV = await vCpu.grad!.cpu();
+    const cpuDQ = await qCpu.grad?.cpu();
+    const cpuDK = await kCpu.grad?.cpu();
+    const cpuDV = await vCpu.grad?.cpu();
 
     console.log("GPU dQ:", gpuDQ.slice(0, 8));
     console.log("CPU dQ:", cpuDQ.slice(0, 8));
@@ -313,7 +411,10 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
   it("backward with larger causal attention", async () => {
     await initWebGPU();
 
-    const B = 1, H = 2, N = 16, D = 16;
+    const B = 1,
+      H = 2,
+      N = 16,
+      D = 16;
     const scale = 1.0 / Math.sqrt(D);
 
     const qData: number[] = [];
@@ -327,33 +428,59 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
 
     // GPU backward
     const gpu = new Torchlette("webgpu");
-    const qGpu = gpu.tensorFromArray(qData, [B, H, N, D], { requiresGrad: true });
-    const kGpu = gpu.tensorFromArray(kData, [B, H, N, D], { requiresGrad: true });
-    const vGpu = gpu.tensorFromArray(vData, [B, H, N, D], { requiresGrad: true });
+    const qGpu = gpu.tensorFromArray(qData, [B, H, N, D], {
+      requiresGrad: true,
+    });
+    const kGpu = gpu.tensorFromArray(kData, [B, H, N, D], {
+      requiresGrad: true,
+    });
+    const vGpu = gpu.tensorFromArray(vData, [B, H, N, D], {
+      requiresGrad: true,
+    });
 
-    const gpuResult = gpu.scaledDotProductAttention(qGpu, kGpu, vGpu, scale, true);
+    const gpuResult = gpu.scaledDotProductAttention(
+      qGpu,
+      kGpu,
+      vGpu,
+      scale,
+      true,
+    );
     const gpuLoss = gpuResult.sum();
     await gpuLoss.backward();
 
-    const gpuDQ = await qGpu.grad!.cpu();
-    const gpuDK = await kGpu.grad!.cpu();
-    const gpuDV = await vGpu.grad!.cpu();
+    const gpuDQ = await qGpu.grad?.cpu();
+    const gpuDK = await kGpu.grad?.cpu();
+    const gpuDV = await vGpu.grad?.cpu();
 
     // CPU backward
     const cpu = new Torchlette("cpu");
-    const qCpu = cpu.tensorFromArray(qData, [B, H, N, D], { requiresGrad: true });
-    const kCpu = cpu.tensorFromArray(kData, [B, H, N, D], { requiresGrad: true });
-    const vCpu = cpu.tensorFromArray(vData, [B, H, N, D], { requiresGrad: true });
+    const qCpu = cpu.tensorFromArray(qData, [B, H, N, D], {
+      requiresGrad: true,
+    });
+    const kCpu = cpu.tensorFromArray(kData, [B, H, N, D], {
+      requiresGrad: true,
+    });
+    const vCpu = cpu.tensorFromArray(vData, [B, H, N, D], {
+      requiresGrad: true,
+    });
 
-    const cpuResult = cpu.scaledDotProductAttention(qCpu, kCpu, vCpu, scale, true);
+    const cpuResult = cpu.scaledDotProductAttention(
+      qCpu,
+      kCpu,
+      vCpu,
+      scale,
+      true,
+    );
     const cpuLoss = cpuResult.sum();
     await cpuLoss.backward();
 
-    const cpuDQ = await qCpu.grad!.cpu();
-    const cpuDK = await kCpu.grad!.cpu();
-    const cpuDV = await vCpu.grad!.cpu();
+    const cpuDQ = await qCpu.grad?.cpu();
+    const cpuDK = await kCpu.grad?.cpu();
+    const cpuDV = await vCpu.grad?.cpu();
 
-    let maxDQ = 0, maxDK = 0, maxDV = 0;
+    let maxDQ = 0,
+      maxDK = 0,
+      maxDV = 0;
     for (let i = 0; i < gpuDQ.length; i++) {
       maxDQ = Math.max(maxDQ, Math.abs(gpuDQ[i] - cpuDQ[i]));
     }
@@ -364,7 +491,9 @@ describe.skipIf(cpuOnly)("fused flash attention", { timeout: 60000 }, () => {
       maxDV = Math.max(maxDV, Math.abs(gpuDV[i] - cpuDV[i]));
     }
 
-    console.log(`Larger causal backward - max errors: dQ=${maxDQ}, dK=${maxDK}, dV=${maxDV}`);
+    console.log(
+      `Larger causal backward - max errors: dQ=${maxDQ}, dK=${maxDK}, dV=${maxDV}`,
+    );
     expect(maxDQ).toBeLessThan(5e-2);
     expect(maxDK).toBeLessThan(5e-2);
     expect(maxDV).toBeLessThan(5e-2);

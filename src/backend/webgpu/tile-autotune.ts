@@ -8,11 +8,11 @@
  * Equivalent to Triton's @triton.autotune decorator but for our tile-IR.
  */
 
-import type { AutotuneConfig } from "./tile-ir";
-import { createTileKernelDispatcher } from "./tile-dispatch";
-import { requireContext } from "./webgpu-state";
-import { beginSharedEncoder, flushSharedEncoder } from "./shared-encoder";
 import type { GPUBuffer } from "./gpu-types";
+import { beginSharedEncoder, flushSharedEncoder } from "./shared-encoder";
+import { createTileKernelDispatcher } from "./tile-dispatch";
+import type { AutotuneConfig } from "./tile-ir";
+import { requireContext } from "./webgpu-state";
 
 // ============================================================================
 // Config Generation
@@ -29,19 +29,19 @@ export function generateTileConfigs(
   uniforms?: Record<string, number>,
 ): Record<string, number>[] {
   // Optionally narrow params based on shape
-  const params = (uniforms && autoConfig.pruneForShape)
-    ? autoConfig.pruneForShape(uniforms)
-    : autoConfig.params;
+  const params =
+    uniforms && autoConfig.pruneForShape
+      ? autoConfig.pruneForShape(uniforms)
+      : autoConfig.params;
 
   const paramNames = Object.keys(params);
-  const paramValues = paramNames.map(name => params[name].values);
+  const paramValues = paramNames.map((name) => params[name].values);
 
   // Cartesian product
   const configs: Record<string, number>[] = [];
   const indices = new Array(paramNames.length).fill(0);
 
-  outer:
-  while (true) {
+  outer: while (true) {
     // Build config from current indices
     const config: Record<string, number> = {};
     for (let i = 0; i < paramNames.length; i++) {
@@ -49,8 +49,9 @@ export function generateTileConfigs(
     }
 
     // Apply constraints
-    const valid = !autoConfig.constraints ||
-      autoConfig.constraints.every(fn => fn(config));
+    const valid =
+      !autoConfig.constraints ||
+      autoConfig.constraints.every((fn) => fn(config));
     if (valid) {
       configs.push(config);
     }
@@ -70,7 +71,9 @@ export function generateTileConfigs(
 /**
  * Get the default config from an AutotuneConfig (using each param's default).
  */
-export function getDefaultConfig(autoConfig: AutotuneConfig): Record<string, number> {
+export function getDefaultConfig(
+  autoConfig: AutotuneConfig,
+): Record<string, number> {
   const config: Record<string, number> = {};
   for (const [name, param] of Object.entries(autoConfig.params)) {
     config[name] = param.default;
@@ -178,9 +181,15 @@ export async function autotuneTileKernel(
 // ============================================================================
 
 /** In-memory cache: specName:uniformKey → best config + timing. */
-const tuneCache = new Map<string, { config: Record<string, number>; medianMs: number }>();
+const tuneCache = new Map<
+  string,
+  { config: Record<string, number>; medianMs: number }
+>();
 
-function buildCacheKey(autoConfig: AutotuneConfig, uniforms: Record<string, number>): string {
+function buildCacheKey(
+  autoConfig: AutotuneConfig,
+  uniforms: Record<string, number>,
+): string {
   // Use the factory's default config name as the spec identifier
   const defaultConfig = getDefaultConfig(autoConfig);
   const specName = autoConfig.factory(defaultConfig).name;
@@ -204,7 +213,9 @@ export function exportTileAutotuneCache(): string {
 
 /** Import autotuning results from JSON. */
 export function importTileAutotuneCache(json: string): void {
-  const entries = JSON.parse(json) as Array<[string, { config: Record<string, number>; medianMs: number }]>;
+  const entries = JSON.parse(json) as Array<
+    [string, { config: Record<string, number>; medianMs: number }]
+  >;
   for (const [key, value] of entries) {
     tuneCache.set(key, value);
   }

@@ -5,15 +5,24 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  OP_REGISTRY,
   canVectorize,
   isUnaryOp,
+  OP_REGISTRY,
 } from "../../src/backend/webgpu/ops/registry";
 
 describe("Op Registry", () => {
   describe("Registry structure", () => {
     it("contains all expected activation ops", () => {
-      const activations = ["relu", "gelu", "gelu_tanh", "gelu_erf", "silu", "sigmoid", "tanh", "softplus"];
+      const activations = [
+        "relu",
+        "gelu",
+        "gelu_tanh",
+        "gelu_erf",
+        "silu",
+        "sigmoid",
+        "tanh",
+        "softplus",
+      ];
       for (const op of activations) {
         expect(op in OP_REGISTRY, `Missing activation op: ${op}`).toBe(true);
         expect(OP_REGISTRY[op].category).toBe("activation");
@@ -21,7 +30,20 @@ describe("Op Registry", () => {
     });
 
     it("contains all expected math ops", () => {
-      const math = ["neg", "abs", "exp", "log", "sqrt", "rsqrt", "sin", "cos", "floor", "ceil", "round", "sign"];
+      const math = [
+        "neg",
+        "abs",
+        "exp",
+        "log",
+        "sqrt",
+        "rsqrt",
+        "sin",
+        "cos",
+        "floor",
+        "ceil",
+        "round",
+        "sign",
+      ];
       for (const op of math) {
         expect(op in OP_REGISTRY, `Missing math op: ${op}`).toBe(true);
         expect(OP_REGISTRY[op].category).toBe("math");
@@ -29,7 +51,16 @@ describe("Op Registry", () => {
     });
 
     it("contains all expected arithmetic ops", () => {
-      const arithmetic = ["add", "sub", "mul", "div", "pow", "min", "max", "mod"];
+      const arithmetic = [
+        "add",
+        "sub",
+        "mul",
+        "div",
+        "pow",
+        "min",
+        "max",
+        "mod",
+      ];
       for (const op of arithmetic) {
         expect(op in OP_REGISTRY, `Missing arithmetic op: ${op}`).toBe(true);
         expect(OP_REGISTRY[op].category).toBe("arithmetic");
@@ -110,7 +141,9 @@ describe("Op Registry", () => {
     });
 
     it("generates where expression", () => {
-      expect(OP_REGISTRY.where.expr("cond", "a", "b")).toBe("select(b, a, cond > 0.0)");
+      expect(OP_REGISTRY.where.expr("cond", "a", "b")).toBe(
+        "select(b, a, cond > 0.0)",
+      );
     });
 
     it("generates cast expressions", () => {
@@ -121,7 +154,11 @@ describe("Op Registry", () => {
     });
 
     it("uses custom zero for relu when provided", () => {
-      const expr = OP_REGISTRY.relu.expr("v", "vec4<f32>(0.0)", "vec4<f32>(1.0)");
+      const expr = OP_REGISTRY.relu.expr(
+        "v",
+        "vec4<f32>(0.0)",
+        "vec4<f32>(1.0)",
+      );
       expect(expr).toContain("vec4<f32>(0.0)");
     });
   });
@@ -147,7 +184,15 @@ describe("Op Registry", () => {
 
   describe("vectorization", () => {
     it("most ops are vectorizable", () => {
-      const vectorizable = ["relu", "add", "mul", "sigmoid", "tanh", "neg", "sqrt"];
+      const vectorizable = [
+        "relu",
+        "add",
+        "mul",
+        "sigmoid",
+        "tanh",
+        "neg",
+        "sqrt",
+      ];
       for (const op of vectorizable) {
         expect(canVectorize(op), `Op ${op} should be vectorizable`).toBe(true);
       }
@@ -165,8 +210,15 @@ describe("Op Registry", () => {
 
   describe("consistency checks", () => {
     it("all ops have valid arity, category, and fusible/vectorizable flags", () => {
-      const validCategories = ["activation", "math", "arithmetic", "comparison", "ternary", "cast"];
-      for (const [name, def] of Object.entries(OP_REGISTRY)) {
+      const validCategories = [
+        "activation",
+        "math",
+        "arithmetic",
+        "comparison",
+        "ternary",
+        "cast",
+      ];
+      for (const [_name, def] of Object.entries(OP_REGISTRY)) {
         expect([1, 2, 3]).toContain(def.arity);
         expect(validCategories).toContain(def.category);
         expect(typeof def.fusible).toBe("boolean");

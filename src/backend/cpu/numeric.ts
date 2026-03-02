@@ -1,5 +1,5 @@
-import { normalizeDim as normalizeDimShared, type GeluOptions } from "../types";
-import { sizeOf, broadcastShapes } from "../../core/shape";
+import { broadcastShapes, sizeOf } from "../../core/shape";
+import { type GeluOptions, normalizeDim as normalizeDimShared } from "../types";
 
 export type Shape = number[];
 
@@ -90,8 +90,14 @@ export class Tensor {
   }
 }
 
-export function tensorFromArray(values: number[] | Float32Array, shape: Shape): Tensor {
-  return new Tensor(shape, values instanceof Float32Array ? values.slice() : Float32Array.from(values));
+export function tensorFromArray(
+  values: number[] | Float32Array,
+  shape: Shape,
+): Tensor {
+  return new Tensor(
+    shape,
+    values instanceof Float32Array ? values.slice() : Float32Array.from(values),
+  );
 }
 
 export function full(shape: Shape, fillValue: number): Tensor {
@@ -111,7 +117,8 @@ export function arange(end: number, start = 0, step = 1): Tensor {
 }
 
 export function tril(a: Tensor, k = 0): Tensor {
-  if (a.shape.length < 2) throw new Error("tril requires at least 2 dimensions");
+  if (a.shape.length < 2)
+    throw new Error("tril requires at least 2 dimensions");
   const data = Float32Array.from(a.data);
   const H = a.shape[a.shape.length - 2];
   const W = a.shape[a.shape.length - 1];
@@ -127,7 +134,8 @@ export function tril(a: Tensor, k = 0): Tensor {
 }
 
 export function triu(a: Tensor, k = 0): Tensor {
-  if (a.shape.length < 2) throw new Error("triu requires at least 2 dimensions");
+  if (a.shape.length < 2)
+    throw new Error("triu requires at least 2 dimensions");
   const data = Float32Array.from(a.data);
   const H = a.shape[a.shape.length - 2];
   const W = a.shape[a.shape.length - 1];
@@ -184,13 +192,20 @@ export function contiguous(a: Tensor): Tensor {
 /**
  * Select a contiguous sub-range along one dimension. Returns a view.
  */
-export function narrow(a: Tensor, dim: number, start: number, length: number): Tensor {
+export function narrow(
+  a: Tensor,
+  dim: number,
+  start: number,
+  length: number,
+): Tensor {
   const rank = a.shape.length;
   if (dim < 0 || dim >= rank) {
     throw new Error(`narrow: dim ${dim} out of range for rank ${rank}`);
   }
   if (start < 0 || start + length > a.shape[dim]) {
-    throw new Error(`narrow: range [${start}, ${start + length}) out of bounds for dim size ${a.shape[dim]}`);
+    throw new Error(
+      `narrow: range [${start}, ${start + length}) out of bounds for dim size ${a.shape[dim]}`,
+    );
   }
   const newShape = a.shape.slice();
   newShape[dim] = length;
@@ -201,7 +216,12 @@ export function narrow(a: Tensor, dim: number, start: number, length: number): T
 /**
  * Backward for narrow: pad gradient back to original shape.
  */
-export function narrowBackward(grad: Tensor, dim: number, start: number, originalLength: number): Tensor {
+export function narrowBackward(
+  grad: Tensor,
+  dim: number,
+  start: number,
+  originalLength: number,
+): Tensor {
   const outShape = grad.shape.slice();
   outShape[dim] = originalLength;
   const outSize = sizeOf(outShape);
@@ -217,7 +237,8 @@ export function narrowBackward(grad: Tensor, dim: number, start: number, origina
     for (let d = 0; d < gradDimSize; d++) {
       for (let i = 0; i < innerSize; i++) {
         const gradIdx = getStridedIndex(grad, o, d, i, dim);
-        const outIdx = o * originalLength * innerSize + (start + d) * innerSize + i;
+        const outIdx =
+          o * originalLength * innerSize + (start + d) * innerSize + i;
         result[outIdx] = grad.data[gradIdx];
       }
     }
@@ -228,7 +249,8 @@ export function narrowBackward(grad: Tensor, dim: number, start: number, origina
 
 export function cat(tensors: Tensor[], options: { dim: number }): Tensor {
   if (tensors.length === 0) throw new Error("cat: empty tensor list");
-  const dim = options.dim < 0 ? options.dim + tensors[0].shape.length : options.dim;
+  const dim =
+    options.dim < 0 ? options.dim + tensors[0].shape.length : options.dim;
   const rank = tensors[0].shape.length;
   // Validate shapes match on all non-cat dims
   for (let i = 1; i < tensors.length; i++) {
@@ -252,7 +274,8 @@ export function cat(tensors: Tensor[], options: { dim: number }): Tensor {
       for (let d = 0; d < tDimSize; d++) {
         for (let i = 0; i < innerSize; i++) {
           const srcIdx = getStridedIndex(t, o, d, i, dim);
-          const outIdx = o * outShape[dim] * innerSize + (dimOffset + d) * innerSize + i;
+          const outIdx =
+            o * outShape[dim] * innerSize + (dimOffset + d) * innerSize + i;
           result[outIdx] = t.data[srcIdx];
         }
       }
@@ -262,7 +285,13 @@ export function cat(tensors: Tensor[], options: { dim: number }): Tensor {
   return new Tensor(outShape, result);
 }
 
-function getStridedIndex(t: Tensor, outer: number, dimIdx: number, inner: number, dim: number): number {
+function getStridedIndex(
+  t: Tensor,
+  outer: number,
+  dimIdx: number,
+  inner: number,
+  dim: number,
+): number {
   // Compute strided index for [outer, dimIdx, inner] where dim splits the dimensions
   let idx = t.offset;
   // Outer dimensions
@@ -349,7 +378,11 @@ function applyUnaryOp(a: Tensor, fn: (x: number) => number): Tensor {
   return new Tensor(a.shape, out);
 }
 
-function applyBinaryOp(a: Tensor, b: Tensor, fn: (x: number, y: number) => number): Tensor {
+function applyBinaryOp(
+  a: Tensor,
+  b: Tensor,
+  fn: (x: number, y: number) => number,
+): Tensor {
   const outShape = broadcastShapes(a.shape, b.shape);
   const aBroadcast = broadcastTo(a, outShape);
   const bBroadcast = broadcastTo(b, outShape);
@@ -357,14 +390,23 @@ function applyBinaryOp(a: Tensor, b: Tensor, fn: (x: number, y: number) => numbe
   const out = new Float32Array(outSize);
   const shapeStrides = computeStrides(outShape);
   for (let i = 0; i < outSize; i += 1) {
-    out[i] = fn(readAtLinear(aBroadcast, i, shapeStrides), readAtLinear(bBroadcast, i, shapeStrides));
+    out[i] = fn(
+      readAtLinear(aBroadcast, i, shapeStrides),
+      readAtLinear(bBroadcast, i, shapeStrides),
+    );
   }
   return new Tensor(outShape, out);
 }
 
-export function add(a: Tensor, b: Tensor): Tensor { return applyBinaryOp(a, b, (x, y) => x + y); }
-export function mul(a: Tensor, b: Tensor): Tensor { return applyBinaryOp(a, b, (x, y) => x * y); }
-export function relu(a: Tensor): Tensor { return applyUnaryOp(a, x => x > 0 ? x : 0); }
+export function add(a: Tensor, b: Tensor): Tensor {
+  return applyBinaryOp(a, b, (x, y) => x + y);
+}
+export function mul(a: Tensor, b: Tensor): Tensor {
+  return applyBinaryOp(a, b, (x, y) => x * y);
+}
+export function relu(a: Tensor): Tensor {
+  return applyUnaryOp(a, (x) => (x > 0 ? x : 0));
+}
 
 export function matmul(a: Tensor, b: Tensor): Tensor {
   const aRank = a.shape.length;
@@ -453,13 +495,27 @@ export function matmul(a: Tensor, b: Tensor): Tensor {
   return new Tensor(outShape, out);
 }
 
-export function sqrt(a: Tensor): Tensor { return applyUnaryOp(a, Math.sqrt); }
-export function exp(a: Tensor): Tensor { return applyUnaryOp(a, Math.exp); }
-export function log(a: Tensor): Tensor { return applyUnaryOp(a, Math.log); }
-export function neg(a: Tensor): Tensor { return applyUnaryOp(a, x => -x); }
-export function abs(a: Tensor): Tensor { return applyUnaryOp(a, Math.abs); }
-export function tanh(a: Tensor): Tensor { return applyUnaryOp(a, Math.tanh); }
-export function sigmoid(a: Tensor): Tensor { return applyUnaryOp(a, x => 1.0 / (1.0 + Math.exp(-x))); }
+export function sqrt(a: Tensor): Tensor {
+  return applyUnaryOp(a, Math.sqrt);
+}
+export function exp(a: Tensor): Tensor {
+  return applyUnaryOp(a, Math.exp);
+}
+export function log(a: Tensor): Tensor {
+  return applyUnaryOp(a, Math.log);
+}
+export function neg(a: Tensor): Tensor {
+  return applyUnaryOp(a, (x) => -x);
+}
+export function abs(a: Tensor): Tensor {
+  return applyUnaryOp(a, Math.abs);
+}
+export function tanh(a: Tensor): Tensor {
+  return applyUnaryOp(a, Math.tanh);
+}
+export function sigmoid(a: Tensor): Tensor {
+  return applyUnaryOp(a, (x) => 1.0 / (1.0 + Math.exp(-x)));
+}
 
 /**
  * Error function approximation using Horner's method.
@@ -478,7 +534,8 @@ function erf(x: number): number {
   x = Math.abs(x);
 
   const t = 1.0 / (1.0 + p * x);
-  const y = 1.0 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+  const y =
+    1.0 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
 
   return sign * y;
 }
@@ -494,12 +551,13 @@ export function gelu(a: Tensor, options?: GeluOptions): Tensor {
     const sqrt2OverPi = 0.7978845608; // sqrt(2/pi)
     for (let i = 0; i < a.size; i += 1) {
       const x = readAtLinear(a, i, shapeStrides);
-      out[i] = x * 0.5 * (1.0 + Math.tanh(sqrt2OverPi * (x + 0.044715 * x * x * x)));
+      out[i] =
+        x * 0.5 * (1.0 + Math.tanh(sqrt2OverPi * (x + 0.044715 * x * x * x)));
     }
   } else {
     // Exact formula using erf:
     // x * 0.5 * (1 + erf(x / sqrt(2)))
-    const sqrt2Inv = 0.7071067811865476; // 1/sqrt(2)
+    const sqrt2Inv = Math.SQRT1_2; // 1/sqrt(2)
     for (let i = 0; i < a.size; i += 1) {
       const x = readAtLinear(a, i, shapeStrides);
       out[i] = x * 0.5 * (1.0 + erf(x * sqrt2Inv));
@@ -509,25 +567,49 @@ export function gelu(a: Tensor, options?: GeluOptions): Tensor {
   return new Tensor(a.shape, out);
 }
 
-export function silu(a: Tensor): Tensor { return applyUnaryOp(a, x => x / (1.0 + Math.exp(-x))); }
-export function sin(a: Tensor): Tensor { return applyUnaryOp(a, Math.sin); }
-export function cos(a: Tensor): Tensor { return applyUnaryOp(a, Math.cos); }
-export function rsqrt(a: Tensor): Tensor { return applyUnaryOp(a, x => 1.0 / Math.sqrt(x)); }
-export function floor(a: Tensor): Tensor { return applyUnaryOp(a, Math.floor); }
-export function ceil(a: Tensor): Tensor { return applyUnaryOp(a, Math.ceil); }
-export function round(a: Tensor): Tensor { return applyUnaryOp(a, Math.round); }
-export function sign(a: Tensor): Tensor { return applyUnaryOp(a, Math.sign); }
-export function isfinite(a: Tensor): Tensor { return applyUnaryOp(a, x => Number.isFinite(x) ? 1.0 : 0.0); }
+export function silu(a: Tensor): Tensor {
+  return applyUnaryOp(a, (x) => x / (1.0 + Math.exp(-x)));
+}
+export function sin(a: Tensor): Tensor {
+  return applyUnaryOp(a, Math.sin);
+}
+export function cos(a: Tensor): Tensor {
+  return applyUnaryOp(a, Math.cos);
+}
+export function rsqrt(a: Tensor): Tensor {
+  return applyUnaryOp(a, (x) => 1.0 / Math.sqrt(x));
+}
+export function floor(a: Tensor): Tensor {
+  return applyUnaryOp(a, Math.floor);
+}
+export function ceil(a: Tensor): Tensor {
+  return applyUnaryOp(a, Math.ceil);
+}
+export function round(a: Tensor): Tensor {
+  return applyUnaryOp(a, Math.round);
+}
+export function sign(a: Tensor): Tensor {
+  return applyUnaryOp(a, Math.sign);
+}
+export function isfinite(a: Tensor): Tensor {
+  return applyUnaryOp(a, (x) => (Number.isFinite(x) ? 1.0 : 0.0));
+}
 
-export function clamp(a: Tensor, min: number | null, max: number | null): Tensor {
-  return applyUnaryOp(a, v => {
+export function clamp(
+  a: Tensor,
+  min: number | null,
+  max: number | null,
+): Tensor {
+  return applyUnaryOp(a, (v) => {
     if (min !== null && v < min) v = min;
     if (max !== null && v > max) v = max;
     return v;
   });
 }
 
-export function pow(a: Tensor, b: Tensor): Tensor { return applyBinaryOp(a, b, Math.pow); }
+export function pow(a: Tensor, b: Tensor): Tensor {
+  return applyBinaryOp(a, b, Math.pow);
+}
 
 export type SumOptions = {
   dim?: number | number[] | null;
@@ -579,7 +661,10 @@ function inferReshapeStrides(
     let oldProduct = oldShape[oldIdx];
     let newProduct = newShape[newIdx];
     while (oldProduct < newProduct && oldIdx + 1 < oldN) {
-      if (oldStrides[oldIdx] !== oldStrides[oldIdx + 1] * oldShape[oldIdx + 1]) {
+      if (
+        oldStrides[oldIdx] !==
+        oldStrides[oldIdx + 1] * oldShape[oldIdx + 1]
+      ) {
         return null;
       }
       oldIdx++;
@@ -726,11 +811,15 @@ export function conv2d(
   input: Tensor,
   weight: Tensor,
   bias: Tensor | undefined,
-  options?: { stride?: number | [number, number]; padding?: number | [number, number] },
+  options?: {
+    stride?: number | [number, number];
+    padding?: number | [number, number];
+  },
 ): Tensor {
   const [N, Cin, H, W] = input.shape;
   const [Cout, CinK, KH, KW] = weight.shape;
-  if (Cin !== CinK) throw new Error(`conv2d: input channels ${Cin} != weight channels ${CinK}`);
+  if (Cin !== CinK)
+    throw new Error(`conv2d: input channels ${Cin} != weight channels ${CinK}`);
 
   const stride = normalizePair(options?.stride, 1);
   const padding = normalizePair(options?.padding, 0);
@@ -752,8 +841,9 @@ export function conv2d(
                 const ih = oh * sH - pH + ky;
                 const iw = ow * sW - pW + kx;
                 if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                  acc += readElement(input, [n, ci, ih, iw]) *
-                         readElement(weight, [co, ci, ky, kx]);
+                  acc +=
+                    readElement(input, [n, ci, ih, iw]) *
+                    readElement(weight, [co, ci, ky, kx]);
                 }
               }
             }
@@ -767,7 +857,10 @@ export function conv2d(
   return new Tensor([N, Cout, outH, outW], out);
 }
 
-function normalizePair(p: number | [number, number] | undefined, fallback: number): [number, number] {
+function normalizePair(
+  p: number | [number, number] | undefined,
+  fallback: number,
+): [number, number] {
   if (p === undefined) return [fallback, fallback];
   if (typeof p === "number") return [p, p];
   return p;
@@ -1117,7 +1210,11 @@ export function min(a: Tensor, options?: MaxOptions): Tensor {
   return new Tensor(outShape, out);
 }
 
-function normalizeDimsForReduce(dim: number | number[], rank: number, opName: string): number[] {
+function normalizeDimsForReduce(
+  dim: number | number[],
+  rank: number,
+  opName: string,
+): number[] {
   const dims = Array.isArray(dim) ? dim.slice() : [dim];
   const normalized = dims.map((value) => (value < 0 ? rank + value : value));
   const unique = new Set<number>();
@@ -1139,7 +1236,9 @@ export function argmax(a: Tensor, options: ArgReduceOptions): Tensor {
   const rank = a.shape.length;
   const dim = options.dim < 0 ? options.dim + rank : options.dim;
   if (dim < 0 || dim >= rank) {
-    throw new Error(`argmax: dim ${options.dim} out of range for tensor of rank ${rank}`);
+    throw new Error(
+      `argmax: dim ${options.dim} out of range for tensor of rank ${rank}`,
+    );
   }
   const keepdim = options.keepdim ?? false;
 
@@ -1200,7 +1299,9 @@ export function argmin(a: Tensor, options: ArgReduceOptions): Tensor {
   const rank = a.shape.length;
   const dim = options.dim < 0 ? options.dim + rank : options.dim;
   if (dim < 0 || dim >= rank) {
-    throw new Error(`argmin: dim ${options.dim} out of range for tensor of rank ${rank}`);
+    throw new Error(
+      `argmin: dim ${options.dim} out of range for tensor of rank ${rank}`,
+    );
   }
   const keepdim = options.keepdim ?? false;
 
@@ -1261,16 +1362,32 @@ export function argmin(a: Tensor, options: ArgReduceOptions): Tensor {
 // Comparison ops - return 1.0 for true, 0.0 for false
 // ============================================================================
 
-function comparisonOp(a: Tensor, b: Tensor, cmp: (x: number, y: number) => boolean): Tensor {
-  return applyBinaryOp(a, b, (x, y) => cmp(x, y) ? 1.0 : 0.0);
+function comparisonOp(
+  a: Tensor,
+  b: Tensor,
+  cmp: (x: number, y: number) => boolean,
+): Tensor {
+  return applyBinaryOp(a, b, (x, y) => (cmp(x, y) ? 1.0 : 0.0));
 }
 
-export function gt(a: Tensor, b: Tensor): Tensor { return comparisonOp(a, b, (x, y) => x > y); }
-export function lt(a: Tensor, b: Tensor): Tensor { return comparisonOp(a, b, (x, y) => x < y); }
-export function ge(a: Tensor, b: Tensor): Tensor { return comparisonOp(a, b, (x, y) => x >= y); }
-export function le(a: Tensor, b: Tensor): Tensor { return comparisonOp(a, b, (x, y) => x <= y); }
-export function eq(a: Tensor, b: Tensor): Tensor { return comparisonOp(a, b, (x, y) => x === y); }
-export function ne(a: Tensor, b: Tensor): Tensor { return comparisonOp(a, b, (x, y) => x !== y); }
+export function gt(a: Tensor, b: Tensor): Tensor {
+  return comparisonOp(a, b, (x, y) => x > y);
+}
+export function lt(a: Tensor, b: Tensor): Tensor {
+  return comparisonOp(a, b, (x, y) => x < y);
+}
+export function ge(a: Tensor, b: Tensor): Tensor {
+  return comparisonOp(a, b, (x, y) => x >= y);
+}
+export function le(a: Tensor, b: Tensor): Tensor {
+  return comparisonOp(a, b, (x, y) => x <= y);
+}
+export function eq(a: Tensor, b: Tensor): Tensor {
+  return comparisonOp(a, b, (x, y) => x === y);
+}
+export function ne(a: Tensor, b: Tensor): Tensor {
+  return comparisonOp(a, b, (x, y) => x !== y);
+}
 
 /**
  * where(condition, x, y): returns x where condition is true (non-zero), else y.

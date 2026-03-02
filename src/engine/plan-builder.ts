@@ -1,6 +1,6 @@
 import type { Backend } from "../backend/types";
-import type { ExecutionPlan, LazyIRNode, LazyRef } from "./lazy-types";
 import { sizeOf } from "../core/shape";
+import type { ExecutionPlan, LazyIRNode, LazyRef } from "./lazy-types";
 
 /**
  * Mark a LazyIRNode as a checkpoint boundary.
@@ -15,9 +15,7 @@ export function markAsCheckpointBoundary(node: LazyIRNode): void {
  * Returns an array of segments, where each segment ends at a checkpoint boundary
  * (or the end of the plan for the last segment).
  */
-export function segmentPlanAtCheckpoints(
-  plan: ExecutionPlan,
-): ExecutionPlan[] {
+export function segmentPlanAtCheckpoints(plan: ExecutionPlan): ExecutionPlan[] {
   const segments: ExecutionPlan[] = [];
   let currentSegment: LazyIRNode[] = [];
 
@@ -68,7 +66,10 @@ export function buildPlan(root: LazyIRNode): ExecutionPlan {
  * @param roots - Array of LazyIRNode roots to include in the plan
  * @returns A single ExecutionPlan containing all nodes from all roots
  */
-export function buildMergedPlan(roots: LazyIRNode[], skipExecuted = false): ExecutionPlan {
+export function buildMergedPlan(
+  roots: LazyIRNode[],
+  skipExecuted = false,
+): ExecutionPlan {
   const nodes: LazyIRNode[] = [];
   // Use object identity for visited tracking instead of numeric IDs.
   // Node IDs can collide when resetNodeIdCounter() is called between
@@ -140,7 +141,9 @@ export function extractPlanMetadata(plan: ExecutionPlan): {
  * Extract matmul shapes from a plan for pre-tuning.
  * Returns array of [M, N, K] tuples.
  */
-function extractMatmulShapes(plan: ExecutionPlan): Array<[number, number, number]> {
+function extractMatmulShapes(
+  plan: ExecutionPlan,
+): Array<[number, number, number]> {
   const shapes: Array<[number, number, number]> = [];
 
   for (const node of plan.nodes) {
@@ -197,7 +200,7 @@ export async function pretunePlanMatmuls(
 
   const shapes = extractMatmulShapes(plan);
   // Filter to only shapes not yet pretuned
-  const untunedShapes = shapes.filter(s => {
+  const untunedShapes = shapes.filter((s) => {
     const sig = `${s[0]},${s[1]},${s[2]}`;
     return !pretunedShapeSignatures.has(sig);
   });

@@ -40,17 +40,17 @@
  */
 
 import * as path from "node:path";
-import { Torchlette, type Tensor } from "../src/frontend";
+import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
 import {
-  initWebGPU,
   destroyWebGPU,
-  getWebGPUDevice,
   flushSharedEncoder,
+  getWebGPUDevice,
+  initWebGPU,
   isF16Supported,
 } from "../src/backend/webgpu";
-import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
-import { Adam, GradScaler } from "../src/optim";
+import { type Tensor, Torchlette } from "../src/frontend";
 import { crossEntropy } from "../src/nn";
+import { Adam, GradScaler } from "../src/optim";
 
 const FENCE_TIMEOUT_MS = 10_000;
 const PROFILING = !!process.env.TORCHLETTE_PROFILE;
@@ -65,7 +65,9 @@ async function testFence(label: string): Promise<string> {
   const start = performance.now();
   const result = await Promise.race([
     dev.queue.onSubmittedWorkDone().then(() => "OK" as const),
-    new Promise<"TIMEOUT">((r) => setTimeout(() => r("TIMEOUT"), FENCE_TIMEOUT_MS)),
+    new Promise<"TIMEOUT">((r) =>
+      setTimeout(() => r("TIMEOUT"), FENCE_TIMEOUT_MS),
+    ),
   ]);
   const elapsed = (performance.now() - start).toFixed(1);
   console.log(`  [fence] ${label}: ${result} (${elapsed}ms)`);
@@ -80,10 +82,15 @@ async function main() {
 
   // Initialize WebGPU (requests timestamp-query when TORCHLETTE_PROFILE=1)
   const gpuOk = await initWebGPU();
-  if (!gpuOk) { console.error("WebGPU init failed"); process.exit(1); }
+  if (!gpuOk) {
+    console.error("WebGPU init failed");
+    process.exit(1);
+  }
 
   const dev = getWebGPUDevice()!;
-  console.log(`Device features: ${[...dev.device.features].sort().join(", ")}\n`);
+  console.log(
+    `Device features: ${[...dev.device.features].sort().join(", ")}\n`,
+  );
 
   // Set up model + optimizer (same as profile-training.ts)
   const api = new Torchlette("webgpu", {
@@ -94,7 +101,12 @@ async function main() {
 
   console.log("Loading DistilGPT-2...");
   const modelDir = path.join(process.cwd(), "models", "distilgpt2");
-  const model = await loadPretrainedGPT2(api, modelDir, { dropoutRate: 0 }, { device: "webgpu" });
+  const model = await loadPretrainedGPT2(
+    api,
+    modelDir,
+    { dropoutRate: 0 },
+    { device: "webgpu" },
+  );
   model.train();
   console.log("Model loaded.\n");
 
@@ -124,8 +136,12 @@ async function main() {
   for (let step = 0; step < 3; step++) {
     console.log(`Step ${step} (warmup)...`);
     if (scaler) await scaler.resolveDeferred();
-    const input = api.tensorFromArray(inputData, [1, SEQ_LEN], { device: "webgpu" });
-    const target = api.tensorFromArray(targetData, [1, SEQ_LEN], { device: "webgpu" });
+    const input = api.tensorFromArray(inputData, [1, SEQ_LEN], {
+      device: "webgpu",
+    });
+    const target = api.tensorFromArray(targetData, [1, SEQ_LEN], {
+      device: "webgpu",
+    });
     const loss = compiledForward(input, target);
     const v = await loss.item();
     console.log(`  loss = ${v.toFixed(4)}`);
@@ -150,8 +166,12 @@ async function main() {
   // Diagnostic step: test fences at each phase boundary
   console.log("\nDiagnostic step...");
   if (scaler) await scaler.resolveDeferred();
-  const input = api.tensorFromArray(inputData, [1, SEQ_LEN], { device: "webgpu" });
-  const target = api.tensorFromArray(targetData, [1, SEQ_LEN], { device: "webgpu" });
+  const input = api.tensorFromArray(inputData, [1, SEQ_LEN], {
+    device: "webgpu",
+  });
+  const target = api.tensorFromArray(targetData, [1, SEQ_LEN], {
+    device: "webgpu",
+  });
 
   // Forward
   console.log("  Forward pass...");
@@ -203,12 +223,18 @@ async function main() {
   console.log(`Optimizer fence: ${optResult}`);
 
   if (bwdResult === "TIMEOUT" && fwdResult === "OK") {
-    console.log("\nBUG CONFIRMED: onSubmittedWorkDone deadlocks after backward pass");
+    console.log(
+      "\nBUG CONFIRMED: onSubmittedWorkDone deadlocks after backward pass",
+    );
     console.log("when timestamp-query device feature is enabled on V100/Dawn.");
-    console.log("\nRun without TORCHLETTE_PROFILE=1 to verify the control case works.");
+    console.log(
+      "\nRun without TORCHLETTE_PROFILE=1 to verify the control case works.",
+    );
   } else if (fwdResult === "OK" && bwdResult === "OK" && optResult === "OK") {
     if (PROFILING) {
-      console.log("\nBug did NOT reproduce (all fences OK with timestamp-query).");
+      console.log(
+        "\nBug did NOT reproduce (all fences OK with timestamp-query).",
+      );
     } else {
       console.log("\nControl case: all fences work without timestamp-query.");
     }
@@ -218,4 +244,7 @@ async function main() {
   process.exit(bwdResult === "OK" ? 0 : 1);
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

@@ -15,7 +15,10 @@
 
 import { describe, expect, it } from "vitest";
 import { compileTileKernel } from "../../src/backend/webgpu/tile-compiler";
-import { type TileKernelSpec, elementwiseGrid } from "../../src/backend/webgpu/tile-ir";
+import {
+  elementwiseGrid,
+  type TileKernelSpec,
+} from "../../src/backend/webgpu/tile-ir";
 
 const WG = 64;
 

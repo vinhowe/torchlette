@@ -5,53 +5,47 @@
  * For internal-only symbols, import directly from the source module.
  */
 
-// ── Types, interfaces, ref constructors, type guards ──────────────────────────
-export type {
-  LazyOpCode,
-  StorageHandle,
-  LazyIRNode,
-  LazyRef,
-  ExecutionPlan,
-} from "./lazy-types";
+// ── Lowered plan executor ─────────────────────────────────────────────────────
+export { executeLoweredPlan } from "./executor-lowered";
+// ── Optimized executor ────────────────────────────────────────────────────────
+export type { OptimizedExecutionStats } from "./executor-optimized";
 export {
-  createPendingRef,
-  createMaterializedRef,
-  createScalarRef,
-  isPending,
-  isMaterialized,
-} from "./lazy-types";
-
-// ── Node and storage factories ────────────────────────────────────────────────
-export {
-  resetNodeIdCounter,
-  createLazyIRNode,
-  resetStorageIdCounter,
-  createStorageHandle,
-} from "./node-factory";
-
-// ── Storage tracking ──────────────────────────────────────────────────────────
-export { storageTracker } from "./storage-tracker";
-
-// ── Plan building ─────────────────────────────────────────────────────────────
-export {
-  markAsCheckpointBoundary,
-  buildPlan,
-  buildMergedPlan,
-} from "./plan-builder";
-
+  executePlanOptimized,
+  getFusionAnalysisTemplate,
+} from "./executor-optimized";
 // ── Sequential executor ───────────────────────────────────────────────────────
 export {
   executePlan,
   executePlanWithCheckpointSegments,
   executePlanWithTrueSegments,
 } from "./executor-sequential";
-
-// ── Optimized executor ────────────────────────────────────────────────────────
-export type { OptimizedExecutionStats } from "./executor-optimized";
+// ── Types, interfaces, ref constructors, type guards ──────────────────────────
+export type {
+  ExecutionPlan,
+  LazyIRNode,
+  LazyOpCode,
+  LazyRef,
+  StorageHandle,
+} from "./lazy-types";
 export {
-  getFusionAnalysisTemplate,
-  executePlanOptimized,
-} from "./executor-optimized";
-
-// ── Lowered plan executor ─────────────────────────────────────────────────────
-export { executeLoweredPlan } from "./executor-lowered";
+  createMaterializedRef,
+  createPendingRef,
+  createScalarRef,
+  isMaterialized,
+  isPending,
+} from "./lazy-types";
+// ── Node and storage factories ────────────────────────────────────────────────
+export {
+  createLazyIRNode,
+  createStorageHandle,
+  resetNodeIdCounter,
+  resetStorageIdCounter,
+} from "./node-factory";
+// ── Plan building ─────────────────────────────────────────────────────────────
+export {
+  buildMergedPlan,
+  buildPlan,
+  markAsCheckpointBoundary,
+} from "./plan-builder";
+// ── Storage tracking ──────────────────────────────────────────────────────────
+export { storageTracker } from "./storage-tracker";

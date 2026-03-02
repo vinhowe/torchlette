@@ -9,7 +9,7 @@
  *    Used by gather/scatterAdd.
  */
 
-import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM, gcd } from "./shape-utils";
+import { gcd, MAX_WORKGROUPS_PER_DIM, WORKGROUP_SIZE } from "./shape-utils";
 
 // ============================================================================
 // Types
@@ -45,10 +45,9 @@ export function computeFlatChunkLayout(
   minAlignment: number,
   elementsPerAlignment?: number,
 ): FlatChunkLayout {
-  const epa = elementsPerAlignment ?? (minAlignment / maxBytesPerElement);
+  const epa = elementsPerAlignment ?? minAlignment / maxBytesPerElement;
   const maxElementsPerChunk = Math.floor(maxBindingSize / maxBytesPerElement);
-  const elementsPerChunk =
-    Math.floor(maxElementsPerChunk / epa) * epa;
+  const elementsPerChunk = Math.floor(maxElementsPerChunk / epa) * epa;
 
   const numChunks = Math.ceil(totalElements / elementsPerChunk);
 
@@ -100,7 +99,8 @@ export function computeDimChunkLayout(
   // (slicesPerChunk * bytesPerSlice) is always aligned.
   if (bytesPerSlice % minAlignment !== 0) {
     const slicesForAlignment = minAlignment / gcd(bytesPerSlice, minAlignment);
-    maxSlicesPerChunk = Math.floor(maxSlicesPerChunk / slicesForAlignment) * slicesForAlignment;
+    maxSlicesPerChunk =
+      Math.floor(maxSlicesPerChunk / slicesForAlignment) * slicesForAlignment;
     if (maxSlicesPerChunk === 0) {
       maxSlicesPerChunk = slicesForAlignment; // At least one aligned group
     }

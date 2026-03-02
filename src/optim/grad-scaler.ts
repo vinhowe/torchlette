@@ -27,11 +27,12 @@
  * }
  * ```
  */
+
+import type { Backend, DeviceKind } from "../backend/types";
+import { createLazyIRNode, createPendingRef } from "../engine/lazy";
 import type { Tensor, Torchlette } from "../frontend";
 import type { Adam } from "./adam";
 import type { SGD } from "./sgd";
-import { createLazyIRNode, createPendingRef } from "../engine/lazy";
-import type { Backend, DeviceKind } from "../backend/types";
 
 export type Optimizer = Adam | SGD;
 
@@ -142,7 +143,9 @@ export class GradScaler {
       // In the normal training loop, markStep() is called before resolveDeferred(),
       // but we handle the case where it wasn't called explicitly.
       await this.api.markStep();
-      const val = await this._pendingInfBackend!.ops.readAndDestroyInfCount!(this._pendingInfBuffer);
+      const val = await this._pendingInfBackend?.ops.readAndDestroyInfCount?.(
+        this._pendingInfBuffer,
+      );
       this._foundInfThisStep = val > 0.5;
       this._pendingInfBuffer = null;
       this._pendingInfBackend = null;
@@ -210,7 +213,10 @@ export class GradScaler {
     // Determine device from first param with a grad
     let device: DeviceKind = "cpu";
     for (const p of params) {
-      if (p.grad) { device = p.device; break; }
+      if (p.grad) {
+        device = p.device;
+        break;
+      }
     }
 
     const backend = runtime.getBackend(device);
@@ -223,7 +229,7 @@ export class GradScaler {
       isFusedOptimizer(optimizer) &&
       optimizer.hasFusedKernel()
     ) {
-      const infFlagBuffer = backend.ops.createInfCountBuffer!();
+      const infFlagBuffer = backend.ops.createInfCountBuffer?.();
       optimizer.setUnscaleConfig(invScale, infFlagBuffer);
       this._pendingInfBuffer = infFlagBuffer;
       this._pendingInfBackend = backend;
@@ -247,7 +253,7 @@ export class GradScaler {
     backend: Backend,
     device: DeviceKind,
   ): void {
-    const infFlagBuffer = backend.ops.createInfCountBuffer!();
+    const infFlagBuffer = backend.ops.createInfCountBuffer?.();
     const sharedPayload = { invScale, infFlagBuffer };
 
     for (const param of params) {

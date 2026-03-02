@@ -304,7 +304,11 @@ let tensorDisposedCount = 0;
 let tensorMaterializedCount = 0;
 
 export function getTensorDebugStats() {
-  return { created: tensorCreatedCount, disposed: tensorDisposedCount, materialized: tensorMaterializedCount };
+  return {
+    created: tensorCreatedCount,
+    disposed: tensorDisposedCount,
+    materialized: tensorMaterializedCount,
+  };
 }
 
 export function resetTensorDebugStats() {

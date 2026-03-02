@@ -14,28 +14,34 @@
  * which are lowered to scalar/vec4 WGSL before imperative emission.
  */
 
+import { getSubgroupSupport } from "./matmul/types";
+import { computeSafeVecWidth } from "./tile-access-analysis";
 import type {
-  IRNode, TileKernelSpec,
+  IRNode,
   Statement,
   ThreadIdxNode,
+  TileKernelSpec,
 } from "./tile-ir";
-import { buildKernelIR, type KernelContext, elementwiseGrid } from "./tile-ir";
-import { computeSafeVecWidth } from "./tile-access-analysis";
-import { getSubgroupSupport } from "./matmul/types";
+import { buildKernelIR, elementwiseGrid, type KernelContext } from "./tile-ir";
 import {
+  autoDetectTPR,
+  computeBlockLayouts,
   freshVar,
-  resetLoweringState,
-  setTPR,
-  setBlockLayouts,
   getActiveTPR,
   hasTileStatements,
   lowerTileStatements,
-  autoDetectTPR,
-  computeBlockLayouts,
+  resetLoweringState,
+  setBlockLayouts,
+  setTPR,
 } from "./tile-lowering";
 
 /** Well-known uniform names that represent element counts for elementwise kernels. */
-const ELEMENTWISE_UNIFORMS = new Set(["size", "total_elements", "num_elements", "outSize"]);
+const ELEMENTWISE_UNIFORMS = new Set([
+  "size",
+  "total_elements",
+  "num_elements",
+  "outSize",
+]);
 
 /** Find a u32 uniform that represents the element count, if any. */
 function findElementwiseUniform(spec: TileKernelSpec): string | null {
@@ -44,7 +50,6 @@ function findElementwiseUniform(spec: TileKernelSpec): string | null {
   }
   return null;
 }
-
 
 // ============================================================================
 // WGSL Expression Emission
@@ -71,11 +76,14 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
     case "const": {
       if (node.dataType === "f32") {
         const s = String(node.value);
-        return s.includes(".") || s.includes("e") || s.includes("E") ? s : s + ".0";
+        return s.includes(".") || s.includes("e") || s.includes("E")
+          ? s
+          : s + ".0";
       }
       if (node.dataType === "f16") {
         const s = String(node.value);
-        const numStr = s.includes(".") || s.includes("e") || s.includes("E") ? s : s + ".0";
+        const numStr =
+          s.includes(".") || s.includes("e") || s.includes("E") ? s : s + ".0";
         return `f16(${numStr})`;
       }
       if (node.dataType === "u32") return `${node.value}u`;
@@ -89,33 +97,65 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
       const lhs = exprFor(node.lhs, bindings);
       const rhs = exprFor(node.rhs, bindings);
       switch (node.op) {
-        case "add": return `(${lhs} + ${rhs})`;
-        case "sub": return `(${lhs} - ${rhs})`;
-        case "mul": return `(${lhs} * ${rhs})`;
-        case "div": return `(${lhs} / ${rhs})`;
-        case "mod": return `(${lhs} % ${rhs})`;
-        case "and": return `(${lhs} & ${rhs})`;
-        case "or": return `(${lhs} | ${rhs})`;
-        case "xor": return `(${lhs} ^ ${rhs})`;
-        case "shr": return `(${lhs} >> ${rhs})`;
-        case "shl": return `(${lhs} << ${rhs})`;
-        case "min": return `min(${lhs}, ${rhs})`;
-        case "max": return `max(${lhs}, ${rhs})`;
-        case "pow": return `pow(${lhs}, ${rhs})`;
+        case "add":
+          return `(${lhs} + ${rhs})`;
+        case "sub":
+          return `(${lhs} - ${rhs})`;
+        case "mul":
+          return `(${lhs} * ${rhs})`;
+        case "div":
+          return `(${lhs} / ${rhs})`;
+        case "mod":
+          return `(${lhs} % ${rhs})`;
+        case "and":
+          return `(${lhs} & ${rhs})`;
+        case "or":
+          return `(${lhs} | ${rhs})`;
+        case "xor":
+          return `(${lhs} ^ ${rhs})`;
+        case "shr":
+          return `(${lhs} >> ${rhs})`;
+        case "shl":
+          return `(${lhs} << ${rhs})`;
+        case "min":
+          return `min(${lhs}, ${rhs})`;
+        case "max":
+          return `max(${lhs}, ${rhs})`;
+        case "pow":
+          return `pow(${lhs}, ${rhs})`;
       }
       break;
     }
     case "unary": {
       const input = exprFor(node.input, bindings);
       switch (node.op) {
-        case "neg": return `(-${input})`;
-        case "rsqrt": return `inverseSqrt(${input})`;
-        case "tanh": return `tanh(${input})`;
-        case "floor": return `floor(${input})`;
-        case "ceil": return `ceil(${input})`;
-        case "not": return `!(${input})`;
+        case "neg":
+          return `(-${input})`;
+        case "rsqrt":
+          return `inverseSqrt(${input})`;
+        case "tanh":
+          return `tanh(${input})`;
+        case "floor":
+          return `floor(${input})`;
+        case "ceil":
+          return `ceil(${input})`;
+        case "not":
+          return `!(${input})`;
         default: {
-          const fn = ({ exp: "exp", log: "log", abs: "abs", sqrt: "sqrt", sin: "sin", cos: "cos", round: "round", sign: "sign", exp2: "exp2", log2: "log2" } as const)[node.op];
+          const fn = (
+            {
+              exp: "exp",
+              log: "log",
+              abs: "abs",
+              sqrt: "sqrt",
+              sin: "sin",
+              cos: "cos",
+              round: "round",
+              sign: "sign",
+              exp2: "exp2",
+              log2: "log2",
+            } as const
+          )[node.op];
           return `${fn}(${input})`;
         }
       }
@@ -137,7 +177,9 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
     case "cmp": {
       const lhs = exprFor(node.lhs, bindings);
       const rhs = exprFor(node.rhs, bindings);
-      const op = ({ eq: "==", ne: "!=", lt: "<", le: "<=", gt: ">", ge: ">=" } as const)[node.op];
+      const op = (
+        { eq: "==", ne: "!=", lt: "<", le: "<=", gt: ">", ge: ">=" } as const
+      )[node.op];
       return `(${lhs} ${op} ${rhs})`;
     }
     // -- Imperative mode nodes --
@@ -147,7 +189,10 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
     case "localIndex": {
       return getActiveTPR() > 1 ? "_logical_idx" : "local_idx";
     }
-    case "sharedRead": case "arrayRead": case "vec4ArrayRead": case "vec4SharedRead": {
+    case "sharedRead":
+    case "arrayRead":
+    case "vec4ArrayRead":
+    case "vec4SharedRead": {
       return `${node.arrayName}[${exprFor(node.idx, bindings)}]`;
     }
     case "namedRef": {
@@ -164,13 +209,16 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
       const mask = exprFor(node.mask, bindings);
       return `subgroupShuffleXor(${val}, ${mask})`;
     }
-    case "subgroupAdd": case "subgroupMax": case "subgroupMin":
-    case "subgroupBroadcastFirst": case "subgroupInclusiveAdd": {
+    case "subgroupAdd":
+    case "subgroupMax":
+    case "subgroupMin":
+    case "subgroupBroadcastFirst":
+    case "subgroupInclusiveAdd": {
       return `${node.kind}(${exprFor(node.value, bindings)})`;
     }
     case "vec4dot": {
-      const a = node.a.map(n => exprFor(n, bindings));
-      const b = node.b.map(n => exprFor(n, bindings));
+      const a = node.a.map((n) => exprFor(n, bindings));
+      const b = node.b.map((n) => exprFor(n, bindings));
       return `dot(vec4<f32>(${a.join(", ")}), vec4<f32>(${b.join(", ")}))`;
     }
     // -- Vec4 native nodes --
@@ -222,16 +270,28 @@ export function compileTileKernel(spec: TileKernelSpec): string {
   // 0. Auto vec-width selection: if vectorize is "auto", use access analysis.
   //    Works with both globalId(0) and flatGlobalId() kernels. The access
   //    analysis recognizes tagged flatGlobalId nodes as stride-1 coalesced.
-  if ((spec as any).vectorize === "auto" || (spec.vectorize === undefined && (spec as any).autoVectorize)) {
+  if (
+    (spec as any).vectorize === "auto" ||
+    (spec.vectorize === undefined && (spec as any).autoVectorize)
+  ) {
     const safeWidth = computeSafeVecWidth(spec);
     if (safeWidth > 1) {
-      const wgSize = typeof spec.workgroupSize === "number"
-        ? spec.workgroupSize : spec.workgroupSize[0] * spec.workgroupSize[1];
+      const wgSize =
+        typeof spec.workgroupSize === "number"
+          ? spec.workgroupSize
+          : spec.workgroupSize[0] * spec.workgroupSize[1];
       const elementUniform = findElementwiseUniform(spec);
       spec = {
         ...spec,
         vectorize: safeWidth,
-        ...(elementUniform ? { grid: elementwiseGrid(wgSize, { vecWidth: safeWidth, elementUniform }) } : {}),
+        ...(elementUniform
+          ? {
+              grid: elementwiseGrid(wgSize, {
+                vecWidth: safeWidth,
+                elementUniform,
+              }),
+            }
+          : {}),
       };
     }
   }
@@ -240,7 +300,9 @@ export function compileTileKernel(spec: TileKernelSpec): string {
   const sgSupport = getSubgroupSupport();
   const sgSize = spec.enableSubgroups
     ? (sgSupport?.subgroupSize ?? 32)
-    : (sgSupport?.supported ? (sgSupport.subgroupSize ?? 32) : 0);
+    : sgSupport?.supported
+      ? (sgSupport.subgroupSize ?? 32)
+      : 0;
 
   // 1. Build the IR DAG (includes constant folding + CSE in makeNode)
   const ctx = buildKernelIR(spec, sgSize);
@@ -261,9 +323,21 @@ export function compileTileKernel(spec: TileKernelSpec): string {
     }
 
     // Auto-emit thread_row/thread_col if not present (tile lowering needs them)
-    if (!stmts.some(s => s.kind === "let" && s.name === "thread_row")) {
-      const threadRowNode: ThreadIdxNode = { id: -1, kind: "threadIdx", dim: 1, valueType: "scalar", dataType: "u32" };
-      const threadColNode: ThreadIdxNode = { id: -1, kind: "threadIdx", dim: 0, valueType: "scalar", dataType: "u32" };
+    if (!stmts.some((s) => s.kind === "let" && s.name === "thread_row")) {
+      const threadRowNode: ThreadIdxNode = {
+        id: -1,
+        kind: "threadIdx",
+        dim: 1,
+        valueType: "scalar",
+        dataType: "u32",
+      };
+      const threadColNode: ThreadIdxNode = {
+        id: -1,
+        kind: "threadIdx",
+        dim: 0,
+        valueType: "scalar",
+        dataType: "u32",
+      };
       stmts = [
         { kind: "let", name: "thread_row", dtype: "u32", value: threadRowNode },
         { kind: "let", name: "thread_col", dtype: "u32", value: threadColNode },
@@ -294,13 +368,15 @@ export function compileTileKernel(spec: TileKernelSpec): string {
   }
 }
 
-
-
 // ============================================================================
 // Imperative Compiler (new)
 // ============================================================================
 
-function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overrideStatements?: Statement[]): string {
+function compileImperativeKernel(
+  spec: TileKernelSpec,
+  ctx: KernelContext,
+  overrideStatements?: Statement[],
+): string {
   const lines: string[] = [];
 
   // Feature enables
@@ -328,7 +404,8 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
   for (const sa of ctx.vec4SharedArrays) {
     lines.push(`var<workgroup> ${sa.name}: array<vec4<f32>, ${sa.size}>;`);
   }
-  if (ctx.sharedArrays.length > 0 || ctx.vec4SharedArrays.length > 0) lines.push("");
+  if (ctx.sharedArrays.length > 0 || ctx.vec4SharedArrays.length > 0)
+    lines.push("");
 
   // Constants
   if (spec.constants) {
@@ -338,7 +415,8 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
         lines.push(`const ${name}: u32 = ${value}u;`);
       } else {
         const s = String(value);
-        const numStr = s.includes(".") || s.includes("e") || s.includes("E") ? s : s + ".0";
+        const numStr =
+          s.includes(".") || s.includes("e") || s.includes("E") ? s : s + ".0";
         lines.push(`const ${name}: f32 = ${numStr};`);
       }
     }
@@ -346,21 +424,33 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
   }
 
   // Function signature — physical WG size = logical × TPR
-  const [logicalWgX, wgY] = typeof spec.workgroupSize === "number"
-    ? [spec.workgroupSize, 1]
-    : spec.workgroupSize;
+  const [logicalWgX, wgY] =
+    typeof spec.workgroupSize === "number"
+      ? [spec.workgroupSize, 1]
+      : spec.workgroupSize;
   const wgX = logicalWgX * getActiveTPR();
 
   // Scan nodes to determine which builtins are actually used
-  const hasFlatGidVec = (spec.vectorize ?? 0) > 1 && ctx.flatGlobalIdNodeIds.length > 0;
-  const needsGid = ctx.nodes.some(n => n.kind === "globalId");
-  const needsWid = ctx.nodes.some(n => n.kind === "programId") || hasFlatGidVec;
-  const needsLocalId = ctx.nodes.some(n => n.kind === "threadIdx");
-  const needsLocalIdx = ctx.nodes.some(n => n.kind === "localIndex") || hasFlatGidVec;
-  const needsNumWg = ctx.nodes.some(n => n.kind === "numWorkgroups") || hasFlatGidVec;
+  const hasFlatGidVec =
+    (spec.vectorize ?? 0) > 1 && ctx.flatGlobalIdNodeIds.length > 0;
+  const needsGid = ctx.nodes.some((n) => n.kind === "globalId");
+  const needsWid =
+    ctx.nodes.some((n) => n.kind === "programId") || hasFlatGidVec;
+  const needsLocalId = ctx.nodes.some((n) => n.kind === "threadIdx");
+  const needsLocalIdx =
+    ctx.nodes.some((n) => n.kind === "localIndex") || hasFlatGidVec;
+  const needsNumWg =
+    ctx.nodes.some((n) => n.kind === "numWorkgroups") || hasFlatGidVec;
   // Shared arrays and tile-level stmts require local_id/local_idx even if not explicitly referenced
-  const hasTileOps = ctx.sharedArrays.length > 0 || ctx.vec4SharedArrays.length > 0 ||
-    ctx.statements.some(s => s.kind === "tileLoad" || s.kind === "tileStore" || s.kind === "tileLoad1d");
+  const hasTileOps =
+    ctx.sharedArrays.length > 0 ||
+    ctx.vec4SharedArrays.length > 0 ||
+    ctx.statements.some(
+      (s) =>
+        s.kind === "tileLoad" ||
+        s.kind === "tileStore" ||
+        s.kind === "tileLoad1d",
+    );
   const emitWid = needsWid || hasTileOps;
   const emitLocalId = needsLocalId || hasTileOps;
   const emitLocalIdx = needsLocalIdx || hasTileOps;
@@ -368,10 +458,12 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
   lines.push(`@compute @workgroup_size(${wgX}, ${wgY})`);
   lines.push(`fn main(`);
   const params: string[] = [];
-  if (needsGid)    params.push(`  @builtin(global_invocation_id) gid: vec3<u32>`);
-  if (emitWid)     params.push(`  @builtin(workgroup_id) wid: vec3<u32>`);
-  if (emitLocalId) params.push(`  @builtin(local_invocation_id) local_id: vec3<u32>`);
-  if (emitLocalIdx) params.push(`  @builtin(local_invocation_index) local_idx: u32`);
+  if (needsGid) params.push(`  @builtin(global_invocation_id) gid: vec3<u32>`);
+  if (emitWid) params.push(`  @builtin(workgroup_id) wid: vec3<u32>`);
+  if (emitLocalId)
+    params.push(`  @builtin(local_invocation_id) local_id: vec3<u32>`);
+  if (emitLocalIdx)
+    params.push(`  @builtin(local_invocation_index) local_idx: u32`);
   if (needsNumWg) params.push(`  @builtin(num_workgroups) num_wg: vec3<u32>`);
   lines.push(params.join(",\n") + (params.length > 0 ? "," : ""));
   lines.push(`) {`);
@@ -388,9 +480,13 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
     if (flatGidNodeIds.length > 0) {
       // flatGlobalId path: compute base from workgroup + local index
       // _flatBase = (wid.x + wid.y * num_wg.x) * (WG * VEC) + local_idx * VEC
-      const wgTotal = typeof spec.workgroupSize === "number"
-        ? spec.workgroupSize : spec.workgroupSize[0] * spec.workgroupSize[1];
-      lines.push(`  let _flatBase = (wid.x + wid.y * num_wg.x) * ${wgTotal * vecWidth}u + local_idx * ${vecWidth}u;`);
+      const wgTotal =
+        typeof spec.workgroupSize === "number"
+          ? spec.workgroupSize
+          : spec.workgroupSize[0] * spec.workgroupSize[1];
+      lines.push(
+        `  let _flatBase = (wid.x + wid.y * num_wg.x) * ${wgTotal * vecWidth}u + local_idx * ${vecWidth}u;`,
+      );
 
       for (let v = 0; v < vecWidth; v++) {
         lines.push(`  // vec element ${v}`);
@@ -406,7 +502,9 @@ function compileImperativeKernel(spec: TileKernelSpec, ctx: KernelContext, overr
       }
     } else {
       // globalId(0) path: compute base from gid.x
-      const gidXNodes = ctx.nodes.filter(n => n.kind === "globalId" && n.dim === 0);
+      const gidXNodes = ctx.nodes.filter(
+        (n) => n.kind === "globalId" && n.dim === 0,
+      );
       lines.push(`  let _base = gid.x * ${vecWidth}u;`);
 
       for (let v = 0; v < vecWidth; v++) {
@@ -448,14 +546,21 @@ function isStaticTrue(node: IRNode): boolean {
   if (node.kind === "cmp") {
     const { op, lhs, rhs } = node;
     if (lhs.kind === "const" && rhs.kind === "const") {
-      const l = lhs.value, r = rhs.value;
+      const l = lhs.value,
+        r = rhs.value;
       switch (op) {
-        case "eq": return l === r;
-        case "ne": return l !== r;
-        case "lt": return l < r;
-        case "le": return l <= r;
-        case "gt": return l > r;
-        case "ge": return l >= r;
+        case "eq":
+          return l === r;
+        case "ne":
+          return l !== r;
+        case "lt":
+          return l < r;
+        case "le":
+          return l <= r;
+        case "gt":
+          return l > r;
+        case "ge":
+          return l >= r;
       }
     }
   }
@@ -496,16 +601,25 @@ function emitStatement(
       break;
     }
     case "varArray": {
-      lines.push(`${indent}var ${stmt.name}: array<${stmt.elemType}, ${stmt.size}>;`);
+      lines.push(
+        `${indent}var ${stmt.name}: array<${stmt.elemType}, ${stmt.size}>;`,
+      );
       if (!stmt.skipZeroInit) {
-        const zero = stmt.elemType === "f32" ? "0.0" : stmt.elemType === "f16" ? "f16(0.0)" : "0u";
+        const zero =
+          stmt.elemType === "f32"
+            ? "0.0"
+            : stmt.elemType === "f16"
+              ? "f16(0.0)"
+              : "0u";
         if (stmt.size <= 16) {
           // Unroll zero-init for small arrays
           for (let i = 0; i < stmt.size; i++) {
             lines.push(`${indent}${stmt.name}[${i}u] = ${zero};`);
           }
         } else {
-          lines.push(`${indent}for (var _zi = 0u; _zi < ${stmt.size}u; _zi = _zi + 1u) {`);
+          lines.push(
+            `${indent}for (var _zi = 0u; _zi < ${stmt.size}u; _zi = _zi + 1u) {`,
+          );
           lines.push(`${indent}  ${stmt.name}[_zi] = ${zero};`);
           lines.push(`${indent}}`);
         }
@@ -522,24 +636,34 @@ function emitStatement(
       lines.push(`${indent}${stmt.name} = ${stmt.name} + ${val};`);
       break;
     }
-    case "indexAssign": case "sharedWrite": case "vec4ArrayWrite": {
+    case "indexAssign":
+    case "sharedWrite":
+    case "vec4ArrayWrite": {
       const idx = exprFor(stmt.idx, bindings);
       const val = exprFor(stmt.value, bindings);
       lines.push(`${indent}${stmt.arrayName}[${idx}] = ${val};`);
       break;
     }
-    case "indexAddAssign": case "vec4ArrayAddAssign": {
+    case "indexAddAssign":
+    case "vec4ArrayAddAssign": {
       const idx = exprFor(stmt.idx, bindings);
       const val = exprFor(stmt.value, bindings);
-      lines.push(`${indent}${stmt.arrayName}[${idx}] = ${stmt.arrayName}[${idx}] + ${val};`);
+      lines.push(
+        `${indent}${stmt.arrayName}[${idx}] = ${stmt.arrayName}[${idx}] + ${val};`,
+      );
       break;
     }
     case "forRange": {
       // Check if we can unroll: both start and bound must be ConstNode
       const startConst = stmt.start.kind === "const" ? stmt.start.value : null;
       const boundConst = stmt.bound.kind === "const" ? stmt.bound.value : null;
-      const tripCount = startConst !== null && boundConst !== null ? boundConst - startConst : null;
-      const shouldUnroll = tripCount !== null && tripCount >= 0 &&
+      const tripCount =
+        startConst !== null && boundConst !== null
+          ? boundConst - startConst
+          : null;
+      const shouldUnroll =
+        tripCount !== null &&
+        tripCount >= 0 &&
         (stmt.unroll === true || tripCount <= 16);
 
       if (shouldUnroll && tripCount !== null && startConst !== null) {
@@ -557,7 +681,9 @@ function emitStatement(
       } else {
         const start = exprFor(stmt.start, bindings);
         const bound = exprFor(stmt.bound, bindings);
-        lines.push(`${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + 1u) {`);
+        lines.push(
+          `${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + 1u) {`,
+        );
         const childBindings = new Map(bindings);
         for (const s of stmt.body) {
           emitStatement(s, childBindings, lines, depth + 1);
@@ -594,10 +720,14 @@ function emitStatement(
       // Max trips = ceil(bound / stride) (assuming start ∈ [0, stride)).
       if (startConst === null && boundConst !== null && strideVal > 0) {
         const maxTrips = Math.ceil(boundConst / strideVal);
-        if (maxTrips >= 1 && (stmt.unroll === true ? maxTrips <= 16 : maxTrips <= 8)) {
+        if (
+          maxTrips >= 1 &&
+          (stmt.unroll === true ? maxTrips <= 16 : maxTrips <= 8)
+        ) {
           const startExpr = exprFor(stmt.start, bindings);
           for (let i = 0; i < maxTrips; i++) {
-            const ivExpr = i === 0 ? startExpr : `(${startExpr} + ${i * strideVal}u)`;
+            const ivExpr =
+              i === 0 ? startExpr : `(${startExpr} + ${i * strideVal}u)`;
             lines.push(`${indent}{ // unrolled iter ${i}`);
             lines.push(`${indent}  let ${stmt.varName} = ${ivExpr};`);
             // Guard: skip check on first iteration when bound is a multiple of stride
@@ -625,7 +755,9 @@ function emitStatement(
       {
         const start = exprFor(stmt.start, bindings);
         const bound = exprFor(stmt.bound, bindings);
-        lines.push(`${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + ${strideVal}u) {`);
+        lines.push(
+          `${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + ${strideVal}u) {`,
+        );
         const childBindings = new Map(bindings);
         for (const s of stmt.body) {
           emitStatement(s, childBindings, lines, depth + 1);
@@ -719,16 +851,22 @@ function emitStatement(
         xor: "atomicXor",
         exchange: "atomicExchange",
       };
-      lines.push(`${indent}${fnName[stmt.op]}(&${stmt.binding}[${idx}], ${val});`);
+      lines.push(
+        `${indent}${fnName[stmt.op]}(&${stmt.binding}[${idx}], ${val});`,
+      );
       break;
     }
     case "atomicCAS": {
       const idx = exprFor(stmt.idx, bindings);
       const exp = exprFor(stmt.expected, bindings);
       const des = exprFor(stmt.desired, bindings);
-      lines.push(`${indent}let _cas_result = atomicCompareExchangeWeak(&${stmt.binding}[${idx}], ${exp}, ${des});`);
+      lines.push(
+        `${indent}let _cas_result = atomicCompareExchangeWeak(&${stmt.binding}[${idx}], ${exp}, ${des});`,
+      );
       lines.push(`${indent}let ${stmt.oldValueVar} = _cas_result.old_value;`);
-      lines.push(`${indent}let ${stmt.exchangedVar} = select(0u, 1u, _cas_result.exchanged);`);
+      lines.push(
+        `${indent}let ${stmt.exchangedVar} = select(0u, 1u, _cas_result.exchanged);`,
+      );
       break;
     }
     case "return": {
@@ -748,51 +886,104 @@ function emitStatement(
  */
 function someExprChild(node: IRNode, fn: (child: IRNode) => boolean): boolean {
   switch (node.kind) {
-    case "binary": case "cmp":
+    case "binary":
+    case "cmp":
       return fn(node.lhs) || fn(node.rhs);
-    case "unary": case "cast": case "bitcast":
+    case "unary":
+    case "cast":
+    case "bitcast":
       return fn((node as any).input);
     case "select":
       return fn(node.condition) || fn(node.trueVal) || fn(node.falseVal);
     case "load":
       return fn(node.offsets) || (node.mask ? fn(node.mask) : false);
-    case "sharedRead": case "arrayRead": case "vec4ArrayRead": case "vec4SharedRead":
+    case "sharedRead":
+    case "arrayRead":
+    case "vec4ArrayRead":
+    case "vec4SharedRead":
       return fn(node.idx);
     case "subgroupShuffleXor":
       return fn(node.value) || fn(node.mask);
-    case "subgroupAdd": case "subgroupMax": case "subgroupMin":
-    case "subgroupBroadcastFirst": case "subgroupInclusiveAdd":
-    case "vec4Splat": case "vec4Component":
+    case "subgroupAdd":
+    case "subgroupMax":
+    case "subgroupMin":
+    case "subgroupBroadcastFirst":
+    case "subgroupInclusiveAdd":
+    case "vec4Splat":
+    case "vec4Component":
       return fn(node.value);
     case "vec4Construct":
       return fn(node.x) || fn(node.y) || fn(node.z) || fn(node.w);
-    case "vec4NativeDot": case "vec4Binary":
+    case "vec4NativeDot":
+    case "vec4Binary":
       return fn(node.a) || fn(node.b);
     case "vec4dot":
       return node.a.some(fn) || node.b.some(fn);
-    default: return false; // leaves: programId, uniform, const, threadIdx, localIndex, globalId, namedRef, numPrograms
+    default:
+      return false; // leaves: programId, uniform, const, threadIdx, localIndex, globalId, namedRef, numPrograms
   }
 }
 
 /** Call fn on each child expression of an IR node. */
 function forEachExprChild(node: IRNode, fn: (child: IRNode) => void): void {
-  someExprChild(node, child => { fn(child); return false; });
+  someExprChild(node, (child) => {
+    fn(child);
+    return false;
+  });
 }
 
 /** Call fn on each IR expression field of a statement (not recursing into bodies). */
 function forEachStmtExpr(stmt: Statement, fn: (expr: IRNode) => void): void {
   switch (stmt.kind) {
-    case "let": case "var": fn(stmt.value); break;
-    case "assign": case "addAssign": fn(stmt.value); break;
-    case "indexAssign": case "indexAddAssign": fn(stmt.idx); fn(stmt.value); break;
-    case "sharedWrite": fn(stmt.idx); fn(stmt.value); break;
-    case "guardedStore": fn(stmt.condition); fn(stmt.idx); fn(stmt.value); break;
-    case "directStore": fn(stmt.idx); fn(stmt.value); break;
-    case "atomicOp": fn(stmt.idx); fn(stmt.value); break;
-    case "atomicCAS": fn(stmt.idx); fn(stmt.expected); fn(stmt.desired); break;
-    case "vec4ArrayWrite": case "vec4ArrayAddAssign": fn(stmt.idx); fn(stmt.value); break;
-    case "forRange": case "forStride": fn(stmt.start); fn(stmt.bound); break;
-    case "if": case "ifElse": fn(stmt.condition); break;
+    case "let":
+    case "var":
+      fn(stmt.value);
+      break;
+    case "assign":
+    case "addAssign":
+      fn(stmt.value);
+      break;
+    case "indexAssign":
+    case "indexAddAssign":
+      fn(stmt.idx);
+      fn(stmt.value);
+      break;
+    case "sharedWrite":
+      fn(stmt.idx);
+      fn(stmt.value);
+      break;
+    case "guardedStore":
+      fn(stmt.condition);
+      fn(stmt.idx);
+      fn(stmt.value);
+      break;
+    case "directStore":
+      fn(stmt.idx);
+      fn(stmt.value);
+      break;
+    case "atomicOp":
+      fn(stmt.idx);
+      fn(stmt.value);
+      break;
+    case "atomicCAS":
+      fn(stmt.idx);
+      fn(stmt.expected);
+      fn(stmt.desired);
+      break;
+    case "vec4ArrayWrite":
+    case "vec4ArrayAddAssign":
+      fn(stmt.idx);
+      fn(stmt.value);
+      break;
+    case "forRange":
+    case "forStride":
+      fn(stmt.start);
+      fn(stmt.bound);
+      break;
+    case "if":
+    case "ifElse":
+      fn(stmt.condition);
+      break;
     // barrier, return, varArray, vec4VarArray, vec4SharedArray: no expressions
   }
 }
@@ -804,13 +995,17 @@ function forEachStmtExpr(stmt: Statement, fn: (expr: IRNode) => void): void {
 /** Collect all namedRef names referenced by an IR expression tree. */
 function collectExprNames(node: IRNode, names: Set<string>): void {
   if (node.kind === "namedRef") names.add(node.name);
-  forEachExprChild(node, child => collectExprNames(child, names));
+  forEachExprChild(node, (child) => collectExprNames(child, names));
 }
 
 /** Collect all namedRef names from all expressions in a statement (recursively into bodies). */
 function collectAllStmtNames(stmt: Statement, names: Set<string>): void {
-  forEachStmtExpr(stmt, e => collectExprNames(e, names));
-  if (stmt.kind === "forRange" || stmt.kind === "forStride" || stmt.kind === "if") {
+  forEachStmtExpr(stmt, (e) => collectExprNames(e, names));
+  if (
+    stmt.kind === "forRange" ||
+    stmt.kind === "forStride" ||
+    stmt.kind === "if"
+  ) {
     for (const s of stmt.body) collectAllStmtNames(s, names);
   } else if (stmt.kind === "ifElse") {
     for (const s of stmt.body) collectAllStmtNames(s, names);
@@ -824,20 +1019,24 @@ function collectAllStmtNames(stmt: Statement, names: Set<string>): void {
 
 /** Collect shared array names read by IR nodes within a statement. */
 function getSharedReadsFromExpr(node: IRNode, names: Set<string>): void {
-  if (node.kind === "sharedRead" || node.kind === "vec4SharedRead") names.add(node.arrayName);
-  forEachExprChild(node, child => getSharedReadsFromExpr(child, names));
+  if (node.kind === "sharedRead" || node.kind === "vec4SharedRead")
+    names.add(node.arrayName);
+  forEachExprChild(node, (child) => getSharedReadsFromExpr(child, names));
 }
 
 /** Get shared array names read by a statement's expressions (not recursing into forRange). */
 function getSharedReadsFromStmt(stmt: Statement): Set<string> {
   const reads = new Set<string>();
-  forEachStmtExpr(stmt, e => getSharedReadsFromExpr(e, reads));
+  forEachStmtExpr(stmt, (e) => getSharedReadsFromExpr(e, reads));
   // Recurse into if/ifElse bodies but not forRange/forStride (separate scope for barrier insertion)
   if (stmt.kind === "if") {
-    for (const s of stmt.body) for (const r of getSharedReadsFromStmt(s)) reads.add(r);
+    for (const s of stmt.body)
+      for (const r of getSharedReadsFromStmt(s)) reads.add(r);
   } else if (stmt.kind === "ifElse") {
-    for (const s of stmt.body) for (const r of getSharedReadsFromStmt(s)) reads.add(r);
-    for (const s of stmt.elseBody) for (const r of getSharedReadsFromStmt(s)) reads.add(r);
+    for (const s of stmt.body)
+      for (const r of getSharedReadsFromStmt(s)) reads.add(r);
+    for (const s of stmt.elseBody)
+      for (const r of getSharedReadsFromStmt(s)) reads.add(r);
   }
   return reads;
 }
@@ -873,7 +1072,7 @@ function getSharedWritesFromStmt(stmt: Statement): Set<string> {
 /** Deeply collect all shared reads from statements, recursing into ALL bodies (including forRange/forStride). */
 function collectAllSharedReads(stmts: Statement[], names: Set<string>): void {
   for (const stmt of stmts) {
-    forEachStmtExpr(stmt, e => getSharedReadsFromExpr(e, names));
+    forEachStmtExpr(stmt, (e) => getSharedReadsFromExpr(e, names));
     if (stmt.kind === "if") {
       collectAllSharedReads(stmt.body, names);
     } else if (stmt.kind === "ifElse") {
@@ -912,7 +1111,10 @@ export function insertBarriers(stmts: Statement[]): Statement[] {
       collectAllSharedReads(stmt.body, loopReads);
       let loopNeedsBarrier = false;
       for (const r of loopReads) {
-        if (dirtyArrays.has(r)) { loopNeedsBarrier = true; break; }
+        if (dirtyArrays.has(r)) {
+          loopNeedsBarrier = true;
+          break;
+        }
       }
       if (loopNeedsBarrier) {
         result.push({ kind: "barrier" });
@@ -1013,7 +1215,9 @@ export function validateBarriers(stmts: Statement[]): string[] {
       const reads = getSharedReadsFromStmt(stmt);
       for (const r of reads) {
         if (dirtyArrays.has(r)) {
-          warnings.push(`Missing barrier: shared array '${r}' written then read without barrier`);
+          warnings.push(
+            `Missing barrier: shared array '${r}' written then read without barrier`,
+          );
           dirtyArrays.clear();
           break;
         }
@@ -1049,19 +1253,34 @@ export function validateBarriers(stmts: Statement[]): string[] {
 function collectModifiedNames(stmts: Statement[], names: Set<string>): void {
   for (const stmt of stmts) {
     switch (stmt.kind) {
-      case "assign": case "addAssign": case "var":
-        names.add(stmt.name); break;
-      case "indexAssign": case "indexAddAssign":
-      case "sharedWrite": case "vec4ArrayWrite": case "vec4ArrayAddAssign":
-        names.add(stmt.arrayName); break;
+      case "assign":
+      case "addAssign":
+      case "var":
+        names.add(stmt.name);
+        break;
+      case "indexAssign":
+      case "indexAddAssign":
+      case "sharedWrite":
+      case "vec4ArrayWrite":
+      case "vec4ArrayAddAssign":
+        names.add(stmt.arrayName);
+        break;
       case "atomicCAS":
-        names.add(stmt.oldValueVar); names.add(stmt.exchangedVar); break;
-      case "forRange": case "forStride":
-        names.add(stmt.varName); collectModifiedNames(stmt.body, names); break;
+        names.add(stmt.oldValueVar);
+        names.add(stmt.exchangedVar);
+        break;
+      case "forRange":
+      case "forStride":
+        names.add(stmt.varName);
+        collectModifiedNames(stmt.body, names);
+        break;
       case "if":
-        collectModifiedNames(stmt.body, names); break;
+        collectModifiedNames(stmt.body, names);
+        break;
       case "ifElse":
-        collectModifiedNames(stmt.body, names); collectModifiedNames(stmt.elseBody, names); break;
+        collectModifiedNames(stmt.body, names);
+        collectModifiedNames(stmt.elseBody, names);
+        break;
     }
   }
 }
@@ -1069,14 +1288,24 @@ function collectModifiedNames(stmts: Statement[], names: Set<string>): void {
 /** Check if an IR expression depends on any of the given names (namedRef references). */
 function exprDependsOn(node: IRNode, names: Set<string>): boolean {
   switch (node.kind) {
-    case "namedRef": return names.has(node.name);
-    case "load": return true; // global loads always variant
-    case "sharedRead": case "vec4SharedRead":
-      return names.has(node.arrayName) || someExprChild(node, c => exprDependsOn(c, names));
-    case "arrayRead": case "vec4ArrayRead":
-      return names.has(node.arrayName) || someExprChild(node, c => exprDependsOn(c, names));
+    case "namedRef":
+      return names.has(node.name);
+    case "load":
+      return true; // global loads always variant
+    case "sharedRead":
+    case "vec4SharedRead":
+      return (
+        names.has(node.arrayName) ||
+        someExprChild(node, (c) => exprDependsOn(c, names))
+      );
+    case "arrayRead":
+    case "vec4ArrayRead":
+      return (
+        names.has(node.arrayName) ||
+        someExprChild(node, (c) => exprDependsOn(c, names))
+      );
     default:
-      return someExprChild(node, c => exprDependsOn(c, names));
+      return someExprChild(node, (c) => exprDependsOn(c, names));
   }
 }
 
@@ -1121,9 +1350,12 @@ export function hoistLoopInvariants(stmts: Statement[]): Statement[] {
           continue;
         }
 
-        if (s.kind === "let" && !seenBarrier &&
-            !exprDependsOn(s.value, variantNames) &&
-            !exprContainsLoad(s.value)) {
+        if (
+          s.kind === "let" &&
+          !seenBarrier &&
+          !exprDependsOn(s.value, variantNames) &&
+          !exprContainsLoad(s.value)
+        ) {
           hoisted.push(s);
         } else {
           // If a let is NOT hoisted, mark its name as variant so subsequent
@@ -1137,7 +1369,10 @@ export function hoistLoopInvariants(stmts: Statement[]): Statement[] {
       result.push(...hoisted);
       result.push({ ...stmt, body: remaining } as Statement);
     } else if (stmt.kind === "if") {
-      result.push({ ...stmt, body: hoistLoopInvariants(stmt.body) } as Statement);
+      result.push({
+        ...stmt,
+        body: hoistLoopInvariants(stmt.body),
+      } as Statement);
     } else if (stmt.kind === "ifElse") {
       result.push({
         ...stmt,
@@ -1157,12 +1392,24 @@ export function hoistLoopInvariants(stmts: Statement[]): Statement[] {
 // ============================================================================
 
 /** Map a function over all nested bodies (forRange, forStride, if, ifElse). */
-function mapStmtBodies(stmts: Statement[], fn: (body: Statement[]) => Statement[]): Statement[] {
-  return stmts.map(s => {
+function mapStmtBodies(
+  stmts: Statement[],
+  fn: (body: Statement[]) => Statement[],
+): Statement[] {
+  return stmts.map((s) => {
     switch (s.kind) {
-      case "forRange": case "forStride": case "if": return { ...s, body: fn(s.body) } as Statement;
-      case "ifElse": return { ...s, body: fn(s.body), elseBody: fn(s.elseBody) } as Statement;
-      default: return s;
+      case "forRange":
+      case "forStride":
+      case "if":
+        return { ...s, body: fn(s.body) } as Statement;
+      case "ifElse":
+        return {
+          ...s,
+          body: fn(s.body),
+          elseBody: fn(s.elseBody),
+        } as Statement;
+      default:
+        return s;
     }
   });
 }
@@ -1205,7 +1452,7 @@ function eliminateDeadCode(stmts: Statement[]): Statement[] {
   }
 
   // Step 5: Filter dead lets — keep if name is used OR if value's node ID is referenced
-  return processed.filter(s => {
+  return processed.filter((s) => {
     if (s.kind !== "let") return true;
     if (usedNames.has(s.name)) return true;
     // Keep auto-CSE bindings: value node has valid ID and appears in other statements
@@ -1244,7 +1491,12 @@ function isTrivialNode(node: IRNode): boolean {
  * may change between uses (e.g., across barriers).
  */
 function exprContainsMemoryRead(node: IRNode): boolean {
-  if (node.kind === "load" || node.kind === "sharedRead" || node.kind === "vec4SharedRead") return true;
+  if (
+    node.kind === "load" ||
+    node.kind === "sharedRead" ||
+    node.kind === "vec4SharedRead"
+  )
+    return true;
   return someExprChild(node, exprContainsMemoryRead);
 }
 
@@ -1254,16 +1506,26 @@ function exprContainsMemoryRead(node: IRNode): boolean {
  * Always recurses into children even for memory-read nodes, so pure sub-expressions
  * (like address calculations inside loads) can still be CSE'd.
  */
-function collectExprCSECandidates(node: IRNode, nodes: Map<number, IRNode>): void {
+function collectExprCSECandidates(
+  node: IRNode,
+  nodes: Map<number, IRNode>,
+): void {
   if (node.id < 0 || isTrivialNode(node)) return;
   if (!exprContainsMemoryRead(node)) nodes.set(node.id, node);
-  forEachExprChild(node, child => collectExprCSECandidates(child, nodes));
+  forEachExprChild(node, (child) => collectExprCSECandidates(child, nodes));
 }
 
 /** Collect all CSE candidate node IDs from all expressions in a statement (recursing into all bodies). */
-function collectStmtCSENodes(stmt: Statement, nodes: Map<number, IRNode>): void {
-  forEachStmtExpr(stmt, e => collectExprCSECandidates(e, nodes));
-  if (stmt.kind === "forRange" || stmt.kind === "forStride" || stmt.kind === "if") {
+function collectStmtCSENodes(
+  stmt: Statement,
+  nodes: Map<number, IRNode>,
+): void {
+  forEachStmtExpr(stmt, (e) => collectExprCSECandidates(e, nodes));
+  if (
+    stmt.kind === "forRange" ||
+    stmt.kind === "forStride" ||
+    stmt.kind === "if"
+  ) {
     for (const s of stmt.body) collectStmtCSENodes(s, nodes);
   } else if (stmt.kind === "ifElse") {
     for (const s of stmt.body) collectStmtCSENodes(s, nodes);
@@ -1277,28 +1539,48 @@ function collectStmtCSENodes(stmt: Statement, nodes: Map<number, IRNode>): void 
 function exprDepth(node: IRNode): number {
   if (isTrivialNode(node) || node.id < 0) return 0;
   switch (node.kind) {
-    case "binary": return 1 + Math.max(exprDepth(node.lhs), exprDepth(node.rhs));
-    case "unary": case "cast": case "bitcast": return 1 + exprDepth((node as any).input);
-    case "cmp": return 1 + Math.max(exprDepth(node.lhs), exprDepth(node.rhs));
-    case "select": return 1 + Math.max(exprDepth(node.condition), exprDepth(node.trueVal), exprDepth(node.falseVal));
-    default: return 1;
+    case "binary":
+      return 1 + Math.max(exprDepth(node.lhs), exprDepth(node.rhs));
+    case "unary":
+    case "cast":
+    case "bitcast":
+      return 1 + exprDepth((node as any).input);
+    case "cmp":
+      return 1 + Math.max(exprDepth(node.lhs), exprDepth(node.rhs));
+    case "select":
+      return (
+        1 +
+        Math.max(
+          exprDepth(node.condition),
+          exprDepth(node.trueVal),
+          exprDepth(node.falseVal),
+        )
+      );
+    default:
+      return 1;
   }
 }
 
 /** Collect all node IDs that are proper sub-expressions of a given node. */
 function collectSubExprIds(node: IRNode, ids: Set<number>): void {
   if (node.id < 0 || isTrivialNode(node)) return;
-  forEachExprChild(node, child => { ids.add(child.id); collectSubExprIds(child, ids); });
+  forEachExprChild(node, (child) => {
+    ids.add(child.id);
+    collectSubExprIds(child, ids);
+  });
 }
 
 /**
  * Walk an IR expression tree and push every non-trivial, memory-read-free node
  * occurrence (NOT deduplicated). Same node appearing N times produces N entries.
  */
-function countExprCSEOccurrences(node: IRNode, out: { id: number; node: IRNode }[]): void {
+function countExprCSEOccurrences(
+  node: IRNode,
+  out: { id: number; node: IRNode }[],
+): void {
   if (node.id < 0 || isTrivialNode(node)) return;
   if (!exprContainsMemoryRead(node)) out.push({ id: node.id, node });
-  forEachExprChild(node, child => countExprCSEOccurrences(child, out));
+  forEachExprChild(node, (child) => countExprCSEOccurrences(child, out));
 }
 
 /**
@@ -1310,8 +1592,11 @@ function countExprCSEOccurrences(node: IRNode, out: { id: number; node: IRNode }
  * bounds, conditions, and leaf statement expressions).
  */
 /** Count CSE occurrences at this scope level only (no body recursion — handled by autoCSE). */
-function countStmtCSEOccurrences(stmt: Statement, out: { id: number; node: IRNode }[]): void {
-  forEachStmtExpr(stmt, e => countExprCSEOccurrences(e, out));
+function countStmtCSEOccurrences(
+  stmt: Statement,
+  out: { id: number; node: IRNode }[],
+): void {
+  forEachStmtExpr(stmt, (e) => countExprCSEOccurrences(e, out));
 }
 
 /**
@@ -1327,7 +1612,10 @@ function countStmtCSEOccurrences(stmt: Statement, out: { id: number; node: IRNod
  *
  * LICM runs after this pass and hoists loop-invariant injected bindings.
  */
-export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Set()): Statement[] {
+export function autoCSE(
+  stmts: Statement[],
+  parentBoundIds: Set<number> = new Set(),
+): Statement[] {
   // Phase 1: Count references at this scope using two strategies:
   //
   // (a) Cross-statement sharing: per-statement dedup (walks into children).
@@ -1340,7 +1628,10 @@ export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Se
   //     count += 2 instead of += 1. This catches the case the dedup approach missed.
   //
   // We take the max count from both strategies for each node.
-  const refCounts = new Map<number, { count: number; node: IRNode; firstIdx: number }>();
+  const refCounts = new Map<
+    number,
+    { count: number; node: IRNode; firstIdx: number }
+  >();
   const letValueIds = new Set<number>();
 
   for (let i = 0; i < stmts.length; i++) {
@@ -1390,7 +1681,12 @@ export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Se
   // Skip: already bound by existing let, bound at ancestor scope, or depth <= 1
   const candidates: { firstIdx: number; node: IRNode; id: number }[] = [];
   for (const [id, { count, node, firstIdx }] of refCounts) {
-    if (count > 1 && !letValueIds.has(id) && !parentBoundIds.has(id) && exprDepth(node) > 1) {
+    if (
+      count > 1 &&
+      !letValueIds.has(id) &&
+      !parentBoundIds.has(id) &&
+      exprDepth(node) > 1
+    ) {
       candidates.push({ firstIdx, node, id });
     }
   }
@@ -1405,18 +1701,24 @@ export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Se
     collectSubExprIds(c.node, subs);
     candidateSubExprs.set(c.id, subs);
   }
-  const toBind: { firstIdx: number; name: string; node: IRNode; id: number }[] = [];
+  const toBind: { firstIdx: number; name: string; node: IRNode; id: number }[] =
+    [];
   for (const c of candidates) {
     // Count how many parent candidate usages "cover" this candidate's references
     let parentCoverage = 0;
     for (const other of candidates) {
-      if (other.id !== c.id && candidateSubExprs.get(other.id)!.has(c.id)) {
-        parentCoverage += refCounts.get(other.id)!.count;
+      if (other.id !== c.id && candidateSubExprs.get(other.id)?.has(c.id)) {
+        parentCoverage += refCounts.get(other.id)?.count;
       }
     }
     // Keep if not a sub-expression of any candidate, or has external references
-    if (parentCoverage === 0 || refCounts.get(c.id)!.count > parentCoverage) {
-      toBind.push({ firstIdx: c.firstIdx, name: freshVar("cse"), node: c.node, id: c.id });
+    if (parentCoverage === 0 || refCounts.get(c.id)?.count > parentCoverage) {
+      toBind.push({
+        firstIdx: c.firstIdx,
+        name: freshVar("cse"),
+        node: c.node,
+        id: c.id,
+      });
     }
   }
 
@@ -1433,7 +1735,9 @@ export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Se
   }
 
   // Phase 3: Recurse into child scopes (top-down: children see parent bindings)
-  const processed = mapStmtBodies(stmts, body => autoCSE(body, childBoundIds));
+  const processed = mapStmtBodies(stmts, (body) =>
+    autoCSE(body, childBoundIds),
+  );
 
   if (toBind.length === 0) return processed;
   toBind.sort((a, b) => a.firstIdx - b.firstIdx);
@@ -1442,7 +1746,7 @@ export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Se
   const injByIdx = new Map<number, typeof toBind>();
   for (const b of toBind) {
     if (!injByIdx.has(b.firstIdx)) injByIdx.set(b.firstIdx, []);
-    injByIdx.get(b.firstIdx)!.push(b);
+    injByIdx.get(b.firstIdx)?.push(b);
   }
 
   // Topological sort bindings within each firstIdx group so that if binding B's
@@ -1456,10 +1760,10 @@ export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Se
       }
       // Stable topological sort: binding A before B if B's sub-exprs contain A's id
       group.sort((a, b) => {
-        const bDepsA = subSets.get(b.id)!.has(a.id);
-        const aDepsB = subSets.get(a.id)!.has(b.id);
+        const bDepsA = subSets.get(b.id)?.has(a.id);
+        const aDepsB = subSets.get(a.id)?.has(b.id);
         if (bDepsA && !aDepsB) return -1; // A before B
-        if (aDepsB && !bDepsA) return 1;  // B before A
+        if (aDepsB && !bDepsA) return 1; // B before A
         return 0; // no dependency — preserve order
       });
     }
@@ -1470,7 +1774,12 @@ export function autoCSE(stmts: Statement[], parentBoundIds: Set<number> = new Se
     const inj = injByIdx.get(i);
     if (inj) {
       for (const b of inj) {
-        result.push({ kind: "let", name: b.name, value: b.node, dtype: b.node.dataType } as Statement);
+        result.push({
+          kind: "let",
+          name: b.name,
+          value: b.node,
+          dtype: b.node.dataType,
+        } as Statement);
       }
     }
     result.push(processed[i]);
@@ -1507,24 +1816,36 @@ function emitBindings(spec: TileKernelSpec): string[] {
 
   for (let i = 0; i < entries.length; i++) {
     // Insert uniform at the specified index if requested
-    if (hasUniforms && uniformIdx !== undefined && bindingIndex === uniformIdx) {
-      lines.push(`@group(0) @binding(${bindingIndex}) var<uniform> config: TileConfig;`);
+    if (
+      hasUniforms &&
+      uniformIdx !== undefined &&
+      bindingIndex === uniformIdx
+    ) {
+      lines.push(
+        `@group(0) @binding(${bindingIndex}) var<uniform> config: TileConfig;`,
+      );
       bindingIndex++;
     }
     const [name, binding] = entries[i];
     if (binding.storage === "atomic") {
       // Atomic bindings use array<atomic<T>>
-      lines.push(`@group(0) @binding(${bindingIndex}) var<storage, read_write> ${name}: array<atomic<${binding.type}>>;`);
+      lines.push(
+        `@group(0) @binding(${bindingIndex}) var<storage, read_write> ${name}: array<atomic<${binding.type}>>;`,
+      );
     } else {
       const access = binding.storage === "read" ? "read" : "read_write";
-      lines.push(`@group(0) @binding(${bindingIndex}) var<storage, ${access}> ${name}: array<${binding.type}>;`);
+      lines.push(
+        `@group(0) @binding(${bindingIndex}) var<storage, ${access}> ${name}: array<${binding.type}>;`,
+      );
     }
     bindingIndex++;
   }
 
   // If uniform wasn't inserted yet (no uniformBindingIndex or it's after all bindings)
   if (hasUniforms && (uniformIdx === undefined || bindingIndex <= uniformIdx)) {
-    lines.push(`@group(0) @binding(${bindingIndex}) var<uniform> config: TileConfig;`);
+    lines.push(
+      `@group(0) @binding(${bindingIndex}) var<uniform> config: TileConfig;`,
+    );
   }
 
   return lines;

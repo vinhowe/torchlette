@@ -14,18 +14,31 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  beginSharedEncoder,
+  flushSharedEncoder,
   getWebGPUDevice,
   initWebGPU,
   syncWebGPU,
-  beginSharedEncoder,
-  flushSharedEncoder,
 } from "../../src/backend/webgpu";
-import { createTileKernelDispatcher } from "../../src/backend/webgpu/tile-dispatch";
-import { compileTileKernel } from "../../src/backend/webgpu/tile-compiler";
-import { type TileKernelSpec, elementwiseGrid, perRowGrid, ceilDivGrid } from "../../src/backend/webgpu/tile-ir";
-import { setSubgroupSupport, clearSubgroupSupport, getSubgroupSupport } from "../../src/backend/webgpu/matmul/types";
-import type { GPUBuffer, GPUDevice, GPUQueue } from "../../src/backend/webgpu/gpu-types";
+import type {
+  GPUBuffer,
+  GPUDevice,
+  GPUQueue,
+} from "../../src/backend/webgpu/gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "../../src/backend/webgpu/gpu-types";
+import {
+  clearSubgroupSupport,
+  getSubgroupSupport,
+  setSubgroupSupport,
+} from "../../src/backend/webgpu/matmul/types";
+import { compileTileKernel } from "../../src/backend/webgpu/tile-compiler";
+import { createTileKernelDispatcher } from "../../src/backend/webgpu/tile-dispatch";
+import {
+  ceilDivGrid,
+  elementwiseGrid,
+  perRowGrid,
+  type TileKernelSpec,
+} from "../../src/backend/webgpu/tile-ir";
 
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -67,7 +80,10 @@ function makeOutputBuffer(numElements: number, bytesPerElement = 4): GPUBuffer {
   });
 }
 
-async function readF32Buffer(buf: GPUBuffer, count: number): Promise<Float32Array> {
+async function readF32Buffer(
+  buf: GPUBuffer,
+  count: number,
+): Promise<Float32Array> {
   const staging = device.createBuffer({
     size: count * 4,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -82,7 +98,10 @@ async function readF32Buffer(buf: GPUBuffer, count: number): Promise<Float32Arra
   return data;
 }
 
-async function readU32Buffer(buf: GPUBuffer, count: number): Promise<Uint32Array> {
+async function readU32Buffer(
+  buf: GPUBuffer,
+  count: number,
+): Promise<Uint32Array> {
   const staging = device.createBuffer({
     size: count * 4,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -106,8 +125,8 @@ const elementwiseAddSpec: TileKernelSpec = {
   name: "elementwiseAdd",
   workgroupSize: 64,
   bindings: {
-    a:      { storage: "read", type: "f32" },
-    b:      { storage: "read", type: "f32" },
+    a: { storage: "read", type: "f32" },
+    b: { storage: "read", type: "f32" },
     output: { storage: "read_write", type: "f32" },
   },
   uniforms: { n: "u32" },
@@ -128,8 +147,8 @@ const elementwiseMul2DSpec: TileKernelSpec = {
   name: "elementwiseMul2D",
   workgroupSize: [8, 8],
   bindings: {
-    a:      { storage: "read", type: "f32" },
-    b:      { storage: "read", type: "f32" },
+    a: { storage: "read", type: "f32" },
+    b: { storage: "read", type: "f32" },
     output: { storage: "read_write", type: "f32" },
   },
   uniforms: { rows: "u32", cols: "u32" },
@@ -140,12 +159,15 @@ const elementwiseMul2DSpec: TileKernelSpec = {
     const rows = ctx.uniform("rows");
     const cols = ctx.uniform("cols");
     const inBounds = row.lt(rows).and(col.lt(cols));
-    ctx.ifThen(new (Object.getPrototypeOf(row).constructor)(inBounds.node), () => {
-      const idx = row.mul(cols).add(col);
-      const a = ctx.load("a", idx);
-      const b = ctx.load("b", idx);
-      ctx.guardedStore("output", inBounds, idx, a.mul(b));
-    });
+    ctx.ifThen(
+      new (Object.getPrototypeOf(row).constructor)(inBounds.node),
+      () => {
+        const idx = row.mul(cols).add(col);
+        const a = ctx.load("a", idx);
+        const b = ctx.load("b", idx);
+        ctx.guardedStore("output", inBounds, idx, a.mul(b));
+      },
+    );
   },
 };
 
@@ -173,7 +195,7 @@ describe("Gap 1: Elementwise dispatch (globalId)", () => {
       workgroupSize: [8, 8],
       bindings: { output: { storage: "read_write", type: "f32" } },
       uniforms: { n: "u32" },
-      grid: (u) => [1],
+      grid: (_u) => [1],
       kernel(ctx) {
         const wid = ctx.programId(0);
         const tid = ctx.threadIdx(0);
@@ -277,9 +299,9 @@ const meanAndNormalizeSpec: TileKernelSpec = {
   name: "meanAndNormalize",
   workgroupSize: 256,
   bindings: {
-    x:        { storage: "read", type: "f32" },
+    x: { storage: "read", type: "f32" },
     mean_out: { storage: "read_write", type: "f32" },
-    output:   { storage: "read_write", type: "f32" },
+    output: { storage: "read_write", type: "f32" },
   },
   uniforms: { numRows: "u32", featureDim: "u32" },
   grid: (u) => [u.numRows],
@@ -291,8 +313,12 @@ const meanAndNormalizeSpec: TileKernelSpec = {
     const base = row.mul(D);
 
     // Sum reduction for mean via wgReduce
-    const mean = ctx.emitLet("mean",
-      ctx.wgReduce("sum", tid, D, 256, (i) => ctx.load("x", base.add(i))).div(Df));
+    const mean = ctx.emitLet(
+      "mean",
+      ctx
+        .wgReduce("sum", tid, D, 256, (i) => ctx.load("x", base.add(i)))
+        .div(Df),
+    );
 
     // Store scalar mean (only thread 0)
     ctx.ifThen(tid.eq(ctx.u32(0)), () => {
@@ -301,7 +327,11 @@ const meanAndNormalizeSpec: TileKernelSpec = {
 
     // Store normalized block values
     ctx.stridedFor(tid, D, 256, (i) => {
-      ctx.emitStore("output", base.add(i), ctx.load("x", base.add(i)).sub(mean));
+      ctx.emitStore(
+        "output",
+        base.add(i),
+        ctx.load("x", base.add(i)).sub(mean),
+      );
     });
   },
 };
@@ -319,73 +349,76 @@ describe("Gap 2: Multiple output stores (imperative)", () => {
   });
 });
 
-describe.runIf(isWebGPUEnabled)("Gap 2: Multiple output stores GPU dispatch", () => {
-  beforeAll(async () => {
-    const ok = await initWebGPU();
-    if (!ok) throw new Error("WebGPU init failed");
-    const ctx = getWebGPUDevice();
-    if (!ctx) throw new Error("No WebGPU device");
-    device = ctx.device;
-    queue = ctx.queue;
-  });
+describe.runIf(isWebGPUEnabled)(
+  "Gap 2: Multiple output stores GPU dispatch",
+  () => {
+    beforeAll(async () => {
+      const ok = await initWebGPU();
+      if (!ok) throw new Error("WebGPU init failed");
+      const ctx = getWebGPUDevice();
+      if (!ctx) throw new Error("No WebGPU device");
+      device = ctx.device;
+      queue = ctx.queue;
+    });
 
-  afterAll(async () => {
-    await syncWebGPU();
-  });
+    afterAll(async () => {
+      await syncWebGPU();
+    });
 
-  it("mean + normalize: correct scalar and block outputs", async () => {
-    const numRows = 4;
-    const D = 128;
-    const N = numRows * D;
+    it("mean + normalize: correct scalar and block outputs", async () => {
+      const numRows = 4;
+      const D = 128;
+      const N = numRows * D;
 
-    // Create input data
-    const xData = new Float32Array(N);
-    for (let i = 0; i < N; i++) {
-      xData[i] = (i % 7) - 3; // values in -3..3
-    }
-
-    // CPU reference
-    const expectedMean = new Float32Array(numRows);
-    const expectedNorm = new Float32Array(N);
-    for (let r = 0; r < numRows; r++) {
-      let sum = 0;
-      for (let j = 0; j < D; j++) sum += xData[r * D + j];
-      expectedMean[r] = sum / D;
-      for (let j = 0; j < D; j++) {
-        expectedNorm[r * D + j] = xData[r * D + j] - expectedMean[r];
+      // Create input data
+      const xData = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        xData[i] = (i % 7) - 3; // values in -3..3
       }
-    }
 
-    const xBuf = makeF32Buffer(xData, GPUBufferUsage.STORAGE);
-    const meanBuf = makeOutputBuffer(numRows);
-    const outBuf = makeOutputBuffer(N);
+      // CPU reference
+      const expectedMean = new Float32Array(numRows);
+      const expectedNorm = new Float32Array(N);
+      for (let r = 0; r < numRows; r++) {
+        let sum = 0;
+        for (let j = 0; j < D; j++) sum += xData[r * D + j];
+        expectedMean[r] = sum / D;
+        for (let j = 0; j < D; j++) {
+          expectedNorm[r * D + j] = xData[r * D + j] - expectedMean[r];
+        }
+      }
 
-    const kernel = createTileKernelDispatcher(meanAndNormalizeSpec);
-    beginSharedEncoder();
-    kernel.dispatch(
-      { x: xBuf, mean_out: meanBuf, output: outBuf },
-      { numRows, featureDim: D },
-    );
-    flushSharedEncoder();
+      const xBuf = makeF32Buffer(xData, GPUBufferUsage.STORAGE);
+      const meanBuf = makeOutputBuffer(numRows);
+      const outBuf = makeOutputBuffer(N);
 
-    const meanResult = await readF32Buffer(meanBuf, numRows);
-    const normResult = await readF32Buffer(outBuf, N);
+      const kernel = createTileKernelDispatcher(meanAndNormalizeSpec);
+      beginSharedEncoder();
+      kernel.dispatch(
+        { x: xBuf, mean_out: meanBuf, output: outBuf },
+        { numRows, featureDim: D },
+      );
+      flushSharedEncoder();
 
-    // Check means
-    for (let r = 0; r < numRows; r++) {
-      expect(meanResult[r]).toBeCloseTo(expectedMean[r], 3);
-    }
+      const meanResult = await readF32Buffer(meanBuf, numRows);
+      const normResult = await readF32Buffer(outBuf, N);
 
-    // Check normalized values
-    for (let i = 0; i < N; i++) {
-      expect(normResult[i]).toBeCloseTo(expectedNorm[i], 3);
-    }
+      // Check means
+      for (let r = 0; r < numRows; r++) {
+        expect(meanResult[r]).toBeCloseTo(expectedMean[r], 3);
+      }
 
-    xBuf.destroy();
-    meanBuf.destroy();
-    outBuf.destroy();
-  });
-});
+      // Check normalized values
+      for (let i = 0; i < N; i++) {
+        expect(normResult[i]).toBeCloseTo(expectedNorm[i], 3);
+      }
+
+      xBuf.destroy();
+      meanBuf.destroy();
+      outBuf.destroy();
+    });
+  },
+);
 
 // ---------------------------------------------------------------------------
 // Gap 3: Bitcast
@@ -400,7 +433,7 @@ const isInfNanSpec: TileKernelSpec = {
   name: "isInfNan",
   workgroupSize: 64,
   bindings: {
-    x:      { storage: "read", type: "f32" },
+    x: { storage: "read", type: "f32" },
     output: { storage: "read_write", type: "u32" },
   },
   uniforms: { n: "u32" },
@@ -412,8 +445,10 @@ const isInfNanSpec: TileKernelSpec = {
       const val = ctx.load("x", idx);
       const bits = val.bitcastTo("u32");
       // Extract exponent: (bits >> 23) & 0xFF
-      const exponent = bits.shr(ctx.const(23, "u32")).and(ctx.const(0xFF, "u32"));
-      const isInfBool = exponent.eq(ctx.const(0xFF, "u32"));
+      const exponent = bits
+        .shr(ctx.const(23, "u32"))
+        .and(ctx.const(0xff, "u32"));
+      const isInfBool = exponent.eq(ctx.const(0xff, "u32"));
       const flag = isInfBool.select(ctx.const(1, "u32"), ctx.const(0, "u32"));
       ctx.guardedStore("output", idx.lt(n), idx, flag);
     });
@@ -445,9 +480,14 @@ describe.runIf(isWebGPUEnabled)("Gap 3: Bitcast GPU dispatch", () => {
     const values = [1.0, Infinity, -Infinity, NaN, 0.0, -0.0, 3.14];
     const N = values.length;
     // Expected: 0 for normal, 1 for inf/NaN
-    const expected = values.map(v => (!isFinite(v) || isNaN(v)) ? 1 : 0);
+    const expected = values.map((v) =>
+      !Number.isFinite(v) || Number.isNaN(v) ? 1 : 0,
+    );
 
-    const xBuf = makeF32Buffer(new Float32Array(values), GPUBufferUsage.STORAGE);
+    const xBuf = makeF32Buffer(
+      new Float32Array(values),
+      GPUBufferUsage.STORAGE,
+    );
     const outBuf = makeOutputBuffer(N);
 
     const kernel = createTileKernelDispatcher(isInfNanSpec);
@@ -477,7 +517,7 @@ const hasInfNanSpec: TileKernelSpec = {
   name: "hasInfNan",
   workgroupSize: 64,
   bindings: {
-    x:    { storage: "read", type: "f32" },
+    x: { storage: "read", type: "f32" },
     flag: { storage: "atomic", type: "u32" },
   },
   uniforms: { n: "u32" },
@@ -488,8 +528,10 @@ const hasInfNanSpec: TileKernelSpec = {
     ctx.ifThen(idx.lt(n), () => {
       const val = ctx.load("x", idx);
       const bits = val.bitcastTo("u32");
-      const exponent = bits.shr(ctx.const(23, "u32")).and(ctx.const(0xFF, "u32"));
-      const isInf = exponent.eq(ctx.const(0xFF, "u32"));
+      const exponent = bits
+        .shr(ctx.const(23, "u32"))
+        .and(ctx.const(0xff, "u32"));
+      const isInf = exponent.eq(ctx.const(0xff, "u32"));
       // Convert bool to u32: select(0u, 1u, cond)
       const flag = isInf.select(ctx.const(1, "u32"), ctx.const(0, "u32"));
       ctx.atomicOp("flag", ctx.const(0, "u32"), "max", flag);
@@ -523,8 +565,14 @@ describe.runIf(isWebGPUEnabled)("Gap 4: Atomics GPU dispatch", () => {
     const values = [1.0, 2.0, Infinity, 4.0];
     const N = values.length;
 
-    const xBuf = makeF32Buffer(new Float32Array(values), GPUBufferUsage.STORAGE);
-    const flagBuf = makeU32Buffer(new Uint32Array([0]), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const xBuf = makeF32Buffer(
+      new Float32Array(values),
+      GPUBufferUsage.STORAGE,
+    );
+    const flagBuf = makeU32Buffer(
+      new Uint32Array([0]),
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    );
 
     const kernel = createTileKernelDispatcher(hasInfNanSpec);
     beginSharedEncoder();
@@ -542,8 +590,14 @@ describe.runIf(isWebGPUEnabled)("Gap 4: Atomics GPU dispatch", () => {
     const values = [1.0, 2.0, 3.0, 4.0];
     const N = values.length;
 
-    const xBuf = makeF32Buffer(new Float32Array(values), GPUBufferUsage.STORAGE);
-    const flagBuf = makeU32Buffer(new Uint32Array([0]), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const xBuf = makeF32Buffer(
+      new Float32Array(values),
+      GPUBufferUsage.STORAGE,
+    );
+    const flagBuf = makeU32Buffer(
+      new Uint32Array([0]),
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    );
 
     const kernel = createTileKernelDispatcher(hasInfNanSpec);
     beginSharedEncoder();
@@ -571,7 +625,7 @@ const subgroupXorSumSpec: TileKernelSpec = {
   workgroupSize: 4,
   enableSubgroups: true,
   bindings: {
-    input:  { storage: "read", type: "f32" },
+    input: { storage: "read", type: "f32" },
     output: { storage: "read_write", type: "f32" },
   },
   uniforms: { n: "u32" },
@@ -584,7 +638,12 @@ const subgroupXorSumSpec: TileKernelSpec = {
     const s2 = s1.add(s1.subgroupShuffleXor(ctx.const(2, "u32")));
     // Thread 0 writes the result
     ctx.ifThen(tid.eq(ctx.const(0, "u32")), () => {
-      ctx.guardedStore("output", tid.eq(ctx.const(0, "u32")), ctx.const(0, "u32"), s2);
+      ctx.guardedStore(
+        "output",
+        tid.eq(ctx.const(0, "u32")),
+        ctx.const(0, "u32"),
+        s2,
+      );
     });
   },
 };
@@ -612,8 +671,8 @@ const elementwiseAddVec4Spec: TileKernelSpec = {
   workgroupSize: 64,
   vectorize: 4,
   bindings: {
-    a:      { storage: "read", type: "f32" },
-    b:      { storage: "read", type: "f32" },
+    a: { storage: "read", type: "f32" },
+    b: { storage: "read", type: "f32" },
     output: { storage: "read_write", type: "f32" },
   },
   uniforms: { n: "u32" },
@@ -649,81 +708,84 @@ describe("Gap 6: Auto-vectorization", () => {
   });
 });
 
-describe.runIf(isWebGPUEnabled)("Gap 6: Auto-vectorization GPU dispatch", () => {
-  beforeAll(async () => {
-    const ok = await initWebGPU();
-    if (!ok) throw new Error("WebGPU init failed");
-    const ctx = getWebGPUDevice();
-    if (!ctx) throw new Error("No WebGPU device");
-    device = ctx.device;
-    queue = ctx.queue;
-  });
+describe.runIf(isWebGPUEnabled)(
+  "Gap 6: Auto-vectorization GPU dispatch",
+  () => {
+    beforeAll(async () => {
+      const ok = await initWebGPU();
+      if (!ok) throw new Error("WebGPU init failed");
+      const ctx = getWebGPUDevice();
+      if (!ctx) throw new Error("No WebGPU device");
+      device = ctx.device;
+      queue = ctx.queue;
+    });
 
-  afterAll(async () => {
-    await syncWebGPU();
-  });
+    afterAll(async () => {
+      await syncWebGPU();
+    });
 
-  it("vec4 add: 1024 elements (multiple of 4*64)", async () => {
-    const N = 1024;
-    const aData = new Float32Array(N);
-    const bData = new Float32Array(N);
-    const expected = new Float32Array(N);
-    for (let i = 0; i < N; i++) {
-      aData[i] = i * 0.1;
-      bData[i] = (N - i) * 0.01;
-      expected[i] = aData[i] + bData[i];
-    }
+    it("vec4 add: 1024 elements (multiple of 4*64)", async () => {
+      const N = 1024;
+      const aData = new Float32Array(N);
+      const bData = new Float32Array(N);
+      const expected = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        aData[i] = i * 0.1;
+        bData[i] = (N - i) * 0.01;
+        expected[i] = aData[i] + bData[i];
+      }
 
-    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
-    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
-    const outBuf = makeOutputBuffer(N);
+      const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+      const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+      const outBuf = makeOutputBuffer(N);
 
-    const kernel = createTileKernelDispatcher(elementwiseAddVec4Spec);
-    beginSharedEncoder();
-    kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
-    flushSharedEncoder();
+      const kernel = createTileKernelDispatcher(elementwiseAddVec4Spec);
+      beginSharedEncoder();
+      kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
+      flushSharedEncoder();
 
-    const result = await readF32Buffer(outBuf, N);
-    for (let i = 0; i < N; i++) {
-      expect(result[i]).toBeCloseTo(expected[i], 3);
-    }
+      const result = await readF32Buffer(outBuf, N);
+      for (let i = 0; i < N; i++) {
+        expect(result[i]).toBeCloseTo(expected[i], 3);
+      }
 
-    aBuf.destroy();
-    bBuf.destroy();
-    outBuf.destroy();
-  });
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
+    });
 
-  it("vec4 add: non-multiple of 4 (boundary check)", async () => {
-    const N = 137; // not divisible by 4
-    const aData = new Float32Array(N);
-    const bData = new Float32Array(N);
-    const expected = new Float32Array(N);
-    for (let i = 0; i < N; i++) {
-      aData[i] = i;
-      bData[i] = -i * 0.5;
-      expected[i] = aData[i] + bData[i];
-    }
+    it("vec4 add: non-multiple of 4 (boundary check)", async () => {
+      const N = 137; // not divisible by 4
+      const aData = new Float32Array(N);
+      const bData = new Float32Array(N);
+      const expected = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        aData[i] = i;
+        bData[i] = -i * 0.5;
+        expected[i] = aData[i] + bData[i];
+      }
 
-    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
-    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
-    // Allocate slightly more to avoid out-of-bounds
-    const outBuf = makeOutputBuffer(Math.ceil(N / 4) * 4);
+      const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+      const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+      // Allocate slightly more to avoid out-of-bounds
+      const outBuf = makeOutputBuffer(Math.ceil(N / 4) * 4);
 
-    const kernel = createTileKernelDispatcher(elementwiseAddVec4Spec);
-    beginSharedEncoder();
-    kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
-    flushSharedEncoder();
+      const kernel = createTileKernelDispatcher(elementwiseAddVec4Spec);
+      beginSharedEncoder();
+      kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
+      flushSharedEncoder();
 
-    const result = await readF32Buffer(outBuf, N);
-    for (let i = 0; i < N; i++) {
-      expect(result[i]).toBeCloseTo(expected[i], 3);
-    }
+      const result = await readF32Buffer(outBuf, N);
+      for (let i = 0; i < N; i++) {
+        expect(result[i]).toBeCloseTo(expected[i], 3);
+      }
 
-    aBuf.destroy();
-    bBuf.destroy();
-    outBuf.destroy();
-  });
-});
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
+    });
+  },
+);
 
 // ---------------------------------------------------------------------------
 // Masked auto-phase elementwise (Triton-like)
@@ -734,8 +796,8 @@ const maskedElementwiseAddSpec: TileKernelSpec = {
   name: "maskedElementwiseAdd",
   workgroupSize: 256,
   bindings: {
-    a:      { storage: "read", type: "f32" },
-    b:      { storage: "read", type: "f32" },
+    a: { storage: "read", type: "f32" },
+    b: { storage: "read", type: "f32" },
     output: { storage: "read_write", type: "f32" },
   },
   uniforms: { n: "u32" },
@@ -756,7 +818,7 @@ const maskedElementwiseReluSpec: TileKernelSpec = {
   name: "maskedElementwiseRelu",
   workgroupSize: 64,
   bindings: {
-    x:      { storage: "read", type: "f32" },
+    x: { storage: "read", type: "f32" },
     output: { storage: "read_write", type: "f32" },
   },
   uniforms: { n: "u32" },
@@ -779,8 +841,8 @@ const maskedElementwiseAddVec4Spec: TileKernelSpec = {
   workgroupSize: 64,
   vectorize: 4,
   bindings: {
-    a:      { storage: "read", type: "f32" },
-    b:      { storage: "read", type: "f32" },
+    a: { storage: "read", type: "f32" },
+    b: { storage: "read", type: "f32" },
     output: { storage: "read_write", type: "f32" },
   },
   uniforms: { n: "u32" },
@@ -823,166 +885,169 @@ describe("Imperative elementwise (WGSL)", () => {
   });
 });
 
-describe.runIf(isWebGPUEnabled)("Masked auto-phase elementwise GPU dispatch", () => {
-  beforeAll(async () => {
-    const ok = await initWebGPU();
-    if (!ok) throw new Error("WebGPU init failed");
-    const ctx = getWebGPUDevice();
-    if (!ctx) throw new Error("No WebGPU device");
-    device = ctx.device;
-    queue = ctx.queue;
-  });
+describe.runIf(isWebGPUEnabled)(
+  "Masked auto-phase elementwise GPU dispatch",
+  () => {
+    beforeAll(async () => {
+      const ok = await initWebGPU();
+      if (!ok) throw new Error("WebGPU init failed");
+      const ctx = getWebGPUDevice();
+      if (!ctx) throw new Error("No WebGPU device");
+      device = ctx.device;
+      queue = ctx.queue;
+    });
 
-  afterAll(async () => {
-    await syncWebGPU();
-  });
+    afterAll(async () => {
+      await syncWebGPU();
+    });
 
-  it("masked add: 1000 elements", async () => {
-    const N = 1000;
-    const aData = new Float32Array(N);
-    const bData = new Float32Array(N);
-    const expected = new Float32Array(N);
-    for (let i = 0; i < N; i++) {
-      aData[i] = i * 0.1;
-      bData[i] = (N - i) * 0.01;
-      expected[i] = aData[i] + bData[i];
-    }
+    it("masked add: 1000 elements", async () => {
+      const N = 1000;
+      const aData = new Float32Array(N);
+      const bData = new Float32Array(N);
+      const expected = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        aData[i] = i * 0.1;
+        bData[i] = (N - i) * 0.01;
+        expected[i] = aData[i] + bData[i];
+      }
 
-    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
-    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
-    const outBuf = makeOutputBuffer(N);
+      const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+      const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+      const outBuf = makeOutputBuffer(N);
 
-    const kernel = createTileKernelDispatcher(maskedElementwiseAddSpec);
-    beginSharedEncoder();
-    kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
-    flushSharedEncoder();
+      const kernel = createTileKernelDispatcher(maskedElementwiseAddSpec);
+      beginSharedEncoder();
+      kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
+      flushSharedEncoder();
 
-    const result = await readF32Buffer(outBuf, N);
-    for (let i = 0; i < N; i++) {
-      expect(result[i]).toBeCloseTo(expected[i], 3);
-    }
+      const result = await readF32Buffer(outBuf, N);
+      for (let i = 0; i < N; i++) {
+        expect(result[i]).toBeCloseTo(expected[i], 3);
+      }
 
-    aBuf.destroy();
-    bBuf.destroy();
-    outBuf.destroy();
-  });
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
+    });
 
-  it("masked add: non-multiple of workgroup size (137)", async () => {
-    const N = 137;
-    const aData = new Float32Array(N);
-    const bData = new Float32Array(N);
-    const expected = new Float32Array(N);
-    for (let i = 0; i < N; i++) {
-      aData[i] = i;
-      bData[i] = -i * 0.5;
-      expected[i] = aData[i] + bData[i];
-    }
+    it("masked add: non-multiple of workgroup size (137)", async () => {
+      const N = 137;
+      const aData = new Float32Array(N);
+      const bData = new Float32Array(N);
+      const expected = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        aData[i] = i;
+        bData[i] = -i * 0.5;
+        expected[i] = aData[i] + bData[i];
+      }
 
-    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
-    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
-    const outBuf = makeOutputBuffer(N);
+      const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+      const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+      const outBuf = makeOutputBuffer(N);
 
-    const kernel = createTileKernelDispatcher(maskedElementwiseAddSpec);
-    beginSharedEncoder();
-    kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
-    flushSharedEncoder();
+      const kernel = createTileKernelDispatcher(maskedElementwiseAddSpec);
+      beginSharedEncoder();
+      kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
+      flushSharedEncoder();
 
-    const result = await readF32Buffer(outBuf, N);
-    for (let i = 0; i < N; i++) {
-      expect(result[i]).toBeCloseTo(expected[i], 3);
-    }
+      const result = await readF32Buffer(outBuf, N);
+      for (let i = 0; i < N; i++) {
+        expect(result[i]).toBeCloseTo(expected[i], 3);
+      }
 
-    aBuf.destroy();
-    bBuf.destroy();
-    outBuf.destroy();
-  });
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
+    });
 
-  it("masked relu: correct output", async () => {
-    const N = 500;
-    const xData = new Float32Array(N);
-    const expected = new Float32Array(N);
-    for (let i = 0; i < N; i++) {
-      xData[i] = (i % 7) - 3; // -3..3
-      expected[i] = Math.max(0, xData[i]);
-    }
+    it("masked relu: correct output", async () => {
+      const N = 500;
+      const xData = new Float32Array(N);
+      const expected = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        xData[i] = (i % 7) - 3; // -3..3
+        expected[i] = Math.max(0, xData[i]);
+      }
 
-    const xBuf = makeF32Buffer(xData, GPUBufferUsage.STORAGE);
-    const outBuf = makeOutputBuffer(N);
+      const xBuf = makeF32Buffer(xData, GPUBufferUsage.STORAGE);
+      const outBuf = makeOutputBuffer(N);
 
-    const kernel = createTileKernelDispatcher(maskedElementwiseReluSpec);
-    beginSharedEncoder();
-    kernel.dispatch({ x: xBuf, output: outBuf }, { n: N });
-    flushSharedEncoder();
+      const kernel = createTileKernelDispatcher(maskedElementwiseReluSpec);
+      beginSharedEncoder();
+      kernel.dispatch({ x: xBuf, output: outBuf }, { n: N });
+      flushSharedEncoder();
 
-    const result = await readF32Buffer(outBuf, N);
-    for (let i = 0; i < N; i++) {
-      expect(result[i]).toBeCloseTo(expected[i], 3);
-    }
+      const result = await readF32Buffer(outBuf, N);
+      for (let i = 0; i < N; i++) {
+        expect(result[i]).toBeCloseTo(expected[i], 3);
+      }
 
-    xBuf.destroy();
-    outBuf.destroy();
-  });
+      xBuf.destroy();
+      outBuf.destroy();
+    });
 
-  it("masked vec4 add: 1024 elements", async () => {
-    const N = 1024;
-    const aData = new Float32Array(N);
-    const bData = new Float32Array(N);
-    const expected = new Float32Array(N);
-    for (let i = 0; i < N; i++) {
-      aData[i] = i * 0.01;
-      bData[i] = -i * 0.005;
-      expected[i] = aData[i] + bData[i];
-    }
+    it("masked vec4 add: 1024 elements", async () => {
+      const N = 1024;
+      const aData = new Float32Array(N);
+      const bData = new Float32Array(N);
+      const expected = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        aData[i] = i * 0.01;
+        bData[i] = -i * 0.005;
+        expected[i] = aData[i] + bData[i];
+      }
 
-    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
-    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
-    const outBuf = makeOutputBuffer(N);
+      const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+      const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+      const outBuf = makeOutputBuffer(N);
 
-    const kernel = createTileKernelDispatcher(maskedElementwiseAddVec4Spec);
-    beginSharedEncoder();
-    kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
-    flushSharedEncoder();
+      const kernel = createTileKernelDispatcher(maskedElementwiseAddVec4Spec);
+      beginSharedEncoder();
+      kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
+      flushSharedEncoder();
 
-    const result = await readF32Buffer(outBuf, N);
-    for (let i = 0; i < N; i++) {
-      expect(result[i]).toBeCloseTo(expected[i], 3);
-    }
+      const result = await readF32Buffer(outBuf, N);
+      for (let i = 0; i < N; i++) {
+        expect(result[i]).toBeCloseTo(expected[i], 3);
+      }
 
-    aBuf.destroy();
-    bBuf.destroy();
-    outBuf.destroy();
-  });
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
+    });
 
-  it("masked vec4 add: non-multiple-of-4 (137)", async () => {
-    const N = 137;
-    const aData = new Float32Array(N);
-    const bData = new Float32Array(N);
-    const expected = new Float32Array(N);
-    for (let i = 0; i < N; i++) {
-      aData[i] = i;
-      bData[i] = -i * 0.5;
-      expected[i] = aData[i] + bData[i];
-    }
+    it("masked vec4 add: non-multiple-of-4 (137)", async () => {
+      const N = 137;
+      const aData = new Float32Array(N);
+      const bData = new Float32Array(N);
+      const expected = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        aData[i] = i;
+        bData[i] = -i * 0.5;
+        expected[i] = aData[i] + bData[i];
+      }
 
-    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
-    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
-    const outBuf = makeOutputBuffer(Math.ceil(N / 4) * 4);
+      const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+      const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+      const outBuf = makeOutputBuffer(Math.ceil(N / 4) * 4);
 
-    const kernel = createTileKernelDispatcher(maskedElementwiseAddVec4Spec);
-    beginSharedEncoder();
-    kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
-    flushSharedEncoder();
+      const kernel = createTileKernelDispatcher(maskedElementwiseAddVec4Spec);
+      beginSharedEncoder();
+      kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { n: N });
+      flushSharedEncoder();
 
-    const result = await readF32Buffer(outBuf, N);
-    for (let i = 0; i < N; i++) {
-      expect(result[i]).toBeCloseTo(expected[i], 3);
-    }
+      const result = await readF32Buffer(outBuf, N);
+      for (let i = 0; i < N; i++) {
+        expect(result[i]).toBeCloseTo(expected[i], 3);
+      }
 
-    aBuf.destroy();
-    bBuf.destroy();
-    outBuf.destroy();
-  });
-});
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
+    });
+  },
+);
 
 // ============================================================================
 // Constant folding for guardedStore conditions
@@ -1069,7 +1134,7 @@ describe("Triton Gap: blockWhere", () => {
       name: "blockWhereTest",
       workgroupSize: 64,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: { N: "u32" },
@@ -1093,7 +1158,7 @@ describe("Triton Gap: blockRange", () => {
       name: "blockRangeTest",
       workgroupSize: 64,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: { N: "u32" },
@@ -1113,111 +1178,121 @@ describe("Triton Gap: blockRange", () => {
   });
 });
 
-describe.runIf(isWebGPUEnabled)("Triton Gap: blockWhere + blockRange GPU", () => {
-  beforeAll(async () => {
-    const ok = await initWebGPU();
-    if (!ok) throw new Error("WebGPU init failed");
-    const ctx = getWebGPUDevice();
-    if (!ctx) throw new Error("No WebGPU device");
-    device = ctx.device;
-    queue = ctx.queue;
-  });
+describe.runIf(isWebGPUEnabled)(
+  "Triton Gap: blockWhere + blockRange GPU",
+  () => {
+    beforeAll(async () => {
+      const ok = await initWebGPU();
+      if (!ok) throw new Error("WebGPU init failed");
+      const ctx = getWebGPUDevice();
+      if (!ctx) throw new Error("No WebGPU device");
+      device = ctx.device;
+      queue = ctx.queue;
+    });
 
-  afterAll(async () => { await syncWebGPU(); });
+    afterAll(async () => {
+      await syncWebGPU();
+    });
 
-  it("blockWhere relu: x > 0 ? x : 0", async () => {
-    const N = 256;
-    const data = new Float32Array(N);
-    const expected = new Float32Array(N);
-    for (let i = 0; i < N; i++) {
-      data[i] = i - 128; // -128..127
-      expected[i] = Math.max(0, data[i]);
-    }
+    it("blockWhere relu: x > 0 ? x : 0", async () => {
+      const N = 256;
+      const data = new Float32Array(N);
+      const expected = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        data[i] = i - 128; // -128..127
+        expected[i] = Math.max(0, data[i]);
+      }
 
-    const inBuf = makeF32Buffer(data, GPUBufferUsage.STORAGE);
-    const outBuf = makeOutputBuffer(N);
+      const inBuf = makeF32Buffer(data, GPUBufferUsage.STORAGE);
+      const outBuf = makeOutputBuffer(N);
 
-    const spec: TileKernelSpec = {
-      name: "blockWhereRelu",
-      workgroupSize: 64,
-      bindings: {
-        input:  { storage: "read", type: "f32" },
-        output: { storage: "read_write", type: "f32" },
-      },
-      uniforms: { N: "u32" },
-      grid: (u) => [Math.ceil(u.N / 64)],
-      kernel(ctx) {
-        const gid = ctx.globalId(0);
-        const N = ctx.uniform("N");
-        const val = ctx.load("input", gid);
-        const zero = ctx.f32(0.0);
-        ctx.guardedStore("output", gid.lt(N), gid, ctx.blockWhere(val.gt(zero), val, zero));
-      },
-    };
+      const spec: TileKernelSpec = {
+        name: "blockWhereRelu",
+        workgroupSize: 64,
+        bindings: {
+          input: { storage: "read", type: "f32" },
+          output: { storage: "read_write", type: "f32" },
+        },
+        uniforms: { N: "u32" },
+        grid: (u) => [Math.ceil(u.N / 64)],
+        kernel(ctx) {
+          const gid = ctx.globalId(0);
+          const N = ctx.uniform("N");
+          const val = ctx.load("input", gid);
+          const zero = ctx.f32(0.0);
+          ctx.guardedStore(
+            "output",
+            gid.lt(N),
+            gid,
+            ctx.blockWhere(val.gt(zero), val, zero),
+          );
+        },
+      };
 
-    const kernel = createTileKernelDispatcher(spec);
-    beginSharedEncoder();
-    kernel.dispatch({ input: inBuf, output: outBuf }, { N });
-    flushSharedEncoder();
+      const kernel = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      kernel.dispatch({ input: inBuf, output: outBuf }, { N });
+      flushSharedEncoder();
 
-    const result = await readF32Buffer(outBuf, N);
-    for (let i = 0; i < N; i++) {
-      expect(result[i]).toBeCloseTo(expected[i], 4);
-    }
+      const result = await readF32Buffer(outBuf, N);
+      for (let i = 0; i < N; i++) {
+        expect(result[i]).toBeCloseTo(expected[i], 4);
+      }
 
-    inBuf.destroy();
-    outBuf.destroy();
-  });
+      inBuf.destroy();
+      outBuf.destroy();
+    });
 
-  it("blockRange elementwise add: matches globalId approach", async () => {
-    const N = 256;
-    const WG = 64;
-    const aData = new Float32Array(N);
-    const bData = new Float32Array(N);
-    const expected = new Float32Array(N);
-    for (let i = 0; i < N; i++) {
-      aData[i] = i * 0.1;
-      bData[i] = (N - i) * 0.01;
-      expected[i] = aData[i] + bData[i];
-    }
+    it("blockRange elementwise add: matches globalId approach", async () => {
+      const N = 256;
+      const WG = 64;
+      const aData = new Float32Array(N);
+      const bData = new Float32Array(N);
+      const expected = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        aData[i] = i * 0.1;
+        bData[i] = (N - i) * 0.01;
+        expected[i] = aData[i] + bData[i];
+      }
 
-    const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
-    const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
-    const outBuf = makeOutputBuffer(N);
+      const aBuf = makeF32Buffer(aData, GPUBufferUsage.STORAGE);
+      const bBuf = makeF32Buffer(bData, GPUBufferUsage.STORAGE);
+      const outBuf = makeOutputBuffer(N);
 
-    const spec: TileKernelSpec = {
-      name: "blockRangeAdd",
-      workgroupSize: WG,
-      bindings: {
-        a:      { storage: "read", type: "f32" },
-        b:      { storage: "read", type: "f32" },
-        output: { storage: "read_write", type: "f32" },
-      },
-      uniforms: { N: "u32" },
-      grid: (u) => [Math.ceil(u.N / WG)],
-      kernel(ctx) {
-        const Nval = ctx.uniform("N");
-        const idx = ctx.blockRange(ctx.u32(0), WG);
-        const val = ctx.load("a", idx).add(ctx.load("b", idx));
-        ctx.guardedStore("output", idx.lt(Nval), idx, val);
-      },
-    };
+      const spec: TileKernelSpec = {
+        name: "blockRangeAdd",
+        workgroupSize: WG,
+        bindings: {
+          a: { storage: "read", type: "f32" },
+          b: { storage: "read", type: "f32" },
+          output: { storage: "read_write", type: "f32" },
+        },
+        uniforms: { N: "u32" },
+        grid: (u) => [Math.ceil(u.N / WG)],
+        kernel(ctx) {
+          const Nval = ctx.uniform("N");
+          const idx = ctx.blockRange(ctx.u32(0), WG);
+          const val = ctx.load("a", idx).add(ctx.load("b", idx));
+          ctx.guardedStore("output", idx.lt(Nval), idx, val);
+        },
+      };
 
-    const kernel = createTileKernelDispatcher(spec);
-    beginSharedEncoder();
-    kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { N });
-    flushSharedEncoder();
+      const kernel = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      kernel.dispatch({ a: aBuf, b: bBuf, output: outBuf }, { N });
+      flushSharedEncoder();
 
-    const result = await readF32Buffer(outBuf, N);
-    for (let i = 0; i < N; i++) {
-      expect(result[i]).toBeCloseTo(expected[i], 3);
-    }
+      const result = await readF32Buffer(outBuf, N);
+      for (let i = 0; i < N; i++) {
+        expect(result[i]).toBeCloseTo(expected[i], 3);
+      }
 
-    aBuf.destroy();
-    bBuf.destroy();
-    outBuf.destroy();
-  });
-});
+      aBuf.destroy();
+      bBuf.destroy();
+      outBuf.destroy();
+    });
+  },
+);
 
 // ============================================================================
 // Triton Gap: Scan Primitives
@@ -1230,7 +1305,7 @@ describe("Triton Gap: Scan primitives (WGSL)", () => {
       name: "inclusiveScanTest",
       workgroupSize: WG,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: { N: "u32" },
@@ -1262,7 +1337,9 @@ describe.runIf(isWebGPUEnabled)("Triton Gap: Scan primitives GPU", () => {
     queue = ctx.queue;
   });
 
-  afterAll(async () => { await syncWebGPU(); });
+  afterAll(async () => {
+    await syncWebGPU();
+  });
 
   it("inclusive prefix sum of [1,1,...,1] → [1,2,3,...,N]", async () => {
     const WG = 64;
@@ -1275,7 +1352,7 @@ describe.runIf(isWebGPUEnabled)("Triton Gap: Scan primitives GPU", () => {
       name: "inclusivePrefixSum",
       workgroupSize: WG,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
@@ -1305,7 +1382,9 @@ describe.runIf(isWebGPUEnabled)("Triton Gap: Scan primitives GPU", () => {
 
   it("inclusive max scan", async () => {
     const WG = 16;
-    const data = new Float32Array([3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3]);
+    const data = new Float32Array([
+      3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3,
+    ]);
 
     const inBuf = makeF32Buffer(data, GPUBufferUsage.STORAGE);
     const outBuf = makeOutputBuffer(WG);
@@ -1314,7 +1393,7 @@ describe.runIf(isWebGPUEnabled)("Triton Gap: Scan primitives GPU", () => {
       name: "inclusiveMaxScan",
       workgroupSize: WG,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
@@ -1350,7 +1429,7 @@ describe.runIf(isWebGPUEnabled)("Triton Gap: Scan primitives GPU", () => {
 // Triton Gap: Automatic Barrier Insertion
 // ============================================================================
 
-import { insertBarriers, validateBarriers, hoistLoopInvariants } from "../../src/backend/webgpu/tile-compiler";
+import { validateBarriers } from "../../src/backend/webgpu/tile-compiler";
 import { buildKernelIR } from "../../src/backend/webgpu/tile-ir";
 
 describe("Triton Gap: Automatic barrier insertion", () => {
@@ -1360,7 +1439,7 @@ describe("Triton Gap: Automatic barrier insertion", () => {
       workgroupSize: 64,
       autoBarriers: true,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
@@ -1384,7 +1463,7 @@ describe("Triton Gap: Automatic barrier insertion", () => {
       workgroupSize: 64,
       autoBarriers: true,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
@@ -1410,7 +1489,7 @@ describe("Triton Gap: Automatic barrier insertion", () => {
       workgroupSize: 64,
       autoBarriers: true,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
@@ -1456,7 +1535,7 @@ describe("Triton Gap: Automatic barrier insertion", () => {
       name: "validateMissing",
       workgroupSize: 64,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
@@ -1577,7 +1656,7 @@ describe("Triton Gap: Richer access analysis", () => {
       name: "divTest4",
       workgroupSize: 64,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
@@ -1590,10 +1669,10 @@ describe("Triton Gap: Richer access analysis", () => {
       },
     };
     const patterns = analyzeAccessPatterns(spec);
-    const load = patterns.find(p => p.accessType === "load");
+    const load = patterns.find((p) => p.accessType === "load");
     expect(load).toBeDefined();
-    expect(load!.innerStride).toBe(4);
-    expect(load!.baseDivisibility).toBe(4);
+    expect(load?.innerStride).toBe(4);
+    expect(load?.baseDivisibility).toBe(4);
   });
 
   it("globalId(0) * 2 + 1 has odd constant term", () => {
@@ -1601,7 +1680,7 @@ describe("Triton Gap: Richer access analysis", () => {
       name: "divTestOdd",
       workgroupSize: 64,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
@@ -1614,9 +1693,9 @@ describe("Triton Gap: Richer access analysis", () => {
       },
     };
     const patterns = analyzeAccessPatterns(spec);
-    const load = patterns.find(p => p.accessType === "load");
+    const load = patterns.find((p) => p.accessType === "load");
     expect(load).toBeDefined();
-    expect(load!.baseConstantTerm).toBe(1);
+    expect(load?.baseConstantTerm).toBe(1);
   });
 
   it("globalId(0) + const(0) has constantTerm 0", () => {
@@ -1624,7 +1703,7 @@ describe("Triton Gap: Richer access analysis", () => {
       name: "divTestZeroConst",
       workgroupSize: 64,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
@@ -1637,10 +1716,10 @@ describe("Triton Gap: Richer access analysis", () => {
       },
     };
     const patterns = analyzeAccessPatterns(spec);
-    const load = patterns.find(p => p.accessType === "load");
+    const load = patterns.find((p) => p.accessType === "load");
     expect(load).toBeDefined();
-    expect(load!.baseConstantTerm).toBe(0);
-    expect(load!.maxVecWidth).toBe(4);
+    expect(load?.baseConstantTerm).toBe(0);
+    expect(load?.maxVecWidth).toBe(4);
   });
 
   it("programId(0) * 128 + localIndex has divisibility tracking", () => {
@@ -1648,7 +1727,7 @@ describe("Triton Gap: Richer access analysis", () => {
       name: "divTestProgramId",
       workgroupSize: 64,
       bindings: {
-        input:  { storage: "read", type: "f32" },
+        input: { storage: "read", type: "f32" },
         output: { storage: "read_write", type: "f32" },
       },
       uniforms: {},
@@ -1662,10 +1741,10 @@ describe("Triton Gap: Richer access analysis", () => {
       },
     };
     const patterns = analyzeAccessPatterns(spec);
-    const load = patterns.find(p => p.accessType === "load");
+    const load = patterns.find((p) => p.accessType === "load");
     expect(load).toBeDefined();
-    expect(load!.innerStride).toBe(1);
-    expect(load!.isCoalesced).toBe(true);
+    expect(load?.innerStride).toBe(1);
+    expect(load?.isCoalesced).toBe(true);
   });
 });
 
@@ -1770,7 +1849,12 @@ describe("Triton Gap: sigmoid/clamp/fma/erf (WGSL)", () => {
       kernel(ctx) {
         const gid = ctx.globalId(0);
         const val = ctx.load("input", gid);
-        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, val.sigmoid());
+        ctx.guardedStore(
+          "output",
+          gid.lt(ctx.uniform("N")),
+          gid,
+          val.sigmoid(),
+        );
       },
     };
     const wgsl = compileTileKernel(spec);
@@ -1791,7 +1875,12 @@ describe("Triton Gap: sigmoid/clamp/fma/erf (WGSL)", () => {
       kernel(ctx) {
         const gid = ctx.globalId(0);
         const val = ctx.load("input", gid);
-        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, val.clamp(ctx.f32(0), ctx.f32(1)));
+        ctx.guardedStore(
+          "output",
+          gid.lt(ctx.uniform("N")),
+          gid,
+          val.clamp(ctx.f32(0), ctx.f32(1)),
+        );
       },
     };
     const wgsl = compileTileKernel(spec);
@@ -1832,13 +1921,16 @@ describe("Triton Gap: bitwise XOR (WGSL)", () => {
     const spec: TileKernelSpec = {
       name: "xorTest",
       workgroupSize: 64,
-      bindings: { input: { storage: "read", type: "u32" }, output: { storage: "read_write", type: "u32" } },
+      bindings: {
+        input: { storage: "read", type: "u32" },
+        output: { storage: "read_write", type: "u32" },
+      },
       uniforms: {},
       grid: () => [1],
       kernel: (ctx) => {
         const gid = ctx.globalId(0);
         const val = ctx.load("input", gid);
-        ctx.emitStore("output", gid, val.xor(ctx.u32(0xFF)));
+        ctx.emitStore("output", gid, val.xor(ctx.u32(0xff)));
       },
     };
     const wgsl = compileTileKernel(spec);
@@ -1867,7 +1959,10 @@ describe("Triton Gap: bitwise XOR (WGSL)", () => {
     const spec: TileKernelSpec = {
       name: "xorZero",
       workgroupSize: 64,
-      bindings: { input: { storage: "read", type: "u32" }, output: { storage: "read_write", type: "u32" } },
+      bindings: {
+        input: { storage: "read", type: "u32" },
+        output: { storage: "read_write", type: "u32" },
+      },
       uniforms: {},
       grid: () => [1],
       kernel: (ctx) => {
@@ -1904,7 +1999,10 @@ describe("Triton Gap: cdiv / floorDiv (WGSL)", () => {
     const spec: TileKernelSpec = {
       name: "cdivExpr",
       workgroupSize: 64,
-      bindings: { input: { storage: "read", type: "u32" }, output: { storage: "read_write", type: "u32" } },
+      bindings: {
+        input: { storage: "read", type: "u32" },
+        output: { storage: "read_write", type: "u32" },
+      },
       uniforms: {},
       grid: () => [1],
       kernel: (ctx) => {
@@ -1923,7 +2021,10 @@ describe("Triton Gap: cdiv / floorDiv (WGSL)", () => {
     const spec: TileKernelSpec = {
       name: "floorDivExpr",
       workgroupSize: 64,
-      bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
       uniforms: {},
       grid: () => [1],
       kernel: (ctx) => {
@@ -1996,7 +2097,10 @@ describe("Triton Gap: wgReduceGeneric (WGSL)", () => {
     const spec: TileKernelSpec = {
       name: "treeReduceProduct",
       workgroupSize: 64,
-      bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
       uniforms: {},
       grid: () => [1],
       kernel: (ctx) => {
@@ -2017,14 +2121,19 @@ describe("Triton Gap: wgReduceGeneric (WGSL)", () => {
     const spec: TileKernelSpec = {
       name: "wgReduceMin",
       workgroupSize: 64,
-      bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+      bindings: {
+        input: { storage: "read", type: "f32" },
+        output: { storage: "read_write", type: "f32" },
+      },
       uniforms: {},
       grid: () => [1],
       kernel: (ctx) => {
         const tid = ctx.localIndex();
         const result = ctx.wgReduceGeneric(
-          tid, ctx.u32(64), 64,
-          ctx.f32(3.402823e+38), // +inf identity
+          tid,
+          ctx.u32(64),
+          64,
+          ctx.f32(3.402823e38), // +inf identity
           (i) => ctx.load("input", i),
           (a, b) => a.min(b),
         );
@@ -2054,9 +2163,9 @@ describe("Triton Gap: Philox RNG (WGSL)", () => {
     const wgsl = compileTileKernel(spec);
     // Should contain Philox multiplier constant and XOR operations
     expect(wgsl).toContain("3528905107u"); // PHILOX_M = 0xD256D193
-    expect(wgsl).toContain("^");            // XOR mixing
+    expect(wgsl).toContain("^"); // XOR mixing
     // Should have 10 rounds of mixing (10 mulhi calls)
-    expect(wgsl).toContain("_phi_r9");     // last round
+    expect(wgsl).toContain("_phi_r9"); // last round
   });
 
   it("randF32 produces f32 output with u32→f32 cast", () => {
@@ -2074,14 +2183,17 @@ describe("Triton Gap: Philox RNG (WGSL)", () => {
       },
     };
     const wgsl = compileTileKernel(spec);
-    expect(wgsl).toContain("f32(");  // cast to f32
+    expect(wgsl).toContain("f32("); // cast to f32
   });
 
   it("randF32x2 produces two independent f32 values", () => {
     const spec: TileKernelSpec = {
       name: "randF32x2Test",
       workgroupSize: 64,
-      bindings: { out0: { storage: "read_write", type: "f32" }, out1: { storage: "read_write", type: "f32" } },
+      bindings: {
+        out0: { storage: "read_write", type: "f32" },
+        out1: { storage: "read_write", type: "f32" },
+      },
       uniforms: { seed: "u32" },
       grid: () => [1],
       kernel: (ctx) => {
@@ -2113,7 +2225,9 @@ describe.runIf(isWebGPUEnabled)("Triton Gap Round 2: GPU tests", () => {
     queue = ctx.queue;
   });
 
-  afterAll(async () => { await syncWebGPU(); });
+  afterAll(async () => {
+    await syncWebGPU();
+  });
 
   it("numPrograms returns correct grid dimension", async () => {
     const N = 128;
@@ -2127,20 +2241,36 @@ describe.runIf(isWebGPUEnabled)("Triton Gap Round 2: GPU tests", () => {
       grid: (u) => [Math.ceil(u.N / 64)],
       kernel(ctx) {
         const gid = ctx.globalId(0);
-        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, ctx.numPrograms(0));
+        ctx.guardedStore(
+          "output",
+          gid.lt(ctx.uniform("N")),
+          gid,
+          ctx.numPrograms(0),
+        );
       },
     };
     const kernel = createTileKernelDispatcher(spec);
-    const buf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const readBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-    beginSharedEncoder(); kernel.dispatch({ output: buf }, { N }); flushSharedEncoder(); await syncWebGPU();
+    const buf = device.createBuffer({
+      size: N * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+    const readBuf = device.createBuffer({
+      size: N * 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+    beginSharedEncoder();
+    kernel.dispatch({ output: buf }, { N });
+    flushSharedEncoder();
+    await syncWebGPU();
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(buf, 0, readBuf, 0, N * 4);
     queue.submit([enc.finish()]);
     await readBuf.mapAsync(GPUMapMode.READ);
     const data = new Uint32Array(readBuf.getMappedRange());
     for (let i = 0; i < N; i++) expect(data[i]).toBe(numWg);
-    readBuf.unmap(); buf.destroy(); readBuf.destroy();
+    readBuf.unmap();
+    buf.destroy();
+    readBuf.destroy();
   });
 
   it("exp2: 2^x for x in [0,1,2,3]", async () => {
@@ -2156,14 +2286,31 @@ describe.runIf(isWebGPUEnabled)("Triton Gap Round 2: GPU tests", () => {
       grid: (u) => [Math.ceil(u.N / 64)],
       kernel(ctx) {
         const gid = ctx.globalId(0);
-        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, ctx.load("input", gid).exp2());
+        ctx.guardedStore(
+          "output",
+          gid.lt(ctx.uniform("N")),
+          gid,
+          ctx.load("input", gid).exp2(),
+        );
       },
     };
-    const inputBuf = makeF32Buffer(new Float32Array([0, 1, 2, 3]), GPUBufferUsage.STORAGE);
-    const outBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const readBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const inputBuf = makeF32Buffer(
+      new Float32Array([0, 1, 2, 3]),
+      GPUBufferUsage.STORAGE,
+    );
+    const outBuf = device.createBuffer({
+      size: N * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+    const readBuf = device.createBuffer({
+      size: N * 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
     const kernel = createTileKernelDispatcher(spec);
-    beginSharedEncoder(); kernel.dispatch({ input: inputBuf, output: outBuf }, { N }); flushSharedEncoder(); await syncWebGPU();
+    beginSharedEncoder();
+    kernel.dispatch({ input: inputBuf, output: outBuf }, { N });
+    flushSharedEncoder();
+    await syncWebGPU();
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, N * 4);
     queue.submit([enc.finish()]);
@@ -2173,7 +2320,10 @@ describe.runIf(isWebGPUEnabled)("Triton Gap Round 2: GPU tests", () => {
     expect(r[1]).toBeCloseTo(2, 5);
     expect(r[2]).toBeCloseTo(4, 5);
     expect(r[3]).toBeCloseTo(8, 5);
-    readBuf.unmap(); inputBuf.destroy(); outBuf.destroy(); readBuf.destroy();
+    readBuf.unmap();
+    inputBuf.destroy();
+    outBuf.destroy();
+    readBuf.destroy();
   });
 
   it("sigmoid: sigmoid(0)=0.5, sigmoid(1)≈0.731", async () => {
@@ -2189,14 +2339,31 @@ describe.runIf(isWebGPUEnabled)("Triton Gap Round 2: GPU tests", () => {
       grid: (u) => [Math.ceil(u.N / 64)],
       kernel(ctx) {
         const gid = ctx.globalId(0);
-        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, ctx.load("input", gid).sigmoid());
+        ctx.guardedStore(
+          "output",
+          gid.lt(ctx.uniform("N")),
+          gid,
+          ctx.load("input", gid).sigmoid(),
+        );
       },
     };
-    const inputBuf = makeF32Buffer(new Float32Array([0, 1, -1, 10]), GPUBufferUsage.STORAGE);
-    const outBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const readBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const inputBuf = makeF32Buffer(
+      new Float32Array([0, 1, -1, 10]),
+      GPUBufferUsage.STORAGE,
+    );
+    const outBuf = device.createBuffer({
+      size: N * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+    const readBuf = device.createBuffer({
+      size: N * 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
     const kernel = createTileKernelDispatcher(spec);
-    beginSharedEncoder(); kernel.dispatch({ input: inputBuf, output: outBuf }, { N }); flushSharedEncoder(); await syncWebGPU();
+    beginSharedEncoder();
+    kernel.dispatch({ input: inputBuf, output: outBuf }, { N });
+    flushSharedEncoder();
+    await syncWebGPU();
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, N * 4);
     queue.submit([enc.finish()]);
@@ -2206,7 +2373,10 @@ describe.runIf(isWebGPUEnabled)("Triton Gap Round 2: GPU tests", () => {
     expect(r[1]).toBeCloseTo(0.7311, 3);
     expect(r[2]).toBeCloseTo(0.2689, 3);
     expect(r[3]).toBeCloseTo(1.0, 3);
-    readBuf.unmap(); inputBuf.destroy(); outBuf.destroy(); readBuf.destroy();
+    readBuf.unmap();
+    inputBuf.destroy();
+    outBuf.destroy();
+    readBuf.destroy();
   });
 
   it("erf: erf(0)=0, erf(1)≈0.843", async () => {
@@ -2222,14 +2392,31 @@ describe.runIf(isWebGPUEnabled)("Triton Gap Round 2: GPU tests", () => {
       grid: (u) => [Math.ceil(u.N / 64)],
       kernel(ctx) {
         const gid = ctx.globalId(0);
-        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, ctx.load("input", gid).erf());
+        ctx.guardedStore(
+          "output",
+          gid.lt(ctx.uniform("N")),
+          gid,
+          ctx.load("input", gid).erf(),
+        );
       },
     };
-    const inputBuf = makeF32Buffer(new Float32Array([0, 1, -1, 0.5]), GPUBufferUsage.STORAGE);
-    const outBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const readBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const inputBuf = makeF32Buffer(
+      new Float32Array([0, 1, -1, 0.5]),
+      GPUBufferUsage.STORAGE,
+    );
+    const outBuf = device.createBuffer({
+      size: N * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+    const readBuf = device.createBuffer({
+      size: N * 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
     const kernel = createTileKernelDispatcher(spec);
-    beginSharedEncoder(); kernel.dispatch({ input: inputBuf, output: outBuf }, { N }); flushSharedEncoder(); await syncWebGPU();
+    beginSharedEncoder();
+    kernel.dispatch({ input: inputBuf, output: outBuf }, { N });
+    flushSharedEncoder();
+    await syncWebGPU();
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, N * 4);
     queue.submit([enc.finish()]);
@@ -2239,7 +2426,10 @@ describe.runIf(isWebGPUEnabled)("Triton Gap Round 2: GPU tests", () => {
     expect(r[1]).toBeCloseTo(0.8427, 3);
     expect(r[2]).toBeCloseTo(-0.8427, 3);
     expect(r[3]).toBeCloseTo(0.5205, 3);
-    readBuf.unmap(); inputBuf.destroy(); outBuf.destroy(); readBuf.destroy();
+    readBuf.unmap();
+    inputBuf.destroy();
+    outBuf.destroy();
+    readBuf.destroy();
   });
 });
 
@@ -2247,116 +2437,153 @@ describe.runIf(isWebGPUEnabled)("Triton Gap Round 2: GPU tests", () => {
 // GPU tests for Round 3: Philox RNG
 // ============================================================================
 
-describe.runIf(isWebGPUEnabled)("Triton Gap Round 3: Philox RNG GPU tests", () => {
-  let device: any;
-  let queue: any;
+describe.runIf(isWebGPUEnabled)(
+  "Triton Gap Round 3: Philox RNG GPU tests",
+  () => {
+    let device: any;
+    let queue: any;
 
-  beforeAll(async () => {
-    const ok = await initWebGPU();
-    if (!ok) throw new Error("WebGPU init failed");
-    const ctx = getWebGPUDevice();
-    if (!ctx) throw new Error("No WebGPU device");
-    device = ctx.device;
-    queue = ctx.queue;
-  });
+    beforeAll(async () => {
+      const ok = await initWebGPU();
+      if (!ok) throw new Error("WebGPU init failed");
+      const ctx = getWebGPUDevice();
+      if (!ctx) throw new Error("No WebGPU device");
+      device = ctx.device;
+      queue = ctx.queue;
+    });
 
-  it("randF32 produces values in [0, 1) with reasonable distribution", async () => {
-    const N = 1024;
-    const spec: TileKernelSpec = {
-      name: "randF32GPU",
-      workgroupSize: 64,
-      bindings: { output: { storage: "read_write", type: "f32" } },
-      uniforms: { seed: "u32" },
-      grid: (u) => [Math.ceil(u.N / 64)],
-      kernel: (ctx) => {
-        const gid = ctx.globalId(0);
-        const seed = ctx.uniform("seed");
-        const val = ctx.randF32(seed, gid);
-        ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, val);
-      },
-    };
-    // Need to declare N uniform too
-    spec.uniforms.N = "u32";
+    it("randF32 produces values in [0, 1) with reasonable distribution", async () => {
+      const N = 1024;
+      const spec: TileKernelSpec = {
+        name: "randF32GPU",
+        workgroupSize: 64,
+        bindings: { output: { storage: "read_write", type: "f32" } },
+        uniforms: { seed: "u32" },
+        grid: (u) => [Math.ceil(u.N / 64)],
+        kernel: (ctx) => {
+          const gid = ctx.globalId(0);
+          const seed = ctx.uniform("seed");
+          const val = ctx.randF32(seed, gid);
+          ctx.guardedStore("output", gid.lt(ctx.uniform("N")), gid, val);
+        },
+      };
+      // Need to declare N uniform too
+      spec.uniforms.N = "u32";
 
-    const outBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const readBuf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-    const kernel = createTileKernelDispatcher(spec);
-    beginSharedEncoder(); kernel.dispatch({ output: outBuf }, { seed: 42, N }); flushSharedEncoder(); await syncWebGPU();
-    const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, N * 4);
-    queue.submit([enc.finish()]);
-    await readBuf.mapAsync(GPUMapMode.READ);
-    const r = new Float32Array(readBuf.getMappedRange());
+      const outBuf = device.createBuffer({
+        size: N * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+      const readBuf = device.createBuffer({
+        size: N * 4,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      const kernel = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      kernel.dispatch({ output: outBuf }, { seed: 42, N });
+      flushSharedEncoder();
+      await syncWebGPU();
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, N * 4);
+      queue.submit([enc.finish()]);
+      await readBuf.mapAsync(GPUMapMode.READ);
+      const r = new Float32Array(readBuf.getMappedRange());
 
-    // Check all values are in [0, 1)
-    let minVal = Infinity, maxVal = -Infinity, sum = 0;
-    for (let i = 0; i < N; i++) {
-      expect(r[i]).toBeGreaterThanOrEqual(0);
-      expect(r[i]).toBeLessThan(1);
-      minVal = Math.min(minVal, r[i]);
-      maxVal = Math.max(maxVal, r[i]);
-      sum += r[i];
-    }
-    // Mean should be roughly 0.5 (within reasonable tolerance for N=1024)
-    const mean = sum / N;
-    expect(mean).toBeGreaterThan(0.3);
-    expect(mean).toBeLessThan(0.7);
-    // Values should span a good range (not all clustered)
-    expect(minVal).toBeLessThan(0.1);
-    expect(maxVal).toBeGreaterThan(0.9);
+      // Check all values are in [0, 1)
+      let minVal = Infinity,
+        maxVal = -Infinity,
+        sum = 0;
+      for (let i = 0; i < N; i++) {
+        expect(r[i]).toBeGreaterThanOrEqual(0);
+        expect(r[i]).toBeLessThan(1);
+        minVal = Math.min(minVal, r[i]);
+        maxVal = Math.max(maxVal, r[i]);
+        sum += r[i];
+      }
+      // Mean should be roughly 0.5 (within reasonable tolerance for N=1024)
+      const mean = sum / N;
+      expect(mean).toBeGreaterThan(0.3);
+      expect(mean).toBeLessThan(0.7);
+      // Values should span a good range (not all clustered)
+      expect(minVal).toBeLessThan(0.1);
+      expect(maxVal).toBeGreaterThan(0.9);
 
-    readBuf.unmap(); outBuf.destroy(); readBuf.destroy();
-  });
+      readBuf.unmap();
+      outBuf.destroy();
+      readBuf.destroy();
+    });
 
-  it("different seeds produce different sequences", async () => {
-    const N = 64;
-    const spec: TileKernelSpec = {
-      name: "randSeedDiff",
-      workgroupSize: 64,
-      bindings: { output: { storage: "read_write", type: "f32" } },
-      uniforms: { seed: "u32" },
-      grid: () => [1],
-      kernel: (ctx) => {
-        const gid = ctx.globalId(0);
-        const seed = ctx.uniform("seed");
-        ctx.emitStore("output", gid, ctx.randF32(seed, gid));
-      },
-    };
+    it("different seeds produce different sequences", async () => {
+      const N = 64;
+      const spec: TileKernelSpec = {
+        name: "randSeedDiff",
+        workgroupSize: 64,
+        bindings: { output: { storage: "read_write", type: "f32" } },
+        uniforms: { seed: "u32" },
+        grid: () => [1],
+        kernel: (ctx) => {
+          const gid = ctx.globalId(0);
+          const seed = ctx.uniform("seed");
+          ctx.emitStore("output", gid, ctx.randF32(seed, gid));
+        },
+      };
 
-    // Generate with seed 1
-    const out1 = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const read1 = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-    const k1 = createTileKernelDispatcher(spec);
-    beginSharedEncoder(); k1.dispatch({ output: out1 }, { seed: 1 }); flushSharedEncoder(); await syncWebGPU();
-    let enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(out1, 0, read1, 0, N * 4);
-    queue.submit([enc.finish()]);
-    await read1.mapAsync(GPUMapMode.READ);
-    const r1 = new Float32Array(read1.getMappedRange().slice(0));
-    read1.unmap();
+      // Generate with seed 1
+      const out1 = device.createBuffer({
+        size: N * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+      const read1 = device.createBuffer({
+        size: N * 4,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      const k1 = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      k1.dispatch({ output: out1 }, { seed: 1 });
+      flushSharedEncoder();
+      await syncWebGPU();
+      let enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(out1, 0, read1, 0, N * 4);
+      queue.submit([enc.finish()]);
+      await read1.mapAsync(GPUMapMode.READ);
+      const r1 = new Float32Array(read1.getMappedRange().slice(0));
+      read1.unmap();
 
-    // Generate with seed 2
-    const out2 = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const read2 = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-    const k2 = createTileKernelDispatcher(spec);
-    beginSharedEncoder(); k2.dispatch({ output: out2 }, { seed: 2 }); flushSharedEncoder(); await syncWebGPU();
-    enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(out2, 0, read2, 0, N * 4);
-    queue.submit([enc.finish()]);
-    await read2.mapAsync(GPUMapMode.READ);
-    const r2 = new Float32Array(read2.getMappedRange().slice(0));
-    read2.unmap();
+      // Generate with seed 2
+      const out2 = device.createBuffer({
+        size: N * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+      const read2 = device.createBuffer({
+        size: N * 4,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      const k2 = createTileKernelDispatcher(spec);
+      beginSharedEncoder();
+      k2.dispatch({ output: out2 }, { seed: 2 });
+      flushSharedEncoder();
+      await syncWebGPU();
+      enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(out2, 0, read2, 0, N * 4);
+      queue.submit([enc.finish()]);
+      await read2.mapAsync(GPUMapMode.READ);
+      const r2 = new Float32Array(read2.getMappedRange().slice(0));
+      read2.unmap();
 
-    // At least some values should differ
-    let diffCount = 0;
-    for (let i = 0; i < N; i++) {
-      if (Math.abs(r1[i] - r2[i]) > 1e-7) diffCount++;
-    }
-    expect(diffCount).toBeGreaterThan(N / 2); // Most values should differ
+      // At least some values should differ
+      let diffCount = 0;
+      for (let i = 0; i < N; i++) {
+        if (Math.abs(r1[i] - r2[i]) > 1e-7) diffCount++;
+      }
+      expect(diffCount).toBeGreaterThan(N / 2); // Most values should differ
 
-    out1.destroy(); read1.destroy(); out2.destroy(); read2.destroy();
-  });
-});
+      out1.destroy();
+      read1.destroy();
+      out2.destroy();
+      read2.destroy();
+    });
+  },
+);
 
 // ============================================================================
 // Automatic Subgroup Optimization Tests
@@ -2383,7 +2610,10 @@ describe("Tile-IR Subgroup Optimization", () => {
       const spec: TileKernelSpec = {
         name: "sgNodes",
         workgroupSize: 64,
-        bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+        bindings: {
+          input: { storage: "read", type: "f32" },
+          output: { storage: "read_write", type: "f32" },
+        },
         uniforms: { N: "u32" },
         enableSubgroups: true,
         grid: (u) => [Math.ceil(u.N / 64)],
@@ -2439,13 +2669,18 @@ describe("Tile-IR Subgroup Optimization", () => {
       const spec: TileKernelSpec = {
         name: "sgWgReduce",
         workgroupSize: 256,
-        bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+        bindings: {
+          input: { storage: "read", type: "f32" },
+          output: { storage: "read_write", type: "f32" },
+        },
         uniforms: { N: "u32" },
         grid: () => [1],
         kernel: (ctx) => {
           const tid = ctx.localIndex();
           const N = ctx.uniform("N");
-          const result = ctx.wgReduce("sum", tid, N, 256, (i) => ctx.load("input", i));
+          const result = ctx.wgReduce("sum", tid, N, 256, (i) =>
+            ctx.load("input", i),
+          );
           ctx.ifThen(tid.eq(ctx.u32(0)), () => {
             ctx.emitStore("output", ctx.u32(0), result);
           });
@@ -2462,7 +2697,10 @@ describe("Tile-IR Subgroup Optimization", () => {
       const spec: TileKernelSpec = {
         name: "sgDualWgReduce",
         workgroupSize: 256,
-        bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+        bindings: {
+          input: { storage: "read", type: "f32" },
+          output: { storage: "read_write", type: "f32" },
+        },
         uniforms: { N: "u32" },
         grid: () => [1],
         kernel: (ctx) => {
@@ -2534,13 +2772,18 @@ describe("Tile-IR Subgroup Optimization", () => {
       const spec: TileKernelSpec = {
         name: "noSgWgReduce",
         workgroupSize: 256,
-        bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+        bindings: {
+          input: { storage: "read", type: "f32" },
+          output: { storage: "read_write", type: "f32" },
+        },
         uniforms: { N: "u32" },
         grid: () => [1],
         kernel: (ctx) => {
           const tid = ctx.localIndex();
           const N = ctx.uniform("N");
-          const result = ctx.wgReduce("sum", tid, N, 256, (i) => ctx.load("input", i));
+          const result = ctx.wgReduce("sum", tid, N, 256, (i) =>
+            ctx.load("input", i),
+          );
           ctx.ifThen(tid.eq(ctx.u32(0)), () => {
             ctx.emitStore("output", ctx.u32(0), result);
           });
@@ -2597,13 +2840,18 @@ describe("Tile-IR Subgroup Optimization", () => {
       const spec: TileKernelSpec = {
         name: "sgGpuReduceSum",
         workgroupSize: WG,
-        bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+        bindings: {
+          input: { storage: "read", type: "f32" },
+          output: { storage: "read_write", type: "f32" },
+        },
         uniforms: { N: "u32" },
         grid: () => [1],
         kernel: (ctx) => {
           const tid = ctx.localIndex();
           const Nuni = ctx.uniform("N");
-          const result = ctx.wgReduce("sum", tid, Nuni, WG, (i) => ctx.load("input", i));
+          const result = ctx.wgReduce("sum", tid, Nuni, WG, (i) =>
+            ctx.load("input", i),
+          );
           ctx.ifThen(tid.eq(ctx.u32(0)), () => {
             ctx.emitStore("output", ctx.u32(0), result);
           });
@@ -2616,8 +2864,14 @@ describe("Tile-IR Subgroup Optimization", () => {
       const expectedSum = (N * (N + 1)) / 2; // 524800
 
       const inputBuf = makeF32Buffer(inputData, GPUBufferUsage.STORAGE);
-      const outputBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-      const readBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const outputBuf = device.createBuffer({
+        size: 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+      const readBuf = device.createBuffer({
+        size: 4,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
 
       const dispatcher = createTileKernelDispatcher(spec);
       beginSharedEncoder();
@@ -2633,9 +2887,13 @@ describe("Tile-IR Subgroup Optimization", () => {
       readBuf.unmap();
 
       // Allow small floating point tolerance
-      expect(Math.abs(result[0] - expectedSum) / expectedSum).toBeLessThan(1e-4);
+      expect(Math.abs(result[0] - expectedSum) / expectedSum).toBeLessThan(
+        1e-4,
+      );
 
-      inputBuf.destroy(); outputBuf.destroy(); readBuf.destroy();
+      inputBuf.destroy();
+      outputBuf.destroy();
+      readBuf.destroy();
     });
 
     it("wgReduce max produces correct result", async () => {
@@ -2644,13 +2902,18 @@ describe("Tile-IR Subgroup Optimization", () => {
       const spec: TileKernelSpec = {
         name: "sgGpuReduceMax",
         workgroupSize: WG,
-        bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+        bindings: {
+          input: { storage: "read", type: "f32" },
+          output: { storage: "read_write", type: "f32" },
+        },
         uniforms: { N: "u32" },
         grid: () => [1],
         kernel: (ctx) => {
           const tid = ctx.localIndex();
           const Nuni = ctx.uniform("N");
-          const result = ctx.wgReduce("max", tid, Nuni, WG, (i) => ctx.load("input", i));
+          const result = ctx.wgReduce("max", tid, Nuni, WG, (i) =>
+            ctx.load("input", i),
+          );
           ctx.ifThen(tid.eq(ctx.u32(0)), () => {
             ctx.emitStore("output", ctx.u32(0), result);
           });
@@ -2662,8 +2925,14 @@ describe("Tile-IR Subgroup Optimization", () => {
       const expectedMax = Math.max(...inputData);
 
       const inputBuf = makeF32Buffer(inputData, GPUBufferUsage.STORAGE);
-      const outputBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-      const readBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const outputBuf = device.createBuffer({
+        size: 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+      const readBuf = device.createBuffer({
+        size: 4,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
 
       const dispatcher = createTileKernelDispatcher(spec);
       beginSharedEncoder();
@@ -2680,7 +2949,9 @@ describe("Tile-IR Subgroup Optimization", () => {
 
       expect(Math.abs(result[0] - expectedMax)).toBeLessThan(0.01);
 
-      inputBuf.destroy(); outputBuf.destroy(); readBuf.destroy();
+      inputBuf.destroy();
+      outputBuf.destroy();
+      readBuf.destroy();
     });
 
     it("dualWgReduce produces correct results", async () => {
@@ -2689,7 +2960,10 @@ describe("Tile-IR Subgroup Optimization", () => {
       const spec: TileKernelSpec = {
         name: "sgGpuDualReduce",
         workgroupSize: WG,
-        bindings: { input: { storage: "read", type: "f32" }, output: { storage: "read_write", type: "f32" } },
+        bindings: {
+          input: { storage: "read", type: "f32" },
+          output: { storage: "read_write", type: "f32" },
+        },
         uniforms: { N: "u32" },
         grid: () => [1],
         kernel: (ctx) => {
@@ -2708,12 +2982,22 @@ describe("Tile-IR Subgroup Optimization", () => {
 
       const inputData = new Float32Array(N);
       for (let i = 0; i < N; i++) inputData[i] = i + 1;
-      let expectedSum = 0, expectedSumSq = 0;
-      for (let i = 0; i < N; i++) { expectedSum += inputData[i]; expectedSumSq += inputData[i] * inputData[i]; }
+      let expectedSum = 0,
+        expectedSumSq = 0;
+      for (let i = 0; i < N; i++) {
+        expectedSum += inputData[i];
+        expectedSumSq += inputData[i] * inputData[i];
+      }
 
       const inputBuf = makeF32Buffer(inputData, GPUBufferUsage.STORAGE);
-      const outputBuf = device.createBuffer({ size: 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-      const readBuf = device.createBuffer({ size: 8, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const outputBuf = device.createBuffer({
+        size: 8,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+      const readBuf = device.createBuffer({
+        size: 8,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
 
       const dispatcher = createTileKernelDispatcher(spec);
       beginSharedEncoder();
@@ -2728,10 +3012,16 @@ describe("Tile-IR Subgroup Optimization", () => {
       const result = new Float32Array(readBuf.getMappedRange().slice(0));
       readBuf.unmap();
 
-      expect(Math.abs(result[0] - expectedSum) / expectedSum).toBeLessThan(1e-4);
-      expect(Math.abs(result[1] - expectedSumSq) / expectedSumSq).toBeLessThan(1e-3);
+      expect(Math.abs(result[0] - expectedSum) / expectedSum).toBeLessThan(
+        1e-4,
+      );
+      expect(Math.abs(result[1] - expectedSumSq) / expectedSumSq).toBeLessThan(
+        1e-3,
+      );
 
-      inputBuf.destroy(); outputBuf.destroy(); readBuf.destroy();
+      inputBuf.destroy();
+      outputBuf.destroy();
+      readBuf.destroy();
     });
 
     it("inclusiveScan produces correct prefix sums", async () => {
@@ -2751,8 +3041,14 @@ describe("Tile-IR Subgroup Optimization", () => {
         },
       };
 
-      const outputBuf = device.createBuffer({ size: WG * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-      const readBuf = device.createBuffer({ size: WG * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const outputBuf = device.createBuffer({
+        size: WG * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+      const readBuf = device.createBuffer({
+        size: WG * 4,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
 
       const dispatcher = createTileKernelDispatcher(spec);
       beginSharedEncoder();
@@ -2772,7 +3068,8 @@ describe("Tile-IR Subgroup Optimization", () => {
         expect(result[i]).toBeCloseTo(i + 1, 0);
       }
 
-      outputBuf.destroy(); readBuf.destroy();
+      outputBuf.destroy();
+      readBuf.destroy();
     });
   });
 
@@ -2894,9 +3191,14 @@ describe("Tile-IR Subgroup Optimization", () => {
         grid: () => [1],
         kernel(ctx) {
           const acc = ctx.emitVar("acc", "f32", ctx.f32(0));
-          ctx.forRange(ctx.u32(0), ctx.u32(32), (i) => {
-            acc.addAssign(i.toF32());
-          }, { unroll: true });
+          ctx.forRange(
+            ctx.u32(0),
+            ctx.u32(32),
+            (i) => {
+              acc.addAssign(i.toF32());
+            },
+            { unroll: true },
+          );
           ctx.emitStore("out", ctx.u32(0), acc.get());
         },
       };
@@ -2915,9 +3217,14 @@ describe("Tile-IR Subgroup Optimization", () => {
         grid: () => [1],
         kernel(ctx) {
           const acc = ctx.emitVar("acc", "f32", ctx.f32(0));
-          ctx.forRange(ctx.u32(0), ctx.uniform("N"), (i) => {
-            acc.addAssign(i.toF32());
-          }, { unroll: true }); // unroll ignored for dynamic bounds
+          ctx.forRange(
+            ctx.u32(0),
+            ctx.uniform("N"),
+            (i) => {
+              acc.addAssign(i.toF32());
+            },
+            { unroll: true },
+          ); // unroll ignored for dynamic bounds
           ctx.emitStore("out", ctx.u32(0), acc.get());
         },
       };
@@ -2970,35 +3277,40 @@ describe("Tile-IR Subgroup Optimization", () => {
       expect(wgsl).not.toContain("for (var _zi");
     });
 
-    it.skipIf(!isWebGPUEnabled)("GPU: unrolled loop produces correct results", async () => {
-      // Kernel: sum of 0..7 = 28, stored at out[0]
-      const spec: TileKernelSpec = {
-        name: "gpu_unroll_test",
-        workgroupSize: 64,
-        bindings: { out: { storage: "read_write", type: "f32" } },
-        uniforms: {},
-        grid: () => [1],
-        kernel(ctx) {
-          const tid = ctx.localIndex();
-          ctx.ifThen(tid.ge(ctx.u32(1)), () => { ctx.emitReturn(); });
-          const acc = ctx.emitVar("acc", "f32", ctx.f32(0));
-          ctx.forRange(ctx.u32(0), ctx.u32(8), (i) => {
-            acc.addAssign(i.toF32());
-          });
-          ctx.emitStore("out", ctx.u32(0), acc.get());
-        },
-      };
+    it.skipIf(!isWebGPUEnabled)(
+      "GPU: unrolled loop produces correct results",
+      async () => {
+        // Kernel: sum of 0..7 = 28, stored at out[0]
+        const spec: TileKernelSpec = {
+          name: "gpu_unroll_test",
+          workgroupSize: 64,
+          bindings: { out: { storage: "read_write", type: "f32" } },
+          uniforms: {},
+          grid: () => [1],
+          kernel(ctx) {
+            const tid = ctx.localIndex();
+            ctx.ifThen(tid.ge(ctx.u32(1)), () => {
+              ctx.emitReturn();
+            });
+            const acc = ctx.emitVar("acc", "f32", ctx.f32(0));
+            ctx.forRange(ctx.u32(0), ctx.u32(8), (i) => {
+              acc.addAssign(i.toF32());
+            });
+            ctx.emitStore("out", ctx.u32(0), acc.get());
+          },
+        };
 
-      const outBuf = makeOutputBuffer(1);
-      const dispatcher = createTileKernelDispatcher(spec);
-      beginSharedEncoder();
-      dispatcher.dispatch({ out: outBuf }, {});
-      flushSharedEncoder();
-      await syncWebGPU();
+        const outBuf = makeOutputBuffer(1);
+        const dispatcher = createTileKernelDispatcher(spec);
+        beginSharedEncoder();
+        dispatcher.dispatch({ out: outBuf }, {});
+        flushSharedEncoder();
+        await syncWebGPU();
 
-      const result = await readF32Buffer(outBuf, 1);
-      expect(result[0]).toBeCloseTo(28, 5); // 0+1+2+3+4+5+6+7 = 28
-      outBuf.destroy();
-    });
+        const result = await readF32Buffer(outBuf, 1);
+        expect(result[0]).toBeCloseTo(28, 5); // 0+1+2+3+4+5+6+7 = 28
+        outBuf.destroy();
+      },
+    );
   });
 });

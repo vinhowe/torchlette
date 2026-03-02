@@ -1,40 +1,48 @@
 import type { Backend, DType } from "../backend/types";
-import { gpuBuffer, type GPUBuffer } from "../backend/webgpu/gpu-types";
 import {
+  type BufferArena,
+  beginSharedEncoder,
+  clearActiveArena,
+  clearArenaExternalInputBuffers,
+  endSharedEncoder,
   flushBufferPool,
   flushSharedEncoder,
-  beginSharedEncoder,
-  endSharedEncoder,
   setActiveArena,
-  clearActiveArena,
   setArenaExternalInputBuffers,
-  clearArenaExternalInputBuffers,
-  type BufferArena,
 } from "../backend/webgpu";
-import { isProfilingEnabled, recordPlanAnalysis, type PlanAnalysis } from "../backend/webgpu/profiler";
+import { type GPUBuffer, gpuBuffer } from "../backend/webgpu/gpu-types";
+import {
+  isProfilingEnabled,
+  type PlanAnalysis,
+  recordPlanAnalysis,
+} from "../backend/webgpu/profiler";
+import type { CompoundMatch } from "./compound-patterns";
+import { executePlan } from "./executor-sequential";
 import {
   computePlanFingerprint,
-  groupToRecipe,
-  isFusibleOp,
   type ExecutionSegment,
   type FusionGroup,
+  groupToRecipe,
+  isFusibleOp,
 } from "./fusion-detect";
-import {
-  analyzeLifetimes,
-  type TensorLifetime,
-} from "./lifetime-analysis";
-import {
-  type LoweredPlan,
-  LoweredPlanBuilder,
-} from "./lowered-plan";
-import type { LazyIRNode, LazyRef, StorageHandle, ExecutionPlan } from "./lazy-types";
-import { releaseDeadTensors } from "./storage-tracker";
-import { extractPlanMetadata, pretunePlanMatmuls } from "./plan-builder";
-import { executePlan } from "./executor-sequential";
-import { executeFusedSegment, executeSequentialSegmentWithEarlyRelease, DEFAULT_RECLAIM_INTERVAL, type CompoundMatchExec } from "./segment-executors";
-import type { MatmulPrologueInfo } from "./matmul-epilogue";
-import type { CompoundMatch } from "./compound-patterns";
 import { analyzeGraph } from "./graph-compiler";
+import type {
+  ExecutionPlan,
+  LazyIRNode,
+  LazyRef,
+  StorageHandle,
+} from "./lazy-types";
+import { analyzeLifetimes, type TensorLifetime } from "./lifetime-analysis";
+import { type LoweredPlan, LoweredPlanBuilder } from "./lowered-plan";
+import type { MatmulPrologueInfo } from "./matmul-epilogue";
+import { extractPlanMetadata, pretunePlanMatmuls } from "./plan-builder";
+import {
+  type CompoundMatchExec,
+  DEFAULT_RECLAIM_INTERVAL,
+  executeFusedSegment,
+  executeSequentialSegmentWithEarlyRelease,
+} from "./segment-executors";
+import { releaseDeadTensors } from "./storage-tracker";
 
 /**
  * Options for optimized plan execution.
@@ -71,7 +79,6 @@ export interface OptimizedExecutionResult {
   stats: OptimizedExecutionStats;
 }
 
-
 // ============================================================================
 // Fusion Analysis Cache
 // ============================================================================
@@ -97,21 +104,37 @@ export interface FusionAnalysisTemplate {
   epilogueChains: Array<[number, number[]]>;
 
   /** Matmul prologues: [origPos, [{inputIndex, castOrigPos, fromDtype, toDtype}]]. */
-  prologueDescs: Array<[number, Array<{
-    inputIndex: 0 | 1;
-    castOrigPos: number;
-    fromDtype: DType;
-    toDtype: DType;
-  }>]>;
+  prologueDescs: Array<
+    [
+      number,
+      Array<{
+        inputIndex: 0 | 1;
+        castOrigPos: number;
+        fromDtype: DType;
+        toDtype: DType;
+      }>,
+    ]
+  >;
 
   /** Compound pattern matches (position-based: coveredOrigPoss, outputOrigPos, dim). */
-  compoundDescs?: Array<{ name: string; coveredOrigPoss: number[]; outputOrigPos: number; dim: number }>;
+  compoundDescs?: Array<{
+    name: string;
+    coveredOrigPoss: number[];
+    outputOrigPos: number;
+    dim: number;
+  }>;
 
   /** Original plan positions of graph-rewrite-bypassed nodes (identity casts, etc.). */
   rewriteBypassedOrigPoss?: number[];
 
   /** Cached lifetime analysis (position-based). */
-  lifetimeTemplate?: Array<{ firstUse: number; lastUse: number; isOutput: boolean; isInput: boolean; bufferSize: number }>;
+  lifetimeTemplate?: Array<{
+    firstUse: number;
+    lastUse: number;
+    isOutput: boolean;
+    isInput: boolean;
+    bufferSize: number;
+  }>;
 
   /** Cached lowered execution plan (built during first execution on cache miss). */
   loweredPlan?: LoweredPlan;
@@ -142,7 +165,9 @@ export type CachedSegmentDesc =
 export const fusionAnalysisCache = new Map<number, FusionAnalysisTemplate>();
 
 /** Get a cached fusion analysis template by fingerprint. */
-export function getFusionAnalysisTemplate(fingerprint: number): FusionAnalysisTemplate | undefined {
+export function getFusionAnalysisTemplate(
+  fingerprint: number,
+): FusionAnalysisTemplate | undefined {
   return fusionAnalysisCache.get(fingerprint);
 }
 
@@ -160,7 +185,9 @@ export function getFusionAnalysisTemplate(fingerprint: number): FusionAnalysisTe
  */
 export async function executePlanOptimized(
   plan: ExecutionPlan,
-  backend: Backend & { device?: { limits?: { maxStorageBuffersPerShaderStage?: number } } },
+  backend: Backend & {
+    device?: { limits?: { maxStorageBuffersPerShaderStage?: number } };
+  },
   options: OptimizedExecutionOptions = {},
 ): Promise<OptimizedExecutionResult> {
   if (plan.nodes.length === 0) {
@@ -235,7 +262,7 @@ export async function executePlanOptimized(
 
   if (cachedTemplate) {
     // ── Cache hit: reconstruct from template ──
-    planNodes = cachedTemplate.finalPerm.map(i => plan.nodes[i]);
+    planNodes = cachedTemplate.finalPerm.map((i) => plan.nodes[i]);
 
     // Reconstruct epilogue/prologue ID sets
     for (const pos of cachedTemplate.epilogueClaimedOrigPoss) {
@@ -247,23 +274,26 @@ export async function executePlanOptimized(
     for (const [matmulPos, epiloguePoss] of cachedTemplate.epilogueChains) {
       matmulEpilogueChains.set(
         plan.nodes[matmulPos].id,
-        epiloguePoss.map(p => plan.nodes[p].id),
+        epiloguePoss.map((p) => plan.nodes[p].id),
       );
     }
     for (const [matmulPos, descs] of cachedTemplate.prologueDescs) {
-      matmulPrologues.set(plan.nodes[matmulPos].id, descs.map(d => ({
-        inputIndex: d.inputIndex,
-        castNodeId: plan.nodes[d.castOrigPos].id,
-        originalInputRef: plan.nodes[d.castOrigPos].inputs[0],
-        fromDtype: d.fromDtype,
-        toDtype: d.toDtype,
-      })));
+      matmulPrologues.set(
+        plan.nodes[matmulPos].id,
+        descs.map((d) => ({
+          inputIndex: d.inputIndex,
+          castNodeId: plan.nodes[d.castOrigPos].id,
+          originalInputRef: plan.nodes[d.castOrigPos].inputs[0],
+          fromDtype: d.fromDtype,
+          toDtype: d.toDtype,
+        })),
+      );
     }
 
     // Reconstruct compound pattern matches from cached template
     if (cachedTemplate.compoundDescs) {
       for (const desc of cachedTemplate.compoundDescs) {
-        const coveredIds = desc.coveredOrigPoss.map(p => plan.nodes[p].id);
+        const coveredIds = desc.coveredOrigPoss.map((p) => plan.nodes[p].id);
         compoundMatches.push({
           name: desc.name,
           coveredNodeIds: coveredIds,
@@ -297,31 +327,48 @@ export async function executePlanOptimized(
     }
 
     // Reconstruct segments from cached pattern
-    segments = cachedTemplate.segments.map(seg => {
+    segments = cachedTemplate.segments.map((seg) => {
       if (seg.kind === "sequential") {
         return {
           kind: "sequential" as const,
-          nodes: seg.finalPoss.map(i => planNodes[i]),
+          nodes: seg.finalPoss.map((i) => planNodes[i]),
         };
       }
       // Reconstruct FusionGroup
-      const groupNodes = seg.finalPoss.map(i => planNodes[i]);
-      const groupNodeIds = new Set(groupNodes.map(n => n.id));
+      const groupNodes = seg.finalPoss.map((i) => planNodes[i]);
+      const groupNodeIds = new Set(groupNodes.map((n) => n.id));
       const extInputs: LazyRef[] = [];
       for (const node of groupNodes) {
         for (const inp of node.inputs) {
           if (inp.kind === "pending") {
-            if (!groupNodeIds.has(inp.node.id) &&
-                !extInputs.some(ei => ei.kind === "pending" && ei.node.id === inp.node.id)) {
+            if (
+              !groupNodeIds.has(inp.node.id) &&
+              !extInputs.some(
+                (ei) => ei.kind === "pending" && ei.node.id === inp.node.id,
+              )
+            ) {
               extInputs.push(inp);
             }
           } else if (inp.kind === "scalar") {
             // Deduplicate scalar inputs by value+dtype
-            if (!extInputs.some(ei => ei.kind === "scalar" && ei.value === inp.value && ei.dtype === inp.dtype)) {
+            if (
+              !extInputs.some(
+                (ei) =>
+                  ei.kind === "scalar" &&
+                  ei.value === inp.value &&
+                  ei.dtype === inp.dtype,
+              )
+            ) {
               extInputs.push(inp);
             }
           } else {
-            if (!extInputs.some(ei => ei.kind === "materialized" && ei.storage.id === inp.storage.id)) {
+            if (
+              !extInputs.some(
+                (ei) =>
+                  ei.kind === "materialized" &&
+                  ei.storage.id === inp.storage.id,
+              )
+            ) {
               extInputs.push(inp);
             }
           }
@@ -332,10 +379,14 @@ export async function executePlanOptimized(
         planIndices: seg.finalPoss,
         externalInputs: extInputs,
         outputNode: planNodes[seg.outputFinalPos],
-        additionalOutputNodes: seg.additionalOutputFinalPoss.length > 0
-          ? seg.additionalOutputFinalPoss.map(i => planNodes[i]) : undefined,
-        neededIntermediates: seg.neededIntermediateFinalPoss.length > 0
-          ? seg.neededIntermediateFinalPoss.map(i => planNodes[i]) : undefined,
+        additionalOutputNodes:
+          seg.additionalOutputFinalPoss.length > 0
+            ? seg.additionalOutputFinalPoss.map((i) => planNodes[i])
+            : undefined,
+        neededIntermediates:
+          seg.neededIntermediateFinalPoss.length > 0
+            ? seg.neededIntermediateFinalPoss.map((i) => planNodes[i])
+            : undefined,
       };
       const recipe = groupToRecipe(group);
       return { kind: "fused" as const, group, recipe };
@@ -343,7 +394,11 @@ export async function executePlanOptimized(
   } else {
     // ── Cache miss: run full analysis via unified graph compiler ──
 
-    const analysis = analyzeGraph(plan.nodes, externalNodeIds, maxStorageBuffers);
+    const analysis = analyzeGraph(
+      plan.nodes,
+      externalNodeIds,
+      maxStorageBuffers,
+    );
     planNodes = analysis.planNodes;
     segments = analysis.segments;
 
@@ -351,8 +406,10 @@ export async function executePlanOptimized(
     for (const id of analysis.epilogueClaimedIds) epilogueClaimedIds.add(id);
     for (const id of analysis.prologueClaimedIds) prologueClaimedIds.add(id);
     for (const id of analysis.compoundClaimedIds) compoundClaimedIds.add(id);
-    for (const [mmId, chain] of analysis.matmulEpilogueChains) matmulEpilogueChains.set(mmId, chain);
-    for (const [mmId, prologues] of analysis.matmulPrologues) matmulPrologues.set(mmId, prologues);
+    for (const [mmId, chain] of analysis.matmulEpilogueChains)
+      matmulEpilogueChains.set(mmId, chain);
+    for (const [mmId, prologues] of analysis.matmulPrologues)
+      matmulPrologues.set(mmId, prologues);
     compoundMatches = analysis.compoundMatches;
     analysisConsumerCount = analysis.consumerCount;
 
@@ -361,58 +418,86 @@ export async function executePlanOptimized(
     for (let i = 0; i < plan.nodes.length; i++) {
       origIdToPos.set(plan.nodes[i].id, i);
     }
-    const finalPerm = planNodes.map(n => origIdToPos.get(n.id)!);
+    const finalPerm = planNodes.map((n) => origIdToPos.get(n.id)!);
 
     const finalIdToPos = new Map<number, number>();
     for (let i = 0; i < planNodes.length; i++) {
       finalIdToPos.set(planNodes[i].id, i);
     }
 
-    const cachedSegments: CachedSegmentDesc[] = segments.map(seg => {
+    const cachedSegments: CachedSegmentDesc[] = segments.map((seg) => {
       if (seg.kind === "sequential") {
         return {
           kind: "sequential" as const,
-          finalPoss: seg.nodes.map(n => finalIdToPos.get(n.id)!),
+          finalPoss: seg.nodes.map((n) => finalIdToPos.get(n.id)!),
         };
       }
       return {
         kind: "fused" as const,
-        finalPoss: seg.group.nodes.map(n => finalIdToPos.get(n.id)!),
+        finalPoss: seg.group.nodes.map((n) => finalIdToPos.get(n.id)!),
         outputFinalPos: finalIdToPos.get(seg.group.outputNode.id)!,
-        additionalOutputFinalPoss: (seg.group.additionalOutputNodes ?? [])
-          .map(n => finalIdToPos.get(n.id)!),
-        neededIntermediateFinalPoss: (seg.group.neededIntermediates ?? [])
-          .map(n => finalIdToPos.get(n.id)!),
+        additionalOutputFinalPoss: (seg.group.additionalOutputNodes ?? []).map(
+          (n) => finalIdToPos.get(n.id)!,
+        ),
+        neededIntermediateFinalPoss: (seg.group.neededIntermediates ?? []).map(
+          (n) => finalIdToPos.get(n.id)!,
+        ),
       };
     });
 
     const template: FusionAnalysisTemplate = {
       finalPerm,
       segments: cachedSegments,
-      epilogueClaimedOrigPoss: [...epilogueClaimedIds].map(id => origIdToPos.get(id)!),
-      prologueClaimedOrigPoss: [...prologueClaimedIds].map(id => origIdToPos.get(id)!),
-      epilogueChains: [...matmulEpilogueChains].map(([mmId, epilogueIds]) => [
-        origIdToPos.get(mmId)!,
-        epilogueIds.map(id => origIdToPos.get(id)!),
-      ] as [number, number[]]),
-      prologueDescs: [...matmulPrologues].map(([mmId, prologues]) => [
-        origIdToPos.get(mmId)!,
-        prologues.map(p => ({
-          inputIndex: p.inputIndex,
-          castOrigPos: origIdToPos.get(p.castNodeId)!,
-          fromDtype: p.fromDtype,
-          toDtype: p.toDtype,
-        })),
-      ] as [number, Array<{ inputIndex: 0 | 1; castOrigPos: number; fromDtype: DType; toDtype: DType }>]),
-      compoundDescs: compoundMatches.length > 0 ? compoundMatches.map(m => ({
-        name: m.name,
-        coveredOrigPoss: m.coveredNodeIds.map(id => origIdToPos.get(id)!),
-        outputOrigPos: origIdToPos.get(m.outputNodeId)!,
-        dim: m.dim,
-      })) : undefined,
-      rewriteBypassedOrigPoss: analysis.rewriteBypassedIds.size > 0
-        ? [...analysis.rewriteBypassedIds].map(id => origIdToPos.get(id)!).filter(p => p !== undefined)
-        : undefined,
+      epilogueClaimedOrigPoss: [...epilogueClaimedIds].map(
+        (id) => origIdToPos.get(id)!,
+      ),
+      prologueClaimedOrigPoss: [...prologueClaimedIds].map(
+        (id) => origIdToPos.get(id)!,
+      ),
+      epilogueChains: [...matmulEpilogueChains].map(
+        ([mmId, epilogueIds]) =>
+          [
+            origIdToPos.get(mmId)!,
+            epilogueIds.map((id) => origIdToPos.get(id)!),
+          ] as [number, number[]],
+      ),
+      prologueDescs: [...matmulPrologues].map(
+        ([mmId, prologues]) =>
+          [
+            origIdToPos.get(mmId)!,
+            prologues.map((p) => ({
+              inputIndex: p.inputIndex,
+              castOrigPos: origIdToPos.get(p.castNodeId)!,
+              fromDtype: p.fromDtype,
+              toDtype: p.toDtype,
+            })),
+          ] as [
+            number,
+            Array<{
+              inputIndex: 0 | 1;
+              castOrigPos: number;
+              fromDtype: DType;
+              toDtype: DType;
+            }>,
+          ],
+      ),
+      compoundDescs:
+        compoundMatches.length > 0
+          ? compoundMatches.map((m) => ({
+              name: m.name,
+              coveredOrigPoss: m.coveredNodeIds.map(
+                (id) => origIdToPos.get(id)!,
+              ),
+              outputOrigPos: origIdToPos.get(m.outputNodeId)!,
+              dim: m.dim,
+            }))
+          : undefined,
+      rewriteBypassedOrigPoss:
+        analysis.rewriteBypassedIds.size > 0
+          ? [...analysis.rewriteBypassedIds]
+              .map((id) => origIdToPos.get(id)!)
+              .filter((p) => p !== undefined)
+          : undefined,
     };
     fusionAnalysisCache.set(fingerprint, template);
   }
@@ -432,24 +517,35 @@ export async function executePlanOptimized(
   // Skip if already reconstructed from cached template (cache hit path above).
   if (enableEarlyRelease && !lifetimes) {
     const reorderedPlan = { nodes: planNodes };
-    const { nodeOrder, nodeInputs, nodeSizes } = extractPlanMetadata(reorderedPlan);
+    const { nodeOrder, nodeInputs, nodeSizes } =
+      extractPlanMetadata(reorderedPlan);
     const lastNodeId = plan.nodes[plan.nodes.length - 1].id;
     outputNodeIds = new Set([lastNodeId]);
     if (externalNodeIds) {
       for (const id of externalNodeIds) outputNodeIds.add(id);
     }
-    lifetimes = analyzeLifetimes(nodeOrder, nodeInputs, outputNodeIds, nodeSizes);
+    lifetimes = analyzeLifetimes(
+      nodeOrder,
+      nodeInputs,
+      outputNodeIds,
+      nodeSizes,
+    );
 
     // Store lifetime template in the fusion analysis cache for future hits
     const cached = fusionAnalysisCache.get(fingerprint);
     if (cached && !cached.lifetimeTemplate) {
       cached.lifetimeTemplate = planNodes.map((node) => {
-        const lt = lifetimes!.get(node.id)!;
-        return { firstUse: lt.firstUse, lastUse: lt.lastUse, isOutput: lt.isOutput, isInput: lt.isInput, bufferSize: lt.bufferSize };
+        const lt = lifetimes?.get(node.id)!;
+        return {
+          firstUse: lt.firstUse,
+          lastUse: lt.lastUse,
+          isOutput: lt.isOutput,
+          isInput: lt.isInput,
+          bufferSize: lt.bufferSize,
+        };
       });
     }
   }
-
 
   // Collect plan analysis for profiling
   let planAnalysisRef: PlanAnalysis | null = null;
@@ -459,10 +555,16 @@ export async function executePlanOptimized(
     let fusedNodeCount = 0;
     let fusionGroupCount = 0;
     const sequentialOps: Record<string, number> = {};
-    const unfusedByShape: Record<string, { count: number; ops: Record<string, number> }> = {};
+    const unfusedByShape: Record<
+      string,
+      { count: number; ops: Record<string, number> }
+    > = {};
 
     for (const segment of segments) {
-      if (segment.kind === "fused" && segment.group.nodes.length >= minFusionSize) {
+      if (
+        segment.kind === "fused" &&
+        segment.group.nodes.length >= minFusionSize
+      ) {
         fusedSegCount++;
         fusedNodeCount += segment.group.nodes.length;
         fusionGroupCount++;
@@ -473,7 +575,10 @@ export async function executePlanOptimized(
           if (isFusibleOp(node.op)) {
             const shapeKey = node.shape.join(",");
             let bucket = unfusedByShape[shapeKey];
-            if (!bucket) { bucket = { count: 0, ops: {} }; unfusedByShape[shapeKey] = bucket; }
+            if (!bucket) {
+              bucket = { count: 0, ops: {} };
+              unfusedByShape[shapeKey] = bucket;
+            }
             bucket.count++;
             bucket.ops[node.op] = (bucket.ops[node.op] ?? 0) + 1;
           }
@@ -482,10 +587,17 @@ export async function executePlanOptimized(
         seqSegCount++;
         for (const node of segment.nodes) {
           sequentialOps[node.op] = (sequentialOps[node.op] ?? 0) + 1;
-          if (isFusibleOp(node.op) && !epilogueClaimedIds.has(node.id) && !prologueClaimedIds.has(node.id)) {
+          if (
+            isFusibleOp(node.op) &&
+            !epilogueClaimedIds.has(node.id) &&
+            !prologueClaimedIds.has(node.id)
+          ) {
             const shapeKey = node.shape.join(",");
             let bucket = unfusedByShape[shapeKey];
-            if (!bucket) { bucket = { count: 0, ops: {} }; unfusedByShape[shapeKey] = bucket; }
+            if (!bucket) {
+              bucket = { count: 0, ops: {} };
+              unfusedByShape[shapeKey] = bucket;
+            }
             bucket.count++;
             bucket.ops[node.op] = (bucket.ops[node.op] ?? 0) + 1;
           }
@@ -500,7 +612,11 @@ export async function executePlanOptimized(
       for (let i = 0; i < segment.nodes.length - 1; i++) {
         const cur = segment.nodes[i];
         const next = segment.nodes[i + 1];
-        if (isFusibleOp(cur.op) && cur.op !== "cast" && (next.op === "sum" || next.op === "mean")) {
+        if (
+          isFusibleOp(cur.op) &&
+          cur.op !== "cast" &&
+          (next.op === "sum" || next.op === "mean")
+        ) {
           reductionFusionEstimate++;
         }
       }
@@ -536,7 +652,10 @@ export async function executePlanOptimized(
       for (const n of planNodes) {
         for (const ref of n.inputs) {
           if (ref.kind === "pending") {
-            planConsumerCount.set(ref.node.id, (planConsumerCount.get(ref.node.id) ?? 0) + 1);
+            planConsumerCount.set(
+              ref.node.id,
+              (planConsumerCount.get(ref.node.id) ?? 0) + 1,
+            );
           }
         }
       }
@@ -554,10 +673,12 @@ export async function executePlanOptimized(
   // This is critical for the fallback path: when executeLoweredPlan fails and
   // we fall back to executePlanOptimized, the arena still provides stable buffer
   // identities for bind group cache hits.
-  const useArenaFallback = useTopLevelSharedEncoder && cachedTemplate?.bufferArena
-    && process.env.TORCHLETTE_USE_ARENA !== "0";
+  const useArenaFallback =
+    useTopLevelSharedEncoder &&
+    cachedTemplate?.bufferArena &&
+    process.env.TORCHLETTE_USE_ARENA !== "0";
   if (useArenaFallback) {
-    setActiveArena(cachedTemplate!.bufferArena!);
+    setActiveArena(cachedTemplate?.bufferArena!);
     // Register external input buffers for arena conflict detection
     const extBufs: GPUBuffer[] = [];
     for (const node of planNodes) {
@@ -575,122 +696,144 @@ export async function executePlanOptimized(
   }
 
   try {
+    // Build compound match map: maps the first covered node ID (in plan order)
+    // to the execution descriptor, and all other covered nodes to skip entries.
+    let compoundMatchMap: Map<number, CompoundMatchExec> | undefined;
+    if (compoundMatches.length > 0) {
+      compoundMatchMap = new Map();
+      // Build a nodeId→position map for finding first covered node in plan order
+      const idToPos = new Map<number, number>();
+      for (let i = 0; i < planNodes.length; i++)
+        idToPos.set(planNodes[i].id, i);
 
-  // Build compound match map: maps the first covered node ID (in plan order)
-  // to the execution descriptor, and all other covered nodes to skip entries.
-  let compoundMatchMap: Map<number, CompoundMatchExec> | undefined;
-  if (compoundMatches.length > 0) {
-    compoundMatchMap = new Map();
-    // Build a nodeId→position map for finding first covered node in plan order
-    const idToPos = new Map<number, number>();
-    for (let i = 0; i < planNodes.length; i++) idToPos.set(planNodes[i].id, i);
+      for (const match of compoundMatches) {
+        // Find the first covered node in plan order
+        let firstPos = Infinity;
+        let firstId = match.coveredNodeIds[0];
+        for (const id of match.coveredNodeIds) {
+          const pos = idToPos.get(id) ?? Infinity;
+          if (pos < firstPos) {
+            firstPos = pos;
+            firstId = id;
+          }
+        }
 
-    for (const match of compoundMatches) {
-      // Find the first covered node in plan order
-      let firstPos = Infinity;
-      let firstId = match.coveredNodeIds[0];
-      for (const id of match.coveredNodeIds) {
-        const pos = idToPos.get(id) ?? Infinity;
-        if (pos < firstPos) { firstPos = pos; firstId = id; }
-      }
-
-      const coveredSet = new Set(match.coveredNodeIds);
-      // Map the first node to the full match descriptor
-      compoundMatchMap.set(firstId, {
-        name: match.name,
-        coveredNodeIds: coveredSet,
-        outputNodeId: match.outputNodeId,
-        dim: match.dim,
-      });
-      // Map remaining covered nodes to skip entries
-      for (const id of match.coveredNodeIds) {
-        if (id !== firstId) {
-          compoundMatchMap.set(id, { name: "", coveredNodeIds: coveredSet, outputNodeId: match.outputNodeId, dim: match.dim });
+        const coveredSet = new Set(match.coveredNodeIds);
+        // Map the first node to the full match descriptor
+        compoundMatchMap.set(firstId, {
+          name: match.name,
+          coveredNodeIds: coveredSet,
+          outputNodeId: match.outputNodeId,
+          dim: match.dim,
+        });
+        // Map remaining covered nodes to skip entries
+        for (const id of match.coveredNodeIds) {
+          if (id !== firstId) {
+            compoundMatchMap.set(id, {
+              name: "",
+              coveredNodeIds: coveredSet,
+              outputNodeId: match.outputNodeId,
+              dim: match.dim,
+            });
+          }
         }
       }
     }
-  }
 
-  // Track dispatched nodes for periodic buffer reclamation.
-  // When the shared encoder is active, released buffers go to pendingRelease
-  // and can't be reused. Periodically flushing moves them back to the main pool.
-  let nodesSinceReclaim = 0;
+    // Track dispatched nodes for periodic buffer reclamation.
+    // When the shared encoder is active, released buffers go to pendingRelease
+    // and can't be reused. Periodically flushing moves them back to the main pool.
+    let nodesSinceReclaim = 0;
 
-  // Execute each segment
-  for (const segment of segments) {
-    if (
-      segment.kind === "fused" &&
-      segment.group.nodes.length >= minFusionSize
-    ) {
-      // Execute fused segment
-      await executeFusedSegment(
-        segment.group,
-        segment.recipe,
-        backend,
-        enableVectorization,
-      );
-      stats.fusedNodes += segment.group.nodes.length;
-      stats.fusionGroups++;
-
-      // Record fused action in lowered plan builder
-      if (loweredPlanBuilder) {
-        loweredPlanBuilder.recordFused(
-          segment.group.nodes.map(n => nodeIdToFinalPos.get(n.id)!),
-          nodeIdToFinalPos.get(segment.group.outputNode.id)!,
-          (segment.group.additionalOutputNodes ?? []).map(n => nodeIdToFinalPos.get(n.id)!),
-          (segment.group.neededIntermediates ?? []).map(n => nodeIdToFinalPos.get(n.id)!),
+    // Execute each segment
+    for (const segment of segments) {
+      if (
+        segment.kind === "fused" &&
+        segment.group.nodes.length >= minFusionSize
+      ) {
+        // Execute fused segment
+        await executeFusedSegment(
+          segment.group,
           segment.recipe,
+          backend,
           enableVectorization,
         );
-      }
+        stats.fusedNodes += segment.group.nodes.length;
+        stats.fusionGroups++;
 
-      // Track storages and release dead buffers for fused nodes
-      if (enableEarlyRelease) {
-        for (const node of segment.group.nodes) {
-          if (node.result) {
-            nodeToStorage.set(node.id, node.result);
-          }
-          overallStep++;
-          releaseDeadTensors(lifetimes, overallStep, outputNodeIds, alreadyReleased, nodeToStorage);
+        // Record fused action in lowered plan builder
+        if (loweredPlanBuilder) {
+          loweredPlanBuilder.recordFused(
+            segment.group.nodes.map((n) => nodeIdToFinalPos.get(n.id)!),
+            nodeIdToFinalPos.get(segment.group.outputNode.id)!,
+            (segment.group.additionalOutputNodes ?? []).map(
+              (n) => nodeIdToFinalPos.get(n.id)!,
+            ),
+            (segment.group.neededIntermediates ?? []).map(
+              (n) => nodeIdToFinalPos.get(n.id)!,
+            ),
+            segment.recipe,
+            enableVectorization,
+          );
         }
+
+        // Track storages and release dead buffers for fused nodes
+        if (enableEarlyRelease) {
+          for (const node of segment.group.nodes) {
+            if (node.result) {
+              nodeToStorage.set(node.id, node.result);
+            }
+            overallStep++;
+            releaseDeadTensors(
+              lifetimes,
+              overallStep,
+              outputNodeIds,
+              alreadyReleased,
+              nodeToStorage,
+            );
+          }
+        }
+        nodesSinceReclaim += segment.group.nodes.length;
+      } else {
+        // Execute sequentially (too-small fusion groups or sequential segments)
+        const seqNodes =
+          segment.kind === "fused" ? segment.group.nodes : segment.nodes;
+        await executeSequentialSegmentWithEarlyRelease(
+          seqNodes,
+          backend,
+          enableEarlyRelease,
+          lifetimes,
+          outputNodeIds,
+          alreadyReleased,
+          nodeToStorage,
+          overallStep,
+          externalNodeIds,
+          planNodes,
+          matmulPrologues.size > 0 ? matmulPrologues : undefined,
+          prologueClaimedIds.size > 0 ? prologueClaimedIds : undefined,
+          planConsumerCount,
+          loweredPlanBuilder,
+          nodeIdToFinalPos,
+          compoundMatchMap,
+        );
+        stats.sequentialNodes += seqNodes.length;
+        overallStep += seqNodes.length;
+        nodesSinceReclaim += seqNodes.length;
       }
-      nodesSinceReclaim += segment.group.nodes.length;
-    } else {
-      // Execute sequentially (too-small fusion groups or sequential segments)
-      const seqNodes = segment.kind === "fused" ? segment.group.nodes : segment.nodes;
-      await executeSequentialSegmentWithEarlyRelease(
-        seqNodes,
-        backend,
-        enableEarlyRelease,
-        lifetimes,
-        outputNodeIds,
-        alreadyReleased,
-        nodeToStorage,
-        overallStep,
-        externalNodeIds,
-        planNodes,
-        matmulPrologues.size > 0 ? matmulPrologues : undefined,
-        prologueClaimedIds.size > 0 ? prologueClaimedIds : undefined,
-        planConsumerCount,
-        loweredPlanBuilder,
-        nodeIdToFinalPos,
-        compoundMatchMap,
-      );
-      stats.sequentialNodes += seqNodes.length;
-      overallStep += seqNodes.length;
-      nodesSinceReclaim += seqNodes.length;
-    }
 
-    // Periodic buffer reclamation: flush the shared encoder and buffer pool
-    // so that dead buffers in pendingRelease become available for reuse.
-    if (useTopLevelSharedEncoder && reclaimInterval > 0 && nodesSinceReclaim >= reclaimInterval) {
-      flushSharedEncoder();
-      flushBufferPool();
-      if (loweredPlanBuilder) loweredPlanBuilder.recordReclaim();
-      nodesSinceReclaim = 0;
+      // Periodic buffer reclamation: flush the shared encoder and buffer pool
+      // so that dead buffers in pendingRelease become available for reuse.
+      if (
+        useTopLevelSharedEncoder &&
+        reclaimInterval > 0 &&
+        nodesSinceReclaim >= reclaimInterval
+      ) {
+        flushSharedEncoder();
+        flushBufferPool();
+        if (loweredPlanBuilder) loweredPlanBuilder.recordReclaim();
+        nodesSinceReclaim = 0;
+      }
     }
-  }
-
   } finally {
     if (useArenaFallback) {
       clearActiveArena();

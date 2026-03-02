@@ -12,19 +12,19 @@
  * aggressively (x*1→x, x/1→x, dead code elimination for rank-1 tensors).
  */
 
+import type { DType } from "../types";
+import { applyFusedOp, dtypeToTileIR } from "./fusion-tile-ir";
+import { MAX_WORKGROUPS_PER_DIM, WORKGROUP_SIZE } from "./shape-utils";
+import { compileTileKernel } from "./tile-compiler";
 import {
-  type TileKernelSpec,
-  type KernelContext,
-  type BlockExpr,
   type BindingSpec,
+  type BlockExpr,
   type DataType,
   elementwiseGrid,
+  type KernelContext,
   singleWorkgroup,
+  type TileKernelSpec,
 } from "./tile-ir";
-import { compileTileKernel } from "./tile-compiler";
-import { applyFusedOp, dtypeToTileIR } from "./fusion-tile-ir";
-import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
-import type { DType } from "../types";
 
 const WG = WORKGROUP_SIZE; // 256
 
@@ -101,15 +101,13 @@ function buildInputOffset(
   const rank = dim.inputShape.length;
 
   // Decompose outIdx into output coordinates
-  const outCoords = dim.outShape.length > 0
-    ? ctx.decomposeIndex(outIdx, dim.outShape)
-    : [];
+  const outCoords =
+    dim.outShape.length > 0 ? ctx.decomposeIndex(outIdx, dim.outShape) : [];
 
   // Decompose reduceIdx into reduction coordinates
-  const reduceShape = dim.normalizedDims.map(d => dim.inputShape[d]);
-  const reduceCoords = reduceShape.length > 0
-    ? ctx.decomposeIndex(reduceIdx, reduceShape)
-    : [];
+  const reduceShape = dim.normalizedDims.map((d) => dim.inputShape[d]);
+  const reduceCoords =
+    reduceShape.length > 0 ? ctx.decomposeIndex(reduceIdx, reduceShape) : [];
 
   // Interleave output and reduction coordinates into input coordinates,
   // then linearize with input strides
@@ -198,7 +196,11 @@ function applyEpilogueChain(
       else if (eop.toDtype === "i32") result = result.toI32();
       else if (eop.toDtype === "u32") result = result.toU32();
       else result = result.toF32();
-    } else if (eop.kind === "binary" && eop.op && eop.inputIndex !== undefined) {
+    } else if (
+      eop.kind === "binary" &&
+      eop.op &&
+      eop.inputIndex !== undefined
+    ) {
       const epInput = ctx.load(`ep_in${eop.inputIndex}`, outIdx);
       result = applyFusedOp(ctx, eop.op, [result, epInput]);
     } else if (eop.kind === "unary" && eop.op) {
@@ -217,7 +219,10 @@ function buildEpilogueBindings(
   const bindings: Record<string, BindingSpec> = {};
   for (const eop of epilogueOps) {
     if (eop.kind === "binary" && eop.inputIndex !== undefined) {
-      bindings[`ep_in${eop.inputIndex}`] = { storage: "read", type: "f32" as DataType };
+      bindings[`ep_in${eop.inputIndex}`] = {
+        storage: "read",
+        type: "f32" as DataType,
+      };
     }
   }
   return bindings;
@@ -249,7 +254,8 @@ export function makeReductionSpec(config: ReductionConfig): TileKernelSpec {
   } else {
     parts.push("full");
   }
-  if (preamble) parts.push("pre_" + preamble.chainOps.map(o => o.op).join("+"));
+  if (preamble)
+    parts.push("pre_" + preamble.chainOps.map((o) => o.op).join("+"));
   if (epilogue) parts.push("epi");
   const name = parts.join("_");
 
@@ -270,8 +276,9 @@ export function makeReductionSpec(config: ReductionConfig): TileKernelSpec {
   bindings.out = { storage: "read_write", type: outType };
 
   const needsF16 =
-    preamble?.inputDtypes.some(d => d === "f16") ||
-    epilogue?.outputDtype === "f16" || false;
+    preamble?.inputDtypes.some((d) => d === "f16") ||
+    epilogue?.outputDtype === "f16" ||
+    false;
 
   // --- Load function: bare load or preamble chain ---
   function emitLoad(ctx: KernelContext, offset: BlockExpr): BlockExpr {
@@ -281,9 +288,13 @@ export function makeReductionSpec(config: ReductionConfig): TileKernelSpec {
 
   // --- Finalize: apply optional epilogue ---
   function finalize(
-    ctx: KernelContext, value: BlockExpr, outIdx: BlockExpr,
+    ctx: KernelContext,
+    value: BlockExpr,
+    outIdx: BlockExpr,
   ): BlockExpr {
-    return epilogue ? applyEpilogueChain(ctx, value, epilogue.ops, outIdx) : value;
+    return epilogue
+      ? applyEpilogueChain(ctx, value, epilogue.ops, outIdx)
+      : value;
   }
 
   // ==========================================================================
@@ -299,8 +310,12 @@ export function makeReductionSpec(config: ReductionConfig): TileKernelSpec {
       grid: singleWorkgroup(),
       kernel(ctx) {
         const tid = ctx.localIndex();
-        const result = ctx.wgReduce(reduceOp, tid, ctx.uniform("size"), WG, (i) =>
-          emitLoad(ctx, i),
+        const result = ctx.wgReduce(
+          reduceOp,
+          tid,
+          ctx.uniform("size"),
+          WG,
+          (i) => emitLoad(ctx, i),
         );
         const final = finalize(ctx, result, ctx.u32(0));
         ctx.guardedStore("out", tid.eq(ctx.u32(0)), ctx.u32(0), final);
@@ -321,7 +336,10 @@ export function makeReductionSpec(config: ReductionConfig): TileKernelSpec {
       grid: (u) => {
         const n = u.outSize;
         if (n <= MAX_WORKGROUPS_PER_DIM) return [n];
-        return [Math.min(n, MAX_WORKGROUPS_PER_DIM), Math.ceil(n / MAX_WORKGROUPS_PER_DIM)];
+        return [
+          Math.min(n, MAX_WORKGROUPS_PER_DIM),
+          Math.ceil(n / MAX_WORKGROUPS_PER_DIM),
+        ];
       },
       kernel(ctx) {
         const tid = ctx.localIndex();
@@ -388,13 +406,23 @@ export function makeReductionSpec(config: ReductionConfig): TileKernelSpec {
 // ============================================================================
 
 export function dimInfo(
-  inputShape: number[], inputStrides: number[],
-  normalizedDims: number[], outShape: number[],
-  outStrides: number[], inputToOutDim: number[],
+  inputShape: number[],
+  inputStrides: number[],
+  normalizedDims: number[],
+  outShape: number[],
+  outStrides: number[],
+  inputToOutDim: number[],
   parallel: boolean,
 ): DimInfo {
-  return { inputShape, inputStrides, normalizedDims, outShape,
-    outStrides, inputToOutDim, parallel };
+  return {
+    inputShape,
+    inputStrides,
+    normalizedDims,
+    outShape,
+    outStrides,
+    inputToOutDim,
+    parallel,
+  };
 }
 
 // --- Mean division (elementwise, not a reduction) ---
@@ -412,7 +440,11 @@ export function makeMeanDivSpec(): TileKernelSpec {
     kernel(ctx) {
       const idx = ctx.globalId(0);
       ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
-      ctx.emitStore("out", idx, ctx.load("input", idx).div(ctx.uniform("count")));
+      ctx.emitStore(
+        "out",
+        idx,
+        ctx.load("input", idx).div(ctx.uniform("count")),
+      );
     },
   };
 }

@@ -9,44 +9,52 @@
  * Also manages the params buffer pool and sequence-indexed params buffer reuse.
  */
 
-import type { GPUBuffer, GPUComputePipeline, GPUBindGroup, GPUDevice } from "./gpu-types";
-import { GPUBufferUsage } from "./gpu-types";
-import { bufferPool } from "./buffer-pool";
-import { profileApiCall } from "./profiler";
 import {
-  activeBatch,
-  sharedEncoderActive as sharedEncoderFlag,
-  replayPinnedBufferSet,
-  paramsBufferPools,
-  MAX_PARAMS_POOL_SIZE_PER_CLASS,
-  paramsBufferSizeClass,
-  paramsSequenceSet,
-  getOutputSeqIndex,
-  setOutputSeqIndex,
-  getCurrentOpLabel,
-} from "./webgpu-state";
+  isArenaBuffer,
+  outputSequenceHints,
+  pinnedOutputBuffers,
+  resetArenaResolveStats,
+  resetArenaState,
+} from "./buffer-arena";
+import { bufferPool } from "./buffer-pool";
+import {
+  dispatchRecordingBuffer,
+  setLastBindGroupBuffers,
+} from "./dispatch-recording";
+import type {
+  GPUBindGroup,
+  GPUBuffer,
+  GPUComputePipeline,
+  GPUDevice,
+} from "./gpu-types";
+import { GPUBufferUsage } from "./gpu-types";
+import { profileApiCall } from "./profiler";
 import {
   autoFlushSharedEncoder,
   deferUniformBufferForSharedEncoder,
 } from "./shared-encoder";
 import {
-  dispatchRecordingBuffer,
-  setLastBindGroupBuffers,
-} from "./dispatch-recording";
-
-import {
-  isArenaBuffer,
-  resetArenaState,
-  resetArenaResolveStats,
-  outputSequenceHints,
-  pinnedOutputBuffers,
-} from "./buffer-arena";
+  activeBatch,
+  getCurrentOpLabel,
+  getOutputSeqIndex,
+  MAX_PARAMS_POOL_SIZE_PER_CLASS,
+  paramsBufferPools,
+  paramsBufferSizeClass,
+  paramsSequenceSet,
+  replayPinnedBufferSet,
+  setOutputSeqIndex,
+  sharedEncoderActive as sharedEncoderFlag,
+} from "./webgpu-state";
 
 // ============================================================================
 // Params Buffer Pool (state in webgpu-state.ts, re-exported for backward compat)
 // ============================================================================
 
-export { paramsBufferPools, MAX_PARAMS_POOL_SIZE_PER_CLASS, paramsBufferSizeClass } from "./webgpu-state";
+export {
+  MAX_PARAMS_POOL_SIZE_PER_CLASS,
+  paramsBufferPools,
+  paramsBufferSizeClass,
+} from "./webgpu-state";
 
 // Pre-allocated Uint32Array pool to avoid ~700 short-lived allocations per step.
 // Each op dispatch creates a params array; reusing pre-allocated arrays reduces GC pressure.
@@ -85,11 +93,20 @@ interface BindGroupCacheState {
   /** Cache miss count. */
   misses: number;
   /** Detailed miss log for diagnostics. */
-  missLog: Array<{ idx: number; reason: string; label: string | null; details: string }>;
+  missLog: Array<{
+    idx: number;
+    reason: string;
+    label: string | null;
+    details: string;
+  }>;
   /** Current params sequence position. */
   paramsSeqIndex: number;
   /** Cached params buffers indexed by dispatch position. */
-  paramsSequenceBuffers: Array<{ buffer: GPUBuffer; sizeClass: number; data: Uint32Array } | null>;
+  paramsSequenceBuffers: Array<{
+    buffer: GPUBuffer;
+    sizeClass: number;
+    data: Uint32Array;
+  } | null>;
 }
 
 const cacheState: BindGroupCacheState = {
@@ -102,7 +119,10 @@ const cacheState: BindGroupCacheState = {
   paramsSequenceBuffers: [],
 };
 
-export function createParamsBuffer(device: GPUDevice, data: Uint32Array): GPUBuffer {
+export function createParamsBuffer(
+  device: GPUDevice,
+  data: Uint32Array,
+): GPUBuffer {
   const sizeClass = paramsBufferSizeClass(data.byteLength);
   const idx = cacheState.paramsSeqIndex++;
 
@@ -110,20 +130,29 @@ export function createParamsBuffer(device: GPUDevice, data: Uint32Array): GPUBuf
   // This keeps the GPUBuffer pointer stable so bind group caching can hit.
   if (!activeBatch) {
     const cached = cacheState.paramsSequenceBuffers[idx];
-    if (cached !== undefined && cached !== null && cached.sizeClass === sizeClass) {
+    if (
+      cached !== undefined &&
+      cached !== null &&
+      cached.sizeClass === sizeClass
+    ) {
       // Fast path: skip writeBuffer if data is identical (params derived from
       // tensor shapes which are constant across steps).
       if (cached.data.length === data.length) {
         let same = true;
         for (let i = 0; i < data.length; i++) {
-          if (cached.data[i] !== data[i]) { same = false; break; }
+          if (cached.data[i] !== data[i]) {
+            same = false;
+            break;
+          }
         }
         if (same) {
-          return cached.buffer;  // Skip writeBuffer entirely
+          return cached.buffer; // Skip writeBuffer entirely
         }
       }
       // Data changed — write new data, update cached copy
-      profileApiCall("writeBuffer", () => device.queue.writeBuffer(cached.buffer, 0, data));
+      profileApiCall("writeBuffer", () =>
+        device.queue.writeBuffer(cached.buffer, 0, data),
+      );
       cached.data.set(data);
       return cached.buffer;
     }
@@ -132,20 +161,34 @@ export function createParamsBuffer(device: GPUDevice, data: Uint32Array): GPUBuf
     const pool = paramsBufferPools.get(sizeClass);
     if (pool && pool.length > 0) {
       const buffer = pool.pop()!;
-      profileApiCall("writeBuffer", () => device.queue.writeBuffer(buffer, 0, data));
-      cacheState.paramsSequenceBuffers[idx] = { buffer, sizeClass, data: data.slice() };
+      profileApiCall("writeBuffer", () =>
+        device.queue.writeBuffer(buffer, 0, data),
+      );
+      cacheState.paramsSequenceBuffers[idx] = {
+        buffer,
+        sizeClass,
+        data: data.slice(),
+      };
       paramsSequenceSet.add(buffer);
       return buffer;
     }
   }
 
-  const buffer = profileApiCall("createBuffer", () => device.createBuffer({
-    size: sizeClass,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  }));
-  profileApiCall("writeBuffer", () => device.queue.writeBuffer(buffer, 0, data));
+  const buffer = profileApiCall("createBuffer", () =>
+    device.createBuffer({
+      size: sizeClass,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    }),
+  );
+  profileApiCall("writeBuffer", () =>
+    device.queue.writeBuffer(buffer, 0, data),
+  );
   if (!activeBatch) {
-    cacheState.paramsSequenceBuffers[idx] = { buffer, sizeClass, data: data.slice() };
+    cacheState.paramsSequenceBuffers[idx] = {
+      buffer,
+      sizeClass,
+      data: data.slice(),
+    };
     paramsSequenceSet.add(buffer);
   }
   return buffer;
@@ -155,7 +198,7 @@ export function releaseParamsBuffer(buffer: GPUBuffer): void {
   // Sequence-cached params buffers are reused across steps — don't return to pool
   if (paramsSequenceSet.has(buffer)) return;
   // Replay-pinned buffers must stay alive — referenced by recorded bind groups
-  if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) return;
+  if (replayPinnedBufferSet?.has(buffer)) return;
 
   if (activeBatch) {
     activeBatch.deferredDestroyBuffers.push(buffer);
@@ -180,7 +223,10 @@ export function releaseParamsBuffer(buffer: GPUBuffer): void {
 }
 
 // Backward-compatible wrappers for existing callsites
-export function createUniformBuffer(device: GPUDevice, size: number): GPUBuffer {
+export function createUniformBuffer(
+  device: GPUDevice,
+  size: number,
+): GPUBuffer {
   return createParamsBuffer(device, params(size));
 }
 
@@ -193,8 +239,19 @@ export function releaseUniformBuffer(buffer: GPUBuffer): void {
 // ============================================================================
 
 // Profiled helper for hot-path WebGPU API calls
-export function profiledCreateBindGroup(device: GPUDevice, descriptor: { layout: unknown; entries: Array<{ binding: number; resource: { buffer: GPUBuffer; offset?: number; size?: number } }> }): GPUBindGroup {
-  const bg = profileApiCall("createBindGroup", () => device.createBindGroup(descriptor));
+export function profiledCreateBindGroup(
+  device: GPUDevice,
+  descriptor: {
+    layout: unknown;
+    entries: Array<{
+      binding: number;
+      resource: { buffer: GPUBuffer; offset?: number; size?: number };
+    }>;
+  },
+): GPUBindGroup {
+  const bg = profileApiCall("createBindGroup", () =>
+    device.createBindGroup(descriptor),
+  );
   // When recording, capture buffer references from the descriptor for replay pinning
   if (dispatchRecordingBuffer && descriptor.entries) {
     const bufs: GPUBuffer[] = [];
@@ -232,12 +289,18 @@ export function cachedCreateBindGroup(
   const idx = cacheState.dispatchIndex++;
   const entry = cacheState.sequenceEntries[idx];
 
-  if (entry !== undefined && entry !== null
-      && entry.pipeline === pipeline
-      && entry.buffers.length === buffers.length) {
+  if (
+    entry !== undefined &&
+    entry !== null &&
+    entry.pipeline === pipeline &&
+    entry.buffers.length === buffers.length
+  ) {
     let match = true;
     for (let i = 0; i < buffers.length; i++) {
-      if (entry.buffers[i] !== buffers[i]) { match = false; break; }
+      if (entry.buffers[i] !== buffers[i]) {
+        match = false;
+        break;
+      }
     }
     if (match) {
       cacheState.hits++;
@@ -271,9 +334,15 @@ export function cachedCreateBindGroup(
         details = parts.join(" ");
       }
     }
-    cacheState.missLog.push({ idx, reason, label: getCurrentOpLabel(), details });
+    cacheState.missLog.push({
+      idx,
+      reason,
+      label: getCurrentOpLabel(),
+      details,
+    });
   }
-  const entries: Array<{ binding: number; resource: { buffer: GPUBuffer } }> = [];
+  const entries: Array<{ binding: number; resource: { buffer: GPUBuffer } }> =
+    [];
   for (let i = 0; i < buffers.length; i++) {
     entries.push({ binding: i, resource: { buffer: buffers[i] } });
   }
@@ -281,7 +350,7 @@ export function cachedCreateBindGroup(
     device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries,
-    })
+    }),
   );
 
   const bufCopy = buffers.slice();
@@ -302,15 +371,27 @@ export function resetDispatchSequence(): void {
 }
 
 /** Set dispatch sequence counters to specific positions (for replay cache). */
-export function setDispatchSequenceCounters(dispatch: number, params: number, output: number): void {
+export function setDispatchSequenceCounters(
+  dispatch: number,
+  params: number,
+  output: number,
+): void {
   cacheState.dispatchIndex = dispatch;
   cacheState.paramsSeqIndex = params;
   setOutputSeqIndex(output);
 }
 
 /** Get current dispatch sequence counters (for recording). */
-export function getDispatchSequenceCounters(): { dispatch: number; params: number; output: number } {
-  return { dispatch: cacheState.dispatchIndex, params: cacheState.paramsSeqIndex, output: getOutputSeqIndex() };
+export function getDispatchSequenceCounters(): {
+  dispatch: number;
+  params: number;
+  output: number;
+} {
+  return {
+    dispatch: cacheState.dispatchIndex,
+    params: cacheState.paramsSeqIndex,
+    output: getOutputSeqIndex(),
+  };
 }
 
 // ============================================================================
@@ -333,9 +414,19 @@ export function clearBindGroupCache(): void {
   resetArenaState();
 }
 
-export function getBindGroupCacheStats(): { hits: number; misses: number; size: number; hitRate: number } {
+export function getBindGroupCacheStats(): {
+  hits: number;
+  misses: number;
+  size: number;
+  hitRate: number;
+} {
   const total = cacheState.hits + cacheState.misses;
-  return { hits: cacheState.hits, misses: cacheState.misses, size: cacheState.sequenceEntries.length, hitRate: total > 0 ? cacheState.hits / total : 0 };
+  return {
+    hits: cacheState.hits,
+    misses: cacheState.misses,
+    size: cacheState.sequenceEntries.length,
+    hitRate: total > 0 ? cacheState.hits / total : 0,
+  };
 }
 
 export function resetBindGroupCacheStats(): void {
@@ -345,7 +436,11 @@ export function resetBindGroupCacheStats(): void {
   resetArenaResolveStats();
 }
 
-export function getBindGroupCacheMissLog(): Array<{ idx: number; reason: string; label: string | null; details: string }> {
+export function getBindGroupCacheMissLog(): Array<{
+  idx: number;
+  reason: string;
+  label: string | null;
+  details: string;
+}> {
   return cacheState.missLog;
 }
-

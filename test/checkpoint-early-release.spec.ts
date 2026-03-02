@@ -16,14 +16,13 @@
  * Run with: npm test -- test/checkpoint-early-release.spec.ts
  */
 
-import { describe, expect, it, beforeAll, afterEach } from "vitest";
-import { Torchlette } from "../src/frontend";
-import { initWebGPU } from "../src/backend/webgpu";
-import { gpuMemoryTracker } from "../src/backend/webgpu/memory-tracker";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { GPT2, type GPT2Config } from "../examples/gpt2/model";
-import { canUseWebGPU } from "./helpers/webgpu";
+import { gpuMemoryTracker } from "../src/backend/webgpu/memory-tracker";
 import { resetNodeIdCounter, resetStorageIdCounter } from "../src/engine/lazy";
+import { Torchlette } from "../src/frontend";
 import { resetBaseIdCounter } from "../src/runtime/tensor";
+import { canUseWebGPU } from "./helpers/webgpu";
 
 // Test configuration - small enough to fit in memory but large enough to show effects
 const TEST_CONFIG: GPT2Config = {
@@ -46,7 +45,7 @@ interface MemoryMeasurement {
 async function measureMemory(
   description: string,
   useCheckpoint: boolean,
-  enableEarlyRelease: boolean
+  enableEarlyRelease: boolean,
 ): Promise<MemoryMeasurement> {
   gpuMemoryTracker.reset();
   resetNodeIdCounter();
@@ -66,7 +65,7 @@ async function measureMemory(
   model.train();
 
   const inputData = Array.from({ length: BATCH * SEQ_LEN }, () =>
-    Math.floor(Math.random() * TEST_CONFIG.vocabSize)
+    Math.floor(Math.random() * TEST_CONFIG.vocabSize),
   );
   const input = api.tensorFromArray(inputData, [BATCH, SEQ_LEN]);
 
@@ -105,31 +104,33 @@ describe("Checkpoint Memory with Early Release", { timeout: 300000 }, () => {
     }
 
     console.log("\n=== Checkpoint + Early Release Memory Analysis ===\n");
-    console.log(`Config: ${TEST_CONFIG.numLayers} layers, ${TEST_CONFIG.embedDim} embed, ${BATCH}x${SEQ_LEN} batch\n`);
+    console.log(
+      `Config: ${TEST_CONFIG.numLayers} layers, ${TEST_CONFIG.embedDim} embed, ${BATCH}x${SEQ_LEN} batch\n`,
+    );
 
     // Measure all 4 configurations
     const noCheckpointNoEarly = await measureMemory(
       "No checkpoint, no early release",
       false,
-      false
+      false,
     );
 
     const noCheckpointWithEarly = await measureMemory(
       "No checkpoint, WITH early release",
       false,
-      true
+      true,
     );
 
     const withCheckpointNoEarly = await measureMemory(
       "WITH checkpoint, no early release",
       true,
-      false
+      false,
     );
 
     const withCheckpointWithEarly = await measureMemory(
       "WITH checkpoint, WITH early release",
       true,
-      true
+      true,
     );
 
     // Print results
@@ -137,30 +138,53 @@ describe("Checkpoint Memory with Early Release", { timeout: 300000 }, () => {
     console.log("|---------------|-------------|-------------|");
 
     const baseline = noCheckpointNoEarly.peakBytes;
-    for (const m of [noCheckpointNoEarly, noCheckpointWithEarly, withCheckpointNoEarly, withCheckpointWithEarly]) {
-      const reduction = ((baseline - m.peakBytes) / baseline * 100).toFixed(1);
+    for (const m of [
+      noCheckpointNoEarly,
+      noCheckpointWithEarly,
+      withCheckpointNoEarly,
+      withCheckpointWithEarly,
+    ]) {
+      const reduction = (((baseline - m.peakBytes) / baseline) * 100).toFixed(
+        1,
+      );
       const sign = m.peakBytes <= baseline ? "-" : "+";
       console.log(
-        `| ${m.description.padEnd(40)} | ${(m.peakBytes / 1e6).toFixed(2).padStart(8)} MB | ${sign}${Math.abs(parseFloat(reduction)).toFixed(1).padStart(5)}% |`
+        `| ${m.description.padEnd(40)} | ${(m.peakBytes / 1e6).toFixed(2).padStart(8)} MB | ${sign}${Math.abs(parseFloat(reduction)).toFixed(1).padStart(5)}% |`,
       );
     }
 
     // Calculate improvements
     console.log("\n=== Analysis ===\n");
 
-    const checkpointOnlyReduction = (1 - withCheckpointNoEarly.peakBytes / noCheckpointNoEarly.peakBytes) * 100;
-    const earlyOnlyReduction = (1 - noCheckpointWithEarly.peakBytes / noCheckpointNoEarly.peakBytes) * 100;
-    const combinedReduction = (1 - withCheckpointWithEarly.peakBytes / noCheckpointNoEarly.peakBytes) * 100;
+    const checkpointOnlyReduction =
+      (1 - withCheckpointNoEarly.peakBytes / noCheckpointNoEarly.peakBytes) *
+      100;
+    const earlyOnlyReduction =
+      (1 - noCheckpointWithEarly.peakBytes / noCheckpointNoEarly.peakBytes) *
+      100;
+    const combinedReduction =
+      (1 - withCheckpointWithEarly.peakBytes / noCheckpointNoEarly.peakBytes) *
+      100;
 
-    console.log(`Checkpoint-only reduction: ${checkpointOnlyReduction.toFixed(1)}%`);
-    console.log(`Early-release-only reduction: ${earlyOnlyReduction.toFixed(1)}%`);
-    console.log(`Combined (checkpoint + early release): ${combinedReduction.toFixed(1)}%`);
+    console.log(
+      `Checkpoint-only reduction: ${checkpointOnlyReduction.toFixed(1)}%`,
+    );
+    console.log(
+      `Early-release-only reduction: ${earlyOnlyReduction.toFixed(1)}%`,
+    );
+    console.log(
+      `Combined (checkpoint + early release): ${combinedReduction.toFixed(1)}%`,
+    );
 
     // Calculate if early release improves checkpoint savings
-    const checkpointWithEarlyImprovement = withCheckpointNoEarly.peakBytes - withCheckpointWithEarly.peakBytes;
-    const improvementPercent = (checkpointWithEarlyImprovement / withCheckpointNoEarly.peakBytes) * 100;
+    const checkpointWithEarlyImprovement =
+      withCheckpointNoEarly.peakBytes - withCheckpointWithEarly.peakBytes;
+    const improvementPercent =
+      (checkpointWithEarlyImprovement / withCheckpointNoEarly.peakBytes) * 100;
 
-    console.log(`\nEarly release additional savings with checkpoint: ${(checkpointWithEarlyImprovement / 1e6).toFixed(2)} MB (${improvementPercent.toFixed(1)}%)`);
+    console.log(
+      `\nEarly release additional savings with checkpoint: ${(checkpointWithEarlyImprovement / 1e6).toFixed(2)} MB (${improvementPercent.toFixed(1)}%)`,
+    );
 
     // Expectations
     // 1. In a lazy execution engine, checkpoint alone (without early release)
@@ -186,17 +210,31 @@ describe("Checkpoint Memory with Early Release", { timeout: 300000 }, () => {
     }
 
     // Run without early release
-    const withoutEarly = await measureMemory("Checkpoint without early release", true, false);
+    const withoutEarly = await measureMemory(
+      "Checkpoint without early release",
+      true,
+      false,
+    );
 
     // Run with early release
-    const withEarly = await measureMemory("Checkpoint with early release", true, true);
+    const withEarly = await measureMemory(
+      "Checkpoint with early release",
+      true,
+      true,
+    );
 
     const improvement = withoutEarly.peakBytes - withEarly.peakBytes;
     const improvementPercent = (improvement / withoutEarly.peakBytes) * 100;
 
-    console.log(`\nCheckpoint peak WITHOUT early release: ${(withoutEarly.peakBytes / 1e6).toFixed(2)} MB`);
-    console.log(`Checkpoint peak WITH early release: ${(withEarly.peakBytes / 1e6).toFixed(2)} MB`);
-    console.log(`Improvement: ${(improvement / 1e6).toFixed(2)} MB (${improvementPercent.toFixed(1)}%)`);
+    console.log(
+      `\nCheckpoint peak WITHOUT early release: ${(withoutEarly.peakBytes / 1e6).toFixed(2)} MB`,
+    );
+    console.log(
+      `Checkpoint peak WITH early release: ${(withEarly.peakBytes / 1e6).toFixed(2)} MB`,
+    );
+    console.log(
+      `Improvement: ${(improvement / 1e6).toFixed(2)} MB (${improvementPercent.toFixed(1)}%)`,
+    );
 
     // Early release should not make things worse
     expect(withEarly.peakBytes).toBeLessThanOrEqual(withoutEarly.peakBytes);
@@ -224,7 +262,7 @@ describe("Checkpoint Memory with Early Release", { timeout: 300000 }, () => {
     model1.eval();
 
     const inputData = Array.from({ length: BATCH * SEQ_LEN }, () =>
-      Math.floor(Math.random() * TEST_CONFIG.vocabSize)
+      Math.floor(Math.random() * TEST_CONFIG.vocabSize),
     );
     const input1 = apiNoEarly.tensorFromArray(inputData, [BATCH, SEQ_LEN]);
     const output1 = model1.forward(input1);
@@ -255,9 +293,15 @@ describe("Checkpoint Memory with Early Release", { timeout: 300000 }, () => {
 
     const peakWithEarly = gpuMemoryTracker.getPeakUsageBytes();
 
-    console.log(`\nForward-only peak WITHOUT early release: ${(peakNoEarly / 1e6).toFixed(2)} MB`);
-    console.log(`Forward-only peak WITH early release: ${(peakWithEarly / 1e6).toFixed(2)} MB`);
-    console.log(`Improvement: ${((peakNoEarly - peakWithEarly) / 1e6).toFixed(2)} MB (${((1 - peakWithEarly / peakNoEarly) * 100).toFixed(1)}%)`);
+    console.log(
+      `\nForward-only peak WITHOUT early release: ${(peakNoEarly / 1e6).toFixed(2)} MB`,
+    );
+    console.log(
+      `Forward-only peak WITH early release: ${(peakWithEarly / 1e6).toFixed(2)} MB`,
+    );
+    console.log(
+      `Improvement: ${((peakNoEarly - peakWithEarly) / 1e6).toFixed(2)} MB (${((1 - peakWithEarly / peakNoEarly) * 100).toFixed(1)}%)`,
+    );
 
     // Early release should provide some benefit for forward-only passes
     expect(peakWithEarly).toBeLessThanOrEqual(peakNoEarly);

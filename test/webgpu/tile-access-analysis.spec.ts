@@ -8,12 +8,12 @@
  */
 
 import { describe, expect, it } from "vitest";
-import type { TileKernelSpec } from "../../src/backend/webgpu/tile-ir";
 import {
   analyzeAccessPatterns,
-  reportAccessPatterns,
   computeSafeVecWidth,
+  reportAccessPatterns,
 } from "../../src/backend/webgpu/tile-access-analysis";
+import type { TileKernelSpec } from "../../src/backend/webgpu/tile-ir";
 
 // ============================================================================
 // Helper: build a spec with a given kernel
@@ -32,7 +32,7 @@ function makeSpec(
     name,
     workgroupSize: opts?.workgroupSize ?? 64,
     bindings: opts?.bindings ?? {
-      input:  { storage: "read", type: "f32" },
+      input: { storage: "read", type: "f32" },
       output: { storage: "read_write", type: "f32" },
     },
     uniforms: opts?.uniforms ?? { N: "u32" },
@@ -56,8 +56,8 @@ describe("tile-access-analysis", () => {
 
       const patterns = analyzeAccessPatterns(spec);
       // Should have at least one load and one store
-      const loads = patterns.filter(p => p.accessType === "load");
-      const stores = patterns.filter(p => p.accessType === "store");
+      const loads = patterns.filter((p) => p.accessType === "load");
+      const stores = patterns.filter((p) => p.accessType === "store");
       expect(loads.length).toBeGreaterThanOrEqual(1);
       expect(stores.length).toBeGreaterThanOrEqual(1);
 
@@ -81,24 +81,30 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load" && p.bindingName === "input");
+      const load = patterns.find(
+        (p) => p.accessType === "load" && p.bindingName === "input",
+      );
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe(128);
-      expect(load!.isCoalesced).toBe(false);
-      expect(load!.maxVecWidth).toBe(1);
+      expect(load?.innerStride).toBe(128);
+      expect(load?.isCoalesced).toBe(false);
+      expect(load?.maxVecWidth).toBe(1);
     });
   });
 
   describe("2D tile access", () => {
     it("load(tid.y * cols + tid.x) → stride 1, coalesced", () => {
-      const spec = makeSpec("tiled2D", (ctx) => {
-        const tidX = ctx.threadIdx(0);
-        const tidY = ctx.threadIdx(1);
-        const cols = ctx.u32(32);
-        const idx = tidY.mul(cols).add(tidX);
-        const val = ctx.load("input", idx);
-        ctx.emitStore("output", idx, val);
-      }, { workgroupSize: [32, 8] });
+      const spec = makeSpec(
+        "tiled2D",
+        (ctx) => {
+          const tidX = ctx.threadIdx(0);
+          const tidY = ctx.threadIdx(1);
+          const cols = ctx.u32(32);
+          const idx = tidY.mul(cols).add(tidX);
+          const val = ctx.load("input", idx);
+          ctx.emitStore("output", idx, val);
+        },
+        { workgroupSize: [32, 8] },
+      );
 
       const patterns = analyzeAccessPatterns(spec);
       // All accesses should be coalesced (innerStride = 1)
@@ -109,20 +115,24 @@ describe("tile-access-analysis", () => {
     });
 
     it("load(tid.x * rows + tid.y) → stride rows, not coalesced", () => {
-      const spec = makeSpec("tiled2DColMajor", (ctx) => {
-        const tidX = ctx.threadIdx(0);
-        const tidY = ctx.threadIdx(1);
-        const rows = ctx.u32(32);
-        const idx = tidX.mul(rows).add(tidY);
-        const val = ctx.load("input", idx);
-        ctx.emitStore("output", idx, val);
-      }, { workgroupSize: [32, 8] });
+      const spec = makeSpec(
+        "tiled2DColMajor",
+        (ctx) => {
+          const tidX = ctx.threadIdx(0);
+          const tidY = ctx.threadIdx(1);
+          const rows = ctx.u32(32);
+          const idx = tidX.mul(rows).add(tidY);
+          const val = ctx.load("input", idx);
+          ctx.emitStore("output", idx, val);
+        },
+        { workgroupSize: [32, 8] },
+      );
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe(32);
-      expect(load!.isCoalesced).toBe(false);
+      expect(load?.innerStride).toBe(32);
+      expect(load?.isCoalesced).toBe(false);
     });
   });
 
@@ -136,16 +146,18 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load" && p.bindingName === "input");
+      const load = patterns.find(
+        (p) => p.accessType === "load" && p.bindingName === "input",
+      );
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe(0);
-      expect(load!.isCoalesced).toBe(false);
+      expect(load?.innerStride).toBe(0);
+      expect(load?.isCoalesced).toBe(false);
 
       // Store should still be coalesced
-      const store = patterns.find(p => p.accessType === "store");
+      const store = patterns.find((p) => p.accessType === "store");
       expect(store).toBeDefined();
-      expect(store!.innerStride).toBe(1);
-      expect(store!.isCoalesced).toBe(true);
+      expect(store?.innerStride).toBe(1);
+      expect(store?.isCoalesced).toBe(true);
     });
   });
 
@@ -160,10 +172,10 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
-      expect(load!.innerStride).toBe(1);
-      expect(load!.isCoalesced).toBe(true);
-      expect(load!.maxVecWidth).toBe(4);
+      const load = patterns.find((p) => p.accessType === "load");
+      expect(load?.innerStride).toBe(1);
+      expect(load?.isCoalesced).toBe(true);
+      expect(load?.maxVecWidth).toBe(4);
     });
   });
 
@@ -180,9 +192,9 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
-      expect(load!.innerStride).toBe(1);
-      expect(load!.isCoalesced).toBe(true);
+      const load = patterns.find((p) => p.accessType === "load");
+      expect(load?.innerStride).toBe(1);
+      expect(load?.isCoalesced).toBe(true);
     });
   });
 
@@ -261,10 +273,10 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const store = patterns.find(p => p.accessType === "store");
+      const store = patterns.find((p) => p.accessType === "store");
       expect(store).toBeDefined();
-      expect(store!.innerStride).toBe(1);
-      expect(store!.isCoalesced).toBe(true);
+      expect(store?.innerStride).toBe(1);
+      expect(store?.isCoalesced).toBe(true);
     });
   });
 
@@ -279,7 +291,7 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const stores = patterns.filter(p => p.accessType === "store");
+      const stores = patterns.filter((p) => p.accessType === "store");
       expect(stores.length).toBeGreaterThanOrEqual(1);
       expect(stores[0].isCoalesced).toBe(true);
     });
@@ -294,10 +306,10 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.baseDivisibility).toBe(1);
-      expect(load!.baseConstantTerm).toBe(0);
+      expect(load?.baseDivisibility).toBe(1);
+      expect(load?.baseConstantTerm).toBe(0);
     });
 
     it("globalId(0) * 4 has stride 4 and divisibility 4", () => {
@@ -308,10 +320,10 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe(4);
-      expect(load!.baseDivisibility).toBe(4);
+      expect(load?.innerStride).toBe(4);
+      expect(load?.baseDivisibility).toBe(4);
     });
 
     it("globalId(0) + const(4) has constantTerm 4", () => {
@@ -322,10 +334,10 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.baseConstantTerm).toBe(4);
-      expect(load!.maxVecWidth).toBe(4); // constantTerm 4 is 4-aligned
+      expect(load?.baseConstantTerm).toBe(4);
+      expect(load?.maxVecWidth).toBe(4); // constantTerm 4 is 4-aligned
     });
 
     it("globalId(0) + const(1) limits vec width", () => {
@@ -336,10 +348,10 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.baseConstantTerm).toBe(1);
-      expect(load!.maxVecWidth).toBe(1); // odd offset → scalar only
+      expect(load?.baseConstantTerm).toBe(1);
+      expect(load?.maxVecWidth).toBe(1); // odd offset → scalar only
     });
 
     it("globalId(0) + const(2) allows vec2", () => {
@@ -350,10 +362,10 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.baseConstantTerm).toBe(2);
-      expect(load!.maxVecWidth).toBe(2); // 2-aligned offset → vec2
+      expect(load?.baseConstantTerm).toBe(2);
+      expect(load?.maxVecWidth).toBe(2); // 2-aligned offset → vec2
     });
 
     it("globalId(0) + uniform has null constantTerm → vec4", () => {
@@ -365,10 +377,10 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.baseConstantTerm).toBeNull(); // unknown constant
-      expect(load!.maxVecWidth).toBe(4); // unknown → conservatively vec4
+      expect(load?.baseConstantTerm).toBeNull(); // unknown constant
+      expect(load?.maxVecWidth).toBe(4); // unknown → conservatively vec4
     });
   });
 
@@ -383,10 +395,10 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe(1);
-      expect(load!.isCoalesced).toBe(true);
+      expect(load?.innerStride).toBe(1);
+      expect(load?.isCoalesced).toBe(true);
     });
 
     it("(globalId.x * 2) / 4 → stride 0.5 floors to unknown", () => {
@@ -399,9 +411,9 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe("unknown");
+      expect(load?.innerStride).toBe("unknown");
     });
 
     it("thread-invariant / const → thread-invariant", () => {
@@ -415,10 +427,12 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load" && p.bindingName === "input");
+      const load = patterns.find(
+        (p) => p.accessType === "load" && p.bindingName === "input",
+      );
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe(0);
-      expect(load!.isCoalesced).toBe(false);
+      expect(load?.innerStride).toBe(0);
+      expect(load?.isCoalesced).toBe(false);
     });
   });
 
@@ -433,9 +447,9 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe(0);
+      expect(load?.innerStride).toBe(0);
     });
 
     it("globalId.x % 128 → stride 1 (coeff < modulus)", () => {
@@ -448,10 +462,10 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe(1);
-      expect(load!.isCoalesced).toBe(true);
+      expect(load?.innerStride).toBe(1);
+      expect(load?.isCoalesced).toBe(true);
     });
 
     it("thread-invariant % const → thread-invariant", () => {
@@ -464,9 +478,11 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load" && p.bindingName === "input");
+      const load = patterns.find(
+        (p) => p.accessType === "load" && p.bindingName === "input",
+      );
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe(0);
+      expect(load?.innerStride).toBe(0);
     });
   });
 
@@ -487,10 +503,12 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load" && p.bindingName === "input");
+      const load = patterns.find(
+        (p) => p.accessType === "load" && p.bindingName === "input",
+      );
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe(1);
-      expect(load!.isCoalesced).toBe(true);
+      expect(load?.innerStride).toBe(1);
+      expect(load?.isCoalesced).toBe(true);
     });
 
     it("(gid * 32) / 32 + (gid % 32) * stride → divisible div produces stride 1", () => {
@@ -504,10 +522,10 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe(1);
-      expect(load!.isCoalesced).toBe(true);
+      expect(load?.innerStride).toBe(1);
+      expect(load?.isCoalesced).toBe(true);
     });
   });
 
@@ -521,10 +539,10 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe(1);
-      expect(load!.isCoalesced).toBe(true);
+      expect(load?.innerStride).toBe(1);
+      expect(load?.isCoalesced).toBe(true);
     });
 
     it("let base = programId.x * N; let idx = base + gid → coalesced", () => {
@@ -538,10 +556,10 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe(1);
-      expect(load!.isCoalesced).toBe(true);
+      expect(load?.innerStride).toBe(1);
+      expect(load?.isCoalesced).toBe(true);
     });
   });
 
@@ -600,10 +618,10 @@ describe("tile-access-analysis", () => {
       });
 
       const patterns = analyzeAccessPatterns(spec);
-      const load = patterns.find(p => p.accessType === "load");
+      const load = patterns.find((p) => p.accessType === "load");
       expect(load).toBeDefined();
-      expect(load!.innerStride).toBe(1);
-      expect(load!.isCoalesced).toBe(true);
+      expect(load?.innerStride).toBe(1);
+      expect(load?.isCoalesced).toBe(true);
     });
   });
 });

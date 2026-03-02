@@ -7,7 +7,8 @@
 
 import type { DType } from "../types";
 import { computeContiguousStrides } from "../types";
-export { sizeOf, broadcastShapes } from "../../core/shape";
+
+export { broadcastShapes, sizeOf } from "../../core/shape";
 export { computeContiguousStrides as contiguousStrides } from "../types";
 
 // ============================================================================
@@ -20,10 +21,10 @@ export const WORKGROUP_SIZE = 256;
 export const MAX_WORKGROUPS_PER_DIM = 65535;
 
 /** IEEE 754 negative float max — used as -infinity identity for max reduction. */
-export const F32_NEG_MAX = -3.402823e+38;
+export const F32_NEG_MAX = -3.402823e38;
 
 /** IEEE 754 positive float max — used as +infinity identity for min reduction. */
-export const F32_POS_MAX = 3.402823e+38;
+export const F32_POS_MAX = 3.402823e38;
 
 /** IEEE 754 bit pattern of 1.0f as u32 — for atomicMax-based infinity detection. */
 export const F32_ONE_BITS = 1065353216; // bitcast<u32>(1.0f) = 0x3F800000
@@ -49,9 +50,16 @@ export function lcm(a: number, b: number): number {
  * Compute the largest chunk size ≤ maxUnits that satisfies GPU buffer offset alignment.
  * Used for chunked dispatch when tensors exceed maxStorageBufferBindingSize.
  */
-export function alignedChunkSize(bytesPerUnit: number, maxUnits: number, minAlignment: number): number {
+export function alignedChunkSize(
+  bytesPerUnit: number,
+  maxUnits: number,
+  minAlignment: number,
+): number {
   const unitAlignment = minAlignment / gcd(bytesPerUnit, minAlignment);
-  return Math.max(unitAlignment, Math.floor(maxUnits / unitAlignment) * unitAlignment);
+  return Math.max(
+    unitAlignment,
+    Math.floor(maxUnits / unitAlignment) * unitAlignment,
+  );
 }
 
 // broadcastShapes re-exported from core/shape
@@ -109,7 +117,10 @@ export function computeEffectiveBroadcastStrides(
 /**
  * Check if strides represent contiguous memory layout.
  */
-export function checkContiguousStrides(shape: number[], strides: number[]): boolean {
+export function checkContiguousStrides(
+  shape: number[],
+  strides: number[],
+): boolean {
   const expected = computeContiguousStrides(shape);
   for (let i = 0; i < shape.length; i++) {
     // Size-1 dims don't affect contiguity

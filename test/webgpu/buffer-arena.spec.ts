@@ -1,15 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { initWebGPU, getWebGPUDevice } from "../../src/backend/webgpu";
 import {
-  setActiveArena,
-  clearActiveArena,
-  resolveOutputBuffer,
   allocateOutputBuffer,
-  isArenaBuffer,
-  getArenaResolveIndex,
-  setArenaResolveIndexTo,
-  destroyArena,
   type BufferArena,
+  clearActiveArena,
+  destroyArena,
+  getArenaResolveIndex,
+  getWebGPUDevice,
+  initWebGPU,
+  isArenaBuffer,
+  resolveOutputBuffer,
+  setActiveArena,
+  setArenaResolveIndexTo,
 } from "../../src/backend/webgpu";
 import { cpuOnly } from "../helpers/webgpu";
 

@@ -288,7 +288,17 @@ export function clearSubgroupSupport(): void {
  * Generate a cache key for a matmul shader configuration.
  */
 export function getShaderCacheKey(options: CodegenOptions): string {
-  const { config, transposeMode, dtype, dtypeB, epilogue, batched, inputCastA, inputCastB, kSplit } = options;
+  const {
+    config,
+    transposeMode,
+    dtype,
+    dtypeB,
+    epilogue,
+    batched,
+    inputCastA,
+    inputCastB,
+    kSplit,
+  } = options;
   const epilogueKey = epilogue
     ? `${epilogue.ops.map((op) => op.kind).join(",")}_${epilogue.outputDtype}`
     : "none";
@@ -306,12 +316,17 @@ export function getShaderCacheKey(options: CodegenOptions): string {
     inputCastA ? `castA_${inputCastA}` : "",
     inputCastB ? `castB_${inputCastB}` : "",
     kSplit ? `ksplit${kSplit}` : "",
-  ].filter(Boolean).join("_");
+  ]
+    .filter(Boolean)
+    .join("_");
 }
 
 /**
  * Generate a cache key for a K-split reduction shader.
  */
-export function getKSplitReductionCacheKey(kSplitCount: number, outputDtype: DType): string {
+export function getKSplitReductionCacheKey(
+  kSplitCount: number,
+  outputDtype: DType,
+): string {
   return `ksplit_reduce_${kSplitCount}_${outputDtype}`;
 }

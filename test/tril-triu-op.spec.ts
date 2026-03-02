@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { Torchlette } from "../src/frontend";
 
 describe("tril/triu ops", () => {
@@ -13,54 +13,35 @@ describe("tril/triu ops", () => {
       const a = api.full([3, 3], 1);
       const t = api.tril(a);
       const data = await t.cpu();
-      expect(data).toEqual([
-        1, 0, 0,
-        1, 1, 0,
-        1, 1, 1,
-      ]);
+      expect(data).toEqual([1, 0, 0, 1, 1, 0, 1, 1, 1]);
     });
 
     it("works with k=1 (one above main diagonal)", async () => {
       const a = api.full([3, 3], 1);
       const t = api.tril(a, 1);
       const data = await t.cpu();
-      expect(data).toEqual([
-        1, 1, 0,
-        1, 1, 1,
-        1, 1, 1,
-      ]);
+      expect(data).toEqual([1, 1, 0, 1, 1, 1, 1, 1, 1]);
     });
 
     it("works with k=-1 (one below main diagonal)", async () => {
       const a = api.full([3, 3], 1);
       const t = api.tril(a, -1);
       const data = await t.cpu();
-      expect(data).toEqual([
-        0, 0, 0,
-        1, 0, 0,
-        1, 1, 0,
-      ]);
+      expect(data).toEqual([0, 0, 0, 1, 0, 0, 1, 1, 0]);
     });
 
     it("works via tensor instance method", async () => {
       const a = api.full([3, 3], 5);
       const t = a.tril();
       const data = await t.cpu();
-      expect(data).toEqual([
-        5, 0, 0,
-        5, 5, 0,
-        5, 5, 5,
-      ]);
+      expect(data).toEqual([5, 0, 0, 5, 5, 0, 5, 5, 5]);
     });
 
     it("works with non-square matrix", async () => {
       const a = api.full([2, 4], 1);
       const t = api.tril(a);
       const data = await t.cpu();
-      expect(data).toEqual([
-        1, 0, 0, 0,
-        1, 1, 0, 0,
-      ]);
+      expect(data).toEqual([1, 0, 0, 0, 1, 1, 0, 0]);
     });
 
     it("works with batched 3D tensor", async () => {
@@ -68,12 +49,7 @@ describe("tril/triu ops", () => {
       const a = api.full([2, 2, 2], 1);
       const t = api.tril(a);
       const data = await t.cpu();
-      expect(data).toEqual([
-        1, 0,
-        1, 1,
-        1, 0,
-        1, 1,
-      ]);
+      expect(data).toEqual([1, 0, 1, 1, 1, 0, 1, 1]);
     });
   });
 
@@ -82,44 +58,28 @@ describe("tril/triu ops", () => {
       const a = api.full([3, 3], 1);
       const t = api.triu(a);
       const data = await t.cpu();
-      expect(data).toEqual([
-        1, 1, 1,
-        0, 1, 1,
-        0, 0, 1,
-      ]);
+      expect(data).toEqual([1, 1, 1, 0, 1, 1, 0, 0, 1]);
     });
 
     it("works with k=1 (one above main diagonal)", async () => {
       const a = api.full([3, 3], 1);
       const t = api.triu(a, 1);
       const data = await t.cpu();
-      expect(data).toEqual([
-        0, 1, 1,
-        0, 0, 1,
-        0, 0, 0,
-      ]);
+      expect(data).toEqual([0, 1, 1, 0, 0, 1, 0, 0, 0]);
     });
 
     it("works with k=-1 (one below main diagonal)", async () => {
       const a = api.full([3, 3], 1);
       const t = api.triu(a, -1);
       const data = await t.cpu();
-      expect(data).toEqual([
-        1, 1, 1,
-        1, 1, 1,
-        0, 1, 1,
-      ]);
+      expect(data).toEqual([1, 1, 1, 1, 1, 1, 0, 1, 1]);
     });
 
     it("works via tensor instance method", async () => {
       const a = api.full([3, 3], 7);
       const t = a.triu();
       const data = await t.cpu();
-      expect(data).toEqual([
-        7, 7, 7,
-        0, 7, 7,
-        0, 0, 7,
-      ]);
+      expect(data).toEqual([7, 7, 7, 0, 7, 7, 0, 0, 7]);
     });
   });
 

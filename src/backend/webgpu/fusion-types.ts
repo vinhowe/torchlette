@@ -6,11 +6,11 @@
  * (recipe construction from IR graphs).
  */
 
-import type { DType } from "../types";
-import type { IRNode } from "../../engine/ir";
 import { sizeOf } from "../../core/shape";
-import { MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
+import type { IRNode } from "../../engine/ir";
+import type { DType } from "../types";
 import { canVectorize as canVectorizeOp } from "./ops/registry";
+import { MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 
 // ============================================================================
 // Fusion Recipe Types
@@ -72,10 +72,7 @@ export type VectorWidth = 1 | 2 | 4;
 /**
  * Determine the best vector width for a given shape and dtype.
  */
-function selectVectorWidth(
-  shape: number[],
-  dtype: DType,
-): VectorWidth {
+function selectVectorWidth(shape: number[], dtype: DType): VectorWidth {
   if (dtype !== "f32" && dtype !== "f16") return 1;
   if (shape.length === 0) return 1;
 
@@ -107,7 +104,8 @@ function canVectorize(
     if (input.shape.length === 0) return false;
     const inputInner = input.shape[input.shape.length - 1];
     if (inputInner !== outputInner && inputInner !== 1) return false;
-    if (inputInner === outputInner && inputInner % vectorWidth !== 0) return false;
+    if (inputInner === outputInner && inputInner % vectorWidth !== 0)
+      return false;
   }
   return true;
 }
@@ -185,10 +183,12 @@ function generateKernelCacheKey(
   const opParts: string[] = [];
   for (let i = 0; i < recipe.nodes.length; i++) {
     const n = recipe.nodes[i];
-    const inputRefs = n.inputs.map(inp => {
-      const pos = idToPos.get(inp);
-      return pos !== undefined ? `n${pos}` : `e${inp}`;
-    }).join(",");
+    const inputRefs = n.inputs
+      .map((inp) => {
+        const pos = idToPos.get(inp);
+        return pos !== undefined ? `n${pos}` : `e${inp}`;
+      })
+      .join(",");
     opParts.push(`${n.op}(${inputRefs})${n.isOutput ? "!" : ""}`);
   }
   parts.push(`ops:[${opParts.join(";")}]`);
@@ -203,7 +203,13 @@ function generateKernelCacheKey(
 export function computeKernelMeta(
   recipe: FusedKernelRecipe,
   options: KernelGenOptions = {},
-): { cacheKey: string; vectorWidth: VectorWidth; workItems: number; workgroupSize: number; gridSizeX: number } {
+): {
+  cacheKey: string;
+  vectorWidth: VectorWidth;
+  workItems: number;
+  workgroupSize: number;
+  gridSizeX: number;
+} {
   const workgroupSize = options.workgroupSize ?? recipe.workgroupSize ?? 256;
   const outputShape = recipe.outputs[0].shape;
   const primaryDtype = recipe.outputs[0].dtype;
@@ -226,11 +232,13 @@ export function computeKernelMeta(
 
   const workItems = Math.ceil(totalElements / vectorWidth);
   const totalWorkgroups = Math.ceil(workItems / workgroupSize);
-  const gridSizeX = totalWorkgroups <= MAX_WORKGROUPS_PER_DIM
-    ? totalWorkgroups
-    : MAX_WORKGROUPS_PER_DIM;
+  const gridSizeX =
+    totalWorkgroups <= MAX_WORKGROUPS_PER_DIM
+      ? totalWorkgroups
+      : MAX_WORKGROUPS_PER_DIM;
   const baseCacheKey = generateKernelCacheKey(recipe, vectorWidth);
-  const cacheKey = gridSizeX >= MAX_WORKGROUPS_PER_DIM ? baseCacheKey + ":2d" : baseCacheKey;
+  const cacheKey =
+    gridSizeX >= MAX_WORKGROUPS_PER_DIM ? baseCacheKey + ":2d" : baseCacheKey;
   return { cacheKey, vectorWidth, workItems, workgroupSize, gridSizeX };
 }
 

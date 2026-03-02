@@ -1,19 +1,19 @@
-import { describe, expect, it, beforeAll, afterAll } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { requireContext } from "../../src/backend/webgpu/gpu-context";
 import {
-  initWebGPU,
+  clearWarmupCache,
+  deserializeRegistry,
   destroyWebGPU,
+  getPipeline,
   getWebGPUDevice,
+  initWebGPU,
+  serializeRegistry,
   startPipelineRecording,
   stopPipelineRecording,
-  warmupPipelines,
-  warmupFromStep,
   warmupFromRegistry,
-  clearWarmupCache,
-  serializeRegistry,
-  deserializeRegistry,
-  getPipeline,
+  warmupFromStep,
+  warmupPipelines,
 } from "../../src/backend/webgpu/index";
-import { requireContext } from "../../src/backend/webgpu/gpu-context";
 import { getWarmupPipeline } from "../../src/backend/webgpu/pipeline-warmup";
 
 describe("Pipeline Warmup", () => {
@@ -106,9 +106,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       const devInfo = getWebGPUDevice()!;
       clearWarmupCache();
 
-      const entries = [
-        { key: "warmup_skip_1", wgsl: trivialShader(30) },
-      ];
+      const entries = [{ key: "warmup_skip_1", wgsl: trivialShader(30) }];
 
       // First warmup compiles
       const r1 = await warmupPipelines(devInfo.device, entries);

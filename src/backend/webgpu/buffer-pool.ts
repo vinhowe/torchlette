@@ -11,13 +11,16 @@
  */
 
 import { getSizeClass, getSizeForClass } from "../../engine/lifetime-analysis";
+import type { GPUBuffer, GPUDevice, GPUQueue } from "./gpu-types";
+import { STORAGE_BUFFER_USAGE } from "./gpu-types";
 import { gpuMemoryTracker } from "./memory-tracker";
 import { isProfilingEnabled } from "./profiler";
-import type { GPUBuffer, GPUQueue, GPUDevice } from "./gpu-types";
-import { STORAGE_BUFFER_USAGE } from "./gpu-types";
 import {
-  activeBatch, sharedEncoderActive, gpuContext,
-  arenaBufferSet, replayPinnedBufferSet,
+  activeBatch,
+  arenaBufferSet,
+  gpuContext,
+  replayPinnedBufferSet,
+  sharedEncoderActive,
 } from "./webgpu-state";
 
 // ============================================================================
@@ -47,7 +50,9 @@ class SimpleBufferPool {
   // Window-based demand tracking for reservation
   private windowTracking = false;
   private currentWindowId = 0;
-  private windowDemand: Array<Map<number, { acquires: number; releases: number }>> = [];
+  private windowDemand: Array<
+    Map<number, { acquires: number; releases: number }>
+  > = [];
   private reservation: Map<number, number> | null = null;
 
   // Total byte budget for pooled + pending buffers.
@@ -94,7 +99,10 @@ class SimpleBufferPool {
       releaseToPool: this.releaseToPool,
       releaseToDestroy: this.releaseToDestroy,
       pendingReleaseCount: this.pendingRelease.length,
-      pendingReleaseBytes: this.pendingRelease.reduce((sum, p) => sum + p.size, 0),
+      pendingReleaseBytes: this.pendingRelease.reduce(
+        (sum, p) => sum + p.size,
+        0,
+      ),
     };
   }
 
@@ -109,13 +117,19 @@ class SimpleBufferPool {
   /** Get or create a pool bucket for a size class. */
   private getBucket(sizeClass: number): GPUBuffer[] {
     let bucket = this.pool.get(sizeClass);
-    if (!bucket) { bucket = []; this.pool.set(sizeClass, bucket); }
+    if (!bucket) {
+      bucket = [];
+      this.pool.set(sizeClass, bucket);
+    }
     return bucket;
   }
 
   /** Increment reference count for a buffer (called when an owning tensor is created). */
   incRef(buffer: GPUBuffer): void {
-    this.bufferLiveCount.set(buffer, (this.bufferLiveCount.get(buffer) ?? 0) + 1);
+    this.bufferLiveCount.set(
+      buffer,
+      (this.bufferLiveCount.get(buffer) ?? 0) + 1,
+    );
   }
 
   /** Decrement reference count for a buffer (called when an owning tensor is destroyed or ownership transferred). */
@@ -213,7 +227,9 @@ class SimpleBufferPool {
       // Re-track allocation (was deallocated when released to pool)
       gpuMemoryTracker.trackAllocation(buffer, actualSize);
       if (this.debugTrace) {
-        console.log(`[pool] acquire from POOL: ${(actualSize / 1e6).toFixed(2)} MB`);
+        console.log(
+          `[pool] acquire from POOL: ${(actualSize / 1e6).toFixed(2)} MB`,
+        );
       }
       return buffer;
     }
@@ -226,7 +242,11 @@ class SimpleBufferPool {
     // are from a previous step and the GPU may still be using them.
     // Also skip during shared encoder scope — pending buffers may have been
     // written by earlier passes and their command buffers not yet submitted.
-    if (!activeBatch && !fenceState.pendingFencePromise && !sharedEncoderActive) {
+    if (
+      !activeBatch &&
+      !fenceState.pendingFencePromise &&
+      !sharedEncoderActive
+    ) {
       const pendingIdx = this.pendingRelease.findIndex(
         (p) => p.sizeClass === sizeClass && !this.bufferLiveCount.has(p.buffer),
       );
@@ -240,7 +260,9 @@ class SimpleBufferPool {
         // Re-track allocation (was deallocated when added to pending)
         gpuMemoryTracker.trackAllocation(buffer, size);
         if (this.debugTrace) {
-          console.log(`[pool] acquire from PENDING: ${(size / 1e6).toFixed(2)} MB (${this.pendingRelease.length} remaining)`);
+          console.log(
+            `[pool] acquire from PENDING: ${(size / 1e6).toFixed(2)} MB (${this.pendingRelease.length} remaining)`,
+          );
         }
         return buffer;
       }
@@ -270,7 +292,11 @@ class SimpleBufferPool {
     for (const [sizeClass, count] of this.newAllocsByClass) {
       const size = getSizeForClass(sizeClass);
       for (let i = 0; i < count; i++) {
-        if (this.pooledBytes + this.pendingReleaseBytes + size > this.maxPoolBytes) break;
+        if (
+          this.pooledBytes + this.pendingReleaseBytes + size >
+          this.maxPoolBytes
+        )
+          break;
         const buf = device.createBuffer({ size, usage: STORAGE_BUFFER_USAGE });
         this.getBucket(sizeClass).push(buf);
         this.pooledBytes += size;
@@ -302,7 +328,10 @@ class SimpleBufferPool {
     this.computeReservation();
   }
 
-  private recordWindowDemand(sizeClass: number, field: "acquires" | "releases"): void {
+  private recordWindowDemand(
+    sizeClass: number,
+    field: "acquires" | "releases",
+  ): void {
     if (!this.windowTracking) return;
     const wm = this.windowDemand[this.currentWindowId];
     if (!wm) return;
@@ -319,7 +348,9 @@ class SimpleBufferPool {
 
     const reservation = new Map<number, number>();
     for (const sc of allSc) {
-      let cumAcq = 0, cumRel = 0, maxDeficit = 0;
+      let cumAcq = 0,
+        cumRel = 0,
+        maxDeficit = 0;
       for (let w = 0; w < this.windowDemand.length; w++) {
         const e = this.windowDemand[w].get(sc);
         cumAcq += e?.acquires ?? 0;
@@ -352,7 +383,11 @@ class SimpleBufferPool {
       if (deficit <= 0) continue;
 
       for (let i = 0; i < deficit; i++) {
-        if (this.pooledBytes + this.pendingReleaseBytes + size > this.maxPoolBytes) break;
+        if (
+          this.pooledBytes + this.pendingReleaseBytes + size >
+          this.maxPoolBytes
+        )
+          break;
         const buf = device.createBuffer({ size, usage: STORAGE_BUFFER_USAGE });
         this.getBucket(sizeClass).push(buf);
         this.pooledBytes += size;
@@ -374,7 +409,9 @@ class SimpleBufferPool {
     if (usage !== STORAGE_BUFFER_USAGE) {
       this.releaseToDestroy++;
       if (this.debugTrace) {
-        console.log(`[pool] release INCOMPATIBLE (wrong usage): ${(sizeBytes / 1e6).toFixed(2)} MB`);
+        console.log(
+          `[pool] release INCOMPATIBLE (wrong usage): ${(sizeBytes / 1e6).toFixed(2)} MB`,
+        );
       }
       return false;
     }
@@ -386,10 +423,15 @@ class SimpleBufferPool {
     this.pooledBufferSet.delete(buffer);
 
     // Check total byte budget: pooledBytes tracks main pool, pendingReleaseBytes tracks pending
-    if (this.pooledBytes + this.pendingReleaseBytes + actualSize > this.maxPoolBytes) {
+    if (
+      this.pooledBytes + this.pendingReleaseBytes + actualSize >
+      this.maxPoolBytes
+    ) {
       this.releaseToDestroy++;
       if (this.debugTrace) {
-        console.log(`[pool] release BUDGET (${((this.pooledBytes + this.pendingReleaseBytes) / 1e6).toFixed(1)}MB + ${(actualSize / 1e6).toFixed(2)}MB > ${(this.maxPoolBytes / 1e6).toFixed(0)}MB): ${(actualSize / 1e6).toFixed(2)} MB`);
+        console.log(
+          `[pool] release BUDGET (${((this.pooledBytes + this.pendingReleaseBytes) / 1e6).toFixed(1)}MB + ${(actualSize / 1e6).toFixed(2)}MB > ${(this.maxPoolBytes / 1e6).toFixed(0)}MB): ${(actualSize / 1e6).toFixed(2)} MB`,
+        );
       }
       return false; // Don't pool, destroy instead
     }
@@ -409,7 +451,9 @@ class SimpleBufferPool {
     gpuMemoryTracker.trackDeallocation(buffer);
 
     if (this.debugTrace) {
-      console.log(`[pool] release to PENDING: ${(actualSize / 1e6).toFixed(2)} MB (now ${this.pendingRelease.length} pending)`);
+      console.log(
+        `[pool] release to PENDING: ${(actualSize / 1e6).toFixed(2)} MB (now ${this.pendingRelease.length} pending)`,
+      );
     }
 
     // Schedule fence if we have a queue and no pending fence
@@ -434,7 +478,7 @@ class SimpleBufferPool {
     // This check covers ALL callers (direct pool calls and wrapper).
     if (arenaBufferSet.has(buffer)) return;
     // Replay-pinned buffers are referenced by recorded bind groups — never destroy.
-    if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) return;
+    if (replayPinnedBufferSet?.has(buffer)) return;
     // Track deallocation immediately - the memory is now "freeable"
     gpuMemoryTracker.trackDeallocation(buffer);
     // When batching or shared encoder active, defer until after submit
@@ -452,7 +496,7 @@ class SimpleBufferPool {
    */
   deferredDestroyUntracked(buffer: GPUBuffer): void {
     // Replay-pinned buffers are referenced by recorded bind groups — never destroy.
-    if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) return;
+    if (replayPinnedBufferSet?.has(buffer)) return;
     // When batching, command buffers haven't been submitted yet.
     // scheduleFence()'s onSubmittedWorkDone would resolve before the batch submits,
     // destroying the buffer while it's still referenced by collected command buffers.
@@ -525,7 +569,7 @@ class SimpleBufferPool {
   destroyPendingBuffers(): void {
     for (const { buffer } of this.pendingDestroy) {
       // Replay-pinned buffers must survive
-      if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) continue;
+      if (replayPinnedBufferSet?.has(buffer)) continue;
       try {
         buffer.destroy();
       } catch {
@@ -659,7 +703,7 @@ class SimpleBufferPool {
       while (buffers.length > 0 && bytesFreed < bytesNeeded) {
         const buffer = buffers.pop()!;
         // Replay-pinned buffers must survive — push back and skip.
-        if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) {
+        if (replayPinnedBufferSet?.has(buffer)) {
           buffers.push(buffer);
           break; // Can't evict from this size class
         }
@@ -669,7 +713,11 @@ class SimpleBufferPool {
         // These buffers have already passed the GPU fence (promoted from pending
         // to free pool), so they're safe to destroy.
         gpuMemoryTracker.trackDeallocation(buffer);
-        try { buffer.destroy(); } catch { /* already destroyed */ }
+        try {
+          buffer.destroy();
+        } catch {
+          /* already destroyed */
+        }
         bytesFreed += sizePerBuffer;
       }
 
@@ -738,8 +786,14 @@ class SimpleBufferPool {
    * Get bytes in pending queues (not yet safe to destroy).
    */
   getPendingBytes(): number {
-    const pendingReleaseBytes = this.pendingRelease.reduce((sum, p) => sum + p.size, 0);
-    const pendingDestroyBytes = this.pendingDestroy.reduce((sum, p) => sum + p.size, 0);
+    const pendingReleaseBytes = this.pendingRelease.reduce(
+      (sum, p) => sum + p.size,
+      0,
+    );
+    const pendingDestroyBytes = this.pendingDestroy.reduce(
+      (sum, p) => sum + p.size,
+      0,
+    );
     return pendingReleaseBytes + pendingDestroyBytes;
   }
 
@@ -821,7 +875,7 @@ export function getBufferPoolBudget(): number {
 export function flushBufferPool(): void {
   bufferPool.flushPendingToAvailable();
   bufferPool.sortPoolBuckets(); // deterministic acquire order for bind group cache
-  bufferPool.beginWindow();  // Advance window counter for demand tracking
+  bufferPool.beginWindow(); // Advance window counter for demand tracking
 }
 
 /**
@@ -846,7 +900,11 @@ export function decRefBuffer(buffer: GPUBuffer): void {
  * Release a contiguous copy's buffer if one was created.
  * Common pattern: `if (copy !== original) destroyCopy(copy)`.
  */
-export function destroyCopy(tensor: { buffer: GPUBuffer; size: number; dtype: string }): void {
+export function destroyCopy(tensor: {
+  buffer: GPUBuffer;
+  size: number;
+  dtype: string;
+}): void {
   const bytes = tensor.size * (tensor.dtype === "f16" ? 2 : 4);
   bufferPool.decRef(tensor.buffer);
   bufferPool.deferredDestroy(tensor.buffer, bytes);
@@ -901,11 +959,15 @@ export function issueDeferredFence(): void {
         usage: 0x0008 | 0x0001, // COPY_DST | MAP_READ
       });
     }
-    ctx.queue.writeBuffer(fenceState.profilingFenceBuffer, 0, profilingFenceData);
+    ctx.queue.writeBuffer(
+      fenceState.profilingFenceBuffer,
+      0,
+      profilingFenceData,
+    );
     fenceState.pendingFencePromise = fenceState.profilingFenceBuffer
       .mapAsync(0x0001 /* MAP_READ */)
       .then(() => {
-        fenceState.profilingFenceBuffer!.unmap();
+        fenceState.profilingFenceBuffer?.unmap();
       });
     fenceState.deferredPendingRelease = true;
     return;

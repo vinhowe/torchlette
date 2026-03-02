@@ -5,16 +5,17 @@
  * directly on subsequent steps — bypassing all JS dispatch logic.
  */
 
-import type { GPUBuffer, GPUComputePipeline, GPUBindGroup } from "./gpu-types";
+import type { GPUBindGroup, GPUBuffer, GPUComputePipeline } from "./gpu-types";
+import { getTimestampWrites, setProfileModule } from "./profiler";
 import {
-  replayPinnedBufferSet, setReplayPinnedBufferSet,
-} from "./webgpu-state";
-import {
-  getSharedEncoderInstance,
   autoFlushSharedEncoder,
+  getSharedEncoderInstance,
   incrementSharedEncoderPassCount,
 } from "./shared-encoder";
-import { getTimestampWrites, setProfileModule } from "./profiler";
+import {
+  replayPinnedBufferSet,
+  setReplayPinnedBufferSet,
+} from "./webgpu-state";
 
 // ---------------------------------------------------------------------------
 // RecordedDispatch interface
@@ -53,7 +54,6 @@ export function setLastBindGroupBuffers(bufs: GPUBuffer[] | null): void {
 // ---------------------------------------------------------------------------
 // Replay Buffer Pinning
 // ---------------------------------------------------------------------------
-
 
 // ---------------------------------------------------------------------------
 // Public API

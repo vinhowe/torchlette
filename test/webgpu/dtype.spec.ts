@@ -1,8 +1,8 @@
-import { describe, it, expect, beforeAll } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
   initWebGPU,
-  tensorFromArrayWithDtype,
   isF16Supported,
+  tensorFromArrayWithDtype,
 } from "../../src/backend/webgpu/index";
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -88,7 +88,11 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
     });
 
     it("reshape preserves i32 dtype", async () => {
-      const tensor = tensorFromArrayWithDtype([1, 2, 3, 4, 5, 6], [2, 3], "i32");
+      const tensor = tensorFromArrayWithDtype(
+        [1, 2, 3, 4, 5, 6],
+        [2, 3],
+        "i32",
+      );
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
       const reshaped = webgpuBackend.ops.reshape(tensor, [3, 2]);
@@ -100,10 +104,17 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
     });
 
     it("transpose preserves i32 dtype", async () => {
-      const tensor = tensorFromArrayWithDtype([1, 2, 3, 4, 5, 6], [2, 3], "i32");
+      const tensor = tensorFromArrayWithDtype(
+        [1, 2, 3, 4, 5, 6],
+        [2, 3],
+        "i32",
+      );
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
-      const transposed = webgpuBackend.ops.transpose(tensor, { dim0: 0, dim1: 1 });
+      const transposed = webgpuBackend.ops.transpose(tensor, {
+        dim0: 0,
+        dim1: 1,
+      });
       expect(transposed.dtype).toBe("i32");
       expect(transposed.shape).toEqual([3, 2]);
 
@@ -161,7 +172,11 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
 
   describe("f32 dtype (default)", () => {
     it("creates f32 tensor by default", async () => {
-      const tensor = tensorFromArrayWithDtype([1.5, 2.5, 3.5, 4.5], [2, 2], "f32");
+      const tensor = tensorFromArrayWithDtype(
+        [1.5, 2.5, 3.5, 4.5],
+        [2, 2],
+        "f32",
+      );
       expect(tensor.dtype).toBe("f32");
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
@@ -189,7 +204,11 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
         return;
       }
 
-      const tensor = tensorFromArrayWithDtype([1.5, 2.5, 3.5, 4.5], [2, 2], "f16");
+      const tensor = tensorFromArrayWithDtype(
+        [1.5, 2.5, 3.5, 4.5],
+        [2, 2],
+        "f16",
+      );
       expect(tensor.shape).toEqual([2, 2]);
       expect(tensor.dtype).toBe("f16");
 
@@ -228,7 +247,11 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
         return;
       }
 
-      const a = tensorFromArrayWithDtype([10.0, 20.0, 30.0, 40.0], [2, 2], "f16");
+      const a = tensorFromArrayWithDtype(
+        [10.0, 20.0, 30.0, 40.0],
+        [2, 2],
+        "f16",
+      );
       const b = tensorFromArrayWithDtype([1.0, 2.0, 3.0, 4.0], [2, 2], "f16");
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
@@ -268,7 +291,11 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
         return;
       }
 
-      const a = tensorFromArrayWithDtype([10.0, 20.0, 30.0, 40.0], [2, 2], "f16");
+      const a = tensorFromArrayWithDtype(
+        [10.0, 20.0, 30.0, 40.0],
+        [2, 2],
+        "f16",
+      );
       const b = tensorFromArrayWithDtype([2.0, 4.0, 5.0, 8.0], [2, 2], "f16");
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
@@ -309,7 +336,11 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
         return;
       }
 
-      const tensor = tensorFromArrayWithDtype([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3], "f16");
+      const tensor = tensorFromArrayWithDtype(
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        [2, 3],
+        "f16",
+      );
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
       const reshaped = webgpuBackend.ops.reshape(tensor, [3, 2]);
@@ -327,10 +358,17 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
         return;
       }
 
-      const tensor = tensorFromArrayWithDtype([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3], "f16");
+      const tensor = tensorFromArrayWithDtype(
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        [2, 3],
+        "f16",
+      );
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
-      const transposed = webgpuBackend.ops.transpose(tensor, { dim0: 0, dim1: 1 });
+      const transposed = webgpuBackend.ops.transpose(tensor, {
+        dim0: 0,
+        dim1: 1,
+      });
       expect(transposed.dtype).toBe("f16");
       expect(transposed.shape).toEqual([3, 2]);
 
@@ -342,21 +380,29 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
 
     it("throws when f16 not supported", async () => {
       if (isF16Supported()) {
-        console.log("Skipping f16 not-supported test: f16 is actually supported");
+        console.log(
+          "Skipping f16 not-supported test: f16 is actually supported",
+        );
         return;
       }
 
-      expect(() => tensorFromArrayWithDtype([1.0, 2.0], [2], "f16")).toThrow(/shader-f16/);
+      expect(() => tensorFromArrayWithDtype([1.0, 2.0], [2], "f16")).toThrow(
+        /shader-f16/,
+      );
     });
   });
 
   describe("dtype casting", () => {
     it("casts f32 to i32", async () => {
-      const tensor = tensorFromArrayWithDtype([1.5, 2.7, 3.1, 4.9], [2, 2], "f32");
+      const tensor = tensorFromArrayWithDtype(
+        [1.5, 2.7, 3.1, 4.9],
+        [2, 2],
+        "f32",
+      );
       expect(tensor.dtype).toBe("f32");
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
-      const casted = webgpuBackend.ops.cast!(tensor, "i32");
+      const casted = webgpuBackend.ops.cast?.(tensor, "i32");
       expect(casted.dtype).toBe("i32");
       expect(casted.shape).toEqual([2, 2]);
 
@@ -370,7 +416,7 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
       expect(tensor.dtype).toBe("i32");
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
-      const casted = webgpuBackend.ops.cast!(tensor, "f32");
+      const casted = webgpuBackend.ops.cast?.(tensor, "f32");
       expect(casted.dtype).toBe("f32");
 
       const data = await webgpuBackend.ops.read(casted);
@@ -381,10 +427,14 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
     });
 
     it("casts f32 to u32", async () => {
-      const tensor = tensorFromArrayWithDtype([1.5, 2.7, 3.1, 4.9], [2, 2], "f32");
+      const tensor = tensorFromArrayWithDtype(
+        [1.5, 2.7, 3.1, 4.9],
+        [2, 2],
+        "f32",
+      );
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
-      const casted = webgpuBackend.ops.cast!(tensor, "u32");
+      const casted = webgpuBackend.ops.cast?.(tensor, "u32");
       expect(casted.dtype).toBe("u32");
 
       const data = await webgpuBackend.ops.read(casted);
@@ -395,7 +445,7 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
       const tensor = tensorFromArrayWithDtype([1, 2, 3, 4], [2, 2], "i32");
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
-      const casted = webgpuBackend.ops.cast!(tensor, "u32");
+      const casted = webgpuBackend.ops.cast?.(tensor, "u32");
       expect(casted.dtype).toBe("u32");
 
       const data = await webgpuBackend.ops.read(casted);
@@ -406,7 +456,7 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
       const tensor = tensorFromArrayWithDtype([1, 2, 3, 4], [2, 2], "i32");
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
-      const casted = webgpuBackend.ops.cast!(tensor, "i32");
+      const casted = webgpuBackend.ops.cast?.(tensor, "i32");
       // Should return same tensor (no-op)
       expect(casted).toBe(tensor);
     });
@@ -417,10 +467,14 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
         return;
       }
 
-      const tensor = tensorFromArrayWithDtype([1.5, 2.5, 3.5, 4.5], [2, 2], "f32");
+      const tensor = tensorFromArrayWithDtype(
+        [1.5, 2.5, 3.5, 4.5],
+        [2, 2],
+        "f32",
+      );
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
-      const casted = webgpuBackend.ops.cast!(tensor, "f16");
+      const casted = webgpuBackend.ops.cast?.(tensor, "f16");
       expect(casted.dtype).toBe("f16");
 
       const data = await webgpuBackend.ops.read(casted);
@@ -436,10 +490,14 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
         return;
       }
 
-      const tensor = tensorFromArrayWithDtype([1.5, 2.5, 3.5, 4.5], [2, 2], "f16");
+      const tensor = tensorFromArrayWithDtype(
+        [1.5, 2.5, 3.5, 4.5],
+        [2, 2],
+        "f16",
+      );
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
-      const casted = webgpuBackend.ops.cast!(tensor, "f32");
+      const casted = webgpuBackend.ops.cast?.(tensor, "f32");
       expect(casted.dtype).toBe("f32");
 
       const data = await webgpuBackend.ops.read(casted);
@@ -448,13 +506,20 @@ describe.skipIf(cpuOnly)("WebGPU dtype support", () => {
     });
 
     it("casts non-contiguous tensor (transposed)", async () => {
-      const tensor = tensorFromArrayWithDtype([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3], "f32");
+      const tensor = tensorFromArrayWithDtype(
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        [2, 3],
+        "f32",
+      );
 
       const { webgpuBackend } = await import("../../src/backend/webgpu/index");
-      const transposed = webgpuBackend.ops.transpose(tensor, { dim0: 0, dim1: 1 });
+      const transposed = webgpuBackend.ops.transpose(tensor, {
+        dim0: 0,
+        dim1: 1,
+      });
       expect(transposed.isContiguous).toBe(false);
 
-      const casted = webgpuBackend.ops.cast!(transposed, "i32");
+      const casted = webgpuBackend.ops.cast?.(transposed, "i32");
       expect(casted.dtype).toBe("i32");
       expect(casted.shape).toEqual([3, 2]);
       expect(casted.isContiguous).toBe(true); // Cast materializes to contiguous

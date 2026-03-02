@@ -15,7 +15,7 @@ describe("compiled region caching", () => {
   });
 
   it("caches identical compiled graphs", () => {
-    const compiled = engine.compile((a: number, b: number) => {
+    const compiled = engine.compile((_a: number, _b: number) => {
       const t1 = engine._debug_emitLazyOp("input", {
         shape: [2, 3],
         dtype: "f32",
@@ -347,13 +347,47 @@ describe("scalar canonicalization in hashIRGraph (§8.2.1)", () => {
 
   it("different scalar values produce different hashes", () => {
     const graph1 = makeGraph([
-      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [2, 3], dtype: "f32" },
-      { id: 1, op: "mul", epoch: 1, kind: "lazy_op", inputs: [0], shape: [2, 3], dtype: "f32", scalarValues: [2.0] },
+      {
+        id: 0,
+        op: "input",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [],
+        shape: [2, 3],
+        dtype: "f32",
+      },
+      {
+        id: 1,
+        op: "mul",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [0],
+        shape: [2, 3],
+        dtype: "f32",
+        scalarValues: [2.0],
+      },
     ]);
 
     const graph2 = makeGraph([
-      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [2, 3], dtype: "f32" },
-      { id: 1, op: "mul", epoch: 1, kind: "lazy_op", inputs: [0], shape: [2, 3], dtype: "f32", scalarValues: [3.0] },
+      {
+        id: 0,
+        op: "input",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [],
+        shape: [2, 3],
+        dtype: "f32",
+      },
+      {
+        id: 1,
+        op: "mul",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [0],
+        shape: [2, 3],
+        dtype: "f32",
+        scalarValues: [3.0],
+      },
     ]);
 
     expect(hashIRGraph(graph1)).not.toBe(hashIRGraph(graph2));
@@ -361,13 +395,47 @@ describe("scalar canonicalization in hashIRGraph (§8.2.1)", () => {
 
   it("+0 vs -0 produces different hashes", () => {
     const graphPos = makeGraph([
-      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [4], dtype: "f32" },
-      { id: 1, op: "add", epoch: 1, kind: "lazy_op", inputs: [0], shape: [4], dtype: "f32", scalarValues: [+0.0] },
+      {
+        id: 0,
+        op: "input",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [],
+        shape: [4],
+        dtype: "f32",
+      },
+      {
+        id: 1,
+        op: "add",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [0],
+        shape: [4],
+        dtype: "f32",
+        scalarValues: [+0.0],
+      },
     ]);
 
     const graphNeg = makeGraph([
-      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [4], dtype: "f32" },
-      { id: 1, op: "add", epoch: 1, kind: "lazy_op", inputs: [0], shape: [4], dtype: "f32", scalarValues: [-0.0] },
+      {
+        id: 0,
+        op: "input",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [],
+        shape: [4],
+        dtype: "f32",
+      },
+      {
+        id: 1,
+        op: "add",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [0],
+        shape: [4],
+        dtype: "f32",
+        scalarValues: [-0.0],
+      },
     ]);
 
     expect(hashIRGraph(graphPos)).not.toBe(hashIRGraph(graphNeg));
@@ -390,13 +458,47 @@ describe("scalar canonicalization in hashIRGraph (§8.2.1)", () => {
     expect(Number.isNaN(nan2)).toBe(true);
 
     const graphNaN1 = makeGraph([
-      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [2], dtype: "f32" },
-      { id: 1, op: "mul", epoch: 1, kind: "lazy_op", inputs: [0], shape: [2], dtype: "f32", scalarValues: [nan1] },
+      {
+        id: 0,
+        op: "input",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [],
+        shape: [2],
+        dtype: "f32",
+      },
+      {
+        id: 1,
+        op: "mul",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [0],
+        shape: [2],
+        dtype: "f32",
+        scalarValues: [nan1],
+      },
     ]);
 
     const graphNaN2 = makeGraph([
-      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [2], dtype: "f32" },
-      { id: 1, op: "mul", epoch: 1, kind: "lazy_op", inputs: [0], shape: [2], dtype: "f32", scalarValues: [nan2] },
+      {
+        id: 0,
+        op: "input",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [],
+        shape: [2],
+        dtype: "f32",
+      },
+      {
+        id: 1,
+        op: "mul",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [0],
+        shape: [2],
+        dtype: "f32",
+        scalarValues: [nan2],
+      },
     ]);
 
     // Canonical NaN → same hash
@@ -405,8 +507,24 @@ describe("scalar canonicalization in hashIRGraph (§8.2.1)", () => {
 
   it("no scalars produces same hash as before (backward compatible)", () => {
     const graph = makeGraph([
-      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [2, 3], dtype: "f32" },
-      { id: 1, op: "relu", epoch: 1, kind: "lazy_op", inputs: [0], shape: [2, 3], dtype: "f32" },
+      {
+        id: 0,
+        op: "input",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [],
+        shape: [2, 3],
+        dtype: "f32",
+      },
+      {
+        id: 1,
+        op: "relu",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [0],
+        shape: [2, 3],
+        dtype: "f32",
+      },
     ]);
 
     // Hash without scalarsByNode parameter
@@ -419,8 +537,25 @@ describe("scalar canonicalization in hashIRGraph (§8.2.1)", () => {
 
   it("scalarsByNode parameter overrides node.scalarValues", () => {
     const graph = makeGraph([
-      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [2], dtype: "f32" },
-      { id: 1, op: "mul", epoch: 1, kind: "lazy_op", inputs: [0], shape: [2], dtype: "f32", scalarValues: [2.0] },
+      {
+        id: 0,
+        op: "input",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [],
+        shape: [2],
+        dtype: "f32",
+      },
+      {
+        id: 1,
+        op: "mul",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [0],
+        shape: [2],
+        dtype: "f32",
+        scalarValues: [2.0],
+      },
     ]);
 
     // Hash using node.scalarValues (2.0)
@@ -437,8 +572,25 @@ describe("scalar canonicalization in hashIRGraph (§8.2.1)", () => {
 
   it("hash is deterministic across calls", () => {
     const graph = makeGraph([
-      { id: 0, op: "input", epoch: 1, kind: "lazy_op", inputs: [], shape: [2, 3], dtype: "f32" },
-      { id: 1, op: "mul", epoch: 1, kind: "lazy_op", inputs: [0], shape: [2, 3], dtype: "f32", scalarValues: [42.5] },
+      {
+        id: 0,
+        op: "input",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [],
+        shape: [2, 3],
+        dtype: "f32",
+      },
+      {
+        id: 1,
+        op: "mul",
+        epoch: 1,
+        kind: "lazy_op",
+        inputs: [0],
+        shape: [2, 3],
+        dtype: "f32",
+        scalarValues: [42.5],
+      },
     ]);
 
     const hash1 = hashIRGraph(graph);

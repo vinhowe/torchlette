@@ -269,9 +269,12 @@ export interface DebugPlanLinearOrder {
 }
 
 export function compareEventKey(a: EventKey, b: EventKey): number {
-  if (a.graphInstanceId !== b.graphInstanceId) return a.graphInstanceId - b.graphInstanceId;
-  if (a.callInstanceId !== b.callInstanceId) return a.callInstanceId - b.callInstanceId;
-  if (a.planInstanceId !== b.planInstanceId) return a.planInstanceId - b.planInstanceId;
+  if (a.graphInstanceId !== b.graphInstanceId)
+    return a.graphInstanceId - b.graphInstanceId;
+  if (a.callInstanceId !== b.callInstanceId)
+    return a.callInstanceId - b.callInstanceId;
+  if (a.planInstanceId !== b.planInstanceId)
+    return a.planInstanceId - b.planInstanceId;
   if (a.opNonce !== b.opNonce) return a.opNonce - b.opNonce;
   if (a.drawNonce !== b.drawNonce) return a.drawNonce - b.drawNonce;
   if (a.mutId !== b.mutId) return a.mutId - b.mutId;
@@ -280,12 +283,18 @@ export function compareEventKey(a: EventKey, b: EventKey): number {
   return 0;
 }
 
-export function buildPlanLinearOrder(events: PlanEvent[]): DebugPlanLinearOrder {
-  const orderedEvents = events.slice().sort((left, right) => compareEventKey(left.key, right.key));
+export function buildPlanLinearOrder(
+  events: PlanEvent[],
+): DebugPlanLinearOrder {
+  const orderedEvents = events
+    .slice()
+    .sort((left, right) => compareEventKey(left.key, right.key));
   return { orderedEvents, eventKeys: orderedEvents.map((event) => event.key) };
 }
 
-export function expandSemanticSubeventSchedule(schedule: SemanticSubeventSchedule): PlanEvent[] {
+export function expandSemanticSubeventSchedule(
+  schedule: SemanticSubeventSchedule,
+): PlanEvent[] {
   return schedule.subevents.map((subevent) => ({
     name: subevent.kind,
     key: {

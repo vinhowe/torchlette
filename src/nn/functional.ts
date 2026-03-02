@@ -81,11 +81,13 @@ export function crossEntropy(
     if (reduction === "none") return perSampleLoss;
     if (reduction === "sum") {
       const s = perSampleLoss.sum();
-      if (typeof s === "number") return api.full([], s, { device: logits.device });
+      if (typeof s === "number")
+        return api.full([], s, { device: logits.device });
       return s;
     }
     const m = perSampleLoss.mean();
-    if (typeof m === "number") return api.full([], m, { device: logits.device });
+    if (typeof m === "number")
+      return api.full([], m, { device: logits.device });
     return m;
   }
 

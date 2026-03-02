@@ -4,24 +4,18 @@
  * Verifies that the tile-IR fusion codegen path produces correct WGSL
  * and computes the same results as the string-template codegen.
  */
-import { describe, expect, it, beforeAll } from "vitest";
-import {
-  initWebGPU,
-  webgpuBackend,
-} from "../../src/backend/webgpu";
+import { beforeAll, describe, expect, it } from "vitest";
+import { initWebGPU, webgpuBackend } from "../../src/backend/webgpu";
 import {
   dispatchFusedKernel,
   resetFusionCache,
 } from "../../src/backend/webgpu/fusion-dispatch";
+import { generateFusedKernelTileIR } from "../../src/backend/webgpu/fusion-tile-ir";
 import {
   computeKernelMeta,
   type FusedKernelRecipe,
-  type FusedNode,
-  type FusedInput,
-  type FusedOutput,
   type KernelGenOptions,
 } from "../../src/backend/webgpu/fusion-types";
-import { generateFusedKernelTileIR } from "../../src/backend/webgpu/fusion-tile-ir";
 import { sizeOf } from "../../src/core/shape";
 
 import { cpuOnly } from "../helpers/webgpu";
@@ -29,7 +23,11 @@ import { cpuOnly } from "../helpers/webgpu";
 const SKIP = cpuOnly;
 
 // Helper to build a simple unary recipe
-function unaryRecipe(op: string, shape: number[], dtype: "f32" | "f16" = "f32"): FusedKernelRecipe {
+function unaryRecipe(
+  op: string,
+  shape: number[],
+  dtype: "f32" | "f16" = "f32",
+): FusedKernelRecipe {
   return {
     id: `test_${op}`,
     nodes: [{ id: 1, op, inputs: [-1], shape, dtype, isOutput: true }],
@@ -39,7 +37,11 @@ function unaryRecipe(op: string, shape: number[], dtype: "f32" | "f16" = "f32"):
 }
 
 // Helper to build a simple binary recipe
-function binaryRecipe(op: string, shape: number[], dtype: "f32" | "f16" = "f32"): FusedKernelRecipe {
+function binaryRecipe(
+  op: string,
+  shape: number[],
+  dtype: "f32" | "f16" = "f32",
+): FusedKernelRecipe {
   return {
     id: `test_${op}`,
     nodes: [{ id: 1, op, inputs: [-1, -2], shape, dtype, isOutput: true }],
@@ -83,7 +85,16 @@ describe("Tile-IR Fusion Codegen", () => {
     it("generates valid WGSL for cast_f16", () => {
       const recipe: FusedKernelRecipe = {
         id: "test_cast_f16",
-        nodes: [{ id: 1, op: "cast_f16", inputs: [-1], shape: [16], dtype: "f16", isOutput: true }],
+        nodes: [
+          {
+            id: 1,
+            op: "cast_f16",
+            inputs: [-1],
+            shape: [16],
+            dtype: "f16",
+            isOutput: true,
+          },
+        ],
         inputs: [{ id: 100, index: 0, shape: [16], dtype: "f32" }],
         outputs: [{ nodeId: 1, index: 0, shape: [16], dtype: "f16" }],
       };
@@ -96,7 +107,14 @@ describe("Tile-IR Fusion Codegen", () => {
         id: "test_chain",
         nodes: [
           { id: 1, op: "mul", inputs: [-1, -2], shape: [16], dtype: "f32" },
-          { id: 2, op: "relu", inputs: [1], shape: [16], dtype: "f32", isOutput: true },
+          {
+            id: 2,
+            op: "relu",
+            inputs: [1],
+            shape: [16],
+            dtype: "f32",
+            isOutput: true,
+          },
         ],
         inputs: [
           { id: 100, index: 0, shape: [16], dtype: "f32" },
@@ -113,8 +131,22 @@ describe("Tile-IR Fusion Codegen", () => {
       const recipe: FusedKernelRecipe = {
         id: "test_multi_out",
         nodes: [
-          { id: 1, op: "relu", inputs: [-1], shape: [16], dtype: "f32", isOutput: true },
-          { id: 2, op: "neg", inputs: [-1], shape: [16], dtype: "f32", isOutput: true },
+          {
+            id: 1,
+            op: "relu",
+            inputs: [-1],
+            shape: [16],
+            dtype: "f32",
+            isOutput: true,
+          },
+          {
+            id: 2,
+            op: "neg",
+            inputs: [-1],
+            shape: [16],
+            dtype: "f32",
+            isOutput: true,
+          },
         ],
         inputs: [{ id: 100, index: 0, shape: [16], dtype: "f32" }],
         outputs: [
@@ -131,7 +163,16 @@ describe("Tile-IR Fusion Codegen", () => {
     it("generates valid WGSL for where (ternary)", () => {
       const recipe: FusedKernelRecipe = {
         id: "test_where",
-        nodes: [{ id: 1, op: "where", inputs: [-1, -2, -3], shape: [16], dtype: "f32", isOutput: true }],
+        nodes: [
+          {
+            id: 1,
+            op: "where",
+            inputs: [-1, -2, -3],
+            shape: [16],
+            dtype: "f32",
+            isOutput: true,
+          },
+        ],
         inputs: [
           { id: 100, index: 0, shape: [16], dtype: "f32" },
           { id: 101, index: 1, shape: [16], dtype: "f32" },
@@ -154,10 +195,26 @@ describe("Tile-IR Fusion Codegen", () => {
     it("handles inlined constants", () => {
       const recipe: FusedKernelRecipe = {
         id: "test_inlined",
-        nodes: [{ id: 1, op: "add", inputs: [-1, -2], shape: [16], dtype: "f32", isOutput: true }],
+        nodes: [
+          {
+            id: 1,
+            op: "add",
+            inputs: [-1, -2],
+            shape: [16],
+            dtype: "f32",
+            isOutput: true,
+          },
+        ],
         inputs: [
           { id: 100, index: 0, shape: [16], dtype: "f32" },
-          { id: 101, index: 1, shape: [1], dtype: "f32", isInlinedConstant: true, inlinedValue: 2.0 },
+          {
+            id: 101,
+            index: 1,
+            shape: [1],
+            dtype: "f32",
+            isInlinedConstant: true,
+            inlinedValue: 2.0,
+          },
         ],
         outputs: [{ nodeId: 1, index: 0, shape: [16], dtype: "f32" }],
       };
@@ -169,7 +226,16 @@ describe("Tile-IR Fusion Codegen", () => {
     it("handles broadcasting", () => {
       const recipe: FusedKernelRecipe = {
         id: "test_broadcast",
-        nodes: [{ id: 1, op: "add", inputs: [-1, -2], shape: [4, 4], dtype: "f32", isOutput: true }],
+        nodes: [
+          {
+            id: 1,
+            op: "add",
+            inputs: [-1, -2],
+            shape: [4, 4],
+            dtype: "f32",
+            isOutput: true,
+          },
+        ],
         inputs: [
           { id: 100, index: 0, shape: [4, 4], dtype: "f32" },
           { id: 101, index: 1, shape: [1, 4], dtype: "f32" },
@@ -195,11 +261,31 @@ describe("Tile-IR Fusion Codegen", () => {
     // Test every op in the registry compiles
     const allOps = [
       // Unary
-      "relu", "gelu", "gelu_tanh", "gelu_erf", "silu", "sigmoid", "tanh", "softplus",
-      "neg", "abs", "exp", "log", "sqrt", "rsqrt", "sin", "cos", "floor", "ceil",
-      "round", "sign", "isfinite",
+      "relu",
+      "gelu",
+      "gelu_tanh",
+      "gelu_erf",
+      "silu",
+      "sigmoid",
+      "tanh",
+      "softplus",
+      "neg",
+      "abs",
+      "exp",
+      "log",
+      "sqrt",
+      "rsqrt",
+      "sin",
+      "cos",
+      "floor",
+      "ceil",
+      "round",
+      "sign",
+      "isfinite",
       // Casts
-      "cast_f32", "cast_i32", "cast_u32",
+      "cast_f32",
+      "cast_i32",
+      "cast_u32",
     ];
 
     for (const op of allOps) {
@@ -236,7 +322,10 @@ describe("Tile-IR Fusion Codegen", () => {
       await initWebGPU();
     });
 
-    async function readBuffer(buffer: GPUBuffer, size: number): Promise<Float32Array> {
+    async function readBuffer(
+      buffer: GPUBuffer,
+      size: number,
+    ): Promise<Float32Array> {
       const device = webgpuBackend.device!;
       const staging = device.createBuffer({
         size,
@@ -259,7 +348,9 @@ describe("Tile-IR Fusion Codegen", () => {
     ): Promise<Float32Array[]> {
       const device = webgpuBackend.device!;
       const inputs = inputArrays.map((arr, i) => {
-        const recipeInput = recipe.inputs.filter(inp => !inp.isInlinedConstant)[i];
+        const recipeInput = recipe.inputs.filter(
+          (inp) => !inp.isInlinedConstant,
+        )[i];
         const buf = device.createBuffer({
           size: arr.byteLength,
           usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
@@ -267,7 +358,11 @@ describe("Tile-IR Fusion Codegen", () => {
         });
         new Float32Array(buf.getMappedRange()).set(arr);
         buf.unmap();
-        return { buffer: buf, shape: recipeInput.shape, dtype: recipeInput.dtype as "f32" };
+        return {
+          buffer: buf,
+          shape: recipeInput.shape,
+          dtype: recipeInput.dtype as "f32",
+        };
       });
 
       const result = dispatchFusedKernel(device, recipe, inputs, {
@@ -313,7 +408,14 @@ describe("Tile-IR Fusion Codegen", () => {
         id: "test_mul_relu",
         nodes: [
           { id: 1, op: "mul", inputs: [-1, -2], shape: [4], dtype: "f32" },
-          { id: 2, op: "relu", inputs: [1], shape: [4], dtype: "f32", isOutput: true },
+          {
+            id: 2,
+            op: "relu",
+            inputs: [1],
+            shape: [4],
+            dtype: "f32",
+            isOutput: true,
+          },
         ],
         inputs: [
           { id: 100, index: 0, shape: [4], dtype: "f32" },
@@ -332,7 +434,16 @@ describe("Tile-IR Fusion Codegen", () => {
       resetFusionCache();
       const recipe: FusedKernelRecipe = {
         id: "test_where_dispatch",
-        nodes: [{ id: 1, op: "where", inputs: [-1, -2, -3], shape: [4], dtype: "f32", isOutput: true }],
+        nodes: [
+          {
+            id: 1,
+            op: "where",
+            inputs: [-1, -2, -3],
+            shape: [4],
+            dtype: "f32",
+            isOutput: true,
+          },
+        ],
         inputs: [
           { id: 100, index: 0, shape: [4], dtype: "f32" },
           { id: 101, index: 1, shape: [4], dtype: "f32" },
@@ -351,7 +462,16 @@ describe("Tile-IR Fusion Codegen", () => {
       resetFusionCache();
       const recipe: FusedKernelRecipe = {
         id: "test_broadcast_dispatch",
-        nodes: [{ id: 1, op: "add", inputs: [-1, -2], shape: [2, 3], dtype: "f32", isOutput: true }],
+        nodes: [
+          {
+            id: 1,
+            op: "add",
+            inputs: [-1, -2],
+            shape: [2, 3],
+            dtype: "f32",
+            isOutput: true,
+          },
+        ],
         inputs: [
           { id: 100, index: 0, shape: [2, 3], dtype: "f32" },
           { id: 101, index: 1, shape: [1, 3], dtype: "f32" },
@@ -368,10 +488,26 @@ describe("Tile-IR Fusion Codegen", () => {
       resetFusionCache();
       const recipe: FusedKernelRecipe = {
         id: "test_inlined_dispatch",
-        nodes: [{ id: 1, op: "mul", inputs: [-1, -2], shape: [4], dtype: "f32", isOutput: true }],
+        nodes: [
+          {
+            id: 1,
+            op: "mul",
+            inputs: [-1, -2],
+            shape: [4],
+            dtype: "f32",
+            isOutput: true,
+          },
+        ],
         inputs: [
           { id: 100, index: 0, shape: [4], dtype: "f32" },
-          { id: 101, index: 1, shape: [1], dtype: "f32", isInlinedConstant: true, inlinedValue: 3.0 },
+          {
+            id: 101,
+            index: 1,
+            shape: [1],
+            dtype: "f32",
+            isInlinedConstant: true,
+            inlinedValue: 3.0,
+          },
         ],
         outputs: [{ nodeId: 1, index: 0, shape: [4], dtype: "f32" }],
       };
@@ -385,8 +521,22 @@ describe("Tile-IR Fusion Codegen", () => {
       const recipe: FusedKernelRecipe = {
         id: "test_multi_out_dispatch",
         nodes: [
-          { id: 1, op: "relu", inputs: [-1], shape: [4], dtype: "f32", isOutput: true },
-          { id: 2, op: "neg", inputs: [-1], shape: [4], dtype: "f32", isOutput: true },
+          {
+            id: 1,
+            op: "relu",
+            inputs: [-1],
+            shape: [4],
+            dtype: "f32",
+            isOutput: true,
+          },
+          {
+            id: 2,
+            op: "neg",
+            inputs: [-1],
+            shape: [4],
+            dtype: "f32",
+            isOutput: true,
+          },
         ],
         inputs: [{ id: 100, index: 0, shape: [4], dtype: "f32" }],
         outputs: [
@@ -429,7 +579,9 @@ describe("Tile-IR Fusion Codegen", () => {
       const recipe = unaryRecipe("relu", [32]);
       const input = new Float32Array(32);
       for (let i = 0; i < 32; i++) input[i] = i - 16;
-      const [result] = await dispatchAndRead(recipe, [input], { vectorize: true });
+      const [result] = await dispatchAndRead(recipe, [input], {
+        vectorize: true,
+      });
       for (let i = 0; i < 32; i++) {
         expect(result[i]).toBe(Math.max(0, i - 16));
       }

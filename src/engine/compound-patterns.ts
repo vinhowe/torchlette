@@ -57,7 +57,9 @@ function matchSoftmax(
   // 1. maxNode must be "max" with keepdim=true
   if (maxNode.op !== "max") return null;
   if (maxNode.dtype !== "f32") return null;
-  const maxPayload = maxNode.payload as { dim?: number; keepdim?: boolean } | undefined;
+  const maxPayload = maxNode.payload as
+    | { dim?: number; keepdim?: boolean }
+    | undefined;
   if (!maxPayload || !maxPayload.keepdim) return null;
   const dim = maxPayload.dim;
   if (dim === undefined) return null;
@@ -79,13 +81,15 @@ function matchSoftmax(
   if (subNode.inputs.length < 2) return null;
   const subInput0 = subNode.inputs[0];
   const subInput1 = subNode.inputs[1];
-  if (subInput1.kind !== "pending" || subInput1.node.id !== maxNode.id) return null;
+  if (subInput1.kind !== "pending" || subInput1.node.id !== maxNode.id)
+    return null;
   // sub.inputs[0] should be the same x as max.inputs[0]
   if (xIsMaterialized) {
     if (subInput0.kind !== "materialized") return null;
     // Can't verify identity of materialized refs — rely on structural match
   } else {
-    if (subInput0.kind !== "pending" || subInput0.node.id !== xNodeId) return null;
+    if (subInput0.kind !== "pending" || subInput0.node.id !== xNodeId)
+      return null;
   }
 
   // 4. sub must have exactly 1 consumer → exp
@@ -110,11 +114,17 @@ function matchSoftmax(
   if (!sumNode || !divNode) return null;
 
   // 6. sum must use the same dim with keepdim=true
-  const sumPayload = sumNode.payload as { dim?: number; keepdim?: boolean } | undefined;
+  const sumPayload = sumNode.payload as
+    | { dim?: number; keepdim?: boolean }
+    | undefined;
   if (!sumPayload || !sumPayload.keepdim || sumPayload.dim !== dim) return null;
   // sum's input must be exp
   if (sumNode.inputs.length < 1) return null;
-  if (sumNode.inputs[0].kind !== "pending" || sumNode.inputs[0].node.id !== expNode.id) return null;
+  if (
+    sumNode.inputs[0].kind !== "pending" ||
+    sumNode.inputs[0].node.id !== expNode.id
+  )
+    return null;
 
   // 7. sum must have exactly 1 consumer → div
   if ((consumerCount.get(sumNode.id) ?? 0) !== 1) return null;
@@ -126,8 +136,10 @@ function matchSoftmax(
   if (divNode.inputs.length < 2) return null;
   const divInput0 = divNode.inputs[0];
   const divInput1 = divNode.inputs[1];
-  if (divInput0.kind !== "pending" || divInput0.node.id !== expNode.id) return null;
-  if (divInput1.kind !== "pending" || divInput1.node.id !== sumNode.id) return null;
+  if (divInput0.kind !== "pending" || divInput0.node.id !== expNode.id)
+    return null;
+  if (divInput1.kind !== "pending" || divInput1.node.id !== sumNode.id)
+    return null;
 
   // 9. Don't claim nodes that are externally referenced (except the output)
   const intermediates = [maxNode, subNode, expNode, sumNode];
@@ -138,7 +150,13 @@ function matchSoftmax(
   // All checks pass — this is a softmax pattern
   return {
     name: "softmax",
-    coveredNodeIds: [maxNode.id, subNode.id, expNode.id, sumNode.id, divNode.id],
+    coveredNodeIds: [
+      maxNode.id,
+      subNode.id,
+      expNode.id,
+      sumNode.id,
+      divNode.id,
+    ],
     outputNodeId: divNode.id,
     dim,
     inputNodeId: xNodeId,
@@ -168,7 +186,9 @@ function matchLogSoftmax(
   // 1. maxNode must be "max" with keepdim=true
   if (maxNode.op !== "max") return null;
   if (maxNode.dtype !== "f32") return null;
-  const maxPayload = maxNode.payload as { dim?: number; keepdim?: boolean } | undefined;
+  const maxPayload = maxNode.payload as
+    | { dim?: number; keepdim?: boolean }
+    | undefined;
   if (!maxPayload || !maxPayload.keepdim) return null;
   const dim = maxPayload.dim;
   if (dim === undefined) return null;
@@ -187,11 +207,19 @@ function matchLogSoftmax(
   const xIsMaterialized = maxInputRef.kind === "materialized";
 
   if (sub1Node.inputs.length < 2) return null;
-  if (sub1Node.inputs[1].kind !== "pending" || sub1Node.inputs[1].node.id !== maxNode.id) return null;
+  if (
+    sub1Node.inputs[1].kind !== "pending" ||
+    sub1Node.inputs[1].node.id !== maxNode.id
+  )
+    return null;
   if (xIsMaterialized) {
     if (sub1Node.inputs[0].kind !== "materialized") return null;
   } else {
-    if (sub1Node.inputs[0].kind !== "pending" || sub1Node.inputs[0].node.id !== xNodeId) return null;
+    if (
+      sub1Node.inputs[0].kind !== "pending" ||
+      sub1Node.inputs[0].node.id !== xNodeId
+    )
+      return null;
   }
 
   // 4. sub₁ must have exactly 2 consumers → exp + sub₂
@@ -215,9 +243,15 @@ function matchLogSoftmax(
   if (sumNode.op !== "sum") return null;
 
   // 6. sum must use same dim, keepdim=true
-  const sumPayload = sumNode.payload as { dim?: number; keepdim?: boolean } | undefined;
+  const sumPayload = sumNode.payload as
+    | { dim?: number; keepdim?: boolean }
+    | undefined;
   if (!sumPayload || !sumPayload.keepdim || sumPayload.dim !== dim) return null;
-  if (sumNode.inputs[0].kind !== "pending" || sumNode.inputs[0].node.id !== expNode.id) return null;
+  if (
+    sumNode.inputs[0].kind !== "pending" ||
+    sumNode.inputs[0].node.id !== expNode.id
+  )
+    return null;
 
   // 7. sum → log (exactly 1 consumer)
   if ((consumerCount.get(sumNode.id) ?? 0) !== 1) return null;
@@ -234,8 +268,16 @@ function matchLogSoftmax(
 
   // 9. sub₂ must take (shifted, logSumVal)
   if (sub2Node.inputs.length < 2) return null;
-  if (sub2Node.inputs[0].kind !== "pending" || sub2Node.inputs[0].node.id !== sub1Node.id) return null;
-  if (sub2Node.inputs[1].kind !== "pending" || sub2Node.inputs[1].node.id !== logNode.id) return null;
+  if (
+    sub2Node.inputs[0].kind !== "pending" ||
+    sub2Node.inputs[0].node.id !== sub1Node.id
+  )
+    return null;
+  if (
+    sub2Node.inputs[1].kind !== "pending" ||
+    sub2Node.inputs[1].node.id !== logNode.id
+  )
+    return null;
 
   // 10. Don't claim externally referenced intermediates
   const intermediates = [maxNode, sub1Node, expNode, sumNode, logNode];
@@ -245,7 +287,14 @@ function matchLogSoftmax(
 
   return {
     name: "log_softmax",
-    coveredNodeIds: [maxNode.id, sub1Node.id, expNode.id, sumNode.id, logNode.id, sub2Node.id],
+    coveredNodeIds: [
+      maxNode.id,
+      sub1Node.id,
+      expNode.id,
+      sumNode.id,
+      logNode.id,
+      sub2Node.id,
+    ],
     outputNodeId: sub2Node.id,
     dim,
     inputNodeId: xNodeId,
@@ -280,14 +329,19 @@ export function detectCompoundPatterns(
     if (node.op !== "max") continue;
 
     // Try log_softmax first (it's a superset of softmax pattern start)
-    let match = matchLogSoftmax(node, consumers, consumerCount, externalNodeIds);
+    let match = matchLogSoftmax(
+      node,
+      consumers,
+      consumerCount,
+      externalNodeIds,
+    );
     if (!match) {
       match = matchSoftmax(node, consumers, consumerCount, externalNodeIds);
     }
 
     if (match) {
       // Verify no nodes are already claimed
-      const conflict = match.coveredNodeIds.some(id => claimedIds.has(id));
+      const conflict = match.coveredNodeIds.some((id) => claimedIds.has(id));
       if (!conflict) {
         matches.push(match);
         for (const id of match.coveredNodeIds) claimedIds.add(id);

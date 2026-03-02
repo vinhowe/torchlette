@@ -1,9 +1,13 @@
 import type { Backend, BackendTensor, DType } from "../backend/types";
 import { asGPUTensor } from "../backend/webgpu/gpu-types";
-import type { LazyIRNode, LazyRef } from "./lazy-types";
-import { createStorageHandle, ensureWebGPUMatmulImports, _webgpuMatmulImports } from "./node-factory";
-import { getInputStorage } from "./op-dispatch";
 import { shapesEqual } from "../core/shape";
+import type { LazyIRNode, LazyRef } from "./lazy-types";
+import {
+  _webgpuMatmulImports,
+  createStorageHandle,
+  ensureWebGPUMatmulImports,
+} from "./node-factory";
+import { getInputStorage } from "./op-dispatch";
 export { shapesEqual };
 
 // ============================================================================
@@ -29,7 +33,12 @@ export interface MatmulEpiloguePlan {
   /** Number of nodes consumed (matmul + epilogue ops) */
   consumedCount: number;
   /** Epilogue operations to fuse */
-  epilogueOps: Array<{ kind: string; toDtype?: DType; inputIndex?: number; op?: string }>;
+  epilogueOps: Array<{
+    kind: string;
+    toDtype?: DType;
+    inputIndex?: number;
+    op?: string;
+  }>;
   /** Additional inputs required by epilogue (e.g. bias tensor) */
   epilogueInputRefs: LazyRef[];
   /** Output dtype after epilogue */
@@ -77,11 +86,20 @@ export function detectMatmulEpilogueCore(
     if (nextNode.inputs.length === 0) break;
     let chainInputIdx = 0;
     const primaryInput = nextNode.inputs[0];
-    if (primaryInput.kind !== "pending" || primaryInput.node.id !== currentNode.id) {
+    if (
+      primaryInput.kind !== "pending" ||
+      primaryInput.node.id !== currentNode.id
+    ) {
       // For commutative binary ops, check if the chain continues via inputs[1]
-      if ((nextNode.op === "add" || nextNode.op === "mul") && nextNode.inputs.length === 2) {
+      if (
+        (nextNode.op === "add" || nextNode.op === "mul") &&
+        nextNode.inputs.length === 2
+      ) {
         const altInput = nextNode.inputs[1];
-        if (altInput.kind === "pending" && altInput.node.id === currentNode.id) {
+        if (
+          altInput.kind === "pending" &&
+          altInput.node.id === currentNode.id
+        ) {
           chainInputIdx = 1;
         } else {
           break;
@@ -103,9 +121,11 @@ export function detectMatmulEpilogueCore(
     if (nextNode.op === "reshape") {
       const curShape = currentNode.shape;
       const nextShape = nextNode.shape;
-      if (curShape.length === nextShape.length + 1
-          && curShape[0] === 1
-          && curShape.slice(1).every((d: number, i: number) => d === nextShape[i])) {
+      if (
+        curShape.length === nextShape.length + 1 &&
+        curShape[0] === 1 &&
+        curShape.slice(1).every((d: number, i: number) => d === nextShape[i])
+      ) {
         chainLength++;
         currentNode = nextNode;
         currentIsReshapeSkip = true;
@@ -146,22 +166,37 @@ export function detectMatmulEpilogueCore(
       } else {
         // General binary add
         if (additionalInputCount >= 4) break;
-        epilogueOps.push({ kind: "binary", op: "add", inputIndex: additionalInputCount });
+        epilogueOps.push({
+          kind: "binary",
+          op: "add",
+          inputIndex: additionalInputCount,
+        });
         epilogueInputRefs.push(secondInput);
         additionalInputCount++;
         matched = true;
       }
     } else if (nextNode.op === "mul" && nextNode.inputs.length === 2) {
       if (additionalInputCount >= 4) break;
-      epilogueOps.push({ kind: "binary", op: "mul", inputIndex: additionalInputCount });
+      epilogueOps.push({
+        kind: "binary",
+        op: "mul",
+        inputIndex: additionalInputCount,
+      });
       epilogueInputRefs.push(nextNode.inputs[chainInputIdx === 0 ? 1 : 0]);
       additionalInputCount++;
       matched = true;
-    } else if (nextNode.op === "relu" || nextNode.op === "silu" || nextNode.op === "sigmoid" || nextNode.op === "tanh") {
+    } else if (
+      nextNode.op === "relu" ||
+      nextNode.op === "silu" ||
+      nextNode.op === "sigmoid" ||
+      nextNode.op === "tanh"
+    ) {
       epilogueOps.push({ kind: "unary", op: nextNode.op });
       matched = true;
     } else if (nextNode.op === "gelu") {
-      const geluPayload = nextNode.payload as { approximate?: string } | undefined;
+      const geluPayload = nextNode.payload as
+        | { approximate?: string }
+        | undefined;
       if (geluPayload?.approximate === "tanh") {
         epilogueOps.push({ kind: "gelu" });
       } else {
@@ -205,11 +240,19 @@ export function detectMatmulEpilogue(
   for (const node of allPlanNodes) {
     for (const input of node.inputs) {
       if (input.kind === "pending") {
-        consumerCount.set(input.node.id, (consumerCount.get(input.node.id) ?? 0) + 1);
+        consumerCount.set(
+          input.node.id,
+          (consumerCount.get(input.node.id) ?? 0) + 1,
+        );
       }
     }
   }
-  return detectMatmulEpilogueCore(nodes, startIdx, consumerCount, externalNodeIds);
+  return detectMatmulEpilogueCore(
+    nodes,
+    startIdx,
+    consumerCount,
+    externalNodeIds,
+  );
 }
 
 /**
@@ -217,12 +260,22 @@ export function detectMatmulEpilogue(
  * Returns the effective contiguous shape and whether a transpose was detected.
  * Used by the matmul epilogue cache to compute correct geometry.
  */
-export function _detectTransposeView(tensor: { shape: number[]; strides?: number[]; isContiguous?: boolean; offset?: number }): { shape: number[]; transposed: boolean } {
+export function _detectTransposeView(tensor: {
+  shape: number[];
+  strides?: number[];
+  isContiguous?: boolean;
+  offset?: number;
+}): { shape: number[]; transposed: boolean } {
   const shape = tensor.shape;
   const strides = tensor.strides;
   const rank = shape.length;
 
-  if (tensor.isContiguous || (tensor.offset ?? 0) !== 0 || rank < 2 || !strides) {
+  if (
+    tensor.isContiguous ||
+    (tensor.offset ?? 0) !== 0 ||
+    rank < 2 ||
+    !strides
+  ) {
     return { shape: shape.slice(), transposed: false };
   }
 
@@ -232,7 +285,10 @@ export function _detectTransposeView(tensor: { shape: number[]; strides?: number
     let expectedStride = shape[rank - 1] * shape[rank - 2];
     let valid = true;
     for (let i = rank - 3; i >= 0; i--) {
-      if (strides[i] !== expectedStride) { valid = false; break; }
+      if (strides[i] !== expectedStride) {
+        valid = false;
+        break;
+      }
       expectedStride *= shape[i];
     }
     if (valid) {
@@ -254,7 +310,7 @@ export function _detectTransposeView(tensor: { shape: number[]; strides?: number
 export async function executeMatmulWithEpilogue(
   matmulNode: LazyIRNode,
   plan: MatmulEpiloguePlan,
-  backend: Backend,
+  _backend: Backend,
 ): Promise<void> {
   // Use cached imports (initialized once at executeLoweredPlan/executePlanOptimized entry)
   await ensureWebGPUMatmulImports();
@@ -270,8 +326,10 @@ export async function executeMatmulWithEpilogue(
   if (plan.prologues) {
     for (const p of plan.prologues) {
       // Check if the cast node's result was computed (e.g., via fusion group)
-      const castRef = p.inputIndex === 0 ? matmulNode.inputs[0] : matmulNode.inputs[1];
-      const castAlreadyRan = castRef.kind === "pending" && castRef.node.result != null;
+      const castRef =
+        p.inputIndex === 0 ? matmulNode.inputs[0] : matmulNode.inputs[1];
+      const castAlreadyRan =
+        castRef.kind === "pending" && castRef.node.result != null;
       if (!castAlreadyRan) {
         // Cast was skipped — use the pre-cast f32 input and tell codegen about the cast
         if (p.inputIndex === 0) {
@@ -313,7 +371,7 @@ export async function executeMatmulWithEpilogue(
     undefined, // donatedBuffer
     {
       epilogue: epilogueConfig,
-      epilogueInputs: epilogueInputTensors.map(t => asGPUTensor(t)),
+      epilogueInputs: epilogueInputTensors.map((t) => asGPUTensor(t)),
       inputCastA,
       inputCastB,
     },
@@ -335,7 +393,10 @@ export async function executeMatmulWithEpilogue(
     }
     gpuT.strides = newStrides;
   }
-  plan.outputNode.result = createStorageHandle(plan.outputNode.device, resultTensor);
+  plan.outputNode.result = createStorageHandle(
+    plan.outputNode.device,
+    resultTensor,
+  );
 }
 
 // shapesEqual re-exported from core/shape

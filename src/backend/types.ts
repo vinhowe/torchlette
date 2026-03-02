@@ -200,14 +200,14 @@ export type FusedCrossEntropyConfig = {
 };
 
 export type FusedLayerNormConfig = {
-  numRows: number;     // product of all dims except last (B*S for [B,S,D])
-  featureDim: number;  // last dim size (D)
+  numRows: number; // product of all dims except last (B*S for [B,S,D])
+  featureDim: number; // last dim size (D)
   eps: number;
 };
 
 export type FusedRMSNormConfig = {
-  numRows: number;     // product of all dims except last (B*S for [B,S,D])
-  featureDim: number;  // last dim size (D)
+  numRows: number; // product of all dims except last (B*S for [B,S,D])
+  featureDim: number; // last dim size (D)
   eps: number;
 };
 
@@ -244,11 +244,31 @@ export interface BackendOps {
   randn?(shape: Shape, seed: number): BackendTensor;
   /** Create a tensor with Bernoulli-distributed values (1 with probability p, else 0). */
   bernoulli?(shape: Shape, p: number, seed: number): BackendTensor;
-  add(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
-  sub(a: BackendTensor, b: BackendTensor, options?: SubOptions & OpExecOptions): BackendTensor;
-  div(a: BackendTensor, b: BackendTensor, options?: DivOptions & OpExecOptions): BackendTensor;
-  mul(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
-  matmul(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  add(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
+  sub(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: SubOptions & OpExecOptions,
+  ): BackendTensor;
+  div(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: DivOptions & OpExecOptions,
+  ): BackendTensor;
+  mul(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
+  matmul(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   sqrt(a: BackendTensor, options?: OpExecOptions): BackendTensor;
   relu(a: BackendTensor, options?: OpExecOptions): BackendTensor;
   exp?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
@@ -266,8 +286,17 @@ export interface BackendOps {
   ceil?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
   round?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
   sign?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
-  clamp?(a: BackendTensor, min: number | null, max: number | null, options?: OpExecOptions): BackendTensor;
-  pow?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  clamp?(
+    a: BackendTensor,
+    min: number | null,
+    max: number | null,
+    options?: OpExecOptions,
+  ): BackendTensor;
+  pow?(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   /** Check if values are finite (not NaN and not Inf). Returns 1.0 where finite, 0.0 elsewhere. */
   isfinite?(a: BackendTensor): BackendTensor;
   expand(a: BackendTensor, shape: Shape): BackendTensor;
@@ -276,12 +305,22 @@ export interface BackendOps {
   /** Permute dimensions according to the given order. Returns a view. */
   permute(a: BackendTensor, dims: number[]): BackendTensor;
   /** Select a contiguous sub-range along one dimension. Returns a view (zero cost). */
-  narrow?(a: BackendTensor, dim: number, start: number, length: number): BackendTensor;
+  narrow?(
+    a: BackendTensor,
+    dim: number,
+    start: number,
+    length: number,
+  ): BackendTensor;
   /**
    * Backward for narrow: pads gradient back to original shape.
    * Copies grad into [start, start+length) along dim, zeros elsewhere.
    */
-  narrowBackward?(grad: BackendTensor, dim: number, start: number, originalLength: number): BackendTensor;
+  narrowBackward?(
+    grad: BackendTensor,
+    dim: number,
+    start: number,
+    originalLength: number,
+  ): BackendTensor;
   /** Materialize non-contiguous tensor to contiguous buffer. Returns same tensor if already contiguous. */
   contiguous(a: BackendTensor): BackendTensor;
   /** Cast tensor to a different dtype. Returns same tensor if already target dtype. */
@@ -291,7 +330,11 @@ export interface BackendOps {
     input: BackendTensor,
     weight: BackendTensor,
     bias: BackendTensor | undefined,
-    options?: { stride?: number | [number, number]; padding?: number | [number, number]; outBuffer?: unknown },
+    options?: {
+      stride?: number | [number, number];
+      padding?: number | [number, number];
+      outBuffer?: unknown;
+    },
   ): BackendTensor;
   gather(
     a: BackendTensor,
@@ -319,17 +362,41 @@ export interface BackendOps {
   /** Argmin reduction. Returns indices of minimum values along dimension. */
   argmin?(a: BackendTensor, options: ArgReduceOptions): BackendTensor;
   /** Greater than comparison. Returns 1.0 where a > b, 0.0 elsewhere. */
-  gt?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  gt?(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   /** Less than comparison. Returns 1.0 where a < b, 0.0 elsewhere. */
-  lt?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  lt?(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   /** Greater than or equal comparison. Returns 1.0 where a >= b, 0.0 elsewhere. */
-  ge?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  ge?(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   /** Less than or equal comparison. Returns 1.0 where a <= b, 0.0 elsewhere. */
-  le?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  le?(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   /** Equal comparison. Returns 1.0 where a == b, 0.0 elsewhere. */
-  eq?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  eq?(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   /** Not equal comparison. Returns 1.0 where a != b, 0.0 elsewhere. */
-  ne?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  ne?(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   /** Ternary select: where(condition, x, y) -> x if condition else y */
   where(
     condition: BackendTensor,

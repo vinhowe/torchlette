@@ -1,53 +1,94 @@
-import type { AdamStepConfig, Backend, BackendTensor, DType } from "../backend/types";
-import { gpuBuffer, asGPUTensor, type GPUBuffer } from "../backend/webgpu/gpu-types";
 import { getBackend } from "../backend/registry";
+import type {
+  AdamStepConfig,
+  Backend,
+  BackendTensor,
+  DType,
+} from "../backend/types";
+import { computeContiguousStrides } from "../backend/types";
 import {
+  addReplayPinnedBuffers,
+  type BufferArena,
+  beginSharedEncoder,
+  clearActiveArena,
+  clearArenaConflictDetected,
+  clearArenaExternalInputBuffers,
+  endSharedEncoder,
   flushBufferPool,
   flushSharedEncoder,
-  beginSharedEncoder,
-  endSharedEncoder,
-  setCurrentOpLabel,
-  setAdamBatchMode,
-  setActiveArena,
-  clearActiveArena,
-  setArenaExternalInputBuffers,
-  clearArenaExternalInputBuffers,
   getArenaConflictDetected,
-  clearArenaConflictDetected,
+  getArenaResolveIndex,
+  getDispatchSequenceCounters,
   hasArenaExternalConflicts,
-  type BufferArena,
+  type RecordedDispatch,
+  replayDispatches,
+  setActiveArena,
+  setAdamBatchMode,
+  setArenaExternalInputBuffers,
+  setArenaResolveIndexTo,
+  setCurrentOpLabel,
+  setDispatchSequenceCounters,
   startDispatchRecording,
   stopDispatchRecording,
-  replayDispatches,
-  type RecordedDispatch,
-  setDispatchSequenceCounters,
-  getDispatchSequenceCounters,
-  addReplayPinnedBuffers,
-  getArenaResolveIndex,
-  setArenaResolveIndexTo,
 } from "../backend/webgpu";
-import { profileOpBegin, profileOpEnd, setProfileModule } from "../backend/webgpu/profiler";
-import type { FusionGroup } from "./fusion-detect";
 import {
+  asGPUTensor,
+  type GPUBuffer,
+  gpuBuffer,
+} from "../backend/webgpu/gpu-types";
+import {
+  profileOpBegin,
+  profileOpEnd,
+  setProfileModule,
+} from "../backend/webgpu/profiler";
+import { sizeOf } from "../core/shape";
+import type {
+  OptimizedExecutionResult,
+  OptimizedExecutionStats,
+} from "./executor-optimized";
+import type { FusionGroup } from "./fusion-detect";
+import type {
+  ExecutionPlan,
+  LazyIRNode,
+  LazyRef,
+  StorageHandle,
+} from "./lazy-types";
+import {
+  ENCODER_COPY_OPS,
   type LoweredPlan,
   type ReplayEntry,
-  ENCODER_COPY_OPS,
 } from "./lowered-plan";
-import type { LazyIRNode, LazyRef, StorageHandle, ExecutionPlan } from "./lazy-types";
-import { createStorageHandle, wrapResultAsStorage, ensureWebGPUMatmulImports, _webgpuMatmulImports, _webgpuMatmulGeomImports } from "./node-factory";
-import { storageTracker } from "./storage-tracker";
-import { getInputStorage, executeOp, withProfileContext } from "./op-dispatch";
-import { pretunePlanMatmuls } from "./plan-builder";
-import { executeFusedSegment } from "./segment-executors";
 import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "./matmul-epilogue";
-import { executeMatmulWithEpilogue, _detectTransposeView, shapesEqual } from "./matmul-epilogue";
-import type { ReductionPreamblePlan, ReductionEpiloguePlan, ReductionFusionPlan } from "./reduction-preamble";
-import { executeReductionWithPreamble, executeReductionWithEpilogue, executeReductionWithFusion } from "./reduction-preamble";
-import { computeContiguousStrides } from "../backend/types";
-import { sizeOf } from "../core/shape";
-import type { OptimizedExecutionStats, OptimizedExecutionResult } from "./executor-optimized";
+import {
+  _detectTransposeView,
+  executeMatmulWithEpilogue,
+  shapesEqual,
+} from "./matmul-epilogue";
+import {
+  _webgpuMatmulGeomImports,
+  _webgpuMatmulImports,
+  createStorageHandle,
+  ensureWebGPUMatmulImports,
+  wrapResultAsStorage,
+} from "./node-factory";
+import { executeOp, getInputStorage, withProfileContext } from "./op-dispatch";
+import { pretunePlanMatmuls } from "./plan-builder";
+import type {
+  ReductionEpiloguePlan,
+  ReductionFusionPlan,
+  ReductionPreamblePlan,
+} from "./reduction-preamble";
+import {
+  executeReductionWithEpilogue,
+  executeReductionWithFusion,
+  executeReductionWithPreamble,
+} from "./reduction-preamble";
+import { executeFusedSegment } from "./segment-executors";
+import { storageTracker } from "./storage-tracker";
 
-type AdamStepFn = NonNullable<import("../backend/types").Backend["ops"]["adamStep"]>;
+type AdamStepFn = NonNullable<
+  import("../backend/types").Backend["ops"]["adamStep"]
+>;
 
 /**
  * Execute a batch of adamStep nodes using a direct adamOp call (bypasses executeOp switch).
@@ -69,16 +110,18 @@ async function executeAdamBatchInner(
     const s3 = getStorage(inputs[3]);
     const adamPayload = adamNode.payload as AdamStepConfig;
     const adamResult = await adamOp(
-      s0.backendTensor, s1.backendTensor, s2.backendTensor, s3.backendTensor,
+      s0.backendTensor,
+      s1.backendTensor,
+      s2.backendTensor,
+      s3.backendTensor,
       adamPayload,
     );
     // Adam is in-place: param buffer is returned as result.
     // Set ownsBuffer: false since the buffer is shared with the input.
     const paramResult = adamResult.param;
     const paramOwns = paramResult.ownsBuffer;
-    const finalResult = paramOwns === true
-      ? { ...paramResult, ownsBuffer: false }
-      : paramResult;
+    const finalResult =
+      paramOwns === true ? { ...paramResult, ownsBuffer: false } : paramResult;
     // Side outputs (m, v) — create storage handles
     const mStorage = createStorageHandle(adamNode.device, adamResult.m);
     const vStorage = createStorageHandle(adamNode.device, adamResult.v);
@@ -95,12 +138,26 @@ async function executeAdamBatchInner(
 /** Create a StorageHandle from arena buffer metadata (ownsBuffer: false, no-op destroy). */
 function arenaStorage(
   device: string,
-  meta: { buffer: GPUBuffer; shape: number[]; dtype: DType; size: number; strides: number[]; offset?: number; isContiguous?: boolean },
+  meta: {
+    buffer: GPUBuffer;
+    shape: number[];
+    dtype: DType;
+    size: number;
+    strides: number[];
+    offset?: number;
+    isContiguous?: boolean;
+  },
 ): StorageHandle {
   return createStorageHandle(device, {
-    buffer: meta.buffer, shape: meta.shape, dtype: meta.dtype, size: meta.size,
-    strides: meta.strides, offset: meta.offset ?? 0, isContiguous: meta.isContiguous ?? true,
-    ownsBuffer: false, destroy() {},
+    buffer: meta.buffer,
+    shape: meta.shape,
+    dtype: meta.dtype,
+    size: meta.size,
+    strides: meta.strides,
+    offset: meta.offset ?? 0,
+    isContiguous: meta.isContiguous ?? true,
+    ownsBuffer: false,
+    destroy() {},
   } as BackendTensor);
 }
 
@@ -142,7 +199,12 @@ export async function executeLoweredPlan(
   planNodes: LazyIRNode[],
   loweredPlan: LoweredPlan,
   backend: Backend,
-  options: { enableEarlyRelease?: boolean; enableVectorization?: boolean; bufferArena?: BufferArena; enableReplay?: boolean } = {},
+  options: {
+    enableEarlyRelease?: boolean;
+    enableVectorization?: boolean;
+    bufferArena?: BufferArena;
+    enableReplay?: boolean;
+  } = {},
 ): Promise<OptimizedExecutionResult> {
   const { enableReplay = true } = options;
 
@@ -176,7 +238,8 @@ export async function executeLoweredPlan(
   // optimizer) whose external inputs (saved-for-backward tensors, gradient
   // seeds) may not have stable buffer identities across steps.
   // Disable globally with TORCHLETTE_DISPATCH_REPLAY=0.
-  const useReplayCache = enableReplay && process.env.TORCHLETTE_DISPATCH_REPLAY !== "0";
+  const useReplayCache =
+    enableReplay && process.env.TORCHLETTE_DISPATCH_REPLAY !== "0";
 
   // =========================================================================
   // FAST PATH: Dispatch Replay
@@ -190,7 +253,11 @@ export async function executeLoweredPlan(
   // (they reference the old buffer). We must skip replay and use normal execution
   // which replaces the conflicting arena slot with a fresh buffer.
   let extInputBufSet: Set<GPUBuffer> | null = null;
-  if (useReplayCache && loweredPlan.dispatchCache?.valid && options.bufferArena) {
+  if (
+    useReplayCache &&
+    loweredPlan.dispatchCache?.valid &&
+    options.bufferArena
+  ) {
     extInputBufSet = new Set(collectExternalInputBuffers(planNodes));
     if (hasArenaExternalConflicts(options.bufferArena, extInputBufSet)) {
       // Arena buffers conflict with external inputs — invalidate replay cache.
@@ -199,7 +266,12 @@ export async function executeLoweredPlan(
     }
   }
 
-  if (useReplayCache && loweredPlan.dispatchCache?.valid && useTopLevelSharedEncoder && options.bufferArena) {
+  if (
+    useReplayCache &&
+    loweredPlan.dispatchCache?.valid &&
+    useTopLevelSharedEncoder &&
+    options.bufferArena
+  ) {
     const cache = loweredPlan.dispatchCache;
     if (useTopLevelSharedEncoder) beginSharedEncoder();
     setActiveArena(options.bufferArena);
@@ -212,18 +284,32 @@ export async function executeLoweredPlan(
       if (act.kind === "fused") {
         stats.fusedNodes += act.coveredNodeIndices.length;
         stats.fusionGroups++;
-      } else if (act.kind === "sequential" || act.kind === "data-source"
-                 || act.kind === "view" || act.kind === "prologue-skip") {
+      } else if (
+        act.kind === "sequential" ||
+        act.kind === "data-source" ||
+        act.kind === "view" ||
+        act.kind === "prologue-skip"
+      ) {
         stats.sequentialNodes++;
       }
     }
 
     // Replay timing instrumentation (controlled by env var)
     const _replayTiming = process.env.TORCHLETTE_REPLAY_TIMING === "1";
-    let _tReplayDispatch = 0, _tDataSource = 0, _tView = 0, _tSequential = 0;
-    let _tAdamBatch = 0, _tReclaim = 0, _tResult = 0;
-    let _nDispatches = 0, _nDataSources = 0, _nViews = 0, _nSequential = 0;
-    let _nAdamNodes = 0, _nReclaims = 0, _nResults = 0;
+    let _tReplayDispatch = 0,
+      _tDataSource = 0,
+      _tView = 0,
+      _tSequential = 0;
+    let _tAdamBatch = 0,
+      _tReclaim = 0,
+      _tResult = 0;
+    let _nDispatches = 0,
+      _nDataSources = 0,
+      _nViews = 0,
+      _nSequential = 0;
+    let _nAdamNodes = 0,
+      _nReclaims = 0,
+      _nResults = 0;
     const _tReplayStart = _replayTiming ? performance.now() : 0;
 
     try {
@@ -233,7 +319,10 @@ export async function executeLoweredPlan(
         if (dispatchBatch.length > 0) {
           const _t0 = _replayTiming ? performance.now() : 0;
           replayDispatches(dispatchBatch);
-          if (_replayTiming) { _tReplayDispatch += performance.now() - _t0; _nDispatches += dispatchBatch.length; }
+          if (_replayTiming) {
+            _tReplayDispatch += performance.now() - _t0;
+            _nDispatches += dispatchBatch.length;
+          }
           dispatchBatch.length = 0;
         }
       };
@@ -254,35 +343,72 @@ export async function executeLoweredPlan(
               entry.seqCounters.output,
             );
             const dsNode = planNodes[entry.nodeIndex];
-            if (dsNode.result) { if (_replayTiming) { _tDataSource += performance.now() - _dsT0; _nDataSources++; } break; }
+            if (dsNode.result) {
+              if (_replayTiming) {
+                _tDataSource += performance.now() - _dsT0;
+                _nDataSources++;
+              }
+              break;
+            }
             const dsBackend = getBackend(dsNode.device) ?? backend;
-            const dsInputs = dsNode.inputs.map(ref => getInputStorage(ref, dsBackend));
-            const dsBackendInputs = dsInputs.map(s => s.backendTensor);
-            const dsResult = await executeOp(dsNode, dsBackendInputs, dsBackend);
+            const dsInputs = dsNode.inputs.map((ref) =>
+              getInputStorage(ref, dsBackend),
+            );
+            const dsBackendInputs = dsInputs.map((s) => s.backendTensor);
+            const dsResult = await executeOp(
+              dsNode,
+              dsBackendInputs,
+              dsBackend,
+            );
             dsNode.result = createStorageHandle(dsNode.device, dsResult);
-            if (_replayTiming) { _tDataSource += performance.now() - _dsT0; _nDataSources++; }
+            if (_replayTiming) {
+              _tDataSource += performance.now() - _dsT0;
+              _nDataSources++;
+            }
             break;
           }
           case "view": {
             flushDispatchBatch();
             const _vT0 = _replayTiming ? performance.now() : 0;
             const vNode = planNodes[entry.nodeIndex];
-            if (vNode.result) { if (_replayTiming) { _tView += performance.now() - _vT0; _nViews++; } break; }
+            if (vNode.result) {
+              if (_replayTiming) {
+                _tView += performance.now() - _vT0;
+                _nViews++;
+              }
+              break;
+            }
             if (entry.cachedResult) {
               // Fast path: reconstruct from cached metadata (arena buffers stable)
-              setArenaResolveIndexTo(entry.arenaResolveIdxAfter ?? entry.arenaResolveIdx);
+              setArenaResolveIndexTo(
+                entry.arenaResolveIdxAfter ?? entry.arenaResolveIdx,
+              );
               const cr = entry.cachedResult;
               vNode.result = arenaStorage(vNode.device, cr);
             } else {
               // Slow path: re-execute (first replay before cache populated)
               setArenaResolveIndexTo(entry.arenaResolveIdx);
               const vNodeBackend = getBackend(vNode.device) ?? backend;
-              const vInputs = vNode.inputs.map(ref => getInputStorage(ref, vNodeBackend));
-              const vBackendInputs = vInputs.map(s => s.backendTensor);
-              const vResultTensor = await executeOp(vNode, vBackendInputs, vNodeBackend);
-              vNode.result = wrapResultAsStorage(vNode.device, vResultTensor, vBackendInputs, vInputs);
+              const vInputs = vNode.inputs.map((ref) =>
+                getInputStorage(ref, vNodeBackend),
+              );
+              const vBackendInputs = vInputs.map((s) => s.backendTensor);
+              const vResultTensor = await executeOp(
+                vNode,
+                vBackendInputs,
+                vNodeBackend,
+              );
+              vNode.result = wrapResultAsStorage(
+                vNode.device,
+                vResultTensor,
+                vBackendInputs,
+                vInputs,
+              );
             }
-            if (_replayTiming) { _tView += performance.now() - _vT0; _nViews++; }
+            if (_replayTiming) {
+              _tView += performance.now() - _vT0;
+              _nViews++;
+            }
             break;
           }
           case "sequential": {
@@ -296,13 +422,33 @@ export async function executeLoweredPlan(
               entry.seqCounters.output,
             );
             const node = planNodes[entry.nodeIndex];
-            if (node.result) { if (_replayTiming) { _tSequential += performance.now() - _seqT0; _nSequential++; } break; }
+            if (node.result) {
+              if (_replayTiming) {
+                _tSequential += performance.now() - _seqT0;
+                _nSequential++;
+              }
+              break;
+            }
             const nodeBackend = getBackend(node.device) ?? backend;
-            const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
-            const backendInputs = inputs.map(s => s.backendTensor);
-            const resultTensor = await executeOp(node, backendInputs, nodeBackend);
-            node.result = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
-            if (_replayTiming) { _tSequential += performance.now() - _seqT0; _nSequential++; }
+            const inputs = node.inputs.map((ref) =>
+              getInputStorage(ref, nodeBackend),
+            );
+            const backendInputs = inputs.map((s) => s.backendTensor);
+            const resultTensor = await executeOp(
+              node,
+              backendInputs,
+              nodeBackend,
+            );
+            node.result = wrapResultAsStorage(
+              node.device,
+              resultTensor,
+              backendInputs,
+              inputs,
+            );
+            if (_replayTiming) {
+              _tSequential += performance.now() - _seqT0;
+              _nSequential++;
+            }
             break;
           }
           case "adam-batch": {
@@ -321,12 +467,20 @@ export async function executeLoweredPlan(
               const adamOp = backend.ops.adamStep!;
               setCurrentOpLabel("adamStep");
               const _adamBatchT0 = profileOpBegin("adamStep");
-              await executeAdamBatchInner(planNodes, entry.nodeIndices, adamOp, (ref) => getInputStorage(ref, backend));
+              await executeAdamBatchInner(
+                planNodes,
+                entry.nodeIndices,
+                adamOp,
+                (ref) => getInputStorage(ref, backend),
+              );
               profileOpEnd("adamStep", _adamBatchT0);
             } finally {
               setAdamBatchMode(false);
             }
-            if (_replayTiming) { _tAdamBatch += performance.now() - _adamT0; _nAdamNodes += entry.nodeIndices.length; }
+            if (_replayTiming) {
+              _tAdamBatch += performance.now() - _adamT0;
+              _nAdamNodes += entry.nodeIndices.length;
+            }
             break;
           }
           case "reclaim": {
@@ -335,7 +489,10 @@ export async function executeLoweredPlan(
             flushDispatchBatch();
             const _rclT0 = _replayTiming ? performance.now() : 0;
             flushSharedEncoder();
-            if (_replayTiming) { _tReclaim += performance.now() - _rclT0; _nReclaims++; }
+            if (_replayTiming) {
+              _tReclaim += performance.now() - _rclT0;
+              _nReclaims++;
+            }
             break;
           }
           case "pre-adam-reclaim": {
@@ -344,7 +501,10 @@ export async function executeLoweredPlan(
             // Still need pre-adam flush for Adam's flushSharedEncoder requirement
             flushSharedEncoder();
             flushBufferPool();
-            if (_replayTiming) { _tReclaim += performance.now() - _parT0; _nReclaims++; }
+            if (_replayTiming) {
+              _tReclaim += performance.now() - _parT0;
+              _nReclaims++;
+            }
             break;
           }
           case "result": {
@@ -357,7 +517,10 @@ export async function executeLoweredPlan(
             if (!node.result) {
               node.result = arenaStorage(node.device, nr);
             }
-            if (_replayTiming) { _tResult += performance.now() - _rsT0; _nResults++; }
+            if (_replayTiming) {
+              _tResult += performance.now() - _rsT0;
+              _nResults++;
+            }
             break;
           }
           case "side-output": {
@@ -367,7 +530,10 @@ export async function executeLoweredPlan(
             const soNode = planNodes[entry.nodeIndex];
             if (!soNode._sideOutputs?.attnLogsumexp) {
               if (!soNode._sideOutputs) soNode._sideOutputs = {};
-              soNode._sideOutputs.attnLogsumexp = arenaStorage(soNode.device, entry);
+              soNode._sideOutputs.attnLogsumexp = arenaStorage(
+                soNode.device,
+                entry,
+              );
             }
             break;
           }
@@ -382,8 +548,18 @@ export async function executeLoweredPlan(
       const _tEnd = _replayTiming ? performance.now() - _tEndT0 : 0;
       if (_replayTiming) {
         const _tTotal = performance.now() - _tReplayStart;
-        const _tAccounted = _tReplayDispatch + _tDataSource + _tView + _tSequential + _tAdamBatch + _tReclaim + _tResult + _tEnd;
-        console.log(`[replay-timing] nodes=${plan.nodes.length} entries=${cache.entries.length} | total=${_tTotal.toFixed(1)}ms | dispatch=${_tReplayDispatch.toFixed(1)}ms(${_nDispatches}) dataSrc=${_tDataSource.toFixed(1)}ms(${_nDataSources}) view=${_tView.toFixed(1)}ms(${_nViews}) seq=${_tSequential.toFixed(1)}ms(${_nSequential}) adam=${_tAdamBatch.toFixed(1)}ms(${_nAdamNodes}) reclaim=${_tReclaim.toFixed(1)}ms(${_nReclaims}) result=${_tResult.toFixed(1)}ms(${_nResults}) endEnc=${_tEnd.toFixed(1)}ms | unaccounted=${(_tTotal - _tAccounted).toFixed(1)}ms`);
+        const _tAccounted =
+          _tReplayDispatch +
+          _tDataSource +
+          _tView +
+          _tSequential +
+          _tAdamBatch +
+          _tReclaim +
+          _tResult +
+          _tEnd;
+        console.log(
+          `[replay-timing] nodes=${plan.nodes.length} entries=${cache.entries.length} | total=${_tTotal.toFixed(1)}ms | dispatch=${_tReplayDispatch.toFixed(1)}ms(${_nDispatches}) dataSrc=${_tDataSource.toFixed(1)}ms(${_nDataSources}) view=${_tView.toFixed(1)}ms(${_nViews}) seq=${_tSequential.toFixed(1)}ms(${_nSequential}) adam=${_tAdamBatch.toFixed(1)}ms(${_nAdamNodes}) reclaim=${_tReclaim.toFixed(1)}ms(${_nReclaims}) result=${_tResult.toFixed(1)}ms(${_nResults}) endEnc=${_tEnd.toFixed(1)}ms | unaccounted=${(_tTotal - _tAccounted).toFixed(1)}ms`,
+        );
       }
     }
 
@@ -420,9 +596,12 @@ export async function executeLoweredPlan(
   // Set up dispatch recording if we have an arena (needed for stable bind groups)
   // and no replay cache yet. We only record after the first execution (arena needs
   // to be populated first), so we check if the arena already has buffers.
-  const shouldRecord = useReplayCache && useTopLevelSharedEncoder && options.bufferArena
-    && !loweredPlan.dispatchCache
-    && options.bufferArena.resolve.length > 0; // Arena populated from prior execution
+  const shouldRecord =
+    useReplayCache &&
+    useTopLevelSharedEncoder &&
+    options.bufferArena &&
+    !loweredPlan.dispatchCache &&
+    options.bufferArena.resolve.length > 0; // Arena populated from prior execution
   const recordingBuffer: RecordedDispatch[] = [];
   const replayEntries: ReplayEntry[] = [];
   let recordingDispatchIdx = 0;
@@ -430,7 +609,10 @@ export async function executeLoweredPlan(
   /** Capture all new dispatches since last call and push to replay entries. */
   const captureDispatches = () => {
     while (recordingDispatchIdx < recordingBuffer.length) {
-      replayEntries.push({ kind: "dispatch", dispatch: recordingBuffer[recordingDispatchIdx++] });
+      replayEntries.push({
+        kind: "dispatch",
+        dispatch: recordingBuffer[recordingDispatchIdx++],
+      });
     }
   };
   /** Skip all new dispatches since last call (for ops that must re-execute). */
@@ -438,11 +620,29 @@ export async function executeLoweredPlan(
     recordingDispatchIdx = recordingBuffer.length;
   };
   /** Record a node result for replay. */
-  const recordResult = (nodeIndex: number, bt: { buffer: GPUBuffer; shape: number[]; dtype: DType; size: number; strides: number[] }, isView = false) => {
-    replayEntries.push({ kind: "result", nodeResult: {
-      nodeIndex, buffer: bt.buffer, shape: bt.shape.slice(), dtype: bt.dtype,
-      size: bt.size, strides: bt.strides.slice(), isView,
-    }});
+  const recordResult = (
+    nodeIndex: number,
+    bt: {
+      buffer: GPUBuffer;
+      shape: number[];
+      dtype: DType;
+      size: number;
+      strides: number[];
+    },
+    isView = false,
+  ) => {
+    replayEntries.push({
+      kind: "result",
+      nodeResult: {
+        nodeIndex,
+        buffer: bt.buffer,
+        shape: bt.shape.slice(),
+        dtype: bt.dtype,
+        size: bt.size,
+        strides: bt.strides.slice(),
+        isView,
+      },
+    });
   };
 
   if (shouldRecord) {
@@ -461,40 +661,63 @@ export async function executeLoweredPlan(
       switch (action.kind) {
         case "fused": {
           // Reconstruct FusionGroup from plan nodes
-          const groupNodes = action.coveredNodeIndices.map(i => planNodes[i]);
+          const groupNodes = action.coveredNodeIndices.map((i) => planNodes[i]);
           const outputNode = planNodes[action.outputNodeIndex];
-          const additionalOutputNodes = action.additionalOutputNodeIndices.map(i => planNodes[i]);
-          const neededIntermediates = action.neededIntermediateNodeIndices.map(i => planNodes[i]);
+          const additionalOutputNodes = action.additionalOutputNodeIndices.map(
+            (i) => planNodes[i],
+          );
+          const neededIntermediates = action.neededIntermediateNodeIndices.map(
+            (i) => planNodes[i],
+          );
 
           // Reconstruct external inputs using cached pattern (O(n) instead of O(n²))
           let extInputs: LazyRef[];
           if (action.cachedExternalInputPattern) {
             // Fast path: use pre-computed pattern
-            extInputs = action.cachedExternalInputPattern.map(p =>
-              groupNodes[p.nodeLocalIdx].inputs[p.inputIdx],
+            extInputs = action.cachedExternalInputPattern.map(
+              (p) => groupNodes[p.nodeLocalIdx].inputs[p.inputIdx],
             );
           } else {
             // First execution: compute pattern with dedup, then cache it
-            const groupNodeIds = new Set(groupNodes.map(n => n.id));
+            const groupNodeIds = new Set(groupNodes.map((n) => n.id));
             extInputs = [];
-            const pattern: Array<{ nodeLocalIdx: number; inputIdx: number }> = [];
+            const pattern: Array<{ nodeLocalIdx: number; inputIdx: number }> =
+              [];
             for (let ni = 0; ni < groupNodes.length; ni++) {
               const node = groupNodes[ni];
               for (let ii = 0; ii < node.inputs.length; ii++) {
                 const inp = node.inputs[ii];
                 if (inp.kind === "pending") {
-                  if (!groupNodeIds.has(inp.node.id) &&
-                      !extInputs.some(ei => ei.kind === "pending" && ei.node.id === inp.node.id)) {
+                  if (
+                    !groupNodeIds.has(inp.node.id) &&
+                    !extInputs.some(
+                      (ei) =>
+                        ei.kind === "pending" && ei.node.id === inp.node.id,
+                    )
+                  ) {
                     extInputs.push(inp);
                     pattern.push({ nodeLocalIdx: ni, inputIdx: ii });
                   }
                 } else if (inp.kind === "scalar") {
-                  if (!extInputs.some(ei => ei.kind === "scalar" && ei.value === inp.value && ei.dtype === inp.dtype)) {
+                  if (
+                    !extInputs.some(
+                      (ei) =>
+                        ei.kind === "scalar" &&
+                        ei.value === inp.value &&
+                        ei.dtype === inp.dtype,
+                    )
+                  ) {
                     extInputs.push(inp);
                     pattern.push({ nodeLocalIdx: ni, inputIdx: ii });
                   }
                 } else {
-                  if (!extInputs.some(ei => ei.kind === "materialized" && ei.storage.id === inp.storage.id)) {
+                  if (
+                    !extInputs.some(
+                      (ei) =>
+                        ei.kind === "materialized" &&
+                        ei.storage.id === inp.storage.id,
+                    )
+                  ) {
                     extInputs.push(inp);
                     pattern.push({ nodeLocalIdx: ni, inputIdx: ii });
                   }
@@ -509,8 +732,12 @@ export async function executeLoweredPlan(
             planIndices: action.coveredNodeIndices,
             externalInputs: extInputs,
             outputNode,
-            additionalOutputNodes: additionalOutputNodes.length > 0 ? additionalOutputNodes : undefined,
-            neededIntermediates: neededIntermediates.length > 0 ? neededIntermediates : undefined,
+            additionalOutputNodes:
+              additionalOutputNodes.length > 0
+                ? additionalOutputNodes
+                : undefined,
+            neededIntermediates:
+              neededIntermediates.length > 0 ? neededIntermediates : undefined,
           };
 
           await executeFusedSegment(
@@ -528,7 +755,10 @@ export async function executeLoweredPlan(
             captureDispatches();
             // Record output node result (inline for ordering)
             if (outputNode.result) {
-              recordResult(action.outputNodeIndex, asGPUTensor(outputNode.result.backendTensor));
+              recordResult(
+                action.outputNodeIndex,
+                asGPUTensor(outputNode.result.backendTensor),
+              );
             }
             // Record additional output node results
             for (const addIdx of action.additionalOutputNodeIndices) {
@@ -549,10 +779,14 @@ export async function executeLoweredPlan(
           let epLabel = action.cachedLabel;
           if (!epLabel) {
             const prologueLabel = action.prologues ? "prologue+" : "";
-            const epilogueLabel = action.epilogueOps.length > 0
-              ? "+" + action.epilogueOps.map(o => o.kind).join("+")
-              : "";
-            epLabel = `matmul+${prologueLabel}${epilogueLabel}`.replace(/\+$/, "");
+            const epilogueLabel =
+              action.epilogueOps.length > 0
+                ? "+" + action.epilogueOps.map((o) => o.kind).join("+")
+                : "";
+            epLabel = `matmul+${prologueLabel}${epilogueLabel}`.replace(
+              /\+$/,
+              "",
+            );
             action.cachedLabel = epLabel;
           }
 
@@ -564,28 +798,43 @@ export async function executeLoweredPlan(
             const _profT0 = profileOpBegin(epLabel);
             try {
               // Resolve GPU buffers from cached paths (plan-node-relative lookups)
-              const refA = planNodes[cfg.inputAPath.planNodeIndex].inputs[cfg.inputAPath.inputIndex];
-              const refB = planNodes[cfg.inputBPath.planNodeIndex].inputs[cfg.inputBPath.inputIndex];
+              const refA =
+                planNodes[cfg.inputAPath.planNodeIndex].inputs[
+                  cfg.inputAPath.inputIndex
+                ];
+              const refB =
+                planNodes[cfg.inputBPath.planNodeIndex].inputs[
+                  cfg.inputBPath.inputIndex
+                ];
               const bufA = gpuBuffer(getInputStorage(refA).backendTensor);
               const bufB = gpuBuffer(getInputStorage(refB).backendTensor);
               const epilogueBuffers: GPUBuffer[] = [];
               for (const path of cfg.epilogueInputPaths) {
-                const ref = planNodes[path.planNodeIndex].inputs[path.inputIndex];
-                epilogueBuffers.push(gpuBuffer(getInputStorage(ref).backendTensor));
+                const ref =
+                  planNodes[path.planNodeIndex].inputs[path.inputIndex];
+                epilogueBuffers.push(
+                  gpuBuffer(getInputStorage(ref).backendTensor),
+                );
               }
 
               // Dispatch directly — skips shape computation, transpose detection,
               // contiguous checks, prologue resolution, dynamic imports
-              const resultTensor = _webgpuMatmulImports!.dispatchMatmulDirect(
-                bufA, bufB, {
-                  m: cfg.m, n: cfg.n, k: cfg.k,
-                  transA: cfg.transA, transB: cfg.transB,
+              const resultTensor = _webgpuMatmulImports?.dispatchMatmulDirect(
+                bufA,
+                bufB,
+                {
+                  m: cfg.m,
+                  n: cfg.n,
+                  k: cfg.k,
+                  transA: cfg.transA,
+                  transB: cfg.transB,
                   batchSize: cfg.batchSize,
                   batchStrideA: cfg.batchStrideA,
                   batchStrideB: cfg.batchStrideB,
                   batchStrideC: cfg.batchStrideC,
                   outShape: cfg.outShape,
-                  dtypeA: cfg.dtypeA, dtypeB: cfg.dtypeB,
+                  dtypeA: cfg.dtypeA,
+                  dtypeB: cfg.dtypeB,
                   outputDtype: cfg.outputDtype,
                   epilogueConfig: cfg.epilogueConfig,
                   epilogueBuffers,
@@ -606,7 +855,10 @@ export async function executeLoweredPlan(
                 }
                 gpuT.strides = newStrides;
               }
-              outputNode.result = createStorageHandle(outputNode.device, resultTensor);
+              outputNode.result = createStorageHandle(
+                outputNode.device,
+                resultTensor,
+              );
             } finally {
               profileOpEnd(epLabel, _profT0);
               setCurrentOpLabel(null);
@@ -617,7 +869,10 @@ export async function executeLoweredPlan(
             if (shouldRecord) {
               captureDispatches();
               if (outputNode.result) {
-                recordResult(action.outputNodeIndex, asGPUTensor(outputNode.result.backendTensor));
+                recordResult(
+                  action.outputNodeIndex,
+                  asGPUTensor(outputNode.result.backendTensor),
+                );
               }
             }
             break;
@@ -630,16 +885,27 @@ export async function executeLoweredPlan(
           // is the epilogue input. The chain may connect via inputs[0] or inputs[1]
           // (commutative ops), so we check which input is the previous chain node.
           const epilogueInputRefs: LazyRef[] = [];
-          const epilogueInputPaths: Array<{ planNodeIndex: number; inputIndex: number }> = [];
+          const epilogueInputPaths: Array<{
+            planNodeIndex: number;
+            inputIndex: number;
+          }> = [];
           for (let ci = 1; ci < action.coveredNodeIndices.length; ci++) {
             const chainNode = planNodes[action.coveredNodeIndices[ci]];
-            if ((chainNode.op === "add" || chainNode.op === "mul") && chainNode.inputs.length === 2) {
-              const prevChainNodeId = planNodes[action.coveredNodeIndices[ci - 1]].id;
-              const inp0IsChain = chainNode.inputs[0].kind === "pending"
-                && chainNode.inputs[0].node.id === prevChainNodeId;
+            if (
+              (chainNode.op === "add" || chainNode.op === "mul") &&
+              chainNode.inputs.length === 2
+            ) {
+              const prevChainNodeId =
+                planNodes[action.coveredNodeIndices[ci - 1]].id;
+              const inp0IsChain =
+                chainNode.inputs[0].kind === "pending" &&
+                chainNode.inputs[0].node.id === prevChainNodeId;
               const externalIdx = inp0IsChain ? 1 : 0;
               epilogueInputRefs.push(chainNode.inputs[externalIdx]);
-              epilogueInputPaths.push({ planNodeIndex: action.coveredNodeIndices[ci], inputIndex: externalIdx });
+              epilogueInputPaths.push({
+                planNodeIndex: action.coveredNodeIndices[ci],
+                inputIndex: externalIdx,
+              });
             }
           }
 
@@ -650,11 +916,17 @@ export async function executeLoweredPlan(
           let resolvedInputRefA = matmulNode.inputs[0];
           let resolvedInputRefB = matmulNode.inputs[1];
           // Track paths for caching (plan-node-relative, stable across steps)
-          let inputAPath = { planNodeIndex: action.matmulNodeIndex, inputIndex: 0 };
-          let inputBPath = { planNodeIndex: action.matmulNodeIndex, inputIndex: 1 };
+          let inputAPath = {
+            planNodeIndex: action.matmulNodeIndex,
+            inputIndex: 0,
+          };
+          let inputBPath = {
+            planNodeIndex: action.matmulNodeIndex,
+            inputIndex: 1,
+          };
 
           if (action.prologues && action.prologues.length > 0) {
-            prologues = action.prologues.map(p => ({
+            prologues = action.prologues.map((p) => ({
               inputIndex: p.inputIndex,
               castNodeId: planNodes[p.castNodeIndex].id,
               originalInputRef: planNodes[p.castNodeIndex].inputs[0],
@@ -664,17 +936,27 @@ export async function executeLoweredPlan(
 
             // Resolve prologue decisions (same logic as executeMatmulWithEpilogue)
             for (const p of action.prologues) {
-              const castRef = p.inputIndex === 0 ? matmulNode.inputs[0] : matmulNode.inputs[1];
-              const castAlreadyRan = castRef.kind === "pending" && castRef.node.result != null;
+              const castRef =
+                p.inputIndex === 0
+                  ? matmulNode.inputs[0]
+                  : matmulNode.inputs[1];
+              const castAlreadyRan =
+                castRef.kind === "pending" && castRef.node.result != null;
               if (!castAlreadyRan) {
                 if (p.inputIndex === 0) {
                   resolvedInputRefA = planNodes[p.castNodeIndex].inputs[0];
                   inputCastA = p.toDtype;
-                  inputAPath = { planNodeIndex: p.castNodeIndex, inputIndex: 0 };
+                  inputAPath = {
+                    planNodeIndex: p.castNodeIndex,
+                    inputIndex: 0,
+                  };
                 } else {
                   resolvedInputRefB = planNodes[p.castNodeIndex].inputs[0];
                   inputCastB = p.toDtype;
-                  inputBPath = { planNodeIndex: p.castNodeIndex, inputIndex: 0 };
+                  inputBPath = {
+                    planNodeIndex: p.castNodeIndex,
+                    inputIndex: 0,
+                  };
                 }
               }
             }
@@ -697,11 +979,19 @@ export async function executeLoweredPlan(
           // Compute matmul geometry from the resolved inputs (shapes are stable across steps).
           // Must replicate dispatchMatmul's transpose detection logic exactly.
           {
-            const { computeMatmulOutputShape, computeBatchSize, computeBatchStrides } = _webgpuMatmulGeomImports!;
+            const {
+              computeMatmulOutputShape,
+              computeBatchSize,
+              computeBatchStrides,
+            } = _webgpuMatmulGeomImports!;
             const { isF16Supported } = await import("../backend/webgpu/index");
 
-            const tensorA = asGPUTensor(getInputStorage(resolvedInputRefA).backendTensor);
-            const tensorB = asGPUTensor(getInputStorage(resolvedInputRefB).backendTensor);
+            const tensorA = asGPUTensor(
+              getInputStorage(resolvedInputRefA).backendTensor,
+            );
+            const tensorB = asGPUTensor(
+              getInputStorage(resolvedInputRefB).backendTensor,
+            );
 
             // Detect simple last-2-dim transposes (matching detectSimpleTranspose in index.ts).
             // If detected, use original contiguous shape and flip transpose flag.
@@ -712,24 +1002,51 @@ export async function executeLoweredPlan(
             const transA = detA.transposed;
             const transB = detB.transposed;
 
-            const outShape = computeMatmulOutputShape(effectiveShapeA, effectiveShapeB, transA, transB);
+            const outShape = computeMatmulOutputShape(
+              effectiveShapeA,
+              effectiveShapeB,
+              transA,
+              transB,
+            );
             const aRank = effectiveShapeA.length;
             const bRank = effectiveShapeB.length;
-            const m = transA ? effectiveShapeA[aRank - 1] : effectiveShapeA[aRank - 2];
-            const k = transA ? effectiveShapeA[aRank - 2] : effectiveShapeA[aRank - 1];
-            const n = transB ? effectiveShapeB[bRank - 2] : effectiveShapeB[bRank - 1];
+            const m = transA
+              ? effectiveShapeA[aRank - 1]
+              : effectiveShapeA[aRank - 2];
+            const k = transA
+              ? effectiveShapeA[aRank - 2]
+              : effectiveShapeA[aRank - 1];
+            const n = transB
+              ? effectiveShapeB[bRank - 2]
+              : effectiveShapeB[bRank - 1];
 
             const batchDims = outShape.slice(0, -2);
             const batchSize = computeBatchSize(batchDims);
-            const { strideA, strideB, strideC } = computeBatchStrides(effectiveShapeA, effectiveShapeB, batchDims, m, n, k);
+            const { strideA, strideB, strideC } = computeBatchStrides(
+              effectiveShapeA,
+              effectiveShapeB,
+              batchDims,
+              m,
+              n,
+              k,
+            );
 
             // Compute dtypes (matching dispatchMatmul logic)
             const f16ok = isF16Supported();
-            const rawDtypeA = tensorA.dtype === "f16" && f16ok ? "f16" as const : "f32" as const;
-            const rawDtypeB = tensorB.dtype === "f16" && f16ok ? "f16" as const : "f32" as const;
-            const dtypeA: "f16" | "f32" = inputCastA === "f16" && f16ok ? "f16" : rawDtypeA;
-            const dtypeB: "f16" | "f32" = inputCastB === "f16" && f16ok ? "f16" : rawDtypeB;
-            const promotedDtype = (dtypeA === "f32" || dtypeB === "f32") ? "f32" as const : dtypeA;
+            const rawDtypeA =
+              tensorA.dtype === "f16" && f16ok
+                ? ("f16" as const)
+                : ("f32" as const);
+            const rawDtypeB =
+              tensorB.dtype === "f16" && f16ok
+                ? ("f16" as const)
+                : ("f32" as const);
+            const dtypeA: "f16" | "f32" =
+              inputCastA === "f16" && f16ok ? "f16" : rawDtypeA;
+            const dtypeB: "f16" | "f32" =
+              inputCastB === "f16" && f16ok ? "f16" : rawDtypeB;
+            const promotedDtype =
+              dtypeA === "f32" || dtypeB === "f32" ? ("f32" as const) : dtypeA;
             const outputDtype = action.outputDtype ?? promotedDtype;
 
             const epilogueConfig = {
@@ -744,8 +1061,11 @@ export async function executeLoweredPlan(
               epilogueInputPaths,
               inputCastA,
               inputCastB,
-              m, k, n,
-              transA, transB,
+              m,
+              k,
+              n,
+              transA,
+              transB,
               batchSize,
               batchStrideA: strideA,
               batchStrideB: strideB,
@@ -762,7 +1082,10 @@ export async function executeLoweredPlan(
           if (shouldRecord) {
             captureDispatches();
             if (outputNode.result) {
-              recordResult(action.outputNodeIndex, asGPUTensor(outputNode.result.backendTensor));
+              recordResult(
+                action.outputNodeIndex,
+                asGPUTensor(outputNode.result.backendTensor),
+              );
             }
           }
           break;
@@ -774,9 +1097,13 @@ export async function executeLoweredPlan(
 
           let reductionPlan: ReductionPreamblePlan;
 
-          if (action.chainNodeIndices && action.chainOps && action.chainInputDtypes) {
+          if (
+            action.chainNodeIndices &&
+            action.chainOps &&
+            action.chainInputDtypes
+          ) {
             // Multi-op chain replay: reconstruct external input refs
-            const chainNodes = action.chainNodeIndices.map(i => planNodes[i]);
+            const chainNodes = action.chainNodeIndices.map((i) => planNodes[i]);
             const externalInputRefs: import("./lazy").LazyRef[] = [];
 
             // First chain node: all inputs are external
@@ -788,7 +1115,8 @@ export async function executeLoweredPlan(
               const node = chainNodes[ci];
               const prevNode = chainNodes[ci - 1];
               if (node.inputs.length === 2) {
-                const inp0IsChain = node.inputs[0].kind === "pending" &&
+                const inp0IsChain =
+                  node.inputs[0].kind === "pending" &&
                   node.inputs[0].node === prevNode;
                 externalInputRefs.push(node.inputs[inp0IsChain ? 1 : 0]);
               }
@@ -820,8 +1148,9 @@ export async function executeLoweredPlan(
 
           const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${
             reductionPlan.preambleChain
-              ? reductionPlan.preambleChain.map(n => n.op).join("+")
-              : reductionPlan.op}`;
+              ? reductionPlan.preambleChain.map((n) => n.op).join("+")
+              : reductionPlan.op
+          }`;
           await withProfileContext(rpLabel, preambleNode.module, () =>
             executeReductionWithPreamble(reductionPlan, backend),
           );
@@ -831,7 +1160,10 @@ export async function executeLoweredPlan(
             captureDispatches();
             // Record reduction node result
             if (reductionNode.result) {
-              recordResult(action.reductionNodeIndex, asGPUTensor(reductionNode.result.backendTensor));
+              recordResult(
+                action.reductionNodeIndex,
+                asGPUTensor(reductionNode.result.backendTensor),
+              );
             }
           }
           break;
@@ -847,10 +1179,15 @@ export async function executeLoweredPlan(
           const reEpilogueInputRefs: import("./lazy").LazyRef[] = [];
           for (let ci = 1; ci < action.coveredNodeIndices.length; ci++) {
             const chainNode = planNodes[action.coveredNodeIndices[ci]];
-            if ((chainNode.op === "add" || chainNode.op === "mul") && chainNode.inputs.length === 2) {
-              const prevChainNodeId = planNodes[action.coveredNodeIndices[ci - 1]].id;
-              const inp0IsChain = chainNode.inputs[0].kind === "pending"
-                && chainNode.inputs[0].node.id === prevChainNodeId;
+            if (
+              (chainNode.op === "add" || chainNode.op === "mul") &&
+              chainNode.inputs.length === 2
+            ) {
+              const prevChainNodeId =
+                planNodes[action.coveredNodeIndices[ci - 1]].id;
+              const inp0IsChain =
+                chainNode.inputs[0].kind === "pending" &&
+                chainNode.inputs[0].node.id === prevChainNodeId;
               const externalIdx = inp0IsChain ? 1 : 0;
               reEpilogueInputRefs.push(chainNode.inputs[externalIdx]);
             }
@@ -865,9 +1202,18 @@ export async function executeLoweredPlan(
             consumedCount: action.consumedCount,
           };
 
-          const reLabel = reNode.op + "+" + action.epilogueOps.map(
-            o => o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind,
-          ).join("+");
+          const reLabel =
+            reNode.op +
+            "+" +
+            action.epilogueOps
+              .map((o) =>
+                o.kind === "binary"
+                  ? o.op
+                  : o.kind === "cast"
+                    ? "cast"
+                    : o.op || o.kind,
+              )
+              .join("+");
           await withProfileContext(reLabel, reNode.module, () =>
             executeReductionWithEpilogue(reEpiloguePlan, backend),
           );
@@ -876,7 +1222,10 @@ export async function executeLoweredPlan(
           if (shouldRecord) {
             captureDispatches();
             if (reOutputNode.result) {
-              recordResult(action.outputNodeIndex, asGPUTensor(reOutputNode.result.backendTensor));
+              recordResult(
+                action.outputNodeIndex,
+                asGPUTensor(reOutputNode.result.backendTensor),
+              );
             }
           }
           break;
@@ -886,7 +1235,9 @@ export async function executeLoweredPlan(
           const rfOutputNode = planNodes[action.outputNodeIndex];
 
           // Reconstruct preamble input refs by walking preamble chain nodes
-          const rfPreambleNodes = action.preambleNodeIndices.map(i => planNodes[i]);
+          const rfPreambleNodes = action.preambleNodeIndices.map(
+            (i) => planNodes[i],
+          );
           const rfPreambleInputRefs: import("./lazy").LazyRef[] = [];
 
           // First preamble node: all inputs are external
@@ -898,7 +1249,8 @@ export async function executeLoweredPlan(
             const node = rfPreambleNodes[ci];
             const prevNode = rfPreambleNodes[ci - 1];
             if (node.inputs.length === 2) {
-              const inp0IsChain = node.inputs[0].kind === "pending" &&
+              const inp0IsChain =
+                node.inputs[0].kind === "pending" &&
                 node.inputs[0].node === prevNode;
               rfPreambleInputRefs.push(node.inputs[inp0IsChain ? 1 : 0]);
             }
@@ -906,16 +1258,21 @@ export async function executeLoweredPlan(
 
           // Reconstruct epilogue input refs by walking epilogue chain nodes
           const rfReductionNode = planNodes[action.reductionNodeIndex];
-          const rfEpilogueNodes = action.epilogueNodeIndices.map(i => planNodes[i]);
+          const rfEpilogueNodes = action.epilogueNodeIndices.map(
+            (i) => planNodes[i],
+          );
           const rfEpilogueInputRefs: import("./lazy").LazyRef[] = [];
           for (let ci = 0; ci < rfEpilogueNodes.length; ci++) {
             const chainNode = rfEpilogueNodes[ci];
-            if ((chainNode.op === "add" || chainNode.op === "mul") && chainNode.inputs.length === 2) {
-              const prevNodeId = ci === 0
-                ? rfReductionNode.id
-                : rfEpilogueNodes[ci - 1].id;
-              const inp0IsChain = chainNode.inputs[0].kind === "pending"
-                && chainNode.inputs[0].node.id === prevNodeId;
+            if (
+              (chainNode.op === "add" || chainNode.op === "mul") &&
+              chainNode.inputs.length === 2
+            ) {
+              const prevNodeId =
+                ci === 0 ? rfReductionNode.id : rfEpilogueNodes[ci - 1].id;
+              const inp0IsChain =
+                chainNode.inputs[0].kind === "pending" &&
+                chainNode.inputs[0].node.id === prevNodeId;
               const externalIdx = inp0IsChain ? 1 : 0;
               rfEpilogueInputRefs.push(chainNode.inputs[externalIdx]);
             }
@@ -936,11 +1293,17 @@ export async function executeLoweredPlan(
             consumedCount: action.consumedCount,
           };
 
-          const rfLabel = `${action.isMean ? "mean" : "sum"}+${
-            rfPreambleNodes.map(n => n.op).join("+")
-          }+${action.epilogueOps.map(
-            o => o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind,
-          ).join("+")}`;
+          const rfLabel = `${action.isMean ? "mean" : "sum"}+${rfPreambleNodes
+            .map((n) => n.op)
+            .join("+")}+${action.epilogueOps
+            .map((o) =>
+              o.kind === "binary"
+                ? o.op
+                : o.kind === "cast"
+                  ? "cast"
+                  : o.op || o.kind,
+            )
+            .join("+")}`;
           await withProfileContext(rfLabel, rfPreambleNodes[0].module, () =>
             executeReductionWithFusion(rfFusionPlan, backend),
           );
@@ -949,7 +1312,10 @@ export async function executeLoweredPlan(
           if (shouldRecord) {
             captureDispatches();
             if (rfOutputNode.result) {
-              recordResult(action.outputNodeIndex, asGPUTensor(rfOutputNode.result.backendTensor));
+              recordResult(
+                action.outputNodeIndex,
+                asGPUTensor(rfOutputNode.result.backendTensor),
+              );
             }
           }
           break;
@@ -963,7 +1329,9 @@ export async function executeLoweredPlan(
           }
 
           // Record pre-adam reclaim and capture counter positions
-          let adamSeqCountersBefore: { dispatch: number; params: number; output: number } | undefined;
+          let adamSeqCountersBefore:
+            | { dispatch: number; params: number; output: number }
+            | undefined;
           if (shouldRecord && useSharedEncoder) {
             replayEntries.push({ kind: "pre-adam-reclaim" });
             adamSeqCountersBefore = getDispatchSequenceCounters();
@@ -971,10 +1339,16 @@ export async function executeLoweredPlan(
 
           setAdamBatchMode(true);
           try {
-            const adamBackend = getBackend(planNodes[action.nodeIndices[0]].device) ?? backend;
+            const adamBackend =
+              getBackend(planNodes[action.nodeIndices[0]].device) ?? backend;
             const adamOp = adamBackend.ops.adamStep!;
             await withProfileContext("adamStep", "optimizer.step", () =>
-              executeAdamBatchInner(planNodes, action.nodeIndices, adamOp, (ref) => getInputStorage(ref, adamBackend)),
+              executeAdamBatchInner(
+                planNodes,
+                action.nodeIndices,
+                adamOp,
+                (ref) => getInputStorage(ref, adamBackend),
+              ),
             );
           } finally {
             setAdamBatchMode(false);
@@ -1002,28 +1376,48 @@ export async function executeLoweredPlan(
           if (node.result) break;
 
           // Capture arena resolve index and sequence counters BEFORE execution
-          const arenaResolveIdxBefore = shouldRecord ? getArenaResolveIndex() : 0;
-          const seqCountersBefore = shouldRecord ? getDispatchSequenceCounters() : undefined;
+          const arenaResolveIdxBefore = shouldRecord
+            ? getArenaResolveIndex()
+            : 0;
+          const seqCountersBefore = shouldRecord
+            ? getDispatchSequenceCounters()
+            : undefined;
 
           const nodeBackend = getBackend(node.device) ?? backend;
           setProfileModule(node.module ?? "unknown");
-          const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
-          const backendInputs = inputs.map(s => s.backendTensor);
+          const inputs = node.inputs.map((ref) =>
+            getInputStorage(ref, nodeBackend),
+          );
+          const backendInputs = inputs.map((s) => s.backendTensor);
 
-          const resultTensor = await executeOp(node, backendInputs, nodeBackend);
-          node.result = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
+          const resultTensor = await executeOp(
+            node,
+            backendInputs,
+            nodeBackend,
+          );
+          node.result = wrapResultAsStorage(
+            node.device,
+            resultTensor,
+            backendInputs,
+            inputs,
+          );
           stats.sequentialNodes++;
 
           // Record for replay cache
           if (shouldRecord) {
             if (action.kind === "data-source") {
               // Data sources must re-execute each step (host data changes).
-              replayEntries.push({ kind: "data-source", nodeIndex: nodeIdx, arenaResolveIdx: arenaResolveIdxBefore, seqCounters: seqCountersBefore! });
+              replayEntries.push({
+                kind: "data-source",
+                nodeIndex: nodeIdx,
+                arenaResolveIdx: arenaResolveIdxBefore,
+                seqCounters: seqCountersBefore!,
+              });
               skipDispatches();
             } else if (action.kind === "view") {
               // Views produce deterministic results (same arena buffer, same
               // shape/strides/offset). Cache the result to skip re-execution.
-              const bt = asGPUTensor(node.result!.backendTensor);
+              const bt = asGPUTensor(node.result?.backendTensor);
               replayEntries.push({
                 kind: "view",
                 nodeIndex: nodeIdx,
@@ -1044,7 +1438,12 @@ export async function executeLoweredPlan(
               // Ops that use encoder copy commands (copyBufferToBuffer) alongside
               // compute dispatches must be re-executed during replay — the copy
               // commands are invisible to the compute dispatch recording mechanism.
-              replayEntries.push({ kind: "sequential", nodeIndex: nodeIdx, arenaResolveIdx: arenaResolveIdxBefore, seqCounters: seqCountersBefore! });
+              replayEntries.push({
+                kind: "sequential",
+                nodeIndex: nodeIdx,
+                arenaResolveIdx: arenaResolveIdxBefore,
+                seqCounters: seqCountersBefore!,
+              });
               skipDispatches();
             } else {
               // With arena active, all buffer identities are stable (arena returns
@@ -1055,7 +1454,11 @@ export async function executeLoweredPlan(
               captureDispatches();
               // Record node result (inline for ordering)
               if (node.result) {
-                recordResult(nodeIdx, asGPUTensor(node.result.backendTensor), node.result.backendTensor.ownsBuffer === false);
+                recordResult(
+                  nodeIdx,
+                  asGPUTensor(node.result.backendTensor),
+                  node.result.backendTensor.ownsBuffer === false,
+                );
               }
               // Record side output for fusedAttentionForward so replay
               // restores attnLogsumexp (needed by extractAttentionLogsumexp
@@ -1063,7 +1466,9 @@ export async function executeLoweredPlan(
               if (node._sideOutputs?.attnLogsumexp) {
                 const soSH = node._sideOutputs.attnLogsumexp;
                 const sobt = asGPUTensor(soSH.backendTensor);
-                replayEntries.push({ kind: "side-output", nodeIndex: nodeIdx,
+                replayEntries.push({
+                  kind: "side-output",
+                  nodeIndex: nodeIdx,
                   buffer: sobt.buffer,
                   shape: sobt.shape.slice(),
                   dtype: sobt.dtype,
@@ -1084,14 +1489,19 @@ export async function executeLoweredPlan(
 
         case "compound": {
           // Execute a compound pattern (softmax, log_softmax) as a single fused kernel.
-          const { dispatchFusedSoftmax } = await import("../backend/webgpu/softmax-kernel");
+          const { dispatchFusedSoftmax } = await import(
+            "../backend/webgpu/softmax-kernel"
+          );
 
           // The output node is where the result goes
           const compOutNode = planNodes[action.outputNodeIndex];
           // The first covered node's first input is the pattern's input tensor
           const firstCoveredNode = planNodes[action.coveredNodeIndices[0]];
           const nodeBackend = getBackend(firstCoveredNode.device) ?? backend;
-          const inputStorage = getInputStorage(firstCoveredNode.inputs[0], nodeBackend);
+          const inputStorage = getInputStorage(
+            firstCoveredNode.inputs[0],
+            nodeBackend,
+          );
           const inputBT = asGPUTensor(inputStorage.backendTensor);
 
           // Compute reduction geometry
@@ -1102,22 +1512,35 @@ export async function executeLoweredPlan(
           for (let d = 0; d < dim; d++) numRows *= shape[d];
 
           const isLog = action.name === "log_softmax";
-          const outBuffer = dispatchFusedSoftmax(inputBT.buffer, numRows, dimSize, isLog);
+          const outBuffer = dispatchFusedSoftmax(
+            inputBT.buffer,
+            numRows,
+            dimSize,
+            isLog,
+          );
 
           // Create result on the output node
           const outShape = shape.slice();
           const outStrides = computeContiguousStrides(outShape);
-          compOutNode.result = createStorageHandle(
-            firstCoveredNode.device,
-            { buffer: outBuffer, shape: outShape, dtype: "f32", size: sizeOf(outShape),
-              strides: outStrides, offset: 0, isContiguous: true, ownsBuffer: true },
-          );
+          compOutNode.result = createStorageHandle(firstCoveredNode.device, {
+            buffer: outBuffer,
+            shape: outShape,
+            dtype: "f32",
+            size: sizeOf(outShape),
+            strides: outStrides,
+            offset: 0,
+            isContiguous: true,
+            ownsBuffer: true,
+          });
 
           // Record dispatches for replay
           if (shouldRecord) {
             captureDispatches();
             if (compOutNode.result) {
-              recordResult(action.outputNodeIndex, asGPUTensor(compOutNode.result.backendTensor));
+              recordResult(
+                action.outputNodeIndex,
+                asGPUTensor(compOutNode.result.backendTensor),
+              );
             }
           }
           break;

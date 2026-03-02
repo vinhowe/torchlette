@@ -7,22 +7,18 @@
  * Env: BENCH_WARMUP=N BENCH_ITERS=N
  */
 
+import { getWebGPUDevice, initWebGPU, syncWebGPU } from "../src/backend/webgpu";
 import {
-  getWebGPUDevice,
-  initWebGPU,
-  syncWebGPU,
-} from "../src/backend/webgpu";
-import {
+  type CodegenOptions,
   classifyShape,
   type DType,
+  type EpilogueConfig,
   getDefaultConfigForShape,
   getWorkgroupSize,
-  type EpilogueConfig,
-  type CodegenOptions,
 } from "../src/backend/webgpu/matmul";
 import {
-  generateTiledMatmulShaderTileIR,
   generateKSplitReductionShaderTileIR,
+  generateTiledMatmulShaderTileIR,
 } from "../src/backend/webgpu/matmul/tile-matmul";
 import { getTransposeMode } from "../src/backend/webgpu/matmul/types";
 
@@ -51,26 +47,168 @@ interface MatmulShape {
 
 const SHAPES: MatmulShape[] = [
   // Forward — epilogue matmuls (cast+bias+activation)
-  { name: "QKV proj (fwd)",       m: 512, n: 2304, k: 768,  transA: false, transB: false, count: 6,
-    epilogue: { ops: [{ kind: "cast", toDtype: "f32" }, { kind: "bias", inputIndex: 0 }], additionalInputCount: 1, outputDtype: "f32" } },
-  { name: "attn out (fwd)",       m: 512, n: 768,  k: 768,  transA: false, transB: false, count: 6,
-    epilogue: { ops: [{ kind: "cast", toDtype: "f32" }, { kind: "bias", inputIndex: 0 }], additionalInputCount: 1, outputDtype: "f32" } },
-  { name: "MLP fc1 gelu (fwd)",   m: 512, n: 3072, k: 768,  transA: false, transB: false, count: 6,
-    epilogue: { ops: [{ kind: "cast", toDtype: "f32" }, { kind: "bias", inputIndex: 0 }, { kind: "gelu" }, { kind: "cast", toDtype: "f16" }], additionalInputCount: 1, outputDtype: "f16" } },
-  { name: "MLP fc2 (fwd)",        m: 512, n: 768,  k: 3072, transA: false, transB: false, count: 6,
-    epilogue: { ops: [{ kind: "cast", toDtype: "f32" }, { kind: "bias", inputIndex: 0 }], additionalInputCount: 1, outputDtype: "f32" } },
-  { name: "lm_head (fwd)",        m: 512, n: 50304,k: 768,  transA: false, transB: false, count: 1,
-    epilogue: { ops: [{ kind: "cast", toDtype: "f32" }, { kind: "bias", inputIndex: 0 }, { kind: "add", inputIndex: 1 }], additionalInputCount: 2, outputDtype: "f32" } },
+  {
+    name: "QKV proj (fwd)",
+    m: 512,
+    n: 2304,
+    k: 768,
+    transA: false,
+    transB: false,
+    count: 6,
+    epilogue: {
+      ops: [
+        { kind: "cast", toDtype: "f32" },
+        { kind: "bias", inputIndex: 0 },
+      ],
+      additionalInputCount: 1,
+      outputDtype: "f32",
+    },
+  },
+  {
+    name: "attn out (fwd)",
+    m: 512,
+    n: 768,
+    k: 768,
+    transA: false,
+    transB: false,
+    count: 6,
+    epilogue: {
+      ops: [
+        { kind: "cast", toDtype: "f32" },
+        { kind: "bias", inputIndex: 0 },
+      ],
+      additionalInputCount: 1,
+      outputDtype: "f32",
+    },
+  },
+  {
+    name: "MLP fc1 gelu (fwd)",
+    m: 512,
+    n: 3072,
+    k: 768,
+    transA: false,
+    transB: false,
+    count: 6,
+    epilogue: {
+      ops: [
+        { kind: "cast", toDtype: "f32" },
+        { kind: "bias", inputIndex: 0 },
+        { kind: "gelu" },
+        { kind: "cast", toDtype: "f16" },
+      ],
+      additionalInputCount: 1,
+      outputDtype: "f16",
+    },
+  },
+  {
+    name: "MLP fc2 (fwd)",
+    m: 512,
+    n: 768,
+    k: 3072,
+    transA: false,
+    transB: false,
+    count: 6,
+    epilogue: {
+      ops: [
+        { kind: "cast", toDtype: "f32" },
+        { kind: "bias", inputIndex: 0 },
+      ],
+      additionalInputCount: 1,
+      outputDtype: "f32",
+    },
+  },
+  {
+    name: "lm_head (fwd)",
+    m: 512,
+    n: 50304,
+    k: 768,
+    transA: false,
+    transB: false,
+    count: 1,
+    epilogue: {
+      ops: [
+        { kind: "cast", toDtype: "f32" },
+        { kind: "bias", inputIndex: 0 },
+        { kind: "add", inputIndex: 1 },
+      ],
+      additionalInputCount: 2,
+      outputDtype: "f32",
+    },
+  },
 
   // Backward — bare matmuls (no epilogue)
-  { name: "attn out dX (bwd)",    m: 512, n: 768,  k: 768,  transA: false, transB: true,  count: 6 },
-  { name: "attn out dW (bwd)",    m: 768, n: 768,  k: 512,  transA: true,  transB: false, count: 6 },
-  { name: "MLP fc1 dX (bwd)",     m: 512, n: 768,  k: 3072, transA: false, transB: true,  count: 6 },
-  { name: "MLP fc1 dW (bwd)",     m: 3072,n: 768,  k: 512,  transA: true,  transB: false, count: 6 },
-  { name: "MLP fc2 dX (bwd)",     m: 512, n: 3072, k: 768,  transA: false, transB: true,  count: 6 },
-  { name: "MLP fc2 dW (bwd)",     m: 768, n: 3072, k: 512,  transA: true,  transB: false, count: 6 },
-  { name: "lm_head dX (bwd)",     m: 512, n: 768,  k: 50304,transA: false, transB: true,  count: 1 },
-  { name: "lm_head dW (bwd)",     m: 50304,n: 768, k: 512,  transA: true,  transB: false, count: 1 },
+  {
+    name: "attn out dX (bwd)",
+    m: 512,
+    n: 768,
+    k: 768,
+    transA: false,
+    transB: true,
+    count: 6,
+  },
+  {
+    name: "attn out dW (bwd)",
+    m: 768,
+    n: 768,
+    k: 512,
+    transA: true,
+    transB: false,
+    count: 6,
+  },
+  {
+    name: "MLP fc1 dX (bwd)",
+    m: 512,
+    n: 768,
+    k: 3072,
+    transA: false,
+    transB: true,
+    count: 6,
+  },
+  {
+    name: "MLP fc1 dW (bwd)",
+    m: 3072,
+    n: 768,
+    k: 512,
+    transA: true,
+    transB: false,
+    count: 6,
+  },
+  {
+    name: "MLP fc2 dX (bwd)",
+    m: 512,
+    n: 3072,
+    k: 768,
+    transA: false,
+    transB: true,
+    count: 6,
+  },
+  {
+    name: "MLP fc2 dW (bwd)",
+    m: 768,
+    n: 3072,
+    k: 512,
+    transA: true,
+    transB: false,
+    count: 6,
+  },
+  {
+    name: "lm_head dX (bwd)",
+    m: 512,
+    n: 768,
+    k: 50304,
+    transA: false,
+    transB: true,
+    count: 1,
+  },
+  {
+    name: "lm_head dW (bwd)",
+    m: 50304,
+    n: 768,
+    k: 512,
+    transA: true,
+    transB: false,
+    count: 1,
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -92,7 +230,7 @@ async function benchmarkKernel(
   const transposeMode = getTransposeMode(transA, transB);
 
   // Check K-split eligibility (same logic as dispatch.ts)
-  const wgSize = getWorkgroupSize(config);
+  const _wgSize = getWorkgroupSize(config);
   const workgroupsX = Math.ceil(n / config.tileN);
   const workgroupsY = Math.ceil(m / config.tileM);
   const baseWorkgroups = workgroupsX * workgroupsY;
@@ -129,8 +267,12 @@ async function benchmarkKernel(
   // K-split reduction pipeline (if needed)
   let reductionPipeline: any = null;
   if (kSplitFactor >= 2) {
-    const outputDtype = epilogue?.outputDtype ?? (dtype === "f32" ? "f32" : "f32");
-    const reduceCode = generateKSplitReductionShaderTileIR(kSplitFactor, outputDtype as DType);
+    const outputDtype =
+      epilogue?.outputDtype ?? (dtype === "f32" ? "f32" : "f32");
+    const reduceCode = generateKSplitReductionShaderTileIR(
+      kSplitFactor,
+      outputDtype as DType,
+    );
     const reduceModule = device.createShaderModule({ code: reduceCode });
     reductionPipeline = device.createComputePipeline({
       layout: "auto",
@@ -159,14 +301,22 @@ async function benchmarkKernel(
   if (epilogue) {
     for (let i = 0; i < epilogue.additionalInputCount; i++) {
       // Bias is 1D (column count), binary epilogue is full M×N
-      const isRowwise = epilogue.ops.some(o => (o.kind === "bias" || o.kind === "add" || o.kind === "mul") && o.inputIndex === i);
+      const isRowwise = epilogue.ops.some(
+        (o) =>
+          (o.kind === "bias" || o.kind === "add" || o.kind === "mul") &&
+          o.inputIndex === i,
+      );
       const size = isRowwise
-        ? (epilogue.ops.find(o => o.kind === "bias" && o.inputIndex === i) ? n : m * n)
+        ? epilogue.ops.find((o) => o.kind === "bias" && o.inputIndex === i)
+          ? n
+          : m * n
         : m * n;
-      epilogueBuffers.push(device.createBuffer({
-        size: Math.max(16, size * 4),
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      }));
+      epilogueBuffers.push(
+        device.createBuffer({
+          size: Math.max(16, size * 4),
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        }),
+      );
     }
   }
 
@@ -186,8 +336,12 @@ async function benchmarkKernel(
   const paramsData = new ArrayBuffer(48);
   const u32View = new Uint32Array(paramsData);
   const f32View = new Float32Array(paramsData);
-  u32View[0] = m; u32View[1] = n; u32View[2] = k;
-  u32View[3] = lda; u32View[4] = ldb; u32View[5] = ldc;
+  u32View[0] = m;
+  u32View[1] = n;
+  u32View[2] = k;
+  u32View[3] = lda;
+  u32View[4] = ldb;
+  u32View[5] = ldc;
   f32View[6] = 1.0; // alpha
   u32View[7] = batchSize;
   u32View[8] = m * k; // batchStrideA
@@ -204,7 +358,10 @@ async function benchmarkKernel(
   const entries: any[] = [
     { binding: 0, resource: { buffer: aBuffer } },
     { binding: 1, resource: { buffer: bBuffer } },
-    { binding: 2, resource: { buffer: kSplitFactor >= 2 ? kSplitBuffer : outBuffer } },
+    {
+      binding: 2,
+      resource: { buffer: kSplitFactor >= 2 ? kSplitBuffer : outBuffer },
+    },
     { binding: 3, resource: { buffer: paramsBuffer } },
   ];
   for (let i = 0; i < epilogueBuffers.length; i++) {
@@ -223,7 +380,7 @@ async function benchmarkKernel(
     const ru32 = new Uint32Array(reduceParamsData);
     const rf32 = new Float32Array(reduceParamsData);
     ru32[0] = m * n; // totalElements
-    rf32[1] = 1.0;   // alpha
+    rf32[1] = 1.0; // alpha
     const reduceParamsBuffer = device.createBuffer({
       size: 8,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -255,7 +412,7 @@ async function benchmarkKernel(
     if (kSplitFactor >= 2 && reductionPipeline && reductionBindGroup) {
       pass.setPipeline(reductionPipeline);
       pass.setBindGroup(0, reductionBindGroup);
-      pass.dispatchWorkgroups(Math.ceil(m * n / 256), 1, 1);
+      pass.dispatchWorkgroups(Math.ceil((m * n) / 256), 1, 1);
     }
 
     pass.end();
@@ -294,21 +451,29 @@ async function benchmarkKernel(
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const warmup = parseInt(process.env.BENCH_WARMUP ?? "5");
-  const iters = parseInt(process.env.BENCH_ITERS ?? "15");
+  const warmup = parseInt(process.env.BENCH_WARMUP ?? "5", 10);
+  const iters = parseInt(process.env.BENCH_ITERS ?? "15", 10);
 
   const ok = await initWebGPU();
-  if (!ok) { console.error("WebGPU init failed"); process.exit(1); }
+  if (!ok) {
+    console.error("WebGPU init failed");
+    process.exit(1);
+  }
   const ctx = getWebGPUDevice();
-  if (!ctx) { console.error("No WebGPU device"); process.exit(1); }
+  if (!ctx) {
+    console.error("No WebGPU device");
+    process.exit(1);
+  }
   const { device, queue } = ctx;
 
   console.log(`Tile-IR Matmul Benchmark (warmup=${warmup}, iters=${iters})\n`);
-  console.log("Shape".padEnd(28) +
-    "Config".padEnd(22) +
-    "K-split".padEnd(8) +
-    "Time(ms)".padStart(10) +
-    "GFLOPS".padStart(12));
+  console.log(
+    "Shape".padEnd(28) +
+      "Config".padEnd(22) +
+      "K-split".padEnd(8) +
+      "Time(ms)".padStart(10) +
+      "GFLOPS".padStart(12),
+  );
   console.log("-".repeat(80));
 
   let totalWeighted = 0;
@@ -326,7 +491,11 @@ async function main() {
     const baseWG = workgroupsX * workgroupsY;
     let kSplit = 0;
     if (batchSize === 1 && !hasEpilogue && baseWG < 64 && k >= 512) {
-      kSplit = Math.min(Math.ceil(128 / baseWG), Math.floor(k / config.tileK), 32);
+      kSplit = Math.min(
+        Math.ceil(128 / baseWG),
+        Math.floor(k / config.tileK),
+        32,
+      );
     }
 
     try {
@@ -339,17 +508,17 @@ async function main() {
 
       console.log(
         shape.name.padEnd(28) +
-        configStr.padEnd(22) +
-        (kSplit >= 2 ? `×${kSplit}` : "-").padEnd(8) +
-        ms.toFixed(3).padStart(10) +
-        gflops.toFixed(0).padStart(12)
+          configStr.padEnd(22) +
+          (kSplit >= 2 ? `×${kSplit}` : "-").padEnd(8) +
+          ms.toFixed(3).padStart(10) +
+          gflops.toFixed(0).padStart(12),
       );
     } catch (e: any) {
       console.log(
         shape.name.padEnd(28) +
-        configStr.padEnd(22) +
-        (kSplit >= 2 ? `×${kSplit}` : "-").padEnd(8) +
-        `ERROR: ${e.message}`
+          configStr.padEnd(22) +
+          (kSplit >= 2 ? `×${kSplit}` : "-").padEnd(8) +
+          `ERROR: ${e.message}`,
       );
     }
   }
@@ -357,9 +526,9 @@ async function main() {
   console.log("-".repeat(80));
   console.log(
     `WEIGHTED TOTAL (per step)`.padEnd(28) +
-    "".padEnd(22) +
-    "".padEnd(8) +
-    totalWeighted.toFixed(3).padStart(10)
+      "".padEnd(22) +
+      "".padEnd(8) +
+      totalWeighted.toFixed(3).padStart(10),
   );
 
   process.exit(0);

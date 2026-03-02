@@ -8,34 +8,29 @@
  * - Tuning cache operations
  * - Full autotune with mock benchmarks
  */
-import { describe, expect, it, beforeAll, beforeEach, afterEach } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { getWebGPUDevice, initWebGPU } from "../../src/backend/webgpu";
 import {
-  initWebGPU,
-  getWebGPUDevice,
-  webgpuBackend,
-} from "../../src/backend/webgpu";
-import {
-  generateTuningConfigs,
-  getDefaultConfigForShape,
-  getCachedTuningResult,
+  autotune,
+  type BenchmarkFn,
   cacheTuningResult,
   clearTuningCache,
   exportTuningCache,
+  generateTuningConfigs,
+  getCachedTuningResult,
+  getDefaultConfigForShape,
   importTuningCache,
-  autotune,
   quickAutotune,
-  type BenchmarkFn,
 } from "../../src/backend/webgpu/matmul/autotune";
+import { dispatchTiledMatmul } from "../../src/backend/webgpu/matmul/dispatch";
 import {
   classifyShape,
-  validateConfig,
   DEFAULT_CONFIG,
-  TUNING_SPACE,
-  type MatmulKernelConfig,
   type ShapeClass,
+  TUNING_SPACE,
   type TuneResult,
+  validateConfig,
 } from "../../src/backend/webgpu/matmul/types";
-import { dispatchTiledMatmul } from "../../src/backend/webgpu/matmul/dispatch";
 
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -244,7 +239,14 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
     });
 
     it("other shape classes return same config regardless of hasEpilogue", () => {
-      const otherClasses: ShapeClass[] = ["tall_skinny", "short_wide", "large_k", "gemv", "batched_small", "square_small"];
+      const otherClasses: ShapeClass[] = [
+        "tall_skinny",
+        "short_wide",
+        "large_k",
+        "gemv",
+        "batched_small",
+        "square_small",
+      ];
       for (const sc of otherClasses) {
         const bare = getDefaultConfigForShape(sc, false);
         const epilogue = getDefaultConfigForShape(sc, true);
@@ -322,7 +324,7 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
 
     it("throws on invalid import JSON", () => {
       expect(() => importTuningCache("invalid json")).toThrow(
-        "Invalid tuning cache JSON"
+        "Invalid tuning cache JSON",
       );
     });
 
@@ -357,7 +359,7 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
   describe("autotune", () => {
     it("runs autotune with mock benchmark", async () => {
       // Mock benchmark that returns decreasing time for configs with larger tiles
-      const mockBenchmark: BenchmarkFn = async (config, warmup, iters) => {
+      const mockBenchmark: BenchmarkFn = async (config, _warmup, _iters) => {
         // Larger tiles = better performance (lower time)
         const baseTime = 10.0;
         const tileBonus = (config.tileM + config.tileN) / 256;
@@ -407,14 +409,9 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
         return 5.0;
       };
 
-      const result = await autotune(
-        failingBenchmark,
-        256,
-        256,
-        256,
-        "f32",
-        { maxTrials: 5 }
-      );
+      const result = await autotune(failingBenchmark, 256, 256, 256, "f32", {
+        maxTrials: 5,
+      });
 
       // Should still return a result (either from successful benchmark or default)
       expect(result).toBeDefined();
@@ -464,7 +461,7 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
         1024,
         1024,
         1024,
-        "f32"
+        "f32",
       );
 
       expect(result.config.tileM).toBe(64);
@@ -479,7 +476,7 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       };
 
       await quickAutotune(mockBenchmark, 512, 512, 512, "f32");
-      const afterFirst = callCount;
+      const _afterFirst = callCount;
 
       // Clear and run autotune - should use same cache key
       const cached = getCachedTuningResult("square_medium", "f32");

@@ -10,17 +10,17 @@
  * - base_commit tracking for mutations
  */
 
-import { describe, expect, it, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
+import { resetNodeIdCounter, resetStorageIdCounter } from "../src/engine/lazy";
 import { RuntimeEngine } from "../src/runtime/engine";
 import {
-  tensorFromArray,
-  copy_,
   add_,
-  zero_,
+  copy_,
   fill_,
   mul_,
+  tensorFromArray,
+  zero_,
 } from "../src/runtime/engine-facade";
-import { resetNodeIdCounter, resetStorageIdCounter } from "../src/engine/lazy";
 import { resetBaseIdCounter } from "../src/runtime/tensor";
 
 describe("in-place operations (runtime)", () => {
@@ -153,10 +153,7 @@ describe("in-place operations (runtime)", () => {
     });
 
     it("works on 3D tensors", async () => {
-      const dst = engine.tensorFromArray(
-        [1, 2, 3, 4, 5, 6, 7, 8],
-        [2, 2, 2],
-      );
+      const dst = engine.tensorFromArray([1, 2, 3, 4, 5, 6, 7, 8], [2, 2, 2]);
 
       engine.zero_(dst);
       await engine.force(dst);

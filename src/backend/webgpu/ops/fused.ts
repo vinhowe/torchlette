@@ -3,34 +3,36 @@
  * fusedLayerNorm, fusedAttention, read, waitForGPU, mulScalarInPlace.
  */
 import type { BackendTensor } from "../../types";
-import type { GPUBuffer } from "../gpu-types";
-import { GPUBufferUsage, GPUMapMode, asGPUTensor } from "../gpu-types";
-import {
-  dtypeBytes, alignBufferSize, WORKGROUP_SIZE,
-} from "../shape-utils";
-import {
-  requireContext,
-  f16WeightCache, f16ArrayToF32Array,
-} from "../gpu-context";
-import { gpuContext } from "../webgpu-state";
-import { createTensor, createTrackedBuffer } from "../tensor";
-import { bufferPool, destroyCopy } from "../buffer-pool";
 import { allocateOutputBuffer } from "../buffer-arena";
+import { bufferPool, destroyCopy } from "../buffer-pool";
+import {
+  f16ArrayToF32Array,
+  f16WeightCache,
+  requireContext,
+} from "../gpu-context";
+import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
+import { asGPUTensor, GPUBufferUsage, GPUMapMode } from "../gpu-types";
+import { gpuMemoryTracker } from "../memory-tracker";
+import {
+  profileApiCall,
+  profileSubOpBegin,
+  profileSubOpEnd,
+} from "../profiler";
+import { alignBufferSize, dtypeBytes, WORKGROUP_SIZE } from "../shape-utils";
+import {
+  flushSharedEncoder,
+  getSharedEncoderInstance,
+  incrementSubmitCount,
+  isAdamBatchMode,
+  isSharedEncoderActive,
+  trackSharedEncoderWrite,
+} from "../shared-encoder";
+import { createTensor, createTrackedBuffer } from "../tensor";
+import { createTileKernelDispatcher } from "../tile-dispatch";
 import type { TileKernelSpec } from "../tile-ir";
 import { elementwiseGrid } from "../tile-ir";
-import { createTileKernelDispatcher } from "../tile-dispatch";
-import {
-  flushSharedEncoder, isSharedEncoderActive,
-  getSharedEncoderInstance, trackSharedEncoderWrite,
-  isAdamBatchMode, incrementSubmitCount,
-} from "../shared-encoder";
-import { sharedEncoderActive } from "../webgpu-state";
-import {
-  profileApiCall, profileSubOpBegin, profileSubOpEnd,
-} from "../profiler";
-import { gpuMemoryTracker } from "../memory-tracker";
+import { gpuContext, sharedEncoderActive } from "../webgpu-state";
 import { asContiguous, ensureContiguous } from "./views";
-import type { WebGPUTensor } from "../gpu-types";
 
 /** Destroy contiguous copies that differ from their originals. */
 function cleanupContiguous(...pairs: [BackendTensor, WebGPUTensor][]) {
@@ -40,11 +42,31 @@ function cleanupContiguous(...pairs: [BackendTensor, WebGPUTensor][]) {
 }
 
 import { dispatchAdamStep as dispatchAdamStepKernel } from "../adam-kernel";
-import { dispatchUnscaleGrad as dispatchUnscaleGradKernel, allocateInfFlagBuffer, readInfFlag } from "../unscale-kernel";
-import { dispatchCrossEntropyForward as dispatchCEForwardKernel, dispatchCrossEntropyBackward as dispatchCEBackwardKernel } from "../cross-entropy-kernel";
-import { dispatchFlashAttentionForward as dispatchFAForwardKernel, dispatchFlashAttentionBackwardD as dispatchFABwdDKernel, dispatchFlashAttentionBackwardDQ as dispatchFABwdDQKernel, dispatchFlashAttentionBackwardDKV as dispatchFABwdDKVKernel } from "../attention-kernel";
-import { dispatchLayerNormForward as dispatchLNForwardKernel, dispatchLayerNormBackwardGradX as dispatchLNBwdGradXKernel, dispatchLayerNormBackwardGradWeightBias as dispatchLNBwdGradWBKernel } from "../layernorm-kernel";
-import { dispatchRMSNormForward as dispatchRMSForwardKernel, dispatchRMSNormBackwardGradX as dispatchRMSBwdGradXKernel, dispatchRMSNormBackwardGradWeight as dispatchRMSBwdGradWKernel } from "../rmsnorm-kernel";
+import {
+  dispatchFlashAttentionBackwardD as dispatchFABwdDKernel,
+  dispatchFlashAttentionBackwardDKV as dispatchFABwdDKVKernel,
+  dispatchFlashAttentionBackwardDQ as dispatchFABwdDQKernel,
+  dispatchFlashAttentionForward as dispatchFAForwardKernel,
+} from "../attention-kernel";
+import {
+  dispatchCrossEntropyBackward as dispatchCEBackwardKernel,
+  dispatchCrossEntropyForward as dispatchCEForwardKernel,
+} from "../cross-entropy-kernel";
+import {
+  dispatchLayerNormBackwardGradWeightBias as dispatchLNBwdGradWBKernel,
+  dispatchLayerNormBackwardGradX as dispatchLNBwdGradXKernel,
+  dispatchLayerNormForward as dispatchLNForwardKernel,
+} from "../layernorm-kernel";
+import {
+  dispatchRMSNormBackwardGradWeight as dispatchRMSBwdGradWKernel,
+  dispatchRMSNormBackwardGradX as dispatchRMSBwdGradXKernel,
+  dispatchRMSNormForward as dispatchRMSForwardKernel,
+} from "../rmsnorm-kernel";
+import {
+  allocateInfFlagBuffer,
+  dispatchUnscaleGrad as dispatchUnscaleGradKernel,
+  readInfFlag,
+} from "../unscale-kernel";
 
 // ============================================================================
 // Fused Adam/AdamW Step
@@ -131,7 +153,11 @@ export async function adamStep(
 
     // If any copies were made, flush again so the copy commands are submitted
     // before the Adam kernel binds the original buffers as read_write.
-    if (paramBuf !== paramT.buffer || mBuf !== mT.buffer || vBuf !== vT.buffer) {
+    if (
+      paramBuf !== paramT.buffer ||
+      mBuf !== mT.buffer ||
+      vBuf !== vT.buffer
+    ) {
       flushSharedEncoder();
     }
 
@@ -180,7 +206,13 @@ export async function adamStep(
     mT.destroy = noop;
     vT.destroy = noop;
     const ret = {
-      param: createTensor(paramT.shape, result.paramBuffer, undefined, 0, paramT.dtype),
+      param: createTensor(
+        paramT.shape,
+        result.paramBuffer,
+        undefined,
+        0,
+        paramT.dtype,
+      ),
       m: createTensor(mT.shape, result.mBuffer, undefined, 0, mT.dtype),
       v: createTensor(vT.shape, result.vBuffer, undefined, 0, vT.dtype),
     };
@@ -232,7 +264,10 @@ export function fusedCrossEntropyForward(
   const logitsT = asContiguous(logits);
   const targetsT = asContiguous(targets);
   const outBuf = dispatchCEForwardKernel(
-    logitsT.buffer, targetsT.buffer, config.batchSize, config.vocabSize,
+    logitsT.buffer,
+    targetsT.buffer,
+    config.batchSize,
+    config.vocabSize,
   );
   cleanupContiguous([logits, logitsT], [targets, targetsT]);
   return createTensor([config.batchSize], outBuf);
@@ -248,10 +283,17 @@ export function fusedCrossEntropyBackward(
   const targetsT = asContiguous(targets);
   const gradT = asContiguous(gradOutput);
   const outBuf = dispatchCEBackwardKernel(
-    logitsT.buffer, targetsT.buffer, gradT.buffer,
-    config.batchSize, config.vocabSize,
+    logitsT.buffer,
+    targetsT.buffer,
+    gradT.buffer,
+    config.batchSize,
+    config.vocabSize,
   );
-  cleanupContiguous([logits, logitsT], [targets, targetsT], [gradOutput, gradT]);
+  cleanupContiguous(
+    [logits, logitsT],
+    [targets, targetsT],
+    [gradOutput, gradT],
+  );
   return createTensor([config.batchSize, config.vocabSize], outBuf);
 }
 
@@ -269,8 +311,12 @@ export function fusedLayerNormForward(
   const weightT = asContiguous(weight);
   const biasT = asContiguous(bias);
   const outBuf = dispatchLNForwardKernel(
-    xT.buffer, weightT.buffer, biasT.buffer,
-    config.numRows, config.featureDim, config.eps,
+    xT.buffer,
+    weightT.buffer,
+    biasT.buffer,
+    config.numRows,
+    config.featureDim,
+    config.eps,
   );
   cleanupContiguous([x, xT], [weight, weightT], [bias, biasT]);
   return createTensor(xT.shape.slice(), outBuf);
@@ -287,8 +333,12 @@ export function fusedLayerNormBackwardGradX(
   const weightT = asContiguous(weight);
 
   const gradXBuf = dispatchLNBwdGradXKernel(
-    gradT.buffer, xT.buffer, weightT.buffer,
-    config.numRows, config.featureDim, config.eps,
+    gradT.buffer,
+    xT.buffer,
+    weightT.buffer,
+    config.numRows,
+    config.featureDim,
+    config.eps,
   );
   cleanupContiguous([gradOutput, gradT], [x, xT], [weight, weightT]);
   return createTensor(xT.shape.slice(), gradXBuf);
@@ -302,8 +352,11 @@ export function fusedLayerNormBackwardGradWeightBias(
   const gradT = asContiguous(gradOutput);
   const xT = asContiguous(x);
   const result = dispatchLNBwdGradWBKernel(
-    gradT.buffer, xT.buffer,
-    config.numRows, config.featureDim, config.eps,
+    gradT.buffer,
+    xT.buffer,
+    config.numRows,
+    config.featureDim,
+    config.eps,
   );
   cleanupContiguous([gradOutput, gradT], [x, xT]);
   const shape = [config.featureDim];
@@ -325,8 +378,11 @@ export function fusedRMSNormForward(
   const xT = asContiguous(x);
   const weightT = asContiguous(weight);
   const outBuf = dispatchRMSForwardKernel(
-    xT.buffer, weightT.buffer,
-    config.numRows, config.featureDim, config.eps,
+    xT.buffer,
+    weightT.buffer,
+    config.numRows,
+    config.featureDim,
+    config.eps,
   );
   cleanupContiguous([x, xT], [weight, weightT]);
   return createTensor(xT.shape.slice(), outBuf);
@@ -342,8 +398,12 @@ export function fusedRMSNormBackwardGradX(
   const xT = asContiguous(x);
   const wT = asContiguous(weight);
   const outBuf = dispatchRMSBwdGradXKernel(
-    goT.buffer, xT.buffer, wT.buffer,
-    config.numRows, config.featureDim, config.eps,
+    goT.buffer,
+    xT.buffer,
+    wT.buffer,
+    config.numRows,
+    config.featureDim,
+    config.eps,
   );
   cleanupContiguous([gradOutput, goT], [x, xT], [weight, wT]);
   return createTensor(xT.shape.slice(), outBuf);
@@ -352,14 +412,17 @@ export function fusedRMSNormBackwardGradX(
 export function fusedRMSNormBackwardGradWeight(
   gradOutput: BackendTensor,
   x: BackendTensor,
-  weight: BackendTensor,
+  _weight: BackendTensor,
   config: import("../../types").FusedRMSNormConfig,
 ): BackendTensor {
   const goT = asContiguous(gradOutput);
   const xT = asContiguous(x);
   const outBuf = dispatchRMSBwdGradWKernel(
-    goT.buffer, xT.buffer,
-    config.numRows, config.featureDim, config.eps,
+    goT.buffer,
+    xT.buffer,
+    config.numRows,
+    config.featureDim,
+    config.eps,
   );
   cleanupContiguous([gradOutput, goT], [x, xT]);
   return createTensor([config.featureDim], outBuf);
@@ -379,13 +442,24 @@ export function fusedAttentionForward(
   const kT = asContiguous(k);
   const vT = asContiguous(v);
   const { outputBuffer, logsumexpBuffer } = dispatchFAForwardKernel(
-    qT.buffer, kT.buffer, vT.buffer,
-    config.batchSize, config.numHeads, config.seqLen, config.headDim,
-    config.scale, config.isCausal,
+    qT.buffer,
+    kT.buffer,
+    vT.buffer,
+    config.batchSize,
+    config.numHeads,
+    config.seqLen,
+    config.headDim,
+    config.scale,
+    config.isCausal,
   );
 
   cleanupContiguous([q, qT], [k, kT], [v, vT]);
-  const outShape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
+  const outShape = [
+    config.batchSize,
+    config.numHeads,
+    config.seqLen,
+    config.headDim,
+  ];
   const lseShape = [config.batchSize, config.numHeads, config.seqLen];
   return {
     output: createTensor(outShape, outputBuffer),
@@ -411,31 +485,66 @@ export function fusedAttentionBackward(
 
   // Step 1: Compute D[i] = rowsum(dO[i,:] * O[i,:])
   const dBuf = dispatchFABwdDKernel(
-    dOT.buffer, oT.buffer,
-    config.batchSize, config.numHeads, config.seqLen, config.headDim,
-    config.scale, config.isCausal,
+    dOT.buffer,
+    oT.buffer,
+    config.batchSize,
+    config.numHeads,
+    config.seqLen,
+    config.headDim,
+    config.scale,
+    config.isCausal,
   );
 
   // Step 2: Compute dQ
   const dQBuf = dispatchFABwdDQKernel(
-    qT.buffer, kT.buffer, vT.buffer, lseT.buffer, dBuf, dOT.buffer,
-    config.batchSize, config.numHeads, config.seqLen, config.headDim,
-    config.scale, config.isCausal,
+    qT.buffer,
+    kT.buffer,
+    vT.buffer,
+    lseT.buffer,
+    dBuf,
+    dOT.buffer,
+    config.batchSize,
+    config.numHeads,
+    config.seqLen,
+    config.headDim,
+    config.scale,
+    config.isCausal,
   );
 
   // Step 3: Compute dK, dV
   const { dKBuffer, dVBuffer } = dispatchFABwdDKVKernel(
-    qT.buffer, kT.buffer, vT.buffer, lseT.buffer, dBuf, dOT.buffer,
-    config.batchSize, config.numHeads, config.seqLen, config.headDim,
-    config.scale, config.isCausal,
+    qT.buffer,
+    kT.buffer,
+    vT.buffer,
+    lseT.buffer,
+    dBuf,
+    dOT.buffer,
+    config.batchSize,
+    config.numHeads,
+    config.seqLen,
+    config.headDim,
+    config.scale,
+    config.isCausal,
   );
 
   // D buffer is an intermediate — release it back to the pool now
   const dBufSize = config.batchSize * config.numHeads * config.seqLen * 4;
   bufferPool.deferredDestroy(dBuf, dBufSize);
 
-  cleanupContiguous([q, qT], [k, kT], [v, vT], [logsumexp, lseT], [dO, dOT], [output, oT]);
-  const gradShape = [config.batchSize, config.numHeads, config.seqLen, config.headDim];
+  cleanupContiguous(
+    [q, qT],
+    [k, kT],
+    [v, vT],
+    [logsumexp, lseT],
+    [dO, dOT],
+    [output, oT],
+  );
+  const gradShape = [
+    config.batchSize,
+    config.numHeads,
+    config.seqLen,
+    config.headDim,
+  ];
   return {
     dQ: createTensor(gradShape, dQBuf),
     dK: createTensor(gradShape, dKBuffer),
@@ -470,7 +579,13 @@ export async function read(a: BackendTensor): Promise<number[]> {
   });
   // Use the shared encoder for the copy if active, otherwise create a standalone one
   if (getSharedEncoderInstance()) {
-    getSharedEncoderInstance().copyBufferToBuffer(tensor.buffer, 0, readBuffer, 0, alignedBytes);
+    getSharedEncoderInstance().copyBufferToBuffer(
+      tensor.buffer,
+      0,
+      readBuffer,
+      0,
+      alignedBytes,
+    );
     // Flush to submit the copy command
     flushSharedEncoder();
   } else {
@@ -501,7 +616,6 @@ export async function read(a: BackendTensor): Promise<number[]> {
       // Convert f16 (Uint16Array) back to f32 numbers
       result = f16ArrayToF32Array(new Uint16Array(mapped.slice(0, totalBytes)));
       break;
-    case "f32":
     default:
       result = Array.from(new Float32Array(mapped.slice(0, totalBytes)));
       break;
@@ -565,8 +679,5 @@ const mulScalarKernel = createTileKernelDispatcher(mulScalarInPlaceSpec);
  */
 export function mulScalarInPlace(tensor: BackendTensor, scalar: number): void {
   const a = asGPUTensor(tensor);
-  mulScalarKernel.dispatch(
-    { data: a.buffer },
-    { scalar, size: a.size },
-  );
+  mulScalarKernel.dispatch({ data: a.buffer }, { scalar, size: a.size });
 }

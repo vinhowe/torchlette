@@ -5,9 +5,15 @@
  * Supports vectorized memory coalescing (§15.3) for improved bandwidth.
  */
 
-import { dispatchComputePass, createParamsBuffer, releaseParamsBuffer, allocateOutputBuffer, cachedCreateBindGroup } from "./index";
-import { trackSharedEncoderWrite } from "./webgpu-state";
 import type { RecordedDispatch } from "./dispatch-recording";
+import {
+  allocateOutputBuffer,
+  cachedCreateBindGroup,
+  createParamsBuffer,
+  dispatchComputePass,
+  releaseParamsBuffer,
+} from "./index";
+import { trackSharedEncoderWrite } from "./webgpu-state";
 
 /** Module-level recording buffer (shared with index.ts recording system). */
 let fusionRecordingBuffer: RecordedDispatch[] | null = null;
@@ -15,18 +21,19 @@ export function setFusionRecordingBuffer(buf: RecordedDispatch[] | null): void {
   fusionRecordingBuffer = buf;
 }
 
-import { recordPipeline, getWarmupPipeline } from "./pipeline-warmup";
-import type { DType } from "../types";
-import { dtypeBytes, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 import { sizeOf } from "../../core/shape";
+import type { DType } from "../types";
+import { generateFusedKernelTileIR } from "./fusion-tile-ir";
 import {
+  computeKernelMeta,
   type FusedKernelRecipe,
   type GeneratedKernel,
-  computeKernelMeta,
   type KernelGenOptions,
 } from "./fusion-types";
-import { generateFusedKernelTileIR } from "./fusion-tile-ir";
-import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
+import type { GPUBuffer, GPUComputePipeline, GPUDevice } from "./gpu-types";
+import { getWarmupPipeline, recordPipeline } from "./pipeline-warmup";
+import { dtypeBytes, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
+
 // ============================================================================
 // Kernel Cache
 // ============================================================================
@@ -201,7 +208,9 @@ export function dispatchFusedKernel(
   options: FusedDispatchOptions = {},
 ): FusedDispatchResult {
   // Count non-inlined inputs (inlined constants don't need buffer bindings)
-  const nonInlinedCount = recipe.inputs.filter(inp => !inp.isInlinedConstant).length;
+  const nonInlinedCount = recipe.inputs.filter(
+    (inp) => !inp.isInlinedConstant,
+  ).length;
 
   // Validate inputs — caller should pass only non-inlined input buffers
   if (inputs.length !== nonInlinedCount) {
@@ -244,7 +253,10 @@ export function dispatchFusedKernel(
   }
 
   // Create uniform buffer for params via shared pool
-  const paramsBuffer = createParamsBuffer(device, new Uint32Array([totalElements]));
+  const paramsBuffer = createParamsBuffer(
+    device,
+    new Uint32Array([totalElements]),
+  );
 
   // Build flat buffer array: non-inlined inputs, then outputs, then params
   const bgBuffers: GPUBuffer[] = [];
@@ -261,9 +273,19 @@ export function dispatchFusedKernel(
   // Use 2D dispatch when workgroups exceed WebGPU per-dimension limit (65535)
   const totalWorkgroups = Math.ceil(kernel.workItems / kernel.workgroupSize);
   const workgroupsX = Math.min(totalWorkgroups, MAX_WORKGROUPS_PER_DIM);
-  const workgroupsY = totalWorkgroups <= MAX_WORKGROUPS_PER_DIM ? 1 : Math.ceil(totalWorkgroups / MAX_WORKGROUPS_PER_DIM);
+  const workgroupsY =
+    totalWorkgroups <= MAX_WORKGROUPS_PER_DIM
+      ? 1
+      : Math.ceil(totalWorkgroups / MAX_WORKGROUPS_PER_DIM);
 
-  dispatchComputePass(pipeline, bindGroup, workgroupsX, workgroupsY, 1, fusionRecordingBuffer);
+  dispatchComputePass(
+    pipeline,
+    bindGroup,
+    workgroupsX,
+    workgroupsY,
+    1,
+    fusionRecordingBuffer,
+  );
 
   // Release the params uniform buffer via the params buffer pool (handles deferred destruction)
   releaseParamsBuffer(paramsBuffer);

@@ -1,23 +1,33 @@
-import type { Backend } from "../backend/types";
 import { getBackend } from "../backend/registry";
+import type { Backend } from "../backend/types";
 import {
-  beginBatchExecution,
-  endBatchExecution,
-  isBatchActive,
   abortBatch,
-  flushBufferPool,
+  beginBatchExecution,
   beginSharedEncoder,
+  endBatchExecution,
   endSharedEncoder,
+  flushBufferPool,
+  isBatchActive,
 } from "../backend/webgpu";
-import {
-  analyzeLifetimes,
-  type TensorLifetime,
-} from "./lifetime-analysis";
-import type { LazyIRNode, StorageHandle, ExecutionPlan, ExecutePlanOptions } from "./lazy-types";
+import type {
+  ExecutePlanOptions,
+  ExecutionPlan,
+  LazyIRNode,
+  StorageHandle,
+} from "./lazy-types";
+import { analyzeLifetimes, type TensorLifetime } from "./lifetime-analysis";
 import { wrapResultAsStorage } from "./node-factory";
-import { canSafelyRelease, releaseBufferImmediate, releaseDeadTensors } from "./storage-tracker";
-import { extractPlanMetadata, pretunePlanMatmuls, segmentPlanAtCheckpoints } from "./plan-builder";
-import { getInputStorage, executeOp } from "./op-dispatch";
+import { executeOp, getInputStorage } from "./op-dispatch";
+import {
+  extractPlanMetadata,
+  pretunePlanMatmuls,
+  segmentPlanAtCheckpoints,
+} from "./plan-builder";
+import {
+  canSafelyRelease,
+  releaseBufferImmediate,
+  releaseDeadTensors,
+} from "./storage-tracker";
 
 // ============================================================================
 // Constants
@@ -26,9 +36,17 @@ import { getInputStorage, executeOp } from "./op-dispatch";
 /** Ops safe to execute during tape replay fill-in: pure views + data sources. */
 const FILL_IN_OPS: ReadonlySet<string> = new Set([
   // Pure view ops (no GPU dispatch, same buffer)
-  "reshape", "transpose", "permute", "expand", "narrow", "contiguous",
+  "reshape",
+  "transpose",
+  "permute",
+  "expand",
+  "narrow",
+  "contiguous",
   // Data source ops (create new buffers from host data)
-  "tensorFromArray", "zeros", "full", "arange",
+  "tensorFromArray",
+  "zeros",
+  "full",
+  "arange",
 ]);
 
 /**
@@ -89,44 +107,62 @@ export async function executePlan(
     try {
       const { getPendingNodeIds } = await import("../runtime/tensor");
       for (const id of getPendingNodeIds()) outputNodeIds.add(id);
-    } catch { /* runtime/tensor not available */ }
-    lifetimes = analyzeLifetimes(nodeOrder, nodeInputs, outputNodeIds, nodeSizes);
+    } catch {
+      /* runtime/tensor not available */
+    }
+    lifetimes = analyzeLifetimes(
+      nodeOrder,
+      nodeInputs,
+      outputNodeIds,
+      nodeSizes,
+    );
   }
 
   const useSharedEncoder = backend.name === "webgpu";
   if (useSharedEncoder) beginSharedEncoder();
 
   try {
+    const viewOnly = options?.viewOpsOnly === true;
 
-  const viewOnly = options?.viewOpsOnly === true;
+    for (let step = 0; step < plan.nodes.length; step++) {
+      const node = plan.nodes[step];
 
-  for (let step = 0; step < plan.nodes.length; step++) {
-    const node = plan.nodes[step];
+      // Skip nodes that already have results (from a prior plan execution within this step).
+      if (node.result) continue;
 
-    // Skip nodes that already have results (from a prior plan execution within this step).
-    if (node.result) continue;
+      // In view-only mode (tape replay fill-in), skip compute ops.
+      // Only view ops and data-source ops need execution; compute ops are
+      // either already handled by replay or are intermediate fused nodes.
+      if (viewOnly && !FILL_IN_OPS.has(node.op)) continue;
 
-    // In view-only mode (tape replay fill-in), skip compute ops.
-    // Only view ops and data-source ops need execution; compute ops are
-    // either already handled by replay or are intermediate fused nodes.
-    if (viewOnly && !FILL_IN_OPS.has(node.op)) continue;
+      // For multi-device graphs, use the node's device backend
+      const nodeBackend = getBackend(node.device) ?? backend;
 
-    // For multi-device graphs, use the node's device backend
-    const nodeBackend = getBackend(node.device) ?? backend;
+      const inputs = node.inputs.map((ref) =>
+        getInputStorage(ref, nodeBackend),
+      );
+      const backendInputs = inputs.map((s) => s.backendTensor);
 
-    const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
-    const backendInputs = inputs.map((s) => s.backendTensor);
+      const resultTensor = await executeOp(node, backendInputs, nodeBackend);
+      node.result = wrapResultAsStorage(
+        node.device,
+        resultTensor,
+        backendInputs,
+        inputs,
+      );
 
-    const resultTensor = await executeOp(node, backendInputs, nodeBackend);
-    node.result = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
-
-    // Track storage for early release
-    if (options?.enableEarlyRelease) {
-      nodeToStorage.set(node.id, node.result);
-      releaseDeadTensors(lifetimes, step + 1, outputNodeIds, alreadyReleased, nodeToStorage);
+      // Track storage for early release
+      if (options?.enableEarlyRelease) {
+        nodeToStorage.set(node.id, node.result);
+        releaseDeadTensors(
+          lifetimes,
+          step + 1,
+          outputNodeIds,
+          alreadyReleased,
+          nodeToStorage,
+        );
+      }
     }
-  }
-
   } finally {
     if (useSharedEncoder) endSharedEncoder();
   }
@@ -174,7 +210,9 @@ export async function executePlanWithCheckpointSegments(
   flushBufferPool: () => void,
 ): Promise<StorageHandle> {
   // Check if plan has any checkpoint boundaries
-  const hasCheckpointBoundaries = plan.nodes.some((n) => n.isCheckpointBoundary);
+  const hasCheckpointBoundaries = plan.nodes.some(
+    (n) => n.isCheckpointBoundary,
+  );
 
   if (!hasCheckpointBoundaries) {
     // No segmentation needed - use regular execution
@@ -250,7 +288,9 @@ export async function executePlanWithTrueSegments(
   options?: ExecutePlanOptions,
 ): Promise<StorageHandle> {
   // Check if plan has any checkpoint boundaries
-  const hasCheckpointBoundaries = plan.nodes.some((n) => n.isCheckpointBoundary);
+  const hasCheckpointBoundaries = plan.nodes.some(
+    (n) => n.isCheckpointBoundary,
+  );
 
   if (!hasCheckpointBoundaries) {
     // No segmentation needed - use regular execution
@@ -292,16 +332,19 @@ export async function executePlanWithTrueSegments(
       // Execute all ops in segment (encode to shared encoder, no GPU submit yet)
       for (const node of segment.nodes) {
         const nodeBackend = getBackend(node.device) ?? backend;
-        const inputs = node.inputs.map(ref => getInputStorage(ref, nodeBackend));
+        const inputs = node.inputs.map((ref) =>
+          getInputStorage(ref, nodeBackend),
+        );
         const backendInputs = inputs.map((s) => s.backendTensor);
 
-        const resultTensor = await executeOp(
-          node,
-          backendInputs,
-          nodeBackend,
-        );
+        const resultTensor = await executeOp(node, backendInputs, nodeBackend);
 
-        node.result = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
+        node.result = wrapResultAsStorage(
+          node.device,
+          resultTensor,
+          backendInputs,
+          inputs,
+        );
         nodeToStorage.set(node.id, node.result);
         materializedStorages.set(node.id, node.result);
       }
@@ -327,7 +370,6 @@ export async function executePlanWithTrueSegments(
       }
 
       lastResult = segment.nodes[segment.nodes.length - 1].result!;
-
     } catch (error) {
       // Clean up batch on error
       if (isBatchActive()) {
@@ -352,7 +394,7 @@ export async function executePlanWithTrueSegments(
  * Find node IDs that must survive this segment (used by later segments).
  */
 export function findSurvivingOutputs(
-  segment: ExecutionPlan,
+  _segment: ExecutionPlan,
   laterSegments: ExecutionPlan[],
   finalOutputId: number,
 ): Set<number> {

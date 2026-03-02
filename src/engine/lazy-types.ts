@@ -1,8 +1,4 @@
-import type {
-  BackendTensor,
-  DeviceKind,
-  DType,
-} from "../backend/types";
+import type { BackendTensor, DeviceKind, DType } from "../backend/types";
 import type { Token } from "./tokens";
 
 export type LazyOpCode =

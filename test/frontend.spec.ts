@@ -182,7 +182,9 @@ describe("frontend api: gather autograd", () => {
     // input: [1, 2, 3, 4] shape [2, 2]
     // index: [0, 1] shape [2] along dim 1
     // output: [1, 4] (gathered from row 0 col 0, row 1 col 1)
-    const a = torch.tensorFromArray([1, 2, 3, 4], [2, 2], { requiresGrad: true });
+    const a = torch.tensorFromArray([1, 2, 3, 4], [2, 2], {
+      requiresGrad: true,
+    });
     const index = torch.tensorFromArray([0, 1], [2, 1]);
     const gathered = torch.gather(a, index, { dim: 1 });
     const loss = gathered.sum();
@@ -424,7 +426,9 @@ describe("frontend api: where", () => {
 describe("frontend api: where autograd", () => {
   it("where backward computes gradient for x", async () => {
     const condition = torch.tensorFromArray([1, 0, 1, 0], [4]);
-    const x = torch.tensorFromArray([10, 20, 30, 40], [4], { requiresGrad: true });
+    const x = torch.tensorFromArray([10, 20, 30, 40], [4], {
+      requiresGrad: true,
+    });
     const y = torch.tensorFromArray([1, 2, 3, 4], [4]);
 
     const result = torch.where(condition, x, y);

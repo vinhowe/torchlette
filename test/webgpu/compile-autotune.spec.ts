@@ -7,17 +7,19 @@
  *
  * Tests auto-detect WebGPU; skip with TORCHLETTE_CPU_ONLY=1.
  */
-import { describe, expect, it, beforeAll, afterEach } from "vitest";
-import { Torchlette } from "../../src/frontend";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   initWebGPU,
-  getWebGPUDevice,
   isAutotuneEnabled,
   setAutotuneEnabled,
 } from "../../src/backend/webgpu";
-import { getSubgroupSupport } from "../../src/backend/webgpu/matmul/types";
+import {
+  clearTuningCache,
+  getCachedTuningResult,
+} from "../../src/backend/webgpu/matmul/autotune";
 import { clearDispatchTuningCache } from "../../src/backend/webgpu/matmul/dispatch";
-import { clearTuningCache, getCachedTuningResult } from "../../src/backend/webgpu/matmul/autotune";
+import { getSubgroupSupport } from "../../src/backend/webgpu/matmul/types";
+import { Torchlette } from "../../src/frontend";
 
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -80,7 +82,7 @@ describe.skipIf(SKIP)("Compile Autotune", () => {
           autotuneWasEnabled = isAutotuneEnabled();
           return x.matmul(y);
         },
-        { autotune: true }
+        { autotune: true },
       );
 
       fn(a, b);
@@ -115,10 +117,9 @@ describe.skipIf(SKIP)("Compile Autotune", () => {
       const a = torch.randn([128, 64]);
       const b = torch.randn([64, 128]);
 
-      const fn = torch.compile(
-        (x: typeof a, y: typeof b) => x.matmul(y),
-        { autotune: true }
-      );
+      const fn = torch.compile((x: typeof a, y: typeof b) => x.matmul(y), {
+        autotune: true,
+      });
 
       const result = fn(a, b);
 
@@ -136,17 +137,18 @@ describe.skipIf(SKIP)("Compile Autotune", () => {
 
     it("autotuned matmul produces correct results", async () => {
       // Create matrices with known values for verification
-      const M = 64, N = 64, K = 32;
+      const M = 64,
+        N = 64,
+        K = 32;
       const aData = Array.from({ length: M * K }, () => 1.0);
       const bData = Array.from({ length: K * N }, () => 1.0);
 
       const a = torch.tensorFromArray(aData, [M, K]);
       const b = torch.tensorFromArray(bData, [K, N]);
 
-      const fn = torch.compile(
-        (x: typeof a, y: typeof b) => x.matmul(y),
-        { autotune: true }
-      );
+      const fn = torch.compile((x: typeof a, y: typeof b) => x.matmul(y), {
+        autotune: true,
+      });
 
       const result = fn(a, b);
       const resultData = await result.cpu();
@@ -169,10 +171,9 @@ describe.skipIf(SKIP)("Compile Autotune", () => {
       const a = torch.randn([64, 64]);
       const b = torch.randn([64, 64]);
 
-      const fn = torch.compile(
-        (x: typeof a, y: typeof b) => x.matmul(y),
-        { autotune: true }
-      );
+      const fn = torch.compile((x: typeof a, y: typeof b) => x.matmul(y), {
+        autotune: true,
+      });
 
       const result = fn(a, b);
       await result.cpu();
@@ -189,7 +190,7 @@ describe.skipIf(SKIP)("Compile Autotune", () => {
         "Autotuned config:",
         cachedResult?.config,
         "Subgroup size:",
-        subgroupSupport.subgroupSize
+        subgroupSupport.subgroupSize,
       );
     });
 
@@ -197,10 +198,9 @@ describe.skipIf(SKIP)("Compile Autotune", () => {
       const a = torch.randn([64, 64]);
       const b = torch.randn([64, 64]);
 
-      const fn = torch.compile(
-        (x: typeof a, y: typeof b) => x.matmul(y),
-        { autotune: true }
-      );
+      const fn = torch.compile((x: typeof a, y: typeof b) => x.matmul(y), {
+        autotune: true,
+      });
 
       // First call - triggers autotuning
       const start1 = performance.now();
@@ -216,7 +216,9 @@ describe.skipIf(SKIP)("Compile Autotune", () => {
 
       // Second call should be faster (no autotuning overhead)
       // This is a soft check - timing can vary
-      console.log(`First call: ${time1.toFixed(2)}ms, Second call: ${time2.toFixed(2)}ms`);
+      console.log(
+        `First call: ${time1.toFixed(2)}ms, Second call: ${time2.toFixed(2)}ms`,
+      );
 
       // Just verify both completed successfully
       expect(result1.shape).toEqual([64, 64]);
@@ -231,10 +233,9 @@ describe.skipIf(SKIP)("Compile Autotune", () => {
       const a1 = torch.randn([32, 32]);
       const b1 = torch.randn([32, 32]);
 
-      const fn1 = torch.compile(
-        (x: typeof a1, y: typeof b1) => x.matmul(y),
-        { autotune: true }
-      );
+      const fn1 = torch.compile((x: typeof a1, y: typeof b1) => x.matmul(y), {
+        autotune: true,
+      });
 
       const r1 = fn1(a1, b1);
       await r1.cpu();
@@ -243,10 +244,9 @@ describe.skipIf(SKIP)("Compile Autotune", () => {
       const a2 = torch.randn([128, 128]);
       const b2 = torch.randn([128, 128]);
 
-      const fn2 = torch.compile(
-        (x: typeof a2, y: typeof b2) => x.matmul(y),
-        { autotune: true }
-      );
+      const fn2 = torch.compile((x: typeof a2, y: typeof b2) => x.matmul(y), {
+        autotune: true,
+      });
 
       const r2 = fn2(a2, b2);
       await r2.cpu();
@@ -269,7 +269,7 @@ describe.skipIf(SKIP)("Compile Autotune", () => {
           // A @ B = 64x64, then result @ C = 64x64
           return x.matmul(y).matmul(z);
         },
-        { autotune: true }
+        { autotune: true },
       );
 
       const result = fn(a, b, c);
@@ -294,7 +294,7 @@ describe.skipIf(SKIP)("Compile Autotune", () => {
           // Matmul followed by elementwise ops (should fuse the elementwise part)
           return x.matmul(y).relu().mul(scale);
         },
-        { autotune: true }
+        { autotune: true },
       );
 
       const result = fn(a, b, two);
@@ -315,7 +315,7 @@ describe.skipIf(SKIP)("Compile Autotune", () => {
           const t2 = t1.add(z);
           return t2.matmul(x);
         },
-        { autotune: true }
+        { autotune: true },
       );
 
       const result = fn(a, b, c);
@@ -331,10 +331,9 @@ describe.skipIf(SKIP)("Compile Autotune", () => {
       const a = torch.randn([64, 64]);
       const b = torch.randn([64, 64]);
 
-      const fn = torch.compile(
-        (x: typeof a, y: typeof b) => x.matmul(y),
-        { autotune: true }
-      );
+      const fn = torch.compile((x: typeof a, y: typeof b) => x.matmul(y), {
+        autotune: true,
+      });
 
       // Should not throw
       const result = fn(a, b);

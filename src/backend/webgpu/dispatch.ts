@@ -3,39 +3,28 @@
  * binary/unary/matmul dispatch.
  */
 
-import {
-  sizeOf,
-  broadcastShapes,
-  toIndexShape,
-  computeEffectiveBroadcastStrides,
-  dtypeBytes,
-  compute2DDispatch,
-  WORKGROUP_SIZE,
-} from "./shape-utils";
 import type { DType } from "../types";
-import type { GPUBuffer, GPUComputePipeline, GPUBindGroup, WebGPUContext, WebGPUTensor } from "./gpu-types";
-import { recordPipeline, getWarmupPipeline } from "./pipeline-warmup";
-import { requireContext, isF16Supported } from "./gpu-context";
+import {
+  cachedCreateBindGroup,
+  createParamsBuffer,
+  params,
+  releaseParamsBuffer,
+} from "./bind-group-cache";
+import { resolveOutputBuffer } from "./buffer-arena";
 import { destroyCopy } from "./buffer-pool";
 import {
-  getSharedEncoderInstance,
-  autoFlushSharedEncoder,
-  incrementSharedEncoderPassCount,
-  submitOrCollect,
-  getCurrentOpLabel,
-} from "./shared-encoder";
-import { dispatchRecordingBuffer, getAndClearLastBindGroupBuffers, type RecordedDispatch } from "./dispatch-recording";
-import { resolveOutputBuffer } from "./buffer-arena";
-import {
-  createParamsBuffer,
-  releaseParamsBuffer,
-  cachedCreateBindGroup,
-  params,
-} from "./bind-group-cache";
-import { getTimestampWrites, getProfileModule } from "./profiler";
-import { binaryBroadcastTileIR, binaryBroadcastSpec, unaryStridedTileIR, unaryStridedSpec } from "./ops/ops-tile-ir";
-import { createTileKernelDispatcher } from "./tile-dispatch";
-
+  dispatchRecordingBuffer,
+  getAndClearLastBindGroupBuffers,
+  type RecordedDispatch,
+} from "./dispatch-recording";
+import { isF16Supported, requireContext } from "./gpu-context";
+import type {
+  GPUBindGroup,
+  GPUBuffer,
+  GPUComputePipeline,
+  WebGPUContext,
+  WebGPUTensor,
+} from "./gpu-types";
 import {
   computeBatchSize,
   computeBatchStrides,
@@ -43,10 +32,35 @@ import {
   dispatchTiledMatmul,
 } from "./matmul/dispatch";
 import type { EpilogueConfig } from "./matmul/types";
+import {
+  binaryBroadcastSpec,
+  binaryBroadcastTileIR,
+  unaryStridedSpec,
+  unaryStridedTileIR,
+} from "./ops/ops-tile-ir";
+import { detectSimpleTranspose, ensureContiguous } from "./ops/views";
+import { getWarmupPipeline, recordPipeline } from "./pipeline-warmup";
+import { getProfileModule, getTimestampWrites } from "./profiler";
+import {
+  broadcastShapes,
+  compute2DDispatch,
+  computeEffectiveBroadcastStrides,
+  dtypeBytes,
+  sizeOf,
+  toIndexShape,
+  WORKGROUP_SIZE,
+} from "./shape-utils";
+import {
+  autoFlushSharedEncoder,
+  getCurrentOpLabel,
+  getSharedEncoderInstance,
+  incrementSharedEncoderPassCount,
+  submitOrCollect,
+} from "./shared-encoder";
 
 // Tensor construction helpers (extracted to tensor.ts)
 import { createTensor } from "./tensor";
-import { ensureContiguous, detectSimpleTranspose } from "./ops/views";
+import { createTileKernelDispatcher } from "./tile-dispatch";
 
 export function dispatchComputePass(
   pipeline: GPUComputePipeline,
@@ -59,7 +73,8 @@ export function dispatchComputePass(
 ): void {
   const ctx = requireContext();
   const label = labelOverride ?? getCurrentOpLabel();
-  const recBuf = recordingBuffer !== undefined ? recordingBuffer : dispatchRecordingBuffer;
+  const recBuf =
+    recordingBuffer !== undefined ? recordingBuffer : dispatchRecordingBuffer;
 
   // Record dispatch if recording is active
   if (recBuf) {
@@ -112,12 +127,17 @@ export function dispatchElementwise(desc: {
 
   const pipeline = getPipeline(ctx, desc.key, desc.shader);
 
-  const outBuffer = desc.outBuffer
-    ?? resolveOutputBuffer(ctx.device, desc.outputSizeBytes, desc.inputs);
+  const outBuffer =
+    desc.outBuffer ??
+    resolveOutputBuffer(ctx.device, desc.outputSizeBytes, desc.inputs);
 
   const paramsBuffer = createParamsBuffer(ctx.device, desc.params);
 
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [...desc.inputs, outBuffer, paramsBuffer]);
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
+    ...desc.inputs,
+    outBuffer,
+    paramsBuffer,
+  ]);
 
   dispatchComputePass(pipeline, bindGroup, desc.dispatchX, desc.dispatchY ?? 1);
 
@@ -125,8 +145,6 @@ export function dispatchElementwise(desc: {
 
   return outBuffer;
 }
-
-
 
 export function getPipeline(
   context: WebGPUContext,
@@ -177,28 +195,58 @@ export function dispatchBinary(
   }
 
   const bytesPerElement = dtypeBytes(dtype);
-  const maxBindingSize = ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize =
+    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const aSizeBytes = a.size * bytesPerElement;
   const bSizeBytes = b.size * bytesPerElement;
   const outSizeBytes = outSize * bytesPerElement;
 
   // Large tensor chunked dispatch path
-  if (aSizeBytes > maxBindingSize || bSizeBytes > maxBindingSize || outSizeBytes > maxBindingSize) {
+  if (
+    aSizeBytes > maxBindingSize ||
+    bSizeBytes > maxBindingSize ||
+    outSizeBytes > maxBindingSize
+  ) {
     const aIsScalar = a.size === 1;
     const bIsScalar = b.size === 1;
-    const sameShape = a.shape.length === b.shape.length &&
+    const sameShape =
+      a.shape.length === b.shape.length &&
       a.shape.every((d, i) => d === b.shape[i]);
 
-    if ((sameShape && a.isContiguous && b.isContiguous) ||
-        (aIsScalar && b.isContiguous) ||
-        (bIsScalar && a.isContiguous)) {
-      return binaryChunked(op, a, b, aIsScalar, bIsScalar, outShape, outSize, dtype, bytesPerElement, options);
+    if (
+      (sameShape && a.isContiguous && b.isContiguous) ||
+      (aIsScalar && b.isContiguous) ||
+      (bIsScalar && a.isContiguous)
+    ) {
+      return binaryChunked(
+        op,
+        a,
+        b,
+        aIsScalar,
+        bIsScalar,
+        outShape,
+        outSize,
+        dtype,
+        bytesPerElement,
+        options,
+      );
     }
 
     if (sameShape) {
       const aC = a.isContiguous ? a : ensureContiguous(a);
       const bC = b.isContiguous ? b : ensureContiguous(b);
-      const result = binaryChunked(op, aC, bC, aC.size === 1, bC.size === 1, outShape, outSize, dtype, bytesPerElement, options);
+      const result = binaryChunked(
+        op,
+        aC,
+        bC,
+        aC.size === 1,
+        bC.size === 1,
+        outShape,
+        outSize,
+        dtype,
+        bytesPerElement,
+        options,
+      );
       if (aC !== a) aC.destroy?.();
       if (bC !== b) bC.destroy?.();
       return result;
@@ -226,16 +274,26 @@ export function dispatchBinary(
   const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
-  const code = binaryBroadcastTileIR(op, indexShape, aStrides, bStrides, a.offset, b.offset, dtype);
+  const code = binaryBroadcastTileIR(
+    op,
+    indexShape,
+    aStrides,
+    bStrides,
+    a.offset,
+    b.offset,
+    dtype,
+  );
   const key = `binary:${op}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${a.offset}:${b.offset}:${dtype}:${use2D ? dispatch.gridSizeX : "1d"}`;
 
   const outBuffer = dispatchElementwise({
-    key, shader: code,
+    key,
+    shader: code,
     inputs: [a.buffer, b.buffer],
     outputSizeBytes: outSize * bytesPerElement,
     params: params(outSize),
     outBuffer: options?.outBuffer,
-    dispatchX: dispatch.x, dispatchY: dispatch.y,
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y,
   });
 
   const ownsBuffer = options?.outBuffer === undefined;
@@ -244,25 +302,46 @@ export function dispatchBinary(
 
 /** Chunked binary dispatch for large contiguous tensors exceeding maxStorageBufferBindingSize. */
 function binaryChunked(
-  op: string, a: WebGPUTensor, b: WebGPUTensor,
-  aIsScalar: boolean, bIsScalar: boolean,
-  outShape: number[], outSize: number, dtype: DType, bytesPerElement: number,
+  op: string,
+  a: WebGPUTensor,
+  b: WebGPUTensor,
+  aIsScalar: boolean,
+  bIsScalar: boolean,
+  outShape: number[],
+  outSize: number,
+  dtype: DType,
+  bytesPerElement: number,
   options?: { outBuffer?: GPUBuffer },
 ): WebGPUTensor {
   const ctx = requireContext();
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement, [a.buffer, b.buffer], options?.outBuffer);
+  const outBuffer = resolveOutputBuffer(
+    ctx.device,
+    outSize * bytesPerElement,
+    [a.buffer, b.buffer],
+    options?.outBuffer,
+  );
   const spec = binaryBroadcastSpec(
-    op, [outSize],
-    aIsScalar ? [0] : [1], bIsScalar ? [0] : [1],
-    0, 0, dtype as "f32" | "f16" | "u32" | "i32",
+    op,
+    [outSize],
+    aIsScalar ? [0] : [1],
+    bIsScalar ? [0] : [1],
+    0,
+    0,
+    dtype as "f32" | "f16" | "u32" | "i32",
   );
   const dispatcher = createTileKernelDispatcher(spec);
   dispatcher.dispatchChunked(
     { a: a.buffer, b: b.buffer, out: outBuffer },
     { size: outSize },
     {
-      modes: { a: aIsScalar ? "scalar" : "chunked", b: bIsScalar ? "scalar" : "chunked", out: "chunked" },
-      sizeUniform: "size", totalElements: outSize, maxBytesPerElement: bytesPerElement,
+      modes: {
+        a: aIsScalar ? "scalar" : "chunked",
+        b: bIsScalar ? "scalar" : "chunked",
+        out: "chunked",
+      },
+      sizeUniform: "size",
+      totalElements: outSize,
+      maxBytesPerElement: bytesPerElement,
     },
   );
   const ownsBuffer = options?.outBuffer === undefined;
@@ -275,25 +354,42 @@ function binaryChunked(
  */
 export function dispatchUnary(
   opKey: string,
-  expr: string,
+  _expr: string,
   a: WebGPUTensor,
   options?: { outBuffer?: GPUBuffer },
 ): WebGPUTensor {
   const ctx = requireContext();
   const dtype = a.dtype;
   const bytesPerElement = dtypeBytes(dtype);
-  const maxBindingSize = ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const maxBindingSize =
+    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
 
   // Chunked dispatch for large contiguous tensors
   if (a.size * bytesPerElement > maxBindingSize && a.isContiguous) {
     const outSize = a.size;
-    const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement, [a.buffer], options?.outBuffer);
-    const spec = unaryStridedSpec(opKey, [outSize], [1], 0, dtype as "f32" | "f16" | "u32" | "i32");
+    const outBuffer = resolveOutputBuffer(
+      ctx.device,
+      outSize * bytesPerElement,
+      [a.buffer],
+      options?.outBuffer,
+    );
+    const spec = unaryStridedSpec(
+      opKey,
+      [outSize],
+      [1],
+      0,
+      dtype as "f32" | "f16" | "u32" | "i32",
+    );
     const dispatcher = createTileKernelDispatcher(spec);
     dispatcher.dispatchChunked(
       { a: a.buffer, out: outBuffer },
       { size: outSize },
-      { modes: { a: "chunked", out: "chunked" }, sizeUniform: "size", totalElements: outSize, maxBytesPerElement: bytesPerElement },
+      {
+        modes: { a: "chunked", out: "chunked" },
+        sizeUniform: "size",
+        totalElements: outSize,
+        maxBytesPerElement: bytesPerElement,
+      },
     );
     const ownsBuffer = options?.outBuffer === undefined;
     return createTensor(a.shape, outBuffer, undefined, 0, dtype, ownsBuffer);
@@ -307,12 +403,14 @@ export function dispatchUnary(
   const key = `unary:${opKey}:${a.shape.join("x")}:${a.strides.join(",")}:${a.offset}:${dtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
 
   const outBuffer = dispatchElementwise({
-    key, shader: code,
+    key,
+    shader: code,
     inputs: [a.buffer],
     outputSizeBytes: a.size * bytesPerElement,
     params: params(a.size),
     outBuffer: options?.outBuffer,
-    dispatchX: dispatch.x, dispatchY: dispatch.y,
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y,
   });
 
   const ownsBuffer = options?.outBuffer === undefined;
@@ -327,7 +425,11 @@ export function dispatchUnary(
 function resolveMatmulInput(t: WebGPUTensor, trans: boolean) {
   const origShape = !trans ? detectSimpleTranspose(t) : null;
   if (origShape) {
-    return { tensor: createTensor(origShape, t.buffer, undefined, 0, t.dtype, false), trans: true, wasCopied: false };
+    return {
+      tensor: createTensor(origShape, t.buffer, undefined, 0, t.dtype, false),
+      trans: true,
+      wasCopied: false,
+    };
   }
   const contig = ensureContiguous(t);
   return { tensor: contig, trans, wasCopied: contig !== t };
@@ -345,8 +447,12 @@ function prepareMatmulInputs(
 ) {
   const rA = resolveMatmulInput(a, transA);
   const rB = resolveMatmulInput(b, transB);
-  const effectiveA = rA.tensor, effectiveTransA = rA.trans, aWasCopied = rA.wasCopied;
-  const effectiveB = rB.tensor, effectiveTransB = rB.trans, bWasCopied = rB.wasCopied;
+  const effectiveA = rA.tensor,
+    effectiveTransA = rA.trans,
+    aWasCopied = rA.wasCopied;
+  const effectiveB = rB.tensor,
+    effectiveTransB = rB.trans,
+    bWasCopied = rB.wasCopied;
 
   // Compute output shape with transpose and batch broadcasting
   const outShape = computeMatmulOutputShape(
@@ -387,9 +493,21 @@ function prepareMatmulInputs(
   );
 
   return {
-    effectiveA, effectiveB, effectiveTransA, effectiveTransB,
-    aWasCopied, bWasCopied, outShape, m, k, n, batchDims, batchSize,
-    strideA, strideB, strideC,
+    effectiveA,
+    effectiveB,
+    effectiveTransA,
+    effectiveTransB,
+    aWasCopied,
+    bWasCopied,
+    outShape,
+    m,
+    k,
+    n,
+    batchDims,
+    batchSize,
+    strideA,
+    strideB,
+    strideC,
   };
 }
 
@@ -409,22 +527,43 @@ export function dispatchMatmul(
   const ctx = requireContext();
 
   const {
-    effectiveA, effectiveB, effectiveTransA, effectiveTransB,
-    aWasCopied, bWasCopied, outShape, m, k, n, batchSize,
-    strideA, strideB, strideC,
+    effectiveA,
+    effectiveB,
+    effectiveTransA,
+    effectiveTransB,
+    aWasCopied,
+    bWasCopied,
+    outShape,
+    m,
+    k,
+    n,
+    batchSize,
+    strideA,
+    strideB,
+    strideC,
   } = prepareMatmulInputs(a, b, transA, transB);
 
   // Derive per-input dtypes.
   // When inputCast is set, buffer is wider (e.g. f32) but matmul computes in target (e.g. f16).
-  const rawDtypeA = effectiveA.dtype === "f16" && isF16Supported() ? "f16" as const : "f32" as const;
-  const rawDtypeB = effectiveB.dtype === "f16" && isF16Supported() ? "f16" as const : "f32" as const;
-  const dtypeA: "f16" | "f32" = epilogueOpts?.inputCastA === "f16" && isF16Supported() ? "f16" : rawDtypeA;
-  const dtypeB: "f16" | "f32" = epilogueOpts?.inputCastB === "f16" && isF16Supported() ? "f16" : rawDtypeB;
-  const promotedDtype = (dtypeA === "f32" || dtypeB === "f32") ? "f32" as const : dtypeA;
+  const rawDtypeA =
+    effectiveA.dtype === "f16" && isF16Supported()
+      ? ("f16" as const)
+      : ("f32" as const);
+  const rawDtypeB =
+    effectiveB.dtype === "f16" && isF16Supported()
+      ? ("f16" as const)
+      : ("f32" as const);
+  const dtypeA: "f16" | "f32" =
+    epilogueOpts?.inputCastA === "f16" && isF16Supported() ? "f16" : rawDtypeA;
+  const dtypeB: "f16" | "f32" =
+    epilogueOpts?.inputCastB === "f16" && isF16Supported() ? "f16" : rawDtypeB;
+  const promotedDtype =
+    dtypeA === "f32" || dtypeB === "f32" ? ("f32" as const) : dtypeA;
   const outputDtype = epilogueOpts?.epilogue.outputDtype ?? promotedDtype;
   const bytesPerElement = outputDtype === "f16" ? 2 : 4;
 
-  const epilogueBuffers = epilogueOpts?.epilogueInputs.map((t) => t.buffer) ?? [];
+  const epilogueBuffers =
+    epilogueOpts?.epilogueInputs.map((t) => t.buffer) ?? [];
 
   // Create or use donated output buffer
   const outSize = sizeOf(outShape);
@@ -432,8 +571,11 @@ export function dispatchMatmul(
   const useDonated = donatedBuffer && donatedBuffer.size >= requiredSize;
   const outBuffer = useDonated
     ? donatedBuffer
-    : resolveOutputBuffer(ctx.device, requiredSize,
-        [effectiveA.buffer, effectiveB.buffer, ...epilogueBuffers]);
+    : resolveOutputBuffer(ctx.device, requiredSize, [
+        effectiveA.buffer,
+        effectiveB.buffer,
+        ...epilogueBuffers,
+      ]);
 
   dispatchTiledMatmul({
     device: ctx.device,
@@ -441,7 +583,10 @@ export function dispatchMatmul(
     a: effectiveA.buffer,
     b: effectiveB.buffer,
     out: outBuffer,
-    m, n, k, batchSize,
+    m,
+    n,
+    k,
+    batchSize,
     batchStrideA: strideA,
     batchStrideB: strideB,
     batchStrideC: strideC,
@@ -458,7 +603,14 @@ export function dispatchMatmul(
   if (aWasCopied) destroyCopy(effectiveA);
   if (bWasCopied) destroyCopy(effectiveB);
 
-  return createTensor(outShape, outBuffer, undefined, 0, outputDtype, useDonated || !epilogueOpts);
+  return createTensor(
+    outShape,
+    outBuffer,
+    undefined,
+    0,
+    outputDtype,
+    useDonated || !epilogueOpts,
+  );
 }
 
 /**
@@ -472,10 +624,15 @@ export function dispatchMatmulDirect(
   bufA: GPUBuffer,
   bufB: GPUBuffer,
   config: {
-    m: number; n: number; k: number;
-    transA: boolean; transB: boolean;
+    m: number;
+    n: number;
+    k: number;
+    transA: boolean;
+    transB: boolean;
     batchSize: number;
-    batchStrideA: number; batchStrideB: number; batchStrideC: number;
+    batchStrideA: number;
+    batchStrideB: number;
+    batchStrideC: number;
     outShape: number[];
     dtypeA: "f16" | "f32";
     dtypeB?: "f16" | "f32";
@@ -489,11 +646,11 @@ export function dispatchMatmulDirect(
   const ctx = requireContext();
   const bytesPerElement = config.outputDtype === "f16" ? 2 : 4;
   const outSize = sizeOf(config.outShape);
-  const outBuffer = resolveOutputBuffer(
-    ctx.device,
-    outSize * bytesPerElement,
-    [bufA, bufB, ...config.epilogueBuffers],
-  );
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement, [
+    bufA,
+    bufB,
+    ...config.epilogueBuffers,
+  ]);
 
   dispatchTiledMatmul({
     device: ctx.device,
@@ -518,5 +675,11 @@ export function dispatchMatmulDirect(
     inputCastB: config.inputCastB,
   });
 
-  return createTensor(config.outShape, outBuffer, undefined, 0, config.outputDtype);
+  return createTensor(
+    config.outShape,
+    outBuffer,
+    undefined,
+    0,
+    config.outputDtype,
+  );
 }

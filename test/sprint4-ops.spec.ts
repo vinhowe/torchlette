@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from "vitest";
 import { Torchlette } from "../src/frontend";
-import { Dropout, dropout, crossEntropy, logSoftmax, nllLoss } from "../src/nn";
+import { crossEntropy, Dropout, dropout, logSoftmax, nllLoss } from "../src/nn";
 
 describe("Sprint 4 ops (CPU)", () => {
   const api = new Torchlette("cpu");
@@ -39,8 +39,8 @@ describe("Sprint 4 ops (CPU)", () => {
       expect(mean).toBeCloseTo(0, 0); // rough check
 
       // Check some values are negative and some positive
-      const hasNegative = data.some(v => v < 0);
-      const hasPositive = data.some(v => v > 0);
+      const hasNegative = data.some((v) => v < 0);
+      const hasPositive = data.some((v) => v > 0);
       expect(hasNegative).toBe(true);
       expect(hasPositive).toBe(true);
     });
@@ -60,13 +60,13 @@ describe("Sprint 4 ops (CPU)", () => {
     it("bernoulli with p=0 creates all zeros", async () => {
       const t = api.bernoulli([100], 0);
       const data = await t.cpu();
-      expect(data.every(v => v === 0)).toBe(true);
+      expect(data.every((v) => v === 0)).toBe(true);
     });
 
     it("bernoulli with p=1 creates all ones", async () => {
       const t = api.bernoulli([100], 1);
       const data = await t.cpu();
-      expect(data.every(v => v === 1)).toBe(true);
+      expect(data.every((v) => v === 1)).toBe(true);
     });
 
     it("zeros creates all zeros", async () => {
@@ -95,12 +95,12 @@ describe("Sprint 4 ops (CPU)", () => {
       const data = await output.cpu();
 
       // Some values should be 0 (dropped)
-      const numDropped = data.filter(v => v === 0).length;
+      const numDropped = data.filter((v) => v === 0).length;
       expect(numDropped).toBeGreaterThan(0);
       expect(numDropped).toBeLessThan(100);
 
       // Non-dropped values should be scaled by 1/(1-p) = 2
-      const nonDropped = data.filter(v => v !== 0);
+      const nonDropped = data.filter((v) => v !== 0);
       for (const val of nonDropped) {
         expect(val).toBeCloseTo(2, 5);
       }
@@ -111,7 +111,7 @@ describe("Sprint 4 ops (CPU)", () => {
       const output = dropout(api, input, 0.5, false);
       const data = await output.cpu();
       // All values should be 1 (unchanged)
-      expect(data.every(v => v === 1)).toBe(true);
+      expect(data.every((v) => v === 1)).toBe(true);
     });
 
     it("handles p=0 (no dropout)", async () => {
@@ -138,7 +138,7 @@ describe("Sprint 4 ops (CPU)", () => {
       const data = await output.cpu();
 
       // Some should be dropped
-      const numDropped = data.filter(v => v === 0).length;
+      const numDropped = data.filter((v) => v === 0).length;
       expect(numDropped).toBeGreaterThan(0);
     });
 
@@ -148,7 +148,7 @@ describe("Sprint 4 ops (CPU)", () => {
       const input = api.ones([100]);
       const output = drop.forward(input);
       const data = await output.cpu();
-      expect(data.every(v => v === 1)).toBe(true);
+      expect(data.every((v) => v === 1)).toBe(true);
     });
 
     it("toggles train/eval mode", () => {
@@ -209,10 +209,17 @@ describe("Sprint 4 ops (CPU)", () => {
 
     it("computes batch loss with mean reduction", async () => {
       // Batch of 2, 3 classes
-      const logits = api.tensorFromArray([
-        1, 2, 3,  // sample 1: should predict class 2
-        3, 2, 1,  // sample 2: should predict class 0
-      ], [2, 3]);
+      const logits = api.tensorFromArray(
+        [
+          1,
+          2,
+          3, // sample 1: should predict class 2
+          3,
+          2,
+          1, // sample 2: should predict class 0
+        ],
+        [2, 3],
+      );
       const targets = api.tensorFromArray([2, 0], [2]);
       const loss = crossEntropy(api, logits, targets, { reduction: "mean" });
       const lossValue = await loss.cpu();
@@ -225,7 +232,9 @@ describe("Sprint 4 ops (CPU)", () => {
     it("computes batch loss with sum reduction", async () => {
       const logits = api.tensorFromArray([1, 2, 3, 3, 2, 1], [2, 3]);
       const targets = api.tensorFromArray([2, 0], [2]);
-      const lossMean = crossEntropy(api, logits, targets, { reduction: "mean" });
+      const lossMean = crossEntropy(api, logits, targets, {
+        reduction: "mean",
+      });
       const lossSum = crossEntropy(api, logits, targets, { reduction: "sum" });
 
       const meanVal = await lossMean.cpu();
@@ -246,7 +255,9 @@ describe("Sprint 4 ops (CPU)", () => {
     });
 
     it("is differentiable", async () => {
-      const logits = api.tensorFromArray([1, 2, 3], [3], { requiresGrad: true });
+      const logits = api.tensorFromArray([1, 2, 3], [3], {
+        requiresGrad: true,
+      });
       const targets = api.tensorFromArray([2], [1]);
       const loss = crossEntropy(api, logits, targets);
       await loss.backward();
@@ -281,9 +292,10 @@ describe("Sprint 4 ops (CPU)", () => {
 
   describe("nllLoss", () => {
     it("computes NLL loss from log probabilities", async () => {
-      const logProbs = api.tensorFromArray([
-        Math.log(0.1), Math.log(0.2), Math.log(0.7),
-      ], [3]);
+      const logProbs = api.tensorFromArray(
+        [Math.log(0.1), Math.log(0.2), Math.log(0.7)],
+        [3],
+      );
       const targets = api.tensorFromArray([2], [1]);
       const loss = nllLoss(api, logProbs, targets);
       const lossValue = await loss.cpu();

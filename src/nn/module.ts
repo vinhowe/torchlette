@@ -28,7 +28,11 @@ export abstract class Module {
    */
   registerBuffer(name: string, tensor: Tensor): void {
     this._buffers.set(name, tensor);
-    Object.defineProperty(this, name, { value: tensor, writable: true, configurable: true });
+    Object.defineProperty(this, name, {
+      value: tensor,
+      writable: true,
+      configurable: true,
+    });
   }
 
   /**
