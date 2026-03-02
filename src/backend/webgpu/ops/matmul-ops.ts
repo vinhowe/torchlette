@@ -443,8 +443,7 @@ function matmulChunkedTransposed(
   });
 
   for (const partial of partialOutputs) {
-    const { tensor: partialTensor, colStart, colEnd } = partial;
-    const chunkWidth = colEnd - colStart;
+    const { tensor: partialTensor, colStart } = partial;
 
     // Scatter columns from partial [batchSize*M, chunkWidth] to output [batchSize*M, N]
     scatterColumnsToOutput(
@@ -496,7 +495,6 @@ function matmulChunkedContiguous(
   for (let chunk = 0; chunk < numChunks; chunk++) {
     const colStart = chunk * alignedColumnsPerChunk;
     const colEnd = Math.min(colStart + alignedColumnsPerChunk, N);
-    const chunkWidth = colEnd - colStart;
 
     // Extract column slice using sliceColumns
     const bSlice = sliceColumns(b, colStart, colEnd);
@@ -523,8 +521,7 @@ function matmulChunkedContiguous(
   });
 
   for (const partial of partialOutputs) {
-    const { tensor: partialTensor, colStart, colEnd } = partial;
-    const chunkWidth = colEnd - colStart;
+    const { tensor: partialTensor, colStart } = partial;
 
     scatterColumnsToOutput(
       partialTensor,
@@ -600,7 +597,6 @@ function matmulChunkedOutput(
   for (let chunk = 0; chunk < numChunks; chunk++) {
     const colStart = chunk * alignedColumnsPerChunk;
     const colEnd = Math.min(colStart + alignedColumnsPerChunk, N);
-    const chunkWidth = colEnd - colStart;
 
     // Slice B to get columns [colStart:colEnd] -> shape [batchSize, K, chunkWidth]
     // For contiguous B [batchSize, K, N], columns aren't contiguous, so we need to copy

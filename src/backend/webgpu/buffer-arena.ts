@@ -18,7 +18,7 @@ import { GPUBufferUsage, STORAGE_BUFFER_USAGE, asGPUTensor } from "./gpu-types";
 import {
   arenaBufferSet, trackSharedEncoderWrite, requireContext,
   replayPinnedBufferSet,
-  outputSeqIndex, getOutputSeqIndex, setOutputSeqIndex,
+  getOutputSeqIndex, setOutputSeqIndex,
 } from "./webgpu-state";
 import { createTrackedBuffer } from "./tensor";
 import { bufferPool } from "./buffer-pool";

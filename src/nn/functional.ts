@@ -94,7 +94,6 @@ export function crossEntropy(
 
   // Get dimensions
   const isBatched = logits.shape.length >= 2;
-  const numClasses = logits.shape[logits.shape.length - 1];
 
   // For numerical stability, compute: -logits[target] + log(sum(exp(logits - max(logits))))
   // This is equivalent to: -log(softmax(logits)[target])

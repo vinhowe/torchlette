@@ -239,7 +239,7 @@ function matmulKernelBlockOps(
   postAccumulate?: BlockOpsPostAccFn,
 ): void {
   const { batched, kSplit } = opts;
-  const { tileM, tileN, tileK, threadTileM, threadTileN, wgSizeX, wgSizeY, transA, transB, outputDtype } = p;
+  const { tileM, tileN, tileK, threadTileM, threadTileN, transA, transB, outputDtype } = p;
 
   // Initialize tile context — set thread tile, emit thread position bindings
   const { threadRow, threadCol } = ctx.configureTiles({

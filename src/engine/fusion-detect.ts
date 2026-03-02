@@ -988,9 +988,8 @@ export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
     let id: number;
     if (ref.kind === "scalar") {
       // Scalar refs use a synthetic ID based on value+dtype
-      const key = `scalar_${ref.value}_${ref.dtype}`;
       // Check if we've already registered this exact scalar
-      for (const [existingId, existingIdx] of inputMap) {
+      for (const [, existingIdx] of inputMap) {
         const inp = inputs[-existingIdx - 1];
         if (inp?.isInlinedConstant && inp.inlinedValue === ref.value) {
           return existingIdx;

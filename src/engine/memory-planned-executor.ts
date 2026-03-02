@@ -38,7 +38,6 @@ export { MemoryLimitExceededError };
 
 // WebGPU donation functions (registered by initWebGPU)
 let webgpuDonateBuffer: ((tensor: BackendTensor) => unknown) | null = null;
-let webgpuGetBufferSize: ((tensor: BackendTensor) => number) | null = null;
 
 /**
  * Register WebGPU donation functions.
@@ -46,10 +45,9 @@ let webgpuGetBufferSize: ((tensor: BackendTensor) => number) | null = null;
  */
 export function registerWebGPUDonation(
   donateBuffer: (tensor: BackendTensor) => unknown,
-  getBufferSize: (tensor: BackendTensor) => number,
+  _getBufferSize: (tensor: BackendTensor) => number,
 ): void {
   webgpuDonateBuffer = donateBuffer;
-  webgpuGetBufferSize = getBufferSize;
 }
 
 /**
@@ -255,7 +253,6 @@ export async function executeWithMemoryPlanning(
   },
 ): Promise<MemoryPlannedResult> {
   const enableDonation = options?.enableDonation ?? true;
-  const trackStats = options?.trackStats ?? true;
   const enableEarlyRelease = options?.enableEarlyRelease ?? false;
 
   if (plan.nodes.length === 0) {
@@ -270,8 +267,7 @@ export async function executeWithMemoryPlanning(
     createMemoryPlanForExecution(plan);
 
   // Register this execution for in-flight tracking
-  const { nodeOrder, nodeInputs, nodeShapes, nodeDtypes, outputNodeId } =
-    extractPlanMetadata(plan);
+  const { outputNodeId } = extractPlanMetadata(plan);
   const planId = planner.registerExecution(memoryPlan, [outputNodeId]);
 
   // Track which node results are available for donation

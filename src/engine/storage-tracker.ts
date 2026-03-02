@@ -186,7 +186,7 @@ class StorageTracker {
 
     // Step 2: Collect storages to destroy (unreachable, not needed by views, created since sinceId)
     const toDestroy: number[] = [];
-    for (const [id, storage] of this.allStorages) {
+    for (const [id] of this.allStorages) {
       if (id >= sinceId && !this.externallyReachable.has(id) && !neededByViews.has(id)) {
         toDestroy.push(id);
       }

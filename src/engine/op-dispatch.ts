@@ -90,6 +90,13 @@ function getPayload<T>(node: LazyIRNode): T | undefined {
   return node.payload as T | undefined;
 }
 
+/** Like getPayload but throws if payload is missing. */
+function requirePayload<T>(node: LazyIRNode): T {
+  const p = node.payload as T | undefined;
+  if (!p) throw new Error(`${node.op} requires payload`);
+  return p;
+}
+
 /** Assert that an optional backend op exists, throwing a descriptive error if not. */
 function assertOpSupported(op: string, fn: unknown): asserts fn {
   if (!fn) throw new Error(`${op} not supported by backend`);
@@ -207,56 +214,21 @@ function executeUnaryOp(
       return backend.ops.sqrt(input, donationOpts);
     case "relu":
       return backend.ops.relu(input, donationOpts);
-    case "exp":
-      assertOpSupported("exp", backend.ops.exp);
-      return backend.ops.exp(input, donationOpts);
-    case "log":
-      assertOpSupported("log", backend.ops.log);
-      return backend.ops.log(input, donationOpts);
-    case "neg":
-      assertOpSupported("neg", backend.ops.neg);
-      return backend.ops.neg(input, donationOpts);
-    case "abs":
-      assertOpSupported("abs", backend.ops.abs);
-      return backend.ops.abs(input, donationOpts);
-    case "tanh":
-      assertOpSupported("tanh", backend.ops.tanh);
-      return backend.ops.tanh(input, donationOpts);
-    case "sigmoid":
-      assertOpSupported("sigmoid", backend.ops.sigmoid);
-      return backend.ops.sigmoid(input, donationOpts);
+    case "exp": case "log": case "neg": case "abs": case "tanh": case "sigmoid":
+    case "silu": case "sin": case "cos": case "rsqrt": case "floor": case "ceil":
+    case "round": case "sign": {
+      const fn = backend.ops[node.op as "exp"];
+      assertOpSupported(node.op, fn);
+      return fn(input, donationOpts);
+    }
     case "gelu": {
       assertOpSupported("gelu", backend.ops.gelu);
       const geluOpts = getPayload<GeluOptions>(node);
       return backend.ops.gelu(input, { ...geluOpts, ...donationOpts });
     }
-    case "silu":
-      assertOpSupported("silu", backend.ops.silu);
-      return backend.ops.silu(input, donationOpts);
     case "isfinite":
       assertOpSupported("isfinite", backend.ops.isfinite);
       return backend.ops.isfinite(input);
-    case "sin":
-      assertOpSupported("sin", backend.ops.sin);
-      return backend.ops.sin(input, donationOpts);
-    case "cos":
-      assertOpSupported("cos", backend.ops.cos);
-      return backend.ops.cos(input, donationOpts);
-    case "rsqrt":
-      assertOpSupported("rsqrt", backend.ops.rsqrt);
-      return backend.ops.rsqrt(input, donationOpts);
-    case "floor":
-      assertOpSupported("floor", backend.ops.floor);
-      return backend.ops.floor(input, donationOpts);
-    case "ceil":
-      assertOpSupported("ceil", backend.ops.ceil);
-      return backend.ops.ceil(input, donationOpts);
-    case "round":
-      assertOpSupported("round", backend.ops.round);
-      return backend.ops.round(input, donationOpts);
-    case "sign":
-      assertOpSupported("sign", backend.ops.sign);
-      return backend.ops.sign(input, donationOpts);
     case "clamp": {
       assertOpSupported("clamp", backend.ops.clamp);
       const clampPayload = getPayload<{ min: number | null; max: number | null }>(node);
@@ -305,13 +277,11 @@ function executeShapeOp(
     case "expand":
       return backend.ops.expand(backendInputs[0], node.shape);
     case "transpose": {
-      const payload = getPayload<{ dim0: number; dim1: number }>(node);
-      if (!payload) throw new Error("transpose requires dim0 and dim1 in payload");
+      const payload = requirePayload<{ dim0: number; dim1: number }>(node);
       return backend.ops.transpose(backendInputs[0], payload);
     }
     case "permute": {
-      const payload = getPayload<{ dims: number[] }>(node);
-      if (!payload) throw new Error("permute requires dims in payload");
+      const payload = requirePayload<{ dims: number[] }>(node);
       return backend.ops.permute(backendInputs[0], payload.dims);
     }
     case "contiguous":
@@ -327,8 +297,7 @@ function executeShapeOp(
       return backend.ops.narrowBackward(backendInputs[0], p.dim, p.start, p.originalLength);
     }
     case "cast": {
-      const payload = getPayload<{ dtype: DType }>(node);
-      if (!payload) throw new Error("cast requires dtype in payload");
+      const payload = requirePayload<{ dtype: DType }>(node);
       assertOpSupported("cast", backend.ops.cast);
       return backend.ops.cast(backendInputs[0], payload.dtype);
     }
@@ -365,39 +334,23 @@ function executeReductionOp(
       return backend.ops.conv2d(backendInputs[0], backendInputs[1], backendInputs[2], { ...payload, ...donationOpts });
     }
     case "gather": {
-      const payload = getPayload<{ dim: number }>(node);
-      if (!payload) throw new Error("gather requires dim in payload");
+      const payload = requirePayload<{ dim: number }>(node);
       return backend.ops.gather(backendInputs[0], backendInputs[1], payload);
     }
     case "scatterAdd": {
-      const payload = getPayload<{ dim: number }>(node);
-      if (!payload) throw new Error("scatterAdd requires dim in payload");
+      const payload = requirePayload<{ dim: number }>(node);
       return backend.ops.scatterAdd(backendInputs[0], backendInputs[1], backendInputs[2], payload);
     }
     case "cat": {
-      const payload = getPayload<{ dim: number }>(node);
-      if (!payload) throw new Error("cat requires dim in payload");
+      const payload = requirePayload<{ dim: number }>(node);
       assertOpSupported("cat", backend.ops.cat);
       return backend.ops.cat(backendInputs, payload);
     }
-    case "gt":
-      assertOpSupported("gt", backend.ops.gt);
-      return backend.ops.gt(backendInputs[0], backendInputs[1], donationOpts);
-    case "lt":
-      assertOpSupported("lt", backend.ops.lt);
-      return backend.ops.lt(backendInputs[0], backendInputs[1], donationOpts);
-    case "ge":
-      assertOpSupported("ge", backend.ops.ge);
-      return backend.ops.ge(backendInputs[0], backendInputs[1], donationOpts);
-    case "le":
-      assertOpSupported("le", backend.ops.le);
-      return backend.ops.le(backendInputs[0], backendInputs[1], donationOpts);
-    case "eq":
-      assertOpSupported("eq", backend.ops.eq);
-      return backend.ops.eq(backendInputs[0], backendInputs[1], donationOpts);
-    case "ne":
-      assertOpSupported("ne", backend.ops.ne);
-      return backend.ops.ne(backendInputs[0], backendInputs[1], donationOpts);
+    case "gt": case "lt": case "ge": case "le": case "eq": case "ne": {
+      const fn = backend.ops[node.op as "gt"];
+      assertOpSupported(node.op, fn);
+      return fn(backendInputs[0], backendInputs[1], donationOpts);
+    }
     case "where":
       return backend.ops.where(backendInputs[0], backendInputs[1], backendInputs[2], donationOpts);
     default:
@@ -410,13 +363,11 @@ function executeMutationOp(
 ): BackendTensor | Promise<BackendTensor> {
   switch (node.op) {
     case "stridedScatterCopy": {
-      const payload = getPayload<{ offset: number; viewShape: number[]; viewStrides: number[] }>(node);
-      if (!payload) throw new Error("stridedScatterCopy requires options in payload");
+      const payload = requirePayload<{ offset: number; viewShape: number[]; viewStrides: number[] }>(node);
       return backend.ops.stridedScatterCopy(backendInputs[0], backendInputs[1], payload);
     }
     case "stridedScatterAdd": {
-      const payload = getPayload<{ offset: number; viewShape: number[]; viewStrides: number[] }>(node);
-      if (!payload) throw new Error("stridedScatterAdd requires options in payload");
+      const payload = requirePayload<{ offset: number; viewShape: number[]; viewStrides: number[] }>(node);
       return backend.ops.stridedScatterAdd(backendInputs[0], backendInputs[1], payload);
     }
     case "adamStep": {

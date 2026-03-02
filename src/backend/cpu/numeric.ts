@@ -767,7 +767,6 @@ function inferReshapeStrides(
 
     let oldProduct = oldShape[oldIdx];
     let newProduct = newShape[newIdx];
-    const groupStart = oldIdx;
     while (oldProduct < newProduct && oldIdx + 1 < oldN) {
       if (oldStrides[oldIdx] !== oldStrides[oldIdx + 1] * oldShape[oldIdx + 1]) {
         return null;
@@ -1344,7 +1343,6 @@ export function argmax(a: Tensor, options: ArgReduceOptions): Tensor {
 
   const inShapeStrides = computeStrides(a.shape);
   const outStrides = computeStrides(outShape);
-  const dimSize = a.shape[dim];
 
   for (let linear = 0; linear < a.size; linear += 1) {
     let remainder = linear;

@@ -477,39 +477,6 @@ export class RuntimeEngine {
     }
   }
 
-  /**
-   * Ensure all tensors are on the same device, auto-transferring if needed.
-   * Returns the tensors (possibly transferred) and the target device.
-   */
-  private ensureSameDevice(...tensors: Tensor[]): {
-    tensors: Tensor[];
-    device: DeviceKind;
-  } {
-    if (tensors.length === 0) {
-      return { tensors: [], device: this.getDevice() };
-    }
-
-    // Determine target device - prefer GPU if any tensor is on GPU
-    let targetDevice = tensors[0].device;
-    for (const tensor of tensors) {
-      if (tensor.device === "webgpu") {
-        targetDevice = "webgpu";
-        break;
-      }
-    }
-
-    // Transfer any tensors not on target device
-    const result: Tensor[] = [];
-    for (const tensor of tensors) {
-      if (tensor.device !== targetDevice) {
-        result.push(this.transfer(tensor, targetDevice));
-      } else {
-        result.push(tensor);
-      }
-    }
-
-    return { tensors: result, device: targetDevice };
-  }
 
   /**
    * Force a tensor to materialize by executing its computation graph.
@@ -696,7 +663,7 @@ export class RuntimeEngine {
     }
 
     try {
-      const { result, stats: loweredStats } = await executeLoweredPlan(
+      const { stats: loweredStats } = await executeLoweredPlan(
         plan as { nodes: LazyIRNode[] },
         planNodes,
         template.loweredPlan,

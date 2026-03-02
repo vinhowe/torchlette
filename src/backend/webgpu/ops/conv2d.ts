@@ -116,7 +116,6 @@ function makeConv2dSpec(
 
       // Weight strides: [Cin*KH*KW, KH*KW, KW, 1]
       const cKHKW = ctx.u32(Cin * kH * kW);
-      const cKW = ctx.u32(kW);
       const weightCoBase = co.mul(cKHKW);
 
       // Loop over input channels and kernel spatial positions

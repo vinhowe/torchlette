@@ -1,4 +1,3 @@
-import type { DeviceKind } from "../backend/types";
 import type { Tensor, Torchlette } from "../frontend";
 import type { RuntimeTensor } from "../runtime/tensor";
 import { validateOptimizerParams } from "./validate";
@@ -15,11 +14,10 @@ export class SGD {
   private readonly lr: number;
   private readonly momentum: number;
   private readonly weightDecay: number;
-  private readonly device: DeviceKind;
   private velocity: Array<RuntimeTensor | null>;
 
   constructor(params: Tensor[], options: SGDOptions, api?: Torchlette) {
-    const { api: engine, device } = validateOptimizerParams("SGD", params, api);
+    const { api: engine } = validateOptimizerParams("SGD", params, api);
     if (options.lr <= 0) {
       throw new Error("SGD learning rate must be > 0");
     }
@@ -28,7 +26,6 @@ export class SGD {
     this.params = params.slice();
     this.momentum = options.momentum ?? 0;
     this.weightDecay = options.weightDecay ?? 0;
-    this.device = device;
     this.velocity = new Array(params.length).fill(null);
   }
 

@@ -13,7 +13,7 @@
  * connection pattern.
  */
 
-import type { LazyIRNode, LazyRef } from "./lazy-types";
+import type { LazyIRNode } from "./lazy-types";
 
 // ============================================================================
 // Types

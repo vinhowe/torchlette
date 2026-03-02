@@ -65,7 +65,6 @@ class SimpleBufferPool {
   }> = [];
   private pendingReleaseBytes = 0;
   private queue: GPUQueue | null = null;
-  private fencePromise: Promise<void> | null = null;
 
   // Reference counting: track how many owning tensors reference each GPUBuffer.
   // Only owning tensors (ownsBuffer=true) participate. When refcount drops to 0,

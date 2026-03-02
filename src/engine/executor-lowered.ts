@@ -28,7 +28,6 @@ import {
 } from "../backend/webgpu";
 import { profileOpBegin, profileOpEnd, setProfileModule } from "../backend/webgpu/profiler";
 import type { FusionGroup } from "./fusion-detect";
-import { groupToRecipe } from "./fusion-detect";
 import {
   type LoweredPlan,
   type ReplayEntry,

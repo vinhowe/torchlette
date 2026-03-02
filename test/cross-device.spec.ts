@@ -273,42 +273,6 @@ describe("RuntimeEngine Lazy Transfer", () => {
   });
 });
 
-describe("RuntimeEngine ensureSameDevice (internal)", () => {
-  let engine: RuntimeEngine;
-
-  beforeEach(() => {
-    engine = new RuntimeEngine("cpu");
-    resetNodeIdCounter();
-    resetBaseIdCounter();
-  });
-
-  it("returns tensors unchanged when already same device", () => {
-    const a = engine.tensorFromArray([1, 2], [2], "cpu");
-    const b = engine.tensorFromArray([3, 4], [2], "cpu");
-
-    // Access private method for testing
-    const result = (engine as any).ensureSameDevice(a, b);
-
-    expect(result.tensors[0]).toBe(a);
-    expect(result.tensors[1]).toBe(b);
-    expect(result.device).toBe("cpu");
-  });
-
-  it("prefers GPU when mixed devices", () => {
-    const a = engine.tensorFromArray([1, 2], [2], "cpu");
-    const b = engine.tensorFromArray([3, 4], [2], "webgpu");
-
-    const result = (engine as any).ensureSameDevice(a, b);
-
-    expect(result.device).toBe("webgpu");
-    // First tensor should be transferred
-    expect(result.tensors[0].device).toBe("webgpu");
-    expect(result.tensors[0]).not.toBe(a);
-    // Second tensor unchanged
-    expect(result.tensors[1]).toBe(b);
-  });
-});
-
 describe("Cross-Device Transfer Execution (CPU)", () => {
   let engine: RuntimeEngine;
 
