@@ -940,33 +940,11 @@ export class Torchlette {
     }, tensorsToSave);
   }
 
-  floor(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.floor(a._unwrap());
-    // floor is piecewise constant — gradient is 0 everywhere (not differentiable at integers)
-    return this._wrap(inner);
-  }
-
-  ceil(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.ceil(a._unwrap());
-    // ceil is piecewise constant — gradient is 0
-    return this._wrap(inner);
-  }
-
-  round(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.round(a._unwrap());
-    // round is piecewise constant — gradient is 0
-    return this._wrap(inner);
-  }
-
-  sign(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.sign(a._unwrap());
-    // sign is piecewise constant — gradient is 0
-    return this._wrap(inner);
-  }
+  // Piecewise constant ops — gradient is 0, no autograd needed
+  floor(a: Tensor): Tensor { this._assertUsable(a); return this._wrap(this.runtime.floor(a._unwrap())); }
+  ceil(a: Tensor): Tensor { this._assertUsable(a); return this._wrap(this.runtime.ceil(a._unwrap())); }
+  round(a: Tensor): Tensor { this._assertUsable(a); return this._wrap(this.runtime.round(a._unwrap())); }
+  sign(a: Tensor): Tensor { this._assertUsable(a); return this._wrap(this.runtime.sign(a._unwrap())); }
 
   clamp(a: Tensor, min: number | null, max: number | null): Tensor {
     this._assertUsable(a);
@@ -1060,16 +1038,7 @@ export class Torchlette {
     }, tensorsToSave);
   }
 
-  /**
-   * Check if values are finite (not NaN and not Inf).
-   * Returns 1.0 where finite, 0.0 where NaN or Inf.
-   * This op is not differentiable.
-   */
-  isfinite(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.isfinite(a._unwrap());
-    return this._wrap(inner);
-  }
+  isfinite(a: Tensor): Tensor { this._assertUsable(a); return this._wrap(this.runtime.isfinite(a._unwrap())); }
 
   softplus(a: Tensor): Tensor {
     this._assertUsable(a);
@@ -1117,23 +1086,13 @@ export class Torchlette {
     });
   }
 
-  max(a: Tensor, options?: MaxOptions): number | Tensor {
+  private _maxMinOp(op: "max" | "min", a: Tensor, options?: MaxOptions): number | Tensor {
     this._assertUsable(a);
-    const result = this.runtime.max(a._unwrap(), options);
-    if (typeof result === "number") {
-      return result;
-    }
-    return this._wrap(result);
+    const result = this.runtime[op](a._unwrap(), options);
+    return typeof result === "number" ? result : this._wrap(result);
   }
-
-  min(a: Tensor, options?: MinOptions): number | Tensor {
-    this._assertUsable(a);
-    const result = this.runtime.min(a._unwrap(), options);
-    if (typeof result === "number") {
-      return result;
-    }
-    return this._wrap(result);
-  }
+  max(a: Tensor, options?: MaxOptions): number | Tensor { return this._maxMinOp("max", a, options); }
+  min(a: Tensor, options?: MinOptions): number | Tensor { return this._maxMinOp("min", a, options); }
 
   mean(a: Tensor, options?: MeanOptions): number | Tensor {
     this._assertUsable(a);
@@ -1158,17 +1117,8 @@ export class Torchlette {
     });
   }
 
-  argmax(a: Tensor, options: ArgReduceOptions): Tensor {
-    this._assertUsable(a);
-    const result = this.runtime.argmax(a._unwrap(), options);
-    return this._wrap(result);
-  }
-
-  argmin(a: Tensor, options: ArgReduceOptions): Tensor {
-    this._assertUsable(a);
-    const result = this.runtime.argmin(a._unwrap(), options);
-    return this._wrap(result);
-  }
+  argmax(a: Tensor, options: ArgReduceOptions): Tensor { this._assertUsable(a); return this._wrap(this.runtime.argmax(a._unwrap(), options)); }
+  argmin(a: Tensor, options: ArgReduceOptions): Tensor { this._assertUsable(a); return this._wrap(this.runtime.argmin(a._unwrap(), options)); }
 
   variance(a: Tensor, options?: { dim?: number | number[] | null; correction?: number; keepdim?: boolean }): Tensor {
     this._assertUsable(a);
@@ -1201,35 +1151,16 @@ export class Torchlette {
   // Comparison ops
   // ============================================================================
 
-  gt(a: Tensor, b: Tensor): Tensor {
+  private _cmpOp(op: "gt" | "lt" | "ge" | "le" | "eq" | "ne", a: Tensor, b: Tensor): Tensor {
     this._assertUsable(a, b);
-    return this._wrap(this.runtime.gt(a._unwrap(), b._unwrap()));
+    return this._wrap(this.runtime[op](a._unwrap(), b._unwrap()));
   }
-
-  lt(a: Tensor, b: Tensor): Tensor {
-    this._assertUsable(a, b);
-    return this._wrap(this.runtime.lt(a._unwrap(), b._unwrap()));
-  }
-
-  ge(a: Tensor, b: Tensor): Tensor {
-    this._assertUsable(a, b);
-    return this._wrap(this.runtime.ge(a._unwrap(), b._unwrap()));
-  }
-
-  le(a: Tensor, b: Tensor): Tensor {
-    this._assertUsable(a, b);
-    return this._wrap(this.runtime.le(a._unwrap(), b._unwrap()));
-  }
-
-  eq(a: Tensor, b: Tensor): Tensor {
-    this._assertUsable(a, b);
-    return this._wrap(this.runtime.eq(a._unwrap(), b._unwrap()));
-  }
-
-  ne(a: Tensor, b: Tensor): Tensor {
-    this._assertUsable(a, b);
-    return this._wrap(this.runtime.ne(a._unwrap(), b._unwrap()));
-  }
+  gt(a: Tensor, b: Tensor): Tensor { return this._cmpOp("gt", a, b); }
+  lt(a: Tensor, b: Tensor): Tensor { return this._cmpOp("lt", a, b); }
+  ge(a: Tensor, b: Tensor): Tensor { return this._cmpOp("ge", a, b); }
+  le(a: Tensor, b: Tensor): Tensor { return this._cmpOp("le", a, b); }
+  eq(a: Tensor, b: Tensor): Tensor { return this._cmpOp("eq", a, b); }
+  ne(a: Tensor, b: Tensor): Tensor { return this._cmpOp("ne", a, b); }
 
   // ============================================================================
   // Fused ops — delegated to frontend-fused-ops.ts
