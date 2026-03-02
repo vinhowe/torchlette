@@ -14,17 +14,11 @@
  * Handles large buffers (>maxStorageBufferBindingSize) via chunked dispatch.
  */
 
-import {
-  dispatchComputePass,
-  getMaxStorageBufferBindingSize,
-  trackSharedEncoderWrite,
-  createParamsBuffer,
-  releaseParamsBuffer,
-  cachedCreateBindGroup,
-  awaitDeferredFence,
-  getPipeline,
-} from "./index";
-import { requireContext } from "./webgpu-state";
+import { dispatchComputePass, getPipeline } from "./dispatch";
+import { getMaxStorageBufferBindingSize, requireContext } from "./gpu-context";
+import { trackSharedEncoderWrite } from "./shared-encoder";
+import { createParamsBuffer, releaseParamsBuffer, cachedCreateBindGroup } from "./bind-group-cache";
+import { awaitDeferredFence } from "./buffer-pool";
 import { isProfilingEnabled } from "./profiler";
 import { gpuMemoryTracker } from "./memory-tracker";
 import type { GPUBuffer, GPUBindGroup, GPUDevice } from "./gpu-types";
