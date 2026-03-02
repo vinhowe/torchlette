@@ -24,7 +24,7 @@ import { getInputStorage, executeOp } from "./op-dispatch";
 // ============================================================================
 
 /** Ops safe to execute during tape replay fill-in: pure views + data sources. */
-export const FILL_IN_OPS: ReadonlySet<string> = new Set([
+const FILL_IN_OPS: ReadonlySet<string> = new Set([
   // Pure view ops (no GPU dispatch, same buffer)
   "reshape", "transpose", "permute", "expand", "narrow", "contiguous",
   // Data source ops (create new buffers from host data)

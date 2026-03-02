@@ -270,8 +270,6 @@ describe("Memory-Aware Scheduler with Fusion", () => {
 describe("Memory-Aware Scheduler with Memory Planning", () => {
   it("should work correctly with memory planning and early release", async () => {
     const engine = new RuntimeEngine("cpu", {
-
-      enableDonation: true,
       enableEarlyRelease: true,
     });
 
@@ -345,8 +343,6 @@ describe("Memory-Aware Scheduler with WebGPU", { skip: cpuOnly }, () => {
 
   it("should work with memory planning and early release on WebGPU", async () => {
     const engine = new RuntimeEngine("webgpu", {
-
-      enableDonation: true,
       enableEarlyRelease: true,
     });
 

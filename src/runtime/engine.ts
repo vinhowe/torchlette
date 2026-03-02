@@ -89,8 +89,6 @@ export class TidyDispatchMode implements DispatchMode {
 }
 
 export interface RuntimeEngineOptions {
-  enableDonation?: boolean;
-  trackStats?: boolean;
   enableFusion?: boolean;
   enableVectorization?: boolean;
   enableEarlyRelease?: boolean;
@@ -157,8 +155,6 @@ function castRef(input: OpInput, toDtype: DType): OpInput {
 
 export class RuntimeEngine {
   private defaultDevice: DeviceKind | null = null;
-  private donationEnabled = true;
-  private trackStats = false;
   private fusionEnabled = false;
   private vectorizationEnabled = false;
   private lastFusionStats: OptimizedExecutionStats | null = null;
@@ -178,12 +174,6 @@ export class RuntimeEngine {
   constructor(backendName?: DeviceKind, options?: RuntimeEngineOptions) {
     if (backendName) {
       this.defaultDevice = backendName;
-    }
-    if (options?.enableDonation !== undefined) {
-      this.donationEnabled = options.enableDonation;
-    }
-    if (options?.trackStats) {
-      this.trackStats = true;
     }
     if (options?.enableFusion !== undefined) {
       this.fusionEnabled = options.enableFusion;
