@@ -649,7 +649,7 @@ function emitStatement(
       const shouldUnroll =
         tripCount !== null &&
         tripCount >= 0 &&
-        (stmt.unroll === true || tripCount <= 16);
+        (stmt.unroll || tripCount <= 16);
 
       if (shouldUnroll && tripCount !== null && startConst !== null) {
         for (let i = 0; i < tripCount; i++) {
@@ -684,7 +684,7 @@ function emitStatement(
       // Case 1: Fully const — emit JS-time unrolled iterations (no guards needed)
       if (startConst !== null && boundConst !== null && strideVal > 0) {
         const tripCount = Math.ceil((boundConst - startConst) / strideVal);
-        if (tripCount >= 0 && (stmt.unroll === true || tripCount <= 8)) {
+        if (tripCount >= 0 && (stmt.unroll || tripCount <= 8)) {
           for (let i = 0; i < tripCount; i++) {
             emitUnrolledBlock(
               stmt.varName,
@@ -704,10 +704,7 @@ function emitStatement(
       // Max trips = ceil(bound / stride) (assuming start ∈ [0, stride)).
       if (startConst === null && boundConst !== null && strideVal > 0) {
         const maxTrips = Math.ceil(boundConst / strideVal);
-        if (
-          maxTrips >= 1 &&
-          (stmt.unroll === true ? maxTrips <= 16 : maxTrips <= 8)
-        ) {
+        if (maxTrips >= 1 && (stmt.unroll ? maxTrips <= 16 : maxTrips <= 8)) {
           const startExpr = exprFor(stmt.start, bindings);
           for (let i = 0; i < maxTrips; i++) {
             const ivExpr =

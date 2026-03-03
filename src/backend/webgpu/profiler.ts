@@ -180,18 +180,6 @@ function accumulateNs(
     e.opCount++;
   } else map.set(key, { totalNs: ns, opCount: 1 });
 }
-function getOrCreateMap<K, V>(
-  outer: Map<K, Map<string, V>>,
-  key: K,
-): Map<string, V> {
-  let m = outer.get(key);
-  if (!m) {
-    m = new Map();
-    outer.set(key, m);
-  }
-  return m;
-}
-
 export function recordFusionFallback(
   reason: string,
   groupSize: number,
@@ -430,18 +418,20 @@ function processTimestampRecords(timestamps: BigInt64Array): void {
     recordNs(gpuTs.labelStats, record.label, durationNs);
 
     accumulateNs(gpuTs.phaseStats, record.phase, durationNs);
-    recordNs(
-      getOrCreateMap(gpuTs.phaseOpStats, record.phase),
-      record.label,
-      durationNs,
-    );
+    let phaseOps = gpuTs.phaseOpStats.get(record.phase);
+    if (!phaseOps) {
+      phaseOps = new Map();
+      gpuTs.phaseOpStats.set(record.phase, phaseOps);
+    }
+    recordNs(phaseOps, record.label, durationNs);
 
     accumulateNs(gpuTs.moduleStats, record.module, durationNs);
-    recordNs(
-      getOrCreateMap(gpuTs.moduleOpStats, record.module),
-      record.label,
-      durationNs,
-    );
+    let moduleOps = gpuTs.moduleOpStats.get(record.module);
+    if (!moduleOps) {
+      moduleOps = new Map();
+      gpuTs.moduleOpStats.set(record.module, moduleOps);
+    }
+    recordNs(moduleOps, record.label, durationNs);
   }
 }
 
