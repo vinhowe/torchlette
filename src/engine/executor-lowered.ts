@@ -90,6 +90,37 @@ type AdamStepFn = NonNullable<
   import("../backend/types").Backend["ops"]["adamStep"]
 >;
 
+/** Restore arena + dispatch counters from a replay entry. */
+function restoreReplayCounters(entry: {
+  arenaResolveIdx: number;
+  seqCounters: SeqCounters;
+}): void {
+  setArenaResolveIndexTo(entry.arenaResolveIdx);
+  setDispatchSequenceCounters(
+    entry.seqCounters.dispatch,
+    entry.seqCounters.params,
+    entry.seqCounters.output,
+  );
+}
+
+/** Execute an op node: resolve backend, get inputs, run executeOp. */
+async function executeNodeOp(
+  node: LazyIRNode,
+  backend: Backend,
+): Promise<{
+  result: BackendTensor;
+  backendInputs: BackendTensor[];
+  inputStorages: StorageHandle[];
+}> {
+  const nodeBackend = getBackend(node.device) ?? backend;
+  const inputStorages = node.inputs.map((ref) =>
+    getInputStorage(ref, nodeBackend),
+  );
+  const backendInputs = inputStorages.map((s) => s.backendTensor);
+  const result = await executeOp(node, backendInputs, nodeBackend);
+  return { result, backendInputs, inputStorages };
+}
+
 /**
  * Walk a chain of binary ops (add/mul), returning the external (non-chain) input ref
  * at each step. `prevId` is the ID of the node feeding into chainNodes[0].
@@ -351,24 +382,10 @@ export async function executeLoweredPlan(
             break;
           case "data-source": {
             flushDispatchBatch();
-            setArenaResolveIndexTo(entry.arenaResolveIdx);
-            setDispatchSequenceCounters(
-              entry.seqCounters.dispatch,
-              entry.seqCounters.params,
-              entry.seqCounters.output,
-            );
+            restoreReplayCounters(entry);
             const dsNode = planNodes[entry.nodeIndex];
             if (dsNode.result) break;
-            const dsBackend = getBackend(dsNode.device) ?? backend;
-            const dsInputs = dsNode.inputs.map((ref) =>
-              getInputStorage(ref, dsBackend),
-            );
-            const dsBackendInputs = dsInputs.map((s) => s.backendTensor);
-            const dsResult = await executeOp(
-              dsNode,
-              dsBackendInputs,
-              dsBackend,
-            );
+            const { result: dsResult } = await executeNodeOp(dsNode, backend);
             dsNode.result = createStorageHandle(dsNode.device, dsResult);
             break;
           }
@@ -385,50 +402,32 @@ export async function executeLoweredPlan(
             } else {
               // Slow path: re-execute (first replay before cache populated)
               setArenaResolveIndexTo(entry.arenaResolveIdx);
-              const vNodeBackend = getBackend(vNode.device) ?? backend;
-              const vInputs = vNode.inputs.map((ref) =>
-                getInputStorage(ref, vNodeBackend),
-              );
-              const vBackendInputs = vInputs.map((s) => s.backendTensor);
-              const vResultTensor = await executeOp(
-                vNode,
-                vBackendInputs,
-                vNodeBackend,
-              );
+              const {
+                result: vResult,
+                backendInputs: vBI,
+                inputStorages: vIS,
+              } = await executeNodeOp(vNode, backend);
               vNode.result = wrapResultAsStorage(
                 vNode.device,
-                vResultTensor,
-                vBackendInputs,
-                vInputs,
+                vResult,
+                vBI,
+                vIS,
               );
             }
             break;
           }
           case "sequential": {
             flushDispatchBatch();
-            setArenaResolveIndexTo(entry.arenaResolveIdx);
-            setDispatchSequenceCounters(
-              entry.seqCounters.dispatch,
-              entry.seqCounters.params,
-              entry.seqCounters.output,
-            );
+            restoreReplayCounters(entry);
             const node = planNodes[entry.nodeIndex];
             if (node.result) break;
-            const nodeBackend = getBackend(node.device) ?? backend;
-            const inputs = node.inputs.map((ref) =>
-              getInputStorage(ref, nodeBackend),
-            );
-            const backendInputs = inputs.map((s) => s.backendTensor);
-            const resultTensor = await executeOp(
-              node,
-              backendInputs,
-              nodeBackend,
-            );
+            const { result, backendInputs, inputStorages } =
+              await executeNodeOp(node, backend);
             node.result = wrapResultAsStorage(
               node.device,
-              resultTensor,
+              result,
               backendInputs,
-              inputs,
+              inputStorages,
             );
             break;
           }
@@ -1194,11 +1193,7 @@ export async function executeLoweredPlan(
             replayEntries.push({
               kind: "adam-batch",
               nodeIndices: action.nodeIndices,
-              seqCounters: adamSeqCountersBefore as {
-                dispatch: number;
-                params: number;
-                output: number;
-              },
+              seqCounters: adamSeqCountersBefore as SeqCounters,
             });
           }
           break;
@@ -1247,11 +1242,7 @@ export async function executeLoweredPlan(
                 kind: "data-source",
                 nodeIndex: nodeIdx,
                 arenaResolveIdx: arenaResolveIdxBefore,
-                seqCounters: seqCountersBefore as {
-                  dispatch: number;
-                  params: number;
-                  output: number;
-                },
+                seqCounters: seqCountersBefore as SeqCounters,
               });
               skipDispatches();
             } else if (action.kind === "view") {
@@ -1282,11 +1273,7 @@ export async function executeLoweredPlan(
                 kind: "sequential",
                 nodeIndex: nodeIdx,
                 arenaResolveIdx: arenaResolveIdxBefore,
-                seqCounters: seqCountersBefore as {
-                  dispatch: number;
-                  params: number;
-                  output: number;
-                },
+                seqCounters: seqCountersBefore as SeqCounters,
               });
               skipDispatches();
             } else {
