@@ -308,7 +308,7 @@ export function destroyArena(arena: BufferArena): void {
 }
 
 /** Allocate or reuse an arena buffer at the given position in the given array. */
-export function arenaAllocAt(
+function arenaAllocAt(
   arr: (GPUBuffer | undefined)[],
   idx: number,
   sizeBytes: number,

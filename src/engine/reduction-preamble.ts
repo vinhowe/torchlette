@@ -321,7 +321,7 @@ export async function executeReductionWithPreamble(
 // ============================================================================
 
 /** Describes a single epilogue op to apply after the reduction. */
-export type ReductionEpilogueOp = {
+type ReductionEpilogueOp = {
   kind: string;
   toDtype?: DType;
   inputIndex?: number;

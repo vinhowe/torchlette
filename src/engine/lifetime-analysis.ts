@@ -7,7 +7,6 @@
  * Also provides size-class utilities used by the WebGPU buffer pool and arena.
  */
 
-import type { DType } from "../backend/types";
 import { sizeOf } from "../core/shape";
 
 // ============================================================================
@@ -36,13 +35,6 @@ export function getSizeClass(sizeBytes: number): number {
 
 export function getSizeForClass(sizeClass: number): number {
   return 2 ** sizeClass;
-}
-
-export function computeBufferSize(shape: number[], dtype: DType): number {
-  const elements = sizeOf(shape);
-  const bytesPerElement =
-    dtype === "f32" || dtype === "i32" ? 4 : dtype === "f16" ? 2 : 1;
-  return elements * bytesPerElement;
 }
 
 // ============================================================================

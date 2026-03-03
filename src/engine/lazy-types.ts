@@ -92,7 +92,7 @@ export interface StorageHandle {
 }
 
 /** Side outputs for multi-output ops (attention, layernorm, adam). */
-export interface NodeSideOutputs {
+interface NodeSideOutputs {
   /** fusedAttentionForward → logsumexp StorageHandle */
   attnLogsumexp?: StorageHandle;
   /** fusedAttentionBackward → dK StorageHandle */
