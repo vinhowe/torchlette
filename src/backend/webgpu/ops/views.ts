@@ -19,7 +19,7 @@ import {
   getPipeline,
 } from "../dispatch";
 import { f16WeightCache, requireContext } from "../gpu-context";
-import type { WebGPUTensor } from "../gpu-types";
+import type { GPUBufferBinding, WebGPUTensor } from "../gpu-types";
 import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
 import {
   alignBufferSize,
