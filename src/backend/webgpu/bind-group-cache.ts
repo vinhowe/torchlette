@@ -130,11 +130,7 @@ export function createParamsBuffer(
   // This keeps the GPUBuffer pointer stable so bind group caching can hit.
   if (!activeBatch) {
     const cached = cacheState.paramsSequenceBuffers[idx];
-    if (
-      cached !== undefined &&
-      cached !== null &&
-      cached.sizeClass === sizeClass
-    ) {
+    if (cached != null && cached.sizeClass === sizeClass) {
       // Fast path: skip writeBuffer if data is identical (params derived from
       // tensor shapes which are constant across steps).
       if (cached.data.length === data.length) {
@@ -278,8 +274,7 @@ export function cachedCreateBindGroup(
   const entry = cacheState.sequenceEntries[idx];
 
   if (
-    entry !== undefined &&
-    entry !== null &&
+    entry != null &&
     entry.pipeline === pipeline &&
     entry.buffers.length === buffers.length
   ) {
@@ -301,7 +296,7 @@ export function cachedCreateBindGroup(
   if (cacheState.missLog.length < 200) {
     let reason = "new";
     let details = "";
-    if (entry !== undefined && entry !== null) {
+    if (entry != null) {
       if (entry.pipeline !== pipeline) reason = "pipeline";
       else if (entry.buffers.length !== buffers.length) reason = "buf-count";
       else {

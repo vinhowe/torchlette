@@ -293,7 +293,7 @@ export async function executeReductionWithPreamble(
     const inputShape = plan.preambleNode.shape;
     const dim = payload?.dim;
     let reductionSize: number;
-    if (dim === undefined || dim === null) {
+    if (dim == null) {
       reductionSize = inputShape.reduce((a, b) => a * b, 1);
     } else {
       const dims = Array.isArray(dim) ? dim : [dim];

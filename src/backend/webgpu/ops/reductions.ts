@@ -52,7 +52,7 @@ function reductionCount(
   inputShape: number[],
   dim: number | number[] | undefined | null,
 ): number {
-  if (dim === undefined || dim === null) return sizeOf(inputShape);
+  if (dim == null) return sizeOf(inputShape);
   const dims = Array.isArray(dim) ? dim : [dim];
   const rank = inputShape.length;
   return dims.reduce((acc, d) => acc * inputShape[normalizeDim(d, rank)], 1);
@@ -236,9 +236,7 @@ function reduction(
     : undefined;
 
   const setup =
-    dim !== undefined && dim !== null
-      ? prepareDimReduction(inputShape, dim, keepdim)
-      : null;
+    dim != null ? prepareDimReduction(inputShape, dim, keepdim) : null;
 
   // Full reduction (no dim or all dims reduced)
   if (!setup) {
@@ -471,9 +469,7 @@ export function sumDimWithPreambleChain(
   const keepdim = sumOptions?.keepdim ?? false;
 
   const setup =
-    dim !== undefined && dim !== null
-      ? prepareDimReduction(inputShape, dim, keepdim)
-      : null;
+    dim != null ? prepareDimReduction(inputShape, dim, keepdim) : null;
 
   const inputBuffers = inputs.map((inp) => asGPUTensor(inp).buffer);
   const preamble = { chainOps, totalInputs: inputs.length, inputDtypes };
@@ -563,9 +559,7 @@ export function sumWithPreambleEpilogue(
 
   const bpe = dtypeBytes(outputDtype);
   const setup =
-    dim !== undefined && dim !== null
-      ? prepareDimReduction(inputShape, dim, keepdim)
-      : null;
+    dim != null ? prepareDimReduction(inputShape, dim, keepdim) : null;
   const preamble = {
     chainOps,
     totalInputs: preambleInputs.length,

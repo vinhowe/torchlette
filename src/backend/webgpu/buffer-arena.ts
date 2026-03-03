@@ -371,7 +371,7 @@ export function prePinOutputBuffers(): void {
   pinnedOutputBuffers.length = 0;
   for (let i = 0; i < outputSequenceHints.length; i++) {
     const hint = outputSequenceHints[i];
-    if (hint === null || hint === undefined) {
+    if (hint == null) {
       pinnedOutputBuffers[i] = null;
       continue;
     }
@@ -454,7 +454,7 @@ export function resolveOutputBuffer(
   // buffer without racing other positions for the same pool slot.
   if (!providedOutBuffer) {
     const pinned = pinnedOutputBuffers[outIdx];
-    if (pinned !== null && pinned !== undefined) {
+    if (pinned != null) {
       const neededSizeClass = getSizeClass(alignedSize);
       const pinnedSizeClass = getSizeClass(pinned.size);
       if (

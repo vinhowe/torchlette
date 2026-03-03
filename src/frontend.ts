@@ -1846,7 +1846,7 @@ function collectEngineTensors(value: unknown): EngineTensor[] {
   const seen = new Set<unknown>();
 
   const visit = (current: unknown) => {
-    if (current === null || current === undefined) {
+    if (current == null) {
       return;
     }
     if (current instanceof Tensor) {
