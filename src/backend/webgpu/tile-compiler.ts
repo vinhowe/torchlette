@@ -83,13 +83,15 @@ type BindingMap = Map<number, string>;
  * If the node is in `bindings`, returns its variable name.
  * Otherwise builds the expression recursively.
  */
+const DIMS = ["x", "y", "z"] as const;
+
 function exprFor(node: IRNode, bindings: BindingMap): string {
   const cached = bindings.get(node.id);
   if (cached !== undefined) return cached;
 
   switch (node.kind) {
     case "programId": {
-      return `wid.${(["x", "y", "z"] as const)[node.dim]}`;
+      return `wid.${DIMS[node.dim]}`;
     }
     case "uniform":
       return `config.${node.name}`;
@@ -151,7 +153,7 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
     }
     // -- Imperative mode nodes --
     case "threadIdx": {
-      return `local_id.${(["x", "y", "z"] as const)[node.dim]}`;
+      return `local_id.${DIMS[node.dim]}`;
     }
     case "localIndex": {
       return getActiveTPR() > 1 ? "_logical_idx" : "local_idx";
@@ -166,10 +168,10 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
       return node.name;
     }
     case "globalId": {
-      return `gid.${(["x", "y", "z"] as const)[node.dim]}`;
+      return `gid.${DIMS[node.dim]}`;
     }
     case "numWorkgroups": {
-      return `num_wg.${(["x", "y", "z"] as const)[node.dim]}`;
+      return `num_wg.${DIMS[node.dim]}`;
     }
     case "subgroupShuffleXor": {
       const val = exprFor(node.value, bindings);

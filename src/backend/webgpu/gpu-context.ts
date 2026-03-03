@@ -387,8 +387,6 @@ export async function initWebGPU(): Promise<boolean> {
     f16Supported: actualF16Supported,
   });
 
-  bufferPool.setQueue(device.queue);
-
   if (
     typeof process !== "undefined" &&
     process.env?.TORCHLETTE_POOL_BUDGET_MB
