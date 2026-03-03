@@ -307,14 +307,12 @@ export function computeInputCasts(
 /**
  * Compute required cast for an op's output under AMP.
  *
- * @param op The operation name
  * @param computeDtype The dtype used for computation
  * @param targetDtype The desired output dtype
  * @param ctx Autocast context
  * @returns Cast info if needed, null otherwise
  */
 export function computeOutputCast(
-  _op: string,
   computeDtype: DType,
   targetDtype: DType,
   ctx: AutocastContext,
