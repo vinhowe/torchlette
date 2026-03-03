@@ -143,42 +143,18 @@ class GPUMemoryTracker {
   }
 
   /**
-   * Snapshot current unmatched allocations, grouped by call site.
+   * Snapshot unmatched allocations grouped by call site.
+   * If step is specified, only includes allocations from that step.
    */
-  snapshotLeakedAllocs(): Map<
-    string,
-    { count: number; totalBytes: number; exampleStack: string }
-  > {
-    const grouped = new Map<
-      string,
-      { count: number; totalBytes: number; exampleStack: string }
-    >();
-    for (const [, info] of this._allocStacks) {
-      const key = info.stack.split("\n").slice(0, 3).join("\n");
-      const existing = grouped.get(key) || {
-        count: 0,
-        totalBytes: 0,
-        exampleStack: info.stack,
-      };
-      existing.count++;
-      existing.totalBytes += info.size;
-      grouped.set(key, existing);
-    }
-    return grouped;
-  }
-
-  /**
-   * Snapshot unmatched allocations from a specific step only.
-   */
-  snapshotLeakedAllocsForStep(
-    step: number,
+  snapshotLeakedAllocs(
+    step?: number,
   ): Map<string, { count: number; totalBytes: number; exampleStack: string }> {
     const grouped = new Map<
       string,
       { count: number; totalBytes: number; exampleStack: string }
     >();
     for (const [, info] of this._allocStacks) {
-      if (info.step !== step) continue;
+      if (step !== undefined && info.step !== step) continue;
       const key = info.stack.split("\n").slice(0, 3).join("\n");
       const existing = grouped.get(key) || {
         count: 0,
@@ -505,17 +481,10 @@ export function setAllocStep(step: number): void {
   gpuMemoryTracker.setAllocStep(step);
 }
 
-export function snapshotLeakedAllocs(): Map<
-  string,
-  { count: number; totalBytes: number; exampleStack: string }
-> {
-  return gpuMemoryTracker.snapshotLeakedAllocs();
-}
-
-export function snapshotLeakedAllocsForStep(
-  step: number,
+export function snapshotLeakedAllocs(
+  step?: number,
 ): Map<string, { count: number; totalBytes: number; exampleStack: string }> {
-  return gpuMemoryTracker.snapshotLeakedAllocsForStep(step);
+  return gpuMemoryTracker.snapshotLeakedAllocs(step);
 }
 
 export function getLeakedAllocCount(): number {

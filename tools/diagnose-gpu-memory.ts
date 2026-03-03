@@ -16,7 +16,7 @@ import {
   initWebGPU,
   setAllocStep,
   setGPUMemoryLimit,
-  snapshotLeakedAllocsForStep,
+  snapshotLeakedAllocs,
 } from "../src/backend/webgpu";
 import { storageTracker } from "../src/engine/lazy";
 import { type Tensor, Torchlette } from "../src/frontend";
@@ -148,7 +148,7 @@ async function main() {
     const leakedThisStep = getLeakedAllocCountForStep(step);
     console.log(`  Leaked allocs this step: ${leakedThisStep}`);
     if (step >= 1 && leakedThisStep > 0) {
-      const leaked = snapshotLeakedAllocsForStep(step);
+      const leaked = snapshotLeakedAllocs(step);
       const sorted = [...leaked.entries()].sort(
         (a, b) => b[1].totalBytes - a[1].totalBytes,
       );

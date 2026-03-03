@@ -108,7 +108,6 @@ export {
   setAllocStep,
   setGPUMemoryLimit,
   snapshotLeakedAllocs,
-  snapshotLeakedAllocsForStep,
 } from "./memory-tracker";
 // Re-export public functions from ops modules
 export { tensorFromArrayWithDtype } from "./ops/creation";
