@@ -233,7 +233,9 @@ function arenaStorage(
 }
 
 /** Collect GPU buffers from all external (materialized/already-resolved) plan inputs. */
-function collectExternalInputBuffers(planNodes: LazyIRNode[]): GPUBuffer[] {
+export function collectExternalInputBuffers(
+  planNodes: LazyIRNode[],
+): GPUBuffer[] {
   const bufs: GPUBuffer[] = [];
   for (const node of planNodes) {
     for (const ref of node.inputs) {

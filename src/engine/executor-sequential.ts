@@ -34,7 +34,10 @@ import {
 // ============================================================================
 
 /** Execute a single node: resolve inputs → dispatch op → store result. */
-async function executeNode(node: LazyIRNode, backend: Backend): Promise<void> {
+export async function executeNode(
+  node: LazyIRNode,
+  backend: Backend,
+): Promise<void> {
   const nodeBackend = getBackend(node.device) ?? backend;
   const inputs = node.inputs.map((ref) => getInputStorage(ref, nodeBackend));
   const backendInputs = inputs.map((s) => s.backendTensor);

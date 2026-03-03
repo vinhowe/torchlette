@@ -10,13 +10,14 @@ import {
   setActiveArena,
   setArenaExternalInputBuffers,
 } from "../backend/webgpu";
-import { type GPUBuffer, gpuBuffer } from "../backend/webgpu/gpu-types";
+import type { GPUBuffer } from "../backend/webgpu/gpu-types";
 import {
   isProfilingEnabled,
   type PlanAnalysis,
   recordPlanAnalysis,
 } from "../backend/webgpu/profiler";
 import type { CompoundMatch } from "./compound-patterns";
+import { collectExternalInputBuffers } from "./executor-lowered";
 import { executePlan } from "./executor-sequential";
 import {
   buildIdPositionMap,
@@ -619,20 +620,7 @@ export async function executePlanOptimized(
     setActiveArena(
       (cachedTemplate as FusionAnalysisTemplate).bufferArena as BufferArena,
     );
-    // Register external input buffers for arena conflict detection
-    const extBufs: GPUBuffer[] = [];
-    for (const node of planNodes) {
-      for (const ref of node.inputs) {
-        if (ref.kind === "materialized") {
-          const buf = gpuBuffer(ref.storage.backendTensor);
-          if (buf) extBufs.push(buf);
-        } else if (ref.kind === "pending" && ref.node.result) {
-          const buf = gpuBuffer(ref.node.result.backendTensor);
-          if (buf) extBufs.push(buf);
-        }
-      }
-    }
-    setArenaExternalInputBuffers(extBufs);
+    setArenaExternalInputBuffers(collectExternalInputBuffers(planNodes));
   }
 
   try {

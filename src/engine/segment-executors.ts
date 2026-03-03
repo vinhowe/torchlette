@@ -14,6 +14,7 @@ import {
   setProfileModule,
 } from "../backend/webgpu/profiler";
 import { contiguousStrides, sizeOf } from "../core/shape";
+import { executeNode } from "./executor-sequential";
 import {
   type FusionGroup,
   type groupToRecipe,
@@ -63,23 +64,8 @@ export function buildConsumerCount(nodes: LazyIRNode[]): Map<number, number> {
   return counts;
 }
 
-/** Execute a node: resolve backend, get inputs, run op, wrap result. */
-async function executeAndStoreNode(
-  node: LazyIRNode,
-  backend: Backend,
-): Promise<void> {
-  const nodeBackend = getBackend(node.device) ?? backend;
-  setProfileModule(node.module ?? "unknown");
-  const inputs = node.inputs.map((ref) => getInputStorage(ref, nodeBackend));
-  const backendInputs = inputs.map((s) => s.backendTensor);
-  const resultTensor = await executeOp(node, backendInputs, nodeBackend);
-  node.result = wrapResultAsStorage(
-    node.device,
-    resultTensor,
-    backendInputs,
-    inputs,
-  );
-}
+// Re-use executeNode from executor-sequential (identical logic)
+const executeAndStoreNode = executeNode;
 
 /** Collect final positions for a range of nodes. */
 function collectNodePositions(
