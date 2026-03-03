@@ -256,6 +256,7 @@ export async function executeReductionWithPreamble(
 
   let resultTensor: BackendTensor;
 
+  const { sumDimWithPreambleChain } = await import("../backend/webgpu/index");
   if (
     plan.preambleChain &&
     plan.chainOps &&
@@ -263,7 +264,6 @@ export async function executeReductionWithPreamble(
     plan.chainInputDtypes
   ) {
     // Multi-op chain path
-    const { sumDimWithPreambleChain } = await import("../backend/webgpu/index");
     const inputStorages = plan.chainInputRefs.map((ref) =>
       getInputStorage(ref, backend),
     );
@@ -276,12 +276,16 @@ export async function executeReductionWithPreamble(
     );
   } else {
     // Single-op path
-    const { sumDimWithPreamble } = await import("../backend/webgpu/index");
     const elemInputStorages = plan.preambleNode.inputs.map((ref) =>
       getInputStorage(ref, backend),
     );
     const elemInputTensors = elemInputStorages.map((s) => s.backendTensor);
-    resultTensor = sumDimWithPreamble(elemInputTensors, plan.op, payload ?? {});
+    resultTensor = sumDimWithPreambleChain(
+      elemInputTensors,
+      [{ op: plan.op, arity: elemInputTensors.length }],
+      [],
+      payload ?? {},
+    );
   }
 
   // If this is a mean, divide by reduction size
