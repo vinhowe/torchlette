@@ -60,6 +60,20 @@ function materializeSegmentInputs(
 // Sequential Plan Execution
 // ============================================================================
 
+/** Execute a single node: resolve inputs → dispatch op → store result. */
+async function executeNode(node: LazyIRNode, backend: Backend): Promise<void> {
+  const nodeBackend = getBackend(node.device) ?? backend;
+  const inputs = node.inputs.map((ref) => getInputStorage(ref, nodeBackend));
+  const backendInputs = inputs.map((s) => s.backendTensor);
+  const resultTensor = await executeOp(node, backendInputs, nodeBackend);
+  node.result = wrapResultAsStorage(
+    node.device,
+    resultTensor,
+    backendInputs,
+    inputs,
+  );
+}
+
 export async function executePlan(
   plan: ExecutionPlan,
   backend: Backend,
@@ -108,21 +122,7 @@ export async function executePlan(
       // Skip nodes that already have results (from a prior plan execution within this step).
       if (node.result) continue;
 
-      // For multi-device graphs, use the node's device backend
-      const nodeBackend = getBackend(node.device) ?? backend;
-
-      const inputs = node.inputs.map((ref) =>
-        getInputStorage(ref, nodeBackend),
-      );
-      const backendInputs = inputs.map((s) => s.backendTensor);
-
-      const resultTensor = await executeOp(node, backendInputs, nodeBackend);
-      node.result = wrapResultAsStorage(
-        node.device,
-        resultTensor,
-        backendInputs,
-        inputs,
-      );
+      await executeNode(node, backend);
 
       // Track storage for early release
       if (options?.enableEarlyRelease) {
@@ -230,25 +230,9 @@ export async function executePlanSegmented(
         const nodeToStorage = new Map<number, StorageHandle>();
 
         for (const node of segment.nodes) {
-          const nodeBackend = getBackend(node.device) ?? backend;
-          const inputs = node.inputs.map((ref) =>
-            getInputStorage(ref, nodeBackend),
-          );
-          const backendInputs = inputs.map((s) => s.backendTensor);
-
-          const resultTensor = await executeOp(
-            node,
-            backendInputs,
-            nodeBackend,
-          );
-          node.result = wrapResultAsStorage(
-            node.device,
-            resultTensor,
-            backendInputs,
-            inputs,
-          );
-          nodeToStorage.set(node.id, node.result);
-          materializedStorages.set(node.id, node.result);
+          await executeNode(node, backend);
+          nodeToStorage.set(node.id, node.result!);
+          materializedStorages.set(node.id, node.result!);
         }
 
         await endBatchExecution();

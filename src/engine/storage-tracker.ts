@@ -82,6 +82,42 @@ class StorageTracker {
     this.tensorWeakRefs.delete(storageId);
   }
 
+  /** Find base storage IDs transitively needed by reachable view storages. */
+  private findNeededByViews(): Set<number> {
+    const neededByViews = new Set<number>();
+    const worklist = [...this.externallyReachable];
+    while (worklist.length > 0) {
+      const id = worklist.pop() as number;
+      const storage = this.allStorages.get(id);
+      if (
+        storage?.baseStorageId !== undefined &&
+        !neededByViews.has(storage.baseStorageId)
+      ) {
+        neededByViews.add(storage.baseStorageId);
+        worklist.push(storage.baseStorageId);
+      }
+    }
+    return neededByViews;
+  }
+
+  /** Destroy a list of storage IDs and return the count destroyed. */
+  private destroyStorageIds(ids: number[]): number {
+    let count = 0;
+    for (const id of ids) {
+      const storage = this.allStorages.get(id);
+      if (storage) {
+        const tensor = storage.backendTensor;
+        if (tensor.ownsBuffer !== false && tensor.destroy) {
+          tensor.destroy();
+        }
+        this.allStorages.delete(id);
+        count++;
+        this._debugDestroyCount++;
+      }
+    }
+    return count;
+  }
+
   /**
    * Destroy all unreachable storages (called at markStep after GPU fence).
    * Returns the number of storages destroyed.
@@ -91,9 +127,7 @@ class StorageTracker {
    * Base storages that are needed by reachable views are kept alive.
    */
   destroyUnreachable(): number {
-    let destroyedCount = 0;
-
-    // Step 0: Check WeakRefs — if the owning tensor was GC'd, demote to unreachable
+    // Check WeakRefs — if the owning tensor was GC'd, demote to unreachable
     for (const [id, ref] of this.tensorWeakRefs) {
       if (ref.deref() === undefined) {
         this.externallyReachable.delete(id);
@@ -110,23 +144,9 @@ class StorageTracker {
       return 0;
     }
 
-    // Step 1: Find all base storage IDs transitively needed by reachable view storages
-    // If A is a view of B, and B is a view of C, then both B and C must stay alive
-    const neededByViews = new Set<number>();
-    const worklist = [...this.externallyReachable];
-    while (worklist.length > 0) {
-      const id = worklist.pop() as number;
-      const storage = this.allStorages.get(id);
-      if (
-        storage?.baseStorageId !== undefined &&
-        !neededByViews.has(storage.baseStorageId)
-      ) {
-        neededByViews.add(storage.baseStorageId);
-        worklist.push(storage.baseStorageId);
-      }
-    }
+    const neededByViews = this.findNeededByViews();
 
-    // Step 2: Collect storages to destroy (unreachable and not needed by views)
+    // Collect storages to destroy (unreachable and not needed by views)
     const toDestroy: number[] = [];
     for (const [id] of this.allStorages) {
       if (!this.externallyReachable.has(id) && !neededByViews.has(id)) {
@@ -137,24 +157,7 @@ class StorageTracker {
     // Clear the recently unreachable set since we've scanned everything
     this.recentlyUnreachable.clear();
 
-    // Step 3: Destroy collected storages
-    for (const id of toDestroy) {
-      const storage = this.allStorages.get(id);
-      if (storage) {
-        // Check if the backend tensor owns its buffer (not a view)
-        const tensor = storage.backendTensor;
-
-        // Only destroy if the tensor owns its buffer
-        if (tensor.ownsBuffer !== false && tensor.destroy) {
-          tensor.destroy();
-        }
-        this.allStorages.delete(id);
-        destroyedCount++;
-        this._debugDestroyCount++;
-      }
-    }
-
-    return destroyedCount;
+    return this.destroyStorageIds(toDestroy);
   }
 
   /**
@@ -173,24 +176,8 @@ class StorageTracker {
    * Returns the number of storages destroyed.
    */
   destroyUnreachableSince(sinceId: number): number {
-    let destroyedCount = 0;
+    const neededByViews = this.findNeededByViews();
 
-    // Step 1: Find all base storage IDs transitively needed by reachable view storages
-    const neededByViews = new Set<number>();
-    const worklist = [...this.externallyReachable];
-    while (worklist.length > 0) {
-      const id = worklist.pop() as number;
-      const storage = this.allStorages.get(id);
-      if (
-        storage?.baseStorageId !== undefined &&
-        !neededByViews.has(storage.baseStorageId)
-      ) {
-        neededByViews.add(storage.baseStorageId);
-        worklist.push(storage.baseStorageId);
-      }
-    }
-
-    // Step 2: Collect storages to destroy (unreachable, not needed by views, created since sinceId)
     const toDestroy: number[] = [];
     for (const [id] of this.allStorages) {
       if (
@@ -202,21 +189,7 @@ class StorageTracker {
       }
     }
 
-    // Step 3: Destroy collected storages
-    for (const id of toDestroy) {
-      const storage = this.allStorages.get(id);
-      if (storage) {
-        const tensor = storage.backendTensor;
-        if (tensor.ownsBuffer !== false && tensor.destroy) {
-          tensor.destroy();
-        }
-        this.allStorages.delete(id);
-        destroyedCount++;
-        this._debugDestroyCount++;
-      }
-    }
-
-    return destroyedCount;
+    return this.destroyStorageIds(toDestroy);
   }
 
   /**
