@@ -911,7 +911,7 @@ export async function executeLoweredPlan(
           };
 
           await withProfileContext(epLabel, matmulNode.module, () =>
-            executeMatmulWithEpilogue(matmulNode, epiloguePlan, backend),
+            executeMatmulWithEpilogue(matmulNode, epiloguePlan),
           );
 
           // ── Cache dispatch config for next step ──

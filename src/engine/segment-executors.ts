@@ -551,7 +551,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
             "",
           );
           await withProfileContext(epLabel, node.module, () =>
-            executeMatmulWithEpilogue(node, epiloguePlan, backend),
+            executeMatmulWithEpilogue(node, epiloguePlan),
           );
 
           advanceConsumed(nodeIdx, epiloguePlan.consumedCount);
