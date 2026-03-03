@@ -89,6 +89,46 @@ type AdamStepFn = NonNullable<
 >;
 
 /**
+ * Walk a chain of binary ops (add/mul), returning the external (non-chain) input ref
+ * at each step. `prevId` is the ID of the node feeding into chainNodes[0].
+ */
+function collectEpilogueExternalRefs(
+  chainNodes: LazyIRNode[],
+  prevId: number,
+): LazyRef[] {
+  const refs: LazyRef[] = [];
+  for (let ci = 0; ci < chainNodes.length; ci++) {
+    const node = chainNodes[ci];
+    if ((node.op === "add" || node.op === "mul") && node.inputs.length === 2) {
+      const prev = ci === 0 ? prevId : chainNodes[ci - 1].id;
+      const inp0IsChain =
+        node.inputs[0].kind === "pending" && node.inputs[0].node.id === prev;
+      refs.push(node.inputs[inp0IsChain ? 1 : 0]);
+    }
+  }
+  return refs;
+}
+
+/**
+ * Collect external input refs from a preamble chain: all inputs of the first node
+ * are external; for subsequent binary nodes, the non-chain input is external.
+ */
+function collectPreambleExternalRefs(chainNodes: LazyIRNode[]): LazyRef[] {
+  const refs: LazyRef[] = [];
+  for (const ref of chainNodes[0].inputs) refs.push(ref);
+  for (let ci = 1; ci < chainNodes.length; ci++) {
+    const node = chainNodes[ci];
+    if (node.inputs.length === 2) {
+      const inp0IsChain =
+        node.inputs[0].kind === "pending" &&
+        node.inputs[0].node === chainNodes[ci - 1];
+      refs.push(node.inputs[inp0IsChain ? 1 : 0]);
+    }
+  }
+  return refs;
+}
+
+/**
  * Execute a batch of adamStep nodes using a direct adamOp call (bypasses executeOp switch).
  * Shared by both the lowered-plan replay path and the normal lowered plan execution path.
  */
@@ -1004,23 +1044,7 @@ export async function executeLoweredPlan(
           ) {
             // Multi-op chain replay: reconstruct external input refs
             const chainNodes = action.chainNodeIndices.map((i) => planNodes[i]);
-            const externalInputRefs: import("./lazy").LazyRef[] = [];
-
-            // First chain node: all inputs are external
-            for (const ref of chainNodes[0].inputs) {
-              externalInputRefs.push(ref);
-            }
-            // Subsequent chain nodes: non-chain inputs are external
-            for (let ci = 1; ci < chainNodes.length; ci++) {
-              const node = chainNodes[ci];
-              const prevNode = chainNodes[ci - 1];
-              if (node.inputs.length === 2) {
-                const inp0IsChain =
-                  node.inputs[0].kind === "pending" &&
-                  node.inputs[0].node === prevNode;
-                externalInputRefs.push(node.inputs[inp0IsChain ? 1 : 0]);
-              }
-            }
+            const externalInputRefs = collectPreambleExternalRefs(chainNodes);
 
             reductionPlan = {
               preambleNode,
@@ -1074,24 +1098,13 @@ export async function executeLoweredPlan(
           const reOutputNode = planNodes[action.outputNodeIndex];
 
           // Reconstruct epilogue input refs by chain-walking covered nodes.
-          // For binary ops in the epilogue chain, the external input is the one
-          // that doesn't point to the previous chain node.
-          const reEpilogueInputRefs: import("./lazy").LazyRef[] = [];
-          for (let ci = 1; ci < action.coveredNodeIndices.length; ci++) {
-            const chainNode = planNodes[action.coveredNodeIndices[ci]];
-            if (
-              (chainNode.op === "add" || chainNode.op === "mul") &&
-              chainNode.inputs.length === 2
-            ) {
-              const prevChainNodeId =
-                planNodes[action.coveredNodeIndices[ci - 1]].id;
-              const inp0IsChain =
-                chainNode.inputs[0].kind === "pending" &&
-                chainNode.inputs[0].node.id === prevChainNodeId;
-              const externalIdx = inp0IsChain ? 1 : 0;
-              reEpilogueInputRefs.push(chainNode.inputs[externalIdx]);
-            }
-          }
+          const reEpilogueChainNodes = action.coveredNodeIndices
+            .slice(1)
+            .map((i) => planNodes[i]);
+          const reEpilogueInputRefs = collectEpilogueExternalRefs(
+            reEpilogueChainNodes,
+            planNodes[action.coveredNodeIndices[0]].id,
+          );
 
           const reEpiloguePlan: ReductionEpiloguePlan = {
             reductionNode: reNode,
@@ -1138,45 +1151,18 @@ export async function executeLoweredPlan(
           const rfPreambleNodes = action.preambleNodeIndices.map(
             (i) => planNodes[i],
           );
-          const rfPreambleInputRefs: import("./lazy").LazyRef[] = [];
-
-          // First preamble node: all inputs are external
-          for (const ref of rfPreambleNodes[0].inputs) {
-            rfPreambleInputRefs.push(ref);
-          }
-          // Subsequent preamble nodes: non-chain inputs are external
-          for (let ci = 1; ci < rfPreambleNodes.length; ci++) {
-            const node = rfPreambleNodes[ci];
-            const prevNode = rfPreambleNodes[ci - 1];
-            if (node.inputs.length === 2) {
-              const inp0IsChain =
-                node.inputs[0].kind === "pending" &&
-                node.inputs[0].node === prevNode;
-              rfPreambleInputRefs.push(node.inputs[inp0IsChain ? 1 : 0]);
-            }
-          }
+          const rfPreambleInputRefs =
+            collectPreambleExternalRefs(rfPreambleNodes);
 
           // Reconstruct epilogue input refs by walking epilogue chain nodes
           const rfReductionNode = planNodes[action.reductionNodeIndex];
           const rfEpilogueNodes = action.epilogueNodeIndices.map(
             (i) => planNodes[i],
           );
-          const rfEpilogueInputRefs: import("./lazy").LazyRef[] = [];
-          for (let ci = 0; ci < rfEpilogueNodes.length; ci++) {
-            const chainNode = rfEpilogueNodes[ci];
-            if (
-              (chainNode.op === "add" || chainNode.op === "mul") &&
-              chainNode.inputs.length === 2
-            ) {
-              const prevNodeId =
-                ci === 0 ? rfReductionNode.id : rfEpilogueNodes[ci - 1].id;
-              const inp0IsChain =
-                chainNode.inputs[0].kind === "pending" &&
-                chainNode.inputs[0].node.id === prevNodeId;
-              const externalIdx = inp0IsChain ? 1 : 0;
-              rfEpilogueInputRefs.push(chainNode.inputs[externalIdx]);
-            }
-          }
+          const rfEpilogueInputRefs = collectEpilogueExternalRefs(
+            rfEpilogueNodes,
+            rfReductionNode.id,
+          );
 
           const rfFusionPlan: ReductionFusionPlan = {
             preambleChain: rfPreambleNodes,
