@@ -101,10 +101,7 @@ class SimpleBufferPool {
       releaseToPool: this.releaseToPool,
       releaseToDestroy: this.releaseToDestroy,
       pendingReleaseCount: this.pendingRelease.length,
-      pendingReleaseBytes: this.pendingRelease.reduce(
-        (sum, p) => sum + p.size,
-        0,
-      ),
+      pendingReleaseBytes: this.pendingReleaseBytes,
     };
   }
 
@@ -286,27 +283,6 @@ class SimpleBufferPool {
     }
   }
 
-  /**
-   * Pre-warm the pool by creating buffers for size classes that had misses last step.
-   * Call at the start of each step (before opening the shared encoder).
-   */
-  prewarm(device: GPUDevice): void {
-    for (const [sizeClass, count] of this.newAllocsByClass) {
-      const size = getSizeForClass(sizeClass);
-      for (let i = 0; i < count; i++) {
-        if (
-          this.pooledBytes + this.pendingReleaseBytes + size >
-          this.maxPoolBytes
-        )
-          break;
-        const buf = device.createBuffer({ size, usage: STORAGE_BUFFER_USAGE });
-        this.getBucket(sizeClass).push(buf);
-        this.pooledBytes += size;
-      }
-    }
-    this.newAllocsByClass.clear();
-  }
-
   /** Start recording window demand for this step. */
   beginWindowTracking(): void {
     this.windowTracking = true;
@@ -371,17 +347,16 @@ class SimpleBufferPool {
    * Replaces prewarm() — call at beginStep() BEFORE opening shared encoder.
    */
   reserve(device: GPUDevice): void {
-    if (!this.reservation) {
-      // No reservation yet (step 0): fall back to prewarm
-      this.prewarm(device);
-      return;
-    }
+    // Iterate either the window-based reservation (step 1+) or the
+    // new-allocs-by-class map (step 0 prewarm fallback).
+    const source: Iterable<[number, number]> =
+      this.reservation ?? this.newAllocsByClass;
 
-    for (const [sizeClass, needed] of this.reservation) {
+    for (const [sizeClass, needed] of source) {
       const size = getSizeForClass(sizeClass);
-      const bucket = this.pool.get(sizeClass);
-      const have = bucket?.length ?? 0;
-      const deficit = needed - have;
+      const deficit = this.reservation
+        ? needed - (this.pool.get(sizeClass)?.length ?? 0)
+        : needed;
       if (deficit <= 0) continue;
 
       for (let i = 0; i < deficit; i++) {
@@ -458,9 +433,6 @@ class SimpleBufferPool {
       );
     }
 
-    // Schedule fence if we have a queue and no pending fence
-    this.scheduleFence();
-
     return true;
   }
 
@@ -489,7 +461,6 @@ class SimpleBufferPool {
       return;
     }
     this.pendingDestroy.push({ buffer, size });
-    this.scheduleFence();
   }
 
   /**
@@ -500,39 +471,11 @@ class SimpleBufferPool {
     // Replay-pinned buffers are referenced by recorded bind groups — never destroy.
     if (replayPinnedBufferSet?.has(buffer)) return;
     // When batching, command buffers haven't been submitted yet.
-    // scheduleFence()'s onSubmittedWorkDone would resolve before the batch submits,
-    // destroying the buffer while it's still referenced by collected command buffers.
     if (activeBatch) {
       activeBatch.deferredDestroyBuffers.push(buffer);
       return;
     }
     this.pendingDestroy.push({ buffer, size: 0 });
-    this.scheduleFence();
-  }
-
-  /**
-   * Schedule a fence to move pending buffers to the pool.
-   * Uses onSubmittedWorkDone to wait for GPU completion.
-   *
-   * IMPORTANT: We snapshot the current pending arrays at fence creation time.
-   * The fence's onSubmittedWorkDone() only covers GPU work submitted BEFORE the
-   * fence was created. Buffers added to pending AFTER the fence was created may
-   * still have in-flight GPU work, so they must NOT be processed by this fence.
-   * They'll be handled by a subsequent fence.
-   */
-  private scheduleFence(): void {
-    // Don't use async onSubmittedWorkDone() fences - they fire at unpredictable
-    // times via microtask queue and cause "buffer destroyed while in use" errors
-    // when the fence callback destroys a buffer still referenced by pending GPU work.
-    //
-    // Instead, buffers stay in pendingRelease/pendingDestroy and are only processed:
-    // 1. pendingRelease: acquire() can reuse them immediately (safe because WebGPU
-    //    guarantees submission-order execution between queue.submit calls)
-    // 2. pendingDestroy: processed at explicit sync points (waitAndFlushPending,
-    //    markStep, or read()) where we know GPU work is complete
-    //
-    // This trades slightly higher memory usage for correctness.
-    return;
   }
 
   /**
@@ -778,15 +721,9 @@ class SimpleBufferPool {
    * Get bytes in pending queues (not yet safe to destroy).
    */
   getPendingBytes(): number {
-    const pendingReleaseBytes = this.pendingRelease.reduce(
-      (sum, p) => sum + p.size,
-      0,
-    );
-    const pendingDestroyBytes = this.pendingDestroy.reduce(
-      (sum, p) => sum + p.size,
-      0,
-    );
-    return pendingReleaseBytes + pendingDestroyBytes;
+    let destroyBytes = 0;
+    for (const p of this.pendingDestroy) destroyBytes += p.size;
+    return this.pendingReleaseBytes + destroyBytes;
   }
 
   /**
