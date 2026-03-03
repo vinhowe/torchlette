@@ -16,35 +16,39 @@ import type {
 import { createPendingRef, type LazyRef } from "../engine/lazy-types";
 import { createLazyIRNode } from "../engine/node-factory";
 
-interface FusedOpResult {
+export interface FusedOpResult {
   ref: LazyRef;
   shape: number[];
 }
 
-/**
- * Fused cross-entropy forward: logits [B,V] + targets [B] → per-sample loss [B].
- */
+/** Create a fused op node and return its pending ref + output shape. */
+function makeFusedOp(
+  op: string,
+  inputs: LazyRef[],
+  shape: number[],
+  device: DeviceKind,
+  config?: unknown,
+): FusedOpResult {
+  const node = createLazyIRNode(op, inputs, shape, "f32", device, config);
+  return { ref: createPendingRef(node), shape };
+}
+
+// Cross-entropy
 export function fusedCrossEntropyForwardOp(
   logitsRef: LazyRef,
   targetsRef: LazyRef,
   device: DeviceKind,
   config: FusedCrossEntropyConfig,
 ): FusedOpResult {
-  const shape = [config.batchSize];
-  const node = createLazyIRNode(
+  return makeFusedOp(
     "fusedCrossEntropyForward",
     [logitsRef, targetsRef],
-    shape,
-    "f32",
+    [config.batchSize],
     device,
     config,
   );
-  return { ref: createPendingRef(node), shape };
 }
 
-/**
- * Fused cross-entropy backward: logits [B,V] + targets [B] + grad [B] → grad_logits [B,V].
- */
 export function fusedCrossEntropyBackwardOp(
   logitsRef: LazyRef,
   targetsRef: LazyRef,
@@ -52,21 +56,16 @@ export function fusedCrossEntropyBackwardOp(
   device: DeviceKind,
   config: FusedCrossEntropyConfig,
 ): FusedOpResult {
-  const shape = [config.batchSize, config.vocabSize];
-  const node = createLazyIRNode(
+  return makeFusedOp(
     "fusedCrossEntropyBackward",
     [logitsRef, targetsRef, gradOutputRef],
-    shape,
-    "f32",
+    [config.batchSize, config.vocabSize],
     device,
     config,
   );
-  return { ref: createPendingRef(node), shape };
 }
 
-/**
- * Fused LayerNorm forward: x [N,D] + weight [D] + bias [D] → output [N,D].
- */
+// LayerNorm
 export function fusedLayerNormForwardOp(
   xRef: LazyRef,
   weightRef: LazyRef,
@@ -75,21 +74,15 @@ export function fusedLayerNormForwardOp(
   device: DeviceKind,
   config: FusedLayerNormConfig,
 ): FusedOpResult {
-  const shape = xShape.slice();
-  const node = createLazyIRNode(
+  return makeFusedOp(
     "fusedLayerNormForward",
     [xRef, weightRef, biasRef],
-    shape,
-    "f32",
+    xShape.slice(),
     device,
     config,
   );
-  return { ref: createPendingRef(node), shape };
 }
 
-/**
- * Fused LayerNorm backward gradX: grad [N,D] + x [N,D] + weight [D] → gradX [N,D].
- */
 export function fusedLayerNormBackwardGradXOp(
   gradOutputRef: LazyRef,
   xRef: LazyRef,
@@ -98,44 +91,31 @@ export function fusedLayerNormBackwardGradXOp(
   device: DeviceKind,
   config: FusedLayerNormConfig,
 ): FusedOpResult {
-  const shape = xShape.slice();
-  const node = createLazyIRNode(
+  return makeFusedOp(
     "fusedLayerNormBackwardGradX",
     [gradOutputRef, xRef, weightRef],
-    shape,
-    "f32",
+    xShape.slice(),
     device,
     config,
   );
-  return { ref: createPendingRef(node), shape };
 }
 
-/**
- * Fused LayerNorm backward gradWeight+gradBias.
- * Returns gradWeight as main output. gradBias extracted via extractLnBwdGradBiasOp.
- */
 export function fusedLayerNormBackwardGradWeightBiasOp(
   gradOutputRef: LazyRef,
   xRef: LazyRef,
   device: DeviceKind,
   config: FusedLayerNormConfig,
 ): FusedOpResult {
-  const shape = [config.featureDim];
-  const node = createLazyIRNode(
+  return makeFusedOp(
     "fusedLayerNormBackwardGradWeightBias",
     [gradOutputRef, xRef],
-    shape,
-    "f32",
+    [config.featureDim],
     device,
     config,
   );
-  return { ref: createPendingRef(node), shape };
 }
 
-/**
- * Fused attention forward: Q,K,V [B,H,N,D] → O [B,H,N,D].
- * Logsumexp is extracted via extractAttentionLogsumexpOp.
- */
+// Attention
 export function fusedAttentionForwardOp(
   qRef: LazyRef,
   kRef: LazyRef,
@@ -143,46 +123,28 @@ export function fusedAttentionForwardOp(
   device: DeviceKind,
   config: FusedAttentionConfig,
 ): FusedOpResult {
-  const shape = [
-    config.batchSize,
-    config.numHeads,
-    config.seqLen,
-    config.headDim,
-  ];
-  const node = createLazyIRNode(
+  return makeFusedOp(
     "fusedAttentionForward",
     [qRef, kRef, vRef],
-    shape,
-    "f32",
+    [config.batchSize, config.numHeads, config.seqLen, config.headDim],
     device,
     config,
   );
-  return { ref: createPendingRef(node), shape };
 }
 
-/**
- * Extract logsumexp side output [B,H,N] from fusedAttentionForward.
- */
 export function extractAttentionLogsumexpOp(
   fwdOutputRef: LazyRef,
   device: DeviceKind,
   config: FusedAttentionConfig,
 ): FusedOpResult {
-  const shape = [config.batchSize, config.numHeads, config.seqLen];
-  const node = createLazyIRNode(
+  return makeFusedOp(
     "extractAttentionLogsumexp",
     [fwdOutputRef],
-    shape,
-    "f32",
+    [config.batchSize, config.numHeads, config.seqLen],
     device,
   );
-  return { ref: createPendingRef(node), shape };
 }
 
-/**
- * Fused attention backward: Q,K,V,L,dO,O → dQ [B,H,N,D].
- * dK and dV are extracted via extractAttentionDKOp/DVOp.
- */
 export function fusedAttentionBackwardOp(
   qRef: LazyRef,
   kRef: LazyRef,
@@ -193,74 +155,42 @@ export function fusedAttentionBackwardOp(
   device: DeviceKind,
   config: FusedAttentionConfig,
 ): FusedOpResult {
-  const shape = [
-    config.batchSize,
-    config.numHeads,
-    config.seqLen,
-    config.headDim,
-  ];
-  const node = createLazyIRNode(
+  return makeFusedOp(
     "fusedAttentionBackward",
     [qRef, kRef, vRef, logsumexpRef, dORef, outputRef],
-    shape,
-    "f32",
+    [config.batchSize, config.numHeads, config.seqLen, config.headDim],
     device,
     config,
   );
-  return { ref: createPendingRef(node), shape };
 }
 
-/**
- * Extract dK side output from fusedAttentionBackward.
- */
 export function extractAttentionDKOp(
   bwdDQRef: LazyRef,
   device: DeviceKind,
   config: FusedAttentionConfig,
 ): FusedOpResult {
-  const shape = [
-    config.batchSize,
-    config.numHeads,
-    config.seqLen,
-    config.headDim,
-  ];
-  const node = createLazyIRNode(
+  return makeFusedOp(
     "extractAttentionDK",
     [bwdDQRef],
-    shape,
-    "f32",
+    [config.batchSize, config.numHeads, config.seqLen, config.headDim],
     device,
   );
-  return { ref: createPendingRef(node), shape };
 }
 
-/**
- * Extract dV side output from fusedAttentionBackward.
- */
 export function extractAttentionDVOp(
   bwdDQRef: LazyRef,
   device: DeviceKind,
   config: FusedAttentionConfig,
 ): FusedOpResult {
-  const shape = [
-    config.batchSize,
-    config.numHeads,
-    config.seqLen,
-    config.headDim,
-  ];
-  const node = createLazyIRNode(
+  return makeFusedOp(
     "extractAttentionDV",
     [bwdDQRef],
-    shape,
-    "f32",
+    [config.batchSize, config.numHeads, config.seqLen, config.headDim],
     device,
   );
-  return { ref: createPendingRef(node), shape };
 }
 
-/**
- * Fused RMSNorm forward: x [N,D] + weight [D] → output [N,D].
- */
+// RMSNorm
 export function fusedRMSNormForwardOp(
   xRef: LazyRef,
   weightRef: LazyRef,
@@ -268,21 +198,15 @@ export function fusedRMSNormForwardOp(
   device: DeviceKind,
   config: FusedRMSNormConfig,
 ): FusedOpResult {
-  const shape = xShape.slice();
-  const node = createLazyIRNode(
+  return makeFusedOp(
     "fusedRMSNormForward",
     [xRef, weightRef],
-    shape,
-    "f32",
+    xShape.slice(),
     device,
     config,
   );
-  return { ref: createPendingRef(node), shape };
 }
 
-/**
- * Fused RMSNorm backward gradX: grad [N,D] + x [N,D] + weight [D] → gradX [N,D].
- */
 export function fusedRMSNormBackwardGradXOp(
   gradOutputRef: LazyRef,
   xRef: LazyRef,
@@ -291,21 +215,15 @@ export function fusedRMSNormBackwardGradXOp(
   device: DeviceKind,
   config: FusedRMSNormConfig,
 ): FusedOpResult {
-  const shape = xShape.slice();
-  const node = createLazyIRNode(
+  return makeFusedOp(
     "fusedRMSNormBackwardGradX",
     [gradOutputRef, xRef, weightRef],
-    shape,
-    "f32",
+    xShape.slice(),
     device,
     config,
   );
-  return { ref: createPendingRef(node), shape };
 }
 
-/**
- * Fused RMSNorm backward gradWeight: grad [N,D] + x [N,D] + weight [D] → gradWeight [D].
- */
 export function fusedRMSNormBackwardGradWeightOp(
   gradOutputRef: LazyRef,
   xRef: LazyRef,
@@ -313,34 +231,26 @@ export function fusedRMSNormBackwardGradWeightOp(
   device: DeviceKind,
   config: FusedRMSNormConfig,
 ): FusedOpResult {
-  const shape = [config.featureDim];
-  const node = createLazyIRNode(
+  return makeFusedOp(
     "fusedRMSNormBackwardGradWeight",
     [gradOutputRef, xRef, weightRef],
-    shape,
-    "f32",
+    [config.featureDim],
     device,
     config,
   );
-  return { ref: createPendingRef(node), shape };
 }
 
-/**
- * Extract the gradBias side output from a fusedLayerNormBackwardGradWeightBias node.
- */
+// LayerNorm side output extraction
 export function extractLnBwdGradBiasOp(
   gradWeightRef: LazyRef,
   device: DeviceKind,
   featureDim: number,
 ): FusedOpResult {
-  const shape = [featureDim];
-  const node = createLazyIRNode(
+  return makeFusedOp(
     "extractLnBwdGradBias",
     [gradWeightRef],
-    shape,
-    "f32",
+    [featureDim],
     device,
     { featureDim },
   );
-  return { ref: createPendingRef(node), shape };
 }

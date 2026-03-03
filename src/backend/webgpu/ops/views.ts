@@ -685,49 +685,26 @@ export function narrowBackward(
 
 /**
  * Transpose returns a VIEW - no data copy, just metadata change.
- * The returned tensor shares the same buffer but with swapped strides.
+ * Delegates to permute with swapped dimension indices.
  */
 export function transpose(
   a: BackendTensor,
   options: TransposeOptions,
 ): BackendTensor {
-  const tensor = asGPUTensor(a);
   const { dim0, dim1 } = options;
-  const inputShape = tensor.shape;
-  const rank = inputShape.length;
-
+  const rank = (a as WebGPUTensor).shape.length;
   if (dim0 < 0 || dim0 >= rank || dim1 < 0 || dim1 >= rank) {
     throw new Error("transpose: dimension out of range");
   }
-
-  // Swap shape dimensions
-  const outShape = inputShape.slice();
-  outShape[dim0] = inputShape[dim1];
-  outShape[dim1] = inputShape[dim0];
-
-  // Swap strides - this is the key to view-based transpose
-  const outStrides = tensor.strides.slice();
-  outStrides[dim0] = tensor.strides[dim1];
-  outStrides[dim1] = tensor.strides[dim0];
-
-  // Return a view sharing the same buffer
-  // Note: createTensor will correctly compute isContiguous=false for transposed strides
-  // View - does not own the buffer
-  return createTensor(
-    outShape,
-    tensor.buffer,
-    outStrides,
-    tensor.offset,
-    tensor.dtype,
-    false,
-  );
+  const dims = Array.from({ length: rank }, (_, i) => i);
+  dims[dim0] = dim1;
+  dims[dim1] = dim0;
+  return permute(a, dims);
 }
 
 /**
  * Permute dimensions according to the given order.
  * Returns a view sharing the same buffer (no data copy).
- *
- * Example: permute([2, 3, 4], [2, 0, 1]) -> [4, 2, 3]
  */
 export function permute(a: BackendTensor, dims: number[]): BackendTensor {
   const tensor = asGPUTensor(a);

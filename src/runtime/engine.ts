@@ -1118,18 +1118,20 @@ export class RuntimeEngine {
     return this._binaryOp("pow", a, b);
   }
 
-  view(a: Tensor, shape: number[]): Tensor {
-    return this.reshape(a, shape);
-  }
-
-  reshape(a: Tensor, shape: number[]): Tensor {
+  /** Create a view op node that shares baseId with the input tensor. */
+  private _viewOp(
+    op: LazyOpCode,
+    a: Tensor,
+    shape: number[],
+    payload?: unknown,
+  ): Tensor {
     const node = createLazyIRNode(
-      "reshape",
+      op,
       [a.lazyRef],
       shape,
       a.dtype,
       a.device,
-      { targetShape: shape },
+      payload,
     );
     return this.createAndTrack(
       a.baseId,
@@ -1138,6 +1140,14 @@ export class RuntimeEngine {
       a.device,
       a.dtype,
     );
+  }
+
+  view(a: Tensor, shape: number[]): Tensor {
+    return this.reshape(a, shape);
+  }
+
+  reshape(a: Tensor, shape: number[]): Tensor {
+    return this._viewOp("reshape", a, shape, { targetShape: shape });
   }
 
   matmul(a: Tensor, b: Tensor): Tensor {
@@ -1232,39 +1242,15 @@ export class RuntimeEngine {
   }
 
   expand(a: Tensor, shape: number[]): Tensor {
-    const node = createLazyIRNode(
-      "expand",
-      [a.lazyRef],
-      shape,
-      a.dtype,
-      a.device,
-      { targetShape: shape },
-    );
-    return this.createAndTrack(
-      a.baseId,
-      createPendingRef(node),
-      shape,
-      a.device,
-      a.dtype,
-    );
+    return this._viewOp("expand", a, shape, { targetShape: shape });
   }
 
   transpose(a: Tensor, options: TransposeOptions): Tensor {
-    const shape = transposeShape(a.shape, options);
-    const node = createLazyIRNode(
+    return this._viewOp(
       "transpose",
-      [a.lazyRef],
-      shape,
-      a.dtype,
-      a.device,
+      a,
+      transposeShape(a.shape, options),
       options,
-    );
-    return this.createAndTrack(
-      a.baseId,
-      createPendingRef(node),
-      shape,
-      a.device,
-      a.dtype,
     );
   }
 
@@ -1292,22 +1278,7 @@ export class RuntimeEngine {
     const normalizedDims = dims.map((d) => normalizeDim(d, rank));
     const shape = normalizedDims.map((d) => a.shape[d]);
 
-    const node = createLazyIRNode(
-      "permute",
-      [a.lazyRef],
-      shape,
-      a.dtype,
-      a.device,
-      { dims: normalizedDims },
-    );
-    // Permute shares baseId with input (it's a view)
-    return this.createAndTrack(
-      a.baseId,
-      createPendingRef(node),
-      shape,
-      a.device,
-      a.dtype,
-    );
+    return this._viewOp("permute", a, shape, { dims: normalizedDims });
   }
 
   contiguous(a: Tensor): Tensor {
@@ -1326,22 +1297,7 @@ export class RuntimeEngine {
     }
     const shape = a.shape.slice();
     shape[dim] = length;
-    const node = createLazyIRNode(
-      "narrow",
-      [a.lazyRef],
-      shape,
-      a.dtype,
-      a.device,
-      { dim, start, length },
-    );
-    // narrow is a view, shares baseId with input
-    return this.createAndTrack(
-      a.baseId,
-      createPendingRef(node),
-      shape,
-      a.device,
-      a.dtype,
-    );
+    return this._viewOp("narrow", a, shape, { dim, start, length });
   }
 
   narrowBackward(
