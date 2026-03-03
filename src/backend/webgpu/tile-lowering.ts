@@ -275,6 +275,31 @@ function shuffleXorNode(value: IRNode, mask: number): IRNode {
   } as IRNode;
 }
 
+/** Shorthand: forRange loop starting at 0. */
+function forRange0(
+  varName: string,
+  bound: IRNode,
+  body: Statement[],
+): Statement {
+  return { kind: "forRange", varName, start: cU32(0), bound, body };
+}
+
+/** Store to result: indexAddAssign if accumulating, indexAssign otherwise. */
+function storeResult(
+  body: Statement[],
+  accName: string | undefined,
+  arrayName: string,
+  idx: IRNode,
+  value: IRNode,
+): void {
+  body.push({
+    kind: accName ? "indexAddAssign" : "indexAssign",
+    arrayName,
+    idx,
+    value,
+  });
+}
+
 // ============================================================================
 // Reduction / Memory Helpers
 // ============================================================================
@@ -619,13 +644,7 @@ function lowerTileLoad(stmt: TileLoadStmt, spec: TileKernelSpec): Statement[] {
     body: ifBody,
   });
 
-  result.push({
-    kind: "forRange",
-    varName: iVar,
-    start: cU32(0),
-    bound: cU32(elemsPerThread),
-    body: loopBody,
-  });
+  result.push(forRange0(iVar, cU32(elemsPerThread), loopBody));
 
   return result;
 }
@@ -650,12 +669,8 @@ function lowerTileLoad1D(stmt: TileLoad1DStmt): Statement[] {
   });
 
   const tnVar = freshVar("tn");
-  result.push({
-    kind: "forRange",
-    varName: tnVar,
-    start: cU32(0),
-    bound: cU32(size),
-    body: [
+  result.push(
+    forRange0(tnVar, cU32(size), [
       {
         kind: "indexAssign",
         arrayName,
@@ -673,8 +688,8 @@ function lowerTileLoad1D(stmt: TileLoad1DStmt): Statement[] {
           ),
         ),
       },
-    ],
-  });
+    ]),
+  );
 
   return result;
 }
@@ -777,21 +792,11 @@ function lowerTileStore(
     body: ifBody,
   });
 
-  result.push({
-    kind: "forRange",
-    varName: tmVar,
-    start: cU32(0),
-    bound: cU32(threadTileM),
-    body: [
-      {
-        kind: "forRange",
-        varName: tnVar,
-        start: cU32(0),
-        bound: cU32(threadTileN),
-        body: innerBody,
-      },
-    ],
-  });
+  result.push(
+    forRange0(tmVar, cU32(threadTileM), [
+      forRange0(tnVar, cU32(threadTileN), innerBody),
+    ]),
+  );
 
   return result;
 }
@@ -821,20 +826,16 @@ function lowerBlockAlloc(stmt: BlockAllocStmt): Statement[] {
     const iVar = freshVar("fi");
     const fillVal: IRNode =
       elemType === "f32" ? cF32(initValue) : cU32(initValue);
-    result.push({
-      kind: "forRange",
-      varName: iVar,
-      start: cU32(0),
-      bound: cU32(size),
-      body: [
+    result.push(
+      forRange0(iVar, cU32(size), [
         {
           kind: "indexAssign",
           arrayName: name,
           idx: ref(iVar),
           value: fillVal,
         },
-      ],
-    });
+      ]),
+    );
   } else {
     // Zero-initialized
     result.push({
@@ -926,13 +927,7 @@ function lowerBlockLoadThread(
         });
       }
 
-      loadBody.push({
-        kind: "forRange",
-        varName: d4Var,
-        start: cU32(0),
-        bound: cU32(pCols / 4),
-        body: innerBody,
-      });
+      loadBody.push(forRange0(d4Var, cU32(pCols / 4), innerBody));
     } else {
       // Scalar path: for (d = 0; d < pCols; d++) { reg[d] = buf[base + d]; }
       const dVar = freshVar("d");
@@ -951,13 +946,7 @@ function lowerBlockLoadThread(
         value: loadExpr,
       });
 
-      loadBody.push({
-        kind: "forRange",
-        varName: dVar,
-        start: cU32(0),
-        bound: cU32(pCols),
-        body: innerBody,
-      });
+      loadBody.push(forRange0(dVar, cU32(pCols), innerBody));
     }
   } else {
     // Multiple rows: for (r = 0; r < rows; r++) for (d = 0; d < pCols; d++)
@@ -989,41 +978,25 @@ function lowerBlockLoadThread(
       value: loadExpr,
     });
 
-    loadBody.push({
-      kind: "forRange",
-      varName: rVar,
-      start: cU32(0),
-      bound: cU32(rows),
-      body: [
-        {
-          kind: "forRange",
-          varName: dVar,
-          start: cU32(0),
-          bound: cU32(pCols),
-          body: innerBody,
-        },
-      ],
-    });
+    loadBody.push(
+      forRange0(rVar, cU32(rows), [forRange0(dVar, cU32(pCols), innerBody)]),
+    );
   }
 
   if (guard) {
     // Guarded: if (guard) { load } else { zero-fill }
     const zeroBody: Statement[] = [];
     const zVar = freshVar("zi");
-    zeroBody.push({
-      kind: "forRange",
-      varName: zVar,
-      start: cU32(0),
-      bound: cU32(size),
-      body: [
+    zeroBody.push(
+      forRange0(zVar, cU32(size), [
         {
           kind: "indexAssign",
           arrayName: name,
           idx: ref(zVar),
           value: cF32(0),
         },
-      ],
-    });
+      ]),
+    );
     result.push({
       kind: "ifElse",
       condition: guard,
@@ -1111,30 +1084,20 @@ function lowerBlockStore(stmt: BlockStoreStmt): Statement[] {
         ),
       });
     }
-    storeBody.push({
-      kind: "forRange",
-      varName: d4Var,
-      start: cU32(0),
-      bound: cU32(pCols / 4),
-      body: innerBody,
-    });
+    storeBody.push(forRange0(d4Var, cU32(pCols / 4), innerBody));
   } else if (rows === 1) {
     // Scalar single row: for (d = 0; d < pCols; d++) { buf[base + d] = reg[d]; }
     const dVar = freshVar("sd");
-    storeBody.push({
-      kind: "forRange",
-      varName: dVar,
-      start: cU32(0),
-      bound: cU32(pCols),
-      body: [
+    storeBody.push(
+      forRange0(dVar, cU32(pCols), [
         {
           kind: "indexAssign",
           arrayName: binding,
           idx: binOp("add", effectiveBase, ref(dVar)),
           value: arrayRead(blockName, ref(dVar)),
         },
-      ],
-    });
+      ]),
+    );
   } else {
     // Multiple rows
     const rVar = freshVar("sr");
@@ -1143,31 +1106,21 @@ function lowerBlockStore(stmt: BlockStoreStmt): Statement[] {
     const effRowBase = isDistributed
       ? binOp("add", rowBase, binOp("mul", ref("_sub_idx"), cU32(pCols)))
       : rowBase;
-    storeBody.push({
-      kind: "forRange",
-      varName: rVar,
-      start: cU32(0),
-      bound: cU32(rows),
-      body: [
-        {
-          kind: "forRange",
-          varName: dVar,
-          start: cU32(0),
-          bound: cU32(pCols),
-          body: [
-            {
-              kind: "indexAssign",
-              arrayName: binding,
-              idx: binOp("add", effRowBase, ref(dVar)),
-              value: arrayRead(
-                blockName,
-                binOp("add", binOp("mul", ref(rVar), cU32(pCols)), ref(dVar)),
-              ),
-            },
-          ],
-        },
-      ],
-    });
+    storeBody.push(
+      forRange0(rVar, cU32(rows), [
+        forRange0(dVar, cU32(pCols), [
+          {
+            kind: "indexAssign",
+            arrayName: binding,
+            idx: binOp("add", effRowBase, ref(dVar)),
+            value: arrayRead(
+              blockName,
+              binOp("add", binOp("mul", ref(rVar), cU32(pCols)), ref(dVar)),
+            ),
+          },
+        ]),
+      ]),
+    );
   }
 
   if (guard) {
@@ -1270,12 +1223,8 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
     skipZeroInit: true,
   });
   const tmVar1 = freshVar("tm");
-  kkLoop.push({
-    kind: "forRange",
-    varName: tmVar1,
-    start: cU32(0),
-    bound: cU32(threadTileM),
-    body: [
+  kkLoop.push(
+    forRange0(tmVar1, cU32(threadTileM), [
       {
         kind: "indexAssign",
         arrayName: aValsName,
@@ -1297,8 +1246,8 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
           ),
         ),
       },
-    ],
-  });
+    ]),
+  );
 
   // Load b_vals from shared B: b_vals[tn] = B[kk * bSmemStride + thread_col*ttN + tn]
   const bValsName = freshVar("b_vals");
@@ -1310,12 +1259,8 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
     skipZeroInit: true,
   });
   const tnVar1 = freshVar("tn");
-  kkLoop.push({
-    kind: "forRange",
-    varName: tnVar1,
-    start: cU32(0),
-    bound: cU32(threadTileN),
-    body: [
+  kkLoop.push(
+    forRange0(tnVar1, cU32(threadTileN), [
       {
         kind: "indexAssign",
         arrayName: bValsName,
@@ -1333,52 +1278,36 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
           ),
         ),
       },
-    ],
-  });
+    ]),
+  );
 
   // Outer product: acc[tm*ttN + tn] += a_vals[tm] * b_vals[tn]
   const targetName = accName ?? resultName;
   const tmVar2 = freshVar("tm");
   const tnVar2 = freshVar("tn");
-  kkLoop.push({
-    kind: "forRange",
-    varName: tmVar2,
-    start: cU32(0),
-    bound: cU32(threadTileM),
-    body: [
-      {
-        kind: "forRange",
-        varName: tnVar2,
-        start: cU32(0),
-        bound: cU32(threadTileN),
-        body: [
-          {
-            kind: "indexAddAssign",
-            arrayName: targetName,
-            idx: binOp(
-              "add",
-              binOp("mul", ref(tmVar2), cU32(threadTileN)),
-              ref(tnVar2),
-            ),
-            value: binOp(
-              "mul",
-              arrayRead(aValsName, ref(tmVar2)),
-              arrayRead(bValsName, ref(tnVar2)),
-              "f32",
-            ),
-          },
-        ],
-      },
-    ],
-  });
+  kkLoop.push(
+    forRange0(tmVar2, cU32(threadTileM), [
+      forRange0(tnVar2, cU32(threadTileN), [
+        {
+          kind: "indexAddAssign",
+          arrayName: targetName,
+          idx: binOp(
+            "add",
+            binOp("mul", ref(tmVar2), cU32(threadTileN)),
+            ref(tnVar2),
+          ),
+          value: binOp(
+            "mul",
+            arrayRead(aValsName, ref(tmVar2)),
+            arrayRead(bValsName, ref(tnVar2)),
+            "f32",
+          ),
+        },
+      ]),
+    ]),
+  );
 
-  result.push({
-    kind: "forRange",
-    varName: kkVar,
-    start: cU32(0),
-    bound: cU32(innerDim),
-    body: kkLoop,
-  });
+  result.push(forRange0(kkVar, cU32(innerDim), kkLoop));
 
   // barrier() after shared memory use
   result.push({ kind: "barrier" });
@@ -1427,12 +1356,8 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
     if (useVec4) {
       // Vec4 path: partial inner loop over physInnerDim/4 vec4 dots
       const d4Var = freshVar("d4");
-      jBody.push({
-        kind: "forRange",
-        varName: d4Var,
-        start: cU32(0),
-        bound: cU32(physInnerDim / 4),
-        body: [
+      jBody.push(
+        forRange0(d4Var, cU32(physInnerDim / 4), [
           {
             kind: "addAssign",
             name: sVar,
@@ -1453,17 +1378,13 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
               ) as [IRNode, IRNode, IRNode, IRNode],
             ),
           },
-        ],
-      });
+        ]),
+      );
     } else {
       // Scalar path: for d in 0..physInnerDim
       const dVar = freshVar("d");
-      jBody.push({
-        kind: "forRange",
-        varName: dVar,
-        start: cU32(0),
-        bound: cU32(physInnerDim),
-        body: [
+      jBody.push(
+        forRange0(dVar, cU32(physInnerDim), [
           {
             kind: "addAssign",
             name: sVar,
@@ -1474,8 +1395,8 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
               "f32",
             ),
           },
-        ],
-      });
+        ]),
+      );
     }
 
     // Butterfly reduction across TPR threads (result becomes replicated)
@@ -1484,29 +1405,9 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
     }
 
     // Store to result (replicated — all TPR threads write same value)
-    if (accName) {
-      jBody.push({
-        kind: "indexAddAssign",
-        arrayName: resultName,
-        idx: ref(jVar),
-        value: ref(sVar, "f32"),
-      });
-    } else {
-      jBody.push({
-        kind: "indexAssign",
-        arrayName: resultName,
-        idx: ref(jVar),
-        value: ref(sVar, "f32"),
-      });
-    }
+    storeResult(jBody, accName, resultName, ref(jVar), ref(sVar, "f32"));
 
-    result.push({
-      kind: "forRange",
-      varName: jVar,
-      start: cU32(0),
-      bound: cU32(outCols),
-      body: jBody,
-    });
+    result.push(forRange0(jVar, cU32(outCols), jBody));
   } else {
     // Multi-row mode (general case — no TPR for multi-row)
     const rVar = freshVar("r");
@@ -1519,12 +1420,8 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
 
     if (useVec4) {
       const d4Var = freshVar("d4");
-      jBody.push({
-        kind: "forRange",
-        varName: d4Var,
-        start: cU32(0),
-        bound: cU32(innerDim / 4),
-        body: [
+      jBody.push(
+        forRange0(d4Var, cU32(innerDim / 4), [
           {
             kind: "addAssign",
             name: sVar,
@@ -1559,16 +1456,12 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
               ) as [IRNode, IRNode, IRNode, IRNode],
             ),
           },
-        ],
-      });
+        ]),
+      );
     } else {
       const dVar = freshVar("d");
-      jBody.push({
-        kind: "forRange",
-        varName: dVar,
-        start: cU32(0),
-        bound: cU32(innerDim),
-        body: [
+      jBody.push(
+        forRange0(dVar, cU32(innerDim), [
           {
             kind: "addAssign",
             name: sVar,
@@ -1585,8 +1478,8 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
               "f32",
             ),
           },
-        ],
-      });
+        ]),
+      );
     }
 
     const outIdx = binOp(
@@ -1594,35 +1487,9 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
       binOp("mul", ref(rVar), cU32(outCols)),
       ref(jVar),
     );
-    if (accName) {
-      jBody.push({
-        kind: "indexAddAssign",
-        arrayName: resultName,
-        idx: outIdx,
-        value: ref(sVar, "f32"),
-      });
-    } else {
-      jBody.push({
-        kind: "indexAssign",
-        arrayName: resultName,
-        idx: outIdx,
-        value: ref(sVar, "f32"),
-      });
-    }
-    rBody.push({
-      kind: "forRange",
-      varName: jVar,
-      start: cU32(0),
-      bound: cU32(outCols),
-      body: jBody,
-    });
-    result.push({
-      kind: "forRange",
-      varName: rVar,
-      start: cU32(0),
-      bound: cU32(aRows),
-      body: rBody,
-    });
+    storeResult(jBody, accName, resultName, outIdx, ref(sVar, "f32"));
+    rBody.push(forRange0(jVar, cU32(outCols), jBody));
+    result.push(forRange0(rVar, cU32(aRows), rBody));
   }
 
   return result;
@@ -1692,22 +1559,12 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
           ),
         });
       }
-      jBody.push({
-        kind: "forRange",
-        varName: d4Var,
-        start: cU32(0),
-        bound: cU32(physOutCols / 4),
-        body: d4Body,
-      });
+      jBody.push(forRange0(d4Var, cU32(physOutCols / 4), d4Body));
     } else {
       // Scalar path: for d in 0..physOutCols
       const dVar = freshVar("d");
-      jBody.push({
-        kind: "forRange",
-        varName: dVar,
-        start: cU32(0),
-        bound: cU32(physOutCols),
-        body: [
+      jBody.push(
+        forRange0(dVar, cU32(physOutCols), [
           {
             kind: "indexAddAssign",
             arrayName: resultName,
@@ -1719,17 +1576,11 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
               "f32",
             ),
           },
-        ],
-      });
+        ]),
+      );
     }
 
-    result.push({
-      kind: "forRange",
-      varName: jVar,
-      start: cU32(0),
-      bound: cU32(aCols),
-      body: jBody,
-    });
+    result.push(forRange0(jVar, cU32(aCols), jBody));
   } else {
     // Multi-row general case (no TPR for multi-row)
     const rVar = freshVar("r");
@@ -1748,12 +1599,8 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
         binOp("add", binOp("mul", ref(rVar), cU32(aCols)), ref(jVar)),
       ),
     });
-    jBody.push({
-      kind: "forRange",
-      varName: dVar,
-      start: cU32(0),
-      bound: cU32(outCols),
-      body: [
+    jBody.push(
+      forRange0(dVar, cU32(outCols), [
         {
           kind: "indexAddAssign",
           arrayName: resultName,
@@ -1768,22 +1615,10 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
             "f32",
           ),
         },
-      ],
-    });
-    rBody.push({
-      kind: "forRange",
-      varName: jVar,
-      start: cU32(0),
-      bound: cU32(aCols),
-      body: jBody,
-    });
-    result.push({
-      kind: "forRange",
-      varName: rVar,
-      start: cU32(0),
-      bound: cU32(aRows),
-      body: rBody,
-    });
+      ]),
+    );
+    rBody.push(forRange0(jVar, cU32(aCols), jBody));
+    result.push(forRange0(rVar, cU32(aRows), rBody));
   }
 
   return result;
@@ -1843,20 +1678,16 @@ function lowerBlockReduce(stmt: BlockReduceStmt): Statement[] {
     idx: ref(outerVar),
     value: initVal,
   });
-  outerBody.push({
-    kind: "forRange",
-    varName: innerVar,
-    start: cU32(0),
-    bound: cU32(innerDim),
-    body: [
+  outerBody.push(
+    forRange0(innerVar, cU32(innerDim), [
       {
         kind: "indexAssign",
         arrayName: outputName,
         idx: ref(outerVar),
         value: accumExpr,
       },
-    ],
-  });
+    ]),
+  );
 
   // For distributed blocks with axis=1: cross-thread butterfly reduction
   if (isDistributed && axis === 1) {
@@ -1880,13 +1711,7 @@ function lowerBlockReduce(stmt: BlockReduceStmt): Statement[] {
     });
   }
 
-  result.push({
-    kind: "forRange",
-    varName: outerVar,
-    start: cU32(0),
-    bound: cU32(outerDim),
-    body: outerBody,
-  });
+  result.push(forRange0(outerVar, cU32(outerDim), outerBody));
 
   return result;
 }
@@ -1922,20 +1747,16 @@ function lowerBlockUnary(stmt: BlockUnaryStmt): Statement[] {
     dataType: "f32",
   };
 
-  result.push({
-    kind: "forRange",
-    varName: iVar,
-    start: cU32(0),
-    bound: cU32(size),
-    body: [
+  result.push(
+    forRange0(iVar, cU32(size), [
       {
         kind: "indexAssign",
         arrayName: outputName,
         idx: ref(iVar),
         value: outputVal,
       },
-    ],
-  });
+    ]),
+  );
 
   return result;
 }
@@ -1999,12 +1820,8 @@ function lowerBlockBinary(stmt: BlockBinaryStmt): Statement[] {
 
     // Flat loop over all elements
     const iVar = freshVar("bi");
-    result.push({
-      kind: "forRange",
-      varName: iVar,
-      start: cU32(0),
-      bound: cU32(outSize),
-      body: [
+    result.push(
+      forRange0(iVar, cU32(outSize), [
         {
           kind: "indexAssign",
           arrayName: outputName,
@@ -2015,17 +1832,13 @@ function lowerBlockBinary(stmt: BlockBinaryStmt): Statement[] {
             ref(bValName, "f32"),
           ),
         },
-      ],
-    });
+      ]),
+    );
   } else if (isSameDims) {
     // Same shape: element-wise
     const iVar = freshVar("bi");
-    result.push({
-      kind: "forRange",
-      varName: iVar,
-      start: cU32(0),
-      bound: cU32(outSize),
-      body: [
+    result.push(
+      forRange0(iVar, cU32(outSize), [
         {
           kind: "indexAssign",
           arrayName: outputName,
@@ -2036,89 +1849,69 @@ function lowerBlockBinary(stmt: BlockBinaryStmt): Statement[] {
             arrayRead(bName, ref(iVar)),
           ),
         },
-      ],
-    });
+      ]),
+    );
   } else if (isPerRowB) {
     // [R×C] op [R×1]: broadcast B per-row
     const rVar = freshVar("br");
     const cVar = freshVar("bc");
     const bvName = freshVar("bv");
-    result.push({
-      kind: "forRange",
-      varName: rVar,
-      start: cU32(0),
-      bound: cU32(outRows),
-      body: [
+    result.push(
+      forRange0(rVar, cU32(outRows), [
         {
           kind: "let",
           name: bvName,
           dtype: "f32",
           value: arrayRead(bName, ref(rVar)),
         },
-        {
-          kind: "forRange",
-          varName: cVar,
-          start: cU32(0),
-          bound: cU32(outCols),
-          body: [
-            {
-              kind: "indexAssign",
-              arrayName: outputName,
-              idx: binOp(
-                "add",
-                binOp("mul", ref(rVar), cU32(outCols)),
-                ref(cVar),
+        forRange0(cVar, cU32(outCols), [
+          {
+            kind: "indexAssign",
+            arrayName: outputName,
+            idx: binOp(
+              "add",
+              binOp("mul", ref(rVar), cU32(outCols)),
+              ref(cVar),
+            ),
+            value: emitBinaryOp(
+              op,
+              arrayRead(
+                aName,
+                binOp("add", binOp("mul", ref(rVar), cU32(aCols)), ref(cVar)),
               ),
-              value: emitBinaryOp(
-                op,
-                arrayRead(
-                  aName,
-                  binOp("add", binOp("mul", ref(rVar), cU32(aCols)), ref(cVar)),
-                ),
-                ref(bvName, "f32"),
-              ),
-            },
-          ],
-        },
-      ],
-    });
+              ref(bvName, "f32"),
+            ),
+          },
+        ]),
+      ]),
+    );
   } else if (isPerColB) {
     // [R×C] op [1×C]: broadcast B per-column
     const rVar = freshVar("br");
     const cVar = freshVar("bc");
-    result.push({
-      kind: "forRange",
-      varName: rVar,
-      start: cU32(0),
-      bound: cU32(outRows),
-      body: [
-        {
-          kind: "forRange",
-          varName: cVar,
-          start: cU32(0),
-          bound: cU32(outCols),
-          body: [
-            {
-              kind: "indexAssign",
-              arrayName: outputName,
-              idx: binOp(
-                "add",
-                binOp("mul", ref(rVar), cU32(outCols)),
-                ref(cVar),
+    result.push(
+      forRange0(rVar, cU32(outRows), [
+        forRange0(cVar, cU32(outCols), [
+          {
+            kind: "indexAssign",
+            arrayName: outputName,
+            idx: binOp(
+              "add",
+              binOp("mul", ref(rVar), cU32(outCols)),
+              ref(cVar),
+            ),
+            value: emitBinaryOp(
+              op,
+              arrayRead(
+                aName,
+                binOp("add", binOp("mul", ref(rVar), cU32(aCols)), ref(cVar)),
               ),
-              value: emitBinaryOp(
-                op,
-                arrayRead(
-                  aName,
-                  binOp("add", binOp("mul", ref(rVar), cU32(aCols)), ref(cVar)),
-                ),
-                arrayRead(bName, ref(cVar)),
-              ),
-            },
-          ],
-        },
-      ],
-    });
+              arrayRead(bName, ref(cVar)),
+            ),
+          },
+        ]),
+      ]),
+    );
   } else {
     throw new Error(
       `blockBinary: unsupported broadcast [${aRows}×${aCols}] op [${bRows}×${bCols}]`,
