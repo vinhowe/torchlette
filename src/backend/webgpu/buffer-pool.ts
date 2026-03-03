@@ -888,15 +888,6 @@ export async function flushBufferPoolWithSync(): Promise<void> {
 }
 
 /**
- * Decrement the owning-tensor reference count for a GPUBuffer.
- * Use this when transferring buffer ownership outside the normal
- * createTensor/destroy lifecycle (e.g., external donation consumers).
- */
-export function decRefBuffer(buffer: GPUBuffer): void {
-  bufferPool.decRef(buffer);
-}
-
-/**
  * Release a contiguous copy's buffer if one was created.
  * Common pattern: `if (copy !== original) destroyCopy(copy)`.
  */
@@ -994,13 +985,6 @@ export async function awaitDeferredFence(): Promise<void> {
   }
 }
 
-/**
- * Check if there's a pending deferred fence.
- */
-export function hasDeferredFence(): boolean {
-  return fenceState.pendingFencePromise !== null;
-}
-
 // ============================================================================
 // Detailed stats, debug trace, and buffer lifecycle helpers
 // ============================================================================
@@ -1022,28 +1006,12 @@ export function resetBufferPoolDetailedStats(): void {
 }
 
 /**
- * Enable or disable debug tracing for buffer pool operations.
- */
-export function setBufferPoolDebugTrace(enabled: boolean): void {
-  bufferPool.setDebugTrace(enabled);
-}
-
-/**
  * Queue a buffer for deferred destruction after GPU work completes.
  * Tracks deallocation immediately in the memory tracker.
  * Used by engine layer for buffers not managed by WebGPUTensor.destroy().
  */
 export function deferredDestroyBuffer(buffer: GPUBuffer, size: number): void {
   bufferPool.deferredDestroy(buffer, size); // arena/replay guards are inside deferredDestroy
-}
-
-/**
- * Acquire a buffer from the pool for output allocation.
- * Returns null if no suitable buffer is available.
- * The caller is responsible for returning the buffer to the pool.
- */
-export function acquirePooledBuffer(sizeBytes: number): GPUBuffer | null {
-  return bufferPool.acquire(sizeBytes) as GPUBuffer | null;
 }
 
 // ============================================================================

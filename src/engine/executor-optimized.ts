@@ -47,7 +47,7 @@ import { releaseDeadTensors } from "./storage-tracker";
 /**
  * Options for optimized plan execution.
  */
-export interface OptimizedExecutionOptions {
+interface OptimizedExecutionOptions {
   /** Enable elementwise fusion (default: true for WebGPU) */
   enableFusion?: boolean;
   /** Enable vectorization for fused kernels (default: true) */
@@ -143,7 +143,7 @@ export interface FusionAnalysisTemplate {
   bufferArena?: BufferArena;
 }
 
-export type CachedSegmentDesc =
+type CachedSegmentDesc =
   | { kind: "sequential"; finalPoss: number[] }
   | {
       kind: "fused";
@@ -162,7 +162,7 @@ export type CachedSegmentDesc =
  * Keyed by structural fingerprint (FNV-1a hash).
  * Typically holds <10 entries (one per unique plan structure).
  */
-export const fusionAnalysisCache = new Map<number, FusionAnalysisTemplate>();
+const fusionAnalysisCache = new Map<number, FusionAnalysisTemplate>();
 
 /** Get a cached fusion analysis template by fingerprint. */
 export function getFusionAnalysisTemplate(

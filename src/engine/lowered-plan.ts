@@ -261,7 +261,7 @@ interface LoweredReclaimAction {
 }
 
 /** A compound pattern (softmax, log_softmax) replacing multiple decomposed ops. */
-export interface LoweredCompoundAction {
+interface LoweredCompoundAction {
   kind: "compound";
   /** Pattern name (e.g. "softmax", "log_softmax"). */
   name: string;
@@ -322,7 +322,7 @@ interface ReplayDispatch {
  * Recorded node result metadata for reconstructing StorageHandles during replay.
  * Arena buffers are stable across steps, so we record the buffer reference directly.
  */
-export interface ReplayNodeResult {
+interface ReplayNodeResult {
   nodeIndex: number;
   buffer: GPUBuffer;
   shape: number[];
@@ -394,7 +394,7 @@ export type ReplayEntry =
  * Dispatch replay cache: records the full dispatch sequence during the first
  * execution and replays it on subsequent steps, bypassing all JS dispatch logic.
  */
-export interface DispatchReplayCache {
+interface DispatchReplayCache {
   /** Ordered replay entries (dispatches, data sources, reclaims, result assignments). */
   entries: ReplayEntry[];
   /** Whether this cache is valid for replay. Set to false on invalidation. */

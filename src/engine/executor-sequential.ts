@@ -164,7 +164,7 @@ export async function executePlan(
 // ============================================================================
 
 /** Options for segmented plan execution at checkpoint boundaries. */
-export interface SegmentedPlanOptions extends ExecutePlanOptions {
+interface SegmentedPlanOptions extends ExecutePlanOptions {
   /**
    * When true, uses GPU synchronization between segments: batches all ops
    * into a single command buffer, submits and waits for GPU completion,
@@ -305,7 +305,7 @@ export async function executePlanSegmented(
 /**
  * Find node IDs that must survive this segment (used by later segments).
  */
-export function findSurvivingOutputs(
+function findSurvivingOutputs(
   _segment: ExecutionPlan,
   laterSegments: ExecutionPlan[],
   finalOutputId: number,

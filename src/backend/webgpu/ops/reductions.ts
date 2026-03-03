@@ -204,16 +204,22 @@ function addEpilogueBindings(
 }
 
 // ============================================================================
-// Sum
+// Unified reduction dispatch (sum, max, min)
 // ============================================================================
 
-export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
+type ReduceOp = "sum" | "max" | "min";
+
+function reduction(
+  op: ReduceOp,
+  a: BackendTensor,
+  options?: SumOptions | MaxOptions,
+): BackendTensor {
   const ctx = requireContext();
   let tensor = asGPUTensor(a);
   let contiguousCopy: WebGPUTensor | null = null;
 
   // Must materialize non-contiguous tensors first (e.g., expanded views)
-  // The sum kernels assume contiguous layout for index computation
+  // The reduction kernels assume contiguous layout for index computation
   if (!tensor.isContiguous) {
     tensor = asGPUTensor(contiguous(tensor));
     contiguousCopy = tensor;
@@ -224,21 +230,21 @@ export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
   const keepdim = options?.keepdim ?? false;
 
   if (dim === undefined || dim === null) {
-    const result = sumFullReduction(ctx, tensor);
+    const result = fullReduction(op, ctx, tensor);
     if (contiguousCopy) contiguousCopy.destroy();
     return result;
   }
 
   const setup = prepareDimReduction(inputShape, dim, keepdim);
   if (!setup) {
-    const result = sumFullReduction(ctx, tensor);
+    const result = fullReduction(op, ctx, tensor);
     if (contiguousCopy) contiguousCopy.destroy();
     return result;
   }
 
   for (const d of setup.normalizedDims) {
     if (d < 0 || d >= setup.rank) {
-      throw new Error(`sum: dimension ${d} out of range`);
+      throw new Error(`${op}: dimension ${d} out of range`);
     }
   }
 
@@ -257,7 +263,7 @@ export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
 
   const useParallel = reductionSize > 64;
   const spec = makeReductionSpec({
-    reduceOp: "sum",
+    reduceOp: op,
     dim: dimInfo(
       inputShape,
       inputStrides,
@@ -268,9 +274,7 @@ export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
       useParallel,
     ),
   });
-  const dispatcher = createTileKernelDispatcher(spec);
-
-  dispatcher.dispatch(
+  createTileKernelDispatcher(spec).dispatch(
     { input: tensor.buffer, out: outBuffer },
     { outSize, reductionSize },
   );
@@ -280,36 +284,37 @@ export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
 }
 
 // ============================================================================
-// Sum Full Reduction
+// Full Reduction (all dims)
 // ============================================================================
 
-function sumFullReduction(
+function fullReduction(
+  op: ReduceOp,
   ctx: WebGPUContext,
   tensor: WebGPUTensor,
 ): WebGPUTensor {
-  const inputSize = tensor.size;
-  const bytesPerElement = dtypeBytes(tensor.dtype);
-
-  // Check if input buffer exceeds max binding size
-  const limits = ctx.device.limits;
-  const maxBindingSize =
-    limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
-  const inputBufferSize = tensor.buffer.size;
-
-  if (
-    inputBufferSize > maxBindingSize ||
-    inputSize * bytesPerElement > maxBindingSize
-  ) {
-    return sumFullReductionChunked(ctx, tensor, maxBindingSize);
+  // Only sum needs the chunked path for tensors exceeding maxStorageBufferBindingSize
+  if (op === "sum") {
+    const bytesPerElement = dtypeBytes(tensor.dtype);
+    const limits = ctx.device.limits;
+    const maxBindingSize =
+      limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    if (
+      tensor.buffer.size > maxBindingSize ||
+      tensor.size * bytesPerElement > maxBindingSize
+    ) {
+      return sumFullReductionChunked(ctx, tensor, maxBindingSize);
+    }
   }
 
   const outBuffer = resolveOutputBuffer(ctx.device, 4, [tensor.buffer]);
-
-  getCachedDispatcher("sumFull", () =>
-    makeReductionSpec({ reduceOp: "sum" }),
-  ).dispatch({ input: tensor.buffer, out: outBuffer }, { size: inputSize });
-
+  getCachedDispatcher(`${op}Full`, () =>
+    makeReductionSpec({ reduceOp: op }),
+  ).dispatch({ input: tensor.buffer, out: outBuffer }, { size: tensor.size });
   return createTensor([], outBuffer);
+}
+
+export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
+  return reduction("sum", a, options);
 }
 
 // ============================================================================
@@ -617,90 +622,12 @@ export function sumWithPreambleEpilogue(
   return result;
 }
 
-// ============================================================================
-// Max / Min (unified implementation)
-// ============================================================================
-
-type MaxMinOp = "max" | "min";
-
-function maxMinReduction(
-  op: MaxMinOp,
-  a: BackendTensor,
-  options?: MaxOptions,
-): BackendTensor {
-  const ctx = requireContext();
-  let tensor = asGPUTensor(a);
-  if (!tensor.isContiguous) tensor = asGPUTensor(contiguous(tensor));
-
-  const inputShape = tensor.shape;
-  const dim = options?.dim;
-  const keepdim = options?.keepdim ?? false;
-
-  if (dim === undefined || dim === null) {
-    return maxMinFullReduction(op, ctx, tensor);
-  }
-
-  const setup = prepareDimReduction(inputShape, dim, keepdim);
-  if (!setup) return maxMinFullReduction(op, ctx, tensor);
-
-  for (const d of setup.normalizedDims) {
-    if (d < 0 || d >= setup.rank)
-      throw new Error(`${op}: dimension ${d} out of range`);
-  }
-
-  const {
-    normalizedDims,
-    outShape,
-    outSize,
-    reductionSize,
-    inputStrides,
-    outStrides,
-    inputToOutDim,
-  } = setup;
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [
-    tensor.buffer,
-  ]);
-
-  const useParallel = reductionSize > 64;
-  const spec = makeReductionSpec({
-    reduceOp: op,
-    dim: dimInfo(
-      inputShape,
-      inputStrides,
-      normalizedDims,
-      outShape,
-      outStrides,
-      inputToOutDim,
-      useParallel,
-    ),
-  });
-  const dispatcher = createTileKernelDispatcher(spec);
-  dispatcher.dispatch(
-    { input: tensor.buffer, out: outBuffer },
-    { outSize, reductionSize },
-  );
-
-  return createTensor(outShape, outBuffer);
-}
-
-function maxMinFullReduction(
-  op: MaxMinOp,
-  ctx: WebGPUContext,
-  tensor: WebGPUTensor,
-): WebGPUTensor {
-  const outBuffer = resolveOutputBuffer(ctx.device, 4, [tensor.buffer]);
-  getCachedDispatcher(`${op}Full`, () =>
-    makeReductionSpec({ reduceOp: op }),
-  ).dispatch({ input: tensor.buffer, out: outBuffer }, { size: tensor.size });
-  return createTensor([], outBuffer);
-}
-
 export function max(a: BackendTensor, options?: MaxOptions): BackendTensor {
-  return maxMinReduction("max", a, options);
+  return reduction("max", a, options);
 }
 
 export function min(a: BackendTensor, options?: MaxOptions): BackendTensor {
-  return maxMinReduction("min", a, options);
+  return reduction("min", a, options);
 }
 
 // ============================================================================

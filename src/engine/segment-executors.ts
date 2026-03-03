@@ -344,7 +344,7 @@ export async function executeSequentialSegment(
 /**
  * Options for sequential segment execution with early release and lowered plan recording.
  */
-export interface SegmentExecOptions {
+interface SegmentExecOptions {
   enableEarlyRelease: boolean;
   lifetimes: Map<number, TensorLifetime> | null;
   outputNodeIds: Set<number> | null;
