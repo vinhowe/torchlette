@@ -147,7 +147,7 @@ export function popAutocast(ctx: AutocastContext): void {
 /**
  * Result of computing the output dtype for an op under AMP.
  */
-export type SelectGatedResult = {
+type SelectGatedResult = {
   /** The dtype to use for this op's output */
   outputDtype: DType;
   /** Whether a cast is needed from the compute dtype */

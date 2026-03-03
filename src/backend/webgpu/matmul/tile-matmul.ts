@@ -522,7 +522,7 @@ function matmulKernelBlockOps(
 // K-Split Reduction Kernel (imperative mode)
 // ============================================================================
 
-export function createKSplitReductionKernel(
+function createKSplitReductionKernel(
   kSplitCount: number,
   outputDtype: DType,
 ): TileKernelSpec {

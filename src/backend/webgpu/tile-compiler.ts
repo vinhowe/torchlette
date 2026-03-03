@@ -1081,7 +1081,7 @@ function collectAllSharedWrites(stmts: Statement[], names: Set<string>): void {
  * Insert workgroupBarrier() between shared memory writes and subsequent reads.
  * Does not double-barrier: existing barriers clear the dirty set.
  */
-export function insertBarriers(stmts: Statement[]): Statement[] {
+function insertBarriers(stmts: Statement[]): Statement[] {
   const result: Statement[] = [];
   const dirtyArrays = new Set<string>();
 
@@ -1300,7 +1300,7 @@ function exprContainsLoad(node: IRNode): boolean {
  * - Never hoists across barriers (a let after a barrier stays after it)
  * - Recurse inner-to-outer (inner loops hoisted first)
  */
-export function hoistLoopInvariants(stmts: Statement[]): Statement[] {
+function hoistLoopInvariants(stmts: Statement[]): Statement[] {
   const result: Statement[] = [];
 
   for (const stmt of stmts) {

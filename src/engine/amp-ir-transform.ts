@@ -24,7 +24,7 @@ import type { IRGraph, IRNode } from "./ir";
 /**
  * Result of the AMP IR transform.
  */
-export type AMPTransformResult = {
+type AMPTransformResult = {
   /** The transformed graph with cast nodes inserted */
   graph: IRGraph;
   /** Number of cast nodes inserted */

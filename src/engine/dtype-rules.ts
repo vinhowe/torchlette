@@ -13,7 +13,7 @@
 import type { DType } from "../backend/types";
 import type { LazyOpCode } from "./lazy-types";
 
-export type OpDtypeCategory =
+type OpDtypeCategory =
   | "f16_eligible"
   | "f32_required"
   | "promote_inputs"
