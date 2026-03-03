@@ -92,6 +92,13 @@ function getLogSoftmaxKernel(): TileKernelInstance {
   return logSoftmaxKernel;
 }
 
+export function resetSoftmaxKernelState(): void {
+  softmaxKernel?.reset();
+  logSoftmaxKernel?.reset();
+  softmaxKernel = null;
+  logSoftmaxKernel = null;
+}
+
 // ============================================================================
 // Dispatch Functions
 // ============================================================================

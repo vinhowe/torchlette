@@ -8,7 +8,6 @@ import type { Tensor, Torchlette } from "../frontend";
 export abstract class Module {
   protected readonly api: Torchlette;
   private trainingMode = true;
-  private _buffers = new Map<string, Tensor>();
   private _modules = new Map<string, Module>();
 
   constructor(api: Torchlette) {
@@ -24,10 +23,9 @@ export abstract class Module {
 
   /**
    * Register a buffer (non-parameter persistent tensor) on this module.
-   * The tensor is stored in _buffers and also set as a property on `this`.
+   * The tensor is set as a property on `this` for direct access.
    */
   registerBuffer(name: string, tensor: Tensor): void {
-    this._buffers.set(name, tensor);
     Object.defineProperty(this, name, {
       value: tensor,
       writable: true,
@@ -40,26 +38,6 @@ export abstract class Module {
    */
   registerModule(name: string, module: Module): void {
     this._modules.set(name, module);
-  }
-
-  /**
-   * Return all registered buffers, optionally recursing into child modules.
-   */
-  buffers(recurse = true): Tensor[] {
-    const result = [...this._buffers.values()];
-    if (recurse) {
-      for (const child of this._modules.values()) {
-        result.push(...child.buffers(true));
-      }
-    }
-    return result;
-  }
-
-  /**
-   * Return all registered child modules.
-   */
-  modules(): Module[] {
-    return [...this._modules.values()];
   }
 
   /**
@@ -87,11 +65,4 @@ export abstract class Module {
    * Forward pass. Subclasses must implement this.
    */
   abstract forward(input: Tensor): Tensor;
-
-  /**
-   * Callable interface - calls forward().
-   */
-  call(input: Tensor): Tensor {
-    return this.forward(input);
-  }
 }

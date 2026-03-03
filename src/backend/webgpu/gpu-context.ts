@@ -28,6 +28,7 @@ import {
 import { initGpuTimestamps, isProfilingEnabled } from "./profiler";
 import { resetRMSNormKernelState } from "./rmsnorm-kernel";
 import { setSharedEncoderEnabled } from "./shared-encoder";
+import { resetSoftmaxKernelState } from "./softmax-kernel";
 import { resetUnscaleKernelState } from "./unscale-kernel";
 import { gpuContext, requireContext, setGpuContext } from "./webgpu-state";
 
@@ -423,6 +424,7 @@ export function resetAllKernelCaches(): void {
   resetAttentionKernelState();
   resetLayerNormKernelState();
   resetRMSNormKernelState();
+  resetSoftmaxKernelState();
   resetCrossEntropyKernelState();
   resetAdamKernelState();
   resetUnscaleKernelState();
