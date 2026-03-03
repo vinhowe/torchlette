@@ -37,23 +37,17 @@ function collectTensorHandles(value: unknown): EngineTensor[] {
   return out;
 }
 
-function isThenable(value: unknown): value is Promise<unknown> {
-  if (!value) return false;
-  return typeof (value as Promise<unknown>).then === "function";
-}
-
 function collectTraceTensorIds(value: unknown): number[] {
   if (!value) return [];
   if (Array.isArray(value))
     return value.flatMap((item) => collectTraceTensorIds(item));
-  if (isTraceTensor(value)) return [value.id];
+  if (
+    typeof value === "object" &&
+    typeof (value as TraceTensor).id === "number" &&
+    typeof (value as TraceTensor).epoch === "number"
+  )
+    return [(value as TraceTensor).id];
   return [];
-}
-
-function isTraceTensor(value: unknown): value is TraceTensor {
-  if (!value || typeof value !== "object") return false;
-  const record = value as TraceTensor;
-  return typeof record.id === "number" && typeof record.epoch === "number";
 }
 
 function computeRngValue(
@@ -65,20 +59,15 @@ function computeRngValue(
   const algo = basis.algorithmId >>> 0;
   const op = opNonce >>> 0;
   const draw = drawNonce >>> 0;
-  let state =
-    seed ^ Math.imul(algo, 0x9e3779b9) ^ op ^ Math.imul(draw, 0x85ebca6b);
-  state = mix32(state);
-  return (state >>> 0) / 2 ** 32;
-}
-
-function mix32(value: number): number {
-  let v = value >>> 0;
+  let v =
+    (seed ^ Math.imul(algo, 0x9e3779b9) ^ op ^ Math.imul(draw, 0x85ebca6b)) >>>
+    0;
   v ^= v >>> 16;
   v = Math.imul(v, 0x7feb352d);
   v ^= v >>> 15;
   v = Math.imul(v, 0x846ca68b);
   v ^= v >>> 16;
-  return v >>> 0;
+  return (v >>> 0) / 2 ** 32;
 }
 
 // ── Error classes (merged from engine-errors.ts) ────────────────────────────
@@ -481,7 +470,7 @@ export class Engine {
         throw error;
       }
 
-      if (isThenable(result)) {
+      if (result && typeof (result as Promise<unknown>).then === "function") {
         this.finishStaging(undefined);
         throw new AsyncInCompileError("Async work is not allowed in compile");
       }
