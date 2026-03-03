@@ -1,6 +1,6 @@
 import type { BackendTensor, DType } from "../backend/types";
 import { asGPUTensor } from "../backend/webgpu/gpu-types";
-import { shapesEqual } from "../core/shape";
+import { contiguousStrides, shapesEqual } from "../core/shape";
 import type { LazyIRNode, LazyRef } from "./lazy-types";
 import {
   _webgpuMatmulImports,
@@ -364,14 +364,7 @@ export async function executeMatmulWithEpilogue(
   if (!shapesEqual(resultTensor.shape, outNodeShape)) {
     const gpuT = asGPUTensor(resultTensor);
     gpuT.shape = outNodeShape;
-    // Recompute strides for the new shape (contiguous row-major)
-    const newStrides = new Array(outNodeShape.length);
-    let stride = 1;
-    for (let i = outNodeShape.length - 1; i >= 0; i--) {
-      newStrides[i] = stride;
-      stride *= outNodeShape[i];
-    }
-    gpuT.strides = newStrides;
+    gpuT.strides = contiguousStrides(outNodeShape);
   }
   plan.outputNode.result = createStorageHandle(
     plan.outputNode.device,
