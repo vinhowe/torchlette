@@ -43,6 +43,11 @@ export type GPUCommandEncoder = {
 
 export type GPUCommandBuffer = unknown;
 export type GPUBindGroup = unknown;
+export type GPUBufferBinding = {
+  buffer: GPUBuffer;
+  offset?: number;
+  size?: number;
+};
 
 export type GPUQueue = {
   onSubmittedWorkDone?: () => Promise<void>;

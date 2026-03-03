@@ -12,7 +12,7 @@ import {
 } from "../bind-group-cache";
 import { dispatchComputePass, dispatchMatmul, getPipeline } from "../dispatch";
 import { requireContext } from "../gpu-context";
-import type { GPUBuffer, WebGPUTensor } from "../gpu-types";
+import type { GPUBuffer, GPUBufferBinding, WebGPUTensor } from "../gpu-types";
 import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
 import {
   alignedChunkSize,
@@ -31,9 +31,6 @@ import {
   sliceColumnsTileIR,
 } from "./ops-tile-ir";
 import { ensureContiguous } from "./views";
-
-/** Local type alias for GPU buffer binding descriptors with offset/size. */
-type GPUBufferBinding = { buffer: GPUBuffer; offset?: number; size?: number };
 
 export function matmul(
   _a: BackendTensor,

@@ -74,71 +74,38 @@ function comparisonOp(
   return createTensor(outShape, outBuffer);
 }
 
-export function gt(
+type ComparisonFn = (
   a: BackendTensor,
   b: BackendTensor,
   options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return comparisonOp("gt", ">", a, b, options);
-}
+) => BackendTensor;
+const cmp =
+  (name: string, op: string): ComparisonFn =>
+  (a, b, options) =>
+    comparisonOp(name, op, a, b, options);
 
-export function lt(
-  a: BackendTensor,
-  b: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return comparisonOp("lt", "<", a, b, options);
-}
-
-export function ge(
-  a: BackendTensor,
-  b: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return comparisonOp("ge", ">=", a, b, options);
-}
-
-export function le(
-  a: BackendTensor,
-  b: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return comparisonOp("le", "<=", a, b, options);
-}
-
-export function eq(
-  a: BackendTensor,
-  b: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return comparisonOp("eq", "==", a, b, options);
-}
-
-export function ne(
-  a: BackendTensor,
-  b: BackendTensor,
-  options?: { outBuffer?: GPUBuffer },
-): BackendTensor {
-  return comparisonOp("ne", "!=", a, b, options);
-}
+export const gt = cmp("gt", ">");
+export const lt = cmp("lt", "<");
+export const ge = cmp("ge", ">=");
+export const le = cmp("le", "<=");
+export const eq = cmp("eq", "==");
+export const ne = cmp("ne", "!=");
 
 // ============================================================================
 // ArgMax/ArgMin - return indices of max/min values
 // ============================================================================
 
-export function argmax(
+type ArgReduceFn = (
   a: BackendTensor,
   options: ArgReduceOptions,
-): BackendTensor {
-  return argReduceOp("argmax", ">", a, options);
-}
+) => BackendTensor;
+const argReduce =
+  (name: string, op: string): ArgReduceFn =>
+  (a, options) =>
+    argReduceOp(name, op, a, options);
 
-export function argmin(
-  a: BackendTensor,
-  options: ArgReduceOptions,
-): BackendTensor {
-  return argReduceOp("argmin", "<", a, options);
-}
+export const argmax = argReduce("argmax", ">");
+export const argmin = argReduce("argmin", "<");
 
 function argReduceOp(
   opName: string,

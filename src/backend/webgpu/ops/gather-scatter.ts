@@ -23,7 +23,7 @@ import { resolveOutputBuffer } from "../buffer-arena";
 import { computeDimChunkLayout } from "../chunked-dispatch";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { requireContext } from "../gpu-context";
-import type { GPUBuffer } from "../gpu-types";
+import type { GPUBuffer, GPUBufferBinding } from "../gpu-types";
 import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
 import { compute2DDispatch, dtypeBytes, WORKGROUP_SIZE } from "../shape-utils";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
@@ -34,9 +34,6 @@ import {
   gatherTileIR,
   scatterAddTileIR,
 } from "./ops-tile-ir";
-
-/** Local type alias for GPU buffer binding descriptors with offset/size. */
-type GPUBufferBinding = { buffer: GPUBuffer; offset?: number; size?: number };
 
 // ============================================================================
 // Gather
