@@ -328,7 +328,6 @@ interface SegmentExecOptions {
   nodeToStorage: Map<number, StorageHandle>;
   startStep: number;
   externalNodeIds?: Set<number>;
-  allPlanNodes?: LazyIRNode[];
   matmulPrologueMap?: Map<number, MatmulPrologueInfo[]>;
   prologueSkipIds?: Set<number>;
   prebuiltConsumerCount?: Map<number, number>;
@@ -353,7 +352,6 @@ export async function executeSequentialSegmentWithEarlyRelease(
     nodeToStorage,
     startStep,
     externalNodeIds,
-    allPlanNodes,
     matmulPrologueMap,
     prologueSkipIds,
     prebuiltConsumerCount,
@@ -365,11 +363,11 @@ export async function executeSequentialSegmentWithEarlyRelease(
   if (useSharedEncoder) beginSharedEncoder();
 
   try {
-    // Use pre-built consumer count if provided, otherwise build it.
+    // Use pre-built consumer count if provided, otherwise build from local nodes.
     const reductionConsumerCount =
       prebuiltConsumerCount ??
       (backend.name === "webgpu"
-        ? buildConsumerCount(allPlanNodes ?? nodes)
+        ? buildConsumerCount(nodes)
         : new Map<number, number>());
 
     // Intra-segment periodic reclamation: flush pending buffers to main pool
