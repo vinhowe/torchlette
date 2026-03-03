@@ -171,15 +171,51 @@ function tryGetScalarValue(ref: LazyRef): number | null {
   return payload.fillValue;
 }
 
+/** Algebraic identity rules: op(x, identity) → x. Commutative ops also check op(identity, x) → x. */
+const IDENTITY_RULES: Record<string, { value: number; commutative: boolean }> =
+  {
+    mul: { value: 1, commutative: true },
+    add: { value: 0, commutative: true },
+    sub: { value: 0, commutative: false },
+    div: { value: 1, commutative: false },
+  };
+
+/**
+ * Try to bypass a binary node if one operand is the algebraic identity.
+ * Returns true if the node was bypassed.
+ */
+function tryBypassIdentity(
+  node: LazyIRNode,
+  ref0: LazyRef,
+  ref1: LazyRef,
+  identity: number,
+  commutative: boolean,
+  ctx: RewriteContext,
+  bypassed: Set<number>,
+): boolean {
+  const val1 = tryGetScalarValue(ref1);
+  if (val1 === identity) {
+    redirectConsumers(node, ref0, ctx);
+    bypassed.add(node.id);
+    return true;
+  }
+  if (commutative) {
+    const val0 = tryGetScalarValue(ref0);
+    if (val0 === identity) {
+      redirectConsumers(node, ref1, ctx);
+      bypassed.add(node.id);
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Eliminate algebraic identities:
  *   mul(x, 1) → x,  mul(1, x) → x
  *   add(x, 0) → x,  add(0, x) → x
  *   div(x, 1) → x
  *   sub(x, 0) → x
- *
- * These appear in AMP scaling paths, optimizer computations, and
- * autograd where scalar constants flow through the graph.
  */
 function eliminateAlgebraicIdentities(
   ctx: RewriteContext,
@@ -189,51 +225,17 @@ function eliminateAlgebraicIdentities(
     if (node.result) continue;
     if (node.inputs.length !== 2) continue;
 
-    const ref0 = node.inputs[0];
-    const ref1 = node.inputs[1];
-
-    if (node.op === "mul") {
-      // mul(x, 1) → x
-      const val1 = tryGetScalarValue(ref1);
-      if (val1 === 1) {
-        redirectConsumers(node, ref0, ctx);
-        bypassed.add(node.id);
-        continue;
-      }
-      // mul(1, x) → x
-      const val0 = tryGetScalarValue(ref0);
-      if (val0 === 1) {
-        redirectConsumers(node, ref1, ctx);
-        bypassed.add(node.id);
-      }
-    } else if (node.op === "add") {
-      // add(x, 0) → x
-      const val1 = tryGetScalarValue(ref1);
-      if (val1 === 0) {
-        redirectConsumers(node, ref0, ctx);
-        bypassed.add(node.id);
-        continue;
-      }
-      // add(0, x) → x
-      const val0 = tryGetScalarValue(ref0);
-      if (val0 === 0) {
-        redirectConsumers(node, ref1, ctx);
-        bypassed.add(node.id);
-      }
-    } else if (node.op === "sub") {
-      // sub(x, 0) → x
-      const val1 = tryGetScalarValue(ref1);
-      if (val1 === 0) {
-        redirectConsumers(node, ref0, ctx);
-        bypassed.add(node.id);
-      }
-    } else if (node.op === "div") {
-      // div(x, 1) → x
-      const val1 = tryGetScalarValue(ref1);
-      if (val1 === 1) {
-        redirectConsumers(node, ref0, ctx);
-        bypassed.add(node.id);
-      }
+    const rule = IDENTITY_RULES[node.op];
+    if (rule) {
+      tryBypassIdentity(
+        node,
+        node.inputs[0],
+        node.inputs[1],
+        rule.value,
+        rule.commutative,
+        ctx,
+        bypassed,
+      );
     }
   }
 }
