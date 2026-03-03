@@ -204,7 +204,7 @@ function addEpilogueBindings(
 }
 
 // ============================================================================
-// Unified reduction dispatch (sum, max, min)
+// Unified reduction dispatch (sum, max, min) with optional epilogue
 // ============================================================================
 
 type ReduceOp = "sum" | "max" | "min";
@@ -213,13 +213,14 @@ function reduction(
   op: ReduceOp,
   a: BackendTensor,
   options?: SumOptions | MaxOptions,
+  epilogueOps?: ReductionEpilogueOpDesc[],
+  epilogueInputs?: BackendTensor[],
+  outputDtype?: DType,
 ): BackendTensor {
   const ctx = requireContext();
   let tensor = asGPUTensor(a);
   let contiguousCopy: WebGPUTensor | null = null;
 
-  // Must materialize non-contiguous tensors first (e.g., expanded views)
-  // The reduction kernels assume contiguous layout for index computation
   if (!tensor.isContiguous) {
     tensor = asGPUTensor(contiguous(tensor));
     contiguousCopy = tensor;
@@ -228,20 +229,39 @@ function reduction(
   const inputShape = tensor.shape;
   const dim = options?.dim;
   const keepdim = options?.keepdim ?? false;
+  const hasEpilogue = epilogueOps != null && epilogueOps.length > 0;
+  const bpe = outputDtype ? dtypeBytes(outputDtype) : 4;
+  const epilogue = hasEpilogue
+    ? { ops: epilogueOps!, outputDtype: outputDtype! }
+    : undefined;
 
-  if (dim === undefined || dim === null) {
-    const result = fullReduction(op, ctx, tensor);
-    if (contiguousCopy) contiguousCopy.destroy();
-    return result;
-  }
+  const setup =
+    dim !== undefined && dim !== null
+      ? prepareDimReduction(inputShape, dim, keepdim)
+      : null;
 
-  const setup = prepareDimReduction(inputShape, dim, keepdim);
+  // Full reduction (no dim or all dims reduced)
   if (!setup) {
-    const result = fullReduction(op, ctx, tensor);
+    if (!hasEpilogue) {
+      // Non-epilogue uses cached/chunked fullReduction path
+      const result = fullReduction(op, ctx, tensor);
+      if (contiguousCopy) contiguousCopy.destroy();
+      return result;
+    }
+    const outBuffer = resolveOutputBuffer(ctx.device, bpe, [tensor.buffer]);
+    const buffers: Record<string, GPUBuffer> = {
+      input: tensor.buffer,
+      out: outBuffer,
+    };
+    addEpilogueBindings(buffers, epilogueOps!, epilogueInputs!);
+    createTileKernelDispatcher(
+      makeReductionSpec({ reduceOp: op, epilogue }),
+    ).dispatch(buffers, { size: tensor.size });
     if (contiguousCopy) contiguousCopy.destroy();
-    return result;
+    return createTensor([], outBuffer, undefined, 0, outputDtype);
   }
 
+  // Dim reduction
   for (const d of setup.normalizedDims) {
     if (d < 0 || d >= setup.rank) {
       throw new Error(`${op}: dimension ${d} out of range`);
@@ -257,10 +277,9 @@ function reduction(
     outStrides,
     inputToOutDim,
   } = setup;
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bpe, [
     tensor.buffer,
   ]);
-
   const useParallel = reductionSize > 64;
   const spec = makeReductionSpec({
     reduceOp: op,
@@ -273,14 +292,20 @@ function reduction(
       inputToOutDim,
       useParallel,
     ),
+    epilogue,
   });
-  createTileKernelDispatcher(spec).dispatch(
-    { input: tensor.buffer, out: outBuffer },
-    { outSize, reductionSize },
-  );
+  const buffers: Record<string, GPUBuffer> = {
+    input: tensor.buffer,
+    out: outBuffer,
+  };
+  if (hasEpilogue) addEpilogueBindings(buffers, epilogueOps!, epilogueInputs!);
+  createTileKernelDispatcher(spec).dispatch(buffers, {
+    outSize,
+    reductionSize,
+  });
 
   if (contiguousCopy) contiguousCopy.destroy();
-  return createTensor(outShape, outBuffer);
+  return createTensor(outShape, outBuffer, undefined, 0, outputDtype);
 }
 
 // ============================================================================
@@ -640,93 +665,8 @@ export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
 }
 
 // ============================================================================
-// Sum With Epilogue
+// Sum/Max With Epilogue (delegates to unified reduction())
 // ============================================================================
-
-/** Shared implementation for sumWithEpilogue / maxWithEpilogue. */
-function reductionWithEpilogue(
-  reduceOp: "sum" | "max",
-  a: BackendTensor,
-  options: SumOptions | MaxOptions,
-  epilogueOps: ReductionEpilogueOpDesc[],
-  epilogueInputs: BackendTensor[],
-  outputDtype: DType,
-): BackendTensor {
-  const ctx = requireContext();
-  let tensor = asGPUTensor(a);
-  let contiguousCopy: WebGPUTensor | null = null;
-
-  if (!tensor.isContiguous) {
-    tensor = asGPUTensor(contiguous(tensor));
-    contiguousCopy = tensor;
-  }
-
-  const inputShape = tensor.shape;
-  const dim = options?.dim;
-  const keepdim = options?.keepdim ?? false;
-  const bpe = dtypeBytes(outputDtype);
-
-  const setup =
-    dim !== undefined && dim !== null
-      ? prepareDimReduction(inputShape, dim, keepdim)
-      : null;
-
-  if (!setup) {
-    const outBuffer = resolveOutputBuffer(ctx.device, bpe, [tensor.buffer]);
-    const spec = makeReductionSpec({
-      reduceOp,
-      epilogue: { ops: epilogueOps, outputDtype },
-    });
-    const dispatcher = createTileKernelDispatcher(spec);
-    const buffers: Record<string, GPUBuffer> = {
-      input: tensor.buffer,
-      out: outBuffer,
-    };
-    addEpilogueBindings(buffers, epilogueOps, epilogueInputs);
-    dispatcher.dispatch(buffers, { size: tensor.size });
-    if (contiguousCopy) contiguousCopy.destroy();
-    return createTensor([], outBuffer, undefined, 0, outputDtype);
-  }
-
-  const {
-    normalizedDims,
-    outShape,
-    outSize,
-    reductionSize,
-    inputStrides,
-    outStrides,
-    inputToOutDim,
-  } = setup;
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bpe, [
-    tensor.buffer,
-  ]);
-
-  const useParallel = reductionSize > 64;
-  const spec = makeReductionSpec({
-    reduceOp,
-    dim: dimInfo(
-      inputShape,
-      inputStrides,
-      normalizedDims,
-      outShape,
-      outStrides,
-      inputToOutDim,
-      useParallel,
-    ),
-    epilogue: { ops: epilogueOps, outputDtype },
-  });
-  const dispatcher = createTileKernelDispatcher(spec);
-
-  const buffers: Record<string, GPUBuffer> = {
-    input: tensor.buffer,
-    out: outBuffer,
-  };
-  addEpilogueBindings(buffers, epilogueOps, epilogueInputs);
-  dispatcher.dispatch(buffers, { outSize, reductionSize });
-
-  if (contiguousCopy) contiguousCopy.destroy();
-  return createTensor(outShape, outBuffer, undefined, 0, outputDtype);
-}
 
 export function sumWithEpilogue(
   a: BackendTensor,
@@ -735,14 +675,7 @@ export function sumWithEpilogue(
   epilogueInputs: BackendTensor[],
   outputDtype: DType,
 ): BackendTensor {
-  return reductionWithEpilogue(
-    "sum",
-    a,
-    options,
-    epilogueOps,
-    epilogueInputs,
-    outputDtype,
-  );
+  return reduction("sum", a, options, epilogueOps, epilogueInputs, outputDtype);
 }
 
 export function maxWithEpilogue(
@@ -752,14 +685,7 @@ export function maxWithEpilogue(
   epilogueInputs: BackendTensor[],
   outputDtype: DType,
 ): BackendTensor {
-  return reductionWithEpilogue(
-    "max",
-    a,
-    options,
-    epilogueOps,
-    epilogueInputs,
-    outputDtype,
-  );
+  return reduction("max", a, options, epilogueOps, epilogueInputs, outputDtype);
 }
 
 // ============================================================================
