@@ -436,7 +436,8 @@ export async function executeSequentialSegmentWithEarlyRelease(
       // uses the pre-cast input via prologue info.
       if (prologueSkipIds?.has(node.id)) {
         if (loweredPlanBuilder && nodeIdToFinalPos) {
-          loweredPlanBuilder.recordPrologueSkip(
+          loweredPlanBuilder.recordNode(
+            "prologue-skip",
             nodeIdToFinalPos.get(node.id) as number,
           );
         }
@@ -454,7 +455,8 @@ export async function executeSequentialSegmentWithEarlyRelease(
         if (match.name === "") {
           // This is an intermediate/non-first covered node — skip it
           if (loweredPlanBuilder && nodeIdToFinalPos) {
-            loweredPlanBuilder.recordPrologueSkip(
+            loweredPlanBuilder.recordNode(
+              "prologue-skip",
               nodeIdToFinalPos.get(node.id) as number,
             );
           }
@@ -817,13 +819,12 @@ export async function executeSequentialSegmentWithEarlyRelease(
       // Record action in lowered plan builder
       if (loweredPlanBuilder && nodeIdToFinalPos) {
         const finalPos = nodeIdToFinalPos.get(node.id) as number;
-        if (isDataSourceOp(node.op)) {
-          loweredPlanBuilder.recordDataSource(finalPos);
-        } else if (isViewOp(node.op)) {
-          loweredPlanBuilder.recordView(finalPos);
-        } else {
-          loweredPlanBuilder.recordSequential(finalPos);
-        }
+        const kind = isDataSourceOp(node.op)
+          ? ("data-source" as const)
+          : isViewOp(node.op)
+            ? ("view" as const)
+            : ("sequential" as const);
+        loweredPlanBuilder.recordNode(kind, finalPos);
       }
 
       advanceConsumed(nodeIdx, 1);

@@ -433,12 +433,9 @@ export class LoweredPlanBuilder {
     });
   }
 
-  /** Record a single sequential op dispatch. */
-  recordSequential(nodeIndex: number): void {
-    this.actions.push({
-      kind: "sequential",
-      nodeIndex,
-    });
+  /** Record a single-node action (sequential op, view, data source, or prologue skip). */
+  recordNode(kind: LoweredNodeAction["kind"], nodeIndex: number): void {
+    this.actions.push({ kind, nodeIndex });
   }
 
   /** Record a matmul + epilogue chain. */
@@ -539,30 +536,6 @@ export class LoweredPlanBuilder {
       epilogueInputCount,
       outputDtype,
       consumedCount,
-    });
-  }
-
-  /** Record a view op (metadata only). */
-  recordView(nodeIndex: number): void {
-    this.actions.push({
-      kind: "view",
-      nodeIndex,
-    });
-  }
-
-  /** Record a data source op. */
-  recordDataSource(nodeIndex: number): void {
-    this.actions.push({
-      kind: "data-source",
-      nodeIndex,
-    });
-  }
-
-  /** Record a prologue-skipped cast node. */
-  recordPrologueSkip(nodeIndex: number): void {
-    this.actions.push({
-      kind: "prologue-skip",
-      nodeIndex,
     });
   }
 

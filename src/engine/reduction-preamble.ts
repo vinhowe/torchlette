@@ -16,6 +16,9 @@ import {
 import { createStorageHandle } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
 
+/** Reduction payload shape shared across sum/mean/max. */
+type ReductionPayload = { dim?: number | number[] | null; keepdim?: boolean };
+
 // ============================================================================
 // Reduction Preamble Fusion (Phase 3)
 // Detects elementwise → sum/mean patterns and fuses them into a single
@@ -249,9 +252,7 @@ export async function executeReductionWithPreamble(
   backend: Backend,
 ): Promise<void> {
   // Get sum options from the reduction node's payload
-  const payload = plan.reductionNode.payload as
-    | { dim?: number | number[] | null; keepdim?: boolean }
-    | undefined;
+  const payload = plan.reductionNode.payload as ReductionPayload | undefined;
 
   let resultTensor: BackendTensor;
 
@@ -476,9 +477,7 @@ export async function executeReductionWithEpilogue(
     (ref) => getInputStorage(ref, backend).backendTensor,
   );
 
-  const payload = plan.reductionNode.payload as
-    | { dim?: number | number[] | null; keepdim?: boolean }
-    | undefined;
+  const payload = plan.reductionNode.payload as ReductionPayload | undefined;
 
   let resultTensor: BackendTensor;
   if (plan.reductionNode.op === "max") {
@@ -666,9 +665,7 @@ export async function executeReductionWithFusion(
     (ref) => getInputStorage(ref, backend).backendTensor,
   );
 
-  const payload = plan.reductionNode.payload as
-    | { dim?: number | number[] | null; keepdim?: boolean }
-    | undefined;
+  const payload = plan.reductionNode.payload as ReductionPayload | undefined;
 
   const resultTensor = sumWithPreambleEpilogue(
     preambleInputTensors,
