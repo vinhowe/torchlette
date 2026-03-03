@@ -438,7 +438,7 @@ export async function executeReductionWithEpilogue(
   plan: ReductionEpiloguePlan,
   backend: Backend,
 ): Promise<void> {
-  const { sumWithEpilogue, maxWithEpilogue, meanWithEpilogue } = await import(
+  const { reduction, meanWithEpilogue } = await import(
     "../backend/webgpu/index"
   );
 
@@ -456,32 +456,24 @@ export async function executeReductionWithEpilogue(
 
   const payload = plan.reductionNode.payload as ReductionPayload | undefined;
 
-  let resultTensor: BackendTensor;
-  if (plan.reductionNode.op === "max") {
-    resultTensor = maxWithEpilogue(
-      reductionInputTensor,
-      payload ?? {},
-      plan.epilogueOps,
-      epilogueInputTensors,
-      plan.outputDtype,
-    );
-  } else if (plan.reductionNode.op === "mean") {
-    resultTensor = meanWithEpilogue(
-      reductionInputTensor,
-      payload ?? {},
-      plan.epilogueOps,
-      epilogueInputTensors,
-      plan.outputDtype,
-    );
-  } else {
-    resultTensor = sumWithEpilogue(
-      reductionInputTensor,
-      payload ?? {},
-      plan.epilogueOps,
-      epilogueInputTensors,
-      plan.outputDtype,
-    );
-  }
+  // Mean has special handling (prepends mul(1/count) to epilogue), others go directly
+  const resultTensor =
+    plan.reductionNode.op === "mean"
+      ? meanWithEpilogue(
+          reductionInputTensor,
+          payload ?? {},
+          plan.epilogueOps,
+          epilogueInputTensors,
+          plan.outputDtype,
+        )
+      : reduction(
+          plan.reductionNode.op as "sum" | "max",
+          reductionInputTensor,
+          payload ?? {},
+          plan.epilogueOps,
+          epilogueInputTensors,
+          plan.outputDtype,
+        );
 
   // Store result on the FINAL output node (not the reduction node)
   plan.outputNode.result = createStorageHandle(

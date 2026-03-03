@@ -111,10 +111,9 @@ export {
 export { tensorFromArrayWithDtype } from "./ops/creation";
 export { waitForGPU } from "./ops/fused";
 export {
-  maxWithEpilogue,
   meanWithEpilogue,
+  reduction,
   sumDimWithPreambleChain,
-  sumWithEpilogue,
   sumWithPreambleEpilogue,
 } from "./ops/reductions";
 export {
