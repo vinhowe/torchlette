@@ -292,7 +292,7 @@ export async function executeFusedSegment(
  * (e.g., binding limits, non-contiguous inputs, oversized buffers).
  * Fusion groups contain only elementwise ops, so no pattern matching needed.
  */
-export async function executeSequentialSegment(
+async function executeSequentialSegment(
   nodes: LazyIRNode[],
   backend: Backend,
 ): Promise<void> {
