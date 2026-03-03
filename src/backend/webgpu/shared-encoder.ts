@@ -39,7 +39,6 @@ import {
 } from "./webgpu-state";
 
 // Re-exports from webgpu-state
-export type { BatchExecutionContext } from "./webgpu-state";
 export {
   getSubmitCount,
   incrementSubmitCount,
