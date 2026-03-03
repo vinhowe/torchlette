@@ -46,16 +46,6 @@ import {
   sharedEncoderActive as sharedEncoderFlag,
 } from "./webgpu-state";
 
-// ============================================================================
-// Params Buffer Pool (state in webgpu-state.ts, re-exported for backward compat)
-// ============================================================================
-
-export {
-  MAX_PARAMS_POOL_SIZE_PER_CLASS,
-  paramsBufferPools,
-  paramsBufferSizeClass,
-} from "./webgpu-state";
-
 // Pre-allocated Uint32Array pool to avoid ~700 short-lived allocations per step.
 // Each op dispatch creates a params array; reusing pre-allocated arrays reduces GC pressure.
 const paramsArrayPool: Uint32Array[] = [];

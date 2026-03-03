@@ -130,7 +130,7 @@ export function isF16Supported(): boolean {
  * Convert a f32 value to f16 (IEEE 754 half-precision).
  * Returns a 16-bit unsigned integer representing the f16 value.
  */
-export function f32ToF16(value: number): number {
+function f32ToF16(value: number): number {
   const floatView = new Float32Array(1);
   const int32View = new Int32Array(floatView.buffer);
 
@@ -181,7 +181,7 @@ export function f32ToF16(value: number): number {
 /**
  * Convert a f16 value (16-bit unsigned int) to f32.
  */
-export function f16ToF32(h: number): number {
+function f16ToF32(h: number): number {
   const sign = (h >>> 15) & 0x1;
   const exp = (h >>> 10) & 0x1f;
   const frac = h & 0x3ff;

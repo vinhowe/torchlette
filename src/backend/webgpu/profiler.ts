@@ -578,13 +578,8 @@ export async function readGpuTimestamps(): Promise<void> {
 // Reporting
 // ---------------------------------------------------------------------------
 
-function padR(s: string, len: number): string {
-  return s.length >= len ? s : s + " ".repeat(len - s.length);
-}
-
-function padL(s: string, len: number): string {
-  return s.length >= len ? s : " ".repeat(len - s.length) + s;
-}
+const padR = (s: string, n: number) => s.padEnd(n);
+const padL = (s: string, n: number) => s.padStart(n);
 
 function nsToMs(ns: bigint): number {
   return Number(ns) / 1_000_000;
