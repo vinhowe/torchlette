@@ -17,10 +17,6 @@ import {
 } from "./shape-utils";
 import { arenaBufferSet } from "./webgpu-state";
 
-function toArrayUnsupported(): number[] {
-  throw new Error("Use cpu() to read back WebGPU tensors");
-}
-
 /**
  * Create a WebGPU tensor with optional stride info.
  * If strides not provided, assumes contiguous layout.
@@ -66,7 +62,9 @@ export function createTensor(
     isContiguous: isContiguousLayout,
     dtype,
     ownsBuffer,
-    toArray: toArrayUnsupported,
+    toArray: () => {
+      throw new Error("Use cpu() to read back WebGPU tensors");
+    },
     destroy(): void {
       if (destroyed) return;
       destroyed = true;

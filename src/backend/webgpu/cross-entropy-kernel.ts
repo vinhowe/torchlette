@@ -11,8 +11,8 @@
  * Backward: logits [B, V] + targets [B] + grad_output [B] → grad_logits [B, V]
  */
 
+import { allocateOutputBuffer } from "./buffer-arena";
 import type { GPUBuffer } from "./gpu-types";
-import { allocateOutputBuffer } from "./index";
 import { WORKGROUP_SIZE } from "./shape-utils";
 import { createTileKernelDispatcher } from "./tile-dispatch";
 import { perRowKernel } from "./tile-ir";

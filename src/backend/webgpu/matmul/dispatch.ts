@@ -2,15 +2,15 @@
  * Matmul dispatch: kernel selection, pipeline caching, and execution.
  */
 
-import type { RecordedDispatch } from "../dispatch-recording";
 import {
   cachedCreateBindGroup,
-  dispatchComputePass,
-  getCurrentOpLabel,
   releaseParamsBuffer,
   createParamsBuffer as sharedCreateParamsBuffer,
-} from "../index";
+} from "../bind-group-cache";
+import { dispatchComputePass } from "../dispatch";
+import type { RecordedDispatch } from "../dispatch-recording";
 import { getWarmupPipeline, recordPipeline } from "../pipeline-warmup";
+import { getCurrentOpLabel } from "../shared-encoder";
 
 /** Module-level recording buffer (shared with index.ts recording system). */
 let matmulRecordingBuffer: RecordedDispatch[] | null = null;

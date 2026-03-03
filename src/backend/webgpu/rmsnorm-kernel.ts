@@ -9,9 +9,9 @@
  * Each workgroup handles one row (one sample/position in the batch).
  */
 
+import { allocateOutputBuffer } from "./buffer-arena";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
-import { allocateOutputBuffer } from "./index";
 import { WORKGROUP_SIZE } from "./shape-utils";
 import { createTileKernelDispatcher } from "./tile-dispatch";
 import { ceilDivGrid, perRowKernel, type TileKernelSpec } from "./tile-ir";

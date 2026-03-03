@@ -5,14 +5,14 @@
  * Supports vectorized memory coalescing (§15.3) for improved bandwidth.
  */
 
-import type { RecordedDispatch } from "./dispatch-recording";
 import {
-  allocateOutputBuffer,
   cachedCreateBindGroup,
   createParamsBuffer,
-  dispatchComputePass,
   releaseParamsBuffer,
-} from "./index";
+} from "./bind-group-cache";
+import { allocateOutputBuffer } from "./buffer-arena";
+import { dispatchComputePass } from "./dispatch";
+import type { RecordedDispatch } from "./dispatch-recording";
 import { trackSharedEncoderWrite } from "./webgpu-state";
 
 /** Module-level recording buffer (shared with index.ts recording system). */

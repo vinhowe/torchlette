@@ -172,30 +172,6 @@ export function isAdamBatchMode(): boolean {
   return encoderState.adamBatchMode;
 }
 
-/**
- * Return deferred uniform buffers to pool. Reverse iteration preserves LIFO
- * acquisition order for bind group cache stability. Replay-pinned buffers
- * are skipped (they're referenced by recorded bind groups).
- */
-function returnDeferredUniformBuffers(): void {
-  for (let i = encoderState.deferredUniformBuffers.length - 1; i >= 0; i--) {
-    const buf = encoderState.deferredUniformBuffers[i];
-    if (replayPinnedBufferSet?.has(buf)) continue;
-    const sc = paramsBufferSizeClass(buf.size);
-    const pool = paramsBufferPools.get(sc);
-    if (pool) {
-      if (pool.length < MAX_PARAMS_POOL_SIZE_PER_CLASS) {
-        pool.push(buf);
-      } else {
-        bufferPool.deferredDestroyUntracked(buf);
-      }
-    } else {
-      paramsBufferPools.set(sc, [buf]);
-    }
-  }
-  encoderState.deferredUniformBuffers = [];
-}
-
 export function beginSharedEncoder(): void {
   if (!encoderState.enabled) return;
   if (encoderState.depth === 0) {
@@ -242,7 +218,24 @@ function finishAndSubmitEncoder(createNew: boolean): void {
   encoderState.collectedCommandBuffers = [];
   resetSharedEncoderWriteSet();
   encoderState.passCount = 0;
-  returnDeferredUniformBuffers();
+  // Return deferred uniform buffers to pool. Reverse iteration preserves LIFO
+  // acquisition order for bind group cache stability.
+  for (let i = encoderState.deferredUniformBuffers.length - 1; i >= 0; i--) {
+    const buf = encoderState.deferredUniformBuffers[i];
+    if (replayPinnedBufferSet?.has(buf)) continue;
+    const sc = paramsBufferSizeClass(buf.size);
+    const pool = paramsBufferPools.get(sc);
+    if (pool) {
+      if (pool.length < MAX_PARAMS_POOL_SIZE_PER_CLASS) {
+        pool.push(buf);
+      } else {
+        bufferPool.deferredDestroyUntracked(buf);
+      }
+    } else {
+      paramsBufferPools.set(sc, [buf]);
+    }
+  }
+  encoderState.deferredUniformBuffers = [];
 }
 
 /**
