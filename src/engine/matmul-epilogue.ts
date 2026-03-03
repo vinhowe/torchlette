@@ -78,12 +78,7 @@ export interface MatmulEpiloguePlan {
   /** Number of nodes consumed (matmul + epilogue ops) */
   consumedCount: number;
   /** Epilogue operations to fuse */
-  epilogueOps: Array<{
-    kind: string;
-    toDtype?: DType;
-    inputIndex?: number;
-    op?: string;
-  }>;
+  epilogueOps: EpilogueOp[];
   /** Additional inputs required by epilogue (e.g. bias tensor) */
   epilogueInputRefs: LazyRef[];
   /** Output dtype after epilogue */
@@ -114,7 +109,7 @@ export function detectMatmulEpilogueCore(
   const matmulNode = nodes[startIdx];
   if (matmulNode.op !== "matmul") return null;
 
-  const epilogueOps: MatmulEpiloguePlan["epilogueOps"] = [];
+  const epilogueOps: EpilogueOp[] = [];
   const epilogueInputRefs: LazyRef[] = [];
   let additionalInputCount = 0;
   let chainLength = 0;
@@ -414,5 +409,3 @@ export async function executeMatmulWithEpilogue(
     resultTensor,
   );
 }
-
-// shapesEqual re-exported from core/shape

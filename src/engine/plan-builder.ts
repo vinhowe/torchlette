@@ -35,35 +35,24 @@ export function segmentPlanAtCheckpoints(plan: ExecutionPlan): ExecutionPlan[] {
   return segments;
 }
 
+/**
+ * Build an execution plan from a single root node.
+ */
 export function buildPlan(root: LazyIRNode): ExecutionPlan {
-  const nodes: LazyIRNode[] = [];
-  const visited = new Set<LazyIRNode>();
-
-  const visit = (ref: LazyRef) => {
-    if (ref.kind !== "pending") return;
-    if (visited.has(ref.node)) return;
-    visited.add(ref.node);
-
-    for (const input of ref.node.inputs) {
-      visit(input);
-    }
-    nodes.push(ref.node);
-  };
-
-  visit({ kind: "pending", node: root });
-
-  return { nodes };
+  return buildMergedPlan([root]);
 }
 
 /**
  * Build an execution plan from multiple root nodes.
  * Used to merge recomputations from multiple checkpoint regions into a single plan.
  *
- * This enables unified backward execution where all checkpointed layers'
- * recomputations are executed in one plan with proper segmentation at
- * checkpoint boundaries.
+ * Uses object identity for visited tracking instead of numeric IDs.
+ * Node IDs can collide when resetNodeIdCounter() is called between
+ * API instances (e.g., in tests), but lingering pending tensors from
+ * a previous instance still reference old node objects.
  *
  * @param roots - Array of LazyIRNode roots to include in the plan
+ * @param skipExecuted - Skip nodes that already have results from a previous force call
  * @returns A single ExecutionPlan containing all nodes from all roots
  */
 export function buildMergedPlan(
@@ -71,17 +60,10 @@ export function buildMergedPlan(
   skipExecuted = false,
 ): ExecutionPlan {
   const nodes: LazyIRNode[] = [];
-  // Use object identity for visited tracking instead of numeric IDs.
-  // Node IDs can collide when resetNodeIdCounter() is called between
-  // API instances (e.g., in tests), but lingering pending tensors from
-  // a previous instance still reference old node objects. ID-based
-  // deduplication would incorrectly merge distinct node objects.
   const visited = new Set<LazyIRNode>();
 
   const visit = (ref: LazyRef) => {
     if (ref.kind !== "pending") return;
-    // Skip nodes that were already executed (have results from a previous force call).
-    // Their results are accessible via ref.node.result in getInputStorage().
     if (skipExecuted && ref.node.result) return;
     if (visited.has(ref.node)) return;
     visited.add(ref.node);

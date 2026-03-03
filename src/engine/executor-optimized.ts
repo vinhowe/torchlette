@@ -39,6 +39,7 @@ import { type LoweredPlan, LoweredPlanBuilder } from "./lowered-plan";
 import type { MatmulPrologueInfo } from "./matmul-epilogue";
 import { extractPlanMetadata, pretunePlanMatmuls } from "./plan-builder";
 import {
+  buildConsumerCount,
   type CompoundMatchExec,
   DEFAULT_RECLAIM_INTERVAL,
   executeFusedSegment,
@@ -629,21 +630,10 @@ export async function executePlanOptimized(
   // On cache hit, build it from the reconstructed plan nodes.
   let planConsumerCount: Map<number, number> | undefined;
   if (backend.name === "webgpu") {
-    if (!cachedTemplate && analysisConsumerCount) {
-      planConsumerCount = analysisConsumerCount;
-    } else {
-      planConsumerCount = new Map<number, number>();
-      for (const n of planNodes) {
-        for (const ref of n.inputs) {
-          if (ref.kind === "pending") {
-            planConsumerCount.set(
-              ref.node.id,
-              (planConsumerCount.get(ref.node.id) ?? 0) + 1,
-            );
-          }
-        }
-      }
-    }
+    planConsumerCount =
+      !cachedTemplate && analysisConsumerCount
+        ? analysisConsumerCount
+        : buildConsumerCount(planNodes);
   }
 
   // Wrap the entire segment loop in a top-level shared encoder scope.

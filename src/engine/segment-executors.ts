@@ -51,7 +51,7 @@ import {
 import { releaseDeadTensors } from "./storage-tracker";
 
 /** Build a map of nodeId → consumer count from plan nodes. */
-function buildConsumerCount(nodes: LazyIRNode[]): Map<number, number> {
+export function buildConsumerCount(nodes: LazyIRNode[]): Map<number, number> {
   const counts = new Map<number, number>();
   for (const n of nodes) {
     for (const ref of n.inputs) {
