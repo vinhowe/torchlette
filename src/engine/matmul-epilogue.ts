@@ -1,4 +1,4 @@
-import type { Backend, BackendTensor, DType } from "../backend/types";
+import type { BackendTensor, DType } from "../backend/types";
 import { asGPUTensor } from "../backend/webgpu/gpu-types";
 import { shapesEqual } from "../core/shape";
 import type { LazyIRNode, LazyRef } from "./lazy-types";
@@ -289,7 +289,6 @@ export function _detectTransposeView(tensor: {
 export async function executeMatmulWithEpilogue(
   matmulNode: LazyIRNode,
   plan: MatmulEpiloguePlan,
-  _backend: Backend,
 ): Promise<void> {
   // Use cached imports (initialized once at executeLoweredPlan/executePlanOptimized entry)
   await ensureWebGPUMatmulImports();

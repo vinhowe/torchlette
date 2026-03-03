@@ -197,7 +197,6 @@ function sliceColumns(
 function scatterColumnsToOutput(
   partial: WebGPUTensor,
   outBuffer: GPUBuffer,
-  _M: number,
   N: number,
   colStart: number,
 ): void {
@@ -369,7 +368,6 @@ function matmulChunked(
       K,
       N,
       batchSize,
-      batchDims,
       outShape,
       maxBindingSize,
       minAlignment,
@@ -394,7 +392,6 @@ function matmulChunked(
     K,
     N,
     batchSize,
-    batchDims,
     outShape,
     maxBindingSize,
     minAlignment,
@@ -415,7 +412,6 @@ function matmulChunkedTransposed(
   K: number,
   N: number,
   batchSize: number,
-  _batchDims: number[],
   outShape: number[],
   maxBindingSize: number,
   minAlignment: number,
@@ -530,13 +526,7 @@ function matmulChunkedTransposed(
     const { tensor: partialTensor, colStart } = partial;
 
     // Scatter columns from partial [batchSize*M, chunkWidth] to output [batchSize*M, N]
-    scatterColumnsToOutput(
-      partialTensor,
-      outBuffer,
-      batchSize * M,
-      N,
-      colStart,
-    );
+    scatterColumnsToOutput(partialTensor, outBuffer, N, colStart);
 
     // Destroy the partial result buffer (deferred destruction waits for GPU fence)
     partialTensor.destroy?.();
@@ -556,7 +546,6 @@ function matmulChunkedContiguous(
   K: number,
   N: number,
   batchSize: number,
-  _batchDims: number[],
   outShape: number[],
   maxBindingSize: number,
   minAlignment: number,
@@ -618,13 +607,7 @@ function matmulChunkedContiguous(
   for (const partial of partialOutputs) {
     const { tensor: partialTensor, colStart } = partial;
 
-    scatterColumnsToOutput(
-      partialTensor,
-      outBuffer,
-      batchSize * M,
-      N,
-      colStart,
-    );
+    scatterColumnsToOutput(partialTensor, outBuffer, N, colStart);
 
     // Destroy the partial result buffer (deferred destruction waits for GPU fence)
     partialTensor.destroy?.();
@@ -727,13 +710,7 @@ function matmulChunkedOutput(
     const partialResult = dispatchMatmul(aReshaped, bSlice, false, false);
 
     // Copy partial result to output buffer at the right column offset
-    scatterColumnsToOutput(
-      partialResult,
-      outBuffer,
-      batchSize * M,
-      N,
-      colStart,
-    );
+    scatterColumnsToOutput(partialResult, outBuffer, N, colStart);
 
     // Destroy temporary buffers after scattering (deferred destruction waits for GPU fence)
     bSlice.destroy?.();

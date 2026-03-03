@@ -105,7 +105,7 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
       src = asGPUTensor(contiguous(tensor));
       contiguousCopy = src;
     }
-    const result = castChunked(src, dtype, ctx, maxBindingSize, limits);
+    const result = castChunked(src, dtype, ctx, limits);
     if (contiguousCopy) contiguousCopy.destroy();
     return result;
   }
@@ -150,7 +150,6 @@ function castChunked(
   tensor: WebGPUTensor,
   dtype: DType,
   ctx: ReturnType<typeof requireContext>,
-  _maxBindingSize: number,
   limits: Record<string, number>,
 ): BackendTensor {
   const srcBytesPerElement = dtypeBytes(tensor.dtype);
