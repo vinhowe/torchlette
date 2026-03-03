@@ -83,14 +83,6 @@ class SimpleBufferPool {
   private releaseToPool = 0;
   private releaseToDestroy = 0;
 
-  setDebugTrace(enabled: boolean): void {
-    this.debugTrace = enabled;
-  }
-
-  getPendingReleaseCount(): number {
-    return this.pendingRelease.length;
-  }
-
   getDetailedStats() {
     return {
       acquireFromPool: this.acquireFromPool,
