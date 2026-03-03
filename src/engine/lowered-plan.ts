@@ -31,18 +31,7 @@ import type {
   GPUBuffer,
   GPUComputePipeline,
 } from "../backend/webgpu/gpu-types";
-
-// ============================================================================
-// Shared Types
-// ============================================================================
-
-/** An epilogue operation descriptor (cast, binary add/mul, unary activation). */
-type EpilogueOp = {
-  kind: string;
-  toDtype?: DType;
-  inputIndex?: number;
-  op?: string;
-};
+import type { EpilogueOp } from "./matmul-epilogue";
 
 /** A path to resolve a tensor reference: planNodes[planNodeIndex].inputs[inputIndex]. */
 type PlanNodePath = { planNodeIndex: number; inputIndex: number };
@@ -82,9 +71,9 @@ interface LoweredFusedAction {
   }>;
 }
 
-/** A single non-fused op dispatch. */
-interface LoweredSequentialAction {
-  kind: "sequential";
+/** A single-node action (sequential op, view, data source, or prologue skip). */
+interface LoweredNodeAction {
+  kind: "sequential" | "view" | "data-source" | "prologue-skip";
   /** Plan-node index for this op. */
   nodeIndex: number;
 }
@@ -225,27 +214,6 @@ interface LoweredReductionFusionAction {
   isMean: boolean;
 }
 
-/** A view op (metadata only, no GPU dispatch). */
-interface LoweredViewAction {
-  kind: "view";
-  /** Plan-node index. */
-  nodeIndex: number;
-}
-
-/** A data source op (tensorFromArray, zeros, full, arange). */
-interface LoweredDataSourceAction {
-  kind: "data-source";
-  /** Plan-node index. */
-  nodeIndex: number;
-}
-
-/** A prologue-skipped cast node (absorbed into matmul). */
-interface LoweredPrologueSkipAction {
-  kind: "prologue-skip";
-  /** Plan-node index. */
-  nodeIndex: number;
-}
-
 /** A batch of consecutive adamStep nodes. */
 interface LoweredAdamBatchAction {
   kind: "adam-batch";
@@ -274,14 +242,11 @@ interface LoweredCompoundAction {
 /** Union of all lowered action types. */
 type LoweredAction =
   | LoweredFusedAction
-  | LoweredSequentialAction
+  | LoweredNodeAction
   | LoweredMatmulEpilogueAction
   | LoweredReductionPreambleAction
   | LoweredReductionEpilogueAction
   | LoweredReductionFusionAction
-  | LoweredViewAction
-  | LoweredDataSourceAction
-  | LoweredPrologueSkipAction
   | LoweredAdamBatchAction
   | LoweredReclaimAction
   | LoweredCompoundAction;
@@ -481,12 +446,7 @@ export class LoweredPlanBuilder {
     matmulNodeIndex: number,
     coveredNodeIndices: number[],
     outputNodeIndex: number,
-    epilogueOps: Array<{
-      kind: string;
-      toDtype?: DType;
-      inputIndex?: number;
-      op?: string;
-    }>,
+    epilogueOps: EpilogueOp[],
     epilogueInputCount: number,
     outputDtype: DType,
     consumedCount: number,
@@ -538,12 +498,7 @@ export class LoweredPlanBuilder {
     outputNodeIndex: number,
     preambleOps: Array<{ op: string; arity: number; chainInputPos?: 0 | 1 }>,
     preambleInputDtypes: DType[],
-    epilogueOps: Array<{
-      kind: string;
-      toDtype?: DType;
-      inputIndex?: number;
-      op?: string;
-    }>,
+    epilogueOps: EpilogueOp[],
     epilogueInputCount: number,
     outputDtype: DType,
     consumedCount: number,
@@ -570,12 +525,7 @@ export class LoweredPlanBuilder {
     reductionNodeIndex: number,
     coveredNodeIndices: number[],
     outputNodeIndex: number,
-    epilogueOps: Array<{
-      kind: string;
-      toDtype?: DType;
-      inputIndex?: number;
-      op?: string;
-    }>,
+    epilogueOps: EpilogueOp[],
     epilogueInputCount: number,
     outputDtype: DType,
     consumedCount: number,
