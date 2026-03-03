@@ -40,7 +40,7 @@ import {
   profileOpEnd,
   setProfileModule,
 } from "../backend/webgpu/profiler";
-import { contiguousStrides, shapesEqual, sizeOf } from "../core/shape";
+import { contiguousStrides, shapesEqual } from "../core/shape";
 import type {
   OptimizedExecutionResult,
   OptimizedExecutionStats,
@@ -83,7 +83,10 @@ import {
   executeReductionWithPreamble,
   formatEpilogueLabel,
 } from "./reduction-preamble";
-import { executeFusedSegment } from "./segment-executors";
+import {
+  executeCompoundSoftmax,
+  executeFusedSegment,
+} from "./segment-executors";
 import { storageTracker } from "./storage-tracker";
 
 type AdamStepFn = NonNullable<
@@ -1262,51 +1265,15 @@ export async function executeLoweredPlan(
         }
 
         case "compound": {
-          // Execute a compound pattern (softmax, log_softmax) as a single fused kernel.
-          const { dispatchFusedSoftmax } = await import(
-            "../backend/webgpu/softmax-kernel"
-          );
-
-          // The output node is where the result goes
           const compOutNode = planNodes[action.outputNodeIndex];
-          // The first covered node's first input is the pattern's input tensor
           const firstCoveredNode = planNodes[action.coveredNodeIndices[0]];
-          const nodeBackend = getBackend(firstCoveredNode.device) ?? backend;
-          const inputStorage = getInputStorage(
-            firstCoveredNode.inputs[0],
-            nodeBackend,
+          await executeCompoundSoftmax(
+            firstCoveredNode,
+            compOutNode,
+            action.dim,
+            action.name,
+            backend,
           );
-          const inputBT = asGPUTensor(inputStorage.backendTensor);
-
-          // Compute reduction geometry
-          const shape = inputBT.shape;
-          const dim = action.dim < 0 ? shape.length + action.dim : action.dim;
-          const dimSize = shape[dim];
-          let numRows = 1;
-          for (let d = 0; d < dim; d++) numRows *= shape[d];
-
-          const isLog = action.name === "log_softmax";
-          const outBuffer = dispatchFusedSoftmax(
-            inputBT.buffer,
-            numRows,
-            dimSize,
-            isLog,
-          );
-
-          // Create result on the output node
-          const outShape = shape.slice();
-          const outStrides = contiguousStrides(outShape);
-          compOutNode.result = createStorageHandle(firstCoveredNode.device, {
-            buffer: outBuffer,
-            shape: outShape,
-            dtype: "f32",
-            size: sizeOf(outShape),
-            strides: outStrides,
-            offset: 0,
-            isContiguous: true,
-            ownsBuffer: true,
-          });
-
           captureAndRecordResult(action.outputNodeIndex, compOutNode);
           break;
         }

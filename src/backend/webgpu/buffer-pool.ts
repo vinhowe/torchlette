@@ -783,13 +783,6 @@ export function setBufferPoolBudget(bytes: number | null): void {
 }
 
 /**
- * Get the current buffer pool budget in bytes (Infinity if no limit).
- */
-export function getBufferPoolBudget(): number {
-  return bufferPool.getMaxPoolBytes();
-}
-
-/**
  * Flush pending buffers to make them immediately available for reuse.
  *
  * Call this when GPU work is known to be complete (e.g., at the start of

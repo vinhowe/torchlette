@@ -50,6 +50,49 @@ import {
 } from "./reduction-preamble";
 import { releaseDeadTensors } from "./storage-tracker";
 
+/**
+ * Execute a compound softmax/log_softmax pattern as a single fused kernel.
+ * Shared by both the first-time execution path (segment-executors) and the
+ * lowered plan replay path (executor-lowered).
+ */
+export async function executeCompoundSoftmax(
+  inputNode: LazyIRNode,
+  outputNode: LazyIRNode,
+  dim: number,
+  name: string,
+  backend: Backend,
+): Promise<void> {
+  const { dispatchFusedSoftmax } = await import(
+    "../backend/webgpu/softmax-kernel"
+  );
+  const nodeBackend = getBackend(inputNode.device) ?? backend;
+  const inputStorage = getInputStorage(inputNode.inputs[0], nodeBackend);
+  const inputBT = asGPUTensor(inputStorage.backendTensor);
+  const shape = inputBT.shape;
+  const normDim = dim < 0 ? shape.length + dim : dim;
+  const dimSize = shape[normDim];
+  let numRows = 1;
+  for (let d = 0; d < normDim; d++) numRows *= shape[d];
+  const isLog = name === "log_softmax";
+  const outBuffer = dispatchFusedSoftmax(
+    inputBT.buffer,
+    numRows,
+    dimSize,
+    isLog,
+  );
+  const outShape = shape.slice();
+  outputNode.result = createStorageHandle(inputNode.device, {
+    buffer: outBuffer,
+    shape: outShape,
+    dtype: "f32",
+    size: sizeOf(outShape),
+    strides: contiguousStrides(outShape),
+    offset: 0,
+    isContiguous: true,
+    ownsBuffer: true,
+  });
+}
+
 /** Build a map of nodeId → consumer count from plan nodes. */
 export function buildConsumerCount(nodes: LazyIRNode[]): Map<number, number> {
   const counts = new Map<number, number>();
@@ -444,49 +487,15 @@ export async function executeSequentialSegmentWithEarlyRelease(
           continue;
         }
 
-        // Execute compound kernel. We lazy-import to avoid circular deps.
-        const { dispatchFusedSoftmax } = await import(
-          "../backend/webgpu/softmax-kernel"
+        const outputNode =
+          nodes[nodes.findIndex((n) => n.id === match.outputNodeId)];
+        await executeCompoundSoftmax(
+          node,
+          outputNode,
+          match.dim,
+          match.name,
+          backend,
         );
-
-        // Resolve input: the max node's input[0]
-        const nodeBackend = getBackend(node.device) ?? backend;
-        const inputStorage = getInputStorage(node.inputs[0], nodeBackend);
-        const inputBT = asGPUTensor(inputStorage.backendTensor);
-
-        // Compute reduction geometry: numRows = product of dims before dim,
-        // dimSize = shape[dim]
-        const outputNodeIdx = nodes.findIndex(
-          (n) => n.id === match.outputNodeId,
-        );
-        const outputNode = nodes[outputNodeIdx];
-        const shape = inputBT.shape;
-        const dim = match.dim < 0 ? shape.length + match.dim : match.dim;
-        const dimSize = shape[dim];
-        let numRows = 1;
-        for (let d = 0; d < dim; d++) numRows *= shape[d];
-
-        const isLog = match.name === "log_softmax";
-        const outBuffer = dispatchFusedSoftmax(
-          inputBT.buffer,
-          numRows,
-          dimSize,
-          isLog,
-        );
-
-        // Create result storage on the output node
-        const outShape = shape.slice();
-        const outStrides = contiguousStrides(outShape);
-        outputNode.result = createStorageHandle(node.device, {
-          buffer: outBuffer,
-          shape: outShape,
-          dtype: "f32",
-          size: sizeOf(outShape),
-          strides: outStrides,
-          offset: 0,
-          isContiguous: true,
-          ownsBuffer: true,
-        });
 
         const coveredCount = match.coveredNodeIds.size;
         advanceConsumed(nodeIdx, coveredCount);

@@ -39,7 +39,6 @@ export {
   clearBufferPool,
   deferredDestroyBuffer,
   flushBufferPool,
-  getBufferPoolBudget,
   getBufferPoolDetailedStats,
   getBufferPoolStats,
   resetBufferPoolDetailedStats,
@@ -64,9 +63,7 @@ export {
 export {
   destroyWebGPU,
   f16ArrayToF32Array,
-  f16ToF32,
   f32ArrayToF16Array,
-  f32ToF16,
   getMaxStorageBufferBindingSize,
   getWebGPUDevice,
   getWebGPUInitError,
