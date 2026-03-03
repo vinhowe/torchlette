@@ -11,7 +11,7 @@
  */
 
 import type { DType } from "../backend/types";
-import type { LazyOpCode } from "./lazy";
+import type { LazyOpCode } from "./lazy-types";
 
 export type OpDtypeCategory =
   | "f16_eligible"

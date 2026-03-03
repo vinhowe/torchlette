@@ -136,28 +136,6 @@ function simpleHash(str: string): string {
 }
 
 /**
- * Extract input signatures from an IR graph.
- * Identifies which nodes are external inputs vs computed nodes.
- */
-function extractInputSignatures(graph: IRGraph): InputSignature[] {
-  const nodeIds = new Set(graph.nodes.map((n) => n.id));
-  const signatures: InputSignature[] = [];
-
-  for (const node of graph.nodes) {
-    // Check if any input is external (not in this graph)
-    const hasExternalInput = node.inputs.some((id) => !nodeIds.has(id));
-
-    signatures.push({
-      shape: node.shape?.slice() ?? [],
-      dtype: node.dtype ?? "f32",
-      isInput: hasExternalInput || node.inputs.length === 0,
-    });
-  }
-
-  return signatures;
-}
-
-/**
  * Generate a full cache key for a compiled graph.
  *
  * @param graph - The IR graph
@@ -167,9 +145,19 @@ export function generateCacheKey(
   graph: IRGraph,
   scalarsByNode?: Map<number, number[]>,
 ): CompiledCacheKey {
+  const nodeIds = new Set(graph.nodes.map((n) => n.id));
+  const inputSignatures: InputSignature[] = [];
+  for (const node of graph.nodes) {
+    const hasExternalInput = node.inputs.some((id) => !nodeIds.has(id));
+    inputSignatures.push({
+      shape: node.shape?.slice() ?? [],
+      dtype: node.dtype ?? "f32",
+      isInput: hasExternalInput || node.inputs.length === 0,
+    });
+  }
   return {
     irHash: hashIRGraph(graph, scalarsByNode),
-    inputSignatures: extractInputSignatures(graph),
+    inputSignatures,
   };
 }
 
