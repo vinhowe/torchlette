@@ -118,25 +118,7 @@ export function abortBatch(): void {
 // ============================================================================
 // Shared Encoder — Command Buffer Consolidation
 // ============================================================================
-//
-// Multiple compute passes are encoded into a shared GPUCommandEncoder to reduce
-// queue.submit() calls. A write-set tracks all buffers written during the current
-// encoder scope so the buffer pool never returns a buffer that was already written
-// in this scope (preventing the aliasing corruption that broke previous attempts).
-//
-// Ops that create their own encoders (matmul, reductions) flush the shared encoder
-// first, then their command buffer is collected and submitted alongside the
-// shared encoder's CB at flush/end time.
 
-// True Shared Encoder: a single GPUCommandEncoder is shared across multiple ops.
-// Each op encodes its compute pass directly onto the shared encoder instead of
-// creating its own encoder + command buffer. This eliminates ~3700 encoder
-// creations per DistilGPT-2 training step.
-//
-// The write set tracks buffers written during the current shared encoder scope
-// to prevent buffer pool aliasing — ensuring a buffer written by an earlier op
-// is not reused as output for a later op within the same scope.
-//
 /**
  * Shared encoder mutable state — groups all module-level let variables
  * into a single typed object for debuggability and explicit reset.
@@ -230,25 +212,25 @@ export function beginSharedEncoder(): void {
 }
 
 /**
- * Flush the shared encoder: finish current encoder into a CB, combine with
- * any collected CBs, submit all, then create a fresh encoder.
+ * Finish current encoder, combine with collected CBs, submit, and reset state.
+ * When createNew is true (flush), a fresh encoder is created for continued encoding.
+ * When createNew is false (end), the encoder is nulled out.
  */
-export function flushSharedEncoder(): void {
-  if (!sharedEncoderActive) return;
+function finishAndSubmitEncoder(createNew: boolean): void {
   const ctx = requireContext();
-
-  // Finish the shared encoder into a command buffer
   const cbs: GPUCommandBuffer[] = [];
   if (encoderState.instance) {
     resolveGpuTimestamps();
     cbs.push(encoderState.instance.finish());
+    encoderState.instance = createNew
+      ? ctx.device.createCommandEncoder()
+      : null;
   }
-  // Add any collected CBs (from ops that bypassed the shared encoder)
   cbs.push(...encoderState.collectedCommandBuffers);
 
   if (DEBUG_SHARED_ENCODER && cbs.length > 0) {
     console.log(
-      `[shared-enc] FLUSH: ${encoderState.passCount} passes on encoder, ${encoderState.collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`,
+      `[shared-enc] ${createNew ? "FLUSH" : "END"}: ${encoderState.passCount} passes, ${encoderState.collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`,
     );
   }
 
@@ -257,19 +239,24 @@ export function flushSharedEncoder(): void {
     incrementSubmitCount();
   }
 
-  // Reset state and create fresh encoder
   encoderState.collectedCommandBuffers = [];
   resetSharedEncoderWriteSet();
-  encoderState.instance = ctx.device.createCommandEncoder();
   encoderState.passCount = 0;
-
   returnDeferredUniformBuffers();
+}
 
-  // NOTE: Do NOT flush pendingRelease to pool here (§14.1). Mid-step buffer
-  // reclamation causes corruption — buffers released during a step (e.g.
-  // forward-pass intermediates) may still be in-flight on the GPU when
-  // reacquired by a subsequent op in the same step. Pending buffers are
-  // safely flushed at endSharedEncoder() (end-of-step).
+/**
+ * Flush the shared encoder: finish current encoder into a CB, combine with
+ * any collected CBs, submit all, then create a fresh encoder.
+ *
+ * NOTE: Does NOT flush pendingRelease to pool (§14.1). Mid-step buffer
+ * reclamation causes corruption — buffers released during a step may still
+ * be in-flight on the GPU when reacquired. Pending buffers are safely
+ * flushed at endSharedEncoder() (end-of-step).
+ */
+export function flushSharedEncoder(): void {
+  if (!sharedEncoderActive) return;
+  finishAndSubmitEncoder(true);
 }
 
 export function endSharedEncoder(): void {
@@ -284,34 +271,7 @@ export function endSharedEncoder(): void {
     }
 
     setSharedEncoderActive(false);
-    const ctx = requireContext();
-
-    // Finish the shared encoder and submit everything
-    const cbs: GPUCommandBuffer[] = [];
-    if (encoderState.instance) {
-      resolveGpuTimestamps();
-      cbs.push(encoderState.instance.finish());
-      encoderState.instance = null;
-    }
-    cbs.push(...encoderState.collectedCommandBuffers);
-
-    if (DEBUG_SHARED_ENCODER && cbs.length > 0) {
-      console.log(
-        `[shared-enc] END: ${encoderState.passCount} passes on encoder, ${encoderState.collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`,
-      );
-    }
-
-    if (cbs.length > 0) {
-      profileApiCall("queue.submit", () => ctx.queue.submit(cbs));
-      incrementSubmitCount();
-    }
-
-    encoderState.collectedCommandBuffers = [];
-    resetSharedEncoderWriteSet();
-
-    encoderState.passCount = 0;
-
-    returnDeferredUniformBuffers();
+    finishAndSubmitEncoder(false);
 
     // Flush storage buffer pendingRelease → main pool. The encoder was just
     // submitted, so buffers released by earlier passes are safe to reuse.
