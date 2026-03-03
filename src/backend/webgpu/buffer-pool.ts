@@ -773,16 +773,6 @@ class SimpleBufferPool {
   }
 
   /**
-   * Flush pending-release to pool AND destroy pending-destroy buffers,
-   * after awaiting GPU sync. Safe to call from any context.
-   */
-  async flushAndDestroyPending(): Promise<void> {
-    if (this.queue) await this.queue.onSubmittedWorkDone();
-    this.flushPendingToPool();
-    this.destroyPendingBuffers();
-  }
-
-  /**
    * Get bytes in pending queues (not yet safe to destroy).
    */
   getPendingBytes(): number {
@@ -876,15 +866,6 @@ export function flushBufferPool(): void {
   bufferPool.flushPendingToAvailable();
   bufferPool.sortPoolBuckets(); // deterministic acquire order for bind group cache
   bufferPool.beginWindow(); // Advance window counter for demand tracking
-}
-
-/**
- * Flush pending buffers to pool AND safely destroy pending-destroy buffers
- * after GPU sync. Use this at markStep() to prevent memory leaks from
- * non-poolable buffers (mappedAtCreation, staging buffers, etc.).
- */
-export async function flushBufferPoolWithSync(): Promise<void> {
-  await bufferPool.flushAndDestroyPending();
 }
 
 /**
