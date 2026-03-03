@@ -8,7 +8,6 @@ import {
   ensureWebGPUMatmulImports,
 } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
-import { buildConsumerCount } from "./segment-executors";
 
 // ============================================================================
 // Shared epilogue chain helpers (used by matmul-epilogue and reduction-preamble)
@@ -233,26 +232,6 @@ export function detectMatmulEpilogueCore(
     outputDtype,
     outputNode: currentNode,
   };
-}
-
-/**
- * Segment variant: detect matmul epilogue within a segment.
- * Also checks the full plan for consumer counts.
- */
-export function detectMatmulEpilogue(
-  nodes: LazyIRNode[],
-  startIdx: number,
-  allPlanNodes: LazyIRNode[],
-  externalNodeIds?: Set<number>,
-): MatmulEpiloguePlan | null {
-  // Build consumer count from full plan for accurate "only one consumer" checks
-  const consumerCount = buildConsumerCount(allPlanNodes);
-  return detectMatmulEpilogueCore(
-    nodes,
-    startIdx,
-    consumerCount,
-    externalNodeIds,
-  );
 }
 
 /**
