@@ -16,7 +16,7 @@ import type {
 import { createPendingRef, type LazyRef } from "../engine/lazy-types";
 import { createLazyIRNode } from "../engine/node-factory";
 
-export interface FusedOpResult {
+interface FusedOpResult {
   ref: LazyRef;
   shape: number[];
 }

@@ -1,5 +1,5 @@
-export type TokenId = number;
-export type TokenKind = "root" | "join" | "effect" | "token_only";
+type TokenId = number;
+type TokenKind = "root" | "join" | "effect" | "token_only";
 
 export interface Token {
   id: TokenId;
