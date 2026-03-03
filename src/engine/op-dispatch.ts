@@ -5,10 +5,6 @@ import type {
   BackendTensor,
   DeviceKind,
   DType,
-  FusedAttentionConfig,
-  FusedCrossEntropyConfig,
-  FusedLayerNormConfig,
-  FusedRMSNormConfig,
   GeluOptions,
 } from "../backend/types";
 import { getCurrentOpLabel, setCurrentOpLabel } from "../backend/webgpu";
@@ -533,182 +529,119 @@ function executeMutationOp(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Fused op dispatch table
+// ---------------------------------------------------------------------------
+
+type FusedOpDesc =
+  | { kind: "dispatch" }
+  | {
+      kind: "sideOutputs";
+      returnField: string;
+      sideOutputs: [storeKey: string, resultField: string][];
+    }
+  | {
+      kind: "rawSideOutputs";
+      returnField: string;
+      rawSideOutputs: [storeKey: string, resultField: string][];
+    }
+  | { kind: "extract"; key: string }
+  | { kind: "extractRaw"; key: string };
+
+/** Maps fused op names to their dispatch configuration. */
+const FUSED_OP_TABLE: Record<string, FusedOpDesc> = {
+  fusedCrossEntropyForward: { kind: "dispatch" },
+  fusedCrossEntropyBackward: { kind: "dispatch" },
+  fusedLayerNormForward: { kind: "dispatch" },
+  fusedLayerNormBackwardGradX: { kind: "dispatch" },
+  fusedLayerNormBackwardGradWeightBias: {
+    kind: "rawSideOutputs",
+    returnField: "gradWeight",
+    rawSideOutputs: [["lnBwdGradBias", "gradBias"]],
+  },
+  fusedRMSNormForward: { kind: "dispatch" },
+  fusedRMSNormBackwardGradX: { kind: "dispatch" },
+  fusedRMSNormBackwardGradWeight: { kind: "dispatch" },
+  fusedAttentionForward: {
+    kind: "sideOutputs",
+    returnField: "output",
+    sideOutputs: [["attnLogsumexp", "logsumexp"]],
+  },
+  fusedAttentionBackward: {
+    kind: "sideOutputs",
+    returnField: "dQ",
+    sideOutputs: [
+      ["attnBwdDK", "dK"],
+      ["attnBwdDV", "dV"],
+    ],
+  },
+  extractAttentionLogsumexp: { kind: "extract", key: "attnLogsumexp" },
+  extractAttentionDK: { kind: "extract", key: "attnBwdDK" },
+  extractAttentionDV: { kind: "extract", key: "attnBwdDV" },
+  extractLnBwdGradBias: { kind: "extractRaw", key: "lnBwdGradBias" },
+};
+
+type AnyOpFn = (...args: unknown[]) => unknown;
+
 function executeFusedOp(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
 ): BackendTensor | Promise<BackendTensor> {
-  switch (node.op) {
-    case "fusedAttentionForward": {
-      const payload = requirePayload<FusedAttentionConfig>(node);
-      assertOpSupported(
-        "fusedAttentionForward",
-        backend.ops.fusedAttentionForward,
-      );
-      const result = backend.ops.fusedAttentionForward(
-        backendInputs[0],
-        backendInputs[1],
-        backendInputs[2],
-        payload,
-      );
-      storeSideOutput(node, "attnLogsumexp", result.logsumexp);
-      return result.output;
-    }
-    case "extractAttentionLogsumexp":
-      return extractSideOutput(node, "attnLogsumexp");
-    case "fusedAttentionBackward": {
-      const payload = requirePayload<FusedAttentionConfig>(node);
-      assertOpSupported(
-        "fusedAttentionBackward",
-        backend.ops.fusedAttentionBackward,
-      );
-      const result = backend.ops.fusedAttentionBackward(
-        backendInputs[0],
-        backendInputs[1],
-        backendInputs[2],
-        backendInputs[3],
-        backendInputs[4],
-        backendInputs[5],
-        payload,
-      );
-      storeSideOutput(node, "attnBwdDK", result.dK);
-      storeSideOutput(node, "attnBwdDV", result.dV);
-      return result.dQ;
-    }
-    case "extractAttentionDK":
-      return extractSideOutput(node, "attnBwdDK");
-    case "extractAttentionDV":
-      return extractSideOutput(node, "attnBwdDV");
-    case "fusedCrossEntropyForward": {
-      const payload = requirePayload<FusedCrossEntropyConfig>(node);
-      assertOpSupported(
-        "fusedCrossEntropyForward",
-        backend.ops.fusedCrossEntropyForward,
-      );
-      return backend.ops.fusedCrossEntropyForward(
-        backendInputs[0],
-        backendInputs[1],
-        payload,
-      );
-    }
-    case "fusedCrossEntropyBackward": {
-      const payload = requirePayload<FusedCrossEntropyConfig>(node);
-      assertOpSupported(
-        "fusedCrossEntropyBackward",
-        backend.ops.fusedCrossEntropyBackward,
-      );
-      return backend.ops.fusedCrossEntropyBackward(
-        backendInputs[0],
-        backendInputs[1],
-        backendInputs[2],
-        payload,
-      );
-    }
-    case "fusedLayerNormForward": {
-      const payload = requirePayload<FusedLayerNormConfig>(node);
-      assertOpSupported(
-        "fusedLayerNormForward",
-        backend.ops.fusedLayerNormForward,
-      );
-      return backend.ops.fusedLayerNormForward(
-        backendInputs[0],
-        backendInputs[1],
-        backendInputs[2],
-        payload,
-      );
-    }
-    case "fusedLayerNormBackwardGradX": {
-      const payload = requirePayload<FusedLayerNormConfig>(node);
-      assertOpSupported(
-        "fusedLayerNormBackwardGradX",
-        backend.ops.fusedLayerNormBackwardGradX,
-      );
-      return backend.ops.fusedLayerNormBackwardGradX(
-        backendInputs[0],
-        backendInputs[1],
-        backendInputs[2],
-        payload,
-      );
-    }
-    case "fusedLayerNormBackwardGradWeightBias": {
-      const payload = requirePayload<FusedLayerNormConfig>(node);
-      assertOpSupported(
-        "fusedLayerNormBackwardGradWeightBias",
-        backend.ops.fusedLayerNormBackwardGradWeightBias,
-      );
-      const result = backend.ops.fusedLayerNormBackwardGradWeightBias(
-        backendInputs[0],
-        backendInputs[1],
-        payload,
-      );
-      // Store raw gradBias BackendTensor for extractLnBwdGradBias
+  const desc = FUSED_OP_TABLE[node.op];
+  if (desc) {
+    if (desc.kind === "extract") return extractSideOutput(node, desc.key);
+    if (desc.kind === "extractRaw") return extractRawSideOutput(node, desc.key);
+
+    const payload = requirePayload(node);
+    const fn = backend.ops[node.op as keyof Backend["ops"]] as
+      | AnyOpFn
+      | undefined;
+    assertOpSupported(node.op, fn);
+    const result = fn(...backendInputs, payload);
+
+    if (desc.kind === "dispatch") return result as BackendTensor;
+
+    const r = result as Record<string, BackendTensor>;
+    if (desc.kind === "sideOutputs") {
+      for (const [storeKey, field] of desc.sideOutputs) {
+        storeSideOutput(node, storeKey, r[field]);
+      }
+    } else {
       if (!node._sideOutputs) node._sideOutputs = {};
-      node._sideOutputs.lnBwdGradBias = result.gradBias;
-      return result.gradWeight;
+      for (const [storeKey, field] of desc.rawSideOutputs) {
+        node._sideOutputs[storeKey] = r[field];
+      }
     }
-    case "extractLnBwdGradBias":
-      return extractRawSideOutput(node, "lnBwdGradBias");
-    case "fusedRMSNormForward": {
-      const payload = requirePayload<FusedRMSNormConfig>(node);
-      assertOpSupported("fusedRMSNormForward", backend.ops.fusedRMSNormForward);
-      return backend.ops.fusedRMSNormForward(
-        backendInputs[0],
-        backendInputs[1],
-        payload,
-      );
-    }
-    case "fusedRMSNormBackwardGradX": {
-      const payload = requirePayload<FusedRMSNormConfig>(node);
-      assertOpSupported(
-        "fusedRMSNormBackwardGradX",
-        backend.ops.fusedRMSNormBackwardGradX,
-      );
-      return backend.ops.fusedRMSNormBackwardGradX(
-        backendInputs[0],
-        backendInputs[1],
-        backendInputs[2],
-        payload,
-      );
-    }
-    case "fusedRMSNormBackwardGradWeight": {
-      const payload = requirePayload<FusedRMSNormConfig>(node);
-      assertOpSupported(
-        "fusedRMSNormBackwardGradWeight",
-        backend.ops.fusedRMSNormBackwardGradWeight,
-      );
-      return backend.ops.fusedRMSNormBackwardGradWeight(
-        backendInputs[0],
-        backendInputs[1],
-        backendInputs[2],
-        payload,
-      );
-    }
-    case "transfer": {
-      const transferPayload = getPayload<{ sourceDevice?: DeviceKind }>(node);
-      const sourceDevice =
-        transferPayload?.sourceDevice ??
-        (node.inputs[0]?.kind === "materialized"
-          ? node.inputs[0].storage.device
-          : undefined);
-      const sourceBackend = sourceDevice ? getBackend(sourceDevice) : backend;
-      if (!sourceBackend)
-        throw new Error(
-          `Transfer failed: backend not available for source device ${sourceDevice}`,
-        );
-      const targetBackend = getBackend(node.device);
-      if (!targetBackend)
-        throw new Error(
-          `Transfer failed: backend not available for ${node.device}`,
-        );
-      if (sourceDevice === node.device) return backendInputs[0]; // no-op
-      return (async () => {
-        const data = await sourceBackend.ops.read(backendInputs[0]);
-        return targetBackend.ops.tensorFromArray(data, node.shape);
-      })();
-    }
-    default:
-      throw new Error(`Unknown fused op: ${node.op}`);
+    return r[desc.returnField];
   }
+
+  // Special case: transfer (multi-backend, async)
+  if (node.op === "transfer") {
+    const transferPayload = getPayload<{ sourceDevice?: DeviceKind }>(node);
+    const sourceDevice =
+      transferPayload?.sourceDevice ??
+      (node.inputs[0]?.kind === "materialized"
+        ? node.inputs[0].storage.device
+        : undefined);
+    const sourceBackend = sourceDevice ? getBackend(sourceDevice) : backend;
+    if (!sourceBackend)
+      throw new Error(
+        `Transfer failed: backend not available for source device ${sourceDevice}`,
+      );
+    const targetBackend = getBackend(node.device);
+    if (!targetBackend)
+      throw new Error(
+        `Transfer failed: backend not available for ${node.device}`,
+      );
+    if (sourceDevice === node.device) return backendInputs[0]; // no-op
+    return (async () => {
+      const data = await sourceBackend.ops.read(backendInputs[0]);
+      return targetBackend.ops.tensorFromArray(data, node.shape);
+    })();
+  }
+
+  throw new Error(`Unknown fused op: ${node.op}`);
 }
 
 // ---------------------------------------------------------------------------
