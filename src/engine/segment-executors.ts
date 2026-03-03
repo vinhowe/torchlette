@@ -85,6 +85,7 @@ export const DEFAULT_RECLAIM_INTERVAL =
 
 /**
  * Execute a fused segment using a fused kernel.
+ * For WebGPU, dispatches a generated kernel. For other backends, falls back to sequential.
  */
 export async function executeFusedSegment(
   group: FusionGroup,
@@ -92,34 +93,11 @@ export async function executeFusedSegment(
   backend: Backend,
   enableVectorization: boolean,
 ): Promise<void> {
-  // For WebGPU, use the fused kernel dispatcher
-  if (backend.name === "webgpu" && "dispatchFusedKernel" in backend) {
-    await executeFusedWebGPU(
-      group,
-      recipe,
-      backend as Backend & {
-        device?: { limits?: { maxStorageBuffersPerShaderStage?: number } };
-      },
-      enableVectorization,
-    );
+  // For CPU or other backends, fall back to sequential execution
+  if (backend.name !== "webgpu" || !("dispatchFusedKernel" in backend)) {
+    await executeSequentialSegment(group.nodes, backend);
     return;
   }
-
-  // For CPU or other backends, fall back to sequential execution
-  await executeSequentialSegment(group.nodes, backend);
-}
-
-/**
- * Execute a fused segment on WebGPU using generated kernels.
- */
-export async function executeFusedWebGPU(
-  group: FusionGroup,
-  recipe: ReturnType<typeof groupToRecipe>,
-  backend: Backend & {
-    device?: { limits?: { maxStorageBuffersPerShaderStage?: number } };
-  },
-  enableVectorization: boolean,
-): Promise<void> {
   // Import fusion dispatch and buffer lifecycle helpers (cached on first call)
   const fusionDispatch = await import("../backend/webgpu/fusion-dispatch");
   const { dispatchFusedKernel } = fusionDispatch;
@@ -153,8 +131,12 @@ export async function executeFusedWebGPU(
     } as BackendTensor);
   };
 
-  // Get WebGPU device from backend
-  const device = backend.device;
+  // Get WebGPU device from backend (narrowed by the webgpu check above)
+  const device = (
+    backend as Backend & {
+      device?: { limits?: { maxStorageBuffersPerShaderStage?: number } };
+    }
+  ).device;
   if (!device) {
     // No device available - fall back to sequential
     recordFusionFallback("no_device", group.nodes.length);
