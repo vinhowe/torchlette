@@ -51,8 +51,6 @@ interface OptimizedExecutionOptions {
   enableFusion?: boolean;
   /** Enable vectorization for fused kernels (default: true) */
   enableVectorization?: boolean;
-  /** Minimum ops required to trigger fusion (default: 2) */
-  minFusionSize?: number;
   /** Enable early buffer release based on lifetime analysis */
   enableEarlyRelease?: boolean;
   /** Flush buffer pool every N nodes to reclaim dead buffers mid-plan (default: 50, 0=disabled) */
@@ -199,7 +197,6 @@ export async function executePlanOptimized(
   const {
     enableFusion = backend.name === "webgpu",
     enableVectorization = true,
-    minFusionSize = 2,
     enableEarlyRelease = false,
     reclaimInterval = DEFAULT_RECLAIM_INTERVAL,
   } = options;
@@ -530,10 +527,7 @@ export async function executePlanOptimized(
     };
 
     for (const segment of segments) {
-      if (
-        segment.kind === "fused" &&
-        segment.group.nodes.length >= minFusionSize
-      ) {
+      if (segment.kind === "fused" && segment.group.nodes.length >= 2) {
         fusedSegCount++;
         fusedNodeCount += segment.group.nodes.length;
         fusionGroupCount++;
@@ -658,10 +652,7 @@ export async function executePlanOptimized(
 
     // Execute each segment
     for (const segment of segments) {
-      if (
-        segment.kind === "fused" &&
-        segment.group.nodes.length >= minFusionSize
-      ) {
+      if (segment.kind === "fused" && segment.group.nodes.length >= 2) {
         // Execute fused segment
         await executeFusedSegment(
           segment.group,
