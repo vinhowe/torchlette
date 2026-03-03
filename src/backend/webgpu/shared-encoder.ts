@@ -360,7 +360,7 @@ export function endStep(): void {
   // Return any unconsumed pre-pinned buffers to the pool
   for (let i = 0; i < pinnedOutputBuffers.length; i++) {
     const buf = pinnedOutputBuffers[i];
-    if (buf !== null && buf !== undefined) {
+    if (buf != null) {
       bufferPool.returnToPool(buf, getSizeClass(buf.size));
       pinnedOutputBuffers[i] = null;
     }

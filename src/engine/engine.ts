@@ -18,7 +18,7 @@ function collectTensorHandles(value: unknown): EngineTensor[] {
   const out: EngineTensor[] = [];
   const seen = new Set<unknown>();
   const visit = (current: unknown) => {
-    if (current === null || current === undefined) return;
+    if (current == null) return;
     if (current instanceof EngineTensor) {
       out.push(current);
       return;
