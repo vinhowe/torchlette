@@ -169,6 +169,17 @@ function recordNs(map: Map<string, NsStats>, key: string, ns: bigint): void {
     if (ns > e.maxNs) e.maxNs = ns;
   } else map.set(key, { count: 1, totalNs: ns, maxNs: ns });
 }
+function accumulateNs(
+  map: Map<string, { totalNs: bigint; opCount: number }>,
+  key: string,
+  ns: bigint,
+): void {
+  const e = map.get(key);
+  if (e) {
+    e.totalNs += ns;
+    e.opCount++;
+  } else map.set(key, { totalNs: ns, opCount: 1 });
+}
 function getOrCreateMap<K, V>(
   outer: Map<K, Map<string, V>>,
   key: K,
@@ -418,34 +429,73 @@ function processTimestampRecords(timestamps: BigInt64Array): void {
 
     recordNs(gpuTs.labelStats, record.label, durationNs);
 
-    // Per-phase GPU stats
-    const phase = gpuTs.phaseStats.get(record.phase);
-    if (phase) {
-      phase.totalNs += durationNs;
-      phase.opCount++;
-    } else
-      gpuTs.phaseStats.set(record.phase, { totalNs: durationNs, opCount: 1 });
-
+    accumulateNs(gpuTs.phaseStats, record.phase, durationNs);
     recordNs(
       getOrCreateMap(gpuTs.phaseOpStats, record.phase),
       record.label,
       durationNs,
     );
 
-    // Per-module GPU stats
-    const mod = gpuTs.moduleStats.get(record.module);
-    if (mod) {
-      mod.totalNs += durationNs;
-      mod.opCount++;
-    } else
-      gpuTs.moduleStats.set(record.module, { totalNs: durationNs, opCount: 1 });
-
+    accumulateNs(gpuTs.moduleStats, record.module, durationNs);
     recordNs(
       getOrCreateMap(gpuTs.moduleOpStats, record.module),
       record.label,
       durationNs,
     );
   }
+}
+
+/**
+ * Shared: resolve query set into a staging buffer, map it, and process records.
+ * Returns true if timestamps were successfully read.
+ */
+async function resolveAndMapTimestamps(slotsToRead: number): Promise<boolean> {
+  const MAP_READ = 0x0001;
+  const COPY_DST = 0x0008;
+  const byteSize = slotsToRead * 8;
+
+  const staging = gpuTs.device!.createBuffer({
+    size: byteSize,
+    usage: MAP_READ | COPY_DST,
+  });
+
+  const encoder = gpuTs.device!.createCommandEncoder();
+  encoder.resolveQuerySet(
+    gpuTs.querySet!,
+    0,
+    slotsToRead,
+    gpuTs.resolveBuffer!,
+    0,
+  );
+  encoder.copyBufferToBuffer(gpuTs.resolveBuffer!, 0, staging, 0, byteSize);
+  gpuTs.device!.queue.submit([encoder.finish()]);
+
+  const MAPASYNC_TIMEOUT_MS = 5_000;
+  try {
+    const mapOk = await Promise.race([
+      staging.mapAsync(MAP_READ).then(() => true),
+      new Promise<false>((resolve) =>
+        setTimeout(() => resolve(false), MAPASYNC_TIMEOUT_MS),
+      ),
+    ]);
+    if (!mapOk) {
+      console.warn(
+        "[profiler] mapAsync timed out (5s) — GPU timestamps unavailable",
+      );
+      staging.destroy();
+      return false;
+    }
+  } catch (e) {
+    console.warn("[profiler] Failed to map timestamp staging buffer:", e);
+    staging.destroy();
+    return false;
+  }
+
+  const timestamps = new BigInt64Array(staging.getMappedRange());
+  processTimestampRecords(timestamps);
+  staging.unmap();
+  staging.destroy();
+  return true;
 }
 
 /**
@@ -458,8 +508,6 @@ function processTimestampRecords(timestamps: BigInt64Array): void {
  * However, they work correctly after the forward pass. This function reads
  * all forward-phase GPU timestamps while the fence mechanism still works,
  * then disables timestamp writes for the remainder of the step.
- *
- * Returns true if timestamps were successfully read, false otherwise.
  */
 export async function flushAndReadGpuTimestamps(): Promise<boolean> {
   if (
@@ -477,29 +525,7 @@ export async function flushAndReadGpuTimestamps(): Promise<boolean> {
   const { flushSharedEncoder } = await import("./index");
   flushSharedEncoder();
 
-  const slotsToRead = gpuTs.nextSlot;
-  const byteSize = slotsToRead * 8;
-  const MAP_READ = 0x0001;
-  const COPY_DST = 0x0008;
-
-  // 2. Resolve + copy timestamps in a separate submission
-  const staging = gpuTs.device.createBuffer({
-    size: byteSize,
-    usage: MAP_READ | COPY_DST,
-  });
-
-  const encoder = gpuTs.device.createCommandEncoder();
-  encoder.resolveQuerySet(
-    gpuTs.querySet,
-    0,
-    slotsToRead,
-    gpuTs.resolveBuffer,
-    0,
-  );
-  encoder.copyBufferToBuffer(gpuTs.resolveBuffer, 0, staging, 0, byteSize);
-  gpuTs.device.queue.submit([encoder.finish()]);
-
-  // 3. Fence using onSubmittedWorkDone (works after forward pass)
+  // 2. Fence using onSubmittedWorkDone (works after forward pass)
   if (typeof gpuTs.device.queue.onSubmittedWorkDone === "function") {
     const FENCE_TIMEOUT_MS = 10_000;
     const fenceOk = await Promise.race([
@@ -512,46 +538,19 @@ export async function flushAndReadGpuTimestamps(): Promise<boolean> {
       console.warn(
         "[profiler] onSubmittedWorkDone timed out after forward — skipping GPU timestamps",
       );
-      staging.destroy();
       gpuTs.enabled = false;
       return false;
     }
   }
 
-  // 4. Read timestamp data
-  const MAPASYNC_TIMEOUT_MS = 5_000;
-  let mapOk = false;
-  try {
-    const result = await Promise.race([
-      staging.mapAsync(MAP_READ).then(() => true),
-      new Promise<false>((resolve) =>
-        setTimeout(() => resolve(false), MAPASYNC_TIMEOUT_MS),
-      ),
-    ]);
-    mapOk = result;
-  } catch (e) {
-    console.warn("[profiler] Failed to map timestamp staging buffer:", e);
-    staging.destroy();
+  // 3. Resolve + read + process
+  const ok = await resolveAndMapTimestamps(gpuTs.nextSlot);
+  if (!ok) {
     gpuTs.enabled = false;
     return false;
   }
 
-  if (!mapOk) {
-    console.warn(
-      "[profiler] mapAsync timed out after forward — skipping GPU timestamps",
-    );
-    staging.destroy();
-    gpuTs.enabled = false;
-    return false;
-  }
-
-  // 5. Process timestamp records
-  const timestamps = new BigInt64Array(staging.getMappedRange());
-  processTimestampRecords(timestamps);
-  staging.unmap();
-  staging.destroy();
-
-  // 6. Disable timestamp writes for backward/optimizer to avoid corrupting
+  // 4. Disable timestamp writes for backward/optimizer to avoid corrupting
   //    Dawn's fence state. Forward GPU timing is captured; backward uses CPU timing.
   gpuTs.enabled = false;
   return true;
@@ -578,60 +577,11 @@ export async function readGpuTimestamps(): Promise<void> {
   // labelStats will be non-empty. Skip redundant readback.
   if (gpuTs.labelStats.size > 0) return;
 
-  const MAP_READ = 0x0001;
-  const COPY_DST = 0x0008;
-  const slotsToRead = gpuTs.stagingSlots;
-  const byteSize = slotsToRead * 8;
-
   // Drain the deferred fence from markStep()
   const { awaitDeferredFence } = await import("./index");
   await awaitDeferredFence();
 
-  // Resolve + copy timestamps
-  const staging = gpuTs.device.createBuffer({
-    size: byteSize,
-    usage: MAP_READ | COPY_DST,
-  });
-
-  const encoder = gpuTs.device.createCommandEncoder();
-  encoder.resolveQuerySet(
-    gpuTs.querySet,
-    0,
-    slotsToRead,
-    gpuTs.resolveBuffer,
-    0,
-  );
-  encoder.copyBufferToBuffer(gpuTs.resolveBuffer, 0, staging, 0, byteSize);
-  gpuTs.device.queue.submit([encoder.finish()]);
-
-  const MAPASYNC_TIMEOUT_MS = 5_000;
-  let mapOk = false;
-  try {
-    const result = await Promise.race([
-      staging.mapAsync(MAP_READ).then(() => true),
-      new Promise<false>((resolve) =>
-        setTimeout(() => resolve(false), MAPASYNC_TIMEOUT_MS),
-      ),
-    ]);
-    mapOk = result;
-  } catch (e) {
-    console.warn("[profiler] Failed to map staging buffer:", e);
-    staging.destroy();
-    return;
-  }
-
-  if (!mapOk) {
-    console.warn(
-      "[profiler] mapAsync timed out (5s) — GPU timestamps unavailable (V100/Dawn timestamp-query bug)",
-    );
-    staging.destroy();
-    return;
-  }
-
-  const timestamps = new BigInt64Array(staging.getMappedRange());
-  processTimestampRecords(timestamps);
-  staging.unmap();
-  staging.destroy();
+  await resolveAndMapTimestamps(gpuTs.stagingSlots);
 }
 
 // ---------------------------------------------------------------------------
