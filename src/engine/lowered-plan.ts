@@ -33,6 +33,24 @@ import type {
 } from "../backend/webgpu/gpu-types";
 
 // ============================================================================
+// Shared Types
+// ============================================================================
+
+/** An epilogue operation descriptor (cast, binary add/mul, unary activation). */
+type EpilogueOp = {
+  kind: string;
+  toDtype?: DType;
+  inputIndex?: number;
+  op?: string;
+};
+
+/** A path to resolve a tensor reference: planNodes[planNodeIndex].inputs[inputIndex]. */
+type PlanNodePath = { planNodeIndex: number; inputIndex: number };
+
+/** Sequence counter snapshot for replay cache alignment. */
+export type SeqCounters = { dispatch: number; params: number; output: number };
+
+// ============================================================================
 // Lowered Action Types
 // ============================================================================
 
@@ -81,12 +99,7 @@ interface LoweredMatmulEpilogueAction {
   /** Index of the final output node. */
   outputNodeIndex: number;
   /** Cached epilogue operations (structural, same across steps). */
-  epilogueOps: Array<{
-    kind: string;
-    toDtype?: DType;
-    inputIndex?: number;
-    op?: string;
-  }>;
+  epilogueOps: EpilogueOp[];
   /** Number of additional epilogue inputs (e.g., bias tensors). */
   epilogueInputCount: number;
   /** Output dtype after epilogue chain. */
@@ -113,11 +126,11 @@ interface LoweredMatmulEpilogueAction {
    *  The paths are resolved against the current step's planNodes array. */
   cachedDispatchConfig?: {
     /** Path to resolve input A: planNodes[planNodeIndex].inputs[inputIndex]. */
-    inputAPath: { planNodeIndex: number; inputIndex: number };
+    inputAPath: PlanNodePath;
     /** Path to resolve input B. */
-    inputBPath: { planNodeIndex: number; inputIndex: number };
+    inputBPath: PlanNodePath;
     /** Paths to resolve epilogue inputs (e.g., bias tensors). */
-    epilogueInputPaths: Array<{ planNodeIndex: number; inputIndex: number }>;
+    epilogueInputPaths: PlanNodePath[];
     /** Prologue cast for input A (if cast was absorbed into matmul codegen). */
     inputCastA?: DType;
     /** Prologue cast for input B. */
@@ -141,12 +154,7 @@ interface LoweredMatmulEpilogueAction {
     outputDtype: DType;
     /** Pre-computed epilogue config (structural, same across steps). */
     epilogueConfig: {
-      ops: Array<{
-        kind: string;
-        toDtype?: DType;
-        inputIndex?: number;
-        op?: string;
-      }>;
+      ops: EpilogueOp[];
       additionalInputCount: number;
       outputDtype?: DType;
     };
@@ -181,12 +189,7 @@ interface LoweredReductionEpilogueAction {
   /** Index of the final output node in the plan. */
   outputNodeIndex: number;
   /** Epilogue operations to apply after the reduction. */
-  epilogueOps: Array<{
-    kind: string;
-    toDtype?: DType;
-    inputIndex?: number;
-    op?: string;
-  }>;
+  epilogueOps: EpilogueOp[];
   /** Number of additional epilogue inputs (e.g., external tensors for binary ops). */
   epilogueInputCount: number;
   /** Output dtype after epilogue chain. */
@@ -211,12 +214,7 @@ interface LoweredReductionFusionAction {
   /** Dtypes for each preamble external input. */
   preambleInputDtypes: DType[];
   /** Epilogue operations to apply after the reduction. */
-  epilogueOps: Array<{
-    kind: string;
-    toDtype?: DType;
-    inputIndex?: number;
-    op?: string;
-  }>;
+  epilogueOps: EpilogueOp[];
   /** Number of additional epilogue inputs (e.g., external tensors for binary ops). */
   epilogueInputCount: number;
   /** Output dtype after epilogue chain. */
@@ -345,7 +343,7 @@ export type ReplayEntry =
       nodeIndex: number;
       arenaResolveIdx: number;
       /** Sequence counter positions so re-executed dispatches hit correct cache positions. */
-      seqCounters: { dispatch: number; params: number; output: number };
+      seqCounters: SeqCounters;
     }
   | {
       kind: "view";
@@ -369,14 +367,14 @@ export type ReplayEntry =
       nodeIndex: number;
       arenaResolveIdx: number;
       /** Sequence counter positions so re-executed dispatches hit correct cache positions. */
-      seqCounters: { dispatch: number; params: number; output: number };
+      seqCounters: SeqCounters;
     }
   | { kind: "result"; nodeResult: ReplayNodeResult }
   | {
       kind: "adam-batch";
       nodeIndices: number[];
       /** Sequence counter positions at adam batch start (for correct cache indexing). */
-      seqCounters: { dispatch: number; params: number; output: number };
+      seqCounters: SeqCounters;
     }
   | {
       kind: "side-output";

@@ -56,6 +56,7 @@ import {
   ENCODER_COPY_OPS,
   type LoweredPlan,
   type ReplayEntry,
+  type SeqCounters,
 } from "./lowered-plan";
 import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "./matmul-epilogue";
 import {
@@ -1160,9 +1161,7 @@ export async function executeLoweredPlan(
           }
 
           // Record pre-adam reclaim and capture counter positions
-          let adamSeqCountersBefore:
-            | { dispatch: number; params: number; output: number }
-            | undefined;
+          let adamSeqCountersBefore: SeqCounters | undefined;
           if (shouldRecord && useSharedEncoder) {
             replayEntries.push({ kind: "pre-adam-reclaim" });
             adamSeqCountersBefore = getDispatchSequenceCounters();
