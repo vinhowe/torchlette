@@ -331,7 +331,7 @@ export function generateFusedKernelTileIR(
           // Inlined constant: emit as tile-IR constant
           inputExprs.set(
             i,
-            constForDtype(ctx, input.inlinedValue, input.dtype),
+            ctx[dtypeToTileIR(input.dtype)](input.inlinedValue),
           );
           continue;
         }
@@ -421,35 +421,5 @@ export function generateFusedKernelTileIR(
 // ============================================================================
 
 export function dtypeToTileIR(dtype: DType): DataType {
-  switch (dtype) {
-    case "f32":
-      return "f32";
-    case "f16":
-      return "f16";
-    case "i32":
-      return "i32";
-    case "u32":
-      return "u32";
-    default:
-      return "f32";
-  }
-}
-
-function constForDtype(
-  ctx: KernelContext,
-  value: number,
-  dtype: DType,
-): BlockExpr {
-  switch (dtype) {
-    case "f32":
-      return ctx.f32(value);
-    case "f16":
-      return ctx.f16(value);
-    case "i32":
-      return ctx.i32(value);
-    case "u32":
-      return ctx.u32(value);
-    default:
-      return ctx.f32(value);
-  }
+  return dtype === "bool" ? "f32" : (dtype as DataType);
 }
