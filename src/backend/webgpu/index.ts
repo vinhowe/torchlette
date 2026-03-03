@@ -39,7 +39,6 @@ export {
   clearBufferPool,
   deferredDestroyBuffer,
   flushBufferPool,
-  flushBufferPoolWithSync,
   getBufferPoolBudget,
   getBufferPoolDetailedStats,
   getBufferPoolStats,
