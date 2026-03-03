@@ -27,7 +27,7 @@ export { CANONICAL_NAN_BITS };
  * Input signature for cache key generation.
  * Captures the abstract properties of inputs that affect compilation.
  */
-export type InputSignature = {
+type InputSignature = {
   shape: number[];
   dtype: DType;
   isInput: boolean; // true if this is an external input, false if computed
@@ -45,7 +45,7 @@ export type CompiledCacheKey = {
 /**
  * Cached compiled entry.
  */
-export type CompiledCacheEntry = {
+type CompiledCacheEntry = {
   key: CompiledCacheKey;
   graph: IRGraph;
   createdAt: number;
@@ -176,7 +176,7 @@ export function generateCacheKey(
 /**
  * Serialize a cache key to a string for use as a map key.
  */
-export function serializeCacheKey(key: CompiledCacheKey): string {
+function serializeCacheKey(key: CompiledCacheKey): string {
   const sigParts = key.inputSignatures.map(
     (sig) => `${sig.shape.join("x")}:${sig.dtype}:${sig.isInput ? "i" : "c"}`,
   );

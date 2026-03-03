@@ -31,7 +31,7 @@ import type { MatmulPrologueInfo } from "./matmul-epilogue";
 // ============================================================================
 
 /** Result of the unified graph analysis. */
-export interface GraphAnalysisResult {
+interface GraphAnalysisResult {
   /** Plan nodes in final (reordered) execution order. */
   planNodes: LazyIRNode[];
 
