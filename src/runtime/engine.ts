@@ -341,6 +341,26 @@ export class RuntimeEngine {
     return tensor;
   }
 
+  /** Shorthand: create a tracked tensor from a lazy ref. */
+  private trackRef(
+    ref: LazyRef,
+    shape: number[],
+    device: DeviceKind,
+    dtype?: DType,
+  ): Tensor {
+    return this.createAndTrack(createBaseId(), ref, shape, device, dtype);
+  }
+
+  /** Shorthand: create a tracked tensor from a lazy IR node. */
+  private trackNode(
+    node: LazyIRNode,
+    shape: number[],
+    device: DeviceKind,
+    dtype?: DType,
+  ): Tensor {
+    return this.trackRef(createPendingRef(node), shape, device, dtype);
+  }
+
   setBackend(name: DeviceKind): Backend {
     const backend = getBackend(name);
     if (!backend) {
@@ -839,8 +859,7 @@ export class RuntimeEngine {
       resolvedDevice,
       { values: payload },
     );
-    const lazyRef: LazyRef = createPendingRef(node);
-    return this.createAndTrack(createBaseId(), lazyRef, shape, resolvedDevice);
+    return this.trackNode(node, shape, resolvedDevice);
   }
 
   /**
@@ -850,8 +869,7 @@ export class RuntimeEngine {
   zeros(shape: number[], device?: DeviceKind): Tensor {
     const resolvedDevice = this.getDevice(device);
     const node = createLazyIRNode("zeros", [], shape, "f32", resolvedDevice);
-    const lazyRef: LazyRef = createPendingRef(node);
-    return this.createAndTrack(createBaseId(), lazyRef, shape, resolvedDevice);
+    return this.trackNode(node, shape, resolvedDevice);
   }
 
   /**
@@ -863,8 +881,7 @@ export class RuntimeEngine {
     const node = createLazyIRNode("full", [], shape, "f32", resolvedDevice, {
       fillValue,
     });
-    const lazyRef: LazyRef = createPendingRef(node);
-    return this.createAndTrack(createBaseId(), lazyRef, shape, resolvedDevice);
+    return this.trackNode(node, shape, resolvedDevice);
   }
 
   /**
@@ -880,8 +897,7 @@ export class RuntimeEngine {
       start,
       step,
     });
-    const lazyRef: LazyRef = createPendingRef(node);
-    return this.createAndTrack(createBaseId(), lazyRef, shape, resolvedDevice);
+    return this.trackNode(node, shape, resolvedDevice);
   }
 
   /**
@@ -899,13 +915,7 @@ export class RuntimeEngine {
       a.device,
       { k },
     );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape,
-      a.device,
-      a.dtype,
-    );
+    return this.trackNode(node, a.shape, a.device, a.dtype);
   }
 
   /**
@@ -923,13 +933,7 @@ export class RuntimeEngine {
       a.device,
       { k },
     );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape,
-      a.device,
-      a.dtype,
-    );
+    return this.trackNode(node, a.shape, a.device, a.dtype);
   }
 
   rand(shape: number[], device?: DeviceKind): Tensor {
@@ -938,12 +942,7 @@ export class RuntimeEngine {
     const node = createLazyIRNode("rand", [], shape, "f32", resolvedDevice, {
       seed,
     });
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      shape,
-      resolvedDevice,
-    );
+    return this.trackNode(node, shape, resolvedDevice);
   }
 
   randn(shape: number[], device?: DeviceKind): Tensor {
@@ -952,12 +951,7 @@ export class RuntimeEngine {
     const node = createLazyIRNode("randn", [], shape, "f32", resolvedDevice, {
       seed,
     });
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      shape,
-      resolvedDevice,
-    );
+    return this.trackNode(node, shape, resolvedDevice);
   }
 
   bernoulli(shape: number[], p: number, device?: DeviceKind): Tensor {
@@ -971,12 +965,7 @@ export class RuntimeEngine {
       resolvedDevice,
       { seed, p },
     );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      shape,
-      resolvedDevice,
-    );
+    return this.trackNode(node, shape, resolvedDevice);
   }
 
   /** Helper: create a simple binary lazy op node (comparison ops output f32). */
@@ -987,12 +976,7 @@ export class RuntimeEngine {
   ): Tensor {
     const { refA, refB, shape, device } = this.resolveBinaryOp(op, a, b);
     const node = createLazyIRNode(op, [refA, refB], shape, "f32", device);
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      shape,
-      device,
-    );
+    return this.trackNode(node, shape, device);
   }
 
   /** Helper: create a simple unary lazy op node. */
@@ -1005,13 +989,7 @@ export class RuntimeEngine {
       a.device,
       payload,
     );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
+    return this.trackNode(node, a.shape.slice(), a.device, a.dtype);
   }
 
   /**
@@ -1121,13 +1099,7 @@ export class RuntimeEngine {
       device,
       payload,
     );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      shape,
-      device,
-      dtype,
-    );
+    return this.trackNode(node, shape, device, dtype);
   }
 
   add(a: TensorOrScalar, b: TensorOrScalar): Tensor {
@@ -1181,13 +1153,7 @@ export class RuntimeEngine {
       dtype,
       device,
     );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      shape,
-      device,
-      dtype,
-    );
+    return this.trackNode(node, shape, device, dtype);
   }
 
   sqrt(a: Tensor): Tensor {
@@ -1262,12 +1228,7 @@ export class RuntimeEngine {
       "f32",
       a.device,
     );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-    );
+    return this.trackNode(node, a.shape.slice(), a.device);
   }
 
   expand(a: Tensor, shape: number[]): Tensor {
@@ -1399,13 +1360,7 @@ export class RuntimeEngine {
       grad.device,
       { dim, start, originalLength },
     );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      shape,
-      grad.device,
-      grad.dtype,
-    );
+    return this.trackNode(node, shape, grad.device, grad.dtype);
   }
 
   cast(a: Tensor, dtype: DType): Tensor {
@@ -1417,13 +1372,7 @@ export class RuntimeEngine {
       a.device,
       { dtype },
     );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      dtype,
-    );
+    return this.trackNode(node, a.shape.slice(), a.device, dtype);
   }
 
   gather(a: Tensor, index: Tensor, options: GatherOptions): Tensor {
@@ -1437,13 +1386,7 @@ export class RuntimeEngine {
       device,
       options,
     );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      shape,
-      device,
-      a.dtype,
-    );
+    return this.trackNode(node, shape, device, a.dtype);
   }
 
   scatterAdd(
@@ -1464,13 +1407,7 @@ export class RuntimeEngine {
       device,
       options,
     );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      shape,
-      device,
-      dtype,
-    );
+    return this.trackNode(node, shape, device, dtype);
   }
 
   cat(tensors: Tensor[], options?: CatOptions): Tensor {
@@ -1493,13 +1430,7 @@ export class RuntimeEngine {
       device,
       { dim: d } satisfies CatOptions,
     );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      outShape,
-      device,
-      dtype,
-    );
+    return this.trackNode(node, outShape, device, dtype);
   }
 
   private _reductionOp(
@@ -1521,13 +1452,7 @@ export class RuntimeEngine {
       safe.device,
       options,
     );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      shape,
-      safe.device,
-      safe.dtype,
-    );
+    return this.trackNode(node, shape, safe.device, safe.dtype);
   }
 
   sum(a: Tensor, options?: SumOptions): Tensor {
@@ -1556,12 +1481,7 @@ export class RuntimeEngine {
       dim,
       keepdim: options.keepdim,
     });
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      shape,
-      a.device,
-    );
+    return this.trackNode(node, shape, a.device);
   }
 
   argmax(a: Tensor, options: ArgReduceOptions): Tensor {
@@ -1608,13 +1528,7 @@ export class RuntimeEngine {
       dtype,
       device,
     );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      shape,
-      device,
-      dtype,
-    );
+    return this.trackNode(node, shape, device, dtype);
   }
 
   async cpu(a: Tensor): Promise<number[]> {
@@ -1648,13 +1562,7 @@ export class RuntimeEngine {
       { sourceDevice: a.device },
     );
     // Transfer creates a new tensor with new baseId on target device
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      device,
-      a.dtype,
-    );
+    return this.trackNode(node, a.shape.slice(), device, a.dtype);
   }
 
   /**
@@ -1736,7 +1644,7 @@ export class RuntimeEngine {
     dtype: DType = "f32",
   ): Tensor {
     const ref: LazyRef = createMaterializedRef(storage);
-    return this.createAndTrack(createBaseId(), ref, shape, device, dtype);
+    return this.trackRef(ref, shape, device, dtype);
   }
 
   fusedCrossEntropyForward(
@@ -1750,7 +1658,7 @@ export class RuntimeEngine {
       logits.device,
       config,
     );
-    return this.createAndTrack(createBaseId(), ref, shape, logits.device);
+    return this.trackRef(ref, shape, logits.device);
   }
 
   fusedCrossEntropyBackward(
@@ -1766,7 +1674,7 @@ export class RuntimeEngine {
       logits.device,
       config,
     );
-    return this.createAndTrack(createBaseId(), ref, shape, logits.device);
+    return this.trackRef(ref, shape, logits.device);
   }
 
   fusedLayerNormForward(
@@ -1783,7 +1691,7 @@ export class RuntimeEngine {
       x.device,
       config,
     );
-    return this.createAndTrack(createBaseId(), ref, shape, x.device);
+    return this.trackRef(ref, shape, x.device);
   }
 
   fusedLayerNormBackwardGradX(
@@ -1800,7 +1708,7 @@ export class RuntimeEngine {
       x.device,
       config,
     );
-    return this.createAndTrack(createBaseId(), ref, shape, x.device);
+    return this.trackRef(ref, shape, x.device);
   }
 
   fusedLayerNormBackwardGradWeightBias(
@@ -1814,7 +1722,7 @@ export class RuntimeEngine {
       gradOutput.device,
       config,
     );
-    return this.createAndTrack(createBaseId(), ref, shape, gradOutput.device);
+    return this.trackRef(ref, shape, gradOutput.device);
   }
 
   fusedRMSNormForward(
@@ -1829,7 +1737,7 @@ export class RuntimeEngine {
       x.device,
       config,
     );
-    return this.createAndTrack(createBaseId(), ref, shape, x.device);
+    return this.trackRef(ref, shape, x.device);
   }
 
   fusedRMSNormBackwardGradX(
@@ -1846,7 +1754,7 @@ export class RuntimeEngine {
       x.device,
       config,
     );
-    return this.createAndTrack(createBaseId(), ref, shape, x.device);
+    return this.trackRef(ref, shape, x.device);
   }
 
   fusedRMSNormBackwardGradWeight(
@@ -1862,7 +1770,7 @@ export class RuntimeEngine {
       x.device,
       config,
     );
-    return this.createAndTrack(createBaseId(), ref, shape, x.device);
+    return this.trackRef(ref, shape, x.device);
   }
 
   fusedAttentionForward(
@@ -1878,7 +1786,7 @@ export class RuntimeEngine {
       q.device,
       config,
     );
-    return this.createAndTrack(createBaseId(), ref, shape, q.device);
+    return this.trackRef(ref, shape, q.device);
   }
 
   extractAttentionLogsumexp(
@@ -1890,7 +1798,7 @@ export class RuntimeEngine {
       fwdOutput.device,
       config,
     );
-    return this.createAndTrack(createBaseId(), ref, shape, fwdOutput.device);
+    return this.trackRef(ref, shape, fwdOutput.device);
   }
 
   fusedAttentionBackward(
@@ -1912,7 +1820,7 @@ export class RuntimeEngine {
       q.device,
       config,
     );
-    return this.createAndTrack(createBaseId(), ref, shape, q.device);
+    return this.trackRef(ref, shape, q.device);
   }
 
   extractAttentionDK(bwdDQ: Tensor, config: FusedAttentionConfig): Tensor {
@@ -1921,7 +1829,7 @@ export class RuntimeEngine {
       bwdDQ.device,
       config,
     );
-    return this.createAndTrack(createBaseId(), ref, shape, bwdDQ.device);
+    return this.trackRef(ref, shape, bwdDQ.device);
   }
 
   extractAttentionDV(bwdDQ: Tensor, config: FusedAttentionConfig): Tensor {
@@ -1930,7 +1838,7 @@ export class RuntimeEngine {
       bwdDQ.device,
       config,
     );
-    return this.createAndTrack(createBaseId(), ref, shape, bwdDQ.device);
+    return this.trackRef(ref, shape, bwdDQ.device);
   }
 
   extractLnBwdGradBias(gradWeight: Tensor, featureDim: number): Tensor {
@@ -1939,6 +1847,6 @@ export class RuntimeEngine {
       gradWeight.device,
       featureDim,
     );
-    return this.createAndTrack(createBaseId(), ref, shape, gradWeight.device);
+    return this.trackRef(ref, shape, gradWeight.device);
   }
 }
