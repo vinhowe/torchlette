@@ -57,6 +57,13 @@ function getChainOpName(node: LazyIRNode): string {
   return node.op;
 }
 
+/** Extract the shape from a LazyRef (pending or materialized). */
+function getRefShape(ref: LazyRef): number[] | undefined {
+  if (ref.kind === "pending") return ref.node.shape;
+  if (ref.kind === "materialized") return ref.storage.backendTensor.shape;
+  return undefined;
+}
+
 /** Get the dtype of a LazyRef's backing tensor. */
 function getRefDtype(ref: LazyRef): DType {
   if (ref.kind === "pending") return ref.node.dtype;
@@ -173,12 +180,7 @@ export function detectReductionPreamble(
 
   // First node: all inputs are external
   for (const ref of firstNode.inputs) {
-    const refShape =
-      ref.kind === "pending"
-        ? ref.node.shape
-        : ref.kind === "materialized"
-          ? ref.storage.backendTensor.shape
-          : undefined;
+    const refShape = getRefShape(ref);
     if (refShape && !shapesEqual(refShape, firstShape)) return null;
     externalInputRefs.push(ref);
     externalInputDtypes.push(getRefDtype(ref));
@@ -202,12 +204,7 @@ export function detectReductionPreamble(
       const chainPos: 0 | 1 = inp0IsChain ? 0 : 1;
 
       const extRef = node.inputs[externalPos];
-      const refShape =
-        extRef.kind === "pending"
-          ? extRef.node.shape
-          : extRef.kind === "materialized"
-            ? extRef.storage.backendTensor.shape
-            : undefined;
+      const refShape = getRefShape(extRef);
       if (refShape && !shapesEqual(refShape, firstShape)) return null;
 
       externalInputRefs.push(extRef);
@@ -433,12 +430,7 @@ export function detectReductionEpilogue(
       const secondInput = nextNode.inputs[chainInputIdx === 0 ? 1 : 0];
       // The external input must have the same shape as the reduction output
       // (it gets indexed at the output position)
-      let secondShape: number[] | undefined;
-      if (secondInput.kind === "materialized") {
-        secondShape = secondInput.storage.backendTensor.shape;
-      } else if (secondInput.kind === "pending") {
-        secondShape = secondInput.node.shape;
-      }
+      const secondShape = getRefShape(secondInput);
       if (secondShape && !shapesEqual(secondShape, currentNode.shape)) break;
 
       epilogueOps.push({
