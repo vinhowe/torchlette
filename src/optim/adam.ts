@@ -161,11 +161,7 @@ export class Adam {
         continue;
       }
 
-      const step = this.steps[i] + 1;
-      this.steps[i] = step;
-      const biasCorrection1 = 1 - this.beta1 ** step;
-      const biasCorrection2 = 1 - this.beta2 ** step;
-      const stepSize = (this.lr * Math.sqrt(biasCorrection2)) / biasCorrection1;
+      const stepSize = this._advanceStep(i);
 
       // Initialize m, v as zeros on first step
       if (!this.expAvg[i]) {
@@ -232,6 +228,67 @@ export class Adam {
     return updated;
   }
 
+  /** Advance step counter and return bias-corrected step size. */
+  private _advanceStep(i: number): number {
+    const step = this.steps[i] + 1;
+    this.steps[i] = step;
+    const bc1 = 1 - this.beta1 ** step;
+    const bc2 = 1 - this.beta2 ** step;
+    return (this.lr * Math.sqrt(bc2)) / bc1;
+  }
+
+  /**
+   * Update a single parameter using elementwise ops (shared by sync and async paths).
+   */
+  private _updateParamElementwise(
+    runtime: ReturnType<Torchlette["_runtime"]>,
+    i: number,
+    param: Tensor,
+    grad: RuntimeTensor,
+  ): void {
+    const stepSize = this._advanceStep(i);
+
+    let gradAdj = grad;
+    if (this.weightDecay !== 0) {
+      const paramW = runtime.mul(param._unwrap(), this.weightDecay);
+      gradAdj = runtime.add(gradAdj, paramW);
+    }
+
+    const prevAvg = this.expAvg[i];
+    const prevAvgSq = this.expAvgSq[i];
+
+    let avg: RuntimeTensor;
+    if (prevAvg) {
+      avg = runtime.add(
+        runtime.mul(prevAvg, this.beta1),
+        runtime.mul(gradAdj, 1 - this.beta1),
+      );
+    } else {
+      avg = runtime.mul(gradAdj, 1 - this.beta1);
+    }
+
+    const gradSq = runtime.mul(gradAdj, gradAdj);
+
+    let avgSq: RuntimeTensor;
+    if (prevAvgSq) {
+      avgSq = runtime.add(
+        runtime.mul(prevAvgSq, this.beta2),
+        runtime.mul(gradSq, 1 - this.beta2),
+      );
+    } else {
+      avgSq = runtime.mul(gradSq, 1 - this.beta2);
+    }
+
+    prevAvg?.dispose();
+    prevAvgSq?.dispose();
+    this.expAvg[i] = avg;
+    this.expAvgSq[i] = avgSq;
+
+    const denom = runtime.add(runtime.sqrt(avgSq), this.eps);
+    const scaled = runtime.mul(runtime.div(avg, denom), stepSize);
+    runtime.copy_(param._unwrap(), runtime.sub(param._unwrap(), scaled));
+  }
+
   /**
    * Elementwise Adam step: fallback for backends without fused kernel (e.g., CPU).
    */
@@ -239,71 +296,16 @@ export class Adam {
     runtime: ReturnType<Torchlette["_runtime"]>,
   ): Tensor[] {
     const updated: Tensor[] = [];
-
-    for (let i = 0; i < this.params.length; i += 1) {
+    for (let i = 0; i < this.params.length; i++) {
       const param = this.params[i];
       const grad = param.grad?._unwrap() ?? null;
       if (!grad) {
         updated.push(param);
         continue;
       }
-
-      const step = this.steps[i] + 1;
-      this.steps[i] = step;
-      const biasCorrection1 = 1 - this.beta1 ** step;
-      const biasCorrection2 = 1 - this.beta2 ** step;
-      const stepSize = (this.lr * Math.sqrt(biasCorrection2)) / biasCorrection1;
-
-      let gradAdj = grad;
-      if (this.weightDecay !== 0) {
-        const paramW = runtime.mul(param._unwrap(), this.weightDecay);
-        gradAdj = runtime.add(gradAdj, paramW);
-      }
-
-      const prevAvg = this.expAvg[i];
-      const prevAvgSq = this.expAvgSq[i];
-
-      let avg: RuntimeTensor;
-      if (prevAvg) {
-        const t1 = runtime.mul(prevAvg, this.beta1);
-        const t2 = runtime.mul(gradAdj, 1 - this.beta1);
-        avg = runtime.add(t1, t2);
-      } else {
-        avg = runtime.mul(gradAdj, 1 - this.beta1);
-      }
-
-      const gradSq = runtime.mul(gradAdj, gradAdj);
-
-      let avgSq: RuntimeTensor;
-      if (prevAvgSq) {
-        const t1 = runtime.mul(prevAvgSq, this.beta2);
-        const t2 = runtime.mul(gradSq, 1 - this.beta2);
-        avgSq = runtime.add(t1, t2);
-      } else {
-        avgSq = runtime.mul(gradSq, 1 - this.beta2);
-      }
-
-      // Dispose old optimizer state tensors (cross-step state, not tracked by dispatch modes)
-      if (prevAvg) {
-        prevAvg.dispose();
-      }
-      if (prevAvgSq) {
-        prevAvgSq.dispose();
-      }
-      this.expAvg[i] = avg;
-      this.expAvgSq[i] = avgSq;
-
-      const sqrtAvgSq = runtime.sqrt(avgSq);
-      const denom = runtime.add(sqrtAvgSq, this.eps);
-      const update = runtime.div(avg, denom);
-      const scaled = runtime.mul(update, stepSize);
-      const next = runtime.sub(param._unwrap(), scaled);
-
-      // Update parameter IN-PLACE to preserve tensor identity
-      runtime.copy_(param._unwrap(), next);
+      this._updateParamElementwise(runtime, i, param, grad);
       updated.push(param);
     }
-
     return updated;
   }
 
@@ -314,79 +316,19 @@ export class Adam {
    */
   async stepAsync(): Promise<Tensor[]> {
     const runtime = this.api._runtime();
-
-    // Resolve side outputs from previous fused step
     this._resolvePendingState();
-
     const updated: Tensor[] = [];
-
-    for (let i = 0; i < this.params.length; i += 1) {
+    for (let i = 0; i < this.params.length; i++) {
       const param = this.params[i];
       const grad = param.grad?._unwrap() ?? null;
       if (!grad) {
         updated.push(param);
         continue;
       }
-
-      const step = this.steps[i] + 1;
-      this.steps[i] = step;
-      const biasCorrection1 = 1 - this.beta1 ** step;
-      const biasCorrection2 = 1 - this.beta2 ** step;
-      const stepSize = (this.lr * Math.sqrt(biasCorrection2)) / biasCorrection1;
-
-      let gradAdj = grad;
-      if (this.weightDecay !== 0) {
-        const paramW = runtime.mul(param._unwrap(), this.weightDecay);
-        gradAdj = runtime.add(gradAdj, paramW);
-      }
-
-      const prevAvg = this.expAvg[i];
-      const prevAvgSq = this.expAvgSq[i];
-
-      let avg: RuntimeTensor;
-      if (prevAvg) {
-        const t1 = runtime.mul(prevAvg, this.beta1);
-        const t2 = runtime.mul(gradAdj, 1 - this.beta1);
-        avg = runtime.add(t1, t2);
-      } else {
-        avg = runtime.mul(gradAdj, 1 - this.beta1);
-      }
-
-      const gradSq = runtime.mul(gradAdj, gradAdj);
-
-      let avgSq: RuntimeTensor;
-      if (prevAvgSq) {
-        const t1 = runtime.mul(prevAvgSq, this.beta2);
-        const t2 = runtime.mul(gradSq, 1 - this.beta2);
-        avgSq = runtime.add(t1, t2);
-      } else {
-        avgSq = runtime.mul(gradSq, 1 - this.beta2);
-      }
-
-      if (prevAvg) {
-        prevAvg.dispose();
-      }
-      if (prevAvgSq) {
-        prevAvgSq.dispose();
-      }
-      this.expAvg[i] = avg;
-      this.expAvgSq[i] = avgSq;
-
-      const sqrtAvgSq = runtime.sqrt(avgSq);
-      const denom = runtime.add(sqrtAvgSq, this.eps);
-      const update = runtime.div(avg, denom);
-      const scaled = runtime.mul(update, stepSize);
-      const next = runtime.sub(param._unwrap(), scaled);
-
-      // Update parameter IN-PLACE
-      runtime.copy_(param._unwrap(), next);
-
-      // Force this parameter's computation immediately to limit peak memory.
+      this._updateParamElementwise(runtime, i, param, grad);
       await runtime.force(param._unwrap());
-
       updated.push(param);
     }
-
     return updated;
   }
 
