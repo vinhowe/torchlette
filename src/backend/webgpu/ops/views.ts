@@ -7,11 +7,9 @@ import type { BackendTensor, DType, TransposeOptions } from "../../types";
 import {
   cachedCreateBindGroup,
   createParamsBuffer,
-  createUniformBuffer,
   params,
   profiledCreateBindGroup,
   releaseParamsBuffer,
-  releaseUniformBuffer,
 } from "../bind-group-cache";
 import { resolveOutputBuffer } from "../buffer-arena";
 import { bufferPool, destroyCopy } from "../buffer-pool";
@@ -131,14 +129,14 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
     tensor.size * bytesPerElement,
     [tensor.buffer],
   );
-  const params = createUniformBuffer(ctx.device, tensor.size);
+  const uniformBuf = createParamsBuffer(ctx.device, params(tensor.size));
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
     tensor.buffer,
     outBuffer,
-    params,
+    uniformBuf,
   ]);
   dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
-  releaseUniformBuffer(params);
+  releaseParamsBuffer(uniformBuf);
   return createTensor(tensor.shape, outBuffer, undefined, 0, dtype);
 }
 

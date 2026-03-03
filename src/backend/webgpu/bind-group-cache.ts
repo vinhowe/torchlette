@@ -222,18 +222,6 @@ export function releaseParamsBuffer(buffer: GPUBuffer): void {
   }
 }
 
-// Backward-compatible wrappers for existing callsites
-export function createUniformBuffer(
-  device: GPUDevice,
-  size: number,
-): GPUBuffer {
-  return createParamsBuffer(device, params(size));
-}
-
-export function releaseUniformBuffer(buffer: GPUBuffer): void {
-  releaseParamsBuffer(buffer);
-}
-
 // ============================================================================
 // Profiled Bind Group Creation
 // ============================================================================
