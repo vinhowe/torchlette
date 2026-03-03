@@ -122,39 +122,25 @@ async function executeNodeOp(
 }
 
 /**
- * Walk a chain of binary ops (add/mul), returning the external (non-chain) input ref
- * at each step. `prevId` is the ID of the node feeding into chainNodes[0].
+ * Walk a chain of ops collecting external (non-chain) input refs.
+ * When `prevId` is given (epilogue): the first node's chain input comes from prevId.
+ * When `prevId` is undefined (preamble): all first-node inputs are external.
  */
-function collectEpilogueExternalRefs(
+function collectChainExternalRefs(
   chainNodes: LazyIRNode[],
-  prevId: number,
+  prevId?: number,
 ): LazyRef[] {
   const refs: LazyRef[] = [];
-  for (let ci = 0; ci < chainNodes.length; ci++) {
-    const node = chainNodes[ci];
-    if ((node.op === "add" || node.op === "mul") && node.inputs.length === 2) {
-      const prev = ci === 0 ? prevId : chainNodes[ci - 1].id;
-      const inp0IsChain =
-        node.inputs[0].kind === "pending" && node.inputs[0].node.id === prev;
-      refs.push(node.inputs[inp0IsChain ? 1 : 0]);
-    }
+  const startIdx = prevId !== undefined ? 0 : 1;
+  if (prevId === undefined) {
+    for (const ref of chainNodes[0].inputs) refs.push(ref);
   }
-  return refs;
-}
-
-/**
- * Collect external input refs from a preamble chain: all inputs of the first node
- * are external; for subsequent binary nodes, the non-chain input is external.
- */
-function collectPreambleExternalRefs(chainNodes: LazyIRNode[]): LazyRef[] {
-  const refs: LazyRef[] = [];
-  for (const ref of chainNodes[0].inputs) refs.push(ref);
-  for (let ci = 1; ci < chainNodes.length; ci++) {
+  for (let ci = startIdx; ci < chainNodes.length; ci++) {
     const node = chainNodes[ci];
     if (node.inputs.length === 2) {
+      const prev = ci === 0 ? prevId! : chainNodes[ci - 1].id;
       const inp0IsChain =
-        node.inputs[0].kind === "pending" &&
-        node.inputs[0].node === chainNodes[ci - 1];
+        node.inputs[0].kind === "pending" && node.inputs[0].node.id === prev;
       refs.push(node.inputs[inp0IsChain ? 1 : 0]);
     }
   }
@@ -795,13 +781,7 @@ export async function executeLoweredPlan(
               if (!shapesEqual(resultTensor.shape, fastOutShape)) {
                 const gpuT = asGPUTensor(resultTensor);
                 gpuT.shape = fastOutShape;
-                const newStrides = new Array(fastOutShape.length);
-                let stride = 1;
-                for (let i = fastOutShape.length - 1; i >= 0; i--) {
-                  newStrides[i] = stride;
-                  stride *= fastOutShape[i];
-                }
-                gpuT.strides = newStrides;
+                gpuT.strides = contiguousStrides(fastOutShape);
               }
               outputNode.result = createStorageHandle(
                 outputNode.device,
@@ -1036,7 +1016,7 @@ export async function executeLoweredPlan(
           ) {
             // Multi-op chain replay: reconstruct external input refs
             const chainNodes = action.chainNodeIndices.map((i) => planNodes[i]);
-            const externalInputRefs = collectPreambleExternalRefs(chainNodes);
+            const externalInputRefs = collectChainExternalRefs(chainNodes);
 
             reductionPlan = {
               preambleNode,
@@ -1083,7 +1063,7 @@ export async function executeLoweredPlan(
           const reEpilogueChainNodes = action.coveredNodeIndices
             .slice(1)
             .map((i) => planNodes[i]);
-          const reEpilogueInputRefs = collectEpilogueExternalRefs(
+          const reEpilogueInputRefs = collectChainExternalRefs(
             reEpilogueChainNodes,
             planNodes[action.coveredNodeIndices[0]].id,
           );
@@ -1113,15 +1093,14 @@ export async function executeLoweredPlan(
           const rfPreambleNodes = action.preambleNodeIndices.map(
             (i) => planNodes[i],
           );
-          const rfPreambleInputRefs =
-            collectPreambleExternalRefs(rfPreambleNodes);
+          const rfPreambleInputRefs = collectChainExternalRefs(rfPreambleNodes);
 
           // Reconstruct epilogue input refs by walking epilogue chain nodes
           const rfReductionNode = planNodes[action.reductionNodeIndex];
           const rfEpilogueNodes = action.epilogueNodeIndices.map(
             (i) => planNodes[i],
           );
-          const rfEpilogueInputRefs = collectEpilogueExternalRefs(
+          const rfEpilogueInputRefs = collectChainExternalRefs(
             rfEpilogueNodes,
             rfReductionNode.id,
           );
