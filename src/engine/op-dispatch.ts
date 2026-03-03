@@ -602,78 +602,82 @@ function executeFusedOp(
 }
 
 // ---------------------------------------------------------------------------
-// Op category sets for fast routing
+// Unified op routing table
 // ---------------------------------------------------------------------------
 
-const CREATION_OPS = new Set([
-  "tensorFromArray",
-  "zeros",
-  "full",
-  "arange",
-  "tril",
-  "triu",
-  "rand",
-  "randn",
-  "bernoulli",
-]);
-const UNARY_OPS = new Set([
-  "sqrt",
-  "relu",
-  "exp",
-  "log",
-  "neg",
-  "abs",
-  "tanh",
-  "sigmoid",
-  "gelu",
-  "silu",
-  "isfinite",
-  "pow",
-  "sin",
-  "cos",
-  "rsqrt",
-  "floor",
-  "ceil",
-  "round",
-  "sign",
-  "clamp",
-]);
-const BINARY_OPS = new Set(["add", "sub", "mul", "div", "matmul"]);
-const SHAPE_OPS = new Set([
-  "reshape",
-  "expand",
-  "transpose",
-  "permute",
-  "contiguous",
-  "narrow",
-  "narrowBackward",
-  "cast",
-]);
-const REDUCTION_OPS = new Set([
-  "sum",
-  "max",
-  "min",
-  "mean",
-  "argmax",
-  "argmin",
-  "gather",
-  "scatterAdd",
-  "cat",
-  "gt",
-  "lt",
-  "ge",
-  "le",
-  "eq",
-  "ne",
-  "where",
-  "conv2d",
-]);
-const MUTATION_OPS = new Set([
-  "stridedScatterCopy",
-  "stridedScatterAdd",
-  "adamStep",
-  "unscaleGrad",
-]);
+type OpHandler = (
+  node: LazyIRNode,
+  backendInputs: BackendTensor[],
+  backend: Backend,
+) => BackendTensor | Promise<BackendTensor>;
+
+function buildOpTable(): Map<string, OpHandler> {
+  const t = new Map<string, OpHandler>();
+  const add = (ops: string[], h: OpHandler) => {
+    for (const op of ops) t.set(op, h);
+  };
+  add(
+    [
+      "tensorFromArray",
+      "zeros",
+      "full",
+      "arange",
+      "tril",
+      "triu",
+      "rand",
+      "randn",
+      "bernoulli",
+    ],
+    executeCreationOp,
+  );
+  add(
+    [
+      "sqrt",
+      "relu",
+      "exp",
+      "log",
+      "neg",
+      "abs",
+      "tanh",
+      "sigmoid",
+      "gelu",
+      "silu",
+      "isfinite",
+      "pow",
+      "sin",
+      "cos",
+      "rsqrt",
+      "floor",
+      "ceil",
+      "round",
+      "sign",
+      "clamp",
+    ],
+    executeUnaryOp,
+  );
+  add(["add", "sub", "mul", "div", "matmul"], executeBinaryOp);
+  add(
+    [
+      "reshape",
+      "expand",
+      "transpose",
+      "permute",
+      "contiguous",
+      "narrow",
+      "narrowBackward",
+      "cast",
+    ],
+    executeShapeOp,
+  );
+  for (const op of Object.keys(REDUCTION_TABLE)) t.set(op, executeReductionOp);
+  add(
+    ["stridedScatterCopy", "stridedScatterAdd", "adamStep", "unscaleGrad"],
+    executeMutationOp,
+  );
+  return t;
+}
+
+const OP_TABLE = buildOpTable();
 
 /**
  * Execute a single op on the backend.
@@ -688,17 +692,8 @@ export async function executeOp(
   setProfileModule(nodeModule);
   const _profT0 = profileOpBegin(node.op);
   try {
-    const op = node.op;
-    if (CREATION_OPS.has(op))
-      return executeCreationOp(node, backendInputs, backend);
-    if (UNARY_OPS.has(op)) return executeUnaryOp(node, backendInputs, backend);
-    if (BINARY_OPS.has(op))
-      return executeBinaryOp(node, backendInputs, backend);
-    if (SHAPE_OPS.has(op)) return executeShapeOp(node, backendInputs, backend);
-    if (REDUCTION_OPS.has(op))
-      return executeReductionOp(node, backendInputs, backend);
-    if (MUTATION_OPS.has(op))
-      return executeMutationOp(node, backendInputs, backend);
+    const handler = OP_TABLE.get(node.op);
+    if (handler) return handler(node, backendInputs, backend);
     // Fused ops and extract ops — no set needed, they're the remainder
     return executeFusedOp(node, backendInputs, backend);
   } finally {
