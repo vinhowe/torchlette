@@ -1126,18 +1126,10 @@ export class BlockExpr {
   erf(): BlockExpr {
     // erf(x) = sign(x) * (1 - poly(t) * exp(-x²))
     // where t = 1/(1 + p*|x|), poly = a1*t + a2*t² + a3*t³ + a4*t⁴ + a5*t⁵
-    const mkOne = () =>
-      new BlockExpr(
-        makeNode<ConstNode>({
-          kind: "const",
-          value: 1.0,
-          valueType: "scalar",
-          dataType: "f32",
-        }),
-      );
+    const one = this.f32(1.0);
     const signX = this.sign();
     const absX = this.abs();
-    const t = mkOne().div(mkOne().add(absX.mul(0.3275911)));
+    const t = one.div(one.add(absX.mul(0.3275911)));
     // Horner: ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
     const inner = t
       .mul(1.061405429)
@@ -1150,7 +1142,7 @@ export class BlockExpr {
       .add(0.254829592);
     const poly = inner.mul(t);
     const expTerm = absX.neg().mul(absX).exp(); // exp(-x²)
-    return signX.mul(mkOne().sub(poly.mul(expTerm)));
+    return signX.mul(one.sub(poly.mul(expTerm)));
   }
 
   pow(other: BlockExpr | number) {

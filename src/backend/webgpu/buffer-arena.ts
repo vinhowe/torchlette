@@ -34,7 +34,6 @@ import {
 export {
   arenaBufferSet,
   getOutputSeqIndex,
-  outputSeqIndex,
   setOutputSeqIndex,
 } from "./webgpu-state";
 
@@ -138,7 +137,7 @@ export function getBufferSize(tensor: BackendTensor): number {
 // On the next step, try to acquire the same buffer from the pool for bind
 // group cache stability.
 
-// outputSeqIndex, getOutputSeqIndex, setOutputSeqIndex are in webgpu-state.ts and re-exported above.
+// getOutputSeqIndex, setOutputSeqIndex are in webgpu-state.ts and re-exported above.
 export const outputSequenceHints: Array<GPUBuffer | null> = [];
 
 // Pre-pinned output buffers: extracted from pool at step start before any dispatches.

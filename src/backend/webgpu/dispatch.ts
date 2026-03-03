@@ -73,8 +73,7 @@ export function dispatchComputePass(
 ): void {
   const ctx = requireContext();
   const label = labelOverride ?? getCurrentOpLabel();
-  const recBuf =
-    recordingBuffer !== undefined ? recordingBuffer : dispatchRecordingBuffer;
+  const recBuf = recordingBuffer ?? dispatchRecordingBuffer;
 
   // Record dispatch if recording is active
   if (recBuf) {
