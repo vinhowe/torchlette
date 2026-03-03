@@ -181,36 +181,6 @@ const IDENTITY_RULES: Record<string, { value: number; commutative: boolean }> =
   };
 
 /**
- * Try to bypass a binary node if one operand is the algebraic identity.
- * Returns true if the node was bypassed.
- */
-function tryBypassIdentity(
-  node: LazyIRNode,
-  ref0: LazyRef,
-  ref1: LazyRef,
-  identity: number,
-  commutative: boolean,
-  ctx: RewriteContext,
-  bypassed: Set<number>,
-): boolean {
-  const val1 = tryGetScalarValue(ref1);
-  if (val1 === identity) {
-    redirectConsumers(node, ref0, ctx);
-    bypassed.add(node.id);
-    return true;
-  }
-  if (commutative) {
-    const val0 = tryGetScalarValue(ref0);
-    if (val0 === identity) {
-      redirectConsumers(node, ref1, ctx);
-      bypassed.add(node.id);
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
  * Eliminate algebraic identities:
  *   mul(x, 1) → x,  mul(1, x) → x
  *   add(x, 0) → x,  add(0, x) → x
@@ -226,16 +196,18 @@ function eliminateAlgebraicIdentities(
     if (node.inputs.length !== 2) continue;
 
     const rule = IDENTITY_RULES[node.op];
-    if (rule) {
-      tryBypassIdentity(
-        node,
-        node.inputs[0],
-        node.inputs[1],
-        rule.value,
-        rule.commutative,
-        ctx,
-        bypassed,
-      );
+    if (!rule) continue;
+
+    const val1 = tryGetScalarValue(node.inputs[1]);
+    if (val1 === rule.value) {
+      redirectConsumers(node, node.inputs[0], ctx);
+      bypassed.add(node.id);
+    } else if (rule.commutative) {
+      const val0 = tryGetScalarValue(node.inputs[0]);
+      if (val0 === rule.value) {
+        redirectConsumers(node, node.inputs[1], ctx);
+        bypassed.add(node.id);
+      }
     }
   }
 }
