@@ -170,6 +170,44 @@ function castRef(input: OpInput, toDtype: DType): OpInput {
   };
 }
 
+// ── Force-method helpers ────────────────────────────────────────────────────
+
+/** Collect pending lazy nodes from tensors that still need execution. */
+function collectPendingRoots(tensors: readonly Tensor[]): LazyIRNode[] {
+  const roots: LazyIRNode[] = [];
+  for (const t of tensors) {
+    if (t.isMaterialized() || t.disposed) continue;
+    const ref = t.lazyRef;
+    if (ref.kind === "pending") roots.push(ref.node);
+  }
+  return roots;
+}
+
+/** Find the device of the first non-materialized tensor (defaults to "cpu"). */
+function resolveDeviceFromTensors(tensors: readonly Tensor[]): DeviceKind {
+  for (const t of tensors) {
+    if (!t.isMaterialized()) return t.device;
+  }
+  return "cpu";
+}
+
+/**
+ * Materialize tensors whose lazy nodes have results but haven't been materialized yet.
+ * Returns any nodes that were materialized (for cleanup of skipped nodes).
+ */
+function materializeRemaining(tensors: readonly Tensor[]): LazyIRNode[] {
+  const materialized: LazyIRNode[] = [];
+  for (const t of tensors) {
+    if (t.isMaterialized() || t.disposed) continue;
+    const ref = t.lazyRef;
+    if (ref.kind === "pending" && ref.node.result) {
+      t._materialize(ref.node.result);
+      materialized.push(ref.node);
+    }
+  }
+  return materialized;
+}
+
 export class RuntimeEngine {
   private defaultDevice: DeviceKind | null = null;
   private fusionEnabled = false;
@@ -599,38 +637,13 @@ export class RuntimeEngine {
    * memory savings.
    */
   async forceAllMerged(...tensors: Tensor[]): Promise<void> {
-    // Collect all pending nodes
-    const pendingRoots: LazyIRNode[] = [];
+    const pendingRoots = collectPendingRoots(tensors);
+    if (pendingRoots.length === 0) return;
 
-    for (const tensor of tensors) {
-      if (tensor.isMaterialized() || tensor.disposed) {
-        continue;
-      }
-      const lazyRef = tensor.lazyRef;
-      if (lazyRef.kind === "pending") {
-        pendingRoots.push(lazyRef.node);
-      }
-    }
-
-    if (pendingRoots.length === 0) {
-      return;
-    }
-
-    // Build ONE merged plan from all pending roots
     const plan = buildMergedPlan(pendingRoots);
+    if (plan.nodes.length === 0) return;
 
-    if (plan.nodes.length === 0) {
-      return;
-    }
-
-    // Determine device from first pending tensor
-    let device: DeviceKind = "cpu";
-    for (const tensor of tensors) {
-      if (!tensor.isMaterialized()) {
-        device = tensor.device;
-        break;
-      }
-    }
+    const device = resolveDeviceFromTensors(tensors);
 
     // Data-source-only plans skip the template/arena/lowered-plan path.
     const allDataSource = plan.nodes.every((n) => isDataSourceOp(n.op));
@@ -694,20 +707,8 @@ export class RuntimeEngine {
       }
     }
 
-    // Update tensor refs to point to results for any tensors not yet materialized
-    // Use isMaterialized() to check (not lazyRef.kind) because materializePendingTensors
-    // above may have already updated some tensors.
-    // IMPORTANT: Skip disposed tensors - materializing a disposed tensor marks its storage
-    // reachable, but since the tensor is disposed, no one will ever mark it unreachable,
-    // causing a permanent storage leak.
-    for (const tensor of tensors) {
-      if (!tensor.isMaterialized() && !tensor.disposed) {
-        const lazyRef = tensor.lazyRef;
-        if (lazyRef.kind === "pending" && lazyRef.node.result) {
-          tensor._materialize(lazyRef.node.result);
-        }
-      }
-    }
+    // Materialize any remaining tensors whose nodes were already executed
+    materializeRemaining(tensors);
   }
 
   /**
@@ -726,18 +727,9 @@ export class RuntimeEngine {
       return;
     }
 
-    // Collect pending roots
-    const pendingRoots: LazyIRNode[] = [];
-    for (const tensor of pendingTensors) {
-      if (tensor.isMaterialized() || tensor.disposed) continue;
-      const lazyRef = tensor.lazyRef;
-      if (lazyRef.kind === "pending") {
-        pendingRoots.push(lazyRef.node);
-      }
-    }
+    const pendingRoots = collectPendingRoots(pendingTensors);
     if (pendingRoots.length === 0) return;
 
-    // Build merged plan, skipping already-executed nodes
     const plan = buildMergedPlan(pendingRoots, /* skipExecuted */ true);
     if (plan.nodes.length === 0) return;
 
@@ -746,13 +738,7 @@ export class RuntimeEngine {
     // before the new plan allocates output buffers.
     storageTracker.destroyUnreachable();
 
-    let device: DeviceKind = "cpu";
-    for (const tensor of pendingTensors) {
-      if (!tensor.isMaterialized()) {
-        device = tensor.device;
-        break;
-      }
-    }
+    const device = resolveDeviceFromTensors(pendingTensors);
 
     // Flush recycled GPU buffers from pendingRelease to the main pool.
     // Must happen BEFORE the shared encoder opens (executePlan opens one),
@@ -772,15 +758,7 @@ export class RuntimeEngine {
         device,
       );
       if (executed) {
-        // Handle skipped nodes (already executed from prior force() calls)
-        for (const tensor of pendingTensors) {
-          if (!tensor.isMaterialized() && !tensor.disposed) {
-            const lazyRef = tensor.lazyRef;
-            if (lazyRef.kind === "pending" && lazyRef.node.result) {
-              tensor._materialize(lazyRef.node.result);
-            }
-          }
-        }
+        materializeRemaining(pendingTensors);
         storageTracker.destroyUnreachableSince(storageSnapshot);
         return;
       }
@@ -809,25 +787,11 @@ export class RuntimeEngine {
         materialize(node.id, node.result);
       }
     }
-    // Materialize any remaining tensors whose nodes were already executed
-    // (skipped by buildMergedPlan because they already had results).
-    // Also collect these skipped nodes so we can clear their results below.
-    const skippedNodes: LazyIRNode[] = [];
-    for (const tensor of pendingTensors) {
-      if (!tensor.isMaterialized() && !tensor.disposed) {
-        const lazyRef = tensor.lazyRef;
-        if (lazyRef.kind === "pending" && lazyRef.node.result) {
-          tensor._materialize(lazyRef.node.result);
-          skippedNodes.push(lazyRef.node);
-        }
-      }
-    }
+    // Materialize remaining tensors and collect skipped nodes (already executed
+    // by prior force() calls but not in plan.nodes) for result cleanup.
+    const skippedNodes = materializeRemaining(pendingTensors);
 
     // Drop node.result references to allow GC of unclaimed intermediate storages.
-    // Without this, lazy nodes keep StorageHandles alive via node.result references,
-    // preventing storageTracker.destroyUnreachable() from freeing their buffers.
-    // Must clear BOTH plan nodes AND skipped nodes (which were already executed
-    // by a prior force() call but not in plan.nodes).
     for (const node of plan.nodes) {
       node.result = undefined;
     }

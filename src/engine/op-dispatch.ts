@@ -5,7 +5,6 @@ import type {
   BackendTensor,
   DeviceKind,
   DType,
-  GeluOptions,
 } from "../backend/types";
 import { getCurrentOpLabel, setCurrentOpLabel } from "../backend/webgpu";
 import {
@@ -228,82 +227,14 @@ function executeCreationOp(
   }
 }
 
-function executeUnaryOp(
+function executeClampOp(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
 ): BackendTensor {
-  const input = backendInputs[0];
-  switch (node.op) {
-    case "sqrt":
-    case "relu":
-    case "exp":
-    case "log":
-    case "neg":
-    case "abs":
-    case "tanh":
-    case "sigmoid":
-    case "silu":
-    case "sin":
-    case "cos":
-    case "rsqrt":
-    case "floor":
-    case "ceil":
-    case "round":
-    case "isfinite":
-    case "sign": {
-      const fn = backend.ops[node.op as "exp"];
-      assertOpSupported(node.op, fn);
-      return fn(input);
-    }
-    case "gelu": {
-      assertOpSupported("gelu", backend.ops.gelu);
-      const geluOpts = getPayload<GeluOptions>(node);
-      return backend.ops.gelu(input, geluOpts);
-    }
-    case "clamp": {
-      assertOpSupported("clamp", backend.ops.clamp);
-      const clampPayload = getPayload<{
-        min: number | null;
-        max: number | null;
-      }>(node);
-      return backend.ops.clamp(
-        input,
-        clampPayload?.min ?? null,
-        clampPayload?.max ?? null,
-      );
-    }
-    case "pow":
-      assertOpSupported("pow", backend.ops.pow);
-      return backend.ops.pow(input, backendInputs[1]);
-    default:
-      throw new Error(`Unknown unary op: ${node.op}`);
-  }
-}
-
-function executeBinaryOp(
-  node: LazyIRNode,
-  backendInputs: BackendTensor[],
-  backend: Backend,
-): BackendTensor {
-  switch (node.op) {
-    case "add":
-      return backend.ops.add(backendInputs[0], backendInputs[1]);
-    case "sub": {
-      const payload = getPayload<{ alpha?: number }>(node);
-      return backend.ops.sub(backendInputs[0], backendInputs[1], payload);
-    }
-    case "mul":
-      return backend.ops.mul(backendInputs[0], backendInputs[1]);
-    case "div": {
-      const payload = getPayload<{ roundingMode?: "trunc" | "floor" }>(node);
-      return backend.ops.div(backendInputs[0], backendInputs[1], payload);
-    }
-    case "matmul":
-      return backend.ops.matmul(backendInputs[0], backendInputs[1]);
-    default:
-      throw new Error(`Unknown binary op: ${node.op}`);
-  }
+  assertOpSupported("clamp", backend.ops.clamp);
+  const p = getPayload<{ min: number | null; max: number | null }>(node);
+  return backend.ops.clamp(backendInputs[0], p?.min ?? null, p?.max ?? null);
 }
 
 function executeShapeOp(
@@ -373,17 +304,46 @@ type ReductionDesc = {
   payload: "required" | "optional" | "none";
 };
 
-const REDUCTION_TABLE: Record<string, ReductionDesc> = {
+const GENERIC_OP_TABLE: Record<string, ReductionDesc> = {
+  // Unary ops (arity 1, no payload)
+  sqrt: { arity: 1, payload: "none" },
+  relu: { arity: 1, payload: "none" },
+  exp: { arity: 1, payload: "none" },
+  log: { arity: 1, payload: "none" },
+  neg: { arity: 1, payload: "none" },
+  abs: { arity: 1, payload: "none" },
+  tanh: { arity: 1, payload: "none" },
+  sigmoid: { arity: 1, payload: "none" },
+  silu: { arity: 1, payload: "none" },
+  sin: { arity: 1, payload: "none" },
+  cos: { arity: 1, payload: "none" },
+  rsqrt: { arity: 1, payload: "none" },
+  floor: { arity: 1, payload: "none" },
+  ceil: { arity: 1, payload: "none" },
+  round: { arity: 1, payload: "none" },
+  isfinite: { arity: 1, payload: "none" },
+  sign: { arity: 1, payload: "none" },
+  gelu: { arity: 1, payload: "optional" },
+  // Binary ops
+  add: { arity: 2, payload: "none" },
+  sub: { arity: 2, payload: "optional" },
+  mul: { arity: 2, payload: "none" },
+  div: { arity: 2, payload: "optional" },
+  matmul: { arity: 2, payload: "none" },
+  pow: { arity: 2, payload: "none" },
+  // Reductions
   sum: { arity: 1, payload: "optional" },
   max: { arity: 1, payload: "optional" },
   min: { arity: 1, payload: "optional" },
   mean: { arity: 1, payload: "optional" },
   argmax: { arity: 1, payload: "required" },
   argmin: { arity: 1, payload: "required" },
+  // Multi-input ops
   conv2d: { arity: 3, payload: "optional" },
   gather: { arity: 2, payload: "required" },
   scatterAdd: { arity: 3, payload: "required" },
   cat: { arity: "all", payload: "required" },
+  // Comparisons
   gt: { arity: 2, payload: "none" },
   lt: { arity: 2, payload: "none" },
   ge: { arity: 2, payload: "none" },
@@ -391,14 +351,17 @@ const REDUCTION_TABLE: Record<string, ReductionDesc> = {
   eq: { arity: 2, payload: "none" },
   ne: { arity: 2, payload: "none" },
   where: { arity: 3, payload: "none" },
+  // Mutation ops (simple pass-through)
+  stridedScatterCopy: { arity: 2, payload: "required" },
+  stridedScatterAdd: { arity: 2, payload: "required" },
 };
 
-function executeReductionOp(
+function executeGenericOp(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
 ): BackendTensor {
-  const desc = REDUCTION_TABLE[node.op];
+  const desc = GENERIC_OP_TABLE[node.op];
   if (!desc) throw new Error(`Unknown reduction op: ${node.op}`);
 
   const fn = backend.ops[node.op as keyof Backend["ops"]] as
@@ -420,17 +383,6 @@ function executeMutationOp(
   backend: Backend,
 ): BackendTensor | Promise<BackendTensor> {
   switch (node.op) {
-    case "stridedScatterCopy":
-    case "stridedScatterAdd": {
-      const payload = requirePayload<{
-        offset: number;
-        viewShape: number[];
-        viewStrides: number[];
-      }>(node);
-      const fn = backend.ops[node.op as "stridedScatterCopy"];
-      assertOpSupported(node.op, fn);
-      return fn(backendInputs[0], backendInputs[1], payload);
-    }
     case "adamStep": {
       assertOpSupported("adamStep", backend.ops.adamStep);
       const payload = requirePayload<AdamStepConfig>(node);
@@ -614,32 +566,7 @@ function buildOpTable(): Map<string, OpHandler> {
     ],
     executeCreationOp,
   );
-  add(
-    [
-      "sqrt",
-      "relu",
-      "exp",
-      "log",
-      "neg",
-      "abs",
-      "tanh",
-      "sigmoid",
-      "gelu",
-      "silu",
-      "pow",
-      "isfinite",
-      "sin",
-      "cos",
-      "rsqrt",
-      "floor",
-      "ceil",
-      "round",
-      "sign",
-      "clamp",
-    ],
-    executeUnaryOp,
-  );
-  add(["add", "sub", "mul", "div", "matmul"], executeBinaryOp);
+  t.set("clamp", executeClampOp);
   add(
     [
       "reshape",
@@ -653,11 +580,8 @@ function buildOpTable(): Map<string, OpHandler> {
     ],
     executeShapeOp,
   );
-  for (const op of Object.keys(REDUCTION_TABLE)) t.set(op, executeReductionOp);
-  add(
-    ["stridedScatterCopy", "stridedScatterAdd", "adamStep", "unscaleGrad"],
-    executeMutationOp,
-  );
+  for (const op of Object.keys(GENERIC_OP_TABLE)) t.set(op, executeGenericOp);
+  add(["adamStep", "unscaleGrad"], executeMutationOp);
   return t;
 }
 
