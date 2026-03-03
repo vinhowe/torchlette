@@ -113,7 +113,6 @@ export { waitForGPU } from "./ops/fused";
 export {
   maxWithEpilogue,
   meanWithEpilogue,
-  sumDimWithPreamble,
   sumDimWithPreambleChain,
   sumWithEpilogue,
   sumWithPreambleEpilogue,

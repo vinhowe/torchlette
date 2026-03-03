@@ -40,7 +40,7 @@ import {
 import { alignBufferSize, contiguousStrides, dtypeBytes } from "../shape-utils";
 import { createTensor, createTrackedBuffer } from "../tensor";
 import { createTileKernelDispatcher } from "../tile-dispatch";
-import { isUnaryOp as isUnaryOpFromRegistry } from "./registry";
+
 import { contiguous } from "./views";
 
 // ============================================================================
@@ -427,24 +427,6 @@ function sumFullReductionChunked(
 // ============================================================================
 // Sum Dim With Preamble (fused elementwise + reduce)
 // ============================================================================
-
-/**
- * Dimension-wise sum with a single fused elementwise preamble.
- * Delegates to sumDimWithPreambleChain with a single-op chain.
- */
-export function sumDimWithPreamble(
-  inputs: BackendTensor[],
-  preambleOp: string,
-  sumOptions: SumOptions,
-): BackendTensor {
-  const arity = isUnaryOpFromRegistry(preambleOp) ? 1 : 2;
-  return sumDimWithPreambleChain(
-    inputs,
-    [{ op: preambleOp, arity }],
-    [],
-    sumOptions,
-  );
-}
 
 /**
  * Dimension-wise sum with a fused multi-op preamble chain.
