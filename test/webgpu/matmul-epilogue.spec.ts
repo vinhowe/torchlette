@@ -190,7 +190,7 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
       const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]);
 
       const epilogue: EpilogueConfig = {
-        ops: [{ kind: "relu" }],
+        ops: [{ kind: "unary", op: "relu" }],
         additionalInputCount: 0,
         outputDtype: "f32",
       };
@@ -221,7 +221,7 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
       const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]);
 
       const epilogue: EpilogueConfig = {
-        ops: [{ kind: "gelu" }],
+        ops: [{ kind: "unary", op: "gelu" }],
         additionalInputCount: 0,
         outputDtype: "f32",
       };
@@ -252,7 +252,7 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
       const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]);
 
       const epilogue: EpilogueConfig = {
-        ops: [{ kind: "silu" }],
+        ops: [{ kind: "unary", op: "silu" }],
         additionalInputCount: 0,
         outputDtype: "f32",
       };
@@ -286,7 +286,10 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
       const bias = webgpuBackend.ops.tensorFromArray(biasVals, [n]);
 
       const epilogue: EpilogueConfig = {
-        ops: [{ kind: "bias", inputIndex: 0 }, { kind: "relu" }],
+        ops: [
+          { kind: "bias", inputIndex: 0 },
+          { kind: "unary", op: "relu" },
+        ],
         additionalInputCount: 1,
         outputDtype: "f32",
       };
@@ -320,7 +323,10 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
       const bias = webgpuBackend.ops.tensorFromArray(biasVals, [n]);
 
       const epilogue: EpilogueConfig = {
-        ops: [{ kind: "bias", inputIndex: 0 }, { kind: "gelu" }],
+        ops: [
+          { kind: "bias", inputIndex: 0 },
+          { kind: "unary", op: "gelu" },
+        ],
         additionalInputCount: 1,
         outputDtype: "f32",
       };

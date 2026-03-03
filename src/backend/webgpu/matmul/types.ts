@@ -13,12 +13,7 @@ type EpilogueOp =
   | { kind: "bias"; inputIndex: number }
   | { kind: "unary"; op: string }
   | { kind: "binary"; op: string; inputIndex: number }
-  | { kind: "cast"; toDtype: DType }
-  | { kind: "relu" }
-  | { kind: "gelu" }
-  | { kind: "silu" }
-  | { kind: "add"; inputIndex: number }
-  | { kind: "mul"; inputIndex: number };
+  | { kind: "cast"; toDtype: DType };
 
 export type EpilogueConfig = {
   ops: EpilogueOp[];
