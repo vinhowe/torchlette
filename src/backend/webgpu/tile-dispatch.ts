@@ -27,7 +27,7 @@ import { dtypeBytes } from "./shape-utils";
 import type { AutotuneOptions } from "./tile-autotune";
 import { autotuneTileKernel, getDefaultConfig } from "./tile-autotune";
 import { compileTileKernel } from "./tile-compiler";
-import type { AutotuneConfig, DataType, TileKernelSpec } from "./tile-ir";
+import type { AutotuneConfig, TileKernelSpec } from "./tile-ir";
 import { resolveGrid } from "./tile-ir";
 import { requireContext, trackSharedEncoderWrite } from "./webgpu-state";
 

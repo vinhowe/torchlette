@@ -147,7 +147,6 @@ function argReduceOp(
   });
 
   const inputStrides = contiguousStrides(inputShape);
-  const outStrides = contiguousStrides(outShape);
 
   const dimSize = inputShape[dim];
   const dimStride = inputStrides[dim];
