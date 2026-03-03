@@ -184,10 +184,7 @@ export function argReduceWGSL(
   inputShape: number[],
   inputStrides: number[],
   outShape: number[],
-  _outStrides: number[],
   dim: number,
-  _dimSize: number,
-  _dimStride: number,
   inputToOutDim: number[],
 ): string {
   const rank = inputShape.length;

@@ -206,10 +206,7 @@ function argReduceOp(
     inputShape,
     inputStrides,
     outShape,
-    outStrides,
     dim,
-    dimSize,
-    dimStride,
     inputToOutDim,
   );
 
