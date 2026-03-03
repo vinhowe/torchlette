@@ -157,15 +157,14 @@ interface LoweredReductionPreambleAction {
   preambleNodeIndex: number;
   /** Plan-node index of the reduction (sum/mean) node. */
   reductionNodeIndex: number;
-  // Multi-op chain info (set only for chains with length > 1):
   /** Plan-node indices for all chain nodes. */
-  chainNodeIndices?: number[];
+  chainNodeIndices: number[];
   /** Kernel op descriptors for the chain. */
-  chainOps?: Array<{ op: string; arity: number; chainInputPos?: 0 | 1 }>;
+  chainOps: Array<{ op: string; arity: number; chainInputPos?: 0 | 1 }>;
   /** Dtypes for each external input. */
-  chainInputDtypes?: DType[];
+  chainInputDtypes: DType[];
   /** Total nodes consumed (chain + reduction). */
-  consumedCount?: number;
+  consumedCount: number;
 }
 
 /** A reduction with elementwise epilogue fusion (sum/mean/max → cast/add/mul/activation chain). */
@@ -471,10 +470,10 @@ export class LoweredPlanBuilder {
   recordReductionPreamble(
     preambleNodeIndex: number,
     reductionNodeIndex: number,
-    chainNodeIndices?: number[],
-    chainOps?: Array<{ op: string; arity: number; chainInputPos?: 0 | 1 }>,
-    chainInputDtypes?: DType[],
-    consumedCount?: number,
+    chainNodeIndices: number[],
+    chainOps: Array<{ op: string; arity: number; chainInputPos?: 0 | 1 }>,
+    chainInputDtypes: DType[],
+    consumedCount: number,
   ): void {
     this.actions.push({
       kind: "reduction-preamble",
