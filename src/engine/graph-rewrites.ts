@@ -21,7 +21,7 @@ import type { LazyIRNode, LazyRef } from "./lazy-types";
 /**
  * Context provided to rewrite passes.
  */
-export interface RewriteContext {
+interface RewriteContext {
   /** Plan nodes in current order. */
   planNodes: LazyIRNode[];
   /** Map from node ID → consumer nodes. */
