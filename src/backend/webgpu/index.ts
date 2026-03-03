@@ -3,16 +3,7 @@
 // ============================================================================
 
 export {
-  cachedCreateBindGroup,
-  clearBindGroupCache,
-  createParamsBuffer,
-  getBindGroupCacheMissLog,
-  getBindGroupCacheStats,
   getDispatchSequenceCounters,
-  profiledCreateBindGroup,
-  releaseParamsBuffer,
-  resetBindGroupCacheStats,
-  resetDispatchSequence,
   setDispatchSequenceCounters,
 } from "./bind-group-cache";
 export type { BufferArena } from "./buffer-arena";
@@ -35,84 +26,55 @@ export {
 } from "./buffer-arena";
 
 export {
-  bufferPool,
   clearBufferPool,
   deferredDestroyBuffer,
   flushBufferPool,
   getBufferPoolDetailedStats,
   getBufferPoolStats,
   resetBufferPoolDetailedStats,
-  setBufferPoolBudget,
 } from "./buffer-pool";
 export {
-  dispatchBinary,
-  dispatchComputePass,
-  dispatchElementwise,
   dispatchMatmul,
   dispatchMatmulDirect,
-  dispatchUnary,
   getPipeline,
 } from "./dispatch";
 export {
   addReplayPinnedBuffers,
-  getAndClearLastBindGroupBuffers,
   replayDispatches,
   startDispatchRecording,
   stopDispatchRecording,
 } from "./dispatch-recording";
 export {
   destroyWebGPU,
-  f16ArrayToF32Array,
-  f32ArrayToF16Array,
   getMaxStorageBufferBindingSize,
   getWebGPUDevice,
   getWebGPUInitError,
   initWebGPU,
   isF16Supported,
-  resetAllKernelCaches,
   syncWebGPU,
   warmupFromRegistry,
   warmupFromStep,
 } from "./gpu-context";
-export type { WebGPUContext, WebGPUTensor } from "./gpu-types";
-export { GPUBufferUsage, GPUMapMode } from "./gpu-types";
+export type { WebGPUTensor } from "./gpu-types";
 // Re-export autotune control functions
 export {
   isAutotuneEnabled,
-  pretuneMatmulShapes,
   setAutotuneEnabled,
 } from "./matmul/dispatch";
 // Re-export memory tracking functions
 export {
-  clearAllocStacks,
-  clearLargeAllocLog,
-  disableAllAllocDebug,
   enableAllAllocDebug,
-  enableLargeAllocDebug,
-  GPUMemoryLimitExceededError,
   getAndResetFlowCounters,
   getGPUAllocationHistogram,
-  getGPUMemoryLimit,
   getGPUMemoryStats,
-  getLargeAllocLog,
   getLeakedAllocCount,
   getLeakedAllocCountForStep,
-  getLeakedSizeHistogramForStep,
-  getTrackedBuffers,
-  gpuMemoryTracker,
   setAllocStep,
   setGPUMemoryLimit,
   snapshotLeakedAllocs,
 } from "./memory-tracker";
 // Re-export public functions from ops modules
 export { tensorFromArrayWithDtype } from "./ops/creation";
-export { waitForGPU } from "./ops/fused";
-export {
-  meanWithEpilogue,
-  reduction,
-  sumDimWithPreambleChain,
-  sumWithPreambleEpilogue,
-} from "./ops/reductions";
 export {
   clearWarmupCache,
   deserializeRegistry,
@@ -122,16 +84,11 @@ export {
   warmupPipelines,
 } from "./pipeline-warmup";
 
-// Re-export profiler functions for use in tests
+// Re-export profiler functions for use in tests and tools
 export {
-  flushAndReadGpuTimestamps,
-  getProfileJSON,
-  getProfileModule,
   isProfilingEnabled,
-  type PlanAnalysis,
   printProfileSummary,
   readGpuTimestamps,
-  recordPlanAnalysis,
   resetProfileStats,
   setProfileModule,
   setProfilePhase,
@@ -139,59 +96,28 @@ export {
   writeProfileJSON,
 } from "./profiler";
 export {
-  alignBufferSize,
-  broadcastShapes,
-  compute2DDispatch,
-  computeEffectiveBroadcastStrides,
-  contiguousStrides,
-  dtypeBytes,
-  MAX_WORKGROUPS_PER_DIM,
-  sizeOf,
-  WORKGROUP_SIZE,
-} from "./shape-utils";
-export {
   abortBatch,
   beginBatchExecution,
   beginSharedEncoder,
-  beginStep,
   endBatchExecution,
   endSharedEncoder,
-  endStep,
   flushSharedEncoder,
   getCurrentOpLabel,
   getSubmitCount,
   isBatchActive,
-  isSharedEncoderActive,
   resetSubmitCount,
   setAdamBatchMode,
   setCurrentOpLabel,
-  setSharedEncoderEnabled,
 } from "./shared-encoder";
-export { createTensor, createTrackedBuffer } from "./tensor";
 export { compileTileKernel } from "./tile-compiler";
-export {
-  createTileKernelDispatcher,
-  type TileKernelInstance,
-} from "./tile-dispatch";
+export { createTileKernelDispatcher } from "./tile-dispatch";
 // Re-export tile-IR public API for custom kernels
 export {
-  type BindingSpec,
-  Block,
-  type BlockCoopPtr,
-  type BlockLoadOpts,
-  type BlockPtr,
-  type BlockStorePtr,
-  type BlockThreadPtr,
   ceilDivGrid,
-  type DataType,
   elementwiseGrid,
-  elementwiseKernel,
   KernelContext,
-  perRowGrid,
-  perRowKernel,
   singleWorkgroup,
   type TileKernelSpec,
-  type UniformType,
 } from "./tile-ir";
 
 import { registerBackend } from "../registry";
