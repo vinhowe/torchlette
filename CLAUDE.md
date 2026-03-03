@@ -136,11 +136,7 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
   - Null-state sentinels (§8.8): Stable missing state representation
   - Functionalization (§8.10): In-place to out-of-place conversion
   - Region-exit persistence (§8.11): Commit and writeback tracking
-- **IR optimization** (src/engine/ir-optimize.ts):
-  - CSE with RNG exclusion (§15): Random ops never merged
-  - Dead code elimination: Removes unreachable nodes
-  - tok_after analysis (§15): Redundant load detection
-- **§15 Integration** (src/engine/lazy-to-ir.ts, src/engine/fusion-detect.ts):
+- **§15 Integration** (src/engine/fusion-detect.ts):
   - Lazy plan to IR conversion: Convert LazyIRNode graphs to IRGraph
   - Fusion group detection: Identify consecutive elementwise ops
   - Optimized execution: `executePlanOptimized()` with automatic fusion
@@ -189,7 +185,7 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
 - tokens.spec.ts, versioning.spec.ts, planning.spec.ts
 - checkpoint.spec.ts, rng.spec.ts, exec-lock.spec.ts
 - lifecycle.spec.ts, backward.spec.ts, compile.spec.ts
-- compile-cache.spec.ts, compiled-region.spec.ts, ir-optimize.spec.ts, compile-fusion-integration.spec.ts
+- compile-cache.spec.ts, compiled-region.spec.ts, compile-fusion-integration.spec.ts
 - memory-planning.spec.ts, memory-planning-integration.spec.ts, cross-device.spec.ts
 - amp.spec.ts, frontend-amp.spec.ts, amp-ir-transform.spec.ts, amp-compile-integration.spec.ts
 - webgpu/matmul-*.spec.ts, webgpu/cross-device-transfer.spec.ts, webgpu/fusion-codegen.spec.ts
