@@ -113,7 +113,7 @@ export function setReplayPinnedBufferSet(set: Set<GPUBuffer> | null): void {
 // GPU Submit Counter (moved from shared-encoder.ts)
 // ============================================================================
 
-export let gpuSubmitCount = 0;
+let gpuSubmitCount = 0;
 
 export function getSubmitCount(): number {
   return gpuSubmitCount;

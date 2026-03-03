@@ -209,7 +209,7 @@ function addEpilogueBindings(
 
 type ReduceOp = "sum" | "max" | "min";
 
-function reduction(
+export function reduction(
   op: ReduceOp,
   a: BackendTensor,
   options?: SumOptions | MaxOptions,
@@ -659,30 +659,6 @@ export function mean(a: BackendTensor, options?: MeanOptions): BackendTensor {
 }
 
 // ============================================================================
-// Sum/Max With Epilogue (delegates to unified reduction())
-// ============================================================================
-
-export function sumWithEpilogue(
-  a: BackendTensor,
-  options: SumOptions,
-  epilogueOps: ReductionEpilogueOpDesc[],
-  epilogueInputs: BackendTensor[],
-  outputDtype: DType,
-): BackendTensor {
-  return reduction("sum", a, options, epilogueOps, epilogueInputs, outputDtype);
-}
-
-export function maxWithEpilogue(
-  a: BackendTensor,
-  options: MaxOptions,
-  epilogueOps: ReductionEpilogueOpDesc[],
-  epilogueInputs: BackendTensor[],
-  outputDtype: DType,
-): BackendTensor {
-  return reduction("max", a, options, epilogueOps, epilogueInputs, outputDtype);
-}
-
-// ============================================================================
 // Mean With Epilogue
 // ============================================================================
 
@@ -706,7 +682,8 @@ export function meanWithEpilogue(
     epilogueOps,
     epilogueInputs,
   );
-  const result = sumWithEpilogue(
+  const result = reduction(
+    "sum",
     a,
     options,
     mean.ops,
