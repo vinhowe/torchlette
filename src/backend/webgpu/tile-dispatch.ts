@@ -15,15 +15,14 @@
  * ```
  */
 
-import { profiledCreateBindGroup } from "./bind-group-cache";
-import { computeFlatChunkLayout } from "./chunked-dispatch";
-import type { GPUBuffer, GPUDevice } from "./gpu-types";
-import { GPUBufferUsage } from "./gpu-types";
 import {
   cachedCreateBindGroup,
-  dispatchComputePass,
-  getPipeline,
-} from "./index";
+  profiledCreateBindGroup,
+} from "./bind-group-cache";
+import { computeFlatChunkLayout } from "./chunked-dispatch";
+import { dispatchComputePass, getPipeline } from "./dispatch";
+import type { GPUBuffer, GPUDevice } from "./gpu-types";
+import { GPUBufferUsage } from "./gpu-types";
 import { dtypeBytes } from "./shape-utils";
 import type { AutotuneOptions } from "./tile-autotune";
 import { autotuneTileKernel, getDefaultConfig } from "./tile-autotune";

@@ -10,13 +10,10 @@
  */
 
 import type { AdamStepConfig } from "../types";
+import { allocateOutputBuffer } from "./buffer-arena";
 import { computeFlatChunkLayout } from "./chunked-dispatch";
+import { getMaxStorageBufferBindingSize, isF16Supported } from "./gpu-context";
 import type { GPUBuffer } from "./gpu-types";
-import {
-  allocateOutputBuffer,
-  getMaxStorageBufferBindingSize,
-  isF16Supported,
-} from "./index";
 import { profileSubOpBegin, profileSubOpEnd } from "./profiler";
 import {
   F32_ONE_BITS,

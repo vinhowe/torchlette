@@ -15,14 +15,11 @@
  * memory code. Auto-CSE handles all sub-expression sharing.
  */
 
+import { cachedCreateBindGroup } from "./bind-group-cache";
+import { allocateOutputBuffer } from "./buffer-arena";
+import { dispatchComputePass, getPipeline } from "./dispatch";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
-import {
-  allocateOutputBuffer,
-  cachedCreateBindGroup,
-  dispatchComputePass,
-  getPipeline,
-} from "./index";
 import { F32_NEG_MAX, WORKGROUP_SIZE } from "./shape-utils";
 import { compileTileKernel } from "./tile-compiler";
 import type { TileKernelSpec } from "./tile-ir";

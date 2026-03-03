@@ -364,7 +364,9 @@ export async function initWebGPU(): Promise<boolean> {
   if (!acquired) return false;
   const { adapter, provider } = acquired;
 
-  const subgroupSupport = detectSubgroupSupport(adapter);
+  const subgroupSupport: SubgroupSupport = adapter.features?.has("subgroups")
+    ? { supported: true, subgroupSize: 32 }
+    : { supported: false };
   setSubgroupSupport(subgroupSupport);
 
   const f16Supported = adapter.features?.has("shader-f16") ?? false;
@@ -408,23 +410,6 @@ export async function initWebGPU(): Promise<boolean> {
   setSharedEncoderEnabled(batchSubmits !== "0");
 
   return true;
-}
-
-// ============================================================================
-// Subgroup Detection
-// ============================================================================
-
-/**
- * Detect subgroup support from the GPU adapter.
- */
-function detectSubgroupSupport(adapter: GPUAdapter): SubgroupSupport {
-  // Check if adapter has features and if subgroups is in the set
-  if (adapter.features?.has("subgroups")) {
-    // Typical subgroup sizes: 32 (NVIDIA/AMD), 16 (Intel/mobile)
-    // We assume 32 as default since that's most common
-    return { supported: true, subgroupSize: 32 };
-  }
-  return { supported: false };
 }
 
 // ============================================================================
