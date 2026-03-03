@@ -240,7 +240,7 @@ export function flushSharedEncoder(): void {
   // Finish the shared encoder into a command buffer
   const cbs: GPUCommandBuffer[] = [];
   if (encoderState.instance) {
-    resolveGpuTimestamps(encoderState.instance);
+    resolveGpuTimestamps();
     cbs.push(encoderState.instance.finish());
   }
   // Add any collected CBs (from ops that bypassed the shared encoder)
@@ -289,7 +289,7 @@ export function endSharedEncoder(): void {
     // Finish the shared encoder and submit everything
     const cbs: GPUCommandBuffer[] = [];
     if (encoderState.instance) {
-      resolveGpuTimestamps(encoderState.instance);
+      resolveGpuTimestamps();
       cbs.push(encoderState.instance.finish());
       encoderState.instance = null;
     }

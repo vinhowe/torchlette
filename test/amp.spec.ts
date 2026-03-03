@@ -227,12 +227,12 @@ describe("Output Cast for AMP", () => {
   });
 
   it("returns null when dtypes match", () => {
-    const cast = computeOutputCast("matmul", "f16", "f16", ctx);
+    const cast = computeOutputCast("f16", "f16", ctx);
     expect(cast).toBeNull();
   });
 
   it("returns cast info when conversion needed", () => {
-    const cast = computeOutputCast("matmul", "f32", "f16", ctx);
+    const cast = computeOutputCast("f32", "f16", ctx);
     expect(cast).not.toBeNull();
     expect(cast?.fromDtype).toBe("f32");
     expect(cast?.toDtype).toBe("f16");
@@ -241,7 +241,7 @@ describe("Output Cast for AMP", () => {
 
   it("returns null when autocast disabled", () => {
     popAutocast(ctx);
-    const cast = computeOutputCast("matmul", "f32", "f16", ctx);
+    const cast = computeOutputCast("f32", "f16", ctx);
     expect(cast).toBeNull();
   });
 });

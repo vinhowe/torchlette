@@ -378,7 +378,7 @@ export function getTimestampWrites(
 // Resolve timestamps into the resolve buffer (call before encoder.finish())
 // ---------------------------------------------------------------------------
 
-export function resolveGpuTimestamps(_encoder: GPUCommandEncoder): void {
+export function resolveGpuTimestamps(): void {
   if (
     !PROFILING_ENABLED ||
     !gpuTs.supported ||
