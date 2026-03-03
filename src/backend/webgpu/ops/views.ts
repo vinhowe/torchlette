@@ -648,7 +648,7 @@ export function narrowBackward(
   outShape[dim] = originalLength;
   const outSize = sizeOf(outShape);
   const dtype = gradTensor.dtype;
-  const bytesPerElement = dtype === "f16" ? 2 : 4;
+  const bytesPerElement = dtypeBytes(dtype);
 
   const outerSize = sizeOf(outShape.slice(0, dim));
   const innerSize = sizeOf(outShape.slice(dim + 1));

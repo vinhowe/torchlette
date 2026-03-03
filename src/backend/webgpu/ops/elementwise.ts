@@ -92,7 +92,7 @@ export function gelu(
 ): BackendTensor {
   const approximate = options?.approximate ?? "tanh";
 
-  const key = approximate === "tanh" ? "gelu_tanh" : "gelu_erf";
+  const key = approximate === "tanh" ? "gelu" : "gelu_erf";
   return dispatchUnary(key, asGPUTensor(a), { outBuffer: options?.outBuffer });
 }
 

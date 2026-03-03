@@ -559,7 +559,7 @@ export function dispatchMatmul(
   const promotedDtype =
     dtypeA === "f32" || dtypeB === "f32" ? ("f32" as const) : dtypeA;
   const outputDtype = epilogueOpts?.epilogue.outputDtype ?? promotedDtype;
-  const bytesPerElement = outputDtype === "f16" ? 2 : 4;
+  const bytesPerElement = dtypeBytes(outputDtype);
 
   const epilogueBuffers =
     epilogueOpts?.epilogueInputs.map((t) => t.buffer) ?? [];
@@ -643,7 +643,7 @@ export function dispatchMatmulDirect(
   },
 ): WebGPUTensor {
   const ctx = requireContext();
-  const bytesPerElement = config.outputDtype === "f16" ? 2 : 4;
+  const bytesPerElement = dtypeBytes(config.outputDtype);
   const outSize = sizeOf(config.outShape);
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement, [
     bufA,
