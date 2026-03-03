@@ -163,34 +163,6 @@ function applyBlockEpilogue(
       case "cast":
         if (op.toDtype === "f16") acc.castTo_("f16");
         break;
-      // Backward-compat kinds
-      case "relu":
-        acc.apply_((x) => x.gt(ctx.const(0.0)).select(x, ctx.const(0.0)));
-        break;
-      case "gelu":
-        acc.apply_((x) => applyGelu(ctx, x));
-        break;
-      case "silu":
-        acc.apply_((x) => applySilu(ctx, x));
-        break;
-      case "add": {
-        const b = ops.load(
-          `epilogue_in${op.inputIndex}`,
-          { kind: "thread", base: threadOutBase, stride: threadOutStride },
-          { rows: acc.rows, cols: acc.cols },
-        );
-        acc.add_(b);
-        break;
-      }
-      case "mul": {
-        const b = ops.load(
-          `epilogue_in${op.inputIndex}`,
-          { kind: "thread", base: threadOutBase, stride: threadOutStride },
-          { rows: acc.rows, cols: acc.cols },
-        );
-        acc.mul_(b);
-        break;
-      }
     }
   }
   if (

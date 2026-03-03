@@ -48,11 +48,10 @@ export function pushGeluEpilogueOp(
   epilogueOps: EpilogueOp[],
 ): void {
   const p = nextNode.payload as { approximate?: string } | undefined;
-  epilogueOps.push(
-    p?.approximate === "tanh"
-      ? { kind: "gelu" }
-      : { kind: "unary", op: "gelu_erf" },
-  );
+  epilogueOps.push({
+    kind: "unary",
+    op: p?.approximate === "tanh" ? "gelu" : "gelu_erf",
+  });
 }
 
 // ============================================================================

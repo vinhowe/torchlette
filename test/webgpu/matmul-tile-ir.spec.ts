@@ -1134,7 +1134,7 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
         ops: [
           { kind: "cast", toDtype: "f32" },
           { kind: "bias", inputIndex: 0 },
-          { kind: "gelu" },
+          { kind: "unary", op: "gelu" },
         ],
         additionalInputCount: 1,
         outputDtype: "f32",
@@ -1207,7 +1207,7 @@ describe.runIf(isWebGPUEnabled)("tile IR matmul (webgpu)", () => {
         ops: [
           { kind: "cast", toDtype: "f32" },
           { kind: "bias", inputIndex: 0 },
-          { kind: "gelu" },
+          { kind: "unary", op: "gelu" },
           { kind: "cast", toDtype: "f16" },
         ],
         additionalInputCount: 1,
