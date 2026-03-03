@@ -23,7 +23,7 @@ import { resolveOutputBuffer } from "../buffer-arena";
 import { computeDimChunkLayout } from "../chunked-dispatch";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { requireContext } from "../gpu-context";
-import type { GPUBuffer, GPUBufferBinding } from "../gpu-types";
+import type { GPUBufferBinding } from "../gpu-types";
 import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
 import { compute2DDispatch, dtypeBytes, WORKGROUP_SIZE } from "../shape-utils";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
