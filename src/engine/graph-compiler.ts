@@ -230,57 +230,9 @@ function detectMatmulEpilogueChains(
   };
 }
 
-/**
- * Relocate epilogue chain nodes to appear immediately after their matmul.
- */
-function relocateEpilogueNodes(
-  planNodes: LazyIRNode[],
-  epilogueClaimedIds: Set<number>,
-  matmulEpilogueChains: Map<number, number[]>,
-  nodeById: Map<number, LazyIRNode>,
-): LazyIRNode[] {
-  const unclaimed = planNodes.filter((n) => !epilogueClaimedIds.has(n.id));
-  const relocated: LazyIRNode[] = [];
-  for (const n of unclaimed) {
-    relocated.push(n);
-    const chain = matmulEpilogueChains.get(n.id);
-    if (chain) {
-      for (const id of chain) {
-        const chainNode = nodeById.get(id);
-        if (chainNode) relocated.push(chainNode);
-      }
-    }
-  }
-  return relocated;
-}
-
 // ============================================================================
 // Main Entry Point
 // ============================================================================
-
-/** Build consumer, position, and ID lookup maps in a single pass. */
-function buildGraphMaps(nodes: LazyIRNode[]) {
-  const consumers = new Map<number, LazyIRNode[]>();
-  const consumerCount = new Map<number, number>();
-  const nodePosition = new Map<number, number>();
-  const nodeById = new Map<number, LazyIRNode>();
-
-  for (let i = 0; i < nodes.length; i++) {
-    const node = nodes[i];
-    nodePosition.set(node.id, i);
-    nodeById.set(node.id, node);
-    for (const input of node.inputs) {
-      if (input.kind === "pending") {
-        const producerId = input.node.id;
-        consumerCount.set(producerId, (consumerCount.get(producerId) ?? 0) + 1);
-        if (!consumers.has(producerId)) consumers.set(producerId, []);
-        consumers.get(producerId)!.push(node);
-      }
-    }
-  }
-
-  return { consumers, consumerCount, nodePosition, nodeById };
-}
 
 /**
  * Analyze a computation graph and produce a unified analysis result.
@@ -308,8 +260,24 @@ export function analyzeGraph(
     reorderedNodes = reorderPlanForFusion(planNodes);
   }
 
-  const { consumers, consumerCount, nodePosition, nodeById } =
-    buildGraphMaps(reorderedNodes);
+  // Build consumer, position, and ID lookup maps in a single pass
+  const consumers = new Map<number, LazyIRNode[]>();
+  const consumerCount = new Map<number, number>();
+  const nodePosition = new Map<number, number>();
+  const nodeById = new Map<number, LazyIRNode>();
+  for (let i = 0; i < reorderedNodes.length; i++) {
+    const node = reorderedNodes[i];
+    nodePosition.set(node.id, i);
+    nodeById.set(node.id, node);
+    for (const input of node.inputs) {
+      if (input.kind === "pending") {
+        const producerId = input.node.id;
+        consumerCount.set(producerId, (consumerCount.get(producerId) ?? 0) + 1);
+        if (!consumers.has(producerId)) consumers.set(producerId, []);
+        consumers.get(producerId)!.push(node);
+      }
+    }
+  }
 
   // --- Graph rewrites: simplify before pattern detection ---
   const rewriteBypassedIds = runRewritePasses({
@@ -334,12 +302,21 @@ export function analyzeGraph(
 
   // Relocate epilogue chain nodes after their matmul
   if (epilogueClaimedIds.size > 0) {
-    reorderedNodes = relocateEpilogueNodes(
-      reorderedNodes,
-      epilogueClaimedIds,
-      matmulEpilogueChains,
-      nodeById,
+    const unclaimed = reorderedNodes.filter(
+      (n) => !epilogueClaimedIds.has(n.id),
     );
+    const relocated: LazyIRNode[] = [];
+    for (const n of unclaimed) {
+      relocated.push(n);
+      const chain = matmulEpilogueChains.get(n.id);
+      if (chain) {
+        for (const id of chain) {
+          const chainNode = nodeById.get(id);
+          if (chainNode) relocated.push(chainNode);
+        }
+      }
+    }
+    reorderedNodes = relocated;
   }
 
   // --- Priority 80: Compound patterns (softmax, log_softmax) ---

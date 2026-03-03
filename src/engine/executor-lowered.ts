@@ -344,7 +344,7 @@ export async function executeLoweredPlan(
     options.bufferArena
   ) {
     const cache = loweredPlan.dispatchCache;
-    if (useTopLevelSharedEncoder) beginSharedEncoder();
+    beginSharedEncoder();
     setActiveArena(options.bufferArena);
 
     // Register external input buffers for arena conflict detection
