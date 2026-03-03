@@ -3,7 +3,44 @@
  * Similar to PyTorch's torch.nn.functional.
  */
 
+import type { DeviceKind } from "../backend/types";
 import type { Tensor, Torchlette } from "../frontend";
+
+/** Apply none/sum/mean reduction to a per-sample loss tensor. */
+function applyReduction(
+  api: Torchlette,
+  loss: Tensor,
+  reduction: "none" | "mean" | "sum",
+  device: DeviceKind,
+): Tensor {
+  if (reduction === "none") return loss;
+  if (reduction === "sum") {
+    const s = loss.sum();
+    return typeof s === "number" ? api.full([], s, { device }) : s;
+  }
+  const m = loss.mean();
+  return typeof m === "number" ? api.full([], m, { device }) : m;
+}
+
+/** Gather values at target indices along the last dim, handling unsqueeze/squeeze. */
+function gatherTargets(
+  api: Torchlette,
+  input: Tensor,
+  targets: Tensor,
+): Tensor {
+  const isBatched = input.shape.length >= 2;
+  let targetsForGather = targets;
+  if (isBatched && targets.shape.length === input.shape.length - 1) {
+    targetsForGather = targets.reshape([...targets.shape, 1]);
+  }
+  const gathered = api.gather(input, targetsForGather, {
+    dim: input.shape.length - 1,
+  });
+  if (isBatched && targets.shape.length === input.shape.length - 1) {
+    return gathered.reshape(targets.shape);
+  }
+  return gathered;
+}
 
 /**
  * Apply dropout to a tensor.
@@ -77,25 +114,16 @@ export function crossEntropy(
 
   // Fused path for WebGPU (single kernel instead of 9 ops)
   if (logits.device === "webgpu" && logits.shape.length === 2) {
-    const perSampleLoss = api._crossEntropyFused(logits, targets);
-    if (reduction === "none") return perSampleLoss;
-    if (reduction === "sum") {
-      const s = perSampleLoss.sum();
-      if (typeof s === "number")
-        return api.full([], s, { device: logits.device });
-      return s;
-    }
-    const m = perSampleLoss.mean();
-    if (typeof m === "number")
-      return api.full([], m, { device: logits.device });
-    return m;
+    return applyReduction(
+      api,
+      api._crossEntropyFused(logits, targets),
+      reduction,
+      logits.device,
+    );
   }
 
   // f16 inputs are automatically upcast to f32 by the RuntimeEngine's
   // ensureDtypeSafety when max/sum/exp/log are called below.
-
-  // Get dimensions
-  const isBatched = logits.shape.length >= 2;
 
   // For numerical stability, compute: -logits[target] + log(sum(exp(logits - max(logits))))
   // This is equivalent to: -log(softmax(logits)[target])
@@ -116,46 +144,11 @@ export function crossEntropy(
   const logSumExp = sumExp.log();
   const logSoftmax = api.sub(shifted, logSumExp);
 
-  // Step 2: Gather the log-softmax values at target indices
-  // This gives us -log(softmax[target])
-  // For batch inputs, targets is [batch] but gather needs same rank as input [batch, classes]
-  // So we unsqueeze targets to [batch, 1], gather gives [batch, 1], then reshape to [batch]
-  let targetsForGather = targets;
-  if (isBatched && targets.shape.length === logits.shape.length - 1) {
-    // Unsqueeze targets to add dimension for gather
-    targetsForGather = targets.reshape([...targets.shape, 1]);
-  }
-  const gatheredLogProbs = api.gather(logSoftmax, targetsForGather, {
-    dim: logits.shape.length - 1,
-  });
+  // Step 2: Gather the log-softmax values at target indices and negate
+  const loss = api.neg(gatherTargets(api, logSoftmax, targets));
 
-  // Squeeze the gathered result if we added a dimension
-  let gatheredSqueezed = gatheredLogProbs;
-  if (isBatched && targets.shape.length === logits.shape.length - 1) {
-    // Remove the last dimension we added (shape goes from [batch, 1] to [batch])
-    gatheredSqueezed = gatheredLogProbs.reshape(targets.shape);
-  }
-
-  // Step 3: Negate to get the loss
-  const loss = api.neg(gatheredSqueezed);
-
-  // Step 4: Apply reduction
-  if (reduction === "none") {
-    return loss;
-  } else if (reduction === "sum") {
-    const sumLoss = loss.sum();
-    if (typeof sumLoss === "number") {
-      return api.full([], sumLoss, { device: logits.device });
-    }
-    return sumLoss;
-  } else {
-    // mean
-    const meanLoss = loss.mean();
-    if (typeof meanLoss === "number") {
-      return api.full([], meanLoss, { device: logits.device });
-    }
-    return meanLoss;
-  }
+  // Step 3: Apply reduction
+  return applyReduction(api, loss, reduction, logits.device);
 }
 
 /**
@@ -180,39 +173,8 @@ export function nllLoss(
 ): Tensor {
   const reduction = options?.reduction ?? "mean";
 
-  // Gather log probs at target indices and negate
-  // For batch inputs, targets is [batch] but gather needs same rank as input [batch, classes]
-  const isBatched = logProbs.shape.length >= 2;
-  let targetsForGather = targets;
-  if (isBatched && targets.shape.length === logProbs.shape.length - 1) {
-    targetsForGather = targets.reshape([...targets.shape, 1]);
-  }
-  const gatheredLogProbs = api.gather(logProbs, targetsForGather, {
-    dim: logProbs.shape.length - 1,
-  });
-
-  // Squeeze if we added a dimension
-  let gatheredSqueezed = gatheredLogProbs;
-  if (isBatched && targets.shape.length === logProbs.shape.length - 1) {
-    gatheredSqueezed = gatheredLogProbs.reshape(targets.shape);
-  }
-  const loss = api.neg(gatheredSqueezed);
-
-  if (reduction === "none") {
-    return loss;
-  } else if (reduction === "sum") {
-    const sumLoss = loss.sum();
-    if (typeof sumLoss === "number") {
-      return api.full([], sumLoss, { device: logProbs.device });
-    }
-    return sumLoss;
-  } else {
-    const meanLoss = loss.mean();
-    if (typeof meanLoss === "number") {
-      return api.full([], meanLoss, { device: logProbs.device });
-    }
-    return meanLoss;
-  }
+  const loss = api.neg(gatherTargets(api, logProbs, targets));
+  return applyReduction(api, loss, reduction, logProbs.device);
 }
 
 /**
