@@ -29,33 +29,6 @@ import {
   releaseDeadTensors,
 } from "./storage-tracker";
 
-/**
- * Replace pending input refs with materialized storages from previous segments.
- * Clone-on-write: only copies the inputs array if a substitution is needed,
- * preserving plan immutability across steps.
- */
-function materializeSegmentInputs(
-  nodes: LazyIRNode[],
-  materializedStorages: Map<number, StorageHandle>,
-): void {
-  for (const node of nodes) {
-    let needsClone = false;
-    for (let j = 0; j < node.inputs.length; j++) {
-      const input = node.inputs[j];
-      if (input.kind === "pending") {
-        const materialized = materializedStorages.get(input.node.id);
-        if (materialized) {
-          if (!needsClone) {
-            node.inputs = [...node.inputs];
-            needsClone = true;
-          }
-          node.inputs[j] = { kind: "materialized", storage: materialized };
-        }
-      }
-    }
-  }
-}
-
 // ============================================================================
 // Sequential Plan Execution
 // ============================================================================
@@ -214,15 +187,37 @@ export async function executePlanSegmented(
     const segment = segments[segIdx];
     const isLastSegment = segIdx === segments.length - 1;
 
-    materializeSegmentInputs(segment.nodes, materializedStorages);
+    // Replace pending input refs with materialized storages from previous segments
+    for (const node of segment.nodes) {
+      let needsClone = false;
+      for (let j = 0; j < node.inputs.length; j++) {
+        const input = node.inputs[j];
+        if (input.kind === "pending") {
+          const materialized = materializedStorages.get(input.node.id);
+          if (materialized) {
+            if (!needsClone) {
+              node.inputs = [...node.inputs];
+              needsClone = true;
+            }
+            node.inputs[j] = { kind: "materialized", storage: materialized };
+          }
+        }
+      }
+    }
 
     if (gpuSync) {
       // GPU sync path: batch ops, submit, wait, then release dead buffers
-      const survivingNodeIds = findSurvivingOutputs(
-        segment,
-        segments.slice(segIdx + 1),
-        finalOutputId,
-      );
+      // Find node IDs that must survive this segment (used by later segments)
+      const survivingNodeIds = new Set<number>([finalOutputId]);
+      for (const laterSegment of segments.slice(segIdx + 1)) {
+        for (const laterNode of laterSegment.nodes) {
+          for (const input of laterNode.inputs) {
+            if (input.kind === "pending") {
+              survivingNodeIds.add(input.node.id);
+            }
+          }
+        }
+      }
 
       beginBatchExecution();
 
@@ -280,33 +275,4 @@ export async function executePlanSegmented(
   }
 
   return lastResult;
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/**
- * Find node IDs that must survive this segment (used by later segments).
- */
-function findSurvivingOutputs(
-  _segment: ExecutionPlan,
-  laterSegments: ExecutionPlan[],
-  finalOutputId: number,
-): Set<number> {
-  const surviving = new Set<number>();
-  surviving.add(finalOutputId);
-
-  // Find all nodes from this segment that are used as inputs in later segments
-  for (const laterSegment of laterSegments) {
-    for (const node of laterSegment.nodes) {
-      for (const input of node.inputs) {
-        if (input.kind === "pending") {
-          surviving.add(input.node.id);
-        }
-      }
-    }
-  }
-
-  return surviving;
 }

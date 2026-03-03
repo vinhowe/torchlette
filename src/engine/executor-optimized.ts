@@ -28,12 +28,7 @@ import {
   isFusibleOp,
 } from "./fusion-detect";
 import { analyzeGraph } from "./graph-compiler";
-import type {
-  ExecutionPlan,
-  LazyIRNode,
-  LazyRef,
-  StorageHandle,
-} from "./lazy-types";
+import type { ExecutionPlan, LazyIRNode, StorageHandle } from "./lazy-types";
 import { analyzeLifetimes, type TensorLifetime } from "./lifetime-analysis";
 import { type LoweredPlan, LoweredPlanBuilder } from "./lowered-plan";
 import type { MatmulPrologueInfo } from "./matmul-epilogue";
@@ -46,37 +41,6 @@ import {
   executeSequentialSegmentWithEarlyRelease,
 } from "./segment-executors";
 import { releaseDeadTensors } from "./storage-tracker";
-
-/** Build compound match map: maps first covered node to full descriptor, rest to skip entries. */
-function buildCompoundMatchMap(
-  compoundMatches: CompoundMatch[],
-  nodeIdToFinalPos: Map<number, number>,
-): Map<number, CompoundMatchExec> {
-  const map = new Map<number, CompoundMatchExec>();
-  for (const match of compoundMatches) {
-    let firstPos = Infinity;
-    let firstId = match.coveredNodeIds[0];
-    for (const id of match.coveredNodeIds) {
-      const pos = nodeIdToFinalPos.get(id) ?? Infinity;
-      if (pos < firstPos) {
-        firstPos = pos;
-        firstId = id;
-      }
-    }
-    const coveredSet = new Set(match.coveredNodeIds);
-    const desc = {
-      name: match.name,
-      coveredNodeIds: coveredSet,
-      outputNodeId: match.outputNodeId,
-      dim: match.dim,
-    };
-    map.set(firstId, desc);
-    for (const id of match.coveredNodeIds) {
-      if (id !== firstId) map.set(id, { ...desc, name: "" });
-    }
-  }
-  return map;
-}
 
 /**
  * Options for optimized plan execution.
@@ -672,10 +636,32 @@ export async function executePlanOptimized(
   }
 
   try {
-    const compoundMatchMap =
-      compoundMatches.length > 0
-        ? buildCompoundMatchMap(compoundMatches, nodeIdToFinalPos)
-        : undefined;
+    let compoundMatchMap: Map<number, CompoundMatchExec> | undefined;
+    if (compoundMatches.length > 0) {
+      compoundMatchMap = new Map();
+      for (const match of compoundMatches) {
+        let firstPos = Infinity;
+        let firstId = match.coveredNodeIds[0];
+        for (const id of match.coveredNodeIds) {
+          const pos = nodeIdToFinalPos.get(id) ?? Infinity;
+          if (pos < firstPos) {
+            firstPos = pos;
+            firstId = id;
+          }
+        }
+        const coveredSet = new Set(match.coveredNodeIds);
+        const desc = {
+          name: match.name,
+          coveredNodeIds: coveredSet,
+          outputNodeId: match.outputNodeId,
+          dim: match.dim,
+        };
+        compoundMatchMap.set(firstId, desc);
+        for (const id of match.coveredNodeIds) {
+          if (id !== firstId) compoundMatchMap.set(id, { ...desc, name: "" });
+        }
+      }
+    }
 
     // Track dispatched nodes for periodic buffer reclamation.
     // When the shared encoder is active, released buffers go to pendingRelease
