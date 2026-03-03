@@ -22,7 +22,7 @@ import {
   getLeakedSizeHistogramForStep,
   getTrackedBuffers,
   setAllocStep,
-  snapshotLeakedAllocsForStep,
+  snapshotLeakedAllocs,
 } from "../src/backend/webgpu/memory-tracker";
 import { storageTracker } from "../src/engine/lazy";
 import { type Tensor, Torchlette } from "../src/frontend";
@@ -492,7 +492,7 @@ async function main() {
   const analyzeStep = Math.min(3, steps - 1);
   console.log(`\n=== Leaked Alloc Stacks (step ${analyzeStep}) ===`);
   {
-    const leaked = snapshotLeakedAllocsForStep(analyzeStep);
+    const leaked = snapshotLeakedAllocs(analyzeStep);
     if (leaked.size === 0) {
       console.log("  No leaked allocations for this step.");
     } else {
