@@ -371,13 +371,8 @@ function splitCandidatesByComponent(
     // Build position maps
     const nodeIdToPos = buildIdPositionMap(candidate.nodes);
 
-    // Union-Find for connected component decomposition
-    const parent: number[] = [];
-    const ufRank: number[] = [];
-    for (let k = 0; k < candidate.nodes.length; k++) {
-      parent[k] = k;
-      ufRank[k] = 0;
-    }
+    // Union-Find for connected component decomposition (path compression only)
+    const parent = Array.from({ length: candidate.nodes.length }, (_, i) => i);
     const find = (x: number): number => {
       if (parent[x] !== x) parent[x] = find(parent[x]);
       return parent[x];
@@ -385,15 +380,7 @@ function splitCandidatesByComponent(
     const union = (a: number, b: number): void => {
       const ra = find(a);
       const rb = find(b);
-      if (ra === rb) return;
-      if (ufRank[ra] < ufRank[rb]) {
-        parent[ra] = rb;
-      } else if (ufRank[ra] > ufRank[rb]) {
-        parent[rb] = ra;
-      } else {
-        parent[rb] = ra;
-        ufRank[ra]++;
-      }
+      if (ra !== rb) parent[rb] = ra;
     };
 
     // Union nodes connected by internal data dependencies
@@ -480,23 +467,28 @@ function splitCandidatesByComponent(
 
           for (let j = batchStart; j < sameShapePositions.length; j++) {
             const node = candidate.nodes[sameShapePositions[j]];
-            const newCount = countNewInputKeys(node, seenInputs);
+            const newCount = addInputKeys(node, seenInputs);
             if (
-              seenInputs.size + newCount + batchPositions.length + 1 >
-                maxBuffers &&
+              seenInputs.size + batchPositions.length + 1 > maxBuffers &&
               batchPositions.length >= 2
             ) {
               break;
             }
             batchPositions.push(sameShapePositions[j]);
-            addInputKeys(node, seenInputs);
           }
 
           if (batchPositions.length < 2) break;
           batchStart += batchPositions.length;
-          groups.push(
-            makeBatchGroup(batchPositions, candidate.nodes, candidate.indices),
-          );
+          const batchNodes = batchPositions.map((p) => candidate.nodes[p]);
+          const batchIndices = batchPositions.map((p) => candidate.indices[p]);
+          const batchNodeIds = nodeIdSet(batchNodes);
+          groups.push({
+            nodes: batchNodes,
+            planIndices: batchIndices,
+            externalInputs: collectExternalInputs(batchNodes, batchNodeIds),
+            outputNode: batchNodes[batchNodes.length - 1],
+            additionalOutputNodes: batchNodes.slice(0, -1),
+          });
         }
       }
     }
@@ -634,9 +626,9 @@ function batchGlobalSingletons(
         }
         if (!orderingSafe) break;
 
-        const newCount = countNewInputKeys(node, seenInputs);
+        addInputKeys(node, seenInputs);
         if (
-          seenInputs.size + newCount + batchEntries.length + 1 > maxBuffers &&
+          seenInputs.size + batchEntries.length + 1 > maxBuffers &&
           batchEntries.length >= 2
         ) {
           break;
@@ -646,7 +638,6 @@ function batchGlobalSingletons(
         batchNodeIds.add(node.id);
         batchMaxPos = candidateMaxPos;
         batchMinPos = candidateMinPos;
-        addInputKeys(node, seenInputs);
       }
 
       if (batchEntries.length < 2) {
@@ -1254,40 +1245,17 @@ function inputKey(input: LazyRef): string | null {
     : `p:${input.node.id}`;
 }
 
-/** Count new non-scalar input keys a node would add to an existing set. */
-function countNewInputKeys(node: LazyIRNode, seenInputs: Set<string>): number {
-  let count = 0;
+/** Add a node's non-scalar input keys to a tracking set and return the count of newly added keys. */
+function addInputKeys(node: LazyIRNode, seenInputs: Set<string>): number {
+  let added = 0;
   for (const input of node.inputs) {
     const k = inputKey(input);
-    if (k !== null && !seenInputs.has(k)) count++;
+    if (k !== null && !seenInputs.has(k)) {
+      seenInputs.add(k);
+      added++;
+    }
   }
-  return count;
-}
-
-/** Add a node's non-scalar input keys to a tracking set. */
-function addInputKeys(node: LazyIRNode, seenInputs: Set<string>): void {
-  for (const input of node.inputs) {
-    const k = inputKey(input);
-    if (k !== null) seenInputs.add(k);
-  }
-}
-
-/** Build a multi-output FusionGroup from a batch of nodes at given positions. */
-function makeBatchGroup(
-  batchPositions: number[],
-  sourceNodes: LazyIRNode[],
-  sourceIndices: number[],
-): FusionGroup {
-  const batchNodes = batchPositions.map((p) => sourceNodes[p]);
-  const batchIndices = batchPositions.map((p) => sourceIndices[p]);
-  const batchNodeIds = nodeIdSet(batchNodes);
-  return {
-    nodes: batchNodes,
-    planIndices: batchIndices,
-    externalInputs: collectExternalInputs(batchNodes, batchNodeIds),
-    outputNode: batchNodes[batchNodes.length - 1],
-    additionalOutputNodes: batchNodes.slice(0, -1),
-  };
+  return added;
 }
 
 /**
