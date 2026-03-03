@@ -322,11 +322,8 @@ export async function executeReductionWithPreamble(
 // subsequent elementwise ops. Mirrors matmul epilogue detection.
 // ============================================================================
 
-/** Describes a single epilogue op to apply after the reduction. */
-export type ReductionEpilogueOp = EpilogueOp;
-
 /** Format an array of epilogue ops into a profile label fragment (e.g. "cast+add+relu"). */
-export function formatEpilogueLabel(ops: ReductionEpilogueOp[]): string {
+export function formatEpilogueLabel(ops: EpilogueOp[]): string {
   return ops
     .map((o) =>
       o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind,
@@ -338,7 +335,7 @@ export interface ReductionEpiloguePlan {
   /** The reduction node (sum, mean, or max) */
   reductionNode: LazyIRNode;
   /** Epilogue operations to fuse after the reduction */
-  epilogueOps: ReductionEpilogueOp[];
+  epilogueOps: EpilogueOp[];
   /** Additional inputs required by epilogue binary ops */
   epilogueInputRefs: LazyRef[];
   /** Output dtype after epilogue chain */
@@ -370,7 +367,7 @@ export function detectReductionEpilogue(
     return null;
   }
 
-  const epilogueOps: ReductionEpilogueOp[] = [];
+  const epilogueOps: EpilogueOp[] = [];
   const epilogueInputRefs: LazyRef[] = [];
   let additionalInputCount = 0;
   let chainLength = 0;
@@ -542,7 +539,7 @@ export interface ReductionFusionPlan {
   /** Dtypes for each preamble external input */
   preambleInputDtypes: DType[];
   /** Epilogue operations to apply after the reduction */
-  epilogueOps: ReductionEpilogueOp[];
+  epilogueOps: EpilogueOp[];
   /** External input refs for the epilogue binary ops */
   epilogueInputRefs: LazyRef[];
   /** Output dtype after epilogue chain */
