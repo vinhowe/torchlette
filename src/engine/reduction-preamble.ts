@@ -321,12 +321,21 @@ export async function executeReductionWithPreamble(
 // ============================================================================
 
 /** Describes a single epilogue op to apply after the reduction. */
-type ReductionEpilogueOp = {
+export type ReductionEpilogueOp = {
   kind: string;
   toDtype?: DType;
   inputIndex?: number;
   op?: string;
 };
+
+/** Format an array of epilogue ops into a profile label fragment (e.g. "cast+add+relu"). */
+export function formatEpilogueLabel(ops: ReductionEpilogueOp[]): string {
+  return ops
+    .map((o) =>
+      o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind,
+    )
+    .join("+");
+}
 
 export interface ReductionEpiloguePlan {
   /** The reduction node (sum, mean, or max) */

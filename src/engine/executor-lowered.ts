@@ -80,6 +80,7 @@ import {
   executeReductionWithEpilogue,
   executeReductionWithFusion,
   executeReductionWithPreamble,
+  formatEpilogueLabel,
 } from "./reduction-preamble";
 import { executeFusedSegment } from "./segment-executors";
 import { storageTracker } from "./storage-tracker";
@@ -583,6 +584,15 @@ export async function executeLoweredPlan(
     });
   };
 
+  /** Capture dispatches and record the output node result (common suffix for action cases). */
+  const captureAndRecordResult = (nodeIndex: number, node: LazyIRNode) => {
+    if (!shouldRecord) return;
+    captureDispatches();
+    if (node.result) {
+      recordResult(nodeIndex, asGPUTensor(node.result.backendTensor));
+    }
+  };
+
   if (shouldRecord) {
     startDispatchRecording(recordingBuffer);
     // Also set up matmul and fusion recording buffers (imports cached from prior calls)
@@ -803,16 +813,7 @@ export async function executeLoweredPlan(
               setProfileModule("unknown");
             }
 
-            // Record dispatches and node results (for replay cache)
-            if (shouldRecord) {
-              captureDispatches();
-              if (outputNode.result) {
-                recordResult(
-                  action.outputNodeIndex,
-                  asGPUTensor(outputNode.result.backendTensor),
-                );
-              }
-            }
+            captureAndRecordResult(action.outputNodeIndex, outputNode);
             break;
           }
 
@@ -1018,16 +1019,7 @@ export async function executeLoweredPlan(
             };
           }
 
-          // Record dispatches and node results
-          if (shouldRecord) {
-            captureDispatches();
-            if (outputNode.result) {
-              recordResult(
-                action.outputNodeIndex,
-                asGPUTensor(outputNode.result.backendTensor),
-              );
-            }
-          }
+          captureAndRecordResult(action.outputNodeIndex, outputNode);
           break;
         }
 
@@ -1079,17 +1071,7 @@ export async function executeLoweredPlan(
             executeReductionWithPreamble(reductionPlan, backend),
           );
 
-          // Record dispatches and node results
-          if (shouldRecord) {
-            captureDispatches();
-            // Record reduction node result
-            if (reductionNode.result) {
-              recordResult(
-                action.reductionNodeIndex,
-                asGPUTensor(reductionNode.result.backendTensor),
-              );
-            }
-          }
+          captureAndRecordResult(action.reductionNodeIndex, reductionNode);
           break;
         }
 
@@ -1115,32 +1097,12 @@ export async function executeLoweredPlan(
             consumedCount: action.consumedCount,
           };
 
-          const reLabel =
-            reNode.op +
-            "+" +
-            action.epilogueOps
-              .map((o) =>
-                o.kind === "binary"
-                  ? o.op
-                  : o.kind === "cast"
-                    ? "cast"
-                    : o.op || o.kind,
-              )
-              .join("+");
+          const reLabel = `${reNode.op}+${formatEpilogueLabel(action.epilogueOps)}`;
           await withProfileContext(reLabel, reNode.module, () =>
             executeReductionWithEpilogue(reEpiloguePlan, backend),
           );
 
-          // Record dispatches and output node result for replay cache
-          if (shouldRecord) {
-            captureDispatches();
-            if (reOutputNode.result) {
-              recordResult(
-                action.outputNodeIndex,
-                asGPUTensor(reOutputNode.result.backendTensor),
-              );
-            }
-          }
+          captureAndRecordResult(action.outputNodeIndex, reOutputNode);
           break;
         }
 
@@ -1181,29 +1143,12 @@ export async function executeLoweredPlan(
 
           const rfLabel = `${action.isMean ? "mean" : "sum"}+${rfPreambleNodes
             .map((n) => n.op)
-            .join("+")}+${action.epilogueOps
-            .map((o) =>
-              o.kind === "binary"
-                ? o.op
-                : o.kind === "cast"
-                  ? "cast"
-                  : o.op || o.kind,
-            )
-            .join("+")}`;
+            .join("+")}+${formatEpilogueLabel(action.epilogueOps)}`;
           await withProfileContext(rfLabel, rfPreambleNodes[0].module, () =>
             executeReductionWithFusion(rfFusionPlan, backend),
           );
 
-          // Record dispatches and output node result for replay cache
-          if (shouldRecord) {
-            captureDispatches();
-            if (rfOutputNode.result) {
-              recordResult(
-                action.outputNodeIndex,
-                asGPUTensor(rfOutputNode.result.backendTensor),
-              );
-            }
-          }
+          captureAndRecordResult(action.outputNodeIndex, rfOutputNode);
           break;
         }
 
@@ -1433,16 +1378,7 @@ export async function executeLoweredPlan(
             ownsBuffer: true,
           });
 
-          // Record dispatches for replay
-          if (shouldRecord) {
-            captureDispatches();
-            if (compOutNode.result) {
-              recordResult(
-                action.outputNodeIndex,
-                asGPUTensor(compOutNode.result.backendTensor),
-              );
-            }
-          }
+          captureAndRecordResult(action.outputNodeIndex, compOutNode);
           break;
         }
 
