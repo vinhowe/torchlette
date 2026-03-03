@@ -64,9 +64,6 @@ export function buildConsumerCount(nodes: LazyIRNode[]): Map<number, number> {
   return counts;
 }
 
-// Re-use executeNode from executor-sequential (identical logic)
-const executeAndStoreNode = executeNode;
-
 /** Collect final positions for a range of nodes. */
 function collectNodePositions(
   nodes: LazyIRNode[],
@@ -314,7 +311,7 @@ async function executeSequentialSegment(
   try {
     for (const node of nodes) {
       if (node.result) continue;
-      await executeAndStoreNode(node, backend);
+      await executeNode(node, backend);
     }
   } finally {
     if (useSharedEncoder) endSharedEncoder();
@@ -800,7 +797,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
         }
       }
 
-      await executeAndStoreNode(node, backend);
+      await executeNode(node, backend);
 
       // Record action in lowered plan builder
       if (loweredPlanBuilder && nodeIdToFinalPos) {

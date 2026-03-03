@@ -28,9 +28,9 @@ type BinaryOp = (
 ) => BackendTensor;
 
 const unary =
-  (name: string, expr: string): UnaryOp =>
+  (name: string): UnaryOp =>
   (a, options) =>
-    dispatchUnary(name, expr, asGPUTensor(a), options);
+    dispatchUnary(name, asGPUTensor(a), options);
 
 const binary =
   (op: string): BinaryOp =>
@@ -65,22 +65,22 @@ export function div(
 // Simple unary ops
 // ---------------------------------------------------------------------------
 
-export const sqrt: UnaryOp = unary("sqrt", "sqrt(x)");
-export const relu: UnaryOp = unary("relu", "select(0.0, x, x > 0.0)");
-export const exp: UnaryOp = unary("exp", "exp(x)");
-export const log: UnaryOp = unary("log", "log(x)");
-export const neg: UnaryOp = unary("neg", "-x");
-export const abs: UnaryOp = unary("abs", "abs(x)");
-export const tanh: UnaryOp = unary("tanh", "tanh(x)");
-export const sigmoid: UnaryOp = unary("sigmoid", "(1.0 / (1.0 + exp(-x)))");
-export const silu: UnaryOp = unary("silu", "(x / (1.0 + exp(-x)))");
-export const sin: UnaryOp = unary("sin", "sin(x)");
-export const cos: UnaryOp = unary("cos", "cos(x)");
-export const rsqrt: UnaryOp = unary("rsqrt", "inverseSqrt(x)");
-export const floor: UnaryOp = unary("floor", "floor(x)");
-export const ceil: UnaryOp = unary("ceil", "ceil(x)");
-export const round: UnaryOp = unary("round", "round(x)");
-export const sign: UnaryOp = unary("sign", "sign(x)");
+export const sqrt: UnaryOp = unary("sqrt");
+export const relu: UnaryOp = unary("relu");
+export const exp: UnaryOp = unary("exp");
+export const log: UnaryOp = unary("log");
+export const neg: UnaryOp = unary("neg");
+export const abs: UnaryOp = unary("abs");
+export const tanh: UnaryOp = unary("tanh");
+export const sigmoid: UnaryOp = unary("sigmoid");
+export const silu: UnaryOp = unary("silu");
+export const sin: UnaryOp = unary("sin");
+export const cos: UnaryOp = unary("cos");
+export const rsqrt: UnaryOp = unary("rsqrt");
+export const floor: UnaryOp = unary("floor");
+export const ceil: UnaryOp = unary("ceil");
+export const round: UnaryOp = unary("round");
+export const sign: UnaryOp = unary("sign");
 
 // ---------------------------------------------------------------------------
 // Complex ops (not table-driven)
@@ -92,21 +92,8 @@ export function gelu(
 ): BackendTensor {
   const approximate = options?.approximate ?? "tanh";
 
-  if (approximate === "tanh") {
-    return dispatchUnary(
-      "gelu_tanh",
-      "(x * 0.5 * (1.0 + tanh(clamp(0.7978845608 * (x + 0.044715 * x * x * x), -10.0, 10.0))))",
-      asGPUTensor(a),
-      { outBuffer: options?.outBuffer },
-    );
-  } else {
-    return dispatchUnary(
-      "gelu_erf",
-      "(x * 0.5 * (1.0 + sign(x) * (1.0 - (((((1.061405429 * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) + -1.453152027) * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) + 1.421413741) * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) + -0.284496736) * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) + 0.254829592) * (1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476))) * exp(-x * x * 0.5)))))",
-      asGPUTensor(a),
-      { outBuffer: options?.outBuffer },
-    );
-  }
+  const key = approximate === "tanh" ? "gelu_tanh" : "gelu_erf";
+  return dispatchUnary(key, asGPUTensor(a), { outBuffer: options?.outBuffer });
 }
 
 export function clamp(
@@ -115,17 +102,7 @@ export function clamp(
   max: number | null,
   options?: { outBuffer?: GPUBuffer },
 ): BackendTensor {
-  let expr: string;
-  if (min !== null && max !== null) {
-    expr = `clamp(x, ${min}, ${max})`;
-  } else if (min !== null) {
-    expr = `max(x, ${min})`;
-  } else if (max !== null) {
-    expr = `min(x, ${max})`;
-  } else {
-    expr = "x";
-  }
-  return dispatchUnary(`clamp_${min}_${max}`, expr, asGPUTensor(a), options);
+  return dispatchUnary(`clamp_${min}_${max}`, asGPUTensor(a), options);
 }
 
 /**

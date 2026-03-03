@@ -26,6 +26,7 @@ import {
   warmupPipelines,
 } from "./pipeline-warmup";
 import { initGpuTimestamps, isProfilingEnabled } from "./profiler";
+import { resetRMSNormKernelState } from "./rmsnorm-kernel";
 import { setSharedEncoderEnabled } from "./shared-encoder";
 import { resetUnscaleKernelState } from "./unscale-kernel";
 import { gpuContext, requireContext, setGpuContext } from "./webgpu-state";
@@ -438,6 +439,7 @@ function detectSubgroupSupport(adapter: GPUAdapter): SubgroupSupport {
 export function resetAllKernelCaches(): void {
   resetAttentionKernelState();
   resetLayerNormKernelState();
+  resetRMSNormKernelState();
   resetCrossEntropyKernelState();
   resetAdamKernelState();
   resetUnscaleKernelState();
