@@ -698,7 +698,6 @@ export async function executePlanOptimized(
           nodeToStorage,
           startStep: overallStep,
           externalNodeIds,
-          allPlanNodes: planNodes,
           matmulPrologueMap:
             matmulPrologues.size > 0 ? matmulPrologues : undefined,
           prologueSkipIds:
