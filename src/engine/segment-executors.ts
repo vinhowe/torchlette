@@ -260,13 +260,6 @@ export async function executeFusedSegment(
           addNode.result = wrapFusionOutput(addNode.device, addOutput);
       }
     }
-    // Clean up temporary contiguous copies (deferred destroy for GPU fence)
-    for (const temp of tempContiguousCopies) {
-      if (temp.destroy) temp.destroy();
-    }
-
-    setCurrentOpLabel(null);
-
     // Re-execute intermediates that are consumed outside the group but
     // couldn't be promoted to additional outputs (shape mismatch / binding limit).
     // The fused kernel computed the chain inline; we re-execute just the needed
@@ -275,15 +268,15 @@ export async function executeFusedSegment(
       await executeSequentialSegment(group.neededIntermediates, backend);
     }
   } catch (e) {
-    // Clean up temporary contiguous copies on failure too
-    for (const temp of tempContiguousCopies) {
-      if (temp.destroy) temp.destroy();
-    }
-    setCurrentOpLabel(null);
     // Fusion failed - fall back to sequential
     recordFusionFallback("exception", group.nodes.length, { error: String(e) });
     console.warn("Fusion dispatch failed, falling back to sequential:", e);
     await executeSequentialSegment(group.nodes, backend);
+  } finally {
+    for (const temp of tempContiguousCopies) {
+      temp.destroy?.();
+    }
+    setCurrentOpLabel(null);
   }
 }
 

@@ -7,8 +7,6 @@
  * Also provides size-class utilities used by the WebGPU buffer pool and arena.
  */
 
-import { sizeOf } from "../core/shape";
-
 // ============================================================================
 // Types
 // ============================================================================

@@ -44,6 +44,15 @@ import {
 } from "./segment-executors";
 import { releaseDeadTensors } from "./storage-tracker";
 
+/** Build a map from node IDs to their position index in an array. */
+function buildIdPositionMap(nodes: LazyIRNode[]): Map<number, number> {
+  const map = new Map<number, number>();
+  for (let i = 0; i < nodes.length; i++) {
+    map.set(nodes[i].id, i);
+  }
+  return map;
+}
+
 /**
  * Options for optimized plan execution.
  */
@@ -414,16 +423,9 @@ export async function executePlanOptimized(
     analysisConsumerCount = analysis.consumerCount;
 
     // ── Build template and cache it ──
-    const origIdToPos = new Map<number, number>();
-    for (let i = 0; i < plan.nodes.length; i++) {
-      origIdToPos.set(plan.nodes[i].id, i);
-    }
+    const origIdToPos = buildIdPositionMap(plan.nodes);
     const finalPerm = planNodes.map((n) => origIdToPos.get(n.id) as number);
-
-    const finalIdToPos = new Map<number, number>();
-    for (let i = 0; i < planNodes.length; i++) {
-      finalIdToPos.set(planNodes[i].id, i);
-    }
+    const finalIdToPos = buildIdPositionMap(planNodes);
 
     const cachedSegments: CachedSegmentDesc[] = segments.map((seg) => {
       if (seg.kind === "sequential") {
@@ -505,10 +507,7 @@ export async function executePlanOptimized(
   // Build a lowered plan during cache miss execution (first run).
   // On cache hit, the lowered plan is already attached to the template.
   let loweredPlanBuilder: LoweredPlanBuilder | null = null;
-  const nodeIdToFinalPos = new Map<number, number>();
-  for (let i = 0; i < planNodes.length; i++) {
-    nodeIdToFinalPos.set(planNodes[i].id, i);
-  }
+  const nodeIdToFinalPos = buildIdPositionMap(planNodes);
   if (!cachedTemplate) {
     loweredPlanBuilder = new LoweredPlanBuilder(planNodes.length);
   }
@@ -562,6 +561,20 @@ export async function executePlanOptimized(
       { count: number; ops: Record<string, number> }
     > = {};
 
+    const recordUnfused = (node: LazyIRNode) => {
+      sequentialOps[node.op] = (sequentialOps[node.op] ?? 0) + 1;
+      if (isFusibleOp(node.op)) {
+        const shapeKey = node.shape.join(",");
+        let bucket = unfusedByShape[shapeKey];
+        if (!bucket) {
+          bucket = { count: 0, ops: {} };
+          unfusedByShape[shapeKey] = bucket;
+        }
+        bucket.count++;
+        bucket.ops[node.op] = (bucket.ops[node.op] ?? 0) + 1;
+      }
+    };
+
     for (const segment of segments) {
       if (
         segment.kind === "fused" &&
@@ -572,36 +585,17 @@ export async function executePlanOptimized(
         fusionGroupCount++;
       } else if (segment.kind === "fused") {
         seqSegCount++;
-        for (const node of segment.group.nodes) {
-          sequentialOps[node.op] = (sequentialOps[node.op] ?? 0) + 1;
-          if (isFusibleOp(node.op)) {
-            const shapeKey = node.shape.join(",");
-            let bucket = unfusedByShape[shapeKey];
-            if (!bucket) {
-              bucket = { count: 0, ops: {} };
-              unfusedByShape[shapeKey] = bucket;
-            }
-            bucket.count++;
-            bucket.ops[node.op] = (bucket.ops[node.op] ?? 0) + 1;
-          }
-        }
+        for (const node of segment.group.nodes) recordUnfused(node);
       } else {
         seqSegCount++;
         for (const node of segment.nodes) {
-          sequentialOps[node.op] = (sequentialOps[node.op] ?? 0) + 1;
           if (
-            isFusibleOp(node.op) &&
             !epilogueClaimedIds.has(node.id) &&
             !prologueClaimedIds.has(node.id)
           ) {
-            const shapeKey = node.shape.join(",");
-            let bucket = unfusedByShape[shapeKey];
-            if (!bucket) {
-              bucket = { count: 0, ops: {} };
-              unfusedByShape[shapeKey] = bucket;
-            }
-            bucket.count++;
-            bucket.ops[node.op] = (bucket.ops[node.op] ?? 0) + 1;
+            recordUnfused(node);
+          } else {
+            sequentialOps[node.op] = (sequentialOps[node.op] ?? 0) + 1;
           }
         }
       }
@@ -705,17 +699,13 @@ export async function executePlanOptimized(
     let compoundMatchMap: Map<number, CompoundMatchExec> | undefined;
     if (compoundMatches.length > 0) {
       compoundMatchMap = new Map();
-      // Build a nodeId→position map for finding first covered node in plan order
-      const idToPos = new Map<number, number>();
-      for (let i = 0; i < planNodes.length; i++)
-        idToPos.set(planNodes[i].id, i);
 
       for (const match of compoundMatches) {
         // Find the first covered node in plan order
         let firstPos = Infinity;
         let firstId = match.coveredNodeIds[0];
         for (const id of match.coveredNodeIds) {
-          const pos = idToPos.get(id) ?? Infinity;
+          const pos = nodeIdToFinalPos.get(id) ?? Infinity;
           if (pos < firstPos) {
             firstPos = pos;
             firstId = id;
