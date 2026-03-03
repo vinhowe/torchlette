@@ -18,8 +18,7 @@ import { compute2DDispatch, sizeOf, WORKGROUP_SIZE } from "../shape-utils";
 import { createTensor } from "../tensor";
 import { createTileKernelDispatcher } from "../tile-dispatch";
 import {
-  flatAddSpec,
-  flatCopySpec,
+  flatOpSpec,
   stridedScatterAddTileIR,
   stridedScatterCopyTileIR,
 } from "./ops-tile-ir";
@@ -182,7 +181,7 @@ function stridedScatterCopyChunkedSimple(
     [baseTensor.buffer, srcTensor.buffer],
   );
 
-  const dispatcher = createTileKernelDispatcher(flatCopySpec());
+  const dispatcher = createTileKernelDispatcher(flatOpSpec("copy"));
   dispatcher.dispatchChunked(
     { src: srcTensor.buffer, out: outBuffer },
     { size: totalElements },
@@ -215,7 +214,7 @@ function stridedScatterAddChunkedSimple(
     [baseTensor.buffer, srcTensor.buffer],
   );
 
-  const dispatcher = createTileKernelDispatcher(flatAddSpec());
+  const dispatcher = createTileKernelDispatcher(flatOpSpec("add"));
   dispatcher.dispatchChunked(
     { base: baseTensor.buffer, src: srcTensor.buffer, out: outBuffer },
     { size: totalElements },

@@ -867,25 +867,10 @@ export function chunkedTransposeTileIR(dtype: DataType): string {
 const VEC = 4;
 
 /**
- * Helper: compute a vec4-unrolled flat thread base index.
- * Each thread processes VEC consecutive elements starting at this base.
- * Handles 2D dispatch overflow via programId(1) * numPrograms(0).
- */
-function flatVec4Base(ctx: KernelContext): BlockExpr {
-  const flatWgId = ctx
-    .programId(0)
-    .add(ctx.programId(1).mul(ctx.numPrograms(0)));
-  return ctx.emitLet(
-    "base",
-    flatWgId.mul(ctx.u32(WG * VEC)).add(ctx.localIndex().mul(ctx.u32(VEC))),
-  );
-}
-
-/**
  * Unified flat contiguous spec: copy (out=src) or add (out=base+src).
  * Vec4 unrolled: each thread processes VEC consecutive elements.
  */
-function flatOpSpec(op: "copy" | "add"): TileKernelSpec {
+export function flatOpSpec(op: "copy" | "add"): TileKernelSpec {
   const bindings: Record<
     string,
     { storage: "read" | "read_write"; type: "f32" }
@@ -908,7 +893,13 @@ function flatOpSpec(op: "copy" | "add"): TileKernelSpec {
     uniforms: { size: "u32" },
     grid: elementwiseGrid(WG, { elementUniform: "size", vecWidth: VEC }),
     kernel(ctx) {
-      const b = flatVec4Base(ctx);
+      const flatWgId = ctx
+        .programId(0)
+        .add(ctx.programId(1).mul(ctx.numPrograms(0)));
+      const b = ctx.emitLet(
+        "base",
+        flatWgId.mul(ctx.u32(WG * VEC)).add(ctx.localIndex().mul(ctx.u32(VEC))),
+      );
       const size = ctx.uniform("size");
       ctx.ifThen(b.ge(size), () => ctx.emitReturn());
       for (let v = 0; v < VEC; v++) {
@@ -923,13 +914,6 @@ function flatOpSpec(op: "copy" | "add"): TileKernelSpec {
       }
     },
   };
-}
-
-export function flatCopySpec(): TileKernelSpec {
-  return flatOpSpec("copy");
-}
-export function flatAddSpec(): TileKernelSpec {
-  return flatOpSpec("add");
 }
 
 // ============================================================================
