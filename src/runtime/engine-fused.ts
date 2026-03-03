@@ -164,26 +164,14 @@ export function fusedAttentionBackwardOp(
   );
 }
 
-export function extractAttentionDKOp(
+export function extractAttentionSideOutputOp(
+  op: "extractAttentionDK" | "extractAttentionDV",
   bwdDQRef: LazyRef,
   device: DeviceKind,
   config: FusedAttentionConfig,
 ): FusedOpResult {
   return makeFusedOp(
-    "extractAttentionDK",
-    [bwdDQRef],
-    [config.batchSize, config.numHeads, config.seqLen, config.headDim],
-    device,
-  );
-}
-
-export function extractAttentionDVOp(
-  bwdDQRef: LazyRef,
-  device: DeviceKind,
-  config: FusedAttentionConfig,
-): FusedOpResult {
-  return makeFusedOp(
-    "extractAttentionDV",
+    op,
     [bwdDQRef],
     [config.batchSize, config.numHeads, config.seqLen, config.headDim],
     device,

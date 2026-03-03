@@ -105,11 +105,4 @@ export function clamp(
   return dispatchUnary(`clamp_${min}_${max}`, asGPUTensor(a), options);
 }
 
-/**
- * Check if values are finite (not NaN and not Inf).
- * Uses bitcast to check IEEE 754 exponent bits directly.
- */
-export const isfinite: UnaryOp = unary(
-  "isfinite",
-  "select(0.0, 1.0, (bitcast<u32>(x) & 0x7F800000u) != 0x7F800000u)",
-);
+export const isfinite: UnaryOp = unary("isfinite");

@@ -51,9 +51,8 @@ import { createLazyIRNode } from "../engine/node-factory";
 import { buildMergedPlan } from "../engine/plan-builder";
 import { storageTracker } from "../engine/storage-tracker";
 import {
-  extractAttentionDKOp,
-  extractAttentionDVOp,
   extractAttentionLogsumexpOp,
+  extractAttentionSideOutputOp,
   extractLnBwdGradBiasOp,
   fusedAttentionBackwardOp,
   fusedAttentionForwardOp,
@@ -1738,7 +1737,8 @@ export class RuntimeEngine {
   }
 
   extractAttentionDK(bwdDQ: Tensor, config: FusedAttentionConfig): Tensor {
-    const { ref, shape } = extractAttentionDKOp(
+    const { ref, shape } = extractAttentionSideOutputOp(
+      "extractAttentionDK",
       bwdDQ.lazyRef,
       bwdDQ.device,
       config,
@@ -1747,7 +1747,8 @@ export class RuntimeEngine {
   }
 
   extractAttentionDV(bwdDQ: Tensor, config: FusedAttentionConfig): Tensor {
-    const { ref, shape } = extractAttentionDVOp(
+    const { ref, shape } = extractAttentionSideOutputOp(
+      "extractAttentionDV",
       bwdDQ.lazyRef,
       bwdDQ.device,
       config,
