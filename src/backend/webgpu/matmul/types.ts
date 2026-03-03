@@ -320,13 +320,3 @@ export function getShaderCacheKey(options: CodegenOptions): string {
     .filter(Boolean)
     .join("_");
 }
-
-/**
- * Generate a cache key for a K-split reduction shader.
- */
-export function getKSplitReductionCacheKey(
-  kSplitCount: number,
-  outputDtype: DType,
-): string {
-  return `ksplit_reduce_${kSplitCount}_${outputDtype}`;
-}

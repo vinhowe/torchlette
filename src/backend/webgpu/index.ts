@@ -44,7 +44,6 @@ export {
   getBufferPoolStats,
   resetBufferPoolDetailedStats,
   setBufferPoolBudget,
-  setBufferPoolEnabled,
 } from "./buffer-pool";
 export {
   dispatchBinary,

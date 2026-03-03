@@ -273,8 +273,6 @@ export async function executeLoweredPlan(
   loweredPlan: LoweredPlan,
   backend: Backend,
   options: {
-    enableEarlyRelease?: boolean;
-    enableVectorization?: boolean;
     bufferArena?: BufferArena;
     enableReplay?: boolean;
   } = {},

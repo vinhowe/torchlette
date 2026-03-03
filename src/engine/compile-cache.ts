@@ -117,21 +117,12 @@ export function hashIRGraph(
     parts.push(`fuse:${group.kind}[${normalizedIds.join(",")}]`);
   }
 
-  // Simple hash: join all parts and compute a string hash
+  // Simple djb2 hash: join all parts and compute a string hash
   const normalized = parts.join("|");
-  return simpleHash(normalized);
-}
-
-/**
- * Simple string hash function.
- * Uses djb2 algorithm for reasonable distribution.
- */
-function simpleHash(str: string): string {
   let hash = 5381;
-  for (let i = 0; i < str.length; i++) {
-    hash = (hash * 33) ^ str.charCodeAt(i);
+  for (let i = 0; i < normalized.length; i++) {
+    hash = (hash * 33) ^ normalized.charCodeAt(i);
   }
-  // Convert to hex string, handle negative numbers
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
@@ -220,13 +211,6 @@ export class CompiledCache {
     };
     this.cache.set(keyStr, entry);
     return entry;
-  }
-
-  /**
-   * Check if a key exists in the cache.
-   */
-  has(key: CompiledCacheKey): boolean {
-    return this.cache.has(serializeCacheKey(key));
   }
 
   /**
