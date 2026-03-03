@@ -537,6 +537,25 @@ function isStaticFalse(node: IRNode): boolean {
   return false;
 }
 
+/** Emit an unrolled iteration block: { const varName = iterVal; ...body... } */
+function emitUnrolledBlock(
+  varName: string,
+  iterVal: number,
+  body: Statement[],
+  bindings: BindingMap,
+  lines: string[],
+  depth: number,
+): void {
+  const indent = "  ".repeat(depth);
+  lines.push(`${indent}{ // unrolled ${varName}=${iterVal}`);
+  lines.push(`${indent}  const ${varName} = ${iterVal}u;`);
+  const childBindings = new Map(bindings);
+  for (const s of body) {
+    emitStatement(s, childBindings, lines, depth + 1);
+  }
+  lines.push(`${indent}}`);
+}
+
 function emitStatement(
   stmt: Statement,
   bindings: BindingMap,
@@ -631,16 +650,15 @@ function emitStatement(
         (stmt.unroll === true || tripCount <= 16);
 
       if (shouldUnroll && tripCount !== null && startConst !== null) {
-        // Emit unrolled iterations, each in its own block scope
         for (let i = 0; i < tripCount; i++) {
-          const iterVal = startConst + i;
-          lines.push(`${indent}{ // unrolled ${stmt.varName}=${iterVal}`);
-          lines.push(`${indent}  const ${stmt.varName} = ${iterVal}u;`);
-          const childBindings = new Map(bindings);
-          for (const s of stmt.body) {
-            emitStatement(s, childBindings, lines, depth + 1);
-          }
-          lines.push(`${indent}}`);
+          emitUnrolledBlock(
+            stmt.varName,
+            startConst + i,
+            stmt.body,
+            bindings,
+            lines,
+            depth,
+          );
         }
       } else {
         const start = exprFor(stmt.start, bindings);
@@ -666,14 +684,14 @@ function emitStatement(
         const tripCount = Math.ceil((boundConst - startConst) / strideVal);
         if (tripCount >= 0 && (stmt.unroll === true || tripCount <= 8)) {
           for (let i = 0; i < tripCount; i++) {
-            const iterVal = startConst + i * strideVal;
-            lines.push(`${indent}{ // unrolled ${stmt.varName}=${iterVal}`);
-            lines.push(`${indent}  const ${stmt.varName} = ${iterVal}u;`);
-            const childBindings = new Map(bindings);
-            for (const s of stmt.body) {
-              emitStatement(s, childBindings, lines, depth + 1);
-            }
-            lines.push(`${indent}}`);
+            emitUnrolledBlock(
+              stmt.varName,
+              startConst + i * strideVal,
+              stmt.body,
+              bindings,
+              lines,
+              depth,
+            );
           }
           break;
         }
@@ -952,6 +970,20 @@ function forEachStmtExpr(stmt: Statement, fn: (expr: IRNode) => void): void {
   }
 }
 
+/** Recurse into all nested bodies of a statement (forRange, forStride, if, ifElse). */
+function forEachBody(stmt: Statement, fn: (body: Statement[]) => void): void {
+  if (
+    stmt.kind === "forRange" ||
+    stmt.kind === "forStride" ||
+    stmt.kind === "if"
+  ) {
+    fn(stmt.body);
+  } else if (stmt.kind === "ifElse") {
+    fn(stmt.body);
+    fn(stmt.elseBody);
+  }
+}
+
 // ============================================================================
 // Dead Code Elimination
 // ============================================================================
@@ -965,16 +997,9 @@ function collectExprNames(node: IRNode, names: Set<string>): void {
 /** Collect all namedRef names from all expressions in a statement (recursively into bodies). */
 function collectAllStmtNames(stmt: Statement, names: Set<string>): void {
   forEachStmtExpr(stmt, (e) => collectExprNames(e, names));
-  if (
-    stmt.kind === "forRange" ||
-    stmt.kind === "forStride" ||
-    stmt.kind === "if"
-  ) {
-    for (const s of stmt.body) collectAllStmtNames(s, names);
-  } else if (stmt.kind === "ifElse") {
-    for (const s of stmt.body) collectAllStmtNames(s, names);
-    for (const s of stmt.elseBody) collectAllStmtNames(s, names);
-  }
+  forEachBody(stmt, (body) => {
+    for (const s of body) collectAllStmtNames(s, names);
+  });
 }
 
 // ============================================================================
@@ -1037,14 +1062,7 @@ function getSharedWritesFromStmt(stmt: Statement): Set<string> {
 function collectAllSharedReads(stmts: Statement[], names: Set<string>): void {
   for (const stmt of stmts) {
     forEachStmtExpr(stmt, (e) => getSharedReadsFromExpr(e, names));
-    if (stmt.kind === "if") {
-      collectAllSharedReads(stmt.body, names);
-    } else if (stmt.kind === "ifElse") {
-      collectAllSharedReads(stmt.body, names);
-      collectAllSharedReads(stmt.elseBody, names);
-    } else if (stmt.kind === "forRange" || stmt.kind === "forStride") {
-      collectAllSharedReads(stmt.body, names);
-    }
+    forEachBody(stmt, (body) => collectAllSharedReads(body, names));
   }
 }
 
@@ -1191,14 +1209,7 @@ export function validateBarriers(stmts: Statement[]): string[] {
         dirtyArrays.add(w);
       }
 
-      if (stmt.kind === "forRange") {
-        walk(stmt.body);
-      } else if (stmt.kind === "if") {
-        walk(stmt.body);
-      } else if (stmt.kind === "ifElse") {
-        walk(stmt.body);
-        walk(stmt.elseBody);
-      }
+      forEachBody(stmt, walk);
     }
   }
 
@@ -1464,19 +1475,11 @@ function exprContainsMemoryRead(node: IRNode): boolean {
   return someExprChild(node, exprContainsMemoryRead);
 }
 
-/**
- * Walk an IR expression tree and collect non-trivial, memory-read-free candidate nodes.
- * Only considers nodes with valid IDs (>= 0, from makeNode).
- * Always recurses into children even for memory-read nodes, so pure sub-expressions
- * (like address calculations inside loads) can still be CSE'd.
- */
-function collectExprCSECandidates(
-  node: IRNode,
-  nodes: Map<number, IRNode>,
-): void {
+/** Walk non-trivial, memory-read-free IR nodes (CSE candidates) in an expression tree. */
+function walkCSECandidates(node: IRNode, visit: (node: IRNode) => void): void {
   if (node.id < 0 || isTrivialNode(node)) return;
-  if (!exprContainsMemoryRead(node)) nodes.set(node.id, node);
-  forEachExprChild(node, (child) => collectExprCSECandidates(child, nodes));
+  if (!exprContainsMemoryRead(node)) visit(node);
+  forEachExprChild(node, (child) => walkCSECandidates(child, visit));
 }
 
 /** Collect all CSE candidate node IDs from all expressions in a statement (recursing into all bodies). */
@@ -1484,17 +1487,10 @@ function collectStmtCSENodes(
   stmt: Statement,
   nodes: Map<number, IRNode>,
 ): void {
-  forEachStmtExpr(stmt, (e) => collectExprCSECandidates(e, nodes));
-  if (
-    stmt.kind === "forRange" ||
-    stmt.kind === "forStride" ||
-    stmt.kind === "if"
-  ) {
-    for (const s of stmt.body) collectStmtCSENodes(s, nodes);
-  } else if (stmt.kind === "ifElse") {
-    for (const s of stmt.body) collectStmtCSENodes(s, nodes);
-    for (const s of stmt.elseBody) collectStmtCSENodes(s, nodes);
-  }
+  forEachStmtExpr(stmt, (e) => walkCSECandidates(e, (n) => nodes.set(n.id, n)));
+  forEachBody(stmt, (body) => {
+    for (const s of body) collectStmtCSENodes(s, nodes);
+  });
 }
 
 /**
@@ -1534,33 +1530,14 @@ function collectSubExprIds(node: IRNode, ids: Set<number>): void {
   });
 }
 
-/**
- * Walk an IR expression tree and push every non-trivial, memory-read-free node
- * occurrence (NOT deduplicated). Same node appearing N times produces N entries.
- */
-function countExprCSEOccurrences(
-  node: IRNode,
-  out: { id: number; node: IRNode }[],
-): void {
-  if (node.id < 0 || isTrivialNode(node)) return;
-  if (!exprContainsMemoryRead(node)) out.push({ id: node.id, node });
-  forEachExprChild(node, (child) => countExprCSEOccurrences(child, out));
-}
-
-/**
- * Count all CSE candidate occurrences from expressions in a single statement.
- * Unlike collectStmtCSENodes, does NOT deduplicate — same node appearing N
- * times produces N occurrences. Also does NOT recurse into child bodies
- * (forRange/forStride/if/ifElse) — those are handled by autoCSE's recursive
- * call into child scopes. Only counts expressions at this scope level (loop
- * bounds, conditions, and leaf statement expressions).
- */
 /** Count CSE occurrences at this scope level only (no body recursion — handled by autoCSE). */
 function countStmtCSEOccurrences(
   stmt: Statement,
   out: { id: number; node: IRNode }[],
 ): void {
-  forEachStmtExpr(stmt, (e) => countExprCSEOccurrences(e, out));
+  forEachStmtExpr(stmt, (e) =>
+    walkCSECandidates(e, (n) => out.push({ id: n.id, node: n })),
+  );
 }
 
 /**
