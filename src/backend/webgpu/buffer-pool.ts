@@ -12,7 +12,7 @@
 
 import { getSizeClass, getSizeForClass } from "../../engine/lifetime-analysis";
 import type { DType } from "../types";
-import type { GPUBuffer, GPUDevice, GPUQueue } from "./gpu-types";
+import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { STORAGE_BUFFER_USAGE } from "./gpu-types";
 import { gpuMemoryTracker } from "./memory-tracker";
 import { isProfilingEnabled } from "./profiler";
@@ -71,8 +71,6 @@ class SimpleBufferPool {
     size: number;
   }> = [];
   private pendingReleaseBytes = 0;
-  private queue: GPUQueue | null = null;
-
   // Reference counting: track how many owning tensors reference each GPUBuffer.
   // Only owning tensors (ownsBuffer=true) participate. When refcount drops to 0,
   // the buffer is eligible for pool promotion or reuse from pendingRelease.
@@ -142,14 +140,6 @@ class SimpleBufferPool {
   /** Check if a buffer is still referenced by any owning tensor. */
   isLive(buffer: GPUBuffer): boolean {
     return this.bufferLiveCount.has(buffer);
-  }
-
-  /**
-   * Set the GPU queue for fence integration.
-   * Must be called after WebGPU initialization.
-   */
-  setQueue(queue: GPUQueue): void {
-    this.queue = queue;
   }
 
   /**
