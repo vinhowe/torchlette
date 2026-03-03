@@ -122,30 +122,9 @@ export function crossEntropy(
     );
   }
 
-  // f16 inputs are automatically upcast to f32 by the RuntimeEngine's
-  // ensureDtypeSafety when max/sum/exp/log are called below.
-
-  // For numerical stability, compute: -logits[target] + log(sum(exp(logits - max(logits))))
-  // This is equivalent to: -log(softmax(logits)[target])
-
-  // Step 1: Compute log-softmax along the last dimension
-  // log_softmax = logits - max(logits) - log(sum(exp(logits - max(logits))))
-  const dim = -1;
-  const maxLogits = logits.max({ dim, keepdim: true });
-  if (typeof maxLogits === "number") {
-    throw new Error("crossEntropy: max with keepdim should return tensor");
-  }
-  const shifted = api.sub(logits, maxLogits);
-  const expShifted = shifted.exp();
-  const sumExp = expShifted.sum({ dim, keepdim: true });
-  if (typeof sumExp === "number") {
-    throw new Error("crossEntropy: sum with keepdim should return tensor");
-  }
-  const logSumExp = sumExp.log();
-  const logSoftmax = api.sub(shifted, logSumExp);
-
-  // Step 2: Gather the log-softmax values at target indices and negate
-  const loss = api.neg(gatherTargets(api, logSoftmax, targets));
+  // Fallback: decomposed cross-entropy via log-softmax + gather
+  const logProbs = logSoftmax(api, logits, -1);
+  const loss = api.neg(gatherTargets(api, logProbs, targets));
 
   // Step 3: Apply reduction
   return applyReduction(api, loss, reduction, logits.device);

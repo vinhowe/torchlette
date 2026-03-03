@@ -73,7 +73,7 @@ import { type BaseId, createBaseId, Tensor } from "./tensor";
 export type TensorOrScalar = Tensor | number;
 
 /** Lightweight reference to a lazy computation with shape/dtype metadata. */
-export type OpInput = Pick<Tensor, "lazyRef" | "shape" | "dtype" | "device">;
+type OpInput = Pick<Tensor, "lazyRef" | "shape" | "dtype" | "device">;
 
 /** Dispatch mode: receives notifications when RuntimeTensors are created or escape a scope. */
 export interface DispatchMode {
@@ -107,7 +107,7 @@ export interface RuntimeEngineOptions {
 }
 
 /** Internal dispatch mode used by startIntermediateTracking/stopIntermediateTracking. */
-export class IntermediateTrackingMode implements DispatchMode {
+class IntermediateTrackingMode implements DispatchMode {
   readonly tracked = new Set<Tensor>();
   onTensorCreated(tensor: Tensor): void {
     this.tracked.add(tensor);
@@ -117,7 +117,7 @@ export class IntermediateTrackingMode implements DispatchMode {
 // ── Shape helpers (merged from shape-helpers.ts) ────────────────────────────
 export { broadcastShapes };
 
-export function matmulShape(a: number[], b: number[]): number[] {
+function matmulShape(a: number[], b: number[]): number[] {
   if (a.length < 1 || b.length < 1)
     throw new Error("matmul requires at least 1D tensors");
   if (a.length === 1 && b.length === 1) return [];
@@ -129,10 +129,7 @@ export function matmulShape(a: number[], b: number[]): number[] {
   return [...batch, m, n];
 }
 
-export function transposeShape(
-  shape: number[],
-  options: TransposeOptions,
-): number[] {
+function transposeShape(shape: number[], options: TransposeOptions): number[] {
   const result = shape.slice();
   const temp = result[options.dim0];
   result[options.dim0] = result[options.dim1];
@@ -140,7 +137,7 @@ export function transposeShape(
   return result;
 }
 
-export function reduceShape(
+function reduceShape(
   shape: number[],
   dim: number | number[] | null | undefined,
   keepdim: boolean,
