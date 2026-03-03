@@ -29,7 +29,6 @@ import {
 } from "./lowered-plan";
 import type { MatmulPrologueInfo } from "./matmul-epilogue";
 import {
-  detectMatmulEpilogue,
   detectMatmulEpilogueCore,
   executeMatmulWithEpilogue,
 } from "./matmul-epilogue";
@@ -516,19 +515,12 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
       // Try matmul epilogue/prologue fusion (Phase 1)
       if (node.op === "matmul" && backend.name === "webgpu") {
-        let epiloguePlan = prebuiltConsumerCount
-          ? detectMatmulEpilogueCore(
-              nodes,
-              nodeIdx,
-              prebuiltConsumerCount,
-              externalNodeIds,
-            )
-          : detectMatmulEpilogue(
-              nodes,
-              nodeIdx,
-              allPlanNodes ?? nodes,
-              externalNodeIds,
-            );
+        let epiloguePlan = detectMatmulEpilogueCore(
+          nodes,
+          nodeIdx,
+          reductionConsumerCount,
+          externalNodeIds,
+        );
         const prologues = matmulPrologueMap?.get(node.id);
 
         // If we have prologues but no epilogue, create a minimal (empty) epilogue plan
