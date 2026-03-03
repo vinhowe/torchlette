@@ -41,24 +41,22 @@ export async function withProfileContext<T>(
   }
 }
 
-/** Extract a StorageHandle side output from a parent node, unregister it, and return the BackendTensor. */
-function extractSideOutput(node: LazyIRNode, key: string): BackendTensor {
+/** Extract a side output from a parent node and clear it.
+ *  raw=false (default): value is a StorageHandle — unregister it and return the BackendTensor.
+ *  raw=true: value is already a BackendTensor — return it directly. */
+function extractSideOutput(
+  node: LazyIRNode,
+  key: string,
+  raw = false,
+): BackendTensor {
   const parent = node.inputs[0].node;
-  const sh = parent._sideOutputs?.[key] as StorageHandle | undefined;
-  if (!sh) throw new Error(`${node.op}: parent has no ${key} side output`);
-  const bt = sh.backendTensor;
+  const value = parent._sideOutputs?.[key];
+  if (!value) throw new Error(`${node.op}: parent has no ${key} side output`);
+  if (parent._sideOutputs) parent._sideOutputs[key] = undefined;
+  if (raw) return value as BackendTensor;
+  const sh = value as StorageHandle;
   storageTracker.unregister(sh.id);
-  if (parent._sideOutputs) parent._sideOutputs[key] = undefined;
-  return bt;
-}
-
-/** Extract a raw BackendTensor side output from a parent node and clear it. */
-function extractRawSideOutput(node: LazyIRNode, key: string): BackendTensor {
-  const parent = node.inputs[0].node;
-  const bt = parent._sideOutputs?.[key] as BackendTensor | undefined;
-  if (!bt) throw new Error(`${node.op}: parent has no ${key} side output`);
-  if (parent._sideOutputs) parent._sideOutputs[key] = undefined;
-  return bt;
+  return sh.backendTensor;
 }
 
 export function getInputStorage(
@@ -252,6 +250,7 @@ function executeUnaryOp(
     case "floor":
     case "ceil":
     case "round":
+    case "isfinite":
     case "sign": {
       const fn = backend.ops[node.op as "exp"];
       assertOpSupported(node.op, fn);
@@ -262,9 +261,6 @@ function executeUnaryOp(
       const geluOpts = getPayload<GeluOptions>(node);
       return backend.ops.gelu(input, geluOpts);
     }
-    case "isfinite":
-      assertOpSupported("isfinite", backend.ops.isfinite);
-      return backend.ops.isfinite(input);
     case "clamp": {
       assertOpSupported("clamp", backend.ops.clamp);
       const clampPayload = getPayload<{
@@ -424,29 +420,16 @@ function executeMutationOp(
   backend: Backend,
 ): BackendTensor | Promise<BackendTensor> {
   switch (node.op) {
-    case "stridedScatterCopy": {
-      const payload = requirePayload<{
-        offset: number;
-        viewShape: number[];
-        viewStrides: number[];
-      }>(node);
-      return backend.ops.stridedScatterCopy(
-        backendInputs[0],
-        backendInputs[1],
-        payload,
-      );
-    }
+    case "stridedScatterCopy":
     case "stridedScatterAdd": {
       const payload = requirePayload<{
         offset: number;
         viewShape: number[];
         viewStrides: number[];
       }>(node);
-      return backend.ops.stridedScatterAdd(
-        backendInputs[0],
-        backendInputs[1],
-        payload,
-      );
+      const fn = backend.ops[node.op as "stridedScatterCopy"];
+      assertOpSupported(node.op, fn);
+      return fn(backendInputs[0], backendInputs[1], payload);
     }
     case "adamStep": {
       assertOpSupported("adamStep", backend.ops.adamStep);
@@ -548,7 +531,8 @@ function executeFusedOp(
   const desc = FUSED_OP_TABLE[node.op];
   if (desc) {
     if (desc.kind === "extract") return extractSideOutput(node, desc.key);
-    if (desc.kind === "extractRaw") return extractRawSideOutput(node, desc.key);
+    if (desc.kind === "extractRaw")
+      return extractSideOutput(node, desc.key, true);
 
     const payload = requirePayload(node);
     const fn = backend.ops[node.op as keyof Backend["ops"]] as
@@ -642,8 +626,8 @@ function buildOpTable(): Map<string, OpHandler> {
       "sigmoid",
       "gelu",
       "silu",
-      "isfinite",
       "pow",
+      "isfinite",
       "sin",
       "cos",
       "rsqrt",

@@ -79,6 +79,25 @@ export function isFusibleOp(op: string): boolean {
   return FUSIBLE_OPS.has(op);
 }
 
+/** Collect node IDs into a Set. */
+function nodeIdSet(nodes: LazyIRNode[]): Set<number> {
+  return new Set(nodes.map((n) => n.id));
+}
+
+/** Build a map from node IDs to their index in an array. */
+function buildIdPositionMap(nodes: LazyIRNode[]): Map<number, number> {
+  const map = new Map<number, number>();
+  for (let k = 0; k < nodes.length; k++) {
+    map.set(nodes[k].id, k);
+  }
+  return map;
+}
+
+/** Count external inputs that require a storage buffer binding (not inlinable scalars). */
+function countNonInlinableInputs(inputs: LazyRef[]): number {
+  return inputs.filter((ref) => !isInlinableScalar(ref).inlinable).length;
+}
+
 /**
  * A detected fusion group in a lazy plan.
  */
@@ -169,10 +188,8 @@ function processCandidate(
 
     // Check binding limit: non-inlined externalInputs + 1 (primary) + N (additional) <= maxBuffers
     const externalInputs = collectExternalInputs(subNodes, subNodeIds);
-    const nonInlinedInputs = externalInputs.filter(
-      (ref) => !isInlinableScalar(ref).inlinable,
-    ).length;
-    const totalBindings = nonInlinedInputs + 1 + additionalNodes.length;
+    const totalBindings =
+      countNonInlinableInputs(externalInputs) + 1 + additionalNodes.length;
 
     if (shapesMatch && totalBindings <= maxBuffers) {
       // Keep group intact with multi-output
@@ -241,7 +258,7 @@ function processCandidate(
       const splitNodes = subNodes.slice(start, end);
       const splitIndices = subIndices.slice(start, end);
       if (splitNodes.length >= 2) {
-        const splitNodeIds = new Set(splitNodes.map((n) => n.id));
+        const splitNodeIds = nodeIdSet(splitNodes);
         const externalInputs = collectExternalInputs(splitNodes, splitNodeIds);
         outGroups.push({
           nodes: splitNodes,
@@ -256,7 +273,7 @@ function processCandidate(
     const remaining = subNodes.slice(start);
     const remainingIndices = subIndices.slice(start);
     if (remaining.length >= 2) {
-      const remainingIds = new Set(remaining.map((n) => n.id));
+      const remainingIds = nodeIdSet(remaining);
       const externalInputs = collectExternalInputs(remaining, remainingIds);
       outGroups.push({
         nodes: remaining,
@@ -335,10 +352,7 @@ function splitCandidatesByComponent(
 
   for (const candidate of candidateGroups) {
     // Build position maps
-    const nodeIdToPos = new Map<number, number>();
-    for (let k = 0; k < candidate.nodes.length; k++) {
-      nodeIdToPos.set(candidate.nodes[k].id, k);
-    }
+    const nodeIdToPos = buildIdPositionMap(candidate.nodes);
 
     // Union-Find for connected component decomposition
     const parent: number[] = [];
@@ -398,12 +412,9 @@ function splitCandidatesByComponent(
 
       const subNodes = positions.map((p) => candidate.nodes[p]);
       const subIndices = positions.map((p) => candidate.indices[p]);
-      const subNodeIds = new Set(subNodes.map((n) => n.id));
+      const subNodeIds = nodeIdSet(subNodes);
 
-      const subNodeIdToPos = new Map<number, number>();
-      for (let k = 0; k < subNodes.length; k++) {
-        subNodeIdToPos.set(subNodes[k].id, k);
-      }
+      const subNodeIdToPos = buildIdPositionMap(subNodes);
       const internalDeps: number[][] = [];
       for (let k = 0; k < subNodes.length; k++) {
         const deps: number[] = [];
@@ -488,10 +499,7 @@ function splitGroupsByBufferLimit(
   for (const group of groups) {
     const numOutputs = 1 + (group.additionalOutputNodes?.length ?? 0);
     const maxInputsForGroup = maxBuffers - numOutputs;
-    const nonInlinableInputs = group.externalInputs.filter(
-      (ref) => !isInlinableScalar(ref).inlinable,
-    ).length;
-    if (nonInlinableInputs <= maxInputsForGroup) {
+    if (countNonInlinableInputs(group.externalInputs) <= maxInputsForGroup) {
       finalGroups.push(group);
       continue;
     }
@@ -700,10 +708,10 @@ function promoteIntermediates(
         shapesEqual(n.shape, primaryShape),
       );
       const currentOutputs = 1 + (group.additionalOutputNodes?.length ?? 0);
-      const nonInlinedExtInputs = group.externalInputs.filter(
-        (ref) => !isInlinableScalar(ref).inlinable,
-      ).length;
-      const availableSlots = maxBuffers - nonInlinedExtInputs - currentOutputs;
+      const availableSlots =
+        maxBuffers -
+        countNonInlinableInputs(group.externalInputs) -
+        currentOutputs;
 
       if (
         promotable.length === neededIntermediates.length &&
@@ -1264,7 +1272,7 @@ function makeBatchGroup(
 ): FusionGroup {
   const batchNodes = batchPositions.map((p) => sourceNodes[p]);
   const batchIndices = batchPositions.map((p) => sourceIndices[p]);
-  const batchNodeIds = new Set(batchNodes.map((n) => n.id));
+  const batchNodeIds = nodeIdSet(batchNodes);
   return {
     nodes: batchNodes,
     planIndices: batchIndices,
