@@ -227,16 +227,6 @@ function executeCreationOp(
   }
 }
 
-function executeClampOp(
-  node: LazyIRNode,
-  backendInputs: BackendTensor[],
-  backend: Backend,
-): BackendTensor {
-  assertOpSupported("clamp", backend.ops.clamp);
-  const p = getPayload<{ min: number | null; max: number | null }>(node);
-  return backend.ops.clamp(backendInputs[0], p?.min ?? null, p?.max ?? null);
-}
-
 function executeShapeOp(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
@@ -566,7 +556,11 @@ function buildOpTable(): Map<string, OpHandler> {
     ],
     executeCreationOp,
   );
-  t.set("clamp", executeClampOp);
+  t.set("clamp", (node, backendInputs, backend) => {
+    assertOpSupported("clamp", backend.ops.clamp);
+    const p = getPayload<{ min: number | null; max: number | null }>(node);
+    return backend.ops.clamp(backendInputs[0], p?.min ?? null, p?.max ?? null);
+  });
   add(
     [
       "reshape",

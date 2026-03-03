@@ -135,24 +135,19 @@ export function checkContiguousStrides(
 // Dtype Helpers
 // ============================================================================
 
+const DTYPE_BYTES: Record<string, number> = {
+  f16: 2,
+  f32: 4,
+  i32: 4,
+  u32: 4,
+  bool: 1,
+};
+
 /**
  * Get bytes per element for a dtype.
  */
 export function dtypeBytes(dtype: DType): number {
-  switch (dtype) {
-    case "f16":
-      return 2;
-    case "f32":
-      return 4;
-    case "i32":
-      return 4;
-    case "u32":
-      return 4;
-    case "bool":
-      return 1;
-    default:
-      return 4;
-  }
+  return DTYPE_BYTES[dtype] ?? 4;
 }
 
 /**
@@ -166,20 +161,7 @@ export function alignBufferSize(bytes: number): number {
  * Convert dtype to WGSL type string.
  */
 export function dtypeToWgsl(dtype: DType): string {
-  switch (dtype) {
-    case "f16":
-      return "f16";
-    case "f32":
-      return "f32";
-    case "i32":
-      return "i32";
-    case "u32":
-      return "u32";
-    case "bool":
-      return "bool";
-    default:
-      return "f32";
-  }
+  return dtype;
 }
 
 // ============================================================================
