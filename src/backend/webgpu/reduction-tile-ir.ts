@@ -205,8 +205,6 @@ function applyEpilogueChain(
       result = applyFusedOp(ctx, eop.op, [result, epInput]);
     } else if (eop.kind === "unary" && eop.op) {
       result = applyFusedOp(ctx, eop.op, [result]);
-    } else if (eop.kind === "gelu") {
-      result = applyFusedOp(ctx, "gelu_tanh", [result]);
     }
   }
   return result;

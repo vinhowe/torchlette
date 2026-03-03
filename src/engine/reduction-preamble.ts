@@ -60,7 +60,7 @@ function getChainOpName(node: LazyIRNode): string {
   }
   if (node.op === "gelu") {
     const payload = node.payload as { approximate?: string } | undefined;
-    return payload?.approximate === "tanh" ? "gelu_tanh" : "gelu_erf";
+    return payload?.approximate === "tanh" ? "gelu" : "gelu_erf";
   }
   return node.op;
 }

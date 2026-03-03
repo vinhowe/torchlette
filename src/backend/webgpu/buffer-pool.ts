@@ -11,10 +11,12 @@
  */
 
 import { getSizeClass, getSizeForClass } from "../../engine/lifetime-analysis";
+import type { DType } from "../types";
 import type { GPUBuffer, GPUDevice, GPUQueue } from "./gpu-types";
 import { STORAGE_BUFFER_USAGE } from "./gpu-types";
 import { gpuMemoryTracker } from "./memory-tracker";
 import { isProfilingEnabled } from "./profiler";
+import { dtypeBytes } from "./shape-utils";
 import {
   activeBatch,
   arenaBufferSet,
@@ -868,9 +870,9 @@ export function flushBufferPool(): void {
 export function destroyCopy(tensor: {
   buffer: GPUBuffer;
   size: number;
-  dtype: string;
+  dtype: DType;
 }): void {
-  const bytes = tensor.size * (tensor.dtype === "f16" ? 2 : 4);
+  const bytes = tensor.size * dtypeBytes(tensor.dtype);
   bufferPool.decRef(tensor.buffer);
   bufferPool.deferredDestroy(tensor.buffer, bytes);
 }

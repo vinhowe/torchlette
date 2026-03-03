@@ -27,7 +27,7 @@ import { dispatchComputePass, getPipeline } from "../dispatch";
 import { requireContext } from "../gpu-context";
 import type { GPUBuffer } from "../gpu-types";
 import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
-import { compute2DDispatch, WORKGROUP_SIZE } from "../shape-utils";
+import { compute2DDispatch, dtypeBytes, WORKGROUP_SIZE } from "../shape-utils";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
 import { createTensor, createTrackedBuffer } from "../tensor";
 import {
@@ -297,7 +297,7 @@ export function cat(
 
   const ctx = requireContext();
   const gpuTensors = tensors.map((t) => asGPUTensor(t));
-  const bytesPerElement = gpuTensors[0].dtype === "f16" ? 2 : 4;
+  const bytesPerElement = dtypeBytes(gpuTensors[0].dtype);
 
   // Compute output shape
   const dim = options.dim;
