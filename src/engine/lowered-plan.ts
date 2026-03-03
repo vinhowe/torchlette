@@ -89,8 +89,6 @@ interface LoweredMatmulEpilogueAction {
   outputNodeIndex: number;
   /** Cached epilogue operations (structural, same across steps). */
   epilogueOps: EpilogueOp[];
-  /** Number of additional epilogue inputs (e.g., bias tensors). */
-  epilogueInputCount: number;
   /** Output dtype after epilogue chain. */
   outputDtype: DType;
   /** Number of nodes consumed (matmul + epilogue chain). */
@@ -178,8 +176,6 @@ interface LoweredReductionEpilogueAction {
   outputNodeIndex: number;
   /** Epilogue operations to apply after the reduction. */
   epilogueOps: EpilogueOp[];
-  /** Number of additional epilogue inputs (e.g., external tensors for binary ops). */
-  epilogueInputCount: number;
   /** Output dtype after epilogue chain. */
   outputDtype: DType;
   /** Number of nodes consumed (reduction + epilogue chain). */
@@ -203,8 +199,6 @@ interface LoweredReductionFusionAction {
   preambleInputDtypes: DType[];
   /** Epilogue operations to apply after the reduction. */
   epilogueOps: EpilogueOp[];
-  /** Number of additional epilogue inputs (e.g., external tensors for binary ops). */
-  epilogueInputCount: number;
   /** Output dtype after epilogue chain. */
   outputDtype: DType;
   /** Total nodes consumed (preamble chain + reduction + epilogue chain). */
@@ -291,9 +285,6 @@ interface ReplayNodeResult {
   dtype: DType;
   size: number;
   strides: number[];
-  /** If this result aliases an input (view ops), the aliased input's node index or -1 for materialized refs. */
-  isView: boolean;
-  baseNodeIndex?: number;
 }
 
 /**
@@ -443,7 +434,6 @@ export class LoweredPlanBuilder {
     coveredNodeIndices: number[],
     outputNodeIndex: number,
     epilogueOps: EpilogueOp[],
-    epilogueInputCount: number,
     outputDtype: DType,
     consumedCount: number,
     prologues?: Array<{
@@ -459,7 +449,6 @@ export class LoweredPlanBuilder {
       coveredNodeIndices,
       outputNodeIndex,
       epilogueOps,
-      epilogueInputCount,
       outputDtype,
       consumedCount,
       prologues,
@@ -495,7 +484,6 @@ export class LoweredPlanBuilder {
     preambleOps: Array<{ op: string; arity: number; chainInputPos?: 0 | 1 }>,
     preambleInputDtypes: DType[],
     epilogueOps: EpilogueOp[],
-    epilogueInputCount: number,
     outputDtype: DType,
     consumedCount: number,
     isMean: boolean,
@@ -509,7 +497,6 @@ export class LoweredPlanBuilder {
       preambleOps,
       preambleInputDtypes,
       epilogueOps,
-      epilogueInputCount,
       outputDtype,
       consumedCount,
       isMean,
@@ -522,7 +509,6 @@ export class LoweredPlanBuilder {
     coveredNodeIndices: number[],
     outputNodeIndex: number,
     epilogueOps: EpilogueOp[],
-    epilogueInputCount: number,
     outputDtype: DType,
     consumedCount: number,
   ): void {
@@ -532,7 +518,6 @@ export class LoweredPlanBuilder {
       coveredNodeIndices,
       outputNodeIndex,
       epilogueOps,
-      epilogueInputCount,
       outputDtype,
       consumedCount,
     });
