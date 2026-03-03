@@ -101,17 +101,6 @@ export function isAutotuneEnabled(): boolean {
 }
 
 /**
- * Get tuning cache key.
- */
-function getTuningKey(
-  shapeClass: ShapeClass,
-  dtype: DType,
-  hasEpilogue: boolean = false,
-): string {
-  return `${shapeClass}_${dtype}_${hasEpilogue ? "epilogue" : "bare"}`;
-}
-
-/**
  * Get the best kernel config for a shape class (from cache or default).
  * For bare matmuls, also checks the per-shape tuning cache when M,N,K are provided.
  */
@@ -129,7 +118,7 @@ function getConfigForShape(
     if (perShapeHit) return perShapeHit;
   }
   // Fall through to shape-class cache → defaults
-  const key = getTuningKey(shapeClass, dtype, hasEpilogue);
+  const key = `${shapeClass}_${dtype}_${hasEpilogue ? "epilogue" : "bare"}`;
   const cached = tuningCache.get(key);
   if (cached) {
     return cached;
