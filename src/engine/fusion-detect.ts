@@ -85,12 +85,29 @@ function nodeIdSet(nodes: LazyIRNode[]): Set<number> {
 }
 
 /** Build a map from node IDs to their index in an array. */
-function buildIdPositionMap(nodes: LazyIRNode[]): Map<number, number> {
+export function buildIdPositionMap(nodes: LazyIRNode[]): Map<number, number> {
   const map = new Map<number, number>();
   for (let k = 0; k < nodes.length; k++) {
     map.set(nodes[k].id, k);
   }
   return map;
+}
+
+/** Collect output + additional output node IDs for a fusion group. */
+function groupOutputIds(group: {
+  outputNode: LazyIRNode;
+  additionalOutputNodes?: LazyIRNode[];
+}): Set<number> {
+  const ids = new Set([group.outputNode.id]);
+  if (group.additionalOutputNodes) {
+    for (const n of group.additionalOutputNodes) ids.add(n.id);
+  }
+  return ids;
+}
+
+/** Shape+dtype key for grouping nodes by compatible shape. */
+function shapeDtypeKey(node: LazyIRNode): string {
+  return `${(node.shape ?? [1]).join(",")}_${node.dtype ?? "f32"}`;
 }
 
 /** Count external inputs that require a storage buffer binding (not inlinable scalars). */
@@ -447,7 +464,7 @@ function splitCandidatesByComponent(
       const byShapeDtype = new Map<string, number[]>();
       for (const pos of singletonPositions) {
         const node = candidate.nodes[pos];
-        const key = `${(node.shape ?? [1]).join(",")}_${node.dtype ?? "f32"}`;
+        const key = shapeDtypeKey(node);
         if (!byShapeDtype.has(key)) byShapeDtype.set(key, []);
         byShapeDtype.get(key)?.push(pos);
       }
@@ -546,7 +563,7 @@ function batchGlobalSingletons(
     Array<{ node: LazyIRNode; planIndex: number }>
   >();
   for (const s of singletons) {
-    const key = `${(s.node.shape ?? [1]).join(",")}_${s.node.dtype ?? "f32"}`;
+    const key = shapeDtypeKey(s.node);
     if (!byShapeDtype.has(key)) byShapeDtype.set(key, []);
     byShapeDtype.get(key)?.push(s);
   }
@@ -677,12 +694,8 @@ function promoteIntermediates(
   }
 
   for (const group of finalGroups) {
-    const groupNodeIds = new Set(group.nodes.map((n) => n.id));
-    const outputIds = new Set<number>();
-    outputIds.add(group.outputNode.id);
-    if (group.additionalOutputNodes) {
-      for (const n of group.additionalOutputNodes) outputIds.add(n.id);
-    }
+    const groupNodeIds = nodeIdSet(group.nodes);
+    const outputIds = groupOutputIds(group);
 
     const neededIntermediates: LazyIRNode[] = [];
     for (const gnode of group.nodes) {
@@ -903,13 +916,8 @@ function splitGroupByInputLimit(
     for (let g = 0; g < result.length - 1; g++) {
       const earlier = result[g];
       const later = result[g + 1];
-      const earlierNodeIds = new Set(earlier.nodes.map((n) => n.id));
-      const earlierOutputIds = new Set<number>();
-      earlierOutputIds.add(earlier.outputNode.id);
-      if (earlier.additionalOutputNodes) {
-        for (const n of earlier.additionalOutputNodes)
-          earlierOutputIds.add(n.id);
-      }
+      const earlierNodeIds = nodeIdSet(earlier.nodes);
+      const earlierOutputIds = groupOutputIds(earlier);
 
       // Find nodes in the later group that depend on intermediates of the earlier group
       for (const laterNode of later.nodes) {
@@ -954,7 +962,7 @@ function splitGroupByInputLimit(
  * - Materialized refs (already computed tensors)
  * - Pending refs to nodes outside the group
  */
-function collectExternalInputs(
+export function collectExternalInputs(
   groupNodes: LazyIRNode[],
   groupNodeIds: Set<number>,
 ): LazyRef[] {

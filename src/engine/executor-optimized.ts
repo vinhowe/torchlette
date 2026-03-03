@@ -19,6 +19,8 @@ import {
 import type { CompoundMatch } from "./compound-patterns";
 import { executePlan } from "./executor-sequential";
 import {
+  buildIdPositionMap,
+  collectExternalInputs,
   computePlanFingerprint,
   type ExecutionSegment,
   type FusionGroup,
@@ -44,11 +46,33 @@ import {
 } from "./segment-executors";
 import { releaseDeadTensors } from "./storage-tracker";
 
-/** Build a map from node IDs to their position index in an array. */
-function buildIdPositionMap(nodes: LazyIRNode[]): Map<number, number> {
-  const map = new Map<number, number>();
-  for (let i = 0; i < nodes.length; i++) {
-    map.set(nodes[i].id, i);
+/** Build compound match map: maps first covered node to full descriptor, rest to skip entries. */
+function buildCompoundMatchMap(
+  compoundMatches: CompoundMatch[],
+  nodeIdToFinalPos: Map<number, number>,
+): Map<number, CompoundMatchExec> {
+  const map = new Map<number, CompoundMatchExec>();
+  for (const match of compoundMatches) {
+    let firstPos = Infinity;
+    let firstId = match.coveredNodeIds[0];
+    for (const id of match.coveredNodeIds) {
+      const pos = nodeIdToFinalPos.get(id) ?? Infinity;
+      if (pos < firstPos) {
+        firstPos = pos;
+        firstId = id;
+      }
+    }
+    const coveredSet = new Set(match.coveredNodeIds);
+    const desc = {
+      name: match.name,
+      coveredNodeIds: coveredSet,
+      outputNodeId: match.outputNodeId,
+      dim: match.dim,
+    };
+    map.set(firstId, desc);
+    for (const id of match.coveredNodeIds) {
+      if (id !== firstId) map.set(id, { ...desc, name: "" });
+    }
   }
   return map;
 }
@@ -346,43 +370,7 @@ export async function executePlanOptimized(
       // Reconstruct FusionGroup
       const groupNodes = seg.finalPoss.map((i) => planNodes[i]);
       const groupNodeIds = new Set(groupNodes.map((n) => n.id));
-      const extInputs: LazyRef[] = [];
-      for (const node of groupNodes) {
-        for (const inp of node.inputs) {
-          if (inp.kind === "pending") {
-            if (
-              !groupNodeIds.has(inp.node.id) &&
-              !extInputs.some(
-                (ei) => ei.kind === "pending" && ei.node.id === inp.node.id,
-              )
-            ) {
-              extInputs.push(inp);
-            }
-          } else if (inp.kind === "scalar") {
-            // Deduplicate scalar inputs by value+dtype
-            if (
-              !extInputs.some(
-                (ei) =>
-                  ei.kind === "scalar" &&
-                  ei.value === inp.value &&
-                  ei.dtype === inp.dtype,
-              )
-            ) {
-              extInputs.push(inp);
-            }
-          } else {
-            if (
-              !extInputs.some(
-                (ei) =>
-                  ei.kind === "materialized" &&
-                  ei.storage.id === inp.storage.id,
-              )
-            ) {
-              extInputs.push(inp);
-            }
-          }
-        }
-      }
+      const extInputs = collectExternalInputs(groupNodes, groupNodeIds);
       const group: FusionGroup = {
         nodes: groupNodes,
         planIndices: seg.finalPoss,
@@ -694,45 +682,10 @@ export async function executePlanOptimized(
   }
 
   try {
-    // Build compound match map: maps the first covered node ID (in plan order)
-    // to the execution descriptor, and all other covered nodes to skip entries.
-    let compoundMatchMap: Map<number, CompoundMatchExec> | undefined;
-    if (compoundMatches.length > 0) {
-      compoundMatchMap = new Map();
-
-      for (const match of compoundMatches) {
-        // Find the first covered node in plan order
-        let firstPos = Infinity;
-        let firstId = match.coveredNodeIds[0];
-        for (const id of match.coveredNodeIds) {
-          const pos = nodeIdToFinalPos.get(id) ?? Infinity;
-          if (pos < firstPos) {
-            firstPos = pos;
-            firstId = id;
-          }
-        }
-
-        const coveredSet = new Set(match.coveredNodeIds);
-        // Map the first node to the full match descriptor
-        compoundMatchMap.set(firstId, {
-          name: match.name,
-          coveredNodeIds: coveredSet,
-          outputNodeId: match.outputNodeId,
-          dim: match.dim,
-        });
-        // Map remaining covered nodes to skip entries
-        for (const id of match.coveredNodeIds) {
-          if (id !== firstId) {
-            compoundMatchMap.set(id, {
-              name: "",
-              coveredNodeIds: coveredSet,
-              outputNodeId: match.outputNodeId,
-              dim: match.dim,
-            });
-          }
-        }
-      }
-    }
+    const compoundMatchMap =
+      compoundMatches.length > 0
+        ? buildCompoundMatchMap(compoundMatches, nodeIdToFinalPos)
+        : undefined;
 
     // Track dispatched nodes for periodic buffer reclamation.
     // When the shared encoder is active, released buffers go to pendingRelease

@@ -63,6 +63,38 @@ function buildConsumerCount(nodes: LazyIRNode[]): Map<number, number> {
   return counts;
 }
 
+/** Execute a node: resolve backend, get inputs, run op, wrap result. */
+async function executeAndStoreNode(
+  node: LazyIRNode,
+  backend: Backend,
+): Promise<void> {
+  const nodeBackend = getBackend(node.device) ?? backend;
+  setProfileModule(node.module ?? "unknown");
+  const inputs = node.inputs.map((ref) => getInputStorage(ref, nodeBackend));
+  const backendInputs = inputs.map((s) => s.backendTensor);
+  const resultTensor = await executeOp(node, backendInputs, nodeBackend);
+  node.result = wrapResultAsStorage(
+    node.device,
+    resultTensor,
+    backendInputs,
+    inputs,
+  );
+}
+
+/** Collect final positions for a range of nodes. */
+function collectNodePositions(
+  nodes: LazyIRNode[],
+  startIdx: number,
+  count: number,
+  posMap: Map<number, number>,
+): number[] {
+  const result: number[] = [];
+  for (let i = 0; i < count; i++) {
+    result.push(posMap.get(nodes[startIdx + i].id) as number);
+  }
+  return result;
+}
+
 /**
  * Execution descriptor for a compound pattern match.
  * Built from CompoundMatch by the executor before passing to segment executors.
@@ -296,21 +328,7 @@ async function executeSequentialSegment(
   try {
     for (const node of nodes) {
       if (node.result) continue;
-
-      const nodeBackend = getBackend(node.device) ?? backend;
-      setProfileModule(node.module ?? "unknown");
-      const inputs = node.inputs.map((ref) =>
-        getInputStorage(ref, nodeBackend),
-      );
-      const backendInputs = inputs.map((s) => s.backendTensor);
-
-      const resultTensor = await executeOp(node, backendInputs, nodeBackend);
-      node.result = wrapResultAsStorage(
-        node.device,
-        resultTensor,
-        backendInputs,
-        inputs,
-      );
+      await executeAndStoreNode(node, backend);
     }
   } finally {
     if (useSharedEncoder) endSharedEncoder();
@@ -493,12 +511,12 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
         // Record compound action in lowered plan builder
         if (loweredPlanBuilder && nodeIdToFinalPos) {
-          const coveredPoss: number[] = [];
-          for (let c = 0; c < coveredCount; c++) {
-            coveredPoss.push(
-              nodeIdToFinalPos.get(nodes[nodeIdx + c].id) as number,
-            );
-          }
+          const coveredPoss = collectNodePositions(
+            nodes,
+            nodeIdx,
+            coveredCount,
+            nodeIdToFinalPos,
+          );
           loweredPlanBuilder.recordCompound(
             match.name,
             coveredPoss,
@@ -563,12 +581,12 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
           // Record matmul epilogue action in lowered plan builder
           if (loweredPlanBuilder && nodeIdToFinalPos) {
-            const covered: number[] = [];
-            for (let skip = 0; skip < epiloguePlan.consumedCount; skip++) {
-              covered.push(
-                nodeIdToFinalPos.get(nodes[nodeIdx + skip].id) as number,
-              );
-            }
+            const covered = collectNodePositions(
+              nodes,
+              nodeIdx,
+              epiloguePlan.consumedCount,
+              nodeIdToFinalPos,
+            );
             loweredPlanBuilder.recordMatmulEpilogue(
               nodeIdToFinalPos.get(node.id) as number,
               covered,
@@ -705,12 +723,12 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
           // Record reduction epilogue action in lowered plan builder
           if (loweredPlanBuilder && nodeIdToFinalPos) {
-            const covered: number[] = [];
-            for (let c = 0; c < epiloguePlan.consumedCount; c++) {
-              covered.push(
-                nodeIdToFinalPos.get(nodes[nodeIdx + c].id) as number,
-              );
-            }
+            const covered = collectNodePositions(
+              nodes,
+              nodeIdx,
+              epiloguePlan.consumedCount,
+              nodeIdToFinalPos,
+            );
             loweredPlanBuilder.recordReductionEpilogue(
               nodeIdToFinalPos.get(node.id) as number,
               covered,
@@ -780,12 +798,12 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
           // Record adam batch action in lowered plan builder
           if (loweredPlanBuilder && nodeIdToFinalPos) {
-            const adamIndices: number[] = [];
-            for (let a = 0; a < adamCount; a++) {
-              adamIndices.push(
-                nodeIdToFinalPos.get(nodes[nodeIdx + a].id) as number,
-              );
-            }
+            const adamIndices = collectNodePositions(
+              nodes,
+              nodeIdx,
+              adamCount,
+              nodeIdToFinalPos,
+            );
             loweredPlanBuilder.recordAdamBatch(adamIndices);
           }
 
@@ -794,20 +812,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
         }
       }
 
-      const nodeBackend = getBackend(node.device) ?? backend;
-      setProfileModule(node.module ?? "unknown");
-      const inputs = node.inputs.map((ref) =>
-        getInputStorage(ref, nodeBackend),
-      );
-      const backendInputs = inputs.map((s) => s.backendTensor);
-
-      const resultTensor = await executeOp(node, backendInputs, nodeBackend);
-      node.result = wrapResultAsStorage(
-        node.device,
-        resultTensor,
-        backendInputs,
-        inputs,
-      );
+      await executeAndStoreNode(node, backend);
 
       // Record action in lowered plan builder
       if (loweredPlanBuilder && nodeIdToFinalPos) {
