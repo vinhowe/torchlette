@@ -122,9 +122,14 @@ export function arange(end: number, start = 0, step = 1): Tensor {
   return new Tensor([numElements], data);
 }
 
-export function tril(a: Tensor, k = 0): Tensor {
+/** Shared impl for tril/triu: zero elements where zeroWhen(col, row, k) is true. */
+function triangularMask(
+  a: Tensor,
+  k: number,
+  zeroWhen: (c: number, r: number, k: number) => boolean,
+): Tensor {
   if (a.shape.length < 2)
-    throw new Error("tril requires at least 2 dimensions");
+    throw new Error("tril/triu requires at least 2 dimensions");
   const data = Float32Array.from(a.data);
   const H = a.shape[a.shape.length - 2];
   const W = a.shape[a.shape.length - 1];
@@ -132,28 +137,19 @@ export function tril(a: Tensor, k = 0): Tensor {
   for (let b = 0; b < batchSize; b++) {
     for (let r = 0; r < H; r++) {
       for (let c = 0; c < W; c++) {
-        if (c > r + k) data[b * H * W + r * W + c] = 0;
+        if (zeroWhen(c, r, k)) data[b * H * W + r * W + c] = 0;
       }
     }
   }
   return new Tensor(a.shape.slice(), data);
 }
 
+export function tril(a: Tensor, k = 0): Tensor {
+  return triangularMask(a, k, (c, r, k) => c > r + k);
+}
+
 export function triu(a: Tensor, k = 0): Tensor {
-  if (a.shape.length < 2)
-    throw new Error("triu requires at least 2 dimensions");
-  const data = Float32Array.from(a.data);
-  const H = a.shape[a.shape.length - 2];
-  const W = a.shape[a.shape.length - 1];
-  const batchSize = data.length / (H * W);
-  for (let b = 0; b < batchSize; b++) {
-    for (let r = 0; r < H; r++) {
-      for (let c = 0; c < W; c++) {
-        if (c < r + k) data[b * H * W + r * W + c] = 0;
-      }
-    }
-  }
-  return new Tensor(a.shape.slice(), data);
+  return triangularMask(a, k, (c, r, k) => c < r + k);
 }
 
 export function expand(a: Tensor, shape: Shape): Tensor {
@@ -1156,12 +1152,19 @@ function normalizeDimsForReduce(
 
 export type ArgReduceOptions = { dim: number; keepdim?: boolean };
 
-export function argmax(a: Tensor, options: ArgReduceOptions): Tensor {
+/** Shared argmax/argmin implementation parameterized by comparison direction. */
+function argReduce(
+  a: Tensor,
+  opName: string,
+  options: ArgReduceOptions,
+  initVal: number,
+  isBetter: (val: number, best: number) => boolean,
+): Tensor {
   const rank = a.shape.length;
   const dim = options.dim < 0 ? options.dim + rank : options.dim;
   if (dim < 0 || dim >= rank) {
     throw new Error(
-      `argmax: dim ${options.dim} out of range for tensor of rank ${rank}`,
+      `${opName}: dim ${options.dim} out of range for tensor of rank ${rank}`,
     );
   }
   const keepdim = options.keepdim ?? false;
@@ -1172,8 +1175,8 @@ export function argmax(a: Tensor, options: ArgReduceOptions): Tensor {
 
   const outSize = outShape.reduce((acc, d) => acc * d, 1) || 1;
   const out = new Float32Array(outSize);
-  const maxVals = new Float32Array(outSize);
-  maxVals.fill(-Infinity);
+  const bestVals = new Float32Array(outSize);
+  bestVals.fill(initVal);
 
   const inShapeStrides = computeStrides(a.shape);
   const outStrides = computeStrides(outShape);
@@ -1210,8 +1213,8 @@ export function argmax(a: Tensor, options: ArgReduceOptions): Tensor {
     }
 
     const val = readAtLinear(a, linear, inShapeStrides);
-    if (val > maxVals[outOffset]) {
-      maxVals[outOffset] = val;
+    if (isBetter(val, bestVals[outOffset])) {
+      bestVals[outOffset] = val;
       out[outOffset] = dimCoord;
     }
   }
@@ -1219,67 +1222,12 @@ export function argmax(a: Tensor, options: ArgReduceOptions): Tensor {
   return new Tensor(outShape, out);
 }
 
+export function argmax(a: Tensor, options: ArgReduceOptions): Tensor {
+  return argReduce(a, "argmax", options, -Infinity, (v, b) => v > b);
+}
+
 export function argmin(a: Tensor, options: ArgReduceOptions): Tensor {
-  const rank = a.shape.length;
-  const dim = options.dim < 0 ? options.dim + rank : options.dim;
-  if (dim < 0 || dim >= rank) {
-    throw new Error(
-      `argmin: dim ${options.dim} out of range for tensor of rank ${rank}`,
-    );
-  }
-  const keepdim = options.keepdim ?? false;
-
-  const outShape = keepdim
-    ? a.shape.map((d, i) => (i === dim ? 1 : d))
-    : a.shape.filter((_, i) => i !== dim);
-
-  const outSize = outShape.reduce((acc, d) => acc * d, 1) || 1;
-  const out = new Float32Array(outSize);
-  const minVals = new Float32Array(outSize);
-  minVals.fill(Infinity);
-
-  const inShapeStrides = computeStrides(a.shape);
-  const outStrides = computeStrides(outShape);
-
-  for (let linear = 0; linear < a.size; linear += 1) {
-    let remainder = linear;
-    let outOffset = 0;
-    let dimCoord = 0;
-
-    if (keepdim) {
-      for (let d = 0; d < rank; d += 1) {
-        const stride = inShapeStrides[d];
-        const coord = Math.floor(remainder / stride);
-        remainder -= coord * stride;
-        if (d === dim) {
-          dimCoord = coord;
-        } else {
-          outOffset += coord * outStrides[d];
-        }
-      }
-    } else {
-      let outDim = 0;
-      for (let d = 0; d < rank; d += 1) {
-        const stride = inShapeStrides[d];
-        const coord = Math.floor(remainder / stride);
-        remainder -= coord * stride;
-        if (d === dim) {
-          dimCoord = coord;
-        } else {
-          outOffset += coord * outStrides[outDim];
-          outDim += 1;
-        }
-      }
-    }
-
-    const val = readAtLinear(a, linear, inShapeStrides);
-    if (val < minVals[outOffset]) {
-      minVals[outOffset] = val;
-      out[outOffset] = dimCoord;
-    }
-  }
-
-  return new Tensor(outShape, out);
+  return argReduce(a, "argmin", options, Infinity, (v, b) => v < b);
 }
 
 // ============================================================================
@@ -1350,113 +1298,84 @@ export type StridedScatterOptions = {
 };
 
 /**
- * Copy src values into base tensor at positions defined by view metadata.
+ * Scatter src values into base tensor at positions defined by view metadata.
  * Returns a new tensor (does not mutate base).
  *
  * This is the fundamental operation for view mutation lowering (§4.4):
- * When mutating a view, we load the base, scatter-copy the new values
+ * When mutating a view, we load the base, scatter the new values
  * into the view positions, and store back.
  */
-export function stridedScatterCopy(
+function stridedScatterImpl(
+  opName: string,
   base: Tensor,
   src: Tensor,
   options: StridedScatterOptions,
+  combine: (existing: number, srcVal: number) => number,
 ): Tensor {
   const { offset, viewShape, viewStrides } = options;
 
-  // Validate src shape matches view shape
   if (src.shape.length !== viewShape.length) {
     throw new Error(
-      `stridedScatterCopy: src rank ${src.shape.length} doesn't match view rank ${viewShape.length}`,
+      `${opName}: src rank ${src.shape.length} doesn't match view rank ${viewShape.length}`,
     );
   }
   for (let i = 0; i < viewShape.length; i++) {
     if (src.shape[i] !== viewShape[i]) {
       throw new Error(
-        `stridedScatterCopy: src shape [${src.shape}] doesn't match view shape [${viewShape}]`,
+        `${opName}: src shape [${src.shape}] doesn't match view shape [${viewShape}]`,
       );
     }
   }
 
-  // Clone base data (we don't mutate the original)
   const out = new Float32Array(base.data.length);
   out.set(base.data);
 
-  // Iterate over src and write each value to the corresponding position in base
   const srcSize = sizeOf(viewShape);
   const srcShapeStrides = computeStrides(viewShape);
 
   for (let linear = 0; linear < srcSize; linear++) {
-    // Convert linear index to coordinates in view shape
     let remainder = linear;
     let baseOffset = offset;
     for (let axis = 0; axis < viewShape.length; axis++) {
       const stride = srcShapeStrides[axis];
       const coord = Math.floor(remainder / stride);
       remainder -= coord * stride;
-      // Map to base using view strides
       baseOffset += coord * viewStrides[axis];
     }
 
-    // Read from src (handling src's own strides)
     const srcVal = readAtLinear(src, linear, srcShapeStrides);
-    out[baseOffset] = srcVal;
+    out[baseOffset] = combine(out[baseOffset], srcVal);
   }
 
   return new Tensor(base.shape, out, computeStrides(base.shape), 0);
 }
 
-/**
- * Add src values into base tensor at positions defined by view metadata.
- * Returns a new tensor (does not mutate base).
- */
+export function stridedScatterCopy(
+  base: Tensor,
+  src: Tensor,
+  options: StridedScatterOptions,
+): Tensor {
+  return stridedScatterImpl(
+    "stridedScatterCopy",
+    base,
+    src,
+    options,
+    (_, v) => v,
+  );
+}
+
 export function stridedScatterAdd(
   base: Tensor,
   src: Tensor,
   options: StridedScatterOptions,
 ): Tensor {
-  const { offset, viewShape, viewStrides } = options;
-
-  // Validate src shape matches view shape
-  if (src.shape.length !== viewShape.length) {
-    throw new Error(
-      `stridedScatterAdd: src rank ${src.shape.length} doesn't match view rank ${viewShape.length}`,
-    );
-  }
-  for (let i = 0; i < viewShape.length; i++) {
-    if (src.shape[i] !== viewShape[i]) {
-      throw new Error(
-        `stridedScatterAdd: src shape [${src.shape}] doesn't match view shape [${viewShape}]`,
-      );
-    }
-  }
-
-  // Clone base data (we don't mutate the original)
-  const out = new Float32Array(base.data.length);
-  out.set(base.data);
-
-  // Iterate over src and add each value to the corresponding position in base
-  const srcSize = sizeOf(viewShape);
-  const srcShapeStrides = computeStrides(viewShape);
-
-  for (let linear = 0; linear < srcSize; linear++) {
-    // Convert linear index to coordinates in view shape
-    let remainder = linear;
-    let baseOffset = offset;
-    for (let axis = 0; axis < viewShape.length; axis++) {
-      const stride = srcShapeStrides[axis];
-      const coord = Math.floor(remainder / stride);
-      remainder -= coord * stride;
-      // Map to base using view strides
-      baseOffset += coord * viewStrides[axis];
-    }
-
-    // Read from src (handling src's own strides)
-    const srcVal = readAtLinear(src, linear, srcShapeStrides);
-    out[baseOffset] += srcVal;
-  }
-
-  return new Tensor(base.shape, out, computeStrides(base.shape), 0);
+  return stridedScatterImpl(
+    "stridedScatterAdd",
+    base,
+    src,
+    options,
+    (e, v) => e + v,
+  );
 }
 
 export function mean(a: Tensor, options?: MeanOptions): Tensor {

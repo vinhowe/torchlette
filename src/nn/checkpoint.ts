@@ -37,13 +37,6 @@ export type CheckpointOptions = {
    * Default: true
    */
   preserveRngState?: boolean;
-
-  /**
-   * Whether to use reentrant checkpointing (PyTorch-style).
-   * When false, uses simpler non-reentrant implementation.
-   * Default: false (non-reentrant is more efficient and recommended)
-   */
-  useReentrant?: boolean;
 };
 
 /**
@@ -92,12 +85,7 @@ export function checkpoint<T extends Tensor>(
   inputs: Tensor[],
   options: CheckpointOptions = {},
 ): T {
-  const { preserveRngState = true, useReentrant = false } = options;
-
-  if (useReentrant) {
-    // Reentrant falls back to non-reentrant for now
-    return checkpointNonReentrant(api, fn, inputs, preserveRngState);
-  }
+  const { preserveRngState = true } = options;
   return checkpointNonReentrant(api, fn, inputs, preserveRngState);
 }
 
