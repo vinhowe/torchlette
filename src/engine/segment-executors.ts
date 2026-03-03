@@ -567,7 +567,6 @@ export async function executeSequentialSegmentWithEarlyRelease(
               covered,
               nodeIdToFinalPos.get(epiloguePlan.outputNode.id) as number,
               epiloguePlan.epilogueOps,
-              epiloguePlan.epilogueInputRefs.length,
               epiloguePlan.outputDtype,
               epiloguePlan.consumedCount,
               epiloguePlan.prologues?.map((p) => ({
@@ -618,7 +617,6 @@ export async function executeSequentialSegmentWithEarlyRelease(
               fusionPlan.preambleOps,
               fusionPlan.preambleInputDtypes,
               fusionPlan.epilogueOps,
-              fusionPlan.epilogueInputRefs.length,
               fusionPlan.outputDtype,
               fusionPlan.consumedCount,
               fusionPlan.isMean,
@@ -694,7 +692,6 @@ export async function executeSequentialSegmentWithEarlyRelease(
               covered,
               nodeIdToFinalPos.get(epiloguePlan.outputNode.id) as number,
               epiloguePlan.epilogueOps,
-              epiloguePlan.epilogueInputRefs.length,
               epiloguePlan.outputDtype,
               epiloguePlan.consumedCount,
             );

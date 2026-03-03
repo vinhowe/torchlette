@@ -591,6 +591,8 @@ class SimpleBufferPool {
     reuseCount: number;
     allocCount: number;
     reuseRate: number;
+    pendingRelease: number;
+    pendingDestroy: number;
   } {
     let totalPooled = 0;
     for (const buffers of this.pool.values()) {

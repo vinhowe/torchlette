@@ -546,7 +546,6 @@ export async function executeLoweredPlan(
       size: number;
       strides: number[];
     },
-    isView = false,
   ) => {
     replayEntries.push({
       kind: "result",
@@ -557,7 +556,6 @@ export async function executeLoweredPlan(
         dtype: bt.dtype,
         size: bt.size,
         strides: bt.strides.slice(),
-        isView,
       },
     });
   };
