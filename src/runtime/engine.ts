@@ -559,7 +559,6 @@ export class RuntimeEngine {
         backend,
         {
           bufferArena: useArena ? template.bufferArena : undefined,
-          enableReplay: true,
         },
       );
 

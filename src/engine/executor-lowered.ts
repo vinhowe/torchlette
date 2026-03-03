@@ -260,11 +260,8 @@ export async function executeLoweredPlan(
   backend: Backend,
   options: {
     bufferArena?: BufferArena;
-    enableReplay?: boolean;
   } = {},
 ): Promise<OptimizedExecutionResult> {
-  const { enableReplay = true } = options;
-
   // Validate plan node count matches
   if (planNodes.length !== loweredPlan.planNodeCount) {
     throw new Error(
@@ -290,13 +287,8 @@ export async function executeLoweredPlan(
   };
 
   const useTopLevelSharedEncoder = backend.name === "webgpu";
-  // Dispatch replay cache: enabled by default for compiled plans where arena
-  // stabilizes buffer identities. Disabled for non-compiled plans (backward,
-  // optimizer) whose external inputs (saved-for-backward tensors, gradient
-  // seeds) may not have stable buffer identities across steps.
-  // Disable globally with TORCHLETTE_DISPATCH_REPLAY=0.
-  const useReplayCache =
-    enableReplay && process.env.TORCHLETTE_DISPATCH_REPLAY !== "0";
+  // Dispatch replay cache: enabled by default. Disable with TORCHLETTE_DISPATCH_REPLAY=0.
+  const useReplayCache = process.env.TORCHLETTE_DISPATCH_REPLAY !== "0";
 
   // =========================================================================
   // FAST PATH: Dispatch Replay
