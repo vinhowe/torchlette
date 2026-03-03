@@ -15,11 +15,9 @@ import type {
 import {
   cachedCreateBindGroup,
   createParamsBuffer,
-  createUniformBuffer,
   params,
   profiledCreateBindGroup,
   releaseParamsBuffer,
-  releaseUniformBuffer,
 } from "../bind-group-cache";
 import { resolveOutputBuffer } from "../buffer-arena";
 import { computeDimChunkLayout } from "../chunked-dispatch";
@@ -90,15 +88,15 @@ export function gather(
       tensorA.buffer,
       tensorIndex.buffer,
     ]);
-    const uniformBuffer = createUniformBuffer(ctx.device, outSize);
+    const uniformBuf = createParamsBuffer(ctx.device, params(outSize));
     const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
       tensorA.buffer,
       tensorIndex.buffer,
       outBuffer,
-      uniformBuffer,
+      uniformBuf,
     ]);
     dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
-    releaseUniformBuffer(uniformBuffer);
+    releaseParamsBuffer(uniformBuf);
     return createTensor(outShape, outBuffer);
   }
 
@@ -228,15 +226,15 @@ export function scatterAdd(
 
   // --- Direct path ---
   if (!chunked) {
-    const uniformBuffer = createUniformBuffer(ctx.device, srcSize);
+    const uniformBuf = createParamsBuffer(ctx.device, params(srcSize));
     const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
       tensorIndex.buffer,
       tensorSrc.buffer,
       outBuffer,
-      uniformBuffer,
+      uniformBuf,
     ]);
     dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
-    releaseUniformBuffer(uniformBuffer);
+    releaseParamsBuffer(uniformBuf);
     return createTensor(outShape, outBuffer);
   }
 
