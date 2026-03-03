@@ -558,8 +558,6 @@ export class RuntimeEngine {
         template.loweredPlan,
         backend,
         {
-          enableEarlyRelease: this.earlyReleaseEnabled,
-          enableVectorization: this.vectorizationEnabled,
           bufferArena: useArena ? template.bufferArena : undefined,
           enableReplay: true,
         },

@@ -40,7 +40,6 @@ import {
   DEFAULT_CONFIG,
   type DType,
   type EpilogueConfig,
-  getKSplitReductionCacheKey,
   getShaderCacheKey,
   getSubgroupSupport,
   getTransposeMode,
@@ -667,7 +666,7 @@ function getOrCreateReductionPipeline(
   return cachedPipeline(
     device,
     reductionPipelineCache,
-    getKSplitReductionCacheKey(kSplitCount, outputDtype),
+    `ksplit_reduce_${kSplitCount}_${outputDtype}`,
     () => generateKSplitReductionShaderTileIR(kSplitCount, outputDtype),
   );
 }

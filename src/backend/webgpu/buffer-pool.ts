@@ -818,13 +818,6 @@ export function getBufferPoolStats(): ReturnType<SimpleBufferPool["stats"]> {
 }
 
 /**
- * Enable or disable buffer pooling.
- */
-export function setBufferPoolEnabled(enabled: boolean): void {
-  bufferPool.setEnabled(enabled);
-}
-
-/**
  * Clear the buffer pool (destroy all pooled buffers).
  */
 export function clearBufferPool(): void {

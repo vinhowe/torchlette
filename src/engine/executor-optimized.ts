@@ -53,8 +53,6 @@ interface OptimizedExecutionOptions {
   enableVectorization?: boolean;
   /** Enable early buffer release based on lifetime analysis */
   enableEarlyRelease?: boolean;
-  /** Flush buffer pool every N nodes to reclaim dead buffers mid-plan (default: 50, 0=disabled) */
-  reclaimInterval?: number;
 }
 
 /**
@@ -120,9 +118,6 @@ export interface FusionAnalysisTemplate {
     outputOrigPos: number;
     dim: number;
   }>;
-
-  /** Original plan positions of graph-rewrite-bypassed nodes (identity casts, etc.). */
-  rewriteBypassedOrigPoss?: number[];
 
   /** Cached lifetime analysis (position-based). */
   lifetimeTemplate?: Array<{
@@ -198,8 +193,8 @@ export async function executePlanOptimized(
     enableFusion = backend.name === "webgpu",
     enableVectorization = true,
     enableEarlyRelease = false,
-    reclaimInterval = DEFAULT_RECLAIM_INTERVAL,
   } = options;
+  const reclaimInterval = DEFAULT_RECLAIM_INTERVAL;
 
   const stats: OptimizedExecutionStats = {
     totalNodes: plan.nodes.length,
@@ -444,12 +439,6 @@ export async function executePlanOptimized(
               outputOrigPos: origIdToPos.get(m.outputNodeId) as number,
               dim: m.dim,
             }))
-          : undefined,
-      rewriteBypassedOrigPoss:
-        analysis.rewriteBypassedIds.size > 0
-          ? [...analysis.rewriteBypassedIds]
-              .map((id) => origIdToPos.get(id) as number)
-              .filter((p) => p !== undefined)
           : undefined,
     };
     fusionAnalysisCache.set(fingerprint, template);
