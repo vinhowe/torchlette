@@ -10,6 +10,52 @@ import {
 import { getInputStorage } from "./op-dispatch";
 
 // ============================================================================
+// Shared epilogue chain helpers (used by matmul-epilogue and reduction-preamble)
+// ============================================================================
+
+/** Epilogue operation descriptor for fused kernel chains. */
+export type EpilogueOp = {
+  kind: string;
+  toDtype?: DType;
+  inputIndex?: number;
+  op?: string;
+};
+
+/**
+ * Find which input of `nextNode` continues a chain from `currentNode`.
+ * Returns the input index (0 or 1) if found, or -1 if the chain breaks.
+ * For commutative ops (add, mul), checks both inputs.
+ */
+export function findChainInput(
+  nextNode: LazyIRNode,
+  currentNodeId: number,
+): number {
+  const primary = nextNode.inputs[0];
+  if (primary.kind === "pending" && primary.node.id === currentNodeId) return 0;
+  if (
+    (nextNode.op === "add" || nextNode.op === "mul") &&
+    nextNode.inputs.length === 2
+  ) {
+    const alt = nextNode.inputs[1];
+    if (alt.kind === "pending" && alt.node.id === currentNodeId) return 1;
+  }
+  return -1;
+}
+
+/** Push the appropriate gelu epilogue op based on the node's approximate payload. */
+export function pushGeluEpilogueOp(
+  nextNode: LazyIRNode,
+  epilogueOps: EpilogueOp[],
+): void {
+  const p = nextNode.payload as { approximate?: string } | undefined;
+  epilogueOps.push(
+    p?.approximate === "tanh"
+      ? { kind: "gelu" }
+      : { kind: "unary", op: "gelu_erf" },
+  );
+}
+
+// ============================================================================
 // Matmul Epilogue Fusion (Phase 1)
 // Detects matmul → cast/bias/activation chains and fuses them into a single
 // dispatchMatmul call with epilogue options, eliminating intermediate buffers.
@@ -80,33 +126,10 @@ export function detectMatmulEpilogueCore(
   for (let i = startIdx + 1; i < nodes.length && chainLength < 4; i++) {
     const nextNode = nodes[i];
 
-    // Check that the candidate node's primary input (input[0]) is a pending ref
-    // to the current chain node
+    // Check that the candidate's input continues the chain from currentNode
     if (nextNode.inputs.length === 0) break;
-    let chainInputIdx = 0;
-    const primaryInput = nextNode.inputs[0];
-    if (
-      primaryInput.kind !== "pending" ||
-      primaryInput.node.id !== currentNode.id
-    ) {
-      // For commutative binary ops, check if the chain continues via inputs[1]
-      if (
-        (nextNode.op === "add" || nextNode.op === "mul") &&
-        nextNode.inputs.length === 2
-      ) {
-        const altInput = nextNode.inputs[1];
-        if (
-          altInput.kind === "pending" &&
-          altInput.node.id === currentNode.id
-        ) {
-          chainInputIdx = 1;
-        } else {
-          break;
-        }
-      } else {
-        break;
-      }
-    }
+    const chainInputIdx = findChainInput(nextNode, currentNode.id);
+    if (chainInputIdx < 0) break;
 
     // Check that the current chain node is NOT externally referenced
     // (must be used only by this next node).
@@ -193,15 +216,7 @@ export function detectMatmulEpilogueCore(
       epilogueOps.push({ kind: "unary", op: nextNode.op });
       matched = true;
     } else if (nextNode.op === "gelu") {
-      const geluPayload = nextNode.payload as
-        | { approximate?: string }
-        | undefined;
-      if (geluPayload?.approximate === "tanh") {
-        epilogueOps.push({ kind: "gelu" });
-      } else {
-        // gelu with approximate="none" uses erf — expressed as unary "gelu_erf"
-        epilogueOps.push({ kind: "unary", op: "gelu_erf" });
-      }
+      pushGeluEpilogueOp(nextNode, epilogueOps);
       matched = true;
     }
 

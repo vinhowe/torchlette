@@ -8,6 +8,11 @@ import type { PreambleChainKernelOp } from "../backend/webgpu/reduction-tile-ir"
 import { shapesEqual } from "../core/shape";
 import { isFusibleOp } from "./fusion-detect";
 import type { LazyIRNode, LazyRef } from "./lazy-types";
+import {
+  type EpilogueOp,
+  findChainInput,
+  pushGeluEpilogueOp,
+} from "./matmul-epilogue";
 import { createStorageHandle } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
 
@@ -318,12 +323,7 @@ export async function executeReductionWithPreamble(
 // ============================================================================
 
 /** Describes a single epilogue op to apply after the reduction. */
-export type ReductionEpilogueOp = {
-  kind: string;
-  toDtype?: DType;
-  inputIndex?: number;
-  op?: string;
-};
+export type ReductionEpilogueOp = EpilogueOp;
 
 /** Format an array of epilogue ops into a profile label fragment (e.g. "cast+add+relu"). */
 export function formatEpilogueLabel(ops: ReductionEpilogueOp[]): string {
@@ -381,31 +381,9 @@ export function detectReductionEpilogue(
     const nextNode = nodes[i];
     if (nextNode.inputs.length === 0) break;
 
-    // Check that the candidate's input is a pending ref to the current chain node
-    let chainInputIdx = 0;
-    const primaryInput = nextNode.inputs[0];
-    if (
-      primaryInput.kind !== "pending" ||
-      primaryInput.node.id !== currentNode.id
-    ) {
-      // For commutative binary ops, check inputs[1]
-      if (
-        (nextNode.op === "add" || nextNode.op === "mul") &&
-        nextNode.inputs.length === 2
-      ) {
-        const altInput = nextNode.inputs[1];
-        if (
-          altInput.kind === "pending" &&
-          altInput.node.id === currentNode.id
-        ) {
-          chainInputIdx = 1;
-        } else {
-          break;
-        }
-      } else {
-        break;
-      }
-    }
+    // Check that the candidate's input continues the chain from currentNode
+    const chainInputIdx = findChainInput(nextNode, currentNode.id);
+    if (chainInputIdx < 0) break;
 
     // Current chain node must have exactly 1 consumer and not be external
     if (externalNodeIds?.has(currentNode.id)) break;
@@ -455,14 +433,7 @@ export function detectReductionEpilogue(
       epilogueOps.push({ kind: "unary", op: nextNode.op });
       matched = true;
     } else if (nextNode.op === "gelu") {
-      const geluPayload = nextNode.payload as
-        | { approximate?: string }
-        | undefined;
-      if (geluPayload?.approximate === "tanh") {
-        epilogueOps.push({ kind: "gelu" });
-      } else {
-        epilogueOps.push({ kind: "unary", op: "gelu_erf" });
-      }
+      pushGeluEpilogueOp(nextNode, epilogueOps);
       matched = true;
     }
 
