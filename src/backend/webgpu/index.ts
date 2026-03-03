@@ -193,7 +193,6 @@ export {
   type TileKernelSpec,
   type UniformType,
 } from "./tile-ir";
-export { replayPinnedBufferSet } from "./webgpu-state";
 
 import { registerBackend } from "../registry";
 // ============================================================================
