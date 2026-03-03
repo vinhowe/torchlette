@@ -467,7 +467,7 @@ function splitCandidatesByComponent(
 
           for (let j = batchStart; j < sameShapePositions.length; j++) {
             const node = candidate.nodes[sameShapePositions[j]];
-            const newCount = addInputKeys(node, seenInputs);
+            addInputKeys(node, seenInputs);
             if (
               seenInputs.size + batchPositions.length + 1 > maxBuffers &&
               batchPositions.length >= 2
