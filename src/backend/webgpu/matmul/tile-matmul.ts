@@ -79,10 +79,6 @@ function applySilu(ctx: KernelContext, x: BlockExpr): BlockExpr {
   return x.div(ctx.const(1.0).add(x.neg().exp()));
 }
 
-function applySigmoid(ctx: KernelContext, x: BlockExpr): BlockExpr {
-  return ctx.const(1.0).div(ctx.const(1.0).add(x.neg().exp()));
-}
-
 function applyUnaryOp(
   ctx: KernelContext,
   opName: string,
@@ -99,7 +95,7 @@ function applyUnaryOp(
     case "silu":
       return applySilu(ctx, x);
     case "sigmoid":
-      return applySigmoid(ctx, x);
+      return ctx.const(1.0).div(ctx.const(1.0).add(x.neg().exp()));
     case "tanh":
       return x.tanh();
     case "neg":
@@ -205,15 +201,6 @@ function applyBlockEpilogue(
   }
 }
 
-function composeBlockOpsEpilogue(
-  epilogue: EpilogueConfig,
-  _outputDtype: DType,
-): BlockOpsPostAccFn {
-  return (ctx, ops, acc, addressing) => {
-    applyBlockEpilogue(ctx, ops, acc, epilogue, addressing);
-  };
-}
-
 // ============================================================================
 // Main Kernel Builder
 // ============================================================================
@@ -275,7 +262,8 @@ export function createTiledMatmulKernel(
   // Build post-accumulate callback from epilogue config.
   let postAcc: BlockOpsPostAccFn | undefined;
   if (epilogue && epilogue.ops.length > 0 && !kSplit) {
-    postAcc = composeBlockOpsEpilogue(epilogue, outputDtype);
+    postAcc = (ctx, ops, acc, addressing) =>
+      applyBlockEpilogue(ctx, ops, acc, epilogue, addressing);
   }
 
   const params: MatmulKernelParams = {

@@ -10,7 +10,6 @@ import {
   setActiveArena,
   setArenaExternalInputBuffers,
 } from "../backend/webgpu";
-import type { GPUBuffer } from "../backend/webgpu/gpu-types";
 import {
   isProfilingEnabled,
   type PlanAnalysis,
