@@ -56,6 +56,23 @@ function hasExternalNode(
   );
 }
 
+/** Extract node ID and materialized status from a ref. */
+function refInfo(
+  ref: LazyRef | undefined,
+): { nodeId: number; isMaterialized: boolean } | null {
+  if (!ref) return null;
+  return {
+    nodeId: ref.kind === "pending" ? ref.node.id : -1,
+    isMaterialized: ref.kind === "materialized",
+  };
+}
+
+/** Find a consumer by op from a list. */
+function findByOp(nodes: LazyIRNode[], op: string): LazyIRNode | null {
+  for (const n of nodes) if (n.op === op) return n;
+  return null;
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -106,10 +123,9 @@ function matchSoftmax(
   if (!subNode || subNode.op !== "sub") return null;
 
   // 3. sub must take (x, maxVal) where x is also the input to max
-  const maxInputRef = maxNode.inputs[0];
-  if (!maxInputRef) return null;
-  const xNodeId = maxInputRef.kind === "pending" ? maxInputRef.node.id : -1;
-  const xIsMaterialized = maxInputRef.kind === "materialized";
+  const xInfo = refInfo(maxNode.inputs[0]);
+  if (!xInfo) return null;
+  const { nodeId: xNodeId, isMaterialized: xIsMaterialized } = xInfo;
 
   if (subNode.inputs.length < 2) return null;
   if (!isPendingFrom(subNode.inputs[1], maxNode.id)) return null;
@@ -128,12 +144,8 @@ function matchSoftmax(
   const expConsumers = consumers.get(expNode.id);
   if (!expConsumers || expConsumers.length !== 2) return null;
 
-  let sumNode: LazyIRNode | null = null;
-  let divNode: LazyIRNode | null = null;
-  for (const c of expConsumers) {
-    if (c.op === "sum") sumNode = c;
-    else if (c.op === "div") divNode = c;
-  }
+  const sumNode = findByOp(expConsumers, "sum");
+  const divNode = findByOp(expConsumers, "div");
   if (!sumNode || !divNode) return null;
 
   // 6. sum must use the same dim with keepdim=true, input from exp
@@ -201,10 +213,9 @@ function matchLogSoftmax(
   if (!sub1Node || sub1Node.op !== "sub") return null;
 
   // 3. Verify sub₁(x, maxVal)
-  const maxInputRef = maxNode.inputs[0];
-  if (!maxInputRef) return null;
-  const xNodeId = maxInputRef.kind === "pending" ? maxInputRef.node.id : -1;
-  const xIsMaterialized = maxInputRef.kind === "materialized";
+  const xInfo = refInfo(maxNode.inputs[0]);
+  if (!xInfo) return null;
+  const { nodeId: xNodeId, isMaterialized: xIsMaterialized } = xInfo;
 
   if (sub1Node.inputs.length < 2) return null;
   if (!isPendingFrom(sub1Node.inputs[1], maxNode.id)) return null;
@@ -219,12 +230,8 @@ function matchLogSoftmax(
   const sub1Consumers = consumers.get(sub1Node.id);
   if (!sub1Consumers || sub1Consumers.length !== 2) return null;
 
-  let expNode: LazyIRNode | null = null;
-  let sub2Node: LazyIRNode | null = null;
-  for (const c of sub1Consumers) {
-    if (c.op === "exp") expNode = c;
-    else if (c.op === "sub") sub2Node = c;
-  }
+  const expNode = findByOp(sub1Consumers, "exp");
+  const sub2Node = findByOp(sub1Consumers, "sub");
   if (!expNode || !sub2Node) return null;
 
   // 5. exp → sum (single consumer)

@@ -8,6 +8,7 @@ import {
   ensureWebGPUMatmulImports,
 } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
+import { buildConsumerCount } from "./segment-executors";
 
 // ============================================================================
 // Shared epilogue chain helpers (used by matmul-epilogue and reduction-preamble)
@@ -245,17 +246,7 @@ export function detectMatmulEpilogue(
   externalNodeIds?: Set<number>,
 ): MatmulEpiloguePlan | null {
   // Build consumer count from full plan for accurate "only one consumer" checks
-  const consumerCount = new Map<number, number>();
-  for (const node of allPlanNodes) {
-    for (const input of node.inputs) {
-      if (input.kind === "pending") {
-        consumerCount.set(
-          input.node.id,
-          (consumerCount.get(input.node.id) ?? 0) + 1,
-        );
-      }
-    }
-  }
+  const consumerCount = buildConsumerCount(allPlanNodes);
   return detectMatmulEpilogueCore(
     nodes,
     startIdx,

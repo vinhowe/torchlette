@@ -19,7 +19,7 @@ import type {
   FusedOutput,
 } from "../backend/webgpu/fusion-types";
 import { shapesEqual } from "../core/shape";
-import type { LazyIRNode, LazyRef } from "./lazy";
+import type { LazyIRNode, LazyRef } from "./lazy-types";
 
 /**
  * Ops that can be fused into elementwise kernels.
