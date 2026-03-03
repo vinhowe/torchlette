@@ -636,11 +636,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
           reductionConsumerCount,
         );
         if (reductionPlan) {
-          const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${
-            reductionPlan.preambleChain
-              ? reductionPlan.preambleChain.map((n) => n.op).join("+")
-              : reductionPlan.op
-          }`;
+          const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${reductionPlan.preambleChain.map((n) => n.op).join("+")}`;
           await withProfileContext(rpLabel, node.module, () =>
             executeReductionWithPreamble(reductionPlan, backend),
           );
@@ -649,27 +645,16 @@ export async function executeSequentialSegmentWithEarlyRelease(
           advanceConsumed(nodeIdx, consumed);
 
           if (loweredPlanBuilder && nodeIdToFinalPos) {
-            if (
-              reductionPlan.preambleChain &&
-              reductionPlan.chainOps &&
-              reductionPlan.chainInputDtypes
-            ) {
-              loweredPlanBuilder.recordReductionPreamble(
-                nodeIdToFinalPos.get(node.id) as number,
-                nodeIdToFinalPos.get(reductionPlan.reductionNode.id) as number,
-                reductionPlan.preambleChain.map(
-                  (n) => nodeIdToFinalPos.get(n.id) as number,
-                ),
-                reductionPlan.chainOps,
-                reductionPlan.chainInputDtypes,
-                reductionPlan.consumedCount,
-              );
-            } else {
-              loweredPlanBuilder.recordReductionPreamble(
-                nodeIdToFinalPos.get(node.id) as number,
-                nodeIdToFinalPos.get(reductionPlan.reductionNode.id) as number,
-              );
-            }
+            loweredPlanBuilder.recordReductionPreamble(
+              nodeIdToFinalPos.get(node.id) as number,
+              nodeIdToFinalPos.get(reductionPlan.reductionNode.id) as number,
+              reductionPlan.preambleChain.map(
+                (n) => nodeIdToFinalPos.get(n.id) as number,
+              ),
+              reductionPlan.chainOps,
+              reductionPlan.chainInputDtypes,
+              reductionPlan.consumedCount,
+            );
           }
 
           nodeIdx += consumed - 1;

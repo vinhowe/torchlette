@@ -30,23 +30,18 @@ export interface ReductionPreamblePlan {
   preambleNode: LazyIRNode;
   /** The sum or mean reduction node */
   reductionNode: LazyIRNode;
-  /** The first elementwise op name (e.g., "mul", "exp", "add") */
-  op: string;
-  /** Number of inputs to the first elementwise op (1=unary, 2=binary) */
-  arity: number;
   /** Whether the reduction is a mean (divide by count after sum) */
   isMean: boolean;
   /** Total nodes consumed (chain length + 1 for reduction) */
   consumedCount: number;
-  // Multi-op chain fields (set only for chains with length > 1):
   /** All preamble nodes in chain order */
-  preambleChain?: LazyIRNode[];
+  preambleChain: LazyIRNode[];
   /** Kernel op descriptors for the chain */
-  chainOps?: PreambleChainKernelOp[];
+  chainOps: PreambleChainKernelOp[];
   /** External input refs for the entire chain */
-  chainInputRefs?: LazyRef[];
+  chainInputRefs: LazyRef[];
   /** Dtypes for each external input */
-  chainInputDtypes?: DType[];
+  chainInputDtypes: DType[];
 }
 
 /**
@@ -173,10 +168,12 @@ export function detectReductionPreamble(
     return {
       preambleNode: firstNode,
       reductionNode,
-      op: firstNode.op,
-      arity: firstNode.inputs.length,
       isMean: reductionNode.op === "mean",
       consumedCount: 2,
+      preambleChain: [firstNode],
+      chainOps: [{ op: firstNode.op, arity: firstNode.inputs.length }],
+      chainInputRefs: [...firstNode.inputs],
+      chainInputDtypes: firstNode.inputs.map(getRefDtype),
     };
   }
 
@@ -232,8 +229,6 @@ export function detectReductionPreamble(
   return {
     preambleNode: firstNode,
     reductionNode,
-    op: firstNode.op,
-    arity: firstNode.inputs.length,
     isMean: reductionNode.op === "mean",
     consumedCount: chain.length + 1,
     preambleChain: chain,
@@ -254,39 +249,17 @@ export async function executeReductionWithPreamble(
   // Get sum options from the reduction node's payload
   const payload = plan.reductionNode.payload as ReductionPayload | undefined;
 
-  let resultTensor: BackendTensor;
-
   const { sumDimWithPreambleChain } = await import("../backend/webgpu/index");
-  if (
-    plan.preambleChain &&
-    plan.chainOps &&
-    plan.chainInputRefs &&
-    plan.chainInputDtypes
-  ) {
-    // Multi-op chain path
-    const inputStorages = plan.chainInputRefs.map((ref) =>
-      getInputStorage(ref, backend),
-    );
-    const inputTensors = inputStorages.map((s) => s.backendTensor);
-    resultTensor = sumDimWithPreambleChain(
-      inputTensors,
-      plan.chainOps,
-      plan.chainInputDtypes,
-      payload ?? {},
-    );
-  } else {
-    // Single-op path
-    const elemInputStorages = plan.preambleNode.inputs.map((ref) =>
-      getInputStorage(ref, backend),
-    );
-    const elemInputTensors = elemInputStorages.map((s) => s.backendTensor);
-    resultTensor = sumDimWithPreambleChain(
-      elemInputTensors,
-      [{ op: plan.op, arity: elemInputTensors.length }],
-      [],
-      payload ?? {},
-    );
-  }
+  const inputStorages = plan.chainInputRefs.map((ref) =>
+    getInputStorage(ref, backend),
+  );
+  const inputTensors = inputStorages.map((s) => s.backendTensor);
+  let resultTensor: BackendTensor = sumDimWithPreambleChain(
+    inputTensors,
+    plan.chainOps,
+    plan.chainInputDtypes,
+    payload ?? {},
+  );
 
   // If this is a mean, divide by reduction size
   if (plan.isMean) {
@@ -595,36 +568,6 @@ export function detectReductionFusion(
   );
   if (!epiloguePlan) return null;
 
-  // Build the preamble ops and input refs
-  let preambleOps: PreambleChainKernelOp[];
-  let preambleInputRefs: LazyRef[];
-  let preambleInputDtypes: DType[];
-  let preambleChain: LazyIRNode[];
-
-  if (
-    preamblePlan.preambleChain &&
-    preamblePlan.chainOps &&
-    preamblePlan.chainInputRefs &&
-    preamblePlan.chainInputDtypes
-  ) {
-    // Multi-op chain
-    preambleOps = preamblePlan.chainOps;
-    preambleInputRefs = preamblePlan.chainInputRefs;
-    preambleInputDtypes = preamblePlan.chainInputDtypes;
-    preambleChain = preamblePlan.preambleChain;
-  } else {
-    // Single-op preamble — wrap into chain format
-    preambleOps = [
-      {
-        op: getChainOpName(preamblePlan.preambleNode),
-        arity: preamblePlan.arity,
-      },
-    ];
-    preambleInputRefs = [...preamblePlan.preambleNode.inputs];
-    preambleInputDtypes = preamblePlan.preambleNode.inputs.map(getRefDtype);
-    preambleChain = [preamblePlan.preambleNode];
-  }
-
   // Collect epilogue chain nodes
   const epilogueChain: LazyIRNode[] = [];
   for (let i = 1; i < epiloguePlan.consumedCount; i++) {
@@ -632,14 +575,14 @@ export function detectReductionFusion(
   }
 
   return {
-    preambleChain,
+    preambleChain: preamblePlan.preambleChain,
     reductionNode: preamblePlan.reductionNode,
     epilogueChain,
     outputNode: epiloguePlan.outputNode,
     isMean: preamblePlan.isMean,
-    preambleOps,
-    preambleInputRefs,
-    preambleInputDtypes,
+    preambleOps: preamblePlan.chainOps,
+    preambleInputRefs: preamblePlan.chainInputRefs,
+    preambleInputDtypes: preamblePlan.chainInputDtypes,
     epilogueOps: epiloguePlan.epilogueOps,
     epilogueInputRefs: epiloguePlan.epilogueInputRefs,
     outputDtype: epiloguePlan.outputDtype,
