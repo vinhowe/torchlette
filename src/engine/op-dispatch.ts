@@ -238,9 +238,7 @@ function executeUnaryOp(
   const input = backendInputs[0];
   switch (node.op) {
     case "sqrt":
-      return backend.ops.sqrt(input);
     case "relu":
-      return backend.ops.relu(input);
     case "exp":
     case "log":
     case "neg":
@@ -368,97 +366,56 @@ function executeShapeOp(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Reduction op dispatch table
+// ---------------------------------------------------------------------------
+
+type ReductionDesc = {
+  /** Number of backendInputs to pass individually, or "all" to pass the array itself. */
+  arity: number | "all";
+  /** Whether payload is required, optional, or not passed. */
+  payload: "required" | "optional" | "none";
+};
+
+const REDUCTION_TABLE: Record<string, ReductionDesc> = {
+  sum: { arity: 1, payload: "optional" },
+  max: { arity: 1, payload: "optional" },
+  min: { arity: 1, payload: "optional" },
+  mean: { arity: 1, payload: "optional" },
+  argmax: { arity: 1, payload: "required" },
+  argmin: { arity: 1, payload: "required" },
+  conv2d: { arity: 3, payload: "optional" },
+  gather: { arity: 2, payload: "required" },
+  scatterAdd: { arity: 3, payload: "required" },
+  cat: { arity: "all", payload: "required" },
+  gt: { arity: 2, payload: "none" },
+  lt: { arity: 2, payload: "none" },
+  ge: { arity: 2, payload: "none" },
+  le: { arity: 2, payload: "none" },
+  eq: { arity: 2, payload: "none" },
+  ne: { arity: 2, payload: "none" },
+  where: { arity: 3, payload: "none" },
+};
+
 function executeReductionOp(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
 ): BackendTensor {
-  switch (node.op) {
-    case "sum":
-      return backend.ops.sum(
-        backendInputs[0],
-        getPayload<{ dim?: number | number[] | null; keepdim?: boolean }>(node),
-      );
-    case "max":
-      return backend.ops.max(
-        backendInputs[0],
-        getPayload<{ dim?: number | number[] | null; keepdim?: boolean }>(node),
-      );
-    case "min":
-      assertOpSupported("min", backend.ops.min);
-      return backend.ops.min(
-        backendInputs[0],
-        getPayload<{ dim?: number | number[] | null; keepdim?: boolean }>(node),
-      );
-    case "mean":
-      return backend.ops.mean(
-        backendInputs[0],
-        getPayload<{ dim?: number | number[] | null; keepdim?: boolean }>(node),
-      );
-    case "argmax": {
-      assertOpSupported("argmax", backend.ops.argmax);
-      return backend.ops.argmax(
-        backendInputs[0],
-        requirePayload<{ dim: number; keepdim?: boolean }>(node),
-      );
-    }
-    case "argmin": {
-      assertOpSupported("argmin", backend.ops.argmin);
-      return backend.ops.argmin(
-        backendInputs[0],
-        requirePayload<{ dim: number; keepdim?: boolean }>(node),
-      );
-    }
-    case "conv2d": {
-      assertOpSupported("conv2d", backend.ops.conv2d);
-      const payload = getPayload<{
-        stride?: number | [number, number];
-        padding?: number | [number, number];
-      }>(node);
-      return backend.ops.conv2d(
-        backendInputs[0],
-        backendInputs[1],
-        backendInputs[2],
-        payload,
-      );
-    }
-    case "gather": {
-      const payload = requirePayload<{ dim: number }>(node);
-      return backend.ops.gather(backendInputs[0], backendInputs[1], payload);
-    }
-    case "scatterAdd": {
-      const payload = requirePayload<{ dim: number }>(node);
-      return backend.ops.scatterAdd(
-        backendInputs[0],
-        backendInputs[1],
-        backendInputs[2],
-        payload,
-      );
-    }
-    case "cat": {
-      const payload = requirePayload<{ dim: number }>(node);
-      assertOpSupported("cat", backend.ops.cat);
-      return backend.ops.cat(backendInputs, payload);
-    }
-    case "gt":
-    case "lt":
-    case "ge":
-    case "le":
-    case "eq":
-    case "ne": {
-      const fn = backend.ops[node.op as "gt"];
-      assertOpSupported(node.op, fn);
-      return fn(backendInputs[0], backendInputs[1]);
-    }
-    case "where":
-      return backend.ops.where(
-        backendInputs[0],
-        backendInputs[1],
-        backendInputs[2],
-      );
-    default:
-      throw new Error(`Unknown reduction op: ${node.op}`);
-  }
+  const desc = REDUCTION_TABLE[node.op];
+  if (!desc) throw new Error(`Unknown reduction op: ${node.op}`);
+
+  const fn = backend.ops[node.op as keyof Backend["ops"]] as
+    | AnyOpFn
+    | undefined;
+  assertOpSupported(node.op, fn);
+
+  const args: unknown[] =
+    desc.arity === "all" ? [backendInputs] : backendInputs.slice(0, desc.arity);
+  if (desc.payload === "required") args.push(requirePayload(node));
+  else if (desc.payload === "optional") args.push(getPayload(node));
+
+  return fn(...args) as BackendTensor;
 }
 
 function executeMutationOp(
