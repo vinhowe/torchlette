@@ -354,7 +354,6 @@ function binaryChunked(
  */
 export function dispatchUnary(
   opKey: string,
-  _expr: string,
   a: WebGPUTensor,
   options?: { outBuffer?: GPUBuffer },
 ): WebGPUTensor {

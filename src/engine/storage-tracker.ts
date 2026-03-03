@@ -144,20 +144,8 @@ class StorageTracker {
       return 0;
     }
 
-    const neededByViews = this.findNeededByViews();
-
-    // Collect storages to destroy (unreachable and not needed by views)
-    const toDestroy: number[] = [];
-    for (const [id] of this.allStorages) {
-      if (!this.externallyReachable.has(id) && !neededByViews.has(id)) {
-        toDestroy.push(id);
-      }
-    }
-
-    // Clear the recently unreachable set since we've scanned everything
     this.recentlyUnreachable.clear();
-
-    return this.destroyStorageIds(toDestroy);
+    return this._destroyUnreachableFrom();
   }
 
   /**
@@ -173,22 +161,21 @@ class StorageTracker {
    * This is a scoped version of destroyUnreachable() that only affects
    * storages created within a specific time window (e.g., during backward pass
    * gradient computation). Pre-existing unreachable storages are left alone.
-   * Returns the number of storages destroyed.
    */
   destroyUnreachableSince(sinceId: number): number {
-    const neededByViews = this.findNeededByViews();
+    return this._destroyUnreachableFrom(sinceId);
+  }
 
+  /** Collect and destroy unreachable storages, optionally scoped to ids >= sinceId. */
+  private _destroyUnreachableFrom(sinceId?: number): number {
+    const neededByViews = this.findNeededByViews();
     const toDestroy: number[] = [];
     for (const [id] of this.allStorages) {
-      if (
-        id >= sinceId &&
-        !this.externallyReachable.has(id) &&
-        !neededByViews.has(id)
-      ) {
+      if (sinceId !== undefined && id < sinceId) continue;
+      if (!this.externallyReachable.has(id) && !neededByViews.has(id)) {
         toDestroy.push(id);
       }
     }
-
     return this.destroyStorageIds(toDestroy);
   }
 

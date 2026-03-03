@@ -41,7 +41,6 @@ import { dtypeBytes, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 interface CachedPipeline {
   pipeline: GPUComputePipeline;
   kernel: GeneratedKernel;
-  createdAt: number;
 }
 
 /**
@@ -86,27 +85,13 @@ export class FusionKernelCache {
       });
     }
 
-    // Cache it
+    // Cache it (Map preserves insertion order — first key is oldest)
     if (this.cache.size >= this.maxSize) {
-      // Evict oldest entry
-      let oldest: string | null = null;
-      let oldestTime = Infinity;
-      for (const [key, entry] of this.cache) {
-        if (entry.createdAt < oldestTime) {
-          oldestTime = entry.createdAt;
-          oldest = key;
-        }
-      }
-      if (oldest) {
-        this.cache.delete(oldest);
-      }
+      const oldest = this.cache.keys().next().value;
+      if (oldest !== undefined) this.cache.delete(oldest);
     }
 
-    this.cache.set(meta.cacheKey, {
-      pipeline,
-      kernel,
-      createdAt: Date.now(),
-    });
+    this.cache.set(meta.cacheKey, { pipeline, kernel });
 
     return { pipeline, kernel };
   }

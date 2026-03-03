@@ -80,9 +80,6 @@ export type LazyOpCode =
   | "fusedRMSNormBackwardGradX"
   | "fusedRMSNormBackwardGradWeight";
 
-/** GELU approximation type matching PyTorch's nn.GELU */
-export type GeluApproximate = "none" | "tanh";
-
 export interface StorageHandle {
   id: number;
   device: DeviceKind;
@@ -168,6 +165,4 @@ export interface ExecutionPlan {
 export interface ExecutePlanOptions {
   /** Enable early buffer release based on lifetime analysis */
   enableEarlyRelease?: boolean;
-  /** Enable segmented execution at checkpoint boundaries */
-  enableCheckpointSegmentation?: boolean;
 }
