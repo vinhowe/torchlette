@@ -101,16 +101,6 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     needsVectorConstants: true,
     category: "activation",
   },
-  gelu_tanh: {
-    // Alias for gelu (tanh approximation)
-    expr: (a: string, _zero = "0.0", one = "1.0") =>
-      `(${a} * 0.5 * (1.0 + tanh(clamp(0.7978845608 * (${a} + 0.044715 * ${a} * ${a} * ${a}), -10.0 * ${one}, 10.0 * ${one}))))`,
-    arity: 1,
-    fusible: true,
-    vectorizable: true,
-    needsVectorConstants: true,
-    category: "activation",
-  },
   gelu_erf: {
     // GELU with exact erf formula: x * 0.5 * (1 + erf(x / sqrt(2)))
     // Uses Abramowitz and Stegun polynomial approximation for erf
@@ -412,6 +402,9 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     category: "cast",
   },
 };
+
+// gelu_tanh is an alias for gelu (both use tanh approximation)
+OP_REGISTRY.gelu_tanh = OP_REGISTRY.gelu;
 
 // ============================================================================
 // Helper Functions (only those used in production)

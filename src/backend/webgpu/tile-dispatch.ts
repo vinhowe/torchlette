@@ -24,6 +24,7 @@ import {
   dispatchComputePass,
   getPipeline,
 } from "./index";
+import { dtypeBytes } from "./shape-utils";
 import type { AutotuneOptions } from "./tile-autotune";
 import { autotuneTileKernel, getDefaultConfig } from "./tile-autotune";
 import { compileTileKernel } from "./tile-compiler";
@@ -48,11 +49,6 @@ export interface ChunkedBindingConfig {
   maxBytesPerElement: number;
   /** Override elements-per-alignment (for cast with mixed dtypes). */
   elementsPerAlignment?: number;
-}
-
-/** Bytes per element for a tile-IR DataType. */
-function dataTypeBpe(dt: DataType): number {
-  return dt === "f16" ? 2 : 4;
 }
 
 // ============================================================================
@@ -320,7 +316,7 @@ export function createTileKernelDispatcher(
             } else {
               const bpe =
                 chunking.bytesPerElement?.[name] ??
-                dataTypeBpe(spec.bindings[name].type);
+                dtypeBytes(spec.bindings[name].type);
               entries.push({
                 binding: idx,
                 resource: {
