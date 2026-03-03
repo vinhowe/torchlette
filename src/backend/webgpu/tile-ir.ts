@@ -797,21 +797,24 @@ function evalUnaryConst(op: UnaryOp, x: number): number | null {
  * - A new ConstNode with id = -1 for constant folding (caller assigns real id)
  * - null if no optimization applies
  */
+/** Create a folded constant node (id=-1, not tracked by CSE). */
+function constFolded(value: number, dataType: DataType): ConstNode {
+  return {
+    kind: "const",
+    value,
+    valueType: "scalar",
+    dataType,
+    id: -1,
+  } as ConstNode;
+}
+
 function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
   if (partial.kind === "binary") {
     const { op, lhs, rhs, dataType } = partial as Omit<BinaryNode, "id">;
     // Constant folding: both operands are const
     if (lhs.kind === "const" && rhs.kind === "const") {
       const result = evalBinaryConst(op, lhs.value, rhs.value);
-      if (result !== null) {
-        return {
-          kind: "const",
-          value: result,
-          valueType: "scalar",
-          dataType,
-          id: -1,
-        } as ConstNode;
-      }
+      if (result !== null) return constFolded(result, dataType);
     }
     // Algebraic simplifications
     switch (op) {
@@ -831,13 +834,7 @@ function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
         break;
       case "and":
         if (isConstVal(rhs, 0) || isConstVal(lhs, 0))
-          return {
-            kind: "const",
-            value: 0,
-            valueType: "scalar",
-            dataType: "u32",
-            id: -1,
-          } as ConstNode;
+          return constFolded(0, "u32");
         break;
       case "or":
         if (isConstVal(rhs, 0)) return lhs;
@@ -856,15 +853,7 @@ function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
     // Constant folding
     if (input.kind === "const") {
       const result = evalUnaryConst(op, input.value);
-      if (result !== null) {
-        return {
-          kind: "const",
-          value: result,
-          valueType: "scalar",
-          dataType,
-          id: -1,
-        } as ConstNode;
-      }
+      if (result !== null) return constFolded(result, dataType);
     }
     // neg(neg(x)) → x
     if (op === "neg" && input.kind === "unary" && input.op === "neg") {
@@ -899,28 +888,14 @@ function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
           result = l >= r;
           break;
       }
-      return {
-        kind: "const",
-        value: result ? 1 : 0,
-        valueType: "scalar",
-        dataType: "u32",
-        id: -1,
-      } as ConstNode;
+      return constFolded(result ? 1 : 0, "u32");
     }
     return null;
   }
 
   if (partial.kind === "cast") {
     const { input, targetType } = partial as Omit<CastNode, "id">;
-    if (input.kind === "const") {
-      return {
-        kind: "const",
-        value: input.value,
-        valueType: "scalar",
-        dataType: targetType,
-        id: -1,
-      } as ConstNode;
-    }
+    if (input.kind === "const") return constFolded(input.value, targetType);
     return null;
   }
 

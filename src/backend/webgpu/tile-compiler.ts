@@ -55,6 +55,26 @@ function findElementwiseUniform(spec: TileKernelSpec): string | null {
 // WGSL Expression Emission
 // ============================================================================
 
+/** Binary ops → infix WGSL operator. Function-style ops (min, max, pow) use op name directly. */
+const BINARY_INFIX: Record<string, string> = {
+  add: "+",
+  sub: "-",
+  mul: "*",
+  div: "/",
+  mod: "%",
+  and: "&",
+  or: "|",
+  xor: "^",
+  shr: ">>",
+  shl: "<<",
+};
+
+/** Unary ops with prefix syntax. */
+const UNARY_PREFIX: Record<string, string> = { neg: "-", not: "!" };
+
+/** Unary ops where the WGSL function name differs from the op name. */
+const UNARY_FN: Record<string, string> = { rsqrt: "inverseSqrt" };
+
 type BindingMap = Map<number, string>;
 
 /**
@@ -96,69 +116,16 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
     case "binary": {
       const lhs = exprFor(node.lhs, bindings);
       const rhs = exprFor(node.rhs, bindings);
-      switch (node.op) {
-        case "add":
-          return `(${lhs} + ${rhs})`;
-        case "sub":
-          return `(${lhs} - ${rhs})`;
-        case "mul":
-          return `(${lhs} * ${rhs})`;
-        case "div":
-          return `(${lhs} / ${rhs})`;
-        case "mod":
-          return `(${lhs} % ${rhs})`;
-        case "and":
-          return `(${lhs} & ${rhs})`;
-        case "or":
-          return `(${lhs} | ${rhs})`;
-        case "xor":
-          return `(${lhs} ^ ${rhs})`;
-        case "shr":
-          return `(${lhs} >> ${rhs})`;
-        case "shl":
-          return `(${lhs} << ${rhs})`;
-        case "min":
-          return `min(${lhs}, ${rhs})`;
-        case "max":
-          return `max(${lhs}, ${rhs})`;
-        case "pow":
-          return `pow(${lhs}, ${rhs})`;
-      }
-      break;
+      const infixOp = BINARY_INFIX[node.op];
+      if (infixOp) return `(${lhs} ${infixOp} ${rhs})`;
+      return `${node.op}(${lhs}, ${rhs})`; // min, max, pow
     }
     case "unary": {
       const input = exprFor(node.input, bindings);
-      switch (node.op) {
-        case "neg":
-          return `(-${input})`;
-        case "rsqrt":
-          return `inverseSqrt(${input})`;
-        case "tanh":
-          return `tanh(${input})`;
-        case "floor":
-          return `floor(${input})`;
-        case "ceil":
-          return `ceil(${input})`;
-        case "not":
-          return `!(${input})`;
-        default: {
-          const fn = (
-            {
-              exp: "exp",
-              log: "log",
-              abs: "abs",
-              sqrt: "sqrt",
-              sin: "sin",
-              cos: "cos",
-              round: "round",
-              sign: "sign",
-              exp2: "exp2",
-              log2: "log2",
-            } as const
-          )[node.op];
-          return `${fn}(${input})`;
-        }
-      }
+      const prefix = UNARY_PREFIX[node.op];
+      if (prefix) return `${prefix}(${input})`;
+      const fn = UNARY_FN[node.op] ?? node.op;
+      return `${fn}(${input})`;
     }
     case "cast": {
       const input = exprFor(node.input, bindings);

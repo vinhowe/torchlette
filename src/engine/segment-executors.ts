@@ -46,6 +46,7 @@ import {
   executeReductionWithEpilogue,
   executeReductionWithFusion,
   executeReductionWithPreamble,
+  formatEpilogueLabel,
 } from "./reduction-preamble";
 import { releaseDeadTensors } from "./storage-tracker";
 
@@ -608,9 +609,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
         if (fusionPlan) {
           const fusionLabel = `${fusionPlan.isMean ? "mean" : "sum"}+${fusionPlan.preambleChain
             .map((n) => n.op)
-            .join(
-              "+",
-            )}+${fusionPlan.epilogueOps.map((o) => (o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind)).join("+")}`;
+            .join("+")}+${formatEpilogueLabel(fusionPlan.epilogueOps)}`;
           await withProfileContext(fusionLabel, node.module, () =>
             executeReductionWithFusion(fusionPlan, backend),
           );
@@ -704,18 +703,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
           externalNodeIds,
         );
         if (epiloguePlan) {
-          const reLabel =
-            node.op +
-            "+" +
-            epiloguePlan.epilogueOps
-              .map((o) =>
-                o.kind === "binary"
-                  ? o.op
-                  : o.kind === "cast"
-                    ? "cast"
-                    : o.op || o.kind,
-              )
-              .join("+");
+          const reLabel = `${node.op}+${formatEpilogueLabel(epiloguePlan.epilogueOps)}`;
           await withProfileContext(reLabel, node.module, () =>
             executeReductionWithEpilogue(epiloguePlan, backend),
           );

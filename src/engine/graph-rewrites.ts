@@ -17,6 +17,7 @@
 
 import type { DType } from "../backend/types";
 import type { LazyIRNode, LazyRef } from "./lazy-types";
+import { isViewOp } from "./lowered-plan";
 
 /**
  * Context provided to rewrite passes.
@@ -79,15 +80,6 @@ function eliminateIdentityCasts(
   }
 }
 
-/** Ops that produce non-contiguous output (views). All other ops produce contiguous output. */
-const VIEW_OPS = new Set([
-  "reshape",
-  "transpose",
-  "permute",
-  "expand",
-  "narrow",
-]);
-
 /**
  * Eliminate redundant contiguous: contiguous(x) → x when x always produces contiguous output.
  *
@@ -109,7 +101,7 @@ function eliminateRedundantContiguous(
 
     const inputNode = inputRef.node;
     // If input op always produces contiguous output, this contiguous is redundant
-    if (!VIEW_OPS.has(inputNode.op)) {
+    if (!isViewOp(inputNode.op)) {
       redirectConsumers(node, inputRef, ctx);
       bypassed.add(node.id);
     }
