@@ -707,88 +707,50 @@ function isConstVal(node: IRNode, val: number): boolean {
   return node.kind === "const" && node.value === val;
 }
 
+/** Return r if finite, else null. */
+const F = (r: number): number | null => (Number.isFinite(r) ? r : null);
+
+const BINARY_EVAL: Record<string, (a: number, b: number) => number | null> = {
+  add: (a, b) => F(a + b),
+  sub: (a, b) => F(a - b),
+  mul: (a, b) => F(a * b),
+  div: (a, b) => (b !== 0 ? F(a / b) : null),
+  mod: (a, b) => (b !== 0 ? a % b : null),
+  min: (a, b) => Math.min(a, b),
+  max: (a, b) => Math.max(a, b),
+  pow: (a, b) => F(a ** b),
+  and: (a, b) => ((a >>> 0) & (b >>> 0)) >>> 0,
+  or: (a, b) => ((a >>> 0) | (b >>> 0)) >>> 0,
+  xor: (a, b) => ((a >>> 0) ^ (b >>> 0)) >>> 0,
+  shr: (a, b) => (a >>> 0) >>> (b >>> 0),
+  shl: (a, b) => ((a >>> 0) << (b >>> 0)) >>> 0,
+};
+
 function evalBinaryConst(op: BinaryOp, a: number, b: number): number | null {
-  switch (op) {
-    case "add": {
-      const r = a + b;
-      return Number.isFinite(r) ? r : null;
-    }
-    case "sub": {
-      const r = a - b;
-      return Number.isFinite(r) ? r : null;
-    }
-    case "mul": {
-      const r = a * b;
-      return Number.isFinite(r) ? r : null;
-    }
-    case "div":
-      return b !== 0 && Number.isFinite(a / b) ? a / b : null;
-    case "mod":
-      return b !== 0 ? a % b : null;
-    case "min":
-      return Math.min(a, b);
-    case "max":
-      return Math.max(a, b);
-    case "pow": {
-      const r = a ** b;
-      return Number.isFinite(r) ? r : null;
-    }
-    case "and":
-      return ((a >>> 0) & (b >>> 0)) >>> 0;
-    case "or":
-      return ((a >>> 0) | (b >>> 0)) >>> 0;
-    case "xor":
-      return ((a >>> 0) ^ (b >>> 0)) >>> 0;
-    case "shr":
-      return (a >>> 0) >>> (b >>> 0);
-    case "shl":
-      return ((a >>> 0) << (b >>> 0)) >>> 0;
-    default:
-      return null;
-  }
+  return BINARY_EVAL[op]?.(a, b) ?? null;
 }
 
+const UNARY_EVAL: Record<string, (x: number) => number | null> = {
+  neg: (x) => -x,
+  abs: (x) => Math.abs(x),
+  exp: (x) => F(Math.exp(x)),
+  log: (x) => (x > 0 ? Math.log(x) : null),
+  sqrt: (x) => (x >= 0 ? Math.sqrt(x) : null),
+  rsqrt: (x) => (x > 0 ? 1 / Math.sqrt(x) : null),
+  floor: (x) => Math.floor(x),
+  ceil: (x) => Math.ceil(x),
+  sin: (x) => Math.sin(x),
+  cos: (x) => Math.cos(x),
+  tanh: (x) => Math.tanh(x),
+  round: (x) => Math.round(x),
+  sign: (x) => Math.sign(x),
+  not: (x) => (x ? 0 : 1),
+  exp2: (x) => F(2 ** x),
+  log2: (x) => (x > 0 ? Math.log2(x) : null),
+};
+
 function evalUnaryConst(op: UnaryOp, x: number): number | null {
-  switch (op) {
-    case "neg":
-      return -x;
-    case "abs":
-      return Math.abs(x);
-    case "exp": {
-      const r = Math.exp(x);
-      return Number.isFinite(r) ? r : null;
-    }
-    case "log":
-      return x > 0 ? Math.log(x) : null;
-    case "sqrt":
-      return x >= 0 ? Math.sqrt(x) : null;
-    case "rsqrt":
-      return x > 0 ? 1 / Math.sqrt(x) : null;
-    case "floor":
-      return Math.floor(x);
-    case "ceil":
-      return Math.ceil(x);
-    case "sin":
-      return Math.sin(x);
-    case "cos":
-      return Math.cos(x);
-    case "tanh":
-      return Math.tanh(x);
-    case "round":
-      return Math.round(x);
-    case "sign":
-      return Math.sign(x);
-    case "not":
-      return x ? 0 : 1;
-    case "exp2": {
-      const r = 2 ** x;
-      return Number.isFinite(r) ? r : null;
-    }
-    case "log2":
-      return x > 0 ? Math.log2(x) : null;
-    default:
-      return null;
-  }
+  return UNARY_EVAL[op]?.(x) ?? null;
 }
 
 /**
