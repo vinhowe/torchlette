@@ -1208,24 +1208,6 @@ export function segmentPlanForExecution(
 }
 
 /**
- * Check if a plan has any fusible opportunities (consecutive fusible ops).
- */
-export function hasFusionOpportunities(nodes: LazyIRNode[]): boolean {
-  let consecutiveFusible = 0;
-  for (const node of nodes) {
-    if (isFusibleOp(node.op)) {
-      consecutiveFusible++;
-      if (consecutiveFusible >= 2) {
-        return true;
-      }
-    } else {
-      consecutiveFusible = 0;
-    }
-  }
-  return false;
-}
-
-/**
  * Relaxed pre-check: returns true if the plan has 2+ fusible ops anywhere
  * (not necessarily consecutive). Used as a cheaper gate before reordering.
  */

@@ -13,7 +13,6 @@ import { executePlanOptimized } from "../src/engine/executor-optimized";
 import {
   detectFusionGroups,
   groupToRecipe,
-  hasFusionOpportunities,
   hasFusionPotential,
   isFusibleOp,
   reorderPlanForFusion,
@@ -160,59 +159,6 @@ describe("§15 Fusion Detection", () => {
       expect(result.groups.length).toBe(0);
       expect(result.stats.fusibleNodes).toBe(1);
       expect(result.stats.nodesInGroups).toBe(0);
-    });
-  });
-
-  describe("hasFusionOpportunities", () => {
-    it("returns true when 2+ consecutive fusible ops exist", () => {
-      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
-        values: [1],
-      });
-      const add = createLazyIRNode(
-        "add",
-        [createPendingRef(a), createPendingRef(a)],
-        [4],
-        "f32",
-        "cpu",
-      );
-      const mul = createLazyIRNode(
-        "mul",
-        [createPendingRef(add), createPendingRef(a)],
-        [4],
-        "f32",
-        "cpu",
-      );
-
-      expect(hasFusionOpportunities([a, add, mul])).toBe(true);
-    });
-
-    it("returns false when no consecutive fusible ops", () => {
-      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
-        values: [1],
-      });
-      const add = createLazyIRNode(
-        "add",
-        [createPendingRef(a), createPendingRef(a)],
-        [4],
-        "f32",
-        "cpu",
-      );
-      const sum = createLazyIRNode(
-        "sum",
-        [createPendingRef(add)],
-        [],
-        "f32",
-        "cpu",
-      );
-      const sqrt = createLazyIRNode(
-        "sqrt",
-        [createPendingRef(sum)],
-        [],
-        "f32",
-        "cpu",
-      );
-
-      expect(hasFusionOpportunities([a, add, sum, sqrt])).toBe(false);
     });
   });
 
@@ -844,8 +790,6 @@ describe("§15 hasFusionPotential", () => {
 
     // add and mul are NOT consecutive (sum breaks them), but hasFusionPotential returns true
     expect(hasFusionPotential([a, add, sum, mul])).toBe(true);
-    // hasFusionOpportunities requires consecutive — returns false
-    expect(hasFusionOpportunities([a, add, sum, mul])).toBe(false);
   });
 
   it("returns false when fewer than 2 fusible ops", () => {
