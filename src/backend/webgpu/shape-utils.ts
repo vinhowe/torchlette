@@ -61,13 +61,9 @@ export function alignedChunkSize(
   );
 }
 
-// broadcastShapes re-exported from core/shape
-
 export function toIndexShape(shape: number[]): number[] {
   return shape.length === 0 ? [1] : shape;
 }
-
-// contiguousStrides re-exported from ../types above
 
 /**
  * Compute effective broadcast strides for a tensor with existing strides.
@@ -129,8 +125,6 @@ export function checkContiguousStrides(
   return true;
 }
 
-// shapesEqual re-exported from core/shape
-
 // ============================================================================
 // Dtype Helpers
 // ============================================================================
@@ -155,13 +149,6 @@ export function dtypeBytes(dtype: DType): number {
  */
 export function alignBufferSize(bytes: number): number {
   return Math.ceil(bytes / 4) * 4;
-}
-
-/**
- * Convert dtype to WGSL type string.
- */
-export function dtypeToWgsl(dtype: DType): string {
-  return dtype;
 }
 
 // ============================================================================

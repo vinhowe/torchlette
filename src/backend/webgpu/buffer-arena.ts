@@ -30,13 +30,6 @@ import {
   trackSharedEncoderWrite,
 } from "./webgpu-state";
 
-// Re-export from webgpu-state for backward compatibility
-export {
-  arenaBufferSet,
-  getOutputSeqIndex,
-  setOutputSeqIndex,
-} from "./webgpu-state";
-
 // ============================================================================
 // Output allocation functions
 // ============================================================================
@@ -137,7 +130,6 @@ export function getBufferSize(tensor: BackendTensor): number {
 // On the next step, try to acquire the same buffer from the pool for bind
 // group cache stability.
 
-// getOutputSeqIndex, setOutputSeqIndex are in webgpu-state.ts and re-exported above.
 export const outputSequenceHints: Array<GPUBuffer | null> = [];
 
 // Pre-pinned output buffers: extracted from pool at step start before any dispatches.
@@ -169,8 +161,6 @@ export interface BufferArena {
   resolve: (GPUBuffer | undefined)[];
   alloc: (GPUBuffer | undefined)[];
 }
-
-// arenaBufferSet is in webgpu-state.ts and re-exported above.
 
 /**
  * Arena mutable state — groups all module-level let variables into a single
