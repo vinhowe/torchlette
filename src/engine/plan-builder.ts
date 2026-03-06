@@ -1,6 +1,7 @@
 import type { Backend } from "../backend/types";
 import { sizeOf } from "../core/shape";
 import type { ExecutionPlan, LazyIRNode, LazyRef } from "./lazy-types";
+import { analyzeLifetimes, type TensorLifetime } from "./lifetime-analysis";
 
 /**
  * Mark a LazyIRNode as a checkpoint boundary.
@@ -117,6 +118,30 @@ export function extractPlanMetadata(plan: ExecutionPlan): {
   }
 
   return { nodeOrder, nodeInputs, nodeSizes };
+}
+
+/**
+ * Initialize lifetime analysis for early buffer release.
+ * Combines extractPlanMetadata + analyzeLifetimes with output node protection.
+ */
+export function initLifetimeAnalysis(
+  planNodes: LazyIRNode[],
+  externalNodeIds?: Set<number>,
+): { lifetimes: Map<number, TensorLifetime>; outputNodeIds: Set<number> } {
+  const { nodeOrder, nodeInputs, nodeSizes } = extractPlanMetadata({
+    nodes: planNodes,
+  });
+  const outputNodeIds = new Set([planNodes[planNodes.length - 1].id]);
+  if (externalNodeIds) {
+    for (const id of externalNodeIds) outputNodeIds.add(id);
+  }
+  const lifetimes = analyzeLifetimes(
+    nodeOrder,
+    nodeInputs,
+    outputNodeIds,
+    nodeSizes,
+  );
+  return { lifetimes, outputNodeIds };
 }
 
 /**

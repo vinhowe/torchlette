@@ -9,17 +9,22 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Torchlette, type Tensor } from "../../src/frontend";
 import {
-  initWebGPU, getBufferPoolStats, getGPUMemoryStats,
-  startPipelineRecording, stopPipelineRecording,
-  warmupFromRegistry, serializeRegistry, deserializeRegistry,
+  deserializeRegistry,
+  getBufferPoolStats,
+  getGPUMemoryStats,
+  initWebGPU,
+  serializeRegistry,
+  startPipelineRecording,
+  stopPipelineRecording,
+  warmupFromRegistry,
 } from "../../src/backend/webgpu";
-import { storageTracker } from "../../src/engine/lazy";
-import { GPT2, DISTILGPT2_CONFIG } from "./model";
+import { storageTracker } from "../../src/engine/storage-tracker";
+import { type Tensor, Torchlette } from "../../src/frontend";
+import { Adam, GradScaler } from "../../src/optim";
 import { GPT2Tokenizer } from "./data";
 import { loadPretrainedGPT2 } from "./loader";
-import { Adam, GradScaler } from "../../src/optim";
+import { DISTILGPT2_CONFIG, type GPT2 } from "./model";
 
 // ============================================================================
 // Shakespeare Training Data
@@ -77,7 +82,7 @@ async function generateText(
   tokenizer: GPT2Tokenizer,
   prompt: string,
   maxTokens: number,
-  temperature = 0.8
+  temperature = 0.8,
 ): Promise<string> {
   const tokens = tokenizer.encode(prompt);
   const generated = [...tokens];
@@ -88,9 +93,13 @@ async function generateText(
 
     // Use tidy to automatically clean up intermediate tensors from forward pass
     const logits = api.tidy(() => {
-      const inputTensor = api.tensorFromArray(contextTokens, [1, contextTokens.length], {
-        device: "webgpu",
-      });
+      const inputTensor = api.tensorFromArray(
+        contextTokens,
+        [1, contextTokens.length],
+        {
+          device: "webgpu",
+        },
+      );
       // Forward pass creates many intermediate tensors that will be auto-disposed
       return model.forward(inputTensor);
     });
@@ -102,7 +111,10 @@ async function generateText(
     const vocabSize = tokenizer.vocabSize;
     const stride = model.paddedVocabSize;
     const startIdx = (seqLen - 1) * stride;
-    const lastLogits = Array.from(logitsData).slice(startIdx, startIdx + vocabSize);
+    const lastLogits = Array.from(logitsData).slice(
+      startIdx,
+      startIdx + vocabSize,
+    );
 
     // Apply temperature
     const scaledLogits = lastLogits.map((x) => x / temperature);
@@ -175,16 +187,16 @@ async function main() {
     enableCheckpointSegmentation: true,
   });
 
-  const model = await loadPretrainedGPT2(api, modelDir, { dropoutRate: 0.0 }, { device: "webgpu" });
+  const model = await loadPretrainedGPT2(
+    api,
+    modelDir,
+    { dropoutRate: 0.0 },
+    { device: "webgpu" },
+  );
   model.eval();
 
   // Test prompts
-  const prompts = [
-    "To be or not to be",
-    "The summer sun",
-    "Love is",
-    "When I",
-  ];
+  const prompts = ["To be or not to be", "The summer sun", "Love is", "When I"];
 
   // Show original outputs
   console.log("\n" + "=".repeat(60));
@@ -209,7 +221,9 @@ async function main() {
   // AMP: autocast wraps the compiled forward to use f16 for matmul, f32 for reductions
   const compiledForward = api.compile((input: Tensor, target: Tensor) => {
     return api.autocast(() => {
-      const result = model.forwardWithLoss(input, target, { useCheckpoint: true });
+      const result = model.forwardWithLoss(input, target, {
+        useCheckpoint: true,
+      });
       if (!result.loss) throw new Error("Loss is null");
       return result.loss;
     });
@@ -220,7 +234,7 @@ async function main() {
   console.log(`\nTraining tokens: ${trainingTokens.length}`);
 
   // Create training sequences (shorter for faster iteration)
-  const seqLen = 512;  // Longer sequences for realistic profiling
+  const seqLen = 512; // Longer sequences for realistic profiling
   const sequences: number[][] = [];
   for (let i = 0; i < trainingTokens.length - seqLen; i += seqLen / 2) {
     sequences.push(trainingTokens.slice(i, i + seqLen));
@@ -234,7 +248,9 @@ async function main() {
       const json = fs.readFileSync(warmupFile, "utf-8");
       const entries = deserializeRegistry(json);
       const result = await warmupFromRegistry(entries);
-      console.log(`Pipeline warmup: ${result.compiled} compiled, ${result.skipped} skipped (${result.timeMs.toFixed(0)}ms)`);
+      console.log(
+        `Pipeline warmup: ${result.compiled} compiled, ${result.skipped} skipped (${result.timeMs.toFixed(0)}ms)`,
+      );
     } catch {
       console.log("Pipeline warmup failed (stale cache?)");
     }
@@ -255,8 +271,12 @@ async function main() {
       const inputData = seq.slice(0, -1);
       const targetData = seq.slice(1);
 
-      const input = api.tensorFromArray(inputData, [1, inputData.length], { device: "webgpu" });
-      const target = api.tensorFromArray(targetData, [1, targetData.length], { device: "webgpu" });
+      const input = api.tensorFromArray(inputData, [1, inputData.length], {
+        device: "webgpu",
+      });
+      const target = api.tensorFromArray(targetData, [1, targetData.length], {
+        device: "webgpu",
+      });
 
       const t0 = performance.now();
       // Forward pass inside compile region with AMP autocast
@@ -290,7 +310,9 @@ async function main() {
       if (globalStep === 0) {
         const pipelineRegistry = stopPipelineRecording();
         fs.writeFileSync(warmupFile, serializeRegistry(pipelineRegistry));
-        console.log(`  Pipeline registry: ${pipelineRegistry.length} pipelines saved`);
+        console.log(
+          `  Pipeline registry: ${pipelineRegistry.length} pipelines saved`,
+        );
       }
 
       // Log loss and timing every 5 steps
@@ -298,10 +320,18 @@ async function main() {
         const memStats = getGPUMemoryStats();
         const poolStats = getBufferPoolStats();
         const storageStats = storageTracker.stats();
-        console.log(`Step ${globalStep}: loss = ${lossValue.toFixed(4)} | scale=${scaler.getScale().toFixed(0)} (fwd: ${(t1-t0).toFixed(0)}ms, bwd: ${(t2-t1).toFixed(0)}ms, opt: ${(t3-t2).toFixed(0)}ms, cleanup: ${(t4-t3).toFixed(0)}ms)`);
-        console.log(`  Memory: ${(memStats.currentBytes / 1e9).toFixed(2)}GB / ${(memStats.limitBytes / 1e9).toFixed(2)}GB (${memStats.usagePercent.toFixed(1)}%), allocations: ${memStats.allocationCount}`);
-        console.log(`  Pool: ${poolStats.pooledBuffers} buffers (${(poolStats.pooledBytes / 1e6).toFixed(1)}MB), pending: ${poolStats.pendingBuffers}`);
-        console.log(`  Storages: total=${storageStats.totalStorages}, reachable=${storageStats.reachableStorages}`);
+        console.log(
+          `Step ${globalStep}: loss = ${lossValue.toFixed(4)} | scale=${scaler.getScale().toFixed(0)} (fwd: ${(t1 - t0).toFixed(0)}ms, bwd: ${(t2 - t1).toFixed(0)}ms, opt: ${(t3 - t2).toFixed(0)}ms, cleanup: ${(t4 - t3).toFixed(0)}ms)`,
+        );
+        console.log(
+          `  Memory: ${(memStats.currentBytes / 1e9).toFixed(2)}GB / ${(memStats.limitBytes / 1e9).toFixed(2)}GB (${memStats.usagePercent.toFixed(1)}%), allocations: ${memStats.allocationCount}`,
+        );
+        console.log(
+          `  Pool: ${poolStats.pooledBuffers} buffers (${(poolStats.pooledBytes / 1e6).toFixed(1)}MB), pending: ${poolStats.pendingBuffers}`,
+        );
+        console.log(
+          `  Storages: total=${storageStats.totalStorages}, reachable=${storageStats.reachableStorages}`,
+        );
       }
 
       globalStep++;
@@ -325,4 +355,9 @@ async function main() {
   console.log("=".repeat(60));
 }
 
-main().then(() => process.exit(0)).catch(e => { console.error(e); process.exit(1); });
+main()
+  .then(() => process.exit(0))
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });

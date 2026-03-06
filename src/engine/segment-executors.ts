@@ -142,6 +142,33 @@ export const DEFAULT_RECLAIM_INTERVAL =
     : 10000;
 
 /**
+ * Tracks node count since last buffer reclamation and flushes when threshold is reached.
+ * Used by both executor-optimized (batch-level) and segment-executors (per-node).
+ */
+export function createReclaimController(
+  interval: number,
+  builder: LoweredPlanBuilder | null,
+) {
+  let count = 0;
+  return {
+    advance(n: number) {
+      count += n;
+    },
+    /** Flush if count >= interval and active is true. Returns whether it flushed. */
+    maybeFlush(active: boolean): boolean {
+      if (active && interval > 0 && count >= interval) {
+        flushSharedEncoder();
+        flushBufferPool();
+        if (builder) builder.recordReclaim();
+        count = 0;
+        return true;
+      }
+      return false;
+    },
+  };
+}
+
+/**
  * Execute a fused segment using a fused kernel.
  * For WebGPU, dispatches a generated kernel. For other backends, falls back to sequential.
  */
@@ -415,11 +442,10 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
     // Intra-segment periodic reclamation: flush pending buffers to main pool
     // every N nodes so freed intermediates can be reused within the same segment.
-    // Uses the safe pattern: flushSharedEncoder() submits all encoded work, then
-    // flushBufferPool() moves pending→pool. Subsequent dispatches encode on a
-    // fresh encoder, and WebGPU queue ordering guarantees prior work completes first.
-    const INTRA_SEGMENT_RECLAIM_INTERVAL = DEFAULT_RECLAIM_INTERVAL;
-    let nodesSinceIntraReclaim = 0;
+    const reclaim = createReclaimController(
+      DEFAULT_RECLAIM_INTERVAL,
+      loweredPlanBuilder ?? null,
+    );
 
     let step = startStep;
 
@@ -794,17 +820,8 @@ export async function executeSequentialSegmentWithEarlyRelease(
       advanceConsumed(nodeIdx, 1);
 
       // Periodic intra-segment reclamation
-      nodesSinceIntraReclaim++;
-      if (
-        useSharedEncoder &&
-        enableEarlyRelease &&
-        nodesSinceIntraReclaim >= INTRA_SEGMENT_RECLAIM_INTERVAL
-      ) {
-        flushSharedEncoder();
-        flushBufferPool();
-        if (loweredPlanBuilder) loweredPlanBuilder.recordReclaim();
-        nodesSinceIntraReclaim = 0;
-      }
+      reclaim.advance(1);
+      reclaim.maybeFlush(useSharedEncoder && enableEarlyRelease);
     }
   } finally {
     if (useSharedEncoder) endSharedEncoder();
