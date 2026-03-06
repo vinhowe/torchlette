@@ -26,7 +26,6 @@ import {
   alignedChunkSize,
   compute2DDispatch,
   dtypeBytes,
-  dtypeToWgsl,
   lcm,
   sizeOf,
   WORKGROUP_SIZE,
@@ -407,7 +406,7 @@ function contiguousChunked(
   const rank = shape.length;
   const outSize = sizeOf(shape);
   const dtype = tensor.dtype;
-  const wgslType = dtypeToWgsl(dtype);
+  const wgslType = dtype;
   const bytesPerElement = dtypeBytes(dtype);
 
   // Currently optimized for 2D transposed tensors
