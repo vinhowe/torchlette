@@ -110,14 +110,20 @@ export {
   setCurrentOpLabel,
 } from "./shared-encoder";
 export { compileTileKernel } from "./tile-compiler";
-export { createTileKernelDispatcher } from "./tile-dispatch";
+export {
+  createTileKernelDispatcher,
+  type TileKernelInstance,
+} from "./tile-dispatch";
 // Re-export tile-IR public API for custom kernels
 export {
+  type BindingSpec,
   ceilDivGrid,
+  type DataType,
   elementwiseGrid,
   KernelContext,
   singleWorkgroup,
   type TileKernelSpec,
+  type UniformType,
 } from "./tile-ir";
 
 import { registerBackend } from "../registry";

@@ -15,11 +15,11 @@ import type {
   LazyIRNode,
   StorageHandle,
 } from "./lazy-types";
-import { analyzeLifetimes, type TensorLifetime } from "./lifetime-analysis";
+import type { TensorLifetime } from "./lifetime-analysis";
 import { wrapResultAsStorage } from "./node-factory";
 import { executeOp, getInputStorage } from "./op-dispatch";
 import {
-  extractPlanMetadata,
+  initLifetimeAnalysis,
   pretunePlanMatmuls,
   segmentPlanAtCheckpoints,
 } from "./plan-builder";
@@ -69,23 +69,19 @@ export async function executePlan(
   const nodeToStorage = new Map<number, StorageHandle>();
 
   if (options?.enableEarlyRelease) {
-    const { nodeOrder, nodeInputs, nodeSizes } = extractPlanMetadata(plan);
-    const lastNodeId = plan.nodes[plan.nodes.length - 1].id;
-    outputNodeIds = new Set([lastNodeId]);
-    // Protect externally-referenced nodes (saved for backward, user-held tensors)
-    // from early release — later plans need their buffers intact.
+    // Resolve externally-referenced nodes (saved for backward, user-held tensors)
+    let externalNodeIds: Set<number> | undefined;
     try {
       const { getPendingNodeIds } = await import("../runtime/tensor");
-      for (const id of getPendingNodeIds()) outputNodeIds.add(id);
+      const pending = getPendingNodeIds();
+      if (pending.size > 0) externalNodeIds = pending;
     } catch {
       /* runtime/tensor not available */
     }
-    lifetimes = analyzeLifetimes(
-      nodeOrder,
-      nodeInputs,
-      outputNodeIds,
-      nodeSizes,
-    );
+    ({ lifetimes, outputNodeIds } = initLifetimeAnalysis(
+      plan.nodes,
+      externalNodeIds,
+    ));
   }
 
   const useSharedEncoder = backend.name === "webgpu";

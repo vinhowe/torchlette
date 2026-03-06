@@ -5,8 +5,6 @@ import {
   clearActiveArena,
   clearArenaExternalInputBuffers,
   endSharedEncoder,
-  flushBufferPool,
-  flushSharedEncoder,
   setActiveArena,
   setArenaExternalInputBuffers,
 } from "../backend/webgpu";
@@ -29,13 +27,14 @@ import {
 } from "./fusion-detect";
 import { analyzeGraph } from "./graph-compiler";
 import type { ExecutionPlan, LazyIRNode, StorageHandle } from "./lazy-types";
-import { analyzeLifetimes, type TensorLifetime } from "./lifetime-analysis";
+import type { TensorLifetime } from "./lifetime-analysis";
 import { type LoweredPlan, LoweredPlanBuilder } from "./lowered-plan";
 import type { MatmulPrologueInfo } from "./matmul-epilogue";
-import { extractPlanMetadata, pretunePlanMatmuls } from "./plan-builder";
+import { initLifetimeAnalysis, pretunePlanMatmuls } from "./plan-builder";
 import {
   buildConsumerCount,
   type CompoundMatchExec,
+  createReclaimController,
   DEFAULT_RECLAIM_INTERVAL,
   executeFusedSegment,
   executeSequentialSegmentWithEarlyRelease,
@@ -193,7 +192,6 @@ export async function executePlanOptimized(
     enableVectorization = true,
     enableEarlyRelease = false,
   } = options;
-  const reclaimInterval = DEFAULT_RECLAIM_INTERVAL;
 
   const stats: OptimizedExecutionStats = {
     totalNodes: plan.nodes.length,
@@ -296,7 +294,7 @@ export async function executePlanOptimized(
       }
     }
 
-    // Reconstruct lifetime analysis from cached template (avoids extractPlanMetadata + analyzeLifetimes)
+    // Reconstruct lifetime analysis from cached template (avoids initLifetimeAnalysis)
     if (cachedTemplate.lifetimeTemplate && enableEarlyRelease) {
       lifetimes = new Map();
       for (let i = 0; i < planNodes.length; i++) {
@@ -454,20 +452,10 @@ export async function executePlanOptimized(
   // Set up lifetime analysis after final plan order is determined.
   // Skip if already reconstructed from cached template (cache hit path above).
   if (enableEarlyRelease && !lifetimes) {
-    const reorderedPlan = { nodes: planNodes };
-    const { nodeOrder, nodeInputs, nodeSizes } =
-      extractPlanMetadata(reorderedPlan);
-    const lastNodeId = plan.nodes[plan.nodes.length - 1].id;
-    outputNodeIds = new Set([lastNodeId]);
-    if (externalNodeIds) {
-      for (const id of externalNodeIds) outputNodeIds.add(id);
-    }
-    lifetimes = analyzeLifetimes(
-      nodeOrder,
-      nodeInputs,
-      outputNodeIds,
-      nodeSizes,
-    );
+    ({ lifetimes, outputNodeIds } = initLifetimeAnalysis(
+      planNodes,
+      externalNodeIds,
+    ));
 
     // Store lifetime template in the fusion analysis cache for future hits
     const cached = fusionAnalysisCache.get(fingerprint);
@@ -636,7 +624,10 @@ export async function executePlanOptimized(
     // Track dispatched nodes for periodic buffer reclamation.
     // When the shared encoder is active, released buffers go to pendingRelease
     // and can't be reused. Periodically flushing moves them back to the main pool.
-    let nodesSinceReclaim = 0;
+    const reclaim = createReclaimController(
+      DEFAULT_RECLAIM_INTERVAL,
+      loweredPlanBuilder,
+    );
 
     // Execute each segment
     for (const segment of segments) {
@@ -685,7 +676,7 @@ export async function executePlanOptimized(
             );
           }
         }
-        nodesSinceReclaim += segment.group.nodes.length;
+        reclaim.advance(segment.group.nodes.length);
       } else {
         // Execute sequentially (too-small fusion groups or sequential segments)
         const seqNodes =
@@ -709,21 +700,11 @@ export async function executePlanOptimized(
         });
         stats.sequentialNodes += seqNodes.length;
         overallStep += seqNodes.length;
-        nodesSinceReclaim += seqNodes.length;
+        reclaim.advance(seqNodes.length);
       }
 
-      // Periodic buffer reclamation: flush the shared encoder and buffer pool
-      // so that dead buffers in pendingRelease become available for reuse.
-      if (
-        useTopLevelSharedEncoder &&
-        reclaimInterval > 0 &&
-        nodesSinceReclaim >= reclaimInterval
-      ) {
-        flushSharedEncoder();
-        flushBufferPool();
-        if (loweredPlanBuilder) loweredPlanBuilder.recordReclaim();
-        nodesSinceReclaim = 0;
-      }
+      // Periodic buffer reclamation
+      reclaim.maybeFlush(useTopLevelSharedEncoder);
     }
   } finally {
     if (useArenaFallback) {

@@ -8,11 +8,7 @@ import {
   createParamsBuffer,
   releaseParamsBuffer,
 } from "../bind-group-cache";
-import {
-  arenaBufferSet,
-  getActiveArena,
-  resolveOutputBuffer,
-} from "../buffer-arena";
+import { getActiveArena, resolveOutputBuffer } from "../buffer-arena";
 import { bufferPool, destroyCopy } from "../buffer-pool";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { f32ArrayToF16Array, requireContext } from "../gpu-context";
@@ -31,6 +27,7 @@ import {
   createTensor,
   createTrackedBuffer,
 } from "../tensor";
+import { arenaBufferSet } from "../webgpu-state";
 import {
   arangeWGSL,
   bernoulliWGSL,
