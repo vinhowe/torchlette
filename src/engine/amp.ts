@@ -240,7 +240,7 @@ export function computeSelectGatedDtype(
 /**
  * Represents a cast op to be inserted for AMP.
  */
-export type AMPCastNode = {
+type AMPCastNode = {
   /** Node ID to cast */
   inputNodeId: number;
   /** Source dtype */
@@ -341,7 +341,7 @@ export function computeOutputCast(
  * AMP state captured at compiled region entry.
  * Used for cache keying and select-gated commit decisions.
  */
-export type CompiledRegionAMPState = {
+type CompiledRegionAMPState = {
   /** Whether AMP was enabled at region entry */
   ampEnabled: boolean;
   /** The policy hash for cache keying */

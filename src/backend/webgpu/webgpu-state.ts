@@ -24,7 +24,7 @@ import type { GPUBuffer, GPUCommandBuffer, WebGPUContext } from "./gpu-types";
 /**
  * Batch execution context - collects command buffers for deferred submission.
  */
-export interface BatchExecutionContext {
+interface BatchExecutionContext {
   /** Collected command buffers to submit together */
   commandBuffers: GPUCommandBuffer[];
   /** Buffers to destroy after the batch submits (deferred from mid-batch destroy calls) */
