@@ -807,16 +807,11 @@ function splitGroupByInputLimit(
   let subNodes: LazyIRNode[] = [];
   let subIndices: number[] = [];
   let subNodeIds = new Set<number>();
-  // Track which storage/node IDs are external for the current sub-group
-  // Only count non-inlinable inputs toward the binding limit
-  let externalStorageIds = new Set<number>();
-  let externalPendingIds = new Set<number>();
+  let seenExternals = new Set<string>();
 
   const flushSubGroup = () => {
     if (subNodes.length >= 2) {
       const externalInputs = collectExternalInputs(subNodes, subNodeIds);
-      // Preserve additional outputs from the original group that are
-      // intermediates in this sub-group (not the output node)
       const outputNode = subNodes[subNodes.length - 1];
       const additionalOutputNodes: LazyIRNode[] = [];
       for (let j = 0; j < subNodes.length - 1; j++) {
@@ -836,65 +831,30 @@ function splitGroupByInputLimit(
     subNodes = [];
     subIndices = [];
     subNodeIds = new Set();
-    externalStorageIds = new Set();
-    externalPendingIds = new Set();
+    seenExternals = new Set();
   };
 
   for (let k = 0; k < group.nodes.length; k++) {
     const node = group.nodes[k];
     const planIdx = group.planIndices[k];
 
-    // Count how many NEW external inputs this node would introduce.
-    // Inlinable scalar constants don't consume binding slots.
-    let newExternalCount = 0;
-    for (const input of node.inputs) {
-      if (input.kind === "materialized") {
-        if (!externalStorageIds.has(input.storage.id)) {
-          newExternalCount++;
-        }
-      } else if (input.kind === "pending") {
-        if (
-          !subNodeIds.has(input.node.id) &&
-          !externalPendingIds.has(input.node.id)
-        ) {
-          // Skip inlinable scalar constants — they won't consume a binding
-          const check = isInlinableScalar(input);
-          if (!check.inlinable) {
-            newExternalCount++;
-          }
-        }
-      }
-    }
-
-    const currentExternalCount =
-      externalStorageIds.size + externalPendingIds.size;
+    const newExternalCount = countNewExternals(
+      node,
+      subNodeIds,
+      seenExternals,
+      false,
+    );
     if (
-      currentExternalCount + newExternalCount > maxExternalInputs &&
+      seenExternals.size + newExternalCount > maxExternalInputs &&
       subNodes.length >= 2
     ) {
-      // Adding this node would exceed the limit — flush current sub-group
       flushSubGroup();
-      // Re-count this node's externals against the fresh sub-group
     }
 
-    // Add node to current sub-group
     subNodes.push(node);
     subIndices.push(planIdx);
     subNodeIds.add(node.id);
-
-    // Update external input tracking (only non-inlinable inputs)
-    for (const input of node.inputs) {
-      if (input.kind === "materialized") {
-        externalStorageIds.add(input.storage.id);
-      } else if (input.kind === "pending") {
-        if (!subNodeIds.has(input.node.id)) {
-          const check = isInlinableScalar(input);
-          if (!check.inlinable) {
-            externalPendingIds.add(input.node.id);
-          }
-        }
-      }
-    }
+    countNewExternals(node, subNodeIds, seenExternals, true);
   }
 
   flushSubGroup();
@@ -952,40 +912,28 @@ function splitGroupByInputLimit(
  * External inputs are:
  * - Materialized refs (already computed tensors)
  * - Pending refs to nodes outside the group
+ * - Scalar refs (inlined as constants, don't consume bindings)
+ *
+ * Uses prefixed string keys for dedup (s: storage, p: pending, v: scalar)
+ * to avoid ID namespace collisions between storage.id and node.id.
  */
 export function collectExternalInputs(
   groupNodes: LazyIRNode[],
   groupNodeIds: Set<number>,
 ): LazyRef[] {
   const external: LazyRef[] = [];
-  // Use separate tracking for materialized vs pending to avoid ID namespace collisions
-  // (a storage.id could equal a node.id, causing a valid input to be skipped)
-  const seenStorage = new Set<number>();
-  const seenNodes = new Set<number>();
-  // Track scalar refs by value+dtype to deduplicate
-  const seenScalars = new Set<string>();
+  const seen = new Set<string>();
 
   for (const node of groupNodes) {
     for (const input of node.inputs) {
-      if (input.kind === "scalar") {
-        // Scalar refs are always external but don't consume bindings (inlined as constants)
-        const key = `${input.value}_${input.dtype}`;
-        if (!seenScalars.has(key)) {
-          seenScalars.add(key);
-          external.push(input);
-        }
-      } else if (input.kind === "materialized") {
-        // Already computed tensor - always external
-        if (!seenStorage.has(input.storage.id)) {
-          seenStorage.add(input.storage.id);
-          external.push(input);
-        }
-      } else if (input.kind === "pending") {
-        // Pending node - check if it's in our group
-        if (!groupNodeIds.has(input.node.id) && !seenNodes.has(input.node.id)) {
-          seenNodes.add(input.node.id);
-          external.push(input);
-        }
+      if (input.kind === "pending" && groupNodeIds.has(input.node.id)) continue;
+      const key =
+        input.kind === "scalar"
+          ? `v:${input.value}_${input.dtype}`
+          : inputKey(input)!;
+      if (!seen.has(key)) {
+        seen.add(key);
+        external.push(input);
       }
     }
   }
@@ -1238,6 +1186,33 @@ function addInputKeys(node: LazyIRNode, seenInputs: Set<string>): number {
     }
   }
   return added;
+}
+
+/**
+ * Count (and optionally track) non-inlinable external inputs a node would introduce.
+ * Skips scalars and inlinable pending refs that won't consume binding slots.
+ * When `track` is true, adds newly-seen keys to `seen` for incremental tracking.
+ */
+function countNewExternals(
+  node: LazyIRNode,
+  groupNodeIds: Set<number>,
+  seen: Set<string>,
+  track: boolean,
+): number {
+  let count = 0;
+  for (const input of node.inputs) {
+    if (input.kind === "scalar") continue;
+    if (input.kind === "pending") {
+      if (groupNodeIds.has(input.node.id)) continue;
+      if (isInlinableScalar(input).inlinable) continue;
+    }
+    const key = inputKey(input)!;
+    if (!seen.has(key)) {
+      count++;
+      if (track) seen.add(key);
+    }
+  }
+  return count;
 }
 
 /**
