@@ -50,21 +50,6 @@ import { isDataSourceOp } from "../engine/lowered-plan";
 import { createLazyIRNode } from "../engine/node-factory";
 import { buildMergedPlan } from "../engine/plan-builder";
 import { storageTracker } from "../engine/storage-tracker";
-import {
-  extractAttentionLogsumexpOp,
-  extractAttentionSideOutputOp,
-  extractLnBwdGradBiasOp,
-  fusedAttentionBackwardOp,
-  fusedAttentionForwardOp,
-  fusedCrossEntropyBackwardOp,
-  fusedCrossEntropyForwardOp,
-  fusedLayerNormBackwardGradWeightBiasOp,
-  fusedLayerNormBackwardGradXOp,
-  fusedLayerNormForwardOp,
-  fusedRMSNormBackwardGradWeightOp,
-  fusedRMSNormBackwardGradXOp,
-  fusedRMSNormForwardOp,
-} from "./engine-fused";
 import { type BaseId, createBaseId, Tensor } from "./tensor";
 
 // ── Engine types (merged from engine-types.ts) ─────────────────────────────
@@ -1560,18 +1545,37 @@ export class RuntimeEngine {
     return this.trackRef(ref, shape, device, dtype);
   }
 
+  /** Create a fused kernel op node and track it as a new Tensor. */
+  private fusedOp(
+    op: string,
+    tensors: Tensor[],
+    shape: number[],
+    device: DeviceKind,
+    config?: unknown,
+  ): Tensor {
+    const node = createLazyIRNode(
+      op,
+      tensors.map((t) => t.lazyRef),
+      shape,
+      "f32",
+      device,
+      config,
+    );
+    return this.trackRef(createPendingRef(node), shape, device);
+  }
+
   fusedCrossEntropyForward(
     logits: Tensor,
     targets: Tensor,
     config: FusedCrossEntropyConfig,
   ): Tensor {
-    const { ref, shape } = fusedCrossEntropyForwardOp(
-      logits.lazyRef,
-      targets.lazyRef,
+    return this.fusedOp(
+      "fusedCrossEntropyForward",
+      [logits, targets],
+      [config.batchSize],
       logits.device,
       config,
     );
-    return this.trackRef(ref, shape, logits.device);
   }
 
   fusedCrossEntropyBackward(
@@ -1580,14 +1584,13 @@ export class RuntimeEngine {
     gradOutput: Tensor,
     config: FusedCrossEntropyConfig,
   ): Tensor {
-    const { ref, shape } = fusedCrossEntropyBackwardOp(
-      logits.lazyRef,
-      targets.lazyRef,
-      gradOutput.lazyRef,
+    return this.fusedOp(
+      "fusedCrossEntropyBackward",
+      [logits, targets, gradOutput],
+      [config.batchSize, config.vocabSize],
       logits.device,
       config,
     );
-    return this.trackRef(ref, shape, logits.device);
   }
 
   fusedLayerNormForward(
@@ -1596,15 +1599,13 @@ export class RuntimeEngine {
     bias: Tensor,
     config: FusedLayerNormConfig,
   ): Tensor {
-    const { ref, shape } = fusedLayerNormForwardOp(
-      x.lazyRef,
-      weight.lazyRef,
-      bias.lazyRef,
-      x.shape,
+    return this.fusedOp(
+      "fusedLayerNormForward",
+      [x, weight, bias],
+      x.shape.slice(),
       x.device,
       config,
     );
-    return this.trackRef(ref, shape, x.device);
   }
 
   fusedLayerNormBackwardGradX(
@@ -1613,15 +1614,13 @@ export class RuntimeEngine {
     weight: Tensor,
     config: FusedLayerNormConfig,
   ): Tensor {
-    const { ref, shape } = fusedLayerNormBackwardGradXOp(
-      gradOutput.lazyRef,
-      x.lazyRef,
-      weight.lazyRef,
-      x.shape,
+    return this.fusedOp(
+      "fusedLayerNormBackwardGradX",
+      [gradOutput, x, weight],
+      x.shape.slice(),
       x.device,
       config,
     );
-    return this.trackRef(ref, shape, x.device);
   }
 
   fusedLayerNormBackwardGradWeightBias(
@@ -1629,13 +1628,13 @@ export class RuntimeEngine {
     x: Tensor,
     config: FusedLayerNormConfig,
   ): Tensor {
-    const { ref, shape } = fusedLayerNormBackwardGradWeightBiasOp(
-      gradOutput.lazyRef,
-      x.lazyRef,
+    return this.fusedOp(
+      "fusedLayerNormBackwardGradWeightBias",
+      [gradOutput, x],
+      [config.featureDim],
       gradOutput.device,
       config,
     );
-    return this.trackRef(ref, shape, gradOutput.device);
   }
 
   fusedRMSNormForward(
@@ -1643,14 +1642,13 @@ export class RuntimeEngine {
     weight: Tensor,
     config: FusedRMSNormConfig,
   ): Tensor {
-    const { ref, shape } = fusedRMSNormForwardOp(
-      x.lazyRef,
-      weight.lazyRef,
-      x.shape,
+    return this.fusedOp(
+      "fusedRMSNormForward",
+      [x, weight],
+      x.shape.slice(),
       x.device,
       config,
     );
-    return this.trackRef(ref, shape, x.device);
   }
 
   fusedRMSNormBackwardGradX(
@@ -1659,15 +1657,13 @@ export class RuntimeEngine {
     weight: Tensor,
     config: FusedRMSNormConfig,
   ): Tensor {
-    const { ref, shape } = fusedRMSNormBackwardGradXOp(
-      gradOutput.lazyRef,
-      x.lazyRef,
-      weight.lazyRef,
-      x.shape,
+    return this.fusedOp(
+      "fusedRMSNormBackwardGradX",
+      [gradOutput, x, weight],
+      x.shape.slice(),
       x.device,
       config,
     );
-    return this.trackRef(ref, shape, x.device);
   }
 
   fusedRMSNormBackwardGradWeight(
@@ -1676,14 +1672,13 @@ export class RuntimeEngine {
     weight: Tensor,
     config: FusedRMSNormConfig,
   ): Tensor {
-    const { ref, shape } = fusedRMSNormBackwardGradWeightOp(
-      gradOutput.lazyRef,
-      x.lazyRef,
-      weight.lazyRef,
+    return this.fusedOp(
+      "fusedRMSNormBackwardGradWeight",
+      [gradOutput, x, weight],
+      [config.featureDim],
       x.device,
       config,
     );
-    return this.trackRef(ref, shape, x.device);
   }
 
   fusedAttentionForward(
@@ -1692,26 +1687,25 @@ export class RuntimeEngine {
     v: Tensor,
     config: FusedAttentionConfig,
   ): Tensor {
-    const { ref, shape } = fusedAttentionForwardOp(
-      q.lazyRef,
-      k.lazyRef,
-      v.lazyRef,
+    return this.fusedOp(
+      "fusedAttentionForward",
+      [q, k, v],
+      [config.batchSize, config.numHeads, config.seqLen, config.headDim],
       q.device,
       config,
     );
-    return this.trackRef(ref, shape, q.device);
   }
 
   extractAttentionLogsumexp(
     fwdOutput: Tensor,
     config: FusedAttentionConfig,
   ): Tensor {
-    const { ref, shape } = extractAttentionLogsumexpOp(
-      fwdOutput.lazyRef,
+    return this.fusedOp(
+      "extractAttentionLogsumexp",
+      [fwdOutput],
+      [config.batchSize, config.numHeads, config.seqLen],
       fwdOutput.device,
-      config,
     );
-    return this.trackRef(ref, shape, fwdOutput.device);
   }
 
   fusedAttentionBackward(
@@ -1723,45 +1717,40 @@ export class RuntimeEngine {
     output: Tensor,
     config: FusedAttentionConfig,
   ): Tensor {
-    const { ref, shape } = fusedAttentionBackwardOp(
-      q.lazyRef,
-      k.lazyRef,
-      v.lazyRef,
-      logsumexp.lazyRef,
-      dO.lazyRef,
-      output.lazyRef,
+    return this.fusedOp(
+      "fusedAttentionBackward",
+      [q, k, v, logsumexp, dO, output],
+      [config.batchSize, config.numHeads, config.seqLen, config.headDim],
       q.device,
       config,
     );
-    return this.trackRef(ref, shape, q.device);
   }
 
   extractAttentionDK(bwdDQ: Tensor, config: FusedAttentionConfig): Tensor {
-    const { ref, shape } = extractAttentionSideOutputOp(
+    return this.fusedOp(
       "extractAttentionDK",
-      bwdDQ.lazyRef,
+      [bwdDQ],
+      [config.batchSize, config.numHeads, config.seqLen, config.headDim],
       bwdDQ.device,
-      config,
     );
-    return this.trackRef(ref, shape, bwdDQ.device);
   }
 
   extractAttentionDV(bwdDQ: Tensor, config: FusedAttentionConfig): Tensor {
-    const { ref, shape } = extractAttentionSideOutputOp(
+    return this.fusedOp(
       "extractAttentionDV",
-      bwdDQ.lazyRef,
+      [bwdDQ],
+      [config.batchSize, config.numHeads, config.seqLen, config.headDim],
       bwdDQ.device,
-      config,
     );
-    return this.trackRef(ref, shape, bwdDQ.device);
   }
 
   extractLnBwdGradBias(gradWeight: Tensor, featureDim: number): Tensor {
-    const { ref, shape } = extractLnBwdGradBiasOp(
-      gradWeight.lazyRef,
+    return this.fusedOp(
+      "extractLnBwdGradBias",
+      [gradWeight],
+      [featureDim],
       gradWeight.device,
-      featureDim,
+      { featureDim },
     );
-    return this.trackRef(ref, shape, gradWeight.device);
   }
 }
