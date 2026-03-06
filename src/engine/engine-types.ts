@@ -231,8 +231,6 @@ export interface MemoryStatsProvider {
 }
 
 // ── Plan linearization (merged from planner.ts) ─────────────────────────────
-export type EventKind = string;
-
 export interface EventKey {
   graphInstanceId: number;
   callInstanceId: number;
@@ -240,7 +238,7 @@ export interface EventKey {
   opNonce: number;
   drawNonce: number;
   mutId: number;
-  kind: EventKind;
+  kind: string;
 }
 
 export interface PlanEvent {
@@ -250,7 +248,7 @@ export interface PlanEvent {
 }
 
 export interface SemanticSubevent {
-  kind: EventKind;
+  kind: string;
   opNonce: number;
   drawNonce?: number;
   mutId?: number;
@@ -268,7 +266,7 @@ export interface DebugPlanLinearOrder {
   eventKeys: EventKey[];
 }
 
-export function compareEventKey(a: EventKey, b: EventKey): number {
+function compareEventKey(a: EventKey, b: EventKey): number {
   if (a.graphInstanceId !== b.graphInstanceId)
     return a.graphInstanceId - b.graphInstanceId;
   if (a.callInstanceId !== b.callInstanceId)

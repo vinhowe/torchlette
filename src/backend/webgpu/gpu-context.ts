@@ -420,7 +420,7 @@ export async function initWebGPU(): Promise<boolean> {
  * Called by destroyWebGPU() for full cleanup, and can be called
  * independently for test isolation.
  */
-export function resetAllKernelCaches(): void {
+function resetAllKernelCaches(): void {
   resetAttentionKernelState();
   resetLayerNormKernelState();
   resetRMSNormKernelState();

@@ -819,7 +819,7 @@ export function printProfileSummary(label: string): void {
 // JSON export
 // ---------------------------------------------------------------------------
 
-export function getProfileJSON(): object {
+function getProfileJSON(): object {
   // Build phases object with per-op kernel breakdown
   const phases: Record<string, unknown> = {};
   const allPhases = new Set([

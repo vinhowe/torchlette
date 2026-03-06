@@ -101,20 +101,6 @@ class GPUMemoryTracker {
    * Track a buffer allocation.
    * @throws GPUMemoryLimitExceededError if allocation would exceed the limit
    */
-  // Debug: track large allocation sources
-  private _debugLargeAllocLog: string[] = [];
-  private _debugLargeAllocEnabled = false;
-
-  enableLargeAllocDebug(): void {
-    this._debugLargeAllocEnabled = true;
-  }
-  getLargeAllocLog(): string[] {
-    return this._debugLargeAllocLog;
-  }
-  clearLargeAllocLog(): void {
-    this._debugLargeAllocLog = [];
-  }
-
   // Debug: track ALL allocation stack traces for leak detection
   private _debugAllAllocEnabled = false;
   private _allocStacks = new Map<
@@ -131,12 +117,6 @@ class GPUMemoryTracker {
 
   enableAllAllocDebug(): void {
     this._debugAllAllocEnabled = true;
-  }
-  disableAllAllocDebug(): void {
-    this._debugAllAllocEnabled = false;
-  }
-  clearAllocStacks(): void {
-    this._allocStacks.clear();
   }
   setAllocStep(step: number): void {
     this._currentStep = step;
@@ -280,18 +260,6 @@ class GPUMemoryTracker {
     this.currentAllocatedBytes += sizeBytes;
     this.allocationCount++;
 
-    if (
-      this._debugLargeAllocEnabled &&
-      buffer !== null &&
-      sizeBytes > 16 * 1024 * 1024
-    ) {
-      const stack =
-        new Error().stack?.split("\n").slice(1, 6).join("\n") ?? "no stack";
-      this._debugLargeAllocLog.push(
-        `ALLOC ${(sizeBytes / 1e6).toFixed(2)}MB:\n${stack}`,
-      );
-    }
-
     if (this._debugAllAllocEnabled && buffer !== null) {
       const stack =
         new Error().stack?.split("\n").slice(1, 15).join("\n") ?? "no stack";
@@ -325,21 +293,10 @@ class GPUMemoryTracker {
 
     if (this._debugAllAllocEnabled) {
       this._allocStacks.delete(buffer);
-    }
-
-    if (this._debugAllAllocEnabled) {
       this._debugDeallocCount++;
       if (size === undefined) {
         this._debugDeallocMissCount++;
       }
-    }
-
-    if (size === undefined && this._debugLargeAllocEnabled && buffer !== null) {
-      const stack =
-        new Error().stack?.split("\n").slice(1, 4).join("\n") ?? "no stack";
-      this._debugLargeAllocLog.push(
-        `DEALLOC_MISS (buffer not found):\n${stack}`,
-      );
     }
   }
 
@@ -453,28 +410,8 @@ export function getGPUAllocationHistogram(): Map<
   return gpuMemoryTracker.getAllocationSizeHistogram();
 }
 
-export function enableLargeAllocDebug(): void {
-  gpuMemoryTracker.enableLargeAllocDebug();
-}
-
-export function getLargeAllocLog(): string[] {
-  return gpuMemoryTracker.getLargeAllocLog();
-}
-
-export function clearLargeAllocLog(): void {
-  gpuMemoryTracker.clearLargeAllocLog();
-}
-
 export function enableAllAllocDebug(): void {
   gpuMemoryTracker.enableAllAllocDebug();
-}
-
-export function disableAllAllocDebug(): void {
-  gpuMemoryTracker.disableAllAllocDebug();
-}
-
-export function clearAllocStacks(): void {
-  gpuMemoryTracker.clearAllocStacks();
 }
 
 export function setAllocStep(step: number): void {
