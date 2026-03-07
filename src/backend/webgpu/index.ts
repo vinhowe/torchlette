@@ -75,6 +75,13 @@ export {
 } from "./memory-tracker";
 // Re-export public functions from ops modules
 export { tensorFromArrayWithDtype } from "./ops/creation";
+// Re-export reduction fusion functions (used by engine/reduction-preamble.ts via dynamic import)
+export {
+  meanWithEpilogue,
+  reduction,
+  sumDimWithPreambleChain,
+  sumWithPreambleEpilogue,
+} from "./ops/reductions";
 export {
   clearWarmupCache,
   deserializeRegistry,
@@ -83,7 +90,6 @@ export {
   stopPipelineRecording,
   warmupPipelines,
 } from "./pipeline-warmup";
-
 // Re-export profiler functions for use in tests and tools
 export {
   isProfilingEnabled,
