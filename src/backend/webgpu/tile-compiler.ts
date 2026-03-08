@@ -77,15 +77,90 @@ const UNARY_FN: Record<string, string> = { rsqrt: "inverseSqrt" };
 
 type BindingMap = Map<number, string>;
 
+// ============================================================================
+// Vec4 Taint Tracking
+// ============================================================================
+
+/**
+ * Ops where `vec4<T> op scalar` is INVALID in WGSL and needs explicit splatting.
+ * Arithmetic (+,-,*,/,%) and shifts (>>,<<) auto-broadcast; these do not.
+ */
+const NEEDS_SPLAT = new Set(["and", "or", "xor", "min", "max", "pow"]);
+
+/** Vec4 context for true vectorized emission. */
+interface Vec4Ctx {
+  /** Node IDs that produce vec4 values. */
+  nodes: Set<number>;
+  /** Variable names that hold vec4 values. */
+  vars: Set<string>;
+}
+
+/**
+ * Determine if an IR node produces a vec4 value in vec4 mode.
+ * Loads produce vec4 (since bindings are array<vec4<T>>).
+ * Operations propagate vec4-ness from their inputs.
+ */
+function isVec4(node: IRNode, v4: Vec4Ctx): boolean {
+  if (v4.nodes.has(node.id)) return true;
+  let result = false;
+  switch (node.kind) {
+    case "load":
+      result = true;
+      break;
+    case "binary":
+      result = isVec4(node.lhs, v4) || isVec4(node.rhs, v4);
+      break;
+    case "unary":
+      result = isVec4(node.input, v4);
+      break;
+    case "cast":
+    case "bitcast":
+      result = isVec4(node.input, v4);
+      break;
+    case "select":
+      result = isVec4(node.trueVal, v4) || isVec4(node.falseVal, v4);
+      break;
+    case "cmp":
+      result = isVec4(node.lhs, v4) || isVec4(node.rhs, v4);
+      break;
+    case "namedRef":
+      result = v4.vars.has(node.name);
+      break;
+  }
+  if (result) v4.nodes.add(node.id);
+  return result;
+}
+
+/**
+ * Wrap a scalar WGSL expression in a vec4 splat if needed.
+ * E.g. `0xFFu` → `vec4<u32>(0xFFu)` for bitwise ops with vec4 operands.
+ */
+function splatScalar(expr: string, dtype: string): string {
+  const wgslType =
+    dtype === "f16"
+      ? "f16"
+      : dtype === "u32"
+        ? "u32"
+        : dtype === "i32"
+          ? "i32"
+          : "f32";
+  return `vec4<${wgslType}>(${expr})`;
+}
+
+// ============================================================================
+// WGSL Expression Emission
+// ============================================================================
+
 /**
  * Emit a WGSL expression for an IR node.
  *
  * If the node is in `bindings`, returns its variable name.
  * Otherwise builds the expression recursively.
+ * When `v4` is provided, emits true vec4 expressions (vec4 loads, splatting).
  */
 const DIMS = ["x", "y", "z"] as const;
 
-function exprFor(node: IRNode, bindings: BindingMap): string {
+function exprFor(node: IRNode, bindings: BindingMap, v4?: Vec4Ctx): string {
   const cached = bindings.get(node.id);
   if (cached !== undefined) return cached;
 
@@ -112,43 +187,66 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
       return `i32(${node.value})`;
     }
     case "load": {
-      const offs = exprFor(node.offsets, bindings);
+      const offs = exprFor(node.offsets, bindings, v4);
+      if (v4) return `${node.binding}[(${offs}) >> 2u]`;
       return `${node.binding}[${offs}]`;
     }
     case "binary": {
-      const lhs = exprFor(node.lhs, bindings);
-      const rhs = exprFor(node.rhs, bindings);
+      const lhs = exprFor(node.lhs, bindings, v4);
+      const rhs = exprFor(node.rhs, bindings, v4);
       const infixOp = BINARY_INFIX[node.op];
+      if (v4 && (NEEDS_SPLAT.has(node.op) || !infixOp)) {
+        // For ops that don't auto-broadcast (bitwise, min/max/pow):
+        // splat the scalar side if the other is vec4
+        const lVec = isVec4(node.lhs, v4);
+        const rVec = isVec4(node.rhs, v4);
+        const lExpr = !lVec && rVec ? splatScalar(lhs, node.lhs.dataType) : lhs;
+        const rExpr = !rVec && lVec ? splatScalar(rhs, node.rhs.dataType) : rhs;
+        if (infixOp) return `(${lExpr} ${infixOp} ${rExpr})`;
+        return `${node.op}(${lExpr}, ${rExpr})`;
+      }
       if (infixOp) return `(${lhs} ${infixOp} ${rhs})`;
       return `${node.op}(${lhs}, ${rhs})`; // min, max, pow
     }
     case "unary": {
-      const input = exprFor(node.input, bindings);
+      const input = exprFor(node.input, bindings, v4);
       const prefix = UNARY_PREFIX[node.op];
       if (prefix) return `${prefix}(${input})`;
       const fn = UNARY_FN[node.op] ?? node.op;
       return `${fn}(${input})`;
     }
     case "cast": {
-      const input = exprFor(node.input, bindings);
+      const input = exprFor(node.input, bindings, v4);
+      if (v4 && isVec4(node.input, v4))
+        return `vec4<${node.targetType}>(${input})`;
       return `${node.targetType}(${input})`;
     }
     case "bitcast": {
-      const input = exprFor(node.input, bindings);
+      const input = exprFor(node.input, bindings, v4);
+      if (v4 && isVec4(node.input, v4))
+        return `bitcast<vec4<${node.targetType}>>(${input})`;
       return `bitcast<${node.targetType}>(${input})`;
     }
     case "select": {
-      const cond = exprFor(node.condition, bindings);
-      const t = exprFor(node.trueVal, bindings);
-      const f = exprFor(node.falseVal, bindings);
+      const cond = exprFor(node.condition, bindings, v4);
+      const t = exprFor(node.trueVal, bindings, v4);
+      const f = exprFor(node.falseVal, bindings, v4);
       return `select(${f}, ${t}, ${cond})`;
     }
     case "cmp": {
-      const lhs = exprFor(node.lhs, bindings);
-      const rhs = exprFor(node.rhs, bindings);
+      const lhs = exprFor(node.lhs, bindings, v4);
+      const rhs = exprFor(node.rhs, bindings, v4);
       const op = (
         { eq: "==", ne: "!=", lt: "<", le: "<=", gt: ">", ge: ">=" } as const
       )[node.op];
+      if (v4) {
+        // Comparisons require both operands to be vec4 or both scalar
+        const lVec = isVec4(node.lhs, v4);
+        const rVec = isVec4(node.rhs, v4);
+        const lExpr = !lVec && rVec ? splatScalar(lhs, node.lhs.dataType) : lhs;
+        const rExpr = !rVec && lVec ? splatScalar(rhs, node.rhs.dataType) : rhs;
+        return `(${lExpr} ${op} ${rExpr})`;
+      }
       return `(${lhs} ${op} ${rhs})`;
     }
     // -- Imperative mode nodes --
@@ -162,7 +260,7 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
     case "arrayRead":
     case "vec4ArrayRead":
     case "vec4SharedRead": {
-      return `${node.arrayName}[${exprFor(node.idx, bindings)}]`;
+      return `${node.arrayName}[${exprFor(node.idx, bindings, v4)}]`;
     }
     case "namedRef": {
       return node.name;
@@ -174,8 +272,8 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
       return `num_wg.${DIMS[node.dim]}`;
     }
     case "subgroupShuffleXor": {
-      const val = exprFor(node.value, bindings);
-      const mask = exprFor(node.mask, bindings);
+      const val = exprFor(node.value, bindings, v4);
+      const mask = exprFor(node.mask, bindings, v4);
       return `subgroupShuffleXor(${val}, ${mask})`;
     }
     case "subgroupAdd":
@@ -183,38 +281,38 @@ function exprFor(node: IRNode, bindings: BindingMap): string {
     case "subgroupMin":
     case "subgroupBroadcastFirst":
     case "subgroupInclusiveAdd": {
-      return `${node.kind}(${exprFor(node.value, bindings)})`;
+      return `${node.kind}(${exprFor(node.value, bindings, v4)})`;
     }
     case "vec4dot": {
-      const a = node.a.map((n) => exprFor(n, bindings));
-      const b = node.b.map((n) => exprFor(n, bindings));
+      const a = node.a.map((n) => exprFor(n, bindings, v4));
+      const b = node.b.map((n) => exprFor(n, bindings, v4));
       return `dot(vec4<f32>(${a.join(", ")}), vec4<f32>(${b.join(", ")}))`;
     }
     // -- Vec4 native nodes --
     case "vec4Construct": {
-      const x = exprFor(node.x, bindings);
-      const y = exprFor(node.y, bindings);
-      const z = exprFor(node.z, bindings);
-      const w = exprFor(node.w, bindings);
+      const x = exprFor(node.x, bindings, v4);
+      const y = exprFor(node.y, bindings, v4);
+      const z = exprFor(node.z, bindings, v4);
+      const w = exprFor(node.w, bindings, v4);
       return `vec4<f32>(${x}, ${y}, ${z}, ${w})`;
     }
     case "vec4Splat": {
-      const v = exprFor(node.value, bindings);
+      const v = exprFor(node.value, bindings, v4);
       return `vec4<f32>(${v})`;
     }
     case "vec4NativeDot": {
-      const a = exprFor(node.a, bindings);
-      const b = exprFor(node.b, bindings);
+      const a = exprFor(node.a, bindings, v4);
+      const b = exprFor(node.b, bindings, v4);
       return `dot(${a}, ${b})`;
     }
     case "vec4Component": {
-      const v = exprFor(node.value, bindings);
+      const v = exprFor(node.value, bindings, v4);
       const comp = ["x", "y", "z", "w"][node.comp];
       return `${v}.${comp}`;
     }
     case "vec4Binary": {
-      const a = exprFor(node.a, bindings);
-      const b = exprFor(node.b, bindings);
+      const a = exprFor(node.a, bindings, v4);
+      const b = exprFor(node.b, bindings, v4);
       const op = node.op === "add" ? "+" : node.op === "sub" ? "-" : "*";
       return `(${a} ${op} ${b})`;
     }
@@ -439,13 +537,14 @@ function compileImperativeKernel(
   const stmts = overrideStatements ?? ctx.statements;
 
   if (spec.vectorize && spec.vectorize > 1) {
-    // Auto-vectorization: unroll body VEC_WIDTH times
+    // True vec4 vectorization: bindings are array<vec4<T>>, loads/stores
+    // use >> 2u indexing, arithmetic is vec4-native. Single body emission.
     const vecWidth = spec.vectorize;
     const flatGidNodeIds = ctx.flatGlobalIdNodeIds;
+    const v4: Vec4Ctx = { nodes: new Set(), vars: new Set() };
 
     if (flatGidNodeIds.length > 0) {
-      // flatGlobalId path: compute base from workgroup + local index
-      // _flatBase = (wid.x + wid.y * num_wg.x) * (WG * VEC) + local_idx * VEC
+      // flatGlobalId path: compute scalar base index for guard checks
       const wgTotal =
         typeof spec.workgroupSize === "number"
           ? spec.workgroupSize
@@ -453,38 +552,22 @@ function compileImperativeKernel(
       lines.push(
         `  let _flatBase = (wid.x + wid.y * num_wg.x) * ${wgTotal * vecWidth}u + local_idx * ${vecWidth}u;`,
       );
-
-      for (let v = 0; v < vecWidth; v++) {
-        lines.push(`  // vec element ${v}`);
-        lines.push(`  {`);
-        const vecBindings = new Map(bindings);
-        for (const nodeId of flatGidNodeIds) {
-          vecBindings.set(nodeId, `(_flatBase + ${v}u)`);
-        }
-        for (const stmt of stmts) {
-          emitStatement(stmt, vecBindings, lines, 2);
-        }
-        lines.push(`  }`);
+      for (const nodeId of flatGidNodeIds) {
+        bindings.set(nodeId, `_flatBase`);
       }
     } else {
-      // globalId(0) path: compute base from gid.x
+      // globalId(0) path: compute scalar base index
       const gidXNodes = ctx.nodes.filter(
         (n) => n.kind === "globalId" && n.dim === 0,
       );
-      lines.push(`  let _base = gid.x * ${vecWidth}u;`);
-
-      for (let v = 0; v < vecWidth; v++) {
-        lines.push(`  // vec element ${v}`);
-        lines.push(`  {`);
-        const vecBindings = new Map(bindings);
-        for (const n of gidXNodes) {
-          vecBindings.set(n.id, `(_base + ${v}u)`);
-        }
-        for (const stmt of stmts) {
-          emitStatement(stmt, vecBindings, lines, 2);
-        }
-        lines.push(`  }`);
+      lines.push(`  let _flatBase = gid.x * ${vecWidth}u;`);
+      for (const n of gidXNodes) {
+        bindings.set(n.id, `_flatBase`);
       }
+    }
+
+    for (const stmt of stmts) {
+      emitStatement(stmt, bindings, lines, 1, v4);
     }
   } else {
     // Emit TPR (threads-per-row) helper variables for subgroup cooperative mode
@@ -547,13 +630,14 @@ function emitUnrolledBlock(
   bindings: BindingMap,
   lines: string[],
   depth: number,
+  v4?: Vec4Ctx,
 ): void {
   const indent = "  ".repeat(depth);
   lines.push(`${indent}{ // unrolled ${varName}=${iterVal}`);
   lines.push(`${indent}  const ${varName} = ${iterVal}u;`);
   const childBindings = new Map(bindings);
   for (const s of body) {
-    emitStatement(s, childBindings, lines, depth + 1);
+    emitStatement(s, childBindings, lines, depth + 1, v4);
   }
   lines.push(`${indent}}`);
 }
@@ -563,11 +647,12 @@ function emitStatement(
   bindings: BindingMap,
   lines: string[],
   depth: number,
+  v4?: Vec4Ctx,
 ): void {
   const indent = "  ".repeat(depth);
   switch (stmt.kind) {
     case "let": {
-      const val = exprFor(stmt.value, bindings);
+      const val = exprFor(stmt.value, bindings, v4);
       lines.push(`${indent}let ${stmt.name} = ${val};`);
       // Register binding: subsequent exprFor calls for the same node ID
       // will return the variable name instead of re-expanding the expression.
@@ -578,11 +663,21 @@ function emitStatement(
       if (stmt.value.id >= 0) {
         bindings.set(stmt.value.id, stmt.name);
       }
+      // Track vec4 variable names for namedRef resolution
+      if (v4 && isVec4(stmt.value, v4)) {
+        v4.vars.add(stmt.name);
+      }
       break;
     }
     case "var": {
-      const val = exprFor(stmt.value, bindings);
-      lines.push(`${indent}var ${stmt.name}: ${stmt.dtype} = ${val};`);
+      const val = exprFor(stmt.value, bindings, v4);
+      // In vec4 mode, promote scalar type to vec4 when value is vec4
+      let dtype = stmt.dtype;
+      if (v4 && isVec4(stmt.value, v4)) {
+        dtype = `vec4<${dtype}>`;
+        v4.vars.add(stmt.name);
+      }
+      lines.push(`${indent}var ${stmt.name}: ${dtype} = ${val};`);
       break;
     }
     case "varArray": {
@@ -612,27 +707,27 @@ function emitStatement(
       break;
     }
     case "assign": {
-      const val = exprFor(stmt.value, bindings);
+      const val = exprFor(stmt.value, bindings, v4);
       lines.push(`${indent}${stmt.name} = ${val};`);
       break;
     }
     case "addAssign": {
-      const val = exprFor(stmt.value, bindings);
+      const val = exprFor(stmt.value, bindings, v4);
       lines.push(`${indent}${stmt.name} = ${stmt.name} + ${val};`);
       break;
     }
     case "indexAssign":
     case "sharedWrite":
     case "vec4ArrayWrite": {
-      const idx = exprFor(stmt.idx, bindings);
-      const val = exprFor(stmt.value, bindings);
+      const idx = exprFor(stmt.idx, bindings, v4);
+      const val = exprFor(stmt.value, bindings, v4);
       lines.push(`${indent}${stmt.arrayName}[${idx}] = ${val};`);
       break;
     }
     case "indexAddAssign":
     case "vec4ArrayAddAssign": {
-      const idx = exprFor(stmt.idx, bindings);
-      const val = exprFor(stmt.value, bindings);
+      const idx = exprFor(stmt.idx, bindings, v4);
+      const val = exprFor(stmt.value, bindings, v4);
       lines.push(
         `${indent}${stmt.arrayName}[${idx}] = ${stmt.arrayName}[${idx}] + ${val};`,
       );
@@ -660,17 +755,18 @@ function emitStatement(
             bindings,
             lines,
             depth,
+            v4,
           );
         }
       } else {
-        const start = exprFor(stmt.start, bindings);
-        const bound = exprFor(stmt.bound, bindings);
+        const start = exprFor(stmt.start, bindings, v4);
+        const bound = exprFor(stmt.bound, bindings, v4);
         lines.push(
           `${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + 1u) {`,
         );
         const childBindings = new Map(bindings);
         for (const s of stmt.body) {
-          emitStatement(s, childBindings, lines, depth + 1);
+          emitStatement(s, childBindings, lines, depth + 1, v4);
         }
         lines.push(`${indent}}`);
       }
@@ -693,6 +789,7 @@ function emitStatement(
               bindings,
               lines,
               depth,
+              v4,
             );
           }
           break;
@@ -705,7 +802,7 @@ function emitStatement(
       if (startConst === null && boundConst !== null && strideVal > 0) {
         const maxTrips = Math.ceil(boundConst / strideVal);
         if (maxTrips >= 1 && (stmt.unroll ? maxTrips <= 16 : maxTrips <= 8)) {
-          const startExpr = exprFor(stmt.start, bindings);
+          const startExpr = exprFor(stmt.start, bindings, v4);
           for (let i = 0; i < maxTrips; i++) {
             const ivExpr =
               i === 0 ? startExpr : `(${startExpr} + ${i * strideVal}u)`;
@@ -718,12 +815,12 @@ function emitStatement(
             if (needsGuard) {
               lines.push(`${indent}  if (${stmt.varName} < ${boundConst}u) {`);
               for (const s of stmt.body) {
-                emitStatement(s, childBindings, lines, depth + 2);
+                emitStatement(s, childBindings, lines, depth + 2, v4);
               }
               lines.push(`${indent}  }`);
             } else {
               for (const s of stmt.body) {
-                emitStatement(s, childBindings, lines, depth + 1);
+                emitStatement(s, childBindings, lines, depth + 1, v4);
               }
             }
             lines.push(`${indent}}`);
@@ -734,14 +831,14 @@ function emitStatement(
 
       // Case 3: Fallback — emit runtime loop
       {
-        const start = exprFor(stmt.start, bindings);
-        const bound = exprFor(stmt.bound, bindings);
+        const start = exprFor(stmt.start, bindings, v4);
+        const bound = exprFor(stmt.bound, bindings, v4);
         lines.push(
           `${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + ${strideVal}u) {`,
         );
         const childBindings = new Map(bindings);
         for (const s of stmt.body) {
-          emitStatement(s, childBindings, lines, depth + 1);
+          emitStatement(s, childBindings, lines, depth + 1, v4);
         }
         lines.push(`${indent}}`);
       }
@@ -750,13 +847,13 @@ function emitStatement(
     case "if": {
       if (isStaticTrue(stmt.condition)) {
         // Static-true: body emitted at parent scope — bindings propagate up
-        for (const s of stmt.body) emitStatement(s, bindings, lines, depth);
+        for (const s of stmt.body) emitStatement(s, bindings, lines, depth, v4);
       } else if (!isStaticFalse(stmt.condition)) {
-        const cond = exprFor(stmt.condition, bindings);
+        const cond = exprFor(stmt.condition, bindings, v4);
         lines.push(`${indent}if (${cond}) {`);
         const childBindings = new Map(bindings);
         for (const s of stmt.body) {
-          emitStatement(s, childBindings, lines, depth + 1);
+          emitStatement(s, childBindings, lines, depth + 1, v4);
         }
         lines.push(`${indent}}`);
       }
@@ -764,20 +861,21 @@ function emitStatement(
     }
     case "ifElse": {
       if (isStaticTrue(stmt.condition)) {
-        for (const s of stmt.body) emitStatement(s, bindings, lines, depth);
+        for (const s of stmt.body) emitStatement(s, bindings, lines, depth, v4);
       } else if (isStaticFalse(stmt.condition)) {
-        for (const s of stmt.elseBody) emitStatement(s, bindings, lines, depth);
+        for (const s of stmt.elseBody)
+          emitStatement(s, bindings, lines, depth, v4);
       } else {
-        const cond = exprFor(stmt.condition, bindings);
+        const cond = exprFor(stmt.condition, bindings, v4);
         lines.push(`${indent}if (${cond}) {`);
         const childBindings1 = new Map(bindings);
         for (const s of stmt.body) {
-          emitStatement(s, childBindings1, lines, depth + 1);
+          emitStatement(s, childBindings1, lines, depth + 1, v4);
         }
         lines.push(`${indent}} else {`);
         const childBindings2 = new Map(bindings);
         for (const s of stmt.elseBody) {
-          emitStatement(s, childBindings2, lines, depth + 1);
+          emitStatement(s, childBindings2, lines, depth + 1, v4);
         }
         lines.push(`${indent}}`);
       }
@@ -797,9 +895,13 @@ function emitStatement(
       break;
     }
     case "directStore": {
-      const idx = exprFor(stmt.idx, bindings);
-      const val = exprFor(stmt.value, bindings);
-      lines.push(`${indent}${stmt.binding}[${idx}] = ${val};`);
+      const idx = exprFor(stmt.idx, bindings, v4);
+      const val = exprFor(stmt.value, bindings, v4);
+      if (v4) {
+        lines.push(`${indent}${stmt.binding}[(${idx}) >> 2u] = ${val};`);
+      } else {
+        lines.push(`${indent}${stmt.binding}[${idx}] = ${val};`);
+      }
       break;
     }
     case "guardedStore": {
@@ -807,20 +909,22 @@ function emitStatement(
         // Dead store — omit entirely
         break;
       }
-      const idx = exprFor(stmt.idx, bindings);
-      const val = exprFor(stmt.value, bindings);
+      const idx = exprFor(stmt.idx, bindings, v4);
+      const val = exprFor(stmt.value, bindings, v4);
+      const storeIdx = v4 ? `(${idx}) >> 2u` : idx;
       if (isStaticTrue(stmt.condition)) {
         // Constant-fold: emit unconditional store
-        lines.push(`${indent}${stmt.binding}[${idx}] = ${val};`);
+        lines.push(`${indent}${stmt.binding}[${storeIdx}] = ${val};`);
       } else {
-        const cond = exprFor(stmt.condition, bindings);
+        const cond = exprFor(stmt.condition, bindings, v4);
         lines.push(`${indent}if (${cond}) {`);
-        lines.push(`${indent}  ${stmt.binding}[${idx}] = ${val};`);
+        lines.push(`${indent}  ${stmt.binding}[${storeIdx}] = ${val};`);
         lines.push(`${indent}}`);
       }
       break;
     }
     case "atomicOp": {
+      // Atomics are scalar-only — never use vec4 mode
       const idx = exprFor(stmt.idx, bindings);
       const val = exprFor(stmt.value, bindings);
       const fnName: Record<string, string> = {
@@ -838,6 +942,7 @@ function emitStatement(
       break;
     }
     case "atomicCAS": {
+      // Atomics are scalar-only — never use vec4 mode
       const idx = exprFor(stmt.idx, bindings);
       const exp = exprFor(stmt.expected, bindings);
       const des = exprFor(stmt.desired, bindings);
@@ -1753,6 +1858,7 @@ function emitBindings(spec: TileKernelSpec): string[] {
   const uniformIdx = spec.uniformBindingIndex;
   const entries = Object.entries(spec.bindings);
   const hasUniforms = Object.keys(spec.uniforms).length > 0;
+  const isVec4Mode = (spec.vectorize ?? 0) > 1;
 
   for (let i = 0; i < entries.length; i++) {
     // Insert uniform at the specified index if requested
@@ -1768,14 +1874,15 @@ function emitBindings(spec: TileKernelSpec): string[] {
     }
     const [name, binding] = entries[i];
     if (binding.storage === "atomic") {
-      // Atomic bindings use array<atomic<T>>
+      // Atomic bindings always use scalar array<atomic<T>>
       lines.push(
         `@group(0) @binding(${bindingIndex}) var<storage, read_write> ${name}: array<atomic<${binding.type}>>;`,
       );
     } else {
       const access = binding.storage === "read" ? "read" : "read_write";
+      const elemType = isVec4Mode ? `vec4<${binding.type}>` : binding.type;
       lines.push(
-        `@group(0) @binding(${bindingIndex}) var<storage, ${access}> ${name}: array<${binding.type}>;`,
+        `@group(0) @binding(${bindingIndex}) var<storage, ${access}> ${name}: array<${elemType}>;`,
       );
     }
     bindingIndex++;
