@@ -6,6 +6,7 @@
  * - Op dispatch (op-dispatch.ts): arity, category
  * - Tile compiler (tile-compiler.ts): wgslInfix, wgslPrefix, wgslFnName
  * - Vectorization (fusion-types.ts): vectorizable flag
+ * - Dtype safety (dtype-rules.ts): dtypeRule
  *
  * Op behavior (WGSL codegen) lives in fusion-tile-ir.ts via BlockExpr methods.
  */
@@ -15,6 +16,12 @@
 // ============================================================================
 
 type OpArity = 1 | 2 | 3;
+
+export type OpDtypeRule =
+  | "preserve"
+  | "f32_required"
+  | "always_f32"
+  | "promote_inputs";
 
 interface OpDef {
   /** Number of inputs */
@@ -36,6 +43,9 @@ interface OpDef {
     | "cast"
     | "bitwise";
 
+  /** Dtype behavior rule for runtime dtype safety. */
+  dtypeRule?: OpDtypeRule;
+
   /** WGSL infix operator for tile-compiler binary ops (e.g., "+", "&"). */
   wgslInfix?: string;
   /** WGSL prefix operator for tile-compiler unary ops (e.g., "-" for neg). */
@@ -50,29 +60,56 @@ interface OpDef {
 
 export const OP_REGISTRY: Record<string, OpDef> = {
   // ---------------------------------------------------------------------------
-  // Activation Functions
+  // Activation Functions (all preserve dtype)
   // ---------------------------------------------------------------------------
-  relu: { arity: 1, fusible: true, vectorizable: true, category: "activation" },
-  gelu: { arity: 1, fusible: true, vectorizable: true, category: "activation" },
+  relu: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "activation",
+    dtypeRule: "preserve",
+  },
+  gelu: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "activation",
+    dtypeRule: "preserve",
+  },
   gelu_erf: {
     arity: 1,
     fusible: true,
     vectorizable: true,
     category: "activation",
+    dtypeRule: "preserve",
   },
-  silu: { arity: 1, fusible: true, vectorizable: true, category: "activation" },
+  silu: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "activation",
+    dtypeRule: "preserve",
+  },
   sigmoid: {
     arity: 1,
     fusible: true,
     vectorizable: true,
     category: "activation",
+    dtypeRule: "preserve",
   },
-  tanh: { arity: 1, fusible: true, vectorizable: true, category: "activation" },
+  tanh: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "activation",
+    dtypeRule: "preserve",
+  },
   softplus: {
     arity: 1,
     fusible: true,
     vectorizable: true,
     category: "activation",
+    dtypeRule: "preserve",
   },
 
   // ---------------------------------------------------------------------------
@@ -83,26 +120,94 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     fusible: true,
     vectorizable: true,
     category: "math",
+    dtypeRule: "preserve",
     wgslPrefix: "-",
   },
-  abs: { arity: 1, fusible: true, vectorizable: true, category: "math" },
-  exp: { arity: 1, fusible: true, vectorizable: true, category: "math" },
-  log: { arity: 1, fusible: true, vectorizable: true, category: "math" },
-  sqrt: { arity: 1, fusible: true, vectorizable: true, category: "math" },
+  abs: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "math",
+    dtypeRule: "preserve",
+  },
+  exp: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "math",
+    dtypeRule: "f32_required",
+  },
+  log: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "math",
+    dtypeRule: "f32_required",
+  },
+  sqrt: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "math",
+    dtypeRule: "preserve",
+  },
   rsqrt: {
     arity: 1,
     fusible: true,
     vectorizable: true,
     category: "math",
+    dtypeRule: "preserve",
     wgslFnName: "inverseSqrt",
   },
-  sin: { arity: 1, fusible: true, vectorizable: true, category: "math" },
-  cos: { arity: 1, fusible: true, vectorizable: true, category: "math" },
-  floor: { arity: 1, fusible: true, vectorizable: true, category: "math" },
-  ceil: { arity: 1, fusible: true, vectorizable: true, category: "math" },
-  round: { arity: 1, fusible: true, vectorizable: true, category: "math" },
-  sign: { arity: 1, fusible: true, vectorizable: true, category: "math" },
-  isfinite: { arity: 1, fusible: true, vectorizable: true, category: "math" },
+  sin: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "math",
+    dtypeRule: "preserve",
+  },
+  cos: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "math",
+    dtypeRule: "preserve",
+  },
+  floor: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "math",
+    dtypeRule: "preserve",
+  },
+  ceil: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "math",
+    dtypeRule: "preserve",
+  },
+  round: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "math",
+    dtypeRule: "preserve",
+  },
+  sign: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "math",
+    dtypeRule: "preserve",
+  },
+  isfinite: {
+    arity: 1,
+    fusible: true,
+    vectorizable: true,
+    category: "math",
+    dtypeRule: "always_f32",
+  },
 
   // ---------------------------------------------------------------------------
   // Binary Arithmetic
@@ -112,6 +217,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     fusible: true,
     vectorizable: true,
     category: "arithmetic",
+    dtypeRule: "promote_inputs",
     wgslInfix: "+",
   },
   sub: {
@@ -119,6 +225,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     fusible: true,
     vectorizable: true,
     category: "arithmetic",
+    dtypeRule: "promote_inputs",
     wgslInfix: "-",
   },
   mul: {
@@ -126,6 +233,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     fusible: true,
     vectorizable: true,
     category: "arithmetic",
+    dtypeRule: "promote_inputs",
     wgslInfix: "*",
   },
   div: {
@@ -133,11 +241,30 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     fusible: true,
     vectorizable: true,
     category: "arithmetic",
+    dtypeRule: "promote_inputs",
     wgslInfix: "/",
   },
-  pow: { arity: 2, fusible: true, vectorizable: true, category: "arithmetic" },
-  min: { arity: 2, fusible: true, vectorizable: true, category: "arithmetic" },
-  max: { arity: 2, fusible: true, vectorizable: true, category: "arithmetic" },
+  pow: {
+    arity: 2,
+    fusible: true,
+    vectorizable: true,
+    category: "arithmetic",
+    dtypeRule: "f32_required",
+  },
+  min: {
+    arity: 2,
+    fusible: true,
+    vectorizable: true,
+    category: "arithmetic",
+    dtypeRule: "f32_required",
+  },
+  max: {
+    arity: 2,
+    fusible: true,
+    vectorizable: true,
+    category: "arithmetic",
+    dtypeRule: "f32_required",
+  },
   mod: {
     arity: 2,
     fusible: true,
@@ -147,19 +274,61 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   },
 
   // ---------------------------------------------------------------------------
-  // Comparisons (return f32 0.0 or 1.0)
+  // Comparisons (always produce f32 0.0 or 1.0)
   // ---------------------------------------------------------------------------
-  eq: { arity: 2, fusible: true, vectorizable: true, category: "comparison" },
-  ne: { arity: 2, fusible: true, vectorizable: true, category: "comparison" },
-  lt: { arity: 2, fusible: true, vectorizable: true, category: "comparison" },
-  le: { arity: 2, fusible: true, vectorizable: true, category: "comparison" },
-  gt: { arity: 2, fusible: true, vectorizable: true, category: "comparison" },
-  ge: { arity: 2, fusible: true, vectorizable: true, category: "comparison" },
+  eq: {
+    arity: 2,
+    fusible: true,
+    vectorizable: true,
+    category: "comparison",
+    dtypeRule: "always_f32",
+  },
+  ne: {
+    arity: 2,
+    fusible: true,
+    vectorizable: true,
+    category: "comparison",
+    dtypeRule: "always_f32",
+  },
+  lt: {
+    arity: 2,
+    fusible: true,
+    vectorizable: true,
+    category: "comparison",
+    dtypeRule: "always_f32",
+  },
+  le: {
+    arity: 2,
+    fusible: true,
+    vectorizable: true,
+    category: "comparison",
+    dtypeRule: "always_f32",
+  },
+  gt: {
+    arity: 2,
+    fusible: true,
+    vectorizable: true,
+    category: "comparison",
+    dtypeRule: "always_f32",
+  },
+  ge: {
+    arity: 2,
+    fusible: true,
+    vectorizable: true,
+    category: "comparison",
+    dtypeRule: "always_f32",
+  },
 
   // ---------------------------------------------------------------------------
   // Ternary Operations
   // ---------------------------------------------------------------------------
-  where: { arity: 3, fusible: true, vectorizable: true, category: "ternary" },
+  where: {
+    arity: 3,
+    fusible: true,
+    vectorizable: true,
+    category: "ternary",
+    dtypeRule: "preserve",
+  },
 
   // ---------------------------------------------------------------------------
   // Type Casts
@@ -226,4 +395,9 @@ export function getWgslPrefix(op: string): string | undefined {
 /** Get WGSL function name, falling back to op name (e.g., "rsqrt" → "inverseSqrt"). */
 export function getWgslFnName(op: string): string {
   return OP_REGISTRY[op]?.wgslFnName ?? op;
+}
+
+/** Get the dtype rule for an op from the registry. */
+export function getOpDtypeRule(op: string): OpDtypeRule | undefined {
+  return OP_REGISTRY[op]?.dtypeRule;
 }
