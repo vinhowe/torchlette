@@ -217,6 +217,7 @@ describe("Op Registry", () => {
         "comparison",
         "ternary",
         "cast",
+        "bitwise",
       ];
       for (const [_name, def] of Object.entries(OP_REGISTRY)) {
         expect([1, 2, 3]).toContain(def.arity);
@@ -226,8 +227,9 @@ describe("Op Registry", () => {
       }
     });
 
-    it("all registered ops are fusible", () => {
+    it("all non-bitwise ops are fusible", () => {
       for (const [name, def] of Object.entries(OP_REGISTRY)) {
+        if (def.category === "bitwise") continue;
         expect(def.fusible, `Op ${name} should be fusible`).toBe(true);
       }
     });
