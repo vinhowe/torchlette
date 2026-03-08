@@ -25,8 +25,8 @@ export type LinearOptions = {
 export class Linear extends Module {
   readonly inFeatures: number;
   readonly outFeatures: number;
-  readonly weight: Tensor;
-  readonly bias: Tensor | null;
+  declare readonly weight: Tensor;
+  declare readonly bias: Tensor | null;
 
   constructor(
     api: Torchlette,
@@ -44,17 +44,16 @@ export class Linear extends Module {
     // Initialize weight with standard normal distribution.
     // Uses lazy GPU-side randn to avoid allocating large JS arrays on CPU.
     // Note: for pretrained models, weights are overwritten by copy_ during loading.
-    this.weight = api.randn([outFeatures, inFeatures], {
-      requiresGrad: true,
-      device,
-    });
+    this.registerParameter(
+      "weight",
+      api.randn([outFeatures, inFeatures], { requiresGrad: true, device }),
+    );
 
     // Bias shape: [outFeatures]
-    if (hasBias) {
-      this.bias = api.zeros([outFeatures], { requiresGrad: true, device });
-    } else {
-      this.bias = null;
-    }
+    this.registerParameter(
+      "bias",
+      hasBias ? api.zeros([outFeatures], { requiresGrad: true, device }) : null,
+    );
   }
 
   /**
@@ -65,15 +64,5 @@ export class Linear extends Module {
    */
   forward(input: Tensor): Tensor {
     return this.api.linear(input, this.weight, this.bias);
-  }
-
-  /**
-   * Get all learnable parameters.
-   */
-  parameters(): Tensor[] {
-    if (this.bias !== null) {
-      return [this.weight, this.bias];
-    }
-    return [this.weight];
   }
 }
