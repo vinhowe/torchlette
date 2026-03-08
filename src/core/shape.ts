@@ -52,6 +52,20 @@ export function broadcastThreeShapes(
   return out;
 }
 
+/**
+ * Check if strides represent a contiguous layout for the given shape.
+ * Size-1 dimensions don't affect contiguity since stride doesn't matter.
+ */
+export function checkContiguous(shape: number[], strides: number[]): boolean {
+  if (shape.length !== strides.length) return false;
+  const expected = contiguousStrides(shape);
+  for (let i = 0; i < shape.length; i++) {
+    if (shape[i] <= 1) continue;
+    if (strides[i] !== expected[i]) return false;
+  }
+  return true;
+}
+
 export function contiguousStrides(shape: number[]): number[] {
   if (shape.length === 0) return [];
   const strides = new Array<number>(shape.length);

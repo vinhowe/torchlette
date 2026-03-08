@@ -5,7 +5,6 @@
  * Zero mutable state. No GPU context dependency.
  */
 
-import { contiguousStrides } from "../../core/shape";
 import type { DType } from "../types";
 
 export { broadcastShapes, contiguousStrides, sizeOf } from "../../core/shape";
@@ -109,21 +108,7 @@ export function computeEffectiveBroadcastStrides(
 // Shape Comparison & Contiguity Checks
 // ============================================================================
 
-/**
- * Check if strides represent contiguous memory layout.
- */
-export function checkContiguousStrides(
-  shape: number[],
-  strides: number[],
-): boolean {
-  const expected = contiguousStrides(shape);
-  for (let i = 0; i < shape.length; i++) {
-    // Size-1 dims don't affect contiguity
-    if (shape[i] <= 1) continue;
-    if (strides[i] !== expected[i]) return false;
-  }
-  return true;
-}
+export { checkContiguous as checkContiguousStrides } from "../../core/shape";
 
 // ============================================================================
 // Dtype Helpers
