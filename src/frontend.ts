@@ -525,28 +525,77 @@ export class Torchlette {
     );
   }
 
-  add(a: Tensor | number, b: Tensor | number): Tensor {
-    // Unwrap: numbers go directly to RuntimeEngine as scalars
-    const aUnwrap: TensorOrScalar = typeof a === "number" ? a : a._unwrap();
-    const bUnwrap: TensorOrScalar = typeof b === "number" ? b : b._unwrap();
+  /**
+   * Shared dispatch for binary ops that accept Tensor|number operands.
+   * Handles tensor+tensor (with autocast) and tensor+scalar branches,
+   * including sumToShape gradient reduction and tensor saving for backward.
+   *
+   * @param ttGrad - Tensor+Tensor grad: return [gradA, gradB] (before sumToShape)
+   * @param tsGrad - Tensor+Scalar grad: return [gradTensor] (before sumToShape).
+   *                 If omitted, gradient passes through unchanged.
+   * @param save - Whether to save input tensors for backward (for getSaved access in grad)
+   */
+  private _dispatchBinary(
+    opName: string,
+    a: Tensor | number,
+    b: Tensor | number,
+    ttGrad: (
+      g: RuntimeTensor,
+      getSaved: (i: number) => Tensor,
+    ) => [RuntimeTensor, RuntimeTensor],
+    tsGrad?: (
+      g: RuntimeTensor,
+      getSaved: (i: number) => Tensor,
+      scalar: number,
+      scalarIsA: boolean,
+    ) => RuntimeTensor[],
+    save = false,
+  ): Tensor {
     const tensors = [a, b].filter((x): x is Tensor => typeof x !== "number");
     this._assertUsable(...tensors);
+    const rt = this.runtime;
+
     if (typeof a !== "number" && typeof b !== "number") {
-      [a, b] = this._applyAutocast("add", [a, b]) as [Tensor, Tensor];
-      const inner = this.runtime.add(a._unwrap(), b._unwrap());
-      const aShape = a.shape;
-      const bShape = b.shape;
-      return this._wrapWithGrad(inner, [a, b], (grad, _getSaved) => [
-        this._sumToShape(grad, aShape),
-        this._sumToShape(grad, bShape),
-      ]);
+      [a, b] = this._applyAutocast(opName, [a, b]) as [Tensor, Tensor];
+      const inner = (rt as any)[opName](a._unwrap(), b._unwrap());
+      const aShape = a.shape,
+        bShape = b.shape;
+      const tensorsToSave =
+        save && (a.requiresGrad || b.requiresGrad) ? [a, b] : [];
+      return this._wrapWithGrad(
+        inner,
+        [a, b],
+        (grad, getSaved) => {
+          const [gA, gB] = ttGrad(grad, getSaved);
+          return [this._sumToShape(gA, aShape), this._sumToShape(gB, bShape)];
+        },
+        tensorsToSave,
+      );
     }
-    // At least one operand is a number — no grad needed for the number
-    const inner = this.runtime.add(aUnwrap, bUnwrap);
+
+    // Tensor + Scalar
     const tensorInput = typeof a !== "number" ? a : (b as Tensor);
-    return this._wrapWithGrad(inner, [tensorInput], (grad, _getSaved) => [
-      this._sumToShape(grad, tensorInput.shape),
-    ]);
+    const scalarVal = typeof a === "number" ? a : (b as number);
+    const scalarIsA = typeof a === "number";
+    const inner = (rt as any)[opName](
+      typeof a === "number" ? a : a._unwrap(),
+      typeof b === "number" ? b : b._unwrap(),
+    );
+    const tensorsToSave = save && tensorInput.requiresGrad ? [tensorInput] : [];
+    const gFn = tsGrad ?? ((g: RuntimeTensor) => [g]);
+    return this._wrapWithGrad(
+      inner,
+      [tensorInput],
+      (grad, getSaved) =>
+        gFn(grad, getSaved, scalarVal, scalarIsA).map((g) =>
+          this._sumToShape(g, tensorInput.shape),
+        ),
+      tensorsToSave,
+    );
+  }
+
+  add(a: Tensor | number, b: Tensor | number): Tensor {
+    return this._dispatchBinary("add", a, b, (g) => [g, g]);
   }
 
   sub(a: Tensor, b: Tensor, options?: SubOptions): Tensor {
@@ -565,103 +614,35 @@ export class Torchlette {
   }
 
   mul(a: Tensor | number, b: Tensor | number): Tensor {
-    const tensors = [a, b].filter((x): x is Tensor => typeof x !== "number");
-    this._assertUsable(...tensors);
-    if (typeof a !== "number" && typeof b !== "number") {
-      [a, b] = this._applyAutocast("mul", [a, b]) as [Tensor, Tensor];
-      const inner = this.runtime.mul(a._unwrap(), b._unwrap());
-      const aShape = a.shape;
-      const bShape = b.shape;
-      const tensorsToSave = a.requiresGrad || b.requiresGrad ? [a, b] : [];
-      return this._wrapWithGrad(
-        inner,
-        [a, b],
-        (grad, getSaved) => {
-          const savedA = getSaved(0);
-          const savedB = getSaved(1);
-          const gradA = this._sumToShape(
-            this.runtime.mul(grad, savedB._unwrap()),
-            aShape,
-          );
-          const gradB = this._sumToShape(
-            this.runtime.mul(grad, savedA._unwrap()),
-            bShape,
-          );
-          return [gradA, gradB];
-        },
-        tensorsToSave,
-      );
-    }
-    // One operand is a number — simpler backward
-    const tensorInput = typeof a !== "number" ? a : (b as Tensor);
-    const scalarVal = typeof a === "number" ? a : (b as number);
-    const inner = this.runtime.mul(
-      typeof a === "number" ? a : a._unwrap(),
-      typeof b === "number" ? b : b._unwrap(),
+    const rt = this.runtime;
+    return this._dispatchBinary(
+      "mul",
+      a,
+      b,
+      (g, gs) => [rt.mul(g, gs(1)._unwrap()), rt.mul(g, gs(0)._unwrap())],
+      (g, _, s) => [rt.mul(g, s)],
+      true,
     );
-    return this._wrapWithGrad(inner, [tensorInput], (grad, _getSaved) => [
-      this._sumToShape(this.runtime.mul(grad, scalarVal), tensorInput.shape),
-    ]);
   }
 
   div(a: Tensor | number, b: Tensor | number): Tensor {
-    const tensors = [a, b].filter((x): x is Tensor => typeof x !== "number");
-    this._assertUsable(...tensors);
-    if (typeof a !== "number" && typeof b !== "number") {
-      [a, b] = this._applyAutocast("div", [a, b]) as [Tensor, Tensor];
-      const inner = this.runtime.div(a._unwrap(), b._unwrap());
-      const aShape = a.shape;
-      const bShape = b.shape;
-      const tensorsToSave = a.requiresGrad || b.requiresGrad ? [a, b] : [];
-      return this._wrapWithGrad(
-        inner,
-        [a, b],
-        (grad, getSaved) => {
-          const savedA = getSaved(0);
-          const savedB = getSaved(1);
-          const gradA = this._sumToShape(
-            this.runtime.div(grad, savedB._unwrap()),
-            aShape,
-          );
-          const bSquared = this.runtime.mul(savedB._unwrap(), savedB._unwrap());
-          const negA = this.runtime.neg(savedA._unwrap());
-          const gradB = this._sumToShape(
-            this.runtime.mul(grad, this.runtime.div(negA, bSquared)),
-            bShape,
-          );
-          return [gradA, gradB];
-        },
-        tensorsToSave,
-      );
-    }
-    // One operand is a number — simpler backward
-    const tensorInput = typeof a !== "number" ? a : (b as Tensor);
-    const scalarVal = typeof a === "number" ? a : (b as number);
-    const inner = this.runtime.div(
-      typeof a === "number" ? a : a._unwrap(),
-      typeof b === "number" ? b : b._unwrap(),
-    );
-    if (typeof b === "number") {
-      // a / scalar → grad_a = grad / scalar
-      return this._wrapWithGrad(inner, [tensorInput], (grad, _getSaved) => [
-        this._sumToShape(this.runtime.div(grad, scalarVal), tensorInput.shape),
-      ]);
-    }
-    // scalar / b → grad_b = -scalar / b^2 * grad
-    return this._wrapWithGrad(
-      inner,
-      [tensorInput],
-      (grad, getSaved) => {
-        const savedB = getSaved(0);
-        const bSq = this.runtime.mul(savedB._unwrap(), savedB._unwrap());
-        return [
-          this._sumToShape(
-            this.runtime.mul(grad, this.runtime.div(-scalarVal, bSq)),
-            tensorInput.shape,
-          ),
-        ];
+    const rt = this.runtime;
+    return this._dispatchBinary(
+      "div",
+      a,
+      b,
+      (g, gs) => {
+        const sA = gs(0)._unwrap(),
+          sB = gs(1)._unwrap();
+        return [rt.div(g, sB), rt.mul(g, rt.div(rt.neg(sA), rt.mul(sB, sB)))];
       },
-      [tensorInput],
+      (g, gs, scalar, scalarIsA) => {
+        if (!scalarIsA) return [rt.div(g, scalar)]; // a / scalar
+        // scalar / b → -scalar / b² * grad
+        const sB = gs(0)._unwrap();
+        return [rt.mul(g, rt.div(-scalar, rt.mul(sB, sB)))];
+      },
+      true,
     );
   }
 
@@ -979,86 +960,30 @@ export class Torchlette {
   }
 
   pow(a: Tensor | number, b: Tensor | number): Tensor {
-    const tensors = [a, b].filter((x): x is Tensor => typeof x !== "number");
-    this._assertUsable(...tensors);
-    if (typeof a !== "number" && typeof b !== "number") {
-      const inner = this.runtime.pow(a._unwrap(), b._unwrap());
-      const aShape = a.shape;
-      const bShape = b.shape;
-      const tensorsToSave = a.requiresGrad || b.requiresGrad ? [a, b] : [];
+    const rt = this.runtime;
+    return this._dispatchBinary(
+      "pow",
+      a,
+      b,
       // d/da pow(a,b) = b * pow(a, b-1), d/db pow(a,b) = pow(a,b) * log(a)
-      return this._wrapWithGrad(
-        inner,
-        [a, b],
-        (grad, getSaved) => {
-          const savedA = getSaved(0);
-          const savedB = getSaved(1);
-          const gradA = this._sumToShape(
-            this.runtime.mul(
-              grad,
-              this.runtime.mul(
-                savedB._unwrap(),
-                this.runtime.pow(
-                  savedA._unwrap(),
-                  this.runtime.sub(savedB._unwrap(), 1),
-                ),
-              ),
-            ),
-            aShape,
-          );
-          const gradB = this._sumToShape(
-            this.runtime.mul(
-              grad,
-              this.runtime.mul(
-                this.runtime.pow(savedA._unwrap(), savedB._unwrap()),
-                this.runtime.log(savedA._unwrap()),
-              ),
-            ),
-            bShape,
-          );
-          return [gradA, gradB];
-        },
-        tensorsToSave,
-      );
-    }
-    // One operand is a number
-    const tensorInput = typeof a !== "number" ? a : (b as Tensor);
-    const scalarVal = typeof a === "number" ? a : (b as number);
-    const isBaseScalar = typeof a === "number";
-    const inner = this.runtime.pow(
-      typeof a === "number" ? a : a._unwrap(),
-      typeof b === "number" ? b : b._unwrap(),
-    );
-    const tensorsToSave = tensorInput.requiresGrad ? [tensorInput] : [];
-    return this._wrapWithGrad(
-      inner,
-      [tensorInput],
-      (grad, getSaved) => {
-        const saved = getSaved(0);
-        if (isBaseScalar) {
-          // d/db a^b = a^b * log(a)
-          const powResult = this.runtime.pow(scalarVal, saved._unwrap());
-          return [
-            this._sumToShape(
-              this.runtime.mul(
-                grad,
-                this.runtime.mul(powResult, Math.log(scalarVal)),
-              ),
-              tensorInput.shape,
-            ),
-          ];
-        } else {
-          // d/da a^n = n * a^(n-1)
-          const powResult = this.runtime.pow(saved._unwrap(), scalarVal - 1);
-          return [
-            this._sumToShape(
-              this.runtime.mul(grad, this.runtime.mul(scalarVal, powResult)),
-              tensorInput.shape,
-            ),
-          ];
-        }
+      (g, gs) => {
+        const sA = gs(0)._unwrap(),
+          sB = gs(1)._unwrap();
+        return [
+          rt.mul(g, rt.mul(sB, rt.pow(sA, rt.sub(sB, 1)))),
+          rt.mul(g, rt.mul(rt.pow(sA, sB), rt.log(sA))),
+        ];
       },
-      tensorsToSave,
+      (g, gs, scalar, scalarIsA) => {
+        const saved = gs(0)._unwrap();
+        if (scalarIsA) {
+          // d/db a^b = a^b * log(a)
+          return [rt.mul(g, rt.mul(rt.pow(scalar, saved), Math.log(scalar)))];
+        }
+        // d/da a^n = n * a^(n-1)
+        return [rt.mul(g, rt.mul(scalar, rt.pow(saved, scalar - 1)))];
+      },
+      true,
     );
   }
 
