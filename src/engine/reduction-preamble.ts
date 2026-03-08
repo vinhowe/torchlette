@@ -11,7 +11,7 @@ import type { LazyIRNode, LazyRef } from "./lazy-types";
 import {
   type EpilogueOp,
   findChainInput,
-  pushGeluEpilogueOp,
+  getEpilogueOpName as getChainOpName,
 } from "./matmul-epilogue";
 import { createStorageHandle } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
@@ -42,22 +42,6 @@ export interface ReductionPreamblePlan {
   chainInputRefs: LazyRef[];
   /** Dtypes for each external input */
   chainInputDtypes: DType[];
-}
-
-/**
- * Convert a LazyIRNode op name to applyFusedOp-compatible name.
- * Handles cast (needs dtype suffix) and gelu (needs variant suffix).
- */
-function getChainOpName(node: LazyIRNode): string {
-  if (node.op === "cast") {
-    const payload = node.payload as { dtype: DType } | undefined;
-    return `cast_${payload?.dtype || "f32"}`;
-  }
-  if (node.op === "gelu") {
-    const payload = node.payload as { approximate?: string } | undefined;
-    return payload?.approximate === "tanh" ? "gelu" : "gelu_erf";
-  }
-  return node.op;
 }
 
 /** Extract the shape from a LazyRef (pending or materialized). */
@@ -395,20 +379,11 @@ export function detectReductionEpilogue(
       additionalInputCount++;
       matched = true;
     } else if (
-      nextNode.op === "relu" ||
-      nextNode.op === "silu" ||
-      nextNode.op === "sigmoid" ||
-      nextNode.op === "tanh" ||
-      nextNode.op === "neg" ||
-      nextNode.op === "abs" ||
-      nextNode.op === "exp" ||
-      nextNode.op === "log" ||
-      nextNode.op === "sqrt"
+      isFusibleOp(nextNode.op) &&
+      nextNode.inputs.length === 1 &&
+      nextNode.op !== "cast"
     ) {
-      epilogueOps.push({ kind: "unary", op: nextNode.op });
-      matched = true;
-    } else if (nextNode.op === "gelu") {
-      pushGeluEpilogueOp(nextNode, epilogueOps);
+      epilogueOps.push({ kind: "unary", op: getEpilogueOpName(nextNode) });
       matched = true;
     }
 

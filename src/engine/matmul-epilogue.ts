@@ -1,6 +1,7 @@
 import type { BackendTensor, DType } from "../backend/types";
 import { asGPUTensor } from "../backend/webgpu/gpu-types";
 import { contiguousStrides, shapesEqual } from "../core/shape";
+import { isFusibleOp } from "./fusion-detect";
 import type { LazyIRNode, LazyRef } from "./lazy-types";
 import {
   _webgpuMatmulImports,
@@ -42,16 +43,21 @@ export function findChainInput(
   return -1;
 }
 
-/** Push the appropriate gelu epilogue op based on the node's approximate payload. */
-export function pushGeluEpilogueOp(
-  nextNode: LazyIRNode,
-  epilogueOps: EpilogueOp[],
-): void {
-  const p = nextNode.payload as { approximate?: string } | undefined;
-  epilogueOps.push({
-    kind: "unary",
-    op: p?.approximate === "tanh" ? "gelu" : "gelu_erf",
-  });
+/**
+ * Get the applyFusedOp-compatible operation name for a node.
+ * Handles payload inspection for gelu (approximate variant) and cast (dtype suffix).
+ * For all other ops, node.op is used directly.
+ */
+export function getEpilogueOpName(node: LazyIRNode): string {
+  if (node.op === "gelu") {
+    const p = node.payload as { approximate?: string } | undefined;
+    return p?.approximate === "tanh" ? "gelu" : "gelu_erf";
+  }
+  if (node.op === "cast") {
+    const p = node.payload as { dtype?: string } | undefined;
+    return `cast_${p?.dtype || "f32"}`;
+  }
+  return node.op;
 }
 
 // ============================================================================
@@ -191,26 +197,25 @@ export function detectMatmulEpilogueCore(
         additionalInputCount++;
         matched = true;
       }
-    } else if (nextNode.op === "mul" && nextNode.inputs.length === 2) {
+    } else if (
+      (nextNode.op === "mul" || nextNode.op === "sub") &&
+      nextNode.inputs.length === 2
+    ) {
       if (additionalInputCount >= 4) break;
       epilogueOps.push({
         kind: "binary",
-        op: "mul",
+        op: nextNode.op,
         inputIndex: additionalInputCount,
       });
       epilogueInputRefs.push(nextNode.inputs[chainInputIdx === 0 ? 1 : 0]);
       additionalInputCount++;
       matched = true;
     } else if (
-      nextNode.op === "relu" ||
-      nextNode.op === "silu" ||
-      nextNode.op === "sigmoid" ||
-      nextNode.op === "tanh"
+      isFusibleOp(nextNode.op) &&
+      nextNode.inputs.length === 1 &&
+      nextNode.op !== "cast"
     ) {
-      epilogueOps.push({ kind: "unary", op: nextNode.op });
-      matched = true;
-    } else if (nextNode.op === "gelu") {
-      pushGeluEpilogueOp(nextNode, epilogueOps);
+      epilogueOps.push({ kind: "unary", op: getEpilogueOpName(nextNode) });
       matched = true;
     }
 
