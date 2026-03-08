@@ -148,6 +148,15 @@ const UNARY_OPS: Record<string, UnaryOpSpec> = {
       return rt.mul(g, rt.mul(-0.5, rt.mul(r, rt.mul(r, r))));
     },
   },
+  sqrt: {
+    grad: (rt, g, s) => {
+      const sqrtA = rt.sqrt(s._unwrap());
+      return rt.mul(g, rt.div(0.5, rt.add(sqrtA, 1e-8)));
+    },
+  },
+  relu: {
+    grad: (rt, g, s) => rt.mul(g, rt.gt(s._unwrap(), 0)),
+  },
   floor: { grad: null },
   ceil: { grad: null },
   round: { grad: null },
@@ -787,43 +796,11 @@ export class Torchlette {
   }
 
   sqrt(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.sqrt(a._unwrap());
-    const tensorsToSave = a.requiresGrad ? [a] : [];
-    return this._wrapWithGrad(
-      inner,
-      [a],
-      (grad, getSaved) => {
-        // grad_input = grad_output * 0.5 / sqrt(input)
-        // Recompute sqrt from saved input for checkpointing support
-        const savedA = getSaved(0);
-        const sqrtA = this.runtime.sqrt(savedA._unwrap());
-        const denom = this.runtime.add(sqrtA, 1e-8);
-        const reciprocal = this.runtime.div(0.5, denom);
-        const gradInput = this.runtime.mul(grad, reciprocal);
-        return [gradInput];
-      },
-      tensorsToSave,
-    );
+    return this._dispatchUnary("sqrt", a);
   }
 
   relu(a: Tensor): Tensor {
-    this._assertUsable(a);
-    const inner = this.runtime.relu(a._unwrap());
-    const tensorsToSave = a.requiresGrad ? [a] : [];
-    return this._wrapWithGrad(
-      inner,
-      [a],
-      (grad, getSaved) => {
-        // grad_input = grad_output * (input > 0)
-        // Use comparison op to create mask, then multiply
-        const savedA = getSaved(0);
-        const mask = this.runtime.gt(savedA._unwrap(), 0);
-        const gradInput = this.runtime.mul(grad, mask);
-        return [gradInput];
-      },
-      tensorsToSave,
-    );
+    return this._dispatchUnary("relu", a);
   }
 
   exp(a: Tensor): Tensor {
