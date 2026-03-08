@@ -70,7 +70,15 @@ interface OpDef {
     | "arithmetic"
     | "comparison"
     | "ternary"
-    | "cast";
+    | "cast"
+    | "bitwise";
+
+  /** WGSL infix operator for tile-compiler binary ops (e.g., "+", "&"). */
+  wgslInfix?: string;
+  /** WGSL prefix operator for tile-compiler unary ops (e.g., "-" for neg). */
+  wgslPrefix?: string;
+  /** WGSL function name when it differs from op name (e.g., rsqrt → inverseSqrt). */
+  wgslFnName?: string;
 }
 
 // ============================================================================
@@ -150,6 +158,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     fusible: true,
     vectorizable: true,
     category: "math",
+    wgslPrefix: "-",
   },
   abs: {
     expr: (a: string) => `abs(${a})`,
@@ -185,6 +194,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     fusible: true,
     vectorizable: true,
     category: "math",
+    wgslFnName: "inverseSqrt",
   },
   sin: {
     expr: (a: string) => `sin(${a})`,
@@ -249,6 +259,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     fusible: true,
     vectorizable: true,
     category: "arithmetic",
+    wgslInfix: "+",
   },
   sub: {
     expr: (a: string, b: string) => `(${a} - ${b})`,
@@ -256,6 +267,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     fusible: true,
     vectorizable: true,
     category: "arithmetic",
+    wgslInfix: "-",
   },
   mul: {
     expr: (a: string, b: string) => `(${a} * ${b})`,
@@ -263,6 +275,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     fusible: true,
     vectorizable: true,
     category: "arithmetic",
+    wgslInfix: "*",
   },
   div: {
     expr: (a: string, b: string) => `(${a} / ${b})`,
@@ -270,6 +283,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     fusible: true,
     vectorizable: true,
     category: "arithmetic",
+    wgslInfix: "/",
   },
   pow: {
     expr: (a: string, b: string) => `pow(${a}, ${b})`,
@@ -296,8 +310,9 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     expr: (a: string, b: string) => `(${a} % ${b})`,
     arity: 2,
     fusible: true,
-    vectorizable: false, // WGSL % doesn't work on vectors the same way
+    vectorizable: false,
     category: "arithmetic",
+    wgslInfix: "%",
   },
 
   // ---------------------------------------------------------------------------
@@ -406,6 +421,37 @@ export const OP_REGISTRY: Record<string, OpDef> = {
 // gelu_tanh is an alias for gelu (both use tanh approximation)
 OP_REGISTRY.gelu_tanh = OP_REGISTRY.gelu;
 
+// ---------------------------------------------------------------------------
+// Bitwise / Shift Ops (used by tile-compiler, not fusible in elementwise)
+// ---------------------------------------------------------------------------
+const BITWISE_OPS: Record<
+  string,
+  Pick<OpDef, "expr" | "wgslInfix" | "wgslPrefix">
+> = {
+  and: { expr: (a: string, b: string) => `(${a} & ${b})`, wgslInfix: "&" },
+  or: { expr: (a: string, b: string) => `(${a} | ${b})`, wgslInfix: "|" },
+  xor: { expr: (a: string, b: string) => `(${a} ^ ${b})`, wgslInfix: "^" },
+  shr: { expr: (a: string, b: string) => `(${a} >> ${b})`, wgslInfix: ">>" },
+  shl: { expr: (a: string, b: string) => `(${a} << ${b})`, wgslInfix: "<<" },
+};
+for (const [name, def] of Object.entries(BITWISE_OPS)) {
+  OP_REGISTRY[name] = {
+    ...def,
+    arity: 2,
+    fusible: false,
+    vectorizable: false,
+    category: "bitwise",
+  } as OpDef;
+}
+OP_REGISTRY["not"] = {
+  expr: (a: string) => `(!${a})`,
+  arity: 1,
+  fusible: false,
+  vectorizable: false,
+  category: "bitwise",
+  wgslPrefix: "!",
+};
+
 // ============================================================================
 // Helper Functions (only those used in production)
 // ============================================================================
@@ -418,4 +464,19 @@ export function canVectorize(op: string): boolean {
 /** Check if an op is a unary operation. */
 export function isUnaryOp(op: string): boolean {
   return OP_REGISTRY[op]?.arity === 1;
+}
+
+/** Get WGSL infix operator for a binary op (e.g., "add" → "+"). */
+export function getWgslInfix(op: string): string | undefined {
+  return OP_REGISTRY[op]?.wgslInfix;
+}
+
+/** Get WGSL prefix operator for a unary op (e.g., "neg" → "-"). */
+export function getWgslPrefix(op: string): string | undefined {
+  return OP_REGISTRY[op]?.wgslPrefix;
+}
+
+/** Get WGSL function name, falling back to op name (e.g., "rsqrt" → "inverseSqrt"). */
+export function getWgslFnName(op: string): string {
+  return OP_REGISTRY[op]?.wgslFnName ?? op;
 }

@@ -55,25 +55,7 @@ function findElementwiseUniform(spec: TileKernelSpec): string | null {
 // WGSL Expression Emission
 // ============================================================================
 
-/** Binary ops → infix WGSL operator. Function-style ops (min, max, pow) use op name directly. */
-const BINARY_INFIX: Record<string, string> = {
-  add: "+",
-  sub: "-",
-  mul: "*",
-  div: "/",
-  mod: "%",
-  and: "&",
-  or: "|",
-  xor: "^",
-  shr: ">>",
-  shl: "<<",
-};
-
-/** Unary ops with prefix syntax. */
-const UNARY_PREFIX: Record<string, string> = { neg: "-", not: "!" };
-
-/** Unary ops where the WGSL function name differs from the op name. */
-const UNARY_FN: Record<string, string> = { rsqrt: "inverseSqrt" };
+import { getWgslFnName, getWgslInfix, getWgslPrefix } from "./ops/registry";
 
 type BindingMap = Map<number, string>;
 
@@ -194,7 +176,7 @@ function exprFor(node: IRNode, bindings: BindingMap, v4?: Vec4Ctx): string {
     case "binary": {
       const lhs = exprFor(node.lhs, bindings, v4);
       const rhs = exprFor(node.rhs, bindings, v4);
-      const infixOp = BINARY_INFIX[node.op];
+      const infixOp = getWgslInfix(node.op);
       if (v4 && (NEEDS_SPLAT.has(node.op) || !infixOp)) {
         // For ops that don't auto-broadcast (bitwise, min/max/pow):
         // splat the scalar side if the other is vec4
@@ -210,10 +192,9 @@ function exprFor(node: IRNode, bindings: BindingMap, v4?: Vec4Ctx): string {
     }
     case "unary": {
       const input = exprFor(node.input, bindings, v4);
-      const prefix = UNARY_PREFIX[node.op];
+      const prefix = getWgslPrefix(node.op);
       if (prefix) return `${prefix}(${input})`;
-      const fn = UNARY_FN[node.op] ?? node.op;
-      return `${fn}(${input})`;
+      return `${getWgslFnName(node.op)}(${input})`;
     }
     case "cast": {
       const input = exprFor(node.input, bindings, v4);
