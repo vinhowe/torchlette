@@ -47,6 +47,7 @@ import {
   executeReductionWithEpilogue,
   executeReductionWithFusion,
   executeReductionWithPreamble,
+  type ReductionDirective,
 } from "./reduction-preamble";
 import { releaseDeadTensors } from "./storage-tracker";
 
@@ -404,6 +405,7 @@ interface SegmentExecOptions {
   loweredPlanBuilder?: LoweredPlanBuilder | null;
   nodeIdToFinalPos?: Map<number, number>;
   compoundMatchMap?: Map<number, CompoundMatchExec>;
+  reductionDirectives?: Map<number, ReductionDirective>;
 }
 
 /**
@@ -428,6 +430,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
     loweredPlanBuilder,
     nodeIdToFinalPos,
     compoundMatchMap,
+    reductionDirectives,
   } = options;
   const useSharedEncoder = backend.name === "webgpu";
   if (useSharedEncoder) beginSharedEncoder();
@@ -620,12 +623,16 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
       // Try combined preamble + epilogue reduction fusion (Phase 5)
       if (isFusibleOp(node.op) && backend.name === "webgpu") {
-        const fusionPlan = detectReductionFusion(
-          nodes,
-          nodeIdx,
-          reductionConsumerCount,
-          externalNodeIds,
-        );
+        const rdDirective = reductionDirectives?.get(node.id);
+        const fusionPlan =
+          rdDirective?.kind === "fusion"
+            ? rdDirective.plan
+            : detectReductionFusion(
+                nodes,
+                nodeIdx,
+                reductionConsumerCount,
+                externalNodeIds,
+              );
         if (fusionPlan) {
           const fusionLabel = `${fusionPlan.isMean ? "mean" : "sum"}+${fusionPlan.preambleChain
             .map((n) => n.op)
@@ -663,11 +670,10 @@ export async function executeSequentialSegmentWithEarlyRelease(
         }
 
         // Fall back to preamble-only fusion (Phase 3)
-        const reductionPlan = detectReductionPreamble(
-          nodes,
-          nodeIdx,
-          reductionConsumerCount,
-        );
+        const reductionPlan =
+          rdDirective?.kind === "preamble"
+            ? rdDirective.plan
+            : detectReductionPreamble(nodes, nodeIdx, reductionConsumerCount);
         if (reductionPlan) {
           const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${reductionPlan.preambleChain.map((n) => n.op).join("+")}`;
           await withProfileContext(rpLabel, node.module, () =>
@@ -700,12 +706,16 @@ export async function executeSequentialSegmentWithEarlyRelease(
         (node.op === "sum" || node.op === "mean" || node.op === "max") &&
         backend.name === "webgpu"
       ) {
-        const epiloguePlan = detectReductionEpilogue(
-          nodes,
-          nodeIdx,
-          reductionConsumerCount,
-          externalNodeIds,
-        );
+        const reDirective = reductionDirectives?.get(node.id);
+        const epiloguePlan =
+          reDirective?.kind === "epilogue"
+            ? reDirective.plan
+            : detectReductionEpilogue(
+                nodes,
+                nodeIdx,
+                reductionConsumerCount,
+                externalNodeIds,
+              );
         if (epiloguePlan) {
           const reLabel = `${node.op}+${formatEpilogueLabel(epiloguePlan.epilogueOps)}`;
           await withProfileContext(reLabel, node.module, () =>

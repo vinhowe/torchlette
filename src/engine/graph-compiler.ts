@@ -29,6 +29,7 @@ import {
   detectReductionEpilogue,
   detectReductionFusion,
   detectReductionPreamble,
+  type ReductionDirective,
 } from "./reduction-preamble";
 
 // ============================================================================
@@ -66,6 +67,9 @@ interface GraphAnalysisResult {
 
   /** Node IDs bypassed by graph rewrites (identity casts, redundant contiguous). */
   rewriteBypassedIds: Set<number>;
+
+  /** Pre-computed reduction pattern directives (trigger nodeId → plan). */
+  reductionDirectives: Map<number, ReductionDirective>;
 }
 
 // ============================================================================
@@ -367,6 +371,7 @@ export function analyzeGraph(
   // ensuring preamble/epilogue ops stay in sequential segments where
   // inline detection can fuse them into reduction kernels.
   const reductionClaimedIds = new Set<number>();
+  const reductionDirectives = new Map<number, ReductionDirective>();
   for (let i = 0; i < reorderedNodes.length; i++) {
     const node = reorderedNodes[i];
     if (reductionClaimedIds.has(node.id)) continue;
@@ -382,6 +387,7 @@ export function analyzeGraph(
         externalNodeIds,
       );
       if (fusion) {
+        reductionDirectives.set(node.id, { kind: "fusion", plan: fusion });
         for (const n of fusion.preambleChain) reductionClaimedIds.add(n.id);
         for (const n of fusion.epilogueChain) reductionClaimedIds.add(n.id);
         continue;
@@ -393,6 +399,7 @@ export function analyzeGraph(
         consumerCount,
       );
       if (preamble) {
+        reductionDirectives.set(node.id, { kind: "preamble", plan: preamble });
         for (const n of preamble.preambleChain) reductionClaimedIds.add(n.id);
         continue;
       }
@@ -407,6 +414,7 @@ export function analyzeGraph(
         externalNodeIds,
       );
       if (epilogue) {
+        reductionDirectives.set(node.id, { kind: "epilogue", plan: epilogue });
         // Claim epilogue chain nodes (not the reduction itself — it's the anchor)
         for (let j = 1; j < epilogue.consumedCount; j++) {
           reductionClaimedIds.add(reorderedNodes[i + j].id);
@@ -450,6 +458,7 @@ export function analyzeGraph(
     compoundMatches,
     consumerCount,
     rewriteBypassedIds,
+    reductionDirectives,
   };
 }
 

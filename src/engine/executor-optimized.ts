@@ -247,6 +247,9 @@ export async function executePlanOptimized(
   const compoundClaimedIds = new Set<number>();
   let compoundMatches: CompoundMatch[] = [];
   let analysisConsumerCount: Map<number, number> | undefined;
+  let reductionDirectives:
+    | ReturnType<typeof analyzeGraph>["reductionDirectives"]
+    | undefined;
 
   if (cachedTemplate) {
     // ── Cache hit: reconstruct from template ──
@@ -364,6 +367,7 @@ export async function executePlanOptimized(
       matmulPrologues.set(mmId, prologues);
     compoundMatches = analysis.compoundMatches;
     analysisConsumerCount = analysis.consumerCount;
+    reductionDirectives = analysis.reductionDirectives;
 
     // ── Build template and cache it ──
     const origIdToPos = buildIdPositionMap(plan.nodes);
@@ -697,6 +701,7 @@ export async function executePlanOptimized(
           loweredPlanBuilder,
           nodeIdToFinalPos,
           compoundMatchMap,
+          reductionDirectives,
         });
         stats.sequentialNodes += seqNodes.length;
         overallStep += seqNodes.length;
