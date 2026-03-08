@@ -63,7 +63,7 @@ import {
   startPipelineRecording,
   stopPipelineRecording,
 } from "../src/backend/webgpu/pipeline-warmup";
-import { storageTracker } from "../src/engine/lazy";
+import { storageTracker } from "../src/engine/storage-tracker";
 import { type Tensor, Torchlette } from "../src/frontend";
 import { checkpoint, crossEntropy } from "../src/nn";
 import { Adam, GradScaler } from "../src/optim";

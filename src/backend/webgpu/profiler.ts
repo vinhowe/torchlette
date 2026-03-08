@@ -568,7 +568,7 @@ export async function readGpuTimestamps(): Promise<void> {
   if (gpuTs.labelStats.size > 0) return;
 
   // Drain the deferred fence from markStep()
-  const { awaitDeferredFence } = await import("./index");
+  const { awaitDeferredFence } = await import("./buffer-pool");
   await awaitDeferredFence();
 
   await resolveAndMapTimestamps(gpuTs.stagingSlots);

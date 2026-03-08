@@ -327,7 +327,7 @@ function matmulKernelBlockOps(
       "k_per_split",
       k.add(ctx.const(kSplit - 1, "u32")).div(ctx.const(kSplit, "u32")),
     );
-    kStart = ctx.emitLet("k_start", splitIdx?.mul(kPerSplit));
+    kStart = ctx.emitLet("k_start", splitIdx!.mul(kPerSplit));
     kEnd = ctx.emitLet("k_end", kStart.add(kPerSplit).min(k));
     numKTiles = ctx.emitLet(
       "num_k_tiles",
@@ -373,7 +373,7 @@ function matmulKernelBlockOps(
 
   // 9. Store — two paths: K-split (raw partials) vs normal (with optional post-accumulate)
   if (kSplit) {
-    const splitBase = ctx.emitLet("split_base", splitIdx?.mul(m.mul(n)));
+    const splitBase = ctx.emitLet("split_base", splitIdx!.mul(m.mul(n)));
     const outPtr = ctx.tilePtr(splitBase, offsM.outer(ldc), offsN.inner(cOne));
     const outMask = ctx.tileMask(offsM.lt(m), offsN.lt(n));
     ctx.store2D("out", acc, outPtr, outMask);

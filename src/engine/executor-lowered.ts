@@ -823,8 +823,8 @@ export async function executeLoweredPlan(
 
           // Reconstruct prologues and resolve prologue decisions
           let prologues: MatmulPrologueInfo[] | undefined;
-          let inputCastA: DType | undefined;
-          let inputCastB: DType | undefined;
+          let inputCastA: "f16" | "f32" | undefined;
+          let inputCastB: "f16" | "f32" | undefined;
           let resolvedInputRefA = matmulNode.inputs[0];
           let resolvedInputRefB = matmulNode.inputs[1];
           // Track paths for caching (plan-node-relative, stable across steps)
@@ -857,14 +857,14 @@ export async function executeLoweredPlan(
               if (!castAlreadyRan) {
                 if (p.inputIndex === 0) {
                   resolvedInputRefA = planNodes[p.castNodeIndex].inputs[0];
-                  inputCastA = p.toDtype;
+                  inputCastA = p.toDtype as "f16" | "f32";
                   inputAPath = {
                     planNodeIndex: p.castNodeIndex,
                     inputIndex: 0,
                   };
                 } else {
                   resolvedInputRefB = planNodes[p.castNodeIndex].inputs[0];
-                  inputCastB = p.toDtype;
+                  inputCastB = p.toDtype as "f16" | "f32";
                   inputBPath = {
                     planNodeIndex: p.castNodeIndex,
                     inputIndex: 0,

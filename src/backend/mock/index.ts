@@ -86,18 +86,12 @@ function scatterAdd(
   return cpuScatterAdd(a, index, src, options);
 }
 
-function sum(a: Tensor, options?: SumOptions): number | Tensor {
-  if (options?.dim != null) {
-    return cpuSum(a, options);
-  }
-  return cpuSum(a);
+function sum(a: Tensor, options?: SumOptions): Tensor {
+  return cpuSum(a, options);
 }
 
-function mean(a: Tensor, options?: MeanOptions): number | Tensor {
-  if (options?.dim != null) {
-    return cpuMean(a, options);
-  }
-  return cpuMean(a);
+function mean(a: Tensor, options?: MeanOptions): Tensor {
+  return cpuMean(a, options);
 }
 
 function read(a: Tensor): Promise<number[]> {
