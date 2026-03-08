@@ -7,6 +7,7 @@ import type {
   DType,
 } from "../backend/types";
 import { getCurrentOpLabel, setCurrentOpLabel } from "../backend/webgpu";
+import { OP_REGISTRY } from "../backend/webgpu/ops/registry";
 import {
   profileOpBegin,
   profileOpEnd,
@@ -284,7 +285,7 @@ function executeShapeOp(
 }
 
 // ---------------------------------------------------------------------------
-// Reduction op dispatch table
+// Generic op dispatch table
 // ---------------------------------------------------------------------------
 
 type ReductionDesc = {
@@ -294,57 +295,46 @@ type ReductionDesc = {
   payload: "required" | "optional" | "none";
 };
 
-const GENERIC_OP_TABLE: Record<string, ReductionDesc> = {
-  // Unary ops (arity 1, no payload)
-  sqrt: { arity: 1, payload: "none" },
-  relu: { arity: 1, payload: "none" },
-  exp: { arity: 1, payload: "none" },
-  log: { arity: 1, payload: "none" },
-  neg: { arity: 1, payload: "none" },
-  abs: { arity: 1, payload: "none" },
-  tanh: { arity: 1, payload: "none" },
-  sigmoid: { arity: 1, payload: "none" },
-  silu: { arity: 1, payload: "none" },
-  sin: { arity: 1, payload: "none" },
-  cos: { arity: 1, payload: "none" },
-  rsqrt: { arity: 1, payload: "none" },
-  floor: { arity: 1, payload: "none" },
-  ceil: { arity: 1, payload: "none" },
-  round: { arity: 1, payload: "none" },
-  isfinite: { arity: 1, payload: "none" },
-  sign: { arity: 1, payload: "none" },
-  gelu: { arity: 1, payload: "optional" },
-  // Binary ops
-  add: { arity: 2, payload: "none" },
-  sub: { arity: 2, payload: "optional" },
-  mul: { arity: 2, payload: "none" },
-  div: { arity: 2, payload: "optional" },
+// Payload overrides: lazy engine ops that accept options not captured in OP_REGISTRY
+const PAYLOAD_OVERRIDES: Record<string, "optional"> = {
+  gelu: "optional", // GeluOptions (approximation mode)
+  sub: "optional", // SubOptions (alpha)
+  div: "optional", // DivOptions (rounding_mode)
+};
+
+// Auto-derive elementwise op entries from OP_REGISTRY (single source of truth)
+const GENERIC_OP_TABLE: Record<string, ReductionDesc> = {};
+for (const [name, def] of Object.entries(OP_REGISTRY)) {
+  // Skip cast variants (lazy engine uses "cast" with separate handler)
+  if (name.startsWith("cast_")) continue;
+  // Skip gelu aliases (lazy engine dispatches "gelu" with payload)
+  if (name === "gelu_tanh" || name === "gelu_erf") continue;
+  // Skip bitwise ops (not lazy engine ops)
+  if (def.category === "bitwise") continue;
+  // Skip max/min (reductions in lazy engine, listed below with arity 1)
+  if (name === "max" || name === "min") continue;
+
+  GENERIC_OP_TABLE[name] = {
+    arity: def.arity,
+    payload: PAYLOAD_OVERRIDES[name] ?? "none",
+  };
+}
+// Non-registry ops (reductions, multi-input, mutations)
+Object.assign(GENERIC_OP_TABLE, {
   matmul: { arity: 2, payload: "none" },
-  pow: { arity: 2, payload: "none" },
-  // Reductions
   sum: { arity: 1, payload: "optional" },
   max: { arity: 1, payload: "optional" },
   min: { arity: 1, payload: "optional" },
   mean: { arity: 1, payload: "optional" },
   argmax: { arity: 1, payload: "required" },
   argmin: { arity: 1, payload: "required" },
-  // Multi-input ops
   conv2d: { arity: 3, payload: "optional" },
   gather: { arity: 2, payload: "required" },
   scatterAdd: { arity: 3, payload: "required" },
   cat: { arity: "all", payload: "required" },
-  // Comparisons
-  gt: { arity: 2, payload: "none" },
-  lt: { arity: 2, payload: "none" },
-  ge: { arity: 2, payload: "none" },
-  le: { arity: 2, payload: "none" },
-  eq: { arity: 2, payload: "none" },
-  ne: { arity: 2, payload: "none" },
-  where: { arity: 3, payload: "none" },
-  // Mutation ops (simple pass-through)
   stridedScatterCopy: { arity: 2, payload: "required" },
   stridedScatterAdd: { arity: 2, payload: "required" },
-};
+});
 
 function executeGenericOp(
   node: LazyIRNode,
