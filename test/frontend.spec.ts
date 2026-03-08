@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { DisposedTensorError, FrontendTensor, Torchlette, torch } from "../src";
 import { SavedTensorModifiedError } from "../src/engine/engine";
+import { Linear, Module } from "../src/nn";
 
 describe("frontend api: Tensor wrapper", () => {
   it("creates tensors and runs elementwise ops", async () => {
@@ -610,5 +611,154 @@ describe("frontend api: chunk and split", () => {
     await loss.backward();
 
     expect(await x.grad?.cpu()).toEqual([1, 1, 1, 1, 1]);
+  });
+
+  // ==========================================================================
+  // embedding()
+  // ==========================================================================
+
+  it("embedding lookup returns correct rows", async () => {
+    const weight = torch.tensorFromArray(
+      [10, 11, 20, 21, 30, 31, 40, 41],
+      [4, 2],
+    );
+    const indices = torch.tensorFromArray([0, 2, 3], [3]);
+    const result = torch.embedding(weight, indices);
+
+    expect(result.shape).toEqual([3, 2]);
+    expect(await result.cpu()).toEqual([10, 11, 30, 31, 40, 41]);
+  });
+
+  it("embedding handles 2D indices", async () => {
+    const weight = torch.tensorFromArray([1, 2, 3, 4, 5, 6], [3, 2]);
+    const indices = torch.tensorFromArray([0, 2, 1, 0], [2, 2]);
+    const result = torch.embedding(weight, indices);
+
+    expect(result.shape).toEqual([2, 2, 2]);
+    expect(await result.cpu()).toEqual([1, 2, 5, 6, 3, 4, 1, 2]);
+  });
+
+  it("embedding backward accumulates to weight rows", async () => {
+    const weight = torch.tensorFromArray([0, 0, 0, 0, 0, 0], [3, 2], {
+      requiresGrad: true,
+    });
+    const indices = torch.tensorFromArray([0, 2, 0], [3]);
+    const result = torch.embedding(weight, indices);
+    // result shape: [3, 2]
+    const loss = result.sum() as FrontendTensor;
+    await loss.backward();
+
+    // Row 0 selected twice, row 2 once → grad weight row 0 = [2,2], row 1 = [0,0], row 2 = [1,1]
+    expect(await weight.grad?.cpu()).toEqual([2, 2, 0, 0, 1, 1]);
+  });
+
+  // ==========================================================================
+  // requires_grad_()
+  // ==========================================================================
+
+  it("requires_grad_ enables grad on tensor", async () => {
+    const a = torch.tensorFromArray([1, 2, 3], [3]);
+    expect(a.requiresGrad).toBe(false);
+
+    a.requires_grad_(true);
+    expect(a.requiresGrad).toBe(true);
+
+    const b = a.mul(2);
+    const loss = b.sum() as FrontendTensor;
+    await loss.backward();
+    expect(await a.grad?.cpu()).toEqual([2, 2, 2]);
+  });
+
+  it("requires_grad_ disables grad on tensor", () => {
+    const a = torch.tensorFromArray([1, 2], [2], { requiresGrad: true });
+    expect(a.requiresGrad).toBe(true);
+
+    a.requires_grad_(false);
+    expect(a.requiresGrad).toBe(false);
+  });
+
+  it("requires_grad_ returns this for chaining", () => {
+    const a = torch.tensorFromArray([1], [1]);
+    const b = a.requires_grad_(true);
+    expect(b).toBe(a);
+  });
+});
+
+// =============================================================================
+// Module system tests
+// =============================================================================
+
+describe("Module system", () => {
+  it("registerParameter stores params and sets property", () => {
+    const linear = new Linear(torch, 4, 2);
+    expect(linear.weight).toBeDefined();
+    expect(linear.weight.shape).toEqual([2, 4]);
+    expect(linear.bias).toBeDefined();
+    expect(linear.bias!.shape).toEqual([2]);
+  });
+
+  it("base parameters() collects own + child params", () => {
+    class TwoLinear extends Module {
+      declare fc1: any;
+      declare fc2: any;
+      constructor() {
+        super(torch);
+        this.fc1 = new Linear(torch, 4, 3);
+        this.fc2 = new Linear(torch, 3, 2);
+        this.registerModule("fc1", this.fc1);
+        this.registerModule("fc2", this.fc2);
+      }
+      forward(x: FrontendTensor) {
+        return this.fc2.forward(this.fc1.forward(x));
+      }
+    }
+    const model = new TwoLinear();
+    const params = model.parameters();
+    // fc1: weight + bias = 2, fc2: weight + bias = 2 → 4 total
+    expect(params.length).toBe(4);
+  });
+
+  it("namedParameters returns dotted paths", () => {
+    class TwoLinear extends Module {
+      declare fc1: any;
+      declare fc2: any;
+      constructor() {
+        super(torch);
+        this.fc1 = new Linear(torch, 4, 3);
+        this.fc2 = new Linear(torch, 3, 2);
+        this.registerModule("fc1", this.fc1);
+        this.registerModule("fc2", this.fc2);
+      }
+      forward(x: FrontendTensor) {
+        return this.fc2.forward(this.fc1.forward(x));
+      }
+    }
+    const model = new TwoLinear();
+    const named = model.namedParameters();
+    const names = named.map(([n]) => n);
+    expect(names).toEqual(["fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"]);
+  });
+
+  it("stateDict returns named tensor map", () => {
+    const linear = new Linear(torch, 3, 2);
+    const sd = linear.stateDict();
+    expect(Object.keys(sd)).toEqual(["weight", "bias"]);
+    expect(sd.weight.shape).toEqual([2, 3]);
+    expect(sd.bias.shape).toEqual([2]);
+  });
+
+  it("loadStateDict copies values in-place", async () => {
+    const linear = new Linear(torch, 2, 2, { bias: false });
+    // Create a known weight
+    const newWeight = torch.tensorFromArray([1, 2, 3, 4], [2, 2]);
+    linear.loadStateDict({ weight: newWeight });
+    expect(await linear.weight.cpu()).toEqual([1, 2, 3, 4]);
+  });
+
+  it("Linear without bias has null bias in stateDict", () => {
+    const linear = new Linear(torch, 3, 2, { bias: false });
+    const sd = linear.stateDict();
+    // Only weight, no bias since bias=null
+    expect(Object.keys(sd)).toEqual(["weight"]);
   });
 });
