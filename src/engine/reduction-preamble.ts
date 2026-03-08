@@ -482,6 +482,12 @@ export interface ReductionFusionPlan {
   consumedCount: number;
 }
 
+/** Pre-computed reduction pattern, keyed by trigger node ID. */
+export type ReductionDirective =
+  | { kind: "fusion"; plan: ReductionFusionPlan }
+  | { kind: "preamble"; plan: ReductionPreamblePlan }
+  | { kind: "epilogue"; plan: ReductionEpiloguePlan };
+
 /**
  * Detect a combined [elem chain] → reduction → [elem chain] pattern.
  *

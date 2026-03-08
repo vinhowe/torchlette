@@ -232,4 +232,93 @@ describe("Graph Compiler — analyzeGraph()", () => {
     // mul(x, 1) should be bypassed
     expect(result.rewriteBypassedIds.has(mulOne.id)).toBe(true);
   });
+
+  it("produces reduction preamble directives", () => {
+    // Build: mul → sum chain — should produce a preamble directive
+    const x = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const y = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [5, 6, 7, 8],
+    });
+    const mul = createLazyIRNode(
+      "mul",
+      [createPendingRef(x), createPendingRef(y)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const sum = createLazyIRNode(
+      "sum",
+      [createPendingRef(mul)],
+      [],
+      "f32",
+      "cpu",
+      { dim: null },
+    );
+
+    const result = analyzeGraph([x, y, mul, sum]);
+
+    // The mul node triggers a preamble directive
+    const directive = result.reductionDirectives.get(mul.id);
+    expect(directive).toBeDefined();
+    expect(directive!.kind).toBe("preamble");
+    if (directive!.kind === "preamble") {
+      expect(directive!.plan.reductionNode.id).toBe(sum.id);
+      expect(directive!.plan.preambleChain.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("produces reduction epilogue directives", () => {
+    // Build: sum → relu chain — should produce an epilogue directive
+    const x = createLazyIRNode("tensorFromArray", [], [2, 4], "f32", "cpu", {
+      values: [1, 2, 3, 4, 5, 6, 7, 8],
+    });
+    const sum = createLazyIRNode(
+      "sum",
+      [createPendingRef(x)],
+      [2, 1],
+      "f32",
+      "cpu",
+      { dim: 1, keepdim: true },
+    );
+    const relu = createLazyIRNode(
+      "relu",
+      [createPendingRef(sum)],
+      [2, 1],
+      "f32",
+      "cpu",
+    );
+
+    const result = analyzeGraph([x, sum, relu]);
+
+    // The sum node triggers an epilogue directive
+    const directive = result.reductionDirectives.get(sum.id);
+    expect(directive).toBeDefined();
+    expect(directive!.kind).toBe("epilogue");
+    if (directive!.kind === "epilogue") {
+      expect(directive!.plan.reductionNode.id).toBe(sum.id);
+      expect(directive!.plan.outputNode.id).toBe(relu.id);
+    }
+  });
+
+  it("reductionDirectives is empty when no patterns match", () => {
+    const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const b = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [5, 6, 7, 8],
+    });
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(a), createPendingRef(b)],
+      [4],
+      "f32",
+      "cpu",
+    );
+
+    const result = analyzeGraph([a, b, add]);
+
+    expect(result.reductionDirectives.size).toBe(0);
+  });
 });
