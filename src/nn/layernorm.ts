@@ -30,8 +30,8 @@ export type LayerNormOptions = {
 export class LayerNorm extends Module {
   readonly normalizedShape: number;
   readonly eps: number;
-  readonly weight: Tensor | null;
-  readonly bias: Tensor | null;
+  declare readonly weight: Tensor | null;
+  declare readonly bias: Tensor | null;
 
   constructor(
     api: Torchlette,
@@ -45,14 +45,19 @@ export class LayerNorm extends Module {
     const elementwiseAffine = options?.elementwiseAffine ?? true;
     const device = options?.device;
 
-    if (elementwiseAffine) {
-      // Initialize weight to ones and bias to zeros (like PyTorch)
-      this.weight = api.ones([normalizedShape], { requiresGrad: true, device });
-      this.bias = api.zeros([normalizedShape], { requiresGrad: true, device });
-    } else {
-      this.weight = null;
-      this.bias = null;
-    }
+    // Initialize weight to ones and bias to zeros (like PyTorch)
+    this.registerParameter(
+      "weight",
+      elementwiseAffine
+        ? api.ones([normalizedShape], { requiresGrad: true, device })
+        : null,
+    );
+    this.registerParameter(
+      "bias",
+      elementwiseAffine
+        ? api.zeros([normalizedShape], { requiresGrad: true, device })
+        : null,
+    );
   }
 
   /**
@@ -63,24 +68,11 @@ export class LayerNorm extends Module {
    */
   forward(input: Tensor): Tensor {
     if (this.weight === null || this.bias === null) {
-      // Without affine parameters, just normalize
-      // This requires implementing normalization without affine transform
-      // For now, we'll require affine=true
       throw new Error(
         "LayerNorm without elementwiseAffine is not yet supported",
       );
     }
 
     return input.layernorm(this.weight, this.bias, this.eps);
-  }
-
-  /**
-   * Get all learnable parameters.
-   */
-  parameters(): Tensor[] {
-    if (this.weight !== null && this.bias !== null) {
-      return [this.weight, this.bias];
-    }
-    return [];
   }
 }
