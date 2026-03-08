@@ -1,25 +1,10 @@
-import { describe, expect, test } from "vitest";
+import { describe, test } from "vitest";
 
 import { Adam, SGD, Torchlette } from "../../src";
+import { assertClose } from "../helpers/assertions";
 import { runTorchOracleBackwardBatch } from "./torch-oracle";
 
-type Payload = { shape: number[]; values: number[] };
 type AdamState = { m: number[]; v: number[] };
-
-const DEFAULT_ATOL = 1e-5;
-const DEFAULT_RTOL = 1e-4;
-
-function assertClose(actual: Payload, expected: Payload): void {
-  expect(actual.shape).toEqual(expected.shape);
-  expect(actual.values.length).toBe(expected.values.length);
-  for (let i = 0; i < actual.values.length; i += 1) {
-    const a = actual.values[i];
-    const b = expected.values[i];
-    const diff = Math.abs(a - b);
-    const tol = DEFAULT_ATOL + DEFAULT_RTOL * Math.abs(b);
-    expect(diff).toBeLessThanOrEqual(tol);
-  }
-}
 
 function applyAdamStep(
   params: number[],
