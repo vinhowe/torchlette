@@ -31,6 +31,7 @@ import type { MatmulPrologueInfo } from "./matmul-epilogue";
 import {
   detectMatmulEpilogueCore,
   executeMatmulWithEpilogue,
+  formatEpilogueLabel,
 } from "./matmul-epilogue";
 import {
   _webgpuMatmulImports,
@@ -46,7 +47,6 @@ import {
   executeReductionWithEpilogue,
   executeReductionWithFusion,
   executeReductionWithPreamble,
-  formatEpilogueLabel,
 } from "./reduction-preamble";
 import { releaseDeadTensors } from "./storage-tracker";
 

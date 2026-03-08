@@ -1155,18 +1155,6 @@ export function segmentPlanForExecution(
   return segments;
 }
 
-/**
- * Relaxed pre-check: returns true if the plan has 2+ fusible ops anywhere
- * (not necessarily consecutive). Used as a cheaper gate before reordering.
- */
-export function hasFusionPotential(nodes: LazyIRNode[]): boolean {
-  let count = 0;
-  for (const node of nodes) {
-    if (isFusibleOp(node.op) && ++count >= 2) return true;
-  }
-  return false;
-}
-
 /** Stable key for a non-scalar LazyRef (for input dedup tracking). */
 function inputKey(input: LazyRef): string | null {
   if (input.kind === "scalar") return null;

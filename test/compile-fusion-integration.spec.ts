@@ -13,7 +13,6 @@ import { executePlanOptimized } from "../src/engine/executor-optimized";
 import {
   detectFusionGroups,
   groupToRecipe,
-  hasFusionPotential,
   isFusibleOp,
   reorderPlanForFusion,
   segmentPlanForExecution,
@@ -753,65 +752,6 @@ describe("§15 reorderPlanForFusion", () => {
     const nodes = [ext, add, mul];
     const reordered = reorderPlanForFusion(nodes);
     expect(reordered.length).toBe(3);
-  });
-});
-
-describe("§15 hasFusionPotential", () => {
-  beforeEach(() => {
-    resetNodeIdCounter();
-    resetStorageIdCounter();
-  });
-
-  it("returns true when 2+ fusible ops exist anywhere", () => {
-    const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
-      values: [1],
-    });
-    const add = createLazyIRNode(
-      "add",
-      [createPendingRef(a), createPendingRef(a)],
-      [4],
-      "f32",
-      "cpu",
-    );
-    const sum = createLazyIRNode(
-      "sum",
-      [createPendingRef(add)],
-      [],
-      "f32",
-      "cpu",
-    );
-    const mul = createLazyIRNode(
-      "mul",
-      [createPendingRef(sum), createPendingRef(sum)],
-      [],
-      "f32",
-      "cpu",
-    );
-
-    // add and mul are NOT consecutive (sum breaks them), but hasFusionPotential returns true
-    expect(hasFusionPotential([a, add, sum, mul])).toBe(true);
-  });
-
-  it("returns false when fewer than 2 fusible ops", () => {
-    const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
-      values: [1],
-    });
-    const add = createLazyIRNode(
-      "add",
-      [createPendingRef(a), createPendingRef(a)],
-      [4],
-      "f32",
-      "cpu",
-    );
-    const sum = createLazyIRNode(
-      "sum",
-      [createPendingRef(add)],
-      [],
-      "f32",
-      "cpu",
-    );
-
-    expect(hasFusionPotential([a, add, sum])).toBe(false);
   });
 });
 
