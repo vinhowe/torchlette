@@ -283,6 +283,22 @@ export class Tensor {
   }
 
   /**
+   * Split tensor into approximately equal chunks along a dimension.
+   * Returns views (zero cost, no data copy). Last chunk may be smaller.
+   */
+  chunk(chunks: number, dim = 0): Tensor[] {
+    return this.engine.chunk(this, chunks, dim);
+  }
+
+  /**
+   * Split tensor into pieces of given size (or list of sizes) along a dimension.
+   * Returns views (zero cost, no data copy).
+   */
+  split(splitSizeOrSections: number | number[], dim = 0): Tensor[] {
+    return this.engine.split(this, splitSizeOrSections, dim);
+  }
+
+  /**
    * Cast tensor to a different dtype.
    * Returns a new tensor with the specified dtype.
    */

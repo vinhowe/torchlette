@@ -477,3 +477,138 @@ describe("frontend api: where autograd", () => {
     expect(await y.grad?.cpu()).toEqual([0, 1, 0]);
   });
 });
+
+describe("frontend api: chunk and split", () => {
+  it("chunk splits evenly", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5, 6], [6]);
+    const parts = x.chunk(3, 0);
+
+    expect(parts).toHaveLength(3);
+    expect(parts[0].shape).toEqual([2]);
+    expect(parts[1].shape).toEqual([2]);
+    expect(parts[2].shape).toEqual([2]);
+    expect(await parts[0].cpu()).toEqual([1, 2]);
+    expect(await parts[1].cpu()).toEqual([3, 4]);
+    expect(await parts[2].cpu()).toEqual([5, 6]);
+  });
+
+  it("chunk with uneven division returns fewer chunks", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5], [5]);
+    const parts = x.chunk(3, 0);
+
+    expect(parts).toHaveLength(3);
+    expect(parts[0].shape).toEqual([2]);
+    expect(parts[1].shape).toEqual([2]);
+    expect(parts[2].shape).toEqual([1]);
+    expect(await parts[2].cpu()).toEqual([5]);
+  });
+
+  it("chunk returns views sharing baseId", () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4], [4]);
+    const [a, b] = x.chunk(2, 0);
+
+    expect(a.baseId).toBe(x.baseId);
+    expect(b.baseId).toBe(x.baseId);
+  });
+
+  it("chunk along non-zero dim", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5, 6], [2, 3]);
+    const [a, b] = x.chunk(2, 0);
+
+    expect(a.shape).toEqual([1, 3]);
+    expect(b.shape).toEqual([1, 3]);
+    expect(await a.cpu()).toEqual([1, 2, 3]);
+    expect(await b.cpu()).toEqual([4, 5, 6]);
+  });
+
+  it("chunk supports negative dim", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5, 6], [2, 3]);
+    const parts = x.chunk(3, -1); // last dim, size 3 → 3 chunks of 1
+
+    expect(parts).toHaveLength(3);
+    expect(parts[0].shape).toEqual([2, 1]);
+  });
+
+  it("chunk more chunks than dim size", async () => {
+    const x = torch.tensorFromArray([1, 2, 3], [3]);
+    const parts = x.chunk(5, 0);
+
+    // ceil(3/5) = 1, so each chunk is size 1, only 3 returned
+    expect(parts).toHaveLength(3);
+    expect(parts[0].shape).toEqual([1]);
+    expect(parts[1].shape).toEqual([1]);
+    expect(parts[2].shape).toEqual([1]);
+  });
+
+  it("split with uniform size", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5, 6], [6]);
+    const parts = x.split(2, 0);
+
+    expect(parts).toHaveLength(3);
+    expect(await parts[0].cpu()).toEqual([1, 2]);
+    expect(await parts[1].cpu()).toEqual([3, 4]);
+    expect(await parts[2].cpu()).toEqual([5, 6]);
+  });
+
+  it("split with remainder", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5], [5]);
+    const parts = x.split(2, 0);
+
+    expect(parts).toHaveLength(3);
+    expect(parts[0].shape).toEqual([2]);
+    expect(parts[1].shape).toEqual([2]);
+    expect(parts[2].shape).toEqual([1]);
+  });
+
+  it("split with explicit size list", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5], [5]);
+    const [a, b] = x.split([2, 3], 0);
+
+    expect(a.shape).toEqual([2]);
+    expect(b.shape).toEqual([3]);
+    expect(await a.cpu()).toEqual([1, 2]);
+    expect(await b.cpu()).toEqual([3, 4, 5]);
+  });
+
+  it("split returns views sharing baseId", () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4], [4]);
+    const [a, b] = x.split(2, 0);
+
+    expect(a.baseId).toBe(x.baseId);
+    expect(b.baseId).toBe(x.baseId);
+  });
+
+  it("split throws for mismatched sizes", () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5], [5]);
+    expect(() => x.split([2, 2], 0)).toThrow();
+  });
+
+  it("chunk backward propagates gradients", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5, 6], [6], {
+      requiresGrad: true,
+    });
+    const [a, b, c] = x.chunk(3, 0);
+
+    // Use each chunk differently: sum first, double second, ignore third
+    const scale = torch.tensorFromArray([2, 2], [2]);
+    const loss = a.sum().add(b.mul(scale).sum());
+    await loss.backward();
+
+    // grad for a: [1, 1] (from sum)
+    // grad for b: [2, 2] (from mul(2).sum())
+    // grad for c: [0, 0] (unused)
+    expect(await x.grad?.cpu()).toEqual([1, 1, 2, 2, 0, 0]);
+  });
+
+  it("split backward propagates gradients", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5], [5], {
+      requiresGrad: true,
+    });
+    const [a, b] = x.split([2, 3], 0);
+
+    const loss = a.sum().add(b.sum());
+    await loss.backward();
+
+    expect(await x.grad?.cpu()).toEqual([1, 1, 1, 1, 1]);
+  });
+});

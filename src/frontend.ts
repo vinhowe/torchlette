@@ -1508,6 +1508,56 @@ export class Torchlette {
     ]);
   }
 
+  chunk(a: Tensor, chunks: number, dim = 0): Tensor[] {
+    this._assertUsable(a);
+    const rank = a.shape.length;
+    const d = dim < 0 ? dim + rank : dim;
+    if (d < 0 || d >= rank)
+      throw new Error(`chunk: dim ${dim} out of range for rank ${rank}`);
+    if (chunks <= 0) throw new Error("chunk: chunks must be positive");
+    const dimSize = a.shape[d];
+    const chunkSize = Math.ceil(dimSize / chunks);
+    const results: Tensor[] = [];
+    for (let i = 0; i < chunks; i++) {
+      const start = i * chunkSize;
+      if (start >= dimSize) break;
+      const length = Math.min(chunkSize, dimSize - start);
+      results.push(this.narrow(a, d, start, length));
+    }
+    return results;
+  }
+
+  split(a: Tensor, splitSizeOrSections: number | number[], dim = 0): Tensor[] {
+    this._assertUsable(a);
+    const rank = a.shape.length;
+    const d = dim < 0 ? dim + rank : dim;
+    if (d < 0 || d >= rank)
+      throw new Error(`split: dim ${dim} out of range for rank ${rank}`);
+    const dimSize = a.shape[d];
+    let sizes: number[];
+    if (typeof splitSizeOrSections === "number") {
+      sizes = [];
+      for (let pos = 0; pos < dimSize; pos += splitSizeOrSections) {
+        sizes.push(Math.min(splitSizeOrSections, dimSize - pos));
+      }
+    } else {
+      sizes = splitSizeOrSections;
+      const total = sizes.reduce((s, v) => s + v, 0);
+      if (total !== dimSize) {
+        throw new Error(
+          `split: sizes sum ${total} != dimension size ${dimSize}`,
+        );
+      }
+    }
+    const results: Tensor[] = [];
+    let start = 0;
+    for (const size of sizes) {
+      results.push(this.narrow(a, d, start, size));
+      start += size;
+    }
+    return results;
+  }
+
   cat(tensors: Tensor[], dim = 0): Tensor {
     if (tensors.length === 0) throw new Error("cat: empty tensor list");
     for (const t of tensors) this._assertUsable(t);
