@@ -18,59 +18,29 @@ import type {
   FusedNode,
   FusedOutput,
 } from "../backend/webgpu/fusion-types";
+import { OP_REGISTRY } from "../backend/webgpu/ops/registry";
 import { shapesEqual } from "../core/shape";
 import type { LazyIRNode, LazyRef } from "./lazy-types";
 
 /**
  * Ops that can be fused into elementwise kernels.
+ * Derived from OP_REGISTRY (single source of truth).
+ *
+ * Exclusions:
+ * - cast_* variants: the lazy engine uses "cast" (mapped to cast_f16 etc. at codegen time)
+ * - max, min: the lazy engine uses these as reductions (arity 1 + dim), not binary elementwise
  */
-const FUSIBLE_OPS = new Set([
-  // Arithmetic (binary elementwise)
-  "add",
-  "sub",
-  "mul",
-  "div",
-  "pow",
-  // Math (unary elementwise)
-  "sqrt",
-  "rsqrt",
-  "neg",
-  "abs",
-  "exp",
-  "log",
-  "sin",
-  "cos",
-  "floor",
-  "ceil",
-  "round",
-  "sign",
-  // Activations (unary elementwise)
-  "relu",
-  "sigmoid",
-  "tanh",
-  "gelu",
-  "gelu_tanh",
-  "gelu_erf",
-  "silu",
-  "softplus",
-  // Comparisons (binary elementwise)
-  "eq",
-  "ne",
-  "lt",
-  "le",
-  "gt",
-  "ge",
-  // Ternary (elementwise)
-  "where",
-  // Type cast (elementwise)
-  "cast",
-  // Finite check (unary elementwise, returns f32 0/1)
-  "isfinite",
-  // Note: "max" and "min" are NOT included here because the runtime
-  // uses them as reduction ops (single input + dim option), not as
-  // binary elementwise ops. The registry's max/min are binary elementwise
-  // but the lazy engine's max/min are reductions.
-]);
+const FUSIBLE_OPS = new Set<string>();
+for (const [name, def] of Object.entries(OP_REGISTRY)) {
+  if (def.fusible && !name.startsWith("cast_")) {
+    FUSIBLE_OPS.add(name);
+  }
+}
+// "cast" is fusible (mapped to cast_f16 etc. at codegen time)
+FUSIBLE_OPS.add("cast");
+// max/min are reductions in the lazy engine, not binary elementwise
+FUSIBLE_OPS.delete("max");
+FUSIBLE_OPS.delete("min");
 
 /**
  * Check if an op can be fused.
