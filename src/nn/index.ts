@@ -25,3 +25,5 @@ export {
 export { LayerNorm, type LayerNormOptions } from "./layernorm";
 export { Linear, type LinearOptions } from "./linear";
 export { Module } from "./module";
+export { ModuleList } from "./modulelist";
+export { Sequential } from "./sequential";
