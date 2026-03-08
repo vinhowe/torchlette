@@ -5,15 +5,15 @@
  * Based on the original OpenAI GPT-2 architecture.
  */
 
-import type { Tensor, Torchlette, DeviceKind } from "../../src/frontend";
+import type { DeviceKind, Tensor, Torchlette } from "../../src/frontend";
 import {
-  Module,
-  Linear,
+  checkpoint,
+  crossEntropy,
+  Dropout,
   Embedding,
   LayerNorm,
-  Dropout,
-  crossEntropy,
-  checkpoint,
+  Linear,
+  Module,
 } from "../../src/nn";
 
 // ============================================================================
@@ -118,7 +118,10 @@ export class CausalSelfAttention extends Module {
     this.residDropout = new Dropout(api, { p: config.dropoutRate });
 
     // Cache causal mask: upper-triangular -1e9 values (0 on/below diagonal)
-    const causalBias = api.triu(api.full([1, 1, config.blockSize, config.blockSize], -1e9), 1);
+    const causalBias = api.triu(
+      api.full([1, 1, config.blockSize, config.blockSize], -1e9),
+      1,
+    );
     this.registerBuffer("causalBias", causalBias);
 
     // Register child modules for recursive train()/eval()
@@ -140,28 +143,16 @@ export class CausalSelfAttention extends Module {
     // Combined QKV projection: [batch, seqLen, 3 * embedDim]
     const qkv = this.cAttn.forward(x);
 
-    // Split QKV using narrow (zero-cost view ops)
-    // qkv: [batch, seqLen, 3 * embedDim]
-    // Reshape to [batch, seqLen, 3, embedDim], then narrow along dim 2
-    const qkvFor3 = qkv.reshape([batch, seqLen, 3, this.embedDim]);
-    const qSlice = qkvFor3.narrow(2, 0, 1); // [batch, seqLen, 1, embedDim] view
-    const kSlice = qkvFor3.narrow(2, 1, 1); // [batch, seqLen, 1, embedDim] view
-    const vSlice = qkvFor3.narrow(2, 2, 1); // [batch, seqLen, 1, embedDim] view
-
-    // Reshape narrow views to multi-head layout
-    // inferReshapeStrides handles the non-contiguous narrow views (zero-cost)
-    const q = qSlice
-      .reshape([batch, seqLen, this.numHeads, this.headDim])
-      .permute([0, 2, 1, 3])
-      .contiguous();
-    const k = kSlice
-      .reshape([batch, seqLen, this.numHeads, this.headDim])
-      .permute([0, 2, 1, 3])
-      .contiguous();
-    const v = vSlice
-      .reshape([batch, seqLen, this.numHeads, this.headDim])
-      .permute([0, 2, 1, 3])
-      .contiguous();
+    // Split QKV into [batch, seqLen, embedDim] chunks, then reshape to multi-head
+    const [qFlat, kFlat, vFlat] = qkv.chunk(3, -1);
+    const toHeads = (t: Tensor) =>
+      t
+        .reshape([batch, seqLen, this.numHeads, this.headDim])
+        .permute([0, 2, 1, 3])
+        .contiguous();
+    const q = toHeads(qFlat);
+    const k = toHeads(kFlat);
+    const v = toHeads(vFlat);
 
     // Scaled dot-product attention
     // Use fused FlashAttention when dropout is disabled (eval mode or rate=0)
@@ -195,13 +186,6 @@ export class CausalSelfAttention extends Module {
 
     // Residual dropout
     return this.residDropout.forward(output);
-  }
-
-  /**
-   * Get all learnable parameters.
-   */
-  parameters(): Tensor[] {
-    return [...this.cAttn.parameters(), ...this.cProj.parameters()];
   }
 }
 
@@ -247,13 +231,6 @@ export class MLP extends Module {
     h = h.gelu();
     h = this.cProj.forward(h);
     return this.dropout.forward(h);
-  }
-
-  /**
-   * Get all learnable parameters.
-   */
-  parameters(): Tensor[] {
-    return [...this.cFc.parameters(), ...this.cProj.parameters()];
   }
 }
 
@@ -305,18 +282,6 @@ export class TransformerBlock extends Module {
     h = this.api.add(h, mlpOut);
 
     return h;
-  }
-
-  /**
-   * Get all learnable parameters.
-   */
-  parameters(): Tensor[] {
-    return [
-      ...this.ln1.parameters(),
-      ...this.attn.parameters(),
-      ...this.ln2.parameters(),
-      ...this.mlp.parameters(),
-    ];
   }
 }
 
@@ -371,7 +336,9 @@ export class GPT2 extends Module {
     this.lnF = new LayerNorm(api, config.embedDim, { device });
 
     // Cache position indices: [0, 1, 2, ..., blockSize-1] reshaped to [1, blockSize]
-    const posIndices = api.arange(config.blockSize).reshape([1, config.blockSize]);
+    const posIndices = api
+      .arange(config.blockSize)
+      .reshape([1, config.blockSize]);
     this.registerBuffer("posIndices", posIndices);
 
     // Register child modules for recursive train()/eval()
@@ -392,7 +359,10 @@ export class GPT2 extends Module {
    * @param options - Optional forward options
    * @returns Logits tensor of shape [batch, seqLen, vocabSize]
    */
-  forward(idx: Tensor, options?: { useCheckpoint?: boolean; selectiveCheckpoint?: boolean }): Tensor {
+  forward(
+    idx: Tensor,
+    options?: { useCheckpoint?: boolean; selectiveCheckpoint?: boolean },
+  ): Tensor {
     return this.forwardWithLoss(idx, undefined, options).logits;
   }
 
@@ -486,30 +456,20 @@ export class GPT2 extends Module {
       // The lm_head matmul uses paddedVocabSize for tile alignment, but cross-entropy
       // must only see vocabSize classes (padding logits at 0 would dominate softmax).
       const [batch, seqLenT] = targets.shape;
-      const flatLogits = logits.reshape([batch * seqLenT, this.paddedVocabSize]);
-      const realLogits = this.paddedVocabSize > this.config.vocabSize
-        ? flatLogits.narrow(1, 0, this.config.vocabSize)
-        : flatLogits;
+      const flatLogits = logits.reshape([
+        batch * seqLenT,
+        this.paddedVocabSize,
+      ]);
+      const realLogits =
+        this.paddedVocabSize > this.config.vocabSize
+          ? flatLogits.narrow(1, 0, this.config.vocabSize)
+          : flatLogits;
       const flatTargets = targets.reshape([batch * seqLenT]);
       loss = crossEntropy(this.api, realLogits, flatTargets);
     }
 
     return { logits, loss };
   }
-
-  /**
-   * Get all learnable parameters.
-   */
-  parameters(): Tensor[] {
-    const params: Tensor[] = [];
-    params.push(...this.wte.parameters());
-    params.push(...this.wpe.parameters());
-    for (const block of this.h) {
-      params.push(...block.parameters());
-    }
-    params.push(...this.lnF.parameters());
-    // Note: lmHead weight is tied to wte.weight, so we don't add it separately
-    return params;
-  }
-
+  // Note: parameters() inherited from Module base class.
+  // lm_head weight is tied to wte.weight, so not registered separately.
 }
