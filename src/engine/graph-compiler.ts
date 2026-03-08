@@ -283,7 +283,36 @@ export function analyzeGraph(
   // --- Graph rewrites: simplify before pattern detection ---
   const rewriteCtx = { planNodes: reorderedNodes, consumers, consumerCount };
   const rewriteBypassedIds = new Set<number>();
-  runPasses(rewriteCtx, rewriteBypassedIds, SIMPLIFICATION_PASSES);
+  const passStats = runPasses(
+    rewriteCtx,
+    rewriteBypassedIds,
+    SIMPLIFICATION_PASSES,
+  );
+
+  // Log pass stats when TORCHLETTE_LOG_REWRITES=1
+  if (
+    typeof process !== "undefined" &&
+    process.env?.TORCHLETTE_LOG_REWRITES === "1" &&
+    rewriteBypassedIds.size > 0
+  ) {
+    const parts: string[] = [];
+    for (const [name, count] of passStats) {
+      if (count > 0) parts.push(`${name}=${count}`);
+    }
+    // Collect per-op breakdown of bypassed nodes
+    const opCounts: Record<string, number> = {};
+    for (const node of reorderedNodes) {
+      if (rewriteBypassedIds.has(node.id)) {
+        opCounts[node.op] = (opCounts[node.op] ?? 0) + 1;
+      }
+    }
+    const opParts = Object.entries(opCounts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([op, n]) => `${op}×${n}`);
+    console.log(
+      `[graph-rewrites] ${reorderedNodes.length} nodes → ${parts.join(", ")} (${rewriteBypassedIds.size} bypassed: ${opParts.join(", ")})`,
+    );
+  }
 
   // --- Priority 100: Matmul epilogue chains ---
   const {
