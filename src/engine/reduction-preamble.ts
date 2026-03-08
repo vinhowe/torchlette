@@ -11,7 +11,7 @@ import type { LazyIRNode, LazyRef } from "./lazy-types";
 import {
   type EpilogueOp,
   findChainInput,
-  getEpilogueOpName as getChainOpName,
+  getEpilogueOpName,
 } from "./matmul-epilogue";
 import { createStorageHandle } from "./node-factory";
 import { getInputStorage } from "./op-dispatch";
@@ -175,7 +175,7 @@ export function detectReductionPreamble(
     externalInputDtypes.push(getRefDtype(ref));
   }
   chainOps.push({
-    op: getChainOpName(firstNode),
+    op: getEpilogueOpName(firstNode),
     arity: firstNode.inputs.length,
   });
 
@@ -185,7 +185,7 @@ export function detectReductionPreamble(
     const prevNode = chain[i - 1];
 
     if (node.inputs.length === 1) {
-      chainOps.push({ op: getChainOpName(node), arity: 1 });
+      chainOps.push({ op: getEpilogueOpName(node), arity: 1 });
     } else {
       const inp0IsChain =
         node.inputs[0].kind === "pending" && node.inputs[0].node === prevNode;
@@ -199,7 +199,7 @@ export function detectReductionPreamble(
       externalInputRefs.push(extRef);
       externalInputDtypes.push(getRefDtype(extRef));
       chainOps.push({
-        op: getChainOpName(node),
+        op: getEpilogueOpName(node),
         arity: 2,
         chainInputPos: chainPos,
       });
@@ -283,15 +283,6 @@ export async function executeReductionWithPreamble(
 // single kernel, eliminating intermediate buffers between reduction and
 // subsequent elementwise ops. Mirrors matmul epilogue detection.
 // ============================================================================
-
-/** Format an array of epilogue ops into a profile label fragment (e.g. "cast+add+relu"). */
-export function formatEpilogueLabel(ops: EpilogueOp[]): string {
-  return ops
-    .map((o) =>
-      o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind,
-    )
-    .join("+");
-}
 
 export interface ReductionEpiloguePlan {
   /** The reduction node (sum, mean, or max) */

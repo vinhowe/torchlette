@@ -62,6 +62,7 @@ import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "./matmul-epilogue";
 import {
   _detectTransposeView,
   executeMatmulWithEpilogue,
+  formatEpilogueLabel,
 } from "./matmul-epilogue";
 import {
   _webgpuMatmulGeomImports,
@@ -81,7 +82,6 @@ import {
   executeReductionWithEpilogue,
   executeReductionWithFusion,
   executeReductionWithPreamble,
-  formatEpilogueLabel,
 } from "./reduction-preamble";
 import {
   executeCompoundSoftmax,

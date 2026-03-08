@@ -60,6 +60,15 @@ export function getEpilogueOpName(node: LazyIRNode): string {
   return node.op;
 }
 
+/** Format an array of epilogue ops into a profile label fragment (e.g. "cast+add+relu"). */
+export function formatEpilogueLabel(ops: EpilogueOp[]): string {
+  return ops
+    .map((o) =>
+      o.kind === "binary" ? o.op : o.kind === "cast" ? "cast" : o.op || o.kind,
+    )
+    .join("+");
+}
+
 // ============================================================================
 // Matmul Epilogue Fusion (Phase 1)
 // Detects matmul → cast/bias/activation chains and fuses them into a single
