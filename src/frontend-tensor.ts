@@ -25,7 +25,7 @@ export class Tensor {
   private readonly engine: Torchlette;
   private readonly inner: RuntimeTensor;
   private readonly engineTensor: EngineTensor;
-  private readonly requiresGradValue: boolean;
+  private requiresGradValue: boolean;
   private gradNode: AutogradNode | null = null;
   private gradValue: Tensor | null = null;
   private retainGradValue = false;
@@ -94,6 +94,17 @@ export class Tensor {
       );
     }
     this.retainGradValue = true;
+  }
+
+  /**
+   * Set whether this tensor requires gradient computation.
+   * Like PyTorch's tensor.requires_grad_(bool).
+   * Returns this tensor for chaining.
+   */
+  requires_grad_(value = true): this {
+    this.ensureNotDisposed();
+    this.requiresGradValue = value;
+    return this;
   }
 
   zeroGrad(): void {
