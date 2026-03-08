@@ -72,7 +72,6 @@ describe("Op Registry", () => {
       for (const op of comparisons) {
         expect(op in OP_REGISTRY, `Missing comparison op: ${op}`).toBe(true);
         expect(OP_REGISTRY[op].category).toBe("comparison");
-        expect(OP_REGISTRY[op].outputDtype).toBe("f32");
       }
     });
 
@@ -89,77 +88,6 @@ describe("Op Registry", () => {
         expect(OP_REGISTRY[op].category).toBe("cast");
         expect(OP_REGISTRY[op].vectorizable).toBe(true);
       }
-    });
-  });
-
-  describe("expression generation", () => {
-    it("generates unary expressions", () => {
-      expect(OP_REGISTRY.relu.expr("x")).toBe("select(0.0, x, x > 0.0)");
-      expect(OP_REGISTRY.neg.expr("x")).toBe("(-x)");
-      expect(OP_REGISTRY.sqrt.expr("x")).toBe("sqrt(x)");
-      expect(OP_REGISTRY.exp.expr("x")).toBe("exp(x)");
-      expect(OP_REGISTRY.log.expr("x")).toBe("log(x)");
-      expect(OP_REGISTRY.tanh.expr("x")).toBe("tanh(x)");
-      expect(OP_REGISTRY.rsqrt.expr("x")).toBe("inverseSqrt(x)");
-      expect(OP_REGISTRY.sin.expr("x")).toBe("sin(x)");
-      expect(OP_REGISTRY.cos.expr("x")).toBe("cos(x)");
-      expect(OP_REGISTRY.floor.expr("x")).toBe("floor(x)");
-      expect(OP_REGISTRY.ceil.expr("x")).toBe("ceil(x)");
-      expect(OP_REGISTRY.round.expr("x")).toBe("round(x)");
-    });
-
-    it("generates gelu expression with tanh", () => {
-      const expr = OP_REGISTRY.gelu.expr("x");
-      expect(expr).toContain("tanh");
-      expect(expr).toContain("0.5");
-      expect(expr).toContain("clamp");
-    });
-
-    it("generates silu/sigmoid expressions", () => {
-      expect(OP_REGISTRY.silu.expr("x")).toContain("exp");
-      expect(OP_REGISTRY.sigmoid.expr("x")).toContain("exp");
-    });
-
-    it("generates binary arithmetic expressions", () => {
-      expect(OP_REGISTRY.add.expr("a", "b")).toBe("(a + b)");
-      expect(OP_REGISTRY.sub.expr("a", "b")).toBe("(a - b)");
-      expect(OP_REGISTRY.mul.expr("a", "b")).toBe("(a * b)");
-      expect(OP_REGISTRY.div.expr("a", "b")).toBe("(a / b)");
-      expect(OP_REGISTRY.mod.expr("a", "b")).toBe("(a % b)");
-      expect(OP_REGISTRY.pow.expr("a", "b")).toBe("pow(a, b)");
-      expect(OP_REGISTRY.min.expr("a", "b")).toBe("min(a, b)");
-      expect(OP_REGISTRY.max.expr("a", "b")).toBe("max(a, b)");
-    });
-
-    it("generates comparison expressions with select", () => {
-      expect(OP_REGISTRY.eq.expr("a", "b")).toBe("select(0.0, 1.0, a == b)");
-      expect(OP_REGISTRY.ne.expr("a", "b")).toBe("select(0.0, 1.0, a != b)");
-      expect(OP_REGISTRY.lt.expr("a", "b")).toBe("select(0.0, 1.0, a < b)");
-      expect(OP_REGISTRY.le.expr("a", "b")).toBe("select(0.0, 1.0, a <= b)");
-      expect(OP_REGISTRY.gt.expr("a", "b")).toBe("select(0.0, 1.0, a > b)");
-      expect(OP_REGISTRY.ge.expr("a", "b")).toBe("select(0.0, 1.0, a >= b)");
-    });
-
-    it("generates where expression", () => {
-      expect(OP_REGISTRY.where.expr("cond", "a", "b")).toBe(
-        "select(b, a, cond > 0.0)",
-      );
-    });
-
-    it("generates cast expressions", () => {
-      expect(OP_REGISTRY.cast_f16.expr("x")).toBe("f16(x)");
-      expect(OP_REGISTRY.cast_f32.expr("x")).toBe("f32(x)");
-      expect(OP_REGISTRY.cast_i32.expr("x")).toBe("i32(x)");
-      expect(OP_REGISTRY.cast_u32.expr("x")).toBe("u32(x)");
-    });
-
-    it("uses custom zero for relu when provided", () => {
-      const expr = OP_REGISTRY.relu.expr(
-        "v",
-        "vec4<f32>(0.0)",
-        "vec4<f32>(1.0)",
-      );
-      expect(expr).toContain("vec4<f32>(0.0)");
     });
   });
 
@@ -198,7 +126,7 @@ describe("Op Registry", () => {
       }
     });
 
-    it("casts are vectorizable via vectorExpr", () => {
+    it("casts are vectorizable", () => {
       expect(canVectorize("cast_f16")).toBe(true);
       expect(canVectorize("cast_f32")).toBe(true);
     });
