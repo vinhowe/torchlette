@@ -38,21 +38,7 @@ export type ViewMeta = {
   isContiguous: boolean;
 };
 
-import { contiguousStrides } from "../core/shape";
-
-/**
- * Check if strides represent a contiguous layout for the given shape.
- * Size-1 dimensions don't affect contiguity since stride doesn't matter.
- */
-export function checkContiguous(shape: number[], strides: number[]): boolean {
-  if (shape.length !== strides.length) return false;
-  const expected = contiguousStrides(shape);
-  for (let i = 0; i < shape.length; i++) {
-    if (shape[i] <= 1) continue;
-    if (strides[i] !== expected[i]) return false;
-  }
-  return true;
-}
+export { checkContiguous } from "../core/shape";
 
 /**
  * Normalize a possibly-negative dimension index to a non-negative one.
@@ -99,23 +85,15 @@ export type DType = "f16" | "f32" | "i32" | "u32" | "bool";
  */
 export type OpExecOptions = { outBuffer?: unknown };
 
-export type SumOptions = {
+export type ReduceDimOptions = {
   dim?: number | number[] | null;
   keepdim?: boolean;
-  dtype?: DType | null;
 };
 
+export type SumOptions = ReduceDimOptions & { dtype?: DType | null };
 export type MeanOptions = SumOptions;
-
-export type MaxOptions = {
-  dim?: number | number[] | null;
-  keepdim?: boolean;
-};
-
-export type MinOptions = {
-  dim?: number | number[] | null;
-  keepdim?: boolean;
-};
+export type MaxOptions = ReduceDimOptions;
+export type MinOptions = ReduceDimOptions;
 
 export type ArgReduceOptions = {
   dim: number;
