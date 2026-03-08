@@ -14,6 +14,17 @@ export abstract class Module {
 
   constructor(api: Torchlette) {
     this.api = api;
+    // Return a Proxy that auto-registers Module-typed property assignments.
+    // registerParameter() uses Object.defineProperty which does NOT trigger
+    // the Proxy set trap, so parameters are unaffected.
+    return new Proxy(this, {
+      set(target, prop, value, receiver) {
+        if (value instanceof Module && typeof prop === "string") {
+          target._modules.set(prop, value);
+        }
+        return Reflect.set(target, prop, value, receiver);
+      },
+    });
   }
 
   /**
@@ -53,9 +64,16 @@ export abstract class Module {
 
   /**
    * Register a child module for recursive train()/eval() propagation.
+   * Usually not needed — assigning a Module-typed property auto-registers it.
+   * Use this for indexed children (e.g., `registerModule("0", child)`).
    */
   registerModule(name: string, module: Module): void {
     this._modules.set(name, module);
+  }
+
+  /** Iterate over direct child modules. */
+  protected children(): IterableIterator<Module> {
+    return this._modules.values();
   }
 
   /**
