@@ -14,7 +14,12 @@ import { dispatchComputePass, getPipeline } from "../dispatch";
 import { requireContext } from "../gpu-context";
 import type { WebGPUTensor } from "../gpu-types";
 import { asGPUTensor } from "../gpu-types";
-import { compute2DDispatch, sizeOf, WORKGROUP_SIZE } from "../shape-utils";
+import {
+  checkContiguousStrides,
+  compute2DDispatch,
+  sizeOf,
+  WORKGROUP_SIZE,
+} from "../shape-utils";
 import { createTensor } from "../tensor";
 import { createTileKernelDispatcher } from "../tile-dispatch";
 import {
@@ -25,16 +30,6 @@ import {
 import { ensureContiguous } from "./views";
 
 type ScatterOp = "copy" | "add";
-
-/** Check if strides represent contiguous layout for the given shape. */
-function isContiguousStrides(shape: number[], strides: number[]): boolean {
-  let expected = 1;
-  for (let d = shape.length - 1; d >= 0; d--) {
-    if (strides[d] !== expected) return false;
-    expected *= shape[d];
-  }
-  return true;
-}
 
 /** Direct strided scatter dispatch (small tensors that fit in a single binding). */
 function stridedScatterDirect(
@@ -122,10 +117,10 @@ function stridedScatterImpl(
 
   if (baseSizeBytes > maxBindingSize || srcSizeBytes > maxBindingSize) {
     const isFull = viewSize === baseSize && offset === 0;
-    const viewContiguous = isContiguousStrides(viewShape, viewStrides);
+    const viewContiguous = checkContiguousStrides(viewShape, viewStrides);
     const srcContiguous =
       srcTensor.isContiguous ||
-      isContiguousStrides(srcTensor.shape, srcTensor.strides);
+      checkContiguousStrides(srcTensor.shape, srcTensor.strides);
 
     if (isFull && baseTensor.isContiguous && srcContiguous && viewContiguous) {
       return op === "copy"

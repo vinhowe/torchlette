@@ -566,41 +566,43 @@ function compileImperativeKernel(
 }
 
 /**
- * Detect statically-true guard conditions (e.g. `1u == 1u` or folded const(1)).
- * Returns true if the expression is a compile-time constant that evaluates to true.
+ * Evaluate a guard condition at compile time if possible.
+ * Returns "true"/"false" for statically-known conditions, "dynamic" otherwise.
  */
-function isStaticTrue(node: IRNode): boolean {
-  // Handle folded constant (from const-const comparison folding)
-  if (node.kind === "const") return node.value !== 0;
-  // Handle unfolded comparison (in case folding was bypassed)
+function evaluateStaticCondition(node: IRNode): "true" | "false" | "dynamic" {
+  if (node.kind === "const") return node.value !== 0 ? "true" : "false";
   if (node.kind === "cmp") {
     const { op, lhs, rhs } = node;
     if (lhs.kind === "const" && rhs.kind === "const") {
       const l = lhs.value,
         r = rhs.value;
+      let result: boolean;
       switch (op) {
         case "eq":
-          return l === r;
+          result = l === r;
+          break;
         case "ne":
-          return l !== r;
+          result = l !== r;
+          break;
         case "lt":
-          return l < r;
+          result = l < r;
+          break;
         case "le":
-          return l <= r;
+          result = l <= r;
+          break;
         case "gt":
-          return l > r;
+          result = l > r;
+          break;
         case "ge":
-          return l >= r;
+          result = l >= r;
+          break;
+        default:
+          return "dynamic";
       }
+      return result ? "true" : "false";
     }
   }
-  return false;
-}
-
-/** Detect statically-false guard conditions (folded const(0) or false comparisons). */
-function isStaticFalse(node: IRNode): boolean {
-  if (node.kind === "const") return node.value === 0;
-  return false;
+  return "dynamic";
 }
 
 /** Emit an unrolled iteration block: { const varName = iterVal; ...body... } */
@@ -826,29 +828,32 @@ function emitStatement(
       break;
     }
     case "if": {
-      if (isStaticTrue(stmt.condition)) {
+      const cond = evaluateStaticCondition(stmt.condition);
+      if (cond === "true") {
         // Static-true: body emitted at parent scope — bindings propagate up
         for (const s of stmt.body) emitStatement(s, bindings, lines, depth, v4);
-      } else if (!isStaticFalse(stmt.condition)) {
-        const cond = exprFor(stmt.condition, bindings, v4);
-        lines.push(`${indent}if (${cond}) {`);
+      } else if (cond === "dynamic") {
+        const condExpr = exprFor(stmt.condition, bindings, v4);
+        lines.push(`${indent}if (${condExpr}) {`);
         const childBindings = new Map(bindings);
         for (const s of stmt.body) {
           emitStatement(s, childBindings, lines, depth + 1, v4);
         }
         lines.push(`${indent}}`);
       }
+      // cond === "false": dead branch — omit entirely
       break;
     }
     case "ifElse": {
-      if (isStaticTrue(stmt.condition)) {
+      const cond = evaluateStaticCondition(stmt.condition);
+      if (cond === "true") {
         for (const s of stmt.body) emitStatement(s, bindings, lines, depth, v4);
-      } else if (isStaticFalse(stmt.condition)) {
+      } else if (cond === "false") {
         for (const s of stmt.elseBody)
           emitStatement(s, bindings, lines, depth, v4);
       } else {
-        const cond = exprFor(stmt.condition, bindings, v4);
-        lines.push(`${indent}if (${cond}) {`);
+        const condExpr = exprFor(stmt.condition, bindings, v4);
+        lines.push(`${indent}if (${condExpr}) {`);
         const childBindings1 = new Map(bindings);
         for (const s of stmt.body) {
           emitStatement(s, childBindings1, lines, depth + 1, v4);
@@ -886,19 +891,20 @@ function emitStatement(
       break;
     }
     case "guardedStore": {
-      if (isStaticFalse(stmt.condition)) {
+      const guard = evaluateStaticCondition(stmt.condition);
+      if (guard === "false") {
         // Dead store — omit entirely
         break;
       }
       const idx = exprFor(stmt.idx, bindings, v4);
       const val = exprFor(stmt.value, bindings, v4);
       const storeIdx = v4 ? `(${idx}) >> 2u` : idx;
-      if (isStaticTrue(stmt.condition)) {
+      if (guard === "true") {
         // Constant-fold: emit unconditional store
         lines.push(`${indent}${stmt.binding}[${storeIdx}] = ${val};`);
       } else {
-        const cond = exprFor(stmt.condition, bindings, v4);
-        lines.push(`${indent}if (${cond}) {`);
+        const condExpr = exprFor(stmt.condition, bindings, v4);
+        lines.push(`${indent}if (${condExpr}) {`);
         lines.push(`${indent}  ${stmt.binding}[${storeIdx}] = ${val};`);
         lines.push(`${indent}}`);
       }
