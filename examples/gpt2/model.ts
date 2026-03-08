@@ -14,6 +14,7 @@ import {
   LayerNorm,
   Linear,
   Module,
+  ModuleList,
 } from "../../src/nn";
 
 // ============================================================================
@@ -123,12 +124,6 @@ export class CausalSelfAttention extends Module {
       1,
     );
     this.registerBuffer("causalBias", causalBias);
-
-    // Register child modules for recursive train()/eval()
-    this.registerModule("cAttn", this.cAttn);
-    this.registerModule("cProj", this.cProj);
-    this.registerModule("attnDropout", this.attnDropout);
-    this.registerModule("residDropout", this.residDropout);
   }
 
   /**
@@ -216,11 +211,6 @@ export class MLP extends Module {
       device,
     });
     this.dropout = new Dropout(api, { p: config.dropoutRate });
-
-    // Register child modules for recursive train()/eval()
-    this.registerModule("cFc", this.cFc);
-    this.registerModule("cProj", this.cProj);
-    this.registerModule("dropout", this.dropout);
   }
 
   /**
@@ -259,12 +249,6 @@ export class TransformerBlock extends Module {
     this.attn = new CausalSelfAttention(api, config, { device });
     this.ln2 = new LayerNorm(api, config.embedDim, { device });
     this.mlp = new MLP(api, config, { device });
-
-    // Register child modules for recursive train()/eval()
-    this.registerModule("ln1", this.ln1);
-    this.registerModule("attn", this.attn);
-    this.registerModule("ln2", this.ln2);
-    this.registerModule("mlp", this.mlp);
   }
 
   /**
@@ -300,7 +284,7 @@ export class GPT2 extends Module {
   readonly wte: Embedding; // Token embeddings [paddedVocabSize, embedDim]
   readonly wpe: Embedding; // Position embeddings [blockSize, embedDim]
   readonly drop: Dropout;
-  readonly h: TransformerBlock[]; // Transformer blocks
+  readonly h: ModuleList; // Transformer blocks
   readonly lnF: LayerNorm; // Final layer norm
   declare readonly posIndices: Tensor; // Cached position indices [1, blockSize]
   // Note: lmHead shares weights with wte (weight tying)
@@ -328,9 +312,9 @@ export class GPT2 extends Module {
     this.drop = new Dropout(api, { p: config.dropoutRate });
 
     // Create transformer blocks
-    this.h = [];
+    this.h = new ModuleList(api);
     for (let i = 0; i < config.numLayers; i++) {
-      this.h.push(new TransformerBlock(api, config, { device }));
+      this.h.append(new TransformerBlock(api, config, { device }));
     }
 
     this.lnF = new LayerNorm(api, config.embedDim, { device });
@@ -340,15 +324,6 @@ export class GPT2 extends Module {
       .arange(config.blockSize)
       .reshape([1, config.blockSize]);
     this.registerBuffer("posIndices", posIndices);
-
-    // Register child modules for recursive train()/eval()
-    this.registerModule("wte", this.wte);
-    this.registerModule("wpe", this.wpe);
-    this.registerModule("drop", this.drop);
-    for (let i = 0; i < this.h.length; i++) {
-      this.registerModule(`h.${i}`, this.h[i]);
-    }
-    this.registerModule("lnF", this.lnF);
   }
 
   /**
@@ -410,7 +385,7 @@ export class GPT2 extends Module {
       // This eliminates 6 expensive fusedAttentionForward recomputes during
       // backward while still saving the bulk of memory from MLP checkpointing.
       for (let i = 0; i < this.h.length; i++) {
-        const block = this.h[i];
+        const block = this.h.get(i) as TransformerBlock;
         // Attention block: NOT checkpointed
         const attnOut = block.attn.forward(block.ln1.forward(x));
         const h = this.api.add(x, attnOut);

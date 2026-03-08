@@ -705,8 +705,6 @@ describe("Module system", () => {
         super(torch);
         this.fc1 = new Linear(torch, 4, 3);
         this.fc2 = new Linear(torch, 3, 2);
-        this.registerModule("fc1", this.fc1);
-        this.registerModule("fc2", this.fc2);
       }
       forward(x: FrontendTensor) {
         return this.fc2.forward(this.fc1.forward(x));
@@ -726,8 +724,6 @@ describe("Module system", () => {
         super(torch);
         this.fc1 = new Linear(torch, 4, 3);
         this.fc2 = new Linear(torch, 3, 2);
-        this.registerModule("fc1", this.fc1);
-        this.registerModule("fc2", this.fc2);
       }
       forward(x: FrontendTensor) {
         return this.fc2.forward(this.fc1.forward(x));
