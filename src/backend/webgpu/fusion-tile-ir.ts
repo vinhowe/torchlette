@@ -17,7 +17,6 @@ import {
   type KernelGenOptions,
   needsBroadcast,
 } from "./fusion-types";
-import { MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 import { compileTileKernel } from "./tile-compiler";
 import {
   type BindingSpec,
@@ -251,8 +250,6 @@ export function generateFusedKernelTileIR(
   const meta = computeKernelMeta(recipe, options);
   const { vectorWidth, workItems, workgroupSize, gridSizeX } = meta;
 
-  const use2D = gridSizeX >= MAX_WORKGROUPS_PER_DIM;
-
   // Build physical binding map (skip inlined constants)
   const physicalBinding: (number | null)[] = [];
   let nextBinding = 0;
@@ -302,25 +299,9 @@ export function generateFusedKernelTileIR(
     vectorize: vectorWidth > 1 ? vectorWidth : undefined,
     grid: elementwiseGrid(workgroupSize, { vecWidth: vectorWidth }),
     kernel: (ctx: KernelContext) => {
-      // Compute linear element index
-      let gidExpr: BlockExpr;
-      if (use2D) {
-        // Linear index from 2D workgroup grid
-        const gx = ctx.globalId(0);
-        const gy = ctx.globalId(1);
-        gidExpr = gx.add(gy.mul(ctx.u32(gridSizeX * workgroupSize)));
-      } else {
-        gidExpr = ctx.globalId(0);
-      }
-
-      // For vectorized mode, the compiler unrolls globalId(0) to _base + offset,
-      // so gidExpr already points to each element. For non-vectorized, it's direct.
-      const idx = ctx.emitLet("idx", gidExpr);
-
-      // Bounds check
-      ctx.ifThen(idx.ge(ctx.uniform("total_elements")), () => {
-        ctx.emitReturn();
-      });
+      // flatGlobalId handles both 1D and 2D grids, and works correctly
+      // with the compiler's true vec4 vectorization path.
+      const idx = ctx.elementIndex(workgroupSize, "total_elements");
 
       // Load inputs
       const inputExprs = new Map<number, BlockExpr>();
