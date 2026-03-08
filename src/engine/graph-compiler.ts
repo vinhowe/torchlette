@@ -22,11 +22,7 @@ import {
   reorderPlanForFusion,
   segmentPlanForExecution,
 } from "./fusion-detect";
-import {
-  eliminateAlgebraicIdentities,
-  eliminateIdentityCasts,
-  eliminateRedundantContiguous,
-} from "./graph-rewrites";
+import { runPasses, SIMPLIFICATION_PASSES } from "./graph-rewrites";
 import type { LazyIRNode } from "./lazy-types";
 import type { MatmulPrologueInfo } from "./matmul-epilogue";
 import {
@@ -287,9 +283,7 @@ export function analyzeGraph(
   // --- Graph rewrites: simplify before pattern detection ---
   const rewriteCtx = { planNodes: reorderedNodes, consumers, consumerCount };
   const rewriteBypassedIds = new Set<number>();
-  eliminateIdentityCasts(rewriteCtx, rewriteBypassedIds);
-  eliminateRedundantContiguous(rewriteCtx, rewriteBypassedIds);
-  eliminateAlgebraicIdentities(rewriteCtx, rewriteBypassedIds);
+  runPasses(rewriteCtx, rewriteBypassedIds, SIMPLIFICATION_PASSES);
 
   // --- Priority 100: Matmul epilogue chains ---
   const {

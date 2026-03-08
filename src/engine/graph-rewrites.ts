@@ -4,6 +4,9 @@
  * Simplification passes run before pattern detection in the graph compiler.
  * Each pass identifies and bypasses redundant nodes, reducing the graph
  * before fusion and epilogue detection.
+ *
+ * The GraphPass interface formalizes each pass as a composable function.
+ * Passes are run in order via runPasses(), which returns per-pass stats.
  */
 
 import type { DType } from "../backend/types";
@@ -20,6 +23,38 @@ export interface RewriteContext {
   consumerCount: Map<number, number>;
 }
 
+/** A composable graph rewrite pass. */
+export interface GraphPass {
+  name: string;
+  run(ctx: RewriteContext, bypassed: Set<number>): number;
+}
+
+// ============================================================================
+// Pass Registry
+// ============================================================================
+
+/** All simplification passes in execution order. */
+export const SIMPLIFICATION_PASSES: GraphPass[] = [
+  { name: "identity-casts", run: eliminateIdentityCasts },
+  { name: "redundant-contiguous", run: eliminateRedundantContiguous },
+  { name: "algebraic-identities", run: eliminateAlgebraicIdentities },
+  { name: "cse", run: eliminateCommonSubexpressions },
+  { name: "dce", run: eliminateDeadCode },
+];
+
+/** Run a sequence of passes, returning per-pass elimination counts. */
+export function runPasses(
+  ctx: RewriteContext,
+  bypassed: Set<number>,
+  passes: GraphPass[],
+): Map<string, number> {
+  const stats = new Map<string, number>();
+  for (const pass of passes) {
+    stats.set(pass.name, pass.run(ctx, bypassed));
+  }
+  return stats;
+}
+
 // ============================================================================
 // Rewrite Passes
 // ============================================================================
@@ -28,7 +63,8 @@ export interface RewriteContext {
 export function eliminateIdentityCasts(
   ctx: RewriteContext,
   bypassed: Set<number>,
-): void {
+): number {
+  let count = 0;
   for (const node of ctx.planNodes) {
     if (node.op !== "cast" || node.result) continue;
     const payload = node.payload as { dtype?: DType } | undefined;
@@ -44,7 +80,9 @@ export function eliminateIdentityCasts(
     if (inputDtype !== payload.dtype) continue;
     redirectConsumers(node, inputRef, ctx);
     bypassed.add(node.id);
+    count++;
   }
+  return count;
 }
 
 /**
@@ -54,7 +92,8 @@ export function eliminateIdentityCasts(
 export function eliminateRedundantContiguous(
   ctx: RewriteContext,
   bypassed: Set<number>,
-): void {
+): number {
+  let count = 0;
   for (const node of ctx.planNodes) {
     if (node.op !== "contiguous" || node.result) continue;
     const inputRef = node.inputs[0];
@@ -62,8 +101,10 @@ export function eliminateRedundantContiguous(
     if (!isViewOp(inputRef.node.op)) {
       redirectConsumers(node, inputRef, ctx);
       bypassed.add(node.id);
+      count++;
     }
   }
+  return count;
 }
 
 /** Try to extract a constant scalar value from a LazyRef. */
@@ -90,7 +131,8 @@ const IDENTITY_RULES: Record<string, { value: number; commutative: boolean }> =
 export function eliminateAlgebraicIdentities(
   ctx: RewriteContext,
   bypassed: Set<number>,
-): void {
+): number {
+  let count = 0;
   for (const node of ctx.planNodes) {
     if (node.result || node.inputs.length !== 2) continue;
     const rule = IDENTITY_RULES[node.op];
@@ -100,14 +142,152 @@ export function eliminateAlgebraicIdentities(
     if (val1 === rule.value) {
       redirectConsumers(node, node.inputs[0], ctx);
       bypassed.add(node.id);
+      count++;
     } else if (rule.commutative) {
       const val0 = tryGetScalarValue(node.inputs[0]);
       if (val0 === rule.value) {
         redirectConsumers(node, node.inputs[1], ctx);
         bypassed.add(node.id);
+        count++;
       }
     }
   }
+  return count;
+}
+
+// ============================================================================
+// CSE Pass
+// ============================================================================
+
+/** Ops that must never be CSE'd due to side effects or non-determinism. */
+const NON_CSE_OPS = new Set([
+  "rand",
+  "randn",
+  "bernoulli",
+  "fusedAttentionForward",
+  "fusedAttentionBackward",
+  "fusedLayerNormForward",
+  "fusedLayerNormBackwardGradX",
+  "fusedLayerNormBackwardGradWeightBias",
+  "fusedRMSNormForward",
+  "fusedRMSNormBackwardGradX",
+  "fusedRMSNormBackwardGradWeight",
+  "fusedCrossEntropyForward",
+  "fusedCrossEntropyBackward",
+  "adamStep",
+  "extractAttentionLogsumexp",
+  "extractAttentionDK",
+  "extractAttentionDV",
+  "extractLnBwdGradBias",
+  "stridedScatterCopy",
+  "stridedScatterAdd",
+  "unscaleGrad",
+]);
+
+/** Ops whose payload is too large to include in CSE keys (e.g., full tensor data). */
+const LARGE_PAYLOAD_OPS = new Set(["tensorFromArray", "zeros", "arange"]);
+
+/**
+ * Compute a structural key for a node.
+ * Key format: `op|shape|dtype|ref0|ref1|...|payload_hash`
+ *
+ * Input refs are encoded as:
+ *   - pending:   `p:nodeId` (the canonical node for already-CSE'd chains)
+ *   - materialized: `m:storageId`
+ *   - scalar:    `s:value:dtype`
+ *
+ * Nodes with no inputs and large payloads (tensorFromArray, zeros, arange)
+ * are excluded from CSE entirely — they're data sources with unique identity.
+ */
+function structuralKey(node: LazyIRNode): string | null {
+  // Data source ops with no pending inputs can't be CSE'd meaningfully
+  if (node.inputs.length === 0) return null;
+
+  let key = `${node.op}|${node.shape.join(",")}|${node.dtype}`;
+  for (const ref of node.inputs) {
+    if (ref.kind === "pending") {
+      key += `|p:${ref.node.id}`;
+    } else if (ref.kind === "materialized") {
+      key += `|m:${ref.storage.id}`;
+    } else {
+      key += `|s:${ref.value}:${ref.dtype}`;
+    }
+  }
+  if (node.payload !== undefined && !LARGE_PAYLOAD_OPS.has(node.op)) {
+    // Known small payloads: cast {dtype}, full {fillValue}, reduction {dim, keepdim}
+    key += `|${JSON.stringify(node.payload)}`;
+  }
+  return key;
+}
+
+/**
+ * Eliminate common subexpressions: when two nodes have identical
+ * (op, shape, dtype, inputs, payload), redirect the second's consumers
+ * to the first and bypass the second.
+ *
+ * Non-deterministic ops (RNG) and side-output ops (adam, fused kernels)
+ * are excluded.
+ */
+export function eliminateCommonSubexpressions(
+  ctx: RewriteContext,
+  bypassed: Set<number>,
+): number {
+  const canonical = new Map<string, LazyIRNode>();
+  let count = 0;
+  for (const node of ctx.planNodes) {
+    if (node.result || bypassed.has(node.id) || NON_CSE_OPS.has(node.op))
+      continue;
+    const key = structuralKey(node);
+    if (key === null) continue; // Data source ops — not eligible for CSE
+    const existing = canonical.get(key);
+    if (existing) {
+      redirectConsumers(node, { kind: "pending", node: existing }, ctx);
+      bypassed.add(node.id);
+      count++;
+    } else {
+      canonical.set(key, node);
+    }
+  }
+  return count;
+}
+
+// ============================================================================
+// DCE Pass
+// ============================================================================
+
+/**
+ * Eliminate dead code: remove nodes with zero consumers that aren't the
+ * plan output or already-materialized. Iterates until fixed point since
+ * removing a node may make its inputs dead.
+ */
+export function eliminateDeadCode(
+  ctx: RewriteContext,
+  bypassed: Set<number>,
+): number {
+  let count = 0;
+  const lastNode = ctx.planNodes[ctx.planNodes.length - 1];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const node of ctx.planNodes) {
+      if (bypassed.has(node.id) || node.result) continue;
+      if (node === lastNode) continue; // Never eliminate plan output
+      const consumers = ctx.consumerCount.get(node.id) ?? 0;
+      if (consumers === 0) {
+        bypassed.add(node.id);
+        // Decrement consumer counts of this node's inputs
+        for (const ref of node.inputs) {
+          if (ref.kind === "pending") {
+            const c = ctx.consumerCount.get(ref.node.id) ?? 0;
+            if (c > 0) ctx.consumerCount.set(ref.node.id, c - 1);
+          }
+        }
+        count++;
+        changed = true;
+      }
+    }
+  }
+  return count;
 }
 
 // ============================================================================
