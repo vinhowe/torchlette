@@ -833,7 +833,6 @@ export function chunkedTransposeTileIR(dtype: DataType): string {
       rowEnd: "u32",
       colStart: "u32",
       colEnd: "u32",
-      gridStride: "u32",
     },
     kernel(ctx) {
       const numRows = ctx.uniform("rowEnd").sub(ctx.uniform("rowStart"));
