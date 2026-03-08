@@ -57,7 +57,7 @@ function makeAdamStepSpec(
     bindings.inf_flag = { storage: "atomic", type: "u32" };
   }
 
-  // Build uniforms. grid_stride replaces the compile-time gridSizeX constant.
+  // Build uniforms
   const uniforms: Record<string, UniformType> = {
     beta1: "f32",
     beta2: "f32",
@@ -67,20 +67,43 @@ function makeAdamStepSpec(
     lr_times_wd: "f32",
     decoupled_wd: "u32",
     num_elements: "u32",
-    grid_stride: "u32",
   };
   if (emitUnscale) {
+    // Unscale path keeps grid_stride for manual 2D indexing (atomics prevent auto-vec4)
+    uniforms.grid_stride = "u32";
     uniforms.inv_scale = "f32";
     uniforms._pad0 = "u32";
     uniforms._pad1 = "u32";
   } else {
+    // Non-unscale: compiler handles 2D grid via flatGlobalId, no grid_stride needed
     uniforms._pad0 = "u32";
     uniforms._pad1 = "u32";
     uniforms._pad2 = "u32";
+    uniforms._pad3 = "u32";
   }
 
+  // Non-unscale path: pure elementwise, auto-vectorized by the compiler.
+  // Unscale path: atomics prevent auto-vec4, so manual vec4 with grid_stride.
+  if (!emitUnscale) {
+    return {
+      name: `adamStep${emitF16 ? "F16" : ""}`,
+      workgroupSize: WORKGROUP_SIZE,
+      bindings,
+      uniforms,
+      uniformBindingIndex: 4,
+      enableF16: emitF16,
+      autoVectorize: true,
+      kernel(ctx) {
+        const idx = ctx.elementIndex(WORKGROUP_SIZE, "num_elements");
+        const gVar = ctx.emitVar("g", "f32", ctx.load("grad", idx));
+        emitAdamScalarBody(ctx, idx, gVar, emitF16);
+      },
+    };
+  }
+
+  // Unscale path: manual vec4 with per-element inf checks + atomicMax
   return {
-    name: `adamStep${emitF16 ? "F16" : ""}${emitUnscale ? "Unscale" : ""}${useVec4 ? "Vec4" : ""}`,
+    name: `adamStepUnscale${emitF16 ? "F16" : ""}${useVec4 ? "Vec4" : ""}`,
     workgroupSize: WORKGROUP_SIZE,
     bindings,
     uniforms,
@@ -98,10 +121,9 @@ function makeAdamStepSpec(
     kernel(ctx) {
       const numElements = ctx.uniform("num_elements");
       const gridStride = ctx.uniform("grid_stride");
+      const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
 
       if (useVec4) {
-        // Vec4 path: 4 elements per thread.
-        // 2D-safe: grid_stride = gridSizeX * WG. For 1D, globalId(1)=0.
         const flatId = ctx.emitLet(
           "flatId",
           ctx.globalId(0).add(ctx.globalId(1).mul(gridStride)),
@@ -111,67 +133,28 @@ function makeAdamStepSpec(
           ctx.emitReturn();
         });
 
-        if (emitUnscale) {
-          const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
-          const g0Var = ctx.emitVar(
-            "g0",
+        // Load and unscale 4 grads, check each for inf/nan
+        const gVars: VarHandle[] = [];
+        for (let e = 0; e < 4; e++) {
+          const off = e === 0 ? base : base.add(ctx.u32(e));
+          const gVar = ctx.emitVar(
+            `g${e}`,
             "f32",
-            ctx.load("grad", base).mul(invScale),
+            ctx.load("grad", off).mul(invScale),
           );
-          const g1Var = ctx.emitVar(
-            "g1",
-            "f32",
-            ctx.load("grad", base.add(ctx.u32(1))).mul(invScale),
-          );
-          const g2Var = ctx.emitVar(
-            "g2",
-            "f32",
-            ctx.load("grad", base.add(ctx.u32(2))).mul(invScale),
-          );
-          const g3Var = ctx.emitVar(
-            "g3",
-            "f32",
-            ctx.load("grad", base.add(ctx.u32(3))).mul(invScale),
-          );
-
-          for (let e = 0; e < 4; e++) {
-            const gVar = [g0Var, g1Var, g2Var, g3Var][e];
-            const bits = gVar.get().bitcastTo("u32");
-            const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xff));
-            ctx.ifThen(exponent.eq(ctx.u32(0xff)), () => {
-              ctx.atomicOp(
-                "inf_flag",
-                ctx.u32(0),
-                "max",
-                ctx.u32(F32_ONE_BITS),
-              );
-              gVar.set(ctx.f32(0.0));
-            });
-          }
-
-          emitAdamVec4Body(ctx, base, g0Var, g1Var, g2Var, g3Var, emitF16);
-        } else {
-          const g0Var = ctx.emitVar("g0", "f32", ctx.load("grad", base));
-          const g1Var = ctx.emitVar(
-            "g1",
-            "f32",
-            ctx.load("grad", base.add(ctx.u32(1))),
-          );
-          const g2Var = ctx.emitVar(
-            "g2",
-            "f32",
-            ctx.load("grad", base.add(ctx.u32(2))),
-          );
-          const g3Var = ctx.emitVar(
-            "g3",
-            "f32",
-            ctx.load("grad", base.add(ctx.u32(3))),
-          );
-
-          emitAdamVec4Body(ctx, base, g0Var, g1Var, g2Var, g3Var, emitF16);
+          gVars.push(gVar);
+          const bits = gVar.get().bitcastTo("u32");
+          const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xff));
+          ctx.ifThen(exponent.eq(ctx.u32(0xff)), () => {
+            ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(F32_ONE_BITS));
+            gVar.set(ctx.f32(0.0));
+          });
+        }
+        for (let e = 0; e < 4; e++) {
+          const off = e === 0 ? base : base.add(ctx.u32(e));
+          emitAdamScalarBody(ctx, off, gVars[e], emitF16, `${e}`);
         }
       } else {
-        // Scalar path
         const idx = ctx.emitLet(
           "idx",
           ctx.globalId(0).add(ctx.globalId(1).mul(gridStride)),
@@ -180,26 +163,19 @@ function makeAdamStepSpec(
           ctx.emitReturn();
         });
 
-        if (emitUnscale) {
-          const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
-          const gVar = ctx.emitVar(
-            "g",
-            "f32",
-            ctx.load("grad", idx).mul(invScale),
-          );
+        const gVar = ctx.emitVar(
+          "g",
+          "f32",
+          ctx.load("grad", idx).mul(invScale),
+        );
+        const bits = gVar.get().bitcastTo("u32");
+        const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xff));
+        ctx.ifThen(exponent.eq(ctx.u32(0xff)), () => {
+          ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(F32_ONE_BITS));
+          gVar.set(ctx.f32(0.0));
+        });
 
-          const bits = gVar.get().bitcastTo("u32");
-          const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xff));
-          ctx.ifThen(exponent.eq(ctx.u32(0xff)), () => {
-            ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(F32_ONE_BITS));
-            gVar.set(ctx.f32(0.0));
-          });
-
-          emitAdamScalarBody(ctx, idx, gVar, emitF16);
-        } else {
-          const gVar = ctx.emitVar("g", "f32", ctx.load("grad", idx));
-          emitAdamScalarBody(ctx, idx, gVar, emitF16);
-        }
+        emitAdamScalarBody(ctx, idx, gVar, emitF16);
       }
     },
   };
@@ -221,14 +197,15 @@ function loadAdamUniforms(ctx: KernelContext) {
   };
 }
 
-/** Emit the Adam update logic for the scalar path. */
+/** Emit the Adam update logic for a single element at `idx`. */
 function emitAdamScalarBody(
   ctx: KernelContext,
   idx: BlockExpr,
   gVar: VarHandle,
   emitF16: boolean,
+  suffix = "",
 ): void {
-  const p = ctx.emitLet("p", ctx.load("param", idx));
+  const p = ctx.emitLet(`p${suffix}`, ctx.load("param", idx));
   const { beta1, beta2, stepSize, eps, weightDecay, lrTimesWd, decoupledWd } =
     loadAdamUniforms(ctx);
 
@@ -242,16 +219,16 @@ function emitAdamScalarBody(
 
   const g = gVar.get();
   const mNew = ctx.emitLet(
-    "m_new",
+    `m_new${suffix}`,
     beta1.mul(ctx.load("m", idx)).add(ctx.f32(1.0).sub(beta1).mul(g)),
   );
   const vNew = ctx.emitLet(
-    "v_new",
+    `v_new${suffix}`,
     beta2.mul(ctx.load("v", idx)).add(ctx.f32(1.0).sub(beta2).mul(g).mul(g)),
   );
 
   const pNewVar = ctx.emitVar(
-    "p_new",
+    `p_new${suffix}`,
     "f32",
     p.sub(stepSize.mul(mNew).div(vNew.sqrt().add(eps))),
   );
@@ -268,86 +245,6 @@ function emitAdamScalarBody(
 
   if (emitF16) {
     ctx.emitStore("param_f16", idx, pNewVar.get().toF16());
-  }
-}
-
-/** Emit the Adam update logic for the vec4 path (4 separate scalars). */
-function emitAdamVec4Body(
-  ctx: KernelContext,
-  base: BlockExpr,
-  g0Var: VarHandle,
-  g1Var: VarHandle,
-  g2Var: VarHandle,
-  g3Var: VarHandle,
-  emitF16: boolean,
-): void {
-  const { beta1, beta2, stepSize, eps, weightDecay, lrTimesWd, decoupledWd } =
-    loadAdamUniforms(ctx);
-
-  // Load param, m, v for all 4 elements
-  const offsets = [ctx.u32(0), ctx.u32(1), ctx.u32(2), ctx.u32(3)];
-  const pVars = offsets.map((o, i) =>
-    ctx.emitLet(`p${i}`, ctx.load("param", base.add(o))),
-  );
-  const mVars = offsets.map((o, i) =>
-    ctx.emitLet(`m_old${i}`, ctx.load("m", base.add(o))),
-  );
-  const vVars = offsets.map((o, i) =>
-    ctx.emitLet(`v_old${i}`, ctx.load("v", base.add(o))),
-  );
-  const gVars = [g0Var, g1Var, g2Var, g3Var];
-
-  // L2 weight decay
-  ctx.ifThen(
-    decoupledWd.eq(ctx.u32(0)).and(weightDecay.bitcastTo("u32").gt(ctx.u32(0))),
-    () => {
-      for (let i = 0; i < 4; i++) {
-        gVars[i].set(gVars[i].get().add(weightDecay.mul(pVars[i])));
-      }
-    },
-  );
-
-  // Moment updates + parameter update for each element
-  const pNewVars: VarHandle[] = [];
-  const mNewLets: BlockExpr[] = [];
-  const vNewLets: BlockExpr[] = [];
-  for (let i = 0; i < 4; i++) {
-    const g = gVars[i].get();
-    const mNew = ctx.emitLet(
-      `m_new${i}`,
-      beta1.mul(mVars[i]).add(ctx.f32(1.0).sub(beta1).mul(g)),
-    );
-    const vNew = ctx.emitLet(
-      `v_new${i}`,
-      beta2.mul(vVars[i]).add(ctx.f32(1.0).sub(beta2).mul(g).mul(g)),
-    );
-    mNewLets.push(mNew);
-    vNewLets.push(vNew);
-    pNewVars.push(
-      ctx.emitVar(
-        `p_new${i}`,
-        "f32",
-        pVars[i].sub(stepSize.mul(mNew).div(vNew.sqrt().add(eps))),
-      ),
-    );
-  }
-
-  // Decoupled weight decay
-  ctx.ifThen(decoupledWd.eq(ctx.u32(1)), () => {
-    for (let i = 0; i < 4; i++) {
-      pNewVars[i].set(pNewVars[i].get().sub(lrTimesWd.mul(pVars[i])));
-    }
-  });
-
-  // Write outputs
-  for (let i = 0; i < 4; i++) {
-    const off = base.add(offsets[i]);
-    ctx.emitStore("param", off, pNewVars[i].get());
-    ctx.emitStore("m", off, mNewLets[i]);
-    ctx.emitStore("v", off, vNewLets[i]);
-    if (emitF16) {
-      ctx.emitStore("param_f16", off, pNewVars[i].get().toF16());
-    }
   }
 }
 
@@ -430,27 +327,8 @@ export function dispatchAdamStep(
   }
   profileSubOpEnd("adam.allocBufs", _st);
 
-  // Vec4 coalescing: use when total elements divisible by 4
-  // (elementsPerChunk is aligned to 64 or 128 elements, both multiples of 4)
-  const useVec4 = numElements % 4 === 0;
-
-  // Compute grid_stride based on per-chunk element count for 2D-safe indexing
-  const epa = doF16 ? 128 : 64; // f16 needs 128-element alignment
-  const elemPerChunk = needsChunking
-    ? computeFlatChunkLayout(
-        numElements,
-        bytesPerElement,
-        maxBindingSize,
-        256,
-        epa,
-      ).elementsPerChunk
-    : numElements;
-  const workItems = useVec4 ? Math.ceil(elemPerChunk / 4) : elemPerChunk;
-  const wg = Math.ceil(workItems / WORKGROUP_SIZE);
-  const gridSizeX = Math.min(wg, MAX_WORKGROUPS_PER_DIM);
-  const gridStride = gridSizeX * WORKGROUP_SIZE;
-
-  const dispatcher = getAdamDispatcher(useVec4, doF16, doUnscale);
+  // Vec4 coalescing for unscale path (non-unscale uses autoVectorize)
+  const useVec4 = doUnscale && numElements % 4 === 0;
 
   // Build buffers map
   const buffers: Record<string, GPUBuffer> = {
@@ -472,9 +350,23 @@ export function dispatchAdamStep(
     lr_times_wd: config.lrTimesWd,
     decoupled_wd: config.decoupledWd ? 1 : 0,
     num_elements: numElements,
-    grid_stride: gridStride,
   };
   if (doUnscale) {
+    // Unscale path needs grid_stride for manual 2D indexing
+    const epa = doF16 ? 128 : 64;
+    const elemPerChunk = needsChunking
+      ? computeFlatChunkLayout(
+          numElements,
+          bytesPerElement,
+          maxBindingSize,
+          256,
+          epa,
+        ).elementsPerChunk
+      : numElements;
+    const workItems = useVec4 ? Math.ceil(elemPerChunk / 4) : elemPerChunk;
+    const wg = Math.ceil(workItems / WORKGROUP_SIZE);
+    const gridSizeX = Math.min(wg, MAX_WORKGROUPS_PER_DIM);
+    uniforms.grid_stride = gridSizeX * WORKGROUP_SIZE;
     uniforms.inv_scale = config.invScale ?? 1.0;
     uniforms._pad0 = 0;
     uniforms._pad1 = 0;
@@ -482,10 +374,14 @@ export function dispatchAdamStep(
     uniforms._pad0 = 0;
     uniforms._pad1 = 0;
     uniforms._pad2 = 0;
+    uniforms._pad3 = 0;
   }
+
+  const dispatcher = getAdamDispatcher(useVec4, doF16, doUnscale);
 
   _st = profileSubOpBegin();
   if (needsChunking) {
+    const epa = doF16 ? 128 : 64;
     const modes: Record<string, "scalar" | "chunked"> = {
       grad: "chunked",
       param: "chunked",
