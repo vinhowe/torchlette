@@ -4,10 +4,10 @@
  * Consolidates the 4 scattered pattern detection systems into a single
  * `analyzeGraph()` call with priority-ordered pattern detectors:
  *
- *  1. Matmul epilogue chains  (priority 100)
- *  2. Compound patterns        (priority 80)
- *  3. Reduction preamble/epilogue (detected during execution, not here yet)
- *  4. Elementwise fusion       (priority 40)
+ *  1. Matmul epilogue chains       (priority 100)
+ *  2. Compound patterns             (priority 80)
+ *  3. Reduction preamble/epilogue   (priority 60 — claiming only)
+ *  4. Elementwise fusion            (priority 40)
  *
  * The analysis phase runs once per structural fingerprint and produces a
  * `GraphAnalysisResult` consumed by executor-optimized.ts. Results are
@@ -19,12 +19,18 @@ import type { CompoundMatch } from "./compound-patterns";
 import { detectCompoundPatterns } from "./compound-patterns";
 import {
   type ExecutionSegment,
+  isFusibleOp,
   reorderPlanForFusion,
   segmentPlanForExecution,
 } from "./fusion-detect";
 import { runRewritePasses } from "./graph-rewrites";
 import type { LazyIRNode } from "./lazy-types";
 import type { MatmulPrologueInfo } from "./matmul-epilogue";
+import {
+  detectReductionEpilogue,
+  detectReductionFusion,
+  detectReductionPreamble,
+} from "./reduction-preamble";
 
 // ============================================================================
 // Types
@@ -148,7 +154,7 @@ function detectMatmulEpilogueChains(
       let ok = false;
       if (next.op === "cast") ok = true;
       else if (
-        (next.op === "add" || next.op === "mul") &&
+        (next.op === "add" || next.op === "mul" || next.op === "sub") &&
         next.inputs.length === 2
       ) {
         if (additionalInputCount >= 4) break;
@@ -162,13 +168,7 @@ function detectMatmulEpilogueChains(
           }
         }
         if (ok) additionalInputCount++;
-      } else if (
-        next.op === "relu" ||
-        next.op === "silu" ||
-        next.op === "sigmoid" ||
-        next.op === "tanh" ||
-        next.op === "gelu"
-      ) {
+      } else if (isFusibleOp(next.op) && next.inputs.length === 1) {
         ok = true;
       }
 
@@ -240,10 +240,12 @@ function detectMatmulEpilogueChains(
  * Runs the following detectors in priority order:
  *  1. Matmul epilogue chains (claims cast/bias/activation after matmul)
  *  2. Compound patterns (claims softmax/log_softmax decomposition)
- *  3. Elementwise fusion (claims fusible chains from remaining nodes)
+ *  3. Reduction preamble/epilogue (claims elementwise ops adjacent to reductions)
+ *  4. Elementwise fusion (claims fusible chains from remaining nodes)
  *
- * Reduction preamble/epilogue detection still happens during execution
- * (in segment-executors.ts) for now. It will be moved here in a future phase.
+ * Reduction execution still happens inline in segment-executors.ts;
+ * graph-compiler handles claiming so preamble nodes aren't stolen by
+ * elementwise fusion.
  *
  * @param planNodes - Original plan nodes in topological order
  * @param externalNodeIds - Node IDs with external references (saved-for-backward)
@@ -333,6 +335,60 @@ export function analyzeGraph(
     }
   }
 
+  // --- Priority 60: Reduction preamble/epilogue claiming ---
+  // Scan for elementwise→reduction and reduction→elementwise patterns.
+  // Claim their nodes so they're excluded from elementwise fusion (P40),
+  // ensuring preamble/epilogue ops stay in sequential segments where
+  // inline detection can fuse them into reduction kernels.
+  const reductionClaimedIds = new Set<number>();
+  for (let i = 0; i < reorderedNodes.length; i++) {
+    const node = reorderedNodes[i];
+    if (reductionClaimedIds.has(node.id)) continue;
+    if (epilogueClaimedIds.has(node.id) || compoundClaimedIds.has(node.id))
+      continue;
+
+    // Try combined preamble+epilogue first
+    if (isFusibleOp(node.op)) {
+      const fusion = detectReductionFusion(
+        reorderedNodes,
+        i,
+        consumerCount,
+        externalNodeIds,
+      );
+      if (fusion) {
+        for (const n of fusion.preambleChain) reductionClaimedIds.add(n.id);
+        for (const n of fusion.epilogueChain) reductionClaimedIds.add(n.id);
+        continue;
+      }
+      // Try preamble-only
+      const preamble = detectReductionPreamble(
+        reorderedNodes,
+        i,
+        consumerCount,
+      );
+      if (preamble) {
+        for (const n of preamble.preambleChain) reductionClaimedIds.add(n.id);
+        continue;
+      }
+    }
+
+    // Try epilogue-only for reduction nodes
+    if (node.op === "sum" || node.op === "mean" || node.op === "max") {
+      const epilogue = detectReductionEpilogue(
+        reorderedNodes,
+        i,
+        consumerCount,
+        externalNodeIds,
+      );
+      if (epilogue) {
+        // Claim epilogue chain nodes (not the reduction itself — it's the anchor)
+        for (let j = 1; j < epilogue.consumedCount; j++) {
+          reductionClaimedIds.add(reorderedNodes[i + j].id);
+        }
+      }
+    }
+  }
+
   // --- Priority 40: Elementwise fusion (via segmentPlanForExecution) ---
   // Bypassed nodes are excluded from fusion (they become view-like pass-throughs)
   let allClaimedIds: Set<number> | undefined;
@@ -340,12 +396,14 @@ export function analyzeGraph(
     epilogueClaimedIds.size > 0 ||
     prologueClaimedIds.size > 0 ||
     compoundClaimedIds.size > 0 ||
+    reductionClaimedIds.size > 0 ||
     rewriteBypassedIds.size > 0
   ) {
     allClaimedIds = new Set([
       ...epilogueClaimedIds,
       ...prologueClaimedIds,
       ...compoundClaimedIds,
+      ...reductionClaimedIds,
       ...rewriteBypassedIds,
     ]);
   }

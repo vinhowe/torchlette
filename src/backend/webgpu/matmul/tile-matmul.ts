@@ -8,6 +8,7 @@
  * callbacks that the matmul kernel body can call without knowing about epilogues.
  */
 
+import { applyFusedOp } from "../fusion-tile-ir";
 import {
   type BlockExpr,
   ceilDivGrid,
@@ -39,80 +40,6 @@ type BlockOpsPostAccFn = (
   addressing: BlockOpsAddressing,
 ) => void;
 
-// ---- Epilogue expression helpers ----
-
-function applyGelu(ctx: KernelContext, x: BlockExpr): BlockExpr {
-  const inner = ctx
-    .const(0.7978845608)
-    .mul(x.add(ctx.const(0.044715).mul(x.mul(x).mul(x))));
-  return x.mul(ctx.const(0.5)).mul(ctx.const(1.0).add(inner.tanh()));
-}
-
-function applyGeluErf(ctx: KernelContext, x: BlockExpr): BlockExpr {
-  const absX = x.abs();
-  const t = ctx
-    .const(1.0)
-    .div(
-      ctx
-        .const(1.0)
-        .add(ctx.const(0.3275911).mul(absX.mul(ctx.const(Math.SQRT1_2)))),
-    );
-  const poly = ctx
-    .const(1.061405429)
-    .mul(t)
-    .add(ctx.const(-1.453152027))
-    .mul(t)
-    .add(ctx.const(1.421413741))
-    .mul(t)
-    .add(ctx.const(-0.284496736))
-    .mul(t)
-    .add(ctx.const(0.254829592))
-    .mul(t);
-  const erfApprox = ctx
-    .const(1.0)
-    .sub(poly.mul(x.neg().mul(x).mul(ctx.const(0.5)).exp()));
-  const signX = x.ge(ctx.const(0.0)).select(ctx.const(1.0), ctx.const(-1.0));
-  return x.mul(ctx.const(0.5)).mul(ctx.const(1.0).add(signX.mul(erfApprox)));
-}
-
-function applySilu(ctx: KernelContext, x: BlockExpr): BlockExpr {
-  return x.div(ctx.const(1.0).add(x.neg().exp()));
-}
-
-function applyUnaryOp(
-  ctx: KernelContext,
-  opName: string,
-  x: BlockExpr,
-): BlockExpr {
-  switch (opName) {
-    case "relu":
-      return x.gt(ctx.const(0.0)).select(x, ctx.const(0.0));
-    case "gelu":
-    case "gelu_tanh":
-      return applyGelu(ctx, x);
-    case "gelu_erf":
-      return applyGeluErf(ctx, x);
-    case "silu":
-      return applySilu(ctx, x);
-    case "sigmoid":
-      return ctx.const(1.0).div(ctx.const(1.0).add(x.neg().exp()));
-    case "tanh":
-      return x.tanh();
-    case "neg":
-      return x.neg();
-    case "abs":
-      return x.abs();
-    case "exp":
-      return x.exp();
-    case "log":
-      return x.log();
-    case "sqrt":
-      return x.sqrt();
-    default:
-      throw new Error(`Unsupported unary epilogue op: ${opName}`);
-  }
-}
-
 /**
  * Apply composable epilogue ops to a Block accumulator using only Block-level operations.
  *
@@ -137,7 +64,7 @@ function applyBlockEpilogue(
         acc.add_(ops.load1d(`epilogue_in${op.inputIndex}`, offsN));
         break;
       case "unary":
-        acc.apply_((x) => applyUnaryOp(ctx, op.op, x));
+        acc.apply_((x) => applyFusedOp(ctx, op.op!, [x]));
         break;
       case "binary": {
         const binBlock = ops.load(
