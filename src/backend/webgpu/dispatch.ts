@@ -31,7 +31,7 @@ import {
   computeMatmulOutputShape,
   dispatchTiledMatmul,
 } from "./matmul/dispatch";
-import type { EpilogueConfig } from "./matmul/types";
+import type { EpilogueConfig, DType as MatmulDType } from "./matmul/types";
 import {
   binaryBroadcastSpec,
   binaryBroadcastTileIR,
@@ -280,7 +280,7 @@ export function dispatchBinary(
     bStrides,
     a.offset,
     b.offset,
-    dtype,
+    dtype as "f32" | "f16" | "u32" | "i32",
   );
   const key = `binary:${op}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${a.offset}:${b.offset}:${dtype}:${use2D ? dispatch.gridSizeX : "1d"}`;
 
@@ -397,7 +397,13 @@ export function dispatchUnary(
   const totalWorkgroups = Math.ceil(a.size / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
-  const code = unaryStridedTileIR(opKey, a.shape, a.strides, a.offset, dtype);
+  const code = unaryStridedTileIR(
+    opKey,
+    a.shape,
+    a.strides,
+    a.offset,
+    dtype as "f32" | "f16" | "u32" | "i32",
+  );
   const key = `unary:${opKey}:${a.shape.join("x")}:${a.strides.join(",")}:${a.offset}:${dtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
 
   const outBuffer = dispatchElementwise({
@@ -518,8 +524,8 @@ export function dispatchMatmul(
   epilogueOpts?: {
     epilogue: EpilogueConfig;
     epilogueInputs: WebGPUTensor[];
-    inputCastA?: DType;
-    inputCastB?: DType;
+    inputCastA?: MatmulDType;
+    inputCastB?: MatmulDType;
   },
 ): WebGPUTensor {
   const ctx = requireContext();
@@ -594,8 +600,8 @@ export function dispatchMatmul(
     dtypeB: dtypeB !== dtypeA ? dtypeB : undefined,
     epilogue: epilogueOpts?.epilogue,
     epilogueInputs: epilogueBuffers.length > 0 ? epilogueBuffers : undefined,
-    inputCastA: epilogueOpts?.inputCastA,
-    inputCastB: epilogueOpts?.inputCastB,
+    inputCastA: epilogueOpts?.inputCastA as MatmulDType | undefined,
+    inputCastB: epilogueOpts?.inputCastB as MatmulDType | undefined,
   });
 
   if (aWasCopied) destroyCopy(effectiveA);
@@ -637,8 +643,8 @@ export function dispatchMatmulDirect(
     outputDtype: DType;
     epilogueConfig: EpilogueConfig | undefined;
     epilogueBuffers: GPUBuffer[];
-    inputCastA?: DType;
-    inputCastB?: DType;
+    inputCastA?: MatmulDType;
+    inputCastB?: MatmulDType;
   },
 ): WebGPUTensor {
   const ctx = requireContext();

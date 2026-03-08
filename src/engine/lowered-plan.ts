@@ -119,9 +119,9 @@ interface LoweredMatmulEpilogueAction {
     /** Paths to resolve epilogue inputs (e.g., bias tensors). */
     epilogueInputPaths: PlanNodePath[];
     /** Prologue cast for input A (if cast was absorbed into matmul codegen). */
-    inputCastA?: DType;
+    inputCastA?: "f16" | "f32";
     /** Prologue cast for input B. */
-    inputCastB?: DType;
+    inputCastB?: "f16" | "f32";
     /** Pre-computed matmul geometry — stable across steps for same plan fingerprint. */
     m: number;
     k: number;

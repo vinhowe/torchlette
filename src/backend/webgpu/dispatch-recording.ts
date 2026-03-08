@@ -94,7 +94,8 @@ export function stopDispatchRecording(): void {
  * Caller must ensure the shared encoder is active.
  */
 export function replayDispatches(dispatches: RecordedDispatch[]): void {
-  if (!getSharedEncoderInstance()) {
+  const encoder = getSharedEncoderInstance();
+  if (!encoder) {
     throw new Error("replayDispatches requires an active shared encoder");
   }
   for (let i = 0; i < dispatches.length; i++) {
@@ -102,7 +103,7 @@ export function replayDispatches(dispatches: RecordedDispatch[]): void {
     // Restore module context and attach GPU timestamp queries during profiling
     if (d.module) setProfileModule(d.module);
     const tsWrites = getTimestampWrites(d.label ?? "unknown");
-    const pass = getSharedEncoderInstance().beginComputePass(
+    const pass = encoder.beginComputePass(
       tsWrites ? { timestampWrites: tsWrites } : undefined,
     );
     pass.setPipeline(d.pipeline);

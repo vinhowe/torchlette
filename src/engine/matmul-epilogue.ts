@@ -303,8 +303,8 @@ export async function executeMatmulWithEpilogue(
   // Determine which inputs have prologue casts.
   // If the prologue cast was skipped (no result), use the original pre-cast input.
   // If the cast ran (e.g., in a fusion group), use the normal cast output instead.
-  let inputCastA: DType | undefined;
-  let inputCastB: DType | undefined;
+  let inputCastA: "f16" | "f32" | undefined;
+  let inputCastB: "f16" | "f32" | undefined;
   let resolvedInputRefA = matmulNode.inputs[0];
   let resolvedInputRefB = matmulNode.inputs[1];
   if (plan.prologues) {
@@ -318,10 +318,10 @@ export async function executeMatmulWithEpilogue(
         // Cast was skipped — use the pre-cast f32 input and tell codegen about the cast
         if (p.inputIndex === 0) {
           resolvedInputRefA = p.originalInputRef;
-          inputCastA = p.toDtype;
+          inputCastA = p.toDtype as "f16" | "f32";
         } else {
           resolvedInputRefB = p.originalInputRef;
-          inputCastB = p.toDtype;
+          inputCastB = p.toDtype as "f16" | "f32";
         }
       }
       // If cast already ran, just use the normal matmul input (cast's f16 output)

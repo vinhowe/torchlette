@@ -549,7 +549,7 @@ function dispatchAttention(
     configBuf,
   ]);
   for (const b of buffers) trackSharedEncoderWrite(b);
-  dispatchComputePass(pipeline, bindGroup, ...grid);
+  dispatchComputePass(pipeline, bindGroup, grid[0], grid[1] ?? 1, grid[2] ?? 1);
 }
 
 /** Q,K,V: [B, H, N, D] → O: [B, H, N, D], L: [B, H, N] */
