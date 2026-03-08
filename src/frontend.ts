@@ -1114,6 +1114,32 @@ export class Torchlette {
     return this._wrap(inner);
   }
 
+  /**
+   * Embedding lookup: weight[indices] for each index.
+   * Like PyTorch's F.embedding(input, weight).
+   *
+   * @param weight - Embedding table of shape [numEmbeddings, embeddingDim]
+   * @param indices - Index tensor of arbitrary shape [...]
+   * @returns Tensor of shape [..., embeddingDim]
+   */
+  embedding(weight: Tensor, indices: Tensor): Tensor {
+    this._assertUsable(weight, indices);
+    const inputShape = indices.shape;
+    const embDim = weight.shape[1];
+    const numElements = sizeOf(inputShape);
+
+    // Flatten → expand → contiguous → gather → reshape
+    // Uses existing gather autograd (scatterAdd backward)
+    const flat = this.reshape(indices, [numElements]);
+    const expanded = this.expand(this.reshape(flat, [numElements, 1]), [
+      numElements,
+      embDim,
+    ]);
+    const contig = this.contiguous(expanded);
+    const gathered = this.gather(weight, contig, { dim: 0 });
+    return this.reshape(gathered, [...inputShape, embDim]);
+  }
+
   expand(a: Tensor, shape: number[]): Tensor {
     this._assertUsable(a);
     const aShape = a.shape;
