@@ -8,42 +8,12 @@
 import { describe, expect, test } from "vitest";
 import { Torchlette } from "../../src";
 import { checkpoint } from "../../src/nn/checkpoint";
+import { assertClose } from "../helpers/assertions";
 import { type OracleCase, runTorchOracleFullBatch } from "./torch-oracle";
-
-type Payload = { shape: number[]; values: number[] };
-
-const DEFAULT_ATOL = 1e-5;
-const DEFAULT_RTOL = 1e-4;
 
 // Looser tolerance for AMP (f16 precision)
 const AMP_ATOL = 1e-2;
 const AMP_RTOL = 1e-2;
-
-function assertClose(
-  actual: Payload,
-  expected: Payload,
-  atol = DEFAULT_ATOL,
-  rtol = DEFAULT_RTOL,
-): void {
-  expect(actual.shape).toEqual(expected.shape);
-  expect(actual.values.length).toBe(expected.values.length);
-  for (let i = 0; i < actual.values.length; i += 1) {
-    const a = actual.values[i];
-    const b = expected.values[i];
-    // Handle null values (NaN/Inf from oracle)
-    if (b === null) {
-      // Skip comparison for NaN/Inf
-      continue;
-    }
-    const diff = Math.abs(a - b);
-    const tol = atol + rtol * Math.abs(b);
-    if (diff > tol) {
-      throw new Error(
-        `Mismatch at index ${i}: actual=${a}, expected=${b}, diff=${diff}, tol=${tol}`,
-      );
-    }
-  }
-}
 
 describe("Checkpoint Parity with PyTorch", () => {
   test(

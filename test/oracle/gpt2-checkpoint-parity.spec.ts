@@ -22,10 +22,9 @@ import {
   resetStorageIdCounter,
 } from "../../src/engine/node-factory";
 import { resetBaseIdCounter } from "../../src/runtime/tensor";
-import { canUseWebGPU } from "../helpers/webgpu";
+import { assertClose } from "../helpers/assertions";
+import { canUseWebGPU, cpuOnly } from "../helpers/webgpu";
 import { type OracleCase, runTorchOracleFullBatch } from "./torch-oracle";
-
-type Payload = { shape: number[]; values: number[] };
 
 // Same-device comparison should be very strict
 const SAME_DEVICE_ATOL = 1e-6;
@@ -36,44 +35,7 @@ const SAME_DEVICE_RTOL = 1e-5;
 const _CROSS_DEVICE_ATOL = 0.5; // 50% absolute tolerance
 const _CROSS_DEVICE_RTOL = 0.5; // 50% relative tolerance
 
-import { cpuOnly } from "../helpers/webgpu";
-
 const hasWebGPU = !cpuOnly;
-
-function assertClose(
-  actual: Payload,
-  expected: Payload,
-  atol: number,
-  rtol: number,
-  label = "",
-): void {
-  expect(actual.shape).toEqual(expected.shape);
-  expect(actual.values.length).toBe(expected.values.length);
-
-  let maxDiff = 0;
-  let maxIndex = 0;
-
-  for (let i = 0; i < actual.values.length; i += 1) {
-    const a = actual.values[i];
-    const b = expected.values[i];
-
-    if (b === null) continue;
-
-    const diff = Math.abs(a - b);
-    if (diff > maxDiff) {
-      maxDiff = diff;
-      maxIndex = i;
-    }
-
-    const tol = atol + rtol * Math.abs(b);
-    if (diff > tol) {
-      const context = `at index ${maxIndex}: actual=${a}, expected=${b}`;
-      throw new Error(
-        `Mismatch ${label}: max diff=${maxDiff.toExponential(2)}, ${context}`,
-      );
-    }
-  }
-}
 
 function deterministicInit(shape: number[], seed: number): number[] {
   const size = shape.reduce((a, b) => a * b, 1);

@@ -3,13 +3,10 @@ import { describe, expect, test } from "vitest";
 
 import { OP_SPECS } from "../../ops/specs/registry";
 import type { OpCase, OpSpec } from "../../ops/specs/types";
+import { assertClose } from "../helpers/assertions";
 import { rt } from "../helpers/runtime";
 import { runTorchOracleBatch } from "./torch-oracle";
 
-type OutputPayload = { shape: number[]; values: number[] };
-
-const DEFAULT_ATOL = 1e-5;
-const DEFAULT_RTOL = 1e-4;
 const PROPERTY_RUNS_MATCH = 3;
 const PROPERTY_RUNS_FAIL = 1;
 const FAIL_ASSERT_OPTIONS = { numRuns: PROPERTY_RUNS_FAIL, endOnFailure: true };
@@ -240,26 +237,6 @@ const transposeCaseArb = shape2dArb.chain((shape) => {
     }));
 });
 
-function assertClose(
-  actual: OutputPayload,
-  expected: OutputPayload,
-  options?: { atol?: number; rtol?: number },
-) {
-  const atol = options?.atol ?? DEFAULT_ATOL;
-  const rtol = options?.rtol ?? DEFAULT_RTOL;
-
-  expect(actual.shape).toEqual(expected.shape);
-  expect(actual.values.length).toBe(expected.values.length);
-
-  for (let i = 0; i < actual.values.length; i += 1) {
-    const a = actual.values[i];
-    const b = expected.values[i];
-    const diff = Math.abs(a - b);
-    const tol = atol + rtol * Math.abs(b);
-    expect(diff).toBeLessThanOrEqual(tol);
-  }
-}
-
 function toPayload(values: number[], shape: number[]): OutputPayload {
   return { values, shape };
 }
@@ -394,7 +371,7 @@ async function runCases(spec: OpSpec, cases: OpCase[]) {
     const opCase = cases[i];
     const expected = oracleOutputs[i];
     const actual = await runTorchletteCase(spec, opCase);
-    assertClose(actual, expected, { atol: opCase.atol, rtol: opCase.rtol });
+    assertClose(actual, expected, opCase.atol, opCase.rtol);
   }
 }
 
