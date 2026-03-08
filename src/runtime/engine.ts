@@ -910,28 +910,32 @@ export class RuntimeEngine {
     return this.trackNode(node, shape, resolvedDevice);
   }
 
-  /** Helper: create a simple binary lazy op node (comparison ops output f32). */
-  private _comparisonOp(
-    op: LazyOpCode,
-    a: TensorOrScalar,
-    b: TensorOrScalar,
-  ): Tensor {
-    const { refA, refB, shape, device } = this.resolveBinaryOp(op, a, b);
-    const node = createLazyIRNode(op, [refA, refB], shape, "f32", device);
-    return this.trackNode(node, shape, device);
-  }
-
-  /** Helper: create a simple unary lazy op node. */
+  /** Helper: create a simple unary lazy op node.
+   *  Automatically handles dtype safety from OP_DTYPE_RULES:
+   *  - f32_required: casts f16 input to f32
+   *  - always_f32: forces f32 output dtype
+   */
   private _unaryOp(op: LazyOpCode, a: OpInput, payload?: unknown): Tensor {
+    let input: OpInput = a;
+    let outDtype = a.dtype;
+    const rule = OP_DTYPE_RULES[op];
+    if (rule) {
+      if (rule.category === "f32_required" && a.dtype === "f16") {
+        input = castRef(a, "f32");
+        outDtype = "f32";
+      } else if (rule.category === "always_f32") {
+        outDtype = "f32";
+      }
+    }
     const node = createLazyIRNode(
       op,
-      [a.lazyRef],
+      [input.lazyRef],
       a.shape.slice(),
-      a.dtype,
+      outDtype,
       a.device,
       payload,
     );
-    return this.trackNode(node, a.shape.slice(), a.device, a.dtype);
+    return this.trackNode(node, a.shape.slice(), a.device, outDtype);
   }
 
   /**
@@ -1017,11 +1021,14 @@ export class RuntimeEngine {
     const resA = this.resolveOperand(opA, ref);
     const resB = this.resolveOperand(opB, ref);
     const shape = broadcastShapes(resA.shape, resB.shape);
+    // Check if this op always produces f32 (comparisons, etc.)
+    const rule = OP_DTYPE_RULES[op];
+    const dtype = rule?.category === "always_f32" ? "f32" : ref.dtype;
     return {
       refA: resA.ref,
       refB: resB.ref,
       shape,
-      dtype: ref.dtype,
+      dtype,
       device: ref.device,
     };
   }
@@ -1116,13 +1123,10 @@ export class RuntimeEngine {
   }
 
   exp(a: Tensor): Tensor {
-    const [op] = this.ensureDtypeSafety("exp", [a]);
-    return this._unaryOp("exp", op);
+    return this._unaryOp("exp", a);
   }
-
   log(a: Tensor): Tensor {
-    const [op] = this.ensureDtypeSafety("log", [a]);
-    return this._unaryOp("log", op);
+    return this._unaryOp("log", a);
   }
 
   neg(a: Tensor): Tensor {
@@ -1173,14 +1177,7 @@ export class RuntimeEngine {
 
   /** Returns 1.0 where finite, 0.0 where NaN or Inf. */
   isfinite(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "isfinite",
-      [a.lazyRef],
-      a.shape.slice(),
-      "f32",
-      a.device,
-    );
-    return this.trackNode(node, a.shape.slice(), a.device);
+    return this._unaryOp("isfinite", a);
   }
 
   expand(a: Tensor, shape: number[]): Tensor {
@@ -1390,22 +1387,22 @@ export class RuntimeEngine {
   }
 
   gt(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._comparisonOp("gt", a, b);
+    return this._binaryOp("gt", a, b);
   }
   lt(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._comparisonOp("lt", a, b);
+    return this._binaryOp("lt", a, b);
   }
   ge(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._comparisonOp("ge", a, b);
+    return this._binaryOp("ge", a, b);
   }
   le(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._comparisonOp("le", a, b);
+    return this._binaryOp("le", a, b);
   }
   eq(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._comparisonOp("eq", a, b);
+    return this._binaryOp("eq", a, b);
   }
   ne(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._comparisonOp("ne", a, b);
+    return this._binaryOp("ne", a, b);
   }
 
   where(condition: Tensor, x: TensorOrScalar, y: TensorOrScalar): Tensor {
