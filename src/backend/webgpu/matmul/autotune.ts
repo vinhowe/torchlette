@@ -111,12 +111,13 @@ export function getDefaultConfigForShape(
         };
       }
       // Bare matmuls: larger thread tiles (t8x4) give better register reuse
+      // tileK=16 halves K-loop iterations and barriers for large-K backward matmuls
       // Benchmarked on MLP shapes (512x3072x768, 512x768x3072): +11% to +100% vs t4x4
       return {
         ...DEFAULT_CONFIG,
         tileM: 64,
         tileN: 128,
-        tileK: 8,
+        tileK: 16,
         threadTileM: 8,
         threadTileN: 4,
       };
@@ -132,11 +133,12 @@ export function getDefaultConfigForShape(
         };
       }
       // Bare matmuls: step up from 32x32x16 for better throughput
+      // tileK=16 halves K-loop iterations; same shared memory as 64x64x8
       return {
         ...DEFAULT_CONFIG,
         tileM: 64,
         tileN: 64,
-        tileK: 8,
+        tileK: 16,
       };
 
     case "large_k":
@@ -183,12 +185,13 @@ export function getDefaultConfigForShape(
         };
       }
       // Wide matrices (e.g. lm_head: M=512, N=50304, K=768)
-      // Large output tile with tileK=8 for better occupancy; 256 threads
+      // Large output tile with tileK=16 for fewer K-loop iterations; 256 threads
+      // f16 shared memory halves tile footprint, making tileK=16 fit in same budget as tileK=8 with f32
       return {
         ...DEFAULT_CONFIG,
         tileM: 64,
         tileN: 128,
-        tileK: 8,
+        tileK: 16,
         threadTileM: 8,
         threadTileN: 4,
       };

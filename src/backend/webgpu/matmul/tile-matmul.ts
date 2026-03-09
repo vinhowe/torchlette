@@ -278,19 +278,11 @@ function matmulKernelBlockOps(
       batchIdx.mul(ctx.uniform("batchStrideC")),
     );
   } else {
-    const batchIdx = ctx.emitLet("batch_idx", ctx.const(0, "u32"));
-    batchOffA = ctx.emitLet(
-      "batch_offset_a",
-      batchIdx.mul(ctx.uniform("batchStrideA")),
-    );
-    batchOffB = ctx.emitLet(
-      "batch_offset_b",
-      batchIdx.mul(ctx.uniform("batchStrideB")),
-    );
-    batchOffC = ctx.emitLet(
-      "batch_offset_c",
-      batchIdx.mul(ctx.uniform("batchStrideC")),
-    );
+    // Non-batched: offsets are constant zero (no uniform reads needed)
+    const zero = ctx.const(0, "u32");
+    batchOffA = zero;
+    batchOffB = zero;
+    batchOffC = zero;
   }
 
   // 3. Workgroup positions
@@ -340,8 +332,8 @@ function matmulKernelBlockOps(
       "num_k_tiles",
       k.add(ctx.const(tileK - 1, "u32")).div(cTK),
     );
-    kStart = ctx.emitLet("k_start", ctx.const(0, "u32"));
-    kEnd = ctx.emitLet("k_end", k);
+    kStart = ctx.const(0, "u32");
+    kEnd = k;
   }
 
   // 8. K-loop — the core matmul
