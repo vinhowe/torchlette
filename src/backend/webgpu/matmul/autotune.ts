@@ -102,12 +102,13 @@ export function getDefaultConfigForShape(
     case "square_large":
       if (hasEpilogue) {
         // Epilogue matmuls: t4x4 avoids register pressure from extra per-element ops
-        // Benchmarked: 64x64x8 t4x4 is +50% faster than 64x128x8 t8x4 with epilogue
+        // tileK=16 halves K-loop iterations while keeping 8KB smem budget
+        // Benchmarked: 64x64 t4x4 is +50% faster than 64x128 t8x4 with epilogue
         return {
           ...DEFAULT_CONFIG,
           tileM: 64,
           tileN: 64,
-          tileK: 8,
+          tileK: 16,
         };
       }
       // Bare matmuls: larger thread tiles (t8x4) give better register reuse
