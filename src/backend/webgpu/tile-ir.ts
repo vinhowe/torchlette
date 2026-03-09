@@ -458,6 +458,32 @@ export interface BlockDotStmt {
   bSmemElemType?: DataType; // shared memory element type for B (default: "f32")
 }
 
+/** Single-row dot product: scalar = dot(regBlock[0,:], sharedBlock[rowIdx,:]) */
+export interface BlockDotRowStmt {
+  kind: "blockDotRow";
+  aName: string; // register block (1×D)
+  bName: string; // shared block (K×D)
+  resultName: string; // scalar variable to store result
+  rowIdx: IRNode; // which row of B to dot with
+  aCols: number; // D dimension
+  bCols: number; // original B cols (= D for non-transposed)
+  bSmemStride?: number; // stride for B in shared memory
+  bSmemElemType?: DataType;
+}
+
+/** Single-row scaled accumulation: accBlock[:] += scalar * sharedBlock[rowIdx,:] */
+export interface BlockAccumRowStmt {
+  kind: "blockAccumRow";
+  accName: string; // register accumulator block (1×D)
+  bName: string; // shared block (K×D)
+  scalarName: string; // scalar variable to multiply by
+  rowIdx: IRNode; // which row of B
+  accCols: number; // D dimension
+  bCols: number; // original B cols
+  bSmemStride?: number;
+  bSmemElemType?: DataType;
+}
+
 export interface BlockReduceStmt {
   kind: "blockReduce";
   inputName: string;
@@ -528,6 +554,8 @@ export type Statement =
   | BlockLoadStmt
   | BlockStoreStmt
   | BlockDotStmt
+  | BlockDotRowStmt
+  | BlockAccumRowStmt
   | BlockReduceStmt
   | BlockUnaryStmt
   | BlockBinaryStmt
@@ -2802,6 +2830,21 @@ export class KernelContext {
     return this._requireOps().dot(a, b);
   }
 
+  /** Single-row dot product: scalar = dot(reg[0,:], shared[rowIdx,:]). Used in fused inner loops. */
+  dotRow(reg: Block, shared: Block, rowIdx: BlockExpr): BlockExpr {
+    return this._requireOps().dotRow(reg, shared, rowIdx);
+  }
+
+  /** Single-row scaled accumulation: acc[:] += scalar * shared[rowIdx,:]. Used in fused inner loops. */
+  accumRow(
+    acc: Block,
+    scalar: BlockExpr,
+    shared: Block,
+    rowIdx: BlockExpr,
+  ): void {
+    this._requireOps().accumRow(acc, scalar, shared, rowIdx);
+  }
+
   /** Unified tile load: ptr type determines register vs shared placement. ≈ tl.load(ptr, mask) */
   tileLoad(binding: string, ptr: BlockPtr, opts: BlockLoadOpts): Block {
     return this._requireOps().load(binding, ptr, opts);
@@ -2858,6 +2901,18 @@ export class KernelContext {
       }),
     );
   }
+
+  /** Create a BlockExpr referencing a named variable. */
+  _makeRef(name: string, dt: DataType = "f32"): BlockExpr {
+    return new BlockExpr(
+      makeNode({
+        kind: "namedRef",
+        name,
+        valueType: "scalar",
+        dataType: dt,
+      } as IRNode),
+    );
+  }
 }
 
 // ============================================================================
@@ -2898,6 +2953,9 @@ export interface TileKernelSpec {
    *  between shared memory writes and subsequent reads. Opt-in to avoid
    *  double-barriering existing kernels with manual barriers. */
   autoBarriers?: boolean;
+  /** When true, disable auto-detected TPR (threads-per-row) optimization.
+   *  Forces single-thread-per-row execution even when subgroups are available. */
+  noTPR?: boolean;
   /** Compute grid dimensions from uniform values.
    *  If omitted, auto-inferred from uniforms: a u32 uniform named "size",
    *  "total_elements", "num_elements", or "outSize" triggers elementwiseGrid. */
