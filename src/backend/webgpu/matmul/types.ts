@@ -34,6 +34,8 @@ export type CodegenOptions = {
   inputCastA?: DType;
   inputCastB?: DType;
   kSplit?: number;
+  /** Swap grid X/Y axes so M is fast and N is slow. Improves L2 cache reuse for wide shapes. */
+  swapGrid?: boolean;
 };
 
 /**
@@ -311,6 +313,7 @@ export function getShaderCacheKey(options: CodegenOptions): string {
     inputCastA ? `castA_${inputCastA}` : "",
     inputCastB ? `castB_${inputCastB}` : "",
     kSplit ? `ksplit${kSplit}` : "",
+    options.swapGrid ? "swapgrid" : "",
   ]
     .filter(Boolean)
     .join("_");

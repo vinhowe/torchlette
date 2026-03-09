@@ -118,6 +118,7 @@ export function createTiledMatmulKernel(
     inputCastA,
     inputCastB,
     kSplit,
+    swapGrid,
   } = options;
   const { tileM, tileN, tileK, threadTileM, threadTileN } = config;
 
@@ -200,7 +201,7 @@ export function createTiledMatmulKernel(
     grid: singleWorkgroup(), // Actual grid computed at dispatch time in dispatch.ts
 
     kernel: (ctx) =>
-      matmulKernelBlockOps(ctx, { batched, kSplit }, params, postAcc),
+      matmulKernelBlockOps(ctx, { batched, kSplit, swapGrid }, params, postAcc),
   };
 }
 
@@ -220,11 +221,11 @@ interface MatmulKernelParams {
 /** Matmul kernel body — pure matmul with optional post-accumulate callback. */
 function matmulKernelBlockOps(
   ctx: KernelContext,
-  opts: { batched?: boolean; kSplit?: number },
+  opts: { batched?: boolean; kSplit?: number; swapGrid?: boolean },
   p: MatmulKernelParams,
   postAccumulate?: BlockOpsPostAccFn,
 ): void {
-  const { batched, kSplit } = opts;
+  const { batched, kSplit, swapGrid } = opts;
   const {
     tileM,
     tileN,
@@ -293,14 +294,12 @@ function matmulKernelBlockOps(
   }
 
   // 3. Workgroup positions
-  const wgRow = ctx.emitLet(
-    "wg_row",
-    ctx.programId(1).mul(ctx.const(tileM, "u32")),
-  );
-  const wgCol = ctx.emitLet(
-    "wg_col",
-    ctx.programId(0).mul(ctx.const(tileN, "u32")),
-  );
+  // When swapGrid is set, X iterates over M (rows) and Y over N (cols).
+  // This improves L2 cache reuse for wide shapes where N >> M.
+  const pidRow = swapGrid ? ctx.programId(0) : ctx.programId(1);
+  const pidCol = swapGrid ? ctx.programId(1) : ctx.programId(0);
+  const wgRow = ctx.emitLet("wg_row", pidRow.mul(ctx.const(tileM, "u32")));
+  const wgCol = ctx.emitLet("wg_col", pidCol.mul(ctx.const(tileN, "u32")));
 
   // 4. Block ranges — ≈ tl.arange(wgRow, wgRow + BLOCK_M)
   const offsM = ctx.arange(wgRow, tileM);

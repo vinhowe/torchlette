@@ -238,10 +238,21 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       expect(config.tileK).toBe(16);
     });
 
+    it("tall_skinny and short_wide have epilogue-specific configs", () => {
+      for (const sc of ["tall_skinny", "short_wide"] as ShapeClass[]) {
+        const bare = getDefaultConfigForShape(sc, false);
+        const epilogue = getDefaultConfigForShape(sc, true);
+        // Epilogue: conservative t4x4 to avoid register pressure
+        expect(epilogue.threadTileM).toBe(4);
+        expect(epilogue.threadTileN).toBe(4);
+        // Bare: larger thread tiles for better register reuse
+        expect(bare.threadTileM).toBe(8);
+        expect(bare.threadTileN).toBe(4);
+      }
+    });
+
     it("other shape classes return same config regardless of hasEpilogue", () => {
       const otherClasses: ShapeClass[] = [
-        "tall_skinny",
-        "short_wide",
         "large_k",
         "gemv",
         "batched_small",

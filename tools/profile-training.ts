@@ -24,6 +24,7 @@ import {
   DISTILGPT2_CONFIG,
   type GPT2,
   GPT2_SMALL_CONFIG,
+  type TransformerBlock,
 } from "../examples/gpt2/model";
 import {
   destroyWebGPU,
@@ -138,7 +139,7 @@ function instrumentedForwardWithLoss(
 
   // --- Transformer Blocks ---
   for (let i = 0; i < model.h.length; i++) {
-    const block = model.h[i];
+    const block = model.h.get(i) as TransformerBlock;
 
     // LayerNorm 1
     profileModule(api, `block${i}.ln1`);
