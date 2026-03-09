@@ -368,6 +368,8 @@ export interface TileLoadStmt {
   tileRows: number; // BLOCK dimension (not thread tile)
   tileCols: number;
   elemType: DataType;
+  smemElemType?: DataType; // override shared memory element type (e.g. "f16" for f32→f16 smem)
+  smemStride?: number; // shared memory row stride (>tileCols for padding)
 }
 
 export interface TileLoad1DStmt {
@@ -420,6 +422,8 @@ export interface BlockLoadStmt {
   tileMask?: TileMask2D;
   // Thread-level guard (for thread ptr bounds checking)
   guard?: IRNode;
+  // Override shared memory element type (e.g. "f16" for f32 binding → f16 smem)
+  smemElemType?: DataType;
 }
 
 export interface BlockStoreStmt {
@@ -2762,8 +2766,13 @@ export class KernelContext {
   }
 
   /** Cooperative tile load into shared memory. ≈ tl.load(ptr, mask) */
-  load2D(binding: string, ptr: TilePtr, mask: TileMask): Block {
-    return this._requireOps().loadTile(binding, ptr, mask);
+  load2D(
+    binding: string,
+    ptr: TilePtr,
+    mask: TileMask,
+    opts?: { smemElemType?: DataType; smemPadding?: number },
+  ): Block {
+    return this._requireOps().loadTile(binding, ptr, mask, opts);
   }
 
   /** 1D register load (e.g. bias vector). ≈ tl.load(bias_ptr) */

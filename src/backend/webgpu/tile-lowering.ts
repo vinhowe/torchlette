@@ -608,20 +608,32 @@ function lowerTileLoad(stmt: TileLoadStmt, spec: TileKernelSpec): Statement[] {
     cmpOp("lt", ref(globalColName), mask.innerBound),
   );
 
-  // Shared memory write index: flat (row-major, no padding)
-  const smemIdx = ref(flatName);
+  // Shared memory write index: row * smemStride + col (with optional padding)
+  const smemStride = stmt.smemStride ?? tileCols;
+  const smemIdx =
+    smemStride !== tileCols
+      ? binOp("add", binOp("mul", ref(rowName), cU32(smemStride)), ref(colName))
+      : ref(flatName);
 
   // if (mask) { shared[idx] = cast(binding[gIdx]) } else { shared[idx] = 0 }
-  // When shared memory is f16 (binding is f16), store as-is; widening to f32 happens on read.
-  // When shared memory is f32, cast to f32 on store (existing behavior).
+  // When shared memory is f16 (native or overridden), data is narrowed on store
+  // and widened to f32 on read. This halves smem footprint for larger tiles.
   const bindingDtype = spec.bindings[binding]?.type ?? elemType;
   const loadExpr = loadBinding(binding, ref(gIdxName), bindingDtype);
-  const smemIsF16 = bindingDtype === "f16";
-  const storeValue = smemIsF16
-    ? loadExpr
-    : bindingDtype === "f32"
-      ? loadExpr
-      : castNode(loadExpr, "f32");
+  const effectiveSmemType = stmt.smemElemType ?? bindingDtype;
+  const smemIsF16 = effectiveSmemType === "f16";
+  let storeValue: IRNode;
+  if (smemIsF16 && bindingDtype !== "f16") {
+    // f32 binding → f16 shared memory: narrow on store
+    storeValue = castNode(loadExpr, "f16");
+  } else if (smemIsF16) {
+    // f16 binding → f16 shared memory: store as-is
+    storeValue = loadExpr;
+  } else if (bindingDtype === "f32") {
+    storeValue = loadExpr;
+  } else {
+    storeValue = castNode(loadExpr, "f32");
+  }
   const zeroValue: IRNode = smemIsF16
     ? {
         id: -1,
@@ -1049,6 +1061,7 @@ function lowerBlockLoadTile(
       tileRows: stmt.rows,
       tileCols: stmt.cols,
       elemType: stmt.elemType,
+      smemElemType: stmt.smemElemType,
     },
     spec,
   );
@@ -1355,9 +1368,16 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
   const { aName, bName, resultName, accName, aRows, aCols, bRows, bCols } =
     stmt;
   const bStride = stmt.bSmemStride ?? bCols; // stride for B in shared memory
+  const bIsF16 = stmt.bSmemElemType === "f16";
   const result: Statement[] = [];
   const innerDim = aCols; // = bCols (dimension being contracted)
   const outCols = bRows; // B^T has bRows columns
+
+  // Helper: read from shared B with f16→f32 widening if needed
+  const bRead = (idx: IRNode): IRNode => {
+    const raw = sharedRead(bName, idx, bIsF16 ? "f16" : "f32");
+    return bIsF16 ? castNode(raw, "f32") : raw;
+  };
 
   // With TPR: A is distributed, each thread has physInnerDim elements
   const physInnerDim = _activeTPR > 1 ? innerDim / _activeTPR : innerDim;
@@ -1396,8 +1416,7 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
                 ),
               ) as [IRNode, IRNode, IRNode, IRNode],
               [0, 1, 2, 3].map((k) =>
-                sharedRead(
-                  bName,
+                bRead(
                   bRowBase(
                     binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k)),
                   ),
@@ -1418,7 +1437,7 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
             value: binOp(
               "mul",
               arrayRead(aName, ref(dVar)),
-              sharedRead(bName, bRowBase(ref(dVar))),
+              bRead(bRowBase(ref(dVar))),
               "f32",
             ),
           },
@@ -1468,8 +1487,7 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
                 ),
               ) as [IRNode, IRNode, IRNode, IRNode],
               [0, 1, 2, 3].map((k) =>
-                sharedRead(
-                  bName,
+                bRead(
                   binOp(
                     "add",
                     binOp(
@@ -1498,8 +1516,7 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
                 aName,
                 binOp("add", binOp("mul", ref(rVar), cU32(aCols)), ref(dVar)),
               ),
-              sharedRead(
-                bName,
+              bRead(
                 binOp("add", binOp("mul", ref(jVar), cU32(bStride)), ref(dVar)),
               ),
               "f32",
@@ -1536,8 +1553,15 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
 function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
   const { aName, bName, resultName, aRows, aCols, bCols } = stmt;
   const bStride = stmt.bSmemStride ?? bCols; // stride for B in shared memory
+  const bIsF16 = stmt.bSmemElemType === "f16";
   const result: Statement[] = [];
   const outCols = bCols;
+
+  // Helper: read from shared B with f16→f32 widening if needed
+  const bRead = (idx: IRNode): IRNode => {
+    const raw = sharedRead(bName, idx, bIsF16 ? "f16" : "f32");
+    return bIsF16 ? castNode(raw, "f32") : raw;
+  };
 
   // With TPR: result is distributed, each thread handles physOutCols columns
   const physOutCols = _activeTPR > 1 ? outCols / _activeTPR : outCols;
@@ -1578,12 +1602,7 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
           kind: "indexAddAssign",
           arrayName: resultName,
           idx: regIdx,
-          value: binOp(
-            "mul",
-            ref(pVar, "f32"),
-            sharedRead(bName, smemIdx),
-            "f32",
-          ),
+          value: binOp("mul", ref(pVar, "f32"), bRead(smemIdx), "f32"),
         });
       }
       jBody.push(forRange0(d4Var, cU32(physOutCols / 4), d4Body));
@@ -1599,7 +1618,7 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
             value: binOp(
               "mul",
               ref(pVar, "f32"),
-              sharedRead(bName, bColBase(ref(dVar))),
+              bRead(bColBase(ref(dVar))),
               "f32",
             ),
           },
@@ -1635,8 +1654,7 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
           value: binOp(
             "mul",
             ref(pVar, "f32"),
-            sharedRead(
-              bName,
+            bRead(
               binOp("add", binOp("mul", ref(jVar), cU32(bStride)), ref(dVar)),
             ),
             "f32",
