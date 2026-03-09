@@ -106,7 +106,7 @@ export async function warmupPipelines(
         layout: "auto",
         compute: { module, entryPoint: "main" },
       });
-      warmupCache.set(entry.key, pipeline);
+      if (pipeline) warmupCache.set(entry.key, pipeline);
     });
     await Promise.all(promises);
   } else {

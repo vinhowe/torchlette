@@ -207,7 +207,7 @@ export function dispatchFusedKernel(
   // Check storage buffer binding count against device limits BEFORE creating pipeline.
   const storageBindingCount = nonInlinedCount + recipe.outputs.length;
   const maxStorageBuffers = device.limits.maxStorageBuffersPerShaderStage;
-  if (storageBindingCount > maxStorageBuffers) {
+  if (storageBindingCount > maxStorageBuffers!) {
     throw new Error(
       `Fused kernel requires ${storageBindingCount} storage buffers but device limit is ${maxStorageBuffers}`,
     );

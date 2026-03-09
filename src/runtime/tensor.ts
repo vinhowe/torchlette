@@ -109,7 +109,7 @@ export class Tensor {
   private _lazyRef: LazyRef;
   private _pendingNodeId: number | null = null;
   /** Mutable object for FinalizationRegistry - updated when tensor materializes */
-  private readonly _held: { storageId: number };
+  private readonly _held: { storageId: number; pendingNodeId: number | null };
 
   constructor(
     baseId: BaseId,
@@ -128,6 +128,7 @@ export class Tensor {
     // storageId = -1 means not yet materialized
     this._held = {
       storageId: lazyRef.kind === "materialized" ? lazyRef.storage.id : -1,
+      pendingNodeId: lazyRef.kind === "pending" ? lazyRef.node.id : null,
     };
 
     // Register with FinalizationRegistry for automatic cleanup on GC

@@ -38,6 +38,7 @@ export {
   dispatchMatmulDirect,
   getPipeline,
 } from "./dispatch";
+export type { RecordedDispatch } from "./dispatch-recording";
 export {
   addReplayPinnedBuffers,
   replayDispatches,
@@ -222,7 +223,8 @@ import { gpuContext } from "./webgpu-state";
 
 // Wire up creation.ts contiguous injection callback (the sole remaining callback —
 // all other injection callbacks were eliminated by the webgpu-state.ts refactoring).
-_setContiguous(contiguous);
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+_setContiguous(contiguous as any);
 
 // ============================================================================
 // webgpuBackend object

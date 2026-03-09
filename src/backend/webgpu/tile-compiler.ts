@@ -667,7 +667,7 @@ function emitStatement(
       // In vec4 mode, promote scalar type to vec4 when value is vec4
       let dtype = stmt.dtype;
       if (v4 && isVec4(stmt.value, v4)) {
-        dtype = `vec4<${dtype}>`;
+        dtype = `vec4<${dtype}>` as typeof dtype;
         v4.vars.add(stmt.name);
       }
       lines.push(`${indent}var ${stmt.name}: ${dtype} = ${val};`);
@@ -1750,11 +1750,14 @@ export function autoCSE(
     let parentCoverage = 0;
     for (const other of candidates) {
       if (other.id !== c.id && candidateSubExprs.get(other.id)?.has(c.id)) {
-        parentCoverage += refCounts.get(other.id)?.count;
+        parentCoverage += refCounts.get(other.id)?.count ?? 0;
       }
     }
     // Keep if not a sub-expression of any candidate, or has external references
-    if (parentCoverage === 0 || refCounts.get(c.id)?.count > parentCoverage) {
+    if (
+      parentCoverage === 0 ||
+      (refCounts.get(c.id)?.count ?? 0) > parentCoverage
+    ) {
       toBind.push({
         firstIdx: c.firstIdx,
         name: freshVar("cse"),

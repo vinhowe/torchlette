@@ -578,14 +578,9 @@ export async function read(a: BackendTensor): Promise<number[]> {
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   });
   // Use the shared encoder for the copy if active, otherwise create a standalone one
-  if (getSharedEncoderInstance()) {
-    getSharedEncoderInstance().copyBufferToBuffer(
-      tensor.buffer,
-      0,
-      readBuffer,
-      0,
-      alignedBytes,
-    );
+  const sharedEnc = getSharedEncoderInstance();
+  if (sharedEnc) {
+    sharedEnc.copyBufferToBuffer(tensor.buffer, 0, readBuffer, 0, alignedBytes);
     // Flush to submit the copy command
     flushSharedEncoder();
   } else {

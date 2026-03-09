@@ -12,7 +12,7 @@ import { getActiveArena, resolveOutputBuffer } from "../buffer-arena";
 import { bufferPool, destroyCopy } from "../buffer-pool";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { f32ArrayToF16Array, requireContext } from "../gpu-context";
-import type { WebGPUTensor } from "../gpu-types";
+import type { GPUBuffer as LocalGPUBuffer, WebGPUTensor } from "../gpu-types";
 import { GPUBufferUsage } from "../gpu-types";
 import { profileApiCall } from "../profiler";
 import {
@@ -91,7 +91,7 @@ function dispatchCreationKernel(
   numElements: number,
   paramsData: Uint32Array,
   workgroupThreads?: number,
-): GPUBuffer {
+): LocalGPUBuffer {
   const ctx = requireContext();
   const threads = workgroupThreads ?? numElements;
   const totalWorkgroups = Math.ceil(threads / WORKGROUP_SIZE);
@@ -128,8 +128,9 @@ export function zeros(shape: number[]): WebGPUTensor {
   // Arena and pooled buffers may contain stale data — always clear to zero on GPU.
   // Fresh buffers are already zero, so this is a no-op on the GPU side.
   if (bufferPool.isFromPool(buffer) || arenaBufferSet.has(buffer)) {
-    if (getSharedEncoderInstance()) {
-      getSharedEncoderInstance().clearBuffer(buffer, 0, alignedSize);
+    const sharedEnc = getSharedEncoderInstance();
+    if (sharedEnc) {
+      sharedEnc.clearBuffer(buffer, 0, alignedSize);
     } else {
       const encoder = ctx.device.createCommandEncoder();
       encoder.clearBuffer(buffer, 0, alignedSize);

@@ -49,10 +49,16 @@ function extractSideOutput(
   key: string,
   raw = false,
 ): BackendTensor {
-  const parent = node.inputs[0].node;
-  const value = parent._sideOutputs?.[key];
+  const ref = node.inputs[0];
+  if (ref.kind !== "pending")
+    throw new Error(`${node.op}: expected pending ref for parent`);
+  const parent = ref.node;
+  const value = (parent._sideOutputs as Record<string, unknown> | undefined)?.[
+    key
+  ];
   if (!value) throw new Error(`${node.op}: parent has no ${key} side output`);
-  if (parent._sideOutputs) parent._sideOutputs[key] = undefined;
+  if (parent._sideOutputs)
+    (parent._sideOutputs as Record<string, unknown>)[key] = undefined;
   if (raw) return value as BackendTensor;
   const sh = value as StorageHandle;
   storageTracker.unregister(sh.id);
@@ -117,7 +123,7 @@ function storeSideOutput(
   const sh = createStorageHandle(node.device, tensor);
   if (reachableAnchor) storageTracker.markReachable(sh.id, reachableAnchor);
   if (!node._sideOutputs) node._sideOutputs = {};
-  node._sideOutputs[key] = sh;
+  (node._sideOutputs as Record<string, unknown>)[key] = sh;
   return sh;
 }
 
@@ -367,7 +373,7 @@ function executeMutationOp(
       assertOpSupported("adamStep", backend.ops.adamStep);
       const payload = requirePayload<AdamStepConfig>(node);
       return (async () => {
-        const adamResult = await backend.ops.adamStep?.(
+        const adamResult = await backend.ops.adamStep!(
           backendInputs[0],
           backendInputs[1],
           backendInputs[2],
@@ -483,7 +489,7 @@ function executeFusedOp(
     } else {
       if (!node._sideOutputs) node._sideOutputs = {};
       for (const [storeKey, field] of desc.rawSideOutputs) {
-        node._sideOutputs[storeKey] = r[field];
+        (node._sideOutputs as Record<string, unknown>)[storeKey] = r[field];
       }
     }
     return r[desc.returnField];

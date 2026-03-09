@@ -190,8 +190,8 @@ export class Adam {
         [
           grad.lazyRef,
           param._unwrap().lazyRef,
-          this.expAvg[i]?.lazyRef,
-          this.expAvgSq[i]?.lazyRef,
+          this.expAvg[i]!.lazyRef,
+          this.expAvgSq[i]!.lazyRef,
         ],
         param.shape,
         "f32",

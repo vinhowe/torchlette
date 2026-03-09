@@ -295,7 +295,7 @@ export function getShaderCacheKey(options: CodegenOptions): string {
     kSplit,
   } = options;
   const epilogueKey = epilogue
-    ? `${epilogue.ops.map((op) => `${op.kind}:${op.op ?? ""}:${op.toDtype ?? ""}`).join(",")}_${epilogue.outputDtype}`
+    ? `${epilogue.ops.map((op: Record<string, unknown>) => `${op.kind}:${op.op ?? ""}:${op.toDtype ?? ""}`).join(",")}_${epilogue.outputDtype}`
     : "none";
   return [
     `tiled`,

@@ -147,7 +147,7 @@ export class GradScaler {
       const val = await this._pendingInfBackend?.ops.readAndDestroyInfCount?.(
         this._pendingInfBuffer,
       );
-      this._foundInfThisStep = val > 0.5;
+      this._foundInfThisStep = val! > 0.5;
       this._pendingInfBuffer = null;
       this._pendingInfBackend = null;
     } else if (this._pendingInfAccum) {
@@ -309,23 +309,36 @@ export class GradScaler {
 
       // Count non-finite elements: (1 - isfinite(x)) gives 1.0 for inf/nan, 0.0 for finite.
       const finiteFlags = this.api.isfinite(unscaledGrad);
-      const nonFiniteFlags = this.api.sub(1.0, finiteFlags);
+      const one = this.api.full([], 1);
+      const nonFiniteFlags = this.api.sub(one, finiteFlags);
       const paramInfCount = this.api.sum(nonFiniteFlags);
 
       // Accumulate on GPU — no item() call in the loop
       const prevAccum = infAccum;
       infAccum = this.api.add(infAccum, paramInfCount);
 
-      toDispose.push(finiteFlags, nonFiniteFlags, paramInfCount, prevAccum);
+      toDispose.push(
+        one,
+        finiteFlags,
+        nonFiniteFlags,
+        paramInfCount,
+        prevAccum,
+      );
     }
 
     // Build shouldZero flag from final infAccum (lazy, 0-d tensor)
-    const shouldZero = this.api.gt(infAccum, 0.5);
-    toDispose.push(shouldZero);
+    const threshold = this.api.full([], 0.5);
+    const shouldZero = this.api.gt(infAccum, threshold);
+    const zeroTensor = this.api.full([], 0);
+    toDispose.push(shouldZero, threshold, zeroTensor);
 
     // Loop 2: Mask grads and write back (all lazy)
     for (let i = 0; i < unscaledGrads.length; i++) {
-      const maskedGrad = this.api.where(shouldZero, 0.0, unscaledGrads[i]);
+      const maskedGrad = this.api.where(
+        shouldZero,
+        zeroTensor,
+        unscaledGrads[i],
+      );
       runtime.copy_(gradTensors[i]._unwrap(), maskedGrad._unwrap());
       toDispose.push(maskedGrad);
     }

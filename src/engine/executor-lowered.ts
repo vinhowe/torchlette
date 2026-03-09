@@ -3,6 +3,7 @@ import type {
   AdamStepConfig,
   Backend,
   BackendTensor,
+  DeviceKind,
   DType,
 } from "../backend/types";
 import {
@@ -35,6 +36,7 @@ import {
   type GPUBuffer,
   gpuBuffer,
 } from "../backend/webgpu/gpu-types";
+import type { EpilogueConfig } from "../backend/webgpu/matmul/types";
 import {
   profileOpBegin,
   profileOpEnd,
@@ -197,7 +199,7 @@ async function executeAdamBatchInner(
 
 /** Create a StorageHandle from arena buffer metadata (ownsBuffer: false, no-op destroy). */
 function arenaStorage(
-  device: string,
+  device: DeviceKind,
   meta: {
     buffer: GPUBuffer;
     shape: number[];
@@ -218,7 +220,7 @@ function arenaStorage(
     isContiguous: meta.isContiguous ?? true,
     ownsBuffer: false,
     destroy() {},
-  } as BackendTensor);
+  } as unknown as BackendTensor);
 }
 
 /** Collect GPU buffers from all external (materialized/already-resolved) plan inputs. */
@@ -746,7 +748,7 @@ export async function executeLoweredPlan(
 
               // Dispatch directly — skips shape computation, transpose detection,
               // contiguous checks, prologue resolution, dynamic imports
-              const resultTensor = _webgpuMatmulImports?.dispatchMatmulDirect(
+              const resultTensor = _webgpuMatmulImports!.dispatchMatmulDirect(
                 bufA,
                 bufB,
                 {
@@ -763,7 +765,9 @@ export async function executeLoweredPlan(
                   dtypeA: cfg.dtypeA,
                   dtypeB: cfg.dtypeB,
                   outputDtype: cfg.outputDtype,
-                  epilogueConfig: cfg.epilogueConfig,
+                  epilogueConfig: cfg.epilogueConfig as
+                    | EpilogueConfig
+                    | undefined,
                   epilogueBuffers,
                   inputCastA: cfg.inputCastA,
                   inputCastB: cfg.inputCastB,
@@ -1231,11 +1235,7 @@ export async function executeLoweredPlan(
               captureDispatches();
               // Record node result (inline for ordering)
               if (node.result) {
-                recordResult(
-                  nodeIdx,
-                  asGPUTensor(node.result.backendTensor),
-                  node.result.backendTensor.ownsBuffer === false,
-                );
+                recordResult(nodeIdx, asGPUTensor(node.result.backendTensor));
               }
               // Record side output for fusedAttentionForward so replay
               // restores attnLogsumexp (needed by extractAttentionLogsumexp

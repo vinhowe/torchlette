@@ -30,11 +30,7 @@ import {
 } from "./engine/amp";
 import { Engine, type EngineTensor } from "./engine/engine";
 import { storageTracker } from "./engine/storage-tracker";
-import {
-  RuntimeEngine,
-  type TensorOrScalar,
-  TidyDispatchMode,
-} from "./runtime/engine";
+import { RuntimeEngine, TidyDispatchMode } from "./runtime/engine";
 import type { Tensor as RuntimeTensor } from "./runtime/tensor";
 
 // Re-export the Tensor class and DisposedTensorError from their new home
@@ -112,50 +108,50 @@ interface UnaryOpSpec {
 }
 
 const UNARY_OPS: Record<string, UnaryOpSpec> = {
-  exp: { autocast: "exp", grad: (rt, g, s) => rt.mul(g, rt.exp(s._unwrap())) },
+  exp: { autocast: "exp", grad: (rt, g, s) => rt.mul(g, rt.exp(s!._unwrap())) },
   log: {
     autocast: "log",
-    grad: (rt, g, s) => rt.div(g, rt.add(s._unwrap(), 1e-8)),
+    grad: (rt, g, s) => rt.div(g, rt.add(s!._unwrap(), 1e-8)),
   },
   neg: { needsSave: false, grad: (rt, g) => rt.neg(g) },
-  abs: { grad: (rt, g, s) => rt.mul(g, rt.sign(s._unwrap())) },
+  abs: { grad: (rt, g, s) => rt.mul(g, rt.sign(s!._unwrap())) },
   silu: {
     grad: (rt, g, s) => {
-      const sig = rt.sigmoid(s._unwrap());
+      const sig = rt.sigmoid(s!._unwrap());
       return rt.mul(
         g,
-        rt.add(sig, rt.mul(s._unwrap(), rt.mul(sig, rt.sub(1, sig)))),
+        rt.add(sig, rt.mul(s!._unwrap(), rt.mul(sig, rt.sub(1, sig)))),
       );
     },
   },
   tanh: {
     grad: (rt, g, s) => {
-      const t = rt.tanh(s._unwrap());
+      const t = rt.tanh(s!._unwrap());
       return rt.mul(rt.sub(1, rt.mul(t, t)), g);
     },
   },
   sigmoid: {
     grad: (rt, g, s) => {
-      const sig = rt.sigmoid(s._unwrap());
+      const sig = rt.sigmoid(s!._unwrap());
       return rt.mul(rt.mul(sig, rt.sub(1, sig)), g);
     },
   },
-  sin: { grad: (rt, g, s) => rt.mul(g, rt.cos(s._unwrap())) },
-  cos: { grad: (rt, g, s) => rt.mul(g, rt.neg(rt.sin(s._unwrap()))) },
+  sin: { grad: (rt, g, s) => rt.mul(g, rt.cos(s!._unwrap())) },
+  cos: { grad: (rt, g, s) => rt.mul(g, rt.neg(rt.sin(s!._unwrap()))) },
   rsqrt: {
     grad: (rt, g, s) => {
-      const r = rt.rsqrt(s._unwrap());
+      const r = rt.rsqrt(s!._unwrap());
       return rt.mul(g, rt.mul(-0.5, rt.mul(r, rt.mul(r, r))));
     },
   },
   sqrt: {
     grad: (rt, g, s) => {
-      const sqrtA = rt.sqrt(s._unwrap());
+      const sqrtA = rt.sqrt(s!._unwrap());
       return rt.mul(g, rt.div(0.5, rt.add(sqrtA, 1e-8)));
     },
   },
   relu: {
-    grad: (rt, g, s) => rt.mul(g, rt.gt(s._unwrap(), 0)),
+    grad: (rt, g, s) => rt.mul(g, rt.gt(s!._unwrap(), 0)),
   },
   floor: { grad: null },
   ceil: { grad: null },
@@ -518,7 +514,11 @@ export class Torchlette {
       [a],
       (grad, getSaved) => {
         return [
-          spec.grad?.(this.runtime, grad, needsSave ? getSaved(0) : undefined),
+          spec.grad?.(
+            this.runtime,
+            grad,
+            needsSave ? getSaved(0) : undefined,
+          ) ?? null,
         ];
       },
       tensorsToSave,
@@ -598,7 +598,12 @@ export class Torchlette {
     return this._dispatchBinary("add", a, b, (g) => [g, g]);
   }
 
-  sub(a: Tensor, b: Tensor, options?: SubOptions): Tensor {
+  sub(a: Tensor, b: Tensor | number, options?: SubOptions): Tensor {
+    if (typeof b === "number") {
+      // scalar sub: a - b*alpha => a + (-b*alpha)
+      const alpha = options?.alpha ?? 1;
+      return this.add(a, -(b * alpha));
+    }
     this._assertUsable(a, b);
     [a, b] = this._applyAutocast("sub", [a, b]) as [Tensor, Tensor];
     const inner = this.runtime.sub(a._unwrap(), b._unwrap(), options);
@@ -994,7 +999,7 @@ export class Torchlette {
   softplus(a: Tensor): Tensor {
     this._assertUsable(a);
     // softplus(x) = log(1 + exp(x))
-    const one = this.runtime.full(a.shape, 1, a.dtype, a.device);
+    const one = this.runtime.full(a.shape, 1, a.device);
     const expA = this.runtime.exp(a._unwrap());
     const inner = this.runtime.log(this.runtime.add(one, expA));
     // d/dx softplus(x) = sigmoid(x)
@@ -1144,7 +1149,7 @@ export class Torchlette {
         "variance: correction >= number of elements in reduction",
       );
     }
-    return this.div(sumSq, this.runtime.full([], denom, a.dtype, a.device));
+    return this.div(sumSq, denom);
   }
 
   std(

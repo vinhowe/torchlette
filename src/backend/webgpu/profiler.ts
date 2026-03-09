@@ -5,6 +5,11 @@
  * When disabled, all functions are no-ops with zero overhead.
  */
 
+import type {
+  GPUBuffer as LocalGPUBuffer,
+  GPUDevice as LocalGPUDevice,
+} from "./gpu-types";
+
 const PROFILING_ENABLED =
   typeof process !== "undefined" && !!process.env?.TORCHLETTE_PROFILE;
 
@@ -92,17 +97,17 @@ function resetCpuProfileState(): void {
 const GPU_MAX_PASSES = 2048; // 4096 timestamp slots (Dawn limit is 4096 queries)
 
 interface GpuTimestampState {
-  querySet: GPUQuerySet | null;
-  resolveBuffer: GPUBuffer | null;
-  readbackBuffer: GPUBuffer | null;
+  querySet: unknown;
+  resolveBuffer: LocalGPUBuffer | null;
+  readbackBuffer: LocalGPUBuffer | null;
   passRecords: GpuPassRecord[];
   nextSlot: number;
-  stagingBuffer: GPUBuffer | null;
+  stagingBuffer: LocalGPUBuffer | null;
   stagingSlots: number;
   maxSlots: number;
   supported: boolean;
   enabled: boolean;
-  device: GPUDevice | null;
+  device: LocalGPUDevice | null;
   labelStats: Map<string, { count: number; totalNs: bigint; maxNs: bigint }>;
   phaseStats: Map<string, { totalNs: bigint; opCount: number }>;
   phaseOpStats: Map<
@@ -299,13 +304,14 @@ export function recordPlanAnalysis(analysis: PlanAnalysis): void {
 // GPU timestamp initialization
 // ---------------------------------------------------------------------------
 
-export function initGpuTimestamps(device: GPUDevice): void {
+export function initGpuTimestamps(device: LocalGPUDevice): void {
   if (!PROFILING_ENABLED) return;
   gpuTs.device = device;
   gpuTs.supported = true;
 
   // Check device limits for max query count
-  const maxQueryCount = device.limits.maxQueryCount ?? 4096;
+  const maxQueryCount =
+    (device.limits as unknown as Record<string, number>).maxQueryCount ?? 4096;
   const count = Math.min(GPU_MAX_PASSES * 2, maxQueryCount);
   gpuTs.maxSlots = count;
 
@@ -367,7 +373,7 @@ export function getTimestampWrites(
   });
 
   return {
-    querySet: gpuTs.querySet,
+    querySet: gpuTs.querySet as GPUQuerySet,
     beginningOfPassWriteIndex: startSlot,
     endOfPassWriteIndex: endSlot,
   };
