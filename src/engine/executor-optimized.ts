@@ -250,6 +250,9 @@ export async function executePlanOptimized(
   let reductionDirectives:
     | ReturnType<typeof analyzeGraph>["reductionDirectives"]
     | undefined;
+  let matmulDirectives:
+    | ReturnType<typeof analyzeGraph>["matmulDirectives"]
+    | undefined;
 
   if (cachedTemplate) {
     // ── Cache hit: reconstruct from template ──
@@ -368,6 +371,7 @@ export async function executePlanOptimized(
     compoundMatches = analysis.compoundMatches;
     analysisConsumerCount = analysis.consumerCount;
     reductionDirectives = analysis.reductionDirectives;
+    matmulDirectives = analysis.matmulDirectives;
 
     // ── Build template and cache it ──
     const origIdToPos = buildIdPositionMap(plan.nodes);
@@ -702,6 +706,7 @@ export async function executePlanOptimized(
           nodeIdToFinalPos,
           compoundMatchMap,
           reductionDirectives,
+          matmulDirectives,
         });
         stats.sequentialNodes += seqNodes.length;
         overallStep += seqNodes.length;

@@ -302,6 +302,69 @@ describe("Graph Compiler — analyzeGraph()", () => {
     }
   });
 
+  it("produces matmul epilogue directives with full plans", () => {
+    const a = createLazyIRNode("tensorFromArray", [], [2, 3], "f32", "cpu", {
+      values: [1, 2, 3, 4, 5, 6],
+    });
+    const b = createLazyIRNode("tensorFromArray", [], [3, 2], "f32", "cpu", {
+      values: [1, 2, 3, 4, 5, 6],
+    });
+    // bias must appear BEFORE matmul in plan order
+    const bias = createLazyIRNode("tensorFromArray", [], [2], "f32", "cpu", {
+      values: [0.1, 0.2],
+    });
+    const mm = createLazyIRNode(
+      "matmul",
+      [createPendingRef(a), createPendingRef(b)],
+      [2, 2],
+      "f32",
+      "cpu",
+    );
+    const castNode = createLazyIRNode(
+      "cast",
+      [createPendingRef(mm)],
+      [2, 2],
+      "f16",
+      "cpu",
+      { dtype: "f16" },
+    );
+    const addBias = createLazyIRNode(
+      "add",
+      [createPendingRef(castNode), createPendingRef(bias)],
+      [2, 2],
+      "f16",
+      "cpu",
+    );
+
+    const result = analyzeGraph([a, b, bias, mm, castNode, addBias]);
+
+    // Should have a matmul directive with full epilogue plan
+    const directive = result.matmulDirectives.get(mm.id);
+    expect(directive).toBeDefined();
+    expect(directive!.epilogueOps.length).toBeGreaterThan(0);
+    // cast + bias add = 2 epilogue ops
+    expect(directive!.epilogueOps[0].kind).toBe("cast");
+    expect(directive!.epilogueOps[1].kind).toBe("bias");
+    expect(directive!.outputNode.id).toBe(addBias.id);
+    expect(directive!.consumedCount).toBe(3); // matmul + cast + add
+  });
+
+  it("matmulDirectives is empty when no matmul epilogue chains exist", () => {
+    const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const relu = createLazyIRNode(
+      "relu",
+      [createPendingRef(a)],
+      [4],
+      "f32",
+      "cpu",
+    );
+
+    const result = analyzeGraph([a, relu]);
+    expect(result.matmulDirectives.size).toBe(0);
+  });
+
   it("reductionDirectives is empty when no patterns match", () => {
     const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
       values: [1, 2, 3, 4],
