@@ -36,9 +36,8 @@ import {
   isViewOp,
   type LoweredPlanBuilder,
 } from "./lowered-plan";
-import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "./matmul-epilogue";
+import type { MatmulEpiloguePlan } from "./matmul-epilogue";
 import {
-  detectMatmulEpilogueCore,
   executeMatmulWithEpilogue,
   formatEpilogueLabel,
 } from "./matmul-epilogue";
@@ -50,9 +49,6 @@ import {
 } from "./node-factory";
 import { executeOp, getInputStorage, withProfileContext } from "./op-dispatch";
 import {
-  detectReductionEpilogue,
-  detectReductionFusion,
-  detectReductionPreamble,
   executeReductionWithEpilogue,
   executeReductionWithFusion,
   executeReductionWithPreamble,
@@ -410,10 +406,7 @@ interface SegmentExecOptions {
   alreadyReleased: Set<number>;
   nodeToStorage: Map<number, StorageHandle>;
   startStep: number;
-  externalNodeIds?: Set<number>;
-  matmulPrologueMap?: Map<number, MatmulPrologueInfo[]>;
   prologueSkipIds?: Set<number>;
-  prebuiltConsumerCount?: Map<number, number>;
   loweredPlanBuilder?: LoweredPlanBuilder | null;
   nodeIdToFinalPos?: Map<number, number>;
   compoundMatchMap?: Map<number, CompoundMatchExec>;
@@ -436,10 +429,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
     alreadyReleased,
     nodeToStorage,
     startStep,
-    externalNodeIds,
-    matmulPrologueMap,
     prologueSkipIds,
-    prebuiltConsumerCount,
     loweredPlanBuilder,
     nodeIdToFinalPos,
     compoundMatchMap,
@@ -450,13 +440,6 @@ export async function executeSequentialSegmentWithEarlyRelease(
   if (useSharedEncoder) beginSharedEncoder();
 
   try {
-    // Use pre-built consumer count if provided, otherwise build from local nodes.
-    const reductionConsumerCount =
-      prebuiltConsumerCount ??
-      (backend.name === "webgpu"
-        ? buildConsumerCount(nodes)
-        : new Map<number, number>());
-
     // Intra-segment periodic reclamation: flush pending buffers to main pool
     // every N nodes so freed intermediates can be reused within the same segment.
     const reclaim = createReclaimController(
@@ -565,36 +548,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
       // Try matmul epilogue/prologue fusion (Phase 1)
       if (node.op === "matmul" && backend.name === "webgpu") {
-        // Use pre-computed directive from graph-compiler if available,
-        // fall back to inline detection (cache hit path)
-        let epiloguePlan = matmulDirectives?.get(node.id) ?? null;
-        if (!epiloguePlan) {
-          epiloguePlan = detectMatmulEpilogueCore(
-            nodes,
-            nodeIdx,
-            reductionConsumerCount,
-            externalNodeIds,
-          );
-          const prologues = matmulPrologueMap?.get(node.id);
-
-          // If we have prologues but no epilogue, create a minimal (empty) epilogue plan
-          // so the matmul goes through the epilogue dispatch path with prologue support.
-          if (!epiloguePlan && prologues && prologues.length > 0) {
-            epiloguePlan = {
-              consumedCount: 1, // just the matmul itself
-              epilogueOps: [],
-              epilogueInputRefs: [],
-              outputDtype: node.dtype,
-              outputNode: node,
-            };
-          }
-
-          // Attach prologues to the plan
-          if (epiloguePlan && prologues && prologues.length > 0) {
-            epiloguePlan.prologues = prologues;
-          }
-        }
-
+        const epiloguePlan = matmulDirectives?.get(node.id) ?? null;
         if (epiloguePlan) {
           const prologueLabel = epiloguePlan.prologues ? "prologue+" : "";
           const epilogueLabel =
@@ -644,14 +598,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
       if (isFusibleOp(node.op) && backend.name === "webgpu") {
         const rdDirective = reductionDirectives?.get(node.id);
         const fusionPlan =
-          rdDirective?.kind === "fusion"
-            ? rdDirective.plan
-            : detectReductionFusion(
-                nodes,
-                nodeIdx,
-                reductionConsumerCount,
-                externalNodeIds,
-              );
+          rdDirective?.kind === "fusion" ? rdDirective.plan : null;
         if (fusionPlan) {
           const fusionLabel = `${fusionPlan.isMean ? "mean" : "sum"}+${fusionPlan.preambleChain
             .map((n) => n.op)
@@ -688,11 +635,9 @@ export async function executeSequentialSegmentWithEarlyRelease(
           continue;
         }
 
-        // Fall back to preamble-only fusion (Phase 3)
+        // Preamble-only fusion (Phase 3)
         const reductionPlan =
-          rdDirective?.kind === "preamble"
-            ? rdDirective.plan
-            : detectReductionPreamble(nodes, nodeIdx, reductionConsumerCount);
+          rdDirective?.kind === "preamble" ? rdDirective.plan : null;
         if (reductionPlan) {
           const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${reductionPlan.preambleChain.map((n) => n.op).join("+")}`;
           await withProfileContext(rpLabel, node.module, () =>
@@ -727,14 +672,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
       ) {
         const reDirective = reductionDirectives?.get(node.id);
         const epiloguePlan =
-          reDirective?.kind === "epilogue"
-            ? reDirective.plan
-            : detectReductionEpilogue(
-                nodes,
-                nodeIdx,
-                reductionConsumerCount,
-                externalNodeIds,
-              );
+          reDirective?.kind === "epilogue" ? reDirective.plan : null;
         if (epiloguePlan) {
           const reLabel = `${node.op}+${formatEpilogueLabel(epiloguePlan.epilogueOps)}`;
           await withProfileContext(reLabel, node.module, () =>
