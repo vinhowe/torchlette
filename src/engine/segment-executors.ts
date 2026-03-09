@@ -27,7 +27,7 @@ import {
   isViewOp,
   type LoweredPlanBuilder,
 } from "./lowered-plan";
-import type { MatmulPrologueInfo } from "./matmul-epilogue";
+import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "./matmul-epilogue";
 import {
   detectMatmulEpilogueCore,
   executeMatmulWithEpilogue,
@@ -406,6 +406,7 @@ interface SegmentExecOptions {
   nodeIdToFinalPos?: Map<number, number>;
   compoundMatchMap?: Map<number, CompoundMatchExec>;
   reductionDirectives?: Map<number, ReductionDirective>;
+  matmulDirectives?: Map<number, MatmulEpiloguePlan>;
 }
 
 /**
@@ -431,6 +432,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
     nodeIdToFinalPos,
     compoundMatchMap,
     reductionDirectives,
+    matmulDirectives,
   } = options;
   const useSharedEncoder = backend.name === "webgpu";
   if (useSharedEncoder) beginSharedEncoder();
@@ -551,29 +553,34 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
       // Try matmul epilogue/prologue fusion (Phase 1)
       if (node.op === "matmul" && backend.name === "webgpu") {
-        let epiloguePlan = detectMatmulEpilogueCore(
-          nodes,
-          nodeIdx,
-          reductionConsumerCount,
-          externalNodeIds,
-        );
-        const prologues = matmulPrologueMap?.get(node.id);
+        // Use pre-computed directive from graph-compiler if available,
+        // fall back to inline detection (cache hit path)
+        let epiloguePlan = matmulDirectives?.get(node.id) ?? null;
+        if (!epiloguePlan) {
+          epiloguePlan = detectMatmulEpilogueCore(
+            nodes,
+            nodeIdx,
+            reductionConsumerCount,
+            externalNodeIds,
+          );
+          const prologues = matmulPrologueMap?.get(node.id);
 
-        // If we have prologues but no epilogue, create a minimal (empty) epilogue plan
-        // so the matmul goes through the epilogue dispatch path with prologue support.
-        if (!epiloguePlan && prologues && prologues.length > 0) {
-          epiloguePlan = {
-            consumedCount: 1, // just the matmul itself
-            epilogueOps: [],
-            epilogueInputRefs: [],
-            outputDtype: node.dtype,
-            outputNode: node,
-          };
-        }
+          // If we have prologues but no epilogue, create a minimal (empty) epilogue plan
+          // so the matmul goes through the epilogue dispatch path with prologue support.
+          if (!epiloguePlan && prologues && prologues.length > 0) {
+            epiloguePlan = {
+              consumedCount: 1, // just the matmul itself
+              epilogueOps: [],
+              epilogueInputRefs: [],
+              outputDtype: node.dtype,
+              outputNode: node,
+            };
+          }
 
-        // Attach prologues to the plan
-        if (epiloguePlan && prologues && prologues.length > 0) {
-          epiloguePlan.prologues = prologues;
+          // Attach prologues to the plan
+          if (epiloguePlan && prologues && prologues.length > 0) {
+            epiloguePlan.prologues = prologues;
+          }
         }
 
         if (epiloguePlan) {

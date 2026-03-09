@@ -24,7 +24,11 @@ import {
 } from "./fusion-detect";
 import { runPasses, SIMPLIFICATION_PASSES } from "./graph-rewrites";
 import type { LazyIRNode } from "./lazy-types";
-import type { MatmulPrologueInfo } from "./matmul-epilogue";
+import {
+  detectMatmulEpilogueCore,
+  type MatmulEpiloguePlan,
+  type MatmulPrologueInfo,
+} from "./matmul-epilogue";
 import {
   detectReductionEpilogue,
   detectReductionFusion,
@@ -70,6 +74,9 @@ interface GraphAnalysisResult {
 
   /** Pre-computed reduction pattern directives (trigger nodeId → plan). */
   reductionDirectives: Map<number, ReductionDirective>;
+
+  /** Pre-computed matmul epilogue directives (matmulNodeId → full plan with prologues). */
+  matmulDirectives: Map<number, MatmulEpiloguePlan>;
 }
 
 // ============================================================================
@@ -351,6 +358,48 @@ export function analyzeGraph(
     reorderedNodes = relocated;
   }
 
+  // Build matmul directives: full epilogue plans for execution.
+  // This runs detectMatmulEpilogueCore() once during analysis so that
+  // segment-executors can look up plans instead of re-detecting.
+  const matmulDirectives = new Map<number, MatmulEpiloguePlan>();
+  if (matmulEpilogueChains.size > 0 || matmulPrologues.size > 0) {
+    for (let i = 0; i < reorderedNodes.length; i++) {
+      const node = reorderedNodes[i];
+      if (node.op !== "matmul") continue;
+      const hasChain = matmulEpilogueChains.has(node.id);
+      const prologues = matmulPrologues.get(node.id);
+      if (!hasChain && !prologues) continue;
+
+      let plan = hasChain
+        ? detectMatmulEpilogueCore(
+            reorderedNodes,
+            i,
+            consumerCount,
+            externalNodeIds,
+          )
+        : null;
+
+      // If we have prologues but no epilogue, create a minimal plan
+      // so the matmul goes through the epilogue dispatch path with prologue support.
+      if (!plan && prologues && prologues.length > 0) {
+        plan = {
+          consumedCount: 1,
+          epilogueOps: [],
+          epilogueInputRefs: [],
+          outputDtype: node.dtype,
+          outputNode: node,
+        };
+      }
+
+      if (plan) {
+        if (prologues && prologues.length > 0) {
+          plan.prologues = prologues;
+        }
+        matmulDirectives.set(node.id, plan);
+      }
+    }
+  }
+
   // --- Priority 80: Compound patterns (softmax, log_softmax) ---
   const compoundMatches = detectCompoundPatterns(
     reorderedNodes,
@@ -459,6 +508,7 @@ export function analyzeGraph(
     consumerCount,
     rewriteBypassedIds,
     reductionDirectives,
+    matmulDirectives,
   };
 }
 
