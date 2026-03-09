@@ -450,6 +450,8 @@ export interface BlockDotStmt {
   threadTileN?: number; // per-thread N dim (for shared×shared outer product)
   aSmemStride?: number; // stride for A in shared memory (default: aCols)
   bSmemStride?: number; // stride for B in shared memory (default: bCols)
+  aSmemElemType?: DataType; // shared memory element type for A (default: "f32")
+  bSmemElemType?: DataType; // shared memory element type for B (default: "f32")
 }
 
 export interface BlockReduceStmt {

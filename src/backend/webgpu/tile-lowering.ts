@@ -611,12 +611,27 @@ function lowerTileLoad(stmt: TileLoadStmt, spec: TileKernelSpec): Statement[] {
   // Shared memory write index: flat (row-major, no padding)
   const smemIdx = ref(flatName);
 
-  // if (mask) { shared[idx] = f32(binding[gIdx]) } else { shared[idx] = 0.0 }
-  // Use the actual binding dtype (e.g., f16) for the load, then cast to f32 for shared memory
+  // if (mask) { shared[idx] = cast(binding[gIdx]) } else { shared[idx] = 0 }
+  // When shared memory is f16 (binding is f16), store as-is; widening to f32 happens on read.
+  // When shared memory is f32, cast to f32 on store (existing behavior).
   const bindingDtype = spec.bindings[binding]?.type ?? elemType;
   const loadExpr = loadBinding(binding, ref(gIdxName), bindingDtype);
-  const loadAsF32 =
-    bindingDtype === "f32" ? loadExpr : castNode(loadExpr, "f32");
+  const smemIsF16 = bindingDtype === "f16";
+  const storeValue = smemIsF16
+    ? loadExpr
+    : bindingDtype === "f32"
+      ? loadExpr
+      : castNode(loadExpr, "f32");
+  const zeroValue: IRNode = smemIsF16
+    ? {
+        id: -1,
+        kind: "const",
+        value: 0,
+        dtype: "f16",
+        valueType: "scalar",
+        dataType: "f16",
+      }
+    : cF32(0);
   ifBody.push({
     kind: "ifElse",
     condition: maskCond,
@@ -625,7 +640,7 @@ function lowerTileLoad(stmt: TileLoadStmt, spec: TileKernelSpec): Statement[] {
         kind: "sharedWrite",
         arrayName: sharedName,
         idx: smemIdx,
-        value: loadAsF32,
+        value: storeValue,
       },
     ],
     elseBody: [
@@ -633,7 +648,7 @@ function lowerTileLoad(stmt: TileLoadStmt, spec: TileKernelSpec): Statement[] {
         kind: "sharedWrite",
         arrayName: sharedName,
         idx: smemIdx,
-        value: cF32(0),
+        value: zeroValue,
       },
     ],
   });
@@ -1204,6 +1219,8 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
   const aSmemStride = stmt.aSmemStride ?? aCols; // stride for A in shared memory
   const bSmemStride = stmt.bSmemStride ?? bCols; // stride for B in shared memory
   const innerDim = aCols; // K dimension (A cols = B rows for non-transposed)
+  const aIsF16 = stmt.aSmemElemType === "f16";
+  const bIsF16 = stmt.bSmemElemType === "f16";
 
   const result: Statement[] = [];
 
@@ -1213,7 +1230,7 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
   const kkVar = freshVar("kk");
   const kkLoop: Statement[] = [];
 
-  // Load a_vals from shared A: a_vals[tm] = A[(thread_row*ttM + tm) * aSmemStride + kk]
+  // Load a_vals from shared A: a_vals[tm] = f32(A[(thread_row*ttM + tm) * aSmemStride + kk])
   const aValsName = freshVar("a_vals");
   kkLoop.push({
     kind: "varArray",
@@ -1223,33 +1240,38 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
     skipZeroInit: true,
   });
   const tmVar1 = freshVar("tm");
+  const aReadDtype = aIsF16 ? ("f16" as const) : ("f32" as const);
   kkLoop.push(
     forRange0(tmVar1, cU32(threadTileM), [
       {
         kind: "indexAssign",
         arrayName: aValsName,
         idx: ref(tmVar1),
-        value: sharedRead(
-          aName,
-          binOp(
-            "add",
+        value: (() => {
+          const raw = sharedRead(
+            aName,
             binOp(
-              "mul",
+              "add",
               binOp(
-                "add",
-                binOp("mul", ref("thread_row"), cU32(threadTileM)),
-                ref(tmVar1),
+                "mul",
+                binOp(
+                  "add",
+                  binOp("mul", ref("thread_row"), cU32(threadTileM)),
+                  ref(tmVar1),
+                ),
+                cU32(aSmemStride),
               ),
-              cU32(aSmemStride),
+              ref(kkVar),
             ),
-            ref(kkVar),
-          ),
-        ),
+            aReadDtype,
+          );
+          return aIsF16 ? castNode(raw, "f32") : raw;
+        })(),
       },
     ]),
   );
 
-  // Load b_vals from shared B: b_vals[tn] = B[kk * bSmemStride + thread_col*ttN + tn]
+  // Load b_vals from shared B: b_vals[tn] = f32(B[kk * bSmemStride + thread_col*ttN + tn])
   const bValsName = freshVar("b_vals");
   kkLoop.push({
     kind: "varArray",
@@ -1259,24 +1281,29 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
     skipZeroInit: true,
   });
   const tnVar1 = freshVar("tn");
+  const bReadDtype = bIsF16 ? ("f16" as const) : ("f32" as const);
   kkLoop.push(
     forRange0(tnVar1, cU32(threadTileN), [
       {
         kind: "indexAssign",
         arrayName: bValsName,
         idx: ref(tnVar1),
-        value: sharedRead(
-          bName,
-          binOp(
-            "add",
-            binOp("mul", ref(kkVar), cU32(bSmemStride)),
+        value: (() => {
+          const raw = sharedRead(
+            bName,
             binOp(
               "add",
-              binOp("mul", ref("thread_col"), cU32(threadTileN)),
-              ref(tnVar1),
+              binOp("mul", ref(kkVar), cU32(bSmemStride)),
+              binOp(
+                "add",
+                binOp("mul", ref("thread_col"), cU32(threadTileN)),
+                ref(tnVar1),
+              ),
             ),
-          ),
-        ),
+            bReadDtype,
+          );
+          return bIsF16 ? castNode(raw, "f32") : raw;
+        })(),
       },
     ]),
   );

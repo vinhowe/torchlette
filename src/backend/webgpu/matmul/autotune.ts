@@ -152,6 +152,15 @@ export function getDefaultConfigForShape(
       };
 
     case "tall_skinny":
+      if (hasEpilogue) {
+        // Epilogue: conservative thread tiles to avoid register pressure
+        return {
+          ...DEFAULT_CONFIG,
+          tileM: 64,
+          tileN: 64,
+          tileK: 8,
+        };
+      }
       // Tall matrices (e.g. lm_head backward dW: M=50304, N=768, K=512)
       // Large output tile with tileK=8 for better occupancy; 256 threads
       return {
@@ -164,6 +173,15 @@ export function getDefaultConfigForShape(
       };
 
     case "short_wide":
+      if (hasEpilogue) {
+        // Epilogue: conservative thread tiles to avoid register pressure
+        return {
+          ...DEFAULT_CONFIG,
+          tileM: 64,
+          tileN: 64,
+          tileK: 8,
+        };
+      }
       // Wide matrices (e.g. lm_head: M=512, N=50304, K=768)
       // Large output tile with tileK=8 for better occupancy; 256 threads
       return {

@@ -860,6 +860,11 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
 
   // --- Standard path (no K-split) ---
 
+  // Swap grid axes for L2 cache reuse when the N-grid is much wider than M-grid.
+  // Consecutive workgroups then iterate over M (sharing B column tiles in L2).
+  const swapGrid =
+    batchSize === 1 && workgroupsX > workgroupsY * 4 ? true : undefined;
+
   // Build codegen options
   const codegenOptions: CodegenOptions = {
     config,
@@ -870,6 +875,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
     batched: batchSize > 1,
     inputCastA,
     inputCastB,
+    swapGrid,
   };
 
   // Get or create pipeline
@@ -897,12 +903,16 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
 
   const workgroupsZ = batchSize;
 
+  // When grid is swapped, X iterates over M and Y over N
+  const dispatchX = swapGrid ? workgroupsY : workgroupsX;
+  const dispatchY = swapGrid ? workgroupsX : workgroupsY;
+
   // Encode and submit
   dispatchComputePass(
     pipeline,
     bindGroup,
-    workgroupsX,
-    workgroupsY,
+    dispatchX,
+    dispatchY,
     workgroupsZ,
     matmulRecordingBuffer,
   );
