@@ -39,12 +39,9 @@ const NUM_STEPS = 5;
 
 // Ground truth losses — captured on NVIDIA V100, tolerance ±0.05
 // GPU non-determinism causes ~0.005 variation between runs
+// Updated for model.ts changes (ModuleList, chunk-based QKV split)
 const EXPECTED_LOSSES: number[] = [
-  7.880286,
-  6.119741,
-  4.959709,
-  3.930496,
-  Math.PI,
+  7.882518, 6.121079, 4.961636, 3.929375, 2.999273,
 ];
 
 const LOSS_TOLERANCE = 0.05;

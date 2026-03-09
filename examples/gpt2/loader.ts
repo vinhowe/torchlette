@@ -6,8 +6,13 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Tensor, Torchlette, DeviceKind } from "../../src/frontend";
-import { GPT2, GPT2_SMALL_CONFIG, type GPT2Config } from "./model";
+import type { DeviceKind, Tensor, Torchlette } from "../../src/frontend";
+import {
+  GPT2,
+  GPT2_SMALL_CONFIG,
+  type GPT2Config,
+  type TransformerBlock,
+} from "./model";
 
 // ============================================================================
 // Types
@@ -82,16 +87,28 @@ function mapWeightName(hfName: string): {
     // Attention
     if (component === "attn.c_attn.weight") {
       // GPT-2 uses Conv1D which stores as [in, out], we need [out, in]
-      return { path: ["h", blockIdx, "attn", "cAttn", "weight"], needsTranspose: true };
+      return {
+        path: ["h", blockIdx, "attn", "cAttn", "weight"],
+        needsTranspose: true,
+      };
     }
     if (component === "attn.c_attn.bias") {
-      return { path: ["h", blockIdx, "attn", "cAttn", "bias"], needsTranspose: false };
+      return {
+        path: ["h", blockIdx, "attn", "cAttn", "bias"],
+        needsTranspose: false,
+      };
     }
     if (component === "attn.c_proj.weight") {
-      return { path: ["h", blockIdx, "attn", "cProj", "weight"], needsTranspose: true };
+      return {
+        path: ["h", blockIdx, "attn", "cProj", "weight"],
+        needsTranspose: true,
+      };
     }
     if (component === "attn.c_proj.bias") {
-      return { path: ["h", blockIdx, "attn", "cProj", "bias"], needsTranspose: false };
+      return {
+        path: ["h", blockIdx, "attn", "cProj", "bias"],
+        needsTranspose: false,
+      };
     }
 
     // Layer norm 2
@@ -104,16 +121,28 @@ function mapWeightName(hfName: string): {
 
     // MLP
     if (component === "mlp.c_fc.weight") {
-      return { path: ["h", blockIdx, "mlp", "cFc", "weight"], needsTranspose: true };
+      return {
+        path: ["h", blockIdx, "mlp", "cFc", "weight"],
+        needsTranspose: true,
+      };
     }
     if (component === "mlp.c_fc.bias") {
-      return { path: ["h", blockIdx, "mlp", "cFc", "bias"], needsTranspose: false };
+      return {
+        path: ["h", blockIdx, "mlp", "cFc", "bias"],
+        needsTranspose: false,
+      };
     }
     if (component === "mlp.c_proj.weight") {
-      return { path: ["h", blockIdx, "mlp", "cProj", "weight"], needsTranspose: true };
+      return {
+        path: ["h", blockIdx, "mlp", "cProj", "weight"],
+        needsTranspose: true,
+      };
     }
     if (component === "mlp.c_proj.bias") {
-      return { path: ["h", blockIdx, "mlp", "cProj", "bias"], needsTranspose: false };
+      return {
+        path: ["h", blockIdx, "mlp", "cProj", "bias"],
+        needsTranspose: false,
+      };
     }
   }
 
@@ -129,15 +158,20 @@ function mapWeightName(hfName: string): {
  * Parse a safetensors file header using streaming reads (no large buffer allocation).
  * Returns metadata and data offset for on-demand weight extraction.
  */
-function parseSafetensorsHeader(
-  fd: number,
-): { metadata: SafetensorsMetadata; dataStart: number } {
+function parseSafetensorsHeader(fd: number): {
+  metadata: SafetensorsMetadata;
+  dataStart: number;
+} {
   // Read header length (first 8 bytes)
   const headerSizeBuf = Buffer.alloc(8);
   fs.readSync(fd, headerSizeBuf, 0, 8, 0);
-  const headerLength = Number(new DataView(
-    headerSizeBuf.buffer, headerSizeBuf.byteOffset, 8,
-  ).getBigUint64(0, true));
+  const headerLength = Number(
+    new DataView(
+      headerSizeBuf.buffer,
+      headerSizeBuf.byteOffset,
+      8,
+    ).getBigUint64(0, true),
+  );
 
   // Read header JSON
   const headerBuf = Buffer.alloc(headerLength);
@@ -169,14 +203,22 @@ function extractWeight(
     // F32: create Float32Array from the read buffer (aligned since Buffer.alloc is aligned)
     return new Float32Array(rawBuf.buffer, rawBuf.byteOffset, byteLength / 4);
   } else if (info.dtype === "F16") {
-    const uint16View = new Uint16Array(rawBuf.buffer, rawBuf.byteOffset, byteLength / 2);
+    const uint16View = new Uint16Array(
+      rawBuf.buffer,
+      rawBuf.byteOffset,
+      byteLength / 2,
+    );
     const floatData = new Float32Array(uint16View.length);
     for (let i = 0; i < uint16View.length; i++) {
       floatData[i] = float16ToFloat32(uint16View[i]);
     }
     return floatData;
   } else if (info.dtype === "BF16") {
-    const uint16View = new Uint16Array(rawBuf.buffer, rawBuf.byteOffset, byteLength / 2);
+    const uint16View = new Uint16Array(
+      rawBuf.buffer,
+      rawBuf.byteOffset,
+      byteLength / 2,
+    );
     const floatData = new Float32Array(uint16View.length);
     for (let i = 0; i < uint16View.length; i++) {
       floatData[i] = bfloat16ToFloat32(uint16View[i]);
@@ -201,7 +243,7 @@ function float16ToFloat32(bits: number): number {
       return sign ? -0 : 0;
     }
     // Denormalized
-    return (sign ? -1 : 1) * Math.pow(2, -14) * (frac / 1024);
+    return (sign ? -1 : 1) * 2 ** -14 * (frac / 1024);
   } else if (exp === 31) {
     // Infinity or NaN
     if (frac === 0) {
@@ -211,7 +253,7 @@ function float16ToFloat32(bits: number): number {
   }
 
   // Normalized
-  return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + frac / 1024);
+  return (sign ? -1 : 1) * 2 ** (exp - 15) * (1 + frac / 1024);
 }
 
 /**
@@ -276,7 +318,7 @@ export async function loadGPT2Weights(
     if (!fs.existsSync(safetensorsPath)) {
       throw new Error(
         `Could not find model.safetensors in ${modelPath}. ` +
-        `Please download the model first.`,
+          `Please download the model first.`,
       );
     }
   }
@@ -305,7 +347,9 @@ export async function loadGPT2Weights(
       // Read this weight's bytes from disk (only one weight in memory at a time)
       const data = extractWeight(fd, dataStart, info);
       if (!data) {
-        console.warn(`Unsupported dtype ${info.dtype} for weight ${name}, skipping`);
+        console.warn(
+          `Unsupported dtype ${info.dtype} for weight ${name}, skipping`,
+        );
         continue;
       }
 
@@ -321,7 +365,11 @@ export async function loadGPT2Weights(
 
       // Pad wte weight to paddedVocabSize if specified
       const key = mapping.path.join(".");
-      if (key === "wte.weight" && options?.paddedVocabSize && options.paddedVocabSize > finalShape[0]) {
+      if (
+        key === "wte.weight" &&
+        options?.paddedVocabSize &&
+        options.paddedVocabSize > finalShape[0]
+      ) {
         const paddedRows = options.paddedVocabSize;
         const cols = finalShape[1];
         const paddedData = new Float32Array(paddedRows * cols);
@@ -330,11 +378,10 @@ export async function loadGPT2Weights(
         finalShape = [paddedRows, cols];
       }
 
-      const tensor = api.tensorFromArray(
-        finalData,
-        finalShape,
-        { requiresGrad: true, device },
-      );
+      const tensor = api.tensorFromArray(finalData, finalShape, {
+        requiresGrad: true,
+        device,
+      });
 
       weights.set(key, tensor);
       pendingBytes += finalData.byteLength;
@@ -386,7 +433,7 @@ function applyWeights(model: GPT2, weights: Map<string, Tensor>): void {
 
   // Transformer blocks
   for (let i = 0; i < model.h.length; i++) {
-    const block = model.h[i];
+    const block = model.h.get(i) as TransformerBlock;
 
     // Layer norm 1
     const ln1Weight = weights.get(`h.${i}.ln1.weight`);
@@ -398,12 +445,14 @@ function applyWeights(model: GPT2, weights: Map<string, Tensor>): void {
     const cAttnWeight = weights.get(`h.${i}.attn.cAttn.weight`);
     const cAttnBias = weights.get(`h.${i}.attn.cAttn.bias`);
     if (cAttnWeight) copyWeight(block.attn.cAttn.weight, cAttnWeight);
-    if (cAttnBias && block.attn.cAttn.bias) copyWeight(block.attn.cAttn.bias, cAttnBias);
+    if (cAttnBias && block.attn.cAttn.bias)
+      copyWeight(block.attn.cAttn.bias, cAttnBias);
 
     const cProjWeight = weights.get(`h.${i}.attn.cProj.weight`);
     const cProjBias = weights.get(`h.${i}.attn.cProj.bias`);
     if (cProjWeight) copyWeight(block.attn.cProj.weight, cProjWeight);
-    if (cProjBias && block.attn.cProj.bias) copyWeight(block.attn.cProj.bias, cProjBias);
+    if (cProjBias && block.attn.cProj.bias)
+      copyWeight(block.attn.cProj.bias, cProjBias);
 
     // Layer norm 2
     const ln2Weight = weights.get(`h.${i}.ln2.weight`);
@@ -420,7 +469,8 @@ function applyWeights(model: GPT2, weights: Map<string, Tensor>): void {
     const cProjWeight2 = weights.get(`h.${i}.mlp.cProj.weight`);
     const cProjBias2 = weights.get(`h.${i}.mlp.cProj.bias`);
     if (cProjWeight2) copyWeight(block.mlp.cProj.weight, cProjWeight2);
-    if (cProjBias2 && block.mlp.cProj.bias) copyWeight(block.mlp.cProj.bias, cProjBias2);
+    if (cProjBias2 && block.mlp.cProj.bias)
+      copyWeight(block.mlp.cProj.bias, cProjBias2);
   }
 }
 
