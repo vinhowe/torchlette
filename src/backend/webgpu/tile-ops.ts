@@ -666,6 +666,78 @@ export class BlockOps {
     this._pushBlockDot(a, b, acc.name, acc.name);
   }
 
+  /**
+   * Single-row dot product: returns scalar = dot(regBlock[0,:], sharedBlock[rowIdx,:]).
+   * Used inside range() loops for fused attention inner loops.
+   * regBlock must be register (1×D), sharedBlock must be shared (K×D).
+   * With TPR, handles subgroup reduction automatically.
+   */
+  dotRow(regBlock: Block, sharedBlock: Block, rowIdx: BlockExpr): BlockExpr {
+    if (regBlock.placement !== "register" || regBlock.rows !== 1) {
+      throw new Error("dotRow: regBlock must be register with rows=1");
+    }
+    if (sharedBlock.placement !== "shared") {
+      throw new Error("dotRow: sharedBlock must be shared");
+    }
+    const resultName = this.freshName() + "_s";
+    this.ctx.pushStatement({
+      kind: "blockDotRow",
+      aName: regBlock.name,
+      bName: sharedBlock.name,
+      resultName,
+      rowIdx: rowIdx.node,
+      aCols: regBlock.cols,
+      bCols: sharedBlock._origCols,
+      bSmemStride: sharedBlock.smemStride,
+      bSmemElemType:
+        sharedBlock.smemElemType !== "f32"
+          ? sharedBlock.smemElemType
+          : undefined,
+    });
+    return this.ctx._makeRef(resultName, "f32");
+  }
+
+  /**
+   * Single-row scaled accumulation: accBlock[:] += scalar * sharedBlock[rowIdx,:].
+   * Used inside range() loops for fused attention inner loops.
+   * accBlock must be register (1×D), sharedBlock must be shared (K×D).
+   */
+  accumRow(
+    accBlock: Block,
+    scalar: BlockExpr,
+    sharedBlock: Block,
+    rowIdx: BlockExpr,
+  ): void {
+    if (accBlock.placement !== "register" || accBlock.rows !== 1) {
+      throw new Error("accumRow: accBlock must be register with rows=1");
+    }
+    if (sharedBlock.placement !== "shared") {
+      throw new Error("accumRow: sharedBlock must be shared");
+    }
+    // Store scalar to a named variable so lowering can reference it
+    const scalarName = this.freshName() + "_p";
+    this.ctx.pushStatement({
+      kind: "let",
+      name: scalarName,
+      dtype: "f32" as const,
+      value: scalar.node,
+    });
+    this.ctx.pushStatement({
+      kind: "blockAccumRow",
+      accName: accBlock.name,
+      bName: sharedBlock.name,
+      scalarName,
+      rowIdx: rowIdx.node,
+      accCols: accBlock.cols,
+      bCols: sharedBlock._origCols,
+      bSmemStride: sharedBlock.smemStride,
+      bSmemElemType:
+        sharedBlock.smemElemType !== "f32"
+          ? sharedBlock.smemElemType
+          : undefined,
+    });
+  }
+
   // ---- Store ----
 
   /** Store register block to global memory. */

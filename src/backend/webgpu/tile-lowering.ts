@@ -10,9 +10,11 @@
 
 import { F32_NEG_MAX } from "./shape-utils";
 import type {
+  BlockAccumRowStmt,
   BlockAllocStmt,
   BlockBinaryOp,
   BlockBinaryStmt,
+  BlockDotRowStmt,
   BlockDotStmt,
   BlockLoadStmt,
   BlockReduceStmt,
@@ -81,12 +83,49 @@ function getPhysCols(name: string, logicalCols: number): number {
   return layout === "distributed" ? logicalCols / _activeTPR : logicalCols;
 }
 
-/** Recursively collect all BlockDotStmt from a statement tree. */
+/** Recursively collect all BlockDotStmt (and equivalent row ops) from a statement tree. */
 function collectBlockDots(stmts: Statement[]): BlockDotStmt[] {
   const dots: BlockDotStmt[] = [];
   function scan(ss: Statement[]) {
     for (const s of ss) {
       if (s.kind === "blockDot") dots.push(s);
+      // blockDotRow is equivalent to RegSharedT for TPR analysis
+      if (s.kind === "blockDotRow") {
+        dots.push({
+          kind: "blockDot",
+          aName: s.aName,
+          bName: s.bName,
+          resultName: s.resultName,
+          aPlacement: "register",
+          bPlacement: "shared",
+          bTransposed: true,
+          aRows: 1,
+          aCols: s.aCols,
+          bRows: 1, // single row, but D cols
+          bCols: s.bCols,
+          bSmemStride: s.bSmemStride,
+          bSmemElemType: s.bSmemElemType,
+        });
+      }
+      // blockAccumRow is equivalent to RegSharedNN for TPR analysis
+      if (s.kind === "blockAccumRow") {
+        dots.push({
+          kind: "blockDot",
+          aName: s.scalarName, // scalar input (replicated)
+          bName: s.bName,
+          resultName: s.accName,
+          accName: s.accName,
+          aPlacement: "register",
+          bPlacement: "shared",
+          bTransposed: false,
+          aRows: 1,
+          aCols: 1, // scalar
+          bRows: 1,
+          bCols: s.bCols,
+          bSmemStride: s.bSmemStride,
+          bSmemElemType: s.bSmemElemType,
+        });
+      }
       if (
         s.kind === "forRange" ||
         s.kind === "forStride" ||
@@ -405,6 +444,8 @@ export function hasTileStatements(stmts: Statement[]): boolean {
       case "blockLoad":
       case "blockStore":
       case "blockDot":
+      case "blockDotRow":
+      case "blockAccumRow":
       case "blockReduce":
       case "blockUnary":
       case "blockBinary":
@@ -471,6 +512,12 @@ export function lowerTileStatements(
         break;
       case "blockDot":
         result.push(...lowerBlockDot(s));
+        break;
+      case "blockDotRow":
+        result.push(...lowerBlockDotRow(s));
+        break;
+      case "blockAccumRow":
+        result.push(...lowerBlockAccumRow(s));
         break;
       case "blockReduce":
         result.push(...lowerBlockReduce(s));
@@ -1664,6 +1711,155 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
     );
     rBody.push(forRange0(jVar, cU32(aCols), jBody));
     result.push(forRange0(rVar, cU32(aRows), rBody));
+  }
+
+  return result;
+}
+
+/**
+ * Lower blockDotRow → single-row dot product: scalar = dot(reg[0,:], shared[rowIdx,:]).
+ *
+ * Like lowerBlockDotRegSharedT but for ONE row (no j loop).
+ * The row index is a runtime expression (variable), not a loop variable.
+ */
+function lowerBlockDotRow(stmt: BlockDotRowStmt): Statement[] {
+  const { aName, bName, resultName, rowIdx, aCols, bCols } = stmt;
+  const bStride = stmt.bSmemStride ?? bCols;
+  const bIsF16 = stmt.bSmemElemType === "f16";
+  const result: Statement[] = [];
+
+  const bRead = (idx: IRNode): IRNode => {
+    const raw = sharedRead(bName, idx, bIsF16 ? "f16" : "f32");
+    return bIsF16 ? castNode(raw, "f32") : raw;
+  };
+
+  const physInnerDim = _activeTPR > 1 ? aCols / _activeTPR : aCols;
+  const useVec4 = physInnerDim % 4 === 0;
+
+  // var result_s: f32 = 0.0;
+  result.push({ kind: "var", name: resultName, dtype: "f32", value: cF32(0) });
+
+  // B access: rowIdx*bStride + (sub_idx*physInnerDim + d)
+  const bRowBase = (d: IRNode) => {
+    const base = binOp("add", binOp("mul", rowIdx, cU32(bStride)), d);
+    return _activeTPR > 1
+      ? binOp("add", binOp("mul", ref("_sub_idx"), cU32(physInnerDim)), base)
+      : base;
+  };
+
+  if (useVec4) {
+    const d4Var = freshVar("d4");
+    result.push(
+      forRange0(d4Var, cU32(physInnerDim / 4), [
+        {
+          kind: "addAssign",
+          name: resultName,
+          value: vec4DotExpr(
+            [0, 1, 2, 3].map((k) =>
+              arrayRead(
+                aName,
+                binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k)),
+              ),
+            ) as [IRNode, IRNode, IRNode, IRNode],
+            [0, 1, 2, 3].map((k) =>
+              bRead(
+                bRowBase(
+                  binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k)),
+                ),
+              ),
+            ) as [IRNode, IRNode, IRNode, IRNode],
+          ),
+        },
+      ]),
+    );
+  } else {
+    const dVar = freshVar("d");
+    result.push(
+      forRange0(dVar, cU32(physInnerDim), [
+        {
+          kind: "addAssign",
+          name: resultName,
+          value: binOp(
+            "mul",
+            arrayRead(aName, ref(dVar)),
+            bRead(bRowBase(ref(dVar))),
+            "f32",
+          ),
+        },
+      ]),
+    );
+  }
+
+  // Butterfly reduction across TPR threads
+  if (_activeTPR > 1) {
+    result.push(...emitButterflyReduce(resultName, _activeTPR, "sum"));
+  }
+
+  return result;
+}
+
+/**
+ * Lower blockAccumRow → single-row scaled accumulation: acc[:] += scalar * shared[rowIdx,:].
+ *
+ * Like lowerBlockDotRegSharedNN but for ONE j value (no j loop).
+ */
+function lowerBlockAccumRow(stmt: BlockAccumRowStmt): Statement[] {
+  const { accName, bName, scalarName, rowIdx, accCols, bCols } = stmt;
+  const bStride = stmt.bSmemStride ?? bCols;
+  const bIsF16 = stmt.bSmemElemType === "f16";
+  const result: Statement[] = [];
+
+  const bRead = (idx: IRNode): IRNode => {
+    const raw = sharedRead(bName, idx, bIsF16 ? "f16" : "f32");
+    return bIsF16 ? castNode(raw, "f32") : raw;
+  };
+
+  // With TPR: accumulator is distributed
+  const physOutCols = _activeTPR > 1 ? accCols / _activeTPR : accCols;
+  const useVec4 = physOutCols % 4 === 0;
+
+  // B access: rowIdx*bStride + (sub_idx*physOutCols + d)
+  const bColBase = (d: IRNode) => {
+    const colIdx =
+      _activeTPR > 1
+        ? binOp("add", binOp("mul", ref("_sub_idx"), cU32(physOutCols)), d)
+        : d;
+    return binOp("add", binOp("mul", rowIdx, cU32(bStride)), colIdx);
+  };
+
+  if (useVec4) {
+    const d4Var = freshVar("d4");
+    const d4Body: Statement[] = [];
+    for (let k = 0; k < 4; k++) {
+      const regIdx = binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k));
+      const smemIdx = bColBase(
+        binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k)),
+      );
+      d4Body.push({
+        kind: "indexAddAssign",
+        arrayName: accName,
+        idx: regIdx,
+        value: binOp("mul", ref(scalarName, "f32"), bRead(smemIdx), "f32"),
+      });
+    }
+    result.push(forRange0(d4Var, cU32(physOutCols / 4), d4Body));
+  } else {
+    const dVar = freshVar("d");
+    result.push(
+      forRange0(dVar, cU32(physOutCols), [
+        {
+          kind: "indexAddAssign",
+          arrayName: accName,
+          idx: ref(dVar),
+          value: binOp(
+            "mul",
+            ref(scalarName, "f32"),
+            bRead(bColBase(ref(dVar))),
+            "f32",
+          ),
+        },
+      ]),
+    );
   }
 
   return result;

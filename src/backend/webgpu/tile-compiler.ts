@@ -370,7 +370,7 @@ export function compileTileKernel(spec: TileKernelSpec): string {
   // 2. Lower tile-level ops if present
   let stmts = ctx.statements;
   if (hasTileStatements(stmts)) {
-    const tpr = autoDetectTPR(stmts, sgSize > 0);
+    const tpr = spec.noTPR ? 1 : autoDetectTPR(stmts, sgSize > 0);
     setTPR(tpr);
     setBlockLayouts(computeBlockLayouts(stmts, tpr));
     if (tpr > 1) {
@@ -687,7 +687,7 @@ function emitStatement(
             : stmt.elemType === "f16"
               ? "f16(0.0)"
               : "0u";
-        if (stmt.size <= 16) {
+        if (stmt.size <= 4) {
           // Unroll zero-init for small arrays
           for (let i = 0; i < stmt.size; i++) {
             lines.push(`${indent}${stmt.name}[${i}u] = ${zero};`);

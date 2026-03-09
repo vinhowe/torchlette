@@ -344,21 +344,18 @@ function makeBackwardDQSpec(headDim: number): TileKernelSpec {
         const K = ctx.load2D("K", tilePtr, tileMask);
         const V = ctx.load2D("V", tilePtr, tileMask);
 
-        const scores = ctx.dot(Q, K.T());
-        const dovs = ctx.dot(dO, V.T());
-
-        const ds = ctx.zeros(1, BC);
+        // Fused single-loop: compute score, p, ds per KV-row, accumulate dQ inline
         ctx.range(0, BC, (j) => {
           const kvPos = kvStart.add(j);
           const isActive = valid
             .and(kvPos.lt(N))
             .and(isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)));
-          const s = scores.get(j).mul(scale);
+          const s = ctx.dotRow(Q, K, j).mul(scale);
+          const dov = ctx.dotRow(dO, V, j);
           const p = isActive.select(s.sub(lVar.get()).exp(), ctx.f32(0));
-          ds.set(j, p.mul(dovs.get(j).sub(dVar.get())));
+          const ds = p.mul(dov.sub(dVar.get()));
+          ctx.accumRow(dqAcc, ds, K, j);
         });
-
-        ctx.dotAccum(ds, K, dqAcc);
       });
 
       ctx.ifThen(valid, () => {
@@ -485,25 +482,19 @@ function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
 
           ctx.barrier();
 
-          const scores = ctx.dot(K, QTile.T());
-          const dovs = ctx.dot(V, dOTile.T());
-
-          const dsBlk = ctx.zeros(1, BQ_BW);
-          const pBlk = ctx.zeros(1, BQ_BW);
+          // Fused single-loop: compute score, p, ds per Q-row, accumulate dK/dV inline
           ctx.range(0, BQ_BW, (j) => {
             const qi = qStart.add(j);
             const isActive = valid
               .and(qi.lt(N))
               .and(isCausal.eq(ctx.u32(0)).or(kvRow.le(qi)));
-            const s = scores.get(j).mul(scale);
+            const s = ctx.dotRow(K, QTile, j).mul(scale);
             const p = isActive.select(s.sub(lTile.read(j)).exp(), ctx.f32(0));
-            const ds = p.mul(dovs.get(j).sub(dTile.read(j)));
-            dsBlk.set(j, ds.mul(scale));
-            pBlk.set(j, p);
+            const dov = ctx.dotRow(V, dOTile, j);
+            const ds = p.mul(dov.sub(dTile.read(j))).mul(scale);
+            ctx.accumRow(dkAcc, ds, QTile, j);
+            ctx.accumRow(dvAcc, p, dOTile, j);
           });
-
-          ctx.dotAccum(dsBlk, QTile, dkAcc);
-          ctx.dotAccum(pBlk, dOTile, dvAcc);
 
           ctx.barrier();
         });
