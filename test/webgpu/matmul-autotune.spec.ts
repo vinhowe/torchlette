@@ -215,11 +215,11 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       expect(config.threadTileN).toBe(4);
     });
 
-    it("square_large epilogue uses smaller thread tiles (t4x4)", () => {
+    it("square_large epilogue uses smaller thread tiles (t4x4) with tileK=16", () => {
       const config = getDefaultConfigForShape("square_large", true);
       expect(config.tileM).toBe(64);
       expect(config.tileN).toBe(64);
-      expect(config.tileK).toBe(8);
+      expect(config.tileK).toBe(16);
       expect(config.threadTileM).toBe(4);
       expect(config.threadTileN).toBe(4);
     });
