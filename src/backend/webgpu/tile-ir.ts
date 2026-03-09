@@ -1126,7 +1126,7 @@ export class BlockExpr {
   erf(): BlockExpr {
     // erf(x) = sign(x) * (1 - poly(t) * exp(-x²))
     // where t = 1/(1 + p*|x|), poly = a1*t + a2*t² + a3*t³ + a4*t⁴ + a5*t⁵
-    const one = this.f32(1.0);
+    const one = new BlockExpr(resolveArg(1.0));
     const signX = this.sign();
     const absX = this.abs();
     const t = one.div(one.add(absX.mul(0.3275911)));

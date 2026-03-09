@@ -210,8 +210,18 @@ function exprFor(node: IRNode, bindings: BindingMap, v4?: Vec4Ctx): string {
     }
     case "select": {
       const cond = exprFor(node.condition, bindings, v4);
-      const t = exprFor(node.trueVal, bindings, v4);
-      const f = exprFor(node.falseVal, bindings, v4);
+      let t = exprFor(node.trueVal, bindings, v4);
+      let f = exprFor(node.falseVal, bindings, v4);
+      if (v4) {
+        // select() requires all operands to match vec4-ness
+        const tVec = isVec4(node.trueVal, v4);
+        const fVec = isVec4(node.falseVal, v4);
+        const anyVec = tVec || fVec || isVec4(node.condition, v4);
+        if (anyVec) {
+          if (!tVec) t = splatScalar(t, node.trueVal.dataType);
+          if (!fVec) f = splatScalar(f, node.falseVal.dataType);
+        }
+      }
       return `select(${f}, ${t}, ${cond})`;
     }
     case "cmp": {
@@ -541,9 +551,9 @@ function compileImperativeKernel(
       const gidXNodes = ctx.nodes.filter(
         (n) => n.kind === "globalId" && n.dim === 0,
       );
-      lines.push(`  let _flatBase = gid.x * ${vecWidth}u;`);
+      lines.push(`  let _base = gid.x * ${vecWidth}u;`);
       for (const n of gidXNodes) {
-        bindings.set(n.id, `_flatBase`);
+        bindings.set(n.id, `_base`);
       }
     }
 
