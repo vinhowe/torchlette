@@ -118,10 +118,9 @@ describe("autoVectorize with elementIndex", () => {
       },
     };
     const wgsl = compileTileKernel(spec);
-    // Should have vec4 unrolling with _flatBase
+    // Should have vec4-native mode with _flatBase and vec4 bindings
     expect(wgsl).toContain("_flatBase");
-    expect(wgsl).toContain("vec element 0");
-    expect(wgsl).toContain("vec element 3");
+    expect(wgsl).toContain("vec4<f32>");
     // Should use num_wg for flat workgroup calculation
     expect(wgsl).toContain("num_wg");
   });
@@ -149,8 +148,8 @@ describe("autoVectorize with elementIndex", () => {
     // Should use _base (not _flatBase) for globalId(0) path
     expect(wgsl).toContain("_base");
     expect(wgsl).not.toContain("_flatBase");
-    expect(wgsl).toContain("vec element 0");
-    expect(wgsl).toContain("vec element 3");
+    // Should generate vec4-native bindings
+    expect(wgsl).toContain("vec4<f32>");
   });
 });
 

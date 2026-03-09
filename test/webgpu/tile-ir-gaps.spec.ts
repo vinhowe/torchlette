@@ -690,15 +690,13 @@ const elementwiseAddVec4Spec: TileKernelSpec = {
 };
 
 describe("Gap 6: Auto-vectorization", () => {
-  it("unrolls body 4 times with base+offset pattern", () => {
+  it("generates vec4-native bindings and indexing", () => {
     const wgsl = compileTileKernel(elementwiseAddVec4Spec);
     // Should have base computation
     expect(wgsl).toContain("gid.x * 4u");
-    // Should have 4 copies of the body with different offsets
-    expect(wgsl).toContain("(_base + 0u)");
-    expect(wgsl).toContain("(_base + 1u)");
-    expect(wgsl).toContain("(_base + 2u)");
-    expect(wgsl).toContain("(_base + 3u)");
+    // Vec4-native mode: bindings are array<vec4<f32>>, indexing uses >> 2u
+    expect(wgsl).toContain("array<vec4<f32>>");
+    expect(wgsl).toContain(">> 2u");
   });
 
   it("non-vectorized kernel does not have _base", () => {
@@ -756,8 +754,10 @@ describe.runIf(isWebGPUEnabled)(
 
     it("vec4 add: non-multiple of 4 (boundary check)", async () => {
       const N = 137; // not divisible by 4
-      const aData = new Float32Array(N);
-      const bData = new Float32Array(N);
+      // Pad inputs to multiple of 4 for vec4-native reads
+      const padded = Math.ceil(N / 4) * 4;
+      const aData = new Float32Array(padded);
+      const bData = new Float32Array(padded);
       const expected = new Float32Array(N);
       for (let i = 0; i < N; i++) {
         aData[i] = i;
@@ -880,8 +880,9 @@ describe("Imperative elementwise (WGSL)", () => {
   it("vectorize works with imperative kernels", () => {
     const wgsl = compileTileKernel(maskedElementwiseAddVec4Spec);
     expect(wgsl).toContain("* 4u");
-    expect(wgsl).toContain("(_base + 0u)");
-    expect(wgsl).toContain("(_base + 3u)");
+    // Vec4-native mode: bindings are array<vec4<f32>>, indexing uses >> 2u
+    expect(wgsl).toContain("array<vec4<f32>>");
+    expect(wgsl).toContain(">> 2u");
   });
 });
 
@@ -1019,8 +1020,10 @@ describe.runIf(isWebGPUEnabled)(
 
     it("masked vec4 add: non-multiple-of-4 (137)", async () => {
       const N = 137;
-      const aData = new Float32Array(N);
-      const bData = new Float32Array(N);
+      // Pad inputs to multiple of 4 for vec4-native reads
+      const padded = Math.ceil(N / 4) * 4;
+      const aData = new Float32Array(padded);
+      const bData = new Float32Array(padded);
       const expected = new Float32Array(N);
       for (let i = 0; i < N; i++) {
         aData[i] = i;
