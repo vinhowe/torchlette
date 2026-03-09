@@ -68,7 +68,7 @@ async function loadWebGPU(): Promise<WebGPUModule | null> {
     return null;
   }
   try {
-    const mod = (await import("webgpu")) as WebGPUModule;
+    const mod = (await import("webgpu")) as unknown as WebGPUModule;
     return mod;
   } catch {
     return null;
@@ -398,7 +398,12 @@ export async function initWebGPU(): Promise<boolean> {
     }
   }
 
-  if (isProfilingEnabled() && device.features.has("timestamp-query")) {
+  if (
+    isProfilingEnabled() &&
+    (
+      device as unknown as { features: { has(s: string): boolean } }
+    ).features.has("timestamp-query")
+  ) {
     initGpuTimestamps(device);
   }
 
@@ -460,7 +465,7 @@ export function destroyWebGPU(): void {
   resetAllKernelCaches();
   clearWarmupCache();
   destroyProfilingFenceBuffer();
-  gpuContext.device.destroy();
+  (gpuContext.device as unknown as { destroy(): void }).destroy();
   gpuContext.pipelines.clear();
   setGpuContext(null);
 }

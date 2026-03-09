@@ -102,7 +102,12 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
       src = asGPUTensor(contiguous(tensor));
       contiguousCopy = src;
     }
-    const result = castChunked(src, dtype, ctx, limits);
+    const result = castChunked(
+      src,
+      dtype,
+      ctx,
+      limits as Record<string, number>,
+    );
     if (contiguousCopy) contiguousCopy.destroy();
     return result;
   }

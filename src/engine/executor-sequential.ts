@@ -98,7 +98,7 @@ export async function executePlan(
 
       // Track storage for early release
       if (options?.enableEarlyRelease) {
-        nodeToStorage.set(node.id, node.result);
+        nodeToStorage.set(node.id, node.result!);
         releaseDeadTensors(
           lifetimes,
           step + 1,
@@ -246,7 +246,7 @@ export async function executePlanSegmented(
         }
 
         const lastNode = segment.nodes[segment.nodes.length - 1];
-        lastResult = lastNode.result ?? undefined;
+        lastResult = lastNode.result ?? null;
       } catch (error) {
         if (isBatchActive()) {
           abortBatch();

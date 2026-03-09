@@ -16,8 +16,11 @@ import type {
   Backend,
   DivOptions,
   GatherOptions,
+  MaxOptions,
   MeanOptions,
+  OpExecOptions,
   ScatterAddOptions,
+  StridedScatterOptions,
   SubOptions,
   SumOptions,
   TransposeOptions,
@@ -98,6 +101,52 @@ function read(a: Tensor): Promise<number[]> {
   return Promise.resolve(a.toArray());
 }
 
+function permute(a: Tensor, _dims: number[]): Tensor {
+  return new Tensor(a.shape, Float32Array.from(a.toArray()));
+}
+
+function contiguous(a: Tensor): Tensor {
+  return new Tensor(a.shape, Float32Array.from(a.toArray()));
+}
+
+function max(a: Tensor, _options?: MaxOptions): Tensor {
+  const arr = a.toArray();
+  const maxVal = Math.max(...arr);
+  return new Tensor([], Float32Array.of(maxVal));
+}
+
+function where(
+  condition: Tensor,
+  x: Tensor,
+  y: Tensor,
+  _options?: OpExecOptions,
+): Tensor {
+  const cArr = condition.toArray();
+  const xArr = x.toArray();
+  const yArr = y.toArray();
+  const result = new Float32Array(cArr.length);
+  for (let i = 0; i < cArr.length; i++) {
+    result[i] = cArr[i] !== 0 ? xArr[i] : yArr[i];
+  }
+  return new Tensor(condition.shape, result);
+}
+
+function stridedScatterCopy(
+  base: Tensor,
+  _src: Tensor,
+  _options: StridedScatterOptions,
+): Tensor {
+  return new Tensor(base.shape, Float32Array.from(base.toArray()));
+}
+
+function stridedScatterAdd(
+  base: Tensor,
+  _src: Tensor,
+  _options: StridedScatterOptions,
+): Tensor {
+  return new Tensor(base.shape, Float32Array.from(base.toArray()));
+}
+
 export const mockBackend: Backend = {
   name: "mock",
   ops: {
@@ -112,6 +161,12 @@ export const mockBackend: Backend = {
     expand,
     reshape,
     transpose,
+    permute,
+    contiguous,
+    max,
+    where,
+    stridedScatterCopy,
+    stridedScatterAdd,
     gather,
     scatterAdd,
     sum,

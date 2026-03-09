@@ -1,5 +1,6 @@
 import type { BackendTensor, DType } from "../backend/types";
 import { asGPUTensor } from "../backend/webgpu/gpu-types";
+import type { EpilogueConfig } from "../backend/webgpu/matmul/types";
 import { contiguousStrides, shapesEqual } from "../core/shape";
 import { isFusibleOp } from "./fusion-detect";
 import type { LazyIRNode, LazyRef } from "./lazy-types";
@@ -222,7 +223,7 @@ export function detectMatmulEpilogueCore(
     } else if (
       isFusibleOp(nextNode.op) &&
       nextNode.inputs.length === 1 &&
-      nextNode.op !== "cast"
+      (nextNode.op as string) !== "cast"
     ) {
       epilogueOps.push({ kind: "unary", op: getEpilogueOpName(nextNode) });
       matched = true;
@@ -348,12 +349,12 @@ export async function executeMatmulWithEpilogue(
     epilogueInputTensors.push(storage.backendTensor);
   }
 
-  // Build EpilogueConfig
+  // Build EpilogueConfig (cast loose EpilogueOp[] to matmul's strict discriminated union)
   const epilogueConfig = {
     ops: plan.epilogueOps,
     additionalInputCount: plan.epilogueInputRefs.length,
     outputDtype: plan.outputDtype,
-  };
+  } as EpilogueConfig;
 
   // Call dispatchMatmul with epilogue options
   const resultTensor = dispatchMatmul(

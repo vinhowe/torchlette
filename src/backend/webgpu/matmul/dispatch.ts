@@ -410,7 +410,7 @@ async function autotuneIfNeeded(
               reduceParamsBuffer,
             );
           }
-          await queue.onSubmittedWorkDone();
+          await queue.onSubmittedWorkDone?.();
 
           // Timed iterations
           const times: number[] = [];
@@ -432,7 +432,7 @@ async function autotuneIfNeeded(
               reductionPipeline,
               reduceParamsBuffer,
             );
-            await queue.onSubmittedWorkDone();
+            await queue.onSubmittedWorkDone?.();
             times.push(performance.now() - start);
           }
 

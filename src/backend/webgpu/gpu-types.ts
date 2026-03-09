@@ -38,6 +38,14 @@ export type GPUCommandEncoder = {
     destinationOffset: number,
     size: number,
   ): void;
+  clearBuffer(buffer: GPUBuffer, offset?: number, size?: number): void;
+  resolveQuerySet(
+    querySet: unknown,
+    firstQuery: number,
+    queryCount: number,
+    destination: GPUBuffer,
+    destinationOffset: number,
+  ): void;
   finish(): GPUCommandBuffer;
 };
 
@@ -89,6 +97,7 @@ export type GPUDevice = {
     compute: { module: unknown; entryPoint: string };
   }): Promise<GPUComputePipeline>;
   createShaderModule(descriptor: { code: string }): unknown;
+  createQuerySet(descriptor: { type: unknown; count: number }): unknown;
   queue: GPUQueue;
   limits: GPUDeviceLimits;
 };

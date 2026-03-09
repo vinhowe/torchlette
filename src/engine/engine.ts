@@ -106,6 +106,7 @@ export class RngReplayMismatchError extends Error {
 import {
   type AsyncScope,
   type BaseBinding,
+  type BaseDebugState,
   type BaseId,
   type BaseState,
   type BaseStateInfo,
@@ -122,15 +123,18 @@ import {
   type FinalizeRecord,
   type LocDebugState,
   type LocId,
+  type LocRole,
   type MemorySnapshot,
   type MemoryStatsProvider,
   type PlanEvent,
   type PredictedStateDelta,
   type RngBasis,
   type RngDrawRecord,
+  type RngDrawResult,
   type SavedTensorInfo,
   type SavedTensorRecord,
   type SemanticSubeventSchedule,
+  type TensorOrigin,
   type TidyScope,
   type TokenSnapshot,
   type TraceTensor,
@@ -470,7 +474,10 @@ export class Engine {
         throw error;
       }
 
-      if (result && typeof (result as Promise<unknown>).then === "function") {
+      if (
+        result &&
+        typeof (result as unknown as Promise<unknown>).then === "function"
+      ) {
         this.finishStaging(undefined);
         throw new AsyncInCompileError("Async work is not allowed in compile");
       }
@@ -718,7 +725,7 @@ export class Engine {
     if (resolvedBaseId >= this.nextBaseId) {
       this.nextBaseId = resolvedBaseId + 1;
     }
-    const origin =
+    const origin: TensorOrigin =
       this.tidyScopes.length > 0
         ? {
             kind: "tidy",
@@ -742,14 +749,14 @@ export class Engine {
       new Set(planTokens.map((token) => token.id)),
     ).sort((a, b) => a - b);
     this.trace.record({ type: "force_plan", baseId, tokenIds });
-    const token = this.afterAll(planTokens);
+    const token = this.afterAll(...planTokens);
     this.emitEffectFrom(token, `host_read:${baseId}`);
   }
 
   tidy<T>(fn: () => T): T {
     const scope: TidyScope = { id: this.nextScopeId++, tensors: new Set() };
     this.tidyScopes.push(scope);
-    let result: T;
+    let result!: T;
     let succeeded = false;
 
     try {
@@ -958,7 +965,7 @@ export class Engine {
     const emit = (
       kind: string,
       overrides?: { opNonce?: number; drawNonce?: number; mutId?: number },
-      payload?: Record<string, unknown>,
+      payload?: Record<string, number>,
     ) => {
       events.push({
         name: kind,

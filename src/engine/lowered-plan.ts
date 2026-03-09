@@ -272,6 +272,8 @@ interface ReplayDispatch {
   workgroupsX: number;
   workgroupsY: number;
   workgroupsZ: number;
+  /** GPUBuffers referenced by this bind group (from RecordedDispatch). Used for pinning. */
+  buffers?: GPUBuffer[];
 }
 
 /**

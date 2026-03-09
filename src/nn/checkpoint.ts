@@ -24,6 +24,7 @@
  * linearly with sequence length and layer count.
  */
 
+import type { RngDrawRecord } from "../engine/engine-types";
 import { markAsCheckpointBoundary } from "../engine/plan-builder";
 import type { PackHook, Tensor, Torchlette, UnpackHook } from "../frontend";
 
@@ -116,7 +117,7 @@ function checkpointNonReentrant<T extends Tensor>(
   }
 
   // Record RNG state if needed for deterministic recomputation
-  let rngDraws: unknown[] | null = null;
+  let rngDraws: RngDrawRecord[] | null = null;
   if (preserveRngState) {
     engine._debug_startCheckpointRecord();
   }
@@ -183,7 +184,7 @@ function checkpointNonReentrant<T extends Tensor>(
       // This tells the segmented executor to flush buffers after this
       // checkpoint region, enabling memory reuse for subsequent segments.
       if (lastCapturedTensor) {
-        const lazyRef = lastCapturedTensor._runtimeTensor().lazyRef;
+        const lazyRef = (lastCapturedTensor as Tensor)._runtimeTensor().lazyRef;
         if (lazyRef?.kind === "pending" && lazyRef.node) {
           markAsCheckpointBoundary(lazyRef.node);
         }

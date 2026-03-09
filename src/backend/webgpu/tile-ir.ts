@@ -34,6 +34,10 @@ import {
   type BlockStorePtr,
   buildMask,
   buildPtr,
+  type TileMask,
+  type TileMaskComponent,
+  type TilePtr,
+  type TilePtrComponent,
   type TileRange,
 } from "./tile-ops";
 
@@ -866,48 +870,49 @@ function tryFold(partial: Omit<IRNode, "id">): IRNode | null {
 
 // ---- CSE key computation ----
 
-type CSEableNode = IRNode | Omit<IRNode, "id">;
-
-function cseKey(node: CSEableNode): string | null {
-  // Access id safely — folded nodes from tryFold() have id, partial nodes don't yet
-  const getId = (n: IRNode | Omit<IRNode, "id">): number => (n as IRNode).id;
-  switch (node.kind) {
+function cseKey(node: IRNode | Omit<IRNode, "id">): string | null {
+  // Cast to IRNode — Omit<IRNode,"id"> breaks TS discriminated union narrowing,
+  // but the switch on `kind` is safe at runtime. Only `id` may be missing.
+  const n = node as IRNode;
+  const getId = (ref: IRNode | Omit<IRNode, "id">): number =>
+    (ref as IRNode).id;
+  switch (n.kind) {
     case "const":
-      return `K:${node.dataType}:${node.value}`;
+      return `K:${n.dataType}:${n.value}`;
     case "binary":
-      return `B:${node.op}:${getId(node.lhs)}:${getId(node.rhs)}`;
+      return `B:${n.op}:${getId(n.lhs)}:${getId(n.rhs)}`;
     case "unary":
-      return `U:${node.op}:${getId(node.input)}`;
+      return `U:${n.op}:${getId(n.input)}`;
     case "cmp":
-      return `C:${node.op}:${getId(node.lhs)}:${getId(node.rhs)}`;
+      return `C:${n.op}:${getId(n.lhs)}:${getId(n.rhs)}`;
     case "cast":
-      return `T:${node.targetType}:${getId(node.input)}`;
+      return `T:${n.targetType}:${getId(n.input)}`;
     case "bitcast":
-      return `BC:${node.targetType}:${getId(node.input)}`;
+      return `BC:${n.targetType}:${getId(n.input)}`;
     case "select":
-      return `S:${getId(node.condition)}:${getId(node.trueVal)}:${getId(node.falseVal)}`;
+      return `S:${getId(n.condition)}:${getId(n.trueVal)}:${getId(n.falseVal)}`;
     case "uniform":
-      return `UNI:${node.name}`;
+      return `UNI:${n.name}`;
     case "programId":
-      return `PID:${node.dim}`;
+      return `PID:${n.dim}`;
     case "threadIdx":
-      return `TID:${node.dim}`;
+      return `TID:${n.dim}`;
     case "localIndex":
       return "LI";
     case "globalId":
-      return `GID:${node.dim}`;
+      return `GID:${n.dim}`;
     case "numWorkgroups":
-      return `NWG:${node.dim}`;
+      return `NWG:${n.dim}`;
     case "vec4Construct":
-      return `V4C:${getId(node.x)}:${getId(node.y)}:${getId(node.z)}:${getId(node.w)}`;
+      return `V4C:${getId(n.x)}:${getId(n.y)}:${getId(n.z)}:${getId(n.w)}`;
     case "vec4Splat":
-      return `V4S:${getId(node.value)}`;
+      return `V4S:${getId(n.value)}`;
     case "vec4NativeDot":
-      return `V4D:${getId(node.a)}:${getId(node.b)}`;
+      return `V4D:${getId(n.a)}:${getId(n.b)}`;
     case "vec4Component":
-      return `V4X:${getId(node.value)}:${node.comp}`;
+      return `V4X:${getId(n.value)}:${n.comp}`;
     case "vec4Binary":
-      return `V4B:${node.op}:${getId(node.a)}:${getId(node.b)}`;
+      return `V4B:${n.op}:${getId(n.a)}:${getId(n.b)}`;
     default:
       return null; // Not CSE-eligible (loads, sharedRead, namedRef, vec4ArrayRead, etc.)
   }

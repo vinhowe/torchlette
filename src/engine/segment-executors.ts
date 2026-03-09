@@ -1,5 +1,10 @@
 import { getBackend } from "../backend/registry";
-import type { Backend, BackendTensor, DType } from "../backend/types";
+import type {
+  Backend,
+  BackendTensor,
+  DeviceKind,
+  DType,
+} from "../backend/types";
 import {
   beginSharedEncoder,
   endSharedEncoder,
@@ -8,7 +13,11 @@ import {
   setAdamBatchMode,
   setCurrentOpLabel,
 } from "../backend/webgpu";
-import { asGPUTensor, type GPUBuffer } from "../backend/webgpu/gpu-types";
+import {
+  asGPUTensor,
+  type GPUBuffer,
+  type GPUDevice,
+} from "../backend/webgpu/gpu-types";
 import {
   recordFusionFallback,
   setProfileModule,
@@ -91,7 +100,7 @@ export async function executeCompoundSoftmax(
     offset: 0,
     isContiguous: true,
     ownsBuffer: true,
-  });
+  } as unknown as BackendTensor);
 }
 
 /** Build a map of nodeId → consumer count from plan nodes. */
@@ -200,27 +209,30 @@ export async function executeFusedSegment(
     const buf = output.buffer as GPUBuffer;
     const bufSize = buf.size;
     let destroyed = false;
-    return createStorageHandle(device, {
-      buffer: output.buffer,
-      shape: output.shape,
-      dtype: output.dtype,
-      size: sizeOf(output.shape),
-      strides: contiguousStrides(output.shape),
-      offset: 0,
-      isContiguous: true,
-      ownsBuffer: true,
-      destroy() {
-        if (destroyed) return;
-        destroyed = true;
-        deferredDestroyBuffer(buf, bufSize);
-      },
-    } as BackendTensor);
+    return createStorageHandle(
+      device as DeviceKind,
+      {
+        buffer: output.buffer,
+        shape: output.shape,
+        dtype: output.dtype,
+        size: sizeOf(output.shape),
+        strides: contiguousStrides(output.shape),
+        offset: 0,
+        isContiguous: true,
+        ownsBuffer: true,
+        destroy() {
+          if (destroyed) return;
+          destroyed = true;
+          deferredDestroyBuffer(buf, bufSize);
+        },
+      } as unknown as BackendTensor,
+    );
   };
 
   // Get WebGPU device from backend (narrowed by the webgpu check above)
   const device = (
     backend as Backend & {
-      device?: { limits?: { maxStorageBuffersPerShaderStage?: number } };
+      device?: GPUDevice;
     }
   ).device;
   if (!device) {

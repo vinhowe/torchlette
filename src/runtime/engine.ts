@@ -457,7 +457,7 @@ export class RuntimeEngine {
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const webgpu = require("../backend/webgpu");
         this._webgpuFlushBufferPool = webgpu.flushBufferPool ?? (() => {});
-        return this._webgpuFlushBufferPool;
+        return this._webgpuFlushBufferPool!;
       } catch {
         return () => {};
       }
@@ -1292,7 +1292,7 @@ export class RuntimeEngine {
   private _reductionOp(
     op: LazyOpCode,
     a: Tensor,
-    options?: { dim?: number | number[]; keepdim?: boolean },
+    options?: { dim?: number | number[] | null; keepdim?: boolean },
   ): Tensor {
     const [safe] = this.ensureDtypeSafety(op, [a]);
     const shape = reduceShape(
@@ -1505,7 +1505,7 @@ export class RuntimeEngine {
 
   /** Create a fused kernel op node and track it as a new Tensor. */
   private fusedOp(
-    op: string,
+    op: LazyOpCode,
     tensors: Tensor[],
     shape: number[],
     device: DeviceKind,

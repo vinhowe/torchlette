@@ -14,6 +14,7 @@
  * cached in the FusionAnalysisTemplate.
  */
 
+import type { DType } from "../backend/types";
 import type { CompoundMatch } from "./compound-patterns";
 import { detectCompoundPatterns } from "./compound-patterns";
 import {

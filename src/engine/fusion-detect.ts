@@ -1003,7 +1003,7 @@ export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
     // Translate generic "cast" op to specific "cast_{dtype}" for codegen registry
     let fusedOp = node.op;
     if (node.op === "cast" && node.dtype) {
-      fusedOp = `cast_${node.dtype}`;
+      fusedOp = `cast_${node.dtype}` as typeof fusedOp;
     }
 
     // Check if node is any output (primary or additional)

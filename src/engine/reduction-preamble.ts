@@ -372,7 +372,7 @@ export function detectReductionEpilogue(
     } else if (
       isFusibleOp(nextNode.op) &&
       nextNode.inputs.length === 1 &&
-      nextNode.op !== "cast"
+      (nextNode.op as string) !== "cast"
     ) {
       epilogueOps.push({ kind: "unary", op: getEpilogueOpName(nextNode) });
       matched = true;
