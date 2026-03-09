@@ -99,19 +99,6 @@ export async function executeCompoundSoftmax(
   } as unknown as BackendTensor);
 }
 
-/** Build a map of nodeId → consumer count from plan nodes. */
-export function buildConsumerCount(nodes: LazyIRNode[]): Map<number, number> {
-  const counts = new Map<number, number>();
-  for (const n of nodes) {
-    for (const ref of n.inputs) {
-      if (ref.kind === "pending") {
-        counts.set(ref.node.id, (counts.get(ref.node.id) ?? 0) + 1);
-      }
-    }
-  }
-  return counts;
-}
-
 /** Collect final positions for a range of nodes. */
 function collectNodePositions(
   nodes: LazyIRNode[],
