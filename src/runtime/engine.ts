@@ -804,110 +804,71 @@ export class RuntimeEngine {
     return this.trackNode(node, shape, resolvedDevice);
   }
 
-  /**
-   * Create a zero-filled tensor efficiently without allocating a large JS array.
-   * Uses the "zeros" lazy op so the backend can create a zero-initialized buffer directly.
-   */
-  zeros(shape: number[], device?: DeviceKind): Tensor {
+  /** Helper: create a data-source op (no inputs, f32 output). */
+  private _creationOp(
+    op: LazyOpCode,
+    shape: number[],
+    device?: DeviceKind,
+    payload?: unknown,
+  ): Tensor {
     const resolvedDevice = this.getDevice(device);
-    const node = createLazyIRNode("zeros", [], shape, "f32", resolvedDevice);
-    return this.trackNode(node, shape, resolvedDevice);
-  }
-
-  /**
-   * Create a tensor filled with a constant value.
-   * Uses the "full" lazy op so the backend can create the buffer directly.
-   */
-  full(shape: number[], fillValue: number, device?: DeviceKind): Tensor {
-    const resolvedDevice = this.getDevice(device);
-    const node = createLazyIRNode("full", [], shape, "f32", resolvedDevice, {
-      fillValue,
-    });
-    return this.trackNode(node, shape, resolvedDevice);
-  }
-
-  /**
-   * Create a 1-D tensor of evenly spaced values.
-   * Uses the "arange" lazy op so the backend can compute values on device.
-   */
-  arange(end: number, start = 0, step = 1, device?: DeviceKind): Tensor {
-    const resolvedDevice = this.getDevice(device);
-    const numElements = Math.max(0, Math.ceil((end - start) / step));
-    const shape = [numElements];
-    const node = createLazyIRNode("arange", [], shape, "f32", resolvedDevice, {
-      end,
-      start,
-      step,
-    });
-    return this.trackNode(node, shape, resolvedDevice);
-  }
-
-  /**
-   * Return the lower-triangular part of a matrix (or batch of matrices).
-   * Elements above the k-th diagonal are zeroed.
-   */
-  tril(a: Tensor, k = 0): Tensor {
-    if (a.shape.length < 2)
-      throw new Error("tril requires at least 2 dimensions");
     const node = createLazyIRNode(
-      "tril",
-      [a.lazyRef],
-      a.shape,
-      a.dtype,
-      a.device,
-      { k },
-    );
-    return this.trackNode(node, a.shape, a.device, a.dtype);
-  }
-
-  /**
-   * Return the upper-triangular part of a matrix (or batch of matrices).
-   * Elements below the k-th diagonal are zeroed.
-   */
-  triu(a: Tensor, k = 0): Tensor {
-    if (a.shape.length < 2)
-      throw new Error("triu requires at least 2 dimensions");
-    const node = createLazyIRNode(
-      "triu",
-      [a.lazyRef],
-      a.shape,
-      a.dtype,
-      a.device,
-      { k },
-    );
-    return this.trackNode(node, a.shape, a.device, a.dtype);
-  }
-
-  rand(shape: number[], device?: DeviceKind): Tensor {
-    const resolvedDevice = this.getDevice(device);
-    const seed = this._rngCounter++;
-    const node = createLazyIRNode("rand", [], shape, "f32", resolvedDevice, {
-      seed,
-    });
-    return this.trackNode(node, shape, resolvedDevice);
-  }
-
-  randn(shape: number[], device?: DeviceKind): Tensor {
-    const resolvedDevice = this.getDevice(device);
-    const seed = this._rngCounter++;
-    const node = createLazyIRNode("randn", [], shape, "f32", resolvedDevice, {
-      seed,
-    });
-    return this.trackNode(node, shape, resolvedDevice);
-  }
-
-  bernoulli(shape: number[], p: number, device?: DeviceKind): Tensor {
-    const resolvedDevice = this.getDevice(device);
-    const seed = this._rngCounter++;
-    const node = createLazyIRNode(
-      "bernoulli",
+      op,
       [],
       shape,
       "f32",
       resolvedDevice,
-      { seed, p },
+      payload,
     );
     return this.trackNode(node, shape, resolvedDevice);
+  }
+
+  zeros(shape: number[], device?: DeviceKind): Tensor {
+    return this._creationOp("zeros", shape, device);
+  }
+
+  full(shape: number[], fillValue: number, device?: DeviceKind): Tensor {
+    return this._creationOp("full", shape, device, { fillValue });
+  }
+
+  arange(end: number, start = 0, step = 1, device?: DeviceKind): Tensor {
+    const numElements = Math.max(0, Math.ceil((end - start) / step));
+    return this._creationOp("arange", [numElements], device, {
+      end,
+      start,
+      step,
+    });
+  }
+
+  tril(a: Tensor, k = 0): Tensor {
+    if (a.shape.length < 2)
+      throw new Error("tril requires at least 2 dimensions");
+    return this._unaryOp("tril", a, { k });
+  }
+
+  triu(a: Tensor, k = 0): Tensor {
+    if (a.shape.length < 2)
+      throw new Error("triu requires at least 2 dimensions");
+    return this._unaryOp("triu", a, { k });
+  }
+
+  rand(shape: number[], device?: DeviceKind): Tensor {
+    return this._creationOp("rand", shape, device, {
+      seed: this._rngCounter++,
+    });
+  }
+
+  randn(shape: number[], device?: DeviceKind): Tensor {
+    return this._creationOp("randn", shape, device, {
+      seed: this._rngCounter++,
+    });
+  }
+
+  bernoulli(shape: number[], p: number, device?: DeviceKind): Tensor {
+    return this._creationOp("bernoulli", shape, device, {
+      seed: this._rngCounter++,
+      p,
+    });
   }
 
   /** Helper: create a simple unary lazy op node.
