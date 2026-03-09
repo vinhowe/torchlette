@@ -738,9 +738,7 @@ function emitStatement(
           ? boundConst - startConst
           : null;
       const shouldUnroll =
-        tripCount !== null &&
-        tripCount >= 0 &&
-        (stmt.unroll || tripCount <= 16);
+        tripCount !== null && tripCount >= 0 && (stmt.unroll || tripCount <= 4);
 
       if (shouldUnroll && tripCount !== null && startConst !== null) {
         for (let i = 0; i < tripCount; i++) {
