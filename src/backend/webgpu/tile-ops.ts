@@ -741,16 +741,62 @@ export class BlockOps {
     binding: string,
     ptr: TilePtr,
     mask: TileMask,
-    opts?: { smemElemType?: DataType; smemPadding?: number },
+    opts?: {
+      smemElemType?: DataType;
+      smemPadding?: number;
+      reuseShared?: Block;
+    },
   ): Block {
-    const name = this.freshName();
     const tileRows = ptr.data.outerRange.size;
     const tileCols = ptr.data.innerRange.size;
     const padding = opts?.smemPadding ?? 0;
+    const bindingType = this.ctx.getBindingType(binding);
+
+    // Reuse existing shared memory allocation if specified
+    const reuse = opts?.reuseShared;
+    if (reuse) {
+      // Validate dimensions match
+      if (reuse.rows !== tileRows || reuse.cols !== tileCols) {
+        throw new Error(
+          `reuseShared dimensions mismatch: expected ${tileRows}×${tileCols}, got ${reuse.rows}×${reuse.cols}`,
+        );
+      }
+      const name = reuse.name;
+      const smemStride = reuse.smemStride;
+      const smemElemType = reuse.smemElemType;
+
+      // Emit load into existing shared array (no new allocation)
+      this.ctx.pushStatement({
+        kind: "tileLoad",
+        binding,
+        ptr: ptr.data,
+        mask: mask.data,
+        sharedName: name,
+        tileRows,
+        tileCols,
+        elemType: bindingType,
+        smemElemType: smemElemType !== bindingType ? smemElemType : undefined,
+        smemStride: smemStride !== tileCols ? smemStride : undefined,
+      });
+
+      return new Block(
+        "shared",
+        tileRows,
+        tileCols,
+        name,
+        this.ctx,
+        this,
+        undefined,
+        undefined,
+        smemStride,
+        smemElemType,
+      );
+    }
+
+    const name = this.freshName();
     const smemStride = tileCols + padding;
 
     // Use native f16 shared memory when binding is f16, or when explicitly overridden
-    const bindingType = this.ctx.getBindingType(binding);
     const smemElemType: DataType =
       opts?.smemElemType ?? (bindingType === "f16" ? "f16" : "f32");
 

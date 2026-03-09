@@ -98,6 +98,7 @@ function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
   return {
     name: `tileAttnFwd_D${D}`,
     workgroupSize: WG,
+    autoBarriers: true,
     bindings: {
       Q: { storage: "read", type: "f32" },
       K: { storage: "read", type: "f32" },
@@ -255,6 +256,7 @@ function makeBackwardDQSpec(headDim: number): TileKernelSpec {
   return {
     name: `tileAttnBwdDQ_D${D}`,
     workgroupSize: WG,
+    autoBarriers: true,
     bindings: {
       Q: { storage: "read", type: "f32" },
       K: { storage: "read", type: "f32" },
@@ -376,6 +378,7 @@ function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
   return {
     name: `tileAttnBwdDKV_D${D}`,
     workgroupSize: WG,
+    autoBarriers: true,
     bindings: {
       Q: { storage: "read", type: "f32" },
       K: { storage: "read", type: "f32" },

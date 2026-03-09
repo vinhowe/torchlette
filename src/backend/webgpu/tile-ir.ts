@@ -2770,7 +2770,12 @@ export class KernelContext {
     binding: string,
     ptr: TilePtr,
     mask: TileMask,
-    opts?: { smemElemType?: DataType; smemPadding?: number },
+    opts?: {
+      smemElemType?: DataType;
+      smemPadding?: number;
+      /** Reuse shared memory from a previous load (must be same dimensions). */
+      reuseShared?: Block;
+    },
   ): Block {
     return this._requireOps().loadTile(binding, ptr, mask, opts);
   }
