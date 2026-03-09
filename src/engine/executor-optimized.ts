@@ -32,7 +32,6 @@ import { type LoweredPlan, LoweredPlanBuilder } from "./lowered-plan";
 import type { MatmulPrologueInfo } from "./matmul-epilogue";
 import { initLifetimeAnalysis, pretunePlanMatmuls } from "./plan-builder";
 import {
-  buildConsumerCount,
   type CompoundMatchExec,
   createReclaimController,
   DEFAULT_RECLAIM_INTERVAL,
@@ -246,7 +245,6 @@ export async function executePlanOptimized(
   const matmulPrologues = new Map<number, MatmulPrologueInfo[]>();
   const compoundClaimedIds = new Set<number>();
   let compoundMatches: CompoundMatch[] = [];
-  let analysisConsumerCount: Map<number, number> | undefined;
   let reductionDirectives:
     | ReturnType<typeof analyzeGraph>["reductionDirectives"]
     | undefined;
@@ -369,7 +367,6 @@ export async function executePlanOptimized(
     for (const [mmId, prologues] of analysis.matmulPrologues)
       matmulPrologues.set(mmId, prologues);
     compoundMatches = analysis.compoundMatches;
-    analysisConsumerCount = analysis.consumerCount;
     reductionDirectives = analysis.reductionDirectives;
     matmulDirectives = analysis.matmulDirectives;
 
@@ -569,16 +566,6 @@ export async function executePlanOptimized(
 
   // Pre-build consumer count map once for the entire plan.
   // This is used by both reduction preamble detection and matmul epilogue detection.
-  // On cache miss, reuse the consumer count from the graph analysis.
-  // On cache hit, build it from the reconstructed plan nodes.
-  let planConsumerCount: Map<number, number> | undefined;
-  if (backend.name === "webgpu") {
-    planConsumerCount =
-      !cachedTemplate && analysisConsumerCount
-        ? analysisConsumerCount
-        : buildConsumerCount(planNodes);
-  }
-
   // Wrap the entire segment loop in a top-level shared encoder scope.
   // Inner begin/end calls in executeSequentialSegment become nested no-ops
   // thanks to the depth counter. This lets elementwise ops from consecutive
@@ -696,12 +683,8 @@ export async function executePlanOptimized(
           alreadyReleased,
           nodeToStorage,
           startStep: overallStep,
-          externalNodeIds,
-          matmulPrologueMap:
-            matmulPrologues.size > 0 ? matmulPrologues : undefined,
           prologueSkipIds:
             prologueClaimedIds.size > 0 ? prologueClaimedIds : undefined,
-          prebuiltConsumerCount: planConsumerCount,
           loweredPlanBuilder,
           nodeIdToFinalPos,
           compoundMatchMap,
