@@ -200,6 +200,10 @@ export interface BlockLoadOpts {
   rows: number;
   cols: number;
   guard?: BlockExpr;
+  /** Override shared memory element type for cooperative loads.
+   * When set to "f16" with an f32 binding, data is converted f32→f16 on
+   * store to shared memory (halving smem footprint) and f16→f32 on read. */
+  smemElemType?: DataType;
 }
 
 /** Pointer for storing register data back to global memory. */
@@ -550,9 +554,11 @@ export class BlockOps {
       return new Block("register", rows, cols, name, this.ctx, this);
     } else {
       // Cooperative load → shared memory placement
-      // Use native f16 shared memory when binding is f16 — halves smem footprint,
-      // reduces bank conflicts, and skips f32 widening on store (done on read instead).
-      const smemElemType: DataType = bindingType === "f16" ? "f16" : "f32";
+      // Use native f16 shared memory when binding is f16, or when explicitly requested
+      // via opts.smemElemType. f16 smem halves footprint (allowing larger tiles),
+      // reduces bank conflicts, and converts on read (f16→f32 widening).
+      const smemElemType: DataType =
+        opts.smemElemType ?? (bindingType === "f16" ? "f16" : "f32");
       const smemStride = cols;
       this.ctx.sharedArrays.push({
         name,
@@ -580,6 +586,7 @@ export class BlockOps {
           innerRange: ptr.innerRange,
           innerBound: ptr.innerBound.node,
         },
+        smemElemType: smemElemType !== bindingType ? smemElemType : undefined,
       });
       return new Block(
         "shared",
@@ -730,15 +737,22 @@ export class BlockOps {
    * Cooperative tile load from global memory into shared memory.
    * Uses TilePtr/TileMask for 2D bounds-checked loading.
    */
-  loadTile(binding: string, ptr: TilePtr, mask: TileMask): Block {
+  loadTile(
+    binding: string,
+    ptr: TilePtr,
+    mask: TileMask,
+    opts?: { smemElemType?: DataType; smemPadding?: number },
+  ): Block {
     const name = this.freshName();
     const tileRows = ptr.data.outerRange.size;
     const tileCols = ptr.data.innerRange.size;
-    const smemStride = tileCols;
+    const padding = opts?.smemPadding ?? 0;
+    const smemStride = tileCols + padding;
 
-    // Use native f16 shared memory when binding is f16
+    // Use native f16 shared memory when binding is f16, or when explicitly overridden
     const bindingType = this.ctx.getBindingType(binding);
-    const smemElemType: DataType = bindingType === "f16" ? "f16" : "f32";
+    const smemElemType: DataType =
+      opts?.smemElemType ?? (bindingType === "f16" ? "f16" : "f32");
 
     // Declare shared memory
     this.ctx.sharedArrays.push({
@@ -756,6 +770,8 @@ export class BlockOps {
       tileRows,
       tileCols,
       elemType: bindingType,
+      smemElemType: smemElemType !== bindingType ? smemElemType : undefined,
+      smemStride: padding > 0 ? smemStride : undefined,
     });
 
     return new Block(

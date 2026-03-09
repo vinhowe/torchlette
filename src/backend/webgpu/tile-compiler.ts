@@ -435,13 +435,16 @@ function compileImperativeKernel(
   const lines: string[] = [];
 
   // Feature enables
-  if (spec.enableF16) {
+  // Auto-enable f16 if any shared array uses f16 element type
+  const needsF16 =
+    spec.enableF16 || ctx.sharedArrays.some((sa) => sa.elemType === "f16");
+  if (needsF16) {
     lines.push("enable f16;");
   }
   if (spec.enableSubgroups) {
     lines.push("enable subgroups;");
   }
-  if (spec.enableF16 || spec.enableSubgroups) {
+  if (needsF16 || spec.enableSubgroups) {
     lines.push("");
   }
 
