@@ -12,7 +12,7 @@
  *   TORCHLETTE_PROFILE=1 npx tsx tools/profile-training.ts
  *
  * Environment variables:
- *   TORCHLETTE_MODEL=gpt2|distilgpt2  (default: distilgpt2)
+ *   TORCHLETTE_MODEL=gpt2-medium|gpt2|distilgpt2  (default: distilgpt2)
  *   TORCHLETTE_BATCH_SIZE=N            (default: 1)
  *   TORCHLETTE_SEQ_LEN=N              (default: 512)
  */
@@ -23,6 +23,7 @@ import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
 import {
   DISTILGPT2_CONFIG,
   type GPT2,
+  GPT2_MEDIUM_CONFIG,
   GPT2_SMALL_CONFIG,
   type TransformerBlock,
 } from "../examples/gpt2/model";
@@ -77,13 +78,30 @@ const NUM_STEPS = 5;
 const PROFILE_STEP = 4; // Which step to analyze in detail (steady-state)
 const BATCH_SIZE = parseInt(process.env.TORCHLETTE_BATCH_SIZE ?? "1", 10);
 const MODEL_NAME = process.env.TORCHLETTE_MODEL ?? "distilgpt2";
-const _MODEL_CONFIG =
-  MODEL_NAME === "gpt2" ? GPT2_SMALL_CONFIG : DISTILGPT2_CONFIG;
-const MODEL_DIR_NAME = MODEL_NAME === "gpt2" ? "gpt2" : "distilgpt2";
-const MODEL_LABEL =
-  MODEL_NAME === "gpt2"
-    ? "GPT-2 Small (12 layers, 12 heads, 768 dim, 124M params)"
-    : "DistilGPT-2 (6 layers, 12 heads, 768 dim, 81M params)";
+const MODEL_CONFIGS: Record<
+  string,
+  { config: typeof GPT2_SMALL_CONFIG; dir: string; label: string }
+> = {
+  "gpt2-medium": {
+    config: GPT2_MEDIUM_CONFIG,
+    dir: "gpt2-medium",
+    label: "GPT-2 Medium (24 layers, 16 heads, 1024 dim, 355M params)",
+  },
+  gpt2: {
+    config: GPT2_SMALL_CONFIG,
+    dir: "gpt2",
+    label: "GPT-2 Small (12 layers, 12 heads, 768 dim, 124M params)",
+  },
+  distilgpt2: {
+    config: DISTILGPT2_CONFIG,
+    dir: "distilgpt2",
+    label: "DistilGPT-2 (6 layers, 12 heads, 768 dim, 81M params)",
+  },
+};
+const MODEL_ENTRY = MODEL_CONFIGS[MODEL_NAME] ?? MODEL_CONFIGS["distilgpt2"];
+const _MODEL_CONFIG = MODEL_ENTRY.config;
+const MODEL_DIR_NAME = MODEL_ENTRY.dir;
+const MODEL_LABEL = MODEL_ENTRY.label;
 
 // Shakespeare sonnets tokens — tiled to seq_len+1 for seq_len=512 profiling
 const BASE_TOKENS: number[] = [
