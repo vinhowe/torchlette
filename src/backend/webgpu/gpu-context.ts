@@ -2,6 +2,7 @@
  * GPU context management: initialization, device lifecycle, f16 support.
  */
 
+import { resetPackedOptimizerCache } from "../../optim/packed-dispatch";
 import { resetAdamKernelState } from "./adam-kernel";
 import { resetAttentionKernelState } from "./attention-kernel";
 import { clearBindGroupCache } from "./bind-group-cache";
@@ -432,6 +433,7 @@ function resetAllKernelCaches(): void {
   resetSoftmaxKernelState();
   resetCrossEntropyKernelState();
   resetAdamKernelState();
+  resetPackedOptimizerCache();
   resetUnscaleKernelState();
   resetMatmulState();
   resetFusionCache();

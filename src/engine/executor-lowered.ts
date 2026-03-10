@@ -31,6 +31,9 @@ import {
   startDispatchRecording,
   stopDispatchRecording,
 } from "../backend/webgpu";
+import { dispatchAdamStep } from "../backend/webgpu/adam-kernel";
+import { bufferPool } from "../backend/webgpu/buffer-pool";
+import { f16WeightCache } from "../backend/webgpu/gpu-context";
 import {
   asGPUTensor,
   type GPUBuffer,
@@ -42,7 +45,12 @@ import {
   profileOpEnd,
   setProfileModule,
 } from "../backend/webgpu/profiler";
+import { createTensor } from "../backend/webgpu/tensor";
 import { contiguousStrides, shapesEqual } from "../core/shape";
+import {
+  dispatchPackedOptimizer,
+  type PackedOptimizerItem,
+} from "../optim/packed-dispatch";
 import type {
   OptimizedExecutionResult,
   OptimizedExecutionStats,
@@ -153,8 +161,9 @@ function collectChainExternalRefs(
 }
 
 /**
- * Execute a batch of adamStep nodes using a direct adamOp call (bypasses executeOp switch).
- * Shared by both the lowered-plan replay path and the normal lowered plan execution path.
+ * Execute a batch of adamStep nodes using packed dispatch for groups of same-size params.
+ * Groups params by element count and dispatches one Adam kernel per group (instead of one
+ * per param). Single-param groups fall through to per-param adamOp.
  */
 async function executeAdamBatchInner(
   planNodes: LazyIRNode[],
@@ -162,6 +171,13 @@ async function executeAdamBatchInner(
   adamOp: AdamStepFn,
   getStorage: (ref: LazyRef) => StorageHandle,
 ): Promise<void> {
+  // Pre-resolve all storages and build packed items list
+  const packedItems: PackedOptimizerItem[] = [];
+  const nodes: LazyIRNode[] = [];
+  const storages: Array<
+    [StorageHandle, StorageHandle, StorageHandle, StorageHandle]
+  > = [];
+
   for (const nodeIdx of nodeIndices) {
     const adamNode = planNodes[nodeIdx];
     if (adamNode.result) continue;
@@ -170,6 +186,64 @@ async function executeAdamBatchInner(
     const s1 = getStorage(inputs[1]);
     const s2 = getStorage(inputs[2]);
     const s3 = getStorage(inputs[3]);
+    const numElements = adamNode.shape.reduce(
+      (a: number, b: number) => a * b,
+      1,
+    );
+
+    packedItems.push({
+      buffers: [
+        gpuBuffer(s0.backendTensor),
+        gpuBuffer(s1.backendTensor),
+        gpuBuffer(s2.backendTensor),
+        gpuBuffer(s3.backendTensor),
+      ],
+      numElements,
+    });
+    nodes.push(adamNode);
+    storages.push([s0, s1, s2, s3]);
+  }
+
+  if (packedItems.length === 0) return;
+
+  // Packed dispatch: scatter→dispatch→gather for groups of ≥2 same-size params
+  const config = nodes[0].payload as AdamStepConfig;
+  const infFlagBuffer = (config.infFlagBuffer as GPUBuffer | null) ?? null;
+  const handled = dispatchPackedOptimizer({
+    items: packedItems,
+    gatherIndices: [1, 2, 3], // gather param, m, v (not grad)
+    dispatch(packed, totalElements) {
+      dispatchAdamStep(
+        packed[0],
+        packed[1],
+        packed[2],
+        packed[3],
+        totalElements,
+        config,
+        false,
+        infFlagBuffer,
+      );
+    },
+    label: "packedAdam",
+  });
+
+  // Create result StorageHandles for packed items (data updated in-place via gather)
+  for (const i of handled) {
+    assignPackedAdamResult(nodes[i], storages[i]);
+    // Evict stale f16 weight cache entries (param data changed in-place)
+    const paramBuf = packedItems[i].buffers[1];
+    const oldF16 = f16WeightCache.get(paramBuf);
+    if (oldF16) {
+      bufferPool.deferredDestroy(oldF16, oldF16.size);
+      f16WeightCache.delete(paramBuf);
+    }
+  }
+
+  // Fall through: dispatch remaining singles via per-param adamOp
+  for (let i = 0; i < packedItems.length; i++) {
+    if (handled.has(i)) continue;
+    const adamNode = nodes[i];
+    const [s0, s1, s2, s3] = storages[i];
     const adamPayload = adamNode.payload as AdamStepConfig;
     const adamResult = await adamOp(
       s0.backendTensor,
@@ -178,23 +252,76 @@ async function executeAdamBatchInner(
       s3.backendTensor,
       adamPayload,
     );
-    // Adam is in-place: param buffer is returned as result.
-    // Set ownsBuffer: false since the buffer is shared with the input.
-    const paramResult = adamResult.param;
-    const paramOwns = paramResult.ownsBuffer;
-    const finalResult =
-      paramOwns === true ? { ...paramResult, ownsBuffer: false } : paramResult;
-    // Side outputs (m, v) — create storage handles
-    const mStorage = createStorageHandle(adamNode.device, adamResult.m);
-    const vStorage = createStorageHandle(adamNode.device, adamResult.v);
-    const sideOutputs = { m: mStorage, v: vStorage };
-    storageTracker.markReachable(mStorage.id, sideOutputs);
-    storageTracker.markReachable(vStorage.id, sideOutputs);
-    if (!adamNode._sideOutputs) adamNode._sideOutputs = {};
-    adamNode._sideOutputs.adamMV = sideOutputs;
-    // Adam param is always input[1] — use s1.id directly (no findIndex)
-    adamNode.result = createStorageHandle(adamNode.device, finalResult, s1.id);
+    assignPerParamAdamResult(adamNode, s1, adamResult);
   }
+}
+
+/** Assign result + side outputs for a param updated by packed dispatch (in-place via gather copy). */
+function assignPackedAdamResult(
+  adamNode: LazyIRNode,
+  [, s1, s2, s3]: [StorageHandle, StorageHandle, StorageHandle, StorageHandle],
+): void {
+  // Param: same buffer, ownsBuffer: false since buffer is shared with s1
+  adamNode.result = createStorageHandle(
+    adamNode.device,
+    { ...(s1.backendTensor as Record<string, unknown>), ownsBuffer: false },
+    s1.id,
+  );
+
+  // m/v: transfer ownership from old tensors to new ones
+  // 1. DecRef old (undoes the incRef from the original createTensor)
+  // 2. Noop old destroy (prevents double-free when old storage is GC'd)
+  // 3. Create new tensor wrapping same buffer (does incRef)
+  const mBT = s2.backendTensor as {
+    buffer: GPUBuffer;
+    shape: number[];
+    dtype: DType;
+    ownsBuffer?: boolean;
+    destroy?: () => void;
+  };
+  const vBT = s3.backendTensor as {
+    buffer: GPUBuffer;
+    shape: number[];
+    dtype: DType;
+    ownsBuffer?: boolean;
+    destroy?: () => void;
+  };
+
+  if (mBT.ownsBuffer) bufferPool.decRef(mBT.buffer);
+  if (vBT.ownsBuffer) bufferPool.decRef(vBT.buffer);
+  mBT.destroy = () => {};
+  vBT.destroy = () => {};
+
+  const newM = createTensor(mBT.shape, mBT.buffer, undefined, 0, mBT.dtype);
+  const newV = createTensor(vBT.shape, vBT.buffer, undefined, 0, vBT.dtype);
+
+  const mStorage = createStorageHandle(adamNode.device, newM);
+  const vStorage = createStorageHandle(adamNode.device, newV);
+  const sideOutputs = { m: mStorage, v: vStorage };
+  storageTracker.markReachable(mStorage.id, sideOutputs);
+  storageTracker.markReachable(vStorage.id, sideOutputs);
+  if (!adamNode._sideOutputs) adamNode._sideOutputs = {};
+  adamNode._sideOutputs.adamMV = sideOutputs;
+}
+
+/** Assign result + side outputs for a param updated by per-param adamOp (standard path). */
+function assignPerParamAdamResult(
+  adamNode: LazyIRNode,
+  s1: StorageHandle,
+  adamResult: { param: BackendTensor; m: BackendTensor; v: BackendTensor },
+): void {
+  const paramResult = adamResult.param;
+  const paramOwns = (paramResult as { ownsBuffer?: boolean }).ownsBuffer;
+  const finalResult =
+    paramOwns === true ? { ...paramResult, ownsBuffer: false } : paramResult;
+  const mStorage = createStorageHandle(adamNode.device, adamResult.m);
+  const vStorage = createStorageHandle(adamNode.device, adamResult.v);
+  const sideOutputs = { m: mStorage, v: vStorage };
+  storageTracker.markReachable(mStorage.id, sideOutputs);
+  storageTracker.markReachable(vStorage.id, sideOutputs);
+  if (!adamNode._sideOutputs) adamNode._sideOutputs = {};
+  adamNode._sideOutputs.adamMV = sideOutputs;
+  adamNode.result = createStorageHandle(adamNode.device, finalResult, s1.id);
 }
 
 /** Create a StorageHandle from arena buffer metadata (ownsBuffer: false, no-op destroy). */
