@@ -16,13 +16,19 @@ import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
 import { createTileKernelDispatcher } from "./tile-dispatch";
-import { ceilDivGrid, perRowKernel, type TileKernelSpec } from "./tile-ir";
+import {
+  ceilDivGrid,
+  perRowKernel,
+  type TileKernelSpec,
+  tiledGrid,
+} from "./tile-ir";
 import { onTeardown, requireContext } from "./webgpu-state";
 
 // ============================================================================
-// Row Stats Temp Buffer Cache (persistent, keyed by numRows)
+// Temp Buffer Caches (persistent, reused across steps)
 // ============================================================================
 
+/** Row stats (mean, inv_std): keyed by numRows. */
 const rowStatsTempCache = new Map<
   number,
   { meanBuffer: GPUBuffer; invStdBuffer: GPUBuffer }
@@ -46,6 +52,36 @@ function getOrCreateRowStatsTempBuffers(
       }),
     };
     rowStatsTempCache.set(numRows, entry);
+  }
+  return entry;
+}
+
+/** GradWB partial sums: keyed by `${numRowTiles}:${featureDim}`. */
+const gradWBPartialCache = new Map<
+  string,
+  { partialGW: GPUBuffer; partialGB: GPUBuffer }
+>();
+
+function getOrCreateGradWBPartials(
+  device: GPUDevice,
+  numRowTiles: number,
+  featureDim: number,
+): { partialGW: GPUBuffer; partialGB: GPUBuffer } {
+  const key = `${numRowTiles}:${featureDim}`;
+  let entry = gradWBPartialCache.get(key);
+  if (!entry) {
+    const size = numRowTiles * featureDim * 4; // f32
+    entry = {
+      partialGW: device.createBuffer({
+        size,
+        usage: GPUBufferUsage.STORAGE,
+      }),
+      partialGB: device.createBuffer({
+        size,
+        usage: GPUBufferUsage.STORAGE,
+      }),
+    };
+    gradWBPartialCache.set(key, entry);
   }
   return entry;
 }
@@ -215,41 +251,49 @@ const layerNormRowStatsSpec = perRowKernel({
 });
 
 /**
- * LayerNorm backward gradWeight + gradBias kernel (tile-IR).
- * One thread per feature, loops over all rows.
+ * LayerNorm backward gradWeight + gradBias: partial accumulation (tile-IR).
+ * 2D grid: [ceil(D/WG), numRowTiles]. Each workgroup accumulates over a
+ * tile of rows for WG features, writing partials to temp buffers.
  */
-const layerNormBackwardGradWeightBiasSpec: TileKernelSpec = {
-  name: "lnBwdGradWB",
+const ROWS_PER_TILE = 32;
+
+const lnBwdGradWBPartialSpec: TileKernelSpec = {
+  name: "lnBwdGradWBPartial",
   workgroupSize: WG,
   bindings: {
     grad_output: { storage: "read", type: "f32" },
     x: { storage: "read", type: "f32" },
     row_mean: { storage: "read", type: "f32" },
     row_inv_std: { storage: "read", type: "f32" },
-    grad_weight: { storage: "read_write", type: "f32" },
-    grad_bias: { storage: "read_write", type: "f32" },
+    partial_gw: { storage: "read_write", type: "f32" },
+    partial_gb: { storage: "read_write", type: "f32" },
   },
   uniforms: {
     num_rows: "u32",
     feature_dim: "u32",
-    eps: "f32",
+    num_row_tiles: "u32",
   },
-  grid: ceilDivGrid(WG, "feature_dim"),
+  grid: tiledGrid({
+    x: { uniform: "feature_dim", tileSize: WG },
+    y: "num_row_tiles",
+  }),
 
   kernel(ctx) {
     const featureIdx = ctx.globalId(0);
+    const rowTileIdx = ctx.programId(1);
     const D = ctx.uniform("feature_dim");
     const N = ctx.uniform("num_rows");
+    const RPT = ctx.u32(ROWS_PER_TILE);
 
-    // Early return if out of bounds
-    ctx.ifThen(featureIdx.ge(D), () => {
-      ctx.emitReturn();
-    });
+    ctx.ifThen(featureIdx.ge(D), () => ctx.emitReturn());
+
+    const rowStart = rowTileIdx.mul(RPT);
+    const rowEnd = rowStart.add(RPT).min(N);
 
     const accGW = ctx.emitVar("acc_gw", "f32", ctx.f32(0.0));
     const accGB = ctx.emitVar("acc_gb", "f32", ctx.f32(0.0));
 
-    ctx.forRange(ctx.u32(0), N, (row) => {
+    ctx.forRange(rowStart, rowEnd, (row) => {
       const base = row.mul(D);
       const go = ctx.load("grad_output", base.add(featureIdx));
       const normalized = ctx
@@ -260,16 +304,59 @@ const layerNormBackwardGradWeightBiasSpec: TileKernelSpec = {
       accGB.addAssign(go);
     });
 
-    const inBounds = featureIdx.lt(D);
-    ctx.guardedStore("grad_weight", inBounds, featureIdx, accGW.get());
-    ctx.guardedStore("grad_bias", inBounds, featureIdx, accGB.get());
+    const partialIdx = rowTileIdx.mul(D).add(featureIdx);
+    ctx.emitStore("partial_gw", partialIdx, accGW.get());
+    ctx.emitStore("partial_gb", partialIdx, accGB.get());
+  },
+};
+
+/**
+ * LayerNorm backward gradWeight + gradBias: reduction (tile-IR).
+ * 1D grid: [ceil(D/WG)]. Each thread sums partials across all row tiles.
+ */
+const lnBwdGradWBReduceSpec: TileKernelSpec = {
+  name: "lnBwdGradWBReduce",
+  workgroupSize: WG,
+  bindings: {
+    partial_gw: { storage: "read", type: "f32" },
+    partial_gb: { storage: "read", type: "f32" },
+    grad_weight: { storage: "read_write", type: "f32" },
+    grad_bias: { storage: "read_write", type: "f32" },
+  },
+  uniforms: {
+    feature_dim: "u32",
+    num_row_tiles: "u32",
+  },
+  grid: ceilDivGrid(WG, "feature_dim"),
+
+  kernel(ctx) {
+    const featureIdx = ctx.globalId(0);
+    const D = ctx.uniform("feature_dim");
+    const numTiles = ctx.uniform("num_row_tiles");
+
+    ctx.ifThen(featureIdx.ge(D), () => ctx.emitReturn());
+
+    const sumGW = ctx.emitVar("sum_gw", "f32", ctx.f32(0.0));
+    const sumGB = ctx.emitVar("sum_gb", "f32", ctx.f32(0.0));
+
+    ctx.forRange(ctx.u32(0), numTiles, (t) => {
+      const idx = t.mul(D).add(featureIdx);
+      sumGW.addAssign(ctx.load("partial_gw", idx));
+      sumGB.addAssign(ctx.load("partial_gb", idx));
+    });
+
+    ctx.emitStore("grad_weight", featureIdx, sumGW.get());
+    ctx.emitStore("grad_bias", featureIdx, sumGB.get());
   },
 };
 
 const gradXTileKernel = createTileKernelDispatcher(layerNormBackwardGradXSpec);
 const rowStatsTileKernel = createTileKernelDispatcher(layerNormRowStatsSpec);
-const gradWBTileKernel = createTileKernelDispatcher(
-  layerNormBackwardGradWeightBiasSpec,
+const gradWBPartialTileKernel = createTileKernelDispatcher(
+  lnBwdGradWBPartialSpec,
+);
+const gradWBReduceTileKernel = createTileKernelDispatcher(
+  lnBwdGradWBReduceSpec,
 );
 
 // ============================================================================
@@ -331,9 +418,11 @@ export function dispatchLayerNormBackwardGradX(
 
 /**
  * Dispatch fused LayerNorm backward gradWeight + gradBias kernel.
- * Two-pass approach:
+ * Three-pass approach:
  *   Pass 1: Compute row stats (mean, inv_std) for all N rows
- *   Pass 2: Accumulate gradWeight/gradBias using precomputed stats (no barriers)
+ *   Pass 2: 2D partial accumulation — each workgroup handles ROWS_PER_TILE rows
+ *           for WG features, writing partials to temp buffers
+ *   Pass 3: Reduce partials across row tiles → final gradWeight/gradBias
  *
  * grad_output [N, D] + x [N, D] → grad_weight [D] + grad_bias [D]
  */
@@ -358,21 +447,40 @@ export function dispatchLayerNormBackwardGradWeightBias(
     { num_rows: numRows, feature_dim: featureDim, eps },
   );
 
-  // Pass 2: Accumulate gradWeight/gradBias using precomputed stats
-  const featureSizeBytes = featureDim * 4;
-  const gradWeightBuffer = allocateOutputBuffer(featureSizeBytes);
-  const gradBiasBuffer = allocateOutputBuffer(featureSizeBytes);
+  const numRowTiles = Math.ceil(numRows / ROWS_PER_TILE);
 
-  gradWBTileKernel.dispatch(
+  // Pass 2: 2D partial accumulation
+  const { partialGW, partialGB } = getOrCreateGradWBPartials(
+    device,
+    numRowTiles,
+    featureDim,
+  );
+
+  gradWBPartialTileKernel.dispatch(
     {
       grad_output: gradOutputBuffer,
       x: xBuffer,
       row_mean: meanBuffer,
       row_inv_std: invStdBuffer,
+      partial_gw: partialGW,
+      partial_gb: partialGB,
+    },
+    { num_rows: numRows, feature_dim: featureDim, num_row_tiles: numRowTiles },
+  );
+
+  // Pass 3: Reduce partials → final output
+  const featureSizeBytes = featureDim * 4;
+  const gradWeightBuffer = allocateOutputBuffer(featureSizeBytes);
+  const gradBiasBuffer = allocateOutputBuffer(featureSizeBytes);
+
+  gradWBReduceTileKernel.dispatch(
+    {
+      partial_gw: partialGW,
+      partial_gb: partialGB,
       grad_weight: gradWeightBuffer,
       grad_bias: gradBiasBuffer,
     },
-    { num_rows: numRows, feature_dim: featureDim, eps },
+    { feature_dim: featureDim, num_row_tiles: numRowTiles },
   );
 
   return { gradWeightBuffer, gradBiasBuffer };
@@ -385,11 +493,17 @@ export function resetLayerNormKernelState(): void {
   fwdTileKernel.reset();
   gradXTileKernel.reset();
   rowStatsTileKernel.reset();
-  gradWBTileKernel.reset();
+  gradWBPartialTileKernel.reset();
+  gradWBReduceTileKernel.reset();
   for (const entry of rowStatsTempCache.values()) {
     entry.meanBuffer.destroy();
     entry.invStdBuffer.destroy();
   }
   rowStatsTempCache.clear();
+  for (const entry of gradWBPartialCache.values()) {
+    entry.partialGW.destroy();
+    entry.partialGB.destroy();
+  }
+  gradWBPartialCache.clear();
 }
 onTeardown(resetLayerNormKernelState);
