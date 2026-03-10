@@ -1,11 +1,11 @@
 import type { BackendTensor, DeviceKind, DType } from "../backend/types";
-import { getProfileModule } from "../backend/webgpu/profiler";
 import type {
   LazyIRNode,
   LazyOpCode,
   LazyRef,
   StorageHandle,
 } from "./lazy-types";
+import { getProfileModule } from "./profiler";
 import { storageTracker } from "./storage-tracker";
 
 // ============================================================================

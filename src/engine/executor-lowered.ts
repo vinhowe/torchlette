@@ -40,11 +40,6 @@ import {
   gpuBuffer,
 } from "../backend/webgpu/gpu-types";
 import type { EpilogueConfig } from "../backend/webgpu/matmul/types";
-import {
-  profileOpBegin,
-  profileOpEnd,
-  setProfileModule,
-} from "../backend/webgpu/profiler";
 import { createTensor } from "../backend/webgpu/tensor";
 import { contiguousStrides, shapesEqual } from "../core/shape";
 import {
@@ -83,6 +78,7 @@ import {
 } from "./node-factory";
 import { executeOp, getInputStorage, withProfileContext } from "./op-dispatch";
 import { pretunePlanMatmuls } from "./plan-builder";
+import { profileOpBegin, profileOpEnd, setProfileModule } from "./profiler";
 import type { ReductionGroup } from "./reduction-detect";
 import {
   executeCompoundSoftmax,

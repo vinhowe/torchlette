@@ -1,3 +1,4 @@
+import { OP_REGISTRY } from "../backend/op-registry";
 import { getBackend } from "../backend/registry";
 import type {
   AdamStepConfig,
@@ -6,16 +7,16 @@ import type {
   DeviceKind,
   DType,
 } from "../backend/types";
-import { getCurrentOpLabel, setCurrentOpLabel } from "../backend/webgpu";
-import { OP_REGISTRY } from "../backend/webgpu/ops/registry";
-import {
-  profileOpBegin,
-  profileOpEnd,
-  setProfileModule,
-} from "../backend/webgpu/profiler";
 import { sizeOf } from "../core/shape";
 import type { LazyIRNode, LazyRef, StorageHandle } from "./lazy-types";
 import { createStorageHandle } from "./node-factory";
+import {
+  getCurrentOpLabel,
+  profileOpBegin,
+  profileOpEnd,
+  setCurrentOpLabel,
+  setProfileModule,
+} from "./profiler";
 import { storageTracker } from "./storage-tracker";
 
 /**

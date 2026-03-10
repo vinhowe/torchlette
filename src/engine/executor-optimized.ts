@@ -8,11 +8,6 @@ import {
   setActiveArena,
   setArenaExternalInputBuffers,
 } from "../backend/webgpu";
-import {
-  isProfilingEnabled,
-  type PlanAnalysis,
-  recordPlanAnalysis,
-} from "../backend/webgpu/profiler";
 import type { CompoundMatch } from "./compound-patterns";
 import { collectExternalInputBuffers } from "./executor-lowered";
 import { executePlan } from "./executor-sequential";
@@ -31,6 +26,11 @@ import type { TensorLifetime } from "./lifetime-analysis";
 import { type LoweredPlan, LoweredPlanBuilder } from "./lowered-plan";
 import type { MatmulPrologueInfo } from "./matmul-epilogue";
 import { initLifetimeAnalysis, pretunePlanMatmuls } from "./plan-builder";
+import {
+  isProfilingEnabled,
+  type PlanAnalysis,
+  recordPlanAnalysis,
+} from "./profiler";
 import type { ReductionGroup } from "./reduction-detect";
 import {
   type CompoundMatchExec,

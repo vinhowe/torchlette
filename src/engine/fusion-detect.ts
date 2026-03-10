@@ -11,6 +11,7 @@
  * - Fused groups must have 2+ ops to be worthwhile
  */
 
+import { OP_REGISTRY } from "../backend/op-registry";
 import type { DType } from "../backend/types";
 import type {
   FusedInput,
@@ -18,7 +19,6 @@ import type {
   FusedNode,
   FusedOutput,
 } from "../backend/webgpu/fusion-types";
-import { OP_REGISTRY } from "../backend/webgpu/ops/registry";
 import { shapesEqual } from "../core/shape";
 import type { LazyIRNode, LazyRef } from "./lazy-types";
 import type { ReductionGroup } from "./reduction-detect";
