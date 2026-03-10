@@ -233,6 +233,8 @@ export class Block {
   readonly smemStride: number;
   /** @internal Shared memory element type ("f16" for native f16 storage, "f32" default). */
   readonly smemElemType: DataType;
+  /** @internal True if shared memory uses array<vec4<f32>> layout. */
+  readonly smemVec4: boolean;
 
   constructor(
     readonly placement: "register" | "shared",
@@ -245,11 +247,13 @@ export class Block {
     origCols?: number,
     smemStride?: number,
     smemElemType?: DataType,
+    smemVec4?: boolean,
   ) {
     this._origRows = origRows ?? rows;
     this._origCols = origCols ?? cols;
     this.smemStride = smemStride ?? cols;
     this.smemElemType = smemElemType ?? "f32";
+    this.smemVec4 = smemVec4 ?? false;
   }
 
   get transposed(): boolean {
@@ -291,6 +295,8 @@ export class Block {
       this._origRows,
       this._origCols,
       this.smemStride,
+      this.smemElemType,
+      this.smemVec4,
     );
     b._transposed = !this._transposed;
     return b;
@@ -560,11 +566,27 @@ export class BlockOps {
       const smemElemType: DataType =
         opts.smemElemType ?? (bindingType === "f16" ? "f16" : "f32");
       const smemStride = cols;
-      this.ctx.sharedArrays.push({
-        name,
-        size: rows * smemStride,
-        elemType: smemElemType,
-      });
+      // Auto-detect vec4 shared memory: same criteria as loadTile.
+      // Skip for matmul (threadTileM set): the shared×shared dot K-loop
+      // reads individual scalars, and vec4 component extraction overhead
+      // outweighs cooperative load savings (benchmarked: +17-36% regression).
+      const useVec4Smem =
+        cols % 4 === 0 &&
+        smemElemType === "f32" &&
+        smemStride % 4 === 0 &&
+        !this.threadTileM;
+      if (useVec4Smem) {
+        this.ctx.vec4SharedArrays.push({
+          name,
+          size: (rows * smemStride) / 4,
+        });
+      } else {
+        this.ctx.sharedArrays.push({
+          name,
+          size: rows * smemStride,
+          elemType: smemElemType,
+        });
+      }
       this.ctx.pushStatement({
         kind: "blockLoad",
         binding,
@@ -587,6 +609,7 @@ export class BlockOps {
           innerBound: ptr.innerBound.node,
         },
         smemElemType: smemElemType !== bindingType ? smemElemType : undefined,
+        smemVec4: useVec4Smem || undefined,
       });
       return new Block(
         "shared",
@@ -599,6 +622,7 @@ export class BlockOps {
         undefined,
         smemStride,
         smemElemType,
+        useVec4Smem,
       );
     }
   }
@@ -849,6 +873,7 @@ export class BlockOps {
         elemType: bindingType,
         smemElemType: smemElemType !== bindingType ? smemElemType : undefined,
         smemStride: smemStride !== tileCols ? smemStride : undefined,
+        smemVec4: reuse.smemVec4 || undefined,
       });
 
       return new Block(
@@ -862,6 +887,7 @@ export class BlockOps {
         undefined,
         smemStride,
         smemElemType,
+        reuse.smemVec4,
       );
     }
 
@@ -872,12 +898,27 @@ export class BlockOps {
     const smemElemType: DataType =
       opts?.smemElemType ?? (bindingType === "f16" ? "f16" : "f32");
 
+    // Use vec4 shared memory when: cols divisible by 4, f32 type, no padding.
+    // Skip for matmul (threadTileM set) — see load() comment for rationale.
+    const useVec4Smem =
+      tileCols % 4 === 0 &&
+      smemElemType === "f32" &&
+      smemStride % 4 === 0 &&
+      !this.threadTileM;
+
     // Declare shared memory
-    this.ctx.sharedArrays.push({
-      name,
-      size: tileRows * smemStride,
-      elemType: smemElemType,
-    });
+    if (useVec4Smem) {
+      this.ctx.vec4SharedArrays.push({
+        name,
+        size: (tileRows * smemStride) / 4,
+      });
+    } else {
+      this.ctx.sharedArrays.push({
+        name,
+        size: tileRows * smemStride,
+        elemType: smemElemType,
+      });
+    }
 
     this.ctx.pushStatement({
       kind: "tileLoad",
@@ -890,6 +931,7 @@ export class BlockOps {
       elemType: bindingType,
       smemElemType: smemElemType !== bindingType ? smemElemType : undefined,
       smemStride: padding > 0 ? smemStride : undefined,
+      smemVec4: useVec4Smem || undefined,
     });
 
     return new Block(
@@ -903,6 +945,7 @@ export class BlockOps {
       undefined,
       smemStride,
       smemElemType,
+      useVec4Smem,
     );
   }
 

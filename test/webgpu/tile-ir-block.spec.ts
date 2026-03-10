@@ -344,6 +344,77 @@ describe("Block API WGSL compilation", () => {
     expect(wgsl).toContain("max(");
     expect(wgsl).toContain("exp(");
   });
+
+  it("dot QK^T uses vec4 shared memory when D%4==0", () => {
+    const wgsl = compileTileKernel(makeDotQKTSpec(64, 32));
+    // Shared memory should be declared as vec4
+    expect(wgsl).toContain("array<vec4<f32>,");
+    // Dot should use native dot() with vec4 shared reads
+    expect(wgsl).toMatch(/dot\(vec4<f32>\(/);
+  });
+
+  it("dot QK^T falls back to scalar shared when D%4!=0", () => {
+    const wgsl = compileTileKernel(makeDotQKTSpec(6, 4));
+    // Shared memory should be scalar f32
+    expect(wgsl).toContain("array<f32,");
+    // Should NOT have vec4 shared declarations
+    expect(wgsl).not.toContain("array<vec4<f32>,");
+  });
+
+  it("dot PV uses vec4 shared memory when D%4==0", () => {
+    const wgsl = compileTileKernel(makeDotPVSpec(64, 32));
+    expect(wgsl).toContain("array<vec4<f32>,");
+    // Component access from vec4 reads
+    expect(wgsl).toMatch(/\.x|\.y|\.z|\.w/);
+  });
+
+  it("dot PV falls back to scalar shared when D%4!=0", () => {
+    const wgsl = compileTileKernel(makeDotPVSpec(6, 4));
+    expect(wgsl).toContain("array<f32,");
+    expect(wgsl).not.toContain("array<vec4<f32>,");
+  });
+
+  it("matmul shared×shared dot uses scalar shared memory (vec4 causes regression)", () => {
+    const spec = createTiledMatmulKernel({
+      config: {
+        tileM: 32,
+        tileN: 32,
+        tileK: 16,
+        threadTileM: 4,
+        threadTileN: 4,
+        useSubgroups: false,
+        vectorWidth: 1,
+      },
+      transposeMode: "NN",
+      dtype: "f32",
+      batched: false,
+    });
+    const wgsl = compileTileKernel(spec);
+    // Matmul uses scalar shared memory — vec4 component extraction in the
+    // K-loop causes 17-36% regression (benchmarked on V100)
+    expect(wgsl).toContain("array<f32,");
+    expect(wgsl).not.toContain("array<vec4<f32>,");
+  });
+
+  it("matmul uses scalar shared memory with f16 dtype", () => {
+    const spec = createTiledMatmulKernel({
+      config: {
+        tileM: 32,
+        tileN: 32,
+        tileK: 16,
+        threadTileM: 4,
+        threadTileN: 4,
+        useSubgroups: false,
+        vectorWidth: 1,
+      },
+      transposeMode: "NN",
+      dtype: "f16",
+      batched: false,
+    });
+    const wgsl = compileTileKernel(spec);
+    expect(wgsl).not.toContain("array<vec4<f32>,");
+    expect(wgsl).toContain("array<f16,");
+  });
 });
 
 // ============================================================================
