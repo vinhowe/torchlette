@@ -497,3 +497,55 @@ export interface Backend {
   beginStep?(): void | Promise<void>;
   endStep?(): void;
 }
+
+// ============================================================================
+// FusedBackend — extended interface for backends with fused execution support
+// ============================================================================
+
+/**
+ * Extended backend interface for backends that support fused kernel dispatch.
+ *
+ * Adds shared command encoder lifecycle, buffer pool management, and arena
+ * support that enable the engine to orchestrate optimized execution without
+ * importing backend-specific modules directly.
+ *
+ * Currently implemented by the WebGPU backend. A future Metal or Vulkan
+ * backend could implement this interface to get fusion/batching/arena
+ * support from the engine layer automatically.
+ */
+export interface FusedBackend extends Backend {
+  /** Begin a shared command encoder scope. Nested calls increment a depth counter. */
+  beginSharedEncoder(): void;
+  /** End a shared command encoder scope. Submits when depth reaches 0. */
+  endSharedEncoder(): void;
+  /** Flush the current shared encoder (submit commands) without closing the scope. */
+  flushSharedEncoder(): void;
+  /** Move pending-release buffers back to the main pool for reuse. */
+  flushBufferPool(): void;
+
+  /** Enable/disable Adam batch mode (suppresses per-op encoder flushes). */
+  setAdamBatchMode(enabled: boolean): void;
+
+  /** Activate a buffer arena for stable buffer identity across steps. */
+  setActiveArena(arena: unknown): void;
+  /** Deactivate the buffer arena. */
+  clearActiveArena(): void;
+  /** Set external input buffer mappings for arena resolution. */
+  setArenaExternalInputBuffers(buffers: Map<unknown, unknown>): void;
+  /** Clear external input buffer mappings. */
+  clearArenaExternalInputBuffers(): void;
+
+  /** Begin a batch execution scope (for checkpoint segmentation with GPU sync). */
+  beginBatchExecution(): void;
+  /** End batch execution and wait for GPU completion. */
+  endBatchExecution(): Promise<void>;
+  /** Check if a batch execution scope is active. */
+  isBatchActive(): boolean;
+  /** Abort the current batch execution scope. */
+  abortBatch(): void;
+}
+
+/** Type guard: check if a backend supports fused execution (shared encoder, arena, etc.). */
+export function isFusedBackend(backend: Backend): backend is FusedBackend {
+  return "beginSharedEncoder" in backend;
+}

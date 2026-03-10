@@ -137,7 +137,14 @@ import { registerBackend } from "../registry";
 // ============================================================================
 // Imports used locally (for webgpuBackend object and remaining wiring)
 // ============================================================================
-import type { Backend } from "../types";
+import type { FusedBackend } from "../types";
+import {
+  clearActiveArena,
+  clearArenaExternalInputBuffers,
+  setActiveArena,
+  setArenaExternalInputBuffers,
+} from "./buffer-arena";
+import { flushBufferPool } from "./buffer-pool";
 import { dispatchFusedKernel } from "./fusion-dispatch";
 import type { GPUDevice } from "./gpu-types";
 import { pretuneMatmulShapes as pretuneShapes } from "./matmul/dispatch";
@@ -218,7 +225,18 @@ import {
   transpose,
 } from "./ops/views";
 import { where } from "./ops/where";
-import { beginStep, endStep } from "./shared-encoder";
+import {
+  abortBatch,
+  beginBatchExecution,
+  beginSharedEncoder,
+  beginStep,
+  endBatchExecution,
+  endSharedEncoder,
+  endStep,
+  flushSharedEncoder,
+  isBatchActive,
+  setAdamBatchMode,
+} from "./shared-encoder";
 import { gpuContext } from "./webgpu-state";
 
 // Wire up creation.ts contiguous injection callback (the sole remaining callback —
@@ -229,12 +247,10 @@ _setContiguous(contiguous as any);
 // ============================================================================
 // webgpuBackend object
 // ============================================================================
-export const webgpuBackend: Backend & {
+export const webgpuBackend: FusedBackend & {
   waitForGPU: typeof waitForGPU;
   mulScalarInPlace: typeof mulScalarInPlace;
   dispatchFusedKernel: typeof dispatchFusedKernel;
-  beginStep: typeof beginStep;
-  endStep: typeof endStep;
   device: GPUDevice | null;
 } = {
   name: "webgpu",
@@ -245,6 +261,25 @@ export const webgpuBackend: Backend & {
   },
   // Fusion dispatch (§15.1, §15.2, §15.3)
   dispatchFusedKernel,
+
+  // FusedBackend: shared encoder lifecycle
+  beginSharedEncoder,
+  endSharedEncoder,
+  flushSharedEncoder,
+  flushBufferPool,
+  setAdamBatchMode,
+
+  // FusedBackend: buffer arena management
+  setActiveArena,
+  clearActiveArena,
+  setArenaExternalInputBuffers,
+  clearArenaExternalInputBuffers,
+
+  // FusedBackend: batch execution (checkpoint segmentation)
+  beginBatchExecution,
+  endBatchExecution,
+  isBatchActive,
+  abortBatch,
   ops: {
     tensorFromArray,
     zeros,
