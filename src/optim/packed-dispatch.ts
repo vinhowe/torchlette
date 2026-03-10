@@ -15,12 +15,12 @@
  * scatter/gather encoding.
  */
 
-import { requireContext } from "../backend/webgpu/gpu-context";
 import type { GPUBuffer } from "../backend/webgpu/gpu-types";
 import { STORAGE_BUFFER_USAGE } from "../backend/webgpu/gpu-types";
 import { profileSubOpBegin, profileSubOpEnd } from "../backend/webgpu/profiler";
 import { alignBufferSize } from "../backend/webgpu/shape-utils";
 import { getSharedEncoderInstance } from "../backend/webgpu/shared-encoder";
+import { onTeardown, requireContext } from "../backend/webgpu/webgpu-state";
 
 /**
  * Maximum packed buffer size before sub-batching (512 MB).
@@ -76,13 +76,14 @@ function getPackedBuffers(count: number, alignedBytes: number): GPUBuffer[] {
   return bufs;
 }
 
-/** Release all cached packed buffers. Called from destroyWebGPU(). */
-export function resetPackedOptimizerCache(): void {
+/** Release all cached packed buffers. */
+function resetPackedOptimizerCache(): void {
   for (const bufs of packedBufferCache.values()) {
     for (const buf of bufs) buf.destroy();
   }
   packedBufferCache.clear();
 }
+onTeardown(resetPackedOptimizerCache);
 
 // ---------------------------------------------------------------------------
 // Core dispatch

@@ -2,13 +2,8 @@
  * GPU context management: initialization, device lifecycle, f16 support.
  */
 
-import { resetPackedOptimizerCache } from "../../optim/packed-dispatch";
-import { resetAdamKernelState } from "./adam-kernel";
-import { resetAttentionKernelState } from "./attention-kernel";
 import { clearBindGroupCache } from "./bind-group-cache";
 import { bufferPool, destroyProfilingFenceBuffer } from "./buffer-pool";
-import { resetCrossEntropyKernelState } from "./cross-entropy-kernel";
-import { resetFusionCache } from "./fusion-dispatch";
 import type {
   GPUAdapter,
   GPUBuffer,
@@ -17,8 +12,6 @@ import type {
   WebGPUModule,
   WebGPUProvider,
 } from "./gpu-types";
-import { resetLayerNormKernelState } from "./layernorm-kernel";
-import { resetMatmulState } from "./matmul/dispatch";
 import { type SubgroupSupport, setSubgroupSupport } from "./matmul/types";
 import {
   clearWarmupCache,
@@ -27,11 +20,13 @@ import {
   warmupPipelines,
 } from "./pipeline-warmup";
 import { initGpuTimestamps, isProfilingEnabled } from "./profiler";
-import { resetRMSNormKernelState } from "./rmsnorm-kernel";
 import { setSharedEncoderEnabled } from "./shared-encoder";
-import { resetSoftmaxKernelState } from "./softmax-kernel";
-import { resetUnscaleKernelState } from "./unscale-kernel";
-import { gpuContext, requireContext, setGpuContext } from "./webgpu-state";
+import {
+  gpuContext,
+  requireContext,
+  runTeardownCallbacks,
+  setGpuContext,
+} from "./webgpu-state";
 
 // Re-export from webgpu-state
 export { requireContext } from "./webgpu-state";
@@ -418,28 +413,6 @@ export async function initWebGPU(): Promise<boolean> {
 }
 
 // ============================================================================
-// Kernel Cache Reset
-// ============================================================================
-
-/**
- * Reset all kernel pipeline caches and associated mutable state.
- * Called by destroyWebGPU() for full cleanup, and can be called
- * independently for test isolation.
- */
-function resetAllKernelCaches(): void {
-  resetAttentionKernelState();
-  resetLayerNormKernelState();
-  resetRMSNormKernelState();
-  resetSoftmaxKernelState();
-  resetCrossEntropyKernelState();
-  resetAdamKernelState();
-  resetPackedOptimizerCache();
-  resetUnscaleKernelState();
-  resetMatmulState();
-  resetFusionCache();
-}
-
-// ============================================================================
 // syncWebGPU / destroyWebGPU / getWebGPUDevice / requireContext
 // ============================================================================
 
@@ -464,7 +437,7 @@ export function destroyWebGPU(): void {
   }
   f16WeightCache.clear();
   clearBindGroupCache();
-  resetAllKernelCaches();
+  runTeardownCallbacks();
   clearWarmupCache();
   destroyProfilingFenceBuffer();
   (gpuContext.device as unknown as { destroy(): void }).destroy();

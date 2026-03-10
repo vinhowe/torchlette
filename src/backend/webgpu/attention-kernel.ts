@@ -24,7 +24,11 @@ import { F32_NEG_MAX, WORKGROUP_SIZE } from "./shape-utils";
 import { compileTileKernel } from "./tile-compiler";
 import type { TileKernelSpec } from "./tile-ir";
 import { tiledGrid } from "./tile-ir";
-import { requireContext, trackSharedEncoderWrite } from "./webgpu-state";
+import {
+  onTeardown,
+  requireContext,
+  trackSharedEncoderWrite,
+} from "./webgpu-state";
 
 // ============================================================================
 // Tiling Parameters
@@ -688,3 +692,4 @@ export function resetAttentionKernelState(): void {
   configCache.clear();
   tileIRWGSLCache.clear();
 }
+onTeardown(resetAttentionKernelState);

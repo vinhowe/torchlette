@@ -16,6 +16,7 @@ import type { GPUBuffer } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
 import { createTileKernelDispatcher } from "./tile-dispatch";
 import { perRowKernel } from "./tile-ir";
+import { onTeardown } from "./webgpu-state";
 
 // ============================================================================
 // Tile IR Kernels
@@ -174,3 +175,4 @@ export function resetCrossEntropyKernelState(): void {
   ceFwdTileKernel.reset();
   ceBwdTileKernel.reset();
 }
+onTeardown(resetCrossEntropyKernelState);

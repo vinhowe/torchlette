@@ -19,7 +19,7 @@ import {
   type TileKernelInstance,
 } from "./tile-dispatch";
 import { perRowKernel, type TileKernelSpec } from "./tile-ir";
-import { requireContext } from "./webgpu-state";
+import { onTeardown, requireContext } from "./webgpu-state";
 
 const WG = WORKGROUP_SIZE; // 256
 
@@ -98,6 +98,7 @@ export function resetSoftmaxKernelState(): void {
   softmaxKernel = null;
   logSoftmaxKernel = null;
 }
+onTeardown(resetSoftmaxKernelState);
 
 // ============================================================================
 // Dispatch Functions
