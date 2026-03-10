@@ -83,19 +83,11 @@ import {
 } from "./node-factory";
 import { executeOp, getInputStorage, withProfileContext } from "./op-dispatch";
 import { pretunePlanMatmuls } from "./plan-builder";
-import type {
-  ReductionEpiloguePlan,
-  ReductionFusionPlan,
-  ReductionPreamblePlan,
-} from "./reduction-preamble";
-import {
-  executeReductionWithEpilogue,
-  executeReductionWithFusion,
-  executeReductionWithPreamble,
-} from "./reduction-preamble";
+import type { ReductionGroup } from "./reduction-detect";
 import {
   executeCompoundSoftmax,
   executeFusedSegment,
+  executeReductionSegment,
 } from "./segment-executors";
 import { storageTracker } from "./storage-tracker";
 
@@ -1128,56 +1120,65 @@ export async function executeLoweredPlan(
         }
 
         case "reduction-preamble": {
-          const preambleNode = planNodes[action.preambleNodeIndex];
-          const reductionNode = planNodes[action.reductionNodeIndex];
-          const chainNodes = action.chainNodeIndices.map((i) => planNodes[i]);
-          const externalInputRefs = collectChainExternalRefs(chainNodes);
-
-          const reductionPlan: ReductionPreamblePlan = {
-            preambleNode,
-            reductionNode,
-            isMean: reductionNode.op === "mean",
-            consumedCount: action.consumedCount,
-            preambleChain: chainNodes,
-            chainOps: action.chainOps,
-            chainInputRefs: externalInputRefs,
-            chainInputDtypes: action.chainInputDtypes,
+          const rpChainNodes = action.chainNodeIndices.map((i) => planNodes[i]);
+          const rpReductionNode = planNodes[action.reductionNodeIndex];
+          const rpGroup: ReductionGroup = {
+            nodes: [...rpChainNodes, rpReductionNode],
+            planIndices: [
+              ...action.chainNodeIndices,
+              action.reductionNodeIndex,
+            ],
+            reductionNode: rpReductionNode,
+            preambleNodes: rpChainNodes,
+            epilogueNodes: [],
+            outputNode: rpReductionNode,
+            preambleOps: action.chainOps,
+            preambleInputRefs: collectChainExternalRefs(rpChainNodes),
+            preambleInputDtypes: action.chainInputDtypes,
+            epilogueOps: [],
+            epilogueInputRefs: [],
+            outputDtype: rpReductionNode.dtype,
+            isMean: rpReductionNode.op === "mean",
           };
 
-          const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${chainNodes.map((n) => n.op).join("+")}`;
-          await withProfileContext(rpLabel, preambleNode.module, () =>
-            executeReductionWithPreamble(reductionPlan, backend),
+          const rpLabel = `${rpGroup.isMean ? "mean" : "sum"}+${rpChainNodes.map((n) => n.op).join("+")}`;
+          await withProfileContext(rpLabel, rpChainNodes[0].module, () =>
+            executeReductionSegment(rpGroup, backend),
           );
 
-          captureAndRecordResult(action.reductionNodeIndex, reductionNode);
+          captureAndRecordResult(action.reductionNodeIndex, rpReductionNode);
           break;
         }
 
         case "reduction-epilogue": {
           const reNode = planNodes[action.reductionNodeIndex];
           const reOutputNode = planNodes[action.outputNodeIndex];
-
-          // Reconstruct epilogue input refs by chain-walking covered nodes.
           const reEpilogueChainNodes = action.coveredNodeIndices
             .slice(1)
             .map((i) => planNodes[i]);
-          const reEpilogueInputRefs = collectChainExternalRefs(
-            reEpilogueChainNodes,
-            planNodes[action.coveredNodeIndices[0]].id,
-          );
 
-          const reEpiloguePlan: ReductionEpiloguePlan = {
+          const reGroup: ReductionGroup = {
+            nodes: action.coveredNodeIndices.map((i) => planNodes[i]),
+            planIndices: action.coveredNodeIndices,
             reductionNode: reNode,
-            epilogueOps: action.epilogueOps,
-            epilogueInputRefs: reEpilogueInputRefs,
-            outputDtype: action.outputDtype,
+            preambleNodes: [],
+            epilogueNodes: reEpilogueChainNodes,
             outputNode: reOutputNode,
-            consumedCount: action.consumedCount,
+            preambleOps: [],
+            preambleInputRefs: [],
+            preambleInputDtypes: [],
+            epilogueOps: action.epilogueOps,
+            epilogueInputRefs: collectChainExternalRefs(
+              reEpilogueChainNodes,
+              reNode.id,
+            ),
+            outputDtype: action.outputDtype,
+            isMean: reNode.op === "mean",
           };
 
           const reLabel = `${reNode.op}+${formatEpilogueLabel(action.epilogueOps)}`;
           await withProfileContext(reLabel, reNode.module, () =>
-            executeReductionWithEpilogue(reEpiloguePlan, backend),
+            executeReductionSegment(reGroup, backend),
           );
 
           captureAndRecordResult(action.outputNodeIndex, reOutputNode);
@@ -1185,44 +1186,43 @@ export async function executeLoweredPlan(
         }
 
         case "reduction-fusion": {
+          const rfReductionNode = planNodes[action.reductionNodeIndex];
           const rfOutputNode = planNodes[action.outputNodeIndex];
-
-          // Reconstruct preamble input refs by walking preamble chain nodes
           const rfPreambleNodes = action.preambleNodeIndices.map(
             (i) => planNodes[i],
           );
-          const rfPreambleInputRefs = collectChainExternalRefs(rfPreambleNodes);
-
-          // Reconstruct epilogue input refs by walking epilogue chain nodes
-          const rfReductionNode = planNodes[action.reductionNodeIndex];
           const rfEpilogueNodes = action.epilogueNodeIndices.map(
             (i) => planNodes[i],
           );
-          const rfEpilogueInputRefs = collectChainExternalRefs(
-            rfEpilogueNodes,
-            rfReductionNode.id,
-          );
 
-          const rfFusionPlan: ReductionFusionPlan = {
-            preambleChain: rfPreambleNodes,
+          const rfGroup: ReductionGroup = {
+            nodes: [...rfPreambleNodes, rfReductionNode, ...rfEpilogueNodes],
+            planIndices: [
+              ...action.preambleNodeIndices,
+              action.reductionNodeIndex,
+              ...action.epilogueNodeIndices,
+            ],
             reductionNode: rfReductionNode,
-            epilogueChain: rfEpilogueNodes,
+            preambleNodes: rfPreambleNodes,
+            epilogueNodes: rfEpilogueNodes,
             outputNode: rfOutputNode,
-            isMean: action.isMean,
             preambleOps: action.preambleOps,
-            preambleInputRefs: rfPreambleInputRefs,
+            preambleInputRefs: collectChainExternalRefs(rfPreambleNodes),
             preambleInputDtypes: action.preambleInputDtypes,
             epilogueOps: action.epilogueOps,
-            epilogueInputRefs: rfEpilogueInputRefs,
+            epilogueInputRefs: collectChainExternalRefs(
+              rfEpilogueNodes,
+              rfReductionNode.id,
+            ),
             outputDtype: action.outputDtype,
-            consumedCount: action.consumedCount,
+            isMean: action.isMean,
           };
 
           const rfLabel = `${action.isMean ? "mean" : "sum"}+${rfPreambleNodes
             .map((n) => n.op)
             .join("+")}+${formatEpilogueLabel(action.epilogueOps)}`;
           await withProfileContext(rfLabel, rfPreambleNodes[0].module, () =>
-            executeReductionWithFusion(rfFusionPlan, backend),
+            executeReductionSegment(rfGroup, backend),
           );
 
           captureAndRecordResult(action.outputNodeIndex, rfOutputNode);

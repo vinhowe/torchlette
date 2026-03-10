@@ -48,12 +48,7 @@ import {
   wrapResultAsStorage,
 } from "./node-factory";
 import { executeOp, getInputStorage, withProfileContext } from "./op-dispatch";
-import {
-  executeReductionWithEpilogue,
-  executeReductionWithFusion,
-  executeReductionWithPreamble,
-  type ReductionDirective,
-} from "./reduction-preamble";
+import type { ReductionGroup } from "./reduction-detect";
 import { releaseDeadTensors } from "./storage-tracker";
 
 /**
@@ -397,7 +392,6 @@ interface SegmentExecOptions {
   loweredPlanBuilder?: LoweredPlanBuilder | null;
   nodeIdToFinalPos?: Map<number, number>;
   compoundMatchMap?: Map<number, CompoundMatchExec>;
-  reductionDirectives?: Map<number, ReductionDirective>;
   matmulDirectives?: Map<number, MatmulEpiloguePlan>;
 }
 
@@ -420,7 +414,6 @@ export async function executeSequentialSegmentWithEarlyRelease(
     loweredPlanBuilder,
     nodeIdToFinalPos,
     compoundMatchMap,
-    reductionDirectives,
     matmulDirectives,
   } = options;
   const useSharedEncoder = backend.name === "webgpu";
@@ -581,116 +574,6 @@ export async function executeSequentialSegmentWithEarlyRelease(
         }
       }
 
-      // Try combined preamble + epilogue reduction fusion (Phase 5)
-      if (isFusibleOp(node.op) && backend.name === "webgpu") {
-        const rdDirective = reductionDirectives?.get(node.id);
-        const fusionPlan =
-          rdDirective?.kind === "fusion" ? rdDirective.plan : null;
-        if (fusionPlan) {
-          const fusionLabel = `${fusionPlan.isMean ? "mean" : "sum"}+${fusionPlan.preambleChain
-            .map((n) => n.op)
-            .join("+")}+${formatEpilogueLabel(fusionPlan.epilogueOps)}`;
-          await withProfileContext(fusionLabel, node.module, () =>
-            executeReductionWithFusion(fusionPlan, backend),
-          );
-
-          const consumed = fusionPlan.consumedCount;
-          advanceConsumed(nodeIdx, consumed);
-
-          if (loweredPlanBuilder && nodeIdToFinalPos) {
-            const preambleIndices = fusionPlan.preambleChain.map(
-              (n) => nodeIdToFinalPos.get(n.id) as number,
-            );
-            const epilogueIndices = fusionPlan.epilogueChain.map(
-              (n) => nodeIdToFinalPos.get(n.id) as number,
-            );
-            loweredPlanBuilder.recordReductionFusion(
-              preambleIndices,
-              nodeIdToFinalPos.get(fusionPlan.reductionNode.id) as number,
-              epilogueIndices,
-              nodeIdToFinalPos.get(fusionPlan.outputNode.id) as number,
-              fusionPlan.preambleOps,
-              fusionPlan.preambleInputDtypes,
-              fusionPlan.epilogueOps,
-              fusionPlan.outputDtype,
-              fusionPlan.consumedCount,
-              fusionPlan.isMean,
-            );
-          }
-
-          nodeIdx += consumed - 1;
-          continue;
-        }
-
-        // Preamble-only fusion (Phase 3)
-        const reductionPlan =
-          rdDirective?.kind === "preamble" ? rdDirective.plan : null;
-        if (reductionPlan) {
-          const rpLabel = `${reductionPlan.isMean ? "mean" : "sum"}+${reductionPlan.preambleChain.map((n) => n.op).join("+")}`;
-          await withProfileContext(rpLabel, node.module, () =>
-            executeReductionWithPreamble(reductionPlan, backend),
-          );
-
-          const consumed = reductionPlan.consumedCount;
-          advanceConsumed(nodeIdx, consumed);
-
-          if (loweredPlanBuilder && nodeIdToFinalPos) {
-            loweredPlanBuilder.recordReductionPreamble(
-              nodeIdToFinalPos.get(node.id) as number,
-              nodeIdToFinalPos.get(reductionPlan.reductionNode.id) as number,
-              reductionPlan.preambleChain.map(
-                (n) => nodeIdToFinalPos.get(n.id) as number,
-              ),
-              reductionPlan.chainOps,
-              reductionPlan.chainInputDtypes,
-              reductionPlan.consumedCount,
-            );
-          }
-
-          nodeIdx += consumed - 1;
-          continue;
-        }
-      }
-
-      // Try reduction epilogue fusion (Phase 4)
-      if (
-        (node.op === "sum" || node.op === "mean" || node.op === "max") &&
-        backend.name === "webgpu"
-      ) {
-        const reDirective = reductionDirectives?.get(node.id);
-        const epiloguePlan =
-          reDirective?.kind === "epilogue" ? reDirective.plan : null;
-        if (epiloguePlan) {
-          const reLabel = `${node.op}+${formatEpilogueLabel(epiloguePlan.epilogueOps)}`;
-          await withProfileContext(reLabel, node.module, () =>
-            executeReductionWithEpilogue(epiloguePlan, backend),
-          );
-
-          advanceConsumed(nodeIdx, epiloguePlan.consumedCount);
-
-          // Record reduction epilogue action in lowered plan builder
-          if (loweredPlanBuilder && nodeIdToFinalPos) {
-            const covered = collectNodePositions(
-              nodes,
-              nodeIdx,
-              epiloguePlan.consumedCount,
-              nodeIdToFinalPos,
-            );
-            loweredPlanBuilder.recordReductionEpilogue(
-              nodeIdToFinalPos.get(node.id) as number,
-              covered,
-              nodeIdToFinalPos.get(epiloguePlan.outputNode.id) as number,
-              epiloguePlan.epilogueOps,
-              epiloguePlan.outputDtype,
-              epiloguePlan.consumedCount,
-            );
-          }
-
-          nodeIdx += epiloguePlan.consumedCount - 1;
-          continue;
-        }
-      }
-
       // Batch consecutive adamStep nodes: flush once before the batch, then
       // execute all Adam nodes without per-op flushes. All 76 params are
       // independent — a single pre-flush resolves all read→read_write conflicts.
@@ -779,5 +662,144 @@ export async function executeSequentialSegmentWithEarlyRelease(
     }
   } finally {
     if (useSharedEncoder) endSharedEncoder();
+  }
+}
+
+// ============================================================================
+// Reduction Segment Execution
+// ============================================================================
+
+/** Reduction payload shape shared across sum/mean/max. */
+type ReductionPayload = { dim?: number | number[] | null; keepdim?: boolean };
+
+/**
+ * Execute a reduction segment: preamble → reduction → epilogue.
+ *
+ * Routes to the appropriate backend dispatch based on which parts are present:
+ * - Preamble + epilogue → sumWithPreambleEpilogue
+ * - Preamble only → sumDimWithPreambleChain
+ * - Epilogue only → reduction / meanWithEpilogue
+ */
+export async function executeReductionSegment(
+  group: ReductionGroup,
+  backend: Backend,
+): Promise<void> {
+  // Fused reduction kernels are WebGPU-only; fall back to sequential on CPU
+  if (group.reductionNode.device === "cpu") {
+    for (const node of group.nodes) {
+      if (!node.result) await executeNode(node, backend);
+    }
+    return;
+  }
+
+  const payload = group.reductionNode.payload as ReductionPayload | undefined;
+  const hasPreamble = group.preambleNodes.length > 0;
+  const hasEpilogue = group.epilogueOps.length > 0;
+
+  if (hasPreamble && hasEpilogue) {
+    // Combined preamble + epilogue
+    const { sumWithPreambleEpilogue } = await import("../backend/webgpu/index");
+    const preambleInputTensors = group.preambleInputRefs.map(
+      (ref) => getInputStorage(ref, backend).backendTensor,
+    );
+    const epilogueInputTensors = group.epilogueInputRefs.map(
+      (ref) => getInputStorage(ref, backend).backendTensor,
+    );
+
+    const resultTensor = sumWithPreambleEpilogue(
+      preambleInputTensors,
+      group.preambleOps,
+      group.preambleInputDtypes,
+      group.epilogueOps,
+      epilogueInputTensors,
+      group.outputDtype,
+      payload ?? {},
+      group.isMean,
+    );
+
+    group.outputNode.result = createStorageHandle(
+      group.outputNode.device,
+      resultTensor,
+    );
+  } else if (hasPreamble) {
+    // Preamble only
+    const { sumDimWithPreambleChain } = await import("../backend/webgpu/index");
+    const inputTensors = group.preambleInputRefs.map(
+      (ref) => getInputStorage(ref, backend).backendTensor,
+    );
+
+    let resultTensor = sumDimWithPreambleChain(
+      inputTensors,
+      group.preambleOps,
+      group.preambleInputDtypes,
+      payload ?? {},
+    );
+
+    // If this is a mean, divide by reduction size
+    if (group.isMean) {
+      const { normalizeDim } = await import("../backend/types");
+      const inputShape = group.preambleNodes[0].shape;
+      const dim = payload?.dim;
+      let reductionSize: number;
+      if (dim == null) {
+        reductionSize = inputShape.reduce((a, b) => a * b, 1);
+      } else {
+        const dims = Array.isArray(dim) ? dim : [dim];
+        const rank = inputShape.length;
+        reductionSize = dims.reduce(
+          (acc, d) => acc * inputShape[normalizeDim(d, rank)],
+          1,
+        );
+      }
+      const invSize = 1.0 / reductionSize;
+      const sumResult = resultTensor;
+      const invSizeTensor = backend.ops.full
+        ? backend.ops.full([], invSize)
+        : backend.ops.tensorFromArray([invSize], []);
+      resultTensor = backend.ops.mul(sumResult, invSizeTensor);
+      (sumResult as { destroy?: () => void }).destroy?.();
+      (invSizeTensor as { destroy?: () => void }).destroy?.();
+    }
+
+    group.outputNode.result = createStorageHandle(
+      group.outputNode.device,
+      resultTensor,
+    );
+  } else if (hasEpilogue) {
+    // Epilogue only
+    const { reduction, meanWithEpilogue } = await import(
+      "../backend/webgpu/index"
+    );
+    const reductionInputStorage = getInputStorage(
+      group.reductionNode.inputs[0],
+      backend,
+    );
+    const reductionInputTensor = reductionInputStorage.backendTensor;
+    const epilogueInputTensors = group.epilogueInputRefs.map(
+      (ref) => getInputStorage(ref, backend).backendTensor,
+    );
+
+    const resultTensor =
+      group.reductionNode.op === "mean"
+        ? meanWithEpilogue(
+            reductionInputTensor,
+            payload ?? {},
+            group.epilogueOps,
+            epilogueInputTensors,
+            group.outputDtype,
+          )
+        : reduction(
+            group.reductionNode.op as "sum" | "max",
+            reductionInputTensor,
+            payload ?? {},
+            group.epilogueOps,
+            epilogueInputTensors,
+            group.outputDtype,
+          );
+
+    group.outputNode.result = createStorageHandle(
+      group.outputNode.device,
+      resultTensor,
+    );
   }
 }
