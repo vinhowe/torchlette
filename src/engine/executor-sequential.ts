@@ -1,14 +1,6 @@
 import { getBackend } from "../backend/registry";
 import type { Backend } from "../backend/types";
-import {
-  abortBatch,
-  beginBatchExecution,
-  beginSharedEncoder,
-  endBatchExecution,
-  endSharedEncoder,
-  flushBufferPool,
-  isBatchActive,
-} from "../backend/webgpu";
+import { isFusedBackend } from "../backend/types";
 import type {
   ExecutePlanOptions,
   ExecutionPlan,
@@ -84,8 +76,8 @@ export async function executePlan(
     ));
   }
 
-  const useSharedEncoder = backend.name === "webgpu";
-  if (useSharedEncoder) beginSharedEncoder();
+  const fused = isFusedBackend(backend) ? backend : null;
+  if (fused) fused.beginSharedEncoder();
 
   try {
     for (let step = 0; step < plan.nodes.length; step++) {
@@ -109,7 +101,7 @@ export async function executePlan(
       }
     }
   } finally {
-    if (useSharedEncoder) endSharedEncoder();
+    if (fused) fused.endSharedEncoder();
   }
 
   const lastNode = plan.nodes[plan.nodes.length - 1];
@@ -218,7 +210,8 @@ export async function executePlanSegmented(
         }
       }
 
-      beginBatchExecution();
+      const fusedBe = isFusedBackend(backend) ? backend : null;
+      fusedBe?.beginBatchExecution();
 
       try {
         const nodeToStorage = new Map<number, StorageHandle>();
@@ -229,7 +222,7 @@ export async function executePlanSegmented(
           materializedStorages.set(node.id, node.result!);
         }
 
-        await endBatchExecution();
+        await fusedBe?.endBatchExecution();
 
         if (!isLastSegment) {
           for (const node of segment.nodes) {
@@ -242,14 +235,14 @@ export async function executePlanSegmented(
               }
             }
           }
-          flushBufferPool();
+          fusedBe?.flushBufferPool();
         }
 
         const lastNode = segment.nodes[segment.nodes.length - 1];
         lastResult = lastNode.result ?? null;
       } catch (error) {
-        if (isBatchActive()) {
-          abortBatch();
+        if (fusedBe?.isBatchActive()) {
+          fusedBe.abortBatch();
         }
         throw error;
       }

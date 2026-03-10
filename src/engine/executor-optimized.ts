@@ -1,13 +1,5 @@
 import type { Backend, DType } from "../backend/types";
-import {
-  type BufferArena,
-  beginSharedEncoder,
-  clearActiveArena,
-  clearArenaExternalInputBuffers,
-  endSharedEncoder,
-  setActiveArena,
-  setArenaExternalInputBuffers,
-} from "../backend/webgpu";
+import { isFusedBackend } from "../backend/types";
 import type { CompoundMatch } from "./compound-patterns";
 import { collectExternalInputBuffers } from "./executor-lowered";
 import { executePlan } from "./executor-sequential";
@@ -152,7 +144,7 @@ export interface FusionAnalysisTemplate {
   loweredPlan?: LoweredPlan;
 
   /** Per-plan buffer arena: GPUBuffers that persist across steps for bind group cache stability. */
-  bufferArena?: BufferArena;
+  bufferArena?: unknown;
 }
 
 type CachedSegmentDesc =
@@ -238,7 +230,7 @@ export async function executePlanOptimized(
   await pretunePlanMatmuls(plan, backend);
 
   const {
-    enableFusion = backend.name === "webgpu",
+    enableFusion = isFusedBackend(backend),
     enableVectorization = true,
     enableEarlyRelease = false,
   } = options;
@@ -670,22 +662,22 @@ export async function executePlanOptimized(
   // Inner begin/end calls in executeSequentialSegment become nested no-ops
   // thanks to the depth counter. This lets elementwise ops from consecutive
   // segments accumulate into a single batch, reducing queue.submit() calls.
-  const useTopLevelSharedEncoder = backend.name === "webgpu";
-  if (useTopLevelSharedEncoder) beginSharedEncoder();
+  const fused = isFusedBackend(backend) ? backend : null;
+  if (fused) fused.beginSharedEncoder();
 
   // Activate buffer arena if available from cached template.
   // This is critical for the fallback path: when executeLoweredPlan fails and
   // we fall back to executePlanOptimized, the arena still provides stable buffer
   // identities for bind group cache hits.
   const useArenaFallback =
-    useTopLevelSharedEncoder &&
+    fused &&
     cachedTemplate?.bufferArena &&
     process.env.TORCHLETTE_USE_ARENA !== "0";
   if (useArenaFallback) {
-    setActiveArena(
-      (cachedTemplate as FusionAnalysisTemplate).bufferArena as BufferArena,
+    fused.setActiveArena(
+      (cachedTemplate as FusionAnalysisTemplate).bufferArena,
     );
-    setArenaExternalInputBuffers(collectExternalInputBuffers(planNodes));
+    fused.setArenaExternalInputBuffers(collectExternalInputBuffers(planNodes));
   }
 
   try {
@@ -722,6 +714,7 @@ export async function executePlanOptimized(
     const reclaim = createReclaimController(
       DEFAULT_RECLAIM_INTERVAL,
       loweredPlanBuilder,
+      backend,
     );
 
     // Execute each segment
@@ -863,15 +856,15 @@ export async function executePlanOptimized(
       }
 
       // Periodic buffer reclamation
-      reclaim.maybeFlush(useTopLevelSharedEncoder);
+      reclaim.maybeFlush(true);
     }
   } finally {
-    if (useArenaFallback) {
-      clearActiveArena();
-      clearArenaExternalInputBuffers();
+    if (useArenaFallback && fused) {
+      fused.clearActiveArena();
+      fused.clearArenaExternalInputBuffers();
     }
-    if (useTopLevelSharedEncoder) {
-      endSharedEncoder();
+    if (fused) {
+      fused.endSharedEncoder();
     }
   }
 

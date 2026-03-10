@@ -5,13 +5,7 @@ import type {
   DeviceKind,
   DType,
 } from "../backend/types";
-import {
-  beginSharedEncoder,
-  endSharedEncoder,
-  flushBufferPool,
-  flushSharedEncoder,
-  setAdamBatchMode,
-} from "../backend/webgpu";
+import { isFusedBackend } from "../backend/types";
 import {
   asGPUTensor,
   type GPUBuffer,
@@ -136,7 +130,9 @@ export const DEFAULT_RECLAIM_INTERVAL =
 export function createReclaimController(
   interval: number,
   builder: LoweredPlanBuilder | null,
+  backend: Backend,
 ) {
+  const fused = isFusedBackend(backend) ? backend : null;
   let count = 0;
   return {
     advance(n: number) {
@@ -144,9 +140,9 @@ export function createReclaimController(
     },
     /** Flush if count >= interval and active is true. Returns whether it flushed. */
     maybeFlush(active: boolean): boolean {
-      if (active && interval > 0 && count >= interval) {
-        flushSharedEncoder();
-        flushBufferPool();
+      if (active && fused && interval > 0 && count >= interval) {
+        fused.flushSharedEncoder();
+        fused.flushBufferPool();
         if (builder) builder.recordReclaim();
         count = 0;
         return true;
@@ -166,8 +162,8 @@ export async function executeFusedSegment(
   backend: Backend,
   enableVectorization: boolean,
 ): Promise<void> {
-  // For CPU or other backends, fall back to sequential execution
-  if (backend.name !== "webgpu" || !("dispatchFusedKernel" in backend)) {
+  // For CPU or other backends without fusion support, fall back to sequential execution
+  if (!isFusedBackend(backend) || !("dispatchFusedKernel" in backend)) {
     await executeSequentialSegment(group.nodes, backend);
     return;
   }
@@ -365,8 +361,8 @@ async function executeSequentialSegment(
   nodes: LazyIRNode[],
   backend: Backend,
 ): Promise<void> {
-  const useSharedEncoder = backend.name === "webgpu";
-  if (useSharedEncoder) beginSharedEncoder();
+  const fused = isFusedBackend(backend) ? backend : null;
+  if (fused) fused.beginSharedEncoder();
 
   try {
     for (const node of nodes) {
@@ -374,7 +370,7 @@ async function executeSequentialSegment(
       await executeNode(node, backend);
     }
   } finally {
-    if (useSharedEncoder) endSharedEncoder();
+    if (fused) fused.endSharedEncoder();
   }
 }
 
@@ -416,8 +412,8 @@ export async function executeSequentialSegmentWithEarlyRelease(
     compoundMatchMap,
     matmulDirectives,
   } = options;
-  const useSharedEncoder = backend.name === "webgpu";
-  if (useSharedEncoder) beginSharedEncoder();
+  const fused = isFusedBackend(backend) ? backend : null;
+  if (fused) fused.beginSharedEncoder();
 
   try {
     // Intra-segment periodic reclamation: flush pending buffers to main pool
@@ -425,6 +421,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
     const reclaim = createReclaimController(
       DEFAULT_RECLAIM_INTERVAL,
       loweredPlanBuilder ?? null,
+      backend,
     );
 
     let step = startStep;
@@ -527,7 +524,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
       }
 
       // Try matmul epilogue/prologue fusion (Phase 1)
-      if (node.op === "matmul" && backend.name === "webgpu") {
+      if (node.op === "matmul" && fused) {
         const epiloguePlan = matmulDirectives?.get(node.id) ?? null;
         if (epiloguePlan) {
           const prologueLabel = epiloguePlan.prologues ? "prologue+" : "";
@@ -577,7 +574,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
       // Batch consecutive adamStep nodes: flush once before the batch, then
       // execute all Adam nodes without per-op flushes. All 76 params are
       // independent — a single pre-flush resolves all read→read_write conflicts.
-      if (node.op === "adamStep" && useSharedEncoder) {
+      if (node.op === "adamStep" && fused) {
         // Count consecutive adamStep nodes
         let adamCount = 1;
         for (let j = nodeIdx + 1; j < nodes.length; j++) {
@@ -587,10 +584,10 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
         if (adamCount > 1) {
           // Single flush before the entire Adam batch
-          flushSharedEncoder();
-          flushBufferPool(); // Make released fwd/bwd buffers available for Adam allocs
+          fused!.flushSharedEncoder();
+          fused!.flushBufferPool(); // Make released fwd/bwd buffers available for Adam allocs
 
-          setAdamBatchMode(true);
+          fused!.setAdamBatchMode(true);
           try {
             for (let a = 0; a < adamCount; a++) {
               const adamNode = nodes[nodeIdx + a];
@@ -622,7 +619,7 @@ export async function executeSequentialSegmentWithEarlyRelease(
               advanceConsumed(nodeIdx + a, 1);
             }
           } finally {
-            setAdamBatchMode(false);
+            fused!.setAdamBatchMode(false);
           }
 
           // Record adam batch action in lowered plan builder
@@ -658,10 +655,10 @@ export async function executeSequentialSegmentWithEarlyRelease(
 
       // Periodic intra-segment reclamation
       reclaim.advance(1);
-      reclaim.maybeFlush(useSharedEncoder && enableEarlyRelease);
+      reclaim.maybeFlush(enableEarlyRelease);
     }
   } finally {
-    if (useSharedEncoder) endSharedEncoder();
+    if (fused) fused.endSharedEncoder();
   }
 }
 
