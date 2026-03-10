@@ -14,7 +14,7 @@ WebGPU is auto-detected at runtime. Use `TORCHLETTE_CPU_ONLY=1` to force CPU-onl
 
 For WebGPU backend changes, also run the relevant integration test (e.g. `npx tsx examples/gpt2/finetune-demo.ts` for training-related fixes).
 
-**Zero test failures policy.** There are currently no known test failures — all 1310 tests pass (2 skipped). Never accept test failures. If a test fails after your change, fix it before moving on. Do not skip, disable, or mark tests as expected-to-fail. If a test is genuinely flaky (e.g. GPU timing), investigate and fix the flakiness rather than ignoring it.
+**Zero test failures policy.** There are currently no known test failures — all 841 tests pass across 60 test files. Never accept test failures. If a test fails after your change, fix it before moving on. Do not skip, disable, or mark tests as expected-to-fail. If a test is genuinely flaky (e.g. GPU timing), investigate and fix the flakiness rather than ignoring it.
 
 **Important:** Any standalone script or tool that uses WebGPU (Dawn) must call `process.exit(0)` at the end of `main()`. Dawn holds background threads that prevent Node from exiting naturally.
 
@@ -100,11 +100,16 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
 ## Project Structure
 
 - `src/` - Source code
-  - `backend/webgpu/` - WebGPU backend
+  - `backend/webgpu/` - WebGPU backend (dispatch, buffer pool, pipeline warmup)
+  - `backend/webgpu/ops/` - Op implementations (elementwise, reductions, views, fused kernels, registry)
   - `backend/webgpu/matmul/` - Tiled matmul with autotuning
-  - `engine/` - Tensor engine core
-  - `frontend/` - User-facing API
-- `test/` - Test suites
+  - `backend/webgpu/tile-*.ts` - Tile-IR compiler (IR, lowering, compiler, ops, dispatch)
+  - `engine/` - Tensor engine core (lazy execution, graph compiler, fusion, plan building)
+  - `frontend/` - User-facing API (table-driven ops, autograd, autocast)
+  - `runtime/` - RuntimeEngine (lazy IR node creation, dtype rules)
+  - `nn/` - Module system (auto parameters, linear, embedding, layernorm)
+  - `optim/` - Optimizers (Adam/AdamW with fused GPU kernel, GradScaler)
+- `test/` - Test suites (60 files, 841 tests)
 - `bench/` - Benchmarks
 
 ## Current Implementation Status
@@ -128,34 +133,17 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
   - Cache key: IR hash + input signatures (shapes/dtypes)
   - LRU eviction with configurable max size
   - Cache hit tracking for diagnostics
-- **Advanced compiled region features** (src/engine/compiled-region.ts):
-  - Arg alias groups (§8.3): Track aliased input arguments
-  - StateIfaceSig (§8.4): Ordered state access signatures
-  - State-slot alias patterns (§8.5): Bind-time alias tracking
-  - Auto-externalize (§8.7): SSA to pending_loc conversion
-  - Null-state sentinels (§8.8): Stable missing state representation
-  - Functionalization (§8.10): In-place to out-of-place conversion
-  - Region-exit persistence (§8.11): Commit and writeback tracking
 - **§15 Integration** (src/engine/fusion-detect.ts):
   - Lazy plan to IR conversion: Convert LazyIRNode graphs to IRGraph
   - Fusion group detection: Identify consecutive elementwise ops
   - Optimized execution: `executePlanOptimized()` with automatic fusion
   - RuntimeEngine integration: `enableFusion` option for opt-in fusion
   - Segmented execution: Mix fused and sequential execution for non-fusible ops
-- **Memory planning** (src/engine/memory-planning.ts, src/engine/memory-planned-executor.ts) - COMPLETE:
-  - In-flight plan strong rooting (§14): Plans hold refs to all touched tensors
-  - Allocator fencing: Track GPU completion before buffer reuse
-  - Lifetime analysis: Determine when tensors can be freed
-  - Memory donation: Reuse input buffers for outputs when safe
-  - Buffer pooling: Pre-allocate and reuse buffers by size class
-  - RuntimeEngine integration: `enableMemoryPlanning` option for opt-in buffer pooling
-  - GPU buffer pool (src/backend/webgpu/buffer-pool.ts): WebGPU-specific buffer management
-- **Cross-device execution** (src/engine/cross-device.ts, §13):
-  - Lazy transfer op: `tensor.to(device)` defers transfer until forced
-  - Transfer path resolution: Determines optimal route (via_cpu, direct, noop)
-  - Multi-device graph analysis: Detects cross-device ops and transfer points
-  - Auto-transfer support: `ensureSameDevice()` for ops with mixed device inputs
-  - Transfer statistics: Track bytes transferred and paths used
+- **Buffer management** (src/backend/webgpu/buffer-pool.ts, src/backend/webgpu/buffer-arena.ts):
+  - Per-lowered-plan buffer arenas: stable GPUBuffer identity across steps
+  - Window-based pool reservation: empirical per-size-class demand recording
+  - Early release in sequential execution with periodic reclamation
+  - 99.9% pool reuse, 1 new alloc/step steady-state
 
 ### Frontend API (src/frontend/) - COMPLETE
 - Tensor class with full PyTorch-like API
@@ -181,14 +169,14 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
 - **Kernel caching**: LRU cache for compiled pipelines by recipe signature
 - **Supported ops**: relu, gelu, silu, sigmoid, tanh, neg, abs, exp, log, sqrt, add, sub, mul, div, pow, min, max, comparisons, casts
 
-### Test Coverage - 51 spec files, 758 tests (756 passing, 2 skipped)
+### Test Coverage - 60 test files, 841 tests passing
 - tokens.spec.ts, versioning.spec.ts, planning.spec.ts
 - checkpoint.spec.ts, rng.spec.ts, exec-lock.spec.ts
 - lifecycle.spec.ts, backward.spec.ts, compile.spec.ts
-- compile-cache.spec.ts, compiled-region.spec.ts, compile-fusion-integration.spec.ts
-- memory-planning.spec.ts, memory-planning-integration.spec.ts, cross-device.spec.ts
+- compile-cache.spec.ts, compile-fusion-integration.spec.ts
 - amp.spec.ts, frontend-amp.spec.ts, amp-ir-transform.spec.ts, amp-compile-integration.spec.ts
-- webgpu/matmul-*.spec.ts, webgpu/cross-device-transfer.spec.ts, webgpu/fusion-codegen.spec.ts
+- webgpu/matmul-*.spec.ts, webgpu/tile-ir-*.spec.ts, webgpu/fusion-codegen.spec.ts
+- webgpu/pipeline-warmup.spec.ts, webgpu/attention-*.spec.ts
 - oracle/*.spec.ts, etc.
 
 ### AMP inside compile (§12) - COMPLETE
@@ -254,18 +242,10 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
 ### §7 Optimization Boundary - IMPLEMENTED
 - ✅ No fusion outside compile regions
 
-### §8 Compiled Regions - IMPLEMENTED
+### §8 Compiled Regions - PARTIAL
 - ✅ `8.1` Deterministic staging
 - ✅ `8.2` Cache keys + scalar canonicalization (§8.2.1)
-- ✅ `8.3` Alias groups
-- ✅ `8.4` StateIfaceSig
-- ✅ `8.5` State-slot alias patterns
-- ✅ `8.6` Token ABI reconciliation
-- ✅ `8.6.0` SemanticSubeventSchedule
-- ✅ `8.7` Auto-externalize
-- ✅ `8.8` Null-state sentinels
-- ✅ `8.10` Functionalization
-- ✅ `8.11` Region-exit persistence
+- ❌ `8.3-8.11` Advanced features (alias groups, functionalization, etc.) — removed as unused scaffolding
 
 ### §9 Autograd - IMPLEMENTED
 - ✅ `9.1` Lazy backward (rooted under tokGlobal)
@@ -288,14 +268,11 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
 - ✅ Select-gated commits
 - ✅ GradScaler with NaN/Inf detection and dynamic rescaling
 
-### §13 Cross-device - IMPLEMENTED
-- ✅ Lazy transfers
-- ✅ Transfer path resolution
+### §13 Cross-device - REMOVED
+- Removed as unused. Eager `tensor.to(device)` in op-dispatch.ts covers the only use case.
 
-### §14 Memory Planning - IMPLEMENTED
-- ✅ Buffer pooling
-- ✅ Allocator fencing
-- ✅ In-flight plan retention
+### §14 Memory Planning - REMOVED
+- Removed (−2,756 lines). Replaced by buffer arena + pool reservation system which achieves 99.9% reuse.
 
 ### §15 IR Optimization + Fusion - COMPLETE
 - ✅ `15.1` Elementwise fusion (single-output) - IMPLEMENTED
@@ -309,13 +286,13 @@ Use `/profile` to run the profiler and produce a full report automatically. The 
 |----------|--------|
 | Core engine semantics (§1, §3, §6) | ✅ Implemented |
 | Token algebra & planning | ✅ Implemented |
-| Compiled regions (§8) | ✅ Implemented |
+| Compiled regions (§8) | ⚠️ Partial (caching only; §8.3-8.11 scaffolding removed) |
 | Autograd (§9) | ✅ Implemented |
 | Checkpointing (§10) | ✅ Implemented |
 | RNG (§11) | ✅ Implemented |
 | AMP (§12) | ✅ Implemented |
-| Cross-device (§13) | ✅ Implemented |
-| Memory planning (§14) | ✅ Implemented |
+| Cross-device (§13) | ❌ Removed (unused) |
+| Memory planning (§14) | ❌ Removed (replaced by arena + pool) |
 | Elementwise fusion (§15.1) | ✅ Implemented |
 | Multi-output fusion (§15.2) | ✅ Implemented |
 | Memory coalescing (§15.3) | ✅ Implemented |
@@ -541,9 +518,15 @@ Targets ranked by impact:
 - **Double-buffered K-loop for matmul** — Ping-pong shared memory (2× allocation) to overlap next tile's global→shared load with current tile's compute, reducing barriers from 2→1 per K-tile iteration. Enabled when doubled shared memory fits in 16KB (9/11 shape classes). All matmul kernels regressed ~13%: bare `matmul` 24.8ms→28.4ms, `matmul++cast+bias+binary` 9.1ms→10.3ms, `matmul++cast+bias+unary+cast` 4.0ms→5.1ms, `matmul++bias` 2.2ms→3.1ms. Total GPU ~64ms→~72ms. The 2× shared memory reduces GPU occupancy (fewer warps per SM), and this GPU already has effective warp-level latency hiding — occupancy loss outweighs barrier reduction. Reverted.
 - **Blanket tileK doubling for f16 matmuls** — Applied `tileK *= 2` in dispatch.ts for all f16 matmuls with tileK=8. Forward GPU 18.4→18.7ms, backward 46.4→47.7ms (overall regression). The doubled shared memory reduces occupancy for shapes where the existing tileK was already optimal. Must be applied selectively per shape class, not globally.
 - **Per-shape matmul autotuning** — Per-shape cache (`m_n_k_dtype` keys instead of shape-class), ~12 neighbor configs benchmarked per shape with K-split-aware dispatch (full matmul+reduction path). Self-contained benchmark avoids shared state pollution. For 512-token DistilGPT-2 shapes, autotuner selects configs with identical GPU kernel times to hand-tuned defaults (bare matmul 24.8ms vs 24.9ms). Adds ~5s to step 0 with no steady-state benefit. The hand-tuned shape-class defaults are already near-optimal for standard transformer shapes. Infrastructure kept (disabled by default): enable with `TORCHLETTE_AUTOTUNE=1` env var or `compile({ autotune: true })` for non-standard shapes.
+- **Vec4 shared memory for matmul cooperative loads** — Declared shared memory as `array<vec4<f32>>` to reduce cooperative load iterations 4×. Three approaches benchmarked for the shared×shared dot K-loop: (a) runtime `v[kk%4]` indexing: +17% (25.3ms→29.7ms); (b) static `.x/.y/.z/.w` with full unrolling: +36% (25.3ms→34.4ms); (c) scalar baseline: best. Root cause: K-loop reads individual scalars — extraction overhead multiplied by K×ttM×ttN dwarfs the cooperative load savings. Vec4 kept enabled for attention (register×shared dot, fewer shared reads amortize extraction). Infrastructure landed (`Vec4DynComponentNode`, `lowerBlockDotBothVec4`) but matmul uses scalar via `!threadTileM` guard.
+
+**Completed infrastructure (not steady-state performance):**
+- ~~**Pipeline cache warmup**~~ — DONE. `pipeline-warmup.ts` records pipelines on first run, pre-compiles via `createComputePipelineAsync()` on subsequent runs. Step 0: ~1.6s→~1s. Integrated into profiler and finetune-demo.
+- ~~**Table-driven ops**~~ — DONE. Frontend `_dispatchUnary`/`_dispatchBinary` + `UNARY_OPS` table. Runtime `_unaryOp`/`_binaryOp` + `OP_REGISTRY`. ~50 methods collapsed to 1-liner delegates.
+- ~~**Dead subsystem removal**~~ — DONE. Memory-planning (−2,756L), cross-device, `lazy-to-ir.ts`, `engine-facade.ts` all removed. Replaced by buffer arena + pool reservation.
+- ~~**Auto Module.parameters()**~~ — DONE. Base class recursively walks `_params` + `_modules`. Subclasses no longer override.
 
 **Open targets (ranked by estimated savings at 512 tokens):**
 1. **Matmul kernel optimization** — 39.2ms GPU (59% of total), extensively optimized. Bare matmul 25.3ms, epilogue matmul 13.9ms. Shape-class configs hand-tuned via exhaustive benchmarking. Remaining gains require tensor core access (not available in WebGPU) or fundamentally different algorithms. Current V100 FP32 efficiency: 50-66% for large shapes (lm_head), 10-38% for medium shapes (bounded by launch overhead, not compute). Further kernel-level optimization has reached diminishing returns.
 2. **GC pressure** — Object pooling for Tensor metadata.
-3. **Pipeline cache warmup** — Step 0 is 1.6s due to pipeline compilation. Pre-compile pipeline variants during model load.
-4. **Single-plan training step** — Currently each training step executes 3 separate plans: forward (304 nodes, triggered by `force(loss)`), backward (315 nodes, triggered by `loss.backward()`), and optimizer (460 nodes, triggered by `markStep()`). Merging into a single traced graph would save ~2-3ms/step (~4-6%) from eliminated plan boundaries (2 fewer `buildPlan` + `queue.submit` calls). This would require spec §8 compiled-region infrastructure: alias group tracking (§8.3) for shared weight tensors, functionalization (§8.10) for in-place optimizer ops (`param.add_()`), and region-exit persistence (§8.11) for committing updated parameters. The §8 scaffolding was previously implemented but never wired in and was removed as dead code — it would need to be rebuilt around the actual graph IR if pursued.
+3. **Single-plan training step** — Currently each training step executes 3 separate plans: forward (304 nodes, triggered by `force(loss)`), backward (315 nodes, triggered by `loss.backward()`), and optimizer (460 nodes, triggered by `markStep()`). Merging into a single traced graph would save ~2-3ms/step (~4-6%) from eliminated plan boundaries (2 fewer `buildPlan` + `queue.submit` calls). This would require spec §8 compiled-region infrastructure: alias group tracking (§8.3) for shared weight tensors, functionalization (§8.10) for in-place optimizer ops (`param.add_()`), and region-exit persistence (§8.11) for committing updated parameters. The §8 scaffolding was previously implemented but never wired in and was removed as dead code — it would need to be rebuilt around the actual graph IR if pursued.
