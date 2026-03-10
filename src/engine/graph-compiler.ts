@@ -30,12 +30,7 @@ import {
   type MatmulEpiloguePlan,
   type MatmulPrologueInfo,
 } from "./matmul-epilogue";
-import {
-  detectReductionEpilogue,
-  detectReductionFusion,
-  detectReductionPreamble,
-  type ReductionDirective,
-} from "./reduction-preamble";
+import { detectReductionGroups, type ReductionGroup } from "./reduction-detect";
 
 // ============================================================================
 // Types
@@ -73,8 +68,8 @@ interface GraphAnalysisResult {
   /** Node IDs bypassed by graph rewrites (identity casts, redundant contiguous). */
   rewriteBypassedIds: Set<number>;
 
-  /** Pre-computed reduction pattern directives (trigger nodeId → plan). */
-  reductionDirectives: Map<number, ReductionDirective>;
+  /** Detected reduction groups (preamble → reduction → epilogue). */
+  reductionGroups: ReductionGroup[];
 
   /** Pre-computed matmul epilogue directives (matmulNodeId → full plan with prologues). */
   matmulDirectives: Map<number, MatmulEpiloguePlan>;
@@ -417,61 +412,15 @@ export function analyzeGraph(
 
   // --- Priority 60: Reduction preamble/epilogue claiming ---
   // Scan for elementwise→reduction and reduction→elementwise patterns.
-  // Claim their nodes so they're excluded from elementwise fusion (P40),
-  // ensuring preamble/epilogue ops stay in sequential segments where
-  // inline detection can fuse them into reduction kernels.
-  const reductionClaimedIds = new Set<number>();
-  const reductionDirectives = new Map<number, ReductionDirective>();
-  for (let i = 0; i < reorderedNodes.length; i++) {
-    const node = reorderedNodes[i];
-    if (reductionClaimedIds.has(node.id)) continue;
-    if (epilogueClaimedIds.has(node.id) || compoundClaimedIds.has(node.id))
-      continue;
-
-    // Try combined preamble+epilogue first
-    if (isFusibleOp(node.op)) {
-      const fusion = detectReductionFusion(
-        reorderedNodes,
-        i,
-        consumerCount,
-        externalNodeIds,
-      );
-      if (fusion) {
-        reductionDirectives.set(node.id, { kind: "fusion", plan: fusion });
-        for (const n of fusion.preambleChain) reductionClaimedIds.add(n.id);
-        for (const n of fusion.epilogueChain) reductionClaimedIds.add(n.id);
-        continue;
-      }
-      // Try preamble-only
-      const preamble = detectReductionPreamble(
-        reorderedNodes,
-        i,
-        consumerCount,
-      );
-      if (preamble) {
-        reductionDirectives.set(node.id, { kind: "preamble", plan: preamble });
-        for (const n of preamble.preambleChain) reductionClaimedIds.add(n.id);
-        continue;
-      }
-    }
-
-    // Try epilogue-only for reduction nodes
-    if (node.op === "sum" || node.op === "mean" || node.op === "max") {
-      const epilogue = detectReductionEpilogue(
-        reorderedNodes,
-        i,
-        consumerCount,
-        externalNodeIds,
-      );
-      if (epilogue) {
-        reductionDirectives.set(node.id, { kind: "epilogue", plan: epilogue });
-        // Claim epilogue chain nodes (not the reduction itself — it's the anchor)
-        for (let j = 1; j < epilogue.consumedCount; j++) {
-          reductionClaimedIds.add(reorderedNodes[i + j].id);
-        }
-      }
-    }
-  }
+  // Claim their nodes so they're excluded from elementwise fusion (P40).
+  // Reduction groups become first-class segments alongside elementwise groups.
+  const { groups: reductionGroups, claimedIds: reductionClaimedIds } =
+    detectReductionGroups(
+      reorderedNodes,
+      consumerCount,
+      new Set([...epilogueClaimedIds, ...compoundClaimedIds]),
+      externalNodeIds,
+    );
 
   // --- Priority 40: Elementwise fusion (via segmentPlanForExecution) ---
   // Bypassed nodes are excluded from fusion (they become view-like pass-throughs)
@@ -495,6 +444,7 @@ export function analyzeGraph(
     maxStorageBuffers,
     enableMultiOutput: true,
     epilogueClaimedIds: allClaimedIds,
+    reductionGroups,
   });
 
   return {
@@ -508,7 +458,7 @@ export function analyzeGraph(
     compoundMatches,
     consumerCount,
     rewriteBypassedIds,
-    reductionDirectives,
+    reductionGroups,
     matmulDirectives,
   };
 }

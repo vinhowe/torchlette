@@ -31,14 +31,37 @@ import type { TensorLifetime } from "./lifetime-analysis";
 import { type LoweredPlan, LoweredPlanBuilder } from "./lowered-plan";
 import type { MatmulPrologueInfo } from "./matmul-epilogue";
 import { initLifetimeAnalysis, pretunePlanMatmuls } from "./plan-builder";
+import type { ReductionGroup } from "./reduction-detect";
 import {
   type CompoundMatchExec,
   createReclaimController,
   DEFAULT_RECLAIM_INTERVAL,
   executeFusedSegment,
+  executeReductionSegment,
   executeSequentialSegmentWithEarlyRelease,
 } from "./segment-executors";
 import { releaseDeadTensors } from "./storage-tracker";
+
+/**
+ * Collect external input refs from a chain of nodes.
+ * For each node, inputs that don't reference the previous chain node are external.
+ * Used when reconstructing ReductionGroup from cached template on cache hit.
+ */
+function collectChainExternalRefsFromNodes(
+  chainNodes: LazyIRNode[],
+  skipNodeId?: number,
+): LazyIRNode["inputs"] {
+  const refs: LazyIRNode["inputs"] = [];
+  const chainNodeIds = new Set(chainNodes.map((n) => n.id));
+  if (skipNodeId !== undefined) chainNodeIds.add(skipNodeId);
+  for (const node of chainNodes) {
+    for (const ref of node.inputs) {
+      if (ref.kind === "pending" && chainNodeIds.has(ref.node.id)) continue;
+      refs.push(ref);
+    }
+  }
+  return refs;
+}
 
 /**
  * Options for optimized plan execution.
@@ -144,6 +167,34 @@ type CachedSegmentDesc =
       additionalOutputFinalPoss: number[];
       /** Needed intermediate positions in final plan. */
       neededIntermediateFinalPoss: number[];
+    }
+  | {
+      kind: "reduction";
+      /** All group node positions in final plan. */
+      finalPoss: number[];
+      /** Reduction node position. */
+      reductionFinalPos: number;
+      /** Preamble node positions. */
+      preambleFinalPoss: number[];
+      /** Epilogue node positions. */
+      epilogueFinalPoss: number[];
+      /** Output node position. */
+      outputFinalPos: number;
+      /** Serialized preamble ops. */
+      preambleOps: Array<{ op: string; arity: number; chainInputPos?: 0 | 1 }>;
+      /** Preamble input dtypes. */
+      preambleInputDtypes: DType[];
+      /** Serialized epilogue ops. */
+      epilogueOps: Array<{
+        kind: string;
+        toDtype?: DType;
+        inputIndex?: number;
+        op?: string;
+      }>;
+      /** Output dtype. */
+      outputDtype: DType;
+      /** Whether this is a mean reduction. */
+      isMean: boolean;
     };
 
 /**
@@ -245,9 +296,6 @@ export async function executePlanOptimized(
   const matmulPrologues = new Map<number, MatmulPrologueInfo[]>();
   const compoundClaimedIds = new Set<number>();
   let compoundMatches: CompoundMatch[] = [];
-  let reductionDirectives:
-    | ReturnType<typeof analyzeGraph>["reductionDirectives"]
-    | undefined;
   let matmulDirectives:
     | ReturnType<typeof analyzeGraph>["matmulDirectives"]
     | undefined;
@@ -326,6 +374,39 @@ export async function executePlanOptimized(
           nodes: seg.finalPoss.map((i) => planNodes[i]),
         };
       }
+      if (seg.kind === "reduction") {
+        // Reconstruct ReductionGroup from cached positions
+        const groupNodes = seg.finalPoss.map((i) => planNodes[i]);
+        const preambleNodes = seg.preambleFinalPoss.map((i) => planNodes[i]);
+        const epilogueNodes = seg.epilogueFinalPoss.map((i) => planNodes[i]);
+        const reductionNode = planNodes[seg.reductionFinalPos];
+        const outputNode = planNodes[seg.outputFinalPos];
+
+        // Reconstruct external input refs from preamble/epilogue nodes
+        const preambleInputRefs =
+          collectChainExternalRefsFromNodes(preambleNodes);
+        const epilogueInputRefs = collectChainExternalRefsFromNodes(
+          epilogueNodes,
+          preambleNodes.length > 0 ? undefined : reductionNode.id,
+        );
+
+        const group: ReductionGroup = {
+          nodes: groupNodes,
+          planIndices: seg.finalPoss,
+          reductionNode,
+          preambleNodes,
+          epilogueNodes,
+          outputNode,
+          preambleOps: seg.preambleOps,
+          preambleInputRefs,
+          preambleInputDtypes: seg.preambleInputDtypes,
+          epilogueOps: seg.epilogueOps,
+          epilogueInputRefs,
+          outputDtype: seg.outputDtype,
+          isMean: seg.isMean,
+        };
+        return { kind: "reduction" as const, group };
+      }
       // Reconstruct FusionGroup
       const groupNodes = seg.finalPoss.map((i) => planNodes[i]);
       const groupNodeIds = new Set(groupNodes.map((n) => n.id));
@@ -367,7 +448,6 @@ export async function executePlanOptimized(
     for (const [mmId, prologues] of analysis.matmulPrologues)
       matmulPrologues.set(mmId, prologues);
     compoundMatches = analysis.compoundMatches;
-    reductionDirectives = analysis.reductionDirectives;
     matmulDirectives = analysis.matmulDirectives;
 
     // ── Build template and cache it ──
@@ -380,6 +460,26 @@ export async function executePlanOptimized(
         return {
           kind: "sequential" as const,
           finalPoss: seg.nodes.map((n) => finalIdToPos.get(n.id) as number),
+        };
+      }
+      if (seg.kind === "reduction") {
+        const rg = seg.group;
+        return {
+          kind: "reduction" as const,
+          finalPoss: rg.nodes.map((n) => finalIdToPos.get(n.id) as number),
+          reductionFinalPos: finalIdToPos.get(rg.reductionNode.id) as number,
+          preambleFinalPoss: rg.preambleNodes.map(
+            (n) => finalIdToPos.get(n.id) as number,
+          ),
+          epilogueFinalPoss: rg.epilogueNodes.map(
+            (n) => finalIdToPos.get(n.id) as number,
+          ),
+          outputFinalPos: finalIdToPos.get(rg.outputNode.id) as number,
+          preambleOps: rg.preambleOps,
+          preambleInputDtypes: rg.preambleInputDtypes,
+          epilogueOps: rg.epilogueOps,
+          outputDtype: rg.outputDtype,
+          isMean: rg.isMean,
         };
       }
       return {
@@ -626,7 +726,74 @@ export async function executePlanOptimized(
 
     // Execute each segment
     for (const segment of segments) {
-      if (segment.kind === "fused" && segment.group.nodes.length >= 2) {
+      if (segment.kind === "reduction") {
+        // Execute reduction segment
+        const rg = segment.group;
+        const reductionLabel =
+          rg.preambleNodes.length > 0
+            ? `${rg.isMean ? "mean" : rg.reductionNode.op}+${rg.preambleNodes.map((n) => n.op).join("+")}${rg.epilogueOps.length > 0 ? "+" + rg.epilogueOps.map((o) => o.op || o.kind).join("+") : ""}`
+            : `${rg.reductionNode.op}+${rg.epilogueOps.map((o) => o.op || o.kind).join("+")}`;
+
+        const { withProfileContext } = await import("./op-dispatch");
+        await withProfileContext(reductionLabel, rg.nodes[0].module, () =>
+          executeReductionSegment(rg, backend),
+        );
+
+        // Record reduction action in lowered plan builder
+        if (loweredPlanBuilder) {
+          if (rg.preambleNodes.length > 0 && rg.epilogueOps.length > 0) {
+            loweredPlanBuilder.recordReductionFusion(
+              rg.preambleNodes.map((n) => nodeIdToFinalPos.get(n.id) as number),
+              nodeIdToFinalPos.get(rg.reductionNode.id) as number,
+              rg.epilogueNodes.map((n) => nodeIdToFinalPos.get(n.id) as number),
+              nodeIdToFinalPos.get(rg.outputNode.id) as number,
+              rg.preambleOps,
+              rg.preambleInputDtypes,
+              rg.epilogueOps,
+              rg.outputDtype,
+              rg.nodes.length,
+              rg.isMean,
+            );
+          } else if (rg.preambleNodes.length > 0) {
+            loweredPlanBuilder.recordReductionPreamble(
+              nodeIdToFinalPos.get(rg.preambleNodes[0].id) as number,
+              nodeIdToFinalPos.get(rg.reductionNode.id) as number,
+              rg.preambleNodes.map((n) => nodeIdToFinalPos.get(n.id) as number),
+              rg.preambleOps,
+              rg.preambleInputDtypes,
+              rg.nodes.length,
+            );
+          } else {
+            const covered = rg.nodes.map(
+              (n) => nodeIdToFinalPos.get(n.id) as number,
+            );
+            loweredPlanBuilder.recordReductionEpilogue(
+              nodeIdToFinalPos.get(rg.reductionNode.id) as number,
+              covered,
+              nodeIdToFinalPos.get(rg.outputNode.id) as number,
+              rg.epilogueOps,
+              rg.outputDtype,
+              rg.nodes.length,
+            );
+          }
+        }
+
+        // Track storages and release dead buffers
+        if (enableEarlyRelease) {
+          for (const node of rg.nodes) {
+            if (node.result) nodeToStorage.set(node.id, node.result);
+            overallStep++;
+            releaseDeadTensors(
+              lifetimes,
+              overallStep,
+              outputNodeIds,
+              alreadyReleased,
+              nodeToStorage,
+            );
+          }
+        }
+        reclaim.advance(rg.nodes.length);
+      } else if (segment.kind === "fused" && segment.group.nodes.length >= 2) {
         // Execute fused segment
         await executeFusedSegment(
           segment.group,
@@ -688,7 +855,6 @@ export async function executePlanOptimized(
           loweredPlanBuilder,
           nodeIdToFinalPos,
           compoundMatchMap,
-          reductionDirectives,
           matmulDirectives,
         });
         stats.sequentialNodes += seqNodes.length;

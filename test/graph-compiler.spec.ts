@@ -259,14 +259,13 @@ describe("Graph Compiler — analyzeGraph()", () => {
 
     const result = analyzeGraph([x, y, mul, sum]);
 
-    // The mul node triggers a preamble directive
-    const directive = result.reductionDirectives.get(mul.id);
-    expect(directive).toBeDefined();
-    expect(directive!.kind).toBe("preamble");
-    if (directive!.kind === "preamble") {
-      expect(directive!.plan.reductionNode.id).toBe(sum.id);
-      expect(directive!.plan.preambleChain.length).toBeGreaterThan(0);
-    }
+    // The mul node triggers a reduction group with preamble
+    expect(result.reductionGroups.length).toBeGreaterThan(0);
+    const group = result.reductionGroups.find(
+      (g) => g.reductionNode.id === sum.id,
+    );
+    expect(group).toBeDefined();
+    expect(group!.preambleNodes.length).toBeGreaterThan(0);
   });
 
   it("produces reduction epilogue directives", () => {
@@ -292,14 +291,14 @@ describe("Graph Compiler — analyzeGraph()", () => {
 
     const result = analyzeGraph([x, sum, relu]);
 
-    // The sum node triggers an epilogue directive
-    const directive = result.reductionDirectives.get(sum.id);
-    expect(directive).toBeDefined();
-    expect(directive!.kind).toBe("epilogue");
-    if (directive!.kind === "epilogue") {
-      expect(directive!.plan.reductionNode.id).toBe(sum.id);
-      expect(directive!.plan.outputNode.id).toBe(relu.id);
-    }
+    // The sum node triggers a reduction group with epilogue
+    expect(result.reductionGroups.length).toBeGreaterThan(0);
+    const group = result.reductionGroups.find(
+      (g) => g.reductionNode.id === sum.id,
+    );
+    expect(group).toBeDefined();
+    expect(group!.epilogueNodes.length).toBeGreaterThan(0);
+    expect(group!.outputNode.id).toBe(relu.id);
   });
 
   it("produces matmul epilogue directives with full plans", () => {
@@ -365,7 +364,7 @@ describe("Graph Compiler — analyzeGraph()", () => {
     expect(result.matmulDirectives.size).toBe(0);
   });
 
-  it("reductionDirectives is empty when no patterns match", () => {
+  it("reductionGroups is empty when no patterns match", () => {
     const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
       values: [1, 2, 3, 4],
     });
@@ -382,6 +381,6 @@ describe("Graph Compiler — analyzeGraph()", () => {
 
     const result = analyzeGraph([a, b, add]);
 
-    expect(result.reductionDirectives.size).toBe(0);
+    expect(result.reductionGroups.length).toBe(0);
   });
 });
