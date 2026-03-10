@@ -275,6 +275,13 @@ interface Vec4ComponentNode extends IRNodeBase {
   comp: 0 | 1 | 2 | 3;
 }
 
+/** v[idx] — runtime-indexed component extraction from vec4<f32> */
+interface Vec4DynComponentNode extends IRNodeBase {
+  kind: "vec4DynComponent";
+  value: IRNode;
+  idx: IRNode;
+}
+
 /** vec4 binary: add, sub, mul between two vec4s, or vec4 * scalar */
 interface Vec4BinaryNode extends IRNodeBase {
   kind: "vec4Binary";
@@ -326,6 +333,7 @@ export type IRNode =
   | Vec4SplatNode
   | Vec4NativeDotNode
   | Vec4ComponentNode
+  | Vec4DynComponentNode
   | Vec4BinaryNode
   | Vec4ArrayReadNode
   | Vec4SharedReadNode;
@@ -370,6 +378,7 @@ export interface TileLoadStmt {
   elemType: DataType;
   smemElemType?: DataType; // override shared memory element type (e.g. "f16" for f32→f16 smem)
   smemStride?: number; // shared memory row stride (>tileCols for padding)
+  smemVec4?: boolean; // true = shared memory uses array<vec4<f32>, N/4>
 }
 
 export interface TileLoad1DStmt {
@@ -424,6 +433,8 @@ export interface BlockLoadStmt {
   guard?: IRNode;
   // Override shared memory element type (e.g. "f16" for f32 binding → f16 smem)
   smemElemType?: DataType;
+  // Set by ops layer when shared memory uses array<vec4<f32>> layout
+  smemVec4?: boolean;
 }
 
 export interface BlockStoreStmt {

@@ -38,6 +38,8 @@ let _varCounter = 0;
 /** Module-level TPR state — set during compilation, reset after. */
 let _activeTPR = 1;
 let _blockLayouts: Map<string, BlockLayout> = new Map();
+/** Shared memory arrays declared as vec4<f32> (auto-populated during lowering). */
+const _smemVec4Arrays: Set<string> = new Set();
 
 // ============================================================================
 // State Management Functions
@@ -51,6 +53,7 @@ export function resetLoweringState(): void {
   _varCounter = 0;
   _activeTPR = 1;
   _blockLayouts = new Map();
+  _smemVec4Arrays.clear();
 }
 
 export function setTPR(tpr: number): void {
@@ -420,6 +423,59 @@ function vec4DotExpr(
     dataType: "f32",
   };
 }
+function vec4SharedReadNode(arrayName: string, idx: IRNode): IRNode {
+  return {
+    id: -1,
+    kind: "vec4SharedRead",
+    arrayName,
+    idx,
+    valueType: "vec4" as const,
+    dataType: "f32" as const,
+  };
+}
+function vec4NativeDotNode(a: IRNode, b: IRNode): IRNode {
+  return {
+    id: -1,
+    kind: "vec4NativeDot",
+    a,
+    b,
+    valueType: "scalar" as const,
+    dataType: "f32" as const,
+  };
+}
+function vec4ComponentNode(value: IRNode, comp: 0 | 1 | 2 | 3): IRNode {
+  return {
+    id: -1,
+    kind: "vec4Component",
+    value,
+    comp,
+    valueType: "scalar" as const,
+    dataType: "f32" as const,
+  };
+}
+/** Runtime-indexed vec4 component: v[idx] where idx is 0..3 at runtime. */
+function vec4DynComponentNode(value: IRNode, idx: IRNode): IRNode {
+  return {
+    id: -1,
+    kind: "vec4DynComponent",
+    value,
+    idx,
+    valueType: "scalar" as const,
+    dataType: "f32" as const,
+  };
+}
+function vec4ConstructNode(x: IRNode, y: IRNode, z: IRNode, w: IRNode): IRNode {
+  return {
+    id: -1,
+    kind: "vec4Construct",
+    x,
+    y,
+    z,
+    w,
+    valueType: "vec4" as const,
+    dataType: "f32" as const,
+  };
+}
 
 function getTotalThreads(spec: TileKernelSpec): number {
   const logical =
@@ -573,6 +629,10 @@ export function lowerTileStatements(
  * Bounds-checked via the mask.
  */
 function lowerTileLoad(stmt: TileLoadStmt, spec: TileKernelSpec): Statement[] {
+  if (stmt.smemVec4) {
+    _smemVec4Arrays.add(stmt.sharedName);
+    return lowerTileLoadVec4(stmt, spec);
+  }
   const { binding, ptr, mask, sharedName, tileRows, tileCols, elemType } = stmt;
   const totalElems = tileRows * tileCols;
   const totalThreads = getTotalThreads(spec);
@@ -720,6 +780,166 @@ function lowerTileLoad(stmt: TileLoadStmt, spec: TileKernelSpec): Statement[] {
 
   result.push(forRange0(iVar, cU32(elemsPerThread), loopBody));
 
+  return result;
+}
+
+/**
+ * Vec4 cooperative load: loads 4 consecutive f32 elements per iteration,
+ * writes one vec4<f32> to shared memory. 4× fewer loop iterations.
+ */
+function lowerTileLoadVec4(
+  stmt: TileLoadStmt,
+  spec: TileKernelSpec,
+): Statement[] {
+  const { binding, ptr, mask, sharedName, tileRows, tileCols } = stmt;
+  const smemStride = stmt.smemStride ?? tileCols;
+  const totalVec4 = (tileRows * smemStride) / 4;
+  const totalThreads = getTotalThreads(spec);
+  const vec4PerThread = Math.ceil(totalVec4 / totalThreads);
+  const colsV4 = tileCols / 4;
+  const strideV4 = smemStride / 4;
+
+  const result: Statement[] = [];
+  const iVar = `_ld_i`;
+  const localIdx = ref("local_idx");
+
+  const loopBody: Statement[] = [];
+
+  // flat_v4 = local_idx * vec4PerThread + i
+  const flatName = freshVar("fv4");
+  loopBody.push({
+    kind: "let",
+    name: flatName,
+    dtype: "u32",
+    value: binOp("add", binOp("mul", localIdx, cU32(vec4PerThread)), ref(iVar)),
+  });
+
+  const ifBody: Statement[] = [];
+  const rowName = freshVar("row");
+  const colV4Name = freshVar("cv4");
+  ifBody.push({
+    kind: "let",
+    name: rowName,
+    dtype: "u32",
+    value: binOp("div", ref(flatName), cU32(strideV4)),
+  });
+  ifBody.push({
+    kind: "let",
+    name: colV4Name,
+    dtype: "u32",
+    value: binOp("mod", ref(flatName), cU32(strideV4)),
+  });
+
+  const globalRowName = freshVar("gr");
+  const globalColName = freshVar("gc");
+  ifBody.push({
+    kind: "let",
+    name: globalRowName,
+    dtype: "u32",
+    value: binOp("add", ptr.outerRange.base, ref(rowName)),
+  });
+  // globalCol = innerBase + colV4 * 4
+  ifBody.push({
+    kind: "let",
+    name: globalColName,
+    dtype: "u32",
+    value: binOp(
+      "add",
+      ptr.innerRange.base,
+      binOp("mul", ref(colV4Name), cU32(4)),
+    ),
+  });
+
+  // globalIdx = base + globalRow * outerStride + globalCol * innerStride
+  const gIdxName = freshVar("gIdx");
+  ifBody.push({
+    kind: "let",
+    name: gIdxName,
+    dtype: "u32",
+    value: binOp(
+      "add",
+      binOp(
+        "add",
+        ptr.baseOffset,
+        mulOrSkip(ref(globalRowName), ptr.outerStride),
+      ),
+      mulOrSkip(ref(globalColName), ptr.innerStride),
+    ),
+  });
+
+  // Mask: globalRow < outerBound && colV4 < colsV4
+  const maskCond = andOp(
+    cmpOp("lt", ref(globalRowName), mask.outerBound),
+    cmpOp("lt", ref(colV4Name), cU32(colsV4)),
+  );
+
+  const bindingDtype = spec.bindings[binding]?.type ?? stmt.elemType;
+  // Load 4 consecutive f32 elements and pack into vec4
+  const loadElems = [0, 1, 2, 3].map((k) =>
+    loadBinding(binding, binOp("add", ref(gIdxName), cU32(k)), bindingDtype),
+  );
+  // Ensure f32 for vec4 construction
+  const f32Elems = loadElems.map((e) =>
+    bindingDtype !== "f32" ? castNode(e, "f32") : e,
+  );
+  const vec4Value: IRNode = {
+    id: -1,
+    kind: "vec4Construct",
+    x: f32Elems[0],
+    y: f32Elems[1],
+    z: f32Elems[2],
+    w: f32Elems[3],
+    valueType: "vec4" as const,
+    dataType: "f32" as const,
+  };
+
+  // smemIdx = row * strideV4 + colV4 (= flatName when no padding)
+  const smemIdx =
+    strideV4 !== colsV4
+      ? binOp("add", binOp("mul", ref(rowName), cU32(strideV4)), ref(colV4Name))
+      : ref(flatName);
+
+  const zeroVec4: IRNode = {
+    id: -1,
+    kind: "vec4Construct",
+    x: cF32(0),
+    y: cF32(0),
+    z: cF32(0),
+    w: cF32(0),
+    valueType: "vec4" as const,
+    dataType: "f32" as const,
+  };
+
+  ifBody.push({
+    kind: "ifElse",
+    condition: maskCond,
+    body: [
+      {
+        kind: "vec4ArrayWrite",
+        arrayName: sharedName,
+        idx: smemIdx,
+        value: vec4Value,
+        isShared: true,
+      },
+    ],
+    elseBody: [
+      {
+        kind: "vec4ArrayWrite",
+        arrayName: sharedName,
+        idx: smemIdx,
+        value: zeroVec4,
+        isShared: true,
+      },
+    ],
+  });
+
+  loopBody.push({
+    kind: "if",
+    condition: cmpOp("lt", ref(flatName), cU32(totalVec4)),
+    body: ifBody,
+  });
+
+  result.push(forRange0(iVar, cU32(vec4PerThread), loopBody));
   return result;
 }
 
@@ -1097,7 +1317,7 @@ function lowerBlockLoadTile(
       "blockLoad with ptrKind=tile requires tilePtr and tileMask",
     );
   }
-  // Delegate to existing tile load lowering
+  // Delegate to existing tile load lowering, passing through vec4 from ops layer
   return lowerTileLoad(
     {
       kind: "tileLoad",
@@ -1109,6 +1329,7 @@ function lowerBlockLoadTile(
       tileCols: stmt.cols,
       elemType: stmt.elemType,
       smemElemType: stmt.smemElemType,
+      smemVec4: stmt.smemVec4,
     },
     spec,
   );
@@ -1282,6 +1503,27 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
   const aIsF16 = stmt.aSmemElemType === "f16";
   const bIsF16 = stmt.bSmemElemType === "f16";
 
+  // Auto-detect vec4: both A and B must be vec4, dimensions must be divisible by 4
+  const aVec4 =
+    _smemVec4Arrays.has(aName) &&
+    !aIsF16 &&
+    innerDim % 4 === 0 &&
+    aSmemStride % 4 === 0;
+  const bVec4 =
+    _smemVec4Arrays.has(bName) &&
+    !bIsF16 &&
+    threadTileN % 4 === 0 &&
+    bSmemStride % 4 === 0;
+
+  // When both A and B are vec4, use a 2-level K-loop with static component
+  // extraction to avoid runtime-indexed vec4 access (which is slow on GPU).
+  // Outer loop iterates K/4 times, loads vec4s once; inner loop (4 iters)
+  // extracts .x/.y/.z/.w statically. a_vals[ttM] and b_vals[ttN] — no register
+  // expansion vs scalar path.
+  if (aVec4 && bVec4) {
+    return lowerBlockDotBothVec4(stmt, aSmemStride, bSmemStride);
+  }
+
   const result: Statement[] = [];
 
   // barrier() before reading shared memory
@@ -1290,7 +1532,7 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
   const kkVar = freshVar("kk");
   const kkLoop: Statement[] = [];
 
-  // Load a_vals from shared A: a_vals[tm] = f32(A[(thread_row*ttM + tm) * aSmemStride + kk])
+  // ---- Load a_vals ----
   const aValsName = freshVar("a_vals");
   kkLoop.push({
     kind: "varArray",
@@ -1300,15 +1542,18 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
     skipZeroInit: true,
   });
   const tmVar1 = freshVar("tm");
-  const aReadDtype = aIsF16 ? ("f16" as const) : ("f32" as const);
-  kkLoop.push(
-    forRange0(tmVar1, cU32(threadTileM), [
-      {
-        kind: "indexAssign",
-        arrayName: aValsName,
-        idx: ref(tmVar1),
-        value: (() => {
-          const raw = sharedRead(
+
+  if (aVec4) {
+    // A is vec4: read vec4, extract component via kk%4
+    const aStrideV4 = aSmemStride / 4;
+    const avVar = freshVar("av");
+    kkLoop.push(
+      forRange0(tmVar1, cU32(threadTileM), [
+        {
+          kind: "let",
+          name: avVar,
+          dtype: "f32",
+          value: vec4SharedReadNode(
             aName,
             binOp(
               "add",
@@ -1319,19 +1564,58 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
                   binOp("mul", ref("thread_row"), cU32(threadTileM)),
                   ref(tmVar1),
                 ),
-                cU32(aSmemStride),
+                cU32(aStrideV4),
               ),
-              ref(kkVar),
+              binOp("div", ref(kkVar), cU32(4)),
             ),
-            aReadDtype,
-          );
-          return aIsF16 ? castNode(raw, "f32") : raw;
-        })(),
-      },
-    ]),
-  );
+          ),
+        },
+        {
+          kind: "indexAssign",
+          arrayName: aValsName,
+          idx: ref(tmVar1),
+          value: vec4DynComponentNode(
+            ref(avVar, "f32"),
+            binOp("mod", ref(kkVar), cU32(4)),
+          ),
+        },
+      ]),
+    );
+  } else {
+    // A is scalar: direct shared read
+    const aReadDtype = aIsF16 ? ("f16" as const) : ("f32" as const);
+    kkLoop.push(
+      forRange0(tmVar1, cU32(threadTileM), [
+        {
+          kind: "indexAssign",
+          arrayName: aValsName,
+          idx: ref(tmVar1),
+          value: (() => {
+            const raw = sharedRead(
+              aName,
+              binOp(
+                "add",
+                binOp(
+                  "mul",
+                  binOp(
+                    "add",
+                    binOp("mul", ref("thread_row"), cU32(threadTileM)),
+                    ref(tmVar1),
+                  ),
+                  cU32(aSmemStride),
+                ),
+                ref(kkVar),
+              ),
+              aReadDtype,
+            );
+            return aIsF16 ? castNode(raw, "f32") : raw;
+          })(),
+        },
+      ]),
+    );
+  }
 
-  // Load b_vals from shared B: b_vals[tn] = f32(B[kk * bSmemStride + thread_col*ttN + tn])
+  // ---- Load b_vals ----
   const bValsName = freshVar("b_vals");
   kkLoop.push({
     kind: "varArray",
@@ -1340,33 +1624,70 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
     size: threadTileN,
     skipZeroInit: true,
   });
-  const tnVar1 = freshVar("tn");
-  const bReadDtype = bIsF16 ? ("f16" as const) : ("f32" as const);
-  kkLoop.push(
-    forRange0(tnVar1, cU32(threadTileN), [
-      {
-        kind: "indexAssign",
-        arrayName: bValsName,
-        idx: ref(tnVar1),
-        value: (() => {
-          const raw = sharedRead(
+
+  if (bVec4) {
+    // B is vec4: read vec4 and extract 4 components per iteration
+    const bStrideV4 = bSmemStride / 4;
+    const ttNv4 = threadTileN / 4;
+    const tnvVar = freshVar("tnv");
+    const bvVar = freshVar("bv");
+    kkLoop.push(
+      forRange0(tnvVar, cU32(ttNv4), [
+        {
+          kind: "let",
+          name: bvVar,
+          dtype: "f32",
+          value: vec4SharedReadNode(
             bName,
             binOp(
               "add",
-              binOp("mul", ref(kkVar), cU32(bSmemStride)),
+              binOp("mul", ref(kkVar), cU32(bStrideV4)),
               binOp(
                 "add",
-                binOp("mul", ref("thread_col"), cU32(threadTileN)),
-                ref(tnVar1),
+                binOp("mul", ref("thread_col"), cU32(ttNv4)),
+                ref(tnvVar),
               ),
             ),
-            bReadDtype,
-          );
-          return bIsF16 ? castNode(raw, "f32") : raw;
-        })(),
-      },
-    ]),
-  );
+          ),
+        },
+        ...([0, 1, 2, 3] as const).map((k) => ({
+          kind: "indexAssign" as const,
+          arrayName: bValsName,
+          idx: binOp("add", binOp("mul", ref(tnvVar), cU32(4)), cU32(k)),
+          value: vec4ComponentNode(ref(bvVar, "f32"), k),
+        })),
+      ]),
+    );
+  } else {
+    // B is scalar: direct shared read
+    const tnVar1 = freshVar("tn");
+    const bReadDtype = bIsF16 ? ("f16" as const) : ("f32" as const);
+    kkLoop.push(
+      forRange0(tnVar1, cU32(threadTileN), [
+        {
+          kind: "indexAssign",
+          arrayName: bValsName,
+          idx: ref(tnVar1),
+          value: (() => {
+            const raw = sharedRead(
+              bName,
+              binOp(
+                "add",
+                binOp("mul", ref(kkVar), cU32(bSmemStride)),
+                binOp(
+                  "add",
+                  binOp("mul", ref("thread_col"), cU32(threadTileN)),
+                  ref(tnVar1),
+                ),
+              ),
+              bReadDtype,
+            );
+            return bIsF16 ? castNode(raw, "f32") : raw;
+          })(),
+        },
+      ]),
+    );
+  }
 
   // Outer product: acc[tm*ttN + tn] += a_vals[tm] * b_vals[tn]
   const targetName = accName ?? resultName;
@@ -1395,6 +1716,172 @@ function lowerBlockDotSharedShared(stmt: BlockDotStmt): Statement[] {
   );
 
   result.push(forRange0(kkVar, cU32(innerDim), kkLoop));
+
+  // barrier() after shared memory use
+  result.push({ kind: "barrier" });
+
+  return result;
+}
+
+/**
+ * Both-vec4 path for shared×shared dot: 2-level K-loop with static extraction.
+ *
+ * Outer loop iterates K/4 times. For each kk4:
+ *   - Load ttM vec4s from A (one per thread-tile row)
+ *   - Inner loop iterates 4 times (sub = 0..3):
+ *     - Extract A[tm].xyzw[sub] statically into a_vals[tm]
+ *     - Load ttN/4 vec4s from B, extract .xyzw statically into b_vals[tn]
+ *     - Outer product: acc[tm*ttN + tn] += a_vals[tm] * b_vals[tn]
+ *
+ * Key: a_vals[ttM] and b_vals[ttN] — same register count as scalar path.
+ * No register expansion, no runtime vec4 indexing.
+ */
+function lowerBlockDotBothVec4(
+  stmt: BlockDotStmt,
+  aSmemStride: number,
+  bSmemStride: number,
+): Statement[] {
+  const { aName, bName, resultName, accName, aCols, threadTileM, threadTileN } =
+    stmt;
+  const innerDim = aCols;
+  const aStrideV4 = aSmemStride / 4;
+  const bStrideV4 = bSmemStride / 4;
+  const ttNv4 = threadTileN / 4;
+  const targetName = accName ?? resultName;
+
+  const result: Statement[] = [];
+  result.push({ kind: "barrier" });
+
+  const kk4Var = freshVar("kk4");
+  const kk4Loop: Statement[] = [];
+
+  // Declare a_vals and b_vals in the outer kk4 loop (reused across sub iterations)
+  const aValsName = freshVar("a_vals");
+  const bValsName = freshVar("b_vals");
+  kk4Loop.push(
+    {
+      kind: "varArray",
+      name: aValsName,
+      elemType: "f32",
+      size: threadTileM,
+      skipZeroInit: true,
+    },
+    {
+      kind: "varArray",
+      name: bValsName,
+      elemType: "f32",
+      size: threadTileN,
+      skipZeroInit: true,
+    },
+  );
+
+  // Load A vec4s: one per thread-tile row (reused across 4 sub iterations)
+  const aVec4Names: string[] = [];
+  for (let tm = 0; tm < threadTileM; tm++) {
+    const name = freshVar("av");
+    aVec4Names.push(name);
+    kk4Loop.push({
+      kind: "let",
+      name,
+      dtype: "f32",
+      value: vec4SharedReadNode(
+        aName,
+        binOp(
+          "add",
+          binOp(
+            "mul",
+            binOp(
+              "add",
+              binOp("mul", ref("thread_row"), cU32(threadTileM)),
+              cU32(tm),
+            ),
+            cU32(aStrideV4),
+          ),
+          ref(kk4Var),
+        ),
+      ),
+    });
+  }
+
+  // Manually unroll sub = 0..3 with static .x/.y/.z/.w extraction
+  const compNames = ["x", "y", "z", "w"] as const;
+  for (let sub = 0; sub < 4; sub++) {
+    const subStmts: Statement[] = [];
+
+    // Extract A component: a_vals[tm] = av_tm.{x,y,z,w}
+    for (let tm = 0; tm < threadTileM; tm++) {
+      subStmts.push({
+        kind: "indexAssign",
+        arrayName: aValsName,
+        idx: cU32(tm),
+        value: vec4ComponentNode(
+          ref(aVec4Names[tm], "f32"),
+          sub as 0 | 1 | 2 | 3,
+        ),
+      });
+    }
+
+    // Load B vec4s for row (kk4*4 + sub), extract .xyzw statically
+    const tnvVar = freshVar("tnv");
+    const bvVar = freshVar("bv");
+    const bRowIdx = binOp("add", binOp("mul", ref(kk4Var), cU32(4)), cU32(sub));
+    subStmts.push(
+      forRange0(tnvVar, cU32(ttNv4), [
+        {
+          kind: "let",
+          name: bvVar,
+          dtype: "f32",
+          value: vec4SharedReadNode(
+            bName,
+            binOp(
+              "add",
+              binOp("mul", bRowIdx, cU32(bStrideV4)),
+              binOp(
+                "add",
+                binOp("mul", ref("thread_col"), cU32(ttNv4)),
+                ref(tnvVar),
+              ),
+            ),
+          ),
+        },
+        ...([0, 1, 2, 3] as const).map((k) => ({
+          kind: "indexAssign" as const,
+          arrayName: bValsName,
+          idx: binOp("add", binOp("mul", ref(tnvVar), cU32(4)), cU32(k)),
+          value: vec4ComponentNode(ref(bvVar, "f32"), k),
+        })),
+      ]),
+    );
+
+    // Outer product: acc[tm*ttN + tn] += a_vals[tm] * b_vals[tn]
+    const tmVar2 = freshVar("tm");
+    const tnVar2 = freshVar("tn");
+    subStmts.push(
+      forRange0(tmVar2, cU32(threadTileM), [
+        forRange0(tnVar2, cU32(threadTileN), [
+          {
+            kind: "indexAddAssign",
+            arrayName: targetName,
+            idx: binOp(
+              "add",
+              binOp("mul", ref(tmVar2), cU32(threadTileN)),
+              ref(tnVar2),
+            ),
+            value: binOp(
+              "mul",
+              arrayRead(aValsName, ref(tmVar2)),
+              arrayRead(bValsName, ref(tnVar2)),
+              "f32",
+            ),
+          },
+        ]),
+      ]),
+    );
+
+    kk4Loop.push(...subStmts);
+  }
+
+  result.push(forRange0(kk4Var, cU32(innerDim / 4), kk4Loop));
 
   // barrier() after shared memory use
   result.push({ kind: "barrier" });
@@ -1447,7 +1934,43 @@ function lowerBlockDotRegSharedT(stmt: BlockDotStmt): Statement[] {
         : base;
     };
 
-    if (useVec4) {
+    if (useVec4 && _smemVec4Arrays.has(bName)) {
+      // Vec4 shared memory path: B stored as array<vec4<f32>, N/4>
+      // One vec4SharedRead per iteration instead of 4 scalar sharedReads
+      const bStrideV4 = bStride / 4;
+      const physInnerDimV4 = physInnerDim / 4;
+      const d4Var = freshVar("d4");
+      // B vec4 index: j * bStrideV4 + sub_idx * physInnerDimV4 + d4
+      const bV4Idx = (d4: IRNode) => {
+        const base = binOp("add", binOp("mul", ref(jVar), cU32(bStrideV4)), d4);
+        return _activeTPR > 1
+          ? binOp(
+              "add",
+              binOp("mul", ref("_sub_idx"), cU32(physInnerDimV4)),
+              base,
+            )
+          : base;
+      };
+      jBody.push(
+        forRange0(d4Var, cU32(physInnerDimV4), [
+          {
+            kind: "addAssign",
+            name: sVar,
+            value: vec4NativeDotNode(
+              vec4ConstructNode(
+                ...([0, 1, 2, 3].map((k) =>
+                  arrayRead(
+                    aName,
+                    binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k)),
+                  ),
+                ) as [IRNode, IRNode, IRNode, IRNode]),
+              ),
+              vec4SharedReadNode(bName, bV4Idx(ref(d4Var))),
+            ),
+          },
+        ]),
+      );
+    } else if (useVec4) {
       // Vec4 path: partial inner loop over physInnerDim/4 vec4 dots
       const d4Var = freshVar("d4");
       jBody.push(
@@ -1636,7 +2159,47 @@ function lowerBlockDotRegSharedNN(stmt: BlockDotStmt): Statement[] {
       return binOp("add", binOp("mul", ref(jVar), cU32(bStride)), colIdx);
     };
 
-    if (useVec4) {
+    if (useVec4 && _smemVec4Arrays.has(bName)) {
+      // Vec4 shared memory path: read one vec4, extract 4 components
+      const bStrideV4 = bStride / 4;
+      const physOutColsV4 = physOutCols / 4;
+      const d4Var = freshVar("d4");
+      const bvVar = freshVar("bv");
+      const d4Body: Statement[] = [];
+      // B vec4 index: j * bStrideV4 + sub_idx * physOutColsV4 + d4
+      const bV4Idx = (() => {
+        const colIdx =
+          _activeTPR > 1
+            ? binOp(
+                "add",
+                binOp("mul", ref("_sub_idx"), cU32(physOutColsV4)),
+                ref(d4Var),
+              )
+            : ref(d4Var);
+        return binOp("add", binOp("mul", ref(jVar), cU32(bStrideV4)), colIdx);
+      })();
+      d4Body.push({
+        kind: "let",
+        name: bvVar,
+        dtype: "f32",
+        value: vec4SharedReadNode(bName, bV4Idx),
+      });
+      for (let k = 0; k < 4; k++) {
+        const regIdx = binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k));
+        d4Body.push({
+          kind: "indexAddAssign",
+          arrayName: resultName,
+          idx: regIdx,
+          value: binOp(
+            "mul",
+            ref(pVar, "f32"),
+            vec4ComponentNode(ref(bvVar), k as 0 | 1 | 2 | 3),
+            "f32",
+          ),
+        });
+      }
+      jBody.push(forRange0(d4Var, cU32(physOutColsV4), d4Body));
+    } else if (useVec4) {
       // Vec4 path: for d4 in 0..physOutCols/4
       const d4Var = freshVar("d4");
       const d4Body: Statement[] = [];
@@ -1747,7 +2310,45 @@ function lowerBlockDotRow(stmt: BlockDotRowStmt): Statement[] {
       : base;
   };
 
-  if (useVec4) {
+  if (useVec4 && _smemVec4Arrays.has(bName)) {
+    // Vec4 shared memory: single vec4SharedRead + vec4NativeDot per iteration
+    const bStrideV4 = bStride / 4;
+    const physInnerDimV4 = physInnerDim / 4;
+    const d4Var = freshVar("d4");
+    const bV4Idx = (() => {
+      const base = binOp(
+        "add",
+        binOp("mul", rowIdx, cU32(bStrideV4)),
+        ref(d4Var),
+      );
+      return _activeTPR > 1
+        ? binOp(
+            "add",
+            binOp("mul", ref("_sub_idx"), cU32(physInnerDimV4)),
+            base,
+          )
+        : base;
+    })();
+    result.push(
+      forRange0(d4Var, cU32(physInnerDimV4), [
+        {
+          kind: "addAssign",
+          name: resultName,
+          value: vec4NativeDotNode(
+            vec4ConstructNode(
+              ...([0, 1, 2, 3].map((k) =>
+                arrayRead(
+                  aName,
+                  binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k)),
+                ),
+              ) as [IRNode, IRNode, IRNode, IRNode]),
+            ),
+            vec4SharedReadNode(bName, bV4Idx),
+          ),
+        },
+      ]),
+    );
+  } else if (useVec4) {
     const d4Var = freshVar("d4");
     result.push(
       forRange0(d4Var, cU32(physInnerDim / 4), [
@@ -1827,7 +2428,46 @@ function lowerBlockAccumRow(stmt: BlockAccumRowStmt): Statement[] {
     return binOp("add", binOp("mul", rowIdx, cU32(bStride)), colIdx);
   };
 
-  if (useVec4) {
+  if (useVec4 && _smemVec4Arrays.has(bName)) {
+    // Vec4 shared memory: read one vec4, extract components
+    const bStrideV4 = bStride / 4;
+    const physOutColsV4 = physOutCols / 4;
+    const d4Var = freshVar("d4");
+    const bvVar = freshVar("bv");
+    const d4Body: Statement[] = [];
+    const bV4Idx = (() => {
+      const colIdx =
+        _activeTPR > 1
+          ? binOp(
+              "add",
+              binOp("mul", ref("_sub_idx"), cU32(physOutColsV4)),
+              ref(d4Var),
+            )
+          : ref(d4Var);
+      return binOp("add", binOp("mul", rowIdx, cU32(bStrideV4)), colIdx);
+    })();
+    d4Body.push({
+      kind: "let",
+      name: bvVar,
+      dtype: "f32",
+      value: vec4SharedReadNode(bName, bV4Idx),
+    });
+    for (let k = 0; k < 4; k++) {
+      const regIdx = binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k));
+      d4Body.push({
+        kind: "indexAddAssign",
+        arrayName: accName,
+        idx: regIdx,
+        value: binOp(
+          "mul",
+          ref(scalarName, "f32"),
+          vec4ComponentNode(ref(bvVar), k as 0 | 1 | 2 | 3),
+          "f32",
+        ),
+      });
+    }
+    result.push(forRange0(d4Var, cU32(physOutColsV4), d4Body));
+  } else if (useVec4) {
     const d4Var = freshVar("d4");
     const d4Body: Statement[] = [];
     for (let k = 0; k < 4; k++) {

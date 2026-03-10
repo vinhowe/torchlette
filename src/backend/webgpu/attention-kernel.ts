@@ -193,7 +193,7 @@ function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
         lPrev.add_(scores.sum(1));
         mPrev.assign(mMax);
 
-        const V = ctx.load2D("V", tilePtr, tileMask);
+        const V = ctx.load2D("V", tilePtr, tileMask, { reuseShared: K });
         ctx.dotAccum(scores, V, oAcc);
       });
 

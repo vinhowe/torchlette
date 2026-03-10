@@ -301,6 +301,16 @@ function exprFor(node: IRNode, bindings: BindingMap, v4?: Vec4Ctx): string {
       const comp = ["x", "y", "z", "w"][node.comp];
       return `${v}.${comp}`;
     }
+    case "vec4DynComponent": {
+      const v = exprFor(node.value, bindings, v4);
+      // When index is a compile-time constant 0-3, use static .x/.y/.z/.w
+      if (node.idx.kind === "const" && typeof node.idx.value === "number") {
+        const comp = ["x", "y", "z", "w"][node.idx.value];
+        if (comp) return `${v}.${comp}`;
+      }
+      const idx = exprFor(node.idx, bindings, v4);
+      return `${v}[${idx}]`;
+    }
     case "vec4Binary": {
       const a = exprFor(node.a, bindings, v4);
       const b = exprFor(node.b, bindings, v4);
@@ -996,6 +1006,8 @@ function someExprChild(node: IRNode, fn: (child: IRNode) => boolean): boolean {
     case "vec4Splat":
     case "vec4Component":
       return fn(node.value);
+    case "vec4DynComponent":
+      return fn(node.value) || fn(node.idx);
     case "vec4Construct":
       return fn(node.x) || fn(node.y) || fn(node.z) || fn(node.w);
     case "vec4NativeDot":
