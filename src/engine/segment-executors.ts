@@ -11,17 +11,12 @@ import {
   flushBufferPool,
   flushSharedEncoder,
   setAdamBatchMode,
-  setCurrentOpLabel,
 } from "../backend/webgpu";
 import {
   asGPUTensor,
   type GPUBuffer,
   type GPUDevice,
 } from "../backend/webgpu/gpu-types";
-import {
-  recordFusionFallback,
-  setProfileModule,
-} from "../backend/webgpu/profiler";
 import { contiguousStrides, sizeOf } from "../core/shape";
 import { executeNode } from "./executor-sequential";
 import {
@@ -48,6 +43,11 @@ import {
   wrapResultAsStorage,
 } from "./node-factory";
 import { executeOp, getInputStorage, withProfileContext } from "./op-dispatch";
+import {
+  recordFusionFallback,
+  setCurrentOpLabel,
+  setProfileModule,
+} from "./profiler";
 import type { ReductionGroup } from "./reduction-detect";
 import { releaseDeadTensors } from "./storage-tracker";
 

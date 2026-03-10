@@ -13,8 +13,8 @@
  * Non-registry ops (matmul, reductions, views, etc.) are listed manually below.
  */
 
+import { OP_REGISTRY } from "../backend/op-registry";
 import type { DType } from "../backend/types";
-import { OP_REGISTRY } from "../backend/webgpu/ops/registry";
 import type { LazyOpCode } from "./lazy-types";
 
 type OpDtypeCategory =
