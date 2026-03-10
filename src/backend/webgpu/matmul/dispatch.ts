@@ -11,6 +11,7 @@ import { dispatchComputePass } from "../dispatch";
 import type { RecordedDispatch } from "../dispatch-recording";
 import { getWarmupPipeline, recordPipeline } from "../pipeline-warmup";
 import { getCurrentOpLabel } from "../shared-encoder";
+import { onTeardown } from "../webgpu-state";
 
 /** Module-level recording buffer (shared with index.ts recording system). */
 let matmulRecordingBuffer: RecordedDispatch[] | null = null;
@@ -123,7 +124,7 @@ function getConfigForShape(
   if (cached) {
     return cached;
   }
-  return getDefaultConfigForShape(shapeClass, hasEpilogue);
+  return getDefaultConfigForShape(shapeClass, hasEpilogue, m, n, k);
 }
 
 /**
@@ -136,6 +137,7 @@ export function resetMatmulState(): void {
   autotuneCounter = 0;
   autotuningInProgress.clear();
 }
+onTeardown(resetMatmulState);
 
 /**
  * Clear the dispatch tuning cache.
@@ -263,7 +265,7 @@ async function autotuneIfNeeded(
 
   try {
     const shapeClass = classifyShape(m, n, k, 1);
-    const baseConfig = getDefaultConfigForShape(shapeClass, false);
+    const baseConfig = getDefaultConfigForShape(shapeClass, false, m, n, k);
     const candidates = generateNeighborConfigs(baseConfig, includeSubgroups);
     // Add DEFAULT_CONFIG if not already included
     const candidateKeys = new Set(

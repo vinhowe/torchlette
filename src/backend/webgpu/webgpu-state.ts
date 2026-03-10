@@ -164,6 +164,27 @@ export function setOutputSeqIndex(v: number): void {
 }
 
 // ============================================================================
+// Teardown Registry (used by destroyWebGPU for test isolation)
+// ============================================================================
+
+/**
+ * Modules register cleanup callbacks here (e.g. to clear kernel caches,
+ * destroy persistent GPU buffers). Called by destroyWebGPU() before
+ * device.destroy(). Each module self-registers at import time — gpu-context.ts
+ * doesn't need to know about every kernel module.
+ */
+const teardownCallbacks: Array<() => void> = [];
+
+export function onTeardown(cb: () => void): void {
+  teardownCallbacks.push(cb);
+}
+
+export function runTeardownCallbacks(): void {
+  for (const cb of teardownCallbacks) cb();
+  teardownCallbacks.length = 0;
+}
+
+// ============================================================================
 // Current Op Label (moved from shared-encoder.ts)
 // ============================================================================
 

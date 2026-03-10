@@ -13,7 +13,7 @@ import {
 import { allocateOutputBuffer } from "./buffer-arena";
 import { dispatchComputePass } from "./dispatch";
 import type { RecordedDispatch } from "./dispatch-recording";
-import { trackSharedEncoderWrite } from "./webgpu-state";
+import { onTeardown, trackSharedEncoderWrite } from "./webgpu-state";
 
 /** Module-level recording buffer (shared with index.ts recording system). */
 let fusionRecordingBuffer: RecordedDispatch[] | null = null;
@@ -131,6 +131,7 @@ export function resetFusionCache(): void {
   globalKernelCache?.clear();
   globalKernelCache = null;
 }
+onTeardown(resetFusionCache);
 
 // ============================================================================
 // Dispatch

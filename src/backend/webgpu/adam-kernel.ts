@@ -32,7 +32,7 @@ import type {
   UniformType,
   VarHandle,
 } from "./tile-ir";
-import { trackSharedEncoderWrite } from "./webgpu-state";
+import { onTeardown, trackSharedEncoderWrite } from "./webgpu-state";
 
 // ============================================================================
 // Tile-IR Adam Spec Factory
@@ -427,3 +427,4 @@ export function resetAdamKernelState(): void {
   for (const d of adamDispatchers.values()) d.reset();
   adamDispatchers.clear();
 }
+onTeardown(resetAdamKernelState);

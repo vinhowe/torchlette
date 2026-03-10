@@ -15,7 +15,7 @@ import { GPUBufferUsage } from "./gpu-types";
 import { WORKGROUP_SIZE } from "./shape-utils";
 import { createTileKernelDispatcher } from "./tile-dispatch";
 import { ceilDivGrid, perRowKernel, type TileKernelSpec } from "./tile-ir";
-import { requireContext } from "./webgpu-state";
+import { onTeardown, requireContext } from "./webgpu-state";
 
 const WG = WORKGROUP_SIZE; // 256
 
@@ -239,6 +239,7 @@ export function resetRMSNormKernelState(): void {
   for (const buf of rowStatsTempCache.values()) buf.destroy();
   rowStatsTempCache.clear();
 }
+onTeardown(resetRMSNormKernelState);
 
 // ============================================================================
 // Dispatch Functions

@@ -32,6 +32,7 @@ import {
   type TileKernelInstance,
 } from "./tile-dispatch";
 import type { TileKernelSpec } from "./tile-ir";
+import { onTeardown } from "./webgpu-state";
 
 // ============================================================================
 // Tile-IR Unscale Spec
@@ -354,3 +355,4 @@ export function resetUnscaleKernelState(): void {
     unscaleDispatcher = null;
   }
 }
+onTeardown(resetUnscaleKernelState);
