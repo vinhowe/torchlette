@@ -15,6 +15,20 @@ export type AdamOptions = {
   adamW?: boolean;
 };
 
+/** Per-group overrides for Adam/AdamW. Unset fields inherit from defaults. */
+export type AdamParamGroup = {
+  params: Tensor[];
+  lr?: number;
+  weightDecay?: number;
+};
+
+/** Resolved internal group with all fields populated. */
+type ResolvedAdamGroup = {
+  params: Tensor[];
+  lr: number;
+  weightDecay: number;
+};
+
 export class Adam {
   private params: Tensor[];
   private readonly api: Torchlette;
@@ -22,9 +36,12 @@ export class Adam {
   private readonly beta1: number;
   private readonly beta2: number;
   private readonly eps: number;
-  private readonly weightDecay: number;
   private readonly adamW: boolean;
   private readonly device: DeviceKind;
+  /** Per-group hyperparameters. Single-group mode has exactly one entry. */
+  private _groups: ResolvedAdamGroup[];
+  /** Maps flat param index → group index. */
+  private _groupIndex: number[];
   private expAvg: Array<RuntimeTensor | null>;
   private expAvgSq: Array<RuntimeTensor | null>;
   private steps: number[];
@@ -34,10 +51,25 @@ export class Adam {
   private _pendingUnscale: { invScale: number; infFlagBuffer: unknown } | null =
     null;
 
-  constructor(params: Tensor[], options: AdamOptions, api?: Torchlette) {
+  constructor(
+    params: Tensor[] | AdamParamGroup[],
+    options: AdamOptions,
+    api?: Torchlette,
+  ) {
+    // Detect whether first arg is param groups or flat params
+    const isGroups =
+      params.length > 0 &&
+      typeof params[0] === "object" &&
+      "params" in params[0] &&
+      Array.isArray((params[0] as AdamParamGroup).params);
+
+    const flatParams: Tensor[] = isGroups
+      ? (params as AdamParamGroup[]).flatMap((g) => g.params)
+      : (params as Tensor[]);
+
     const { api: engine, device } = validateOptimizerParams(
       "Adam",
-      params,
+      flatParams,
       api,
     );
     if (options.lr <= 0) {
@@ -61,26 +93,79 @@ export class Adam {
     this.beta1 = beta1;
     this.beta2 = beta2;
     this.eps = eps;
-    this.params = params.slice();
-    this.weightDecay = options.weightDecay ?? 0;
+    this.params = flatParams;
     this.adamW = options.adamW ?? false;
     this.device = device;
-    this.expAvg = new Array(params.length).fill(null);
-    this.expAvgSq = new Array(params.length).fill(null);
-    this.steps = new Array(params.length).fill(0);
-    this._pendingNodes = new Array(params.length).fill(null);
+
+    // Build groups
+    if (isGroups) {
+      const groups = params as AdamParamGroup[];
+      this._groups = groups.map((g) => ({
+        params: g.params,
+        lr: g.lr ?? options.lr,
+        weightDecay: g.weightDecay ?? options.weightDecay ?? 0,
+      }));
+      this._groupIndex = [];
+      for (let gi = 0; gi < groups.length; gi++) {
+        for (let pi = 0; pi < groups[gi].params.length; pi++) {
+          this._groupIndex.push(gi);
+        }
+      }
+    } else {
+      this._groups = [
+        {
+          params: flatParams,
+          lr: options.lr,
+          weightDecay: options.weightDecay ?? 0,
+        },
+      ];
+      this._groupIndex = flatParams.map(() => 0);
+    }
+
+    this.expAvg = new Array(flatParams.length).fill(null);
+    this.expAvgSq = new Array(flatParams.length).fill(null);
+    this.steps = new Array(flatParams.length).fill(0);
+    this._pendingNodes = new Array(flatParams.length).fill(null);
   }
 
   getParams(): Tensor[] {
     return this.params.slice();
   }
 
+  /** Get the default (first group) learning rate. */
   getLR(): number {
-    return this._lr;
+    return this._groups[0].lr;
   }
 
+  /** Set learning rate for all parameter groups. */
   setLR(lr: number): void {
     this._lr = lr;
+    for (const g of this._groups) g.lr = lr;
+  }
+
+  /** Get per-group learning rates. */
+  getParamGroupLRs(): number[] {
+    return this._groups.map((g) => g.lr);
+  }
+
+  /** Set learning rate for a specific parameter group. */
+  setGroupLR(groupIndex: number, lr: number): void {
+    this._groups[groupIndex].lr = lr;
+  }
+
+  /** Get the number of parameter groups. */
+  get numGroups(): number {
+    return this._groups.length;
+  }
+
+  /** Get per-param LR for the fused kernel. */
+  private _getParamLR(i: number): number {
+    return this._groups[this._groupIndex[i]].lr;
+  }
+
+  /** Get per-param weight decay for the fused kernel. */
+  private _getParamWeightDecay(i: number): number {
+    return this._groups[this._groupIndex[i]].weightDecay;
   }
 
   /**
@@ -179,13 +264,15 @@ export class Adam {
         this.expAvgSq[i] = runtime.zeros(param.shape, this.device);
       }
 
+      const wd = this._getParamWeightDecay(i);
+      const lr = this._getParamLR(i);
       const config: AdamStepConfig = {
         beta1: this.beta1,
         beta2: this.beta2,
         stepSize,
         eps: this.eps,
-        weightDecay: this.weightDecay,
-        lrTimesWd: this._lr * this.weightDecay,
+        weightDecay: wd,
+        lrTimesWd: lr * wd,
         decoupledWd: this.adamW,
         emitF16: true,
         invScale: unscale?.invScale,
@@ -242,7 +329,7 @@ export class Adam {
     this.steps[i] = step;
     const bc1 = 1 - this.beta1 ** step;
     const bc2 = 1 - this.beta2 ** step;
-    return (this._lr * Math.sqrt(bc2)) / bc1;
+    return (this._getParamLR(i) * Math.sqrt(bc2)) / bc1;
   }
 
   /**
@@ -257,8 +344,9 @@ export class Adam {
     const stepSize = this._advanceStep(i);
 
     let gradAdj = grad;
-    if (this.weightDecay !== 0) {
-      const paramW = runtime.mul(param._unwrap(), this.weightDecay);
+    const wd = this._getParamWeightDecay(i);
+    if (wd !== 0) {
+      const paramW = runtime.mul(param._unwrap(), wd);
       gradAdj = runtime.add(gradAdj, paramW);
     }
 
