@@ -68,6 +68,11 @@ export type {
   TransposeOptions,
 };
 
+import {
+  BINARY_AUTOGRAD_OPS,
+  OP_REGISTRY,
+  UNARY_AUTOGRAD_OPS,
+} from "./backend/op-registry";
 // Import extracted modules
 import {
   applyAutocastImpl,
@@ -84,168 +89,6 @@ import {
   scaledDotProductAttentionImpl,
   softmaxImpl,
 } from "./frontend-fused-ops";
-
-// ============================================================================
-// Table-driven unary op autograd (§9)
-// ============================================================================
-
-/**
- * Gradient function for a unary op.
- * @param rt - RuntimeEngine for tensor ops
- * @param grad - Upstream gradient (RuntimeTensor)
- * @param savedA - Saved input tensor (frontend Tensor), null if needsSave=false
- */
-type UnaryGradFn = (
-  rt: RuntimeEngine,
-  grad: RuntimeTensor,
-  savedA: Tensor | undefined,
-) => RuntimeTensor;
-
-interface UnaryOpSpec {
-  autocast?: string; // autocast category (omit = no cast)
-  needsSave?: boolean; // save input for backward? (default true for grad ops)
-  grad: UnaryGradFn | null; // null = no grad (floor, ceil, etc.)
-}
-
-const UNARY_OPS: Record<string, UnaryOpSpec> = {
-  exp: { autocast: "exp", grad: (rt, g, s) => rt.mul(g, rt.exp(s!._unwrap())) },
-  log: {
-    autocast: "log",
-    grad: (rt, g, s) => rt.div(g, rt.add(s!._unwrap(), 1e-8)),
-  },
-  neg: { needsSave: false, grad: (rt, g) => rt.neg(g) },
-  abs: { grad: (rt, g, s) => rt.mul(g, rt.sign(s!._unwrap())) },
-  silu: {
-    grad: (rt, g, s) => {
-      const sig = rt.sigmoid(s!._unwrap());
-      return rt.mul(
-        g,
-        rt.add(sig, rt.mul(s!._unwrap(), rt.mul(sig, rt.sub(1, sig)))),
-      );
-    },
-  },
-  tanh: {
-    grad: (rt, g, s) => {
-      const t = rt.tanh(s!._unwrap());
-      return rt.mul(rt.sub(1, rt.mul(t, t)), g);
-    },
-  },
-  sigmoid: {
-    grad: (rt, g, s) => {
-      const sig = rt.sigmoid(s!._unwrap());
-      return rt.mul(rt.mul(sig, rt.sub(1, sig)), g);
-    },
-  },
-  sin: { grad: (rt, g, s) => rt.mul(g, rt.cos(s!._unwrap())) },
-  cos: { grad: (rt, g, s) => rt.mul(g, rt.neg(rt.sin(s!._unwrap()))) },
-  rsqrt: {
-    grad: (rt, g, s) => {
-      const r = rt.rsqrt(s!._unwrap());
-      return rt.mul(g, rt.mul(-0.5, rt.mul(r, rt.mul(r, r))));
-    },
-  },
-  sqrt: {
-    grad: (rt, g, s) => {
-      const sqrtA = rt.sqrt(s!._unwrap());
-      return rt.mul(g, rt.div(0.5, rt.add(sqrtA, 1e-8)));
-    },
-  },
-  relu: {
-    grad: (rt, g, s) => rt.mul(g, rt.gt(s!._unwrap(), 0)),
-  },
-  floor: { grad: null },
-  ceil: { grad: null },
-  round: { grad: null },
-  sign: { grad: null },
-  isfinite: { grad: null },
-};
-
-// ============================================================================
-// Table-driven binary op autograd (§9)
-// ============================================================================
-
-/**
- * Gradient function for tensor+tensor binary ops.
- * @param rt - RuntimeEngine for tensor ops
- * @param grad - Upstream gradient
- * @param getSaved - Access saved tensor at index
- */
-type BinaryTTGradFn = (
-  rt: RuntimeEngine,
-  grad: RuntimeTensor,
-  getSaved: (i: number) => Tensor,
-) => [RuntimeTensor, RuntimeTensor];
-
-/**
- * Gradient function for tensor+scalar binary ops.
- * @param rt - RuntimeEngine for tensor ops
- * @param grad - Upstream gradient
- * @param getSaved - Access saved tensor at index
- * @param scalar - The scalar operand value
- * @param scalarIsA - True if the scalar is the left operand
- */
-type BinaryTSGradFn = (
-  rt: RuntimeEngine,
-  grad: RuntimeTensor,
-  getSaved: (i: number) => Tensor,
-  scalar: number,
-  scalarIsA: boolean,
-) => RuntimeTensor[];
-
-interface BinaryOpSpec {
-  save?: boolean; // save inputs for backward? (default false)
-  ttGrad: BinaryTTGradFn; // tensor+tensor gradient
-  tsGrad?: BinaryTSGradFn; // tensor+scalar gradient (default: pass through)
-}
-
-const BINARY_OPS: Record<string, BinaryOpSpec> = {
-  add: {
-    ttGrad: (_rt, g) => [g, g],
-  },
-  mul: {
-    save: true,
-    ttGrad: (rt, g, gs) => [
-      rt.mul(g, gs(1)._unwrap()),
-      rt.mul(g, gs(0)._unwrap()),
-    ],
-    tsGrad: (rt, g, _gs, s) => [rt.mul(g, s)],
-  },
-  div: {
-    save: true,
-    ttGrad: (rt, g, gs) => {
-      const sA = gs(0)._unwrap(),
-        sB = gs(1)._unwrap();
-      return [rt.div(g, sB), rt.mul(g, rt.div(rt.neg(sA), rt.mul(sB, sB)))];
-    },
-    tsGrad: (rt, g, gs, scalar, scalarIsA) => {
-      if (!scalarIsA) return [rt.div(g, scalar)]; // a / scalar
-      // scalar / b → -scalar / b² * grad
-      const sB = gs(0)._unwrap();
-      return [rt.mul(g, rt.div(-scalar, rt.mul(sB, sB)))];
-    },
-  },
-  pow: {
-    save: true,
-    // d/da pow(a,b) = b * pow(a, b-1), d/db pow(a,b) = pow(a,b) * log(a)
-    ttGrad: (rt, g, gs) => {
-      const sA = gs(0)._unwrap(),
-        sB = gs(1)._unwrap();
-      return [
-        rt.mul(g, rt.mul(sB, rt.pow(sA, rt.sub(sB, 1)))),
-        rt.mul(g, rt.mul(rt.pow(sA, sB), rt.log(sA))),
-      ];
-    },
-    tsGrad: (rt, g, gs, scalar, scalarIsA) => {
-      const saved = gs(0)._unwrap();
-      if (scalarIsA) {
-        // d/db a^b = a^b * log(a)
-        return [rt.mul(g, rt.mul(rt.pow(scalar, saved), Math.log(scalar)))];
-      }
-      // d/da a^n = n * a^(n-1)
-      return [rt.mul(g, rt.mul(scalar, rt.pow(saved, scalar - 1)))];
-    },
-  },
-};
 
 export class Torchlette {
   readonly engine: Engine;
@@ -580,31 +423,29 @@ export class Torchlette {
   // Math ops (binary, unary, reductions — stay in hub)
   // ============================================================================
 
-  /** Generic dispatcher for table-driven unary ops. */
+  /** Generic dispatcher for registry-driven unary ops. */
   _dispatchUnary(opName: string, a: Tensor): Tensor {
-    const spec = UNARY_OPS[opName];
+    const def = OP_REGISTRY[opName];
     this._assertUsable(a);
-    const castA = spec.autocast
-      ? this._applyAutocast(spec.autocast, [a])[0]
-      : a;
+    const castA = def.autocast ? this._applyAutocast(def.autocast, [a])[0] : a;
     const inner = (
       this.runtime as unknown as Record<
         string,
         (a: RuntimeTensor) => RuntimeTensor
       >
     )[opName](castA._unwrap());
-    if (!spec.grad) return this._wrap(inner);
-    const needsSave = spec.needsSave !== false;
+    if (!def.grad) return this._wrap(inner);
+    const needsSave = def.needsSave !== false;
     const tensorsToSave = needsSave && a.requiresGrad ? [castA] : [];
     return this._wrapWithGrad(
       inner,
       [a],
       (grad, getSaved) => {
         return [
-          spec.grad?.(
+          def.grad?.(
             this.runtime,
             grad,
-            needsSave ? getSaved(0) : undefined,
+            needsSave ? getSaved(0)?._unwrap() : undefined,
           ) ?? null,
         ];
       },
@@ -681,28 +522,24 @@ export class Torchlette {
     );
   }
 
-  /** Generic dispatcher for table-driven binary ops (gradient specs in BINARY_OPS). */
+  /** Generic dispatcher for registry-driven binary ops (gradient specs in OP_REGISTRY). */
   private _dispatchBinaryFromTable(
     opName: string,
     a: Tensor | number,
     b: Tensor | number,
   ): Tensor {
-    const spec = BINARY_OPS[opName];
+    const def = OP_REGISTRY[opName];
     const rt = this.runtime;
     return this._dispatchBinary(
       opName,
       a,
       b,
-      (g, gs) => spec.ttGrad(rt, g, gs),
-      spec.tsGrad
-        ? (g, gs, s, isA) => spec.tsGrad!(rt, g, gs, s, isA)
+      (g, gs) => def.ttGrad!(rt, g, (i) => gs(i)._unwrap()),
+      def.tsGrad
+        ? (g, gs, s, isA) => def.tsGrad!(rt, g, (i) => gs(i)._unwrap(), s, isA)
         : undefined,
-      spec.save ?? false,
+      def.saveBinary ?? false,
     );
-  }
-
-  add(a: Tensor | number, b: Tensor | number): Tensor {
-    return this._dispatchBinaryFromTable("add", a, b);
   }
 
   sub(a: Tensor, b: Tensor | number, options?: SubOptions): Tensor {
@@ -723,14 +560,6 @@ export class Torchlette {
       const gradB = this._sumToShape(scaled, bShape);
       return [gradA, gradB];
     });
-  }
-
-  mul(a: Tensor | number, b: Tensor | number): Tensor {
-    return this._dispatchBinaryFromTable("mul", a, b);
-  }
-
-  div(a: Tensor | number, b: Tensor | number): Tensor {
-    return this._dispatchBinaryFromTable("div", a, b);
   }
 
   matmul(a: Tensor, b: Tensor): Tensor {
@@ -988,10 +817,6 @@ export class Torchlette {
       },
       tensorsToSave,
     );
-  }
-
-  pow(a: Tensor | number, b: Tensor | number): Tensor {
-    return this._dispatchBinaryFromTable("pow", a, b);
   }
 
   softplus(a: Tensor): Tensor {
@@ -1806,7 +1631,7 @@ export class Torchlette {
 // Table-driven method generation — typed declarations + prototype installation
 // ============================================================================
 
-// Unary ops: gradient specs live in UNARY_OPS table, dispatch via _dispatchUnary.
+// Unary ops: gradient specs live in OP_REGISTRY, dispatch via _dispatchUnary.
 interface Torchlette {
   sqrt(a: Tensor): Tensor;
   relu(a: Tensor): Tensor;
@@ -1827,12 +1652,30 @@ interface Torchlette {
   isfinite(a: Tensor): Tensor;
 }
 
-for (const opName of Object.keys(UNARY_OPS)) {
+for (const opName of UNARY_AUTOGRAD_OPS) {
   (Torchlette.prototype as any)[opName] = function (
     this: Torchlette,
     a: Tensor,
   ) {
     return this._dispatchUnary(opName, a);
+  };
+}
+
+// Binary ops: gradient specs live in OP_REGISTRY, dispatch via _dispatchBinaryFromTable.
+interface Torchlette {
+  add(a: Tensor | number, b: Tensor | number): Tensor;
+  mul(a: Tensor | number, b: Tensor | number): Tensor;
+  div(a: Tensor | number, b: Tensor | number): Tensor;
+  pow(a: Tensor | number, b: Tensor | number): Tensor;
+}
+
+for (const opName of BINARY_AUTOGRAD_OPS) {
+  (Torchlette.prototype as any)[opName] = function (
+    this: Torchlette,
+    a: Tensor | number,
+    b: Tensor | number,
+  ) {
+    return this._dispatchBinaryFromTable(opName, a, b);
   };
 }
 
