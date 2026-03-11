@@ -160,6 +160,93 @@ const UNARY_OPS: Record<string, UnaryOpSpec> = {
   isfinite: { grad: null },
 };
 
+// ============================================================================
+// Table-driven binary op autograd (§9)
+// ============================================================================
+
+/**
+ * Gradient function for tensor+tensor binary ops.
+ * @param rt - RuntimeEngine for tensor ops
+ * @param grad - Upstream gradient
+ * @param getSaved - Access saved tensor at index
+ */
+type BinaryTTGradFn = (
+  rt: RuntimeEngine,
+  grad: RuntimeTensor,
+  getSaved: (i: number) => Tensor,
+) => [RuntimeTensor, RuntimeTensor];
+
+/**
+ * Gradient function for tensor+scalar binary ops.
+ * @param rt - RuntimeEngine for tensor ops
+ * @param grad - Upstream gradient
+ * @param getSaved - Access saved tensor at index
+ * @param scalar - The scalar operand value
+ * @param scalarIsA - True if the scalar is the left operand
+ */
+type BinaryTSGradFn = (
+  rt: RuntimeEngine,
+  grad: RuntimeTensor,
+  getSaved: (i: number) => Tensor,
+  scalar: number,
+  scalarIsA: boolean,
+) => RuntimeTensor[];
+
+interface BinaryOpSpec {
+  save?: boolean; // save inputs for backward? (default false)
+  ttGrad: BinaryTTGradFn; // tensor+tensor gradient
+  tsGrad?: BinaryTSGradFn; // tensor+scalar gradient (default: pass through)
+}
+
+const BINARY_OPS: Record<string, BinaryOpSpec> = {
+  add: {
+    ttGrad: (_rt, g) => [g, g],
+  },
+  mul: {
+    save: true,
+    ttGrad: (rt, g, gs) => [
+      rt.mul(g, gs(1)._unwrap()),
+      rt.mul(g, gs(0)._unwrap()),
+    ],
+    tsGrad: (rt, g, _gs, s) => [rt.mul(g, s)],
+  },
+  div: {
+    save: true,
+    ttGrad: (rt, g, gs) => {
+      const sA = gs(0)._unwrap(),
+        sB = gs(1)._unwrap();
+      return [rt.div(g, sB), rt.mul(g, rt.div(rt.neg(sA), rt.mul(sB, sB)))];
+    },
+    tsGrad: (rt, g, gs, scalar, scalarIsA) => {
+      if (!scalarIsA) return [rt.div(g, scalar)]; // a / scalar
+      // scalar / b → -scalar / b² * grad
+      const sB = gs(0)._unwrap();
+      return [rt.mul(g, rt.div(-scalar, rt.mul(sB, sB)))];
+    },
+  },
+  pow: {
+    save: true,
+    // d/da pow(a,b) = b * pow(a, b-1), d/db pow(a,b) = pow(a,b) * log(a)
+    ttGrad: (rt, g, gs) => {
+      const sA = gs(0)._unwrap(),
+        sB = gs(1)._unwrap();
+      return [
+        rt.mul(g, rt.mul(sB, rt.pow(sA, rt.sub(sB, 1)))),
+        rt.mul(g, rt.mul(rt.pow(sA, sB), rt.log(sA))),
+      ];
+    },
+    tsGrad: (rt, g, gs, scalar, scalarIsA) => {
+      const saved = gs(0)._unwrap();
+      if (scalarIsA) {
+        // d/db a^b = a^b * log(a)
+        return [rt.mul(g, rt.mul(rt.pow(scalar, saved), Math.log(scalar)))];
+      }
+      // d/da a^n = n * a^(n-1)
+      return [rt.mul(g, rt.mul(scalar, rt.pow(saved, scalar - 1)))];
+    },
+  },
+};
+
 export class Torchlette {
   readonly engine: Engine;
   readonly runtime: RuntimeEngine;
@@ -494,7 +581,7 @@ export class Torchlette {
   // ============================================================================
 
   /** Generic dispatcher for table-driven unary ops. */
-  private _dispatchUnary(opName: string, a: Tensor): Tensor {
+  _dispatchUnary(opName: string, a: Tensor): Tensor {
     const spec = UNARY_OPS[opName];
     this._assertUsable(a);
     const castA = spec.autocast
@@ -594,8 +681,28 @@ export class Torchlette {
     );
   }
 
+  /** Generic dispatcher for table-driven binary ops (gradient specs in BINARY_OPS). */
+  private _dispatchBinaryFromTable(
+    opName: string,
+    a: Tensor | number,
+    b: Tensor | number,
+  ): Tensor {
+    const spec = BINARY_OPS[opName];
+    const rt = this.runtime;
+    return this._dispatchBinary(
+      opName,
+      a,
+      b,
+      (g, gs) => spec.ttGrad(rt, g, gs),
+      spec.tsGrad
+        ? (g, gs, s, isA) => spec.tsGrad!(rt, g, gs, s, isA)
+        : undefined,
+      spec.save ?? false,
+    );
+  }
+
   add(a: Tensor | number, b: Tensor | number): Tensor {
-    return this._dispatchBinary("add", a, b, (g) => [g, g]);
+    return this._dispatchBinaryFromTable("add", a, b);
   }
 
   sub(a: Tensor, b: Tensor | number, options?: SubOptions): Tensor {
@@ -619,36 +726,11 @@ export class Torchlette {
   }
 
   mul(a: Tensor | number, b: Tensor | number): Tensor {
-    const rt = this.runtime;
-    return this._dispatchBinary(
-      "mul",
-      a,
-      b,
-      (g, gs) => [rt.mul(g, gs(1)._unwrap()), rt.mul(g, gs(0)._unwrap())],
-      (g, _, s) => [rt.mul(g, s)],
-      true,
-    );
+    return this._dispatchBinaryFromTable("mul", a, b);
   }
 
   div(a: Tensor | number, b: Tensor | number): Tensor {
-    const rt = this.runtime;
-    return this._dispatchBinary(
-      "div",
-      a,
-      b,
-      (g, gs) => {
-        const sA = gs(0)._unwrap(),
-          sB = gs(1)._unwrap();
-        return [rt.div(g, sB), rt.mul(g, rt.div(rt.neg(sA), rt.mul(sB, sB)))];
-      },
-      (g, gs, scalar, scalarIsA) => {
-        if (!scalarIsA) return [rt.div(g, scalar)]; // a / scalar
-        // scalar / b → -scalar / b² * grad
-        const sB = gs(0)._unwrap();
-        return [rt.mul(g, rt.div(-scalar, rt.mul(sB, sB)))];
-      },
-      true,
-    );
+    return this._dispatchBinaryFromTable("div", a, b);
   }
 
   matmul(a: Tensor, b: Tensor): Tensor {
@@ -781,35 +863,6 @@ export class Torchlette {
     );
   }
 
-  sqrt(a: Tensor): Tensor {
-    return this._dispatchUnary("sqrt", a);
-  }
-
-  relu(a: Tensor): Tensor {
-    return this._dispatchUnary("relu", a);
-  }
-
-  exp(a: Tensor): Tensor {
-    return this._dispatchUnary("exp", a);
-  }
-  log(a: Tensor): Tensor {
-    return this._dispatchUnary("log", a);
-  }
-  neg(a: Tensor): Tensor {
-    return this._dispatchUnary("neg", a);
-  }
-
-  abs(a: Tensor): Tensor {
-    return this._dispatchUnary("abs", a);
-  }
-
-  tanh(a: Tensor): Tensor {
-    return this._dispatchUnary("tanh", a);
-  }
-  sigmoid(a: Tensor): Tensor {
-    return this._dispatchUnary("sigmoid", a);
-  }
-
   gelu(a: Tensor, options?: GeluOptions): Tensor {
     this._assertUsable(a);
     const approximate = options?.approximate ?? "tanh";
@@ -910,33 +963,6 @@ export class Torchlette {
     }
   }
 
-  silu(a: Tensor): Tensor {
-    return this._dispatchUnary("silu", a);
-  }
-
-  sin(a: Tensor): Tensor {
-    return this._dispatchUnary("sin", a);
-  }
-  cos(a: Tensor): Tensor {
-    return this._dispatchUnary("cos", a);
-  }
-
-  rsqrt(a: Tensor): Tensor {
-    return this._dispatchUnary("rsqrt", a);
-  }
-  floor(a: Tensor): Tensor {
-    return this._dispatchUnary("floor", a);
-  }
-  ceil(a: Tensor): Tensor {
-    return this._dispatchUnary("ceil", a);
-  }
-  round(a: Tensor): Tensor {
-    return this._dispatchUnary("round", a);
-  }
-  sign(a: Tensor): Tensor {
-    return this._dispatchUnary("sign", a);
-  }
-
   clamp(a: Tensor, min: number | null, max: number | null): Tensor {
     this._assertUsable(a);
     const inner = this.runtime.clamp(a._unwrap(), min, max);
@@ -965,35 +991,7 @@ export class Torchlette {
   }
 
   pow(a: Tensor | number, b: Tensor | number): Tensor {
-    const rt = this.runtime;
-    return this._dispatchBinary(
-      "pow",
-      a,
-      b,
-      // d/da pow(a,b) = b * pow(a, b-1), d/db pow(a,b) = pow(a,b) * log(a)
-      (g, gs) => {
-        const sA = gs(0)._unwrap(),
-          sB = gs(1)._unwrap();
-        return [
-          rt.mul(g, rt.mul(sB, rt.pow(sA, rt.sub(sB, 1)))),
-          rt.mul(g, rt.mul(rt.pow(sA, sB), rt.log(sA))),
-        ];
-      },
-      (g, gs, scalar, scalarIsA) => {
-        const saved = gs(0)._unwrap();
-        if (scalarIsA) {
-          // d/db a^b = a^b * log(a)
-          return [rt.mul(g, rt.mul(rt.pow(scalar, saved), Math.log(scalar)))];
-        }
-        // d/da a^n = n * a^(n-1)
-        return [rt.mul(g, rt.mul(scalar, rt.pow(saved, scalar - 1)))];
-      },
-      true,
-    );
-  }
-
-  isfinite(a: Tensor): Tensor {
-    return this._dispatchUnary("isfinite", a);
+    return this._dispatchBinaryFromTable("pow", a, b);
   }
 
   softplus(a: Tensor): Tensor {
@@ -1167,31 +1165,13 @@ export class Torchlette {
   // Comparison ops
   // ============================================================================
 
-  private _cmpOp(
+  _cmpOp(
     op: "gt" | "lt" | "ge" | "le" | "eq" | "ne",
     a: Tensor,
     b: Tensor,
   ): Tensor {
     this._assertUsable(a, b);
     return this._wrap(this.runtime[op](a._unwrap(), b._unwrap()));
-  }
-  gt(a: Tensor, b: Tensor): Tensor {
-    return this._cmpOp("gt", a, b);
-  }
-  lt(a: Tensor, b: Tensor): Tensor {
-    return this._cmpOp("lt", a, b);
-  }
-  ge(a: Tensor, b: Tensor): Tensor {
-    return this._cmpOp("ge", a, b);
-  }
-  le(a: Tensor, b: Tensor): Tensor {
-    return this._cmpOp("le", a, b);
-  }
-  eq(a: Tensor, b: Tensor): Tensor {
-    return this._cmpOp("eq", a, b);
-  }
-  ne(a: Tensor, b: Tensor): Tensor {
-    return this._cmpOp("ne", a, b);
   }
 
   // ============================================================================
@@ -1820,6 +1800,62 @@ export class Torchlette {
       }
     }
   }
+}
+
+// ============================================================================
+// Table-driven method generation — typed declarations + prototype installation
+// ============================================================================
+
+// Unary ops: gradient specs live in UNARY_OPS table, dispatch via _dispatchUnary.
+interface Torchlette {
+  sqrt(a: Tensor): Tensor;
+  relu(a: Tensor): Tensor;
+  exp(a: Tensor): Tensor;
+  log(a: Tensor): Tensor;
+  neg(a: Tensor): Tensor;
+  abs(a: Tensor): Tensor;
+  tanh(a: Tensor): Tensor;
+  sigmoid(a: Tensor): Tensor;
+  silu(a: Tensor): Tensor;
+  sin(a: Tensor): Tensor;
+  cos(a: Tensor): Tensor;
+  rsqrt(a: Tensor): Tensor;
+  floor(a: Tensor): Tensor;
+  ceil(a: Tensor): Tensor;
+  round(a: Tensor): Tensor;
+  sign(a: Tensor): Tensor;
+  isfinite(a: Tensor): Tensor;
+}
+
+for (const opName of Object.keys(UNARY_OPS)) {
+  (Torchlette.prototype as any)[opName] = function (
+    this: Torchlette,
+    a: Tensor,
+  ) {
+    return this._dispatchUnary(opName, a);
+  };
+}
+
+// Comparison ops: non-differentiable, dispatch via _cmpOp.
+const COMPARISON_OPS = ["gt", "lt", "ge", "le", "eq", "ne"] as const;
+
+interface Torchlette {
+  gt(a: Tensor, b: Tensor): Tensor;
+  lt(a: Tensor, b: Tensor): Tensor;
+  ge(a: Tensor, b: Tensor): Tensor;
+  le(a: Tensor, b: Tensor): Tensor;
+  eq(a: Tensor, b: Tensor): Tensor;
+  ne(a: Tensor, b: Tensor): Tensor;
+}
+
+for (const op of COMPARISON_OPS) {
+  (Torchlette.prototype as any)[op] = function (
+    this: Torchlette,
+    a: Tensor,
+    b: Tensor,
+  ) {
+    return this._cmpOp(op, a, b);
+  };
 }
 
 export const torch = new Torchlette();

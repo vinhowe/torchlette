@@ -174,58 +174,15 @@ export class Tensor {
     return this.engine.unsqueeze(this, dim);
   }
 
-  add(other: Tensor | number): Tensor {
-    return this.engine.add(this, other);
-  }
-
   sub(other: Tensor | number, options?: SubOptions): Tensor {
     return this.engine.sub(this, other, options);
-  }
-
-  mul(other: Tensor | number): Tensor {
-    return this.engine.mul(this, other);
-  }
-
-  div(other: Tensor | number): Tensor {
-    return this.engine.div(this, other);
-  }
-
-  pow(exponent: Tensor | number): Tensor {
-    return this.engine.pow(this, exponent);
   }
 
   matmul(other: Tensor): Tensor {
     return this.engine.matmul(this, other);
   }
-  sqrt(): Tensor {
-    return this.engine.sqrt(this);
-  }
-  relu(): Tensor {
-    return this.engine.relu(this);
-  }
-  exp(): Tensor {
-    return this.engine.exp(this);
-  }
-  log(): Tensor {
-    return this.engine.log(this);
-  }
-  neg(): Tensor {
-    return this.engine.neg(this);
-  }
-  abs(): Tensor {
-    return this.engine.abs(this);
-  }
-  tanh(): Tensor {
-    return this.engine.tanh(this);
-  }
-  sigmoid(): Tensor {
-    return this.engine.sigmoid(this);
-  }
   gelu(options?: GeluOptions): Tensor {
     return this.engine.gelu(this, options);
-  }
-  silu(): Tensor {
-    return this.engine.silu(this);
   }
   softplus(): Tensor {
     return this.engine.softplus(this);
@@ -233,32 +190,8 @@ export class Tensor {
   fmod(other: Tensor): Tensor {
     return this.engine.fmod(this, other);
   }
-  sin(): Tensor {
-    return this.engine.sin(this);
-  }
-  cos(): Tensor {
-    return this.engine.cos(this);
-  }
-  rsqrt(): Tensor {
-    return this.engine.rsqrt(this);
-  }
-  floor(): Tensor {
-    return this.engine.floor(this);
-  }
-  ceil(): Tensor {
-    return this.engine.ceil(this);
-  }
-  round(): Tensor {
-    return this.engine.round(this);
-  }
-  sign(): Tensor {
-    return this.engine.sign(this);
-  }
   clamp(min: number | null, max: number | null): Tensor {
     return this.engine.clamp(this, min, max);
-  }
-  isfinite(): Tensor {
-    return this.engine.isfinite(this);
   }
 
   expand(shape: number[]): Tensor {
@@ -390,30 +323,6 @@ export class Tensor {
     keepdim?: boolean;
   }): Tensor {
     return this.engine.std(this, options);
-  }
-
-  gt(other: Tensor): Tensor {
-    return this.engine.gt(this, other);
-  }
-
-  lt(other: Tensor): Tensor {
-    return this.engine.lt(this, other);
-  }
-
-  ge(other: Tensor): Tensor {
-    return this.engine.ge(this, other);
-  }
-
-  le(other: Tensor): Tensor {
-    return this.engine.le(this, other);
-  }
-
-  eq(other: Tensor): Tensor {
-    return this.engine.eq(this, other);
-  }
-
-  ne(other: Tensor): Tensor {
-    return this.engine.ne(this, other);
   }
 
   tril(k = 0): Tensor {
@@ -561,4 +470,93 @@ export class Tensor {
       throw new DisposedTensorError("Tensor has been disposed");
     }
   }
+}
+
+// ============================================================================
+// Loop-generated trivial methods (typed via interface merging)
+// ============================================================================
+
+const SIMPLE_UNARY_OPS = [
+  "sqrt",
+  "relu",
+  "exp",
+  "log",
+  "neg",
+  "abs",
+  "tanh",
+  "sigmoid",
+  "silu",
+  "sin",
+  "cos",
+  "rsqrt",
+  "floor",
+  "ceil",
+  "round",
+  "sign",
+  "isfinite",
+] as const;
+
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+interface Tensor {
+  sqrt(): Tensor;
+  relu(): Tensor;
+  exp(): Tensor;
+  log(): Tensor;
+  neg(): Tensor;
+  abs(): Tensor;
+  tanh(): Tensor;
+  sigmoid(): Tensor;
+  silu(): Tensor;
+  sin(): Tensor;
+  cos(): Tensor;
+  rsqrt(): Tensor;
+  floor(): Tensor;
+  ceil(): Tensor;
+  round(): Tensor;
+  sign(): Tensor;
+  isfinite(): Tensor;
+}
+
+for (const op of SIMPLE_UNARY_OPS) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (Tensor.prototype as any)[op] = function (this: Tensor) {
+    return this._engine()[op](this);
+  };
+}
+
+const SIMPLE_BINARY_OPS = ["add", "mul", "div", "pow"] as const;
+
+interface Tensor {
+  add(other: Tensor | number): Tensor;
+  mul(other: Tensor | number): Tensor;
+  div(other: Tensor | number): Tensor;
+  pow(exponent: Tensor | number): Tensor;
+}
+
+for (const op of SIMPLE_BINARY_OPS) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (Tensor.prototype as any)[op] = function (
+    this: Tensor,
+    other: Tensor | number,
+  ) {
+    return this._engine()[op](this, other);
+  };
+}
+
+const COMPARISON_OPS = ["gt", "lt", "ge", "le", "eq", "ne"] as const;
+
+interface Tensor {
+  gt(other: Tensor): Tensor;
+  lt(other: Tensor): Tensor;
+  ge(other: Tensor): Tensor;
+  le(other: Tensor): Tensor;
+  eq(other: Tensor): Tensor;
+  ne(other: Tensor): Tensor;
+}
+
+for (const op of COMPARISON_OPS) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (Tensor.prototype as any)[op] = function (this: Tensor, other: Tensor) {
+    return this._engine()[op](this, other);
+  };
 }
