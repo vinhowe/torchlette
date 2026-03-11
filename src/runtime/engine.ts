@@ -876,7 +876,7 @@ export class RuntimeEngine {
    *  - f32_required: casts f16 input to f32
    *  - always_f32: forces f32 output dtype
    */
-  private _unaryOp(op: LazyOpCode, a: OpInput, payload?: unknown): Tensor {
+  _unaryOp(op: LazyOpCode, a: OpInput, payload?: unknown): Tensor {
     let input: OpInput = a;
     let outDtype = a.dtype;
     const rule = OP_DTYPE_RULES[op];
@@ -994,7 +994,7 @@ export class RuntimeEngine {
     };
   }
 
-  private _binaryOp(
+  _binaryOp(
     op: LazyOpCode,
     a: TensorOrScalar,
     b: TensorOrScalar,
@@ -1076,69 +1076,11 @@ export class RuntimeEngine {
     return this.trackNode(node, shape, device, dtype);
   }
 
-  sqrt(a: Tensor): Tensor {
-    return this._unaryOp("sqrt", a);
-  }
-  relu(a: Tensor): Tensor {
-    return this._unaryOp("relu", a);
-  }
-
-  exp(a: Tensor): Tensor {
-    return this._unaryOp("exp", a);
-  }
-  log(a: Tensor): Tensor {
-    return this._unaryOp("log", a);
-  }
-
-  neg(a: Tensor): Tensor {
-    return this._unaryOp("neg", a);
-  }
-  abs(a: Tensor): Tensor {
-    return this._unaryOp("abs", a);
-  }
-  tanh(a: Tensor): Tensor {
-    return this._unaryOp("tanh", a);
-  }
-  sigmoid(a: Tensor): Tensor {
-    return this._unaryOp("sigmoid", a);
-  }
-
   gelu(a: Tensor, options?: GeluOptions): Tensor {
     return this._unaryOp("gelu", a, options);
   }
-  silu(a: Tensor): Tensor {
-    return this._unaryOp("silu", a);
-  }
-
-  sin(a: Tensor): Tensor {
-    return this._unaryOp("sin", a);
-  }
-  cos(a: Tensor): Tensor {
-    return this._unaryOp("cos", a);
-  }
-  rsqrt(a: Tensor): Tensor {
-    return this._unaryOp("rsqrt", a);
-  }
-  floor(a: Tensor): Tensor {
-    return this._unaryOp("floor", a);
-  }
-  ceil(a: Tensor): Tensor {
-    return this._unaryOp("ceil", a);
-  }
-  round(a: Tensor): Tensor {
-    return this._unaryOp("round", a);
-  }
-  sign(a: Tensor): Tensor {
-    return this._unaryOp("sign", a);
-  }
-
   clamp(a: Tensor, min: number | null, max: number | null): Tensor {
     return this._unaryOp("clamp", a, { min, max });
-  }
-
-  /** Returns 1.0 where finite, 0.0 where NaN or Inf. */
-  isfinite(a: Tensor): Tensor {
-    return this._unaryOp("isfinite", a);
   }
 
   expand(a: Tensor, shape: number[]): Tensor {
@@ -1345,25 +1287,6 @@ export class RuntimeEngine {
   }
   argmin(a: Tensor, options: ArgReduceOptions): Tensor {
     return this._argReduceOp("argmin", a, options);
-  }
-
-  gt(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._binaryOp("gt", a, b);
-  }
-  lt(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._binaryOp("lt", a, b);
-  }
-  ge(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._binaryOp("ge", a, b);
-  }
-  le(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._binaryOp("le", a, b);
-  }
-  eq(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._binaryOp("eq", a, b);
-  }
-  ne(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._binaryOp("ne", a, b);
   }
 
   where(condition: Tensor, x: TensorOrScalar, y: TensorOrScalar): Tensor {
@@ -1711,4 +1634,82 @@ export class RuntimeEngine {
       { featureDim },
     );
   }
+}
+
+// ============================================================================
+// Table-driven method generation — typed declarations + prototype installation
+// ============================================================================
+
+// Simple unary ops: all delegate to _unaryOp with no payload.
+const SIMPLE_UNARY_OPS = [
+  "sqrt",
+  "relu",
+  "exp",
+  "log",
+  "neg",
+  "abs",
+  "tanh",
+  "sigmoid",
+  "silu",
+  "sin",
+  "cos",
+  "rsqrt",
+  "floor",
+  "ceil",
+  "round",
+  "sign",
+  "isfinite",
+  "contiguous",
+] as const;
+
+interface RuntimeEngine {
+  sqrt(a: Tensor): Tensor;
+  relu(a: Tensor): Tensor;
+  exp(a: Tensor): Tensor;
+  log(a: Tensor): Tensor;
+  neg(a: Tensor): Tensor;
+  abs(a: Tensor): Tensor;
+  tanh(a: Tensor): Tensor;
+  sigmoid(a: Tensor): Tensor;
+  silu(a: Tensor): Tensor;
+  sin(a: Tensor): Tensor;
+  cos(a: Tensor): Tensor;
+  rsqrt(a: Tensor): Tensor;
+  floor(a: Tensor): Tensor;
+  ceil(a: Tensor): Tensor;
+  round(a: Tensor): Tensor;
+  sign(a: Tensor): Tensor;
+  isfinite(a: Tensor): Tensor;
+  contiguous(a: Tensor): Tensor;
+}
+
+for (const op of SIMPLE_UNARY_OPS) {
+  (RuntimeEngine.prototype as any)[op] = function (
+    this: RuntimeEngine,
+    a: Tensor,
+  ) {
+    return this._unaryOp(op, a);
+  };
+}
+
+// Comparison ops: all delegate to _binaryOp.
+const COMPARISON_OPS = ["gt", "lt", "ge", "le", "eq", "ne"] as const;
+
+interface RuntimeEngine {
+  gt(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  lt(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  ge(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  le(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  eq(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  ne(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+}
+
+for (const op of COMPARISON_OPS) {
+  (RuntimeEngine.prototype as any)[op] = function (
+    this: RuntimeEngine,
+    a: TensorOrScalar,
+    b: TensorOrScalar,
+  ) {
+    return this._binaryOp(op, a, b);
+  };
 }
