@@ -7,9 +7,13 @@
  * - Tile compiler (webgpu/tile-compiler.ts): wgslInfix, wgslPrefix, wgslFnName
  * - Vectorization (webgpu/fusion-types.ts): vectorizable flag
  * - Dtype safety (engine/dtype-rules.ts): dtypeRule
+ * - Autograd (frontend.ts): grad, ttGrad, tsGrad
  *
  * Op behavior (WGSL codegen) lives in fusion-tile-ir.ts via BlockExpr methods.
  */
+
+import type { RuntimeEngine } from "../runtime/engine";
+import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 
 // ============================================================================
 // Types
@@ -22,6 +26,46 @@ export type OpDtypeRule =
   | "f32_required"
   | "always_f32"
   | "promote_inputs";
+
+/**
+ * Gradient function for a unary op.
+ * @param rt - RuntimeEngine for tensor ops
+ * @param grad - Upstream gradient (RuntimeTensor)
+ * @param savedA - Saved input tensor (unwrapped via _unwrap()), undefined if needsSave=false
+ */
+export type UnaryGradFn = (
+  rt: RuntimeEngine,
+  grad: RuntimeTensor,
+  savedA: RuntimeTensor | undefined,
+) => RuntimeTensor;
+
+/**
+ * Gradient function for tensor+tensor binary ops.
+ * @param rt - RuntimeEngine for tensor ops
+ * @param grad - Upstream gradient
+ * @param getUnwrapped - Access unwrapped saved tensor at index
+ */
+export type BinaryTTGradFn = (
+  rt: RuntimeEngine,
+  grad: RuntimeTensor,
+  getUnwrapped: (i: number) => RuntimeTensor,
+) => [RuntimeTensor, RuntimeTensor];
+
+/**
+ * Gradient function for tensor+scalar binary ops.
+ * @param rt - RuntimeEngine for tensor ops
+ * @param grad - Upstream gradient
+ * @param getUnwrapped - Access unwrapped saved tensor at index
+ * @param scalar - The scalar operand value
+ * @param scalarIsA - True if the scalar is the left operand
+ */
+export type BinaryTSGradFn = (
+  rt: RuntimeEngine,
+  grad: RuntimeTensor,
+  getUnwrapped: (i: number) => RuntimeTensor,
+  scalar: number,
+  scalarIsA: boolean,
+) => RuntimeTensor[];
 
 interface OpDef {
   /** Number of inputs */
@@ -52,6 +96,22 @@ interface OpDef {
   wgslPrefix?: string;
   /** WGSL function name when it differs from op name (e.g., rsqrt → inverseSqrt). */
   wgslFnName?: string;
+
+  // --- Autograd fields (optional, only for differentiable elementwise ops) ---
+
+  /** Unary gradient function. null = non-differentiable (floor, ceil, etc). */
+  grad?: UnaryGradFn | null;
+  /** Whether to save input for backward (default true for ops with grad). */
+  needsSave?: boolean;
+  /** Autocast category name (omit = no autocast). */
+  autocast?: string;
+
+  /** Binary tensor+tensor gradient function. */
+  ttGrad?: BinaryTTGradFn;
+  /** Binary tensor+scalar gradient function (default: pass through). */
+  tsGrad?: BinaryTSGradFn;
+  /** Whether to save inputs for binary backward. */
+  saveBinary?: boolean;
 }
 
 // ============================================================================
@@ -68,6 +128,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "activation",
     dtypeRule: "preserve",
+    grad: (rt, g, s) => rt.mul(g, rt.gt(s!, 0)),
   },
   gelu: {
     arity: 1,
@@ -89,6 +150,10 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "activation",
     dtypeRule: "preserve",
+    grad: (rt, g, s) => {
+      const sig = rt.sigmoid(s!);
+      return rt.mul(g, rt.add(sig, rt.mul(s!, rt.mul(sig, rt.sub(1, sig)))));
+    },
   },
   sigmoid: {
     arity: 1,
@@ -96,6 +161,10 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "activation",
     dtypeRule: "preserve",
+    grad: (rt, g, s) => {
+      const sig = rt.sigmoid(s!);
+      return rt.mul(rt.mul(sig, rt.sub(1, sig)), g);
+    },
   },
   tanh: {
     arity: 1,
@@ -103,6 +172,10 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "activation",
     dtypeRule: "preserve",
+    grad: (rt, g, s) => {
+      const t = rt.tanh(s!);
+      return rt.mul(rt.sub(1, rt.mul(t, t)), g);
+    },
   },
   softplus: {
     arity: 1,
@@ -122,6 +195,8 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     category: "math",
     dtypeRule: "preserve",
     wgslPrefix: "-",
+    needsSave: false,
+    grad: (rt, g) => rt.neg(g),
   },
   abs: {
     arity: 1,
@@ -129,6 +204,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "math",
     dtypeRule: "preserve",
+    grad: (rt, g, s) => rt.mul(g, rt.sign(s!)),
   },
   exp: {
     arity: 1,
@@ -136,6 +212,8 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "math",
     dtypeRule: "f32_required",
+    autocast: "exp",
+    grad: (rt, g, s) => rt.mul(g, rt.exp(s!)),
   },
   log: {
     arity: 1,
@@ -143,6 +221,8 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "math",
     dtypeRule: "f32_required",
+    autocast: "log",
+    grad: (rt, g, s) => rt.div(g, rt.add(s!, 1e-8)),
   },
   sqrt: {
     arity: 1,
@@ -150,6 +230,10 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "math",
     dtypeRule: "preserve",
+    grad: (rt, g, s) => {
+      const sqrtA = rt.sqrt(s!);
+      return rt.mul(g, rt.div(0.5, rt.add(sqrtA, 1e-8)));
+    },
   },
   rsqrt: {
     arity: 1,
@@ -158,6 +242,10 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     category: "math",
     dtypeRule: "preserve",
     wgslFnName: "inverseSqrt",
+    grad: (rt, g, s) => {
+      const r = rt.rsqrt(s!);
+      return rt.mul(g, rt.mul(-0.5, rt.mul(r, rt.mul(r, r))));
+    },
   },
   sin: {
     arity: 1,
@@ -165,6 +253,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "math",
     dtypeRule: "preserve",
+    grad: (rt, g, s) => rt.mul(g, rt.cos(s!)),
   },
   cos: {
     arity: 1,
@@ -172,6 +261,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "math",
     dtypeRule: "preserve",
+    grad: (rt, g, s) => rt.mul(g, rt.neg(rt.sin(s!))),
   },
   floor: {
     arity: 1,
@@ -179,6 +269,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "math",
     dtypeRule: "preserve",
+    grad: null,
   },
   ceil: {
     arity: 1,
@@ -186,6 +277,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "math",
     dtypeRule: "preserve",
+    grad: null,
   },
   round: {
     arity: 1,
@@ -193,6 +285,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "math",
     dtypeRule: "preserve",
+    grad: null,
   },
   sign: {
     arity: 1,
@@ -200,6 +293,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "math",
     dtypeRule: "preserve",
+    grad: null,
   },
   isfinite: {
     arity: 1,
@@ -207,6 +301,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "math",
     dtypeRule: "always_f32",
+    grad: null,
   },
 
   // ---------------------------------------------------------------------------
@@ -219,6 +314,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     category: "arithmetic",
     dtypeRule: "promote_inputs",
     wgslInfix: "+",
+    ttGrad: (_rt, g) => [g, g],
   },
   sub: {
     arity: 2,
@@ -235,6 +331,9 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     category: "arithmetic",
     dtypeRule: "promote_inputs",
     wgslInfix: "*",
+    saveBinary: true,
+    ttGrad: (rt, g, gs) => [rt.mul(g, gs(1)), rt.mul(g, gs(0))],
+    tsGrad: (rt, g, _gs, s) => [rt.mul(g, s)],
   },
   div: {
     arity: 2,
@@ -243,6 +342,18 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     category: "arithmetic",
     dtypeRule: "promote_inputs",
     wgslInfix: "/",
+    saveBinary: true,
+    ttGrad: (rt, g, gs) => {
+      const sA = gs(0),
+        sB = gs(1);
+      return [rt.div(g, sB), rt.mul(g, rt.div(rt.neg(sA), rt.mul(sB, sB)))];
+    },
+    tsGrad: (rt, g, gs, scalar, scalarIsA) => {
+      if (!scalarIsA) return [rt.div(g, scalar)]; // a / scalar
+      // scalar / b → -scalar / b² * grad
+      const sB = gs(0);
+      return [rt.mul(g, rt.div(-scalar, rt.mul(sB, sB)))];
+    },
   },
   pow: {
     arity: 2,
@@ -250,6 +361,25 @@ export const OP_REGISTRY: Record<string, OpDef> = {
     vectorizable: true,
     category: "arithmetic",
     dtypeRule: "f32_required",
+    saveBinary: true,
+    // d/da pow(a,b) = b * pow(a, b-1), d/db pow(a,b) = pow(a,b) * log(a)
+    ttGrad: (rt, g, gs) => {
+      const sA = gs(0),
+        sB = gs(1);
+      return [
+        rt.mul(g, rt.mul(sB, rt.pow(sA, rt.sub(sB, 1)))),
+        rt.mul(g, rt.mul(rt.pow(sA, sB), rt.log(sA))),
+      ];
+    },
+    tsGrad: (rt, g, gs, scalar, scalarIsA) => {
+      const saved = gs(0);
+      if (scalarIsA) {
+        // d/db a^b = a^b * log(a)
+        return [rt.mul(g, rt.mul(rt.pow(scalar, saved), Math.log(scalar)))];
+      }
+      // d/da a^n = n * a^(n-1)
+      return [rt.mul(g, rt.mul(scalar, rt.pow(saved, scalar - 1)))];
+    },
   },
   min: {
     arity: 2,
@@ -401,3 +531,17 @@ export function getWgslFnName(op: string): string {
 export function getOpDtypeRule(op: string): OpDtypeRule | undefined {
   return OP_REGISTRY[op]?.dtypeRule;
 }
+
+// ============================================================================
+// Autograd helpers
+// ============================================================================
+
+/** Op names with unary autograd specs (grad field is defined, even if null). */
+export const UNARY_AUTOGRAD_OPS: string[] = Object.keys(OP_REGISTRY).filter(
+  (k) => OP_REGISTRY[k].arity === 1 && "grad" in OP_REGISTRY[k],
+);
+
+/** Op names with binary autograd specs (ttGrad field is defined). */
+export const BINARY_AUTOGRAD_OPS: string[] = Object.keys(OP_REGISTRY).filter(
+  (k) => OP_REGISTRY[k].ttGrad != null,
+);
