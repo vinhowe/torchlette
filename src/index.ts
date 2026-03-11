@@ -24,8 +24,14 @@ export * as nn from "./nn";
 export {
   Adam,
   type AdamOptions,
+  CosineAnnealingLR,
+  ExponentialLR,
   GradScaler,
   type GradScalerOptions,
+  type HasLR,
+  type LRScheduler,
+  PolynomialLR,
   SGD,
   type SGDOptions,
+  StepLR,
 } from "./optim";

@@ -11,7 +11,7 @@ export type SGDOptions = {
 export class SGD {
   private params: Tensor[];
   private readonly api: Torchlette;
-  private readonly lr: number;
+  private _lr: number;
   private readonly momentum: number;
   private readonly weightDecay: number;
   private velocity: Array<RuntimeTensor | null>;
@@ -22,7 +22,7 @@ export class SGD {
       throw new Error("SGD learning rate must be > 0");
     }
     this.api = engine;
-    this.lr = options.lr;
+    this._lr = options.lr;
     this.params = params.slice();
     this.momentum = options.momentum ?? 0;
     this.weightDecay = options.weightDecay ?? 0;
@@ -31,6 +31,14 @@ export class SGD {
 
   getParams(): Tensor[] {
     return this.params.slice();
+  }
+
+  getLR(): number {
+    return this._lr;
+  }
+
+  setLR(lr: number): void {
+    this._lr = lr;
   }
 
   step(): Tensor[] {
@@ -60,7 +68,7 @@ export class SGD {
         this.velocity[i] = update;
       }
       const next = runtime.sub(param._unwrap(), update, {
-        alpha: this.lr,
+        alpha: this._lr,
       });
       // Update parameter IN-PLACE to preserve tensor identity
       // This is critical for GradScaler - backward() writes to the same tensor

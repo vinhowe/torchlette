@@ -18,7 +18,7 @@ export type AdamOptions = {
 export class Adam {
   private params: Tensor[];
   private readonly api: Torchlette;
-  private readonly lr: number;
+  private _lr: number;
   private readonly beta1: number;
   private readonly beta2: number;
   private readonly eps: number;
@@ -57,7 +57,7 @@ export class Adam {
     }
 
     this.api = engine;
-    this.lr = options.lr;
+    this._lr = options.lr;
     this.beta1 = beta1;
     this.beta2 = beta2;
     this.eps = eps;
@@ -73,6 +73,14 @@ export class Adam {
 
   getParams(): Tensor[] {
     return this.params.slice();
+  }
+
+  getLR(): number {
+    return this._lr;
+  }
+
+  setLR(lr: number): void {
+    this._lr = lr;
   }
 
   /**
@@ -177,7 +185,7 @@ export class Adam {
         stepSize,
         eps: this.eps,
         weightDecay: this.weightDecay,
-        lrTimesWd: this.lr * this.weightDecay,
+        lrTimesWd: this._lr * this.weightDecay,
         decoupledWd: this.adamW,
         emitF16: true,
         invScale: unscale?.invScale,
@@ -234,7 +242,7 @@ export class Adam {
     this.steps[i] = step;
     const bc1 = 1 - this.beta1 ** step;
     const bc2 = 1 - this.beta2 ** step;
-    return (this.lr * Math.sqrt(bc2)) / bc1;
+    return (this._lr * Math.sqrt(bc2)) / bc1;
   }
 
   /**
