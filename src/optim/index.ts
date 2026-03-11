@@ -1,4 +1,4 @@
-export { Adam, type AdamOptions } from "./adam";
+export { Adam, type AdamOptions, type AdamParamGroup } from "./adam";
 export {
   GradScaler,
   type GradScalerOptions,
@@ -13,4 +13,4 @@ export {
   PolynomialLR,
   StepLR,
 } from "./lr-scheduler";
-export { SGD, type SGDOptions } from "./sgd";
+export { SGD, type SGDOptions, type SGDParamGroup } from "./sgd";
