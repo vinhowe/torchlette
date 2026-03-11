@@ -38,6 +38,7 @@ export const SIMPLIFICATION_PASSES: GraphPass[] = [
   { name: "identity-casts", run: eliminateIdentityCasts },
   { name: "redundant-contiguous", run: eliminateRedundantContiguous },
   { name: "algebraic-identities", run: eliminateAlgebraicIdentities },
+  { name: "fuse-sum-reshape", run: fuseSumReshape },
   { name: "cse", run: eliminateCommonSubexpressions },
   { name: "dce", run: eliminateDeadCode },
 ];
@@ -151,6 +152,58 @@ export function eliminateAlgebraicIdentities(
         count++;
       }
     }
+  }
+  return count;
+}
+
+// ============================================================================
+// Sum+Reshape Fusion Pass
+// ============================================================================
+
+/**
+ * Fuse sum(keepdim:true) → reshape into sum(keepdim:false).
+ *
+ * _sumToShape() generates sum(dims, keepdim:true) then reshape(targetShape)
+ * to handle rank reduction (e.g., [1,512,768] → sum → [1,1,768] → reshape → [768]).
+ * The reshape is metadata-only but still dispatches. Since the backend recomputes
+ * output shape from (inputShape, dim, keepdim), changing keepdim to false and
+ * updating the sum node's shape produces identical output bytes with no reshape.
+ */
+export function fuseSumReshape(
+  ctx: RewriteContext,
+  bypassed: Set<number>,
+): number {
+  let count = 0;
+  for (const node of ctx.planNodes) {
+    if (node.op !== "reshape" || node.result || bypassed.has(node.id)) continue;
+    const inputRef = node.inputs[0];
+    if (!inputRef || inputRef.kind !== "pending") continue;
+
+    const sumNode = inputRef.node;
+    if (sumNode.op !== "sum" && sumNode.op !== "mean") continue;
+    if (bypassed.has(sumNode.id)) continue;
+
+    const payload = sumNode.payload as
+      | { dim?: number | number[] | null; keepdim?: boolean }
+      | undefined;
+    if (!payload?.keepdim) continue;
+
+    // Only fuse single-consumer sums (multi-consumer would change other readers' shape)
+    if ((ctx.consumerCount.get(sumNode.id) ?? 0) > 1) continue;
+
+    // Verify same total elements (reshape just squeezes size-1 dims)
+    const sumElements = sumNode.shape.reduce((a, b) => a * b, 1);
+    const reshapeElements = node.shape.reduce((a, b) => a * b, 1);
+    if (sumElements !== reshapeElements) continue;
+
+    // Mutate sum node: output the reshaped shape directly
+    sumNode.shape = node.shape;
+    payload.keepdim = false;
+
+    // Bypass the reshape
+    redirectConsumers(node, { kind: "pending", node: sumNode }, ctx);
+    bypassed.add(node.id);
+    count++;
   }
   return count;
 }
