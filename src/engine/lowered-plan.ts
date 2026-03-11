@@ -388,182 +388,8 @@ const VIEW_OPS: ReadonlySet<string> = new Set([
  */
 export const ENCODER_COPY_OPS: ReadonlySet<string> = new Set(["scatterAdd"]);
 
-// ============================================================================
-// Lowered Plan Builder
-// ============================================================================
-
-/**
- * Builds a LoweredPlan by observing execution as it happens.
- * Call record*() methods during the first execution of a plan;
- * the builder captures the action sequence for replay.
- */
-export class LoweredPlanBuilder {
-  private actions: LoweredAction[] = [];
-  private planNodeCount: number;
-
-  constructor(planNodeCount: number) {
-    this.planNodeCount = planNodeCount;
-  }
-
-  /** Record a fused elementwise kernel dispatch. */
-  recordFused(
-    coveredNodeIndices: number[],
-    outputNodeIndex: number,
-    additionalOutputNodeIndices: number[],
-    neededIntermediateNodeIndices: number[],
-    recipe: FusedKernelRecipe,
-    enableVectorization: boolean,
-  ): void {
-    this.actions.push({
-      kind: "fused",
-      coveredNodeIndices,
-      outputNodeIndex,
-      additionalOutputNodeIndices,
-      neededIntermediateNodeIndices,
-      recipe,
-      enableVectorization,
-    });
-  }
-
-  /** Record a single-node action (sequential op, view, data source, or prologue skip). */
-  recordNode(kind: LoweredNodeAction["kind"], nodeIndex: number): void {
-    this.actions.push({ kind, nodeIndex });
-  }
-
-  /** Record a matmul + epilogue chain. */
-  recordMatmulEpilogue(
-    matmulNodeIndex: number,
-    coveredNodeIndices: number[],
-    outputNodeIndex: number,
-    epilogueOps: EpilogueOp[],
-    outputDtype: DType,
-    consumedCount: number,
-    prologues?: Array<{
-      inputIndex: 0 | 1;
-      castNodeIndex: number;
-      fromDtype: DType;
-      toDtype: DType;
-    }>,
-  ): void {
-    this.actions.push({
-      kind: "matmul-epilogue",
-      matmulNodeIndex,
-      coveredNodeIndices,
-      outputNodeIndex,
-      epilogueOps,
-      outputDtype,
-      consumedCount,
-      prologues,
-    });
-  }
-
-  /** Record a reduction with elementwise preamble (single-op or multi-op chain). */
-  recordReductionPreamble(
-    preambleNodeIndex: number,
-    reductionNodeIndex: number,
-    chainNodeIndices: number[],
-    chainOps: Array<{ op: string; arity: number; chainInputPos?: 0 | 1 }>,
-    chainInputDtypes: DType[],
-    consumedCount: number,
-  ): void {
-    this.actions.push({
-      kind: "reduction-preamble",
-      preambleNodeIndex,
-      reductionNodeIndex,
-      chainNodeIndices,
-      chainOps,
-      chainInputDtypes,
-      consumedCount,
-    });
-  }
-
-  /** Record a combined preamble + epilogue reduction fusion. */
-  recordReductionFusion(
-    preambleNodeIndices: number[],
-    reductionNodeIndex: number,
-    epilogueNodeIndices: number[],
-    outputNodeIndex: number,
-    preambleOps: Array<{ op: string; arity: number; chainInputPos?: 0 | 1 }>,
-    preambleInputDtypes: DType[],
-    epilogueOps: EpilogueOp[],
-    outputDtype: DType,
-    consumedCount: number,
-    isMean: boolean,
-  ): void {
-    this.actions.push({
-      kind: "reduction-fusion",
-      preambleNodeIndices,
-      reductionNodeIndex,
-      epilogueNodeIndices,
-      outputNodeIndex,
-      preambleOps,
-      preambleInputDtypes,
-      epilogueOps,
-      outputDtype,
-      consumedCount,
-      isMean,
-    });
-  }
-
-  /** Record a reduction with elementwise epilogue. */
-  recordReductionEpilogue(
-    reductionNodeIndex: number,
-    coveredNodeIndices: number[],
-    outputNodeIndex: number,
-    epilogueOps: EpilogueOp[],
-    outputDtype: DType,
-    consumedCount: number,
-  ): void {
-    this.actions.push({
-      kind: "reduction-epilogue",
-      reductionNodeIndex,
-      coveredNodeIndices,
-      outputNodeIndex,
-      epilogueOps,
-      outputDtype,
-      consumedCount,
-    });
-  }
-
-  /** Record an Adam batch (consecutive adamStep nodes). */
-  recordAdamBatch(nodeIndices: number[]): void {
-    this.actions.push({
-      kind: "adam-batch",
-      nodeIndices,
-    });
-  }
-
-  /** Record a compound pattern (softmax, log_softmax). */
-  recordCompound(
-    name: string,
-    coveredNodeIndices: number[],
-    outputNodeIndex: number,
-    dim: number,
-  ): void {
-    this.actions.push({
-      kind: "compound",
-      name,
-      coveredNodeIndices,
-      outputNodeIndex,
-      dim,
-    });
-  }
-
-  /** Record a buffer reclaim point. */
-  recordReclaim(): void {
-    this.actions.push({
-      kind: "reclaim",
-    });
-  }
-
-  /** Build the final lowered plan. */
-  build(): LoweredPlan {
-    return {
-      actions: this.actions,
-      planNodeCount: this.planNodeCount,
-    };
-  }
-}
+// (LoweredPlanBuilder removed — plans are now built from analysis alone
+// via buildLoweredPlanFromAnalysis() below.)
 
 // ============================================================================
 // Helpers
@@ -577,4 +403,330 @@ export function isDataSourceOp(op: string): boolean {
 /** Check if an op is a pure view (metadata only, no GPU dispatch). */
 export function isViewOp(op: string): boolean {
   return VIEW_OPS.has(op);
+}
+
+// ============================================================================
+// Analysis-Driven Lowered Plan Builder
+// ============================================================================
+
+import type { CompoundMatch } from "./compound-patterns";
+import type { ExecutionSegment } from "./fusion-detect";
+import type { LazyIRNode } from "./lazy-types";
+import type { MatmulEpiloguePlan } from "./matmul-epilogue";
+import type { ReductionGroup } from "./reduction-detect";
+
+/** Default reclaim interval, overridable via TORCHLETTE_RECLAIM_INTERVAL env var. */
+export const DEFAULT_RECLAIM_INTERVAL =
+  typeof process !== "undefined" && process.env?.TORCHLETTE_RECLAIM_INTERVAL
+    ? parseInt(process.env.TORCHLETTE_RECLAIM_INTERVAL, 10)
+    : 10000;
+
+interface BuildFromAnalysisInput {
+  segments: ExecutionSegment[];
+  planNodes: LazyIRNode[];
+  nodeIdToFinalPos: Map<number, number>;
+  prologueClaimedIds: Set<number>;
+  compoundMatches: CompoundMatch[];
+  matmulDirectives: Map<number, MatmulEpiloguePlan>;
+  enableVectorization: boolean;
+  reclaimInterval?: number;
+}
+
+/**
+ * Build a LoweredPlan purely from graph analysis results — no execution needed.
+ * This is the sole path for building lowered plans. The action sequence is
+ * derived entirely from the graph analysis (segments, matmul directives,
+ * compound patterns, etc.) without executing any ops.
+ *
+ * Reclaim actions are inserted every `reclaimInterval` nodes to flush the
+ * shared encoder and buffer pool periodically.
+ */
+export function buildLoweredPlanFromAnalysis(
+  input: BuildFromAnalysisInput,
+): LoweredPlan {
+  const {
+    segments,
+    planNodes,
+    nodeIdToFinalPos,
+    prologueClaimedIds,
+    compoundMatches,
+    matmulDirectives,
+    enableVectorization,
+    reclaimInterval = DEFAULT_RECLAIM_INTERVAL,
+  } = input;
+
+  const actions: LoweredAction[] = [];
+  let nodesSinceReclaim = 0;
+
+  /** Insert a reclaim action if enough nodes have been processed. */
+  const maybeReclaim = (nodeCount: number) => {
+    nodesSinceReclaim += nodeCount;
+    if (nodesSinceReclaim >= reclaimInterval) {
+      actions.push({ kind: "reclaim" });
+      nodesSinceReclaim = 0;
+    }
+  };
+
+  // Build compound match map
+  let compoundMatchMap:
+    | Map<
+        number,
+        {
+          name: string;
+          coveredNodeIds: Set<number>;
+          outputNodeId: number;
+          dim: number;
+        }
+      >
+    | undefined;
+  if (compoundMatches.length > 0) {
+    compoundMatchMap = new Map();
+    for (const match of compoundMatches) {
+      let firstPos = Infinity;
+      let firstId = match.coveredNodeIds[0];
+      for (const id of match.coveredNodeIds) {
+        const pos = nodeIdToFinalPos.get(id) ?? Infinity;
+        if (pos < firstPos) {
+          firstPos = pos;
+          firstId = id;
+        }
+      }
+      const coveredSet = new Set(match.coveredNodeIds);
+      const desc = {
+        name: match.name,
+        coveredNodeIds: coveredSet,
+        outputNodeId: match.outputNodeId,
+        dim: match.dim,
+      };
+      compoundMatchMap.set(firstId, desc);
+      for (const id of match.coveredNodeIds) {
+        if (id !== firstId) compoundMatchMap.set(id, { ...desc, name: "" });
+      }
+    }
+  }
+
+  for (const segment of segments) {
+    if (segment.kind === "reduction") {
+      const nodeCount = segment.group.nodes.length;
+      emitReductionActions(actions, segment.group, nodeIdToFinalPos);
+      maybeReclaim(nodeCount);
+    } else if (segment.kind === "fused" && segment.group.nodes.length >= 2) {
+      const nodeCount = segment.group.nodes.length;
+      emitFusedActions(actions, segment, nodeIdToFinalPos, enableVectorization);
+      maybeReclaim(nodeCount);
+    } else {
+      // Sequential segment (or small fused group treated as sequential)
+      const seqNodes =
+        segment.kind === "fused" ? segment.group.nodes : segment.nodes;
+      emitSequentialActions(
+        actions,
+        seqNodes,
+        nodeIdToFinalPos,
+        prologueClaimedIds,
+        compoundMatchMap,
+        matmulDirectives,
+        maybeReclaim,
+      );
+    }
+  }
+
+  return {
+    actions,
+    planNodeCount: planNodes.length,
+  };
+}
+
+function emitReductionActions(
+  actions: LoweredAction[],
+  rg: ReductionGroup,
+  posMap: Map<number, number>,
+): void {
+  const hasPreamble = rg.preambleNodes.length > 0;
+  const hasEpilogue = rg.epilogueOps.length > 0;
+
+  if (hasPreamble && hasEpilogue) {
+    actions.push({
+      kind: "reduction-fusion",
+      preambleNodeIndices: rg.preambleNodes.map(
+        (n) => posMap.get(n.id) as number,
+      ),
+      reductionNodeIndex: posMap.get(rg.reductionNode.id) as number,
+      epilogueNodeIndices: rg.epilogueNodes.map(
+        (n) => posMap.get(n.id) as number,
+      ),
+      outputNodeIndex: posMap.get(rg.outputNode.id) as number,
+      preambleOps: rg.preambleOps,
+      preambleInputDtypes: rg.preambleInputDtypes,
+      epilogueOps: rg.epilogueOps,
+      outputDtype: rg.outputDtype,
+      consumedCount: rg.nodes.length,
+      isMean: rg.isMean,
+    });
+  } else if (hasPreamble) {
+    actions.push({
+      kind: "reduction-preamble",
+      preambleNodeIndex: posMap.get(rg.preambleNodes[0].id) as number,
+      reductionNodeIndex: posMap.get(rg.reductionNode.id) as number,
+      chainNodeIndices: rg.preambleNodes.map((n) => posMap.get(n.id) as number),
+      chainOps: rg.preambleOps,
+      chainInputDtypes: rg.preambleInputDtypes,
+      consumedCount: rg.nodes.length,
+    });
+  } else if (hasEpilogue) {
+    actions.push({
+      kind: "reduction-epilogue",
+      reductionNodeIndex: posMap.get(rg.reductionNode.id) as number,
+      coveredNodeIndices: rg.nodes.map((n) => posMap.get(n.id) as number),
+      outputNodeIndex: posMap.get(rg.outputNode.id) as number,
+      epilogueOps: rg.epilogueOps,
+      outputDtype: rg.outputDtype,
+      consumedCount: rg.nodes.length,
+    });
+  }
+}
+
+function emitFusedActions(
+  actions: LoweredAction[],
+  segment: Extract<ExecutionSegment, { kind: "fused" }>,
+  posMap: Map<number, number>,
+  enableVectorization: boolean,
+): void {
+  actions.push({
+    kind: "fused",
+    coveredNodeIndices: segment.group.nodes.map(
+      (n) => posMap.get(n.id) as number,
+    ),
+    outputNodeIndex: posMap.get(segment.group.outputNode.id) as number,
+    additionalOutputNodeIndices: (
+      segment.group.additionalOutputNodes ?? []
+    ).map((n) => posMap.get(n.id) as number),
+    neededIntermediateNodeIndices: (
+      segment.group.neededIntermediates ?? []
+    ).map((n) => posMap.get(n.id) as number),
+    recipe: segment.recipe,
+    enableVectorization,
+  });
+}
+
+function emitSequentialActions(
+  actions: LoweredAction[],
+  nodes: LazyIRNode[],
+  posMap: Map<number, number>,
+  prologueSkipIds: Set<number>,
+  compoundMatchMap:
+    | Map<
+        number,
+        {
+          name: string;
+          coveredNodeIds: Set<number>;
+          outputNodeId: number;
+          dim: number;
+        }
+      >
+    | undefined,
+  matmulDirectives: Map<number, MatmulEpiloguePlan>,
+  maybeReclaim: (count: number) => void,
+): void {
+  for (let nodeIdx = 0; nodeIdx < nodes.length; nodeIdx++) {
+    const node = nodes[nodeIdx];
+
+    // Already materialized — skip (matches `if (node.result) continue` in execution)
+    if (node.result) continue;
+
+    // Prologue-claimed cast: absorbed into matmul
+    if (prologueSkipIds.has(node.id)) {
+      actions.push({
+        kind: "prologue-skip",
+        nodeIndex: posMap.get(node.id) as number,
+      });
+      maybeReclaim(1);
+      continue;
+    }
+
+    // Compound patterns (softmax, log_softmax)
+    if (compoundMatchMap?.has(node.id)) {
+      const match = compoundMatchMap.get(node.id)!;
+      if (match.name === "") {
+        // Intermediate covered node — skip
+        actions.push({
+          kind: "prologue-skip",
+          nodeIndex: posMap.get(node.id) as number,
+        });
+        continue;
+      }
+
+      const coveredCount = match.coveredNodeIds.size;
+      const coveredPoss: number[] = [];
+      for (let c = 0; c < coveredCount; c++) {
+        coveredPoss.push(posMap.get(nodes[nodeIdx + c].id) as number);
+      }
+      actions.push({
+        kind: "compound",
+        name: match.name,
+        coveredNodeIndices: coveredPoss,
+        outputNodeIndex: posMap.get(match.outputNodeId) as number,
+        dim: match.dim,
+      });
+      maybeReclaim(coveredCount);
+      nodeIdx += coveredCount - 1;
+      continue;
+    }
+
+    // Matmul with epilogue/prologue
+    if (node.op === "matmul") {
+      const epiloguePlan = matmulDirectives.get(node.id);
+      if (epiloguePlan) {
+        const covered: number[] = [];
+        for (let c = 0; c < epiloguePlan.consumedCount; c++) {
+          covered.push(posMap.get(nodes[nodeIdx + c].id) as number);
+        }
+        actions.push({
+          kind: "matmul-epilogue",
+          matmulNodeIndex: posMap.get(node.id) as number,
+          coveredNodeIndices: covered,
+          outputNodeIndex: posMap.get(epiloguePlan.outputNode.id) as number,
+          epilogueOps: epiloguePlan.epilogueOps,
+          outputDtype: epiloguePlan.outputDtype,
+          consumedCount: epiloguePlan.consumedCount,
+          prologues: epiloguePlan.prologues?.map((p) => ({
+            inputIndex: p.inputIndex,
+            castNodeIndex: posMap.get(p.castNodeId) as number,
+            fromDtype: p.fromDtype,
+            toDtype: p.toDtype,
+          })),
+        });
+        maybeReclaim(epiloguePlan.consumedCount);
+        nodeIdx += epiloguePlan.consumedCount - 1;
+        continue;
+      }
+    }
+
+    // Adam batch: count consecutive adamStep nodes
+    if (node.op === "adamStep") {
+      let adamCount = 1;
+      for (let j = nodeIdx + 1; j < nodes.length; j++) {
+        if (nodes[j].op === "adamStep" && !nodes[j].result) adamCount++;
+        else break;
+      }
+      if (adamCount > 1) {
+        const adamIndices: number[] = [];
+        for (let c = 0; c < adamCount; c++) {
+          adamIndices.push(posMap.get(nodes[nodeIdx + c].id) as number);
+        }
+        actions.push({ kind: "adam-batch", nodeIndices: adamIndices });
+        maybeReclaim(adamCount);
+        nodeIdx += adamCount - 1;
+        continue;
+      }
+    }
+
+    // Regular node: classify as data-source, view, or sequential
+    const kind = isDataSourceOp(node.op)
+      ? ("data-source" as const)
+      : isViewOp(node.op)
+        ? ("view" as const)
+        : ("sequential" as const);
+    actions.push({ kind, nodeIndex: posMap.get(node.id) as number });
+    maybeReclaim(1);
+  }
 }
