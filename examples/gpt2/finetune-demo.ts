@@ -93,13 +93,10 @@ async function generateText(
 
     // Use tidy to automatically clean up intermediate tensors from forward pass
     const logits = api.tidy(() => {
-      const inputTensor = api.tensorFromArray(
-        contextTokens,
-        [1, contextTokens.length],
-        {
-          device: "webgpu",
-        },
-      );
+      const inputTensor = api.tensorFromArray(contextTokens, [
+        1,
+        contextTokens.length,
+      ]);
       // Forward pass creates many intermediate tensors that will be auto-disposed
       return model.forward(inputTensor);
     });
@@ -187,12 +184,7 @@ async function main() {
     enableCheckpointSegmentation: true,
   });
 
-  const model = await loadPretrainedGPT2(
-    api,
-    modelDir,
-    { dropoutRate: 0.0 },
-    { device: "webgpu" },
-  );
+  const model = await loadPretrainedGPT2(api, modelDir, { dropoutRate: 0.0 });
   model.eval();
 
   // Test prompts
@@ -271,40 +263,37 @@ async function main() {
       const inputData = seq.slice(0, -1);
       const targetData = seq.slice(1);
 
-      const input = api.tensorFromArray(inputData, [1, inputData.length], {
-        device: "webgpu",
-      });
-      const target = api.tensorFromArray(targetData, [1, targetData.length], {
-        device: "webgpu",
-      });
+      // asyncTidy auto-disposes all per-step tensors (input, target, loss, scaledLoss,
+      // gradients) — no manual dispose() calls needed.
+      const { lossValue, t0, t1, t2, t3, t4 } = await api.asyncTidy(
+        async () => {
+          const input = api.tensorFromArray(inputData, [1, inputData.length]);
+          const target = api.tensorFromArray(targetData, [
+            1,
+            targetData.length,
+          ]);
 
-      const t0 = performance.now();
-      // Forward pass inside compile region with AMP autocast
-      const loss = compiledForward(input, target);
+          const t0 = performance.now();
+          const loss = compiledForward(input, target);
+          const lossValue = await loss.item();
+          const t1 = performance.now();
 
-      const lossValue = await loss.item();
-      const t1 = performance.now();
+          const scaledLoss = scaler.scale(loss);
+          await scaledLoss.backward();
+          const t2 = performance.now();
 
-      // Scale loss for mixed precision, then backward
-      const scaledLoss = scaler.scale(loss);
-      await scaledLoss.backward();
-      const t2 = performance.now();
+          scaler.unscale_(optimizer);
+          scaler.step(optimizer);
+          scaler.update();
+          optimizer.zeroGrad();
+          const t3 = performance.now();
 
-      // Unscale gradients, check for NaN/Inf, step optimizer
-      scaler.unscale_(optimizer);
-      scaler.step(optimizer);
-      scaler.update();
-      optimizer.zeroGrad();
-      const t3 = performance.now();
+          await api.markStep();
+          const t4 = performance.now();
 
-      scaledLoss.dispose();
-      loss.dispose();
-      input.dispose();
-      target.dispose();
-
-      // Call markStep to trigger GPU buffer cleanup
-      await api.markStep();
-      const t4 = performance.now();
+          return { lossValue, t0, t1, t2, t3, t4 };
+        },
+      );
 
       // Save pipeline registry after first step
       if (globalStep === 0) {
