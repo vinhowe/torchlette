@@ -129,167 +129,170 @@ function storeSideOutput(
 }
 
 // ---------------------------------------------------------------------------
-// Handler groups
+// Creation op dispatch table
 // ---------------------------------------------------------------------------
 
-function executeCreationOp(
+type CreationHandler = (
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
-): BackendTensor {
-  switch (node.op) {
-    case "tensorFromArray": {
-      const payload = getPayload<{ values: number[] | Float32Array }>(node);
-      if (!payload?.values) {
-        throw new Error("tensorFromArray requires values in payload");
-      }
-      return backend.ops.tensorFromArray(payload.values, node.shape);
+) => BackendTensor;
+
+const CREATION_OP_TABLE: Record<string, CreationHandler> = {
+  tensorFromArray(node, _bi, backend) {
+    const payload = getPayload<{ values: number[] | Float32Array }>(node);
+    if (!payload?.values)
+      throw new Error("tensorFromArray requires values in payload");
+    return backend.ops.tensorFromArray(payload.values, node.shape);
+  },
+
+  zeros(node, _bi, backend) {
+    if (backend.ops.zeros) return backend.ops.zeros(node.shape);
+    const numEl = sizeOf(node.shape);
+    return backend.ops.tensorFromArray(new Array(numEl).fill(0), node.shape);
+  },
+
+  full(node, _bi, backend) {
+    const payload = requirePayload<{ fillValue: number }>(node);
+    if (backend.ops.full)
+      return backend.ops.full(node.shape, payload.fillValue);
+    const numEl = sizeOf(node.shape);
+    return backend.ops.tensorFromArray(
+      new Array(numEl).fill(payload.fillValue),
+      node.shape,
+    );
+  },
+
+  arange(node, _bi, backend) {
+    const ap = requirePayload<{ end: number; start: number; step: number }>(
+      node,
+    );
+    if (backend.ops.arange)
+      return backend.ops.arange(ap.end, ap.start, ap.step);
+    const n = Math.max(0, Math.ceil((ap.end - ap.start) / ap.step));
+    const vals = new Array(n);
+    for (let i = 0; i < n; i++) vals[i] = ap.start + i * ap.step;
+    return backend.ops.tensorFromArray(vals, node.shape);
+  },
+
+  tril(node, backendInputs, backend) {
+    assertOpSupported("tril", backend.ops.tril);
+    return backend.ops.tril(
+      backendInputs[0],
+      getPayload<{ k: number }>(node)?.k ?? 0,
+    );
+  },
+
+  triu(node, backendInputs, backend) {
+    assertOpSupported("triu", backend.ops.triu);
+    return backend.ops.triu(
+      backendInputs[0],
+      getPayload<{ k: number }>(node)?.k ?? 0,
+    );
+  },
+
+  rand(node, _bi, backend) {
+    const rp = requirePayload<{ seed: number }>(node);
+    if (backend.ops.rand) return backend.ops.rand(node.shape, rp.seed);
+    const n = sizeOf(node.shape);
+    const vals = new Array(n);
+    for (let i = 0; i < n; i++) vals[i] = Math.random();
+    return backend.ops.tensorFromArray(vals, node.shape);
+  },
+
+  randn(node, _bi, backend) {
+    const rp = requirePayload<{ seed: number }>(node);
+    if (backend.ops.randn) return backend.ops.randn(node.shape, rp.seed);
+    const n = sizeOf(node.shape);
+    const vals = new Array(n);
+    for (let i = 0; i < n; i += 2) {
+      const u1 = Math.random(),
+        u2 = Math.random();
+      const r = Math.sqrt(-2 * Math.log(u1 || 1e-10)),
+        theta = 2 * Math.PI * u2;
+      vals[i] = r * Math.cos(theta);
+      if (i + 1 < n) vals[i + 1] = r * Math.sin(theta);
     }
+    return backend.ops.tensorFromArray(vals, node.shape);
+  },
 
-    case "zeros": {
-      if (backend.ops.zeros) {
-        return backend.ops.zeros(node.shape);
-      }
-      const numEl = sizeOf(node.shape);
-      return backend.ops.tensorFromArray(new Array(numEl).fill(0), node.shape);
-    }
+  bernoulli(node, _bi, backend) {
+    const bp = requirePayload<{ seed: number; p: number }>(node);
+    if (backend.ops.bernoulli)
+      return backend.ops.bernoulli(node.shape, bp.p, bp.seed);
+    const n = sizeOf(node.shape);
+    const vals = new Array(n);
+    for (let i = 0; i < n; i++) vals[i] = Math.random() < bp.p ? 1 : 0;
+    return backend.ops.tensorFromArray(vals, node.shape);
+  },
+};
 
-    case "full": {
-      const payload = requirePayload<{ fillValue: number }>(node);
-      if (backend.ops.full) {
-        return backend.ops.full(node.shape, payload.fillValue);
-      }
-      const numEl = sizeOf(node.shape);
-      return backend.ops.tensorFromArray(
-        new Array(numEl).fill(payload.fillValue),
-        node.shape,
-      );
-    }
+// ---------------------------------------------------------------------------
+// Shape op dispatch table
+// ---------------------------------------------------------------------------
 
-    case "arange": {
-      const ap = requirePayload<{ end: number; start: number; step: number }>(
-        node,
-      );
-      if (backend.ops.arange) {
-        return backend.ops.arange(ap.end, ap.start, ap.step);
-      }
-      const n = Math.max(0, Math.ceil((ap.end - ap.start) / ap.step));
-      const vals = new Array(n);
-      for (let i = 0; i < n; i++) vals[i] = ap.start + i * ap.step;
-      return backend.ops.tensorFromArray(vals, node.shape);
-    }
-
-    case "tril": {
-      assertOpSupported("tril", backend.ops.tril);
-      return backend.ops.tril(
-        backendInputs[0],
-        getPayload<{ k: number }>(node)?.k ?? 0,
-      );
-    }
-
-    case "triu": {
-      assertOpSupported("triu", backend.ops.triu);
-      return backend.ops.triu(
-        backendInputs[0],
-        getPayload<{ k: number }>(node)?.k ?? 0,
-      );
-    }
-
-    case "rand": {
-      const rp = requirePayload<{ seed: number }>(node);
-      if (backend.ops.rand) return backend.ops.rand(node.shape, rp.seed);
-      const n = sizeOf(node.shape);
-      const vals = new Array(n);
-      for (let i = 0; i < n; i++) vals[i] = Math.random();
-      return backend.ops.tensorFromArray(vals, node.shape);
-    }
-
-    case "randn": {
-      const rp = requirePayload<{ seed: number }>(node);
-      if (backend.ops.randn) return backend.ops.randn(node.shape, rp.seed);
-      const n = sizeOf(node.shape);
-      const vals = new Array(n);
-      for (let i = 0; i < n; i += 2) {
-        const u1 = Math.random(),
-          u2 = Math.random();
-        const r = Math.sqrt(-2 * Math.log(u1 || 1e-10)),
-          theta = 2 * Math.PI * u2;
-        vals[i] = r * Math.cos(theta);
-        if (i + 1 < n) vals[i + 1] = r * Math.sin(theta);
-      }
-      return backend.ops.tensorFromArray(vals, node.shape);
-    }
-
-    case "bernoulli": {
-      const bp = requirePayload<{ seed: number; p: number }>(node);
-      if (backend.ops.bernoulli)
-        return backend.ops.bernoulli(node.shape, bp.p, bp.seed);
-      const n = sizeOf(node.shape);
-      const vals = new Array(n);
-      for (let i = 0; i < n; i++) vals[i] = Math.random() < bp.p ? 1 : 0;
-      return backend.ops.tensorFromArray(vals, node.shape);
-    }
-
-    default:
-      throw new Error(`Unknown creation op: ${node.op}`);
-  }
-}
-
-function executeShapeOp(
+type ShapeHandler = (
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
-): BackendTensor {
-  switch (node.op) {
-    case "reshape": {
-      const payload = getPayload<{ targetShape: number[] }>(node);
-      return backend.ops.reshape(
-        backendInputs[0],
-        payload?.targetShape ?? node.shape,
-      );
-    }
-    case "expand":
-      return backend.ops.expand(backendInputs[0], node.shape);
-    case "transpose": {
-      const payload = requirePayload<{ dim0: number; dim1: number }>(node);
-      return backend.ops.transpose(backendInputs[0], payload);
-    }
-    case "permute": {
-      const payload = requirePayload<{ dims: number[] }>(node);
-      return backend.ops.permute(backendInputs[0], payload.dims);
-    }
-    case "contiguous":
-      return backend.ops.contiguous(backendInputs[0]);
-    case "narrow": {
-      const p = requirePayload<{ dim: number; start: number; length: number }>(
-        node,
-      );
-      assertOpSupported("narrow", backend.ops.narrow);
-      return backend.ops.narrow(backendInputs[0], p.dim, p.start, p.length);
-    }
-    case "narrowBackward": {
-      const p = requirePayload<{
-        dim: number;
-        start: number;
-        originalLength: number;
-      }>(node);
-      assertOpSupported("narrowBackward", backend.ops.narrowBackward);
-      return backend.ops.narrowBackward(
-        backendInputs[0],
-        p.dim,
-        p.start,
-        p.originalLength,
-      );
-    }
-    case "cast": {
-      const payload = requirePayload<{ dtype: DType }>(node);
-      assertOpSupported("cast", backend.ops.cast);
-      return backend.ops.cast(backendInputs[0], payload.dtype);
-    }
-    default:
-      throw new Error(`Unknown shape op: ${node.op}`);
-  }
-}
+) => BackendTensor;
+
+const SHAPE_OP_TABLE: Record<string, ShapeHandler> = {
+  reshape(node, backendInputs, backend) {
+    const payload = getPayload<{ targetShape: number[] }>(node);
+    return backend.ops.reshape(
+      backendInputs[0],
+      payload?.targetShape ?? node.shape,
+    );
+  },
+
+  expand(node, backendInputs, backend) {
+    return backend.ops.expand(backendInputs[0], node.shape);
+  },
+
+  transpose(node, backendInputs, backend) {
+    const payload = requirePayload<{ dim0: number; dim1: number }>(node);
+    return backend.ops.transpose(backendInputs[0], payload);
+  },
+
+  permute(node, backendInputs, backend) {
+    const payload = requirePayload<{ dims: number[] }>(node);
+    return backend.ops.permute(backendInputs[0], payload.dims);
+  },
+
+  contiguous(_node, backendInputs, backend) {
+    return backend.ops.contiguous(backendInputs[0]);
+  },
+
+  narrow(node, backendInputs, backend) {
+    const p = requirePayload<{ dim: number; start: number; length: number }>(
+      node,
+    );
+    assertOpSupported("narrow", backend.ops.narrow);
+    return backend.ops.narrow(backendInputs[0], p.dim, p.start, p.length);
+  },
+
+  narrowBackward(node, backendInputs, backend) {
+    const p = requirePayload<{
+      dim: number;
+      start: number;
+      originalLength: number;
+    }>(node);
+    assertOpSupported("narrowBackward", backend.ops.narrowBackward);
+    return backend.ops.narrowBackward(
+      backendInputs[0],
+      p.dim,
+      p.start,
+      p.originalLength,
+    );
+  },
+
+  cast(node, backendInputs, backend) {
+    const payload = requirePayload<{ dtype: DType }>(node);
+    assertOpSupported("cast", backend.ops.cast);
+    return backend.ops.cast(backendInputs[0], payload.dtype);
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Generic op dispatch table
@@ -364,48 +367,31 @@ function executeGenericOp(
   return fn(...args) as BackendTensor;
 }
 
-function executeMutationOp(
+/** adamStep is special-cased: async, side outputs, markReachable. */
+function executeAdamStep(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
-): BackendTensor | Promise<BackendTensor> {
-  switch (node.op) {
-    case "adamStep": {
-      assertOpSupported("adamStep", backend.ops.adamStep);
-      const payload = requirePayload<AdamStepConfig>(node);
-      return (async () => {
-        const adamResult = await backend.ops.adamStep!(
-          backendInputs[0],
-          backendInputs[1],
-          backendInputs[2],
-          backendInputs[3],
-          payload,
-        );
-        const mStorage = createStorageHandle(node.device, adamResult.m);
-        const vStorage = createStorageHandle(node.device, adamResult.v);
-        const adamMV = { m: mStorage, v: vStorage };
-        storageTracker.markReachable(mStorage.id, adamMV);
-        storageTracker.markReachable(vStorage.id, adamMV);
-        if (!node._sideOutputs) node._sideOutputs = {};
-        node._sideOutputs.adamMV = adamMV;
-        return adamResult.param;
-      })();
-    }
-    case "unscaleGrad": {
-      const payload = requirePayload<{
-        invScale: number;
-        infFlagBuffer: unknown;
-      }>(node);
-      assertOpSupported("unscaleGrad", backend.ops.unscaleGrad);
-      return backend.ops.unscaleGrad(
-        backendInputs[0],
-        payload.invScale,
-        payload.infFlagBuffer,
-      );
-    }
-    default:
-      throw new Error(`Unknown mutation op: ${node.op}`);
-  }
+): Promise<BackendTensor> {
+  assertOpSupported("adamStep", backend.ops.adamStep);
+  const payload = requirePayload<AdamStepConfig>(node);
+  return (async () => {
+    const adamResult = await backend.ops.adamStep!(
+      backendInputs[0],
+      backendInputs[1],
+      backendInputs[2],
+      backendInputs[3],
+      payload,
+    );
+    const mStorage = createStorageHandle(node.device, adamResult.m);
+    const vStorage = createStorageHandle(node.device, adamResult.v);
+    const adamMV = { m: mStorage, v: vStorage };
+    storageTracker.markReachable(mStorage.id, adamMV);
+    storageTracker.markReachable(vStorage.id, adamMV);
+    if (!node._sideOutputs) node._sideOutputs = {};
+    node._sideOutputs.adamMV = adamMV;
+    return adamResult.param;
+  })();
 }
 
 // ---------------------------------------------------------------------------
@@ -536,43 +522,42 @@ type OpHandler = (
 
 function buildOpTable(): Map<string, OpHandler> {
   const t = new Map<string, OpHandler>();
-  const add = (ops: string[], h: OpHandler) => {
-    for (const op of ops) t.set(op, h);
-  };
-  add(
-    [
-      "tensorFromArray",
-      "zeros",
-      "full",
-      "arange",
-      "tril",
-      "triu",
-      "rand",
-      "randn",
-      "bernoulli",
-    ],
-    executeCreationOp,
-  );
+
+  // Creation ops (table-driven)
+  for (const [op, handler] of Object.entries(CREATION_OP_TABLE))
+    t.set(op, handler);
+
+  // Shape ops (table-driven)
+  for (const [op, handler] of Object.entries(SHAPE_OP_TABLE))
+    t.set(op, handler);
+
+  // Generic ops (auto-derived from OP_REGISTRY + manual entries)
+  for (const op of Object.keys(GENERIC_OP_TABLE)) t.set(op, executeGenericOp);
+
+  // clamp: outlier signature (min/max as separate nullable args)
   t.set("clamp", (node, backendInputs, backend) => {
     assertOpSupported("clamp", backend.ops.clamp);
     const p = getPayload<{ min: number | null; max: number | null }>(node);
     return backend.ops.clamp(backendInputs[0], p?.min ?? null, p?.max ?? null);
   });
-  add(
-    [
-      "reshape",
-      "expand",
-      "transpose",
-      "permute",
-      "contiguous",
-      "narrow",
-      "narrowBackward",
-      "cast",
-    ],
-    executeShapeOp,
-  );
-  for (const op of Object.keys(GENERIC_OP_TABLE)) t.set(op, executeGenericOp);
-  add(["adamStep", "unscaleGrad"], executeMutationOp);
+
+  // unscaleGrad: outlier signature (payload fields spread as separate args)
+  t.set("unscaleGrad", (node, backendInputs, backend) => {
+    const payload = requirePayload<{
+      invScale: number;
+      infFlagBuffer: unknown;
+    }>(node);
+    assertOpSupported("unscaleGrad", backend.ops.unscaleGrad);
+    return backend.ops.unscaleGrad(
+      backendInputs[0],
+      payload.invScale,
+      payload.infFlagBuffer,
+    );
+  });
+
+  // adamStep: special-cased (async, side outputs, markReachable)
+  t.set("adamStep", executeAdamStep);
+
   return t;
 }
 

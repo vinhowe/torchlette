@@ -357,6 +357,212 @@ export function collectExternalInputBuffers(
   return bufs;
 }
 
+// ============================================================================
+// Matmul-epilogue slow-path helpers (extracted for readability)
+// ============================================================================
+
+type PlanNodePath = { planNodeIndex: number; inputIndex: number };
+
+/**
+ * Walk the matmul-epilogue covered node chain to find external epilogue inputs.
+ * For each add/mul in the chain, identifies which input comes from the chain
+ * vs. which is an external input (e.g., bias tensor).
+ */
+function reconstructEpilogueInputs(
+  planNodes: LazyIRNode[],
+  coveredNodeIndices: number[],
+): { epilogueInputRefs: LazyRef[]; epilogueInputPaths: PlanNodePath[] } {
+  const epilogueInputRefs: LazyRef[] = [];
+  const epilogueInputPaths: PlanNodePath[] = [];
+  for (let ci = 1; ci < coveredNodeIndices.length; ci++) {
+    const chainNode = planNodes[coveredNodeIndices[ci]];
+    if (
+      (chainNode.op === "add" || chainNode.op === "mul") &&
+      chainNode.inputs.length === 2
+    ) {
+      const prevChainNodeId = planNodes[coveredNodeIndices[ci - 1]].id;
+      const inp0IsChain =
+        chainNode.inputs[0].kind === "pending" &&
+        chainNode.inputs[0].node.id === prevChainNodeId;
+      const externalIdx = inp0IsChain ? 1 : 0;
+      epilogueInputRefs.push(chainNode.inputs[externalIdx]);
+      epilogueInputPaths.push({
+        planNodeIndex: coveredNodeIndices[ci],
+        inputIndex: externalIdx,
+      });
+    }
+  }
+  return { epilogueInputRefs, epilogueInputPaths };
+}
+
+/**
+ * Resolve prologue cast decisions: for each prologue, check whether the cast
+ * already ran (fused in an earlier group). If not, redirect the matmul input
+ * to the pre-cast tensor and tell codegen to cast inline.
+ */
+function resolvePrologueInputs(
+  planNodes: LazyIRNode[],
+  matmulNode: LazyIRNode,
+  matmulNodeIndex: number,
+  actionPrologues: Array<{
+    inputIndex: 0 | 1;
+    castNodeIndex: number;
+    fromDtype: DType;
+    toDtype: DType;
+  }>,
+): {
+  prologues: MatmulPrologueInfo[];
+  inputCastA: "f16" | "f32" | undefined;
+  inputCastB: "f16" | "f32" | undefined;
+  resolvedInputRefA: LazyRef;
+  resolvedInputRefB: LazyRef;
+  inputAPath: PlanNodePath;
+  inputBPath: PlanNodePath;
+} {
+  let inputCastA: "f16" | "f32" | undefined;
+  let inputCastB: "f16" | "f32" | undefined;
+  let resolvedInputRefA = matmulNode.inputs[0];
+  let resolvedInputRefB = matmulNode.inputs[1];
+  let inputAPath: PlanNodePath = {
+    planNodeIndex: matmulNodeIndex,
+    inputIndex: 0,
+  };
+  let inputBPath: PlanNodePath = {
+    planNodeIndex: matmulNodeIndex,
+    inputIndex: 1,
+  };
+
+  const prologues = actionPrologues.map((p) => ({
+    inputIndex: p.inputIndex,
+    castNodeId: planNodes[p.castNodeIndex].id,
+    originalInputRef: planNodes[p.castNodeIndex].inputs[0],
+    fromDtype: p.fromDtype,
+    toDtype: p.toDtype,
+  }));
+
+  for (const p of actionPrologues) {
+    const castRef =
+      p.inputIndex === 0 ? matmulNode.inputs[0] : matmulNode.inputs[1];
+    const castAlreadyRan =
+      castRef.kind === "pending" && castRef.node.result != null;
+    if (!castAlreadyRan) {
+      if (p.inputIndex === 0) {
+        resolvedInputRefA = planNodes[p.castNodeIndex].inputs[0];
+        inputCastA = p.toDtype as "f16" | "f32";
+        inputAPath = { planNodeIndex: p.castNodeIndex, inputIndex: 0 };
+      } else {
+        resolvedInputRefB = planNodes[p.castNodeIndex].inputs[0];
+        inputCastB = p.toDtype as "f16" | "f32";
+        inputBPath = { planNodeIndex: p.castNodeIndex, inputIndex: 0 };
+      }
+    }
+  }
+
+  return {
+    prologues,
+    inputCastA,
+    inputCastB,
+    resolvedInputRefA,
+    resolvedInputRefB,
+    inputAPath,
+    inputBPath,
+  };
+}
+
+/**
+ * Compute matmul geometry from resolved inputs and store the dispatch config
+ * on the action for fast-path replay on subsequent steps.
+ */
+async function buildAndCacheDispatchConfig(
+  action: {
+    cachedDispatchConfig?: unknown;
+    epilogueOps: unknown[];
+    outputDtype?: DType;
+  },
+  resolvedInputRefA: LazyRef,
+  resolvedInputRefB: LazyRef,
+  inputCastA: "f16" | "f32" | undefined,
+  inputCastB: "f16" | "f32" | undefined,
+  inputAPath: PlanNodePath,
+  inputBPath: PlanNodePath,
+  epilogueInputRefs: LazyRef[],
+  epilogueInputPaths: PlanNodePath[],
+): Promise<void> {
+  const { computeMatmulOutputShape, computeBatchSize, computeBatchStrides } =
+    _webgpuMatmulGeomImports as NonNullable<typeof _webgpuMatmulGeomImports>;
+  const { isF16Supported } = await import("../backend/webgpu/index");
+
+  const tensorA = asGPUTensor(getInputStorage(resolvedInputRefA).backendTensor);
+  const tensorB = asGPUTensor(getInputStorage(resolvedInputRefB).backendTensor);
+
+  const detA = _detectTransposeView(tensorA);
+  const detB = _detectTransposeView(tensorB);
+  const transA = detA.transposed;
+  const transB = detB.transposed;
+
+  const outShape = computeMatmulOutputShape(
+    detA.shape,
+    detB.shape,
+    transA,
+    transB,
+  );
+  const aRank = detA.shape.length;
+  const bRank = detB.shape.length;
+  const m = transA ? detA.shape[aRank - 1] : detA.shape[aRank - 2];
+  const k = transA ? detA.shape[aRank - 2] : detA.shape[aRank - 1];
+  const n = transB ? detB.shape[bRank - 2] : detB.shape[bRank - 1];
+
+  const batchDims = outShape.slice(0, -2);
+  const batchSize = computeBatchSize(batchDims);
+  const { strideA, strideB, strideC } = computeBatchStrides(
+    detA.shape,
+    detB.shape,
+    batchDims,
+    m,
+    n,
+    k,
+  );
+
+  const f16ok = isF16Supported();
+  const rawDtypeA =
+    tensorA.dtype === "f16" && f16ok ? ("f16" as const) : ("f32" as const);
+  const rawDtypeB =
+    tensorB.dtype === "f16" && f16ok ? ("f16" as const) : ("f32" as const);
+  const dtypeA: "f16" | "f32" =
+    inputCastA === "f16" && f16ok ? "f16" : rawDtypeA;
+  const dtypeB: "f16" | "f32" =
+    inputCastB === "f16" && f16ok ? "f16" : rawDtypeB;
+  const promotedDtype =
+    dtypeA === "f32" || dtypeB === "f32" ? ("f32" as const) : dtypeA;
+  const outputDtype = action.outputDtype ?? promotedDtype;
+
+  action.cachedDispatchConfig = {
+    inputAPath,
+    inputBPath,
+    epilogueInputPaths,
+    inputCastA,
+    inputCastB,
+    m,
+    k,
+    n,
+    transA,
+    transB,
+    batchSize,
+    batchStrideA: strideA,
+    batchStrideB: strideB,
+    batchStrideC: strideC,
+    outShape,
+    dtypeA,
+    dtypeB: dtypeB !== dtypeA ? dtypeB : undefined,
+    outputDtype,
+    epilogueConfig: {
+      ops: action.epilogueOps,
+      additionalInputCount: epilogueInputRefs.length,
+      outputDtype: action.outputDtype,
+    },
+  };
+}
+
 /**
  * Execute a lowered plan (cached dispatch sequence).
  *
@@ -911,34 +1117,8 @@ export async function executeLoweredPlan(
 
           // ── SLOW PATH: first lowered plan execution — full reconstruction ──
 
-          // Reconstruct the epilogue input refs from the covered nodes.
-          // For each add/mul in the chain, the "external" input (not from the chain)
-          // is the epilogue input. The chain may connect via inputs[0] or inputs[1]
-          // (commutative ops), so we check which input is the previous chain node.
-          const epilogueInputRefs: LazyRef[] = [];
-          const epilogueInputPaths: Array<{
-            planNodeIndex: number;
-            inputIndex: number;
-          }> = [];
-          for (let ci = 1; ci < action.coveredNodeIndices.length; ci++) {
-            const chainNode = planNodes[action.coveredNodeIndices[ci]];
-            if (
-              (chainNode.op === "add" || chainNode.op === "mul") &&
-              chainNode.inputs.length === 2
-            ) {
-              const prevChainNodeId =
-                planNodes[action.coveredNodeIndices[ci - 1]].id;
-              const inp0IsChain =
-                chainNode.inputs[0].kind === "pending" &&
-                chainNode.inputs[0].node.id === prevChainNodeId;
-              const externalIdx = inp0IsChain ? 1 : 0;
-              epilogueInputRefs.push(chainNode.inputs[externalIdx]);
-              epilogueInputPaths.push({
-                planNodeIndex: action.coveredNodeIndices[ci],
-                inputIndex: externalIdx,
-              });
-            }
-          }
+          const { epilogueInputRefs, epilogueInputPaths } =
+            reconstructEpilogueInputs(planNodes, action.coveredNodeIndices);
 
           // Reconstruct prologues and resolve prologue decisions
           let prologues: MatmulPrologueInfo[] | undefined;
@@ -946,170 +1126,54 @@ export async function executeLoweredPlan(
           let inputCastB: "f16" | "f32" | undefined;
           let resolvedInputRefA = matmulNode.inputs[0];
           let resolvedInputRefB = matmulNode.inputs[1];
-          // Track paths for caching (plan-node-relative, stable across steps)
-          let inputAPath = {
+          let inputAPath: PlanNodePath = {
             planNodeIndex: action.matmulNodeIndex,
             inputIndex: 0,
           };
-          let inputBPath = {
+          let inputBPath: PlanNodePath = {
             planNodeIndex: action.matmulNodeIndex,
             inputIndex: 1,
           };
 
           if (action.prologues && action.prologues.length > 0) {
-            prologues = action.prologues.map((p) => ({
-              inputIndex: p.inputIndex,
-              castNodeId: planNodes[p.castNodeIndex].id,
-              originalInputRef: planNodes[p.castNodeIndex].inputs[0],
-              fromDtype: p.fromDtype,
-              toDtype: p.toDtype,
-            }));
-
-            // Resolve prologue decisions (same logic as executeMatmulWithEpilogue)
-            for (const p of action.prologues) {
-              const castRef =
-                p.inputIndex === 0
-                  ? matmulNode.inputs[0]
-                  : matmulNode.inputs[1];
-              const castAlreadyRan =
-                castRef.kind === "pending" && castRef.node.result != null;
-              if (!castAlreadyRan) {
-                if (p.inputIndex === 0) {
-                  resolvedInputRefA = planNodes[p.castNodeIndex].inputs[0];
-                  inputCastA = p.toDtype as "f16" | "f32";
-                  inputAPath = {
-                    planNodeIndex: p.castNodeIndex,
-                    inputIndex: 0,
-                  };
-                } else {
-                  resolvedInputRefB = planNodes[p.castNodeIndex].inputs[0];
-                  inputCastB = p.toDtype as "f16" | "f32";
-                  inputBPath = {
-                    planNodeIndex: p.castNodeIndex,
-                    inputIndex: 0,
-                  };
-                }
-              }
-            }
+            const resolved = resolvePrologueInputs(
+              planNodes,
+              matmulNode,
+              action.matmulNodeIndex,
+              action.prologues,
+            );
+            prologues = resolved.prologues;
+            inputCastA = resolved.inputCastA;
+            inputCastB = resolved.inputCastB;
+            resolvedInputRefA = resolved.resolvedInputRefA;
+            resolvedInputRefB = resolved.resolvedInputRefB;
+            inputAPath = resolved.inputAPath;
+            inputBPath = resolved.inputBPath;
           }
-
-          const epiloguePlan: MatmulEpiloguePlan = {
-            consumedCount: action.consumedCount,
-            epilogueOps: action.epilogueOps,
-            epilogueInputRefs,
-            outputDtype: action.outputDtype,
-            outputNode,
-            prologues,
-          };
 
           await withProfileContext(epLabel, matmulNode.module, () =>
-            executeMatmulWithEpilogue(matmulNode, epiloguePlan),
+            executeMatmulWithEpilogue(matmulNode, {
+              consumedCount: action.consumedCount,
+              epilogueOps: action.epilogueOps,
+              epilogueInputRefs,
+              outputDtype: action.outputDtype,
+              outputNode,
+              prologues,
+            }),
           );
 
-          // ── Cache dispatch config for next step ──
-          // Compute matmul geometry from the resolved inputs (shapes are stable across steps).
-          // Must replicate dispatchMatmul's transpose detection logic exactly.
-          {
-            const {
-              computeMatmulOutputShape,
-              computeBatchSize,
-              computeBatchStrides,
-            } = _webgpuMatmulGeomImports as NonNullable<
-              typeof _webgpuMatmulGeomImports
-            >;
-            const { isF16Supported } = await import("../backend/webgpu/index");
-
-            const tensorA = asGPUTensor(
-              getInputStorage(resolvedInputRefA).backendTensor,
-            );
-            const tensorB = asGPUTensor(
-              getInputStorage(resolvedInputRefB).backendTensor,
-            );
-
-            // Detect simple last-2-dim transposes (matching detectSimpleTranspose in index.ts).
-            // If detected, use original contiguous shape and flip transpose flag.
-            const detA = _detectTransposeView(tensorA);
-            const detB = _detectTransposeView(tensorB);
-            const effectiveShapeA = detA.shape;
-            const effectiveShapeB = detB.shape;
-            const transA = detA.transposed;
-            const transB = detB.transposed;
-
-            const outShape = computeMatmulOutputShape(
-              effectiveShapeA,
-              effectiveShapeB,
-              transA,
-              transB,
-            );
-            const aRank = effectiveShapeA.length;
-            const bRank = effectiveShapeB.length;
-            const m = transA
-              ? effectiveShapeA[aRank - 1]
-              : effectiveShapeA[aRank - 2];
-            const k = transA
-              ? effectiveShapeA[aRank - 2]
-              : effectiveShapeA[aRank - 1];
-            const n = transB
-              ? effectiveShapeB[bRank - 2]
-              : effectiveShapeB[bRank - 1];
-
-            const batchDims = outShape.slice(0, -2);
-            const batchSize = computeBatchSize(batchDims);
-            const { strideA, strideB, strideC } = computeBatchStrides(
-              effectiveShapeA,
-              effectiveShapeB,
-              batchDims,
-              m,
-              n,
-              k,
-            );
-
-            // Compute dtypes (matching dispatchMatmul logic)
-            const f16ok = isF16Supported();
-            const rawDtypeA =
-              tensorA.dtype === "f16" && f16ok
-                ? ("f16" as const)
-                : ("f32" as const);
-            const rawDtypeB =
-              tensorB.dtype === "f16" && f16ok
-                ? ("f16" as const)
-                : ("f32" as const);
-            const dtypeA: "f16" | "f32" =
-              inputCastA === "f16" && f16ok ? "f16" : rawDtypeA;
-            const dtypeB: "f16" | "f32" =
-              inputCastB === "f16" && f16ok ? "f16" : rawDtypeB;
-            const promotedDtype =
-              dtypeA === "f32" || dtypeB === "f32" ? ("f32" as const) : dtypeA;
-            const outputDtype = action.outputDtype ?? promotedDtype;
-
-            const epilogueConfig = {
-              ops: action.epilogueOps,
-              additionalInputCount: epilogueInputRefs.length,
-              outputDtype: action.outputDtype,
-            };
-
-            action.cachedDispatchConfig = {
-              inputAPath,
-              inputBPath,
-              epilogueInputPaths,
-              inputCastA,
-              inputCastB,
-              m,
-              k,
-              n,
-              transA,
-              transB,
-              batchSize,
-              batchStrideA: strideA,
-              batchStrideB: strideB,
-              batchStrideC: strideC,
-              outShape,
-              dtypeA,
-              dtypeB: dtypeB !== dtypeA ? dtypeB : undefined,
-              outputDtype,
-              epilogueConfig,
-            };
-          }
+          // Cache dispatch config for next step
+          await buildAndCacheDispatchConfig(
+            action,
+            resolvedInputRefA,
+            resolvedInputRefB,
+            inputCastA,
+            inputCastB,
+            inputAPath,
+            inputBPath,
+            epilogueInputRefs,
+            epilogueInputPaths,
+          );
 
           captureAndRecordResult(action.outputNodeIndex, outputNode);
           break;
