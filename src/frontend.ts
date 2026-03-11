@@ -261,6 +261,22 @@ export class Torchlette {
     this.runtime.setBackend(name);
   }
 
+  /**
+   * Set the default device for tensor creation (like PyTorch's torch.set_default_device).
+   * All tensor factory calls (zeros, randn, tensorFromArray, etc.) and nn.Module
+   * constructors will use this device when no explicit device is provided.
+   */
+  setDefaultDevice(device: DeviceKind): void {
+    this.runtime.setBackend(device);
+  }
+
+  /**
+   * Get the current default device.
+   */
+  getDefaultDevice(): DeviceKind {
+    return this.runtime.currentDefaultDevice;
+  }
+
   // ============================================================================
   // Autocast (§12) — delegated to frontend-autocast.ts
   // ============================================================================
