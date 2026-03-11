@@ -1,59 +1,24 @@
 import type { Backend, DType } from "../backend/types";
 import { isFusedBackend } from "../backend/types";
-import type { CompoundMatch } from "./compound-patterns";
-import { collectExternalInputBuffers } from "./executor-lowered";
+import { executeLoweredPlan } from "./executor-lowered";
 import { executePlan } from "./executor-sequential";
 import {
   buildIdPositionMap,
   collectExternalInputs,
   computePlanFingerprint,
   type ExecutionSegment,
-  type FusionGroup,
   groupToRecipe,
   isFusibleOp,
 } from "./fusion-detect";
 import { analyzeGraph } from "./graph-compiler";
 import type { ExecutionPlan, LazyIRNode, StorageHandle } from "./lazy-types";
-import type { TensorLifetime } from "./lifetime-analysis";
-import { type LoweredPlan, LoweredPlanBuilder } from "./lowered-plan";
-import type { MatmulPrologueInfo } from "./matmul-epilogue";
-import { initLifetimeAnalysis, pretunePlanMatmuls } from "./plan-builder";
+import { buildLoweredPlanFromAnalysis, type LoweredPlan } from "./lowered-plan";
+import { pretunePlanMatmuls } from "./plan-builder";
 import {
   isProfilingEnabled,
   type PlanAnalysis,
   recordPlanAnalysis,
 } from "./profiler";
-import type { ReductionGroup } from "./reduction-detect";
-import {
-  type CompoundMatchExec,
-  createReclaimController,
-  DEFAULT_RECLAIM_INTERVAL,
-  executeFusedSegment,
-  executeReductionSegment,
-  executeSequentialSegmentWithEarlyRelease,
-} from "./segment-executors";
-import { releaseDeadTensors } from "./storage-tracker";
-
-/**
- * Collect external input refs from a chain of nodes.
- * For each node, inputs that don't reference the previous chain node are external.
- * Used when reconstructing ReductionGroup from cached template on cache hit.
- */
-function collectChainExternalRefsFromNodes(
-  chainNodes: LazyIRNode[],
-  skipNodeId?: number,
-): LazyIRNode["inputs"] {
-  const refs: LazyIRNode["inputs"] = [];
-  const chainNodeIds = new Set(chainNodes.map((n) => n.id));
-  if (skipNodeId !== undefined) chainNodeIds.add(skipNodeId);
-  for (const node of chainNodes) {
-    for (const ref of node.inputs) {
-      if (ref.kind === "pending" && chainNodeIds.has(ref.node.id)) continue;
-      refs.push(ref);
-    }
-  }
-  return refs;
-}
 
 /**
  * Options for optimized plan execution.
@@ -140,7 +105,7 @@ export interface FusionAnalysisTemplate {
     bufferSize: number;
   }>;
 
-  /** Cached lowered execution plan (built during first execution on cache miss). */
+  /** Cached lowered execution plan (built from graph analysis). */
   loweredPlan?: LoweredPlan;
 
   /** Per-plan buffer arena: GPUBuffers that persist across steps for bind group cache stability. */
@@ -206,10 +171,10 @@ export function getFusionAnalysisTemplate(
 /**
  * Execute a plan with automatic fusion optimization.
  *
- * Per spec §15, this:
- * - Detects fusible elementwise op chains
- * - Dispatches fused WebGPU kernels when beneficial
- * - Falls back to sequential execution for non-fusible ops
+ * Pipeline: analyze graph → build lowered plan → execute lowered plan.
+ * The lowered plan is built purely from graph analysis (no execution needed)
+ * and cached for subsequent steps. executeLoweredPlan() is the sole execution
+ * engine for both first-run and replay paths.
  *
  * @param plan - The execution plan
  * @param backend - The backend to use
@@ -229,27 +194,21 @@ export async function executePlanOptimized(
   // Pre-tune matmul shapes if backend supports it
   await pretunePlanMatmuls(plan, backend);
 
-  const {
-    enableFusion = isFusedBackend(backend),
-    enableVectorization = true,
-    enableEarlyRelease = false,
-  } = options;
-
-  const stats: OptimizedExecutionStats = {
-    totalNodes: plan.nodes.length,
-    fusedNodes: 0,
-    sequentialNodes: 0,
-    fusionGroups: 0,
-    fusionEnabled: enableFusion,
-  };
+  const { enableFusion = isFusedBackend(backend), enableVectorization = true } =
+    options;
 
   // Fall back to simple sequential execution when fusion is disabled entirely.
-  // When fusion IS enabled, always go through the full analysis path even if
-  // no fusible ops exist — this creates lowered plan templates (for adam batching,
-  // arena allocation, bind group cache stability) that benefit all plan types.
   if (!enableFusion) {
-    const result = await executePlan(plan, backend, { enableEarlyRelease });
-    stats.sequentialNodes = plan.nodes.length;
+    const result = await executePlan(plan, backend, {
+      enableEarlyRelease: options.enableEarlyRelease,
+    });
+    const stats: OptimizedExecutionStats = {
+      totalNodes: plan.nodes.length,
+      fusedNodes: 0,
+      sequentialNodes: plan.nodes.length,
+      fusionGroups: 0,
+      fusionEnabled: enableFusion,
+    };
     return { result, stats };
   }
 
@@ -264,164 +223,24 @@ export async function executePlanOptimized(
   } catch {
     // If runtime/tensor is not available, skip external node tracking
   }
-  // Lifetime analysis is set up after analysis (below)
-  let lifetimes: Map<number, TensorLifetime> | null = null;
-  let outputNodeIds: Set<number> | null = null;
-  const alreadyReleased = new Set<number>();
-  const nodeToStorage = new Map<number, StorageHandle>();
 
   // Query device storage buffer limit to constrain fusion group size.
   const maxStorageBuffers: number | undefined =
     backend.device?.limits?.maxStorageBuffersPerShaderStage;
 
   // Compute structural fingerprint for fusion analysis caching.
-  // Plans with the same fingerprint have identical structure (ops, shapes,
-  // dtypes, dependency graph) and can reuse cached analysis results.
   const fingerprint = computePlanFingerprint(plan.nodes, externalNodeIds);
   const cachedTemplate = fusionAnalysisCache.get(fingerprint);
 
   let planNodes: LazyIRNode[];
-  let segments: ExecutionSegment[];
-  const epilogueClaimedIds = new Set<number>();
-  const prologueClaimedIds = new Set<number>();
-  const matmulEpilogueChains = new Map<number, number[]>();
-  const matmulPrologues = new Map<number, MatmulPrologueInfo[]>();
-  const compoundClaimedIds = new Set<number>();
-  let compoundMatches: CompoundMatch[] = [];
-  let matmulDirectives:
-    | ReturnType<typeof analyzeGraph>["matmulDirectives"]
-    | undefined;
+  let loweredPlan: LoweredPlan;
 
-  if (cachedTemplate) {
-    // ── Cache hit: reconstruct from template ──
+  if (cachedTemplate?.loweredPlan) {
+    // ── Cache hit: reuse existing lowered plan ──
     planNodes = cachedTemplate.finalPerm.map((i) => plan.nodes[i]);
-
-    // Reconstruct epilogue/prologue ID sets
-    for (const pos of cachedTemplate.epilogueClaimedOrigPoss) {
-      epilogueClaimedIds.add(plan.nodes[pos].id);
-    }
-    for (const pos of cachedTemplate.prologueClaimedOrigPoss) {
-      prologueClaimedIds.add(plan.nodes[pos].id);
-    }
-    for (const [matmulPos, epiloguePoss] of cachedTemplate.epilogueChains) {
-      matmulEpilogueChains.set(
-        plan.nodes[matmulPos].id,
-        epiloguePoss.map((p) => plan.nodes[p].id),
-      );
-    }
-    for (const [matmulPos, descs] of cachedTemplate.prologueDescs) {
-      matmulPrologues.set(
-        plan.nodes[matmulPos].id,
-        descs.map((d) => ({
-          inputIndex: d.inputIndex,
-          castNodeId: plan.nodes[d.castOrigPos].id,
-          originalInputRef: plan.nodes[d.castOrigPos].inputs[0],
-          fromDtype: d.fromDtype,
-          toDtype: d.toDtype,
-        })),
-      );
-    }
-
-    // Reconstruct compound pattern matches from cached template
-    if (cachedTemplate.compoundDescs) {
-      for (const desc of cachedTemplate.compoundDescs) {
-        const coveredIds = desc.coveredOrigPoss.map((p) => plan.nodes[p].id);
-        compoundMatches.push({
-          name: desc.name,
-          coveredNodeIds: coveredIds,
-          outputNodeId: plan.nodes[desc.outputOrigPos].id,
-          dim: desc.dim,
-          inputNodeId: -1, // Not needed for execution
-          inputIsMaterialized: false,
-        });
-        for (const id of coveredIds) compoundClaimedIds.add(id);
-      }
-    }
-
-    // Reconstruct lifetime analysis from cached template (avoids initLifetimeAnalysis)
-    if (cachedTemplate.lifetimeTemplate && enableEarlyRelease) {
-      lifetimes = new Map();
-      for (let i = 0; i < planNodes.length; i++) {
-        const t = cachedTemplate.lifetimeTemplate[i];
-        lifetimes.set(planNodes[i].id, {
-          nodeId: planNodes[i].id,
-          firstUse: t.firstUse,
-          lastUse: t.lastUse,
-          isOutput: t.isOutput,
-          isInput: t.isInput,
-          bufferSize: t.bufferSize,
-        });
-      }
-      outputNodeIds = new Set([planNodes[planNodes.length - 1].id]);
-      if (externalNodeIds) {
-        for (const id of externalNodeIds) outputNodeIds.add(id);
-      }
-    }
-
-    // Reconstruct segments from cached pattern
-    segments = cachedTemplate.segments.map((seg) => {
-      if (seg.kind === "sequential") {
-        return {
-          kind: "sequential" as const,
-          nodes: seg.finalPoss.map((i) => planNodes[i]),
-        };
-      }
-      if (seg.kind === "reduction") {
-        // Reconstruct ReductionGroup from cached positions
-        const groupNodes = seg.finalPoss.map((i) => planNodes[i]);
-        const preambleNodes = seg.preambleFinalPoss.map((i) => planNodes[i]);
-        const epilogueNodes = seg.epilogueFinalPoss.map((i) => planNodes[i]);
-        const reductionNode = planNodes[seg.reductionFinalPos];
-        const outputNode = planNodes[seg.outputFinalPos];
-
-        // Reconstruct external input refs from preamble/epilogue nodes
-        const preambleInputRefs =
-          collectChainExternalRefsFromNodes(preambleNodes);
-        const epilogueInputRefs = collectChainExternalRefsFromNodes(
-          epilogueNodes,
-          preambleNodes.length > 0 ? undefined : reductionNode.id,
-        );
-
-        const group: ReductionGroup = {
-          nodes: groupNodes,
-          planIndices: seg.finalPoss,
-          reductionNode,
-          preambleNodes,
-          epilogueNodes,
-          outputNode,
-          preambleOps: seg.preambleOps,
-          preambleInputRefs,
-          preambleInputDtypes: seg.preambleInputDtypes,
-          epilogueOps: seg.epilogueOps,
-          epilogueInputRefs,
-          outputDtype: seg.outputDtype,
-          isMean: seg.isMean,
-        };
-        return { kind: "reduction" as const, group };
-      }
-      // Reconstruct FusionGroup
-      const groupNodes = seg.finalPoss.map((i) => planNodes[i]);
-      const groupNodeIds = new Set(groupNodes.map((n) => n.id));
-      const extInputs = collectExternalInputs(groupNodes, groupNodeIds);
-      const group: FusionGroup = {
-        nodes: groupNodes,
-        planIndices: seg.finalPoss,
-        externalInputs: extInputs,
-        outputNode: planNodes[seg.outputFinalPos],
-        additionalOutputNodes:
-          seg.additionalOutputFinalPoss.length > 0
-            ? seg.additionalOutputFinalPoss.map((i) => planNodes[i])
-            : undefined,
-        neededIntermediates:
-          seg.neededIntermediateFinalPoss.length > 0
-            ? seg.neededIntermediateFinalPoss.map((i) => planNodes[i])
-            : undefined,
-      };
-      const recipe = groupToRecipe(group);
-      return { kind: "fused" as const, group, recipe };
-    });
+    loweredPlan = cachedTemplate.loweredPlan;
   } else {
-    // ── Cache miss: run full analysis via unified graph compiler ──
+    // ── Cache miss: run full analysis + build lowered plan ──
 
     const analysis = analyzeGraph(
       plan.nodes,
@@ -429,25 +248,13 @@ export async function executePlanOptimized(
       maxStorageBuffers,
     );
     planNodes = analysis.planNodes;
-    segments = analysis.segments;
 
-    // Copy analysis results into local variables
-    for (const id of analysis.epilogueClaimedIds) epilogueClaimedIds.add(id);
-    for (const id of analysis.prologueClaimedIds) prologueClaimedIds.add(id);
-    for (const id of analysis.compoundClaimedIds) compoundClaimedIds.add(id);
-    for (const [mmId, chain] of analysis.matmulEpilogueChains)
-      matmulEpilogueChains.set(mmId, chain);
-    for (const [mmId, prologues] of analysis.matmulPrologues)
-      matmulPrologues.set(mmId, prologues);
-    compoundMatches = analysis.compoundMatches;
-    matmulDirectives = analysis.matmulDirectives;
-
-    // ── Build template and cache it ──
+    // Build template and cache it
     const origIdToPos = buildIdPositionMap(plan.nodes);
     const finalPerm = planNodes.map((n) => origIdToPos.get(n.id) as number);
     const finalIdToPos = buildIdPositionMap(planNodes);
 
-    const cachedSegments: CachedSegmentDesc[] = segments.map((seg) => {
+    const cachedSegments: CachedSegmentDesc[] = analysis.segments.map((seg) => {
       if (seg.kind === "sequential") {
         return {
           kind: "sequential" as const,
@@ -490,20 +297,20 @@ export async function executePlanOptimized(
     const template: FusionAnalysisTemplate = {
       finalPerm,
       segments: cachedSegments,
-      epilogueClaimedOrigPoss: [...epilogueClaimedIds].map(
+      epilogueClaimedOrigPoss: [...analysis.epilogueClaimedIds].map(
         (id) => origIdToPos.get(id) as number,
       ),
-      prologueClaimedOrigPoss: [...prologueClaimedIds].map(
+      prologueClaimedOrigPoss: [...analysis.prologueClaimedIds].map(
         (id) => origIdToPos.get(id) as number,
       ),
-      epilogueChains: [...matmulEpilogueChains].map(
+      epilogueChains: [...analysis.matmulEpilogueChains].map(
         ([mmId, epilogueIds]) =>
           [
             origIdToPos.get(mmId) as number,
             epilogueIds.map((id) => origIdToPos.get(id) as number),
           ] as [number, number[]],
       ),
-      prologueDescs: [...matmulPrologues].map(
+      prologueDescs: [...analysis.matmulPrologues].map(
         ([mmId, prologues]) =>
           [
             origIdToPos.get(mmId) as number,
@@ -524,8 +331,8 @@ export async function executePlanOptimized(
           ],
       ),
       compoundDescs:
-        compoundMatches.length > 0
-          ? compoundMatches.map((m) => ({
+        analysis.compoundMatches.length > 0
+          ? analysis.compoundMatches.map((m) => ({
               name: m.name,
               coveredOrigPoss: m.coveredNodeIds.map(
                 (id) => origIdToPos.get(id) as number,
@@ -535,361 +342,128 @@ export async function executePlanOptimized(
             }))
           : undefined,
     };
-    fusionAnalysisCache.set(fingerprint, template);
-  }
 
-  // Build a lowered plan during cache miss execution (first run).
-  // On cache hit, the lowered plan is already attached to the template.
-  let loweredPlanBuilder: LoweredPlanBuilder | null = null;
-  const nodeIdToFinalPos = buildIdPositionMap(planNodes);
-  if (!cachedTemplate) {
-    loweredPlanBuilder = new LoweredPlanBuilder(planNodes.length);
-  }
-
-  // Set up lifetime analysis after final plan order is determined.
-  // Skip if already reconstructed from cached template (cache hit path above).
-  if (enableEarlyRelease && !lifetimes) {
-    ({ lifetimes, outputNodeIds } = initLifetimeAnalysis(
+    // Build lowered plan from analysis (the sole plan-building path)
+    loweredPlan = buildLoweredPlanFromAnalysis({
+      segments: analysis.segments,
       planNodes,
-      externalNodeIds,
-    ));
+      nodeIdToFinalPos: finalIdToPos,
+      prologueClaimedIds: analysis.prologueClaimedIds,
+      compoundMatches: analysis.compoundMatches,
+      matmulDirectives: analysis.matmulDirectives,
+      enableVectorization,
+    });
+    template.loweredPlan = loweredPlan;
 
-    // Store lifetime template in the fusion analysis cache for future hits
-    const cached = fusionAnalysisCache.get(fingerprint);
-    if (cached && !cached.lifetimeTemplate) {
-      cached.lifetimeTemplate = planNodes.map((node) => {
-        const lt = (lifetimes as Map<number, TensorLifetime>).get(
-          node.id,
-        ) as TensorLifetime;
-        return {
-          firstUse: lt.firstUse,
-          lastUse: lt.lastUse,
-          isOutput: lt.isOutput,
-          isInput: lt.isInput,
-          bufferSize: lt.bufferSize,
-        };
-      });
+    fusionAnalysisCache.set(fingerprint, template);
+
+    // Collect plan analysis for profiling (structural, no execution needed)
+    if (isProfilingEnabled()) {
+      collectProfilingStats(
+        analysis.segments,
+        analysis.epilogueClaimedIds,
+        analysis.prologueClaimedIds,
+        analysis.matmulEpilogueChains,
+        plan.nodes.length,
+      );
     }
   }
 
-  // Collect plan analysis for profiling
-  let planAnalysisRef: PlanAnalysis | null = null;
-  if (isProfilingEnabled()) {
-    let fusedSegCount = 0;
-    let seqSegCount = 0;
-    let fusedNodeCount = 0;
-    let fusionGroupCount = 0;
-    const sequentialOps: Record<string, number> = {};
-    const unfusedByShape: Record<
-      string,
-      { count: number; ops: Record<string, number> }
-    > = {};
+  // Execute via the lowered plan — the sole execution engine
+  const bufferArena = (cachedTemplate ?? fusionAnalysisCache.get(fingerprint))
+    ?.bufferArena;
+  return executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
+    bufferArena: bufferArena as
+      | import("../backend/webgpu").BufferArena
+      | undefined,
+  });
+}
 
-    const recordUnfused = (node: LazyIRNode) => {
-      sequentialOps[node.op] = (sequentialOps[node.op] ?? 0) + 1;
-      if (isFusibleOp(node.op)) {
-        const shapeKey = node.shape.join(",");
-        let bucket = unfusedByShape[shapeKey];
-        if (!bucket) {
-          bucket = { count: 0, ops: {} };
-          unfusedByShape[shapeKey] = bucket;
-        }
-        bucket.count++;
-        bucket.ops[node.op] = (bucket.ops[node.op] ?? 0) + 1;
-      }
-    };
+// ============================================================================
+// Profiling (structural analysis, no execution needed)
+// ============================================================================
 
-    for (const segment of segments) {
-      if (segment.kind === "fused" && segment.group.nodes.length >= 2) {
-        fusedSegCount++;
-        fusedNodeCount += segment.group.nodes.length;
-        fusionGroupCount++;
-      } else if (segment.kind === "fused") {
-        seqSegCount++;
-        for (const node of segment.group.nodes) recordUnfused(node);
-      } else {
-        seqSegCount++;
-        for (const node of segment.nodes) {
-          if (
-            !epilogueClaimedIds.has(node.id) &&
-            !prologueClaimedIds.has(node.id)
-          ) {
-            recordUnfused(node);
-          } else {
-            sequentialOps[node.op] = (sequentialOps[node.op] ?? 0) + 1;
-          }
-        }
+function collectProfilingStats(
+  segments: ExecutionSegment[],
+  epilogueClaimedIds: Set<number>,
+  prologueClaimedIds: Set<number>,
+  matmulEpilogueChains: Map<number, number[]>,
+  totalNodes: number,
+): void {
+  let fusedSegCount = 0;
+  let seqSegCount = 0;
+  let fusedNodeCount = 0;
+  let fusionGroupCount = 0;
+  const sequentialOps: Record<string, number> = {};
+  const unfusedByShape: Record<
+    string,
+    { count: number; ops: Record<string, number> }
+  > = {};
+
+  const recordUnfused = (node: LazyIRNode) => {
+    sequentialOps[node.op] = (sequentialOps[node.op] ?? 0) + 1;
+    if (isFusibleOp(node.op)) {
+      const shapeKey = node.shape.join(",");
+      let bucket = unfusedByShape[shapeKey];
+      if (!bucket) {
+        bucket = { count: 0, ops: {} };
+        unfusedByShape[shapeKey] = bucket;
       }
+      bucket.count++;
+      bucket.ops[node.op] = (bucket.ops[node.op] ?? 0) + 1;
     }
+  };
 
-    // Count reduction preamble opportunities from sequential segments
-    let reductionFusionEstimate = 0;
-    for (const segment of segments) {
-      if (segment.kind !== "sequential") continue;
-      for (let i = 0; i < segment.nodes.length - 1; i++) {
-        const cur = segment.nodes[i];
-        const next = segment.nodes[i + 1];
+  for (const segment of segments) {
+    if (segment.kind === "fused" && segment.group.nodes.length >= 2) {
+      fusedSegCount++;
+      fusedNodeCount += segment.group.nodes.length;
+      fusionGroupCount++;
+    } else if (segment.kind === "fused") {
+      seqSegCount++;
+      for (const node of segment.group.nodes) recordUnfused(node);
+    } else if (segment.kind === "sequential") {
+      seqSegCount++;
+      for (const node of segment.nodes) {
         if (
-          isFusibleOp(cur.op) &&
-          cur.op !== "cast" &&
-          (next.op === "sum" || next.op === "mean")
+          !epilogueClaimedIds.has(node.id) &&
+          !prologueClaimedIds.has(node.id)
         ) {
-          reductionFusionEstimate++;
+          recordUnfused(node);
+        } else {
+          sequentialOps[node.op] = (sequentialOps[node.op] ?? 0) + 1;
         }
       }
     }
-
-    planAnalysisRef = {
-      planIndex: 0, // assigned by recordPlanAnalysis
-      totalNodes: plan.nodes.length,
-      segments: { fused: fusedSegCount, sequential: seqSegCount },
-      fusedNodes: fusedNodeCount,
-      fusionGroups: fusionGroupCount,
-      epilogueFusions: matmulEpilogueChains.size,
-      reductionFusions: reductionFusionEstimate,
-      sequentialOps,
-      unfusedByShape,
-    };
-    recordPlanAnalysis(planAnalysisRef);
   }
 
-  // Track overall step index for early release
-  let overallStep = 0;
-
-  // Pre-build consumer count map once for the entire plan.
-  // This is used by both reduction preamble detection and matmul epilogue detection.
-  // Wrap the entire segment loop in a top-level shared encoder scope.
-  // Inner begin/end calls in executeSequentialSegment become nested no-ops
-  // thanks to the depth counter. This lets elementwise ops from consecutive
-  // segments accumulate into a single batch, reducing queue.submit() calls.
-  const fused = isFusedBackend(backend) ? backend : null;
-  if (fused) fused.beginSharedEncoder();
-
-  // Activate buffer arena if available from cached template.
-  // This is critical for the fallback path: when executeLoweredPlan fails and
-  // we fall back to executePlanOptimized, the arena still provides stable buffer
-  // identities for bind group cache hits.
-  const useArenaFallback =
-    fused &&
-    cachedTemplate?.bufferArena &&
-    process.env.TORCHLETTE_USE_ARENA !== "0";
-  if (useArenaFallback) {
-    fused.setActiveArena(
-      (cachedTemplate as FusionAnalysisTemplate).bufferArena,
-    );
-    fused.setArenaExternalInputBuffers(collectExternalInputBuffers(planNodes));
-  }
-
-  try {
-    let compoundMatchMap: Map<number, CompoundMatchExec> | undefined;
-    if (compoundMatches.length > 0) {
-      compoundMatchMap = new Map();
-      for (const match of compoundMatches) {
-        let firstPos = Infinity;
-        let firstId = match.coveredNodeIds[0];
-        for (const id of match.coveredNodeIds) {
-          const pos = nodeIdToFinalPos.get(id) ?? Infinity;
-          if (pos < firstPos) {
-            firstPos = pos;
-            firstId = id;
-          }
-        }
-        const coveredSet = new Set(match.coveredNodeIds);
-        const desc = {
-          name: match.name,
-          coveredNodeIds: coveredSet,
-          outputNodeId: match.outputNodeId,
-          dim: match.dim,
-        };
-        compoundMatchMap.set(firstId, desc);
-        for (const id of match.coveredNodeIds) {
-          if (id !== firstId) compoundMatchMap.set(id, { ...desc, name: "" });
-        }
-      }
-    }
-
-    // Track dispatched nodes for periodic buffer reclamation.
-    // When the shared encoder is active, released buffers go to pendingRelease
-    // and can't be reused. Periodically flushing moves them back to the main pool.
-    const reclaim = createReclaimController(
-      DEFAULT_RECLAIM_INTERVAL,
-      loweredPlanBuilder,
-      backend,
-    );
-
-    // Execute each segment
-    for (const segment of segments) {
-      if (segment.kind === "reduction") {
-        // Execute reduction segment
-        const rg = segment.group;
-        const reductionLabel =
-          rg.preambleNodes.length > 0
-            ? `${rg.isMean ? "mean" : rg.reductionNode.op}+${rg.preambleNodes.map((n) => n.op).join("+")}${rg.epilogueOps.length > 0 ? "+" + rg.epilogueOps.map((o) => o.op || o.kind).join("+") : ""}`
-            : `${rg.reductionNode.op}+${rg.epilogueOps.map((o) => o.op || o.kind).join("+")}`;
-
-        const { withProfileContext } = await import("./op-dispatch");
-        await withProfileContext(reductionLabel, rg.nodes[0].module, () =>
-          executeReductionSegment(rg, backend),
-        );
-
-        // Record reduction action in lowered plan builder
-        if (loweredPlanBuilder) {
-          if (rg.preambleNodes.length > 0 && rg.epilogueOps.length > 0) {
-            loweredPlanBuilder.recordReductionFusion(
-              rg.preambleNodes.map((n) => nodeIdToFinalPos.get(n.id) as number),
-              nodeIdToFinalPos.get(rg.reductionNode.id) as number,
-              rg.epilogueNodes.map((n) => nodeIdToFinalPos.get(n.id) as number),
-              nodeIdToFinalPos.get(rg.outputNode.id) as number,
-              rg.preambleOps,
-              rg.preambleInputDtypes,
-              rg.epilogueOps,
-              rg.outputDtype,
-              rg.nodes.length,
-              rg.isMean,
-            );
-          } else if (rg.preambleNodes.length > 0) {
-            loweredPlanBuilder.recordReductionPreamble(
-              nodeIdToFinalPos.get(rg.preambleNodes[0].id) as number,
-              nodeIdToFinalPos.get(rg.reductionNode.id) as number,
-              rg.preambleNodes.map((n) => nodeIdToFinalPos.get(n.id) as number),
-              rg.preambleOps,
-              rg.preambleInputDtypes,
-              rg.nodes.length,
-            );
-          } else {
-            const covered = rg.nodes.map(
-              (n) => nodeIdToFinalPos.get(n.id) as number,
-            );
-            loweredPlanBuilder.recordReductionEpilogue(
-              nodeIdToFinalPos.get(rg.reductionNode.id) as number,
-              covered,
-              nodeIdToFinalPos.get(rg.outputNode.id) as number,
-              rg.epilogueOps,
-              rg.outputDtype,
-              rg.nodes.length,
-            );
-          }
-        }
-
-        // Track storages and release dead buffers
-        if (enableEarlyRelease) {
-          for (const node of rg.nodes) {
-            if (node.result) nodeToStorage.set(node.id, node.result);
-            overallStep++;
-            releaseDeadTensors(
-              lifetimes,
-              overallStep,
-              outputNodeIds,
-              alreadyReleased,
-              nodeToStorage,
-            );
-          }
-        }
-        reclaim.advance(rg.nodes.length);
-      } else if (segment.kind === "fused" && segment.group.nodes.length >= 2) {
-        // Execute fused segment
-        await executeFusedSegment(
-          segment.group,
-          segment.recipe,
-          backend,
-          enableVectorization,
-        );
-        stats.fusedNodes += segment.group.nodes.length;
-        stats.fusionGroups++;
-
-        // Record fused action in lowered plan builder
-        if (loweredPlanBuilder) {
-          loweredPlanBuilder.recordFused(
-            segment.group.nodes.map(
-              (n) => nodeIdToFinalPos.get(n.id) as number,
-            ),
-            nodeIdToFinalPos.get(segment.group.outputNode.id) as number,
-            (segment.group.additionalOutputNodes ?? []).map(
-              (n) => nodeIdToFinalPos.get(n.id) as number,
-            ),
-            (segment.group.neededIntermediates ?? []).map(
-              (n) => nodeIdToFinalPos.get(n.id) as number,
-            ),
-            segment.recipe,
-            enableVectorization,
-          );
-        }
-
-        // Track storages and release dead buffers for fused nodes
-        if (enableEarlyRelease) {
-          for (const node of segment.group.nodes) {
-            if (node.result) {
-              nodeToStorage.set(node.id, node.result);
-            }
-            overallStep++;
-            releaseDeadTensors(
-              lifetimes,
-              overallStep,
-              outputNodeIds,
-              alreadyReleased,
-              nodeToStorage,
-            );
-          }
-        }
-        reclaim.advance(segment.group.nodes.length);
-      } else {
-        // Execute sequentially (too-small fusion groups or sequential segments)
-        const seqNodes =
-          segment.kind === "fused" ? segment.group.nodes : segment.nodes;
-        await executeSequentialSegmentWithEarlyRelease(seqNodes, backend, {
-          enableEarlyRelease,
-          lifetimes,
-          outputNodeIds,
-          alreadyReleased,
-          nodeToStorage,
-          startStep: overallStep,
-          prologueSkipIds:
-            prologueClaimedIds.size > 0 ? prologueClaimedIds : undefined,
-          loweredPlanBuilder,
-          nodeIdToFinalPos,
-          compoundMatchMap,
-          matmulDirectives,
-        });
-        stats.sequentialNodes += seqNodes.length;
-        overallStep += seqNodes.length;
-        reclaim.advance(seqNodes.length);
-      }
-
-      // Periodic buffer reclamation
-      reclaim.maybeFlush(true);
-    }
-  } finally {
-    if (useArenaFallback && fused) {
-      fused.clearActiveArena();
-      fused.clearArenaExternalInputBuffers();
-    }
-    if (fused) {
-      fused.endSharedEncoder();
-    }
-  }
-
-  // Save the lowered plan to the fusion analysis template (first execution only).
-  if (loweredPlanBuilder) {
-    const cached = fusionAnalysisCache.get(fingerprint);
-    if (cached && !cached.loweredPlan) {
-      cached.loweredPlan = loweredPlanBuilder.build();
-    }
-  }
-
-  // Get the result from the last node
-  const lastNode = plan.nodes[plan.nodes.length - 1];
-  if (!lastNode.result) {
-    throw new Error("Execution failed: no result for last node");
-  }
-
-  // Clear results for nodes whose buffers were destroyed by early release.
-  if (alreadyReleased.size > 0) {
-    for (const node of plan.nodes) {
-      if (alreadyReleased.has(node.id)) {
-        node.result = undefined;
+  // Count reduction preamble opportunities from sequential segments
+  let reductionFusionEstimate = 0;
+  for (const segment of segments) {
+    if (segment.kind !== "sequential") continue;
+    for (let i = 0; i < segment.nodes.length - 1; i++) {
+      const cur = segment.nodes[i];
+      const next = segment.nodes[i + 1];
+      if (
+        isFusibleOp(cur.op) &&
+        cur.op !== "cast" &&
+        (next.op === "sum" || next.op === "mean")
+      ) {
+        reductionFusionEstimate++;
       }
     }
   }
 
-  return { result: lastNode.result, stats };
+  const planAnalysisRef: PlanAnalysis = {
+    planIndex: 0, // assigned by recordPlanAnalysis
+    totalNodes,
+    segments: { fused: fusedSegCount, sequential: seqSegCount },
+    fusedNodes: fusedNodeCount,
+    fusionGroups: fusionGroupCount,
+    epilogueFusions: matmulEpilogueChains.size,
+    reductionFusions: reductionFusionEstimate,
+    sequentialOps,
+    unfusedByShape,
+  };
+  recordPlanAnalysis(planAnalysisRef);
 }
