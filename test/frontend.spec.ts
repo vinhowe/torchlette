@@ -758,3 +758,46 @@ describe("Module system", () => {
     expect(Object.keys(sd)).toEqual(["weight"]);
   });
 });
+
+describe("frontend api: noGrad", () => {
+  it("skips autograd recording inside noGrad", async () => {
+    const a = torch.tensorFromArray([1, 2, 3], [3], { requiresGrad: true });
+    const b = torch.tensorFromArray([4, 5, 6], [3]);
+
+    const result = torch.noGrad(() => a.add(b));
+
+    expect(result.requiresGrad).toBe(false);
+    expect(await result.cpu()).toEqual([5, 7, 9]);
+  });
+
+  it("restores grad recording after noGrad", async () => {
+    const a = torch.tensorFromArray([1, 2], [2], { requiresGrad: true });
+    const b = torch.tensorFromArray([3, 4], [2]);
+
+    // Inside noGrad — no grad
+    const noGradResult = torch.noGrad(() => a.add(b));
+    expect(noGradResult.requiresGrad).toBe(false);
+
+    // Outside noGrad — grad is recorded
+    const gradResult = a.add(b);
+    expect(gradResult.requiresGrad).toBe(true);
+  });
+
+  it("isGradEnabled reflects noGrad context", () => {
+    expect(torch.isGradEnabled()).toBe(true);
+    torch.noGrad(() => {
+      expect(torch.isGradEnabled()).toBe(false);
+    });
+    expect(torch.isGradEnabled()).toBe(true);
+  });
+
+  it("restores state even if fn throws", () => {
+    expect(torch.isGradEnabled()).toBe(true);
+    expect(() =>
+      torch.noGrad(() => {
+        throw new Error("test");
+      }),
+    ).toThrow("test");
+    expect(torch.isGradEnabled()).toBe(true);
+  });
+});
