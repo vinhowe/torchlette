@@ -76,11 +76,17 @@ import {
   ensureWebGPUMatmulImports,
   wrapResultAsStorage,
 } from "./node-factory";
-import { executeOp, getInputStorage, withProfileContext } from "./op-dispatch";
+import {
+  executeOp,
+  executeOpSync,
+  getInputStorage,
+  withProfileContext,
+} from "./op-dispatch";
 import { pretunePlanMatmuls } from "./plan-builder";
 import { profileOpBegin, profileOpEnd, setProfileModule } from "./profiler";
 import type { ReductionGroup } from "./reduction-detect";
 import {
+  ensureFusionImports,
   executeCompoundSoftmax,
   executeFusedSegment,
   executeReductionSegment,
@@ -899,6 +905,10 @@ export async function executeLoweredPlan(
     fusionMod.setFusionRecordingBuffer(recordingBuffer);
   }
 
+  // Pre-resolve dynamic imports before the action loop so subsequent calls
+  // to executeFusedSegment avoid per-call async import overhead.
+  await ensureFusionImports();
+
   try {
     for (const action of loweredPlan.actions) {
       switch (action.kind) {
@@ -1344,18 +1354,20 @@ export async function executeLoweredPlan(
             ? getDispatchSequenceCounters()
             : undefined;
 
-          const nodeBackend = getBackend(node.device) ?? backend;
           setProfileModule(node.module ?? "unknown");
           const inputs = node.inputs.map((ref) =>
-            getInputStorage(ref, nodeBackend),
+            getInputStorage(ref, backend),
           );
           const backendInputs = inputs.map((s) => s.backendTensor);
 
-          const resultTensor = await executeOp(
-            node,
-            backendInputs,
-            nodeBackend,
-          );
+          // Use synchronous dispatch to avoid microtask overhead (~5-15µs/await).
+          // Only adamStep and transfer are truly async; neither appears in
+          // sequential/view/data-source actions.
+          const resultOrPromise = executeOpSync(node, backendInputs, backend);
+          const resultTensor =
+            resultOrPromise instanceof Promise
+              ? await resultOrPromise
+              : resultOrPromise;
           node.result = wrapResultAsStorage(
             node.device,
             resultTensor,

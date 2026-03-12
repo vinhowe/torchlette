@@ -71,6 +71,26 @@ export async function executeCompoundSoftmax(
   } as unknown as BackendTensor);
 }
 
+// Module-level cached imports to avoid per-call dynamic import overhead.
+// After first call, these are resolved and reused synchronously.
+let _cachedDispatchFusedKernel:
+  | typeof import("../backend/webgpu/fusion-dispatch").dispatchFusedKernel
+  | null = null;
+let _cachedDeferredDestroyBuffer:
+  | NonNullable<typeof _webgpuMatmulImports>["deferredDestroyBuffer"]
+  | null = null;
+
+/** Ensure fusion dispatch imports are resolved. Call once; subsequent calls are no-ops. */
+export async function ensureFusionImports(): Promise<void> {
+  if (_cachedDispatchFusedKernel) return;
+  const fusionDispatch = await import("../backend/webgpu/fusion-dispatch");
+  _cachedDispatchFusedKernel = fusionDispatch.dispatchFusedKernel;
+  await ensureWebGPUMatmulImports();
+  _cachedDeferredDestroyBuffer = (
+    _webgpuMatmulImports as NonNullable<typeof _webgpuMatmulImports>
+  ).deferredDestroyBuffer;
+}
+
 /**
  * Execute a fused segment using a fused kernel.
  * For WebGPU, dispatches a generated kernel. For other backends, falls back to sequential.
@@ -86,13 +106,10 @@ export async function executeFusedSegment(
     await executeSequentialSegment(group.nodes, backend);
     return;
   }
-  // Import fusion dispatch and buffer lifecycle helpers (cached on first call)
-  const fusionDispatch = await import("../backend/webgpu/fusion-dispatch");
-  const { dispatchFusedKernel } = fusionDispatch;
-  await ensureWebGPUMatmulImports();
-  const { deferredDestroyBuffer } = _webgpuMatmulImports as NonNullable<
-    typeof _webgpuMatmulImports
-  >;
+  // Ensure imports are resolved (no-op after first call)
+  await ensureFusionImports();
+  const dispatchFusedKernel = _cachedDispatchFusedKernel!;
+  const deferredDestroyBuffer = _cachedDeferredDestroyBuffer!;
 
   /** Wrap a fusion output buffer into a StorageHandle with deferred destroy. */
   const wrapFusionOutput = (
