@@ -91,15 +91,15 @@ async function generateText(
     // Truncate to block size if needed
     const contextTokens = generated.slice(-DISTILGPT2_CONFIG.blockSize);
 
-    // Use tidy to automatically clean up intermediate tensors from forward pass
-    const logits = api.tidy(() => {
-      const inputTensor = api.tensorFromArray(contextTokens, [
-        1,
-        contextTokens.length,
-      ]);
-      // Forward pass creates many intermediate tensors that will be auto-disposed
-      return model.forward(inputTensor);
-    });
+    const logits = api.noGrad(() =>
+      api.tidy(() => {
+        const inputTensor = api.tensorFromArray(contextTokens, [
+          1,
+          contextTokens.length,
+        ]);
+        return model.forward(inputTensor);
+      }),
+    );
 
     const logitsData = await logits.cpu();
 

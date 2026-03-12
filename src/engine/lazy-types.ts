@@ -66,16 +66,12 @@ export type LazyOpCode =
   | "adamStep"
   | "unscaleGrad"
   | "fusedAttentionForward"
-  | "extractAttentionLogsumexp"
   | "fusedAttentionBackward"
-  | "extractAttentionDK"
-  | "extractAttentionDV"
   | "fusedCrossEntropyForward"
   | "fusedCrossEntropyBackward"
   | "fusedLayerNormForward"
   | "fusedLayerNormBackwardGradX"
   | "fusedLayerNormBackwardGradWeightBias"
-  | "extractLnBwdGradBias"
   | "fusedRMSNormForward"
   | "fusedRMSNormBackwardGradX"
   | "fusedRMSNormBackwardGradWeight";
@@ -88,20 +84,6 @@ export interface StorageHandle {
   baseStorageId?: number;
 }
 
-/** Side outputs for multi-output ops (attention, layernorm, adam). */
-interface NodeSideOutputs {
-  /** fusedAttentionForward → logsumexp StorageHandle */
-  attnLogsumexp?: StorageHandle;
-  /** fusedAttentionBackward → dK StorageHandle */
-  attnBwdDK?: StorageHandle;
-  /** fusedAttentionBackward → dV StorageHandle */
-  attnBwdDV?: StorageHandle;
-  /** fusedLayerNormBackwardGradWeightBias → gradBias BackendTensor */
-  lnBwdGradBias?: BackendTensor;
-  /** adamStep → updated m and v StorageHandles */
-  adamMV?: { m: StorageHandle; v: StorageHandle };
-}
-
 export interface LazyIRNode {
   id: number;
   op: LazyOpCode;
@@ -111,7 +93,10 @@ export interface LazyIRNode {
   device: DeviceKind;
   tokenIn?: Token;
   tokenOut?: Token;
+  /** Primary output (index 0). Set after execution. */
   result?: StorageHandle;
+  /** All outputs for multi-output ops. results[0] === result. */
+  results?: StorageHandle[];
   payload?: unknown;
   /** Module label for profiling (set via setProfileModule during graph construction) */
   module?: string;
@@ -122,16 +107,20 @@ export interface LazyIRNode {
    * This enables memory savings for large models that don't fit in GPU memory.
    */
   isCheckpointBoundary?: boolean;
-  /** Side outputs for multi-output ops (attention, layernorm, adam). */
-  _sideOutputs?: NodeSideOutputs;
 }
 
 export type LazyRef =
-  | { kind: "pending"; node: LazyIRNode }
+  | { kind: "pending"; node: LazyIRNode; outputIndex?: number }
   | { kind: "materialized"; storage: StorageHandle }
   | { kind: "scalar"; value: number; dtype: DType };
 
-export function createPendingRef(node: LazyIRNode): LazyRef {
+export function createPendingRef(
+  node: LazyIRNode,
+  outputIndex?: number,
+): LazyRef {
+  if (outputIndex !== undefined && outputIndex !== 0) {
+    return { kind: "pending", node, outputIndex };
+  }
   return { kind: "pending", node };
 }
 
