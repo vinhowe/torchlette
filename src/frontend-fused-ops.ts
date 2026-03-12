@@ -323,30 +323,42 @@ export function scaledDotProductAttentionImpl(
       v._unwrap(),
       config,
     );
-    const logsumexp = torch.runtime.extractAttentionLogsumexp(
-      fwdResult,
-      config,
-    );
 
-    // Save Q, K, V, logsumexp, and output O for backward.
-    // IMPORTANT: Create reshape views with independent RuntimeTensors for saved
-    // tensors. Without this, wrap(fwdResult) shares the same RuntimeTensor as the
-    // wrapWithGrad output. When checkpoint tidy disposes these wrappers, it calls
-    // dispose() on the shared RuntimeTensor BEFORE materialization, setting _disposed=true.
-    // Later disposal of the real output hits the idempotency guard and skips cleanup,
-    // leaking the GPU buffer. Similarly, disposing the logsumexp wrapper unregisters
-    // its pending node, preventing extractAttentionLogsumexp from executing and
-    // orphaning the side-output buffer. Reshape-to-same-shape creates a new
-    // RuntimeTensor that can be safely disposed without poisoning the original.
-    const logsumexpRef = torch.runtime.reshape(logsumexp, [batch, heads, seq]);
-    const logsumexpTensor = torch._wrap(logsumexpRef);
-    const outputRef = torch.runtime.reshape(fwdResult, [batch, heads, seq, hd]);
-    const outputTensor = torch._wrap(outputRef);
+    const needsGrad =
+      torch.isGradEnabled() &&
+      (q.requiresGrad || k.requiresGrad || v.requiresGrad);
 
-    const tensorsToSave =
-      q.requiresGrad || k.requiresGrad || v.requiresGrad
-        ? [q, k, v, logsumexpTensor, outputTensor]
-        : [];
+    // Only extract logsumexp and save tensors when backward is needed.
+    // In noGrad/eval mode, extracting logsumexp creates dangling side-output
+    // references that become stale across generation steps.
+    let tensorsToSave: Tensor[] = [];
+    if (needsGrad) {
+      const logsumexp = torch.runtime.extractAttentionLogsumexp(
+        fwdResult,
+        config,
+      );
+
+      // Create reshape views with independent RuntimeTensors for saved tensors.
+      // Without this, wrap(fwdResult) shares the same RuntimeTensor as the
+      // wrapWithGrad output. When checkpoint tidy disposes these wrappers, it
+      // calls dispose() on the shared RuntimeTensor BEFORE materialization,
+      // setting _disposed=true. Reshape-to-same-shape creates a new
+      // RuntimeTensor that can be safely disposed without poisoning the original.
+      const logsumexpRef = torch.runtime.reshape(logsumexp, [
+        batch,
+        heads,
+        seq,
+      ]);
+      const logsumexpTensor = torch._wrap(logsumexpRef);
+      const outputRef = torch.runtime.reshape(fwdResult, [
+        batch,
+        heads,
+        seq,
+        hd,
+      ]);
+      const outputTensor = torch._wrap(outputRef);
+      tensorsToSave = [q, k, v, logsumexpTensor, outputTensor];
+    }
 
     return torch._wrapWithGrad(
       fwdResult,

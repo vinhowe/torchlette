@@ -80,7 +80,9 @@ export function getAllPendingTensors(): Tensor[] {
   const result: Tensor[] = [];
   for (const tensors of pendingTensorsByNodeId.values()) {
     for (const tensor of tensors) {
-      result.push(tensor);
+      if (!tensor.disposed) {
+        result.push(tensor);
+      }
     }
   }
   return result;

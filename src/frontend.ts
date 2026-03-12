@@ -101,6 +101,8 @@ export class Torchlette {
   readonly _savedTensorHooksStack: SavedTensorHooksContext[] = [];
   /** Label to capture on subsequent autograd nodes (for backward attribution) */
   private _currentNodeLabel: string | null = null;
+  /** Depth counter for noGrad context. When > 0, autograd recording is disabled. */
+  private _noGradDepth = 0;
   /** Hooks fired before each backward op */
   readonly _backwardDispatchHooks: Array<
     (info: { output: Tensor; inputs: Tensor[]; label?: string }) => void
@@ -313,6 +315,25 @@ export class Torchlette {
   /** Set an opaque label captured on subsequent autograd nodes. */
   setNodeLabel(label: string | null): void {
     this._currentNodeLabel = label;
+  }
+
+  /**
+   * Execute `fn` with autograd recording disabled.
+   * Inside noGrad, ops never create grad nodes or save tensors for backward,
+   * even when inputs have requiresGrad=true. Matches PyTorch's torch.no_grad().
+   */
+  noGrad<T>(fn: () => T): T {
+    this._noGradDepth++;
+    try {
+      return fn();
+    } finally {
+      this._noGradDepth--;
+    }
+  }
+
+  /** Returns true if autograd recording is currently enabled. */
+  isGradEnabled(): boolean {
+    return this._noGradDepth === 0;
   }
 
   /** Register a hook that fires before each backward op. Returns unregister function. */
@@ -1377,7 +1398,8 @@ export class Torchlette {
     backward: GradFn,
     tensorsToSave: Tensor[] = [],
   ): Tensor {
-    const requiresGrad = inputs.some((tensor) => tensor.requiresGrad);
+    const requiresGrad =
+      this._noGradDepth === 0 && inputs.some((tensor) => tensor.requiresGrad);
     const output = this._wrap(inner, requiresGrad);
 
     if (requiresGrad) {
@@ -1561,13 +1583,49 @@ export class Torchlette {
 
   dispose(tensor: Tensor): void {
     this.assertSameEngine(tensor);
-    const gradNode = tensor._gradNode();
-    if (gradNode) {
-      gradNode.savedSlots.length = 0;
-      gradNode.inputs.length = 0;
-      tensor._setGradNode(null);
-    }
+    this._disposeAutogradChain(tensor);
     this.engine.dispose(tensor._engineTensor());
+  }
+
+  /**
+   * Walk the autograd graph rooted at `tensor` and deterministically clean up
+   * all pending saved tensors. Without this, saved tensors deep in the chain
+   * (e.g., attention logsumexp reshapes) survive as zombie pending RuntimeTensors
+   * until GC, causing stale-graph crashes in forceAllPending().
+   */
+  private _disposeAutogradChain(tensor: Tensor): void {
+    const visited = new Set<Tensor>();
+    const stack: Tensor[] = [tensor];
+    while (stack.length > 0) {
+      const t = stack.pop()!;
+      if (visited.has(t)) continue;
+      visited.add(t);
+      const gradNode = t._gradNode();
+      if (!gradNode) continue;
+      // Dispose pending (unmaterialized) saved tensors.
+      // Materialized tensors (e.g., model params) are shared and must not be disposed.
+      for (const slot of gradNode.savedSlots) {
+        const saved = slot.packed;
+        if (
+          saved &&
+          typeof (saved as Tensor).disposed === "boolean" &&
+          !(saved as Tensor).disposed &&
+          typeof (saved as Tensor)._unwrap === "function"
+        ) {
+          const rt = (saved as Tensor)._unwrap();
+          if (!rt.isMaterialized()) {
+            this.engine.dispose((saved as Tensor)._engineTensor());
+          }
+        }
+      }
+      gradNode.savedSlots.length = 0;
+      // Recurse into autograd inputs
+      for (const input of gradNode.inputs) {
+        stack.push(input);
+      }
+      gradNode.inputs.length = 0;
+      t._setGradNode(null);
+    }
   }
 
   async markStep(): Promise<void> {
