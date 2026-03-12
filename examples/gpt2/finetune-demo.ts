@@ -24,7 +24,7 @@ import { type Tensor, Torchlette } from "../../src/frontend";
 import { Adam, GradScaler } from "../../src/optim";
 import { GPT2Tokenizer } from "./data";
 import { loadPretrainedGPT2 } from "./loader";
-import { DISTILGPT2_CONFIG, type GPT2 } from "./model";
+import { DISTILGPT2_CONFIG, type GPT2, type KVCache } from "./model";
 
 // ============================================================================
 // Shakespeare Training Data
@@ -86,70 +86,78 @@ async function generateText(
 ): Promise<string> {
   const tokens = tokenizer.encode(prompt);
   const generated = [...tokens];
+  const vocabSize = tokenizer.vocabSize;
+  const stride = model.paddedVocabSize;
 
-  for (let i = 0; i < maxTokens; i++) {
-    // Truncate to block size if needed
-    const contextTokens = generated.slice(-DISTILGPT2_CONFIG.blockSize);
-
-    const logits = api.noGrad(() =>
-      api.tidy(() => {
-        const inputTensor = api.tensorFromArray(contextTokens, [
-          1,
-          contextTokens.length,
-        ]);
-        return model.forward(inputTensor);
-      }),
-    );
-
+  // Prefill: process the full prompt, get initial KV cache
+  let kvCache: KVCache[] | undefined;
+  {
+    const { logits, presentKVs } = api.noGrad(() => {
+      const inputTensor = api.tensorFromArray(tokens, [1, tokens.length]);
+      return model.forwardCached(inputTensor);
+    });
+    kvCache = presentKVs;
     const logitsData = await logits.cpu();
-
-    // Get last position logits (stride is paddedVocabSize, take first vocabSize)
-    const seqLen = contextTokens.length;
-    const vocabSize = tokenizer.vocabSize;
-    const stride = model.paddedVocabSize;
-    const startIdx = (seqLen - 1) * stride;
-    const lastLogits = Array.from(logitsData).slice(
-      startIdx,
-      startIdx + vocabSize,
-    );
-
-    // Apply temperature
-    const scaledLogits = lastLogits.map((x) => x / temperature);
-
-    // Softmax
-    const maxLogit = Math.max(...scaledLogits);
-    const expLogits = scaledLogits.map((x) => Math.exp(x - maxLogit));
-    const sumExp = expLogits.reduce((a, b) => a + b, 0);
-    const probs = expLogits.map((x) => x / sumExp);
-
-    // Sample from distribution
-    const r = Math.random();
-    let cumsum = 0;
-    let nextToken = 0;
-    for (let j = 0; j < probs.length; j++) {
-      cumsum += probs[j];
-      if (r < cumsum) {
-        nextToken = j;
-        break;
-      }
-    }
-
-    generated.push(nextToken);
-
-    // Cleanup the logits tensor (tidy already cleaned up intermediates)
     logits.dispose();
 
-    // Call markStep to trigger GPU buffer cleanup
-    // This is necessary because lazy execution defers buffer destruction until markStep
+    // Sample first token from last position of prefill
+    const startIdx = (tokens.length - 1) * stride;
+    const nextToken = sampleToken(logitsData, startIdx, vocabSize, temperature);
+    generated.push(nextToken);
+    if (nextToken === tokenizer.eosToken) return tokenizer.decode(generated);
+    await api.markStep();
+  }
+
+  // Decode: one token at a time with KV cache
+  for (let i = 1; i < maxTokens; i++) {
+    const lastToken = generated[generated.length - 1];
+    const posOffset = generated.length - 1; // position of the new token
+
+    const { logits, presentKVs } = api.noGrad(() => {
+      const inputTensor = api.tensorFromArray([lastToken], [1, 1]);
+      return model.forwardCached(inputTensor, kvCache, posOffset);
+    });
+    kvCache = presentKVs;
+
+    const logitsData = await logits.cpu();
+    logits.dispose();
+
+    // logits shape is [1, 1, paddedVocabSize], so last-position offset is 0
+    const nextToken = sampleToken(logitsData, 0, vocabSize, temperature);
+    generated.push(nextToken);
+
     await api.markStep();
 
-    // Stop on EOS
-    if (nextToken === tokenizer.eosToken) {
-      break;
-    }
+    if (nextToken === tokenizer.eosToken) break;
   }
 
   return tokenizer.decode(generated);
+}
+
+/** Sample a token from logits at a given offset using temperature scaling. */
+function sampleToken(
+  logitsData: Float32Array | Float64Array | number[],
+  startIdx: number,
+  vocabSize: number,
+  temperature: number,
+): number {
+  const lastLogits = Array.from(logitsData).slice(
+    startIdx,
+    startIdx + vocabSize,
+  );
+  const scaledLogits = lastLogits.map((x) => x / temperature);
+  const maxLogit = Math.max(...scaledLogits);
+  const expLogits = scaledLogits.map((x) => Math.exp(x - maxLogit));
+  const sumExp = expLogits.reduce((a, b) => a + b, 0);
+  const probs = expLogits.map((x) => x / sumExp);
+
+  const r = Math.random();
+  let cumsum = 0;
+  for (let j = 0; j < probs.length; j++) {
+    cumsum += probs[j];
+    if (r < cumsum) return j;
+  }
+  return 0;
 }
 
 // ============================================================================

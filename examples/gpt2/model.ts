@@ -67,6 +67,13 @@ export const DISTILGPT2_CONFIG: GPT2Config = {
 };
 
 // ============================================================================
+// KV Cache Types
+// ============================================================================
+
+/** Per-layer KV cache: cached key and value tensors from previous positions. */
+export type KVCache = { k: Tensor; v: Tensor };
+
+// ============================================================================
 // Causal Self-Attention
 // ============================================================================
 
@@ -74,7 +81,8 @@ export const DISTILGPT2_CONFIG: GPT2Config = {
  * Multi-head causal (masked) self-attention.
  *
  * Uses combined QKV projection for efficiency, applies causal mask to prevent
- * attending to future positions.
+ * attending to future positions. Supports optional KV caching for efficient
+ * autoregressive generation.
  */
 export class CausalSelfAttention extends Module {
   private readonly numHeads: number;
@@ -130,9 +138,10 @@ export class CausalSelfAttention extends Module {
    * Forward pass for causal self-attention.
    *
    * @param x - Input tensor of shape [batch, seqLen, embedDim]
-   * @returns Output tensor of shape [batch, seqLen, embedDim]
+   * @param pastKV - Optional cached K/V from previous positions
+   * @returns Output tensor and present KV cache (if pastKV was provided)
    */
-  forward(x: Tensor): Tensor {
+  forward(x: Tensor, pastKV?: KVCache): { out: Tensor; presentKV?: KVCache } {
     const [batch, seqLen, _embedDim] = x.shape;
 
     // Combined QKV projection: [batch, seqLen, 3 * embedDim]
@@ -140,29 +149,45 @@ export class CausalSelfAttention extends Module {
 
     // Split QKV into [batch, seqLen, embedDim] chunks, then reshape to multi-head
     const [qFlat, kFlat, vFlat] = qkv.chunk(3, -1);
-    const toHeads = (t: Tensor) =>
+    const toHeads = (t: Tensor, tSeqLen: number) =>
       t
-        .reshape([batch, seqLen, this.numHeads, this.headDim])
+        .reshape([batch, tSeqLen, this.numHeads, this.headDim])
         .permute([0, 2, 1, 3])
         .contiguous();
-    const q = toHeads(qFlat);
-    const k = toHeads(kFlat);
-    const v = toHeads(vFlat);
+    const q = toHeads(qFlat, seqLen);
+    let k = toHeads(kFlat, seqLen);
+    let v = toHeads(vFlat, seqLen);
+
+    // KV cache: concatenate past K/V with current K/V
+    let presentKV: KVCache | undefined;
+    if (pastKV) {
+      k = this.api.cat([pastKV.k, k], 2); // concat along seqLen dim
+      v = this.api.cat([pastKV.v, v], 2);
+      presentKV = { k, v };
+    }
+
+    const kvSeqLen = k.shape[2]; // total sequence length (past + current)
 
     // Scaled dot-product attention
-    // Use fused FlashAttention when dropout is disabled (eval mode or rate=0)
     let attnOutput: Tensor;
-    if (!this.attnDropout.training || this.dropoutRate === 0) {
-      // Fused path: single kernel for Q@K^T + scale + causal_mask + softmax + attn@V
+    // Use fused FlashAttention only when Q/K/V have the same seqLen
+    // (no KV cache) and dropout is disabled
+    if (!pastKV && (!this.attnDropout.training || this.dropoutRate === 0)) {
       const scale = 1.0 / Math.sqrt(this.headDim);
       attnOutput = this.api.scaledDotProductAttention(q, k, v, scale, true);
     } else {
-      // Decomposed path (needed when dropout is active)
+      // Decomposed path: needed when KV cache makes Q/K seqLen differ,
+      // or when dropout is active during training
       const kT = k.transpose({ dim0: 2, dim1: 3 });
-      const scores = q.matmul(kT);
+      const scores = q.matmul(kT); // [batch, heads, seqLen, kvSeqLen]
       const scaledScores = scores.mul(1.0 / Math.sqrt(this.headDim));
 
-      const mask = this.causalBias.narrow(2, 0, seqLen).narrow(3, 0, seqLen);
+      // Causal mask: slice to [seqLen, kvSeqLen] window
+      // For cached inference: Q positions are [kvSeqLen-seqLen, kvSeqLen),
+      // K positions are [0, kvSeqLen). We need the mask rows for Q's positions.
+      const mask = this.causalBias
+        .narrow(2, kvSeqLen - seqLen, seqLen)
+        .narrow(3, 0, kvSeqLen);
       const maskedScores = this.api.add(scaledScores, mask);
       const attnWeights = maskedScores.softmax(-1);
       const attnDropped = this.attnDropout.forward(attnWeights);
@@ -170,17 +195,16 @@ export class CausalSelfAttention extends Module {
     }
 
     // Concatenate heads: [batch, numHeads, seqLen, headDim] -> [batch, seqLen, embedDim]
-    // Note: permute creates non-contiguous tensor, need contiguous before reshape
     const attnConcat = attnOutput
       .permute([0, 2, 1, 3])
       .contiguous()
       .reshape([batch, seqLen, this.embedDim]);
 
-    // Output projection
+    // Output projection + residual dropout
     const output = this.cProj.forward(attnConcat);
+    const out = this.residDropout.forward(output);
 
-    // Residual dropout
-    return this.residDropout.forward(output);
+    return { out, presentKV };
   }
 }
 
@@ -256,16 +280,19 @@ export class TransformerBlock extends Module {
    * x = x + attn(ln1(x))
    * x = x + mlp(ln2(x))
    */
-  forward(x: Tensor): Tensor {
+  forward(x: Tensor, pastKV?: KVCache): { out: Tensor; presentKV?: KVCache } {
     // Attention block with residual
-    const attnOut = this.attn.forward(this.ln1.forward(x));
+    const { out: attnOut, presentKV } = this.attn.forward(
+      this.ln1.forward(x),
+      pastKV,
+    );
     let h = this.api.add(x, attnOut);
 
     // MLP block with residual
     const mlpOut = this.mlp.forward(this.ln2.forward(h));
     h = this.api.add(h, mlpOut);
 
-    return h;
+    return { out: h, presentKV };
   }
 }
 
@@ -342,6 +369,50 @@ export class GPT2 extends Module {
   }
 
   /**
+   * Forward pass with KV cache for efficient autoregressive generation.
+   *
+   * @param idx - Token indices of shape [batch, seqLen]
+   * @param pastKVs - Optional per-layer KV cache from previous positions
+   * @param posOffset - Position offset for position embeddings (= past sequence length)
+   * @returns Logits and updated KV cache
+   */
+  forwardCached(
+    idx: Tensor,
+    pastKVs?: KVCache[],
+    posOffset = 0,
+  ): { logits: Tensor; presentKVs: KVCache[] } {
+    const [_batch, seqLen] = idx.shape;
+
+    if (posOffset + seqLen > this.config.blockSize) {
+      throw new Error(
+        `Sequence length ${posOffset + seqLen} exceeds block size ${this.config.blockSize}`,
+      );
+    }
+
+    // Position indices offset by past sequence length
+    const pos = this.posIndices.narrow(1, posOffset, seqLen);
+
+    const tokEmb = this.wte.forward(idx);
+    const posEmb = this.wpe.forward(pos);
+    let x = this.api.add(tokEmb, posEmb);
+    x = this.drop.forward(x);
+
+    const presentKVs: KVCache[] = [];
+    for (let i = 0; i < this.h.length; i++) {
+      const block = this.h.get(i) as TransformerBlock;
+      const layerPast = pastKVs?.[i];
+      const { out, presentKV } = block.forward(x, layerPast);
+      x = out;
+      if (presentKV) presentKVs.push(presentKV);
+    }
+
+    x = this.lnF.forward(x);
+    const logits = this.api.linear(x, this.wte.weight, null);
+
+    return { logits, presentKVs };
+  }
+
+  /**
    * Forward pass with optional loss computation.
    *
    * @param idx - Token indices of shape [batch, seqLen]
@@ -387,7 +458,7 @@ export class GPT2 extends Module {
       for (let i = 0; i < this.h.length; i++) {
         const block = this.h.get(i) as TransformerBlock;
         // Attention block: NOT checkpointed
-        const attnOut = block.attn.forward(block.ln1.forward(x));
+        const { out: attnOut } = block.attn.forward(block.ln1.forward(x));
         const h = this.api.add(x, attnOut);
         // MLP block: checkpointed
         x = checkpoint(
@@ -403,12 +474,14 @@ export class GPT2 extends Module {
       // Full-block checkpointing: entire transformer block is checkpointed.
       // All activations (including attention O and L) are recomputed during backward.
       for (const block of this.h) {
-        x = checkpoint(this.api, (input: Tensor) => block.forward(input), [x]);
+        x = checkpoint(this.api, (input: Tensor) => block.forward(input).out, [
+          x,
+        ]);
       }
     } else {
       // Standard forward pass - store all activations
       for (const block of this.h) {
-        x = block.forward(x);
+        x = block.forward(x).out;
       }
     }
 
