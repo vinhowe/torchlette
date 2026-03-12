@@ -531,3 +531,28 @@ export async function executeOp(
     setProfileModule("unknown");
   }
 }
+
+/**
+ * Synchronous version of executeOp for the lowered plan fast path.
+ * Avoids async/Promise overhead (~5-15µs per microtask boundary) for ops
+ * that are known to be synchronous (everything except adamStep and transfer).
+ * Falls back to executeOp for async ops.
+ */
+export function executeOpSync(
+  node: LazyIRNode,
+  backendInputs: BackendTensor[],
+  backend: Backend,
+): BackendTensor | Promise<BackendTensor> {
+  setCurrentOpLabel(node.op);
+  setProfileModule(node.module ?? "unknown");
+  const _profT0 = profileOpBegin(node.op);
+  try {
+    const handler = OP_TABLE.get(node.op);
+    if (handler) return handler(node, backendInputs, backend);
+    return executeFusedOp(node, backendInputs, backend);
+  } finally {
+    profileOpEnd(node.op, _profT0);
+    setCurrentOpLabel(null);
+    setProfileModule("unknown");
+  }
+}
