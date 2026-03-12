@@ -279,9 +279,9 @@ class StorageTracker {
         disposed: t.disposed ?? t._disposed,
       };
     }
-    // It's a sideOutputs object or other ref
-    if ("m" in obj && "v" in obj) {
-      return { type: "adamSideOutputs" };
+    // Multi-output results array or other ref
+    if (Array.isArray(obj)) {
+      return { type: "resultsArray" };
     }
     return { type: typeof obj };
   }

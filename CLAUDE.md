@@ -14,7 +14,7 @@ WebGPU is auto-detected at runtime. Use `TORCHLETTE_CPU_ONLY=1` to force CPU-onl
 
 For WebGPU backend changes, also run the relevant integration test (e.g. `npx tsx examples/gpt2/finetune-demo.ts` for training-related fixes).
 
-**Zero test failures policy.** Currently 841 tests pass across 60 test files. Never accept test failures. Fix before moving on.
+**Zero test failures policy.** Currently 865 tests pass across 64 test files. Never accept test failures. Fix before moving on.
 
 **Important:** Any standalone script or tool that uses WebGPU (Dawn) must call `process.exit(0)` at the end of `main()`. Dawn holds background threads that prevent Node from exiting naturally.
 
@@ -43,11 +43,11 @@ BENCH_WARMUP=3 BENCH_ITERS=7 npx tsx bench/matmul-comparison.ts
   - `matmul/` - Tiled matmul with shape-class tuning and K-split
   - `tile-*.ts` - Tile-IR compiler (IR, lowering, compiler, ops, dispatch)
 - `src/engine/` - Tensor engine core (lazy execution, graph compiler, fusion, plan building)
-- `src/frontend/` - User-facing API (table-driven ops, autograd, autocast)
+- `src/frontend/` - User-facing API (table-driven ops, autograd, autocast, noGrad)
 - `src/runtime/` - RuntimeEngine (lazy IR node creation, dtype rules)
-- `src/nn/` - Module system (auto parameters, linear, embedding, layernorm)
-- `src/optim/` - Optimizers (Adam/AdamW with fused GPU kernel, GradScaler)
-- `test/` - 60 test files, 841 tests
+- `src/nn/` - Module system (auto parameters, linear, embedding, layernorm, init, grad clipping)
+- `src/optim/` - Optimizers (Adam/AdamW with fused GPU kernel, SGD, GradScaler, LR schedulers, parameter groups)
+- `test/` - 64 test files, 860 tests
 - `examples/gpt2/` - GPT-2 model, loader, tokenizer, finetune demo
 - `tools/profile-training.ts` - GPU training profiler (supports distilgpt2, gpt2, gpt2-medium)
 
@@ -77,31 +77,35 @@ Known divergences: `number` not `bigint` for versions, 2 LocRoles not 6, no tomb
 - Periodic reclamation between plan segments (flush + pool flush as separate calls)
 - The `sharedEncoderWriteSet` WAW check must be kept
 
-## Performance Baselines
+## Performance Baselines (2026-03-11)
 
 ### Baseline A: DistilGPT-2, 512 tokens (6 layers, 768 dim, 81M params)
-Steady-state ~51ms/step wall clock. GPU: ~66ms total (forward 17ms, backward 47ms, cleanup 5ms). Top kernels: `matmul` 30ms (45%), epilogue matmul 15ms (22%), `fusedAttentionBackward` 5.4ms (8%), `adamStep` 5ms (7%), `fusedAttentionForward` 2.5ms (4%). Memory: 5529MB steady, zero leak. Pool reuse 57%. Bind group cache 99.7%.
+Steady-state ~48ms/step wall clock. Memory: 5397MB steady, zero leak. Pool reuse 58%. Top GPU: matmul 4.4ms, epilogue matmul 7.8ms, fusedAttentionBwd 5.5ms, adamStep 3.7ms (14 dispatches, packed).
 
 ### Baseline B: GPT-2 Medium, 512 tokens (24 layers, 1024 dim, 355M params)
-Steady-state ~265-330ms/step wall clock. GPU: ~315ms total (forward 71ms, backward 223ms, cleanup 21ms). Top kernels: `matmul` 131ms (42%), `matmul++cast+bias+binary` 45ms (14%), `matmul++cast+bias+unary+cast` 33ms (10%), `fusedAttentionBackward` 22.5ms (7%), `adamStep` 21.6ms (7%), `matmul++cast+bias` 18ms (6%), `fusedLNBackwardGradWeightBias` 9.8ms (3%), `fusedAttentionForward` 9.7ms (3%). Memory: 15.3GB steady, zero leak. Bind group cache 99.7%. Overall matmul FP32 efficiency: ~30%.
+Steady-state ~162ms/step wall clock. Memory: 14.7GB steady, zero leak. Pool reuse 58%. 741/4449 nodes fused (16.7%). Top GPU: bare matmul 125ms (bwd), epilogue matmul ~49ms (fwd) + ~47ms (bwd), fusedAttentionBwd 22.5ms, adamStep 14.3ms (14 dispatches, packed), sum 5.1ms, add 3.5ms, cast 6.4ms, LN gradWB 2.6ms. GPU is 81% matmul.
 
 ## Open Performance Targets
 
-### GPT-2 Medium targets (ranked by estimated GPU savings)
+### Remaining GPU targets (GPT-2 Medium, ranked)
 
-1. **Re-implement packed Adam** — 292 individual adamStep dispatches = 21.6ms GPU. Packed Adam (group same-element-count params, one dispatch per size class) was implemented, reduced to ~8 dispatches (5.4→1.9ms), but code was deleted as "superseded by adam-batch." Adam-batch only pre-flushes, doesn't pack. Need to re-implement. **~14ms savings.**
+1. **Per-shape matmul autotuning** — Infrastructure exists (`TORCHLETTE_AUTOTUNE=1`). Pre-seed cache for Medium shapes. ~5-10ms potential from sub-optimal tile configs on 1024-embed shapes.
 
-2. **Matmul tile tuning for 1024-embed** — Benchmark shows 64×64×16 t4×4 outperforms current 64×128×16 t8×4 for dX shapes (M=512, K large) by 29-31%. Applied M≤512 && K≥2M heuristic in square_large bare path, plus fixed square_medium epilogue (32×32→64×64). Measured ~7ms improvement. Full per-shape autotuning (infrastructure exists, `TORCHLETTE_AUTOTUNE=1`) could recover more of the benchmarked 23ms gap.
+2. **Fuse bias-gradient sums** — 96 sum dispatches (5.1ms) from dBias = sum(dY, dim=0). Each followed by reshape. Extend reduction epilogue detector to handle reshape as valid epilogue. **~2-3ms savings.**
 
-3. **LN backward gradW/B kernel** — 9.8ms (3%), 98 dispatches at 100µs avg. Cross-row reduction over [512,1024] scales with embedDim. Could optimize with wider workgroups or multi-pass reduction. **~3-5ms savings.**
+3. **Backward elementwise fusion** — 16.7% fusion rate. 97 standalone adds, 26 muls in backward. Graph reorder priority tuning may recover more fusion opportunities.
 
-4. **Fuse bias-gradient sums** — 96 sum dispatches (5.1ms) from dBias = sum(dY, dim=0). Each followed by reshape. Extend `detectReductionEpilogue()` to handle reshape as valid epilogue. **~2-3ms savings.**
+### Framework completeness targets (high user impact)
 
-### General targets (low priority)
+4. **LR Schedulers** — StepLR, CosineAnnealingLR, etc. ~300 lines, pure math, zero risk.
+5. **Weight initialization** — kaiming_normal_, xavier_uniform_. ~200 lines.
+6. **Gradient clipping** — clip_grad_norm_, clip_grad_value_. ~50 lines.
+7. **Parameter groups** — per-layer LR in Adam/SGD. ~150 lines.
 
-5. **GC pressure** — ~2.7ms worst-case for 1,200 Tensor metadata objects + full GC. Not a bottleneck at current scale (<5% of step budget). Would need object pooling if model size grows significantly.
-6. **Pipeline warmup** — Step 0 is ~700ms (not 1.6s). Warmup infra exists (`pipeline-warmup.ts`), pre-compiles 13/57 pipelines on second run in 86ms. One-time cost, diminishing returns.
-7. **Single-plan training step** — Merge forward/backward/optimizer into one plan. Requires §8 compiled-region infrastructure (removed as unused). **~2-3ms savings.** Punted — complexity outweighs benefit.
+### Architecture targets (long-term)
+
+8. **Serializable compiled plans** — Pre-compile full dispatch sequence to disk. Eliminates ~700ms cold start. Pipeline warmup already serializes individual pipelines; extend to full dispatch sequence.
+9. **Single-plan training step** — Merge forward/backward/optimizer into one plan. Punted — complexity outweighs benefit at current scale.
 
 ## What didn't work (don't re-attempt)
 

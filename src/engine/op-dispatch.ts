@@ -42,30 +42,6 @@ export async function withProfileContext<T>(
   }
 }
 
-/** Extract a side output from a parent node and clear it.
- *  raw=false (default): value is a StorageHandle — unregister it and return the BackendTensor.
- *  raw=true: value is already a BackendTensor — return it directly. */
-function extractSideOutput(
-  node: LazyIRNode,
-  key: string,
-  raw = false,
-): BackendTensor {
-  const ref = node.inputs[0];
-  if (ref.kind !== "pending")
-    throw new Error(`${node.op}: expected pending ref for parent`);
-  const parent = ref.node;
-  const value = (parent._sideOutputs as Record<string, unknown> | undefined)?.[
-    key
-  ];
-  if (!value) throw new Error(`${node.op}: parent has no ${key} side output`);
-  if (parent._sideOutputs)
-    (parent._sideOutputs as Record<string, unknown>)[key] = undefined;
-  if (raw) return value as BackendTensor;
-  const sh = value as StorageHandle;
-  storageTracker.unregister(sh.id);
-  return sh.backendTensor;
-}
-
 export function getInputStorage(
   ref: LazyRef,
   backend?: Backend,
@@ -85,11 +61,16 @@ export function getInputStorage(
     setCurrentOpLabel(prevLabel);
     return createStorageHandle("cpu", bt);
   }
-  if (ref.node.result) {
+  // Multi-output: check outputIndex for secondary results
+  const idx = ref.outputIndex ?? 0;
+  if (idx === 0 && ref.node.result) {
     return ref.node.result;
   }
+  if (ref.node.results?.[idx]) {
+    return ref.node.results[idx];
+  }
   throw new Error(
-    `Input not ready: node id=${ref.node.id} op=${ref.node.op} shape=[${ref.node.shape}] caller=${new Error().stack?.split("\n")[2]?.trim()}`,
+    `Input not ready: node id=${ref.node.id} op=${ref.node.op}[${idx}] shape=[${ref.node.shape}] caller=${new Error().stack?.split("\n")[2]?.trim()}`,
   );
 }
 
@@ -112,20 +93,6 @@ function requirePayload<T>(node: LazyIRNode): T {
 /** Assert that an optional backend op exists, throwing a descriptive error if not. */
 function assertOpSupported(op: string, fn: unknown): asserts fn {
   if (!fn) throw new Error(`${op} not supported by backend`);
-}
-
-/** Create a StorageHandle for a side output, optionally mark it reachable, and store it on the node. */
-function storeSideOutput(
-  node: LazyIRNode,
-  key: string,
-  tensor: BackendTensor,
-  reachableAnchor?: object,
-): StorageHandle {
-  const sh = createStorageHandle(node.device, tensor);
-  if (reachableAnchor) storageTracker.markReachable(sh.id, reachableAnchor);
-  if (!node._sideOutputs) node._sideOutputs = {};
-  (node._sideOutputs as Record<string, unknown>)[key] = sh;
-  return sh;
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +334,7 @@ function executeGenericOp(
   return fn(...args) as BackendTensor;
 }
 
-/** adamStep is special-cased: async, side outputs, markReachable. */
+/** adamStep is special-cased: async, multi-output (param, m, v), markReachable. */
 function executeAdamStep(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
@@ -383,13 +350,13 @@ function executeAdamStep(
       backendInputs[3],
       payload,
     );
+    const paramStorage = createStorageHandle(node.device, adamResult.param);
     const mStorage = createStorageHandle(node.device, adamResult.m);
     const vStorage = createStorageHandle(node.device, adamResult.v);
-    const adamMV = { m: mStorage, v: vStorage };
-    storageTracker.markReachable(mStorage.id, adamMV);
-    storageTracker.markReachable(vStorage.id, adamMV);
-    if (!node._sideOutputs) node._sideOutputs = {};
-    node._sideOutputs.adamMV = adamMV;
+    node.results = [paramStorage, mStorage, vStorage];
+    // Keep m/v alive until optimizer reads them at next step
+    storageTracker.markReachable(mStorage.id, node.results);
+    storageTracker.markReachable(vStorage.id, node.results);
     return adamResult.param;
   })();
 }
@@ -401,17 +368,10 @@ function executeAdamStep(
 type FusedOpDesc =
   | { kind: "dispatch" }
   | {
-      kind: "sideOutputs";
+      kind: "multiOutput";
       returnField: string;
-      sideOutputs: [storeKey: string, resultField: string][];
-    }
-  | {
-      kind: "rawSideOutputs";
-      returnField: string;
-      rawSideOutputs: [storeKey: string, resultField: string][];
-    }
-  | { kind: "extract"; key: string }
-  | { kind: "extractRaw"; key: string };
+      extraFields: string[];
+    };
 
 /** Maps fused op names to their dispatch configuration. */
 const FUSED_OP_TABLE: Record<string, FusedOpDesc> = {
@@ -420,30 +380,23 @@ const FUSED_OP_TABLE: Record<string, FusedOpDesc> = {
   fusedLayerNormForward: { kind: "dispatch" },
   fusedLayerNormBackwardGradX: { kind: "dispatch" },
   fusedLayerNormBackwardGradWeightBias: {
-    kind: "rawSideOutputs",
+    kind: "multiOutput",
     returnField: "gradWeight",
-    rawSideOutputs: [["lnBwdGradBias", "gradBias"]],
+    extraFields: ["gradBias"],
   },
   fusedRMSNormForward: { kind: "dispatch" },
   fusedRMSNormBackwardGradX: { kind: "dispatch" },
   fusedRMSNormBackwardGradWeight: { kind: "dispatch" },
   fusedAttentionForward: {
-    kind: "sideOutputs",
+    kind: "multiOutput",
     returnField: "output",
-    sideOutputs: [["attnLogsumexp", "logsumexp"]],
+    extraFields: ["logsumexp"],
   },
   fusedAttentionBackward: {
-    kind: "sideOutputs",
+    kind: "multiOutput",
     returnField: "dQ",
-    sideOutputs: [
-      ["attnBwdDK", "dK"],
-      ["attnBwdDV", "dV"],
-    ],
+    extraFields: ["dK", "dV"],
   },
-  extractAttentionLogsumexp: { kind: "extract", key: "attnLogsumexp" },
-  extractAttentionDK: { kind: "extract", key: "attnBwdDK" },
-  extractAttentionDV: { kind: "extract", key: "attnBwdDV" },
-  extractLnBwdGradBias: { kind: "extractRaw", key: "lnBwdGradBias" },
 };
 
 type AnyOpFn = (...args: unknown[]) => unknown;
@@ -455,10 +408,6 @@ function executeFusedOp(
 ): BackendTensor | Promise<BackendTensor> {
   const desc = FUSED_OP_TABLE[node.op];
   if (desc) {
-    if (desc.kind === "extract") return extractSideOutput(node, desc.key);
-    if (desc.kind === "extractRaw")
-      return extractSideOutput(node, desc.key, true);
-
     const payload = requirePayload(node);
     const fn = backend.ops[node.op as keyof Backend["ops"]] as
       | AnyOpFn
@@ -468,17 +417,13 @@ function executeFusedOp(
 
     if (desc.kind === "dispatch") return result as BackendTensor;
 
+    // Multi-output: store all outputs in node.results
     const r = result as Record<string, BackendTensor>;
-    if (desc.kind === "sideOutputs") {
-      for (const [storeKey, field] of desc.sideOutputs) {
-        storeSideOutput(node, storeKey, r[field]);
-      }
-    } else {
-      if (!node._sideOutputs) node._sideOutputs = {};
-      for (const [storeKey, field] of desc.rawSideOutputs) {
-        (node._sideOutputs as Record<string, unknown>)[storeKey] = r[field];
-      }
-    }
+    const primarySH = createStorageHandle(node.device, r[desc.returnField]);
+    const extraSHs = desc.extraFields.map((field) =>
+      createStorageHandle(node.device, r[field]),
+    );
+    node.results = [primarySH, ...extraSHs];
     return r[desc.returnField];
   }
 

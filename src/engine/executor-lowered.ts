@@ -285,11 +285,9 @@ function assignPackedAdamResult(
 
   const mStorage = createStorageHandle(adamNode.device, newM);
   const vStorage = createStorageHandle(adamNode.device, newV);
-  const sideOutputs = { m: mStorage, v: vStorage };
-  storageTracker.markReachable(mStorage.id, sideOutputs);
-  storageTracker.markReachable(vStorage.id, sideOutputs);
-  if (!adamNode._sideOutputs) adamNode._sideOutputs = {};
-  adamNode._sideOutputs.adamMV = sideOutputs;
+  adamNode.results = [adamNode.result!, mStorage, vStorage];
+  storageTracker.markReachable(mStorage.id, adamNode.results);
+  storageTracker.markReachable(vStorage.id, adamNode.results);
 }
 
 /** Assign result + side outputs for a param updated by per-param adamOp (standard path). */
@@ -302,14 +300,12 @@ function assignPerParamAdamResult(
   const paramOwns = (paramResult as { ownsBuffer?: boolean }).ownsBuffer;
   const finalResult =
     paramOwns === true ? { ...paramResult, ownsBuffer: false } : paramResult;
+  adamNode.result = createStorageHandle(adamNode.device, finalResult, s1.id);
   const mStorage = createStorageHandle(adamNode.device, adamResult.m);
   const vStorage = createStorageHandle(adamNode.device, adamResult.v);
-  const sideOutputs = { m: mStorage, v: vStorage };
-  storageTracker.markReachable(mStorage.id, sideOutputs);
-  storageTracker.markReachable(vStorage.id, sideOutputs);
-  if (!adamNode._sideOutputs) adamNode._sideOutputs = {};
-  adamNode._sideOutputs.adamMV = sideOutputs;
-  adamNode.result = createStorageHandle(adamNode.device, finalResult, s1.id);
+  adamNode.results = [adamNode.result, mStorage, vStorage];
+  storageTracker.markReachable(mStorage.id, adamNode.results);
+  storageTracker.markReachable(vStorage.id, adamNode.results);
 }
 
 /** Create a StorageHandle from arena buffer metadata (ownsBuffer: false, no-op destroy). */
@@ -784,16 +780,13 @@ export async function executeLoweredPlan(
             break;
           }
           case "side-output": {
-            // Restore attnLogsumexp on fusedAttentionForward nodes so a later
+            // Restore multi-output results on fusedAttentionForward nodes so a later
             // plan (backward Phase B) can skip re-executing fusedAttentionForward
-            // and extractAttentionLogsumexp can read the side output directly.
+            // and outputIndex refs can read the secondary output directly.
             const soNode = planNodes[entry.nodeIndex];
-            if (!soNode._sideOutputs?.attnLogsumexp) {
-              if (!soNode._sideOutputs) soNode._sideOutputs = {};
-              soNode._sideOutputs.attnLogsumexp = arenaStorage(
-                soNode.device,
-                entry,
-              );
+            if (!soNode.results?.[1]) {
+              const secondaryStorage = arenaStorage(soNode.device, entry);
+              soNode.results = [soNode.result!, secondaryStorage];
             }
             break;
           }
@@ -1424,11 +1417,10 @@ export async function executeLoweredPlan(
               if (node.result) {
                 recordResult(nodeIdx, asGPUTensor(node.result.backendTensor));
               }
-              // Record side output for fusedAttentionForward so replay
-              // restores attnLogsumexp (needed by extractAttentionLogsumexp
-              // in a later plan that skips re-executing this node).
-              if (node._sideOutputs?.attnLogsumexp) {
-                const soSH = node._sideOutputs.attnLogsumexp;
+              // Record secondary outputs for multi-output ops (e.g. fusedAttentionForward
+              // logsumexp at results[1]) so replay restores them for later plans.
+              if (node.results && node.results.length > 1) {
+                const soSH = node.results[1];
                 const sobt = asGPUTensor(soSH.backendTensor);
                 replayEntries.push({
                   kind: "side-output",

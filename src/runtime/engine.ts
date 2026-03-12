@@ -181,9 +181,13 @@ function materializeRemaining(tensors: readonly Tensor[]): LazyIRNode[] {
   for (const t of tensors) {
     if (t.isMaterialized() || t.disposed) continue;
     const ref = t.lazyRef;
-    if (ref.kind === "pending" && ref.node.result) {
-      t._materialize(ref.node.result);
-      materialized.push(ref.node);
+    if (ref.kind === "pending") {
+      const idx = ref.outputIndex ?? 0;
+      const storage = idx === 0 ? ref.node.result : ref.node.results?.[idx];
+      if (storage) {
+        t._materialize(storage);
+        materialized.push(ref.node);
+      }
     }
   }
   return materialized;
@@ -599,6 +603,7 @@ export class RuntimeEngine {
 
       for (const node of plan.nodes) {
         node.result = undefined;
+        node.results = undefined;
       }
       return false;
     }
@@ -769,12 +774,14 @@ export class RuntimeEngine {
     // by prior force() calls but not in plan.nodes) for result cleanup.
     const skippedNodes = materializeRemaining(pendingTensors);
 
-    // Drop node.result references to allow GC of unclaimed intermediate storages.
+    // Drop node.result/results references to allow GC of unclaimed intermediate storages.
     for (const node of plan.nodes) {
       node.result = undefined;
+      node.results = undefined;
     }
     for (const node of skippedNodes) {
       node.result = undefined;
+      node.results = undefined;
     }
 
     // Destroy orphaned intermediates created during this plan execution.
@@ -1581,9 +1588,13 @@ export class RuntimeEngine {
     fwdOutput: Tensor,
     config: FusedAttentionConfig,
   ): Tensor {
-    return this.fusedOp(
-      "extractAttentionLogsumexp",
-      [fwdOutput],
+    // Multi-output: logsumexp is output index 1 of fusedAttentionForward
+    const parentRef = fwdOutput.lazyRef;
+    if (parentRef.kind !== "pending")
+      throw new Error("extractAttentionLogsumexp: expected pending ref");
+    const ref = createPendingRef(parentRef.node, 1);
+    return this.trackRef(
+      ref,
       [config.batchSize, config.numHeads, config.seqLen],
       fwdOutput.device,
     );
@@ -1608,31 +1619,38 @@ export class RuntimeEngine {
   }
 
   extractAttentionDK(bwdDQ: Tensor, config: FusedAttentionConfig): Tensor {
-    return this.fusedOp(
-      "extractAttentionDK",
-      [bwdDQ],
+    // Multi-output: dK is output index 1 of fusedAttentionBackward
+    const parentRef = bwdDQ.lazyRef;
+    if (parentRef.kind !== "pending")
+      throw new Error("extractAttentionDK: expected pending ref");
+    const ref = createPendingRef(parentRef.node, 1);
+    return this.trackRef(
+      ref,
       [config.batchSize, config.numHeads, config.seqLen, config.headDim],
       bwdDQ.device,
     );
   }
 
   extractAttentionDV(bwdDQ: Tensor, config: FusedAttentionConfig): Tensor {
-    return this.fusedOp(
-      "extractAttentionDV",
-      [bwdDQ],
+    // Multi-output: dV is output index 2 of fusedAttentionBackward
+    const parentRef = bwdDQ.lazyRef;
+    if (parentRef.kind !== "pending")
+      throw new Error("extractAttentionDV: expected pending ref");
+    const ref = createPendingRef(parentRef.node, 2);
+    return this.trackRef(
+      ref,
       [config.batchSize, config.numHeads, config.seqLen, config.headDim],
       bwdDQ.device,
     );
   }
 
   extractLnBwdGradBias(gradWeight: Tensor, featureDim: number): Tensor {
-    return this.fusedOp(
-      "extractLnBwdGradBias",
-      [gradWeight],
-      [featureDim],
-      gradWeight.device,
-      { featureDim },
-    );
+    // Multi-output: gradBias is output index 1 of fusedLayerNormBackwardGradWeightBias
+    const parentRef = gradWeight.lazyRef;
+    if (parentRef.kind !== "pending")
+      throw new Error("extractLnBwdGradBias: expected pending ref");
+    const ref = createPendingRef(parentRef.node, 1);
+    return this.trackRef(ref, [featureDim], gradWeight.device);
   }
 }
 

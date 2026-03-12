@@ -170,10 +170,13 @@ export async function executeFusedSegment(
     if (inputRef.kind === "scalar") {
       continue;
     }
-    const storage =
-      inputRef.kind === "materialized"
-        ? inputRef.storage
-        : inputRef.node.result;
+    let storage: StorageHandle | undefined;
+    if (inputRef.kind === "materialized") {
+      storage = inputRef.storage;
+    } else {
+      const idx = inputRef.outputIndex ?? 0;
+      storage = idx === 0 ? inputRef.node.result : inputRef.node.results?.[idx];
+    }
 
     if (!storage) {
       // Input not materialized - fall back to sequential

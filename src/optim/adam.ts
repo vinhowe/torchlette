@@ -197,22 +197,23 @@ export class Adam {
       const node = this._pendingNodes[i];
       if (!node) continue;
 
-      // Side outputs are StorageHandles created during execution
-      const sideOutputs = node._sideOutputs?.adamMV;
+      // Multi-output: results[1] = m, results[2] = v
+      const mStorage = node.results?.[1];
+      const vStorage = node.results?.[2];
 
-      if (sideOutputs) {
+      if (mStorage && vStorage) {
         // Dispose old state
         if (this.expAvg[i]) this.expAvg[i]?.dispose();
         if (this.expAvgSq[i]) this.expAvgSq[i]?.dispose();
 
         // Wrap existing StorageHandles into tracked RuntimeTensors
         this.expAvg[i] = runtime.createFromStorageHandle(
-          sideOutputs.m,
+          mStorage,
           this.params[i].shape,
           this.device,
         );
         this.expAvgSq[i] = runtime.createFromStorageHandle(
-          sideOutputs.v,
+          vStorage,
           this.params[i].shape,
           this.device,
         );
