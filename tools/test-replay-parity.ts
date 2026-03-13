@@ -7,7 +7,6 @@ import * as path from "node:path";
 import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
 import { type Tensor, Torchlette } from "../src/frontend";
-import { crossEntropy } from "../src/nn";
 import { Adam } from "../src/optim";
 
 async function main() {
@@ -34,18 +33,12 @@ async function main() {
       : null;
 
   const seqLen = 31;
-  const vocabSize = 50257;
-  const inputData = Array.from({ length: seqLen }, (_, i) => i % vocabSize);
-  const targetData = Array.from(
-    { length: seqLen },
-    (_, i) => (i + 1) % vocabSize,
-  );
+  const inputData = Array.from({ length: seqLen }, (_, i) => i % 50257);
+  const targetData = Array.from({ length: seqLen }, (_, i) => (i + 1) % 50257);
 
   const compiledForward = api.compile((inp: Tensor, tgt: Tensor) => {
-    const logits = model.forward(inp);
-    const flatLogits = logits.reshape([seqLen, vocabSize]);
-    const flatTargets = tgt.reshape([seqLen]);
-    return crossEntropy(api, flatLogits, flatTargets);
+    const { loss } = model.forwardWithLoss(inp, tgt);
+    return loss!;
   });
 
   const NUM_STEPS = parseInt(process.env.NUM_STEPS || "8", 10);

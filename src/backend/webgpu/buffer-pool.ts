@@ -6,8 +6,8 @@
  * lifecycle helpers (deferredDestroy, acquirePooledBuffer).
  *
  * Cross-module state (activeBatch, sharedEncoderActive, gpuContext,
- * arenaBufferSet, replayPinnedBufferSet) is accessed via direct imports
- * from webgpu-state.ts (a zero-dependency leaf module).
+ * arenaBufferSet) is accessed via direct imports from webgpu-state.ts
+ * (a zero-dependency leaf module).
  */
 
 import { getSizeClass, getSizeForClass } from "../../engine/lifetime-analysis";
@@ -21,7 +21,6 @@ import {
   activeBatch,
   arenaBufferSet,
   gpuContext,
-  replayPinnedBufferSet,
   sharedEncoderActive,
 } from "./webgpu-state";
 
@@ -433,8 +432,6 @@ class SimpleBufferPool {
     // Arena buffers are owned by the arena — never destroy them.
     // This check covers ALL callers (direct pool calls and wrapper).
     if (arenaBufferSet.has(buffer)) return;
-    // Replay-pinned buffers are referenced by recorded bind groups — never destroy.
-    if (replayPinnedBufferSet?.has(buffer)) return;
     // Track deallocation immediately - the memory is now "freeable"
     gpuMemoryTracker.trackDeallocation(buffer);
     // When batching or shared encoder active, defer until after submit
@@ -450,8 +447,6 @@ class SimpleBufferPool {
    * Use for tiny params buffers that are not in the memory tracker.
    */
   deferredDestroyUntracked(buffer: GPUBuffer): void {
-    // Replay-pinned buffers are referenced by recorded bind groups — never destroy.
-    if (replayPinnedBufferSet?.has(buffer)) return;
     // When batching, command buffers haven't been submitted yet.
     if (activeBatch) {
       activeBatch.deferredDestroyBuffers.push(buffer);
@@ -495,8 +490,6 @@ class SimpleBufferPool {
    */
   destroyPendingBuffers(): void {
     for (const { buffer } of this.pendingDestroy) {
-      // Replay-pinned buffers must survive
-      if (replayPinnedBufferSet?.has(buffer)) continue;
       try {
         buffer.destroy();
       } catch {
@@ -631,11 +624,6 @@ class SimpleBufferPool {
 
       while (buffers.length > 0 && bytesFreed < bytesNeeded) {
         const buffer = buffers.pop() as GPUBuffer;
-        // Replay-pinned buffers must survive — push back and skip.
-        if (replayPinnedBufferSet?.has(buffer)) {
-          buffers.push(buffer);
-          break; // Can't evict from this size class
-        }
         this.pooledBufferSet.delete(buffer);
         this.pooledBytes -= sizePerBuffer;
         // Track deallocation and destroy the buffer to actually free GPU memory.
@@ -901,7 +889,7 @@ export function resetBufferPoolDetailedStats(): void {
  * Used by engine layer for buffers not managed by WebGPUTensor.destroy().
  */
 export function deferredDestroyBuffer(buffer: GPUBuffer, size: number): void {
-  bufferPool.deferredDestroy(buffer, size); // arena/replay guards are inside deferredDestroy
+  bufferPool.deferredDestroy(buffer, size); // arena guard is inside deferredDestroy
 }
 
 // ============================================================================

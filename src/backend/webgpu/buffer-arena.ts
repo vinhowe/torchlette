@@ -12,6 +12,7 @@
  * per step each have their own arena).
  */
 
+import { recordAlloc } from "../../engine/compiled-plan";
 import { getSizeClass, getSizeForClass } from "../../engine/lifetime-analysis";
 import type { BackendTensor } from "../types";
 import { bufferPool } from "./buffer-pool";
@@ -24,7 +25,6 @@ import { createTrackedBuffer } from "./tensor";
 import {
   arenaBufferSet,
   getOutputSeqIndex,
-  replayPinnedBufferSet,
   requireContext,
   setOutputSeqIndex,
   trackSharedEncoderWrite,
@@ -63,8 +63,10 @@ export function allocateOutputBuffer(sizeBytes: number): GPUBuffer {
           sizeBytes,
         );
         arenaLocal.conflictDetected = true;
+        recordAlloc(freshBuffer as GPUBuffer, sizeBytes, 1, []);
         return freshBuffer as GPUBuffer;
       }
+      recordAlloc(arenaBuffer, sizeBytes, 1, []);
       return arenaBuffer;
     }
   }
@@ -78,6 +80,7 @@ export function allocateOutputBuffer(sizeBytes: number): GPUBuffer {
       GPUBufferUsage.COPY_SRC |
       GPUBufferUsage.COPY_DST,
   }) as GPUBuffer;
+  recordAlloc(buffer, sizeBytes, 1, []);
   return buffer;
 }
 
@@ -222,23 +225,6 @@ export function clearArenaConflictDetected(): void {
 }
 
 /**
- * Pre-check if any arena buffers conflict with external input buffers.
- * Used before replay to determine if the cached bind groups are still valid.
- */
-export function hasArenaExternalConflicts(
-  arena: BufferArena,
-  extBufs: Set<GPUBuffer>,
-): boolean {
-  for (const buf of arena.resolve) {
-    if (buf && extBufs.has(buf)) return true;
-  }
-  for (const buf of arena.alloc) {
-    if (buf && extBufs.has(buf)) return true;
-  }
-  return false;
-}
-
-/**
  * Activate a buffer arena for the duration of a lowered plan execution.
  * All subsequent resolveOutputBuffer/allocateOutputBuffer calls will use
  * the arena instead of the pool, stabilizing buffer identities.
@@ -259,16 +245,6 @@ export function clearActiveArena(): void {
   arenaLocal.allocIndex = 0;
 }
 
-/** Get the current arena resolve index (for dispatch replay recording). */
-export function getArenaResolveIndex(): number {
-  return arenaLocal.resolveIndex;
-}
-
-/** Set the arena resolve index to a specific value (for dispatch replay restore). */
-export function setArenaResolveIndexTo(idx: number): void {
-  arenaLocal.resolveIndex = idx;
-}
-
 /** Check if a buffer is owned by an arena (should not be released to pool). */
 export function isArenaBuffer(buffer: GPUBuffer): boolean {
   return arenaBufferSet.has(buffer);
@@ -285,8 +261,6 @@ export function destroyArena(arena: BufferArena): void {
         arenaBufferSet.delete(buffer);
         // Only destroy if not referenced by a live tensor
         if (!bufferPool.isLive(buffer)) {
-          // Replay-pinned buffers must survive
-          if (replayPinnedBufferSet?.has(buffer)) continue;
           gpuMemoryTracker.trackDeallocation(buffer);
           buffer.destroy();
         }
@@ -322,14 +296,9 @@ function arenaAllocAt(
       // Live buffer — don't destroy. The owning tensor still references it.
       arenaLocal.conflictDetected = true;
     } else {
-      // Dead buffer with wrong size class — destroy if not replay-pinned
-      if (
-        replayPinnedBufferSet === null ||
-        !replayPinnedBufferSet.has(existing)
-      ) {
-        gpuMemoryTracker.trackDeallocation(existing);
-        existing.destroy();
-      }
+      // Dead buffer with wrong size class — destroy
+      gpuMemoryTracker.trackDeallocation(existing);
+      existing.destroy();
     }
   }
 
@@ -410,6 +379,7 @@ export function resolveOutputBuffer(
         // Still need to check direct aliasing on the fresh buffer
         if (freshBuffer && !inputBuffers.some((b) => b === freshBuffer)) {
           arenaLocal.resolveHits++;
+          recordAlloc(freshBuffer, sizeBytes, 0, inputBuffers);
           return freshBuffer;
         }
         // Fresh buffer aliased with direct input — fall through to normal path
@@ -417,6 +387,7 @@ export function resolveOutputBuffer(
       } else if (!inputBuffers.some((b) => b === arenaBuffer)) {
         // No conflict, no aliasing — use arena buffer directly
         arenaLocal.resolveHits++;
+        recordAlloc(arenaBuffer, sizeBytes, 0, inputBuffers);
         return arenaBuffer;
       } else {
         // Direct aliasing with current op's input — fall through to normal path.
@@ -450,7 +421,6 @@ export function resolveOutputBuffer(
         pinnedSizeClass === neededSizeClass &&
         !inputBuffers.some((b) => b === pinned)
       ) {
-        // Use pre-pinned buffer directly (already extracted from pool)
         trackSharedEncoderWrite(pinned);
         gpuMemoryTracker.trackAllocation(
           pinned,
@@ -459,6 +429,7 @@ export function resolveOutputBuffer(
         bufferPool.markAsFromPool(pinned);
         outputSequenceHints[outIdx] = pinned;
         pinnedOutputBuffers[outIdx] = null; // consumed
+        recordAlloc(pinned, sizeBytes, 0, inputBuffers);
         return pinned;
       }
       // Pin didn't match (size class changed or aliased with input) — return to pool
@@ -494,6 +465,7 @@ export function resolveOutputBuffer(
     outputSequenceHints[outIdx] = outBuffer;
   }
 
+  recordAlloc(outBuffer, sizeBytes, 0, inputBuffers);
   return outBuffer;
 }
 

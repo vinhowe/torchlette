@@ -1,12 +1,11 @@
 /**
  * Lowered Execution Plan
  *
- * Replaces the dispatch tape replay system with plan-level caching.
- * Instead of recording raw GPU dispatches and replaying them (with a costly
- * fill-in pass for fused intermediates), we record the full dispatch sequence
- * as a sequence of typed actions during the first execution of a plan with a
- * given structural fingerprint, then re-execute from the cached lowered plan
- * on subsequent steps.
+ * A cached sequence of typed actions derived from graph analysis. On the first
+ * execution with a given structural fingerprint, the lowered plan is built from
+ * segments, matmul directives, compound patterns, etc. On subsequent steps it
+ * is re-executed directly, skipping all analysis. A compiled plan (flat GPU
+ * command sequence) is built after the second execution for even faster replay.
  *
  * The lowered plan captures:
  * - Fused kernel dispatches (recipe + covered node indices)
@@ -26,18 +25,10 @@
 
 import type { DType } from "../backend/types";
 import type { FusedKernelRecipe } from "../backend/webgpu/fusion-types";
-import type {
-  GPUBindGroup,
-  GPUBuffer,
-  GPUComputePipeline,
-} from "../backend/webgpu/gpu-types";
 import type { EpilogueOp } from "./matmul-epilogue";
 
 /** A path to resolve a tensor reference: planNodes[planNodeIndex].inputs[inputIndex]. */
 type PlanNodePath = { planNodeIndex: number; inputIndex: number };
-
-/** Sequence counter snapshot for replay cache alignment. */
-export type SeqCounters = { dispatch: number; params: number; output: number };
 
 // ============================================================================
 // Lowered Action Types
@@ -254,108 +245,8 @@ export interface LoweredPlan {
   actions: LoweredAction[];
   /** Total plan node count (for validation). */
   planNodeCount: number;
-  /** Dispatch replay cache: recorded GPU dispatches for fast replay. */
-  dispatchCache?: DispatchReplayCache;
-}
-
-// ============================================================================
-// Dispatch Replay Cache
-// ============================================================================
-
-/**
- * A recorded GPU dispatch for replay. Contains everything needed to encode
- * a compute pass without any JS-level op dispatch logic.
- */
-interface ReplayDispatch {
-  pipeline: GPUComputePipeline;
-  bindGroup: GPUBindGroup;
-  workgroupsX: number;
-  workgroupsY: number;
-  workgroupsZ: number;
-  /** GPUBuffers referenced by this bind group (from RecordedDispatch). Used for pinning. */
-  buffers?: GPUBuffer[];
-}
-
-/**
- * Recorded node result metadata for reconstructing StorageHandles during replay.
- * Arena buffers are stable across steps, so we record the buffer reference directly.
- */
-interface ReplayNodeResult {
-  nodeIndex: number;
-  buffer: GPUBuffer;
-  shape: number[];
-  dtype: DType;
-  size: number;
-  strides: number[];
-}
-
-/**
- * A replay entry: either a GPU dispatch, a data source re-execution,
- * a view re-execution, a reclaim point, or a result assignment.
- */
-export type ReplayEntry =
-  | { kind: "dispatch"; dispatch: ReplayDispatch }
-  | {
-      kind: "data-source";
-      nodeIndex: number;
-      arenaResolveIdx: number;
-      /** Sequence counter positions so re-executed dispatches hit correct cache positions. */
-      seqCounters: SeqCounters;
-    }
-  | {
-      kind: "view";
-      nodeIndex: number;
-      arenaResolveIdx: number;
-      /** Cached view result for replay (arena buffers are stable, so buffer refs stay valid). */
-      cachedResult?: {
-        buffer: GPUBuffer;
-        shape: number[];
-        dtype: DType;
-        size: number;
-        strides: number[];
-        offset: number;
-        isContiguous: boolean;
-      };
-      /** Arena counter position AFTER view execution (may differ if contiguous() triggered). */
-      arenaResolveIdxAfter?: number;
-    }
-  | {
-      kind: "sequential";
-      nodeIndex: number;
-      arenaResolveIdx: number;
-      /** Sequence counter positions so re-executed dispatches hit correct cache positions. */
-      seqCounters: SeqCounters;
-    }
-  | { kind: "result"; nodeResult: ReplayNodeResult }
-  | {
-      kind: "adam-batch";
-      nodeIndices: number[];
-      /** Sequence counter positions at adam batch start (for correct cache indexing). */
-      seqCounters: SeqCounters;
-    }
-  | {
-      kind: "side-output";
-      nodeIndex: number;
-      buffer: GPUBuffer;
-      shape: number[];
-      dtype: DType;
-      size: number;
-      strides: number[];
-    }
-  | { kind: "reclaim" }
-  | { kind: "pre-adam-reclaim" };
-
-/**
- * Dispatch replay cache: records the full dispatch sequence during the first
- * execution and replays it on subsequent steps, bypassing all JS dispatch logic.
- */
-interface DispatchReplayCache {
-  /** Ordered replay entries (dispatches, data sources, reclaims, result assignments). */
-  entries: ReplayEntry[];
-  /** Whether this cache is valid for replay. Set to false on invalidation. */
-  valid: boolean;
-  /** GPUBuffers referenced by recorded bind groups that must not be destroyed between steps. */
-  pinnedBuffers?: Set<GPUBuffer>;
+  /** Compiled execution plan: flat GPU command sequence. */
+  compiledPlan?: import("./compiled-plan").CompiledPlan;
 }
 
 // ============================================================================

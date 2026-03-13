@@ -3,11 +3,9 @@ import type {
   AdamStepConfig,
   Backend,
   BackendTensor,
-  DeviceKind,
   DType,
 } from "../backend/types";
 import {
-  addReplayPinnedBuffers,
   type BufferArena,
   beginSharedEncoder,
   clearActiveArena,
@@ -17,19 +15,10 @@ import {
   flushBufferPool,
   flushSharedEncoder,
   getArenaConflictDetected,
-  getArenaResolveIndex,
-  getDispatchSequenceCounters,
-  hasArenaExternalConflicts,
-  type RecordedDispatch,
-  replayDispatches,
   setActiveArena,
   setAdamBatchMode,
   setArenaExternalInputBuffers,
-  setArenaResolveIndexTo,
   setCurrentOpLabel,
-  setDispatchSequenceCounters,
-  startDispatchRecording,
-  stopDispatchRecording,
 } from "../backend/webgpu";
 import { dispatchAdamStep } from "../backend/webgpu/adam-kernel";
 import { bufferPool } from "../backend/webgpu/buffer-pool";
@@ -46,6 +35,18 @@ import {
   dispatchPackedOptimizer,
   type PackedOptimizerItem,
 } from "../optim/packed-dispatch";
+import {
+  assignSlot,
+  buildCompiledPlan,
+  type CompiledPlan,
+  executeCompiledPlan,
+  isCompilationRecordingActive,
+  type NodeResult,
+  recordBarrier,
+  recordWrite,
+  startCompilationRecording,
+  stopCompilationRecording,
+} from "./compiled-plan";
 import type {
   OptimizedExecutionResult,
   OptimizedExecutionStats,
@@ -57,12 +58,7 @@ import type {
   LazyRef,
   StorageHandle,
 } from "./lazy-types";
-import {
-  ENCODER_COPY_OPS,
-  type LoweredPlan,
-  type ReplayEntry,
-  type SeqCounters,
-} from "./lowered-plan";
+import type { LoweredPlan } from "./lowered-plan";
 import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "./matmul-epilogue";
 import {
   _detectTransposeView,
@@ -77,7 +73,6 @@ import {
   wrapResultAsStorage,
 } from "./node-factory";
 import {
-  executeOp,
   executeOpSync,
   getInputStorage,
   withProfileContext,
@@ -96,37 +91,6 @@ import { storageTracker } from "./storage-tracker";
 type AdamStepFn = NonNullable<
   import("../backend/types").Backend["ops"]["adamStep"]
 >;
-
-/** Restore arena + dispatch counters from a replay entry. */
-function restoreReplayCounters(entry: {
-  arenaResolveIdx: number;
-  seqCounters: SeqCounters;
-}): void {
-  setArenaResolveIndexTo(entry.arenaResolveIdx);
-  setDispatchSequenceCounters(
-    entry.seqCounters.dispatch,
-    entry.seqCounters.params,
-    entry.seqCounters.output,
-  );
-}
-
-/** Execute an op node: resolve backend, get inputs, run executeOp. */
-async function executeNodeOp(
-  node: LazyIRNode,
-  backend: Backend,
-): Promise<{
-  result: BackendTensor;
-  backendInputs: BackendTensor[];
-  inputStorages: StorageHandle[];
-}> {
-  const nodeBackend = getBackend(node.device) ?? backend;
-  const inputStorages = node.inputs.map((ref) =>
-    getInputStorage(ref, nodeBackend),
-  );
-  const backendInputs = inputStorages.map((s) => s.backendTensor);
-  const result = await executeOp(node, backendInputs, nodeBackend);
-  return { result, backendInputs, inputStorages };
-}
 
 /**
  * Walk a chain of ops collecting external (non-chain) input refs.
@@ -312,32 +276,6 @@ function assignPerParamAdamResult(
   adamNode.results = [adamNode.result, mStorage, vStorage];
   storageTracker.markReachable(mStorage.id, adamNode.results);
   storageTracker.markReachable(vStorage.id, adamNode.results);
-}
-
-/** Create a StorageHandle from arena buffer metadata (ownsBuffer: false, no-op destroy). */
-function arenaStorage(
-  device: DeviceKind,
-  meta: {
-    buffer: GPUBuffer;
-    shape: number[];
-    dtype: DType;
-    size: number;
-    strides: number[];
-    offset?: number;
-    isContiguous?: boolean;
-  },
-): StorageHandle {
-  return createStorageHandle(device, {
-    buffer: meta.buffer,
-    shape: meta.shape,
-    dtype: meta.dtype,
-    size: meta.size,
-    strides: meta.strides,
-    offset: meta.offset ?? 0,
-    isContiguous: meta.isContiguous ?? true,
-    ownsBuffer: false,
-    destroy() {},
-  } as unknown as BackendTensor);
 }
 
 /** Collect GPU buffers from all external (materialized/already-resolved) plan inputs. */
@@ -615,206 +553,35 @@ export async function executeLoweredPlan(
   };
 
   const useTopLevelSharedEncoder = backend.name === "webgpu";
-  // Dispatch replay cache: enabled by default. Disable with TORCHLETTE_DISPATCH_REPLAY=0.
-  const useReplayCache = process.env.TORCHLETTE_DISPATCH_REPLAY !== "0";
-
   // =========================================================================
-  // FAST PATH: Dispatch Replay
+  // FAST PATH: Compiled Plan Execution
   // =========================================================================
-  // If we have a valid dispatch replay cache, skip all JS dispatch logic and
-  // replay recorded GPU dispatches directly. Only data sources, view ops, and
-  // encoder-copy ops (scatterAdd) are re-executed (their data or encoder
-  // commands change per step).
-  // Pre-check: collect external input buffers for arena conflict detection.
-  // If any arena buffer matches an external input, replay bind groups are stale
-  // (they reference the old buffer). We must skip replay and use normal execution
-  // which replaces the conflicting arena slot with a fresh buffer.
-  let extInputBufSet: Set<GPUBuffer> | null = null;
+  // If we have a valid compiled plan, execute it directly.
+  // The compiled plan is a flat sequence of GPU primitives (alloc, dispatch,
+  // copy, write, barrier) with abstract slot indices instead of concrete buffers.
+  // Compiled plan: enabled by default. Disable with TORCHLETTE_COMPILED_PLAN=0.
   if (
-    useReplayCache &&
-    loweredPlan.dispatchCache?.valid &&
-    options.bufferArena
-  ) {
-    extInputBufSet = new Set(collectExternalInputBuffers(planNodes));
-    if (hasArenaExternalConflicts(options.bufferArena, extInputBufSet)) {
-      // Arena buffers conflict with external inputs — invalidate replay cache.
-      // Normal execution path will replace the conflicting arena slots.
-      loweredPlan.dispatchCache.valid = false;
-    }
-  }
-
-  if (
-    useReplayCache &&
-    loweredPlan.dispatchCache?.valid &&
+    loweredPlan.compiledPlan?.valid &&
     useTopLevelSharedEncoder &&
-    options.bufferArena
+    options.bufferArena &&
+    process.env.TORCHLETTE_COMPILED_PLAN !== "0"
   ) {
-    const cache = loweredPlan.dispatchCache;
-    beginSharedEncoder();
-    setActiveArena(options.bufferArena);
-
-    // Register external input buffers for arena conflict detection
-    setArenaExternalInputBuffers(collectExternalInputBuffers(planNodes));
-
-    // Compute stats from lowered plan structure (same as normal path would)
-    for (const act of loweredPlan.actions) {
-      if (act.kind === "fused") {
-        stats.fusedNodes += act.coveredNodeIndices.length;
-        stats.fusionGroups++;
-      } else if (
-        act.kind === "sequential" ||
-        act.kind === "data-source" ||
-        act.kind === "view" ||
-        act.kind === "prologue-skip"
-      ) {
-        stats.sequentialNodes++;
-      }
-    }
-
-    try {
-      // Batch consecutive dispatch entries for efficient replay
-      const dispatchBatch: RecordedDispatch[] = [];
-      const flushDispatchBatch = () => {
-        if (dispatchBatch.length > 0) {
-          replayDispatches(dispatchBatch);
-          dispatchBatch.length = 0;
-        }
-      };
-
-      for (const entry of cache.entries) {
-        switch (entry.kind) {
-          case "dispatch":
-            dispatchBatch.push(entry.dispatch);
-            break;
-          case "data-source": {
-            flushDispatchBatch();
-            restoreReplayCounters(entry);
-            const dsNode = planNodes[entry.nodeIndex];
-            if (dsNode.result) break;
-            const { result: dsResult } = await executeNodeOp(dsNode, backend);
-            dsNode.result = createStorageHandle(dsNode.device, dsResult);
-            break;
-          }
-          case "view": {
-            flushDispatchBatch();
-            const vNode = planNodes[entry.nodeIndex];
-            if (vNode.result) break;
-            if (entry.cachedResult) {
-              // Fast path: reconstruct from cached metadata (arena buffers stable)
-              setArenaResolveIndexTo(
-                entry.arenaResolveIdxAfter ?? entry.arenaResolveIdx,
-              );
-              vNode.result = arenaStorage(vNode.device, entry.cachedResult);
-            } else {
-              // Slow path: re-execute (first replay before cache populated)
-              setArenaResolveIndexTo(entry.arenaResolveIdx);
-              const {
-                result: vResult,
-                backendInputs: vBI,
-                inputStorages: vIS,
-              } = await executeNodeOp(vNode, backend);
-              vNode.result = wrapResultAsStorage(
-                vNode.device,
-                vResult,
-                vBI,
-                vIS,
-              );
-            }
-            break;
-          }
-          case "sequential": {
-            flushDispatchBatch();
-            restoreReplayCounters(entry);
-            const node = planNodes[entry.nodeIndex];
-            if (node.result) break;
-            const { result, backendInputs, inputStorages } =
-              await executeNodeOp(node, backend);
-            node.result = wrapResultAsStorage(
-              node.device,
-              result,
-              backendInputs,
-              inputStorages,
-            );
-            break;
-          }
-          case "adam-batch": {
-            flushDispatchBatch();
-            flushSharedEncoder();
-            flushBufferPool();
-            setDispatchSequenceCounters(
-              entry.seqCounters.dispatch,
-              entry.seqCounters.params,
-              entry.seqCounters.output,
-            );
-            setAdamBatchMode(true);
-            try {
-              const adamOp = backend.ops.adamStep as NonNullable<
-                typeof backend.ops.adamStep
-              >;
-              setCurrentOpLabel("adamStep");
-              const _adamBatchT0 = profileOpBegin("adamStep");
-              await executeAdamBatchInner(
-                planNodes,
-                entry.nodeIndices,
-                adamOp,
-                (ref) => getInputStorage(ref, backend),
-              );
-              profileOpEnd("adamStep", _adamBatchT0);
-            } finally {
-              setAdamBatchMode(false);
-            }
-            break;
-          }
-          case "reclaim": {
-            flushDispatchBatch();
-            flushSharedEncoder();
-            break;
-          }
-          case "pre-adam-reclaim": {
-            flushDispatchBatch();
-            flushSharedEncoder();
-            flushBufferPool();
-            break;
-          }
-          case "result": {
-            flushDispatchBatch();
-            const nr = entry.nodeResult;
-            const node = planNodes[nr.nodeIndex];
-            if (!node.result) {
-              node.result = arenaStorage(node.device, nr);
-            }
-            break;
-          }
-          case "side-output": {
-            // Restore multi-output results on fusedAttentionForward nodes so a later
-            // plan (backward Phase B) can skip re-executing fusedAttentionForward
-            // and outputIndex refs can read the secondary output directly.
-            const soNode = planNodes[entry.nodeIndex];
-            if (!soNode.results?.[1]) {
-              const secondaryStorage = arenaStorage(soNode.device, entry);
-              soNode.results = [soNode.result!, secondaryStorage];
-            }
-            break;
-          }
-        }
-      }
-      flushDispatchBatch(); // Flush remaining batched dispatches
-    } finally {
-      clearActiveArena();
-      clearArenaExternalInputBuffers();
-      if (useTopLevelSharedEncoder) endSharedEncoder();
-    }
-
-    // Get the result from the last original plan node
-    const lastNode = plan.nodes[plan.nodes.length - 1];
-    if (!lastNode.result) {
-      throw new Error("Dispatch replay failed: no result for last node");
-    }
-    return { result: lastNode.result, stats };
+    const externalInputBuffers = collectExternalInputBuffers(planNodes);
+    await executeCompiledPlan(
+      loweredPlan.compiledPlan,
+      planNodes,
+      options.bufferArena,
+      backend,
+      externalInputBuffers,
+    );
+    return {
+      result: planNodes[planNodes.length - 1].result!,
+      stats,
+    };
   }
 
   // =========================================================================
-  // NORMAL PATH (with optional recording for dispatch replay cache)
+  // NORMAL PATH (with optional compilation recording for compiled plan)
   // =========================================================================
 
   // Shared encoder scope
@@ -835,74 +602,43 @@ export async function executeLoweredPlan(
     setArenaExternalInputBuffers(collectExternalInputBuffers(planNodes));
   }
 
-  // Set up dispatch recording if we have an arena (needed for stable bind groups)
-  // and no replay cache yet. We only record after the first execution (arena needs
-  // to be populated first), so we check if the arena already has buffers.
-  const shouldRecord =
-    useReplayCache &&
+  // Start compilation recording for compiled plan
+  const shouldCompile =
     useTopLevelSharedEncoder &&
     options.bufferArena &&
-    !loweredPlan.dispatchCache &&
+    !loweredPlan.compiledPlan &&
     options.bufferArena.resolve.length > 0; // Arena populated from prior execution
-  const recordingBuffer: RecordedDispatch[] = [];
-  const replayEntries: ReplayEntry[] = [];
-  let recordingDispatchIdx = 0;
-
-  /** Capture all new dispatches since last call and push to replay entries. */
-  const captureDispatches = () => {
-    while (recordingDispatchIdx < recordingBuffer.length) {
-      replayEntries.push({
-        kind: "dispatch",
-        dispatch: recordingBuffer[recordingDispatchIdx++],
-      });
+  let compilationRecording: ReturnType<
+    typeof startCompilationRecording
+  > | null = null;
+  if (shouldCompile) {
+    compilationRecording = startCompilationRecording();
+    // Pre-assign external input slots for inputs that are already materialized
+    // (results from prior plan executions). Inputs produced within this plan
+    // are NOT yet materialized and will get slots during recording via arena alloc.
+    for (let i = 0; i < planNodes.length; i++) {
+      const node = planNodes[i];
+      for (let j = 0; j < node.inputs.length; j++) {
+        const ref = node.inputs[j];
+        // Only assign if the input is already materialized
+        let storage: StorageHandle | undefined;
+        if (ref.kind === "materialized") {
+          storage = ref.storage;
+        } else if (ref.kind === "scalar") {
+          continue; // Scalar constants don't have GPU buffers
+        } else {
+          const idx = ref.outputIndex ?? 0;
+          storage = idx === 0 ? ref.node.result : ref.node.results?.[idx];
+        }
+        if (!storage) continue;
+        const buf = gpuBuffer(storage.backendTensor);
+        assignSlot(buf, {
+          kind: "external",
+          planNodeIndex: i,
+          inputIndex: j,
+        });
+      }
     }
-  };
-  /** Skip all new dispatches since last call (for ops that must re-execute). */
-  const skipDispatches = () => {
-    recordingDispatchIdx = recordingBuffer.length;
-  };
-  /** Record a node result for replay. */
-  const recordResult = (
-    nodeIndex: number,
-    bt: {
-      buffer: GPUBuffer;
-      shape: number[];
-      dtype: DType;
-      size: number;
-      strides: number[];
-    },
-  ) => {
-    replayEntries.push({
-      kind: "result",
-      nodeResult: {
-        nodeIndex,
-        buffer: bt.buffer,
-        shape: bt.shape.slice(),
-        dtype: bt.dtype,
-        size: bt.size,
-        strides: bt.strides.slice(),
-      },
-    });
-  };
-
-  /** Capture dispatches and record the output node result (common suffix for action cases). */
-  const captureAndRecordResult = (nodeIndex: number, node: LazyIRNode) => {
-    if (!shouldRecord) return;
-    captureDispatches();
-    if (node.result) {
-      recordResult(nodeIndex, asGPUTensor(node.result.backendTensor));
-    }
-  };
-
-  if (shouldRecord) {
-    startDispatchRecording(recordingBuffer);
-    // Also set up matmul and fusion recording buffers (imports cached from prior calls)
-    const [matmulMod, fusionMod] = await Promise.all([
-      import("../backend/webgpu/matmul/dispatch"),
-      import("../backend/webgpu/fusion-dispatch"),
-    ]);
-    matmulMod.setMatmulRecordingBuffer(recordingBuffer);
-    fusionMod.setFusionRecordingBuffer(recordingBuffer);
   }
 
   // Pre-resolve dynamic imports before the action loop so subsequent calls
@@ -1001,26 +737,6 @@ export async function executeLoweredPlan(
           );
           stats.fusedNodes += groupNodes.length;
           stats.fusionGroups++;
-
-          // Record dispatches and node results for replay cache
-          if (shouldRecord) {
-            // Capture dispatches emitted during this action
-            captureDispatches();
-            // Record output node result (inline for ordering)
-            if (outputNode.result) {
-              recordResult(
-                action.outputNodeIndex,
-                asGPUTensor(outputNode.result.backendTensor),
-              );
-            }
-            // Record additional output node results
-            for (const addIdx of action.additionalOutputNodeIndices) {
-              const addNode = planNodes[addIdx];
-              if (addNode.result) {
-                recordResult(addIdx, asGPUTensor(addNode.result.backendTensor));
-              }
-            }
-          }
           break;
         }
 
@@ -1114,7 +830,6 @@ export async function executeLoweredPlan(
               setProfileModule("unknown");
             }
 
-            captureAndRecordResult(action.outputNodeIndex, outputNode);
             break;
           }
 
@@ -1178,7 +893,6 @@ export async function executeLoweredPlan(
             epilogueInputPaths,
           );
 
-          captureAndRecordResult(action.outputNodeIndex, outputNode);
           break;
         }
 
@@ -1209,7 +923,6 @@ export async function executeLoweredPlan(
             executeReductionSegment(rpGroup, backend),
           );
 
-          captureAndRecordResult(action.reductionNodeIndex, rpReductionNode);
           break;
         }
 
@@ -1244,7 +957,6 @@ export async function executeLoweredPlan(
             executeReductionSegment(reGroup, backend),
           );
 
-          captureAndRecordResult(action.outputNodeIndex, reOutputNode);
           break;
         }
 
@@ -1288,7 +1000,6 @@ export async function executeLoweredPlan(
             executeReductionSegment(rfGroup, backend),
           );
 
-          captureAndRecordResult(action.outputNodeIndex, rfOutputNode);
           break;
         }
 
@@ -1297,13 +1008,7 @@ export async function executeLoweredPlan(
           if (useSharedEncoder) {
             flushSharedEncoder();
             flushBufferPool();
-          }
-
-          // Record pre-adam reclaim and capture counter positions
-          let adamSeqCountersBefore: SeqCounters | undefined;
-          if (shouldRecord && useSharedEncoder) {
-            replayEntries.push({ kind: "pre-adam-reclaim" });
-            adamSeqCountersBefore = getDispatchSequenceCounters();
+            recordBarrier();
           }
 
           setAdamBatchMode(true);
@@ -1324,18 +1029,6 @@ export async function executeLoweredPlan(
           } finally {
             setAdamBatchMode(false);
           }
-
-          // Record adam batch as a single replay entry (must re-execute each step).
-          // Capture the sequence counter positions so adam dispatches hit the correct
-          // cache positions during replay.
-          if (shouldRecord) {
-            skipDispatches();
-            replayEntries.push({
-              kind: "adam-batch",
-              nodeIndices: action.nodeIndices,
-              seqCounters: adamSeqCountersBefore as SeqCounters,
-            });
-          }
           break;
         }
 
@@ -1345,14 +1038,6 @@ export async function executeLoweredPlan(
           const nodeIdx = action.nodeIndex;
           const node = planNodes[nodeIdx];
           if (node.result) break;
-
-          // Capture arena resolve index and sequence counters BEFORE execution
-          const arenaResolveIdxBefore = shouldRecord
-            ? getArenaResolveIndex()
-            : 0;
-          const seqCountersBefore = shouldRecord
-            ? getDispatchSequenceCounters()
-            : undefined;
 
           setProfileModule(node.module ?? "unknown");
           const inputs = node.inputs.map((ref) =>
@@ -1376,75 +1061,9 @@ export async function executeLoweredPlan(
           );
           stats.sequentialNodes++;
 
-          // Record for replay cache
-          if (shouldRecord) {
-            if (action.kind === "data-source") {
-              // Data sources must re-execute each step (host data changes).
-              replayEntries.push({
-                kind: "data-source",
-                nodeIndex: nodeIdx,
-                arenaResolveIdx: arenaResolveIdxBefore,
-                seqCounters: seqCountersBefore as SeqCounters,
-              });
-              skipDispatches();
-            } else if (action.kind === "view") {
-              // Views produce deterministic results (same arena buffer, same
-              // shape/strides/offset). Cache the result to skip re-execution.
-              const bt = asGPUTensor(node.result?.backendTensor);
-              replayEntries.push({
-                kind: "view",
-                nodeIndex: nodeIdx,
-                arenaResolveIdx: arenaResolveIdxBefore,
-                arenaResolveIdxAfter: getArenaResolveIndex(),
-                cachedResult: {
-                  buffer: bt.buffer,
-                  shape: bt.shape.slice(),
-                  dtype: bt.dtype,
-                  size: bt.size,
-                  strides: bt.strides.slice(),
-                  offset: bt.offset,
-                  isContiguous: bt.isContiguous,
-                },
-              });
-              skipDispatches();
-            } else if (ENCODER_COPY_OPS.has(node.op)) {
-              // Ops that use encoder copy commands (copyBufferToBuffer) alongside
-              // compute dispatches must be re-executed during replay — the copy
-              // commands are invisible to the compute dispatch recording mechanism.
-              replayEntries.push({
-                kind: "sequential",
-                nodeIndex: nodeIdx,
-                arenaResolveIdx: arenaResolveIdxBefore,
-                seqCounters: seqCountersBefore as SeqCounters,
-              });
-              skipDispatches();
-            } else {
-              // With arena active, all buffer identities are stable (arena returns
-              // same GPUBuffer object on subsequent steps). Data-source-consuming
-              // ops can be safely replayed — their bind groups reference arena
-              // buffers that don't change identity.
-              // Safe to replay: capture dispatches
-              captureDispatches();
-              // Record node result (inline for ordering)
-              if (node.result) {
-                recordResult(nodeIdx, asGPUTensor(node.result.backendTensor));
-              }
-              // Record secondary outputs for multi-output ops (e.g. fusedAttentionForward
-              // logsumexp at results[1]) so replay restores them for later plans.
-              if (node.results && node.results.length > 1) {
-                const soSH = node.results[1];
-                const sobt = asGPUTensor(soSH.backendTensor);
-                replayEntries.push({
-                  kind: "side-output",
-                  nodeIndex: nodeIdx,
-                  buffer: sobt.buffer,
-                  shape: sobt.shape.slice(),
-                  dtype: sobt.dtype,
-                  size: sobt.size,
-                  strides: sobt.strides.slice(),
-                });
-              }
-            }
+          // Record data-source for compiled plan (re-executed each step)
+          if (action.kind === "data-source" && isCompilationRecordingActive()) {
+            recordWrite(gpuBuffer(node.result!.backendTensor), nodeIdx);
           }
           break;
         }
@@ -1465,7 +1084,6 @@ export async function executeLoweredPlan(
             action.name,
             backend,
           );
-          captureAndRecordResult(action.outputNodeIndex, compOutNode);
           break;
         }
 
@@ -1474,64 +1092,69 @@ export async function executeLoweredPlan(
             flushSharedEncoder();
             flushBufferPool();
           }
-          if (shouldRecord) {
-            replayEntries.push({ kind: "reclaim" });
-          }
+          recordBarrier();
           break;
         }
       }
     }
   } finally {
-    // Stop recording
-    if (shouldRecord) {
-      stopDispatchRecording();
-      const [matmulMod, fusionMod] = await Promise.all([
-        import("../backend/webgpu/matmul/dispatch"),
-        import("../backend/webgpu/fusion-dispatch"),
-      ]);
-      matmulMod.setMatmulRecordingBuffer(null);
-      fusionMod.setFusionRecordingBuffer(null);
-
-      // Collect all GPUBuffers referenced by recorded bind groups.
-      // These must be pinned (not destroyed) between steps so replay bind groups stay valid.
-      const pinnedBuffers = new Set<GPUBuffer>();
-      for (const entry of replayEntries) {
-        if (entry.kind === "dispatch" && entry.dispatch.buffers) {
-          for (const b of entry.dispatch.buffers) pinnedBuffers.add(b);
-        }
-        if (entry.kind === "result" && entry.nodeResult.buffer) {
-          pinnedBuffers.add(entry.nodeResult.buffer);
-        }
-        if (entry.kind === "side-output" && entry.buffer) {
-          pinnedBuffers.add(entry.buffer);
+    // Build compiled plan from recording
+    if (compilationRecording) {
+      stopCompilationRecording();
+      // Collect node results for the compiled plan
+      const nodeResults: NodeResult[] = [];
+      for (let i = 0; i < planNodes.length; i++) {
+        const node = planNodes[i];
+        if (node.results && node.results.length > 0) {
+          for (let oi = 0; oi < node.results.length; oi++) {
+            const sh = node.results[oi];
+            if (!sh) continue;
+            const bt = asGPUTensor(sh.backendTensor);
+            const slot = compilationRecording.bufferToSlot.get(bt.buffer);
+            if (slot !== undefined) {
+              nodeResults.push({
+                nodeIndex: i,
+                outputIndex: oi,
+                slot,
+                shape: bt.shape.slice(),
+                strides: bt.strides.slice(),
+                dtype: bt.dtype,
+                offset: bt.offset,
+              });
+            }
+          }
+        } else if (node.result) {
+          const bt = asGPUTensor(node.result.backendTensor);
+          const slot = compilationRecording.bufferToSlot.get(bt.buffer);
+          if (slot !== undefined) {
+            nodeResults.push({
+              nodeIndex: i,
+              outputIndex: 0,
+              slot,
+              shape: bt.shape.slice(),
+              strides: bt.strides.slice(),
+              dtype: bt.dtype,
+              offset: bt.offset,
+            });
+          }
         }
       }
-
-      // Activate pinning globally — buffers survive across markStep() boundaries.
-      // Multiple plans accumulate into the same global set.
-      addReplayPinnedBuffers(pinnedBuffers);
-
-      // Build and store the dispatch replay cache — but only if no arena
-      // conflicts were detected. Conflicts mean bind groups reference replaced
-      // buffers and cannot be replayed safely.
-      if (getArenaConflictDetected()) {
-        // Don't cache — bind groups reference stale (replaced) arena buffers
-        clearArenaConflictDetected();
-      } else {
-        loweredPlan.dispatchCache = {
-          entries: replayEntries,
-          valid: true,
-          pinnedBuffers,
-        };
+      const compiled = buildCompiledPlan({
+        commandLog: compilationRecording.commandLog,
+        arena: options.bufferArena!,
+        planNodes,
+        bufferToSlot: compilationRecording.bufferToSlot,
+        slotSources: compilationRecording.slotSources,
+        nodeResults,
+      });
+      if (compiled.valid && !getArenaConflictDetected()) {
+        loweredPlan.compiledPlan = compiled;
       }
+      compilationRecording = null;
     }
 
-    // If arena conflicts were detected during non-recording execution,
-    // invalidate any existing dispatch cache.
+    // Clear arena conflict flag
     if (getArenaConflictDetected()) {
-      if (loweredPlan.dispatchCache) {
-        loweredPlan.dispatchCache.valid = false;
-      }
       clearArenaConflictDetected();
     }
 

@@ -8,17 +8,6 @@ import {
   createParamsBuffer as sharedCreateParamsBuffer,
 } from "../bind-group-cache";
 import { dispatchComputePass } from "../dispatch";
-import type { RecordedDispatch } from "../dispatch-recording";
-import { getWarmupPipeline, recordPipeline } from "../pipeline-warmup";
-import { getCurrentOpLabel } from "../shared-encoder";
-import { onTeardown } from "../webgpu-state";
-
-/** Module-level recording buffer (shared with index.ts recording system). */
-let matmulRecordingBuffer: RecordedDispatch[] | null = null;
-export function setMatmulRecordingBuffer(buf: RecordedDispatch[] | null): void {
-  matmulRecordingBuffer = buf;
-}
-
 import type {
   GPUBuffer,
   GPUComputePipeline,
@@ -26,6 +15,9 @@ import type {
   GPUQueue,
 } from "../gpu-types";
 import { GPUBufferUsage } from "../gpu-types";
+import { getWarmupPipeline, recordPipeline } from "../pipeline-warmup";
+import { getCurrentOpLabel } from "../shared-encoder";
+import { onTeardown } from "../webgpu-state";
 import {
   cacheTuningResult,
   generateNeighborConfigs,
@@ -816,7 +808,6 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
       workgroupsX,
       workgroupsY,
       kSplitFactor,
-      matmulRecordingBuffer,
       opLabel,
     );
 
@@ -852,7 +843,6 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
       reduceWorkgroups,
       1,
       1,
-      matmulRecordingBuffer,
       opLabel + "_ksplit_reduce",
     );
 
@@ -910,14 +900,7 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
   const dispatchY = swapGrid ? workgroupsX : workgroupsY;
 
   // Encode and submit
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    dispatchX,
-    dispatchY,
-    workgroupsZ,
-    matmulRecordingBuffer,
-  );
+  dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY, workgroupsZ);
 
   // Release params buffer back to shared pool
   releaseParamsBuffer(paramsBuffer);

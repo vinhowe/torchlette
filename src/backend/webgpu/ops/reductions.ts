@@ -619,7 +619,7 @@ export function sumWithPreambleEpilogue(
     result = createTensor(outShape, outBuffer, undefined, 0, outputDtype);
   }
 
-  if (invCountBuffer) invCountBuffer.destroy();
+  if (invCountBuffer) releaseParamsBuffer(invCountBuffer);
   return result;
 }
 
@@ -690,6 +690,6 @@ export function meanWithEpilogue(
     mean.inputs,
     outputDtype,
   );
-  mean.invCountBuffer.destroy();
+  releaseParamsBuffer(mean.invCountBuffer);
   return result;
 }

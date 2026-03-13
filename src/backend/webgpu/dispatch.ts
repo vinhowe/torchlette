@@ -3,6 +3,11 @@
  * binary/unary/matmul dispatch.
  */
 
+import {
+  getAndClearLastBindGroupBuffers,
+  isCompilationRecordingActive,
+  recordDispatch as recordCompiledDispatch,
+} from "../../engine/compiled-plan";
 import type { DType } from "../types";
 import {
   cachedCreateBindGroup,
@@ -12,11 +17,6 @@ import {
 } from "./bind-group-cache";
 import { resolveOutputBuffer } from "./buffer-arena";
 import { destroyCopy } from "./buffer-pool";
-import {
-  dispatchRecordingBuffer,
-  getAndClearLastBindGroupBuffers,
-  type RecordedDispatch,
-} from "./dispatch-recording";
 import { isF16Supported, requireContext } from "./gpu-context";
 import type {
   GPUBindGroup,
@@ -40,7 +40,7 @@ import {
 } from "./ops/ops-tile-ir";
 import { detectSimpleTranspose, ensureContiguous } from "./ops/views";
 import { getWarmupPipeline, recordPipeline } from "./pipeline-warmup";
-import { getProfileModule, getTimestampWrites } from "./profiler";
+import { getTimestampWrites } from "./profiler";
 import {
   broadcastShapes,
   compute2DDispatch,
@@ -68,24 +68,20 @@ export function dispatchComputePass(
   workgroupsX: number,
   workgroupsY: number = 1,
   workgroupsZ: number = 1,
-  recordingBuffer?: RecordedDispatch[] | null,
   labelOverride?: string,
 ): void {
   const ctx = requireContext();
   const label = labelOverride ?? getCurrentOpLabel();
-  const recBuf = recordingBuffer ?? dispatchRecordingBuffer;
 
-  // Record dispatch if recording is active
-  if (recBuf) {
-    recBuf.push({
+  // Record dispatch for compiled plan
+  if (isCompilationRecordingActive()) {
+    recordCompiledDispatch({
       pipeline,
       bindGroup: bindGroup as GPUBindGroup,
       workgroupsX,
       workgroupsY,
       workgroupsZ,
       buffers: getAndClearLastBindGroupBuffers(),
-      label: label ?? undefined,
-      module: getProfileModule(),
     });
   }
 

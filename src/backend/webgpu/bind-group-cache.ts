@@ -10,6 +10,11 @@
  */
 
 import {
+  assignSlot,
+  isCompilationRecordingActive,
+  setLastBindGroupBuffers,
+} from "../../engine/compiled-plan";
+import {
   isArenaBuffer,
   outputSequenceHints,
   pinnedOutputBuffers,
@@ -17,10 +22,6 @@ import {
   resetArenaState,
 } from "./buffer-arena";
 import { bufferPool } from "./buffer-pool";
-import {
-  dispatchRecordingBuffer,
-  setLastBindGroupBuffers,
-} from "./dispatch-recording";
 import type {
   GPUBindGroup,
   GPUBuffer,
@@ -41,7 +42,6 @@ import {
   paramsBufferPools,
   paramsBufferSizeClass,
   paramsSequenceSet,
-  replayPinnedBufferSet,
   setOutputSeqIndex,
   sharedEncoderActive as sharedEncoderFlag,
 } from "./webgpu-state";
@@ -115,6 +115,7 @@ export function createParamsBuffer(
 ): GPUBuffer {
   const sizeClass = paramsBufferSizeClass(data.byteLength);
   const idx = cacheState.paramsSeqIndex++;
+  const compiling = isCompilationRecordingActive();
 
   // Try to reuse the buffer from the same dispatch position (previous step).
   // This keeps the GPUBuffer pointer stable so bind group caching can hit.
@@ -132,6 +133,12 @@ export function createParamsBuffer(
           }
         }
         if (same) {
+          if (compiling)
+            assignSlot(cached.buffer, {
+              kind: "params",
+              seqIndex: idx,
+              data: data.slice(),
+            });
           return cached.buffer; // Skip writeBuffer entirely
         }
       }
@@ -140,6 +147,12 @@ export function createParamsBuffer(
         device.queue.writeBuffer(cached.buffer, 0, data),
       );
       cached.data.set(data);
+      if (compiling)
+        assignSlot(cached.buffer, {
+          kind: "params",
+          seqIndex: idx,
+          data: data.slice(),
+        });
       return cached.buffer;
     }
 
@@ -156,6 +169,12 @@ export function createParamsBuffer(
         data: data.slice(),
       };
       paramsSequenceSet.add(buffer);
+      if (compiling)
+        assignSlot(buffer, {
+          kind: "params",
+          seqIndex: idx,
+          data: data.slice(),
+        });
       return buffer;
     }
   }
@@ -177,15 +196,14 @@ export function createParamsBuffer(
     };
     paramsSequenceSet.add(buffer);
   }
+  if (compiling)
+    assignSlot(buffer, { kind: "params", seqIndex: idx, data: data.slice() });
   return buffer;
 }
 
 export function releaseParamsBuffer(buffer: GPUBuffer): void {
   // Sequence-cached params buffers are reused across steps — don't return to pool
   if (paramsSequenceSet.has(buffer)) return;
-  // Replay-pinned buffers must stay alive — referenced by recorded bind groups
-  if (replayPinnedBufferSet?.has(buffer)) return;
-
   if (activeBatch) {
     activeBatch.deferredDestroyBuffers.push(buffer);
     return;
@@ -226,8 +244,8 @@ export function profiledCreateBindGroup(
   const bg = profileApiCall("createBindGroup", () =>
     device.createBindGroup(descriptor),
   );
-  // When recording, capture buffer references from the descriptor for replay pinning
-  if (dispatchRecordingBuffer && descriptor.entries) {
+  // When recording, capture buffer references from the descriptor for compilation
+  if (isCompilationRecordingActive() && descriptor.entries) {
     const bufs: GPUBuffer[] = [];
     for (const e of descriptor.entries) {
       const r = e.resource;
@@ -277,7 +295,8 @@ export function cachedCreateBindGroup(
     }
     if (match) {
       cacheState.hits++;
-      if (dispatchRecordingBuffer) setLastBindGroupBuffers(entry.buffers);
+      if (isCompilationRecordingActive())
+        setLastBindGroupBuffers(entry.buffers);
       return entry.bindGroup;
     }
   }
@@ -328,7 +347,7 @@ export function cachedCreateBindGroup(
 
   const bufCopy = buffers.slice();
   cacheState.sequenceEntries[idx] = { bindGroup, pipeline, buffers: bufCopy };
-  if (dispatchRecordingBuffer) setLastBindGroupBuffers(bufCopy);
+  if (isCompilationRecordingActive()) setLastBindGroupBuffers(bufCopy);
   return bindGroup;
 }
 
