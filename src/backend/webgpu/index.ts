@@ -15,14 +15,11 @@ export {
   destroyArena,
   donateBuffer,
   getArenaConflictDetected,
-  getArenaResolveIndex,
   getBufferSize,
-  hasArenaExternalConflicts,
   isArenaBuffer,
   resolveOutputBuffer,
   setActiveArena,
   setArenaExternalInputBuffers,
-  setArenaResolveIndexTo,
 } from "./buffer-arena";
 
 export {
@@ -38,13 +35,6 @@ export {
   dispatchMatmulDirect,
   getPipeline,
 } from "./dispatch";
-export type { RecordedDispatch } from "./dispatch-recording";
-export {
-  addReplayPinnedBuffers,
-  replayDispatches,
-  startDispatchRecording,
-  stopDispatchRecording,
-} from "./dispatch-recording";
 export {
   destroyWebGPU,
   getMaxStorageBufferBindingSize,

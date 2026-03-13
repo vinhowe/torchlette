@@ -8,7 +8,7 @@
  *
  * This eliminates injection callbacks that were previously used to break
  * circular dependencies between buffer-pool, shared-encoder, gpu-context,
- * buffer-arena, dispatch-recording, and bind-group-cache.
+ * buffer-arena, and bind-group-cache.
  *
  * All setter functions are called only at lifecycle boundaries (step start/end),
  * not in hot dispatch loops. ESM live bindings make accessing these variables
@@ -94,20 +94,6 @@ export function requireContext(): WebGPUContext {
 
 /** The set of all buffers owned by any active arena (for release interception). */
 export const arenaBufferSet = new Set<GPUBuffer>();
-
-// ============================================================================
-// Replay Pinned Buffer Set (moved from dispatch-recording.ts)
-// ============================================================================
-
-/**
- * When dispatch replay caches exist, buffers referenced by recorded bind groups
- * must not be destroyed between steps. This set accumulates all such buffers.
- */
-export let replayPinnedBufferSet: Set<GPUBuffer> | null = null;
-
-export function setReplayPinnedBufferSet(set: Set<GPUBuffer> | null): void {
-  replayPinnedBufferSet = set;
-}
 
 // ============================================================================
 // GPU Submit Counter (moved from shared-encoder.ts)

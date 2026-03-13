@@ -29,7 +29,6 @@ import {
   MAX_PARAMS_POOL_SIZE_PER_CLASS,
   paramsBufferPools,
   paramsBufferSizeClass,
-  replayPinnedBufferSet,
   requireContext,
   resetSharedEncoderWriteSet,
   setActiveBatch,
@@ -92,8 +91,6 @@ export async function endBatchExecution(): Promise<void> {
 
   // Now safe to destroy deferred buffers (GPU is done with them)
   for (const buffer of batch.deferredDestroyBuffers) {
-    // Replay-pinned buffers must survive — referenced by recorded bind groups.
-    if (replayPinnedBufferSet?.has(buffer)) continue;
     buffer.destroy();
   }
   // Also flush any pending pool buffers since GPU work is complete
@@ -221,7 +218,6 @@ function finishAndSubmitEncoder(createNew: boolean): void {
   // acquisition order for bind group cache stability.
   for (let i = encoderState.deferredUniformBuffers.length - 1; i >= 0; i--) {
     const buf = encoderState.deferredUniformBuffers[i];
-    if (replayPinnedBufferSet?.has(buf)) continue;
     const sc = paramsBufferSizeClass(buf.size);
     const pool = paramsBufferPools.get(sc);
     if (pool) {

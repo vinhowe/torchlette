@@ -5,6 +5,8 @@
  * Supports vectorized memory coalescing (§15.3) for improved bandwidth.
  */
 
+import { sizeOf } from "../../core/shape";
+import type { DType } from "../types";
 import {
   cachedCreateBindGroup,
   createParamsBuffer,
@@ -12,17 +14,6 @@ import {
 } from "./bind-group-cache";
 import { allocateOutputBuffer } from "./buffer-arena";
 import { dispatchComputePass } from "./dispatch";
-import type { RecordedDispatch } from "./dispatch-recording";
-import { onTeardown, trackSharedEncoderWrite } from "./webgpu-state";
-
-/** Module-level recording buffer (shared with index.ts recording system). */
-let fusionRecordingBuffer: RecordedDispatch[] | null = null;
-export function setFusionRecordingBuffer(buf: RecordedDispatch[] | null): void {
-  fusionRecordingBuffer = buf;
-}
-
-import { sizeOf } from "../../core/shape";
-import type { DType } from "../types";
 import { generateFusedKernelTileIR } from "./fusion-tile-ir";
 import {
   computeKernelMeta,
@@ -33,6 +24,7 @@ import {
 import type { GPUBuffer, GPUComputePipeline, GPUDevice } from "./gpu-types";
 import { getWarmupPipeline, recordPipeline } from "./pipeline-warmup";
 import { dtypeBytes, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
+import { onTeardown, trackSharedEncoderWrite } from "./webgpu-state";
 
 // ============================================================================
 // Kernel Cache
@@ -264,14 +256,7 @@ export function dispatchFusedKernel(
       ? 1
       : Math.ceil(totalWorkgroups / MAX_WORKGROUPS_PER_DIM);
 
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    workgroupsX,
-    workgroupsY,
-    1,
-    fusionRecordingBuffer,
-  );
+  dispatchComputePass(pipeline, bindGroup, workgroupsX, workgroupsY, 1);
 
   // Release the params uniform buffer via the params buffer pool (handles deferred destruction)
   releaseParamsBuffer(paramsBuffer);
