@@ -18,17 +18,25 @@ async function collectAndForceSavedTensors(
   const allUnpackedTensors = new Map<AutogradNode, Tensor[]>();
 
   // Phase A: Collect all unpacked tensors
-  for (let i = ordered.length - 1; i >= 0; i -= 1) {
-    const node = ordered[i];
-    for (const slot of node.savedSlots) {
-      torch.engine._debug_useSavedTensor(slot.record);
+  // Suppress markEscaped during checkpoint recomputation so recomputed
+  // RuntimeTensors stay tracked (not escaped) in TidyDispatchMode.
+  // This ensures disposeNonEscaped() cleans them up after backward.
+  torch._inCheckpointRecompute = true;
+  try {
+    for (let i = ordered.length - 1; i >= 0; i -= 1) {
+      const node = ordered[i];
+      for (const slot of node.savedSlots) {
+        torch.engine._debug_useSavedTensor(slot.record);
+      }
+      const unpackedTensors: Tensor[] = [];
+      for (const slot of node.savedSlots) {
+        const tensor = slot.unpackHook(slot.packed);
+        unpackedTensors.push(tensor);
+      }
+      allUnpackedTensors.set(node, unpackedTensors);
     }
-    const unpackedTensors: Tensor[] = [];
-    for (const slot of node.savedSlots) {
-      const tensor = slot.unpackHook(slot.packed);
-      unpackedTensors.push(tensor);
-    }
-    allUnpackedTensors.set(node, unpackedTensors);
+  } finally {
+    torch._inCheckpointRecompute = false;
   }
 
   // Phase B: Force all saved tensors in ONE merged plan
@@ -135,32 +143,44 @@ async function runBackwardFunctions(
 
 /**
  * Dispose checkpoint-recomputed tensors that are no longer needed after
- * backward execution. Protects parameters and user-held inputs.
+ * backward execution. Only protects parameters and external user inputs.
  */
 function disposeCheckpointTensors(
   ordered: AutogradNode[],
   allUnpackedTensors: Map<AutogradNode, Tensor[]>,
+  leafTensors: Set<Tensor>,
 ): void {
+  // Protect actual leaf tensors (parameters) and external user inputs.
+  // Do NOT over-protect all autograd node inputs — that includes
+  // checkpoint-recomputed intermediates whose RuntimeTensors would leak.
   const protectedTensors = new Set<Tensor>();
+  for (const t of leafTensors) {
+    protectedTensors.add(t);
+  }
+  // Also protect non-leaf inputs that are NOT forward intermediates
+  // (e.g., user-provided x, target tensors)
+  const forwardOutputs = new Set<Tensor>();
+  for (const node of ordered) {
+    forwardOutputs.add(node.output);
+  }
   for (const node of ordered) {
     for (const input of node.inputs) {
-      protectedTensors.add(input);
+      if (!forwardOutputs.has(input)) {
+        protectedTensors.add(input);
+      }
     }
   }
+
   for (const [node, tensors] of allUnpackedTensors.entries()) {
     for (let idx = 0; idx < tensors.length; idx++) {
       const unpacked = tensors[idx];
       const packed = node.savedSlots[idx]?.packed;
-      // Non-checkpoint: packed === unpacked (identity hook) -> skip
-      // Checkpoint: packed is a placeholder, unpacked is a Tensor
-      //   - If unpacked is a parameter/input tensor -> skip (protected)
-      //   - If unpacked is a recomputed intermediate -> dispose
       if (unpacked === packed) {
-        // identity
+        // Identity: not recomputed, skip
       } else if (unpacked.isDisposed) {
-        // already disposed (e.g. by tidy in checkpoint recomputation)
+        // Already disposed
       } else if (protectedTensors.has(unpacked)) {
-        // protected
+        // Protected (parameter or external input) — do not dispose
       } else {
         unpacked.dispose();
       }
@@ -300,15 +320,32 @@ export async function backwardImpl(
           await torch.runtime.forceAllMerged(...tensorsToForce);
         }
 
-        // ========================================================================
-        // UNIFIED BACKWARD EXECUTION
-        // ========================================================================
+        // Collect checkpoint-recomputed saved tensors and force them
         const allUnpackedTensors = await collectAndForceSavedTensors(
           torch,
           ordered,
         );
+
+        // Run backward functions
         await runBackwardFunctions(torch, ordered, gradMap, allUnpackedTensors);
-        disposeCheckpointTensors(ordered, allUnpackedTensors);
+
+        // Pre-compute leaf tensor set BEFORE disposeCheckpointTensors.
+        // disposeCheckpointTensors triggers _disposeAutogradChain which clears
+        // gradNodes on shared inputs, causing forward intermediates to falsely
+        // appear as leaf tensors (requiresGrad=true, _gradNode()=null).
+        const leafTensors = new Set<Tensor>();
+        const retainTensors = new Set<Tensor>();
+        for (const [tensor] of gradMap) {
+          if (tensor.requiresGrad && !tensor._gradNode()) {
+            leafTensors.add(tensor);
+          }
+          if (tensor.isRetainGrad) {
+            retainTensors.add(tensor);
+          }
+        }
+
+        // Dispose checkpoint-recomputed tensors no longer needed
+        disposeCheckpointTensors(ordered, allUnpackedTensors, leafTensors);
 
         // Force ALL final gradients in one merged plan.
         const allGrads = [...gradMap.values()].filter(
@@ -317,15 +354,13 @@ export async function backwardImpl(
         if (allGrads.length > 0) {
           await torch.runtime.forceAllMerged(...allGrads);
         }
+
         storageTracker.destroyUnreachable();
 
         // Store final gradients on leaf tensors and retained non-leaf tensors
         // Mark these tensors as "kept" so they survive async scope cleanup
         for (const [tensor, gradTensor] of gradMap) {
-          const isLeaf = tensor.requiresGrad && !tensor._gradNode();
-          const shouldRetain = tensor.isRetainGrad;
-
-          if (isLeaf || shouldRetain) {
+          if (leafTensors.has(tensor) || retainTensors.has(tensor)) {
             // Wrap and keep the gradient tensor before async scope exits
             const gradWrapper = torch._wrap(gradTensor, false);
             torch.keep(gradWrapper);
@@ -339,6 +374,8 @@ export async function backwardImpl(
     } finally {
       torch.runtime.popDispatchMode();
       tidyMode.disposeNonEscaped();
+      // Destroy storages made unreachable by tidy disposal
+      storageTracker.destroyUnreachable();
     }
   });
 }

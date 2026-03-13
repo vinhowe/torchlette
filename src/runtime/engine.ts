@@ -314,6 +314,10 @@ export class RuntimeEngine {
     return mode;
   }
 
+  hasDispatchMode(): boolean {
+    return this.dispatchModes.length > 0;
+  }
+
   markEscaped(tensor: Tensor): void {
     for (const mode of this.dispatchModes) {
       mode.onTensorEscaped?.(tensor);
@@ -774,14 +778,16 @@ export class RuntimeEngine {
     // by prior force() calls but not in plan.nodes) for result cleanup.
     const skippedNodes = materializeRemaining(pendingTensors);
 
-    // Drop node.result/results references to allow GC of unclaimed intermediate storages.
+    // Drop node.result references to allow GC of unclaimed intermediate storages.
+    // Note: node.results is NOT cleared here — multi-output ops (e.g., adamStep)
+    // store side outputs (m/v) in node.results that the optimizer reads on the
+    // next step via _resolvePendingState(). Clearing results would make those
+    // storages unreachable (killing their WeakRef anchor) before they're consumed.
     for (const node of plan.nodes) {
       node.result = undefined;
-      node.results = undefined;
     }
     for (const node of skippedNodes) {
       node.result = undefined;
-      node.results = undefined;
     }
 
     // Destroy orphaned intermediates created during this plan execution.
