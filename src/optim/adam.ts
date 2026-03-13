@@ -193,6 +193,8 @@ export class Adam {
    */
   private _resolvePendingState(): void {
     const runtime = this.api._runtime();
+    let resolved = 0;
+    let missed = 0;
     for (let i = 0; i < this._pendingNodes.length; i++) {
       const node = this._pendingNodes[i];
       if (!node) continue;
@@ -202,6 +204,7 @@ export class Adam {
       const vStorage = node.results?.[2];
 
       if (mStorage && vStorage) {
+        resolved++;
         // Dispose old state
         if (this.expAvg[i]) this.expAvg[i]?.dispose();
         if (this.expAvgSq[i]) this.expAvgSq[i]?.dispose();
@@ -217,9 +220,12 @@ export class Adam {
           this.params[i].shape,
           this.device,
         );
+      } else {
+        missed++;
       }
       this._pendingNodes[i] = null;
     }
+    // resolved/missed counters available for debug if needed
   }
 
   step(): Tensor[] {

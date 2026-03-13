@@ -103,6 +103,9 @@ export class Torchlette {
   private _currentNodeLabel: string | null = null;
   /** Depth counter for noGrad context. When > 0, autograd recording is disabled. */
   private _noGradDepth = 0;
+  /** When true, _wrap skips markEscaped — used during checkpoint recomputation
+   *  so recomputed RuntimeTensors stay tracked (not escaped) in TidyDispatchMode. */
+  _inCheckpointRecompute = false;
   /** Hooks fired before each backward op */
   readonly _backwardDispatchHooks: Array<
     (info: { output: Tensor; inputs: Tensor[]; label?: string }) => void
@@ -1383,7 +1386,9 @@ export class Torchlette {
   // ============================================================================
 
   _wrap(inner: RuntimeTensor, requiresGrad = false): Tensor {
-    this.runtime.markEscaped(inner);
+    if (!this._inCheckpointRecompute) {
+      this.runtime.markEscaped(inner);
+    }
     const handle = this.engine.createTensor(inner.baseId);
     const tensor = new Tensor(this, inner, handle, { requiresGrad });
     if (this.inCompileRegion) {
