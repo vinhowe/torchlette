@@ -53,6 +53,12 @@ export interface DispatchCommand {
   gx: number;
   gy: number;
   gz: number;
+  /** Inline bind group cache — bypasses global sequence-indexed cache.
+   *  Needed because the normal path mixes cachedCreateBindGroup (advances
+   *  dispatchIndex) and profiledCreateBindGroup (doesn't), so the global
+   *  sequence counter is misaligned during compiled plan replay. */
+  cachedBindGroup?: GPUBindGroup;
+  cachedBuffers?: GPUBuffer[];
 }
 
 export interface CopyCommand {
@@ -457,8 +463,8 @@ export function recordBarrier(): void {
 
 import type { Backend, BackendTensor } from "../backend/types";
 import {
-  cachedCreateBindGroup,
   createParamsBuffer,
+  profiledCreateBindGroup,
 } from "../backend/webgpu/bind-group-cache";
 import {
   allocateOutputBuffer,
@@ -566,7 +572,39 @@ export async function executeCompiledPlan(
           for (let j = 0; j < cmd.bindings.length; j++) {
             bufs[j] = slots[cmd.bindings[j]];
           }
-          const bg = cachedCreateBindGroup(device, cmd.pipeline, bufs);
+          // Inline bind group cache — bypasses global sequence-indexed cache.
+          // The normal path mixes cachedCreateBindGroup (advances dispatchIndex)
+          // and profiledCreateBindGroup (doesn't), so the global sequence counter
+          // is misaligned during compiled plan replay.
+          let bg = cmd.cachedBindGroup;
+          if (bg && cmd.cachedBuffers) {
+            // Validate cached bind group: pipeline is fixed, check buffers
+            let match = cmd.cachedBuffers.length === bufs.length;
+            if (match) {
+              for (let j = 0; j < bufs.length; j++) {
+                if (cmd.cachedBuffers[j] !== bufs[j]) {
+                  match = false;
+                  break;
+                }
+              }
+            }
+            if (!match) bg = undefined;
+          }
+          if (!bg) {
+            const entries: Array<{
+              binding: number;
+              resource: { buffer: GPUBuffer };
+            }> = [];
+            for (let j = 0; j < bufs.length; j++) {
+              entries.push({ binding: j, resource: { buffer: bufs[j] } });
+            }
+            bg = profiledCreateBindGroup(device, {
+              layout: cmd.pipeline.getBindGroupLayout(0),
+              entries,
+            });
+            cmd.cachedBindGroup = bg;
+            cmd.cachedBuffers = bufs.slice();
+          }
           dispatchComputePass(cmd.pipeline, bg, cmd.gx, cmd.gy, cmd.gz);
           break;
         }
