@@ -231,10 +231,10 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       expect(config.tileK).toBe(16);
     });
 
-    it("square_medium epilogue uses 32x32x16 config", () => {
+    it("square_medium epilogue uses 64x64x16 config", () => {
       const config = getDefaultConfigForShape("square_medium", true);
-      expect(config.tileM).toBe(32);
-      expect(config.tileN).toBe(32);
+      expect(config.tileM).toBe(64);
+      expect(config.tileN).toBe(64);
       expect(config.tileK).toBe(16);
     });
 

@@ -15,11 +15,13 @@ export {
   destroyArena,
   donateBuffer,
   getArenaConflictDetected,
+  getArenaResolveIndex,
   getBufferSize,
   isArenaBuffer,
   resolveOutputBuffer,
   setActiveArena,
   setArenaExternalInputBuffers,
+  setArenaResolveIndexTo,
 } from "./buffer-arena";
 
 export {
