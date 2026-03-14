@@ -485,6 +485,16 @@ export function getArenaResolveStats(): {
   };
 }
 
+/** Get the current resolve-path output index within the active arena. */
+export function getArenaResolveIndex(): number {
+  return arenaLocal.resolveIndex;
+}
+
+/** Set the resolve-path output index to a specific value. */
+export function setArenaResolveIndexTo(value: number): void {
+  arenaLocal.resolveIndex = value;
+}
+
 export function resetArenaResolveStats(): void {
   arenaLocal.resolveHits = 0;
   arenaLocal.resolveAliased = 0;

@@ -61,12 +61,20 @@ function unregisterPendingTensor(nodeId: number, tensor: Tensor): void {
 export function materializePendingTensors(
   nodeId: number,
   storage: StorageHandle,
+  allResults?: StorageHandle[],
 ): void {
   const tensors = pendingTensorsByNodeId.get(nodeId);
   if (tensors) {
     for (const tensor of tensors) {
       if (!tensor.isMaterialized() && !tensor.disposed) {
-        tensor._materialize(storage);
+        // Multi-output: use the correct result based on outputIndex
+        const ref = tensor.lazyRef;
+        const outputIdx = ref.kind === "pending" ? (ref.outputIndex ?? 0) : 0;
+        const targetStorage =
+          outputIdx > 0 && allResults?.[outputIdx]
+            ? allResults[outputIdx]
+            : storage;
+        tensor._materialize(targetStorage);
       }
     }
     // Don't delete from map - tensors will unregister themselves

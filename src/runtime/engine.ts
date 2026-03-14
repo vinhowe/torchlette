@@ -564,7 +564,7 @@ export class RuntimeEngine {
       );
       for (const node of plan.nodes) {
         if (node.result) {
-          materialize(node.id, node.result);
+          materialize(node.id, node.result, node.results);
         }
       }
 
@@ -573,7 +573,12 @@ export class RuntimeEngine {
         if (!tensor.isMaterialized() && !tensor.disposed) {
           const lazyRef = tensor.lazyRef;
           if (lazyRef.kind === "pending" && lazyRef.node.result) {
-            tensor._materialize(lazyRef.node.result);
+            const oi = lazyRef.outputIndex ?? 0;
+            const storage =
+              oi > 0 && lazyRef.node.results?.[oi]
+                ? lazyRef.node.results[oi]
+                : lazyRef.node.result;
+            tensor._materialize(storage);
           }
         }
       }
@@ -690,7 +695,7 @@ export class RuntimeEngine {
     const { materializePendingTensors } = await import("./tensor");
     for (const node of plan.nodes) {
       if (node.result) {
-        materializePendingTensors(node.id, node.result);
+        materializePendingTensors(node.id, node.result, node.results);
       }
     }
 
@@ -771,7 +776,7 @@ export class RuntimeEngine {
     // Materialize all tensors pending on executed nodes
     for (const node of plan.nodes) {
       if (node.result) {
-        materialize(node.id, node.result);
+        materialize(node.id, node.result, node.results);
       }
     }
     // Materialize remaining tensors and collect skipped nodes (already executed
