@@ -350,10 +350,16 @@ function executeAdamStep(
       backendInputs[3],
       payload,
     );
-    const paramStorage = createStorageHandle(node.device, adamResult.param);
+    // Only m and v go into node.results — _resolvePendingState reads
+    // results[1] and results[2]. The param result is returned below and
+    // wrapped in an owning StorageHandle by executeNode (→ node.result).
+    // Creating a second owning StorageHandle here would cause a double-free
+    // when destroyUnreachableSince runs (paramStorage wouldn't be marked
+    // reachable, so it would release the buffer to the pool while
+    // node.result still references it).
     const mStorage = createStorageHandle(node.device, adamResult.m);
     const vStorage = createStorageHandle(node.device, adamResult.v);
-    node.results = [paramStorage, mStorage, vStorage];
+    node.results = [null as unknown as StorageHandle, mStorage, vStorage];
     // Keep m/v alive until optimizer reads them at next step
     storageTracker.markReachable(mStorage.id, node.results);
     storageTracker.markReachable(vStorage.id, node.results);
