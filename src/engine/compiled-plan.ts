@@ -16,6 +16,7 @@ import type {
   GPUBuffer,
   GPUComputePipeline,
 } from "../backend/webgpu/gpu-types";
+import { setCompilationRecording } from "../backend/webgpu/webgpu-state";
 
 // ============================================================================
 // Slot table
@@ -27,7 +28,12 @@ export type Slot = number;
 /** How a slot gets its buffer at execution time. */
 export type SlotSource =
   | { kind: "external"; planNodeIndex: number; inputIndex: number }
-  | { kind: "params"; seqIndex: number; data: Uint32Array }
+  | {
+      kind: "params";
+      seqIndex: number;
+      data: Uint32Array;
+      cachedBuffer?: GPUBuffer;
+    }
   | { kind: "arena" } // Populated by an alloc command during execution
   | { kind: "write" } // Populated by a write command during execution
   | { kind: "persistent"; buffer: GPUBuffer }; // Cached/singleton buffer (e.g. attention config)
@@ -123,6 +129,10 @@ export interface CompiledPlan {
   results: NodeResult[];
   /** Whether this compiled plan is valid for execution. */
   valid: boolean;
+  /** Sequence counter positions at the end of the normal-path recording execution.
+   *  Restored after compiled plan execution so subsequent non-compiled plans
+   *  see the correct global sequence counter positions. */
+  endCounters?: { dispatch: number; params: number; output: number };
 }
 
 // ============================================================================
@@ -346,6 +356,7 @@ export function startCompilationRecording(): {
   activeBufferToSlot = new Map();
   activeSlotSources = [];
   nextSlot = 0;
+  setCompilationRecording(true);
   return {
     commandLog: activeCommandLog,
     bufferToSlot: activeBufferToSlot,
@@ -359,6 +370,7 @@ export function stopCompilationRecording(): void {
   activeBufferToSlot = null;
   activeSlotSources = null;
   nextSlot = 0;
+  setCompilationRecording(false);
 }
 
 /** Check if compilation recording is active. */
@@ -463,8 +475,8 @@ export function recordBarrier(): void {
 
 import type { Backend, BackendTensor } from "../backend/types";
 import {
-  createParamsBuffer,
   profiledCreateBindGroup,
+  setDispatchSequenceCounters,
 } from "../backend/webgpu/bind-group-cache";
 import {
   allocateOutputBuffer,
@@ -476,7 +488,7 @@ import {
 } from "../backend/webgpu/buffer-arena";
 import { flushBufferPool } from "../backend/webgpu/buffer-pool";
 import { dispatchComputePass } from "../backend/webgpu/dispatch";
-import { gpuBuffer } from "../backend/webgpu/gpu-types";
+import { GPUBufferUsage, gpuBuffer } from "../backend/webgpu/gpu-types";
 import {
   beginSharedEncoder,
   endSharedEncoder,
@@ -484,7 +496,10 @@ import {
   getSharedEncoderInstance,
 } from "../backend/webgpu/shared-encoder";
 import { createTensor } from "../backend/webgpu/tensor";
-import { requireContext } from "../backend/webgpu/webgpu-state";
+import {
+  paramsBufferSizeClass,
+  requireContext,
+} from "../backend/webgpu/webgpu-state";
 import type { StorageHandle } from "./lazy-types";
 import { createStorageHandle } from "./node-factory";
 import { executeOpSync } from "./op-dispatch";
@@ -533,22 +548,25 @@ export async function executeCompiledPlan(
       // "arena", "write", and "params" slots are populated below
     }
 
-    // Phase 1b: Create params buffers in sequence order.
-    // createParamsBuffer uses a positional sequence cache — calling order must
-    // match the recording order (by seqIndex), not slot index order.
-    const paramsSlots: Array<{
-      slotIdx: number;
-      src: SlotSource & { kind: "params" };
-    }> = [];
+    // Phase 1b: Self-contained params buffers.
+    // The compiled plan owns its params GPUBuffers — created once, cached on the
+    // SlotSource, reused every step. Bypasses the global createParamsBuffer cache
+    // entirely, so paramsSeqIndex is never advanced by the compiled plan.
     for (let i = 0; i < compiled.slots.length; i++) {
       const src = compiled.slots[i];
       if (src.kind === "params") {
-        paramsSlots.push({ slotIdx: i, src });
+        if (src.cachedBuffer) {
+          slots[i] = src.cachedBuffer;
+        } else {
+          const buf = device.createBuffer({
+            size: paramsBufferSizeClass(src.data.byteLength),
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          });
+          device.queue.writeBuffer(buf, 0, src.data);
+          src.cachedBuffer = buf;
+          slots[i] = buf;
+        }
       }
-    }
-    paramsSlots.sort((a, b) => a.src.seqIndex - b.src.seqIndex);
-    for (const { slotIdx, src } of paramsSlots) {
-      slots[slotIdx] = createParamsBuffer(device, src.data);
     }
 
     // Phase 2: Execute GPU commands
@@ -649,6 +667,16 @@ export async function executeCompiledPlan(
           break;
         }
       }
+    }
+
+    // Restore global sequence counters to where the normal path would have
+    // left them. Subsequent non-compiled plans see correct counter positions.
+    if (compiled.endCounters) {
+      setDispatchSequenceCounters(
+        compiled.endCounters.dispatch,
+        compiled.endCounters.params,
+        compiled.endCounters.output,
+      );
     }
 
     // Phase 3: Harvest results — assign to plan nodes for downstream plans

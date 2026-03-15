@@ -21,6 +21,7 @@ import {
   setCurrentOpLabel,
 } from "../backend/webgpu";
 import { dispatchAdamStep } from "../backend/webgpu/adam-kernel";
+import { getDispatchSequenceCounters } from "../backend/webgpu/bind-group-cache";
 import { bufferPool } from "../backend/webgpu/buffer-pool";
 import { f16WeightCache } from "../backend/webgpu/gpu-context";
 import {
@@ -566,6 +567,11 @@ export async function executeLoweredPlan(
     options.bufferArena &&
     process.env.TORCHLETTE_COMPILED_PLAN !== "0"
   ) {
+    if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+      console.log(
+        `[exec] COMPILED nodes=${planNodes.length} cmds=${loweredPlan.compiledPlan.commands.length}`,
+      );
+    }
     const externalInputBuffers = collectExternalInputBuffers(planNodes);
     await executeCompiledPlan(
       loweredPlan.compiledPlan,
@@ -583,6 +589,12 @@ export async function executeLoweredPlan(
   // =========================================================================
   // NORMAL PATH (with optional compilation recording for compiled plan)
   // =========================================================================
+
+  if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+    console.log(
+      `[exec] NORMAL nodes=${planNodes.length} hasCompiledPlan=${!!loweredPlan.compiledPlan?.valid} hasArena=${!!options.bufferArena} arenaLen=${options.bufferArena?.resolve?.length ?? "n/a"}`,
+    );
+  }
 
   // Shared encoder scope
   if (useTopLevelSharedEncoder) beginSharedEncoder();
@@ -612,6 +624,9 @@ export async function executeLoweredPlan(
     typeof startCompilationRecording
   > | null = null;
   if (shouldCompile) {
+    if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+      console.log(`[exec] RECORDING nodes=${planNodes.length}`);
+    }
     compilationRecording = startCompilationRecording();
     // Pre-assign external input slots for inputs that are already materialized
     // (results from prior plan executions). Inputs produced within this plan
@@ -1101,8 +1116,18 @@ export async function executeLoweredPlan(
     // Build compiled plan from recording
     if (compilationRecording) {
       stopCompilationRecording();
-      // Collect node results for the compiled plan
+      // Collect node results for the compiled plan.
+      //
+      // The compiled plan is a dispatch-level replay: it can only reproduce results
+      // that were produced by GPU dispatches recorded during this execution. If a
+      // backend op returned a cached/pre-existing buffer (no dispatch), that buffer
+      // won't be in bufferToSlot and the compiled plan can't reproduce it.
+      //
+      // Backend ops must check isCompilationRecording() (from webgpu-state) and
+      // bypass optimization caches during recording. If any result still slips
+      // through, we invalidate the compiled plan rather than silently dropping it.
       const nodeResults: NodeResult[] = [];
+      const unrecordedNodes: string[] = [];
       for (let i = 0; i < planNodes.length; i++) {
         const node = planNodes[i];
         if (node.results && node.results.length > 0) {
@@ -1121,6 +1146,10 @@ export async function executeLoweredPlan(
                 dtype: bt.dtype,
                 offset: bt.offset,
               });
+            } else {
+              unrecordedNodes.push(
+                `node[${i}].results[${oi}] op=${node.op} shape=${JSON.stringify(node.shape)} dtype=${bt.dtype}`,
+              );
             }
           }
         } else if (node.result) {
@@ -1136,6 +1165,10 @@ export async function executeLoweredPlan(
               dtype: bt.dtype,
               offset: bt.offset,
             });
+          } else {
+            unrecordedNodes.push(
+              `node[${i}] op=${node.op} shape=${JSON.stringify(node.shape)} dtype=${bt.dtype}`,
+            );
           }
         }
       }
@@ -1147,7 +1180,20 @@ export async function executeLoweredPlan(
         slotSources: compilationRecording.slotSources,
         nodeResults,
       });
+      if (unrecordedNodes.length > 0) {
+        // A backend op returned a cached buffer that wasn't tracked during
+        // recording. The op needs to check isCompilationRecording() and bypass
+        // its cache. Log details so the developer knows exactly which op to fix.
+        console.warn(
+          `[compiled-plan] Invalidated: ${unrecordedNodes.length} node(s) have result buffers not tracked during recording.\n` +
+            `  This means a backend op returned a cached/pre-existing buffer instead of dispatching.\n` +
+            `  Fix: check isCompilationRecording() from webgpu-state and bypass the cache.\n` +
+            unrecordedNodes.map((s) => `  - ${s}`).join("\n"),
+        );
+        compiled.valid = false;
+      }
       if (compiled.valid && !getArenaConflictDetected()) {
+        compiled.endCounters = getDispatchSequenceCounters();
         loweredPlan.compiledPlan = compiled;
       }
       compilationRecording = null;

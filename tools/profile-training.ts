@@ -379,6 +379,9 @@ async function main() {
     if (step === 0) startPipelineRecording();
 
     if (scaler) await scaler.resolveDeferred();
+    if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+      console.log(`\n========== STEP ${step} ==========`);
+    }
     await api.beginStep();
     const input = api.tensorFromArray(inputData, [BATCH_SIZE, seqLen], {
       device: "webgpu",
