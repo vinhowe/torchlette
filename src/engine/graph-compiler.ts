@@ -31,6 +31,8 @@ import {
   type MatmulPrologueInfo,
 } from "./matmul-epilogue";
 import { detectReductionGroups, type ReductionGroup } from "./reduction-detect";
+import { detectRowPrograms } from "./row-program-detect";
+import type { RowProgramMatch } from "./row-program-types";
 
 // ============================================================================
 // Types
@@ -73,6 +75,9 @@ interface GraphAnalysisResult {
 
   /** Pre-computed matmul epilogue directives (matmulNodeId → full plan with prologues). */
   matmulDirectives: Map<number, MatmulEpiloguePlan>;
+
+  /** Detected row-program matches (multi-reduction → single kernel). */
+  rowProgramMatches: RowProgramMatch[];
 }
 
 // ============================================================================
@@ -396,17 +401,70 @@ export function analyzeGraph(
     }
   }
 
-  // --- Priority 80: Compound patterns (softmax, log_softmax) ---
-  const compoundMatches = detectCompoundPatterns(
-    reorderedNodes,
-    consumerCount,
-    consumers,
-    externalNodeIds,
-  );
+  // --- Priority 80/70: Compound patterns OR row-program fusion ---
+  // Row-program detection subsumes compound patterns (softmax/log_softmax).
+  // When row programs are active, skip compound detection.
+  const rowProgramDisabled =
+    typeof process !== "undefined" &&
+    process.env?.TORCHLETTE_ROW_PROGRAM === "0";
+
+  let compoundMatches: CompoundMatch[] = [];
   const compoundClaimedIds = new Set<number>();
-  for (const match of compoundMatches) {
-    for (const id of match.coveredNodeIds) {
-      compoundClaimedIds.add(id);
+  let rowProgramMatches: RowProgramMatch[] = [];
+  const rowProgramClaimedIds = new Set<number>();
+
+  if (rowProgramDisabled) {
+    // Fallback: use compound patterns (priority 80)
+    compoundMatches = detectCompoundPatterns(
+      reorderedNodes,
+      consumerCount,
+      consumers,
+      externalNodeIds,
+    );
+    for (const match of compoundMatches) {
+      for (const id of match.coveredNodeIds) {
+        compoundClaimedIds.add(id);
+      }
+    }
+  } else {
+    // Row-program detection (priority 70)
+    rowProgramMatches = detectRowPrograms(
+      reorderedNodes,
+      consumerCount,
+      consumers,
+      externalNodeIds,
+      new Set([...epilogueClaimedIds, ...prologueClaimedIds]),
+    );
+    for (const match of rowProgramMatches) {
+      for (const id of match.coveredNodeIds) {
+        rowProgramClaimedIds.add(id);
+      }
+    }
+
+    // If no row programs found, fall back to compound patterns
+    if (rowProgramMatches.length > 0 && process.env.TORCHLETTE_DEBUG_COMPILED) {
+      console.log(
+        `[row-program] Detected ${rowProgramMatches.length} row program(s): ` +
+          rowProgramMatches
+            .map(
+              (m) =>
+                `${m.coveredNodeIds.length} nodes, ${m.program.phases.length} phases, key=${m.program.cacheKey}`,
+            )
+            .join("; "),
+      );
+    }
+    if (rowProgramMatches.length === 0) {
+      compoundMatches = detectCompoundPatterns(
+        reorderedNodes,
+        consumerCount,
+        consumers,
+        externalNodeIds,
+      );
+      for (const match of compoundMatches) {
+        for (const id of match.coveredNodeIds) {
+          compoundClaimedIds.add(id);
+        }
+      }
     }
   }
 
@@ -418,7 +476,11 @@ export function analyzeGraph(
     detectReductionGroups(
       reorderedNodes,
       consumerCount,
-      new Set([...epilogueClaimedIds, ...compoundClaimedIds]),
+      new Set([
+        ...epilogueClaimedIds,
+        ...compoundClaimedIds,
+        ...rowProgramClaimedIds,
+      ]),
       externalNodeIds,
     );
 
@@ -429,6 +491,7 @@ export function analyzeGraph(
     epilogueClaimedIds.size > 0 ||
     prologueClaimedIds.size > 0 ||
     compoundClaimedIds.size > 0 ||
+    rowProgramClaimedIds.size > 0 ||
     reductionClaimedIds.size > 0 ||
     rewriteBypassedIds.size > 0
   ) {
@@ -436,6 +499,7 @@ export function analyzeGraph(
       ...epilogueClaimedIds,
       ...prologueClaimedIds,
       ...compoundClaimedIds,
+      ...rowProgramClaimedIds,
       ...reductionClaimedIds,
       ...rewriteBypassedIds,
     ]);
@@ -460,6 +524,7 @@ export function analyzeGraph(
     rewriteBypassedIds,
     reductionGroups,
     matmulDirectives,
+    rowProgramMatches,
   };
 }
 

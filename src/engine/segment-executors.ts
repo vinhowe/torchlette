@@ -14,7 +14,7 @@ import {
 import { contiguousStrides, sizeOf } from "../core/shape";
 import { executeNode } from "./executor-sequential";
 import type { FusionGroup, groupToRecipe } from "./fusion-detect";
-import type { LazyIRNode, StorageHandle } from "./lazy-types";
+import type { LazyIRNode, LazyRef, StorageHandle } from "./lazy-types";
 import {
   _webgpuMatmulImports,
   createStorageHandle,
@@ -27,6 +27,7 @@ import {
   setProfileModule,
 } from "./profiler";
 import type { ReductionGroup } from "./reduction-detect";
+import type { RowProgram } from "./row-program-types";
 
 /**
  * Execute a compound softmax/log_softmax pattern as a single fused kernel.
@@ -449,5 +450,79 @@ export async function executeReductionSegment(
       group.outputNode.device,
       resultTensor,
     );
+  }
+}
+
+// ============================================================================
+// Row-Program Execution
+// ============================================================================
+
+/**
+ * Execute a row-program fusion: multi-reduction subgraph → single perRowKernel.
+ * Falls back to sequential execution on CPU or if dispatch fails.
+ */
+export async function executeRowProgram(
+  program: RowProgram,
+  inputRefs: LazyRef[],
+  outputNode: LazyIRNode,
+  dim: number,
+  coveredNodes: LazyIRNode[],
+  backend: Backend,
+): Promise<void> {
+  // CPU fallback
+  if (outputNode.device === "cpu") {
+    for (const node of coveredNodes) {
+      if (!node.result) await executeNode(node, backend);
+    }
+    return;
+  }
+
+  try {
+    const { dispatchRowProgram } = await import(
+      "../backend/webgpu/row-program-dispatch"
+    );
+
+    // Resolve input buffers from inputRefs
+    const inputBuffers: GPUBuffer[] = [];
+    for (const ref of inputRefs) {
+      const storage = getInputStorage(ref, backend);
+      const tensor = asGPUTensor(storage.backendTensor);
+      inputBuffers.push(tensor.buffer);
+    }
+
+    // Compute row/dim geometry from the output node
+    const shape = outputNode.shape;
+    const normDim = dim < 0 ? shape.length + dim : dim;
+    const dimSize = shape[normDim];
+    let numRows = 1;
+    for (let d = 0; d < normDim; d++) numRows *= shape[d];
+    // Include dims after the reduction dim (for keepdim cases)
+    for (let d = normDim + 1; d < shape.length; d++) numRows *= shape[d];
+
+    setCurrentOpLabel("row-program");
+    const outBuffer = dispatchRowProgram(
+      program,
+      inputBuffers,
+      numRows,
+      dimSize,
+    );
+
+    outputNode.result = createStorageHandle(outputNode.device, {
+      buffer: outBuffer,
+      shape: shape.slice(),
+      dtype: program.output.dtype,
+      size: sizeOf(shape),
+      strides: contiguousStrides(shape),
+      offset: 0,
+      isContiguous: true,
+      ownsBuffer: true,
+    } as unknown as BackendTensor);
+  } catch (e) {
+    console.warn("Row-program dispatch failed, falling back to sequential:", e);
+    for (const node of coveredNodes) {
+      if (!node.result) await executeNode(node, backend);
+    }
+  } finally {
+    setCurrentOpLabel(null);
   }
 }

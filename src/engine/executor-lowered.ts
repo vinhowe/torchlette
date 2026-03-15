@@ -86,6 +86,7 @@ import {
   executeCompoundSoftmax,
   executeFusedSegment,
   executeReductionSegment,
+  executeRowProgram,
 } from "./segment-executors";
 import { storageTracker } from "./storage-tracker";
 
@@ -1097,6 +1098,18 @@ export async function executeLoweredPlan(
             compOutNode,
             action.dim,
             action.name,
+            backend,
+          );
+          break;
+        }
+
+        case "row-program": {
+          await executeRowProgram(
+            action.program,
+            action.inputRefs,
+            planNodes[action.outputNodeIndex],
+            action.dim,
+            planNodes.filter((_n, i) => action.coveredNodeIndices.includes(i)),
             backend,
           );
           break;
