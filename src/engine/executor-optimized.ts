@@ -360,6 +360,7 @@ export async function executePlanOptimized(
       nodeIdToFinalPos: finalIdToPos,
       prologueClaimedIds: analysis.prologueClaimedIds,
       compoundMatches: analysis.compoundMatches,
+      rowProgramMatches: analysis.rowProgramMatches,
       matmulDirectives: analysis.matmulDirectives,
       enableVectorization,
     });

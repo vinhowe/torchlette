@@ -223,6 +223,21 @@ interface LoweredCompoundAction {
   dim: number;
 }
 
+/** A row-program fusion: multi-reduction + elementwise → single perRowKernel. */
+interface LoweredRowProgramAction {
+  kind: "row-program";
+  /** Plan-node indices consumed by this row program. */
+  coveredNodeIndices: number[];
+  /** Index of the final output node. */
+  outputNodeIndex: number;
+  /** Reduction dimension (normalized, last dim). */
+  dim: number;
+  /** The RowProgram specification (structural, reusable across steps). */
+  program: RowProgram;
+  /** External input refs for resolving buffers at execution time. */
+  inputRefs: LazyRef[];
+}
+
 /** Union of all lowered action types. */
 type LoweredAction =
   | LoweredFusedAction
@@ -233,7 +248,8 @@ type LoweredAction =
   | LoweredReductionFusionAction
   | LoweredAdamBatchAction
   | LoweredReclaimAction
-  | LoweredCompoundAction;
+  | LoweredCompoundAction
+  | LoweredRowProgramAction;
 
 // ============================================================================
 // Lowered Plan
@@ -302,9 +318,10 @@ export function isViewOp(op: string): boolean {
 
 import type { CompoundMatch } from "./compound-patterns";
 import type { ExecutionSegment } from "./fusion-detect";
-import type { LazyIRNode } from "./lazy-types";
+import type { LazyIRNode, LazyRef } from "./lazy-types";
 import type { MatmulEpiloguePlan } from "./matmul-epilogue";
 import type { ReductionGroup } from "./reduction-detect";
+import type { RowProgram, RowProgramMatch } from "./row-program-types";
 
 /** Default reclaim interval, overridable via TORCHLETTE_RECLAIM_INTERVAL env var. */
 export const DEFAULT_RECLAIM_INTERVAL =
@@ -318,6 +335,7 @@ interface BuildFromAnalysisInput {
   nodeIdToFinalPos: Map<number, number>;
   prologueClaimedIds: Set<number>;
   compoundMatches: CompoundMatch[];
+  rowProgramMatches: RowProgramMatch[];
   matmulDirectives: Map<number, MatmulEpiloguePlan>;
   enableVectorization: boolean;
   reclaimInterval?: number;
@@ -341,6 +359,7 @@ export function buildLoweredPlanFromAnalysis(
     nodeIdToFinalPos,
     prologueClaimedIds,
     compoundMatches,
+    rowProgramMatches,
     matmulDirectives,
     enableVectorization,
     reclaimInterval = DEFAULT_RECLAIM_INTERVAL,
@@ -396,6 +415,37 @@ export function buildLoweredPlanFromAnalysis(
     }
   }
 
+  // Build row-program match map (same structure as compound matches)
+  let rowProgramMatchMap:
+    | Map<
+        number,
+        {
+          match: RowProgramMatch;
+          isFirst: boolean;
+        }
+      >
+    | undefined;
+  if (rowProgramMatches.length > 0) {
+    rowProgramMatchMap = new Map();
+    for (const match of rowProgramMatches) {
+      let firstPos = Infinity;
+      let firstId = match.coveredNodeIds[0];
+      for (const id of match.coveredNodeIds) {
+        const pos = nodeIdToFinalPos.get(id) ?? Infinity;
+        if (pos < firstPos) {
+          firstPos = pos;
+          firstId = id;
+        }
+      }
+      for (const id of match.coveredNodeIds) {
+        rowProgramMatchMap.set(id, {
+          match,
+          isFirst: id === firstId,
+        });
+      }
+    }
+  }
+
   for (const segment of segments) {
     if (segment.kind === "reduction") {
       const nodeCount = segment.group.nodes.length;
@@ -415,6 +465,7 @@ export function buildLoweredPlanFromAnalysis(
         nodeIdToFinalPos,
         prologueClaimedIds,
         compoundMatchMap,
+        rowProgramMatchMap,
         matmulDirectives,
         maybeReclaim,
       );
@@ -515,6 +566,9 @@ function emitSequentialActions(
         }
       >
     | undefined,
+  rowProgramMatchMap:
+    | Map<number, { match: RowProgramMatch; isFirst: boolean }>
+    | undefined,
   matmulDirectives: Map<number, MatmulEpiloguePlan>,
   maybeReclaim: (count: number) => void,
 ): void {
@@ -531,6 +585,32 @@ function emitSequentialActions(
         nodeIndex: posMap.get(node.id) as number,
       });
       maybeReclaim(1);
+      continue;
+    }
+
+    // Row-program fusion (multi-reduction → single perRowKernel)
+    if (rowProgramMatchMap?.has(node.id)) {
+      const entry = rowProgramMatchMap.get(node.id)!;
+      if (!entry.isFirst) {
+        // Intermediate node — skip (covered by the row-program action)
+        actions.push({
+          kind: "prologue-skip",
+          nodeIndex: posMap.get(node.id) as number,
+        });
+        continue;
+      }
+      const m = entry.match;
+      actions.push({
+        kind: "row-program",
+        coveredNodeIndices: m.coveredNodeIds.map(
+          (id) => posMap.get(id) as number,
+        ),
+        outputNodeIndex: posMap.get(m.outputNodeId) as number,
+        dim: m.dim,
+        program: m.program,
+        inputRefs: m.inputRefs,
+      });
+      maybeReclaim(m.coveredNodeIds.length);
       continue;
     }
 
