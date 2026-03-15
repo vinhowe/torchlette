@@ -83,7 +83,6 @@ import { profileOpBegin, profileOpEnd, setProfileModule } from "./profiler";
 import type { ReductionGroup } from "./reduction-detect";
 import {
   ensureFusionImports,
-  executeCompoundSoftmax,
   executeFusedSegment,
   executeReductionSegment,
   executeRowProgram,
@@ -1087,19 +1086,6 @@ export async function executeLoweredPlan(
         case "prologue-skip": {
           // Prologue-claimed cast nodes are skipped — their work is absorbed
           // into the matmul tile load.
-          break;
-        }
-
-        case "compound": {
-          const compOutNode = planNodes[action.outputNodeIndex];
-          const firstCoveredNode = planNodes[action.coveredNodeIndices[0]];
-          await executeCompoundSoftmax(
-            firstCoveredNode,
-            compOutNode,
-            action.dim,
-            action.name,
-            backend,
-          );
           break;
         }
 

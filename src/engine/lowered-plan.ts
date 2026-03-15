@@ -3,7 +3,7 @@
  *
  * A cached sequence of typed actions derived from graph analysis. On the first
  * execution with a given structural fingerprint, the lowered plan is built from
- * segments, matmul directives, compound patterns, etc. On subsequent steps it
+ * segments, matmul directives, row programs, etc. On subsequent steps it
  * is re-executed directly, skipping all analysis. A compiled plan (flat GPU
  * command sequence) is built after the second execution for even faster replay.
  *
@@ -210,19 +210,6 @@ interface LoweredReclaimAction {
   kind: "reclaim";
 }
 
-/** A compound pattern (softmax, log_softmax) replacing multiple decomposed ops. */
-interface LoweredCompoundAction {
-  kind: "compound";
-  /** Pattern name (e.g. "softmax", "log_softmax"). */
-  name: string;
-  /** Plan-node indices consumed by this pattern. */
-  coveredNodeIndices: number[];
-  /** Index of the final output node. */
-  outputNodeIndex: number;
-  /** Reduction dimension. */
-  dim: number;
-}
-
 /** A row-program fusion: multi-reduction + elementwise → single perRowKernel. */
 interface LoweredRowProgramAction {
   kind: "row-program";
@@ -248,7 +235,6 @@ type LoweredAction =
   | LoweredReductionFusionAction
   | LoweredAdamBatchAction
   | LoweredReclaimAction
-  | LoweredCompoundAction
   | LoweredRowProgramAction;
 
 // ============================================================================
@@ -319,7 +305,6 @@ export function isViewOp(op: string): boolean {
 // Analysis-Driven Lowered Plan Builder
 // ============================================================================
 
-import type { CompoundMatch } from "./compound-patterns";
 import type { ExecutionSegment } from "./fusion-detect";
 import type { LazyIRNode, LazyRef } from "./lazy-types";
 import type { MatmulEpiloguePlan } from "./matmul-epilogue";
@@ -337,7 +322,6 @@ interface BuildFromAnalysisInput {
   planNodes: LazyIRNode[];
   nodeIdToFinalPos: Map<number, number>;
   prologueClaimedIds: Set<number>;
-  compoundMatches: CompoundMatch[];
   rowProgramMatches: RowProgramMatch[];
   matmulDirectives: Map<number, MatmulEpiloguePlan>;
   enableVectorization: boolean;
@@ -348,7 +332,7 @@ interface BuildFromAnalysisInput {
  * Build a LoweredPlan purely from graph analysis results — no execution needed.
  * This is the sole path for building lowered plans. The action sequence is
  * derived entirely from the graph analysis (segments, matmul directives,
- * compound patterns, etc.) without executing any ops.
+ * row programs, etc.) without executing any ops.
  *
  * Reclaim actions are inserted every `reclaimInterval` nodes to flush the
  * shared encoder and buffer pool periodically.
@@ -361,7 +345,6 @@ export function buildLoweredPlanFromAnalysis(
     planNodes,
     nodeIdToFinalPos,
     prologueClaimedIds,
-    compoundMatches,
     rowProgramMatches,
     matmulDirectives,
     enableVectorization,
@@ -379,44 +362,6 @@ export function buildLoweredPlanFromAnalysis(
       nodesSinceReclaim = 0;
     }
   };
-
-  // Build compound match map
-  let compoundMatchMap:
-    | Map<
-        number,
-        {
-          name: string;
-          coveredNodeIds: Set<number>;
-          outputNodeId: number;
-          dim: number;
-        }
-      >
-    | undefined;
-  if (compoundMatches.length > 0) {
-    compoundMatchMap = new Map();
-    for (const match of compoundMatches) {
-      let firstPos = Infinity;
-      let firstId = match.coveredNodeIds[0];
-      for (const id of match.coveredNodeIds) {
-        const pos = nodeIdToFinalPos.get(id) ?? Infinity;
-        if (pos < firstPos) {
-          firstPos = pos;
-          firstId = id;
-        }
-      }
-      const coveredSet = new Set(match.coveredNodeIds);
-      const desc = {
-        name: match.name,
-        coveredNodeIds: coveredSet,
-        outputNodeId: match.outputNodeId,
-        dim: match.dim,
-      };
-      compoundMatchMap.set(firstId, desc);
-      for (const id of match.coveredNodeIds) {
-        if (id !== firstId) compoundMatchMap.set(id, { ...desc, name: "" });
-      }
-    }
-  }
 
   // Build row-program match map (same structure as compound matches)
   let rowProgramMatchMap:
@@ -467,7 +412,6 @@ export function buildLoweredPlanFromAnalysis(
         seqNodes,
         nodeIdToFinalPos,
         prologueClaimedIds,
-        compoundMatchMap,
         rowProgramMatchMap,
         matmulDirectives,
         maybeReclaim,
@@ -558,17 +502,6 @@ function emitSequentialActions(
   nodes: LazyIRNode[],
   posMap: Map<number, number>,
   prologueSkipIds: Set<number>,
-  compoundMatchMap:
-    | Map<
-        number,
-        {
-          name: string;
-          coveredNodeIds: Set<number>;
-          outputNodeId: number;
-          dim: number;
-        }
-      >
-    | undefined,
   rowProgramMatchMap:
     | Map<number, { match: RowProgramMatch; isFirst: boolean }>
     | undefined,
@@ -614,35 +547,6 @@ function emitSequentialActions(
         inputRefs: m.inputRefs,
       });
       maybeReclaim(m.coveredNodeIds.length);
-      continue;
-    }
-
-    // Compound patterns (softmax, log_softmax)
-    if (compoundMatchMap?.has(node.id)) {
-      const match = compoundMatchMap.get(node.id)!;
-      if (match.name === "") {
-        // Intermediate covered node — skip
-        actions.push({
-          kind: "prologue-skip",
-          nodeIndex: posMap.get(node.id) as number,
-        });
-        continue;
-      }
-
-      const coveredCount = match.coveredNodeIds.size;
-      const coveredPoss: number[] = [];
-      for (let c = 0; c < coveredCount; c++) {
-        coveredPoss.push(posMap.get(nodes[nodeIdx + c].id) as number);
-      }
-      actions.push({
-        kind: "compound",
-        name: match.name,
-        coveredNodeIndices: coveredPoss,
-        outputNodeIndex: posMap.get(match.outputNodeId) as number,
-        dim: match.dim,
-      });
-      maybeReclaim(coveredCount);
-      nodeIdx += coveredCount - 1;
       continue;
     }
 

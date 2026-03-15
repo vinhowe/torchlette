@@ -15,8 +15,6 @@
  */
 
 import type { DType } from "../backend/types";
-import type { CompoundMatch } from "./compound-patterns";
-import { detectCompoundPatterns } from "./compound-patterns";
 import {
   type ExecutionSegment,
   isFusibleOp,
@@ -52,17 +50,11 @@ interface GraphAnalysisResult {
   /** Node IDs claimed by matmul prologues (absorbed casts). */
   prologueClaimedIds: Set<number>;
 
-  /** Node IDs claimed by compound patterns (softmax, etc.). */
-  compoundClaimedIds: Set<number>;
-
   /** Matmul ID → epilogue chain node IDs. */
   matmulEpilogueChains: Map<number, number[]>;
 
   /** Matmul ID → prologue info array. */
   matmulPrologues: Map<number, MatmulPrologueInfo[]>;
-
-  /** Detected compound pattern matches. */
-  compoundMatches: CompoundMatch[];
 
   /** Consumer count map (nodeId → number of consumers in the plan). */
   consumerCount: Map<number, number>;
@@ -401,70 +393,18 @@ export function analyzeGraph(
     }
   }
 
-  // --- Priority 80/70: Compound patterns OR row-program fusion ---
-  // Row-program detection subsumes compound patterns (softmax/log_softmax).
-  // When row programs are active, skip compound detection.
-  const rowProgramDisabled =
-    typeof process !== "undefined" &&
-    process.env?.TORCHLETTE_ROW_PROGRAM === "0";
-
-  let compoundMatches: CompoundMatch[] = [];
-  const compoundClaimedIds = new Set<number>();
-  let rowProgramMatches: RowProgramMatch[] = [];
+  // --- Priority 70: Row-program fusion (multi-reduction → single kernel) ---
+  const rowProgramMatches = detectRowPrograms(
+    reorderedNodes,
+    consumerCount,
+    consumers,
+    externalNodeIds,
+    new Set([...epilogueClaimedIds, ...prologueClaimedIds]),
+  );
   const rowProgramClaimedIds = new Set<number>();
-
-  if (rowProgramDisabled) {
-    // Fallback: use compound patterns (priority 80)
-    compoundMatches = detectCompoundPatterns(
-      reorderedNodes,
-      consumerCount,
-      consumers,
-      externalNodeIds,
-    );
-    for (const match of compoundMatches) {
-      for (const id of match.coveredNodeIds) {
-        compoundClaimedIds.add(id);
-      }
-    }
-  } else {
-    // Row-program detection (priority 70)
-    rowProgramMatches = detectRowPrograms(
-      reorderedNodes,
-      consumerCount,
-      consumers,
-      externalNodeIds,
-      new Set([...epilogueClaimedIds, ...prologueClaimedIds]),
-    );
-    for (const match of rowProgramMatches) {
-      for (const id of match.coveredNodeIds) {
-        rowProgramClaimedIds.add(id);
-      }
-    }
-
-    // If no row programs found, fall back to compound patterns
-    if (rowProgramMatches.length > 0 && process.env.TORCHLETTE_DEBUG_COMPILED) {
-      console.log(
-        `[row-program] Detected ${rowProgramMatches.length} row program(s): ` +
-          rowProgramMatches
-            .map(
-              (m) =>
-                `${m.coveredNodeIds.length} nodes, ${m.program.phases.length} phases, key=${m.program.cacheKey}`,
-            )
-            .join("; "),
-      );
-    }
-    if (rowProgramMatches.length === 0) {
-      compoundMatches = detectCompoundPatterns(
-        reorderedNodes,
-        consumerCount,
-        consumers,
-        externalNodeIds,
-      );
-      for (const match of compoundMatches) {
-        for (const id of match.coveredNodeIds) {
-          compoundClaimedIds.add(id);
-        }
-      }
+  for (const match of rowProgramMatches) {
+    for (const id of match.coveredNodeIds) {
+      rowProgramClaimedIds.add(id);
     }
   }
 
@@ -476,11 +416,7 @@ export function analyzeGraph(
     detectReductionGroups(
       reorderedNodes,
       consumerCount,
-      new Set([
-        ...epilogueClaimedIds,
-        ...compoundClaimedIds,
-        ...rowProgramClaimedIds,
-      ]),
+      new Set([...epilogueClaimedIds, ...rowProgramClaimedIds]),
       externalNodeIds,
     );
 
@@ -490,7 +426,6 @@ export function analyzeGraph(
   if (
     epilogueClaimedIds.size > 0 ||
     prologueClaimedIds.size > 0 ||
-    compoundClaimedIds.size > 0 ||
     rowProgramClaimedIds.size > 0 ||
     reductionClaimedIds.size > 0 ||
     rewriteBypassedIds.size > 0
@@ -498,7 +433,6 @@ export function analyzeGraph(
     allClaimedIds = new Set([
       ...epilogueClaimedIds,
       ...prologueClaimedIds,
-      ...compoundClaimedIds,
       ...rowProgramClaimedIds,
       ...reductionClaimedIds,
       ...rewriteBypassedIds,
@@ -516,10 +450,8 @@ export function analyzeGraph(
     segments,
     epilogueClaimedIds,
     prologueClaimedIds,
-    compoundClaimedIds,
     matmulEpilogueChains,
     matmulPrologues,
-    compoundMatches,
     consumerCount,
     rewriteBypassedIds,
     reductionGroups,

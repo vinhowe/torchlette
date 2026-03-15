@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { LazyIRNode, LazyRef } from "../src/engine/lazy-types";
 import { detectRowPrograms } from "../src/engine/row-program-detect";
 
@@ -181,5 +181,156 @@ describe("row-program-detect", () => {
     expect(program.phases[program.phases.length - 1].kind).toBe("write");
     expect(program.inputs.length).toBe(1);
     expect(matches[0].outputNodeId).toBe(mulOut.id);
+  });
+});
+
+// ============================================================================
+// GPU Dispatch Tests — verify row-program kernels produce correct output
+// ============================================================================
+
+import { tensorFromArrayWithDtype, webgpuBackend } from "../src/backend/webgpu";
+import type { WebGPUTensor } from "../src/backend/webgpu/gpu-types";
+import { asGPUTensor } from "../src/backend/webgpu/gpu-types";
+import { dispatchRowProgram } from "../src/backend/webgpu/row-program-dispatch";
+import type { RowProgram } from "../src/engine/row-program-types";
+import { canUseWebGPU } from "./helpers/webgpu";
+
+/** Read f32 data from a GPU buffer. */
+async function readGPUBuffer(
+  buffer: {
+    getMappedRange?: () => ArrayBuffer;
+    mapAsync?: (mode: number) => Promise<void>;
+    size: number;
+  },
+  device: any,
+): Promise<Float32Array> {
+  // Use staging buffer for readback
+  const staging = device.createBuffer({
+    size: buffer.size,
+    usage: 0x0001 | 0x0008, // MAP_READ | COPY_DST
+  });
+  const encoder = device.createCommandEncoder();
+  encoder.copyBufferToBuffer(buffer as any, 0, staging, 0, buffer.size);
+  device.queue.submit([encoder.finish()]);
+  await staging.mapAsync(1); // MAP_READ
+  const data = new Float32Array(staging.getMappedRange().slice(0));
+  staging.unmap();
+  staging.destroy();
+  return data;
+}
+
+describe("row-program GPU dispatch", { timeout: 60000 }, () => {
+  let webgpuAvailable = false;
+
+  beforeAll(async () => {
+    const mod = await import("./helpers/webgpu");
+    webgpuAvailable = await mod.canUseWebGPU();
+  });
+
+  it("softmax row-program produces correct output", async () => {
+    if (!webgpuAvailable) return;
+
+    // Input: 3 rows of 4 elements
+    const input = tensorFromArrayWithDtype(
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+      [3, 4],
+      "f32",
+    );
+    const inputT = asGPUTensor(input);
+
+    // Build a softmax RowProgram manually:
+    // Phase 0: reduce max over input
+    // Phase 1: reduce sum over exp(input - max)
+    // Phase 2: write exp(input - max) / sum
+    const program: RowProgram = {
+      inputs: [{ dtype: "f32" }],
+      output: { dtype: "f32" },
+      dim: 1,
+      phases: [
+        {
+          kind: "reduce",
+          reduceOp: "max",
+          bodyExpr: { kind: "input", bufferIndex: 0 },
+        },
+        {
+          kind: "reduce",
+          reduceOp: "sum",
+          bodyExpr: {
+            op: "exp",
+            inputs: [
+              {
+                op: "sub",
+                inputs: [
+                  { kind: "input", bufferIndex: 0 },
+                  { kind: "reduceResult", phaseIndex: 0 },
+                ],
+              },
+            ],
+          },
+        },
+        {
+          kind: "write",
+          bodyExpr: {
+            op: "div",
+            inputs: [
+              {
+                op: "exp",
+                inputs: [
+                  {
+                    op: "sub",
+                    inputs: [
+                      { kind: "input", bufferIndex: 0 },
+                      { kind: "reduceResult", phaseIndex: 0 },
+                    ],
+                  },
+                ],
+              },
+              { kind: "reduceResult", phaseIndex: 1 },
+            ],
+          },
+        },
+      ],
+      cacheKey: "test_softmax_3x4",
+    };
+
+    const outBuffer = dispatchRowProgram(
+      program,
+      [inputT.buffer],
+      3, // numRows
+      4, // dimSize
+    );
+
+    // Read back and verify
+    const { requireContext } = await import(
+      "../src/backend/webgpu/webgpu-state"
+    );
+    const ctx = requireContext();
+    // Flush the shared encoder so compute passes are submitted
+    const { flushSharedEncoder } = await import(
+      "../src/backend/webgpu/shared-encoder"
+    );
+    flushSharedEncoder();
+
+    const result = await readGPUBuffer(outBuffer, ctx.device);
+
+    // Compute expected softmax in JS
+    const inputData = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    for (let row = 0; row < 3; row++) {
+      const rowData = inputData.slice(row * 4, (row + 1) * 4);
+      const maxVal = Math.max(...rowData);
+      const exps = rowData.map((x) => Math.exp(x - maxVal));
+      const sumExp = exps.reduce((a, b) => a + b, 0);
+      const expected = exps.map((e) => e / sumExp);
+
+      let rowSum = 0;
+      for (let col = 0; col < 4; col++) {
+        const got = result[row * 4 + col];
+        const exp = expected[col];
+        rowSum += got;
+        expect(got).toBeCloseTo(exp, 4);
+      }
+      // Each row should sum to ~1.0
+      expect(rowSum).toBeCloseTo(1.0, 4);
+    }
   });
 });

@@ -1,4 +1,3 @@
-import { getBackend } from "../backend/registry";
 import type {
   Backend,
   BackendTensor,
@@ -28,49 +27,6 @@ import {
 } from "./profiler";
 import type { ReductionGroup } from "./reduction-detect";
 import type { RowProgram } from "./row-program-types";
-
-/**
- * Execute a compound softmax/log_softmax pattern as a single fused kernel.
- * Shared by both the first-time execution path (segment-executors) and the
- * lowered plan replay path (executor-lowered).
- */
-export async function executeCompoundSoftmax(
-  inputNode: LazyIRNode,
-  outputNode: LazyIRNode,
-  dim: number,
-  name: string,
-  backend: Backend,
-): Promise<void> {
-  const { dispatchFusedSoftmax } = await import(
-    "../backend/webgpu/softmax-kernel"
-  );
-  const nodeBackend = getBackend(inputNode.device) ?? backend;
-  const inputStorage = getInputStorage(inputNode.inputs[0], nodeBackend);
-  const inputBT = asGPUTensor(inputStorage.backendTensor);
-  const shape = inputBT.shape;
-  const normDim = dim < 0 ? shape.length + dim : dim;
-  const dimSize = shape[normDim];
-  let numRows = 1;
-  for (let d = 0; d < normDim; d++) numRows *= shape[d];
-  const isLog = name === "log_softmax";
-  const outBuffer = dispatchFusedSoftmax(
-    inputBT.buffer,
-    numRows,
-    dimSize,
-    isLog,
-  );
-  const outShape = shape.slice();
-  outputNode.result = createStorageHandle(inputNode.device, {
-    buffer: outBuffer,
-    shape: outShape,
-    dtype: "f32",
-    size: sizeOf(outShape),
-    strides: contiguousStrides(outShape),
-    offset: 0,
-    isContiguous: true,
-    ownsBuffer: true,
-  } as unknown as BackendTensor);
-}
 
 // Module-level cached imports to avoid per-call dynamic import overhead.
 // After first call, these are resolved and reused synchronously.

@@ -88,14 +88,6 @@ export interface FusionAnalysisTemplate {
     ]
   >;
 
-  /** Compound pattern matches (position-based: coveredOrigPoss, outputOrigPos, dim). */
-  compoundDescs?: Array<{
-    name: string;
-    coveredOrigPoss: number[];
-    outputOrigPos: number;
-    dim: number;
-  }>;
-
   /** Cached lifetime analysis (position-based). */
   lifetimeTemplate?: Array<{
     firstUse: number;
@@ -340,17 +332,6 @@ export async function executePlanOptimized(
             }>,
           ],
       ),
-      compoundDescs:
-        analysis.compoundMatches.length > 0
-          ? analysis.compoundMatches.map((m) => ({
-              name: m.name,
-              coveredOrigPoss: m.coveredNodeIds.map(
-                (id) => origIdToPos.get(id) as number,
-              ),
-              outputOrigPos: origIdToPos.get(m.outputNodeId) as number,
-              dim: m.dim,
-            }))
-          : undefined,
     };
 
     // Build lowered plan from analysis (the sole plan-building path)
@@ -359,7 +340,6 @@ export async function executePlanOptimized(
       planNodes,
       nodeIdToFinalPos: finalIdToPos,
       prologueClaimedIds: analysis.prologueClaimedIds,
-      compoundMatches: analysis.compoundMatches,
       rowProgramMatches: analysis.rowProgramMatches,
       matmulDirectives: analysis.matmulDirectives,
       enableVectorization,
