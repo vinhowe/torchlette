@@ -32,6 +32,7 @@ import {
 } from "../shape-utils";
 import { createTensor, createTrackedBuffer } from "../tensor";
 import { createTileKernelDispatcher } from "../tile-dispatch";
+import { isCompilationRecording } from "../webgpu-state";
 import {
   castSpec,
   castTileIR,
@@ -53,8 +54,12 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
     return tensor;
   }
 
-  // Check f16 weight cache (populated by Adam dual-write)
-  if (dtype === "f16" && tensor.dtype === "f32") {
+  // Check f16 weight cache (populated by Adam dual-write).
+  // Skip during compilation recording: cached buffers weren't allocated during
+  // this plan so they won't be in bufferToSlot, causing the result to be silently
+  // dropped from compiled.results. Forcing a real dispatch ensures the output
+  // buffer is recorded and the saved-for-backward tensor gets materialized.
+  if (dtype === "f16" && tensor.dtype === "f32" && !isCompilationRecording()) {
     const cached = f16WeightCache.get(tensor.buffer);
     if (cached) {
       if (tensor.isContiguous && tensor.offset === 0) {

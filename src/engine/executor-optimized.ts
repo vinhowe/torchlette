@@ -239,6 +239,16 @@ export async function executePlanOptimized(
     // ── Cache hit: reuse existing lowered plan ──
     planNodes = cachedTemplate.finalPerm.map((i) => plan.nodes[i]);
     loweredPlan = cachedTemplate.loweredPlan;
+    if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+      const extCount = externalNodeIds?.size ?? 0;
+      const n0 = plan.nodes[0];
+      const n0Info = n0
+        ? `n0=${n0.op}(${n0.dtype},${JSON.stringify(n0.shape)})`
+        : "";
+      console.log(
+        `[template] HIT fp=0x${(fingerprint >>> 0).toString(16)} nodes=${plan.nodes.length} ext=${extCount} compiled=${!!loweredPlan.compiledPlan?.valid} ${n0Info}`,
+      );
+    }
   } else {
     // ── Cache miss: run full analysis + build lowered plan ──
 
@@ -356,6 +366,73 @@ export async function executePlanOptimized(
     template.loweredPlan = loweredPlan;
 
     fusionAnalysisCache.set(fingerprint, template);
+
+    if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+      // Log op histogram for structural comparison
+      const opCounts = new Map<string, number>();
+      for (const n of plan.nodes)
+        opCounts.set(n.op, (opCounts.get(n.op) ?? 0) + 1);
+      const opSummary = [...opCounts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([op, c]) => `${op}:${c}`)
+        .join(" ");
+      const extCount = externalNodeIds?.size ?? 0;
+      // Check if this is a near-miss with an existing template (same node count ±2)
+      let nearMiss = "";
+      for (const [
+        existingFp,
+        existingTemplate,
+      ] of fusionAnalysisCache.entries()) {
+        if (existingFp !== fingerprint) {
+          const nOld = existingTemplate.finalPerm?.length ?? 0;
+          const diff = plan.nodes.length - nOld;
+          if (Math.abs(diff) <= 2 && diff !== 0) {
+            nearMiss += ` [near: fp=0x${(existingFp >>> 0).toString(16)} nodes=${nOld} diff=${diff > 0 ? "+" : ""}${diff}]`;
+            // Diff the op sequences to find the extra node
+            // Reconstruct old op list from the cached template
+            // We can't access old plan.nodes, but we have the current plan.nodes
+            // and the old externalNodeIds. Let's find which nodes are new externals.
+            if (externalNodeIds && diff === 1) {
+              // Find external nodes that could be the extra
+              const extNodes = plan.nodes.filter((n) =>
+                externalNodeIds.has(n.id),
+              );
+              const castExts = extNodes.filter((n) => n.op === "cast");
+              if (castExts.length > 0) {
+                const c = castExts[castExts.length - 1]; // likely the new one
+                const cIdx = plan.nodes.indexOf(c);
+                const inp = c.inputs[0];
+                const inputOp =
+                  inp.kind === "pending" ? inp.node.op : "(materialized)";
+                const inputDtype =
+                  inp.kind === "pending"
+                    ? inp.node.dtype
+                    : inp.kind === "materialized"
+                      ? inp.storage.backendTensor.dtype
+                      : "?";
+                console.log(
+                  `  EXTRA CAST: node[${cIdx}] cast ${inputDtype}->${c.dtype} shape=${JSON.stringify(c.shape)} input=${inputOp} isExt=${externalNodeIds.has(c.id)}`,
+                );
+                // Also show the consumer of this cast
+                const consumers = plan.nodes.filter((n) =>
+                  n.inputs.some(
+                    (i) => i.kind === "pending" && i.node.id === c.id,
+                  ),
+                );
+                for (const con of consumers) {
+                  console.log(
+                    `    consumer: ${con.op} shape=${JSON.stringify(con.shape)} dtype=${con.dtype}`,
+                  );
+                }
+              }
+            }
+          }
+        }
+      }
+      console.log(
+        `[template] MISS fp=0x${(fingerprint >>> 0).toString(16)} nodes=${plan.nodes.length} ext=${extCount} actions=${loweredPlan.actions.length} cacheSize=${fusionAnalysisCache.size}${nearMiss}\n  ops: ${opSummary}`,
+      );
+    }
 
     // Collect plan analysis for profiling (structural, no execution needed)
     if (isProfilingEnabled()) {
