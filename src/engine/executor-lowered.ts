@@ -583,7 +583,7 @@ export async function executeLoweredPlan(
     );
     return {
       result: planNodes[planNodes.length - 1].result!,
-      stats,
+      stats: loweredPlan.cachedStats ?? stats,
     };
   }
 
@@ -1232,6 +1232,9 @@ export async function executeLoweredPlan(
   if (!lastNode.result) {
     throw new Error("Lowered plan execution failed: no result for last node");
   }
+
+  // Cache stats on the lowered plan so the compiled path can return them
+  loweredPlan.cachedStats = stats;
 
   return { result: lastNode.result, stats };
 }
