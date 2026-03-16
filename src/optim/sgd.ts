@@ -24,7 +24,6 @@ type ResolvedSGDGroup = {
 export class SGD {
   private params: Tensor[];
   private readonly api: Torchlette;
-  private _lr: number;
   private readonly momentum: number;
   private _groups: ResolvedSGDGroup[];
   private _groupIndex: number[];
@@ -50,7 +49,6 @@ export class SGD {
       throw new Error("SGD learning rate must be > 0");
     }
     this.api = engine;
-    this._lr = options.lr;
     this.params = flatParams;
     this.momentum = options.momentum ?? 0;
 
@@ -90,7 +88,6 @@ export class SGD {
   }
 
   setLR(lr: number): void {
-    this._lr = lr;
     for (const g of this._groups) g.lr = lr;
   }
 

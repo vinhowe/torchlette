@@ -1,8 +1,8 @@
 import type { AdamStepConfig, DeviceKind } from "../backend/types";
+import type { Tensor, Torchlette } from "../frontend/torchlette";
+import { createLazyIRNode } from "../graph/node-factory";
 import type { LazyIRNode } from "../graph/types";
 import { createPendingRef } from "../graph/types";
-import { createLazyIRNode } from "../graph/node-factory";
-import type { Tensor, Torchlette } from "../frontend/torchlette";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import { validateOptimizerParams } from "./validate";
 
@@ -32,7 +32,6 @@ type ResolvedAdamGroup = {
 export class Adam {
   private params: Tensor[];
   private readonly api: Torchlette;
-  private _lr: number;
   private readonly beta1: number;
   private readonly beta2: number;
   private readonly eps: number;
@@ -89,7 +88,6 @@ export class Adam {
     }
 
     this.api = engine;
-    this._lr = options.lr;
     this.beta1 = beta1;
     this.beta2 = beta2;
     this.eps = eps;
@@ -139,7 +137,6 @@ export class Adam {
 
   /** Set learning rate for all parameter groups. */
   setLR(lr: number): void {
-    this._lr = lr;
     for (const g of this._groups) g.lr = lr;
   }
 

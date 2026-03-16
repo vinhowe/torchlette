@@ -32,47 +32,20 @@ import {
 } from "../backend/webgpu/gpu-types";
 import type { EpilogueConfig } from "../backend/webgpu/matmul/types";
 import { createTensor } from "../backend/webgpu/tensor";
-import { contiguousStrides, shapesEqual } from "../core/shape";
-import {
-  dispatchPackedOptimizer,
-  type PackedOptimizerItem,
-} from "../optim/packed-dispatch";
-import {
-  assignSlot,
-  buildCompiledPlan,
-  type CompiledPlan,
-  executeCompiledPlan,
-  isCompilationRecordingActive,
-  type NodeResult,
-  recordBarrier,
-  recordWrite,
-  startCompilationRecording,
-  stopCompilationRecording,
-} from "./compiled-plan";
-import { executePlanSequential } from "./sequential";
 import type { FusionGroup } from "../compiler/fusion-detect";
 import {
   buildIdPositionMap,
-  collectExternalInputs,
   computePlanFingerprint,
   type ExecutionSegment,
-  groupToRecipe,
   isFusibleOp,
 } from "../compiler/fusion-detect";
 import { analyzeGraph } from "../compiler/graph-compiler";
-import type {
-  ExecutionPlan,
-  LazyIRNode,
-  LazyRef,
-  StorageHandle,
-} from "../graph/types";
-import { buildLoweredPlanFromAnalysis, type LoweredPlan } from "./lowered-plan";
-import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "../compiler/matmul-epilogue";
+import type { MatmulPrologueInfo } from "../compiler/matmul-epilogue";
 import {
   _detectTransposeView,
   executeMatmulWithEpilogue,
-  formatEpilogueLabel,
 } from "../compiler/matmul-epilogue";
+import { contiguousStrides, shapesEqual } from "../core/shape";
 import {
   _webgpuMatmulGeomImports,
   _webgpuMatmulImports,
@@ -81,12 +54,6 @@ import {
   wrapResultAsStorage,
 } from "../graph/node-factory";
 import {
-  executeOpSync,
-  getInputStorage,
-  withProfileContext,
-} from "./op-dispatch";
-import { pretunePlanMatmuls } from "./plan-builder";
-import {
   isProfilingEnabled,
   type PlanAnalysis,
   profileOpBegin,
@@ -94,12 +61,41 @@ import {
   recordPlanAnalysis,
   setProfileModule,
 } from "../graph/profiler";
+import { storageTracker } from "../graph/storage-tracker";
+import type {
+  ExecutionPlan,
+  LazyIRNode,
+  LazyRef,
+  StorageHandle,
+} from "../graph/types";
+import {
+  dispatchPackedOptimizer,
+  type PackedOptimizerItem,
+} from "../optim/packed-dispatch";
+import {
+  assignSlot,
+  buildCompiledPlan,
+  executeCompiledPlan,
+  isCompilationRecordingActive,
+  type NodeResult,
+  recordBarrier,
+  recordWrite,
+  startCompilationRecording,
+  stopCompilationRecording,
+} from "./compiled-plan";
+import { buildLoweredPlanFromAnalysis, type LoweredPlan } from "./lowered-plan";
+import {
+  executeOpSync,
+  getInputStorage,
+  withProfileContext,
+} from "./op-dispatch";
+import { pretunePlanMatmuls } from "./plan-builder";
 import {
   ensureFusionImports,
   executeFusedSegment,
   executeRowProgram,
 } from "./segment-executors";
-import { storageTracker } from "../graph/storage-tracker";
+import { executePlanSequential } from "./sequential";
 
 // ============================================================================
 // Optimized Execution Types
@@ -248,32 +244,6 @@ export function getFusionAnalysisTemplate(
 type AdamStepFn = NonNullable<
   import("../backend/types").Backend["ops"]["adamStep"]
 >;
-
-/**
- * Walk a chain of ops collecting external (non-chain) input refs.
- * When `prevId` is given (epilogue): the first node's chain input comes from prevId.
- * When `prevId` is undefined (preamble): all first-node inputs are external.
- */
-function collectChainExternalRefs(
-  chainNodes: LazyIRNode[],
-  prevId?: number,
-): LazyRef[] {
-  const refs: LazyRef[] = [];
-  const startIdx = prevId !== undefined ? 0 : 1;
-  if (prevId === undefined) {
-    for (const ref of chainNodes[0].inputs) refs.push(ref);
-  }
-  for (let ci = startIdx; ci < chainNodes.length; ci++) {
-    const node = chainNodes[ci];
-    if (node.inputs.length === 2) {
-      const prev = ci === 0 ? prevId! : chainNodes[ci - 1].id;
-      const inp0IsChain =
-        node.inputs[0].kind === "pending" && node.inputs[0].node.id === prev;
-      refs.push(node.inputs[inp0IsChain ? 1 : 0]);
-    }
-  }
-  return refs;
-}
 
 /**
  * Execute a batch of adamStep nodes using packed dispatch for groups of same-size params.
