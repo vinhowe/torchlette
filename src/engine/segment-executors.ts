@@ -86,12 +86,15 @@ export async function executeFusedSegment(
         offset: 0,
         isContiguous: true,
         ownsBuffer: true,
+        toArray() {
+          return [];
+        },
         destroy() {
           if (destroyed) return;
           destroyed = true;
           deferredDestroyBuffer(buf, bufSize);
         },
-      } as unknown as BackendTensor,
+      } as BackendTensor,
     );
   };
 
@@ -324,7 +327,8 @@ export async function executeRowProgram(
       offset: 0,
       isContiguous: true,
       ownsBuffer: true,
-    } as unknown as BackendTensor);
+      toArray: () => [],
+    } as BackendTensor);
   } catch (e) {
     console.warn("Row-program dispatch failed, falling back to sequential:", e);
     for (const node of coveredNodes) {
