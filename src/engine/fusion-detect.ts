@@ -21,7 +21,6 @@ import type {
 } from "../backend/webgpu/fusion-types";
 import { shapesEqual } from "../core/shape";
 import type { LazyIRNode, LazyRef } from "./lazy-types";
-import type { ReductionGroup } from "./reduction-detect";
 
 /**
  * Ops that can be fused into elementwise kernels.
@@ -1056,8 +1055,7 @@ export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
  */
 export type ExecutionSegment =
   | { kind: "fused"; group: FusionGroup; recipe: FusedKernelRecipe }
-  | { kind: "sequential"; nodes: LazyIRNode[] }
-  | { kind: "reduction"; group: ReductionGroup };
+  | { kind: "sequential"; nodes: LazyIRNode[] };
 
 /**
  * Segment a lazy plan into fusible and sequential parts.
@@ -1072,7 +1070,6 @@ export function segmentPlanForExecution(
     maxStorageBuffers?: number;
     enableMultiOutput?: boolean;
     epilogueClaimedIds?: Set<number>;
-    reductionGroups?: ReductionGroup[];
   },
 ): ExecutionSegment[] {
   const { groups } = detectFusionGroups(nodes, externalNodeIds, options);
@@ -1086,19 +1083,8 @@ export function segmentPlanForExecution(
     }
   }
 
-  // Build index lookup for reduction groups
-  const indexToReductionGroup = new Map<number, ReductionGroup>();
-  if (options?.reductionGroups) {
-    for (const rg of options.reductionGroups) {
-      for (const idx of rg.planIndices) {
-        indexToReductionGroup.set(idx, rg);
-      }
-    }
-  }
-
   // Track which groups have been emitted.
   const emittedGroups = new Set<FusionGroup>();
-  const emittedReductionGroups = new Set<ReductionGroup>();
 
   // Pre-compute max plan index for each group so we can emit at the last
   // member's position. This ensures all gap nodes (including those in other
@@ -1107,33 +1093,17 @@ export function segmentPlanForExecution(
   for (const group of groups) {
     groupMaxIdx.set(group, Math.max(...group.planIndices));
   }
-  const reductionGroupMaxIdx = new Map<ReductionGroup, number>();
-  if (options?.reductionGroups) {
-    for (const rg of options.reductionGroups) {
-      reductionGroupMaxIdx.set(rg, Math.max(...rg.planIndices));
-    }
-  }
 
-  /** Check if index i belongs to any group (elementwise or reduction). */
+  /** Check if index i belongs to any group. */
   function isGroupMember(idx: number): boolean {
-    return indexToGroup.has(idx) || indexToReductionGroup.has(idx);
+    return indexToGroup.has(idx);
   }
 
   let i = 0;
   while (i < nodes.length) {
     const group = indexToGroup.get(i);
-    const reductionGroup = indexToReductionGroup.get(i);
 
-    if (reductionGroup) {
-      if (
-        !emittedReductionGroups.has(reductionGroup) &&
-        i === reductionGroupMaxIdx.get(reductionGroup)
-      ) {
-        emittedReductionGroups.add(reductionGroup);
-        segments.push({ kind: "reduction", group: reductionGroup });
-      }
-      i++;
-    } else if (group) {
+    if (group) {
       if (!emittedGroups.has(group) && i === groupMaxIdx.get(group)) {
         emittedGroups.add(group);
         const recipe = groupToRecipe(group);

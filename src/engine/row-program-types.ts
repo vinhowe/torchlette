@@ -44,11 +44,14 @@ export interface ReducePhase {
   isMean?: boolean;
 }
 
-/** A phase that writes per-element output values. */
+/** A phase that writes output values. */
 export interface WritePhase {
   kind: "write";
   /** Expression computing each output element value. */
   bodyExpr: RPExpr;
+  /** If true, output is a scalar per row (1 element, not D elements).
+   *  Used when the output IS a reduction result with no epilogue. */
+  scalarOutput?: boolean;
 }
 
 export type RPPhase = ReducePhase | WritePhase;
@@ -85,6 +88,10 @@ export interface RowProgramMatch {
   inputRefs: LazyRef[];
   /** Reduction dimension (normalized). */
   dim: number;
+  /** Number of rows (product of dims before reduction dim in the first reduction's input). */
+  numRows: number;
+  /** Size of the reduction dimension (feature dim for perRowKernel). */
+  dimSize: number;
   /** The constructed RowProgram IR. */
   program: RowProgram;
 }

@@ -52,7 +52,11 @@ export function dispatchRowProgram(
   dimSize: number,
 ): GPUBuffer {
   const ctx = requireContext();
-  const outBytes = numRows * dimSize * dtypeBytes(program.output.dtype);
+  // Scalar output: 1 element per row; element output: dimSize elements per row
+  const lastPhase = program.phases[program.phases.length - 1];
+  const isScalar = lastPhase.kind === "write" && lastPhase.scalarOutput;
+  const outElements = isScalar ? numRows : numRows * dimSize;
+  const outBytes = outElements * dtypeBytes(program.output.dtype);
   const outBuffer = resolveOutputBuffer(ctx.device, outBytes, inputBuffers);
 
   const buffers: Record<string, GPUBuffer> = {};

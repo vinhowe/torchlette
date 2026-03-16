@@ -65,15 +65,28 @@ export function rowProgramToSpec(program: RowProgram): TileKernelSpec {
           reduceResults.push(named);
         } else {
           // WritePhase
-          ctx.stridedFor(tid, D, WG, (i) => {
-            const val = emitExpr(
-              ctx,
-              phase.bodyExpr,
-              base.add(i),
-              reduceResults,
-            );
-            ctx.emitStore("output", base.add(i), val);
-          });
+          if (phase.scalarOutput) {
+            // Scalar output: only thread 0 writes one value per row
+            ctx.ifThen(tid.eq(ctx.u32(0)), () => {
+              const val = emitExpr(
+                ctx,
+                phase.bodyExpr,
+                base, // offset = row index (base = row * D, but output is [numRows])
+                reduceResults,
+              );
+              ctx.emitStore("output", _row, val);
+            });
+          } else {
+            ctx.stridedFor(tid, D, WG, (i) => {
+              const val = emitExpr(
+                ctx,
+                phase.bodyExpr,
+                base.add(i),
+                reduceResults,
+              );
+              ctx.emitStore("output", base.add(i), val);
+            });
+          }
         }
       }
     },
