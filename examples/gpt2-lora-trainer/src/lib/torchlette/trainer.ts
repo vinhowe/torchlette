@@ -7,10 +7,10 @@
  * - Gradient checkpointing to trade compute for memory
  */
 
-import type { FrontendTensor as Tensor, Torchlette } from 'torchlette';
-import { Adam, GradScaler } from 'torchlette';
-import type { GPT2WithLoRA } from './gpt2-lora';
-import type { GPT2Tokenizer } from './tokenizer';
+import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
+import { Adam, GradScaler } from "torchlette";
+import type { GPT2WithLoRA } from "./gpt2-lora";
+import type { GPT2Tokenizer } from "./tokenizer";
 
 export type TrainingConfig = {
   maxSteps: number;
@@ -46,7 +46,7 @@ class SimpleDataLoader {
     private api: Torchlette,
     tokens: number[],
     private batchSize: number,
-    private seqLength: number
+    private seqLength: number,
   ) {
     this.tokens = new Uint32Array(tokens);
   }
@@ -66,7 +66,9 @@ class SimpleDataLoader {
     for (let b = 0; b < this.batchSize; b++) {
       // Wrap around if we've exhausted the data
       if (this.currentIdx + this.seqLength + 1 > this.tokens.length) {
-        this.currentIdx = Math.floor(Math.random() * (this.tokens.length - this.seqLength - 1));
+        this.currentIdx = Math.floor(
+          Math.random() * (this.tokens.length - this.seqLength - 1),
+        );
       }
 
       for (let i = 0; i < this.seqLength; i++) {
@@ -75,16 +77,26 @@ class SimpleDataLoader {
       }
 
       // Move to next random position for variety
-      this.currentIdx = Math.floor(Math.random() * (this.tokens.length - this.seqLength - 1));
+      this.currentIdx = Math.floor(
+        Math.random() * (this.tokens.length - this.seqLength - 1),
+      );
     }
 
     return {
-      input: this.api.tensorFromArray(inputData, [this.batchSize, this.seqLength], {
-        device: 'webgpu',
-      }),
-      target: this.api.tensorFromArray(targetData, [this.batchSize, this.seqLength], {
-        device: 'webgpu',
-      }),
+      input: this.api.tensorFromArray(
+        inputData,
+        [this.batchSize, this.seqLength],
+        {
+          device: "webgpu",
+        },
+      ),
+      target: this.api.tensorFromArray(
+        targetData,
+        [this.batchSize, this.seqLength],
+        {
+          device: "webgpu",
+        },
+      ),
     };
   }
 }
@@ -99,11 +111,7 @@ export class LoRATrainer {
   private optimizer: Adam | null = null;
   private gradScaler: GradScaler | null = null;
 
-  constructor(
-    api: Torchlette,
-    model: GPT2WithLoRA,
-    tokenizer: GPT2Tokenizer
-  ) {
+  constructor(api: Torchlette, model: GPT2WithLoRA, tokenizer: GPT2Tokenizer) {
     this.api = api;
     this.model = model;
     this.tokenizer = tokenizer;
@@ -115,7 +123,7 @@ export class LoRATrainer {
   async train(
     trainingText: string,
     config: TrainingConfig,
-    callbacks: TrainingCallbacks = {}
+    callbacks: TrainingCallbacks = {},
   ): Promise<TrainingResult> {
     const useAMP = config.useAMP ?? false;
     const useCheckpointing = config.useCheckpointing ?? false;
@@ -125,7 +133,7 @@ export class LoRATrainer {
 
     if (tokens.length < config.batchSize * (config.seqLength + 1)) {
       throw new Error(
-        `Training text too short. Need at least ${config.batchSize * (config.seqLength + 1)} tokens, got ${tokens.length}`
+        `Training text too short. Need at least ${config.batchSize * (config.seqLength + 1)} tokens, got ${tokens.length}`,
       );
     }
 
@@ -134,12 +142,16 @@ export class LoRATrainer {
       this.api,
       tokens,
       config.batchSize,
-      config.seqLength
+      config.seqLength,
     );
 
     // Create optimizer for LoRA parameters only
     const loraParams = this.model.getLoRAParameters();
-    this.optimizer = new Adam(loraParams, { lr: config.learningRate }, this.api);
+    this.optimizer = new Adam(
+      loraParams,
+      { lr: config.learningRate },
+      this.api,
+    );
 
     // Create gradient scaler for AMP
     if (useAMP) {
@@ -175,10 +187,13 @@ export class LoRATrainer {
     const compiledForwardWithLoss = useAMP
       ? api.compile((batchInput: Tensor, batchTarget: Tensor) => {
           // autocast inside compile enables f16 for matmuls
-          return api.autocast(() => {
-            const { loss } = model.forwardWithLoss(batchInput, batchTarget);
-            return loss;
-          }, { deviceType: 'webgpu' });
+          return api.autocast(
+            () => {
+              const { loss } = model.forwardWithLoss(batchInput, batchTarget);
+              return loss;
+            },
+            { deviceType: "webgpu" },
+          );
         })
       : null;
 
@@ -190,6 +205,9 @@ export class LoRATrainer {
 
       callbacks.onStepStart?.(step);
       const stepStart = performance.now();
+
+      // Begin step lifecycle (enables fusion, buffer arena, compiled plans)
+      await this.api.beginStep();
 
       // Get batch
       const { input, target } = dataLoader.nextBatch();
@@ -218,7 +236,9 @@ export class LoRATrainer {
 
         if (!stepped) {
           // Skip this step due to NaN/Inf gradients
-          console.warn(`Step ${step}: Skipped due to NaN/Inf gradients, scale=${this.gradScaler.getScale()}`);
+          console.warn(
+            `Step ${step}: Skipped due to NaN/Inf gradients, scale=${this.gradScaler.getScale()}`,
+          );
         }
       } else {
         this.optimizer!.step();
@@ -236,6 +256,9 @@ export class LoRATrainer {
       // Explicitly dispose batch tensors to free memory
       input.dispose();
       target.dispose();
+
+      // End step lifecycle (flush shared encoder, release buffers)
+      this.api.endStep();
 
       const stepTime = performance.now() - stepStart;
 
@@ -290,7 +313,9 @@ export class LoRATrainer {
   /**
    * Export LoRA weights asynchronously.
    */
-  async exportLoRAWeights(): Promise<Map<string, { data: Float32Array; shape: number[] }>> {
+  async exportLoRAWeights(): Promise<
+    Map<string, { data: Float32Array; shape: number[] }>
+  > {
     const weights = new Map<string, { data: Float32Array; shape: number[] }>();
     const loraParams = this.model.getLoRAParameters();
 
