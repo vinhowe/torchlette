@@ -531,7 +531,7 @@ export interface FusedBackend extends Backend {
   /** Deactivate the buffer arena. */
   clearActiveArena(): void;
   /** Set external input buffer mappings for arena resolution. */
-  setArenaExternalInputBuffers(buffers: Map<unknown, unknown>): void;
+  setArenaExternalInputBuffers(buffers: unknown[]): void;
   /** Clear external input buffer mappings. */
   clearArenaExternalInputBuffers(): void;
 

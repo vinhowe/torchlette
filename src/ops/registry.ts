@@ -12,6 +12,7 @@
  * Op behavior (WGSL codegen) lives in fusion-tile-ir.ts via BlockExpr methods.
  */
 
+import type { DType } from "../backend/types";
 import type { RuntimeEngine } from "../runtime/engine";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 

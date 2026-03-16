@@ -12,10 +12,10 @@ import type {
   SumOptions,
   TransposeOptions,
 } from "../backend/types";
-import type { Torchlette } from "./torchlette";
-import type { AutogradNode, TensorCreateOptions } from "./types";
 import type { EngineTensor } from "../runtime/engine";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
+import type { Torchlette } from "./torchlette";
+import type { AutogradNode, TensorCreateOptions } from "./types";
 
 export class DisposedTensorError extends Error {
   name = "DisposedTensorError";
@@ -497,7 +497,7 @@ const SIMPLE_UNARY_OPS = [
 ] as const;
 
 // eslint-disable-next-line @typescript-eslint/no-empty-object-type
-interface Tensor {
+export interface Tensor {
   sqrt(): Tensor;
   relu(): Tensor;
   exp(): Tensor;
@@ -526,7 +526,7 @@ for (const op of SIMPLE_UNARY_OPS) {
 
 const SIMPLE_BINARY_OPS = ["add", "mul", "div", "pow"] as const;
 
-interface Tensor {
+export interface Tensor {
   add(other: Tensor | number): Tensor;
   mul(other: Tensor | number): Tensor;
   div(other: Tensor | number): Tensor;
@@ -545,7 +545,7 @@ for (const op of SIMPLE_BINARY_OPS) {
 
 const COMPARISON_OPS = ["gt", "lt", "ge", "le", "eq", "ne"] as const;
 
-interface Tensor {
+export interface Tensor {
   gt(other: Tensor): Tensor;
   lt(other: Tensor): Tensor;
   ge(other: Tensor): Tensor;

@@ -10,22 +10,22 @@ import {
   type GPUBuffer,
   type GPUDevice,
 } from "../backend/webgpu/gpu-types";
-import { contiguousStrides, sizeOf } from "../core/shape";
-import { executeNode } from "./sequential";
 import type { FusionGroup, groupToRecipe } from "../compiler/fusion-detect";
-import type { LazyIRNode, LazyRef, StorageHandle } from "../graph/types";
+import type { RowProgram } from "../compiler/row-program-types";
+import { contiguousStrides, sizeOf } from "../core/shape";
 import {
   _webgpuMatmulImports,
   createStorageHandle,
   ensureWebGPUMatmulImports,
 } from "../graph/node-factory";
-import { getInputStorage } from "./op-dispatch";
 import {
   recordFusionFallback,
   setCurrentOpLabel,
   setProfileModule,
 } from "../graph/profiler";
-import type { RowProgram } from "../compiler/row-program-types";
+import type { LazyIRNode, LazyRef, StorageHandle } from "../graph/types";
+import { getInputStorage } from "./op-dispatch";
+import { executeNode } from "./sequential";
 
 // Module-level cached imports to avoid per-call dynamic import overhead.
 // After first call, these are resolved and reused synchronously.
@@ -318,6 +318,7 @@ export async function executeRowProgram(
       dimSize,
     );
 
+    const shape = outputNode.shape;
     outputNode.result = createStorageHandle(outputNode.device, {
       buffer: outBuffer,
       shape: shape.slice(),

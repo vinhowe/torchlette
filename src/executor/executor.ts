@@ -349,7 +349,10 @@ function assignPackedAdamResult(
   // Param: same buffer, ownsBuffer: false since buffer is shared with s1
   adamNode.result = createStorageHandle(
     adamNode.device,
-    { ...(s1.backendTensor as Record<string, unknown>), ownsBuffer: false },
+    {
+      ...(s1.backendTensor as Record<string, unknown>),
+      ownsBuffer: false,
+    } as BackendTensor,
     s1.id,
   );
 
@@ -357,14 +360,14 @@ function assignPackedAdamResult(
   // 1. DecRef old (undoes the incRef from the original createTensor)
   // 2. Noop old destroy (prevents double-free when old storage is GC'd)
   // 3. Create new tensor wrapping same buffer (does incRef)
-  const mBT = s2.backendTensor as {
+  const mBT = s2.backendTensor as unknown as {
     buffer: GPUBuffer;
     shape: number[];
     dtype: DType;
     ownsBuffer?: boolean;
     destroy?: () => void;
   };
-  const vBT = s3.backendTensor as {
+  const vBT = s3.backendTensor as unknown as {
     buffer: GPUBuffer;
     shape: number[];
     dtype: DType;
@@ -1349,20 +1352,26 @@ export async function executePlanOptimized(
       if (seg.kind === "sequential") {
         return {
           kind: "sequential" as const,
-          finalPoss: seg.nodes.map((n) => finalIdToPos.get(n.id) as number),
+          finalPoss: seg.nodes.map(
+            (n: LazyIRNode) => finalIdToPos.get(n.id) as number,
+          ),
         };
       }
-      if (seg.kind === "reduction") {
-        const rg = seg.group;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if ((seg as any).kind === "reduction") {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const rg = (seg as any).group;
         return {
           kind: "reduction" as const,
-          finalPoss: rg.nodes.map((n) => finalIdToPos.get(n.id) as number),
+          finalPoss: rg.nodes.map(
+            (n: LazyIRNode) => finalIdToPos.get(n.id) as number,
+          ),
           reductionFinalPos: finalIdToPos.get(rg.reductionNode.id) as number,
           preambleFinalPoss: rg.preambleNodes.map(
-            (n) => finalIdToPos.get(n.id) as number,
+            (n: LazyIRNode) => finalIdToPos.get(n.id) as number,
           ),
           epilogueFinalPoss: rg.epilogueNodes.map(
-            (n) => finalIdToPos.get(n.id) as number,
+            (n: LazyIRNode) => finalIdToPos.get(n.id) as number,
           ),
           outputFinalPos: finalIdToPos.get(rg.outputNode.id) as number,
           preambleOps: rg.preambleOps,

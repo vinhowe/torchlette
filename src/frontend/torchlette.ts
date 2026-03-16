@@ -22,12 +22,12 @@ import {
   getGPUMemoryStats,
   setGPUMemoryLimit,
 } from "../backend/webgpu/memory-tracker";
-import { shapesEqual, sizeOf } from "../core/shape";
 import {
   type AutocastConfig,
   type AutocastContext,
   createAutocastContext,
 } from "../compiler/amp";
+import { shapesEqual, sizeOf } from "../core/shape";
 import { storageTracker } from "../graph/storage-tracker";
 import {
   type EngineTensor,
@@ -564,7 +564,7 @@ export class Torchlette {
   }
 
   /** Generic dispatcher for registry-driven binary ops (gradient specs in OP_REGISTRY). */
-  private _dispatchBinaryFromTable(
+  _dispatchBinaryFromTable(
     opName: string,
     a: Tensor | number,
     b: Tensor | number,
@@ -1707,7 +1707,7 @@ export class Torchlette {
 // ============================================================================
 
 // Unary ops: gradient specs live in OP_REGISTRY, dispatch via _dispatchUnary.
-interface Torchlette {
+export interface Torchlette {
   sqrt(a: Tensor): Tensor;
   relu(a: Tensor): Tensor;
   exp(a: Tensor): Tensor;
@@ -1737,7 +1737,7 @@ for (const opName of UNARY_AUTOGRAD_OPS) {
 }
 
 // Binary ops: gradient specs live in OP_REGISTRY, dispatch via _dispatchBinaryFromTable.
-interface Torchlette {
+export interface Torchlette {
   add(a: Tensor | number, b: Tensor | number): Tensor;
   mul(a: Tensor | number, b: Tensor | number): Tensor;
   div(a: Tensor | number, b: Tensor | number): Tensor;
@@ -1757,7 +1757,7 @@ for (const opName of BINARY_AUTOGRAD_OPS) {
 // Comparison ops: non-differentiable, dispatch via _cmpOp.
 const COMPARISON_OPS = ["gt", "lt", "ge", "le", "eq", "ne"] as const;
 
-interface Torchlette {
+export interface Torchlette {
   gt(a: Tensor, b: Tensor): Tensor;
   lt(a: Tensor, b: Tensor): Tensor;
   ge(a: Tensor, b: Tensor): Tensor;
