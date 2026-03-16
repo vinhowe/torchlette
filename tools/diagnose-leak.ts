@@ -24,8 +24,8 @@ import {
   setAllocStep,
   snapshotLeakedAllocs,
 } from "../src/backend/webgpu/memory-tracker";
-import { storageTracker } from "../src/engine/lazy";
-import { type Tensor, Torchlette } from "../src/frontend";
+import { storageTracker } from "../src/graph/storage-tracker";
+import { type Tensor, Torchlette } from "../src/frontend/torchlette";
 import { Adam, GradScaler } from "../src/optim";
 
 // Parse --steps N from CLI args

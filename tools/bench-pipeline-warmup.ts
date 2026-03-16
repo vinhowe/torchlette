@@ -20,7 +20,7 @@ import {
   stopPipelineRecording,
   warmupPipelines,
 } from "../src/backend/webgpu";
-import { type Tensor, Torchlette } from "../src/frontend";
+import { type Tensor, Torchlette } from "../src/frontend/torchlette";
 import { checkpoint, crossEntropy } from "../src/nn";
 import { Adam, GradScaler } from "../src/optim";
 

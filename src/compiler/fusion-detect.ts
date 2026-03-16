@@ -11,7 +11,7 @@
  * - Fused groups must have 2+ ops to be worthwhile
  */
 
-import { OP_REGISTRY } from "../backend/op-registry";
+import { OP_REGISTRY } from "../ops/registry";
 import type { DType } from "../backend/types";
 import type {
   FusedInput,
@@ -20,7 +20,7 @@ import type {
   FusedOutput,
 } from "../backend/webgpu/fusion-types";
 import { shapesEqual } from "../core/shape";
-import type { LazyIRNode, LazyRef } from "./lazy-types";
+import type { LazyIRNode, LazyRef } from "../graph/types";
 
 /**
  * Ops that can be fused into elementwise kernels.

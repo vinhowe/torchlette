@@ -1,7 +1,7 @@
 import type { Backend } from "../backend/types";
 import { sizeOf } from "../core/shape";
-import type { ExecutionPlan, LazyIRNode, LazyRef } from "./lazy-types";
-import { analyzeLifetimes, type TensorLifetime } from "./lifetime-analysis";
+import type { ExecutionPlan, LazyIRNode, LazyRef } from "../graph/types";
+import { analyzeLifetimes, type TensorLifetime } from "../graph/lifetime-analysis";
 
 /**
  * Mark a LazyIRNode as a checkpoint boundary.

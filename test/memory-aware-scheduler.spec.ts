@@ -10,12 +10,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   analyzeLifetimes,
   findDeadTensorsAtStep,
-} from "../src/engine/lifetime-analysis";
+} from "../src/graph/lifetime-analysis";
 import {
   resetNodeIdCounter,
   resetStorageIdCounter,
-} from "../src/engine/node-factory";
-import { storageTracker } from "../src/engine/storage-tracker";
+} from "../src/graph/node-factory";
+import { storageTracker } from "../src/graph/storage-tracker";
 import { RuntimeEngine } from "../src/runtime/engine";
 
 describe("Memory-Aware Scheduler", () => {

@@ -22,7 +22,7 @@ import {
 import { generateFusedKernelTileIR } from "../../src/backend/webgpu/fusion-tile-ir";
 import type { FusedKernelRecipe } from "../../src/backend/webgpu/fusion-types";
 import type { GPUDevice } from "../../src/backend/webgpu/gpu-types";
-import { Torchlette } from "../../src/frontend";
+import { Torchlette } from "../../src/frontend/torchlette";
 
 import { cpuOnly } from "../helpers/webgpu";
 

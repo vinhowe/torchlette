@@ -48,7 +48,7 @@ import {
   initWebGPU,
   isF16Supported,
 } from "../src/backend/webgpu";
-import { type Tensor, Torchlette } from "../src/frontend";
+import { type Tensor, Torchlette } from "../src/frontend/torchlette";
 import { crossEntropy } from "../src/nn";
 import { Adam, GradScaler } from "../src/optim";
 

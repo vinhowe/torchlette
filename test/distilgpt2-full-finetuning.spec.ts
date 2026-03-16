@@ -16,9 +16,9 @@ import { gpuMemoryTracker } from "../src/backend/webgpu/memory-tracker";
 import {
   resetNodeIdCounter,
   resetStorageIdCounter,
-} from "../src/engine/node-factory";
-import { storageTracker } from "../src/engine/storage-tracker";
-import { Torchlette } from "../src/frontend";
+} from "../src/graph/node-factory";
+import { storageTracker } from "../src/graph/storage-tracker";
+import { Torchlette } from "../src/frontend/torchlette";
 import { Adam, GradScaler } from "../src/optim";
 import { resetBaseIdCounter } from "../src/runtime/tensor";
 import { canUseWebGPU } from "./helpers/webgpu";

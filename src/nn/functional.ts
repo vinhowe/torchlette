@@ -4,7 +4,7 @@
  */
 
 import type { DeviceKind } from "../backend/types";
-import type { Tensor, Torchlette } from "../frontend";
+import type { Tensor, Torchlette } from "../frontend/torchlette";
 
 /** Apply none/sum/mean reduction to a per-sample loss tensor. */
 function applyReduction(

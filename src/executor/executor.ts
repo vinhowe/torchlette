@@ -49,8 +49,8 @@ import {
   startCompilationRecording,
   stopCompilationRecording,
 } from "./compiled-plan";
-import { executePlanSequential } from "./executor-sequential";
-import type { FusionGroup } from "./fusion-detect";
+import { executePlanSequential } from "./sequential";
+import type { FusionGroup } from "../compiler/fusion-detect";
 import {
   buildIdPositionMap,
   collectExternalInputs,
@@ -58,28 +58,28 @@ import {
   type ExecutionSegment,
   groupToRecipe,
   isFusibleOp,
-} from "./fusion-detect";
-import { analyzeGraph } from "./graph-compiler";
+} from "../compiler/fusion-detect";
+import { analyzeGraph } from "../compiler/graph-compiler";
 import type {
   ExecutionPlan,
   LazyIRNode,
   LazyRef,
   StorageHandle,
-} from "./lazy-types";
+} from "../graph/types";
 import { buildLoweredPlanFromAnalysis, type LoweredPlan } from "./lowered-plan";
-import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "./matmul-epilogue";
+import type { MatmulEpiloguePlan, MatmulPrologueInfo } from "../compiler/matmul-epilogue";
 import {
   _detectTransposeView,
   executeMatmulWithEpilogue,
   formatEpilogueLabel,
-} from "./matmul-epilogue";
+} from "../compiler/matmul-epilogue";
 import {
   _webgpuMatmulGeomImports,
   _webgpuMatmulImports,
   createStorageHandle,
   ensureWebGPUMatmulImports,
   wrapResultAsStorage,
-} from "./node-factory";
+} from "../graph/node-factory";
 import {
   executeOpSync,
   getInputStorage,
@@ -93,13 +93,13 @@ import {
   profileOpEnd,
   recordPlanAnalysis,
   setProfileModule,
-} from "./profiler";
+} from "../graph/profiler";
 import {
   ensureFusionImports,
   executeFusedSegment,
   executeRowProgram,
 } from "./segment-executors";
-import { storageTracker } from "./storage-tracker";
+import { storageTracker } from "../graph/storage-tracker";
 
 // ============================================================================
 // Optimized Execution Types

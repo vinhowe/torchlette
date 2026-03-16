@@ -3,7 +3,7 @@
  * Similar to PyTorch's nn.Module.
  */
 
-import type { DeviceKind, Tensor, Torchlette } from "../frontend";
+import type { DeviceKind, Tensor, Torchlette } from "../frontend/torchlette";
 
 export abstract class Module {
   protected readonly api: Torchlette;

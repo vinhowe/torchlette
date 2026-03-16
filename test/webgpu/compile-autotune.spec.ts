@@ -19,7 +19,7 @@ import {
 } from "../../src/backend/webgpu/matmul/autotune";
 import { clearDispatchTuningCache } from "../../src/backend/webgpu/matmul/dispatch";
 import { getSubgroupSupport } from "../../src/backend/webgpu/matmul/types";
-import { Torchlette } from "../../src/frontend";
+import { Torchlette } from "../../src/frontend/torchlette";
 
 import { cpuOnly } from "../helpers/webgpu";
 

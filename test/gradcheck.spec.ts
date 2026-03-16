@@ -7,9 +7,9 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { OP_REGISTRY } from "../src/backend/op-registry";
-import type { Tensor } from "../src/frontend";
-import { Torchlette } from "../src/frontend";
+import { OP_REGISTRY } from "../src/ops/registry";
+import type { Tensor } from "../src/frontend/torchlette";
+import { Torchlette } from "../src/frontend/torchlette";
 import { gradcheck } from "../src/testing/gradcheck";
 
 // CPU-only, no fusion — pure f32 deterministic execution

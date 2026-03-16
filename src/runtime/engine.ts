@@ -1,4 +1,3 @@
-import { OP_DTYPE_RULES, promoteDtype } from "../backend/op-registry";
 import { getActiveBackend, getBackend } from "../backend/registry";
 import {
   type ArgReduceOptions,
@@ -22,20 +21,24 @@ import {
   type SumOptions,
   type TransposeOptions,
 } from "../backend/types";
+import type { AutocastContext } from "../compiler/amp";
 import {
   broadcastShapes,
   broadcastThreeShapes,
   contiguousStrides,
 } from "../core/shape";
-import type { AutocastContext } from "../engine/amp";
 import {
   executePlanOptimized,
   type OptimizedExecutionStats,
-} from "../engine/executor-lowered";
+} from "../executor/executor";
+import { isDataSourceOp } from "../executor/lowered-plan";
+import { buildMergedPlan } from "../executor/plan-builder";
 import {
   executePlanSegmented,
   executePlanSequential,
-} from "../engine/executor-sequential";
+} from "../executor/sequential";
+import { createLazyIRNode } from "../graph/node-factory";
+import { storageTracker } from "../graph/storage-tracker";
 import {
   createMaterializedRef,
   createPendingRef,
@@ -43,15 +46,12 @@ import {
   type LazyIRNode,
   type LazyOpCode,
   type LazyRef,
-} from "../engine/lazy-types";
-import { isDataSourceOp } from "../engine/lowered-plan";
-import { createLazyIRNode } from "../engine/node-factory";
-import { buildMergedPlan } from "../engine/plan-builder";
-import { storageTracker } from "../engine/storage-tracker";
+} from "../graph/types";
+import { OP_DTYPE_RULES, promoteDtype } from "../ops/registry";
 import { type BaseId, createBaseId, Tensor } from "./tensor";
 
 // Re-export all types from engine-types (EngineTensor, SavedTensorRecord, etc.)
-export * from "../engine/engine-types";
+export * from "../graph/engine-types";
 
 // Local imports from engine-types (used by Engine methods merged into RuntimeEngine)
 import {
@@ -71,7 +71,7 @@ import {
   type SavedTensorRecord,
   type TensorOrigin,
   type TidyScope,
-} from "../engine/engine-types";
+} from "../graph/engine-types";
 
 // ── Engine helpers ──────────────────────────────────────────────────────────
 function collectTensorHandles(value: unknown): EngineTensor[] {
@@ -1385,7 +1385,7 @@ export class RuntimeEngine {
    * Used by the fused Adam kernel to create tensors for side outputs (m, v).
    */
   createFromStorageHandle(
-    storage: import("../engine/lazy-types").StorageHandle,
+    storage: import("../graph/types").StorageHandle,
     shape: number[],
     device: DeviceKind,
     dtype: DType = "f32",

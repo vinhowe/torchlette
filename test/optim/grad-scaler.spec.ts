@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { Torchlette } from "../../src/frontend";
+import { Torchlette } from "../../src/frontend/torchlette";
 import { Adam, GradScaler } from "../../src/optim";
 import { canUseWebGPU } from "../helpers/webgpu";
 

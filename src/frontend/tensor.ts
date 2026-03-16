@@ -11,11 +11,11 @@ import type {
   SubOptions,
   SumOptions,
   TransposeOptions,
-} from "./backend/types";
-import type { Torchlette } from "./frontend";
-import type { AutogradNode, TensorCreateOptions } from "./frontend-types";
-import type { EngineTensor } from "./runtime/engine";
-import type { Tensor as RuntimeTensor } from "./runtime/tensor";
+} from "../backend/types";
+import type { Torchlette } from "./torchlette";
+import type { AutogradNode, TensorCreateOptions } from "./types";
+import type { EngineTensor } from "../runtime/engine";
+import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 
 export class DisposedTensorError extends Error {
   name = "DisposedTensorError";

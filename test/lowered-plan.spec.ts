@@ -11,7 +11,7 @@ import {
   ENCODER_COPY_OPS,
   isDataSourceOp,
   isViewOp,
-} from "../src/engine/lowered-plan";
+} from "../src/executor/lowered-plan";
 
 describe("LoweredPlan", () => {
   // ========================================================================

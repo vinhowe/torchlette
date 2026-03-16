@@ -1,4 +1,4 @@
-import type { StorageHandle } from "./lazy-types";
+import type { StorageHandle } from "./types";
 import {
   findDeadTensorsAtStep,
   type TensorLifetime,

@@ -5,7 +5,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { type Tensor, Torchlette } from "../../src/frontend";
+import { type Tensor, Torchlette } from "../../src/frontend/torchlette";
 import { checkpoint } from "../../src/nn/checkpoint";
 
 describe("checkpoint gradient correctness", () => {

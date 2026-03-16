@@ -6,7 +6,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { DeviceKind, Tensor, Torchlette } from "../../src/frontend";
+import type { DeviceKind, Tensor, Torchlette } from "../../src/frontend/torchlette";
 import {
   GPT2,
   GPT2_SMALL_CONFIG,

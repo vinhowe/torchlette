@@ -1,4 +1,4 @@
-import type { OP_REGISTRY } from "../backend/op-registry";
+import type { OP_REGISTRY } from "../ops/registry";
 import type { BackendTensor, DeviceKind, DType } from "../backend/types";
 
 /**

@@ -7,12 +7,12 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import type { BackendTensor } from "../src/backend/types";
-import type { StorageHandle } from "../src/engine/lazy-types";
+import type { StorageHandle } from "../src/graph/types";
 import {
   canSafelyRelease,
   releaseBufferImmediate,
   storageTracker,
-} from "../src/engine/storage-tracker";
+} from "../src/graph/storage-tracker";
 
 /** Create a mock StorageHandle with a trackable destroy(). */
 function mockStorage(

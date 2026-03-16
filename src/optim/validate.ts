@@ -1,5 +1,5 @@
 import type { DeviceKind } from "../backend/types";
-import type { Tensor, Torchlette } from "../frontend";
+import type { Tensor, Torchlette } from "../frontend/torchlette";
 
 /**
  * Validate common optimizer constructor parameters.

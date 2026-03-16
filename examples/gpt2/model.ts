@@ -5,7 +5,7 @@
  * Based on the original OpenAI GPT-2 architecture.
  */
 
-import type { DeviceKind, Tensor, Torchlette } from "../../src/frontend";
+import type { DeviceKind, Tensor, Torchlette } from "../../src/frontend/torchlette";
 import {
   checkpoint,
   crossEntropy,

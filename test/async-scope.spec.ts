@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Torchlette } from "../src/frontend";
+import { Torchlette } from "../src/frontend/torchlette";
 import { type EngineTensor, RuntimeEngine } from "../src/runtime/engine";
 
 describe("Engine: async scope context", () => {

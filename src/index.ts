@@ -19,7 +19,7 @@ export {
   type TensorCreateOptions,
   Torchlette,
   torch,
-} from "./frontend";
+} from "./frontend/torchlette";
 export * as nn from "./nn";
 export {
   Adam,

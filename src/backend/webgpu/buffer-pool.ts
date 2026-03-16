@@ -10,7 +10,7 @@
  * (a zero-dependency leaf module).
  */
 
-import { getSizeClass, getSizeForClass } from "../../engine/lifetime-analysis";
+import { getSizeClass, getSizeForClass } from "../../graph/lifetime-analysis";
 import type { DType } from "../types";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { STORAGE_BUFFER_USAGE } from "./gpu-types";

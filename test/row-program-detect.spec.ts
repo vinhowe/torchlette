@@ -1,6 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import type { LazyIRNode, LazyRef } from "../src/engine/lazy-types";
-import { detectRowPrograms } from "../src/engine/row-program-detect";
+import type { LazyIRNode, LazyRef } from "../src/graph/types";
+import { detectRowPrograms } from "../src/compiler/row-program-detect";
 
 /** Create a minimal LazyIRNode for testing. */
 let nextId = 1;
@@ -218,7 +218,7 @@ import { tensorFromArrayWithDtype, webgpuBackend } from "../src/backend/webgpu";
 import type { WebGPUTensor } from "../src/backend/webgpu/gpu-types";
 import { asGPUTensor } from "../src/backend/webgpu/gpu-types";
 import { dispatchRowProgram } from "../src/backend/webgpu/row-program-dispatch";
-import type { RowProgram } from "../src/engine/row-program-types";
+import type { RowProgram } from "../src/compiler/row-program-types";
 import { canUseWebGPU } from "./helpers/webgpu";
 
 /** Read f32 data from a GPU buffer. */

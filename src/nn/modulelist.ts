@@ -3,7 +3,7 @@
  * Similar to PyTorch's nn.ModuleList.
  */
 
-import type { Tensor, Torchlette } from "../frontend";
+import type { Tensor, Torchlette } from "../frontend/torchlette";
 import { Module } from "./module";
 
 export class ModuleList extends Module {

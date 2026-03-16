@@ -9,22 +9,22 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { getBackend } from "../src/backend/registry";
 import type { Backend } from "../src/backend/types";
-import { executePlanOptimized } from "../src/engine/executor-lowered";
+import { executePlanOptimized } from "../src/executor/executor";
 import {
   detectFusionGroups,
   groupToRecipe,
   isFusibleOp,
   reorderPlanForFusion,
   segmentPlanForExecution,
-} from "../src/engine/fusion-detect";
-import type { LazyIRNode, LazyRef } from "../src/engine/lazy-types";
-import { createPendingRef } from "../src/engine/lazy-types";
+} from "../src/compiler/fusion-detect";
+import type { LazyIRNode, LazyRef } from "../src/graph/types";
+import { createPendingRef } from "../src/graph/types";
 import {
   createLazyIRNode,
   resetNodeIdCounter,
   resetStorageIdCounter,
-} from "../src/engine/node-factory";
-import { buildPlan } from "../src/engine/plan-builder";
+} from "../src/graph/node-factory";
+import { buildPlan } from "../src/executor/plan-builder";
 import { RuntimeEngine } from "../src/runtime/engine";
 import { resetBaseIdCounter, type Tensor } from "../src/runtime/tensor";
 

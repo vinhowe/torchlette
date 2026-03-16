@@ -10,7 +10,7 @@
  */
 
 import type { DType } from "../backend/types";
-import type { LazyRef } from "./lazy-types";
+import type { LazyRef } from "../graph/types";
 
 // ============================================================================
 // Expression IR

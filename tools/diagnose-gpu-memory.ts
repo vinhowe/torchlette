@@ -18,8 +18,8 @@ import {
   setGPUMemoryLimit,
   snapshotLeakedAllocs,
 } from "../src/backend/webgpu";
-import { storageTracker } from "../src/engine/lazy";
-import { type Tensor, Torchlette } from "../src/frontend";
+import { storageTracker } from "../src/graph/storage-tracker";
+import { type Tensor, Torchlette } from "../src/frontend/torchlette";
 import { Adam, GradScaler } from "../src/optim";
 
 async function main() {

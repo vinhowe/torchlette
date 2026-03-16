@@ -25,7 +25,7 @@
 
 import type { DType } from "../backend/types";
 import type { FusedKernelRecipe } from "../backend/webgpu/fusion-types";
-import type { EpilogueOp } from "./matmul-epilogue";
+import type { EpilogueOp } from "../compiler/matmul-epilogue";
 
 /** A path to resolve a tensor reference: planNodes[planNodeIndex].inputs[inputIndex]. */
 type PlanNodePath = { planNodeIndex: number; inputIndex: number };
@@ -191,7 +191,7 @@ export interface LoweredPlan {
   planNodeCount: number;
   /** Cached fusion stats from the normal-path execution that built the compiled plan.
    *  Returned by the compiled plan fast path so cumulative stats stay accurate. */
-  cachedStats?: import("./executor-lowered").OptimizedExecutionStats;
+  cachedStats?: import("./executor").OptimizedExecutionStats;
   /** Compiled execution plan: flat GPU command sequence. */
   compiledPlan?: import("./compiled-plan").CompiledPlan;
 }
@@ -247,10 +247,13 @@ export function isViewOp(op: string): boolean {
 // Analysis-Driven Lowered Plan Builder
 // ============================================================================
 
-import type { ExecutionSegment } from "./fusion-detect";
-import type { LazyIRNode, LazyRef } from "./lazy-types";
-import type { MatmulEpiloguePlan } from "./matmul-epilogue";
-import type { RowProgram, RowProgramMatch } from "./row-program-types";
+import type { ExecutionSegment } from "../compiler/fusion-detect";
+import type { MatmulEpiloguePlan } from "../compiler/matmul-epilogue";
+import type {
+  RowProgram,
+  RowProgramMatch,
+} from "../compiler/row-program-types";
+import type { LazyIRNode, LazyRef } from "../graph/types";
 
 /** Default reclaim interval, overridable via TORCHLETTE_RECLAIM_INTERVAL env var. */
 export const DEFAULT_RECLAIM_INTERVAL =

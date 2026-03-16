@@ -17,7 +17,7 @@
 
 import type { DType } from "../backend/types";
 import { isFusibleOp } from "./fusion-detect";
-import type { LazyIRNode, LazyRef } from "./lazy-types";
+import type { LazyIRNode, LazyRef } from "../graph/types";
 import type {
   RowProgram,
   RowProgramMatch,

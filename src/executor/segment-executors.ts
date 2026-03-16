@@ -11,21 +11,21 @@ import {
   type GPUDevice,
 } from "../backend/webgpu/gpu-types";
 import { contiguousStrides, sizeOf } from "../core/shape";
-import { executeNode } from "./executor-sequential";
-import type { FusionGroup, groupToRecipe } from "./fusion-detect";
-import type { LazyIRNode, LazyRef, StorageHandle } from "./lazy-types";
+import { executeNode } from "./sequential";
+import type { FusionGroup, groupToRecipe } from "../compiler/fusion-detect";
+import type { LazyIRNode, LazyRef, StorageHandle } from "../graph/types";
 import {
   _webgpuMatmulImports,
   createStorageHandle,
   ensureWebGPUMatmulImports,
-} from "./node-factory";
+} from "../graph/node-factory";
 import { getInputStorage } from "./op-dispatch";
 import {
   recordFusionFallback,
   setCurrentOpLabel,
   setProfileModule,
-} from "./profiler";
-import type { RowProgram } from "./row-program-types";
+} from "../graph/profiler";
+import type { RowProgram } from "../compiler/row-program-types";
 
 // Module-level cached imports to avoid per-call dynamic import overhead.
 // After first call, these are resolved and reused synchronously.

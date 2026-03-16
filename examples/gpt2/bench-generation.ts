@@ -6,7 +6,7 @@
 
 import * as path from "node:path";
 import { initWebGPU } from "../../src/backend/webgpu";
-import { type Tensor, Torchlette } from "../../src/frontend";
+import { type Tensor, Torchlette } from "../../src/frontend/torchlette";
 import { GPT2Tokenizer } from "./data";
 import { loadPretrainedGPT2 } from "./loader";
 import { DISTILGPT2_CONFIG, type GPT2, type KVCache } from "./model";

@@ -3,7 +3,7 @@
  * and torch.nn.utils.clip_grad_value_.
  */
 
-import type { Tensor, Torchlette } from "../frontend";
+import type { Tensor, Torchlette } from "../frontend/torchlette";
 
 /**
  * Clip gradients of an iterable of parameters by total norm.

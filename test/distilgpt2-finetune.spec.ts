@@ -23,8 +23,8 @@ import {
   setProfilePhase,
   writeProfileJSON,
 } from "../src/backend/webgpu";
-import type { OptimizedExecutionStats } from "../src/engine/executor-lowered";
-import { type Tensor, Torchlette } from "../src/frontend";
+import type { OptimizedExecutionStats } from "../src/executor/executor";
+import { type Tensor, Torchlette } from "../src/frontend/torchlette";
 import { Adam, GradScaler } from "../src/optim";
 
 // First 32 tokens of Shakespeare sonnets tokenized by GPT-2 tokenizer:

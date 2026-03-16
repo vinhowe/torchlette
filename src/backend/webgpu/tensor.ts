@@ -2,7 +2,7 @@
  * Tensor construction helpers: createTensor, createTrackedBuffer, createBufferWithData.
  */
 
-import { getSizeClass, getSizeForClass } from "../../engine/lifetime-analysis";
+import { getSizeClass, getSizeForClass } from "../../graph/lifetime-analysis";
 import type { DType } from "../types";
 import { bufferPool } from "./buffer-pool";
 import type { GPUBuffer, GPUDevice, GPUQueue, WebGPUTensor } from "./gpu-types";

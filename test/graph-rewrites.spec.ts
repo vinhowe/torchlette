@@ -6,7 +6,7 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import type { DType } from "../src/backend/types";
-import type { RewriteContext } from "../src/engine/graph-rewrites";
+import type { RewriteContext } from "../src/compiler/graph-rewrites";
 import {
   eliminateAlgebraicIdentities,
   eliminateCommonSubexpressions,
@@ -15,18 +15,18 @@ import {
   eliminateRedundantContiguous,
   runPasses,
   SIMPLIFICATION_PASSES,
-} from "../src/engine/graph-rewrites";
+} from "../src/compiler/graph-rewrites";
 import type {
   LazyIRNode,
   LazyRef,
   StorageHandle,
-} from "../src/engine/lazy-types";
-import { createPendingRef } from "../src/engine/lazy-types";
+} from "../src/graph/types";
+import { createPendingRef } from "../src/graph/types";
 import {
   createLazyIRNode,
   resetNodeIdCounter,
   resetStorageIdCounter,
-} from "../src/engine/node-factory";
+} from "../src/graph/node-factory";
 
 /** Build a RewriteContext from plan nodes. */
 function buildContext(planNodes: LazyIRNode[]): RewriteContext {

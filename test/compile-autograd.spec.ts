@@ -14,8 +14,8 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   resetNodeIdCounter,
   resetStorageIdCounter,
-} from "../src/engine/node-factory";
-import { Torchlette } from "../src/frontend";
+} from "../src/graph/node-factory";
+import { Torchlette } from "../src/frontend/torchlette";
 import { RuntimeEngine } from "../src/runtime/engine";
 import { resetBaseIdCounter } from "../src/runtime/tensor";
 

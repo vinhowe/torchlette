@@ -3,7 +3,7 @@
  * Similar to PyTorch's nn.Embedding.
  */
 
-import type { DeviceKind, Tensor, Torchlette } from "../frontend";
+import type { DeviceKind, Tensor, Torchlette } from "../frontend/torchlette";
 import { Module } from "./module";
 
 export type EmbeddingOptions = {

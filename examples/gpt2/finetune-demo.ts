@@ -19,8 +19,8 @@ import {
   stopPipelineRecording,
   warmupFromRegistry,
 } from "../../src/backend/webgpu";
-import { storageTracker } from "../../src/engine/storage-tracker";
-import { type Tensor, Torchlette } from "../../src/frontend";
+import { storageTracker } from "../../src/graph/storage-tracker";
+import { type Tensor, Torchlette } from "../../src/frontend/torchlette";
 import { Adam, GradScaler } from "../../src/optim";
 import { GPT2Tokenizer } from "./data";
 import { loadPretrainedGPT2 } from "./loader";

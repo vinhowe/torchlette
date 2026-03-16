@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createAutocastContext, pushAutocast } from "../src/engine/amp";
+import { createAutocastContext, pushAutocast } from "../src/compiler/amp";
 import { RuntimeEngine } from "../src/runtime/engine";
 
 describe("AMP Compile Integration (§12)", () => {
@@ -39,7 +39,7 @@ describe("AMP Compile Integration (§12)", () => {
 
 describe("Frontend AMP-Engine Integration", () => {
   it("autocast sets engine context", async () => {
-    const { Torchlette } = await import("../src/frontend");
+    const { Torchlette } = await import("../src/frontend/torchlette");
     const torch = new Torchlette("cpu");
 
     // Engine context should be null before autocast
@@ -56,7 +56,7 @@ describe("Frontend AMP-Engine Integration", () => {
   });
 
   it("nested autocast updates engine context", async () => {
-    const { Torchlette } = await import("../src/frontend");
+    const { Torchlette } = await import("../src/frontend/torchlette");
     const torch = new Torchlette("cpu");
 
     const states: boolean[] = [];

@@ -20,7 +20,7 @@ import { STORAGE_BUFFER_USAGE } from "../backend/webgpu/gpu-types";
 import { alignBufferSize } from "../backend/webgpu/shape-utils";
 import { getSharedEncoderInstance } from "../backend/webgpu/shared-encoder";
 import { onTeardown, requireContext } from "../backend/webgpu/webgpu-state";
-import { profileSubOpBegin, profileSubOpEnd } from "../engine/profiler";
+import { profileSubOpBegin, profileSubOpEnd } from "../graph/profiler";
 
 /**
  * Maximum packed buffer size before sub-batching (512 MB).

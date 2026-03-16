@@ -14,7 +14,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   resetNodeIdCounter,
   resetStorageIdCounter,
-} from "../src/engine/node-factory";
+} from "../src/graph/node-factory";
 import { RuntimeEngine } from "../src/runtime/engine";
 import { resetBaseIdCounter } from "../src/runtime/tensor";
 

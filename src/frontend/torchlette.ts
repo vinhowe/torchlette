@@ -11,35 +11,35 @@ import type {
   SubOptions,
   SumOptions,
   TransposeOptions,
-} from "./backend/types";
-import { isAutotuneEnabled, setAutotuneEnabled } from "./backend/webgpu";
+} from "../backend/types";
+import { isAutotuneEnabled, setAutotuneEnabled } from "../backend/webgpu";
 import {
   awaitDeferredFence,
   issueDeferredFence,
-} from "./backend/webgpu/buffer-pool";
+} from "../backend/webgpu/buffer-pool";
 import {
   getGPUMemoryLimit,
   getGPUMemoryStats,
   setGPUMemoryLimit,
-} from "./backend/webgpu/memory-tracker";
-import { shapesEqual, sizeOf } from "./core/shape";
+} from "../backend/webgpu/memory-tracker";
+import { shapesEqual, sizeOf } from "../core/shape";
 import {
   type AutocastConfig,
   type AutocastContext,
   createAutocastContext,
-} from "./engine/amp";
-import { storageTracker } from "./engine/storage-tracker";
+} from "../compiler/amp";
+import { storageTracker } from "../graph/storage-tracker";
 import {
   type EngineTensor,
   RuntimeEngine,
   TidyDispatchMode,
-} from "./runtime/engine";
-import type { Tensor as RuntimeTensor } from "./runtime/tensor";
+} from "../runtime/engine";
+import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 
 // Re-export the Tensor class and DisposedTensorError from their new home
-export { DisposedTensorError, Tensor } from "./frontend-tensor";
+export { DisposedTensorError, Tensor } from "./tensor";
 
-import { Tensor } from "./frontend-tensor";
+import { Tensor } from "./tensor";
 
 // Re-export types from frontend-types
 export type {
@@ -48,7 +48,7 @@ export type {
   TensorCreateOptions,
   TorchletteOptions,
   UnpackHook,
-} from "./frontend-types";
+} from "./types";
 
 import type {
   AutocastOptions,
@@ -57,7 +57,7 @@ import type {
   SavedTensorSlot,
   TensorCreateOptions,
   TorchletteOptions,
-} from "./frontend-types";
+} from "./types";
 
 // Re-export backend types
 export type {
@@ -75,7 +75,7 @@ import {
   BINARY_AUTOGRAD_OPS,
   OP_REGISTRY,
   UNARY_AUTOGRAD_OPS,
-} from "./backend/op-registry";
+} from "../ops/registry";
 // Import extracted modules
 import {
   applyAutocastImpl,
@@ -83,15 +83,15 @@ import {
   autocastCastImpl,
   autocastImpl,
   savedTensorHooksImpl,
-} from "./frontend-autocast";
-import { backwardImpl } from "./frontend-autograd";
+} from "./autocast";
+import { backwardImpl } from "./autograd";
 import {
   crossEntropyFusedImpl,
   layernormImpl,
   rmsnormImpl,
   scaledDotProductAttentionImpl,
   softmaxImpl,
-} from "./frontend-fused-ops";
+} from "./decomposed-ops";
 
 export class Torchlette {
   readonly runtime: RuntimeEngine;

@@ -2,7 +2,7 @@
  * Tests for nn modules: Linear, LayerNorm, Embedding
  */
 import { beforeEach, describe, expect, it } from "vitest";
-import { Torchlette } from "../../src/frontend";
+import { Torchlette } from "../../src/frontend/torchlette";
 import { Embedding } from "../../src/nn/embedding";
 import { LayerNorm } from "../../src/nn/layernorm";
 import { Linear } from "../../src/nn/linear";

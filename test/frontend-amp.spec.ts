@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_AMP_POLICY } from "../src/engine/amp";
-import { Torchlette } from "../src/frontend";
+import { DEFAULT_AMP_POLICY } from "../src/compiler/amp";
+import { Torchlette } from "../src/frontend/torchlette";
 
 describe("Frontend Autocast", () => {
   it("isAutocastEnabled is false by default", () => {

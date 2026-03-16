@@ -13,7 +13,7 @@
  * passes per input element.
  */
 
-import type { Tensor, Torchlette } from "../frontend";
+import type { Tensor, Torchlette } from "../frontend/torchlette";
 
 export interface GradcheckOptions {
   /** Perturbation size for finite differences (default: 1e-3) */

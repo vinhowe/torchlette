@@ -6,7 +6,7 @@
 import * as path from "node:path";
 import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
-import { type Tensor, Torchlette } from "../src/frontend";
+import { type Tensor, Torchlette } from "../src/frontend/torchlette";
 import { Adam } from "../src/optim";
 
 async function main() {

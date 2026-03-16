@@ -20,7 +20,7 @@ import { gpuMemoryTracker } from "../../src/backend/webgpu/memory-tracker";
 import {
   resetNodeIdCounter,
   resetStorageIdCounter,
-} from "../../src/engine/node-factory";
+} from "../../src/graph/node-factory";
 import { resetBaseIdCounter } from "../../src/runtime/tensor";
 import { assertClose } from "../helpers/assertions";
 import { canUseWebGPU, cpuOnly } from "../helpers/webgpu";

@@ -1,4 +1,4 @@
-import { OP_REGISTRY } from "../backend/op-registry";
+import { OP_REGISTRY } from "../ops/registry";
 import { getBackend } from "../backend/registry";
 import type {
   AdamStepConfig,
@@ -8,16 +8,16 @@ import type {
   DType,
 } from "../backend/types";
 import { sizeOf } from "../core/shape";
-import type { LazyIRNode, LazyRef, StorageHandle } from "./lazy-types";
-import { createStorageHandle } from "./node-factory";
+import type { LazyIRNode, LazyRef, StorageHandle } from "../graph/types";
+import { createStorageHandle } from "../graph/node-factory";
 import {
   getCurrentOpLabel,
   profileOpBegin,
   profileOpEnd,
   setCurrentOpLabel,
   setProfileModule,
-} from "./profiler";
-import { storageTracker } from "./storage-tracker";
+} from "../graph/profiler";
+import { storageTracker } from "../graph/storage-tracker";
 
 /**
  * Execute a function within a profiling context.

@@ -10,7 +10,7 @@ import {
   findDeadTensorsAtStep,
   getSizeClass,
   getSizeForClass,
-} from "../src/engine/lifetime-analysis";
+} from "../src/graph/lifetime-analysis";
 
 describe("Lifetime Analysis", () => {
   // ========================================================================

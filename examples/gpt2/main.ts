@@ -20,7 +20,7 @@
  *   --test        Run quick sanity test
  */
 
-import { Torchlette, type DeviceKind, type Tensor } from "../../src/frontend";
+import { Torchlette, type DeviceKind, type Tensor } from "../../src/frontend/torchlette";
 import { initWebGPU } from "../../src/backend/webgpu";
 import { GPT2, GPT2_SMALL_CONFIG, type GPT2Config } from "./model";
 import { loadPretrainedGPT2, downloadGPT2 } from "./loader";

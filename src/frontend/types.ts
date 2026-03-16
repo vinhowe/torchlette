@@ -1,7 +1,7 @@
-import type { DeviceKind } from "./backend/types";
-import type { AMPPolicy } from "./engine/amp";
-import type { SavedTensorRecord } from "./runtime/engine";
-import type { Tensor as RuntimeTensor } from "./runtime/tensor";
+import type { DeviceKind } from "../backend/types";
+import type { AMPPolicy } from "../compiler/amp";
+import type { SavedTensorRecord } from "../runtime/engine";
+import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 
 export type TensorCreateOptions = {
   requiresGrad?: boolean;
@@ -12,7 +12,7 @@ export type TensorCreateOptions = {
  * Accessor function for retrieving saved tensors during backward pass.
  * May trigger recomputation if checkpointing hooks are active.
  */
-export type GetSavedFn = (idx: number) => import("./frontend-tensor").Tensor;
+export type GetSavedFn = (idx: number) => import("./tensor").Tensor;
 
 /**
  * Backward function that computes gradients with respect to inputs.
@@ -26,8 +26,8 @@ export type GradFn = (
 ) => Array<RuntimeTensor | null>;
 
 export type AutogradNode = {
-  inputs: import("./frontend-tensor").Tensor[];
-  output: import("./frontend-tensor").Tensor;
+  inputs: import("./tensor").Tensor[];
+  output: import("./tensor").Tensor;
   backward: GradFn;
   /** Saved tensor slots with pack/unpack hooks support */
   savedSlots: SavedTensorSlot[];
@@ -43,15 +43,13 @@ export type AutogradNode = {
  * Pack hook: transforms a tensor into a packed representation during forward.
  * For checkpointing, this replaces the tensor with a lightweight placeholder.
  */
-export type PackHook = (tensor: import("./frontend-tensor").Tensor) => unknown;
+export type PackHook = (tensor: import("./tensor").Tensor) => unknown;
 
 /**
  * Unpack hook: restores a tensor from its packed representation during backward.
  * For checkpointing, this triggers recomputation to reconstruct the tensor.
  */
-export type UnpackHook = (
-  packed: unknown,
-) => import("./frontend-tensor").Tensor;
+export type UnpackHook = (packed: unknown) => import("./tensor").Tensor;
 
 /**
  * Context for saved tensor hooks.

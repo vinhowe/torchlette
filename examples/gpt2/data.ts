@@ -6,7 +6,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Tensor, Torchlette, DeviceKind } from "../../src/frontend";
+import type { Tensor, Torchlette, DeviceKind } from "../../src/frontend/torchlette";
 
 // ============================================================================
 // GPT-2 BPE Tokenizer
