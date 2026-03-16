@@ -10,7 +10,12 @@ import type { RowProgram, RPExpr } from "../../compiler/row-program-types";
 import { isRPValue } from "../../compiler/row-program-types";
 import { applyFusedOp, dtypeToTileIR } from "./fusion-tile-ir";
 import { WORKGROUP_SIZE } from "./shape-utils";
-import type { BlockExpr, KernelContext, TileKernelSpec } from "./tile-ir";
+import type {
+  BindingSpec,
+  BlockExpr,
+  KernelContext,
+  TileKernelSpec,
+} from "./tile-ir";
 import { perRowKernel } from "./tile-ir";
 
 const WG = WORKGROUP_SIZE; // 256
@@ -20,10 +25,7 @@ const WG = WORKGROUP_SIZE; // 256
  */
 export function rowProgramToSpec(program: RowProgram): TileKernelSpec {
   // Build bindings: in0, in1, ... for inputs; output for the write target
-  const bindings: Record<
-    string,
-    { storage: "read" | "read_write"; type: string }
-  > = {};
+  const bindings: Record<string, BindingSpec> = {};
   for (let i = 0; i < program.inputs.length; i++) {
     bindings[`in${i}`] = {
       storage: "read",

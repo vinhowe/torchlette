@@ -13,6 +13,7 @@
 
 import type { DType } from "../backend/types";
 import type {
+  GPUBindGroup,
   GPUBuffer,
   GPUComputePipeline,
 } from "../backend/webgpu/gpu-types";

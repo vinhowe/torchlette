@@ -65,7 +65,7 @@ import {
 // IR Node Types
 // ============================================================================
 
-type ValueType = "block" | "scalar";
+type ValueType = "block" | "scalar" | "vec4";
 export type DataType = "f32" | "f16" | "u32" | "i32";
 type BinaryOp =
   | "add"

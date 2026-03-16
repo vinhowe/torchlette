@@ -746,7 +746,6 @@ function lowerTileLoad(stmt: TileLoadStmt, spec: TileKernelSpec): Statement[] {
         id: -1,
         kind: "const",
         value: 0,
-        dtype: "f16",
         valueType: "scalar",
         dataType: "f16",
       }
@@ -1741,8 +1740,9 @@ function lowerBlockDotBothVec4(
   aSmemStride: number,
   bSmemStride: number,
 ): Statement[] {
-  const { aName, bName, resultName, accName, aCols, threadTileM, threadTileN } =
-    stmt;
+  const { aName, bName, resultName, accName, aCols } = stmt;
+  const threadTileM = stmt.threadTileM!;
+  const threadTileN = stmt.threadTileN!;
   const innerDim = aCols;
   const aStrideV4 = aSmemStride / 4;
   const bStrideV4 = bSmemStride / 4;

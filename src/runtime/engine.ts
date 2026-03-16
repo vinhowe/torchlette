@@ -2129,7 +2129,7 @@ const SIMPLE_UNARY_OPS = [
   "contiguous",
 ] as const;
 
-interface RuntimeEngine {
+export interface RuntimeEngine {
   sqrt(a: Tensor): Tensor;
   relu(a: Tensor): Tensor;
   exp(a: Tensor): Tensor;
@@ -2162,7 +2162,7 @@ for (const op of SIMPLE_UNARY_OPS) {
 // Comparison ops: all delegate to _binaryOp.
 const COMPARISON_OPS = ["gt", "lt", "ge", "le", "eq", "ne"] as const;
 
-interface RuntimeEngine {
+export interface RuntimeEngine {
   gt(a: TensorOrScalar, b: TensorOrScalar): Tensor;
   lt(a: TensorOrScalar, b: TensorOrScalar): Tensor;
   ge(a: TensorOrScalar, b: TensorOrScalar): Tensor;
