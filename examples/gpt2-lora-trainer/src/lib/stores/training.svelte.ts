@@ -1,185 +1,261 @@
 /**
- * Training state store using Svelte 5 runes.
+ * Training store -- config, data, training loop, LoRA export.
  */
 
-import { LoRATrainer, type TrainingConfig } from '$lib/torchlette/trainer';
-import { serializeLoRAToSafetensors } from '$lib/torchlette/weights';
-import { modelStore } from './model.svelte';
+import { LoRATrainer, type TrainingConfig } from "$lib/torchlette/trainer";
+import { serializeLoRAToSafetensors } from "$lib/torchlette/weights";
+import { modelStore } from "./model.svelte";
 
-// Training data state
-let files = $state<Array<{ name: string; content: string; tokens: number }>>([]);
+const TINY_SHAKESPEARE_URL =
+  "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
 
-// Training config - reduced defaults for GPU memory efficiency
-let maxSteps = $state(50);
-let batchSize = $state(1);
-let seqLength = $state(32);
-let learningRate = $state(1e-4);
+// Config
+let rank = $state(8);
+let alpha = $state(8);
+let maxSteps = $state(100);
+let batchSize = $state(4);
+let seqLen = $state(64);
+let lr = $state(1e-4);
+let useAMP = $state(true);
+let useCheckpointing = $state(true);
 
-// Memory optimization options
-let useAMP = $state(true); // Enable AMP by default for memory savings
-let useCheckpointing = $state(true); // Enable checkpointing by default
+// Data
+let dataSource = $state("");
+let dataText = $state("");
+let dataTokenCount = $state(0);
+let dataLoading = $state(false);
 
-// Training progress state
-let isTraining = $state(false);
-let currentStep = $state(0);
-let currentLoss = $state(0);
+// Training progress
+let running = $state(false);
+let step = $state(0);
+let loss = $state(0);
 let lossHistory = $state<number[]>([]);
-let tokensPerSecond = $state(0);
-let trainingError = $state<string | null>(null);
+let tokPerSec = $state(0);
+let error = $state("");
 
-// Trained LoRA state
-let loraWeights = $state<ArrayBuffer | null>(null);
+// Export
+let loraBlob = $state<ArrayBuffer | null>(null);
 let trainer = $state<LoRATrainer | null>(null);
 
-// Derived state
-const totalTokens = $derived(files.reduce((sum, f) => sum + f.tokens, 0));
-const canStartTraining = $derived(
-  files.length > 0 &&
-  !isTraining &&
-  modelStore.isLoaded &&
-  totalTokens >= batchSize * (seqLength + 1)
+// Stop signal
+let shouldStop = false;
+
+const canTrain = $derived(
+  dataTokenCount >= batchSize * (seqLen + 1) && !running && modelStore.isReady,
 );
 
 /**
- * Add training data from a text file.
+ * Auto-fetch TinyShakespeare on first load.
  */
-function addTrainingData(content: string, name: string): void {
-  if (!modelStore.tokenizer) return;
-
-  const tokens = modelStore.tokenizer.encode(content).length;
-  files = [...files, { name, content, tokens }];
+async function fetchShakespeare(): Promise<void> {
+  if (dataText) return;
+  dataLoading = true;
+  try {
+    const resp = await fetch(TINY_SHAKESPEARE_URL);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const text = await resp.text();
+    setData(text, "tinyshakespeare (1.1 MB)");
+  } catch (e) {
+    error = `Failed to fetch Shakespeare: ${e instanceof Error ? e.message : e}`;
+  } finally {
+    dataLoading = false;
+  }
 }
 
-/**
- * Remove a training file.
- */
-function removeTrainingData(index: number): void {
-  files = files.filter((_, i) => i !== index);
+function setData(text: string, source: string): void {
+  dataText = text;
+  dataSource = source;
+  if (modelStore.tokenizer) {
+    dataTokenCount = modelStore.tokenizer.encode(text).length;
+  } else {
+    // rough estimate: ~4 chars per token
+    dataTokenCount = Math.floor(text.length / 4);
+  }
 }
 
-/**
- * Clear all training data.
- */
-function clearTrainingData(): void {
-  files = [];
+function handleFileDrop(file: File): void {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const text = reader.result as string;
+    setData(text, `${file.name} (${(file.size / 1024).toFixed(0)} KB)`);
+  };
+  reader.readAsText(file);
 }
 
-/**
- * Start training.
- */
 async function startTraining(): Promise<void> {
-  if (!canStartTraining) return;
-  if (!modelStore.api || !modelStore.model || !modelStore.tokenizer) return;
+  if (
+    !canTrain ||
+    !modelStore.api ||
+    !modelStore.model ||
+    !modelStore.tokenizer
+  )
+    return;
 
-  isTraining = true;
-  currentStep = 0;
-  currentLoss = 0;
+  running = true;
+  shouldStop = false;
+  step = 0;
+  loss = 0;
   lossHistory = [];
-  tokensPerSecond = 0;
-  trainingError = null;
-  loraWeights = null;
+  tokPerSec = 0;
+  error = "";
+  loraBlob = null;
 
   try {
-    // Combine all training text
-    const allText = files.map((f) => f.content).join('\n\n');
-
-    // Create trainer
-    trainer = new LoRATrainer(modelStore.api, modelStore.model, modelStore.tokenizer);
+    trainer = new LoRATrainer(
+      modelStore.api,
+      modelStore.model,
+      modelStore.tokenizer,
+    );
 
     const config: TrainingConfig = {
       maxSteps,
       batchSize,
-      seqLength,
-      learningRate,
+      seqLength: seqLen,
+      learningRate: lr,
       useAMP,
       useCheckpointing,
     };
 
-    // Train with callbacks
-    await trainer.train(allText, config, {
-      onStepStart: (step) => {
-        currentStep = step;
+    await trainer.train(dataText, config, {
+      onStepStart: (s) => {
+        step = s;
       },
-      onStepEnd: (step, loss, timeMs) => {
-        currentStep = step + 1;
-        currentLoss = loss;
-        lossHistory = [...lossHistory, loss];
-        tokensPerSecond = (batchSize * seqLength) / (timeMs / 1000);
+      onStepEnd: (s, l, timeMs) => {
+        step = s + 1;
+        loss = l;
+        lossHistory = [...lossHistory, l];
+        tokPerSec = (batchSize * seqLen) / (timeMs / 1000);
       },
-      shouldStop: () => !isTraining,
+      shouldStop: () => shouldStop,
     });
 
-    // Export trained weights
+    // Export weights
     const weights = await trainer.exportLoRAWeights();
-    loraWeights = serializeLoRAToSafetensors(weights, {
-      rank: String(modelStore.loraRank),
-      alpha: String(modelStore.loraAlpha),
-      base_model: 'openai-community/gpt2',
-      target_modules: 'c_attn',
+    loraBlob = serializeLoRAToSafetensors(weights, {
+      rank: String(rank),
+      alpha: String(alpha),
+      base_model: "openai-community/gpt2",
+      target_modules: "c_attn",
     });
   } catch (e) {
-    trainingError = e instanceof Error ? e.message : 'Training failed';
+    error = e instanceof Error ? e.message : "Training failed";
   } finally {
-    isTraining = false;
+    running = false;
   }
 }
 
-/**
- * Stop training.
- */
 function stopTraining(): void {
-  isTraining = false;
+  shouldStop = true;
 }
 
-/**
- * Download trained LoRA weights.
- */
 function downloadLoRA(): void {
-  if (!loraWeights) return;
-
-  const blob = new Blob([loraWeights], { type: 'application/octet-stream' });
+  if (!loraBlob) return;
+  const blob = new Blob([loraBlob], { type: "application/octet-stream" });
   const url = URL.createObjectURL(blob);
-
-  const a = document.createElement('a');
+  const a = document.createElement("a");
   a.href = url;
-  a.download = 'gpt2-lora.safetensors';
+  a.download = "gpt2-lora.safetensors";
   a.click();
-
   URL.revokeObjectURL(url);
 }
 
-// Export store
 export const trainingStore = {
-  // Getters
-  get files() { return files; },
-  get maxSteps() { return maxSteps; },
-  get batchSize() { return batchSize; },
-  get seqLength() { return seqLength; },
-  get learningRate() { return learningRate; },
-  get useAMP() { return useAMP; },
-  get useCheckpointing() { return useCheckpointing; },
-  get isTraining() { return isTraining; },
-  get currentStep() { return currentStep; },
-  get currentLoss() { return currentLoss; },
-  get lossHistory() { return lossHistory; },
-  get tokensPerSecond() { return tokensPerSecond; },
-  get trainingError() { return trainingError; },
-  get loraWeights() { return loraWeights; },
-  get totalTokens() { return totalTokens; },
-  get canStartTraining() { return canStartTraining; },
+  // Config
+  get rank() {
+    return rank;
+  },
+  set rank(v: number) {
+    rank = v;
+  },
+  get alpha() {
+    return alpha;
+  },
+  set alpha(v: number) {
+    alpha = v;
+  },
+  get maxSteps() {
+    return maxSteps;
+  },
+  set maxSteps(v: number) {
+    maxSteps = v;
+  },
+  get batchSize() {
+    return batchSize;
+  },
+  set batchSize(v: number) {
+    batchSize = v;
+  },
+  get seqLen() {
+    return seqLen;
+  },
+  set seqLen(v: number) {
+    seqLen = v;
+  },
+  get lr() {
+    return lr;
+  },
+  set lr(v: number) {
+    lr = v;
+  },
+  get useAMP() {
+    return useAMP;
+  },
+  set useAMP(v: boolean) {
+    useAMP = v;
+  },
+  get useCheckpointing() {
+    return useCheckpointing;
+  },
+  set useCheckpointing(v: boolean) {
+    useCheckpointing = v;
+  },
 
-  // Setters
-  set maxSteps(v: number) { maxSteps = v; },
-  set batchSize(v: number) { batchSize = v; },
-  set seqLength(v: number) { seqLength = v; },
-  set learningRate(v: number) { learningRate = v; },
-  set useAMP(v: boolean) { useAMP = v; },
-  set useCheckpointing(v: boolean) { useCheckpointing = v; },
+  // Data
+  get dataSource() {
+    return dataSource;
+  },
+  get dataText() {
+    return dataText;
+  },
+  get dataTokenCount() {
+    return dataTokenCount;
+  },
+  get dataLoading() {
+    return dataLoading;
+  },
+
+  // Progress
+  get running() {
+    return running;
+  },
+  get step() {
+    return step;
+  },
+  get loss() {
+    return loss;
+  },
+  get lossHistory() {
+    return lossHistory;
+  },
+  get tokPerSec() {
+    return tokPerSec;
+  },
+  get error() {
+    return error;
+  },
+  get canTrain() {
+    return canTrain;
+  },
+
+  // Export
+  get loraBlob() {
+    return loraBlob;
+  },
 
   // Actions
-  addTrainingData,
-  removeTrainingData,
-  clearTrainingData,
+  fetchShakespeare,
+  setData,
+  handleFileDrop,
   startTraining,
   stopTraining,
   downloadLoRA,
