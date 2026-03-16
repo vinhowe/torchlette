@@ -28,9 +28,12 @@ import {
   type AutocastContext,
   createAutocastContext,
 } from "./engine/amp";
-import { Engine, type EngineTensor } from "./engine/engine";
 import { storageTracker } from "./engine/storage-tracker";
-import { RuntimeEngine, TidyDispatchMode } from "./runtime/engine";
+import {
+  type EngineTensor,
+  RuntimeEngine,
+  TidyDispatchMode,
+} from "./runtime/engine";
 import type { Tensor as RuntimeTensor } from "./runtime/tensor";
 
 // Re-export the Tensor class and DisposedTensorError from their new home
@@ -91,7 +94,6 @@ import {
 } from "./frontend-fused-ops";
 
 export class Torchlette {
-  readonly engine: Engine;
   readonly runtime: RuntimeEngine;
   private readonly autocastContext: AutocastContext;
   private inCompileRegion = false;
@@ -112,7 +114,6 @@ export class Torchlette {
   > = [];
 
   constructor(backendName?: DeviceKind, options?: TorchletteOptions) {
-    this.engine = new Engine();
     // Configure memory limit if provided (applies to GPU memory tracker)
     if (options?.memoryLimitBytes !== undefined) {
       setGPUMemoryLimit(options.memoryLimitBytes);
@@ -199,7 +200,7 @@ export class Torchlette {
     const enableAutotune = options?.autotune ?? false;
 
     // Enter compile staging mode on engine
-    const compiledFn = this.engine.compile((..._args: unknown[]) => {
+    const compiledFn = this.runtime.compile((..._args: unknown[]) => {
       // We don't use engine's TraceTensors directly,
       // instead we enable fusion and run the actual function
       return undefined;
@@ -1073,7 +1074,7 @@ export class Torchlette {
   async cpu(a: Tensor): Promise<number[]> {
     this._assertUsable(a);
     return this._runEntryPoint(async () => {
-      this.engine.forceRead(a.baseId);
+      this.runtime.forceRead(a.baseId);
       return this.runtime.cpu(a._unwrap());
     });
   }
@@ -1081,7 +1082,7 @@ export class Torchlette {
   async item(a: Tensor): Promise<number> {
     this._assertUsable(a);
     return this._runEntryPoint(async () => {
-      this.engine.forceRead(a.baseId);
+      this.runtime.forceRead(a.baseId);
       return this.runtime.item(a._unwrap());
     });
   }
@@ -1102,7 +1103,7 @@ export class Torchlette {
   async toNow(a: Tensor, device: DeviceKind): Promise<Tensor> {
     this._assertUsable(a);
     return this._runEntryPoint(async () => {
-      this.engine.forceRead(a.baseId);
+      this.runtime.forceRead(a.baseId);
       const inner = await this.runtime.transferNow(a._unwrap(), device);
       return this._wrap(inner, a.requiresGrad);
     });
@@ -1115,7 +1116,7 @@ export class Torchlette {
   private _inPlace(dst: Tensor, fn: () => void, ...extra: Tensor[]): Tensor {
     this._assertUsable(dst, ...extra);
     fn();
-    this._debug_baseCommit(dst.baseId, this.engine.nextMutId());
+    this._debug_baseCommit(dst.baseId, this.runtime.nextMutId());
     return dst;
   }
 
@@ -1384,7 +1385,7 @@ export class Torchlette {
     if (!this._inCheckpointRecompute) {
       this.runtime.markEscaped(inner);
     }
-    const handle = this.engine.createTensor(inner.baseId);
+    const handle = this.runtime.createTensor(inner.baseId);
     const tensor = new Tensor(this, inner, handle, { requiresGrad });
     if (this.inCompileRegion) {
       this._compileCreatedTensors.add(tensor);
@@ -1409,7 +1410,7 @@ export class Torchlette {
       for (const tensor of tensorsToSave) {
         if (hooks) {
           const packed = hooks.packHook(tensor);
-          const record = this.engine._debug_saveForBackward(tensor.baseId);
+          const record = this.runtime._debug_saveForBackward(tensor.baseId);
           savedSlots.push({
             packed,
             unpackHook: hooks.unpackHook,
@@ -1417,7 +1418,7 @@ export class Torchlette {
           });
         } else {
           this.keep(tensor);
-          const record = this.engine._debug_saveForBackward(tensor.baseId);
+          const record = this.runtime._debug_saveForBackward(tensor.baseId);
           savedSlots.push({
             packed: tensor,
             unpackHook: (t) => t as Tensor,
@@ -1427,7 +1428,7 @@ export class Torchlette {
       }
 
       if (savedSlots.length > 0) {
-        this.engine._debug_publishSave(output.baseId);
+        this.runtime._debug_publishSave(output.baseId);
       }
       output._setGradNode({
         inputs,
@@ -1532,7 +1533,7 @@ export class Torchlette {
   }
 
   _runEntryPoint<T>(fn: () => Promise<T>): Promise<T> {
-    return this.engine.runEntryPoint(fn);
+    return this.runtime.runEntryPoint(fn);
   }
 
   // ============================================================================
@@ -1544,7 +1545,7 @@ export class Torchlette {
     this.runtime.pushDispatchMode(tidyMode);
     let result: T | undefined;
     try {
-      this.engine.tidy(() => {
+      this.runtime.tidy(() => {
         result = fn();
         return collectEngineTensors(result);
       });
@@ -1559,10 +1560,10 @@ export class Torchlette {
     const tidyMode = new TidyDispatchMode();
     this.runtime.pushDispatchMode(tidyMode);
     try {
-      return await this.engine.runWithAsyncScope(async () => {
+      return await this.runtime.runWithAsyncScope(async () => {
         const result = await fn();
         for (const et of collectEngineTensors(result)) {
-          this.engine.keep(et);
+          this.runtime.keep(et);
         }
         return result;
       });
@@ -1573,18 +1574,18 @@ export class Torchlette {
   }
 
   async runWithAsyncScope<T>(fn: () => Promise<T>): Promise<T> {
-    return this.engine.runWithAsyncScope(fn);
+    return this.runtime.runWithAsyncScope(fn);
   }
 
   keep(tensor: Tensor): void {
     this._assertUsable(tensor);
-    this.engine.keep(tensor._engineTensor());
+    this.runtime.keep(tensor._engineTensor());
   }
 
   dispose(tensor: Tensor): void {
     this.assertSameEngine(tensor);
     this._disposeAutogradChain(tensor);
-    this.engine.dispose(tensor._engineTensor());
+    this.runtime.dispose(tensor._engineTensor());
   }
 
   /**
@@ -1614,7 +1615,7 @@ export class Torchlette {
         ) {
           const rt = (saved as Tensor)._unwrap();
           if (!rt.isMaterialized()) {
-            this.engine.dispose((saved as Tensor)._engineTensor());
+            this.runtime.dispose((saved as Tensor)._engineTensor());
           }
         }
       }
@@ -1637,7 +1638,7 @@ export class Torchlette {
     }
 
     // Step 1: Run the engine's markStep (token reset, finalization, etc.)
-    await this.engine.markStep();
+    await this.runtime.markStep();
 
     // Step 2: Force all pending tensors to materialize
     await this.runtime.forceAllPending();
@@ -1657,7 +1658,7 @@ export class Torchlette {
   }
 
   _debug_baseCommit(baseId: number, mutId: number): void {
-    this.engine._debug_baseCommit(baseId, mutId);
+    this.runtime._debug_baseCommit(baseId, mutId);
   }
 
   async beginStep(): Promise<void> {

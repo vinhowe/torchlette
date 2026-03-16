@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  Engine,
   type EngineTensor,
   PoisonedEngineError,
-} from "../src/engine/engine";
+  RuntimeEngine,
+} from "../src/runtime/engine";
 
 describe("lifecycle: tidy/keep/dispose", () => {
   it("disposes tensors created in tidy unless kept or returned", () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     let kept: EngineTensor | null = null;
     let dropped: EngineTensor | null = null;
 
@@ -36,7 +36,7 @@ describe("lifecycle: tidy/keep/dispose", () => {
   });
 
   it("allows cleanup-only disposal while busy or poisoned", () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     const tensor = engine.createTensor();
 
     engine._debug_runEntryPoint(() => {
@@ -51,7 +51,7 @@ describe("lifecycle: tidy/keep/dispose", () => {
 
 describe("lifecycle: markStep", () => {
   it("does not throw when poisoned (markStep acquires lock)", async () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     engine._debug_poison();
 
     await expect(engine.markStep()).rejects.toThrow(PoisonedEngineError);

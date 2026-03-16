@@ -1,6 +1,6 @@
 import type { DeviceKind } from "./backend/types";
 import type { AMPPolicy } from "./engine/amp";
-import type { SavedTensorRecord } from "./engine/engine";
+import type { SavedTensorRecord } from "./runtime/engine";
 import type { Tensor as RuntimeTensor } from "./runtime/tensor";
 
 export type TensorCreateOptions = {

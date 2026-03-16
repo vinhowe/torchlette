@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { Engine, EngineBusyError } from "../src/engine/engine";
+import { EngineBusyError, RuntimeEngine } from "../src/runtime/engine";
 
 describe("exec lock", () => {
   it("throws on overlapping entrypoints and releases the lock", () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
 
     expect(() =>
       engine._debug_runEntryPoint(() => {
@@ -15,7 +15,7 @@ describe("exec lock", () => {
   });
 
   it("holds the lock across async entrypoints", async () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     let resolve: (() => void) | undefined;
 
     const pending = engine.runEntryPoint(

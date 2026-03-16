@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { Engine, SavedTensorModifiedError } from "../src/engine/engine";
+import { RuntimeEngine, SavedTensorModifiedError } from "../src/runtime/engine";
 
 describe("saved-for-backward guards", () => {
   it("throws if base is mutated after save", () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     const saved = engine._debug_saveForBackward(4);
 
     engine._debug_baseCommit(4, 20);
@@ -14,7 +14,7 @@ describe("saved-for-backward guards", () => {
   });
 
   it("allows use when no mutation occurred", () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     const saved = engine._debug_saveForBackward(2);
 
     expect(() => engine._debug_useSavedTensor(saved)).not.toThrow();

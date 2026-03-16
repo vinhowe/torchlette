@@ -1,21 +1,21 @@
 import { describe, expect, it } from "vitest";
 import { createAutocastContext, pushAutocast } from "../src/engine/amp";
-import { Engine } from "../src/engine/engine";
+import { RuntimeEngine } from "../src/runtime/engine";
 
 describe("AMP Compile Integration (§12)", () => {
   it("engine has setAutocastContext method", () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     expect(typeof engine.setAutocastContext).toBe("function");
     expect(typeof engine.getAutocastContext).toBe("function");
   });
 
   it("autocast context is null by default", () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     expect(engine.getAutocastContext()).toBeNull();
   });
 
   it("can set and get autocast context", () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     const ctx = createAutocastContext();
     pushAutocast(ctx, { enabled: true });
 
@@ -25,7 +25,7 @@ describe("AMP Compile Integration (§12)", () => {
   });
 
   it("can clear autocast context", () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     const ctx = createAutocastContext();
     pushAutocast(ctx, { enabled: true });
 

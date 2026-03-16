@@ -108,8 +108,8 @@ function checkpointNonReentrant<T extends Tensor>(
   inputs: Tensor[],
   preserveRngState: boolean,
 ): T {
-  // Get the underlying engine for checkpoint primitives
-  const engine = api.engine;
+  // Get the underlying runtime for checkpoint primitives
+  const engine = api.runtime;
 
   // Keep inputs alive for recomputation
   for (const input of inputs) {

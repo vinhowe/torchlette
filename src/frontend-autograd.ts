@@ -26,7 +26,7 @@ async function collectAndForceSavedTensors(
     for (let i = ordered.length - 1; i >= 0; i -= 1) {
       const node = ordered[i];
       for (const slot of node.savedSlots) {
-        torch.engine._debug_useSavedTensor(slot.record);
+        torch.runtime._debug_useSavedTensor(slot.record);
       }
       const unpackedTensors: Tensor[] = [];
       for (const slot of node.savedSlots) {
@@ -278,7 +278,7 @@ export async function backwardImpl(
     const tidyMode = new TidyDispatchMode();
     torch.runtime.pushDispatchMode(tidyMode);
     try {
-      return await torch.engine.runWithAsyncScope(async () => {
+      return await torch.runtime.runWithAsyncScope(async () => {
         const seed = grad ? grad._unwrap() : torch._seedGrad(a);
 
         // Use Tensor as key for gradient accumulation

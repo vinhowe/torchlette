@@ -6,13 +6,13 @@
  */
 
 import { beforeEach, describe, expect, it } from "vitest";
-import { Engine, type MemoryStatsProvider } from "../src/engine/engine";
+import { type MemoryStatsProvider, RuntimeEngine } from "../src/runtime/engine";
 
 describe("Engine Visibility Tools", () => {
-  let engine: Engine;
+  let engine: RuntimeEngine;
 
   beforeEach(() => {
-    engine = new Engine();
+    engine = new RuntimeEngine();
   });
 
   describe("Memory Stats", () => {
