@@ -1,33 +1,4 @@
-import type { Token } from "./tokens";
-
-export type LocId = number;
 export type BaseId = number;
-export type LocRole = "ephemeral" | "persistent";
-
-export interface LocDebugState {
-  locLogicalVersion: number;
-  locVersion: number;
-  role: LocRole;
-  hasValue: boolean;
-}
-
-export interface BaseDebugState {
-  baseCommitVersion: number;
-  committedMutations: number[];
-}
-
-export interface BaseBindingSnapshot {
-  kind: "ssa" | "loc" | "pending_loc";
-  locId?: number;
-  initTokId?: number;
-  initTokKind?: Token["kind"];
-}
-
-export interface TraceTensor {
-  id: number;
-  epoch: number;
-  label?: string;
-}
 
 export type TensorOrigin =
   | { kind: "global" }
@@ -71,11 +42,6 @@ export interface SavedTensorRecord {
   baseCommitVersionAtSave: number;
 }
 
-export interface CheckpointPack {
-  id: number;
-  reachableBases: BaseId[];
-}
-
 export interface BaseState {
   baseCommitVersion: number;
   committed: Set<number>;
@@ -85,16 +51,6 @@ export interface ExecLock {
   held: boolean;
   ownerId: number;
   depth: number;
-}
-
-export interface FinalizeRecord {
-  id: number;
-}
-
-export interface BaseBinding {
-  kind: "ssa" | "loc" | "pending_loc";
-  locId?: LocId;
-  initTok?: Token;
 }
 
 export interface TidyScope {
@@ -111,40 +67,6 @@ export interface TidyScope {
 export interface AsyncScope {
   id: number;
   tensors: Set<EngineTensor>;
-}
-
-export type TraceTensorStatus = "staging" | "live" | "stale";
-
-export interface TokenSnapshot {
-  id: number;
-  key: string;
-  kind: Token["kind"];
-  roots: number[];
-}
-
-export interface DebugSnapshot {
-  tokGlobal: TokenSnapshot;
-  tokLoc: Record<string, TokenSnapshot>;
-  locs: Record<string, LocDebugState>;
-  bases: Record<string, BaseDebugState>;
-  bindings: Record<string, BaseBindingSnapshot>;
-}
-
-export interface DebugPlan {
-  rootTokenIds: number[];
-}
-
-export interface DebugSimulatedState {
-  tokGlobalId: number;
-  tokLocIds: Record<string, number>;
-}
-
-export interface PredictedStateDelta {
-  locLogicalVersions: Record<string, number>;
-  locVersions: Record<string, number>;
-  baseCommitVersions: Record<string, number>;
-  baseCommittedMutations: Record<string, number[]>;
-  publishSaveCount: number;
 }
 
 // ============================================================================
@@ -228,82 +150,4 @@ export interface MemoryStatsProvider {
     completedPlans: number;
   };
   getPendingTensorCount?: () => number;
-}
-
-// ── Plan linearization (merged from planner.ts) ─────────────────────────────
-export interface EventKey {
-  graphInstanceId: number;
-  callInstanceId: number;
-  planInstanceId: number;
-  opNonce: number;
-  drawNonce: number;
-  mutId: number;
-  kind: string;
-}
-
-export interface PlanEvent {
-  key: EventKey;
-  name: string;
-  payload?: Record<string, number>;
-}
-
-export interface SemanticSubevent {
-  kind: string;
-  opNonce: number;
-  drawNonce?: number;
-  mutId?: number;
-  payload?: Record<string, number>;
-}
-
-export interface SemanticSubeventSchedule {
-  graphInstanceId: number;
-  callInstanceId: number;
-  subevents: SemanticSubevent[];
-}
-
-export interface DebugPlanLinearOrder {
-  orderedEvents: PlanEvent[];
-  eventKeys: EventKey[];
-}
-
-function compareEventKey(a: EventKey, b: EventKey): number {
-  if (a.graphInstanceId !== b.graphInstanceId)
-    return a.graphInstanceId - b.graphInstanceId;
-  if (a.callInstanceId !== b.callInstanceId)
-    return a.callInstanceId - b.callInstanceId;
-  if (a.planInstanceId !== b.planInstanceId)
-    return a.planInstanceId - b.planInstanceId;
-  if (a.opNonce !== b.opNonce) return a.opNonce - b.opNonce;
-  if (a.drawNonce !== b.drawNonce) return a.drawNonce - b.drawNonce;
-  if (a.mutId !== b.mutId) return a.mutId - b.mutId;
-  if (a.kind < b.kind) return -1;
-  if (a.kind > b.kind) return 1;
-  return 0;
-}
-
-export function buildPlanLinearOrder(
-  events: PlanEvent[],
-): DebugPlanLinearOrder {
-  const orderedEvents = events
-    .slice()
-    .sort((left, right) => compareEventKey(left.key, right.key));
-  return { orderedEvents, eventKeys: orderedEvents.map((event) => event.key) };
-}
-
-export function expandSemanticSubeventSchedule(
-  schedule: SemanticSubeventSchedule,
-): PlanEvent[] {
-  return schedule.subevents.map((subevent) => ({
-    name: subevent.kind,
-    key: {
-      graphInstanceId: schedule.graphInstanceId,
-      callInstanceId: schedule.callInstanceId,
-      planInstanceId: schedule.callInstanceId,
-      opNonce: subevent.opNonce,
-      drawNonce: subevent.drawNonce ?? 0,
-      mutId: subevent.mutId ?? 0,
-      kind: subevent.kind,
-    },
-    payload: subevent.payload,
-  }));
 }

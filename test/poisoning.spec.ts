@@ -6,18 +6,15 @@ describe("poisoning", () => {
     const engine = new Engine();
     engine._debug_poison();
 
-    expect(() => engine.emitEffect("noop")).toThrow(PoisonedEngineError);
-    expect(() => engine.orderedAccess(1, "load")).toThrow(PoisonedEngineError);
     expect(() => engine._debug_runEntryPoint(() => undefined)).toThrow(
       PoisonedEngineError,
     );
   });
 
-  it("allows cleanup-only operations when poisoned", () => {
+  it("allows disposal when poisoned", () => {
     const engine = new Engine();
-    engine._debug_enqueueFinalize({ id: 1 });
+    const tensor = engine.createTensor();
     engine._debug_poison();
-
-    expect(() => engine._debug_drainFinalizeQueueCleanupOnly()).not.toThrow();
+    expect(() => engine.dispose(tensor)).not.toThrow();
   });
 });

@@ -20,25 +20,3 @@ describe("saved-for-backward guards", () => {
     expect(() => engine._debug_useSavedTensor(saved)).not.toThrow();
   });
 });
-
-describe("publish-save is token-linear", () => {
-  it("advances tokGlobal and records a semantic event", () => {
-    const engine = new Engine();
-    const before = engine._debugSnapshot().tokGlobal.id;
-
-    engine._debug_publishSave(1);
-
-    const after = engine._debugSnapshot().tokGlobal.id;
-    expect(after).not.toBe(before);
-
-    const effects = engine.trace
-      .snapshot()
-      .filter((event) => event.type === "effect");
-    expect(effects).toContainEqual({
-      type: "effect",
-      op: "publish_save",
-      input: before,
-      output: after,
-    });
-  });
-});

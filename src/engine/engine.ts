@@ -1,14 +1,4 @@
-import type { DType } from "../backend/types";
-import { type AutocastContext, hashAMPPolicy } from "./amp";
-import { applyAMPTransform } from "./amp-ir-transform";
-import {
-  CompiledCache,
-  type CompiledCacheKey,
-  generateCacheKey,
-} from "./compile-cache";
-import { buildIRFromTrace, type IRGraph } from "./ir";
-import { type Token, TokenStore } from "./tokens";
-import { type TraceEvent, TraceRecorder } from "./trace";
+import type { AutocastContext } from "./amp";
 
 // Re-export all types, errors, and helpers from extracted modules
 export * from "./engine-types";
@@ -37,19 +27,6 @@ function collectTensorHandles(value: unknown): EngineTensor[] {
   return out;
 }
 
-function collectTraceTensorIds(value: unknown): number[] {
-  if (!value) return [];
-  if (Array.isArray(value))
-    return value.flatMap((item) => collectTraceTensorIds(item));
-  if (
-    typeof value === "object" &&
-    typeof (value as TraceTensor).id === "number" &&
-    typeof (value as TraceTensor).epoch === "number"
-  )
-    return [(value as TraceTensor).id];
-  return [];
-}
-
 function computeRngValue(
   basis: RngBasis,
   opNonce: number,
@@ -74,17 +51,8 @@ function computeRngValue(
 export class EngineBusyError extends Error {
   name = "EngineBusyError";
 }
-export class CheckpointImpureRegionError extends Error {
-  name = "CheckpointImpureRegionError";
-}
-export class HostReadInCompileError extends Error {
-  name = "HostReadInCompileError";
-}
 export class AsyncInCompileError extends Error {
   name = "AsyncInCompileError";
-}
-export class InvalidTraceTensorEscapeError extends Error {
-  name = "InvalidTraceTensorEscapeError";
 }
 export class SavedTensorModifiedError extends Error {
   name = "SavedTensorModifiedError";
@@ -105,63 +73,28 @@ export class RngReplayMismatchError extends Error {
 // Local imports from extracted modules (used by Engine class implementation)
 import {
   type AsyncScope,
-  type BaseBinding,
-  type BaseDebugState,
   type BaseId,
   type BaseState,
   type BaseStateInfo,
-  buildPlanLinearOrder,
-  type CheckpointPack,
-  type DebugPlan,
-  type DebugPlanLinearOrder,
-  type DebugSimulatedState,
-  type DebugSnapshot,
   type EngineMemoryStats,
   EngineTensor,
   type ExecLock,
-  expandSemanticSubeventSchedule,
-  type FinalizeRecord,
-  type LocDebugState,
-  type LocId,
-  type LocRole,
   type MemorySnapshot,
   type MemoryStatsProvider,
-  type PlanEvent,
-  type PredictedStateDelta,
   type RngBasis,
   type RngDrawRecord,
   type RngDrawResult,
   type SavedTensorInfo,
   type SavedTensorRecord,
-  type SemanticSubeventSchedule,
   type TensorOrigin,
   type TidyScope,
-  type TokenSnapshot,
-  type TraceTensor,
-  type TraceTensorStatus,
 } from "./engine-types";
 
 export class Engine {
-  private readonly tokenStore: TokenStore;
-  private tokGlobal: Token;
-  private readonly tokLoc = new Map<LocId, Token>();
-  private readonly locState = new Map<LocId, LocDebugState>();
   private readonly baseState = new Map<BaseId, BaseState>();
-  private readonly baseBindings = new Map<BaseId, BaseBinding>();
-  private readonly finalizeQueue: FinalizeRecord[] = [];
   private readonly execLock: ExecLock = { held: false, ownerId: 0, depth: 0 };
   private nextOwnerId = 1;
   private poisoned = false;
-  private recomputeMode = false;
-  private stagingActive = false;
-  private currentEpoch = 0;
-  private currentStagingIds = new Set<number>();
-  private readonly traceTensorStatus = new Map<number, TraceTensorStatus>();
-  private lastCompiledGraph: IRGraph | null = null;
-  private lastCacheKey: CompiledCacheKey | null = null;
-  private lastCacheHit = false;
-  private readonly compiledCache = new CompiledCache();
-  private nextTraceTensorId = 1;
   private nextSavedTensorId = 1;
   private backwardActive = false;
   private nextTensorId = 1;
@@ -177,9 +110,6 @@ export class Engine {
   private rngCheckpointMode: "record" | "replay" | null = null;
   private rngCheckpointDraws: RngDrawRecord[] = [];
   private rngCheckpointIndex = 0;
-  private nextCheckpointPackId = 1;
-  private checkpointReachableBases: Set<BaseId> | null = null;
-  private activeCheckpointPackId: number | null = null;
   private autocastContext: AutocastContext | null = null;
 
   // Visibility tracking (Phase 1)
@@ -187,13 +117,7 @@ export class Engine {
   private readonly memorySnapshots: MemorySnapshot[] = [];
   private memoryStatsProvider: MemoryStatsProvider | null = null;
 
-  readonly trace: TraceRecorder;
-
-  constructor(trace: TraceRecorder = new TraceRecorder()) {
-    this.trace = trace;
-    this.tokenStore = new TokenStore();
-    this.tokGlobal = this.tokenStore.root;
-  }
+  constructor() {}
 
   /**
    * Set the autocast context for AMP transforms in compiled regions.
@@ -210,90 +134,13 @@ export class Engine {
     return this.autocastContext;
   }
 
-  afterAll(...tokens: Token[]): Token {
-    const { token, roots } = this.tokenStore.afterAll(tokens);
-    const inputs = Array.from(new Set(tokens.map((tok) => tok.id))).sort(
-      (a, b) => a - b,
-    );
-    this.trace.record({
-      type: "after_all",
-      inputs,
-      output: token.id,
-      outputKey: roots.join(","),
-    });
-    return token;
-  }
-
-  orderedAccess(
-    locId: LocId,
-    op: "load" | "store" | "access" = "access",
-    extraTokens: Token[] = [],
-  ): Token {
-    this.ensureNotPoisoned();
-    const tokLoc = this.tokLoc.get(locId);
-    const tokIn = this.afterAll(
-      this.tokGlobal,
-      tokLoc ?? this.tokGlobal,
-      ...extraTokens,
-    );
-    const tokOut = this.tokenStore.createEffectToken();
-
-    this.trace.record({
-      type: "effect",
-      op: `ordered_${op}`,
-      input: tokIn.id,
-      output: tokOut.id,
-      locId,
-    });
-
-    this.tokGlobal = tokOut;
-    this.tokLoc.set(locId, tokOut);
-
-    this.trace.record({
-      type: "set_token",
-      target: "global",
-      token: tokOut.id,
-    });
-    this.trace.record({
-      type: "set_token",
-      target: "loc",
-      locId,
-      token: tokOut.id,
-    });
-
-    return tokOut;
-  }
-
-  emitEffect(op: string): Token {
-    this.ensureNotPoisoned();
-    return this.emitEffectFrom(this.tokGlobal, op);
-  }
-
-  _debug_publishSave(_baseId: BaseId): Token {
-    const tokOut = this.emitEffect("publish_save");
-    this.trace.record({ type: "publish_save" });
-    return tokOut;
-  }
-
-  _debug_emitCompiledCall(
-    graphInstanceId: number,
-    callInstanceId: number,
-  ): void {
-    this.trace.record({
-      type: "compiled_call",
-      graphInstanceId,
-      callInstanceId,
-    });
+  _debug_publishSave(_baseId: BaseId): void {
+    // No-op: token algebra removed. Kept for frontend.ts call site.
   }
 
   _debug_setRngBasis(basis: RngBasis): void {
     this.rngBasis = { ...basis };
     this.rngDrawNonce = 0;
-    this.trace.record({
-      type: "rng_basis",
-      algorithmId: basis.algorithmId,
-      seed: basis.seed,
-    });
   }
 
   _debug_getRngDrawNonce(): number {
@@ -307,7 +154,6 @@ export class Engine {
     this.rngCheckpointMode = "record";
     this.rngCheckpointDraws = [];
     this.rngCheckpointIndex = 0;
-    this.trace.record({ type: "rng_checkpoint_record_start" });
   }
 
   _debug_finishCheckpointRecord(): RngDrawRecord[] {
@@ -318,10 +164,6 @@ export class Engine {
     this.rngCheckpointMode = null;
     this.rngCheckpointDraws = [];
     this.rngCheckpointIndex = 0;
-    this.trace.record({
-      type: "rng_checkpoint_record_finish",
-      count: draws.length,
-    });
     return draws;
   }
 
@@ -332,24 +174,15 @@ export class Engine {
     this.rngCheckpointMode = "replay";
     this.rngCheckpointDraws = draws.slice();
     this.rngCheckpointIndex = 0;
-    this.trace.record({
-      type: "rng_checkpoint_replay_start",
-      count: draws.length,
-    });
   }
 
   _debug_finishCheckpointReplay(): void {
     if (this.rngCheckpointMode !== "replay") {
       throw new Error("Checkpoint RNG replay not active");
     }
-    const count = this.rngCheckpointDraws.length;
     this.rngCheckpointMode = null;
     this.rngCheckpointDraws = [];
     this.rngCheckpointIndex = 0;
-    this.trace.record({
-      type: "rng_checkpoint_replay_finish",
-      count,
-    });
   }
 
   _debug_random(opNonce: number, drawNonce?: number): RngDrawResult {
@@ -365,12 +198,6 @@ export class Engine {
         throw new RngReplayMismatchError("RNG replay drawNonce mismatch");
       }
       this.rngCheckpointIndex += 1;
-      this.trace.record({
-        type: "rng_draw",
-        opNonce: record.opNonce,
-        drawNonce: record.drawNonce,
-        value: record.value,
-      });
       return { drawNonce: record.drawNonce, value: record.value };
     }
 
@@ -388,13 +215,6 @@ export class Engine {
       });
     }
 
-    this.trace.record({
-      type: "rng_draw",
-      opNonce,
-      drawNonce: assignedDrawNonce,
-      value,
-    });
-
     return { drawNonce: assignedDrawNonce, value };
   }
 
@@ -403,7 +223,6 @@ export class Engine {
       throw new NonReentrantBackwardError("Backward is already running");
     }
     this.backwardActive = true;
-    this.emitEffect("backward_root");
     try {
       return fn();
     } finally {
@@ -458,266 +277,18 @@ export class Engine {
     fn: (...args: Args) => R,
   ): (...args: Args) => R {
     return (...args: Args) => {
-      if (this.stagingActive) {
-        throw new Error("Compile already active");
-      }
-
-      this.stagingActive = true;
-      this.currentEpoch += 1;
-      this.currentStagingIds = new Set();
-
       let result: R;
-      try {
-        result = fn(...args);
-      } catch (error) {
-        this.finishStaging(undefined);
-        throw error;
-      }
+      result = fn(...args);
 
       if (
         result &&
         typeof (result as unknown as Promise<unknown>).then === "function"
       ) {
-        this.finishStaging(undefined);
         throw new AsyncInCompileError("Async work is not allowed in compile");
       }
 
-      this.finishStaging(result);
       return result;
     };
-  }
-
-  _debug_hostRead(): void {
-    if (this.stagingActive) {
-      throw new HostReadInCompileError(
-        "Host reads are forbidden during compile",
-      );
-    }
-  }
-
-  _debug_makeTraceTensor(label?: string): TraceTensor {
-    if (!this.stagingActive) {
-      throw new Error("Trace tensors may only be created during compile");
-    }
-    const tensor: TraceTensor = {
-      id: this.nextTraceTensorId++,
-      epoch: this.currentEpoch,
-      label,
-    };
-    this.currentStagingIds.add(tensor.id);
-    this.traceTensorStatus.set(tensor.id, "staging");
-    return tensor;
-  }
-
-  _debug_emitLazyOp(
-    op: string,
-    options?: {
-      inputs?: TraceTensor[];
-      shape?: number[];
-      dtype?: DType;
-      scalarValues?: number[];
-    },
-  ): TraceTensor {
-    const inputs = options?.inputs ?? [];
-    for (const input of inputs) {
-      if (input.epoch !== this.currentEpoch) {
-        throw new Error("Trace tensor belongs to a different epoch");
-      }
-      this._debug_useTraceTensor(input);
-    }
-    const tensor = this._debug_makeTraceTensor(op);
-    this.trace.record({
-      type: "lazy_op",
-      op,
-      traceId: tensor.id,
-      epoch: tensor.epoch,
-      inputs: inputs.length > 0 ? inputs.map((input) => input.id) : undefined,
-      shape: options?.shape ? options.shape.slice() : undefined,
-      dtype: options?.dtype,
-      scalarValues: options?.scalarValues
-        ? options.scalarValues.slice()
-        : undefined,
-    });
-    return tensor;
-  }
-
-  _debug_getLastCompiledGraph(): IRGraph | null {
-    return this.lastCompiledGraph;
-  }
-
-  _debug_getLastCacheKey(): CompiledCacheKey | null {
-    return this.lastCacheKey;
-  }
-
-  _debug_wasLastCompileCacheHit(): boolean {
-    return this.lastCacheHit;
-  }
-
-  _debug_getCompiledCacheStats(): {
-    size: number;
-    entries: { key: string; hitCount: number }[];
-  } {
-    return this.compiledCache.stats();
-  }
-
-  _debug_clearCompiledCache(): void {
-    this.compiledCache.clear();
-  }
-
-  _debug_useTraceTensor(tensor: TraceTensor): void {
-    const status = this.traceTensorStatus.get(tensor.id);
-    if (!status) {
-      throw new Error(`Unknown trace tensor ${tensor.id}`);
-    }
-    if (status === "stale") {
-      throw new InvalidTraceTensorEscapeError("Trace tensor is stale");
-    }
-  }
-
-  _debug_bindPendingLoc(baseId: BaseId, locId: LocId): void {
-    this.getOrCreateLocState(locId);
-    this.baseBindings.set(baseId, { kind: "pending_loc", locId });
-  }
-
-  _debug_setLocRole(locId: LocId, role: LocRole): void {
-    const state = this.getOrCreateLocState(locId);
-    state.role = role;
-  }
-
-  _debug_setRecomputeMode(enabled: boolean): void {
-    this.recomputeMode = enabled;
-    if (!enabled) {
-      this.checkpointReachableBases = null;
-    }
-  }
-
-  _debug_ensureInitialized(
-    baseId: BaseId,
-    options: { subsumedByStore?: boolean } = {},
-  ): Token {
-    const binding = this.getBaseBinding(baseId);
-    if (binding.kind !== "pending_loc" || binding.locId === undefined) {
-      throw new Error("ensureInitialized requires a pending_loc binding");
-    }
-
-    if (binding.initTok) {
-      return binding.initTok;
-    }
-
-    if (this.recomputeMode) {
-      throw new CheckpointImpureRegionError(
-        "Cannot initialize loc during recompute",
-      );
-    }
-
-    this.getOrCreateLocState(binding.locId);
-    const tokOut = options.subsumedByStore
-      ? this.tokenStore.createTokenOnlyToken()
-      : this.tokenStore.createEffectToken();
-    const op = options.subsumedByStore
-      ? "init_loc_token_only"
-      : "init_loc_store";
-    this.trace.record({
-      type: "effect",
-      op,
-      input: this.tokGlobal.id,
-      output: tokOut.id,
-      locId: binding.locId,
-    });
-    this.tokGlobal = tokOut;
-    this.trace.record({
-      type: "set_token",
-      target: "global",
-      token: tokOut.id,
-    });
-
-    binding.initTok = tokOut;
-    return tokOut;
-  }
-
-  _debug_orderedAccessBase(
-    baseId: BaseId,
-    op: "load" | "store" | "access",
-  ): Token {
-    const binding = this.getBaseBinding(baseId);
-    if (binding.kind === "pending_loc" && binding.locId !== undefined) {
-      const initTok = this._debug_ensureInitialized(baseId);
-      return this.orderedAccess(binding.locId, op, [initTok]);
-    }
-    if (binding.kind === "loc" && binding.locId !== undefined) {
-      return this.orderedAccess(binding.locId, op);
-    }
-    throw new Error("orderedAccessBase requires a loc-backed binding");
-  }
-
-  _debug_recomputeLocStore(locId: LocId): void {
-    const state = this.getOrCreateLocState(locId);
-    if (this.recomputeMode && state.role === "persistent") {
-      throw new CheckpointImpureRegionError(
-        "Cannot store to persistent loc during recompute",
-      );
-    }
-    this._debug_commitLocStore(locId);
-  }
-
-  _debug_writeSavedState(): void {
-    if (this.recomputeMode) {
-      throw new CheckpointImpureRegionError(
-        "Cannot create saved_state during recompute",
-      );
-    }
-  }
-
-  _debug_recomputeMutateBase(baseId: BaseId, mutId: number): void {
-    if (this.recomputeMode && this.checkpointReachableBases?.has(baseId)) {
-      throw new CheckpointImpureRegionError(
-        `Cannot mutate base ${baseId} during recompute`,
-      );
-    }
-    this._debug_baseCommit(baseId, mutId);
-  }
-
-  _debug_checkpointPack(bases: BaseId[]): CheckpointPack {
-    const unique = Array.from(new Set(bases)).sort((a, b) => a - b);
-    const pack = { id: this.nextCheckpointPackId++, reachableBases: unique };
-    this.trace.record({
-      type: "checkpoint_pack",
-      packId: pack.id,
-      reachableBases: pack.reachableBases.slice(),
-    });
-    return pack;
-  }
-
-  _debug_startCheckpointRecompute(pack: CheckpointPack): void {
-    this.recomputeMode = true;
-    this.checkpointReachableBases = new Set(pack.reachableBases);
-    this.activeCheckpointPackId = pack.id;
-    this.trace.record({
-      type: "checkpoint_recompute_start",
-      packId: pack.id,
-      reachableBases: pack.reachableBases.slice(),
-    });
-  }
-
-  _debug_finishCheckpointRecompute(): void {
-    this.recomputeMode = false;
-    this.checkpointReachableBases = null;
-    this.trace.record({
-      type: "checkpoint_recompute_finish",
-      packId: this.activeCheckpointPackId,
-    });
-    this.activeCheckpointPackId = null;
-  }
-
-  _debug_enqueueFinalize(record: FinalizeRecord): void {
-    this.finalizeQueue.push(record);
-    this.trace.record({ type: "finalize_enqueue", recordId: record.id });
-  }
-
-  _debug_drainFinalizeQueueCleanupOnly(): FinalizeRecord[] {
-    const drained = this.finalizeQueue.splice(0);
-    this.trace.record({ type: "finalize_drain", count: drained.length });
-    return drained;
   }
 
   createTensor(baseId?: BaseId): EngineTensor {
@@ -741,16 +312,9 @@ export class Engine {
     return tensor;
   }
 
-  forceRead(baseId: BaseId): void {
-    this._debug_hostRead();
-    this.finalizePendingLocBindings();
-    const planTokens = this.collectForcePlanTokens(baseId);
-    const tokenIds = Array.from(
-      new Set(planTokens.map((token) => token.id)),
-    ).sort((a, b) => a - b);
-    this.trace.record({ type: "force_plan", baseId, tokenIds });
-    const token = this.afterAll(...planTokens);
-    this.emitEffectFrom(token, `host_read:${baseId}`);
+  forceRead(_baseId: BaseId): void {
+    // No-op: token algebra and loc bindings removed.
+    // Callers use this as a barrier; actual read is done by the runtime.
   }
 
   tidy<T>(fn: () => T): T {
@@ -810,24 +374,8 @@ export class Engine {
 
   async markStep(): Promise<void> {
     this._debug_runEntryPoint(() => {
-      this.trace.record({ type: "mark_step_begin" });
-      this.emitEffect("mark_step");
-      const finalized = this.finalizePendingLocBindings();
-      this.trace.record({
-        type: "mark_step_finalize_bindings",
-        count: finalized,
-      });
-      this.trace.record({ type: "mark_step_retain" });
-      this.trace.record({ type: "mark_step_gc" });
-      this._debug_drainFinalizeQueueCleanupOnly();
-      this.tokGlobal = this.tokenStore.root;
-      this.tokLoc.clear();
-      this.trace.record({
-        type: "set_token",
-        target: "global",
-        token: this.tokGlobal.id,
-      });
-      this.trace.record({ type: "mark_step_end" });
+      // No-op: token algebra and loc bindings removed.
+      // Runtime handles plan execution directly.
     });
   }
 
@@ -836,12 +384,10 @@ export class Engine {
     this.execLock.held = true;
     this.execLock.ownerId = this.nextOwnerId++;
     this.execLock.depth = 1;
-    this._debug_drainFinalizeQueueCleanupOnly();
     this.ensureNotPoisoned();
   }
 
   private releaseExecLock(): void {
-    this._debug_drainFinalizeQueueCleanupOnly();
     this.execLock.held = false;
     this.execLock.ownerId = 0;
     this.execLock.depth = 0;
@@ -908,228 +454,6 @@ export class Engine {
     return this.basePinCount.get(baseId) ?? 0;
   }
 
-  _debugSnapshot(): DebugSnapshot {
-    const collect = <K, V, R>(
-      map: Map<K, V>,
-      transform: (v: V) => R,
-    ): Record<string, R> => {
-      const result: Record<string, R> = {};
-      for (const [k, v] of Array.from(map.entries()).sort(
-        ([a], [b]) => (a as number) - (b as number),
-      )) {
-        result[String(k)] = transform(v);
-      }
-      return result;
-    };
-
-    return {
-      tokGlobal: this.snapshotToken(this.tokGlobal),
-      tokLoc: collect(this.tokLoc, (t) => this.snapshotToken(t)),
-      locs: collect(this.locState, (s) => ({
-        locLogicalVersion: s.locLogicalVersion,
-        locVersion: s.locVersion,
-        role: s.role,
-        hasValue: s.hasValue,
-      })),
-      bases: collect(this.baseState, (s) => ({
-        baseCommitVersion: s.baseCommitVersion,
-        committedMutations: Array.from(s.committed).sort((a, b) => a - b),
-      })),
-      bindings: collect(this.baseBindings, (b) => ({
-        kind: b.kind,
-        locId: b.locId,
-        initTokId: b.initTok?.id,
-        initTokKind: b.initTok?.kind,
-      })),
-    };
-  }
-
-  _debugCreateToken(): Token {
-    return this.tokenStore.createDebugToken();
-  }
-
-  _debug_buildPlan(tokens: Token[]): DebugPlan {
-    return { rootTokenIds: tokens.map((token) => token.id) };
-  }
-
-  _debug_buildPlanLinearOrder(events: PlanEvent[]): DebugPlanLinearOrder {
-    return buildPlanLinearOrder(events);
-  }
-
-  _debug_buildPlanFromTrace(
-    traceEvents: TraceEvent[] = this.trace.snapshot(),
-  ): DebugPlanLinearOrder {
-    let opNonce = 0;
-    const events: PlanEvent[] = [];
-
-    const emit = (
-      kind: string,
-      overrides?: { opNonce?: number; drawNonce?: number; mutId?: number },
-      payload?: Record<string, number>,
-    ) => {
-      events.push({
-        name: kind,
-        key: {
-          graphInstanceId: 0,
-          callInstanceId: 0,
-          planInstanceId: 0,
-          opNonce: overrides?.opNonce ?? opNonce,
-          drawNonce: overrides?.drawNonce ?? 0,
-          mutId: overrides?.mutId ?? 0,
-          kind,
-        },
-        ...(payload ? { payload } : {}),
-      });
-    };
-
-    for (const event of traceEvents) {
-      if (event.type === "rng_basis") {
-        opNonce += 1;
-        emit("rng_basis", undefined, {
-          algorithmId: event.algorithmId,
-          seed: event.seed,
-        });
-      } else if (
-        event.type === "rng_checkpoint_record_start" ||
-        event.type === "rng_checkpoint_record_finish" ||
-        event.type === "rng_checkpoint_replay_start" ||
-        event.type === "rng_checkpoint_replay_finish"
-      ) {
-        opNonce += 1;
-        emit(event.type);
-      } else if (event.type === "publish_save") {
-        opNonce += 1;
-        emit("publish_save");
-      } else if (event.type === "rng_draw") {
-        opNonce = Math.max(opNonce, event.opNonce);
-        emit(
-          "rng_draw",
-          { opNonce: event.opNonce, drawNonce: event.drawNonce },
-          { drawNonce: event.drawNonce, opNonce: event.opNonce },
-        );
-      } else if (event.type === "loc_schedule") {
-        opNonce += 1;
-        emit("loc_schedule", undefined, { locId: event.locId });
-      } else if (event.type === "loc_commit") {
-        opNonce += 1;
-        emit("loc_commit", undefined, { locId: event.locId });
-      } else if (event.type === "base_commit") {
-        opNonce += 1;
-        emit(
-          "base_commit",
-          { mutId: event.mutId },
-          { baseId: event.baseId, mutId: event.mutId },
-        );
-      }
-    }
-
-    return buildPlanLinearOrder(events);
-  }
-
-  _debug_buildPlanFromSchedules(
-    schedules: SemanticSubeventSchedule[],
-    traceEvents: TraceEvent[] = this.trace.snapshot(),
-  ): DebugPlanLinearOrder {
-    const basePlan = this._debug_buildPlanFromTrace(traceEvents);
-    const scheduleEvents = schedules.flatMap((schedule) =>
-      expandSemanticSubeventSchedule(schedule),
-    );
-    return buildPlanLinearOrder([...basePlan.orderedEvents, ...scheduleEvents]);
-  }
-
-  _debug_buildPlanWithCompiledCalls(
-    schedules: Record<number, SemanticSubeventSchedule>,
-    traceEvents: TraceEvent[] = this.trace.snapshot(),
-  ): DebugPlanLinearOrder {
-    const compiledSchedules: SemanticSubeventSchedule[] = [];
-    for (const event of traceEvents) {
-      if (event.type === "compiled_call") {
-        const schedule = schedules[event.callInstanceId];
-        if (!schedule) {
-          throw new Error(
-            `Missing schedule for compiled call ${event.callInstanceId}`,
-          );
-        }
-        compiledSchedules.push(schedule);
-      }
-    }
-    return this._debug_buildPlanFromSchedules(compiledSchedules, traceEvents);
-  }
-
-  _debug_simulateCommitPlan(plan: DebugPlanLinearOrder): PredictedStateDelta {
-    const locLogicalVersions: Record<string, number> = {};
-    const locVersions: Record<string, number> = {};
-    const baseCommitVersions: Record<string, number> = {};
-    const baseCommittedMutations: Record<string, number[]> = {};
-    let publishSaveCount = 0;
-
-    for (const event of plan.orderedEvents) {
-      if (event.key.kind === "loc_schedule") {
-        const locId = event.payload?.locId;
-        if (locId !== undefined) {
-          const key = locId.toString();
-          locLogicalVersions[key] = (locLogicalVersions[key] ?? 0) + 1;
-        }
-      }
-
-      if (event.key.kind === "loc_commit") {
-        const locId = event.payload?.locId;
-        if (locId !== undefined) {
-          const key = locId.toString();
-          locVersions[key] = (locVersions[key] ?? 0) + 1;
-        }
-      }
-
-      if (event.key.kind === "base_commit") {
-        const baseId = event.payload?.baseId;
-        if (baseId !== undefined) {
-          const key = baseId.toString();
-          baseCommitVersions[key] = (baseCommitVersions[key] ?? 0) + 1;
-          const mutId = event.payload?.mutId ?? event.key.mutId;
-          if (!baseCommittedMutations[key]) {
-            baseCommittedMutations[key] = [];
-          }
-          baseCommittedMutations[key].push(mutId);
-        }
-      }
-
-      if (event.key.kind === "publish_save") {
-        publishSaveCount += 1;
-      }
-    }
-
-    return {
-      locLogicalVersions,
-      locVersions,
-      baseCommitVersions,
-      baseCommittedMutations,
-      publishSaveCount,
-    };
-  }
-
-  _debug_scheduleLocAccess(locId: LocId): LocDebugState {
-    const state = this.getOrCreateLocState(locId);
-    state.locLogicalVersion += 1;
-    this.trace.record({
-      type: "loc_schedule",
-      locId,
-      locLogicalVersion: state.locLogicalVersion,
-    });
-    return { ...state };
-  }
-
-  _debug_commitLocStore(locId: LocId): LocDebugState {
-    const state = this.getOrCreateLocState(locId);
-    state.locVersion += 1;
-    state.hasValue = true;
-    this.trace.record({
-      type: "loc_commit",
-      locId,
-      locVersion: state.locVersion,
-    });
-    return { ...state };
-  }
-
   /**
    * Get the next unique mutation ID for in-place operations.
    * Per spec §4.3, each in-place mutation needs a unique mutId.
@@ -1138,80 +462,13 @@ export class Engine {
     return this.nextMutIdValue++;
   }
 
-  _debug_baseCommit(baseId: BaseId, mutId: number): BaseDebugState {
+  _debug_baseCommit(baseId: BaseId, mutId: number): void {
     const state = this.getOrCreateBaseState(baseId);
     if (state.committed.has(mutId)) {
       throw new Error(`base_commit already recorded for mutId ${mutId}`);
     }
     state.committed.add(mutId);
     state.baseCommitVersion += 1;
-    this.trace.record({
-      type: "base_commit",
-      baseId,
-      mutId,
-      baseCommitVersion: state.baseCommitVersion,
-    });
-    return {
-      baseCommitVersion: state.baseCommitVersion,
-      committedMutations: Array.from(state.committed).sort((a, b) => a - b),
-    };
-  }
-
-  _debug_simulateCommit(_plan: DebugPlan): DebugSimulatedState {
-    const snapshot = this._debugSnapshot();
-    const tokLocIds: Record<string, number> = {};
-    for (const [locId, token] of Object.entries(snapshot.tokLoc)) {
-      tokLocIds[locId] = token.id;
-    }
-    return {
-      tokGlobalId: snapshot.tokGlobal.id,
-      tokLocIds,
-    };
-  }
-
-  private snapshotToken(token: Token): TokenSnapshot {
-    return {
-      id: token.id,
-      key: token.key,
-      kind: token.kind,
-      roots: token.roots.slice(),
-    };
-  }
-
-  private getOrCreateLocState(locId: LocId): LocDebugState {
-    const existing = this.locState.get(locId);
-    if (existing) {
-      return existing;
-    }
-    const initial: LocDebugState = {
-      locLogicalVersion: 0,
-      locVersion: 0,
-      role: "ephemeral",
-      hasValue: false,
-    };
-    this.locState.set(locId, initial);
-    return initial;
-  }
-
-  private getOrCreateBaseState(baseId: BaseId): BaseState {
-    const existing = this.baseState.get(baseId);
-    if (existing) {
-      return existing;
-    }
-    const initial: BaseState = {
-      baseCommitVersion: 0,
-      committed: new Set<number>(),
-    };
-    this.baseState.set(baseId, initial);
-    return initial;
-  }
-
-  private getBaseBinding(baseId: BaseId): BaseBinding {
-    const binding = this.baseBindings.get(baseId);
-    if (!binding) {
-      throw new Error(`No binding for baseId ${baseId}`);
-    }
-    return binding;
   }
 
   private ensureNotPoisoned(): void {
@@ -1223,62 +480,6 @@ export class Engine {
   private nextRngDrawNonce(): number {
     this.rngDrawNonce += 1;
     return this.rngDrawNonce;
-  }
-
-  private finishStaging(result: unknown): void {
-    const returnedIds = new Set<number>(collectTraceTensorIds(result));
-    for (const traceId of this.currentStagingIds) {
-      if (returnedIds.has(traceId)) {
-        this.traceTensorStatus.set(traceId, "live");
-      } else {
-        this.traceTensorStatus.set(traceId, "stale");
-      }
-    }
-    let graph = buildIRFromTrace(this.trace.snapshot(), this.currentEpoch);
-
-    // Apply AMP transform if autocast is enabled (§12)
-    // This implements the "select-gated commits" pattern
-    let ampPolicyHash = "disabled";
-    if (this.autocastContext?.current.enabled) {
-      const ampResult = applyAMPTransform(graph, this.autocastContext);
-      if (ampResult.modified) {
-        graph = ampResult.graph;
-      }
-      ampPolicyHash = hashAMPPolicy(this.autocastContext.current.policy);
-    }
-
-    // Cache lookup and storage
-    // Include AMP policy hash in the cache key for variant selection
-    if (graph.nodes.length > 0) {
-      const baseCacheKey = generateCacheKey(graph);
-      // Extend cache key with AMP policy hash
-      const cacheKey: CompiledCacheKey = {
-        ...baseCacheKey,
-        irHash: `${baseCacheKey.irHash}:amp=${ampPolicyHash}`,
-      };
-      const cached = this.compiledCache.get(cacheKey);
-
-      if (cached) {
-        // Cache hit - we could reuse the cached graph
-        // For now, we just record the hit for statistics
-        this.lastCacheHit = true;
-        this.lastCacheKey = cacheKey;
-        this.lastCompiledGraph = cached.graph;
-      } else {
-        // Cache miss - store the new graph
-        this.compiledCache.set(cacheKey, graph);
-        this.lastCacheHit = false;
-        this.lastCacheKey = cacheKey;
-        this.lastCompiledGraph = graph;
-      }
-    } else {
-      this.lastCompiledGraph = null;
-      this.lastCacheKey = null;
-      this.lastCacheHit = false;
-    }
-
-    this.currentStagingIds.clear();
-    this.stagingActive = false;
   }
 
   private registerTensor(tensor: EngineTensor): void {
@@ -1298,66 +499,17 @@ export class Engine {
     }
   }
 
-  private finalizePendingLocBindings(): number {
-    let finalized = 0;
-    for (const [baseId, binding] of this.baseBindings.entries()) {
-      if (binding.kind !== "pending_loc" || binding.locId === undefined) {
-        continue;
-      }
-      const locState = this.locState.get(binding.locId);
-      if (!locState || !locState.hasValue) {
-        continue;
-      }
-      this.baseBindings.set(baseId, {
-        kind: "loc",
-        locId: binding.locId,
-      });
-      finalized += 1;
+  private getOrCreateBaseState(baseId: BaseId): BaseState {
+    const existing = this.baseState.get(baseId);
+    if (existing) {
+      return existing;
     }
-    return finalized;
-  }
-
-  private collectForcePlanTokens(baseId: BaseId): Token[] {
-    const tokens: Token[] = [];
-    const binding = this.baseBindings.get(baseId);
-    if (binding) {
-      if (binding.initTok) {
-        tokens.push(binding.initTok);
-      }
-      if (
-        (binding.kind === "pending_loc" || binding.kind === "loc") &&
-        binding.locId !== undefined
-      ) {
-        const tokLoc = this.tokLoc.get(binding.locId);
-        if (tokLoc) {
-          tokens.push(tokLoc);
-        }
-      }
-    }
-    if (tokens.length === 0) {
-      tokens.push(this.tokGlobal);
-    }
-    return tokens;
-  }
-
-  private emitEffectFrom(input: Token, op: string): Token {
-    const tokOut = this.tokenStore.createEffectToken();
-
-    this.trace.record({
-      type: "effect",
-      op,
-      input: input.id,
-      output: tokOut.id,
-    });
-
-    this.tokGlobal = tokOut;
-    this.trace.record({
-      type: "set_token",
-      target: "global",
-      token: tokOut.id,
-    });
-
-    return tokOut;
+    const initial: BaseState = {
+      baseCommitVersion: 0,
+      committed: new Set<number>(),
+    };
+    this.baseState.set(baseId, initial);
+    return initial;
   }
 
   // ============================================================================
@@ -1421,25 +573,13 @@ export class Engine {
     const infos: BaseStateInfo[] = [];
 
     for (const [baseId, count] of this.basePinCount) {
-      const binding = this.baseBindings.get(baseId);
-      const state = this.baseState.get(baseId);
-
-      let locId: number | null = null;
-      let hasValue = false;
-
-      if (binding?.locId !== undefined) {
-        locId = binding.locId;
-        const locState = this.locState.get(binding.locId);
-        hasValue = locState?.hasValue ?? false;
-      }
-
       infos.push({
         baseId,
         pinCount: count,
-        binding: binding?.kind ?? "ssa",
-        locId,
-        hasValue,
-        commitVersion: state?.baseCommitVersion ?? 0,
+        binding: "ssa",
+        locId: null,
+        hasValue: false,
+        commitVersion: this.baseState.get(baseId)?.baseCommitVersion ?? 0,
       });
     }
 
