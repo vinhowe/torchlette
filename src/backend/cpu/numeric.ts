@@ -45,7 +45,7 @@ export class Tensor {
     }
     if (isContiguous(this)) {
       const strides = computeStrides(shape);
-      return new Tensor(shape, this.data, strides, this.offset);
+      return new Tensor(shape, this.data, strides, this.offset, false);
     }
     // Non-contiguous: try to compute valid strides
     const newStrides = inferReshapeStrides(this.shape, this.strides, shape);
@@ -55,7 +55,7 @@ export class Tensor {
     // Incompatible: materialize first
     const contig = this.contiguous();
     const strides = computeStrides(shape);
-    return new Tensor(shape, contig.data, strides, contig.offset);
+    return new Tensor(shape, contig.data, strides, contig.offset, false);
   }
 
   /**
@@ -104,6 +104,10 @@ export function tensorFromArray(
     shape,
     values instanceof Float32Array ? values.slice() : Float32Array.from(values),
   );
+}
+
+export function zeros(shape: Shape): Tensor {
+  return new Tensor(shape, new Float32Array(sizeOf(shape)));
 }
 
 export function full(shape: Shape, fillValue: number): Tensor {
