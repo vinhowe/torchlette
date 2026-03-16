@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
-  Engine,
   RngReplayExhaustedError,
   RngReplayMismatchError,
-} from "../src/engine/engine";
+  RuntimeEngine,
+} from "../src/runtime/engine";
 
 describe("rng semantics", () => {
   it("assigns unique draw nonces for repeated random ops", () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     engine._debug_setRngBasis({ algorithmId: 1, seed: 123 });
 
     const first = engine._debug_random(7);
@@ -19,7 +19,7 @@ describe("rng semantics", () => {
   });
 
   it("is deterministic for explicit draw nonces and advances the counter", () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     engine._debug_setRngBasis({ algorithmId: 2, seed: 9 });
 
     const first = engine._debug_random(3, 10);
@@ -32,7 +32,7 @@ describe("rng semantics", () => {
   });
 
   it("replays checkpointed draws without advancing persistent RNG state", () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     engine._debug_setRngBasis({ algorithmId: 0, seed: 42 });
 
     engine._debug_startCheckpointRecord();
@@ -58,7 +58,7 @@ describe("rng semantics", () => {
   });
 
   it("throws on replay mismatch or exhaustion", () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     engine._debug_setRngBasis({ algorithmId: 0, seed: 1 });
 
     engine._debug_startCheckpointRecord();

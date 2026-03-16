@@ -6,7 +6,7 @@
  * - Op dispatch (engine/op-dispatch.ts): arity, category
  * - Tile compiler (webgpu/tile-compiler.ts): wgslInfix, wgslPrefix, wgslFnName
  * - Vectorization (webgpu/fusion-types.ts): vectorizable flag
- * - Dtype safety (engine/dtype-rules.ts): dtypeRule
+ * - Dtype safety (OP_DTYPE_RULES below): dtypeRule
  * - Autograd (frontend.ts): grad, ttGrad, tsGrad
  *
  * Op behavior (WGSL codegen) lives in fusion-tile-ir.ts via BlockExpr methods.
@@ -545,3 +545,103 @@ export const UNARY_AUTOGRAD_OPS: string[] = Object.keys(OP_REGISTRY).filter(
 export const BINARY_AUTOGRAD_OPS: string[] = Object.keys(OP_REGISTRY).filter(
   (k) => OP_REGISTRY[k].ttGrad != null,
 );
+
+// ============================================================================
+// Dtype Rules (merged from engine/dtype-rules.ts)
+// ============================================================================
+
+export type OpDtypeCategory =
+  | "f16_eligible"
+  | "f32_required"
+  | "promote_inputs"
+  | "preserve"
+  | "always_f32"
+  | "cast";
+
+// Auto-derive rules for registry ops from their dtypeRule field
+const _registryRules: Record<string, { category: OpDtypeCategory }> = {};
+for (const [name, def] of Object.entries(OP_REGISTRY)) {
+  if (def.dtypeRule) {
+    _registryRules[name] = { category: def.dtypeRule };
+  }
+}
+
+/** Per-op dtype behavior rules. Registry ops auto-derived; non-registry ops listed manually. */
+export const OP_DTYPE_RULES: Record<string, { category: OpDtypeCategory }> = {
+  ..._registryRules,
+
+  // Non-registry ops
+  matmul: { category: "f16_eligible" },
+  sum: { category: "f32_required" },
+  mean: { category: "f32_required" },
+  reshape: { category: "preserve" },
+  expand: { category: "preserve" },
+  transpose: { category: "preserve" },
+  permute: { category: "preserve" },
+  contiguous: { category: "preserve" },
+  gather: { category: "preserve" },
+  scatterAdd: { category: "preserve" },
+  transfer: { category: "preserve" },
+  stridedScatterCopy: { category: "preserve" },
+  stridedScatterAdd: { category: "preserve" },
+  tril: { category: "preserve" },
+  triu: { category: "preserve" },
+  argmax: { category: "always_f32" },
+  argmin: { category: "always_f32" },
+  tensorFromArray: { category: "always_f32" },
+  zeros: { category: "always_f32" },
+  full: { category: "always_f32" },
+  arange: { category: "always_f32" },
+  cast: { category: "cast" },
+};
+
+/** Supplementary op names for AMP (composite ops, not in LazyOpCode). */
+const SUPPLEMENTARY_F16_ELIGIBLE = new Set([
+  "linear",
+  "conv1d",
+  "conv2d",
+  "conv3d",
+  "bmm",
+  "addmm",
+]);
+const SUPPLEMENTARY_F32_REQUIRED = new Set([
+  "softmax",
+  "log_softmax",
+  "layer_norm",
+  "batch_norm",
+  "group_norm",
+  "loss",
+  "cross_entropy",
+  "mse_loss",
+]);
+
+const _f16Eligible = new Set(
+  Object.entries(OP_DTYPE_RULES)
+    .filter(([_, r]) => r.category === "f16_eligible")
+    .map(([k]) => k),
+);
+const _f32Required = new Set(
+  Object.entries(OP_DTYPE_RULES)
+    .filter(([_, r]) => r.category === "f32_required")
+    .map(([k]) => k),
+);
+
+/** All f16-eligible ops (lazy + supplementary). */
+export const F16_ELIGIBLE: ReadonlySet<string> = new Set([
+  ..._f16Eligible,
+  ...SUPPLEMENTARY_F16_ELIGIBLE,
+]);
+
+/** All f32-required ops (lazy + supplementary). */
+export const F32_REQUIRED: ReadonlySet<string> = new Set([
+  ..._f32Required,
+  ...SUPPLEMENTARY_F32_REQUIRED,
+]);
+
+/** Promote two dtypes for binary ops. f16 + f32 → f32; same → unchanged. */
+export function promoteDtype(a: DType, b: DType): DType {
+  if (a === b) return a;
+  if ((a === "f16" && b === "f32") || (a === "f32" && b === "f16"))
+    return "f32";
+  return a;
+}

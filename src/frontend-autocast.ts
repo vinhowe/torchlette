@@ -1,3 +1,4 @@
+import { OP_DTYPE_RULES, promoteDtype } from "./backend/op-registry";
 import type { DType } from "./backend/types";
 import {
   DEFAULT_AMP_POLICY,
@@ -6,7 +7,6 @@ import {
   popAutocast,
   pushAutocast,
 } from "./engine/amp";
-import { OP_DTYPE_RULES, promoteDtype } from "./engine/dtype-rules";
 import type { LazyOpCode } from "./engine/lazy-types";
 import type { Torchlette } from "./frontend";
 import type { Tensor } from "./frontend-tensor";
@@ -31,14 +31,14 @@ export function autocastImpl<T>(
   });
 
   // Set the engine's autocast context for AMP transforms in compile (§12)
-  torch.engine.setAutocastContext(torch._getAutocastContext());
+  torch.runtime.setAutocastContext(torch._getAutocastContext());
 
   try {
     return fn();
   } finally {
     popAutocast(torch._getAutocastContext());
     // Update engine's context to reflect the popped state
-    torch.engine.setAutocastContext(
+    torch.runtime.setAutocastContext(
       torch._getAutocastContext().configStack.length > 0
         ? torch._getAutocastContext()
         : null,
@@ -65,14 +65,14 @@ export async function autocastAsyncImpl<T>(
   });
 
   // Set the engine's autocast context for AMP transforms in compile (§12)
-  torch.engine.setAutocastContext(torch._getAutocastContext());
+  torch.runtime.setAutocastContext(torch._getAutocastContext());
 
   try {
     return await fn();
   } finally {
     popAutocast(torch._getAutocastContext());
     // Update engine's context to reflect the popped state
-    torch.engine.setAutocastContext(
+    torch.runtime.setAutocastContext(
       torch._getAutocastContext().configStack.length > 0
         ? torch._getAutocastContext()
         : null,

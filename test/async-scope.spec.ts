@@ -1,11 +1,10 @@
 import { describe, expect, it } from "vitest";
-
-import { Engine, type EngineTensor } from "../src/engine/engine";
 import { Torchlette } from "../src/frontend";
+import { type EngineTensor, RuntimeEngine } from "../src/runtime/engine";
 
 describe("Engine: async scope context", () => {
   it("tracks tensors created during async operation", async () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     let createdInScope: EngineTensor | null = null;
 
     await engine.runWithAsyncScope(async () => {
@@ -19,7 +18,7 @@ describe("Engine: async scope context", () => {
   });
 
   it("keeps tensors marked with keep()", async () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     let kept: EngineTensor | null = null;
     let notKept: EngineTensor | null = null;
 
@@ -38,7 +37,7 @@ describe("Engine: async scope context", () => {
   });
 
   it("returns result from async function", async () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
 
     const result = await engine.runWithAsyncScope(async () => {
       await Promise.resolve();
@@ -49,7 +48,7 @@ describe("Engine: async scope context", () => {
   });
 
   it("can nest async scopes", async () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     let outerTensor: EngineTensor | null = null;
     let innerTensor: EngineTensor | null = null;
 
@@ -71,7 +70,7 @@ describe("Engine: async scope context", () => {
   });
 
   it("does not affect tensors in sync tidy scopes", async () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     let tidyTensor: EngineTensor | null = null;
     let asyncTensor: EngineTensor | null = null;
 
@@ -95,7 +94,7 @@ describe("Engine: async scope context", () => {
   });
 
   it("tensors in tidy scope during async scope go to tidy, not async", async () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     let inTidy: EngineTensor | null = null;
 
     await engine.runWithAsyncScope(async () => {
@@ -111,7 +110,7 @@ describe("Engine: async scope context", () => {
   });
 
   it("preserves pin counts correctly", async () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     let tensor: EngineTensor | null = null;
 
     await engine.runWithAsyncScope(async () => {

@@ -1,3 +1,4 @@
+import { OP_DTYPE_RULES, promoteDtype } from "../backend/op-registry";
 import { getActiveBackend, getBackend } from "../backend/registry";
 import {
   type ArgReduceOptions,
@@ -26,7 +27,7 @@ import {
   broadcastThreeShapes,
   contiguousStrides,
 } from "../core/shape";
-import { OP_DTYPE_RULES, promoteDtype } from "../engine/dtype-rules";
+import type { AutocastContext } from "../engine/amp";
 import {
   executePlanOptimized,
   type OptimizedExecutionStats,
@@ -48,6 +49,96 @@ import { createLazyIRNode } from "../engine/node-factory";
 import { buildMergedPlan } from "../engine/plan-builder";
 import { storageTracker } from "../engine/storage-tracker";
 import { type BaseId, createBaseId, Tensor } from "./tensor";
+
+// Re-export all types from engine-types (EngineTensor, SavedTensorRecord, etc.)
+export * from "../engine/engine-types";
+
+// Local imports from engine-types (used by Engine methods merged into RuntimeEngine)
+import {
+  type AsyncScope,
+  type BaseState,
+  type BaseStateInfo,
+  type BaseId as EngineBaseId,
+  type EngineMemoryStats,
+  EngineTensor,
+  type ExecLock,
+  type MemorySnapshot,
+  type MemoryStatsProvider,
+  type RngBasis,
+  type RngDrawRecord,
+  type RngDrawResult,
+  type SavedTensorInfo,
+  type SavedTensorRecord,
+  type TensorOrigin,
+  type TidyScope,
+} from "../engine/engine-types";
+
+// ── Engine helpers ──────────────────────────────────────────────────────────
+function collectTensorHandles(value: unknown): EngineTensor[] {
+  const out: EngineTensor[] = [];
+  const seen = new Set<unknown>();
+  const visit = (current: unknown) => {
+    if (current == null) return;
+    if (current instanceof EngineTensor) {
+      out.push(current);
+      return;
+    }
+    if (typeof current !== "object") return;
+    if (seen.has(current)) return;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      for (const entry of current) visit(entry);
+      return;
+    }
+    for (const entry of Object.values(current as Record<string, unknown>))
+      visit(entry);
+  };
+  visit(value);
+  return out;
+}
+
+function computeRngValue(
+  basis: RngBasis,
+  opNonce: number,
+  drawNonce: number,
+): number {
+  const seed = basis.seed >>> 0;
+  const algo = basis.algorithmId >>> 0;
+  const op = opNonce >>> 0;
+  const draw = drawNonce >>> 0;
+  let v =
+    (seed ^ Math.imul(algo, 0x9e3779b9) ^ op ^ Math.imul(draw, 0x85ebca6b)) >>>
+    0;
+  v ^= v >>> 16;
+  v = Math.imul(v, 0x7feb352d);
+  v ^= v >>> 15;
+  v = Math.imul(v, 0x846ca68b);
+  v ^= v >>> 16;
+  return (v >>> 0) / 2 ** 32;
+}
+
+// ── Error classes (from Engine) ─────────────────────────────────────────────
+export class EngineBusyError extends Error {
+  name = "EngineBusyError";
+}
+export class AsyncInCompileError extends Error {
+  name = "AsyncInCompileError";
+}
+export class SavedTensorModifiedError extends Error {
+  name = "SavedTensorModifiedError";
+}
+export class NonReentrantBackwardError extends Error {
+  name = "NonReentrantBackwardError";
+}
+export class PoisonedEngineError extends Error {
+  name = "PoisonedEngineError";
+}
+export class RngReplayExhaustedError extends Error {
+  name = "RngReplayExhaustedError";
+}
+export class RngReplayMismatchError extends Error {
+  name = "RngReplayMismatchError";
+}
 
 // ── Engine types (merged from engine-types.ts) ─────────────────────────────
 /** A tensor or a numeric scalar (will be inlined as a constant in fused kernels). */
@@ -214,6 +305,30 @@ export class RuntimeEngine {
 
   /** Stack of active dispatch modes (notified on tensor creation/escape). */
   private dispatchModes: DispatchMode[] = [];
+
+  // ── Engine fields (merged from Engine class) ──────────────────────────────
+  private readonly _baseState = new Map<EngineBaseId, BaseState>();
+  private readonly _execLock: ExecLock = { held: false, ownerId: 0, depth: 0 };
+  private _nextOwnerId = 1;
+  private _poisoned = false;
+  private _nextSavedTensorId = 1;
+  private _backwardActive = false;
+  private _nextTensorId = 1;
+  private _nextBaseId = 1;
+  private _nextScopeId = 1;
+  private _nextMutIdValue = 1;
+  private readonly _tidyScopes: TidyScope[] = [];
+  private _asyncScopeContext: AsyncScope | null = null;
+  private readonly _basePinCount = new Map<EngineBaseId, number>();
+  private _rngBasis: RngBasis = { algorithmId: 0, seed: 0 };
+  private _rngDrawNonce = 0;
+  private _rngCheckpointMode: "record" | "replay" | null = null;
+  private _rngCheckpointDraws: RngDrawRecord[] = [];
+  private _rngCheckpointIndex = 0;
+  private _autocastContext: AutocastContext | null = null;
+  private readonly _savedTensors = new Map<number, SavedTensorInfo>();
+  private readonly _memorySnapshots: MemorySnapshot[] = [];
+  private _memoryStatsProvider: MemoryStatsProvider | null = null;
 
   constructor(backendName?: DeviceKind, options?: RuntimeEngineOptions) {
     if (backendName) {
@@ -1497,6 +1612,494 @@ export class RuntimeEngine {
       throw new Error("extractLnBwdGradBias: expected pending ref");
     const ref = createPendingRef(parentRef.node, 1);
     return this.trackRef(ref, [featureDim], gradWeight.device);
+  }
+
+  // ============================================================================
+  // Engine methods (merged from Engine class)
+  // ============================================================================
+
+  /**
+   * Set the autocast context for AMP transforms in compiled regions.
+   * This should be called by the frontend when entering an autocast block.
+   */
+  setAutocastContext(ctx: AutocastContext | null): void {
+    this._autocastContext = ctx;
+  }
+
+  /**
+   * Get the current autocast context.
+   */
+  getAutocastContext(): AutocastContext | null {
+    return this._autocastContext;
+  }
+
+  _debug_publishSave(_baseId: EngineBaseId): void {
+    // No-op: token algebra removed. Kept for frontend.ts call site.
+  }
+
+  _debug_setRngBasis(basis: RngBasis): void {
+    this._rngBasis = { ...basis };
+    this._rngDrawNonce = 0;
+  }
+
+  _debug_getRngDrawNonce(): number {
+    return this._rngDrawNonce;
+  }
+
+  _debug_startCheckpointRecord(): void {
+    if (this._rngCheckpointMode) {
+      throw new Error("Checkpoint RNG already active");
+    }
+    this._rngCheckpointMode = "record";
+    this._rngCheckpointDraws = [];
+    this._rngCheckpointIndex = 0;
+  }
+
+  _debug_finishCheckpointRecord(): RngDrawRecord[] {
+    if (this._rngCheckpointMode !== "record") {
+      throw new Error("Checkpoint RNG record not active");
+    }
+    const draws = this._rngCheckpointDraws.slice();
+    this._rngCheckpointMode = null;
+    this._rngCheckpointDraws = [];
+    this._rngCheckpointIndex = 0;
+    return draws;
+  }
+
+  _debug_startCheckpointReplay(draws: RngDrawRecord[]): void {
+    if (this._rngCheckpointMode) {
+      throw new Error("Checkpoint RNG already active");
+    }
+    this._rngCheckpointMode = "replay";
+    this._rngCheckpointDraws = draws.slice();
+    this._rngCheckpointIndex = 0;
+  }
+
+  _debug_finishCheckpointReplay(): void {
+    if (this._rngCheckpointMode !== "replay") {
+      throw new Error("Checkpoint RNG replay not active");
+    }
+    this._rngCheckpointMode = null;
+    this._rngCheckpointDraws = [];
+    this._rngCheckpointIndex = 0;
+  }
+
+  _debug_random(opNonce: number, drawNonce?: number): RngDrawResult {
+    if (this._rngCheckpointMode === "replay") {
+      const record = this._rngCheckpointDraws[this._rngCheckpointIndex];
+      if (!record) {
+        throw new RngReplayExhaustedError("RNG replay exhausted");
+      }
+      if (record.opNonce !== opNonce) {
+        throw new RngReplayMismatchError("RNG replay opNonce mismatch");
+      }
+      if (drawNonce !== undefined && drawNonce !== record.drawNonce) {
+        throw new RngReplayMismatchError("RNG replay drawNonce mismatch");
+      }
+      this._rngCheckpointIndex += 1;
+      return { drawNonce: record.drawNonce, value: record.value };
+    }
+
+    const assignedDrawNonce = drawNonce ?? this._nextRngDrawNonce();
+    if (drawNonce !== undefined && drawNonce > this._rngDrawNonce) {
+      this._rngDrawNonce = drawNonce;
+    }
+    const value = computeRngValue(this._rngBasis, opNonce, assignedDrawNonce);
+
+    if (this._rngCheckpointMode === "record") {
+      this._rngCheckpointDraws.push({
+        opNonce,
+        drawNonce: assignedDrawNonce,
+        value,
+      });
+    }
+
+    return { drawNonce: assignedDrawNonce, value };
+  }
+
+  _debug_backward<T>(fn: () => T): T {
+    if (this._backwardActive) {
+      throw new NonReentrantBackwardError("Backward is already running");
+    }
+    this._backwardActive = true;
+    try {
+      return fn();
+    } finally {
+      this._backwardActive = false;
+    }
+  }
+
+  _debug_saveForBackward(baseId: EngineBaseId): SavedTensorRecord {
+    const state = this._getOrCreateBaseState(baseId);
+    const id = this._nextSavedTensorId++;
+    const record = {
+      id,
+      baseId,
+      baseCommitVersionAtSave: state.baseCommitVersion,
+    };
+
+    // Track for visibility
+    this._savedTensors.set(id, {
+      id,
+      baseId,
+      commitVersionAtSave: state.baseCommitVersion,
+      savedAt: Date.now(),
+    });
+
+    return record;
+  }
+
+  _debug_useSavedTensor(record: SavedTensorRecord): void {
+    const state = this._getOrCreateBaseState(record.baseId);
+    if (state.baseCommitVersion !== record.baseCommitVersionAtSave) {
+      throw new SavedTensorModifiedError(
+        `Saved tensor modified for baseId ${record.baseId}`,
+      );
+    }
+  }
+
+  /**
+   * Release a saved tensor from tracking (called after backward completes).
+   */
+  _debug_releaseSavedTensor(id: number): void {
+    this._savedTensors.delete(id);
+  }
+
+  /**
+   * Clear all saved tensor tracking (for cleanup after backward).
+   */
+  _debug_clearSavedTensors(): void {
+    this._savedTensors.clear();
+  }
+
+  compile<Args extends unknown[], R>(
+    fn: (...args: Args) => R,
+  ): (...args: Args) => R {
+    return (...args: Args) => {
+      let result: R;
+      result = fn(...args);
+
+      if (
+        result &&
+        typeof (result as unknown as Promise<unknown>).then === "function"
+      ) {
+        throw new AsyncInCompileError("Async work is not allowed in compile");
+      }
+
+      return result;
+    };
+  }
+
+  createTensor(baseId?: EngineBaseId): EngineTensor {
+    const resolvedBaseId = baseId ?? this._nextBaseId++;
+    if (resolvedBaseId >= this._nextBaseId) {
+      this._nextBaseId = resolvedBaseId + 1;
+    }
+    const origin: TensorOrigin =
+      this._tidyScopes.length > 0
+        ? {
+            kind: "tidy",
+            scopeId: this._tidyScopes[this._tidyScopes.length - 1].id,
+          }
+        : { kind: "global" };
+    const tensor = new EngineTensor(
+      this._nextTensorId++,
+      resolvedBaseId,
+      origin,
+    );
+    this._registerTensor(tensor);
+    return tensor;
+  }
+
+  forceRead(_baseId: EngineBaseId): void {
+    // No-op: token algebra and loc bindings removed.
+    // Callers use this as a barrier; actual read is done by the runtime.
+  }
+
+  tidy<T>(fn: () => T): T {
+    const scope: TidyScope = { id: this._nextScopeId++, tensors: new Set() };
+    this._tidyScopes.push(scope);
+    let result!: T;
+    let succeeded = false;
+
+    try {
+      result = fn();
+      succeeded = true;
+    } finally {
+      const escaped = succeeded ? collectTensorHandles(result) : [];
+      for (const tensor of escaped) {
+        tensor.escapes = true;
+      }
+
+      // Convert to array first since dispose() modifies scope.tensors
+      const tensorsToProcess = Array.from(scope.tensors);
+      for (const tensor of tensorsToProcess) {
+        if (!tensor.escapes) {
+          this.dispose(tensor);
+        }
+      }
+      this._tidyScopes.pop();
+    }
+
+    return result;
+  }
+
+  keep(tensor: EngineTensor): void {
+    if (tensor.disposed) {
+      return;
+    }
+    tensor.escapes = true;
+  }
+
+  dispose(tensor: EngineTensor): void {
+    if (tensor.disposed) {
+      return;
+    }
+    tensor.disposed = true;
+    // Call disposal callback to free backend resources (GPU buffers, etc.)
+    if (tensor.onDispose) {
+      tensor.onDispose();
+    }
+    const count = this._basePinCount.get(tensor.baseId) ?? 0;
+    if (count <= 1) {
+      this._basePinCount.delete(tensor.baseId);
+    } else {
+      this._basePinCount.set(tensor.baseId, count - 1);
+    }
+    for (const scope of this._tidyScopes) {
+      scope.tensors.delete(tensor);
+    }
+  }
+
+  async markStep(): Promise<void> {
+    this._debug_runEntryPoint(() => {
+      // No-op: token algebra and loc bindings removed.
+      // Runtime handles plan execution directly.
+    });
+  }
+
+  private _acquireExecLock(): void {
+    if (this._execLock.held) throw new EngineBusyError("Engine is busy");
+    this._execLock.held = true;
+    this._execLock.ownerId = this._nextOwnerId++;
+    this._execLock.depth = 1;
+    this._ensureNotPoisoned();
+  }
+
+  private _releaseExecLock(): void {
+    this._execLock.held = false;
+    this._execLock.ownerId = 0;
+    this._execLock.depth = 0;
+  }
+
+  _debug_runEntryPoint<T>(fn: () => T): T {
+    this._acquireExecLock();
+    try {
+      return fn();
+    } finally {
+      this._releaseExecLock();
+    }
+  }
+
+  async runEntryPoint<T>(fn: () => Promise<T>): Promise<T> {
+    this._acquireExecLock();
+    try {
+      return await fn();
+    } finally {
+      this._releaseExecLock();
+    }
+  }
+
+  /**
+   * Run an async function with an async scope context that tracks tensors
+   * across await boundaries. Tensors created during the async operation
+   * (but not within a synchronous tidy scope) are tracked and disposed
+   * when the scope exits, unless explicitly kept.
+   */
+  async runWithAsyncScope<T>(fn: () => Promise<T>): Promise<T> {
+    const scope: AsyncScope = {
+      id: this._nextScopeId++,
+      tensors: new Set(),
+    };
+
+    const previous = this._asyncScopeContext;
+    this._asyncScopeContext = scope;
+
+    try {
+      return await fn();
+    } finally {
+      this._asyncScopeContext = previous;
+
+      // Dispose all tensors in this scope that weren't kept
+      for (const tensor of scope.tensors) {
+        if (!tensor.escapes && !tensor.disposed) {
+          this.dispose(tensor);
+        }
+      }
+    }
+  }
+
+  _debug_poison(): void {
+    this._poisoned = true;
+  }
+
+  _debug_getBasePinCount(baseId: EngineBaseId): number {
+    return this._basePinCount.get(baseId) ?? 0;
+  }
+
+  /**
+   * Get the next unique mutation ID for in-place operations.
+   * Per spec §4.3, each in-place mutation needs a unique mutId.
+   */
+  nextMutId(): number {
+    return this._nextMutIdValue++;
+  }
+
+  _debug_baseCommit(baseId: EngineBaseId, mutId: number): void {
+    const state = this._getOrCreateBaseState(baseId);
+    if (state.committed.has(mutId)) {
+      throw new Error(`base_commit already recorded for mutId ${mutId}`);
+    }
+    state.committed.add(mutId);
+    state.baseCommitVersion += 1;
+  }
+
+  private _ensureNotPoisoned(): void {
+    if (this._poisoned) {
+      throw new PoisonedEngineError("Engine is poisoned");
+    }
+  }
+
+  private _nextRngDrawNonce(): number {
+    this._rngDrawNonce += 1;
+    return this._rngDrawNonce;
+  }
+
+  private _registerTensor(tensor: EngineTensor): void {
+    const count = this._basePinCount.get(tensor.baseId) ?? 0;
+    this._basePinCount.set(tensor.baseId, count + 1);
+
+    // Register in all active tidy scopes
+    for (const scope of this._tidyScopes) {
+      scope.tensors.add(tensor);
+    }
+
+    // If no tidy scope is active but async scope is, register there
+    if (this._tidyScopes.length === 0 && this._asyncScopeContext !== null) {
+      this._asyncScopeContext.tensors.add(tensor);
+    }
+  }
+
+  private _getOrCreateBaseState(baseId: EngineBaseId): BaseState {
+    const existing = this._baseState.get(baseId);
+    if (existing) {
+      return existing;
+    }
+    const initial: BaseState = {
+      baseCommitVersion: 0,
+      committed: new Set<number>(),
+    };
+    this._baseState.set(baseId, initial);
+    return initial;
+  }
+
+  // ============================================================================
+  // Engine Visibility Methods (Phase 1)
+  // ============================================================================
+
+  /**
+   * Set the memory stats provider for external memory tracking.
+   * This should be called by the runtime during initialization.
+   */
+  setMemoryStatsProvider(provider: MemoryStatsProvider): void {
+    this._memoryStatsProvider = provider;
+  }
+
+  /**
+   * Get comprehensive memory statistics.
+   */
+  _debug_getMemoryStats(): EngineMemoryStats {
+    const p = this._memoryStatsProvider;
+    const gpu = p?.getGPUStats?.() ?? {
+      currentBytes: 0,
+      peakBytes: 0,
+      limitBytes: 0,
+    };
+    const pool = p?.getBufferPoolStats?.() ?? {
+      pooledBuffers: 0,
+      inUseBuffers: 0,
+      pendingFenceBuffers: 0,
+    };
+    const plan = p?.getPlanStats?.() ?? { activePlans: 0, completedPlans: 0 };
+    let totalPinCount = 0;
+    for (const count of this._basePinCount.values()) totalPinCount += count;
+
+    return {
+      gpuCurrentBytes: gpu.currentBytes,
+      gpuPeakBytes: gpu.peakBytes,
+      gpuLimitBytes: gpu.limitBytes,
+      pooledBuffers: pool.pooledBuffers,
+      inUseBuffers: pool.inUseBuffers,
+      pendingFenceBuffers: pool.pendingFenceBuffers,
+      activeBases: this._basePinCount.size,
+      totalPinCount,
+      savedTensorCount: this._savedTensors.size,
+      pendingTensorCount: p?.getPendingTensorCount?.() ?? 0,
+      activePlans: plan.activePlans,
+      completedPlans: plan.completedPlans,
+    };
+  }
+
+  /**
+   * Get information about all currently saved tensors.
+   */
+  _debug_getSavedTensorsInfo(): SavedTensorInfo[] {
+    return Array.from(this._savedTensors.values());
+  }
+
+  /**
+   * Get information about all base states.
+   */
+  _debug_getBaseStatesInfo(): BaseStateInfo[] {
+    const infos: BaseStateInfo[] = [];
+
+    for (const [baseId, count] of this._basePinCount) {
+      infos.push({
+        baseId,
+        pinCount: count,
+        binding: "ssa",
+        locId: null,
+        hasValue: false,
+        commitVersion: this._baseState.get(baseId)?.baseCommitVersion ?? 0,
+      });
+    }
+
+    return infos;
+  }
+
+  /**
+   * Take a memory snapshot with a label.
+   */
+  _debug_takeMemorySnapshot(label: string): void {
+    this._memorySnapshots.push({
+      label,
+      timestamp: Date.now(),
+      stats: this._debug_getMemoryStats(),
+    });
+  }
+
+  /**
+   * Get all memory snapshots.
+   */
+  _debug_getMemorySnapshots(): MemorySnapshot[] {
+    return this._memorySnapshots.slice();
+  }
+
+  /**
+   * Clear all memory snapshots.
+   */
+  _debug_clearMemorySnapshots(): void {
+    this._memorySnapshots.length = 0;
   }
 }
 
