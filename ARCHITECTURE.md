@@ -91,9 +91,22 @@ Used for: all elementwise ops, reductions, matmul, attention, layernorm, RMSNorm
 
 Forward ops record backward closures in `AutogradNode`s. `backward()` topologically sorts the DAG, forces all saved tensors in one merged plan, then walks nodes in reverse calling backward functions. Gradients accumulate via `add()`. Gradient functions for elementwise ops live in `OP_REGISTRY`; complex ops (matmul, softmax) define gradients in `frontend/torchlette.ts`.
 
+## Known Semantic Limitations
+
+- **In-place self-aliasing** — `tensor.mul_(tensor)` crashes (broken lazy ref). `add_(self)` works because the graph doesn't read-after-write. Use non-in-place `mul(a, a)` instead. Self-aliasing in in-place ops is not detected or prevented.
+
+- **Disposing intermediates breaks autograd** — Calling `dispose()` on a tensor that's part of an active backward graph kills the saved-for-backward reference. Gradients will be null or wrong. Unlike PyTorch, saved tensors share lifecycle with the user handle (no independent refcounting). Use `tidy()`, `compile()`, or `beginStep()`/`endStep()` for automatic lifecycle management instead of manual `dispose()`.
+
+- **No double backward** — `backward()` clears the autograd graph. A second call is a no-op. No `retain_graph` equivalent. By design for memory efficiency.
+
+- **View semantics differ from PyTorch** — Views (`reshape`, `narrow`, etc.) are lazy graph aliases, not buffer aliases. Mutating the original via in-place ops after creating a view does NOT affect the view. In PyTorch, views share storage and see mutations.
+
+- **Buffer pool non-determinism across model instances** — Running two independent models on the same WebGPU device can produce different gradient values due to buffer pool reuse of stale data. Single-model training is deterministic within a step. This only affects test tooling that compares two models on the same device.
+
 ## Testing
 
 - **gradcheck** — Numerical gradient verification via finite differences. Auto-generated for all OP_REGISTRY ops with grad specs.
-- **Unit tests** — 825+ tests across 54 files covering ops, autograd, fusion, modules, optimizers.
+- **Stress tests** — `test/stress-semantics.spec.ts` covers aliasing, view safety, broadcast gradients, autograd corner cases, and complex backward chains.
+- **Unit tests** — 850+ tests across 55 files covering ops, autograd, fusion, modules, optimizers.
 - **Integration** — DistilGPT-2 finetuning regression test validates loss values and fusion stats.
 - **Commands**: `npm run test` (CPU + WebGPU), `npm run test:webgpu`, `npm run test:browser`
