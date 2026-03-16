@@ -19,6 +19,7 @@ export const cpuBackend: Backend = {
   name: "cpu",
   ops: {
     tensorFromArray: numeric.tensorFromArray,
+    zeros: numeric.zeros,
     full: numeric.full,
     arange: numeric.arange,
     add: numeric.add,
