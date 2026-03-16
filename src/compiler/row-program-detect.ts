@@ -16,8 +16,8 @@
  */
 
 import type { DType } from "../backend/types";
-import { isFusibleOp } from "./fusion-detect";
 import type { LazyIRNode, LazyRef } from "../graph/types";
+import { isFusibleOp } from "./fusion-detect";
 import type {
   RowProgram,
   RowProgramMatch,
@@ -662,7 +662,6 @@ export function detectRowPrograms(
       node.inputs[0]?.kind === "pending"
         ? node.inputs[0].node.shape
         : node.shape;
-    const rank = inputShape.length;
     let numRows = 1;
     for (let d = 0; d < dim; d++) numRows *= inputShape[d];
     const dimSize = inputShape[dim];

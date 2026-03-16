@@ -1804,7 +1804,6 @@ function lowerBlockDotBothVec4(
   }
 
   // Manually unroll sub = 0..3 with static .x/.y/.z/.w extraction
-  const compNames = ["x", "y", "z", "w"] as const;
   for (let sub = 0; sub < 4; sub++) {
     const subStmts: Statement[] = [];
 

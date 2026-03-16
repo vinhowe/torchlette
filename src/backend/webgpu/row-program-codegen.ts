@@ -6,12 +6,7 @@
  * Expression trees are compiled via applyFusedOp.
  */
 
-import type {
-  RowProgram,
-  RPExpr,
-  RPPhase,
-  RPValue,
-} from "../../compiler/row-program-types";
+import type { RowProgram, RPExpr } from "../../compiler/row-program-types";
 import { isRPValue } from "../../compiler/row-program-types";
 import { applyFusedOp, dtypeToTileIR } from "./fusion-tile-ir";
 import { WORKGROUP_SIZE } from "./shape-utils";
