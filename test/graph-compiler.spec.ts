@@ -233,72 +233,37 @@ describe("Graph Compiler — analyzeGraph()", () => {
     expect(result.rewriteBypassedIds.has(mulOne.id)).toBe(true);
   });
 
-  it("produces reduction preamble directives", () => {
-    // Build: mul → sum chain — should produce a preamble directive
-    const x = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
-      values: [1, 2, 3, 4],
+  it("produces row-program matches for last-dim reduction with preamble", () => {
+    // Build: mul → sum(dim=-1) chain — row-program should detect this
+    const x = createLazyIRNode("tensorFromArray", [], [2, 4], "f32", "cpu", {
+      values: [1, 2, 3, 4, 5, 6, 7, 8],
     });
-    const y = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
-      values: [5, 6, 7, 8],
+    const y = createLazyIRNode("tensorFromArray", [], [2, 4], "f32", "cpu", {
+      values: [1, 2, 3, 4, 5, 6, 7, 8],
     });
     const mul = createLazyIRNode(
       "mul",
       [createPendingRef(x), createPendingRef(y)],
-      [4],
+      [2, 4],
       "f32",
       "cpu",
     );
     const sum = createLazyIRNode(
       "sum",
       [createPendingRef(mul)],
-      [],
-      "f32",
-      "cpu",
-      { dim: null },
-    );
-
-    const result = analyzeGraph([x, y, mul, sum]);
-
-    // The mul node triggers a reduction group with preamble
-    expect(result.reductionGroups.length).toBeGreaterThan(0);
-    const group = result.reductionGroups.find(
-      (g) => g.reductionNode.id === sum.id,
-    );
-    expect(group).toBeDefined();
-    expect(group!.preambleNodes.length).toBeGreaterThan(0);
-  });
-
-  it("produces reduction epilogue directives", () => {
-    // Build: sum → relu chain — should produce an epilogue directive
-    const x = createLazyIRNode("tensorFromArray", [], [2, 4], "f32", "cpu", {
-      values: [1, 2, 3, 4, 5, 6, 7, 8],
-    });
-    const sum = createLazyIRNode(
-      "sum",
-      [createPendingRef(x)],
       [2, 1],
       "f32",
       "cpu",
       { dim: 1, keepdim: true },
     );
-    const relu = createLazyIRNode(
-      "relu",
-      [createPendingRef(sum)],
-      [2, 1],
-      "f32",
-      "cpu",
-    );
 
-    const result = analyzeGraph([x, sum, relu]);
-
-    // The sum node triggers a reduction group with epilogue
-    expect(result.reductionGroups.length).toBeGreaterThan(0);
-    const group = result.reductionGroups.find(
-      (g) => g.reductionNode.id === sum.id,
+    const result = analyzeGraph([x, y, mul, sum]);
+    expect(result.rowProgramMatches.length).toBeGreaterThan(0);
+    const match = result.rowProgramMatches.find((m) =>
+      m.coveredNodeIds.includes(sum.id),
     );
-    expect(group).toBeDefined();
-    expect(group!.epilogueNodes.length).toBeGreaterThan(0);
-    expect(group!.outputNode.id).toBe(relu.id);
+    expect(match).toBeDefined();
+    expect(match!.coveredNodeIds).toContain(mul.id);
   });
 
   it("produces matmul epilogue directives with full plans", () => {
@@ -364,7 +329,7 @@ describe("Graph Compiler — analyzeGraph()", () => {
     expect(result.matmulDirectives.size).toBe(0);
   });
 
-  it("reductionGroups is empty when no patterns match", () => {
+  it("rowProgramMatches is empty when no reduction patterns match", () => {
     const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
       values: [1, 2, 3, 4],
     });
@@ -381,6 +346,6 @@ describe("Graph Compiler — analyzeGraph()", () => {
 
     const result = analyzeGraph([a, b, add]);
 
-    expect(result.reductionGroups.length).toBe(0);
+    expect(result.rowProgramMatches.length).toBe(0);
   });
 });

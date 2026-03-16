@@ -25,7 +25,6 @@ import {
   setCurrentOpLabel,
   setProfileModule,
 } from "./profiler";
-import type { ReductionGroup } from "./reduction-detect";
 import type { RowProgram } from "./row-program-types";
 
 // Module-level cached imports to avoid per-call dynamic import overhead.
@@ -271,145 +270,6 @@ async function executeSequentialSegment(
 }
 
 // ============================================================================
-// Reduction Segment Execution
-// ============================================================================
-
-/** Reduction payload shape shared across sum/mean/max. */
-type ReductionPayload = { dim?: number | number[] | null; keepdim?: boolean };
-
-/**
- * Execute a reduction segment: preamble → reduction → epilogue.
- *
- * Routes to the appropriate backend dispatch based on which parts are present:
- * - Preamble + epilogue → sumWithPreambleEpilogue
- * - Preamble only → sumDimWithPreambleChain
- * - Epilogue only → reduction / meanWithEpilogue
- */
-export async function executeReductionSegment(
-  group: ReductionGroup,
-  backend: Backend,
-): Promise<void> {
-  // Fused reduction kernels are WebGPU-only; fall back to sequential on CPU
-  if (group.reductionNode.device === "cpu") {
-    for (const node of group.nodes) {
-      if (!node.result) await executeNode(node, backend);
-    }
-    return;
-  }
-
-  const payload = group.reductionNode.payload as ReductionPayload | undefined;
-  const hasPreamble = group.preambleNodes.length > 0;
-  const hasEpilogue = group.epilogueOps.length > 0;
-
-  if (hasPreamble && hasEpilogue) {
-    // Combined preamble + epilogue
-    const { sumWithPreambleEpilogue } = await import("../backend/webgpu/index");
-    const preambleInputTensors = group.preambleInputRefs.map(
-      (ref) => getInputStorage(ref, backend).backendTensor,
-    );
-    const epilogueInputTensors = group.epilogueInputRefs.map(
-      (ref) => getInputStorage(ref, backend).backendTensor,
-    );
-
-    const resultTensor = sumWithPreambleEpilogue(
-      preambleInputTensors,
-      group.preambleOps,
-      group.preambleInputDtypes,
-      group.epilogueOps,
-      epilogueInputTensors,
-      group.outputDtype,
-      payload ?? {},
-      group.isMean,
-    );
-
-    group.outputNode.result = createStorageHandle(
-      group.outputNode.device,
-      resultTensor,
-    );
-  } else if (hasPreamble) {
-    // Preamble only
-    const { sumDimWithPreambleChain } = await import("../backend/webgpu/index");
-    const inputTensors = group.preambleInputRefs.map(
-      (ref) => getInputStorage(ref, backend).backendTensor,
-    );
-
-    let resultTensor = sumDimWithPreambleChain(
-      inputTensors,
-      group.preambleOps,
-      group.preambleInputDtypes,
-      payload ?? {},
-    );
-
-    // If this is a mean, divide by reduction size
-    if (group.isMean) {
-      const { normalizeDim } = await import("../backend/types");
-      const inputShape = group.preambleNodes[0].shape;
-      const dim = payload?.dim;
-      let reductionSize: number;
-      if (dim == null) {
-        reductionSize = inputShape.reduce((a, b) => a * b, 1);
-      } else {
-        const dims = Array.isArray(dim) ? dim : [dim];
-        const rank = inputShape.length;
-        reductionSize = dims.reduce(
-          (acc, d) => acc * inputShape[normalizeDim(d, rank)],
-          1,
-        );
-      }
-      const invSize = 1.0 / reductionSize;
-      const sumResult = resultTensor;
-      const invSizeTensor = backend.ops.full
-        ? backend.ops.full([], invSize)
-        : backend.ops.tensorFromArray([invSize], []);
-      resultTensor = backend.ops.mul(sumResult, invSizeTensor);
-      (sumResult as { destroy?: () => void }).destroy?.();
-      (invSizeTensor as { destroy?: () => void }).destroy?.();
-    }
-
-    group.outputNode.result = createStorageHandle(
-      group.outputNode.device,
-      resultTensor,
-    );
-  } else if (hasEpilogue) {
-    // Epilogue only
-    const { reduction, meanWithEpilogue } = await import(
-      "../backend/webgpu/index"
-    );
-    const reductionInputStorage = getInputStorage(
-      group.reductionNode.inputs[0],
-      backend,
-    );
-    const reductionInputTensor = reductionInputStorage.backendTensor;
-    const epilogueInputTensors = group.epilogueInputRefs.map(
-      (ref) => getInputStorage(ref, backend).backendTensor,
-    );
-
-    const resultTensor =
-      group.reductionNode.op === "mean"
-        ? meanWithEpilogue(
-            reductionInputTensor,
-            payload ?? {},
-            group.epilogueOps,
-            epilogueInputTensors,
-            group.outputDtype,
-          )
-        : reduction(
-            group.reductionNode.op as "sum" | "max",
-            reductionInputTensor,
-            payload ?? {},
-            group.epilogueOps,
-            epilogueInputTensors,
-            group.outputDtype,
-          );
-
-    group.outputNode.result = createStorageHandle(
-      group.outputNode.device,
-      resultTensor,
-    );
-  }
-}
-
-// ============================================================================
 // Row-Program Execution
 // ============================================================================
 
@@ -421,7 +281,8 @@ export async function executeRowProgram(
   program: RowProgram,
   inputRefs: LazyRef[],
   outputNode: LazyIRNode,
-  dim: number,
+  numRows: number,
+  dimSize: number,
   coveredNodes: LazyIRNode[],
   backend: Backend,
 ): Promise<void> {
@@ -445,15 +306,6 @@ export async function executeRowProgram(
       const tensor = asGPUTensor(storage.backendTensor);
       inputBuffers.push(tensor.buffer);
     }
-
-    // Compute row/dim geometry from the output node
-    const shape = outputNode.shape;
-    const normDim = dim < 0 ? shape.length + dim : dim;
-    const dimSize = shape[normDim];
-    let numRows = 1;
-    for (let d = 0; d < normDim; d++) numRows *= shape[d];
-    // Include dims after the reduction dim (for keepdim cases)
-    for (let d = normDim + 1; d < shape.length; d++) numRows *= shape[d];
 
     setCurrentOpLabel("row-program");
     const outBuffer = dispatchRowProgram(

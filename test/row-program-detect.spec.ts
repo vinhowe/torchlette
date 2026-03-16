@@ -107,7 +107,7 @@ describe("row-program-detect", () => {
     expect(program.output.dtype).toBe("f32");
   });
 
-  it("rejects single-reduction patterns (needs ≥2)", () => {
+  it("rejects bare reduction with no elementwise ops", () => {
     const xNode = makeNode("tensorFromArray", [], [4, 8]);
     xNode.result = { id: 100, device: "webgpu", backendTensor: {} as any };
     const xRef: LazyRef = { kind: "pending", node: xNode };
@@ -122,6 +122,32 @@ describe("row-program-detect", () => {
 
     const matches = detectRowPrograms(planNodes, consumerCount, consumers);
     expect(matches.length).toBe(0);
+  });
+
+  it("detects single-reduction with preamble (mul → sum)", () => {
+    const aNode = makeNode("tensorFromArray", [], [4, 8]);
+    aNode.result = { id: 100, device: "webgpu", backendTensor: {} as any };
+    const bNode = makeNode("tensorFromArray", [], [4, 8]);
+    bNode.result = { id: 101, device: "webgpu", backendTensor: {} as any };
+    const aRef: LazyRef = { kind: "pending", node: aNode };
+    const bRef: LazyRef = { kind: "pending", node: bNode };
+
+    const mulNode = makeNode("mul", [aRef, bRef], [4, 8]);
+    const sumNode = makeNode("sum", [pending(mulNode)], [4, 1], "f32", {
+      dim: 1,
+      keepdim: true,
+    });
+
+    const planNodes = [mulNode, sumNode];
+    const { consumers, consumerCount } = buildConsumerMaps(planNodes);
+
+    const matches = detectRowPrograms(planNodes, consumerCount, consumers);
+    expect(matches.length).toBe(1);
+    expect(matches[0].coveredNodeIds).toContain(mulNode.id);
+    expect(matches[0].coveredNodeIds).toContain(sumNode.id);
+    expect(matches[0].program.phases.length).toBe(2); // 1 reduce + 1 write
+    expect(matches[0].numRows).toBe(4);
+    expect(matches[0].dimSize).toBe(8);
   });
 
   it("rejects non-last-dim reductions", () => {

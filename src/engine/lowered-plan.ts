@@ -139,65 +139,6 @@ interface LoweredMatmulEpilogueAction {
   };
 }
 
-/** A reduction with elementwise preamble fusion. */
-interface LoweredReductionPreambleAction {
-  kind: "reduction-preamble";
-  /** Plan-node index of the preamble (elementwise) node. */
-  preambleNodeIndex: number;
-  /** Plan-node index of the reduction (sum/mean) node. */
-  reductionNodeIndex: number;
-  /** Plan-node indices for all chain nodes. */
-  chainNodeIndices: number[];
-  /** Kernel op descriptors for the chain. */
-  chainOps: Array<{ op: string; arity: number; chainInputPos?: 0 | 1 }>;
-  /** Dtypes for each external input. */
-  chainInputDtypes: DType[];
-  /** Total nodes consumed (chain + reduction). */
-  consumedCount: number;
-}
-
-/** A reduction with elementwise epilogue fusion (sum/mean/max → cast/add/mul/activation chain). */
-interface LoweredReductionEpilogueAction {
-  kind: "reduction-epilogue";
-  /** Plan-node index of the reduction (sum/mean/max) node. */
-  reductionNodeIndex: number;
-  /** Plan-node indices consumed by this pattern (reduction + epilogue chain). */
-  coveredNodeIndices: number[];
-  /** Index of the final output node in the plan. */
-  outputNodeIndex: number;
-  /** Epilogue operations to apply after the reduction. */
-  epilogueOps: EpilogueOp[];
-  /** Output dtype after epilogue chain. */
-  outputDtype: DType;
-  /** Number of nodes consumed (reduction + epilogue chain). */
-  consumedCount: number;
-}
-
-/** A combined preamble + epilogue reduction fusion (elem → sum/mean → elem in one kernel). */
-interface LoweredReductionFusionAction {
-  kind: "reduction-fusion";
-  /** Plan-node indices for all preamble chain nodes. */
-  preambleNodeIndices: number[];
-  /** Plan-node index of the reduction (sum/mean) node. */
-  reductionNodeIndex: number;
-  /** Plan-node indices for all epilogue chain nodes. */
-  epilogueNodeIndices: number[];
-  /** Index of the final output node in the plan. */
-  outputNodeIndex: number;
-  /** Kernel op descriptors for the preamble chain. */
-  preambleOps: Array<{ op: string; arity: number; chainInputPos?: 0 | 1 }>;
-  /** Dtypes for each preamble external input. */
-  preambleInputDtypes: DType[];
-  /** Epilogue operations to apply after the reduction. */
-  epilogueOps: EpilogueOp[];
-  /** Output dtype after epilogue chain. */
-  outputDtype: DType;
-  /** Total nodes consumed (preamble chain + reduction + epilogue chain). */
-  consumedCount: number;
-  /** Whether the reduction is a mean. */
-  isMean: boolean;
-}
-
 /** A batch of consecutive adamStep nodes. */
 interface LoweredAdamBatchAction {
   kind: "adam-batch";
@@ -210,7 +151,7 @@ interface LoweredReclaimAction {
   kind: "reclaim";
 }
 
-/** A row-program fusion: multi-reduction + elementwise → single perRowKernel. */
+/** A row-program fusion: reduction(s) + elementwise → single perRowKernel. */
 interface LoweredRowProgramAction {
   kind: "row-program";
   /** Plan-node indices consumed by this row program. */
@@ -219,6 +160,10 @@ interface LoweredRowProgramAction {
   outputNodeIndex: number;
   /** Reduction dimension (normalized, last dim). */
   dim: number;
+  /** Number of rows (from the first reduction's input shape). */
+  numRows: number;
+  /** Size of the reduction dimension. */
+  dimSize: number;
   /** The RowProgram specification (structural, reusable across steps). */
   program: RowProgram;
   /** External input refs for resolving buffers at execution time. */
@@ -230,9 +175,6 @@ type LoweredAction =
   | LoweredFusedAction
   | LoweredNodeAction
   | LoweredMatmulEpilogueAction
-  | LoweredReductionPreambleAction
-  | LoweredReductionEpilogueAction
-  | LoweredReductionFusionAction
   | LoweredAdamBatchAction
   | LoweredReclaimAction
   | LoweredRowProgramAction;
@@ -308,7 +250,6 @@ export function isViewOp(op: string): boolean {
 import type { ExecutionSegment } from "./fusion-detect";
 import type { LazyIRNode, LazyRef } from "./lazy-types";
 import type { MatmulEpiloguePlan } from "./matmul-epilogue";
-import type { ReductionGroup } from "./reduction-detect";
 import type { RowProgram, RowProgramMatch } from "./row-program-types";
 
 /** Default reclaim interval, overridable via TORCHLETTE_RECLAIM_INTERVAL env var. */
@@ -395,11 +336,7 @@ export function buildLoweredPlanFromAnalysis(
   }
 
   for (const segment of segments) {
-    if (segment.kind === "reduction") {
-      const nodeCount = segment.group.nodes.length;
-      emitReductionActions(actions, segment.group, nodeIdToFinalPos);
-      maybeReclaim(nodeCount);
-    } else if (segment.kind === "fused" && segment.group.nodes.length >= 2) {
+    if (segment.kind === "fused" && segment.group.nodes.length >= 2) {
       const nodeCount = segment.group.nodes.length;
       emitFusedActions(actions, segment, nodeIdToFinalPos, enableVectorization);
       maybeReclaim(nodeCount);
@@ -423,55 +360,6 @@ export function buildLoweredPlanFromAnalysis(
     actions,
     planNodeCount: planNodes.length,
   };
-}
-
-function emitReductionActions(
-  actions: LoweredAction[],
-  rg: ReductionGroup,
-  posMap: Map<number, number>,
-): void {
-  const hasPreamble = rg.preambleNodes.length > 0;
-  const hasEpilogue = rg.epilogueOps.length > 0;
-
-  if (hasPreamble && hasEpilogue) {
-    actions.push({
-      kind: "reduction-fusion",
-      preambleNodeIndices: rg.preambleNodes.map(
-        (n) => posMap.get(n.id) as number,
-      ),
-      reductionNodeIndex: posMap.get(rg.reductionNode.id) as number,
-      epilogueNodeIndices: rg.epilogueNodes.map(
-        (n) => posMap.get(n.id) as number,
-      ),
-      outputNodeIndex: posMap.get(rg.outputNode.id) as number,
-      preambleOps: rg.preambleOps,
-      preambleInputDtypes: rg.preambleInputDtypes,
-      epilogueOps: rg.epilogueOps,
-      outputDtype: rg.outputDtype,
-      consumedCount: rg.nodes.length,
-      isMean: rg.isMean,
-    });
-  } else if (hasPreamble) {
-    actions.push({
-      kind: "reduction-preamble",
-      preambleNodeIndex: posMap.get(rg.preambleNodes[0].id) as number,
-      reductionNodeIndex: posMap.get(rg.reductionNode.id) as number,
-      chainNodeIndices: rg.preambleNodes.map((n) => posMap.get(n.id) as number),
-      chainOps: rg.preambleOps,
-      chainInputDtypes: rg.preambleInputDtypes,
-      consumedCount: rg.nodes.length,
-    });
-  } else if (hasEpilogue) {
-    actions.push({
-      kind: "reduction-epilogue",
-      reductionNodeIndex: posMap.get(rg.reductionNode.id) as number,
-      coveredNodeIndices: rg.nodes.map((n) => posMap.get(n.id) as number),
-      outputNodeIndex: posMap.get(rg.outputNode.id) as number,
-      epilogueOps: rg.epilogueOps,
-      outputDtype: rg.outputDtype,
-      consumedCount: rg.nodes.length,
-    });
-  }
 }
 
 function emitFusedActions(
@@ -543,6 +431,8 @@ function emitSequentialActions(
         ),
         outputNodeIndex: posMap.get(m.outputNodeId) as number,
         dim: m.dim,
+        numRows: m.numRows,
+        dimSize: m.dimSize,
         program: m.program,
         inputRefs: m.inputRefs,
       });

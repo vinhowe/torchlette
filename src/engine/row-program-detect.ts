@@ -150,13 +150,15 @@ function expandSubgraph(
         continue;
       }
 
-      // Elementwise: add if at least one input is in the subgraph AND
-      // all of this node's consumers that are candidates are also in the subgraph
-      // (or this node has only 1 consumer total)
+      // Elementwise: add if connected to the subgraph (via input OR consumer)
+      // AND all of this node's consumers that are candidates are accounted for.
       const hasSubgraphInput = candNode.inputs.some(
         (ref) => ref.kind === "pending" && subgraph.has(ref.node.id),
       );
-      if (!hasSubgraphInput) continue;
+      const hasSubgraphConsumer = (consumers.get(candId) ?? []).some((c) =>
+        subgraph.has(c.id),
+      );
+      if (!hasSubgraphInput && !hasSubgraphConsumer) continue;
 
       const cc = consumerCount.get(candId) ?? 0;
       if (cc <= 1) {
@@ -176,13 +178,18 @@ function expandSubgraph(
     }
   }
 
-  // Must have at least 2 reductions for a row program
+  // Must have at least 1 reduction + elementwise ops to be worthwhile.
+  // A bare reduction with no preamble/epilogue is better handled by the
+  // standard reduction dispatch (which supports K-split, chunking, etc.).
   let reductionCount = 0;
+  let elemCount = 0;
   for (const id of subgraph) {
     const n = nodeById.get(id)!;
     if (REDUCE_OPS.has(n.op)) reductionCount++;
+    else elemCount++;
   }
-  if (reductionCount < 2) return null;
+  if (reductionCount < 1) return null;
+  if (reductionCount < 2 && elemCount < 1) return null;
 
   // Verify: no intermediate node has consumers outside the subgraph
   // (except the output node, which is allowed)
@@ -490,7 +497,12 @@ function buildRowProgram(
   }
   if (!writeExpr) return null;
 
-  phases.push({ kind: "write", bodyExpr: writeExpr });
+  const isScalarOutput = REDUCE_OPS.has(outputNode.op);
+  phases.push({
+    kind: "write",
+    bodyExpr: writeExpr,
+    scalarOutput: isScalarOutput || undefined,
+  });
 
   // Build structural cache key
   const cacheKey = buildCacheKey(phases, inputDtypes);
@@ -645,6 +657,16 @@ export function detectRowPrograms(
     );
     if (!result) continue;
 
+    // Compute geometry from the first reduction's input shape
+    const inputShape =
+      node.inputs[0]?.kind === "pending"
+        ? node.inputs[0].node.shape
+        : node.shape;
+    const rank = inputShape.length;
+    let numRows = 1;
+    for (let d = 0; d < dim; d++) numRows *= inputShape[d];
+    const dimSize = inputShape[dim];
+
     // Claim all nodes
     const coveredNodeIds: number[] = [];
     for (const id of subgraphIds) {
@@ -657,6 +679,8 @@ export function detectRowPrograms(
       outputNodeId: result.outputNodeId,
       inputRefs: result.inputRefs,
       dim: result.program.dim,
+      numRows,
+      dimSize,
       program: result.program,
     });
   }

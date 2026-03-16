@@ -80,11 +80,9 @@ import {
 } from "./op-dispatch";
 import { pretunePlanMatmuls } from "./plan-builder";
 import { profileOpBegin, profileOpEnd, setProfileModule } from "./profiler";
-import type { ReductionGroup } from "./reduction-detect";
 import {
   ensureFusionImports,
   executeFusedSegment,
-  executeReductionSegment,
   executeRowProgram,
 } from "./segment-executors";
 import { storageTracker } from "./storage-tracker";
@@ -911,113 +909,6 @@ export async function executeLoweredPlan(
           break;
         }
 
-        case "reduction-preamble": {
-          const rpChainNodes = action.chainNodeIndices.map((i) => planNodes[i]);
-          const rpReductionNode = planNodes[action.reductionNodeIndex];
-          const rpGroup: ReductionGroup = {
-            nodes: [...rpChainNodes, rpReductionNode],
-            planIndices: [
-              ...action.chainNodeIndices,
-              action.reductionNodeIndex,
-            ],
-            reductionNode: rpReductionNode,
-            preambleNodes: rpChainNodes,
-            epilogueNodes: [],
-            outputNode: rpReductionNode,
-            preambleOps: action.chainOps,
-            preambleInputRefs: collectChainExternalRefs(rpChainNodes),
-            preambleInputDtypes: action.chainInputDtypes,
-            epilogueOps: [],
-            epilogueInputRefs: [],
-            outputDtype: rpReductionNode.dtype,
-            isMean: rpReductionNode.op === "mean",
-          };
-
-          const rpLabel = `${rpGroup.isMean ? "mean" : "sum"}+${rpChainNodes.map((n) => n.op).join("+")}`;
-          await withProfileContext(rpLabel, rpChainNodes[0].module, () =>
-            executeReductionSegment(rpGroup, backend),
-          );
-
-          break;
-        }
-
-        case "reduction-epilogue": {
-          const reNode = planNodes[action.reductionNodeIndex];
-          const reOutputNode = planNodes[action.outputNodeIndex];
-          const reEpilogueChainNodes = action.coveredNodeIndices
-            .slice(1)
-            .map((i) => planNodes[i]);
-
-          const reGroup: ReductionGroup = {
-            nodes: action.coveredNodeIndices.map((i) => planNodes[i]),
-            planIndices: action.coveredNodeIndices,
-            reductionNode: reNode,
-            preambleNodes: [],
-            epilogueNodes: reEpilogueChainNodes,
-            outputNode: reOutputNode,
-            preambleOps: [],
-            preambleInputRefs: [],
-            preambleInputDtypes: [],
-            epilogueOps: action.epilogueOps,
-            epilogueInputRefs: collectChainExternalRefs(
-              reEpilogueChainNodes,
-              reNode.id,
-            ),
-            outputDtype: action.outputDtype,
-            isMean: reNode.op === "mean",
-          };
-
-          const reLabel = `${reNode.op}+${formatEpilogueLabel(action.epilogueOps)}`;
-          await withProfileContext(reLabel, reNode.module, () =>
-            executeReductionSegment(reGroup, backend),
-          );
-
-          break;
-        }
-
-        case "reduction-fusion": {
-          const rfReductionNode = planNodes[action.reductionNodeIndex];
-          const rfOutputNode = planNodes[action.outputNodeIndex];
-          const rfPreambleNodes = action.preambleNodeIndices.map(
-            (i) => planNodes[i],
-          );
-          const rfEpilogueNodes = action.epilogueNodeIndices.map(
-            (i) => planNodes[i],
-          );
-
-          const rfGroup: ReductionGroup = {
-            nodes: [...rfPreambleNodes, rfReductionNode, ...rfEpilogueNodes],
-            planIndices: [
-              ...action.preambleNodeIndices,
-              action.reductionNodeIndex,
-              ...action.epilogueNodeIndices,
-            ],
-            reductionNode: rfReductionNode,
-            preambleNodes: rfPreambleNodes,
-            epilogueNodes: rfEpilogueNodes,
-            outputNode: rfOutputNode,
-            preambleOps: action.preambleOps,
-            preambleInputRefs: collectChainExternalRefs(rfPreambleNodes),
-            preambleInputDtypes: action.preambleInputDtypes,
-            epilogueOps: action.epilogueOps,
-            epilogueInputRefs: collectChainExternalRefs(
-              rfEpilogueNodes,
-              rfReductionNode.id,
-            ),
-            outputDtype: action.outputDtype,
-            isMean: action.isMean,
-          };
-
-          const rfLabel = `${action.isMean ? "mean" : "sum"}+${rfPreambleNodes
-            .map((n) => n.op)
-            .join("+")}+${formatEpilogueLabel(action.epilogueOps)}`;
-          await withProfileContext(rfLabel, rfPreambleNodes[0].module, () =>
-            executeReductionSegment(rfGroup, backend),
-          );
-
-          break;
-        }
-
         case "adam-batch": {
           const useSharedEncoder = backend.name === "webgpu";
           if (useSharedEncoder) {
@@ -1094,7 +985,8 @@ export async function executeLoweredPlan(
             action.program,
             action.inputRefs,
             planNodes[action.outputNodeIndex],
-            action.dim,
+            action.numRows,
+            action.dimSize,
             planNodes.filter((_n, i) => action.coveredNodeIndices.includes(i)),
             backend,
           );

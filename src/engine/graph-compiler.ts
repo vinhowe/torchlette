@@ -1,13 +1,12 @@
 /**
  * Unified Graph Compiler
  *
- * Consolidates the 4 scattered pattern detection systems into a single
- * `analyzeGraph()` call with priority-ordered pattern detectors:
+ * Consolidates pattern detection systems into a single `analyzeGraph()` call
+ * with priority-ordered pattern detectors:
  *
  *  1. Matmul epilogue chains       (priority 100)
- *  2. Compound patterns             (priority 80)
- *  3. Reduction preamble/epilogue   (priority 60 — claiming only)
- *  4. Elementwise fusion            (priority 40)
+ *  2. Row-program fusion           (priority 70)
+ *  3. Elementwise fusion            (priority 40)
  *
  * The analysis phase runs once per structural fingerprint and produces a
  * `GraphAnalysisResult` consumed by executor-optimized.ts. Results are
@@ -28,7 +27,6 @@ import {
   type MatmulEpiloguePlan,
   type MatmulPrologueInfo,
 } from "./matmul-epilogue";
-import { detectReductionGroups, type ReductionGroup } from "./reduction-detect";
 import { detectRowPrograms } from "./row-program-detect";
 import type { RowProgramMatch } from "./row-program-types";
 
@@ -61,9 +59,6 @@ interface GraphAnalysisResult {
 
   /** Node IDs bypassed by graph rewrites (identity casts, redundant contiguous). */
   rewriteBypassedIds: Set<number>;
-
-  /** Detected reduction groups (preamble → reduction → epilogue). */
-  reductionGroups: ReductionGroup[];
 
   /** Pre-computed matmul epilogue directives (matmulNodeId → full plan with prologues). */
   matmulDirectives: Map<number, MatmulEpiloguePlan>;
@@ -408,18 +403,6 @@ export function analyzeGraph(
     }
   }
 
-  // --- Priority 60: Reduction preamble/epilogue claiming ---
-  // Scan for elementwise→reduction and reduction→elementwise patterns.
-  // Claim their nodes so they're excluded from elementwise fusion (P40).
-  // Reduction groups become first-class segments alongside elementwise groups.
-  const { groups: reductionGroups, claimedIds: reductionClaimedIds } =
-    detectReductionGroups(
-      reorderedNodes,
-      consumerCount,
-      new Set([...epilogueClaimedIds, ...rowProgramClaimedIds]),
-      externalNodeIds,
-    );
-
   // --- Priority 40: Elementwise fusion (via segmentPlanForExecution) ---
   // Bypassed nodes are excluded from fusion (they become view-like pass-throughs)
   let allClaimedIds: Set<number> | undefined;
@@ -427,14 +410,12 @@ export function analyzeGraph(
     epilogueClaimedIds.size > 0 ||
     prologueClaimedIds.size > 0 ||
     rowProgramClaimedIds.size > 0 ||
-    reductionClaimedIds.size > 0 ||
     rewriteBypassedIds.size > 0
   ) {
     allClaimedIds = new Set([
       ...epilogueClaimedIds,
       ...prologueClaimedIds,
       ...rowProgramClaimedIds,
-      ...reductionClaimedIds,
       ...rewriteBypassedIds,
     ]);
   }
@@ -442,7 +423,6 @@ export function analyzeGraph(
     maxStorageBuffers,
     enableMultiOutput: true,
     epilogueClaimedIds: allClaimedIds,
-    reductionGroups,
   });
 
   return {
@@ -454,7 +434,6 @@ export function analyzeGraph(
     matmulPrologues,
     consumerCount,
     rewriteBypassedIds,
-    reductionGroups,
     matmulDirectives,
     rowProgramMatches,
   };
