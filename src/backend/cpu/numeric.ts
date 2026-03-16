@@ -432,14 +432,47 @@ function applyBinaryOp(
   return new Tensor(outShape, out);
 }
 
+// ============================================================================
+// Table-driven elementwise ops
+// ============================================================================
+
+/** Unary CPU implementations: op name → scalar function. */
+const UNARY_OPS: Record<string, (x: number) => number> = {
+  sqrt: Math.sqrt,
+  exp: Math.exp,
+  log: Math.log,
+  neg: (x) => -x,
+  abs: Math.abs,
+  tanh: Math.tanh,
+  sigmoid: (x) => 1.0 / (1.0 + Math.exp(-x)),
+  silu: (x) => x / (1.0 + Math.exp(-x)),
+  sin: Math.sin,
+  cos: Math.cos,
+  rsqrt: (x) => 1.0 / Math.sqrt(x),
+  floor: Math.floor,
+  ceil: Math.ceil,
+  round: Math.round,
+  sign: Math.sign,
+  isfinite: (x) => (Number.isFinite(x) ? 1.0 : 0.0),
+  relu: (x) => (x > 0 ? x : 0),
+};
+
+/** Binary CPU implementations: op name → scalar function. */
+const BINARY_OPS: Record<string, (x: number, y: number) => number> = {
+  add: (x, y) => x + y,
+  mul: (x, y) => x * y,
+  pow: Math.pow,
+};
+
+// Generate exports from tables
 export function add(a: Tensor, b: Tensor): Tensor {
-  return applyBinaryOp(a, b, (x, y) => x + y);
+  return applyBinaryOp(a, b, BINARY_OPS.add);
 }
 export function mul(a: Tensor, b: Tensor): Tensor {
-  return applyBinaryOp(a, b, (x, y) => x * y);
+  return applyBinaryOp(a, b, BINARY_OPS.mul);
 }
 export function relu(a: Tensor): Tensor {
-  return applyUnaryOp(a, (x) => (x > 0 ? x : 0));
+  return applyUnaryOp(a, UNARY_OPS.relu);
 }
 
 export function matmul(a: Tensor, b: Tensor): Tensor {
@@ -530,25 +563,25 @@ export function matmul(a: Tensor, b: Tensor): Tensor {
 }
 
 export function sqrt(a: Tensor): Tensor {
-  return applyUnaryOp(a, Math.sqrt);
+  return applyUnaryOp(a, UNARY_OPS.sqrt);
 }
 export function exp(a: Tensor): Tensor {
-  return applyUnaryOp(a, Math.exp);
+  return applyUnaryOp(a, UNARY_OPS.exp);
 }
 export function log(a: Tensor): Tensor {
-  return applyUnaryOp(a, Math.log);
+  return applyUnaryOp(a, UNARY_OPS.log);
 }
 export function neg(a: Tensor): Tensor {
-  return applyUnaryOp(a, (x) => -x);
+  return applyUnaryOp(a, UNARY_OPS.neg);
 }
 export function abs(a: Tensor): Tensor {
-  return applyUnaryOp(a, Math.abs);
+  return applyUnaryOp(a, UNARY_OPS.abs);
 }
 export function tanh(a: Tensor): Tensor {
-  return applyUnaryOp(a, Math.tanh);
+  return applyUnaryOp(a, UNARY_OPS.tanh);
 }
 export function sigmoid(a: Tensor): Tensor {
-  return applyUnaryOp(a, (x) => 1.0 / (1.0 + Math.exp(-x)));
+  return applyUnaryOp(a, UNARY_OPS.sigmoid);
 }
 
 /**
@@ -602,31 +635,31 @@ export function gelu(a: Tensor, options?: GeluOptions): Tensor {
 }
 
 export function silu(a: Tensor): Tensor {
-  return applyUnaryOp(a, (x) => x / (1.0 + Math.exp(-x)));
+  return applyUnaryOp(a, UNARY_OPS.silu);
 }
 export function sin(a: Tensor): Tensor {
-  return applyUnaryOp(a, Math.sin);
+  return applyUnaryOp(a, UNARY_OPS.sin);
 }
 export function cos(a: Tensor): Tensor {
-  return applyUnaryOp(a, Math.cos);
+  return applyUnaryOp(a, UNARY_OPS.cos);
 }
 export function rsqrt(a: Tensor): Tensor {
-  return applyUnaryOp(a, (x) => 1.0 / Math.sqrt(x));
+  return applyUnaryOp(a, UNARY_OPS.rsqrt);
 }
 export function floor(a: Tensor): Tensor {
-  return applyUnaryOp(a, Math.floor);
+  return applyUnaryOp(a, UNARY_OPS.floor);
 }
 export function ceil(a: Tensor): Tensor {
-  return applyUnaryOp(a, Math.ceil);
+  return applyUnaryOp(a, UNARY_OPS.ceil);
 }
 export function round(a: Tensor): Tensor {
-  return applyUnaryOp(a, Math.round);
+  return applyUnaryOp(a, UNARY_OPS.round);
 }
 export function sign(a: Tensor): Tensor {
-  return applyUnaryOp(a, Math.sign);
+  return applyUnaryOp(a, UNARY_OPS.sign);
 }
 export function isfinite(a: Tensor): Tensor {
-  return applyUnaryOp(a, (x) => (Number.isFinite(x) ? 1.0 : 0.0));
+  return applyUnaryOp(a, UNARY_OPS.isfinite);
 }
 
 export function clamp(
@@ -642,7 +675,7 @@ export function clamp(
 }
 
 export function pow(a: Tensor, b: Tensor): Tensor {
-  return applyBinaryOp(a, b, Math.pow);
+  return applyBinaryOp(a, b, BINARY_OPS.pow);
 }
 
 export type SumOptions = {

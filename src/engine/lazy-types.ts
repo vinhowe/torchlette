@@ -1,48 +1,35 @@
+import type { OP_REGISTRY } from "../backend/op-registry";
 import type { BackendTensor, DeviceKind, DType } from "../backend/types";
 
+/**
+ * All valid lazy op codes.
+ *
+ * Elementwise ops (add, mul, relu, etc.) are derived automatically from
+ * OP_REGISTRY keys — adding a new entry there makes it a valid LazyOpCode.
+ * Non-elementwise ops (matmul, reductions, views, fused kernels) are listed
+ * explicitly below since they're not in OP_REGISTRY.
+ */
 export type LazyOpCode =
-  | "add"
-  | "sub"
-  | "mul"
-  | "div"
+  | keyof typeof OP_REGISTRY
+  // Structural / view ops
   | "matmul"
-  | "sqrt"
-  | "relu"
   | "reshape"
   | "expand"
   | "transpose"
   | "permute"
   | "contiguous"
-  | "gather"
-  | "scatterAdd"
-  | "cat"
+  | "narrow"
+  | "narrowBackward"
+  | "cast"
+  // Reductions
   | "sum"
   | "mean"
   | "max"
   | "min"
   | "argmax"
   | "argmin"
-  | "gt"
-  | "lt"
-  | "ge"
-  | "le"
-  | "eq"
-  | "ne"
-  | "where"
-  | "stridedScatterCopy"
-  | "stridedScatterAdd"
+  // Creation ops
   | "tensorFromArray"
-  | "transfer"
-  | "neg"
-  | "abs"
-  | "exp"
-  | "log"
-  | "tanh"
-  | "sigmoid"
-  | "gelu"
-  | "silu"
-  | "cast"
-  | "pow"
   | "zeros"
   | "full"
   | "arange"
@@ -51,19 +38,18 @@ export type LazyOpCode =
   | "rand"
   | "randn"
   | "bernoulli"
-  | "sin"
-  | "cos"
-  | "rsqrt"
-  | "floor"
-  | "ceil"
-  | "round"
-  | "sign"
+  // Scatter / gather
+  | "gather"
+  | "scatterAdd"
+  | "cat"
+  | "stridedScatterCopy"
+  | "stridedScatterAdd"
+  // Special
   | "clamp"
-  | "isfinite"
-  | "narrow"
-  | "narrowBackward"
+  | "transfer"
   | "adamStep"
   | "unscaleGrad"
+  // Fused GPU kernels
   | "fusedAttentionForward"
   | "fusedAttentionBackward"
   | "fusedCrossEntropyForward"
