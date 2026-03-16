@@ -69,7 +69,8 @@ export async function clipGradNorm_(
       totalSumP = totalSumP === null ? sumP : api.add(totalSumP, sumP);
     }
     const totalSumPVal = await totalSumP!.item();
-    totalNorm = totalSumPVal ** (1 / normType);
+    // biome-ignore lint/style/useExponentiationOperator: Math.pow avoids `await x ** y` ambiguity after bundler inlining
+    totalNorm = Math.pow(totalSumPVal, 1 / normType);
   }
 
   // Clip: scale gradients if total norm exceeds maxNorm

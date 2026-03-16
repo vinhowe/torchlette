@@ -7,9 +7,12 @@
  * - Only trains LoRA parameters (base model is frozen)
  */
 
-import type { FrontendTensor as Tensor, Torchlette } from 'torchlette';
-import { checkpoint } from '../../../../../src/nn/checkpoint';
-import { LoRALinear, type LoRAConfig } from './lora';
+import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
+import { nn } from "torchlette";
+
+const { checkpoint } = nn;
+
+import { type LoRAConfig, LoRALinear } from "./lora";
 
 // ============================================================================
 // Configuration
@@ -46,7 +49,11 @@ class LayerNorm {
   readonly bias: Tensor;
   readonly eps: number;
 
-  constructor(api: Torchlette, dim: number, device: 'cpu' | 'webgpu' = 'webgpu') {
+  constructor(
+    api: Torchlette,
+    dim: number,
+    device: "cpu" | "webgpu" = "webgpu",
+  ) {
     this.api = api;
     this.eps = 1e-5;
     this.weight = api.ones([dim], { device, requiresGrad: false });
@@ -64,7 +71,9 @@ class LayerNorm {
     const xCentered = this.api.sub(x, mean);
 
     // Compute variance
-    const varianceResult = this.api.mean(this.api.mul(xCentered, xCentered), { dim: -1 }) as Tensor;
+    const varianceResult = this.api.mean(this.api.mul(xCentered, xCentered), {
+      dim: -1,
+    }) as Tensor;
     const variance = varianceResult.reshape(meanShape);
 
     // Normalize
@@ -95,7 +104,7 @@ class Embedding {
     api: Torchlette,
     numEmbeddings: number,
     embeddingDim: number,
-    device: 'cpu' | 'webgpu' = 'webgpu'
+    device: "cpu" | "webgpu" = "webgpu",
   ) {
     this.api = api;
     this.embeddingDim = embeddingDim;
@@ -149,17 +158,18 @@ class Linear {
     api: Torchlette,
     inFeatures: number,
     outFeatures: number,
-    options: { device?: 'cpu' | 'webgpu'; bias?: boolean } = {}
+    options: { device?: "cpu" | "webgpu"; bias?: boolean } = {},
   ) {
     this.api = api;
-    const device = options.device ?? 'webgpu';
+    const device = options.device ?? "webgpu";
     this.weight = api.zeros([outFeatures, inFeatures], {
       device,
       requiresGrad: false,
     });
-    this.bias = options.bias !== false
-      ? api.zeros([outFeatures], { device, requiresGrad: false })
-      : null;
+    this.bias =
+      options.bias !== false
+        ? api.zeros([outFeatures], { device, requiresGrad: false })
+        : null;
   }
 
   forward(x: Tensor): Tensor {
@@ -198,7 +208,7 @@ class CausalSelfAttentionLoRA {
     api: Torchlette,
     config: GPT2Config,
     loraConfig: LoRAConfig,
-    device: 'cpu' | 'webgpu' = 'webgpu'
+    device: "cpu" | "webgpu" = "webgpu",
   ) {
     this.api = api;
     this.numHeads = config.numHeads;
@@ -211,7 +221,7 @@ class CausalSelfAttentionLoRA {
       config.embedDim,
       3 * config.embedDim,
       loraConfig,
-      { device }
+      { device },
     );
 
     // Frozen output projection
@@ -244,24 +254,30 @@ class CausalSelfAttentionLoRA {
     // Extract Q, K, V using gather along dim 0
     // indices shape must match output shape: [1, totalSize]
     // Then we squeeze the first dimension
-    const indices0 = this.api.tensorFromArray(
-      Array(totalSize).fill(0),
-      [1, totalSize]
-    );
-    const indices1 = this.api.tensorFromArray(
-      Array(totalSize).fill(1),
-      [1, totalSize]
-    );
-    const indices2 = this.api.tensorFromArray(
-      Array(totalSize).fill(2),
-      [1, totalSize]
-    );
+    const indices0 = this.api.tensorFromArray(Array(totalSize).fill(0), [
+      1,
+      totalSize,
+    ]);
+    const indices1 = this.api.tensorFromArray(Array(totalSize).fill(1), [
+      1,
+      totalSize,
+    ]);
+    const indices2 = this.api.tensorFromArray(Array(totalSize).fill(2), [
+      1,
+      totalSize,
+    ]);
 
     // Gather along dim 0: output shape is [1, totalSize], then squeeze to [totalSize]
     // Then reshape to [batch * numHeads, seqLen, headDim]
-    const qFlat = this.api.gather(qkvFlat, indices0, { dim: 0 }).reshape([totalSize]);
-    const kFlat = this.api.gather(qkvFlat, indices1, { dim: 0 }).reshape([totalSize]);
-    const vFlat = this.api.gather(qkvFlat, indices2, { dim: 0 }).reshape([totalSize]);
+    const qFlat = this.api
+      .gather(qkvFlat, indices0, { dim: 0 })
+      .reshape([totalSize]);
+    const kFlat = this.api
+      .gather(qkvFlat, indices1, { dim: 0 })
+      .reshape([totalSize]);
+    const vFlat = this.api
+      .gather(qkvFlat, indices2, { dim: 0 })
+      .reshape([totalSize]);
 
     const q = qFlat.reshape([batch * this.numHeads, seqLen, this.headDim]);
     const k = kFlat.reshape([batch * this.numHeads, seqLen, this.headDim]);
@@ -327,11 +343,15 @@ class MLP {
   constructor(
     api: Torchlette,
     config: GPT2Config,
-    device: 'cpu' | 'webgpu' = 'webgpu'
+    device: "cpu" | "webgpu" = "webgpu",
   ) {
     this.api = api;
-    this.cFc = new Linear(api, config.embedDim, 4 * config.embedDim, { device });
-    this.cProj = new Linear(api, 4 * config.embedDim, config.embedDim, { device });
+    this.cFc = new Linear(api, config.embedDim, 4 * config.embedDim, {
+      device,
+    });
+    this.cProj = new Linear(api, 4 * config.embedDim, config.embedDim, {
+      device,
+    });
   }
 
   forward(x: Tensor): Tensor {
@@ -356,7 +376,7 @@ class TransformerBlockLoRA {
     api: Torchlette,
     config: GPT2Config,
     loraConfig: LoRAConfig,
-    device: 'cpu' | 'webgpu' = 'webgpu'
+    device: "cpu" | "webgpu" = "webgpu",
   ) {
     this.api = api;
     this.ln1 = new LayerNorm(api, config.embedDim, device);
@@ -403,7 +423,7 @@ export class GPT2WithLoRA {
     api: Torchlette,
     config: GPT2Config,
     loraConfig: LoRAConfig,
-    device: 'cpu' | 'webgpu' = 'webgpu'
+    device: "cpu" | "webgpu" = "webgpu",
   ) {
     this.api = api;
     this.config = config;
@@ -459,7 +479,7 @@ export class GPT2WithLoRA {
     // Position embeddings
     const positions = this.api.tensorFromArray(
       Array.from({ length: seqLen }, (_, i) => i),
-      [seqLen]
+      [seqLen],
     );
     const posEmb = this.wpe.forward(positions);
 
@@ -487,7 +507,7 @@ export class GPT2WithLoRA {
     // logits = x @ wte.weight^T
     const logits = this.api.matmul(
       x,
-      this.wte.weight.transpose({ dim0: 0, dim1: 1 })
+      this.wte.weight.transpose({ dim0: 0, dim1: 1 }),
     );
 
     return logits;
@@ -508,7 +528,7 @@ export class GPT2WithLoRA {
    */
   forwardWithLoss(
     input: Tensor,
-    target: Tensor
+    target: Tensor,
   ): { logits: Tensor; loss: Tensor } {
     const logits = this.forward(input);
 
@@ -536,14 +556,18 @@ export class GPT2WithLoRA {
     // Step 1: Compute log-softmax along the last dimension
     const dim = -1;
     const maxLogits = logits.max({ dim, keepdim: true });
-    if (typeof maxLogits === 'number') {
-      throw new Error('crossEntropyLoss: max with keepdim should return tensor');
+    if (typeof maxLogits === "number") {
+      throw new Error(
+        "crossEntropyLoss: max with keepdim should return tensor",
+      );
     }
     const shifted = this.api.sub(logits, maxLogits);
     const expShifted = shifted.exp();
     const sumExp = expShifted.sum({ dim, keepdim: true });
-    if (typeof sumExp === 'number') {
-      throw new Error('crossEntropyLoss: sum with keepdim should return tensor');
+    if (typeof sumExp === "number") {
+      throw new Error(
+        "crossEntropyLoss: sum with keepdim should return tensor",
+      );
     }
     const logSumExp = sumExp.log();
     const logSoftmax = this.api.sub(shifted, logSumExp);
@@ -552,13 +576,15 @@ export class GPT2WithLoRA {
     // targets is [N] but gather needs same rank as input [N, C]
     // So we unsqueeze targets to [N, 1], gather gives [N, 1], then reshape to [N]
     const targetsForGather = targets.reshape([targets.shape[0], 1]);
-    const gatheredLogProbs = this.api.gather(logSoftmax, targetsForGather, { dim: 1 });
+    const gatheredLogProbs = this.api.gather(logSoftmax, targetsForGather, {
+      dim: 1,
+    });
     const gatheredSqueezed = gatheredLogProbs.reshape(targets.shape);
 
     // Step 3: Negate and mean
     const loss = this.api.neg(gatheredSqueezed);
     const meanLoss = loss.mean();
-    if (typeof meanLoss === 'number') {
+    if (typeof meanLoss === "number") {
       return this.api.tensorFromArray([meanLoss], []);
     }
     return meanLoss;
@@ -578,24 +604,26 @@ export class GPT2WithLoRA {
   /**
    * Load base weights from HuggingFace format.
    */
-  loadBaseWeights(weights: Map<string, { data: Float32Array; shape: number[] }>): void {
+  loadBaseWeights(
+    weights: Map<string, { data: Float32Array; shape: number[] }>,
+  ): void {
     // Token embeddings
-    const wteWeight = weights.get('wte.weight');
+    const wteWeight = weights.get("wte.weight");
     if (wteWeight) {
       const tensor = this.api.tensorFromArray(wteWeight.data, wteWeight.shape);
       this.wte.loadWeights(tensor);
     }
 
     // Position embeddings
-    const wpeWeight = weights.get('wpe.weight');
+    const wpeWeight = weights.get("wpe.weight");
     if (wpeWeight) {
       const tensor = this.api.tensorFromArray(wpeWeight.data, wpeWeight.shape);
       this.wpe.loadWeights(tensor);
     }
 
     // Final layer norm
-    const lnFWeight = weights.get('ln_f.weight');
-    const lnFBias = weights.get('ln_f.bias');
+    const lnFWeight = weights.get("ln_f.weight");
+    const lnFBias = weights.get("ln_f.bias");
     if (lnFWeight && lnFBias) {
       const w = this.api.tensorFromArray(lnFWeight.data, lnFWeight.shape);
       const b = this.api.tensorFromArray(lnFBias.data, lnFBias.shape);
@@ -613,7 +641,7 @@ export class GPT2WithLoRA {
       if (ln1W && ln1B) {
         block.ln1.loadWeights(
           this.api.tensorFromArray(ln1W.data, ln1W.shape),
-          this.api.tensorFromArray(ln1B.data, ln1B.shape)
+          this.api.tensorFromArray(ln1B.data, ln1B.shape),
         );
       }
 
@@ -623,7 +651,10 @@ export class GPT2WithLoRA {
       if (cAttnW && cAttnB) {
         // Note: HuggingFace stores as [in, out], we need [out, in]
         const transposed = this.transposeWeight(cAttnW.data, cAttnW.shape);
-        const wTensor = this.api.tensorFromArray(transposed.data, transposed.shape);
+        const wTensor = this.api.tensorFromArray(
+          transposed.data,
+          transposed.shape,
+        );
         const bTensor = this.api.tensorFromArray(cAttnB.data, cAttnB.shape);
         block.attn.cAttn.loadBaseWeights(wTensor, bTensor);
       }
@@ -633,7 +664,10 @@ export class GPT2WithLoRA {
       const cProjB = weights.get(`${prefix}.attn.c_proj.bias`);
       if (cProjW && cProjB) {
         const transposed = this.transposeWeight(cProjW.data, cProjW.shape);
-        const wTensor = this.api.tensorFromArray(transposed.data, transposed.shape);
+        const wTensor = this.api.tensorFromArray(
+          transposed.data,
+          transposed.shape,
+        );
         const bTensor = this.api.tensorFromArray(cProjB.data, cProjB.shape);
         block.attn.cProj.loadWeights(wTensor, bTensor);
       }
@@ -644,7 +678,7 @@ export class GPT2WithLoRA {
       if (ln2W && ln2B) {
         block.ln2.loadWeights(
           this.api.tensorFromArray(ln2W.data, ln2W.shape),
-          this.api.tensorFromArray(ln2B.data, ln2B.shape)
+          this.api.tensorFromArray(ln2B.data, ln2B.shape),
         );
       }
 
@@ -655,7 +689,7 @@ export class GPT2WithLoRA {
         const transposed = this.transposeWeight(cFcW.data, cFcW.shape);
         block.mlp.cFc.loadWeights(
           this.api.tensorFromArray(transposed.data, transposed.shape),
-          this.api.tensorFromArray(cFcB.data, cFcB.shape)
+          this.api.tensorFromArray(cFcB.data, cFcB.shape),
         );
       }
 
@@ -666,7 +700,7 @@ export class GPT2WithLoRA {
         const transposed = this.transposeWeight(mlpProjW.data, mlpProjW.shape);
         block.mlp.cProj.loadWeights(
           this.api.tensorFromArray(transposed.data, transposed.shape),
-          this.api.tensorFromArray(mlpProjB.data, mlpProjB.shape)
+          this.api.tensorFromArray(mlpProjB.data, mlpProjB.shape),
         );
       }
     }
@@ -674,7 +708,7 @@ export class GPT2WithLoRA {
 
   private transposeWeight(
     data: Float32Array,
-    shape: number[]
+    shape: number[],
   ): { data: Float32Array; shape: number[] } {
     // Transpose 2D weight from [in, out] to [out, in]
     const [rows, cols] = shape;
