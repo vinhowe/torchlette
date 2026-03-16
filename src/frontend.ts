@@ -919,58 +919,55 @@ export class Torchlette {
     ]);
   }
 
-  sum(a: Tensor, options?: SumOptions): Tensor {
-    this._assertUsable(a);
-    // Autocast: sum is F32-required for numerical stability
-    const [castA] = this._applyAutocast("sum", [a]);
-    const inner = this.runtime.sum(castA._unwrap(), options);
-    const aShape = a.shape;
-    const aRank = aShape.length;
-    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => {
-      const dims = this._normalizeDims(options?.dim ?? null, aRank);
-      const keepdim = options?.keepdim ?? false;
-      const expanded = this._expandGrad(grad, aShape, dims, keepdim);
-      return [expanded];
-    });
-  }
-
-  private _maxMinOp(
-    op: "max" | "min",
+  /** Generic dispatcher for reduction ops with autograd. */
+  private _dispatchReduction(
+    opName: string,
     a: Tensor,
-    options?: MaxOptions,
+    options?: { dim?: number | number[] | null; keepdim?: boolean },
   ): number | Tensor {
     this._assertUsable(a);
-    const result = this.runtime[op](a._unwrap(), options);
-    return typeof result === "number" ? result : this._wrap(result);
-  }
-  max(a: Tensor, options?: MaxOptions): number | Tensor {
-    return this._maxMinOp("max", a, options);
-  }
-  min(a: Tensor, options?: MinOptions): number | Tensor {
-    return this._maxMinOp("min", a, options);
-  }
-
-  mean(a: Tensor, options?: MeanOptions): number | Tensor {
-    this._assertUsable(a);
-    // Autocast: mean is F32-required for numerical stability
-    const [castA] = this._applyAutocast("mean", [a]);
-    const result = this.runtime.mean(castA._unwrap(), options);
+    const autocastOp = opName === "sum" || opName === "mean" ? opName : null;
+    const castA = autocastOp ? this._applyAutocast(autocastOp, [a])[0] : a;
+    const result = (this.runtime as any)[opName](castA._unwrap(), options);
     if (typeof result === "number") {
-      if (a.requiresGrad) {
+      if (a.requiresGrad && opName === "mean") {
         throw new Error("mean with requiresGrad must specify dim");
       }
-      return result;
+      return typeof result === "number" && !a.requiresGrad
+        ? result
+        : this._wrap(
+            typeof result === "number" ? this.runtime.full([], result) : result,
+          );
+    }
+    // Non-differentiable reductions (max, min without dim grad)
+    if (opName === "max" || opName === "min") {
+      return this._wrap(result);
     }
     const aShape = a.shape;
     const dims = this._normalizeDims(options?.dim ?? null, aShape.length);
     const keepdim = options?.keepdim ?? false;
-    const reduceCount =
-      dims.length === 0 ? 1 : dims.reduce((acc, dim) => acc * aShape[dim], 1);
     return this._wrapWithGrad(result, [a], (grad, _getSaved) => {
       const expanded = this._expandGrad(grad, aShape, dims, keepdim);
-      const scaled = this.runtime.mul(expanded, 1 / reduceCount);
-      return [scaled];
+      if (opName === "mean") {
+        const reduceCount =
+          dims.length === 0 ? 1 : dims.reduce((acc, d) => acc * aShape[d], 1);
+        return [this.runtime.mul(expanded, 1 / reduceCount)];
+      }
+      return [expanded];
     });
+  }
+
+  sum(a: Tensor, options?: SumOptions): Tensor {
+    return this._dispatchReduction("sum", a, options) as Tensor;
+  }
+  max(a: Tensor, options?: MaxOptions): number | Tensor {
+    return this._dispatchReduction("max", a, options);
+  }
+  min(a: Tensor, options?: MinOptions): number | Tensor {
+    return this._dispatchReduction("min", a, options);
+  }
+  mean(a: Tensor, options?: MeanOptions): number | Tensor {
+    return this._dispatchReduction("mean", a, options);
   }
 
   argmax(a: Tensor, options: ArgReduceOptions): Tensor {
@@ -1215,7 +1212,7 @@ export class Torchlette {
     this._assertUsable(a);
     const aShape = a.shape;
     const inner = this.runtime.reshape(a._unwrap(), shape);
-    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => [
+    return this._wrapWithGrad(inner, [a], (grad) => [
       this.runtime.reshape(grad, aShape),
     ]);
   }
@@ -1233,9 +1230,9 @@ export class Torchlette {
     } else {
       newShape = aShape.filter((s) => s !== 1);
     }
-    if (newShape.length === aShape.length) return a; // nothing to squeeze
+    if (newShape.length === aShape.length) return a;
     const inner = this.runtime.reshape(a._unwrap(), newShape);
-    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => [
+    return this._wrapWithGrad(inner, [a], (grad) => [
       this.runtime.reshape(grad, aShape),
     ]);
   }
@@ -1246,7 +1243,7 @@ export class Torchlette {
     const d = dim < 0 ? dim + aShape.length + 1 : dim;
     const newShape = [...aShape.slice(0, d), 1, ...aShape.slice(d)];
     const inner = this.runtime.reshape(a._unwrap(), newShape);
-    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => [
+    return this._wrapWithGrad(inner, [a], (grad) => [
       this.runtime.reshape(grad, aShape),
     ]);
   }
@@ -1254,7 +1251,7 @@ export class Torchlette {
   transpose(a: Tensor, options: TransposeOptions): Tensor {
     this._assertUsable(a);
     const inner = this.runtime.transpose(a._unwrap(), options);
-    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => [
+    return this._wrapWithGrad(inner, [a], (grad) => [
       this.runtime.transpose(grad, options),
     ]);
   }
@@ -1263,10 +1260,8 @@ export class Torchlette {
     this._assertUsable(a);
     const inner = this.runtime.permute(a._unwrap(), dims);
     const inverseDims = new Array<number>(dims.length);
-    for (let i = 0; i < dims.length; i++) {
-      inverseDims[dims[i]] = i;
-    }
-    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => [
+    for (let i = 0; i < dims.length; i++) inverseDims[dims[i]] = i;
+    return this._wrapWithGrad(inner, [a], (grad) => [
       this.runtime.permute(grad, inverseDims),
     ]);
   }
@@ -1274,14 +1269,14 @@ export class Torchlette {
   contiguous(a: Tensor): Tensor {
     this._assertUsable(a);
     const inner = this.runtime.contiguous(a._unwrap());
-    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => [grad]);
+    return this._wrapWithGrad(inner, [a], (grad) => [grad]);
   }
 
   narrow(a: Tensor, dim: number, start: number, length: number): Tensor {
     this._assertUsable(a);
     const originalLength = a.shape[dim];
     const inner = this.runtime.narrow(a._unwrap(), dim, start, length);
-    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => [
+    return this._wrapWithGrad(inner, [a], (grad) => [
       this.runtime.narrowBackward(grad, dim, start, originalLength),
     ]);
   }
