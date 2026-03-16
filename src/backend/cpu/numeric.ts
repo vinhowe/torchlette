@@ -117,6 +117,34 @@ export function full(shape: Shape, fillValue: number): Tensor {
   return new Tensor(shape, data);
 }
 
+export function rand(shape: Shape): Tensor {
+  const n = sizeOf(shape);
+  const data = new Float32Array(n);
+  for (let i = 0; i < n; i++) data[i] = Math.random();
+  return new Tensor(shape, data);
+}
+
+export function randn(shape: Shape): Tensor {
+  const n = sizeOf(shape);
+  const data = new Float32Array(n);
+  // Box-Muller transform
+  for (let i = 0; i < n; i += 2) {
+    const u1 = Math.random() || 1e-10;
+    const u2 = Math.random();
+    const r = Math.sqrt(-2 * Math.log(u1));
+    data[i] = r * Math.cos(2 * Math.PI * u2);
+    if (i + 1 < n) data[i + 1] = r * Math.sin(2 * Math.PI * u2);
+  }
+  return new Tensor(shape, data);
+}
+
+export function bernoulli(shape: Shape, p: number, _seed?: number): Tensor {
+  const n = sizeOf(shape);
+  const data = new Float32Array(n);
+  for (let i = 0; i < n; i++) data[i] = Math.random() < p ? 1 : 0;
+  return new Tensor(shape, data);
+}
+
 export function arange(end: number, start = 0, step = 1): Tensor {
   const numElements = Math.max(0, Math.ceil((end - start) / step));
   const data = new Float32Array(numElements);
