@@ -35,8 +35,7 @@ async function main() {
   }
 
   const api = new Torchlette("webgpu", {
-    enableFusion: true,
-    enableMemoryPlanning: true,
+    enableFusion: false,
   });
 
   // Step 2: Load tokenizer
@@ -107,7 +106,10 @@ async function main() {
       console.warn(`   Skipping ${name}: unsupported dtype ${dtype}`);
       continue;
     }
-    weights.set(name, { data: new Float32Array(f32), shape });
+    // Strip "transformer." prefix — safetensors uses "transformer.wte.weight",
+    // but model.loadBaseWeights expects "wte.weight"
+    const cleanName = name.replace(/^transformer\./, "");
+    weights.set(cleanName, { data: new Float32Array(f32), shape });
   }
   model.loadBaseWeights(weights);
   console.log(`   Loaded ${weights.size} weight tensors`);
