@@ -101,6 +101,14 @@ export { broadcastShapes };
 function matmulShape(a: number[], b: number[]): number[] {
   if (a.length < 1 || b.length < 1)
     throw new Error("matmul requires at least 1D tensors");
+  // Validate inner dimension match
+  const kA = a[a.length - 1];
+  const kB = b.length === 1 ? b[0] : b[b.length - 2];
+  if (kA !== kB) {
+    throw new Error(
+      `matmul: inner dimension mismatch — [${a.join(",")}] @ [${b.join(",")}] (${kA} != ${kB})`,
+    );
+  }
   if (a.length === 1 && b.length === 1) return [];
   if (a.length === 1) return [...b.slice(0, -2), b[b.length - 1]];
   if (b.length === 1) return a.slice(0, -1);

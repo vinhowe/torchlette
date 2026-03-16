@@ -182,7 +182,7 @@ function createInvCountEpilogue(
     ],
     inputs: [
       ...epilogueInputs,
-      { buffer: invCountBuffer } as unknown as BackendTensor,
+      { buffer: invCountBuffer, shape: [], toArray: () => [] } as BackendTensor,
     ],
     invCountBuffer,
   };

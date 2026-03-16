@@ -372,7 +372,9 @@ export async function autotune(
           dtype,
         };
       }
-    } catch {}
+    } catch {
+      // Config failed to compile or dispatch — skip and try next
+    }
   }
 
   // If no config worked, use default
@@ -509,7 +511,9 @@ export async function quickAutotune(
           dtype,
         };
       }
-    } catch {}
+    } catch {
+      // Config failed to compile or dispatch — skip and try next
+    }
   }
 
   if (!bestResult) {
