@@ -9,7 +9,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { getBackend } from "../src/backend/registry";
 import type { Backend } from "../src/backend/types";
-import { executePlanOptimized } from "../src/engine/executor-optimized";
+import { executePlanOptimized } from "../src/engine/executor-lowered";
 import {
   detectFusionGroups,
   groupToRecipe,

@@ -23,7 +23,7 @@ import {
   setProfilePhase,
   writeProfileJSON,
 } from "../src/backend/webgpu";
-import type { OptimizedExecutionStats } from "../src/engine/executor-optimized";
+import type { OptimizedExecutionStats } from "../src/engine/executor-lowered";
 import { type Tensor, Torchlette } from "../src/frontend";
 import { Adam, GradScaler } from "../src/optim";
 

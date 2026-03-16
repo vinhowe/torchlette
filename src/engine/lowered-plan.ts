@@ -191,7 +191,7 @@ export interface LoweredPlan {
   planNodeCount: number;
   /** Cached fusion stats from the normal-path execution that built the compiled plan.
    *  Returned by the compiled plan fast path so cumulative stats stay accurate. */
-  cachedStats?: import("./executor-optimized").OptimizedExecutionStats;
+  cachedStats?: import("./executor-lowered").OptimizedExecutionStats;
   /** Compiled execution plan: flat GPU command sequence. */
   compiledPlan?: import("./compiled-plan").CompiledPlan;
 }
