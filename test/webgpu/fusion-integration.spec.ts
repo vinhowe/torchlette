@@ -20,12 +20,8 @@ import {
   resetFusionCache,
 } from "../../src/backend/webgpu/fusion-dispatch";
 import { generateFusedKernelTileIR } from "../../src/backend/webgpu/fusion-tile-ir";
-import {
-  buildRecipeFromIR,
-  type FusedKernelRecipe,
-} from "../../src/backend/webgpu/fusion-types";
+import type { FusedKernelRecipe } from "../../src/backend/webgpu/fusion-types";
 import type { GPUDevice } from "../../src/backend/webgpu/gpu-types";
-import type { IRNode } from "../../src/engine/ir";
 import { Torchlette } from "../../src/frontend";
 
 import { cpuOnly } from "../helpers/webgpu";
@@ -509,103 +505,6 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
       for (let i = 0; i < 256; i++) {
         expect(data[i]).toBeCloseTo(expected[i], 5);
       }
-    });
-  });
-
-  describe("§15.4 Fusion Barriers", () => {
-    it("fusion detection identifies fusible chains", () => {
-      // Create mock IR nodes
-      const nodes: IRNode[] = [
-        {
-          id: 0,
-          op: "input",
-          inputs: [],
-          shape: [4],
-          dtype: "f32",
-          epoch: 1,
-          kind: "lazy_op" as const,
-        },
-        {
-          id: 1,
-          op: "relu",
-          inputs: [0],
-          shape: [4],
-          dtype: "f32",
-          epoch: 1,
-          kind: "lazy_op" as const,
-        },
-        {
-          id: 2,
-          op: "neg",
-          inputs: [1],
-          shape: [4],
-          dtype: "f32",
-          epoch: 1,
-          kind: "lazy_op" as const,
-        },
-      ];
-
-      const nodeById = new Map(nodes.map((n) => [n.id, n]));
-
-      // Build recipe - relu and neg should fuse
-      const recipe = buildRecipeFromIR([1, 2], nodeById, [0]);
-
-      expect(recipe.nodes).toHaveLength(2);
-      expect(recipe.nodes[0].op).toBe("relu");
-      expect(recipe.nodes[1].op).toBe("neg");
-    });
-
-    it("non-fusible ops break chains", () => {
-      // Matmul is not fusible
-      const nodes: IRNode[] = [
-        {
-          id: 0,
-          op: "input",
-          inputs: [],
-          shape: [4, 4],
-          dtype: "f32",
-          epoch: 1,
-          kind: "lazy_op" as const,
-        },
-        {
-          id: 1,
-          op: "relu",
-          inputs: [0],
-          shape: [4, 4],
-          dtype: "f32",
-          epoch: 1,
-          kind: "lazy_op" as const,
-        },
-        {
-          id: 2,
-          op: "matmul",
-          inputs: [1, 0],
-          shape: [4, 4],
-          dtype: "f32",
-          epoch: 1,
-          kind: "lazy_op" as const,
-        },
-        {
-          id: 3,
-          op: "neg",
-          inputs: [2],
-          shape: [4, 4],
-          dtype: "f32",
-          epoch: 1,
-          kind: "lazy_op" as const,
-        },
-      ];
-
-      // Can't fuse across matmul
-      const nodeById = new Map(nodes.map((n) => [n.id, n]));
-
-      // Only relu can fuse with input
-      const recipe1 = buildRecipeFromIR([1], nodeById, [0]);
-      expect(recipe1.nodes).toHaveLength(1);
-
-      // Only neg can be after matmul
-      const recipe2 = buildRecipeFromIR([3], nodeById, [2]);
-      expect(recipe2.nodes).toHaveLength(1);
     });
   });
 

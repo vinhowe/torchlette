@@ -7,15 +7,12 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { Engine, type MemoryStatsProvider } from "../src/engine/engine";
-import { TraceRecorder } from "../src/engine/trace";
 
 describe("Engine Visibility Tools", () => {
   let engine: Engine;
-  let trace: TraceRecorder;
 
   beforeEach(() => {
-    trace = new TraceRecorder();
-    engine = new Engine(trace);
+    engine = new Engine();
   });
 
   describe("Memory Stats", () => {

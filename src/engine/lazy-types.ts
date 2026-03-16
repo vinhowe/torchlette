@@ -1,5 +1,4 @@
 import type { BackendTensor, DeviceKind, DType } from "../backend/types";
-import type { Token } from "./tokens";
 
 export type LazyOpCode =
   | "add"
@@ -91,8 +90,6 @@ export interface LazyIRNode {
   shape: number[];
   dtype: DType;
   device: DeviceKind;
-  tokenIn?: Token;
-  tokenOut?: Token;
   /** Primary output (index 0). Set after execution. */
   result?: StorageHandle;
   /** All outputs for multi-output ops. results[0] === result. */

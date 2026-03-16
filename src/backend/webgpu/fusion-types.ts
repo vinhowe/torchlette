@@ -7,7 +7,6 @@
  */
 
 import { sizeOf } from "../../core/shape";
-import type { IRNode } from "../../engine/ir";
 import type { DType } from "../types";
 import { canVectorize as canVectorizeOp } from "./ops/registry";
 import { MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
@@ -240,94 +239,4 @@ export function computeKernelMeta(
   const cacheKey =
     gridSizeX >= MAX_WORKGROUPS_PER_DIM ? baseCacheKey + ":2d" : baseCacheKey;
   return { cacheKey, vectorWidth, workItems, workgroupSize, gridSizeX };
-}
-
-// ============================================================================
-// Recipe Building from IR
-// ============================================================================
-
-/**
- * Build a fusion recipe from IR nodes.
- * Supports multi-output fusion (§15.2).
- */
-export function buildRecipeFromIR(
-  nodeIds: number[],
-  nodeById: Map<number, IRNode>,
-  inputNodeIds: number[],
-  outputNodeIds?: number[],
-): FusedKernelRecipe {
-  const nodeSet = new Set(nodeIds);
-
-  const inputMap = new Map<number, number>();
-  const inputs: FusedInput[] = [];
-  for (let i = 0; i < inputNodeIds.length; i++) {
-    const nodeId = inputNodeIds[i];
-    const node = nodeById.get(nodeId);
-    inputMap.set(nodeId, -(i + 1));
-    inputs.push({
-      id: nodeId,
-      index: i,
-      shape: node?.shape ?? [1],
-      dtype: node?.dtype ?? "f32",
-    });
-  }
-
-  const outputIds = outputNodeIds ?? [nodeIds[nodeIds.length - 1]];
-  const outputSet = new Set(outputIds);
-
-  const nodes: FusedNode[] = [];
-  for (const nodeId of nodeIds) {
-    const node = nodeById.get(nodeId);
-    if (!node) {
-      throw new Error(`Node ${nodeId} not found`);
-    }
-
-    const mappedInputs: number[] = [];
-    for (const inputId of node.inputs) {
-      if (nodeSet.has(inputId)) {
-        mappedInputs.push(inputId);
-      } else if (inputMap.has(inputId)) {
-        mappedInputs.push(inputMap.get(inputId) ?? inputId);
-      } else {
-        const newIdx = inputs.length;
-        inputMap.set(inputId, -(newIdx + 1));
-        const inputNode = nodeById.get(inputId);
-        inputs.push({
-          id: inputId,
-          index: newIdx,
-          shape: inputNode?.shape ?? [1],
-          dtype: inputNode?.dtype ?? "f32",
-        });
-        mappedInputs.push(-(newIdx + 1));
-      }
-    }
-
-    nodes.push({
-      id: nodeId,
-      op: node.op,
-      inputs: mappedInputs,
-      shape: node.shape ?? [1],
-      dtype: node.dtype ?? "f32",
-      isOutput: outputSet.has(nodeId),
-    });
-  }
-
-  const outputs: FusedOutput[] = [];
-  for (let i = 0; i < outputIds.length; i++) {
-    const nodeId = outputIds[i];
-    const node = nodeById.get(nodeId);
-    outputs.push({
-      nodeId,
-      index: i,
-      shape: node?.shape ?? [1],
-      dtype: node?.dtype ?? "f32",
-    });
-  }
-
-  return {
-    id: `fused_${nodeIds.join("_")}`,
-    nodes,
-    inputs,
-    outputs,
-  };
 }
