@@ -115,3 +115,9 @@ Steady-state ~162ms/step wall clock. Memory: 14.7GB steady, zero leak. Pool reus
 - **Inline D precompute into attention** — D precompute is only 0.3ms; inline overhead exceeds savings.
 - **Per-shape matmul autotuning on DistilGPT-2** — Hand-tuned defaults already optimal for 768-dim. Infrastructure kept for larger models.
 - **Matmul input cast absorption in training** — Backward needs f16 tensors materialized; can't skip the cast.
+
+## Known Semantic Limitations
+
+- **In-place self-aliasing crashes** — `tensor.mul_(tensor)` (same tensor as both operands) creates a broken lazy graph node. `add_(self)` works because the lazy system doesn't read-after-write, but `mul_` needs both input values before writing. Use `api.mul(a, a)` (non-in-place) instead. Not worth fixing: would require aliasing detection on every in-place op for a case that never occurs in real training.
+- **Disposing intermediates breaks autograd** — If you manually `dispose()` a tensor that's part of an active backward graph, the saved-for-backward reference is killed and gradients will be silently wrong or null. Unlike PyTorch, saved tensors share lifecycle with the user handle (no independent refcounting). In practice this doesn't occur: `tidy()`, `compile()`, and `beginStep()`/`endStep()` manage lifecycle automatically. Don't manually dispose tensors between forward and backward.
+- **No double backward** — Calling `backward()` clears the autograd graph. A second call does nothing (no `retain_graph` equivalent). This is by design for memory efficiency.
