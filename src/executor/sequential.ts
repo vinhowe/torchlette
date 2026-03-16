@@ -6,9 +6,9 @@ import type {
   ExecutionPlan,
   LazyIRNode,
   StorageHandle,
-} from "./lazy-types";
-import type { TensorLifetime } from "./lifetime-analysis";
-import { wrapResultAsStorage } from "./node-factory";
+} from "../graph/types";
+import type { TensorLifetime } from "../graph/lifetime-analysis";
+import { wrapResultAsStorage } from "../graph/node-factory";
 import { executeOp, getInputStorage } from "./op-dispatch";
 import {
   initLifetimeAnalysis,
@@ -19,7 +19,7 @@ import {
   canSafelyRelease,
   releaseBufferImmediate,
   releaseDeadTensors,
-} from "./storage-tracker";
+} from "../graph/storage-tracker";
 
 // ============================================================================
 // Sequential Plan Execution

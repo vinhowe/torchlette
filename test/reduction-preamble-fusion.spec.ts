@@ -6,7 +6,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { Torchlette } from "../src/frontend";
+import { Torchlette } from "../src/frontend/torchlette";
 import { canUseWebGPU, cpuOnly } from "./helpers/webgpu";
 
 describe.skipIf(cpuOnly)("Reduction preamble/epilogue fusion", () => {

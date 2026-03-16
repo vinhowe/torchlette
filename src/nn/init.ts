@@ -5,7 +5,7 @@
  * All init functions modify the tensor in-place via api.copy_() and return void.
  */
 
-import type { Tensor, Torchlette } from "../frontend";
+import type { Tensor, Torchlette } from "../frontend/torchlette";
 
 // ---------------------------------------------------------------------------
 // Helpers

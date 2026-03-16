@@ -2,7 +2,7 @@
  * Tests for nn container modules: ModuleList, Sequential
  */
 import { beforeEach, describe, expect, it } from "vitest";
-import { type Tensor, Torchlette } from "../../src/frontend";
+import { type Tensor, Torchlette } from "../../src/frontend/torchlette";
 import { Linear } from "../../src/nn/linear";
 import { Module } from "../../src/nn/module";
 import { ModuleList } from "../../src/nn/modulelist";

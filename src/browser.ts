@@ -29,5 +29,5 @@ export {
   type TensorCreateOptions,
   Torchlette,
   torch,
-} from "./frontend";
+} from "./frontend/torchlette";
 export { Adam, type AdamOptions, SGD, type SGDOptions } from "./optim";

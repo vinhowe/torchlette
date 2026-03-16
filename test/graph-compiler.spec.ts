@@ -6,14 +6,14 @@
  */
 
 import { beforeEach, describe, expect, it } from "vitest";
-import { analyzeGraph } from "../src/engine/graph-compiler";
-import type { LazyIRNode } from "../src/engine/lazy-types";
-import { createPendingRef } from "../src/engine/lazy-types";
+import { analyzeGraph } from "../src/compiler/graph-compiler";
+import type { LazyIRNode } from "../src/graph/types";
+import { createPendingRef } from "../src/graph/types";
 import {
   createLazyIRNode,
   resetNodeIdCounter,
   resetStorageIdCounter,
-} from "../src/engine/node-factory";
+} from "../src/graph/node-factory";
 
 describe("Graph Compiler — analyzeGraph()", () => {
   beforeEach(() => {

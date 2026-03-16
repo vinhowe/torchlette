@@ -3,7 +3,7 @@
  * Similar to PyTorch's nn.Sequential.
  */
 
-import type { Tensor, Torchlette } from "../frontend";
+import type { Tensor, Torchlette } from "../frontend/torchlette";
 import { Module } from "./module";
 
 export class Sequential extends Module {

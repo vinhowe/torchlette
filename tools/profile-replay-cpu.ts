@@ -11,7 +11,7 @@ import {
   initWebGPU,
   isF16Supported,
 } from "../src/backend/webgpu";
-import { type Tensor, Torchlette } from "../src/frontend";
+import { type Tensor, Torchlette } from "../src/frontend/torchlette";
 import { Adam } from "../src/optim/adam";
 import { GradScaler } from "../src/optim/grad-scaler";
 

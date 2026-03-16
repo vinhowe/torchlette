@@ -1,16 +1,16 @@
-import { OP_DTYPE_RULES, promoteDtype } from "./backend/op-registry";
-import type { DType } from "./backend/types";
+import { OP_DTYPE_RULES, promoteDtype } from "../ops/registry";
+import type { DType } from "../backend/types";
 import {
   DEFAULT_AMP_POLICY,
   F16_ELIGIBLE_OPS,
   F32_REQUIRED_OPS,
   popAutocast,
   pushAutocast,
-} from "./engine/amp";
-import type { LazyOpCode } from "./engine/lazy-types";
-import type { Torchlette } from "./frontend";
-import type { Tensor } from "./frontend-tensor";
-import type { AutocastOptions, PackHook, UnpackHook } from "./frontend-types";
+} from "../compiler/amp";
+import type { LazyOpCode } from "../graph/types";
+import type { Torchlette } from "./torchlette";
+import type { Tensor } from "./tensor";
+import type { AutocastOptions, PackHook, UnpackHook } from "./types";
 
 /**
  * Execute a function with automatic mixed precision (AMP) enabled.

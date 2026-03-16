@@ -12,8 +12,8 @@
  * per step each have their own arena).
  */
 
-import { recordAlloc } from "../../engine/compiled-plan";
-import { getSizeClass, getSizeForClass } from "../../engine/lifetime-analysis";
+import { recordAlloc } from "../../executor/compiled-plan";
+import { getSizeClass, getSizeForClass } from "../../graph/lifetime-analysis";
 import type { BackendTensor } from "../types";
 import { bufferPool } from "./buffer-pool";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";

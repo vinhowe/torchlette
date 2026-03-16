@@ -13,7 +13,7 @@
  * step-level scope management (beginStep/endStep).
  */
 
-import { getSizeClass } from "../../engine/lifetime-analysis";
+import { getSizeClass } from "../../graph/lifetime-analysis";
 import { resetDispatchSequence } from "./bind-group-cache";
 import { pinnedOutputBuffers, prePinOutputBuffers } from "./buffer-arena";
 import { awaitDeferredFence, bufferPool } from "./buffer-pool";

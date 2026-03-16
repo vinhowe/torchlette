@@ -157,7 +157,7 @@ export interface RecordedDispatch {
 
 import { asGPUTensor } from "../backend/webgpu/gpu-types";
 import { contiguousStrides } from "../core/shape";
-import type { LazyIRNode } from "./lazy-types";
+import type { LazyIRNode } from "../graph/types";
 import { getInputStorage } from "./op-dispatch";
 
 /** Recorded buffer copy for compilation. */
@@ -500,8 +500,8 @@ import {
   paramsBufferSizeClass,
   requireContext,
 } from "../backend/webgpu/webgpu-state";
-import type { StorageHandle } from "./lazy-types";
-import { createStorageHandle } from "./node-factory";
+import type { StorageHandle } from "../graph/types";
+import { createStorageHandle } from "../graph/node-factory";
 import { executeOpSync } from "./op-dispatch";
 
 /**

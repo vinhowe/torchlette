@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { Torchlette } from "../src/frontend";
+import { Torchlette } from "../src/frontend/torchlette";
 import { crossEntropy, Dropout, dropout, logSoftmax, nllLoss } from "../src/nn";
 
 describe("Sprint 4 ops (CPU)", () => {

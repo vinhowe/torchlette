@@ -10,7 +10,7 @@
 
 import { beforeAll, describe, expect, test } from "vitest";
 import { GPT2, type GPT2Config } from "../examples/gpt2/model";
-import { Torchlette } from "../src/frontend";
+import { Torchlette } from "../src/frontend/torchlette";
 import { Adam } from "../src/optim";
 import { canUseWebGPU, cpuOnly } from "./helpers/webgpu";
 

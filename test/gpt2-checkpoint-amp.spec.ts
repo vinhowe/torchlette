@@ -6,7 +6,7 @@
  */
 
 import { beforeEach, describe, expect, it } from "vitest";
-import { type FrontendTensor as Tensor, Torchlette } from "../src/frontend";
+import { type FrontendTensor as Tensor, Torchlette } from "../src/frontend/torchlette";
 import { checkpoint } from "../src/nn/checkpoint";
 
 /**

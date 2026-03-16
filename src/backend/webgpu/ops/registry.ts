@@ -1,6 +1,6 @@
 // Re-export from backend-agnostic location (preserves existing import paths)
 
-export type { OpDtypeRule } from "../../op-registry";
+export type { OpDtypeRule } from "../../../ops/registry";
 export {
   canVectorize,
   getOpDtypeRule,
@@ -9,4 +9,4 @@ export {
   getWgslPrefix,
   isUnaryOp,
   OP_REGISTRY,
-} from "../../op-registry";
+} from "../../../ops/registry";

@@ -21,7 +21,7 @@ import {
   segmentPlanForExecution,
 } from "./fusion-detect";
 import { runPasses, SIMPLIFICATION_PASSES } from "./graph-rewrites";
-import type { LazyIRNode } from "./lazy-types";
+import type { LazyIRNode } from "../graph/types";
 import {
   detectMatmulEpilogueCore,
   type MatmulEpiloguePlan,

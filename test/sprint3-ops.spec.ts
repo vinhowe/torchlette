@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { Torchlette } from "../src/frontend";
+import { Torchlette } from "../src/frontend/torchlette";
 
 describe("Sprint 3 ops (CPU)", () => {
   const api = new Torchlette("cpu");

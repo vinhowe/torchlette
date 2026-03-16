@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { Torchlette } from "../src/frontend";
+import { Torchlette } from "../src/frontend/torchlette";
 
 describe("tril/triu ops", () => {
   let api: Torchlette;

@@ -7,7 +7,7 @@ import {
   getAndClearLastBindGroupBuffers,
   isCompilationRecordingActive,
   recordDispatch as recordCompiledDispatch,
-} from "../../engine/compiled-plan";
+} from "../../executor/compiled-plan";
 import type { DType } from "../types";
 import {
   cachedCreateBindGroup,

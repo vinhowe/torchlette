@@ -1,4 +1,4 @@
-import type { Tensor, Torchlette } from "../frontend";
+import type { Tensor, Torchlette } from "../frontend/torchlette";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import { validateOptimizerParams } from "./validate";
 

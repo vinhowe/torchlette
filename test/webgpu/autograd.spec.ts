@@ -10,8 +10,8 @@ import { initWebGPU } from "../../src/backend/webgpu/index";
 import {
   resetNodeIdCounter,
   resetStorageIdCounter,
-} from "../../src/engine/node-factory";
-import { Torchlette } from "../../src/frontend";
+} from "../../src/graph/node-factory";
+import { Torchlette } from "../../src/frontend/torchlette";
 import { resetBaseIdCounter } from "../../src/runtime/tensor";
 import { cpuOnly } from "../helpers/webgpu";
 

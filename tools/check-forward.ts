@@ -6,7 +6,7 @@
 import { GPT2Tokenizer } from "../examples/gpt2/data";
 import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
 import { initWebGPU } from "../src/backend/webgpu";
-import { Torchlette } from "../src/frontend";
+import { Torchlette } from "../src/frontend/torchlette";
 
 async function main() {
   await initWebGPU();

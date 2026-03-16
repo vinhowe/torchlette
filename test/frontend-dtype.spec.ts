@@ -4,7 +4,7 @@
 
 import { beforeAll, describe, expect, it } from "vitest";
 import { initWebGPU, isF16Supported } from "../src/backend/webgpu/index";
-import { Torchlette } from "../src/frontend";
+import { Torchlette } from "../src/frontend/torchlette";
 import { cpuOnly } from "./helpers/webgpu";
 
 describe("Frontend dtype casting", () => {

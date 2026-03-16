@@ -24,9 +24,9 @@
  * linearly with sequence length and layer count.
  */
 
-import type { RngDrawRecord } from "../engine/engine-types";
-import { markAsCheckpointBoundary } from "../engine/plan-builder";
-import type { PackHook, Tensor, Torchlette, UnpackHook } from "../frontend";
+import type { RngDrawRecord } from "../graph/engine-types";
+import { markAsCheckpointBoundary } from "../executor/plan-builder";
+import type { PackHook, Tensor, Torchlette, UnpackHook } from "../frontend/torchlette";
 
 // ============================================================================
 // Types

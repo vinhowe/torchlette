@@ -3,13 +3,13 @@ import { asGPUTensor } from "../backend/webgpu/gpu-types";
 import type { EpilogueConfig } from "../backend/webgpu/matmul/types";
 import { contiguousStrides, shapesEqual } from "../core/shape";
 import { isFusibleOp } from "./fusion-detect";
-import type { LazyIRNode, LazyRef } from "./lazy-types";
+import type { LazyIRNode, LazyRef } from "../graph/types";
 import {
   _webgpuMatmulImports,
   createStorageHandle,
   ensureWebGPUMatmulImports,
-} from "./node-factory";
-import { getInputStorage } from "./op-dispatch";
+} from "../graph/node-factory";
+import { getInputStorage } from "../executor/op-dispatch";
 
 // ============================================================================
 // Shared epilogue chain helpers (used by matmul-epilogue and reduction-preamble)

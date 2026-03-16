@@ -13,7 +13,7 @@ import {
   assignSlot,
   isCompilationRecordingActive,
   setLastBindGroupBuffers,
-} from "../../engine/compiled-plan";
+} from "../../executor/compiled-plan";
 import {
   isArenaBuffer,
   outputSequenceHints,

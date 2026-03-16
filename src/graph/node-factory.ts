@@ -4,7 +4,7 @@ import type {
   LazyOpCode,
   LazyRef,
   StorageHandle,
-} from "./lazy-types";
+} from "./types";
 import { getProfileModule } from "./profiler";
 import { storageTracker } from "./storage-tracker";
 

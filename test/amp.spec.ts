@@ -14,7 +14,7 @@ import {
   hashAMPPolicy,
   popAutocast,
   pushAutocast,
-} from "../src/engine/amp";
+} from "../src/compiler/amp";
 
 describe("AMP Policy", () => {
   it("DEFAULT_AMP_POLICY has f16 compute and f32 accumulate", () => {

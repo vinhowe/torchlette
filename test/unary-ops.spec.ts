@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { Torchlette } from "../src/frontend";
+import { Torchlette } from "../src/frontend/torchlette";
 
 describe("Unary ops (CPU)", () => {
   const api = new Torchlette("cpu");

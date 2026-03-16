@@ -5,7 +5,7 @@
  * Kernel cache is structural (keyed by RowProgram.cacheKey, not node IDs).
  */
 
-import type { RowProgram } from "../../engine/row-program-types";
+import type { RowProgram } from "../../compiler/row-program-types";
 import { resolveOutputBuffer } from "./buffer-arena";
 import type { GPUBuffer } from "./gpu-types";
 import { rowProgramToSpec } from "./row-program-codegen";

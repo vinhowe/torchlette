@@ -1,7 +1,7 @@
 import type { BackendTensor, DeviceKind, DType, Shape } from "../backend/types";
-import type { LazyRef, StorageHandle } from "../engine/lazy-types";
-import { isMaterialized } from "../engine/lazy-types";
-import { storageTracker } from "../engine/storage-tracker";
+import type { LazyRef, StorageHandle } from "../graph/types";
+import { isMaterialized } from "../graph/types";
+import { storageTracker } from "../graph/storage-tracker";
 
 export type BaseId = number;
 

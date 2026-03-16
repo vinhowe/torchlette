@@ -2,7 +2,7 @@
  * Dropout module.
  */
 
-import type { Tensor, Torchlette } from "../frontend";
+import type { Tensor, Torchlette } from "../frontend/torchlette";
 import { dropout as dropoutFn } from "./functional";
 import { Module } from "./module";
 

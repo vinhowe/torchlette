@@ -1,8 +1,8 @@
-import { sizeOf } from "./core/shape";
-import type { Torchlette } from "./frontend";
-import { applyAutocastImpl, autocastCastImpl } from "./frontend-autocast";
-import type { Tensor } from "./frontend-tensor";
-import type { Tensor as RuntimeTensor } from "./runtime/tensor";
+import { sizeOf } from "../core/shape";
+import type { Torchlette } from "./torchlette";
+import { applyAutocastImpl, autocastCastImpl } from "./autocast";
+import type { Tensor } from "./tensor";
+import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 
 /**
  * Softmax along a dimension.

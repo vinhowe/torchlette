@@ -9,7 +9,7 @@
  *   with or without AMP by using runtime flags
  */
 
-import { F16_ELIGIBLE, F32_REQUIRED } from "../backend/op-registry";
+import { F16_ELIGIBLE, F32_REQUIRED } from "../ops/registry";
 import type { DType } from "../backend/types";
 
 // ============================================================================

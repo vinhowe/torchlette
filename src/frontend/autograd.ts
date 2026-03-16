@@ -1,10 +1,10 @@
-import { shapesEqual } from "./core/shape";
-import { storageTracker } from "./engine/storage-tracker";
-import type { Torchlette } from "./frontend";
-import type { Tensor } from "./frontend-tensor";
-import type { AutogradNode, GetSavedFn } from "./frontend-types";
-import { TidyDispatchMode } from "./runtime/engine";
-import type { Tensor as RuntimeTensor } from "./runtime/tensor";
+import { shapesEqual } from "../core/shape";
+import { storageTracker } from "../graph/storage-tracker";
+import type { Torchlette } from "./torchlette";
+import type { Tensor } from "./tensor";
+import type { AutogradNode, GetSavedFn } from "./types";
+import { TidyDispatchMode } from "../runtime/engine";
+import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 
 /**
  * Collect saved tensors from all autograd nodes (triggers lazy recompute

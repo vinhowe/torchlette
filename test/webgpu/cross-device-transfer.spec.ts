@@ -1,7 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { registerBackend } from "../../src/backend/registry";
-import { resetNodeIdCounter } from "../../src/engine/node-factory";
+import { resetNodeIdCounter } from "../../src/graph/node-factory";
 import { RuntimeEngine } from "../../src/runtime/engine";
 import { resetBaseIdCounter } from "../../src/runtime/tensor";
 
@@ -146,7 +146,7 @@ describe.skipIf(!hasWebGPU)("Frontend Cross-Device Transfer (WebGPU)", () => {
   });
 
   it("tensor.to('webgpu') transfers and computes correctly", async () => {
-    const { Torchlette } = await import("../../src/frontend");
+    const { Torchlette } = await import("../../src/frontend/torchlette");
     const torch = new Torchlette("cpu");
 
     const a = torch.tensorFromArray([1, 2, 3, 4], [2, 2]);
@@ -163,7 +163,7 @@ describe.skipIf(!hasWebGPU)("Frontend Cross-Device Transfer (WebGPU)", () => {
   });
 
   it("toNow() forces immediate transfer", async () => {
-    const { Torchlette } = await import("../../src/frontend");
+    const { Torchlette } = await import("../../src/frontend/torchlette");
     const torch = new Torchlette("cpu");
 
     const a = torch.tensorFromArray([1, 2, 3, 4], [2, 2]);
@@ -177,7 +177,7 @@ describe.skipIf(!hasWebGPU)("Frontend Cross-Device Transfer (WebGPU)", () => {
   });
 
   it("round-trip transfer preserves data", async () => {
-    const { Torchlette } = await import("../../src/frontend");
+    const { Torchlette } = await import("../../src/frontend/torchlette");
     const torch = new Torchlette("cpu");
 
     const original = [1.5, -2.5, 3.5, -4.5];

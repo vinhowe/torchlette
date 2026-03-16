@@ -10,8 +10,8 @@
  */
 
 import type { DType } from "../backend/types";
-import type { LazyIRNode, LazyRef } from "./lazy-types";
-import { isViewOp } from "./lowered-plan";
+import type { LazyIRNode, LazyRef } from "../graph/types";
+import { isViewOp } from "../executor/lowered-plan";
 
 // ============================================================================
 // Types

@@ -5,11 +5,14 @@
  * This test isolates the memory issue by tracking allocations at each phase.
  */
 
-import { Torchlette, type FrontendTensor as Tensor, Adam } from '../../src';
-import { initWebGPU } from '../../src/backend/webgpu';
-import { getGPUMemoryStats } from '../../src/backend/webgpu/memory-tracker';
-import { storageTracker } from '../../src/engine/lazy';
-import { getAllPendingTensors, hasPendingTensors } from '../../src/runtime/tensor';
+import { Adam, type FrontendTensor as Tensor, Torchlette } from "../../src";
+import { initWebGPU } from "../../src/backend/webgpu";
+import { getGPUMemoryStats } from "../../src/backend/webgpu/memory-tracker";
+import { storageTracker } from "../../src/graph/storage-tracker";
+import {
+  getAllPendingTensors,
+  hasPendingTensors,
+} from "../../src/runtime/tensor";
 
 function logPendingTensors(label: string): void {
   const pending = getAllPendingTensors();
@@ -29,13 +32,15 @@ function formatBytes(bytes: number): string {
 function logMemory(label: string): void {
   const gpuStats = getGPUMemoryStats();
   const storageStats = storageTracker.stats();
-  console.log(`  [MEM ${label}] GPU: ${formatBytes(gpuStats.currentBytes)} (${gpuStats.allocationCount} allocs) | Storage: total=${storageStats.totalStorages} reachable=${storageStats.reachableStorages} unreachable=${storageStats.unreachableStorages}`);
+  console.log(
+    `  [MEM ${label}] GPU: ${formatBytes(gpuStats.currentBytes)} (${gpuStats.allocationCount} allocs) | Storage: total=${storageStats.totalStorages} reachable=${storageStats.reachableStorages} unreachable=${storageStats.unreachableStorages}`,
+  );
 }
 
 async function testSimpleTrainingLoop(): Promise<void> {
-  console.log('=== Test 1: Simple matmul training loop ===\n');
+  console.log("=== Test 1: Simple matmul training loop ===\n");
 
-  const api = new Torchlette('webgpu', {
+  const api = new Torchlette("webgpu", {
     enableFusion: false,
     enableMemoryPlanning: true,
   });
@@ -45,71 +50,76 @@ async function testSimpleTrainingLoop(): Promise<void> {
   const outDim = 768;
 
   const w = api.tensorFromArray(
-    Array.from({ length: inDim * outDim }, (_, i) => Math.cos(i * 0.001) * 0.02),
+    Array.from(
+      { length: inDim * outDim },
+      (_, i) => Math.cos(i * 0.001) * 0.02,
+    ),
     [inDim, outDim],
-    { device: 'webgpu', requiresGrad: true }
+    { device: "webgpu", requiresGrad: true },
   );
 
-  console.log('Weight shape:', w.shape);
-  logMemory('after weight creation');
+  console.log("Weight shape:", w.shape);
+  logMemory("after weight creation");
 
   const optimizer = new Adam([w], { lr: 0.001 }, api);
-  logMemory('after optimizer creation');
+  logMemory("after optimizer creation");
 
   // Training loop - test 10 steps to see memory pattern
   for (let step = 0; step < 10; step++) {
     console.log(`\n--- Step ${step + 1} ---`);
-    logMemory('start of step');
+    logMemory("start of step");
 
     // Create input (fresh each step)
     const x = api.tensorFromArray(
       Array.from({ length: 32 * inDim }, (_, i) => Math.sin(i * 0.01 + step)),
       [32, inDim],
-      { device: 'webgpu' }
+      { device: "webgpu" },
     );
-    logMemory('after input creation');
+    logMemory("after input creation");
 
     // Forward
     const y = api.matmul(x, w);
     const loss = y.sum();
-    logMemory('after forward');
+    logMemory("after forward");
 
     // Get loss value
     const lossVal = await loss.item();
     console.log(`  Loss: ${lossVal.toFixed(4)}`);
-    logMemory('after loss.item()');
+    logMemory("after loss.item()");
 
     // Backward
     await loss.backward();
-    logMemory('after backward');
-    logPendingTensors('after backward');
+    logMemory("after backward");
+    logPendingTensors("after backward");
 
     // Optimizer step
     optimizer.step();
     optimizer.zeroGrad();
-    logMemory('after optimizer step');
-    logPendingTensors('after optimizer');
+    logMemory("after optimizer step");
+    logPendingTensors("after optimizer");
 
     // Dispose forward pass tensors
     x.dispose();
     y.dispose();
     loss.dispose();
-    logMemory('after dispose forward tensors');
-    logPendingTensors('after dispose forward tensors');
+    logMemory("after dispose forward tensors");
+    logPendingTensors("after dispose forward tensors");
 
     // Mark step
     await api.markStep();
-    logMemory('after markStep');
-    logPendingTensors('after markStep');
+    logMemory("after markStep");
+    logPendingTensors("after markStep");
   }
 
-  console.log('\n=== Test 1 Complete ===');
+  console.log("\n=== Test 1 Complete ===");
 }
 
 async function testMultiLayerTrainingLoop(): Promise<void> {
-  console.log('\n=== Test 2: Multi-layer training loop (like transformer) ===\n');
+  console.log(
+    "\n=== Test 2: Multi-layer training loop (like transformer) ===\n",
+  );
 
-  const api = new Torchlette('webgpu', {
+  const api = new Torchlette("webgpu", {
     enableFusion: false,
     enableMemoryPlanning: true,
   });
@@ -121,31 +131,34 @@ async function testMultiLayerTrainingLoop(): Promise<void> {
   const weights: Tensor[] = [];
   for (let i = 0; i < numLayers; i++) {
     const w = api.tensorFromArray(
-      Array.from({ length: dim * dim }, (_, j) => Math.cos(j * 0.001 + i) * 0.02),
+      Array.from(
+        { length: dim * dim },
+        (_, j) => Math.cos(j * 0.001 + i) * 0.02,
+      ),
       [dim, dim],
-      { device: 'webgpu', requiresGrad: true }
+      { device: "webgpu", requiresGrad: true },
     );
     weights.push(w);
   }
 
   console.log(`Created ${numLayers} weight matrices, each [${dim}, ${dim}]`);
-  logMemory('after weight creation');
+  logMemory("after weight creation");
 
   const optimizer = new Adam(weights, { lr: 0.001 }, api);
-  logMemory('after optimizer creation');
+  logMemory("after optimizer creation");
 
   // Training loop
   for (let step = 0; step < 5; step++) {
     console.log(`\n--- Step ${step + 1} ---`);
-    logMemory('start of step');
+    logMemory("start of step");
 
     // Create input
     const x = api.tensorFromArray(
       Array.from({ length: 16 * dim }, (_, i) => Math.sin(i * 0.01 + step)),
       [16, dim],
-      { device: 'webgpu' }
+      { device: "webgpu" },
     );
-    logMemory('after input creation');
+    logMemory("after input creation");
 
     // Forward through all layers
     let h = x;
@@ -153,38 +166,38 @@ async function testMultiLayerTrainingLoop(): Promise<void> {
       h = api.relu(api.matmul(h, weights[i]));
     }
     const loss = h.sum();
-    logMemory('after forward');
+    logMemory("after forward");
 
     // Get loss value
     const lossVal = await loss.item();
     console.log(`  Loss: ${lossVal.toFixed(4)}`);
-    logMemory('after loss.item()');
+    logMemory("after loss.item()");
 
     // Backward
     await loss.backward();
-    logMemory('after backward');
+    logMemory("after backward");
 
     // Optimizer step
     optimizer.step();
     optimizer.zeroGrad();
-    logMemory('after optimizer step');
+    logMemory("after optimizer step");
 
     // Dispose input
     x.dispose();
-    logMemory('after x.dispose()');
+    logMemory("after x.dispose()");
 
     // Mark step
     await api.markStep();
-    logMemory('after markStep');
+    logMemory("after markStep");
   }
 
-  console.log('\n=== Test 2 Complete ===');
+  console.log("\n=== Test 2 Complete ===");
 }
 
 async function testWithTidy(): Promise<void> {
-  console.log('\n=== Test 3: Training with tidy() wrapper ===\n');
+  console.log("\n=== Test 3: Training with tidy() wrapper ===\n");
 
-  const api = new Torchlette('webgpu', {
+  const api = new Torchlette("webgpu", {
     enableFusion: false,
     enableMemoryPlanning: true,
   });
@@ -195,29 +208,32 @@ async function testWithTidy(): Promise<void> {
   const weights: Tensor[] = [];
   for (let i = 0; i < numLayers; i++) {
     const w = api.tensorFromArray(
-      Array.from({ length: dim * dim }, (_, j) => Math.cos(j * 0.001 + i) * 0.02),
+      Array.from(
+        { length: dim * dim },
+        (_, j) => Math.cos(j * 0.001 + i) * 0.02,
+      ),
       [dim, dim],
-      { device: 'webgpu', requiresGrad: true }
+      { device: "webgpu", requiresGrad: true },
     );
     weights.push(w);
   }
 
-  logMemory('after weight creation');
+  logMemory("after weight creation");
 
   const optimizer = new Adam(weights, { lr: 0.001 }, api);
-  logMemory('after optimizer creation');
+  logMemory("after optimizer creation");
 
   // Training loop WITH tidy
   for (let step = 0; step < 5; step++) {
     console.log(`\n--- Step ${step + 1} ---`);
-    logMemory('start of step');
+    logMemory("start of step");
 
     // Wrap forward/backward in tidy
     const loss = api.tidy(() => {
       const x = api.tensorFromArray(
         Array.from({ length: 16 * dim }, (_, i) => Math.sin(i * 0.01 + step)),
         [16, dim],
-        { device: 'webgpu' }
+        { device: "webgpu" },
       );
 
       let h = x;
@@ -228,36 +244,36 @@ async function testWithTidy(): Promise<void> {
       api.keep(lossT); // Keep loss tensor so it survives tidy
       return lossT;
     });
-    logMemory('after tidy forward');
+    logMemory("after tidy forward");
 
     // Get loss value
     const lossVal = await loss.item();
     console.log(`  Loss: ${lossVal.toFixed(4)}`);
-    logMemory('after loss.item()');
+    logMemory("after loss.item()");
 
     // Backward
     await loss.backward();
-    logMemory('after backward');
+    logMemory("after backward");
 
     // Optimizer step
     optimizer.step();
     optimizer.zeroGrad();
-    logMemory('after optimizer step');
+    logMemory("after optimizer step");
 
     // Mark step
     await api.markStep();
-    logMemory('after markStep');
+    logMemory("after markStep");
   }
 
-  console.log('\n=== Test 3 Complete ===');
+  console.log("\n=== Test 3 Complete ===");
 }
 
 async function main(): Promise<void> {
-  console.log('Memory Leak Debug Tests');
-  console.log('=======================\n');
+  console.log("Memory Leak Debug Tests");
+  console.log("=======================\n");
 
   await initWebGPU();
-  logMemory('initial');
+  logMemory("initial");
 
   try {
     await testSimpleTrainingLoop();
@@ -265,13 +281,13 @@ async function main(): Promise<void> {
     // await testMultiLayerTrainingLoop();
     // await testWithTidy();
 
-    console.log('\n=======================');
-    console.log('TEST COMPLETE');
+    console.log("\n=======================");
+    console.log("TEST COMPLETE");
     const finalStats = getGPUMemoryStats();
     console.log(`Peak memory usage: ${formatBytes(finalStats.peakBytes)}`);
-    console.log('=======================');
+    console.log("=======================");
   } catch (e) {
-    console.error('TEST FAILED:', e);
+    console.error("TEST FAILED:", e);
     process.exit(1);
   }
 }
