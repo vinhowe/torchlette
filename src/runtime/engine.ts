@@ -27,17 +27,14 @@ import {
   contiguousStrides,
 } from "../core/shape";
 import { OP_DTYPE_RULES, promoteDtype } from "../engine/dtype-rules";
-import { executeLoweredPlan } from "../engine/executor-lowered";
 import {
   executePlanOptimized,
-  getFusionAnalysisTemplate,
   type OptimizedExecutionStats,
-} from "../engine/executor-optimized";
+} from "../engine/executor-lowered";
 import {
-  executePlan,
   executePlanSegmented,
+  executePlanSequential,
 } from "../engine/executor-sequential";
-import { computePlanFingerprint } from "../engine/fusion-detect";
 import {
   createMaterializedRef,
   createPendingRef,
@@ -206,7 +203,6 @@ export class RuntimeEngine {
   private _webgpuFlushBufferPool: (() => void) | null = null;
 
   /** Cache plan fingerprints by cheap structural key to avoid O(N) hashing. */
-  private planFingerprintCache = new Map<string, number>();
 
   /** Stack of active dispatch modes (notified on tensor creation/escape). */
   private dispatchModes: DispatchMode[] = [];
@@ -473,151 +469,6 @@ export class RuntimeEngine {
     return () => {};
   }
 
-  // --- Lowered Plan Execution ---
-
-  /**
-   * Try to execute a plan using a cached lowered execution plan.
-   * On cache hit with a lowered plan, executes the plan and materializes all
-   * tensors, returning true. On miss, returns false for fallback to normal execution.
-   */
-  private async tryLoweredPlanExecution(
-    plan: { nodes: LazyIRNode[] },
-    tensors: Tensor[],
-    device: DeviceKind,
-  ): Promise<boolean> {
-    // Quick structural key for fingerprint cache lookup
-    const structKey = `${plan.nodes.length}:${plan.nodes[plan.nodes.length - 1].op}`;
-    let fingerprint = this.planFingerprintCache.get(structKey);
-
-    if (fingerprint === undefined) {
-      // First time — compute full O(N) fingerprint
-      let externalNodeIds: Set<number> | undefined;
-      try {
-        const { getPendingNodeIds } = await import("./tensor");
-        const pending = getPendingNodeIds();
-        if (pending.size > 0) {
-          externalNodeIds = pending;
-        }
-      } catch {
-        // tensor module not available
-      }
-      fingerprint = computePlanFingerprint(plan.nodes, externalNodeIds);
-    }
-
-    const template = getFusionAnalysisTemplate(fingerprint);
-    if (!template?.loweredPlan) {
-      return false;
-    }
-
-    // Validate plan node count
-    if (plan.nodes.length !== template.finalPerm.length) {
-      return false;
-    }
-
-    // Reconstruct reordered plan nodes from template
-    const planNodes = template.finalPerm.map((i) => plan.nodes[i]);
-
-    const backend = this.getBackend(device);
-
-    // Get or create buffer arena for this plan (persists across steps).
-    // Arena stabilizes buffer identities for bind group cache hits.
-    const useArena = process.env.TORCHLETTE_USE_ARENA !== "0";
-    if (useArena && !template.bufferArena) {
-      template.bufferArena = { resolve: [], alloc: [] };
-    }
-
-    // Save dispatch sequence counters before attempting lowered plan execution.
-    // If the lowered plan fails, we restore them so the fallback executePlanOptimized
-    // starts at the same dispatch position — preserving bind group cache alignment.
-    let savedCounters:
-      | { dispatch: number; params: number; output: number }
-      | undefined;
-    if (device === "webgpu") {
-      try {
-        const { getDispatchSequenceCounters } = await import(
-          "../backend/webgpu/index"
-        );
-        savedCounters = getDispatchSequenceCounters();
-      } catch {
-        /* non-WebGPU runtime */
-      }
-    }
-
-    try {
-      const { stats: loweredStats } = await executeLoweredPlan(
-        plan as { nodes: LazyIRNode[] },
-        planNodes,
-        template.loweredPlan,
-        backend,
-        {
-          bufferArena: useArena ? template.bufferArena : undefined,
-        },
-      );
-
-      // Update fusion stats for consistency with normal execution path
-      this.lastFusionStats = loweredStats;
-      this.accumulateFusionStats(loweredStats);
-
-      // Materialize ALL tensors that were pending on executed nodes
-      const { materializePendingTensors: materialize } = await import(
-        "./tensor"
-      );
-      for (const node of plan.nodes) {
-        if (node.result) {
-          materialize(node.id, node.result, node.results);
-        }
-      }
-
-      // Materialize the primary tensors
-      for (const tensor of tensors) {
-        if (!tensor.isMaterialized() && !tensor.disposed) {
-          const lazyRef = tensor.lazyRef;
-          if (lazyRef.kind === "pending" && lazyRef.node.result) {
-            const oi = lazyRef.outputIndex ?? 0;
-            const storage =
-              oi > 0 && lazyRef.node.results?.[oi]
-                ? lazyRef.node.results[oi]
-                : lazyRef.node.result;
-            tensor._materialize(storage);
-          }
-        }
-      }
-
-      // Cache fingerprint for this structural key on success
-      this.planFingerprintCache.set(structKey, fingerprint);
-
-      return true;
-    } catch {
-      // Lowered plan execution failed — clean up and fall through.
-      // Disable lowered plan for this fingerprint so we don't retry every step.
-      // The template's bufferArena is preserved so executePlanOptimized can use it.
-      template.loweredPlan = undefined;
-
-      // Restore dispatch sequence counters so the fallback executePlanOptimized
-      // starts at the same position, keeping bind group cache indices aligned.
-      if (savedCounters && device === "webgpu") {
-        try {
-          const { setDispatchSequenceCounters } = await import(
-            "../backend/webgpu/index"
-          );
-          setDispatchSequenceCounters(
-            savedCounters.dispatch,
-            savedCounters.params,
-            savedCounters.output,
-          );
-        } catch {
-          /* non-WebGPU runtime */
-        }
-      }
-
-      for (const node of plan.nodes) {
-        node.result = undefined;
-        node.results = undefined;
-      }
-      return false;
-    }
-  }
-
   /**
    * Force multiple tensors to materialize using a single merged execution plan.
    *
@@ -639,16 +490,6 @@ export class RuntimeEngine {
 
     // Data-source-only plans skip the template/arena/lowered-plan path.
     const allDataSource = plan.nodes.every((n) => isDataSourceOp(n.op));
-
-    // Lowered plan fast-path for forceAllMerged
-    if (!allDataSource && device === "webgpu" && this.fusionEnabled) {
-      const executed = await this.tryLoweredPlanExecution(
-        plan,
-        tensors,
-        device,
-      );
-      if (executed) return;
-    }
 
     const backend = this.getBackend(device);
 
@@ -685,7 +526,7 @@ export class RuntimeEngine {
       });
     } else {
       // Standard execution - no segmentation overhead
-      await executePlan(plan, backend, {
+      await executePlanSequential(plan, backend, {
         enableEarlyRelease: this.earlyReleaseEnabled,
       });
     }
@@ -733,7 +574,7 @@ export class RuntimeEngine {
     const device = resolveDeviceFromTensors(pendingTensors);
 
     // Flush recycled GPU buffers from pendingRelease to the main pool.
-    // Must happen BEFORE the shared encoder opens (executePlan opens one),
+    // Must happen BEFORE the shared encoder opens (executePlanSequential opens one),
     // so that acquire() can find them in the main pool during plan execution
     // (acquire() skips pendingRelease when sharedEncoder is active).
     const flushBufferPool = this.getBufferPoolFlushFn(device);
@@ -741,20 +582,6 @@ export class RuntimeEngine {
 
     // Snapshot storage ID before execution to scope cleanup of orphaned intermediates
     const storageSnapshot = storageTracker.getNextStorageId();
-
-    // Lowered plan fast-path for forceAllPending
-    if (device === "webgpu" && this.fusionEnabled) {
-      const executed = await this.tryLoweredPlanExecution(
-        plan,
-        pendingTensors,
-        device,
-      );
-      if (executed) {
-        materializeRemaining(pendingTensors);
-        storageTracker.destroyUnreachableSince(storageSnapshot);
-        return;
-      }
-    }
 
     const backend = this.getBackend(device);
 
@@ -768,7 +595,7 @@ export class RuntimeEngine {
       this.lastFusionStats = optimizedResult.stats;
       this.accumulateFusionStats(optimizedResult.stats);
     } else {
-      await executePlan(plan, backend, {
+      await executePlanSequential(plan, backend, {
         enableEarlyRelease: this.earlyReleaseEnabled,
       });
     }

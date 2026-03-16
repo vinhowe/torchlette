@@ -42,7 +42,7 @@ export async function executeNode(
   );
 }
 
-export async function executePlan(
+export async function executePlanSequential(
   plan: ExecutionPlan,
   backend: Backend,
   options?: ExecutePlanOptions,
@@ -160,13 +160,13 @@ export async function executePlanSegmented(
   );
 
   if (!hasCheckpointBoundaries) {
-    return executePlan(plan, backend, options);
+    return executePlanSequential(plan, backend, options);
   }
 
   const segments = segmentPlanAtCheckpoints(plan);
 
   if (segments.length === 1) {
-    return executePlan(plan, backend, options);
+    return executePlanSequential(plan, backend, options);
   }
 
   const gpuSync = options?.gpuSync ?? false;
@@ -247,8 +247,8 @@ export async function executePlanSegmented(
         throw error;
       }
     } else {
-      // Lightweight path: execute via executePlan, flush pool between segments
-      lastResult = await executePlan(segment, backend, options);
+      // Lightweight path: execute via executePlanSequential, flush pool between segments
+      lastResult = await executePlanSequential(segment, backend, options);
 
       for (const node of segment.nodes) {
         if (node.result) {

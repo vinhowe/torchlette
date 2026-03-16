@@ -9,7 +9,7 @@
  *  3. Elementwise fusion            (priority 40)
  *
  * The analysis phase runs once per structural fingerprint and produces a
- * `GraphAnalysisResult` consumed by executor-optimized.ts. Results are
+ * `GraphAnalysisResult` consumed by executor-lowered.ts. Results are
  * cached in the FusionAnalysisTemplate.
  */
 
@@ -75,7 +75,7 @@ interface GraphAnalysisResult {
  * Detect matmul epilogue chains from the plan.
  * Walks forward from each matmul node to find cast→bias→activation chains.
  *
- * This is extracted from the inline code in executor-optimized.ts.
+ * This is extracted from the inline code in executor-lowered.ts.
  */
 function detectMatmulEpilogueChains(
   planNodes: LazyIRNode[],
