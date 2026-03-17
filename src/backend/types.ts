@@ -178,9 +178,7 @@ export type FusedRMSNormConfig = {
 export type AdamStepConfig = {
   beta1: number;
   beta2: number;
-  lr: number;
-  bc1: number; // 1 - beta1^step (bias correction for first moment)
-  bc2: number; // 1 - beta2^step (bias correction for second moment)
+  stepSize: number;
   eps: number;
   weightDecay: number;
   lrTimesWd: number;

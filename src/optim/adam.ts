@@ -231,10 +231,12 @@ export class Adam {
     // Resolve side outputs from previous fused step
     this._resolvePendingState();
 
-    // Check if fused kernel is available
-    if (this.hasFusedKernel()) {
-      return this._stepFused(runtime);
-    }
+    // TODO: Fused Adam kernel has a buffer aliasing bug where gradients
+    // are read as scalar instead of element-wise, producing wrong updates.
+    // Use elementwise path until the fused kernel is fixed.
+    // if (this.hasFusedKernel()) {
+    //   return this._stepFused(runtime);
+    // }
     return this._stepElementwise(runtime);
   }
 
@@ -262,6 +264,12 @@ export class Adam {
       const step = this.steps[i];
       const bc1 = 1 - this.beta1 ** step;
       const bc2 = 1 - this.beta2 ** step;
+      const lr = this._getParamLR(i);
+      const stepSize = (lr * Math.sqrt(bc2)) / bc1;
+      // Adjust epsilon so the kernel formula p -= stepSize * m / (sqrt(v) + eps)
+      // becomes equivalent to PyTorch's p -= lr * (m/bc1) / (sqrt(v/bc2) + eps_orig).
+      // The adjustment: eps_adjusted = eps_orig * sqrt(bc2)
+      const epsAdjusted = this.eps * Math.sqrt(bc2);
 
       // Initialize m, v as zeros on first step
       if (!this.expAvg[i]) {
@@ -272,14 +280,11 @@ export class Adam {
       }
 
       const wd = this._getParamWeightDecay(i);
-      const lr = this._getParamLR(i);
       const config: AdamStepConfig = {
         beta1: this.beta1,
         beta2: this.beta2,
-        lr,
-        bc1,
-        bc2,
-        eps: this.eps,
+        stepSize,
+        eps: epsAdjusted,
         weightDecay: wd,
         lrTimesWd: lr * wd,
         decoupledWd: this.adamW,
