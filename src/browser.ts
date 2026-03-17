@@ -30,4 +30,12 @@ export {
   Torchlette,
   torch,
 } from "./frontend/torchlette";
-export { Adam, type AdamOptions, SGD, type SGDOptions } from "./optim";
+export * as nn from "./nn";
+export {
+  Adam,
+  type AdamOptions,
+  GradScaler,
+  type GradScalerOptions,
+  SGD,
+  type SGDOptions,
+} from "./optim";

@@ -1,7 +1,7 @@
 import type { BackendTensor, DeviceKind, DType, Shape } from "../backend/types";
+import { storageTracker } from "../graph/storage-tracker";
 import type { LazyRef, StorageHandle } from "../graph/types";
 import { isMaterialized } from "../graph/types";
-import { storageTracker } from "../graph/storage-tracker";
 
 export type BaseId = number;
 
@@ -28,6 +28,14 @@ const tensorFinalizationRegistry = new FinalizationRegistry<{
  * Used to materialize all tensors whose nodes were executed during force().
  */
 const pendingTensorsByNodeId = new Map<number, Set<Tensor>>();
+
+/**
+ * Node IDs whose pending tensors were disposed (e.g., by checkpoint's tidy()).
+ * These IDs must still appear in getPendingNodeIds() so fusion analysis treats
+ * them as external, but we don't keep full Tensor references (that would leak).
+ * Cleared after each plan execution via clearDisposedPendingNodeIds().
+ */
+const disposedPendingNodeIds = new Set<number>();
 
 /**
  * Register a tensor as pending on a node ID.
@@ -104,11 +112,22 @@ export function hasPendingTensors(): boolean {
 }
 
 /**
- * Get the set of node IDs that have live pending tensors.
+ * Get the set of node IDs that have pending tensors (live or recently disposed).
  * Used by fusion detection to avoid fusing across saved-for-backward boundaries.
+ * Includes disposedPendingNodeIds so checkpoint's tidy() doesn't hide nodes.
  */
 export function getPendingNodeIds(): Set<number> {
-  return new Set(pendingTensorsByNodeId.keys());
+  const ids = new Set(pendingTensorsByNodeId.keys());
+  for (const id of disposedPendingNodeIds) ids.add(id);
+  return ids;
+}
+
+/**
+ * Clear the disposed pending node IDs set.
+ * Called after plan execution to prevent unbounded growth.
+ */
+export function clearDisposedPendingNodeIds(): void {
+  disposedPendingNodeIds.clear();
 }
 
 export class Tensor {
@@ -281,8 +300,13 @@ export class Tensor {
     // Clear held value so finalization callback is a no-op if it runs anyway
     this._held.storageId = -1;
 
-    // Unregister from pending tensors if still pending
+    // Unregister from pending tensors if still pending.
+    // Also record the node ID in disposedPendingNodeIds so that
+    // getPendingNodeIds() still includes it for fusion analysis.
+    // Without this, checkpoint's tidy() would make nodes invisible
+    // to the matmul epilogue detector, causing incorrect fusion.
     if (this._pendingNodeId !== null) {
+      disposedPendingNodeIds.add(this._pendingNodeId);
       unregisterPendingTensor(this._pendingNodeId, this);
       this._pendingNodeId = null;
     }

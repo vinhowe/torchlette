@@ -168,6 +168,12 @@ interface LoweredRowProgramAction {
   program: RowProgram;
   /** External input refs for resolving buffers at execution time. */
   inputRefs: LazyRef[];
+  /**
+   * Plan-node positions for each pending inputRef.
+   * Maps inputRef index → plan-node index (or -1 if materialized/scalar).
+   * Used by executeLoweredPlan to remap stale inputRefs to current-step nodes.
+   */
+  inputRefPositions: number[];
 }
 
 /** Union of all lowered action types. */
@@ -427,6 +433,14 @@ function emitSequentialActions(
         continue;
       }
       const m = entry.match;
+      // Map each inputRef to its plan-node position so executeLoweredPlan
+      // can remap stale refs to the current step's nodes on template reuse.
+      const inputRefPositions = m.inputRefs.map((ref) => {
+        if (ref.kind === "pending") {
+          return posMap.get(ref.node.id) ?? -1;
+        }
+        return -1; // materialized or scalar — no remapping needed
+      });
       actions.push({
         kind: "row-program",
         coveredNodeIndices: m.coveredNodeIds.map(
@@ -438,6 +452,7 @@ function emitSequentialActions(
         dimSize: m.dimSize,
         program: m.program,
         inputRefs: m.inputRefs,
+        inputRefPositions,
       });
       maybeReclaim(m.coveredNodeIds.length);
       continue;

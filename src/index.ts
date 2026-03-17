@@ -1,4 +1,4 @@
-// Tile-IR custom kernel API
+// Tile-IR custom kernel API + WebGPU init
 export {
   type BindingSpec,
   ceilDivGrid,
@@ -6,11 +6,16 @@ export {
   createTileKernelDispatcher,
   type DataType,
   elementwiseGrid,
+  getWebGPUDevice,
+  getWebGPUInitError,
+  initWebGPU,
   KernelContext,
   singleWorkgroup,
+  syncWebGPU,
   type TileKernelInstance,
   type TileKernelSpec,
   type UniformType,
+  webgpuBackend,
 } from "./backend/webgpu";
 export {
   type DeviceKind,

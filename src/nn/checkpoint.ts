@@ -24,9 +24,14 @@
  * linearly with sequence length and layer count.
  */
 
-import type { RngDrawRecord } from "../graph/engine-types";
 import { markAsCheckpointBoundary } from "../executor/plan-builder";
-import type { PackHook, Tensor, Torchlette, UnpackHook } from "../frontend/torchlette";
+import type {
+  PackHook,
+  Tensor,
+  Torchlette,
+  UnpackHook,
+} from "../frontend/torchlette";
+import type { RngDrawRecord } from "../graph/engine-types";
 
 // ============================================================================
 // Types
@@ -200,8 +205,8 @@ function checkpointNonReentrant<T extends Tensor>(
     return result;
   };
 
-  // Run forward with pack/unpack hooks inside tidy() to dispose intermediates
-  // The output tensor is kept, but all other tensors created inside fn() are disposed
+  // Run forward with pack/unpack hooks inside tidy() to dispose intermediates.
+  // The output tensor is kept, but all other tensors created inside fn() are disposed.
   const output = api.tidy(() => {
     const result = api.saved_tensors_hooks(packHook, unpackHook, () => {
       return fn(...inputs);
