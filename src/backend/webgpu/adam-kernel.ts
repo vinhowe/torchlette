@@ -61,9 +61,7 @@ function makeAdamStepSpec(
   const uniforms: Record<string, UniformType> = {
     beta1: "f32",
     beta2: "f32",
-    lr: "f32",
-    bc1: "f32",
-    bc2: "f32",
+    step_size: "f32",
     eps: "f32",
     weight_decay: "f32",
     lr_times_wd: "f32",
@@ -191,9 +189,7 @@ function loadAdamUniforms(ctx: KernelContext) {
   return {
     beta1: ctx.uniform("beta1").bitcastTo("f32"),
     beta2: ctx.uniform("beta2").bitcastTo("f32"),
-    lr: ctx.uniform("lr").bitcastTo("f32"),
-    bc1: ctx.uniform("bc1").bitcastTo("f32"),
-    bc2: ctx.uniform("bc2").bitcastTo("f32"),
+    stepSize: ctx.uniform("step_size").bitcastTo("f32"),
     eps: ctx.uniform("eps").bitcastTo("f32"),
     weightDecay: ctx.uniform("weight_decay").bitcastTo("f32"),
     lrTimesWd: ctx.uniform("lr_times_wd").bitcastTo("f32"),
@@ -210,17 +206,8 @@ function emitAdamScalarBody(
   suffix = "",
 ): void {
   const p = ctx.emitLet(`p${suffix}`, ctx.load("param", idx));
-  const {
-    beta1,
-    beta2,
-    lr,
-    bc1,
-    bc2,
-    eps,
-    weightDecay,
-    lrTimesWd,
-    decoupledWd,
-  } = loadAdamUniforms(ctx);
+  const { beta1, beta2, stepSize, eps, weightDecay, lrTimesWd, decoupledWd } =
+    loadAdamUniforms(ctx);
 
   // L2 weight decay (Adam): grad += wd * param
   ctx.ifThen(
@@ -243,8 +230,7 @@ function emitAdamScalarBody(
   const pNewVar = ctx.emitVar(
     `p_new${suffix}`,
     "f32",
-    // PyTorch-style: param -= lr * (m/bc1) / (sqrt(v/bc2) + eps)
-    p.sub(lr.mul(mNew.div(bc1)).div(vNew.div(bc2).sqrt().add(eps))),
+    p.sub(stepSize.mul(mNew).div(vNew.sqrt().add(eps))),
   );
 
   // Decoupled weight decay (AdamW)
@@ -358,9 +344,7 @@ export function dispatchAdamStep(
   const uniforms: Record<string, number> = {
     beta1: config.beta1,
     beta2: config.beta2,
-    lr: config.lr,
-    bc1: config.bc1,
-    bc2: config.bc2,
+    step_size: config.stepSize,
     eps: config.eps,
     weight_decay: config.weightDecay,
     lr_times_wd: config.lrTimesWd,
