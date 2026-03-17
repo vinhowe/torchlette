@@ -258,7 +258,10 @@ export class Adam {
         continue;
       }
 
-      const stepSize = this._advanceStep(i);
+      this._advanceStep(i);
+      const step = this.steps[i];
+      const bc1 = 1 - this.beta1 ** step;
+      const bc2 = 1 - this.beta2 ** step;
 
       // Initialize m, v as zeros on first step
       if (!this.expAvg[i]) {
@@ -273,7 +276,9 @@ export class Adam {
       const config: AdamStepConfig = {
         beta1: this.beta1,
         beta2: this.beta2,
-        stepSize,
+        lr,
+        bc1,
+        bc2,
         eps: this.eps,
         weightDecay: wd,
         lrTimesWd: lr * wd,
@@ -327,13 +332,9 @@ export class Adam {
     return updated;
   }
 
-  /** Advance step counter and return bias-corrected step size. */
-  private _advanceStep(i: number): number {
-    const step = this.steps[i] + 1;
-    this.steps[i] = step;
-    const bc1 = 1 - this.beta1 ** step;
-    const bc2 = 1 - this.beta2 ** step;
-    return (this._getParamLR(i) * Math.sqrt(bc2)) / bc1;
+  /** Advance step counter. */
+  private _advanceStep(i: number): void {
+    this.steps[i] += 1;
   }
 
   /**
@@ -345,7 +346,7 @@ export class Adam {
     param: Tensor,
     grad: RuntimeTensor,
   ): void {
-    const stepSize = this._advanceStep(i);
+    this._advanceStep(i);
 
     let gradAdj = grad;
     const wd = this._getParamWeightDecay(i);
@@ -384,8 +385,16 @@ export class Adam {
     this.expAvg[i] = avg;
     this.expAvgSq[i] = avgSq;
 
-    const denom = runtime.add(runtime.sqrt(avgSq), this.eps);
-    const scaled = runtime.mul(runtime.div(avg, denom), stepSize);
+    // PyTorch-style bias-corrected Adam: apply bias correction to v directly
+    // in the denominator, not via the step size. This matters because the
+    // epsilon term must NOT be scaled by 1/sqrt(bc2).
+    // PyTorch: param -= lr * (m / bc1) / (sqrt(v / bc2) + eps)
+    const bc1 = 1 - this.beta1 ** this.steps[i];
+    const bc2 = 1 - this.beta2 ** this.steps[i];
+    const mHat = runtime.div(avg, bc1);
+    const vHat = runtime.div(avgSq, bc2);
+    const denom = runtime.add(runtime.sqrt(vHat), this.eps);
+    const scaled = runtime.mul(runtime.div(mHat, denom), this._getParamLR(i));
     runtime.copy_(param._unwrap(), runtime.sub(param._unwrap(), scaled));
   }
 
