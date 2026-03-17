@@ -67,18 +67,20 @@ export class LoRALinear {
       requiresGrad: false,
     });
 
-    // Initialize LoRA A with Kaiming uniform (like PyTorch)
-    // A is [rank, in_features]
-    const stdA = Math.sqrt(1.0 / inFeatures);
-    const loraAData = new Float32Array(config.rank * inFeatures);
-    for (let i = 0; i < loraAData.length; i++) {
-      // Kaiming uniform initialization
-      loraAData[i] = (Math.random() * 2 - 1) * stdA * Math.sqrt(3);
-    }
-    this.loraA = api.tensorFromArray(loraAData, [config.rank, inFeatures], {
+    // Initialize LoRA A with small random normal (std=0.01).
+    // This matches the standard LoRA init and produces stable training
+    // dynamics with Adam. Kaiming uniform gives 2x larger values which
+    // can cause Adam to overshoot on small datasets.
+    this.loraA = api.randn([config.rank, inFeatures], {
       device,
       requiresGrad: true,
     });
+    // Scale to std=0.01
+    const runtime = api._runtime();
+    runtime.copy_(
+      this.loraA._unwrap(),
+      runtime.mul(this.loraA._unwrap(), 0.01),
+    );
 
     // Initialize LoRA B to zeros (so LoRA starts as identity)
     // B is [out_features, rank]
