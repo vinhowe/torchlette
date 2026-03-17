@@ -64,11 +64,9 @@ class SimpleDataLoader {
     const targetData: number[] = [];
 
     for (let b = 0; b < this.batchSize; b++) {
-      // Wrap around if we've exhausted the data
+      // Wrap around to start if we've exhausted the data
       if (this.currentIdx + this.seqLength + 1 > this.tokens.length) {
-        this.currentIdx = Math.floor(
-          Math.random() * (this.tokens.length - this.seqLength - 1),
-        );
+        this.currentIdx = 0;
       }
 
       for (let i = 0; i < this.seqLength; i++) {
@@ -76,10 +74,8 @@ class SimpleDataLoader {
         targetData.push(this.tokens[this.currentIdx + i + 1]);
       }
 
-      // Move to next random position for variety
-      this.currentIdx = Math.floor(
-        Math.random() * (this.tokens.length - this.seqLength - 1),
-      );
+      // Advance sequentially through the data
+      this.currentIdx += this.seqLength;
     }
 
     return {
@@ -156,10 +152,13 @@ export class LoRATrainer {
     // Create gradient scaler for AMP
     if (useAMP) {
       this.gradScaler = new GradScaler(this.api, {
-        initScale: 65536.0,
+        // Start at 1 (no scaling) — LoRA gradients are small and don't need
+        // amplification. The scaler will grow conservatively if stable.
+        // PyTorch's default of 65536 immediately overflows f16 for LoRA.
+        initScale: 1.0,
         growthFactor: 2.0,
         backoffFactor: 0.5,
-        growthInterval: 2000,
+        growthInterval: 1000,
       });
     }
 
@@ -174,6 +173,8 @@ export class LoRATrainer {
     let totalLoss = 0;
     let lastLoss = 0;
     const startTime = performance.now();
+    let emaLoss = 0; // Exponential moving average for smooth loss reporting — biome-ignore
+    const emaAlpha = 0.02; // EMA smoothing factor (lower = smoother)
 
     // Create compiled forward function for AMP, fusion, and memory planning
     // The compile() region enables:
@@ -215,29 +216,31 @@ export class LoRATrainer {
       // Forward pass with loss - use compiled region for AMP
       let loss: Tensor;
       if (useAMP && compiledForwardWithLoss) {
-        // Run forward pass in compiled region with AMP + fusion + memory planning
         loss = compiledForwardWithLoss(input, target);
-
-        // Scale loss for gradient scaling
-        loss = this.gradScaler!.scale(loss);
+        if (this.gradScaler) loss = this.gradScaler.scale(loss);
       } else {
         const result = this.model.forwardWithLoss(input, target);
         loss = result.loss;
       }
 
+      // Read loss value before backward (checkpoint may dispose intermediate tensors).
+      // For AMP with GradScaler, read the scaled value and unscale with current scale.
+      let lossValue = await loss.item();
+      if (this.gradScaler) {
+        lossValue = lossValue / this.gradScaler.getScale();
+      }
+
       // Backward pass
       await loss.backward();
 
-      // Optimizer step - with gradient unscaling for AMP
-      if (useAMP && this.gradScaler) {
+      // Optimizer step — with gradient unscaling for AMP
+      if (this.gradScaler) {
         await this.gradScaler.unscale_(this.optimizer!);
         const stepped = await this.gradScaler.step(this.optimizer!);
         this.gradScaler.update();
-
         if (!stepped) {
-          // Skip this step due to NaN/Inf gradients
           console.warn(
-            `Step ${step}: Skipped due to NaN/Inf gradients, scale=${this.gradScaler.getScale()}`,
+            `Step ${step}: Skipped (scale=${this.gradScaler.getScale()})`,
           );
         }
       } else {
@@ -245,10 +248,11 @@ export class LoRATrainer {
       }
       this.optimizer!.zeroGrad();
 
-      // Get loss value (unscale if AMP was used)
-      let lossValue = await loss.item();
-      if (useAMP && this.gradScaler) {
-        lossValue = lossValue / this.gradScaler.getScale();
+      // Compute smoothed loss (EMA) for stable reporting
+      if (step === 0) {
+        emaLoss = lossValue;
+      } else {
+        emaLoss = emaAlpha * lossValue + (1 - emaAlpha) * emaLoss;
       }
       totalLoss += lossValue;
       lastLoss = lossValue;
@@ -262,7 +266,8 @@ export class LoRATrainer {
 
       const stepTime = performance.now() - stepStart;
 
-      callbacks.onStepEnd?.(step, lossValue, stepTime);
+      // Report smoothed loss to reduce per-batch noise
+      callbacks.onStepEnd?.(step, emaLoss, stepTime);
 
       // Memory cleanup - finalize the step and free intermediate tensors
       await this.api.markStep();

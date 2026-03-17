@@ -790,7 +790,12 @@ export async function executeLoweredPlan(
   await ensureFusionImports();
 
   try {
-    for (const action of loweredPlan.actions) {
+    for (
+      let actionIndex = 0;
+      actionIndex < loweredPlan.actions.length;
+      actionIndex++
+    ) {
+      const action = loweredPlan.actions[actionIndex];
       switch (action.kind) {
         case "fused": {
           // Reconstruct FusionGroup from plan nodes
@@ -1112,9 +1117,24 @@ export async function executeLoweredPlan(
         }
 
         case "row-program": {
+          // Remap inputRefs to current step's nodes (template reuse makes
+          // the original refs stale — they point to cleared previous-step nodes).
+          const remappedRefs = action.inputRefs.map((ref, i) => {
+            const pos = action.inputRefPositions[i];
+            if (pos >= 0 && ref.kind === "pending") {
+              const currentNode = planNodes[pos];
+              return {
+                kind: "pending" as const,
+                node: currentNode,
+                outputIndex: ref.outputIndex,
+              };
+            }
+            return ref;
+          });
+
           await executeRowProgram(
             action.program,
-            action.inputRefs,
+            remappedRefs,
             planNodes[action.outputNodeIndex],
             action.numRows,
             action.dimSize,
@@ -1296,7 +1316,13 @@ export async function executePlanOptimized(
     return { result, stats };
   }
 
-  // Get node IDs with live external tensors (e.g., saved-for-backward)
+  // Get node IDs with live pending tensors (e.g., saved-for-backward).
+  // These nodes must not be absorbed into matmul epilogue chains or fused
+  // as purely-internal intermediates — their output buffers are needed by
+  // backward passes that aren't in the current plan.
+  //
+  // Note: RuntimeTensor.dispose() no longer unregisters from the pending map,
+  // so checkpoint's tidy() disposal won't hide nodes from this set.
   let externalNodeIds: Set<number> | undefined;
   try {
     const { getPendingNodeIds } = await import("../runtime/tensor");

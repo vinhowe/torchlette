@@ -11,7 +11,7 @@
  * - alpha: Scaling factor (typically equal to rank)
  */
 
-import type { FrontendTensor as Tensor, Torchlette } from 'torchlette';
+import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
 
 export type LoRAConfig = {
   rank: number;
@@ -45,7 +45,7 @@ export class LoRALinear {
     inFeatures: number,
     outFeatures: number,
     config: LoRAConfig,
-    options?: { device?: 'cpu' | 'webgpu' }
+    options?: { device?: "cpu" | "webgpu" },
   ) {
     this.api = api;
     this.inFeatures = inFeatures;
@@ -54,7 +54,7 @@ export class LoRALinear {
     this.alpha = config.alpha;
     this.scaling = config.alpha / config.rank;
 
-    const device = options?.device ?? 'webgpu';
+    const device = options?.device ?? "webgpu";
 
     // Initialize base weights (will be loaded from pretrained)
     // These are placeholders - actual values come from loadBaseWeights()
@@ -109,34 +109,26 @@ export class LoRALinear {
     // W is [out, in], so W^T is [in, out]
     const baseOut = this.api.matmul(
       x,
-      this.baseWeight.transpose({ dim0: 0, dim1: 1 })
+      this.baseWeight.transpose({ dim0: 0, dim1: 1 }),
     );
 
     const withBias = this.baseBias
       ? this.api.add(baseOut, this.baseBias)
       : baseOut;
 
-    // IMPORTANT: Detach base output to prevent autograd from building a computation
-    // graph through the frozen base weights. This significantly reduces GPU memory
-    // usage during LoRA training by not retaining intermediate activations for
-    // gradients that will never be computed (base weights are frozen).
-    const detachedBase = withBias.detach();
-
     // LoRA path: scaling * (x @ A^T @ B^T)
-    // A is [rank, in], A^T is [in, rank]
-    // B is [out, rank], B^T is [rank, out]
-    // So: x @ A^T @ B^T = [batch, seq, in] @ [in, rank] @ [rank, out]
-    //                    = [batch, seq, out]
     const loraOut = this.api.matmul(
       this.api.matmul(x, this.loraA.transpose({ dim0: 0, dim1: 1 })),
-      this.loraB.transpose({ dim0: 0, dim1: 1 })
+      this.loraB.transpose({ dim0: 0, dim1: 1 }),
     );
-
-    // Scale and add
     const scalingTensor = this.api.tensorFromArray([this.scaling], []);
     const scaledLora = this.api.mul(loraOut, scalingTensor);
 
-    return this.api.add(detachedBase, scaledLora);
+    // Detach base output — base weights are frozen (requiresGrad=false).
+    // This prevents building autograd graph through base weights, saving memory.
+    // Gradient for x flows through the LoRA path only, which is sufficient
+    // since the LoRA adapter is the only thing being optimized.
+    return this.api.add(withBias.detach(), scaledLora);
   }
 
   /**
@@ -159,10 +151,7 @@ export class LoRALinear {
 /**
  * Create LoRA config with sensible defaults.
  */
-export function createLoRAConfig(
-  rank: number = 8,
-  alpha?: number
-): LoRAConfig {
+export function createLoRAConfig(rank: number = 8, alpha?: number): LoRAConfig {
   return {
     rank,
     alpha: alpha ?? rank,

@@ -2,7 +2,7 @@
  * Model store -- WebGPU init, weight download, model + tokenizer creation.
  */
 
-import { getWebGPUInitError, initWebGPU, Torchlette } from "torchlette/browser";
+import { getWebGPUInitError, initWebGPU, Torchlette } from "torchlette";
 import { GPT2_SMALL_CONFIG, GPT2WithLoRA } from "$lib/torchlette/gpt2-lora";
 import { createLoRAConfig } from "$lib/torchlette/lora";
 import { GPT2Tokenizer } from "$lib/torchlette/tokenizer";
@@ -49,7 +49,6 @@ async function load(loraRank: number, loraAlpha: number): Promise<void> {
 
     api = new Torchlette("webgpu", {
       enableFusion: true,
-      enableMemoryPlanning: true,
     });
     progress = 10;
 
@@ -73,6 +72,11 @@ async function load(loraRank: number, loraAlpha: number): Promise<void> {
     const loraConfig = createLoRAConfig(loraRank, loraAlpha);
     model = new GPT2WithLoRA(api, GPT2_SMALL_CONFIG, loraConfig, "webgpu");
     model.loadBaseWeights(weights);
+
+    // Materialize all weight tensors on GPU before declaring ready.
+    // Without this, the lazy copy_ nodes from loadBaseWeights remain pending
+    // and can fail with "Input not ready" when training starts later.
+    await api.markStep();
 
     progress = 100;
     progressText = "Ready";

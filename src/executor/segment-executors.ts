@@ -302,6 +302,16 @@ export async function executeRowProgram(
       "../backend/webgpu/row-program-dispatch"
     );
 
+    // Force-execute any unresolved pending inputs before dispatch.
+    // This handles the case where the lowered plan's action ordering places
+    // the row-program before a data-source action for one of its external inputs
+    // (e.g., tensorFromArray nodes created during checkpoint recomputation).
+    for (const ref of inputRefs) {
+      if (ref.kind === "pending" && !ref.node.result) {
+        await executeNode(ref.node, backend);
+      }
+    }
+
     // Resolve input buffers from inputRefs
     const inputBuffers: GPUBuffer[] = [];
     for (const ref of inputRefs) {

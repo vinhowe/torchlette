@@ -10,7 +10,7 @@
 import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
 import { nn } from "torchlette";
 
-const { checkpoint } = nn;
+const { checkpoint, crossEntropy } = nn;
 
 import { type LoRAConfig, LoRALinear } from "./lora";
 
@@ -235,53 +235,23 @@ class CausalSelfAttentionLoRA {
     // qkv: [batch, seqLen, 3 * embedDim]
     const qkv = this.cAttn.forward(x);
 
-    // Reshape to [batch, seqLen, 3, numHeads, headDim]
-    const qkvReshaped = qkv.reshape([
-      batch,
-      seqLen,
-      3,
-      this.numHeads,
-      this.headDim,
-    ]);
+    // Split QKV along last dimension: [batch, seqLen, 3*embedDim] → 3 × [batch, seqLen, embedDim]
+    const [qRaw, kRaw, vRaw] = this.api.split(qkv, this.embedDim, 2);
 
-    // Permute to [3, batch, numHeads, seqLen, headDim]
-    const qkvPermuted = qkvReshaped.permute([2, 0, 3, 1, 4]);
-
-    // Reshape to [3, batch * numHeads * seqLen * headDim]
-    const totalSize = batch * this.numHeads * seqLen * this.headDim;
-    const qkvFlat = qkvPermuted.reshape([3, totalSize]);
-
-    // Extract Q, K, V using gather along dim 0
-    // indices shape must match output shape: [1, totalSize]
-    // Then we squeeze the first dimension
-    const indices0 = this.api.tensorFromArray(Array(totalSize).fill(0), [
-      1,
-      totalSize,
-    ]);
-    const indices1 = this.api.tensorFromArray(Array(totalSize).fill(1), [
-      1,
-      totalSize,
-    ]);
-    const indices2 = this.api.tensorFromArray(Array(totalSize).fill(2), [
-      1,
-      totalSize,
-    ]);
-
-    // Gather along dim 0: output shape is [1, totalSize], then squeeze to [totalSize]
-    // Then reshape to [batch * numHeads, seqLen, headDim]
-    const qFlat = this.api
-      .gather(qkvFlat, indices0, { dim: 0 })
-      .reshape([totalSize]);
-    const kFlat = this.api
-      .gather(qkvFlat, indices1, { dim: 0 })
-      .reshape([totalSize]);
-    const vFlat = this.api
-      .gather(qkvFlat, indices2, { dim: 0 })
-      .reshape([totalSize]);
-
-    const q = qFlat.reshape([batch * this.numHeads, seqLen, this.headDim]);
-    const k = kFlat.reshape([batch * this.numHeads, seqLen, this.headDim]);
-    const v = vFlat.reshape([batch * this.numHeads, seqLen, this.headDim]);
+    // Reshape to multi-head: [batch, seqLen, numHeads, headDim] → [batch, numHeads, seqLen, headDim]
+    // Then merge batch and heads: [batch * numHeads, seqLen, headDim]
+    const q = qRaw
+      .reshape([batch, seqLen, this.numHeads, this.headDim])
+      .permute([0, 2, 1, 3])
+      .reshape([batch * this.numHeads, seqLen, this.headDim]);
+    const k = kRaw
+      .reshape([batch, seqLen, this.numHeads, this.headDim])
+      .permute([0, 2, 1, 3])
+      .reshape([batch * this.numHeads, seqLen, this.headDim]);
+    const v = vRaw
+      .reshape([batch, seqLen, this.numHeads, this.headDim])
+      .permute([0, 2, 1, 3])
+      .reshape([batch * this.numHeads, seqLen, this.headDim]);
 
     // Scaled dot-product attention
     // scores = Q @ K^T / sqrt(d_k)
@@ -539,55 +509,11 @@ export class GPT2WithLoRA {
     const logitsFlat = logits.reshape([batch * seqLen, vocabSize]);
     const targetFlat = target.reshape([batch * seqLen]);
 
-    // Cross-entropy loss
-    const loss = this.crossEntropyLoss(logitsFlat, targetFlat);
+    // Cross-entropy loss using the framework's built-in implementation
+    // (has correct backward, unlike the previous hand-rolled version)
+    const loss = crossEntropy(this.api, logitsFlat, targetFlat);
 
     return { logits, loss };
-  }
-
-  private crossEntropyLoss(logits: Tensor, targets: Tensor): Tensor {
-    // Numerically stable cross-entropy loss
-    // logits: [N, C], targets: [N]
-    // loss = -log_softmax(logits)[targets].mean()
-    //
-    // log_softmax = logits - max(logits) - log(sum(exp(logits - max(logits))))
-    // This is equivalent to -log(softmax(logits)[targets]) but numerically stable
-
-    // Step 1: Compute log-softmax along the last dimension
-    const dim = -1;
-    const maxLogits = logits.max({ dim, keepdim: true });
-    if (typeof maxLogits === "number") {
-      throw new Error(
-        "crossEntropyLoss: max with keepdim should return tensor",
-      );
-    }
-    const shifted = this.api.sub(logits, maxLogits);
-    const expShifted = shifted.exp();
-    const sumExp = expShifted.sum({ dim, keepdim: true });
-    if (typeof sumExp === "number") {
-      throw new Error(
-        "crossEntropyLoss: sum with keepdim should return tensor",
-      );
-    }
-    const logSumExp = sumExp.log();
-    const logSoftmax = this.api.sub(shifted, logSumExp);
-
-    // Step 2: Gather the log-softmax values at target indices
-    // targets is [N] but gather needs same rank as input [N, C]
-    // So we unsqueeze targets to [N, 1], gather gives [N, 1], then reshape to [N]
-    const targetsForGather = targets.reshape([targets.shape[0], 1]);
-    const gatheredLogProbs = this.api.gather(logSoftmax, targetsForGather, {
-      dim: 1,
-    });
-    const gatheredSqueezed = gatheredLogProbs.reshape(targets.shape);
-
-    // Step 3: Negate and mean
-    const loss = this.api.neg(gatheredSqueezed);
-    const meanLoss = loss.mean();
-    if (typeof meanLoss === "number") {
-      return this.api.tensorFromArray([meanLoss], []);
-    }
-    return meanLoss;
   }
 
   /**

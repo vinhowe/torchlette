@@ -656,12 +656,17 @@ export class RuntimeEngine {
 
     // Materialize ALL tensors that were pending on executed nodes.
     // This ensures all user-held tensors get their storages marked as externally reachable.
-    const { materializePendingTensors } = await import("./tensor");
+    const { materializePendingTensors, clearDisposedPendingNodeIds } =
+      await import("./tensor");
     for (const node of plan.nodes) {
       if (node.result) {
         materializePendingTensors(node.id, node.result, node.results);
       }
     }
+
+    // Clear disposed pending node IDs — they were needed for fusion analysis
+    // but must not accumulate across steps (memory leak).
+    clearDisposedPendingNodeIds();
 
     // Materialize any remaining tensors whose nodes were already executed
     materializeRemaining(tensors);
@@ -676,8 +681,11 @@ export class RuntimeEngine {
    * are still accessible via node.result in getInputStorage().
    */
   async forceAllPending(): Promise<void> {
-    const { getAllPendingTensors, materializePendingTensors: materialize } =
-      await import("./tensor");
+    const {
+      getAllPendingTensors,
+      materializePendingTensors: materialize,
+      clearDisposedPendingNodeIds,
+    } = await import("./tensor");
     const pendingTensors = getAllPendingTensors();
     if (pendingTensors.length === 0) {
       return;
@@ -729,6 +737,8 @@ export class RuntimeEngine {
         materialize(node.id, node.result, node.results);
       }
     }
+    clearDisposedPendingNodeIds();
+
     // Materialize remaining tensors and collect skipped nodes (already executed
     // by prior force() calls but not in plan.nodes) for result cleanup.
     const skippedNodes = materializeRemaining(pendingTensors);
