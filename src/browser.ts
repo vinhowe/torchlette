@@ -6,6 +6,7 @@ export {
   createTileKernelDispatcher,
   type DataType,
   elementwiseGrid,
+  getGPUMemoryStats,
   getWebGPUDevice,
   getWebGPUInitError,
   initWebGPU,

@@ -25,7 +25,12 @@ export type TrainingConfig = {
 
 export type TrainingCallbacks = {
   onStepStart?: (step: number) => void;
-  onStepEnd?: (step: number, loss: number, timeMs: number) => void;
+  onStepEnd?: (
+    step: number,
+    loss: number,
+    timeMs: number,
+    memoryMB?: number,
+  ) => void;
   shouldStop?: () => boolean;
 };
 
@@ -239,7 +244,7 @@ export class LoRATrainer {
         this.api.endStep();
         await this.api.markStep();
         const stepTime = performance.now() - stepStart;
-        callbacks.onStepEnd?.(step, emaLoss, stepTime);
+        callbacks.onStepEnd?.(step, emaLoss, stepTime, undefined);
         continue;
       }
 
@@ -277,8 +282,15 @@ export class LoRATrainer {
 
       const stepTime = performance.now() - stepStart;
 
-      // Report smoothed loss to reduce per-batch noise
-      callbacks.onStepEnd?.(step, emaLoss, stepTime);
+      // Get GPU memory usage from the WebGPU memory tracker
+      let memoryMB: number | undefined;
+      try {
+        const { getGPUMemoryStats } = await import("torchlette");
+        const stats = getGPUMemoryStats();
+        memoryMB = stats.currentBytes / (1024 * 1024);
+      } catch {}
+
+      callbacks.onStepEnd?.(step, emaLoss, stepTime, memoryMB);
 
       // Memory cleanup - finalize the step and free intermediate tensors
       await this.api.markStep();

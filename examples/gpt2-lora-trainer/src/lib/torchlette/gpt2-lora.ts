@@ -76,9 +76,11 @@ class LayerNorm {
     }) as Tensor;
     const variance = varianceResult.reshape(meanShape);
 
-    // Normalize
+    // Normalize — clamp variance to non-negative before sqrt to prevent NaN
+    // (f32 rounding can produce tiny negative variance on near-constant inputs)
     const epsTensor = this.api.tensorFromArray([this.eps], []);
-    const std = this.api.sqrt(this.api.add(variance, epsTensor));
+    const clampedVar = this.api.relu(variance); // max(variance, 0)
+    const std = this.api.sqrt(this.api.add(clampedVar, epsTensor));
     const normalized = this.api.div(xCentered, std);
 
     // Scale and shift
