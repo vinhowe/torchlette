@@ -8,7 +8,7 @@
  */
 
 import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
-import { Adam, GradScaler } from "torchlette";
+import { Adam, GradScaler, nn } from "torchlette";
 import type { GPT2WithLoRA } from "./gpt2-lora";
 import type { GPT2Tokenizer } from "./tokenizer";
 
@@ -173,8 +173,7 @@ export class LoRATrainer {
     let totalLoss = 0;
     let lastLoss = 0;
     const startTime = performance.now();
-    let emaLoss = 0; // Exponential moving average for smooth loss reporting — biome-ignore
-    const emaAlpha = 0.02; // EMA smoothing factor (lower = smoother)
+    let emaLoss = 0; // biome-ignore
 
     // Create compiled forward function for AMP, fusion, and memory planning
     // The compile() region enables:
@@ -224,16 +223,33 @@ export class LoRATrainer {
       }
 
       // Read loss value before backward (checkpoint may dispose intermediate tensors).
-      // For AMP with GradScaler, read the scaled value and unscale with current scale.
       let lossValue = await loss.item();
       if (this.gradScaler) {
         lossValue = lossValue / this.gradScaler.getScale();
       }
 
+      // Skip step if loss is NaN/Inf (can happen on some GPUs due to
+      // numerical edge cases in attention/softmax with certain inputs).
+      // Zero grads and continue — the model will recover on the next batch.
+      if (!isFinite(lossValue)) {
+        console.warn(`Step ${step}: NaN/Inf loss, skipping`);
+        this.optimizer!.zeroGrad();
+        input.dispose();
+        target.dispose();
+        this.api.endStep();
+        await this.api.markStep();
+        const stepTime = performance.now() - stepStart;
+        callbacks.onStepEnd?.(step, emaLoss, stepTime);
+        continue;
+      }
+
       // Backward pass
       await loss.backward();
 
-      // Optimizer step — with gradient unscaling for AMP
+      // Gradient clipping
+      await nn.clipGradNorm_(this.api, loraParams, 1.0);
+
+      // Optimizer step
       if (this.gradScaler) {
         await this.gradScaler.unscale_(this.optimizer!);
         const stepped = await this.gradScaler.step(this.optimizer!);
@@ -248,12 +264,7 @@ export class LoRATrainer {
       }
       this.optimizer!.zeroGrad();
 
-      // Compute smoothed loss (EMA) for stable reporting
-      if (step === 0) {
-        emaLoss = lossValue;
-      } else {
-        emaLoss = emaAlpha * lossValue + (1 - emaAlpha) * emaLoss;
-      }
+      emaLoss = lossValue;
       totalLoss += lossValue;
       lastLoss = lossValue;
 
