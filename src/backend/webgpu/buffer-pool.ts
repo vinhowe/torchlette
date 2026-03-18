@@ -765,6 +765,11 @@ export function flushBufferPool(): void {
   bufferPool.beginWindow(); // Advance window counter for demand tracking
 }
 
+/** Destroy all buffers in the pending-destroy queue. */
+export function destroyPendingGPUBuffers(): void {
+  bufferPool.destroyPendingBuffers();
+}
+
 /**
  * Release a contiguous copy's buffer if one was created.
  * Common pattern: `if (copy !== original) destroyCopy(copy)`.
