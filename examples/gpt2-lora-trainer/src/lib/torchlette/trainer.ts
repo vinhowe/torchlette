@@ -217,14 +217,26 @@ export class LoRATrainer {
       // Get batch
       const { input, target } = dataLoader.nextBatch();
 
-      // Forward pass with loss - use compiled region for AMP
+      // Forward pass with loss.
+      // Wrap in tidy() to dispose intermediate FrontendTensors (layernorm
+      // outputs, attention scores, etc.) immediately. The underlying lazy
+      // nodes survive for backward — only the frontend wrappers are freed.
+      // Without this, ~100 FrontendTensors per step accumulate until GC,
+      // causing a multi-step memory sawtooth.
       let loss: Tensor;
       if (useAMP && compiledForwardWithLoss) {
-        loss = compiledForwardWithLoss(input, target);
-        if (this.gradScaler) loss = this.gradScaler.scale(loss);
+        loss = this.api.tidy(() => {
+          let l = compiledForwardWithLoss(input, target);
+          if (this.gradScaler) l = this.gradScaler.scale(l);
+          this.api.keep(l);
+          return l;
+        });
       } else {
-        const result = this.model.forwardWithLoss(input, target);
-        loss = result.loss;
+        loss = this.api.tidy(() => {
+          const result = this.model.forwardWithLoss(input, target);
+          this.api.keep(result.loss);
+          return result.loss;
+        });
       }
 
       // Read loss value before backward (checkpoint may dispose intermediate tensors).
