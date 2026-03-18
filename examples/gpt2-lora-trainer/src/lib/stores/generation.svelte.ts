@@ -14,6 +14,7 @@ let temperature = $state(0.8);
 let topK = $state(40);
 let maxTokens = $state(200);
 let isGenerating = $state(false);
+const stopSignal = { value: false };
 let error = $state("");
 
 const canGenerate = $derived(modelStore.isReady && !isGenerating);
@@ -29,6 +30,7 @@ async function generate(): Promise<void> {
   if (!prompt.trim()) return;
 
   isGenerating = true;
+  stopSignal.value = false;
   output = "";
   error = "";
 
@@ -46,6 +48,7 @@ async function generate(): Promise<void> {
       prompt,
       options,
     )) {
+      if (stopSignal.value) break;
       output += token;
     }
   } catch (e) {
@@ -53,6 +56,10 @@ async function generate(): Promise<void> {
   } finally {
     isGenerating = false;
   }
+}
+
+function stopGenerate(): void {
+  stopSignal.value = true;
 }
 
 export const generationStore = {
@@ -94,4 +101,5 @@ export const generationStore = {
   },
 
   generate,
+  stopGenerate,
 };
