@@ -15,6 +15,7 @@ import type {
 import { isAutotuneEnabled, setAutotuneEnabled } from "../backend/webgpu";
 import {
   awaitDeferredFence,
+  destroyPendingGPUBuffers,
   issueDeferredFence,
 } from "../backend/webgpu/buffer-pool";
 import {
@@ -1646,7 +1647,16 @@ export class Torchlette {
     // Step 3: GC - destroy all unreachable storages (intermediate buffers)
     storageTracker.destroyUnreachable();
 
-    // Step 3.5: Reset cumulative fusion stats for the next step
+    // Step 3.5: Flush GPU buffers queued for destruction by destroyUnreachable.
+    // Without this, destroyed buffers accumulate in pendingDestroy until the
+    // next beginStep()/awaitDeferredFence(), causing a multi-step memory sawtooth.
+    try {
+      destroyPendingGPUBuffers();
+    } catch {
+      // Safe to ignore if WebGPU backend is not initialized.
+    }
+
+    // Step 3.6: Reset cumulative fusion stats for the next step
     this.runtime.resetCumulativeFusionStats();
 
     // Step 4: Issue a deferred GPU fence.
