@@ -169,10 +169,9 @@ export class Adam {
    * Check if the fused Adam kernel is available on the current backend.
    */
   hasFusedKernel(): boolean {
-    // Fused Adam kernel disabled: has a gradient buffer read bug
-    // that produces uniform updates instead of element-wise.
-    // Also prevents GradScaler from using the fused unscale path.
-    return false;
+    const runtime = this.api._runtime();
+    const backend = runtime.getBackend(this.device);
+    return !!backend.ops.adamStep;
   }
 
   /**
@@ -232,12 +231,9 @@ export class Adam {
     // Resolve side outputs from previous fused step
     this._resolvePendingState();
 
-    // TODO: Fused Adam kernel has a buffer aliasing bug where gradients
-    // are read as scalar instead of element-wise, producing wrong updates.
-    // Use elementwise path until the fused kernel is fixed.
-    // if (this.hasFusedKernel()) {
-    //   return this._stepFused(runtime);
-    // }
+    if (this.hasFusedKernel()) {
+      return this._stepFused(runtime);
+    }
     return this._stepElementwise(runtime);
   }
 

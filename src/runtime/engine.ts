@@ -697,10 +697,12 @@ export class RuntimeEngine {
     const plan = buildMergedPlan(pendingRoots, /* skipExecuted */ true);
     if (plan.nodes.length === 0) return;
 
-    // Destroy storages from prior steps (e.g., old Adam m/v states
-    // disposed by _resolvePendingState). Frees GPU buffers into pool
-    // before the new plan allocates output buffers.
-    storageTracker.destroyUnreachable();
+    // NOTE: Do NOT call storageTracker.destroyUnreachable() here.
+    // Disposed tensors (e.g., old Adam m/v states) may have buffers that
+    // are still referenced by pending lazy nodes in the plan about to execute.
+    // Destroying them before plan execution causes buffer reuse corruption
+    // on GPUs with fast buffer reclamation (Chrome/Metal WebGPU).
+    // Unreachable storages are cleaned up AFTER plan execution instead.
 
     const device = resolveDeviceFromTensors(pendingTensors);
 
@@ -755,10 +757,11 @@ export class RuntimeEngine {
       node.result = undefined;
     }
 
-    // Destroy orphaned intermediates created during this plan execution.
-    // At markStep time, all pending tensors have been materialized, so
-    // any unreachable storages created during execution are truly orphaned.
-    storageTracker.destroyUnreachableSince(storageSnapshot);
+    // Destroy orphaned intermediates created during this plan execution,
+    // PLUS any storages from prior steps that were marked unreachable
+    // (e.g., old Adam m/v states). This is safe now because the plan
+    // has finished executing — no pending nodes reference these buffers.
+    storageTracker.destroyUnreachable();
   }
 
   tensorFromArray(
