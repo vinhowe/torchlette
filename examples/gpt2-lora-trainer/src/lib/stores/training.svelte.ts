@@ -11,11 +11,11 @@ const TINY_SHAKESPEARE_URL =
 
 // Config
 let rank = $state(64);
-let alpha = $state(64);
+let alpha = $state(16);
 let maxSteps = $state(200);
 let batchSize = $state(1);
 let seqLen = $state(128);
-let lr = $state(1e-3);
+let lr = $state(5e-4);
 let useAMP = $state(true);
 let useCheckpointing = $state(true);
 
@@ -30,6 +30,10 @@ let running = $state(false);
 let step = $state(0);
 let loss = $state(0);
 let lossHistory = $state<number[]>([]);
+// biome-ignore lint/style/useConst: Svelte $state runes require reassignment
+let memoryHistory = $state<number[]>([]);
+// biome-ignore lint/style/useConst: Svelte $state runes require reassignment
+let memoryMB = $state(0);
 let tokPerSec = $state(0);
 let error = $state("");
 
@@ -96,6 +100,8 @@ async function startTraining(): Promise<void> {
   step = 0;
   loss = 0;
   lossHistory = [];
+  memoryHistory = [];
+  memoryMB = 0;
   tokPerSec = 0;
   error = "";
   loraBlob = null;
@@ -120,10 +126,14 @@ async function startTraining(): Promise<void> {
       onStepStart: (s) => {
         step = s;
       },
-      onStepEnd: (s, l, timeMs) => {
+      onStepEnd: (s, l, timeMs, mem) => {
         step = s + 1;
         loss = l;
         lossHistory = [...lossHistory, l];
+        if (mem !== undefined) {
+          memoryMB = mem;
+          memoryHistory = [...memoryHistory, mem];
+        }
         tokPerSec = (batchSize * seqLen) / (timeMs / 1000);
       },
       shouldStop: () => shouldStop,
@@ -236,6 +246,12 @@ export const trainingStore = {
   },
   get lossHistory() {
     return lossHistory;
+  },
+  get memoryHistory() {
+    return memoryHistory;
+  },
+  get memoryMB() {
+    return memoryMB;
   },
   get tokPerSec() {
     return tokPerSec;

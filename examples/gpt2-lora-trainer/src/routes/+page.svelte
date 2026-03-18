@@ -27,20 +27,21 @@ function fmtTokens(n: number): string {
   return String(n);
 }
 
-// --- Loss chart ---
-function lossChartPath(history: number[]): string {
+// --- Charts ---
+function chartPath(history: number[]): string {
   if (history.length < 2) return "";
-  const maxLoss = Math.max(...history);
-  const minLoss = Math.min(...history);
-  const range = maxLoss - minLoss || 1;
-  const w = 100;
-  const h = 100;
-  const pts = history.map((l, i) => {
-    const x = (i / (history.length - 1)) * w;
-    const y = h - ((l - minLoss) / range) * h;
+  const maxVal = Math.max(...history);
+  const minVal = Math.min(...history);
+  const range = maxVal - minVal || 1;
+  const pts = history.map((v, i) => {
+    const x = (i / (history.length - 1)) * 100;
+    const y = 100 - ((v - minVal) / range) * 100;
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   });
   return `M${pts.join(" L")}`;
+}
+function lossChartPath(history: number[]): string {
+  return chartPath(history);
 }
 
 // --- File drop ---
@@ -215,6 +216,9 @@ function handleLoadModel() {
             <span>step <span class="text-slate-200">{trainingStore.step}</span>/{trainingStore.maxSteps}</span>
             <span>loss <span class="text-slate-200">{fmtLoss(trainingStore.loss)}</span></span>
             <span><span class="text-slate-200">{fmtTokSec(trainingStore.tokPerSec)}</span> tok/s</span>
+            {#if trainingStore.memoryMB > 0}
+              <span><span class="text-amber-400">{trainingStore.memoryMB.toFixed(0)}</span> MB</span>
+            {/if}
           {/if}
         </div>
       </div>
@@ -224,18 +228,35 @@ function handleLoadModel() {
         <div class="text-xs text-red-400 font-mono">{trainingStore.error}</div>
       {/if}
 
-      <!-- Loss chart -->
+      <!-- Charts -->
       {#if trainingStore.lossHistory.length >= 2}
-        <div class="border border-slate-800 p-1">
-          <svg viewBox="-2 -2 104 104" class="w-full h-24" preserveAspectRatio="none">
-            <path d={lossChartPath(trainingStore.lossHistory)}
-                  fill="none" stroke="#3b82f6" stroke-width="1.5" vector-effect="non-scaling-stroke" />
-          </svg>
-          <div class="flex justify-between text-[9px] font-mono text-slate-600 px-0.5">
-            <span>0</span>
-            <span>loss</span>
-            <span>{trainingStore.maxSteps}</span>
+        <div class="grid grid-cols-2 gap-1">
+          <!-- Loss chart -->
+          <div class="border border-slate-800 p-1">
+            <svg viewBox="-2 -2 104 104" class="w-full h-20" preserveAspectRatio="none">
+              <path d={lossChartPath(trainingStore.lossHistory)}
+                    fill="none" stroke="#3b82f6" stroke-width="1.5" vector-effect="non-scaling-stroke" />
+            </svg>
+            <div class="flex justify-between text-[9px] font-mono text-slate-600 px-0.5">
+              <span>{Math.min(...trainingStore.lossHistory).toFixed(2)}</span>
+              <span>loss ({trainingStore.lossHistory.length})</span>
+              <span>{Math.max(...trainingStore.lossHistory).toFixed(2)}</span>
+            </div>
           </div>
+          <!-- Memory chart -->
+          {#if trainingStore.memoryHistory.length >= 2}
+            <div class="border border-slate-800 p-1">
+              <svg viewBox="-2 -2 104 104" class="w-full h-20" preserveAspectRatio="none">
+                <path d={chartPath(trainingStore.memoryHistory)}
+                      fill="none" stroke="#f59e0b" stroke-width="1.5" vector-effect="non-scaling-stroke" />
+              </svg>
+              <div class="flex justify-between text-[9px] font-mono text-slate-600 px-0.5">
+                <span>{Math.min(...trainingStore.memoryHistory).toFixed(0)}</span>
+                <span>MB</span>
+                <span>{Math.max(...trainingStore.memoryHistory).toFixed(0)}</span>
+              </div>
+            </div>
+          {/if}
         </div>
       {/if}
 

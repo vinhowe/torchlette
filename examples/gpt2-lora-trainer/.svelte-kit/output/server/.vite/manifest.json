@@ -1,18 +1,63 @@
 {
-  "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types_b60a6125d0c95863c0ed2c3954d1cbca/node_modules/@sveltejs/kit/src/runtime/app/server/remote/index.js": {
+  "../../dist/buffer-pool-B3lfcjyw.js": {
+    "file": "chunks/buffer-pool-B3lfcjyw.js",
+    "name": "buffer-pool-B3lfcjyw",
+    "src": "../../dist/buffer-pool-B3lfcjyw.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "_tensor-1l1COWZg.js"
+    ]
+  },
+  "../../dist/dispatch-hG3P78x9.js": {
+    "file": "chunks/dispatch-hG3P78x9.js",
+    "name": "dispatch-hG3P78x9",
+    "src": "../../dist/dispatch-hG3P78x9.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "_tensor-1l1COWZg.js"
+    ]
+  },
+  "../../dist/fusion-dispatch-D8hThmmh.js": {
+    "file": "chunks/fusion-dispatch-D8hThmmh.js",
+    "name": "fusion-dispatch-D8hThmmh",
+    "src": "../../dist/fusion-dispatch-D8hThmmh.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "_tensor-1l1COWZg.js"
+    ]
+  },
+  "../../dist/row-program-dispatch-BSpjS5_T.js": {
+    "file": "chunks/row-program-dispatch-BSpjS5_T.js",
+    "name": "row-program-dispatch-BSpjS5_T",
+    "src": "../../dist/row-program-dispatch-BSpjS5_T.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "_tensor-1l1COWZg.js"
+    ]
+  },
+  "../../dist/webgpu-S_IN-64Z.js": {
+    "file": "chunks/webgpu-S_IN-64Z.js",
+    "name": "webgpu-S_IN-64Z",
+    "src": "../../dist/webgpu-S_IN-64Z.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "_tensor-1l1COWZg.js"
+    ]
+  },
+  "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types+node@_2sduqbq5h4cbrunoshjxrvpfae/node_modules/@sveltejs/kit/src/runtime/app/server/remote/index.js": {
     "file": "remote-entry.js",
     "name": "remote-entry",
-    "src": "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types_b60a6125d0c95863c0ed2c3954d1cbca/node_modules/@sveltejs/kit/src/runtime/app/server/remote/index.js",
+    "src": "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types+node@_2sduqbq5h4cbrunoshjxrvpfae/node_modules/@sveltejs/kit/src/runtime/app/server/remote/index.js",
     "isEntry": true,
     "imports": [
       "_shared.js",
       "_environment.js"
     ]
   },
-  "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types_b60a6125d0c95863c0ed2c3954d1cbca/node_modules/@sveltejs/kit/src/runtime/components/svelte-5/error.svelte": {
+  "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types+node@_2sduqbq5h4cbrunoshjxrvpfae/node_modules/@sveltejs/kit/src/runtime/components/svelte-5/error.svelte": {
     "file": "entries/fallbacks/error.svelte.js",
     "name": "entries/fallbacks/error.svelte",
-    "src": "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types_b60a6125d0c95863c0ed2c3954d1cbca/node_modules/@sveltejs/kit/src/runtime/components/svelte-5/error.svelte",
+    "src": "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types+node@_2sduqbq5h4cbrunoshjxrvpfae/node_modules/@sveltejs/kit/src/runtime/components/svelte-5/error.svelte",
     "isEntry": true,
     "imports": [
       "_context.js",
@@ -21,10 +66,10 @@
       "_utils.js"
     ]
   },
-  "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types_b60a6125d0c95863c0ed2c3954d1cbca/node_modules/@sveltejs/kit/src/runtime/server/index.js": {
+  "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types+node@_2sduqbq5h4cbrunoshjxrvpfae/node_modules/@sveltejs/kit/src/runtime/server/index.js": {
     "file": "index.js",
     "name": "index",
-    "src": "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types_b60a6125d0c95863c0ed2c3954d1cbca/node_modules/@sveltejs/kit/src/runtime/server/index.js",
+    "src": "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types+node@_2sduqbq5h4cbrunoshjxrvpfae/node_modules/@sveltejs/kit/src/runtime/server/index.js",
     "isEntry": true,
     "imports": [
       "_environment.js",
@@ -87,9 +132,32 @@
       "_utils.js"
     ]
   },
+  "_tensor-1l1COWZg.js": {
+    "file": "chunks/tensor-1l1COWZg.js",
+    "name": "tensor-1l1COWZg",
+    "imports": [
+      "_index.js",
+      "_context.js"
+    ],
+    "dynamicImports": [
+      "../../dist/buffer-pool-B3lfcjyw.js",
+      "../../dist/webgpu-S_IN-64Z.js",
+      "../../dist/dispatch-hG3P78x9.js",
+      "src/lib/webgpu-stub.ts",
+      "../../dist/fusion-dispatch-D8hThmmh.js",
+      "../../dist/row-program-dispatch-BSpjS5_T.js",
+      "../../dist/webgpu-S_IN-64Z.js"
+    ]
+  },
   "_utils.js": {
     "file": "chunks/utils.js",
     "name": "utils"
+  },
+  "src/lib/webgpu-stub.ts": {
+    "file": "chunks/webgpu-stub.js",
+    "name": "webgpu-stub",
+    "src": "src/lib/webgpu-stub.ts",
+    "isDynamicEntry": true
   },
   "src/routes/+layout.svelte": {
     "file": "entries/pages/_layout.svelte.js",
@@ -97,7 +165,7 @@
     "src": "src/routes/+layout.svelte",
     "isEntry": true,
     "css": [
-      "_app/immutable/assets/_layout.DupwL_S5.css"
+      "_app/immutable/assets/_layout.CD3G52s7.css"
     ]
   },
   "src/routes/+page.svelte": {
@@ -107,7 +175,14 @@
     "isEntry": true,
     "imports": [
       "_index.js",
+      "_tensor-1l1COWZg.js",
       "_context.js"
     ]
+  },
+  "src/routes/+page.ts": {
+    "file": "entries/pages/_page.ts.js",
+    "name": "entries/pages/_page.ts",
+    "src": "src/routes/+page.ts",
+    "isEntry": true
   }
 }

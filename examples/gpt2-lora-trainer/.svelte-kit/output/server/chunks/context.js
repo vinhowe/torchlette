@@ -60,11 +60,11 @@ function get_parent_context(ssr_context2) {
   return null;
 }
 export {
-  set_ssr_context as a,
-  ssr_context as b,
-  pop as c,
+  ssr_context as a,
+  pop as b,
+  setContext as c,
   escape_html as e,
   getContext as g,
   push as p,
-  setContext as s
+  set_ssr_context as s
 };

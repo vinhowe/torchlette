@@ -35,7 +35,7 @@ async function main() {
   }
 
   const api = new Torchlette("webgpu", {
-    enableFusion: false,
+    enableFusion: true,
   });
 
   // Step 2: Load tokenizer
@@ -220,6 +220,30 @@ async function main() {
   }
   console.log(`   Prompt: "The"`);
   console.log(`   Generated: "The${generated}"`);
+
+  // Step 8: Test LoRATrainer with AMP + checkpointing (browser code path)
+  console.log("\n8. Testing LoRATrainer with AMP + checkpointing...");
+  const { LoRATrainer } = await import(
+    "../examples/gpt2-lora-trainer/src/lib/torchlette/trainer"
+  );
+  const trainer = new LoRATrainer(api, model, tokenizer);
+  const trainerResult = await trainer.train(
+    trainingText,
+    {
+      maxSteps: 3,
+      batchSize: 1,
+      seqLength: 32,
+      learningRate: 1e-4,
+      useAMP: false,
+      useCheckpointing: true,
+    },
+    {
+      onStepEnd: (s, l) => console.log(`   Step ${s}: loss=${l.toFixed(4)}`),
+    },
+  );
+  console.log(
+    `   LoRATrainer done: finalLoss=${trainerResult.finalLoss.toFixed(4)}`,
+  );
 
   console.log("\n=== SMOKE TEST PASSED ===");
   await destroyWebGPU();

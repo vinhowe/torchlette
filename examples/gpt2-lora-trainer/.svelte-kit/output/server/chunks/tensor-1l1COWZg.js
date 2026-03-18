@@ -1,0 +1,25175 @@
+import { w as attr, x as attr_class, y as stringify } from "./index.js";
+import { e as escape_html } from "./context.js";
+var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __esmMin = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
+var __exportAll = (all, no_symbols) => {
+  let target = {};
+  for (var name in all) __defProp(target, name, {
+    get: all[name],
+    enumerable: true
+  });
+  __defProp(target, Symbol.toStringTag, { value: "Module" });
+  return target;
+};
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") for (var keys = __getOwnPropNames(from), i = 0, n = keys.length, key; i < n; i++) {
+    key = keys[i];
+    if (!__hasOwnProp.call(to, key) && key !== except) __defProp(to, key, {
+      get: ((k) => from[k]).bind(null, key),
+      enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable
+    });
+  }
+  return to;
+};
+var __toCommonJS = (mod) => __hasOwnProp.call(mod, "module.exports") ? mod["module.exports"] : __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+var define_process_env_default$2 = {};
+function setActiveBatch(batch) {
+  activeBatch = batch;
+}
+function isCompilationRecording() {
+  return compilationRecordingActive;
+}
+function setCompilationRecording(active) {
+  compilationRecordingActive = active;
+}
+function setSharedEncoderActive(active) {
+  sharedEncoderActive = active;
+}
+function resetSharedEncoderWriteSet() {
+  sharedEncoderWriteSet = /* @__PURE__ */ new Set();
+}
+function trackSharedEncoderWrite(buffer) {
+  if (sharedEncoderActive) sharedEncoderWriteSet.add(buffer);
+}
+function setGpuContext(ctx) {
+  gpuContext = ctx;
+}
+function requireContext() {
+  if (!gpuContext) throw new Error("WebGPU backend not initialized; call initWebGPU()");
+  return gpuContext;
+}
+function getSubmitCount() {
+  return gpuSubmitCount;
+}
+function incrementSubmitCount() {
+  gpuSubmitCount++;
+}
+function resetSubmitCount() {
+  gpuSubmitCount = 0;
+}
+function paramsBufferSizeClass(byteLength) {
+  if (byteLength <= 4) return 4;
+  if (byteLength <= 8) return 8;
+  if (byteLength <= 16) return 16;
+  if (byteLength <= 32) return 32;
+  if (byteLength <= 48) return 48;
+  return 64;
+}
+function getOutputSeqIndex() {
+  return outputSeqIndex;
+}
+function setOutputSeqIndex(v) {
+  outputSeqIndex = v;
+}
+function onTeardown(cb) {
+  teardownCallbacks.push(cb);
+}
+function runTeardownCallbacks() {
+  for (const cb of teardownCallbacks) cb();
+  teardownCallbacks.length = 0;
+}
+function setCurrentOpLabel(label) {
+  currentOpLabel = label;
+}
+function getCurrentOpLabel() {
+  return currentOpLabel;
+}
+var activeBatch, compilationRecordingActive, sharedEncoderActive, sharedEncoderWriteSet, gpuContext, arenaBufferSet, gpuSubmitCount, paramsBufferPools, paramsSequenceSet, outputSeqIndex, teardownCallbacks, currentOpLabel;
+var init_webgpu_state = __esmMin((() => {
+  activeBatch = null;
+  compilationRecordingActive = false;
+  sharedEncoderActive = false;
+  sharedEncoderWriteSet = /* @__PURE__ */ new Set();
+  gpuContext = null;
+  arenaBufferSet = /* @__PURE__ */ new Set();
+  gpuSubmitCount = 0;
+  paramsBufferPools = /* @__PURE__ */ new Map();
+  paramsSequenceSet = /* @__PURE__ */ new Set();
+  outputSeqIndex = 0;
+  teardownCallbacks = [];
+  currentOpLabel = null;
+}));
+function resetCpuProfileState() {
+  cpuProfile.apiStats.clear();
+  cpuProfile.opStats.clear();
+  cpuProfile.subOpStats.clear();
+  cpuProfile.currentPhase = "unknown";
+  cpuProfile.phaseStats.clear();
+  cpuProfile.currentModule = "unknown";
+  cpuProfile.planAnalyses.length = 0;
+  cpuProfile.fusionFallbackStats.clear();
+}
+function resetGpuTimestampState() {
+  gpuTs.passRecords = [];
+  gpuTs.nextSlot = 0;
+  if (gpuTs.stagingBuffer) {
+    gpuTs.stagingBuffer.destroy();
+    gpuTs.stagingBuffer = null;
+  }
+  gpuTs.stagingSlots = 0;
+  gpuTs.labelStats.clear();
+  gpuTs.phaseStats.clear();
+  gpuTs.phaseOpStats.clear();
+  gpuTs.moduleStats.clear();
+  gpuTs.moduleOpStats.clear();
+}
+function recordMs(map, key, ms) {
+  const e = map.get(key);
+  if (e) {
+    e.count++;
+    e.totalMs += ms;
+    if (ms > e.maxMs) e.maxMs = ms;
+  } else map.set(key, {
+    count: 1,
+    totalMs: ms,
+    maxMs: ms
+  });
+}
+function recordNs(map, key, ns) {
+  const e = map.get(key);
+  if (e) {
+    e.count++;
+    e.totalNs += ns;
+    if (ns > e.maxNs) e.maxNs = ns;
+  } else map.set(key, {
+    count: 1,
+    totalNs: ns,
+    maxNs: ns
+  });
+}
+function accumulateNs(map, key, ns) {
+  const e = map.get(key);
+  if (e) {
+    e.totalNs += ns;
+    e.opCount++;
+  } else map.set(key, {
+    totalNs: ns,
+    opCount: 1
+  });
+}
+function recordFusionFallback(reason, groupSize, detail) {
+  if (!PROFILING_ENABLED) return;
+  const entry = cpuProfile.fusionFallbackStats.get(reason);
+  if (entry) {
+    entry.count++;
+    entry.totalNodes += groupSize;
+    if (detail && entry.details.length < 3) entry.details.push(detail);
+  } else cpuProfile.fusionFallbackStats.set(reason, {
+    count: 1,
+    totalNodes: groupSize,
+    details: detail ? [detail] : []
+  });
+}
+function isProfilingEnabled() {
+  return PROFILING_ENABLED;
+}
+function setTimestampsEnabled(enabled) {
+  gpuTs.enabled = enabled;
+}
+function profileApiCall(name, fn) {
+  if (!PROFILING_ENABLED) return fn();
+  const t0 = performance.now();
+  const result = fn();
+  recordMs(cpuProfile.apiStats, name, performance.now() - t0);
+  return result;
+}
+function profileOpBegin(_opName) {
+  if (!PROFILING_ENABLED) return 0;
+  return performance.now();
+}
+function profileOpEnd(opName, t0) {
+  if (!PROFILING_ENABLED) return;
+  const elapsed = performance.now() - t0;
+  recordMs(cpuProfile.opStats, opName, elapsed);
+  const phase = cpuProfile.phaseStats.get(cpuProfile.currentPhase);
+  if (phase) {
+    phase.totalMs += elapsed;
+    phase.opCount++;
+  } else cpuProfile.phaseStats.set(cpuProfile.currentPhase, {
+    totalMs: elapsed,
+    opCount: 1
+  });
+}
+function profileSubOpBegin() {
+  if (!PROFILING_ENABLED) return 0;
+  return performance.now();
+}
+function profileSubOpEnd(label, t0) {
+  if (!PROFILING_ENABLED) return;
+  recordMs(cpuProfile.subOpStats, label, performance.now() - t0);
+}
+function setProfilePhase(phase) {
+  cpuProfile.currentPhase = phase;
+}
+function setProfileModule(module) {
+  cpuProfile.currentModule = module;
+}
+function getProfileModule() {
+  return cpuProfile.currentModule;
+}
+function recordPlanAnalysis(analysis) {
+  if (!PROFILING_ENABLED) return;
+  analysis.planIndex = cpuProfile.planAnalyses.length;
+  cpuProfile.planAnalyses.push(analysis);
+}
+function initGpuTimestamps(device) {
+  if (!PROFILING_ENABLED) return;
+  gpuTs.device = device;
+  gpuTs.supported = true;
+  const maxQueryCount = device.limits.maxQueryCount ?? 4096;
+  const count = Math.min(GPU_MAX_PASSES * 2, maxQueryCount);
+  gpuTs.maxSlots = count;
+  const QUERY_RESOLVE = 512;
+  const COPY_SRC = 4;
+  gpuTs.querySet = device.createQuerySet({
+    type: "timestamp",
+    count
+  });
+  gpuTs.resolveBuffer = device.createBuffer({
+    size: count * 8,
+    usage: QUERY_RESOLVE | COPY_SRC
+  });
+  gpuTs.readbackBuffer = null;
+  console.log(`[profiler] GPU timestamps initialized: ${count} slots`);
+  gpuTs.passRecords = [];
+  gpuTs.nextSlot = 0;
+}
+function getTimestampWrites(label) {
+  if (!PROFILING_ENABLED || !gpuTs.supported || !gpuTs.querySet || !gpuTs.enabled) return void 0;
+  if (gpuTs.nextSlot + 2 > gpuTs.maxSlots) return void 0;
+  const startSlot = gpuTs.nextSlot;
+  const endSlot = gpuTs.nextSlot + 1;
+  gpuTs.nextSlot += 2;
+  gpuTs.passRecords.push({
+    label,
+    phase: cpuProfile.currentPhase,
+    module: cpuProfile.currentModule,
+    startSlot,
+    endSlot
+  });
+  return {
+    querySet: gpuTs.querySet,
+    beginningOfPassWriteIndex: startSlot,
+    endOfPassWriteIndex: endSlot
+  };
+}
+function resolveGpuTimestamps() {
+  if (!PROFILING_ENABLED || !gpuTs.supported || !gpuTs.querySet || !gpuTs.resolveBuffer || gpuTs.nextSlot === 0) return;
+  gpuTs.stagingSlots = gpuTs.nextSlot;
+}
+function processTimestampRecords(timestamps) {
+  for (const record of gpuTs.passRecords) {
+    if (record.startSlot >= timestamps.length || record.endSlot >= timestamps.length) continue;
+    const startNs = timestamps[record.startSlot];
+    const endNs = timestamps[record.endSlot];
+    if (startNs === 0n && endNs === 0n) continue;
+    const durationNs = endNs - startNs;
+    if (durationNs < 0n) continue;
+    recordNs(gpuTs.labelStats, record.label, durationNs);
+    accumulateNs(gpuTs.phaseStats, record.phase, durationNs);
+    let phaseOps = gpuTs.phaseOpStats.get(record.phase);
+    if (!phaseOps) {
+      phaseOps = /* @__PURE__ */ new Map();
+      gpuTs.phaseOpStats.set(record.phase, phaseOps);
+    }
+    recordNs(phaseOps, record.label, durationNs);
+    accumulateNs(gpuTs.moduleStats, record.module, durationNs);
+    let moduleOps = gpuTs.moduleOpStats.get(record.module);
+    if (!moduleOps) {
+      moduleOps = /* @__PURE__ */ new Map();
+      gpuTs.moduleOpStats.set(record.module, moduleOps);
+    }
+    recordNs(moduleOps, record.label, durationNs);
+  }
+}
+async function resolveAndMapTimestamps(slotsToRead) {
+  const MAP_READ = 1;
+  const COPY_DST = 8;
+  const byteSize = slotsToRead * 8;
+  const staging = gpuTs.device.createBuffer({
+    size: byteSize,
+    usage: MAP_READ | COPY_DST
+  });
+  const encoder = gpuTs.device.createCommandEncoder();
+  encoder.resolveQuerySet(gpuTs.querySet, 0, slotsToRead, gpuTs.resolveBuffer, 0);
+  encoder.copyBufferToBuffer(gpuTs.resolveBuffer, 0, staging, 0, byteSize);
+  gpuTs.device.queue.submit([encoder.finish()]);
+  const MAPASYNC_TIMEOUT_MS = 5e3;
+  try {
+    if (!await Promise.race([staging.mapAsync(MAP_READ).then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), MAPASYNC_TIMEOUT_MS))])) {
+      console.warn("[profiler] mapAsync timed out (5s) — GPU timestamps unavailable");
+      staging.destroy();
+      return false;
+    }
+  } catch (e) {
+    console.warn("[profiler] Failed to map timestamp staging buffer:", e);
+    staging.destroy();
+    return false;
+  }
+  processTimestampRecords(new BigInt64Array(staging.getMappedRange()));
+  staging.unmap();
+  staging.destroy();
+  return true;
+}
+async function readGpuTimestamps() {
+  if (!PROFILING_ENABLED || !gpuTs.supported || !gpuTs.device || !gpuTs.querySet || !gpuTs.resolveBuffer || gpuTs.passRecords.length === 0 || gpuTs.stagingSlots === 0) return;
+  if (gpuTs.labelStats.size > 0) return;
+  const { awaitDeferredFence: awaitDeferredFence2 } = await import("./buffer-pool-B3lfcjyw.js");
+  await awaitDeferredFence2();
+  await resolveAndMapTimestamps(gpuTs.stagingSlots);
+}
+function nsToMs(ns) {
+  return Number(ns) / 1e6;
+}
+function nsToUs(ns) {
+  return Number(ns) / 1e3;
+}
+function printCpuStatsTable(title, stats) {
+  if (stats.size === 0) return;
+  const sorted = [...stats.entries()].sort((a, b) => b[1].totalMs - a[1].totalMs);
+  console.log(`${padR(title, 28)} ${padL("Count", 8)} ${padL("Total(ms)", 11)} ${padL("Avg(µs)", 10)} ${padL("Max(µs)", 10)}`);
+  console.log("─".repeat(69));
+  for (const [name, s] of sorted) {
+    const avgUs = s.totalMs / s.count * 1e3;
+    console.log(`${padR(name, 28)} ${padL(String(s.count), 8)} ${padL(s.totalMs.toFixed(1), 11)} ${padL(avgUs.toFixed(1), 10)} ${padL((s.maxMs * 1e3).toFixed(1), 10)}`);
+  }
+  console.log();
+}
+function printGpuKernelTimeStats() {
+  if (gpuTs.labelStats.size === 0) return;
+  const sorted = [...gpuTs.labelStats.entries()].sort((a, b) => nsToMs(b[1].totalNs) - nsToMs(a[1].totalNs));
+  console.log(`${padR("GPU Kernel Time", 28)} ${padL("Count", 8)} ${padL("Total(ms)", 11)} ${padL("Avg(µs)", 10)} ${padL("Max(µs)", 10)}`);
+  console.log("─".repeat(69));
+  for (const [name, s] of sorted) {
+    const totalMs = nsToMs(s.totalNs);
+    const avgUs = nsToUs(s.totalNs) / s.count;
+    const maxUs = nsToUs(s.maxNs);
+    console.log(`${padR(name, 28)} ${padL(String(s.count), 8)} ${padL(totalMs.toFixed(1), 11)} ${padL(avgUs.toFixed(1), 10)} ${padL(maxUs.toFixed(1), 10)}`);
+  }
+  console.log();
+}
+function printPhaseStats() {
+  if (cpuProfile.phaseStats.size === 0 && gpuTs.phaseStats.size === 0) return;
+  const allPhases = /* @__PURE__ */ new Set([...cpuProfile.phaseStats.keys(), ...gpuTs.phaseStats.keys()]);
+  console.log(`${padR("Phase", 16)} ${padL("Ops", 8)} ${padL("CPU(ms)", 10)} ${padL("GPU(ms)", 10)}`);
+  console.log("─".repeat(46));
+  for (const phase of allPhases) {
+    const cpu = cpuProfile.phaseStats.get(phase);
+    const gpu = gpuTs.phaseStats.get(phase);
+    const ops = cpu?.opCount ?? gpu?.opCount ?? 0;
+    const cpuMs = cpu?.totalMs ?? 0;
+    const gpuMs = gpu ? nsToMs(gpu.totalNs) : 0;
+    console.log(`${padR(phase, 16)} ${padL(String(ops), 8)} ${padL(cpuMs.toFixed(1), 10)} ${padL(gpuMs.toFixed(1), 10)}`);
+  }
+  console.log();
+}
+function printGpuOpsBreakdown(header, opsMap) {
+  const sorted = [...opsMap.entries()].sort((a, b) => nsToMs(b[1].totalNs) - nsToMs(a[1].totalNs));
+  console.log(header);
+  console.log(`${padR("  Kernel", 30)} ${padL("Count", 8)} ${padL("Total(ms)", 11)} ${padL("Avg(µs)", 10)}`);
+  for (const [op, s] of sorted) {
+    const totalMs = nsToMs(s.totalNs);
+    const avgUs = nsToUs(s.totalNs) / s.count;
+    console.log(`${padR("  " + op, 30)} ${padL(String(s.count), 8)} ${padL(totalMs.toFixed(1), 11)} ${padL(avgUs.toFixed(0), 10)}`);
+  }
+  console.log();
+}
+function printPerPhaseGpuBreakdown() {
+  if (gpuTs.phaseOpStats.size === 0) return;
+  console.log("=== Per-Phase GPU Breakdown ===\n");
+  for (const [phase, opsMap] of gpuTs.phaseOpStats) {
+    const gpuPhase = gpuTs.phaseStats.get(phase);
+    const phaseGpuMs = gpuPhase ? nsToMs(gpuPhase.totalNs) : 0;
+    printGpuOpsBreakdown(`--- ${phase} (${gpuPhase?.opCount ?? 0} dispatches, ${phaseGpuMs.toFixed(0)}ms GPU) ---`, opsMap);
+  }
+}
+function printPerModuleGpuStats() {
+  if (gpuTs.moduleStats.size === 0) return;
+  const totalGpuNs = [...gpuTs.moduleStats.values()].reduce((s, v) => s + v.totalNs, 0n);
+  const sortedModules = [...gpuTs.moduleStats.entries()].sort((a, b) => nsToMs(b[1].totalNs) - nsToMs(a[1].totalNs));
+  console.log("=== Per-Module GPU Breakdown ===\n");
+  console.log(`${padR("Module", 28)} ${padL("Dispatches", 11)} ${padL("GPU(ms)", 10)} ${padL("% GPU", 8)}`);
+  console.log("─".repeat(59));
+  for (const [mod, s] of sortedModules) {
+    const ms = nsToMs(s.totalNs);
+    const pct = totalGpuNs > 0n ? (Number(s.totalNs * 10000n / totalGpuNs) / 100).toFixed(1) : "0.0";
+    console.log(`${padR(mod, 28)} ${padL(String(s.opCount), 11)} ${padL(ms.toFixed(1), 10)} ${padL(pct + "%", 8)}`);
+  }
+  console.log();
+  console.log("=== Per-Module Kernel Detail ===\n");
+  for (const [mod, s] of sortedModules) {
+    const opsMap = gpuTs.moduleOpStats.get(mod);
+    if (!opsMap || opsMap.size === 0) continue;
+    const modMs = nsToMs(s.totalNs);
+    printGpuOpsBreakdown(`--- ${mod} (${s.opCount} dispatches, ${modMs.toFixed(0)}ms GPU) ---`, opsMap);
+  }
+}
+function printFusionFallbackStats() {
+  if (cpuProfile.fusionFallbackStats.size === 0) return;
+  const sorted = [...cpuProfile.fusionFallbackStats.entries()].sort((a, b) => b[1].count - a[1].count);
+  console.log("=== Fusion Fallback Reasons ===\n");
+  console.log(`${padR("Reason", 24)} ${padL("Count", 8)} ${padL("Nodes Lost", 12)}`);
+  console.log("─".repeat(46));
+  for (const [reason, s] of sorted) {
+    console.log(`${padR(reason, 24)} ${padL(String(s.count), 8)} ${padL(String(s.totalNodes), 12)}`);
+    for (const d of s.details) console.log(`    detail: ${JSON.stringify(d)}`);
+  }
+  console.log();
+}
+function printPlanAnalysis() {
+  if (cpuProfile.planAnalyses.length === 0) return;
+  console.log("=== Plan Analysis ===\n");
+  for (const pa of cpuProfile.planAnalyses) {
+    const fusionRate = pa.totalNodes > 0 ? (pa.fusedNodes / pa.totalNodes * 100).toFixed(1) : "0.0";
+    console.log(`Plan ${pa.planIndex}: ${pa.totalNodes} nodes (${pa.fusedNodes} fused/${pa.totalNodes - pa.fusedNodes} seq, ${pa.fusionGroups} groups, ${fusionRate}% fused)`);
+    if (pa.epilogueFusions > 0 || pa.reductionFusions > 0) console.log(`  Epilogue fusions: ${pa.epilogueFusions}, Reduction fusions: ${pa.reductionFusions}`);
+    const seqEntries = Object.entries(pa.sequentialOps).sort((a, b) => b[1] - a[1]);
+    if (seqEntries.length > 0) {
+      const top = seqEntries.slice(0, 10).map(([op, n]) => `${op}:${n}`).join(", ");
+      console.log(`  Top unfused ops: ${top}`);
+    }
+    const shapeEntries = Object.entries(pa.unfusedByShape).sort((a, b) => b[1].count - a[1].count);
+    if (shapeEntries.length > 0) {
+      console.log("  Unfused fusible by shape:");
+      for (const [shape, info] of shapeEntries.slice(0, 8)) {
+        const opsStr = Object.entries(info.ops).sort((a, b) => b[1] - a[1]).map(([op, n]) => `${op}:${n}`).join(", ");
+        console.log(`    [${shape}]: ${info.count} ops (${opsStr})`);
+      }
+    }
+    console.log();
+  }
+}
+function printProfileSummary(label) {
+  if (!PROFILING_ENABLED) return;
+  console.log(`
+=== Profiling (${label}) ===
+`);
+  printCpuStatsTable("CPU API Call", cpuProfile.apiStats);
+  printCpuStatsTable("CPU Op Type", cpuProfile.opStats);
+  printCpuStatsTable("CPU Sub-Op", cpuProfile.subOpStats);
+  printGpuKernelTimeStats();
+  printPhaseStats();
+  printPerPhaseGpuBreakdown();
+  printPerModuleGpuStats();
+  printFusionFallbackStats();
+  printPlanAnalysis();
+  const jsonPath = typeof process !== "undefined" ? define_process_env_default$2?.TORCHLETTE_PROFILE_JSON : void 0;
+  if (jsonPath) writeProfileJSON(jsonPath);
+}
+function getProfileJSON() {
+  const phases = {};
+  const allPhases = /* @__PURE__ */ new Set([
+    ...cpuProfile.phaseStats.keys(),
+    ...gpuTs.phaseStats.keys(),
+    ...gpuTs.phaseOpStats.keys()
+  ]);
+  for (const phase of allPhases) {
+    const cpu = cpuProfile.phaseStats.get(phase);
+    const gpu = gpuTs.phaseStats.get(phase);
+    const kernels = {};
+    const phaseOps = gpuTs.phaseOpStats.get(phase);
+    if (phaseOps) for (const [op, s] of phaseOps) kernels[op] = {
+      count: s.count,
+      gpu_ms: nsToMs(s.totalNs),
+      avg_us: nsToUs(s.totalNs) / s.count,
+      max_us: nsToUs(s.maxNs)
+    };
+    phases[phase] = {
+      cpu_ms: cpu?.totalMs ?? 0,
+      gpu_ms: gpu ? nsToMs(gpu.totalNs) : 0,
+      dispatch_count: gpu?.opCount ?? 0,
+      kernels
+    };
+  }
+  const gpu_totals = {};
+  for (const [op, s] of gpuTs.labelStats) gpu_totals[op] = {
+    count: s.count,
+    gpu_ms: nsToMs(s.totalNs),
+    avg_us: nsToUs(s.totalNs) / s.count,
+    max_us: nsToUs(s.maxNs)
+  };
+  let totalGpuMs = 0;
+  let totalDispatches = 0;
+  for (const [, s] of gpuTs.phaseStats) {
+    totalGpuMs += nsToMs(s.totalNs);
+    totalDispatches += s.opCount;
+  }
+  let totalNodes = 0;
+  let totalFused = 0;
+  for (const pa of cpuProfile.planAnalyses) {
+    totalNodes += pa.totalNodes;
+    totalFused += pa.fusedNodes;
+  }
+  const fusionRate = totalNodes > 0 ? totalFused / totalNodes : 0;
+  const bottlenecks = [];
+  for (const [phase, opsMap] of gpuTs.phaseOpStats) for (const [op, s] of opsMap) bottlenecks.push({
+    phase,
+    op,
+    gpu_ms: nsToMs(s.totalNs)
+  });
+  bottlenecks.sort((a, b) => b.gpu_ms - a.gpu_ms);
+  const topBottlenecks = bottlenecks.slice(0, 5).map((b) => `${b.phase}/${b.op} (${b.gpu_ms.toFixed(1)}ms)`);
+  const modules = {};
+  for (const [mod, s] of gpuTs.moduleStats) {
+    const kernels = {};
+    const modOps = gpuTs.moduleOpStats.get(mod);
+    if (modOps) for (const [op, os] of modOps) kernels[op] = {
+      count: os.count,
+      gpu_ms: nsToMs(os.totalNs),
+      avg_us: nsToUs(os.totalNs) / os.count
+    };
+    modules[mod] = {
+      gpu_ms: nsToMs(s.totalNs),
+      dispatch_count: s.opCount,
+      kernels
+    };
+  }
+  return {
+    phases,
+    modules,
+    plans: cpuProfile.planAnalyses,
+    gpu_totals,
+    summary: {
+      total_gpu_ms: totalGpuMs,
+      total_dispatches: totalDispatches,
+      fusion_rate: fusionRate,
+      top_bottlenecks: topBottlenecks
+    }
+  };
+}
+async function writeProfileJSON(filePath) {
+  if (!PROFILING_ENABLED) return;
+  try {
+    const fs = await import("node:fs");
+    const json = getProfileJSON();
+    fs.writeFileSync(filePath, JSON.stringify(json, null, 2));
+    console.log(`Profile JSON written to ${filePath}`);
+  } catch (e) {
+    console.warn(`[profiler] Failed to write profile JSON to ${filePath}:`, e);
+  }
+}
+function resetProfileStats() {
+  if (!PROFILING_ENABLED) return;
+  resetCpuProfileState();
+  resetGpuTimestampState();
+}
+var PROFILING_ENABLED, cpuProfile, GPU_MAX_PASSES, gpuTs, padR, padL;
+var init_profiler$1 = __esmMin((() => {
+  PROFILING_ENABLED = typeof process !== "undefined" && !!define_process_env_default$2?.TORCHLETTE_PROFILE;
+  cpuProfile = {
+    apiStats: /* @__PURE__ */ new Map(),
+    opStats: /* @__PURE__ */ new Map(),
+    subOpStats: /* @__PURE__ */ new Map(),
+    currentPhase: "unknown",
+    phaseStats: /* @__PURE__ */ new Map(),
+    currentModule: "unknown",
+    planAnalyses: [],
+    fusionFallbackStats: /* @__PURE__ */ new Map()
+  };
+  GPU_MAX_PASSES = 2048;
+  gpuTs = {
+    querySet: null,
+    resolveBuffer: null,
+    readbackBuffer: null,
+    passRecords: [],
+    nextSlot: 0,
+    stagingBuffer: null,
+    stagingSlots: 0,
+    maxSlots: GPU_MAX_PASSES * 2,
+    supported: false,
+    enabled: true,
+    device: null,
+    labelStats: /* @__PURE__ */ new Map(),
+    phaseStats: /* @__PURE__ */ new Map(),
+    phaseOpStats: /* @__PURE__ */ new Map(),
+    moduleStats: /* @__PURE__ */ new Map(),
+    moduleOpStats: /* @__PURE__ */ new Map()
+  };
+  padR = (s, n) => s.padEnd(n);
+  padL = (s, n) => s.padStart(n);
+}));
+function getSizeClass(sizeBytes) {
+  const size = Math.max(sizeBytes, MIN_BUFFER_SIZE);
+  return Math.ceil(Math.log2(size));
+}
+function getSizeForClass(sizeClass) {
+  return 2 ** sizeClass;
+}
+function analyzeLifetimes(nodeOrder, nodeInputs, nodeOutputs, nodeSizes) {
+  const lifetimes = /* @__PURE__ */ new Map();
+  const stepIndex = /* @__PURE__ */ new Map();
+  nodeOrder.forEach((nodeId, idx) => {
+    stepIndex.set(nodeId, idx);
+  });
+  for (const nodeId of nodeOrder) {
+    const step2 = stepIndex.get(nodeId);
+    lifetimes.set(nodeId, {
+      nodeId,
+      firstUse: step2,
+      lastUse: step2,
+      isOutput: nodeOutputs.has(nodeId),
+      isInput: !nodeInputs.has(nodeId) || nodeInputs.get(nodeId)?.length === 0,
+      bufferSize: nodeSizes.get(nodeId) ?? 0
+    });
+  }
+  for (const [nodeId, inputs] of nodeInputs) {
+    const nodeStep = stepIndex.get(nodeId);
+    for (const inputId of inputs) {
+      const lifetime = lifetimes.get(inputId);
+      if (lifetime && nodeStep > lifetime.lastUse) lifetime.lastUse = nodeStep;
+    }
+  }
+  const lastStep = nodeOrder.length - 1;
+  for (const outputId of nodeOutputs) {
+    const lifetime = lifetimes.get(outputId);
+    if (lifetime) lifetime.lastUse = lastStep;
+  }
+  return lifetimes;
+}
+function findDeadTensorsAtStep(lifetimes, currentStep, outputNodeIds, alreadyReleased) {
+  const dead = [];
+  for (const [nodeId, lifetime] of lifetimes) {
+    if (outputNodeIds.has(nodeId)) continue;
+    if (alreadyReleased.has(nodeId)) continue;
+    if (lifetime.lastUse < currentStep) dead.push(nodeId);
+  }
+  return dead;
+}
+var MIN_BUFFER_SIZE;
+var init_lifetime_analysis = __esmMin((() => {
+  MIN_BUFFER_SIZE = 256;
+}));
+function sizeOf(shape) {
+  return shape.reduce((acc, dim) => acc * dim, 1);
+}
+function broadcastShapes(a, b) {
+  const outRank = Math.max(a.length, b.length);
+  const out = new Array(outRank);
+  for (let i = 0; i < outRank; i += 1) {
+    const aDim = a[a.length - 1 - i] ?? 1;
+    const bDim = b[b.length - 1 - i] ?? 1;
+    if (aDim !== bDim && aDim !== 1 && bDim !== 1) throw new Error(`Cannot broadcast shapes [${a}] and [${b}]`);
+    out[outRank - 1 - i] = Math.max(aDim, bDim);
+  }
+  return out;
+}
+function shapesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
+}
+function broadcastThreeShapes(a, b, c) {
+  const outRank = Math.max(a.length, b.length, c.length);
+  const out = new Array(outRank);
+  for (let i = 0; i < outRank; i++) {
+    const aDim = a[a.length - 1 - i] ?? 1;
+    const bDim = b[b.length - 1 - i] ?? 1;
+    const cDim = c[c.length - 1 - i] ?? 1;
+    if (aDim !== bDim && aDim !== 1 && bDim !== 1) throw new Error(`Cannot broadcast shapes [${a}], [${b}], and [${c}]`);
+    if (aDim !== cDim && aDim !== 1 && cDim !== 1) throw new Error(`Cannot broadcast shapes [${a}], [${b}], and [${c}]`);
+    if (bDim !== cDim && bDim !== 1 && cDim !== 1) throw new Error(`Cannot broadcast shapes [${a}], [${b}], and [${c}]`);
+    out[outRank - 1 - i] = Math.max(aDim, bDim, cDim);
+  }
+  return out;
+}
+function checkContiguous(shape, strides) {
+  if (shape.length !== strides.length) return false;
+  const expected = contiguousStrides(shape);
+  for (let i = 0; i < shape.length; i++) {
+    if (shape[i] <= 1) continue;
+    if (strides[i] !== expected[i]) return false;
+  }
+  return true;
+}
+function contiguousStrides(shape) {
+  if (shape.length === 0) return [];
+  const strides = new Array(shape.length);
+  let stride = 1;
+  for (let i = shape.length - 1; i >= 0; i--) {
+    strides[i] = stride;
+    stride *= shape[i];
+  }
+  return strides;
+}
+function inferReshapeStrides(oldShape, oldStrides, newShape) {
+  if (newShape.length === 0) return [];
+  if (oldShape.length === 0) return contiguousStrides(newShape);
+  const newStrides = new Array(newShape.length);
+  let oldIdx = 0;
+  let newIdx = 0;
+  const oldN = oldShape.length;
+  const newN = newShape.length;
+  while (newIdx < newN) {
+    if (newShape[newIdx] === 1) {
+      newStrides[newIdx] = newIdx + 1 < newN ? newStrides[newIdx + 1] || 1 : 1;
+      newIdx++;
+      continue;
+    }
+    while (oldIdx < oldN && oldShape[oldIdx] === 1) oldIdx++;
+    if (oldIdx >= oldN) return null;
+    let oldProduct = oldShape[oldIdx];
+    let newProduct = newShape[newIdx];
+    while (oldProduct < newProduct && oldIdx + 1 < oldN) {
+      if (oldStrides[oldIdx] !== oldStrides[oldIdx + 1] * oldShape[oldIdx + 1]) return null;
+      oldIdx++;
+      if (oldShape[oldIdx] === 1) continue;
+      oldProduct *= oldShape[oldIdx];
+    }
+    const newGroupStart = newIdx;
+    while (newProduct < oldProduct && newIdx + 1 < newN) {
+      newIdx++;
+      if (newShape[newIdx] === 1) {
+        newStrides[newIdx] = 1;
+        continue;
+      }
+      newProduct *= newShape[newIdx];
+    }
+    if (oldProduct !== newProduct) return null;
+    let stride = oldStrides[oldIdx];
+    for (let i = newIdx; i >= newGroupStart; i--) {
+      if (newShape[i] === 1) {
+        newStrides[i] = stride;
+        continue;
+      }
+      newStrides[i] = stride;
+      stride *= newShape[i];
+    }
+    oldIdx++;
+    newIdx++;
+  }
+  while (oldIdx < oldN) {
+    if (oldShape[oldIdx] !== 1) return null;
+    oldIdx++;
+  }
+  return newStrides;
+}
+var init_shape = __esmMin((() => {
+}));
+function asGPUTensor(tensor) {
+  return tensor;
+}
+function gpuBuffer(tensor) {
+  return asGPUTensor(tensor).buffer;
+}
+var GPUBufferUsage, GPUMapMode;
+var init_gpu_types = __esmMin((() => {
+  GPUBufferUsage = {
+    MAP_READ: 1,
+    COPY_SRC: 4,
+    COPY_DST: 8,
+    UNIFORM: 64,
+    STORAGE: 128
+  };
+  GPUMapMode = { READ: 1 };
+}));
+function formatBytes(bytes) {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)}GB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)}MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(2)}KB`;
+  return `${bytes}B`;
+}
+function setGPUMemoryLimit(limitBytes) {
+  gpuMemoryTracker.setMemoryLimit(limitBytes);
+}
+function getGPUMemoryLimit() {
+  return gpuMemoryTracker.getMemoryLimit();
+}
+function getGPUMemoryStats() {
+  return gpuMemoryTracker.stats();
+}
+function getGPUAllocationHistogram() {
+  return gpuMemoryTracker.getAllocationSizeHistogram();
+}
+function enableAllAllocDebug() {
+  gpuMemoryTracker.enableAllAllocDebug();
+}
+function setAllocStep(step2) {
+  gpuMemoryTracker.setAllocStep(step2);
+}
+function snapshotLeakedAllocs(step2) {
+  return gpuMemoryTracker.snapshotLeakedAllocs(step2);
+}
+function getLeakedAllocCount() {
+  return gpuMemoryTracker.getLeakedAllocCount();
+}
+function getLeakedAllocCountForStep(step2) {
+  return gpuMemoryTracker.getLeakedAllocCountForStep(step2);
+}
+function getAndResetFlowCounters() {
+  return gpuMemoryTracker.getAndResetFlowCounters();
+}
+var DEFAULT_MEMORY_LIMIT_BYTES, GPUMemoryLimitExceededError, GPUMemoryTracker, gpuMemoryTracker;
+var init_memory_tracker = __esmMin((() => {
+  DEFAULT_MEMORY_LIMIT_BYTES = 32 * 1024 * 1024 * 1024;
+  GPUMemoryLimitExceededError = class extends Error {
+    constructor(requestedBytes, currentBytes, limitBytes) {
+      super(`GPU memory limit exceeded: requested ${formatBytes(requestedBytes)}, current usage ${formatBytes(currentBytes)}, limit ${formatBytes(limitBytes)}`);
+      this.requestedBytes = requestedBytes;
+      this.currentBytes = currentBytes;
+      this.limitBytes = limitBytes;
+      this.name = "GPUMemoryLimitExceededError";
+    }
+  };
+  GPUMemoryTracker = class {
+    memoryLimitBytes = DEFAULT_MEMORY_LIMIT_BYTES;
+    currentAllocatedBytes = 0;
+    bufferSizes = /* @__PURE__ */ new Map();
+    allocationCount = 0;
+    peakUsageBytes = 0;
+    /**
+    * Get the current memory limit in bytes.
+    */
+    getMemoryLimit() {
+      return this.memoryLimitBytes;
+    }
+    /**
+    * Set the memory limit in bytes.
+    */
+    setMemoryLimit(limitBytes) {
+      if (limitBytes <= 0) throw new Error("Memory limit must be positive");
+      this.memoryLimitBytes = limitBytes;
+    }
+    /**
+    * Get the current total allocated memory in bytes.
+    */
+    getCurrentAllocatedBytes() {
+      return this.currentAllocatedBytes;
+    }
+    /**
+    * Get the peak memory usage in bytes.
+    */
+    getPeakUsageBytes() {
+      return this.peakUsageBytes;
+    }
+    /**
+    * Get memory usage as a percentage of the limit.
+    */
+    getUsagePercent() {
+      return this.currentAllocatedBytes / this.memoryLimitBytes * 100;
+    }
+    /**
+    * Get the number of active allocations.
+    */
+    getAllocationCount() {
+      return this.allocationCount;
+    }
+    /**
+    * Track a buffer allocation.
+    * @throws GPUMemoryLimitExceededError if allocation would exceed the limit
+    */
+    _debugAllAllocEnabled = false;
+    _allocStacks = /* @__PURE__ */ new Map();
+    _currentStep = 0;
+    _debugAllocCount = 0;
+    _debugDeallocCount = 0;
+    _debugDeallocMissCount = 0;
+    _debugDoubleTrackCount = 0;
+    enableAllAllocDebug() {
+      this._debugAllAllocEnabled = true;
+    }
+    setAllocStep(step2) {
+      this._currentStep = step2;
+    }
+    /**
+    * Snapshot unmatched allocations grouped by call site.
+    * If step is specified, only includes allocations from that step.
+    */
+    snapshotLeakedAllocs(step2) {
+      const grouped = /* @__PURE__ */ new Map();
+      for (const [, info] of this._allocStacks) {
+        if (step2 !== void 0 && info.step !== step2) continue;
+        const key = info.stack.split("\n").slice(0, 3).join("\n");
+        const existing = grouped.get(key) || {
+          count: 0,
+          totalBytes: 0,
+          exampleStack: info.stack
+        };
+        existing.count++;
+        existing.totalBytes += info.size;
+        grouped.set(key, existing);
+      }
+      return grouped;
+    }
+    /**
+    * Count unmatched allocations from a specific step.
+    */
+    getLeakedAllocCountForStep(step2) {
+      let count = 0;
+      for (const [, info] of this._allocStacks) if (info.step === step2) count++;
+      return count;
+    }
+    /**
+    * Get the number of tracked-but-not-deallocated allocations.
+    */
+    getLeakedAllocCount() {
+      return this._allocStacks.size;
+    }
+    /**
+    * Get the actual buffer objects tracked in bufferSizes (for cross-referencing).
+    */
+    getTrackedBuffers() {
+      return new Set(this.bufferSizes.keys());
+    }
+    /**
+    * Get size histogram of leaked allocations for a specific step.
+    */
+    getLeakedSizeHistogramForStep(step2) {
+      const histogram = /* @__PURE__ */ new Map();
+      for (const [, info] of this._allocStacks) {
+        if (info.step !== step2) continue;
+        const count = histogram.get(info.size) || 0;
+        histogram.set(info.size, count + 1);
+      }
+      return histogram;
+    }
+    /**
+    * Get and reset per-step allocation/deallocation flow counters.
+    */
+    getAndResetFlowCounters() {
+      const result = {
+        allocs: this._debugAllocCount,
+        deallocs: this._debugDeallocCount,
+        deallocMisses: this._debugDeallocMissCount,
+        doubleTracked: this._debugDoubleTrackCount
+      };
+      this._debugAllocCount = 0;
+      this._debugDeallocCount = 0;
+      this._debugDeallocMissCount = 0;
+      this._debugDoubleTrackCount = 0;
+      return result;
+    }
+    /**
+    * Scoped limit-check suppression. When > 0, trackAllocation skips
+    * the limit check (behaves like trackAllocationForced).
+    * Used by the optimizer where temporary 2x peak memory is expected.
+    */
+    _suppressLimitCheckDepth = 0;
+    suppressLimitCheck() {
+      this._suppressLimitCheckDepth++;
+    }
+    unsuppressLimitCheck() {
+      this._suppressLimitCheckDepth = Math.max(0, this._suppressLimitCheckDepth - 1);
+    }
+    trackAllocation(buffer, sizeBytes) {
+      if (this._suppressLimitCheckDepth === 0 && this.currentAllocatedBytes + sizeBytes > this.memoryLimitBytes) throw new GPUMemoryLimitExceededError(sizeBytes, this.currentAllocatedBytes, this.memoryLimitBytes);
+      this._trackAllocationInner(buffer, sizeBytes);
+    }
+    /**
+    * Track allocation without throwing on limit exceeded.
+    * Used by the optimizer where old buffers haven't been released yet
+    * but will be shortly after (temporary peak is expected and safe).
+    */
+    trackAllocationForced(buffer, sizeBytes) {
+      this._trackAllocationInner(buffer, sizeBytes);
+    }
+    _trackAllocationInner(buffer, sizeBytes) {
+      if (this._debugAllAllocEnabled && buffer !== null && this.bufferSizes.has(buffer)) this._debugDoubleTrackCount++;
+      this.bufferSizes.set(buffer, sizeBytes);
+      this.currentAllocatedBytes += sizeBytes;
+      this.allocationCount++;
+      if (this._debugAllAllocEnabled && buffer !== null) {
+        const stack = (/* @__PURE__ */ new Error()).stack?.split("\n").slice(1, 15).join("\n") ?? "no stack";
+        this._allocStacks.set(buffer, {
+          size: sizeBytes,
+          stack,
+          timestamp: Date.now(),
+          step: this._currentStep
+        });
+      }
+      if (this.currentAllocatedBytes > this.peakUsageBytes) this.peakUsageBytes = this.currentAllocatedBytes;
+      if (this._debugAllAllocEnabled) this._debugAllocCount++;
+    }
+    /**
+    * Track a buffer deallocation.
+    */
+    trackDeallocation(buffer) {
+      const size = this.bufferSizes.get(buffer);
+      if (size !== void 0) {
+        this.currentAllocatedBytes -= size;
+        this.bufferSizes.delete(buffer);
+        this.allocationCount--;
+      }
+      if (this._debugAllAllocEnabled) {
+        this._allocStacks.delete(buffer);
+        this._debugDeallocCount++;
+        if (size === void 0) this._debugDeallocMissCount++;
+      }
+    }
+    /**
+    * Check if an allocation of the given size would exceed the limit.
+    * @param freeableBytes - Bytes that can be freed if needed (e.g., pending buffers)
+    */
+    wouldExceedLimit(sizeBytes, freeableBytes = 0) {
+      return this.currentAllocatedBytes - freeableBytes + sizeBytes > this.memoryLimitBytes;
+    }
+    /**
+    * Get statistics about memory usage.
+    */
+    stats() {
+      return {
+        currentBytes: this.currentAllocatedBytes,
+        peakBytes: this.peakUsageBytes,
+        limitBytes: this.memoryLimitBytes,
+        usagePercent: this.getUsagePercent(),
+        allocationCount: this.allocationCount,
+        bufferSizesCount: this.bufferSizes.size,
+        availableBytes: this.memoryLimitBytes - this.currentAllocatedBytes
+      };
+    }
+    /**
+    * Reset all tracking state (for testing).
+    */
+    reset() {
+      this.currentAllocatedBytes = 0;
+      this.bufferSizes.clear();
+      this.allocationCount = 0;
+      this.peakUsageBytes = 0;
+    }
+    /**
+    * Get a histogram of allocation sizes for diagnostics.
+    * Returns a map of size bucket labels to counts.
+    */
+    getAllocationSizeHistogram() {
+      const buckets = /* @__PURE__ */ new Map();
+      for (const [, size] of this.bufferSizes) {
+        let label;
+        if (size <= 256) label = "<=256B";
+        else if (size <= 1024) label = "<=1KB";
+        else if (size <= 4096) label = "<=4KB";
+        else if (size <= 16384) label = "<=16KB";
+        else if (size <= 65536) label = "<=64KB";
+        else if (size <= 262144) label = "<=256KB";
+        else if (size <= 1048576) label = "<=1MB";
+        else if (size <= 4194304) label = "<=4MB";
+        else if (size <= 16777216) label = "<=16MB";
+        else label = ">16MB";
+        const existing = buckets.get(label) || {
+          count: 0,
+          totalBytes: 0
+        };
+        existing.count++;
+        existing.totalBytes += size;
+        buckets.set(label, existing);
+      }
+      return buckets;
+    }
+  };
+  gpuMemoryTracker = new GPUMemoryTracker();
+}));
+function gcd$1(a, b) {
+  while (b !== 0) {
+    const t = b;
+    b = a % b;
+    a = t;
+  }
+  return a;
+}
+function lcm(a, b) {
+  return a * b / gcd$1(a, b);
+}
+function alignedChunkSize(bytesPerUnit, maxUnits, minAlignment) {
+  const unitAlignment = minAlignment / gcd$1(bytesPerUnit, minAlignment);
+  return Math.max(unitAlignment, Math.floor(maxUnits / unitAlignment) * unitAlignment);
+}
+function toIndexShape(shape) {
+  return shape.length === 0 ? [1] : shape;
+}
+function computeEffectiveBroadcastStrides(tensor, outShape) {
+  const shape = tensor.shape;
+  const strides = tensor.strides;
+  if (shape.length > outShape.length) throw new Error("webgpu broadcast target has fewer dimensions than input");
+  const pad = outShape.length - shape.length;
+  const outStrides = new Array(outShape.length);
+  for (let axis = 0; axis < outShape.length; axis += 1) {
+    const inAxis = axis - pad;
+    if (inAxis < 0) {
+      outStrides[axis] = 0;
+      continue;
+    }
+    const inDim = shape[inAxis];
+    if (inDim === outShape[axis]) outStrides[axis] = strides[inAxis];
+    else if (inDim === 1) outStrides[axis] = 0;
+    else throw new Error("webgpu broadcast target shape is incompatible");
+  }
+  return outStrides;
+}
+function dtypeBytes(dtype) {
+  return DTYPE_BYTES[dtype] ?? 4;
+}
+function alignBufferSize(bytes) {
+  return Math.ceil(bytes / 4) * 4;
+}
+function compute2DDispatch(totalWorkgroups) {
+  if (totalWorkgroups <= 65535) return {
+    x: totalWorkgroups,
+    y: 1,
+    gridSizeX: totalWorkgroups
+  };
+  const x = MAX_WORKGROUPS_PER_DIM;
+  return {
+    x,
+    y: Math.ceil(totalWorkgroups / MAX_WORKGROUPS_PER_DIM),
+    gridSizeX: x
+  };
+}
+var MAX_WORKGROUPS_PER_DIM, F32_NEG_MAX, F32_POS_MAX, F32_ONE_BITS, DTYPE_BYTES;
+var init_shape_utils = __esmMin((() => {
+  init_shape();
+  MAX_WORKGROUPS_PER_DIM = 65535;
+  F32_NEG_MAX = -3402823e32;
+  F32_POS_MAX = 3402823e32;
+  F32_ONE_BITS = 1065353216;
+  DTYPE_BYTES = {
+    f16: 2,
+    f32: 4,
+    i32: 4,
+    u32: 4,
+    bool: 1
+  };
+}));
+function getBufferPoolStats() {
+  return bufferPool.stats();
+}
+function clearBufferPool() {
+  bufferPool.clear();
+}
+function flushBufferPool() {
+  bufferPool.flushPendingToAvailable();
+  bufferPool.sortPoolBuckets();
+  bufferPool.beginWindow();
+}
+function destroyCopy(tensor) {
+  const bytes = tensor.size * dtypeBytes(tensor.dtype);
+  bufferPool.decRef(tensor.buffer);
+  bufferPool.deferredDestroy(tensor.buffer, bytes);
+}
+function issueDeferredFence() {
+  const ctx = gpuContext;
+  if (!ctx) return;
+  if (isProfilingEnabled()) {
+    if (!fenceState.profilingFenceBuffer) fenceState.profilingFenceBuffer = ctx.device.createBuffer({
+      size: 4,
+      usage: 9
+    });
+    ctx.queue.writeBuffer(fenceState.profilingFenceBuffer, 0, profilingFenceData);
+    fenceState.pendingFencePromise = fenceState.profilingFenceBuffer.mapAsync(1).then(() => {
+      fenceState.profilingFenceBuffer?.unmap();
+    });
+    fenceState.deferredPendingRelease = true;
+    return;
+  }
+  if (typeof ctx.queue.onSubmittedWorkDone !== "function") return;
+  fenceState.pendingFencePromise = ctx.queue.onSubmittedWorkDone();
+  fenceState.deferredPendingRelease = true;
+}
+async function awaitDeferredFence() {
+  if (fenceState.pendingFencePromise) {
+    await fenceState.pendingFencePromise;
+    fenceState.pendingFencePromise = null;
+  }
+  if (fenceState.deferredPendingRelease) {
+    bufferPool.flushPendingToPool();
+    bufferPool.destroyPendingBuffers();
+    fenceState.deferredPendingRelease = false;
+  }
+}
+function getBufferPoolDetailedStats() {
+  return bufferPool.getDetailedStats();
+}
+function resetBufferPoolDetailedStats() {
+  bufferPool.resetDetailedStats();
+}
+function deferredDestroyBuffer(buffer, size) {
+  bufferPool.deferredDestroy(buffer, size);
+}
+function destroyProfilingFenceBuffer() {
+  if (fenceState.profilingFenceBuffer) {
+    fenceState.profilingFenceBuffer.destroy();
+    fenceState.profilingFenceBuffer = null;
+  }
+}
+var SimpleBufferPool, bufferPool, fenceState, profilingFenceData;
+var init_buffer_pool = __esmMin((() => {
+  init_lifetime_analysis();
+  init_gpu_types();
+  init_memory_tracker();
+  init_profiler$1();
+  init_shape_utils();
+  init_webgpu_state();
+  SimpleBufferPool = class {
+    pool = /* @__PURE__ */ new Map();
+    pooledBytes = 0;
+    pooledBufferSet = /* @__PURE__ */ new Set();
+    reuseCount = 0;
+    allocCount = 0;
+    enabled = true;
+    debugTrace = false;
+    newAllocsByClass = /* @__PURE__ */ new Map();
+    nextBufferPoolId = 1;
+    bufferPoolIdMap = /* @__PURE__ */ new WeakMap();
+    windowTracking = false;
+    currentWindowId = 0;
+    windowDemand = [];
+    reservation = null;
+    maxPoolBytes = Infinity;
+    pendingRelease = [];
+    pendingReleaseBytes = 0;
+    bufferLiveCount = /* @__PURE__ */ new Map();
+    acquireFromPool = 0;
+    acquireFromPending = 0;
+    acquireNew = 0;
+    releaseToPool = 0;
+    releaseToDestroy = 0;
+    getDetailedStats() {
+      return {
+        acquireFromPool: this.acquireFromPool,
+        acquireFromPending: this.acquireFromPending,
+        acquireNew: this.acquireNew,
+        releaseToPool: this.releaseToPool,
+        releaseToDestroy: this.releaseToDestroy,
+        pendingReleaseCount: this.pendingRelease.length,
+        pendingReleaseBytes: this.pendingReleaseBytes
+      };
+    }
+    resetDetailedStats() {
+      this.acquireFromPool = 0;
+      this.acquireFromPending = 0;
+      this.acquireNew = 0;
+      this.releaseToPool = 0;
+      this.releaseToDestroy = 0;
+    }
+    /** Get or create a pool bucket for a size class. */
+    getBucket(sizeClass) {
+      let bucket = this.pool.get(sizeClass);
+      if (!bucket) {
+        bucket = [];
+        this.pool.set(sizeClass, bucket);
+      }
+      return bucket;
+    }
+    /** Increment reference count for a buffer (called when an owning tensor is created). */
+    incRef(buffer) {
+      this.bufferLiveCount.set(buffer, (this.bufferLiveCount.get(buffer) ?? 0) + 1);
+    }
+    /** Decrement reference count for a buffer (called when an owning tensor is destroyed or ownership transferred). */
+    decRef(buffer) {
+      const c = this.bufferLiveCount.get(buffer);
+      if (c === void 0) return;
+      if (c <= 1) this.bufferLiveCount.delete(buffer);
+      else this.bufferLiveCount.set(buffer, c - 1);
+    }
+    /** Check if a buffer is still referenced by any owning tensor. */
+    isLive(buffer) {
+      return this.bufferLiveCount.has(buffer);
+    }
+    /**
+    * Try to acquire a storage buffer from the pool, or return null if none available.
+    * Only returns buffers with STORAGE | COPY_SRC | COPY_DST usage.
+    *
+    * Checks both the main pool AND pendingRelease queue. Buffers in pendingRelease
+    * are safe to reuse within the same execution because WebGPU guarantees
+    * submission-order execution - writes to reused buffers happen after reads.
+    */
+    /**
+    * Try to acquire a specific preferred buffer from the pool.
+    * Returns the preferred buffer if found and not in writeSet, else null.
+    * Used by resolveOutputBuffer to stabilize buffer assignments across steps,
+    * enabling bind group cache hits.
+    */
+    acquirePreferred(sizeBytes, preferred) {
+      if (!this.enabled) return null;
+      const sizeClass = getSizeClass(sizeBytes);
+      const pooledBuffers = this.pool.get(sizeClass);
+      if (!pooledBuffers) return null;
+      const idx = pooledBuffers.indexOf(preferred);
+      if (idx === -1) return null;
+      pooledBuffers.splice(idx, 1);
+      const actualSize = getSizeForClass(sizeClass);
+      this.pooledBytes -= actualSize;
+      this.reuseCount++;
+      this.acquireFromPool++;
+      this.recordWindowDemand(sizeClass, "acquires");
+      this.pooledBufferSet.add(preferred);
+      gpuMemoryTracker.trackAllocation(preferred, actualSize);
+      return preferred;
+    }
+    /**
+    * Sort each pool bucket by stable buffer ID for deterministic acquire order.
+    * Call at step start and after each flush to ensure the same set of buffers
+    * yields the same LIFO order for bind group cache stability.
+    */
+    sortPoolBuckets() {
+      const idMap = this.bufferPoolIdMap;
+      for (const bucket of this.pool.values()) if (bucket.length > 1) bucket.sort((a, b) => (idMap.get(a) ?? 0) - (idMap.get(b) ?? 0));
+    }
+    acquire(sizeBytes) {
+      if (!this.enabled) return null;
+      const sizeClass = getSizeClass(sizeBytes);
+      const pooledBuffers = this.pool.get(sizeClass);
+      if (pooledBuffers && pooledBuffers.length > 0) {
+        const buffer = pooledBuffers.pop();
+        const actualSize = getSizeForClass(sizeClass);
+        this.pooledBytes -= actualSize;
+        this.reuseCount++;
+        this.acquireFromPool++;
+        this.recordWindowDemand(sizeClass, "acquires");
+        this.pooledBufferSet.add(buffer);
+        gpuMemoryTracker.trackAllocation(buffer, actualSize);
+        if (this.debugTrace) console.log(`[pool] acquire from POOL: ${(actualSize / 1e6).toFixed(2)} MB`);
+        return buffer;
+      }
+      if (!activeBatch && !fenceState.pendingFencePromise && !sharedEncoderActive) {
+        const pendingIdx = this.pendingRelease.findIndex((p) => p.sizeClass === sizeClass && !this.bufferLiveCount.has(p.buffer));
+        if (pendingIdx !== -1) {
+          const { buffer, size } = this.pendingRelease.splice(pendingIdx, 1)[0];
+          this.pendingReleaseBytes -= size;
+          this.reuseCount++;
+          this.acquireFromPending++;
+          this.recordWindowDemand(sizeClass, "acquires");
+          this.pooledBufferSet.add(buffer);
+          gpuMemoryTracker.trackAllocation(buffer, size);
+          if (this.debugTrace) console.log(`[pool] acquire from PENDING: ${(size / 1e6).toFixed(2)} MB (${this.pendingRelease.length} remaining)`);
+          return buffer;
+        }
+      }
+      return null;
+    }
+    /**
+    * Called when a new buffer is allocated (not from pool).
+    */
+    trackNewAllocation(sizeBytes) {
+      this.acquireNew++;
+      const sc = getSizeClass(sizeBytes);
+      this.newAllocsByClass.set(sc, (this.newAllocsByClass.get(sc) ?? 0) + 1);
+      this.recordWindowDemand(sc, "acquires");
+      if (this.debugTrace) console.log(`[pool] NEW allocation: ${(sizeBytes / 1e6).toFixed(2)} MB`);
+    }
+    /** Start recording window demand for this step. */
+    beginWindowTracking() {
+      this.windowTracking = true;
+      this.currentWindowId = 0;
+      this.windowDemand = [/* @__PURE__ */ new Map()];
+    }
+    /** Advance to the next reclaim window. Call at each flushBufferPool boundary. */
+    beginWindow() {
+      if (!this.windowTracking) return;
+      this.currentWindowId++;
+      while (this.windowDemand.length <= this.currentWindowId) this.windowDemand.push(/* @__PURE__ */ new Map());
+    }
+    /** Stop recording and compute reservation for next step. */
+    endWindowTracking() {
+      if (!this.windowTracking) return;
+      this.windowTracking = false;
+      this.computeReservation();
+    }
+    recordWindowDemand(sizeClass, field) {
+      if (!this.windowTracking) return;
+      const wm = this.windowDemand[this.currentWindowId];
+      if (!wm) return;
+      const e = wm.get(sizeClass) ?? {
+        acquires: 0,
+        releases: 0
+      };
+      e[field]++;
+      wm.set(sizeClass, e);
+    }
+    computeReservation() {
+      const allSc = /* @__PURE__ */ new Set();
+      for (const wm of this.windowDemand) for (const sc of wm.keys()) allSc.add(sc);
+      const reservation = /* @__PURE__ */ new Map();
+      for (const sc of allSc) {
+        let cumAcq = 0, cumRel = 0, maxDeficit = 0;
+        for (let w = 0; w < this.windowDemand.length; w++) {
+          const e = this.windowDemand[w].get(sc);
+          cumAcq += e?.acquires ?? 0;
+          maxDeficit = Math.max(maxDeficit, cumAcq - cumRel);
+          cumRel += e?.releases ?? 0;
+        }
+        reservation.set(sc, maxDeficit);
+      }
+      this.reservation = reservation;
+    }
+    /**
+    * Reserve buffers to match the computed window-demand reservation.
+    * Only creates buffers for size classes where the pool has a deficit.
+    * Replaces prewarm() — call at beginStep() BEFORE opening shared encoder.
+    */
+    reserve(device) {
+      const source = this.reservation ?? this.newAllocsByClass;
+      for (const [sizeClass, needed] of source) {
+        const size = getSizeForClass(sizeClass);
+        const deficit = this.reservation ? needed - (this.pool.get(sizeClass)?.length ?? 0) : needed;
+        if (deficit <= 0) continue;
+        for (let i = 0; i < deficit; i++) {
+          if (this.pooledBytes + this.pendingReleaseBytes + size > this.maxPoolBytes) break;
+          const buf = device.createBuffer({
+            size,
+            usage: 140
+          });
+          this.getBucket(sizeClass).push(buf);
+          this.pooledBytes += size;
+        }
+      }
+      this.newAllocsByClass.clear();
+    }
+    /**
+    * Release a buffer back to the pool for reuse.
+    * Per spec section 14, the buffer goes to a pending queue first and only becomes
+    * available after GPU work completes (fence signaled).
+    * Returns true if the buffer was queued for pooling, false if it should be destroyed.
+    */
+    release(buffer, sizeBytes, usage) {
+      if (!this.enabled) return false;
+      if (usage !== 140) {
+        this.releaseToDestroy++;
+        if (this.debugTrace) console.log(`[pool] release INCOMPATIBLE (wrong usage): ${(sizeBytes / 1e6).toFixed(2)} MB`);
+        return false;
+      }
+      const sizeClass = getSizeClass(sizeBytes);
+      const actualSize = getSizeForClass(sizeClass);
+      this.pooledBufferSet.delete(buffer);
+      if (this.pooledBytes + this.pendingReleaseBytes + actualSize > this.maxPoolBytes) {
+        this.releaseToDestroy++;
+        if (this.debugTrace) console.log(`[pool] release BUDGET (${((this.pooledBytes + this.pendingReleaseBytes) / 1e6).toFixed(1)}MB + ${(actualSize / 1e6).toFixed(2)}MB > ${(this.maxPoolBytes / 1e6).toFixed(0)}MB): ${(actualSize / 1e6).toFixed(2)} MB`);
+        return false;
+      }
+      this.pendingRelease.push({
+        buffer,
+        sizeClass,
+        size: actualSize
+      });
+      this.pendingReleaseBytes += actualSize;
+      this.releaseToPool++;
+      gpuMemoryTracker.trackDeallocation(buffer);
+      if (this.debugTrace) console.log(`[pool] release to PENDING: ${(actualSize / 1e6).toFixed(2)} MB (now ${this.pendingRelease.length} pending)`);
+      return true;
+    }
+    /** Buffers to destroy after fence (not pool, just destroy safely) */
+    pendingDestroy = [];
+    /**
+    * Queue a buffer for destruction after GPU work completes.
+    * Use this for buffers that can't be pooled but need safe destruction.
+    * This prevents "buffer destroyed while in use" validation errors.
+    *
+    * @param buffer The GPU buffer to destroy
+    * @param size The buffer size in bytes (for memory tracking)
+    */
+    deferredDestroy(buffer, size) {
+      if (arenaBufferSet.has(buffer)) return;
+      gpuMemoryTracker.trackDeallocation(buffer);
+      if (activeBatch) {
+        activeBatch.deferredDestroyBuffers.push(buffer);
+        return;
+      }
+      this.pendingDestroy.push({
+        buffer,
+        size
+      });
+    }
+    /**
+    * Queue an untracked buffer for deferred destruction.
+    * Use for tiny params buffers that are not in the memory tracker.
+    */
+    deferredDestroyUntracked(buffer) {
+      if (activeBatch) {
+        activeBatch.deferredDestroyBuffers.push(buffer);
+        return;
+      }
+      this.pendingDestroy.push({
+        buffer,
+        size: 0
+      });
+    }
+    /**
+    * Move pending-release buffers into the available pool.
+    * Always safe to call — these buffers are reusable after WebGPU submission ordering.
+    *
+    * NOTE: This method is accessed directly by awaitDeferredFence() in this module,
+    * so it cannot be private despite being an implementation detail.
+    */
+    flushPendingToPool() {
+      const remaining = [];
+      let remainingBytes = 0;
+      for (const entry of this.pendingRelease) {
+        if (this.bufferLiveCount.has(entry.buffer)) {
+          remaining.push(entry);
+          remainingBytes += entry.size;
+          continue;
+        }
+        this.getBucket(entry.sizeClass).push(entry.buffer);
+        this.pooledBytes += entry.size;
+        this.recordWindowDemand(entry.sizeClass, "releases");
+      }
+      this.pendingRelease = remaining;
+      this.pendingReleaseBytes = remainingBytes;
+    }
+    /**
+    * Destroy all pending-destroy buffers. Only call after GPU sync
+    * (queue.onSubmittedWorkDone()) to avoid "buffer destroyed while in use" errors.
+    */
+    destroyPendingBuffers() {
+      for (const { buffer } of this.pendingDestroy) try {
+        buffer.destroy();
+      } catch {
+      }
+      this.pendingDestroy = [];
+    }
+    /**
+    * Track a newly allocated buffer (for stats).
+    */
+    trackAllocation(_buffer, _sizeBytes) {
+      this.allocCount++;
+    }
+    /**
+    * Check if a buffer is from the pool.
+    */
+    isFromPool(buffer) {
+      return this.pooledBufferSet.has(buffer);
+    }
+    /**
+    * Mark a buffer as from pool (for release tracking).
+    */
+    markAsFromPool(buffer) {
+      this.pooledBufferSet.add(buffer);
+      if (!this.bufferPoolIdMap.has(buffer)) this.bufferPoolIdMap.set(buffer, this.nextBufferPoolId++);
+    }
+    /**
+    * Get the pool bucket for a given size class. Used by pre-pinning to extract
+    * specific buffers before dispatches run.
+    */
+    getPoolBucket(sizeClass) {
+      return this.pool.get(sizeClass);
+    }
+    /**
+    * Adjust pooledBytes tracking (e.g. when pre-pinning extracts buffers from pool).
+    */
+    adjustPooledBytes(delta) {
+      this.pooledBytes += delta;
+    }
+    /**
+    * Return a buffer directly to the pool bucket (bypassing pendingRelease).
+    * Used when a pre-pinned buffer wasn't consumed and needs to go back.
+    */
+    returnToPool(buffer, sizeClass) {
+      this.getBucket(sizeClass).push(buffer);
+      this.pooledBytes += getSizeForClass(sizeClass);
+    }
+    /**
+    * Record a pool acquire for window-demand tracking (used by pre-pin path).
+    */
+    recordAcquireForPin(sizeClass) {
+      this.reuseCount++;
+      this.acquireFromPool++;
+      this.recordWindowDemand(sizeClass, "acquires");
+    }
+    /**
+    * Get pool statistics.
+    */
+    stats() {
+      let totalPooled = 0;
+      for (const buffers of this.pool.values()) totalPooled += buffers.length;
+      const total = this.reuseCount + this.allocCount;
+      return {
+        pooledBuffers: totalPooled,
+        pendingBuffers: this.pendingRelease.length,
+        pooledBytes: this.pooledBytes,
+        reuseCount: this.reuseCount,
+        allocCount: this.allocCount,
+        reuseRate: total > 0 ? this.reuseCount / total : 0,
+        pendingRelease: this.pendingRelease.length,
+        pendingDestroy: this.pendingDestroy.length
+      };
+    }
+    /**
+    * Clear the pool and destroy all pooled buffers.
+    */
+    clear() {
+      this.pool.clear();
+      this.pooledBytes = 0;
+      this.pooledBufferSet.clear();
+      this.pendingRelease = [];
+      this.pendingReleaseBytes = 0;
+      this.pendingDestroy = [];
+      this.bufferLiveCount.clear();
+    }
+    /**
+    * Evict pooled buffers to free up memory.
+    * Called automatically when memory pressure is high.
+    * Returns the number of bytes freed.
+    *
+    * Note: This only evicts from the main pool (buffers that have passed the GPU fence).
+    * Pending buffers are NOT destroyed here as they may still be in use by GPU work.
+    * If you need to free pending buffers, call waitAndFlushPending() first.
+    */
+    evictBuffers(bytesNeeded) {
+      let bytesFreed = 0;
+      const sizeClasses = Array.from(this.pool.keys()).sort((a, b) => b - a);
+      for (const sizeClass of sizeClasses) {
+        const buffers = this.pool.get(sizeClass);
+        if (!buffers || buffers.length === 0) continue;
+        const sizePerBuffer = getSizeForClass(sizeClass);
+        while (buffers.length > 0 && bytesFreed < bytesNeeded) {
+          const buffer = buffers.pop();
+          this.pooledBufferSet.delete(buffer);
+          this.pooledBytes -= sizePerBuffer;
+          gpuMemoryTracker.trackDeallocation(buffer);
+          try {
+            buffer.destroy();
+          } catch {
+          }
+          bytesFreed += sizePerBuffer;
+        }
+        if (buffers.length === 0) this.pool.delete(sizeClass);
+        if (bytesFreed >= bytesNeeded) break;
+      }
+      return bytesFreed;
+    }
+    /**
+    * Enable or disable buffer pooling.
+    */
+    setEnabled(enabled) {
+      this.enabled = enabled;
+      if (!enabled) this.clear();
+    }
+    isEnabled() {
+      return this.enabled;
+    }
+    /**
+    * Set the maximum byte budget for pooled + pending buffers.
+    * Pass Infinity (or null) for no limit (PyTorch-like behavior).
+    * When set, release() will destroy buffers rather than pooling them
+    * if the budget would be exceeded, and reserve() will stop pre-creating
+    * buffers at the budget boundary.
+    */
+    setMaxPoolBytes(bytes) {
+      this.maxPoolBytes = bytes == null ? Infinity : bytes;
+    }
+    getMaxPoolBytes() {
+      return this.maxPoolBytes;
+    }
+    /**
+    * Flush pending buffers to make them immediately available for reuse.
+    *
+    * This is safe to call when we know GPU work has completed (e.g., at the
+    * start of backward pass, since backward depends on forward results being
+    * ready). This enables checkpoint memory savings by making buffers available
+    * for recomputation before the async onSubmittedWorkDone() callback runs.
+    */
+    flushPendingToAvailable() {
+      this.flushPendingToPool();
+    }
+    /**
+    * Get bytes in pending queues (not yet safe to destroy).
+    */
+    getPendingBytes() {
+      let destroyBytes = 0;
+      for (const p of this.pendingDestroy) destroyBytes += p.size;
+      return this.pendingReleaseBytes + destroyBytes;
+    }
+    /**
+    * Get total bytes held by the pool (free + pending release).
+    * These bytes are in GPU memory but not tracked by the memory tracker
+    * (trackDeallocation was called when buffers were released to pool).
+    * Used by createTrackedBuffer to check physical GPU memory pressure.
+    */
+    getTotalHeldBytes() {
+      return this.pooledBytes + this.pendingReleaseBytes;
+    }
+  };
+  bufferPool = new SimpleBufferPool();
+  fenceState = {
+    pendingFencePromise: null,
+    deferredPendingRelease: false,
+    profilingFenceBuffer: null
+  };
+  profilingFenceData = new Uint8Array([
+    1,
+    2,
+    3,
+    4
+  ]);
+}));
+var init_profiler = __esmMin((() => {
+  init_profiler$1();
+  init_webgpu_state();
+}));
+function canSafelyRelease(storage, activeStorages) {
+  if (storageTracker.isReachable(storage.id)) return false;
+  for (const [, activeStorage] of activeStorages) if (activeStorage.baseStorageId === storage.id) return false;
+  return true;
+}
+function releaseBufferImmediate(storage) {
+  const tensor = storage.backendTensor;
+  if (tensor.ownsBuffer === false) return;
+  storageTracker.unregister(storage.id);
+  if (tensor.destroy) tensor.destroy();
+}
+function releaseDeadTensors(lifetimes, step2, outputNodeIds, alreadyReleased, nodeToStorage) {
+  if (!lifetimes || !outputNodeIds) return;
+  const deadNodeIds = findDeadTensorsAtStep(lifetimes, step2, outputNodeIds, alreadyReleased);
+  for (const deadId of deadNodeIds) {
+    const storage = nodeToStorage.get(deadId);
+    if (storage && canSafelyRelease(storage, nodeToStorage)) {
+      releaseBufferImmediate(storage);
+      nodeToStorage.delete(deadId);
+      alreadyReleased.add(deadId);
+    }
+  }
+}
+var StorageTracker, storageTracker;
+var init_storage_tracker = __esmMin((() => {
+  init_lifetime_analysis();
+  init_node_factory();
+  StorageTracker = class {
+    /** All storages created and not yet destroyed */
+    allStorages = /* @__PURE__ */ new Map();
+    /** Storage IDs that are externally reachable (linked to Tensors) */
+    externallyReachable = /* @__PURE__ */ new Set();
+    /** WeakRefs to owning tensors — used to detect GC'd tensors at cleanup time */
+    tensorWeakRefs = /* @__PURE__ */ new Map();
+    /** Storage IDs that recently became unreachable (for incremental scanning) */
+    recentlyUnreachable = /* @__PURE__ */ new Set();
+    /** Debug counters for tracking reachability changes per step */
+    _debugRegisterCount = 0;
+    _debugReachableCount = 0;
+    _debugUnreachableCount = 0;
+    _debugDestroyCount = 0;
+    /**
+    * Register a newly created storage.
+    */
+    register(storage) {
+      this.allStorages.set(storage.id, storage);
+      this._debugRegisterCount++;
+    }
+    /**
+    * Mark a storage as externally reachable (linked to a user-visible Tensor).
+    * Optionally pass the owning tensor object so we can track it via WeakRef
+    * and detect when it has been garbage collected.
+    */
+    markReachable(storageId, tensorRef) {
+      const wasNew = !this.externallyReachable.has(storageId);
+      this.externallyReachable.add(storageId);
+      if (wasNew) this._debugReachableCount++;
+      if (tensorRef) this.tensorWeakRefs.set(storageId, new WeakRef(tensorRef));
+    }
+    /**
+    * Mark a storage as no longer externally reachable (Tensor disposed).
+    */
+    markUnreachable(storageId) {
+      const wasReachable = this.externallyReachable.has(storageId);
+      this.externallyReachable.delete(storageId);
+      this.tensorWeakRefs.delete(storageId);
+      if (wasReachable) {
+        this._debugUnreachableCount++;
+        this.recentlyUnreachable.add(storageId);
+      }
+    }
+    /**
+    * Check if a storage is externally reachable.
+    */
+    isReachable(storageId) {
+      return this.externallyReachable.has(storageId);
+    }
+    /**
+    * Unregister a storage (after it's been destroyed).
+    */
+    unregister(storageId) {
+      this.allStorages.delete(storageId);
+      this.externallyReachable.delete(storageId);
+      this.tensorWeakRefs.delete(storageId);
+    }
+    /** Find base storage IDs transitively needed by reachable view storages. */
+    findNeededByViews() {
+      const neededByViews = /* @__PURE__ */ new Set();
+      const worklist = [...this.externallyReachable];
+      while (worklist.length > 0) {
+        const id = worklist.pop();
+        const storage = this.allStorages.get(id);
+        if (storage?.baseStorageId !== void 0 && !neededByViews.has(storage.baseStorageId)) {
+          neededByViews.add(storage.baseStorageId);
+          worklist.push(storage.baseStorageId);
+        }
+      }
+      return neededByViews;
+    }
+    /** Destroy a list of storage IDs and return the count destroyed. */
+    destroyStorageIds(ids) {
+      let count = 0;
+      for (const id of ids) {
+        const storage = this.allStorages.get(id);
+        if (storage) {
+          const tensor = storage.backendTensor;
+          if (tensor.ownsBuffer !== false && tensor.destroy) tensor.destroy();
+          this.allStorages.delete(id);
+          count++;
+          this._debugDestroyCount++;
+        }
+      }
+      return count;
+    }
+    /**
+    * Destroy all unreachable storages (called at markStep after GPU fence).
+    * Returns the number of storages destroyed.
+    *
+    * Note: Only destroys storages whose backend tensors own their buffers.
+    * Views (tensors that borrow buffers) are unregistered but not destroyed.
+    * Base storages that are needed by reachable views are kept alive.
+    */
+    destroyUnreachable() {
+      for (const [id, ref2] of this.tensorWeakRefs) if (ref2.deref() === void 0) {
+        this.externallyReachable.delete(id);
+        this.tensorWeakRefs.delete(id);
+        this.recentlyUnreachable.add(id);
+      }
+      if (this.recentlyUnreachable.size === 0 && this.allStorages.size === this.externallyReachable.size) return 0;
+      this.recentlyUnreachable.clear();
+      return this._destroyUnreachableFrom();
+    }
+    /**
+    * Get the next storage ID that will be assigned.
+    * Used to scope destroyUnreachableSince() to only affect newly created storages.
+    */
+    getNextStorageId() {
+      return getNextStorageId();
+    }
+    /**
+    * Destroy unreachable storages created at or after the given storage ID.
+    * This is a scoped version of destroyUnreachable() that only affects
+    * storages created within a specific time window (e.g., during backward pass
+    * gradient computation). Pre-existing unreachable storages are left alone.
+    */
+    destroyUnreachableSince(sinceId) {
+      return this._destroyUnreachableFrom(sinceId);
+    }
+    /** Collect and destroy unreachable storages, optionally scoped to ids >= sinceId. */
+    _destroyUnreachableFrom(sinceId) {
+      const neededByViews = this.findNeededByViews();
+      const toDestroy = [];
+      for (const [id] of this.allStorages) {
+        if (sinceId !== void 0 && id < sinceId) continue;
+        if (!this.externallyReachable.has(id) && !neededByViews.has(id)) toDestroy.push(id);
+      }
+      return this.destroyStorageIds(toDestroy);
+    }
+    /**
+    * Get statistics about tracked storages.
+    */
+    stats() {
+      return {
+        totalStorages: this.allStorages.size,
+        reachableStorages: this.externallyReachable.size,
+        unreachableStorages: this.allStorages.size - this.externallyReachable.size
+      };
+    }
+    /**
+    * Get and reset debug counters.
+    */
+    debugCounters() {
+      const result = {
+        registered: this._debugRegisterCount,
+        reachable: this._debugReachableCount,
+        unreachable: this._debugUnreachableCount,
+        destroyed: this._debugDestroyCount
+      };
+      this._debugRegisterCount = 0;
+      this._debugReachableCount = 0;
+      this._debugUnreachableCount = 0;
+      this._debugDestroyCount = 0;
+      return result;
+    }
+    /**
+    * Reset the tracker (for testing).
+    */
+    reset() {
+      this.allStorages.clear();
+      this.externallyReachable.clear();
+      this.tensorWeakRefs.clear();
+      this.recentlyUnreachable.clear();
+    }
+    /**
+    * Get the set of externally reachable storage IDs.
+    */
+    getReachableIds() {
+      return new Set(this.externallyReachable);
+    }
+    /**
+    * Check if a storage has a live (not GC'd) tensor WeakRef.
+    */
+    hasLiveTensorRef(storageId) {
+      const ref2 = this.tensorWeakRefs.get(storageId);
+      if (!ref2) return false;
+      return ref2.deref() !== void 0;
+    }
+    /**
+    * Get a storage by ID.
+    */
+    getStorage(storageId) {
+      return this.allStorages.get(storageId);
+    }
+    /**
+    * Get debug info about the tensor ref holding a storage reachable.
+    * Returns shape/dtype if the ref is a RuntimeTensor, or a description otherwise.
+    */
+    getTensorRefDebugInfo(storageId) {
+      const ref2 = this.tensorWeakRefs.get(storageId);
+      if (!ref2) return null;
+      const obj = ref2.deref();
+      if (!obj) return null;
+      if ("shape" in obj && "dtype" in obj) {
+        const t = obj;
+        return {
+          shape: t.shape,
+          dtype: t.dtype,
+          type: "tensor",
+          disposed: t.disposed ?? t._disposed
+        };
+      }
+      if (Array.isArray(obj)) return { type: "resultsArray" };
+      return { type: typeof obj };
+    }
+    /**
+    * Get storages that became reachable since a given snapshot.
+    * Returns entries for IDs present in current reachable set but absent from prevIds.
+    */
+    getNewReachableSince(prevIds) {
+      const result = [];
+      for (const id of this.externallyReachable) if (!prevIds.has(id)) result.push({
+        id,
+        hasLiveTensorRef: this.hasLiveTensorRef(id),
+        debugInfo: this.getTensorRefDebugInfo(id)
+      });
+      return result;
+    }
+    /**
+    * Get all buffer objects from live storages that own their buffer.
+    * For cross-referencing with memory tracker to find orphaned buffers.
+    */
+    getLiveOwnedBuffers() {
+      const buffers = /* @__PURE__ */ new Set();
+      for (const [, storage] of this.allStorages) {
+        const tensor = storage.backendTensor;
+        const buf = tensor.buffer;
+        if (tensor.ownsBuffer !== false && buf) buffers.add(buf);
+      }
+      return buffers;
+    }
+  };
+  storageTracker = new StorageTracker();
+}));
+function createLazyIRNode(op, inputs, shape, dtype, device, payload) {
+  const node = {
+    id: nextNodeId$1++,
+    op,
+    inputs,
+    shape,
+    dtype,
+    device,
+    payload
+  };
+  const mod = getProfileModule();
+  if (mod !== "unknown") node.module = mod;
+  return node;
+}
+function getNextStorageId() {
+  return nextStorageId;
+}
+function createStorageHandle(device, backendTensor, baseStorageId) {
+  const storage = {
+    id: nextStorageId++,
+    device,
+    backendTensor,
+    baseStorageId
+  };
+  storageTracker.register(storage);
+  return storage;
+}
+function wrapResultAsStorage(device, resultTensor, backendInputs, inputStorages) {
+  const aliasedInputIdx = backendInputs.indexOf(resultTensor);
+  if (aliasedInputIdx >= 0 && resultTensor.ownsBuffer === true) resultTensor = {
+    ...resultTensor,
+    ownsBuffer: false
+  };
+  const baseStorageId = resultTensor.ownsBuffer === false && inputStorages.length > 0 ? inputStorages[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id : void 0;
+  return createStorageHandle(device, resultTensor, baseStorageId);
+}
+async function ensureWebGPUMatmulImports() {
+  if (!_webgpuMatmulImports) {
+    const mod = await import("./webgpu-S_IN-64Z.js");
+    _webgpuMatmulImports = {
+      dispatchMatmul: mod.dispatchMatmul,
+      dispatchMatmulDirect: mod.dispatchMatmulDirect,
+      deferredDestroyBuffer: mod.deferredDestroyBuffer
+    };
+  }
+  if (!_webgpuMatmulGeomImports) {
+    const mod = await import("./dispatch-hG3P78x9.js");
+    _webgpuMatmulGeomImports = {
+      computeMatmulOutputShape: mod.computeMatmulOutputShape,
+      computeBatchSize: mod.computeBatchSize,
+      computeBatchStrides: mod.computeBatchStrides
+    };
+  }
+}
+var nextNodeId$1, nextStorageId, _webgpuMatmulImports, _webgpuMatmulGeomImports;
+var init_node_factory = __esmMin((() => {
+  init_profiler();
+  init_storage_tracker();
+  nextNodeId$1 = 1;
+  nextStorageId = 1;
+  _webgpuMatmulImports = null;
+  _webgpuMatmulGeomImports = null;
+}));
+var define_process_env_default$1 = {};
+function canVectorize$1(op) {
+  return OP_REGISTRY[op]?.vectorizable ?? false;
+}
+function getWgslInfix(op) {
+  return OP_REGISTRY[op]?.wgslInfix;
+}
+function getWgslPrefix(op) {
+  return OP_REGISTRY[op]?.wgslPrefix;
+}
+function getWgslFnName(op) {
+  return OP_REGISTRY[op]?.wgslFnName ?? op;
+}
+function promoteDtype(a, b) {
+  if (a === b) return a;
+  if (a === "f16" && b === "f32" || a === "f32" && b === "f16") return "f32";
+  return a;
+}
+var OP_REGISTRY, UNARY_AUTOGRAD_OPS, BINARY_AUTOGRAD_OPS, _registryRules, OP_DTYPE_RULES, SUPPLEMENTARY_F16_ELIGIBLE, SUPPLEMENTARY_F32_REQUIRED, _f16Eligible, _f32Required, F16_ELIGIBLE, F32_REQUIRED;
+var init_registry$2 = __esmMin((() => {
+  OP_REGISTRY = {
+    relu: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "activation",
+      dtypeRule: "preserve",
+      grad: (rt, g, s) => rt.mul(g, rt.gt(s, 0))
+    },
+    gelu: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "activation",
+      dtypeRule: "preserve"
+    },
+    gelu_erf: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "activation",
+      dtypeRule: "preserve"
+    },
+    silu: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "activation",
+      dtypeRule: "preserve",
+      grad: (rt, g, s) => {
+        const sig = rt.sigmoid(s);
+        return rt.mul(g, rt.add(sig, rt.mul(s, rt.mul(sig, rt.sub(1, sig)))));
+      }
+    },
+    sigmoid: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "activation",
+      dtypeRule: "preserve",
+      grad: (rt, g, s) => {
+        const sig = rt.sigmoid(s);
+        return rt.mul(rt.mul(sig, rt.sub(1, sig)), g);
+      }
+    },
+    tanh: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "activation",
+      dtypeRule: "preserve",
+      grad: (rt, g, s) => {
+        const t = rt.tanh(s);
+        return rt.mul(rt.sub(1, rt.mul(t, t)), g);
+      }
+    },
+    softplus: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "activation",
+      dtypeRule: "preserve"
+    },
+    neg: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "math",
+      dtypeRule: "preserve",
+      wgslPrefix: "-",
+      needsSave: false,
+      grad: (rt, g) => rt.neg(g)
+    },
+    abs: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "math",
+      dtypeRule: "preserve",
+      grad: (rt, g, s) => rt.mul(g, rt.sign(s))
+    },
+    exp: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "math",
+      dtypeRule: "f32_required",
+      autocast: "exp",
+      grad: (rt, g, s) => rt.mul(g, rt.exp(s))
+    },
+    log: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "math",
+      dtypeRule: "f32_required",
+      autocast: "log",
+      grad: (rt, g, s) => rt.div(g, rt.add(s, 1e-8))
+    },
+    sqrt: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "math",
+      dtypeRule: "preserve",
+      grad: (rt, g, s) => {
+        const sqrtA = rt.sqrt(s);
+        return rt.mul(g, rt.div(0.5, rt.add(sqrtA, 1e-8)));
+      }
+    },
+    rsqrt: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "math",
+      dtypeRule: "preserve",
+      wgslFnName: "inverseSqrt",
+      grad: (rt, g, s) => {
+        const r = rt.rsqrt(s);
+        return rt.mul(g, rt.mul(-0.5, rt.mul(r, rt.mul(r, r))));
+      }
+    },
+    sin: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "math",
+      dtypeRule: "preserve",
+      grad: (rt, g, s) => rt.mul(g, rt.cos(s))
+    },
+    cos: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "math",
+      dtypeRule: "preserve",
+      grad: (rt, g, s) => rt.mul(g, rt.neg(rt.sin(s)))
+    },
+    floor: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "math",
+      dtypeRule: "preserve",
+      grad: null
+    },
+    ceil: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "math",
+      dtypeRule: "preserve",
+      grad: null
+    },
+    round: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "math",
+      dtypeRule: "preserve",
+      grad: null
+    },
+    sign: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "math",
+      dtypeRule: "preserve",
+      grad: null
+    },
+    isfinite: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "math",
+      dtypeRule: "always_f32",
+      grad: null
+    },
+    add: {
+      arity: 2,
+      fusible: true,
+      vectorizable: true,
+      category: "arithmetic",
+      dtypeRule: "promote_inputs",
+      wgslInfix: "+",
+      ttGrad: (_rt, g) => [g, g]
+    },
+    sub: {
+      arity: 2,
+      fusible: true,
+      vectorizable: true,
+      category: "arithmetic",
+      dtypeRule: "promote_inputs",
+      wgslInfix: "-"
+    },
+    mul: {
+      arity: 2,
+      fusible: true,
+      vectorizable: true,
+      category: "arithmetic",
+      dtypeRule: "promote_inputs",
+      wgslInfix: "*",
+      saveBinary: true,
+      ttGrad: (rt, g, gs) => [rt.mul(g, gs(1)), rt.mul(g, gs(0))],
+      tsGrad: (rt, g, _gs, s) => [rt.mul(g, s)]
+    },
+    div: {
+      arity: 2,
+      fusible: true,
+      vectorizable: true,
+      category: "arithmetic",
+      dtypeRule: "promote_inputs",
+      wgslInfix: "/",
+      saveBinary: true,
+      ttGrad: (rt, g, gs) => {
+        const sA = gs(0), sB = gs(1);
+        return [rt.div(g, sB), rt.mul(g, rt.div(rt.neg(sA), rt.mul(sB, sB)))];
+      },
+      tsGrad: (rt, g, gs, scalar, scalarIsA) => {
+        if (!scalarIsA) return [rt.div(g, scalar)];
+        const sB = gs(0);
+        return [rt.mul(g, rt.div(-scalar, rt.mul(sB, sB)))];
+      }
+    },
+    pow: {
+      arity: 2,
+      fusible: true,
+      vectorizable: true,
+      category: "arithmetic",
+      dtypeRule: "f32_required",
+      saveBinary: true,
+      ttGrad: (rt, g, gs) => {
+        const sA = gs(0), sB = gs(1);
+        return [rt.mul(g, rt.mul(sB, rt.pow(sA, rt.sub(sB, 1)))), rt.mul(g, rt.mul(rt.pow(sA, sB), rt.log(sA)))];
+      },
+      tsGrad: (rt, g, gs, scalar, scalarIsA) => {
+        const saved = gs(0);
+        if (scalarIsA) return [rt.mul(g, rt.mul(rt.pow(scalar, saved), Math.log(scalar)))];
+        return [rt.mul(g, rt.mul(scalar, rt.pow(saved, scalar - 1)))];
+      }
+    },
+    min: {
+      arity: 2,
+      fusible: true,
+      vectorizable: true,
+      category: "arithmetic",
+      dtypeRule: "f32_required"
+    },
+    max: {
+      arity: 2,
+      fusible: true,
+      vectorizable: true,
+      category: "arithmetic",
+      dtypeRule: "f32_required"
+    },
+    mod: {
+      arity: 2,
+      fusible: true,
+      vectorizable: false,
+      category: "arithmetic",
+      wgslInfix: "%"
+    },
+    eq: {
+      arity: 2,
+      fusible: true,
+      vectorizable: true,
+      category: "comparison",
+      dtypeRule: "always_f32"
+    },
+    ne: {
+      arity: 2,
+      fusible: true,
+      vectorizable: true,
+      category: "comparison",
+      dtypeRule: "always_f32"
+    },
+    lt: {
+      arity: 2,
+      fusible: true,
+      vectorizable: true,
+      category: "comparison",
+      dtypeRule: "always_f32"
+    },
+    le: {
+      arity: 2,
+      fusible: true,
+      vectorizable: true,
+      category: "comparison",
+      dtypeRule: "always_f32"
+    },
+    gt: {
+      arity: 2,
+      fusible: true,
+      vectorizable: true,
+      category: "comparison",
+      dtypeRule: "always_f32"
+    },
+    ge: {
+      arity: 2,
+      fusible: true,
+      vectorizable: true,
+      category: "comparison",
+      dtypeRule: "always_f32"
+    },
+    where: {
+      arity: 3,
+      fusible: true,
+      vectorizable: true,
+      category: "ternary",
+      dtypeRule: "preserve"
+    },
+    cast_f16: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "cast"
+    },
+    cast_f32: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "cast"
+    },
+    cast_i32: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "cast"
+    },
+    cast_u32: {
+      arity: 1,
+      fusible: true,
+      vectorizable: true,
+      category: "cast"
+    }
+  };
+  OP_REGISTRY.gelu_tanh = OP_REGISTRY.gelu;
+  for (const [name, infix] of Object.entries({
+    and: "&",
+    or: "|",
+    xor: "^",
+    shr: ">>",
+    shl: "<<"
+  })) OP_REGISTRY[name] = {
+    arity: 2,
+    fusible: false,
+    vectorizable: false,
+    category: "bitwise",
+    wgslInfix: infix
+  };
+  OP_REGISTRY["not"] = {
+    arity: 1,
+    fusible: false,
+    vectorizable: false,
+    category: "bitwise",
+    wgslPrefix: "!"
+  };
+  UNARY_AUTOGRAD_OPS = Object.keys(OP_REGISTRY).filter((k) => OP_REGISTRY[k].arity === 1 && "grad" in OP_REGISTRY[k]);
+  BINARY_AUTOGRAD_OPS = Object.keys(OP_REGISTRY).filter((k) => OP_REGISTRY[k].ttGrad != null);
+  _registryRules = {};
+  for (const [name, def] of Object.entries(OP_REGISTRY)) if (def.dtypeRule) _registryRules[name] = { category: def.dtypeRule };
+  OP_DTYPE_RULES = {
+    ..._registryRules,
+    matmul: { category: "f16_eligible" },
+    sum: { category: "f32_required" },
+    mean: { category: "f32_required" },
+    reshape: { category: "preserve" },
+    expand: { category: "preserve" },
+    transpose: { category: "preserve" },
+    permute: { category: "preserve" },
+    contiguous: { category: "preserve" },
+    gather: { category: "preserve" },
+    scatterAdd: { category: "preserve" },
+    transfer: { category: "preserve" },
+    stridedScatterCopy: { category: "preserve" },
+    stridedScatterAdd: { category: "preserve" },
+    tril: { category: "preserve" },
+    triu: { category: "preserve" },
+    argmax: { category: "always_f32" },
+    argmin: { category: "always_f32" },
+    tensorFromArray: { category: "always_f32" },
+    zeros: { category: "always_f32" },
+    full: { category: "always_f32" },
+    arange: { category: "always_f32" },
+    cast: { category: "cast" }
+  };
+  SUPPLEMENTARY_F16_ELIGIBLE = /* @__PURE__ */ new Set([
+    "linear",
+    "conv1d",
+    "conv2d",
+    "conv3d",
+    "bmm",
+    "addmm"
+  ]);
+  SUPPLEMENTARY_F32_REQUIRED = /* @__PURE__ */ new Set([
+    "softmax",
+    "log_softmax",
+    "layer_norm",
+    "batch_norm",
+    "group_norm",
+    "loss",
+    "cross_entropy",
+    "mse_loss"
+  ]);
+  _f16Eligible = new Set(Object.entries(OP_DTYPE_RULES).filter(([_, r]) => r.category === "f16_eligible").map(([k]) => k));
+  _f32Required = new Set(Object.entries(OP_DTYPE_RULES).filter(([_, r]) => r.category === "f32_required").map(([k]) => k));
+  F16_ELIGIBLE = /* @__PURE__ */ new Set([..._f16Eligible, ...SUPPLEMENTARY_F16_ELIGIBLE]);
+  F32_REQUIRED = /* @__PURE__ */ new Set([..._f32Required, ...SUPPLEMENTARY_F32_REQUIRED]);
+}));
+function normalizeDim$1(d, rank2) {
+  return d < 0 ? d + rank2 : d;
+}
+function isFusedBackend(backend) {
+  return "beginSharedEncoder" in backend;
+}
+var init_types$1 = __esmMin((() => {
+}));
+function tensorFromArray$1(values, shape) {
+  return new Tensor$2(shape, values instanceof Float32Array ? values.slice() : Float32Array.from(values));
+}
+function zeros$1(shape) {
+  return new Tensor$2(shape, new Float32Array(sizeOf(shape)));
+}
+function full$1(shape, fillValue) {
+  const numElements = sizeOf(shape);
+  const data = new Float32Array(numElements);
+  data.fill(fillValue);
+  return new Tensor$2(shape, data);
+}
+function rand$1(shape) {
+  const n = sizeOf(shape);
+  const data = new Float32Array(n);
+  for (let i = 0; i < n; i++) data[i] = Math.random();
+  return new Tensor$2(shape, data);
+}
+function randn$1(shape) {
+  const n = sizeOf(shape);
+  const data = new Float32Array(n);
+  for (let i = 0; i < n; i += 2) {
+    const u1 = Math.random() || 1e-10;
+    const u2 = Math.random();
+    const r = Math.sqrt(-2 * Math.log(u1));
+    data[i] = r * Math.cos(2 * Math.PI * u2);
+    if (i + 1 < n) data[i + 1] = r * Math.sin(2 * Math.PI * u2);
+  }
+  return new Tensor$2(shape, data);
+}
+function bernoulli$1(shape, p, _seed) {
+  const n = sizeOf(shape);
+  const data = new Float32Array(n);
+  for (let i = 0; i < n; i++) data[i] = Math.random() < p ? 1 : 0;
+  return new Tensor$2(shape, data);
+}
+function arange$1(end, start = 0, step2 = 1) {
+  const numElements = Math.max(0, Math.ceil((end - start) / step2));
+  const data = new Float32Array(numElements);
+  for (let i = 0; i < numElements; i++) data[i] = start + i * step2;
+  return new Tensor$2([numElements], data);
+}
+function triangularMask(a, k, zeroWhen) {
+  if (a.shape.length < 2) throw new Error("tril/triu requires at least 2 dimensions");
+  const data = Float32Array.from(a.data);
+  const H = a.shape[a.shape.length - 2];
+  const W = a.shape[a.shape.length - 1];
+  const batchSize2 = data.length / (H * W);
+  for (let b = 0; b < batchSize2; b++) for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) if (zeroWhen(c, r, k)) data[b * H * W + r * W + c] = 0;
+  return new Tensor$2(a.shape.slice(), data);
+}
+function tril$1(a, k = 0) {
+  return triangularMask(a, k, (c, r, k2) => c > r + k2);
+}
+function triu$1(a, k = 0) {
+  return triangularMask(a, k, (c, r, k2) => c < r + k2);
+}
+function expand$2(a, shape) {
+  return broadcastTo(a, shape);
+}
+function sub$1(a, b, options) {
+  const alpha2 = options?.alpha ?? 1;
+  return applyBinaryOp(a, b, (x, y) => x - alpha2 * y);
+}
+function div$1(a, b, options) {
+  const rounding = options?.roundingMode ?? null;
+  return applyBinaryOp(a, b, (x, y) => {
+    let v = x / y;
+    if (rounding === "floor") v = Math.floor(v);
+    else if (rounding === "trunc") v = Math.trunc(v);
+    return v;
+  });
+}
+function reshape$2(a, shape) {
+  return a.view(shape);
+}
+function contiguous$2(a) {
+  return a.contiguous();
+}
+function narrow$1(a, dim, start, length) {
+  const rank2 = a.shape.length;
+  if (dim < 0 || dim >= rank2) throw new Error(`narrow: dim ${dim} out of range for rank ${rank2}`);
+  if (start < 0 || start + length > a.shape[dim]) throw new Error(`narrow: range [${start}, ${start + length}) out of bounds for dim size ${a.shape[dim]}`);
+  const newShape = a.shape.slice();
+  newShape[dim] = length;
+  const newOffset = a.offset + start * a.strides[dim];
+  return new Tensor$2(newShape, a.data, a.strides.slice(), newOffset, false);
+}
+function narrowBackward$1(grad, dim, start, originalLength) {
+  const outShape = grad.shape.slice();
+  outShape[dim] = originalLength;
+  const outSize = sizeOf(outShape);
+  const result = new Float32Array(outSize);
+  const outerSize = sizeOf(outShape.slice(0, dim));
+  const innerSize = sizeOf(outShape.slice(dim + 1));
+  const gradDimSize = grad.shape[dim];
+  for (let o = 0; o < outerSize; o++) for (let d = 0; d < gradDimSize; d++) for (let i = 0; i < innerSize; i++) {
+    const gradIdx = getStridedIndex(grad, o, d, i, dim);
+    const outIdx = o * originalLength * innerSize + (start + d) * innerSize + i;
+    result[outIdx] = grad.data[gradIdx];
+  }
+  return new Tensor$2(outShape, result);
+}
+function cat$1(tensors, options) {
+  if (tensors.length === 0) throw new Error("cat: empty tensor list");
+  const dim = options.dim < 0 ? options.dim + tensors[0].shape.length : options.dim;
+  const rank2 = tensors[0].shape.length;
+  for (let i = 1; i < tensors.length; i++) {
+    if (tensors[i].shape.length !== rank2) throw new Error("cat: rank mismatch");
+    for (let d = 0; d < rank2; d++) if (d !== dim && tensors[i].shape[d] !== tensors[0].shape[d]) throw new Error(`cat: shape mismatch at dim ${d}`);
+  }
+  const outShape = tensors[0].shape.slice();
+  outShape[dim] = tensors.reduce((s, t) => s + t.shape[dim], 0);
+  const outSize = sizeOf(outShape);
+  const result = new Float32Array(outSize);
+  const outerSize = dim === 0 ? 1 : sizeOf(outShape.slice(0, dim));
+  const innerSize = dim === rank2 - 1 ? 1 : sizeOf(outShape.slice(dim + 1));
+  let dimOffset = 0;
+  for (const t of tensors) {
+    const tDimSize = t.shape[dim];
+    for (let o = 0; o < outerSize; o++) for (let d = 0; d < tDimSize; d++) for (let i = 0; i < innerSize; i++) {
+      const srcIdx = getStridedIndex(t, o, d, i, dim);
+      const outIdx = o * outShape[dim] * innerSize + (dimOffset + d) * innerSize + i;
+      result[outIdx] = t.data[srcIdx];
+    }
+    dimOffset += tDimSize;
+  }
+  return new Tensor$2(outShape, result);
+}
+function getStridedIndex(t, outer, dimIdx, inner, dim) {
+  let idx = t.offset;
+  let outerRemain = outer;
+  for (let d = dim - 1; d >= 0; d--) {
+    idx += outerRemain % t.shape[d] * t.strides[d];
+    outerRemain = Math.floor(outerRemain / t.shape[d]);
+  }
+  idx += dimIdx * t.strides[dim];
+  let innerRemain = inner;
+  for (let d = t.shape.length - 1; d > dim; d--) {
+    idx += innerRemain % t.shape[d] * t.strides[d];
+    innerRemain = Math.floor(innerRemain / t.shape[d]);
+  }
+  return idx;
+}
+function transpose$2(a, options) {
+  if (!options) throw new Error("transpose requires options.dim0 and options.dim1");
+  const rank2 = a.shape.length;
+  const dim0 = normalizeDim$2(options.dim0, rank2);
+  const dim1 = normalizeDim$2(options.dim1, rank2);
+  if (dim0 === dim1) return a;
+  const shape = a.shape.slice();
+  const strides = a.strides.slice();
+  [shape[dim0], shape[dim1]] = [shape[dim1], shape[dim0]];
+  [strides[dim0], strides[dim1]] = [strides[dim1], strides[dim0]];
+  return new Tensor$2(shape, a.data, strides, a.offset, false);
+}
+function permute$2(a, dims) {
+  const rank2 = a.shape.length;
+  if (dims.length !== rank2) throw new Error(`permute: dims length ${dims.length} doesn't match tensor rank ${rank2}`);
+  const seen = /* @__PURE__ */ new Set();
+  for (const d of dims) {
+    const nd = normalizeDim$1(d, rank2);
+    if (nd < 0 || nd >= rank2) throw new Error(`permute: dimension ${d} out of range for rank ${rank2}`);
+    if (seen.has(nd)) throw new Error(`permute: duplicate dimension ${d}`);
+    seen.add(nd);
+  }
+  const normalizedDims = dims.map((d) => normalizeDim$1(d, rank2));
+  const newShape = normalizedDims.map((d) => a.shape[d]);
+  const newStrides = normalizedDims.map((d) => a.strides[d]);
+  return new Tensor$2(newShape, a.data, newStrides, a.offset, false);
+}
+function applyUnaryOp(a, fn) {
+  const out = new Float32Array(a.size);
+  const shapeStrides = contiguousStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) out[i] = fn(readAtLinear(a, i, shapeStrides));
+  return new Tensor$2(a.shape, out);
+}
+function applyBinaryOp(a, b, fn) {
+  const outShape = broadcastShapes(a.shape, b.shape);
+  const aBroadcast = broadcastTo(a, outShape);
+  const bBroadcast = broadcastTo(b, outShape);
+  const outSize = sizeOf(outShape);
+  const out = new Float32Array(outSize);
+  const shapeStrides = contiguousStrides(outShape);
+  for (let i = 0; i < outSize; i += 1) out[i] = fn(readAtLinear(aBroadcast, i, shapeStrides), readAtLinear(bBroadcast, i, shapeStrides));
+  return new Tensor$2(outShape, out);
+}
+function add$1(a, b) {
+  return applyBinaryOp(a, b, BINARY_OPS.add);
+}
+function mul$1(a, b) {
+  return applyBinaryOp(a, b, BINARY_OPS.mul);
+}
+function relu$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.relu);
+}
+function matmul$1(a, b) {
+  const aRank = a.shape.length;
+  const bRank = b.shape.length;
+  if (aRank === 0 || bRank === 0) throw new Error("matmul does not support scalar inputs");
+  const aWas1d = aRank === 1;
+  const bWas1d = bRank === 1;
+  const aMatrix = aWas1d ? new Tensor$2([1, a.shape[0]], a.data, [0, a.strides[0]], a.offset, false) : a;
+  const bMatrix = bWas1d ? new Tensor$2([b.shape[0], 1], b.data, [b.strides[0], 0], b.offset, false) : b;
+  if (aMatrix.shape.length < 2 || bMatrix.shape.length < 2) throw new Error("matmul requires tensors with at least 1 dimension");
+  const m = aMatrix.shape[aMatrix.shape.length - 2];
+  const k = aMatrix.shape[aMatrix.shape.length - 1];
+  const kB = bMatrix.shape[bMatrix.shape.length - 2];
+  const n = bMatrix.shape[bMatrix.shape.length - 1];
+  if (k !== kB) throw new Error("matmul dimension mismatch");
+  const batchShape = broadcastShapes(aMatrix.shape.slice(0, -2), bMatrix.shape.slice(0, -2));
+  const aBroadcast = broadcastTo(aMatrix, batchShape.concat([m, k]));
+  const bBroadcast = broadcastTo(bMatrix, batchShape.concat([k, n]));
+  const batchSize2 = sizeOf(batchShape);
+  const out = new Float32Array(batchSize2 * m * n);
+  const batchRank = batchShape.length;
+  const batchShapeStrides = contiguousStrides(batchShape);
+  const aBatchStrides = aBroadcast.strides.slice(0, batchRank);
+  const bBatchStrides = bBroadcast.strides.slice(0, batchRank);
+  const aRowStride = aBroadcast.strides[batchRank];
+  const aInnerStride = aBroadcast.strides[batchRank + 1];
+  const bInnerStride = bBroadcast.strides[batchRank];
+  const bColStride = bBroadcast.strides[batchRank + 1];
+  for (let batch = 0; batch < batchSize2; batch += 1) {
+    const aBase = linearOffset(batch, batchShapeStrides, aBatchStrides, aBroadcast.offset);
+    const bBase = linearOffset(batch, batchShapeStrides, bBatchStrides, bBroadcast.offset);
+    const outBase = batch * m * n;
+    for (let row = 0; row < m; row += 1) {
+      const rowOffset = aBase + row * aRowStride;
+      const outOffset = outBase + row * n;
+      for (let col = 0; col < n; col += 1) {
+        let acc = 0;
+        for (let inner = 0; inner < k; inner += 1) acc += aBroadcast.data[rowOffset + inner * aInnerStride] * bBroadcast.data[bBase + inner * bInnerStride + col * bColStride];
+        out[outOffset + col] = acc;
+      }
+    }
+  }
+  const outShape = batchShape.concat([m, n]);
+  if (aWas1d && bWas1d) return new Tensor$2([], out);
+  if (aWas1d) return new Tensor$2(batchShape.concat([n]), out);
+  if (bWas1d) return new Tensor$2(batchShape.concat([m]), out);
+  return new Tensor$2(outShape, out);
+}
+function sqrt$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.sqrt);
+}
+function exp$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.exp);
+}
+function log$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.log);
+}
+function neg$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.neg);
+}
+function abs$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.abs);
+}
+function tanh$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.tanh);
+}
+function sigmoid$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.sigmoid);
+}
+function erf(x) {
+  const a1 = 0.254829592;
+  const a2 = -0.284496736;
+  const a3 = 1.421413741;
+  const a4 = -1.453152027;
+  const a5 = 1.061405429;
+  const p = 0.3275911;
+  const sign2 = x < 0 ? -1 : 1;
+  x = Math.abs(x);
+  const t = 1 / (1 + p * x);
+  return sign2 * (1 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-x * x));
+}
+function gelu$1(a, options) {
+  const approximate = options?.approximate ?? "tanh";
+  const out = new Float32Array(a.size);
+  const shapeStrides = contiguousStrides(a.shape);
+  if (approximate === "tanh") {
+    const sqrt2OverPi = 0.7978845608;
+    for (let i = 0; i < a.size; i += 1) {
+      const x = readAtLinear(a, i, shapeStrides);
+      out[i] = x * 0.5 * (1 + Math.tanh(sqrt2OverPi * (x + 0.044715 * x * x * x)));
+    }
+  } else {
+    const sqrt2Inv = Math.SQRT1_2;
+    for (let i = 0; i < a.size; i += 1) {
+      const x = readAtLinear(a, i, shapeStrides);
+      out[i] = x * 0.5 * (1 + erf(x * sqrt2Inv));
+    }
+  }
+  return new Tensor$2(a.shape, out);
+}
+function silu$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.silu);
+}
+function sin$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.sin);
+}
+function cos$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.cos);
+}
+function rsqrt$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.rsqrt);
+}
+function floor$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.floor);
+}
+function ceil$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.ceil);
+}
+function round$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.round);
+}
+function sign$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.sign);
+}
+function isfinite$1(a) {
+  return applyUnaryOp(a, UNARY_OPS.isfinite);
+}
+function clamp$1(a, min2, max2) {
+  return applyUnaryOp(a, (v) => {
+    if (min2 !== null && v < min2) v = min2;
+    if (max2 !== null && v > max2) v = max2;
+    return v;
+  });
+}
+function pow$1(a, b) {
+  return applyBinaryOp(a, b, BINARY_OPS.pow);
+}
+function isContiguous(tensor) {
+  const expected = contiguousStrides(tensor.shape);
+  if (expected.length !== tensor.strides.length) return false;
+  for (let axis = 0; axis < expected.length; axis += 1) {
+    if (tensor.shape[axis] <= 1) continue;
+    if (tensor.strides[axis] !== expected[axis]) return false;
+  }
+  return true;
+}
+function linearOffset(linear, shapeStrides, strides, baseOffset) {
+  let remainder = linear;
+  let offset = baseOffset;
+  for (let axis = 0; axis < shapeStrides.length; axis += 1) {
+    const stride = shapeStrides[axis];
+    const coord = stride === 0 ? 0 : Math.floor(remainder / stride);
+    remainder -= coord * stride;
+    offset += coord * strides[axis];
+  }
+  return offset;
+}
+function readAtLinear(tensor, linear, shapeStrides) {
+  const offset = linearOffset(linear, shapeStrides, tensor.strides, tensor.offset);
+  return tensor.data[offset];
+}
+function broadcastTo(a, targetShape) {
+  if (a.shape.length === targetShape.length && a.shape.every((dim, index) => dim === targetShape[index])) return a;
+  if (a.shape.length > targetShape.length) throw new Error("broadcast target has fewer dimensions than input");
+  const pad = targetShape.length - a.shape.length;
+  const outStrides = new Array(targetShape.length);
+  for (let axis = 0; axis < targetShape.length; axis += 1) {
+    const inAxis = axis - pad;
+    if (inAxis < 0) {
+      outStrides[axis] = 0;
+      continue;
+    }
+    const inDim = a.shape[inAxis];
+    if (inDim === targetShape[axis]) outStrides[axis] = a.strides[inAxis];
+    else if (inDim === 1) outStrides[axis] = 0;
+    else throw new Error("broadcast target shape is incompatible");
+  }
+  return new Tensor$2(targetShape, a.data, outStrides, a.offset, false);
+}
+function normalizeDim$2(dim, rank2) {
+  const normalized = dim < 0 ? rank2 + dim : dim;
+  if (normalized < 0 || normalized >= rank2) throw new Error(`dim out of range: ${dim}`);
+  return normalized;
+}
+function readIndexValue(value, limit) {
+  if (!Number.isFinite(value) || Math.trunc(value) !== value) throw new Error("index values must be integers");
+  if (value < 0 || value >= limit) throw new Error("index out of range");
+  return value;
+}
+function conv2d$1(input, weight, bias, options) {
+  const [N, Cin, H, W] = input.shape;
+  const [Cout, CinK, KH, KW] = weight.shape;
+  if (Cin !== CinK) throw new Error(`conv2d: input channels ${Cin} != weight channels ${CinK}`);
+  const stride = normalizePair(options?.stride, 1);
+  const padding = normalizePair(options?.padding, 0);
+  const [sH, sW] = stride;
+  const [pH, pW] = padding;
+  const outH = Math.floor((H + 2 * pH - KH) / sH + 1);
+  const outW = Math.floor((W + 2 * pW - KW) / sW + 1);
+  const out = new Float32Array(N * Cout * outH * outW);
+  for (let n = 0; n < N; n++) for (let co = 0; co < Cout; co++) for (let oh = 0; oh < outH; oh++) for (let ow = 0; ow < outW; ow++) {
+    let acc = bias ? readElement(bias, [co]) : 0;
+    for (let ci = 0; ci < Cin; ci++) for (let ky = 0; ky < KH; ky++) for (let kx = 0; kx < KW; kx++) {
+      const ih = oh * sH - pH + ky;
+      const iw = ow * sW - pW + kx;
+      if (ih >= 0 && ih < H && iw >= 0 && iw < W) acc += readElement(input, [
+        n,
+        ci,
+        ih,
+        iw
+      ]) * readElement(weight, [
+        co,
+        ci,
+        ky,
+        kx
+      ]);
+    }
+    out[n * Cout * outH * outW + co * outH * outW + oh * outW + ow] = acc;
+  }
+  return new Tensor$2([
+    N,
+    Cout,
+    outH,
+    outW
+  ], out);
+}
+function normalizePair(p, fallback) {
+  if (p === void 0) return [fallback, fallback];
+  if (typeof p === "number") return [p, p];
+  return p;
+}
+function readElement(t, indices) {
+  let offset = t.offset;
+  for (let i = 0; i < indices.length; i++) offset += indices[i] * t.strides[i];
+  return t.data[offset];
+}
+function gather$1(a, index, options) {
+  if (!options) throw new Error("gather requires options.dim");
+  const rank2 = a.shape.length;
+  if (index.shape.length !== rank2) throw new Error("gather requires index with the same rank as input");
+  const dim = normalizeDim$2(options.dim, rank2);
+  for (let i = 0; i < rank2; i += 1) if (i !== dim && index.shape[i] > a.shape[i]) throw new Error("gather index shape must be <= input shape");
+  const out = new Float32Array(index.size);
+  const indexShapeStrides = contiguousStrides(index.shape);
+  const inputStrides = a.strides;
+  for (let linear = 0; linear < index.size; linear += 1) {
+    let remainder = linear;
+    let inputOffset = 0;
+    for (let axis = 0; axis < rank2; axis += 1) {
+      const stride = indexShapeStrides[axis];
+      const coord = Math.floor(remainder / stride);
+      remainder -= coord * stride;
+      if (axis === dim) {
+        const idx = readIndexValue(readAtLinear(index, linear, indexShapeStrides), a.shape[dim]);
+        inputOffset += idx * inputStrides[axis];
+      } else inputOffset += coord * inputStrides[axis];
+    }
+    out[linear] = a.data[inputOffset + a.offset];
+  }
+  return new Tensor$2(index.shape, out);
+}
+function scatterAdd$1(a, index, src, options) {
+  if (!options) throw new Error("scatterAdd requires options.dim");
+  const rank2 = a.shape.length;
+  if (index.shape.length !== rank2 || src.shape.length !== rank2) throw new Error("scatterAdd requires index/src with the same rank as input");
+  const dim = normalizeDim$2(options.dim, rank2);
+  for (let i = 0; i < rank2; i += 1) {
+    if (index.shape[i] !== src.shape[i]) throw new Error("scatterAdd requires index and src to have the same shape");
+    if (i !== dim && index.shape[i] > a.shape[i]) throw new Error("scatterAdd index shape must be <= input shape");
+  }
+  const out = new Float32Array(a.size);
+  const shapeStrides = contiguousStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) out[i] = readAtLinear(a, i, shapeStrides);
+  const indexShapeStrides = contiguousStrides(index.shape);
+  const outStrides = contiguousStrides(a.shape);
+  for (let linear = 0; linear < index.size; linear += 1) {
+    let remainder = linear;
+    let outputOffset = 0;
+    for (let axis = 0; axis < rank2; axis += 1) {
+      const stride = indexShapeStrides[axis];
+      const coord = Math.floor(remainder / stride);
+      remainder -= coord * stride;
+      if (axis === dim) {
+        const idx = readIndexValue(readAtLinear(index, linear, indexShapeStrides), a.shape[dim]);
+        outputOffset += idx * outStrides[axis];
+      } else outputOffset += coord * outStrides[axis];
+    }
+    out[outputOffset] += readAtLinear(src, linear, indexShapeStrides);
+  }
+  return new Tensor$2(a.shape, out);
+}
+function sumAll(a) {
+  let total = 0;
+  const shapeStrides = contiguousStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) total += readAtLinear(a, i, shapeStrides);
+  return total;
+}
+function normalizeDims(dim, rank2) {
+  const normalized = (Array.isArray(dim) ? dim.slice() : [dim]).map((value) => value < 0 ? rank2 + value : value);
+  const unique = /* @__PURE__ */ new Set();
+  for (const value of normalized) {
+    if (value < 0 || value >= rank2) throw new Error(`sum dim out of range: ${value}`);
+    if (unique.has(value)) throw new Error(`sum dim repeated: ${value}`);
+    unique.add(value);
+  }
+  return Array.from(unique).sort((a, b) => a - b);
+}
+function sum$1(a, options) {
+  if (!options || options.dim == null) return new Tensor$2([], new Float32Array([sumAll(a)]));
+  if (options.dtype != null) throw new Error("sum dtype option is not supported yet");
+  const rank2 = a.shape.length;
+  const dims = normalizeDims(options.dim, rank2);
+  const keepdim = options.keepdim ?? false;
+  const reduceSet = new Set(dims);
+  const outShape = keepdim ? a.shape.map((dim, index) => reduceSet.has(index) ? 1 : dim) : a.shape.filter((_, index) => !reduceSet.has(index));
+  const outSize = outShape.reduce((acc, dim) => acc * dim, 1) || 1;
+  const out = new Float32Array(outSize);
+  const inShapeStrides = contiguousStrides(a.shape);
+  const outStrides = contiguousStrides(outShape);
+  for (let linear = 0; linear < a.size; linear += 1) {
+    let remainder = linear;
+    let outOffset = 0;
+    if (keepdim) for (let dim = 0; dim < rank2; dim += 1) {
+      const stride = inShapeStrides[dim];
+      const coord = Math.floor(remainder / stride);
+      remainder -= coord * stride;
+      if (!reduceSet.has(dim)) outOffset += coord * outStrides[dim];
+    }
+    else {
+      let outDim = 0;
+      for (let dim = 0; dim < rank2; dim += 1) {
+        const stride = inShapeStrides[dim];
+        const coord = Math.floor(remainder / stride);
+        remainder -= coord * stride;
+        if (!reduceSet.has(dim)) {
+          outOffset += coord * outStrides[outDim];
+          outDim += 1;
+        }
+      }
+    }
+    out[outOffset] += readAtLinear(a, linear, inShapeStrides);
+  }
+  return new Tensor$2(outShape, out);
+}
+function maxAll(a) {
+  let maxVal = -Infinity;
+  const shapeStrides = contiguousStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) {
+    const val = readAtLinear(a, i, shapeStrides);
+    if (val > maxVal) maxVal = val;
+  }
+  return maxVal;
+}
+function max$1(a, options) {
+  if (!options || options.dim == null) return new Tensor$2([], new Float32Array([maxAll(a)]));
+  const rank2 = a.shape.length;
+  const dims = normalizeDimsForReduce(options.dim, rank2, "max");
+  const keepdim = options.keepdim ?? false;
+  const reduceSet = new Set(dims);
+  const outShape = keepdim ? a.shape.map((dim, index) => reduceSet.has(index) ? 1 : dim) : a.shape.filter((_, index) => !reduceSet.has(index));
+  const outSize = outShape.reduce((acc, dim) => acc * dim, 1) || 1;
+  const out = new Float32Array(outSize);
+  out.fill(-Infinity);
+  const inShapeStrides = contiguousStrides(a.shape);
+  const outStrides = contiguousStrides(outShape);
+  for (let linear = 0; linear < a.size; linear += 1) {
+    let remainder = linear;
+    let outOffset = 0;
+    if (keepdim) for (let dim = 0; dim < rank2; dim += 1) {
+      const stride = inShapeStrides[dim];
+      const coord = Math.floor(remainder / stride);
+      remainder -= coord * stride;
+      if (!reduceSet.has(dim)) outOffset += coord * outStrides[dim];
+    }
+    else {
+      let outDim = 0;
+      for (let dim = 0; dim < rank2; dim += 1) {
+        const stride = inShapeStrides[dim];
+        const coord = Math.floor(remainder / stride);
+        remainder -= coord * stride;
+        if (!reduceSet.has(dim)) {
+          outOffset += coord * outStrides[outDim];
+          outDim += 1;
+        }
+      }
+    }
+    const val = readAtLinear(a, linear, inShapeStrides);
+    if (val > out[outOffset]) out[outOffset] = val;
+  }
+  return new Tensor$2(outShape, out);
+}
+function minAll(a) {
+  let minVal = Infinity;
+  const shapeStrides = contiguousStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) {
+    const val = readAtLinear(a, i, shapeStrides);
+    if (val < minVal) minVal = val;
+  }
+  return minVal;
+}
+function min$1(a, options) {
+  if (!options || options.dim == null) return new Tensor$2([], new Float32Array([minAll(a)]));
+  const rank2 = a.shape.length;
+  const dims = normalizeDimsForReduce(options.dim, rank2, "min");
+  const keepdim = options.keepdim ?? false;
+  const reduceSet = new Set(dims);
+  const outShape = keepdim ? a.shape.map((dim, index) => reduceSet.has(index) ? 1 : dim) : a.shape.filter((_, index) => !reduceSet.has(index));
+  const outSize = outShape.reduce((acc, dim) => acc * dim, 1) || 1;
+  const out = new Float32Array(outSize);
+  out.fill(Infinity);
+  const inShapeStrides = contiguousStrides(a.shape);
+  const outStrides = contiguousStrides(outShape);
+  for (let linear = 0; linear < a.size; linear += 1) {
+    let remainder = linear;
+    let outOffset = 0;
+    if (keepdim) for (let dim = 0; dim < rank2; dim += 1) {
+      const stride = inShapeStrides[dim];
+      const coord = Math.floor(remainder / stride);
+      remainder -= coord * stride;
+      if (!reduceSet.has(dim)) outOffset += coord * outStrides[dim];
+    }
+    else {
+      let outDim = 0;
+      for (let dim = 0; dim < rank2; dim += 1) {
+        const stride = inShapeStrides[dim];
+        const coord = Math.floor(remainder / stride);
+        remainder -= coord * stride;
+        if (!reduceSet.has(dim)) {
+          outOffset += coord * outStrides[outDim];
+          outDim += 1;
+        }
+      }
+    }
+    const val = readAtLinear(a, linear, inShapeStrides);
+    if (val < out[outOffset]) out[outOffset] = val;
+  }
+  return new Tensor$2(outShape, out);
+}
+function normalizeDimsForReduce(dim, rank2, opName) {
+  const normalized = (Array.isArray(dim) ? dim.slice() : [dim]).map((value) => value < 0 ? rank2 + value : value);
+  const unique = /* @__PURE__ */ new Set();
+  for (const value of normalized) {
+    if (value < 0 || value >= rank2) throw new Error(`${opName} dim out of range: ${value}`);
+    if (unique.has(value)) throw new Error(`${opName} dim repeated: ${value}`);
+    unique.add(value);
+  }
+  return Array.from(unique).sort((a, b) => a - b);
+}
+function argReduce$1(a, opName, options, initVal, isBetter) {
+  const rank2 = a.shape.length;
+  const dim = options.dim < 0 ? options.dim + rank2 : options.dim;
+  if (dim < 0 || dim >= rank2) throw new Error(`${opName}: dim ${options.dim} out of range for tensor of rank ${rank2}`);
+  const keepdim = options.keepdim ?? false;
+  const outShape = keepdim ? a.shape.map((d, i) => i === dim ? 1 : d) : a.shape.filter((_, i) => i !== dim);
+  const outSize = outShape.reduce((acc, d) => acc * d, 1) || 1;
+  const out = new Float32Array(outSize);
+  const bestVals = new Float32Array(outSize);
+  bestVals.fill(initVal);
+  const inShapeStrides = contiguousStrides(a.shape);
+  const outStrides = contiguousStrides(outShape);
+  for (let linear = 0; linear < a.size; linear += 1) {
+    let remainder = linear;
+    let outOffset = 0;
+    let dimCoord = 0;
+    if (keepdim) for (let d = 0; d < rank2; d += 1) {
+      const stride = inShapeStrides[d];
+      const coord = Math.floor(remainder / stride);
+      remainder -= coord * stride;
+      if (d === dim) dimCoord = coord;
+      else outOffset += coord * outStrides[d];
+    }
+    else {
+      let outDim = 0;
+      for (let d = 0; d < rank2; d += 1) {
+        const stride = inShapeStrides[d];
+        const coord = Math.floor(remainder / stride);
+        remainder -= coord * stride;
+        if (d === dim) dimCoord = coord;
+        else {
+          outOffset += coord * outStrides[outDim];
+          outDim += 1;
+        }
+      }
+    }
+    const val = readAtLinear(a, linear, inShapeStrides);
+    if (isBetter(val, bestVals[outOffset])) {
+      bestVals[outOffset] = val;
+      out[outOffset] = dimCoord;
+    }
+  }
+  return new Tensor$2(outShape, out);
+}
+function argmax$1(a, options) {
+  return argReduce$1(a, "argmax", options, -Infinity, (v, b) => v > b);
+}
+function argmin$1(a, options) {
+  return argReduce$1(a, "argmin", options, Infinity, (v, b) => v < b);
+}
+function comparisonOp$1(a, b, cmp2) {
+  return applyBinaryOp(a, b, (x, y) => cmp2(x, y) ? 1 : 0);
+}
+function gt$1(a, b) {
+  return comparisonOp$1(a, b, (x, y) => x > y);
+}
+function lt$1(a, b) {
+  return comparisonOp$1(a, b, (x, y) => x < y);
+}
+function ge$1(a, b) {
+  return comparisonOp$1(a, b, (x, y) => x >= y);
+}
+function le$1(a, b) {
+  return comparisonOp$1(a, b, (x, y) => x <= y);
+}
+function eq$1(a, b) {
+  return comparisonOp$1(a, b, (x, y) => x === y);
+}
+function ne$1(a, b) {
+  return comparisonOp$1(a, b, (x, y) => x !== y);
+}
+function where$1(condition, x, y) {
+  const outShape = broadcastThreeShapes(condition.shape, x.shape, y.shape);
+  const condBroadcast = broadcastTo(condition, outShape);
+  const xBroadcast = broadcastTo(x, outShape);
+  const yBroadcast = broadcastTo(y, outShape);
+  const outSize = sizeOf(outShape);
+  const out = new Float32Array(outSize);
+  const shapeStrides = contiguousStrides(outShape);
+  for (let i = 0; i < outSize; i += 1) {
+    const condVal = readAtLinear(condBroadcast, i, shapeStrides);
+    const xVal = readAtLinear(xBroadcast, i, shapeStrides);
+    const yVal = readAtLinear(yBroadcast, i, shapeStrides);
+    out[i] = condVal !== 0 ? xVal : yVal;
+  }
+  return new Tensor$2(outShape, out);
+}
+function stridedScatterImpl$1(opName, base, src, options, combine) {
+  const { offset, viewShape, viewStrides } = options;
+  if (src.shape.length !== viewShape.length) throw new Error(`${opName}: src rank ${src.shape.length} doesn't match view rank ${viewShape.length}`);
+  for (let i = 0; i < viewShape.length; i++) if (src.shape[i] !== viewShape[i]) throw new Error(`${opName}: src shape [${src.shape}] doesn't match view shape [${viewShape}]`);
+  const out = new Float32Array(base.data.length);
+  out.set(base.data);
+  const srcSize = sizeOf(viewShape);
+  const srcShapeStrides = contiguousStrides(viewShape);
+  for (let linear = 0; linear < srcSize; linear++) {
+    let remainder = linear;
+    let baseOffset = offset;
+    for (let axis = 0; axis < viewShape.length; axis++) {
+      const stride = srcShapeStrides[axis];
+      const coord = Math.floor(remainder / stride);
+      remainder -= coord * stride;
+      baseOffset += coord * viewStrides[axis];
+    }
+    const srcVal = readAtLinear(src, linear, srcShapeStrides);
+    out[baseOffset] = combine(out[baseOffset], srcVal);
+  }
+  return new Tensor$2(base.shape, out, contiguousStrides(base.shape), 0);
+}
+function stridedScatterCopy$1(base, src, options) {
+  return stridedScatterImpl$1("stridedScatterCopy", base, src, options, (_, v) => v);
+}
+function stridedScatterAdd$1(base, src, options) {
+  return stridedScatterImpl$1("stridedScatterAdd", base, src, options, (e, v) => e + v);
+}
+function mean$1(a, options) {
+  if (!options || options.dim == null) return new Tensor$2([], new Float32Array([sumAll(a) / a.size]));
+  if (options.dtype != null) throw new Error("mean dtype option is not supported yet");
+  const rank2 = a.shape.length;
+  const dims = normalizeDims(options.dim, rank2);
+  const keepdim = options.keepdim ?? false;
+  const reduceSet = new Set(dims);
+  const reduceCount = dims.reduce((acc, dim) => acc * a.shape[dim], 1);
+  const outShape = keepdim ? a.shape.map((dim, index) => reduceSet.has(index) ? 1 : dim) : a.shape.filter((_, index) => !reduceSet.has(index));
+  const outSize = outShape.reduce((acc, dim) => acc * dim, 1) || 1;
+  const out = new Float32Array(outSize);
+  const inShapeStrides = contiguousStrides(a.shape);
+  const outStrides = contiguousStrides(outShape);
+  for (let linear = 0; linear < a.size; linear += 1) {
+    let remainder = linear;
+    let outOffset = 0;
+    if (keepdim) for (let dim = 0; dim < rank2; dim += 1) {
+      const stride = inShapeStrides[dim];
+      const coord = Math.floor(remainder / stride);
+      remainder -= coord * stride;
+      if (!reduceSet.has(dim)) outOffset += coord * outStrides[dim];
+    }
+    else {
+      let outDim = 0;
+      for (let dim = 0; dim < rank2; dim += 1) {
+        const stride = inShapeStrides[dim];
+        const coord = Math.floor(remainder / stride);
+        remainder -= coord * stride;
+        if (!reduceSet.has(dim)) {
+          outOffset += coord * outStrides[outDim];
+          outDim += 1;
+        }
+      }
+    }
+    out[outOffset] += readAtLinear(a, linear, inShapeStrides);
+  }
+  const denom = reduceCount || 0;
+  for (let i = 0; i < out.length; i += 1) out[i] = out[i] / denom;
+  return new Tensor$2(outShape, out);
+}
+var Tensor$2, UNARY_OPS, BINARY_OPS;
+var init_numeric = __esmMin((() => {
+  init_shape();
+  init_types$1();
+  Tensor$2 = class Tensor22 {
+    shape;
+    strides;
+    data;
+    offset;
+    sizeValue;
+    constructor(shape, data, strides, offset = 0, validateLength = true) {
+      const expected = sizeOf(shape);
+      if (validateLength && expected !== data.length) throw new Error("Tensor data length does not match shape");
+      this.shape = shape.slice();
+      this.strides = (strides ?? contiguousStrides(shape)).slice();
+      this.data = data;
+      this.offset = offset;
+      this.sizeValue = expected;
+    }
+    get size() {
+      return this.sizeValue;
+    }
+    view(shape) {
+      if (sizeOf(shape) !== this.size) throw new Error("View shape does not match tensor size");
+      if (isContiguous(this)) {
+        const strides2 = contiguousStrides(shape);
+        return new Tensor22(shape, this.data, strides2, this.offset, false);
+      }
+      const newStrides = inferReshapeStrides(this.shape, this.strides, shape);
+      if (newStrides !== null) return new Tensor22(shape, this.data, newStrides, this.offset, false);
+      const contig = this.contiguous();
+      const strides = contiguousStrides(shape);
+      return new Tensor22(shape, contig.data, strides, contig.offset, false);
+    }
+    /**
+    * Check if this tensor has contiguous memory layout.
+    * Returns true if strides match row-major (C-style) layout.
+    */
+    isContiguous() {
+      return isContiguous(this);
+    }
+    /**
+    * Return a contiguous tensor. If already contiguous, returns self.
+    * Otherwise, materializes into a new contiguous tensor.
+    */
+    contiguous() {
+      if (isContiguous(this)) return this;
+      const out = new Float32Array(this.size);
+      const shapeStrides = contiguousStrides(this.shape);
+      for (let i = 0; i < this.size; i++) out[i] = readAtLinear(this, i, shapeStrides);
+      return new Tensor22(this.shape, out);
+    }
+    toArray() {
+      const out = new Array(this.sizeValue);
+      if (this.sizeValue === 0) return out;
+      const shapeStrides = contiguousStrides(this.shape);
+      for (let i = 0; i < this.sizeValue; i += 1) out[i] = readAtLinear(this, i, shapeStrides);
+      return out;
+    }
+  };
+  UNARY_OPS = {
+    sqrt: Math.sqrt,
+    exp: Math.exp,
+    log: Math.log,
+    neg: (x) => -x,
+    abs: Math.abs,
+    tanh: Math.tanh,
+    sigmoid: (x) => 1 / (1 + Math.exp(-x)),
+    silu: (x) => x / (1 + Math.exp(-x)),
+    sin: Math.sin,
+    cos: Math.cos,
+    rsqrt: (x) => 1 / Math.sqrt(x),
+    floor: Math.floor,
+    ceil: Math.ceil,
+    round: Math.round,
+    sign: Math.sign,
+    isfinite: (x) => Number.isFinite(x) ? 1 : 0,
+    relu: (x) => x > 0 ? x : 0
+  };
+  BINARY_OPS = {
+    add: (x, y) => x + y,
+    mul: (x, y) => x * y,
+    pow: Math.pow
+  };
+}));
+function read$1(tensor) {
+  return Promise.resolve(tensor.toArray());
+}
+function cast$1(a, _dtype) {
+  return a;
+}
+var cpuBackend;
+var init_cpu = __esmMin((() => {
+  init_numeric();
+  init_numeric();
+  cpuBackend = {
+    name: "cpu",
+    ops: {
+      tensorFromArray: tensorFromArray$1,
+      zeros: zeros$1,
+      full: full$1,
+      rand: rand$1,
+      randn: randn$1,
+      bernoulli: bernoulli$1,
+      arange: arange$1,
+      add: add$1,
+      sub: sub$1,
+      div: div$1,
+      mul: mul$1,
+      matmul: matmul$1,
+      sqrt: sqrt$1,
+      relu: relu$1,
+      exp: exp$1,
+      log: log$1,
+      neg: neg$1,
+      abs: abs$1,
+      tanh: tanh$1,
+      sigmoid: sigmoid$1,
+      gelu: gelu$1,
+      silu: silu$1,
+      sin: sin$1,
+      cos: cos$1,
+      rsqrt: rsqrt$1,
+      floor: floor$1,
+      ceil: ceil$1,
+      round: round$1,
+      sign: sign$1,
+      clamp: clamp$1,
+      pow: pow$1,
+      isfinite: isfinite$1,
+      conv2d: conv2d$1,
+      gather: gather$1,
+      scatterAdd: scatterAdd$1,
+      cat: cat$1,
+      sum: sum$1,
+      max: max$1,
+      mean: mean$1,
+      min: min$1,
+      argmax: argmax$1,
+      argmin: argmin$1,
+      gt: gt$1,
+      lt: lt$1,
+      ge: ge$1,
+      le: le$1,
+      eq: eq$1,
+      ne: ne$1,
+      expand: expand$2,
+      reshape: reshape$2,
+      transpose: transpose$2,
+      permute: permute$2,
+      narrow: narrow$1,
+      narrowBackward: narrowBackward$1,
+      contiguous: contiguous$2,
+      cast: cast$1,
+      where: where$1,
+      tril: tril$1,
+      triu: triu$1,
+      stridedScatterCopy: stridedScatterCopy$1,
+      stridedScatterAdd: stridedScatterAdd$1,
+      read: read$1
+    }
+  };
+}));
+function tensorFromArray$2(values, shape) {
+  return new Tensor$2(shape, values instanceof Float32Array ? values.slice() : Float32Array.from(values));
+}
+function add$2(a, _b) {
+  return new Tensor$2(a.shape, Float32Array.from(a.toArray()));
+}
+function sub$2(a, _b, _options) {
+  return new Tensor$2(a.shape, Float32Array.from(a.toArray()));
+}
+function div$2(a, _b, _options) {
+  return new Tensor$2(a.shape, Float32Array.from(a.toArray()));
+}
+function mul$2(a, _b) {
+  return new Tensor$2(a.shape, Float32Array.from(a.toArray()));
+}
+function matmul$2(a, b) {
+  return matmul$1(a, b);
+}
+function sqrt$2(a) {
+  return sqrt$1(a);
+}
+function relu$2(a) {
+  return relu$1(a);
+}
+function expand$1(a, shape) {
+  return expand$2(a, shape);
+}
+function reshape$1(a, shape) {
+  return reshape$2(a, shape);
+}
+function transpose$1(a, options) {
+  return transpose$2(a, options);
+}
+function gather$2(a, index, options) {
+  return gather$1(a, index, options);
+}
+function scatterAdd$2(a, index, src, options) {
+  return scatterAdd$1(a, index, src, options);
+}
+function sum$2(a, options) {
+  return sum$1(a, options);
+}
+function mean$2(a, options) {
+  return mean$1(a, options);
+}
+function read$2(a) {
+  return Promise.resolve(a.toArray());
+}
+function permute$1(a, _dims) {
+  return new Tensor$2(a.shape, Float32Array.from(a.toArray()));
+}
+function contiguous$1(a) {
+  return new Tensor$2(a.shape, Float32Array.from(a.toArray()));
+}
+function max$2(a, _options) {
+  const arr = a.toArray();
+  const maxVal = Math.max(...arr);
+  return new Tensor$2([], Float32Array.of(maxVal));
+}
+function where$2(condition, x, y, _options) {
+  const cArr = condition.toArray();
+  const xArr = x.toArray();
+  const yArr = y.toArray();
+  const result = new Float32Array(cArr.length);
+  for (let i = 0; i < cArr.length; i++) result[i] = cArr[i] !== 0 ? xArr[i] : yArr[i];
+  return new Tensor$2(condition.shape, result);
+}
+function stridedScatterCopy$2(base, _src, _options) {
+  return new Tensor$2(base.shape, Float32Array.from(base.toArray()));
+}
+function stridedScatterAdd$2(base, _src, _options) {
+  return new Tensor$2(base.shape, Float32Array.from(base.toArray()));
+}
+var mockBackend;
+var init_mock = __esmMin((() => {
+  init_cpu();
+  mockBackend = {
+    name: "mock",
+    ops: {
+      tensorFromArray: tensorFromArray$2,
+      add: add$2,
+      sub: sub$2,
+      div: div$2,
+      mul: mul$2,
+      matmul: matmul$2,
+      sqrt: sqrt$2,
+      relu: relu$2,
+      expand: expand$1,
+      reshape: reshape$1,
+      transpose: transpose$1,
+      permute: permute$1,
+      contiguous: contiguous$1,
+      max: max$2,
+      where: where$2,
+      stridedScatterCopy: stridedScatterCopy$2,
+      stridedScatterAdd: stridedScatterAdd$2,
+      gather: gather$2,
+      scatterAdd: scatterAdd$2,
+      sum: sum$2,
+      mean: mean$2,
+      read: read$2
+    }
+  };
+}));
+function getBackend(name) {
+  return backends.get(name);
+}
+function registerBackend(backend) {
+  backends.set(backend.name, backend);
+}
+function getActiveBackend() {
+  return activeBackend;
+}
+var backends, activeBackend;
+var init_registry$1 = __esmMin((() => {
+  init_cpu();
+  init_mock();
+  backends = /* @__PURE__ */ new Map();
+  backends.set(cpuBackend.name, cpuBackend);
+  backends.set(mockBackend.name, mockBackend);
+  activeBackend = cpuBackend;
+}));
+async function withProfileContext(label, module, fn) {
+  setCurrentOpLabel(label);
+  setProfileModule(module ?? "unknown");
+  const t0 = profileOpBegin();
+  try {
+    return await fn();
+  } finally {
+    profileOpEnd(label, t0);
+    setCurrentOpLabel(null);
+    setProfileModule("unknown");
+  }
+}
+function getInputStorage(ref2, backend) {
+  if (ref2.kind === "materialized") return ref2.storage;
+  if (ref2.kind === "scalar") {
+    const b = backend ?? getBackend("cpu");
+    if (!b) throw new Error("No backend available to materialize scalar ref");
+    const prevLabel = getCurrentOpLabel();
+    setCurrentOpLabel("full");
+    const bt = b.ops.full ? b.ops.full([], ref2.value) : b.ops.tensorFromArray([ref2.value], []);
+    setCurrentOpLabel(prevLabel);
+    return createStorageHandle("cpu", bt);
+  }
+  const idx = ref2.outputIndex ?? 0;
+  if (idx === 0 && ref2.node.result) return ref2.node.result;
+  if (ref2.node.results?.[idx]) return ref2.node.results[idx];
+  throw new Error(`Input not ready: node id=${ref2.node.id} op=${ref2.node.op}[${idx}] shape=[${ref2.node.shape}] caller=${(/* @__PURE__ */ new Error()).stack?.split("\n")[2]?.trim()}`);
+}
+function getPayload(node) {
+  return node.payload;
+}
+function requirePayload(node) {
+  const p = node.payload;
+  if (!p) throw new Error(`${node.op} requires payload`);
+  return p;
+}
+function assertOpSupported(op, fn) {
+  if (!fn) throw new Error(`${op} not supported by backend`);
+}
+function executeGenericOp(node, backendInputs, backend) {
+  const desc = GENERIC_OP_TABLE[node.op];
+  if (!desc) throw new Error(`Unknown reduction op: ${node.op}`);
+  const fn = backend.ops[node.op];
+  assertOpSupported(node.op, fn);
+  const args = desc.arity === "all" ? [backendInputs] : backendInputs.slice(0, desc.arity);
+  if (desc.payload === "required") args.push(requirePayload(node));
+  else if (desc.payload === "optional") args.push(getPayload(node));
+  return fn(...args);
+}
+function executeAdamStep(node, backendInputs, backend) {
+  assertOpSupported("adamStep", backend.ops.adamStep);
+  const payload = requirePayload(node);
+  return (async () => {
+    const adamResult = await backend.ops.adamStep(backendInputs[0], backendInputs[1], backendInputs[2], backendInputs[3], payload);
+    const mStorage = createStorageHandle(node.device, adamResult.m);
+    const vStorage = createStorageHandle(node.device, adamResult.v);
+    node.results = [
+      null,
+      mStorage,
+      vStorage
+    ];
+    storageTracker.markReachable(mStorage.id, node.results);
+    storageTracker.markReachable(vStorage.id, node.results);
+    return adamResult.param;
+  })();
+}
+function executeFusedOp(node, backendInputs, backend) {
+  const desc = FUSED_OP_TABLE[node.op];
+  if (desc) {
+    const payload = requirePayload(node);
+    const fn = backend.ops[node.op];
+    assertOpSupported(node.op, fn);
+    const result = fn(...backendInputs, payload);
+    if (desc.kind === "dispatch") return result;
+    const r = result;
+    node.results = [createStorageHandle(node.device, r[desc.returnField]), ...desc.extraFields.map((field) => createStorageHandle(node.device, r[field]))];
+    return r[desc.returnField];
+  }
+  if (node.op === "transfer") {
+    const sourceDevice = getPayload(node)?.sourceDevice ?? (node.inputs[0]?.kind === "materialized" ? node.inputs[0].storage.device : void 0);
+    const sourceBackend = sourceDevice ? getBackend(sourceDevice) : backend;
+    if (!sourceBackend) throw new Error(`Transfer failed: backend not available for source device ${sourceDevice}`);
+    const targetBackend = getBackend(node.device);
+    if (!targetBackend) throw new Error(`Transfer failed: backend not available for ${node.device}`);
+    if (sourceDevice === node.device) return backendInputs[0];
+    return (async () => {
+      const data = await sourceBackend.ops.read(backendInputs[0]);
+      return targetBackend.ops.tensorFromArray(data, node.shape);
+    })();
+  }
+  throw new Error(`Unknown fused op: ${node.op}`);
+}
+function buildOpTable() {
+  const t = /* @__PURE__ */ new Map();
+  for (const [op, handler] of Object.entries(CREATION_OP_TABLE)) t.set(op, handler);
+  for (const [op, handler] of Object.entries(SHAPE_OP_TABLE)) t.set(op, handler);
+  for (const op of Object.keys(GENERIC_OP_TABLE)) t.set(op, executeGenericOp);
+  t.set("clamp", (node, backendInputs, backend) => {
+    assertOpSupported("clamp", backend.ops.clamp);
+    const p = getPayload(node);
+    return backend.ops.clamp(backendInputs[0], p?.min ?? null, p?.max ?? null);
+  });
+  t.set("unscaleGrad", (node, backendInputs, backend) => {
+    const payload = requirePayload(node);
+    assertOpSupported("unscaleGrad", backend.ops.unscaleGrad);
+    return backend.ops.unscaleGrad(backendInputs[0], payload.invScale, payload.infFlagBuffer);
+  });
+  t.set("adamStep", executeAdamStep);
+  return t;
+}
+async function executeOp(node, backendInputs, backend) {
+  setCurrentOpLabel(node.op);
+  setProfileModule(node.module ?? "unknown");
+  const _profT0 = profileOpBegin(node.op);
+  try {
+    const handler = OP_TABLE.get(node.op);
+    if (handler) return handler(node, backendInputs, backend);
+    return executeFusedOp(node, backendInputs, backend);
+  } finally {
+    profileOpEnd(node.op, _profT0);
+    setCurrentOpLabel(null);
+    setProfileModule("unknown");
+  }
+}
+function executeOpSync(node, backendInputs, backend) {
+  setCurrentOpLabel(node.op);
+  setProfileModule(node.module ?? "unknown");
+  const _profT0 = profileOpBegin(node.op);
+  try {
+    const handler = OP_TABLE.get(node.op);
+    if (handler) return handler(node, backendInputs, backend);
+    return executeFusedOp(node, backendInputs, backend);
+  } finally {
+    profileOpEnd(node.op, _profT0);
+    setCurrentOpLabel(null);
+    setProfileModule("unknown");
+  }
+}
+var CREATION_OP_TABLE, SHAPE_OP_TABLE, PAYLOAD_OVERRIDES, GENERIC_OP_TABLE, FUSED_OP_TABLE, OP_TABLE;
+var init_op_dispatch = __esmMin((() => {
+  init_registry$2();
+  init_registry$1();
+  init_shape();
+  init_node_factory();
+  init_profiler();
+  init_storage_tracker();
+  CREATION_OP_TABLE = {
+    tensorFromArray(node, _bi, backend) {
+      const payload = getPayload(node);
+      if (!payload?.values) throw new Error("tensorFromArray requires values in payload");
+      return backend.ops.tensorFromArray(payload.values, node.shape);
+    },
+    zeros(node, _bi, backend) {
+      if (backend.ops.zeros) return backend.ops.zeros(node.shape);
+      const numEl = sizeOf(node.shape);
+      return backend.ops.tensorFromArray(new Array(numEl).fill(0), node.shape);
+    },
+    full(node, _bi, backend) {
+      const payload = requirePayload(node);
+      if (backend.ops.full) return backend.ops.full(node.shape, payload.fillValue);
+      const numEl = sizeOf(node.shape);
+      return backend.ops.tensorFromArray(new Array(numEl).fill(payload.fillValue), node.shape);
+    },
+    arange(node, _bi, backend) {
+      const ap = requirePayload(node);
+      if (backend.ops.arange) return backend.ops.arange(ap.end, ap.start, ap.step);
+      const n = Math.max(0, Math.ceil((ap.end - ap.start) / ap.step));
+      const vals = new Array(n);
+      for (let i = 0; i < n; i++) vals[i] = ap.start + i * ap.step;
+      return backend.ops.tensorFromArray(vals, node.shape);
+    },
+    tril(node, backendInputs, backend) {
+      assertOpSupported("tril", backend.ops.tril);
+      return backend.ops.tril(backendInputs[0], getPayload(node)?.k ?? 0);
+    },
+    triu(node, backendInputs, backend) {
+      assertOpSupported("triu", backend.ops.triu);
+      return backend.ops.triu(backendInputs[0], getPayload(node)?.k ?? 0);
+    },
+    rand(node, _bi, backend) {
+      const rp = requirePayload(node);
+      if (backend.ops.rand) return backend.ops.rand(node.shape, rp.seed);
+      const n = sizeOf(node.shape);
+      const vals = new Array(n);
+      for (let i = 0; i < n; i++) vals[i] = Math.random();
+      return backend.ops.tensorFromArray(vals, node.shape);
+    },
+    randn(node, _bi, backend) {
+      const rp = requirePayload(node);
+      if (backend.ops.randn) return backend.ops.randn(node.shape, rp.seed);
+      const n = sizeOf(node.shape);
+      const vals = new Array(n);
+      for (let i = 0; i < n; i += 2) {
+        const u1 = Math.random(), u2 = Math.random();
+        const r = Math.sqrt(-2 * Math.log(u1 || 1e-10)), theta = 2 * Math.PI * u2;
+        vals[i] = r * Math.cos(theta);
+        if (i + 1 < n) vals[i + 1] = r * Math.sin(theta);
+      }
+      return backend.ops.tensorFromArray(vals, node.shape);
+    },
+    bernoulli(node, _bi, backend) {
+      const bp = requirePayload(node);
+      if (backend.ops.bernoulli) return backend.ops.bernoulli(node.shape, bp.p, bp.seed);
+      const n = sizeOf(node.shape);
+      const vals = new Array(n);
+      for (let i = 0; i < n; i++) vals[i] = Math.random() < bp.p ? 1 : 0;
+      return backend.ops.tensorFromArray(vals, node.shape);
+    }
+  };
+  SHAPE_OP_TABLE = {
+    reshape(node, backendInputs, backend) {
+      const payload = getPayload(node);
+      return backend.ops.reshape(backendInputs[0], payload?.targetShape ?? node.shape);
+    },
+    expand(node, backendInputs, backend) {
+      return backend.ops.expand(backendInputs[0], node.shape);
+    },
+    transpose(node, backendInputs, backend) {
+      const payload = requirePayload(node);
+      return backend.ops.transpose(backendInputs[0], payload);
+    },
+    permute(node, backendInputs, backend) {
+      const payload = requirePayload(node);
+      return backend.ops.permute(backendInputs[0], payload.dims);
+    },
+    contiguous(_node, backendInputs, backend) {
+      return backend.ops.contiguous(backendInputs[0]);
+    },
+    narrow(node, backendInputs, backend) {
+      const p = requirePayload(node);
+      assertOpSupported("narrow", backend.ops.narrow);
+      return backend.ops.narrow(backendInputs[0], p.dim, p.start, p.length);
+    },
+    narrowBackward(node, backendInputs, backend) {
+      const p = requirePayload(node);
+      assertOpSupported("narrowBackward", backend.ops.narrowBackward);
+      return backend.ops.narrowBackward(backendInputs[0], p.dim, p.start, p.originalLength);
+    },
+    cast(node, backendInputs, backend) {
+      const payload = requirePayload(node);
+      assertOpSupported("cast", backend.ops.cast);
+      return backend.ops.cast(backendInputs[0], payload.dtype);
+    }
+  };
+  PAYLOAD_OVERRIDES = {
+    gelu: "optional",
+    sub: "optional",
+    div: "optional"
+  };
+  GENERIC_OP_TABLE = {};
+  for (const [name, def] of Object.entries(OP_REGISTRY)) {
+    if (name.startsWith("cast_")) continue;
+    if (name === "gelu_tanh" || name === "gelu_erf") continue;
+    if (def.category === "bitwise") continue;
+    if (name === "max" || name === "min") continue;
+    GENERIC_OP_TABLE[name] = {
+      arity: def.arity,
+      payload: PAYLOAD_OVERRIDES[name] ?? "none"
+    };
+  }
+  Object.assign(GENERIC_OP_TABLE, {
+    matmul: {
+      arity: 2,
+      payload: "none"
+    },
+    sum: {
+      arity: 1,
+      payload: "optional"
+    },
+    max: {
+      arity: 1,
+      payload: "optional"
+    },
+    min: {
+      arity: 1,
+      payload: "optional"
+    },
+    mean: {
+      arity: 1,
+      payload: "optional"
+    },
+    argmax: {
+      arity: 1,
+      payload: "required"
+    },
+    argmin: {
+      arity: 1,
+      payload: "required"
+    },
+    conv2d: {
+      arity: 3,
+      payload: "optional"
+    },
+    gather: {
+      arity: 2,
+      payload: "required"
+    },
+    scatterAdd: {
+      arity: 3,
+      payload: "required"
+    },
+    cat: {
+      arity: "all",
+      payload: "required"
+    },
+    stridedScatterCopy: {
+      arity: 2,
+      payload: "required"
+    },
+    stridedScatterAdd: {
+      arity: 2,
+      payload: "required"
+    }
+  });
+  FUSED_OP_TABLE = {
+    fusedCrossEntropyForward: { kind: "dispatch" },
+    fusedCrossEntropyBackward: { kind: "dispatch" },
+    fusedLayerNormForward: { kind: "dispatch" },
+    fusedLayerNormBackwardGradX: { kind: "dispatch" },
+    fusedLayerNormBackwardGradWeightBias: {
+      kind: "multiOutput",
+      returnField: "gradWeight",
+      extraFields: ["gradBias"]
+    },
+    fusedRMSNormForward: { kind: "dispatch" },
+    fusedRMSNormBackwardGradX: { kind: "dispatch" },
+    fusedRMSNormBackwardGradWeight: { kind: "dispatch" },
+    fusedAttentionForward: {
+      kind: "multiOutput",
+      returnField: "output",
+      extraFields: ["logsumexp"]
+    },
+    fusedAttentionBackward: {
+      kind: "multiOutput",
+      returnField: "dQ",
+      extraFields: ["dK", "dV"]
+    }
+  };
+  OP_TABLE = buildOpTable();
+}));
+function createTensor(shape, buffer, strides, offset = 0, dtype = "f32", ownsBuffer = true) {
+  const computedStrides = strides ?? contiguousStrides(shape);
+  const isContiguousLayout = strides === void 0 || checkContiguous(shape, computedStrides);
+  let destroyed = false;
+  const bufferSize = buffer.size;
+  const bufferUsage = buffer.usage;
+  const expectedPoolSize = getSizeForClass(getSizeClass(bufferSize));
+  const isPoolCompatible = bufferUsage === 140 && bufferSize === expectedPoolSize;
+  if (ownsBuffer) bufferPool.incRef(buffer);
+  return {
+    shape: shape.slice(),
+    size: sizeOf(shape),
+    buffer,
+    strides: computedStrides,
+    offset,
+    isContiguous: isContiguousLayout,
+    dtype,
+    ownsBuffer,
+    toArray: () => {
+      throw new Error("Use cpu() to read back WebGPU tensors");
+    },
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      if (ownsBuffer) {
+        bufferPool.decRef(buffer);
+        if (arenaBufferSet.has(buffer)) return;
+        if (!(isPoolCompatible && bufferPool.release(buffer, bufferSize, bufferUsage))) bufferPool.deferredDestroy(buffer, bufferSize);
+      }
+    }
+  };
+}
+function createTrackedBuffer(device, descriptor, preferredBuffer) {
+  const alignedSize = alignBufferSize(descriptor.size);
+  const isStorageBuffer = descriptor.usage === 140;
+  if (isStorageBuffer && !descriptor.mappedAtCreation) {
+    if (preferredBuffer) {
+      const pooled2 = bufferPool.acquirePreferred(alignedSize, preferredBuffer);
+      if (pooled2) return pooled2;
+    }
+    const pooled = bufferPool.acquire(alignedSize);
+    if (pooled) return pooled;
+  }
+  const skipTracking = (descriptor.usage & GPUBufferUsage.UNIFORM) !== 0 && (descriptor.usage & GPUBufferUsage.STORAGE) === 0 && alignedSize <= 64;
+  let actualSize;
+  if (isStorageBuffer) {
+    const pooledSize = getSizeForClass(getSizeClass(alignedSize));
+    actualSize = pooledSize <= (device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024) ? pooledSize : alignedSize;
+  } else actualSize = alignedSize;
+  if (!skipTracking) {
+    const poolHeldBytes = bufferPool.getTotalHeldBytes();
+    if (gpuMemoryTracker.getCurrentAllocatedBytes() + poolHeldBytes + actualSize > gpuMemoryTracker.getMemoryLimit()) bufferPool.evictBuffers(actualSize * 2);
+    gpuMemoryTracker.trackAllocation(null, actualSize);
+  }
+  try {
+    const buffer = profileApiCall("createBuffer", () => device.createBuffer({
+      ...descriptor,
+      size: actualSize
+    }));
+    if (!skipTracking) {
+      gpuMemoryTracker.trackDeallocation(null);
+      gpuMemoryTracker.trackAllocation(buffer, actualSize);
+    }
+    if (isStorageBuffer) {
+      bufferPool.trackAllocation(buffer, actualSize);
+      bufferPool.markAsFromPool(buffer);
+    }
+    if (!skipTracking) bufferPool.trackNewAllocation(actualSize);
+    return buffer;
+  } catch (e) {
+    if (!skipTracking) gpuMemoryTracker.trackDeallocation(null);
+    throw e;
+  }
+}
+function createBufferWithData(device, data, queue) {
+  if (data.byteLength === 0) throw new Error("webgpu tensors cannot be empty yet");
+  const alignedSize = alignBufferSize(data.byteLength);
+  const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+  const rawPoolSize = getSizeForClass(getSizeClass(alignedSize));
+  const maxBindingSizeForPool = device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const poolSize = rawPoolSize <= maxBindingSizeForPool ? rawPoolSize : alignedSize;
+  const pooled = rawPoolSize <= maxBindingSizeForPool ? bufferPool.acquire(poolSize) : null;
+  if (pooled && queue) {
+    profileApiCall("writeBuffer", () => queue.writeBuffer(pooled, 0, data));
+    return pooled;
+  }
+  const buffer = createTrackedBuffer(device, {
+    size: alignedSize,
+    usage,
+    mappedAtCreation: true
+  });
+  if (data instanceof Int32Array) new Int32Array(buffer.getMappedRange()).set(data);
+  else if (data instanceof Uint32Array) new Uint32Array(buffer.getMappedRange()).set(data);
+  else if (data instanceof Uint16Array) new Uint16Array(buffer.getMappedRange()).set(data);
+  else new Float32Array(buffer.getMappedRange()).set(data);
+  buffer.unmap();
+  return buffer;
+}
+var init_tensor = __esmMin((() => {
+  init_lifetime_analysis();
+  init_buffer_pool();
+  init_gpu_types();
+  init_memory_tracker();
+  init_profiler$1();
+  init_shape_utils();
+  init_webgpu_state();
+}));
+function allocateOutputBuffer(sizeBytes) {
+  if (arenaLocal.active) {
+    const idx = arenaLocal.allocIndex++;
+    const arenaBuffer = arenaAllocAt(arenaLocal.active.alloc, idx, sizeBytes);
+    if (arenaBuffer) {
+      if (arenaLocal.externalInputBuffers?.has(arenaBuffer)) {
+        arenaBufferSet.delete(arenaBuffer);
+        arenaLocal.active.alloc[idx] = void 0;
+        const freshBuffer = arenaAllocAt(arenaLocal.active.alloc, idx, sizeBytes);
+        arenaLocal.conflictDetected = true;
+        recordAlloc(freshBuffer, sizeBytes, 1, []);
+        return freshBuffer;
+      }
+      recordAlloc(arenaBuffer, sizeBytes, 1, []);
+      return arenaBuffer;
+    }
+  }
+  const ctx = requireContext();
+  const alignedSize = alignBufferSize(sizeBytes);
+  const buffer = createTrackedBuffer(ctx.device, {
+    size: alignedSize,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  });
+  recordAlloc(buffer, sizeBytes, 1, []);
+  return buffer;
+}
+function donateBuffer(tensor) {
+  const t = asGPUTensor(tensor);
+  if (!t.ownsBuffer) return null;
+  if ((t.buffer.usage ?? 0) !== 140) return null;
+  bufferPool.decRef(t.buffer);
+  t.ownsBuffer = false;
+  t.destroy = () => {
+  };
+  return t.buffer;
+}
+function getBufferSize(tensor) {
+  return asGPUTensor(tensor).buffer.size ?? 0;
+}
+function getActiveArena() {
+  return arenaLocal.active;
+}
+function setArenaExternalInputBuffers(buffers) {
+  arenaLocal.externalInputBuffers = new Set(buffers);
+}
+function clearArenaExternalInputBuffers() {
+  arenaLocal.externalInputBuffers = null;
+}
+function getArenaConflictDetected() {
+  return arenaLocal.conflictDetected;
+}
+function clearArenaConflictDetected() {
+  arenaLocal.conflictDetected = false;
+}
+function setActiveArena(arena) {
+  arenaLocal.active = arena;
+  arenaLocal.resolveIndex = 0;
+  arenaLocal.allocIndex = 0;
+  arenaLocal.conflictDetected = false;
+}
+function clearActiveArena() {
+  arenaLocal.active = null;
+  arenaLocal.resolveIndex = 0;
+  arenaLocal.allocIndex = 0;
+}
+function isArenaBuffer(buffer) {
+  return arenaBufferSet.has(buffer);
+}
+function destroyArena(arena) {
+  for (const arr of [arena.resolve, arena.alloc]) {
+    for (const buffer of arr) if (buffer) {
+      arenaBufferSet.delete(buffer);
+      if (!bufferPool.isLive(buffer)) {
+        gpuMemoryTracker.trackDeallocation(buffer);
+        buffer.destroy();
+      }
+    }
+    arr.length = 0;
+  }
+}
+function arenaAllocAt(arr, idx, sizeBytes) {
+  const neededSizeClass = getSizeClass(alignBufferSize(sizeBytes));
+  const existing = arr[idx];
+  if (existing) {
+    if (getSizeClass(existing.size) === neededSizeClass && !bufferPool.isLive(existing)) {
+      trackSharedEncoderWrite(existing);
+      return existing;
+    }
+    arenaBufferSet.delete(existing);
+    if (bufferPool.isLive(existing)) arenaLocal.conflictDetected = true;
+    else {
+      gpuMemoryTracker.trackDeallocation(existing);
+      existing.destroy();
+    }
+  }
+  const ctx = requireContext();
+  const pooledSize = getSizeForClass(neededSizeClass);
+  const usage = 140;
+  const buffer = profileApiCall("createBuffer", () => ctx.device.createBuffer({
+    size: pooledSize,
+    usage
+  }));
+  gpuMemoryTracker.trackAllocation(buffer, pooledSize);
+  bufferPool.trackAllocation(buffer, pooledSize);
+  bufferPool.markAsFromPool(buffer);
+  arr[idx] = buffer;
+  arenaBufferSet.add(buffer);
+  trackSharedEncoderWrite(buffer);
+  return buffer;
+}
+function prePinOutputBuffers() {
+  pinnedOutputBuffers.length = 0;
+  for (let i = 0; i < outputSequenceHints.length; i++) {
+    const hint = outputSequenceHints[i];
+    if (hint == null) {
+      pinnedOutputBuffers[i] = null;
+      continue;
+    }
+    const sizeClass = getSizeClass(hint.size);
+    const bucket = bufferPool.getPoolBucket(sizeClass);
+    if (bucket) {
+      const idx = bucket.indexOf(hint);
+      if (idx !== -1) {
+        bucket.splice(idx, 1);
+        const actualSize = getSizeForClass(sizeClass);
+        bufferPool.adjustPooledBytes(-actualSize);
+        bufferPool.recordAcquireForPin(sizeClass);
+        pinnedOutputBuffers[i] = hint;
+        continue;
+      }
+    }
+    pinnedOutputBuffers[i] = null;
+  }
+}
+function resolveOutputBuffer(device, sizeBytes, inputBuffers, providedOutBuffer) {
+  if (!providedOutBuffer && arenaLocal.active) {
+    const idx = arenaLocal.resolveIndex++;
+    const arenaBuffer = arenaAllocAt(arenaLocal.active.resolve, idx, sizeBytes);
+    if (arenaBuffer) if (arenaLocal.externalInputBuffers?.has(arenaBuffer)) {
+      arenaBufferSet.delete(arenaBuffer);
+      arenaLocal.active.resolve[idx] = void 0;
+      const freshBuffer = arenaAllocAt(arenaLocal.active.resolve, idx, sizeBytes);
+      arenaLocal.conflictDetected = true;
+      if (freshBuffer && !inputBuffers.some((b) => b === freshBuffer)) {
+        arenaLocal.resolveHits++;
+        recordAlloc(freshBuffer, sizeBytes, 0, inputBuffers);
+        return freshBuffer;
+      }
+      arenaLocal.resolveAliased++;
+    } else if (!inputBuffers.some((b) => b === arenaBuffer)) {
+      arenaLocal.resolveHits++;
+      recordAlloc(arenaBuffer, sizeBytes, 0, inputBuffers);
+      return arenaBuffer;
+    } else arenaLocal.resolveAliased++;
+  } else if (!providedOutBuffer) arenaLocal.resolveNoArena++;
+  const alignedSize = alignBufferSize(sizeBytes);
+  const pooledSize = getSizeForClass(getSizeClass(alignedSize));
+  const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+  const outIdx = getOutputSeqIndex();
+  setOutputSeqIndex(outIdx + 1);
+  if (!providedOutBuffer) {
+    const pinned = pinnedOutputBuffers[outIdx];
+    if (pinned != null) {
+      const neededSizeClass = getSizeClass(alignedSize);
+      const pinnedSizeClass = getSizeClass(pinned.size);
+      if (pinnedSizeClass === neededSizeClass && !inputBuffers.some((b) => b === pinned)) {
+        trackSharedEncoderWrite(pinned);
+        gpuMemoryTracker.trackAllocation(pinned, getSizeForClass(pinnedSizeClass));
+        bufferPool.markAsFromPool(pinned);
+        outputSequenceHints[outIdx] = pinned;
+        pinnedOutputBuffers[outIdx] = null;
+        recordAlloc(pinned, sizeBytes, 0, inputBuffers);
+        return pinned;
+      }
+      bufferPool.returnToPool(pinned, getSizeClass(pinned.size));
+      pinnedOutputBuffers[outIdx] = null;
+    }
+  }
+  const preferredBuf = providedOutBuffer ? void 0 : outputSequenceHints[outIdx] ?? void 0;
+  let outBuffer = providedOutBuffer ?? createTrackedBuffer(device, {
+    size: alignedSize,
+    usage
+  }, preferredBuf);
+  if (!providedOutBuffer && inputBuffers.some((b) => b === outBuffer)) {
+    if (!bufferPool.release(outBuffer, alignedSize, usage)) bufferPool.deferredDestroy(outBuffer, alignedSize);
+    outBuffer = device.createBuffer({
+      size: pooledSize,
+      usage
+    });
+    gpuMemoryTracker.trackAllocation(outBuffer, pooledSize);
+    bufferPool.trackAllocation(outBuffer, pooledSize);
+    bufferPool.markAsFromPool(outBuffer);
+    bufferPool.trackNewAllocation(pooledSize);
+  }
+  trackSharedEncoderWrite(outBuffer);
+  if (!providedOutBuffer) outputSequenceHints[outIdx] = outBuffer;
+  recordAlloc(outBuffer, sizeBytes, 0, inputBuffers);
+  return outBuffer;
+}
+function getArenaResolveIndex() {
+  return arenaLocal.resolveIndex;
+}
+function setArenaResolveIndexTo(value) {
+  arenaLocal.resolveIndex = value;
+}
+function resetArenaState() {
+  outputSequenceHints.length = 0;
+  pinnedOutputBuffers.length = 0;
+  setOutputSeqIndex(0);
+  arenaLocal.active = null;
+  arenaLocal.resolveIndex = 0;
+  arenaLocal.allocIndex = 0;
+}
+var outputSequenceHints, pinnedOutputBuffers, arenaLocal;
+var init_buffer_arena = __esmMin((() => {
+  init_compiled_plan();
+  init_lifetime_analysis();
+  init_buffer_pool();
+  init_gpu_types();
+  init_memory_tracker();
+  init_profiler$1();
+  init_shape_utils();
+  init_tensor();
+  init_webgpu_state();
+  outputSequenceHints = [];
+  pinnedOutputBuffers = [];
+  arenaLocal = {
+    active: null,
+    resolveIndex: 0,
+    allocIndex: 0,
+    resolveHits: 0,
+    resolveAliased: 0,
+    resolveNoArena: 0,
+    externalInputBuffers: null,
+    conflictDetected: false
+  };
+}));
+function getTransposeMode(transA, transB) {
+  if (!transA && !transB) return "NN";
+  if (!transA && transB) return "NT";
+  if (transA && !transB) return "TN";
+  return "TT";
+}
+function classifyShape(m, n, k, batchSize2) {
+  if (m === 1 || n === 1) return "gemv";
+  if (batchSize2 > 1 && m * n < 512 * 512) return "batched_small";
+  if (k < 64 && m * n > 1e5) return "small_k";
+  if (k / Math.max(m, n) > 4) return "large_k";
+  if (m / Math.max(k, n) > 4) return "tall_skinny";
+  if (n / Math.max(k, m) > 4) return "short_wide";
+  const maxDim = Math.max(m, n, k);
+  if (maxDim < 512) return "square_small";
+  if (maxDim < 2048) return "square_medium";
+  return "square_large";
+}
+function validateConfig(config) {
+  const { tileM, tileN, tileK, threadTileM, threadTileN } = config;
+  const workgroupSize = tileM / threadTileM * (tileN / threadTileN);
+  if (workgroupSize > 256) throw new Error(`Invalid config: workgroup size ${workgroupSize} exceeds 256`);
+  if (tileM % threadTileM !== 0) throw new Error(`tileM (${tileM}) must be divisible by threadTileM (${threadTileM})`);
+  if (tileN % threadTileN !== 0) throw new Error(`tileN (${tileN}) must be divisible by threadTileN (${threadTileN})`);
+  const sharedMemBytes = (tileM * tileK + tileK * tileN) * 4;
+  if (sharedMemBytes > 16384) throw new Error(`Config requires ${sharedMemBytes} bytes of shared memory, exceeds 16KB limit`);
+}
+function getWorkgroupSize(config) {
+  return {
+    x: config.tileN / config.threadTileN,
+    y: config.tileM / config.threadTileM
+  };
+}
+function setSubgroupSupport(support) {
+  cachedSubgroupSupport = support;
+}
+function getSubgroupSupport() {
+  return cachedSubgroupSupport;
+}
+function getShaderCacheKey(options) {
+  const { config, transposeMode, dtype, dtypeB, epilogue, batched, inputCastA, inputCastB, kSplit } = options;
+  const epilogueKey = epilogue ? `${epilogue.ops.map((op) => `${op.kind}:${op.op ?? ""}:${op.toDtype ?? ""}`).join(",")}_${epilogue.outputDtype}` : "none";
+  return [
+    `tiled`,
+    `${config.tileM}x${config.tileN}x${config.tileK}`,
+    `t${config.threadTileM}x${config.threadTileN}`,
+    `v${config.vectorWidth}`,
+    config.useSubgroups ? "sg" : "nosg",
+    transposeMode,
+    dtype,
+    dtypeB && dtypeB !== dtype ? `dtypeB_${dtypeB}` : "",
+    batched ? "batch" : "nobatch",
+    epilogueKey,
+    inputCastA ? `castA_${inputCastA}` : "",
+    inputCastB ? `castB_${inputCastB}` : "",
+    kSplit ? `ksplit${kSplit}` : "",
+    options.swapGrid ? "swapgrid" : ""
+  ].filter(Boolean).join("_");
+}
+var DEFAULT_CONFIG, cachedSubgroupSupport;
+var init_types = __esmMin((() => {
+  DEFAULT_CONFIG = {
+    tileM: 32,
+    tileN: 32,
+    tileK: 16,
+    threadTileM: 4,
+    threadTileN: 4,
+    useSubgroups: false,
+    vectorWidth: 1
+  };
+  cachedSubgroupSupport = null;
+}));
+function getWarmupPipeline(key) {
+  return warmupCache.get(key);
+}
+function clearWarmupCache() {
+  warmupCache.clear();
+}
+function startPipelineRecording() {
+  recording = true;
+  registry.length = 0;
+  registryKeys.clear();
+}
+function stopPipelineRecording() {
+  recording = false;
+  return [...registry];
+}
+function recordPipeline(key, wgsl) {
+  if (!recording) return;
+  if (registryKeys.has(key)) return;
+  registryKeys.add(key);
+  registry.push({
+    key,
+    wgsl
+  });
+}
+async function warmupPipelines(device, entries) {
+  const t0 = performance.now();
+  let skipped = 0;
+  const toCompile = [];
+  for (const entry of entries) if (warmupCache.has(entry.key)) skipped++;
+  else toCompile.push(entry);
+  if (toCompile.length === 0) return {
+    compiled: 0,
+    skipped,
+    timeMs: performance.now() - t0
+  };
+  if (device.createComputePipelineAsync) {
+    const promises = toCompile.map(async (entry) => {
+      const module = device.createShaderModule({ code: entry.wgsl });
+      const pipeline = await device.createComputePipelineAsync?.({
+        layout: "auto",
+        compute: {
+          module,
+          entryPoint: "main"
+        }
+      });
+      if (pipeline) warmupCache.set(entry.key, pipeline);
+    });
+    await Promise.all(promises);
+  } else for (const entry of toCompile) {
+    const module = device.createShaderModule({ code: entry.wgsl });
+    const pipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: {
+        module,
+        entryPoint: "main"
+      }
+    });
+    warmupCache.set(entry.key, pipeline);
+  }
+  return {
+    compiled: toCompile.length,
+    skipped,
+    timeMs: performance.now() - t0
+  };
+}
+function serializeRegistry(entries) {
+  return JSON.stringify(entries);
+}
+function deserializeRegistry(json) {
+  return JSON.parse(json);
+}
+var warmupCache, recording, registry, registryKeys;
+var init_pipeline_warmup = __esmMin((() => {
+  warmupCache = /* @__PURE__ */ new Map();
+  recording = false;
+  registry = [];
+  registryKeys = /* @__PURE__ */ new Set();
+}));
+function beginBatchExecution() {
+  if (activeBatch) throw new Error("Batch execution already active");
+  setActiveBatch({
+    commandBuffers: [],
+    deferredDestroyBuffers: []
+  });
+}
+async function endBatchExecution() {
+  if (!activeBatch) throw new Error("No active batch execution");
+  const ctx = requireContext();
+  const batch = activeBatch;
+  setActiveBatch(null);
+  for (const cb of batch.commandBuffers) {
+    profileApiCall("queue.submit", () => ctx.queue.submit([cb]));
+    incrementSubmitCount();
+  }
+  if (typeof ctx.queue.onSubmittedWorkDone === "function") await ctx.queue.onSubmittedWorkDone();
+  for (const buffer of batch.deferredDestroyBuffers) buffer.destroy();
+  bufferPool.flushPendingToAvailable();
+}
+function isBatchActive() {
+  return activeBatch !== null;
+}
+function abortBatch() {
+  setActiveBatch(null);
+}
+function setAdamBatchMode(active) {
+  encoderState.adamBatchMode = active;
+}
+function isAdamBatchMode() {
+  return encoderState.adamBatchMode;
+}
+function beginSharedEncoder() {
+  if (!encoderState.enabled) return;
+  if (encoderState.depth === 0) {
+    const ctx = requireContext();
+    setSharedEncoderActive(true);
+    encoderState.instance = ctx.device.createCommandEncoder();
+    encoderState.passCount = 0;
+    encoderState.collectedCommandBuffers = [];
+    resetSharedEncoderWriteSet();
+    encoderState.deferredUniformBuffers = [];
+  }
+  encoderState.depth++;
+}
+function finishAndSubmitEncoder(createNew) {
+  const ctx = requireContext();
+  const cbs = [];
+  if (encoderState.instance) {
+    resolveGpuTimestamps();
+    cbs.push(encoderState.instance.finish());
+    encoderState.instance = createNew ? ctx.device.createCommandEncoder() : null;
+  }
+  cbs.push(...encoderState.collectedCommandBuffers);
+  if (DEBUG_SHARED_ENCODER && cbs.length > 0) console.log(`[shared-enc] ${createNew ? "FLUSH" : "END"}: ${encoderState.passCount} passes, ${encoderState.collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`);
+  if (cbs.length > 0) {
+    profileApiCall("queue.submit", () => ctx.queue.submit(cbs));
+    incrementSubmitCount();
+  }
+  encoderState.collectedCommandBuffers = [];
+  resetSharedEncoderWriteSet();
+  encoderState.passCount = 0;
+  for (let i = encoderState.deferredUniformBuffers.length - 1; i >= 0; i--) {
+    const buf = encoderState.deferredUniformBuffers[i];
+    const sc = paramsBufferSizeClass(buf.size);
+    const pool = paramsBufferPools.get(sc);
+    if (pool) if (pool.length < 256) pool.push(buf);
+    else bufferPool.deferredDestroyUntracked(buf);
+    else paramsBufferPools.set(sc, [buf]);
+  }
+  encoderState.deferredUniformBuffers = [];
+}
+function flushSharedEncoder() {
+  if (!sharedEncoderActive) return;
+  finishAndSubmitEncoder(true);
+}
+function endSharedEncoder() {
+  if (!encoderState.enabled) return;
+  encoderState.depth--;
+  if (encoderState.depth === 0 && sharedEncoderActive) {
+    if (encoderState.stepLevelScope) {
+      encoderState.depth = 1;
+      return;
+    }
+    setSharedEncoderActive(false);
+    finishAndSubmitEncoder(false);
+    bufferPool.flushPendingToAvailable();
+    bufferPool.beginWindow();
+  }
+}
+async function beginStep() {
+  if (encoderState.stepLevelScope) return;
+  encoderState.stepLevelScope = true;
+  await awaitDeferredFence();
+  bufferPool.endWindowTracking();
+  bufferPool.reserve(requireContext().device);
+  bufferPool.sortPoolBuckets();
+  prePinOutputBuffers();
+  bufferPool.beginWindowTracking();
+  beginSharedEncoder();
+  resetDispatchSequence();
+}
+function endStep() {
+  if (!encoderState.stepLevelScope) return;
+  encoderState.stepLevelScope = false;
+  for (let i = 0; i < pinnedOutputBuffers.length; i++) {
+    const buf = pinnedOutputBuffers[i];
+    if (buf != null) {
+      bufferPool.returnToPool(buf, getSizeClass(buf.size));
+      pinnedOutputBuffers[i] = null;
+    }
+  }
+  endSharedEncoder();
+}
+function isSharedEncoderActive() {
+  return sharedEncoderActive;
+}
+function setSharedEncoderEnabled(enabled) {
+  encoderState.enabled = enabled;
+}
+function getSharedEncoderInstance() {
+  return encoderState.instance;
+}
+function incrementSharedEncoderPassCount() {
+  encoderState.passCount++;
+}
+function autoFlushSharedEncoder() {
+  if (sharedEncoderActive && (encoderState.passCount >= SHARED_ENCODER_MAX_PASSES || encoderState.deferredUniformBuffers.length >= PARAMS_FLUSH_THRESHOLD)) flushSharedEncoder();
+}
+function deferUniformBufferForSharedEncoder(buffer) {
+  encoderState.deferredUniformBuffers.push(buffer);
+}
+function submitOrCollect(commandBuffer) {
+  if (sharedEncoderActive) encoderState.collectedCommandBuffers.push(commandBuffer);
+  else if (activeBatch) activeBatch.commandBuffers.push(commandBuffer);
+  else {
+    const ctx = requireContext();
+    profileApiCall("queue.submit", () => ctx.queue.submit([commandBuffer]));
+    incrementSubmitCount();
+  }
+}
+var encoderState, SHARED_ENCODER_MAX_PASSES, PARAMS_FLUSH_THRESHOLD, DEBUG_SHARED_ENCODER;
+var init_shared_encoder = __esmMin((() => {
+  init_lifetime_analysis();
+  init_bind_group_cache();
+  init_buffer_arena();
+  init_buffer_pool();
+  init_profiler$1();
+  init_webgpu_state();
+  encoderState = {
+    enabled: false,
+    depth: 0,
+    instance: null,
+    passCount: 0,
+    collectedCommandBuffers: [],
+    deferredUniformBuffers: [],
+    stepLevelScope: false,
+    adamBatchMode: false
+  };
+  SHARED_ENCODER_MAX_PASSES = 2e3;
+  PARAMS_FLUSH_THRESHOLD = 2e3;
+  DEBUG_SHARED_ENCODER = typeof process !== "undefined" && !!define_process_env_default$1?.TORCHLETTE_DEBUG_SHARED_ENCODER;
+}));
+function isBrowserWithWebGPU() {
+  return typeof navigator !== "undefined" && typeof navigator.gpu !== "undefined";
+}
+async function loadWebGPU() {
+  if (isBrowserWithWebGPU()) return null;
+  try {
+    return await import("./webgpu-stub.js");
+  } catch {
+    return null;
+  }
+}
+function parseWebGPUOptions() {
+  if (typeof process === "undefined") return [];
+  const options = (define_process_env_default$1.TORCHLETTE_WEBGPU_OPTS ?? "").split(",").map((value) => value.trim()).filter((value) => value.length > 0);
+  if (process.platform === "darwin" && !options.some((value) => value.startsWith("backend="))) options.unshift("backend=metal");
+  if (process.platform === "linux" && !options.some((value) => value.includes("vulkan_enable_f16_on_nvidia"))) options.push("enable-dawn-features=vulkan_enable_f16_on_nvidia");
+  return options;
+}
+function getWebGPUInitError() {
+  return lastInitError;
+}
+function isF16Supported() {
+  return gpuContext?.f16Supported ?? false;
+}
+function f32ToF16(value) {
+  const floatView = new Float32Array(1);
+  const int32View = new Int32Array(floatView.buffer);
+  floatView[0] = value;
+  const f = int32View[0];
+  const sign2 = f >>> 31 & 1;
+  const exp2 = f >>> 23 & 255;
+  const frac = f & 8388607;
+  let newExp;
+  let newFrac;
+  if (exp2 === 255) {
+    newExp = 31;
+    newFrac = frac ? 512 : 0;
+  } else if (exp2 === 0) {
+    newExp = 0;
+    newFrac = 0;
+  } else {
+    const unbiasedExp = exp2 - 127;
+    if (unbiasedExp < -24) {
+      newExp = 0;
+      newFrac = 0;
+    } else if (unbiasedExp < -14) {
+      newExp = 0;
+      const shift = -14 - unbiasedExp;
+      newFrac = (1024 | frac >>> 13) >>> shift;
+    } else if (unbiasedExp > 15) {
+      newExp = 31;
+      newFrac = 0;
+    } else {
+      newExp = unbiasedExp + 15;
+      newFrac = frac >>> 13;
+    }
+  }
+  return sign2 << 15 | newExp << 10 | newFrac;
+}
+function f16ToF32(h) {
+  const sign2 = h >>> 15 & 1;
+  const exp2 = h >>> 10 & 31;
+  const frac = h & 1023;
+  let f;
+  if (exp2 === 0) if (frac === 0) f = sign2 ? -0 : 0;
+  else f = (sign2 ? -1 : 1) * 2 ** -14 * (frac / 1024);
+  else if (exp2 === 31) if (frac === 0) f = sign2 ? -Infinity : Infinity;
+  else f = NaN;
+  else f = (sign2 ? -1 : 1) * 2 ** (exp2 - 15) * (1 + frac / 1024);
+  return f;
+}
+function f32ArrayToF16Array(values) {
+  const result = new Uint16Array(values.length);
+  for (let i = 0; i < values.length; i++) result[i] = f32ToF16(values[i]);
+  return result;
+}
+function f16ArrayToF32Array(data) {
+  const result = new Array(data.length);
+  for (let i = 0; i < data.length; i++) result[i] = f16ToF32(data[i]);
+  return result;
+}
+async function acquireAdapter() {
+  if (isBrowserWithWebGPU()) {
+    const gpu = navigator.gpu;
+    try {
+      const adapter = await gpu.requestAdapter();
+      if (!adapter) {
+        lastInitError = "No WebGPU adapter found";
+        return null;
+      }
+      return {
+        adapter,
+        provider: gpu
+      };
+    } catch (error) {
+      lastInitError = `WebGPU requestAdapter failed: ${error instanceof Error ? error.message : "Unknown error"}`;
+      return null;
+    }
+  }
+  const mod = await loadWebGPU();
+  if (!mod) {
+    lastInitError = "webgpu module not available";
+    return null;
+  }
+  Object.assign(globalThis, mod.globals);
+  const options = parseWebGPUOptions();
+  const nodeProvider = mod.create(options);
+  if (!nodeProvider) {
+    lastInitError = "webgpu create() returned no provider";
+    return null;
+  }
+  try {
+    const adapter = await nodeProvider.requestAdapter();
+    if (!adapter) {
+      lastInitError = `No WebGPU adapter found` + (options.length > 0 ? ` (options: ${options.join(", ")})` : "");
+      return null;
+    }
+    return {
+      adapter,
+      provider: nodeProvider
+    };
+  } catch (error) {
+    lastInitError = `WebGPU requestAdapter failed: ${error instanceof Error ? error.message : "Unknown error"}`;
+    return null;
+  }
+}
+async function requestDeviceWithFallback(adapter, f16Supported, subgroupSupport) {
+  const adapterMaxStorage = adapter.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const adapterMaxBuffer = adapter.limits?.maxBufferSize ?? 256 * 1024 * 1024;
+  const adapterMaxStorageBuffers = adapter.limits?.maxStorageBuffersPerShaderStage ?? 8;
+  console.log(`[WebGPU] Adapter limits: maxStorageBufferBindingSize=${adapterMaxStorage}, maxBufferSize=${adapterMaxBuffer}, maxStorageBuffersPerShaderStage=${adapterMaxStorageBuffers}`);
+  const requiredLimits = {
+    maxStorageBufferBindingSize: adapterMaxStorage,
+    maxBufferSize: adapterMaxBuffer,
+    maxStorageBuffersPerShaderStage: adapterMaxStorageBuffers
+  };
+  try {
+    const requiredFeatures = [];
+    if (subgroupSupport.supported) requiredFeatures.push("subgroups");
+    if (f16Supported) requiredFeatures.push("shader-f16");
+    if (isProfilingEnabled() && adapter.features?.has("timestamp-query")) requiredFeatures.push("timestamp-query");
+    return {
+      device: await adapter.requestDevice({
+        requiredFeatures: requiredFeatures.length > 0 ? requiredFeatures : void 0,
+        requiredLimits
+      }),
+      actualF16Supported: f16Supported
+    };
+  } catch {
+  }
+  try {
+    const fallbackFeatures = [];
+    if (subgroupSupport.supported) fallbackFeatures.push("subgroups");
+    return {
+      device: await adapter.requestDevice({
+        requiredFeatures: fallbackFeatures.length > 0 ? fallbackFeatures : void 0,
+        requiredLimits
+      }),
+      actualF16Supported: false
+    };
+  } catch {
+  }
+  try {
+    const device = await adapter.requestDevice({ requiredLimits });
+    setSubgroupSupport({ supported: false });
+    return {
+      device,
+      actualF16Supported: false
+    };
+  } catch (finalError) {
+    lastInitError = `WebGPU requestDevice failed: ${finalError instanceof Error ? finalError.message : "Unknown error"}`;
+    return null;
+  }
+}
+async function initWebGPU() {
+  if (gpuContext) return true;
+  lastInitError = null;
+  const acquired = await acquireAdapter();
+  if (!acquired) return false;
+  const { adapter, provider } = acquired;
+  const subgroupSupport = adapter.features?.has("subgroups") ? {
+    supported: true,
+    subgroupSize: 32
+  } : { supported: false };
+  setSubgroupSupport(subgroupSupport);
+  const deviceResult = await requestDeviceWithFallback(adapter, adapter.features?.has("shader-f16") ?? false, subgroupSupport);
+  if (!deviceResult) return false;
+  const { device, actualF16Supported } = deviceResult;
+  setGpuContext({
+    provider,
+    device,
+    queue: device.queue,
+    pipelines: /* @__PURE__ */ new Map(),
+    f16Supported: actualF16Supported
+  });
+  if (typeof process !== "undefined" && define_process_env_default$1?.TORCHLETTE_POOL_BUDGET_MB) {
+    const mb = Number(define_process_env_default$1.TORCHLETTE_POOL_BUDGET_MB);
+    if (Number.isFinite(mb) && mb > 0) bufferPool.setMaxPoolBytes(mb * 1024 * 1024);
+  }
+  if (isProfilingEnabled() && device.features.has("timestamp-query")) initGpuTimestamps(device);
+  setSharedEncoderEnabled((typeof process !== "undefined" ? define_process_env_default$1?.TORCHLETTE_BATCH_SUBMITS : void 0) !== "0");
+  return true;
+}
+async function syncWebGPU() {
+  const ctx = requireContext();
+  if (typeof ctx.queue.onSubmittedWorkDone === "function") await ctx.queue.onSubmittedWorkDone();
+  bufferPool.flushPendingToAvailable();
+}
+function destroyWebGPU() {
+  if (!gpuContext) return;
+  for (const buf of f16WeightCache.values()) buf.destroy();
+  f16WeightCache.clear();
+  clearBindGroupCache();
+  runTeardownCallbacks();
+  clearWarmupCache();
+  destroyProfilingFenceBuffer();
+  gpuContext.device.destroy();
+  gpuContext.pipelines.clear();
+  setGpuContext(null);
+}
+function getWebGPUDevice() {
+  if (!gpuContext) return null;
+  return {
+    device: gpuContext.device,
+    queue: gpuContext.queue
+  };
+}
+function getMaxStorageBufferBindingSize() {
+  return requireContext().device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+}
+async function warmupFromStep(fn) {
+  startPipelineRecording();
+  await fn();
+  return stopPipelineRecording();
+}
+async function warmupFromRegistry(entries) {
+  return warmupPipelines(requireContext().device, entries);
+}
+var lastInitError, f16WeightCache;
+var init_gpu_context = __esmMin((() => {
+  init_bind_group_cache();
+  init_buffer_pool();
+  init_types();
+  init_pipeline_warmup();
+  init_profiler$1();
+  init_shared_encoder();
+  init_webgpu_state();
+  lastInitError = null;
+  f16WeightCache = /* @__PURE__ */ new Map();
+}));
+function getDefaultConfigForShape(shapeClass, hasEpilogue = false, m, n, k) {
+  switch (shapeClass) {
+    case "square_large":
+      if (hasEpilogue) return {
+        ...DEFAULT_CONFIG,
+        tileM: 64,
+        tileN: 64,
+        tileK: 16
+      };
+      if (m !== void 0 && k !== void 0 && m <= 512 && k >= m * 2) return {
+        ...DEFAULT_CONFIG,
+        tileM: 64,
+        tileN: 64,
+        tileK: 16
+      };
+      return {
+        ...DEFAULT_CONFIG,
+        tileM: 64,
+        tileN: 128,
+        tileK: 16,
+        threadTileM: 8,
+        threadTileN: 4
+      };
+    case "square_medium":
+      if (hasEpilogue) return {
+        ...DEFAULT_CONFIG,
+        tileM: 64,
+        tileN: 64,
+        tileK: 16
+      };
+      return {
+        ...DEFAULT_CONFIG,
+        tileM: 64,
+        tileN: 64,
+        tileK: 16
+      };
+    case "large_k":
+      return {
+        ...DEFAULT_CONFIG,
+        tileM: 128,
+        tileN: 128,
+        tileK: 8,
+        threadTileM: 8,
+        threadTileN: 8
+      };
+    case "tall_skinny":
+      if (hasEpilogue) return {
+        ...DEFAULT_CONFIG,
+        tileM: 64,
+        tileN: 64,
+        tileK: 8
+      };
+      return {
+        ...DEFAULT_CONFIG,
+        tileM: 64,
+        tileN: 128,
+        tileK: 16,
+        threadTileM: 8,
+        threadTileN: 4
+      };
+    case "short_wide":
+      if (hasEpilogue) return {
+        ...DEFAULT_CONFIG,
+        tileM: 64,
+        tileN: 64,
+        tileK: 8
+      };
+      return {
+        ...DEFAULT_CONFIG,
+        tileM: 64,
+        tileN: 128,
+        tileK: 16,
+        threadTileM: 8,
+        threadTileN: 4
+      };
+    case "small_k":
+      return {
+        ...DEFAULT_CONFIG,
+        tileM: 64,
+        tileN: 64,
+        tileK: 32,
+        threadTileM: 8,
+        threadTileN: 8
+      };
+    case "gemv":
+      return {
+        ...DEFAULT_CONFIG,
+        tileM: 32,
+        tileN: 32,
+        tileK: 32,
+        threadTileM: 4,
+        threadTileN: 4
+      };
+    case "batched_small":
+      return DEFAULT_CONFIG;
+    default:
+      return DEFAULT_CONFIG;
+  }
+}
+function getTuningCacheKey(shapeClass, dtype) {
+  return `${shapeClass}_${dtype}`;
+}
+function cacheTuningResult(result) {
+  const key = getTuningCacheKey(result.shapeClass, result.dtype);
+  tuningCache$1.set(key, result);
+}
+function generateNeighborConfigs(baseConfig, includeSubgroups) {
+  const configs = [baseConfig];
+  const { tileM, tileN, tileK } = baseConfig;
+  for (const newTileM of [
+    32,
+    64,
+    128
+  ]) if (newTileM !== tileM) configs.push({
+    ...baseConfig,
+    tileM: newTileM
+  });
+  for (const newTileN of [
+    32,
+    64,
+    128
+  ]) if (newTileN !== tileN) configs.push({
+    ...baseConfig,
+    tileN: newTileN
+  });
+  for (const newTileK of [
+    8,
+    16,
+    32
+  ]) if (newTileK !== tileK) configs.push({
+    ...baseConfig,
+    tileK: newTileK
+  });
+  for (const [ttm, ttn] of [
+    [4, 4],
+    [8, 4],
+    [4, 8],
+    [8, 8]
+  ]) if (ttm !== baseConfig.threadTileM || ttn !== baseConfig.threadTileN) configs.push({
+    ...baseConfig,
+    threadTileM: ttm,
+    threadTileN: ttn
+  });
+  if (includeSubgroups && !baseConfig.useSubgroups) configs.push({
+    ...baseConfig,
+    useSubgroups: true
+  });
+  const seen = /* @__PURE__ */ new Set();
+  return configs.filter((c) => {
+    const key = `${c.tileM}_${c.tileN}_${c.tileK}_${c.threadTileM}_${c.threadTileN}_${c.vectorWidth}_${c.useSubgroups}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    try {
+      validateConfig(c);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+var tuningCache$1;
+var init_autotune = __esmMin((() => {
+  init_types();
+  tuningCache$1 = /* @__PURE__ */ new Map();
+}));
+var init_registry = __esmMin((() => {
+  init_registry$2();
+}));
+function selectVectorWidth(shape, dtype) {
+  if (dtype !== "f32" && dtype !== "f16") return 1;
+  if (shape.length === 0) return 1;
+  const innerDim = shape[shape.length - 1];
+  if (sizeOf(shape) < 16) return 1;
+  if (innerDim >= 4 && innerDim % 4 === 0) return 4;
+  if (innerDim >= 2 && innerDim % 2 === 0) return 2;
+  return 1;
+}
+function canVectorize(outputShape, inputs, vectorWidth) {
+  if (vectorWidth === 1) return true;
+  if (outputShape.length === 0) return false;
+  const outputInner = outputShape[outputShape.length - 1];
+  if (outputInner % vectorWidth !== 0) return false;
+  for (const input of inputs) {
+    if (sizeOf(input.shape) === 1) continue;
+    if (input.shape.length === 0) return false;
+    const inputInner = input.shape[input.shape.length - 1];
+    if (inputInner !== outputInner && inputInner !== 1) return false;
+    if (inputInner === outputInner && inputInner % vectorWidth !== 0) return false;
+  }
+  return true;
+}
+function needsBroadcast(outputShape, inputShape) {
+  if (outputShape.length !== inputShape.length) return true;
+  return !outputShape.every((d, i) => d === inputShape[i]);
+}
+function generateKernelCacheKey(recipe, vectorWidth = 1) {
+  const parts = [`vec:${vectorWidth}`];
+  for (const output of recipe.outputs) parts.push(`out${output.index}:${output.shape.join("x")}:${output.dtype}`);
+  for (const input of recipe.inputs) if (input.isInlinedConstant) parts.push(`in${input.index}:const=${input.inlinedValue}`);
+  else parts.push(`in${input.index}:${input.shape.join("x")}:${input.dtype}`);
+  const idToPos = /* @__PURE__ */ new Map();
+  for (let i = 0; i < recipe.nodes.length; i++) idToPos.set(recipe.nodes[i].id, i);
+  const opParts = [];
+  for (let i = 0; i < recipe.nodes.length; i++) {
+    const n = recipe.nodes[i];
+    const inputRefs = n.inputs.map((inp) => {
+      const pos = idToPos.get(inp);
+      return pos !== void 0 ? `n${pos}` : `e${inp}`;
+    }).join(",");
+    opParts.push(`${n.op}(${inputRefs})${n.isOutput ? "!" : ""}`);
+  }
+  parts.push(`ops:[${opParts.join(";")}]`);
+  return parts.join("|");
+}
+function computeKernelMeta(recipe, options = {}) {
+  const workgroupSize = options.workgroupSize ?? recipe.workgroupSize ?? 256;
+  const outputShape = recipe.outputs[0].shape;
+  const primaryDtype = recipe.outputs[0].dtype;
+  const totalElements = sizeOf(outputShape);
+  let vectorWidth = 1;
+  if (options.forceVectorWidth !== void 0) vectorWidth = options.forceVectorWidth;
+  else if (options.vectorize) {
+    const candidateWidth = selectVectorWidth(outputShape, primaryDtype);
+    if (canVectorize(outputShape, recipe.inputs, candidateWidth)) vectorWidth = candidateWidth;
+  }
+  if (vectorWidth > 1) {
+    if (recipe.nodes.some((n) => !canVectorize$1(n.op))) vectorWidth = 1;
+  }
+  const workItems = Math.ceil(totalElements / vectorWidth);
+  const totalWorkgroups = Math.ceil(workItems / workgroupSize);
+  const gridSizeX = totalWorkgroups <= 65535 ? totalWorkgroups : MAX_WORKGROUPS_PER_DIM;
+  const baseCacheKey = generateKernelCacheKey(recipe, vectorWidth);
+  return {
+    cacheKey: gridSizeX >= 65535 ? baseCacheKey + ":2d" : baseCacheKey,
+    vectorWidth,
+    workItems,
+    workgroupSize,
+    gridSizeX
+  };
+}
+var init_fusion_types = __esmMin((() => {
+  init_shape();
+  init_registry();
+  init_shape_utils();
+}));
+function buildPtr(base, outer, inner) {
+  const outerComp = outer.dim === "outer" ? outer : inner;
+  const innerComp = inner.dim === "inner" ? inner : outer;
+  return new TilePtr({
+    baseOffset: base.node,
+    outerRange: outerComp.range,
+    outerStride: outerComp.stride,
+    innerRange: innerComp.range,
+    innerStride: innerComp.stride
+  });
+}
+function buildMask(outer, inner) {
+  return new TileMask({
+    outerRange: outer.range,
+    outerBound: outer.bound,
+    innerRange: inner.range,
+    innerBound: inner.bound
+  });
+}
+var TileRange, TilePtr, TileMask, Block, BlockOps;
+var init_tile_ops = __esmMin((() => {
+  init_tile_ir();
+  TileRange = class {
+    constructor(info) {
+      this.info = info;
+    }
+    /** Broadcast to outer (row) dimension: [:, None] * stride */
+    outer(stride) {
+      return {
+        range: this.info,
+        stride: stride ? stride.node : {
+          id: -1,
+          kind: "const",
+          valueType: "scalar",
+          dataType: "u32",
+          value: 1
+        },
+        dim: "outer"
+      };
+    }
+    /** Broadcast to inner (col) dimension: [None, :] * stride (default stride=1) */
+    inner(stride) {
+      return {
+        range: this.info,
+        stride: stride ? stride.node : {
+          id: -1,
+          kind: "const",
+          valueType: "scalar",
+          dataType: "u32",
+          value: 1
+        },
+        dim: "inner"
+      };
+    }
+    /** Range < bound: produces a mask component for this dimension. */
+    lt(bound) {
+      return {
+        range: this.info,
+        bound: bound.node
+      };
+    }
+  };
+  TilePtr = class TilePtr2 {
+    constructor(data) {
+      this.data = data;
+    }
+    /** Advance pointer by blockDim * stride (e.g. a_ptrs += BLOCK_K * stride_ak) */
+    advance(blockDim, stride) {
+      const advanceNode = {
+        id: -1,
+        kind: "binary",
+        op: "add",
+        lhs: this.data.baseOffset,
+        rhs: {
+          id: -1,
+          kind: "binary",
+          op: "mul",
+          lhs: {
+            id: -1,
+            kind: "const",
+            valueType: "scalar",
+            dataType: "u32",
+            value: blockDim
+          },
+          rhs: stride.node,
+          valueType: "scalar",
+          dataType: "u32"
+        },
+        valueType: "scalar",
+        dataType: "u32"
+      };
+      return new TilePtr2({
+        ...this.data,
+        baseOffset: advanceNode
+      });
+    }
+  };
+  TileMask = class {
+    constructor(data) {
+      this.data = data;
+    }
+  };
+  Block = class Block2 {
+    /** @internal */
+    _transposed = false;
+    /** @internal Original rows before any T() call (for storage indexing) */
+    _origRows;
+    /** @internal Original cols before any T() call (for storage indexing) */
+    _origCols;
+    /** @internal Column stride for shared memory indexing. Always equals cols (no padding). */
+    smemStride;
+    /** @internal Shared memory element type ("f16" for native f16 storage, "f32" default). */
+    smemElemType;
+    /** @internal True if shared memory uses array<vec4<f32>> layout. */
+    smemVec4;
+    constructor(placement, rows, cols, name, ctx, ops, origRows, origCols, smemStride, smemElemType, smemVec4) {
+      this.placement = placement;
+      this.rows = rows;
+      this.cols = cols;
+      this.name = name;
+      this.ctx = ctx;
+      this.ops = ops;
+      this._origRows = origRows ?? rows;
+      this._origCols = origCols ?? cols;
+      this.smemStride = smemStride ?? cols;
+      this.smemElemType = smemElemType ?? "f32";
+      this.smemVec4 = smemVec4 ?? false;
+    }
+    get transposed() {
+      return this._transposed;
+    }
+    /** Read a scalar from the block at flat index, or 2D (row, col). */
+    get(row, col) {
+      const idx = col !== void 0 ? row.mul(this.ctx.u32(this.cols)).add(col) : row;
+      if (this.placement === "shared") return this.ctx._makeSharedRead(this.name, idx);
+      return this.ctx._makeArrayRead(this.name, idx);
+    }
+    /** Write a scalar to the block at flat index. */
+    set(idx, value) {
+      const kind = this.placement === "shared" ? "sharedWrite" : "indexAssign";
+      this.ctx.pushStatement({
+        kind,
+        arrayName: this.name,
+        idx: idx.node,
+        value: value.node
+      });
+    }
+    T() {
+      const b = new Block2(this.placement, this.cols, this.rows, this.name, this.ctx, this.ops, this._origRows, this._origCols, this.smemStride, this.smemElemType, this.smemVec4);
+      b._transposed = !this._transposed;
+      return b;
+    }
+    add(other) {
+      return this.ops._binary(this, other, "add");
+    }
+    sub(other) {
+      return this.ops._binary(this, other, "sub");
+    }
+    mul(other) {
+      return this.ops._binary(this, other, "mul");
+    }
+    div(other) {
+      return this.ops._binary(this, other, "div");
+    }
+    max(arg) {
+      if (typeof arg === "number") return this.ops._reduce(this, arg, "max");
+      return this.ops._binary(this, arg, "max");
+    }
+    sum(axis) {
+      return this.ops._reduce(this, axis, "sum");
+    }
+    mul_(other) {
+      this.ops._binary(this, other, "mul", true);
+    }
+    add_(other) {
+      this.ops._binary(this, other, "add", true);
+    }
+    sub_(other) {
+      this.ops._binary(this, other, "sub", true);
+    }
+    exp_() {
+      this.ops._unary(this, "exp", true);
+    }
+    /** Copy values from other into this block (with broadcasting). */
+    assign(other) {
+      this.ops._binary(this, other, "copy", true);
+    }
+    /** Accumulate: this += other (with broadcasting). */
+    addAssign(other) {
+      this.ops._binary(this, other, "add", true);
+    }
+    exp() {
+      return this.ops._unary(this, "exp");
+    }
+    log() {
+      return this.ops._unary(this, "log");
+    }
+    neg() {
+      return this.ops._unary(this, "neg");
+    }
+    /**
+    * Apply an elementwise function in-place: block[i] = fn(block[i]).
+    * Used for epilogue ops (relu, gelu, etc.) on register blocks.
+    */
+    apply_(fn) {
+      const size = this.rows * this.cols;
+      const valName = `_apply_val_${this.name}`;
+      const valRef = new BlockExpr({
+        id: -1,
+        kind: "namedRef",
+        name: valName,
+        valueType: "scalar",
+        dataType: "f32"
+      });
+      const body = this.ctx.captureScope(() => {
+        const result = fn(valRef);
+        this.ctx.pushStatement({
+          kind: "assign",
+          name: `_apply_result_${this.name}`,
+          value: result.node
+        });
+      });
+      const lastStmt = body[body.length - 1];
+      const resultNode = lastStmt && lastStmt.kind === "assign" ? lastStmt.value : valRef.node;
+      if (lastStmt && lastStmt.kind === "assign" && lastStmt.name === `_apply_result_${this.name}`) body.pop();
+      const iVar = `_apply_i_${this.name}`;
+      const innerBody = [];
+      innerBody.push({
+        kind: "let",
+        name: valName,
+        dtype: "f32",
+        value: {
+          id: -1,
+          kind: "arrayRead",
+          arrayName: this.name,
+          idx: {
+            id: -1,
+            kind: "namedRef",
+            name: iVar,
+            valueType: "scalar",
+            dataType: "u32"
+          },
+          valueType: "scalar",
+          dataType: "f32"
+        }
+      });
+      innerBody.push(...body);
+      innerBody.push({
+        kind: "indexAssign",
+        arrayName: this.name,
+        idx: {
+          id: -1,
+          kind: "namedRef",
+          name: iVar,
+          valueType: "scalar",
+          dataType: "u32"
+        },
+        value: resultNode
+      });
+      this.ctx.pushStatement({
+        kind: "forRange",
+        varName: iVar,
+        start: {
+          id: -1,
+          kind: "const",
+          valueType: "scalar",
+          dataType: "u32",
+          value: 0
+        },
+        bound: {
+          id: -1,
+          kind: "const",
+          valueType: "scalar",
+          dataType: "u32",
+          value: size
+        },
+        body: innerBody
+      });
+    }
+    /**
+    * Mark this block for dtype conversion at store time.
+    * The actual cast is applied by the store lowering.
+    */
+    castTo_(dtype) {
+      this._castDtype = dtype;
+    }
+    /** @internal */
+    _castDtype;
+  };
+  BlockOps = class {
+    blockCounter = 0;
+    /** @internal */
+    wgSize;
+    /** @internal */
+    threadTileM;
+    /** @internal */
+    threadTileN;
+    constructor(ctx, config) {
+      this.ctx = ctx;
+      this.wgSize = typeof config.wgSize === "number" ? config.wgSize : config.wgSize[0] * config.wgSize[1];
+      if (config.threadTile) {
+        this.threadTileM = config.threadTile[0];
+        this.threadTileN = config.threadTile[1];
+      }
+    }
+    /** Set thread tile dimensions (can be called after construction). */
+    setThreadTile(m, n) {
+      this.threadTileM = m;
+      this.threadTileN = n;
+    }
+    freshName() {
+      return `blk_${this.blockCounter++}`;
+    }
+    /** Create a register block initialized to zero. */
+    zeros(rows, cols) {
+      const name = this.freshName();
+      this.ctx.pushStatement({
+        kind: "blockAlloc",
+        name,
+        rows,
+        cols,
+        elemType: "f32"
+      });
+      return new Block("register", rows, cols, name, this.ctx, this);
+    }
+    /** Create a register block filled with a constant value. */
+    full(rows, cols, val) {
+      const name = this.freshName();
+      this.ctx.pushStatement({
+        kind: "blockAlloc",
+        name,
+        rows,
+        cols,
+        elemType: "f32",
+        initValue: val
+      });
+      return new Block("register", rows, cols, name, this.ctx, this);
+    }
+    /** Unified load: ptr type determines placement (register vs shared). */
+    load(binding, ptr, opts) {
+      const name = this.freshName();
+      const { rows, cols, guard } = opts;
+      const bindingType = this.ctx.getBindingType(binding);
+      if (ptr.kind === "thread") {
+        this.ctx.pushStatement({
+          kind: "blockLoad",
+          binding,
+          name,
+          rows,
+          cols,
+          elemType: bindingType,
+          ptrKind: "thread",
+          threadBase: ptr.base.node,
+          threadStride: ptr.stride.node,
+          guard: guard?.node
+        });
+        return new Block("register", rows, cols, name, this.ctx, this);
+      } else {
+        const smemElemType = opts.smemElemType ?? (bindingType === "f16" ? "f16" : "f32");
+        const smemStride = cols;
+        const useVec4Smem = cols % 4 === 0 && smemElemType === "f32" && smemStride % 4 === 0 && !this.threadTileM;
+        if (useVec4Smem) this.ctx.vec4SharedArrays.push({
+          name,
+          size: rows * smemStride / 4
+        });
+        else this.ctx.sharedArrays.push({
+          name,
+          size: rows * smemStride,
+          elemType: smemElemType
+        });
+        this.ctx.pushStatement({
+          kind: "blockLoad",
+          binding,
+          name,
+          rows,
+          cols,
+          elemType: bindingType,
+          ptrKind: "tile",
+          tilePtr: {
+            baseOffset: ptr.baseOffset.node,
+            outerRange: ptr.outerRange,
+            outerStride: ptr.outerStride.node,
+            innerRange: ptr.innerRange,
+            innerStride: ptr.innerStride.node
+          },
+          tileMask: {
+            outerRange: ptr.outerRange,
+            outerBound: ptr.outerBound.node,
+            innerRange: ptr.innerRange,
+            innerBound: ptr.innerBound.node
+          },
+          smemElemType: smemElemType !== bindingType ? smemElemType : void 0,
+          smemVec4: useVec4Smem || void 0
+        });
+        return new Block("shared", rows, cols, name, this.ctx, this, void 0, void 0, smemStride, smemElemType, useVec4Smem);
+      }
+    }
+    /** Push a blockDot statement with common fields derived from a and b. */
+    _pushBlockDot(a, b, resultName, accName) {
+      this.ctx.pushStatement({
+        kind: "blockDot",
+        aName: a.name,
+        bName: b.name,
+        resultName,
+        ...accName !== void 0 && { accName },
+        aPlacement: a.placement,
+        bPlacement: b.placement,
+        bTransposed: b._transposed,
+        aRows: a.rows,
+        aCols: a.cols,
+        bRows: b._origRows,
+        bCols: b._origCols,
+        threadTileM: this.threadTileM,
+        threadTileN: this.threadTileN,
+        aSmemStride: a.placement === "shared" ? a.smemStride : void 0,
+        bSmemStride: b.placement === "shared" ? b.smemStride : void 0,
+        aSmemElemType: a.placement === "shared" ? a.smemElemType : void 0,
+        bSmemElemType: b.placement === "shared" ? b.smemElemType : void 0
+      });
+    }
+    /** Unified dot product: operand placements determine lowering. */
+    dot(a, b) {
+      const name = this.freshName();
+      let outRows, outCols;
+      if (a.placement === "shared" && b.placement === "shared") {
+        if (!this.threadTileM || !this.threadTileN) throw new Error("shared×shared dot requires threadTile in BlockOps config");
+        outRows = this.threadTileM;
+        outCols = this.threadTileN;
+      } else {
+        outRows = a.rows;
+        outCols = b._transposed ? b._origRows : b.cols;
+      }
+      this.ctx.pushStatement({
+        kind: "blockAlloc",
+        name,
+        rows: outRows,
+        cols: outCols,
+        elemType: "f32"
+      });
+      this._pushBlockDot(a, b, name);
+      return new Block("register", outRows, outCols, name, this.ctx, this);
+    }
+    /** Dot with accumulation: acc += a @ b. */
+    dotAccum(a, b, acc) {
+      this._pushBlockDot(a, b, acc.name, acc.name);
+    }
+    /**
+    * Single-row dot product: returns scalar = dot(regBlock[0,:], sharedBlock[rowIdx,:]).
+    * Used inside range() loops for fused attention inner loops.
+    * regBlock must be register (1×D), sharedBlock must be shared (K×D).
+    * With TPR, handles subgroup reduction automatically.
+    */
+    dotRow(regBlock, sharedBlock, rowIdx) {
+      if (regBlock.placement !== "register" || regBlock.rows !== 1) throw new Error("dotRow: regBlock must be register with rows=1");
+      if (sharedBlock.placement !== "shared") throw new Error("dotRow: sharedBlock must be shared");
+      const resultName = this.freshName() + "_s";
+      this.ctx.pushStatement({
+        kind: "blockDotRow",
+        aName: regBlock.name,
+        bName: sharedBlock.name,
+        resultName,
+        rowIdx: rowIdx.node,
+        aCols: regBlock.cols,
+        bCols: sharedBlock._origCols,
+        bSmemStride: sharedBlock.smemStride,
+        bSmemElemType: sharedBlock.smemElemType !== "f32" ? sharedBlock.smemElemType : void 0
+      });
+      return this.ctx._makeRef(resultName, "f32");
+    }
+    /**
+    * Single-row scaled accumulation: accBlock[:] += scalar * sharedBlock[rowIdx,:].
+    * Used inside range() loops for fused attention inner loops.
+    * accBlock must be register (1×D), sharedBlock must be shared (K×D).
+    */
+    accumRow(accBlock, scalar, sharedBlock, rowIdx) {
+      if (accBlock.placement !== "register" || accBlock.rows !== 1) throw new Error("accumRow: accBlock must be register with rows=1");
+      if (sharedBlock.placement !== "shared") throw new Error("accumRow: sharedBlock must be shared");
+      const scalarName = this.freshName() + "_p";
+      this.ctx.pushStatement({
+        kind: "let",
+        name: scalarName,
+        dtype: "f32",
+        value: scalar.node
+      });
+      this.ctx.pushStatement({
+        kind: "blockAccumRow",
+        accName: accBlock.name,
+        bName: sharedBlock.name,
+        scalarName,
+        rowIdx: rowIdx.node,
+        accCols: accBlock.cols,
+        bCols: sharedBlock._origCols,
+        bSmemStride: sharedBlock.smemStride,
+        bSmemElemType: sharedBlock.smemElemType !== "f32" ? sharedBlock.smemElemType : void 0
+      });
+    }
+    /** Store register block to global memory. */
+    store(binding, block, ptr, opts) {
+      this.ctx.pushStatement({
+        kind: "blockStore",
+        binding,
+        blockName: block.name,
+        rows: block.rows,
+        cols: block.cols,
+        base: ptr.base.node,
+        stride: ptr.stride.node,
+        guard: opts?.guard?.node
+      });
+    }
+    /**
+    * Store a register block using tile-level 2D addressing with bounds checking.
+    * Thread-tile-aware: each thread stores its threadTileM × threadTileN slice.
+    */
+    storeTile(binding, block, ptr, mask) {
+      if (!this.threadTileM || !this.threadTileN) throw new Error("storeTile requires threadTile in BlockOps config");
+      this.ctx.pushStatement({
+        kind: "tileStore",
+        binding,
+        ptr: ptr.data,
+        mask: mask.data,
+        accName: block.name,
+        threadTileM: this.threadTileM,
+        threadTileN: this.threadTileN,
+        accDtype: block._castDtype
+      });
+    }
+    /** Create a 1D range: [base, base+1, ..., base+blockSize-1] */
+    arange(base, blockSize) {
+      return new TileRange({
+        base: base.node,
+        size: blockSize
+      });
+    }
+    /**
+    * Load a 1D tile into per-thread registers (e.g., bias vector).
+    * Returns a Block of shape [1, threadTileN].
+    */
+    load1d(binding, range) {
+      if (!this.threadTileN) throw new Error("load1d requires threadTile in BlockOps config");
+      const name = this.freshName();
+      this.ctx.pushStatement({
+        kind: "tileLoad1d",
+        binding,
+        range: range.info,
+        arrayName: name,
+        size: this.threadTileN
+      });
+      return new Block("register", 1, this.threadTileN, name, this.ctx, this);
+    }
+    /**
+    * Cooperative tile load from global memory into shared memory.
+    * Uses TilePtr/TileMask for 2D bounds-checked loading.
+    */
+    loadTile(binding, ptr, mask, opts) {
+      const tileRows = ptr.data.outerRange.size;
+      const tileCols = ptr.data.innerRange.size;
+      const padding = opts?.smemPadding ?? 0;
+      const bindingType = this.ctx.getBindingType(binding);
+      const reuse = opts?.reuseShared;
+      if (reuse) {
+        if (reuse.rows !== tileRows || reuse.cols !== tileCols) throw new Error(`reuseShared dimensions mismatch: expected ${tileRows}×${tileCols}, got ${reuse.rows}×${reuse.cols}`);
+        const name2 = reuse.name;
+        const smemStride2 = reuse.smemStride;
+        const smemElemType2 = reuse.smemElemType;
+        this.ctx.pushStatement({
+          kind: "tileLoad",
+          binding,
+          ptr: ptr.data,
+          mask: mask.data,
+          sharedName: name2,
+          tileRows,
+          tileCols,
+          elemType: bindingType,
+          smemElemType: smemElemType2 !== bindingType ? smemElemType2 : void 0,
+          smemStride: smemStride2 !== tileCols ? smemStride2 : void 0,
+          smemVec4: reuse.smemVec4 || void 0
+        });
+        return new Block("shared", tileRows, tileCols, name2, this.ctx, this, void 0, void 0, smemStride2, smemElemType2, reuse.smemVec4);
+      }
+      const name = this.freshName();
+      const smemStride = tileCols + padding;
+      const smemElemType = opts?.smemElemType ?? (bindingType === "f16" ? "f16" : "f32");
+      const useVec4Smem = tileCols % 4 === 0 && smemElemType === "f32" && smemStride % 4 === 0 && !this.threadTileM;
+      if (useVec4Smem) this.ctx.vec4SharedArrays.push({
+        name,
+        size: tileRows * smemStride / 4
+      });
+      else this.ctx.sharedArrays.push({
+        name,
+        size: tileRows * smemStride,
+        elemType: smemElemType
+      });
+      this.ctx.pushStatement({
+        kind: "tileLoad",
+        binding,
+        ptr: ptr.data,
+        mask: mask.data,
+        sharedName: name,
+        tileRows,
+        tileCols,
+        elemType: bindingType,
+        smemElemType: smemElemType !== bindingType ? smemElemType : void 0,
+        smemStride: padding > 0 ? smemStride : void 0,
+        smemVec4: useVec4Smem || void 0
+      });
+      return new Block("shared", tileRows, tileCols, name, this.ctx, this, void 0, void 0, smemStride, smemElemType, useVec4Smem);
+    }
+    /** @internal */
+    _binary(a, b, op, inPlace = false) {
+      const outputName = inPlace ? a.name : this.freshName();
+      const isBlock = b instanceof Block;
+      this.ctx.pushStatement({
+        kind: "blockBinary",
+        aName: a.name,
+        bName: isBlock ? b.name : "",
+        outputName,
+        aRows: a.rows,
+        aCols: a.cols,
+        bRows: isBlock ? b.rows : 1,
+        bCols: isBlock ? b.cols : 1,
+        op,
+        inPlace,
+        ...isBlock ? {} : { bScalarExpr: b.node }
+      });
+      if (inPlace) return a;
+      return new Block("register", isBlock ? Math.max(a.rows, b.rows) : a.rows, isBlock ? Math.max(a.cols, b.cols) : a.cols, outputName, this.ctx, this);
+    }
+    /** @internal */
+    _unary(a, op, inPlace = false) {
+      const outputName = inPlace ? a.name : this.freshName();
+      this.ctx.pushStatement({
+        kind: "blockUnary",
+        inputName: a.name,
+        outputName,
+        rows: a.rows,
+        cols: a.cols,
+        op,
+        inPlace
+      });
+      return inPlace ? a : new Block("register", a.rows, a.cols, outputName, this.ctx, this);
+    }
+    /** @internal */
+    _reduce(a, axis, op) {
+      const name = this.freshName();
+      const outRows = axis === 0 ? 1 : a.rows;
+      const outCols = axis === 1 ? 1 : a.cols;
+      this.ctx.pushStatement({
+        kind: "blockReduce",
+        inputName: a.name,
+        outputName: name,
+        inputRows: a.rows,
+        inputCols: a.cols,
+        axis,
+        op
+      });
+      return new Block("register", outRows, outCols, name, this.ctx, this);
+    }
+  };
+}));
+function isConstVal(node, val) {
+  return node.kind === "const" && node.value === val;
+}
+function evalBinaryConst(op, a, b) {
+  return BINARY_EVAL[op]?.(a, b) ?? null;
+}
+function evalUnaryConst(op, x) {
+  return UNARY_EVAL[op]?.(x) ?? null;
+}
+function constFolded(value, dataType) {
+  return {
+    kind: "const",
+    value,
+    valueType: "scalar",
+    dataType,
+    id: -1
+  };
+}
+function tryFold(partial) {
+  if (partial.kind === "binary") {
+    const { op, lhs, rhs, dataType } = partial;
+    if (lhs.kind === "const" && rhs.kind === "const") {
+      const result = evalBinaryConst(op, lhs.value, rhs.value);
+      if (result !== null) return constFolded(result, dataType);
+    }
+    switch (op) {
+      case "add":
+        if (isConstVal(rhs, 0)) return lhs;
+        if (isConstVal(lhs, 0)) return rhs;
+        break;
+      case "sub":
+        if (isConstVal(rhs, 0)) return lhs;
+        break;
+      case "mul":
+        if (isConstVal(rhs, 1)) return lhs;
+        if (isConstVal(lhs, 1)) return rhs;
+        break;
+      case "div":
+        if (isConstVal(rhs, 1)) return lhs;
+        break;
+      case "and":
+        if (isConstVal(rhs, 0) || isConstVal(lhs, 0)) return constFolded(0, "u32");
+        break;
+      case "or":
+        if (isConstVal(rhs, 0)) return lhs;
+        if (isConstVal(lhs, 0)) return rhs;
+        break;
+      case "xor":
+        if (isConstVal(rhs, 0)) return lhs;
+        if (isConstVal(lhs, 0)) return rhs;
+        break;
+    }
+    return null;
+  }
+  if (partial.kind === "unary") {
+    const { op, input, dataType } = partial;
+    if (input.kind === "const") {
+      const result = evalUnaryConst(op, input.value);
+      if (result !== null) return constFolded(result, dataType);
+    }
+    if (op === "neg" && input.kind === "unary" && input.op === "neg") return input.input;
+    return null;
+  }
+  if (partial.kind === "cmp") {
+    const { op, lhs, rhs } = partial;
+    if (lhs.kind === "const" && rhs.kind === "const") {
+      const l = lhs.value, r = rhs.value;
+      let result = false;
+      switch (op) {
+        case "eq":
+          result = l === r;
+          break;
+        case "ne":
+          result = l !== r;
+          break;
+        case "lt":
+          result = l < r;
+          break;
+        case "le":
+          result = l <= r;
+          break;
+        case "gt":
+          result = l > r;
+          break;
+        case "ge":
+          result = l >= r;
+          break;
+      }
+      return constFolded(result ? 1 : 0, "u32");
+    }
+    return null;
+  }
+  if (partial.kind === "cast") {
+    const { input, targetType } = partial;
+    if (input.kind === "const") return constFolded(input.value, targetType);
+    return null;
+  }
+  return null;
+}
+function cseKey(node) {
+  const n = node;
+  const getId = (ref2) => ref2.id;
+  switch (n.kind) {
+    case "const":
+      return `K:${n.dataType}:${n.value}`;
+    case "binary":
+      return `B:${n.op}:${getId(n.lhs)}:${getId(n.rhs)}`;
+    case "unary":
+      return `U:${n.op}:${getId(n.input)}`;
+    case "cmp":
+      return `C:${n.op}:${getId(n.lhs)}:${getId(n.rhs)}`;
+    case "cast":
+      return `T:${n.targetType}:${getId(n.input)}`;
+    case "bitcast":
+      return `BC:${n.targetType}:${getId(n.input)}`;
+    case "select":
+      return `S:${getId(n.condition)}:${getId(n.trueVal)}:${getId(n.falseVal)}`;
+    case "uniform":
+      return `UNI:${n.name}`;
+    case "programId":
+      return `PID:${n.dim}`;
+    case "threadIdx":
+      return `TID:${n.dim}`;
+    case "localIndex":
+      return "LI";
+    case "globalId":
+      return `GID:${n.dim}`;
+    case "numWorkgroups":
+      return `NWG:${n.dim}`;
+    case "vec4Construct":
+      return `V4C:${getId(n.x)}:${getId(n.y)}:${getId(n.z)}:${getId(n.w)}`;
+    case "vec4Splat":
+      return `V4S:${getId(n.value)}`;
+    case "vec4NativeDot":
+      return `V4D:${getId(n.a)}:${getId(n.b)}`;
+    case "vec4Component":
+      return `V4X:${getId(n.value)}:${n.comp}`;
+    case "vec4Binary":
+      return `V4B:${n.op}:${getId(n.a)}:${getId(n.b)}`;
+    default:
+      return null;
+  }
+}
+function makeNode(partial) {
+  const folded = tryFold(partial);
+  if (folded !== null) {
+    if (folded.id >= 0) return folded;
+    const key2 = cseKey(folded);
+    if (key2 !== null) {
+      const existing = cseCache.get(key2);
+      if (existing) return existing;
+    }
+    folded.id = nextNodeId++;
+    if (key2 !== null) cseCache.set(key2, folded);
+    return folded;
+  }
+  const key = cseKey(partial);
+  if (key !== null) {
+    const existing = cseCache.get(key);
+    if (existing) return existing;
+  }
+  const node = {
+    ...partial,
+    id: nextNodeId++
+  };
+  if (key !== null) cseCache.set(key, node);
+  return node;
+}
+function resolveArgAs(arg, dtype = "f32") {
+  if (typeof arg === "number") return makeNode({
+    kind: "const",
+    valueType: "scalar",
+    dataType: dtype,
+    value: arg
+  });
+  return arg.node;
+}
+function promoteValueType(a, b) {
+  return a === "block" || b === "block" ? "block" : "scalar";
+}
+function elementwiseGrid(workgroupSize, opts) {
+  const vw = opts?.vecWidth ?? 1;
+  const uName = opts?.elementUniform ?? "total_elements";
+  return (u) => {
+    const totalWg = Math.ceil(u[uName] / (workgroupSize * vw));
+    if (totalWg <= 65535) return [totalWg];
+    return [Math.min(totalWg, MAX_WORKGROUPS_PER_DIM), Math.ceil(totalWg / MAX_WORKGROUPS_PER_DIM)];
+  };
+}
+function perRowGrid(rowUniform) {
+  const name = rowUniform ?? "num_rows";
+  return (u) => [u[name]];
+}
+function ceilDivGrid(divisor, elementUniform) {
+  const name = elementUniform ?? "total_elements";
+  return (u) => [Math.ceil(u[name] / divisor)];
+}
+function singleWorkgroup() {
+  return () => [1];
+}
+function tiledGrid(dims) {
+  function resolve(dim, u) {
+    if (typeof dim === "string") return u[dim];
+    return Math.ceil(u[dim.uniform] / dim.tileSize);
+  }
+  return (u) => {
+    const x = resolve(dims.x, u);
+    if (dims.z !== void 0 && dims.y !== void 0) return [
+      x,
+      resolve(dims.y, u),
+      resolve(dims.z, u)
+    ];
+    if (dims.y !== void 0) return [x, resolve(dims.y, u)];
+    return [x];
+  };
+}
+function elementwiseKernel(config) {
+  const sizeU = config.sizeUniform ?? "size";
+  return {
+    name: config.name,
+    workgroupSize: DEFAULT_WG,
+    bindings: config.bindings,
+    uniforms: {
+      [sizeU]: "u32",
+      ...config.uniforms
+    },
+    enableF16: config.enableF16,
+    constants: config.constants,
+    grid: elementwiseGrid(DEFAULT_WG, { elementUniform: sizeU }),
+    kernel(ctx) {
+      const idx = ctx.elementIndex(DEFAULT_WG, sizeU);
+      config.kernel(ctx, idx);
+    }
+  };
+}
+function perRowKernel(config) {
+  const rowU = config.rowUniform ?? "num_rows";
+  const dimU = config.dimUniform ?? "feature_dim";
+  return {
+    name: config.name,
+    workgroupSize: DEFAULT_WG,
+    bindings: config.bindings,
+    uniforms: {
+      [rowU]: "u32",
+      [dimU]: "u32",
+      ...config.uniforms
+    },
+    enableF16: config.enableF16,
+    constants: config.constants,
+    grid: perRowGrid(rowU),
+    kernel(ctx) {
+      const row = ctx.programId(0);
+      const tid = ctx.localIndex();
+      const D = ctx.uniform(dimU);
+      const base = row.mul(D);
+      config.kernel(ctx, row, tid, D, base);
+    }
+  };
+}
+function inferGrid(spec) {
+  const wgSize = typeof spec.workgroupSize === "number" ? spec.workgroupSize : spec.workgroupSize[0] * spec.workgroupSize[1];
+  for (const [name, type] of Object.entries(spec.uniforms)) if (type === "u32" && ELEMENTWISE_UNIFORM_NAMES.has(name)) return elementwiseGrid(wgSize, { elementUniform: name });
+  return null;
+}
+function resolveGrid(spec) {
+  if (spec.grid) return spec.grid;
+  const inferred = inferGrid(spec);
+  if (inferred) return inferred;
+  throw new Error(`tile-ir: no grid function for kernel "${spec.name}" and no auto-inference matched. Add an explicit \`grid\` or use a well-known uniform name (${[...ELEMENTWISE_UNIFORM_NAMES].join(", ")}).`);
+}
+function buildKernelIR(spec, subgroupSize = 0) {
+  nextNodeId = 0;
+  cseCache = /* @__PURE__ */ new Map();
+  try {
+    const ctx = new KernelContext(spec.bindings, subgroupSize);
+    ctx._setWgSize(spec.workgroupSize);
+    spec.kernel(ctx);
+    return ctx;
+  } finally {
+  }
+}
+var nextNodeId, cseCache, F, BINARY_EVAL, UNARY_EVAL, resolveArg, resolveArgU32, BlockExpr, SharedArrayHandle, VarHandle, ArrayVarHandle, Vec4ArrayHandle, KernelContext, DEFAULT_WG, ELEMENTWISE_UNIFORM_NAMES;
+var init_tile_ir = __esmMin((() => {
+  init_tile_ops();
+  init_shape_utils();
+  nextNodeId = 0;
+  cseCache = /* @__PURE__ */ new Map();
+  F = (r) => Number.isFinite(r) ? r : null;
+  BINARY_EVAL = {
+    add: (a, b) => F(a + b),
+    sub: (a, b) => F(a - b),
+    mul: (a, b) => F(a * b),
+    div: (a, b) => b !== 0 ? F(a / b) : null,
+    mod: (a, b) => b !== 0 ? a % b : null,
+    min: (a, b) => Math.min(a, b),
+    max: (a, b) => Math.max(a, b),
+    pow: (a, b) => F(a ** b),
+    and: (a, b) => (a >>> 0 & b >>> 0) >>> 0,
+    or: (a, b) => (a >>> 0 | b >>> 0) >>> 0,
+    xor: (a, b) => (a >>> 0 ^ b >>> 0) >>> 0,
+    shr: (a, b) => a >>> 0 >>> (b >>> 0),
+    shl: (a, b) => a >>> 0 << (b >>> 0) >>> 0
+  };
+  UNARY_EVAL = {
+    neg: (x) => -x,
+    abs: (x) => Math.abs(x),
+    exp: (x) => F(Math.exp(x)),
+    log: (x) => x > 0 ? Math.log(x) : null,
+    sqrt: (x) => x >= 0 ? Math.sqrt(x) : null,
+    rsqrt: (x) => x > 0 ? 1 / Math.sqrt(x) : null,
+    floor: (x) => Math.floor(x),
+    ceil: (x) => Math.ceil(x),
+    sin: (x) => Math.sin(x),
+    cos: (x) => Math.cos(x),
+    tanh: (x) => Math.tanh(x),
+    round: (x) => Math.round(x),
+    sign: (x) => Math.sign(x),
+    not: (x) => x ? 0 : 1,
+    exp2: (x) => F(2 ** x),
+    log2: (x) => x > 0 ? Math.log2(x) : null
+  };
+  resolveArg = (arg) => resolveArgAs(arg, "f32");
+  resolveArgU32 = (arg) => resolveArgAs(arg, "u32");
+  BlockExpr = class BlockExpr2 {
+    constructor(node) {
+      this.node = node;
+    }
+    _binOp(op, other, u32Rhs, dt) {
+      const rhs = u32Rhs ? resolveArgU32(other) : resolveArg(other);
+      return new BlockExpr2(makeNode({
+        kind: "binary",
+        op,
+        lhs: this.node,
+        rhs,
+        valueType: promoteValueType(this.node.valueType, rhs.valueType),
+        dataType: dt
+      }));
+    }
+    _unaryOp(op, dt) {
+      return new BlockExpr2(makeNode({
+        kind: "unary",
+        op,
+        input: this.node,
+        valueType: this.node.valueType,
+        dataType: dt ?? this.node.dataType
+      }));
+    }
+    add(other) {
+      return this._binOp("add", other, false, this.node.dataType);
+    }
+    sub(other) {
+      return this._binOp("sub", other, false, this.node.dataType);
+    }
+    mul(other) {
+      return this._binOp("mul", other, false, this.node.dataType);
+    }
+    div(other) {
+      return this._binOp("div", other, false, this.node.dataType);
+    }
+    mod(other) {
+      return this._binOp("mod", other, false, this.node.dataType);
+    }
+    min(other) {
+      return this._binOp("min", other, false, this.node.dataType);
+    }
+    max(other) {
+      return this._binOp("max", other, false, this.node.dataType);
+    }
+    and(other) {
+      return this._binOp("and", other, true, "u32");
+    }
+    or(other) {
+      return this._binOp("or", other, true, "u32");
+    }
+    xor(other) {
+      return this._binOp("xor", other, true, "u32");
+    }
+    shr(other) {
+      return this._binOp("shr", other, true, this.node.dataType);
+    }
+    shl(other) {
+      return this._binOp("shl", other, true, this.node.dataType);
+    }
+    rsqrt() {
+      return this._unaryOp("rsqrt", "f32");
+    }
+    exp() {
+      return this._unaryOp("exp", "f32");
+    }
+    log() {
+      return this._unaryOp("log", "f32");
+    }
+    sqrt() {
+      return this._unaryOp("sqrt", "f32");
+    }
+    tanh() {
+      return this._unaryOp("tanh", "f32");
+    }
+    sin() {
+      return this._unaryOp("sin", "f32");
+    }
+    cos() {
+      return this._unaryOp("cos", "f32");
+    }
+    exp2() {
+      return this._unaryOp("exp2", "f32");
+    }
+    log2() {
+      return this._unaryOp("log2", "f32");
+    }
+    abs() {
+      return this._unaryOp("abs");
+    }
+    neg() {
+      return this._unaryOp("neg");
+    }
+    floor() {
+      return this._unaryOp("floor");
+    }
+    ceil() {
+      return this._unaryOp("ceil");
+    }
+    round() {
+      return this._unaryOp("round");
+    }
+    sign() {
+      return this._unaryOp("sign");
+    }
+    /** Sigmoid activation: 1 / (1 + exp(-x)). Compound — no new IR node. */
+    sigmoid() {
+      const one = new BlockExpr2(makeNode({
+        kind: "const",
+        value: 1,
+        valueType: "scalar",
+        dataType: "f32"
+      }));
+      return one.div(one.add(this.neg().exp()));
+    }
+    /** Clamp x to [lo, hi]. Compound — uses max(lo, min(x, hi)). */
+    clamp(lo, hi) {
+      return this.max(lo).min(hi);
+    }
+    /** Fused multiply-add: this * b + c. Compound — GPU will fuse automatically. */
+    fma(b, c) {
+      return this.mul(b).add(c);
+    }
+    /** Ceiling division: cdiv(a, b) = (a + b - 1) / b. Compound. */
+    cdiv(other) {
+      const b = typeof other === "number" ? new BlockExpr2(resolveArg(other)) : other;
+      return this.add(b.sub(1)).div(b);
+    }
+    /** Floor division (truncated toward negative infinity). For unsigned, same as div. Compound. */
+    floorDiv(other) {
+      return this.div(other).floor();
+    }
+    /** Approximate erf(x) using Abramowitz & Stegun (max error ~1.5e-7). Compound. */
+    erf() {
+      const one = new BlockExpr2(resolveArg(1));
+      const signX = this.sign();
+      const absX = this.abs();
+      const t = one.div(one.add(absX.mul(0.3275911)));
+      const poly = t.mul(1.061405429).add(-1.453152027).mul(t).add(1.421413741).mul(t).add(-0.284496736).mul(t).add(0.254829592).mul(t);
+      const expTerm = absX.neg().mul(absX).exp();
+      return signX.mul(one.sub(poly.mul(expTerm)));
+    }
+    pow(other) {
+      return this._binOp("pow", other, false, "f32");
+    }
+    _castTo(dt) {
+      if (this.node.dataType === dt) return this;
+      return new BlockExpr2(makeNode({
+        kind: "cast",
+        input: this.node,
+        targetType: dt,
+        valueType: this.node.valueType,
+        dataType: dt
+      }));
+    }
+    toF32() {
+      return this._castTo("f32");
+    }
+    toU32() {
+      return this._castTo("u32");
+    }
+    toI32() {
+      return this._castTo("i32");
+    }
+    toF16() {
+      return this._castTo("f16");
+    }
+    bitcastTo(dtype) {
+      return new BlockExpr2(makeNode({
+        kind: "bitcast",
+        input: this.node,
+        targetType: dtype,
+        valueType: this.node.valueType,
+        dataType: dtype
+      }));
+    }
+    _subgroupOp(kind) {
+      return new BlockExpr2(makeNode({
+        kind,
+        value: this.node,
+        valueType: this.node.valueType,
+        dataType: this.node.dataType
+      }));
+    }
+    subgroupShuffleXor(mask) {
+      const m = resolveArgU32(mask);
+      return new BlockExpr2(makeNode({
+        kind: "subgroupShuffleXor",
+        value: this.node,
+        mask: m,
+        valueType: this.node.valueType,
+        dataType: this.node.dataType
+      }));
+    }
+    subgroupAdd() {
+      return this._subgroupOp("subgroupAdd");
+    }
+    subgroupMax() {
+      return this._subgroupOp("subgroupMax");
+    }
+    subgroupMin() {
+      return this._subgroupOp("subgroupMin");
+    }
+    subgroupBroadcastFirst() {
+      return this._subgroupOp("subgroupBroadcastFirst");
+    }
+    subgroupInclusiveAdd() {
+      return this._subgroupOp("subgroupInclusiveAdd");
+    }
+    /** dot(this, other) — both must be vec4<f32>. Returns f32 scalar. */
+    vec4Dot(other) {
+      return new BlockExpr2(makeNode({
+        kind: "vec4NativeDot",
+        a: this.node,
+        b: other.node,
+        valueType: "scalar",
+        dataType: "f32"
+      }));
+    }
+    /** Extract component from vec4: .x=0, .y=1, .z=2, .w=3. Returns f32 scalar. */
+    vec4Component(comp) {
+      return new BlockExpr2(makeNode({
+        kind: "vec4Component",
+        value: this.node,
+        comp,
+        valueType: "scalar",
+        dataType: "f32"
+      }));
+    }
+    _vec4BinOp(op, other) {
+      return new BlockExpr2(makeNode({
+        kind: "vec4Binary",
+        op,
+        a: this.node,
+        b: other.node,
+        valueType: "scalar",
+        dataType: "f32"
+      }));
+    }
+    vec4MulScalar(s) {
+      return this._vec4BinOp("mul", s);
+    }
+    vec4Add(other) {
+      return this._vec4BinOp("add", other);
+    }
+    vec4Sub(other) {
+      return this._vec4BinOp("sub", other);
+    }
+    vec4Mul(other) {
+      return this._vec4BinOp("mul", other);
+    }
+    _cmpOp(op, other) {
+      const rhs = resolveArg(other);
+      return new BlockExpr2(makeNode({
+        kind: "cmp",
+        op,
+        lhs: this.node,
+        rhs,
+        valueType: promoteValueType(this.node.valueType, rhs.valueType),
+        dataType: "u32"
+      }));
+    }
+    eq(other) {
+      return this._cmpOp("eq", other);
+    }
+    ne(other) {
+      return this._cmpOp("ne", other);
+    }
+    lt(other) {
+      return this._cmpOp("lt", other);
+    }
+    le(other) {
+      return this._cmpOp("le", other);
+    }
+    gt(other) {
+      return this._cmpOp("gt", other);
+    }
+    ge(other) {
+      return this._cmpOp("ge", other);
+    }
+    not() {
+      return this._unaryOp("not");
+    }
+    select(trueVal, falseVal) {
+      const t = resolveArg(trueVal);
+      const f = resolveArg(falseVal);
+      return new BlockExpr2(makeNode({
+        kind: "select",
+        condition: this.node,
+        trueVal: t,
+        falseVal: f,
+        valueType: promoteValueType(promoteValueType(this.node.valueType, t.valueType), f.valueType),
+        dataType: t.dataType
+      }));
+    }
+  };
+  SharedArrayHandle = class {
+    constructor(name, size, elemType, ctx) {
+      this.name = name;
+      this.size = size;
+      this.elemType = elemType;
+      this.ctx = ctx;
+    }
+    read(idx) {
+      return new BlockExpr(makeNode({
+        kind: "sharedRead",
+        arrayName: this.name,
+        idx: idx.node,
+        valueType: "scalar",
+        dataType: this.elemType
+      }));
+    }
+    write(idx, value) {
+      this.ctx.pushStatement({
+        kind: "sharedWrite",
+        arrayName: this.name,
+        idx: idx.node,
+        value: value.node
+      });
+    }
+  };
+  VarHandle = class {
+    constructor(name, dtype, ctx) {
+      this.name = name;
+      this.dtype = dtype;
+      this.ctx = ctx;
+    }
+    get() {
+      return new BlockExpr(makeNode({
+        kind: "namedRef",
+        name: this.name,
+        valueType: "scalar",
+        dataType: this.dtype
+      }));
+    }
+    set(value) {
+      this.ctx.pushStatement({
+        kind: "assign",
+        name: this.name,
+        value: value.node
+      });
+    }
+    addAssign(value) {
+      this.ctx.pushStatement({
+        kind: "addAssign",
+        name: this.name,
+        value: value.node
+      });
+    }
+  };
+  ArrayVarHandle = class {
+    constructor(name, elemType, size, ctx) {
+      this.name = name;
+      this.elemType = elemType;
+      this.size = size;
+      this.ctx = ctx;
+    }
+    get(idx) {
+      return new BlockExpr(makeNode({
+        kind: "arrayRead",
+        arrayName: this.name,
+        idx: idx.node,
+        valueType: "scalar",
+        dataType: this.elemType
+      }));
+    }
+    set(idx, value) {
+      this.ctx.pushStatement({
+        kind: "indexAssign",
+        arrayName: this.name,
+        idx: idx.node,
+        value: value.node
+      });
+    }
+    addAssign(idx, value) {
+      this.ctx.pushStatement({
+        kind: "indexAddAssign",
+        arrayName: this.name,
+        idx: idx.node,
+        value: value.node
+      });
+    }
+  };
+  Vec4ArrayHandle = class {
+    constructor(name, size, isShared, ctx) {
+      this.name = name;
+      this.size = size;
+      this.isShared = isShared;
+      this.ctx = ctx;
+    }
+    read(idx) {
+      return new BlockExpr(makeNode({
+        kind: this.isShared ? "vec4SharedRead" : "vec4ArrayRead",
+        arrayName: this.name,
+        idx: idx.node,
+        valueType: "scalar",
+        dataType: "f32"
+      }));
+    }
+    write(idx, value) {
+      this.ctx.pushStatement({
+        kind: "vec4ArrayWrite",
+        arrayName: this.name,
+        idx: idx.node,
+        value: value.node,
+        isShared: this.isShared
+      });
+    }
+    addAssign(idx, value) {
+      this.ctx.pushStatement({
+        kind: "vec4ArrayAddAssign",
+        arrayName: this.name,
+        idx: idx.node,
+        value: value.node,
+        isShared: this.isShared
+      });
+    }
+  };
+  KernelContext = class {
+    /** All nodes created during kernel execution, in creation order. */
+    nodes = [];
+    /** Statement list (imperative mode). */
+    statements = [];
+    /** Shared memory arrays declared by this kernel. */
+    sharedArrays = [];
+    /** Vec4 shared memory arrays declared by this kernel. */
+    vec4SharedArrays = [];
+    /** Binding specs from the kernel spec (for dataType resolution in load). */
+    bindingSpecs;
+    /** Subgroup size (0 = no subgroup support). Set by compileTileKernel(). */
+    subgroupSize;
+    /** Statement stack for nested scopes (forRange, ifThen). */
+    stmtStack = [];
+    /** Counter for unique loop variable names. */
+    loopVarCounter = 0;
+    /** Counter for unique wgReduce shared memory / accumulator names. */
+    reduceCounter = 0;
+    /** Whether this kernel's reduction primitives used subgroup operations. */
+    _usesSubgroups = false;
+    /** Node IDs of flatGlobalId() results (for auto-vectorization override). */
+    flatGlobalIdNodeIds = [];
+    /** Workgroup size (product if 2D), set by buildKernelIR from spec.workgroupSize. */
+    _wgSize = 0;
+    constructor(bindings, subgroupSize = 0) {
+      this.bindingSpecs = bindings ?? {};
+      this.subgroupSize = subgroupSize;
+    }
+    /** Get the DataType for a named binding, defaulting to "f32". */
+    getBindingType(binding) {
+      return this.bindingSpecs[binding]?.type ?? "f32";
+    }
+    /** @internal Set workgroup size from spec. Called by buildKernelIR(). */
+    _setWgSize(wgSize) {
+      this._wgSize = wgSize;
+    }
+    trackNode(node) {
+      this.nodes.push(node);
+      return node;
+    }
+    /** Push a statement to the current scope (top of stack or root). */
+    pushStatement(stmt) {
+      (this.stmtStack.length > 0 ? this.stmtStack[this.stmtStack.length - 1] : this.statements).push(stmt);
+    }
+    /** Workgroup ID for the given dimension (0=x, 1=y, 2=z). */
+    programId(dim) {
+      return new BlockExpr(this.trackNode(makeNode({
+        kind: "programId",
+        dim,
+        valueType: "scalar",
+        dataType: "u32"
+      })));
+    }
+    /** Number of workgroups dispatched in given dimension (like Triton's `tl.num_programs`). */
+    numPrograms(dim) {
+      return new BlockExpr(this.trackNode(makeNode({
+        kind: "numWorkgroups",
+        dim,
+        valueType: "scalar",
+        dataType: "u32"
+      })));
+    }
+    /** Load from a storage buffer at given offsets. Optional mask for bounds. */
+    load(binding, offsets, mask) {
+      const bindingType = this.bindingSpecs[binding]?.type ?? "f32";
+      const partial = {
+        kind: "load",
+        binding,
+        offsets: offsets.node,
+        valueType: "block",
+        dataType: bindingType
+      };
+      if (mask) partial.mask = mask.node;
+      return new BlockExpr(this.trackNode(makeNode(partial)));
+    }
+    /** Read a uniform config value. */
+    uniform(name) {
+      return new BlockExpr(this.trackNode(makeNode({
+        kind: "uniform",
+        name,
+        valueType: "scalar",
+        dataType: "u32"
+      })));
+    }
+    /** Create a scalar constant. */
+    const(value, dataType = "f32") {
+      return new BlockExpr(this.trackNode(makeNode({
+        kind: "const",
+        value,
+        valueType: "scalar",
+        dataType
+      })));
+    }
+    /** Shorthand: u32 constant. */
+    u32(value) {
+      return this.const(value, "u32");
+    }
+    /** Shorthand: i32 constant. */
+    i32(value) {
+      return this.const(value, "i32");
+    }
+    /** Shorthand: f32 constant. */
+    f32(value) {
+      return this.const(value, "f32");
+    }
+    /** Shorthand: f16 constant. */
+    f16(value) {
+      return this.const(value, "f16");
+    }
+    /** Thread-local invocation ID for the given dimension (0=x, 1=y, 2=z). */
+    threadIdx(dim) {
+      return new BlockExpr(this.trackNode(makeNode({
+        kind: "threadIdx",
+        dim,
+        valueType: "scalar",
+        dataType: "u32"
+      })));
+    }
+    /** Flat local invocation index (local_invocation_index). */
+    localIndex() {
+      return new BlockExpr(this.trackNode(makeNode({
+        kind: "localIndex",
+        valueType: "scalar",
+        dataType: "u32"
+      })));
+    }
+    /** Global invocation ID (global_invocation_id.x/y/z). */
+    globalId(dim) {
+      return new BlockExpr(this.trackNode(makeNode({
+        kind: "globalId",
+        dim,
+        valueType: "scalar",
+        dataType: "u32"
+      })));
+    }
+    /**
+    * Flat global thread index, correct for both 1D and 2D dispatch.
+    * For 1D dispatch: gid.x (same as globalId(0)).
+    * For 2D dispatch: (wg.x + wg.y * num_wg.x) * workgroupSize + local_index.
+    */
+    flatGlobalId(workgroupSize) {
+      const result = this.programId(0).add(this.programId(1).mul(this.numPrograms(0))).mul(this.u32(workgroupSize)).add(this.localIndex());
+      this.flatGlobalIdNodeIds.push(result.node.id);
+      return result;
+    }
+    /**
+    * Decompose a flat linear index into multi-dimensional coordinates.
+    * Given shape [D0, D1, ..., Dn], returns [c0, c1, ..., cn] where
+    * flatIdx = c0 * (D1*D2*...*Dn) + c1 * (D2*...*Dn) + ... + cn.
+    *
+    * Equivalent to numpy.unravel_index or Triton's manual `pid // cols, pid % cols`.
+    */
+    decomposeIndex(flatIdx, shape) {
+      const rank2 = shape.length;
+      if (rank2 === 0) return [];
+      if (rank2 === 1) return [flatIdx];
+      const coords = [];
+      let rem = flatIdx;
+      for (let d = 0; d < rank2; d++) {
+        let dimStride = 1;
+        for (let j = d + 1; j < rank2; j++) dimStride *= shape[j];
+        if (d < rank2 - 1) {
+          coords.push(rem.div(this.u32(dimStride)));
+          rem = rem.mod(this.u32(dimStride));
+        } else coords.push(rem);
+      }
+      return coords;
+    }
+    /**
+    * Linearize multi-dimensional coordinates using given strides.
+    * Returns coords[0]*strides[0] + coords[1]*strides[1] + ... + offset.
+    *
+    * Handles stride=0 (broadcast) via constant folding (coord*0 → 0).
+    */
+    linearizeIndex(coords, strides, offset = 0) {
+      let result = this.u32(offset);
+      for (let d = 0; d < coords.length; d++) result = result.add(coords[d].mul(this.u32(strides[d])));
+      return result;
+    }
+    /** Declare a workgroup shared memory array. Returns a handle for read/write. */
+    sharedArray(name, size, elemType = "f32") {
+      this.sharedArrays.push({
+        name,
+        size,
+        elemType
+      });
+      return new SharedArrayHandle(name, size, elemType, this);
+    }
+    /** Emit a `let` binding and return a reference to it. */
+    emitLet(name, expr) {
+      this.pushStatement({
+        kind: "let",
+        name,
+        value: expr.node,
+        dtype: expr.node.dataType
+      });
+      return new BlockExpr(makeNode({
+        kind: "namedRef",
+        name,
+        valueType: "scalar",
+        dataType: expr.node.dataType
+      }));
+    }
+    /** Emit a `var` binding and return a handle for get/set/addAssign. */
+    emitVar(name, dtype, init) {
+      this.pushStatement({
+        kind: "var",
+        name,
+        value: init.node,
+        dtype
+      });
+      return new VarHandle(name, dtype, this);
+    }
+    /** Emit a `var` array and return a handle. Zero-initialized by default. */
+    emitVarArray(name, elemType, size, skipZeroInit) {
+      this.pushStatement({
+        kind: "varArray",
+        name,
+        elemType,
+        size,
+        skipZeroInit
+      });
+      return new ArrayVarHandle(name, elemType, size, this);
+    }
+    /** Declare a register-space vec4 array: `var name: array<vec4<f32>, size>;` */
+    registerVec4Array(name, size) {
+      this.pushStatement({
+        kind: "vec4VarArray",
+        name,
+        size
+      });
+      return new Vec4ArrayHandle(name, size, false, this);
+    }
+    /** Declare a workgroup shared vec4 array: `var<workgroup> name: array<vec4<f32>, size>;` */
+    sharedVec4Array(name, size) {
+      this.vec4SharedArrays.push({
+        name,
+        size
+      });
+      return new Vec4ArrayHandle(name, size, true, this);
+    }
+    /** Construct vec4<f32>(x, y, z, w) from 4 scalar expressions. */
+    vec4(x, y, z, w) {
+      return new BlockExpr(makeNode({
+        kind: "vec4Construct",
+        x: x.node,
+        y: y.node,
+        z: z.node,
+        w: w.node,
+        valueType: "scalar",
+        dataType: "f32"
+      }));
+    }
+    /** Construct vec4<f32>(v) — splat scalar to all 4 lanes. */
+    vec4Splat(v) {
+      return new BlockExpr(makeNode({
+        kind: "vec4Splat",
+        value: v.node,
+        valueType: "scalar",
+        dataType: "f32"
+      }));
+    }
+    /** Shared loop emission for forRange/forStride. */
+    _emitLoop(kind, start, bound, body, extra) {
+      const varName = `_lv${this.loopVarCounter++}`;
+      const loopVar = new BlockExpr(makeNode({
+        kind: "namedRef",
+        name: varName,
+        valueType: "scalar",
+        dataType: "u32"
+      }));
+      const bodyStmts = this.captureScope(() => body(loopVar));
+      if (kind === "forStride") {
+        const stmt = {
+          kind,
+          varName,
+          start: start.node,
+          bound: bound.node,
+          stride: extra?.stride ?? 1,
+          body: bodyStmts
+        };
+        if (extra?.unroll != null) stmt.unroll = extra.unroll;
+        this.pushStatement(stmt);
+      } else {
+        const stmt = {
+          kind,
+          varName,
+          start: start.node,
+          bound: bound.node,
+          body: bodyStmts
+        };
+        if (extra?.unroll != null) stmt.unroll = extra.unroll;
+        this.pushStatement(stmt);
+      }
+    }
+    /** Emit a for loop: `for (var v = start; v < bound; v++)`. */
+    forRange(start, bound, body, opts) {
+      this._emitLoop("forRange", start, bound, body, opts?.unroll ? { unroll: true } : void 0);
+    }
+    /** Strided for loop: `for (var i = start; i < bound; i += stride)`.
+    *  Auto-unrolled when start/bound are const and trip count ≤ 8.
+    *  Set opts.unroll to force unrolling up to trip count 16. */
+    forStride(start, bound, stride, body, opts) {
+      this._emitLoop("forStride", start, bound, body, {
+        stride,
+        unroll: opts?.unroll
+      });
+    }
+    /** Emit a compile-time unrolled loop. Body called N times with constant index. */
+    forUnrolled(count, body) {
+      for (let i = 0; i < count; i++) body(this.u32(i));
+    }
+    /** Emit an if-then block. */
+    ifThen(cond, body) {
+      this.pushStatement({
+        kind: "if",
+        condition: cond.node,
+        body: this.captureScope(body)
+      });
+    }
+    /** Emit an if-then-else block. */
+    ifThenElse(cond, body, elseBody) {
+      const bodyStmts = this.captureScope(body);
+      const elseStmts = this.captureScope(elseBody);
+      this.pushStatement({
+        kind: "ifElse",
+        condition: cond.node,
+        body: bodyStmts,
+        elseBody: elseStmts
+      });
+    }
+    /** Emit a workgroupBarrier(). */
+    barrier() {
+      this.pushStatement({ kind: "barrier" });
+    }
+    /**
+    * Capture statements emitted inside a callback into a separate array.
+    * Used by tile-level ops to capture sub-bodies (e.g., apply() lambdas).
+    */
+    captureScope(body) {
+      const captured = [];
+      this.stmtStack.push(captured);
+      body();
+      this.stmtStack.pop();
+      return captured;
+    }
+    /** Whether subgroup-optimized path should be used for the given workgroup size. */
+    canUseSubgroups(wgSize) {
+      const sg = this.subgroupSize;
+      const ok = sg > 0 && wgSize >= sg * 2 && wgSize % sg === 0;
+      if (ok) this._usesSubgroups = true;
+      return ok;
+    }
+    /** Stride-halving barrier loop: for each stride from count/2 to 1, ifThen(tid < stride) body, barrier. */
+    _treeLoop(tid, count, body) {
+      for (let stride = count >> 1; stride >= 1; stride >>= 1) {
+        this.ifThen(tid.lt(this.u32(stride)), () => body(this.u32(stride)));
+        this.barrier();
+      }
+    }
+    /** Tree reduction: `smem[0] = op(smem[0..wgSize-1])`. Uses subgroup intrinsics when available. */
+    _treeReduce(smem, tid, wgSize, combine, subgroupOp) {
+      const smemCombine = (off) => {
+        smem.write(tid, combine(smem.read(tid), smem.read(tid.add(off))));
+      };
+      if (this.canUseSubgroups(wgSize)) {
+        const sg = this.subgroupSize;
+        const numSubgroups = wgSize / sg;
+        let reduced;
+        if (subgroupOp) {
+          const val = this.emitLet("_sgr_val", smem.read(tid));
+          reduced = this.emitLet("_sgr_red", subgroupOp === "sum" ? val.subgroupAdd() : subgroupOp === "max" ? val.subgroupMax() : val.subgroupMin());
+        } else {
+          let val = this.emitLet("_sgrg_val", smem.read(tid));
+          for (let mask = sg >> 1; mask >= 1; mask >>= 1) val = this.emitLet(`_sgrg_m${mask}`, combine(val, val.subgroupShuffleXor(mask)));
+          reduced = val;
+        }
+        this.barrier();
+        this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
+          smem.write(tid.div(this.u32(sg)), reduced);
+        });
+        this.barrier();
+        this._treeLoop(tid, numSubgroups, smemCombine);
+        return;
+      }
+      this._treeLoop(tid, wgSize, smemCombine);
+    }
+    treeReduceSum(smem, tid, wgSize) {
+      this._treeReduce(smem, tid, wgSize, (a, b) => a.add(b), "sum");
+    }
+    treeReduceMax(smem, tid, wgSize) {
+      this._treeReduce(smem, tid, wgSize, (a, b) => a.max(b), "max");
+    }
+    treeReduceMin(smem, tid, wgSize) {
+      this._treeReduce(smem, tid, wgSize, (a, b) => a.min(b), "min");
+    }
+    /** Generic tree reduction with user-defined combine function. */
+    treeReduceGeneric(smem, tid, wgSize, combine) {
+      this._treeReduce(smem, tid, wgSize, combine);
+    }
+    /** Dual tree sum reduction: reduces two shared arrays in parallel. */
+    dualTreeReduceSum(smem1, smem2, tid, wgSize) {
+      const dualAdd = (off) => {
+        smem1.write(tid, smem1.read(tid).add(smem1.read(tid.add(off))));
+        smem2.write(tid, smem2.read(tid).add(smem2.read(tid.add(off))));
+      };
+      if (this.canUseSubgroups(wgSize)) {
+        const sg = this.subgroupSize;
+        const numSubgroups = wgSize / sg;
+        const v1 = this.emitLet("_sgrd1_v", smem1.read(tid));
+        const v2 = this.emitLet("_sgrd2_v", smem2.read(tid));
+        const r1 = this.emitLet("_sgrd1_r", v1.subgroupAdd());
+        const r2 = this.emitLet("_sgrd2_r", v2.subgroupAdd());
+        this.barrier();
+        this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
+          smem1.write(tid.div(this.u32(sg)), r1);
+          smem2.write(tid.div(this.u32(sg)), r2);
+        });
+        this.barrier();
+        this._treeLoop(tid, numSubgroups, dualAdd);
+        return;
+      }
+      this._treeLoop(tid, wgSize, dualAdd);
+    }
+    /**
+    * Generic workgroup-cooperative reduction with user-defined combine.
+    * Like `wgReduce` but takes a combine function and identity value.
+    */
+    wgReduceGeneric(tid, count, wgSize, identity, bodyFn, combine) {
+      const id = this.reduceCounter++;
+      const acc = this.emitVar(`_wgr${id}_a`, "f32", identity);
+      this.stridedFor(tid, count, wgSize, (i) => {
+        acc.set(combine(acc.get(), bodyFn(i)));
+      });
+      if (this.canUseSubgroups(wgSize)) {
+        const sg = this.subgroupSize;
+        const numSubgroups = wgSize / sg;
+        let val = this.emitLet(`_wgr${id}_sv`, acc.get());
+        for (let mask = sg >> 1; mask >= 1; mask >>= 1) val = this.emitLet(`_wgr${id}_m${mask}`, combine(val, val.subgroupShuffleXor(mask)));
+        const smem2 = this.sharedArray(`_wgr${id}_s`, numSubgroups);
+        this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
+          smem2.write(tid.div(this.u32(sg)), val);
+        });
+        this.barrier();
+        this._treeLoop(tid, numSubgroups, (off) => {
+          smem2.write(tid, combine(smem2.read(tid), smem2.read(tid.add(off))));
+        });
+        return smem2.read(this.u32(0));
+      }
+      const smem = this.sharedArray(`_wgr${id}_s`, wgSize);
+      smem.write(tid, acc.get());
+      this.barrier();
+      this.treeReduceGeneric(smem, tid, wgSize, combine);
+      return smem.read(this.u32(0));
+    }
+    /** Strided loop: `for (var i = tid; i < bound; i += wgSize) { body(i); }` */
+    stridedFor(tid, bound, wgSize, body) {
+      this.forStride(tid, bound, wgSize, body);
+    }
+    /**
+    * Workgroup-cooperative reduction. Allocates shared memory, accumulates via
+    * stridedFor, writes to shared memory, barriers, and tree-reduces.
+    * Returns the reduced scalar (`smem[0]` after reduction).
+    *
+    * With subgroups: accumulates in registers, reduces within subgroup via
+    * subgroupAdd/Max, then small tree reduction across subgroup leaders.
+    */
+    wgReduce(op, tid, count, wgSize, bodyFn) {
+      const id = this.reduceCounter++;
+      const identity = op === "sum" ? 0 : op === "max" ? F32_NEG_MAX : F32_POS_MAX;
+      const acc = this.emitVar(`_wgr${id}_a`, "f32", this.f32(identity));
+      this.stridedFor(tid, count, wgSize, (i) => {
+        if (op === "sum") acc.addAssign(bodyFn(i));
+        else if (op === "max") acc.set(acc.get().max(bodyFn(i)));
+        else acc.set(acc.get().min(bodyFn(i)));
+      });
+      if (this.canUseSubgroups(wgSize)) {
+        const sg = this.subgroupSize;
+        const numSubgroups = wgSize / sg;
+        const sgReduced = this.emitLet(`_wgr${id}_sgr`, op === "sum" ? acc.get().subgroupAdd() : op === "max" ? acc.get().subgroupMax() : acc.get().subgroupMin());
+        const smem2 = this.sharedArray(`_wgr${id}_s`, numSubgroups);
+        this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
+          smem2.write(tid.div(this.u32(sg)), sgReduced);
+        });
+        this.barrier();
+        const combine = (a, b) => op === "sum" ? a.add(b) : op === "max" ? a.max(b) : a.min(b);
+        this._treeLoop(tid, numSubgroups, (off) => {
+          smem2.write(tid, combine(smem2.read(tid), smem2.read(tid.add(off))));
+        });
+        return smem2.read(this.u32(0));
+      }
+      const smem = this.sharedArray(`_wgr${id}_s`, wgSize);
+      smem.write(tid, acc.get());
+      this.barrier();
+      this._treeReduce(smem, tid, wgSize, (a, b) => op === "sum" ? a.add(b) : op === "max" ? a.max(b) : a.min(b), op);
+      return smem.read(this.u32(0));
+    }
+    /**
+    * Dual workgroup-cooperative sum reduction. Same as wgReduce but reduces
+    * two values in parallel using a single stridedFor pass.
+    * Returns `[smem1[0], smem2[0]]` after reduction.
+    *
+    * With subgroups: both accumulators are reduced via subgroupAdd, then
+    * leaders write to small smem arrays for final tree reduction.
+    */
+    dualWgReduce(tid, count, wgSize, bodyFn) {
+      const id = this.reduceCounter++;
+      const acc1 = this.emitVar(`_wgr${id}_a1`, "f32", this.f32(0));
+      const acc2 = this.emitVar(`_wgr${id}_a2`, "f32", this.f32(0));
+      this.stridedFor(tid, count, wgSize, (i) => {
+        const [v1, v2] = bodyFn(i);
+        acc1.addAssign(v1);
+        acc2.addAssign(v2);
+      });
+      if (this.canUseSubgroups(wgSize)) {
+        const sg = this.subgroupSize;
+        const numSubgroups = wgSize / sg;
+        const sgr1 = this.emitLet(`_wgr${id}_sgr1`, acc1.get().subgroupAdd());
+        const sgr2 = this.emitLet(`_wgr${id}_sgr2`, acc2.get().subgroupAdd());
+        const smem12 = this.sharedArray(`_wgr${id}_s1`, numSubgroups);
+        const smem22 = this.sharedArray(`_wgr${id}_s2`, numSubgroups);
+        this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(0)), () => {
+          smem12.write(tid.div(this.u32(sg)), sgr1);
+          smem22.write(tid.div(this.u32(sg)), sgr2);
+        });
+        this.barrier();
+        this._treeLoop(tid, numSubgroups, (off) => {
+          smem12.write(tid, smem12.read(tid).add(smem12.read(tid.add(off))));
+          smem22.write(tid, smem22.read(tid).add(smem22.read(tid.add(off))));
+        });
+        return [smem12.read(this.u32(0)), smem22.read(this.u32(0))];
+      }
+      const smem1 = this.sharedArray(`_wgr${id}_s1`, wgSize);
+      const smem2 = this.sharedArray(`_wgr${id}_s2`, wgSize);
+      smem1.write(tid, acc1.get());
+      smem2.write(tid, acc2.get());
+      this.barrier();
+      this.dualTreeReduceSum(smem1, smem2, tid, wgSize);
+      return [smem1.read(this.u32(0)), smem2.read(this.u32(0))];
+    }
+    /** Emit an atomic operation: `atomicMax(&binding[idx], val)` etc. */
+    atomicOp(binding, idx, op, val) {
+      this.pushStatement({
+        kind: "atomicOp",
+        binding,
+        idx: idx.node,
+        op,
+        value: val.node
+      });
+    }
+    /**
+    * Emit an atomic compare-and-swap.
+    * `atomicCompareExchangeWeak(&binding[idx], expected, desired)`
+    * Returns `{ oldValue: BlockExpr, exchanged: BlockExpr }`.
+    */
+    atomicCAS(binding, idx, expected, desired) {
+      const id = this.reduceCounter++;
+      const oldVar = `_cas${id}_old`;
+      const exchVar = `_cas${id}_ok`;
+      this.pushStatement({
+        kind: "atomicCAS",
+        binding,
+        idx: idx.node,
+        expected: expected.node,
+        desired: desired.node,
+        oldValueVar: oldVar,
+        exchangedVar: exchVar
+      });
+      const oldNode = makeNode({
+        kind: "namedRef",
+        name: oldVar,
+        valueType: "scalar",
+        dataType: "u32"
+      });
+      const exchNode = makeNode({
+        kind: "namedRef",
+        name: exchVar,
+        valueType: "scalar",
+        dataType: "u32"
+      });
+      return {
+        oldValue: new BlockExpr(oldNode),
+        exchanged: new BlockExpr(exchNode)
+      };
+    }
+    /** Emit an unconditional scalar store: `binding[idx] = val;`. */
+    emitStore(binding, idx, val) {
+      this.pushStatement({
+        kind: "directStore",
+        binding,
+        idx: idx.node,
+        value: val.node
+      });
+    }
+    /** Store a vec4 value as 4 consecutive scalar elements.
+    *  Expands to: store(binding, base+0, v.x); store(binding, base+1, v.y); ... */
+    vec4Store(binding, baseIdx, vec) {
+      for (let c = 0; c < 4; c++) {
+        const idx = c === 0 ? baseIdx : baseIdx.add(this.u32(c));
+        this.emitStore(binding, idx, vec.vec4Component(c));
+      }
+    }
+    /** Emit an early `return` statement. */
+    emitReturn() {
+      this.pushStatement({ kind: "return" });
+    }
+    /** Emit a guarded store: `if (cond) { binding[idx] = val; }`. */
+    guardedStore(binding, cond, idx, val) {
+      this.pushStatement({
+        kind: "guardedStore",
+        binding,
+        condition: cond.node,
+        idx: idx.node,
+        value: val.node
+      });
+    }
+    /** Block-level where (like `tl.where`): returns trueVal where cond is true, falseVal otherwise. */
+    blockWhere(cond, trueVal, falseVal) {
+      return cond.select(trueVal, falseVal);
+    }
+    /** Thread-distributed index range (like `tl.arange(0, BLOCK) + base`).
+    *  Returns: programId(0) * blockSize + localIndex() + base. */
+    blockRange(base, blockSize) {
+      return this.programId(0).mul(this.u32(blockSize)).add(this.localIndex()).add(base);
+    }
+    /**
+    * Get the flat element index with automatic early-return bounds check.
+    * Combines `flatGlobalId` + `ifThen(idx >= size, return)` into one call.
+    *
+    * Like Triton's pattern: `offsets = pid * BLOCK + tl.arange(0, BLOCK)`
+    * followed by `mask = offsets < n` — but using early-return instead of masking
+    * since WebGPU dispatches one thread per element.
+    *
+    * @param wgSize - Workgroup size (typically 256)
+    * @param size   - Upper bound. String → uniform name; BlockExpr → direct. Default: "size"
+    */
+    elementIndex(wgSize, size) {
+      const idx = this.flatGlobalId(wgSize);
+      const bound = size === void 0 ? this.uniform("size") : typeof size === "string" ? this.uniform(size) : size;
+      this.ifThen(idx.ge(bound), () => this.emitReturn());
+      return idx;
+    }
+    /**
+    * Masked load from storage buffer (like `tl.load(ptr + offs, mask, other)`).
+    * Returns the loaded value when idx < size, otherwise returns fallback.
+    * Safe because WebGPU robust buffer access clamps out-of-bounds reads.
+    *
+    * @param binding  - Storage buffer name
+    * @param idx      - Element index
+    * @param size     - Upper bound for valid indices
+    * @param fallback - Value for out-of-bounds (default: zero of binding's dtype)
+    */
+    blockLoad(binding, idx, size, fallback) {
+      const val = this.load(binding, idx);
+      const fb = fallback ?? this.const(0, this.bindingSpecs[binding]?.type ?? "f32");
+      return idx.lt(size).select(val, fb);
+    }
+    /**
+    * Masked store to buffer (like `tl.store(ptr + offs, val, mask)`).
+    * Only writes when idx < size; no-op for out-of-bounds threads.
+    *
+    * @param binding - Storage buffer name
+    * @param idx     - Element index
+    * @param size    - Upper bound for valid indices
+    * @param val     - Value to store
+    */
+    blockStore(binding, idx, size, val) {
+      this.guardedStore(binding, idx.lt(size), idx, val);
+    }
+    /**
+    * Map a flat index through a strided layout (like Triton's pointer arithmetic).
+    * Combines `decomposeIndex` + `linearizeIndex` into one call.
+    *
+    * Common pattern it replaces:
+    *   const coords = ctx.decomposeIndex(idx, shape);
+    *   const offset = ctx.linearizeIndex(coords, strides, baseOffset);
+    *
+    * @param flatIdx     - Flat linear index to remap
+    * @param indexShape  - Shape to decompose against (the "logical" shape)
+    * @param strides     - Strides for re-linearization
+    * @param baseOffset  - Base offset (default: 0)
+    */
+    stridedIndex(flatIdx, indexShape, strides, baseOffset = 0) {
+      const coords = this.decomposeIndex(flatIdx, indexShape);
+      return this.linearizeIndex(coords, strides, baseOffset);
+    }
+    /**
+    * Iterate over a range [start, end) with constant bounds (like `for i in range(n)`).
+    * Sugar over `forRange` that accepts numbers instead of BlockExprs.
+    *
+    * @param start - Start value (inclusive)
+    * @param end   - End value (exclusive), or the body if start=0
+    * @param body  - Loop body receiving the iteration variable
+    */
+    range(start, end, body) {
+      this.forRange(this.u32(start), this.u32(end), body);
+    }
+    /**
+    * Cooperatively load two vec4 shared memory tiles in a single strided loop.
+    * Uses one loop and one barrier instead of two, saving one barrier per tile pair.
+    * Common pattern in attention kernels (load K and V simultaneously).
+    *
+    * @param tid        - Thread index within workgroup
+    * @param wgSize     - Workgroup size
+    * @param smemA      - First vec4 shared memory array
+    * @param smemB      - Second vec4 shared memory array
+    * @param count      - Number of vec4 elements per tile
+    * @param loadFn     - Function mapping tile-local index → [valueA, valueB]
+    */
+    tileLoadPairVec4(tid, wgSize, smemA, smemB, count, loadFn) {
+      const bound = typeof count === "number" ? this.u32(count) : count;
+      this.stridedFor(tid, bound, wgSize, (i) => {
+        const [a, b] = loadFn(i);
+        smemA.write(i, a);
+        smemB.write(i, b);
+      });
+      this.barrier();
+    }
+    /** Hillis-Steele inclusive parallel prefix scan in shared memory.
+    *  After the call, smem[tid] = op(smem[0], ..., smem[tid]).
+    *  Requires tid < wgSize.
+    *
+    *  With subgroups (sum only): subgroupInclusiveAdd within each subgroup,
+    *  then cross-subgroup scan via sequential accumulation + broadcast. */
+    inclusiveScan(smem, tid, wgSize, op) {
+      if (op === "sum" && this.canUseSubgroups(wgSize)) {
+        const sg = this.subgroupSize;
+        const numSubgroups = wgSize / sg;
+        const val = this.emitLet("_sgs_val", smem.read(tid));
+        const sgPrefix = this.emitLet("_sgs_pfx", val.subgroupInclusiveAdd());
+        this.barrier();
+        smem.write(tid, sgPrefix);
+        this.barrier();
+        const sgTotals = this.sharedArray("_sgs_totals", numSubgroups);
+        this.ifThen(tid.mod(this.u32(sg)).eq(this.u32(sg - 1)), () => {
+          sgTotals.write(tid.div(this.u32(sg)), sgPrefix);
+        });
+        this.barrier();
+        this.ifThen(tid.eq(this.u32(0)), () => {
+          for (let i = 1; i < numSubgroups; i++) sgTotals.write(this.u32(i), sgTotals.read(this.u32(i)).add(sgTotals.read(this.u32(i - 1))));
+        });
+        this.barrier();
+        const sgId = this.emitLet("_sgs_sgid", tid.div(this.u32(sg)));
+        this.ifThen(sgId.gt(this.u32(0)), () => {
+          smem.write(tid, smem.read(tid).add(sgTotals.read(sgId.sub(this.u32(1)))));
+        });
+        this.barrier();
+        return;
+      }
+      for (let stride = 1; stride < wgSize; stride *= 2) {
+        this.barrier();
+        const prev = smem.read(tid.sub(this.u32(stride)));
+        const curr = smem.read(tid);
+        const merged = op === "sum" ? curr.add(prev) : curr.max(prev);
+        this.ifThen(tid.ge(this.u32(stride)), () => {
+          smem.write(tid, merged);
+        });
+      }
+      this.barrier();
+    }
+    /**
+    * Compute mulhi(a, b) — high 32 bits of a*b — via 16-bit decomposition.
+    * Returns a BlockExpr for the result. Uses emitLet to keep WGSL readable.
+    */
+    mulhi(prefix, a, b) {
+      const aL = this.emitLet(`${prefix}_aL`, a.and(65535));
+      const aH = this.emitLet(`${prefix}_aH`, a.shr(16));
+      const bL = this.emitLet(`${prefix}_bL`, b.and(65535));
+      const bH = this.emitLet(`${prefix}_bH`, b.shr(16));
+      const ll = this.emitLet(`${prefix}_ll`, aL.mul(bL));
+      const lh = this.emitLet(`${prefix}_lh`, aL.mul(bH));
+      const hl = this.emitLet(`${prefix}_hl`, aH.mul(bL));
+      const hh = this.emitLet(`${prefix}_hh`, aH.mul(bH));
+      const mid = this.emitLet(`${prefix}_mid`, lh.add(hl));
+      const carry = mid.lt(lh).select(this.u32(1), this.u32(0));
+      const t = this.emitLet(`${prefix}_t`, ll.shr(16).add(mid.and(65535)));
+      return hh.add(mid.shr(16)).add(carry).add(t.shr(16));
+    }
+    /**
+    * Philox 2x32-10 counter-based PRNG. Returns two pseudorandom u32 values.
+    *
+    * Usage: `const [r0, r1] = ctx.philox2x32(seed, offset);`
+    * - seed: a u32 key (e.g., from a uniform)
+    * - offset: a u32 counter (e.g., globalId(0))
+    *
+    * The two outputs are independent random streams.
+    */
+    philox2x32(seed, offset) {
+      const PHILOX_M = 3528905107;
+      const PHILOX_W = 2654435769;
+      let ctr0 = this.emitLet("_phi_c0", offset);
+      let ctr1 = this.emitLet("_phi_c1", seed);
+      let key = this.emitLet("_phi_k", seed);
+      for (let r = 0; r < 10; r++) {
+        const hi = this.mulhi(`_phi_r${r}`, this.u32(PHILOX_M), ctr0);
+        const lo = this.emitLet(`_phi_lo${r}`, this.u32(PHILOX_M).mul(ctr0));
+        ctr0 = this.emitLet(`_phi_c0_${r}`, hi.xor(key).xor(ctr1));
+        ctr1 = this.emitLet(`_phi_c1_${r}`, lo);
+        if (r < 9) key = this.emitLet(`_phi_k${r}`, key.add(this.u32(PHILOX_W)));
+      }
+      return [ctr0, ctr1];
+    }
+    /** Generate a uniform random f32 in [0, 1) from Philox 2x32-10. */
+    randF32(seed, offset) {
+      return this.randF32x2(seed, offset)[0];
+    }
+    /** Generate two uniform random f32s in [0, 1) from a single Philox call. */
+    randF32x2(seed, offset) {
+      const [r0, r1] = this.philox2x32(seed, offset);
+      const scale = this.f32(23283064365386963e-26);
+      return [r0.toF32().mul(scale), r1.toF32().mul(scale)];
+    }
+    /** Internal BlockOps instance, lazily created on first use. */
+    _blockOps;
+    /** Thread tile config, set by setThreadTile() or configureTiles(). */
+    _threadTile;
+    _requireOps() {
+      if (!this._blockOps) {
+        if (!this._wgSize) throw new Error("Kernel spec must have workgroupSize for tile operations");
+        this._blockOps = new BlockOps(this, {
+          wgSize: this._wgSize,
+          ...this._threadTile ? { threadTile: this._threadTile } : {}
+        });
+      }
+      return this._blockOps;
+    }
+    /**
+    * Set thread tile dimensions for dot/store operations.
+    * Call this before dotAccum() or tileStore() if not using configureTiles().
+    */
+    setThreadTile(threadTileM, threadTileN) {
+      this._threadTile = [threadTileM, threadTileN];
+      if (this._blockOps) this._blockOps.setThreadTile(threadTileM, threadTileN);
+    }
+    /**
+    * Initialize tile context: set thread tile, emit thread position bindings.
+    * Returns threadRow/threadCol for use in epilogue addressing.
+    *
+    * Sugar for setThreadTile() + emitLet("thread_row"/thread_col").
+    */
+    configureTiles(config) {
+      this.setThreadTile(config.threadTileM, config.threadTileN);
+      return {
+        threadRow: this.emitLet("thread_row", this.threadIdx(1)),
+        threadCol: this.emitLet("thread_col", this.threadIdx(0))
+      };
+    }
+    /** Access the underlying BlockOps (for epilogue callbacks). */
+    get tileOps() {
+      return this._requireOps();
+    }
+    /** Create a 1D offset range: [base, base+blockSize). ≈ tl.arange(base, base+size) */
+    arange(base, blockSize) {
+      return this._requireOps().arange(base, blockSize);
+    }
+    /** Build a 2D pointer from base + outer + inner. ≈ Triton pointer arithmetic */
+    tilePtr(base, outer, inner) {
+      return buildPtr(base, outer, inner);
+    }
+    /** Build a 2D mask from outer + inner bounds. ≈ Triton mask construction */
+    tileMask(outer, inner) {
+      return buildMask(outer, inner);
+    }
+    /** Create a register block initialized to zero. ≈ tl.zeros([M, N]) */
+    zeros(rows, cols) {
+      return this._requireOps().zeros(rows, cols);
+    }
+    /** Create a register block filled with a constant. ≈ tl.full([M, N], val) */
+    full(rows, cols, val) {
+      return this._requireOps().full(rows, cols, val);
+    }
+    /** Cooperative tile load into shared memory. ≈ tl.load(ptr, mask) */
+    load2D(binding, ptr, mask, opts) {
+      return this._requireOps().loadTile(binding, ptr, mask, opts);
+    }
+    /** 1D register load (e.g. bias vector). ≈ tl.load(bias_ptr) */
+    load1D(binding, range) {
+      return this._requireOps().load1d(binding, range);
+    }
+    /** Block dot product: acc += a @ b. ≈ acc += tl.dot(a, b) */
+    dotAccum(a, b, acc) {
+      this._requireOps().dotAccum(a, b, acc);
+    }
+    /** Store block to global memory with bounds checking. ≈ tl.store(ptr, block, mask) */
+    store2D(binding, block, ptr, mask) {
+      this._requireOps().storeTile(binding, block, ptr, mask);
+    }
+    /** Block dot product: returns new result block. ≈ tl.dot(a, b) */
+    dot(a, b) {
+      return this._requireOps().dot(a, b);
+    }
+    /** Single-row dot product: scalar = dot(reg[0,:], shared[rowIdx,:]). Used in fused inner loops. */
+    dotRow(reg, shared, rowIdx) {
+      return this._requireOps().dotRow(reg, shared, rowIdx);
+    }
+    /** Single-row scaled accumulation: acc[:] += scalar * shared[rowIdx,:]. Used in fused inner loops. */
+    accumRow(acc, scalar, shared, rowIdx) {
+      this._requireOps().accumRow(acc, scalar, shared, rowIdx);
+    }
+    /** Unified tile load: ptr type determines register vs shared placement. ≈ tl.load(ptr, mask) */
+    tileLoad(binding, ptr, opts) {
+      return this._requireOps().load(binding, ptr, opts);
+    }
+    /** Store register tile to global memory. ≈ tl.store(ptr, block, mask) */
+    tileStore(binding, block, ptr, opts) {
+      this._requireOps().store(binding, block, ptr, opts);
+    }
+    /** Load from strided layout: combined stridedIndex + load. */
+    stridedLoad(binding, flatIdx, indexShape, strides, baseOffset = 0) {
+      return this.load(binding, this.stridedIndex(flatIdx, indexShape, strides, baseOffset));
+    }
+    /** @internal Create a properly ID'd arrayRead node. */
+    _makeArrayRead(arrayName, idx) {
+      return new BlockExpr(makeNode({
+        kind: "arrayRead",
+        arrayName,
+        idx: idx.node,
+        valueType: "scalar",
+        dataType: "f32"
+      }));
+    }
+    /** @internal Create a properly ID'd sharedRead node. */
+    _makeSharedRead(arrayName, idx) {
+      return new BlockExpr(makeNode({
+        kind: "sharedRead",
+        arrayName,
+        idx: idx.node,
+        valueType: "scalar",
+        dataType: "f32"
+      }));
+    }
+    /** Create a BlockExpr referencing a named variable. */
+    _makeRef(name, dt = "f32") {
+      return new BlockExpr(makeNode({
+        kind: "namedRef",
+        name,
+        valueType: "scalar",
+        dataType: dt
+      }));
+    }
+  };
+  DEFAULT_WG = 256;
+  ELEMENTWISE_UNIFORM_NAMES = /* @__PURE__ */ new Set([
+    "size",
+    "total_elements",
+    "num_elements",
+    "outSize"
+  ]);
+}));
+function gcd(a, b) {
+  a = Math.abs(a);
+  b = Math.abs(b);
+  while (b) [a, b] = [b, a % b];
+  return a;
+}
+function createAnalysisContext(flatGlobalIdNodeIds) {
+  return {
+    letDefs: /* @__PURE__ */ new Map(),
+    boundedLoopVars: /* @__PURE__ */ new Set(),
+    flatGlobalIdNodes: flatGlobalIdNodeIds?.length ? new Set(flatGlobalIdNodeIds) : void 0
+  };
+}
+function evalSymbolic(node, wgSizeX, actx) {
+  if (actx?.flatGlobalIdNodes?.has(node.id)) return {
+    innerCoeff: 1,
+    hasDataDep: false,
+    constantTerm: 0,
+    divisibility: 1
+  };
+  switch (node.kind) {
+    case "globalId":
+      return node.dim === 0 ? {
+        innerCoeff: 1,
+        hasDataDep: false,
+        constantTerm: 0,
+        divisibility: 1
+      } : ZERO;
+    case "threadIdx":
+      return node.dim === 0 ? {
+        innerCoeff: 1,
+        hasDataDep: false,
+        constantTerm: 0,
+        divisibility: 1
+      } : ZERO;
+    case "localIndex":
+      return {
+        innerCoeff: 1,
+        hasDataDep: false,
+        constantTerm: 0,
+        divisibility: 1
+      };
+    case "programId":
+      return {
+        innerCoeff: 0,
+        hasDataDep: false,
+        constantTerm: null,
+        divisibility: null
+      };
+    case "uniform":
+      return {
+        innerCoeff: 0,
+        hasDataDep: false,
+        constantTerm: null,
+        divisibility: null
+      };
+    case "const": {
+      const v = node.value;
+      return {
+        innerCoeff: 0,
+        hasDataDep: false,
+        constantTerm: v,
+        divisibility: v === 0 ? 0 : Math.abs(v)
+      };
+    }
+    case "binary": {
+      const lhs = evalSymbolic(node.lhs, wgSizeX, actx);
+      const rhs = evalSymbolic(node.rhs, wgSizeX, actx);
+      switch (node.op) {
+        case "add":
+        case "sub": {
+          if (lhs.innerCoeff === "unknown" || rhs.innerCoeff === "unknown") return {
+            innerCoeff: "unknown",
+            hasDataDep: lhs.hasDataDep || rhs.hasDataDep,
+            constantTerm: null,
+            divisibility: null
+          };
+          const coeff = node.op === "add" ? lhs.innerCoeff + rhs.innerCoeff : lhs.innerCoeff - rhs.innerCoeff;
+          const ct = lhs.constantTerm !== null && rhs.constantTerm !== null ? node.op === "add" ? lhs.constantTerm + rhs.constantTerm : lhs.constantTerm - rhs.constantTerm : null;
+          const div2 = computeDivisibilityBinary(lhs.divisibility, rhs.divisibility);
+          return {
+            innerCoeff: coeff,
+            hasDataDep: lhs.hasDataDep || rhs.hasDataDep,
+            constantTerm: ct,
+            divisibility: div2
+          };
+        }
+        case "mul":
+          if (lhs.innerCoeff === 0 && !lhs.hasDataDep) {
+            const constVal = extractConstant(node.lhs);
+            if (constVal !== null && rhs.innerCoeff !== "unknown") {
+              const coeff = constVal * rhs.innerCoeff;
+              const ct = rhs.constantTerm !== null ? constVal * rhs.constantTerm : null;
+              const div2 = rhs.divisibility !== null ? Math.abs(constVal) * rhs.divisibility : null;
+              return {
+                innerCoeff: coeff,
+                hasDataDep: rhs.hasDataDep,
+                constantTerm: ct,
+                divisibility: div2
+              };
+            }
+            if (rhs.innerCoeff === 0) {
+              const ct = lhs.constantTerm !== null && rhs.constantTerm !== null ? lhs.constantTerm * rhs.constantTerm : null;
+              const div2 = lhs.divisibility !== null && rhs.divisibility !== null ? lhs.divisibility * rhs.divisibility : null;
+              return {
+                innerCoeff: 0,
+                hasDataDep: lhs.hasDataDep || rhs.hasDataDep,
+                constantTerm: ct,
+                divisibility: div2
+              };
+            }
+          }
+          if (rhs.innerCoeff === 0 && !rhs.hasDataDep) {
+            const constVal = extractConstant(node.rhs);
+            if (constVal !== null && lhs.innerCoeff !== "unknown") {
+              const coeff = constVal * lhs.innerCoeff;
+              const ct = lhs.constantTerm !== null ? constVal * lhs.constantTerm : null;
+              const div2 = lhs.divisibility !== null ? Math.abs(constVal) * lhs.divisibility : null;
+              return {
+                innerCoeff: coeff,
+                hasDataDep: lhs.hasDataDep,
+                constantTerm: ct,
+                divisibility: div2
+              };
+            }
+            if (lhs.innerCoeff === 0) {
+              const ct = lhs.constantTerm !== null && rhs.constantTerm !== null ? lhs.constantTerm * rhs.constantTerm : null;
+              const div2 = lhs.divisibility !== null && rhs.divisibility !== null ? lhs.divisibility * rhs.divisibility : null;
+              return {
+                innerCoeff: 0,
+                hasDataDep: lhs.hasDataDep || rhs.hasDataDep,
+                constantTerm: ct,
+                divisibility: div2
+              };
+            }
+          }
+          return UNKNOWN;
+        case "div": {
+          const divisor = extractConstant(node.rhs);
+          if (divisor !== null && divisor !== 0) {
+            if (lhs.innerCoeff !== "unknown") {
+              if (lhs.innerCoeff === 0) {
+                const ct = lhs.constantTerm !== null ? Math.floor(lhs.constantTerm / divisor) : null;
+                const div2 = lhs.divisibility !== null && lhs.divisibility >= divisor ? Math.floor(lhs.divisibility / divisor) : null;
+                return {
+                  innerCoeff: 0,
+                  hasDataDep: lhs.hasDataDep,
+                  constantTerm: ct,
+                  divisibility: div2
+                };
+              }
+              if (lhs.innerCoeff % divisor === 0) {
+                const newCoeff = lhs.innerCoeff / divisor;
+                const ct = lhs.constantTerm !== null ? Math.floor(lhs.constantTerm / divisor) : null;
+                return {
+                  innerCoeff: newCoeff,
+                  hasDataDep: lhs.hasDataDep,
+                  constantTerm: ct,
+                  divisibility: null
+                };
+              }
+            }
+          }
+          if (lhs.innerCoeff === 0 && rhs.innerCoeff === 0 && !lhs.hasDataDep && !rhs.hasDataDep) return ZERO;
+          return UNKNOWN;
+        }
+        case "mod": {
+          const modulus = extractConstant(node.rhs);
+          if (modulus !== null && modulus !== 0) {
+            if (lhs.innerCoeff !== "unknown") {
+              if (lhs.innerCoeff === 0) {
+                const ct = lhs.constantTerm !== null ? lhs.constantTerm % modulus : null;
+                return {
+                  innerCoeff: 0,
+                  hasDataDep: lhs.hasDataDep,
+                  constantTerm: ct,
+                  divisibility: ct !== null ? ct === 0 ? 0 : Math.abs(ct) : null
+                };
+              }
+              if (lhs.innerCoeff % modulus === 0) {
+                const ct = lhs.constantTerm !== null ? lhs.constantTerm % modulus : null;
+                return {
+                  innerCoeff: 0,
+                  hasDataDep: lhs.hasDataDep,
+                  constantTerm: ct,
+                  divisibility: ct !== null ? ct === 0 ? 0 : Math.abs(ct) : null
+                };
+              }
+              if (Math.abs(lhs.innerCoeff) < modulus) return {
+                innerCoeff: lhs.innerCoeff,
+                hasDataDep: lhs.hasDataDep,
+                constantTerm: null,
+                divisibility: null
+              };
+            }
+          }
+          if (lhs.innerCoeff === 0 && rhs.innerCoeff === 0 && !lhs.hasDataDep && !rhs.hasDataDep) return ZERO;
+          return UNKNOWN;
+        }
+        case "shr":
+        case "shl":
+        case "and":
+        case "or":
+        case "xor":
+          if (lhs.innerCoeff === 0 && rhs.innerCoeff === 0 && !lhs.hasDataDep && !rhs.hasDataDep) return ZERO;
+          return UNKNOWN;
+        default:
+          return UNKNOWN;
+      }
+    }
+    case "cast":
+      return evalSymbolic(node.input, wgSizeX, actx);
+    case "unary":
+      if (node.op === "neg") {
+        const inner = evalSymbolic(node.input, wgSizeX, actx);
+        if (inner.innerCoeff === "unknown") return UNKNOWN;
+        return {
+          innerCoeff: -inner.innerCoeff,
+          hasDataDep: inner.hasDataDep,
+          constantTerm: inner.constantTerm !== null ? -inner.constantTerm : null,
+          divisibility: inner.divisibility
+        };
+      }
+      return UNKNOWN;
+    case "select":
+      return UNKNOWN;
+    case "cmp":
+      return UNKNOWN;
+    case "load":
+    case "sharedRead":
+    case "arrayRead":
+      return UNKNOWN;
+    case "numWorkgroups":
+      return {
+        innerCoeff: 0,
+        hasDataDep: false,
+        constantTerm: null,
+        divisibility: null
+      };
+    case "namedRef":
+      if (actx) {
+        const def = actx.letDefs.get(node.name);
+        if (def) return evalSymbolic(def, wgSizeX, actx);
+        if (actx.boundedLoopVars.has(node.name)) return {
+          innerCoeff: 0,
+          hasDataDep: true,
+          constantTerm: null,
+          divisibility: null
+        };
+      }
+      return {
+        innerCoeff: 0,
+        hasDataDep: true,
+        constantTerm: null,
+        divisibility: null
+      };
+    default:
+      return UNKNOWN;
+  }
+}
+function computeDivisibilityBinary(lhsDiv, rhsDiv, _coeff) {
+  if (lhsDiv === null || rhsDiv === null) return null;
+  if (lhsDiv === 0) return rhsDiv;
+  if (rhsDiv === 0) return lhsDiv;
+  return gcd(lhsDiv, rhsDiv);
+}
+function extractConstant(node) {
+  if (node.kind === "const") return node.value;
+  return null;
+}
+function analyzeAccessPatterns(spec) {
+  const ctx = buildKernelIR(spec);
+  const wgSizeX = typeof spec.workgroupSize === "number" ? spec.workgroupSize : spec.workgroupSize[0];
+  const actx = createAnalysisContext(ctx.flatGlobalIdNodeIds);
+  const patterns = [];
+  walkStatements(ctx.statements, wgSizeX, patterns, actx);
+  for (const node of ctx.nodes) if (node.kind === "load") {
+    const sym = evalSymbolic(node.offsets, wgSizeX, actx);
+    patterns.push(makePattern(node.binding, "load", sym, node.id));
+  }
+  return patterns;
+}
+function walkStatements(stmts, wgSizeX, patterns, actx) {
+  for (const stmt of stmts) switch (stmt.kind) {
+    case "let":
+      actx.letDefs.set(stmt.name, stmt.value);
+      break;
+    case "var":
+      actx.letDefs.set(stmt.name, stmt.value);
+      break;
+    case "assign":
+    case "addAssign":
+      actx.letDefs.delete(stmt.name);
+      break;
+    case "directStore": {
+      const sym = evalSymbolic(stmt.idx, wgSizeX, actx);
+      patterns.push(makePattern(stmt.binding, "store", sym, stmt.idx.id));
+      break;
+    }
+    case "guardedStore": {
+      const sym = evalSymbolic(stmt.idx, wgSizeX, actx);
+      patterns.push(makePattern(stmt.binding, "store", sym, stmt.idx.id));
+      break;
+    }
+    case "forRange": {
+      const hasConstBounds = extractConstant(stmt.start) !== null && extractConstant(stmt.bound) !== null;
+      if (hasConstBounds) actx.boundedLoopVars.add(stmt.varName);
+      walkStatements(stmt.body, wgSizeX, patterns, actx);
+      if (hasConstBounds) actx.boundedLoopVars.delete(stmt.varName);
+      break;
+    }
+    case "if":
+      walkStatements(stmt.body, wgSizeX, patterns, actx);
+      break;
+    case "ifElse":
+      walkStatements(stmt.body, wgSizeX, patterns, actx);
+      walkStatements(stmt.elseBody, wgSizeX, patterns, actx);
+      break;
+  }
+}
+function makePattern(bindingName, accessType, sym, nodeId) {
+  const innerStride = sym.innerCoeff;
+  const isCoalesced = innerStride === 1;
+  let maxVecWidth = 1;
+  if (isCoalesced && !sym.hasDataDep) {
+    const ct = sym.constantTerm;
+    if (ct !== null && ct % 4 !== 0) if (ct % 2 === 0) maxVecWidth = 2;
+    else maxVecWidth = 1;
+    else maxVecWidth = 4;
+  } else if (isCoalesced) maxVecWidth = 1;
+  return {
+    bindingName,
+    accessType,
+    innerStride,
+    isCoalesced,
+    maxVecWidth,
+    baseDivisibility: sym.divisibility,
+    baseConstantTerm: sym.constantTerm,
+    nodeId
+  };
+}
+function computeSafeVecWidth(spec) {
+  const patterns = analyzeAccessPatterns(spec);
+  if (patterns.length === 0) return 1;
+  let minWidth = 4;
+  for (const p of patterns) if (p.maxVecWidth < minWidth) minWidth = p.maxVecWidth;
+  return minWidth;
+}
+var UNKNOWN, ZERO;
+var init_tile_access_analysis = __esmMin((() => {
+  init_tile_ir();
+  UNKNOWN = {
+    innerCoeff: "unknown",
+    hasDataDep: true,
+    constantTerm: null,
+    divisibility: null
+  };
+  ZERO = {
+    innerCoeff: 0,
+    hasDataDep: false,
+    constantTerm: 0,
+    divisibility: 0
+  };
+}));
+function freshVar(hint) {
+  return `_${hint}${_varCounter++}`;
+}
+function resetLoweringState() {
+  _varCounter = 0;
+  _activeTPR = 1;
+  _blockLayouts = /* @__PURE__ */ new Map();
+  _smemVec4Arrays.clear();
+}
+function setTPR(tpr) {
+  _activeTPR = tpr;
+}
+function setBlockLayouts(layouts) {
+  _blockLayouts = layouts;
+}
+function getActiveTPR() {
+  return _activeTPR;
+}
+function getPhysCols(name, logicalCols) {
+  if (_activeTPR <= 1) return logicalCols;
+  return _blockLayouts.get(name) === "distributed" ? logicalCols / _activeTPR : logicalCols;
+}
+function collectBlockDots(stmts) {
+  const dots = [];
+  function scan(ss) {
+    for (const s of ss) {
+      if (s.kind === "blockDot") dots.push(s);
+      if (s.kind === "blockDotRow") dots.push({
+        kind: "blockDot",
+        aName: s.aName,
+        bName: s.bName,
+        resultName: s.resultName,
+        aPlacement: "register",
+        bPlacement: "shared",
+        bTransposed: true,
+        aRows: 1,
+        aCols: s.aCols,
+        bRows: 1,
+        bCols: s.bCols,
+        bSmemStride: s.bSmemStride,
+        bSmemElemType: s.bSmemElemType
+      });
+      if (s.kind === "blockAccumRow") dots.push({
+        kind: "blockDot",
+        aName: s.scalarName,
+        bName: s.bName,
+        resultName: s.accName,
+        accName: s.accName,
+        aPlacement: "register",
+        bPlacement: "shared",
+        bTransposed: false,
+        aRows: 1,
+        aCols: 1,
+        bRows: 1,
+        bCols: s.bCols,
+        bSmemStride: s.bSmemStride,
+        bSmemElemType: s.bSmemElemType
+      });
+      if (s.kind === "forRange" || s.kind === "forStride" || s.kind === "if" || s.kind === "ifElse") scan(s.body);
+      if (s.kind === "ifElse") scan(s.elseBody);
+    }
+  }
+  scan(stmts);
+  return dots;
+}
+function autoDetectTPR(stmts, sgSupported) {
+  if (!sgSupported) return 1;
+  const dots = collectBlockDots(stmts);
+  if (dots.length === 0) return 1;
+  if (dots.some((d) => d.aPlacement === "shared" && d.bPlacement === "shared")) return 1;
+  if (!dots.some((d) => d.aPlacement === "register" && d.bPlacement === "shared" && d.aRows === 1)) return 1;
+  const layouts = /* @__PURE__ */ new Map();
+  for (const dot of dots) if (dot.aPlacement === "register" && dot.bPlacement === "shared") if (dot.bTransposed) {
+    if (dot.aCols < 16 || dot.aCols % 4 !== 0) return 1;
+    if (layouts.get(dot.aName) === "replicated") return 1;
+    layouts.set(dot.aName, "distributed");
+    layouts.set(dot.resultName, "replicated");
+    if (dot.accName) {
+      if (layouts.get(dot.accName) === "distributed") return 1;
+      layouts.set(dot.accName, "replicated");
+    }
+  } else {
+    if (dot.bCols < 16 || dot.bCols % 4 !== 0) return 1;
+    if (layouts.get(dot.aName) === "distributed") return 1;
+    layouts.set(dot.aName, "replicated");
+    if (layouts.get(dot.resultName) === "replicated") return 1;
+    layouts.set(dot.resultName, "distributed");
+    if (dot.accName) {
+      if (layouts.get(dot.accName) === "replicated") return 1;
+      layouts.set(dot.accName, "distributed");
+    }
+  }
+  return 4;
+}
+function computeBlockLayouts(stmts, tpr) {
+  const layouts = /* @__PURE__ */ new Map();
+  if (tpr <= 1) return layouts;
+  const dots = collectBlockDots(stmts);
+  for (const dot of dots) if (dot.aPlacement === "register" && dot.bPlacement === "shared") if (dot.bTransposed) {
+    layouts.set(dot.aName, "distributed");
+    layouts.set(dot.resultName, "replicated");
+    if (dot.accName) layouts.set(dot.accName, "replicated");
+  } else {
+    layouts.set(dot.aName, "replicated");
+    layouts.set(dot.resultName, "distributed");
+    if (dot.accName) layouts.set(dot.accName, "distributed");
+  }
+  return layouts;
+}
+function cU32(value) {
+  return {
+    id: -1,
+    kind: "const",
+    valueType: "scalar",
+    dataType: "u32",
+    value
+  };
+}
+function cF32(value) {
+  return {
+    id: -1,
+    kind: "const",
+    valueType: "scalar",
+    dataType: "f32",
+    value
+  };
+}
+function ref(name, dt = "u32") {
+  return {
+    id: -1,
+    kind: "namedRef",
+    valueType: "scalar",
+    dataType: dt,
+    name
+  };
+}
+function binOp(op, lhs, rhs, dt = "u32") {
+  return {
+    id: -1,
+    kind: "binary",
+    op,
+    lhs,
+    rhs,
+    valueType: "scalar",
+    dataType: dt
+  };
+}
+function isConstOne(node) {
+  return node.kind === "const" && node.value === 1;
+}
+function mulOrSkip(a, b, dt = "u32") {
+  if (isConstOne(b)) return a;
+  if (isConstOne(a)) return b;
+  return binOp("mul", a, b, dt);
+}
+function cmpOp(op, lhs, rhs) {
+  return {
+    id: -1,
+    kind: "cmp",
+    op,
+    lhs,
+    rhs,
+    valueType: "scalar",
+    dataType: "u32"
+  };
+}
+function andOp(lhs, rhs) {
+  return {
+    id: -1,
+    kind: "binary",
+    op: "and",
+    lhs,
+    rhs,
+    valueType: "scalar",
+    dataType: "u32"
+  };
+}
+function castNode(input, targetType) {
+  return {
+    id: -1,
+    kind: "cast",
+    input,
+    targetType,
+    valueType: input.valueType,
+    dataType: targetType
+  };
+}
+function shuffleXorNode(value, mask) {
+  return {
+    id: -1,
+    kind: "subgroupShuffleXor",
+    value,
+    mask: cU32(mask),
+    valueType: "scalar",
+    dataType: "f32"
+  };
+}
+function forRange0(varName, bound, body) {
+  return {
+    kind: "forRange",
+    varName,
+    start: cU32(0),
+    bound,
+    body
+  };
+}
+function storeResult(body, accName, arrayName, idx, value) {
+  body.push({
+    kind: accName ? "indexAddAssign" : "indexAssign",
+    arrayName,
+    idx,
+    value
+  });
+}
+function emitButterflyReduce(sVar, tpr, op) {
+  const stmts = [];
+  for (let mask = 1; mask < tpr; mask *= 2) {
+    const shuffled = shuffleXorNode(ref(sVar, "f32"), mask);
+    if (op === "sum") stmts.push({
+      kind: "addAssign",
+      name: sVar,
+      value: shuffled
+    });
+    else stmts.push({
+      kind: "assign",
+      name: sVar,
+      value: binOp("max", ref(sVar, "f32"), shuffled, "f32")
+    });
+  }
+  return stmts;
+}
+function sharedRead(arrayName, idx, dt = "f32") {
+  return {
+    id: -1,
+    kind: "sharedRead",
+    arrayName,
+    idx,
+    valueType: "scalar",
+    dataType: dt
+  };
+}
+function arrayRead(arrayName, idx, dt = "f32") {
+  return {
+    id: -1,
+    kind: "arrayRead",
+    arrayName,
+    idx,
+    valueType: "scalar",
+    dataType: dt
+  };
+}
+function loadBinding(binding, idx, dt = "f32") {
+  return {
+    id: -1,
+    kind: "load",
+    binding,
+    offsets: idx,
+    valueType: "block",
+    dataType: dt
+  };
+}
+function vec4DotExpr(a, b) {
+  return {
+    id: -1,
+    kind: "vec4dot",
+    a,
+    b,
+    valueType: "scalar",
+    dataType: "f32"
+  };
+}
+function vec4SharedReadNode(arrayName, idx) {
+  return {
+    id: -1,
+    kind: "vec4SharedRead",
+    arrayName,
+    idx,
+    valueType: "vec4",
+    dataType: "f32"
+  };
+}
+function vec4NativeDotNode(a, b) {
+  return {
+    id: -1,
+    kind: "vec4NativeDot",
+    a,
+    b,
+    valueType: "scalar",
+    dataType: "f32"
+  };
+}
+function vec4ComponentNode(value, comp) {
+  return {
+    id: -1,
+    kind: "vec4Component",
+    value,
+    comp,
+    valueType: "scalar",
+    dataType: "f32"
+  };
+}
+function vec4DynComponentNode(value, idx) {
+  return {
+    id: -1,
+    kind: "vec4DynComponent",
+    value,
+    idx,
+    valueType: "scalar",
+    dataType: "f32"
+  };
+}
+function vec4ConstructNode(x, y, z, w) {
+  return {
+    id: -1,
+    kind: "vec4Construct",
+    x,
+    y,
+    z,
+    w,
+    valueType: "vec4",
+    dataType: "f32"
+  };
+}
+function getTotalThreads(spec) {
+  return (typeof spec.workgroupSize === "number" ? spec.workgroupSize : spec.workgroupSize[0] * spec.workgroupSize[1]) * _activeTPR;
+}
+function hasTileStatements(stmts) {
+  for (const s of stmts) switch (s.kind) {
+    case "tileLoad":
+    case "tileLoad1d":
+    case "tileStore":
+    case "blockAlloc":
+    case "blockLoad":
+    case "blockStore":
+    case "blockDot":
+    case "blockDotRow":
+    case "blockAccumRow":
+    case "blockReduce":
+    case "blockUnary":
+    case "blockBinary":
+      return true;
+    case "forRange":
+      if (hasTileStatements(s.body)) return true;
+      break;
+    case "forStride":
+      if (hasTileStatements(s.body)) return true;
+      break;
+    case "if":
+      if (hasTileStatements(s.body)) return true;
+      break;
+    case "ifElse":
+      if (hasTileStatements(s.body) || hasTileStatements(s.elseBody)) return true;
+      break;
+  }
+  return false;
+}
+function lowerTileStatements(stmts, spec) {
+  const result = [];
+  let i = 0;
+  while (i < stmts.length) {
+    const s = stmts[i];
+    switch (s.kind) {
+      case "tileLoad":
+        result.push(...lowerTileLoad(s, spec));
+        break;
+      case "tileLoad1d":
+        result.push(...lowerTileLoad1D(s));
+        break;
+      case "tileStore":
+        result.push(...lowerTileStore(s));
+        break;
+      case "blockAlloc":
+        result.push(...lowerBlockAlloc(s));
+        break;
+      case "blockLoad":
+        result.push(...lowerBlockLoad(s, spec));
+        break;
+      case "blockStore":
+        result.push(...lowerBlockStore(s));
+        break;
+      case "blockDot":
+        result.push(...lowerBlockDot(s));
+        break;
+      case "blockDotRow":
+        result.push(...lowerBlockDotRow(s));
+        break;
+      case "blockAccumRow":
+        result.push(...lowerBlockAccumRow(s));
+        break;
+      case "blockReduce":
+        result.push(...lowerBlockReduce(s));
+        break;
+      case "blockUnary":
+        result.push(...lowerBlockUnary(s));
+        break;
+      case "blockBinary":
+        result.push(...lowerBlockBinary(s));
+        break;
+      case "forRange":
+        result.push({
+          ...s,
+          body: lowerTileStatements(s.body, spec)
+        });
+        break;
+      case "forStride":
+        result.push({
+          ...s,
+          body: lowerTileStatements(s.body, spec)
+        });
+        break;
+      case "if":
+        result.push({
+          ...s,
+          body: lowerTileStatements(s.body, spec)
+        });
+        break;
+      case "ifElse":
+        result.push({
+          ...s,
+          body: lowerTileStatements(s.body, spec),
+          elseBody: lowerTileStatements(s.elseBody, spec)
+        });
+        break;
+      default:
+        result.push(s);
+        break;
+    }
+    i++;
+  }
+  return result;
+}
+function lowerTileLoad(stmt, spec) {
+  if (stmt.smemVec4) {
+    _smemVec4Arrays.add(stmt.sharedName);
+    return lowerTileLoadVec4(stmt, spec);
+  }
+  const { binding, ptr, mask, sharedName, tileRows, tileCols, elemType } = stmt;
+  const totalElems = tileRows * tileCols;
+  const totalThreads = getTotalThreads(spec);
+  const elemsPerThread = Math.ceil(totalElems / totalThreads);
+  const result = [];
+  const iVar = `_ld_i`;
+  const localIdx = ref("local_idx");
+  const loopBody = [];
+  const flatName = freshVar("flat");
+  loopBody.push({
+    kind: "let",
+    name: flatName,
+    dtype: "u32",
+    value: binOp("add", binOp("mul", localIdx, cU32(elemsPerThread)), ref(iVar))
+  });
+  const ifBody = [];
+  const rowName = freshVar("row");
+  const colName = freshVar("col");
+  ifBody.push({
+    kind: "let",
+    name: rowName,
+    dtype: "u32",
+    value: binOp("div", ref(flatName), cU32(tileCols))
+  });
+  ifBody.push({
+    kind: "let",
+    name: colName,
+    dtype: "u32",
+    value: binOp("mod", ref(flatName), cU32(tileCols))
+  });
+  const globalRowName = freshVar("gr");
+  const globalColName = freshVar("gc");
+  ifBody.push({
+    kind: "let",
+    name: globalRowName,
+    dtype: "u32",
+    value: binOp("add", ptr.outerRange.base, ref(rowName))
+  });
+  ifBody.push({
+    kind: "let",
+    name: globalColName,
+    dtype: "u32",
+    value: binOp("add", ptr.innerRange.base, ref(colName))
+  });
+  const gIdxName = freshVar("gIdx");
+  ifBody.push({
+    kind: "let",
+    name: gIdxName,
+    dtype: "u32",
+    value: binOp("add", binOp("add", ptr.baseOffset, mulOrSkip(ref(globalRowName), ptr.outerStride)), mulOrSkip(ref(globalColName), ptr.innerStride))
+  });
+  const maskCond = andOp(cmpOp("lt", ref(globalRowName), mask.outerBound), cmpOp("lt", ref(globalColName), mask.innerBound));
+  const smemStride = stmt.smemStride ?? tileCols;
+  const smemIdx = smemStride !== tileCols ? binOp("add", binOp("mul", ref(rowName), cU32(smemStride)), ref(colName)) : ref(flatName);
+  const bindingDtype = spec.bindings[binding]?.type ?? elemType;
+  const loadExpr = loadBinding(binding, ref(gIdxName), bindingDtype);
+  const smemIsF16 = (stmt.smemElemType ?? bindingDtype) === "f16";
+  let storeValue;
+  if (smemIsF16 && bindingDtype !== "f16") storeValue = castNode(loadExpr, "f16");
+  else if (smemIsF16) storeValue = loadExpr;
+  else if (bindingDtype === "f32") storeValue = loadExpr;
+  else storeValue = castNode(loadExpr, "f32");
+  const zeroValue = smemIsF16 ? {
+    id: -1,
+    kind: "const",
+    value: 0,
+    valueType: "scalar",
+    dataType: "f16"
+  } : cF32(0);
+  ifBody.push({
+    kind: "ifElse",
+    condition: maskCond,
+    body: [{
+      kind: "sharedWrite",
+      arrayName: sharedName,
+      idx: smemIdx,
+      value: storeValue
+    }],
+    elseBody: [{
+      kind: "sharedWrite",
+      arrayName: sharedName,
+      idx: smemIdx,
+      value: zeroValue
+    }]
+  });
+  loopBody.push({
+    kind: "if",
+    condition: cmpOp("lt", ref(flatName), cU32(totalElems)),
+    body: ifBody
+  });
+  result.push(forRange0(iVar, cU32(elemsPerThread), loopBody));
+  return result;
+}
+function lowerTileLoadVec4(stmt, spec) {
+  const { binding, ptr, mask, sharedName, tileRows, tileCols } = stmt;
+  const smemStride = stmt.smemStride ?? tileCols;
+  const totalVec4 = tileRows * smemStride / 4;
+  const totalThreads = getTotalThreads(spec);
+  const vec4PerThread = Math.ceil(totalVec4 / totalThreads);
+  const colsV4 = tileCols / 4;
+  const strideV4 = smemStride / 4;
+  const result = [];
+  const iVar = `_ld_i`;
+  const localIdx = ref("local_idx");
+  const loopBody = [];
+  const flatName = freshVar("fv4");
+  loopBody.push({
+    kind: "let",
+    name: flatName,
+    dtype: "u32",
+    value: binOp("add", binOp("mul", localIdx, cU32(vec4PerThread)), ref(iVar))
+  });
+  const ifBody = [];
+  const rowName = freshVar("row");
+  const colV4Name = freshVar("cv4");
+  ifBody.push({
+    kind: "let",
+    name: rowName,
+    dtype: "u32",
+    value: binOp("div", ref(flatName), cU32(strideV4))
+  });
+  ifBody.push({
+    kind: "let",
+    name: colV4Name,
+    dtype: "u32",
+    value: binOp("mod", ref(flatName), cU32(strideV4))
+  });
+  const globalRowName = freshVar("gr");
+  const globalColName = freshVar("gc");
+  ifBody.push({
+    kind: "let",
+    name: globalRowName,
+    dtype: "u32",
+    value: binOp("add", ptr.outerRange.base, ref(rowName))
+  });
+  ifBody.push({
+    kind: "let",
+    name: globalColName,
+    dtype: "u32",
+    value: binOp("add", ptr.innerRange.base, binOp("mul", ref(colV4Name), cU32(4)))
+  });
+  const gIdxName = freshVar("gIdx");
+  ifBody.push({
+    kind: "let",
+    name: gIdxName,
+    dtype: "u32",
+    value: binOp("add", binOp("add", ptr.baseOffset, mulOrSkip(ref(globalRowName), ptr.outerStride)), mulOrSkip(ref(globalColName), ptr.innerStride))
+  });
+  const maskCond = andOp(cmpOp("lt", ref(globalRowName), mask.outerBound), cmpOp("lt", ref(colV4Name), cU32(colsV4)));
+  const bindingDtype = spec.bindings[binding]?.type ?? stmt.elemType;
+  const f32Elems = [
+    0,
+    1,
+    2,
+    3
+  ].map((k) => loadBinding(binding, binOp("add", ref(gIdxName), cU32(k)), bindingDtype)).map((e) => bindingDtype !== "f32" ? castNode(e, "f32") : e);
+  const vec4Value = {
+    id: -1,
+    kind: "vec4Construct",
+    x: f32Elems[0],
+    y: f32Elems[1],
+    z: f32Elems[2],
+    w: f32Elems[3],
+    valueType: "vec4",
+    dataType: "f32"
+  };
+  const smemIdx = strideV4 !== colsV4 ? binOp("add", binOp("mul", ref(rowName), cU32(strideV4)), ref(colV4Name)) : ref(flatName);
+  const zeroVec4 = {
+    id: -1,
+    kind: "vec4Construct",
+    x: cF32(0),
+    y: cF32(0),
+    z: cF32(0),
+    w: cF32(0),
+    valueType: "vec4",
+    dataType: "f32"
+  };
+  ifBody.push({
+    kind: "ifElse",
+    condition: maskCond,
+    body: [{
+      kind: "vec4ArrayWrite",
+      arrayName: sharedName,
+      idx: smemIdx,
+      value: vec4Value,
+      isShared: true
+    }],
+    elseBody: [{
+      kind: "vec4ArrayWrite",
+      arrayName: sharedName,
+      idx: smemIdx,
+      value: zeroVec4,
+      isShared: true
+    }]
+  });
+  loopBody.push({
+    kind: "if",
+    condition: cmpOp("lt", ref(flatName), cU32(totalVec4)),
+    body: ifBody
+  });
+  result.push(forRange0(iVar, cU32(vec4PerThread), loopBody));
+  return result;
+}
+function lowerTileLoad1D(stmt) {
+  const { binding, range, arrayName, size } = stmt;
+  const result = [];
+  result.push({
+    kind: "varArray",
+    name: arrayName,
+    elemType: "f32",
+    size,
+    skipZeroInit: true
+  });
+  const tnVar = freshVar("tn");
+  result.push(forRange0(tnVar, cU32(size), [{
+    kind: "indexAssign",
+    arrayName,
+    idx: ref(tnVar),
+    value: loadBinding(binding, binOp("add", range.base, binOp("add", binOp("mul", ref("thread_col"), cU32(size)), ref(tnVar))))
+  }]));
+  return result;
+}
+function lowerTileStore(stmt, _spec) {
+  const { binding, ptr, mask, accName, threadTileM, threadTileN, accDtype } = stmt;
+  const result = [];
+  const tmVar = freshVar("tm");
+  const tnVar = freshVar("tn");
+  const innerBody = [];
+  const rowName = freshVar("st_row");
+  const colName = freshVar("st_col");
+  innerBody.push({
+    kind: "let",
+    name: rowName,
+    dtype: "u32",
+    value: binOp("add", ptr.outerRange.base, binOp("add", binOp("mul", ref("thread_row"), cU32(threadTileM)), ref(tmVar)))
+  });
+  innerBody.push({
+    kind: "let",
+    name: colName,
+    dtype: "u32",
+    value: binOp("add", ptr.innerRange.base, binOp("add", binOp("mul", ref("thread_col"), cU32(threadTileN)), ref(tnVar)))
+  });
+  const maskCond = andOp(cmpOp("lt", ref(rowName), mask.outerBound), cmpOp("lt", ref(colName), mask.innerBound));
+  const idxName = freshVar("st_idx");
+  const ifBody = [];
+  ifBody.push({
+    kind: "let",
+    name: idxName,
+    dtype: "u32",
+    value: binOp("add", binOp("add", ptr.baseOffset, mulOrSkip(ref(rowName), ptr.outerStride)), mulOrSkip(ref(colName), ptr.innerStride))
+  });
+  let accVal = arrayRead(accName, binOp("add", binOp("mul", ref(tmVar), cU32(threadTileN)), ref(tnVar)));
+  if (accDtype && accDtype !== "f32") accVal = castNode(accVal, accDtype);
+  ifBody.push({
+    kind: "indexAssign",
+    arrayName: binding,
+    idx: ref(idxName),
+    value: accVal
+  });
+  innerBody.push({
+    kind: "if",
+    condition: maskCond,
+    body: ifBody
+  });
+  result.push(forRange0(tmVar, cU32(threadTileM), [forRange0(tnVar, cU32(threadTileN), innerBody)]));
+  return result;
+}
+function lowerBlockAlloc(stmt) {
+  const { name, rows, cols, elemType, initValue } = stmt;
+  const size = rows * getPhysCols(name, cols);
+  const result = [];
+  if (initValue !== void 0) {
+    result.push({
+      kind: "varArray",
+      name,
+      elemType,
+      size,
+      skipZeroInit: true
+    });
+    const iVar = freshVar("fi");
+    const fillVal = elemType === "f32" ? cF32(initValue) : cU32(initValue);
+    result.push(forRange0(iVar, cU32(size), [{
+      kind: "indexAssign",
+      arrayName: name,
+      idx: ref(iVar),
+      value: fillVal
+    }]));
+  } else result.push({
+    kind: "varArray",
+    name,
+    elemType,
+    size
+  });
+  return result;
+}
+function lowerBlockLoad(stmt, spec) {
+  if (stmt.ptrKind === "thread") return lowerBlockLoadThread(stmt, spec);
+  else return lowerBlockLoadTile(stmt, spec);
+}
+function lowerBlockLoadThread(stmt, spec) {
+  const { binding, name, rows, cols, elemType, guard } = stmt;
+  const threadBase = stmt.threadBase;
+  const threadStride = stmt.threadStride;
+  const pCols = getPhysCols(name, cols);
+  const size = rows * pCols;
+  const isDistributed = _activeTPR > 1 && pCols !== cols;
+  const result = [];
+  const bindingDtype = spec.bindings[binding]?.type ?? elemType;
+  const useVec4 = pCols % 4 === 0 && bindingDtype === "f32";
+  result.push({
+    kind: "varArray",
+    name,
+    elemType: "f32",
+    size,
+    skipZeroInit: true
+  });
+  const loadBody = [];
+  const effectiveBase = isDistributed ? binOp("add", threadBase, binOp("mul", ref("_sub_idx"), cU32(pCols))) : threadBase;
+  if (rows === 1) if (useVec4) {
+    const d4Var = freshVar("d4");
+    const offVar = freshVar("off");
+    const innerBody = [];
+    innerBody.push({
+      kind: "let",
+      name: offVar,
+      dtype: "u32",
+      value: binOp("add", effectiveBase, binOp("mul", ref(d4Var), cU32(4)))
+    });
+    for (let k = 0; k < 4; k++) {
+      const loadExpr = loadBinding(binding, k === 0 ? ref(offVar) : binOp("add", ref(offVar), cU32(k)), bindingDtype);
+      innerBody.push({
+        kind: "indexAssign",
+        arrayName: name,
+        idx: binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k)),
+        value: loadExpr
+      });
+    }
+    loadBody.push(forRange0(d4Var, cU32(pCols / 4), innerBody));
+  } else {
+    const dVar = freshVar("d");
+    const innerBody = [];
+    let loadExpr = loadBinding(binding, binOp("add", effectiveBase, ref(dVar)), bindingDtype);
+    if (bindingDtype !== "f32") loadExpr = castNode(loadExpr, "f32");
+    innerBody.push({
+      kind: "indexAssign",
+      arrayName: name,
+      idx: ref(dVar),
+      value: loadExpr
+    });
+    loadBody.push(forRange0(dVar, cU32(pCols), innerBody));
+  }
+  else {
+    const rVar = freshVar("r");
+    const dVar = freshVar("d");
+    const innerBody = [];
+    const stride = threadStride;
+    const rowBase = binOp("add", threadBase, binOp("mul", ref(rVar), stride));
+    let loadExpr = loadBinding(binding, binOp("add", isDistributed ? binOp("add", rowBase, binOp("mul", ref("_sub_idx"), cU32(pCols))) : rowBase, ref(dVar)), bindingDtype);
+    if (bindingDtype !== "f32") loadExpr = castNode(loadExpr, "f32");
+    const regIdx = binOp("add", binOp("mul", ref(rVar), cU32(pCols)), ref(dVar));
+    innerBody.push({
+      kind: "indexAssign",
+      arrayName: name,
+      idx: regIdx,
+      value: loadExpr
+    });
+    loadBody.push(forRange0(rVar, cU32(rows), [forRange0(dVar, cU32(pCols), innerBody)]));
+  }
+  if (guard) {
+    const zeroBody = [];
+    const zVar = freshVar("zi");
+    zeroBody.push(forRange0(zVar, cU32(size), [{
+      kind: "indexAssign",
+      arrayName: name,
+      idx: ref(zVar),
+      value: cF32(0)
+    }]));
+    result.push({
+      kind: "ifElse",
+      condition: guard,
+      body: loadBody,
+      elseBody: zeroBody
+    });
+  } else result.push(...loadBody);
+  return result;
+}
+function lowerBlockLoadTile(stmt, spec) {
+  if (!stmt.tilePtr || !stmt.tileMask) throw new Error("blockLoad with ptrKind=tile requires tilePtr and tileMask");
+  return lowerTileLoad({
+    binding: stmt.binding,
+    ptr: stmt.tilePtr,
+    mask: stmt.tileMask,
+    sharedName: stmt.name,
+    tileRows: stmt.rows,
+    tileCols: stmt.cols,
+    elemType: stmt.elemType,
+    smemElemType: stmt.smemElemType,
+    smemVec4: stmt.smemVec4
+  }, spec);
+}
+function lowerBlockStore(stmt) {
+  const { binding, blockName, rows, cols, base, stride, guard } = stmt;
+  const pCols = getPhysCols(blockName, cols);
+  const isDistributed = _activeTPR > 1 && pCols !== cols;
+  const result = [];
+  const useVec4 = rows === 1 && pCols % 4 === 0;
+  const storeBody = [];
+  const effectiveBase = isDistributed ? binOp("add", base, binOp("mul", ref("_sub_idx"), cU32(pCols))) : base;
+  if (rows === 1 && useVec4) {
+    const d4Var = freshVar("sd4");
+    const offVar = freshVar("soff");
+    const innerBody = [];
+    innerBody.push({
+      kind: "let",
+      name: offVar,
+      dtype: "u32",
+      value: binOp("add", effectiveBase, binOp("mul", ref(d4Var), cU32(4)))
+    });
+    for (let k = 0; k < 4; k++) {
+      const storeIdx = k === 0 ? ref(offVar) : binOp("add", ref(offVar), cU32(k));
+      innerBody.push({
+        kind: "indexAssign",
+        arrayName: binding,
+        idx: storeIdx,
+        value: arrayRead(blockName, binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k)))
+      });
+    }
+    storeBody.push(forRange0(d4Var, cU32(pCols / 4), innerBody));
+  } else if (rows === 1) {
+    const dVar = freshVar("sd");
+    storeBody.push(forRange0(dVar, cU32(pCols), [{
+      kind: "indexAssign",
+      arrayName: binding,
+      idx: binOp("add", effectiveBase, ref(dVar)),
+      value: arrayRead(blockName, ref(dVar))
+    }]));
+  } else {
+    const rVar = freshVar("sr");
+    const dVar = freshVar("sd");
+    const rowBase = binOp("add", base, binOp("mul", ref(rVar), stride));
+    const effRowBase = isDistributed ? binOp("add", rowBase, binOp("mul", ref("_sub_idx"), cU32(pCols))) : rowBase;
+    storeBody.push(forRange0(rVar, cU32(rows), [forRange0(dVar, cU32(pCols), [{
+      kind: "indexAssign",
+      arrayName: binding,
+      idx: binOp("add", effRowBase, ref(dVar)),
+      value: arrayRead(blockName, binOp("add", binOp("mul", ref(rVar), cU32(pCols)), ref(dVar)))
+    }])]));
+  }
+  if (guard) result.push({
+    kind: "if",
+    condition: guard,
+    body: storeBody
+  });
+  else result.push(...storeBody);
+  return result;
+}
+function lowerBlockDot(stmt) {
+  const { aPlacement, bPlacement, bTransposed } = stmt;
+  if (aPlacement === "shared" && bPlacement === "shared") return lowerBlockDotSharedShared(stmt);
+  else if (aPlacement === "register" && bPlacement === "shared" && bTransposed) return lowerBlockDotRegSharedT(stmt);
+  else if (aPlacement === "register" && bPlacement === "shared" && !bTransposed) return lowerBlockDotRegSharedNN(stmt);
+  else throw new Error(`blockDot: unsupported placement pattern: ${aPlacement} × ${bPlacement}` + (bTransposed ? "^T" : ""));
+}
+function lowerBlockDotSharedShared(stmt) {
+  const { aName, bName, resultName, accName, aCols, bCols, threadTileM, threadTileN } = stmt;
+  if (!threadTileM || !threadTileN) throw new Error("shared×shared blockDot requires threadTileM and threadTileN");
+  const aSmemStride = stmt.aSmemStride ?? aCols;
+  const bSmemStride = stmt.bSmemStride ?? bCols;
+  const innerDim = aCols;
+  const aIsF16 = stmt.aSmemElemType === "f16";
+  const bIsF16 = stmt.bSmemElemType === "f16";
+  const aVec4 = _smemVec4Arrays.has(aName) && !aIsF16 && innerDim % 4 === 0 && aSmemStride % 4 === 0;
+  const bVec4 = _smemVec4Arrays.has(bName) && !bIsF16 && threadTileN % 4 === 0 && bSmemStride % 4 === 0;
+  if (aVec4 && bVec4) return lowerBlockDotBothVec4(stmt, aSmemStride, bSmemStride);
+  const result = [];
+  result.push({ kind: "barrier" });
+  const kkVar = freshVar("kk");
+  const kkLoop = [];
+  const aValsName = freshVar("a_vals");
+  kkLoop.push({
+    kind: "varArray",
+    name: aValsName,
+    elemType: "f32",
+    size: threadTileM,
+    skipZeroInit: true
+  });
+  const tmVar1 = freshVar("tm");
+  if (aVec4) {
+    const aStrideV4 = aSmemStride / 4;
+    const avVar = freshVar("av");
+    kkLoop.push(forRange0(tmVar1, cU32(threadTileM), [{
+      kind: "let",
+      name: avVar,
+      dtype: "f32",
+      value: vec4SharedReadNode(aName, binOp("add", binOp("mul", binOp("add", binOp("mul", ref("thread_row"), cU32(threadTileM)), ref(tmVar1)), cU32(aStrideV4)), binOp("div", ref(kkVar), cU32(4))))
+    }, {
+      kind: "indexAssign",
+      arrayName: aValsName,
+      idx: ref(tmVar1),
+      value: vec4DynComponentNode(ref(avVar, "f32"), binOp("mod", ref(kkVar), cU32(4)))
+    }]));
+  } else {
+    const aReadDtype = aIsF16 ? "f16" : "f32";
+    kkLoop.push(forRange0(tmVar1, cU32(threadTileM), [{
+      kind: "indexAssign",
+      arrayName: aValsName,
+      idx: ref(tmVar1),
+      value: (() => {
+        const raw = sharedRead(aName, binOp("add", binOp("mul", binOp("add", binOp("mul", ref("thread_row"), cU32(threadTileM)), ref(tmVar1)), cU32(aSmemStride)), ref(kkVar)), aReadDtype);
+        return aIsF16 ? castNode(raw, "f32") : raw;
+      })()
+    }]));
+  }
+  const bValsName = freshVar("b_vals");
+  kkLoop.push({
+    kind: "varArray",
+    name: bValsName,
+    elemType: "f32",
+    size: threadTileN,
+    skipZeroInit: true
+  });
+  if (bVec4) {
+    const bStrideV4 = bSmemStride / 4;
+    const ttNv4 = threadTileN / 4;
+    const tnvVar = freshVar("tnv");
+    const bvVar = freshVar("bv");
+    kkLoop.push(forRange0(tnvVar, cU32(ttNv4), [{
+      kind: "let",
+      name: bvVar,
+      dtype: "f32",
+      value: vec4SharedReadNode(bName, binOp("add", binOp("mul", ref(kkVar), cU32(bStrideV4)), binOp("add", binOp("mul", ref("thread_col"), cU32(ttNv4)), ref(tnvVar))))
+    }, ...[
+      0,
+      1,
+      2,
+      3
+    ].map((k) => ({
+      kind: "indexAssign",
+      arrayName: bValsName,
+      idx: binOp("add", binOp("mul", ref(tnvVar), cU32(4)), cU32(k)),
+      value: vec4ComponentNode(ref(bvVar, "f32"), k)
+    }))]));
+  } else {
+    const tnVar1 = freshVar("tn");
+    const bReadDtype = bIsF16 ? "f16" : "f32";
+    kkLoop.push(forRange0(tnVar1, cU32(threadTileN), [{
+      kind: "indexAssign",
+      arrayName: bValsName,
+      idx: ref(tnVar1),
+      value: (() => {
+        const raw = sharedRead(bName, binOp("add", binOp("mul", ref(kkVar), cU32(bSmemStride)), binOp("add", binOp("mul", ref("thread_col"), cU32(threadTileN)), ref(tnVar1))), bReadDtype);
+        return bIsF16 ? castNode(raw, "f32") : raw;
+      })()
+    }]));
+  }
+  const targetName = accName ?? resultName;
+  const tmVar2 = freshVar("tm");
+  const tnVar2 = freshVar("tn");
+  kkLoop.push(forRange0(tmVar2, cU32(threadTileM), [forRange0(tnVar2, cU32(threadTileN), [{
+    kind: "indexAddAssign",
+    arrayName: targetName,
+    idx: binOp("add", binOp("mul", ref(tmVar2), cU32(threadTileN)), ref(tnVar2)),
+    value: binOp("mul", arrayRead(aValsName, ref(tmVar2)), arrayRead(bValsName, ref(tnVar2)), "f32")
+  }])]));
+  result.push(forRange0(kkVar, cU32(innerDim), kkLoop));
+  result.push({ kind: "barrier" });
+  return result;
+}
+function lowerBlockDotBothVec4(stmt, aSmemStride, bSmemStride) {
+  const { aName, bName, resultName, accName, aCols } = stmt;
+  const threadTileM = stmt.threadTileM;
+  const threadTileN = stmt.threadTileN;
+  const innerDim = aCols;
+  const aStrideV4 = aSmemStride / 4;
+  const bStrideV4 = bSmemStride / 4;
+  const ttNv4 = threadTileN / 4;
+  const targetName = accName ?? resultName;
+  const result = [];
+  result.push({ kind: "barrier" });
+  const kk4Var = freshVar("kk4");
+  const kk4Loop = [];
+  const aValsName = freshVar("a_vals");
+  const bValsName = freshVar("b_vals");
+  kk4Loop.push({
+    kind: "varArray",
+    name: aValsName,
+    elemType: "f32",
+    size: threadTileM,
+    skipZeroInit: true
+  }, {
+    kind: "varArray",
+    name: bValsName,
+    elemType: "f32",
+    size: threadTileN,
+    skipZeroInit: true
+  });
+  const aVec4Names = [];
+  for (let tm = 0; tm < threadTileM; tm++) {
+    const name = freshVar("av");
+    aVec4Names.push(name);
+    kk4Loop.push({
+      kind: "let",
+      name,
+      dtype: "f32",
+      value: vec4SharedReadNode(aName, binOp("add", binOp("mul", binOp("add", binOp("mul", ref("thread_row"), cU32(threadTileM)), cU32(tm)), cU32(aStrideV4)), ref(kk4Var)))
+    });
+  }
+  for (let sub2 = 0; sub2 < 4; sub2++) {
+    const subStmts = [];
+    for (let tm = 0; tm < threadTileM; tm++) subStmts.push({
+      kind: "indexAssign",
+      arrayName: aValsName,
+      idx: cU32(tm),
+      value: vec4ComponentNode(ref(aVec4Names[tm], "f32"), sub2)
+    });
+    const tnvVar = freshVar("tnv");
+    const bvVar = freshVar("bv");
+    const bRowIdx = binOp("add", binOp("mul", ref(kk4Var), cU32(4)), cU32(sub2));
+    subStmts.push(forRange0(tnvVar, cU32(ttNv4), [{
+      kind: "let",
+      name: bvVar,
+      dtype: "f32",
+      value: vec4SharedReadNode(bName, binOp("add", binOp("mul", bRowIdx, cU32(bStrideV4)), binOp("add", binOp("mul", ref("thread_col"), cU32(ttNv4)), ref(tnvVar))))
+    }, ...[
+      0,
+      1,
+      2,
+      3
+    ].map((k) => ({
+      kind: "indexAssign",
+      arrayName: bValsName,
+      idx: binOp("add", binOp("mul", ref(tnvVar), cU32(4)), cU32(k)),
+      value: vec4ComponentNode(ref(bvVar, "f32"), k)
+    }))]));
+    const tmVar2 = freshVar("tm");
+    const tnVar2 = freshVar("tn");
+    subStmts.push(forRange0(tmVar2, cU32(threadTileM), [forRange0(tnVar2, cU32(threadTileN), [{
+      kind: "indexAddAssign",
+      arrayName: targetName,
+      idx: binOp("add", binOp("mul", ref(tmVar2), cU32(threadTileN)), ref(tnVar2)),
+      value: binOp("mul", arrayRead(aValsName, ref(tmVar2)), arrayRead(bValsName, ref(tnVar2)), "f32")
+    }])]));
+    kk4Loop.push(...subStmts);
+  }
+  result.push(forRange0(kk4Var, cU32(innerDim / 4), kk4Loop));
+  result.push({ kind: "barrier" });
+  return result;
+}
+function lowerBlockDotRegSharedT(stmt) {
+  const { aName, bName, resultName, accName, aRows, aCols, bRows, bCols } = stmt;
+  const bStride = stmt.bSmemStride ?? bCols;
+  const bIsF16 = stmt.bSmemElemType === "f16";
+  const result = [];
+  const innerDim = aCols;
+  const outCols = bRows;
+  const bRead = (idx) => {
+    const raw = sharedRead(bName, idx, bIsF16 ? "f16" : "f32");
+    return bIsF16 ? castNode(raw, "f32") : raw;
+  };
+  const physInnerDim = _activeTPR > 1 ? innerDim / _activeTPR : innerDim;
+  const useVec4 = physInnerDim % 4 === 0;
+  if (aRows === 1) {
+    const jVar = freshVar("j");
+    const sVar = freshVar("s");
+    const jBody = [];
+    jBody.push({
+      kind: "var",
+      name: sVar,
+      dtype: "f32",
+      value: cF32(0)
+    });
+    const bRowBase = (d) => {
+      const base = binOp("add", binOp("mul", ref(jVar), cU32(bStride)), d);
+      return _activeTPR > 1 ? binOp("add", binOp("mul", ref("_sub_idx"), cU32(physInnerDim)), base) : base;
+    };
+    if (useVec4 && _smemVec4Arrays.has(bName)) {
+      const bStrideV4 = bStride / 4;
+      const physInnerDimV4 = physInnerDim / 4;
+      const d4Var = freshVar("d4");
+      const bV4Idx = (d4) => {
+        const base = binOp("add", binOp("mul", ref(jVar), cU32(bStrideV4)), d4);
+        return _activeTPR > 1 ? binOp("add", binOp("mul", ref("_sub_idx"), cU32(physInnerDimV4)), base) : base;
+      };
+      jBody.push(forRange0(d4Var, cU32(physInnerDimV4), [{
+        kind: "addAssign",
+        name: sVar,
+        value: vec4NativeDotNode(vec4ConstructNode(...[
+          0,
+          1,
+          2,
+          3
+        ].map((k) => arrayRead(aName, binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k))))), vec4SharedReadNode(bName, bV4Idx(ref(d4Var))))
+      }]));
+    } else if (useVec4) {
+      const d4Var = freshVar("d4");
+      jBody.push(forRange0(d4Var, cU32(physInnerDim / 4), [{
+        kind: "addAssign",
+        name: sVar,
+        value: vec4DotExpr([
+          0,
+          1,
+          2,
+          3
+        ].map((k) => arrayRead(aName, binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k)))), [
+          0,
+          1,
+          2,
+          3
+        ].map((k) => bRead(bRowBase(binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k))))))
+      }]));
+    } else {
+      const dVar = freshVar("d");
+      jBody.push(forRange0(dVar, cU32(physInnerDim), [{
+        kind: "addAssign",
+        name: sVar,
+        value: binOp("mul", arrayRead(aName, ref(dVar)), bRead(bRowBase(ref(dVar))), "f32")
+      }]));
+    }
+    if (_activeTPR > 1) jBody.push(...emitButterflyReduce(sVar, _activeTPR, "sum"));
+    storeResult(jBody, accName, resultName, ref(jVar), ref(sVar, "f32"));
+    result.push(forRange0(jVar, cU32(outCols), jBody));
+  } else {
+    const rVar = freshVar("r");
+    const jVar = freshVar("j");
+    const sVar = freshVar("s");
+    const rBody = [];
+    const jBody = [];
+    jBody.push({
+      kind: "var",
+      name: sVar,
+      dtype: "f32",
+      value: cF32(0)
+    });
+    if (useVec4) {
+      const d4Var = freshVar("d4");
+      jBody.push(forRange0(d4Var, cU32(innerDim / 4), [{
+        kind: "addAssign",
+        name: sVar,
+        value: vec4DotExpr([
+          0,
+          1,
+          2,
+          3
+        ].map((k) => arrayRead(aName, binOp("add", binOp("add", binOp("mul", ref(rVar), cU32(aCols)), binOp("mul", ref(d4Var), cU32(4))), cU32(k)))), [
+          0,
+          1,
+          2,
+          3
+        ].map((k) => bRead(binOp("add", binOp("add", binOp("mul", ref(jVar), cU32(bStride)), binOp("mul", ref(d4Var), cU32(4))), cU32(k)))))
+      }]));
+    } else {
+      const dVar = freshVar("d");
+      jBody.push(forRange0(dVar, cU32(innerDim), [{
+        kind: "addAssign",
+        name: sVar,
+        value: binOp("mul", arrayRead(aName, binOp("add", binOp("mul", ref(rVar), cU32(aCols)), ref(dVar))), bRead(binOp("add", binOp("mul", ref(jVar), cU32(bStride)), ref(dVar))), "f32")
+      }]));
+    }
+    storeResult(jBody, accName, resultName, binOp("add", binOp("mul", ref(rVar), cU32(outCols)), ref(jVar)), ref(sVar, "f32"));
+    rBody.push(forRange0(jVar, cU32(outCols), jBody));
+    result.push(forRange0(rVar, cU32(aRows), rBody));
+  }
+  return result;
+}
+function lowerBlockDotRegSharedNN(stmt) {
+  const { aName, bName, resultName, aRows, aCols, bCols } = stmt;
+  const bStride = stmt.bSmemStride ?? bCols;
+  const bIsF16 = stmt.bSmemElemType === "f16";
+  const result = [];
+  const outCols = bCols;
+  const bRead = (idx) => {
+    const raw = sharedRead(bName, idx, bIsF16 ? "f16" : "f32");
+    return bIsF16 ? castNode(raw, "f32") : raw;
+  };
+  const physOutCols = _activeTPR > 1 ? outCols / _activeTPR : outCols;
+  const useVec4 = physOutCols % 4 === 0;
+  if (aRows === 1) {
+    const jVar = freshVar("j");
+    const pVar = freshVar("p");
+    const jBody = [];
+    jBody.push({
+      kind: "let",
+      name: pVar,
+      dtype: "f32",
+      value: arrayRead(aName, ref(jVar))
+    });
+    const bColBase = (d) => {
+      const colIdx = _activeTPR > 1 ? binOp("add", binOp("mul", ref("_sub_idx"), cU32(physOutCols)), d) : d;
+      return binOp("add", binOp("mul", ref(jVar), cU32(bStride)), colIdx);
+    };
+    if (useVec4 && _smemVec4Arrays.has(bName)) {
+      const bStrideV4 = bStride / 4;
+      const physOutColsV4 = physOutCols / 4;
+      const d4Var = freshVar("d4");
+      const bvVar = freshVar("bv");
+      const d4Body = [];
+      const bV4Idx = (() => {
+        const colIdx = _activeTPR > 1 ? binOp("add", binOp("mul", ref("_sub_idx"), cU32(physOutColsV4)), ref(d4Var)) : ref(d4Var);
+        return binOp("add", binOp("mul", ref(jVar), cU32(bStrideV4)), colIdx);
+      })();
+      d4Body.push({
+        kind: "let",
+        name: bvVar,
+        dtype: "f32",
+        value: vec4SharedReadNode(bName, bV4Idx)
+      });
+      for (let k = 0; k < 4; k++) {
+        const regIdx = binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k));
+        d4Body.push({
+          kind: "indexAddAssign",
+          arrayName: resultName,
+          idx: regIdx,
+          value: binOp("mul", ref(pVar, "f32"), vec4ComponentNode(ref(bvVar), k), "f32")
+        });
+      }
+      jBody.push(forRange0(d4Var, cU32(physOutColsV4), d4Body));
+    } else if (useVec4) {
+      const d4Var = freshVar("d4");
+      const d4Body = [];
+      for (let k = 0; k < 4; k++) {
+        const regIdx = binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k));
+        const smemIdx = bColBase(binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k)));
+        d4Body.push({
+          kind: "indexAddAssign",
+          arrayName: resultName,
+          idx: regIdx,
+          value: binOp("mul", ref(pVar, "f32"), bRead(smemIdx), "f32")
+        });
+      }
+      jBody.push(forRange0(d4Var, cU32(physOutCols / 4), d4Body));
+    } else {
+      const dVar = freshVar("d");
+      jBody.push(forRange0(dVar, cU32(physOutCols), [{
+        kind: "indexAddAssign",
+        arrayName: resultName,
+        idx: ref(dVar),
+        value: binOp("mul", ref(pVar, "f32"), bRead(bColBase(ref(dVar))), "f32")
+      }]));
+    }
+    result.push(forRange0(jVar, cU32(aCols), jBody));
+  } else {
+    const rVar = freshVar("r");
+    const jVar = freshVar("j");
+    const dVar = freshVar("d");
+    const pVar = freshVar("p");
+    const rBody = [];
+    const jBody = [];
+    jBody.push({
+      kind: "let",
+      name: pVar,
+      dtype: "f32",
+      value: arrayRead(aName, binOp("add", binOp("mul", ref(rVar), cU32(aCols)), ref(jVar)))
+    });
+    jBody.push(forRange0(dVar, cU32(outCols), [{
+      kind: "indexAddAssign",
+      arrayName: resultName,
+      idx: binOp("add", binOp("mul", ref(rVar), cU32(outCols)), ref(dVar)),
+      value: binOp("mul", ref(pVar, "f32"), bRead(binOp("add", binOp("mul", ref(jVar), cU32(bStride)), ref(dVar))), "f32")
+    }]));
+    rBody.push(forRange0(jVar, cU32(aCols), jBody));
+    result.push(forRange0(rVar, cU32(aRows), rBody));
+  }
+  return result;
+}
+function lowerBlockDotRow(stmt) {
+  const { aName, bName, resultName, rowIdx, aCols, bCols } = stmt;
+  const bStride = stmt.bSmemStride ?? bCols;
+  const bIsF16 = stmt.bSmemElemType === "f16";
+  const result = [];
+  const bRead = (idx) => {
+    const raw = sharedRead(bName, idx, bIsF16 ? "f16" : "f32");
+    return bIsF16 ? castNode(raw, "f32") : raw;
+  };
+  const physInnerDim = _activeTPR > 1 ? aCols / _activeTPR : aCols;
+  const useVec4 = physInnerDim % 4 === 0;
+  result.push({
+    kind: "var",
+    name: resultName,
+    dtype: "f32",
+    value: cF32(0)
+  });
+  const bRowBase = (d) => {
+    const base = binOp("add", binOp("mul", rowIdx, cU32(bStride)), d);
+    return _activeTPR > 1 ? binOp("add", binOp("mul", ref("_sub_idx"), cU32(physInnerDim)), base) : base;
+  };
+  if (useVec4 && _smemVec4Arrays.has(bName)) {
+    const bStrideV4 = bStride / 4;
+    const physInnerDimV4 = physInnerDim / 4;
+    const d4Var = freshVar("d4");
+    const bV4Idx = (() => {
+      const base = binOp("add", binOp("mul", rowIdx, cU32(bStrideV4)), ref(d4Var));
+      return _activeTPR > 1 ? binOp("add", binOp("mul", ref("_sub_idx"), cU32(physInnerDimV4)), base) : base;
+    })();
+    result.push(forRange0(d4Var, cU32(physInnerDimV4), [{
+      kind: "addAssign",
+      name: resultName,
+      value: vec4NativeDotNode(vec4ConstructNode(...[
+        0,
+        1,
+        2,
+        3
+      ].map((k) => arrayRead(aName, binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k))))), vec4SharedReadNode(bName, bV4Idx))
+    }]));
+  } else if (useVec4) {
+    const d4Var = freshVar("d4");
+    result.push(forRange0(d4Var, cU32(physInnerDim / 4), [{
+      kind: "addAssign",
+      name: resultName,
+      value: vec4DotExpr([
+        0,
+        1,
+        2,
+        3
+      ].map((k) => arrayRead(aName, binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k)))), [
+        0,
+        1,
+        2,
+        3
+      ].map((k) => bRead(bRowBase(binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k))))))
+    }]));
+  } else {
+    const dVar = freshVar("d");
+    result.push(forRange0(dVar, cU32(physInnerDim), [{
+      kind: "addAssign",
+      name: resultName,
+      value: binOp("mul", arrayRead(aName, ref(dVar)), bRead(bRowBase(ref(dVar))), "f32")
+    }]));
+  }
+  if (_activeTPR > 1) result.push(...emitButterflyReduce(resultName, _activeTPR, "sum"));
+  return result;
+}
+function lowerBlockAccumRow(stmt) {
+  const { accName, bName, scalarName, rowIdx, accCols, bCols } = stmt;
+  const bStride = stmt.bSmemStride ?? bCols;
+  const bIsF16 = stmt.bSmemElemType === "f16";
+  const result = [];
+  const bRead = (idx) => {
+    const raw = sharedRead(bName, idx, bIsF16 ? "f16" : "f32");
+    return bIsF16 ? castNode(raw, "f32") : raw;
+  };
+  const physOutCols = _activeTPR > 1 ? accCols / _activeTPR : accCols;
+  const useVec4 = physOutCols % 4 === 0;
+  const bColBase = (d) => {
+    const colIdx = _activeTPR > 1 ? binOp("add", binOp("mul", ref("_sub_idx"), cU32(physOutCols)), d) : d;
+    return binOp("add", binOp("mul", rowIdx, cU32(bStride)), colIdx);
+  };
+  if (useVec4 && _smemVec4Arrays.has(bName)) {
+    const bStrideV4 = bStride / 4;
+    const physOutColsV4 = physOutCols / 4;
+    const d4Var = freshVar("d4");
+    const bvVar = freshVar("bv");
+    const d4Body = [];
+    const bV4Idx = (() => {
+      const colIdx = _activeTPR > 1 ? binOp("add", binOp("mul", ref("_sub_idx"), cU32(physOutColsV4)), ref(d4Var)) : ref(d4Var);
+      return binOp("add", binOp("mul", rowIdx, cU32(bStrideV4)), colIdx);
+    })();
+    d4Body.push({
+      kind: "let",
+      name: bvVar,
+      dtype: "f32",
+      value: vec4SharedReadNode(bName, bV4Idx)
+    });
+    for (let k = 0; k < 4; k++) {
+      const regIdx = binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k));
+      d4Body.push({
+        kind: "indexAddAssign",
+        arrayName: accName,
+        idx: regIdx,
+        value: binOp("mul", ref(scalarName, "f32"), vec4ComponentNode(ref(bvVar), k), "f32")
+      });
+    }
+    result.push(forRange0(d4Var, cU32(physOutColsV4), d4Body));
+  } else if (useVec4) {
+    const d4Var = freshVar("d4");
+    const d4Body = [];
+    for (let k = 0; k < 4; k++) {
+      const regIdx = binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k));
+      const smemIdx = bColBase(binOp("add", binOp("mul", ref(d4Var), cU32(4)), cU32(k)));
+      d4Body.push({
+        kind: "indexAddAssign",
+        arrayName: accName,
+        idx: regIdx,
+        value: binOp("mul", ref(scalarName, "f32"), bRead(smemIdx), "f32")
+      });
+    }
+    result.push(forRange0(d4Var, cU32(physOutCols / 4), d4Body));
+  } else {
+    const dVar = freshVar("d");
+    result.push(forRange0(dVar, cU32(physOutCols), [{
+      kind: "indexAddAssign",
+      arrayName: accName,
+      idx: ref(dVar),
+      value: binOp("mul", ref(scalarName, "f32"), bRead(bColBase(ref(dVar))), "f32")
+    }]));
+  }
+  return result;
+}
+function lowerBlockReduce(stmt) {
+  const { inputName, outputName, inputRows, inputCols, axis, op } = stmt;
+  const result = [];
+  const inputLayout = _blockLayouts.get(inputName);
+  const isDistributed = _activeTPR > 1 && inputLayout === "distributed";
+  const physInputCols = isDistributed ? inputCols / _activeTPR : inputCols;
+  const outerDim = axis === 1 ? inputRows : isDistributed ? physInputCols : inputCols;
+  const innerDim = axis === 1 ? physInputCols : inputRows;
+  result.push({
+    kind: "varArray",
+    name: outputName,
+    elemType: "f32",
+    size: outerDim,
+    skipZeroInit: true
+  });
+  const outerVar = freshVar("ro");
+  const innerVar = freshVar("ri");
+  const initVal = op === "max" ? cF32(F32_NEG_MAX) : cF32(0);
+  const rowRef = axis === 1 ? ref(outerVar) : ref(innerVar);
+  const colRef = axis === 1 ? ref(innerVar) : ref(outerVar);
+  const inputIdx = binOp("add", binOp("mul", rowRef, cU32(physInputCols)), colRef);
+  const accumExpr = binOp(op === "sum" ? "add" : "max", arrayRead(outputName, ref(outerVar)), arrayRead(inputName, inputIdx), "f32");
+  const outerBody = [];
+  outerBody.push({
+    kind: "indexAssign",
+    arrayName: outputName,
+    idx: ref(outerVar),
+    value: initVal
+  });
+  outerBody.push(forRange0(innerVar, cU32(innerDim), [{
+    kind: "indexAssign",
+    arrayName: outputName,
+    idx: ref(outerVar),
+    value: accumExpr
+  }]));
+  if (isDistributed && axis === 1) {
+    const tmpVar = freshVar("rv");
+    outerBody.push({
+      kind: "var",
+      name: tmpVar,
+      dtype: "f32",
+      value: arrayRead(outputName, ref(outerVar))
+    });
+    outerBody.push(...emitButterflyReduce(tmpVar, _activeTPR, op === "sum" ? "sum" : "max"));
+    outerBody.push({
+      kind: "indexAssign",
+      arrayName: outputName,
+      idx: ref(outerVar),
+      value: ref(tmpVar, "f32")
+    });
+  }
+  result.push(forRange0(outerVar, cU32(outerDim), outerBody));
+  return result;
+}
+function lowerBlockUnary(stmt) {
+  const { inputName, outputName, rows, cols, op, inPlace } = stmt;
+  const size = rows * getPhysCols(inPlace ? outputName : inputName, cols);
+  const result = [];
+  if (!inPlace) result.push({
+    kind: "varArray",
+    name: outputName,
+    elemType: "f32",
+    size,
+    skipZeroInit: true
+  });
+  const iVar = freshVar("ui");
+  const outputVal = {
+    id: -1,
+    kind: "unary",
+    op,
+    input: arrayRead(inputName, ref(iVar)),
+    valueType: "scalar",
+    dataType: "f32"
+  };
+  result.push(forRange0(iVar, cU32(size), [{
+    kind: "indexAssign",
+    arrayName: outputName,
+    idx: ref(iVar),
+    value: outputVal
+  }]));
+  return result;
+}
+function lowerBlockBinary(stmt) {
+  const { aName, bName, outputName, aRows, aCols, bRows, bCols, op, inPlace, bScalarExpr } = stmt;
+  const outRows = Math.max(aRows, bRows);
+  const outCols = Math.max(aCols, bCols);
+  const outSize = outRows * getPhysCols(outputName, outCols);
+  const result = [];
+  if (!inPlace) result.push({
+    kind: "varArray",
+    name: outputName,
+    elemType: "f32",
+    size: outSize,
+    skipZeroInit: true
+  });
+  const isSameDims = aRows === bRows && aCols === bCols;
+  const isScalarB = bRows === 1 && bCols === 1;
+  const isPerRowB = bRows === aRows && bCols === 1;
+  const isPerColB = bRows === 1 && bCols === aCols;
+  if (isScalarB) {
+    const bValName = freshVar("bv");
+    const bVal = bScalarExpr ?? arrayRead(bName, cU32(0));
+    result.push({
+      kind: "let",
+      name: bValName,
+      dtype: "f32",
+      value: bVal
+    });
+    const iVar = freshVar("bi");
+    result.push(forRange0(iVar, cU32(outSize), [{
+      kind: "indexAssign",
+      arrayName: outputName,
+      idx: ref(iVar),
+      value: emitBinaryOp(op, arrayRead(aName, ref(iVar)), ref(bValName, "f32"))
+    }]));
+  } else if (isSameDims) {
+    const iVar = freshVar("bi");
+    result.push(forRange0(iVar, cU32(outSize), [{
+      kind: "indexAssign",
+      arrayName: outputName,
+      idx: ref(iVar),
+      value: emitBinaryOp(op, arrayRead(aName, ref(iVar)), arrayRead(bName, ref(iVar)))
+    }]));
+  } else if (isPerRowB) {
+    const rVar = freshVar("br");
+    const cVar = freshVar("bc");
+    const bvName = freshVar("bv");
+    result.push(forRange0(rVar, cU32(outRows), [{
+      kind: "let",
+      name: bvName,
+      dtype: "f32",
+      value: arrayRead(bName, ref(rVar))
+    }, forRange0(cVar, cU32(outCols), [{
+      kind: "indexAssign",
+      arrayName: outputName,
+      idx: binOp("add", binOp("mul", ref(rVar), cU32(outCols)), ref(cVar)),
+      value: emitBinaryOp(op, arrayRead(aName, binOp("add", binOp("mul", ref(rVar), cU32(aCols)), ref(cVar))), ref(bvName, "f32"))
+    }])]));
+  } else if (isPerColB) {
+    const rVar = freshVar("br");
+    const cVar = freshVar("bc");
+    result.push(forRange0(rVar, cU32(outRows), [forRange0(cVar, cU32(outCols), [{
+      kind: "indexAssign",
+      arrayName: outputName,
+      idx: binOp("add", binOp("mul", ref(rVar), cU32(outCols)), ref(cVar)),
+      value: emitBinaryOp(op, arrayRead(aName, binOp("add", binOp("mul", ref(rVar), cU32(aCols)), ref(cVar))), arrayRead(bName, ref(cVar)))
+    }])]));
+  } else throw new Error(`blockBinary: unsupported broadcast [${aRows}×${aCols}] op [${bRows}×${bCols}]`);
+  return result;
+}
+function emitBinaryOp(op, lhs, rhs) {
+  if (op === "copy") return rhs;
+  return binOp(op, lhs, rhs, "f32");
+}
+var _varCounter, _activeTPR, _blockLayouts, _smemVec4Arrays;
+var init_tile_lowering = __esmMin((() => {
+  init_shape_utils();
+  _varCounter = 0;
+  _activeTPR = 1;
+  _blockLayouts = /* @__PURE__ */ new Map();
+  _smemVec4Arrays = /* @__PURE__ */ new Set();
+}));
+function findElementwiseUniform(spec) {
+  for (const [name, type] of Object.entries(spec.uniforms)) if (type === "u32" && ELEMENTWISE_UNIFORMS.has(name)) return name;
+  return null;
+}
+function isVec4(node, v4) {
+  if (v4.nodes.has(node.id)) return true;
+  let result = false;
+  switch (node.kind) {
+    case "load":
+      result = true;
+      break;
+    case "binary":
+      result = isVec4(node.lhs, v4) || isVec4(node.rhs, v4);
+      break;
+    case "unary":
+      result = isVec4(node.input, v4);
+      break;
+    case "cast":
+    case "bitcast":
+      result = isVec4(node.input, v4);
+      break;
+    case "select":
+      result = isVec4(node.trueVal, v4) || isVec4(node.falseVal, v4);
+      break;
+    case "cmp":
+      result = isVec4(node.lhs, v4) || isVec4(node.rhs, v4);
+      break;
+    case "namedRef":
+      result = v4.vars.has(node.name);
+      break;
+  }
+  if (result) v4.nodes.add(node.id);
+  return result;
+}
+function splatScalar(expr, dtype) {
+  return `vec4<${dtype === "f16" ? "f16" : dtype === "u32" ? "u32" : dtype === "i32" ? "i32" : "f32"}>(${expr})`;
+}
+function exprFor(node, bindings, v4) {
+  const cached = bindings.get(node.id);
+  if (cached !== void 0) return cached;
+  switch (node.kind) {
+    case "programId":
+      return `wid.${DIMS[node.dim]}`;
+    case "uniform":
+      return `config.${node.name}`;
+    case "const":
+      if (node.dataType === "f32") {
+        const s = String(node.value);
+        return s.includes(".") || s.includes("e") || s.includes("E") ? s : s + ".0";
+      }
+      if (node.dataType === "f16") {
+        const s = String(node.value);
+        return `f16(${s.includes(".") || s.includes("e") || s.includes("E") ? s : s + ".0"})`;
+      }
+      if (node.dataType === "u32") return `${node.value}u`;
+      return `i32(${node.value})`;
+    case "load": {
+      const offs = exprFor(node.offsets, bindings, v4);
+      if (v4) return `${node.binding}[(${offs}) >> 2u]`;
+      return `${node.binding}[${offs}]`;
+    }
+    case "binary": {
+      const lhs = exprFor(node.lhs, bindings, v4);
+      const rhs = exprFor(node.rhs, bindings, v4);
+      const infixOp = getWgslInfix(node.op);
+      if (v4 && (NEEDS_SPLAT.has(node.op) || !infixOp)) {
+        const lVec = isVec4(node.lhs, v4);
+        const rVec = isVec4(node.rhs, v4);
+        const lExpr = !lVec && rVec ? splatScalar(lhs, node.lhs.dataType) : lhs;
+        const rExpr = !rVec && lVec ? splatScalar(rhs, node.rhs.dataType) : rhs;
+        if (infixOp) return `(${lExpr} ${infixOp} ${rExpr})`;
+        return `${node.op}(${lExpr}, ${rExpr})`;
+      }
+      if (infixOp) return `(${lhs} ${infixOp} ${rhs})`;
+      return `${node.op}(${lhs}, ${rhs})`;
+    }
+    case "unary": {
+      const input = exprFor(node.input, bindings, v4);
+      const prefix = getWgslPrefix(node.op);
+      if (prefix) return `${prefix}(${input})`;
+      return `${getWgslFnName(node.op)}(${input})`;
+    }
+    case "cast": {
+      const input = exprFor(node.input, bindings, v4);
+      if (v4 && isVec4(node.input, v4)) return `vec4<${node.targetType}>(${input})`;
+      return `${node.targetType}(${input})`;
+    }
+    case "bitcast": {
+      const input = exprFor(node.input, bindings, v4);
+      if (v4 && isVec4(node.input, v4)) return `bitcast<vec4<${node.targetType}>>(${input})`;
+      return `bitcast<${node.targetType}>(${input})`;
+    }
+    case "select": {
+      const cond = exprFor(node.condition, bindings, v4);
+      let t = exprFor(node.trueVal, bindings, v4);
+      let f = exprFor(node.falseVal, bindings, v4);
+      if (v4) {
+        const tVec = isVec4(node.trueVal, v4);
+        const fVec = isVec4(node.falseVal, v4);
+        if (tVec || fVec || isVec4(node.condition, v4)) {
+          if (!tVec) t = splatScalar(t, node.trueVal.dataType);
+          if (!fVec) f = splatScalar(f, node.falseVal.dataType);
+        }
+      }
+      return `select(${f}, ${t}, ${cond})`;
+    }
+    case "cmp": {
+      const lhs = exprFor(node.lhs, bindings, v4);
+      const rhs = exprFor(node.rhs, bindings, v4);
+      const op = {
+        eq: "==",
+        ne: "!=",
+        lt: "<",
+        le: "<=",
+        gt: ">",
+        ge: ">="
+      }[node.op];
+      if (v4) {
+        const lVec = isVec4(node.lhs, v4);
+        const rVec = isVec4(node.rhs, v4);
+        return `(${!lVec && rVec ? splatScalar(lhs, node.lhs.dataType) : lhs} ${op} ${!rVec && lVec ? splatScalar(rhs, node.rhs.dataType) : rhs})`;
+      }
+      return `(${lhs} ${op} ${rhs})`;
+    }
+    case "threadIdx":
+      return `local_id.${DIMS[node.dim]}`;
+    case "localIndex":
+      return getActiveTPR() > 1 ? "_logical_idx" : "local_idx";
+    case "sharedRead":
+    case "arrayRead":
+    case "vec4ArrayRead":
+    case "vec4SharedRead":
+      return `${node.arrayName}[${exprFor(node.idx, bindings, v4)}]`;
+    case "namedRef":
+      return node.name;
+    case "globalId":
+      return `gid.${DIMS[node.dim]}`;
+    case "numWorkgroups":
+      return `num_wg.${DIMS[node.dim]}`;
+    case "subgroupShuffleXor":
+      return `subgroupShuffleXor(${exprFor(node.value, bindings, v4)}, ${exprFor(node.mask, bindings, v4)})`;
+    case "subgroupAdd":
+    case "subgroupMax":
+    case "subgroupMin":
+    case "subgroupBroadcastFirst":
+    case "subgroupInclusiveAdd":
+      return `${node.kind}(${exprFor(node.value, bindings, v4)})`;
+    case "vec4dot": {
+      const a = node.a.map((n) => exprFor(n, bindings, v4));
+      const b = node.b.map((n) => exprFor(n, bindings, v4));
+      return `dot(vec4<f32>(${a.join(", ")}), vec4<f32>(${b.join(", ")}))`;
+    }
+    case "vec4Construct":
+      return `vec4<f32>(${exprFor(node.x, bindings, v4)}, ${exprFor(node.y, bindings, v4)}, ${exprFor(node.z, bindings, v4)}, ${exprFor(node.w, bindings, v4)})`;
+    case "vec4Splat":
+      return `vec4<f32>(${exprFor(node.value, bindings, v4)})`;
+    case "vec4NativeDot":
+      return `dot(${exprFor(node.a, bindings, v4)}, ${exprFor(node.b, bindings, v4)})`;
+    case "vec4Component":
+      return `${exprFor(node.value, bindings, v4)}.${[
+        "x",
+        "y",
+        "z",
+        "w"
+      ][node.comp]}`;
+    case "vec4DynComponent": {
+      const v = exprFor(node.value, bindings, v4);
+      if (node.idx.kind === "const" && typeof node.idx.value === "number") {
+        const comp = [
+          "x",
+          "y",
+          "z",
+          "w"
+        ][node.idx.value];
+        if (comp) return `${v}.${comp}`;
+      }
+      return `${v}[${exprFor(node.idx, bindings, v4)}]`;
+    }
+    case "vec4Binary": {
+      const a = exprFor(node.a, bindings, v4);
+      const b = exprFor(node.b, bindings, v4);
+      return `(${a} ${node.op === "add" ? "+" : node.op === "sub" ? "-" : "*"} ${b})`;
+    }
+    default:
+      throw new Error(`Unknown node kind: ${node.kind}`);
+  }
+}
+function compileTileKernel(spec) {
+  resetLoweringState();
+  if (spec.vectorize === void 0 && spec.autoVectorize) {
+    const safeWidth = computeSafeVecWidth(spec);
+    if (safeWidth > 1) {
+      const wgSize = typeof spec.workgroupSize === "number" ? spec.workgroupSize : spec.workgroupSize[0] * spec.workgroupSize[1];
+      const elementUniform = findElementwiseUniform(spec);
+      spec = {
+        ...spec,
+        vectorize: safeWidth,
+        ...elementUniform ? { grid: elementwiseGrid(wgSize, {
+          vecWidth: safeWidth,
+          elementUniform
+        }) } : {}
+      };
+    }
+  }
+  const sgSupport = getSubgroupSupport();
+  const sgSize = spec.enableSubgroups ? sgSupport?.subgroupSize ?? 32 : sgSupport?.supported ? sgSupport.subgroupSize ?? 32 : 0;
+  const ctx = buildKernelIR(spec, sgSize);
+  if (sgSize > 0 && !spec.enableSubgroups && ctx._usesSubgroups) spec = {
+    ...spec,
+    enableSubgroups: true
+  };
+  let stmts = ctx.statements;
+  if (hasTileStatements(stmts)) {
+    const tpr = spec.noTPR ? 1 : autoDetectTPR(stmts, sgSize > 0);
+    setTPR(tpr);
+    setBlockLayouts(computeBlockLayouts(stmts, tpr));
+    if (tpr > 1) spec = {
+      ...spec,
+      enableSubgroups: true
+    };
+    if (!stmts.some((s) => s.kind === "let" && s.name === "thread_row")) stmts = [
+      {
+        kind: "let",
+        name: "thread_row",
+        dtype: "u32",
+        value: {
+          id: -1,
+          kind: "threadIdx",
+          dim: 1,
+          valueType: "scalar",
+          dataType: "u32"
+        }
+      },
+      {
+        kind: "let",
+        name: "thread_col",
+        dtype: "u32",
+        value: {
+          id: -1,
+          kind: "threadIdx",
+          dim: 0,
+          valueType: "scalar",
+          dataType: "u32"
+        }
+      },
+      ...stmts
+    ];
+    stmts = lowerTileStatements(stmts, spec);
+  }
+  if (spec.autoBarriers || getActiveTPR() > 1) stmts = insertBarriers(stmts);
+  stmts = autoCSE(stmts);
+  stmts = hoistLoopInvariants(stmts);
+  stmts = eliminateDeadCode$1(stmts);
+  try {
+    return compileImperativeKernel(spec, ctx, stmts);
+  } finally {
+    resetLoweringState();
+  }
+}
+function compileImperativeKernel(spec, ctx, overrideStatements) {
+  const lines = [];
+  const needsF16 = spec.enableF16 || ctx.sharedArrays.some((sa) => sa.elemType === "f16");
+  if (needsF16) lines.push("enable f16;");
+  if (spec.enableSubgroups) lines.push("enable subgroups;");
+  if (needsF16 || spec.enableSubgroups) lines.push("");
+  lines.push(emitUniformStruct(spec));
+  lines.push("");
+  lines.push(...emitBindings(spec));
+  lines.push("");
+  for (const sa of ctx.sharedArrays) {
+    const wgslType = sa.elemType;
+    lines.push(`var<workgroup> ${sa.name}: array<${wgslType}, ${sa.size}>;`);
+  }
+  for (const sa of ctx.vec4SharedArrays) lines.push(`var<workgroup> ${sa.name}: array<vec4<f32>, ${sa.size}>;`);
+  if (ctx.sharedArrays.length > 0 || ctx.vec4SharedArrays.length > 0) lines.push("");
+  if (spec.constants) {
+    for (const [name, value] of Object.entries(spec.constants)) if (Number.isInteger(value) && value >= 0) lines.push(`const ${name}: u32 = ${value}u;`);
+    else {
+      const s = String(value);
+      const numStr = s.includes(".") || s.includes("e") || s.includes("E") ? s : s + ".0";
+      lines.push(`const ${name}: f32 = ${numStr};`);
+    }
+    lines.push("");
+  }
+  const [logicalWgX, wgY] = typeof spec.workgroupSize === "number" ? [spec.workgroupSize, 1] : spec.workgroupSize;
+  const wgX = logicalWgX * getActiveTPR();
+  const hasFlatGidVec = (spec.vectorize ?? 0) > 1 && ctx.flatGlobalIdNodeIds.length > 0;
+  const needsGid = ctx.nodes.some((n) => n.kind === "globalId");
+  const needsWid = ctx.nodes.some((n) => n.kind === "programId") || hasFlatGidVec;
+  const needsLocalId = ctx.nodes.some((n) => n.kind === "threadIdx");
+  const needsLocalIdx = ctx.nodes.some((n) => n.kind === "localIndex") || hasFlatGidVec;
+  const needsNumWg = ctx.nodes.some((n) => n.kind === "numWorkgroups") || hasFlatGidVec;
+  const hasTileOps = ctx.sharedArrays.length > 0 || ctx.vec4SharedArrays.length > 0 || ctx.statements.some((s) => s.kind === "tileLoad" || s.kind === "tileStore" || s.kind === "tileLoad1d");
+  const emitWid = needsWid || hasTileOps;
+  const emitLocalId = needsLocalId || hasTileOps;
+  const emitLocalIdx = needsLocalIdx || hasTileOps;
+  lines.push(`@compute @workgroup_size(${wgX}, ${wgY})`);
+  lines.push(`fn main(`);
+  const params2 = [];
+  if (needsGid) params2.push(`  @builtin(global_invocation_id) gid: vec3<u32>`);
+  if (emitWid) params2.push(`  @builtin(workgroup_id) wid: vec3<u32>`);
+  if (emitLocalId) params2.push(`  @builtin(local_invocation_id) local_id: vec3<u32>`);
+  if (emitLocalIdx) params2.push(`  @builtin(local_invocation_index) local_idx: u32`);
+  if (needsNumWg) params2.push(`  @builtin(num_workgroups) num_wg: vec3<u32>`);
+  lines.push(params2.join(",\n") + (params2.length > 0 ? "," : ""));
+  lines.push(`) {`);
+  const bindings = /* @__PURE__ */ new Map();
+  const stmts = overrideStatements ?? ctx.statements;
+  if (spec.vectorize && spec.vectorize > 1) {
+    const vecWidth = spec.vectorize;
+    const flatGidNodeIds = ctx.flatGlobalIdNodeIds;
+    const v4 = {
+      nodes: /* @__PURE__ */ new Set(),
+      vars: /* @__PURE__ */ new Set()
+    };
+    if (flatGidNodeIds.length > 0) {
+      const wgTotal = typeof spec.workgroupSize === "number" ? spec.workgroupSize : spec.workgroupSize[0] * spec.workgroupSize[1];
+      lines.push(`  let _flatBase = (wid.x + wid.y * num_wg.x) * ${wgTotal * vecWidth}u + local_idx * ${vecWidth}u;`);
+      for (const nodeId of flatGidNodeIds) bindings.set(nodeId, `_flatBase`);
+    } else {
+      const gidXNodes = ctx.nodes.filter((n) => n.kind === "globalId" && n.dim === 0);
+      lines.push(`  let _base = gid.x * ${vecWidth}u;`);
+      for (const n of gidXNodes) bindings.set(n.id, `_base`);
+    }
+    for (const stmt of stmts) emitStatement(stmt, bindings, lines, 1, v4);
+  } else {
+    if (getActiveTPR() > 1) {
+      lines.push(`  let _logical_idx = local_idx / ${getActiveTPR()}u;`);
+      lines.push(`  let _sub_idx = local_idx % ${getActiveTPR()}u;`);
+    }
+    for (const stmt of stmts) emitStatement(stmt, bindings, lines, 1);
+  }
+  lines.push(`}`);
+  return lines.join("\n");
+}
+function evaluateStaticCondition(node) {
+  if (node.kind === "const") return node.value !== 0 ? "true" : "false";
+  if (node.kind === "cmp") {
+    const { op, lhs, rhs } = node;
+    if (lhs.kind === "const" && rhs.kind === "const") {
+      const l = lhs.value, r = rhs.value;
+      let result;
+      switch (op) {
+        case "eq":
+          result = l === r;
+          break;
+        case "ne":
+          result = l !== r;
+          break;
+        case "lt":
+          result = l < r;
+          break;
+        case "le":
+          result = l <= r;
+          break;
+        case "gt":
+          result = l > r;
+          break;
+        case "ge":
+          result = l >= r;
+          break;
+        default:
+          return "dynamic";
+      }
+      return result ? "true" : "false";
+    }
+  }
+  return "dynamic";
+}
+function emitUnrolledBlock(varName, iterVal, body, bindings, lines, depth, v4) {
+  const indent = "  ".repeat(depth);
+  lines.push(`${indent}{ // unrolled ${varName}=${iterVal}`);
+  lines.push(`${indent}  const ${varName} = ${iterVal}u;`);
+  const childBindings = new Map(bindings);
+  for (const s of body) emitStatement(s, childBindings, lines, depth + 1, v4);
+  lines.push(`${indent}}`);
+}
+function emitStatement(stmt, bindings, lines, depth, v4) {
+  const indent = "  ".repeat(depth);
+  switch (stmt.kind) {
+    case "let": {
+      const val = exprFor(stmt.value, bindings, v4);
+      lines.push(`${indent}let ${stmt.name} = ${val};`);
+      if (stmt.value.id >= 0) bindings.set(stmt.value.id, stmt.name);
+      if (v4 && isVec4(stmt.value, v4)) v4.vars.add(stmt.name);
+      break;
+    }
+    case "var": {
+      const val = exprFor(stmt.value, bindings, v4);
+      let dtype = stmt.dtype;
+      if (v4 && isVec4(stmt.value, v4)) {
+        dtype = `vec4<${dtype}>`;
+        v4.vars.add(stmt.name);
+      }
+      lines.push(`${indent}var ${stmt.name}: ${dtype} = ${val};`);
+      break;
+    }
+    case "varArray":
+      lines.push(`${indent}var ${stmt.name}: array<${stmt.elemType}, ${stmt.size}>;`);
+      if (!stmt.skipZeroInit) {
+        const zero = stmt.elemType === "f32" ? "0.0" : stmt.elemType === "f16" ? "f16(0.0)" : "0u";
+        if (stmt.size <= 4) for (let i = 0; i < stmt.size; i++) lines.push(`${indent}${stmt.name}[${i}u] = ${zero};`);
+        else {
+          lines.push(`${indent}for (var _zi = 0u; _zi < ${stmt.size}u; _zi = _zi + 1u) {`);
+          lines.push(`${indent}  ${stmt.name}[_zi] = ${zero};`);
+          lines.push(`${indent}}`);
+        }
+      }
+      break;
+    case "assign": {
+      const val = exprFor(stmt.value, bindings, v4);
+      lines.push(`${indent}${stmt.name} = ${val};`);
+      break;
+    }
+    case "addAssign": {
+      const val = exprFor(stmt.value, bindings, v4);
+      lines.push(`${indent}${stmt.name} = ${stmt.name} + ${val};`);
+      break;
+    }
+    case "indexAssign":
+    case "sharedWrite":
+    case "vec4ArrayWrite": {
+      const idx = exprFor(stmt.idx, bindings, v4);
+      const val = exprFor(stmt.value, bindings, v4);
+      lines.push(`${indent}${stmt.arrayName}[${idx}] = ${val};`);
+      break;
+    }
+    case "indexAddAssign":
+    case "vec4ArrayAddAssign": {
+      const idx = exprFor(stmt.idx, bindings, v4);
+      const val = exprFor(stmt.value, bindings, v4);
+      lines.push(`${indent}${stmt.arrayName}[${idx}] = ${stmt.arrayName}[${idx}] + ${val};`);
+      break;
+    }
+    case "forRange": {
+      const startConst = stmt.start.kind === "const" ? stmt.start.value : null;
+      const boundConst = stmt.bound.kind === "const" ? stmt.bound.value : null;
+      const tripCount = startConst !== null && boundConst !== null ? boundConst - startConst : null;
+      if (tripCount !== null && tripCount >= 0 && (stmt.unroll || tripCount <= 4) && tripCount !== null && startConst !== null) for (let i = 0; i < tripCount; i++) emitUnrolledBlock(stmt.varName, startConst + i, stmt.body, bindings, lines, depth, v4);
+      else {
+        const start = exprFor(stmt.start, bindings, v4);
+        const bound = exprFor(stmt.bound, bindings, v4);
+        lines.push(`${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + 1u) {`);
+        const childBindings = new Map(bindings);
+        for (const s of stmt.body) emitStatement(s, childBindings, lines, depth + 1, v4);
+        lines.push(`${indent}}`);
+      }
+      break;
+    }
+    case "forStride": {
+      const startConst = stmt.start.kind === "const" ? stmt.start.value : null;
+      const boundConst = stmt.bound.kind === "const" ? stmt.bound.value : null;
+      const strideVal = stmt.stride;
+      if (startConst !== null && boundConst !== null && strideVal > 0) {
+        const tripCount = Math.ceil((boundConst - startConst) / strideVal);
+        if (tripCount >= 0 && (stmt.unroll || tripCount <= 8)) {
+          for (let i = 0; i < tripCount; i++) emitUnrolledBlock(stmt.varName, startConst + i * strideVal, stmt.body, bindings, lines, depth, v4);
+          break;
+        }
+      }
+      if (startConst === null && boundConst !== null && strideVal > 0) {
+        const maxTrips = Math.ceil(boundConst / strideVal);
+        if (maxTrips >= 1 && (stmt.unroll ? maxTrips <= 16 : maxTrips <= 8)) {
+          const startExpr = exprFor(stmt.start, bindings, v4);
+          for (let i = 0; i < maxTrips; i++) {
+            const ivExpr = i === 0 ? startExpr : `(${startExpr} + ${i * strideVal}u)`;
+            lines.push(`${indent}{ // unrolled iter ${i}`);
+            lines.push(`${indent}  let ${stmt.varName} = ${ivExpr};`);
+            const needsGuard = i > 0 || boundConst % strideVal !== 0;
+            const childBindings = new Map(bindings);
+            if (needsGuard) {
+              lines.push(`${indent}  if (${stmt.varName} < ${boundConst}u) {`);
+              for (const s of stmt.body) emitStatement(s, childBindings, lines, depth + 2, v4);
+              lines.push(`${indent}  }`);
+            } else for (const s of stmt.body) emitStatement(s, childBindings, lines, depth + 1, v4);
+            lines.push(`${indent}}`);
+          }
+          break;
+        }
+      }
+      {
+        const start = exprFor(stmt.start, bindings, v4);
+        const bound = exprFor(stmt.bound, bindings, v4);
+        lines.push(`${indent}for (var ${stmt.varName} = ${start}; ${stmt.varName} < ${bound}; ${stmt.varName} = ${stmt.varName} + ${strideVal}u) {`);
+        const childBindings = new Map(bindings);
+        for (const s of stmt.body) emitStatement(s, childBindings, lines, depth + 1, v4);
+        lines.push(`${indent}}`);
+      }
+      break;
+    }
+    case "if": {
+      const cond = evaluateStaticCondition(stmt.condition);
+      if (cond === "true") for (const s of stmt.body) emitStatement(s, bindings, lines, depth, v4);
+      else if (cond === "dynamic") {
+        const condExpr = exprFor(stmt.condition, bindings, v4);
+        lines.push(`${indent}if (${condExpr}) {`);
+        const childBindings = new Map(bindings);
+        for (const s of stmt.body) emitStatement(s, childBindings, lines, depth + 1, v4);
+        lines.push(`${indent}}`);
+      }
+      break;
+    }
+    case "ifElse": {
+      const cond = evaluateStaticCondition(stmt.condition);
+      if (cond === "true") for (const s of stmt.body) emitStatement(s, bindings, lines, depth, v4);
+      else if (cond === "false") for (const s of stmt.elseBody) emitStatement(s, bindings, lines, depth, v4);
+      else {
+        const condExpr = exprFor(stmt.condition, bindings, v4);
+        lines.push(`${indent}if (${condExpr}) {`);
+        const childBindings1 = new Map(bindings);
+        for (const s of stmt.body) emitStatement(s, childBindings1, lines, depth + 1, v4);
+        lines.push(`${indent}} else {`);
+        const childBindings2 = new Map(bindings);
+        for (const s of stmt.elseBody) emitStatement(s, childBindings2, lines, depth + 1, v4);
+        lines.push(`${indent}}`);
+      }
+      break;
+    }
+    case "barrier":
+      lines.push(`${indent}workgroupBarrier();`);
+      break;
+    case "vec4VarArray":
+      lines.push(`${indent}var ${stmt.name}: array<vec4<f32>, ${stmt.size}>;`);
+      break;
+    case "vec4SharedArray":
+      break;
+    case "directStore": {
+      const idx = exprFor(stmt.idx, bindings, v4);
+      const val = exprFor(stmt.value, bindings, v4);
+      if (v4) lines.push(`${indent}${stmt.binding}[(${idx}) >> 2u] = ${val};`);
+      else lines.push(`${indent}${stmt.binding}[${idx}] = ${val};`);
+      break;
+    }
+    case "guardedStore": {
+      const guard = evaluateStaticCondition(stmt.condition);
+      if (guard === "false") break;
+      const idx = exprFor(stmt.idx, bindings, v4);
+      const val = exprFor(stmt.value, bindings, v4);
+      const storeIdx = v4 ? `(${idx}) >> 2u` : idx;
+      if (guard === "true") lines.push(`${indent}${stmt.binding}[${storeIdx}] = ${val};`);
+      else {
+        const condExpr = exprFor(stmt.condition, bindings, v4);
+        lines.push(`${indent}if (${condExpr}) {`);
+        lines.push(`${indent}  ${stmt.binding}[${storeIdx}] = ${val};`);
+        lines.push(`${indent}}`);
+      }
+      break;
+    }
+    case "atomicOp": {
+      const idx = exprFor(stmt.idx, bindings);
+      const val = exprFor(stmt.value, bindings);
+      lines.push(`${indent}${{
+        max: "atomicMax",
+        min: "atomicMin",
+        add: "atomicAdd",
+        or: "atomicOr",
+        and: "atomicAnd",
+        xor: "atomicXor",
+        exchange: "atomicExchange"
+      }[stmt.op]}(&${stmt.binding}[${idx}], ${val});`);
+      break;
+    }
+    case "atomicCAS": {
+      const idx = exprFor(stmt.idx, bindings);
+      const exp2 = exprFor(stmt.expected, bindings);
+      const des = exprFor(stmt.desired, bindings);
+      lines.push(`${indent}let _cas_result = atomicCompareExchangeWeak(&${stmt.binding}[${idx}], ${exp2}, ${des});`);
+      lines.push(`${indent}let ${stmt.oldValueVar} = _cas_result.old_value;`);
+      lines.push(`${indent}let ${stmt.exchangedVar} = select(0u, 1u, _cas_result.exchanged);`);
+      break;
+    }
+    case "return":
+      lines.push(`${indent}return;`);
+      break;
+  }
+}
+function someExprChild(node, fn) {
+  switch (node.kind) {
+    case "binary":
+    case "cmp":
+      return fn(node.lhs) || fn(node.rhs);
+    case "unary":
+    case "cast":
+    case "bitcast":
+      return fn(node.input);
+    case "select":
+      return fn(node.condition) || fn(node.trueVal) || fn(node.falseVal);
+    case "load":
+      return fn(node.offsets) || (node.mask ? fn(node.mask) : false);
+    case "sharedRead":
+    case "arrayRead":
+    case "vec4ArrayRead":
+    case "vec4SharedRead":
+      return fn(node.idx);
+    case "subgroupShuffleXor":
+      return fn(node.value) || fn(node.mask);
+    case "subgroupAdd":
+    case "subgroupMax":
+    case "subgroupMin":
+    case "subgroupBroadcastFirst":
+    case "subgroupInclusiveAdd":
+    case "vec4Splat":
+    case "vec4Component":
+      return fn(node.value);
+    case "vec4DynComponent":
+      return fn(node.value) || fn(node.idx);
+    case "vec4Construct":
+      return fn(node.x) || fn(node.y) || fn(node.z) || fn(node.w);
+    case "vec4NativeDot":
+    case "vec4Binary":
+      return fn(node.a) || fn(node.b);
+    case "vec4dot":
+      return node.a.some(fn) || node.b.some(fn);
+    default:
+      return false;
+  }
+}
+function forEachExprChild(node, fn) {
+  someExprChild(node, (child) => {
+    fn(child);
+    return false;
+  });
+}
+function forEachStmtExpr(stmt, fn) {
+  switch (stmt.kind) {
+    case "let":
+    case "var":
+      fn(stmt.value);
+      break;
+    case "assign":
+    case "addAssign":
+      fn(stmt.value);
+      break;
+    case "indexAssign":
+    case "indexAddAssign":
+      fn(stmt.idx);
+      fn(stmt.value);
+      break;
+    case "sharedWrite":
+      fn(stmt.idx);
+      fn(stmt.value);
+      break;
+    case "guardedStore":
+      fn(stmt.condition);
+      fn(stmt.idx);
+      fn(stmt.value);
+      break;
+    case "directStore":
+      fn(stmt.idx);
+      fn(stmt.value);
+      break;
+    case "atomicOp":
+      fn(stmt.idx);
+      fn(stmt.value);
+      break;
+    case "atomicCAS":
+      fn(stmt.idx);
+      fn(stmt.expected);
+      fn(stmt.desired);
+      break;
+    case "vec4ArrayWrite":
+    case "vec4ArrayAddAssign":
+      fn(stmt.idx);
+      fn(stmt.value);
+      break;
+    case "forRange":
+    case "forStride":
+      fn(stmt.start);
+      fn(stmt.bound);
+      break;
+    case "if":
+    case "ifElse":
+      fn(stmt.condition);
+      break;
+  }
+}
+function forEachBody(stmt, fn) {
+  if (stmt.kind === "forRange" || stmt.kind === "forStride" || stmt.kind === "if") fn(stmt.body);
+  else if (stmt.kind === "ifElse") {
+    fn(stmt.body);
+    fn(stmt.elseBody);
+  }
+}
+function collectExprNames(node, names) {
+  if (node.kind === "namedRef") names.add(node.name);
+  forEachExprChild(node, (child) => collectExprNames(child, names));
+}
+function collectAllStmtNames(stmt, names) {
+  forEachStmtExpr(stmt, (e) => collectExprNames(e, names));
+  forEachBody(stmt, (body) => {
+    for (const s of body) collectAllStmtNames(s, names);
+  });
+}
+function getSharedReadsFromExpr(node, names) {
+  if (node.kind === "sharedRead" || node.kind === "vec4SharedRead") names.add(node.arrayName);
+  forEachExprChild(node, (child) => getSharedReadsFromExpr(child, names));
+}
+function getSharedReadsFromStmt(stmt) {
+  const reads = /* @__PURE__ */ new Set();
+  forEachStmtExpr(stmt, (e) => getSharedReadsFromExpr(e, reads));
+  if (stmt.kind === "if") for (const s of stmt.body) for (const r of getSharedReadsFromStmt(s)) reads.add(r);
+  else if (stmt.kind === "ifElse") {
+    for (const s of stmt.body) for (const r of getSharedReadsFromStmt(s)) reads.add(r);
+    for (const s of stmt.elseBody) for (const r of getSharedReadsFromStmt(s)) reads.add(r);
+  }
+  return reads;
+}
+function getSharedWritesFromStmt(stmt) {
+  const writes = /* @__PURE__ */ new Set();
+  switch (stmt.kind) {
+    case "sharedWrite":
+      writes.add(stmt.arrayName);
+      break;
+    case "vec4ArrayWrite":
+    case "vec4ArrayAddAssign":
+      if (stmt.isShared) writes.add(stmt.arrayName);
+      break;
+    case "if":
+      for (const s of stmt.body) for (const w of getSharedWritesFromStmt(s)) writes.add(w);
+      break;
+    case "ifElse":
+      for (const s of stmt.body) for (const w of getSharedWritesFromStmt(s)) writes.add(w);
+      for (const s of stmt.elseBody) for (const w of getSharedWritesFromStmt(s)) writes.add(w);
+      break;
+  }
+  return writes;
+}
+function collectAllSharedReads(stmts, names) {
+  for (const stmt of stmts) {
+    forEachStmtExpr(stmt, (e) => getSharedReadsFromExpr(e, names));
+    forEachBody(stmt, (body) => collectAllSharedReads(body, names));
+  }
+}
+function collectAllSharedWrites(stmts, names) {
+  for (const stmt of stmts) {
+    for (const w of getSharedWritesFromStmt(stmt)) names.add(w);
+    if (stmt.kind === "forRange" || stmt.kind === "forStride") collectAllSharedWrites(stmt.body, names);
+  }
+}
+function insertBarriers(stmts) {
+  const result = [];
+  const dirtyArrays = /* @__PURE__ */ new Set();
+  for (const stmt of stmts) {
+    if (stmt.kind === "forRange" || stmt.kind === "forStride") {
+      const loopReads = /* @__PURE__ */ new Set();
+      collectAllSharedReads(stmt.body, loopReads);
+      let loopNeedsBarrier = false;
+      for (const r of loopReads) if (dirtyArrays.has(r)) {
+        loopNeedsBarrier = true;
+        break;
+      }
+      if (loopNeedsBarrier) {
+        result.push({ kind: "barrier" });
+        dirtyArrays.clear();
+      }
+      const newBody = insertBarriersForLoop(stmt.body);
+      result.push({
+        ...stmt,
+        body: newBody
+      });
+      const loopWrites = /* @__PURE__ */ new Set();
+      collectAllSharedWrites(stmt.body, loopWrites);
+      for (const w of loopWrites) dirtyArrays.add(w);
+      continue;
+    }
+    const reads = getSharedReadsFromStmt(stmt);
+    let needsBarrier = false;
+    for (const r of reads) if (dirtyArrays.has(r)) {
+      needsBarrier = true;
+      break;
+    }
+    if (needsBarrier) {
+      result.push({ kind: "barrier" });
+      dirtyArrays.clear();
+    }
+    if (stmt.kind === "barrier") dirtyArrays.clear();
+    result.push(stmt);
+    for (const w of getSharedWritesFromStmt(stmt)) dirtyArrays.add(w);
+  }
+  return result;
+}
+function insertBarriersForLoop(body) {
+  let result = insertBarriers(body);
+  const allWrites = /* @__PURE__ */ new Set();
+  const allReads = /* @__PURE__ */ new Set();
+  collectAllSharedWrites(body, allWrites);
+  collectAllSharedReads(body, allReads);
+  let needsBoundaryBarrier = false;
+  for (const w of allWrites) if (allReads.has(w)) {
+    needsBoundaryBarrier = true;
+    break;
+  }
+  if (needsBoundaryBarrier) {
+    const last = result[result.length - 1];
+    if (!last || last.kind !== "barrier") result = [...result, { kind: "barrier" }];
+  }
+  return result;
+}
+function collectModifiedNames(stmts, names) {
+  for (const stmt of stmts) switch (stmt.kind) {
+    case "assign":
+    case "addAssign":
+    case "var":
+      names.add(stmt.name);
+      break;
+    case "indexAssign":
+    case "indexAddAssign":
+    case "sharedWrite":
+    case "vec4ArrayWrite":
+    case "vec4ArrayAddAssign":
+      names.add(stmt.arrayName);
+      break;
+    case "atomicCAS":
+      names.add(stmt.oldValueVar);
+      names.add(stmt.exchangedVar);
+      break;
+    case "forRange":
+    case "forStride":
+      names.add(stmt.varName);
+      collectModifiedNames(stmt.body, names);
+      break;
+    case "if":
+      collectModifiedNames(stmt.body, names);
+      break;
+    case "ifElse":
+      collectModifiedNames(stmt.body, names);
+      collectModifiedNames(stmt.elseBody, names);
+      break;
+  }
+}
+function exprDependsOn(node, names) {
+  switch (node.kind) {
+    case "namedRef":
+      return names.has(node.name);
+    case "load":
+      return true;
+    case "sharedRead":
+    case "vec4SharedRead":
+      return names.has(node.arrayName) || someExprChild(node, (c) => exprDependsOn(c, names));
+    case "arrayRead":
+    case "vec4ArrayRead":
+      return names.has(node.arrayName) || someExprChild(node, (c) => exprDependsOn(c, names));
+    default:
+      return someExprChild(node, (c) => exprDependsOn(c, names));
+  }
+}
+function exprContainsLoad(node) {
+  if (node.kind === "load") return true;
+  return someExprChild(node, exprContainsLoad);
+}
+function hoistLoopInvariants(stmts) {
+  const result = [];
+  for (const stmt of stmts) if (stmt.kind === "forRange" || stmt.kind === "forStride") {
+    const innerHoisted = hoistLoopInvariants(stmt.body);
+    const variantNames = /* @__PURE__ */ new Set();
+    variantNames.add(stmt.varName);
+    collectModifiedNames(innerHoisted, variantNames);
+    const hoisted = [];
+    const remaining = [];
+    let seenBarrier = false;
+    for (const s of innerHoisted) {
+      if (s.kind === "barrier") {
+        seenBarrier = true;
+        remaining.push(s);
+        continue;
+      }
+      if (s.kind === "let" && !seenBarrier && !exprDependsOn(s.value, variantNames) && !exprContainsLoad(s.value)) hoisted.push(s);
+      else {
+        if (s.kind === "let") variantNames.add(s.name);
+        remaining.push(s);
+      }
+    }
+    result.push(...hoisted);
+    result.push({
+      ...stmt,
+      body: remaining
+    });
+  } else if (stmt.kind === "if") result.push({
+    ...stmt,
+    body: hoistLoopInvariants(stmt.body)
+  });
+  else if (stmt.kind === "ifElse") result.push({
+    ...stmt,
+    body: hoistLoopInvariants(stmt.body),
+    elseBody: hoistLoopInvariants(stmt.elseBody)
+  });
+  else result.push(stmt);
+  return result;
+}
+function mapStmtBodies(stmts, fn) {
+  return stmts.map((s) => {
+    switch (s.kind) {
+      case "forRange":
+      case "forStride":
+      case "if":
+        return {
+          ...s,
+          body: fn(s.body)
+        };
+      case "ifElse":
+        return {
+          ...s,
+          body: fn(s.body),
+          elseBody: fn(s.elseBody)
+        };
+      default:
+        return s;
+    }
+  });
+}
+function eliminateDeadCode$1(stmts) {
+  const processed = mapStmtBodies(stmts, eliminateDeadCode$1);
+  const usedNames = /* @__PURE__ */ new Set();
+  for (const s of processed) if (s.kind !== "let") collectAllStmtNames(s, usedNames);
+  for (let i = processed.length - 1; i >= 0; i--) {
+    const s = processed[i];
+    if (s.kind === "let" && usedNames.has(s.name)) collectExprNames(s.value, usedNames);
+  }
+  const nonLetNodeIds = /* @__PURE__ */ new Set();
+  for (const s of processed) if (s.kind !== "let") {
+    const nodeMap = /* @__PURE__ */ new Map();
+    collectStmtCSENodes(s, nodeMap);
+    for (const id of nodeMap.keys()) nonLetNodeIds.add(id);
+  }
+  return processed.filter((s) => {
+    if (s.kind !== "let") return true;
+    if (usedNames.has(s.name)) return true;
+    if (s.value.id >= 0 && nonLetNodeIds.has(s.value.id)) return true;
+    return false;
+  });
+}
+function isTrivialNode(node) {
+  switch (node.kind) {
+    case "const":
+    case "namedRef":
+    case "programId":
+    case "threadIdx":
+    case "localIndex":
+    case "globalId":
+    case "numWorkgroups":
+    case "uniform":
+      return true;
+    default:
+      return false;
+  }
+}
+function exprContainsMemoryRead(node) {
+  if (node.kind === "load" || node.kind === "sharedRead" || node.kind === "vec4SharedRead") return true;
+  return someExprChild(node, exprContainsMemoryRead);
+}
+function walkCSECandidates(node, visit) {
+  if (node.id < 0 || isTrivialNode(node)) return;
+  if (!exprContainsMemoryRead(node)) visit(node);
+  forEachExprChild(node, (child) => walkCSECandidates(child, visit));
+}
+function collectStmtCSENodes(stmt, nodes) {
+  forEachStmtExpr(stmt, (e) => walkCSECandidates(e, (n) => nodes.set(n.id, n)));
+  forEachBody(stmt, (body) => {
+    for (const s of body) collectStmtCSENodes(s, nodes);
+  });
+}
+function exprDepth(node) {
+  if (isTrivialNode(node) || node.id < 0) return 0;
+  switch (node.kind) {
+    case "binary":
+      return 1 + Math.max(exprDepth(node.lhs), exprDepth(node.rhs));
+    case "unary":
+    case "cast":
+    case "bitcast":
+      return 1 + exprDepth(node.input);
+    case "cmp":
+      return 1 + Math.max(exprDepth(node.lhs), exprDepth(node.rhs));
+    case "select":
+      return 1 + Math.max(exprDepth(node.condition), exprDepth(node.trueVal), exprDepth(node.falseVal));
+    default:
+      return 1;
+  }
+}
+function collectSubExprIds(node, ids) {
+  if (node.id < 0 || isTrivialNode(node)) return;
+  forEachExprChild(node, (child) => {
+    ids.add(child.id);
+    collectSubExprIds(child, ids);
+  });
+}
+function countStmtCSEOccurrences(stmt, out) {
+  forEachStmtExpr(stmt, (e) => walkCSECandidates(e, (n) => out.push({
+    id: n.id,
+    node: n
+  })));
+}
+function autoCSE(stmts, parentBoundIds = /* @__PURE__ */ new Set()) {
+  const refCounts = /* @__PURE__ */ new Map();
+  const letValueIds = /* @__PURE__ */ new Set();
+  for (let i = 0; i < stmts.length; i++) {
+    const stmt = stmts[i];
+    if (stmt.kind === "let" && stmt.value.id >= 0) letValueIds.add(stmt.value.id);
+    const nodeSet = /* @__PURE__ */ new Map();
+    collectStmtCSENodes(stmt, nodeSet);
+    for (const [id, node] of nodeSet) {
+      const entry = refCounts.get(id);
+      if (entry) entry.count++;
+      else refCounts.set(id, {
+        count: 1,
+        node,
+        firstIdx: i
+      });
+    }
+    const occurrences = [];
+    countStmtCSEOccurrences(stmt, occurrences);
+    const occCounts = /* @__PURE__ */ new Map();
+    for (const { id, node } of occurrences) {
+      const e = occCounts.get(id);
+      if (e) e.count++;
+      else occCounts.set(id, {
+        count: 1,
+        node
+      });
+    }
+    for (const [id, { count: occCount, node }] of occCounts) if (occCount > 1) {
+      const entry = refCounts.get(id);
+      if (entry && entry.count < occCount) entry.count = occCount;
+      else if (!entry) refCounts.set(id, {
+        count: occCount,
+        node,
+        firstIdx: i
+      });
+    }
+  }
+  const candidates = [];
+  for (const [id, { count, node, firstIdx }] of refCounts) if (count > 1 && !letValueIds.has(id) && !parentBoundIds.has(id) && exprDepth(node) > 1) candidates.push({
+    firstIdx,
+    node,
+    id
+  });
+  const candidateSubExprs = /* @__PURE__ */ new Map();
+  for (const c of candidates) {
+    const subs = /* @__PURE__ */ new Set();
+    collectSubExprIds(c.node, subs);
+    candidateSubExprs.set(c.id, subs);
+  }
+  const toBind = [];
+  for (const c of candidates) {
+    let parentCoverage = 0;
+    for (const other of candidates) if (other.id !== c.id && candidateSubExprs.get(other.id)?.has(c.id)) parentCoverage += refCounts.get(other.id)?.count ?? 0;
+    if (parentCoverage === 0 || (refCounts.get(c.id)?.count ?? 0) > parentCoverage) toBind.push({
+      firstIdx: c.firstIdx,
+      name: freshVar("cse"),
+      node: c.node,
+      id: c.id
+    });
+  }
+  const childBoundIds = new Set(parentBoundIds);
+  for (const b of toBind) childBoundIds.add(b.node.id);
+  for (const b of toBind) collectSubExprIds(b.node, childBoundIds);
+  const processed = mapStmtBodies(stmts, (body) => autoCSE(body, childBoundIds));
+  if (toBind.length === 0) return processed;
+  toBind.sort((a, b) => a.firstIdx - b.firstIdx);
+  const injByIdx = /* @__PURE__ */ new Map();
+  for (const b of toBind) {
+    if (!injByIdx.has(b.firstIdx)) injByIdx.set(b.firstIdx, []);
+    injByIdx.get(b.firstIdx)?.push(b);
+  }
+  for (const [, group] of injByIdx) if (group.length > 1) {
+    const subSets = /* @__PURE__ */ new Map();
+    for (const b of group) subSets.set(b.id, candidateSubExprs.get(b.id) ?? /* @__PURE__ */ new Set());
+    group.sort((a, b) => {
+      const bDepsA = subSets.get(b.id)?.has(a.id);
+      const aDepsB = subSets.get(a.id)?.has(b.id);
+      if (bDepsA && !aDepsB) return -1;
+      if (aDepsB && !bDepsA) return 1;
+      return 0;
+    });
+  }
+  const result = [];
+  for (let i = 0; i < processed.length; i++) {
+    const inj = injByIdx.get(i);
+    if (inj) for (const b of inj) result.push({
+      kind: "let",
+      name: b.name,
+      value: b.node,
+      dtype: b.node.dataType
+    });
+    result.push(processed[i]);
+  }
+  return result;
+}
+function emitUniformStruct(spec) {
+  const entries = Object.entries(spec.uniforms);
+  if (entries.length === 0) return "";
+  const lines = [];
+  lines.push(`struct TileConfig {`);
+  for (const [name, type] of entries) lines.push(`  ${name}: ${type},`);
+  lines.push(`};`);
+  return lines.join("\n");
+}
+function emitBindings(spec) {
+  const lines = [];
+  let bindingIndex = 0;
+  const uniformIdx = spec.uniformBindingIndex;
+  const entries = Object.entries(spec.bindings);
+  const hasUniforms = Object.keys(spec.uniforms).length > 0;
+  const isVec4Mode = (spec.vectorize ?? 0) > 1;
+  for (let i = 0; i < entries.length; i++) {
+    if (hasUniforms && uniformIdx !== void 0 && bindingIndex === uniformIdx) {
+      lines.push(`@group(0) @binding(${bindingIndex}) var<uniform> config: TileConfig;`);
+      bindingIndex++;
+    }
+    const [name, binding] = entries[i];
+    if (binding.storage === "atomic") lines.push(`@group(0) @binding(${bindingIndex}) var<storage, read_write> ${name}: array<atomic<${binding.type}>>;`);
+    else {
+      const access = binding.storage === "read" ? "read" : "read_write";
+      const elemType = isVec4Mode ? `vec4<${binding.type}>` : binding.type;
+      lines.push(`@group(0) @binding(${bindingIndex}) var<storage, ${access}> ${name}: array<${elemType}>;`);
+    }
+    bindingIndex++;
+  }
+  if (hasUniforms && (uniformIdx === void 0 || bindingIndex <= uniformIdx)) lines.push(`@group(0) @binding(${bindingIndex}) var<uniform> config: TileConfig;`);
+  return lines;
+}
+var ELEMENTWISE_UNIFORMS, NEEDS_SPLAT, DIMS;
+var init_tile_compiler = __esmMin((() => {
+  init_types();
+  init_tile_access_analysis();
+  init_tile_ir();
+  init_tile_lowering();
+  init_registry();
+  ELEMENTWISE_UNIFORMS = /* @__PURE__ */ new Set([
+    "size",
+    "total_elements",
+    "num_elements",
+    "outSize"
+  ]);
+  NEEDS_SPLAT = /* @__PURE__ */ new Set([
+    "and",
+    "or",
+    "xor",
+    "min",
+    "max",
+    "pow"
+  ]);
+  DIMS = [
+    "x",
+    "y",
+    "z"
+  ];
+}));
+function applyFusedOp(ctx, op, inputs) {
+  const a = inputs[0];
+  switch (op) {
+    case "neg":
+      return a.neg();
+    case "abs":
+      return a.abs();
+    case "exp":
+      return a.exp();
+    case "log":
+      return a.log();
+    case "sqrt":
+      return a.sqrt();
+    case "rsqrt":
+      return a.rsqrt();
+    case "tanh":
+      return a.tanh();
+    case "floor":
+      return a.floor();
+    case "ceil":
+      return a.ceil();
+    case "sin":
+      return a.sin();
+    case "cos":
+      return a.cos();
+    case "round":
+      return a.round();
+    case "sign":
+      return a.sign();
+    case "add":
+      return a.add(inputs[1]);
+    case "sub":
+      return a.sub(inputs[1]);
+    case "mul":
+      return a.mul(inputs[1]);
+    case "div":
+      return a.div(inputs[1]);
+    case "pow":
+      return a.pow(inputs[1]);
+    case "min":
+      return a.min(inputs[1]);
+    case "max":
+      return a.max(inputs[1]);
+    case "mod":
+      return a.mod(inputs[1]);
+    case "relu":
+      return a.gt(ctx.f32(0)).select(a, ctx.f32(0));
+    case "sigmoid":
+      return ctx.f32(1).div(ctx.f32(1).add(a.neg().exp()));
+    case "silu":
+      return a.div(ctx.f32(1).add(a.neg().exp()));
+    case "softplus":
+      return ctx.f32(1).add(a.exp()).log();
+    case "gelu":
+    case "gelu_tanh": {
+      const x3 = a.mul(a).mul(a);
+      const clamped = ctx.f32(0.7978845608).mul(a.add(ctx.f32(0.044715).mul(x3))).max(ctx.f32(-10)).min(ctx.f32(10));
+      return a.mul(ctx.f32(0.5)).mul(ctx.f32(1).add(clamped.tanh()));
+    }
+    case "gelu_erf": {
+      const ax = a.abs().mul(ctx.f32(Math.SQRT1_2));
+      const t = ctx.f32(1).div(ctx.f32(1).add(ctx.f32(0.3275911).mul(ax)));
+      const poly = ctx.f32(1.061405429).mul(t).add(ctx.f32(-1.453152027)).mul(t).add(ctx.f32(1.421413741)).mul(t).add(ctx.f32(-0.284496736)).mul(t).add(ctx.f32(0.254829592)).mul(t);
+      const erfAbs = ctx.f32(1).sub(poly.mul(ax.neg().mul(ax).exp()));
+      const erf2 = a.sign().mul(erfAbs);
+      return a.mul(ctx.f32(0.5)).mul(ctx.f32(1).add(erf2));
+    }
+    case "eq":
+      return a.eq(inputs[1]).select(ctx.f32(1), ctx.f32(0));
+    case "ne":
+      return a.ne(inputs[1]).select(ctx.f32(1), ctx.f32(0));
+    case "lt":
+      return a.lt(inputs[1]).select(ctx.f32(1), ctx.f32(0));
+    case "le":
+      return a.le(inputs[1]).select(ctx.f32(1), ctx.f32(0));
+    case "gt":
+      return a.gt(inputs[1]).select(ctx.f32(1), ctx.f32(0));
+    case "ge":
+      return a.ge(inputs[1]).select(ctx.f32(1), ctx.f32(0));
+    case "where":
+      return inputs[0].gt(ctx.f32(0)).select(inputs[1], inputs[2]);
+    case "cast_f32":
+      return a.toF32();
+    case "cast_f16":
+      return a.toF16();
+    case "cast_i32":
+      return a.toI32();
+    case "cast_u32":
+      return a.toU32();
+    case "isfinite": {
+      const bits = a.bitcastTo("u32");
+      const exponentMask = ctx.u32(2139095040);
+      return bits.and(exponentMask).ne(exponentMask).select(ctx.f32(1), ctx.f32(0));
+    }
+    default:
+      throw new Error(`Unsupported fusion op for tile-IR: ${op}`);
+  }
+}
+function emitBroadcastIndex(ctx, outputShape, inputShape, outputIdx, _inputName) {
+  if (sizeOf(inputShape) === 1) return ctx.u32(0);
+  if (outputShape.length === inputShape.length && outputShape.every((d, i) => d === inputShape[i])) return outputIdx;
+  const rank2 = outputShape.length;
+  const inputRank = inputShape.length;
+  const rankDiff = rank2 - inputRank;
+  const outCoords = ctx.decomposeIndex(outputIdx, outputShape);
+  const inCoords = [];
+  for (let i = 0; i < inputRank; i++) {
+    const outIdx = i + rankDiff;
+    if (inputShape[i] === 1) inCoords.push(ctx.u32(0));
+    else inCoords.push(outCoords[outIdx]);
+  }
+  const inStrides = [];
+  for (let i = 0; i < inputRank; i++) {
+    let s = 1;
+    for (let j = i + 1; j < inputRank; j++) s *= inputShape[j];
+    inStrides.push(s);
+  }
+  return ctx.linearizeIndex(inCoords, inStrides);
+}
+function generateFusedKernelTileIR(recipe, options = {}) {
+  const meta = computeKernelMeta(recipe, options);
+  const { vectorWidth, workItems, workgroupSize, gridSizeX } = meta;
+  const physicalBinding = [];
+  let nextBinding = 0;
+  for (let i = 0; i < recipe.inputs.length; i++) if (recipe.inputs[i].isInlinedConstant) physicalBinding.push(null);
+  else physicalBinding.push(nextBinding++);
+  const inputBindingCount = nextBinding;
+  const bindings = {};
+  for (let i = 0; i < recipe.inputs.length; i++) {
+    if (physicalBinding[i] === null) continue;
+    const input = recipe.inputs[i];
+    bindings[`in${i}`] = {
+      storage: "read",
+      type: dtypeToTileIR(input.dtype)
+    };
+  }
+  for (let i = 0; i < recipe.outputs.length; i++) {
+    const output = recipe.outputs[i];
+    bindings[`out${i}`] = {
+      storage: "read_write",
+      type: dtypeToTileIR(output.dtype)
+    };
+  }
+  const uniformBindingIndex = inputBindingCount + recipe.outputs.length;
+  const needsF16 = recipe.inputs.some((inp) => inp.dtype === "f16") || recipe.outputs.some((o) => o.dtype === "f16") || recipe.nodes.some((n) => n.dtype === "f16");
+  const outputShape = recipe.outputs[0].shape;
+  return {
+    source: compileTileKernel({
+      name: `fused_${recipe.id}`,
+      workgroupSize,
+      bindings,
+      uniforms: { total_elements: "u32" },
+      uniformBindingIndex,
+      enableF16: needsF16 || void 0,
+      vectorize: vectorWidth > 1 ? vectorWidth : void 0,
+      grid: elementwiseGrid(workgroupSize, { vecWidth: vectorWidth }),
+      kernel: (ctx) => {
+        const idx = ctx.elementIndex(workgroupSize, "total_elements");
+        const inputExprs = /* @__PURE__ */ new Map();
+        for (let i = 0; i < recipe.inputs.length; i++) {
+          const input = recipe.inputs[i];
+          if (input.isInlinedConstant && input.inlinedValue !== void 0) {
+            inputExprs.set(i, ctx[dtypeToTileIR(input.dtype)](input.inlinedValue));
+            continue;
+          }
+          if (sizeOf(input.shape) === 1) {
+            const val = ctx.emitLet(`v${i}`, ctx.load(`in${i}`, ctx.u32(0)));
+            inputExprs.set(i, val);
+          } else if (needsBroadcast(outputShape, input.shape)) {
+            const broadIdx = emitBroadcastIndex(ctx, outputShape, input.shape, idx);
+            const val = ctx.emitLet(`v${i}`, ctx.load(`in${i}`, broadIdx));
+            inputExprs.set(i, val);
+          } else {
+            const val = ctx.emitLet(`v${i}`, ctx.load(`in${i}`, idx));
+            inputExprs.set(i, val);
+          }
+        }
+        const nodeExprs = /* @__PURE__ */ new Map();
+        for (const node of recipe.nodes) {
+          const nodeInputs = [];
+          for (const inputId of node.inputs) if (inputId < 0) {
+            const inputIdx = -inputId - 1;
+            const expr = inputExprs.get(inputIdx);
+            if (!expr) throw new Error(`Missing input expr for external input ${inputIdx}`);
+            nodeInputs.push(expr);
+          } else {
+            const expr = nodeExprs.get(inputId);
+            if (!expr) throw new Error(`Missing node expr for node ${inputId}`);
+            nodeInputs.push(expr);
+          }
+          const result = applyFusedOp(ctx, node.op, nodeInputs);
+          const named = ctx.emitLet(`t${node.id}`, result);
+          nodeExprs.set(node.id, named);
+        }
+        const totalElements = ctx.uniform("total_elements");
+        for (let i = 0; i < recipe.outputs.length; i++) {
+          const output = recipe.outputs[i];
+          const val = nodeExprs.get(output.nodeId);
+          if (!val) throw new Error(`Missing output expr for node ${output.nodeId}`);
+          ctx.blockStore(`out${i}`, idx, totalElements, val);
+        }
+      }
+    }),
+    workgroupSize,
+    inputBindings: inputBindingCount,
+    cacheKey: meta.cacheKey,
+    vectorWidth,
+    workItems,
+    gridSizeX
+  };
+}
+function dtypeToTileIR(dtype) {
+  return dtype === "bool" ? "f32" : dtype;
+}
+var init_fusion_tile_ir = __esmMin((() => {
+  init_shape();
+  init_fusion_types();
+  init_tile_compiler();
+  init_tile_ir();
+}));
+function applyBlockEpilogue(ctx, ops, acc, epilogue, addressing) {
+  const { offsN, threadOutBase, threadOutStride } = addressing;
+  for (const op of epilogue.ops) switch (op.kind) {
+    case "none":
+      break;
+    case "bias":
+      acc.add_(ops.load1d(`epilogue_in${op.inputIndex}`, offsN));
+      break;
+    case "unary":
+      acc.apply_((x) => applyFusedOp(ctx, op.op, [x]));
+      break;
+    case "binary": {
+      const binBlock = ops.load(`epilogue_in${op.inputIndex}`, {
+        kind: "thread",
+        base: threadOutBase,
+        stride: threadOutStride
+      }, {
+        rows: acc.rows,
+        cols: acc.cols
+      });
+      switch (op.op) {
+        case "add":
+          acc.add_(binBlock);
+          break;
+        case "sub":
+          acc.sub_(binBlock);
+          break;
+        case "mul":
+          acc.mul_(binBlock);
+          break;
+        default:
+          throw new Error(`Unsupported binary epilogue: ${op.op}`);
+      }
+      break;
+    }
+    case "cast":
+      if (op.toDtype === "f16") acc.castTo_("f16");
+      break;
+  }
+  if (epilogue.outputDtype === "f16" && !epilogue.ops.some((o) => o.kind === "cast")) acc.castTo_("f16");
+}
+function createTiledMatmulKernel(options) {
+  const { config, transposeMode, dtype, dtypeB: dtypeBOpt, epilogue, batched, inputCastA, inputCastB, kSplit, swapGrid } = options;
+  const { tileM, tileN, tileK, threadTileM, threadTileN } = config;
+  const wgSize = getWorkgroupSize(config);
+  const wgSizeX = wgSize.x;
+  const wgSizeY = wgSize.y;
+  const dtypeB = dtypeBOpt ?? dtype;
+  const wgslDtypeA = inputCastA ? "f32" : dtype;
+  const wgslDtypeB = inputCastB ? "f32" : dtypeB;
+  const outputDtype = kSplit ? "f32" : epilogue?.outputDtype ?? (dtype === "f32" || dtypeB === "f32" ? "f32" : dtype);
+  const needsF16 = wgslDtypeA === "f16" || wgslDtypeB === "f16" || outputDtype === "f16";
+  const bindings = {
+    a: {
+      storage: "read",
+      type: wgslDtypeA
+    },
+    b: {
+      storage: "read",
+      type: wgslDtypeB
+    },
+    out: {
+      storage: "read_write",
+      type: epilogue?.outputDtype ?? outputDtype
+    }
+  };
+  if (epilogue) for (let i = 0; i < epilogue.additionalInputCount; i++) bindings[`epilogue_in${i}`] = {
+    storage: "read",
+    type: "f32"
+  };
+  const transA = transposeMode === "TN" || transposeMode === "TT";
+  const transB = transposeMode === "NT" || transposeMode === "TT";
+  let postAcc;
+  if (epilogue && epilogue.ops.length > 0 && !kSplit) postAcc = (ctx, ops, acc, addressing) => applyBlockEpilogue(ctx, ops, acc, epilogue, addressing);
+  const params2 = {
+    tileM,
+    tileN,
+    tileK,
+    threadTileM,
+    threadTileN,
+    transA,
+    transB,
+    outputDtype
+  };
+  return {
+    name: "tiledMatmul",
+    workgroupSize: [wgSizeX, wgSizeY],
+    enableF16: needsF16,
+    uniformBindingIndex: 3,
+    bindings,
+    uniforms: {
+      m: "u32",
+      n: "u32",
+      k: "u32",
+      lda: "u32",
+      ldb: "u32",
+      ldc: "u32",
+      alpha: "f32",
+      batchSize: "u32",
+      batchStrideA: "u32",
+      batchStrideB: "u32",
+      batchStrideC: "u32"
+    },
+    grid: singleWorkgroup(),
+    kernel: (ctx) => matmulKernelBlockOps(ctx, {
+      batched,
+      kSplit,
+      swapGrid
+    }, params2, postAcc)
+  };
+}
+function matmulKernelBlockOps(ctx, opts, p, postAccumulate) {
+  const { batched, kSplit, swapGrid } = opts;
+  const { tileM, tileN, tileK, threadTileM, threadTileN, transA, transB, outputDtype } = p;
+  const { threadRow, threadCol } = ctx.configureTiles({
+    threadTileM,
+    threadTileN
+  });
+  const m = ctx.emitLet("m", ctx.uniform("m"));
+  const n = ctx.emitLet("n", ctx.uniform("n"));
+  const k = ctx.emitLet("k", ctx.uniform("k"));
+  const lda = ctx.emitLet("lda", ctx.uniform("lda"));
+  const ldb = ctx.emitLet("ldb", ctx.uniform("ldb"));
+  const ldc = ctx.emitLet("ldc", ctx.uniform("ldc"));
+  const alpha2 = ctx.emitLet("alpha", ctx.uniform("alpha"));
+  let batchOffA;
+  let batchOffB;
+  let batchOffC;
+  let splitIdx;
+  if (kSplit) {
+    splitIdx = ctx.emitLet("split_idx", ctx.programId(2));
+    batchOffA = ctx.emitLet("batch_offset_a", ctx.const(0, "u32"));
+    batchOffB = ctx.emitLet("batch_offset_b", ctx.const(0, "u32"));
+    batchOffC = ctx.const(0, "u32");
+  } else if (batched) {
+    const batchIdx = ctx.emitLet("batch_idx", ctx.programId(2));
+    batchOffA = ctx.emitLet("batch_offset_a", batchIdx.mul(ctx.uniform("batchStrideA")));
+    batchOffB = ctx.emitLet("batch_offset_b", batchIdx.mul(ctx.uniform("batchStrideB")));
+    batchOffC = ctx.emitLet("batch_offset_c", batchIdx.mul(ctx.uniform("batchStrideC")));
+  } else {
+    const zero = ctx.const(0, "u32");
+    batchOffA = zero;
+    batchOffB = zero;
+    batchOffC = zero;
+  }
+  const pidRow = swapGrid ? ctx.programId(0) : ctx.programId(1);
+  const pidCol = swapGrid ? ctx.programId(1) : ctx.programId(0);
+  const wgRow = ctx.emitLet("wg_row", pidRow.mul(ctx.const(tileM, "u32")));
+  const wgCol = ctx.emitLet("wg_col", pidCol.mul(ctx.const(tileN, "u32")));
+  const offsM = ctx.arange(wgRow, tileM);
+  const offsN = ctx.arange(wgCol, tileN);
+  const cOne = ctx.const(1, "u32");
+  const strideAm = transA ? cOne : lda;
+  const strideAk = transA ? lda : cOne;
+  const strideBk = transB ? cOne : ldb;
+  const strideBn = transB ? ldb : cOne;
+  const acc = ctx.zeros(threadTileM, threadTileN);
+  let kStart;
+  let kEnd;
+  let numKTiles;
+  const cTK = ctx.const(tileK, "u32");
+  if (kSplit) {
+    const kPerSplit = ctx.emitLet("k_per_split", k.add(ctx.const(kSplit - 1, "u32")).div(ctx.const(kSplit, "u32")));
+    kStart = ctx.emitLet("k_start", splitIdx.mul(kPerSplit));
+    kEnd = ctx.emitLet("k_end", kStart.add(kPerSplit).min(k));
+    numKTiles = ctx.emitLet("num_k_tiles", kEnd.sub(kStart).add(ctx.const(tileK - 1, "u32")).div(cTK));
+  } else {
+    numKTiles = ctx.emitLet("num_k_tiles", k.add(ctx.const(tileK - 1, "u32")).div(cTK));
+    kStart = ctx.const(0, "u32");
+    kEnd = k;
+  }
+  ctx.forRange(ctx.const(0, "u32"), numKTiles, (kTile) => {
+    const kOffset = ctx.emitLet("k_offset", kStart.add(kTile.mul(cTK)));
+    const offsK = ctx.arange(kOffset, tileK);
+    const aPtr = ctx.tilePtr(batchOffA, offsM.outer(strideAm), offsK.inner(strideAk));
+    const aMask = ctx.tileMask(offsM.lt(m), offsK.lt(kEnd));
+    const a = ctx.load2D("a", aPtr, aMask);
+    const bPtr = ctx.tilePtr(batchOffB, offsK.outer(strideBk), offsN.inner(strideBn));
+    const bMask = ctx.tileMask(offsK.lt(kEnd), offsN.lt(n));
+    const b = ctx.load2D("b", bPtr, bMask);
+    ctx.dotAccum(a, b, acc);
+  });
+  if (kSplit) {
+    const splitBase = ctx.emitLet("split_base", splitIdx.mul(m.mul(n)));
+    const outPtr = ctx.tilePtr(splitBase, offsM.outer(ldc), offsN.inner(cOne));
+    const outMask = ctx.tileMask(offsM.lt(m), offsN.lt(n));
+    ctx.store2D("out", acc, outPtr, outMask);
+  } else {
+    acc.mul_(alpha2.toF32());
+    if (postAccumulate) {
+      const threadOutBase = ctx.emitLet("thread_out_base", batchOffC.add(wgRow.add(threadRow.mul(ctx.const(threadTileM, "u32"))).mul(ldc).add(wgCol.add(threadCol.mul(ctx.const(threadTileN, "u32"))))));
+      postAccumulate(ctx, ctx.tileOps, acc, {
+        offsN,
+        threadOutBase,
+        threadOutStride: ldc
+      });
+    } else if (outputDtype === "f16") acc.castTo_("f16");
+    const outPtr = ctx.tilePtr(batchOffC, offsM.outer(ldc), offsN.inner(cOne));
+    const outMask = ctx.tileMask(offsM.lt(m), offsN.lt(n));
+    ctx.store2D("out", acc, outPtr, outMask);
+  }
+}
+function createKSplitReductionKernel(kSplitCount, outputDtype) {
+  return {
+    name: "kSplitReduce",
+    workgroupSize: 256,
+    enableF16: outputDtype === "f16",
+    bindings: {
+      partials: {
+        storage: "read",
+        type: "f32"
+      },
+      out: {
+        storage: "read_write",
+        type: outputDtype
+      }
+    },
+    uniforms: {
+      totalElements: "u32",
+      alpha: "f32"
+    },
+    grid: ceilDivGrid(256, "totalElements"),
+    kernel(ctx) {
+      const idx = ctx.emitLet("idx", ctx.globalId(0));
+      const totalElements = ctx.uniform("totalElements");
+      ctx.ifThen(idx.ge(totalElements), () => {
+        ctx.emitReturn();
+      });
+      const alpha2 = ctx.uniform("alpha").bitcastTo("f32");
+      const sumVar = ctx.emitVar("sum", "f32", ctx.load("partials", idx));
+      for (let p = 1; p < kSplitCount; p++) sumVar.addAssign(ctx.load("partials", idx.add(totalElements.mul(ctx.u32(p)))));
+      const result = sumVar.get().mul(alpha2);
+      if (outputDtype === "f16") ctx.emitStore("out", idx, result.toF16());
+      else ctx.emitStore("out", idx, result);
+    }
+  };
+}
+function generateTiledMatmulShaderTileIR(options) {
+  return compileTileKernel(createTiledMatmulKernel(options));
+}
+function generateKSplitReductionShaderTileIR(kSplitCount, outputDtype) {
+  return compileTileKernel(createKSplitReductionKernel(kSplitCount, outputDtype));
+}
+var init_tile_matmul = __esmMin((() => {
+  init_fusion_tile_ir();
+  init_tile_ir();
+  init_types();
+  init_tile_compiler();
+}));
+function getPerShapeKey(m, n, k, dtype) {
+  return `${m}_${n}_${k}_${dtype}`;
+}
+function setAutotuneEnabled(enabled) {
+  if (enabled) autotuneCounter++;
+  else autotuneCounter = 0;
+}
+function isAutotuneEnabled() {
+  return autotuneCounter > 0;
+}
+function getConfigForShape(shapeClass, dtype, hasEpilogue = false, m, n, k) {
+  if (!hasEpilogue && m !== void 0 && n !== void 0 && k !== void 0) {
+    const perShapeHit = perShapeTuningCache.get(getPerShapeKey(m, n, k, dtype));
+    if (perShapeHit) return perShapeHit;
+  }
+  const key = `${shapeClass}_${dtype}_${hasEpilogue ? "epilogue" : "bare"}`;
+  const cached = tuningCache.get(key);
+  if (cached) return cached;
+  return getDefaultConfigForShape(shapeClass, hasEpilogue, m, n, k);
+}
+function resetMatmulState() {
+  pipelineCache.clear();
+  tuningCache.clear();
+  perShapeTuningCache.clear();
+  autotuneCounter = 0;
+  autotuningInProgress.clear();
+}
+function benchmarkDispatch(device, queue, pipeline, a, b, out, m, n, config, paramsBuffer, kSplitFactor, kSplitTempBuffer, reductionPipeline, reduceParamsBuffer) {
+  const workgroupsX = Math.ceil(n / config.tileN);
+  const workgroupsY = Math.ceil(m / config.tileM);
+  if (kSplitFactor >= 2 && kSplitTempBuffer && reductionPipeline && reduceParamsBuffer) {
+    const matmulBG = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: a }
+        },
+        {
+          binding: 1,
+          resource: { buffer: b }
+        },
+        {
+          binding: 2,
+          resource: { buffer: kSplitTempBuffer }
+        },
+        {
+          binding: 3,
+          resource: { buffer: paramsBuffer }
+        }
+      ]
+    });
+    const reduceBG = device.createBindGroup({
+      layout: reductionPipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: kSplitTempBuffer }
+        },
+        {
+          binding: 1,
+          resource: { buffer: out }
+        },
+        {
+          binding: 2,
+          resource: { buffer: reduceParamsBuffer }
+        }
+      ]
+    });
+    const encoder = device.createCommandEncoder();
+    const pass1 = encoder.beginComputePass();
+    pass1.setPipeline(pipeline);
+    pass1.setBindGroup(0, matmulBG);
+    pass1.dispatchWorkgroups(workgroupsX, workgroupsY, kSplitFactor);
+    pass1.end();
+    const pass2 = encoder.beginComputePass();
+    pass2.setPipeline(reductionPipeline);
+    pass2.setBindGroup(0, reduceBG);
+    pass2.dispatchWorkgroups(Math.ceil(m * n / 256));
+    pass2.end();
+    queue.submit([encoder.finish()]);
+  } else {
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: a }
+        },
+        {
+          binding: 1,
+          resource: { buffer: b }
+        },
+        {
+          binding: 2,
+          resource: { buffer: out }
+        },
+        {
+          binding: 3,
+          resource: { buffer: paramsBuffer }
+        }
+      ]
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(workgroupsX, workgroupsY, 1);
+    pass.end();
+    queue.submit([encoder.finish()]);
+  }
+}
+async function autotuneIfNeeded(device, queue, m, n, k, dtype) {
+  const perShapeKey = getPerShapeKey(m, n, k, dtype);
+  const perShapeCached = perShapeTuningCache.get(perShapeKey);
+  if (perShapeCached) return perShapeCached;
+  if (autotuningInProgress.has(perShapeKey)) return DEFAULT_CONFIG;
+  const includeSubgroups = getSubgroupSupport()?.supported ?? false;
+  autotuningInProgress.add(perShapeKey);
+  try {
+    const shapeClass = classifyShape(m, n, k, 1);
+    const baseConfig = getDefaultConfigForShape(shapeClass, false, m, n, k);
+    const candidates = generateNeighborConfigs(baseConfig, includeSubgroups);
+    const candidateKeys = new Set(candidates.map((c) => `${c.tileM}_${c.tileN}_${c.tileK}_${c.threadTileM}_${c.threadTileN}_${c.vectorWidth}_${c.useSubgroups}`));
+    const defaultKey = `${DEFAULT_CONFIG.tileM}_${DEFAULT_CONFIG.tileN}_${DEFAULT_CONFIG.tileK}_${DEFAULT_CONFIG.threadTileM}_${DEFAULT_CONFIG.threadTileN}_${DEFAULT_CONFIG.vectorWidth}_${DEFAULT_CONFIG.useSubgroups}`;
+    if (!candidateKeys.has(defaultKey)) candidates.push(DEFAULT_CONFIG);
+    const aSize = m * k * 4;
+    const bSize = k * n * 4;
+    const outSize = m * n * 4;
+    const aBuffer = device.createBuffer({
+      size: aSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+    });
+    const bBuffer = device.createBuffer({
+      size: bSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+    });
+    const outBuffer = device.createBuffer({
+      size: outSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+    });
+    const paramsData = packMatmulParams(m, n, k, k, n, n, 1, 1, m * k, k * n, m * n);
+    const paramsBuffer = device.createBuffer({
+      size: Math.max(paramsData.byteLength, 48),
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    queue.writeBuffer(paramsBuffer, 0, paramsData);
+    const totalElements = m * n;
+    let maxKSplitFactor = 0;
+    for (const config of candidates) {
+      const ksf = computeKSplitFactor(Math.ceil(n / config.tileN) * Math.ceil(m / config.tileM), k, config.tileK, 1, false);
+      if (ksf > maxKSplitFactor) maxKSplitFactor = ksf;
+    }
+    let kSplitTempBuffer;
+    let reduceParamsBuffer;
+    if (maxKSplitFactor >= 2) {
+      const tempBytes = maxKSplitFactor * totalElements * 4;
+      kSplitTempBuffer = device.createBuffer({
+        size: tempBytes,
+        usage: GPUBufferUsage.STORAGE
+      });
+      const reduceParamsBuf = /* @__PURE__ */ new ArrayBuffer(8);
+      const reduceU32 = new Uint32Array(reduceParamsBuf);
+      const reduceF32 = new Float32Array(reduceParamsBuf);
+      reduceU32[0] = totalElements;
+      reduceF32[1] = 1;
+      reduceParamsBuffer = device.createBuffer({
+        size: 8,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+      });
+      queue.writeBuffer(reduceParamsBuffer, 0, reduceU32);
+    }
+    const flops = 2 * m * n * k;
+    let bestConfig = baseConfig;
+    let bestGflops = 0;
+    try {
+      for (const config of candidates) try {
+        const transposeMode = getTransposeMode(false, false);
+        const kSplitFactor = computeKSplitFactor(Math.ceil(n / config.tileN) * Math.ceil(m / config.tileM), k, config.tileK, 1, false);
+        const pipeline = getOrCreatePipeline(device, kSplitFactor >= 2 ? {
+          config,
+          transposeMode,
+          dtype,
+          batched: false,
+          kSplit: kSplitFactor
+        } : {
+          config,
+          transposeMode,
+          dtype,
+          batched: false
+        });
+        let reductionPipeline;
+        if (kSplitFactor >= 2) reductionPipeline = getOrCreateReductionPipeline(device, kSplitFactor, dtype);
+        for (let i = 0; i < 2; i++) benchmarkDispatch(device, queue, pipeline, aBuffer, bBuffer, outBuffer, m, n, config, paramsBuffer, kSplitFactor, kSplitTempBuffer, reductionPipeline, reduceParamsBuffer);
+        await queue.onSubmittedWorkDone?.();
+        const times = [];
+        for (let i = 0; i < 3; i++) {
+          const start = performance.now();
+          benchmarkDispatch(device, queue, pipeline, aBuffer, bBuffer, outBuffer, m, n, config, paramsBuffer, kSplitFactor, kSplitTempBuffer, reductionPipeline, reduceParamsBuffer);
+          await queue.onSubmittedWorkDone?.();
+          times.push(performance.now() - start);
+        }
+        times.sort((a, b) => a - b);
+        const gflops = flops / (times[Math.floor(times.length / 2)] * 1e6);
+        if (gflops > bestGflops) {
+          bestGflops = gflops;
+          bestConfig = config;
+        }
+      } catch {
+      }
+    } finally {
+      aBuffer.destroy();
+      bBuffer.destroy();
+      outBuffer.destroy();
+      paramsBuffer.destroy();
+      kSplitTempBuffer?.destroy();
+      reduceParamsBuffer?.destroy();
+    }
+    perShapeTuningCache.set(perShapeKey, bestConfig);
+    cacheTuningResult({
+      config: bestConfig,
+      gflopsPerSec: bestGflops,
+      medianMs: bestGflops > 0 ? flops / (bestGflops * 1e6) : Infinity,
+      shapeClass,
+      dtype
+    });
+    return bestConfig;
+  } finally {
+    autotuningInProgress.delete(perShapeKey);
+  }
+}
+async function pretuneMatmulShapes(device, queue, shapes, dtype = "f32") {
+  if (!(typeof process !== "undefined" && define_process_env_default$1?.TORCHLETTE_AUTOTUNE === "1") && !isAutotuneEnabled()) return;
+  const seenKeys = /* @__PURE__ */ new Set();
+  for (const [m, n, k] of shapes) {
+    const key = getPerShapeKey(m, n, k, dtype);
+    if (perShapeTuningCache.has(key) || seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    await autotuneIfNeeded(device, queue, m, n, k, dtype);
+  }
+}
+function cachedPipeline(device, cache, cacheKey, generateShader) {
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+  const warmed = getWarmupPipeline(cacheKey);
+  if (warmed) {
+    cache.set(cacheKey, warmed);
+    return warmed;
+  }
+  const shaderCode = generateShader();
+  recordPipeline(cacheKey, shaderCode);
+  const module = device.createShaderModule({ code: shaderCode });
+  const pipeline = device.createComputePipeline({
+    layout: "auto",
+    compute: {
+      module,
+      entryPoint: "main"
+    }
+  });
+  cache.set(cacheKey, pipeline);
+  return pipeline;
+}
+function getOrCreatePipeline(device, options) {
+  return cachedPipeline(device, pipelineCache, getShaderCacheKey(options), () => generateTiledMatmulShaderTileIR(options));
+}
+function packMatmulParams(m, n, k, lda, ldb, ldc, alpha2, batchSize2, batchStrideA, batchStrideB, batchStrideC) {
+  const data = /* @__PURE__ */ new ArrayBuffer(48);
+  const u32View = new Uint32Array(data);
+  const f32View = new Float32Array(data);
+  u32View[0] = m;
+  u32View[1] = n;
+  u32View[2] = k;
+  u32View[3] = lda;
+  u32View[4] = ldb;
+  u32View[5] = ldc;
+  f32View[6] = alpha2;
+  u32View[7] = batchSize2;
+  u32View[8] = batchStrideA;
+  u32View[9] = batchStrideB;
+  u32View[10] = batchStrideC;
+  return u32View;
+}
+function getKSplitTempBuffer(device, byteSize) {
+  let buf = kSplitTempBufferCache.get(byteSize);
+  if (!buf) {
+    buf = device.createBuffer({
+      size: byteSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+    });
+    kSplitTempBufferCache.set(byteSize, buf);
+  }
+  return buf;
+}
+function getOrCreateReductionPipeline(device, kSplitCount, outputDtype) {
+  return cachedPipeline(device, reductionPipelineCache, `ksplit_reduce_${kSplitCount}_${outputDtype}`, () => generateKSplitReductionShaderTileIR(kSplitCount, outputDtype));
+}
+function computeKSplitFactor(baseWorkgroups, k, tileK, batchSize2, hasEpilogue) {
+  if (batchSize2 > 1 || hasEpilogue) return 0;
+  if (baseWorkgroups >= KSPLIT_MIN_WORKGROUPS_THRESHOLD) return 0;
+  if (k < KSPLIT_MIN_K) return 0;
+  const desired = Math.ceil(KSPLIT_TARGET_WORKGROUPS / baseWorkgroups);
+  const maxByK = Math.floor(k / tileK);
+  return Math.min(desired, maxByK, KSPLIT_MAX_FACTOR);
+}
+function dispatchTiledMatmul(options) {
+  const { device, a, b, out, m, n, k, batchSize: batchSize2 = 1, transA = false, transB = false, alpha: alpha2 = 1, dtype = "f32", dtypeB, epilogue, epilogueInputs = [], inputCastA, inputCastB } = options;
+  const hasEpilogue = !!epilogue && epilogue.ops.length > 0 && epilogue.ops.some((op) => op.kind !== "none");
+  const shapeClass = classifyShape(m, n, k, batchSize2);
+  const config = options.config ?? getConfigForShape(shapeClass, dtype, hasEpilogue, m, n, k);
+  validateConfig(config);
+  const transposeMode = getTransposeMode(transA, transB);
+  const lda = transA ? m : k;
+  const ldb = transB ? k : n;
+  const ldc = n;
+  const batchStrideA = options.batchStrideA ?? m * k;
+  const batchStrideB = options.batchStrideB ?? k * n;
+  const batchStrideC = options.batchStrideC ?? m * n;
+  const workgroupsX = Math.ceil(n / config.tileN);
+  const workgroupsY = Math.ceil(m / config.tileM);
+  const kSplitFactor = computeKSplitFactor(workgroupsX * workgroupsY, k, config.tileK, batchSize2, hasEpilogue);
+  if (kSplitFactor >= 2) {
+    const outputDtype = epilogue?.outputDtype ?? (dtype === "f32" || (dtypeB ?? dtype) === "f32" ? "f32" : dtype);
+    const totalElements = m * n;
+    const tempBuffer = getKSplitTempBuffer(device, kSplitFactor * totalElements * 4);
+    const kSplitPipeline = getOrCreatePipeline(device, {
+      config,
+      transposeMode,
+      dtype,
+      dtypeB,
+      batched: false,
+      inputCastA,
+      inputCastB,
+      kSplit: kSplitFactor
+    });
+    const kSplitParamsBuffer = createParamsBuffer(device, packMatmulParams(m, n, k, lda, ldb, ldc, 1, 1, batchStrideA, batchStrideB, batchStrideC));
+    const kSplitBindGroup = cachedCreateBindGroup(device, kSplitPipeline, [
+      a,
+      b,
+      tempBuffer,
+      kSplitParamsBuffer
+    ]);
+    const opLabel = getCurrentOpLabel() ?? "matmul";
+    dispatchComputePass(kSplitPipeline, kSplitBindGroup, workgroupsX, workgroupsY, kSplitFactor, opLabel);
+    releaseParamsBuffer(kSplitParamsBuffer);
+    const reductionPipeline = getOrCreateReductionPipeline(device, kSplitFactor, outputDtype);
+    const reduceParamsBuf = /* @__PURE__ */ new ArrayBuffer(8);
+    const reduceU32 = new Uint32Array(reduceParamsBuf);
+    const reduceF32 = new Float32Array(reduceParamsBuf);
+    reduceU32[0] = totalElements;
+    reduceF32[1] = alpha2;
+    const reduceParamsBuffer = createParamsBuffer(device, reduceU32);
+    dispatchComputePass(reductionPipeline, cachedCreateBindGroup(device, reductionPipeline, [
+      tempBuffer,
+      out,
+      reduceParamsBuffer
+    ]), Math.ceil(totalElements / 256), 1, 1, opLabel + "_ksplit_reduce");
+    releaseParamsBuffer(reduceParamsBuffer);
+    return;
+  }
+  const swapGrid = batchSize2 === 1 && workgroupsX > workgroupsY * 4 ? true : void 0;
+  const pipeline = getOrCreatePipeline(device, {
+    config,
+    transposeMode,
+    dtype,
+    dtypeB,
+    epilogue,
+    batched: batchSize2 > 1,
+    inputCastA,
+    inputCastB,
+    swapGrid
+  });
+  const paramsBuffer = createParamsBuffer(device, packMatmulParams(m, n, k, lda, ldb, ldc, alpha2, batchSize2, batchStrideA, batchStrideB, batchStrideC));
+  dispatchComputePass(pipeline, cachedCreateBindGroup(device, pipeline, [
+    a,
+    b,
+    out,
+    paramsBuffer,
+    ...epilogueInputs
+  ]), swapGrid ? workgroupsY : workgroupsX, swapGrid ? workgroupsX : workgroupsY, batchSize2);
+  releaseParamsBuffer(paramsBuffer);
+}
+function computeMatmulOutputShape(aShape, bShape, transA, transB) {
+  if (aShape.length < 2 || bShape.length < 2) throw new Error("matmul requires at least 2D tensors");
+  const aRank = aShape.length;
+  const bRank = bShape.length;
+  let m, ka, kb, n;
+  if (transA) {
+    ka = aShape[aRank - 2];
+    m = aShape[aRank - 1];
+  } else {
+    m = aShape[aRank - 2];
+    ka = aShape[aRank - 1];
+  }
+  if (transB) {
+    n = bShape[bRank - 2];
+    kb = bShape[bRank - 1];
+  } else {
+    kb = bShape[bRank - 2];
+    n = bShape[bRank - 1];
+  }
+  if (ka !== kb) throw new Error(`matmul shape mismatch: k dimensions ${ka} vs ${kb}`);
+  const aBatch = aShape.slice(0, -2);
+  const bBatch = bShape.slice(0, -2);
+  const maxBatchRank = Math.max(aBatch.length, bBatch.length);
+  const outBatch = [];
+  for (let i = 0; i < maxBatchRank; i++) {
+    const aDim = aBatch[aBatch.length - 1 - i] ?? 1;
+    const bDim = bBatch[bBatch.length - 1 - i] ?? 1;
+    if (aDim !== bDim && aDim !== 1 && bDim !== 1) throw new Error(`batch dimensions not broadcastable: ${aDim} vs ${bDim}`);
+    outBatch.unshift(Math.max(aDim, bDim));
+  }
+  return [
+    ...outBatch,
+    m,
+    n
+  ];
+}
+function computeBatchSize(batchDims) {
+  return batchDims.reduce((acc, dim) => acc * dim, 1);
+}
+function computeBatchStrides(aShape, bShape, outBatchDims, m, n, k) {
+  const aBatchDims = aShape.slice(0, -2);
+  const bBatchDims = bShape.slice(0, -2);
+  if (computeBatchSize(outBatchDims) <= 1) return {
+    strideA: 0,
+    strideB: 0,
+    strideC: 0
+  };
+  return {
+    strideA: computeBatchSize(aBatchDims) === 1 ? 0 : m * k,
+    strideB: computeBatchSize(bBatchDims) === 1 ? 0 : k * n,
+    strideC: m * n
+  };
+}
+var pipelineCache, tuningCache, perShapeTuningCache, autotuneCounter, autotuningInProgress, kSplitTempBufferCache, reductionPipelineCache, KSPLIT_MIN_WORKGROUPS_THRESHOLD, KSPLIT_MIN_K, KSPLIT_TARGET_WORKGROUPS, KSPLIT_MAX_FACTOR;
+var init_dispatch$1 = __esmMin((() => {
+  init_bind_group_cache();
+  init_dispatch();
+  init_gpu_types();
+  init_pipeline_warmup();
+  init_shared_encoder();
+  init_webgpu_state();
+  init_autotune();
+  init_tile_matmul();
+  init_types();
+  pipelineCache = /* @__PURE__ */ new Map();
+  tuningCache = /* @__PURE__ */ new Map();
+  perShapeTuningCache = /* @__PURE__ */ new Map();
+  autotuneCounter = 0;
+  autotuningInProgress = /* @__PURE__ */ new Set();
+  onTeardown(resetMatmulState);
+  kSplitTempBufferCache = /* @__PURE__ */ new Map();
+  reductionPipelineCache = /* @__PURE__ */ new Map();
+  KSPLIT_MIN_WORKGROUPS_THRESHOLD = 64;
+  KSPLIT_MIN_K = 512;
+  KSPLIT_TARGET_WORKGROUPS = 128;
+  KSPLIT_MAX_FACTOR = 32;
+}));
+function applyChunkedGuard(ctx, rawIdx, chunked) {
+  if (!chunked) return rawIdx;
+  ctx.ifThen(rawIdx.lt(ctx.uniform("chunkStart")), () => ctx.emitReturn());
+  ctx.ifThen(rawIdx.ge(ctx.uniform("chunkEnd")), () => ctx.emitReturn());
+  return rawIdx.sub(ctx.uniform("chunkStart"));
+}
+function fixedElementGrid(workgroupSize, elements) {
+  const totalWg = Math.ceil(elements / workgroupSize);
+  if (totalWg <= 65535) return () => [totalWg];
+  return () => [Math.min(totalWg, MAX_WORKGROUPS_PER_DIM), Math.ceil(totalWg / MAX_WORKGROUPS_PER_DIM)];
+}
+function fillWGSL() {
+  return compileTileKernel(elementwiseKernel({
+    name: "fill",
+    bindings: { out: {
+      storage: "read_write",
+      type: "f32"
+    } },
+    uniforms: { value: "f32" },
+    kernel(ctx, idx) {
+      ctx.emitStore("out", idx, ctx.uniform("value"));
+    }
+  }));
+}
+function arangeWGSL() {
+  return compileTileKernel(elementwiseKernel({
+    name: "arange",
+    bindings: { out: {
+      storage: "read_write",
+      type: "f32"
+    } },
+    uniforms: {
+      start: "f32",
+      step: "f32"
+    },
+    kernel(ctx, idx) {
+      ctx.emitStore("out", idx, ctx.uniform("start").add(idx.toF32().mul(ctx.uniform("step"))));
+    }
+  }));
+}
+function triangularWGSL(upper) {
+  return compileTileKernel(elementwiseKernel({
+    name: upper ? "triu" : "tril",
+    bindings: {
+      input: {
+        storage: "read",
+        type: "f32"
+      },
+      output: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      H: "u32",
+      W: "u32",
+      k: "i32"
+    },
+    sizeUniform: "num_elements",
+    kernel(ctx, idx) {
+      const W = ctx.uniform("W");
+      const row = idx.div(W).mod(ctx.uniform("H")).toI32();
+      const col = idx.mod(W).toI32();
+      const k = ctx.uniform("k");
+      const cond = upper ? col.lt(row.add(k)) : col.gt(row.add(k));
+      ctx.ifThenElse(cond, () => ctx.emitStore("output", idx, ctx.f32(0)), () => ctx.emitStore("output", idx, ctx.load("input", idx)));
+    }
+  }));
+}
+function comparisonWGSL(wgslOp, indexShape, aStrides, bStrides, aOffset, bOffset) {
+  const cmpFn = {
+    ">": (a, b) => a.gt(b),
+    "<": (a, b) => a.lt(b),
+    ">=": (a, b) => a.ge(b),
+    "<=": (a, b) => a.le(b),
+    "==": (a, b) => a.eq(b),
+    "!=": (a, b) => a.ne(b)
+  }[wgslOp];
+  if (!cmpFn) throw new Error(`Unknown comparison op: ${wgslOp}`);
+  return compileTileKernel(elementwiseKernel({
+    name: `cmp_${wgslOp}`,
+    bindings: {
+      a: {
+        storage: "read",
+        type: "f32"
+      },
+      b: {
+        storage: "read",
+        type: "f32"
+      },
+      out: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    kernel(ctx, idx) {
+      const aVal = ctx.stridedLoad("a", idx, indexShape, aStrides, aOffset);
+      const bVal = ctx.stridedLoad("b", idx, indexShape, bStrides, bOffset);
+      ctx.emitStore("out", idx, cmpFn(aVal, bVal).select(ctx.f32(1), ctx.f32(0)));
+    }
+  }));
+}
+function argReduceWGSL(compareOp, inputShape, inputStrides, outShape, dim, inputToOutDim) {
+  const rank2 = inputShape.length;
+  const isMax = compareOp === ">";
+  return compileTileKernel(elementwiseKernel({
+    name: `${isMax ? "argmax" : "argmin"}_d${dim}_${inputShape.join("x")}`,
+    bindings: {
+      input: {
+        storage: "read",
+        type: "f32"
+      },
+      out: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      dimSize: "u32",
+      dimStride: "u32"
+    },
+    sizeUniform: "outSize",
+    kernel(ctx, outIdx) {
+      let baseOffset = ctx.u32(0);
+      if (outShape.length > 0) {
+        const outCoords = ctx.decomposeIndex(outIdx, outShape);
+        for (let d = 0; d < outShape.length; d++) for (let id = 0; id < rank2; id++) if (inputToOutDim[id] === d && id !== dim) baseOffset = baseOffset.add(outCoords[d].mul(ctx.u32(inputStrides[id])));
+      }
+      const initVal = isMax ? F32_NEG_MAX : F32_POS_MAX;
+      const bestVal = ctx.emitVar("bestVal", "f32", ctx.f32(initVal));
+      const bestIdx = ctx.emitVar("bestIdx", "u32", ctx.u32(0));
+      ctx.forRange(ctx.u32(0), ctx.uniform("dimSize"), (i) => {
+        const val = ctx.load("input", baseOffset.add(i.mul(ctx.uniform("dimStride"))));
+        const cond = isMax ? val.gt(bestVal.get()) : val.lt(bestVal.get());
+        ctx.ifThen(cond, () => {
+          bestVal.set(val);
+          bestIdx.set(i);
+        });
+      });
+      ctx.emitStore("out", outIdx, bestIdx.get().toF32());
+    }
+  }));
+}
+function whereSpec(indexShape, condStrides, xStrides, yStrides, condOffset, xOffset, yOffset) {
+  return elementwiseKernel({
+    name: "where",
+    bindings: {
+      cond: {
+        storage: "read",
+        type: "f32"
+      },
+      x: {
+        storage: "read",
+        type: "f32"
+      },
+      y: {
+        storage: "read",
+        type: "f32"
+      },
+      out: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    kernel(ctx, idx) {
+      const condVal = ctx.stridedLoad("cond", idx, indexShape, condStrides, condOffset);
+      const xVal = ctx.stridedLoad("x", idx, indexShape, xStrides, xOffset);
+      const yVal = ctx.stridedLoad("y", idx, indexShape, yStrides, yOffset);
+      ctx.emitStore("out", idx, condVal.ne(ctx.f32(0)).select(xVal, yVal));
+    }
+  });
+}
+function whereWGSL(indexShape, condStrides, xStrides, yStrides, condOffset, xOffset, yOffset) {
+  return compileTileKernel(whereSpec(indexShape, condStrides, xStrides, yStrides, condOffset, xOffset, yOffset));
+}
+function binaryBroadcastSpec(op, indexShape, aStrides, bStrides, aOffset, bOffset, dtype) {
+  const fusionOp = WGSL_OP_TO_FUSION[op];
+  if (!fusionOp) throw new Error(`binaryBroadcastSpec: unsupported op "${op}"`);
+  return elementwiseKernel({
+    name: `binary_${fusionOp}`,
+    enableF16: dtype === "f16",
+    bindings: {
+      a: {
+        storage: "read",
+        type: dtype
+      },
+      b: {
+        storage: "read",
+        type: dtype
+      },
+      out: {
+        storage: "read_write",
+        type: dtype
+      }
+    },
+    kernel(ctx, idx) {
+      const aVal = ctx.stridedLoad("a", idx, indexShape, aStrides, aOffset);
+      const bVal = ctx.stridedLoad("b", idx, indexShape, bStrides, bOffset);
+      ctx.emitStore("out", idx, applyFusedOp(ctx, fusionOp, [aVal, bVal]));
+    }
+  });
+}
+function binaryBroadcastTileIR(op, indexShape, aStrides, bStrides, aOffset, bOffset, dtype) {
+  return compileTileKernel(binaryBroadcastSpec(op, indexShape, aStrides, bStrides, aOffset, bOffset, dtype));
+}
+function unaryStridedSpec(opKey, shape, strides, offset, dtype) {
+  return elementwiseKernel({
+    name: `unary_${opKey}`,
+    enableF16: dtype === "f16",
+    bindings: {
+      a: {
+        storage: "read",
+        type: dtype
+      },
+      out: {
+        storage: "read_write",
+        type: dtype
+      }
+    },
+    kernel(ctx, idx) {
+      ctx.emitStore("out", idx, applyFusedOp(ctx, opKey, [ctx.stridedLoad("a", idx, shape, strides, offset)]));
+    }
+  });
+}
+function unaryStridedTileIR(opKey, shape, strides, offset, dtype) {
+  return compileTileKernel(unaryStridedSpec(opKey, shape, strides, offset, dtype));
+}
+function castSpec(srcDtype, dstDtype, shape, strides, offset) {
+  const castOp = `cast_${dstDtype}`;
+  return elementwiseKernel({
+    name: `cast_${srcDtype}_${dstDtype}`,
+    enableF16: srcDtype === "f16" || dstDtype === "f16",
+    bindings: {
+      a: {
+        storage: "read",
+        type: srcDtype
+      },
+      out: {
+        storage: "read_write",
+        type: dstDtype
+      }
+    },
+    kernel(ctx, idx) {
+      const val = ctx.stridedLoad("a", idx, shape, strides, offset);
+      ctx.emitStore("out", idx, srcDtype === dstDtype ? val : applyFusedOp(ctx, castOp, [val]));
+    }
+  });
+}
+function castTileIR(srcDtype, dstDtype, shape, strides, offset) {
+  return compileTileKernel(castSpec(srcDtype, dstDtype, shape, strides, offset));
+}
+function contiguousTileIR(shape, strides, offset, dtype) {
+  return compileTileKernel(elementwiseKernel({
+    name: `contiguous_${dtype}`,
+    enableF16: dtype === "f16",
+    bindings: {
+      input: {
+        storage: "read",
+        type: dtype
+      },
+      out: {
+        storage: "read_write",
+        type: dtype
+      }
+    },
+    kernel(ctx, idx) {
+      ctx.emitStore("out", idx, ctx.stridedLoad("input", idx, shape, strides, offset));
+    }
+  }));
+}
+function narrowBackwardTileIR(outDimSize, outSize, dtype) {
+  return compileTileKernel({
+    name: `narrowBackward_${dtype}`,
+    workgroupSize: WG$5,
+    enableF16: dtype === "f16",
+    bindings: {
+      grad: {
+        storage: "read",
+        type: dtype
+      },
+      out: {
+        storage: "read_write",
+        type: dtype
+      }
+    },
+    uniforms: {
+      outerSize: "u32",
+      innerSize: "u32",
+      gradDimSize: "u32",
+      start: "u32"
+    },
+    grid: fixedElementGrid(WG$5, outSize),
+    kernel(ctx) {
+      const idx = ctx.elementIndex(WG$5, ctx.u32(outSize));
+      const innerSize = ctx.uniform("innerSize");
+      const dimSize = ctx.u32(outDimSize);
+      const outerIdx = ctx.emitLet("outerIdx", idx.div(dimSize.mul(innerSize)));
+      const remainder = ctx.emitLet("rem", idx.mod(dimSize.mul(innerSize)));
+      const dimIdx = ctx.emitLet("dimIdx", remainder.div(innerSize));
+      const innerIdx = ctx.emitLet("innerIdx", remainder.mod(innerSize));
+      const startU = ctx.uniform("start");
+      const gradDimSize = ctx.uniform("gradDimSize");
+      const endU = ctx.emitLet("endU", startU.add(gradDimSize));
+      const zero = dtype === "f16" ? ctx.f16(0) : ctx.f32(0);
+      ctx.ifThen(dimIdx.lt(startU), () => {
+        ctx.emitStore("out", idx, zero);
+        ctx.emitReturn();
+      });
+      ctx.ifThen(dimIdx.ge(endU), () => {
+        ctx.emitStore("out", idx, zero);
+        ctx.emitReturn();
+      });
+      const gradDimIdx = ctx.emitLet("gradDimIdx", dimIdx.sub(startU));
+      const gradIdx = outerIdx.mul(gradDimSize).mul(innerSize).add(gradDimIdx.mul(innerSize)).add(innerIdx);
+      ctx.emitStore("out", idx, ctx.load("grad", gradIdx));
+    }
+  });
+}
+function stridedScatterTileIR(op, baseSize, viewShape, viewStrides, viewOffset, srcStrides, srcOffset) {
+  const viewSize = sizeOf(viewShape);
+  return compileTileKernel({
+    name: op === "copy" ? "stridedScatterCopy" : "stridedScatterAdd",
+    workgroupSize: WG$5,
+    bindings: {
+      base: {
+        storage: "read",
+        type: "f32"
+      },
+      src: {
+        storage: "read",
+        type: "f32"
+      },
+      out: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      baseSize: "u32",
+      viewSize: "u32"
+    },
+    grid: fixedElementGrid(WG$5, Math.max(baseSize, viewSize)),
+    kernel(ctx) {
+      const idx = ctx.flatGlobalId(WG$5);
+      ctx.ifThen(idx.lt(ctx.uniform("baseSize")), () => {
+        ctx.emitStore("out", idx, ctx.load("base", idx));
+      });
+      ctx.barrier();
+      ctx.ifThen(idx.lt(ctx.uniform("viewSize")), () => {
+        const coords = ctx.decomposeIndex(idx, viewShape);
+        const baseOff = ctx.linearizeIndex(coords, viewStrides, viewOffset);
+        const srcOff = ctx.linearizeIndex(coords, srcStrides, srcOffset);
+        const srcVal = ctx.load("src", srcOff);
+        ctx.emitStore("out", baseOff, op === "add" ? ctx.load("out", baseOff).add(srcVal) : srcVal);
+      });
+    }
+  });
+}
+function stridedScatterCopyTileIR(baseSize, viewShape, viewStrides, viewOffset, srcStrides, srcOffset) {
+  return stridedScatterTileIR("copy", baseSize, viewShape, viewStrides, viewOffset, srcStrides, srcOffset);
+}
+function stridedScatterAddTileIR(baseSize, viewShape, viewStrides, viewOffset, srcStrides, srcOffset) {
+  return stridedScatterTileIR("add", baseSize, viewShape, viewStrides, viewOffset, srcStrides, srcOffset);
+}
+function gatherTileIRImpl(inputShape, indexShape, dim, chunked) {
+  const inputStrides = contiguousStrides(inputShape);
+  const uniforms = {};
+  if (chunked) {
+    uniforms.chunkStart = "u32";
+    uniforms.chunkEnd = "u32";
+  }
+  return compileTileKernel(elementwiseKernel({
+    name: chunked ? `gather_chunked_d${dim}` : `gather_d${dim}`,
+    bindings: {
+      input: {
+        storage: "read",
+        type: "f32"
+      },
+      indices: {
+        storage: "read",
+        type: "f32"
+      },
+      out: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms,
+    kernel(ctx, idx) {
+      const dimIdx = applyChunkedGuard(ctx, ctx.emitLet("gatherIdx", ctx.load("indices", idx).toU32()), chunked);
+      const inputCoords = ctx.decomposeIndex(idx, indexShape).map((c, d) => d === dim ? dimIdx : c);
+      ctx.emitStore("out", idx, ctx.load("input", ctx.linearizeIndex(inputCoords, inputStrides)));
+    }
+  }));
+}
+function gatherTileIR(inputShape, indexShape, dim) {
+  return gatherTileIRImpl(inputShape, indexShape, dim, false);
+}
+function chunkedGatherTileIR(inputShape, indexShape, dim) {
+  return gatherTileIRImpl(inputShape, indexShape, dim, true);
+}
+function scatterAddTileIRImpl(inputShape, srcShape, dim, chunked) {
+  const outStrides = contiguousStrides(inputShape);
+  const uniforms = {};
+  if (chunked) {
+    uniforms.chunkStart = "u32";
+    uniforms.chunkEnd = "u32";
+  }
+  return compileTileKernel(elementwiseKernel({
+    name: chunked ? `scatterAdd_chunked_d${dim}` : `scatterAdd_d${dim}`,
+    bindings: {
+      indices: {
+        storage: "read",
+        type: "f32"
+      },
+      src: {
+        storage: "read",
+        type: "f32"
+      },
+      out: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms,
+    sizeUniform: "srcSize",
+    kernel(ctx, srcIdx) {
+      const dimIdx = applyChunkedGuard(ctx, ctx.emitLet("scatterIdx", ctx.load("indices", srcIdx).toU32()), chunked);
+      const outCoords = ctx.decomposeIndex(srcIdx, srcShape).map((c, d) => d === dim ? dimIdx : c);
+      const outOffset = ctx.linearizeIndex(outCoords, outStrides);
+      ctx.emitStore("out", outOffset, ctx.load("out", outOffset).add(ctx.load("src", srcIdx)));
+    }
+  }));
+}
+function scatterAddTileIR(inputShape, srcShape, dim) {
+  return scatterAddTileIRImpl(inputShape, srcShape, dim, false);
+}
+function chunkedScatterAddTileIR(inputShape, srcShape, dim) {
+  return scatterAddTileIRImpl(inputShape, srcShape, dim, true);
+}
+function chunkedTransposeTileIR(dtype) {
+  return compileTileKernel({
+    name: "contiguous_chunked_transpose",
+    workgroupSize: WG$5,
+    bindings: {
+      input: {
+        storage: "read",
+        type: dtype
+      },
+      output: {
+        storage: "read_write",
+        type: dtype
+      }
+    },
+    uniforms: {
+      K: "u32",
+      N: "u32",
+      rowStart: "u32",
+      rowEnd: "u32",
+      colStart: "u32",
+      colEnd: "u32"
+    },
+    kernel(ctx) {
+      const numRows = ctx.uniform("rowEnd").sub(ctx.uniform("rowStart"));
+      const numCols = ctx.uniform("colEnd").sub(ctx.uniform("colStart"));
+      const idx = ctx.elementIndex(WG$5, numRows.mul(numCols));
+      const localRow = idx.div(numCols);
+      const localCol = idx.mod(numCols);
+      const globalRow = ctx.uniform("rowStart").add(localRow);
+      const globalCol = ctx.uniform("colStart").add(localCol);
+      const inputIdx = localCol.mul(ctx.uniform("K")).add(globalRow);
+      const outputIdx = localRow.mul(ctx.uniform("N")).add(globalCol);
+      ctx.emitStore("output", outputIdx, ctx.load("input", inputIdx));
+    }
+  });
+}
+function flatOpSpec(op) {
+  return {
+    name: op === "copy" ? "flatCopy" : "flatAdd",
+    workgroupSize: WG$5,
+    bindings: op === "copy" ? {
+      src: {
+        storage: "read",
+        type: "f32"
+      },
+      out: {
+        storage: "read_write",
+        type: "f32"
+      }
+    } : {
+      base: {
+        storage: "read",
+        type: "f32"
+      },
+      src: {
+        storage: "read",
+        type: "f32"
+      },
+      out: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: { size: "u32" },
+    grid: elementwiseGrid(WG$5, {
+      elementUniform: "size",
+      vecWidth: VEC
+    }),
+    kernel(ctx) {
+      const flatWgId = ctx.programId(0).add(ctx.programId(1).mul(ctx.numPrograms(0)));
+      const b = ctx.emitLet("base", flatWgId.mul(ctx.u32(WG$5 * VEC)).add(ctx.localIndex().mul(ctx.u32(VEC))));
+      const size = ctx.uniform("size");
+      ctx.ifThen(b.ge(size), () => ctx.emitReturn());
+      for (let v = 0; v < VEC; v++) {
+        const idx = b.add(ctx.u32(v));
+        const val = op === "copy" ? ctx.blockLoad("src", idx, size) : ctx.blockLoad("base", idx, size).add(ctx.blockLoad("src", idx, size));
+        ctx.blockStore("out", idx, size, val);
+      }
+    }
+  };
+}
+function sliceColumnsTileIR() {
+  return compileTileKernel({
+    name: "sliceColumns",
+    workgroupSize: WG$5,
+    bindings: {
+      input: {
+        storage: "read",
+        type: "f32"
+      },
+      output: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      numRows: "u32",
+      N: "u32",
+      colStart: "u32",
+      sliceWidth: "u32",
+      rowStart: "u32"
+    },
+    grid: elementwiseGrid(WG$5),
+    kernel(ctx) {
+      const idx = ctx.elementIndex(WG$5, ctx.uniform("numRows").mul(ctx.uniform("sliceWidth")));
+      const localRow = idx.div(ctx.uniform("sliceWidth"));
+      const col = idx.mod(ctx.uniform("sliceWidth"));
+      const srcCol = ctx.uniform("colStart").add(col);
+      const srcIdx = localRow.mul(ctx.uniform("N")).add(srcCol);
+      const dstIdx = ctx.uniform("rowStart").add(localRow).mul(ctx.uniform("sliceWidth")).add(col);
+      ctx.emitStore("output", dstIdx, ctx.load("input", srcIdx));
+    }
+  });
+}
+function scatterColumnsTileIR() {
+  return compileTileKernel({
+    name: "scatterColumns",
+    workgroupSize: WG$5,
+    bindings: {
+      input: {
+        storage: "read",
+        type: "f32"
+      },
+      output: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      numRows: "u32",
+      N: "u32",
+      colStart: "u32",
+      sliceWidth: "u32",
+      rowStart: "u32",
+      inputRowStart: "u32"
+    },
+    grid: elementwiseGrid(WG$5),
+    kernel(ctx) {
+      const idx = ctx.elementIndex(WG$5, ctx.uniform("numRows").mul(ctx.uniform("sliceWidth")));
+      const localRow = idx.div(ctx.uniform("sliceWidth"));
+      const col = idx.mod(ctx.uniform("sliceWidth"));
+      const inputIdx = ctx.uniform("inputRowStart").add(localRow).mul(ctx.uniform("sliceWidth")).add(col);
+      const outputIdx = localRow.mul(ctx.uniform("N")).add(ctx.uniform("colStart").add(col));
+      ctx.emitStore("output", outputIdx, ctx.load("input", inputIdx));
+    }
+  });
+}
+function sliceBColumnsTileIR() {
+  return compileTileKernel({
+    name: "sliceBColumns",
+    workgroupSize: WG$5,
+    bindings: {
+      input: {
+        storage: "read",
+        type: "f32"
+      },
+      output: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      batch: "u32",
+      K: "u32",
+      N: "u32",
+      colStart: "u32",
+      chunkWidth: "u32"
+    },
+    grid: elementwiseGrid(WG$5),
+    kernel(ctx) {
+      const idx = ctx.elementIndex(WG$5, ctx.uniform("batch").mul(ctx.uniform("K")).mul(ctx.uniform("chunkWidth")));
+      const cw = ctx.uniform("chunkWidth");
+      const c = idx.mod(cw);
+      const k = idx.div(cw).mod(ctx.uniform("K"));
+      const inputOffset = idx.div(ctx.uniform("K").mul(cw)).mul(ctx.uniform("K").mul(ctx.uniform("N"))).add(k.mul(ctx.uniform("N"))).add(ctx.uniform("colStart").add(c));
+      ctx.emitStore("output", idx, ctx.load("input", inputOffset));
+    }
+  });
+}
+function randWGSL() {
+  return compileTileKernel(elementwiseKernel({
+    name: "rand",
+    bindings: { out: {
+      storage: "read_write",
+      type: "f32"
+    } },
+    uniforms: { seed: "u32" },
+    kernel(ctx, idx) {
+      ctx.emitStore("out", idx, ctx.randF32(ctx.uniform("seed"), idx));
+    }
+  }));
+}
+function randnWGSL() {
+  return compileTileKernel({
+    name: "randn",
+    workgroupSize: WG$5,
+    bindings: { out: {
+      storage: "read_write",
+      type: "f32"
+    } },
+    uniforms: {
+      size: "u32",
+      seed: "u32"
+    },
+    grid(u) {
+      const numThreads = Math.ceil(u.size / 2);
+      const totalWg = Math.ceil(numThreads / WG$5);
+      if (totalWg <= 65535) return [totalWg];
+      return [Math.min(totalWg, MAX_WORKGROUPS_PER_DIM), Math.ceil(totalWg / MAX_WORKGROUPS_PER_DIM)];
+    },
+    kernel(ctx) {
+      const idx = ctx.globalId(0);
+      const outIdx = idx.mul(ctx.u32(2));
+      const size = ctx.uniform("size");
+      ctx.ifThen(outIdx.ge(size), () => ctx.emitReturn());
+      const [u1raw, u2] = ctx.randF32x2(ctx.uniform("seed"), idx);
+      const r = u1raw.max(ctx.f32(11754944e-45)).log().mul(ctx.f32(-2)).sqrt();
+      const theta = u2.mul(ctx.f32(2 * Math.PI));
+      ctx.emitStore("out", outIdx, r.mul(theta.cos()));
+      const outIdx2 = outIdx.add(ctx.u32(1));
+      ctx.blockStore("out", outIdx2, size, r.mul(theta.sin()));
+    }
+  });
+}
+function bernoulliWGSL() {
+  return compileTileKernel(elementwiseKernel({
+    name: "bernoulli",
+    bindings: { out: {
+      storage: "read_write",
+      type: "f32"
+    } },
+    uniforms: {
+      seed: "u32",
+      prob: "f32"
+    },
+    kernel(ctx, idx) {
+      const u = ctx.randF32(ctx.uniform("seed"), idx);
+      ctx.emitStore("out", idx, u.lt(ctx.uniform("prob")).select(ctx.f32(1), ctx.f32(0)));
+    }
+  }));
+}
+var WG$5, WGSL_OP_TO_FUSION, VEC;
+var init_ops_tile_ir = __esmMin((() => {
+  init_fusion_tile_ir();
+  init_shape_utils();
+  init_tile_compiler();
+  init_tile_ir();
+  WG$5 = 256;
+  WGSL_OP_TO_FUSION = {
+    "+": "add",
+    "-": "sub",
+    "*": "mul",
+    "/": "div"
+  };
+  VEC = 4;
+}));
+function computeFlatChunkLayout(totalElements, maxBytesPerElement, maxBindingSize, minAlignment, elementsPerAlignment) {
+  const epa = elementsPerAlignment ?? minAlignment / maxBytesPerElement;
+  const maxElementsPerChunk = Math.floor(maxBindingSize / maxBytesPerElement);
+  const elementsPerChunk = Math.floor(maxElementsPerChunk / epa) * epa;
+  const numChunks = Math.ceil(totalElements / elementsPerChunk);
+  const maxWorkgroups = Math.ceil(elementsPerChunk / 256);
+  const use2D = maxWorkgroups > MAX_WORKGROUPS_PER_DIM;
+  return {
+    elementsPerChunk,
+    numChunks,
+    use2D,
+    gridSizeX: use2D ? Math.min(maxWorkgroups, MAX_WORKGROUPS_PER_DIM) : maxWorkgroups
+  };
+}
+function computeDimChunkLayout(dimSize, elementsPerSlice, maxBindingSize, minAlignment, bytesPerElement = 4) {
+  const bytesPerSlice = elementsPerSlice * bytesPerElement;
+  let maxSlicesPerChunk = Math.floor(maxBindingSize / bytesPerSlice);
+  if (bytesPerSlice % minAlignment !== 0) {
+    const slicesForAlignment = minAlignment / gcd$1(bytesPerSlice, minAlignment);
+    maxSlicesPerChunk = Math.floor(maxSlicesPerChunk / slicesForAlignment) * slicesForAlignment;
+    if (maxSlicesPerChunk === 0) maxSlicesPerChunk = slicesForAlignment;
+  }
+  return {
+    maxSlicesPerChunk,
+    numChunks: Math.ceil(dimSize / maxSlicesPerChunk),
+    bytesPerSlice
+  };
+}
+var init_chunked_dispatch = __esmMin((() => {
+  init_shape_utils();
+}));
+function packUniforms(spec, values) {
+  const entries = Object.entries(spec.uniforms);
+  const fieldCount = entries.length;
+  const sizeBytes = Math.ceil(fieldCount / 4) * 4 * 4;
+  const buffer = new ArrayBuffer(sizeBytes);
+  const f32 = new Float32Array(buffer);
+  const u32 = new Uint32Array(buffer);
+  for (let i = 0; i < entries.length; i++) {
+    const [name, type] = entries[i];
+    const val = values[name];
+    if (val === void 0) throw new Error(`Missing uniform value: ${name}`);
+    if (type === "f32") f32[i] = val;
+    else u32[i] = val;
+  }
+  return {
+    data: new Uint8Array(buffer),
+    sizeBytes
+  };
+}
+function uniformCacheKey(spec, values) {
+  const parts = [];
+  for (const [name, type] of Object.entries(spec.uniforms)) if (type !== "f32") parts.push(`${values[name]}`);
+  return parts.join(":");
+}
+function createTileKernelDispatcher(spec) {
+  const configCache2 = /* @__PURE__ */ new Map();
+  let cachedWGSL2 = null;
+  function getWGSL() {
+    if (!cachedWGSL2) cachedWGSL2 = compileTileKernel(spec);
+    return cachedWGSL2;
+  }
+  function getConfigBuffer(device, key, sizeBytes, data) {
+    let buf = configCache2.get(key);
+    if (!buf) {
+      buf = device.createBuffer({
+        size: sizeBytes,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+      });
+      configCache2.set(key, buf);
+    }
+    device.queue.writeBuffer(buf, 0, data);
+    return buf;
+  }
+  function buildBindings(bindingNames, buffers, configBuf, visitor, visitUniform) {
+    const uniformIdx = spec.uniformBindingIndex;
+    let bindingIndex = 0;
+    for (let i = 0; i < bindingNames.length; i++) {
+      if (configBuf && uniformIdx !== void 0 && bindingIndex === uniformIdx) {
+        visitUniform(bindingIndex, configBuf);
+        bindingIndex++;
+      }
+      const name = bindingNames[i];
+      const buf = buffers[name];
+      if (!buf) throw new Error(`Missing buffer for binding: ${name}`);
+      visitor(bindingIndex, name, buf);
+      bindingIndex++;
+    }
+    if (configBuf && (uniformIdx === void 0 || bindingIndex <= uniformIdx)) visitUniform(bindingIndex, configBuf);
+  }
+  function prepareConfigBuffer(device, uniforms, keyPrefix = "") {
+    if (Object.keys(spec.uniforms).length === 0) return null;
+    const configKey = keyPrefix + uniformCacheKey(spec, uniforms);
+    const { data, sizeBytes } = packUniforms(spec, uniforms);
+    return getConfigBuffer(device, configKey, sizeBytes, data);
+  }
+  return {
+    dispatch(buffers, uniforms) {
+      const ctx = requireContext();
+      const device = ctx.device;
+      const wgsl = getWGSL();
+      const pipeline = getPipeline(ctx, wgsl, wgsl);
+      const configBuf = prepareConfigBuffer(device, uniforms);
+      const bindingNames = Object.keys(spec.bindings);
+      const bufferArray = [];
+      buildBindings(bindingNames, buffers, configBuf, (_idx, _name, buf) => bufferArray.push(buf), (_idx, buf) => bufferArray.push(buf));
+      const bindGroup = cachedCreateBindGroup(device, pipeline, bufferArray);
+      for (const buf of bufferArray) trackSharedEncoderWrite(buf);
+      dispatchComputePass(pipeline, bindGroup, ...resolveGrid(spec)(uniforms));
+    },
+    dispatchChunked(buffers, uniforms, chunking) {
+      const ctx = requireContext();
+      const device = ctx.device;
+      const limits = device.limits;
+      const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+      const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
+      const layout = computeFlatChunkLayout(chunking.totalElements, chunking.maxBytesPerElement, maxBindingSize, minAlignment, chunking.elementsPerAlignment);
+      const wgsl = getWGSL();
+      const pipeline = getPipeline(ctx, wgsl, wgsl);
+      const bindingNames = Object.keys(spec.bindings);
+      const gridFn = resolveGrid(spec);
+      for (let chunk = 0; chunk < layout.numChunks; chunk++) {
+        const chunkStart = chunk * layout.elementsPerChunk;
+        const chunkSize = Math.min(chunkStart + layout.elementsPerChunk, chunking.totalElements) - chunkStart;
+        const patchedUniforms = {
+          ...uniforms,
+          [chunking.sizeUniform]: chunkSize
+        };
+        const configBuf = prepareConfigBuffer(device, patchedUniforms, "chunked:");
+        const entries = [];
+        buildBindings(bindingNames, buffers, configBuf, (idx, name, buf) => {
+          if ((chunking.modes[name] ?? "chunked") === "scalar") entries.push({
+            binding: idx,
+            resource: { buffer: buf }
+          });
+          else {
+            const bpe = chunking.bytesPerElement?.[name] ?? dtypeBytes(spec.bindings[name].type);
+            entries.push({
+              binding: idx,
+              resource: {
+                buffer: buf,
+                offset: chunkStart * bpe,
+                size: chunkSize * bpe
+              }
+            });
+          }
+        }, (idx, buf) => entries.push({
+          binding: idx,
+          resource: { buffer: buf }
+        }));
+        const bindGroup = profiledCreateBindGroup(device, {
+          layout: pipeline.getBindGroupLayout(0),
+          entries
+        });
+        for (const entry of entries) trackSharedEncoderWrite(entry.resource.buffer);
+        dispatchComputePass(pipeline, bindGroup, ...gridFn(patchedUniforms));
+      }
+    },
+    getWGSL,
+    reset() {
+      configCache2.clear();
+      cachedWGSL2 = null;
+    }
+  };
+}
+var init_tile_dispatch = __esmMin((() => {
+  init_bind_group_cache();
+  init_chunked_dispatch();
+  init_dispatch();
+  init_gpu_types();
+  init_shape_utils();
+  init_tile_compiler();
+  init_tile_ir();
+  init_webgpu_state();
+}));
+function cast(a, dtype) {
+  const tensor = asGPUTensor(a);
+  const ctx = requireContext();
+  if (tensor.dtype === dtype) return tensor;
+  if (dtype === "f16" && tensor.dtype === "f32" && !isCompilationRecording()) {
+    const cached = f16WeightCache.get(tensor.buffer);
+    if (cached) {
+      if (tensor.isContiguous && tensor.offset === 0) return createTensor(tensor.shape, cached, void 0, 0, "f16", false);
+      if (tensor.offset === 0) return createTensor(tensor.shape, cached, tensor.strides, 0, "f16", false);
+    }
+  }
+  if (dtype === "f16" && !ctx.f16Supported) throw new Error("f16 dtype requires shader-f16 device feature which is not available");
+  const srcBytesPerElement = dtypeBytes(tensor.dtype);
+  const dstBytesPerElement = dtypeBytes(dtype);
+  const limits = ctx.device.limits;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const inputDataBytes = tensor.size * srcBytesPerElement;
+  const outputDataBytes = tensor.size * dstBytesPerElement;
+  if (inputDataBytes > maxBindingSize || outputDataBytes > maxBindingSize) {
+    let src = tensor;
+    let contiguousCopy = null;
+    if (!tensor.isContiguous || tensor.offset > 0) {
+      src = asGPUTensor(contiguous(tensor));
+      contiguousCopy = src;
+    }
+    const result = castChunked(src, dtype, ctx, limits);
+    if (contiguousCopy) contiguousCopy.destroy();
+    return result;
+  }
+  const dispatch = compute2DDispatch(Math.ceil(tensor.size / 256));
+  const use2D = dispatch.y > 1;
+  const code = castTileIR(tensor.dtype, dtype, tensor.shape, tensor.strides, tensor.offset);
+  const pipeline = getPipeline(ctx, `cast:${tensor.dtype}->${dtype}:${tensor.shape.join("x")}:${tensor.strides.join(",")}:${tensor.offset}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`, code);
+  const bytesPerElement = dtypeBytes(dtype);
+  const outBuffer = resolveOutputBuffer(ctx.device, tensor.size * bytesPerElement, [tensor.buffer]);
+  const uniformBuf = createParamsBuffer(ctx.device, params(tensor.size));
+  dispatchComputePass(pipeline, cachedCreateBindGroup(ctx.device, pipeline, [
+    tensor.buffer,
+    outBuffer,
+    uniformBuf
+  ]), dispatch.x, dispatch.y);
+  releaseParamsBuffer(uniformBuf);
+  return createTensor(tensor.shape, outBuffer, void 0, 0, dtype);
+}
+function castChunked(tensor, dtype, ctx, limits) {
+  const srcBytesPerElement = dtypeBytes(tensor.dtype);
+  const dstBytesPerElement = dtypeBytes(dtype);
+  const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
+  const elementsPerAlignment = lcm(minAlignment / srcBytesPerElement, minAlignment / dstBytesPerElement);
+  const totalElements = tensor.size;
+  const maxBpe = Math.max(srcBytesPerElement, dstBytesPerElement);
+  const outBuffer = resolveOutputBuffer(ctx.device, totalElements * dstBytesPerElement, [tensor.buffer]);
+  createTileKernelDispatcher(castSpec(tensor.dtype, dtype, [totalElements], [1], 0)).dispatchChunked({
+    a: tensor.buffer,
+    out: outBuffer
+  }, { size: totalElements }, {
+    modes: {
+      a: "chunked",
+      out: "chunked"
+    },
+    bytesPerElement: {
+      a: srcBytesPerElement,
+      out: dstBytesPerElement
+    },
+    sizeUniform: "size",
+    totalElements,
+    maxBytesPerElement: maxBpe,
+    elementsPerAlignment
+  });
+  return createTensor(tensor.shape, outBuffer, void 0, 0, dtype);
+}
+function reshape(a, shape) {
+  const tensor = asGPUTensor(a);
+  if (sizeOf(shape) !== tensor.size) throw new Error("View shape does not match tensor size");
+  if (tensor.isContiguous) return createTensor(shape, tensor.buffer, void 0, tensor.offset, tensor.dtype, false);
+  const newStrides = inferReshapeStrides(tensor.shape, tensor.strides, shape);
+  if (newStrides !== null) return createTensor(shape, tensor.buffer, newStrides, tensor.offset, tensor.dtype, false);
+  const contig = asGPUTensor(contiguous(tensor));
+  bufferPool.decRef(contig.buffer);
+  return createTensor(shape, contig.buffer, void 0, contig.offset, tensor.dtype, true);
+}
+function expand(a, shape) {
+  const tensor = asGPUTensor(a);
+  const inputShape = tensor.shape;
+  const inputStrides = tensor.strides;
+  if (shape.length < inputShape.length) throw new Error("expand: target shape must have at least as many dimensions as input");
+  const outStrides = [];
+  const padded = shape.length - inputShape.length;
+  for (let i = 0; i < shape.length; i++) if (i < padded) outStrides.push(0);
+  else {
+    const inputIdx = i - padded;
+    const inputDim = inputShape[inputIdx];
+    const outputDim = shape[i];
+    if (inputDim === 1 && outputDim > 1) outStrides.push(0);
+    else if (inputDim === outputDim) outStrides.push(inputStrides[inputIdx]);
+    else throw new Error(`expand: incompatible shapes at dimension ${i} (input ${inputDim} vs output ${outputDim})`);
+  }
+  return createTensor(shape, tensor.buffer, outStrides, tensor.offset, tensor.dtype, false);
+}
+function contiguous(a) {
+  const tensor = asGPUTensor(a);
+  if (tensor.isContiguous) return createTensor(tensor.shape, tensor.buffer, tensor.strides, tensor.offset, tensor.dtype, false);
+  const shape = tensor.shape;
+  if (sizeOf(shape) === 0) throw new Error("contiguous: empty tensors not supported");
+  const limits = requireContext().device.limits;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
+  if (tensor.buffer.size > maxBindingSize) return contiguousChunked(tensor, maxBindingSize, minAlignment);
+  return contiguousDirect(tensor);
+}
+function contiguousDirect(tensor) {
+  const ctx = requireContext();
+  const shape = tensor.shape;
+  const outSize = sizeOf(shape);
+  const dtype = tensor.dtype;
+  const bytesPerElement = dtypeBytes(dtype);
+  const dispatch = compute2DDispatch(Math.ceil(outSize / 256));
+  const use2D = dispatch.y > 1;
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement, [tensor.buffer]);
+  const code = contiguousTileIR(shape, tensor.strides, tensor.offset, dtype);
+  dispatchElementwise({
+    key: `contiguous:${shape.join(",")}:${tensor.strides.join(",")}:${tensor.offset}:${dtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`,
+    shader: code,
+    inputs: [tensor.buffer],
+    outputSizeBytes: outSize * bytesPerElement,
+    params: params(outSize),
+    outBuffer,
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y
+  });
+  return createTensor(shape, outBuffer, void 0, 0, dtype);
+}
+function contiguousChunked(tensor, maxBindingSize, minAlignment) {
+  const ctx = requireContext();
+  const shape = tensor.shape;
+  const rank2 = shape.length;
+  const outSize = sizeOf(shape);
+  const dtype = tensor.dtype;
+  const wgslType = dtype;
+  const bytesPerElement = dtypeBytes(dtype);
+  if (rank2 !== 2) throw new Error("Chunked contiguous currently only supports 2D tensors");
+  const [K, N] = shape;
+  const [strideK, strideN] = tensor.strides;
+  const outBuffer = createTrackedBuffer(ctx.device, {
+    size: alignBufferSize(outSize * bytesPerElement),
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  });
+  if (strideK === 1 && strideN === K) {
+    const bytesPerOutputRow = N * bytesPerElement;
+    const bytesPerInputRow = K * bytesPerElement;
+    const maxOutputRows = Math.floor(maxBindingSize / bytesPerOutputRow);
+    const maxInputCols = Math.floor(maxBindingSize / bytesPerInputRow);
+    const alignedOutputRows = alignedChunkSize(bytesPerOutputRow, maxOutputRows, minAlignment);
+    const alignedInputCols = alignedChunkSize(bytesPerInputRow, maxInputCols, minAlignment);
+    const numOutputRowChunks = Math.ceil(K / alignedOutputRows);
+    const numInputColChunks = Math.ceil(N / alignedInputCols);
+    const code = chunkedTransposeTileIR(wgslType);
+    const pipeline = getPipeline(ctx, `contiguous_chunked_transpose_tiled:${K}:${N}:${dtype}`, code);
+    for (let rowChunk = 0; rowChunk < numOutputRowChunks; rowChunk++) {
+      const rowStart = rowChunk * alignedOutputRows;
+      const rowEnd = Math.min(rowStart + alignedOutputRows, K);
+      const numRows = rowEnd - rowStart;
+      const outputByteOffset = rowStart * bytesPerOutputRow;
+      const outputChunkSize = numRows * bytesPerOutputRow;
+      for (let colChunk = 0; colChunk < numInputColChunks; colChunk++) {
+        const colStart = colChunk * alignedInputCols;
+        const colEnd = Math.min(colStart + alignedInputCols, N);
+        const numCols = colEnd - colStart;
+        const inputByteOffset = (tensor.offset + colStart * K) * bytesPerElement;
+        const inputChunkSize = numCols * K * bytesPerElement;
+        const tileSize = numRows * numCols;
+        const dispatch = compute2DDispatch(Math.ceil(tileSize / 256));
+        const paramsBuffer = createParamsBuffer(ctx.device, params(K, N, rowStart, rowEnd, colStart, colEnd, dispatch.gridSizeX * 256));
+        dispatchComputePass(pipeline, profiledCreateBindGroup(ctx.device, {
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [
+            {
+              binding: 0,
+              resource: {
+                buffer: tensor.buffer,
+                offset: inputByteOffset,
+                size: inputChunkSize
+              }
+            },
+            {
+              binding: 1,
+              resource: {
+                buffer: outBuffer,
+                offset: outputByteOffset,
+                size: outputChunkSize
+              }
+            },
+            {
+              binding: 2,
+              resource: { buffer: paramsBuffer }
+            }
+          ]
+        }), dispatch.x, dispatch.y);
+        releaseParamsBuffer(paramsBuffer);
+      }
+    }
+    return createTensor(shape, outBuffer, void 0, 0, dtype);
+  }
+  throw new Error(`Chunked contiguous not yet implemented for stride pattern [${tensor.strides.join(", ")}]`);
+}
+function detectSimpleTranspose(tensor) {
+  if (tensor.isContiguous) return null;
+  if (tensor.offset !== 0) return null;
+  const rank2 = tensor.shape.length;
+  if (rank2 < 2) return null;
+  const strides = tensor.strides;
+  const shape = tensor.shape;
+  if (strides[rank2 - 2] !== 1) return null;
+  if (strides[rank2 - 1] !== shape[rank2 - 2]) return null;
+  let expectedStride = shape[rank2 - 1] * shape[rank2 - 2];
+  for (let i = rank2 - 3; i >= 0; i--) {
+    if (strides[i] !== expectedStride) return null;
+    expectedStride *= shape[i];
+  }
+  const originalShape = shape.slice();
+  originalShape[rank2 - 2] = shape[rank2 - 1];
+  originalShape[rank2 - 1] = shape[rank2 - 2];
+  return originalShape;
+}
+function ensureContiguous(tensor) {
+  if (tensor.isContiguous) return tensor;
+  return asGPUTensor(contiguous(tensor));
+}
+function asContiguous(bt) {
+  return ensureContiguous(asGPUTensor(bt));
+}
+function narrow(a, dim, start, length) {
+  const tensor = asGPUTensor(a);
+  const rank2 = tensor.shape.length;
+  if (dim < 0 || dim >= rank2) throw new Error(`narrow: dim ${dim} out of range for rank ${rank2}`);
+  if (start < 0 || start + length > tensor.shape[dim]) throw new Error(`narrow: range [${start}, ${start + length}) out of bounds for dim size ${tensor.shape[dim]}`);
+  const newShape = tensor.shape.slice();
+  newShape[dim] = length;
+  const newOffset = tensor.offset + start * tensor.strides[dim];
+  return createTensor(newShape, tensor.buffer, tensor.strides.slice(), newOffset, tensor.dtype, false);
+}
+function narrowBackward(grad, dim, start, originalLength) {
+  const gradTensor = ensureContiguous(asGPUTensor(grad));
+  const outShape = gradTensor.shape.slice();
+  outShape[dim] = originalLength;
+  const outSize = sizeOf(outShape);
+  const dtype = gradTensor.dtype;
+  const bytesPerElement = dtypeBytes(dtype);
+  const outerSize = sizeOf(outShape.slice(0, dim));
+  const innerSize = sizeOf(outShape.slice(dim + 1));
+  const gradDimSize = gradTensor.shape[dim];
+  const outDimSize = originalLength;
+  const dispatch = compute2DDispatch(Math.ceil(outSize / 256));
+  const use2D = dispatch.y > 1;
+  const gridSizeX = dispatch.x * 256;
+  const shaderCode = narrowBackwardTileIR(outDimSize, outSize, dtype);
+  const outBuffer = dispatchElementwise({
+    key: `narrowBackward:${outDimSize}:${gradDimSize}:${start}:${outSize}:${dtype}:${use2D ? `2d:${gridSizeX}` : "1d"}`,
+    shader: shaderCode,
+    inputs: [gradTensor.buffer],
+    outputSizeBytes: outSize * bytesPerElement,
+    params: params(outerSize, innerSize, gradDimSize, start),
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y
+  });
+  if (gradTensor !== asGPUTensor(grad)) destroyCopy(gradTensor);
+  return createTensor(outShape, outBuffer, void 0, 0, dtype);
+}
+function transpose(a, options) {
+  const { dim0, dim1 } = options;
+  const rank2 = a.shape.length;
+  if (dim0 < 0 || dim0 >= rank2 || dim1 < 0 || dim1 >= rank2) throw new Error("transpose: dimension out of range");
+  const dims = Array.from({ length: rank2 }, (_, i) => i);
+  dims[dim0] = dim1;
+  dims[dim1] = dim0;
+  return permute(a, dims);
+}
+function permute(a, dims) {
+  const tensor = asGPUTensor(a);
+  const inputShape = tensor.shape;
+  const rank2 = inputShape.length;
+  if (dims.length !== rank2) throw new Error(`permute: dims length ${dims.length} doesn't match tensor rank ${rank2}`);
+  const seen = /* @__PURE__ */ new Set();
+  for (const d of dims) {
+    if (d < 0 || d >= rank2) throw new Error(`permute: dimension ${d} out of range for rank ${rank2}`);
+    if (seen.has(d)) throw new Error(`permute: duplicate dimension ${d}`);
+    seen.add(d);
+  }
+  const outShape = dims.map((d) => inputShape[d]);
+  const outStrides = dims.map((d) => tensor.strides[d]);
+  return createTensor(outShape, tensor.buffer, outStrides, tensor.offset, tensor.dtype, false);
+}
+var init_views = __esmMin((() => {
+  init_shape();
+  init_bind_group_cache();
+  init_buffer_arena();
+  init_buffer_pool();
+  init_dispatch();
+  init_gpu_context();
+  init_gpu_types();
+  init_shape_utils();
+  init_tensor();
+  init_tile_dispatch();
+  init_webgpu_state();
+  init_ops_tile_ir();
+}));
+function dispatchComputePass(pipeline, bindGroup, workgroupsX, workgroupsY = 1, workgroupsZ = 1, labelOverride) {
+  const ctx = requireContext();
+  const label = labelOverride ?? getCurrentOpLabel();
+  if (isCompilationRecordingActive()) recordDispatch({
+    pipeline,
+    bindGroup,
+    workgroupsX,
+    workgroupsY,
+    workgroupsZ,
+    buffers: getAndClearLastBindGroupBuffers()
+  });
+  const sharedEnc = getSharedEncoderInstance();
+  const tsWrites = getTimestampWrites(label ?? "unknown");
+  const encoder = sharedEnc ?? ctx.device.createCommandEncoder();
+  const pass = encoder.beginComputePass(tsWrites ? { timestampWrites: tsWrites } : void 0);
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
+  pass.end();
+  if (sharedEnc) {
+    incrementSharedEncoderPassCount();
+    autoFlushSharedEncoder();
+  } else submitOrCollect(encoder.finish());
+}
+function dispatchElementwise(desc) {
+  const ctx = requireContext();
+  const pipeline = getPipeline(ctx, desc.key, desc.shader);
+  const outBuffer = desc.outBuffer ?? resolveOutputBuffer(ctx.device, desc.outputSizeBytes, desc.inputs);
+  const paramsBuffer = createParamsBuffer(ctx.device, desc.params);
+  dispatchComputePass(pipeline, cachedCreateBindGroup(ctx.device, pipeline, [
+    ...desc.inputs,
+    outBuffer,
+    paramsBuffer
+  ]), desc.dispatchX, desc.dispatchY ?? 1);
+  releaseParamsBuffer(paramsBuffer);
+  return outBuffer;
+}
+function getPipeline(context, key, code) {
+  const cached = context.pipelines.get(key);
+  if (cached) return cached;
+  const warmed = getWarmupPipeline(key);
+  if (warmed) {
+    context.pipelines.set(key, warmed);
+    return warmed;
+  }
+  recordPipeline(key, code);
+  const module = context.device.createShaderModule({ code });
+  const pipeline = context.device.createComputePipeline({
+    layout: "auto",
+    compute: {
+      module,
+      entryPoint: "main"
+    }
+  });
+  context.pipelines.set(key, pipeline);
+  return pipeline;
+}
+function dispatchBinary(op, a, b, options) {
+  const outShape = broadcastShapes(a.shape, b.shape);
+  const outSize = sizeOf(outShape);
+  if (outSize === 0) throw new Error("webgpu ops do not support empty tensors yet");
+  const ctx = requireContext();
+  const dtype = a.dtype;
+  if (b.dtype !== dtype) throw new Error(`webgpu binary op: mismatched dtypes ${a.dtype} and ${b.dtype}`);
+  const bytesPerElement = dtypeBytes(dtype);
+  const maxBindingSize = ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const aSizeBytes = a.size * bytesPerElement;
+  const bSizeBytes = b.size * bytesPerElement;
+  const outSizeBytes = outSize * bytesPerElement;
+  if (aSizeBytes > maxBindingSize || bSizeBytes > maxBindingSize || outSizeBytes > maxBindingSize) {
+    const aIsScalar = a.size === 1;
+    const bIsScalar = b.size === 1;
+    const sameShape = a.shape.length === b.shape.length && a.shape.every((d, i) => d === b.shape[i]);
+    if (sameShape && a.isContiguous && b.isContiguous || aIsScalar && b.isContiguous || bIsScalar && a.isContiguous) return binaryChunked(op, a, b, aIsScalar, bIsScalar, outShape, outSize, dtype, bytesPerElement, options);
+    if (sameShape) {
+      const aC = a.isContiguous ? a : ensureContiguous(a);
+      const bC = b.isContiguous ? b : ensureContiguous(b);
+      const result = binaryChunked(op, aC, bC, aC.size === 1, bC.size === 1, outShape, outSize, dtype, bytesPerElement, options);
+      if (aC !== a) aC.destroy?.();
+      if (bC !== b) bC.destroy?.();
+      return result;
+    }
+    if (!a.isContiguous && aSizeBytes > maxBindingSize) {
+      const aC = ensureContiguous(a);
+      const result = dispatchBinary(op, aC, b, options);
+      aC.destroy?.();
+      return result;
+    }
+    if (!b.isContiguous && bSizeBytes > maxBindingSize) {
+      const bC = ensureContiguous(b);
+      const result = dispatchBinary(op, a, bC, options);
+      bC.destroy?.();
+      return result;
+    }
+  }
+  const indexShape = toIndexShape(outShape);
+  const aStrides = computeEffectiveBroadcastStrides(a, indexShape);
+  const bStrides = computeEffectiveBroadcastStrides(b, indexShape);
+  const dispatch = compute2DDispatch(Math.ceil(outSize / 256));
+  const use2D = dispatch.y > 1;
+  const code = binaryBroadcastTileIR(op, indexShape, aStrides, bStrides, a.offset, b.offset, dtype);
+  return createTensor(outShape, dispatchElementwise({
+    key: `binary:${op}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${a.offset}:${b.offset}:${dtype}:${use2D ? dispatch.gridSizeX : "1d"}`,
+    shader: code,
+    inputs: [a.buffer, b.buffer],
+    outputSizeBytes: outSize * bytesPerElement,
+    params: params(outSize),
+    outBuffer: options?.outBuffer,
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y
+  }), void 0, 0, dtype, options?.outBuffer === void 0);
+}
+function binaryChunked(op, a, b, aIsScalar, bIsScalar, outShape, outSize, dtype, bytesPerElement, options) {
+  const outBuffer = resolveOutputBuffer(requireContext().device, outSize * bytesPerElement, [a.buffer, b.buffer], options?.outBuffer);
+  createTileKernelDispatcher(binaryBroadcastSpec(op, [outSize], aIsScalar ? [0] : [1], bIsScalar ? [0] : [1], 0, 0, dtype)).dispatchChunked({
+    a: a.buffer,
+    b: b.buffer,
+    out: outBuffer
+  }, { size: outSize }, {
+    modes: {
+      a: aIsScalar ? "scalar" : "chunked",
+      b: bIsScalar ? "scalar" : "chunked",
+      out: "chunked"
+    },
+    sizeUniform: "size",
+    totalElements: outSize,
+    maxBytesPerElement: bytesPerElement
+  });
+  return createTensor(outShape, outBuffer, void 0, 0, dtype, options?.outBuffer === void 0);
+}
+function dispatchUnary(opKey, a, options) {
+  const ctx = requireContext();
+  const dtype = a.dtype;
+  const bytesPerElement = dtypeBytes(dtype);
+  const maxBindingSize = ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  if (a.size * bytesPerElement > maxBindingSize && a.isContiguous) {
+    const outSize = a.size;
+    const outBuffer2 = resolveOutputBuffer(ctx.device, outSize * bytesPerElement, [a.buffer], options?.outBuffer);
+    createTileKernelDispatcher(unaryStridedSpec(opKey, [outSize], [1], 0, dtype)).dispatchChunked({
+      a: a.buffer,
+      out: outBuffer2
+    }, { size: outSize }, {
+      modes: {
+        a: "chunked",
+        out: "chunked"
+      },
+      sizeUniform: "size",
+      totalElements: outSize,
+      maxBytesPerElement: bytesPerElement
+    });
+    const ownsBuffer2 = options?.outBuffer === void 0;
+    return createTensor(a.shape, outBuffer2, void 0, 0, dtype, ownsBuffer2);
+  }
+  const dispatch = compute2DDispatch(Math.ceil(a.size / 256));
+  const use2D = dispatch.y > 1;
+  const code = unaryStridedTileIR(opKey, a.shape, a.strides, a.offset, dtype);
+  const outBuffer = dispatchElementwise({
+    key: `unary:${opKey}:${a.shape.join("x")}:${a.strides.join(",")}:${a.offset}:${dtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`,
+    shader: code,
+    inputs: [a.buffer],
+    outputSizeBytes: a.size * bytesPerElement,
+    params: params(a.size),
+    outBuffer: options?.outBuffer,
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y
+  });
+  const ownsBuffer = options?.outBuffer === void 0;
+  return createTensor(a.shape, outBuffer, void 0, 0, dtype, ownsBuffer);
+}
+function resolveMatmulInput(t, trans) {
+  const origShape = !trans ? detectSimpleTranspose(t) : null;
+  if (origShape) return {
+    tensor: createTensor(origShape, t.buffer, void 0, 0, t.dtype, false),
+    trans: true,
+    wasCopied: false
+  };
+  const contig = ensureContiguous(t);
+  return {
+    tensor: contig,
+    trans,
+    wasCopied: contig !== t
+  };
+}
+function prepareMatmulInputs(a, b, transA, transB) {
+  const rA = resolveMatmulInput(a, transA);
+  const rB = resolveMatmulInput(b, transB);
+  const effectiveA = rA.tensor, effectiveTransA = rA.trans, aWasCopied = rA.wasCopied;
+  const effectiveB = rB.tensor, effectiveTransB = rB.trans, bWasCopied = rB.wasCopied;
+  const outShape = computeMatmulOutputShape(effectiveA.shape, effectiveB.shape, effectiveTransA, effectiveTransB);
+  const aRank = effectiveA.shape.length;
+  const bRank = effectiveB.shape.length;
+  let m, k, n;
+  if (effectiveTransA) {
+    k = effectiveA.shape[aRank - 2];
+    m = effectiveA.shape[aRank - 1];
+  } else {
+    m = effectiveA.shape[aRank - 2];
+    k = effectiveA.shape[aRank - 1];
+  }
+  if (effectiveTransB) n = effectiveB.shape[bRank - 2];
+  else n = effectiveB.shape[bRank - 1];
+  const batchDims = outShape.slice(0, -2);
+  const batchSize2 = computeBatchSize(batchDims);
+  const { strideA, strideB, strideC } = computeBatchStrides(effectiveA.shape, effectiveB.shape, batchDims, m, n, k);
+  return {
+    effectiveA,
+    effectiveB,
+    effectiveTransA,
+    effectiveTransB,
+    aWasCopied,
+    bWasCopied,
+    outShape,
+    m,
+    k,
+    n,
+    batchDims,
+    batchSize: batchSize2,
+    strideA,
+    strideB,
+    strideC
+  };
+}
+function dispatchMatmul(a, b, transA = false, transB = false, donatedBuffer, epilogueOpts) {
+  const ctx = requireContext();
+  const { effectiveA, effectiveB, effectiveTransA, effectiveTransB, aWasCopied, bWasCopied, outShape, m, k, n, batchSize: batchSize2, strideA, strideB, strideC } = prepareMatmulInputs(a, b, transA, transB);
+  const rawDtypeA = effectiveA.dtype === "f16" && isF16Supported() ? "f16" : "f32";
+  const rawDtypeB = effectiveB.dtype === "f16" && isF16Supported() ? "f16" : "f32";
+  const dtypeA = epilogueOpts?.inputCastA === "f16" && isF16Supported() ? "f16" : rawDtypeA;
+  const dtypeB = epilogueOpts?.inputCastB === "f16" && isF16Supported() ? "f16" : rawDtypeB;
+  const promotedDtype = dtypeA === "f32" || dtypeB === "f32" ? "f32" : dtypeA;
+  const outputDtype = epilogueOpts?.epilogue.outputDtype ?? promotedDtype;
+  const bytesPerElement = dtypeBytes(outputDtype);
+  const epilogueBuffers = epilogueOpts?.epilogueInputs.map((t) => t.buffer) ?? [];
+  const requiredSize = sizeOf(outShape) * bytesPerElement;
+  const useDonated = donatedBuffer && donatedBuffer.size >= requiredSize;
+  const outBuffer = useDonated ? donatedBuffer : resolveOutputBuffer(ctx.device, requiredSize, [
+    effectiveA.buffer,
+    effectiveB.buffer,
+    ...epilogueBuffers
+  ]);
+  dispatchTiledMatmul({
+    device: ctx.device,
+    queue: ctx.queue,
+    a: effectiveA.buffer,
+    b: effectiveB.buffer,
+    out: outBuffer,
+    m,
+    n,
+    k,
+    batchSize: batchSize2,
+    batchStrideA: strideA,
+    batchStrideB: strideB,
+    batchStrideC: strideC,
+    transA: effectiveTransA,
+    transB: effectiveTransB,
+    dtype: dtypeA,
+    dtypeB: dtypeB !== dtypeA ? dtypeB : void 0,
+    epilogue: epilogueOpts?.epilogue,
+    epilogueInputs: epilogueBuffers.length > 0 ? epilogueBuffers : void 0,
+    inputCastA: epilogueOpts?.inputCastA,
+    inputCastB: epilogueOpts?.inputCastB
+  });
+  if (aWasCopied) destroyCopy(effectiveA);
+  if (bWasCopied) destroyCopy(effectiveB);
+  return createTensor(outShape, outBuffer, void 0, 0, outputDtype, useDonated || !epilogueOpts);
+}
+function dispatchMatmulDirect(bufA, bufB, config) {
+  const ctx = requireContext();
+  const bytesPerElement = dtypeBytes(config.outputDtype);
+  const outSize = sizeOf(config.outShape);
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement, [
+    bufA,
+    bufB,
+    ...config.epilogueBuffers
+  ]);
+  dispatchTiledMatmul({
+    device: ctx.device,
+    queue: ctx.queue,
+    a: bufA,
+    b: bufB,
+    out: outBuffer,
+    m: config.m,
+    n: config.n,
+    k: config.k,
+    batchSize: config.batchSize,
+    batchStrideA: config.batchStrideA,
+    batchStrideB: config.batchStrideB,
+    batchStrideC: config.batchStrideC,
+    transA: config.transA,
+    transB: config.transB,
+    dtype: config.dtypeA,
+    dtypeB: config.dtypeB,
+    epilogue: config.epilogueConfig,
+    epilogueInputs: config.epilogueBuffers,
+    inputCastA: config.inputCastA,
+    inputCastB: config.inputCastB
+  });
+  return createTensor(config.outShape, outBuffer, void 0, 0, config.outputDtype);
+}
+var init_dispatch = __esmMin((() => {
+  init_compiled_plan();
+  init_bind_group_cache();
+  init_buffer_arena();
+  init_buffer_pool();
+  init_gpu_context();
+  init_dispatch$1();
+  init_ops_tile_ir();
+  init_views();
+  init_pipeline_warmup();
+  init_profiler$1();
+  init_shape_utils();
+  init_shared_encoder();
+  init_tensor();
+  init_tile_dispatch();
+}));
+function buildCompiledPlan(input) {
+  const { commandLog, bufferToSlot, slotSources, nodeResults } = input;
+  const commands = [];
+  for (const entry of commandLog) switch (entry.kind) {
+    case "dispatch": {
+      const d = entry.dispatch;
+      if (!d.buffers || d.buffers.length === 0) continue;
+      const bindings = [];
+      for (const buf of d.buffers) {
+        let slot = bufferToSlot.get(buf);
+        if (slot === void 0) {
+          slot = slotSources.length;
+          bufferToSlot.set(buf, slot);
+          slotSources.push({
+            kind: "persistent",
+            buffer: buf
+          });
+        }
+        bindings.push(slot);
+      }
+      commands.push({
+        tag: 1,
+        pipeline: d.pipeline,
+        bindings,
+        gx: d.workgroupsX,
+        gy: d.workgroupsY,
+        gz: d.workgroupsZ
+      });
+      break;
+    }
+    case "alloc": {
+      const slot = bufferToSlot.get(entry.buffer);
+      if (slot === void 0) {
+        if (define_process_env_default$1.TORCHLETTE_DEBUG_COMPILED) console.log(`[compiled] FAIL: alloc buffer unmapped, size=${entry.bytes}, commands so far=${commands.length}`);
+        return {
+          commands: [],
+          slots: [],
+          results: [],
+          valid: false
+        };
+      }
+      const inputSlots = [];
+      for (const ib of entry.inputBuffers) {
+        const is_ = bufferToSlot.get(ib);
+        if (is_ !== void 0) inputSlots.push(is_);
+      }
+      commands.push({
+        tag: 0,
+        slot,
+        bytes: entry.bytes,
+        allocKind: entry.allocKind,
+        inputSlots
+      });
+      break;
+    }
+    case "copy": {
+      let srcSlot = bufferToSlot.get(entry.copy.src);
+      let dstSlot = bufferToSlot.get(entry.copy.dst);
+      if (srcSlot === void 0) {
+        srcSlot = slotSources.length;
+        bufferToSlot.set(entry.copy.src, srcSlot);
+        slotSources.push({
+          kind: "persistent",
+          buffer: entry.copy.src
+        });
+      }
+      if (dstSlot === void 0) {
+        dstSlot = slotSources.length;
+        bufferToSlot.set(entry.copy.dst, dstSlot);
+        slotSources.push({
+          kind: "persistent",
+          buffer: entry.copy.dst
+        });
+      }
+      commands.push({
+        tag: 2,
+        src: srcSlot,
+        dst: dstSlot,
+        srcOffset: entry.copy.srcOffset,
+        dstOffset: entry.copy.dstOffset,
+        bytes: entry.copy.bytes
+      });
+      break;
+    }
+    case "write": {
+      const slot = bufferToSlot.get(entry.buffer);
+      if (slot === void 0) return {
+        commands: [],
+        slots: [],
+        results: [],
+        valid: false
+      };
+      commands.push({
+        tag: 3,
+        slot,
+        nodeIndex: entry.nodeIndex
+      });
+      break;
+    }
+    case "barrier":
+      commands.push({ tag: 4 });
+      break;
+  }
+  if (define_process_env_default$1.TORCHLETTE_DEBUG_COMPILED) {
+    const dispatchCount = commands.filter((c) => c.tag === 1).length;
+    const allocCount = commands.filter((c) => c.tag === 0).length;
+    const barrierCount = commands.filter((c) => c.tag === 4).length;
+    const writeCount = commands.filter((c) => c.tag === 3).length;
+    const copyCount = commands.filter((c) => c.tag === 2).length;
+    const slotKinds = {};
+    for (const s of slotSources) slotKinds[s.kind] = (slotKinds[s.kind] || 0) + 1;
+    console.log(`[compiled] Built: ${commands.length} cmds (${dispatchCount} dispatch, ${allocCount} alloc, ${barrierCount} barrier, ${writeCount} write, ${copyCount} copy), ${slotSources.length} slots (${JSON.stringify(slotKinds)}), ${nodeResults.length} results`);
+  }
+  return {
+    commands,
+    slots: slotSources,
+    results: nodeResults,
+    valid: true
+  };
+}
+function startCompilationRecording() {
+  activeCommandLog = [];
+  activeBufferToSlot = /* @__PURE__ */ new Map();
+  activeSlotSources = [];
+  nextSlot = 0;
+  setCompilationRecording(true);
+  return {
+    commandLog: activeCommandLog,
+    bufferToSlot: activeBufferToSlot,
+    slotSources: activeSlotSources
+  };
+}
+function stopCompilationRecording() {
+  activeCommandLog = null;
+  activeBufferToSlot = null;
+  activeSlotSources = null;
+  nextSlot = 0;
+  setCompilationRecording(false);
+}
+function isCompilationRecordingActive() {
+  return activeCommandLog !== null;
+}
+function assignSlot(buffer, source) {
+  if (!activeBufferToSlot || !activeSlotSources) return -1;
+  const existing = activeBufferToSlot.get(buffer);
+  if (existing !== void 0) return existing;
+  const slot = nextSlot++;
+  activeBufferToSlot.set(buffer, slot);
+  activeSlotSources.push(source);
+  return slot;
+}
+function setLastBindGroupBuffers(bufs) {
+  lastBindGroupBuffers = bufs;
+}
+function getAndClearLastBindGroupBuffers() {
+  const bufs = lastBindGroupBuffers ?? void 0;
+  lastBindGroupBuffers = null;
+  return bufs;
+}
+function recordDispatch(dispatch) {
+  activeCommandLog?.push({
+    kind: "dispatch",
+    dispatch
+  });
+}
+function recordAlloc(buffer, bytes, allocKind, inputBuffers) {
+  if (!activeCommandLog) return;
+  assignSlot(buffer, { kind: "arena" });
+  activeCommandLog.push({
+    kind: "alloc",
+    buffer,
+    bytes,
+    allocKind,
+    inputBuffers
+  });
+}
+function recordWrite(buffer, nodeIndex) {
+  if (!activeCommandLog) return;
+  assignSlot(buffer, { kind: "write" });
+  activeCommandLog.push({
+    kind: "write",
+    buffer,
+    nodeIndex
+  });
+}
+function recordBarrier() {
+  activeCommandLog?.push({ kind: "barrier" });
+}
+async function executeCompiledPlan(compiled, planNodes, arena, backend, externalInputBuffers) {
+  const device = requireContext().device;
+  const slots = new Array(compiled.slots.length);
+  if (define_process_env_default$1.TORCHLETTE_DEBUG_COMPILED) console.log(`[compiled] Executing: ${compiled.commands.length} cmds, ${compiled.slots.length} slots, ${compiled.results.length} results`);
+  beginSharedEncoder();
+  setActiveArena(arena);
+  setArenaExternalInputBuffers(externalInputBuffers);
+  try {
+    for (let i = 0; i < compiled.slots.length; i++) {
+      const src = compiled.slots[i];
+      if (src.kind === "external") {
+        const ref2 = planNodes[src.planNodeIndex].inputs[src.inputIndex];
+        slots[i] = gpuBuffer(getInputStorage(ref2, backend).backendTensor);
+      } else if (src.kind === "persistent") slots[i] = src.buffer;
+    }
+    for (let i = 0; i < compiled.slots.length; i++) {
+      const src = compiled.slots[i];
+      if (src.kind === "params") if (src.cachedBuffer) slots[i] = src.cachedBuffer;
+      else {
+        const buf = device.createBuffer({
+          size: paramsBufferSizeClass(src.data.byteLength),
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+        });
+        device.queue.writeBuffer(buf, 0, src.data);
+        src.cachedBuffer = buf;
+        slots[i] = buf;
+      }
+    }
+    const cmds = compiled.commands;
+    for (let ci = 0; ci < cmds.length; ci++) {
+      const cmd = cmds[ci];
+      switch (cmd.tag) {
+        case 0: {
+          const inputBufs = [];
+          for (let j = 0; j < cmd.inputSlots.length; j++) inputBufs.push(slots[cmd.inputSlots[j]]);
+          slots[cmd.slot] = cmd.allocKind === 0 ? resolveOutputBuffer(device, cmd.bytes, inputBufs) : allocateOutputBuffer(cmd.bytes);
+          break;
+        }
+        case 1: {
+          const bufs = new Array(cmd.bindings.length);
+          for (let j = 0; j < cmd.bindings.length; j++) bufs[j] = slots[cmd.bindings[j]];
+          let bg = cmd.cachedBindGroup;
+          if (bg && cmd.cachedBuffers) {
+            let match = cmd.cachedBuffers.length === bufs.length;
+            if (match) {
+              for (let j = 0; j < bufs.length; j++) if (cmd.cachedBuffers[j] !== bufs[j]) {
+                match = false;
+                break;
+              }
+            }
+            if (!match) bg = void 0;
+          }
+          if (!bg) {
+            const entries = [];
+            for (let j = 0; j < bufs.length; j++) entries.push({
+              binding: j,
+              resource: { buffer: bufs[j] }
+            });
+            bg = profiledCreateBindGroup(device, {
+              layout: cmd.pipeline.getBindGroupLayout(0),
+              entries
+            });
+            cmd.cachedBindGroup = bg;
+            cmd.cachedBuffers = bufs.slice();
+          }
+          dispatchComputePass(cmd.pipeline, bg, cmd.gx, cmd.gy, cmd.gz);
+          break;
+        }
+        case 2: {
+          const encoder = getSharedEncoderInstance();
+          if (encoder) encoder.copyBufferToBuffer(slots[cmd.src], cmd.srcOffset, slots[cmd.dst], cmd.dstOffset, cmd.bytes);
+          break;
+        }
+        case 3: {
+          const writeNode = planNodes[cmd.nodeIndex];
+          if (!writeNode.result) {
+            const resultOrPromise = executeOpSync(writeNode, writeNode.inputs.map((ref2) => getInputStorage(ref2, backend)).map((s) => s.backendTensor), backend);
+            const result = resultOrPromise instanceof Promise ? await resultOrPromise : resultOrPromise;
+            writeNode.result = createStorageHandle(writeNode.device, result);
+          }
+          slots[cmd.slot] = gpuBuffer(writeNode.result.backendTensor);
+          break;
+        }
+        case 4:
+          flushSharedEncoder();
+          flushBufferPool();
+          break;
+      }
+    }
+    if (compiled.endCounters) setDispatchSequenceCounters(compiled.endCounters.dispatch, compiled.endCounters.params, compiled.endCounters.output);
+    for (const r of compiled.results) {
+      const node = planNodes[r.nodeIndex];
+      const tensor = createTensor(r.shape, slots[r.slot], r.strides, r.offset, r.dtype);
+      const sh = createStorageHandle(node.device, tensor);
+      if (r.outputIndex === 0) {
+        if (!node.result) node.result = sh;
+      }
+      if (r.outputIndex > 0 || node.results && node.results.length > 0) {
+        if (!node.results) node.results = [node.result];
+        node.results[r.outputIndex] = sh;
+      }
+    }
+  } finally {
+    clearActiveArena();
+    clearArenaExternalInputBuffers();
+    endSharedEncoder();
+  }
+}
+var activeCommandLog, activeBufferToSlot, activeSlotSources, nextSlot, lastBindGroupBuffers;
+var init_compiled_plan = __esmMin((() => {
+  init_webgpu_state();
+  init_op_dispatch();
+  init_bind_group_cache();
+  init_buffer_arena();
+  init_buffer_pool();
+  init_dispatch();
+  init_gpu_types();
+  init_shared_encoder();
+  init_tensor();
+  init_node_factory();
+  activeCommandLog = null;
+  activeBufferToSlot = null;
+  activeSlotSources = null;
+  nextSlot = 0;
+  lastBindGroupBuffers = null;
+}));
+function params(...values) {
+  const n = values.length;
+  const p = n <= 8 ? paramsArrayPool[n] : new Uint32Array(n);
+  for (let i = 0; i < n; i++) p[i] = values[i];
+  return p;
+}
+function createParamsBuffer(device, data) {
+  const sizeClass = paramsBufferSizeClass(data.byteLength);
+  const idx = cacheState.paramsSeqIndex++;
+  const compiling = isCompilationRecordingActive();
+  if (!activeBatch) {
+    const cached = cacheState.paramsSequenceBuffers[idx];
+    if (cached != null && cached.sizeClass === sizeClass) {
+      if (cached.data.length === data.length) {
+        let same = true;
+        for (let i = 0; i < data.length; i++) if (cached.data[i] !== data[i]) {
+          same = false;
+          break;
+        }
+        if (same) {
+          if (compiling) assignSlot(cached.buffer, {
+            kind: "params",
+            seqIndex: idx,
+            data: data.slice()
+          });
+          return cached.buffer;
+        }
+      }
+      profileApiCall("writeBuffer", () => device.queue.writeBuffer(cached.buffer, 0, data));
+      cached.data.set(data);
+      if (compiling) assignSlot(cached.buffer, {
+        kind: "params",
+        seqIndex: idx,
+        data: data.slice()
+      });
+      return cached.buffer;
+    }
+    const pool = paramsBufferPools.get(sizeClass);
+    if (pool && pool.length > 0) {
+      const buffer2 = pool.pop();
+      profileApiCall("writeBuffer", () => device.queue.writeBuffer(buffer2, 0, data));
+      cacheState.paramsSequenceBuffers[idx] = {
+        buffer: buffer2,
+        sizeClass,
+        data: data.slice()
+      };
+      paramsSequenceSet.add(buffer2);
+      if (compiling) assignSlot(buffer2, {
+        kind: "params",
+        seqIndex: idx,
+        data: data.slice()
+      });
+      return buffer2;
+    }
+  }
+  const buffer = profileApiCall("createBuffer", () => device.createBuffer({
+    size: sizeClass,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  }));
+  profileApiCall("writeBuffer", () => device.queue.writeBuffer(buffer, 0, data));
+  if (!activeBatch) {
+    cacheState.paramsSequenceBuffers[idx] = {
+      buffer,
+      sizeClass,
+      data: data.slice()
+    };
+    paramsSequenceSet.add(buffer);
+  }
+  if (compiling) assignSlot(buffer, {
+    kind: "params",
+    seqIndex: idx,
+    data: data.slice()
+  });
+  return buffer;
+}
+function releaseParamsBuffer(buffer) {
+  if (paramsSequenceSet.has(buffer)) return;
+  if (activeBatch) {
+    activeBatch.deferredDestroyBuffers.push(buffer);
+    return;
+  }
+  if (sharedEncoderActive) {
+    deferUniformBufferForSharedEncoder(buffer);
+    autoFlushSharedEncoder();
+    return;
+  }
+  const sizeClass = paramsBufferSizeClass(buffer.size);
+  const pool = paramsBufferPools.get(sizeClass);
+  if (pool) if (pool.length < 256) pool.push(buffer);
+  else bufferPool.deferredDestroyUntracked(buffer);
+  else paramsBufferPools.set(sizeClass, [buffer]);
+}
+function profiledCreateBindGroup(device, descriptor) {
+  const bg = profileApiCall("createBindGroup", () => device.createBindGroup(descriptor));
+  if (isCompilationRecordingActive() && descriptor.entries) {
+    const bufs = [];
+    for (const e of descriptor.entries) {
+      const r = e.resource;
+      if (r && typeof r === "object" && "buffer" in r) bufs.push(r.buffer);
+    }
+    setLastBindGroupBuffers(bufs);
+  }
+  return bg;
+}
+function cachedCreateBindGroup(device, pipeline, buffers) {
+  const idx = cacheState.dispatchIndex++;
+  const entry = cacheState.sequenceEntries[idx];
+  if (entry != null && entry.pipeline === pipeline && entry.buffers.length === buffers.length) {
+    let match = true;
+    for (let i = 0; i < buffers.length; i++) if (entry.buffers[i] !== buffers[i]) {
+      match = false;
+      break;
+    }
+    if (match) {
+      cacheState.hits++;
+      if (isCompilationRecordingActive()) setLastBindGroupBuffers(entry.buffers);
+      return entry.bindGroup;
+    }
+  }
+  cacheState.misses++;
+  if (cacheState.missLog.length < 200) {
+    let reason = "new";
+    let details = "";
+    if (entry != null) if (entry.pipeline !== pipeline) reason = "pipeline";
+    else if (entry.buffers.length !== buffers.length) reason = "buf-count";
+    else {
+      const changed = [];
+      for (let i = 0; i < buffers.length; i++) if (entry.buffers[i] !== buffers[i]) changed.push(i);
+      reason = `buf[${changed.join(",")}]`;
+      const parts = [];
+      for (const ci of changed) {
+        const oldB = entry.buffers[ci];
+        const newB = buffers[ci];
+        const oldArena = isArenaBuffer(oldB) ? "A" : "P";
+        const newArena = isArenaBuffer(newB) ? "A" : "P";
+        parts.push(`${ci}:${oldB.size}${oldArena}->${newB.size}${newArena}`);
+      }
+      details = parts.join(" ");
+    }
+    cacheState.missLog.push({
+      idx,
+      reason,
+      label: getCurrentOpLabel(),
+      details
+    });
+  }
+  const entries = [];
+  for (let i = 0; i < buffers.length; i++) entries.push({
+    binding: i,
+    resource: { buffer: buffers[i] }
+  });
+  const bindGroup = profileApiCall("createBindGroup", () => device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries
+  }));
+  const bufCopy = buffers.slice();
+  cacheState.sequenceEntries[idx] = {
+    bindGroup,
+    pipeline,
+    buffers: bufCopy
+  };
+  if (isCompilationRecordingActive()) setLastBindGroupBuffers(bufCopy);
+  return bindGroup;
+}
+function resetDispatchSequence() {
+  cacheState.dispatchIndex = 0;
+  cacheState.paramsSeqIndex = 0;
+  setOutputSeqIndex(0);
+}
+function setDispatchSequenceCounters(dispatch, params2, output) {
+  cacheState.dispatchIndex = dispatch;
+  cacheState.paramsSeqIndex = params2;
+  setOutputSeqIndex(output);
+}
+function getDispatchSequenceCounters() {
+  return {
+    dispatch: cacheState.dispatchIndex,
+    params: cacheState.paramsSeqIndex,
+    output: getOutputSeqIndex()
+  };
+}
+function clearBindGroupCache() {
+  cacheState.sequenceEntries.length = 0;
+  cacheState.dispatchIndex = 0;
+  cacheState.hits = 0;
+  cacheState.misses = 0;
+  cacheState.paramsSequenceBuffers.length = 0;
+  paramsSequenceSet.clear();
+  cacheState.paramsSeqIndex = 0;
+  outputSequenceHints.length = 0;
+  pinnedOutputBuffers.length = 0;
+  setOutputSeqIndex(0);
+  resetArenaState();
+}
+var paramsArrayPool, cacheState;
+var init_bind_group_cache = __esmMin((() => {
+  init_compiled_plan();
+  init_buffer_arena();
+  init_buffer_pool();
+  init_gpu_types();
+  init_profiler$1();
+  init_shared_encoder();
+  init_webgpu_state();
+  paramsArrayPool = [];
+  for (let i = 0; i <= 8; i++) paramsArrayPool.push(new Uint32Array(i));
+  cacheState = {
+    dispatchIndex: 0,
+    sequenceEntries: [],
+    hits: 0,
+    misses: 0,
+    missLog: [],
+    paramsSeqIndex: 0,
+    paramsSequenceBuffers: []
+  };
+}));
+function getFusionCache() {
+  if (!globalKernelCache) globalKernelCache = new FusionKernelCache();
+  return globalKernelCache;
+}
+function resetFusionCache() {
+  globalKernelCache?.clear();
+  globalKernelCache = null;
+}
+function dispatchFusedKernel(device, recipe, inputs, options = {}) {
+  const nonInlinedCount = recipe.inputs.filter((inp) => !inp.isInlinedConstant).length;
+  if (inputs.length !== nonInlinedCount) throw new Error(`Expected ${nonInlinedCount} non-inlined inputs, got ${inputs.length}`);
+  const storageBindingCount = nonInlinedCount + recipe.outputs.length;
+  const maxStorageBuffers = device.limits.maxStorageBuffersPerShaderStage;
+  if (storageBindingCount > maxStorageBuffers) throw new Error(`Fused kernel requires ${storageBindingCount} storage buffers but device limit is ${maxStorageBuffers}`);
+  const { pipeline, kernel } = (options.cache ?? getFusionCache()).getOrCreate(device, recipe, { vectorize: options.vectorize ?? true });
+  const primaryOutput = recipe.outputs[0];
+  const totalElements = sizeOf(primaryOutput.shape);
+  const outputBuffers = [];
+  const outputTensors = [];
+  for (const output of recipe.outputs) {
+    const buffer = allocateOutputBuffer(totalElements * dtypeBytes(output.dtype));
+    trackSharedEncoderWrite(buffer);
+    outputBuffers.push(buffer);
+    outputTensors.push({
+      buffer,
+      shape: output.shape.slice(),
+      dtype: output.dtype
+    });
+  }
+  const paramsBuffer = createParamsBuffer(device, new Uint32Array([totalElements]));
+  const bgBuffers = [];
+  for (let i = 0; i < inputs.length; i++) bgBuffers.push(inputs[i].buffer);
+  for (let i = 0; i < outputBuffers.length; i++) bgBuffers.push(outputBuffers[i]);
+  bgBuffers.push(paramsBuffer);
+  const bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers);
+  const totalWorkgroups = Math.ceil(kernel.workItems / kernel.workgroupSize);
+  dispatchComputePass(pipeline, bindGroup, Math.min(totalWorkgroups, MAX_WORKGROUPS_PER_DIM), totalWorkgroups <= 65535 ? 1 : Math.ceil(totalWorkgroups / MAX_WORKGROUPS_PER_DIM), 1);
+  releaseParamsBuffer(paramsBuffer);
+  return {
+    outputs: outputTensors,
+    buffer: outputBuffers[0],
+    shape: primaryOutput.shape.slice(),
+    dtype: primaryOutput.dtype
+  };
+}
+var FusionKernelCache, globalKernelCache;
+var init_fusion_dispatch = __esmMin((() => {
+  init_shape();
+  init_bind_group_cache();
+  init_buffer_arena();
+  init_dispatch();
+  init_fusion_tile_ir();
+  init_fusion_types();
+  init_pipeline_warmup();
+  init_shape_utils();
+  init_webgpu_state();
+  FusionKernelCache = class {
+    cache = /* @__PURE__ */ new Map();
+    maxSize;
+    constructor(maxSize = 1024) {
+      this.maxSize = maxSize;
+    }
+    /**
+    * Get or create a pipeline for a fusion recipe.
+    * Computes a cheap cache key first; only does full WGSL codegen on miss.
+    */
+    getOrCreate(device, recipe, options = {}) {
+      const meta = computeKernelMeta(recipe, options);
+      const cached = this.cache.get(meta.cacheKey);
+      if (cached) return {
+        pipeline: cached.pipeline,
+        kernel: cached.kernel
+      };
+      const kernel = generateFusedKernelTileIR(recipe, options);
+      let pipeline = getWarmupPipeline(meta.cacheKey);
+      if (!pipeline) {
+        recordPipeline(meta.cacheKey, kernel.source);
+        const module = device.createShaderModule({ code: kernel.source });
+        pipeline = device.createComputePipeline({
+          layout: "auto",
+          compute: {
+            module,
+            entryPoint: "main"
+          }
+        });
+      }
+      if (this.cache.size >= this.maxSize) {
+        const oldest = this.cache.keys().next().value;
+        if (oldest !== void 0) this.cache.delete(oldest);
+      }
+      this.cache.set(meta.cacheKey, {
+        pipeline,
+        kernel
+      });
+      return {
+        pipeline,
+        kernel
+      };
+    }
+    /**
+    * Clear the cache.
+    */
+    clear() {
+      this.cache.clear();
+    }
+    /**
+    * Get cache statistics.
+    */
+    stats() {
+      return {
+        size: this.cache.size,
+        maxSize: this.maxSize
+      };
+    }
+  };
+  globalKernelCache = null;
+  onTeardown(resetFusionCache);
+}));
+function _setContiguous(fn) {
+  _contiguous = fn;
+}
+function getContiguous(a) {
+  if (!_contiguous) throw new Error("contiguous not wired up — call _setContiguous first");
+  return _contiguous(a);
+}
+function tensorFromArray(values, shape) {
+  const ctx = requireContext();
+  if (sizeOf(shape) !== values.length) throw new Error("Tensor data length does not match shape");
+  const f32data = values instanceof Float32Array ? values : Float32Array.from(values);
+  if (getActiveArena()) {
+    const buffer = resolveOutputBuffer(ctx.device, f32data.byteLength, []);
+    profileApiCall("writeBuffer", () => ctx.queue.writeBuffer(buffer, 0, f32data));
+    return createTensor(shape, buffer);
+  }
+  return createTensor(shape, createBufferWithData(ctx.device, f32data, ctx.queue));
+}
+function cachedWGSL(gen) {
+  let wgsl = null;
+  return () => {
+    if (wgsl === null) wgsl = gen();
+    return wgsl;
+  };
+}
+function dispatchCreationKernel(cacheKey, shader, numElements, paramsData, workgroupThreads) {
+  const ctx = requireContext();
+  const threads = workgroupThreads ?? numElements;
+  const { x, y } = compute2DDispatch(Math.ceil(threads / 256));
+  const pipeline = getPipeline(ctx, cacheKey, shader);
+  const outBuffer = resolveOutputBuffer(ctx.device, numElements * 4, []);
+  const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
+  dispatchComputePass(pipeline, cachedCreateBindGroup(ctx.device, pipeline, [outBuffer, paramsBuffer]), x, y);
+  releaseParamsBuffer(paramsBuffer);
+  return outBuffer;
+}
+function zeros(shape) {
+  const ctx = requireContext();
+  const numElements = sizeOf(shape);
+  if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
+  const sizeBytes = numElements * 4;
+  const alignedSize = alignBufferSize(sizeBytes);
+  const buffer = resolveOutputBuffer(ctx.device, sizeBytes, []);
+  if (bufferPool.isFromPool(buffer) || arenaBufferSet.has(buffer)) {
+    const sharedEnc = getSharedEncoderInstance();
+    if (sharedEnc) sharedEnc.clearBuffer(buffer, 0, alignedSize);
+    else {
+      const encoder = ctx.device.createCommandEncoder();
+      encoder.clearBuffer(buffer, 0, alignedSize);
+      submitOrCollect(encoder.finish());
+    }
+  }
+  return createTensor(shape, buffer);
+}
+function full(shape, fillValue) {
+  const numElements = sizeOf(shape);
+  if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
+  if (fillValue === 0) return zeros(shape);
+  const paramsData = new Uint32Array(2);
+  paramsData[0] = numElements;
+  new Float32Array(paramsData.buffer, 4, 1)[0] = fillValue;
+  return createTensor(shape, dispatchCreationKernel("fill_tile", getFillWGSL(), numElements, paramsData));
+}
+function arange(end, start = 0, step2 = 1) {
+  const numElements = Math.max(0, Math.ceil((end - start) / step2));
+  if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
+  const paramsData = new Uint32Array(3);
+  paramsData[0] = numElements;
+  new Float32Array(paramsData.buffer, 4, 1)[0] = start;
+  new Float32Array(paramsData.buffer, 8, 1)[0] = step2;
+  return createTensor([numElements], dispatchCreationKernel("arange_tile", getArangeWGSL(), numElements, paramsData));
+}
+function triangularOp(a, k, upper) {
+  const ctx = requireContext();
+  if (a.shape.length < 2) throw new Error("tril/triu requires at least 2 dimensions");
+  const H = a.shape[a.shape.length - 2];
+  const W = a.shape[a.shape.length - 1];
+  const numElements = sizeOf(a.shape);
+  const input = a.isContiguous ? a : getContiguous(a);
+  const { x: dispatchX, y: dispatchY } = compute2DDispatch(Math.ceil(numElements / 256));
+  const shader = upper ? getTriuWGSL() : getTrilWGSL();
+  const pipeline = getPipeline(ctx, upper ? "triu_tile" : "tril_tile", shader);
+  const alignedSize = alignBufferSize(numElements * 4);
+  const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+  const outBuffer = createTrackedBuffer(ctx.device, {
+    size: alignedSize,
+    usage
+  });
+  const paramsData = new Int32Array(4);
+  new Uint32Array(paramsData.buffer, 0, 1)[0] = numElements;
+  new Uint32Array(paramsData.buffer, 4, 1)[0] = H;
+  new Uint32Array(paramsData.buffer, 8, 1)[0] = W;
+  paramsData[3] = k;
+  const paramsBuffer = createParamsBuffer(ctx.device, new Uint32Array(paramsData.buffer));
+  dispatchComputePass(pipeline, cachedCreateBindGroup(ctx.device, pipeline, [
+    input.buffer,
+    outBuffer,
+    paramsBuffer
+  ]), dispatchX, dispatchY);
+  releaseParamsBuffer(paramsBuffer);
+  if (input !== a) destroyCopy(input);
+  return createTensor(a.shape.slice(), outBuffer, void 0, 0, a.dtype);
+}
+function tril(a, k = 0) {
+  return triangularOp(a, k, false);
+}
+function triu(a, k = 0) {
+  return triangularOp(a, k, true);
+}
+function seedParams(numElements, seed) {
+  const p = new Uint32Array(2);
+  p[0] = numElements;
+  p[1] = seed >>> 0;
+  return p;
+}
+function rand(shape, seed) {
+  const numElements = sizeOf(shape);
+  if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
+  return createTensor(shape, dispatchCreationKernel("rand_tile", getRandWGSL(), numElements, seedParams(numElements, seed)));
+}
+function randn(shape, seed) {
+  const numElements = sizeOf(shape);
+  if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
+  return createTensor(shape, dispatchCreationKernel("randn_tile", getRandnWGSL(), numElements, seedParams(numElements, seed), Math.ceil(numElements / 2)));
+}
+function bernoulli(shape, p, seed) {
+  const numElements = sizeOf(shape);
+  if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
+  const paramsData = new Uint32Array(4);
+  paramsData[0] = numElements;
+  paramsData[1] = seed >>> 0;
+  new Float32Array(paramsData.buffer, 8, 1)[0] = p;
+  return createTensor(shape, dispatchCreationKernel("bernoulli_tile", getBernoulliWGSL(), numElements, paramsData));
+}
+function tensorFromArrayWithDtype(values, shape, dtype) {
+  const ctx = requireContext();
+  if (sizeOf(shape) !== values.length) throw new Error("Tensor data length does not match shape");
+  if (dtype === "f16" && !ctx.f16Supported) throw new Error("f16 dtype requires shader-f16 device feature which is not available");
+  let typedData;
+  switch (dtype) {
+    case "i32":
+      typedData = Int32Array.from(values);
+      break;
+    case "u32":
+      typedData = Uint32Array.from(values);
+      break;
+    case "f16":
+      typedData = f32ArrayToF16Array(values);
+      break;
+    default:
+      typedData = Float32Array.from(values);
+      break;
+  }
+  if (getActiveArena()) {
+    const buffer = resolveOutputBuffer(ctx.device, typedData.byteLength, []);
+    profileApiCall("writeBuffer", () => ctx.queue.writeBuffer(buffer, 0, typedData));
+    return createTensor(shape, buffer, void 0, 0, dtype);
+  }
+  return createTensor(shape, createBufferWithData(ctx.device, typedData, ctx.queue), void 0, 0, dtype);
+}
+var _contiguous, getFillWGSL, getArangeWGSL, getTrilWGSL, getTriuWGSL, getRandWGSL, getRandnWGSL, getBernoulliWGSL;
+var init_creation = __esmMin((() => {
+  init_bind_group_cache();
+  init_buffer_arena();
+  init_buffer_pool();
+  init_dispatch();
+  init_gpu_context();
+  init_gpu_types();
+  init_profiler$1();
+  init_shape_utils();
+  init_shared_encoder();
+  init_tensor();
+  init_webgpu_state();
+  init_ops_tile_ir();
+  _contiguous = null;
+  getFillWGSL = cachedWGSL(fillWGSL);
+  getArangeWGSL = cachedWGSL(arangeWGSL);
+  getTrilWGSL = cachedWGSL(() => triangularWGSL(false));
+  getTriuWGSL = cachedWGSL(() => triangularWGSL(true));
+  getRandWGSL = cachedWGSL(randWGSL);
+  getRandnWGSL = cachedWGSL(randnWGSL);
+  getBernoulliWGSL = cachedWGSL(bernoulliWGSL);
+}));
+function buildInputOffset(ctx, outIdx, reduceIdx, dim) {
+  const rank2 = dim.inputShape.length;
+  const outCoords = dim.outShape.length > 0 ? ctx.decomposeIndex(outIdx, dim.outShape) : [];
+  const reduceShape2 = dim.normalizedDims.map((d) => dim.inputShape[d]);
+  const reduceCoords = reduceShape2.length > 0 ? ctx.decomposeIndex(reduceIdx, reduceShape2) : [];
+  const inputCoords = [];
+  let reduceCoordIdx = 0;
+  for (let d = 0; d < rank2; d++) if (dim.normalizedDims.includes(d)) inputCoords.push(reduceCoords[reduceCoordIdx++]);
+  else {
+    const outD = dim.inputToOutDim[d];
+    if (outD >= 0 && outD < outCoords.length) inputCoords.push(outCoords[outD]);
+    else inputCoords.push(ctx.u32(0));
+  }
+  return ctx.linearizeIndex(inputCoords, dim.inputStrides);
+}
+function applyPreambleChain(ctx, chainOps, offset) {
+  let externalIdx = 0;
+  let result;
+  const firstInput = ctx.load(`in${externalIdx++}`, offset);
+  if (chainOps[0].arity === 1) result = applyFusedOp(ctx, chainOps[0].op, [firstInput]);
+  else {
+    const secondInput = ctx.load(`in${externalIdx++}`, offset);
+    result = applyFusedOp(ctx, chainOps[0].op, [firstInput, secondInput]);
+  }
+  for (let i = 1; i < chainOps.length; i++) {
+    const op = chainOps[i];
+    if (op.arity === 1) result = applyFusedOp(ctx, op.op, [result]);
+    else {
+      const ext = ctx.load(`in${externalIdx++}`, offset);
+      if (op.chainInputPos === 1) result = applyFusedOp(ctx, op.op, [ext, result]);
+      else result = applyFusedOp(ctx, op.op, [result, ext]);
+    }
+  }
+  return result;
+}
+function applyEpilogueChain(ctx, value, epilogueOps, outIdx) {
+  let result = value;
+  for (const eop of epilogueOps) if (eop.kind === "cast") if (eop.toDtype === "f16") result = result.toF16();
+  else if (eop.toDtype === "i32") result = result.toI32();
+  else if (eop.toDtype === "u32") result = result.toU32();
+  else result = result.toF32();
+  else if (eop.kind === "binary" && eop.op && eop.inputIndex !== void 0) {
+    const epInput = ctx.load(`ep_in${eop.inputIndex}`, outIdx);
+    result = applyFusedOp(ctx, eop.op, [result, epInput]);
+  } else if (eop.kind === "unary" && eop.op) result = applyFusedOp(ctx, eop.op, [result]);
+  return result;
+}
+function buildEpilogueBindings(epilogueOps) {
+  const bindings = {};
+  for (const eop of epilogueOps) if (eop.kind === "binary" && eop.inputIndex !== void 0) bindings[`ep_in${eop.inputIndex}`] = {
+    storage: "read",
+    type: "f32"
+  };
+  return bindings;
+}
+function makeReductionSpec(config) {
+  const { reduceOp, dim, preamble, epilogue } = config;
+  const parts = [reduceOp];
+  if (dim) {
+    parts.push(dim.parallel ? "par" : "seq");
+    parts.push(dim.inputShape.join("x"));
+    parts.push(`d${dim.normalizedDims.join(",")}`);
+  } else parts.push("full");
+  if (preamble) parts.push("pre_" + preamble.chainOps.map((o) => o.op).join("+"));
+  if (epilogue) parts.push("epi");
+  const name = parts.join("_");
+  const bindings = {};
+  if (preamble) for (let i = 0; i < preamble.totalInputs; i++) bindings[`in${i}`] = {
+    storage: "read",
+    type: preamble.inputDtypes[i] || "f32"
+  };
+  else bindings.input = {
+    storage: "read",
+    type: "f32"
+  };
+  if (epilogue) Object.assign(bindings, buildEpilogueBindings(epilogue.ops));
+  bindings.out = {
+    storage: "read_write",
+    type: epilogue ? dtypeToTileIR(epilogue.outputDtype) : "f32"
+  };
+  const needsF16 = preamble?.inputDtypes.some((d) => d === "f16") || epilogue?.outputDtype === "f16" || false;
+  function emitLoad(ctx, offset) {
+    if (preamble) return applyPreambleChain(ctx, preamble.chainOps, offset);
+    return ctx.load("input", offset);
+  }
+  function finalize(ctx, value, outIdx) {
+    return epilogue ? applyEpilogueChain(ctx, value, epilogue.ops, outIdx) : value;
+  }
+  if (!dim) return {
+    name,
+    workgroupSize: WG$4,
+    bindings,
+    enableF16: needsF16 || void 0,
+    uniforms: { size: "u32" },
+    grid: singleWorkgroup(),
+    kernel(ctx) {
+      const tid = ctx.localIndex();
+      const final = finalize(ctx, ctx.wgReduce(reduceOp, tid, ctx.uniform("size"), WG$4, (i) => emitLoad(ctx, i)), ctx.u32(0));
+      ctx.guardedStore("out", tid.eq(ctx.u32(0)), ctx.u32(0), final);
+    }
+  };
+  if (dim.parallel) return {
+    name,
+    workgroupSize: WG$4,
+    bindings,
+    enableF16: needsF16 || void 0,
+    uniforms: {
+      outSize: "u32",
+      reductionSize: "u32"
+    },
+    grid: (u) => {
+      const n = u.outSize;
+      if (n <= 65535) return [n];
+      return [Math.min(n, MAX_WORKGROUPS_PER_DIM), Math.ceil(n / MAX_WORKGROUPS_PER_DIM)];
+    },
+    kernel(ctx) {
+      const tid = ctx.localIndex();
+      const outIdx = ctx.programId(0);
+      ctx.ifThen(outIdx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
+      const reductionSize = ctx.uniform("reductionSize");
+      const final = finalize(ctx, ctx.wgReduce(reduceOp, tid, reductionSize, WG$4, (r) => {
+        return emitLoad(ctx, buildInputOffset(ctx, outIdx, r, dim));
+      }), outIdx);
+      ctx.guardedStore("out", tid.eq(ctx.u32(0)), outIdx, final);
+    }
+  };
+  return {
+    name,
+    workgroupSize: WG$4,
+    bindings,
+    enableF16: needsF16 || void 0,
+    uniforms: {
+      outSize: "u32",
+      reductionSize: "u32"
+    },
+    grid: elementwiseGrid(WG$4, { elementUniform: "outSize" }),
+    kernel(ctx) {
+      const idx = ctx.globalId(0);
+      ctx.ifThen(idx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
+      const reductionSize = ctx.uniform("reductionSize");
+      let resultExpr;
+      if (reduceOp === "sum") {
+        const acc = ctx.emitVar("total", "f32", ctx.f32(0));
+        ctx.forRange(ctx.u32(0), reductionSize, (r) => {
+          const off = buildInputOffset(ctx, idx, r, dim);
+          acc.addAssign(emitLoad(ctx, off));
+        });
+        resultExpr = acc.get();
+      } else {
+        const firstOff = buildInputOffset(ctx, idx, ctx.u32(0), dim);
+        const acc = ctx.emitVar("accVal", "f32", emitLoad(ctx, firstOff));
+        ctx.forRange(ctx.u32(1), reductionSize, (r) => {
+          const val = emitLoad(ctx, buildInputOffset(ctx, idx, r, dim));
+          acc.set(reduceOp === "max" ? acc.get().max(val) : acc.get().min(val));
+        });
+        resultExpr = acc.get();
+      }
+      const final = finalize(ctx, resultExpr, idx);
+      ctx.emitStore("out", idx, final);
+    }
+  };
+}
+function dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, parallel) {
+  return {
+    inputShape,
+    inputStrides,
+    normalizedDims,
+    outShape,
+    outStrides,
+    inputToOutDim,
+    parallel
+  };
+}
+function makeMeanDivSpec() {
+  return {
+    name: "meanDiv",
+    workgroupSize: WG$4,
+    bindings: {
+      input: {
+        storage: "read",
+        type: "f32"
+      },
+      out: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      size: "u32",
+      count: "f32"
+    },
+    grid: elementwiseGrid(WG$4, { elementUniform: "size" }),
+    kernel(ctx) {
+      const idx = ctx.globalId(0);
+      ctx.ifThen(idx.ge(ctx.uniform("size")), () => ctx.emitReturn());
+      ctx.emitStore("out", idx, ctx.load("input", idx).div(ctx.uniform("count")));
+    }
+  };
+}
+function getChunkedSumWGSL() {
+  return compileTileKernel({
+    name: "sumChunk",
+    workgroupSize: 1,
+    bindings: {
+      input: {
+        storage: "read",
+        type: "f32"
+      },
+      out: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      chunkSize: "u32",
+      chunkIdx: "u32"
+    },
+    grid: singleWorkgroup(),
+    kernel(ctx) {
+      const acc = ctx.emitVar("sum", "f32", ctx.f32(0));
+      ctx.forRange(ctx.u32(0), ctx.uniform("chunkSize"), (i) => {
+        acc.addAssign(ctx.load("input", i));
+      });
+      ctx.emitStore("out", ctx.uniform("chunkIdx"), acc.get());
+    }
+  });
+}
+function getFinalSumWGSL() {
+  return compileTileKernel({
+    name: "sumFinalPartials",
+    workgroupSize: 1,
+    bindings: {
+      input: {
+        storage: "read",
+        type: "f32"
+      },
+      out: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: { size: "u32" },
+    grid: singleWorkgroup(),
+    kernel(ctx) {
+      const acc = ctx.emitVar("sum", "f32", ctx.f32(0));
+      ctx.forRange(ctx.u32(0), ctx.uniform("size"), (i) => {
+        acc.addAssign(ctx.load("input", i));
+      });
+      ctx.emitStore("out", ctx.u32(0), acc.get());
+    }
+  });
+}
+var WG$4;
+var init_reduction_tile_ir = __esmMin((() => {
+  init_fusion_tile_ir();
+  init_shape_utils();
+  init_tile_compiler();
+  init_tile_ir();
+  WG$4 = 256;
+}));
+function reductionCount(inputShape, dim) {
+  if (dim == null) return sizeOf(inputShape);
+  const dims = Array.isArray(dim) ? dim : [dim];
+  const rank2 = inputShape.length;
+  return dims.reduce((acc, d) => acc * inputShape[normalizeDim$1(d, rank2)], 1);
+}
+function prepareDimReduction(inputShape, dim, keepdim) {
+  const dims = Array.isArray(dim) ? dim : [dim];
+  const rank2 = inputShape.length;
+  const normalizedDims = dims.map((d) => normalizeDim$1(d, rank2));
+  const outShape = [];
+  for (let i = 0; i < rank2; i++) if (normalizedDims.includes(i)) {
+    if (keepdim) outShape.push(1);
+  } else outShape.push(inputShape[i]);
+  if (outShape.length === 0) return null;
+  const inputStrides = contiguousStrides(inputShape);
+  const outStrides = contiguousStrides(outShape);
+  let reductionSize = 1;
+  for (const d of normalizedDims) reductionSize *= inputShape[d];
+  const inputToOutDim = [];
+  let outDimIdx = 0;
+  for (let i = 0; i < rank2; i++) if (normalizedDims.includes(i)) if (keepdim) {
+    inputToOutDim.push(outDimIdx);
+    outDimIdx++;
+  } else inputToOutDim.push(-1);
+  else {
+    inputToOutDim.push(outDimIdx);
+    outDimIdx++;
+  }
+  return {
+    normalizedDims,
+    rank: rank2,
+    outShape,
+    outSize: sizeOf(outShape),
+    reductionSize,
+    inputStrides,
+    outStrides,
+    inputToOutDim
+  };
+}
+function getCachedDispatcher(key, specFactory) {
+  let d = dispatcherCache$1.get(key);
+  if (!d) {
+    d = createTileKernelDispatcher(specFactory());
+    dispatcherCache$1.set(key, d);
+  }
+  return d;
+}
+function inputBufferMap(inputs) {
+  const m = {};
+  for (let i = 0; i < inputs.length; i++) m[`in${i}`] = asGPUTensor(inputs[i]).buffer;
+  return m;
+}
+function createInvCountEpilogue(ctx, count, epilogueOps, epilogueInputs) {
+  const invCountBuffer = createTrackedBuffer(ctx.device, {
+    size: 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  });
+  ctx.device.queue.writeBuffer(invCountBuffer, 0, new Float32Array([1 / count]));
+  return {
+    ops: [{
+      kind: "binary",
+      op: "mul",
+      inputIndex: epilogueInputs.length
+    }, ...epilogueOps],
+    inputs: [...epilogueInputs, {
+      buffer: invCountBuffer,
+      shape: [],
+      toArray: () => []
+    }],
+    invCountBuffer
+  };
+}
+function addEpilogueBindings(buffers, epilogueOps, epilogueInputs) {
+  for (const eop of epilogueOps) if (eop.kind === "binary" && eop.inputIndex !== void 0) buffers[`ep_in${eop.inputIndex}`] = asGPUTensor(epilogueInputs[eop.inputIndex]).buffer;
+}
+function reduction(op, a, options, epilogueOps, epilogueInputs, outputDtype) {
+  const ctx = requireContext();
+  let tensor = asGPUTensor(a);
+  let contiguousCopy = null;
+  if (!tensor.isContiguous) {
+    tensor = asGPUTensor(contiguous(tensor));
+    contiguousCopy = tensor;
+  }
+  const inputShape = tensor.shape;
+  const dim = options?.dim;
+  const keepdim = options?.keepdim ?? false;
+  const hasEpilogue = epilogueOps != null && epilogueOps.length > 0;
+  const bpe = outputDtype ? dtypeBytes(outputDtype) : 4;
+  const epilogue = hasEpilogue ? {
+    ops: epilogueOps,
+    outputDtype
+  } : void 0;
+  const setup = dim != null ? prepareDimReduction(inputShape, dim, keepdim) : null;
+  if (!setup) {
+    if (!hasEpilogue) {
+      const result = fullReduction(op, ctx, tensor);
+      if (contiguousCopy) contiguousCopy.destroy();
+      return result;
+    }
+    const outBuffer2 = resolveOutputBuffer(ctx.device, bpe, [tensor.buffer]);
+    const buffers2 = {
+      input: tensor.buffer,
+      out: outBuffer2
+    };
+    addEpilogueBindings(buffers2, epilogueOps, epilogueInputs);
+    createTileKernelDispatcher(makeReductionSpec({
+      reduceOp: op,
+      epilogue
+    })).dispatch(buffers2, { size: tensor.size });
+    if (contiguousCopy) contiguousCopy.destroy();
+    return createTensor([], outBuffer2, void 0, 0, outputDtype);
+  }
+  for (const d of setup.normalizedDims) if (d < 0 || d >= setup.rank) throw new Error(`${op}: dimension ${d} out of range`);
+  const { normalizedDims, outShape, outSize, reductionSize, inputStrides, outStrides, inputToOutDim } = setup;
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bpe, [tensor.buffer]);
+  const spec = makeReductionSpec({
+    reduceOp: op,
+    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, reductionSize > 64),
+    epilogue
+  });
+  const buffers = {
+    input: tensor.buffer,
+    out: outBuffer
+  };
+  if (hasEpilogue) addEpilogueBindings(buffers, epilogueOps, epilogueInputs);
+  createTileKernelDispatcher(spec).dispatch(buffers, {
+    outSize,
+    reductionSize
+  });
+  if (contiguousCopy) contiguousCopy.destroy();
+  return createTensor(outShape, outBuffer, void 0, 0, outputDtype);
+}
+function fullReduction(op, ctx, tensor) {
+  if (op === "sum") {
+    const bytesPerElement = dtypeBytes(tensor.dtype);
+    const maxBindingSize = ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    if (tensor.buffer.size > maxBindingSize || tensor.size * bytesPerElement > maxBindingSize) return sumFullReductionChunked(ctx, tensor, maxBindingSize);
+  }
+  const outBuffer = resolveOutputBuffer(ctx.device, 4, [tensor.buffer]);
+  getCachedDispatcher(`${op}Full`, () => makeReductionSpec({ reduceOp: op })).dispatch({
+    input: tensor.buffer,
+    out: outBuffer
+  }, { size: tensor.size });
+  return createTensor([], outBuffer);
+}
+function sum(a, options) {
+  return reduction("sum", a, options);
+}
+function sumFullReductionChunked(ctx, tensor, maxBindingSize) {
+  const bytesPerElement = dtypeBytes(tensor.dtype);
+  const elementsPerAlignment = (ctx.device.limits?.minStorageBufferOffsetAlignment ?? 256) / bytesPerElement;
+  const maxElementsPerChunk = Math.floor(maxBindingSize / bytesPerElement);
+  const elementsPerChunk = Math.floor(maxElementsPerChunk / elementsPerAlignment) * elementsPerAlignment;
+  const totalElements = tensor.size;
+  const numChunks = Math.ceil(totalElements / elementsPerChunk);
+  const partialsBuffer = createTrackedBuffer(ctx.device, {
+    size: alignBufferSize(numChunks * 4),
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  });
+  const chunkWGSL = getChunkedSumWGSL();
+  const pipeline = getPipeline(ctx, chunkWGSL, chunkWGSL);
+  for (let chunk = 0; chunk < numChunks; chunk++) {
+    const chunkStart = chunk * elementsPerChunk;
+    const chunkSize = Math.min(chunkStart + elementsPerChunk, totalElements) - chunkStart;
+    const chunkByteOffset = chunkStart * bytesPerElement;
+    const chunkByteSize = chunkSize * bytesPerElement;
+    const paramsBuffer = createParamsBuffer(ctx.device, params(chunkSize, chunk));
+    dispatchComputePass(pipeline, profiledCreateBindGroup(ctx.device, {
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: {
+            buffer: tensor.buffer,
+            offset: chunkByteOffset,
+            size: chunkByteSize
+          }
+        },
+        {
+          binding: 1,
+          resource: { buffer: partialsBuffer }
+        },
+        {
+          binding: 2,
+          resource: { buffer: paramsBuffer }
+        }
+      ]
+    }), 1);
+    releaseParamsBuffer(paramsBuffer);
+  }
+  if (numChunks === 1) return createTensor([], partialsBuffer);
+  const outBuffer = createTrackedBuffer(ctx.device, {
+    size: 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  });
+  const finalWGSL = getFinalSumWGSL();
+  const finalPipeline = getPipeline(ctx, finalWGSL, finalWGSL);
+  const finalParamsData = new Uint32Array([
+    numChunks,
+    0,
+    0,
+    0
+  ]);
+  const finalParamsBuffer = createParamsBuffer(ctx.device, finalParamsData);
+  dispatchComputePass(finalPipeline, cachedCreateBindGroup(ctx.device, finalPipeline, [
+    partialsBuffer,
+    outBuffer,
+    finalParamsBuffer
+  ]), 1);
+  releaseParamsBuffer(finalParamsBuffer);
+  bufferPool.deferredDestroy(partialsBuffer, alignBufferSize(numChunks * 4));
+  return createTensor([], outBuffer);
+}
+function sumDimWithPreambleChain(inputs, chainOps, inputDtypes, sumOptions) {
+  const ctx = requireContext();
+  const tensor0 = asGPUTensor(inputs[0]);
+  const inputShape = tensor0.shape;
+  const dim = sumOptions?.dim;
+  const keepdim = sumOptions?.keepdim ?? false;
+  const setup = dim != null ? prepareDimReduction(inputShape, dim, keepdim) : null;
+  const inputBuffers = inputs.map((inp) => asGPUTensor(inp).buffer);
+  const preamble = {
+    chainOps,
+    totalInputs: inputs.length,
+    inputDtypes
+  };
+  if (!setup) {
+    const outBuffer2 = resolveOutputBuffer(ctx.device, 4, inputBuffers);
+    createTileKernelDispatcher(makeReductionSpec({
+      reduceOp: "sum",
+      preamble
+    })).dispatch({
+      ...inputBufferMap(inputs),
+      out: outBuffer2
+    }, { size: tensor0.size });
+    return createTensor([], outBuffer2);
+  }
+  const { normalizedDims, outShape, outSize, reductionSize, inputStrides, outStrides, inputToOutDim } = setup;
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, inputBuffers);
+  createTileKernelDispatcher(makeReductionSpec({
+    reduceOp: "sum",
+    dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, reductionSize > 64),
+    preamble
+  })).dispatch({
+    ...inputBufferMap(inputs),
+    out: outBuffer
+  }, {
+    outSize,
+    reductionSize
+  });
+  return createTensor(outShape, outBuffer);
+}
+function sumWithPreambleEpilogue(preambleInputs, chainOps, preambleInputDtypes, epilogueOps, epilogueInputs, outputDtype, sumOptions, isMean) {
+  const ctx = requireContext();
+  const tensor0 = asGPUTensor(preambleInputs[0]);
+  const inputShape = tensor0.shape;
+  const dim = sumOptions?.dim;
+  const keepdim = sumOptions?.keepdim ?? false;
+  let effectiveEpilogueOps = epilogueOps;
+  let effectiveEpilogueInputs = epilogueInputs;
+  let invCountBuffer = null;
+  if (isMean) {
+    const mean2 = createInvCountEpilogue(ctx, reductionCount(inputShape, dim), epilogueOps, epilogueInputs);
+    effectiveEpilogueOps = mean2.ops;
+    effectiveEpilogueInputs = mean2.inputs;
+    invCountBuffer = mean2.invCountBuffer;
+  }
+  const bpe = dtypeBytes(outputDtype);
+  const setup = dim != null ? prepareDimReduction(inputShape, dim, keepdim) : null;
+  const preamble = {
+    chainOps,
+    totalInputs: preambleInputs.length,
+    inputDtypes: preambleInputDtypes
+  };
+  const epilogue = {
+    ops: effectiveEpilogueOps,
+    outputDtype
+  };
+  const allInputBuffers = [...preambleInputs.map((inp) => asGPUTensor(inp).buffer), ...effectiveEpilogueInputs.map((inp) => asGPUTensor(inp).buffer)];
+  const buffers = { ...inputBufferMap(preambleInputs) };
+  addEpilogueBindings(buffers, effectiveEpilogueOps, effectiveEpilogueInputs);
+  let result;
+  if (!setup) {
+    const outBuffer = resolveOutputBuffer(ctx.device, bpe, allInputBuffers);
+    buffers.out = outBuffer;
+    createTileKernelDispatcher(makeReductionSpec({
+      reduceOp: "sum",
+      preamble,
+      epilogue
+    })).dispatch(buffers, { size: tensor0.size });
+    result = createTensor([], outBuffer, void 0, 0, outputDtype);
+  } else {
+    const { normalizedDims, outShape, outSize, reductionSize, inputStrides, outStrides, inputToOutDim } = setup;
+    const outBuffer = resolveOutputBuffer(ctx.device, outSize * bpe, allInputBuffers);
+    buffers.out = outBuffer;
+    createTileKernelDispatcher(makeReductionSpec({
+      reduceOp: "sum",
+      dim: dimInfo(inputShape, inputStrides, normalizedDims, outShape, outStrides, inputToOutDim, reductionSize > 64),
+      preamble,
+      epilogue
+    })).dispatch(buffers, {
+      outSize,
+      reductionSize
+    });
+    result = createTensor(outShape, outBuffer, void 0, 0, outputDtype);
+  }
+  if (invCountBuffer) releaseParamsBuffer(invCountBuffer);
+  return result;
+}
+function max(a, options) {
+  return reduction("max", a, options);
+}
+function min(a, options) {
+  return reduction("min", a, options);
+}
+function mean(a, options) {
+  const count = reductionCount(asGPUTensor(a).shape, options?.dim);
+  const sumTensor = asGPUTensor(sum(a, options));
+  const ctx = requireContext();
+  const outSize = sumTensor.size;
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [sumTensor.buffer]);
+  getCachedDispatcher("meanDiv", makeMeanDivSpec).dispatch({
+    input: sumTensor.buffer,
+    out: outBuffer
+  }, {
+    size: outSize,
+    count
+  });
+  sumTensor.destroy();
+  return createTensor(sumTensor.shape, outBuffer);
+}
+function meanWithEpilogue(a, options, epilogueOps, epilogueInputs, outputDtype) {
+  const count = reductionCount(asGPUTensor(a).shape, options?.dim);
+  const mean2 = createInvCountEpilogue(requireContext(), count, epilogueOps, epilogueInputs);
+  const result = reduction("sum", a, options, mean2.ops, mean2.inputs, outputDtype);
+  releaseParamsBuffer(mean2.invCountBuffer);
+  return result;
+}
+var dispatcherCache$1;
+var init_reductions = __esmMin((() => {
+  init_shape();
+  init_types$1();
+  init_bind_group_cache();
+  init_buffer_arena();
+  init_buffer_pool();
+  init_dispatch();
+  init_gpu_context();
+  init_gpu_types();
+  init_reduction_tile_ir();
+  init_shape_utils();
+  init_tensor();
+  init_tile_dispatch();
+  init_views();
+  dispatcherCache$1 = /* @__PURE__ */ new Map();
+}));
+function comparisonOp(opName, wgslOp, a, b, options) {
+  const aTensor = asGPUTensor(a);
+  const bTensor = asGPUTensor(b);
+  const outShape = broadcastShapes(aTensor.shape, bTensor.shape);
+  const indexShape = toIndexShape(outShape);
+  const outSize = sizeOf(outShape);
+  const aStrides = computeEffectiveBroadcastStrides(aTensor, indexShape);
+  const bStrides = computeEffectiveBroadcastStrides(bTensor, indexShape);
+  const dispatch = compute2DDispatch(Math.ceil(outSize / 256));
+  const code = comparisonWGSL(wgslOp, indexShape, aStrides, bStrides, aTensor.offset, bTensor.offset);
+  return createTensor(outShape, dispatchElementwise({
+    key: `${opName}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${aTensor.offset}:${bTensor.offset}`,
+    shader: code,
+    inputs: [aTensor.buffer, bTensor.buffer],
+    outputSizeBytes: outSize * 4,
+    params: params(outSize),
+    outBuffer: options?.outBuffer,
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y
+  }));
+}
+function argReduceOp(opName, compareOp, a, options) {
+  const ctx = requireContext();
+  const tensor = asGPUTensor(a);
+  const inputShape = tensor.shape;
+  const rank2 = inputShape.length;
+  const dim = options.dim < 0 ? options.dim + rank2 : options.dim;
+  if (dim < 0 || dim >= rank2) throw new Error(`${opName}: dim ${options.dim} out of range for tensor of rank ${rank2}`);
+  const keepdim = options.keepdim ?? false;
+  const outShape = [];
+  for (let i = 0; i < rank2; i++) if (i === dim) {
+    if (keepdim) outShape.push(1);
+  } else outShape.push(inputShape[i]);
+  const outSize = sizeOf(outShape) || 1;
+  const outBuffer = createTrackedBuffer(ctx.device, {
+    size: outSize * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  });
+  const inputStrides = contiguousStrides(inputShape);
+  const dimSize = inputShape[dim];
+  const dimStride = inputStrides[dim];
+  const inputToOutDim = [];
+  let outDimIdx = 0;
+  for (let i = 0; i < rank2; i++) if (i === dim) if (keepdim) {
+    inputToOutDim.push(outDimIdx);
+    outDimIdx++;
+  } else inputToOutDim.push(-1);
+  else {
+    inputToOutDim.push(outDimIdx);
+    outDimIdx++;
+  }
+  const code = argReduceWGSL(compareOp, inputShape, inputStrides, outShape, dim, inputToOutDim);
+  const pipeline = getPipeline(ctx, `${opName}:${inputShape.join(",")}:${dim}:${keepdim}`, code);
+  const paramsBuffer = createParamsBuffer(ctx.device, params(outSize, dimSize, dimStride));
+  dispatchComputePass(pipeline, cachedCreateBindGroup(ctx.device, pipeline, [
+    tensor.buffer,
+    outBuffer,
+    paramsBuffer
+  ]), Math.ceil(outSize / 256));
+  releaseParamsBuffer(paramsBuffer);
+  return createTensor(outShape, outBuffer);
+}
+var cmp, gt, lt, ge, le, eq, ne, argReduce, argmax, argmin;
+var init_comparison = __esmMin((() => {
+  init_bind_group_cache();
+  init_dispatch();
+  init_gpu_context();
+  init_gpu_types();
+  init_shape_utils();
+  init_tensor();
+  init_ops_tile_ir();
+  cmp = (name, op) => (a, b, options) => comparisonOp(name, op, a, b, options);
+  gt = cmp("gt", ">");
+  lt = cmp("lt", "<");
+  ge = cmp("ge", ">=");
+  le = cmp("le", "<=");
+  eq = cmp("eq", "==");
+  ne = cmp("ne", "!=");
+  argReduce = (name, op) => (a, options) => argReduceOp(name, op, a, options);
+  argmax = argReduce("argmax", ">");
+  argmin = argReduce("argmin", "<");
+}));
+function conv2dOutputShape(inputShape, weightShape, stride, padding) {
+  const [N, , H, W] = inputShape;
+  const [Cout, , KH, KW] = weightShape;
+  return [
+    N,
+    Cout,
+    Math.floor((H + 2 * padding[0] - KH) / stride[0] + 1),
+    Math.floor((W + 2 * padding[1] - KW) / stride[1] + 1)
+  ];
+}
+function normalizeParam(p, fallback) {
+  if (p === void 0) return [fallback, fallback];
+  if (typeof p === "number") return [p, p];
+  return p;
+}
+function makeConv2dSpec(kH, kW, Cin, hasBias, dtype = "f32") {
+  const bindings = {
+    input: {
+      storage: "read",
+      type: dtype
+    },
+    weight: {
+      storage: "read",
+      type: dtype
+    },
+    out: {
+      storage: "read_write",
+      type: dtype
+    }
+  };
+  if (hasBias) bindings.bias = {
+    storage: "read",
+    type: dtype
+  };
+  return {
+    name: `conv2d_${kH}x${kW}_c${Cin}${hasBias ? "_bias" : ""}`,
+    workgroupSize: WG$3,
+    bindings,
+    uniforms: {
+      N: "u32",
+      Cin: "u32",
+      H: "u32",
+      W: "u32",
+      Cout: "u32",
+      outH: "u32",
+      outW: "u32",
+      strideH: "u32",
+      strideW: "u32",
+      padH: "u32",
+      padW: "u32",
+      totalOut: "u32"
+    },
+    grid: elementwiseGrid(WG$3, { elementUniform: "totalOut" }),
+    kernel(ctx) {
+      const idx = ctx.elementIndex(WG$3, "totalOut");
+      const outW = ctx.uniform("outW");
+      const outH = ctx.uniform("outH");
+      const Cout = ctx.uniform("Cout");
+      const H = ctx.uniform("H");
+      const W = ctx.uniform("W");
+      const ow = idx.mod(outW);
+      const rest1 = idx.div(outW);
+      const oh = rest1.mod(outH);
+      const rest2 = rest1.div(outH);
+      const co = rest2.mod(Cout);
+      const n = rest2.div(Cout);
+      const acc = ctx.emitVar("acc", "f32", hasBias ? ctx.load("bias", co) : ctx.f32(0));
+      const baseH = oh.mul(ctx.uniform("strideH"));
+      const baseW = ow.mul(ctx.uniform("strideW"));
+      const padH = ctx.uniform("padH");
+      const padW = ctx.uniform("padW");
+      const inputHW = H.mul(W);
+      const inputCHW = ctx.uniform("Cin").mul(inputHW);
+      const inputBatchBase = n.mul(inputCHW);
+      const cKHKW = ctx.u32(Cin * kH * kW);
+      const weightCoBase = co.mul(cKHKW);
+      ctx.forRange(ctx.u32(0), ctx.uniform("Cin"), (ci) => {
+        const inputCBase = inputBatchBase.add(ci.mul(inputHW));
+        const weightCBase = weightCoBase.add(ci.mul(ctx.u32(kH * kW)));
+        for (let ky = 0; ky < kH; ky++) for (let kx = 0; kx < kW; kx++) {
+          const ih = baseH.add(ctx.u32(ky)).sub(padH);
+          const iw = baseW.add(ctx.u32(kx)).sub(padW);
+          const inBounds = ih.lt(H).and(iw.lt(W));
+          const inputIdx = inputCBase.add(ih.mul(W)).add(iw);
+          const inputVal = inBounds.select(ctx.load("input", inputIdx), ctx.f32(0));
+          const weightIdx = weightCBase.add(ctx.u32(ky * kW + kx));
+          const weightVal = ctx.load("weight", weightIdx);
+          acc.addAssign(inputVal.mul(weightVal));
+        }
+      });
+      ctx.emitStore("out", idx, acc.get());
+    }
+  };
+}
+function getDispatcher(kH, kW, Cin, hasBias) {
+  const key = `conv2d_${kH}x${kW}_c${Cin}${hasBias ? "_b" : ""}`;
+  let d = dispatcherCache.get(key);
+  if (!d) {
+    d = createTileKernelDispatcher(makeConv2dSpec(kH, kW, Cin, hasBias));
+    dispatcherCache.set(key, d);
+  }
+  return d;
+}
+function conv2d(_input, _weight, _bias, options) {
+  const input = asGPUTensor(_input);
+  const weight = asGPUTensor(_weight);
+  const bias = _bias ? asGPUTensor(_bias) : void 0;
+  if (input.shape.length !== 4) throw new Error(`conv2d: input must be 4D [N,C,H,W], got ${input.shape}`);
+  if (weight.shape.length !== 4) throw new Error(`conv2d: weight must be 4D [Cout,Cin,kH,kW], got ${weight.shape}`);
+  const [N, Cin, H, W] = input.shape;
+  const [Cout, CinK, kH, kW] = weight.shape;
+  if (Cin !== CinK) throw new Error(`conv2d: input channels ${Cin} != weight channels ${CinK}`);
+  const stride = normalizeParam(options?.stride, 1);
+  const padding = normalizeParam(options?.padding, 0);
+  const hasBias = !!bias;
+  if (hasBias && (bias?.shape.length !== 1 || bias?.shape[0] !== Cout)) throw new Error(`conv2d: bias must be [Cout=${Cout}], got ${bias?.shape}`);
+  const outShape = conv2dOutputShape(input.shape, weight.shape, stride, padding);
+  const [, , outH, outW] = outShape;
+  const totalOut = N * Cout * outH * outW;
+  const ctx = requireContext();
+  const outBuffer = options?.outBuffer ? options.outBuffer : resolveOutputBuffer(ctx.device, totalOut * 4, [input.buffer, weight.buffer]);
+  const dispatcher = getDispatcher(kH, kW, Cin, hasBias);
+  const buffers = {
+    input: input.buffer,
+    weight: weight.buffer,
+    out: outBuffer
+  };
+  if (hasBias) buffers.bias = bias?.buffer;
+  dispatcher.dispatch(buffers, {
+    N,
+    Cin,
+    H,
+    W,
+    Cout,
+    outH,
+    outW,
+    strideH: stride[0],
+    strideW: stride[1],
+    padH: padding[0],
+    padW: padding[1],
+    totalOut
+  });
+  return createTensor(outShape, outBuffer);
+}
+var WG$3, dispatcherCache;
+var init_conv2d = __esmMin((() => {
+  init_buffer_arena();
+  init_gpu_context();
+  init_gpu_types();
+  init_shape_utils();
+  init_tensor();
+  init_tile_dispatch();
+  init_tile_ir();
+  WG$3 = 256;
+  dispatcherCache = /* @__PURE__ */ new Map();
+}));
+function sub(a, b, options) {
+  return dispatchBinary("-", asGPUTensor(a), asGPUTensor(b), options);
+}
+function div(a, b, options) {
+  return dispatchBinary("/", asGPUTensor(a), asGPUTensor(b), options);
+}
+function gelu(a, options) {
+  return dispatchUnary((options?.approximate ?? "tanh") === "tanh" ? "gelu" : "gelu_erf", asGPUTensor(a), { outBuffer: options?.outBuffer });
+}
+function clamp(a, min2, max2, options) {
+  return dispatchUnary(`clamp_${min2}_${max2}`, asGPUTensor(a), options);
+}
+var unary, binary, add, mul, pow, sqrt, relu, exp, log, neg, abs, tanh, sigmoid, silu, sin, cos, rsqrt, floor, ceil, round, sign, isfinite;
+var init_elementwise = __esmMin((() => {
+  init_dispatch();
+  init_gpu_types();
+  unary = (name) => (a, options) => dispatchUnary(name, asGPUTensor(a), options);
+  binary = (op) => (a, b, options) => dispatchBinary(op, asGPUTensor(a), asGPUTensor(b), options);
+  add = binary("+");
+  mul = binary("*");
+  pow = binary("pow");
+  sqrt = unary("sqrt");
+  relu = unary("relu");
+  exp = unary("exp");
+  log = unary("log");
+  neg = unary("neg");
+  abs = unary("abs");
+  tanh = unary("tanh");
+  sigmoid = unary("sigmoid");
+  silu = unary("silu");
+  sin = unary("sin");
+  cos = unary("cos");
+  rsqrt = unary("rsqrt");
+  floor = unary("floor");
+  ceil = unary("ceil");
+  round = unary("round");
+  sign = unary("sign");
+  isfinite = unary("isfinite");
+}));
+function makeAdamStepSpec(useVec4, emitF16, emitUnscale) {
+  const bindings = {
+    grad: {
+      storage: "read",
+      type: "f32"
+    },
+    param: {
+      storage: "read_write",
+      type: "f32"
+    },
+    m: {
+      storage: "read_write",
+      type: "f32"
+    },
+    v: {
+      storage: "read_write",
+      type: "f32"
+    }
+  };
+  if (emitF16) bindings.param_f16 = {
+    storage: "read_write",
+    type: "f16"
+  };
+  if (emitUnscale) bindings.inf_flag = {
+    storage: "atomic",
+    type: "u32"
+  };
+  const uniforms = {
+    beta1: "f32",
+    beta2: "f32",
+    step_size: "f32",
+    eps: "f32",
+    weight_decay: "f32",
+    lr_times_wd: "f32",
+    decoupled_wd: "u32",
+    num_elements: "u32"
+  };
+  if (emitUnscale) {
+    uniforms.grid_stride = "u32";
+    uniforms.inv_scale = "f32";
+    uniforms._pad0 = "u32";
+    uniforms._pad1 = "u32";
+  } else {
+    uniforms._pad0 = "u32";
+    uniforms._pad1 = "u32";
+    uniforms._pad2 = "u32";
+    uniforms._pad3 = "u32";
+  }
+  if (!emitUnscale) return {
+    name: `adamStep${emitF16 ? "F16" : ""}`,
+    workgroupSize: 256,
+    bindings,
+    uniforms,
+    uniformBindingIndex: 4,
+    enableF16: emitF16,
+    autoVectorize: true,
+    kernel(ctx) {
+      const idx = ctx.elementIndex(256, "num_elements");
+      emitAdamScalarBody(ctx, idx, ctx.emitVar("g", "f32", ctx.load("grad", idx)), emitF16);
+    }
+  };
+  return {
+    name: `adamStepUnscale${emitF16 ? "F16" : ""}${useVec4 ? "Vec4" : ""}`,
+    workgroupSize: 256,
+    bindings,
+    uniforms,
+    uniformBindingIndex: 4,
+    enableF16: emitF16,
+    grid: (u) => {
+      const workItems = useVec4 ? Math.ceil(u.num_elements / 4) : u.num_elements;
+      const wg = Math.ceil(workItems / 256);
+      if (wg <= 65535) return [wg];
+      const x = Math.min(wg, MAX_WORKGROUPS_PER_DIM);
+      return [x, Math.ceil(wg / x)];
+    },
+    kernel(ctx) {
+      const numElements = ctx.uniform("num_elements");
+      const gridStride = ctx.uniform("grid_stride");
+      const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
+      if (useVec4) {
+        const flatId = ctx.emitLet("flatId", ctx.globalId(0).add(ctx.globalId(1).mul(gridStride)));
+        const base = ctx.emitLet("base", flatId.mul(ctx.u32(4)));
+        ctx.ifThen(base.ge(numElements), () => {
+          ctx.emitReturn();
+        });
+        const gVars = [];
+        for (let e = 0; e < 4; e++) {
+          const off = e === 0 ? base : base.add(ctx.u32(e));
+          const gVar = ctx.emitVar(`g${e}`, "f32", ctx.load("grad", off).mul(invScale));
+          gVars.push(gVar);
+          const exponent = gVar.get().bitcastTo("u32").shr(ctx.u32(23)).and(ctx.u32(255));
+          ctx.ifThen(exponent.eq(ctx.u32(255)), () => {
+            ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(F32_ONE_BITS));
+            gVar.set(ctx.f32(0));
+          });
+        }
+        for (let e = 0; e < 4; e++) emitAdamScalarBody(ctx, e === 0 ? base : base.add(ctx.u32(e)), gVars[e], emitF16, `${e}`);
+      } else {
+        const idx = ctx.emitLet("idx", ctx.globalId(0).add(ctx.globalId(1).mul(gridStride)));
+        ctx.ifThen(idx.ge(numElements), () => {
+          ctx.emitReturn();
+        });
+        const gVar = ctx.emitVar("g", "f32", ctx.load("grad", idx).mul(invScale));
+        const exponent = gVar.get().bitcastTo("u32").shr(ctx.u32(23)).and(ctx.u32(255));
+        ctx.ifThen(exponent.eq(ctx.u32(255)), () => {
+          ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(F32_ONE_BITS));
+          gVar.set(ctx.f32(0));
+        });
+        emitAdamScalarBody(ctx, idx, gVar, emitF16);
+      }
+    }
+  };
+}
+function loadAdamUniforms(ctx) {
+  return {
+    beta1: ctx.uniform("beta1").bitcastTo("f32"),
+    beta2: ctx.uniform("beta2").bitcastTo("f32"),
+    stepSize: ctx.uniform("step_size").bitcastTo("f32"),
+    eps: ctx.uniform("eps").bitcastTo("f32"),
+    weightDecay: ctx.uniform("weight_decay").bitcastTo("f32"),
+    lrTimesWd: ctx.uniform("lr_times_wd").bitcastTo("f32"),
+    decoupledWd: ctx.uniform("decoupled_wd")
+  };
+}
+function emitAdamScalarBody(ctx, idx, gVar, emitF16, suffix = "") {
+  const p = ctx.emitLet(`p${suffix}`, ctx.load("param", idx));
+  const { beta1, beta2, stepSize, eps, weightDecay, lrTimesWd, decoupledWd } = loadAdamUniforms(ctx);
+  ctx.ifThen(decoupledWd.eq(ctx.u32(0)).and(weightDecay.bitcastTo("u32").gt(ctx.u32(0))), () => {
+    gVar.set(gVar.get().add(weightDecay.mul(p)));
+  });
+  const g = gVar.get();
+  const mNew = ctx.emitLet(`m_new${suffix}`, beta1.mul(ctx.load("m", idx)).add(ctx.f32(1).sub(beta1).mul(g)));
+  const vNew = ctx.emitLet(`v_new${suffix}`, beta2.mul(ctx.load("v", idx)).add(ctx.f32(1).sub(beta2).mul(g).mul(g)));
+  const pNewVar = ctx.emitVar(`p_new${suffix}`, "f32", p.sub(stepSize.mul(mNew).div(vNew.sqrt().add(eps))));
+  ctx.ifThen(decoupledWd.eq(ctx.u32(1)), () => {
+    pNewVar.set(pNewVar.get().sub(lrTimesWd.mul(p)));
+  });
+  ctx.emitStore("param", idx, pNewVar.get());
+  ctx.emitStore("m", idx, mNew);
+  ctx.emitStore("v", idx, vNew);
+  if (emitF16) ctx.emitStore("param_f16", idx, pNewVar.get().toF16());
+}
+function getAdamDispatcher(useVec4, emitF16, emitUnscale) {
+  const key = `${useVec4}:${emitF16}:${emitUnscale}`;
+  let d = adamDispatchers.get(key);
+  if (!d) {
+    d = createTileKernelDispatcher(makeAdamStepSpec(useVec4, emitF16, emitUnscale));
+    adamDispatchers.set(key, d);
+  }
+  return d;
+}
+function dispatchAdamStep(gradBuffer, paramBuffer, mBuffer, vBuffer, numElements, config, emitF16 = false, infFlagBuffer = null) {
+  const doF16 = emitF16 && isF16Supported();
+  const doUnscale = infFlagBuffer !== null;
+  const bytesPerElement = 4;
+  const f16BytesPerElement = 2;
+  const totalBytes = numElements * bytesPerElement;
+  const maxBindingSize = getMaxStorageBufferBindingSize();
+  const needsChunking = totalBytes > maxBindingSize;
+  let _st = profileSubOpBegin();
+  trackSharedEncoderWrite(gradBuffer);
+  trackSharedEncoderWrite(paramBuffer);
+  trackSharedEncoderWrite(mBuffer);
+  trackSharedEncoderWrite(vBuffer);
+  let paramF16Out = null;
+  if (doF16) {
+    paramF16Out = allocateOutputBuffer(numElements * f16BytesPerElement);
+    trackSharedEncoderWrite(paramF16Out);
+  }
+  profileSubOpEnd("adam.allocBufs", _st);
+  const useVec4 = doUnscale && numElements % 4 === 0;
+  const buffers = {
+    grad: gradBuffer,
+    param: paramBuffer,
+    m: mBuffer,
+    v: vBuffer
+  };
+  if (doF16 && paramF16Out) buffers.param_f16 = paramF16Out;
+  if (doUnscale && infFlagBuffer) buffers.inf_flag = infFlagBuffer;
+  const uniforms = {
+    beta1: config.beta1,
+    beta2: config.beta2,
+    step_size: config.stepSize,
+    eps: config.eps,
+    weight_decay: config.weightDecay,
+    lr_times_wd: config.lrTimesWd,
+    decoupled_wd: config.decoupledWd ? 1 : 0,
+    num_elements: numElements
+  };
+  if (doUnscale) {
+    const elemPerChunk = needsChunking ? computeFlatChunkLayout(numElements, bytesPerElement, maxBindingSize, 256, doF16 ? 128 : 64).elementsPerChunk : numElements;
+    const workItems = useVec4 ? Math.ceil(elemPerChunk / 4) : elemPerChunk;
+    const wg = Math.ceil(workItems / 256);
+    uniforms.grid_stride = Math.min(wg, MAX_WORKGROUPS_PER_DIM) * 256;
+    uniforms.inv_scale = config.invScale ?? 1;
+    uniforms._pad0 = 0;
+    uniforms._pad1 = 0;
+  } else {
+    uniforms._pad0 = 0;
+    uniforms._pad1 = 0;
+    uniforms._pad2 = 0;
+    uniforms._pad3 = 0;
+  }
+  const dispatcher = getAdamDispatcher(useVec4, doF16, doUnscale);
+  _st = profileSubOpBegin();
+  if (needsChunking) {
+    const epa = doF16 ? 128 : 64;
+    const modes = {
+      grad: "chunked",
+      param: "chunked",
+      m: "chunked",
+      v: "chunked"
+    };
+    if (doF16) modes.param_f16 = "chunked";
+    if (doUnscale) modes.inf_flag = "scalar";
+    const bpe = doF16 ? { param_f16: f16BytesPerElement } : void 0;
+    dispatcher.dispatchChunked(buffers, uniforms, {
+      modes,
+      bytesPerElement: bpe,
+      sizeUniform: "num_elements",
+      totalElements: numElements,
+      maxBytesPerElement: bytesPerElement,
+      elementsPerAlignment: epa
+    });
+  } else dispatcher.dispatch(buffers, uniforms);
+  profileSubOpEnd("adam.dispatch", _st);
+  const result = {
+    paramBuffer,
+    mBuffer,
+    vBuffer
+  };
+  if (paramF16Out) result.paramF16Buffer = paramF16Out;
+  return result;
+}
+function resetAdamKernelState() {
+  for (const d of adamDispatchers.values()) d.reset();
+  adamDispatchers.clear();
+}
+var adamDispatchers;
+var init_adam_kernel = __esmMin((() => {
+  init_buffer_arena();
+  init_chunked_dispatch();
+  init_gpu_context();
+  init_profiler$1();
+  init_shape_utils();
+  init_tile_dispatch();
+  init_webgpu_state();
+  adamDispatchers = /* @__PURE__ */ new Map();
+  onTeardown(resetAdamKernelState);
+}));
+function getTileIRWGSL(key, specFactory) {
+  let wgsl = tileIRWGSLCache.get(key);
+  if (!wgsl) {
+    wgsl = compileTileKernel(specFactory());
+    tileIRWGSLCache.set(key, wgsl);
+  }
+  return wgsl;
+}
+function getOrCreateConfigBuffer(device, batchSize2, numHeads, seqLen2, headDim, scale, isCausal) {
+  const key = `${batchSize2}:${numHeads}:${seqLen2}:${headDim}:${scale}:${isCausal}`;
+  let buf = configCache.get(key);
+  if (buf) return buf;
+  buf = device.createBuffer({
+    size: 32,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: false
+  });
+  const data = /* @__PURE__ */ new ArrayBuffer(32);
+  const u32View = new Uint32Array(data);
+  const f32View = new Float32Array(data);
+  u32View[0] = batchSize2;
+  u32View[1] = numHeads;
+  u32View[2] = seqLen2;
+  u32View[3] = headDim;
+  f32View[4] = scale;
+  u32View[5] = isCausal;
+  u32View[6] = 0;
+  u32View[7] = 0;
+  device.queue.writeBuffer(buf, 0, new Uint8Array(data));
+  return buf;
+}
+function makeForwardAttentionSpec(headDim) {
+  if (headDim % 4 !== 0) throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  const D = headDim;
+  const WG2 = BR;
+  return {
+    name: `tileAttnFwd_D${D}`,
+    workgroupSize: WG2,
+    autoBarriers: true,
+    bindings: {
+      Q: {
+        storage: "read",
+        type: "f32"
+      },
+      K: {
+        storage: "read",
+        type: "f32"
+      },
+      V: {
+        storage: "read",
+        type: "f32"
+      },
+      O: {
+        storage: "read_write",
+        type: "f32"
+      },
+      L: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      is_causal: "u32"
+    },
+    grid: tiledGrid({
+      x: {
+        uniform: "seq_len",
+        tileSize: BR
+      },
+      y: "num_heads",
+      z: "batch_size"
+    }),
+    kernel(ctx) {
+      const tidx = ctx.localIndex();
+      const qBlock = ctx.programId(0);
+      const hIdx = ctx.programId(1);
+      const bIdx = ctx.programId(2);
+      const N = ctx.uniform("seq_len");
+      const Dim = ctx.u32(D);
+      const numHeads = ctx.uniform("num_heads");
+      const isCausal = ctx.uniform("is_causal");
+      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
+      const qRow = qBlock.mul(ctx.u32(BR)).add(tidx);
+      const valid = qRow.lt(N);
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const qBase = bhOff.add(qRow.mul(Dim));
+      const Q = ctx.tileLoad("Q", {
+        kind: "thread",
+        base: qBase,
+        stride: ctx.u32(1)
+      }, {
+        rows: 1,
+        cols: D,
+        guard: valid
+      });
+      const mPrev = ctx.full(1, 1, F32_NEG_MAX);
+      const lPrev = ctx.full(1, 1, 0);
+      const oAcc = ctx.zeros(1, D);
+      const numKVTiles = N.add(ctx.u32(BC - 1)).div(ctx.u32(BC));
+      ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
+        const kvStart = tile.mul(ctx.u32(BC));
+        const offsR = ctx.arange(kvStart, BC);
+        const offsD = ctx.arange(ctx.u32(0), D);
+        const tilePtr = ctx.tilePtr(bhOff, offsR.outer(Dim), offsD.inner(ctx.u32(1)));
+        const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+        const K = ctx.load2D("K", tilePtr, tileMask);
+        const scores = ctx.dot(Q, K.T());
+        ctx.range(0, BC, (j) => {
+          const kvPos = kvStart.add(j);
+          const isActive = valid.and(kvPos.lt(N)).and(isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)));
+          scores.set(j, isActive.select(scores.get(j).mul(scale), ctx.f32(F32_NEG_MAX)));
+        });
+        const mMax = scores.max(1).max(mPrev);
+        const correction = mPrev.sub(mMax).exp();
+        oAcc.mul_(correction);
+        lPrev.mul_(correction);
+        scores.sub_(mMax);
+        scores.exp_();
+        lPrev.add_(scores.sum(1));
+        mPrev.assign(mMax);
+        const V = ctx.load2D("V", tilePtr, tileMask, { reuseShared: K });
+        ctx.dotAccum(scores, V, oAcc);
+      });
+      ctx.ifThen(valid, () => {
+        const l = lPrev.get(ctx.u32(0));
+        const invL = l.gt(ctx.f32(0)).select(ctx.f32(1).div(l), ctx.f32(0));
+        oAcc.mul_(invL);
+        ctx.tileStore("O", oAcc, {
+          base: qBase,
+          stride: ctx.u32(1)
+        });
+        const lse = mPrev.get(ctx.u32(0)).add(l.max(ctx.f32(1e-10)).log());
+        ctx.emitStore("L", bhOffL.add(qRow), lse);
+      });
+    }
+  };
+}
+function makeDPrecomputeSpec(headDim) {
+  const D = headDim;
+  const WG2 = 256;
+  return {
+    name: `tileAttnDPrecompute_D${D}`,
+    workgroupSize: WG2,
+    bindings: {
+      dO: {
+        storage: "read",
+        type: "f32"
+      },
+      Out: {
+        storage: "read",
+        type: "f32"
+      },
+      D_val: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      is_causal: "u32"
+    },
+    grid: (u) => [u.batch_size * u.num_heads * u.seq_len],
+    kernel(ctx) {
+      const row = ctx.programId(0);
+      const tid = ctx.localIndex();
+      const Dim = ctx.uniform("head_dim");
+      const base = row.mul(Dim);
+      const dotProd = ctx.wgReduce("sum", tid, Dim, WG2, (i) => ctx.load("dO", base.add(i)).mul(ctx.load("Out", base.add(i))));
+      ctx.guardedStore("D_val", tid.eq(ctx.u32(0)), row, dotProd);
+    }
+  };
+}
+function makeBackwardDQSpec(headDim) {
+  if (headDim % 4 !== 0) throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  const D = headDim;
+  const WG2 = BR;
+  return {
+    name: `tileAttnBwdDQ_D${D}`,
+    workgroupSize: WG2,
+    autoBarriers: true,
+    bindings: {
+      Q: {
+        storage: "read",
+        type: "f32"
+      },
+      K: {
+        storage: "read",
+        type: "f32"
+      },
+      V: {
+        storage: "read",
+        type: "f32"
+      },
+      L_buf: {
+        storage: "read",
+        type: "f32"
+      },
+      D_buf: {
+        storage: "read",
+        type: "f32"
+      },
+      dO: {
+        storage: "read",
+        type: "f32"
+      },
+      dQ: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      is_causal: "u32"
+    },
+    grid: tiledGrid({
+      x: {
+        uniform: "seq_len",
+        tileSize: BR
+      },
+      y: "num_heads",
+      z: "batch_size"
+    }),
+    kernel(ctx) {
+      const tidx = ctx.localIndex();
+      const qBlock = ctx.programId(0);
+      const hIdx = ctx.programId(1);
+      const bIdx = ctx.programId(2);
+      const N = ctx.uniform("seq_len");
+      const Dim = ctx.u32(D);
+      const numHeads = ctx.uniform("num_heads");
+      const isCausal = ctx.uniform("is_causal");
+      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
+      const qRow = qBlock.mul(ctx.u32(BR)).add(tidx);
+      const valid = qRow.lt(N);
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const rowBase = bhOff.add(qRow.mul(Dim));
+      const Q = ctx.tileLoad("Q", {
+        kind: "thread",
+        base: rowBase,
+        stride: ctx.u32(1)
+      }, {
+        rows: 1,
+        cols: D,
+        guard: valid
+      });
+      const dO = ctx.tileLoad("dO", {
+        kind: "thread",
+        base: rowBase,
+        stride: ctx.u32(1)
+      }, {
+        rows: 1,
+        cols: D,
+        guard: valid
+      });
+      const lVar = ctx.emitVar("_Li", "f32", ctx.f32(0));
+      const dVar = ctx.emitVar("_Di", "f32", ctx.f32(0));
+      ctx.ifThen(valid, () => {
+        lVar.set(ctx.load("L_buf", bhOffL.add(qRow)));
+        dVar.set(ctx.load("D_buf", bhOffL.add(qRow)));
+      });
+      const dqAcc = ctx.zeros(1, D);
+      const numKVTiles = N.add(ctx.u32(BC - 1)).div(ctx.u32(BC));
+      ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
+        const kvStart = tile.mul(ctx.u32(BC));
+        const offsR = ctx.arange(kvStart, BC);
+        const offsD = ctx.arange(ctx.u32(0), D);
+        const tilePtr = ctx.tilePtr(bhOff, offsR.outer(Dim), offsD.inner(ctx.u32(1)));
+        const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+        const K = ctx.load2D("K", tilePtr, tileMask);
+        const V = ctx.load2D("V", tilePtr, tileMask);
+        ctx.range(0, BC, (j) => {
+          const kvPos = kvStart.add(j);
+          const isActive = valid.and(kvPos.lt(N)).and(isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)));
+          const s = ctx.dotRow(Q, K, j).mul(scale);
+          const dov = ctx.dotRow(dO, V, j);
+          const ds = isActive.select(s.sub(lVar.get()).exp(), ctx.f32(0)).mul(dov.sub(dVar.get()));
+          ctx.accumRow(dqAcc, ds, K, j);
+        });
+      });
+      ctx.ifThen(valid, () => {
+        dqAcc.mul_(scale);
+        ctx.tileStore("dQ", dqAcc, {
+          base: rowBase,
+          stride: ctx.u32(1)
+        });
+      });
+    }
+  };
+}
+function makeBackwardDKVSpec(headDim) {
+  if (headDim % 4 !== 0) throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  const D = headDim;
+  const WG2 = BC_BW;
+  return {
+    name: `tileAttnBwdDKV_D${D}`,
+    workgroupSize: WG2,
+    autoBarriers: true,
+    bindings: {
+      Q: {
+        storage: "read",
+        type: "f32"
+      },
+      K: {
+        storage: "read",
+        type: "f32"
+      },
+      V: {
+        storage: "read",
+        type: "f32"
+      },
+      L_buf: {
+        storage: "read",
+        type: "f32"
+      },
+      D_buf: {
+        storage: "read",
+        type: "f32"
+      },
+      dO: {
+        storage: "read",
+        type: "f32"
+      },
+      dK: {
+        storage: "read_write",
+        type: "f32"
+      },
+      dV: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      is_causal: "u32"
+    },
+    grid: tiledGrid({
+      x: {
+        uniform: "seq_len",
+        tileSize: BC_BW
+      },
+      y: "num_heads",
+      z: "batch_size"
+    }),
+    kernel(ctx) {
+      const tidx = ctx.localIndex();
+      const kvBlock = ctx.programId(0);
+      const hIdx = ctx.programId(1);
+      const bIdx = ctx.programId(2);
+      const N = ctx.uniform("seq_len");
+      const Dim = ctx.u32(D);
+      const numHeads = ctx.uniform("num_heads");
+      const isCausal = ctx.uniform("is_causal");
+      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
+      const kvRow = kvBlock.mul(ctx.u32(BC_BW)).add(tidx);
+      const valid = kvRow.lt(N);
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const rowBase = bhOff.add(kvRow.mul(Dim));
+      const K = ctx.tileLoad("K", {
+        kind: "thread",
+        base: rowBase,
+        stride: ctx.u32(1)
+      }, {
+        rows: 1,
+        cols: D,
+        guard: valid
+      });
+      const V = ctx.tileLoad("V", {
+        kind: "thread",
+        base: rowBase,
+        stride: ctx.u32(1)
+      }, {
+        rows: 1,
+        cols: D,
+        guard: valid
+      });
+      const dkAcc = ctx.zeros(1, D);
+      const dvAcc = ctx.zeros(1, D);
+      const lTile = ctx.sharedArray("L_tile", BQ_BW, "f32");
+      const dTile = ctx.sharedArray("D_tile", BQ_BW, "f32");
+      const numQTiles = N.add(ctx.u32(BQ_BW - 1)).div(ctx.u32(BQ_BW));
+      ctx.forRange(ctx.u32(0), numQTiles, (qt) => {
+        const qStart = qt.mul(ctx.u32(BQ_BW));
+        const skipTile = isCausal.ne(ctx.u32(0)).and(qStart.add(ctx.u32(BQ_BW - 1)).lt(kvBlock.mul(ctx.u32(BC_BW))));
+        ctx.ifThen(skipTile.not(), () => {
+          const offsR = ctx.arange(qStart, BQ_BW);
+          const offsD = ctx.arange(ctx.u32(0), D);
+          const tilePtr = ctx.tilePtr(bhOff, offsR.outer(Dim), offsD.inner(ctx.u32(1)));
+          const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+          const QTile = ctx.load2D("Q", tilePtr, tileMask);
+          const dOTile = ctx.load2D("dO", tilePtr, tileMask);
+          ctx.ifThen(tidx.lt(ctx.u32(BQ_BW)), () => {
+            const qi = qStart.add(tidx);
+            const inBounds = qi.lt(N);
+            const lIdx = bhOffL.add(qi);
+            lTile.write(tidx, inBounds.select(ctx.load("L_buf", lIdx), ctx.f32(0)));
+            dTile.write(tidx, inBounds.select(ctx.load("D_buf", lIdx), ctx.f32(0)));
+          });
+          ctx.barrier();
+          ctx.range(0, BQ_BW, (j) => {
+            const qi = qStart.add(j);
+            const isActive = valid.and(qi.lt(N)).and(isCausal.eq(ctx.u32(0)).or(kvRow.le(qi)));
+            const s = ctx.dotRow(K, QTile, j).mul(scale);
+            const p = isActive.select(s.sub(lTile.read(j)).exp(), ctx.f32(0));
+            const dov = ctx.dotRow(V, dOTile, j);
+            const ds = p.mul(dov.sub(dTile.read(j))).mul(scale);
+            ctx.accumRow(dkAcc, ds, QTile, j);
+            ctx.accumRow(dvAcc, p, dOTile, j);
+          });
+          ctx.barrier();
+        });
+      });
+      ctx.ifThen(valid, () => {
+        ctx.tileStore("dK", dkAcc, {
+          base: rowBase,
+          stride: ctx.u32(1)
+        });
+        ctx.tileStore("dV", dvAcc, {
+          base: rowBase,
+          stride: ctx.u32(1)
+        });
+      });
+    }
+  };
+}
+function dispatchAttention(wgslKey, pipelinePrefix, specFactory, headDim, batchSize2, numHeads, seqLen2, scale, isCausal, buffers, ...grid) {
+  const ctx = requireContext();
+  const configBuf = getOrCreateConfigBuffer(ctx.device, batchSize2, numHeads, seqLen2, headDim, scale, isCausal ? 1 : 0);
+  const wgsl = getTileIRWGSL(wgslKey, specFactory);
+  const pipeline = getPipeline(ctx, `${pipelinePrefix}:tile:${headDim}`, wgsl);
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [...buffers, configBuf]);
+  for (const b of buffers) trackSharedEncoderWrite(b);
+  dispatchComputePass(pipeline, bindGroup, grid[0], grid[1] ?? 1, grid[2] ?? 1);
+}
+function dispatchFlashAttentionForward(qBuffer, kBuffer, vBuffer, batchSize2, numHeads, seqLen2, headDim, scale, isCausal) {
+  const outBuffer = allocateOutputBuffer(batchSize2 * numHeads * seqLen2 * headDim * 4);
+  const lseBuffer = allocateOutputBuffer(batchSize2 * numHeads * seqLen2 * 4);
+  dispatchAttention(`fwd:${headDim}`, "faFwd", () => makeForwardAttentionSpec(headDim), headDim, batchSize2, numHeads, seqLen2, scale, isCausal, [
+    qBuffer,
+    kBuffer,
+    vBuffer,
+    outBuffer,
+    lseBuffer
+  ], Math.ceil(seqLen2 / BR), numHeads, batchSize2);
+  return {
+    outputBuffer: outBuffer,
+    logsumexpBuffer: lseBuffer
+  };
+}
+function dispatchFlashAttentionBackwardD(dOBuffer, oBuffer, batchSize2, numHeads, seqLen2, headDim, scale, isCausal) {
+  const outBuffer = allocateOutputBuffer(batchSize2 * numHeads * seqLen2 * 4);
+  dispatchAttention(`bwdD:${headDim}`, "faBwdD", () => makeDPrecomputeSpec(headDim), headDim, batchSize2, numHeads, seqLen2, scale, isCausal, [
+    dOBuffer,
+    oBuffer,
+    outBuffer
+  ], batchSize2 * numHeads * seqLen2);
+  return outBuffer;
+}
+function dispatchFlashAttentionBackwardDQ(qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, batchSize2, numHeads, seqLen2, headDim, scale, isCausal) {
+  const outBuffer = allocateOutputBuffer(batchSize2 * numHeads * seqLen2 * headDim * 4);
+  dispatchAttention(`bwdDQ:${headDim}`, "faBwdDQ", () => makeBackwardDQSpec(headDim), headDim, batchSize2, numHeads, seqLen2, scale, isCausal, [
+    qBuffer,
+    kBuffer,
+    vBuffer,
+    lBuffer,
+    dBuffer,
+    dOBuffer,
+    outBuffer
+  ], Math.ceil(seqLen2 / BR), numHeads, batchSize2);
+  return outBuffer;
+}
+function dispatchFlashAttentionBackwardDKV(qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, batchSize2, numHeads, seqLen2, headDim, scale, isCausal) {
+  const dKBuffer = allocateOutputBuffer(batchSize2 * numHeads * seqLen2 * headDim * 4);
+  const dVBuffer = allocateOutputBuffer(batchSize2 * numHeads * seqLen2 * headDim * 4);
+  dispatchAttention(`bwdDKV:${headDim}`, "faBwdDKV", () => makeBackwardDKVSpec(headDim), headDim, batchSize2, numHeads, seqLen2, scale, isCausal, [
+    qBuffer,
+    kBuffer,
+    vBuffer,
+    lBuffer,
+    dBuffer,
+    dOBuffer,
+    dKBuffer,
+    dVBuffer
+  ], Math.ceil(seqLen2 / BC_BW), numHeads, batchSize2);
+  return {
+    dKBuffer,
+    dVBuffer
+  };
+}
+function resetAttentionKernelState() {
+  configCache.clear();
+  tileIRWGSLCache.clear();
+}
+var BR, BC, BQ_BW, BC_BW, tileIRWGSLCache, configCache;
+var init_attention_kernel = __esmMin((() => {
+  init_bind_group_cache();
+  init_buffer_arena();
+  init_dispatch();
+  init_gpu_types();
+  init_shape_utils();
+  init_tile_compiler();
+  init_tile_ir();
+  init_webgpu_state();
+  BR = 64;
+  BC = 32;
+  BQ_BW = 16;
+  BC_BW = 64;
+  tileIRWGSLCache = /* @__PURE__ */ new Map();
+  configCache = /* @__PURE__ */ new Map();
+  onTeardown(resetAttentionKernelState);
+}));
+function dispatchCrossEntropyForward(logitsBuffer, targetsBuffer, batchSize2, vocabSize) {
+  const outBuffer = allocateOutputBuffer(batchSize2 * 4);
+  ceFwdTileKernel.dispatch({
+    logits: logitsBuffer,
+    targets: targetsBuffer,
+    loss: outBuffer
+  }, {
+    batch_size: batchSize2,
+    vocab_size: vocabSize
+  });
+  return outBuffer;
+}
+function dispatchCrossEntropyBackward(logitsBuffer, targetsBuffer, gradOutputBuffer, batchSize2, vocabSize) {
+  const outBuffer = allocateOutputBuffer(batchSize2 * vocabSize * 4);
+  ceBwdTileKernel.dispatch({
+    logits: logitsBuffer,
+    targets: targetsBuffer,
+    grad_output: gradOutputBuffer,
+    grad_logits: outBuffer
+  }, {
+    batch_size: batchSize2,
+    vocab_size: vocabSize
+  });
+  return outBuffer;
+}
+function resetCrossEntropyKernelState() {
+  ceFwdTileKernel.reset();
+  ceBwdTileKernel.reset();
+}
+var WG$2, crossEntropyForwardSpec, crossEntropyBackwardSpec, ceFwdTileKernel, ceBwdTileKernel;
+var init_cross_entropy_kernel = __esmMin((() => {
+  init_buffer_arena();
+  init_shape_utils();
+  init_tile_dispatch();
+  init_tile_ir();
+  init_webgpu_state();
+  WG$2 = 256;
+  crossEntropyForwardSpec = perRowKernel({
+    name: "ceFwd",
+    bindings: {
+      logits: {
+        storage: "read",
+        type: "f32"
+      },
+      targets: {
+        storage: "read",
+        type: "f32"
+      },
+      loss: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    rowUniform: "batch_size",
+    dimUniform: "vocab_size",
+    kernel(ctx, row, tid, V, base) {
+      const rowMax = ctx.emitLet("row_max", ctx.wgReduce("max", tid, V, WG$2, (i) => ctx.load("logits", base.add(i))));
+      const logSumExp = ctx.emitLet("log_sum_exp", ctx.wgReduce("sum", tid, V, WG$2, (i) => ctx.load("logits", base.add(i)).sub(rowMax).exp()).log());
+      const t = ctx.emitLet("t", ctx.load("targets", row).toU32());
+      ctx.guardedStore("loss", tid.eq(ctx.u32(0)), row, ctx.load("logits", base.add(t)).sub(rowMax).sub(logSumExp).neg());
+    }
+  });
+  crossEntropyBackwardSpec = perRowKernel({
+    name: "ceBwd",
+    bindings: {
+      logits: {
+        storage: "read",
+        type: "f32"
+      },
+      targets: {
+        storage: "read",
+        type: "f32"
+      },
+      grad_output: {
+        storage: "read",
+        type: "f32"
+      },
+      grad_logits: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    rowUniform: "batch_size",
+    dimUniform: "vocab_size",
+    kernel(ctx, row, tid, V, base) {
+      const rowMax = ctx.emitLet("row_max", ctx.wgReduce("max", tid, V, WG$2, (i) => ctx.load("logits", base.add(i))));
+      const logSumExp = ctx.emitLet("log_sum_exp", ctx.wgReduce("sum", tid, V, WG$2, (i) => ctx.load("logits", base.add(i)).sub(rowMax).exp()).log());
+      const t = ctx.emitLet("t", ctx.load("targets", row).toU32());
+      const g = ctx.emitLet("g", ctx.load("grad_output", row));
+      ctx.stridedFor(tid, V, WG$2, (i) => {
+        const softmaxI = ctx.load("logits", base.add(i)).sub(rowMax).sub(logSumExp).exp();
+        const oneHotI = i.eq(t).select(ctx.f32(1), ctx.f32(0));
+        ctx.emitStore("grad_logits", base.add(i), g.mul(softmaxI.sub(oneHotI)));
+      });
+    }
+  });
+  ceFwdTileKernel = createTileKernelDispatcher(crossEntropyForwardSpec);
+  ceBwdTileKernel = createTileKernelDispatcher(crossEntropyBackwardSpec);
+  onTeardown(resetCrossEntropyKernelState);
+}));
+function getOrCreateRowStatsTempBuffers(device, numRows) {
+  let entry = rowStatsTempCache$1.get(numRows);
+  if (!entry) {
+    const size = numRows * 4;
+    entry = {
+      meanBuffer: device.createBuffer({
+        size,
+        usage: GPUBufferUsage.STORAGE
+      }),
+      invStdBuffer: device.createBuffer({
+        size,
+        usage: GPUBufferUsage.STORAGE
+      })
+    };
+    rowStatsTempCache$1.set(numRows, entry);
+  }
+  return entry;
+}
+function getOrCreateGradWBPartials(device, numRowTiles, featureDim) {
+  const key = `${numRowTiles}:${featureDim}`;
+  let entry = gradWBPartialCache.get(key);
+  if (!entry) {
+    const size = numRowTiles * featureDim * 4;
+    entry = {
+      partialGW: device.createBuffer({
+        size,
+        usage: GPUBufferUsage.STORAGE
+      }),
+      partialGB: device.createBuffer({
+        size,
+        usage: GPUBufferUsage.STORAGE
+      })
+    };
+    gradWBPartialCache.set(key, entry);
+  }
+  return entry;
+}
+function dispatchLayerNormForward(xBuffer, weightBuffer, biasBuffer, numRows, featureDim, eps) {
+  const outBuffer = allocateOutputBuffer(numRows * featureDim * 4);
+  fwdTileKernel$1.dispatch({
+    x: xBuffer,
+    weight: weightBuffer,
+    bias: biasBuffer,
+    output: outBuffer
+  }, {
+    num_rows: numRows,
+    feature_dim: featureDim,
+    eps
+  });
+  return outBuffer;
+}
+function dispatchLayerNormBackwardGradX(gradOutputBuffer, xBuffer, weightBuffer, numRows, featureDim, eps) {
+  const outBuffer = allocateOutputBuffer(numRows * featureDim * 4);
+  gradXTileKernel$1.dispatch({
+    grad_output: gradOutputBuffer,
+    x: xBuffer,
+    weight: weightBuffer,
+    grad_x: outBuffer
+  }, {
+    num_rows: numRows,
+    feature_dim: featureDim,
+    eps
+  });
+  return outBuffer;
+}
+function dispatchLayerNormBackwardGradWeightBias(gradOutputBuffer, xBuffer, numRows, featureDim, eps) {
+  const device = requireContext().device;
+  const { meanBuffer, invStdBuffer } = getOrCreateRowStatsTempBuffers(device, numRows);
+  rowStatsTileKernel$1.dispatch({
+    x: xBuffer,
+    row_mean: meanBuffer,
+    row_inv_std: invStdBuffer
+  }, {
+    num_rows: numRows,
+    feature_dim: featureDim,
+    eps
+  });
+  const numRowTiles = Math.ceil(numRows / ROWS_PER_TILE$1);
+  const { partialGW, partialGB } = getOrCreateGradWBPartials(device, numRowTiles, featureDim);
+  gradWBPartialTileKernel.dispatch({
+    grad_output: gradOutputBuffer,
+    x: xBuffer,
+    row_mean: meanBuffer,
+    row_inv_std: invStdBuffer,
+    partial_gw: partialGW,
+    partial_gb: partialGB
+  }, {
+    num_rows: numRows,
+    feature_dim: featureDim,
+    num_row_tiles: numRowTiles
+  });
+  const featureSizeBytes = featureDim * 4;
+  const gradWeightBuffer = allocateOutputBuffer(featureSizeBytes);
+  const gradBiasBuffer = allocateOutputBuffer(featureSizeBytes);
+  gradWBReduceTileKernel.dispatch({
+    partial_gw: partialGW,
+    partial_gb: partialGB,
+    grad_weight: gradWeightBuffer,
+    grad_bias: gradBiasBuffer
+  }, {
+    feature_dim: featureDim,
+    num_row_tiles: numRowTiles
+  });
+  return {
+    gradWeightBuffer,
+    gradBiasBuffer
+  };
+}
+function resetLayerNormKernelState() {
+  fwdTileKernel$1.reset();
+  gradXTileKernel$1.reset();
+  rowStatsTileKernel$1.reset();
+  gradWBPartialTileKernel.reset();
+  gradWBReduceTileKernel.reset();
+  for (const entry of rowStatsTempCache$1.values()) {
+    entry.meanBuffer.destroy();
+    entry.invStdBuffer.destroy();
+  }
+  rowStatsTempCache$1.clear();
+  for (const entry of gradWBPartialCache.values()) {
+    entry.partialGW.destroy();
+    entry.partialGB.destroy();
+  }
+  gradWBPartialCache.clear();
+}
+var rowStatsTempCache$1, gradWBPartialCache, WG$1, fwdTileKernel$1, layerNormBackwardGradXSpec, layerNormRowStatsSpec, ROWS_PER_TILE$1, lnBwdGradWBPartialSpec, lnBwdGradWBReduceSpec, gradXTileKernel$1, rowStatsTileKernel$1, gradWBPartialTileKernel, gradWBReduceTileKernel;
+var init_layernorm_kernel = __esmMin((() => {
+  init_buffer_arena();
+  init_gpu_types();
+  init_shape_utils();
+  init_tile_dispatch();
+  init_tile_ir();
+  init_webgpu_state();
+  rowStatsTempCache$1 = /* @__PURE__ */ new Map();
+  gradWBPartialCache = /* @__PURE__ */ new Map();
+  WG$1 = 256;
+  fwdTileKernel$1 = createTileKernelDispatcher(perRowKernel({
+    name: "layerNormFwd",
+    bindings: {
+      x: {
+        storage: "read",
+        type: "f32"
+      },
+      weight: {
+        storage: "read",
+        type: "f32"
+      },
+      bias: {
+        storage: "read",
+        type: "f32"
+      },
+      output: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: { eps: "f32" },
+    kernel(ctx, _row, tid, D, base) {
+      const Df = D.toF32();
+      const mean2 = ctx.emitLet("mean", ctx.wgReduce("sum", tid, D, WG$1, (i) => ctx.load("x", base.add(i))).div(Df));
+      const invStd = ctx.emitLet("inv_std", ctx.wgReduce("sum", tid, D, WG$1, (i) => {
+        const diff = ctx.load("x", base.add(i)).sub(mean2);
+        return diff.mul(diff);
+      }).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
+      ctx.stridedFor(tid, D, WG$1, (i) => {
+        const out = ctx.load("x", base.add(i)).sub(mean2).mul(invStd).mul(ctx.load("weight", i)).add(ctx.load("bias", i));
+        ctx.emitStore("output", base.add(i), out);
+      });
+    }
+  }));
+  layerNormBackwardGradXSpec = perRowKernel({
+    name: "lnBwdGradX",
+    bindings: {
+      grad_output: {
+        storage: "read",
+        type: "f32"
+      },
+      x: {
+        storage: "read",
+        type: "f32"
+      },
+      weight: {
+        storage: "read",
+        type: "f32"
+      },
+      grad_x: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: { eps: "f32" },
+    kernel(ctx, _row, tid, D, base) {
+      const Df = D.toF32();
+      const mean2 = ctx.emitLet("mean", ctx.wgReduce("sum", tid, D, WG$1, (i) => ctx.load("x", base.add(i))).div(Df));
+      const invStd = ctx.emitLet("inv_std", ctx.wgReduce("sum", tid, D, WG$1, (i) => {
+        const diff = ctx.load("x", base.add(i)).sub(mean2);
+        return diff.mul(diff);
+      }).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
+      const [sumC1, sumC2] = ctx.dualWgReduce(tid, D, WG$1, (i) => {
+        const gn = ctx.load("grad_output", base.add(i)).mul(ctx.load("weight", i));
+        const normI = ctx.load("x", base.add(i)).sub(mean2).mul(invStd);
+        return [gn, gn.mul(normI)];
+      });
+      const c1 = ctx.emitLet("c1", sumC1.div(Df));
+      const c2 = ctx.emitLet("c2", sumC2.div(Df));
+      ctx.stridedFor(tid, D, WG$1, (i) => {
+        const gn = ctx.load("grad_output", base.add(i)).mul(ctx.load("weight", i));
+        const normI = ctx.load("x", base.add(i)).sub(mean2).mul(invStd);
+        ctx.emitStore("grad_x", base.add(i), gn.sub(c1).sub(normI.mul(c2)).mul(invStd));
+      });
+    }
+  });
+  layerNormRowStatsSpec = perRowKernel({
+    name: "lnRowStats",
+    bindings: {
+      x: {
+        storage: "read",
+        type: "f32"
+      },
+      row_mean: {
+        storage: "read_write",
+        type: "f32"
+      },
+      row_inv_std: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: { eps: "f32" },
+    kernel(ctx, row, tid, D, base) {
+      const Df = D.toF32();
+      const mean2 = ctx.emitLet("mean", ctx.wgReduce("sum", tid, D, WG$1, (i) => ctx.load("x", base.add(i))).div(Df));
+      const invStd = ctx.emitLet("inv_std", ctx.wgReduce("sum", tid, D, WG$1, (i) => {
+        const diff = ctx.load("x", base.add(i)).sub(mean2);
+        return diff.mul(diff);
+      }).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
+      const isThread0 = tid.eq(ctx.u32(0));
+      ctx.guardedStore("row_mean", isThread0, row, mean2);
+      ctx.guardedStore("row_inv_std", isThread0, row, invStd);
+    }
+  });
+  ROWS_PER_TILE$1 = 32;
+  lnBwdGradWBPartialSpec = {
+    name: "lnBwdGradWBPartial",
+    workgroupSize: WG$1,
+    bindings: {
+      grad_output: {
+        storage: "read",
+        type: "f32"
+      },
+      x: {
+        storage: "read",
+        type: "f32"
+      },
+      row_mean: {
+        storage: "read",
+        type: "f32"
+      },
+      row_inv_std: {
+        storage: "read",
+        type: "f32"
+      },
+      partial_gw: {
+        storage: "read_write",
+        type: "f32"
+      },
+      partial_gb: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      num_rows: "u32",
+      feature_dim: "u32",
+      num_row_tiles: "u32"
+    },
+    grid: tiledGrid({
+      x: {
+        uniform: "feature_dim",
+        tileSize: WG$1
+      },
+      y: "num_row_tiles"
+    }),
+    kernel(ctx) {
+      const featureIdx = ctx.globalId(0);
+      const rowTileIdx = ctx.programId(1);
+      const D = ctx.uniform("feature_dim");
+      const N = ctx.uniform("num_rows");
+      const RPT = ctx.u32(ROWS_PER_TILE$1);
+      ctx.ifThen(featureIdx.ge(D), () => ctx.emitReturn());
+      const rowStart = rowTileIdx.mul(RPT);
+      const rowEnd = rowStart.add(RPT).min(N);
+      const accGW = ctx.emitVar("acc_gw", "f32", ctx.f32(0));
+      const accGB = ctx.emitVar("acc_gb", "f32", ctx.f32(0));
+      ctx.forRange(rowStart, rowEnd, (row) => {
+        const base = row.mul(D);
+        const go = ctx.load("grad_output", base.add(featureIdx));
+        const normalized = ctx.load("x", base.add(featureIdx)).sub(ctx.load("row_mean", row)).mul(ctx.load("row_inv_std", row));
+        accGW.addAssign(go.mul(normalized));
+        accGB.addAssign(go);
+      });
+      const partialIdx = rowTileIdx.mul(D).add(featureIdx);
+      ctx.emitStore("partial_gw", partialIdx, accGW.get());
+      ctx.emitStore("partial_gb", partialIdx, accGB.get());
+    }
+  };
+  lnBwdGradWBReduceSpec = {
+    name: "lnBwdGradWBReduce",
+    workgroupSize: WG$1,
+    bindings: {
+      partial_gw: {
+        storage: "read",
+        type: "f32"
+      },
+      partial_gb: {
+        storage: "read",
+        type: "f32"
+      },
+      grad_weight: {
+        storage: "read_write",
+        type: "f32"
+      },
+      grad_bias: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      feature_dim: "u32",
+      num_row_tiles: "u32"
+    },
+    grid: ceilDivGrid(WG$1, "feature_dim"),
+    kernel(ctx) {
+      const featureIdx = ctx.globalId(0);
+      const D = ctx.uniform("feature_dim");
+      const numTiles = ctx.uniform("num_row_tiles");
+      ctx.ifThen(featureIdx.ge(D), () => ctx.emitReturn());
+      const sumGW = ctx.emitVar("sum_gw", "f32", ctx.f32(0));
+      const sumGB = ctx.emitVar("sum_gb", "f32", ctx.f32(0));
+      ctx.forRange(ctx.u32(0), numTiles, (t) => {
+        const idx = t.mul(D).add(featureIdx);
+        sumGW.addAssign(ctx.load("partial_gw", idx));
+        sumGB.addAssign(ctx.load("partial_gb", idx));
+      });
+      ctx.emitStore("grad_weight", featureIdx, sumGW.get());
+      ctx.emitStore("grad_bias", featureIdx, sumGB.get());
+    }
+  };
+  gradXTileKernel$1 = createTileKernelDispatcher(layerNormBackwardGradXSpec);
+  rowStatsTileKernel$1 = createTileKernelDispatcher(layerNormRowStatsSpec);
+  gradWBPartialTileKernel = createTileKernelDispatcher(lnBwdGradWBPartialSpec);
+  gradWBReduceTileKernel = createTileKernelDispatcher(lnBwdGradWBReduceSpec);
+  onTeardown(resetLayerNormKernelState);
+}));
+function getOrCreateRowStatsTempBuffer(device, numRows) {
+  let buf = rowStatsTempCache.get(numRows);
+  if (!buf) {
+    buf = device.createBuffer({
+      size: numRows * 4,
+      usage: GPUBufferUsage.STORAGE
+    });
+    rowStatsTempCache.set(numRows, buf);
+  }
+  return buf;
+}
+function getOrCreateGradWPartial(device, numRowTiles, featureDim) {
+  const key = `${numRowTiles}:${featureDim}`;
+  let buf = gradWPartialCache.get(key);
+  if (!buf) {
+    buf = device.createBuffer({
+      size: numRowTiles * featureDim * 4,
+      usage: GPUBufferUsage.STORAGE
+    });
+    gradWPartialCache.set(key, buf);
+  }
+  return buf;
+}
+function resetRMSNormKernelState() {
+  fwdTileKernel.reset();
+  gradXTileKernel.reset();
+  rowStatsTileKernel.reset();
+  gradWPartialTileKernel.reset();
+  gradWReduceTileKernel.reset();
+  for (const buf of rowStatsTempCache.values()) buf.destroy();
+  rowStatsTempCache.clear();
+  for (const buf of gradWPartialCache.values()) buf.destroy();
+  gradWPartialCache.clear();
+}
+function dispatchRMSNormForward(xBuffer, weightBuffer, numRows, featureDim, eps) {
+  const outBuffer = allocateOutputBuffer(numRows * featureDim * 4);
+  fwdTileKernel.dispatch({
+    x: xBuffer,
+    weight: weightBuffer,
+    output: outBuffer
+  }, {
+    num_rows: numRows,
+    feature_dim: featureDim,
+    eps
+  });
+  return outBuffer;
+}
+function dispatchRMSNormBackwardGradX(gradOutputBuffer, xBuffer, weightBuffer, numRows, featureDim, eps) {
+  const outBuffer = allocateOutputBuffer(numRows * featureDim * 4);
+  gradXTileKernel.dispatch({
+    grad_output: gradOutputBuffer,
+    x: xBuffer,
+    weight: weightBuffer,
+    grad_x: outBuffer
+  }, {
+    num_rows: numRows,
+    feature_dim: featureDim,
+    eps
+  });
+  return outBuffer;
+}
+function dispatchRMSNormBackwardGradWeight(gradOutputBuffer, xBuffer, numRows, featureDim, eps) {
+  const device = requireContext().device;
+  const invRmsBuffer = getOrCreateRowStatsTempBuffer(device, numRows);
+  rowStatsTileKernel.dispatch({
+    x: xBuffer,
+    row_inv_rms: invRmsBuffer
+  }, {
+    num_rows: numRows,
+    feature_dim: featureDim,
+    eps
+  });
+  const numRowTiles = Math.ceil(numRows / ROWS_PER_TILE);
+  const partialGW = getOrCreateGradWPartial(device, numRowTiles, featureDim);
+  gradWPartialTileKernel.dispatch({
+    grad_output: gradOutputBuffer,
+    x: xBuffer,
+    row_inv_rms: invRmsBuffer,
+    partial_gw: partialGW
+  }, {
+    num_rows: numRows,
+    feature_dim: featureDim,
+    num_row_tiles: numRowTiles
+  });
+  const gradWeightBuffer = allocateOutputBuffer(featureDim * 4);
+  gradWReduceTileKernel.dispatch({
+    partial_gw: partialGW,
+    grad_weight: gradWeightBuffer
+  }, {
+    feature_dim: featureDim,
+    num_row_tiles: numRowTiles
+  });
+  return gradWeightBuffer;
+}
+var WG, fwdTileKernel, rmsNormBackwardGradXSpec, rmsNormRowStatsSpec, ROWS_PER_TILE, rmsNormBwdGradWPartialSpec, rmsNormBwdGradWReduceSpec, gradXTileKernel, rowStatsTileKernel, gradWPartialTileKernel, gradWReduceTileKernel, rowStatsTempCache, gradWPartialCache;
+var init_rmsnorm_kernel = __esmMin((() => {
+  init_buffer_arena();
+  init_gpu_types();
+  init_shape_utils();
+  init_tile_dispatch();
+  init_tile_ir();
+  init_webgpu_state();
+  WG = 256;
+  fwdTileKernel = createTileKernelDispatcher(perRowKernel({
+    name: "rmsNormFwd",
+    bindings: {
+      x: {
+        storage: "read",
+        type: "f32"
+      },
+      weight: {
+        storage: "read",
+        type: "f32"
+      },
+      output: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: { eps: "f32" },
+    kernel(ctx, _row, tid, D, base) {
+      const Df = D.toF32();
+      const invRms = ctx.emitLet("inv_rms", ctx.wgReduce("sum", tid, D, WG, (i) => {
+        const xi = ctx.load("x", base.add(i));
+        return xi.mul(xi);
+      }).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
+      ctx.stridedFor(tid, D, WG, (i) => {
+        const out = ctx.load("x", base.add(i)).mul(invRms).mul(ctx.load("weight", i));
+        ctx.emitStore("output", base.add(i), out);
+      });
+    }
+  }));
+  rmsNormBackwardGradXSpec = perRowKernel({
+    name: "rmsNormBwdGradX",
+    bindings: {
+      grad_output: {
+        storage: "read",
+        type: "f32"
+      },
+      x: {
+        storage: "read",
+        type: "f32"
+      },
+      weight: {
+        storage: "read",
+        type: "f32"
+      },
+      grad_x: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: { eps: "f32" },
+    kernel(ctx, _row, tid, D, base) {
+      const Df = D.toF32();
+      const invRms = ctx.emitLet("inv_rms", ctx.wgReduce("sum", tid, D, WG, (i) => {
+        const xi = ctx.load("x", base.add(i));
+        return xi.mul(xi);
+      }).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
+      const c = ctx.emitLet("c", ctx.wgReduce("sum", tid, D, WG, (i) => {
+        const gw = ctx.load("grad_output", base.add(i)).mul(ctx.load("weight", i));
+        const normI = ctx.load("x", base.add(i)).mul(invRms);
+        return gw.mul(normI);
+      }).div(Df));
+      ctx.stridedFor(tid, D, WG, (i) => {
+        const gw = ctx.load("grad_output", base.add(i)).mul(ctx.load("weight", i));
+        const normI = ctx.load("x", base.add(i)).mul(invRms);
+        ctx.emitStore("grad_x", base.add(i), gw.sub(normI.mul(c)).mul(invRms));
+      });
+    }
+  });
+  rmsNormRowStatsSpec = perRowKernel({
+    name: "rmsNormRowStats",
+    bindings: {
+      x: {
+        storage: "read",
+        type: "f32"
+      },
+      row_inv_rms: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: { eps: "f32" },
+    kernel(ctx, row, tid, D, base) {
+      const Df = D.toF32();
+      const invRms = ctx.emitLet("inv_rms", ctx.wgReduce("sum", tid, D, WG, (i) => {
+        const xi = ctx.load("x", base.add(i));
+        return xi.mul(xi);
+      }).div(Df).add(ctx.uniform("eps").toF32()).rsqrt());
+      const isThread0 = tid.eq(ctx.u32(0));
+      ctx.guardedStore("row_inv_rms", isThread0, row, invRms);
+    }
+  });
+  ROWS_PER_TILE = 32;
+  rmsNormBwdGradWPartialSpec = {
+    name: "rmsNormBwdGradWPartial",
+    workgroupSize: WG,
+    bindings: {
+      grad_output: {
+        storage: "read",
+        type: "f32"
+      },
+      x: {
+        storage: "read",
+        type: "f32"
+      },
+      row_inv_rms: {
+        storage: "read",
+        type: "f32"
+      },
+      partial_gw: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      num_rows: "u32",
+      feature_dim: "u32",
+      num_row_tiles: "u32"
+    },
+    grid: tiledGrid({
+      x: {
+        uniform: "feature_dim",
+        tileSize: WG
+      },
+      y: "num_row_tiles"
+    }),
+    kernel(ctx) {
+      const featureIdx = ctx.globalId(0);
+      const rowTileIdx = ctx.programId(1);
+      const D = ctx.uniform("feature_dim");
+      const N = ctx.uniform("num_rows");
+      const RPT = ctx.u32(ROWS_PER_TILE);
+      ctx.ifThen(featureIdx.ge(D), () => ctx.emitReturn());
+      const rowStart = rowTileIdx.mul(RPT);
+      const rowEnd = rowStart.add(RPT).min(N);
+      const acc = ctx.emitVar("acc", "f32", ctx.f32(0));
+      ctx.forRange(rowStart, rowEnd, (row) => {
+        const base = row.mul(D);
+        const go = ctx.load("grad_output", base.add(featureIdx));
+        const normalized = ctx.load("x", base.add(featureIdx)).mul(ctx.load("row_inv_rms", row));
+        acc.addAssign(go.mul(normalized));
+      });
+      const partialIdx = rowTileIdx.mul(D).add(featureIdx);
+      ctx.emitStore("partial_gw", partialIdx, acc.get());
+    }
+  };
+  rmsNormBwdGradWReduceSpec = {
+    name: "rmsNormBwdGradWReduce",
+    workgroupSize: WG,
+    bindings: {
+      partial_gw: {
+        storage: "read",
+        type: "f32"
+      },
+      grad_weight: {
+        storage: "read_write",
+        type: "f32"
+      }
+    },
+    uniforms: {
+      feature_dim: "u32",
+      num_row_tiles: "u32"
+    },
+    grid: ceilDivGrid(WG, "feature_dim"),
+    kernel(ctx) {
+      const featureIdx = ctx.globalId(0);
+      const D = ctx.uniform("feature_dim");
+      const numTiles = ctx.uniform("num_row_tiles");
+      ctx.ifThen(featureIdx.ge(D), () => ctx.emitReturn());
+      const sumGW = ctx.emitVar("sum_gw", "f32", ctx.f32(0));
+      ctx.forRange(ctx.u32(0), numTiles, (t) => {
+        sumGW.addAssign(ctx.load("partial_gw", t.mul(D).add(featureIdx)));
+      });
+      ctx.emitStore("grad_weight", featureIdx, sumGW.get());
+    }
+  };
+  gradXTileKernel = createTileKernelDispatcher(rmsNormBackwardGradXSpec);
+  rowStatsTileKernel = createTileKernelDispatcher(rmsNormRowStatsSpec);
+  gradWPartialTileKernel = createTileKernelDispatcher(rmsNormBwdGradWPartialSpec);
+  gradWReduceTileKernel = createTileKernelDispatcher(rmsNormBwdGradWReduceSpec);
+  rowStatsTempCache = /* @__PURE__ */ new Map();
+  gradWPartialCache = /* @__PURE__ */ new Map();
+  onTeardown(resetRMSNormKernelState);
+}));
+function makeUnscaleSpec() {
+  return {
+    name: "unscaleGrad",
+    workgroupSize: 256,
+    bindings: {
+      grad_in: {
+        storage: "read",
+        type: "f32"
+      },
+      grad_out: {
+        storage: "read_write",
+        type: "f32"
+      },
+      inf_flag: {
+        storage: "atomic",
+        type: "u32"
+      }
+    },
+    uniforms: {
+      inv_scale: "f32",
+      num_elements: "u32",
+      grid_stride: "u32",
+      _pad0: "u32"
+    },
+    uniformBindingIndex: 3,
+    grid: (u) => {
+      const wg = Math.ceil(u.num_elements / 256);
+      if (wg <= 65535) return [wg];
+      const x = Math.min(wg, MAX_WORKGROUPS_PER_DIM);
+      return [x, Math.ceil(wg / x)];
+    },
+    kernel(ctx) {
+      const gridStride = ctx.uniform("grid_stride");
+      const idx = ctx.emitLet("idx", ctx.globalId(0).add(ctx.globalId(1).mul(gridStride)));
+      const numElements = ctx.uniform("num_elements");
+      ctx.ifThen(idx.ge(numElements), () => {
+        ctx.emitReturn();
+      });
+      const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
+      const g = ctx.emitLet("g", ctx.load("grad_in", idx).mul(invScale));
+      const isFiniteVal = g.bitcastTo("u32").shr(ctx.u32(23)).and(ctx.u32(255)).ne(ctx.u32(255));
+      ctx.ifThenElse(isFiniteVal, () => {
+        ctx.emitStore("grad_out", idx, g);
+      }, () => {
+        ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(F32_ONE_BITS));
+        ctx.emitStore("grad_out", idx, ctx.f32(0));
+      });
+    }
+  };
+}
+function getUnscaleDispatcher() {
+  if (!unscaleDispatcher) unscaleDispatcher = createTileKernelDispatcher(makeUnscaleSpec());
+  return unscaleDispatcher;
+}
+function allocateInfFlagBuffer(device) {
+  if (persistentInfFlagBuffer) {
+    requireContext().device.queue.writeBuffer(persistentInfFlagBuffer, 0, infFlagZeroData);
+    return persistentInfFlagBuffer;
+  }
+  const dev = requireContext().device;
+  persistentInfFlagBuffer = dev.createBuffer({
+    size: 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  });
+  dev.queue.writeBuffer(persistentInfFlagBuffer, 0, infFlagZeroData);
+  return persistentInfFlagBuffer;
+}
+async function readInfFlag(infFlagBuffer) {
+  const device = requireContext().device;
+  await awaitDeferredFence();
+  const staging = device.createBuffer({
+    size: 4,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+  });
+  const encoder = device.createCommandEncoder();
+  encoder.copyBufferToBuffer(infFlagBuffer, 0, staging, 0, 4);
+  device.queue.submit([encoder.finish()]);
+  if (isProfilingEnabled()) {
+    const fenceBuf = device.createBuffer({
+      size: 4,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+    });
+    device.queue.writeBuffer(fenceBuf, 0, new Uint8Array([
+      1,
+      2,
+      3,
+      4
+    ]));
+    await fenceBuf.mapAsync(GPUMapMode.READ);
+    fenceBuf.unmap();
+    fenceBuf.destroy();
+  }
+  const MAPASYNC_TIMEOUT_MS = 2e3;
+  let mapOk = false;
+  try {
+    mapOk = await Promise.race([staging.mapAsync(GPUMapMode.READ).then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), MAPASYNC_TIMEOUT_MS))]);
+  } catch (_e) {
+    staging.destroy();
+    return 1;
+  }
+  if (!mapOk) {
+    console.warn("[readInfFlag] mapAsync timed out (V100/Dawn timestamp corruption). Assuming inf found (safe default).");
+    staging.destroy();
+    return 1;
+  }
+  const mapped = staging.getMappedRange();
+  const value = new Float32Array(mapped)[0];
+  staging.unmap();
+  staging.destroy();
+  return value;
+}
+function destroyPersistentInfFlagBuffer() {
+  if (persistentInfFlagBuffer) {
+    persistentInfFlagBuffer.destroy();
+    persistentInfFlagBuffer = null;
+  }
+}
+function allocateFreshOutputBuffer(device, sizeBytes) {
+  const buf = device.createBuffer({
+    size: sizeBytes,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  });
+  gpuMemoryTracker.trackAllocation(buf, sizeBytes);
+  trackSharedEncoderWrite(buf);
+  return buf;
+}
+function dispatchUnscaleGrad(gradBuffer, numElements, invScale, infFlagBuffer) {
+  const bytesPerElement = 4;
+  const totalBytes = numElements * bytesPerElement;
+  const maxBindingSize = getMaxStorageBufferBindingSize();
+  const needsChunking = totalBytes > maxBindingSize;
+  const alignedBytes = roundUpToPowerOfTwo(totalBytes);
+  const gradOut = allocateFreshOutputBuffer(requireContext().device, alignedBytes);
+  const elemPerChunk = needsChunking ? computeFlatChunkLayout(numElements, bytesPerElement, maxBindingSize, 256).elementsPerChunk : numElements;
+  const workgroups = Math.ceil(elemPerChunk / 256);
+  const gridStride = Math.min(workgroups, MAX_WORKGROUPS_PER_DIM) * 256;
+  const dispatcher = getUnscaleDispatcher();
+  const buffers = {
+    grad_in: gradBuffer,
+    grad_out: gradOut,
+    inf_flag: infFlagBuffer
+  };
+  const uniforms = {
+    inv_scale: invScale,
+    num_elements: numElements,
+    grid_stride: gridStride,
+    _pad0: 0
+  };
+  if (needsChunking) dispatcher.dispatchChunked(buffers, uniforms, {
+    modes: {
+      grad_in: "chunked",
+      grad_out: "chunked",
+      inf_flag: "scalar"
+    },
+    sizeUniform: "num_elements",
+    totalElements: numElements,
+    maxBytesPerElement: bytesPerElement
+  });
+  else dispatcher.dispatch(buffers, uniforms);
+  return { gradOutBuffer: gradOut };
+}
+function roundUpToPowerOfTwo(size) {
+  if (size <= 256) return 256;
+  let s = 1;
+  while (s < size) s <<= 1;
+  return s;
+}
+function resetUnscaleKernelState() {
+  destroyPersistentInfFlagBuffer();
+  if (unscaleDispatcher) {
+    unscaleDispatcher.reset();
+    unscaleDispatcher = null;
+  }
+}
+var unscaleDispatcher, persistentInfFlagBuffer, infFlagZeroData;
+var init_unscale_kernel = __esmMin((() => {
+  init_buffer_pool();
+  init_chunked_dispatch();
+  init_gpu_context();
+  init_gpu_types();
+  init_memory_tracker();
+  init_profiler$1();
+  init_shape_utils();
+  init_shared_encoder();
+  init_tile_dispatch();
+  init_webgpu_state();
+  unscaleDispatcher = null;
+  persistentInfFlagBuffer = null;
+  infFlagZeroData = new Float32Array([0]);
+  onTeardown(resetUnscaleKernelState);
+}));
+function cleanupContiguous(...pairs) {
+  for (const [orig, copy] of pairs) if (copy !== orig) destroyCopy(copy);
+}
+async function adamStep(grad, param, m, v, config) {
+  gpuMemoryTracker.suppressLimitCheck();
+  try {
+    let _st = profileSubOpBegin();
+    const gradT = asContiguous(grad);
+    const paramT = asContiguous(param);
+    const mT = asContiguous(m);
+    const vT = asContiguous(v);
+    profileSubOpEnd("adam.ensureContig", _st);
+    _st = profileSubOpBegin();
+    const oldF16 = f16WeightCache.get(paramT.buffer);
+    if (oldF16) {
+      bufferPool.deferredDestroy(oldF16, oldF16.size);
+      f16WeightCache.delete(paramT.buffer);
+    }
+    profileSubOpEnd("adam.f16evict", _st);
+    if (!isAdamBatchMode()) flushSharedEncoder();
+    trackSharedEncoderWrite(paramT.buffer);
+    trackSharedEncoderWrite(mT.buffer);
+    trackSharedEncoderWrite(vT.buffer);
+    trackSharedEncoderWrite(gradT.buffer);
+    let paramBuf = paramT.buffer;
+    let mBuf = mT.buffer;
+    let vBuf = vT.buffer;
+    const gradBuf = gradT.buffer;
+    const bufSize = gradT.size * dtypeBytes(gradT.dtype);
+    const copyToFresh = (src) => {
+      const dst = allocateOutputBuffer(bufSize);
+      const enc = getSharedEncoderInstance();
+      if (enc) enc.copyBufferToBuffer(src, 0, dst, 0, bufSize);
+      else {
+        const ctx2 = requireContext();
+        const tmpEnc = ctx2.device.createCommandEncoder();
+        tmpEnc.copyBufferToBuffer(src, 0, dst, 0, bufSize);
+        ctx2.queue.submit([tmpEnc.finish()]);
+      }
+      return dst;
+    };
+    if (paramBuf === gradBuf || paramBuf === mBuf || paramBuf === vBuf) paramBuf = copyToFresh(paramBuf);
+    if (mBuf === gradBuf || mBuf === vBuf) mBuf = copyToFresh(mBuf);
+    if (vBuf === gradBuf) vBuf = copyToFresh(vBuf);
+    if (paramBuf !== paramT.buffer || mBuf !== mT.buffer || vBuf !== vT.buffer) flushSharedEncoder();
+    const emitF16 = config.emitF16 ?? false;
+    const infFlagBuf = config.infFlagBuffer ?? null;
+    const numElements = gradT.size;
+    const result = dispatchAdamStep(gradBuf, paramBuf, mBuf, vBuf, numElements, config, emitF16, infFlagBuf);
+    if (!isSharedEncoderActive()) flushSharedEncoder();
+    cleanupContiguous([grad, gradT]);
+    if (result.paramF16Buffer) f16WeightCache.set(result.paramBuffer, result.paramF16Buffer);
+    _st = profileSubOpBegin();
+    if (paramT.ownsBuffer) bufferPool.decRef(paramT.buffer);
+    if (mT.ownsBuffer) bufferPool.decRef(mT.buffer);
+    if (vT.ownsBuffer) bufferPool.decRef(vT.buffer);
+    const noop = () => {
+    };
+    paramT.destroy = noop;
+    mT.destroy = noop;
+    vT.destroy = noop;
+    const ret = {
+      param: createTensor(paramT.shape, result.paramBuffer, void 0, 0, paramT.dtype),
+      m: createTensor(mT.shape, result.mBuffer, void 0, 0, mT.dtype),
+      v: createTensor(vT.shape, result.vBuffer, void 0, 0, vT.dtype)
+    };
+    profileSubOpEnd("adam.createTensor", _st);
+    return ret;
+  } finally {
+    gpuMemoryTracker.unsuppressLimitCheck();
+  }
+}
+function unscaleGrad(grad, invScale, infFlagBuffer) {
+  const gradT = asContiguous(grad);
+  const numElements = gradT.size;
+  const result = dispatchUnscaleGrad(gradT.buffer, numElements, invScale, infFlagBuffer);
+  cleanupContiguous([grad, gradT]);
+  return createTensor(gradT.shape, result.gradOutBuffer);
+}
+function createInfCountBuffer() {
+  return allocateInfFlagBuffer();
+}
+async function readAndDestroyInfCount(buffer) {
+  return readInfFlag(buffer);
+}
+function fusedCrossEntropyForward(logits, targets, config) {
+  const logitsT = asContiguous(logits);
+  const targetsT = asContiguous(targets);
+  const outBuf = dispatchCrossEntropyForward(logitsT.buffer, targetsT.buffer, config.batchSize, config.vocabSize);
+  cleanupContiguous([logits, logitsT], [targets, targetsT]);
+  return createTensor([config.batchSize], outBuf);
+}
+function fusedCrossEntropyBackward(logits, targets, gradOutput, config) {
+  const logitsT = asContiguous(logits);
+  const targetsT = asContiguous(targets);
+  const gradT = asContiguous(gradOutput);
+  const outBuf = dispatchCrossEntropyBackward(logitsT.buffer, targetsT.buffer, gradT.buffer, config.batchSize, config.vocabSize);
+  cleanupContiguous([logits, logitsT], [targets, targetsT], [gradOutput, gradT]);
+  return createTensor([config.batchSize, config.vocabSize], outBuf);
+}
+function fusedLayerNormForward(x, weight, bias, config) {
+  const xT = asContiguous(x);
+  const weightT = asContiguous(weight);
+  const biasT = asContiguous(bias);
+  const outBuf = dispatchLayerNormForward(xT.buffer, weightT.buffer, biasT.buffer, config.numRows, config.featureDim, config.eps);
+  cleanupContiguous([x, xT], [weight, weightT], [bias, biasT]);
+  return createTensor(xT.shape.slice(), outBuf);
+}
+function fusedLayerNormBackwardGradX(gradOutput, x, weight, config) {
+  const gradT = asContiguous(gradOutput);
+  const xT = asContiguous(x);
+  const weightT = asContiguous(weight);
+  const gradXBuf = dispatchLayerNormBackwardGradX(gradT.buffer, xT.buffer, weightT.buffer, config.numRows, config.featureDim, config.eps);
+  cleanupContiguous([gradOutput, gradT], [x, xT], [weight, weightT]);
+  return createTensor(xT.shape.slice(), gradXBuf);
+}
+function fusedLayerNormBackwardGradWeightBias(gradOutput, x, config) {
+  const gradT = asContiguous(gradOutput);
+  const xT = asContiguous(x);
+  const result = dispatchLayerNormBackwardGradWeightBias(gradT.buffer, xT.buffer, config.numRows, config.featureDim, config.eps);
+  cleanupContiguous([gradOutput, gradT], [x, xT]);
+  const shape = [config.featureDim];
+  return {
+    gradWeight: createTensor(shape, result.gradWeightBuffer),
+    gradBias: createTensor(shape, result.gradBiasBuffer)
+  };
+}
+function fusedRMSNormForward(x, weight, config) {
+  const xT = asContiguous(x);
+  const weightT = asContiguous(weight);
+  const outBuf = dispatchRMSNormForward(xT.buffer, weightT.buffer, config.numRows, config.featureDim, config.eps);
+  cleanupContiguous([x, xT], [weight, weightT]);
+  return createTensor(xT.shape.slice(), outBuf);
+}
+function fusedRMSNormBackwardGradX(gradOutput, x, weight, config) {
+  const goT = asContiguous(gradOutput);
+  const xT = asContiguous(x);
+  const wT = asContiguous(weight);
+  const outBuf = dispatchRMSNormBackwardGradX(goT.buffer, xT.buffer, wT.buffer, config.numRows, config.featureDim, config.eps);
+  cleanupContiguous([gradOutput, goT], [x, xT], [weight, wT]);
+  return createTensor(xT.shape.slice(), outBuf);
+}
+function fusedRMSNormBackwardGradWeight(gradOutput, x, _weight, config) {
+  const goT = asContiguous(gradOutput);
+  const xT = asContiguous(x);
+  const outBuf = dispatchRMSNormBackwardGradWeight(goT.buffer, xT.buffer, config.numRows, config.featureDim, config.eps);
+  cleanupContiguous([gradOutput, goT], [x, xT]);
+  return createTensor([config.featureDim], outBuf);
+}
+function fusedAttentionForward(q, k, v, config) {
+  const qT = asContiguous(q);
+  const kT = asContiguous(k);
+  const vT = asContiguous(v);
+  const { outputBuffer, logsumexpBuffer } = dispatchFlashAttentionForward(qT.buffer, kT.buffer, vT.buffer, config.batchSize, config.numHeads, config.seqLen, config.headDim, config.scale, config.isCausal);
+  cleanupContiguous([q, qT], [k, kT], [v, vT]);
+  const outShape = [
+    config.batchSize,
+    config.numHeads,
+    config.seqLen,
+    config.headDim
+  ];
+  const lseShape = [
+    config.batchSize,
+    config.numHeads,
+    config.seqLen
+  ];
+  return {
+    output: createTensor(outShape, outputBuffer),
+    logsumexp: createTensor(lseShape, logsumexpBuffer)
+  };
+}
+function fusedAttentionBackward(q, k, v, logsumexp, dO, output, config) {
+  const qT = asContiguous(q);
+  const kT = asContiguous(k);
+  const vT = asContiguous(v);
+  const lseT = asContiguous(logsumexp);
+  const dOT = asContiguous(dO);
+  const oT = asContiguous(output);
+  const dBuf = dispatchFlashAttentionBackwardD(dOT.buffer, oT.buffer, config.batchSize, config.numHeads, config.seqLen, config.headDim, config.scale, config.isCausal);
+  const dQBuf = dispatchFlashAttentionBackwardDQ(qT.buffer, kT.buffer, vT.buffer, lseT.buffer, dBuf, dOT.buffer, config.batchSize, config.numHeads, config.seqLen, config.headDim, config.scale, config.isCausal);
+  const { dKBuffer, dVBuffer } = dispatchFlashAttentionBackwardDKV(qT.buffer, kT.buffer, vT.buffer, lseT.buffer, dBuf, dOT.buffer, config.batchSize, config.numHeads, config.seqLen, config.headDim, config.scale, config.isCausal);
+  const dBufSize = config.batchSize * config.numHeads * config.seqLen * 4;
+  bufferPool.deferredDestroy(dBuf, dBufSize);
+  cleanupContiguous([q, qT], [k, kT], [v, vT], [logsumexp, lseT], [dO, dOT], [output, oT]);
+  const gradShape = [
+    config.batchSize,
+    config.numHeads,
+    config.seqLen,
+    config.headDim
+  ];
+  return {
+    dQ: createTensor(gradShape, dQBuf),
+    dK: createTensor(gradShape, dKBuffer),
+    dV: createTensor(gradShape, dVBuffer)
+  };
+}
+async function read(a) {
+  const ctx = requireContext();
+  let tensor = asGPUTensor(a);
+  if (tensor.size === 0) return [];
+  if (sharedEncoderActive) flushSharedEncoder();
+  const originalTensor = tensor;
+  if (!tensor.isContiguous) tensor = ensureContiguous(tensor);
+  const bytesPerElement = dtypeBytes(tensor.dtype);
+  const totalBytes = tensor.size * bytesPerElement;
+  const alignedBytes = alignBufferSize(totalBytes);
+  const readBuffer = createTrackedBuffer(ctx.device, {
+    size: alignedBytes,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+  });
+  const sharedEnc = getSharedEncoderInstance();
+  if (sharedEnc) {
+    sharedEnc.copyBufferToBuffer(tensor.buffer, 0, readBuffer, 0, alignedBytes);
+    flushSharedEncoder();
+  } else {
+    const encoder = ctx.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(tensor.buffer, 0, readBuffer, 0, alignedBytes);
+    profileApiCall("queue.submit", () => ctx.queue.submit([encoder.finish()]));
+    incrementSubmitCount();
+  }
+  if (typeof ctx.queue.onSubmittedWorkDone === "function") await ctx.queue.onSubmittedWorkDone();
+  bufferPool.flushPendingToAvailable();
+  await readBuffer.mapAsync(GPUMapMode.READ);
+  const mapped = readBuffer.getMappedRange();
+  let result;
+  switch (tensor.dtype) {
+    case "i32":
+      result = Array.from(new Int32Array(mapped.slice(0, totalBytes)));
+      break;
+    case "u32":
+      result = Array.from(new Uint32Array(mapped.slice(0, totalBytes)));
+      break;
+    case "f16":
+      result = f16ArrayToF32Array(new Uint16Array(mapped.slice(0, totalBytes)));
+      break;
+    default:
+      result = Array.from(new Float32Array(mapped.slice(0, totalBytes)));
+      break;
+  }
+  readBuffer.unmap();
+  bufferPool.deferredDestroy(readBuffer, readBuffer.size ?? alignedBytes);
+  if (tensor !== originalTensor && tensor.destroy) tensor.destroy();
+  return result;
+}
+async function waitForGPU() {
+  const ctx = gpuContext;
+  if (!ctx) return;
+  if (typeof ctx.queue.onSubmittedWorkDone === "function") await ctx.queue.onSubmittedWorkDone();
+  bufferPool.flushPendingToAvailable();
+}
+function mulScalarInPlace(tensor, scalar) {
+  const a = asGPUTensor(tensor);
+  mulScalarKernel.dispatch({ data: a.buffer }, {
+    scalar,
+    size: a.size
+  });
+}
+var WG_MUL, mulScalarKernel;
+var init_fused = __esmMin((() => {
+  init_buffer_arena();
+  init_buffer_pool();
+  init_gpu_context();
+  init_gpu_types();
+  init_memory_tracker();
+  init_profiler$1();
+  init_shape_utils();
+  init_shared_encoder();
+  init_tensor();
+  init_tile_dispatch();
+  init_tile_ir();
+  init_webgpu_state();
+  init_views();
+  init_adam_kernel();
+  init_attention_kernel();
+  init_cross_entropy_kernel();
+  init_layernorm_kernel();
+  init_rmsnorm_kernel();
+  init_unscale_kernel();
+  WG_MUL = 256;
+  mulScalarKernel = createTileKernelDispatcher({
+    name: "mulScalarInPlace",
+    workgroupSize: WG_MUL,
+    bindings: { data: {
+      storage: "read_write",
+      type: "f32"
+    } },
+    uniforms: {
+      scalar: "f32",
+      size: "u32"
+    },
+    grid: elementwiseGrid(WG_MUL, { elementUniform: "size" }),
+    kernel(ctx) {
+      const idx = ctx.elementIndex(WG_MUL);
+      const scalar = ctx.uniform("scalar").toF32();
+      ctx.emitStore("data", idx, ctx.load("data", idx).mul(scalar));
+    }
+  });
+}));
+function gather(a, index, options) {
+  const ctx = requireContext();
+  const tensorA = asGPUTensor(a);
+  const tensorIndex = asGPUTensor(index);
+  const { dim } = options;
+  const inputShape = tensorA.shape;
+  const indexShape = tensorIndex.shape;
+  const rank2 = inputShape.length;
+  if (dim < 0 || dim >= rank2) throw new Error("gather: dimension out of range");
+  const inputSizeBytes = tensorA.size * 4;
+  const deviceLimits = ctx.device.limits;
+  const maxBindingSize = deviceLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const chunked = inputSizeBytes > maxBindingSize;
+  const outShape = indexShape.slice();
+  const outSize = sizeOf(outShape);
+  const dispatch = compute2DDispatch(Math.ceil(outSize / 256));
+  const use2D = dispatch.y > 1;
+  const code = chunked ? chunkedGatherTileIR(inputShape, indexShape, dim) : gatherTileIR(inputShape, indexShape, dim);
+  const pipeline = getPipeline(ctx, `${chunked ? "gatherChunked" : "gather"}:${inputShape.join(",")}:${indexShape.join(",")}:${dim}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`, code);
+  if (!chunked) {
+    const outBuffer2 = resolveOutputBuffer(ctx.device, outSize * 4, [tensorA.buffer, tensorIndex.buffer]);
+    const uniformBuf = createParamsBuffer(ctx.device, params(outSize));
+    dispatchComputePass(pipeline, cachedCreateBindGroup(ctx.device, pipeline, [
+      tensorA.buffer,
+      tensorIndex.buffer,
+      outBuffer2,
+      uniformBuf
+    ]), dispatch.x, dispatch.y);
+    releaseParamsBuffer(uniformBuf);
+    return createTensor(outShape, outBuffer2);
+  }
+  const dimSize = inputShape[dim];
+  const layout = computeDimChunkLayout(dimSize, sizeOf(inputShape.slice(dim + 1)), maxBindingSize, deviceLimits?.minStorageBufferOffsetAlignment ?? 256);
+  const outBuffer = createTrackedBuffer(ctx.device, {
+    size: outSize * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  });
+  for (let chunk = 0; chunk < layout.numChunks; chunk++) {
+    const chunkStart = chunk * layout.maxSlicesPerChunk;
+    const chunkEnd = Math.min(chunkStart + layout.maxSlicesPerChunk, dimSize);
+    const chunkByteOffset = chunkStart * layout.bytesPerSlice;
+    const chunkByteSize = (chunkEnd - chunkStart) * layout.bytesPerSlice;
+    const uniformBuffer = createParamsBuffer(ctx.device, params(outSize, chunkStart, chunkEnd, 0));
+    dispatchComputePass(pipeline, profiledCreateBindGroup(ctx.device, {
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: {
+            buffer: tensorA.buffer,
+            offset: chunkByteOffset,
+            size: chunkByteSize
+          }
+        },
+        {
+          binding: 1,
+          resource: { buffer: tensorIndex.buffer }
+        },
+        {
+          binding: 2,
+          resource: { buffer: outBuffer }
+        },
+        {
+          binding: 3,
+          resource: { buffer: uniformBuffer }
+        }
+      ]
+    }), dispatch.x, dispatch.y);
+    releaseParamsBuffer(uniformBuffer);
+  }
+  return createTensor(outShape, outBuffer);
+}
+function scatterAdd(a, index, src, options) {
+  const ctx = requireContext();
+  const tensorA = asGPUTensor(a);
+  const tensorIndex = asGPUTensor(index);
+  const tensorSrc = asGPUTensor(src);
+  const { dim } = options;
+  const inputShape = tensorA.shape;
+  const rank2 = inputShape.length;
+  if (dim < 0 || dim >= rank2) throw new Error("scatterAdd: dimension out of range");
+  const outputSizeBytes = tensorA.size * 4;
+  const deviceLimits = ctx.device.limits;
+  const maxBindingSize = deviceLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const chunked = outputSizeBytes > maxBindingSize;
+  const outShape = inputShape.slice();
+  const outSize = sizeOf(outShape);
+  const srcSize = sizeOf(tensorSrc.shape);
+  const dispatch = compute2DDispatch(Math.ceil(srcSize / 256));
+  const use2D = dispatch.y > 1;
+  const code = chunked ? chunkedScatterAddTileIR(inputShape, tensorSrc.shape, dim) : scatterAddTileIR(inputShape, tensorSrc.shape, dim);
+  const pipeline = getPipeline(ctx, `${chunked ? "scatterAddChunked" : "scatterAdd"}:${inputShape.join(",")}:${tensorSrc.shape.join(",")}:${dim}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`, code);
+  const outBuffer = chunked ? createTrackedBuffer(ctx.device, {
+    size: outSize * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  }) : resolveOutputBuffer(ctx.device, outSize * 4, [
+    tensorA.buffer,
+    tensorIndex.buffer,
+    tensorSrc.buffer
+  ]);
+  {
+    const enc = getSharedEncoderInstance();
+    if (enc) enc.copyBufferToBuffer(tensorA.buffer, 0, outBuffer, 0, outSize * 4);
+    else {
+      const cmdEnc = ctx.device.createCommandEncoder();
+      cmdEnc.copyBufferToBuffer(tensorA.buffer, 0, outBuffer, 0, outSize * 4);
+      submitOrCollect(cmdEnc.finish());
+    }
+  }
+  if (!chunked) {
+    const uniformBuf = createParamsBuffer(ctx.device, params(srcSize));
+    dispatchComputePass(pipeline, cachedCreateBindGroup(ctx.device, pipeline, [
+      tensorIndex.buffer,
+      tensorSrc.buffer,
+      outBuffer,
+      uniformBuf
+    ]), dispatch.x, dispatch.y);
+    releaseParamsBuffer(uniformBuf);
+    return createTensor(outShape, outBuffer);
+  }
+  const dimSize = inputShape[dim];
+  const layout = computeDimChunkLayout(dimSize, sizeOf(inputShape.slice(dim + 1)), maxBindingSize, deviceLimits?.minStorageBufferOffsetAlignment ?? 256);
+  for (let chunk = 0; chunk < layout.numChunks; chunk++) {
+    const chunkStart = chunk * layout.maxSlicesPerChunk;
+    const chunkEnd = Math.min(chunkStart + layout.maxSlicesPerChunk, dimSize);
+    const chunkByteOffset = chunkStart * layout.bytesPerSlice;
+    const chunkByteSize = (chunkEnd - chunkStart) * layout.bytesPerSlice;
+    const uniformBuffer = createParamsBuffer(ctx.device, params(srcSize, chunkStart, chunkEnd, 0));
+    dispatchComputePass(pipeline, profiledCreateBindGroup(ctx.device, {
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: { buffer: tensorIndex.buffer }
+        },
+        {
+          binding: 1,
+          resource: { buffer: tensorSrc.buffer }
+        },
+        {
+          binding: 2,
+          resource: {
+            buffer: outBuffer,
+            offset: chunkByteOffset,
+            size: chunkByteSize
+          }
+        },
+        {
+          binding: 3,
+          resource: { buffer: uniformBuffer }
+        }
+      ]
+    }), dispatch.x, dispatch.y);
+    releaseParamsBuffer(uniformBuffer);
+  }
+  return createTensor(outShape, outBuffer);
+}
+function cat(tensors, options) {
+  if (tensors.length === 0) throw new Error("cat: empty tensor list");
+  if (tensors.length === 1) return tensors[0];
+  const ctx = requireContext();
+  const gpuTensors = tensors.map((t) => asGPUTensor(t));
+  const bytesPerElement = dtypeBytes(gpuTensors[0].dtype);
+  const dim = options.dim;
+  const rank2 = gpuTensors[0].shape.length;
+  const outShape = gpuTensors[0].shape.slice();
+  for (let i = 1; i < gpuTensors.length; i++) outShape[dim] += gpuTensors[i].shape[dim];
+  const outSize = sizeOf(outShape);
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement, gpuTensors.map((t) => t.buffer));
+  const innerSize = dim === rank2 - 1 ? 1 : sizeOf(outShape.slice(dim + 1));
+  const outerSize = dim === 0 ? 1 : sizeOf(outShape.slice(0, dim));
+  const outDimSize = outShape[dim];
+  const enc = getSharedEncoderInstance();
+  let dimOffset = 0;
+  for (const t of gpuTensors) {
+    const tDimSize = t.shape[dim];
+    const copyBytes = tDimSize * innerSize * bytesPerElement;
+    for (let o = 0; o < outerSize; o++) {
+      const srcByteOffset = o * tDimSize * innerSize * bytesPerElement;
+      const dstByteOffset = (o * outDimSize + dimOffset) * innerSize * bytesPerElement;
+      if (enc) enc.copyBufferToBuffer(t.buffer, srcByteOffset, outBuffer, dstByteOffset, copyBytes);
+      else {
+        const cmdEnc = ctx.device.createCommandEncoder();
+        cmdEnc.copyBufferToBuffer(t.buffer, srcByteOffset, outBuffer, dstByteOffset, copyBytes);
+        submitOrCollect(cmdEnc.finish());
+      }
+    }
+    dimOffset += tDimSize;
+  }
+  return createTensor(outShape, outBuffer, void 0, 0, gpuTensors[0].dtype);
+}
+var init_gather_scatter = __esmMin((() => {
+  init_shape();
+  init_bind_group_cache();
+  init_buffer_arena();
+  init_chunked_dispatch();
+  init_dispatch();
+  init_gpu_context();
+  init_gpu_types();
+  init_shape_utils();
+  init_shared_encoder();
+  init_tensor();
+  init_ops_tile_ir();
+}));
+function matmul(_a, _b, options) {
+  const ctx = requireContext();
+  const a = asGPUTensor(_a);
+  const b = asGPUTensor(_b);
+  const maxBindingSize = ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  if (b.size * dtypeBytes(b.dtype) > maxBindingSize) return matmulChunked(a, b, maxBindingSize);
+  const aShape = a.shape;
+  const bShape = b.shape;
+  const M = aShape[aShape.length - 2];
+  const N = bShape[bShape.length - 1];
+  const aBatch = aShape.slice(0, -2);
+  const bBatch = bShape.slice(0, -2);
+  if (sizeOf([
+    ...broadcastShapes(aBatch.length > 0 ? aBatch : [1], bBatch.length > 0 ? bBatch : [1]),
+    M,
+    N
+  ]) * dtypeBytes(a.dtype === "f32" || b.dtype === "f32" ? "f32" : a.dtype) > maxBindingSize) return matmulChunkedOutput(a, b, maxBindingSize);
+  return dispatchMatmul(a, b, false, false, options?.outBuffer);
+}
+function sliceColumns(input, colStart, colEnd) {
+  const ctx = requireContext();
+  const [K, N] = input.shape;
+  const sliceWidth = colEnd - colStart;
+  const outSize = K * sliceWidth;
+  const limits = ctx.device.limits;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
+  const needsChunking = input.size * 4 > maxBindingSize;
+  const outBuffer = createTrackedBuffer(ctx.device, {
+    size: outSize * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  });
+  const pipeline = getPipeline(ctx, `sliceColumns`, sliceColumnsTileIR());
+  if (!needsChunking) {
+    const dispatch = compute2DDispatch(Math.ceil(outSize / 256));
+    const paramsBuffer = createParamsBuffer(ctx.device, params(K, N, colStart, sliceWidth, 0));
+    dispatchComputePass(pipeline, cachedCreateBindGroup(ctx.device, pipeline, [
+      input.buffer,
+      outBuffer,
+      paramsBuffer
+    ]), dispatch.x, dispatch.y);
+    releaseParamsBuffer(paramsBuffer);
+  } else {
+    const bytesPerRow = N * 4;
+    const rowsPerChunk = alignedChunkSize(bytesPerRow, Math.floor(maxBindingSize / bytesPerRow), minAlignment);
+    const numRowChunks = Math.ceil(K / rowsPerChunk);
+    for (let chunk = 0; chunk < numRowChunks; chunk++) {
+      const rowStart = chunk * rowsPerChunk;
+      const numRows = Math.min(rowStart + rowsPerChunk, K) - rowStart;
+      const byteOffset = rowStart * bytesPerRow;
+      const chunkByteSize = numRows * bytesPerRow;
+      const chunkSize = numRows * sliceWidth;
+      const dispatch = compute2DDispatch(Math.ceil(chunkSize / 256));
+      const paramsBuffer = createParamsBuffer(ctx.device, params(numRows, N, colStart, sliceWidth, rowStart));
+      dispatchComputePass(pipeline, profiledCreateBindGroup(ctx.device, {
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          {
+            binding: 0,
+            resource: {
+              buffer: input.buffer,
+              offset: byteOffset,
+              size: chunkByteSize
+            }
+          },
+          {
+            binding: 1,
+            resource: { buffer: outBuffer }
+          },
+          {
+            binding: 2,
+            resource: { buffer: paramsBuffer }
+          }
+        ]
+      }), dispatch.x, dispatch.y);
+      releaseParamsBuffer(paramsBuffer);
+    }
+  }
+  return createTensor([K, sliceWidth], outBuffer, void 0, 0, "f32", true);
+}
+function scatterColumnsToOutput(partial, outBuffer, N, colStart) {
+  const ctx = requireContext();
+  const sliceWidth = partial.shape[partial.shape.length - 1];
+  const totalRows = partial.size / sliceWidth;
+  const limits = ctx.device.limits;
+  const maxBindingSize = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const minAlignment = limits?.minStorageBufferOffsetAlignment ?? 256;
+  const outputBufferSize = outBuffer.size;
+  const inputBufferSize = partial.buffer.size;
+  const needsChunking = outputBufferSize > maxBindingSize || inputBufferSize > maxBindingSize;
+  const pipeline = getPipeline(ctx, `scatterColumns`, scatterColumnsTileIR());
+  if (!needsChunking) {
+    const totalSize = totalRows * sliceWidth;
+    const dispatch = compute2DDispatch(Math.ceil(totalSize / 256));
+    const paramsBuffer = createParamsBuffer(ctx.device, params(totalRows, N, colStart, sliceWidth, 0, 0));
+    dispatchComputePass(pipeline, cachedCreateBindGroup(ctx.device, pipeline, [
+      partial.buffer,
+      outBuffer,
+      paramsBuffer
+    ]), dispatch.x, dispatch.y);
+    releaseParamsBuffer(paramsBuffer);
+  } else {
+    const outputBytesPerRow = N * 4;
+    const inputBytesPerRow = sliceWidth * 4;
+    const maxRowsPerChunk = Math.min(Math.floor(maxBindingSize / outputBytesPerRow), Math.floor(maxBindingSize / inputBytesPerRow));
+    const outputAlign = minAlignment / gcd$1(outputBytesPerRow, minAlignment);
+    const inputAlign = minAlignment / gcd$1(inputBytesPerRow, minAlignment);
+    const rowAlignment = Math.max(outputAlign, inputAlign);
+    const alignedRowsPerChunk = Math.max(rowAlignment, Math.floor(maxRowsPerChunk / rowAlignment) * rowAlignment);
+    const numChunks = Math.ceil(totalRows / alignedRowsPerChunk);
+    for (let chunk = 0; chunk < numChunks; chunk++) {
+      const rowStart = chunk * alignedRowsPerChunk;
+      const numRows = Math.min(rowStart + alignedRowsPerChunk, totalRows) - rowStart;
+      const outputByteOffset = rowStart * outputBytesPerRow;
+      const inputByteOffset = rowStart * inputBytesPerRow;
+      const outputChunkSize = numRows * outputBytesPerRow;
+      const inputChunkSize = numRows * inputBytesPerRow;
+      const chunkSize = numRows * sliceWidth;
+      const dispatch = compute2DDispatch(Math.ceil(chunkSize / 256));
+      const paramsBuffer = createParamsBuffer(ctx.device, params(numRows, N, colStart, sliceWidth, 0, 0));
+      dispatchComputePass(pipeline, profiledCreateBindGroup(ctx.device, {
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          {
+            binding: 0,
+            resource: {
+              buffer: partial.buffer,
+              offset: inputByteOffset,
+              size: inputChunkSize
+            }
+          },
+          {
+            binding: 1,
+            resource: {
+              buffer: outBuffer,
+              offset: outputByteOffset,
+              size: outputChunkSize
+            }
+          },
+          {
+            binding: 2,
+            resource: { buffer: paramsBuffer }
+          }
+        ]
+      }), dispatch.x, dispatch.y);
+      releaseParamsBuffer(paramsBuffer);
+    }
+  }
+}
+function matmulChunked(a, b, maxBindingSize) {
+  const minAlignment = requireContext().device.limits?.minStorageBufferOffsetAlignment ?? 256;
+  const aContiguous = ensureContiguous(a);
+  const aWasCopied = aContiguous !== a;
+  const aRank = aContiguous.shape.length;
+  if (b.shape.length !== 2) {
+    if (aWasCopied) aContiguous.destroy?.();
+    throw new Error("Chunked matmul currently only supports 2D B matrix");
+  }
+  const M = aContiguous.shape[aRank - 2];
+  const K_a = aContiguous.shape[aRank - 1];
+  const [K_b, N] = b.shape;
+  if (K_a !== K_b) {
+    if (aWasCopied) aContiguous.destroy?.();
+    throw new Error(`Matmul dimension mismatch: A[...,${K_a}] vs B[${K_b},${N}]`);
+  }
+  const K = K_a;
+  const batchDims = aContiguous.shape.slice(0, -2);
+  const batchSize2 = sizeOf(batchDims) || 1;
+  const outShape = [
+    ...batchDims,
+    M,
+    N
+  ];
+  if (b.strides[0] === 1 && b.strides[1] === K) {
+    const result2 = matmulChunkedTransposed(aContiguous, b, M, K, N, batchSize2, outShape, maxBindingSize, minAlignment);
+    if (aWasCopied) aContiguous.destroy?.();
+    return result2;
+  }
+  if (!b.isContiguous) {
+    if (aWasCopied) aContiguous.destroy?.();
+    throw new Error("Chunked matmul for non-contiguous non-transposed B not yet implemented");
+  }
+  const result = matmulChunkedContiguous(aContiguous, b, M, K, N, batchSize2, outShape, maxBindingSize, minAlignment);
+  if (aWasCopied) aContiguous.destroy?.();
+  return result;
+}
+function matmulChunkedTransposed(a, b, _M, K, N, _batchSize, outShape, maxBindingSize, minAlignment) {
+  const ctx = requireContext();
+  const bytesPerBufferRow = K * 4;
+  const alignedRowsPerChunk = alignedChunkSize(bytesPerBufferRow, Math.floor(maxBindingSize / bytesPerBufferRow), minAlignment);
+  const numChunks = Math.ceil(N / alignedRowsPerChunk);
+  const partialOutputs = [];
+  for (let chunk = 0; chunk < numChunks; chunk++) {
+    const bufferRowStart = chunk * alignedRowsPerChunk;
+    const bufferRowEnd = Math.min(bufferRowStart + alignedRowsPerChunk, N);
+    const numBufferRows = bufferRowEnd - bufferRowStart;
+    const colStart = bufferRowStart;
+    const colEnd = bufferRowEnd;
+    const chunkWidth = numBufferRows;
+    const byteOffset = (b.offset + bufferRowStart * K) * 4;
+    const chunkByteSize = numBufferRows * K * 4;
+    const bChunkBuffer = createTrackedBuffer(ctx.device, {
+      size: chunkByteSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    });
+    if (getSharedEncoderInstance()) getSharedEncoderInstance()?.copyBufferToBuffer(b.buffer, byteOffset, bChunkBuffer, 0, chunkByteSize);
+    else {
+      const encoder = ctx.device.createCommandEncoder();
+      encoder.copyBufferToBuffer(b.buffer, byteOffset, bChunkBuffer, 0, chunkByteSize);
+      submitOrCollect(encoder.finish());
+    }
+    const bChunk = createTensor([chunkWidth, K], bChunkBuffer, void 0, 0, "f32", true);
+    const partialResult = dispatchMatmul(a, bChunk, false, true);
+    partialOutputs.push({
+      tensor: partialResult,
+      colStart,
+      colEnd
+    });
+    bChunk.destroy?.();
+  }
+  const outSize = sizeOf(outShape);
+  const outBuffer = createTrackedBuffer(ctx.device, {
+    size: outSize * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  });
+  for (const partial of partialOutputs) {
+    const { tensor: partialTensor, colStart } = partial;
+    scatterColumnsToOutput(partialTensor, outBuffer, N, colStart);
+    partialTensor.destroy?.();
+  }
+  return createTensor(outShape, outBuffer, void 0, 0, "f32", true);
+}
+function matmulChunkedContiguous(a, b, _M, K, N, _batchSize, outShape, maxBindingSize, minAlignment) {
+  const ctx = requireContext();
+  const bytesPerColumn = K * 4;
+  const alignedColumnsPerChunk = alignedChunkSize(bytesPerColumn, Math.floor(maxBindingSize / bytesPerColumn), minAlignment);
+  const numChunks = Math.ceil(N / alignedColumnsPerChunk);
+  const partialOutputs = [];
+  for (let chunk = 0; chunk < numChunks; chunk++) {
+    const colStart = chunk * alignedColumnsPerChunk;
+    const colEnd = Math.min(colStart + alignedColumnsPerChunk, N);
+    const bSlice = sliceColumns(b, colStart, colEnd);
+    const partialResult = dispatchMatmul(a, bSlice, false, false);
+    partialOutputs.push({
+      tensor: partialResult,
+      colStart,
+      colEnd
+    });
+    bSlice.destroy?.();
+  }
+  const outSize = sizeOf(outShape);
+  const outBuffer = createTrackedBuffer(ctx.device, {
+    size: outSize * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  });
+  for (const partial of partialOutputs) {
+    const { tensor: partialTensor, colStart } = partial;
+    scatterColumnsToOutput(partialTensor, outBuffer, N, colStart);
+    partialTensor.destroy?.();
+  }
+  return createTensor(outShape, outBuffer, void 0, 0, "f32", true);
+}
+function matmulChunkedOutput(a, b, maxBindingSize) {
+  const ctx = requireContext();
+  const minAlignment = ctx.device.limits?.minStorageBufferOffsetAlignment ?? 256;
+  const aShape = a.shape;
+  const bShape = b.shape;
+  const M = aShape[aShape.length - 2];
+  const K = aShape[aShape.length - 1];
+  const N = bShape[bShape.length - 1];
+  const aBatch = aShape.slice(0, -2);
+  const bBatch = bShape.slice(0, -2);
+  const batchShape = broadcastShapes(aBatch.length > 0 ? aBatch : [1], bBatch.length > 0 ? bBatch : [1]);
+  const batchSize2 = sizeOf(batchShape);
+  const outShape = [
+    ...batchShape,
+    M,
+    N
+  ];
+  const bytesPerColumn = batchSize2 * M * 4;
+  const maxColumnsPerChunk = Math.floor(maxBindingSize / bytesPerColumn);
+  const alignedColumnsPerChunk = alignedChunkSize(K * 4, maxColumnsPerChunk, minAlignment);
+  const numChunks = Math.ceil(N / alignedColumnsPerChunk);
+  const outSize = sizeOf(outShape);
+  const outBuffer = createTrackedBuffer(ctx.device, {
+    size: outSize * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  });
+  const aReshaped = a.shape.length === 2 ? createTensor([
+    1,
+    M,
+    K
+  ], a.buffer, a.strides ? [0, ...a.strides] : void 0, a.offset, "f32", false) : a;
+  const bReshaped = b.shape.length === 2 ? createTensor([
+    1,
+    K,
+    N
+  ], b.buffer, b.strides ? [0, ...b.strides] : void 0, b.offset, "f32", false) : b;
+  for (let chunk = 0; chunk < numChunks; chunk++) {
+    const colStart = chunk * alignedColumnsPerChunk;
+    const bSlice = sliceBColumns(bReshaped, colStart, Math.min(colStart + alignedColumnsPerChunk, N));
+    const partialResult = dispatchMatmul(aReshaped, bSlice, false, false);
+    scatterColumnsToOutput(partialResult, outBuffer, N, colStart);
+    bSlice.destroy?.();
+    partialResult.destroy?.();
+  }
+  return createTensor(outShape, outBuffer, void 0, 0, "f32", true);
+}
+function sliceBColumns(b, colStart, colEnd) {
+  const ctx = requireContext();
+  const [batch, K, N] = b.shape;
+  const chunkWidth = colEnd - colStart;
+  const outSize = batch * K * chunkWidth;
+  const outBuffer = createTrackedBuffer(ctx.device, {
+    size: outSize * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+  });
+  const pipeline = getPipeline(ctx, `sliceBColumns`, sliceBColumnsTileIR());
+  const dispatch = compute2DDispatch(Math.ceil(outSize / 256));
+  const paramsBuffer = createParamsBuffer(ctx.device, params(batch, K, N, colStart, chunkWidth));
+  dispatchComputePass(pipeline, cachedCreateBindGroup(ctx.device, pipeline, [
+    b.buffer,
+    outBuffer,
+    paramsBuffer
+  ]), dispatch.x, dispatch.y);
+  releaseParamsBuffer(paramsBuffer);
+  return createTensor([
+    batch,
+    K,
+    chunkWidth
+  ], outBuffer);
+}
+var init_matmul_ops = __esmMin((() => {
+  init_bind_group_cache();
+  init_dispatch();
+  init_gpu_context();
+  init_gpu_types();
+  init_shape_utils();
+  init_shared_encoder();
+  init_tensor();
+  init_ops_tile_ir();
+  init_views();
+}));
+function stridedScatterDirect(op, baseTensor, srcTensor, options) {
+  const { offset, viewShape, viewStrides } = options;
+  const baseSize = sizeOf(baseTensor.shape);
+  const viewSize = sizeOf(viewShape);
+  const ctx = requireContext();
+  const maxSize = Math.max(baseSize, viewSize);
+  const dispatch = compute2DDispatch(Math.ceil(maxSize / 256));
+  const use2D = dispatch.y > 1;
+  const contiguousBase = baseTensor.isContiguous ? baseTensor : ensureContiguous(baseTensor);
+  const srcStrides = srcTensor.strides;
+  const srcOffset = srcTensor.offset;
+  const code = (op === "copy" ? stridedScatterCopyTileIR : stridedScatterAddTileIR)(baseSize, viewShape, viewStrides, offset, srcStrides, srcOffset);
+  const pipeline = getPipeline(ctx, `stridedScatter${op === "copy" ? "Copy" : "Add"}:${baseSize}:${viewShape.join("x")}:${viewStrides.join(",")}:${offset}:${srcStrides.join(",")}:${srcOffset}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`, code);
+  const outBuffer = resolveOutputBuffer(ctx.device, baseSize * 4, [contiguousBase.buffer, srcTensor.buffer]);
+  const paramsBuffer = createParamsBuffer(ctx.device, params(baseSize, viewSize));
+  dispatchComputePass(pipeline, cachedCreateBindGroup(ctx.device, pipeline, [
+    contiguousBase.buffer,
+    srcTensor.buffer,
+    outBuffer,
+    paramsBuffer
+  ]), dispatch.x, dispatch.y);
+  releaseParamsBuffer(paramsBuffer);
+  if (contiguousBase !== baseTensor) destroyCopy(contiguousBase);
+  return createTensor(baseTensor.shape, outBuffer);
+}
+function stridedScatterImpl(op, base, src, options) {
+  const baseTensor = asGPUTensor(base);
+  const srcTensor = asGPUTensor(src);
+  const { offset, viewShape, viewStrides } = options;
+  const baseSize = sizeOf(baseTensor.shape);
+  const viewSize = sizeOf(viewShape);
+  if (baseSize === 0) throw new Error(`stridedScatter${op === "copy" ? "Copy" : "Add"}: empty base tensor`);
+  const maxBindingSize = requireContext().device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const baseSizeBytes = baseSize * 4;
+  const srcSizeBytes = srcTensor.size * 4;
+  if (baseSizeBytes > maxBindingSize || srcSizeBytes > maxBindingSize) {
+    const isFull = viewSize === baseSize && offset === 0;
+    const viewContiguous = checkContiguous(viewShape, viewStrides);
+    const srcContiguous = srcTensor.isContiguous || checkContiguous(srcTensor.shape, srcTensor.strides);
+    if (isFull && baseTensor.isContiguous && srcContiguous && viewContiguous) return op === "copy" ? stridedScatterCopyChunkedSimple(baseTensor, srcTensor) : stridedScatterAddChunkedSimple(baseTensor, srcTensor);
+  }
+  return stridedScatterDirect(op, baseTensor, srcTensor, options);
+}
+function stridedScatterCopy(base, src, options) {
+  return stridedScatterImpl("copy", base, src, options);
+}
+function stridedScatterAdd(base, src, options) {
+  return stridedScatterImpl("add", base, src, options);
+}
+function stridedScatterCopyChunkedSimple(baseTensor, srcTensor) {
+  const totalElements = baseTensor.size;
+  const bytesPerElement = 4;
+  const outBuffer = resolveOutputBuffer(requireContext().device, totalElements * bytesPerElement, [baseTensor.buffer, srcTensor.buffer]);
+  createTileKernelDispatcher(flatOpSpec("copy")).dispatchChunked({
+    src: srcTensor.buffer,
+    out: outBuffer
+  }, { size: totalElements }, {
+    modes: {
+      src: "chunked",
+      out: "chunked"
+    },
+    sizeUniform: "size",
+    totalElements,
+    maxBytesPerElement: bytesPerElement
+  });
+  return createTensor(baseTensor.shape, outBuffer);
+}
+function stridedScatterAddChunkedSimple(baseTensor, srcTensor) {
+  const totalElements = baseTensor.size;
+  const bytesPerElement = 4;
+  const outBuffer = resolveOutputBuffer(requireContext().device, totalElements * bytesPerElement, [baseTensor.buffer, srcTensor.buffer]);
+  createTileKernelDispatcher(flatOpSpec("add")).dispatchChunked({
+    base: baseTensor.buffer,
+    src: srcTensor.buffer,
+    out: outBuffer
+  }, { size: totalElements }, {
+    modes: {
+      base: "chunked",
+      src: "chunked",
+      out: "chunked"
+    },
+    sizeUniform: "size",
+    totalElements,
+    maxBytesPerElement: bytesPerElement
+  });
+  return createTensor(baseTensor.shape, outBuffer);
+}
+var init_strided_scatter = __esmMin((() => {
+  init_bind_group_cache();
+  init_buffer_arena();
+  init_buffer_pool();
+  init_dispatch();
+  init_gpu_context();
+  init_gpu_types();
+  init_shape_utils();
+  init_tensor();
+  init_tile_dispatch();
+  init_ops_tile_ir();
+  init_views();
+}));
+function where(condition, x, y, options) {
+  const condTensor = asGPUTensor(condition);
+  const xTensor = asGPUTensor(x);
+  const yTensor = asGPUTensor(y);
+  const outShape = broadcastThreeShapes(condTensor.shape, xTensor.shape, yTensor.shape);
+  const indexShape = toIndexShape(outShape);
+  const outSize = sizeOf(outShape);
+  if (outSize === 0) throw new Error("webgpu where does not support empty tensors yet");
+  const ctx = requireContext();
+  const bytesPerElement = 4;
+  const maxBindingSize = ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  if (outSize * bytesPerElement > maxBindingSize) {
+    const condIsScalar = condTensor.size <= 1;
+    const xIsScalar = xTensor.size <= 1;
+    const yIsScalar = yTensor.size <= 1;
+    const condChunkable = condIsScalar || condTensor.isContiguous;
+    const xChunkable = xIsScalar || xTensor.isContiguous;
+    const yChunkable = yIsScalar || yTensor.isContiguous;
+    if (condChunkable && xChunkable && yChunkable) return whereChunked(condTensor, xTensor, yTensor, outShape, outSize, options);
+  }
+  return whereDirect(condTensor, xTensor, yTensor, outShape, indexShape, outSize, options);
+}
+function whereDirect(condTensor, xTensor, yTensor, outShape, indexShape, outSize, options) {
+  const condStrides = computeEffectiveBroadcastStrides(condTensor, indexShape);
+  const xStrides = computeEffectiveBroadcastStrides(xTensor, indexShape);
+  const yStrides = computeEffectiveBroadcastStrides(yTensor, indexShape);
+  const code = whereWGSL(indexShape, condStrides, xStrides, yStrides, condTensor.offset, xTensor.offset, yTensor.offset);
+  const key = `where:${indexShape.join("x")}:${condStrides.join(",")}:${xStrides.join(",")}:${yStrides.join(",")}:${condTensor.offset}:${xTensor.offset}:${yTensor.offset}`;
+  const providedOut = options?.outBuffer && options.outBuffer.size >= outSize * 4 ? options.outBuffer : void 0;
+  return createTensor(outShape, dispatchElementwise({
+    key,
+    shader: code,
+    inputs: [
+      condTensor.buffer,
+      xTensor.buffer,
+      yTensor.buffer
+    ],
+    outputSizeBytes: outSize * 4,
+    params: params(outSize),
+    outBuffer: providedOut,
+    dispatchX: Math.ceil(outSize / 256)
+  }));
+}
+function whereChunked(condTensor, xTensor, yTensor, outShape, outSize, options) {
+  const ctx = requireContext();
+  const bytesPerElement = 4;
+  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement, [
+    condTensor.buffer,
+    xTensor.buffer,
+    yTensor.buffer
+  ], options?.outBuffer);
+  const condIsScalar = condTensor.size <= 1;
+  const xIsScalar = xTensor.size <= 1;
+  const yIsScalar = yTensor.size <= 1;
+  createTileKernelDispatcher(whereSpec([outSize], condIsScalar ? [0] : [1], xIsScalar ? [0] : [1], yIsScalar ? [0] : [1], 0, 0, 0)).dispatchChunked({
+    cond: condTensor.buffer,
+    x: xTensor.buffer,
+    y: yTensor.buffer,
+    out: outBuffer
+  }, { size: outSize }, {
+    modes: {
+      cond: condIsScalar ? "scalar" : "chunked",
+      x: xIsScalar ? "scalar" : "chunked",
+      y: yIsScalar ? "scalar" : "chunked",
+      out: "chunked"
+    },
+    sizeUniform: "size",
+    totalElements: outSize,
+    maxBytesPerElement: bytesPerElement
+  });
+  return createTensor(outShape, outBuffer);
+}
+var init_where = __esmMin((() => {
+  init_shape();
+  init_bind_group_cache();
+  init_buffer_arena();
+  init_dispatch();
+  init_gpu_context();
+  init_gpu_types();
+  init_shape_utils();
+  init_tensor();
+  init_tile_dispatch();
+  init_ops_tile_ir();
+}));
+var webgpu_exports = /* @__PURE__ */ __exportAll({
+  KernelContext: () => KernelContext,
+  abortBatch: () => abortBatch,
+  allocateOutputBuffer: () => allocateOutputBuffer,
+  beginBatchExecution: () => beginBatchExecution,
+  beginSharedEncoder: () => beginSharedEncoder,
+  ceilDivGrid: () => ceilDivGrid,
+  clearActiveArena: () => clearActiveArena,
+  clearArenaConflictDetected: () => clearArenaConflictDetected,
+  clearArenaExternalInputBuffers: () => clearArenaExternalInputBuffers,
+  clearBufferPool: () => clearBufferPool,
+  clearWarmupCache: () => clearWarmupCache,
+  compileTileKernel: () => compileTileKernel,
+  createTileKernelDispatcher: () => createTileKernelDispatcher,
+  deferredDestroyBuffer: () => deferredDestroyBuffer,
+  deserializeRegistry: () => deserializeRegistry,
+  destroyArena: () => destroyArena,
+  destroyWebGPU: () => destroyWebGPU,
+  dispatchMatmul: () => dispatchMatmul,
+  dispatchMatmulDirect: () => dispatchMatmulDirect,
+  donateBuffer: () => donateBuffer,
+  elementwiseGrid: () => elementwiseGrid,
+  enableAllAllocDebug: () => enableAllAllocDebug,
+  endBatchExecution: () => endBatchExecution,
+  endSharedEncoder: () => endSharedEncoder,
+  flushBufferPool: () => flushBufferPool,
+  flushSharedEncoder: () => flushSharedEncoder,
+  getAndResetFlowCounters: () => getAndResetFlowCounters,
+  getArenaConflictDetected: () => getArenaConflictDetected,
+  getArenaResolveIndex: () => getArenaResolveIndex,
+  getBufferPoolDetailedStats: () => getBufferPoolDetailedStats,
+  getBufferPoolStats: () => getBufferPoolStats,
+  getBufferSize: () => getBufferSize,
+  getCurrentOpLabel: () => getCurrentOpLabel,
+  getDispatchSequenceCounters: () => getDispatchSequenceCounters,
+  getGPUAllocationHistogram: () => getGPUAllocationHistogram,
+  getGPUMemoryStats: () => getGPUMemoryStats,
+  getLeakedAllocCount: () => getLeakedAllocCount,
+  getLeakedAllocCountForStep: () => getLeakedAllocCountForStep,
+  getMaxStorageBufferBindingSize: () => getMaxStorageBufferBindingSize,
+  getPipeline: () => getPipeline,
+  getSubmitCount: () => getSubmitCount,
+  getWebGPUDevice: () => getWebGPUDevice,
+  getWebGPUInitError: () => getWebGPUInitError,
+  initWebGPU: () => initWebGPU,
+  isArenaBuffer: () => isArenaBuffer,
+  isAutotuneEnabled: () => isAutotuneEnabled,
+  isBatchActive: () => isBatchActive,
+  isF16Supported: () => isF16Supported,
+  isProfilingEnabled: () => isProfilingEnabled,
+  meanWithEpilogue: () => meanWithEpilogue,
+  printProfileSummary: () => printProfileSummary,
+  readGpuTimestamps: () => readGpuTimestamps,
+  reduction: () => reduction,
+  resetBufferPoolDetailedStats: () => resetBufferPoolDetailedStats,
+  resetProfileStats: () => resetProfileStats,
+  resetSubmitCount: () => resetSubmitCount,
+  resolveOutputBuffer: () => resolveOutputBuffer,
+  serializeRegistry: () => serializeRegistry,
+  setActiveArena: () => setActiveArena,
+  setAdamBatchMode: () => setAdamBatchMode,
+  setAllocStep: () => setAllocStep,
+  setArenaExternalInputBuffers: () => setArenaExternalInputBuffers,
+  setArenaResolveIndexTo: () => setArenaResolveIndexTo,
+  setAutotuneEnabled: () => setAutotuneEnabled,
+  setCurrentOpLabel: () => setCurrentOpLabel,
+  setDispatchSequenceCounters: () => setDispatchSequenceCounters,
+  setGPUMemoryLimit: () => setGPUMemoryLimit,
+  setProfileModule: () => setProfileModule,
+  setProfilePhase: () => setProfilePhase,
+  setTimestampsEnabled: () => setTimestampsEnabled,
+  singleWorkgroup: () => singleWorkgroup,
+  snapshotLeakedAllocs: () => snapshotLeakedAllocs,
+  startPipelineRecording: () => startPipelineRecording,
+  stopPipelineRecording: () => stopPipelineRecording,
+  sumDimWithPreambleChain: () => sumDimWithPreambleChain,
+  sumWithPreambleEpilogue: () => sumWithPreambleEpilogue,
+  syncWebGPU: () => syncWebGPU,
+  tensorFromArrayWithDtype: () => tensorFromArrayWithDtype,
+  warmupFromRegistry: () => warmupFromRegistry,
+  warmupFromStep: () => warmupFromStep,
+  warmupPipelines: () => warmupPipelines,
+  webgpuBackend: () => webgpuBackend,
+  writeProfileJSON: () => writeProfileJSON
+});
+var webgpuBackend;
+var init_webgpu = __esmMin((() => {
+  init_bind_group_cache();
+  init_buffer_arena();
+  init_buffer_pool();
+  init_dispatch();
+  init_gpu_context();
+  init_dispatch$1();
+  init_memory_tracker();
+  init_creation();
+  init_reductions();
+  init_pipeline_warmup();
+  init_profiler$1();
+  init_shared_encoder();
+  init_tile_compiler();
+  init_tile_dispatch();
+  init_tile_ir();
+  init_registry$1();
+  init_fusion_dispatch();
+  init_comparison();
+  init_conv2d();
+  init_elementwise();
+  init_fused();
+  init_gather_scatter();
+  init_matmul_ops();
+  init_strided_scatter();
+  init_views();
+  init_where();
+  init_webgpu_state();
+  _setContiguous(contiguous);
+  webgpuBackend = {
+    name: "webgpu",
+    waitForGPU,
+    get device() {
+      return gpuContext?.device ?? null;
+    },
+    dispatchFusedKernel,
+    beginSharedEncoder,
+    endSharedEncoder,
+    flushSharedEncoder,
+    flushBufferPool,
+    setAdamBatchMode,
+    setActiveArena,
+    clearActiveArena,
+    setArenaExternalInputBuffers,
+    clearArenaExternalInputBuffers,
+    beginBatchExecution,
+    endBatchExecution,
+    isBatchActive,
+    abortBatch,
+    ops: {
+      tensorFromArray,
+      zeros,
+      full,
+      arange,
+      tril,
+      triu,
+      rand,
+      randn,
+      bernoulli,
+      add,
+      sub,
+      div,
+      mul,
+      matmul,
+      sqrt,
+      relu,
+      exp,
+      log,
+      neg,
+      abs,
+      tanh,
+      sigmoid,
+      gelu,
+      silu,
+      sin,
+      cos,
+      rsqrt,
+      floor,
+      ceil,
+      round,
+      sign,
+      clamp,
+      pow,
+      isfinite,
+      expand,
+      reshape,
+      transpose,
+      permute,
+      narrow,
+      narrowBackward,
+      contiguous,
+      cast,
+      conv2d,
+      gather,
+      scatterAdd,
+      cat,
+      sum,
+      max,
+      min,
+      mean,
+      argmax,
+      argmin,
+      gt,
+      lt,
+      ge,
+      le,
+      eq,
+      ne,
+      where,
+      stridedScatterCopy,
+      stridedScatterAdd,
+      adamStep,
+      unscaleGrad,
+      fusedAttentionForward,
+      fusedAttentionBackward,
+      fusedCrossEntropyForward,
+      fusedCrossEntropyBackward,
+      fusedLayerNormForward,
+      fusedLayerNormBackwardGradX,
+      fusedLayerNormBackwardGradWeightBias,
+      fusedRMSNormForward,
+      fusedRMSNormBackwardGradX,
+      fusedRMSNormBackwardGradWeight,
+      createInfCountBuffer,
+      readAndDestroyInfCount,
+      read
+    },
+    mulScalarInPlace,
+    beginStep,
+    endStep,
+    async pretuneMatmulShapes(shapes) {
+      const ctx = gpuContext;
+      if (!ctx) return;
+      await pretuneMatmulShapes(ctx.device, ctx.queue, shapes, "f32");
+    }
+  };
+  registerBackend(webgpuBackend);
+}));
+function createPendingRef(node, outputIndex) {
+  if (outputIndex !== void 0 && outputIndex !== 0) return {
+    kind: "pending",
+    node,
+    outputIndex
+  };
+  return {
+    kind: "pending",
+    node
+  };
+}
+function createMaterializedRef(storage) {
+  return {
+    kind: "materialized",
+    storage
+  };
+}
+function createScalarRef(value, dtype) {
+  return {
+    kind: "scalar",
+    value,
+    dtype
+  };
+}
+function isMaterialized(ref2) {
+  return ref2.kind === "materialized";
+}
+init_storage_tracker();
+const tensorFinalizationRegistry = new FinalizationRegistry((held) => {
+  if (held.storageId >= 0) storageTracker.markUnreachable(held.storageId);
+});
+const pendingTensorsByNodeId = /* @__PURE__ */ new Map();
+const disposedPendingNodeIds = /* @__PURE__ */ new Set();
+function registerPendingTensor(nodeId, tensor) {
+  let tensors = pendingTensorsByNodeId.get(nodeId);
+  if (!tensors) {
+    tensors = /* @__PURE__ */ new Set();
+    pendingTensorsByNodeId.set(nodeId, tensors);
+  }
+  tensors.add(tensor);
+}
+function unregisterPendingTensor(nodeId, tensor) {
+  const tensors = pendingTensorsByNodeId.get(nodeId);
+  if (tensors) {
+    tensors.delete(tensor);
+    if (tensors.size === 0) pendingTensorsByNodeId.delete(nodeId);
+  }
+}
+function materializePendingTensors(nodeId, storage, allResults) {
+  const tensors = pendingTensorsByNodeId.get(nodeId);
+  if (tensors) {
+    for (const tensor of tensors) if (!tensor.isMaterialized() && !tensor.disposed) {
+      const ref2 = tensor.lazyRef;
+      const outputIdx = ref2.kind === "pending" ? ref2.outputIndex ?? 0 : 0;
+      const targetStorage = outputIdx > 0 && allResults?.[outputIdx] ? allResults[outputIdx] : storage;
+      tensor._materialize(targetStorage);
+    }
+  }
+}
+function getAllPendingTensors() {
+  const result = [];
+  for (const tensors of pendingTensorsByNodeId.values()) for (const tensor of tensors) if (!tensor.disposed) result.push(tensor);
+  return result;
+}
+function getPendingNodeIds() {
+  const ids = new Set(pendingTensorsByNodeId.keys());
+  for (const id of disposedPendingNodeIds) ids.add(id);
+  return ids;
+}
+function clearDisposedPendingNodeIds() {
+  disposedPendingNodeIds.clear();
+}
+var Tensor$1 = class Tensor {
+  baseId;
+  device;
+  shape;
+  dtype;
+  _lazyRef;
+  _pendingNodeId = null;
+  /** Mutable object for FinalizationRegistry - updated when tensor materializes */
+  _held;
+  constructor(baseId, lazyRef, shape, device, dtype = "f32") {
+    this.baseId = baseId;
+    this._lazyRef = lazyRef;
+    this.device = device;
+    this.shape = shape.slice();
+    this.dtype = dtype;
+    this._held = {
+      storageId: lazyRef.kind === "materialized" ? lazyRef.storage.id : -1,
+      pendingNodeId: lazyRef.kind === "pending" ? lazyRef.node.id : null
+    };
+    tensorFinalizationRegistry.register(this, this._held, this);
+    if (lazyRef.kind === "pending") {
+      this._pendingNodeId = lazyRef.node.id;
+      registerPendingTensor(lazyRef.node.id, this);
+    } else if (lazyRef.kind === "materialized") storageTracker.markReachable(lazyRef.storage.id, this);
+  }
+  get lazyRef() {
+    return this._lazyRef;
+  }
+  get backendTensor() {
+    if (!isMaterialized(this._lazyRef)) throw new Error("Tensor not materialized. Call cpu() or item() first to force execution.");
+    return this._lazyRef.storage.backendTensor;
+  }
+  isMaterialized() {
+    return isMaterialized(this._lazyRef);
+  }
+  /**
+  * Materialize this tensor with the given storage.
+  * Called by RuntimeEngine.force() after plan execution.
+  */
+  _materialize(storage) {
+    if (this._disposed) {
+      if (this._pendingNodeId !== null) {
+        unregisterPendingTensor(this._pendingNodeId, this);
+        this._pendingNodeId = null;
+      }
+      return;
+    }
+    if (this._pendingNodeId !== null) {
+      unregisterPendingTensor(this._pendingNodeId, this);
+      this._pendingNodeId = null;
+    }
+    this._lazyRef = {
+      kind: "materialized",
+      storage
+    };
+    this._held.storageId = storage.id;
+    storageTracker.markReachable(storage.id, this);
+  }
+  /**
+  * Update this tensor's lazy ref to point to a new pending node.
+  * Used by in-place operations (§4.3-4.4).
+  */
+  _updateLazyRef(newRef) {
+    if (isMaterialized(this._lazyRef)) {
+      storageTracker.markUnreachable(this._lazyRef.storage.id);
+      this._held.storageId = -1;
+    }
+    if (this._pendingNodeId !== null) {
+      unregisterPendingTensor(this._pendingNodeId, this);
+      this._pendingNodeId = null;
+    }
+    this._lazyRef = newRef;
+    if (newRef.kind === "pending") {
+      this._pendingNodeId = newRef.node.id;
+      registerPendingTensor(newRef.node.id, this);
+    }
+  }
+  toArray() {
+    return this.backendTensor.toArray();
+  }
+  view(shape) {
+    const backend = this.backendTensor;
+    if (!backend.view) throw new Error("view is not supported for this backend tensor");
+    const backendView = backend.view(shape);
+    return new Tensor(this.baseId, {
+      kind: "materialized",
+      storage: {
+        id: -1,
+        device: this.device,
+        backendTensor: backendView
+      }
+    }, backendView.shape, this.device, this.dtype);
+  }
+  _disposed = false;
+  /**
+  * Dispose this tensor and free GPU resources if applicable.
+  * Safe to call multiple times.
+  *
+  * Per spec §1.4, disposal is cleanup-only and must respect allocator fencing.
+  * GPU buffers are NOT destroyed immediately - they're marked for cleanup
+  * at the next markStep() after GPU completion (allocator fencing).
+  *
+  * NOTE: Due to lazy execution, GPU work may not have been submitted yet
+  * when dispose() is called. Destroying buffers immediately would cause
+  * "buffer used while destroyed" errors. Destruction is deferred to markStep().
+  */
+  dispose() {
+    if (this._disposed) return;
+    this._disposed = true;
+    tensorFinalizationRegistry.unregister(this);
+    this._held.storageId = -1;
+    if (this._pendingNodeId !== null) {
+      disposedPendingNodeIds.add(this._pendingNodeId);
+      unregisterPendingTensor(this._pendingNodeId, this);
+      this._pendingNodeId = null;
+    }
+    if (isMaterialized(this._lazyRef)) {
+      const storage = this._lazyRef.storage;
+      storageTracker.markUnreachable(storage.id);
+    }
+  }
+  /**
+  * Check if this tensor has been disposed.
+  */
+  get disposed() {
+    return this._disposed;
+  }
+};
+let nextBaseId = 1;
+function createBaseId() {
+  return nextBaseId++;
+}
+var define_process_env_default = {};
+init_webgpu();
+init_bind_group_cache();
+init_compiled_plan();
+init_gpu_context();
+init_shared_encoder();
+init_tensor();
+init_buffer_pool();
+init_shape_utils();
+init_memory_tracker();
+init_gpu_types();
+init_op_dispatch();
+init_node_factory();
+init_storage_tracker();
+init_lifetime_analysis();
+init_profiler();
+init_registry$1();
+init_shape();
+init_webgpu_state();
+init_registry$2();
+const F16_ELIGIBLE_OPS = F16_ELIGIBLE;
+const F32_REQUIRED_OPS = F32_REQUIRED;
+const DEFAULT_AMP_POLICY = {
+  enabled: true,
+  computeDtype: "f16",
+  accumulateDtype: "f32",
+  memoryDtype: "f32",
+  reductionDtype: "f32"
+};
+const DISABLED_AMP_POLICY = {
+  enabled: false,
+  computeDtype: "f32",
+  accumulateDtype: "f32",
+  memoryDtype: "f32",
+  reductionDtype: "f32"
+};
+function createAutocastContext() {
+  return {
+    configStack: [],
+    current: {
+      enabled: false,
+      policy: DISABLED_AMP_POLICY,
+      deviceType: "cpu"
+    }
+  };
+}
+function pushAutocast(ctx, config) {
+  const newConfig = {
+    enabled: config.enabled ?? true,
+    policy: config.policy ?? DEFAULT_AMP_POLICY,
+    deviceType: config.deviceType ?? ctx.current.deviceType
+  };
+  ctx.configStack.push(newConfig);
+  ctx.current = newConfig;
+}
+function popAutocast(ctx) {
+  ctx.configStack.pop();
+  ctx.current = ctx.configStack.length > 0 ? ctx.configStack[ctx.configStack.length - 1] : {
+    enabled: false,
+    policy: DISABLED_AMP_POLICY,
+    deviceType: "cpu"
+  };
+}
+init_adam_kernel();
+init_types$1();
+init_registry$2();
+const FUSIBLE_OPS = /* @__PURE__ */ new Set();
+for (const [name, def] of Object.entries(OP_REGISTRY)) if (def.fusible && !name.startsWith("cast_")) FUSIBLE_OPS.add(name);
+FUSIBLE_OPS.add("cast");
+FUSIBLE_OPS.delete("max");
+FUSIBLE_OPS.delete("min");
+function isFusibleOp(op) {
+  return FUSIBLE_OPS.has(op);
+}
+function nodeIdSet(nodes) {
+  return new Set(nodes.map((n) => n.id));
+}
+function buildIdPositionMap(nodes) {
+  const map = /* @__PURE__ */ new Map();
+  for (let k = 0; k < nodes.length; k++) map.set(nodes[k].id, k);
+  return map;
+}
+function groupOutputIds(group) {
+  const ids = /* @__PURE__ */ new Set([group.outputNode.id]);
+  if (group.additionalOutputNodes) for (const n of group.additionalOutputNodes) ids.add(n.id);
+  return ids;
+}
+function shapeDtypeKey(node) {
+  return `${(node.shape ?? [1]).join(",")}_${node.dtype ?? "f32"}`;
+}
+function countNonInlinableInputs(inputs) {
+  return inputs.filter((ref2) => !isInlinableScalar(ref2).inlinable).length;
+}
+function processCandidate(subNodes, subIndices, subNodeIds, internalDeps, allPlanNodes, externalNodeIds, enableMultiOutput, maxBuffers, outGroups) {
+  const externallyReferenced = /* @__PURE__ */ new Set();
+  for (let k = 0; k < subNodes.length - 1; k++) {
+    const intermediateId = subNodes[k].id;
+    for (const node of allPlanNodes) {
+      if (subNodeIds.has(node.id)) continue;
+      for (const input of node.inputs) if (input.kind === "pending" && input.node.id === intermediateId) externallyReferenced.add(k);
+    }
+    if (externalNodeIds?.has(intermediateId)) externallyReferenced.add(k);
+  }
+  if (externallyReferenced.size > 0) {
+    const primaryOutputNode = subNodes[subNodes.length - 1];
+    const primaryShape = primaryOutputNode.shape;
+    const additionalNodes = [];
+    let shapesMatch = true;
+    for (const pos of externallyReferenced) {
+      const node = subNodes[pos];
+      if (!shapesEqual(node.shape, primaryShape)) {
+        shapesMatch = false;
+        break;
+      }
+      additionalNodes.push(node);
+    }
+    const externalInputs = collectExternalInputs(subNodes, subNodeIds);
+    const totalBindings = countNonInlinableInputs(externalInputs) + 1 + additionalNodes.length;
+    if (shapesMatch && totalBindings <= maxBuffers) {
+      outGroups.push({
+        nodes: subNodes,
+        planIndices: subIndices,
+        externalInputs,
+        outputNode: primaryOutputNode,
+        additionalOutputNodes: additionalNodes.length > 0 ? additionalNodes : void 0
+      });
+      return;
+    }
+  }
+  const splitAfter = new Set(externallyReferenced);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const sortedSplits = [...splitAfter].sort((a, b) => a - b);
+    for (let k = 0; k < subNodes.length; k++) for (const depPos of internalDeps[k]) for (const s of sortedSplits) if (depPos < s && s < k) {
+      if (!splitAfter.has(depPos)) {
+        splitAfter.add(depPos);
+        changed = true;
+      }
+    }
+  }
+  if (splitAfter.size === 0) {
+    const externalInputs = collectExternalInputs(subNodes, subNodeIds);
+    outGroups.push({
+      nodes: subNodes,
+      planIndices: subIndices,
+      externalInputs,
+      outputNode: subNodes[subNodes.length - 1]
+    });
+  } else {
+    let start = 0;
+    const sortedSplits = [...splitAfter].sort((a, b) => a - b);
+    for (const splitIdx of sortedSplits) {
+      const end = splitIdx + 1;
+      const splitNodes = subNodes.slice(start, end);
+      const splitIndices = subIndices.slice(start, end);
+      if (splitNodes.length >= 2) {
+        const externalInputs = collectExternalInputs(splitNodes, nodeIdSet(splitNodes));
+        outGroups.push({
+          nodes: splitNodes,
+          planIndices: splitIndices,
+          externalInputs,
+          outputNode: splitNodes[splitNodes.length - 1]
+        });
+      }
+      start = end;
+    }
+    const remaining = subNodes.slice(start);
+    const remainingIndices = subIndices.slice(start);
+    if (remaining.length >= 2) {
+      const externalInputs = collectExternalInputs(remaining, nodeIdSet(remaining));
+      outGroups.push({
+        nodes: remaining,
+        planIndices: remainingIndices,
+        externalInputs,
+        outputNode: remaining[remaining.length - 1]
+      });
+    }
+  }
+}
+function buildCandidateGroups(nodes, epilogueClaimedIds) {
+  const candidateGroups = [];
+  let currentGroup = null;
+  const candidateNodeIds = /* @__PURE__ */ new Set();
+  let fusibleCount = 0;
+  const flushCandidate = () => {
+    if (currentGroup && currentGroup.nodes.length >= 2) candidateGroups.push(currentGroup);
+    currentGroup = null;
+    candidateNodeIds.clear();
+  };
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i];
+    if (isFusibleOp(node.op) && !epilogueClaimedIds?.has(node.id)) {
+      fusibleCount++;
+      if (!currentGroup) {
+        currentGroup = {
+          nodes: [],
+          indices: []
+        };
+        candidateNodeIds.clear();
+      }
+      currentGroup.nodes.push(node);
+      currentGroup.indices.push(i);
+      candidateNodeIds.add(node.id);
+    } else if (currentGroup && !hasPendingInputIn(node, candidateNodeIds)) ;
+    else flushCandidate();
+  }
+  flushCandidate();
+  return {
+    candidateGroups,
+    fusibleCount
+  };
+}
+function splitCandidatesByComponent(candidateGroups, nodes, externalNodeIds, enableMultiOutput, maxBuffers) {
+  const groups = [];
+  for (const candidate of candidateGroups) {
+    const nodeIdToPos = buildIdPositionMap(candidate.nodes);
+    const parent = Array.from({ length: candidate.nodes.length }, (_, i) => i);
+    const find = (x) => {
+      if (parent[x] !== x) parent[x] = find(parent[x]);
+      return parent[x];
+    };
+    const union = (a, b) => {
+      const ra = find(a);
+      const rb = find(b);
+      if (ra !== rb) parent[rb] = ra;
+    };
+    for (let k = 0; k < candidate.nodes.length; k++) for (const input of candidate.nodes[k].inputs) if (input.kind === "pending") {
+      const depPos = nodeIdToPos.get(input.node.id);
+      if (depPos !== void 0 && input.node.shape.length > 0) union(k, depPos);
+    }
+    const componentMap = /* @__PURE__ */ new Map();
+    for (let k = 0; k < candidate.nodes.length; k++) {
+      const root = find(k);
+      if (!componentMap.has(root)) componentMap.set(root, []);
+      componentMap.get(root)?.push(k);
+    }
+    const singletonPositions = [];
+    for (const positions of componentMap.values()) {
+      if (positions.length < 2) {
+        singletonPositions.push(positions[0]);
+        continue;
+      }
+      positions.sort((a, b) => a - b);
+      const subNodes = positions.map((p) => candidate.nodes[p]);
+      const subIndices = positions.map((p) => candidate.indices[p]);
+      const subNodeIds = nodeIdSet(subNodes);
+      const subNodeIdToPos = buildIdPositionMap(subNodes);
+      const internalDeps = [];
+      for (let k = 0; k < subNodes.length; k++) {
+        const deps = [];
+        for (const input of subNodes[k].inputs) if (input.kind === "pending") {
+          const pos = subNodeIdToPos.get(input.node.id);
+          if (pos !== void 0 && pos < k) deps.push(pos);
+        }
+        internalDeps.push(deps);
+      }
+      processCandidate(subNodes, subIndices, subNodeIds, internalDeps, nodes, externalNodeIds, enableMultiOutput, maxBuffers, groups);
+    }
+    if (singletonPositions.length >= 2) {
+      const byShapeDtype = /* @__PURE__ */ new Map();
+      for (const pos of singletonPositions) {
+        const node = candidate.nodes[pos];
+        const key = shapeDtypeKey(node);
+        if (!byShapeDtype.has(key)) byShapeDtype.set(key, []);
+        byShapeDtype.get(key)?.push(pos);
+      }
+      for (const sameShapePositions of byShapeDtype.values()) {
+        if (sameShapePositions.length < 2) continue;
+        sameShapePositions.sort((a, b) => a - b);
+        let batchStart = 0;
+        while (batchStart < sameShapePositions.length) {
+          const batchPositions = [];
+          const seenInputs = /* @__PURE__ */ new Set();
+          for (let j = batchStart; j < sameShapePositions.length; j++) {
+            const node = candidate.nodes[sameShapePositions[j]];
+            addInputKeys(node, seenInputs);
+            if (seenInputs.size + batchPositions.length + 1 > maxBuffers && batchPositions.length >= 2) break;
+            batchPositions.push(sameShapePositions[j]);
+          }
+          if (batchPositions.length < 2) break;
+          batchStart += batchPositions.length;
+          const batchNodes = batchPositions.map((p) => candidate.nodes[p]);
+          const batchIndices = batchPositions.map((p) => candidate.indices[p]);
+          const batchNodeIds = nodeIdSet(batchNodes);
+          groups.push({
+            nodes: batchNodes,
+            planIndices: batchIndices,
+            externalInputs: collectExternalInputs(batchNodes, batchNodeIds),
+            outputNode: batchNodes[batchNodes.length - 1],
+            additionalOutputNodes: batchNodes.slice(0, -1)
+          });
+        }
+      }
+    }
+  }
+  return groups;
+}
+function splitGroupsByBufferLimit(groups, maxBuffers) {
+  const finalGroups = [];
+  for (const group of groups) {
+    const maxInputsForGroup = maxBuffers - (1 + (group.additionalOutputNodes?.length ?? 0));
+    if (countNonInlinableInputs(group.externalInputs) <= maxInputsForGroup) {
+      finalGroups.push(group);
+      continue;
+    }
+    const subGroups = splitGroupByInputLimit(group, maxInputsForGroup);
+    for (const sub2 of subGroups) finalGroups.push(sub2);
+  }
+  return finalGroups;
+}
+function batchGlobalSingletons(nodes, finalGroups, epilogueClaimedIds, maxBuffers) {
+  const groupedNodeIds = /* @__PURE__ */ new Set();
+  for (const g of finalGroups) for (const n of g.nodes) groupedNodeIds.add(n.id);
+  const singletons = [];
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i];
+    if (isFusibleOp(node.op) && !groupedNodeIds.has(node.id) && !epilogueClaimedIds?.has(node.id)) singletons.push({
+      node,
+      planIndex: i
+    });
+  }
+  if (singletons.length < 2) return;
+  const byShapeDtype = /* @__PURE__ */ new Map();
+  for (const s of singletons) {
+    const key = shapeDtypeKey(s.node);
+    if (!byShapeDtype.has(key)) byShapeDtype.set(key, []);
+    byShapeDtype.get(key)?.push(s);
+  }
+  const earliestConsumer = /* @__PURE__ */ new Map();
+  for (let i = 0; i < nodes.length; i++) for (const input of nodes[i].inputs) if (input.kind === "pending") {
+    const prev = earliestConsumer.get(input.node.id);
+    if (prev === void 0 || i < prev) earliestConsumer.set(input.node.id, i);
+  }
+  for (const sameBucket of byShapeDtype.values()) {
+    if (sameBucket.length < 2) continue;
+    sameBucket.sort((a, b) => a.planIndex - b.planIndex);
+    let batchStart = 0;
+    while (batchStart < sameBucket.length) {
+      const batchEntries = [];
+      const batchNodeIds = /* @__PURE__ */ new Set();
+      const seenInputs = /* @__PURE__ */ new Set();
+      let batchMaxPos = -1;
+      let batchMinPos = Infinity;
+      let endJ = batchStart;
+      for (let j = batchStart; j < sameBucket.length; j++) {
+        endJ = j + 1;
+        const entry = sameBucket[j];
+        const node = entry.node;
+        const candidateMaxPos = Math.max(batchMaxPos, entry.planIndex);
+        const candidateMinPos = Math.min(batchMinPos, entry.planIndex);
+        let orderingSafe = true;
+        for (const prev of batchEntries) {
+          const ec = earliestConsumer.get(prev.node.id);
+          if (ec !== void 0 && ec <= candidateMaxPos) {
+            orderingSafe = false;
+            break;
+          }
+        }
+        if (orderingSafe) {
+          const ec = earliestConsumer.get(entry.node.id);
+          if (ec !== void 0 && ec <= candidateMaxPos) orderingSafe = false;
+        }
+        if (orderingSafe && batchEntries.length > 0) for (let g = candidateMinPos + 1; g < candidateMaxPos; g++) {
+          const gapNode = nodes[g];
+          if (!gapNode) continue;
+          for (const input of gapNode.inputs) if (input.kind === "pending" && (batchNodeIds.has(input.node.id) || input.node.id === node.id)) {
+            orderingSafe = false;
+            break;
+          }
+          if (!orderingSafe) break;
+        }
+        if (!orderingSafe) break;
+        addInputKeys(node, seenInputs);
+        if (seenInputs.size + batchEntries.length + 1 > maxBuffers && batchEntries.length >= 2) break;
+        batchEntries.push(entry);
+        batchNodeIds.add(node.id);
+        batchMaxPos = candidateMaxPos;
+        batchMinPos = candidateMinPos;
+      }
+      if (batchEntries.length < 2) {
+        batchStart = endJ;
+        continue;
+      }
+      batchStart = endJ;
+      const batchNodes = batchEntries.map((e) => e.node);
+      const batchIndices = batchEntries.map((e) => e.planIndex);
+      finalGroups.push({
+        nodes: batchNodes,
+        planIndices: batchIndices,
+        externalInputs: collectExternalInputs(batchNodes, batchNodeIds),
+        outputNode: batchNodes[batchNodes.length - 1],
+        additionalOutputNodes: batchNodes.slice(0, -1)
+      });
+    }
+  }
+}
+function promoteIntermediates(nodes, finalGroups, externalNodeIds, maxBuffers) {
+  const consumers = /* @__PURE__ */ new Map();
+  for (const planNode of nodes) for (const input of planNode.inputs) if (input.kind === "pending") {
+    let arr = consumers.get(input.node.id);
+    if (!arr) {
+      arr = [];
+      consumers.set(input.node.id, arr);
+    }
+    arr.push(planNode.id);
+  }
+  for (const group of finalGroups) {
+    const groupNodeIds = nodeIdSet(group.nodes);
+    const outputIds = groupOutputIds(group);
+    const neededIntermediates = [];
+    for (const gnode of group.nodes) {
+      if (outputIds.has(gnode.id)) continue;
+      let isExternal = externalNodeIds?.has(gnode.id) ?? false;
+      if (!isExternal) {
+        const cons = consumers.get(gnode.id);
+        if (cons) {
+          for (const cid of cons) if (!groupNodeIds.has(cid)) {
+            isExternal = true;
+            break;
+          }
+        }
+      }
+      if (isExternal) neededIntermediates.push(gnode);
+    }
+    if (neededIntermediates.length > 0) {
+      const primaryShape = group.outputNode.shape;
+      const promotable = neededIntermediates.filter((n) => shapesEqual(n.shape, primaryShape));
+      const currentOutputs = 1 + (group.additionalOutputNodes?.length ?? 0);
+      const availableSlots = maxBuffers - countNonInlinableInputs(group.externalInputs) - currentOutputs;
+      if (promotable.length === neededIntermediates.length && promotable.length <= availableSlots) group.additionalOutputNodes = [...group.additionalOutputNodes ?? [], ...promotable];
+      else group.neededIntermediates = neededIntermediates;
+    }
+  }
+}
+function detectFusionGroups(nodes, externalNodeIds, options) {
+  const maxBuffers = options?.maxStorageBuffers ?? Infinity;
+  const enableMultiOutput = options?.enableMultiOutput;
+  const epilogueClaimedIds = options?.epilogueClaimedIds;
+  const { candidateGroups, fusibleCount } = buildCandidateGroups(nodes, epilogueClaimedIds);
+  const finalGroups = splitGroupsByBufferLimit(splitCandidatesByComponent(candidateGroups, nodes, externalNodeIds, enableMultiOutput, maxBuffers), maxBuffers);
+  batchGlobalSingletons(nodes, finalGroups, epilogueClaimedIds, maxBuffers);
+  promoteIntermediates(nodes, finalGroups, externalNodeIds, maxBuffers);
+  return {
+    groups: finalGroups,
+    stats: {
+      totalNodes: nodes.length,
+      fusibleNodes: fusibleCount,
+      groupCount: finalGroups.length,
+      nodesInGroups: finalGroups.reduce((sum2, g) => sum2 + g.nodes.length, 0)
+    }
+  };
+}
+function splitGroupByInputLimit(group, maxExternalInputs) {
+  const result = [];
+  const originalAdditionalIds = /* @__PURE__ */ new Set();
+  if (group.additionalOutputNodes) for (const n of group.additionalOutputNodes) originalAdditionalIds.add(n.id);
+  let subNodes = [];
+  let subIndices = [];
+  let subNodeIds = /* @__PURE__ */ new Set();
+  let seenExternals = /* @__PURE__ */ new Set();
+  const flushSubGroup = () => {
+    if (subNodes.length >= 2) {
+      const externalInputs = collectExternalInputs(subNodes, subNodeIds);
+      const outputNode = subNodes[subNodes.length - 1];
+      const additionalOutputNodes = [];
+      for (let j = 0; j < subNodes.length - 1; j++) if (originalAdditionalIds.has(subNodes[j].id)) additionalOutputNodes.push(subNodes[j]);
+      result.push({
+        nodes: subNodes,
+        planIndices: subIndices,
+        externalInputs,
+        outputNode,
+        additionalOutputNodes: additionalOutputNodes.length > 0 ? additionalOutputNodes : void 0
+      });
+    }
+    subNodes = [];
+    subIndices = [];
+    subNodeIds = /* @__PURE__ */ new Set();
+    seenExternals = /* @__PURE__ */ new Set();
+  };
+  for (let k = 0; k < group.nodes.length; k++) {
+    const node = group.nodes[k];
+    const planIdx = group.planIndices[k];
+    const newExternalCount = countNewExternals(node, subNodeIds, seenExternals, false);
+    if (seenExternals.size + newExternalCount > maxExternalInputs && subNodes.length >= 2) flushSubGroup();
+    subNodes.push(node);
+    subIndices.push(planIdx);
+    subNodeIds.add(node.id);
+    countNewExternals(node, subNodeIds, seenExternals, true);
+  }
+  flushSubGroup();
+  if (result.length >= 2) for (let g = 0; g < result.length - 1; g++) {
+    const earlier = result[g];
+    const later = result[g + 1];
+    const earlierNodeIds = nodeIdSet(earlier.nodes);
+    const earlierOutputIds = groupOutputIds(earlier);
+    for (const laterNode of later.nodes) for (const input of laterNode.inputs) {
+      if (input.kind !== "pending") continue;
+      const depId = input.node.id;
+      if (!earlierNodeIds.has(depId)) continue;
+      if (earlierOutputIds.has(depId)) continue;
+      const depNode = earlier.nodes.find((n) => n.id === depId);
+      if (!depNode) continue;
+      if (shapesEqual(depNode.shape, earlier.outputNode.shape)) {
+        const currentOutputs = 1 + (earlier.additionalOutputNodes?.length ?? 0);
+        if (maxExternalInputs + currentOutputs - earlier.externalInputs.length - currentOutputs > 0) {
+          if (!earlier.additionalOutputNodes) earlier.additionalOutputNodes = [];
+          earlier.additionalOutputNodes.push(depNode);
+          earlierOutputIds.add(depId);
+        }
+      }
+    }
+  }
+  return result;
+}
+function collectExternalInputs(groupNodes, groupNodeIds) {
+  const external = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const node of groupNodes) for (const input of node.inputs) {
+    if (input.kind === "pending" && groupNodeIds.has(input.node.id)) continue;
+    const key = input.kind === "scalar" ? `v:${input.value}_${input.dtype}` : inputKey(input);
+    if (!seen.has(key)) {
+      seen.add(key);
+      external.push(input);
+    }
+  }
+  return external;
+}
+function groupToRecipe(group) {
+  const nodeIds = group.nodes.map((n) => n.id);
+  const nodeSet = new Set(nodeIds);
+  const inputMap = /* @__PURE__ */ new Map();
+  const inputs = [];
+  let scalarIdCounter = -1e6;
+  const registerInput = (ref2) => {
+    let id;
+    if (ref2.kind === "scalar") {
+      for (const [, existingIdx] of inputMap) {
+        const inp = inputs[-existingIdx - 1];
+        if (inp?.isInlinedConstant && inp.inlinedValue === ref2.value) return existingIdx;
+      }
+      id = scalarIdCounter--;
+    } else id = ref2.kind === "materialized" ? -ref2.storage.id : ref2.node.id;
+    if (inputMap.has(id)) return inputMap.get(id);
+    const idx = inputs.length;
+    inputMap.set(id, -(idx + 1));
+    if (ref2.kind === "scalar") inputs.push({
+      id,
+      index: idx,
+      shape: [],
+      dtype: ref2.dtype,
+      isInlinedConstant: true,
+      inlinedValue: ref2.value
+    });
+    else if (ref2.kind === "materialized") inputs.push({
+      id,
+      index: idx,
+      shape: ref2.storage.backendTensor.shape.slice(),
+      dtype: ref2.storage.backendTensor.dtype ?? "f32"
+    });
+    else {
+      const inlineCheck = isInlinableScalar(ref2);
+      const inputEntry = {
+        id: ref2.node.id,
+        index: idx,
+        shape: ref2.node.shape ?? [1],
+        dtype: ref2.node.dtype ?? "f32"
+      };
+      if (inlineCheck.inlinable) {
+        inputEntry.isInlinedConstant = true;
+        inputEntry.inlinedValue = inlineCheck.value;
+      }
+      inputs.push(inputEntry);
+    }
+    return -(idx + 1);
+  };
+  const fusedNodes = [];
+  for (const node of group.nodes) {
+    const mappedInputs = [];
+    for (const input of node.inputs) if (input.kind === "pending" && nodeSet.has(input.node.id)) mappedInputs.push(input.node.id);
+    else {
+      const negIdx = registerInput(input);
+      mappedInputs.push(negIdx);
+    }
+    let fusedOp = node.op;
+    if (node.op === "cast" && node.dtype) fusedOp = `cast_${node.dtype}`;
+    const isAdditionalOutput = group.additionalOutputNodes?.some((n) => n.id === node.id) ?? false;
+    fusedNodes.push({
+      id: node.id,
+      op: fusedOp,
+      inputs: mappedInputs,
+      shape: node.shape ?? [1],
+      dtype: node.dtype ?? "f32",
+      isOutput: node === group.outputNode || isAdditionalOutput
+    });
+  }
+  const outputNode = group.outputNode;
+  const outputs = [{
+    nodeId: outputNode.id,
+    index: 0,
+    shape: outputNode.shape ?? [1],
+    dtype: outputNode.dtype ?? "f32"
+  }];
+  if (group.additionalOutputNodes) for (let i = 0; i < group.additionalOutputNodes.length; i++) {
+    const addNode = group.additionalOutputNodes[i];
+    outputs.push({
+      nodeId: addNode.id,
+      index: i + 1,
+      shape: addNode.shape ?? [1],
+      dtype: addNode.dtype ?? "f32"
+    });
+  }
+  return {
+    id: `lazy_fused_${nodeIds.join("_")}`,
+    nodes: fusedNodes,
+    inputs,
+    outputs
+  };
+}
+function segmentPlanForExecution(nodes, externalNodeIds, options) {
+  const { groups } = detectFusionGroups(nodes, externalNodeIds, options);
+  const segments = [];
+  const indexToGroup = /* @__PURE__ */ new Map();
+  for (const group of groups) for (const idx of group.planIndices) indexToGroup.set(idx, group);
+  const emittedGroups = /* @__PURE__ */ new Set();
+  const groupMaxIdx = /* @__PURE__ */ new Map();
+  for (const group of groups) groupMaxIdx.set(group, Math.max(...group.planIndices));
+  function isGroupMember(idx) {
+    return indexToGroup.has(idx);
+  }
+  let i = 0;
+  while (i < nodes.length) {
+    const group = indexToGroup.get(i);
+    if (group) {
+      if (!emittedGroups.has(group) && i === groupMaxIdx.get(group)) {
+        emittedGroups.add(group);
+        const recipe = groupToRecipe(group);
+        segments.push({
+          kind: "fused",
+          group,
+          recipe
+        });
+      }
+      i++;
+    } else {
+      const seqNodes = [];
+      while (i < nodes.length && !isGroupMember(i)) {
+        seqNodes.push(nodes[i]);
+        i++;
+      }
+      if (seqNodes.length > 0) segments.push({
+        kind: "sequential",
+        nodes: seqNodes
+      });
+    }
+  }
+  return segments;
+}
+function inputKey(input) {
+  if (input.kind === "scalar") return null;
+  return input.kind === "materialized" ? `s:${input.storage.id}` : `p:${input.node.id}`;
+}
+function addInputKeys(node, seenInputs) {
+  let added = 0;
+  for (const input of node.inputs) {
+    const k = inputKey(input);
+    if (k !== null && !seenInputs.has(k)) {
+      seenInputs.add(k);
+      added++;
+    }
+  }
+  return added;
+}
+function countNewExternals(node, groupNodeIds, seen, track) {
+  let count = 0;
+  for (const input of node.inputs) {
+    if (input.kind === "scalar") continue;
+    if (input.kind === "pending") {
+      if (groupNodeIds.has(input.node.id)) continue;
+      if (isInlinableScalar(input).inlinable) continue;
+    }
+    const key = inputKey(input);
+    if (!seen.has(key)) {
+      count++;
+      if (track) seen.add(key);
+    }
+  }
+  return count;
+}
+function isInlinableScalar(ref2) {
+  if (ref2.kind === "scalar") return {
+    inlinable: true,
+    value: ref2.value
+  };
+  if (ref2.kind !== "pending") return { inlinable: false };
+  const node = ref2.node;
+  if ((node.shape ?? [1]).reduce((a, b) => a * b, 1) !== 1) return { inlinable: false };
+  if (node.result) return { inlinable: false };
+  switch (node.op) {
+    case "tensorFromArray": {
+      const payload = node.payload;
+      if (payload?.values && payload.values.length === 1) return {
+        inlinable: true,
+        value: payload.values[0]
+      };
+      return { inlinable: false };
+    }
+    case "full": {
+      const payload = node.payload;
+      if (payload && typeof payload.fillValue === "number") return {
+        inlinable: true,
+        value: payload.fillValue
+      };
+      return { inlinable: false };
+    }
+    case "zeros":
+      return {
+        inlinable: true,
+        value: 0
+      };
+    default:
+      return { inlinable: false };
+  }
+}
+function hasPendingInputIn(node, nodeIdSet2) {
+  for (const input of node.inputs) if (input.kind === "pending" && nodeIdSet2.has(input.node.id)) return true;
+  return false;
+}
+function selectBestForFusion(ready, chainNodeIds, nodeById, originalPos) {
+  let bestId = -1;
+  let bestPriority = 3;
+  let bestPos = Infinity;
+  for (const id of ready) {
+    const node = nodeById.get(id);
+    const fusible = isFusibleOp(node.op);
+    let priority;
+    if (fusible && chainNodeIds.size > 0 && hasPendingInputIn(node, chainNodeIds)) priority = 0;
+    else if (fusible) priority = 1;
+    else priority = 2;
+    const pos = originalPos.get(id);
+    if (priority < bestPriority || priority === bestPriority && pos < bestPos) {
+      bestId = id;
+      bestPriority = priority;
+      bestPos = pos;
+    }
+  }
+  return bestId;
+}
+function reorderPlanForFusion(nodes) {
+  if (nodes.length <= 2) return nodes;
+  const nodeById = /* @__PURE__ */ new Map();
+  const originalPos = /* @__PURE__ */ new Map();
+  for (let i = 0; i < nodes.length; i++) {
+    nodeById.set(nodes[i].id, nodes[i]);
+    originalPos.set(nodes[i].id, i);
+  }
+  const inDegree = /* @__PURE__ */ new Map();
+  const successors = /* @__PURE__ */ new Map();
+  for (const node of nodes) {
+    inDegree.set(node.id, 0);
+    successors.set(node.id, []);
+  }
+  for (const node of nodes) for (const input of node.inputs) if (input.kind === "pending" && nodeById.has(input.node.id)) {
+    inDegree.set(node.id, inDegree.get(node.id) + 1);
+    successors.get(input.node.id)?.push(node.id);
+  }
+  const ready = /* @__PURE__ */ new Set();
+  for (const node of nodes) if (inDegree.get(node.id) === 0) ready.add(node.id);
+  const result = [];
+  let chainNodeIds = /* @__PURE__ */ new Set();
+  while (ready.size > 0) {
+    const best = selectBestForFusion(ready, chainNodeIds, nodeById, originalPos);
+    ready.delete(best);
+    const bestNode = nodeById.get(best);
+    result.push(bestNode);
+    if (isFusibleOp(bestNode.op)) chainNodeIds.add(best);
+    else chainNodeIds = /* @__PURE__ */ new Set();
+    for (const succId of successors.get(best)) {
+      const newDeg = inDegree.get(succId) - 1;
+      inDegree.set(succId, newDeg);
+      if (newDeg === 0) ready.add(succId);
+    }
+  }
+  return result;
+}
+function computePlanFingerprint(nodes, externalNodeIds) {
+  const idToPos = /* @__PURE__ */ new Map();
+  for (let i = 0; i < nodes.length; i++) idToPos.set(nodes[i].id, i);
+  let h = 2166136261;
+  const prime = 16777619;
+  const hashByte = (b) => {
+    h ^= b & 255;
+    h = Math.imul(h, prime);
+  };
+  const hashInt = (v) => {
+    hashByte(v & 255);
+    hashByte(v >>> 8 & 255);
+    hashByte(v >>> 16 & 255);
+    hashByte(v >>> 24 & 255);
+  };
+  const hashStr = (s) => {
+    for (let j = 0; j < s.length; j++) hashByte(s.charCodeAt(j));
+    hashByte(0);
+  };
+  hashInt(nodes.length);
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i];
+    hashStr(node.op);
+    hashInt(node.shape.length);
+    for (const dim of node.shape) hashInt(dim);
+    hashStr(node.dtype ?? "f32");
+    hashInt(node.inputs.length);
+    for (const inp of node.inputs) if (inp.kind === "pending") {
+      const pos = idToPos.get(inp.node.id);
+      hashInt(pos !== void 0 ? pos : -1);
+      hashByte(1);
+    } else if (inp.kind === "scalar") {
+      hashByte(2);
+      const buf = new Float64Array(1);
+      buf[0] = inp.value;
+      const bytes = new Uint8Array(buf.buffer);
+      for (let b = 0; b < 8; b++) hashByte(bytes[b]);
+    } else {
+      hashByte(3);
+      const mShape = inp.storage.backendTensor.shape;
+      hashInt(mShape.length);
+      for (const d of mShape) hashInt(d);
+      hashStr(inp.storage.backendTensor.dtype ?? "f32");
+    }
+    if (externalNodeIds?.has(node.id)) hashByte(238);
+    if (node.payload) {
+      const p = node.payload;
+      if (p.dtype) hashStr(String(p.dtype));
+      if (typeof p.dim === "number") hashInt(p.dim);
+      if (typeof p.k === "number") hashInt(p.k);
+    }
+  }
+  return h >>> 0;
+}
+const DATA_SOURCE_OPS = /* @__PURE__ */ new Set([
+  "tensorFromArray",
+  "zeros",
+  "full",
+  "arange",
+  "rand",
+  "randn",
+  "bernoulli"
+]);
+const VIEW_OPS = /* @__PURE__ */ new Set([
+  "reshape",
+  "transpose",
+  "permute",
+  "expand",
+  "narrow"
+]);
+function isDataSourceOp(op) {
+  return DATA_SOURCE_OPS.has(op);
+}
+function isViewOp(op) {
+  return VIEW_OPS.has(op);
+}
+const DEFAULT_RECLAIM_INTERVAL = typeof process !== "undefined" && define_process_env_default?.TORCHLETTE_RECLAIM_INTERVAL ? parseInt(define_process_env_default.TORCHLETTE_RECLAIM_INTERVAL, 10) : 1e4;
+function buildLoweredPlanFromAnalysis(input) {
+  const { segments, planNodes, nodeIdToFinalPos, prologueClaimedIds, rowProgramMatches, matmulDirectives, enableVectorization, reclaimInterval = DEFAULT_RECLAIM_INTERVAL } = input;
+  const actions = [];
+  let nodesSinceReclaim = 0;
+  const maybeReclaim = (nodeCount) => {
+    nodesSinceReclaim += nodeCount;
+    if (nodesSinceReclaim >= reclaimInterval) {
+      actions.push({ kind: "reclaim" });
+      nodesSinceReclaim = 0;
+    }
+  };
+  let rowProgramMatchMap;
+  if (rowProgramMatches.length > 0) {
+    rowProgramMatchMap = /* @__PURE__ */ new Map();
+    for (const match of rowProgramMatches) {
+      let firstPos = Infinity;
+      let firstId = match.coveredNodeIds[0];
+      for (const id of match.coveredNodeIds) {
+        const pos = nodeIdToFinalPos.get(id) ?? Infinity;
+        if (pos < firstPos) {
+          firstPos = pos;
+          firstId = id;
+        }
+      }
+      for (const id of match.coveredNodeIds) rowProgramMatchMap.set(id, {
+        match,
+        isFirst: id === firstId
+      });
+    }
+  }
+  for (const segment of segments) if (segment.kind === "fused" && segment.group.nodes.length >= 2) {
+    const nodeCount = segment.group.nodes.length;
+    emitFusedActions(actions, segment, nodeIdToFinalPos, enableVectorization);
+    maybeReclaim(nodeCount);
+  } else emitSequentialActions(actions, segment.kind === "fused" ? segment.group.nodes : segment.nodes, nodeIdToFinalPos, prologueClaimedIds, rowProgramMatchMap, matmulDirectives, maybeReclaim);
+  return {
+    actions,
+    planNodeCount: planNodes.length
+  };
+}
+function emitFusedActions(actions, segment, posMap, enableVectorization) {
+  actions.push({
+    kind: "fused",
+    coveredNodeIndices: segment.group.nodes.map((n) => posMap.get(n.id)),
+    outputNodeIndex: posMap.get(segment.group.outputNode.id),
+    additionalOutputNodeIndices: (segment.group.additionalOutputNodes ?? []).map((n) => posMap.get(n.id)),
+    neededIntermediateNodeIndices: (segment.group.neededIntermediates ?? []).map((n) => posMap.get(n.id)),
+    recipe: segment.recipe,
+    enableVectorization
+  });
+}
+function emitSequentialActions(actions, nodes, posMap, prologueSkipIds, rowProgramMatchMap, matmulDirectives, maybeReclaim) {
+  for (let nodeIdx = 0; nodeIdx < nodes.length; nodeIdx++) {
+    const node = nodes[nodeIdx];
+    if (node.result) continue;
+    if (prologueSkipIds.has(node.id)) {
+      actions.push({
+        kind: "prologue-skip",
+        nodeIndex: posMap.get(node.id)
+      });
+      maybeReclaim(1);
+      continue;
+    }
+    if (rowProgramMatchMap?.has(node.id)) {
+      const entry = rowProgramMatchMap.get(node.id);
+      if (!entry.isFirst) {
+        actions.push({
+          kind: "prologue-skip",
+          nodeIndex: posMap.get(node.id)
+        });
+        continue;
+      }
+      const m = entry.match;
+      const inputRefPositions = m.inputRefs.map((ref2) => {
+        if (ref2.kind === "pending") return posMap.get(ref2.node.id) ?? -1;
+        return -1;
+      });
+      actions.push({
+        kind: "row-program",
+        coveredNodeIndices: m.coveredNodeIds.map((id) => posMap.get(id)),
+        outputNodeIndex: posMap.get(m.outputNodeId),
+        dim: m.dim,
+        numRows: m.numRows,
+        dimSize: m.dimSize,
+        program: m.program,
+        inputRefs: m.inputRefs,
+        inputRefPositions
+      });
+      maybeReclaim(m.coveredNodeIds.length);
+      continue;
+    }
+    if (node.op === "matmul") {
+      const epiloguePlan = matmulDirectives.get(node.id);
+      if (epiloguePlan) {
+        const covered = [];
+        for (let c = 0; c < epiloguePlan.consumedCount; c++) covered.push(posMap.get(nodes[nodeIdx + c].id));
+        actions.push({
+          kind: "matmul-epilogue",
+          matmulNodeIndex: posMap.get(node.id),
+          coveredNodeIndices: covered,
+          outputNodeIndex: posMap.get(epiloguePlan.outputNode.id),
+          epilogueOps: epiloguePlan.epilogueOps,
+          outputDtype: epiloguePlan.outputDtype,
+          consumedCount: epiloguePlan.consumedCount,
+          prologues: epiloguePlan.prologues?.map((p) => ({
+            inputIndex: p.inputIndex,
+            castNodeIndex: posMap.get(p.castNodeId),
+            fromDtype: p.fromDtype,
+            toDtype: p.toDtype
+          }))
+        });
+        maybeReclaim(epiloguePlan.consumedCount);
+        nodeIdx += epiloguePlan.consumedCount - 1;
+        continue;
+      }
+    }
+    if (node.op === "adamStep") {
+      let adamCount = 1;
+      for (let j = nodeIdx + 1; j < nodes.length; j++) if (nodes[j].op === "adamStep" && !nodes[j].result) adamCount++;
+      else break;
+      if (adamCount > 1) {
+        const adamIndices = [];
+        for (let c = 0; c < adamCount; c++) adamIndices.push(posMap.get(nodes[nodeIdx + c].id));
+        actions.push({
+          kind: "adam-batch",
+          nodeIndices: adamIndices
+        });
+        maybeReclaim(adamCount);
+        nodeIdx += adamCount - 1;
+        continue;
+      }
+    }
+    const kind = isDataSourceOp(node.op) ? "data-source" : isViewOp(node.op) ? "view" : "sequential";
+    actions.push({
+      kind,
+      nodeIndex: posMap.get(node.id)
+    });
+    maybeReclaim(1);
+  }
+}
+const SIMPLIFICATION_PASSES = [
+  {
+    name: "identity-casts",
+    run: eliminateIdentityCasts
+  },
+  {
+    name: "redundant-contiguous",
+    run: eliminateRedundantContiguous
+  },
+  {
+    name: "algebraic-identities",
+    run: eliminateAlgebraicIdentities
+  },
+  {
+    name: "fuse-sum-reshape",
+    run: fuseSumReshape
+  },
+  {
+    name: "cse",
+    run: eliminateCommonSubexpressions
+  },
+  {
+    name: "dce",
+    run: eliminateDeadCode
+  }
+];
+function runPasses(ctx, bypassed, passes) {
+  const stats = /* @__PURE__ */ new Map();
+  for (const pass of passes) stats.set(pass.name, pass.run(ctx, bypassed));
+  return stats;
+}
+function eliminateIdentityCasts(ctx, bypassed) {
+  let count = 0;
+  for (const node of ctx.planNodes) {
+    if (node.op !== "cast" || node.result) continue;
+    const payload = node.payload;
+    if (!payload?.dtype) continue;
+    const inputRef = node.inputs[0];
+    if (!inputRef) continue;
+    let inputDtype;
+    if (inputRef.kind === "pending") inputDtype = inputRef.node.dtype;
+    else if (inputRef.kind === "materialized") inputDtype = inputRef.storage.backendTensor.dtype ?? "f32";
+    if (inputDtype !== payload.dtype) continue;
+    redirectConsumers(node, inputRef, ctx);
+    bypassed.add(node.id);
+    count++;
+  }
+  return count;
+}
+function eliminateRedundantContiguous(ctx, bypassed) {
+  let count = 0;
+  for (const node of ctx.planNodes) {
+    if (node.op !== "contiguous" || node.result) continue;
+    const inputRef = node.inputs[0];
+    if (!inputRef || inputRef.kind !== "pending") continue;
+    if (!isViewOp(inputRef.node.op)) {
+      redirectConsumers(node, inputRef, ctx);
+      bypassed.add(node.id);
+      count++;
+    }
+  }
+  return count;
+}
+function tryGetScalarValue(ref2) {
+  if (ref2.kind !== "pending") return null;
+  const node = ref2.node;
+  if (node.op !== "full") return null;
+  if (node.shape.reduce((a, b) => a * b, 1) !== 1) return null;
+  const payload = node.payload;
+  if (!payload || typeof payload.fillValue !== "number") return null;
+  return payload.fillValue;
+}
+const IDENTITY_RULES = {
+  mul: {
+    value: 1,
+    commutative: true
+  },
+  add: {
+    value: 0,
+    commutative: true
+  },
+  sub: {
+    value: 0,
+    commutative: false
+  },
+  div: {
+    value: 1,
+    commutative: false
+  }
+};
+function eliminateAlgebraicIdentities(ctx, bypassed) {
+  let count = 0;
+  for (const node of ctx.planNodes) {
+    if (node.result || node.inputs.length !== 2) continue;
+    const rule = IDENTITY_RULES[node.op];
+    if (!rule) continue;
+    if (tryGetScalarValue(node.inputs[1]) === rule.value) {
+      redirectConsumers(node, node.inputs[0], ctx);
+      bypassed.add(node.id);
+      count++;
+    } else if (rule.commutative) {
+      if (tryGetScalarValue(node.inputs[0]) === rule.value) {
+        redirectConsumers(node, node.inputs[1], ctx);
+        bypassed.add(node.id);
+        count++;
+      }
+    }
+  }
+  return count;
+}
+function fuseSumReshape(ctx, bypassed) {
+  let count = 0;
+  for (const node of ctx.planNodes) {
+    if (node.op !== "reshape" || node.result || bypassed.has(node.id)) continue;
+    const inputRef = node.inputs[0];
+    if (!inputRef || inputRef.kind !== "pending") continue;
+    const sumNode = inputRef.node;
+    if (sumNode.op !== "sum" && sumNode.op !== "mean") continue;
+    if (bypassed.has(sumNode.id)) continue;
+    const payload = sumNode.payload;
+    if (!payload?.keepdim) continue;
+    if ((ctx.consumerCount.get(sumNode.id) ?? 0) > 1) continue;
+    if (sumNode.shape.reduce((a, b) => a * b, 1) !== node.shape.reduce((a, b) => a * b, 1)) continue;
+    sumNode.shape = node.shape;
+    payload.keepdim = false;
+    redirectConsumers(node, {
+      kind: "pending",
+      node: sumNode
+    }, ctx);
+    bypassed.add(node.id);
+    count++;
+  }
+  return count;
+}
+const NON_CSE_OPS = /* @__PURE__ */ new Set([
+  "rand",
+  "randn",
+  "bernoulli",
+  "fusedAttentionForward",
+  "fusedAttentionBackward",
+  "fusedLayerNormForward",
+  "fusedLayerNormBackwardGradX",
+  "fusedLayerNormBackwardGradWeightBias",
+  "fusedRMSNormForward",
+  "fusedRMSNormBackwardGradX",
+  "fusedRMSNormBackwardGradWeight",
+  "fusedCrossEntropyForward",
+  "fusedCrossEntropyBackward",
+  "adamStep",
+  "stridedScatterCopy",
+  "stridedScatterAdd",
+  "unscaleGrad"
+]);
+const LARGE_PAYLOAD_OPS = /* @__PURE__ */ new Set([
+  "tensorFromArray",
+  "zeros",
+  "arange"
+]);
+function structuralKey(node) {
+  if (node.inputs.length === 0) return null;
+  let key = `${node.op}|${node.shape.join(",")}|${node.dtype}`;
+  for (const ref2 of node.inputs) if (ref2.kind === "pending") key += `|p:${ref2.node.id}`;
+  else if (ref2.kind === "materialized") key += `|m:${ref2.storage.id}`;
+  else key += `|s:${ref2.value}:${ref2.dtype}`;
+  if (node.payload !== void 0 && !LARGE_PAYLOAD_OPS.has(node.op)) key += `|${JSON.stringify(node.payload)}`;
+  return key;
+}
+function eliminateCommonSubexpressions(ctx, bypassed) {
+  const canonical = /* @__PURE__ */ new Map();
+  let count = 0;
+  for (const node of ctx.planNodes) {
+    if (node.result || bypassed.has(node.id) || NON_CSE_OPS.has(node.op)) continue;
+    const key = structuralKey(node);
+    if (key === null) continue;
+    const existing = canonical.get(key);
+    if (existing) {
+      redirectConsumers(node, {
+        kind: "pending",
+        node: existing
+      }, ctx);
+      bypassed.add(node.id);
+      count++;
+    } else canonical.set(key, node);
+  }
+  return count;
+}
+function eliminateDeadCode(ctx, bypassed) {
+  let count = 0;
+  const lastNode = ctx.planNodes[ctx.planNodes.length - 1];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const node of ctx.planNodes) {
+      if (bypassed.has(node.id) || node.result) continue;
+      if (node === lastNode) continue;
+      if ((ctx.consumerCount.get(node.id) ?? 0) === 0) {
+        bypassed.add(node.id);
+        for (const ref2 of node.inputs) if (ref2.kind === "pending") {
+          const c = ctx.consumerCount.get(ref2.node.id) ?? 0;
+          if (c > 0) ctx.consumerCount.set(ref2.node.id, c - 1);
+        }
+        count++;
+        changed = true;
+      }
+    }
+  }
+  return count;
+}
+function redirectConsumers(node, replacementRef, ctx) {
+  const nodeConsumers = ctx.consumers.get(node.id);
+  if (!nodeConsumers) return;
+  for (const consumer of nodeConsumers) for (let i = 0; i < consumer.inputs.length; i++) {
+    const ref2 = consumer.inputs[i];
+    if (ref2.kind === "pending" && ref2.node.id === node.id) consumer.inputs[i] = replacementRef;
+  }
+  if (replacementRef.kind === "pending") {
+    const inputId = replacementRef.node.id;
+    const count = ctx.consumerCount.get(inputId) ?? 0;
+    const nodeConsumerCount = ctx.consumerCount.get(node.id) ?? 0;
+    ctx.consumerCount.set(inputId, count + nodeConsumerCount - 1);
+    const filtered = (ctx.consumers.get(inputId) ?? []).filter((c) => c.id !== node.id);
+    for (const consumer of nodeConsumers) if (!filtered.some((c) => c.id === consumer.id)) filtered.push(consumer);
+    ctx.consumers.set(inputId, filtered);
+  }
+  ctx.consumerCount.set(node.id, 0);
+  ctx.consumers.set(node.id, []);
+}
+init_shape();
+function findChainInput(nextNode, currentNodeId) {
+  const primary = nextNode.inputs[0];
+  if (primary.kind === "pending" && primary.node.id === currentNodeId) return 0;
+  if ((nextNode.op === "add" || nextNode.op === "mul") && nextNode.inputs.length === 2) {
+    const alt = nextNode.inputs[1];
+    if (alt.kind === "pending" && alt.node.id === currentNodeId) return 1;
+  }
+  return -1;
+}
+function getEpilogueOpName(node) {
+  if (node.op === "gelu") return node.payload?.approximate === "tanh" ? "gelu" : "gelu_erf";
+  if (node.op === "cast") return `cast_${node.payload?.dtype || "f32"}`;
+  return node.op;
+}
+function detectMatmulEpilogueCore(nodes, startIdx, consumerCount, externalNodeIds) {
+  const matmulNode = nodes[startIdx];
+  if (matmulNode.op !== "matmul") return null;
+  const epilogueOps = [];
+  const epilogueInputRefs = [];
+  let additionalInputCount = 0;
+  let chainLength = 0;
+  let currentNode = matmulNode;
+  let outputDtype = matmulNode.dtype;
+  let currentIsReshapeSkip = false;
+  for (let i = startIdx + 1; i < nodes.length && chainLength < 4; i++) {
+    const nextNode = nodes[i];
+    if (nextNode.inputs.length === 0) break;
+    const chainInputIdx = findChainInput(nextNode, currentNode.id);
+    if (chainInputIdx < 0) break;
+    if (externalNodeIds?.has(currentNode.id) && !currentIsReshapeSkip) break;
+    if ((consumerCount.get(currentNode.id) ?? 0) > 1) break;
+    if (nextNode.op === "reshape") {
+      const curShape = currentNode.shape;
+      const nextShape = nextNode.shape;
+      if (curShape.length === nextShape.length + 1 && curShape[0] === 1 && curShape.slice(1).every((d, i2) => d === nextShape[i2])) {
+        chainLength++;
+        currentNode = nextNode;
+        currentIsReshapeSkip = true;
+        outputDtype = nextNode.dtype || outputDtype;
+        continue;
+      }
+      break;
+    }
+    currentIsReshapeSkip = false;
+    let matched = false;
+    if (nextNode.op === "cast") {
+      const payload = nextNode.payload;
+      if (payload) {
+        epilogueOps.push({
+          kind: "cast",
+          toDtype: payload.dtype
+        });
+        outputDtype = payload.dtype;
+        matched = true;
+      }
+    } else if (nextNode.op === "add" && nextNode.inputs.length === 2) {
+      const secondInput = nextNode.inputs[chainInputIdx === 0 ? 1 : 0];
+      let secondShape;
+      if (secondInput.kind === "materialized") secondShape = secondInput.storage.backendTensor.shape;
+      else if (secondInput.kind === "pending") secondShape = secondInput.node.shape;
+      if (secondShape && secondShape.length === 1) {
+        if (additionalInputCount >= 4) break;
+        epilogueOps.push({
+          kind: "bias",
+          inputIndex: additionalInputCount
+        });
+        epilogueInputRefs.push(secondInput);
+        additionalInputCount++;
+        matched = true;
+      } else {
+        if (additionalInputCount >= 4) break;
+        epilogueOps.push({
+          kind: "binary",
+          op: "add",
+          inputIndex: additionalInputCount
+        });
+        epilogueInputRefs.push(secondInput);
+        additionalInputCount++;
+        matched = true;
+      }
+    } else if ((nextNode.op === "mul" || nextNode.op === "sub") && nextNode.inputs.length === 2) {
+      if (additionalInputCount >= 4) break;
+      epilogueOps.push({
+        kind: "binary",
+        op: nextNode.op,
+        inputIndex: additionalInputCount
+      });
+      epilogueInputRefs.push(nextNode.inputs[chainInputIdx === 0 ? 1 : 0]);
+      additionalInputCount++;
+      matched = true;
+    } else if (isFusibleOp(nextNode.op) && nextNode.inputs.length === 1 && nextNode.op !== "cast") {
+      epilogueOps.push({
+        kind: "unary",
+        op: getEpilogueOpName(nextNode)
+      });
+      matched = true;
+    }
+    if (!matched) break;
+    chainLength++;
+    currentNode = nextNode;
+    outputDtype = nextNode.dtype || outputDtype;
+  }
+  if (chainLength === 0) return null;
+  return {
+    consumedCount: 1 + chainLength,
+    epilogueOps,
+    epilogueInputRefs,
+    outputDtype,
+    outputNode: currentNode
+  };
+}
+function _detectTransposeView(tensor) {
+  const shape = tensor.shape;
+  const strides = tensor.strides;
+  const rank2 = shape.length;
+  if (tensor.isContiguous || (tensor.offset ?? 0) !== 0 || rank2 < 2 || !strides) return {
+    shape: shape.slice(),
+    transposed: false
+  };
+  if (strides[rank2 - 2] === 1 && strides[rank2 - 1] === shape[rank2 - 2]) {
+    let expectedStride = shape[rank2 - 1] * shape[rank2 - 2];
+    let valid = true;
+    for (let i = rank2 - 3; i >= 0; i--) {
+      if (strides[i] !== expectedStride) {
+        valid = false;
+        break;
+      }
+      expectedStride *= shape[i];
+    }
+    if (valid) {
+      const origShape = shape.slice();
+      origShape[rank2 - 2] = shape[rank2 - 1];
+      origShape[rank2 - 1] = shape[rank2 - 2];
+      return {
+        shape: origShape,
+        transposed: true
+      };
+    }
+  }
+  return {
+    shape: shape.slice(),
+    transposed: false
+  };
+}
+async function executeMatmulWithEpilogue(matmulNode, plan) {
+  await ensureWebGPUMatmulImports();
+  const { dispatchMatmul: dispatchMatmul2 } = _webgpuMatmulImports;
+  let inputCastA;
+  let inputCastB;
+  let resolvedInputRefA = matmulNode.inputs[0];
+  let resolvedInputRefB = matmulNode.inputs[1];
+  if (plan.prologues) for (const p of plan.prologues) {
+    const castRef2 = p.inputIndex === 0 ? matmulNode.inputs[0] : matmulNode.inputs[1];
+    if (!(castRef2.kind === "pending" && castRef2.node.result != null)) if (p.inputIndex === 0) {
+      resolvedInputRefA = p.originalInputRef;
+      inputCastA = p.toDtype;
+    } else {
+      resolvedInputRefB = p.originalInputRef;
+      inputCastB = p.toDtype;
+    }
+  }
+  const matmulInputA = getInputStorage(resolvedInputRefA);
+  const matmulInputB = getInputStorage(resolvedInputRefB);
+  const epilogueInputTensors = [];
+  for (const ref2 of plan.epilogueInputRefs) {
+    const storage = getInputStorage(ref2);
+    epilogueInputTensors.push(storage.backendTensor);
+  }
+  const epilogueConfig = {
+    ops: plan.epilogueOps,
+    additionalInputCount: plan.epilogueInputRefs.length,
+    outputDtype: plan.outputDtype
+  };
+  const resultTensor = dispatchMatmul2(asGPUTensor(matmulInputA.backendTensor), asGPUTensor(matmulInputB.backendTensor), false, false, void 0, {
+    epilogue: epilogueConfig,
+    epilogueInputs: epilogueInputTensors.map((t) => asGPUTensor(t)),
+    inputCastA,
+    inputCastB
+  });
+  const outNodeShape = plan.outputNode.shape;
+  if (!shapesEqual(resultTensor.shape, outNodeShape)) {
+    const gpuT = asGPUTensor(resultTensor);
+    gpuT.shape = outNodeShape;
+    gpuT.strides = contiguousStrides(outNodeShape);
+  }
+  plan.outputNode.result = createStorageHandle(plan.outputNode.device, resultTensor);
+}
+const REDUCE_OPS = /* @__PURE__ */ new Set([
+  "sum",
+  "mean",
+  "max"
+]);
+const MAX_INPUT_BINDINGS = 7;
+const MAX_EXPR_NODES = 30;
+function getReductionDim(node) {
+  const payload = node.payload;
+  if (!payload) return null;
+  const dim = payload.dim;
+  if (dim == null) return null;
+  if (Array.isArray(dim)) {
+    if (dim.length !== 1) return null;
+    return normalizeDim(dim[0], node.inputs[0]?.kind === "pending" ? node.inputs[0].node.shape.length : node.shape.length);
+  }
+  return normalizeDim(dim, node.inputs[0]?.kind === "pending" ? node.inputs[0].node.shape.length : node.shape.length);
+}
+function normalizeDim(dim, rank2) {
+  return dim < 0 ? dim + rank2 : dim;
+}
+function isLastDimReduction(node) {
+  const dim = getReductionDim(node);
+  if (dim === null) return false;
+  return dim === (node.inputs[0]?.kind === "pending" ? node.inputs[0].node.shape.length : node.shape.length) - 1;
+}
+function getRefDtype(ref2) {
+  if (ref2.kind === "pending") return ref2.node.dtype;
+  if (ref2.kind === "materialized") return ref2.storage.backendTensor.dtype || "f32";
+  return ref2.dtype;
+}
+function expandSubgraph(seedNode, seedDim, nodeById, consumerCount, consumers, externalNodeIds, alreadyClaimedIds) {
+  const subgraph = /* @__PURE__ */ new Set();
+  const reductionNodes = /* @__PURE__ */ new Set();
+  subgraph.add(seedNode.id);
+  reductionNodes.add(seedNode.id);
+  const candidates = /* @__PURE__ */ new Set();
+  collectCandidates(seedNode, seedDim, nodeById, consumerCount, consumers, externalNodeIds, alreadyClaimedIds, candidates, reductionNodes);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const candId of candidates) {
+      if (subgraph.has(candId)) continue;
+      const candNode = nodeById.get(candId);
+      if (REDUCE_OPS.has(candNode.op)) {
+        const primaryInput = candNode.inputs[0];
+        if (primaryInput?.kind === "pending" && subgraph.has(primaryInput.node.id)) {
+          subgraph.add(candId);
+          changed = true;
+        }
+        continue;
+      }
+      const hasSubgraphInput = candNode.inputs.some((ref2) => ref2.kind === "pending" && subgraph.has(ref2.node.id));
+      const hasSubgraphConsumer = (consumers.get(candId) ?? []).some((c) => subgraph.has(c.id));
+      if (!hasSubgraphInput && !hasSubgraphConsumer) continue;
+      if ((consumerCount.get(candId) ?? 0) <= 1) {
+        subgraph.add(candId);
+        changed = true;
+      } else if ((consumers.get(candId) ?? []).every((c) => subgraph.has(c.id) || candidates.has(c.id))) {
+        subgraph.add(candId);
+        changed = true;
+      }
+    }
+  }
+  let reductionCount2 = 0;
+  let elemCount = 0;
+  for (const id of subgraph) {
+    const n = nodeById.get(id);
+    if (REDUCE_OPS.has(n.op)) reductionCount2++;
+    else elemCount++;
+  }
+  if (reductionCount2 < 1) return null;
+  if (reductionCount2 < 2 && elemCount < 1) return null;
+  let outputCount = 0;
+  for (const nodeId of subgraph) {
+    if (externalNodeIds?.has(nodeId)) {
+      if ((consumers.get(nodeId) ?? []).some((c) => !subgraph.has(c.id))) return null;
+    }
+    if ((consumerCount.get(nodeId) ?? 0) > 0) {
+      if ((consumers.get(nodeId) ?? []).some((c) => !subgraph.has(c.id))) outputCount++;
+    } else outputCount++;
+  }
+  if (outputCount > 1) return null;
+  return subgraph;
+}
+function collectCandidates(seedNode, seedDim, nodeById, consumerCount, consumers, externalNodeIds, alreadyClaimedIds, candidates, reductionNodes) {
+  const queue = [seedNode.id];
+  candidates.add(seedNode.id);
+  while (queue.length > 0) {
+    const nodeId = queue.shift();
+    const node = nodeById.get(nodeId);
+    const nodeConsumers = consumers.get(nodeId) ?? [];
+    for (const consumer of nodeConsumers) {
+      if (candidates.has(consumer.id)) continue;
+      if (alreadyClaimedIds?.has(consumer.id)) continue;
+      if (consumer.result) continue;
+      if (externalNodeIds?.has(consumer.id)) continue;
+      if (REDUCE_OPS.has(consumer.op) && isLastDimReduction(consumer)) {
+        if (getReductionDim(consumer) === seedDim) {
+          candidates.add(consumer.id);
+          reductionNodes.add(consumer.id);
+          queue.push(consumer.id);
+          continue;
+        }
+      }
+      if (isFusibleOp(consumer.op) && consumer.inputs.length <= 3) {
+        candidates.add(consumer.id);
+        queue.push(consumer.id);
+      }
+    }
+    for (const ref2 of node.inputs) {
+      if (ref2.kind !== "pending") continue;
+      const inputNode = ref2.node;
+      if (candidates.has(inputNode.id)) continue;
+      if (alreadyClaimedIds?.has(inputNode.id)) continue;
+      if (inputNode.result) continue;
+      if (externalNodeIds?.has(inputNode.id)) continue;
+      if (REDUCE_OPS.has(inputNode.op) && isLastDimReduction(inputNode)) {
+        if (getReductionDim(inputNode) === seedDim) {
+          candidates.add(inputNode.id);
+          reductionNodes.add(inputNode.id);
+          queue.push(inputNode.id);
+          continue;
+        }
+      }
+      if (isFusibleOp(inputNode.op) && inputNode.inputs.length <= 3) {
+        candidates.add(inputNode.id);
+        queue.push(inputNode.id);
+      }
+    }
+  }
+}
+function buildExpr(node, subgraphIds, completedReducePhases, inputRefMap, inputRefs, inputDtypes, nodeCount) {
+  if (nodeCount.value > MAX_EXPR_NODES) return null;
+  nodeCount.value++;
+  const reducePhase = completedReducePhases.get(node.id);
+  if (reducePhase !== void 0) return {
+    kind: "reduceResult",
+    phaseIndex: reducePhase
+  };
+  const inputExprs = [];
+  for (const ref2 of node.inputs) {
+    const expr = buildRefExpr(ref2, subgraphIds, completedReducePhases, inputRefMap, inputRefs, inputDtypes, nodeCount);
+    if (!expr) return null;
+    inputExprs.push(expr);
+  }
+  let opName = node.op;
+  if (opName === "cast") {
+    const payload = node.payload;
+    if (payload?.dtype) opName = `cast_${payload.dtype}`;
+  }
+  return {
+    op: opName,
+    inputs: inputExprs
+  };
+}
+function buildRefExpr(ref2, subgraphIds, completedReducePhases, inputRefMap, inputRefs, inputDtypes, nodeCount) {
+  if (ref2.kind === "scalar") return {
+    kind: "const",
+    value: ref2.value
+  };
+  if (ref2.kind === "materialized") {
+    const key = `m:${ref2.storage.id}`;
+    let idx = inputRefMap.get(key);
+    if (idx === void 0) {
+      if (inputRefs.length >= MAX_INPUT_BINDINGS) return null;
+      idx = inputRefs.length;
+      inputRefMap.set(key, idx);
+      inputRefs.push(ref2);
+      inputDtypes.push(getRefDtype(ref2));
+    }
+    return {
+      kind: "input",
+      bufferIndex: idx
+    };
+  }
+  const inputNode = ref2.node;
+  if (!subgraphIds.has(inputNode.id)) {
+    const key = `p:${inputNode.id}`;
+    let idx = inputRefMap.get(key);
+    if (idx === void 0) {
+      if (inputRefs.length >= MAX_INPUT_BINDINGS) return null;
+      idx = inputRefs.length;
+      inputRefMap.set(key, idx);
+      inputRefs.push(ref2);
+      inputDtypes.push(getRefDtype(ref2));
+    }
+    return {
+      kind: "input",
+      bufferIndex: idx
+    };
+  }
+  return buildExpr(inputNode, subgraphIds, completedReducePhases, inputRefMap, inputRefs, inputDtypes, nodeCount);
+}
+function buildRowProgram(subgraphIds, nodeById, consumers, consumerCount, dim) {
+  const sorted = topoSortSubgraph(subgraphIds, nodeById);
+  if (!sorted) return null;
+  let outputNode = null;
+  for (const nodeId of subgraphIds) {
+    const node = nodeById.get(nodeId);
+    const cc = consumerCount.get(nodeId) ?? 0;
+    const nodeConsumers = consumers.get(nodeId) ?? [];
+    if (cc === 0 || nodeConsumers.some((c) => !subgraphIds.has(c.id))) {
+      if (outputNode && outputNode.id !== node.id) return null;
+      outputNode = node;
+    }
+  }
+  if (!outputNode) return null;
+  const phases = [];
+  const completedReducePhases = /* @__PURE__ */ new Map();
+  const inputRefMap = /* @__PURE__ */ new Map();
+  const inputRefs = [];
+  const inputDtypes = [];
+  for (const node of sorted) {
+    if (!REDUCE_OPS.has(node.op)) continue;
+    const reduceInput = node.inputs[0];
+    if (!reduceInput || reduceInput.kind !== "pending") return null;
+    const bodyExpr = buildRefExpr(reduceInput, subgraphIds, completedReducePhases, inputRefMap, inputRefs, inputDtypes, { value: 0 });
+    if (!bodyExpr) return null;
+    const reduceOp = node.op === "mean" ? "sum" : node.op;
+    phases.push({
+      kind: "reduce",
+      reduceOp,
+      bodyExpr,
+      isMean: node.op === "mean" || void 0
+    });
+    completedReducePhases.set(node.id, phases.length - 1);
+  }
+  let writeExpr;
+  if (REDUCE_OPS.has(outputNode.op)) {
+    const phaseIdx = completedReducePhases.get(outputNode.id);
+    if (phaseIdx === void 0) return null;
+    writeExpr = {
+      kind: "reduceResult",
+      phaseIndex: phaseIdx
+    };
+  } else writeExpr = buildExpr(outputNode, subgraphIds, completedReducePhases, inputRefMap, inputRefs, inputDtypes, { value: 0 });
+  if (!writeExpr) return null;
+  const isScalarOutput = REDUCE_OPS.has(outputNode.op);
+  phases.push({
+    kind: "write",
+    bodyExpr: writeExpr,
+    scalarOutput: isScalarOutput || void 0
+  });
+  const cacheKey = buildCacheKey(phases, inputDtypes);
+  return {
+    program: {
+      inputs: inputDtypes.map((dtype) => ({ dtype })),
+      output: { dtype: outputNode.dtype },
+      dim,
+      phases,
+      cacheKey
+    },
+    inputRefs,
+    outputNodeId: outputNode.id
+  };
+}
+function buildCacheKey(phases, inputDtypes) {
+  const parts = [`i:${inputDtypes.join(",")}`];
+  for (let i = 0; i < phases.length; i++) {
+    const p = phases[i];
+    if (p.kind === "reduce") parts.push(`R:${p.reduceOp}${p.isMean ? ":m" : ""}:${exprKey(p.bodyExpr)}`);
+    else parts.push(`W:${exprKey(p.bodyExpr)}`);
+  }
+  return parts.join("|");
+}
+function exprKey(e) {
+  if ("kind" in e) switch (e.kind) {
+    case "input":
+      return `I${e.bufferIndex}`;
+    case "reduceResult":
+      return `R${e.phaseIndex}`;
+    case "const":
+      return `C${e.value}`;
+  }
+  return `(${e.op} ${e.inputs.map(exprKey).join(" ")})`;
+}
+function topoSortSubgraph(subgraphIds, nodeById) {
+  const inDegree = /* @__PURE__ */ new Map();
+  for (const id of subgraphIds) inDegree.set(id, 0);
+  for (const id of subgraphIds) {
+    const node = nodeById.get(id);
+    for (const ref2 of node.inputs) if (ref2.kind === "pending" && subgraphIds.has(ref2.node.id)) inDegree.set(id, (inDegree.get(id) ?? 0) + 1);
+  }
+  const queue = [];
+  for (const [id, deg] of inDegree) if (deg === 0) queue.push(id);
+  const sorted = [];
+  while (queue.length > 0) {
+    const id = queue.shift();
+    sorted.push(nodeById.get(id));
+    for (const otherId of subgraphIds) {
+      if (otherId === id) continue;
+      const other = nodeById.get(otherId);
+      for (const ref2 of other.inputs) if (ref2.kind === "pending" && ref2.node.id === id) {
+        const newDeg = (inDegree.get(otherId) ?? 0) - 1;
+        inDegree.set(otherId, newDeg);
+        if (newDeg === 0) queue.push(otherId);
+      }
+    }
+  }
+  if (sorted.length !== subgraphIds.size) return null;
+  return sorted;
+}
+function detectRowPrograms(planNodes, consumerCount, consumers, externalNodeIds, alreadyClaimedIds) {
+  const nodeById = /* @__PURE__ */ new Map();
+  for (const node of planNodes) nodeById.set(node.id, node);
+  const matches = [];
+  const globalClaimedIds = new Set(alreadyClaimedIds);
+  for (const node of planNodes) {
+    if (globalClaimedIds.has(node.id)) continue;
+    if (!REDUCE_OPS.has(node.op)) continue;
+    if (node.result) continue;
+    if (!isLastDimReduction(node)) continue;
+    const dim = getReductionDim(node);
+    const subgraphIds = expandSubgraph(node, dim, nodeById, consumerCount, consumers, externalNodeIds, globalClaimedIds);
+    if (!subgraphIds) continue;
+    const result = buildRowProgram(subgraphIds, nodeById, consumers, consumerCount, dim);
+    if (!result) continue;
+    const inputShape = node.inputs[0]?.kind === "pending" ? node.inputs[0].node.shape : node.shape;
+    let numRows = 1;
+    for (let d = 0; d < dim; d++) numRows *= inputShape[d];
+    const dimSize = inputShape[dim];
+    const coveredNodeIds = [];
+    for (const id of subgraphIds) {
+      coveredNodeIds.push(id);
+      globalClaimedIds.add(id);
+    }
+    matches.push({
+      coveredNodeIds,
+      outputNodeId: result.outputNodeId,
+      inputRefs: result.inputRefs,
+      dim: result.program.dim,
+      numRows,
+      dimSize,
+      program: result.program
+    });
+  }
+  return matches;
+}
+function detectMatmulEpilogueChains(planNodes, consumers, consumerCount, nodePosition, externalNodeIds) {
+  const epilogueClaimedIds = /* @__PURE__ */ new Set();
+  const prologueClaimedIds = /* @__PURE__ */ new Set();
+  const matmulEpilogueChains = /* @__PURE__ */ new Map();
+  const matmulPrologues = /* @__PURE__ */ new Map();
+  for (let mi = 0; mi < planNodes.length; mi++) {
+    const node = planNodes[mi];
+    if (node.op !== "matmul") continue;
+    const matmulPos = mi;
+    const chainIds = [];
+    let current = node;
+    let additionalInputCount = 0;
+    for (let depth = 0; depth < 4; depth++) {
+      if ((consumerCount.get(current.id) ?? 0) !== 1) break;
+      if (externalNodeIds?.has(current.id) && !chainIds.includes(current.id)) break;
+      const nexts = consumers.get(current.id);
+      if (!nexts || nexts.length !== 1) break;
+      const next = nexts[0];
+      if (next.inputs.length === 0) break;
+      let chainInputIdx = 0;
+      const primary = next.inputs[0];
+      if (primary.kind !== "pending" || primary.node.id !== current.id) if ((next.op === "add" || next.op === "mul") && next.inputs.length === 2) {
+        const alt = next.inputs[1];
+        if (alt.kind === "pending" && alt.node.id === current.id) chainInputIdx = 1;
+        else break;
+      } else break;
+      if (next.op === "reshape") {
+        const curShape = current.shape;
+        const nextShape = next.shape;
+        if (curShape.length === nextShape.length + 1 && curShape[0] === 1 && curShape.slice(1).every((d, i) => d === nextShape[i])) {
+          chainIds.push(next.id);
+          current = next;
+          continue;
+        }
+        break;
+      }
+      let ok = false;
+      if (next.op === "cast") ok = true;
+      else if ((next.op === "add" || next.op === "mul" || next.op === "sub") && next.inputs.length === 2) {
+        if (additionalInputCount >= 4) break;
+        const secondary = next.inputs[chainInputIdx === 0 ? 1 : 0];
+        if (secondary.kind === "materialized") ok = true;
+        else if (secondary.kind === "pending") {
+          const secPos = nodePosition.get(secondary.node.id);
+          if (secPos !== void 0 && secPos < matmulPos) ok = true;
+        }
+        if (ok) additionalInputCount++;
+      } else if (isFusibleOp(next.op) && next.inputs.length === 1) ok = true;
+      if (!ok) break;
+      chainIds.push(next.id);
+      current = next;
+    }
+    if (chainIds.length > 0) {
+      matmulEpilogueChains.set(node.id, chainIds);
+      for (const id of chainIds) epilogueClaimedIds.add(id);
+    }
+    if (!externalNodeIds || externalNodeIds.size === 0) {
+      const prologuesForNode = [];
+      for (const idx of [0, 1]) {
+        const inputRef = node.inputs[idx];
+        if (inputRef.kind !== "pending") continue;
+        const castNode2 = inputRef.node;
+        if (castNode2.op !== "cast") continue;
+        if ((consumerCount.get(castNode2.id) ?? 0) !== 1) continue;
+        const castPayload = castNode2.payload;
+        if (!castPayload) continue;
+        const toDtype = castPayload.dtype;
+        const castInput = castNode2.inputs[0];
+        if (!castInput) continue;
+        let fromDtype;
+        if (castInput.kind === "pending") fromDtype = castInput.node.dtype;
+        else if (castInput.kind === "materialized") fromDtype = castInput.storage.backendTensor.dtype ?? "f32";
+        else continue;
+        if (fromDtype !== "f32" || toDtype !== "f16") continue;
+        prologuesForNode.push({
+          inputIndex: idx,
+          castNodeId: castNode2.id,
+          originalInputRef: castInput,
+          fromDtype,
+          toDtype
+        });
+        prologueClaimedIds.add(castNode2.id);
+      }
+      if (prologuesForNode.length > 0) matmulPrologues.set(node.id, prologuesForNode);
+    }
+  }
+  return {
+    epilogueClaimedIds,
+    prologueClaimedIds,
+    matmulEpilogueChains,
+    matmulPrologues
+  };
+}
+function analyzeGraph(planNodes, externalNodeIds, maxStorageBuffers) {
+  let reorderedNodes = planNodes;
+  if (planNodes.length > 2) reorderedNodes = reorderPlanForFusion(planNodes);
+  const consumers = /* @__PURE__ */ new Map();
+  const consumerCount = /* @__PURE__ */ new Map();
+  const nodePosition = /* @__PURE__ */ new Map();
+  const nodeById = /* @__PURE__ */ new Map();
+  for (let i = 0; i < reorderedNodes.length; i++) {
+    const node = reorderedNodes[i];
+    nodePosition.set(node.id, i);
+    nodeById.set(node.id, node);
+    for (const input of node.inputs) if (input.kind === "pending") {
+      const producerId = input.node.id;
+      consumerCount.set(producerId, (consumerCount.get(producerId) ?? 0) + 1);
+      if (!consumers.has(producerId)) consumers.set(producerId, []);
+      consumers.get(producerId).push(node);
+    }
+  }
+  const rewriteCtx = {
+    planNodes: reorderedNodes,
+    consumers,
+    consumerCount
+  };
+  const rewriteBypassedIds = /* @__PURE__ */ new Set();
+  const passStats = runPasses(rewriteCtx, rewriteBypassedIds, SIMPLIFICATION_PASSES);
+  if (typeof process !== "undefined" && define_process_env_default?.TORCHLETTE_LOG_REWRITES === "1" && rewriteBypassedIds.size > 0) {
+    const parts = [];
+    for (const [name, count] of passStats) if (count > 0) parts.push(`${name}=${count}`);
+    const opCounts = {};
+    for (const node of reorderedNodes) if (rewriteBypassedIds.has(node.id)) opCounts[node.op] = (opCounts[node.op] ?? 0) + 1;
+    const opParts = Object.entries(opCounts).sort((a, b) => b[1] - a[1]).map(([op, n]) => `${op}×${n}`);
+    console.log(`[graph-rewrites] ${reorderedNodes.length} nodes → ${parts.join(", ")} (${rewriteBypassedIds.size} bypassed: ${opParts.join(", ")})`);
+  }
+  const { epilogueClaimedIds, prologueClaimedIds, matmulEpilogueChains, matmulPrologues } = detectMatmulEpilogueChains(reorderedNodes, consumers, consumerCount, nodePosition, externalNodeIds);
+  if (epilogueClaimedIds.size > 0) {
+    const unclaimed = reorderedNodes.filter((n) => !epilogueClaimedIds.has(n.id));
+    const relocated = [];
+    for (const n of unclaimed) {
+      relocated.push(n);
+      const chain = matmulEpilogueChains.get(n.id);
+      if (chain) for (const id of chain) {
+        const chainNode = nodeById.get(id);
+        if (chainNode) relocated.push(chainNode);
+      }
+    }
+    reorderedNodes = relocated;
+  }
+  const matmulDirectives = /* @__PURE__ */ new Map();
+  if (matmulEpilogueChains.size > 0 || matmulPrologues.size > 0) for (let i = 0; i < reorderedNodes.length; i++) {
+    const node = reorderedNodes[i];
+    if (node.op !== "matmul") continue;
+    const hasChain = matmulEpilogueChains.has(node.id);
+    const prologues = matmulPrologues.get(node.id);
+    if (!hasChain && !prologues) continue;
+    let plan = hasChain ? detectMatmulEpilogueCore(reorderedNodes, i, consumerCount, externalNodeIds) : null;
+    if (!plan && prologues && prologues.length > 0) plan = {
+      consumedCount: 1,
+      epilogueOps: [],
+      epilogueInputRefs: [],
+      outputDtype: node.dtype,
+      outputNode: node
+    };
+    if (plan) {
+      if (prologues && prologues.length > 0) plan.prologues = prologues;
+      matmulDirectives.set(node.id, plan);
+    }
+  }
+  const rowProgramMatches = detectRowPrograms(reorderedNodes, consumerCount, consumers, externalNodeIds, /* @__PURE__ */ new Set([...epilogueClaimedIds, ...prologueClaimedIds]));
+  const rowProgramClaimedIds = /* @__PURE__ */ new Set();
+  for (const match of rowProgramMatches) for (const id of match.coveredNodeIds) rowProgramClaimedIds.add(id);
+  let allClaimedIds;
+  if (epilogueClaimedIds.size > 0 || prologueClaimedIds.size > 0 || rowProgramClaimedIds.size > 0 || rewriteBypassedIds.size > 0) allClaimedIds = /* @__PURE__ */ new Set([
+    ...epilogueClaimedIds,
+    ...prologueClaimedIds,
+    ...rowProgramClaimedIds,
+    ...rewriteBypassedIds
+  ]);
+  const segments = segmentPlanForExecution(reorderedNodes, externalNodeIds, {
+    maxStorageBuffers,
+    enableMultiOutput: true,
+    epilogueClaimedIds: allClaimedIds
+  });
+  return {
+    planNodes: reorderedNodes,
+    segments,
+    epilogueClaimedIds,
+    prologueClaimedIds,
+    matmulEpilogueChains,
+    matmulPrologues,
+    consumerCount,
+    rewriteBypassedIds,
+    matmulDirectives,
+    rowProgramMatches
+  };
+}
+init_gpu_types();
+const MAX_PACKED_BYTES = 512 * 1024 * 1024;
+const packedBufferCache = /* @__PURE__ */ new Map();
+function getPackedBuffers(count, alignedBytes) {
+  const key = `${count}:${alignedBytes}`;
+  let bufs = packedBufferCache.get(key);
+  if (!bufs) {
+    const device = requireContext().device;
+    bufs = [];
+    for (let i = 0; i < count; i++) bufs.push(device.createBuffer({
+      size: alignedBytes,
+      usage: 140
+    }));
+    packedBufferCache.set(key, bufs);
+  }
+  return bufs;
+}
+function resetPackedOptimizerCache() {
+  for (const bufs of packedBufferCache.values()) for (const buf of bufs) buf.destroy();
+  packedBufferCache.clear();
+}
+onTeardown(resetPackedOptimizerCache);
+function dispatchPackedGroup(items, numElements, gatherIndices, dispatchFn, label) {
+  const bufferCount = items[0].buffers.length;
+  const totalElements = numElements * items.length;
+  const elementBytes = numElements * 4;
+  const alignedBytes = alignBufferSize(totalElements * 4);
+  const _st = profileSubOpBegin();
+  const packed = getPackedBuffers(bufferCount, alignedBytes);
+  const enc = getSharedEncoderInstance();
+  if (!enc) throw new Error("Packed optimizer dispatch requires shared encoder");
+  for (let i = 0; i < items.length; i++) {
+    const bufs = items[i].buffers;
+    const offset = i * elementBytes;
+    for (let b = 0; b < bufferCount; b++) enc.copyBufferToBuffer(bufs[b], 0, packed[b], offset, elementBytes);
+  }
+  profileSubOpEnd(`${label}.scatter`, _st);
+  const _st2 = profileSubOpBegin();
+  dispatchFn(packed, totalElements);
+  profileSubOpEnd(`${label}.dispatch`, _st2);
+  const _st3 = profileSubOpBegin();
+  for (let i = 0; i < items.length; i++) {
+    const bufs = items[i].buffers;
+    const offset = i * elementBytes;
+    for (const b of gatherIndices) enc.copyBufferToBuffer(packed[b], offset, bufs[b], 0, elementBytes);
+  }
+  profileSubOpEnd(`${label}.gather`, _st3);
+}
+function dispatchPackedOptimizer(opts) {
+  const { items, gatherIndices, dispatch: dispatchFn, label = "packedOptim" } = opts;
+  const handled = /* @__PURE__ */ new Set();
+  if (items.length <= 1) return handled;
+  const groups = /* @__PURE__ */ new Map();
+  for (let i = 0; i < items.length; i++) {
+    const numEl = items[i].numElements;
+    const group = groups.get(numEl);
+    if (group) group.push(i);
+    else groups.set(numEl, [i]);
+  }
+  for (const [numElements, indices] of groups) {
+    if (indices.length <= 1) continue;
+    const bufferCount = items[indices[0]].buffers.length;
+    const maxBatchSize = numElements * 4 * indices.length * bufferCount > MAX_PACKED_BYTES ? Math.max(2, Math.floor(MAX_PACKED_BYTES / (numElements * 4 * bufferCount))) : indices.length;
+    for (let start = 0; start < indices.length; start += maxBatchSize) {
+      const end = Math.min(start + maxBatchSize, indices.length);
+      const batchIndices = indices.slice(start, end);
+      if (batchIndices.length <= 1) continue;
+      dispatchPackedGroup(batchIndices.map((i) => items[i]), numElements, gatherIndices, dispatchFn, label);
+      for (const i of batchIndices) handled.add(i);
+    }
+  }
+  return handled;
+}
+init_shape();
+function markAsCheckpointBoundary(node) {
+  node.isCheckpointBoundary = true;
+}
+function segmentPlanAtCheckpoints(plan) {
+  const segments = [];
+  let currentSegment = [];
+  for (const node of plan.nodes) {
+    currentSegment.push(node);
+    if (node.isCheckpointBoundary) {
+      segments.push({ nodes: currentSegment });
+      currentSegment = [];
+    }
+  }
+  if (currentSegment.length > 0) segments.push({ nodes: currentSegment });
+  return segments;
+}
+function buildMergedPlan(roots, skipExecuted = false) {
+  const nodes = [];
+  const visited = /* @__PURE__ */ new Set();
+  const visit = (ref2) => {
+    if (ref2.kind !== "pending") return;
+    if (skipExecuted && ref2.node.result) return;
+    if (visited.has(ref2.node)) return;
+    visited.add(ref2.node);
+    for (const input of ref2.node.inputs) visit(input);
+    nodes.push(ref2.node);
+  };
+  for (const root of roots) visit({
+    kind: "pending",
+    node: root
+  });
+  return { nodes };
+}
+function extractPlanMetadata(plan) {
+  const nodeOrder = [];
+  const nodeInputs = /* @__PURE__ */ new Map();
+  const nodeSizes = /* @__PURE__ */ new Map();
+  for (const node of plan.nodes) {
+    nodeOrder.push(node.id);
+    const inputIds = [];
+    for (const input of node.inputs) if (input.kind === "pending") inputIds.push(input.node.id);
+    nodeInputs.set(node.id, inputIds);
+    const bytesPerElement = node.dtype === "f32" || node.dtype === "i32" ? 4 : node.dtype === "f16" ? 2 : 1;
+    const numElements = sizeOf(node.shape);
+    nodeSizes.set(node.id, numElements * bytesPerElement);
+  }
+  return {
+    nodeOrder,
+    nodeInputs,
+    nodeSizes
+  };
+}
+function initLifetimeAnalysis(planNodes, externalNodeIds) {
+  const { nodeOrder, nodeInputs, nodeSizes } = extractPlanMetadata({ nodes: planNodes });
+  const outputNodeIds = /* @__PURE__ */ new Set([planNodes[planNodes.length - 1].id]);
+  if (externalNodeIds) for (const id of externalNodeIds) outputNodeIds.add(id);
+  return {
+    lifetimes: analyzeLifetimes(nodeOrder, nodeInputs, outputNodeIds, nodeSizes),
+    outputNodeIds
+  };
+}
+function extractMatmulShapes(plan) {
+  const shapes = [];
+  for (const node of plan.nodes) if (node.op === "matmul") {
+    const aRef = node.inputs[0];
+    const bRef = node.inputs[1];
+    let aShape;
+    let bShape;
+    if (aRef.kind === "materialized") aShape = aRef.storage.backendTensor.shape;
+    else if (aRef.kind === "pending" && aRef.node.shape) aShape = aRef.node.shape;
+    if (bRef.kind === "materialized") bShape = bRef.storage.backendTensor.shape;
+    else if (bRef.kind === "pending" && bRef.node.shape) bShape = bRef.node.shape;
+    if (aShape && bShape && aShape.length >= 2 && bShape.length >= 2) {
+      const m = aShape[aShape.length - 2];
+      const k = aShape[aShape.length - 1];
+      const n = bShape[bShape.length - 1];
+      shapes.push([
+        m,
+        n,
+        k
+      ]);
+    }
+  }
+  return shapes;
+}
+const pretunedShapeSignatures = /* @__PURE__ */ new Set();
+async function pretunePlanMatmuls(plan, backend) {
+  if (!backend.pretuneMatmulShapes) return;
+  const untunedShapes = extractMatmulShapes(plan).filter((s) => {
+    const sig = `${s[0]},${s[1]},${s[2]}`;
+    return !pretunedShapeSignatures.has(sig);
+  });
+  if (untunedShapes.length === 0) return;
+  await backend.pretuneMatmulShapes(untunedShapes);
+  for (const s of untunedShapes) pretunedShapeSignatures.add(`${s[0]},${s[1]},${s[2]}`);
+}
+init_node_factory();
+init_op_dispatch();
+async function executeNode(node, backend) {
+  const nodeBackend = getBackend(node.device) ?? backend;
+  const inputs = node.inputs.map((ref2) => getInputStorage(ref2, nodeBackend));
+  const backendInputs = inputs.map((s) => s.backendTensor);
+  const resultTensor = await executeOp(node, backendInputs, nodeBackend);
+  node.result = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
+}
+async function executePlanSequential(plan, backend, options) {
+  if (plan.nodes.length === 0) throw new Error("Cannot execute empty plan");
+  await pretunePlanMatmuls(plan, backend);
+  let lifetimes = null;
+  let outputNodeIds = null;
+  const alreadyReleased = /* @__PURE__ */ new Set();
+  const nodeToStorage = /* @__PURE__ */ new Map();
+  if (options?.enableEarlyRelease) {
+    let externalNodeIds;
+    try {
+      const { getPendingNodeIds: getPendingNodeIds2 } = await Promise.resolve().then(() => tensor1l1COWZg);
+      const pending = getPendingNodeIds2();
+      if (pending.size > 0) externalNodeIds = pending;
+    } catch {
+    }
+    ({ lifetimes, outputNodeIds } = initLifetimeAnalysis(plan.nodes, externalNodeIds));
+  }
+  const fused = isFusedBackend(backend) ? backend : null;
+  if (fused) fused.beginSharedEncoder();
+  try {
+    for (let step2 = 0; step2 < plan.nodes.length; step2++) {
+      const node = plan.nodes[step2];
+      if (node.result) continue;
+      await executeNode(node, backend);
+      if (options?.enableEarlyRelease) {
+        nodeToStorage.set(node.id, node.result);
+        releaseDeadTensors(lifetimes, step2 + 1, outputNodeIds, alreadyReleased, nodeToStorage);
+      }
+    }
+  } finally {
+    if (fused) fused.endSharedEncoder();
+  }
+  const lastNode = plan.nodes[plan.nodes.length - 1];
+  if (!lastNode.result) throw new Error("Execution failed: no result for last node");
+  if (alreadyReleased.size > 0) {
+    for (const node of plan.nodes) if (alreadyReleased.has(node.id)) node.result = void 0;
+  }
+  return lastNode.result;
+}
+async function executePlanSegmented(plan, backend, options) {
+  if (!plan.nodes.some((n) => n.isCheckpointBoundary)) return executePlanSequential(plan, backend, options);
+  const segments = segmentPlanAtCheckpoints(plan);
+  if (segments.length === 1) return executePlanSequential(plan, backend, options);
+  const gpuSync = options?.gpuSync ?? false;
+  const materializedStorages = /* @__PURE__ */ new Map();
+  let lastResult = null;
+  const finalOutputId = gpuSync ? plan.nodes[plan.nodes.length - 1].id : 0;
+  for (let segIdx = 0; segIdx < segments.length; segIdx++) {
+    const segment = segments[segIdx];
+    const isLastSegment = segIdx === segments.length - 1;
+    for (const node of segment.nodes) {
+      let needsClone = false;
+      for (let j = 0; j < node.inputs.length; j++) {
+        const input = node.inputs[j];
+        if (input.kind === "pending") {
+          const materialized = materializedStorages.get(input.node.id);
+          if (materialized) {
+            if (!needsClone) {
+              node.inputs = [...node.inputs];
+              needsClone = true;
+            }
+            node.inputs[j] = {
+              kind: "materialized",
+              storage: materialized
+            };
+          }
+        }
+      }
+    }
+    if (gpuSync) {
+      const survivingNodeIds = /* @__PURE__ */ new Set([finalOutputId]);
+      for (const laterSegment of segments.slice(segIdx + 1)) for (const laterNode of laterSegment.nodes) for (const input of laterNode.inputs) if (input.kind === "pending") survivingNodeIds.add(input.node.id);
+      const fusedBe = isFusedBackend(backend) ? backend : null;
+      fusedBe?.beginBatchExecution();
+      try {
+        const nodeToStorage = /* @__PURE__ */ new Map();
+        for (const node of segment.nodes) {
+          await executeNode(node, backend);
+          nodeToStorage.set(node.id, node.result);
+          materializedStorages.set(node.id, node.result);
+        }
+        await fusedBe?.endBatchExecution();
+        if (!isLastSegment) {
+          for (const node of segment.nodes) if (!survivingNodeIds.has(node.id)) {
+            const storage = nodeToStorage.get(node.id);
+            if (storage && canSafelyRelease(storage, nodeToStorage)) {
+              releaseBufferImmediate(storage);
+              nodeToStorage.delete(node.id);
+              materializedStorages.delete(node.id);
+            }
+          }
+          fusedBe?.flushBufferPool();
+        }
+        lastResult = segment.nodes[segment.nodes.length - 1].result ?? null;
+      } catch (error) {
+        if (fusedBe?.isBatchActive()) fusedBe.abortBatch();
+        throw error;
+      }
+    } else {
+      lastResult = await executePlanSequential(segment, backend, options);
+      for (const node of segment.nodes) if (node.result) materializedStorages.set(node.id, node.result);
+      if (!isLastSegment && options?.flushBufferPoolFn) options.flushBufferPoolFn();
+    }
+  }
+  if (!lastResult) throw new Error("Segmented execution failed: no result");
+  return lastResult;
+}
+init_types$1();
+init_gpu_types();
+init_shape();
+init_node_factory();
+init_profiler();
+init_op_dispatch();
+let _cachedDispatchFusedKernel = null;
+let _cachedDeferredDestroyBuffer = null;
+async function ensureFusionImports() {
+  if (_cachedDispatchFusedKernel) return;
+  _cachedDispatchFusedKernel = (await import("./fusion-dispatch-D8hThmmh.js")).dispatchFusedKernel;
+  await ensureWebGPUMatmulImports();
+  _cachedDeferredDestroyBuffer = _webgpuMatmulImports.deferredDestroyBuffer;
+}
+async function executeFusedSegment(group, recipe, backend, enableVectorization) {
+  if (!isFusedBackend(backend) || !("dispatchFusedKernel" in backend)) {
+    await executeSequentialSegment(group.nodes, backend);
+    return;
+  }
+  await ensureFusionImports();
+  const dispatchFusedKernel2 = _cachedDispatchFusedKernel;
+  const deferredDestroyBuffer2 = _cachedDeferredDestroyBuffer;
+  const wrapFusionOutput = (device2, output) => {
+    const buf = output.buffer;
+    const bufSize = buf.size;
+    let destroyed = false;
+    return createStorageHandle(device2, {
+      buffer: output.buffer,
+      shape: output.shape,
+      dtype: output.dtype,
+      size: sizeOf(output.shape),
+      strides: contiguousStrides(output.shape),
+      offset: 0,
+      isContiguous: true,
+      ownsBuffer: true,
+      toArray() {
+        return [];
+      },
+      destroy() {
+        if (destroyed) return;
+        destroyed = true;
+        deferredDestroyBuffer2(buf, bufSize);
+      }
+    });
+  };
+  const device = backend.device;
+  if (!device) {
+    recordFusionFallback("no_device", group.nodes.length);
+    await executeSequentialSegment(group.nodes, backend);
+    return;
+  }
+  const maxStorageBuffers = device.limits?.maxStorageBuffersPerShaderStage ?? 8;
+  const numOutputs = recipe.outputs?.length ?? 1;
+  const requiredBindings = recipe.inputs.filter((inp) => !inp.isInlinedConstant).length + numOutputs;
+  if (requiredBindings > maxStorageBuffers) {
+    recordFusionFallback("binding_limit", group.nodes.length, {
+      required: requiredBindings,
+      max: maxStorageBuffers
+    });
+    await executeSequentialSegment(group.nodes, backend);
+    return;
+  }
+  const inputs = [];
+  const tempContiguousCopies = [];
+  for (let inputIdx = 0; inputIdx < group.externalInputs.length; inputIdx++) {
+    if (recipe.inputs[inputIdx]?.isInlinedConstant) continue;
+    const inputRef = group.externalInputs[inputIdx];
+    if (inputRef.kind === "scalar") continue;
+    let storage;
+    if (inputRef.kind === "materialized") storage = inputRef.storage;
+    else {
+      const idx = inputRef.outputIndex ?? 0;
+      storage = idx === 0 ? inputRef.node.result : inputRef.node.results?.[idx];
+    }
+    if (!storage) {
+      recordFusionFallback("not_materialized", group.nodes.length);
+      await executeSequentialSegment(group.nodes, backend);
+      return;
+    }
+    const tensor = asGPUTensor(storage.backendTensor);
+    if (tensor.isContiguous === false || tensor.offset != null && tensor.offset > 0) {
+      if (backend.ops.contiguous) {
+        const contig = asGPUTensor(backend.ops.contiguous(tensor));
+        tempContiguousCopies.push(contig);
+        inputs.push({
+          buffer: contig.buffer,
+          shape: contig.shape ?? tensor.shape ?? [1],
+          dtype: contig.dtype ?? tensor.dtype ?? "f32"
+        });
+        continue;
+      }
+      recordFusionFallback("non_contiguous", group.nodes.length, {
+        shape: tensor.shape,
+        isContiguous: tensor.isContiguous,
+        offset: tensor.offset
+      });
+      await executeSequentialSegment(group.nodes, backend);
+      return;
+    }
+    inputs.push({
+      buffer: tensor.buffer,
+      shape: tensor.shape ?? [1],
+      dtype: tensor.dtype ?? "f32"
+    });
+  }
+  const maxBindingSize = device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  if (inputs.some((inp) => inp.buffer.size > maxBindingSize)) {
+    recordFusionFallback("oversized_buffer", group.nodes.length, { maxBindingSize });
+    await executeSequentialSegment(group.nodes, backend);
+    return;
+  }
+  try {
+    setProfileModule(group.outputNode.module ?? "unknown");
+    setCurrentOpLabel([...new Set(group.nodes.map((n) => n.op))].join("+"));
+    const result = dispatchFusedKernel2(device, recipe, inputs, { vectorize: enableVectorization });
+    group.outputNode.result = wrapFusionOutput(group.outputNode.device, result);
+    if (group.additionalOutputNodes && result.outputs) for (let i = 0; i < group.additionalOutputNodes.length; i++) {
+      const addNode = group.additionalOutputNodes[i];
+      const addOutput = result.outputs[i + 1];
+      if (addOutput) addNode.result = wrapFusionOutput(addNode.device, addOutput);
+    }
+    if (group.neededIntermediates && group.neededIntermediates.length > 0) await executeSequentialSegment(group.neededIntermediates, backend);
+  } catch (e) {
+    recordFusionFallback("exception", group.nodes.length, { error: String(e) });
+    console.warn("Fusion dispatch failed, falling back to sequential:", e);
+    await executeSequentialSegment(group.nodes, backend);
+  } finally {
+    for (const temp of tempContiguousCopies) temp.destroy?.();
+    setCurrentOpLabel(null);
+  }
+}
+async function executeSequentialSegment(nodes, backend) {
+  const fused = isFusedBackend(backend) ? backend : null;
+  if (fused) fused.beginSharedEncoder();
+  try {
+    for (const node of nodes) {
+      if (node.result) continue;
+      await executeNode(node, backend);
+    }
+  } finally {
+    if (fused) fused.endSharedEncoder();
+  }
+}
+async function executeRowProgram(program, inputRefs, outputNode, numRows, dimSize, coveredNodes, backend) {
+  if (outputNode.device === "cpu") {
+    for (const node of coveredNodes) if (!node.result) await executeNode(node, backend);
+    return;
+  }
+  try {
+    const { dispatchRowProgram } = await import("./row-program-dispatch-BSpjS5_T.js");
+    for (const ref2 of inputRefs) if (ref2.kind === "pending" && !ref2.node.result) await executeNode(ref2.node, backend);
+    const inputBuffers = [];
+    for (const ref2 of inputRefs) {
+      const tensor = asGPUTensor(getInputStorage(ref2, backend).backendTensor);
+      inputBuffers.push(tensor.buffer);
+    }
+    setCurrentOpLabel("row-program");
+    const outBuffer = dispatchRowProgram(program, inputBuffers, numRows, dimSize);
+    const shape = outputNode.shape;
+    outputNode.result = createStorageHandle(outputNode.device, {
+      buffer: outBuffer,
+      shape: shape.slice(),
+      dtype: program.output.dtype,
+      size: sizeOf(shape),
+      strides: contiguousStrides(shape),
+      offset: 0,
+      isContiguous: true,
+      ownsBuffer: true,
+      toArray: () => []
+    });
+  } catch (e) {
+    console.warn("Row-program dispatch failed, falling back to sequential:", e);
+    for (const node of coveredNodes) if (!node.result) await executeNode(node, backend);
+  } finally {
+    setCurrentOpLabel(null);
+  }
+}
+init_registry$1();
+init_types$1();
+init_gpu_types();
+init_shape();
+init_node_factory();
+init_profiler();
+init_storage_tracker();
+init_op_dispatch();
+const fusionAnalysisCache = /* @__PURE__ */ new Map();
+async function executeAdamBatchInner(planNodes, nodeIndices, adamOp, getStorage) {
+  const packedItems = [];
+  const nodes = [];
+  const storages = [];
+  for (const nodeIdx of nodeIndices) {
+    const adamNode = planNodes[nodeIdx];
+    if (adamNode.result) continue;
+    const inputs = adamNode.inputs;
+    const s0 = getStorage(inputs[0]);
+    const s1 = getStorage(inputs[1]);
+    const s2 = getStorage(inputs[2]);
+    const s3 = getStorage(inputs[3]);
+    const numElements = adamNode.shape.reduce((a, b) => a * b, 1);
+    packedItems.push({
+      buffers: [
+        gpuBuffer(s0.backendTensor),
+        gpuBuffer(s1.backendTensor),
+        gpuBuffer(s2.backendTensor),
+        gpuBuffer(s3.backendTensor)
+      ],
+      numElements
+    });
+    nodes.push(adamNode);
+    storages.push([
+      s0,
+      s1,
+      s2,
+      s3
+    ]);
+  }
+  if (packedItems.length === 0) return;
+  const config = nodes[0].payload;
+  const infFlagBuffer = config.infFlagBuffer ?? null;
+  const handled = dispatchPackedOptimizer({
+    items: packedItems,
+    gatherIndices: [
+      1,
+      2,
+      3
+    ],
+    dispatch(packed, totalElements) {
+      dispatchAdamStep(packed[0], packed[1], packed[2], packed[3], totalElements, config, false, infFlagBuffer);
+    },
+    label: "packedAdam"
+  });
+  for (const i of handled) {
+    assignPackedAdamResult(nodes[i], storages[i]);
+    const paramBuf = packedItems[i].buffers[1];
+    const oldF16 = f16WeightCache.get(paramBuf);
+    if (oldF16) {
+      bufferPool.deferredDestroy(oldF16, oldF16.size);
+      f16WeightCache.delete(paramBuf);
+    }
+  }
+  for (let i = 0; i < packedItems.length; i++) {
+    if (handled.has(i)) continue;
+    const adamNode = nodes[i];
+    const [s0, s1, s2, s3] = storages[i];
+    const adamPayload = adamNode.payload;
+    assignPerParamAdamResult(adamNode, s1, await adamOp(s0.backendTensor, s1.backendTensor, s2.backendTensor, s3.backendTensor, adamPayload));
+  }
+}
+function assignPackedAdamResult(adamNode, [, s1, s2, s3]) {
+  adamNode.result = createStorageHandle(adamNode.device, {
+    ...s1.backendTensor,
+    ownsBuffer: false
+  }, s1.id);
+  const mBT = s2.backendTensor;
+  const vBT = s3.backendTensor;
+  if (mBT.ownsBuffer) bufferPool.decRef(mBT.buffer);
+  if (vBT.ownsBuffer) bufferPool.decRef(vBT.buffer);
+  mBT.destroy = () => {
+  };
+  vBT.destroy = () => {
+  };
+  const newM = createTensor(mBT.shape, mBT.buffer, void 0, 0, mBT.dtype);
+  const newV = createTensor(vBT.shape, vBT.buffer, void 0, 0, vBT.dtype);
+  const mStorage = createStorageHandle(adamNode.device, newM);
+  const vStorage = createStorageHandle(adamNode.device, newV);
+  adamNode.results = [
+    adamNode.result,
+    mStorage,
+    vStorage
+  ];
+  storageTracker.markReachable(mStorage.id, adamNode.results);
+  storageTracker.markReachable(vStorage.id, adamNode.results);
+}
+function assignPerParamAdamResult(adamNode, s1, adamResult) {
+  const paramResult = adamResult.param;
+  const finalResult = paramResult.ownsBuffer === true ? {
+    ...paramResult,
+    ownsBuffer: false
+  } : paramResult;
+  adamNode.result = createStorageHandle(adamNode.device, finalResult, s1.id);
+  const mStorage = createStorageHandle(adamNode.device, adamResult.m);
+  const vStorage = createStorageHandle(adamNode.device, adamResult.v);
+  adamNode.results = [
+    adamNode.result,
+    mStorage,
+    vStorage
+  ];
+  storageTracker.markReachable(mStorage.id, adamNode.results);
+  storageTracker.markReachable(vStorage.id, adamNode.results);
+}
+function collectExternalInputBuffers(planNodes) {
+  const bufs = [];
+  for (const node of planNodes) for (const ref2 of node.inputs) if (ref2.kind === "materialized") {
+    const buf = gpuBuffer(ref2.storage.backendTensor);
+    if (buf) bufs.push(buf);
+  } else if (ref2.kind === "pending" && ref2.node.result) {
+    const buf = gpuBuffer(ref2.node.result.backendTensor);
+    if (buf) bufs.push(buf);
+  }
+  return bufs;
+}
+function reconstructEpilogueInputs(planNodes, coveredNodeIndices) {
+  const epilogueInputRefs = [];
+  const epilogueInputPaths = [];
+  for (let ci = 1; ci < coveredNodeIndices.length; ci++) {
+    const chainNode = planNodes[coveredNodeIndices[ci]];
+    if ((chainNode.op === "add" || chainNode.op === "mul") && chainNode.inputs.length === 2) {
+      const prevChainNodeId = planNodes[coveredNodeIndices[ci - 1]].id;
+      const externalIdx = chainNode.inputs[0].kind === "pending" && chainNode.inputs[0].node.id === prevChainNodeId ? 1 : 0;
+      epilogueInputRefs.push(chainNode.inputs[externalIdx]);
+      epilogueInputPaths.push({
+        planNodeIndex: coveredNodeIndices[ci],
+        inputIndex: externalIdx
+      });
+    }
+  }
+  return {
+    epilogueInputRefs,
+    epilogueInputPaths
+  };
+}
+function resolvePrologueInputs(planNodes, matmulNode, matmulNodeIndex, actionPrologues) {
+  let inputCastA;
+  let inputCastB;
+  let resolvedInputRefA = matmulNode.inputs[0];
+  let resolvedInputRefB = matmulNode.inputs[1];
+  let inputAPath = {
+    planNodeIndex: matmulNodeIndex,
+    inputIndex: 0
+  };
+  let inputBPath = {
+    planNodeIndex: matmulNodeIndex,
+    inputIndex: 1
+  };
+  const prologues = actionPrologues.map((p) => ({
+    inputIndex: p.inputIndex,
+    castNodeId: planNodes[p.castNodeIndex].id,
+    originalInputRef: planNodes[p.castNodeIndex].inputs[0],
+    fromDtype: p.fromDtype,
+    toDtype: p.toDtype
+  }));
+  for (const p of actionPrologues) {
+    const castRef2 = p.inputIndex === 0 ? matmulNode.inputs[0] : matmulNode.inputs[1];
+    if (!(castRef2.kind === "pending" && castRef2.node.result != null)) if (p.inputIndex === 0) {
+      resolvedInputRefA = planNodes[p.castNodeIndex].inputs[0];
+      inputCastA = p.toDtype;
+      inputAPath = {
+        planNodeIndex: p.castNodeIndex,
+        inputIndex: 0
+      };
+    } else {
+      resolvedInputRefB = planNodes[p.castNodeIndex].inputs[0];
+      inputCastB = p.toDtype;
+      inputBPath = {
+        planNodeIndex: p.castNodeIndex,
+        inputIndex: 0
+      };
+    }
+  }
+  return {
+    prologues,
+    inputCastA,
+    inputCastB,
+    resolvedInputRefA,
+    resolvedInputRefB,
+    inputAPath,
+    inputBPath
+  };
+}
+async function buildAndCacheDispatchConfig(action, resolvedInputRefA, resolvedInputRefB, inputCastA, inputCastB, inputAPath, inputBPath, epilogueInputRefs, epilogueInputPaths) {
+  const { computeMatmulOutputShape: computeMatmulOutputShape2, computeBatchSize: computeBatchSize2, computeBatchStrides: computeBatchStrides2 } = _webgpuMatmulGeomImports;
+  const { isF16Supported: isF16Supported2 } = await import("./webgpu-S_IN-64Z.js");
+  const tensorA = asGPUTensor(getInputStorage(resolvedInputRefA).backendTensor);
+  const tensorB = asGPUTensor(getInputStorage(resolvedInputRefB).backendTensor);
+  const detA = _detectTransposeView(tensorA);
+  const detB = _detectTransposeView(tensorB);
+  const transA = detA.transposed;
+  const transB = detB.transposed;
+  const outShape = computeMatmulOutputShape2(detA.shape, detB.shape, transA, transB);
+  const aRank = detA.shape.length;
+  const bRank = detB.shape.length;
+  const m = transA ? detA.shape[aRank - 1] : detA.shape[aRank - 2];
+  const k = transA ? detA.shape[aRank - 2] : detA.shape[aRank - 1];
+  const n = transB ? detB.shape[bRank - 2] : detB.shape[bRank - 1];
+  const batchDims = outShape.slice(0, -2);
+  const batchSize2 = computeBatchSize2(batchDims);
+  const { strideA, strideB, strideC } = computeBatchStrides2(detA.shape, detB.shape, batchDims, m, n, k);
+  const f16ok = isF16Supported2();
+  const rawDtypeA = tensorA.dtype === "f16" && f16ok ? "f16" : "f32";
+  const rawDtypeB = tensorB.dtype === "f16" && f16ok ? "f16" : "f32";
+  const dtypeA = inputCastA === "f16" && f16ok ? "f16" : rawDtypeA;
+  const dtypeB = inputCastB === "f16" && f16ok ? "f16" : rawDtypeB;
+  const promotedDtype = dtypeA === "f32" || dtypeB === "f32" ? "f32" : dtypeA;
+  const outputDtype = action.outputDtype ?? promotedDtype;
+  action.cachedDispatchConfig = {
+    inputAPath,
+    inputBPath,
+    epilogueInputPaths,
+    inputCastA,
+    inputCastB,
+    m,
+    k,
+    n,
+    transA,
+    transB,
+    batchSize: batchSize2,
+    batchStrideA: strideA,
+    batchStrideB: strideB,
+    batchStrideC: strideC,
+    outShape,
+    dtypeA,
+    dtypeB: dtypeB !== dtypeA ? dtypeB : void 0,
+    outputDtype,
+    epilogueConfig: {
+      ops: action.epilogueOps,
+      additionalInputCount: epilogueInputRefs.length,
+      outputDtype: action.outputDtype
+    }
+  };
+}
+async function executeLoweredPlan(plan, planNodes, loweredPlan, backend, options = {}) {
+  if (planNodes.length !== loweredPlan.planNodeCount) throw new Error(`Lowered plan node count mismatch: plan has ${planNodes.length}, lowered expects ${loweredPlan.planNodeCount}`);
+  await pretunePlanMatmuls({ nodes: planNodes }, backend);
+  if (backend.name === "webgpu") await ensureWebGPUMatmulImports();
+  const stats = {
+    totalNodes: planNodes.length,
+    fusedNodes: 0,
+    sequentialNodes: 0,
+    fusionGroups: 0,
+    fusionEnabled: true
+  };
+  const useTopLevelSharedEncoder = backend.name === "webgpu";
+  if (loweredPlan.compiledPlan?.valid && useTopLevelSharedEncoder && options.bufferArena && define_process_env_default.TORCHLETTE_COMPILED_PLAN !== "0") {
+    if (define_process_env_default.TORCHLETTE_DEBUG_COMPILED) console.log(`[exec] COMPILED nodes=${planNodes.length} cmds=${loweredPlan.compiledPlan.commands.length}`);
+    const externalInputBuffers = collectExternalInputBuffers(planNodes);
+    await executeCompiledPlan(loweredPlan.compiledPlan, planNodes, options.bufferArena, backend, externalInputBuffers);
+    return {
+      result: planNodes[planNodes.length - 1].result,
+      stats: loweredPlan.cachedStats ?? stats
+    };
+  }
+  if (define_process_env_default.TORCHLETTE_DEBUG_COMPILED) console.log(`[exec] NORMAL nodes=${planNodes.length} hasCompiledPlan=${!!loweredPlan.compiledPlan?.valid} hasArena=${!!options.bufferArena} arenaLen=${options.bufferArena?.resolve?.length ?? "n/a"}`);
+  if (useTopLevelSharedEncoder) beginSharedEncoder();
+  if (options.bufferArena && useTopLevelSharedEncoder) setActiveArena(options.bufferArena);
+  if (options.bufferArena && useTopLevelSharedEncoder) setArenaExternalInputBuffers(collectExternalInputBuffers(planNodes));
+  const shouldCompile = useTopLevelSharedEncoder && options.bufferArena && !loweredPlan.compiledPlan && options.bufferArena.resolve.length > 0;
+  let compilationRecording = null;
+  if (shouldCompile) {
+    if (define_process_env_default.TORCHLETTE_DEBUG_COMPILED) console.log(`[exec] RECORDING nodes=${planNodes.length}`);
+    compilationRecording = startCompilationRecording();
+    for (let i = 0; i < planNodes.length; i++) {
+      const node = planNodes[i];
+      for (let j = 0; j < node.inputs.length; j++) {
+        const ref2 = node.inputs[j];
+        let storage;
+        if (ref2.kind === "materialized") storage = ref2.storage;
+        else if (ref2.kind === "scalar") continue;
+        else {
+          const idx = ref2.outputIndex ?? 0;
+          storage = idx === 0 ? ref2.node.result : ref2.node.results?.[idx];
+        }
+        if (!storage) continue;
+        assignSlot(gpuBuffer(storage.backendTensor), {
+          kind: "external",
+          planNodeIndex: i,
+          inputIndex: j
+        });
+      }
+    }
+  }
+  await ensureFusionImports();
+  try {
+    for (let actionIndex = 0; actionIndex < loweredPlan.actions.length; actionIndex++) {
+      const action = loweredPlan.actions[actionIndex];
+      switch (action.kind) {
+        case "fused": {
+          const groupNodes = action.coveredNodeIndices.map((i) => planNodes[i]);
+          const outputNode = planNodes[action.outputNodeIndex];
+          const additionalOutputNodes = action.additionalOutputNodeIndices.map((i) => planNodes[i]);
+          const neededIntermediates = action.neededIntermediateNodeIndices.map((i) => planNodes[i]);
+          let extInputs;
+          if (action.cachedExternalInputPattern) extInputs = action.cachedExternalInputPattern.map((p) => groupNodes[p.nodeLocalIdx].inputs[p.inputIdx]);
+          else {
+            const groupNodeIds = new Set(groupNodes.map((n) => n.id));
+            extInputs = [];
+            const pattern = [];
+            for (let ni = 0; ni < groupNodes.length; ni++) {
+              const node = groupNodes[ni];
+              for (let ii = 0; ii < node.inputs.length; ii++) {
+                const inp = node.inputs[ii];
+                if (inp.kind === "pending") {
+                  if (!groupNodeIds.has(inp.node.id) && !extInputs.some((ei) => ei.kind === "pending" && ei.node.id === inp.node.id)) {
+                    extInputs.push(inp);
+                    pattern.push({
+                      nodeLocalIdx: ni,
+                      inputIdx: ii
+                    });
+                  }
+                } else if (inp.kind === "scalar") {
+                  if (!extInputs.some((ei) => ei.kind === "scalar" && ei.value === inp.value && ei.dtype === inp.dtype)) {
+                    extInputs.push(inp);
+                    pattern.push({
+                      nodeLocalIdx: ni,
+                      inputIdx: ii
+                    });
+                  }
+                } else if (!extInputs.some((ei) => ei.kind === "materialized" && ei.storage.id === inp.storage.id)) {
+                  extInputs.push(inp);
+                  pattern.push({
+                    nodeLocalIdx: ni,
+                    inputIdx: ii
+                  });
+                }
+              }
+            }
+            action.cachedExternalInputPattern = pattern;
+          }
+          await executeFusedSegment({
+            nodes: groupNodes,
+            planIndices: action.coveredNodeIndices,
+            externalInputs: extInputs,
+            outputNode,
+            additionalOutputNodes: additionalOutputNodes.length > 0 ? additionalOutputNodes : void 0,
+            neededIntermediates: neededIntermediates.length > 0 ? neededIntermediates : void 0
+          }, action.recipe, backend, action.enableVectorization);
+          stats.fusedNodes += groupNodes.length;
+          stats.fusionGroups++;
+          break;
+        }
+        case "matmul-epilogue": {
+          const matmulNode = planNodes[action.matmulNodeIndex];
+          const outputNode = planNodes[action.outputNodeIndex];
+          let epLabel = action.cachedLabel;
+          if (!epLabel) {
+            epLabel = `matmul+${action.prologues ? "prologue+" : ""}${action.epilogueOps.length > 0 ? "+" + action.epilogueOps.map((o) => o.kind).join("+") : ""}`.replace(/\+$/, "");
+            action.cachedLabel = epLabel;
+          }
+          if (action.cachedDispatchConfig) {
+            const cfg = action.cachedDispatchConfig;
+            setCurrentOpLabel(epLabel);
+            setProfileModule(matmulNode.module ?? "unknown");
+            const _profT0 = profileOpBegin(epLabel);
+            try {
+              const refA = planNodes[cfg.inputAPath.planNodeIndex].inputs[cfg.inputAPath.inputIndex];
+              const refB = planNodes[cfg.inputBPath.planNodeIndex].inputs[cfg.inputBPath.inputIndex];
+              const bufA = gpuBuffer(getInputStorage(refA).backendTensor);
+              const bufB = gpuBuffer(getInputStorage(refB).backendTensor);
+              const epilogueBuffers = [];
+              for (const path of cfg.epilogueInputPaths) {
+                const ref2 = planNodes[path.planNodeIndex].inputs[path.inputIndex];
+                epilogueBuffers.push(gpuBuffer(getInputStorage(ref2).backendTensor));
+              }
+              const resultTensor = _webgpuMatmulImports.dispatchMatmulDirect(bufA, bufB, {
+                m: cfg.m,
+                n: cfg.n,
+                k: cfg.k,
+                transA: cfg.transA,
+                transB: cfg.transB,
+                batchSize: cfg.batchSize,
+                batchStrideA: cfg.batchStrideA,
+                batchStrideB: cfg.batchStrideB,
+                batchStrideC: cfg.batchStrideC,
+                outShape: cfg.outShape,
+                dtypeA: cfg.dtypeA,
+                dtypeB: cfg.dtypeB,
+                outputDtype: cfg.outputDtype,
+                epilogueConfig: cfg.epilogueConfig,
+                epilogueBuffers,
+                inputCastA: cfg.inputCastA,
+                inputCastB: cfg.inputCastB
+              });
+              const fastOutShape = outputNode.shape;
+              if (!shapesEqual(resultTensor.shape, fastOutShape)) {
+                const gpuT = asGPUTensor(resultTensor);
+                gpuT.shape = fastOutShape;
+                gpuT.strides = contiguousStrides(fastOutShape);
+              }
+              outputNode.result = createStorageHandle(outputNode.device, resultTensor);
+            } finally {
+              profileOpEnd(epLabel, _profT0);
+              setCurrentOpLabel(null);
+              setProfileModule("unknown");
+            }
+            break;
+          }
+          const { epilogueInputRefs, epilogueInputPaths } = reconstructEpilogueInputs(planNodes, action.coveredNodeIndices);
+          let prologues;
+          let inputCastA;
+          let inputCastB;
+          let resolvedInputRefA = matmulNode.inputs[0];
+          let resolvedInputRefB = matmulNode.inputs[1];
+          let inputAPath = {
+            planNodeIndex: action.matmulNodeIndex,
+            inputIndex: 0
+          };
+          let inputBPath = {
+            planNodeIndex: action.matmulNodeIndex,
+            inputIndex: 1
+          };
+          if (action.prologues && action.prologues.length > 0) {
+            const resolved = resolvePrologueInputs(planNodes, matmulNode, action.matmulNodeIndex, action.prologues);
+            prologues = resolved.prologues;
+            inputCastA = resolved.inputCastA;
+            inputCastB = resolved.inputCastB;
+            resolvedInputRefA = resolved.resolvedInputRefA;
+            resolvedInputRefB = resolved.resolvedInputRefB;
+            inputAPath = resolved.inputAPath;
+            inputBPath = resolved.inputBPath;
+          }
+          await withProfileContext(epLabel, matmulNode.module, () => executeMatmulWithEpilogue(matmulNode, {
+            consumedCount: action.consumedCount,
+            epilogueOps: action.epilogueOps,
+            epilogueInputRefs,
+            outputDtype: action.outputDtype,
+            outputNode,
+            prologues
+          }));
+          await buildAndCacheDispatchConfig(action, resolvedInputRefA, resolvedInputRefB, inputCastA, inputCastB, inputAPath, inputBPath, epilogueInputRefs, epilogueInputPaths);
+          break;
+        }
+        case "adam-batch":
+          if (backend.name === "webgpu") {
+            flushSharedEncoder();
+            flushBufferPool();
+            recordBarrier();
+          }
+          setAdamBatchMode(true);
+          try {
+            const adamBackend = getBackend(planNodes[action.nodeIndices[0]].device) ?? backend;
+            const adamOp = adamBackend.ops.adamStep;
+            await withProfileContext("adamStep", "optimizer.step", () => executeAdamBatchInner(planNodes, action.nodeIndices, adamOp, (ref2) => getInputStorage(ref2, adamBackend)));
+          } finally {
+            setAdamBatchMode(false);
+          }
+          break;
+        case "sequential":
+        case "view":
+        case "data-source": {
+          const nodeIdx = action.nodeIndex;
+          const node = planNodes[nodeIdx];
+          if (node.result) break;
+          setProfileModule(node.module ?? "unknown");
+          const inputs = node.inputs.map((ref2) => getInputStorage(ref2, backend));
+          const backendInputs = inputs.map((s) => s.backendTensor);
+          const resultOrPromise = executeOpSync(node, backendInputs, backend);
+          const resultTensor = resultOrPromise instanceof Promise ? await resultOrPromise : resultOrPromise;
+          node.result = wrapResultAsStorage(node.device, resultTensor, backendInputs, inputs);
+          stats.sequentialNodes++;
+          if (action.kind === "data-source" && isCompilationRecordingActive()) recordWrite(gpuBuffer(node.result.backendTensor), nodeIdx);
+          break;
+        }
+        case "prologue-skip":
+          break;
+        case "row-program": {
+          const remappedRefs = action.inputRefs.map((ref2, i) => {
+            const pos = action.inputRefPositions[i];
+            if (pos >= 0 && ref2.kind === "pending") return {
+              kind: "pending",
+              node: planNodes[pos],
+              outputIndex: ref2.outputIndex
+            };
+            return ref2;
+          });
+          await executeRowProgram(action.program, remappedRefs, planNodes[action.outputNodeIndex], action.numRows, action.dimSize, planNodes.filter((_n, i) => action.coveredNodeIndices.includes(i)), backend);
+          break;
+        }
+        case "reclaim":
+          if (useTopLevelSharedEncoder) {
+            flushSharedEncoder();
+            flushBufferPool();
+          }
+          recordBarrier();
+          break;
+      }
+    }
+  } finally {
+    if (compilationRecording) {
+      stopCompilationRecording();
+      const nodeResults = [];
+      const unrecordedNodes = [];
+      for (let i = 0; i < planNodes.length; i++) {
+        const node = planNodes[i];
+        if (node.results && node.results.length > 0) for (let oi = 0; oi < node.results.length; oi++) {
+          const sh = node.results[oi];
+          if (!sh) continue;
+          const bt = asGPUTensor(sh.backendTensor);
+          const slot = compilationRecording.bufferToSlot.get(bt.buffer);
+          if (slot !== void 0) nodeResults.push({
+            nodeIndex: i,
+            outputIndex: oi,
+            slot,
+            shape: bt.shape.slice(),
+            strides: bt.strides.slice(),
+            dtype: bt.dtype,
+            offset: bt.offset
+          });
+          else unrecordedNodes.push(`node[${i}].results[${oi}] op=${node.op} shape=${JSON.stringify(node.shape)} dtype=${bt.dtype}`);
+        }
+        else if (node.result) {
+          const bt = asGPUTensor(node.result.backendTensor);
+          const slot = compilationRecording.bufferToSlot.get(bt.buffer);
+          if (slot !== void 0) nodeResults.push({
+            nodeIndex: i,
+            outputIndex: 0,
+            slot,
+            shape: bt.shape.slice(),
+            strides: bt.strides.slice(),
+            dtype: bt.dtype,
+            offset: bt.offset
+          });
+          else unrecordedNodes.push(`node[${i}] op=${node.op} shape=${JSON.stringify(node.shape)} dtype=${bt.dtype}`);
+        }
+      }
+      const compiled = buildCompiledPlan({
+        commandLog: compilationRecording.commandLog,
+        arena: options.bufferArena,
+        bufferToSlot: compilationRecording.bufferToSlot,
+        slotSources: compilationRecording.slotSources,
+        nodeResults
+      });
+      if (unrecordedNodes.length > 0) {
+        console.warn(`[compiled-plan] Invalidated: ${unrecordedNodes.length} node(s) have result buffers not tracked during recording.
+  This means a backend op returned a cached/pre-existing buffer instead of dispatching.
+  Fix: check isCompilationRecording() from webgpu-state and bypass the cache.
+` + unrecordedNodes.map((s) => `  - ${s}`).join("\n"));
+        compiled.valid = false;
+      }
+      if (compiled.valid && !getArenaConflictDetected()) {
+        compiled.endCounters = getDispatchSequenceCounters();
+        loweredPlan.compiledPlan = compiled;
+      }
+      compilationRecording = null;
+    }
+    if (getArenaConflictDetected()) clearArenaConflictDetected();
+    if (options.bufferArena && useTopLevelSharedEncoder) {
+      clearActiveArena();
+      clearArenaExternalInputBuffers();
+    }
+    if (useTopLevelSharedEncoder) endSharedEncoder();
+  }
+  const lastNode = plan.nodes[plan.nodes.length - 1];
+  if (!lastNode.result) throw new Error("Lowered plan execution failed: no result for last node");
+  loweredPlan.cachedStats = stats;
+  return {
+    result: lastNode.result,
+    stats
+  };
+}
+async function executePlanOptimized(plan, backend, options = {}) {
+  if (plan.nodes.length === 0) throw new Error("Cannot execute empty plan");
+  await pretunePlanMatmuls(plan, backend);
+  const { enableFusion = isFusedBackend(backend), enableVectorization = true } = options;
+  if (!enableFusion) return {
+    result: await executePlanSequential(plan, backend, { enableEarlyRelease: options.enableEarlyRelease }),
+    stats: {
+      totalNodes: plan.nodes.length,
+      fusedNodes: 0,
+      sequentialNodes: plan.nodes.length,
+      fusionGroups: 0,
+      fusionEnabled: enableFusion
+    }
+  };
+  let externalNodeIds;
+  try {
+    const { getPendingNodeIds: getPendingNodeIds2 } = await Promise.resolve().then(() => tensor1l1COWZg);
+    const pending = getPendingNodeIds2();
+    if (pending.size > 0) externalNodeIds = pending;
+  } catch {
+  }
+  const maxStorageBuffers = backend.device?.limits?.maxStorageBuffersPerShaderStage;
+  const fingerprint = computePlanFingerprint(plan.nodes, externalNodeIds);
+  const cachedTemplate = fusionAnalysisCache.get(fingerprint);
+  let planNodes;
+  let loweredPlan;
+  if (cachedTemplate?.loweredPlan) {
+    planNodes = cachedTemplate.finalPerm.map((i) => plan.nodes[i]);
+    loweredPlan = cachedTemplate.loweredPlan;
+    if (define_process_env_default.TORCHLETTE_DEBUG_COMPILED) {
+      const extCount = externalNodeIds?.size ?? 0;
+      const n0 = plan.nodes[0];
+      const n0Info = n0 ? `n0=${n0.op}(${n0.dtype},${JSON.stringify(n0.shape)})` : "";
+      console.log(`[template] HIT fp=0x${(fingerprint >>> 0).toString(16)} nodes=${plan.nodes.length} ext=${extCount} compiled=${!!loweredPlan.compiledPlan?.valid} ${n0Info}`);
+    }
+  } else {
+    const analysis = analyzeGraph(plan.nodes, externalNodeIds, maxStorageBuffers);
+    planNodes = analysis.planNodes;
+    const origIdToPos = buildIdPositionMap(plan.nodes);
+    const finalPerm = planNodes.map((n) => origIdToPos.get(n.id));
+    const finalIdToPos = buildIdPositionMap(planNodes);
+    const template = {
+      finalPerm,
+      segments: analysis.segments.map((seg) => {
+        if (seg.kind === "sequential") return {
+          kind: "sequential",
+          finalPoss: seg.nodes.map((n) => finalIdToPos.get(n.id))
+        };
+        if (seg.kind === "reduction") {
+          const rg = seg.group;
+          return {
+            kind: "reduction",
+            finalPoss: rg.nodes.map((n) => finalIdToPos.get(n.id)),
+            reductionFinalPos: finalIdToPos.get(rg.reductionNode.id),
+            preambleFinalPoss: rg.preambleNodes.map((n) => finalIdToPos.get(n.id)),
+            epilogueFinalPoss: rg.epilogueNodes.map((n) => finalIdToPos.get(n.id)),
+            outputFinalPos: finalIdToPos.get(rg.outputNode.id),
+            preambleOps: rg.preambleOps,
+            preambleInputDtypes: rg.preambleInputDtypes,
+            epilogueOps: rg.epilogueOps,
+            outputDtype: rg.outputDtype,
+            isMean: rg.isMean
+          };
+        }
+        return {
+          kind: "fused",
+          finalPoss: seg.group.nodes.map((n) => finalIdToPos.get(n.id)),
+          outputFinalPos: finalIdToPos.get(seg.group.outputNode.id),
+          additionalOutputFinalPoss: (seg.group.additionalOutputNodes ?? []).map((n) => finalIdToPos.get(n.id)),
+          neededIntermediateFinalPoss: (seg.group.neededIntermediates ?? []).map((n) => finalIdToPos.get(n.id))
+        };
+      }),
+      epilogueClaimedOrigPoss: [...analysis.epilogueClaimedIds].map((id) => origIdToPos.get(id)),
+      prologueClaimedOrigPoss: [...analysis.prologueClaimedIds].map((id) => origIdToPos.get(id)),
+      epilogueChains: [...analysis.matmulEpilogueChains].map(([mmId, epilogueIds]) => [origIdToPos.get(mmId), epilogueIds.map((id) => origIdToPos.get(id))]),
+      prologueDescs: [...analysis.matmulPrologues].map(([mmId, prologues]) => [origIdToPos.get(mmId), prologues.map((p) => ({
+        inputIndex: p.inputIndex,
+        castOrigPos: origIdToPos.get(p.castNodeId),
+        fromDtype: p.fromDtype,
+        toDtype: p.toDtype
+      }))])
+    };
+    loweredPlan = buildLoweredPlanFromAnalysis({
+      segments: analysis.segments,
+      planNodes,
+      nodeIdToFinalPos: finalIdToPos,
+      prologueClaimedIds: analysis.prologueClaimedIds,
+      rowProgramMatches: analysis.rowProgramMatches,
+      matmulDirectives: analysis.matmulDirectives,
+      enableVectorization
+    });
+    template.loweredPlan = loweredPlan;
+    fusionAnalysisCache.set(fingerprint, template);
+    if (define_process_env_default.TORCHLETTE_DEBUG_COMPILED) {
+      const opCounts = /* @__PURE__ */ new Map();
+      for (const n of plan.nodes) opCounts.set(n.op, (opCounts.get(n.op) ?? 0) + 1);
+      const opSummary = [...opCounts.entries()].sort((a, b) => b[1] - a[1]).map(([op, c]) => `${op}:${c}`).join(" ");
+      const extCount = externalNodeIds?.size ?? 0;
+      let nearMiss = "";
+      for (const [existingFp, existingTemplate] of fusionAnalysisCache.entries()) if (existingFp !== fingerprint) {
+        const nOld = existingTemplate.finalPerm?.length ?? 0;
+        const diff = plan.nodes.length - nOld;
+        if (Math.abs(diff) <= 2 && diff !== 0) {
+          nearMiss += ` [near: fp=0x${(existingFp >>> 0).toString(16)} nodes=${nOld} diff=${diff > 0 ? "+" : ""}${diff}]`;
+          if (externalNodeIds && diff === 1) {
+            const castExts = plan.nodes.filter((n) => externalNodeIds.has(n.id)).filter((n) => n.op === "cast");
+            if (castExts.length > 0) {
+              const c = castExts[castExts.length - 1];
+              const cIdx = plan.nodes.indexOf(c);
+              const inp = c.inputs[0];
+              const inputOp = inp.kind === "pending" ? inp.node.op : "(materialized)";
+              const inputDtype = inp.kind === "pending" ? inp.node.dtype : inp.kind === "materialized" ? inp.storage.backendTensor.dtype : "?";
+              console.log(`  EXTRA CAST: node[${cIdx}] cast ${inputDtype}->${c.dtype} shape=${JSON.stringify(c.shape)} input=${inputOp} isExt=${externalNodeIds.has(c.id)}`);
+              const consumers = plan.nodes.filter((n) => n.inputs.some((i) => i.kind === "pending" && i.node.id === c.id));
+              for (const con of consumers) console.log(`    consumer: ${con.op} shape=${JSON.stringify(con.shape)} dtype=${con.dtype}`);
+            }
+          }
+        }
+      }
+      console.log(`[template] MISS fp=0x${(fingerprint >>> 0).toString(16)} nodes=${plan.nodes.length} ext=${extCount} actions=${loweredPlan.actions.length} cacheSize=${fusionAnalysisCache.size}${nearMiss}
+  ops: ${opSummary}`);
+    }
+    if (isProfilingEnabled()) collectProfilingStats(analysis.segments, analysis.epilogueClaimedIds, analysis.prologueClaimedIds, analysis.matmulEpilogueChains, plan.nodes.length);
+  }
+  const bufferArena = (cachedTemplate ?? fusionAnalysisCache.get(fingerprint))?.bufferArena;
+  return executeLoweredPlan(plan, planNodes, loweredPlan, backend, { bufferArena });
+}
+function collectProfilingStats(segments, epilogueClaimedIds, prologueClaimedIds, matmulEpilogueChains, totalNodes) {
+  let fusedSegCount = 0;
+  let seqSegCount = 0;
+  let fusedNodeCount = 0;
+  let fusionGroupCount = 0;
+  const sequentialOps = {};
+  const unfusedByShape = {};
+  const recordUnfused = (node) => {
+    sequentialOps[node.op] = (sequentialOps[node.op] ?? 0) + 1;
+    if (isFusibleOp(node.op)) {
+      const shapeKey = node.shape.join(",");
+      let bucket = unfusedByShape[shapeKey];
+      if (!bucket) {
+        bucket = {
+          count: 0,
+          ops: {}
+        };
+        unfusedByShape[shapeKey] = bucket;
+      }
+      bucket.count++;
+      bucket.ops[node.op] = (bucket.ops[node.op] ?? 0) + 1;
+    }
+  };
+  for (const segment of segments) if (segment.kind === "fused" && segment.group.nodes.length >= 2) {
+    fusedSegCount++;
+    fusedNodeCount += segment.group.nodes.length;
+    fusionGroupCount++;
+  } else if (segment.kind === "fused") {
+    seqSegCount++;
+    for (const node of segment.group.nodes) recordUnfused(node);
+  } else if (segment.kind === "sequential") {
+    seqSegCount++;
+    for (const node of segment.nodes) if (!epilogueClaimedIds.has(node.id) && !prologueClaimedIds.has(node.id)) recordUnfused(node);
+    else sequentialOps[node.op] = (sequentialOps[node.op] ?? 0) + 1;
+  }
+  let reductionFusionEstimate = 0;
+  for (const segment of segments) {
+    if (segment.kind !== "sequential") continue;
+    for (let i = 0; i < segment.nodes.length - 1; i++) {
+      const cur = segment.nodes[i];
+      const next = segment.nodes[i + 1];
+      if (isFusibleOp(cur.op) && cur.op !== "cast" && (next.op === "sum" || next.op === "mean")) reductionFusionEstimate++;
+    }
+  }
+  recordPlanAnalysis({
+    planIndex: 0,
+    totalNodes,
+    segments: {
+      fused: fusedSegCount,
+      sequential: seqSegCount
+    },
+    fusedNodes: fusedNodeCount,
+    fusionGroups: fusionGroupCount,
+    epilogueFusions: matmulEpilogueChains.size,
+    reductionFusions: reductionFusionEstimate,
+    sequentialOps,
+    unfusedByShape
+  });
+}
+var EngineTensor = class {
+  id;
+  baseId;
+  origin;
+  escapes = false;
+  disposed = false;
+  /** Optional callback to free backend resources (e.g., GPU buffers) */
+  onDispose;
+  constructor(id, baseId, origin) {
+    this.id = id;
+    this.baseId = baseId;
+    this.origin = origin;
+  }
+};
+init_registry$1();
+init_types$1();
+init_shape();
+init_node_factory();
+init_storage_tracker();
+init_registry$2();
+function collectTensorHandles(value) {
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  const visit = (current) => {
+    if (current == null) return;
+    if (current instanceof EngineTensor) {
+      out.push(current);
+      return;
+    }
+    if (typeof current !== "object") return;
+    if (seen.has(current)) return;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      for (const entry of current) visit(entry);
+      return;
+    }
+    for (const entry of Object.values(current)) visit(entry);
+  };
+  visit(value);
+  return out;
+}
+function computeRngValue(basis, opNonce, drawNonce) {
+  const seed = basis.seed >>> 0;
+  const algo = basis.algorithmId >>> 0;
+  const op = opNonce >>> 0;
+  const draw = drawNonce >>> 0;
+  let v = (seed ^ Math.imul(algo, 2654435769) ^ op ^ Math.imul(draw, 2246822507)) >>> 0;
+  v ^= v >>> 16;
+  v = Math.imul(v, 2146121005);
+  v ^= v >>> 15;
+  v = Math.imul(v, 2221713035);
+  v ^= v >>> 16;
+  return (v >>> 0) / 2 ** 32;
+}
+var EngineBusyError = class extends Error {
+  name = "EngineBusyError";
+};
+var AsyncInCompileError = class extends Error {
+  name = "AsyncInCompileError";
+};
+var SavedTensorModifiedError = class extends Error {
+  name = "SavedTensorModifiedError";
+};
+var NonReentrantBackwardError = class extends Error {
+  name = "NonReentrantBackwardError";
+};
+var PoisonedEngineError = class extends Error {
+  name = "PoisonedEngineError";
+};
+var RngReplayExhaustedError = class extends Error {
+  name = "RngReplayExhaustedError";
+};
+var RngReplayMismatchError = class extends Error {
+  name = "RngReplayMismatchError";
+};
+var TidyDispatchMode = class {
+  tracked = /* @__PURE__ */ new Set();
+  escaped = /* @__PURE__ */ new Set();
+  onTensorCreated(tensor) {
+    this.tracked.add(tensor);
+  }
+  onTensorEscaped(tensor) {
+    this.escaped.add(tensor);
+  }
+  disposeNonEscaped() {
+    for (const t of this.tracked) if (!this.escaped.has(t) && !t.disposed) t.dispose();
+  }
+};
+var IntermediateTrackingMode = class {
+  tracked = /* @__PURE__ */ new Set();
+  onTensorCreated(tensor) {
+    this.tracked.add(tensor);
+  }
+};
+function matmulShape(a, b) {
+  if (a.length < 1 || b.length < 1) throw new Error("matmul requires at least 1D tensors");
+  const kA = a[a.length - 1];
+  const kB = b.length === 1 ? b[0] : b[b.length - 2];
+  if (kA !== kB) throw new Error(`matmul: inner dimension mismatch — [${a.join(",")}] @ [${b.join(",")}] (${kA} != ${kB})`);
+  if (a.length === 1 && b.length === 1) return [];
+  if (a.length === 1) return [...b.slice(0, -2), b[b.length - 1]];
+  if (b.length === 1) return a.slice(0, -1);
+  const m = a[a.length - 2];
+  const n = b[b.length - 1];
+  return [
+    ...broadcastShapes(a.slice(0, -2), b.slice(0, -2)),
+    m,
+    n
+  ];
+}
+function transposeShape(shape, options) {
+  const result = shape.slice();
+  const temp = result[options.dim0];
+  result[options.dim0] = result[options.dim1];
+  result[options.dim1] = temp;
+  return result;
+}
+function reduceShape(shape, dim, keepdim) {
+  if (dim == null) return keepdim ? shape.map(() => 1) : [];
+  const normalizedDims = (Array.isArray(dim) ? dim : [dim]).map((d) => d < 0 ? shape.length + d : d);
+  if (keepdim) return shape.map((s, i) => normalizedDims.includes(i) ? 1 : s);
+  return shape.filter((_, i) => !normalizedDims.includes(i));
+}
+function castRef(input, toDtype) {
+  return {
+    lazyRef: createPendingRef(createLazyIRNode("cast", [input.lazyRef], input.shape.slice(), toDtype, input.device, { dtype: toDtype })),
+    shape: input.shape,
+    dtype: toDtype,
+    device: input.device
+  };
+}
+function collectPendingRoots(tensors) {
+  const roots = [];
+  for (const t of tensors) {
+    if (t.isMaterialized() || t.disposed) continue;
+    const ref2 = t.lazyRef;
+    if (ref2.kind === "pending") roots.push(ref2.node);
+  }
+  return roots;
+}
+function resolveDeviceFromTensors(tensors) {
+  for (const t of tensors) if (!t.isMaterialized()) return t.device;
+  return "cpu";
+}
+function materializeRemaining(tensors) {
+  const materialized = [];
+  for (const t of tensors) {
+    if (t.isMaterialized() || t.disposed) continue;
+    const ref2 = t.lazyRef;
+    if (ref2.kind === "pending") {
+      const idx = ref2.outputIndex ?? 0;
+      const storage = idx === 0 ? ref2.node.result : ref2.node.results?.[idx];
+      if (storage) {
+        t._materialize(storage);
+        materialized.push(ref2.node);
+      }
+    }
+  }
+  return materialized;
+}
+var RuntimeEngine = class {
+  defaultDevice = null;
+  fusionEnabled = false;
+  vectorizationEnabled = false;
+  lastFusionStats = null;
+  cumulativeFusionStats = null;
+  earlyReleaseEnabled = false;
+  checkpointSegmentationEnabled = false;
+  _rngCounter = 0;
+  trueSegmentationEnabled = false;
+  _webgpuFlushBufferPool = null;
+  /** Cache plan fingerprints by cheap structural key to avoid O(N) hashing. */
+  /** Stack of active dispatch modes (notified on tensor creation/escape). */
+  dispatchModes = [];
+  _baseState = /* @__PURE__ */ new Map();
+  _execLock = {
+    held: false,
+    ownerId: 0,
+    depth: 0
+  };
+  _nextOwnerId = 1;
+  _poisoned = false;
+  _nextSavedTensorId = 1;
+  _backwardActive = false;
+  _nextTensorId = 1;
+  _nextBaseId = 1;
+  _nextScopeId = 1;
+  _nextMutIdValue = 1;
+  _tidyScopes = [];
+  _asyncScopeContext = null;
+  _basePinCount = /* @__PURE__ */ new Map();
+  _rngBasis = {
+    algorithmId: 0,
+    seed: 0
+  };
+  _rngDrawNonce = 0;
+  _rngCheckpointMode = null;
+  _rngCheckpointDraws = [];
+  _rngCheckpointIndex = 0;
+  _autocastContext = null;
+  _savedTensors = /* @__PURE__ */ new Map();
+  _memorySnapshots = [];
+  _memoryStatsProvider = null;
+  constructor(backendName, options) {
+    if (backendName) this.defaultDevice = backendName;
+    if (options?.enableFusion !== void 0) this.fusionEnabled = options.enableFusion;
+    if (options?.enableVectorization !== void 0) this.vectorizationEnabled = options.enableVectorization;
+    if (options?.enableEarlyRelease !== void 0) this.earlyReleaseEnabled = options.enableEarlyRelease;
+    if (options?.enableCheckpointSegmentation !== void 0) this.checkpointSegmentationEnabled = options.enableCheckpointSegmentation;
+    if (options?.enableTrueSegmentation !== void 0) this.trueSegmentationEnabled = options.enableTrueSegmentation;
+  }
+  /**
+  * Enable or disable fusion optimization (§15).
+  */
+  setFusionEnabled(enabled) {
+    this.fusionEnabled = enabled;
+  }
+  /**
+  * Check if fusion is enabled.
+  */
+  isFusionEnabled() {
+    return this.fusionEnabled;
+  }
+  /**
+  * Get statistics from the last optimized execution.
+  */
+  getLastFusionStats() {
+    return this.lastFusionStats;
+  }
+  /**
+  * Get cumulative fusion statistics across all force() calls since the last
+  * markStep(). This is useful because lastFusionStats only captures the most
+  * recent force() call, which may be the optimizer step (with no fusion).
+  */
+  getCumulativeFusionStats() {
+    return this.cumulativeFusionStats;
+  }
+  /**
+  * Reset cumulative fusion stats. Called at markStep() boundaries.
+  */
+  resetCumulativeFusionStats() {
+    this.cumulativeFusionStats = null;
+  }
+  /**
+  * Accumulate fusion stats from a single execution into the cumulative total.
+  */
+  accumulateFusionStats(stats) {
+    if (!this.cumulativeFusionStats) this.cumulativeFusionStats = { ...stats };
+    else {
+      this.cumulativeFusionStats.totalNodes += stats.totalNodes;
+      this.cumulativeFusionStats.fusedNodes += stats.fusedNodes;
+      this.cumulativeFusionStats.sequentialNodes += stats.sequentialNodes;
+      this.cumulativeFusionStats.fusionGroups += stats.fusionGroups;
+      this.cumulativeFusionStats.fusionEnabled = stats.fusionEnabled;
+    }
+  }
+  /**
+  * Enable or disable early buffer release during execution.
+  * This releases intermediate buffers as soon as they're no longer needed,
+  * allowing for better memory reuse within a single plan execution.
+  */
+  setEarlyReleaseEnabled(enabled) {
+    this.earlyReleaseEnabled = enabled;
+  }
+  /**
+  * Check if early release is enabled.
+  */
+  isEarlyReleaseEnabled() {
+    return this.earlyReleaseEnabled;
+  }
+  pushDispatchMode(mode) {
+    this.dispatchModes.push(mode);
+  }
+  popDispatchMode() {
+    const mode = this.dispatchModes.pop();
+    if (!mode) throw new Error("No dispatch mode to pop");
+    return mode;
+  }
+  hasDispatchMode() {
+    return this.dispatchModes.length > 0;
+  }
+  markEscaped(tensor) {
+    for (const mode of this.dispatchModes) mode.onTensorEscaped?.(tensor);
+  }
+  /**
+  * Start tracking intermediate tensors created during backward computations.
+  * Implemented as a dispatch mode — supports nesting.
+  */
+  startIntermediateTracking() {
+    this.pushDispatchMode(new IntermediateTrackingMode());
+  }
+  /**
+  * Stop tracking and return all tracked intermediate tensors.
+  * The caller should dispose tensors that are not needed (e.g., not returned gradients).
+  */
+  stopIntermediateTracking() {
+    const mode = this.popDispatchMode();
+    if (!(mode instanceof IntermediateTrackingMode)) throw new Error("Expected IntermediateTrackingMode on dispatch mode stack");
+    return mode.tracked;
+  }
+  /**
+  * Create a tensor and track it as an intermediate if tracking is active.
+  * Helper to reduce boilerplate in all op implementations.
+  */
+  createAndTrack(baseId, lazyRef, shape, device, dtype = "f32") {
+    const tensor = new Tensor$1(baseId, lazyRef, shape, device, dtype);
+    for (let i = 0; i < this.dispatchModes.length; i++) this.dispatchModes[i].onTensorCreated(tensor);
+    return tensor;
+  }
+  /** Shorthand: create a tracked tensor from a lazy ref. */
+  trackRef(ref2, shape, device, dtype) {
+    return this.createAndTrack(createBaseId(), ref2, shape, device, dtype);
+  }
+  /** Shorthand: create a tracked tensor from a lazy IR node. */
+  trackNode(node, shape, device, dtype) {
+    return this.trackRef(createPendingRef(node), shape, device, dtype);
+  }
+  setBackend(name) {
+    const backend = getBackend(name);
+    if (!backend) throw new Error(`Unknown backend: ${name}`);
+    this.defaultDevice = name;
+    return backend;
+  }
+  /**
+  * Get the current default device.
+  */
+  get currentDefaultDevice() {
+    return this.defaultDevice ?? getActiveBackend().name;
+  }
+  getBackend(device) {
+    const resolved = device ?? this.defaultDevice ?? getActiveBackend().name;
+    const backend = getBackend(resolved);
+    if (!backend) throw new Error(`Unknown backend: ${resolved}`);
+    return backend;
+  }
+  getDevice(device) {
+    return device ?? this.defaultDevice ?? getActiveBackend().name;
+  }
+  assertSameDevice(...tensors) {
+    const device = tensors[0]?.device;
+    if (!device) throw new Error("Missing tensor device");
+    for (const tensor of tensors) if (tensor.device !== device) throw new Error("Tensors must be on the same device");
+    return device;
+  }
+  assertShapeMatch(op, dst, src) {
+    if (dst.shape.length !== src.shape.length) throw new Error(`${op}: shape mismatch - dst has rank ${dst.shape.length}, src has rank ${src.shape.length}`);
+    for (let i = 0; i < dst.shape.length; i++) if (dst.shape[i] !== src.shape[i]) throw new Error(`${op}: shape mismatch at dim ${i} - dst has ${dst.shape[i]}, src has ${src.shape[i]}`);
+  }
+  /**
+  * Force a tensor to materialize by executing its computation graph.
+  */
+  async force(tensor) {
+    if (tensor.isMaterialized() || tensor.disposed) return;
+    if (tensor.lazyRef.kind !== "pending") return;
+    await this.forceAllMerged(tensor);
+  }
+  /**
+  * Get the buffer pool flush function for the given device.
+  * Returns a no-op for devices without buffer pools.
+  */
+  getBufferPoolFlushFn(device) {
+    if (device === "webgpu") {
+      if (this._webgpuFlushBufferPool) return this._webgpuFlushBufferPool;
+      try {
+        this._webgpuFlushBufferPool = (init_webgpu(), __toCommonJS(webgpu_exports)).flushBufferPool ?? (() => {
+        });
+        return this._webgpuFlushBufferPool;
+      } catch {
+        return () => {
+        };
+      }
+    }
+    return () => {
+    };
+  }
+  /**
+  * Force multiple tensors to materialize using a single merged execution plan.
+  *
+  * This is critical for unified backward execution: when multiple checkpointed
+  * layers' recomputations are collected, this method builds ONE merged plan
+  * containing all their computation graphs. If true segmentation is enabled
+  * and checkpoint boundaries exist in the merged plan, the execution will
+  * segment at those boundaries with GPU sync between segments, enabling
+  * memory savings.
+  */
+  async forceAllMerged(...tensors) {
+    const pendingRoots = collectPendingRoots(tensors);
+    if (pendingRoots.length === 0) return;
+    const plan = buildMergedPlan(pendingRoots);
+    if (plan.nodes.length === 0) return;
+    const device = resolveDeviceFromTensors(tensors);
+    const allDataSource = plan.nodes.every((n) => isDataSourceOp(n.op));
+    const backend = this.getBackend(device);
+    const hasCheckpointBoundaries = plan.nodes.some((n) => n.isCheckpointBoundary);
+    if (this.fusionEnabled && !allDataSource) {
+      const optimizedResult = await executePlanOptimized(plan, backend, {
+        enableFusion: true,
+        enableVectorization: this.vectorizationEnabled,
+        enableEarlyRelease: this.earlyReleaseEnabled
+      });
+      this.lastFusionStats = optimizedResult.stats;
+      this.accumulateFusionStats(optimizedResult.stats);
+    } else if (this.trueSegmentationEnabled && hasCheckpointBoundaries && device === "webgpu") await executePlanSegmented(plan, backend, {
+      enableEarlyRelease: this.earlyReleaseEnabled,
+      gpuSync: true
+    });
+    else if (this.checkpointSegmentationEnabled && hasCheckpointBoundaries) await executePlanSegmented(plan, backend, {
+      enableEarlyRelease: this.earlyReleaseEnabled,
+      flushBufferPoolFn: this.getBufferPoolFlushFn(device)
+    });
+    else await executePlanSequential(plan, backend, { enableEarlyRelease: this.earlyReleaseEnabled });
+    const { materializePendingTensors: materializePendingTensors2, clearDisposedPendingNodeIds: clearDisposedPendingNodeIds2 } = await Promise.resolve().then(() => tensor1l1COWZg);
+    for (const node of plan.nodes) if (node.result) materializePendingTensors2(node.id, node.result, node.results);
+    clearDisposedPendingNodeIds2();
+    materializeRemaining(tensors);
+  }
+  /**
+  * Force all pending tensors to materialize.
+  * Called at markStep to ensure all pending work is done before cleanup.
+  *
+  * Uses a single merged plan for efficiency. Skips nodes that were already
+  * executed (have results from previous force() calls) since their results
+  * are still accessible via node.result in getInputStorage().
+  */
+  async forceAllPending() {
+    const { getAllPendingTensors: getAllPendingTensors2, materializePendingTensors: materialize, clearDisposedPendingNodeIds: clearDisposedPendingNodeIds2 } = await Promise.resolve().then(() => tensor1l1COWZg);
+    const pendingTensors = getAllPendingTensors2();
+    if (pendingTensors.length === 0) return;
+    const pendingRoots = collectPendingRoots(pendingTensors);
+    if (pendingRoots.length === 0) return;
+    const plan = buildMergedPlan(pendingRoots, true);
+    if (plan.nodes.length === 0) return;
+    storageTracker.destroyUnreachable();
+    const device = resolveDeviceFromTensors(pendingTensors);
+    this.getBufferPoolFlushFn(device)();
+    const storageSnapshot = storageTracker.getNextStorageId();
+    const backend = this.getBackend(device);
+    if (this.fusionEnabled) {
+      const optimizedResult = await executePlanOptimized(plan, backend, {
+        enableFusion: true,
+        enableVectorization: this.vectorizationEnabled,
+        enableEarlyRelease: this.earlyReleaseEnabled
+      });
+      this.lastFusionStats = optimizedResult.stats;
+      this.accumulateFusionStats(optimizedResult.stats);
+    } else await executePlanSequential(plan, backend, { enableEarlyRelease: this.earlyReleaseEnabled });
+    for (const node of plan.nodes) if (node.result) materialize(node.id, node.result, node.results);
+    clearDisposedPendingNodeIds2();
+    const skippedNodes = materializeRemaining(pendingTensors);
+    for (const node of plan.nodes) node.result = void 0;
+    for (const node of skippedNodes) node.result = void 0;
+    storageTracker.destroyUnreachableSince(storageSnapshot);
+  }
+  tensorFromArray(values, shape, device) {
+    const resolvedDevice = this.getDevice(device);
+    const node = createLazyIRNode("tensorFromArray", [], shape, "f32", resolvedDevice, { values: values instanceof Float32Array ? values : values.slice() });
+    return this.trackNode(node, shape, resolvedDevice);
+  }
+  /** Helper: create a data-source op (no inputs, f32 output). */
+  _creationOp(op, shape, device, payload) {
+    const resolvedDevice = this.getDevice(device);
+    const node = createLazyIRNode(op, [], shape, "f32", resolvedDevice, payload);
+    return this.trackNode(node, shape, resolvedDevice);
+  }
+  zeros(shape, device) {
+    return this._creationOp("zeros", shape, device);
+  }
+  full(shape, fillValue, device) {
+    return this._creationOp("full", shape, device, { fillValue });
+  }
+  arange(end, start = 0, step2 = 1, device) {
+    const numElements = Math.max(0, Math.ceil((end - start) / step2));
+    return this._creationOp("arange", [numElements], device, {
+      end,
+      start,
+      step: step2
+    });
+  }
+  tril(a, k = 0) {
+    if (a.shape.length < 2) throw new Error("tril requires at least 2 dimensions");
+    return this._unaryOp("tril", a, { k });
+  }
+  triu(a, k = 0) {
+    if (a.shape.length < 2) throw new Error("triu requires at least 2 dimensions");
+    return this._unaryOp("triu", a, { k });
+  }
+  rand(shape, device) {
+    return this._creationOp("rand", shape, device, { seed: this._rngCounter++ });
+  }
+  randn(shape, device) {
+    return this._creationOp("randn", shape, device, { seed: this._rngCounter++ });
+  }
+  bernoulli(shape, p, device) {
+    return this._creationOp("bernoulli", shape, device, {
+      seed: this._rngCounter++,
+      p
+    });
+  }
+  /** Helper: create a simple unary lazy op node.
+  *  Automatically handles dtype safety from OP_DTYPE_RULES:
+  *  - f32_required: casts f16 input to f32
+  *  - always_f32: forces f32 output dtype
+  */
+  _unaryOp(op, a, payload) {
+    let input = a;
+    let outDtype = a.dtype;
+    const rule = OP_DTYPE_RULES[op];
+    if (rule) {
+      if (rule.category === "f32_required" && a.dtype === "f16") {
+        input = castRef(a, "f32");
+        outDtype = "f32";
+      } else if (rule.category === "always_f32") outDtype = "f32";
+    }
+    const node = createLazyIRNode(op, [input.lazyRef], a.shape.slice(), outDtype, a.device, payload);
+    return this.trackNode(node, a.shape.slice(), a.device, outDtype);
+  }
+  /**
+  * Ensure dtype safety for an op based on the centralized Op Dtype Registry.
+  * - promote_inputs: promote mismatched dtypes to f32
+  * - f32_required: upcast f16 inputs to f32
+  *
+  * Returns OpInput[] (lightweight refs) rather than Tensor[] to avoid creating
+  * lifecycle-managed Tensor objects for internal dtype casts. Callers only need
+  * lazyRef/shape/dtype/device, which OpInput provides.
+  */
+  ensureDtypeSafety(op, inputs) {
+    const rule = OP_DTYPE_RULES[op];
+    if (!rule) return inputs;
+    if (rule.category === "promote_inputs" && inputs.length >= 2) {
+      const [a, b] = inputs;
+      if (a.dtype !== b.dtype) {
+        const target = promoteDtype(a.dtype, b.dtype);
+        return [
+          a.dtype === target ? a : castRef(a, target),
+          b.dtype === target ? b : castRef(b, target),
+          ...inputs.slice(2)
+        ];
+      }
+    }
+    if (rule.category === "f32_required") return inputs.map((t) => t.dtype === "f16" ? castRef(t, "f32") : t);
+    return inputs;
+  }
+  /**
+  * Resolve a TensorOrScalar operand to a LazyRef.
+  * Numbers become scalar LazyRefs (no graph node, no GPU buffer).
+  * The refTensor provides dtype/device context for the scalar.
+  */
+  resolveOperand(value, ref2) {
+    if (typeof value === "number") return {
+      ref: createScalarRef(value, ref2.dtype),
+      shape: []
+    };
+    return {
+      ref: value.lazyRef,
+      shape: value.shape.slice()
+    };
+  }
+  /**
+  * Get the reference input (for dtype/device) from a pair of operands.
+  * At least one must be a non-number.
+  */
+  getRefInput(a, b) {
+    if (typeof a !== "number") return a;
+    if (typeof b !== "number") return b;
+    throw new Error("At least one operand must be a Tensor");
+  }
+  /**
+  * Helper for binary ops that accept TensorOrScalar.
+  * Resolves operands, handles dtype safety, and returns the pieces needed to build a node.
+  */
+  resolveBinaryOp(op, a, b) {
+    let opA = a;
+    let opB = b;
+    if (typeof a !== "number" && typeof b !== "number") {
+      this.assertSameDevice(a, b);
+      [opA, opB] = this.ensureDtypeSafety(op, [a, b]);
+    }
+    const ref2 = this.getRefInput(opA, opB);
+    const resA = this.resolveOperand(opA, ref2);
+    const resB = this.resolveOperand(opB, ref2);
+    const shape = broadcastShapes(resA.shape, resB.shape);
+    const dtype = OP_DTYPE_RULES[op]?.category === "always_f32" ? "f32" : ref2.dtype;
+    return {
+      refA: resA.ref,
+      refB: resB.ref,
+      shape,
+      dtype,
+      device: ref2.device
+    };
+  }
+  _binaryOp(op, a, b, payload) {
+    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp(op, a, b);
+    const node = createLazyIRNode(op, [refA, refB], shape, dtype, device, payload);
+    return this.trackNode(node, shape, device, dtype);
+  }
+  add(a, b) {
+    return this._binaryOp("add", a, b);
+  }
+  sub(a, b, options) {
+    return this._binaryOp("sub", a, b, options);
+  }
+  div(a, b, options) {
+    return this._binaryOp("div", a, b, options);
+  }
+  mul(a, b) {
+    return this._binaryOp("mul", a, b);
+  }
+  pow(a, b) {
+    return this._binaryOp("pow", a, b);
+  }
+  /** Create a view op node that shares baseId with the input tensor. */
+  _viewOp(op, a, shape, payload) {
+    const node = createLazyIRNode(op, [a.lazyRef], shape, a.dtype, a.device, payload);
+    return this.createAndTrack(a.baseId, createPendingRef(node), shape, a.device, a.dtype);
+  }
+  view(a, shape) {
+    return this.reshape(a, shape);
+  }
+  reshape(a, shape) {
+    return this._viewOp("reshape", a, shape, { targetShape: shape });
+  }
+  matmul(a, b) {
+    const device = this.assertSameDevice(a, b);
+    const shape = matmulShape(a.shape, b.shape);
+    const dtype = a.dtype === "f32" || b.dtype === "f32" ? "f32" : a.dtype;
+    const node = createLazyIRNode("matmul", [a.lazyRef, b.lazyRef], shape, dtype, device);
+    return this.trackNode(node, shape, device, dtype);
+  }
+  gelu(a, options) {
+    return this._unaryOp("gelu", a, options);
+  }
+  clamp(a, min2, max2) {
+    return this._unaryOp("clamp", a, {
+      min: min2,
+      max: max2
+    });
+  }
+  expand(a, shape) {
+    return this._viewOp("expand", a, shape, { targetShape: shape });
+  }
+  transpose(a, options) {
+    return this._viewOp("transpose", a, transposeShape(a.shape, options), options);
+  }
+  permute(a, dims) {
+    const rank2 = a.shape.length;
+    if (dims.length !== rank2) throw new Error(`permute: dims length ${dims.length} doesn't match tensor rank ${rank2}`);
+    const seen = /* @__PURE__ */ new Set();
+    for (const d of dims) {
+      const nd = normalizeDim$1(d, rank2);
+      if (nd < 0 || nd >= rank2) throw new Error(`permute: dimension ${d} out of range for rank ${rank2}`);
+      if (seen.has(nd)) throw new Error(`permute: duplicate dimension ${d}`);
+      seen.add(nd);
+    }
+    const normalizedDims = dims.map((d) => normalizeDim$1(d, rank2));
+    const shape = normalizedDims.map((d) => a.shape[d]);
+    return this._viewOp("permute", a, shape, { dims: normalizedDims });
+  }
+  contiguous(a) {
+    return this._unaryOp("contiguous", a);
+  }
+  narrow(a, dim, start, length) {
+    const rank2 = a.shape.length;
+    if (dim < 0 || dim >= rank2) throw new Error(`narrow: dim ${dim} out of range for rank ${rank2}`);
+    if (start < 0 || start + length > a.shape[dim]) throw new Error(`narrow: range [${start}, ${start + length}) out of bounds for dim size ${a.shape[dim]}`);
+    const shape = a.shape.slice();
+    shape[dim] = length;
+    return this._viewOp("narrow", a, shape, {
+      dim,
+      start,
+      length
+    });
+  }
+  narrowBackward(grad, dim, start, originalLength) {
+    const shape = grad.shape.slice();
+    shape[dim] = originalLength;
+    const node = createLazyIRNode("narrowBackward", [grad.lazyRef], shape, grad.dtype, grad.device, {
+      dim,
+      start,
+      originalLength
+    });
+    return this.trackNode(node, shape, grad.device, grad.dtype);
+  }
+  cast(a, dtype) {
+    const node = createLazyIRNode("cast", [a.lazyRef], a.shape.slice(), dtype, a.device, { dtype });
+    return this.trackNode(node, a.shape.slice(), a.device, dtype);
+  }
+  gather(a, index, options) {
+    const device = this.assertSameDevice(a, index);
+    const shape = index.shape.slice();
+    const node = createLazyIRNode("gather", [a.lazyRef, index.lazyRef], shape, a.dtype, device, options);
+    return this.trackNode(node, shape, device, a.dtype);
+  }
+  scatterAdd(a, index, src, options) {
+    const device = this.assertSameDevice(a, index, src);
+    const shape = a.shape.slice();
+    const dtype = a.dtype;
+    const node = createLazyIRNode("scatterAdd", [
+      a.lazyRef,
+      index.lazyRef,
+      src.lazyRef
+    ], shape, dtype, device, options);
+    return this.trackNode(node, shape, device, dtype);
+  }
+  cat(tensors, options) {
+    if (tensors.length === 0) throw new Error("cat: empty tensor list");
+    const dim = options?.dim ?? 0;
+    const rank2 = tensors[0].shape.length;
+    const d = dim < 0 ? dim + rank2 : dim;
+    const outShape = tensors[0].shape.slice();
+    for (let i = 1; i < tensors.length; i++) outShape[d] += tensors[i].shape[d];
+    const device = tensors[0].device;
+    const dtype = tensors[0].dtype;
+    const node = createLazyIRNode("cat", tensors.map((t) => t.lazyRef), outShape, dtype, device, { dim: d });
+    return this.trackNode(node, outShape, device, dtype);
+  }
+  _reductionOp(op, a, options) {
+    const [safe] = this.ensureDtypeSafety(op, [a]);
+    const shape = reduceShape(safe.shape, options?.dim, options?.keepdim ?? false);
+    const node = createLazyIRNode(op, [safe.lazyRef], shape, safe.dtype, safe.device, options);
+    return this.trackNode(node, shape, safe.device, safe.dtype);
+  }
+  sum(a, options) {
+    return this._reductionOp("sum", a, options);
+  }
+  max(a, options) {
+    return this._reductionOp("max", a, options);
+  }
+  min(a, options) {
+    return this._reductionOp("min", a, options);
+  }
+  mean(a, options) {
+    return this._reductionOp("mean", a, options);
+  }
+  _argReduceOp(op, a, options) {
+    const dim = options.dim < 0 ? a.shape.length + options.dim : options.dim;
+    const shape = options.keepdim ? a.shape.map((s, i) => i === dim ? 1 : s) : a.shape.filter((_, i) => i !== dim);
+    const node = createLazyIRNode(op, [a.lazyRef], shape, "f32", a.device, {
+      dim,
+      keepdim: options.keepdim
+    });
+    return this.trackNode(node, shape, a.device);
+  }
+  argmax(a, options) {
+    return this._argReduceOp("argmax", a, options);
+  }
+  argmin(a, options) {
+    return this._argReduceOp("argmin", a, options);
+  }
+  where(condition, x, y) {
+    const refT = typeof x !== "number" ? x : typeof y !== "number" ? y : condition;
+    if (typeof x !== "number" && typeof y !== "number") this.assertSameDevice(condition, x, y);
+    const device = condition.device;
+    const resX = this.resolveOperand(x, refT);
+    const resY = this.resolveOperand(y, refT);
+    const shape = broadcastThreeShapes(condition.shape, resX.shape, resY.shape);
+    const dtype = refT.dtype;
+    const node = createLazyIRNode("where", [
+      condition.lazyRef,
+      resX.ref,
+      resY.ref
+    ], shape, dtype, device);
+    return this.trackNode(node, shape, device, dtype);
+  }
+  async cpu(a) {
+    await this.force(a);
+    return this.getBackend(a.device).ops.read(a.backendTensor);
+  }
+  async item(a) {
+    const values = await this.cpu(a);
+    if (values.length !== 1) throw new Error("item() requires a single-element tensor");
+    return values[0];
+  }
+  /**
+  * Transfer a tensor to a different device (lazy).
+  * Creates a lazy transfer node that will be executed when forced.
+  */
+  transfer(a, device) {
+    if (a.device === device) return a;
+    const node = createLazyIRNode("transfer", [a.lazyRef], a.shape.slice(), a.dtype, device, { sourceDevice: a.device });
+    return this.trackNode(node, a.shape.slice(), device, a.dtype);
+  }
+  /**
+  * Force transfer and return the transferred tensor.
+  * Use this when you need immediate transfer (e.g., for cross-device ops).
+  */
+  async transferNow(a, device) {
+    if (a.device === device) return a;
+    const transferred = this.transfer(a, device);
+    await this.force(transferred);
+    return transferred;
+  }
+  /** Shared logic for in-place scatter ops (copy_, add_). */
+  _scatterInPlace(op, label, dst, src) {
+    this.assertSameDevice(dst, src);
+    this.assertShapeMatch(label, dst, src);
+    const payload = {
+      offset: 0,
+      viewShape: dst.shape.slice(),
+      viewStrides: contiguousStrides(dst.shape)
+    };
+    const node = createLazyIRNode(op, [dst.lazyRef, src.lazyRef], dst.shape, dst.dtype, dst.device, payload);
+    dst._updateLazyRef(createPendingRef(node));
+    return dst;
+  }
+  copy_(dst, src) {
+    return this._scatterInPlace("stridedScatterCopy", "copy_", dst, src);
+  }
+  add_(dst, src) {
+    return this._scatterInPlace("stridedScatterAdd", "add_", dst, src);
+  }
+  zero_(dst) {
+    return this.copy_(dst, this.zeros(dst.shape, dst.device));
+  }
+  fill_(dst, value) {
+    return this.copy_(dst, this.full(dst.shape, value, dst.device));
+  }
+  mul_(dst, value) {
+    return this.copy_(dst, this.mul(dst, value));
+  }
+  async beginStep() {
+    await this.getBackend().beginStep?.();
+  }
+  endStep() {
+    this.getBackend().endStep?.();
+  }
+  /**
+  * Wrap an existing StorageHandle into a tracked RuntimeTensor.
+  * Reuses the existing storage without creating a new one.
+  * Used by the fused Adam kernel to create tensors for side outputs (m, v).
+  */
+  createFromStorageHandle(storage, shape, device, dtype = "f32") {
+    const ref2 = createMaterializedRef(storage);
+    return this.trackRef(ref2, shape, device, dtype);
+  }
+  /** Create a fused kernel op node and track it as a new Tensor. */
+  fusedOp(op, tensors, shape, device, config) {
+    const node = createLazyIRNode(op, tensors.map((t) => t.lazyRef), shape, "f32", device, config);
+    return this.trackRef(createPendingRef(node), shape, device);
+  }
+  fusedCrossEntropyForward(logits, targets, config) {
+    return this.fusedOp("fusedCrossEntropyForward", [logits, targets], [config.batchSize], logits.device, config);
+  }
+  fusedCrossEntropyBackward(logits, targets, gradOutput, config) {
+    return this.fusedOp("fusedCrossEntropyBackward", [
+      logits,
+      targets,
+      gradOutput
+    ], [config.batchSize, config.vocabSize], logits.device, config);
+  }
+  fusedLayerNormForward(x, weight, bias, config) {
+    return this.fusedOp("fusedLayerNormForward", [
+      x,
+      weight,
+      bias
+    ], x.shape.slice(), x.device, config);
+  }
+  fusedLayerNormBackwardGradX(gradOutput, x, weight, config) {
+    return this.fusedOp("fusedLayerNormBackwardGradX", [
+      gradOutput,
+      x,
+      weight
+    ], x.shape.slice(), x.device, config);
+  }
+  fusedLayerNormBackwardGradWeightBias(gradOutput, x, config) {
+    return this.fusedOp("fusedLayerNormBackwardGradWeightBias", [gradOutput, x], [config.featureDim], gradOutput.device, config);
+  }
+  fusedRMSNormForward(x, weight, config) {
+    return this.fusedOp("fusedRMSNormForward", [x, weight], x.shape.slice(), x.device, config);
+  }
+  fusedRMSNormBackwardGradX(gradOutput, x, weight, config) {
+    return this.fusedOp("fusedRMSNormBackwardGradX", [
+      gradOutput,
+      x,
+      weight
+    ], x.shape.slice(), x.device, config);
+  }
+  fusedRMSNormBackwardGradWeight(gradOutput, x, weight, config) {
+    return this.fusedOp("fusedRMSNormBackwardGradWeight", [
+      gradOutput,
+      x,
+      weight
+    ], [config.featureDim], x.device, config);
+  }
+  fusedAttentionForward(q, k, v, config) {
+    return this.fusedOp("fusedAttentionForward", [
+      q,
+      k,
+      v
+    ], [
+      config.batchSize,
+      config.numHeads,
+      config.seqLen,
+      config.headDim
+    ], q.device, config);
+  }
+  extractAttentionLogsumexp(fwdOutput, config) {
+    const parentRef = fwdOutput.lazyRef;
+    if (parentRef.kind !== "pending") throw new Error("extractAttentionLogsumexp: expected pending ref");
+    const ref2 = createPendingRef(parentRef.node, 1);
+    return this.trackRef(ref2, [
+      config.batchSize,
+      config.numHeads,
+      config.seqLen
+    ], fwdOutput.device);
+  }
+  fusedAttentionBackward(q, k, v, logsumexp, dO, output, config) {
+    return this.fusedOp("fusedAttentionBackward", [
+      q,
+      k,
+      v,
+      logsumexp,
+      dO,
+      output
+    ], [
+      config.batchSize,
+      config.numHeads,
+      config.seqLen,
+      config.headDim
+    ], q.device, config);
+  }
+  extractAttentionDK(bwdDQ, config) {
+    const parentRef = bwdDQ.lazyRef;
+    if (parentRef.kind !== "pending") throw new Error("extractAttentionDK: expected pending ref");
+    const ref2 = createPendingRef(parentRef.node, 1);
+    return this.trackRef(ref2, [
+      config.batchSize,
+      config.numHeads,
+      config.seqLen,
+      config.headDim
+    ], bwdDQ.device);
+  }
+  extractAttentionDV(bwdDQ, config) {
+    const parentRef = bwdDQ.lazyRef;
+    if (parentRef.kind !== "pending") throw new Error("extractAttentionDV: expected pending ref");
+    const ref2 = createPendingRef(parentRef.node, 2);
+    return this.trackRef(ref2, [
+      config.batchSize,
+      config.numHeads,
+      config.seqLen,
+      config.headDim
+    ], bwdDQ.device);
+  }
+  extractLnBwdGradBias(gradWeight, featureDim) {
+    const parentRef = gradWeight.lazyRef;
+    if (parentRef.kind !== "pending") throw new Error("extractLnBwdGradBias: expected pending ref");
+    const ref2 = createPendingRef(parentRef.node, 1);
+    return this.trackRef(ref2, [featureDim], gradWeight.device);
+  }
+  /**
+  * Set the autocast context for AMP transforms in compiled regions.
+  * This should be called by the frontend when entering an autocast block.
+  */
+  setAutocastContext(ctx) {
+    this._autocastContext = ctx;
+  }
+  /**
+  * Get the current autocast context.
+  */
+  getAutocastContext() {
+    return this._autocastContext;
+  }
+  _debug_publishSave(_baseId) {
+  }
+  _debug_setRngBasis(basis) {
+    this._rngBasis = { ...basis };
+    this._rngDrawNonce = 0;
+  }
+  _debug_getRngDrawNonce() {
+    return this._rngDrawNonce;
+  }
+  _debug_startCheckpointRecord() {
+    if (this._rngCheckpointMode) throw new Error("Checkpoint RNG already active");
+    this._rngCheckpointMode = "record";
+    this._rngCheckpointDraws = [];
+    this._rngCheckpointIndex = 0;
+  }
+  _debug_finishCheckpointRecord() {
+    if (this._rngCheckpointMode !== "record") throw new Error("Checkpoint RNG record not active");
+    const draws = this._rngCheckpointDraws.slice();
+    this._rngCheckpointMode = null;
+    this._rngCheckpointDraws = [];
+    this._rngCheckpointIndex = 0;
+    return draws;
+  }
+  _debug_startCheckpointReplay(draws) {
+    if (this._rngCheckpointMode) throw new Error("Checkpoint RNG already active");
+    this._rngCheckpointMode = "replay";
+    this._rngCheckpointDraws = draws.slice();
+    this._rngCheckpointIndex = 0;
+  }
+  _debug_finishCheckpointReplay() {
+    if (this._rngCheckpointMode !== "replay") throw new Error("Checkpoint RNG replay not active");
+    this._rngCheckpointMode = null;
+    this._rngCheckpointDraws = [];
+    this._rngCheckpointIndex = 0;
+  }
+  _debug_random(opNonce, drawNonce) {
+    if (this._rngCheckpointMode === "replay") {
+      const record = this._rngCheckpointDraws[this._rngCheckpointIndex];
+      if (!record) throw new RngReplayExhaustedError("RNG replay exhausted");
+      if (record.opNonce !== opNonce) throw new RngReplayMismatchError("RNG replay opNonce mismatch");
+      if (drawNonce !== void 0 && drawNonce !== record.drawNonce) throw new RngReplayMismatchError("RNG replay drawNonce mismatch");
+      this._rngCheckpointIndex += 1;
+      return {
+        drawNonce: record.drawNonce,
+        value: record.value
+      };
+    }
+    const assignedDrawNonce = drawNonce ?? this._nextRngDrawNonce();
+    if (drawNonce !== void 0 && drawNonce > this._rngDrawNonce) this._rngDrawNonce = drawNonce;
+    const value = computeRngValue(this._rngBasis, opNonce, assignedDrawNonce);
+    if (this._rngCheckpointMode === "record") this._rngCheckpointDraws.push({
+      opNonce,
+      drawNonce: assignedDrawNonce,
+      value
+    });
+    return {
+      drawNonce: assignedDrawNonce,
+      value
+    };
+  }
+  _debug_backward(fn) {
+    if (this._backwardActive) throw new NonReentrantBackwardError("Backward is already running");
+    this._backwardActive = true;
+    try {
+      return fn();
+    } finally {
+      this._backwardActive = false;
+    }
+  }
+  _debug_saveForBackward(baseId) {
+    const state = this._getOrCreateBaseState(baseId);
+    const id = this._nextSavedTensorId++;
+    const record = {
+      id,
+      baseId,
+      baseCommitVersionAtSave: state.baseCommitVersion
+    };
+    this._savedTensors.set(id, {
+      id,
+      baseId,
+      commitVersionAtSave: state.baseCommitVersion,
+      savedAt: Date.now()
+    });
+    return record;
+  }
+  _debug_useSavedTensor(record) {
+    if (this._getOrCreateBaseState(record.baseId).baseCommitVersion !== record.baseCommitVersionAtSave) throw new SavedTensorModifiedError(`Saved tensor modified for baseId ${record.baseId}`);
+  }
+  /**
+  * Release a saved tensor from tracking (called after backward completes).
+  */
+  _debug_releaseSavedTensor(id) {
+    this._savedTensors.delete(id);
+  }
+  /**
+  * Clear all saved tensor tracking (for cleanup after backward).
+  */
+  _debug_clearSavedTensors() {
+    this._savedTensors.clear();
+  }
+  compile(fn) {
+    return (...args) => {
+      let result;
+      result = fn(...args);
+      if (result && typeof result.then === "function") throw new AsyncInCompileError("Async work is not allowed in compile");
+      return result;
+    };
+  }
+  createTensor(baseId) {
+    const resolvedBaseId = baseId ?? this._nextBaseId++;
+    if (resolvedBaseId >= this._nextBaseId) this._nextBaseId = resolvedBaseId + 1;
+    const origin = this._tidyScopes.length > 0 ? {
+      kind: "tidy",
+      scopeId: this._tidyScopes[this._tidyScopes.length - 1].id
+    } : { kind: "global" };
+    const tensor = new EngineTensor(this._nextTensorId++, resolvedBaseId, origin);
+    this._registerTensor(tensor);
+    return tensor;
+  }
+  forceRead(_baseId) {
+  }
+  tidy(fn) {
+    const scope = {
+      id: this._nextScopeId++,
+      tensors: /* @__PURE__ */ new Set()
+    };
+    this._tidyScopes.push(scope);
+    let result;
+    let succeeded = false;
+    try {
+      result = fn();
+      succeeded = true;
+    } finally {
+      const escaped = succeeded ? collectTensorHandles(result) : [];
+      for (const tensor of escaped) tensor.escapes = true;
+      const tensorsToProcess = Array.from(scope.tensors);
+      for (const tensor of tensorsToProcess) if (!tensor.escapes) this.dispose(tensor);
+      this._tidyScopes.pop();
+    }
+    return result;
+  }
+  keep(tensor) {
+    if (tensor.disposed) return;
+    tensor.escapes = true;
+  }
+  dispose(tensor) {
+    if (tensor.disposed) return;
+    tensor.disposed = true;
+    if (tensor.onDispose) tensor.onDispose();
+    const count = this._basePinCount.get(tensor.baseId) ?? 0;
+    if (count <= 1) this._basePinCount.delete(tensor.baseId);
+    else this._basePinCount.set(tensor.baseId, count - 1);
+    for (const scope of this._tidyScopes) scope.tensors.delete(tensor);
+  }
+  async markStep() {
+    this._debug_runEntryPoint(() => {
+    });
+  }
+  _acquireExecLock() {
+    if (this._execLock.held) throw new EngineBusyError("Engine is busy");
+    this._execLock.held = true;
+    this._execLock.ownerId = this._nextOwnerId++;
+    this._execLock.depth = 1;
+    this._ensureNotPoisoned();
+  }
+  _releaseExecLock() {
+    this._execLock.held = false;
+    this._execLock.ownerId = 0;
+    this._execLock.depth = 0;
+  }
+  _debug_runEntryPoint(fn) {
+    this._acquireExecLock();
+    try {
+      return fn();
+    } finally {
+      this._releaseExecLock();
+    }
+  }
+  async runEntryPoint(fn) {
+    this._acquireExecLock();
+    try {
+      return await fn();
+    } finally {
+      this._releaseExecLock();
+    }
+  }
+  /**
+  * Run an async function with an async scope context that tracks tensors
+  * across await boundaries. Tensors created during the async operation
+  * (but not within a synchronous tidy scope) are tracked and disposed
+  * when the scope exits, unless explicitly kept.
+  */
+  async runWithAsyncScope(fn) {
+    const scope = {
+      id: this._nextScopeId++,
+      tensors: /* @__PURE__ */ new Set()
+    };
+    const previous = this._asyncScopeContext;
+    this._asyncScopeContext = scope;
+    try {
+      return await fn();
+    } finally {
+      this._asyncScopeContext = previous;
+      for (const tensor of scope.tensors) if (!tensor.escapes && !tensor.disposed) this.dispose(tensor);
+    }
+  }
+  _debug_poison() {
+    this._poisoned = true;
+  }
+  _debug_getBasePinCount(baseId) {
+    return this._basePinCount.get(baseId) ?? 0;
+  }
+  /**
+  * Get the next unique mutation ID for in-place operations.
+  * Per spec §4.3, each in-place mutation needs a unique mutId.
+  */
+  nextMutId() {
+    return this._nextMutIdValue++;
+  }
+  _debug_baseCommit(baseId, mutId) {
+    const state = this._getOrCreateBaseState(baseId);
+    if (state.committed.has(mutId)) throw new Error(`base_commit already recorded for mutId ${mutId}`);
+    state.committed.add(mutId);
+    state.baseCommitVersion += 1;
+  }
+  _ensureNotPoisoned() {
+    if (this._poisoned) throw new PoisonedEngineError("Engine is poisoned");
+  }
+  _nextRngDrawNonce() {
+    this._rngDrawNonce += 1;
+    return this._rngDrawNonce;
+  }
+  _registerTensor(tensor) {
+    const count = this._basePinCount.get(tensor.baseId) ?? 0;
+    this._basePinCount.set(tensor.baseId, count + 1);
+    for (const scope of this._tidyScopes) scope.tensors.add(tensor);
+    if (this._tidyScopes.length === 0 && this._asyncScopeContext !== null) this._asyncScopeContext.tensors.add(tensor);
+  }
+  _getOrCreateBaseState(baseId) {
+    const existing = this._baseState.get(baseId);
+    if (existing) return existing;
+    const initial = {
+      baseCommitVersion: 0,
+      committed: /* @__PURE__ */ new Set()
+    };
+    this._baseState.set(baseId, initial);
+    return initial;
+  }
+  /**
+  * Set the memory stats provider for external memory tracking.
+  * This should be called by the runtime during initialization.
+  */
+  setMemoryStatsProvider(provider) {
+    this._memoryStatsProvider = provider;
+  }
+  /**
+  * Get comprehensive memory statistics.
+  */
+  _debug_getMemoryStats() {
+    const p = this._memoryStatsProvider;
+    const gpu = p?.getGPUStats?.() ?? {
+      currentBytes: 0,
+      peakBytes: 0,
+      limitBytes: 0
+    };
+    const pool = p?.getBufferPoolStats?.() ?? {
+      pooledBuffers: 0,
+      inUseBuffers: 0,
+      pendingFenceBuffers: 0
+    };
+    const plan = p?.getPlanStats?.() ?? {
+      activePlans: 0,
+      completedPlans: 0
+    };
+    let totalPinCount = 0;
+    for (const count of this._basePinCount.values()) totalPinCount += count;
+    return {
+      gpuCurrentBytes: gpu.currentBytes,
+      gpuPeakBytes: gpu.peakBytes,
+      gpuLimitBytes: gpu.limitBytes,
+      pooledBuffers: pool.pooledBuffers,
+      inUseBuffers: pool.inUseBuffers,
+      pendingFenceBuffers: pool.pendingFenceBuffers,
+      activeBases: this._basePinCount.size,
+      totalPinCount,
+      savedTensorCount: this._savedTensors.size,
+      pendingTensorCount: p?.getPendingTensorCount?.() ?? 0,
+      activePlans: plan.activePlans,
+      completedPlans: plan.completedPlans
+    };
+  }
+  /**
+  * Get information about all currently saved tensors.
+  */
+  _debug_getSavedTensorsInfo() {
+    return Array.from(this._savedTensors.values());
+  }
+  /**
+  * Get information about all base states.
+  */
+  _debug_getBaseStatesInfo() {
+    const infos = [];
+    for (const [baseId, count] of this._basePinCount) infos.push({
+      baseId,
+      pinCount: count,
+      binding: "ssa",
+      locId: null,
+      hasValue: false,
+      commitVersion: this._baseState.get(baseId)?.baseCommitVersion ?? 0
+    });
+    return infos;
+  }
+  /**
+  * Take a memory snapshot with a label.
+  */
+  _debug_takeMemorySnapshot(label) {
+    this._memorySnapshots.push({
+      label,
+      timestamp: Date.now(),
+      stats: this._debug_getMemoryStats()
+    });
+  }
+  /**
+  * Get all memory snapshots.
+  */
+  _debug_getMemorySnapshots() {
+    return this._memorySnapshots.slice();
+  }
+  /**
+  * Clear all memory snapshots.
+  */
+  _debug_clearMemorySnapshots() {
+    this._memorySnapshots.length = 0;
+  }
+};
+for (const op of [
+  "sqrt",
+  "relu",
+  "exp",
+  "log",
+  "neg",
+  "abs",
+  "tanh",
+  "sigmoid",
+  "silu",
+  "sin",
+  "cos",
+  "rsqrt",
+  "floor",
+  "ceil",
+  "round",
+  "sign",
+  "isfinite",
+  "contiguous"
+]) RuntimeEngine.prototype[op] = function(a) {
+  return this._unaryOp(op, a);
+};
+for (const op of [
+  "gt",
+  "lt",
+  "ge",
+  "le",
+  "eq",
+  "ne"
+]) RuntimeEngine.prototype[op] = function(a, b) {
+  return this._binaryOp(op, a, b);
+};
+var DisposedTensorError = class extends Error {
+  name = "DisposedTensorError";
+};
+var Tensor2 = class {
+  engine;
+  inner;
+  engineTensor;
+  requiresGradValue;
+  gradNode = null;
+  gradValue = null;
+  retainGradValue = false;
+  constructor(engine, inner, handle, options) {
+    this.engine = engine;
+    this.inner = inner;
+    this.engineTensor = handle;
+    this.requiresGradValue = options?.requiresGrad ?? false;
+    handle.onDispose = () => {
+      inner.dispose();
+    };
+  }
+  get baseId() {
+    return this.inner.baseId;
+  }
+  get requiresGrad() {
+    return this.requiresGradValue;
+  }
+  get grad() {
+    return this.gradValue;
+  }
+  get shape() {
+    return this.inner.shape.slice();
+  }
+  get device() {
+    return this.inner.device;
+  }
+  get dtype() {
+    return this.inner.dtype;
+  }
+  /**
+  * Check if this tensor will retain its gradient during backward.
+  */
+  get isRetainGrad() {
+    return this.retainGradValue;
+  }
+  /**
+  * Request that gradient be retained on this tensor during backward.
+  *
+  * By default, gradients are only stored on leaf tensors (those without
+  * a grad_fn). Calling retainGrad() on a non-leaf tensor will cause its
+  * gradient to be stored during backward.
+  *
+  * @throws Error if tensor does not require gradients
+  */
+  retainGrad() {
+    this.ensureNotDisposed();
+    if (!this.requiresGradValue) throw new Error("retainGrad() can only be called on tensors that require gradients");
+    this.retainGradValue = true;
+  }
+  /**
+  * Set whether this tensor requires gradient computation.
+  * Like PyTorch's tensor.requires_grad_(bool).
+  * Returns this tensor for chaining.
+  */
+  requires_grad_(value = true) {
+    this.ensureNotDisposed();
+    this.requiresGradValue = value;
+    return this;
+  }
+  zeroGrad() {
+    this.ensureNotDisposed();
+    if (this.gradValue) this.gradValue.dispose();
+    this.gradValue = null;
+  }
+  toArray() {
+    this.ensureNotDisposed();
+    return this.inner.toArray();
+  }
+  async cpu() {
+    return this.engine.cpu(this);
+  }
+  async item() {
+    return this.engine.item(this);
+  }
+  backward(grad) {
+    return this.engine.backward(this, grad);
+  }
+  keep() {
+    this.engine.keep(this);
+  }
+  dispose() {
+    this.engine.dispose(this);
+  }
+  [Symbol.toPrimitive]() {
+    this.ensureNotDisposed();
+    throw new Error("Tensor cannot be implicitly converted to a primitive");
+  }
+  valueOf() {
+    this.ensureNotDisposed();
+    throw new Error("Tensor cannot be implicitly converted to a primitive");
+  }
+  toString() {
+    this.ensureNotDisposed();
+    return `Tensor(shape=[${this.shape.join(", ")}], device=${this.device}, baseId=${this.baseId})`;
+  }
+  view(shape) {
+    return this.engine.view(this, shape);
+  }
+  reshape(shape) {
+    return this.engine.reshape(this, shape);
+  }
+  squeeze(dim) {
+    return this.engine.squeeze(this, dim);
+  }
+  unsqueeze(dim) {
+    return this.engine.unsqueeze(this, dim);
+  }
+  sub(other, options) {
+    return this.engine.sub(this, other, options);
+  }
+  matmul(other) {
+    return this.engine.matmul(this, other);
+  }
+  gelu(options) {
+    return this.engine.gelu(this, options);
+  }
+  softplus() {
+    return this.engine.softplus(this);
+  }
+  fmod(other) {
+    return this.engine.fmod(this, other);
+  }
+  clamp(min2, max2) {
+    return this.engine.clamp(this, min2, max2);
+  }
+  expand(shape) {
+    return this.engine.expand(this, shape);
+  }
+  transpose(options) {
+    return this.engine.transpose(this, options);
+  }
+  /**
+  * Permute dimensions according to the given order.
+  * Returns a view (no data copy).
+  */
+  permute(dims) {
+    return this.engine.permute(this, dims);
+  }
+  /**
+  * Return a contiguous tensor. If already contiguous, returns self.
+  * Otherwise materializes to a new contiguous buffer.
+  */
+  contiguous() {
+    return this.engine.contiguous(this);
+  }
+  /**
+  * Select a contiguous sub-range along one dimension.
+  * Returns a view (zero cost, no data copy).
+  */
+  narrow(dim, start, length) {
+    return this.engine.narrow(this, dim, start, length);
+  }
+  /**
+  * Split tensor into approximately equal chunks along a dimension.
+  * Returns views (zero cost, no data copy). Last chunk may be smaller.
+  */
+  chunk(chunks, dim = 0) {
+    return this.engine.chunk(this, chunks, dim);
+  }
+  /**
+  * Split tensor into pieces of given size (or list of sizes) along a dimension.
+  * Returns views (zero cost, no data copy).
+  */
+  split(splitSizeOrSections, dim = 0) {
+    return this.engine.split(this, splitSizeOrSections, dim);
+  }
+  /**
+  * Cast tensor to a different dtype.
+  * Returns a new tensor with the specified dtype.
+  */
+  toDtype(dtype) {
+    return this.engine.toDtype(this, dtype);
+  }
+  /**
+  * Convenience method to cast to f16 (half precision).
+  */
+  half() {
+    return this.toDtype("f16");
+  }
+  /**
+  * Convenience method to cast to f32 (single precision).
+  */
+  float() {
+    return this.toDtype("f32");
+  }
+  /**
+  * Convenience method to cast to i32 (signed integer).
+  */
+  int() {
+    return this.toDtype("i32");
+  }
+  /**
+  * Transfer to a different device (lazy).
+  */
+  to(device) {
+    return this.engine.to(this, device);
+  }
+  /**
+  * Transfer to a different device and force immediately.
+  */
+  async toNow(device) {
+    return this.engine.toNow(this, device);
+  }
+  sum(options) {
+    return this.engine.sum(this, options);
+  }
+  max(options) {
+    return this.engine.max(this, options);
+  }
+  min(options) {
+    return this.engine.min(this, options);
+  }
+  mean(options) {
+    return this.engine.mean(this, options);
+  }
+  argmax(options) {
+    return this.engine.argmax(this, options);
+  }
+  argmin(options) {
+    return this.engine.argmin(this, options);
+  }
+  variance(options) {
+    return this.engine.variance(this, options);
+  }
+  std(options) {
+    return this.engine.std(this, options);
+  }
+  tril(k = 0) {
+    return this.engine.tril(this, k);
+  }
+  triu(k = 0) {
+    return this.engine.triu(this, k);
+  }
+  softmax(dim) {
+    return this.engine.softmax(this, dim);
+  }
+  /**
+  * Layer normalization along the last dimension.
+  * layernorm(x, weight, bias, eps) = (x - mean) / sqrt(var + eps) * weight + bias
+  */
+  layernorm(weight, bias, eps = 1e-5) {
+    return this.engine.layernorm(this, weight, bias, eps);
+  }
+  /**
+  * RMS normalization along the last dimension.
+  * rmsnorm(x, weight, eps) = x / rms(x) * weight
+  */
+  rmsnorm(weight, eps = 1e-5) {
+    return this.engine.rmsnorm(this, weight, eps);
+  }
+  gather(index, options) {
+    return this.engine.gather(this, index, options);
+  }
+  scatterAdd(index, src, options) {
+    return this.engine.scatterAdd(this, index, src, options);
+  }
+  /**
+  * Returns a new tensor detached from the computation graph.
+  * The result will never require grad and will not participate in autograd.
+  * Useful for stopping gradient flow, e.g., in LoRA training where base model
+  * outputs should not contribute to the autograd graph.
+  */
+  detach() {
+    return this.engine.detach(this);
+  }
+  /**
+  * Copy src values into this tensor in-place.
+  * Returns this tensor (same object) with updated values.
+  */
+  copy_(src) {
+    return this.engine.copy_(this, src);
+  }
+  /**
+  * Add src values to this tensor in-place.
+  * Returns this tensor (same object) with updated values.
+  */
+  add_(src) {
+    return this.engine.add_(this, src);
+  }
+  /**
+  * Zero out this tensor in-place.
+  * Returns this tensor (same object) with all zeros.
+  */
+  zero_() {
+    return this.engine.zero_(this);
+  }
+  /**
+  * Fill this tensor with a scalar value in-place.
+  * Returns this tensor (same object) with all values set to the given value.
+  */
+  fill_(value) {
+    return this.engine.fill_(this, value);
+  }
+  /**
+  * Multiply this tensor by a scalar in-place.
+  * Returns this tensor (same object) with values scaled.
+  */
+  mul_(value) {
+    return this.engine.mul_(this, value);
+  }
+  _unwrap() {
+    return this.inner;
+  }
+  _engine() {
+    return this.engine;
+  }
+  _engineTensor() {
+    return this.engineTensor;
+  }
+  _runtimeTensor() {
+    return this.inner;
+  }
+  _gradNode() {
+    return this.gradNode;
+  }
+  _setGradNode(node) {
+    this.gradNode = node;
+  }
+  _setGrad(value) {
+    if (this.gradValue && this.gradValue !== value) this.gradValue.dispose();
+    this.gradValue = value;
+  }
+  /**
+  * Check if this tensor has been disposed.
+  */
+  get disposed() {
+    return this.engineTensor.disposed;
+  }
+  /**
+  * Alias for disposed property.
+  */
+  get isDisposed() {
+    return this.engineTensor.disposed;
+  }
+  _ensureNotDisposed() {
+    this.ensureNotDisposed();
+  }
+  ensureNotDisposed() {
+    if (this.engineTensor.disposed) throw new DisposedTensorError("Tensor has been disposed");
+  }
+};
+for (const op of [
+  "sqrt",
+  "relu",
+  "exp",
+  "log",
+  "neg",
+  "abs",
+  "tanh",
+  "sigmoid",
+  "silu",
+  "sin",
+  "cos",
+  "rsqrt",
+  "floor",
+  "ceil",
+  "round",
+  "sign",
+  "isfinite"
+]) Tensor2.prototype[op] = function() {
+  return this._engine()[op](this);
+};
+for (const op of [
+  "add",
+  "mul",
+  "div",
+  "pow"
+]) Tensor2.prototype[op] = function(other) {
+  return this._engine()[op](this, other);
+};
+for (const op of [
+  "gt",
+  "lt",
+  "ge",
+  "le",
+  "eq",
+  "ne"
+]) Tensor2.prototype[op] = function(other) {
+  return this._engine()[op](this, other);
+};
+init_registry$2();
+function autocastImpl(torch2, fn, options) {
+  const deviceType = options?.deviceType ?? (torch2.runtime.currentDefaultDevice === "webgpu" ? "webgpu" : "cpu");
+  pushAutocast(torch2._getAutocastContext(), {
+    enabled: options?.enabled ?? true,
+    policy: options?.policy ?? DEFAULT_AMP_POLICY,
+    deviceType
+  });
+  torch2.runtime.setAutocastContext(torch2._getAutocastContext());
+  try {
+    return fn();
+  } finally {
+    popAutocast(torch2._getAutocastContext());
+    torch2.runtime.setAutocastContext(torch2._getAutocastContext().configStack.length > 0 ? torch2._getAutocastContext() : null);
+  }
+}
+async function autocastAsyncImpl(torch2, fn, options) {
+  const deviceType = options?.deviceType ?? (torch2.runtime.currentDefaultDevice === "webgpu" ? "webgpu" : "cpu");
+  pushAutocast(torch2._getAutocastContext(), {
+    enabled: options?.enabled ?? true,
+    policy: options?.policy ?? DEFAULT_AMP_POLICY,
+    deviceType
+  });
+  torch2.runtime.setAutocastContext(torch2._getAutocastContext());
+  try {
+    return await fn();
+  } finally {
+    popAutocast(torch2._getAutocastContext());
+    torch2.runtime.setAutocastContext(torch2._getAutocastContext().configStack.length > 0 ? torch2._getAutocastContext() : null);
+  }
+}
+function savedTensorHooksImpl(torch2, packHook, unpackHook, fn) {
+  torch2._savedTensorHooksStack.push({
+    packHook,
+    unpackHook
+  });
+  try {
+    return fn();
+  } finally {
+    torch2._savedTensorHooksStack.pop();
+  }
+}
+function autocastCastImpl(torch2, a, targetDtype) {
+  if (a.dtype === targetDtype) return a;
+  const originalDtype = a.dtype;
+  const inner = torch2.runtime.cast(a._unwrap(), targetDtype);
+  return torch2._wrapWithGrad(inner, [a], (grad, _getSaved) => {
+    if (grad.dtype === originalDtype) return [grad];
+    const target = promoteDtype(grad.dtype, originalDtype);
+    if (target === grad.dtype) return [grad];
+    return [torch2.runtime.cast(grad, target)];
+  });
+}
+function applyAutocastImpl(torch2, op, inputs) {
+  const rule = OP_DTYPE_RULES[op];
+  if (torch2._getAutocastContext().current.enabled) {
+    const policy = torch2._getAutocastContext().current.policy;
+    const isF16Eligible = rule && rule.category === "f16_eligible" || F16_ELIGIBLE_OPS.has(op);
+    const isF32Required = rule && rule.category === "f32_required" || F32_REQUIRED_OPS.has(op);
+    if (isF16Eligible && policy.computeDtype === "f16") inputs = inputs.map((t) => t.dtype === "f32" ? autocastCastImpl(torch2, t, "f16") : t);
+    if (isF32Required) inputs = inputs.map((t) => t.dtype === "f16" ? autocastCastImpl(torch2, t, "f32") : t);
+  }
+  if (rule && rule.category === "promote_inputs" && inputs.length >= 2) {
+    const [a, b] = inputs;
+    if (a.dtype !== b.dtype) {
+      const target = promoteDtype(a.dtype, b.dtype);
+      return [
+        a.dtype === target ? a : autocastCastImpl(torch2, a, target),
+        b.dtype === target ? b : autocastCastImpl(torch2, b, target),
+        ...inputs.slice(2)
+      ];
+    }
+  }
+  return inputs;
+}
+init_shape();
+init_storage_tracker();
+async function collectAndForceSavedTensors(torch2, ordered) {
+  const allUnpackedTensors = /* @__PURE__ */ new Map();
+  torch2._inCheckpointRecompute = true;
+  try {
+    for (let i = ordered.length - 1; i >= 0; i -= 1) {
+      const node = ordered[i];
+      for (const slot of node.savedSlots) torch2.runtime._debug_useSavedTensor(slot.record);
+      const unpackedTensors = [];
+      for (const slot of node.savedSlots) {
+        const tensor = slot.unpackHook(slot.packed);
+        unpackedTensors.push(tensor);
+      }
+      allUnpackedTensors.set(node, unpackedTensors);
+    }
+  } finally {
+    torch2._inCheckpointRecompute = false;
+  }
+  const allPending = [];
+  for (const tensors of allUnpackedTensors.values()) for (const t of tensors) allPending.push(t._unwrap());
+  if (allPending.length > 0) await torch2.runtime.forceAllMerged(...allPending);
+  return allUnpackedTensors;
+}
+async function runBackwardFunctions(torch2, ordered, gradMap, allUnpackedTensors) {
+  for (let i = ordered.length - 1; i >= 0; i -= 1) {
+    const node = ordered[i];
+    const gradOutTensor = gradMap.get(node.output);
+    if (!gradOutTensor) continue;
+    const unpackedTensors = allUnpackedTensors.get(node) || [];
+    const getSaved = (idx) => {
+      if (idx >= unpackedTensors.length) throw new Error(`No saved tensor at index ${idx}`);
+      return unpackedTensors[idx];
+    };
+    for (const hook of torch2._backwardDispatchHooks) hook({
+      output: node.output,
+      inputs: node.inputs,
+      label: node.label
+    });
+    torch2.runtime.startIntermediateTracking();
+    let gradsIn;
+    try {
+      gradsIn = node.backward(gradOutTensor, getSaved);
+    } catch (_e) {
+      torch2.runtime.stopIntermediateTracking();
+      await torch2.runtime.force(gradOutTensor);
+      torch2.runtime.startIntermediateTracking();
+      gradsIn = node.backward(gradOutTensor, getSaved);
+    }
+    const trackedIntermediates = torch2.runtime.stopIntermediateTracking();
+    const keepSet = new Set(gradsIn.filter((g) => g !== null));
+    for (const tensor of trackedIntermediates) if (!keepSet.has(tensor) && !tensor.disposed) tensor.dispose();
+    const usedGradIns = /* @__PURE__ */ new Set();
+    const unusedGradIns = [];
+    for (let idx = 0; idx < node.inputs.length; idx += 1) {
+      const input = node.inputs[idx];
+      const gradIn = gradsIn[idx];
+      if (!gradIn) continue;
+      if (!input.requiresGrad) {
+        unusedGradIns.push(gradIn);
+        continue;
+      }
+      usedGradIns.add(gradIn);
+      const existing = gradMap.get(input);
+      if (existing) {
+        const accumulated = torch2.runtime.add(existing, gradIn);
+        gradMap.set(input, accumulated);
+      } else gradMap.set(input, gradIn);
+    }
+    for (const g of unusedGradIns) if (!g.disposed && !usedGradIns.has(g)) g.dispose();
+  }
+}
+function disposeCheckpointTensors(ordered, allUnpackedTensors, leafTensors) {
+  const protectedTensors = /* @__PURE__ */ new Set();
+  for (const t of leafTensors) protectedTensors.add(t);
+  const forwardOutputs = /* @__PURE__ */ new Set();
+  for (const node of ordered) forwardOutputs.add(node.output);
+  for (const node of ordered) for (const input of node.inputs) if (!forwardOutputs.has(input)) protectedTensors.add(input);
+  for (const [node, tensors] of allUnpackedTensors.entries()) for (let idx = 0; idx < tensors.length; idx++) {
+    const unpacked = tensors[idx];
+    if (unpacked === node.savedSlots[idx]?.packed) ;
+    else if (unpacked.isDisposed) ;
+    else if (protectedTensors.has(unpacked)) ;
+    else unpacked.dispose();
+  }
+  allUnpackedTensors.clear();
+}
+function cleanupAutogradGraph(torch2, ordered, gradMap) {
+  const forwardIntermediates = /* @__PURE__ */ new Set();
+  for (const node of ordered) forwardIntermediates.add(node.output);
+  const preserved = /* @__PURE__ */ new Set();
+  for (const [tensor, _grad] of gradMap) if (tensor.requiresGrad && !tensor._gradNode()) preserved.add(tensor);
+  for (const node of ordered) for (const input of node.inputs) if (!forwardIntermediates.has(input) && !torch2._compileCreatedTensors.has(input)) preserved.add(input);
+  const toDispose = /* @__PURE__ */ new Set();
+  for (const node of ordered) if (!preserved.has(node.output)) toDispose.add(node.output);
+  for (const node of ordered) {
+    for (const slot of node.savedSlots) {
+      const savedTensor = slot.packed;
+      if (savedTensor && typeof savedTensor.dispose === "function") {
+        if (!preserved.has(savedTensor) && !savedTensor.disposed) toDispose.add(savedTensor);
+      }
+    }
+    node.savedSlots.length = 0;
+    node.output._setGradNode(null);
+    node.inputs.length = 0;
+  }
+  for (const tensor of toDispose) if (!tensor.disposed) tensor.dispose();
+}
+async function backwardImpl(torch2, a, grad) {
+  torch2._assertUsable(a);
+  if (grad) {
+    torch2._assertUsable(grad);
+    if (!shapesEqual(grad.shape, a.shape)) throw new Error("backward grad shape mismatch");
+  }
+  return torch2._runEntryPoint(async () => {
+    const tidyMode = new TidyDispatchMode();
+    torch2.runtime.pushDispatchMode(tidyMode);
+    try {
+      return await torch2.runtime.runWithAsyncScope(async () => {
+        const seed = grad ? grad._unwrap() : torch2._seedGrad(a);
+        const gradMap = /* @__PURE__ */ new Map();
+        gradMap.set(a, seed);
+        const ordered = [];
+        const visited = /* @__PURE__ */ new Set();
+        const visit = (node) => {
+          if (visited.has(node)) return;
+          for (const input of node.inputs) {
+            const inputNode = input._gradNode();
+            if (inputNode) visit(inputNode);
+          }
+          visited.add(node);
+          ordered.push(node);
+        };
+        const rootNode = a._gradNode();
+        if (rootNode) visit(rootNode);
+        const tensorsToForce = [];
+        if (!seed.isMaterialized()) tensorsToForce.push(seed);
+        for (const node of ordered) for (const input of node.inputs) {
+          const rt = input._unwrap();
+          if (!rt.disposed && !rt.isMaterialized()) tensorsToForce.push(rt);
+        }
+        if (tensorsToForce.length > 0) await torch2.runtime.forceAllMerged(...tensorsToForce);
+        const allUnpackedTensors = await collectAndForceSavedTensors(torch2, ordered);
+        await runBackwardFunctions(torch2, ordered, gradMap, allUnpackedTensors);
+        const leafTensors = /* @__PURE__ */ new Set();
+        const retainTensors = /* @__PURE__ */ new Set();
+        for (const [tensor] of gradMap) {
+          if (tensor.requiresGrad && !tensor._gradNode()) leafTensors.add(tensor);
+          if (tensor.isRetainGrad) retainTensors.add(tensor);
+        }
+        disposeCheckpointTensors(ordered, allUnpackedTensors, leafTensors);
+        const allGrads = [...gradMap.values()].filter((g) => !g.isMaterialized() && !g.disposed);
+        if (allGrads.length > 0) await torch2.runtime.forceAllMerged(...allGrads);
+        storageTracker.destroyUnreachable();
+        for (const [tensor, gradTensor] of gradMap) if (leafTensors.has(tensor) || retainTensors.has(tensor)) {
+          const gradWrapper = torch2._wrap(gradTensor, false);
+          torch2.keep(gradWrapper);
+          tensor._setGrad(gradWrapper);
+        }
+        cleanupAutogradGraph(torch2, ordered, gradMap);
+      });
+    } finally {
+      torch2.runtime.popDispatchMode();
+      tidyMode.disposeNonEscaped();
+      storageTracker.destroyUnreachable();
+    }
+  });
+}
+init_shape();
+function softmaxImpl(torch2, a, dim) {
+  torch2._assertUsable(a);
+  const [castA] = applyAutocastImpl(torch2, "softmax", [a]);
+  const rank2 = castA.shape.length;
+  const normalizedDim = dim < 0 ? dim + rank2 : dim;
+  if (normalizedDim < 0 || normalizedDim >= rank2) throw new Error(`softmax: dim ${dim} out of range for tensor of rank ${rank2}`);
+  const maxResult = torch2.runtime.max(castA._unwrap(), {
+    dim: normalizedDim,
+    keepdim: true
+  });
+  if (typeof maxResult === "number") throw new Error("softmax: max with keepdim=true should return tensor");
+  const shifted = torch2.runtime.sub(castA._unwrap(), maxResult);
+  const exps = torch2.runtime.exp(shifted);
+  const sumResult = torch2.runtime.sum(exps, {
+    dim: normalizedDim,
+    keepdim: true
+  });
+  if (typeof sumResult === "number") throw new Error("softmax: sum with keepdim=true should return tensor");
+  const result = torch2.runtime.div(exps, sumResult);
+  const tensorsToSave = a.requiresGrad ? [castA] : [];
+  return torch2._wrapWithGrad(result, [a], (grad, getSaved) => {
+    const savedA = getSaved(0);
+    const savedMax = torch2.runtime.max(savedA._unwrap(), {
+      dim: normalizedDim,
+      keepdim: true
+    });
+    if (typeof savedMax === "number") throw new Error("softmax backward: max with keepdim=true should return tensor");
+    const savedShifted = torch2.runtime.sub(savedA._unwrap(), savedMax);
+    const savedExps = torch2.runtime.exp(savedShifted);
+    const savedSum = torch2.runtime.sum(savedExps, {
+      dim: normalizedDim,
+      keepdim: true
+    });
+    if (typeof savedSum === "number") throw new Error("softmax backward: sum with keepdim=true should return tensor");
+    const softmaxResult = torch2.runtime.div(savedExps, savedSum);
+    const softmaxMulGrad = torch2.runtime.mul(softmaxResult, grad);
+    const sumGradResult = torch2.runtime.sum(softmaxMulGrad, {
+      dim: normalizedDim,
+      keepdim: true
+    });
+    if (typeof sumGradResult === "number") throw new Error("softmax backward: sum with keepdim=true should return tensor");
+    const gradMinusSum = torch2.runtime.sub(grad, sumGradResult);
+    return [torch2.runtime.mul(softmaxResult, gradMinusSum)];
+  }, tensorsToSave);
+}
+function crossEntropyFusedImpl(torch2, logits, targets) {
+  torch2._assertUsable(logits, targets);
+  let castLogits = logits;
+  if (logits.dtype === "f16") castLogits = autocastCastImpl(torch2, logits, "f32");
+  const config = {
+    batchSize: castLogits.shape[0],
+    vocabSize: castLogits.shape[1]
+  };
+  const result = torch2.runtime.fusedCrossEntropyForward(castLogits._unwrap(), targets._unwrap(), config);
+  const tensorsToSave = logits.requiresGrad ? [castLogits] : [];
+  const targetsInner = targets._unwrap();
+  return torch2._wrapWithGrad(result, [logits], (grad, getSaved) => {
+    const savedLogits = getSaved(0);
+    return [torch2.runtime.fusedCrossEntropyBackward(savedLogits._unwrap(), targetsInner, grad, config)];
+  }, tensorsToSave);
+}
+function rmsnormImpl(torch2, x, weight, eps = 1e-6) {
+  torch2._assertUsable(x, weight);
+  const xShape = x.shape;
+  const rank2 = xShape.length;
+  const normalizedDim = rank2 - 1;
+  const lastDimSize = xShape[xShape.length - 1];
+  const tensorsToSave = x.requiresGrad || weight.requiresGrad ? [x, weight] : [];
+  if (x.device === "webgpu") {
+    const config = {
+      numRows: sizeOf(xShape.slice(0, rank2 - 1)),
+      featureDim: lastDimSize,
+      eps
+    };
+    const result2 = torch2.runtime.fusedRMSNormForward(x._unwrap(), weight._unwrap(), config);
+    return torch2._wrapWithGrad(result2, [x, weight], (grad, getSaved) => {
+      const savedX = getSaved(0);
+      const savedWeight = getSaved(1);
+      return [torch2.runtime.fusedRMSNormBackwardGradX(grad, savedX._unwrap(), savedWeight._unwrap(), config), torch2.runtime.fusedRMSNormBackwardGradWeight(grad, savedX._unwrap(), savedWeight._unwrap(), config)];
+    }, tensorsToSave);
+  }
+  const xSq = torch2.runtime.mul(x._unwrap(), x._unwrap());
+  const meanSq = torch2.runtime.mean(xSq, {
+    dim: normalizedDim,
+    keepdim: true
+  });
+  if (typeof meanSq === "number") throw new Error("rmsnorm: mean with keepdim=true should return tensor");
+  const meanSqPlusEps = torch2.runtime.add(meanSq, eps);
+  const invRms = torch2.runtime.rsqrt(meanSqPlusEps);
+  const normalized = torch2.runtime.mul(x._unwrap(), invRms);
+  const result = torch2.runtime.mul(normalized, weight._unwrap());
+  return torch2._wrapWithGrad(result, [x, weight], (grad, getSaved) => {
+    return rmsnormBackwardImpl(torch2, grad, getSaved, normalizedDim, lastDimSize, rank2, eps);
+  }, tensorsToSave);
+}
+function rmsnormBackwardImpl(torch2, grad, getSaved, normalizedDim, _lastDimSize, rank2, eps = 1e-6) {
+  const savedX = getSaved(0);
+  const savedWeight = getSaved(1);
+  const x = savedX._unwrap();
+  const xSq = torch2.runtime.mul(x, x);
+  const meanSq = torch2.runtime.mean(xSq, {
+    dim: normalizedDim,
+    keepdim: true
+  });
+  if (typeof meanSq === "number") throw new Error("rmsnorm backward: mean should return tensor");
+  const meanSqPlusEps = torch2.runtime.add(meanSq, eps);
+  const invRms = torch2.runtime.rsqrt(meanSqPlusEps);
+  const normalized = torch2.runtime.mul(x, invRms);
+  const sumDims = Array.from({ length: rank2 - 1 }, (_, i) => i);
+  let gradWeightReduced = torch2.runtime.mul(grad, normalized);
+  for (let i = sumDims.length - 1; i >= 0; i--) {
+    const sumResult = torch2.runtime.sum(gradWeightReduced, {
+      dim: sumDims[i],
+      keepdim: false
+    });
+    if (typeof sumResult === "number") throw new Error("rmsnorm backward: sum for gradWeight should return tensor");
+    gradWeightReduced = sumResult;
+  }
+  const gradTimesWeight = torch2.runtime.mul(grad, savedWeight._unwrap());
+  const gradDotNorm = torch2.runtime.mul(gradTimesWeight, normalized);
+  const meanGradDotNorm = torch2.runtime.mean(gradDotNorm, {
+    dim: normalizedDim,
+    keepdim: true
+  });
+  if (typeof meanGradDotNorm === "number") throw new Error("rmsnorm backward: mean should return tensor");
+  return [torch2.runtime.mul(invRms, torch2.runtime.sub(gradTimesWeight, torch2.runtime.mul(normalized, meanGradDotNorm))), gradWeightReduced];
+}
+function scaledDotProductAttentionImpl(torch2, q, k, v, scale, isCausal = false) {
+  torch2._assertUsable(q, k, v);
+  const [batch, heads, seq, hd] = q.shape;
+  const actualScale = scale ?? 1 / Math.sqrt(hd);
+  const config = {
+    batchSize: batch,
+    numHeads: heads,
+    seqLen: seq,
+    headDim: hd,
+    scale: actualScale,
+    isCausal
+  };
+  if (q.device === "webgpu") {
+    const fwdResult = torch2.runtime.fusedAttentionForward(q._unwrap(), k._unwrap(), v._unwrap(), config);
+    const needsGrad = torch2.isGradEnabled() && (q.requiresGrad || k.requiresGrad || v.requiresGrad);
+    let tensorsToSave2 = [];
+    if (needsGrad) {
+      const logsumexp = torch2.runtime.extractAttentionLogsumexp(fwdResult, config);
+      const logsumexpRef = torch2.runtime.reshape(logsumexp, [
+        batch,
+        heads,
+        seq
+      ]);
+      const logsumexpTensor = torch2._wrap(logsumexpRef);
+      const outputRef = torch2.runtime.reshape(fwdResult, [
+        batch,
+        heads,
+        seq,
+        hd
+      ]);
+      tensorsToSave2 = [
+        q,
+        k,
+        v,
+        logsumexpTensor,
+        torch2._wrap(outputRef)
+      ];
+    }
+    return torch2._wrapWithGrad(fwdResult, [
+      q,
+      k,
+      v
+    ], (dO, getSaved) => {
+      const sQ = getSaved(0);
+      const sK = getSaved(1);
+      const sV = getSaved(2);
+      const sL = getSaved(3);
+      const sO = getSaved(4);
+      const bwdDQ = torch2.runtime.fusedAttentionBackward(sQ._unwrap(), sK._unwrap(), sV._unwrap(), sL._unwrap(), dO, sO._unwrap(), config);
+      return [
+        bwdDQ,
+        torch2.runtime.extractAttentionDK(bwdDQ, config),
+        torch2.runtime.extractAttentionDV(bwdDQ, config)
+      ];
+    }, tensorsToSave2);
+  }
+  const kT = torch2.runtime.transpose(k._unwrap(), {
+    dim0: 2,
+    dim1: 3
+  });
+  const scores = torch2.runtime.matmul(q._unwrap(), kT);
+  const scaleTensor = torch2.runtime.full([], actualScale, q.device);
+  const scaledScores = torch2.runtime.mul(scores, scaleTensor);
+  let finalScores;
+  if (isCausal) {
+    const negInf = torch2.runtime.full([
+      1,
+      1,
+      seq,
+      seq
+    ], -1e9, q.device);
+    const mask = torch2.runtime.triu(negInf, 1);
+    finalScores = torch2.runtime.add(scaledScores, mask);
+  } else finalScores = scaledScores;
+  const softmaxResult = softmaxImpl(torch2, torch2._wrap(finalScores), -1);
+  const output = torch2.runtime.matmul(softmaxResult._unwrap(), v._unwrap());
+  const tensorsToSave = q.requiresGrad || k.requiresGrad || v.requiresGrad ? [
+    q,
+    k,
+    v,
+    softmaxResult
+  ] : [];
+  return torch2._wrapWithGrad(output, [
+    q,
+    k,
+    v
+  ], (dO, getSaved) => {
+    const sQ = getSaved(0);
+    const sK = getSaved(1);
+    const sV = getSaved(2);
+    const sSoftmax = getSaved(3);
+    const attnT = torch2.runtime.transpose(sSoftmax._unwrap(), {
+      dim0: 2,
+      dim1: 3
+    });
+    const dV = torch2.runtime.matmul(attnT, dO);
+    const vT = torch2.runtime.transpose(sV._unwrap(), {
+      dim0: 2,
+      dim1: 3
+    });
+    const dAttn = torch2.runtime.matmul(dO, vT);
+    const dAttnTimesSoftmax = torch2.runtime.mul(dAttn, sSoftmax._unwrap());
+    const sumDAttnSoftmax = torch2.runtime.sum(dAttnTimesSoftmax, {
+      dim: -1,
+      keepdim: true
+    });
+    const dScoresSub = torch2.runtime.sub(dAttn, sumDAttnSoftmax);
+    const dScores = torch2.runtime.mul(sSoftmax._unwrap(), dScoresSub);
+    const scaleT = torch2.runtime.full([], actualScale, sQ.device);
+    const dScoresScaled = torch2.runtime.mul(dScores, scaleT);
+    const dQ = torch2.runtime.matmul(dScoresScaled, sK._unwrap());
+    const dScoresT = torch2.runtime.transpose(dScoresScaled, {
+      dim0: 2,
+      dim1: 3
+    });
+    return [
+      dQ,
+      torch2.runtime.matmul(dScoresT, sQ._unwrap()),
+      dV
+    ];
+  }, tensorsToSave);
+}
+function layernormImpl(torch2, x, weight, bias, eps = 1e-5) {
+  torch2._assertUsable(x, weight, bias);
+  const xShape = x.shape;
+  const rank2 = xShape.length;
+  const dim = -1;
+  const normalizedDim = dim + rank2;
+  const lastDimSize = xShape[xShape.length - 1];
+  const tensorsToSave = x.requiresGrad || weight.requiresGrad || bias.requiresGrad ? [
+    x,
+    weight,
+    bias
+  ] : [];
+  if (x.device === "webgpu") {
+    const config = {
+      numRows: sizeOf(xShape.slice(0, rank2 - 1)),
+      featureDim: lastDimSize,
+      eps
+    };
+    const result2 = torch2.runtime.fusedLayerNormForward(x._unwrap(), weight._unwrap(), bias._unwrap(), config);
+    return torch2._wrapWithGrad(result2, [
+      x,
+      weight,
+      bias
+    ], (grad, getSaved) => {
+      return layernormBackwardImpl(torch2, grad, getSaved, normalizedDim, lastDimSize, rank2, eps);
+    }, tensorsToSave);
+  }
+  const meanResult = torch2.runtime.mean(x._unwrap(), {
+    dim: normalizedDim,
+    keepdim: true
+  });
+  if (typeof meanResult === "number") throw new Error("layernorm: mean with keepdim=true should return tensor");
+  const centered = torch2.runtime.sub(x._unwrap(), meanResult);
+  const centeredSq = torch2.runtime.mul(centered, centered);
+  const varianceResult = torch2.runtime.mean(centeredSq, {
+    dim: normalizedDim,
+    keepdim: true
+  });
+  if (typeof varianceResult === "number") throw new Error("layernorm: variance mean with keepdim=true should return tensor");
+  const variancePlusEps = torch2.runtime.add(varianceResult, eps);
+  const std = torch2.runtime.sqrt(variancePlusEps);
+  const normalized = torch2.runtime.div(centered, std);
+  const scaled = torch2.runtime.mul(normalized, weight._unwrap());
+  const result = torch2.runtime.add(scaled, bias._unwrap());
+  return torch2._wrapWithGrad(result, [
+    x,
+    weight,
+    bias
+  ], (grad, getSaved) => {
+    return layernormBackwardImpl(torch2, grad, getSaved, normalizedDim, lastDimSize, rank2, eps);
+  }, tensorsToSave);
+}
+function layernormBackwardImpl(torch2, grad, getSaved, normalizedDim, lastDimSize, rank2, eps = 1e-5) {
+  const savedX = getSaved(0);
+  const savedWeight = getSaved(1);
+  let gradWeight;
+  let gradBias;
+  let gradX;
+  if (savedX.device === "webgpu") {
+    const config = {
+      numRows: sizeOf(savedX.shape.slice(0, rank2 - 1)),
+      featureDim: lastDimSize,
+      eps
+    };
+    gradX = torch2.runtime.fusedLayerNormBackwardGradX(grad, savedX._unwrap(), savedWeight._unwrap(), config);
+    const gradWeightTensor = torch2.runtime.fusedLayerNormBackwardGradWeightBias(grad, savedX._unwrap(), config);
+    gradWeight = gradWeightTensor;
+    gradBias = torch2.runtime.extractLnBwdGradBias(gradWeightTensor, lastDimSize);
+  } else {
+    const recomputeMean = torch2.runtime.mean(savedX._unwrap(), {
+      dim: normalizedDim,
+      keepdim: true
+    });
+    if (typeof recomputeMean === "number") throw new Error("layernorm backward: mean should return tensor");
+    const recomputeCentered = torch2.runtime.sub(savedX._unwrap(), recomputeMean);
+    const recomputeCenteredSq = torch2.runtime.mul(recomputeCentered, recomputeCentered);
+    const recomputeVariance = torch2.runtime.mean(recomputeCenteredSq, {
+      dim: normalizedDim,
+      keepdim: true
+    });
+    if (typeof recomputeVariance === "number") throw new Error("layernorm backward: variance mean should return tensor");
+    const recomputeVarPlusEps = torch2.runtime.add(recomputeVariance, eps);
+    const recomputeStd = torch2.runtime.sqrt(recomputeVarPlusEps);
+    const recomputeNormalized = torch2.runtime.div(recomputeCentered, recomputeStd);
+    const sumDims = Array.from({ length: rank2 - 1 }, (_, i) => i);
+    let gradBiasReduced = grad;
+    for (let i = sumDims.length - 1; i >= 0; i--) {
+      const sumResult = torch2.runtime.sum(gradBiasReduced, {
+        dim: sumDims[i],
+        keepdim: false
+      });
+      if (typeof sumResult === "number") throw new Error("layernorm backward: sum for gradBias should return tensor");
+      gradBiasReduced = sumResult;
+    }
+    gradBias = gradBiasReduced;
+    let gradWeightReduced = torch2.runtime.mul(grad, recomputeNormalized);
+    for (let i = sumDims.length - 1; i >= 0; i--) {
+      const sumResult = torch2.runtime.sum(gradWeightReduced, {
+        dim: sumDims[i],
+        keepdim: false
+      });
+      if (typeof sumResult === "number") throw new Error("layernorm backward: sum for gradWeight should return tensor");
+      gradWeightReduced = sumResult;
+    }
+    gradWeight = gradWeightReduced;
+    const gradNormalized = torch2.runtime.mul(grad, savedWeight._unwrap());
+    const gradCentered = torch2.runtime.div(gradNormalized, recomputeStd);
+    const gradNormCentered = torch2.runtime.mul(gradNormalized, recomputeCentered);
+    const sumGradNormCentered = torch2.runtime.sum(gradNormCentered, {
+      dim: normalizedDim,
+      keepdim: true
+    });
+    if (typeof sumGradNormCentered === "number") throw new Error("layernorm backward: sum should return tensor");
+    const varStd = torch2.runtime.mul(recomputeVarPlusEps, recomputeStd);
+    const gradVariance = torch2.runtime.mul(-0.5, torch2.runtime.div(sumGradNormCentered, varStd));
+    const gradCenteredFromVar = torch2.runtime.div(torch2.runtime.mul(torch2.runtime.mul(2, gradVariance), recomputeCentered), lastDimSize);
+    const totalGradCentered = torch2.runtime.add(gradCentered, gradCenteredFromVar);
+    const sumTotalGradCentered = torch2.runtime.sum(totalGradCentered, {
+      dim: normalizedDim,
+      keepdim: true
+    });
+    if (typeof sumTotalGradCentered === "number") throw new Error("layernorm backward: sum should return tensor");
+    const gradMean = torch2.runtime.neg(torch2.runtime.div(sumTotalGradCentered, lastDimSize));
+    gradX = torch2.runtime.add(totalGradCentered, gradMean);
+  }
+  return [
+    gradX,
+    gradWeight,
+    gradBias
+  ];
+}
+init_webgpu();
+init_buffer_pool();
+init_shape();
+init_storage_tracker();
+init_registry$2();
+var Torchlette = class {
+  runtime;
+  autocastContext;
+  inCompileRegion = false;
+  /** Tensors created inside compile regions — eligible for disposal after backward */
+  _compileCreatedTensors = /* @__PURE__ */ new WeakSet();
+  /** Stack of saved tensor hooks for checkpointing (§10) */
+  _savedTensorHooksStack = [];
+  /** Label to capture on subsequent autograd nodes (for backward attribution) */
+  _currentNodeLabel = null;
+  /** Depth counter for noGrad context. When > 0, autograd recording is disabled. */
+  _noGradDepth = 0;
+  /** When true, _wrap skips markEscaped — used during checkpoint recomputation
+  *  so recomputed RuntimeTensors stay tracked (not escaped) in TidyDispatchMode. */
+  _inCheckpointRecompute = false;
+  /** Hooks fired before each backward op */
+  _backwardDispatchHooks = [];
+  constructor(backendName, options) {
+    if (options?.memoryLimitBytes !== void 0) setGPUMemoryLimit(options.memoryLimitBytes);
+    this.runtime = new RuntimeEngine(backendName, {
+      enableFusion: options?.enableFusion ?? false,
+      enableEarlyRelease: options?.enableEarlyRelease ?? false,
+      enableCheckpointSegmentation: options?.enableCheckpointSegmentation ?? false,
+      enableTrueSegmentation: options?.enableTrueSegmentation ?? false
+    });
+    this.autocastContext = createAutocastContext();
+  }
+  /**
+  * Get the current GPU memory limit in bytes.
+  */
+  static getGPUMemoryLimit() {
+    return getGPUMemoryLimit();
+  }
+  /**
+  * Set the GPU memory limit in bytes.
+  * @param limitBytes Maximum memory limit (default: 10GB)
+  */
+  static setGPUMemoryLimit(limitBytes) {
+    setGPUMemoryLimit(limitBytes);
+  }
+  /**
+  * Get GPU memory statistics.
+  */
+  static getGPUMemoryStats() {
+    return getGPUMemoryStats();
+  }
+  /**
+  * Enable or disable fusion optimizations.
+  */
+  setFusionEnabled(enabled) {
+    this.runtime.setFusionEnabled(enabled);
+  }
+  /**
+  * Check if fusion is enabled.
+  */
+  isFusionEnabled() {
+    return this.runtime.isFusionEnabled();
+  }
+  /**
+  * Options for compile().
+  */
+  static CompileOptions;
+  /**
+  * Compile a function for optimized execution.
+  *
+  * Inside compile regions, operations are traced and optimized with:
+  * - Elementwise fusion (§15.1)
+  * - CSE elimination
+  * - DCE elimination
+  * - Matmul autotuning (when options.autotune is true)
+  *
+  * @param fn Function to compile (must be synchronous)
+  * @param options Optional compile options (e.g., { autotune: true })
+  * @returns Compiled function that can be called repeatedly
+  */
+  compile(fn, options) {
+    const enableAutotune = options?.autotune ?? false;
+    const compiledFn = this.runtime.compile((..._args) => {
+    });
+    return (...args) => {
+      this.inCompileRegion = true;
+      const wasFusionEnabled = this.runtime.isFusionEnabled();
+      const wasAutotuneEnabled = isAutotuneEnabled();
+      this.runtime.setFusionEnabled(true);
+      if (enableAutotune) setAutotuneEnabled(true);
+      try {
+        compiledFn();
+        const result = this.tidy(() => fn(...args));
+        this._compileCreatedTensors.delete(result);
+        return result;
+      } finally {
+        this.runtime.setFusionEnabled(wasFusionEnabled);
+        if (!enableAutotune) setAutotuneEnabled(wasAutotuneEnabled);
+        this.inCompileRegion = false;
+      }
+    };
+  }
+  /**
+  * Check if autocast is currently enabled.
+  */
+  get isAutocastEnabled() {
+    return this.autocastContext.current.enabled;
+  }
+  /**
+  * Get the current autocast configuration.
+  */
+  get currentAutocastConfig() {
+    return { ...this.autocastContext.current };
+  }
+  setBackend(name) {
+    this.runtime.setBackend(name);
+  }
+  /**
+  * Set the default device for tensor creation (like PyTorch's torch.set_default_device).
+  * All tensor factory calls (zeros, randn, tensorFromArray, etc.) and nn.Module
+  * constructors will use this device when no explicit device is provided.
+  */
+  setDefaultDevice(device) {
+    this.runtime.setBackend(device);
+  }
+  /**
+  * Get the current default device.
+  */
+  getDefaultDevice() {
+    return this.runtime.currentDefaultDevice;
+  }
+  autocast(fn, options) {
+    return autocastImpl(this, fn, options);
+  }
+  async autocastAsync(fn, options) {
+    return autocastAsyncImpl(this, fn, options);
+  }
+  saved_tensors_hooks(packHook, unpackHook, fn) {
+    return savedTensorHooksImpl(this, packHook, unpackHook, fn);
+  }
+  /**
+  * Get the current saved tensor hooks context (if any).
+  * Returns the topmost hooks on the stack, or null if none.
+  */
+  _getSavedTensorHooks() {
+    return this._savedTensorHooksStack.length > 0 ? this._savedTensorHooksStack[this._savedTensorHooksStack.length - 1] : null;
+  }
+  /** Set an opaque label captured on subsequent autograd nodes. */
+  setNodeLabel(label) {
+    this._currentNodeLabel = label;
+  }
+  /**
+  * Execute `fn` with autograd recording disabled.
+  * Inside noGrad, ops never create grad nodes or save tensors for backward,
+  * even when inputs have requiresGrad=true. Matches PyTorch's torch.no_grad().
+  */
+  noGrad(fn) {
+    this._noGradDepth++;
+    try {
+      return fn();
+    } finally {
+      this._noGradDepth--;
+    }
+  }
+  /** Returns true if autograd recording is currently enabled. */
+  isGradEnabled() {
+    return this._noGradDepth === 0;
+  }
+  /** Register a hook that fires before each backward op. Returns unregister function. */
+  onBackwardDispatch(hook) {
+    this._backwardDispatchHooks.push(hook);
+    return () => {
+      const idx = this._backwardDispatchHooks.indexOf(hook);
+      if (idx >= 0) this._backwardDispatchHooks.splice(idx, 1);
+    };
+  }
+  /**
+  * Get the autocast context for use in compiled regions.
+  * This is used internally for select-gated commit logic.
+  */
+  _getAutocastContext() {
+    return this.autocastContext;
+  }
+  tensorFromArray(values, shape, options) {
+    return this._wrap(this.runtime.tensorFromArray(values, shape, options?.device), options?.requiresGrad ?? false);
+  }
+  rand(shape, options) {
+    return this._wrap(this.runtime.rand(shape, options?.device), options?.requiresGrad ?? false);
+  }
+  randn(shape, options) {
+    return this._wrap(this.runtime.randn(shape, options?.device), options?.requiresGrad ?? false);
+  }
+  bernoulli(shape, p = 0.5, options) {
+    if (p < 0 || p > 1) throw new Error(`Bernoulli probability must be between 0 and 1, got ${p}`);
+    return this._wrap(this.runtime.bernoulli(shape, p, options?.device), options?.requiresGrad ?? false);
+  }
+  zeros(shape, options) {
+    return this._wrap(this.runtime.zeros(shape, options?.device), options?.requiresGrad ?? false);
+  }
+  ones(shape, options) {
+    return this.full(shape, 1, options);
+  }
+  full(shape, fillValue, options) {
+    return this._wrap(this.runtime.full(shape, fillValue, options?.device), options?.requiresGrad ?? false);
+  }
+  arange(end, options) {
+    const start = options?.start ?? 0;
+    const step2 = options?.step ?? 1;
+    return this._wrap(this.runtime.arange(end, start, step2, options?.device), options?.requiresGrad ?? false);
+  }
+  tril(a, k = 0) {
+    this._assertUsable(a);
+    return this._wrap(this.runtime.tril(a._unwrap(), k), false);
+  }
+  triu(a, k = 0) {
+    this._assertUsable(a);
+    return this._wrap(this.runtime.triu(a._unwrap(), k), false);
+  }
+  _autocastCast(a, targetDtype) {
+    return autocastCastImpl(this, a, targetDtype);
+  }
+  _applyAutocast(op, inputs) {
+    return applyAutocastImpl(this, op, inputs);
+  }
+  /** Generic dispatcher for registry-driven unary ops. */
+  _dispatchUnary(opName, a) {
+    const def = OP_REGISTRY[opName];
+    this._assertUsable(a);
+    const castA = def.autocast ? this._applyAutocast(def.autocast, [a])[0] : a;
+    const inner = this.runtime[opName](castA._unwrap());
+    if (!def.grad) return this._wrap(inner);
+    const needsSave = def.needsSave !== false;
+    const tensorsToSave = needsSave && a.requiresGrad ? [castA] : [];
+    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
+      return [def.grad?.(this.runtime, grad, needsSave ? getSaved(0)?._unwrap() : void 0) ?? null];
+    }, tensorsToSave);
+  }
+  /**
+  * Shared dispatch for binary ops that accept Tensor|number operands.
+  * Handles tensor+tensor (with autocast) and tensor+scalar branches,
+  * including sumToShape gradient reduction and tensor saving for backward.
+  *
+  * @param ttGrad - Tensor+Tensor grad: return [gradA, gradB] (before sumToShape)
+  * @param tsGrad - Tensor+Scalar grad: return [gradTensor] (before sumToShape).
+  *                 If omitted, gradient passes through unchanged.
+  * @param save - Whether to save input tensors for backward (for getSaved access in grad)
+  */
+  _dispatchBinary(opName, a, b, ttGrad, tsGrad, save = false) {
+    const tensors = [a, b].filter((x) => typeof x !== "number");
+    this._assertUsable(...tensors);
+    const rt = this.runtime;
+    if (typeof a !== "number" && typeof b !== "number") {
+      [a, b] = this._applyAutocast(opName, [a, b]);
+      const inner2 = rt[opName](a._unwrap(), b._unwrap());
+      const aShape = a.shape, bShape = b.shape;
+      const tensorsToSave2 = save && (a.requiresGrad || b.requiresGrad) ? [a, b] : [];
+      return this._wrapWithGrad(inner2, [a, b], (grad, getSaved) => {
+        const [gA, gB] = ttGrad(grad, getSaved);
+        return [this._sumToShape(gA, aShape), this._sumToShape(gB, bShape)];
+      }, tensorsToSave2);
+    }
+    const tensorInput = typeof a !== "number" ? a : b;
+    const scalarVal = typeof a === "number" ? a : b;
+    const scalarIsA = typeof a === "number";
+    const inner = rt[opName](typeof a === "number" ? a : a._unwrap(), typeof b === "number" ? b : b._unwrap());
+    const tensorsToSave = save && tensorInput.requiresGrad ? [tensorInput] : [];
+    const gFn = tsGrad ?? ((g) => [g]);
+    return this._wrapWithGrad(inner, [tensorInput], (grad, getSaved) => gFn(grad, getSaved, scalarVal, scalarIsA).map((g) => this._sumToShape(g, tensorInput.shape)), tensorsToSave);
+  }
+  /** Generic dispatcher for registry-driven binary ops (gradient specs in OP_REGISTRY). */
+  _dispatchBinaryFromTable(opName, a, b) {
+    const def = OP_REGISTRY[opName];
+    const rt = this.runtime;
+    return this._dispatchBinary(opName, a, b, (g, gs) => def.ttGrad(rt, g, (i) => gs(i)._unwrap()), def.tsGrad ? (g, gs, s, isA) => def.tsGrad(rt, g, (i) => gs(i)._unwrap(), s, isA) : void 0, def.saveBinary ?? false);
+  }
+  sub(a, b, options) {
+    if (typeof b === "number") {
+      const alpha2 = options?.alpha ?? 1;
+      return this.add(a, -(b * alpha2));
+    }
+    this._assertUsable(a, b);
+    [a, b] = this._applyAutocast("sub", [a, b]);
+    const inner = this.runtime.sub(a._unwrap(), b._unwrap(), options);
+    const aShape = a.shape;
+    const bShape = b.shape;
+    return this._wrapWithGrad(inner, [a, b], (grad, _getSaved) => {
+      const alpha2 = options?.alpha ?? 1;
+      const gradA = this._sumToShape(grad, aShape);
+      const scaled = this.runtime.mul(grad, -alpha2);
+      return [gradA, this._sumToShape(scaled, bShape)];
+    });
+  }
+  matmul(a, b) {
+    this._assertUsable(a, b);
+    const [castA, castB] = this._applyAutocast("matmul", [a, b]);
+    const inner = this.runtime.matmul(castA._unwrap(), castB._unwrap());
+    const aShape = a.shape;
+    const bShape = b.shape;
+    const tensorsToSave = a.requiresGrad || b.requiresGrad ? [castA, castB] : [];
+    return this._wrapWithGrad(inner, [a, b], (grad, getSaved) => {
+      if (aShape.length < 2 || bShape.length < 2) throw new Error("matmul backward requires rank >= 2");
+      const savedA = getSaved(0);
+      const savedB = getSaved(1);
+      const savedAShape = savedA.shape;
+      const savedBShape = savedB.shape;
+      const savedAInner = savedA._unwrap();
+      const savedBInner = savedB._unwrap();
+      const aT = this.runtime.transpose(savedAInner, {
+        dim0: savedAShape.length - 2,
+        dim1: savedAShape.length - 1
+      });
+      const bT = this.runtime.transpose(savedBInner, {
+        dim0: savedBShape.length - 2,
+        dim1: savedBShape.length - 1
+      });
+      const gradA = this.runtime.matmul(grad, bT);
+      const gradB = this.runtime.matmul(aT, grad);
+      return [this._sumToShape(gradA, aShape), this._sumToShape(gradB, bShape)];
+    }, tensorsToSave);
+  }
+  /**
+  * Linear transformation: Y = input @ weight.T + bias
+  * Custom backward computes dW = dY.T @ X directly in weight's shape,
+  * eliminating the transpose op that generic matmul backward would produce.
+  */
+  linear(input, weight, bias = null) {
+    this._assertUsable(input, weight);
+    if (bias) this._assertUsable(bias);
+    const [castInput, castWeight] = this._applyAutocast("matmul", [input, weight]);
+    const wT = this.runtime.transpose(castWeight._unwrap(), {
+      dim0: castWeight.shape.length - 2,
+      dim1: castWeight.shape.length - 1
+    });
+    let inner = this.runtime.matmul(castInput._unwrap(), wT);
+    if (bias) inner = this.runtime.add(inner, bias._unwrap());
+    const inputShape = input.shape;
+    const weightShape = weight.shape;
+    const needsInputGrad = input.requiresGrad;
+    const needsWeightGrad = weight.requiresGrad;
+    const allInputs = bias ? [
+      input,
+      weight,
+      bias
+    ] : [input, weight];
+    const toSave = [];
+    if (needsInputGrad || needsWeightGrad) {
+      if (needsInputGrad) toSave.push(castWeight);
+      if (needsWeightGrad) toSave.push(castInput);
+      if (bias) toSave.push(bias);
+    }
+    return this._wrapWithGrad(inner, allInputs, (grad, getSaved) => {
+      if (inputShape.length < 2 || weightShape.length < 2) throw new Error("linear backward requires rank >= 2");
+      let savedIdx = 0;
+      let resultInput = null;
+      if (needsInputGrad) {
+        const savedWeight = getSaved(savedIdx++)._unwrap();
+        const gradInput = this.runtime.matmul(grad, savedWeight);
+        resultInput = this._sumToShape(gradInput, inputShape);
+      }
+      let resultWeight = null;
+      if (needsWeightGrad) {
+        const savedInput = getSaved(savedIdx++)._unwrap();
+        const gradT = this.runtime.transpose(grad, {
+          dim0: grad.shape.length - 2,
+          dim1: grad.shape.length - 1
+        });
+        const gradWeight = this.runtime.matmul(gradT, savedInput);
+        resultWeight = this._sumToShape(gradWeight, weightShape);
+      }
+      let resultBias = null;
+      if (bias) {
+        const biasShape = getSaved(savedIdx).shape;
+        resultBias = this._sumToShape(grad, biasShape);
+      }
+      return bias ? [
+        resultInput,
+        resultWeight,
+        resultBias
+      ] : [resultInput, resultWeight];
+    }, toSave);
+  }
+  gelu(a, options) {
+    this._assertUsable(a);
+    const approximate = options?.approximate ?? "tanh";
+    const inner = this.runtime.gelu(a._unwrap(), options);
+    const tensorsToSave = a.requiresGrad ? [a] : [];
+    if (approximate === "tanh") return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
+      const x = getSaved(0)._unwrap();
+      const x2 = this.runtime.mul(x, x);
+      const x3 = this.runtime.mul(x2, x);
+      const term = this.runtime.add(x, this.runtime.mul(0.044715, x3));
+      const innerVal = this.runtime.mul(0.7978845608, term);
+      const clampedInner = this.runtime.where(this.runtime.lt(innerVal, -10), -10, this.runtime.where(this.runtime.gt(innerVal, 10), 10, innerVal));
+      const tanhInner = this.runtime.tanh(clampedInner);
+      const cdf = this.runtime.mul(0.5, this.runtime.add(1, tanhInner));
+      const tanh2 = this.runtime.mul(tanhInner, tanhInner);
+      const sech2 = this.runtime.sub(1, tanh2);
+      const pdfTerm = this.runtime.add(1, this.runtime.mul(0.134145, x2));
+      const pdf = this.runtime.mul(this.runtime.mul(0.7978845608, pdfTerm), sech2);
+      const xPdfHalf = this.runtime.mul(this.runtime.mul(x, pdf), 0.5);
+      const geluGrad = this.runtime.add(cdf, xPdfHalf);
+      return [this.runtime.mul(grad, geluGrad)];
+    }, tensorsToSave);
+    else return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
+      const x = getSaved(0)._unwrap();
+      const z = this.runtime.mul(x, Math.SQRT1_2);
+      const absZ = this.runtime.abs(z);
+      const t = this.runtime.div(1, this.runtime.add(1, this.runtime.mul(0.3275911, absZ)));
+      const t2 = this.runtime.mul(t, t);
+      const t3 = this.runtime.mul(t2, t);
+      const t4 = this.runtime.mul(t3, t);
+      const t5 = this.runtime.mul(t4, t);
+      const poly = this.runtime.add(this.runtime.mul(0.254829592, t), this.runtime.add(this.runtime.mul(-0.284496736, t2), this.runtime.add(this.runtime.mul(1.421413741, t3), this.runtime.add(this.runtime.mul(-1.453152027, t4), this.runtime.mul(1.061405429, t5)))));
+      const negZ2 = this.runtime.mul(-0.5, this.runtime.mul(x, x));
+      const expNegZ2 = this.runtime.exp(negZ2);
+      const erfAbs = this.runtime.sub(1, this.runtime.mul(poly, expNegZ2));
+      const xGe0 = this.runtime.ge(x, 0);
+      const erfPos = this.runtime.add(1, erfAbs);
+      const erfNeg = this.runtime.sub(1, erfAbs);
+      const erfTerm = this.runtime.where(xGe0, erfPos, erfNeg);
+      const cdf = this.runtime.mul(0.5, erfTerm);
+      const pdf = this.runtime.mul(expNegZ2, 0.3989422804014327);
+      const xPdf = this.runtime.mul(x, pdf);
+      const geluGrad = this.runtime.add(cdf, xPdf);
+      return [this.runtime.mul(grad, geluGrad)];
+    }, tensorsToSave);
+  }
+  clamp(a, min2, max2) {
+    this._assertUsable(a);
+    const inner = this.runtime.clamp(a._unwrap(), min2, max2);
+    const tensorsToSave = a.requiresGrad ? [a] : [];
+    return this._wrapWithGrad(inner, [a], (grad, getSaved) => {
+      const x = getSaved(0)._unwrap();
+      let mask = grad;
+      if (min2 !== null) {
+        const geMin = this.runtime.ge(x, min2);
+        mask = this.runtime.mul(mask, geMin);
+      }
+      if (max2 !== null) {
+        const leMax = this.runtime.le(x, max2);
+        mask = this.runtime.mul(mask, leMax);
+      }
+      return [mask];
+    }, tensorsToSave);
+  }
+  softplus(a) {
+    this._assertUsable(a);
+    const one = this.runtime.full(a.shape, 1, a.device);
+    const expA = this.runtime.exp(a._unwrap());
+    const inner = this.runtime.log(this.runtime.add(one, expA));
+    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => {
+      const sigA = this.runtime.sigmoid(a._unwrap());
+      return [this.runtime.mul(grad, sigA)];
+    });
+  }
+  fmod(a, b) {
+    this._assertUsable(a, b);
+    const quotient = this.runtime.div(a._unwrap(), b._unwrap());
+    const floored = this.runtime.floor(quotient);
+    const inner = this.runtime.sub(a._unwrap(), this.runtime.mul(b._unwrap(), floored));
+    return this._wrap(inner);
+  }
+  /**
+  * Embedding lookup: weight[indices] for each index.
+  * Like PyTorch's F.embedding(input, weight).
+  *
+  * @param weight - Embedding table of shape [numEmbeddings, embeddingDim]
+  * @param indices - Index tensor of arbitrary shape [...]
+  * @returns Tensor of shape [..., embeddingDim]
+  */
+  embedding(weight, indices) {
+    this._assertUsable(weight, indices);
+    const inputShape = indices.shape;
+    const embDim = weight.shape[1];
+    const numElements = sizeOf(inputShape);
+    const flat = this.reshape(indices, [numElements]);
+    const expanded = this.expand(this.reshape(flat, [numElements, 1]), [numElements, embDim]);
+    const contig = this.contiguous(expanded);
+    const gathered = this.gather(weight, contig, { dim: 0 });
+    return this.reshape(gathered, [...inputShape, embDim]);
+  }
+  expand(a, shape) {
+    this._assertUsable(a);
+    const aShape = a.shape;
+    const inner = this.runtime.expand(a._unwrap(), shape);
+    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => [this._sumToShape(grad, aShape)]);
+  }
+  /** Generic dispatcher for reduction ops with autograd. */
+  _dispatchReduction(opName, a, options) {
+    this._assertUsable(a);
+    const autocastOp = opName === "sum" || opName === "mean" ? opName : null;
+    const castA = autocastOp ? this._applyAutocast(autocastOp, [a])[0] : a;
+    const result = this.runtime[opName](castA._unwrap(), options);
+    if (typeof result === "number") {
+      if (a.requiresGrad && opName === "mean") throw new Error("mean with requiresGrad must specify dim");
+      return typeof result === "number" && !a.requiresGrad ? result : this._wrap(typeof result === "number" ? this.runtime.full([], result) : result);
+    }
+    if (opName === "max" || opName === "min") return this._wrap(result);
+    const aShape = a.shape;
+    const dims = this._normalizeDims(options?.dim ?? null, aShape.length);
+    const keepdim = options?.keepdim ?? false;
+    return this._wrapWithGrad(result, [a], (grad, _getSaved) => {
+      const expanded = this._expandGrad(grad, aShape, dims, keepdim);
+      if (opName === "mean") {
+        const reduceCount = dims.length === 0 ? 1 : dims.reduce((acc, d) => acc * aShape[d], 1);
+        return [this.runtime.mul(expanded, 1 / reduceCount)];
+      }
+      return [expanded];
+    });
+  }
+  sum(a, options) {
+    return this._dispatchReduction("sum", a, options);
+  }
+  max(a, options) {
+    return this._dispatchReduction("max", a, options);
+  }
+  min(a, options) {
+    return this._dispatchReduction("min", a, options);
+  }
+  mean(a, options) {
+    return this._dispatchReduction("mean", a, options);
+  }
+  argmax(a, options) {
+    this._assertUsable(a);
+    return this._wrap(this.runtime.argmax(a._unwrap(), options));
+  }
+  argmin(a, options) {
+    this._assertUsable(a);
+    return this._wrap(this.runtime.argmin(a._unwrap(), options));
+  }
+  variance(a, options) {
+    this._assertUsable(a);
+    const dim = options?.dim ?? null;
+    const correction = options?.correction ?? 1;
+    const keepdim = options?.keepdim ?? false;
+    const meanVal = this.mean(a, {
+      dim,
+      keepdim: true
+    });
+    const diff = this.sub(a, meanVal);
+    const sq = this.mul(diff, diff);
+    const sumSq = this.sum(sq, {
+      dim,
+      keepdim
+    });
+    const aShape = a.shape;
+    const dims = this._normalizeDims(dim, aShape.length);
+    const reduceCount = dims.length === 0 ? aShape.reduce((acc, s) => acc * s, 1) : dims.reduce((acc, d) => acc * aShape[d], 1);
+    const denom = Math.max(reduceCount - correction, 0);
+    if (denom === 0) throw new Error("variance: correction >= number of elements in reduction");
+    return this.div(sumSq, denom);
+  }
+  std(a, options) {
+    return this.sqrt(this.variance(a, options));
+  }
+  _cmpOp(op, a, b) {
+    this._assertUsable(a, b);
+    return this._wrap(this.runtime[op](a._unwrap(), b._unwrap()));
+  }
+  softmax(a, dim) {
+    return softmaxImpl(this, a, dim);
+  }
+  _crossEntropyFused(logits, targets) {
+    return crossEntropyFusedImpl(this, logits, targets);
+  }
+  scaledDotProductAttention(q, k, v, scale, isCausal = false) {
+    return scaledDotProductAttentionImpl(this, q, k, v, scale, isCausal);
+  }
+  layernorm(x, weight, bias, eps = 1e-5) {
+    return layernormImpl(this, x, weight, bias, eps);
+  }
+  rmsnorm(x, weight, eps = 1e-5) {
+    return rmsnormImpl(this, x, weight, eps);
+  }
+  async cpu(a) {
+    this._assertUsable(a);
+    return this._runEntryPoint(async () => {
+      this.runtime.forceRead(a.baseId);
+      return this.runtime.cpu(a._unwrap());
+    });
+  }
+  async item(a) {
+    this._assertUsable(a);
+    return this._runEntryPoint(async () => {
+      this.runtime.forceRead(a.baseId);
+      return this.runtime.item(a._unwrap());
+    });
+  }
+  to(a, device) {
+    this._assertUsable(a);
+    if (a.device === device) return a;
+    const inner = this.runtime.transfer(a._unwrap(), device);
+    return this._wrap(inner, a.requiresGrad);
+  }
+  async toNow(a, device) {
+    this._assertUsable(a);
+    return this._runEntryPoint(async () => {
+      this.runtime.forceRead(a.baseId);
+      const inner = await this.runtime.transferNow(a._unwrap(), device);
+      return this._wrap(inner, a.requiresGrad);
+    });
+  }
+  _inPlace(dst, fn, ...extra) {
+    this._assertUsable(dst, ...extra);
+    fn();
+    this._debug_baseCommit(dst.baseId, this.runtime.nextMutId());
+    return dst;
+  }
+  copy_(dst, src) {
+    return this._inPlace(dst, () => this.runtime.copy_(dst._unwrap(), src._unwrap()), src);
+  }
+  add_(dst, src) {
+    return this._inPlace(dst, () => this.runtime.add_(dst._unwrap(), src._unwrap()), src);
+  }
+  zero_(dst) {
+    return this._inPlace(dst, () => this.runtime.zero_(dst._unwrap()));
+  }
+  fill_(dst, value) {
+    return this._inPlace(dst, () => this.runtime.fill_(dst._unwrap(), value));
+  }
+  mul_(dst, value) {
+    return this._inPlace(dst, () => this.runtime.mul_(dst._unwrap(), value));
+  }
+  gather(a, index, options) {
+    this._assertUsable(a, index);
+    const inner = this.runtime.gather(a._unwrap(), index._unwrap(), options);
+    const aShape = a.shape;
+    const indexInner = index._unwrap();
+    return this._wrapWithGrad(inner, [a], (grad, _getSaved) => {
+      const z = this.runtime.zeros(aShape);
+      return [this.runtime.scatterAdd(z, indexInner, grad, options)];
+    });
+  }
+  scatterAdd(a, index, src, options) {
+    this._assertUsable(a, index, src);
+    const inner = this.runtime.scatterAdd(a._unwrap(), index._unwrap(), src._unwrap(), options);
+    const indexInner = index._unwrap();
+    return this._wrapWithGrad(inner, [a, src], (grad, _getSaved) => {
+      return [grad, this.runtime.gather(grad, indexInner, options)];
+    });
+  }
+  where(condition, x, y) {
+    this._assertUsable(condition, x, y);
+    const inner = this.runtime.where(condition._unwrap(), x._unwrap(), y._unwrap());
+    const xShape = x.shape;
+    const yShape = y.shape;
+    const conditionInner = condition._unwrap();
+    return this._wrapWithGrad(inner, [x, y], (grad, _getSaved) => {
+      const zerosTensor = this.runtime.zeros(grad.shape, grad.device);
+      const grad_x = this.runtime.where(conditionInner, grad, zerosTensor);
+      const grad_y = this.runtime.where(conditionInner, zerosTensor, grad);
+      return [this._sumToShape(grad_x, xShape), this._sumToShape(grad_y, yShape)];
+    });
+  }
+  view(a, shape) {
+    return this.reshape(a, shape);
+  }
+  reshape(a, shape) {
+    this._assertUsable(a);
+    const aShape = a.shape;
+    const inner = this.runtime.reshape(a._unwrap(), shape);
+    return this._wrapWithGrad(inner, [a], (grad) => [this.runtime.reshape(grad, aShape)]);
+  }
+  squeeze(a, dim) {
+    this._assertUsable(a);
+    const aShape = a.shape;
+    let newShape;
+    if (dim !== void 0) {
+      const d = dim < 0 ? dim + aShape.length : dim;
+      newShape = aShape[d] === 1 ? [...aShape.slice(0, d), ...aShape.slice(d + 1)] : [...aShape];
+    } else newShape = aShape.filter((s) => s !== 1);
+    if (newShape.length === aShape.length) return a;
+    const inner = this.runtime.reshape(a._unwrap(), newShape);
+    return this._wrapWithGrad(inner, [a], (grad) => [this.runtime.reshape(grad, aShape)]);
+  }
+  unsqueeze(a, dim) {
+    this._assertUsable(a);
+    const aShape = a.shape;
+    const d = dim < 0 ? dim + aShape.length + 1 : dim;
+    const newShape = [
+      ...aShape.slice(0, d),
+      1,
+      ...aShape.slice(d)
+    ];
+    const inner = this.runtime.reshape(a._unwrap(), newShape);
+    return this._wrapWithGrad(inner, [a], (grad) => [this.runtime.reshape(grad, aShape)]);
+  }
+  transpose(a, options) {
+    this._assertUsable(a);
+    const inner = this.runtime.transpose(a._unwrap(), options);
+    return this._wrapWithGrad(inner, [a], (grad) => [this.runtime.transpose(grad, options)]);
+  }
+  permute(a, dims) {
+    this._assertUsable(a);
+    const inner = this.runtime.permute(a._unwrap(), dims);
+    const inverseDims = new Array(dims.length);
+    for (let i = 0; i < dims.length; i++) inverseDims[dims[i]] = i;
+    return this._wrapWithGrad(inner, [a], (grad) => [this.runtime.permute(grad, inverseDims)]);
+  }
+  contiguous(a) {
+    this._assertUsable(a);
+    const inner = this.runtime.contiguous(a._unwrap());
+    return this._wrapWithGrad(inner, [a], (grad) => [grad]);
+  }
+  narrow(a, dim, start, length) {
+    this._assertUsable(a);
+    const originalLength = a.shape[dim];
+    const inner = this.runtime.narrow(a._unwrap(), dim, start, length);
+    return this._wrapWithGrad(inner, [a], (grad) => [this.runtime.narrowBackward(grad, dim, start, originalLength)]);
+  }
+  chunk(a, chunks, dim = 0) {
+    this._assertUsable(a);
+    const rank2 = a.shape.length;
+    const d = dim < 0 ? dim + rank2 : dim;
+    if (d < 0 || d >= rank2) throw new Error(`chunk: dim ${dim} out of range for rank ${rank2}`);
+    if (chunks <= 0) throw new Error("chunk: chunks must be positive");
+    const dimSize = a.shape[d];
+    const chunkSize = Math.ceil(dimSize / chunks);
+    const results = [];
+    for (let i = 0; i < chunks; i++) {
+      const start = i * chunkSize;
+      if (start >= dimSize) break;
+      const length = Math.min(chunkSize, dimSize - start);
+      results.push(this.narrow(a, d, start, length));
+    }
+    return results;
+  }
+  split(a, splitSizeOrSections, dim = 0) {
+    this._assertUsable(a);
+    const rank2 = a.shape.length;
+    const d = dim < 0 ? dim + rank2 : dim;
+    if (d < 0 || d >= rank2) throw new Error(`split: dim ${dim} out of range for rank ${rank2}`);
+    const dimSize = a.shape[d];
+    let sizes;
+    if (typeof splitSizeOrSections === "number") {
+      sizes = [];
+      for (let pos = 0; pos < dimSize; pos += splitSizeOrSections) sizes.push(Math.min(splitSizeOrSections, dimSize - pos));
+    } else {
+      sizes = splitSizeOrSections;
+      const total = sizes.reduce((s, v) => s + v, 0);
+      if (total !== dimSize) throw new Error(`split: sizes sum ${total} != dimension size ${dimSize}`);
+    }
+    const results = [];
+    let start = 0;
+    for (const size of sizes) {
+      results.push(this.narrow(a, d, start, size));
+      start += size;
+    }
+    return results;
+  }
+  cat(tensors, dim = 0) {
+    if (tensors.length === 0) throw new Error("cat: empty tensor list");
+    for (const t of tensors) this._assertUsable(t);
+    const d = dim < 0 ? dim + tensors[0].shape.length : dim;
+    const sizes = tensors.map((t) => t.shape[d]);
+    const inner = this.runtime.cat(tensors.map((t) => t._unwrap()), { dim: d });
+    return this._wrapWithGrad(inner, tensors, (grad, _getSaved) => {
+      const grads = [];
+      let offset = 0;
+      for (const size of sizes) {
+        grads.push(this.runtime.narrow(grad, d, offset, size));
+        offset += size;
+      }
+      return grads;
+    });
+  }
+  stack(tensors, dim = 0) {
+    if (tensors.length === 0) throw new Error("stack: empty tensor list");
+    const unsqueezed = tensors.map((t) => this.unsqueeze(t, dim));
+    return this.cat(unsqueezed, dim);
+  }
+  toDtype(a, dtype) {
+    this._assertUsable(a);
+    const inner = this.runtime.cast(a._unwrap(), dtype);
+    return this._wrap(inner);
+  }
+  detach(a) {
+    this._assertUsable(a);
+    return this._wrap(a._unwrap());
+  }
+  async backward(a, grad) {
+    return backwardImpl(this, a, grad);
+  }
+  _wrap(inner, requiresGrad = false) {
+    if (!this._inCheckpointRecompute) this.runtime.markEscaped(inner);
+    const handle = this.runtime.createTensor(inner.baseId);
+    const tensor = new Tensor2(this, inner, handle, { requiresGrad });
+    if (this.inCompileRegion) this._compileCreatedTensors.add(tensor);
+    return tensor;
+  }
+  _wrapWithGrad(inner, inputs, backward, tensorsToSave = []) {
+    const requiresGrad = this._noGradDepth === 0 && inputs.some((tensor) => tensor.requiresGrad);
+    const output = this._wrap(inner, requiresGrad);
+    if (requiresGrad) {
+      const savedSlots = [];
+      const hooks = this._getSavedTensorHooks();
+      for (const tensor of tensorsToSave) if (hooks) {
+        const packed = hooks.packHook(tensor);
+        const record = this.runtime._debug_saveForBackward(tensor.baseId);
+        savedSlots.push({
+          packed,
+          unpackHook: hooks.unpackHook,
+          record
+        });
+      } else {
+        this.keep(tensor);
+        const record = this.runtime._debug_saveForBackward(tensor.baseId);
+        savedSlots.push({
+          packed: tensor,
+          unpackHook: (t) => t,
+          record
+        });
+      }
+      if (savedSlots.length > 0) this.runtime._debug_publishSave(output.baseId);
+      output._setGradNode({
+        inputs,
+        output,
+        backward,
+        savedSlots,
+        label: this._currentNodeLabel ?? void 0
+      });
+    }
+    return output;
+  }
+  _seedGrad(output) {
+    if (sizeOf(output.shape) !== 1) throw new Error("backward requires an explicit grad for non-scalars");
+    return this.runtime.full([], 1, output.device);
+  }
+  _sumToShape(grad, shape) {
+    if (shapesEqual(grad.shape, shape)) return grad;
+    const gradRank = grad.shape.length;
+    const targetRank = shape.length;
+    const pad = Math.max(0, gradRank - targetRank);
+    const paddedTarget = new Array(pad).fill(1).concat(shape);
+    const dims = [];
+    for (let axis = 0; axis < gradRank; axis += 1) {
+      const targetDim = paddedTarget[axis];
+      const gradDim = grad.shape[axis];
+      if (targetDim === 1 && gradDim !== 1) dims.push(axis);
+    }
+    let reduced = grad;
+    if (dims.length > 0) {
+      const summed = this.runtime.sum(reduced, {
+        dim: dims,
+        keepdim: true
+      });
+      if (typeof summed === "number") reduced = this.runtime.full([], summed, grad.device);
+      else reduced = summed;
+    }
+    if (!shapesEqual(reduced.shape, shape)) reduced = this.runtime.reshape(reduced, shape);
+    return reduced;
+  }
+  _expandGrad(grad, inputShape, dims, keepdim) {
+    let expanded = grad;
+    if (!keepdim && dims.length > 0) {
+      const rank2 = inputShape.length;
+      const reduceSet = new Set(dims);
+      const nextShape = new Array(rank2);
+      let gradAxis = 0;
+      for (let axis = 0; axis < rank2; axis += 1) if (reduceSet.has(axis)) nextShape[axis] = 1;
+      else {
+        nextShape[axis] = grad.shape[gradAxis];
+        gradAxis += 1;
+      }
+      expanded = this.runtime.reshape(expanded, nextShape);
+    }
+    return this.runtime.expand(expanded, inputShape);
+  }
+  _normalizeDims(dim, rank2) {
+    if (dim == null) return Array.from({ length: rank2 }, (_, index) => index);
+    const normalized = (Array.isArray(dim) ? dim.slice() : [dim]).map((value) => value < 0 ? rank2 + value : value);
+    const unique = /* @__PURE__ */ new Set();
+    for (const value of normalized) {
+      if (value < 0 || value >= rank2) throw new Error(`dim out of range: ${value}`);
+      if (unique.has(value)) continue;
+      unique.add(value);
+    }
+    return Array.from(unique).sort((a, b) => a - b);
+  }
+  _assertUsable(...tensors) {
+    this.assertSameEngine(...tensors);
+    this.assertSameDevice(...tensors);
+    for (const tensor of tensors) tensor._ensureNotDisposed();
+  }
+  _runEntryPoint(fn) {
+    return this.runtime.runEntryPoint(fn);
+  }
+  tidy(fn) {
+    const tidyMode = new TidyDispatchMode();
+    this.runtime.pushDispatchMode(tidyMode);
+    let result;
+    try {
+      this.runtime.tidy(() => {
+        result = fn();
+        return collectEngineTensors(result);
+      });
+    } finally {
+      this.runtime.popDispatchMode();
+      tidyMode.disposeNonEscaped();
+    }
+    return result;
+  }
+  async asyncTidy(fn) {
+    const tidyMode = new TidyDispatchMode();
+    this.runtime.pushDispatchMode(tidyMode);
+    try {
+      return await this.runtime.runWithAsyncScope(async () => {
+        const result = await fn();
+        for (const et of collectEngineTensors(result)) this.runtime.keep(et);
+        return result;
+      });
+    } finally {
+      this.runtime.popDispatchMode();
+      tidyMode.disposeNonEscaped();
+    }
+  }
+  async runWithAsyncScope(fn) {
+    return this.runtime.runWithAsyncScope(fn);
+  }
+  keep(tensor) {
+    this._assertUsable(tensor);
+    this.runtime.keep(tensor._engineTensor());
+  }
+  dispose(tensor) {
+    this.assertSameEngine(tensor);
+    this._disposeAutogradChain(tensor);
+    this.runtime.dispose(tensor._engineTensor());
+  }
+  /**
+  * Walk the autograd graph rooted at `tensor` and deterministically clean up
+  * all pending saved tensors. Without this, saved tensors deep in the chain
+  * (e.g., attention logsumexp reshapes) survive as zombie pending RuntimeTensors
+  * until GC, causing stale-graph crashes in forceAllPending().
+  */
+  _disposeAutogradChain(tensor) {
+    const visited = /* @__PURE__ */ new Set();
+    const stack = [tensor];
+    while (stack.length > 0) {
+      const t = stack.pop();
+      if (visited.has(t)) continue;
+      visited.add(t);
+      const gradNode = t._gradNode();
+      if (!gradNode) continue;
+      for (const slot of gradNode.savedSlots) {
+        const saved = slot.packed;
+        if (saved && typeof saved.disposed === "boolean" && !saved.disposed && typeof saved._unwrap === "function") {
+          if (!saved._unwrap().isMaterialized()) this.runtime.dispose(saved._engineTensor());
+        }
+      }
+      gradNode.savedSlots.length = 0;
+      for (const input of gradNode.inputs) stack.push(input);
+      gradNode.inputs.length = 0;
+      t._setGradNode(null);
+    }
+  }
+  async markStep() {
+    try {
+      await awaitDeferredFence();
+    } catch {
+    }
+    await this.runtime.markStep();
+    await this.runtime.forceAllPending();
+    storageTracker.destroyUnreachable();
+    this.runtime.resetCumulativeFusionStats();
+    try {
+      issueDeferredFence();
+    } catch {
+    }
+  }
+  _debug_baseCommit(baseId, mutId) {
+    this.runtime._debug_baseCommit(baseId, mutId);
+  }
+  async beginStep() {
+    await this.runtime.beginStep();
+  }
+  endStep() {
+    this.runtime.endStep();
+  }
+  _runtime() {
+    return this.runtime;
+  }
+  _wrapRuntime(inner, requiresGrad) {
+    return this._wrap(inner, requiresGrad);
+  }
+  assertSameEngine(...tensors) {
+    for (const tensor of tensors) if (tensor._engine() !== this) throw new Error("Tensor belongs to a different Torchlette instance");
+  }
+  assertSameDevice(...tensors) {
+    if (tensors.length <= 1) return;
+    const device = tensors[0].device;
+    for (const tensor of tensors) if (tensor.device !== device) throw new Error("Tensors must be on the same device");
+  }
+};
+for (const opName of UNARY_AUTOGRAD_OPS) Torchlette.prototype[opName] = function(a) {
+  return this._dispatchUnary(opName, a);
+};
+for (const opName of BINARY_AUTOGRAD_OPS) Torchlette.prototype[opName] = function(a, b) {
+  return this._dispatchBinaryFromTable(opName, a, b);
+};
+for (const op of [
+  "gt",
+  "lt",
+  "ge",
+  "le",
+  "eq",
+  "ne"
+]) Torchlette.prototype[op] = function(a, b) {
+  return this._cmpOp(op, a, b);
+};
+new Torchlette();
+function collectEngineTensors(value) {
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  const visit = (current) => {
+    if (current == null) return;
+    if (current instanceof Tensor2) {
+      out.push(current._engineTensor());
+      return;
+    }
+    if (typeof current !== "object") return;
+    if (seen.has(current)) return;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      for (const entry of current) visit(entry);
+      return;
+    }
+    for (const entry of Object.values(current)) visit(entry);
+  };
+  visit(value);
+  return out;
+}
+function checkpoint$1(api, fn, inputs, options = {}) {
+  const { preserveRngState = true } = options;
+  return checkpointNonReentrant(api, fn, inputs, preserveRngState);
+}
+function checkpointNonReentrant(api, fn, inputs, preserveRngState) {
+  const engine = api.runtime;
+  for (const input of inputs) api.keep(input);
+  let rngDraws = null;
+  if (preserveRngState) engine._debug_startCheckpointRecord();
+  let recomputedTensors = null;
+  let tensorIndex = 0;
+  const packHook = (tensor) => {
+    return {
+      checkpointIndex: tensorIndex++,
+      baseId: tensor.baseId
+    };
+  };
+  const unpackHook = (packed) => {
+    const { checkpointIndex } = packed;
+    if (!recomputedTensors) {
+      recomputedTensors = /* @__PURE__ */ new Map();
+      if (rngDraws && rngDraws.length > 0) engine._debug_startCheckpointReplay(rngDraws);
+      let captureIndex = 0;
+      let lastCapturedTensor = null;
+      const captureHook = (t) => {
+        recomputedTensors?.set(captureIndex++, t);
+        lastCapturedTensor = t;
+        return t;
+      };
+      api.tidy(() => {
+        api.saved_tensors_hooks(captureHook, (t) => t, () => {
+          fn(...inputs);
+        });
+        for (const t of recomputedTensors?.values() ?? []) api.keep(t);
+      });
+      if (rngDraws && rngDraws.length > 0) engine._debug_finishCheckpointReplay();
+      if (lastCapturedTensor) {
+        const lazyRef = lastCapturedTensor._runtimeTensor().lazyRef;
+        if (lazyRef?.kind === "pending" && lazyRef.node) markAsCheckpointBoundary(lazyRef.node);
+      }
+    }
+    const result = recomputedTensors.get(checkpointIndex);
+    if (!result) throw new Error(`Checkpoint: no tensor at index ${checkpointIndex} after recomputation`);
+    return result;
+  };
+  const output = api.tidy(() => {
+    const result = api.saved_tensors_hooks(packHook, unpackHook, () => {
+      return fn(...inputs);
+    });
+    api.keep(result);
+    return result;
+  });
+  if (preserveRngState) rngDraws = engine._debug_finishCheckpointRecord();
+  return output;
+}
+function checkpointSequential(api, modules, input, options = {}) {
+  let hidden = input;
+  for (const module of modules) hidden = checkpoint$1(api, (x) => module.forward(x), [hidden], options);
+  return hidden;
+}
+function createLayerCheckpointer(api, policy) {
+  const shouldCheckpoint = (idx) => {
+    if (policy.policy === "none") return false;
+    if (policy.policy === "all") return true;
+    if (policy.policy === "alternate") return idx % 2 === 0;
+    if (Array.isArray(policy.policy)) return policy.policy.includes(idx);
+    return false;
+  };
+  return (layerIdx, fn) => {
+    if (shouldCheckpoint(layerIdx)) return checkpoint$1(api, fn, [], { preserveRngState: policy.preserveRngState ?? true });
+    return fn();
+  };
+}
+function estimateCheckpointSavings(numLayers, hiddenSize, seqLength, batchSize2, policy) {
+  const activationBytes = batchSize2 * seqLength * hiddenSize * 4;
+  const perLayerActivations = activationBytes + activationBytes * 4;
+  const totalWithoutCheckpoint = numLayers * perLayerActivations;
+  let checkpointedLayers = 0;
+  if (policy === "all") checkpointedLayers = numLayers;
+  else if (policy === "alternate") checkpointedLayers = Math.ceil(numLayers / 2);
+  else if (Array.isArray(policy)) checkpointedLayers = policy.length;
+  const nonCheckpointedLayers = numLayers - checkpointedLayers;
+  const inputsPerCheckpoint = activationBytes;
+  const totalWithCheckpoint = nonCheckpointedLayers * perLayerActivations + checkpointedLayers * inputsPerCheckpoint;
+  const savings = totalWithoutCheckpoint - totalWithCheckpoint;
+  return {
+    withoutCheckpoint: totalWithoutCheckpoint,
+    withCheckpoint: totalWithCheckpoint,
+    savings,
+    savingsPercent: savings / totalWithoutCheckpoint * 100
+  };
+}
+async function clipGradNorm_(api, parameters, maxNorm, normType = 2) {
+  const grads = [];
+  for (const p of parameters) if (p.grad != null) grads.push(p.grad);
+  if (grads.length === 0) return 0;
+  let totalNorm;
+  if (normType === Infinity) {
+    let maxVal = 0;
+    for (const g of grads) {
+      const result = api.max(api.abs(g));
+      const absMax = typeof result === "number" ? result : await result.item();
+      if (absMax > maxVal) maxVal = absMax;
+    }
+    totalNorm = maxVal;
+  } else if (normType === 2) {
+    let totalSumSq = null;
+    for (const g of grads) {
+      const sq = api.pow(g, 2);
+      const sumSq = api.sum(sq);
+      totalSumSq = totalSumSq === null ? sumSq : api.add(totalSumSq, sumSq);
+    }
+    const totalSumSqVal = await totalSumSq.item();
+    totalNorm = Math.sqrt(totalSumSqVal);
+  } else {
+    let totalSumP = null;
+    for (const g of grads) {
+      const absG = api.abs(g);
+      const powG = api.pow(absG, normType);
+      const sumP = api.sum(powG);
+      totalSumP = totalSumP === null ? sumP : api.add(totalSumP, sumP);
+    }
+    const totalSumPVal = await totalSumP.item();
+    totalNorm = Math.pow(totalSumPVal, 1 / normType);
+  }
+  const clipCoef = maxNorm / (totalNorm + 1e-6);
+  if (clipCoef < 1) for (const g of grads) api.mul_(g, clipCoef);
+  return totalNorm;
+}
+function clipGradValue_(api, parameters, clipValue) {
+  for (const p of parameters) if (p.grad != null) api.copy_(p.grad, api.clamp(p.grad, -clipValue, clipValue));
+}
+var functional_exports = /* @__PURE__ */ __exportAll({
+  crossEntropy: () => crossEntropy$1,
+  dropout: () => dropout,
+  logSoftmax: () => logSoftmax,
+  nllLoss: () => nllLoss
+});
+function applyReduction(api, loss, reduction2, device) {
+  if (reduction2 === "none") return loss;
+  if (reduction2 === "sum") {
+    const s = loss.sum();
+    return typeof s === "number" ? api.full([], s, { device }) : s;
+  }
+  const m = loss.mean();
+  return typeof m === "number" ? api.full([], m, { device }) : m;
+}
+function gatherTargets(api, input, targets) {
+  const isBatched = input.shape.length >= 2;
+  let targetsForGather = targets;
+  if (isBatched && targets.shape.length === input.shape.length - 1) targetsForGather = targets.reshape([...targets.shape, 1]);
+  const gathered = api.gather(input, targetsForGather, { dim: input.shape.length - 1 });
+  if (isBatched && targets.shape.length === input.shape.length - 1) return gathered.reshape(targets.shape);
+  return gathered;
+}
+function dropout(api, input, p = 0.5, training = true) {
+  if (!training || p === 0) return input;
+  if (p === 1) return api.mul(input, 0);
+  if (p < 0 || p > 1) throw new Error(`dropout probability must be between 0 and 1, got ${p}`);
+  const mask = api.bernoulli(input.shape, 1 - p, { device: input.device });
+  const scale = 1 / (1 - p);
+  const scaled = api.mul(input, mask);
+  return api.mul(scaled, scale);
+}
+function crossEntropy$1(api, logits, targets, options) {
+  const reduction2 = options?.reduction ?? "mean";
+  if (logits.shape.length === 0) throw new Error("crossEntropy: logits must have at least 1 dimension");
+  if (logits.device === "webgpu" && logits.shape.length === 2) return applyReduction(api, api._crossEntropyFused(logits, targets), reduction2, logits.device);
+  const logProbs = logSoftmax(api, logits, -1);
+  return applyReduction(api, api.neg(gatherTargets(api, logProbs, targets)), reduction2, logits.device);
+}
+function nllLoss(api, logProbs, targets, options) {
+  const reduction2 = options?.reduction ?? "mean";
+  return applyReduction(api, api.neg(gatherTargets(api, logProbs, targets)), reduction2, logProbs.device);
+}
+function logSoftmax(api, input, dim) {
+  const maxVal = input.max({
+    dim,
+    keepdim: true
+  });
+  if (typeof maxVal === "number") throw new Error("logSoftmax: max with keepdim should return tensor");
+  const shifted = api.sub(input, maxVal);
+  const sumExp = shifted.exp().sum({
+    dim,
+    keepdim: true
+  });
+  if (typeof sumExp === "number") throw new Error("logSoftmax: sum with keepdim should return tensor");
+  const logSumExp = sumExp.log();
+  return api.sub(shifted, logSumExp);
+}
+var Module = class Module2 {
+  api;
+  trainingMode = true;
+  _modules = /* @__PURE__ */ new Map();
+  _params = /* @__PURE__ */ new Map();
+  _buffers = /* @__PURE__ */ new Map();
+  constructor(api) {
+    this.api = api;
+    return new Proxy(this, { set(target, prop, value, receiver) {
+      if (value instanceof Module2 && typeof prop === "string") target._modules.set(prop, value);
+      return Reflect.set(target, prop, value, receiver);
+    } });
+  }
+  /**
+  * Check if module is in training mode.
+  */
+  get training() {
+    return this.trainingMode;
+  }
+  /**
+  * Register a learnable parameter on this module.
+  * The tensor is stored in the params map AND set as a property on `this`.
+  */
+  registerParameter(name, tensor) {
+    if (tensor !== null) this._params.set(name, tensor);
+    Object.defineProperty(this, name, {
+      value: tensor,
+      writable: true,
+      configurable: true
+    });
+  }
+  /**
+  * Register a buffer (non-parameter persistent tensor) on this module.
+  * The tensor is set as a property on `this` for direct access.
+  */
+  registerBuffer(name, tensor) {
+    this._buffers.set(name, tensor);
+    Object.defineProperty(this, name, {
+      value: tensor,
+      writable: true,
+      configurable: true
+    });
+  }
+  /**
+  * Register a child module for recursive train()/eval() propagation.
+  * Usually not needed — assigning a Module-typed property auto-registers it.
+  * Use this for indexed children (e.g., `registerModule("0", child)`).
+  */
+  registerModule(name, module) {
+    this._modules.set(name, module);
+  }
+  /** Iterate over direct child modules. */
+  children() {
+    return this._modules.values();
+  }
+  /**
+  * Set module to training mode.
+  * In training mode, dropout is active, etc.
+  * Recursively sets all registered child modules.
+  */
+  train(mode = true) {
+    this.trainingMode = mode;
+    for (const child of this._modules.values()) child.train(mode);
+    return this;
+  }
+  /**
+  * Set module to evaluation mode.
+  * Equivalent to train(false).
+  */
+  eval() {
+    return this.train(false);
+  }
+  /**
+  * Get all learnable parameters, recursively.
+  * Collects own parameters then recurses into registered child modules.
+  */
+  parameters() {
+    const result = [];
+    for (const param of this._params.values()) result.push(param);
+    for (const child of this._modules.values()) result.push(...child.parameters());
+    return result;
+  }
+  /**
+  * Get all named parameters with dotted key paths, recursively.
+  * E.g. "layers.0.attn.weight" for nested modules.
+  */
+  namedParameters(prefix = "") {
+    const result = [];
+    const p = prefix ? prefix + "." : "";
+    for (const [name, param] of this._params) result.push([p + name, param]);
+    for (const [name, child] of this._modules) result.push(...child.namedParameters(p + name));
+    return result;
+  }
+  /**
+  * Return the module's state as a flat dictionary of named parameters.
+  * Keys are dotted paths like "layers.0.weight".
+  */
+  stateDict() {
+    return Object.fromEntries(this.namedParameters());
+  }
+  /**
+  * Load parameters from a state dictionary using in-place copy.
+  * Keys must match those from stateDict().
+  */
+  loadStateDict(stateDict) {
+    for (const [name, param] of this.namedParameters()) {
+      const src = stateDict[name];
+      if (!src) throw new Error(`Missing key in state_dict: ${name}`);
+      param.copy_(src);
+    }
+  }
+  /**
+  * Move all parameters and buffers to the given device.
+  * Returns this module for chaining.
+  */
+  to(device) {
+    for (const [name, param] of this._params) {
+      const moved = this.api.to(param, device);
+      this._params.set(name, moved);
+      this[name] = moved;
+    }
+    for (const [name, buffer] of this._buffers) {
+      const moved = this.api.to(buffer, device);
+      this._buffers.set(name, moved);
+      this[name] = moved;
+    }
+    for (const child of this._modules.values()) child.to(device);
+    return this;
+  }
+};
+var Dropout = class extends Module {
+  p;
+  constructor(api, options) {
+    super(api);
+    this.p = options?.p ?? 0.5;
+    if (this.p < 0 || this.p > 1) throw new Error(`Dropout probability must be between 0 and 1, got ${this.p}`);
+  }
+  forward(input) {
+    return dropout(this.api, input, this.p, this.training);
+  }
+};
+var Embedding = class extends Module {
+  numEmbeddings;
+  embeddingDim;
+  constructor(api, numEmbeddings, embeddingDim, options) {
+    super(api);
+    this.numEmbeddings = numEmbeddings;
+    this.embeddingDim = embeddingDim;
+    const device = options?.device;
+    this.registerParameter("weight", api.randn([numEmbeddings, embeddingDim], {
+      requiresGrad: true,
+      device
+    }));
+  }
+  /**
+  * Forward pass: lookup embeddings for input indices.
+  *
+  * @param input - Tensor of token indices, shape [...] (any shape)
+  * @returns Tensor of embeddings, shape [..., embeddingDim]
+  */
+  forward(input) {
+    return this.api.embedding(this.weight, input);
+  }
+};
+var init_exports = /* @__PURE__ */ __exportAll({
+  calculateFanInAndFanOut: () => calculateFanInAndFanOut,
+  calculateGain: () => calculateGain,
+  constant_: () => constant_,
+  kaimingNormal_: () => kaimingNormal_,
+  kaimingUniform_: () => kaimingUniform_,
+  normal_: () => normal_,
+  ones_: () => ones_,
+  uniform_: () => uniform_,
+  xavierNormal_: () => xavierNormal_,
+  xavierUniform_: () => xavierUniform_,
+  zeros_: () => zeros_
+});
+function calculateFanInAndFanOut(tensor) {
+  const shape = tensor.shape;
+  if (shape.length < 2) throw new Error("Fan in and fan out can not be computed for tensor with fewer than 2 dimensions");
+  const fanOut = shape[0];
+  const fanIn = shape[1];
+  if (shape.length > 2) {
+    const receptiveField = shape.slice(2).reduce((a, b) => a * b, 1);
+    return {
+      fanIn: fanIn * receptiveField,
+      fanOut: fanOut * receptiveField
+    };
+  }
+  return {
+    fanIn,
+    fanOut
+  };
+}
+function calculateGain(nonlinearity, param) {
+  switch (nonlinearity) {
+    case "linear":
+    case "identity":
+    case "sigmoid":
+      return 1;
+    case "tanh":
+      return 5 / 3;
+    case "relu":
+      return Math.sqrt(2);
+    case "leaky_relu": {
+      const negativeSlope = param ?? 0.01;
+      return Math.sqrt(2 / (1 + negativeSlope * negativeSlope));
+    }
+    default:
+      throw new Error(`Unsupported nonlinearity: ${nonlinearity}`);
+  }
+}
+function normal_(api, tensor, mean2 = 0, std = 1) {
+  const tmp = api.randn(tensor.shape, { device: tensor.device });
+  if (mean2 === 0 && std === 1) api.copy_(tensor, tmp);
+  else if (mean2 === 0) api.copy_(tensor, api.mul(tmp, std));
+  else if (std === 1) api.copy_(tensor, api.add(tmp, mean2));
+  else api.copy_(tensor, api.add(api.mul(tmp, std), mean2));
+}
+function uniform_(api, tensor, low = 0, high = 1) {
+  const tmp = api.rand(tensor.shape, { device: tensor.device });
+  if (low === 0 && high === 1) api.copy_(tensor, tmp);
+  else {
+    const range = high - low;
+    api.copy_(tensor, api.add(api.mul(tmp, range), low));
+  }
+}
+function constant_(api, tensor, val) {
+  api.fill_(tensor, val);
+}
+function zeros_(api, tensor) {
+  api.fill_(tensor, 0);
+}
+function ones_(api, tensor) {
+  api.fill_(tensor, 1);
+}
+function kaimingNormal_(api, tensor, options) {
+  const mode = options?.mode ?? "fan_in";
+  const nonlinearity = options?.nonlinearity ?? "leaky_relu";
+  const negativeSlope = options?.negativeSlope ?? 0;
+  const { fanIn, fanOut } = calculateFanInAndFanOut(tensor);
+  const fan = mode === "fan_in" ? fanIn : fanOut;
+  normal_(api, tensor, 0, calculateGain(nonlinearity, nonlinearity === "leaky_relu" ? negativeSlope : void 0) / Math.sqrt(fan));
+}
+function kaimingUniform_(api, tensor, options) {
+  const mode = options?.mode ?? "fan_in";
+  const nonlinearity = options?.nonlinearity ?? "leaky_relu";
+  const negativeSlope = options?.negativeSlope ?? 0;
+  const { fanIn, fanOut } = calculateFanInAndFanOut(tensor);
+  const fan = mode === "fan_in" ? fanIn : fanOut;
+  const bound = calculateGain(nonlinearity, nonlinearity === "leaky_relu" ? negativeSlope : void 0) * Math.sqrt(3 / fan);
+  uniform_(api, tensor, -bound, bound);
+}
+function xavierUniform_(api, tensor, options) {
+  const gain = options?.gain ?? 1;
+  const { fanIn, fanOut } = calculateFanInAndFanOut(tensor);
+  const bound = gain * Math.sqrt(6 / (fanIn + fanOut));
+  uniform_(api, tensor, -bound, bound);
+}
+function xavierNormal_(api, tensor, options) {
+  const gain = options?.gain ?? 1;
+  const { fanIn, fanOut } = calculateFanInAndFanOut(tensor);
+  normal_(api, tensor, 0, gain * Math.sqrt(2 / (fanIn + fanOut)));
+}
+var LayerNorm = class extends Module {
+  normalizedShape;
+  eps;
+  constructor(api, normalizedShape, options) {
+    super(api);
+    this.normalizedShape = normalizedShape;
+    this.eps = options?.eps ?? 1e-5;
+    const elementwiseAffine = options?.elementwiseAffine ?? true;
+    const device = options?.device;
+    this.registerParameter("weight", elementwiseAffine ? api.ones([normalizedShape], {
+      requiresGrad: true,
+      device
+    }) : null);
+    this.registerParameter("bias", elementwiseAffine ? api.zeros([normalizedShape], {
+      requiresGrad: true,
+      device
+    }) : null);
+  }
+  /**
+  * Forward pass: apply layer normalization.
+  *
+  * @param input - Input tensor of shape [..., normalizedShape]
+  * @returns Normalized tensor of same shape
+  */
+  forward(input) {
+    if (this.weight === null || this.bias === null) throw new Error("LayerNorm without elementwiseAffine is not yet supported");
+    return input.layernorm(this.weight, this.bias, this.eps);
+  }
+};
+var Linear = class extends Module {
+  inFeatures;
+  outFeatures;
+  constructor(api, inFeatures, outFeatures, options) {
+    super(api);
+    this.inFeatures = inFeatures;
+    this.outFeatures = outFeatures;
+    const hasBias = options?.bias ?? true;
+    const device = options?.device;
+    this.registerParameter("weight", api.randn([outFeatures, inFeatures], {
+      requiresGrad: true,
+      device
+    }));
+    this.registerParameter("bias", hasBias ? api.zeros([outFeatures], {
+      requiresGrad: true,
+      device
+    }) : null);
+  }
+  /**
+  * Forward pass: y = x @ W^T + b
+  *
+  * @param input - Input tensor of shape [..., inFeatures]
+  * @returns Output tensor of shape [..., outFeatures]
+  */
+  forward(input) {
+    return this.api.linear(input, this.weight, this.bias);
+  }
+};
+var ModuleList = class extends Module {
+  _list = [];
+  constructor(api, modules) {
+    super(api);
+    if (modules) for (const m of modules) this.append(m);
+  }
+  append(module) {
+    this.registerModule(String(this._list.length), module);
+    this._list.push(module);
+    return this;
+  }
+  get length() {
+    return this._list.length;
+  }
+  get(i) {
+    return this._list[i];
+  }
+  [Symbol.iterator]() {
+    return this._list[Symbol.iterator]();
+  }
+  forward(_input) {
+    throw new Error("ModuleList does not implement forward()");
+  }
+};
+var Sequential = class extends Module {
+  constructor(api, ...modules) {
+    super(api);
+    for (let i = 0; i < modules.length; i++) this.registerModule(String(i), modules[i]);
+  }
+  forward(input) {
+    let x = input;
+    for (const child of this.children()) x = child.forward(x);
+    return x;
+  }
+};
+var nn_exports = /* @__PURE__ */ __exportAll({
+  Dropout: () => Dropout,
+  Embedding: () => Embedding,
+  LayerNorm: () => LayerNorm,
+  Linear: () => Linear,
+  Module: () => Module,
+  ModuleList: () => ModuleList,
+  Sequential: () => Sequential,
+  checkpoint: () => checkpoint$1,
+  checkpointSequential: () => checkpointSequential,
+  clipGradNorm_: () => clipGradNorm_,
+  clipGradValue_: () => clipGradValue_,
+  createLayerCheckpointer: () => createLayerCheckpointer,
+  crossEntropy: () => crossEntropy$1,
+  dropout: () => dropout,
+  estimateCheckpointSavings: () => estimateCheckpointSavings,
+  functional: () => functional_exports,
+  init: () => init_exports,
+  logSoftmax: () => logSoftmax,
+  nllLoss: () => nllLoss
+});
+init_node_factory();
+init_node_factory();
+init_webgpu();
+const { checkpoint, crossEntropy } = nn_exports;
+let status = "idle";
+const modelStore = {
+  get isReady() {
+    return status === "ready";
+  }
+};
+let prompt = "Once upon a time";
+let temperature = 0.8;
+let topK = 40;
+let isGenerating = false;
+const generationStore = {
+  get prompt() {
+    return prompt;
+  },
+  set prompt(v) {
+    prompt = v;
+  },
+  get temperature() {
+    return temperature;
+  },
+  set temperature(v) {
+    temperature = v;
+  },
+  get topK() {
+    return topK;
+  },
+  set topK(v) {
+    topK = v;
+  },
+  get isGenerating() {
+    return isGenerating;
+  }
+};
+let rank = 64;
+let alpha = 16;
+let maxSteps = 200;
+let batchSize = 1;
+let seqLen = 128;
+let lr = 5e-4;
+let useAMP = true;
+let useCheckpointing = true;
+let dataTokenCount = 0;
+let running = false;
+let step = 0;
+let lossHistory = [];
+const canTrain = dataTokenCount >= batchSize * (seqLen + 1) && !running && modelStore.isReady;
+const trainingStore = {
+  // Config
+  get rank() {
+    return rank;
+  },
+  set rank(v) {
+    rank = v;
+  },
+  get alpha() {
+    return alpha;
+  },
+  set alpha(v) {
+    alpha = v;
+  },
+  get maxSteps() {
+    return maxSteps;
+  },
+  set maxSteps(v) {
+    maxSteps = v;
+  },
+  get batchSize() {
+    return batchSize;
+  },
+  set batchSize(v) {
+    batchSize = v;
+  },
+  get seqLen() {
+    return seqLen;
+  },
+  set seqLen(v) {
+    seqLen = v;
+  },
+  get lr() {
+    return lr;
+  },
+  set lr(v) {
+    lr = v;
+  },
+  get useAMP() {
+    return useAMP;
+  },
+  set useAMP(v) {
+    useAMP = v;
+  },
+  get useCheckpointing() {
+    return useCheckpointing;
+  },
+  set useCheckpointing(v) {
+    useCheckpointing = v;
+  },
+  // Progress
+  get running() {
+    return running;
+  },
+  get step() {
+    return step;
+  },
+  get lossHistory() {
+    return lossHistory;
+  },
+  get canTrain() {
+    return canTrain;
+  }
+};
+function _page($$renderer, $$props) {
+  $$renderer.component(($$renderer2) => {
+    function fmtLoss(v) {
+      return "--";
+    }
+    function fmtTokSec(v) {
+      return "--";
+    }
+    function fmtLr(v) {
+      if (v >= 0.01) return v.toFixed(3);
+      return v.toExponential(0);
+    }
+    function lossChartPath(history) {
+      if (history.length < 2) return "";
+      const maxLoss = Math.max(...history);
+      const minLoss = Math.min(...history);
+      const range = maxLoss - minLoss || 1;
+      const w = 100;
+      const h = 100;
+      const pts = history.map((l, i) => {
+        const x = i / (history.length - 1) * w;
+        const y = h - (l - minLoss) / range * h;
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      });
+      return `M${pts.join(" L")}`;
+    }
+    function lrToSlider(lr2) {
+      return (Math.log10(lr2) + 5) / 3 * 100;
+    }
+    $$renderer2.push(`<div class="max-w-5xl mx-auto p-2 font-sans"><header class="flex items-center gap-3 px-2 py-1.5 border-b border-slate-800"><span class="text-sm font-semibold text-slate-200 tracking-tight">GPT-2 LoRA</span> `);
+    {
+      $$renderer2.push("<!--[!-->");
+      {
+        $$renderer2.push("<!--[!-->");
+        {
+          $$renderer2.push("<!--[!-->");
+          $$renderer2.push(`<span class="text-xs text-slate-500">Not loaded</span>`);
+        }
+        $$renderer2.push(`<!--]-->`);
+      }
+      $$renderer2.push(`<!--]-->`);
+    }
+    $$renderer2.push(`<!--]--> <div class="flex-1"></div> `);
+    {
+      $$renderer2.push("<!--[-->");
+      $$renderer2.push(`<button class="px-2 py-0.5 text-xs bg-blue-600 hover:bg-blue-500 text-white">Load Model</button>`);
+    }
+    $$renderer2.push(`<!--]--> `);
+    {
+      $$renderer2.push("<!--[!-->");
+    }
+    $$renderer2.push(`<!--]--> <span class="text-xs text-slate-600 font-mono">distilgpt2</span></header> <div class="grid grid-cols-1 lg:grid-cols-2 gap-0 border-b border-slate-800"><div class="border-r border-slate-800 p-2 flex flex-col gap-2"><div class="text-[10px] uppercase tracking-widest text-slate-500 font-semibold">Training</div> <div class="grid grid-cols-[auto_1fr_auto] gap-x-2 gap-y-1 items-center text-xs"><label for="sl-rank" class="text-slate-400">rank</label> <input id="sl-rank" type="range" min="1" max="64"${attr("value", trainingStore.rank)} class="w-full"${attr("disabled", trainingStore.running, true)}/> <span class="font-mono text-slate-300 w-8 text-right">${escape_html(trainingStore.rank)}</span> <label for="sl-alpha" class="text-slate-400">alpha</label> <input id="sl-alpha" type="range" min="1" max="64"${attr("value", trainingStore.alpha)} class="w-full"${attr("disabled", trainingStore.running, true)}/> <span class="font-mono text-slate-300 w-8 text-right">${escape_html(trainingStore.alpha)}</span> <label for="sl-lr" class="text-slate-400">lr</label> <input id="sl-lr" type="range" min="0" max="100"${attr("value", lrToSlider(trainingStore.lr))} class="w-full"${attr("disabled", trainingStore.running, true)}/> <span class="font-mono text-slate-300 w-12 text-right">${escape_html(fmtLr(trainingStore.lr))}</span> <label for="sl-steps" class="text-slate-400">steps</label> <input id="sl-steps" type="range" min="10" max="1000" step="10"${attr("value", trainingStore.maxSteps)} class="w-full"${attr("disabled", trainingStore.running, true)}/> <span class="font-mono text-slate-300 w-8 text-right">${escape_html(trainingStore.maxSteps)}</span> <label for="sl-batch" class="text-slate-400">batch</label> <input id="sl-batch" type="range" min="1" max="16"${attr("value", trainingStore.batchSize)} class="w-full"${attr("disabled", trainingStore.running, true)}/> <span class="font-mono text-slate-300 w-8 text-right">${escape_html(trainingStore.batchSize)}</span> <label for="sl-seqlen" class="text-slate-400">seqlen</label> <input id="sl-seqlen" type="range" min="16" max="256" step="16"${attr("value", trainingStore.seqLen)} class="w-full"${attr("disabled", trainingStore.running, true)}/> <span class="font-mono text-slate-300 w-8 text-right">${escape_html(trainingStore.seqLen)}</span></div> <div class="flex gap-4 text-xs text-slate-400"><label class="flex items-center gap-1 cursor-pointer"><input type="checkbox"${attr("checked", trainingStore.useAMP, true)}${attr("disabled", trainingStore.running, true)} class="accent-blue-500"/> AMP</label> <label class="flex items-center gap-1 cursor-pointer"><input type="checkbox"${attr("checked", trainingStore.useCheckpointing, true)}${attr("disabled", trainingStore.running, true)} class="accent-blue-500"/> Ckpt</label></div> <div class="flex gap-2 items-center">`);
+    {
+      $$renderer2.push("<!--[-->");
+      $$renderer2.push(`<button${attr("disabled", !trainingStore.canTrain, true)} class="px-2 py-0.5 text-xs bg-green-700 hover:bg-green-600 text-white disabled:opacity-30 disabled:cursor-not-allowed">▶ Train</button>`);
+    }
+    $$renderer2.push(`<!--]--> <div class="font-mono text-xs text-slate-400 flex gap-3">`);
+    if (trainingStore.lossHistory.length > 0) {
+      $$renderer2.push("<!--[-->");
+      $$renderer2.push(`<span>step <span class="text-slate-200">${escape_html(trainingStore.step)}</span>/${escape_html(trainingStore.maxSteps)}</span> <span>loss <span class="text-slate-200">${escape_html(fmtLoss())}</span></span> <span><span class="text-slate-200">${escape_html(fmtTokSec())}</span> tok/s</span>`);
+    } else {
+      $$renderer2.push("<!--[!-->");
+    }
+    $$renderer2.push(`<!--]--></div></div> `);
+    {
+      $$renderer2.push("<!--[!-->");
+    }
+    $$renderer2.push(`<!--]--> `);
+    if (trainingStore.lossHistory.length >= 2) {
+      $$renderer2.push("<!--[-->");
+      $$renderer2.push(`<div class="border border-slate-800 p-1"><svg viewBox="-2 -2 104 104" class="w-full h-24" preserveAspectRatio="none"><path${attr("d", lossChartPath(trainingStore.lossHistory))} fill="none" stroke="#3b82f6" stroke-width="1.5" vector-effect="non-scaling-stroke"></path></svg> <div class="flex justify-between text-[9px] font-mono text-slate-600 px-0.5"><span>0</span> <span>loss</span> <span>${escape_html(trainingStore.maxSteps)}</span></div></div>`);
+    } else {
+      $$renderer2.push("<!--[!-->");
+    }
+    $$renderer2.push(`<!--]--> <div${attr_class(`border border-dashed text-xs px-2 py-1.5 ${stringify("border-slate-700")}`)} role="region" aria-label="File drop zone">`);
+    {
+      $$renderer2.push("<!--[!-->");
+      {
+        $$renderer2.push("<!--[!-->");
+        $$renderer2.push(`<span class="text-slate-500">Drop a .txt file here for training data</span>`);
+      }
+      $$renderer2.push(`<!--]-->`);
+    }
+    $$renderer2.push(`<!--]--></div></div> <div class="p-2 flex flex-col gap-2"><div class="text-[10px] uppercase tracking-widest text-slate-500 font-semibold">Generate</div> <textarea class="w-full bg-slate-900 border border-slate-700 text-sm text-slate-200 font-mono p-1.5 resize-none focus:outline-none focus:border-blue-600" rows="2" placeholder="Enter prompt..."${attr("disabled", generationStore.isGenerating, true)}>`);
+    const $$body = escape_html(generationStore.prompt);
+    if ($$body) {
+      $$renderer2.push(`${$$body}`);
+    }
+    $$renderer2.push(`</textarea> <div class="flex items-center gap-3"><button${attr("disabled", true, true)} class="px-2 py-0.5 text-xs bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-30 disabled:cursor-not-allowed">Generate</button> <div class="flex items-center gap-2 text-xs text-slate-500"><label class="flex items-center gap-1">temp <input type="range" min="1" max="200"${attr("value", Math.round(generationStore.temperature * 100))} class="w-16"/> <span class="font-mono text-slate-400 w-6">${escape_html(generationStore.temperature.toFixed(1))}</span></label> <label class="flex items-center gap-1">k <input type="range" min="1" max="100"${attr("value", generationStore.topK)} class="w-12"/> <span class="font-mono text-slate-400 w-5">${escape_html(generationStore.topK)}</span></label></div></div> <div class="flex-1 min-h-[200px] border border-slate-800 p-2 font-mono text-xs text-slate-300 overflow-y-auto whitespace-pre-wrap">`);
+    {
+      $$renderer2.push("<!--[!-->");
+      {
+        $$renderer2.push("<!--[!-->");
+        $$renderer2.push(`<span class="text-slate-600 italic">Output will appear here...</span>`);
+      }
+      $$renderer2.push(`<!--]-->`);
+    }
+    $$renderer2.push(`<!--]--></div> `);
+    {
+      $$renderer2.push("<!--[!-->");
+    }
+    $$renderer2.push(`<!--]--> `);
+    {
+      $$renderer2.push("<!--[!-->");
+    }
+    $$renderer2.push(`<!--]--></div></div></div>`);
+  });
+}
+const tensor1l1COWZg = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
+  __proto__: null,
+  clearDisposedPendingNodeIds,
+  getAllPendingTensors,
+  getPendingNodeIds,
+  materializePendingTensors
+}, Symbol.toStringTag, { value: "Module" }));
+export {
+  computeBatchStrides as A,
+  computeMatmulOutputShape as B,
+  _page as _,
+  dtypeBytes as a,
+  resolveOutputBuffer as b,
+  createTileKernelDispatcher as c,
+  dispatchFusedKernel as d,
+  dtypeToTileIR as e,
+  init_buffer_arena as f,
+  init_shape_utils as g,
+  init_webgpu_state as h,
+  init_fusion_dispatch as i,
+  init_fusion_tile_ir as j,
+  init_tile_ir as k,
+  applyFusedOp as l,
+  init_tile_dispatch as m,
+  init_webgpu as n,
+  onTeardown as o,
+  perRowKernel as p,
+  deferredDestroyBuffer as q,
+  requireContext as r,
+  dispatchMatmul as s,
+  dispatchMatmulDirect as t,
+  flushSharedEncoder as u,
+  isF16Supported as v,
+  init_buffer_pool as w,
+  awaitDeferredFence as x,
+  init_dispatch$1 as y,
+  computeBatchSize as z
+};

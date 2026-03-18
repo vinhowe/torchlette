@@ -43,6 +43,8 @@ export class Adam {
   private _groupIndex: number[];
   private expAvg: Array<RuntimeTensor | null>;
   private expAvgSq: Array<RuntimeTensor | null>;
+  /** Intermediate tensors from the last step — disposed after markStep(). */
+  private _intermediates: RuntimeTensor[] = [];
   private steps: number[];
   /** Pending adamStep nodes from the last step, for side output extraction */
   private _pendingNodes: Array<LazyIRNode | null>;
