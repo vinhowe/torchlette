@@ -277,11 +277,18 @@ function handleLoadModel() {
 
       <!-- Generate button + sampling params -->
       <div class="flex items-center gap-3">
-        <button
-          onclick={() => generationStore.generate()}
-          disabled={!generationStore.canGenerate}
-          class="px-2 py-0.5 text-xs bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-30 disabled:cursor-not-allowed"
-        >Generate</button>
+        {#if generationStore.isGenerating}
+          <button
+            onclick={() => generationStore.stopGenerate()}
+            class="px-2 py-0.5 text-xs bg-red-600 hover:bg-red-500 text-white"
+          >■ Stop</button>
+        {:else}
+          <button
+            onclick={() => generationStore.generate()}
+            disabled={!generationStore.canGenerate}
+            class="px-2 py-0.5 text-xs bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-30 disabled:cursor-not-allowed"
+          >Generate</button>
+        {/if}
 
         <div class="flex items-center gap-2 text-xs text-slate-500">
           <label class="flex items-center gap-1">
