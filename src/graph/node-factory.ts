@@ -1,12 +1,7 @@
 import type { BackendTensor, DeviceKind, DType } from "../backend/types";
-import type {
-  LazyIRNode,
-  LazyOpCode,
-  LazyRef,
-  StorageHandle,
-} from "./types";
 import { getProfileModule } from "./profiler";
 import { storageTracker } from "./storage-tracker";
+import type { LazyIRNode, LazyOpCode, LazyRef, StorageHandle } from "./types";
 
 // ============================================================================
 // Node and Storage ID Counters
@@ -54,13 +49,11 @@ export function getNextStorageId(): number {
 export function createStorageHandle(
   device: DeviceKind,
   backendTensor: BackendTensor,
-  baseStorageId?: number,
 ): StorageHandle {
   const storage: StorageHandle = {
     id: nextStorageId++,
     device,
     backendTensor,
-    baseStorageId,
   };
   // Register in the global tracker
   storageTracker.register(storage);
@@ -86,12 +79,32 @@ export function wrapResultAsStorage(
   if (aliasedInputIdx >= 0 && resultTensor.ownsBuffer === true) {
     resultTensor = { ...resultTensor, ownsBuffer: false };
   }
-  const isView = resultTensor.ownsBuffer === false;
-  const baseStorageId =
-    isView && inputStorages.length > 0
-      ? inputStorages[aliasedInputIdx >= 0 ? aliasedInputIdx : 0].id
-      : undefined;
-  return createStorageHandle(device, resultTensor, baseStorageId);
+  const storage = createStorageHandle(device, resultTensor);
+  // Set baseStorageId when the result shares a buffer with an input.
+  // Two checks: (1) same object (indexOf match), or (2) same underlying
+  // buffer (for contiguous() which returns a new object wrapping the same buffer).
+  // Do NOT chain results that have ownsBuffer=false but use an independent
+  // buffer (e.g., f16 weight cache hits) — those would create fake view
+  // chains that leak storages.
+  if (inputStorages.length > 0) {
+    let baseIdx = aliasedInputIdx;
+    if (baseIdx < 0 && resultTensor.ownsBuffer === false) {
+      // Check buffer-level aliasing for non-object-aliased views
+      const resultBuf = (resultTensor as { buffer?: unknown }).buffer;
+      if (resultBuf) {
+        for (let i = 0; i < backendInputs.length; i++) {
+          if ((backendInputs[i] as { buffer?: unknown }).buffer === resultBuf) {
+            baseIdx = i;
+            break;
+          }
+        }
+      }
+    }
+    if (baseIdx >= 0) {
+      storage.baseStorageId = inputStorages[baseIdx].id;
+    }
+  }
+  return storage;
 }
 
 // ============================================================================

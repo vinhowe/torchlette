@@ -393,14 +393,12 @@ function assignPackedAdamResult(
 /** Assign result + side outputs for a param updated by per-param adamOp (standard path). */
 function assignPerParamAdamResult(
   adamNode: LazyIRNode,
-  s1: StorageHandle,
+  _s1: StorageHandle,
   adamResult: { param: BackendTensor; m: BackendTensor; v: BackendTensor },
 ): void {
-  const paramResult = adamResult.param;
-  const paramOwns = (paramResult as { ownsBuffer?: boolean }).ownsBuffer;
-  const finalResult =
-    paramOwns === true ? { ...paramResult, ownsBuffer: false } : paramResult;
-  adamNode.result = createStorageHandle(adamNode.device, finalResult, s1.id);
+  // The fused Adam kernel writes in-place and returns a new owning tensor.
+  // Do NOT chain as a view via baseStorageId (removed from createStorageHandle API).
+  adamNode.result = createStorageHandle(adamNode.device, adamResult.param);
   const mStorage = createStorageHandle(adamNode.device, adamResult.m);
   const vStorage = createStorageHandle(adamNode.device, adamResult.v);
   adamNode.results = [adamNode.result, mStorage, vStorage];
