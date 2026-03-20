@@ -1,6 +1,7 @@
 import type { AdamStepConfig, DeviceKind } from "../backend/types";
 import type { Tensor, Torchlette } from "../frontend/torchlette";
 import { createLazyIRNode } from "../graph/node-factory";
+import { storageTracker } from "../graph/storage-tracker";
 import type { LazyIRNode } from "../graph/types";
 import { createPendingRef } from "../graph/types";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
@@ -207,6 +208,11 @@ export class Adam {
         // Dispose old state
         if (this.expAvg[i]) this.expAvg[i]?.dispose();
         if (this.expAvgSq[i]) this.expAvgSq[i]?.dispose();
+
+        // Unprotect m/v storages — createFromStorageHandle will register
+        // them with the RuntimeTensor as the WeakRef target for normal lifecycle.
+        storageTracker.unprotect(mStorage.id);
+        storageTracker.unprotect(vStorage.id);
 
         // Wrap existing StorageHandles into tracked RuntimeTensors
         this.expAvg[i] = runtime.createFromStorageHandle(

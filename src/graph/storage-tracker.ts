@@ -25,6 +25,10 @@ class StorageTracker {
   /** Storage IDs that recently became unreachable (for incremental scanning) */
   private recentlyUnreachable = new Set<number>();
 
+  /** Storage IDs protected from destroyUnreachable without needing a WeakRef.
+   *  Used for Adam m/v side outputs between creation and extraction. */
+  private protectedStorages = new Set<number>();
+
   /** Debug counters for tracking reachability changes per step */
   private _debugRegisterCount = 0;
   private _debugReachableCount = 0;
@@ -64,6 +68,22 @@ class StorageTracker {
       this._debugUnreachableCount++;
       this.recentlyUnreachable.add(storageId);
     }
+  }
+
+  /**
+   * Protect a storage from destroyUnreachable without a WeakRef.
+   * Used for side-output storages (Adam m/v) between creation and extraction.
+   * Call unprotect() when the storage is wrapped in a RuntimeTensor.
+   */
+  protect(storageId: number): void {
+    this.protectedStorages.add(storageId);
+  }
+
+  /**
+   * Remove protection. The storage will be managed by normal reachability.
+   */
+  unprotect(storageId: number): void {
+    this.protectedStorages.delete(storageId);
   }
 
   /**
@@ -172,7 +192,11 @@ class StorageTracker {
     const toDestroy: number[] = [];
     for (const [id] of this.allStorages) {
       if (sinceId !== undefined && id < sinceId) continue;
-      if (!this.externallyReachable.has(id) && !neededByViews.has(id)) {
+      if (
+        !this.externallyReachable.has(id) &&
+        !neededByViews.has(id) &&
+        !this.protectedStorages.has(id)
+      ) {
         toDestroy.push(id);
       }
     }
@@ -225,6 +249,7 @@ class StorageTracker {
     this.externallyReachable.clear();
     this.tensorWeakRefs.clear();
     this.recentlyUnreachable.clear();
+    this.protectedStorages.clear();
   }
 
   /**

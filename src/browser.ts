@@ -6,6 +6,8 @@ export {
   createTileKernelDispatcher,
   type DataType,
   elementwiseGrid,
+  enableAllAllocDebug,
+  getAndResetFlowCounters,
   getGPUMemoryStats,
   getWebGPUDevice,
   getWebGPUInitError,

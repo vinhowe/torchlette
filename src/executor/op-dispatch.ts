@@ -1,4 +1,3 @@
-import { OP_REGISTRY } from "../ops/registry";
 import { getBackend } from "../backend/registry";
 import type {
   AdamStepConfig,
@@ -8,7 +7,6 @@ import type {
   DType,
 } from "../backend/types";
 import { sizeOf } from "../core/shape";
-import type { LazyIRNode, LazyRef, StorageHandle } from "../graph/types";
 import { createStorageHandle } from "../graph/node-factory";
 import {
   getCurrentOpLabel,
@@ -18,6 +16,8 @@ import {
   setProfileModule,
 } from "../graph/profiler";
 import { storageTracker } from "../graph/storage-tracker";
+import type { LazyIRNode, LazyRef, StorageHandle } from "../graph/types";
+import { OP_REGISTRY } from "../ops/registry";
 
 /**
  * Execute a function within a profiling context.
@@ -360,9 +360,9 @@ function executeAdamStep(
     const mStorage = createStorageHandle(node.device, adamResult.m);
     const vStorage = createStorageHandle(node.device, adamResult.v);
     node.results = [null as unknown as StorageHandle, mStorage, vStorage];
-    // Keep m/v alive until optimizer reads them at next step
-    storageTracker.markReachable(mStorage.id, node.results);
-    storageTracker.markReachable(vStorage.id, node.results);
+    // Protect m/v from destroyUnreachable until _resolvePendingState extracts them
+    storageTracker.protect(mStorage.id);
+    storageTracker.protect(vStorage.id);
     return adamResult.param;
   })();
 }

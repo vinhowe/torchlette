@@ -386,8 +386,8 @@ function assignPackedAdamResult(
   const mStorage = createStorageHandle(adamNode.device, newM);
   const vStorage = createStorageHandle(adamNode.device, newV);
   adamNode.results = [adamNode.result!, mStorage, vStorage];
-  storageTracker.markReachable(mStorage.id, adamNode.results);
-  storageTracker.markReachable(vStorage.id, adamNode.results);
+  storageTracker.protect(mStorage.id);
+  storageTracker.protect(vStorage.id);
 }
 
 /** Assign result + side outputs for a param updated by per-param adamOp (standard path). */
@@ -402,8 +402,8 @@ function assignPerParamAdamResult(
   const mStorage = createStorageHandle(adamNode.device, adamResult.m);
   const vStorage = createStorageHandle(adamNode.device, adamResult.v);
   adamNode.results = [adamNode.result, mStorage, vStorage];
-  storageTracker.markReachable(mStorage.id, adamNode.results);
-  storageTracker.markReachable(vStorage.id, adamNode.results);
+  storageTracker.protect(mStorage.id);
+  storageTracker.protect(vStorage.id);
 }
 
 /** Collect GPU buffers from all external (materialized/already-resolved) plan inputs. */
