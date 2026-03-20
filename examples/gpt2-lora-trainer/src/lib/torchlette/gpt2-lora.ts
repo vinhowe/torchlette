@@ -304,23 +304,28 @@ class CausalSelfAttentionLoRA {
 }
 
 // ============================================================================
-// MLP (frozen)
+// MLP with LoRA on the expansion layer
 // ============================================================================
 
-class MLP {
+class MLPLoRA {
   readonly api: Torchlette;
-  readonly cFc: Linear;
-  readonly cProj: Linear;
+  readonly cFc: LoRALinear; // LoRA on expansion — controls feature activation
+  readonly cProj: Linear; // Frozen projection back
 
   constructor(
     api: Torchlette,
     config: GPT2Config,
+    loraConfig: LoRAConfig,
     device: "cpu" | "webgpu" = "webgpu",
   ) {
     this.api = api;
-    this.cFc = new Linear(api, config.embedDim, 4 * config.embedDim, {
-      device,
-    });
+    this.cFc = new LoRALinear(
+      api,
+      config.embedDim,
+      4 * config.embedDim,
+      loraConfig,
+      { device },
+    );
     this.cProj = new Linear(api, 4 * config.embedDim, config.embedDim, {
       device,
     });
@@ -330,6 +335,10 @@ class MLP {
     let h = this.cFc.forward(x);
     h = h.gelu();
     return this.cProj.forward(h);
+  }
+
+  getLoRAParameters(): Tensor[] {
+    return this.cFc.getLoRAParameters();
   }
 }
 
@@ -342,7 +351,7 @@ class TransformerBlockLoRA {
   readonly ln1: LayerNorm;
   readonly attn: CausalSelfAttentionLoRA;
   readonly ln2: LayerNorm;
-  readonly mlp: MLP;
+  readonly mlp: MLPLoRA;
 
   constructor(
     api: Torchlette,
@@ -354,7 +363,7 @@ class TransformerBlockLoRA {
     this.ln1 = new LayerNorm(api, config.embedDim, device);
     this.attn = new CausalSelfAttentionLoRA(api, config, loraConfig, device);
     this.ln2 = new LayerNorm(api, config.embedDim, device);
-    this.mlp = new MLP(api, config, device);
+    this.mlp = new MLPLoRA(api, config, loraConfig, device);
   }
 
   forward(x: Tensor): Tensor {
@@ -370,7 +379,7 @@ class TransformerBlockLoRA {
   }
 
   getLoRAParameters(): Tensor[] {
-    return this.attn.getLoRAParameters();
+    return [...this.attn.getLoRAParameters(), ...this.mlp.getLoRAParameters()];
   }
 }
 
@@ -610,12 +619,12 @@ export class GPT2WithLoRA {
         );
       }
 
-      // MLP cFc
+      // MLP cFc (LoRA-wrapped)
       const cFcW = weights.get(`${prefix}.mlp.c_fc.weight`);
       const cFcB = weights.get(`${prefix}.mlp.c_fc.bias`);
       if (cFcW && cFcB) {
         const transposed = this.transposeWeight(cFcW.data, cFcW.shape);
-        block.mlp.cFc.loadWeights(
+        block.mlp.cFc.loadBaseWeights(
           this.api.tensorFromArray(transposed.data, transposed.shape),
           this.api.tensorFromArray(cFcB.data, cFcB.shape),
         );

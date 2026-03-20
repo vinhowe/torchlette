@@ -126,11 +126,12 @@ export class LoRALinear {
     const scalingTensor = this.api.tensorFromArray([this.scaling], []);
     const scaledLora = this.api.mul(loraOut, scalingTensor);
 
-    // Detach base output — base weights are frozen (requiresGrad=false).
-    // This prevents building autograd graph through base weights, saving memory.
-    // Gradient for x flows through the LoRA path only, which is sufficient
-    // since the LoRA adapter is the only thing being optimized.
-    return this.api.add(withBias.detach(), scaledLora);
+    // Combine base + LoRA outputs. Do NOT detach the base output — even
+    // though base weights have requiresGrad=false (no gradient computed FOR
+    // them), the backward pass still needs dL/dx = grad @ W^T to propagate
+    // gradients through the network. Detaching kills this signal and makes
+    // the LoRA adaptation unable to learn from the base model's structure.
+    return this.api.add(withBias, scaledLora);
   }
 
   /**
