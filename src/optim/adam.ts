@@ -222,6 +222,10 @@ export class Adam {
       } else {
         missed++;
       }
+      // Clear results array to release the WeakRef target used by
+      // storageTracker.markReachable. Without this, old results arrays
+      // keep m/v storages reachable until GC collects the node.
+      if (node.results) node.results = undefined as never;
       this._pendingNodes[i] = null;
     }
     // resolved/missed counters available for debug if needed

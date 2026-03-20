@@ -1,9 +1,9 @@
-import type { StorageHandle } from "./types";
 import {
   findDeadTensorsAtStep,
   type TensorLifetime,
 } from "./lifetime-analysis";
 import { getNextStorageId } from "./node-factory";
+import type { StorageHandle } from "./types";
 
 /**
  * Step-scoped storage tracker for memory management (§14).

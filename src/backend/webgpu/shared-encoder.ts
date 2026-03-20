@@ -281,6 +281,13 @@ export async function beginStep(): Promise<void> {
   // so the upcoming training step can reuse them, eliminating the 2-step lag
   // that previously caused hundreds of unnecessary createBuffer() calls.
   await awaitDeferredFence();
+  // Now that the GPU fence has resolved, it's safe to destroy buffers that
+  // were queued for destruction during the previous step. Before the fence,
+  // these buffers may still be referenced by in-flight command buffers.
+  // Previously destroyPendingGPUBuffers() was called in markStep() and
+  // autograd cleanup — both BEFORE the fence, causing "Buffer used in submit
+  // while destroyed" WebGPU validation warnings.
+  bufferPool.destroyPendingBuffers();
   // End the previous step's window tracking (if any) and compute reservation.
   // This must happen AFTER awaitDeferredFence (which may trigger pool operations)
   // and BEFORE reserve() (which uses the computed reservation).

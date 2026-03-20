@@ -249,12 +249,15 @@ class GPUMemoryTracker {
   }
 
   private _trackAllocationInner(buffer: unknown, sizeBytes: number): void {
-    if (
-      this._debugAllAllocEnabled &&
-      buffer !== null &&
-      this.bufferSizes.has(buffer)
-    ) {
-      this._debugDoubleTrackCount++;
+    // If this buffer is already tracked (e.g., ownership transfer for in-place
+    // Adam updates), subtract the old size first to avoid double-counting.
+    // Without this, currentAllocatedBytes grows by sizeBytes each step for
+    // every buffer that gets a new owning tensor via createTensor.
+    const oldSize = this.bufferSizes.get(buffer);
+    if (oldSize !== undefined) {
+      this.currentAllocatedBytes -= oldSize;
+      this.allocationCount--;
+      if (this._debugAllAllocEnabled) this._debugDoubleTrackCount++;
     }
     this.bufferSizes.set(buffer, sizeBytes);
     this.currentAllocatedBytes += sizeBytes;

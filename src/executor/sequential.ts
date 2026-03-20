@@ -1,25 +1,25 @@
 import { getBackend } from "../backend/registry";
 import type { Backend } from "../backend/types";
 import { isFusedBackend } from "../backend/types";
+import type { TensorLifetime } from "../graph/lifetime-analysis";
+import { wrapResultAsStorage } from "../graph/node-factory";
+import {
+  canSafelyRelease,
+  releaseBufferImmediate,
+  releaseDeadTensors,
+} from "../graph/storage-tracker";
 import type {
   ExecutePlanOptions,
   ExecutionPlan,
   LazyIRNode,
   StorageHandle,
 } from "../graph/types";
-import type { TensorLifetime } from "../graph/lifetime-analysis";
-import { wrapResultAsStorage } from "../graph/node-factory";
 import { executeOp, getInputStorage } from "./op-dispatch";
 import {
   initLifetimeAnalysis,
   pretunePlanMatmuls,
   segmentPlanAtCheckpoints,
 } from "./plan-builder";
-import {
-  canSafelyRelease,
-  releaseBufferImmediate,
-  releaseDeadTensors,
-} from "../graph/storage-tracker";
 
 // ============================================================================
 // Sequential Plan Execution

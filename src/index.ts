@@ -26,6 +26,7 @@ export {
   Torchlette,
   torch,
 } from "./frontend/torchlette";
+export { storageTracker } from "./graph/storage-tracker";
 export * as nn from "./nn";
 export {
   Adam,
@@ -41,3 +42,7 @@ export {
   type SGDOptions,
   StepLR,
 } from "./optim";
+export {
+  getTensorDebugStats,
+  resetTensorDebugStats,
+} from "./runtime/tensor";
