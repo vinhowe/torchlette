@@ -1,10 +1,10 @@
 import { shapesEqual } from "../core/shape";
 import { storageTracker } from "../graph/storage-tracker";
-import type { Torchlette } from "./torchlette";
-import type { Tensor } from "./tensor";
-import type { AutogradNode, GetSavedFn } from "./types";
 import { TidyDispatchMode } from "../runtime/engine";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
+import type { Tensor } from "./tensor";
+import type { Torchlette } from "./torchlette";
+import type { AutogradNode, GetSavedFn } from "./types";
 
 /**
  * Collect saved tensors from all autograd nodes (triggers lazy recompute
@@ -17,7 +17,7 @@ async function collectAndForceSavedTensors(
 ): Promise<Map<AutogradNode, Tensor[]>> {
   const allUnpackedTensors = new Map<AutogradNode, Tensor[]>();
 
-  // Phase A: Collect all unpacked tensors
+  // Phase A: Collect all unpacked tensors.
   // Suppress markEscaped during checkpoint recomputation so recomputed
   // RuntimeTensors stay tracked (not escaped) in TidyDispatchMode.
   // This ensures disposeNonEscaped() cleans them up after backward.
@@ -123,7 +123,7 @@ async function runBackwardFunctions(
       if (existing) {
         const accumulated = torch.runtime.add(existing, gradIn);
         gradMap.set(input, accumulated);
-        // old existing and gradIn are tracked by TidyDispatchMode (not wrapped/escaped)
+        // Old existing is tracked by TidyDispatchMode (not wrapped/escaped)
         // and will be disposed at backward scope exit.
       } else {
         gradMap.set(input, gradIn);
@@ -210,17 +210,18 @@ function cleanupAutogradGraph(
   // - User-held inputs that are not forward intermediates (e.g., x, target)
   const preserved = new Set<Tensor>();
   for (const [tensor, _grad] of gradMap) {
-    const isLeaf = tensor.requiresGrad && !tensor._gradNode();
+    const isLeaf =
+      tensor.requiresGrad && !tensor._gradNode() && !tensor.disposed;
     if (isLeaf) preserved.add(tensor);
   }
   for (const node of ordered) {
     for (const input of node.inputs) {
-      if (
-        !forwardIntermediates.has(input) &&
-        !torch._compileCreatedTensors.has(input)
-      ) {
-        preserved.add(input);
-      }
+      // Preserve external user inputs (not forward intermediates, not
+      // compile-created, and not already disposed by frontend tidy).
+      if (forwardIntermediates.has(input)) continue;
+      if (input.disposed) continue;
+      if (torch._compileCreatedTensors.has(input)) continue;
+      preserved.add(input);
     }
   }
 
@@ -232,10 +233,14 @@ function cleanupAutogradGraph(
     }
   }
 
-  for (const node of ordered) {
-    // Dispose saved tensors that are internal intermediates (e.g., autocast
-    // casts). Only dispose if the saved tensor is NOT a preserved tensor
-    // (parameter or user-held input) and is NOT already in toDispose.
+  // Collect saved slots and inputs from ordered nodes, PLUS any detached
+  // autograd branches reachable from their inputs. Without this, detach()
+  // makes upstream nodes unreachable from the loss's graph traversal, and
+  // their saved tensors (kept by _wrapWithGrad) leak until GC.
+  const visitedNodes = new Set<AutogradNode>();
+  const processNode = (node: AutogradNode) => {
+    if (visitedNodes.has(node)) return;
+    visitedNodes.add(node);
     for (const slot of node.savedSlots) {
       const savedTensor = slot.packed as Tensor;
       if (savedTensor && typeof savedTensor.dispose === "function") {
@@ -244,9 +249,23 @@ function cleanupAutogradGraph(
         }
       }
     }
+    for (const input of node.inputs) {
+      if (!preserved.has(input) && !input.disposed) {
+        toDispose.add(input);
+      }
+      // Walk into detached branches: if this input has its own autograd
+      // chain that's NOT in ordered, recursively process it
+      const inputNode = input._gradNode();
+      if (inputNode && !visitedNodes.has(inputNode)) {
+        processNode(inputNode);
+      }
+    }
     node.savedSlots.length = 0;
     node.output._setGradNode(null);
     node.inputs.length = 0;
+  };
+  for (const node of ordered) {
+    processNode(node);
   }
 
   // Dispose all collected tensors
@@ -271,10 +290,9 @@ export async function backwardImpl(
   }
 
   return torch._runEntryPoint(async () => {
-    // Wrap the entire backward pass in a TidyDispatchMode to auto-dispose
-    // unwrapped RuntimeTensors (gradient accumulation intermediates,
-    // non-retained grads) at scope exit. Leaf/retained grads survive via
-    // wrap() → markEscaped().
+    // TidyDispatchMode tracks all RuntimeTensors created during backward
+    // and auto-disposes non-escaped ones at scope exit. Leaf/retained
+    // gradient RuntimeTensors are explicitly markEscaped so they survive.
     const tidyMode = new TidyDispatchMode();
     torch.runtime.pushDispatchMode(tidyMode);
     try {
@@ -366,7 +384,6 @@ export async function backwardImpl(
             torch.keep(gradWrapper);
             tensor._setGrad(gradWrapper);
           }
-          // Non-retained grads: not wrapped, so TidyDispatchMode disposes them at scope exit
         }
 
         cleanupAutogradGraph(torch, ordered, gradMap);
@@ -374,7 +391,6 @@ export async function backwardImpl(
     } finally {
       torch.runtime.popDispatchMode();
       tidyMode.disposeNonEscaped();
-      // Destroy storages made unreachable by tidy disposal
       storageTracker.destroyUnreachable();
     }
   });

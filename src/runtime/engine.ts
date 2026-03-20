@@ -163,10 +163,23 @@ export class TidyDispatchMode implements DispatchMode {
   onTensorEscaped(tensor: Tensor): void {
     this.escaped.add(tensor);
   }
-  disposeNonEscaped(): void {
+  disposeNonEscaped(): number {
+    let disposed = 0;
     for (const t of this.tracked) {
-      if (!this.escaped.has(t) && !t.disposed) t.dispose();
+      if (!this.escaped.has(t) && !t.disposed) {
+        t.dispose();
+        disposed++;
+      }
     }
+    // Release references so GC can collect disposed RuntimeTensors immediately.
+    // Without this, the tracked Set holds strong refs to thousands of disposed
+    // tensors, preventing GC from collecting them until the TidyDispatchMode
+    // itself is collected. This causes storageTracker's WeakRef check to find
+    // "live" tensors that are actually disposed, keeping their storages in
+    // allStorages and creating a GC-dependent memory oscillation.
+    this.tracked.clear();
+    this.escaped.clear();
+    return disposed;
   }
 }
 
@@ -1949,6 +1962,12 @@ export class RuntimeEngine {
           this.dispose(tensor);
         }
       }
+      // Release references so GC can collect disposed/escaped EngineTensors
+      // and their RuntimeTensors immediately. Without this, the scope.tensors
+      // Set holds strong refs until the scope local is GC'd, which may take
+      // many steps — causing a multi-step memory oscillation as storages
+      // accumulate between GC sweeps.
+      scope.tensors.clear();
     }
   }
 
