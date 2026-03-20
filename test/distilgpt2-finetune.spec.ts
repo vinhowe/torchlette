@@ -56,11 +56,19 @@ describe("DistilGPT-2 Finetuning Regression", { timeout: 300_000 }, () => {
   beforeAll(async () => {
     const { canUseWebGPU } = await import("./helpers/webgpu");
     const success = await canUseWebGPU();
-    webgpuAvailable = success;
     if (!success) {
       console.warn("WebGPU not available — tests will be skipped");
       return;
     }
+    // This test uses AMP (autocast f32→f16) which requires shader-f16
+    const { isF16Supported } = await import(
+      "../src/backend/webgpu/gpu-context"
+    );
+    if (!isF16Supported()) {
+      console.warn("shader-f16 not available — tests will be skipped");
+      return;
+    }
+    webgpuAvailable = true;
 
     api = new Torchlette("webgpu", {
       enableFusion: true,
