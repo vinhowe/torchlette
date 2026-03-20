@@ -10,9 +10,9 @@ const TINY_SHAKESPEARE_URL =
   "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
 
 // Config
-let rank = $state(64);
-let alpha = $state(16);
-let maxSteps = $state(200);
+let rank = $state(8);
+let alpha = $state(8);
+let maxSteps = $state(1000);
 let batchSize = $state(1);
 let seqLen = $state(128);
 let lr = $state(5e-4);

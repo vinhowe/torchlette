@@ -7,6 +7,9 @@ import { trainingStore } from "$lib/stores/training.svelte";
 // Fetch Shakespeare data on mount
 onMount(() => {
   trainingStore.fetchShakespeare();
+  // Expose stores for DevTools debugging
+  (window as any).__model = modelStore;
+  (window as any).__training = trainingStore;
 });
 
 // --- Helpers ---
@@ -162,7 +165,7 @@ function handleLoadModel() {
         <span class="font-mono text-slate-300 w-12 text-right">{fmtLr(trainingStore.lr)}</span>
 
         <label for="sl-steps" class="text-slate-400">steps</label>
-        <input id="sl-steps" type="range" min="10" max="1000" step="10" value={trainingStore.maxSteps} oninput={setSteps}
+        <input id="sl-steps" type="range" min="10" max="5000" step="10" value={trainingStore.maxSteps} oninput={setSteps}
                class="w-full" disabled={trainingStore.running} />
         <span class="font-mono text-slate-300 w-8 text-right">{trainingStore.maxSteps}</span>
 

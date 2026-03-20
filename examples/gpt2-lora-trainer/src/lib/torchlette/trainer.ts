@@ -69,18 +69,14 @@ class SimpleDataLoader {
     const targetData: number[] = [];
 
     for (let b = 0; b < this.batchSize; b++) {
-      // Wrap around to start if we've exhausted the data
-      if (this.currentIdx + this.seqLength + 1 > this.tokens.length) {
-        this.currentIdx = 0;
-      }
+      // Random starting position for diverse data exposure
+      const maxStart = this.tokens.length - this.seqLength - 1;
+      const start = Math.floor(Math.random() * maxStart);
 
       for (let i = 0; i < this.seqLength; i++) {
-        inputData.push(this.tokens[this.currentIdx + i]);
-        targetData.push(this.tokens[this.currentIdx + i + 1]);
+        inputData.push(this.tokens[start + i]);
+        targetData.push(this.tokens[start + i + 1]);
       }
-
-      // Advance sequentially through the data
-      this.currentIdx += this.seqLength;
     }
 
     return {
@@ -294,7 +290,8 @@ export class LoRATrainer {
 
       const stepTime = performance.now() - stepStart;
 
-      // Get GPU memory usage from the WebGPU memory tracker
+      await this.api.markStep();
+
       let memoryMB: number | undefined;
       try {
         const { getGPUMemoryStats } = await import("torchlette");
@@ -303,9 +300,6 @@ export class LoRATrainer {
       } catch {}
 
       callbacks.onStepEnd?.(step, emaLoss, stepTime, memoryMB);
-
-      // Memory cleanup - finalize the step and free intermediate tensors
-      await this.api.markStep();
     }
 
     // Set model to eval mode and disable checkpointing
