@@ -1643,11 +1643,7 @@ export class Torchlette {
     // Step 2: Force all pending tensors to materialize
     await this.runtime.forceAllPending();
 
-    // Step 3: GC - destroy all unreachable storages (intermediate buffers).
-    // This queues GPU buffers for destruction in pendingDestroy, but does NOT
-    // call buffer.destroy() yet — the GPU may still be executing command buffers
-    // that reference these buffers. Actual destruction happens in beginStep()
-    // after awaitDeferredFence() confirms GPU completion.
+    // Step 3: Destroy all unreachable storages (intermediate buffers).
     storageTracker.destroyUnreachable();
 
     // Step 3.5: Reset cumulative fusion stats for the next step
