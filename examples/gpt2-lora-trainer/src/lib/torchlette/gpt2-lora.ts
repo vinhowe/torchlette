@@ -78,9 +78,8 @@ class LayerNorm {
 
     // Normalize — clamp variance to non-negative before sqrt to prevent NaN
     // (f32 rounding can produce tiny negative variance on near-constant inputs)
-    const epsTensor = this.api.tensorFromArray([this.eps], []);
-    const clampedVar = this.api.relu(variance); // max(variance, 0)
-    const std = this.api.sqrt(this.api.add(clampedVar, epsTensor));
+    const clampedVar = this.api.relu(variance);
+    const std = this.api.sqrt(this.api.add(clampedVar, this.eps));
     const normalized = this.api.div(xCentered, std);
 
     // Scale and shift
@@ -260,8 +259,7 @@ class CausalSelfAttentionLoRA {
     const kT = k.transpose({ dim0: 1, dim1: 2 }); // [batch*heads, head_dim, seq]
     const scores = this.api.matmul(q, kT);
 
-    const scale = this.api.tensorFromArray([1.0 / Math.sqrt(this.headDim)], []);
-    const scaledScores = this.api.mul(scores, scale);
+    const scaledScores = this.api.mul(scores, 1.0 / Math.sqrt(this.headDim));
 
     // Apply causal mask (set future positions to -inf)
     const mask = this.createCausalMask(seqLen);

@@ -266,7 +266,7 @@ export class LoRATrainer {
       if (this.gradScaler) {
         await this.gradScaler.unscale_(this.optimizer!);
         const stepped = await this.gradScaler.step(this.optimizer!);
-        this.gradScaler.update();
+        await this.gradScaler.update();
         if (!stepped) {
           console.warn(
             `Step ${step}: Skipped (scale=${this.gradScaler.getScale()})`,

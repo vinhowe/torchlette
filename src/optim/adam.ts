@@ -205,14 +205,15 @@ export class Adam {
 
       if (mStorage && vStorage) {
         resolved++;
-        // Dispose old state
+        // Dispose old state — markUnreachable also clears protection on the
+        // old storage, so it can be destroyed by the next destroyUnreachable.
         if (this.expAvg[i]) this.expAvg[i]?.dispose();
         if (this.expAvgSq[i]) this.expAvgSq[i]?.dispose();
 
-        // Unprotect m/v storages — createFromStorageHandle will register
-        // them with the RuntimeTensor as the WeakRef target for normal lifecycle.
-        storageTracker.unprotect(mStorage.id);
-        storageTracker.unprotect(vStorage.id);
+        // Keep m/v storages protected — they were created during a previous
+        // step and are not in the beginStep snapshot. Protection ensures they
+        // survive destroyStepScoped. Protection is cleared automatically when
+        // the RuntimeTensor is disposed at the next _resolvePendingState.
 
         // Wrap existing StorageHandles into tracked RuntimeTensors
         this.expAvg[i] = runtime.createFromStorageHandle(
