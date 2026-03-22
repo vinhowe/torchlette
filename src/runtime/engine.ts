@@ -14,6 +14,7 @@ import {
   type GeluOptions,
   type MaxOptions,
   type MeanOptions,
+  type MinOptions,
   normalizeDim,
   type ScatterAddOptions,
   type StridedScatterOptions,
@@ -1006,20 +1007,11 @@ export class RuntimeEngine {
     return this.trackNode(node, shape, device, dtype);
   }
 
-  add(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._binaryOp("add", a, b);
-  }
   sub(a: TensorOrScalar, b: TensorOrScalar, options?: SubOptions): Tensor {
     return this._binaryOp("sub", a, b, options);
   }
   div(a: TensorOrScalar, b: TensorOrScalar, options?: DivOptions): Tensor {
     return this._binaryOp("div", a, b, options);
-  }
-  mul(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._binaryOp("mul", a, b);
-  }
-  pow(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    return this._binaryOp("pow", a, b);
   }
 
   /** Create a view op node that shares baseId with the input tensor. */
@@ -1225,7 +1217,7 @@ export class RuntimeEngine {
     return this.trackNode(node, outShape, device, dtype);
   }
 
-  private _reductionOp(
+  _reductionOp(
     op: LazyOpCode,
     a: Tensor,
     options?: { dim?: number | number[] | null; keepdim?: boolean },
@@ -1247,24 +1239,7 @@ export class RuntimeEngine {
     return this.trackNode(node, shape, safe.device, safe.dtype);
   }
 
-  sum(a: Tensor, options?: SumOptions): Tensor {
-    return this._reductionOp("sum", a, options);
-  }
-  max(a: Tensor, options?: MaxOptions): number | Tensor {
-    return this._reductionOp("max", a, options);
-  }
-  min(a: Tensor, options?: MaxOptions): number | Tensor {
-    return this._reductionOp("min", a, options);
-  }
-  mean(a: Tensor, options?: MeanOptions): number | Tensor {
-    return this._reductionOp("mean", a, options);
-  }
-
-  private _argReduceOp(
-    op: LazyOpCode,
-    a: Tensor,
-    options: ArgReduceOptions,
-  ): Tensor {
+  _argReduceOp(op: LazyOpCode, a: Tensor, options: ArgReduceOptions): Tensor {
     const dim = options.dim < 0 ? a.shape.length + options.dim : options.dim;
     const shape = options.keepdim
       ? a.shape.map((s, i) => (i === dim ? 1 : s))
@@ -1274,13 +1249,6 @@ export class RuntimeEngine {
       keepdim: options.keepdim,
     });
     return this.trackNode(node, shape, a.device);
-  }
-
-  argmax(a: Tensor, options: ArgReduceOptions): Tensor {
-    return this._argReduceOp("argmax", a, options);
-  }
-  argmin(a: Tensor, options: ArgReduceOptions): Tensor {
-    return this._argReduceOp("argmin", a, options);
   }
 
   where(condition: Tensor, x: TensorOrScalar, y: TensorOrScalar): Tensor {
@@ -2210,5 +2178,62 @@ for (const op of COMPARISON_OPS) {
     b: TensorOrScalar,
   ) {
     return this._binaryOp(op, a, b);
+  };
+}
+
+// Simple binary ops: gradient specs live in OP_REGISTRY, dispatch via _binaryOp.
+const SIMPLE_BINARY_OPS = ["add", "mul", "pow"] as const;
+
+export interface RuntimeEngine {
+  add(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  mul(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  pow(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+}
+
+for (const op of SIMPLE_BINARY_OPS) {
+  (RuntimeEngine.prototype as any)[op] = function (
+    this: RuntimeEngine,
+    a: TensorOrScalar,
+    b: TensorOrScalar,
+  ) {
+    return this._binaryOp(op, a, b);
+  };
+}
+
+// Reduction ops: dispatch via _reductionOp.
+const SIMPLE_REDUCTION_OPS = ["sum", "max", "min", "mean"] as const;
+
+export interface RuntimeEngine {
+  sum(a: Tensor, options?: SumOptions): Tensor;
+  max(a: Tensor, options?: MaxOptions): number | Tensor;
+  min(a: Tensor, options?: MinOptions): number | Tensor;
+  mean(a: Tensor, options?: MeanOptions): number | Tensor;
+}
+
+for (const op of SIMPLE_REDUCTION_OPS) {
+  (RuntimeEngine.prototype as any)[op] = function (
+    this: RuntimeEngine,
+    a: Tensor,
+    options?: any,
+  ) {
+    return this._reductionOp(op, a, options);
+  };
+}
+
+// Arg-reduce ops: dispatch via _argReduceOp.
+const ARG_REDUCE_OPS = ["argmax", "argmin"] as const;
+
+export interface RuntimeEngine {
+  argmax(a: Tensor, options: ArgReduceOptions): Tensor;
+  argmin(a: Tensor, options: ArgReduceOptions): Tensor;
+}
+
+for (const op of ARG_REDUCE_OPS) {
+  (RuntimeEngine.prototype as any)[op] = function (
+    this: RuntimeEngine,
+    a: Tensor,
+    options: ArgReduceOptions,
+  ) {
+    return this._argReduceOp(op, a, options);
   };
 }
