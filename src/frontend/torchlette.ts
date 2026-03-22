@@ -86,6 +86,13 @@ import {
 } from "./autocast";
 import { backwardImpl } from "./autograd";
 import {
+  type BackwardContext,
+  geluErfBackward,
+  geluTanhBackward,
+  linearBackward,
+  matmulBackward,
+} from "./custom-backward";
+import {
   crossEntropyFusedImpl,
   layernormImpl,
   rmsnormImpl,
@@ -605,50 +612,19 @@ export class Torchlette {
 
   matmul(a: Tensor, b: Tensor): Tensor {
     this._assertUsable(a, b);
-    // Apply autocast: cast f32 inputs to f16 for compute-bound matmul
     const [castA, castB] = this._applyAutocast("matmul", [a, b]) as [
       Tensor,
       Tensor,
     ];
     const inner = this.runtime.matmul(castA._unwrap(), castB._unwrap());
-    // Capture shapes of the ORIGINAL inputs for backward gradient shapes
     const aShape = a.shape;
     const bShape = b.shape;
-    // Save cast tensors for backward so backward matmuls also run in the cast dtype
     const tensorsToSave =
       a.requiresGrad || b.requiresGrad ? [castA, castB] : [];
     return this._wrapWithGrad(
       inner,
       [a, b],
-      (grad, getSaved) => {
-        if (aShape.length < 2 || bShape.length < 2) {
-          throw new Error("matmul backward requires rank >= 2");
-        }
-        const savedA = getSaved(0);
-        const savedB = getSaved(1);
-        const savedAShape = savedA.shape;
-        const savedBShape = savedB.shape;
-        // Mixed-dtype matmul: the backend handles f16/f32 input combinations natively
-        // by promoting to f32 accumulation. No need to cast saved f16 tensors to f32.
-        const savedAInner = savedA._unwrap();
-        const savedBInner = savedB._unwrap();
-        // Transpose creates strided views; the backend detects simple transposes
-        // and handles them natively via flipped transpose flags (no contiguous needed).
-        const aT = this.runtime.transpose(savedAInner, {
-          dim0: savedAShape.length - 2,
-          dim1: savedAShape.length - 1,
-        });
-        const bT = this.runtime.transpose(savedBInner, {
-          dim0: savedBShape.length - 2,
-          dim1: savedBShape.length - 1,
-        });
-        const gradA = this.runtime.matmul(grad, bT);
-        const gradB = this.runtime.matmul(aT, grad);
-        // Sum to the ORIGINAL input shapes (before autocast)
-        const resultA = this._sumToShape(gradA, aShape);
-        const resultB = this._sumToShape(gradB, bShape);
-        return [resultA, resultB];
-      },
+      matmulBackward(this._backwardCtx(), aShape, bShape),
       tensorsToSave,
     );
   }
@@ -692,43 +668,14 @@ export class Torchlette {
     return this._wrapWithGrad(
       inner,
       allInputs,
-      (grad, getSaved) => {
-        if (inputShape.length < 2 || weightShape.length < 2)
-          throw new Error("linear backward requires rank >= 2");
-
-        let savedIdx = 0;
-        // dX = dY @ W  (weight is [out, in], so dY @ W = [..., out] @ [out, in] = [..., in])
-        let resultInput: RuntimeTensor | null = null;
-        if (needsInputGrad) {
-          const savedWeight = getSaved(savedIdx++)._unwrap();
-          const gradInput = this.runtime.matmul(grad, savedWeight);
-          resultInput = this._sumToShape(gradInput, inputShape);
-        }
-
-        // dW = dY^T @ X → [out, in] = weight's shape directly (no transpose needed!)
-        // Skipped when weight doesn't require grad (e.g. detached weight).
-        let resultWeight: RuntimeTensor | null = null;
-        if (needsWeightGrad) {
-          const savedInput = getSaved(savedIdx++)._unwrap();
-          const gradT = this.runtime.transpose(grad, {
-            dim0: grad.shape.length - 2,
-            dim1: grad.shape.length - 1,
-          });
-          const gradWeight = this.runtime.matmul(gradT, savedInput);
-          resultWeight = this._sumToShape(gradWeight, weightShape);
-        }
-
-        // dBias = sum(dY, all dims except last)
-        let resultBias: RuntimeTensor | null = null;
-        if (bias) {
-          const biasShape = getSaved(savedIdx).shape;
-          resultBias = this._sumToShape(grad, biasShape);
-        }
-
-        return bias
-          ? [resultInput, resultWeight, resultBias as RuntimeTensor]
-          : [resultInput, resultWeight];
-      },
+      linearBackward(
+        this._backwardCtx(),
+        inputShape,
+        weightShape,
+        needsInputGrad,
+        needsWeightGrad,
+        !!bias,
+      ),
       toSave,
     );
   }
@@ -739,98 +686,11 @@ export class Torchlette {
     const inner = this.runtime.gelu(a._unwrap(), options);
     const tensorsToSave = a.requiresGrad ? [a] : [];
 
-    if (approximate === "tanh") {
-      return this._wrapWithGrad(
-        inner,
-        [a],
-        (grad, getSaved) => {
-          const savedA = getSaved(0);
-          const x = savedA._unwrap();
-          const x2 = this.runtime.mul(x, x);
-          const x3 = this.runtime.mul(x2, x);
-
-          const term = this.runtime.add(x, this.runtime.mul(0.044715, x3));
-          const innerVal = this.runtime.mul(0.7978845608, term);
-
-          const clampedInner = this.runtime.where(
-            this.runtime.lt(innerVal, -10),
-            -10,
-            this.runtime.where(this.runtime.gt(innerVal, 10), 10, innerVal),
-          );
-
-          const tanhInner = this.runtime.tanh(clampedInner);
-          const cdf = this.runtime.mul(0.5, this.runtime.add(1, tanhInner));
-          const tanh2 = this.runtime.mul(tanhInner, tanhInner);
-          const sech2 = this.runtime.sub(1, tanh2);
-
-          const pdfTerm = this.runtime.add(1, this.runtime.mul(0.134145, x2));
-          const pdf = this.runtime.mul(
-            this.runtime.mul(0.7978845608, pdfTerm),
-            sech2,
-          );
-
-          const xPdfHalf = this.runtime.mul(this.runtime.mul(x, pdf), 0.5);
-          const geluGrad = this.runtime.add(cdf, xPdfHalf);
-          const gradInput = this.runtime.mul(grad, geluGrad);
-
-          return [gradInput];
-        },
-        tensorsToSave,
-      );
-    } else {
-      return this._wrapWithGrad(
-        inner,
-        [a],
-        (grad, getSaved) => {
-          const savedA = getSaved(0);
-          const x = savedA._unwrap();
-
-          const z = this.runtime.mul(x, Math.SQRT1_2);
-          const absZ = this.runtime.abs(z);
-
-          const t = this.runtime.div(
-            1,
-            this.runtime.add(1, this.runtime.mul(0.3275911, absZ)),
-          );
-          const t2 = this.runtime.mul(t, t);
-          const t3 = this.runtime.mul(t2, t);
-          const t4 = this.runtime.mul(t3, t);
-          const t5 = this.runtime.mul(t4, t);
-
-          const poly = this.runtime.add(
-            this.runtime.mul(0.254829592, t),
-            this.runtime.add(
-              this.runtime.mul(-0.284496736, t2),
-              this.runtime.add(
-                this.runtime.mul(1.421413741, t3),
-                this.runtime.add(
-                  this.runtime.mul(-1.453152027, t4),
-                  this.runtime.mul(1.061405429, t5),
-                ),
-              ),
-            ),
-          );
-
-          const negZ2 = this.runtime.mul(-0.5, this.runtime.mul(x, x));
-          const expNegZ2 = this.runtime.exp(negZ2);
-
-          const erfAbs = this.runtime.sub(1, this.runtime.mul(poly, expNegZ2));
-          const xGe0 = this.runtime.ge(x, 0);
-          const erfPos = this.runtime.add(1, erfAbs);
-          const erfNeg = this.runtime.sub(1, erfAbs);
-          const erfTerm = this.runtime.where(xGe0, erfPos, erfNeg);
-          const cdf = this.runtime.mul(0.5, erfTerm);
-
-          const pdf = this.runtime.mul(expNegZ2, 0.3989422804014327);
-          const xPdf = this.runtime.mul(x, pdf);
-          const geluGrad = this.runtime.add(cdf, xPdf);
-          const gradInput = this.runtime.mul(grad, geluGrad);
-
-          return [gradInput];
-        },
-        tensorsToSave,
-      );
-    }
+    const bwdFn =
+      approximate === "tanh"
+        ? geluTanhBackward(this._backwardCtx())
+        : geluErfBackward(this._backwardCtx());
+    return this._wrapWithGrad(inner, [a], bwdFn, tensorsToSave);
   }
 
   clamp(a: Tensor, min: number | null, max: number | null): Tensor {
@@ -1447,6 +1307,14 @@ export class Torchlette {
       throw new Error("backward requires an explicit grad for non-scalars");
     }
     return this.runtime.full([], 1.0, output.device);
+  }
+
+  /** Create a context object for extracted backward functions. */
+  _backwardCtx(): BackwardContext {
+    return {
+      rt: this.runtime,
+      sumToShape: (grad, shape) => this._sumToShape(grad, shape),
+    };
   }
 
   _sumToShape(grad: RuntimeTensor, shape: number[]): RuntimeTensor {
