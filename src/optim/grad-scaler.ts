@@ -29,9 +29,9 @@
  */
 
 import type { Backend, DeviceKind } from "../backend/types";
-import { createPendingRef } from "../graph/types";
-import { createLazyIRNode } from "../graph/node-factory";
 import type { Tensor, Torchlette } from "../frontend/torchlette";
+import { createLazyIRNode } from "../graph/node-factory";
+import { createPendingRef } from "../graph/types";
 import type { Adam } from "./adam";
 import type { SGD } from "./sgd";
 
@@ -141,8 +141,6 @@ export class GradScaler {
     if (this._pendingInfBuffer) {
       // Fused path: force all pending GPU work so the unscaleGrad kernels
       // have written to the infFlagBuffer before we read it back.
-      // In the normal training loop, markStep() is called before resolveDeferred(),
-      // but we handle the case where it wasn't called explicitly.
       await this.api.markStep();
       const val = await this._pendingInfBackend?.ops.readAndDestroyInfCount?.(
         this._pendingInfBuffer,
@@ -150,17 +148,20 @@ export class GradScaler {
       this._foundInfThisStep = val! > 0.5;
       this._pendingInfBuffer = null;
       this._pendingInfBackend = null;
+      this._applyScaleAdjustment();
     } else if (this._pendingInfAccum) {
-      // Elementwise path: read tensor
+      // Elementwise path: should have been resolved in update().
+      // Fallback if update() wasn't called or wasn't awaited.
       const totalInfCount = await this._pendingInfAccum.item();
       this._foundInfThisStep = totalInfCount > 0.5;
       this._pendingInfAccum.dispose();
       this._pendingInfAccum = null;
-    } else {
-      return; // First step, no-op
+      this._applyScaleAdjustment();
     }
+  }
 
-    // Apply scale adjustment (deferred from the previous step's update())
+  /** Adjust scale based on whether inf was found this step. */
+  private _applyScaleAdjustment(): void {
     if (this._foundInfThisStep) {
       this._scale *= this.backoffFactor;
       this._growthTracker = 0;
@@ -387,11 +388,13 @@ export class GradScaler {
   }
 
   /**
-   * Update flags after step(). Scale adjustment is deferred to resolveDeferred().
+   * Update scale after step(). Reads back the inf detection result for the
+   * elementwise unscale path immediately (not deferred) so the infAccum
+   * tensor doesn't need to survive across step boundaries.
    *
-   * Call after step() at the end of each training iteration.
+   * Call after step() at the end of each training iteration, before markStep().
    */
-  update(): void {
+  async update(): Promise<void> {
     if (!this.enabled) {
       this._unscaleCalled = false;
       return;
@@ -403,7 +406,17 @@ export class GradScaler {
       );
     }
 
-    // Reset for next step — scale adjustment happens in resolveDeferred()
+    // Elementwise path: read infAccum NOW (before markStep destroys it).
+    // The fused path uses a raw GPU buffer (_pendingInfBuffer) which is not
+    // affected by step-scoped cleanup — it's resolved in resolveDeferred().
+    if (this._pendingInfAccum) {
+      const totalInfCount = await this._pendingInfAccum.item();
+      this._foundInfThisStep = totalInfCount > 0.5;
+      this._pendingInfAccum.dispose();
+      this._pendingInfAccum = null;
+      this._applyScaleAdjustment();
+    }
+
     this._unscaleCalled = false;
   }
 

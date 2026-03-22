@@ -123,8 +123,7 @@ export class LoRALinear {
       this.api.matmul(x, this.loraA.transpose({ dim0: 0, dim1: 1 })),
       this.loraB.transpose({ dim0: 0, dim1: 1 }),
     );
-    const scalingTensor = this.api.tensorFromArray([this.scaling], []);
-    const scaledLora = this.api.mul(loraOut, scalingTensor);
+    const scaledLora = this.api.mul(loraOut, this.scaling);
 
     // Combine base + LoRA outputs. Do NOT detach the base output — even
     // though base weights have requiresGrad=false (no gradient computed FOR

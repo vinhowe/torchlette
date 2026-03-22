@@ -29,6 +29,11 @@ class StorageTracker {
    *  Used for Adam m/v side outputs between creation and extraction. */
   private protectedStorages = new Set<number>();
 
+  /** Snapshot of RuntimeTensor objects that were alive at the start of the step.
+   *  Used by destroyStepScoped() to distinguish persistent tensors (model params,
+   *  optimizer state) from step-scoped temporaries (activations, views). */
+  private _stepStartTensors: WeakSet<object> | null = null;
+
   /** Debug counters for tracking reachability changes per step */
   private _debugRegisterCount = 0;
   private _debugReachableCount = 0;
@@ -64,6 +69,10 @@ class StorageTracker {
     const wasReachable = this.externallyReachable.has(storageId);
     this.externallyReachable.delete(storageId);
     this.tensorWeakRefs.delete(storageId);
+    // A storage that is unreachable should not remain protected — the owning
+    // tensor is gone, so protection is meaningless. Without this, replaced
+    // optimizer state storages (old m/v) would stay protected and leak.
+    this.protectedStorages.delete(storageId);
     if (wasReachable) {
       this._debugUnreachableCount++;
       this.recentlyUnreachable.add(storageId);
@@ -169,6 +178,55 @@ class StorageTracker {
   }
 
   /**
+   * Snapshot the RuntimeTensor objects currently holding storages reachable.
+   * Call at beginStep() — these tensors are "persistent" (model params, optimizer
+   * state) and their storages survive step-scoped cleanup.
+   */
+  snapshotForStep(): void {
+    this._stepStartTensors = new WeakSet();
+    for (const [, ref] of this.tensorWeakRefs) {
+      const target = ref.deref();
+      if (target) this._stepStartTensors.add(target);
+    }
+  }
+
+  /**
+   * Deterministic step-scoped cleanup. Demotes reachable storages whose owning
+   * RuntimeTensor was NOT alive at the start of the step (i.e., created during
+   * the step as a temporary). Protected storages (optimizer state) are kept.
+   *
+   * Call once at the end of markStep(). This eliminates the memory oscillation
+   * caused by non-deterministic GC — temporary tensors (activations, transpose
+   * views, scalar constants) are cleaned up immediately instead of lingering
+   * until the JS garbage collector runs.
+   */
+  destroyStepScoped(): number {
+    if (!this._stepStartTensors) return 0;
+    for (const [id, ref] of this.tensorWeakRefs) {
+      const target = ref.deref();
+      if (
+        target === undefined ||
+        (!this._stepStartTensors.has(target) && !this.protectedStorages.has(id))
+      ) {
+        this.externallyReachable.delete(id);
+        this.tensorWeakRefs.delete(id);
+        this.recentlyUnreachable.add(id);
+      }
+    }
+    // Demote reachable storages that have no WeakRef (markReachable called
+    // without tensorRef) and are not protected — no way to snapshot-check them.
+    for (const id of this.externallyReachable) {
+      if (!this.tensorWeakRefs.has(id) && !this.protectedStorages.has(id)) {
+        this.externallyReachable.delete(id);
+        this.recentlyUnreachable.add(id);
+      }
+    }
+    if (this.recentlyUnreachable.size === 0) return 0;
+    this.recentlyUnreachable.clear();
+    return this._destroyUnreachableFrom();
+  }
+
+  /**
    * Get the next storage ID that will be assigned.
    * Used to scope destroyUnreachableSince() to only affect newly created storages.
    */
@@ -250,6 +308,7 @@ class StorageTracker {
     this.tensorWeakRefs.clear();
     this.recentlyUnreachable.clear();
     this.protectedStorages.clear();
+    this._stepStartTensors = null;
   }
 
   /**

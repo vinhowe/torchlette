@@ -1646,7 +1646,12 @@ export class Torchlette {
     // Step 3: Destroy all unreachable storages (intermediate buffers).
     storageTracker.destroyUnreachable();
 
-    // Step 3.5: Reset cumulative fusion stats for the next step
+    // Step 3.5: Deterministic step-scoped cleanup. Demotes reachable storages
+    // for tensors created during this step (not in the beginStep snapshot),
+    // so they're destroyed immediately rather than lingering until GC runs.
+    storageTracker.destroyStepScoped();
+
+    // Step 4: Reset cumulative fusion stats for the next step
     this.runtime.resetCumulativeFusionStats();
 
     // Step 4: Issue a deferred GPU fence.
@@ -1662,6 +1667,13 @@ export class Torchlette {
   }
 
   async beginStep(): Promise<void> {
+    // Force any unmaterialized tensors (e.g., model weights from init) so their
+    // storages exist before the snapshot. Without this, lazy model-init tensors
+    // would materialize during the step and be treated as step-scoped.
+    await this.runtime.forceAllPending();
+    // Snapshot which RuntimeTensor objects are alive now. These are persistent
+    // (model params, optimizer state) and their storages survive step cleanup.
+    storageTracker.snapshotForStep();
     await this.runtime.beginStep();
   }
 

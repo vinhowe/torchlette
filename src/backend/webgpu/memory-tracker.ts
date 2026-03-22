@@ -135,7 +135,13 @@ class GPUMemoryTracker {
     >();
     for (const [, info] of this._allocStacks) {
       if (step !== undefined && info.step !== step) continue;
-      const key = info.stack.split("\n").slice(0, 3).join("\n");
+      const lines = info.stack.split("\n");
+      const callerLines = lines.filter(
+        (l) =>
+          !l.includes("_trackAllocationInner") &&
+          !l.includes("trackAllocation"),
+      );
+      const key = callerLines.slice(0, 4).join("\n");
       const existing = grouped.get(key) || {
         count: 0,
         totalBytes: 0,

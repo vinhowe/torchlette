@@ -315,6 +315,7 @@ const WGSL_OP_TO_FUSION: Record<string, string> = {
   "-": "sub",
   "*": "mul",
   "/": "div",
+  pow: "pow",
 };
 
 /**
