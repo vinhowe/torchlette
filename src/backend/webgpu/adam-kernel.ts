@@ -1,10 +1,10 @@
 /**
  * Fused Adam/AdamW Optimizer Kernel
  *
- * A single WGSL compute shader that updates param, m, v in-place in one
- * dispatch per parameter. Supports both Adam (L2 decay on gradient) and
- * AdamW (decoupled decay on parameter). grad is read-only; param/m/v are
- * read_write (no separate output buffers needed).
+ * A single WGSL compute shader that updates param in-place and writes new m/v
+ * to separate output buffers. Supports both Adam (L2 decay on gradient) and
+ * AdamW (decoupled decay on parameter). grad, m_in, v_in are read-only;
+ * param is read_write; m_out, v_out are write-only outputs.
  *
  * Handles large buffers (>maxStorageBufferBindingSize) via tile-IR dispatchChunked.
  */
@@ -46,10 +46,11 @@ function makeAdamStepSpec(
   const bindings: Record<string, BindingSpec> = {
     grad: { storage: "read", type: "f32" },
     param: { storage: "read_write", type: "f32" },
-    m: { storage: "read_write", type: "f32" },
-    v: { storage: "read_write", type: "f32" },
+    m_in: { storage: "read", type: "f32" },
+    v_in: { storage: "read", type: "f32" },
+    m_out: { storage: "read_write", type: "f32" },
+    v_out: { storage: "read_write", type: "f32" },
   };
-  // config uniform goes at binding(4) — set via uniformBindingIndex
   if (emitF16) {
     bindings.param_f16 = { storage: "read_write", type: "f16" };
   }
@@ -90,7 +91,6 @@ function makeAdamStepSpec(
       workgroupSize: WORKGROUP_SIZE,
       bindings,
       uniforms,
-      uniformBindingIndex: 4,
       enableF16: emitF16,
       autoVectorize: true,
       kernel(ctx) {
@@ -107,7 +107,6 @@ function makeAdamStepSpec(
     workgroupSize: WORKGROUP_SIZE,
     bindings,
     uniforms,
-    uniformBindingIndex: 4,
     enableF16: emitF16,
     grid: (u) => {
       const workItems = useVec4
@@ -220,11 +219,11 @@ function emitAdamScalarBody(
   const g = gVar.get();
   const mNew = ctx.emitLet(
     `m_new${suffix}`,
-    beta1.mul(ctx.load("m", idx)).add(ctx.f32(1.0).sub(beta1).mul(g)),
+    beta1.mul(ctx.load("m_in", idx)).add(ctx.f32(1.0).sub(beta1).mul(g)),
   );
   const vNew = ctx.emitLet(
     `v_new${suffix}`,
-    beta2.mul(ctx.load("v", idx)).add(ctx.f32(1.0).sub(beta2).mul(g).mul(g)),
+    beta2.mul(ctx.load("v_in", idx)).add(ctx.f32(1.0).sub(beta2).mul(g).mul(g)),
   );
 
   const pNewVar = ctx.emitVar(
@@ -240,8 +239,8 @@ function emitAdamScalarBody(
 
   // Write outputs
   ctx.emitStore("param", idx, pNewVar.get());
-  ctx.emitStore("m", idx, mNew);
-  ctx.emitStore("v", idx, vNew);
+  ctx.emitStore("m_out", idx, mNew);
+  ctx.emitStore("v_out", idx, vNew);
 
   if (emitF16) {
     ctx.emitStore("param_f16", idx, pNewVar.get().toF16());
@@ -308,18 +307,21 @@ export function dispatchAdamStep(
   const maxBindingSize = getMaxStorageBufferBindingSize();
   const needsChunking = totalBytes > maxBindingSize;
 
-  // In-place: param/m/v are read_write, no output buffer allocation needed.
-  // Track ALL input buffers (including grad, which is read-only) in the write
-  // set BEFORE any allocation, so the pool won't hand back these buffers for
-  // the f16 output allocation. Without this, the pool may return grad's buffer
-  // for the f16 output, causing a read/read_write conflict on the same buffer.
+  // Track ALL input buffers in the write set BEFORE any allocation, so the
+  // pool won't hand back these buffers for output allocation.
   let _st = profileSubOpBegin();
   trackSharedEncoderWrite(gradBuffer);
   trackSharedEncoderWrite(paramBuffer);
   trackSharedEncoderWrite(mBuffer);
   trackSharedEncoderWrite(vBuffer);
 
-  // Only allocate f16 output buffer (different size).
+  // Allocate separate output buffers for m and v (no longer in-place).
+  const mOutBuffer = allocateOutputBuffer(totalBytes);
+  trackSharedEncoderWrite(mOutBuffer);
+  const vOutBuffer = allocateOutputBuffer(totalBytes);
+  trackSharedEncoderWrite(vOutBuffer);
+
+  // Allocate f16 output buffer if needed.
   let paramF16Out: GPUBuffer | null = null;
   if (doF16) {
     paramF16Out = allocateOutputBuffer(numElements * f16BytesPerElement);
@@ -334,8 +336,10 @@ export function dispatchAdamStep(
   const buffers: Record<string, GPUBuffer> = {
     grad: gradBuffer,
     param: paramBuffer,
-    m: mBuffer,
-    v: vBuffer,
+    m_in: mBuffer,
+    v_in: vBuffer,
+    m_out: mOutBuffer,
+    v_out: vOutBuffer,
   };
   if (doF16 && paramF16Out) buffers.param_f16 = paramF16Out;
   if (doUnscale && infFlagBuffer) buffers.inf_flag = infFlagBuffer;
@@ -385,8 +389,10 @@ export function dispatchAdamStep(
     const modes: Record<string, "scalar" | "chunked"> = {
       grad: "chunked",
       param: "chunked",
-      m: "chunked",
-      v: "chunked",
+      m_in: "chunked",
+      v_in: "chunked",
+      m_out: "chunked",
+      v_out: "chunked",
     };
     if (doF16) modes.param_f16 = "chunked";
     if (doUnscale) modes.inf_flag = "scalar";
@@ -408,11 +414,11 @@ export function dispatchAdamStep(
   }
   profileSubOpEnd("adam.dispatch", _st);
 
-  // In-place: return the same input buffers (updated in-place by the shader)
+  // param is updated in-place; m/v are fresh output buffers
   const result: AdamStepResult = {
     paramBuffer,
-    mBuffer,
-    vBuffer,
+    mBuffer: mOutBuffer,
+    vBuffer: vOutBuffer,
   };
   if (paramF16Out) {
     result.paramF16Buffer = paramF16Out;

@@ -760,10 +760,9 @@ export class RuntimeEngine {
     const skippedNodes = materializeRemaining(pendingTensors);
 
     // Drop node.result references to allow GC of unclaimed intermediate storages.
-    // Note: node.results is NOT cleared here — multi-output ops (e.g., adamStep)
-    // store side outputs (m/v) in node.results that the optimizer reads on the
-    // next step via _resolvePendingState(). Clearing results would make those
-    // storages unreachable (killing their WeakRef anchor) before they're consumed.
+    // Note: node.results is NOT cleared here — multi-output ops (e.g., adamStep,
+    // fusedAttention) store side outputs in node.results that are consumed by
+    // materializePendingTensors when RuntimeTensors reference outputIndex > 0.
     for (const node of plan.nodes) {
       node.result = undefined;
     }

@@ -25,10 +25,6 @@ class StorageTracker {
   /** Storage IDs that recently became unreachable (for incremental scanning) */
   private recentlyUnreachable = new Set<number>();
 
-  /** Storage IDs protected from destroyUnreachable without needing a WeakRef.
-   *  Used for Adam m/v side outputs between creation and extraction. */
-  private protectedStorages = new Set<number>();
-
   /** Snapshot of RuntimeTensor objects that were alive at the start of the step.
    *  Used by destroyStepScoped() to distinguish persistent tensors (model params,
    *  optimizer state) from step-scoped temporaries (activations, views). */
@@ -69,30 +65,10 @@ class StorageTracker {
     const wasReachable = this.externallyReachable.has(storageId);
     this.externallyReachable.delete(storageId);
     this.tensorWeakRefs.delete(storageId);
-    // A storage that is unreachable should not remain protected — the owning
-    // tensor is gone, so protection is meaningless. Without this, replaced
-    // optimizer state storages (old m/v) would stay protected and leak.
-    this.protectedStorages.delete(storageId);
     if (wasReachable) {
       this._debugUnreachableCount++;
       this.recentlyUnreachable.add(storageId);
     }
-  }
-
-  /**
-   * Protect a storage from destroyUnreachable without a WeakRef.
-   * Used for side-output storages (Adam m/v) between creation and extraction.
-   * Call unprotect() when the storage is wrapped in a RuntimeTensor.
-   */
-  protect(storageId: number): void {
-    this.protectedStorages.add(storageId);
-  }
-
-  /**
-   * Remove protection. The storage will be managed by normal reachability.
-   */
-  unprotect(storageId: number): void {
-    this.protectedStorages.delete(storageId);
   }
 
   /**
@@ -204,19 +180,16 @@ class StorageTracker {
     if (!this._stepStartTensors) return 0;
     for (const [id, ref] of this.tensorWeakRefs) {
       const target = ref.deref();
-      if (
-        target === undefined ||
-        (!this._stepStartTensors.has(target) && !this.protectedStorages.has(id))
-      ) {
+      if (target === undefined || !this._stepStartTensors.has(target)) {
         this.externallyReachable.delete(id);
         this.tensorWeakRefs.delete(id);
         this.recentlyUnreachable.add(id);
       }
     }
     // Demote reachable storages that have no WeakRef (markReachable called
-    // without tensorRef) and are not protected — no way to snapshot-check them.
+    // without tensorRef) — no way to snapshot-check them.
     for (const id of this.externallyReachable) {
-      if (!this.tensorWeakRefs.has(id) && !this.protectedStorages.has(id)) {
+      if (!this.tensorWeakRefs.has(id)) {
         this.externallyReachable.delete(id);
         this.recentlyUnreachable.add(id);
       }
@@ -250,11 +223,7 @@ class StorageTracker {
     const toDestroy: number[] = [];
     for (const [id] of this.allStorages) {
       if (sinceId !== undefined && id < sinceId) continue;
-      if (
-        !this.externallyReachable.has(id) &&
-        !neededByViews.has(id) &&
-        !this.protectedStorages.has(id)
-      ) {
+      if (!this.externallyReachable.has(id) && !neededByViews.has(id)) {
         toDestroy.push(id);
       }
     }
@@ -307,7 +276,6 @@ class StorageTracker {
     this.externallyReachable.clear();
     this.tensorWeakRefs.clear();
     this.recentlyUnreachable.clear();
-    this.protectedStorages.clear();
     this._stepStartTensors = null;
   }
 
