@@ -15,7 +15,6 @@ import {
   setCurrentOpLabel,
   setProfileModule,
 } from "../graph/profiler";
-import { storageTracker } from "../graph/storage-tracker";
 import type { LazyIRNode, LazyRef, StorageHandle } from "../graph/types";
 import { OP_REGISTRY } from "../ops/registry";
 
@@ -334,7 +333,7 @@ function executeGenericOp(
   return fn(...args) as BackendTensor;
 }
 
-/** adamStep is special-cased: async, multi-output (param, m, v), markReachable. */
+/** adamStep is special-cased: async, multi-output (param, m, v). */
 function executeAdamStep(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
@@ -350,19 +349,13 @@ function executeAdamStep(
       backendInputs[3],
       payload,
     );
-    // Only m and v go into node.results — _resolvePendingState reads
-    // results[1] and results[2]. The param result is returned below and
-    // wrapped in an owning StorageHandle by executeNode (→ node.result).
-    // Creating a second owning StorageHandle here would cause a double-free
-    // when destroyUnreachableSince runs (paramStorage wouldn't be marked
-    // reachable, so it would release the buffer to the pool while
-    // node.result still references it).
+    // m/v are fresh output buffers from the kernel. Store in node.results so
+    // that RuntimeTensors referencing outputIndex 1/2 can resolve them via
+    // materializePendingTensors. The param result is returned and wrapped in
+    // an owning StorageHandle by executeNode (→ node.result).
     const mStorage = createStorageHandle(node.device, adamResult.m);
     const vStorage = createStorageHandle(node.device, adamResult.v);
     node.results = [null as unknown as StorageHandle, mStorage, vStorage];
-    // Protect m/v from destroyUnreachable until _resolvePendingState extracts them
-    storageTracker.protect(mStorage.id);
-    storageTracker.protect(vStorage.id);
     return adamResult.param;
   })();
 }

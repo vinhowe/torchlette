@@ -102,9 +102,9 @@ export async function adamStep(
     }
     profileSubOpEnd("adam.f16evict", _st);
 
-    // Flush shared encoder before dispatching the in-place Adam kernel.
-    // The forward/backward pass may have used param/m/v buffers as read-only
-    // inputs in compute passes. The Adam kernel binds them as read_write,
+    // Flush shared encoder before dispatching the Adam kernel.
+    // The forward/backward pass may have used param buffers as read-only
+    // inputs in compute passes. The Adam kernel binds param as read_write,
     // which conflicts within the same command encoder synchronization scope.
     // Flushing ensures prior passes are submitted before the in-place writes.
     // In Adam batch mode, the caller already flushed once for the entire batch.
@@ -119,45 +119,27 @@ export async function adamStep(
     trackSharedEncoderWrite(gradT.buffer);
 
     // WebGPU forbids binding the same buffer as read_write at multiple
-    // binding points. De-alias input buffers if pool recycling caused
-    // any to share the same GPUBuffer (common for same-size tensors).
+    // binding points. param is read_write, so de-alias it from read-only
+    // inputs (grad, m, v) if pool recycling caused buffer sharing.
+    // m_in/v_in are read-only, so they can safely alias each other or grad.
+    // m_out/v_out are fresh allocations and cannot alias.
     let paramBuf = paramT.buffer;
-    let mBuf = mT.buffer;
-    let vBuf = vT.buffer;
+    const mBuf = mT.buffer;
+    const vBuf = vT.buffer;
     const gradBuf = gradT.buffer;
     const bufSize = gradT.size * dtypeBytes(gradT.dtype);
-    const copyToFresh = (src: GPUBuffer): GPUBuffer => {
+    if (paramBuf === gradBuf || paramBuf === mBuf || paramBuf === vBuf) {
       const dst = allocateOutputBuffer(bufSize);
-      // Use the shared encoder for the copy so it's ordered before the
-      // Adam compute pass in the same command buffer submission.
       const enc = getSharedEncoderInstance();
       if (enc) {
-        enc.copyBufferToBuffer(src, 0, dst, 0, bufSize);
+        enc.copyBufferToBuffer(paramBuf, 0, dst, 0, bufSize);
       } else {
         const ctx2 = requireContext();
         const tmpEnc = ctx2.device.createCommandEncoder();
-        tmpEnc.copyBufferToBuffer(src, 0, dst, 0, bufSize);
+        tmpEnc.copyBufferToBuffer(paramBuf, 0, dst, 0, bufSize);
         ctx2.queue.submit([tmpEnc.finish()]);
       }
-      return dst;
-    };
-    if (paramBuf === gradBuf || paramBuf === mBuf || paramBuf === vBuf) {
-      paramBuf = copyToFresh(paramBuf);
-    }
-    if (mBuf === gradBuf || mBuf === vBuf) {
-      mBuf = copyToFresh(mBuf);
-    }
-    if (vBuf === gradBuf) {
-      vBuf = copyToFresh(vBuf);
-    }
-
-    // If any copies were made, flush again so the copy commands are submitted
-    // before the Adam kernel binds the original buffers as read_write.
-    if (
-      paramBuf !== paramT.buffer ||
-      mBuf !== mT.buffer ||
-      vBuf !== vT.buffer
-    ) {
+      paramBuf = dst;
       flushSharedEncoder();
     }
 
@@ -178,7 +160,7 @@ export async function adamStep(
 
     // Post-dispatch flush only needed outside shared encoder mode.
     // In shared encoder mode, all buffer releases are deferred (deferredDestroy for grad,
-    // sharedEncoderDeferredUniformBuffers for config, noop'd destroy for param/m/v).
+    // sharedEncoderDeferredUniformBuffers for config, noop'd destroy for param).
     // No buffer destruction occurs during plan execution.
     if (!isSharedEncoderActive()) {
       flushSharedEncoder();
@@ -191,20 +173,11 @@ export async function adamStep(
       f16WeightCache.set(result.paramBuffer, result.paramF16Buffer);
     }
 
-    // In-place: the kernel wrote to the input buffers (or de-aliased copies).
-    // Create new owning WebGPUTensor wrappers for the result. Replace the
-    // input tensors' destroy() with a no-op so that when the engine disposes
-    // the old storage handles, the buffer won't be released to the pool
-    // (the result tensors now own it). This prevents double-free.
+    // param is updated in-place — transfer ownership from old tensor to result.
+    // m/v are fresh output buffers — no ownership transfer needed.
     _st = profileSubOpBegin();
-    // Explicitly decRef before noop-ing destroy — ownership transfers to result tensors.
     if (paramT.ownsBuffer) bufferPool.decRef(paramT.buffer);
-    if (mT.ownsBuffer) bufferPool.decRef(mT.buffer);
-    if (vT.ownsBuffer) bufferPool.decRef(vT.buffer);
-    const noop = () => {};
-    paramT.destroy = noop;
-    mT.destroy = noop;
-    vT.destroy = noop;
+    paramT.destroy = () => {};
     const ret = {
       param: createTensor(
         paramT.shape,

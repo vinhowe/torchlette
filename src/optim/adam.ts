@@ -1,8 +1,6 @@
 import type { AdamStepConfig, DeviceKind } from "../backend/types";
 import type { Tensor, Torchlette } from "../frontend/torchlette";
 import { createLazyIRNode } from "../graph/node-factory";
-import { storageTracker } from "../graph/storage-tracker";
-import type { LazyIRNode } from "../graph/types";
 import { createPendingRef } from "../graph/types";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import { validateOptimizerParams } from "./validate";
@@ -42,13 +40,11 @@ export class Adam {
   private _groups: ResolvedAdamGroup[];
   /** Maps flat param index → group index. */
   private _groupIndex: number[];
-  private expAvg: Array<RuntimeTensor | null>;
-  private expAvgSq: Array<RuntimeTensor | null>;
+  private expAvg: RuntimeTensor[];
+  private expAvgSq: RuntimeTensor[];
   /** Intermediate tensors from the last step — disposed after markStep(). */
   private _intermediates: RuntimeTensor[] = [];
   private steps: number[];
-  /** Pending adamStep nodes from the last step, for side output extraction */
-  private _pendingNodes: Array<LazyIRNode | null>;
   /** Pending unscale config from GradScaler (fused unscale+Adam path) */
   private _pendingUnscale: { invScale: number; infFlagBuffer: unknown } | null =
     null;
@@ -123,10 +119,10 @@ export class Adam {
       this._groupIndex = flatParams.map(() => 0);
     }
 
-    this.expAvg = new Array(flatParams.length).fill(null);
-    this.expAvgSq = new Array(flatParams.length).fill(null);
+    const runtime = engine._runtime();
+    this.expAvg = flatParams.map((p) => runtime.zeros(p.shape, device));
+    this.expAvgSq = flatParams.map((p) => runtime.zeros(p.shape, device));
     this.steps = new Array(flatParams.length).fill(0);
-    this._pendingNodes = new Array(flatParams.length).fill(null);
   }
 
   getParams(): Tensor[] {
@@ -186,63 +182,8 @@ export class Adam {
     this._pendingUnscale = { invScale, infFlagBuffer };
   }
 
-  /**
-   * Resolve side outputs (m, v) from pending adamStep nodes.
-   * Called at the start of each step() to extract m/v from the previous step's
-   * fused kernel execution.
-   */
-  private _resolvePendingState(): void {
-    const runtime = this.api._runtime();
-    let resolved = 0;
-    let missed = 0;
-    for (let i = 0; i < this._pendingNodes.length; i++) {
-      const node = this._pendingNodes[i];
-      if (!node) continue;
-
-      // Multi-output: results[1] = m, results[2] = v
-      const mStorage = node.results?.[1];
-      const vStorage = node.results?.[2];
-
-      if (mStorage && vStorage) {
-        resolved++;
-        // Dispose old state — markUnreachable also clears protection on the
-        // old storage, so it can be destroyed by the next destroyUnreachable.
-        if (this.expAvg[i]) this.expAvg[i]?.dispose();
-        if (this.expAvgSq[i]) this.expAvgSq[i]?.dispose();
-
-        // Keep m/v storages protected — they were created during a previous
-        // step and are not in the beginStep snapshot. Protection ensures they
-        // survive destroyStepScoped. Protection is cleared automatically when
-        // the RuntimeTensor is disposed at the next _resolvePendingState.
-
-        // Wrap existing StorageHandles into tracked RuntimeTensors
-        this.expAvg[i] = runtime.createFromStorageHandle(
-          mStorage,
-          this.params[i].shape,
-          this.device,
-        );
-        this.expAvgSq[i] = runtime.createFromStorageHandle(
-          vStorage,
-          this.params[i].shape,
-          this.device,
-        );
-      } else {
-        missed++;
-      }
-      // Clear results array to release the WeakRef target used by
-      // storageTracker.markReachable. Without this, old results arrays
-      // keep m/v storages reachable until GC collects the node.
-      if (node.results) node.results = undefined as never;
-      this._pendingNodes[i] = null;
-    }
-    // resolved/missed counters available for debug if needed
-  }
-
   step(): Tensor[] {
     const runtime = this.api._runtime();
-
-    // Resolve side outputs from previous fused step
-    this._resolvePendingState();
 
     if (this.hasFusedKernel()) {
       return this._stepFused(runtime);
@@ -281,14 +222,6 @@ export class Adam {
       // The adjustment: eps_adjusted = eps_orig * sqrt(bc2)
       const epsAdjusted = this.eps * Math.sqrt(bc2);
 
-      // Initialize m, v as zeros on first step
-      if (!this.expAvg[i]) {
-        this.expAvg[i] = runtime.zeros(param.shape, this.device);
-      }
-      if (!this.expAvgSq[i]) {
-        this.expAvgSq[i] = runtime.zeros(param.shape, this.device);
-      }
-
       const wd = this._getParamWeightDecay(i);
       const config: AdamStepConfig = {
         beta1: this.beta1,
@@ -309,8 +242,8 @@ export class Adam {
         [
           grad.lazyRef,
           param._unwrap().lazyRef,
-          this.expAvg[i]!.lazyRef,
-          this.expAvgSq[i]!.lazyRef,
+          this.expAvg[i].lazyRef,
+          this.expAvgSq[i].lazyRef,
         ],
         param.shape,
         "f32",
@@ -318,11 +251,10 @@ export class Adam {
         config,
       );
 
-      // For in-place execution: prevent the old storage's backend tensor from
-      // releasing the GPU buffer when destroyUnreachable() runs (before the adam
-      // node executes). The adam kernel writes in-place to the same buffer, so
-      // the buffer must NOT be returned to the pool. _updateLazyRef marks the
-      // old storage unreachable, and destroyUnreachable can run before execution.
+      // For in-place execution: prevent the old param storage's backend tensor
+      // from releasing the GPU buffer when destroyUnreachable() runs (before
+      // the adam node executes). The adam kernel writes param in-place, so the
+      // buffer must NOT be returned to the pool.
       const paramRt = param._unwrap();
       if (paramRt.isMaterialized()) {
         const oldBt = paramRt.backendTensor as { destroy?: () => void };
@@ -331,15 +263,11 @@ export class Adam {
         }
       }
 
-      // Update param in-place to point at the adamStep node's result
-      paramRt._updateLazyRef(createPendingRef(adamNode));
-
-      // Store node ref for side output extraction on next step
-      this._pendingNodes[i] = adamNode;
-
-      // Keep expAvg[i] / expAvgSq[i] alive — they're inputs to the lazy node
-      // and can't be disposed until execution completes. _resolvePendingState()
-      // on the NEXT step will dispose them (after markStep() has executed the node).
+      // Update param (output 0), m (output 1), v (output 2) to point at
+      // the adamStep node's results. m/v are fresh output buffers.
+      paramRt._updateLazyRef(createPendingRef(adamNode, 0));
+      this.expAvg[i]._updateLazyRef(createPendingRef(adamNode, 1));
+      this.expAvgSq[i]._updateLazyRef(createPendingRef(adamNode, 2));
 
       updated.push(param);
     }
@@ -373,30 +301,20 @@ export class Adam {
     const prevAvg = this.expAvg[i];
     const prevAvgSq = this.expAvgSq[i];
 
-    let avg: RuntimeTensor;
-    if (prevAvg) {
-      avg = runtime.add(
-        runtime.mul(prevAvg, this.beta1),
-        runtime.mul(gradAdj, 1 - this.beta1),
-      );
-    } else {
-      avg = runtime.mul(gradAdj, 1 - this.beta1);
-    }
+    const avg = runtime.add(
+      runtime.mul(prevAvg, this.beta1),
+      runtime.mul(gradAdj, 1 - this.beta1),
+    );
 
     const gradSq = runtime.mul(gradAdj, gradAdj);
 
-    let avgSq: RuntimeTensor;
-    if (prevAvgSq) {
-      avgSq = runtime.add(
-        runtime.mul(prevAvgSq, this.beta2),
-        runtime.mul(gradSq, 1 - this.beta2),
-      );
-    } else {
-      avgSq = runtime.mul(gradSq, 1 - this.beta2);
-    }
+    const avgSq = runtime.add(
+      runtime.mul(prevAvgSq, this.beta2),
+      runtime.mul(gradSq, 1 - this.beta2),
+    );
 
-    prevAvg?.dispose();
-    prevAvgSq?.dispose();
+    prevAvg.dispose();
+    prevAvgSq.dispose();
     this.expAvg[i] = avg;
     this.expAvgSq[i] = avgSq;
 
@@ -440,7 +358,6 @@ export class Adam {
    */
   async stepAsync(): Promise<Tensor[]> {
     const runtime = this.api._runtime();
-    this._resolvePendingState();
     const updated: Tensor[] = [];
     for (let i = 0; i < this.params.length; i++) {
       const param = this.params[i];

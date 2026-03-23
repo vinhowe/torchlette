@@ -31,6 +31,7 @@ import {
   gpuBuffer,
 } from "../backend/webgpu/gpu-types";
 import type { EpilogueConfig } from "../backend/webgpu/matmul/types";
+import { getSharedEncoderInstance } from "../backend/webgpu/shared-encoder";
 import { createTensor } from "../backend/webgpu/tensor";
 import type { FusionGroup } from "../compiler/fusion-detect";
 import {
@@ -61,7 +62,6 @@ import {
   recordPlanAnalysis,
   setProfileModule,
 } from "../graph/profiler";
-import { storageTracker } from "../graph/storage-tracker";
 import type {
   ExecutionPlan,
   LazyIRNode,
@@ -292,13 +292,17 @@ async function executeAdamBatchInner(
   if (packedItems.length === 0) return;
 
   // Packed dispatch: scatter→dispatch→gather for groups of ≥2 same-size params
+  // With the m/v buffer split, dispatchAdamStep writes m/v to fresh output
+  // buffers. Inside the dispatch callback, we copy the fresh m_out/v_out back
+  // to the packed m_in/v_in buffers (packed[2]/packed[3]) so that the normal
+  // gather path can scatter them back to individual m/v buffers.
   const config = nodes[0].payload as AdamStepConfig;
   const infFlagBuffer = (config.infFlagBuffer as GPUBuffer | null) ?? null;
   const handled = dispatchPackedOptimizer({
     items: packedItems,
     gatherIndices: [1, 2, 3], // gather param, m, v (not grad)
     dispatch(packed, totalElements) {
-      dispatchAdamStep(
+      const result = dispatchAdamStep(
         packed[0],
         packed[1],
         packed[2],
@@ -308,11 +312,24 @@ async function executeAdamBatchInner(
         false,
         infFlagBuffer,
       );
+      // The kernel wrote new m/v to fresh packed buffers (result.mBuffer,
+      // result.vBuffer). Copy them back to packed[2]/packed[3] so the gather
+      // phase can scatter the updated values to individual per-param buffers.
+      const enc = getSharedEncoderInstance();
+      if (enc) {
+        const mBytes = totalElements * 4;
+        enc.copyBufferToBuffer(result.mBuffer, 0, packed[2], 0, mBytes);
+        enc.copyBufferToBuffer(result.vBuffer, 0, packed[3], 0, mBytes);
+      }
+      // The temporary m_out/v_out packed buffers are no longer needed after
+      // the copy. Use deferred destroy so the GPU can finish reading them.
+      bufferPool.deferredDestroy(result.mBuffer, result.mBuffer.size);
+      bufferPool.deferredDestroy(result.vBuffer, result.vBuffer.size);
     },
     label: "packedAdam",
   });
 
-  // Create result StorageHandles for packed items (data updated in-place via gather)
+  // Create result StorageHandles for packed items (data updated via gather copy)
   for (const i of handled) {
     assignPackedAdamResult(nodes[i], storages[i]);
     // Evict stale f16 weight cache entries (param data changed in-place)
@@ -356,10 +373,9 @@ function assignPackedAdamResult(
     s1.id,
   );
 
-  // m/v: transfer ownership from old tensors to new ones
-  // 1. DecRef old (undoes the incRef from the original createTensor)
-  // 2. Noop old destroy (prevents double-free when old storage is GC'd)
-  // 3. Create new tensor wrapping same buffer (does incRef)
+  // m/v: the kernel wrote new values to fresh packed buffers, which were then
+  // copied back to the original individual m/v buffers. Transfer ownership from
+  // old tensors to new ones wrapping the same buffer.
   const mBT = s2.backendTensor as unknown as {
     buffer: GPUBuffer;
     shape: number[];
@@ -386,8 +402,6 @@ function assignPackedAdamResult(
   const mStorage = createStorageHandle(adamNode.device, newM);
   const vStorage = createStorageHandle(adamNode.device, newV);
   adamNode.results = [adamNode.result!, mStorage, vStorage];
-  storageTracker.protect(mStorage.id);
-  storageTracker.protect(vStorage.id);
 }
 
 /** Assign result + side outputs for a param updated by per-param adamOp (standard path). */
@@ -396,14 +410,11 @@ function assignPerParamAdamResult(
   _s1: StorageHandle,
   adamResult: { param: BackendTensor; m: BackendTensor; v: BackendTensor },
 ): void {
-  // The fused Adam kernel writes in-place and returns a new owning tensor.
-  // Do NOT chain as a view via baseStorageId (removed from createStorageHandle API).
+  // The fused Adam kernel returns fresh m/v output buffers and in-place param.
   adamNode.result = createStorageHandle(adamNode.device, adamResult.param);
   const mStorage = createStorageHandle(adamNode.device, adamResult.m);
   const vStorage = createStorageHandle(adamNode.device, adamResult.v);
   adamNode.results = [adamNode.result, mStorage, vStorage];
-  storageTracker.protect(mStorage.id);
-  storageTracker.protect(vStorage.id);
 }
 
 /** Collect GPU buffers from all external (materialized/already-resolved) plan inputs. */
