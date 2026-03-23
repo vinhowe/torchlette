@@ -12,12 +12,14 @@ onMount(async () => {
     disableProfiling,
     enableProfiling,
     getProfileJSON,
+    getDebugLiveTensors,
     getTensorDebugStats,
     getWebGPUDevice,
     initGpuTimestamps,
     readGpuTimestamps,
     resetProfileStats,
     resetTensorDebugStats,
+    setDebugTracking,
     storageTracker,
   } = await import("torchlette");
   // Expose stores and profiling for DevTools
@@ -36,6 +38,9 @@ onMount(async () => {
     tensorStats: getTensorDebugStats,
     resetTensorStats: resetTensorDebugStats,
     storageStats: () => storageTracker.stats(),
+    enableDebugTracking: () => setDebugTracking(true),
+    disableDebugTracking: () => setDebugTracking(false),
+    liveTensors: getDebugLiveTensors,
   };
 });
 
