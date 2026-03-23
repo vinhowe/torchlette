@@ -2,7 +2,11 @@
  * Training store -- config, data, training loop, LoRA export.
  */
 
-import { LoRATrainer, type TrainingConfig } from "$lib/torchlette/trainer";
+import {
+  LoRATrainer,
+  type StepPhaseTimings,
+  type TrainingConfig,
+} from "$lib/torchlette/trainer";
 import { serializeLoRAToSafetensors } from "$lib/torchlette/weights";
 import { modelStore } from "./model.svelte";
 
@@ -37,6 +41,8 @@ let memoryHistory = $state<number[]>([]);
 // biome-ignore lint/style/useConst: Svelte $state runes require reassignment
 let memoryMB = $state(0);
 let tokPerSec = $state(0);
+// biome-ignore lint/style/useConst: Svelte $state runes require reassignment
+let lastPhases = $state<StepPhaseTimings | null>(null);
 let error = $state("");
 
 // Export
@@ -129,7 +135,7 @@ async function startTraining(): Promise<void> {
       onStepStart: (s) => {
         step = s;
       },
-      onStepEnd: (s, l, timeMs, mem) => {
+      onStepEnd: (s, l, timeMs, mem, phases) => {
         step = s + 1;
         loss = l;
         lossHistory = [...lossHistory, l];
@@ -138,6 +144,7 @@ async function startTraining(): Promise<void> {
           memoryHistory = [...memoryHistory, mem];
         }
         tokPerSec = (batchSize * seqLen) / (timeMs / 1000);
+        if (phases) lastPhases = phases;
       },
       shouldStop: () => shouldStop,
     });
@@ -264,6 +271,9 @@ export const trainingStore = {
   },
   get tokPerSec() {
     return tokPerSec;
+  },
+  get phases() {
+    return lastPhases;
   },
   get error() {
     return error;

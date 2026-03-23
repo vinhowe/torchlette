@@ -468,7 +468,6 @@ export function analyzeGraph(
     maxStorageBuffers,
     enableMultiOutput: true,
     excludedIds: allClaimedIds,
-    bypassedIds: rewriteBypassedIds.size > 0 ? rewriteBypassedIds : undefined,
   });
 
   // Debug dump: show fusion break patterns for large backward plans
