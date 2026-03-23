@@ -1,5 +1,9 @@
 import { shapesEqual } from "../core/shape";
 import { storageTracker } from "../graph/storage-tracker";
+import {
+  _pendingCheckpointScopes,
+  disposeCheckpointIntermediates,
+} from "../nn/checkpoint";
 import { TidyDispatchMode } from "../runtime/engine";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import type { Tensor } from "./tensor";
@@ -21,6 +25,14 @@ async function collectAndForceSavedTensors(
   // Suppress markEscaped during checkpoint recomputation so recomputed
   // RuntimeTensors stay tracked (not escaped) in TidyDispatchMode.
   // This ensures disposeNonEscaped() cleans them up after backward.
+  //
+  // Also enable checkpoint recompute tensor tracking: _wrap records every
+  // FrontendTensor created during _inCheckpointRecompute into a single
+  // disposal scope. This scope covers BOTH the recomputation itself AND
+  // the subsequent forceAllMerged (which materializes recomputed tensors
+  // and may create additional RuntimeTensors).
+  const recomputeScope = new Set<Tensor>();
+  torch._checkpointRecomputeTensors = recomputeScope;
   torch._inCheckpointRecompute = true;
   try {
     for (let i = ordered.length - 1; i >= 0; i -= 1) {
@@ -37,9 +49,17 @@ async function collectAndForceSavedTensors(
     }
   } finally {
     torch._inCheckpointRecompute = false;
+    // Close the recompute scope BEFORE Phase B. Phase B's forceAllMerged
+    // creates RuntimeTensors during plan execution that are normal outputs,
+    // NOT checkpoint intermediates. Including them in the scope would cause
+    // massive over-disposal in Full FT mode (588+ tensors/step).
+    torch._checkpointRecomputeTensors = null;
+    if (recomputeScope.size > 0) {
+      _pendingCheckpointScopes.push(recomputeScope);
+    }
   }
 
-  // Phase B: Force all saved tensors in ONE merged plan
+  // Phase B: Force all saved tensors in ONE merged plan.
   const allPending: RuntimeTensor[] = [];
   for (const tensors of allUnpackedTensors.values()) {
     for (const t of tensors) {
@@ -139,59 +159,6 @@ async function runBackwardFunctions(
       }
     }
   }
-}
-
-/**
- * Dispose checkpoint-recomputed tensors that are no longer needed after
- * backward execution. Only protects parameters and external user inputs.
- */
-function disposeCheckpointTensors(
-  ordered: AutogradNode[],
-  allUnpackedTensors: Map<AutogradNode, Tensor[]>,
-  leafTensors: Set<Tensor>,
-): void {
-  // Protect actual leaf tensors (parameters) and external user inputs.
-  // Do NOT over-protect all autograd node inputs — that includes
-  // checkpoint-recomputed intermediates whose RuntimeTensors would leak.
-  const protectedTensors = new Set<Tensor>();
-  for (const t of leafTensors) {
-    protectedTensors.add(t);
-  }
-  // Also protect non-leaf inputs that are NOT forward intermediates
-  // (e.g., user-provided x, target tensors)
-  const forwardOutputs = new Set<Tensor>();
-  for (const node of ordered) {
-    forwardOutputs.add(node.output);
-  }
-  for (const node of ordered) {
-    for (const input of node.inputs) {
-      if (!forwardOutputs.has(input)) {
-        protectedTensors.add(input);
-      }
-    }
-  }
-
-  for (const [node, tensors] of allUnpackedTensors.entries()) {
-    for (let idx = 0; idx < tensors.length; idx++) {
-      const unpacked = tensors[idx];
-      const packed = node.savedSlots[idx]?.packed;
-      if (unpacked === packed) {
-        // Identity unpack (not checkpoint-recomputed) — skip
-      } else if (unpacked.isDisposed) {
-        // Already disposed
-      } else if (unpacked.requiresGrad) {
-        // Trainable parameter — must not dispose
-      } else if (protectedTensors.has(unpacked)) {
-        // Protected (frozen weight, user input) — do not dispose
-      } else {
-        // Checkpoint-recomputed intermediate — safe to dispose.
-        // Without this, captured tensors accumulate as undisposed
-        // RuntimeTensors (+12/step), causing progressive CPU slowdown.
-        unpacked.dispose();
-      }
-    }
-  }
-  allUnpackedTensors.clear();
 }
 
 /**
@@ -303,6 +270,7 @@ export async function backwardImpl(
     try {
       return await torch.runtime.runWithAsyncScope(async () => {
         const seed = grad ? grad._unwrap() : torch._seedGrad(a);
+        const ownsSeed = !grad; // dispose seed after backward if we created it
 
         // Use Tensor as key for gradient accumulation
         const gradMap = new Map<Tensor, RuntimeTensor>();
@@ -352,10 +320,7 @@ export async function backwardImpl(
         // Run backward functions
         await runBackwardFunctions(torch, ordered, gradMap, allUnpackedTensors);
 
-        // Pre-compute leaf tensor set BEFORE disposeCheckpointTensors.
-        // disposeCheckpointTensors triggers _disposeAutogradChain which clears
-        // gradNodes on shared inputs, causing forward intermediates to falsely
-        // appear as leaf tensors (requiresGrad=true, _gradNode()=null).
+        // Pre-compute leaf tensor set for gradient accumulation.
         const leafTensors = new Set<Tensor>();
         const retainTensors = new Set<Tensor>();
         for (const [tensor] of gradMap) {
@@ -367,8 +332,11 @@ export async function backwardImpl(
           }
         }
 
-        // Dispose checkpoint-recomputed tensors no longer needed
-        disposeCheckpointTensors(ordered, allUnpackedTensors, leafTensors);
+        // Dispose checkpoint-recomputed intermediates. The checkpoint owns
+        // this — it tracked which tensors were recomputed (pending at capture
+        // time) vs which were model weight references (already materialized).
+        disposeCheckpointIntermediates();
+        allUnpackedTensors.clear();
 
         // Force ALL final gradients in one merged plan.
         const allGrads = [...gradMap.values()].filter(
@@ -392,6 +360,10 @@ export async function backwardImpl(
         }
 
         cleanupAutogradGraph(torch, ordered, gradMap);
+
+        // Dispose the gradient seed if we created it. Like TF.js, don't rely
+        // on tidy to catch it — explicitly dispose consumed intermediates.
+        if (ownsSeed) seed.dispose();
       });
     } finally {
       torch.runtime.popDispatchMode();
