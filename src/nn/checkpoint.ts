@@ -33,6 +33,30 @@ import type {
 } from "../frontend/torchlette";
 import type { RngDrawRecord } from "../graph/engine-types";
 
+/**
+ * Pending checkpoint disposal scopes. Each checkpoint recomputation pushes
+ * a Set of recomputed intermediate tensors. After backward finishes,
+ * disposeCheckpointIntermediates() disposes and clears all pending scopes.
+ *
+ * This is the ONLY mechanism for checkpoint tensor cleanup — no heuristics
+ * in the autograd cleanup. The checkpoint creates the tensors, the checkpoint
+ * owns their disposal.
+ */
+export const _pendingCheckpointScopes: Array<Set<Tensor>> = [];
+
+/**
+ * Dispose all checkpoint-recomputed intermediates and clear pending scopes.
+ * Called by the autograd backward after all gradient computation is done.
+ */
+export function disposeCheckpointIntermediates(): void {
+  for (const scope of _pendingCheckpointScopes) {
+    for (const t of scope) {
+      if (!t.isDisposed) t.dispose();
+    }
+  }
+  _pendingCheckpointScopes.length = 0;
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -116,10 +140,13 @@ function checkpointNonReentrant<T extends Tensor>(
   // Get the underlying runtime for checkpoint primitives
   const engine = api.runtime;
 
-  // Keep inputs alive for recomputation
+  // Keep inputs alive for recomputation.
+  // Also register them for disposal after backward — they're only needed
+  // for recomputation and shouldn't survive beyond the backward pass.
   for (const input of inputs) {
     api.keep(input);
   }
+  _pendingCheckpointScopes.push(new Set(inputs));
 
   // Record RNG state if needed for deterministic recomputation
   let rngDraws: RngDrawRecord[] | null = null;
@@ -155,11 +182,11 @@ function checkpointNonReentrant<T extends Tensor>(
       let captureIndex = 0;
       let lastCapturedTensor: Tensor | null = null;
 
-      // Capture tensors during recomputation
+      // Capture tensors during recomputation.
       const captureHook: PackHook = (t: Tensor): Tensor => {
         recomputedTensors?.set(captureIndex++, t);
         lastCapturedTensor = t;
-        return t; // Return tensor directly during recompute (no placeholder)
+        return t;
       };
 
       // Recompute with capture hooks inside tidy() to dispose non-captured

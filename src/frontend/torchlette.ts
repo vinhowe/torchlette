@@ -1241,6 +1241,9 @@ export class Torchlette {
   // Public helper methods (promoted from private for extracted modules)
   // ============================================================================
 
+  /** Tensors created during checkpoint recomputation — disposable after backward. */
+  _checkpointRecomputeTensors: Set<Tensor> | null = null;
+
   _wrap(inner: RuntimeTensor, requiresGrad = false): Tensor {
     if (!this._inCheckpointRecompute) {
       this.runtime.markEscaped(inner);
@@ -1249,6 +1252,9 @@ export class Torchlette {
     const tensor = new Tensor(this, inner, handle, { requiresGrad });
     if (this.inCompileRegion) {
       this._compileCreatedTensors.add(tensor);
+    }
+    if (this._checkpointRecomputeTensors) {
+      this._checkpointRecomputeTensors.add(tensor);
     }
     return tensor;
   }

@@ -40,52 +40,47 @@ export async function clipGradNorm_(
   // parameter leak until GC — causing memory oscillation in training.
   let totalNorm: number;
 
+  // Compute total norm lazily on GPU — no item() or materialization.
+  // PyTorch-style: the entire clip operation stays in the lazy graph.
+  let totalNormTensor: Tensor;
+
   if (normType === Infinity) {
-    let maxVal = 0;
+    let maxTensor: Tensor | null = null;
     for (const g of grads) {
-      const absMax = await api
-        .tidy(() => {
-          const result = api.max(api.abs(g));
-          api.keep(result);
-          return result;
-        })
-        .item();
-      if (absMax > maxVal) maxVal = absMax;
+      const absMax = api.max(api.abs(g));
+      maxTensor =
+        maxTensor === null
+          ? absMax
+          : api.max(
+              api.add(
+                api.mul(api.gt(absMax, maxTensor), absMax),
+                api.mul(api.gt(maxTensor, absMax), maxTensor),
+              ),
+            );
     }
-    totalNorm = maxVal;
+    totalNormTensor = maxTensor!;
   } else if (normType === 2) {
-    const totalSumSqVal = await api
-      .tidy(() => {
-        let totalSumSq: Tensor | null = null;
-        for (const g of grads) {
-          const sq = api.pow(g, 2);
-          const sumSq = api.sum(sq);
-          totalSumSq = totalSumSq === null ? sumSq : api.add(totalSumSq, sumSq);
-        }
-        api.keep(totalSumSq!);
-        return totalSumSq!;
-      })
-      .item();
-    totalNorm = Math.sqrt(totalSumSqVal);
+    let totalSumSq: Tensor | null = null;
+    for (const g of grads) {
+      const sq = api.pow(g, 2);
+      const sumSq = api.sum(sq);
+      totalSumSq = totalSumSq === null ? sumSq : api.add(totalSumSq, sumSq);
+    }
+    totalNormTensor = api.sqrt(totalSumSq!);
   } else {
-    const totalSumPVal = await api
-      .tidy(() => {
-        let totalSumP: Tensor | null = null;
-        for (const g of grads) {
-          const absG = api.abs(g);
-          const powG = api.pow(absG, normType);
-          const sumP = api.sum(powG);
-          totalSumP = totalSumP === null ? sumP : api.add(totalSumP, sumP);
-        }
-        api.keep(totalSumP!);
-        return totalSumP!;
-      })
-      .item();
-    // biome-ignore lint/style/useExponentiationOperator: Math.pow avoids `await x ** y` SyntaxError after bundler inlining
-    totalNorm = Math.pow(totalSumPVal, 1 / normType);
+    let totalSumP: Tensor | null = null;
+    for (const g of grads) {
+      const absG = api.abs(g);
+      const powG = api.pow(absG, normType);
+      const sumP = api.sum(powG);
+      totalSumP = totalSumP === null ? sumP : api.add(totalSumP, sumP);
+    }
+    totalNormTensor = api.pow(totalSumP!, 1 / normType);
   }
 
-  // Clip: scale gradients if total norm exceeds maxNorm
+  // Read the norm and clip coefficient — one materialization point.
+  // The norm computation was lazy; item() forces it.
+  totalNorm = await totalNormTensor.item();
   const clipCoef = maxNorm / (totalNorm + 1e-6);
   if (clipCoef < 1) {
     for (const g of grads) {
