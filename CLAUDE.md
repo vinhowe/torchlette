@@ -14,7 +14,7 @@ WebGPU is auto-detected at runtime. Use `TORCHLETTE_CPU_ONLY=1` to force CPU-onl
 
 For WebGPU backend changes, also run the relevant integration test (e.g. `npx tsx examples/gpt2/finetune-demo.ts` for training-related fixes).
 
-**Zero test failures policy.** Currently 865 tests pass across 64 test files. Never accept test failures. Fix before moving on.
+**Zero test failures policy.** Currently 852 tests pass across 55 test files. Never accept test failures. Fix before moving on.
 
 **Important:** Any standalone script or tool that uses WebGPU (Dawn) must call `process.exit(0)` at the end of `main()`. Dawn holds background threads that prevent Node from exiting naturally.
 
@@ -44,10 +44,11 @@ BENCH_WARMUP=3 BENCH_ITERS=7 npx tsx bench/matmul-comparison.ts
   - `tile-*.ts` - Tile-IR compiler (IR, lowering, compiler, ops, dispatch)
 - `src/engine/` - Tensor engine core (lazy execution, graph compiler, fusion, plan building)
 - `src/frontend/` - User-facing API (table-driven ops, autograd, autocast, noGrad)
-- `src/runtime/` - RuntimeEngine (lazy IR node creation, dtype rules)
+  - `custom-backward.ts` - Extracted backward functions (matmul, linear, gelu) with BackwardContext
+- `src/runtime/` - RuntimeEngine (lazy IR node creation, dtype rules, table-driven ops)
 - `src/nn/` - Module system (auto parameters, linear, embedding, layernorm, init, grad clipping)
 - `src/optim/` - Optimizers (Adam/AdamW with fused GPU kernel, SGD, GradScaler, LR schedulers, parameter groups)
-- `test/` - 64 test files, 860 tests
+- `test/` - 55 test files, 852 tests
 - `examples/gpt2/` - GPT-2 model, loader, tokenizer, finetune demo
 - `tools/profile-training.ts` - GPU training profiler (supports distilgpt2, gpt2, gpt2-medium)
 
@@ -67,6 +68,26 @@ BENCH_WARMUP=3 BENCH_ITERS=7 npx tsx bench/matmul-comparison.ts
 | Elementwise fusion (§15.1-15.3) | Implemented |
 
 Known divergences: `number` not `bigint` for versions, 2 LocRoles not 6, no tombstones.
+
+## Step-Scoped Storage Cleanup
+
+GPU memory is managed deterministically via two-tier reachability — no GC dependency.
+
+**At `beginStep()`**: all pending tensors are forced (materializes model weights on first call), then `snapshotForStep()` captures which RuntimeTensor objects are alive. These are "persistent" (model params, optimizer state).
+
+**At `markStep()`**: after normal `destroyUnreachable()`, `destroyStepScoped()` demotes any reachable storage whose RuntimeTensor was NOT in the snapshot (created during the step as a temporary). This gives flat memory without depending on JavaScript GC timing.
+
+**Adam m/v lifecycle**: The fused Adam kernel writes m/v to SEPARATE output buffers (not in-place). This means old and new m/v have independent buffer lifecycles. Adam uses `_updateLazyRef(createPendingRef(adamNode, outputIndex))` for m/v — the existing multi-output `outputIndex` infrastructure handles materialization automatically via `materializePendingTensors`. No protect/unprotect needed.
+
+**Key invariant**: tensors created via public API (`tensorFromArray`, `zeros`, etc.) persist across steps because they're held by user code → in the snapshot. Tensors created by autograd-wrapped ops (activations, views, gradients) are step-scoped → cleaned up deterministically at markStep.
+
+## Op Dispatch Architecture
+
+**Table-driven ops**: Simple unary ops (relu, exp, sqrt, etc.), binary ops (add, mul, pow), comparison ops (gt, lt, etc.), reduction ops (sum, max, min, mean), and arg-reduce ops (argmax, argmin) are all table-driven via interface augmentation + prototype loop at the bottom of their respective files. This preserves TypeScript autocomplete while eliminating boilerplate.
+
+**Custom backward extraction**: Complex backward functions (matmul, linear, gelu tanh, gelu erf) are extracted to `src/frontend/custom-backward.ts` with a `BackwardContext` interface. The frontend methods become thin dispatch stubs. Add new custom backward functions to this file following the same pattern.
+
+**Gradient specs**: Simple ops (elementwise) define gradients in `src/ops/registry.ts` (UnaryGradFn, BinaryTTGradFn, BinaryTSGradFn). Complex ops define gradients in `custom-backward.ts`. Don't add complex backward logic to `torchlette.ts`.
 
 ## WebGPU Buffer Pool Invariants
 
@@ -99,7 +120,7 @@ Steady-state ~162ms/step wall clock. Memory: 14.7GB steady, zero leak. Pool reus
 
 4. **LR Schedulers** — StepLR, CosineAnnealingLR, etc. ~300 lines, pure math, zero risk.
 5. **Weight initialization** — kaiming_normal_, xavier_uniform_. ~200 lines.
-6. **Gradient clipping** — clip_grad_norm_, clip_grad_value_. ~50 lines.
+6. ~~**Gradient clipping**~~ — Implemented (clip_grad_norm_, clip_grad_value_).
 7. **Parameter groups** — per-layer LR in Adam/SGD. ~150 lines.
 
 ### Architecture targets (long-term)
