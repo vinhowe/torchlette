@@ -5,11 +5,38 @@ import { modelStore } from "$lib/stores/model.svelte";
 import { trainingStore } from "$lib/stores/training.svelte";
 
 // Fetch Shakespeare data on mount
-onMount(() => {
+onMount(async () => {
   trainingStore.fetchShakespeare();
-  // Expose stores for DevTools debugging
+  // Dynamic import — torchlette uses WebGPU which isn't available during SSR
+  const {
+    disableProfiling,
+    enableProfiling,
+    getProfileJSON,
+    getTensorDebugStats,
+    getWebGPUDevice,
+    initGpuTimestamps,
+    readGpuTimestamps,
+    resetProfileStats,
+    resetTensorDebugStats,
+    storageTracker,
+  } = await import("torchlette");
+  // Expose stores and profiling for DevTools
   (window as any).__model = modelStore;
   (window as any).__training = trainingStore;
+  (window as any).__profiling = {
+    enable: enableProfiling,
+    disable: disableProfiling,
+    reset: resetProfileStats,
+    getJSON: getProfileJSON,
+    initTimestamps: () => {
+      const ctx = getWebGPUDevice();
+      if (ctx) initGpuTimestamps(ctx.device);
+    },
+    readTimestamps: readGpuTimestamps,
+    tensorStats: getTensorDebugStats,
+    resetTensorStats: resetTensorDebugStats,
+    storageStats: () => storageTracker.stats(),
+  };
 });
 
 // --- Helpers ---

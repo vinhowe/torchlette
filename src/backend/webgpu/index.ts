@@ -88,6 +88,7 @@ export {
   disableProfiling,
   enableProfiling,
   getProfileJSON,
+  initGpuTimestamps,
   isProfilingEnabled,
   printProfileSummary,
   readGpuTimestamps,

@@ -313,7 +313,10 @@ async function requestDeviceWithFallback(
     const requiredFeatures: string[] = [];
     if (subgroupSupport.supported) requiredFeatures.push("subgroups");
     if (f16Supported) requiredFeatures.push("shader-f16");
-    if (isProfilingEnabled() && adapter.features?.has("timestamp-query")) {
+    // Always request timestamp-query if available — profiling can be
+    // enabled at runtime (e.g., from the browser console) and the device
+    // can't be re-created with new features after initialization.
+    if (adapter.features?.has("timestamp-query")) {
       requiredFeatures.push("timestamp-query");
     }
     const device = await adapter.requestDevice({
