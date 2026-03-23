@@ -321,9 +321,9 @@ export function initGpuTimestamps(device: LocalGPUDevice): void {
   gpuTs.device = device;
   gpuTs.supported = true;
 
-  // Check device limits for max query count
+  // Check device limits for max query count (not available in all browsers)
   const maxQueryCount =
-    (device.limits as unknown as Record<string, number>).maxQueryCount ?? 4096;
+    (device.limits as unknown as Record<string, number>)?.maxQueryCount ?? 4096;
   const count = Math.min(GPU_MAX_PASSES * 2, maxQueryCount);
   gpuTs.maxSlots = count;
 
