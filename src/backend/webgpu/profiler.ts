@@ -558,9 +558,16 @@ export async function flushAndReadGpuTimestamps(): Promise<boolean> {
     return false;
   }
 
-  // 4. Disable timestamp writes for backward/optimizer to avoid corrupting
-  //    Dawn's fence state. Forward GPU timing is captured; backward uses CPU timing.
-  gpuTs.enabled = false;
+  // 4. On Node.js/Dawn (V100), disable timestamp writes for backward/optimizer
+  //    to avoid corrupting Dawn's Vulkan fence state. In browsers (Chrome/Metal),
+  //    the fence mechanism works correctly across all phases, so keep timestamps
+  //    enabled to capture full-step GPU timing.
+  const isBrowser =
+    typeof navigator !== "undefined" &&
+    typeof (navigator as { gpu?: unknown }).gpu !== "undefined";
+  if (!isBrowser) {
+    gpuTs.enabled = false;
+  }
   return true;
 }
 

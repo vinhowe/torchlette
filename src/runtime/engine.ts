@@ -49,14 +49,7 @@ import {
   type LazyRef,
 } from "../graph/types";
 import { OP_DTYPE_RULES, promoteDtype } from "../ops/registry";
-import {
-  type BaseId,
-  clearDisposedPendingNodeIds,
-  createBaseId,
-  getAllPendingTensors,
-  materializePendingTensors,
-  Tensor,
-} from "./tensor";
+import { type BaseId, createBaseId, Tensor } from "./tensor";
 
 // Re-export all types from engine-types (EngineTensor, SavedTensorRecord, etc.)
 export * from "../graph/engine-types";
@@ -677,6 +670,8 @@ export class RuntimeEngine {
 
     // Materialize ALL tensors that were pending on executed nodes.
     // This ensures all user-held tensors get their storages marked as externally reachable.
+    const { materializePendingTensors, clearDisposedPendingNodeIds } =
+      await import("./tensor");
     for (const node of plan.nodes) {
       if (node.result) {
         materializePendingTensors(node.id, node.result, node.results);
@@ -700,6 +695,11 @@ export class RuntimeEngine {
    * are still accessible via node.result in getInputStorage().
    */
   async forceAllPending(): Promise<void> {
+    const {
+      getAllPendingTensors,
+      materializePendingTensors: materialize,
+      clearDisposedPendingNodeIds,
+    } = await import("./tensor");
     const pendingTensors = getAllPendingTensors();
     if (pendingTensors.length === 0) {
       return;
@@ -750,7 +750,7 @@ export class RuntimeEngine {
     // Materialize all tensors pending on executed nodes
     for (const node of plan.nodes) {
       if (node.result) {
-        materializePendingTensors(node.id, node.result, node.results);
+        materialize(node.id, node.result, node.results);
       }
     }
     clearDisposedPendingNodeIds();
@@ -1866,24 +1866,8 @@ export class RuntimeEngine {
 
   async markStep(): Promise<void> {
     this._debug_runEntryPoint(() => {
-      // Clean up base state for temporary tensors. Without this, _baseState
-      // grows unboundedly (~2000 entries/step) because entries are created for
-      // every tensor but never removed. Keep entries for pinned bases (model
-      // params, optimizer state) — they need commit version tracking across steps.
-      for (const [baseId] of this._baseState) {
-        if (!this._basePinCount.has(baseId)) {
-          this._baseState.delete(baseId);
-        }
-      }
-      // Clear committed mutation ID sets for surviving base states. The committed
-      // set prevents double-commit within a step but grows unboundedly across
-      // steps (~3 entries/param/step). The baseCommitVersion is preserved for
-      // saved-tensor version checking in the next step.
-      for (const [, state] of this._baseState) {
-        state.committed.clear();
-      }
-      // Clear saved tensor tracking (already empty after backward, but ensure it).
-      this._savedTensors.clear();
+      // No-op: token algebra and loc bindings removed.
+      // Runtime handles plan execution directly.
     });
   }
 
@@ -2059,7 +2043,6 @@ export class RuntimeEngine {
       activeBases: this._basePinCount.size,
       totalPinCount,
       savedTensorCount: this._savedTensors.size,
-      baseStateSize: this._baseState.size,
       pendingTensorCount: p?.getPendingTensorCount?.() ?? 0,
       activePlans: plan.activePlans,
       completedPlans: plan.completedPlans,

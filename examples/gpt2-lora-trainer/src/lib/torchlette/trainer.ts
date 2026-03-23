@@ -25,6 +25,13 @@ export type TrainingConfig = {
   fullFinetune?: boolean;
 };
 
+export type StepPhaseTimings = {
+  forward: number;
+  backward: number;
+  optimizer: number;
+  cleanup: number;
+};
+
 export type TrainingCallbacks = {
   onStepStart?: (step: number) => void;
   onStepEnd?: (
@@ -32,6 +39,7 @@ export type TrainingCallbacks = {
     loss: number,
     timeMs: number,
     memoryMB?: number,
+    phases?: StepPhaseTimings,
   ) => void;
   shouldStop?: () => boolean;
 };
@@ -239,6 +247,8 @@ export class LoRATrainer {
         });
       }
 
+      const fwdEnd = performance.now();
+
       // Read loss value before backward (checkpoint may dispose intermediate tensors).
       let lossValue = await loss.item();
       if (this.gradScaler) {
@@ -261,10 +271,12 @@ export class LoRATrainer {
       }
 
       // Backward pass
+      const bwdStart = performance.now();
       await loss.backward();
 
       // Gradient clipping
       await nn.clipGradNorm_(this.api, trainableParams, 1.0);
+      const bwdEnd = performance.now();
 
       // Optimizer step
       if (this.gradScaler) {
@@ -280,6 +292,7 @@ export class LoRATrainer {
         this.optimizer!.step();
       }
       this.optimizer!.zeroGrad();
+      const optEnd = performance.now();
 
       emaLoss = lossValue;
       totalLoss += lossValue;
@@ -303,7 +316,13 @@ export class LoRATrainer {
         memoryMB = stats.currentBytes / (1024 * 1024);
       } catch {}
 
-      callbacks.onStepEnd?.(step, emaLoss, stepTime, memoryMB);
+      const phases: StepPhaseTimings = {
+        forward: fwdEnd - stepStart,
+        backward: bwdEnd - bwdStart,
+        optimizer: optEnd - bwdEnd,
+        cleanup: stepTime - (optEnd - stepStart),
+      };
+      callbacks.onStepEnd?.(step, emaLoss, stepTime, memoryMB, phases);
     }
 
     // Set model to eval mode, disable checkpointing and full finetuning

@@ -285,7 +285,6 @@ function processCandidate(
 function buildCandidateGroups(
   nodes: LazyIRNode[],
   excludedIds: Set<number> | undefined,
-  bypassedIds?: Set<number>,
 ): {
   candidateGroups: Array<{ nodes: LazyIRNode[]; indices: number[] }>;
   fusibleCount: number;
@@ -314,10 +313,6 @@ function buildCandidateGroups(
       currentGroup.nodes.push(node);
       currentGroup.indices.push(i);
       candidateNodeIds.add(node.id);
-    } else if (bypassedIds?.has(node.id)) {
-      // Bypassed node (CSE'd dead code) — transparent pass-through.
-      // These don't execute and their consumers were redirected, so they
-      // cannot interfere with fusion even if they reference candidate inputs.
     } else if (currentGroup && !hasPendingInputIn(node, candidateNodeIds)) {
       // Independent non-fusible node — passes through as prereq
     } else {
@@ -714,7 +709,6 @@ export function detectFusionGroups(
     maxStorageBuffers?: number;
     enableMultiOutput?: boolean;
     excludedIds?: Set<number>;
-    bypassedIds?: Set<number>;
   },
 ): FusionDetectionResult {
   const maxBuffers = options?.maxStorageBuffers ?? Infinity;
@@ -725,7 +719,6 @@ export function detectFusionGroups(
   const { candidateGroups, fusibleCount } = buildCandidateGroups(
     nodes,
     excludedIds,
-    options?.bypassedIds,
   );
 
   // Phase 2: Split into connected components, process each, batch singletons
@@ -1077,7 +1070,6 @@ export function segmentPlanForExecution(
     maxStorageBuffers?: number;
     enableMultiOutput?: boolean;
     excludedIds?: Set<number>;
-    bypassedIds?: Set<number>;
   },
 ): ExecutionSegment[] {
   const { groups } = detectFusionGroups(nodes, externalNodeIds, options);

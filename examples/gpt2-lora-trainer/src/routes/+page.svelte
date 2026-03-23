@@ -41,6 +41,22 @@ onMount(async () => {
     enableDebugTracking: () => setDebugTracking(true),
     disableDebugTracking: () => setDebugTracking(false),
     liveTensors: getDebugLiveTensors,
+    /** Device info: limits, adapter name, fusion constraints */
+    deviceInfo: () => {
+      const ctx = getWebGPUDevice();
+      if (!ctx) return null;
+      const l = ctx.device.limits;
+      return {
+        maxStorageBuffersPerShaderStage: l.maxStorageBuffersPerShaderStage,
+        maxStorageBufferBindingSize: l.maxStorageBufferBindingSize,
+        maxBufferSize: l.maxBufferSize,
+        maxComputeWorkgroupsPerDimension: l.maxComputeWorkgroupsPerDimension,
+        maxComputeInvocationsPerWorkgroup: l.maxComputeInvocationsPerWorkgroup,
+        maxComputeWorkgroupSizeX: l.maxComputeWorkgroupSizeX,
+        // The key fusion constraint: how many buffers a fused kernel can bind
+        maxFusionGroupSize: `Limited by ${l.maxStorageBuffersPerShaderStage} storage buffers/stage`,
+      };
+    },
   };
 });
 
