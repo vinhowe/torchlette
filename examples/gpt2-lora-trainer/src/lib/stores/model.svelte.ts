@@ -2,7 +2,12 @@
  * Model store -- WebGPU init, weight download, model + tokenizer creation.
  */
 
-import { getWebGPUInitError, initWebGPU, Torchlette } from "torchlette";
+import {
+  getWebGPUInitError,
+  initWebGPU,
+  setGPUMemoryLimit,
+  Torchlette,
+} from "torchlette";
 import { GPT2_SMALL_CONFIG, GPT2WithLoRA } from "$lib/torchlette/gpt2-lora";
 import { createLoRAConfig } from "$lib/torchlette/lora";
 import { GPT2Tokenizer } from "$lib/torchlette/tokenizer";
@@ -46,6 +51,9 @@ async function load(loraRank: number, loraAlpha: number): Promise<void> {
     progress = 5;
     const ok = await initWebGPU();
     if (!ok) throw new Error(getWebGPUInitError() || "WebGPU init failed");
+
+    // Limit GPU memory to 8 GB to avoid browser OOM
+    setGPUMemoryLimit(8 * 1024 * 1024 * 1024);
 
     api = new Torchlette("webgpu", {
       enableFusion: true,

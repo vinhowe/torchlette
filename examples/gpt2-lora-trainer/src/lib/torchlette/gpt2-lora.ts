@@ -537,6 +537,65 @@ export class GPT2WithLoRA {
   }
 
   /**
+   * Get ALL trainable parameters (for full finetuning).
+   * Includes embeddings, layer norms, all linear weights, and LoRA params.
+   */
+  getAllParameters(): Tensor[] {
+    const params: Tensor[] = [];
+    // Embeddings
+    params.push(this.wte.weight, this.wpe.weight);
+    // Transformer blocks
+    for (const block of this.h) {
+      // Layer norms
+      params.push(block.ln1.weight, block.ln1.bias);
+      params.push(block.ln2.weight, block.ln2.bias);
+      // Attention: LoRA base weight + LoRA params + output proj
+      params.push(block.attn.cAttn.baseWeight);
+      if (block.attn.cAttn.baseBias) params.push(block.attn.cAttn.baseBias);
+      params.push(...block.attn.cAttn.getLoRAParameters());
+      params.push(block.attn.cProj.weight);
+      if (block.attn.cProj.bias) params.push(block.attn.cProj.bias);
+      // MLP: LoRA base weight + LoRA params + output proj
+      params.push(block.mlp.cFc.baseWeight);
+      if (block.mlp.cFc.baseBias) params.push(block.mlp.cFc.baseBias);
+      params.push(...block.mlp.cFc.getLoRAParameters());
+      params.push(block.mlp.cProj.weight);
+      if (block.mlp.cProj.bias) params.push(block.mlp.cProj.bias);
+    }
+    // Final layer norm
+    params.push(this.lnF.weight, this.lnF.bias);
+    return params;
+  }
+
+  /**
+   * Enable or disable full finetuning (make all base weights trainable).
+   */
+  setFullFinetuning(enabled: boolean): void {
+    // Embeddings
+    this.wte.weight.requires_grad_(enabled);
+    this.wpe.weight.requires_grad_(enabled);
+    // Transformer blocks
+    for (const block of this.h) {
+      block.ln1.weight.requires_grad_(enabled);
+      block.ln1.bias.requires_grad_(enabled);
+      block.ln2.weight.requires_grad_(enabled);
+      block.ln2.bias.requires_grad_(enabled);
+      block.attn.cAttn.baseWeight.requires_grad_(enabled);
+      if (block.attn.cAttn.baseBias)
+        block.attn.cAttn.baseBias.requires_grad_(enabled);
+      block.attn.cProj.weight.requires_grad_(enabled);
+      if (block.attn.cProj.bias) block.attn.cProj.bias.requires_grad_(enabled);
+      block.mlp.cFc.baseWeight.requires_grad_(enabled);
+      if (block.mlp.cFc.baseBias)
+        block.mlp.cFc.baseBias.requires_grad_(enabled);
+      block.mlp.cProj.weight.requires_grad_(enabled);
+      if (block.mlp.cProj.bias) block.mlp.cProj.bias.requires_grad_(enabled);
+    }
+    this.lnF.weight.requires_grad_(enabled);
+    this.lnF.bias.requires_grad_(enabled);
+  }
+
+  /**
    * Load base weights from HuggingFace format.
    */
   loadBaseWeights(

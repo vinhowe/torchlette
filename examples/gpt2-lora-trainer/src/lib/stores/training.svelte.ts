@@ -18,6 +18,8 @@ let seqLen = $state(128);
 let lr = $state(5e-4);
 let useAMP = $state(true);
 let useCheckpointing = $state(true);
+// biome-ignore lint/style/useConst: Svelte $state runes require reassignment
+let fullFinetune = $state(false);
 
 // Data
 let dataSource = $state("");
@@ -120,6 +122,7 @@ async function startTraining(): Promise<void> {
       learningRate: lr,
       useAMP,
       useCheckpointing,
+      fullFinetune,
     };
 
     await trainer.train(dataText, config, {
@@ -218,6 +221,12 @@ export const trainingStore = {
   },
   set useCheckpointing(v: boolean) {
     useCheckpointing = v;
+  },
+  get fullFinetune() {
+    return fullFinetune;
+  },
+  set fullFinetune(v: boolean) {
+    fullFinetune = v;
   },
 
   // Data

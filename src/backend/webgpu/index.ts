@@ -85,6 +85,9 @@ export {
 } from "./pipeline-warmup";
 // Re-export profiler functions for use in tests and tools
 export {
+  disableProfiling,
+  enableProfiling,
+  getProfileJSON,
   isProfilingEnabled,
   printProfileSummary,
   readGpuTimestamps,
