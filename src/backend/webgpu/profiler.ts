@@ -306,10 +306,18 @@ export function getProfileModule(): string {
 // Plan analysis recording
 // ---------------------------------------------------------------------------
 
+// biome-ignore lint/style/useConst: mutated by resetProfileStats
+let _planAnalysisGeneration = 0;
+
 export function recordPlanAnalysis(analysis: PlanAnalysis): void {
   if (!_profilingEnabled) return;
   analysis.planIndex = cpuProfile.planAnalyses.length;
   cpuProfile.planAnalyses.push(analysis);
+}
+
+/** Generation counter — incremented on reset so cache hits replay once. */
+export function getPlanAnalysisGeneration(): number {
+  return _planAnalysisGeneration;
 }
 
 // ---------------------------------------------------------------------------
@@ -971,4 +979,5 @@ export function resetProfileStats(): void {
   if (!_profilingEnabled) return;
   resetCpuProfileState();
   resetGpuTimestampState();
+  _planAnalysisGeneration++;
 }
