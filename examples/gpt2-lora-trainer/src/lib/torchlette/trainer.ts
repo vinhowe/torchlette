@@ -21,6 +21,8 @@ export type TrainingConfig = {
   useAMP?: boolean;
   /** Enable gradient checkpointing (trade compute for memory) */
   useCheckpointing?: boolean;
+  /** Train ALL parameters, not just LoRA adapters */
+  fullFinetune?: boolean;
 };
 
 export type TrainingCallbacks = {
@@ -142,10 +144,12 @@ export class LoRATrainer {
       config.seqLength,
     );
 
-    // Create optimizer for LoRA parameters only
-    const loraParams = this.model.getLoRAParameters();
+    // Create optimizer — full finetune trains all params, otherwise just LoRA
+    const trainableParams = config.fullFinetune
+      ? (this.model.setFullFinetuning(true), this.model.getAllParameters())
+      : this.model.getLoRAParameters();
     this.optimizer = new Adam(
-      loraParams,
+      trainableParams,
       { lr: config.learningRate },
       this.api,
     );
@@ -260,7 +264,7 @@ export class LoRATrainer {
       await loss.backward();
 
       // Gradient clipping
-      await nn.clipGradNorm_(this.api, loraParams, 1.0);
+      await nn.clipGradNorm_(this.api, trainableParams, 1.0);
 
       // Optimizer step
       if (this.gradScaler) {
@@ -302,10 +306,13 @@ export class LoRATrainer {
       callbacks.onStepEnd?.(step, emaLoss, stepTime, memoryMB);
     }
 
-    // Set model to eval mode and disable checkpointing
+    // Set model to eval mode, disable checkpointing and full finetuning
     this.model.train(false);
     if (useCheckpointing) {
       this.model.enableCheckpointing(false);
+    }
+    if (config.fullFinetune) {
+      this.model.setFullFinetuning(false);
     }
 
     const totalTime = performance.now() - startTime;

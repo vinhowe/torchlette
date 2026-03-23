@@ -10,7 +10,9 @@ import type {
   GPUDevice as LocalGPUDevice,
 } from "./gpu-types";
 
-const PROFILING_ENABLED =
+// biome-ignore lint/style/useLet: must be mutable for runtime enable/disable
+// biome-ignore lint/style/useConst: must be mutable for runtime enable/disable
+let _profilingEnabled =
   typeof process !== "undefined" && !!process.env?.TORCHLETTE_PROFILE;
 
 // ---------------------------------------------------------------------------
@@ -190,7 +192,7 @@ export function recordFusionFallback(
   groupSize: number,
   detail?: unknown,
 ): void {
-  if (!PROFILING_ENABLED) return;
+  if (!_profilingEnabled) return;
   const entry = cpuProfile.fusionFallbackStats.get(reason);
   if (entry) {
     entry.count++;
@@ -210,7 +212,17 @@ export function recordFusionFallback(
 // ============================================================================
 
 export function isProfilingEnabled(): boolean {
-  return PROFILING_ENABLED;
+  return _profilingEnabled;
+}
+
+/** Enable profiling at runtime (for browser use). */
+export function enableProfiling(): void {
+  _profilingEnabled = true;
+}
+
+/** Disable profiling at runtime. */
+export function disableProfiling(): void {
+  _profilingEnabled = false;
 }
 
 /**
@@ -229,7 +241,7 @@ export function setTimestampsEnabled(enabled: boolean): void {
 // ---------------------------------------------------------------------------
 
 export function profileApiCall<T>(name: string, fn: () => T): T {
-  if (!PROFILING_ENABLED) return fn();
+  if (!_profilingEnabled) return fn();
   const t0 = performance.now();
   const result = fn();
   recordMs(cpuProfile.apiStats, name, performance.now() - t0);
@@ -241,12 +253,12 @@ export function profileApiCall<T>(name: string, fn: () => T): T {
 // ---------------------------------------------------------------------------
 
 export function profileOpBegin(_opName: string): number {
-  if (!PROFILING_ENABLED) return 0;
+  if (!_profilingEnabled) return 0;
   return performance.now();
 }
 
 export function profileOpEnd(opName: string, t0: number): void {
-  if (!PROFILING_ENABLED) return;
+  if (!_profilingEnabled) return;
   const elapsed = performance.now() - t0;
   recordMs(cpuProfile.opStats, opName, elapsed);
   const phase = cpuProfile.phaseStats.get(cpuProfile.currentPhase);
@@ -265,12 +277,12 @@ export function profileOpEnd(opName: string, t0: number): void {
 // ---------------------------------------------------------------------------
 
 export function profileSubOpBegin(): number {
-  if (!PROFILING_ENABLED) return 0;
+  if (!_profilingEnabled) return 0;
   return performance.now();
 }
 
 export function profileSubOpEnd(label: string, t0: number): void {
-  if (!PROFILING_ENABLED) return;
+  if (!_profilingEnabled) return;
   recordMs(cpuProfile.subOpStats, label, performance.now() - t0);
 }
 
@@ -295,7 +307,7 @@ export function getProfileModule(): string {
 // ---------------------------------------------------------------------------
 
 export function recordPlanAnalysis(analysis: PlanAnalysis): void {
-  if (!PROFILING_ENABLED) return;
+  if (!_profilingEnabled) return;
   analysis.planIndex = cpuProfile.planAnalyses.length;
   cpuProfile.planAnalyses.push(analysis);
 }
@@ -305,7 +317,7 @@ export function recordPlanAnalysis(analysis: PlanAnalysis): void {
 // ---------------------------------------------------------------------------
 
 export function initGpuTimestamps(device: LocalGPUDevice): void {
-  if (!PROFILING_ENABLED) return;
+  if (!_profilingEnabled) return;
   gpuTs.device = device;
   gpuTs.supported = true;
 
@@ -352,7 +364,7 @@ export function getTimestampWrites(
   label: string,
 ): GPUComputePassTimestampWrites | undefined {
   if (
-    !PROFILING_ENABLED ||
+    !_profilingEnabled ||
     !gpuTs.supported ||
     !gpuTs.querySet ||
     !gpuTs.enabled
@@ -385,7 +397,7 @@ export function getTimestampWrites(
 
 export function resolveGpuTimestamps(): void {
   if (
-    !PROFILING_ENABLED ||
+    !_profilingEnabled ||
     !gpuTs.supported ||
     !gpuTs.querySet ||
     !gpuTs.resolveBuffer ||
@@ -507,7 +519,7 @@ async function resolveAndMapTimestamps(slotsToRead: number): Promise<boolean> {
  */
 export async function flushAndReadGpuTimestamps(): Promise<boolean> {
   if (
-    !PROFILING_ENABLED ||
+    !_profilingEnabled ||
     !gpuTs.supported ||
     !gpuTs.device ||
     !gpuTs.querySet ||
@@ -559,7 +571,7 @@ export async function flushAndReadGpuTimestamps(): Promise<boolean> {
  */
 export async function readGpuTimestamps(): Promise<void> {
   if (
-    !PROFILING_ENABLED ||
+    !_profilingEnabled ||
     !gpuTs.supported ||
     !gpuTs.device ||
     !gpuTs.querySet ||
@@ -797,7 +809,7 @@ function printPlanAnalysis(): void {
 }
 
 export function printProfileSummary(label: string): void {
-  if (!PROFILING_ENABLED) return;
+  if (!_profilingEnabled) return;
 
   console.log(`\n=== Profiling (${label}) ===\n`);
 
@@ -825,7 +837,7 @@ export function printProfileSummary(label: string): void {
 // JSON export
 // ---------------------------------------------------------------------------
 
-function getProfileJSON(): object {
+export function getProfileJSON(): object {
   // Build phases object with per-op kernel breakdown
   const phases: Record<string, unknown> = {};
   const allPhases = new Set([
@@ -933,7 +945,7 @@ function getProfileJSON(): object {
 }
 
 export async function writeProfileJSON(filePath: string): Promise<void> {
-  if (!PROFILING_ENABLED) return;
+  if (!_profilingEnabled) return;
   try {
     const fs = await import("node:fs");
     const json = getProfileJSON();
@@ -949,7 +961,7 @@ export async function writeProfileJSON(filePath: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export function resetProfileStats(): void {
-  if (!PROFILING_ENABLED) return;
+  if (!_profilingEnabled) return;
   resetCpuProfileState();
   resetGpuTimestampState();
 }

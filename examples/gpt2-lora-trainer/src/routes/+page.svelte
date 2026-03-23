@@ -196,6 +196,13 @@ function handleLoadModel() {
                  class="accent-blue-500" />
           Ckpt
         </label>
+        <label class="flex items-center gap-1 cursor-pointer">
+          <input type="checkbox" checked={trainingStore.fullFinetune}
+                 onchange={() => { trainingStore.fullFinetune = !trainingStore.fullFinetune; }}
+                 disabled={trainingStore.running}
+                 class="accent-blue-500" />
+          Full FT
+        </label>
       </div>
 
       <!-- Train / Stop buttons -->
