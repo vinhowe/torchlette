@@ -183,6 +183,9 @@ export interface FusionAnalysisTemplate {
 
   /** Per-plan buffer arena: GPUBuffers that persist across steps for bind group cache stability. */
   bufferArena?: unknown;
+
+  /** Cached plan analysis for profiling (stored on first miss, replayed on hits). */
+  planAnalysis?: PlanAnalysis;
 }
 
 type CachedSegmentDesc =
@@ -1358,6 +1361,12 @@ export async function executePlanOptimized(
     // ── Cache hit: reuse existing lowered plan ──
     planNodes = cachedTemplate.finalPerm.map((i) => plan.nodes[i]);
     loweredPlan = cachedTemplate.loweredPlan;
+    // Replay stored plan analysis on cache hits when profiling is enabled.
+    // This handles the common case where profiling is enabled after the first
+    // step (which populated the cache).
+    if (isProfilingEnabled() && cachedTemplate.planAnalysis) {
+      recordPlanAnalysis({ ...cachedTemplate.planAnalysis });
+    }
     if (process.env.TORCHLETTE_DEBUG_COMPILED) {
       const extCount = externalNodeIds?.size ?? 0;
       const n0 = plan.nodes[0];
@@ -1549,15 +1558,16 @@ export async function executePlanOptimized(
     }
 
     // Collect plan analysis for profiling (structural, no execution needed)
-    if (isProfilingEnabled()) {
-      collectProfilingStats(
-        analysis.segments,
-        analysis.epilogueClaimedIds,
-        analysis.prologueClaimedIds,
-        analysis.matmulEpilogueChains,
-        plan.nodes.length,
-      );
-    }
+    // Store on template so cache hits can replay it when profiling is enabled later.
+    const pa = collectProfilingStats(
+      analysis.segments,
+      analysis.epilogueClaimedIds,
+      analysis.prologueClaimedIds,
+      analysis.matmulEpilogueChains,
+      plan.nodes.length,
+    );
+    const storedTemplate = fusionAnalysisCache.get(fingerprint);
+    if (storedTemplate) storedTemplate.planAnalysis = pa;
   }
 
   // Execute via the lowered plan — the sole execution engine
@@ -1574,11 +1584,11 @@ export async function executePlanOptimized(
 
 function collectProfilingStats(
   segments: ExecutionSegment[],
-  epilogueClaimedIds: Set<number>,
+  excludedIds: Set<number>,
   prologueClaimedIds: Set<number>,
   matmulEpilogueChains: Map<number, number[]>,
   totalNodes: number,
-): void {
+): PlanAnalysis {
   let fusedSegCount = 0;
   let seqSegCount = 0;
   let fusedNodeCount = 0;
@@ -1614,10 +1624,7 @@ function collectProfilingStats(
     } else if (segment.kind === "sequential") {
       seqSegCount++;
       for (const node of segment.nodes) {
-        if (
-          !epilogueClaimedIds.has(node.id) &&
-          !prologueClaimedIds.has(node.id)
-        ) {
+        if (!excludedIds.has(node.id) && !prologueClaimedIds.has(node.id)) {
           recordUnfused(node);
         } else {
           sequentialOps[node.op] = (sequentialOps[node.op] ?? 0) + 1;
@@ -1655,4 +1662,5 @@ function collectProfilingStats(
     unfusedByShape,
   };
   recordPlanAnalysis(planAnalysisRef);
+  return planAnalysisRef;
 }

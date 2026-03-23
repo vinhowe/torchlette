@@ -11,7 +11,6 @@
  * - Fused groups must have 2+ ops to be worthwhile
  */
 
-import { OP_REGISTRY } from "../ops/registry";
 import type { DType } from "../backend/types";
 import type {
   FusedInput,
@@ -21,6 +20,7 @@ import type {
 } from "../backend/webgpu/fusion-types";
 import { shapesEqual } from "../core/shape";
 import type { LazyIRNode, LazyRef } from "../graph/types";
+import { OP_REGISTRY } from "../ops/registry";
 
 /**
  * Ops that can be fused into elementwise kernels.
@@ -284,7 +284,8 @@ function processCandidate(
  */
 function buildCandidateGroups(
   nodes: LazyIRNode[],
-  epilogueClaimedIds: Set<number> | undefined,
+  excludedIds: Set<number> | undefined,
+  bypassedIds?: Set<number>,
 ): {
   candidateGroups: Array<{ nodes: LazyIRNode[]; indices: number[] }>;
   fusibleCount: number;
@@ -304,7 +305,7 @@ function buildCandidateGroups(
 
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i];
-    if (isFusibleOp(node.op) && !epilogueClaimedIds?.has(node.id)) {
+    if (isFusibleOp(node.op) && !excludedIds?.has(node.id)) {
       fusibleCount++;
       if (!currentGroup) {
         currentGroup = { nodes: [], indices: [] };
@@ -313,6 +314,10 @@ function buildCandidateGroups(
       currentGroup.nodes.push(node);
       currentGroup.indices.push(i);
       candidateNodeIds.add(node.id);
+    } else if (bypassedIds?.has(node.id)) {
+      // Bypassed node (CSE'd dead code) — transparent pass-through.
+      // These don't execute and their consumers were redirected, so they
+      // cannot interfere with fusion even if they reference candidate inputs.
     } else if (currentGroup && !hasPendingInputIn(node, candidateNodeIds)) {
       // Independent non-fusible node — passes through as prereq
     } else {
@@ -498,7 +503,7 @@ function splitGroupsByBufferLimit(
 function batchGlobalSingletons(
   nodes: LazyIRNode[],
   finalGroups: FusionGroup[],
-  epilogueClaimedIds: Set<number> | undefined,
+  excludedIds: Set<number> | undefined,
   maxBuffers: number,
 ): void {
   const groupedNodeIds = new Set<number>();
@@ -512,7 +517,7 @@ function batchGlobalSingletons(
     if (
       isFusibleOp(node.op) &&
       !groupedNodeIds.has(node.id) &&
-      !epilogueClaimedIds?.has(node.id)
+      !excludedIds?.has(node.id)
     ) {
       singletons.push({ node, planIndex: i });
     }
@@ -708,17 +713,19 @@ export function detectFusionGroups(
   options?: {
     maxStorageBuffers?: number;
     enableMultiOutput?: boolean;
-    epilogueClaimedIds?: Set<number>;
+    excludedIds?: Set<number>;
+    bypassedIds?: Set<number>;
   },
 ): FusionDetectionResult {
   const maxBuffers = options?.maxStorageBuffers ?? Infinity;
   const enableMultiOutput = options?.enableMultiOutput ?? false;
-  const epilogueClaimedIds = options?.epilogueClaimedIds;
+  const excludedIds = options?.excludedIds;
 
   // Phase 1: Build candidate groups of consecutive fusible ops
   const { candidateGroups, fusibleCount } = buildCandidateGroups(
     nodes,
-    epilogueClaimedIds,
+    excludedIds,
+    options?.bypassedIds,
   );
 
   // Phase 2: Split into connected components, process each, batch singletons
@@ -735,7 +742,7 @@ export function detectFusionGroups(
 
   // Phase 4: Global singleton batching
   if (enableMultiOutput) {
-    batchGlobalSingletons(nodes, finalGroups, epilogueClaimedIds, maxBuffers);
+    batchGlobalSingletons(nodes, finalGroups, excludedIds, maxBuffers);
   }
 
   // Phase 5: Promote externally-referenced intermediates to outputs
@@ -1069,7 +1076,8 @@ export function segmentPlanForExecution(
   options?: {
     maxStorageBuffers?: number;
     enableMultiOutput?: boolean;
-    epilogueClaimedIds?: Set<number>;
+    excludedIds?: Set<number>;
+    bypassedIds?: Set<number>;
   },
 ): ExecutionSegment[] {
   const { groups } = detectFusionGroups(nodes, externalNodeIds, options);

@@ -14,6 +14,7 @@
  */
 
 import type { DType } from "../backend/types";
+import type { LazyIRNode } from "../graph/types";
 import {
   type ExecutionSegment,
   isFusibleOp,
@@ -21,7 +22,6 @@ import {
   segmentPlanForExecution,
 } from "./fusion-detect";
 import { runPasses, SIMPLIFICATION_PASSES } from "./graph-rewrites";
-import type { LazyIRNode } from "../graph/types";
 import {
   detectMatmulEpilogueCore,
   type MatmulEpiloguePlan,
@@ -327,6 +327,30 @@ export function analyzeGraph(
     externalNodeIds,
   );
 
+  // Debug: show epilogue chains for large plans
+  if (
+    typeof process !== "undefined" &&
+    process.env?.TORCHLETTE_DEBUG_FUSION === "1" &&
+    reorderedNodes.length > 200 &&
+    matmulEpilogueChains.size > 0
+  ) {
+    console.log(
+      `[fusion-debug] ${reorderedNodes.length} nodes: ${matmulEpilogueChains.size} matmul epilogue chains`,
+    );
+    for (const [mmId, chainIds] of matmulEpilogueChains) {
+      const mm = nodeById.get(mmId);
+      const chainOps = chainIds
+        .map((id) => {
+          const n = nodeById.get(id);
+          return n ? `${n.op}(${JSON.stringify(n.shape)})` : `?#${id}`;
+        })
+        .join(" → ");
+      console.log(
+        `  matmul#${mmId} ${JSON.stringify(mm?.shape)} → ${chainOps}`,
+      );
+    }
+  }
+
   // Relocate epilogue chain nodes after their matmul
   if (epilogueClaimedIds.size > 0) {
     const unclaimed = reorderedNodes.filter(
@@ -405,6 +429,27 @@ export function analyzeGraph(
 
   // --- Priority 40: Elementwise fusion (via segmentPlanForExecution) ---
   // Bypassed nodes are excluded from fusion (they become view-like pass-throughs)
+  if (
+    typeof process !== "undefined" &&
+    process.env?.TORCHLETTE_DEBUG_FUSION === "1" &&
+    reorderedNodes.length > 200
+  ) {
+    // Show which gelu ops are claimed and by which system
+    for (const n of reorderedNodes) {
+      if (n.op === "gelu") {
+        const epi = epilogueClaimedIds.has(n.id);
+        const pro = prologueClaimedIds.has(n.id);
+        const row = rowProgramClaimedIds.has(n.id);
+        const rew = rewriteBypassedIds.has(n.id);
+        if (epi || pro || row || rew) {
+          console.log(
+            `[fusion-debug] gelu#${n.id} ${JSON.stringify(n.shape)} claimed by: ${epi ? "epilogue " : ""}${pro ? "prologue " : ""}${row ? "rowProgram " : ""}${rew ? "rewrite" : ""}`,
+          );
+        }
+      }
+    }
+  }
+
   let allClaimedIds: Set<number> | undefined;
   if (
     epilogueClaimedIds.size > 0 ||
@@ -422,8 +467,103 @@ export function analyzeGraph(
   const segments = segmentPlanForExecution(reorderedNodes, externalNodeIds, {
     maxStorageBuffers,
     enableMultiOutput: true,
-    epilogueClaimedIds: allClaimedIds,
+    excludedIds: allClaimedIds,
+    bypassedIds: rewriteBypassedIds.size > 0 ? rewriteBypassedIds : undefined,
   });
+
+  // Debug dump: show fusion break patterns for large backward plans
+  if (
+    typeof process !== "undefined" &&
+    process.env?.TORCHLETTE_DEBUG_FUSION === "1" &&
+    reorderedNodes.length > 200
+  ) {
+    let totalFusible = 0;
+    const runLengths: number[] = [];
+    let runLen = 0;
+    for (const n of reorderedNodes) {
+      if (isFusibleOp(n.op) && !allClaimedIds?.has(n.id)) {
+        totalFusible++;
+        runLen++;
+      } else {
+        if (runLen > 0) runLengths.push(runLen);
+        runLen = 0;
+      }
+    }
+    if (runLen > 0) runLengths.push(runLen);
+    runLengths.sort((a, b) => b - a);
+
+    let fusedNodes = 0;
+    for (const seg of segments) {
+      if (seg.kind === "fused" && seg.group.nodes.length >= 2)
+        fusedNodes += seg.group.nodes.length;
+    }
+
+    console.log(
+      `\n[fusion-debug] ${reorderedNodes.length} nodes, ${totalFusible} fusible (unclaimed), ${fusedNodes} fused`,
+    );
+    console.log(
+      `  Consecutive runs (top 15): ${runLengths.slice(0, 15).join(", ")}`,
+    );
+
+    // Show what breaks fusible runs at [*,*,3072]
+    let breaks = 0;
+    for (let i = 1; i < reorderedNodes.length && breaks < 8; i++) {
+      const prev = reorderedNodes[i - 1];
+      const cur = reorderedNodes[i];
+      const prevFusible = isFusibleOp(prev.op) && !allClaimedIds?.has(prev.id);
+      const curFusible = isFusibleOp(cur.op) && !allClaimedIds?.has(cur.id);
+      const prevIs3072 =
+        prev.shape.length >= 2 && prev.shape[prev.shape.length - 1] === 3072;
+      if (prevFusible && !curFusible && prevIs3072) {
+        breaks++;
+        console.log(
+          `  Break #${breaks} at pos ${i}: ${cur.op} ${cur.dtype} ${JSON.stringify(cur.shape)}${allClaimedIds?.has(cur.id) ? " [CLAIMED]" : ""}${externalNodeIds?.has(cur.id) ? " [EXTERNAL]" : ""}`,
+        );
+        // Show context
+        for (
+          let j = Math.max(0, i - 2);
+          j < Math.min(reorderedNodes.length, i + 3);
+          j++
+        ) {
+          const n = reorderedNodes[j];
+          const f = isFusibleOp(n.op) ? "F" : ".";
+          const c = allClaimedIds?.has(n.id) ? "C" : " ";
+          const e = externalNodeIds?.has(n.id) ? "E" : " ";
+          console.log(
+            `    [${j}] ${f}${c}${e} ${n.op.padEnd(14)} ${n.dtype.padEnd(4)} ${JSON.stringify(n.shape)}`,
+          );
+        }
+      }
+    }
+
+    // Shape distribution of fusible ops
+    const shapeGroups = new Map<
+      string,
+      { count: number; ops: Map<string, number> }
+    >();
+    for (const n of reorderedNodes) {
+      if (isFusibleOp(n.op) && !allClaimedIds?.has(n.id)) {
+        const key = JSON.stringify(n.shape);
+        let g = shapeGroups.get(key);
+        if (!g) {
+          g = { count: 0, ops: new Map() };
+          shapeGroups.set(key, g);
+        }
+        g.count++;
+        g.ops.set(n.op, (g.ops.get(n.op) ?? 0) + 1);
+      }
+    }
+    console.log(`  Fusible by shape:`);
+    for (const [shape, g] of [...shapeGroups.entries()].sort(
+      (a, b) => b[1].count - a[1].count,
+    )) {
+      const ops = [...g.ops.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([o, c]) => `${o}:${c}`)
+        .join(" ");
+      console.log(`    ${shape.padEnd(18)} ${g.count} ops (${ops})`);
+    }
+  }
 
   return {
     planNodes: reorderedNodes,

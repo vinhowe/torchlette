@@ -91,6 +91,7 @@ export interface EngineMemoryStats {
   activeBases: number;
   totalPinCount: number;
   savedTensorCount: number;
+  baseStateSize: number;
   pendingTensorCount: number;
 
   // Plan state (from external manager if available)

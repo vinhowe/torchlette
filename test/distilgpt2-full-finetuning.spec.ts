@@ -13,12 +13,12 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { GPT2, type GPT2Config } from "../examples/gpt2/model";
 import { getGPUMemoryStats } from "../src/backend/webgpu";
 import { gpuMemoryTracker } from "../src/backend/webgpu/memory-tracker";
+import { Torchlette } from "../src/frontend/torchlette";
 import {
   resetNodeIdCounter,
   resetStorageIdCounter,
 } from "../src/graph/node-factory";
 import { storageTracker } from "../src/graph/storage-tracker";
-import { Torchlette } from "../src/frontend/torchlette";
 import { Adam, GradScaler } from "../src/optim";
 import { resetBaseIdCounter } from "../src/runtime/tensor";
 import { canUseWebGPU } from "./helpers/webgpu";
@@ -364,6 +364,7 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
 
         async function trainStep() {
           await scaler.resolveDeferred();
+          await api.beginStep();
           for (const param of model.parameters()) {
             param.zeroGrad();
           }
@@ -396,6 +397,7 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
           scaledLoss.dispose();
           loss.dispose();
 
+          api.endStep();
           await api.markStep();
         }
 
