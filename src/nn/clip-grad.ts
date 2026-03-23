@@ -42,21 +42,29 @@ export async function clipGradNorm_(
 
   // Compute total norm lazily on GPU — no item() or materialization.
   // PyTorch-style: the entire clip operation stays in the lazy graph.
+  // Track intermediates so we can dispose them after item() reads the result.
+  // Without explicit disposal, ~48 frontend Tensor objects per step accumulate
+  // until GC, causing progressive slowdown in long training runs.
+  const intermediates: Tensor[] = [];
   let totalNormTensor: Tensor;
 
   if (normType === Infinity) {
     let maxTensor: Tensor | null = null;
     for (const g of grads) {
       const absMax = api.max(api.abs(g));
-      maxTensor =
-        maxTensor === null
-          ? absMax
-          : api.max(
-              api.add(
-                api.mul(api.gt(absMax, maxTensor), absMax),
-                api.mul(api.gt(maxTensor, absMax), maxTensor),
-              ),
-            );
+      intermediates.push(absMax);
+      if (maxTensor === null) {
+        maxTensor = absMax;
+      } else {
+        const gt1 = api.gt(absMax, maxTensor);
+        const gt2 = api.gt(maxTensor, absMax);
+        const m1 = api.mul(gt1, absMax);
+        const m2 = api.mul(gt2, maxTensor);
+        const added = api.add(m1, m2);
+        const newMax = api.max(added);
+        intermediates.push(gt1, gt2, m1, m2, added, newMax);
+        maxTensor = newMax;
+      }
     }
     totalNormTensor = maxTensor!;
   } else if (normType === 2) {
@@ -64,23 +72,44 @@ export async function clipGradNorm_(
     for (const g of grads) {
       const sq = api.pow(g, 2);
       const sumSq = api.sum(sq);
-      totalSumSq = totalSumSq === null ? sumSq : api.add(totalSumSq, sumSq);
+      intermediates.push(sq, sumSq);
+      if (totalSumSq === null) {
+        totalSumSq = sumSq;
+      } else {
+        const added = api.add(totalSumSq, sumSq);
+        intermediates.push(added);
+        totalSumSq = added;
+      }
     }
     totalNormTensor = api.sqrt(totalSumSq!);
+    intermediates.push(totalNormTensor);
   } else {
     let totalSumP: Tensor | null = null;
     for (const g of grads) {
       const absG = api.abs(g);
       const powG = api.pow(absG, normType);
       const sumP = api.sum(powG);
-      totalSumP = totalSumP === null ? sumP : api.add(totalSumP, sumP);
+      intermediates.push(absG, powG, sumP);
+      if (totalSumP === null) {
+        totalSumP = sumP;
+      } else {
+        const added = api.add(totalSumP, sumP);
+        intermediates.push(added);
+        totalSumP = added;
+      }
     }
     totalNormTensor = api.pow(totalSumP!, 1 / normType);
+    intermediates.push(totalNormTensor);
   }
 
   // Read the norm and clip coefficient — one materialization point.
   // The norm computation was lazy; item() forces it.
   totalNorm = await totalNormTensor.item();
+
+  // Dispose all intermediates now that the scalar value is read.
+  for (const t of intermediates) {
+    if (!t.disposed) t.dispose();
+  }
   const clipCoef = maxNorm / (totalNorm + 1e-6);
   if (clipCoef < 1) {
     for (const g of grads) {
