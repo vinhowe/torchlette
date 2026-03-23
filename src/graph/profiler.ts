@@ -9,6 +9,7 @@
 
 export type { PlanAnalysis } from "../backend/webgpu/profiler";
 export {
+  getPlanAnalysisGeneration,
   getProfileModule,
   isProfilingEnabled,
   profileApiCall,

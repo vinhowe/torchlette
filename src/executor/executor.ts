@@ -55,6 +55,7 @@ import {
   wrapResultAsStorage,
 } from "../graph/node-factory";
 import {
+  getPlanAnalysisGeneration,
   isProfilingEnabled,
   type PlanAnalysis,
   profileOpBegin,
@@ -186,6 +187,8 @@ export interface FusionAnalysisTemplate {
 
   /** Cached plan analysis for profiling (stored on first miss, replayed on hits). */
   planAnalysis?: PlanAnalysis;
+  /** Generation at which planAnalysis was last replayed (prevents per-step accumulation). */
+  replayedGeneration?: number;
 }
 
 type CachedSegmentDesc =
@@ -1362,10 +1365,13 @@ export async function executePlanOptimized(
     planNodes = cachedTemplate.finalPerm.map((i) => plan.nodes[i]);
     loweredPlan = cachedTemplate.loweredPlan;
     // Replay stored plan analysis on cache hits when profiling is enabled.
-    // This handles the common case where profiling is enabled after the first
-    // step (which populated the cache).
+    // Only replay once per profiler reset (tracked via generation counter).
     if (isProfilingEnabled() && cachedTemplate.planAnalysis) {
-      recordPlanAnalysis({ ...cachedTemplate.planAnalysis });
+      const gen = getPlanAnalysisGeneration();
+      if (cachedTemplate.replayedGeneration !== gen) {
+        cachedTemplate.replayedGeneration = gen;
+        recordPlanAnalysis({ ...cachedTemplate.planAnalysis });
+      }
     }
     if (process.env.TORCHLETTE_DEBUG_COMPILED) {
       const extCount = externalNodeIds?.size ?? 0;
