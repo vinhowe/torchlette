@@ -130,6 +130,40 @@ export function clearDisposedPendingNodeIds(): void {
   disposedPendingNodeIds.clear();
 }
 
+/** Debug: track live tensors to find leaks. Enable via Tensor._debugTracking = true. */
+// biome-ignore lint/style/useLet: toggled at runtime
+let _debugTracking = false;
+const _debugLiveTensors = new Set<Tensor>();
+
+/** Snapshot live tensor shapes for leak analysis. */
+export function getDebugLiveTensors(): Array<{
+  shape: string;
+  dtype: string;
+  materialized: boolean;
+  disposed: boolean;
+}> {
+  const result: Array<{
+    shape: string;
+    dtype: string;
+    materialized: boolean;
+    disposed: boolean;
+  }> = [];
+  for (const t of _debugLiveTensors) {
+    result.push({
+      shape: t.shape.join("x") || "scalar",
+      dtype: t.dtype,
+      materialized: t.isMaterialized(),
+      disposed: t.disposed,
+    });
+  }
+  return result;
+}
+
+export function setDebugTracking(enabled: boolean): void {
+  _debugTracking = enabled;
+  if (!enabled) _debugLiveTensors.clear();
+}
+
 export class Tensor {
   readonly baseId: BaseId;
   readonly device: DeviceKind;
@@ -152,6 +186,7 @@ export class Tensor {
     this.device = device;
     this.shape = shape.slice();
     this.dtype = dtype;
+    if (_debugTracking) _debugLiveTensors.add(this);
 
     // Initialize held value for finalization registry
     // storageId = -1 means not yet materialized
@@ -294,6 +329,7 @@ export class Tensor {
     if (this._disposed) return;
     this._disposed = true;
     tensorDisposedCount++;
+    if (_debugTracking) _debugLiveTensors.delete(this);
 
     // Unregister from FinalizationRegistry to prevent double cleanup
     tensorFinalizationRegistry.unregister(this);

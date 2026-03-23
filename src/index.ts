@@ -56,6 +56,8 @@ export {
   StepLR,
 } from "./optim";
 export {
+  getDebugLiveTensors,
   getTensorDebugStats,
   resetTensorDebugStats,
+  setDebugTracking,
 } from "./runtime/tensor";

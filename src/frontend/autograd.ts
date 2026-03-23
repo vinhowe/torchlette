@@ -176,12 +176,17 @@ function disposeCheckpointTensors(
       const unpacked = tensors[idx];
       const packed = node.savedSlots[idx]?.packed;
       if (unpacked === packed) {
-        // Identity: not recomputed, skip
+        // Identity unpack (not checkpoint-recomputed) — skip
       } else if (unpacked.isDisposed) {
         // Already disposed
+      } else if (unpacked.requiresGrad) {
+        // Trainable parameter — must not dispose
       } else if (protectedTensors.has(unpacked)) {
-        // Protected (parameter or external input) — do not dispose
+        // Protected (frozen weight, user input) — do not dispose
       } else {
+        // Checkpoint-recomputed intermediate — safe to dispose.
+        // Without this, captured tensors accumulate as undisposed
+        // RuntimeTensors (+12/step), causing progressive CPU slowdown.
         unpacked.dispose();
       }
     }
