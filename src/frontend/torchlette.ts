@@ -1528,9 +1528,13 @@ export class Torchlette {
     // Step 4: Reset cumulative fusion stats for the next step
     this.runtime.resetCumulativeFusionStats();
 
-    // Step 4: Issue a deferred GPU fence.
+    // Step 4: Issue GPU fence and await it. Previously the fence was deferred
+    // to beginStep, which made the "forward" phase timing include the previous
+    // step's GPU execution time. Awaiting here keeps the GPU cost in "cleanup"
+    // where it belongs, giving honest phase breakdowns.
     try {
       issueDeferredFence();
+      await awaitDeferredFence();
     } catch {
       // Safe to ignore if WebGPU backend is not initialized (CPU-only usage).
     }
