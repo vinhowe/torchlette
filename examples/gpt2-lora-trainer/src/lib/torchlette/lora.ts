@@ -104,33 +104,21 @@ export class LoRALinear {
   }
 
   /**
-   * Forward pass: y = Wx + b + scaling * (x @ A^T @ B^T)
+   * Forward pass: y = linear(x, W, b) + scaling * linear(linear(x, A), B)
    */
   forward(x: Tensor): Tensor {
-    // Base linear: y = x @ W^T + b
-    // W is [out, in], so W^T is [in, out]
-    const baseOut = this.api.matmul(
-      x,
-      this.baseWeight.transpose({ dim0: 0, dim1: 1 }),
-    );
-
-    const withBias = this.baseBias
-      ? this.api.add(baseOut, this.baseBias)
-      : baseOut;
+    // Base linear: y = x @ W^T + b (fused, optimized backward)
+    const baseOut = this.api.linear(x, this.baseWeight, this.baseBias);
 
     // LoRA path: scaling * (x @ A^T @ B^T)
-    const loraOut = this.api.matmul(
-      this.api.matmul(x, this.loraA.transpose({ dim0: 0, dim1: 1 })),
-      this.loraB.transpose({ dim0: 0, dim1: 1 }),
+    const loraOut = this.api.linear(
+      this.api.linear(x, this.loraA, null),
+      this.loraB,
+      null,
     );
     const scaledLora = this.api.mul(loraOut, this.scaling);
 
-    // Combine base + LoRA outputs. Do NOT detach the base output — even
-    // though base weights have requiresGrad=false (no gradient computed FOR
-    // them), the backward pass still needs dL/dx = grad @ W^T to propagate
-    // gradients through the network. Detaching kills this signal and makes
-    // the LoRA adaptation unable to learn from the base model's structure.
-    return this.api.add(withBias, scaledLora);
+    return this.api.add(baseOut, scaledLora);
   }
 
   /**
