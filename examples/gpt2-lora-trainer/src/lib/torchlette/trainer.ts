@@ -256,10 +256,6 @@ export class LoRATrainer {
         lossValue = lossValue / this.gradScaler.getScale();
       }
 
-      setProfilePhase("backward");
-      const bwdStart = performance.now();
-      await loss.backward();
-
       // Gradient clipping
       await nn.clipGradNorm_(this.api, trainableParams, 1.0);
       const bwdEnd = performance.now();
