@@ -525,6 +525,64 @@ export function fusedAttentionBackward(
   };
 }
 
+/**
+ * Start a scalar readback: copy the tensor buffer to a staging buffer and submit.
+ * Returns a finish function that mapAsync's the staging buffer and returns the value.
+ * This allows backward to run between start and finish, overlapping GPU readback
+ * with CPU graph construction.
+ */
+export function startScalarReadback(a: BackendTensor): () => Promise<number> {
+  const ctx = requireContext();
+  const tensor = asGPUTensor(a);
+  const bytesPerElement = dtypeBytes(tensor.dtype);
+  const totalBytes = tensor.size * bytesPerElement;
+  const alignedBytes = alignBufferSize(totalBytes);
+
+  const readBuffer = createTrackedBuffer(ctx.device, {
+    size: alignedBytes,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+
+  // Copy to staging buffer on the shared encoder and flush
+  const sharedEnc = getSharedEncoderInstance();
+  if (sharedEnc) {
+    sharedEnc.copyBufferToBuffer(tensor.buffer, 0, readBuffer, 0, alignedBytes);
+    flushSharedEncoder();
+  } else {
+    const encoder = ctx.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(tensor.buffer, 0, readBuffer, 0, alignedBytes);
+    profileApiCall("queue.submit", () => ctx.queue.submit([encoder.finish()]));
+    incrementSubmitCount();
+  }
+
+  // Return a finish function that maps the staging buffer and reads the scalar
+  const dtype = tensor.dtype;
+  return async (): Promise<number> => {
+    await readBuffer.mapAsync(GPUMapMode.READ);
+    const mapped = readBuffer.getMappedRange();
+    let value: number;
+    switch (dtype) {
+      case "f16": {
+        const u16 = new Uint16Array(mapped.slice(0, 2));
+        value = f16ArrayToF32Array(u16)[0];
+        break;
+      }
+      case "i32":
+        value = new Int32Array(mapped.slice(0, 4))[0];
+        break;
+      case "u32":
+        value = new Uint32Array(mapped.slice(0, 4))[0];
+        break;
+      default:
+        value = new Float32Array(mapped.slice(0, 4))[0];
+        break;
+    }
+    readBuffer.unmap();
+    bufferPool.deferredDestroy(readBuffer, readBuffer.size ?? alignedBytes);
+    return value;
+  };
+}
+
 export async function read(a: BackendTensor): Promise<number[]> {
   const ctx = requireContext();
   let tensor = asGPUTensor(a);

@@ -250,8 +250,20 @@ export class LoRATrainer {
 
       const fwdEnd = performance.now();
 
-      // Read loss value — forces the forward plan and reads back the scalar.
-      let lossValue = await loss.item();
+      // Start loss readback: force forward plan, copy scalar to staging
+      // buffer, return a finish function. The staging buffer is separate
+      // from the pool, so backward can reuse the source buffer freely.
+      const finishLossRead = await this.api
+        ._runtime()
+        .startItemReadback(loss._unwrap());
+
+      setProfilePhase("backward");
+      const bwdStart = performance.now();
+      await loss.backward();
+
+      // Finish reading loss — staging buffer mapAsync completed during
+      // backward graph construction (CPU work gave it time).
+      let lossValue = await finishLossRead();
       if (this.gradScaler) {
         lossValue = lossValue / this.gradScaler.getScale();
       }

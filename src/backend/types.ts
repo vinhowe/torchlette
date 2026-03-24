@@ -479,6 +479,8 @@ export interface BackendOps {
   /** Read inf flag (0.0 or 1.0) and destroy buffer. */
   readAndDestroyInfCount?(buffer: unknown): Promise<number>;
   read(a: BackendTensor): Promise<number[]>;
+  /** Start async scalar readback: copy to staging buffer, return finish function. */
+  startScalarReadback?(a: BackendTensor): () => Promise<number>;
 }
 
 export interface Backend {
