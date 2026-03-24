@@ -10,7 +10,7 @@
 import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
 import { nn } from "torchlette";
 
-const { checkpoint, crossEntropy } = nn;
+const { checkpoint, crossEntropy, LayerNorm } = nn;
 
 import { type LoRAConfig, LoRALinear } from "./lora";
 
@@ -40,57 +40,20 @@ export const GPT2_SMALL_CONFIG: GPT2Config = {
 // Layer Implementations
 // ============================================================================
 
-/**
- * Layer Normalization
- */
-class LayerNorm {
-  readonly api: Torchlette;
-  readonly weight: Tensor;
-  readonly bias: Tensor;
-  readonly eps: number;
+// LayerNorm: imported from torchlette framework (fused GPU kernel).
+// The framework's LayerNorm creates weight/bias with requiresGrad=true.
+// For LoRA mode, setFullFinetuning(false) freezes them after construction.
 
-  constructor(
-    api: Torchlette,
-    dim: number,
-    device: "cpu" | "webgpu" = "webgpu",
-  ) {
-    this.api = api;
-    this.eps = 1e-5;
-    this.weight = api.ones([dim], { device, requiresGrad: false });
-    this.bias = api.zeros([dim], { device, requiresGrad: false });
-  }
-
-  forward(x: Tensor): Tensor {
-    // Compute mean along last dimension
-    // Note: We manually add the keepdim dimension via reshape for compatibility
-    const inputShape = x.shape;
-    const meanResult = this.api.mean(x, { dim: -1 }) as Tensor;
-    const meanShape = [...inputShape.slice(0, -1), 1];
-    const mean = meanResult.reshape(meanShape);
-
-    const xCentered = this.api.sub(x, mean);
-
-    // Compute variance
-    const varianceResult = this.api.mean(this.api.mul(xCentered, xCentered), {
-      dim: -1,
-    }) as Tensor;
-    const variance = varianceResult.reshape(meanShape);
-
-    // Normalize — clamp variance to non-negative before sqrt to prevent NaN
-    // (f32 rounding can produce tiny negative variance on near-constant inputs)
-    const clampedVar = this.api.relu(variance);
-    const std = this.api.sqrt(this.api.add(clampedVar, this.eps));
-    const normalized = this.api.div(xCentered, std);
-
-    // Scale and shift
-    return this.api.add(this.api.mul(normalized, this.weight), this.bias);
-  }
-
-  loadWeights(weight: Tensor, bias: Tensor): void {
-    const runtime = this.api._runtime();
-    runtime.copy_(this.weight._unwrap(), weight._unwrap());
-    runtime.copy_(this.bias._unwrap(), bias._unwrap());
-  }
+/** Copy pretrained weights into a LayerNorm module. */
+function loadLayerNormWeights(
+  api: Torchlette,
+  ln: InstanceType<typeof LayerNorm>,
+  weight: Tensor,
+  bias: Tensor,
+): void {
+  const runtime = api._runtime();
+  runtime.copy_(ln.weight!._unwrap(), weight._unwrap());
+  runtime.copy_(ln.bias!._unwrap(), bias._unwrap());
 }
 
 /**
@@ -358,9 +321,13 @@ class TransformerBlockLoRA {
     device: "cpu" | "webgpu" = "webgpu",
   ) {
     this.api = api;
-    this.ln1 = new LayerNorm(api, config.embedDim, device);
+    this.ln1 = new LayerNorm(api, config.embedDim, { device });
+    this.ln1.weight!.requires_grad_(false);
+    this.ln1.bias!.requires_grad_(false);
     this.attn = new CausalSelfAttentionLoRA(api, config, loraConfig, device);
-    this.ln2 = new LayerNorm(api, config.embedDim, device);
+    this.ln2 = new LayerNorm(api, config.embedDim, { device });
+    this.ln2.weight!.requires_grad_(false);
+    this.ln2.bias!.requires_grad_(false);
     this.mlp = new MLPLoRA(api, config, loraConfig, device);
   }
 
@@ -416,7 +383,9 @@ export class GPT2WithLoRA {
       this.h.push(new TransformerBlockLoRA(api, config, loraConfig, device));
     }
 
-    this.lnF = new LayerNorm(api, config.embedDim, device);
+    this.lnF = new LayerNorm(api, config.embedDim, { device });
+    this.lnF.weight!.requires_grad_(false);
+    this.lnF.bias!.requires_grad_(false);
   }
 
   /**
@@ -547,8 +516,8 @@ export class GPT2WithLoRA {
     // Transformer blocks
     for (const block of this.h) {
       // Layer norms
-      params.push(block.ln1.weight, block.ln1.bias);
-      params.push(block.ln2.weight, block.ln2.bias);
+      params.push(block.ln1.weight!, block.ln1.bias!);
+      params.push(block.ln2.weight!, block.ln2.bias!);
       // Attention: LoRA base weight + LoRA params + output proj
       params.push(block.attn.cAttn.baseWeight);
       if (block.attn.cAttn.baseBias) params.push(block.attn.cAttn.baseBias);
@@ -563,7 +532,7 @@ export class GPT2WithLoRA {
       if (block.mlp.cProj.bias) params.push(block.mlp.cProj.bias);
     }
     // Final layer norm
-    params.push(this.lnF.weight, this.lnF.bias);
+    params.push(this.lnF.weight!, this.lnF.bias!);
     return params;
   }
 
@@ -576,10 +545,10 @@ export class GPT2WithLoRA {
     this.wpe.weight.requires_grad_(enabled);
     // Transformer blocks
     for (const block of this.h) {
-      block.ln1.weight.requires_grad_(enabled);
-      block.ln1.bias.requires_grad_(enabled);
-      block.ln2.weight.requires_grad_(enabled);
-      block.ln2.bias.requires_grad_(enabled);
+      block.ln1.weight!.requires_grad_(enabled);
+      block.ln1.bias!.requires_grad_(enabled);
+      block.ln2.weight!.requires_grad_(enabled);
+      block.ln2.bias!.requires_grad_(enabled);
       block.attn.cAttn.baseWeight.requires_grad_(enabled);
       if (block.attn.cAttn.baseBias)
         block.attn.cAttn.baseBias.requires_grad_(enabled);
@@ -591,8 +560,8 @@ export class GPT2WithLoRA {
       block.mlp.cProj.weight.requires_grad_(enabled);
       if (block.mlp.cProj.bias) block.mlp.cProj.bias.requires_grad_(enabled);
     }
-    this.lnF.weight.requires_grad_(enabled);
-    this.lnF.bias.requires_grad_(enabled);
+    this.lnF.weight!.requires_grad_(enabled);
+    this.lnF.bias!.requires_grad_(enabled);
   }
 
   /**
@@ -621,7 +590,7 @@ export class GPT2WithLoRA {
     if (lnFWeight && lnFBias) {
       const w = this.api.tensorFromArray(lnFWeight.data, lnFWeight.shape);
       const b = this.api.tensorFromArray(lnFBias.data, lnFBias.shape);
-      this.lnF.loadWeights(w, b);
+      loadLayerNormWeights(this.api, this.lnF, w, b);
     }
 
     // Transformer blocks
@@ -633,7 +602,9 @@ export class GPT2WithLoRA {
       const ln1W = weights.get(`${prefix}.ln_1.weight`);
       const ln1B = weights.get(`${prefix}.ln_1.bias`);
       if (ln1W && ln1B) {
-        block.ln1.loadWeights(
+        loadLayerNormWeights(
+          this.api,
+          block.ln1,
           this.api.tensorFromArray(ln1W.data, ln1W.shape),
           this.api.tensorFromArray(ln1B.data, ln1B.shape),
         );
@@ -670,7 +641,9 @@ export class GPT2WithLoRA {
       const ln2W = weights.get(`${prefix}.ln_2.weight`);
       const ln2B = weights.get(`${prefix}.ln_2.bias`);
       if (ln2W && ln2B) {
-        block.ln2.loadWeights(
+        loadLayerNormWeights(
+          this.api,
+          block.ln2,
           this.api.tensorFromArray(ln2W.data, ln2W.shape),
           this.api.tensorFromArray(ln2B.data, ln2B.shape),
         );
