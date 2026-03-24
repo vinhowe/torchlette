@@ -276,33 +276,19 @@ export function endSharedEncoder(): void {
 export async function beginStep(): Promise<void> {
   if (encoderState.stepLevelScope) return; // already in step scope
   encoderState.stepLevelScope = true;
-  // Await any deferred fence from the previous markStep BEFORE opening the
-  // shared encoder.  This flushes pendingRelease buffers into the main pool
-  // so the upcoming training step can reuse them, eliminating the 2-step lag
-  // that previously caused hundreds of unnecessary createBuffer() calls.
+
+  // Fence is already awaited by markStep — just do buffer pool maintenance.
+  // awaitDeferredFence() is a no-op here (fence already consumed), but call
+  // it for safety in case beginStep is called without a prior markStep.
   await awaitDeferredFence();
-  // Now that the GPU fence has resolved, it's safe to destroy buffers that
-  // were queued for destruction during the previous step. Before the fence,
-  // these buffers may still be referenced by in-flight command buffers.
-  // Previously destroyPendingGPUBuffers() was called in markStep() and
-  // autograd cleanup — both BEFORE the fence, causing "Buffer used in submit
-  // while destroyed" WebGPU validation warnings.
   bufferPool.destroyPendingBuffers();
-  // End the previous step's window tracking (if any) and compute reservation.
-  // This must happen AFTER awaitDeferredFence (which may trigger pool operations)
-  // and BEFORE reserve() (which uses the computed reservation).
-  // We end tracking here (not in endStep) so that post-step cleanup acquires
-  // (from markStep/GC) are captured in the recording.
   bufferPool.endWindowTracking();
-  // Reserve buffers based on window-demand recording from previous step.
-  // Falls back to prewarm() on the first step (no recording yet).
-  // Must happen BEFORE opening the shared encoder (no writeSet conflicts).
   bufferPool.reserve(requireContext().device);
-  bufferPool.sortPoolBuckets(); // deterministic acquire order for bind group cache
-  prePinOutputBuffers(); // pre-extract hinted output buffers before any dispatches
-  bufferPool.beginWindowTracking(); // Start recording this step's demand
-  beginSharedEncoder(); // open the shared encoder for the whole step
-  resetDispatchSequence(); // reset bind group cache sequence counter for this step
+  bufferPool.sortPoolBuckets();
+  prePinOutputBuffers();
+  bufferPool.beginWindowTracking();
+  beginSharedEncoder();
+  resetDispatchSequence();
 }
 
 /**

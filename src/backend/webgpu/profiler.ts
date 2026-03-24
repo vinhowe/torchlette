@@ -576,6 +576,13 @@ export async function flushAndReadGpuTimestamps(): Promise<boolean> {
   if (!isBrowser) {
     gpuTs.enabled = false;
   }
+
+  // Reset slot counter for next step. Accumulation maps (labelStats, etc.)
+  // are preserved — only the per-step recording state is cleared.
+  gpuTs.nextSlot = 0;
+  gpuTs.passRecords = [];
+  gpuTs.stagingSlots = 0;
+
   return true;
 }
 
@@ -596,15 +603,19 @@ export async function readGpuTimestamps(): Promise<void> {
   )
     return;
 
-  // If timestamps were already processed by flushAndReadGpuTimestamps,
-  // labelStats will be non-empty. Skip redundant readback.
-  if (gpuTs.labelStats.size > 0) return;
+  // If timestamps were already processed by flushAndReadGpuTimestamps
+  // (which resets passRecords/stagingSlots), the guards above catch it.
 
   // Drain the deferred fence from markStep()
   const { awaitDeferredFence } = await import("./buffer-pool");
   await awaitDeferredFence();
 
   await resolveAndMapTimestamps(gpuTs.stagingSlots);
+
+  // Reset slot counter for next step (same as flushAndReadGpuTimestamps).
+  gpuTs.nextSlot = 0;
+  gpuTs.passRecords = [];
+  gpuTs.stagingSlots = 0;
 }
 
 // ---------------------------------------------------------------------------

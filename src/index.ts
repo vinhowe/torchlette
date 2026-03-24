@@ -23,6 +23,7 @@ export {
   resetProfileStats,
   setAllocStep,
   setGPUMemoryLimit,
+  setProfilePhase,
   singleWorkgroup,
   snapshotLeakedAllocs,
   syncWebGPU,

@@ -8,7 +8,7 @@
  */
 
 import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
-import { Adam, GradScaler, nn } from "torchlette";
+import { Adam, GradScaler, nn, setProfilePhase } from "torchlette";
 import type { GPT2WithLoRA } from "./gpt2-lora";
 import type { GPT2Tokenizer } from "./tokenizer";
 
@@ -225,6 +225,7 @@ export class LoRATrainer {
       // Get batch
       const { input, target } = dataLoader.nextBatch();
 
+      setProfilePhase("forward");
       // Forward pass with loss.
       // Wrap in tidy() to dispose intermediate FrontendTensors (layernorm
       // outputs, attention scores, etc.) immediately. The underlying lazy
@@ -270,6 +271,7 @@ export class LoRATrainer {
         continue;
       }
 
+      setProfilePhase("backward");
       // Backward pass
       const bwdStart = performance.now();
       await loss.backward();
@@ -278,6 +280,7 @@ export class LoRATrainer {
       await nn.clipGradNorm_(this.api, trainableParams, 1.0);
       const bwdEnd = performance.now();
 
+      setProfilePhase("optimizer");
       // Optimizer step
       if (this.gradScaler) {
         await this.gradScaler.unscale_(this.optimizer!);
@@ -302,6 +305,7 @@ export class LoRATrainer {
       input.dispose();
       target.dispose();
 
+      setProfilePhase("cleanup");
       // End step lifecycle (flush shared encoder, release buffers)
       this.api.endStep();
 
