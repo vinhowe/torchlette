@@ -1392,8 +1392,22 @@ function stridedScatterImpl(
     }
   }
 
-  const out = new Float32Array(base.data.length);
-  out.set(base.data);
+  // Create output matching base's logical size, not its backing buffer size.
+  // The base may be a view into a larger buffer (offset > 0 or data.length > size).
+  const baseSize = sizeOf(base.shape);
+  const out = new Float32Array(baseSize);
+  // Read base values through strides (handles non-contiguous views)
+  const baseStrides = computeStrides(base.shape);
+  for (let i = 0; i < baseSize; i++) {
+    let remainder = i;
+    let idx = base.offset;
+    for (let axis = 0; axis < base.shape.length; axis++) {
+      const coord = Math.floor(remainder / baseStrides[axis]);
+      remainder -= coord * baseStrides[axis];
+      idx += coord * base.strides[axis];
+    }
+    out[i] = base.data[idx];
+  }
 
   const srcSize = sizeOf(viewShape);
   const srcShapeStrides = computeStrides(viewShape);

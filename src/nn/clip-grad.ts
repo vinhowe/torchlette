@@ -11,18 +11,21 @@ import type { Tensor, Torchlette } from "../frontend/torchlette";
  * The norm is computed over all gradients together, as if they were
  * concatenated into a single vector. Gradients are modified in-place.
  *
+ * Fully lazy on GPU — no CPU readback or GPU fence. The norm computation,
+ * clip coefficient, and conditional scaling all stay in the lazy graph.
+ * This avoids an ~800ms onSubmittedWorkDone stall in Full FT training.
+ *
  * @param api - The Torchlette instance
  * @param parameters - Iterable of Tensors that may have gradients
  * @param maxNorm - Maximum allowed total norm
  * @param normType - Type of the p-norm (default: 2.0). Use Infinity for max norm.
- * @returns The total norm of the parameter gradients (before clipping)
  */
-export async function clipGradNorm_(
+export function clipGradNorm_(
   api: Torchlette,
   parameters: Tensor[],
   maxNorm: number,
   normType: number = 2,
-): Promise<number> {
+): void {
   // Collect parameters that have gradients
   const grads: Tensor[] = [];
   for (const p of parameters) {
@@ -32,15 +35,13 @@ export async function clipGradNorm_(
   }
 
   if (grads.length === 0) {
-    return 0;
+    return;
   }
 
-  // Build the norm tensor inside tidy — all intermediates (pow, sum, add,
-  // sqrt) are disposed automatically when tidy exits. Only the kept result
-  // survives. Without tidy, ~48 frontend Tensor objects per step accumulate
-  // until GC, causing progressive slowdown in long training runs.
-  const totalNormTensor = api.tidy(() => {
-    let result: Tensor;
+  // Build norm + clip coefficient + scaled gradients all as lazy GPU ops.
+  // tidy() disposes all intermediates (pow, sum, add, sqrt, div, clamp).
+  api.tidy(() => {
+    let totalNormTensor: Tensor;
 
     if (normType === Infinity) {
       let maxTensor: Tensor | null = null;
@@ -56,7 +57,7 @@ export async function clipGradNorm_(
                 ),
               );
       }
-      result = maxTensor!;
+      totalNormTensor = maxTensor!;
     } else if (normType === 2) {
       let totalSumSq: Tensor | null = null;
       for (const g of grads) {
@@ -64,7 +65,7 @@ export async function clipGradNorm_(
         const sumSq = api.sum(sq);
         totalSumSq = totalSumSq === null ? sumSq : api.add(totalSumSq, sumSq);
       }
-      result = api.sqrt(totalSumSq!);
+      totalNormTensor = api.sqrt(totalSumSq!);
     } else {
       let totalSumP: Tensor | null = null;
       for (const g of grads) {
@@ -73,25 +74,26 @@ export async function clipGradNorm_(
         const sumP = api.sum(powG);
         totalSumP = totalSumP === null ? sumP : api.add(totalSumP, sumP);
       }
-      result = api.pow(totalSumP!, 1 / normType);
+      totalNormTensor = api.pow(totalSumP!, 1 / normType);
     }
 
-    api.keep(result);
-    return result;
-  });
+    // clipCoef = clamp(maxNorm / (totalNorm + eps), max=1.0)
+    // When clipCoef = 1.0 (norm within budget), multiplication is a no-op.
+    // clipCoef = min(maxNorm / (norm + eps), 1.0) — cap at 1.0 so we never
+    // scale gradients UP. Implemented with fusible ops (clamp isn't in the
+    // tile-IR op registry): rawCoef * le(rawCoef, one) + gt(rawCoef, one).
+    const rawCoef = api.div(maxNorm, api.add(totalNormTensor, 1e-6));
+    const one = api.full([], 1.0);
+    const clipCoef = api.add(
+      api.mul(rawCoef, api.le(rawCoef, one)),
+      api.gt(rawCoef, one),
+    );
 
-  // One materialization point — forces the lazy norm computation.
-  const totalNorm = await totalNormTensor.item();
-  totalNormTensor.dispose();
-
-  const clipCoef = maxNorm / (totalNorm + 1e-6);
-  if (clipCoef < 1) {
+    // Scale all gradients by clipCoef (always — clipCoef=1 is identity)
     for (const g of grads) {
-      api.mul_(g, clipCoef);
+      api.copy_(g, api.mul(g, clipCoef));
     }
-  }
-
-  return totalNorm;
+  });
 }
 
 /**

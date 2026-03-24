@@ -24,10 +24,10 @@ describe("Gradient Clipping", () => {
       // a.grad = [1, 1], b.grad = [1, 1]
       // total L2 norm = sqrt(1+1+1+1) = 2
 
-      const totalNorm = await nn.clipGradNorm_(api, [a, b], 1.0);
-      expect(totalNorm).toBeCloseTo(2.0, 1);
+      await nn.clipGradNorm_(api, [a, b], 1.0);
 
-      // After clipping, grads should be scaled by 1.0 / (2.0 + 1e-6)
+      // After clipping with maxNorm=1.0 and totalNorm=2.0,
+      // grads should be scaled by 1.0 / (2.0 + 1e-6)
       const gradA = await a.grad!.cpu();
       const scale = 1.0 / (2.0 + 1e-6);
       expect(gradA[0]).toBeCloseTo(scale, 3);
@@ -40,20 +40,18 @@ describe("Gradient Clipping", () => {
       await loss.backward();
       // a.grad = [1, 1], norm = sqrt(2) ≈ 1.414
 
-      const totalNorm = await nn.clipGradNorm_(api, [a], 10.0);
-      expect(totalNorm).toBeCloseTo(Math.sqrt(2), 3);
+      await nn.clipGradNorm_(api, [a], 10.0);
 
-      // Grads should be unchanged
+      // Norm = sqrt(2) < maxNorm=10, so grads should be unchanged
       const gradA = await a.grad!.cpu();
       expect(gradA[0]).toBeCloseTo(1.0, 5);
       expect(gradA[1]).toBeCloseTo(1.0, 5);
     });
 
-    it("returns 0 when no parameters have gradients", async () => {
+    it("is a no-op when no parameters have gradients", async () => {
       const a = api.tensorFromArray([1, 2], [2], { requiresGrad: true });
-      // No backward called, so no gradients
-      const totalNorm = await nn.clipGradNorm_(api, [a], 1.0);
-      expect(totalNorm).toBe(0);
+      // No backward called, so no gradients — should not throw
+      await nn.clipGradNorm_(api, [a], 1.0);
     });
   });
 
