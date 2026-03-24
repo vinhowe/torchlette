@@ -10,7 +10,7 @@
 import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
 import { nn } from "torchlette";
 
-const { checkpoint, crossEntropy, LayerNorm } = nn;
+const { checkpoint, crossEntropy, Embedding, LayerNorm, Linear } = nn;
 
 import { type LoRAConfig, LoRALinear } from "./lora";
 
@@ -44,111 +44,20 @@ export const GPT2_SMALL_CONFIG: GPT2Config = {
 // The framework's LayerNorm creates weight/bias with requiresGrad=true.
 // For LoRA mode, setFullFinetuning(false) freezes them after construction.
 
-/** Copy pretrained weights into a LayerNorm module. */
-function loadLayerNormWeights(
+/** Copy pretrained weights into a module's weight (and optional bias). */
+function loadWeights(
   api: Torchlette,
-  ln: InstanceType<typeof LayerNorm>,
+  mod: { weight: Tensor | null; bias?: Tensor | null },
   weight: Tensor,
-  bias: Tensor,
+  bias?: Tensor | null,
 ): void {
   const runtime = api._runtime();
-  runtime.copy_(ln.weight!._unwrap(), weight._unwrap());
-  runtime.copy_(ln.bias!._unwrap(), bias._unwrap());
+  if (mod.weight) runtime.copy_(mod.weight._unwrap(), weight._unwrap());
+  if (bias && mod.bias) runtime.copy_(mod.bias._unwrap(), bias._unwrap());
 }
 
-/**
- * Embedding layer - proper implementation matching torchlette's nn.Embedding
- */
-class Embedding {
-  readonly api: Torchlette;
-  readonly weight: Tensor;
-  readonly embeddingDim: number;
-
-  constructor(
-    api: Torchlette,
-    numEmbeddings: number,
-    embeddingDim: number,
-    device: "cpu" | "webgpu" = "webgpu",
-  ) {
-    this.api = api;
-    this.embeddingDim = embeddingDim;
-    this.weight = api.zeros([numEmbeddings, embeddingDim], {
-      device,
-      requiresGrad: false,
-    });
-  }
-
-  forward(indices: Tensor): Tensor {
-    // indices: [...] containing token indices
-    // weight: [numEmbeddings, embeddingDim]
-    // output: [..., embeddingDim]
-
-    const inputShape = indices.shape;
-    const numElements = inputShape.reduce((a, b) => a * b, 1);
-
-    // Flatten input to [numElements]
-    const flatInput = indices.reshape([numElements]);
-
-    // Expand indices to [numElements, embeddingDim] for gather
-    // Each index is repeated embeddingDim times across dim 1
-    const expandedInput = flatInput
-      .reshape([numElements, 1])
-      .expand([numElements, this.embeddingDim])
-      .contiguous(); // Required: gather doesn't handle strided tensors correctly
-
-    // Gather from weight: output[i][j] = weight[expandedInput[i][j]][j]
-    const gathered = this.weight.gather(expandedInput, { dim: 0 });
-
-    // Reshape to [..., embeddingDim]
-    const outputShape = [...inputShape, this.embeddingDim];
-    return gathered.reshape(outputShape);
-  }
-
-  loadWeights(weight: Tensor): void {
-    const runtime = this.api._runtime();
-    runtime.copy_(this.weight._unwrap(), weight._unwrap());
-  }
-}
-
-/**
- * Linear layer (frozen base)
- */
-class Linear {
-  readonly api: Torchlette;
-  readonly weight: Tensor;
-  readonly bias: Tensor | null;
-
-  constructor(
-    api: Torchlette,
-    inFeatures: number,
-    outFeatures: number,
-    options: { device?: "cpu" | "webgpu"; bias?: boolean } = {},
-  ) {
-    this.api = api;
-    const device = options.device ?? "webgpu";
-    this.weight = api.zeros([outFeatures, inFeatures], {
-      device,
-      requiresGrad: false,
-    });
-    this.bias =
-      options.bias !== false
-        ? api.zeros([outFeatures], { device, requiresGrad: false })
-        : null;
-  }
-
-  forward(x: Tensor): Tensor {
-    const out = this.api.matmul(x, this.weight.transpose({ dim0: 0, dim1: 1 }));
-    return this.bias ? this.api.add(out, this.bias) : out;
-  }
-
-  loadWeights(weight: Tensor, bias: Tensor | null): void {
-    const runtime = this.api._runtime();
-    runtime.copy_(this.weight._unwrap(), weight._unwrap());
-    if (bias && this.bias) {
-      runtime.copy_(this.bias._unwrap(), bias._unwrap());
-    }
-  }
-}
+// Embedding, Linear, LayerNorm: imported from torchlette framework.
+// Framework modules use fused GPU kernels and optimized backward passes.
 
 // ============================================================================
 // Attention with LoRA
@@ -190,73 +99,38 @@ class CausalSelfAttentionLoRA {
 
     // Frozen output projection
     this.cProj = new Linear(api, config.embedDim, config.embedDim, { device });
+    this.cProj.weight.requires_grad_(false);
+    this.cProj.bias!.requires_grad_(false);
   }
 
   forward(x: Tensor): Tensor {
     const [batch, seqLen] = x.shape;
 
     // Combined QKV projection with LoRA
-    // qkv: [batch, seqLen, 3 * embedDim]
     const qkv = this.cAttn.forward(x);
 
-    // Split QKV along last dimension: [batch, seqLen, 3*embedDim] → 3 × [batch, seqLen, embedDim]
-    const [qRaw, kRaw, vRaw] = this.api.split(qkv, this.embedDim, 2);
+    // Split and reshape to [batch, numHeads, seqLen, headDim]
+    const [qFlat, kFlat, vFlat] = qkv.chunk(3, -1);
+    const toHeads = (t: Tensor) =>
+      t
+        .reshape([batch, seqLen, this.numHeads, this.headDim])
+        .permute([0, 2, 1, 3])
+        .contiguous();
+    const q = toHeads(qFlat);
+    const k = toHeads(kFlat);
+    const v = toHeads(vFlat);
 
-    // Reshape to multi-head: [batch, seqLen, numHeads, headDim] → [batch, numHeads, seqLen, headDim]
-    // Then merge batch and heads: [batch * numHeads, seqLen, headDim]
-    const q = qRaw
-      .reshape([batch, seqLen, this.numHeads, this.headDim])
+    // Fused scaled dot-product attention (single kernel)
+    const scale = 1.0 / Math.sqrt(this.headDim);
+    const attnOut = this.api.scaledDotProductAttention(q, k, v, scale, true);
+
+    // Reshape back: [batch, numHeads, seqLen, headDim] → [batch, seqLen, embedDim]
+    const attnFlat = attnOut
       .permute([0, 2, 1, 3])
-      .reshape([batch * this.numHeads, seqLen, this.headDim]);
-    const k = kRaw
-      .reshape([batch, seqLen, this.numHeads, this.headDim])
-      .permute([0, 2, 1, 3])
-      .reshape([batch * this.numHeads, seqLen, this.headDim]);
-    const v = vRaw
-      .reshape([batch, seqLen, this.numHeads, this.headDim])
-      .permute([0, 2, 1, 3])
-      .reshape([batch * this.numHeads, seqLen, this.headDim]);
-
-    // Scaled dot-product attention
-    // scores = Q @ K^T / sqrt(d_k)
-    const kT = k.transpose({ dim0: 1, dim1: 2 }); // [batch*heads, head_dim, seq]
-    const scores = this.api.matmul(q, kT);
-
-    const scaledScores = this.api.mul(scores, 1.0 / Math.sqrt(this.headDim));
-
-    // Apply causal mask (set future positions to -inf)
-    const mask = this.createCausalMask(seqLen);
-    const maskedScores = this.api.add(scaledScores, mask);
-
-    // Softmax
-    const attnWeights = maskedScores.softmax(-1);
-
-    // Apply attention to values
-    const attnOut = this.api.matmul(attnWeights, v);
-
-    // Reshape back: [batch*heads, seq, head_dim] -> [batch, seq, embed_dim]
-    const attnReshaped = attnOut.reshape([
-      batch,
-      this.numHeads,
-      seqLen,
-      this.headDim,
-    ]);
-    const attnPermuted = attnReshaped.permute([0, 2, 1, 3]);
-    const attnFlat = attnPermuted.reshape([batch, seqLen, this.embedDim]);
+      .reshape([batch, seqLen, this.embedDim]);
 
     // Output projection
     return this.cProj.forward(attnFlat);
-  }
-
-  private createCausalMask(seqLen: number): Tensor {
-    // Create lower triangular mask: 0 for valid, -inf for invalid
-    const mask = new Float32Array(seqLen * seqLen);
-    for (let i = 0; i < seqLen; i++) {
-      for (let j = 0; j < seqLen; j++) {
-        mask[i * seqLen + j] = j > i ? -1e9 : 0;
-      }
-    }
-    return this.api.tensorFromArray(mask, [seqLen, seqLen]);
   }
 
   getLoRAParameters(): Tensor[] {
@@ -290,6 +164,8 @@ class MLPLoRA {
     this.cProj = new Linear(api, 4 * config.embedDim, config.embedDim, {
       device,
     });
+    this.cProj.weight.requires_grad_(false);
+    this.cProj.bias!.requires_grad_(false);
   }
 
   forward(x: Tensor): Tensor {
@@ -375,8 +251,14 @@ export class GPT2WithLoRA {
     this.config = config;
     this.loraConfig = loraConfig;
 
-    this.wte = new Embedding(api, config.vocabSize, config.embedDim, device);
-    this.wpe = new Embedding(api, config.blockSize, config.embedDim, device);
+    this.wte = new Embedding(api, config.vocabSize, config.embedDim, {
+      device,
+    });
+    this.wte.weight.requires_grad_(false);
+    this.wpe = new Embedding(api, config.blockSize, config.embedDim, {
+      device,
+    });
+    this.wpe.weight.requires_grad_(false);
 
     this.h = [];
     for (let i = 0; i < config.numLayers; i++) {
@@ -452,11 +334,7 @@ export class GPT2WithLoRA {
     x = this.lnF.forward(x);
 
     // LM head (weight-tied with token embeddings)
-    // logits = x @ wte.weight^T
-    const logits = this.api.matmul(
-      x,
-      this.wte.weight.transpose({ dim0: 0, dim1: 1 }),
-    );
+    const logits = this.api.linear(x, this.wte.weight, null);
 
     return logits;
   }
@@ -574,14 +452,14 @@ export class GPT2WithLoRA {
     const wteWeight = weights.get("wte.weight");
     if (wteWeight) {
       const tensor = this.api.tensorFromArray(wteWeight.data, wteWeight.shape);
-      this.wte.loadWeights(tensor);
+      loadWeights(this.api, this.wte, tensor);
     }
 
     // Position embeddings
     const wpeWeight = weights.get("wpe.weight");
     if (wpeWeight) {
       const tensor = this.api.tensorFromArray(wpeWeight.data, wpeWeight.shape);
-      this.wpe.loadWeights(tensor);
+      loadWeights(this.api, this.wpe, tensor);
     }
 
     // Final layer norm
@@ -590,7 +468,7 @@ export class GPT2WithLoRA {
     if (lnFWeight && lnFBias) {
       const w = this.api.tensorFromArray(lnFWeight.data, lnFWeight.shape);
       const b = this.api.tensorFromArray(lnFBias.data, lnFBias.shape);
-      loadLayerNormWeights(this.api, this.lnF, w, b);
+      loadWeights(this.api, this.lnF, w, b);
     }
 
     // Transformer blocks
@@ -602,7 +480,7 @@ export class GPT2WithLoRA {
       const ln1W = weights.get(`${prefix}.ln_1.weight`);
       const ln1B = weights.get(`${prefix}.ln_1.bias`);
       if (ln1W && ln1B) {
-        loadLayerNormWeights(
+        loadWeights(
           this.api,
           block.ln1,
           this.api.tensorFromArray(ln1W.data, ln1W.shape),
@@ -634,14 +512,14 @@ export class GPT2WithLoRA {
           transposed.shape,
         );
         const bTensor = this.api.tensorFromArray(cProjB.data, cProjB.shape);
-        block.attn.cProj.loadWeights(wTensor, bTensor);
+        loadWeights(this.api, block.attn.cProj, wTensor, bTensor);
       }
 
       // Layer norm 2
       const ln2W = weights.get(`${prefix}.ln_2.weight`);
       const ln2B = weights.get(`${prefix}.ln_2.bias`);
       if (ln2W && ln2B) {
-        loadLayerNormWeights(
+        loadWeights(
           this.api,
           block.ln2,
           this.api.tensorFromArray(ln2W.data, ln2W.shape),
@@ -665,7 +543,9 @@ export class GPT2WithLoRA {
       const mlpProjB = weights.get(`${prefix}.mlp.c_proj.bias`);
       if (mlpProjW && mlpProjB) {
         const transposed = this.transposeWeight(mlpProjW.data, mlpProjW.shape);
-        block.mlp.cProj.loadWeights(
+        loadWeights(
+          this.api,
+          block.mlp.cProj,
           this.api.tensorFromArray(transposed.data, transposed.shape),
           this.api.tensorFromArray(mlpProjB.data, mlpProjB.shape),
         );
