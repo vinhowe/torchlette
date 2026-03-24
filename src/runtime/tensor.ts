@@ -141,12 +141,14 @@ export function getDebugLiveTensors(): Array<{
   dtype: string;
   materialized: boolean;
   disposed: boolean;
+  creationSite?: string;
 }> {
   const result: Array<{
     shape: string;
     dtype: string;
     materialized: boolean;
     disposed: boolean;
+    creationSite?: string;
   }> = [];
   for (const t of _debugLiveTensors) {
     result.push({
@@ -154,6 +156,7 @@ export function getDebugLiveTensors(): Array<{
       dtype: t.dtype,
       materialized: t.isMaterialized(),
       disposed: t.disposed,
+      creationSite: t._debugCreationSite,
     });
   }
   return result;
@@ -173,6 +176,8 @@ export class Tensor {
   private _pendingNodeId: number | null = null;
   /** Mutable object for FinalizationRegistry - updated when tensor materializes */
   private readonly _held: { storageId: number; pendingNodeId: number | null };
+  /** Debug: creation callsite (only when debug tracking is enabled) */
+  _debugCreationSite?: string;
 
   constructor(
     baseId: BaseId,
@@ -186,7 +191,19 @@ export class Tensor {
     this.device = device;
     this.shape = shape.slice();
     this.dtype = dtype;
-    if (_debugTracking) _debugLiveTensors.add(this);
+    if (_debugTracking) {
+      _debugLiveTensors.add(this);
+      // Capture creation stack for leak tracing
+      const stack = new Error().stack;
+      if (stack) {
+        // Skip "Error" + constructor frame, take next 6 useful frames
+        this._debugCreationSite = stack
+          .split("\n")
+          .slice(2, 8)
+          .map((l) => l.trim())
+          .join(" | ");
+      }
+    }
 
     // Initialize held value for finalization registry
     // storageId = -1 means not yet materialized
