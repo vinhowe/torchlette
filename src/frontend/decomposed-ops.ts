@@ -1,8 +1,8 @@
 import { sizeOf } from "../core/shape";
-import type { Torchlette } from "./torchlette";
+import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import { applyAutocastImpl, autocastCastImpl } from "./autocast";
 import type { Tensor } from "./tensor";
-import type { Tensor as RuntimeTensor } from "../runtime/tensor";
+import type { Torchlette } from "./torchlette";
 
 /**
  * Softmax along a dimension.
@@ -646,35 +646,17 @@ function layernormBackwardImpl(
 
     const sumDims = Array.from({ length: rank - 1 }, (_, i) => i);
 
-    let gradBiasReduced = grad;
-    for (let i = sumDims.length - 1; i >= 0; i--) {
-      const sumResult = torch.runtime.sum(gradBiasReduced, {
-        dim: sumDims[i],
-        keepdim: false,
-      });
-      if (typeof sumResult === "number") {
-        throw new Error(
-          "layernorm backward: sum for gradBias should return tensor",
-        );
-      }
-      gradBiasReduced = sumResult;
-    }
-    gradBias = gradBiasReduced;
+    // Single multi-dim reduction instead of sequential per-dim loop.
+    // For rank-3 [batch, seq, dim] → [dim], this is 1 dispatch instead of 2.
+    gradBias = torch.runtime.sum(grad, {
+      dim: sumDims,
+      keepdim: false,
+    }) as Tensor;
 
-    let gradWeightReduced = torch.runtime.mul(grad, recomputeNormalized);
-    for (let i = sumDims.length - 1; i >= 0; i--) {
-      const sumResult = torch.runtime.sum(gradWeightReduced, {
-        dim: sumDims[i],
-        keepdim: false,
-      });
-      if (typeof sumResult === "number") {
-        throw new Error(
-          "layernorm backward: sum for gradWeight should return tensor",
-        );
-      }
-      gradWeightReduced = sumResult;
-    }
-    gradWeight = gradWeightReduced;
+    gradWeight = torch.runtime.sum(
+      torch.runtime.mul(grad, recomputeNormalized),
+      { dim: sumDims, keepdim: false },
+    ) as Tensor;
 
     // Decomposed gradX for CPU
     const gradNormalized = torch.runtime.mul(grad, savedWeight._unwrap());
