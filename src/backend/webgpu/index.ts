@@ -203,6 +203,7 @@ import {
   mulScalarInPlace,
   read,
   readAndDestroyInfCount,
+  startScalarReadback,
   unscaleGrad,
   waitForGPU,
 } from "./ops/fused";
@@ -353,6 +354,7 @@ export const webgpuBackend: FusedBackend & {
     createInfCountBuffer,
     readAndDestroyInfCount,
     read,
+    startScalarReadback,
   },
   mulScalarInPlace,
   beginStep,

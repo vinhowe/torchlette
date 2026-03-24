@@ -1286,6 +1286,23 @@ export class RuntimeEngine {
   }
 
   /**
+   * Start an async scalar readback: force the tensor, copy its value to a
+   * staging buffer, and return a finish function. The staging buffer is
+   * excluded from the pool, so backward can reuse the source buffer freely.
+   * Call the returned function after backward to get the scalar value.
+   */
+  async startItemReadback(a: Tensor): Promise<() => Promise<number>> {
+    await this.force(a);
+    const backend = this.getBackend(a.device);
+    if (backend.ops.startScalarReadback) {
+      return backend.ops.startScalarReadback(a.backendTensor);
+    }
+    // Fallback for backends without staging support (CPU)
+    const values = await backend.ops.read(a.backendTensor);
+    return async () => values[0];
+  }
+
+  /**
    * Transfer a tensor to a different device (lazy).
    * Creates a lazy transfer node that will be executed when forced.
    */
