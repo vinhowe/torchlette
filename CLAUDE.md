@@ -98,13 +98,18 @@ GPU memory is managed deterministically via two-tier reachability — no GC depe
 - Periodic reclamation between plan segments (flush + pool flush as separate calls)
 - The `sharedEncoderWriteSet` WAW check must be kept
 
-## Performance Baselines (2026-03-11)
+## Performance Baselines (2026-03-24)
 
-### Baseline A: DistilGPT-2, 512 tokens (6 layers, 768 dim, 81M params)
-Steady-state ~48ms/step wall clock. Memory: 5397MB steady, zero leak. Pool reuse 58%. Top GPU: matmul 4.4ms, epilogue matmul 7.8ms, fusedAttentionBwd 5.5ms, adamStep 3.7ms (14 dispatches, packed).
+### Baseline A: DistilGPT-2, 512 tokens, Node/Dawn (V100)
+Steady-state ~213ms/step wall clock. Memory: 1645MB steady, zero leak. Pool reuse 68%. 525 dispatches/step. Top GPU: matmul 40ms (61%), fusedAttentionBwd 5.7ms, adamStep 3.2ms (8 dispatches, packed). Fusion: 15.7% forward, 7.3% backward (limited by V100's 10 storage buffer limit).
 
-### Baseline B: GPT-2 Medium, 512 tokens (24 layers, 1024 dim, 355M params)
-Steady-state ~162ms/step wall clock. Memory: 14.7GB steady, zero leak. Pool reuse 58%. 741/4449 nodes fused (16.7%). Top GPU: bare matmul 125ms (bwd), epilogue matmul ~49ms (fwd) + ~47ms (bwd), fusedAttentionBwd 22.5ms, adamStep 14.3ms (14 dispatches, packed), sum 5.1ms, add 3.5ms, cast 6.4ms, LN gradWB 2.6ms. GPU is 81% matmul.
+### Baseline B: DistilGPT-2, 128 tokens, Browser/Chrome (V100)
+**LoRA:** 316 tok/s steady. fwd=4ms, bwd=307ms. Uses fused LayerNorm, Embedding, Linear, scaledDotProductAttention, api.linear(). Selective checkpointing (MLP-only). GPU memory flat.
+
+**Full FT:** 89 tok/s steady. fwd=16ms, bwd=1100ms. GPU-bound at ~786ms/step GPU compute. Fence wait moved to markStep for honest phase timing + proper CPU/GPU overlap (was 47 tok/s before fence fix).
+
+### Baseline C: GPT-2 Medium, 512 tokens, Node/Dawn (V100)
+Steady-state ~162ms/step wall clock. Memory: 14.7GB steady, zero leak. Pool reuse 58%. 741/4449 nodes fused (16.7%). Top GPU: bare matmul 125ms (bwd), epilogue matmul ~49ms (fwd) + ~47ms (bwd), fusedAttentionBwd 22.5ms, adamStep 14.3ms (14 dispatches, packed). GPU is 81% matmul.
 
 ## Open Performance Targets
 
@@ -136,6 +141,9 @@ Steady-state ~162ms/step wall clock. Memory: 14.7GB steady, zero leak. Pool reus
 - **Inline D precompute into attention** — D precompute is only 0.3ms; inline overhead exceeds savings.
 - **Per-shape matmul autotuning on DistilGPT-2** — Hand-tuned defaults already optimal for 768-dim. Infrastructure kept for larger models.
 - **Matmul input cast absorption in training** — Backward needs f16 tensors materialized; can't skip the cast.
+- **Bypassed-node transparency in fusion grouping** — Making CSE-bypassed nodes transparent in `buildCandidateGroups` (so they don't break fusible runs) caused "Input not ready" errors in the browser. The bypassed nodes' plan positions still matter for execution ordering. Bypassed nodes must remain opaque barriers.
+- **Skipping RuntimeTensor for in-place op intermediates** — `mul_` creates `copy_(dst, mul(dst, value))` with an intermediate RuntimeTensor. Tried creating the mul lazy node directly without a RuntimeTensor wrapper to avoid GC pressure. Caused GPU storage leak — the intermediate's StorageHandle had no RuntimeTensor owner, so FinalizationRegistry never cleaned it up.
+- **Moving loss.item() after backward** — Tried deferring loss readback to overlap forward GPU with backward CPU. Two attempts: (1) `retainGrad()` doesn't prevent `cleanupAutogradGraph` disposal. (2) Adding root to `preserved` set keeps the tensor alive but its GPU buffer gets reused by the buffer pool during backward, causing read-write/read-only aliasing errors in the shared encoder. Would require excluding the loss buffer from pool reuse during backward execution.
 
 ## Known Semantic Limitations
 
