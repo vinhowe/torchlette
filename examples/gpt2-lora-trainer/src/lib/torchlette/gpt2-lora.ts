@@ -316,15 +316,27 @@ export class GPT2WithLoRA {
     // Combine embeddings
     let x = this.api.add(tokEmb, posEmb);
 
-    // Transformer blocks - with optional checkpointing
+    // Transformer blocks
     if (this.checkpointingEnabled && this.training) {
-      // With checkpointing: wrap each block to recompute during backward
-      for (let i = 0; i < this.h.length; i++) {
-        const block = this.h[i];
-        x = this.checkpointBlock(block, x);
+      // Selective checkpointing: attention runs outside checkpoint (fused
+      // kernel is already memory-efficient), MLP runs inside checkpoint
+      // (recomputes 4x-expanded activations). This avoids 6 expensive
+      // fusedAttention recomputes during backward.
+      for (const block of this.h) {
+        // Attention: NOT checkpointed
+        const attnOut = block.attn.forward(block.ln1.forward(x));
+        const h = this.api.add(x, attnOut);
+        // MLP: checkpointed
+        x = checkpoint(
+          this.api,
+          (input: Tensor) => {
+            const mlpOut = block.mlp.forward(block.ln2.forward(input));
+            return this.api.add(input, mlpOut);
+          },
+          [h],
+        );
       }
     } else {
-      // Without checkpointing: normal forward pass
       for (const block of this.h) {
         x = block.forward(x);
       }
@@ -337,16 +349,6 @@ export class GPT2WithLoRA {
     const logits = this.api.linear(x, this.wte.weight, null);
 
     return logits;
-  }
-
-  /**
-   * Run a transformer block with gradient checkpointing.
-   * During forward: only save the input, not intermediate activations.
-   * During backward: recompute the forward pass to get activations.
-   */
-  private checkpointBlock(block: TransformerBlockLoRA, x: Tensor): Tensor {
-    // Use the proper checkpoint API from torchlette/nn/checkpoint
-    return checkpoint(this.api, (input: Tensor) => block.forward(input), [x]);
   }
 
   /**
