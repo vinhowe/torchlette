@@ -250,29 +250,13 @@ export class LoRATrainer {
 
       const fwdEnd = performance.now();
 
-      // Read loss value before backward (checkpoint may dispose intermediate tensors).
+      // Read loss value — forces the forward plan and reads back the scalar.
       let lossValue = await loss.item();
       if (this.gradScaler) {
         lossValue = lossValue / this.gradScaler.getScale();
       }
 
-      // Skip step if loss is NaN/Inf (can happen on some GPUs due to
-      // numerical edge cases in attention/softmax with certain inputs).
-      // Zero grads and continue — the model will recover on the next batch.
-      if (!isFinite(lossValue)) {
-        console.warn(`Step ${step}: NaN/Inf loss, skipping`);
-        this.optimizer!.zeroGrad();
-        input.dispose();
-        target.dispose();
-        this.api.endStep();
-        await this.api.markStep();
-        const stepTime = performance.now() - stepStart;
-        callbacks.onStepEnd?.(step, emaLoss, stepTime, undefined);
-        continue;
-      }
-
       setProfilePhase("backward");
-      // Backward pass
       const bwdStart = performance.now();
       await loss.backward();
 
