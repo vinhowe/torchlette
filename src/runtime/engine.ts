@@ -1373,13 +1373,63 @@ export class RuntimeEngine {
   }
 
   zero_(dst: Tensor): Tensor {
-    return this.copy_(dst, this.zeros(dst.shape, dst.device));
+    // Create source node directly — no RuntimeTensor wrapper needed.
+    // The zeros node is a plan-internal intermediate consumed by the scatter.
+    const srcNode = createLazyIRNode(
+      "tensorFromArray",
+      [],
+      dst.shape,
+      dst.dtype,
+      dst.device,
+      { values: new Float32Array(dst.shape.reduce((a, b) => a * b, 1)) },
+    );
+    return this._scatterFromNode(dst, srcNode);
   }
   fill_(dst: Tensor, value: number): Tensor {
-    return this.copy_(dst, this.full(dst.shape, value, dst.device));
+    const size = dst.shape.reduce((a, b) => a * b, 1);
+    const values = new Float32Array(size);
+    values.fill(value);
+    const srcNode = createLazyIRNode(
+      "tensorFromArray",
+      [],
+      dst.shape,
+      dst.dtype,
+      dst.device,
+      { values },
+    );
+    return this._scatterFromNode(dst, srcNode);
   }
   mul_(dst: Tensor, value: number): Tensor {
-    return this.copy_(dst, this.mul(dst, value));
+    // Create mul node directly — no RuntimeTensor wrapper. The intermediate
+    // is consumed by the scatter node within the same plan execution.
+    // Previously, trackNode() created a RuntimeTensor here that persisted
+    // until GC, causing ~2 leaked JS objects/step and progressive slowdown.
+    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp(
+      "mul",
+      dst,
+      value,
+    );
+    const mulNode = createLazyIRNode("mul", [refA, refB], shape, dtype, device);
+    return this._scatterFromNode(dst, mulNode);
+  }
+
+  /** Wire an untracked source node into a scatter-copy on dst. */
+  private _scatterFromNode(dst: Tensor, srcNode: LazyIRNode): Tensor {
+    const payload: StridedScatterOptions = {
+      offset: 0,
+      viewShape: dst.shape.slice(),
+      viewStrides: contiguousStrides(dst.shape),
+    };
+    const scatterNode = createLazyIRNode(
+      "stridedScatterCopy",
+      [dst.lazyRef, createPendingRef(srcNode)],
+      dst.shape,
+      dst.dtype,
+      dst.device,
+      payload,
+    );
+    dst._updateLazyRef(createPendingRef(scatterNode));
+    return dst;
   }
 
   async beginStep(): Promise<void> {
