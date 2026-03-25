@@ -1,5 +1,5 @@
-import type { OP_REGISTRY } from "../ops/registry";
 import type { BackendTensor, DeviceKind, DType } from "../backend/types";
+import type { OP_REGISTRY } from "../ops/registry";
 
 /**
  * All valid lazy op codes.
@@ -26,6 +26,8 @@ export type LazyOpCode =
   | "mean"
   | "max"
   | "min"
+  | "maximum"
+  | "minimum"
   | "argmax"
   | "argmin"
   // Creation ops

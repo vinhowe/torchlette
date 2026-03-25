@@ -77,16 +77,11 @@ export function clipGradNorm_(
       totalNormTensor = api.pow(totalSumP!, 1 / normType);
     }
 
-    // clipCoef = clamp(maxNorm / (totalNorm + eps), max=1.0)
-    // When clipCoef = 1.0 (norm within budget), multiplication is a no-op.
     // clipCoef = min(maxNorm / (norm + eps), 1.0) — cap at 1.0 so we never
-    // scale gradients UP. Implemented with fusible ops (clamp isn't in the
-    // tile-IR op registry): rawCoef * le(rawCoef, one) + gt(rawCoef, one).
-    const rawCoef = api.div(maxNorm, api.add(totalNormTensor, 1e-6));
-    const one = api.full([], 1.0);
-    const clipCoef = api.add(
-      api.mul(rawCoef, api.le(rawCoef, one)),
-      api.gt(rawCoef, one),
+    // scale gradients UP. When clipCoef = 1.0, multiplication is a no-op.
+    const clipCoef = api.minimum(
+      api.div(maxNorm, api.add(totalNormTensor, 1e-6)),
+      1.0,
     );
 
     // Scale all gradients by clipCoef (always — clipCoef=1 is identity)

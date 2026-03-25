@@ -1632,6 +1632,8 @@ export interface Torchlette {
   mul(a: Tensor | number, b: Tensor | number): Tensor;
   div(a: Tensor | number, b: Tensor | number): Tensor;
   pow(a: Tensor | number, b: Tensor | number): Tensor;
+  minimum(a: Tensor | number, b: Tensor | number): Tensor;
+  maximum(a: Tensor | number, b: Tensor | number): Tensor;
 }
 
 for (const opName of BINARY_AUTOGRAD_OPS) {

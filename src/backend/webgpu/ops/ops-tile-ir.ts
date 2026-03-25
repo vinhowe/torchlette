@@ -316,6 +316,8 @@ const WGSL_OP_TO_FUSION: Record<string, string> = {
   "*": "mul",
   "/": "div",
   pow: "pow",
+  min: "minimum",
+  max: "maximum",
 };
 
 /**

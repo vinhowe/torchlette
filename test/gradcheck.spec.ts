@@ -7,9 +7,9 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { OP_REGISTRY } from "../src/ops/registry";
 import type { Tensor } from "../src/frontend/torchlette";
 import { Torchlette } from "../src/frontend/torchlette";
+import { OP_REGISTRY } from "../src/ops/registry";
 import { gradcheck } from "../src/testing/gradcheck";
 
 // CPU-only, no fusion — pure f32 deterministic execution
@@ -58,6 +58,9 @@ describe(
     for (const [opName, def] of Object.entries(OP_REGISTRY)) {
       if (def.arity !== 2 || !def.ttGrad) continue;
       if (!(opName in api)) continue;
+      // Skip minimum/maximum — non-differentiable at a==b boundary.
+      // Tested manually below with non-overlapping values.
+      if (opName === "minimum" || opName === "maximum") continue;
 
       it(`binary: ${opName}`, async () => {
         const a = t(SAFE_BINARY_A, [2, 2]);
@@ -89,6 +92,30 @@ describe(
 // ============================================================================
 
 describe("gradcheck — hand-written", { timeout: 30_000 }, () => {
+  // =====================================================================
+  // minimum/maximum — non-differentiable at a==b, use separated values
+  // =====================================================================
+
+  it("minimum", async () => {
+    const a = t([1.0, 3.0, 2.0, 4.0], [2, 2]);
+    const b = t([2.0, 1.0, 4.0, 3.0], [2, 2]);
+    const r = await gradcheck(api, (x, y) => api.sum(api.minimum(x, y)), [
+      a,
+      b,
+    ]);
+    expect(r.pass, r.message).toBe(true);
+  });
+
+  it("maximum", async () => {
+    const a = t([1.0, 3.0, 2.0, 4.0], [2, 2]);
+    const b = t([2.0, 1.0, 4.0, 3.0], [2, 2]);
+    const r = await gradcheck(api, (x, y) => api.sum(api.maximum(x, y)), [
+      a,
+      b,
+    ]);
+    expect(r.pass, r.message).toBe(true);
+  });
+
   // =====================================================================
   // Reductions
   // =====================================================================

@@ -287,8 +287,8 @@ for (const [name, def] of Object.entries(OP_REGISTRY)) {
   if (name === "gelu_tanh" || name === "gelu_erf") continue;
   // Skip bitwise ops (not lazy engine ops)
   if (def.category === "bitwise") continue;
-  // Skip max/min (reductions in lazy engine, listed below with arity 1)
-  if (name === "max" || name === "min") continue;
+  // Note: min/max are no longer in OP_REGISTRY (renamed to minimum/maximum).
+  // The reduction ops are listed below with arity 1.
 
   GENERIC_OP_TABLE[name] = {
     arity: def.arity,
