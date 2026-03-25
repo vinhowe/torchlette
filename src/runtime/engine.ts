@@ -173,11 +173,6 @@ export class TidyDispatchMode implements DispatchMode {
       }
     }
     // Release references so GC can collect disposed RuntimeTensors immediately.
-    // Without this, the tracked Set holds strong refs to thousands of disposed
-    // tensors, preventing GC from collecting them until the TidyDispatchMode
-    // itself is collected. This causes storageTracker's WeakRef check to find
-    // "live" tensors that are actually disposed, keeping their storages in
-    // allStorages and creating a GC-dependent memory oscillation.
     this.tracked.clear();
     this.escaped.clear();
     return disposed;
@@ -1933,8 +1928,21 @@ export class RuntimeEngine {
 
   async markStep(): Promise<void> {
     this._debug_runEntryPoint(() => {
-      // No-op: token algebra and loc bindings removed.
-      // Runtime handles plan execution directly.
+      // Clean up engine state that grows unboundedly across steps.
+      // _baseState: ~2000 entries/step from temporary tensors. Keep only
+      // entries with active pins (model params, optimizer state).
+      for (const [baseId] of this._baseState) {
+        if (!this._basePinCount.has(baseId)) {
+          this._baseState.delete(baseId);
+        }
+      }
+      // committed: mutation ID sets grow ~3/param/step. Clear them — the
+      // baseCommitVersion is preserved for saved-tensor version checking.
+      for (const [, state] of this._baseState) {
+        state.committed.clear();
+      }
+      // savedTensors: should be empty after backward, but ensure cleanup.
+      this._savedTensors.clear();
     });
   }
 
