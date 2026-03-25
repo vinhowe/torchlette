@@ -462,6 +462,8 @@ const BINARY_OPS: Record<string, (x: number, y: number) => number> = {
   add: (x, y) => x + y,
   mul: (x, y) => x * y,
   pow: Math.pow,
+  minimum: Math.min,
+  maximum: Math.max,
 };
 
 // Generate exports from tables
@@ -470,6 +472,12 @@ export function add(a: Tensor, b: Tensor): Tensor {
 }
 export function mul(a: Tensor, b: Tensor): Tensor {
   return applyBinaryOp(a, b, BINARY_OPS.mul);
+}
+export function minimum(a: Tensor, b: Tensor): Tensor {
+  return applyBinaryOp(a, b, BINARY_OPS.minimum);
+}
+export function maximum(a: Tensor, b: Tensor): Tensor {
+  return applyBinaryOp(a, b, BINARY_OPS.maximum);
 }
 export function relu(a: Tensor): Tensor {
   return applyUnaryOp(a, UNARY_OPS.relu);

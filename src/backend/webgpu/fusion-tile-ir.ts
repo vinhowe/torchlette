@@ -149,6 +149,12 @@ export function applyFusedOp(
     case "ge":
       return a.ge(inputs[1]).select(ctx.f32(1), ctx.f32(0));
 
+    // -- Binary min/max --
+    case "minimum":
+      return a.min(inputs[1]);
+    case "maximum":
+      return a.max(inputs[1]);
+
     // -- Ternary --
     case "where":
       // where(cond, a, b) → select(b, a, cond > 0)

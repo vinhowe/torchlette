@@ -44,6 +44,8 @@ const binary =
 export const add: BinaryOp = binary("+");
 export const mul: BinaryOp = binary("*");
 export const pow: BinaryOp = binary("pow");
+export const minimum: BinaryOp = binary("min");
+export const maximum: BinaryOp = binary("max");
 
 export function sub(
   a: BackendTensor,

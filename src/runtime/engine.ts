@@ -2252,12 +2252,14 @@ for (const op of COMPARISON_OPS) {
 }
 
 // Simple binary ops: gradient specs live in OP_REGISTRY, dispatch via _binaryOp.
-const SIMPLE_BINARY_OPS = ["add", "mul", "pow"] as const;
+const SIMPLE_BINARY_OPS = ["add", "mul", "pow", "minimum", "maximum"] as const;
 
 export interface RuntimeEngine {
   add(a: TensorOrScalar, b: TensorOrScalar): Tensor;
   mul(a: TensorOrScalar, b: TensorOrScalar): Tensor;
   pow(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  minimum(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  maximum(a: TensorOrScalar, b: TensorOrScalar): Tensor;
 }
 
 for (const op of SIMPLE_BINARY_OPS) {

@@ -382,19 +382,35 @@ export const OP_REGISTRY: Record<string, OpDef> = {
       return [rt.mul(g, rt.mul(scalar, rt.pow(saved, scalar - 1)))];
     },
   },
-  min: {
+  // min/max are REDUCTION ops in the lazy engine, not binary elementwise.
+  // Use minimum/maximum for the binary elementwise versions (like PyTorch).
+  minimum: {
     arity: 2,
     fusible: true,
     vectorizable: true,
     category: "arithmetic",
     dtypeRule: "f32_required",
+    wgslFnName: "min",
+    saveBinary: true,
+    ttGrad: (rt, g, gs) => {
+      const sA = gs(0);
+      const sB = gs(1);
+      return [rt.mul(g, rt.le(sA, sB)), rt.mul(g, rt.gt(sA, sB))];
+    },
   },
-  max: {
+  maximum: {
     arity: 2,
     fusible: true,
     vectorizable: true,
     category: "arithmetic",
     dtypeRule: "f32_required",
+    wgslFnName: "max",
+    saveBinary: true,
+    ttGrad: (rt, g, gs) => {
+      const sA = gs(0);
+      const sB = gs(1);
+      return [rt.mul(g, rt.ge(sA, sB)), rt.mul(g, rt.lt(sA, sB))];
+    },
   },
   mod: {
     arity: 2,

@@ -38,9 +38,8 @@ for (const [name, def] of Object.entries(OP_REGISTRY)) {
 }
 // "cast" is fusible (mapped to cast_f16 etc. at codegen time)
 FUSIBLE_OPS.add("cast");
-// max/min are reductions in the lazy engine, not binary elementwise
-FUSIBLE_OPS.delete("max");
-FUSIBLE_OPS.delete("min");
+// min/max are reduction ops — NOT in the registry (use minimum/maximum for
+// binary elementwise). No need to delete them from FUSIBLE_OPS.
 
 /**
  * Check if an op can be fused.

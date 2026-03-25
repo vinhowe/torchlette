@@ -57,8 +57,8 @@ describe("Op Registry", () => {
         "mul",
         "div",
         "pow",
-        "min",
-        "max",
+        "minimum",
+        "maximum",
         "mod",
       ];
       for (const op of arithmetic) {

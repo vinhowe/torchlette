@@ -29,6 +29,8 @@ export const cpuBackend: Backend = {
     sub: numeric.sub,
     div: numeric.div,
     mul: numeric.mul,
+    minimum: numeric.minimum,
+    maximum: numeric.maximum,
     matmul: numeric.matmul,
     sqrt: numeric.sqrt,
     relu: numeric.relu,
