@@ -298,9 +298,11 @@ async function requestDeviceWithFallback(
   const adapterMaxStorageBuffers =
     adapter.limits?.maxStorageBuffersPerShaderStage ?? 8;
 
-  console.log(
-    `[WebGPU] Adapter limits: maxStorageBufferBindingSize=${adapterMaxStorage}, maxBufferSize=${adapterMaxBuffer}, maxStorageBuffersPerShaderStage=${adapterMaxStorageBuffers}`,
-  );
+  if (isProfilingEnabled()) {
+    console.log(
+      `[WebGPU] Adapter limits: maxStorageBufferBindingSize=${adapterMaxStorage}, maxBufferSize=${adapterMaxBuffer}, maxStorageBuffersPerShaderStage=${adapterMaxStorageBuffers}`,
+    );
+  }
 
   const requiredLimits: Record<string, number> = {
     maxStorageBufferBindingSize: adapterMaxStorage,
