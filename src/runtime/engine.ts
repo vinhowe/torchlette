@@ -1103,10 +1103,6 @@ export class RuntimeEngine {
     return this._viewOp("permute", a, shape, { dims: normalizedDims });
   }
 
-  contiguous(a: Tensor): Tensor {
-    return this._unaryOp("contiguous", a);
-  }
-
   narrow(a: Tensor, dim: number, start: number, length: number): Tensor {
     const rank = a.shape.length;
     if (dim < 0 || dim >= rank) {
