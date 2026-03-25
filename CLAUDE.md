@@ -98,40 +98,48 @@ GPU memory is managed deterministically via two-tier reachability — no GC depe
 - Periodic reclamation between plan segments (flush + pool flush as separate calls)
 - The `sharedEncoderWriteSet` WAW check must be kept
 
-## Performance Baselines (2026-03-24)
+## Performance Baselines (2026-03-25)
 
 ### Baseline A: DistilGPT-2, 512 tokens, Node/Dawn (V100)
 Steady-state ~213ms/step wall clock. Memory: 1645MB steady, zero leak. Pool reuse 68%. 525 dispatches/step. Top GPU: matmul 40ms (61%), fusedAttentionBwd 5.7ms, adamStep 3.2ms (8 dispatches, packed). Fusion: 15.7% forward, 7.3% backward (limited by V100's 10 storage buffer limit).
 
 ### Baseline B: DistilGPT-2, 128 tokens, Browser/Chrome (V100)
-**LoRA:** 316 tok/s steady. fwd=4ms, bwd=307ms. Uses fused LayerNorm, Embedding, Linear, scaledDotProductAttention, api.linear(). Selective checkpointing (MLP-only). GPU memory flat.
+**LoRA:** ~1050 tok/s peak, ~800 steady (GC degradation). fwd=5ms, bwd=80ms. Uses fused LayerNorm, Embedding, Linear, scaledDotProductAttention, api.linear(). Selective checkpointing (MLP-only). GPU-only gradient clipping (no CPU readback). Staging buffer loss readback overlaps with backward.
 
-**Full FT:** 89 tok/s steady. fwd=16ms, bwd=1100ms. GPU-bound at ~786ms/step GPU compute. Fence wait moved to markStep for honest phase timing + proper CPU/GPU overlap (was 47 tok/s before fence fix).
+**Full FT:** ~308 tok/s peak, ~160 steady (GC degradation). fwd=80ms, bwd=171ms. No CPU fences in training loop — all computation stays lazy on GPU. Fence awaited in markStep for honest phase timing.
+
+**Progressive slowdown:** Both modes degrade over ~200 steps due to V8 GC not collecting ~2 RuntimeTensor objects/step fast enough. GPU storage is flat — only JS object accumulation. Not a reference leak (objects are GC-eligible). See memory note for details.
 
 ### Baseline C: GPT-2 Medium, 512 tokens, Node/Dawn (V100)
 Steady-state ~162ms/step wall clock. Memory: 14.7GB steady, zero leak. Pool reuse 58%. 741/4449 nodes fused (16.7%). Top GPU: bare matmul 125ms (bwd), epilogue matmul ~49ms (fwd) + ~47ms (bwd), fusedAttentionBwd 22.5ms, adamStep 14.3ms (14 dispatches, packed). GPU is 81% matmul.
 
 ## Open Performance Targets
 
-### Remaining GPU targets (GPT-2 Medium, ranked)
+### Browser training targets (ranked by impact)
 
-1. **Per-shape matmul autotuning** — Infrastructure exists (`TORCHLETTE_AUTOTUNE=1`). Pre-seed cache for Medium shapes. ~5-10ms potential from sub-optimal tile configs on 1024-embed shapes.
+1. **Fix progressive slowdown** — ~2 RuntimeTensors/step accumulate because V8 GC doesn't collect them promptly. After ~200 steps, LoRA drops from 1050→800 tok/s. Root cause: `mul_` intermediates and transpose views created outside tidy scopes are GC-eligible but not promptly collected. Skipping RuntimeTensor wrappers for intermediates leaks GPU storage (FinalizationRegistry needs the wrapper). Needs a different approach — possibly explicit disposal of in-place op intermediates after plan execution.
 
-2. **Fuse bias-gradient sums** — 96 sum dispatches (5.1ms) from dBias = sum(dY, dim=0). Each followed by reshape. Extend reduction epilogue detector to handle reshape as valid epilogue. **~2-3ms savings.**
+2. **Add ternary op support to tile-IR** — `clamp(x, min, max)` is a WGSL built-in but not in the op registry. clipGradNorm works around this with le/gt/mul/add (4 ops instead of 1). Adding ternary op support would simplify this and enable other three-input ops.
 
-3. **Backward elementwise fusion** — 16.7% fusion rate. 97 standalone adds, 26 muls in backward. Graph reorder priority tuning may recover more fusion opportunities.
+3. **Fuse bias-gradient sums** — 244 sum dispatches in Full FT (22% of GPU time). Each `dBias = sum(gradOut, dims)` is a separate dispatch. Would need multi-output reduction support in tile-IR to batch independent same-dim reductions.
 
-### Framework completeness targets (high user impact)
+### Node/Dawn targets (GPT-2 Medium, ranked)
 
-4. **LR Schedulers** — StepLR, CosineAnnealingLR, etc. ~300 lines, pure math, zero risk.
-5. **Weight initialization** — kaiming_normal_, xavier_uniform_. ~200 lines.
-6. ~~**Gradient clipping**~~ — Implemented (clip_grad_norm_, clip_grad_value_).
-7. **Parameter groups** — per-layer LR in Adam/SGD. ~150 lines.
+4. **Per-shape matmul autotuning** — Infrastructure exists (`TORCHLETTE_AUTOTUNE=1`). Pre-seed cache for Medium shapes. ~5-10ms potential from sub-optimal tile configs on 1024-embed shapes.
+
+5. **Backward elementwise fusion** — 7.3% fusion rate on V100 (limited by 10 storage buffer limit). Apple Metal (96 buffers) would get much better fusion. Not actionable on V100.
+
+### Framework completeness targets
+
+6. **LR Schedulers** — StepLR, CosineAnnealingLR, etc. ~300 lines, pure math, zero risk.
+7. **Weight initialization** — kaiming_normal_, xavier_uniform_. ~200 lines.
+8. ~~**Gradient clipping**~~ — Implemented. Fully GPU (no CPU readback).
+9. **Parameter groups** — per-layer LR in Adam/SGD. ~150 lines.
 
 ### Architecture targets (long-term)
 
-8. **Serializable compiled plans** — Pre-compile full dispatch sequence to disk. Eliminates ~700ms cold start. Pipeline warmup already serializes individual pipelines; extend to full dispatch sequence.
-9. **Single-plan training step** — Merge forward/backward/optimizer into one plan. Punted — complexity outweighs benefit at current scale.
+10. **Serializable compiled plans** — Pre-compile full dispatch sequence to disk. Eliminates ~700ms cold start.
+11. **Forward/backward overlap via loss tensor preservation** — 4 approaches tried, all failed (see "What didn't work"). Needs dedicated readback staging buffer excluded from pool — `startScalarReadback` primitive added but only helps for loss readback, not clipGradNorm (which is now fully GPU anyway).
 
 ## What didn't work (don't re-attempt)
 
