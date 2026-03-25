@@ -108,7 +108,7 @@ Steady-state ~213ms/step wall clock. Memory: 1645MB steady, zero leak. Pool reus
 
 **Full FT:** ~308 tok/s peak, ~160 steady (GC degradation). fwd=80ms, bwd=171ms. No CPU fences in training loop — all computation stays lazy on GPU. Fence awaited in markStep for honest phase timing.
 
-**Progressive slowdown:** Both modes degrade over ~200 steps due to V8 GC not collecting ~2 RuntimeTensor objects/step fast enough. GPU storage is flat — only JS object accumulation. Not a reference leak (objects are GC-eligible). See memory note for details.
+**Progressive slowdown:** Reduced from 50%/200 steps to 20%/1000 steps by eliminating RuntimeTensor wrappers for in-place op intermediates (mul_, zero_, fill_). Remaining ~0.8 RT/step from autograd-escaped forward tensors — GC-eligible but V8 collects slowly. GPU storage flat at 292.
 
 ### Baseline C: GPT-2 Medium, 512 tokens, Node/Dawn (V100)
 Steady-state ~162ms/step wall clock. Memory: 14.7GB steady, zero leak. Pool reuse 58%. 741/4449 nodes fused (16.7%). Top GPU: bare matmul 125ms (bwd), epilogue matmul ~49ms (fwd) + ~47ms (bwd), fusedAttentionBwd 22.5ms, adamStep 14.3ms (14 dispatches, packed). GPU is 81% matmul.
