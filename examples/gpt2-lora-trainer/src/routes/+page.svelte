@@ -2,7 +2,9 @@
 import { onMount } from "svelte";
 import { generationStore } from "$lib/stores/generation.svelte";
 import { modelStore } from "$lib/stores/model.svelte";
-import { trainingStore } from "$lib/stores/training.svelte";
+import { DATASETS, trainingStore } from "$lib/stores/training.svelte";
+
+const datasets = DATASETS;
 
 // Fetch Shakespeare data on mount
 onMount(async () => {
@@ -186,7 +188,7 @@ function handleLoadModel() {
       </div>
     {/if}
 
-    <span class="text-xs text-slate-600 font-mono">distilgpt2</span>
+    <span class="text-xs text-slate-600 font-mono">gpt2 (124M)</span>
   </header>
 
   <!-- MAIN GRID -->
@@ -318,7 +320,7 @@ function handleLoadModel() {
         </div>
       {/if}
 
-      <!-- Data info + drop zone -->
+      <!-- Data: dataset picker + drop zone -->
       <div
         class="border border-dashed text-xs px-2 py-1.5 {dragging ? 'border-blue-500 bg-blue-950/30' : 'border-slate-700'}"
         role="region"
@@ -328,15 +330,27 @@ function handleLoadModel() {
         ondrop={onDrop}
       >
         {#if trainingStore.dataLoading}
-          <span class="text-amber-400">Fetching TinyShakespeare...</span>
+          <span class="text-amber-400">Loading dataset...</span>
         {:else if trainingStore.dataSource}
           <span class="text-slate-400">data:</span>
+          {" "}
           <span class="text-slate-300 font-mono">{trainingStore.dataSource}</span>
-          <span class="text-slate-500 font-mono ml-1">{fmtTokens(trainingStore.dataTokenCount)} tok</span>
-          <span class="text-slate-600 ml-2">drop .txt to replace</span>
+          {" "}
+          <span class="text-slate-500 font-mono">{fmtTokens(trainingStore.dataTokenCount)} tok</span>
+          {" "}
+          <span class="text-slate-600">drop .txt to replace</span>
         {:else}
           <span class="text-slate-500">Drop a .txt file here for training data</span>
         {/if}
+        <div class="flex gap-1 mt-1">
+          {#each datasets as ds}
+            <button
+              class="px-1.5 py-0.5 text-[10px] rounded {trainingStore.dataSource?.includes(ds.label) ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-300'}"
+              disabled={trainingStore.running || trainingStore.dataLoading}
+              onclick={() => trainingStore.loadDataset(ds.id)}
+            >{ds.label}</button>
+          {/each}
+        </div>
       </div>
     </div>
 

@@ -13,6 +13,34 @@ import { modelStore } from "./model.svelte";
 const TINY_SHAKESPEARE_URL =
   "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
 
+/** Built-in dataset options. Local files served from static/datasets/. */
+export const DATASETS = [
+  {
+    id: "shakespeare",
+    label: "Shakespeare",
+    size: "1.1 MB",
+    url: TINY_SHAKESPEARE_URL,
+  },
+  {
+    id: "austen",
+    label: "Jane Austen",
+    size: "755 KB",
+    url: "/datasets/austen.txt",
+  },
+  {
+    id: "lovecraft",
+    label: "Lovecraft",
+    size: "91 KB",
+    url: "/datasets/lovecraft.txt",
+  },
+  {
+    id: "aurelius",
+    label: "Marcus Aurelius",
+    size: "416 KB",
+    url: "/datasets/aurelius.txt",
+  },
+] as const;
+
 // Config
 let rank = $state(8);
 let alpha = $state(8);
@@ -61,14 +89,23 @@ const canTrain = $derived(
  */
 async function fetchShakespeare(): Promise<void> {
   if (dataText) return;
+  await loadDataset("shakespeare");
+}
+
+/**
+ * Load a built-in dataset by ID.
+ */
+async function loadDataset(id: string): Promise<void> {
+  const ds = DATASETS.find((d) => d.id === id);
+  if (!ds) return;
   dataLoading = true;
   try {
-    const resp = await fetch(TINY_SHAKESPEARE_URL);
+    const resp = await fetch(ds.url);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const text = await resp.text();
-    setData(text, "tinyshakespeare (1.1 MB)");
+    setData(text, `${ds.label} (${ds.size})`);
   } catch (e) {
-    error = `Failed to fetch Shakespeare: ${e instanceof Error ? e.message : e}`;
+    error = `Failed to fetch ${ds.label}: ${e instanceof Error ? e.message : e}`;
   } finally {
     dataLoading = false;
   }
@@ -289,6 +326,7 @@ export const trainingStore = {
 
   // Actions
   fetchShakespeare,
+  loadDataset,
   setData,
   handleFileDrop,
   startTraining,
