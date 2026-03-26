@@ -75,6 +75,18 @@ import {
 } from "../graph/engine-types";
 
 // ── Engine helpers ──────────────────────────────────────────────────────────
+/**
+ * Collect EngineTensor handles from a tidy() return value.
+ *
+ * Objects that implement `_engineTensor(): EngineTensor` (like the frontend
+ * Tensor class) return their handle without deep-recursing into internal
+ * fields. This prevents walking the autograd graph (gradNode → inputs →
+ * savedSlots → ...) which would mark every reachable tensor as "escaped",
+ * causing an O(graph_size) per-step _basePinCount leak.
+ *
+ * Plain objects and arrays are recursed into as before (for returning
+ * `{ loss, logits }` from tidy).
+ */
 function collectTensorHandles(value: unknown): EngineTensor[] {
   const out: EngineTensor[] = [];
   const seen = new Set<unknown>();
@@ -87,12 +99,24 @@ function collectTensorHandles(value: unknown): EngineTensor[] {
     if (typeof current !== "object") return;
     if (seen.has(current)) return;
     seen.add(current);
+
+    // Protocol: objects with _engineTensor() return their handle directly
+    // without deep-recursing into internal properties (autograd graph, etc.)
+    const obj = current as Record<string, unknown>;
+    if (typeof obj._engineTensor === "function") {
+      const handle = (obj._engineTensor as () => EngineTensor)();
+      if (handle instanceof EngineTensor) {
+        out.push(handle);
+      }
+      return; // Don't recurse into the tensor's internal fields
+    }
+
     if (Array.isArray(current)) {
       for (const entry of current) visit(entry);
       return;
     }
-    for (const entry of Object.values(current as Record<string, unknown>))
-      visit(entry);
+    // Plain objects (e.g., { loss, logits }) — recurse into values
+    for (const entry of Object.values(obj)) visit(entry);
   };
   visit(value);
   return out;
@@ -329,6 +353,19 @@ export class RuntimeEngine {
   private readonly _tidyScopes: TidyScope[] = [];
   private _asyncScopeContext: AsyncScope | null = null;
   private readonly _basePinCount = new Map<EngineBaseId, number>();
+  /** Auto-cleanup for EngineTensors GC'd without being disposed.
+   *  Handles saved-for-backward tensors that escape tidy and become
+   *  unreachable after backward clears autograd graph references. */
+  private readonly _etFinalizer = new FinalizationRegistry<EngineBaseId>(
+    (baseId) => {
+      const count = this._basePinCount.get(baseId) ?? 0;
+      if (count <= 1) {
+        this._basePinCount.delete(baseId);
+      } else {
+        this._basePinCount.set(baseId, count - 1);
+      }
+    },
+  );
   private _rngBasis: RngBasis = { algorithmId: 0, seed: 0 };
   private _rngDrawNonce = 0;
   private _rngCheckpointMode: "record" | "replay" | null = null;
@@ -1859,6 +1896,8 @@ export class RuntimeEngine {
       origin,
     );
     this._registerTensor(tensor);
+    this._etFinalizer.register(tensor, tensor.baseId, tensor);
+
     return tensor;
   }
 
@@ -1907,6 +1946,8 @@ export class RuntimeEngine {
       return;
     }
     tensor.disposed = true;
+    // Unregister from FinalizationRegistry — we're handling cleanup explicitly
+    this._etFinalizer.unregister(tensor);
     // Call disposal callback to free backend resources (GPU buffers, etc.)
     if (tensor.onDispose) {
       tensor.onDispose();

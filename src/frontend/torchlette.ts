@@ -1270,6 +1270,13 @@ export class Torchlette {
     const output = this._wrap(inner, requiresGrad);
 
     if (requiresGrad) {
+      // Keep autograd input tensors alive through tidy — their RuntimeTensors
+      // hold GPU buffers needed for backward. cleanupAutogradGraph disposes
+      // them after backward completes.
+      for (const tensor of inputs) {
+        this.keep(tensor);
+      }
+
       const savedSlots: SavedTensorSlot[] = [];
       const hooks = this._getSavedTensorHooks();
 
