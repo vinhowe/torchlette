@@ -381,6 +381,17 @@ export class Torchlette {
     );
   }
 
+  /**
+   * Set the global random seed for all subsequent random ops (rand, randn, bernoulli).
+   * All Torchlette instances sharing the same runtime use the same RNG state,
+   * so this affects all random generation globally.
+   *
+   * Usage: `api.manualSeed(42)` — equivalent to PyTorch's `torch.manual_seed(42)`.
+   */
+  manualSeed(seed: number): void {
+    this.runtime.setRngSeed(seed);
+  }
+
   rand(shape: number[], options?: TensorCreateOptions): Tensor {
     return this._wrap(
       this.runtime.rand(shape, options?.device),

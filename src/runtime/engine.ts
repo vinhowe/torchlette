@@ -1725,6 +1725,17 @@ export class RuntimeEngine {
     // No-op: token algebra removed. Kept for frontend.ts call site.
   }
 
+  /** Set the global RNG seed for random tensor creation ops
+   *  (rand, randn, bernoulli). Resets the counter so subsequent
+   *  ops produce a deterministic sequence from this seed.
+   *
+   *  Note: this controls GPU random ops only. Checkpoint RNG replay
+   *  uses a separate system (_rngBasis) that is not affected. */
+  setRngSeed(seed: number): void {
+    this._rngCounter = seed;
+  }
+
+  /** @deprecated Use setRngSeed() instead. */
   _debug_setRngBasis(basis: RngBasis): void {
     this._rngBasis = { ...basis };
     this._rngDrawNonce = 0;
