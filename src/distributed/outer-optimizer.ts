@@ -75,8 +75,8 @@ export class NesterovOuterOptimizer {
         // v = mu * v + delta
         const newV = api.add(api.mul(v, this.mu), delta);
 
-        // theta = theta - lr * v (Nesterov: use the NEW velocity)
-        api.copy_(param, api.sub(param, api.mul(newV, this.lr)));
+        // theta = theta + lr * v (apply averaged pseudo-gradient direction)
+        api.copy_(param, api.add(param, api.mul(newV, this.lr)));
 
         // Update stored velocity (keep it alive across tidy)
         api.keep(newV);
