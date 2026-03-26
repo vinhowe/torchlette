@@ -1,25 +1,27 @@
 /**
  * DiLoCo Node Agent
  *
- * A headless training worker that participates in distributed pretraining
- * via the gossip network. Runs on Node.js/Dawn (V100, A100, etc.).
+ * A headless GPT-2 124M training worker for distributed pretraining.
+ * Communicates pseudo-gradients via temp files (coordinator reads/writes).
+ * Uses E3M0 4-bit compression for gradient exchange.
  *
  * Usage:
- *   npx tsx tools/diloco-agent.ts [--seed 42] [--steps 500] [--rounds 10]
+ *   npx tsx tools/diloco-agent.ts
  *
- * Multiple agents on the same or different machines find each other via
- * the PeerJS cloud signaling server and exchange pseudo-gradients over
- * WebRTC data channels.
+ * Environment:
+ *   SEED=42        Global RNG seed (all agents must match)
+ *   STEPS=100      Inner training steps between syncs
+ *   ROUNDS=10      Number of DiLoCo sync rounds
+ *   AGENT_ID=0     Agent index (assigned by coordinator)
+ *   SYNC_DIR=/tmp/diloco  Directory for gradient exchange files
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
-import {
-  e3m0Dequantize,
-  e3m0Quantize,
-  NesterovOuterOptimizer,
-} from "../src/distributed";
+import { e3m0Dequantize, e3m0Quantize } from "../src/distributed";
 import { Torchlette } from "../src/frontend/torchlette";
-import { normal_ } from "../src/nn/init";
+import { clipGradNorm_ } from "../src/nn";
 import { Adam } from "../src/optim";
 
 // ============================================================================
@@ -27,149 +29,265 @@ import { Adam } from "../src/optim";
 // ============================================================================
 
 const SEED = parseInt(process.env.SEED ?? "42", 10);
-const INNER_STEPS = parseInt(process.env.STEPS ?? "50", 10);
+const INNER_STEPS = parseInt(process.env.STEPS ?? "100", 10);
 const OUTER_ROUNDS = parseInt(process.env.ROUNDS ?? "10", 10);
-const LR = parseFloat(process.env.LR ?? "1e-3");
-const OUTER_LR = parseFloat(process.env.OUTER_LR ?? "1.0");
-const OUTER_MU = parseFloat(process.env.OUTER_MU ?? "0.0");
-const SEQ_LEN = 32;
+const LR = parseFloat(process.env.LR ?? "4e-4");
+const SEQ_LEN = parseInt(process.env.SEQ_LEN ?? "128", 10);
+const MODEL_DIR = process.env.MODEL ?? "gpt2";
+const AGENT_ID = parseInt(process.env.AGENT_ID ?? "0", 10);
+const NUM_AGENTS = parseInt(process.env.NUM_AGENTS ?? "2", 10);
+const SYNC_DIR = process.env.SYNC_DIR ?? "/tmp/diloco";
 
-// Tiny GPT-2 for testing coordination (not real pretraining)
-const TINY_CONFIG = {
-  vocabSize: 256,
-  blockSize: 64,
-  numLayers: 2,
-  numHeads: 2,
-  embedDim: 64,
+const GPT2_CONFIG = {
+  vocabSize: 50257,
+  blockSize: 1024,
+  numLayers: 12,
+  numHeads: 12,
+  embedDim: 768,
   dropoutRate: 0,
 };
 
+const log = (msg: string) => console.error(`[agent-${AGENT_ID}] ${msg}`);
+
 // ============================================================================
-// Gossip (simplified for Node — no PeerJS, use stdin/stdout IPC)
+// File-based sync protocol
 // ============================================================================
 
 /**
- * For local testing, agents communicate via a coordinator process that
- * pipes messages between them. Each agent reads JSON lines from stdin
- * and writes JSON lines to stdout.
- *
- * Protocol:
- *   Agent → Coordinator: { type: "ready", agentId: string }
- *   Agent → Coordinator: { type: "pseudograd", agentId: string, round: number, data: number[][] }
- *   Coordinator → Agent: { type: "averaged", round: number, data: number[][] }
- *   Coordinator → Agent: { type: "start", agentId: string, numAgents: number }
+ * Write compressed pseudo-gradients to a file.
+ * Format: numParams (u32) + per-param: numValues (u32) + codes + scales
  */
+function writePseudoGrads(pseudoGrads: Float32Array[], round: number): void {
+  const parts: Buffer[] = [];
 
-let agentId = `agent-${process.pid}`;
-const pendingAverages = new Map<number, (grads: Float32Array[]) => void>();
+  // Header: numParams
+  const header = Buffer.alloc(4);
+  header.writeUInt32LE(pseudoGrads.length, 0);
+  parts.push(header);
 
-function sendMessage(msg: object): void {
-  process.stdout.write(JSON.stringify(msg) + "\n");
-}
+  for (const pg of pseudoGrads) {
+    const padded = new Float32Array(Math.ceil(pg.length / 8) * 8);
+    padded.set(pg);
+    const { codes, scales } = e3m0Quantize(padded);
 
-function setupIPC(): void {
-  let buf = "";
-  process.stdin.setEncoding("utf8");
-  process.stdin.on("data", (chunk: string) => {
-    buf += chunk;
-    const lines = buf.split("\n");
-    buf = lines.pop()!;
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const msg = JSON.parse(line);
-        handleMessage(msg);
-      } catch {}
-    }
-  });
-}
+    // Per-param header: numValues (u32) + codesLen (u32) + scalesLen (u32)
+    const paramHeader = Buffer.alloc(12);
+    paramHeader.writeUInt32LE(pg.length, 0);
+    paramHeader.writeUInt32LE(codes.byteLength, 4);
+    paramHeader.writeUInt32LE(scales.byteLength, 8);
+    parts.push(paramHeader);
 
-function handleMessage(msg: any): void {
-  if (msg.type === "start") {
-    agentId = msg.agentId;
-    console.error(`[${agentId}] Started, ${msg.numAgents} agents in swarm`);
-  } else if (msg.type === "averaged") {
-    const resolve = pendingAverages.get(msg.round);
-    if (resolve) {
-      const grads = msg.data.map((arr: number[]) => new Float32Array(arr));
-      resolve(grads);
-      pendingAverages.delete(msg.round);
-    }
+    parts.push(Buffer.from(codes.buffer, codes.byteOffset, codes.byteLength));
+    parts.push(Buffer.from(scales));
   }
+
+  const filePath = path.join(SYNC_DIR, `grad-${AGENT_ID}-${round}.bin`);
+  fs.writeFileSync(filePath, Buffer.concat(parts));
 }
 
-/** Send pseudo-gradients and wait for averaged result. */
-function exchangePseudoGrads(
-  pseudoGrads: Float32Array[],
-  round: number,
-): Promise<Float32Array[]> {
-  return new Promise((resolve) => {
-    pendingAverages.set(round, resolve);
-    sendMessage({
-      type: "pseudograd",
-      agentId,
-      round,
-      data: pseudoGrads.map((pg) => Array.from(pg)),
-    });
+/** Read and decompress pseudo-gradients from a file. */
+function readPseudoGrads(filePath: string): Float32Array[] {
+  const data = fs.readFileSync(filePath);
+  let offset = 0;
+
+  const numParams = data.readUInt32LE(offset);
+  offset += 4;
+  const result: Float32Array[] = [];
+
+  for (let i = 0; i < numParams; i++) {
+    const numValues = data.readUInt32LE(offset);
+    offset += 4;
+    const codesLen = data.readUInt32LE(offset);
+    offset += 4;
+    const scalesLen = data.readUInt32LE(offset);
+    offset += 4;
+
+    const codes = new Uint32Array(
+      data.buffer.slice(
+        data.byteOffset + offset,
+        data.byteOffset + offset + codesLen,
+      ),
+    );
+    offset += codesLen;
+
+    const scales = new Uint8Array(
+      data.buffer.slice(
+        data.byteOffset + offset,
+        data.byteOffset + offset + scalesLen,
+      ),
+    );
+    offset += scalesLen;
+
+    const padLen = Math.ceil(numValues / 8) * 8;
+    const restored = e3m0Dequantize(codes, scales, padLen);
+    result.push(restored.slice(0, numValues));
+  }
+
+  return result;
+}
+
+/** Wait for a file to appear (polling). */
+function waitForFile(filePath: string, timeoutMs = 300000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const check = () => {
+      if (fs.existsSync(filePath)) {
+        resolve();
+        return;
+      }
+      if (Date.now() - start > timeoutMs) {
+        reject(new Error(`Timeout waiting for ${filePath}`));
+        return;
+      }
+      setTimeout(check, 100);
+    };
+    check();
   });
+}
+
+// ============================================================================
+// Data + Model Loading (reused from previous version)
+// ============================================================================
+
+async function loadTokenizer(modelDir: string) {
+  const { GPT2Tokenizer } = await import(
+    "../examples/gpt2-lora-trainer/src/lib/torchlette/tokenizer"
+  );
+  const vocabPath = path.join(process.cwd(), "models", modelDir, "vocab.json");
+  const mergesPath = path.join(process.cwd(), "models", modelDir, "merges.txt");
+  const vocabJson = JSON.parse(fs.readFileSync(vocabPath, "utf-8"));
+  const mergesText = fs.readFileSync(mergesPath, "utf-8");
+  const tokenizer = new GPT2Tokenizer();
+  tokenizer.load(
+    vocabJson,
+    mergesText.split("\n").filter((l: string) => l && !l.startsWith("#")),
+  );
+  return tokenizer;
+}
+
+function loadTrainingTokens(tokenizer: any): number[] {
+  const textFiles = [
+    "examples/gpt2-lora-trainer/static/datasets/austen.txt",
+    "examples/gpt2-lora-trainer/static/datasets/lovecraft.txt",
+    "examples/gpt2-lora-trainer/static/datasets/aurelius.txt",
+  ];
+  const filePath = path.join(
+    process.cwd(),
+    textFiles[AGENT_ID % textFiles.length],
+  );
+  if (!fs.existsSync(filePath)) {
+    log(`Data not found: ${filePath}, using synthetic`);
+    return tokenizer.encode(
+      "The quick brown fox jumps over the lazy dog. ".repeat(500),
+    );
+  }
+  const text = fs.readFileSync(filePath, "utf-8");
+  log(
+    `Loaded ${(text.length / 1024).toFixed(0)}KB from ${path.basename(filePath)}`,
+  );
+  return tokenizer.encode(text);
+}
+
+async function loadModel(api: Torchlette, modelDir: string) {
+  const { GPT2WithLoRA } = await import(
+    "../examples/gpt2-lora-trainer/src/lib/torchlette/gpt2-lora"
+  );
+  const model = new GPT2WithLoRA(
+    api,
+    GPT2_CONFIG,
+    { rank: 1, alpha: 1 },
+    "webgpu",
+  );
+
+  const modelPath = path.join(
+    process.cwd(),
+    "models",
+    modelDir,
+    "model.safetensors",
+  );
+  const buf = fs.readFileSync(modelPath);
+  const headerLen = Number(
+    new DataView(buf.buffer, buf.byteOffset, 8).getBigUint64(0, true),
+  );
+  const header = JSON.parse(
+    new TextDecoder().decode(buf.subarray(8, 8 + headerLen)),
+  );
+  const dataOffset = 8 + headerLen;
+
+  const weights = new Map<string, { data: Float32Array; shape: number[] }>();
+  for (const [name, meta] of Object.entries(header) as [string, any][]) {
+    if (name === "__metadata__") continue;
+    const { dtype, shape, data_offsets } = meta;
+    const [start, end] = data_offsets;
+    const raw = buf.subarray(dataOffset + start, dataOffset + end);
+    let f32: Float32Array;
+    if (dtype === "F32") {
+      f32 = new Float32Array(new Uint8Array(raw).slice().buffer);
+    } else if (dtype === "F16") {
+      const u16 = new Uint16Array(
+        raw.buffer,
+        raw.byteOffset,
+        raw.byteLength / 2,
+      );
+      f32 = new Float32Array(u16.length);
+      for (let i = 0; i < u16.length; i++) {
+        const h = u16[i];
+        const s = (h >> 15) & 1,
+          e = (h >> 10) & 0x1f,
+          m = h & 0x3ff;
+        if (e === 0) f32[i] = (s ? -1 : 1) * (m / 1024) * 2 ** -14;
+        else if (e === 31) f32[i] = m === 0 ? (s ? -Infinity : Infinity) : NaN;
+        else f32[i] = (s ? -1 : 1) * (1 + m / 1024) * 2 ** (e - 15);
+      }
+    } else continue;
+    weights.set(name.replace(/^transformer\./, ""), {
+      data: new Float32Array(f32),
+      shape,
+    });
+  }
+  model.loadBaseWeights(weights);
+  return model;
 }
 
 // ============================================================================
 // Training
 // ============================================================================
 
-/** Simple repeating text data (byte-level). */
-function generateData(seed: number): number[] {
-  const texts = [
-    "the cat sat on the mat. the dog ran in the park. ",
-    "once upon a time in a land far away there lived a king. ",
-    "the quick brown fox jumps over the lazy dog again and again. ",
-    "to be or not to be that is the question. all the world is a stage. ",
-  ];
-  // Each agent gets a different text based on seed
-  const text = texts[seed % texts.length];
-  const data: number[] = [];
-  for (let i = 0; i < 2000; i++) {
-    data.push(text.charCodeAt(i % text.length));
-  }
-  return data;
-}
-
 async function trainStep(
   api: Torchlette,
   model: any,
   optimizer: Adam,
+  params: any[],
   tokens: number[],
   offset: number,
 ): Promise<number> {
-  const start = offset % (tokens.length - SEQ_LEN - 1);
-  const inputData = tokens.slice(start, start + SEQ_LEN);
-  const targetData = tokens.slice(start + 1, start + SEQ_LEN + 1);
+  const start = offset % Math.max(1, tokens.length - SEQ_LEN - 1);
+  const input = api.tensorFromArray(
+    tokens.slice(start, start + SEQ_LEN),
+    [1, SEQ_LEN],
+    { device: "webgpu" },
+  );
+  const target = api.tensorFromArray(
+    tokens.slice(start + 1, start + SEQ_LEN + 1),
+    [1, SEQ_LEN],
+    { device: "webgpu" },
+  );
 
   await api.beginStep();
-  const input = api.tensorFromArray(inputData, [1, SEQ_LEN], {
-    device: "webgpu",
-  });
-  const target = api.tensorFromArray(targetData, [1, SEQ_LEN], {
-    device: "webgpu",
-  });
-
   const loss = api.tidy(() => {
     const { loss: l } = model.forwardWithLoss(input, target);
     api.keep(l);
     return l;
   });
-
   const lossVal = await loss.item();
   await loss.backward();
+  clipGradNorm_(api, params, 1.0);
   optimizer.step();
   optimizer.zeroGrad();
-
   input.dispose();
   target.dispose();
   api.endStep();
   await api.markStep();
-
   return lossVal;
 }
 
@@ -178,123 +296,139 @@ async function trainStep(
 // ============================================================================
 
 async function main() {
-  setupIPC();
+  fs.mkdirSync(SYNC_DIR, { recursive: true });
 
   const ok = await initWebGPU();
   if (!ok) {
-    console.error("WebGPU not available");
+    log("WebGPU not available");
     process.exit(1);
   }
 
   const api = new Torchlette("webgpu", { enableFusion: true });
-
-  // All agents use the same seed for identical starting weights
   api.manualSeed(SEED);
 
-  // Create tiny model
-  const { GPT2WithLoRA } = await import(
-    "../examples/gpt2-lora-trainer/src/lib/torchlette/gpt2-lora"
-  );
-  const loraConfig = { rank: 4, alpha: 4 };
-  const model = new GPT2WithLoRA(api, TINY_CONFIG, loraConfig, "webgpu");
+  log(`Loading model (${MODEL_DIR})...`);
+  const model = await loadModel(api, MODEL_DIR);
   model.train(true);
-  const params = model.getLoRAParameters();
+  model.enableCheckpointing(true);
+  model.setFullFinetuning(true);
+  const params = model.getAllParameters();
+  const totalParams = params.reduce(
+    (s, p) => s + p.shape.reduce((a, b) => a * b, 1),
+    0,
+  );
 
-  // Each agent gets different training data (use PID for uniqueness before ID assignment)
-  const tokens = generateData(process.pid);
-
-  const outerOpt = new NesterovOuterOptimizer(api, {
-    lr: OUTER_LR,
-    momentum: OUTER_MU,
-  });
+  log("Loading tokenizer...");
+  const tokenizer = await loadTokenizer(MODEL_DIR);
+  log("Loading training data...");
+  const tokens = loadTrainingTokens(tokenizer);
+  log(`${tokens.length} tokens, ${totalParams.toLocaleString()} params`);
 
   // Signal ready
-  sendMessage({ type: "ready", agentId });
+  fs.writeFileSync(path.join(SYNC_DIR, `ready-${AGENT_ID}`), "");
 
-  // Wait for start signal
-  await new Promise<void>((resolve) => {
-    const check = () => {
-      if (agentId.startsWith("agent-") && agentId !== `agent-${process.pid}`) {
-        // Got reassigned by coordinator
-      }
-      // Check periodically — start signal comes via handleMessage
-      const origHandler = handleMessage;
-      const wrapped = (msg: any) => {
-        origHandler(msg);
-        if (msg.type === "start") resolve();
-      };
-      // Replace handler temporarily
-      (globalThis as any).__handleMsg = wrapped;
-    };
-    // Actually, just wait for stdin data
-    const onData = () => {
-      // Start signal will be handled by handleMessage which was already set up
-      // Just resolve after a short delay to let the message process
-      setTimeout(resolve, 100);
-    };
-    process.stdin.once("data", onData);
-  });
-
-  console.error(
-    `[${agentId}] Training: ${OUTER_ROUNDS} rounds × ${INNER_STEPS} steps`,
+  // Wait for all agents to be ready
+  for (let i = 0; i < NUM_AGENTS; i++) {
+    await waitForFile(path.join(SYNC_DIR, `ready-${i}`));
+  }
+  log(
+    `All ${NUM_AGENTS} agents ready. Training: ${OUTER_ROUNDS} rounds × ${INNER_STEPS} steps`,
   );
 
   for (let round = 0; round < OUTER_ROUNDS; round++) {
+    const roundStart = performance.now();
+
     // Snapshot global params
     const globalSnapshot: Float32Array[] = [];
-    for (const p of params) {
+    for (const p of params)
       globalSnapshot.push(new Float32Array(await p.cpu()));
-    }
 
-    // Inner training loop
-    const innerOpt = new Adam(params, { lr: LR }, api);
+    // Inner training
+    const innerOpt = new Adam(params, { lr: LR, weightDecay: 0.1 }, api);
     const losses: number[] = [];
     for (let step = 0; step < INNER_STEPS; step++) {
-      const offset = (round * INNER_STEPS + step) * SEQ_LEN;
-      const l = await trainStep(api, model, innerOpt, tokens, offset);
+      const l = await trainStep(
+        api,
+        model,
+        innerOpt,
+        params,
+        tokens,
+        (round * INNER_STEPS + step) * SEQ_LEN,
+      );
       losses.push(l);
+      if (step % 25 === 0) {
+        const avg =
+          losses.slice(-10).reduce((a, b) => a + b, 0) /
+          Math.min(10, losses.length);
+        log(`  step ${step}: loss=${avg.toFixed(4)}`);
+      }
     }
-    const avgLoss = losses.reduce((a, b) => a + b, 0) / losses.length;
 
-    // Compute pseudo-gradients
+    // Compute + write compressed pseudo-gradients
     const pseudoGrads: Float32Array[] = [];
     for (let i = 0; i < params.length; i++) {
-      const localData = await params[i].cpu();
-      const delta = new Float32Array(localData.length);
-      for (let j = 0; j < delta.length; j++) {
-        delta[j] = localData[j] - globalSnapshot[i][j];
-      }
+      const local = await params[i].cpu();
+      const delta = new Float32Array(local.length);
+      for (let j = 0; j < delta.length; j++)
+        delta[j] = local[j] - globalSnapshot[i][j];
       pseudoGrads.push(delta);
     }
+    writePseudoGrads(pseudoGrads, round);
+    log(`Wrote pseudo-grads (round ${round})`);
 
-    // Exchange with other agents and get averaged result
-    const avgPseudoGrads = await exchangePseudoGrads(pseudoGrads, round);
+    // Wait for all agents to write their gradients
+    for (let i = 0; i < NUM_AGENTS; i++) {
+      await waitForFile(path.join(SYNC_DIR, `grad-${i}-${round}.bin`));
+    }
 
-    // Restore to snapshot + apply outer update
+    // Read and average all agents' pseudo-gradients
+    const avgGrads: Float32Array[] = pseudoGrads.map(
+      (pg) => new Float32Array(pg.length),
+    );
+    for (let a = 0; a < NUM_AGENTS; a++) {
+      const grads = readPseudoGrads(
+        path.join(SYNC_DIR, `grad-${a}-${round}.bin`),
+      );
+      for (let p = 0; p < grads.length; p++) {
+        for (let j = 0; j < grads[p].length; j++) {
+          avgGrads[p][j] += grads[p][j] / NUM_AGENTS;
+        }
+      }
+    }
+
+    // Apply outer update: snapshot + averaged pseudo-gradient
     await api.beginStep();
     for (let i = 0; i < params.length; i++) {
       const updated = new Float32Array(globalSnapshot[i].length);
       for (let j = 0; j < updated.length; j++) {
-        updated[j] = globalSnapshot[i][j] + avgPseudoGrads[i][j];
+        updated[j] = globalSnapshot[i][j] + avgGrads[i][j];
       }
-      const t = api.tensorFromArray(Array.from(updated), params[i].shape, {
-        device: "webgpu",
-      });
-      api.copy_(params[i], t);
+      api.copy_(
+        params[i],
+        api.tensorFromArray(Array.from(updated), params[i].shape, {
+          device: "webgpu",
+        }),
+      );
     }
     api.endStep();
     await api.markStep();
 
-    console.error(`[${agentId}] round ${round}: loss=${avgLoss.toFixed(4)}`);
+    const elapsed = ((performance.now() - roundStart) / 1000).toFixed(1);
+    const avgLoss = losses.reduce((a, b) => a + b, 0) / losses.length;
+    const gradSize = fs.statSync(
+      path.join(SYNC_DIR, `grad-${AGENT_ID}-${round}.bin`),
+    ).size;
+    log(
+      `round ${round}: loss=${avgLoss.toFixed(4)}, ${elapsed}s, grad=${(gradSize / 1024 / 1024).toFixed(1)}MB`,
+    );
   }
 
-  console.error(`[${agentId}] Done`);
-  outerOpt.dispose();
+  log("Done");
   await destroyWebGPU();
   process.exit(0);
 }
 
 main().catch((e) => {
-  console.error(`[${agentId}] FATAL:`, e);
+  log(`FATAL: ${e}`);
   process.exit(1);
 });
