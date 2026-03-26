@@ -79,6 +79,10 @@ interface ReductionConfig {
     ops: ReductionEpilogueOpDesc[];
     outputDtype: DType;
   };
+  /** Batch N independent same-shape reductions into one kernel (default: 1).
+   *  When > 1, bindings are in0..inN-1 (read) + out0..outN-1 (read_write).
+   *  Requires dim (no full reduction) and no preamble/epilogue. */
+  count?: number;
 }
 
 // ============================================================================
@@ -241,10 +245,12 @@ function buildEpilogueBindings(
  * All preamble/epilogue/reduce-op combinations compose cleanly.
  */
 export function makeReductionSpec(config: ReductionConfig): TileKernelSpec {
-  const { reduceOp, dim, preamble, epilogue } = config;
+  const { reduceOp, dim, preamble, epilogue, count = 1 } = config;
+  const batched = count > 1;
 
   // --- Name ---
   const parts: string[] = [reduceOp];
+  if (batched) parts.push(`batched${count}`);
   if (dim) {
     parts.push(dim.parallel ? "par" : "seq");
     parts.push(dim.inputShape.join("x"));
@@ -259,19 +265,26 @@ export function makeReductionSpec(config: ReductionConfig): TileKernelSpec {
 
   // --- Bindings ---
   const bindings: Record<string, BindingSpec> = {};
-  if (preamble) {
-    for (let i = 0; i < preamble.totalInputs; i++) {
-      bindings[`in${i}`] = {
-        storage: "read",
-        type: (preamble.inputDtypes[i] || "f32") as DataType,
-      };
-    }
+  if (batched) {
+    for (let i = 0; i < count; i++)
+      bindings[`in${i}`] = { storage: "read", type: "f32" };
+    for (let i = 0; i < count; i++)
+      bindings[`out${i}`] = { storage: "read_write", type: "f32" };
   } else {
-    bindings.input = { storage: "read", type: "f32" };
+    if (preamble) {
+      for (let i = 0; i < preamble.totalInputs; i++) {
+        bindings[`in${i}`] = {
+          storage: "read",
+          type: (preamble.inputDtypes[i] || "f32") as DataType,
+        };
+      }
+    } else {
+      bindings.input = { storage: "read", type: "f32" };
+    }
+    if (epilogue) Object.assign(bindings, buildEpilogueBindings(epilogue.ops));
+    const outType = epilogue ? dtypeToTileIR(epilogue.outputDtype) : "f32";
+    bindings.out = { storage: "read_write", type: outType };
   }
-  if (epilogue) Object.assign(bindings, buildEpilogueBindings(epilogue.ops));
-  const outType = epilogue ? dtypeToTileIR(epilogue.outputDtype) : "f32";
-  bindings.out = { storage: "read_write", type: outType };
 
   const needsF16 =
     preamble?.inputDtypes.some((d) => d === "f16") ||
@@ -370,31 +383,45 @@ export function makeReductionSpec(config: ReductionConfig): TileKernelSpec {
       const idx = ctx.globalId(0);
       ctx.ifThen(idx.ge(ctx.uniform("outSize")), () => ctx.emitReturn());
 
+      // Helpers that unify single/batched paths
+      const load = (i: number, off: BlockExpr) =>
+        batched ? ctx.load(`in${i}`, off) : emitLoad(ctx, off);
+      const store = (i: number, val: BlockExpr) =>
+        ctx.emitStore(
+          batched ? `out${i}` : "out",
+          idx,
+          batched ? val : finalize(ctx, val, idx),
+        );
+
       const reductionSize = ctx.uniform("reductionSize");
-      let resultExpr: BlockExpr;
 
       if (reduceOp === "sum") {
-        // Sum: start from 0, addAssign
-        const acc = ctx.emitVar("total", "f32", ctx.f32(0));
+        const accs = [];
+        for (let i = 0; i < count; i++)
+          accs.push(ctx.emitVar(`t${i}`, "f32", ctx.f32(0)));
         ctx.forRange(ctx.u32(0), reductionSize, (r) => {
           const off = buildInputOffset(ctx, idx, r, dim);
-          acc.addAssign(emitLoad(ctx, off));
+          for (let i = 0; i < count; i++) accs[i].addAssign(load(i, off));
         });
-        resultExpr = acc.get();
+        for (let i = 0; i < count; i++) store(i, accs[i].get());
       } else {
-        // Max/Min: start from first element, update with max/min
         const firstOff = buildInputOffset(ctx, idx, ctx.u32(0), dim);
-        const acc = ctx.emitVar("accVal", "f32", emitLoad(ctx, firstOff));
+        const accs = [];
+        for (let i = 0; i < count; i++)
+          accs.push(ctx.emitVar(`a${i}`, "f32", load(i, firstOff)));
         ctx.forRange(ctx.u32(1), reductionSize, (r) => {
           const off = buildInputOffset(ctx, idx, r, dim);
-          const val = emitLoad(ctx, off);
-          acc.set(reduceOp === "max" ? acc.get().max(val) : acc.get().min(val));
+          for (let i = 0; i < count; i++) {
+            const val = load(i, off);
+            accs[i].set(
+              reduceOp === "max"
+                ? accs[i].get().max(val)
+                : accs[i].get().min(val),
+            );
+          }
         });
-        resultExpr = acc.get();
+        for (let i = 0; i < count; i++) store(i, accs[i].get());
       }
-
-      const final = finalize(ctx, resultExpr, idx);
-      ctx.emitStore("out", idx, final);
     },
   };
 }

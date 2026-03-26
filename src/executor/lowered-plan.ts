@@ -146,6 +146,17 @@ interface LoweredAdamBatchAction {
   nodeIndices: number[];
 }
 
+/** A batch of consecutive same-config reduction nodes. */
+interface LoweredBatchedReductionAction {
+  kind: "batched-reduction";
+  /** Plan-node indices for all reduction nodes in this batch. */
+  nodeIndices: number[];
+  /** Reduction op (sum, max, min). */
+  reduceOp: string;
+  /** Reduction config from the first node's payload. */
+  payload: { dim: number | number[]; keepdim?: boolean };
+}
+
 /** A buffer reclaim point (flushSharedEncoder + flushBufferPool). */
 interface LoweredReclaimAction {
   kind: "reclaim";
@@ -182,6 +193,7 @@ type LoweredAction =
   | LoweredNodeAction
   | LoweredMatmulEpilogueAction
   | LoweredAdamBatchAction
+  | LoweredBatchedReductionAction
   | LoweredReclaimAction
   | LoweredRowProgramAction;
 
@@ -232,12 +244,165 @@ const VIEW_OPS: ReadonlySet<string> = new Set([
  */
 export const ENCODER_COPY_OPS: ReadonlySet<string> = new Set(["scatterAdd"]);
 
+/**
+ * Merge non-adjacent same-config sequential reduction actions into batched
+ * dispatches. Safe when no intervening action consumes the output of an
+ * earlier reduction in the group (i.e., the reductions are independent).
+ *
+ * Replaces individual sequential actions with a single batched-reduction
+ * action at the position of the LAST member. Earlier members become
+ * prologue-skip (no-op). This preserves topological order — the batch
+ * executes only after all its members' inputs are ready.
+ */
+function mergeBatchableReductions(
+  actions: LoweredAction[],
+  planNodes: LazyIRNode[],
+): void {
+  // 1. Find sequential reduction actions and group by config key
+  const groups = new Map<
+    string,
+    Array<{ actionIndex: number; nodeIndex: number }>
+  >();
+  for (let i = 0; i < actions.length; i++) {
+    const a = actions[i];
+    if (a.kind !== "sequential") continue;
+    const node = planNodes[a.nodeIndex];
+    if (!isReductionOp(node.op) || node.payload?.dim == null) continue;
+    const key = reductionDimKey(node);
+    let group = groups.get(key);
+    if (!group) {
+      group = [];
+      groups.set(key, group);
+    }
+    group.push({ actionIndex: i, nodeIndex: a.nodeIndex });
+  }
+
+  // 2. For each group with ≥2 members, check independence and merge
+  for (const [, members] of groups) {
+    if (members.length < 2) continue;
+
+    // Collect node indices in this group
+    const groupNodeIndices = new Set(members.map((m) => m.nodeIndex));
+
+    // Check: no action between first and last member reads from any member's output.
+    // An action reads from a node if any of its plan nodes' inputs reference a group member.
+    const firstIdx = members[0].actionIndex;
+    const lastIdx = members[members.length - 1].actionIndex;
+    let safe = true;
+    for (let i = firstIdx + 1; i < lastIdx && safe; i++) {
+      const a = actions[i];
+      const nodeIndices = getActionNodeIndices(a);
+      for (const ni of nodeIndices) {
+        if (groupNodeIndices.has(ni)) continue; // skip self
+        const node = planNodes[ni];
+        if (!node) continue;
+        for (const inp of node.inputs) {
+          if (inp.kind === "pending" && groupNodeIndices.has(inp.node.id)) {
+            // This fails if node IDs don't match plan indices.
+            // Node IDs and plan indices are different — need to map.
+            // Actually, inp.node is the LazyIRNode itself, and we stored
+            // planNode indices in groupNodeIndices. Let's check planNodes instead.
+          }
+        }
+      }
+    }
+
+    // Safety check: no action between first and last member can depend
+    // on any group member's output. This means the sum outputs must only
+    // be consumed AFTER the last member's position (e.g., by the optimizer).
+    safe = true;
+    for (let mi = 0; mi < members.length - 1 && safe; mi++) {
+      const memberNode = planNodes[members[mi].nodeIndex];
+      for (let ai = members[mi].actionIndex + 1; ai <= lastIdx; ai++) {
+        for (const ni of getActionNodeIndices(actions[ai])) {
+          if (groupNodeIndices.has(ni)) continue;
+          const depNode = planNodes[ni];
+          if (!depNode) continue;
+          for (const inp of depNode.inputs) {
+            if (inp.kind === "pending" && inp.node === memberNode) {
+              safe = false;
+              break;
+            }
+          }
+          if (!safe) break;
+        }
+        if (!safe) break;
+      }
+    }
+
+    if (!safe) continue;
+
+    // 3. Merge: replace last member with batch, earlier members become no-ops
+    const firstNode = planNodes[members[0].nodeIndex];
+    actions[lastIdx] = {
+      kind: "batched-reduction",
+      nodeIndices: members.map((m) => m.nodeIndex),
+      reduceOp: firstNode.op,
+      payload: {
+        dim: firstNode.payload.dim,
+        keepdim: firstNode.payload.keepdim,
+      },
+    };
+    for (let mi = 0; mi < members.length - 1; mi++) {
+      actions[members[mi].actionIndex] = {
+        kind: "prologue-skip",
+        nodeIndex: members[mi].nodeIndex,
+      };
+    }
+  }
+}
+
+/** Get all plan-node indices referenced by an action. */
+function getActionNodeIndices(action: LoweredAction): number[] {
+  switch (action.kind) {
+    case "sequential":
+    case "view":
+    case "data-source":
+    case "prologue-skip":
+      return [action.nodeIndex];
+    case "fused":
+      return action.coveredNodeIndices;
+    case "matmul-epilogue":
+      return action.coveredNodeIndices;
+    case "adam-batch":
+      return action.nodeIndices;
+    case "batched-reduction":
+      return action.nodeIndices;
+    case "row-program":
+      return action.coveredNodeIndices;
+    case "reclaim":
+      return [];
+  }
+}
+
 // (LoweredPlanBuilder removed — plans are now built from analysis alone
 // via buildLoweredPlanFromAnalysis() below.)
 
 // ============================================================================
 // Helpers
 // ============================================================================
+
+const REDUCTION_OPS: ReadonlySet<string> = new Set([
+  "sum",
+  "max",
+  "min",
+  "mean",
+]);
+
+function isReductionOp(op: string): boolean {
+  return REDUCTION_OPS.has(op);
+}
+
+/** Stable key for matching consecutive reductions with the same config. */
+function reductionDimKey(node: {
+  op: string;
+  payload?: any;
+  shape: number[];
+}): string {
+  const p = node.payload;
+  const dims = Array.isArray(p?.dim) ? p.dim.join(",") : String(p?.dim);
+  return `${node.op}:${dims}:${p?.keepdim ?? false}:${node.shape.join("x")}`;
+}
 
 /** Check if an op is a data source (creates buffers from host data). */
 export function isDataSourceOp(op: string): boolean {
@@ -364,6 +529,13 @@ export function buildLoweredPlanFromAnalysis(
       );
     }
   }
+
+  // Post-process: merge non-adjacent same-config reduction actions into batches.
+  // Only merges sums whose outputs have no consumers between group members.
+  // Currently fires for plans where sums are naturally adjacent. For the common
+  // bias-gradient pattern (sum interleaved with matmul + reshape), the view
+  // dependents prevent merging. To enable: fuse sumToShape into a single node.
+  mergeBatchableReductions(actions, planNodes);
 
   return {
     actions,
@@ -502,6 +674,38 @@ function emitSequentialActions(
         actions.push({ kind: "adam-batch", nodeIndices: adamIndices });
         maybeReclaim(adamCount);
         nodeIdx += adamCount - 1;
+        continue;
+      }
+    }
+
+    // Batched reduction: count consecutive same-config sum/max/min nodes
+    if (isReductionOp(node.op) && node.payload?.dim != null) {
+      const dimKey = reductionDimKey(node);
+      let batchCount = 1;
+      for (let j = nodeIdx + 1; j < nodes.length; j++) {
+        const next = nodes[j];
+        if (
+          next.op === node.op &&
+          !next.result &&
+          next.payload?.dim != null &&
+          reductionDimKey(next) === dimKey
+        )
+          batchCount++;
+        else break;
+      }
+      if (batchCount > 1) {
+        const indices: number[] = [];
+        for (let c = 0; c < batchCount; c++) {
+          indices.push(posMap.get(nodes[nodeIdx + c].id) as number);
+        }
+        actions.push({
+          kind: "batched-reduction",
+          nodeIndices: indices,
+          reduceOp: node.op,
+          payload: { dim: node.payload.dim, keepdim: node.payload.keepdim },
+        });
+        maybeReclaim(batchCount);
+        nodeIdx += batchCount - 1;
         continue;
       }
     }

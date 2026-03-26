@@ -1237,6 +1237,7 @@ function hasPendingInputIn(node: LazyIRNode, nodeIdSet: Set<number>): boolean {
 }
 
 /**
+/**
  * Priority selection for Kahn's algorithm:
  * P0 = fusible node continuing current chain (has pending input in chain),
  * P1 = fusible node (new chain),

@@ -389,6 +389,13 @@ export interface BackendOps {
     options: StridedScatterOptions,
   ): BackendTensor;
   /** Fused Adam/AdamW optimizer step. Returns updated param, m, v. */
+  /** Batched reduction: N independent same-config reductions in one kernel. */
+  batchedReduction?(
+    op: string,
+    inputs: BackendTensor[],
+    dim: number | number[],
+    keepdim?: boolean,
+  ): BackendTensor[];
   adamStep?(
     grad: BackendTensor,
     param: BackendTensor,
