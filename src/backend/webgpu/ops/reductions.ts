@@ -693,3 +693,121 @@ export function meanWithEpilogue(
   releaseParamsBuffer(mean.invCountBuffer);
   return result;
 }
+
+// ============================================================================
+// Batched Reduction
+// ============================================================================
+
+/**
+ * Dispatch N independent same-shape reductions in a single kernel.
+ *
+ * All inputs must have the same shape and be contiguous. All reductions
+ * use the same dim and reduce op. Returns N output BackendTensors.
+ *
+ * The batch size is clamped by the device's maxStorageBuffersPerShaderStage:
+ * 2*N (inputs + outputs) + 1 (uniforms) ≤ limit. Excess items are split
+ * into multiple dispatches automatically.
+ *
+ * @param op - Reduction operation ("sum", "max", "min")
+ * @param inputs - N input tensors (same shape, contiguous)
+ * @param dim - Reduction dimension(s)
+ * @param keepdim - Whether to keep reduced dimensions
+ * @returns N output tensors
+ */
+export function batchedReduction(
+  op: ReduceOp,
+  inputs: BackendTensor[],
+  dim: number | number[],
+  keepdim = false,
+): BackendTensor[] {
+  if (inputs.length === 0) return [];
+  if (inputs.length === 1) return [reduction(op, inputs[0], { dim, keepdim })];
+
+  const ctx = requireContext();
+  const tensors = inputs.map((t) => {
+    const gpu = asGPUTensor(t);
+    return gpu.isContiguous ? gpu : asGPUTensor(contiguous(gpu));
+  });
+
+  const inputShape = tensors[0].shape;
+  const setup = prepareDimReduction(inputShape, dim, keepdim);
+  if (!setup) {
+    // Full reduction — fall back to individual dispatches
+    return inputs.map((t) => reduction(op, t, { dim, keepdim }));
+  }
+
+  const {
+    normalizedDims,
+    outShape,
+    outSize,
+    reductionSize,
+    inputStrides,
+    outStrides,
+    inputToOutDim,
+  } = setup;
+
+  // Batched path only supports dim-sequential (small reduction size).
+  // Parallel reductions (large reduction size) fall back to individual.
+  if (reductionSize > 64) {
+    return inputs.map((t) => reduction(op, t, { dim, keepdim }));
+  }
+
+  // Device binding limit: 2*N + 1 (uniform) ≤ maxStorageBuffersPerShaderStage
+  const maxStorage = ctx.device.limits?.maxStorageBuffersPerShaderStage ?? 8;
+  const maxBatch = Math.max(1, Math.floor((maxStorage - 1) / 2));
+
+  const results: BackendTensor[] = [];
+
+  for (let start = 0; start < tensors.length; start += maxBatch) {
+    const batch = tensors.slice(
+      start,
+      Math.min(start + maxBatch, tensors.length),
+    );
+    const count = batch.length;
+
+    if (count === 1) {
+      results.push(reduction(op, inputs[start], { dim, keepdim }));
+      continue;
+    }
+
+    // Build batched spec via unified factory
+    const spec = makeReductionSpec({
+      reduceOp: op,
+      dim: dimInfo(
+        inputShape,
+        inputStrides,
+        normalizedDims,
+        outShape,
+        outStrides,
+        inputToOutDim,
+        false, // sequential
+      ),
+      count,
+    });
+
+    // Allocate output buffers + build binding map
+    const inputBuffers = batch.map((t) => t.buffer);
+    const buffers: Record<string, GPUBuffer> = {};
+    for (let i = 0; i < count; i++) {
+      buffers[`in${i}`] = batch[i].buffer;
+    }
+    for (let i = 0; i < count; i++) {
+      buffers[`out${i}`] = resolveOutputBuffer(
+        ctx.device,
+        outSize * 4,
+        inputBuffers,
+      );
+    }
+
+    createTileKernelDispatcher(spec).dispatch(buffers, {
+      outSize,
+      reductionSize,
+    });
+
+    for (let i = 0; i < count; i++) {
+      results.push(createTensor(outShape, buffers[`out${i}`]));
+    }
+  }
+
+  return results;
+}

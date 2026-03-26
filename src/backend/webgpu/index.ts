@@ -211,7 +211,7 @@ import {
 } from "./ops/fused";
 import { cat, gather, scatterAdd } from "./ops/gather-scatter";
 import { matmul } from "./ops/matmul-ops";
-import { max, mean, min, sum } from "./ops/reductions";
+import { batchedReduction, max, mean, min, sum } from "./ops/reductions";
 import { stridedScatterAdd, stridedScatterCopy } from "./ops/strided-scatter";
 import {
   cast,
@@ -343,6 +343,7 @@ export const webgpuBackend: FusedBackend & {
     where,
     stridedScatterCopy,
     stridedScatterAdd,
+    batchedReduction,
     adamStep,
     unscaleGrad,
     fusedAttentionForward,

@@ -1089,6 +1089,51 @@ export async function executeLoweredPlan(
           break;
         }
 
+        case "batched-reduction": {
+          const batchNodes = action.nodeIndices.map((i) => planNodes[i]);
+          const batchBackend = getBackend(batchNodes[0].device) ?? backend;
+          const batchInputs = batchNodes.map((node) => {
+            const storage = getInputStorage(node.inputs[0], batchBackend);
+            return storage.backendTensor;
+          });
+          const batchedSum = batchBackend.ops.batchedReduction;
+          if (batchedSum) {
+            const results = batchedSum(
+              action.reduceOp,
+              batchInputs,
+              action.payload.dim,
+              action.payload.keepdim,
+            );
+            for (let bi = 0; bi < batchNodes.length; bi++) {
+              batchNodes[bi].result = wrapResultAsStorage(
+                batchNodes[bi].device,
+                results[bi],
+                [batchInputs[bi]],
+                [],
+              );
+            }
+            stats.sequentialNodes += batchNodes.length;
+          } else {
+            // Fallback: dispatch individually
+            for (let bi = 0; bi < batchNodes.length; bi++) {
+              const node = batchNodes[bi];
+              const inputs = node.inputs.map((ref) =>
+                getInputStorage(ref, batchBackend),
+              );
+              const backendInputs = inputs.map((s) => s.backendTensor);
+              const result = executeOpSync(node, backendInputs, batchBackend);
+              node.result = wrapResultAsStorage(
+                node.device,
+                result instanceof Promise ? await result : result,
+                backendInputs,
+                inputs,
+              );
+              stats.sequentialNodes++;
+            }
+          }
+          break;
+        }
+
         case "sequential":
         case "view":
         case "data-source": {

@@ -1338,23 +1338,28 @@ export class Torchlette {
     const targetRank = shape.length;
     const pad = Math.max(0, gradRank - targetRank);
     const paddedTarget = new Array(pad).fill(1).concat(shape);
+    // Sum dims where target is 1 but grad is not (broadcast reduction),
+    // AND all leading padded dims (rank reduction — target has fewer dims).
+    // Summing a size-1 dim with keepdim=false is a no-op that drops the dim.
     const dims: number[] = [];
     for (let axis = 0; axis < gradRank; axis += 1) {
-      const targetDim = paddedTarget[axis];
-      const gradDim = grad.shape[axis];
-      if (targetDim === 1 && gradDim !== 1) {
+      if (axis < pad) {
+        // Padded leading dim — always include (drops it from output)
+        dims.push(axis);
+      } else if (paddedTarget[axis] === 1 && grad.shape[axis] !== 1) {
         dims.push(axis);
       }
     }
     let reduced = grad;
     if (dims.length > 0) {
-      const summed = this.runtime.sum(reduced, { dim: dims, keepdim: true });
+      const summed = this.runtime.sum(reduced, { dim: dims, keepdim: false });
       if (typeof summed === "number") {
         reduced = this.runtime.full([], summed, grad.device);
       } else {
         reduced = summed;
       }
     }
+    // Reshape only for rare cases (e.g., target has explicit 1-dims)
     if (!shapesEqual(reduced.shape, shape)) {
       reduced = this.runtime.reshape(reduced, shape);
     }
