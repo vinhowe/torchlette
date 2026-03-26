@@ -2,18 +2,15 @@
  * DiLoCo Outer Optimizer: Nesterov Momentum SGD
  *
  * Applies averaged pseudo-gradients to global parameters using Nesterov
- * momentum. This is the "outer loop" of DiLoCo — called once every H
- * inner training steps after all-reducing pseudo-gradients across workers.
+ * momentum. Velocity state lives on CPU (Float32Arrays). The param
+ * update is computed on CPU and written to GPU via tensorFromArray + copy_.
+ *
+ * This avoids GPU buffer lifecycle issues (lazy tensors freed by step-scoped
+ * cleanup) and is fine since the outer step runs once per H inner steps.
  *
  * Algorithm per outer step:
- *   v_t = mu * v_{t-1} + delta_avg        (momentum update)
- *   theta_{t+1} = theta_t + lr * v_t      (parameter update)
- *
- * Where delta_avg is the averaged pseudo-gradient: (local_params - global_params)
- * averaged across all workers.
- *
- * The update runs on CPU (read params, compute, write back). This avoids
- * GPU buffer lifecycle issues and is fine since it runs once per H steps.
+ *   v_t = mu * v_{t-1} + delta_avg
+ *   theta_{t+1} = theta_t + lr * v_t
  *
  * Default hyperparameters from DiLoCo paper:
  *   lr = 0.7, mu = 0.9
@@ -32,8 +29,9 @@ export interface OuterOptimizerConfig {
 /**
  * Nesterov SGD outer optimizer for DiLoCo.
  *
- * Holds momentum buffers (CPU Float32Arrays) for each parameter.
- * Call `step()` with the averaged pseudo-gradients after all-reduce.
+ * Velocity buffers are CPU Float32Arrays. Param update is computed on CPU
+ * and written back to GPU in one copy. Must be called within a
+ * beginStep()/endStep() pair.
  */
 export class NesterovOuterOptimizer {
   private readonly lr: number;
@@ -50,12 +48,10 @@ export class NesterovOuterOptimizer {
   /**
    * Apply one outer optimization step.
    *
-   * Reads params and pseudo-grads to CPU, computes Nesterov update,
-   * writes updated params back to GPU.
+   * Reads current params and pseudo-grads to CPU, computes Nesterov
+   * update, writes result back to GPU via copy_.
    *
-   * @param params - Model parameters
-   * @param pseudoGrads - Averaged pseudo-gradients (same order as params).
-   *   Each pseudo-gradient is: local_params - global_params_at_sync_start.
+   * Must be called within beginStep()/endStep().
    */
   async step(params: Tensor[], pseudoGrads: Tensor[]): Promise<void> {
     if (params.length !== pseudoGrads.length) {
@@ -64,32 +60,33 @@ export class NesterovOuterOptimizer {
       );
     }
 
+    const api = this.api;
+
     for (let i = 0; i < params.length; i++) {
       const param = params[i];
+      const paramData = await param.cpu();
       const deltaData = await pseudoGrads[i].cpu();
+      const n = paramData.length;
 
-      // Get or create velocity (zero-initialized on first use)
+      // Get or create velocity
       let v = this.velocities.get(param);
       if (!v) {
-        v = new Float32Array(deltaData.length);
+        v = new Float32Array(n);
         this.velocities.set(param, v);
       }
 
-      // Read current param values
-      const paramData = await param.cpu();
-
-      // Nesterov momentum: v = mu * v + delta, theta = theta + lr * v
-      const updated = new Float32Array(deltaData.length);
-      for (let j = 0; j < deltaData.length; j++) {
+      // Nesterov: v = mu * v + delta, theta = theta + lr * v
+      const updated = new Float32Array(n);
+      for (let j = 0; j < n; j++) {
         v[j] = this.mu * v[j] + deltaData[j];
         updated[j] = paramData[j] + this.lr * v[j];
       }
 
-      // Write updated params back to GPU
-      const t = this.api.tensorFromArray(Array.from(updated), param.shape, {
+      // Write back to GPU
+      const t = api.tensorFromArray(Array.from(updated), param.shape, {
         device: param.device,
       });
-      this.api.copy_(param, t);
+      api.copy_(param, t);
     }
   }
 

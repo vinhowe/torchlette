@@ -189,6 +189,7 @@ async function main() {
 
       for (let w = 0; w < K; w++) {
         // Restore params to global snapshot before each worker
+        console.log(`  [restore] worker ${w}...`);
         await api.beginStep();
         for (let i = 0; i < params.length; i++) {
           const snap = api.tensorFromArray(
@@ -232,7 +233,9 @@ async function main() {
         workerPseudoGrads.push(pseudoGrads);
       }
 
-      // Restore to global snapshot before applying outer update
+      // Restore to global snapshot + apply outer update in one step.
+      // Don't dispose snapshot tensors — copy_ creates lazy nodes that
+      // reference them. markStep will force execution then clean up.
       await api.beginStep();
       for (let i = 0; i < params.length; i++) {
         const snap = api.tensorFromArray(
@@ -241,10 +244,7 @@ async function main() {
           { device: params[i].device },
         );
         api.copy_(params[i], snap);
-        snap.dispose();
       }
-      api.endStep();
-      await api.markStep();
 
       // Average pseudo-gradients across workers
       const avgPseudoGrads: Float32Array[] = [];
@@ -276,7 +276,8 @@ async function main() {
         `  round ${round}: compression ${(totalOrigBytes / totalCompBytes).toFixed(1)}x (${(totalOrigBytes / 1024).toFixed(0)}KB → ${(totalCompBytes / 1024).toFixed(0)}KB)`,
       );
 
-      // Restore to global snapshot before applying outer update
+      // Restore to global snapshot + apply outer update in one step
+      console.log(`  [outer] step...`);
       await api.beginStep();
       for (let i = 0; i < params.length; i++) {
         const snap = api.tensorFromArray(
@@ -286,17 +287,15 @@ async function main() {
         );
         api.copy_(params[i], snap);
       }
-      api.endStep();
-      await api.markStep();
-
-      // Apply outer Nesterov update (CPU-side math, writes back to GPU)
       const avgTensors = avgPseudoGrads.map((pg, i) =>
         api.tensorFromArray(Array.from(pg), params[i].shape, {
           device: "webgpu",
         }),
       );
       await outerOpt.step(params, avgTensors);
-      for (const t of avgTensors) t.dispose();
+      // Don't dispose avgTensors — outer optimizer's lazy nodes reference them.
+      // Step-scoped cleanup at markStep handles it.
+      api.endStep();
       await api.markStep();
     }
 
