@@ -12,7 +12,7 @@ import {
   createParamsBuffer,
   releaseParamsBuffer,
 } from "./bind-group-cache";
-import { allocateOutputBuffer } from "./buffer-arena";
+import { allocateOutputBuffer, resolveOutputBuffer } from "./buffer-arena";
 import { dispatchComputePass } from "./dispatch";
 import { generateFusedKernelTileIR } from "./fusion-tile-ir";
 import {
@@ -215,12 +215,16 @@ export function dispatchFusedKernel(
   const primaryOutput = recipe.outputs[0];
   const totalElements = sizeOf(primaryOutput.shape);
 
-  // Create output buffers for all outputs (via shared buffer pool)
+  // Create output buffers for all outputs.
+  // Use resolveOutputBuffer (not allocateOutputBuffer) so the arena aliasing
+  // check prevents returning an input buffer as the output — that would create
+  // a read/read_write conflict within the same compute pass.
+  const inputGPUBuffers = inputs.map((inp) => inp.buffer);
   const outputBuffers: GPUBuffer[] = [];
   const outputTensors: FusedOutputTensor[] = [];
   for (const output of recipe.outputs) {
     const outputBytes = totalElements * dtypeBytes(output.dtype);
-    const buffer = allocateOutputBuffer(outputBytes);
+    const buffer = resolveOutputBuffer(device, outputBytes, inputGPUBuffers);
     trackSharedEncoderWrite(buffer);
     outputBuffers.push(buffer);
     outputTensors.push({

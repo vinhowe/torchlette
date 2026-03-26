@@ -221,8 +221,8 @@ async function main() {
   console.log(`   Prompt: "The"`);
   console.log(`   Generated: "The${generated}"`);
 
-  // Step 8: Test LoRATrainer with AMP + checkpointing (browser code path)
-  console.log("\n8. Testing LoRATrainer with AMP + checkpointing...");
+  // Step 8: Test LoRATrainer with checkpointing
+  console.log("\n8. Testing LoRATrainer with checkpointing (3 steps)...");
   const { LoRATrainer } = await import(
     "../examples/gpt2-lora-trainer/src/lib/torchlette/trainer"
   );
