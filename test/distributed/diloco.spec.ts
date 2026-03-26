@@ -14,7 +14,7 @@ describe("NesterovOuterOptimizer", () => {
     // Pseudo-gradient: [0.1, 0.2, 0.3]
     const delta = api.tensorFromArray([0.1, 0.2, 0.3], [3]);
 
-    optimizer.step([param], [delta]);
+    await optimizer.step([param], [delta]);
 
     // With lr=1, mu=0: theta = theta + lr * delta = [1.1, 2.2, 3.3]
     const result = await param.cpu();
@@ -38,13 +38,13 @@ describe("NesterovOuterOptimizer", () => {
     // Step 1: delta = 1.0
     // v = 0.9*0 + 1.0 = 1.0
     // theta = 10 + 1.0*1.0 = 11.0
-    optimizer.step([param], [api.tensorFromArray([1.0], [1])]);
+    await optimizer.step([param], [api.tensorFromArray([1.0], [1])]);
     expect((await param.cpu())[0]).toBeCloseTo(11.0, 5);
 
     // Step 2: delta = 1.0
     // v = 0.9*1.0 + 1.0 = 1.9
     // theta = 11.0 + 1.0*1.9 = 12.9
-    optimizer.step([param], [api.tensorFromArray([1.0], [1])]);
+    await optimizer.step([param], [api.tensorFromArray([1.0], [1])]);
     expect((await param.cpu())[0]).toBeCloseTo(12.9, 5);
 
     optimizer.dispose();
@@ -56,7 +56,7 @@ describe("NesterovOuterOptimizer", () => {
     // Should not throw — defaults are lr=0.7, mu=0.9
     const param = api.tensorFromArray([1], [1]);
     param.requires_grad_(true);
-    optimizer.step([param], [api.tensorFromArray([0.1], [1])]);
+    await optimizer.step([param], [api.tensorFromArray([0.1], [1])]);
     // theta = 1 + 0.7 * (0.9*0 + 0.1) = 1 + 0.07 = 1.07
     expect((await param.cpu())[0]).toBeCloseTo(1.07, 5);
     optimizer.dispose();
@@ -109,7 +109,7 @@ describe("DiLoCoTrainer", () => {
 
     // Outer step: reset to snapshot [10, 20], then apply outer update
     // theta = [10, 20] + 1.0 * [1, 2] = [11, 22]
-    trainer.outerStep([avgDelta]);
+    await trainer.outerStep([avgDelta]);
 
     const result = await param.cpu();
     expect(result[0]).toBeCloseTo(11, 5);

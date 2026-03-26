@@ -133,7 +133,7 @@ export class DiLoCoTrainer {
    *
    * @param avgPseudoGrads - Averaged pseudo-gradients from all workers
    */
-  outerStep(avgPseudoGrads: Tensor[]): void {
+  async outerStep(avgPseudoGrads: Tensor[]): Promise<void> {
     if (!this.globalSnapshot) {
       throw new Error("Must call snapshotGlobalParams() before outerStep");
     }
@@ -150,7 +150,7 @@ export class DiLoCoTrainer {
     }
 
     // Apply outer optimizer update
-    this.outerOptimizer.step(this.params, avgPseudoGrads);
+    await this.outerOptimizer.step(this.params, avgPseudoGrads);
 
     // Reset inner optimizer state (momentum from previous inner loop is stale)
     this.innerOptimizer.zeroGrad();

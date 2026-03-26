@@ -276,21 +276,27 @@ async function main() {
         `  round ${round}: compression ${(totalOrigBytes / totalCompBytes).toFixed(1)}x (${(totalOrigBytes / 1024).toFixed(0)}KB → ${(totalCompBytes / 1024).toFixed(0)}KB)`,
       );
 
-      // Apply outer update: theta = snapshot + avg_delta (lr=1.0, no momentum)
-      // Combine restore + update in one step: directly set params to snapshot + avg_delta
+      // Restore to global snapshot before applying outer update
       await api.beginStep();
       for (let i = 0; i < params.length; i++) {
-        const updated = new Float32Array(globalSnapshot[i].length);
-        for (let j = 0; j < updated.length; j++) {
-          updated[j] = globalSnapshot[i][j] + avgPseudoGrads[i][j];
-        }
-        const t = api.tensorFromArray(Array.from(updated), params[i].shape, {
-          device: "webgpu",
-        });
-        api.copy_(params[i], t);
-        // Don't dispose — let markStep handle cleanup
+        const snap = api.tensorFromArray(
+          Array.from(globalSnapshot[i]),
+          params[i].shape,
+          { device: params[i].device },
+        );
+        api.copy_(params[i], snap);
       }
       api.endStep();
+      await api.markStep();
+
+      // Apply outer Nesterov update (CPU-side math, writes back to GPU)
+      const avgTensors = avgPseudoGrads.map((pg, i) =>
+        api.tensorFromArray(Array.from(pg), params[i].shape, {
+          device: "webgpu",
+        }),
+      );
+      await outerOpt.step(params, avgTensors);
+      for (const t of avgTensors) t.dispose();
       await api.markStep();
     }
 
