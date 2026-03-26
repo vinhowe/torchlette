@@ -18,6 +18,12 @@ export {
 } from "./e3m0";
 
 export {
+  FineWebLoader,
+  type FineWebLoaderConfig,
+  type Tokenizer as FineWebTokenizer,
+} from "./fineweb-loader";
+
+export {
   NesterovOuterOptimizer,
   type OuterOptimizerConfig,
 } from "./outer-optimizer";

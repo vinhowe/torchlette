@@ -20,6 +20,7 @@
     "vite": "^6.0.7"
   },
   "dependencies": {
+    "hyparquet": "^1.25.1",
     "torchlette": "workspace:*"
   }
 }
