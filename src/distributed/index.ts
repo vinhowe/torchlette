@@ -16,12 +16,17 @@ export {
   e3m0Dequantize,
   e3m0Quantize,
 } from "./e3m0";
-
 export {
   FineWebLoader,
   type FineWebLoaderConfig,
   type Tokenizer as FineWebTokenizer,
 } from "./fineweb-loader";
+export {
+  type GossipConfig,
+  GossipNetwork,
+  type OnReceiveCallback,
+  type SyncMessage,
+} from "./gossip";
 
 export {
   NesterovOuterOptimizer,
