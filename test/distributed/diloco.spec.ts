@@ -16,11 +16,11 @@ describe("NesterovOuterOptimizer", () => {
 
     optimizer.step([param], [delta]);
 
-    // With lr=1, mu=0: theta = theta - lr * delta = [0.9, 1.8, 2.7]
+    // With lr=1, mu=0: theta = theta + lr * delta = [1.1, 2.2, 3.3]
     const result = await param.cpu();
-    expect(result[0]).toBeCloseTo(0.9, 5);
-    expect(result[1]).toBeCloseTo(1.8, 5);
-    expect(result[2]).toBeCloseTo(2.7, 5);
+    expect(result[0]).toBeCloseTo(1.1, 5);
+    expect(result[1]).toBeCloseTo(2.2, 5);
+    expect(result[2]).toBeCloseTo(3.3, 5);
 
     optimizer.dispose();
   });
@@ -37,15 +37,15 @@ describe("NesterovOuterOptimizer", () => {
 
     // Step 1: delta = 1.0
     // v = 0.9*0 + 1.0 = 1.0
-    // theta = 10 - 1.0*1.0 = 9.0
+    // theta = 10 + 1.0*1.0 = 11.0
     optimizer.step([param], [api.tensorFromArray([1.0], [1])]);
-    expect((await param.cpu())[0]).toBeCloseTo(9.0, 5);
+    expect((await param.cpu())[0]).toBeCloseTo(11.0, 5);
 
     // Step 2: delta = 1.0
     // v = 0.9*1.0 + 1.0 = 1.9
-    // theta = 9.0 - 1.0*1.9 = 7.1
+    // theta = 11.0 + 1.0*1.9 = 12.9
     optimizer.step([param], [api.tensorFromArray([1.0], [1])]);
-    expect((await param.cpu())[0]).toBeCloseTo(7.1, 5);
+    expect((await param.cpu())[0]).toBeCloseTo(12.9, 5);
 
     optimizer.dispose();
   });
@@ -57,8 +57,8 @@ describe("NesterovOuterOptimizer", () => {
     const param = api.tensorFromArray([1], [1]);
     param.requires_grad_(true);
     optimizer.step([param], [api.tensorFromArray([0.1], [1])]);
-    // theta = 1 - 0.7 * (0.9*0 + 0.1) = 1 - 0.07 = 0.93
-    expect((await param.cpu())[0]).toBeCloseTo(0.93, 5);
+    // theta = 1 + 0.7 * (0.9*0 + 0.1) = 1 + 0.07 = 1.07
+    expect((await param.cpu())[0]).toBeCloseTo(1.07, 5);
     optimizer.dispose();
   });
 });
@@ -108,12 +108,12 @@ describe("DiLoCoTrainer", () => {
     const avgDelta = api.tensorFromArray([1, 2], [2]);
 
     // Outer step: reset to snapshot [10, 20], then apply outer update
-    // theta = [10, 20] - 1.0 * [1, 2] = [9, 18]
+    // theta = [10, 20] + 1.0 * [1, 2] = [11, 22]
     trainer.outerStep([avgDelta]);
 
     const result = await param.cpu();
-    expect(result[0]).toBeCloseTo(9, 5);
-    expect(result[1]).toBeCloseTo(18, 5);
+    expect(result[0]).toBeCloseTo(11, 5);
+    expect(result[1]).toBeCloseTo(22, 5);
 
     trainer.dispose();
   });
