@@ -16,6 +16,14 @@
  *   OUTER_LR=0.7      Outer Nesterov learning rate
  *   OUTER_MU=0.9      Outer Nesterov momentum
  *   PRETRAINED=0       Set to 1 to finetune from pretrained weights
+ *
+ * Multi-GPU: Dawn/WebGPU ignores CUDA_VISIBLE_DEVICES. Use the Vulkan device
+ * filter shim for multi-GPU:
+ *
+ *   VULKAN_DEVICE_INDEX=4 LD_LIBRARY_PATH=tools/vk-shim:$LD_LIBRARY_PATH \
+ *     npx tsx tools/diloco-agent.ts
+ *
+ * Or use the launcher: npx tsx tools/launch-diloco.ts --agents 4 --gpus 4,5,6,7
  */
 
 import * as fs from "node:fs";
@@ -465,6 +473,28 @@ async function main() {
     log(
       `round ${round}: loss=${avgLoss.toFixed(4)}, ${elapsed}s, grad=${(gradSize / 1024 / 1024).toFixed(1)}MB`,
     );
+  }
+
+  // Save final checkpoint (agent 0 only — all agents have the same weights after sync)
+  if (AGENT_ID === 0) {
+    const checkpointDir = path.join(SYNC_DIR, "checkpoint");
+    fs.mkdirSync(checkpointDir, { recursive: true });
+    log("Saving checkpoint...");
+    for (let i = 0; i < params.length; i++) {
+      const data = await params[i].cpu();
+      const f32 = new Float32Array(data);
+      fs.writeFileSync(
+        path.join(checkpointDir, `param-${i}.bin`),
+        Buffer.from(f32.buffer),
+      );
+    }
+    // Save param shapes for loading
+    const shapes = params.map((p) => p.shape);
+    fs.writeFileSync(
+      path.join(checkpointDir, "shapes.json"),
+      JSON.stringify(shapes),
+    );
+    log(`Checkpoint saved to ${checkpointDir}`);
   }
 
   log("Done");

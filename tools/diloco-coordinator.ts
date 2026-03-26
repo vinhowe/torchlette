@@ -35,7 +35,7 @@ async function main() {
   // Clean sync directory
   fs.mkdirSync(SYNC_DIR, { recursive: true });
 
-  // Spawn agents
+  // Spawn agents — stagger launches to avoid Dawn adapter contention
   const procs = [];
   for (let i = 0; i < NUM_AGENTS; i++) {
     const proc = spawn("npx", ["tsx", "tools/diloco-agent.ts"], {
@@ -47,6 +47,10 @@ async function main() {
         AGENT_ID: String(i),
         NUM_AGENTS: String(NUM_AGENTS),
         SYNC_DIR,
+        // Pin each agent to a free GPU (skip GPUs 2,3 — partially used)
+        CUDA_VISIBLE_DEVICES: String(
+          [0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15][i % 14],
+        ),
       },
       stdio: ["ignore", "ignore", "inherit"],
     });
