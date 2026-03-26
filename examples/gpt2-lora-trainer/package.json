@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "hyparquet": "^1.25.1",
+    "peerjs": "^1.5.5",
     "torchlette": "workspace:*"
   }
 }
