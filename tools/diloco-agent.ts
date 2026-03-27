@@ -188,6 +188,17 @@ async function loadTokenizer(modelDir: string) {
 }
 
 function loadTrainingTokens(tokenizer: any): number[] {
+  // Try FineWeb shard first (one unique shard per agent)
+  const finewebPath = `/tmp/fineweb-shards/shard-${AGENT_ID}.txt`;
+  if (fs.existsSync(finewebPath)) {
+    const text = fs.readFileSync(finewebPath, "utf-8");
+    log(
+      `Loaded FineWeb shard ${AGENT_ID} (${(text.length / 1024).toFixed(0)}KB)`,
+    );
+    return tokenizer.encode(text);
+  }
+
+  // Fallback to local dataset files
   const textFiles = [
     "examples/gpt2-lora-trainer/static/datasets/austen.txt",
     "examples/gpt2-lora-trainer/static/datasets/lovecraft.txt",
@@ -198,7 +209,7 @@ function loadTrainingTokens(tokenizer: any): number[] {
     textFiles[AGENT_ID % textFiles.length],
   );
   if (!fs.existsSync(filePath)) {
-    log(`Data not found: ${filePath}, using synthetic`);
+    log(`No data found, using synthetic`);
     return tokenizer.encode(
       "The quick brown fox jumps over the lazy dog. ".repeat(500),
     );
