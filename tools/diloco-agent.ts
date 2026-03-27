@@ -46,7 +46,8 @@ const OUTER_ROUNDS = parseInt(process.env.ROUNDS ?? "10", 10);
 const LR = parseFloat(process.env.LR ?? "4e-4");
 const OUTER_LR = parseFloat(process.env.OUTER_LR ?? "0.7");
 const OUTER_MU = parseFloat(process.env.OUTER_MU ?? "0.9");
-const SEQ_LEN = parseInt(process.env.SEQ_LEN ?? "128", 10);
+const SEQ_LEN = parseInt(process.env.SEQ_LEN ?? "1024", 10);
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE ?? "64", 10);
 const MODEL_DIR = process.env.MODEL ?? "gpt2";
 const AGENT_ID = parseInt(process.env.AGENT_ID ?? "0", 10);
 const NUM_AGENTS = parseInt(process.env.NUM_AGENTS ?? "2", 10);
@@ -314,22 +315,32 @@ async function trainStep(
   tokens: number[],
   offset: number,
 ): Promise<number> {
-  const start = offset % Math.max(1, tokens.length - SEQ_LEN - 1);
+  // Build batch: BATCH_SIZE sequences of SEQ_LEN tokens
+  const inputData: number[] = [];
+  const targetData: number[] = [];
+  const maxStart = Math.max(1, tokens.length - SEQ_LEN - 1);
+  for (let b = 0; b < BATCH_SIZE; b++) {
+    const start = (offset + b * SEQ_LEN) % maxStart;
+    for (let i = 0; i < SEQ_LEN; i++) {
+      inputData.push(tokens[start + i]);
+      targetData.push(tokens[start + i + 1]);
+    }
+  }
 
   await api.beginStep();
-  const input = api.tensorFromArray(
-    tokens.slice(start, start + SEQ_LEN),
-    [1, SEQ_LEN],
-    { device: "webgpu" },
-  );
-  const target = api.tensorFromArray(
-    tokens.slice(start + 1, start + SEQ_LEN + 1),
-    [1, SEQ_LEN],
-    { device: "webgpu" },
-  );
+  const input = api.tensorFromArray(inputData, [BATCH_SIZE, SEQ_LEN], {
+    device: "webgpu",
+  });
+  const target = api.tensorFromArray(targetData, [BATCH_SIZE, SEQ_LEN], {
+    device: "webgpu",
+  });
 
   const loss = api.tidy(() => {
-    const { loss: l } = model.forwardWithLoss(input, target);
+    // AMP: autocast runs matmuls in f16, accumulates in f32
+    const l = api.autocast(() => {
+      const { loss } = model.forwardWithLoss(input, target);
+      return loss;
+    });
     api.keep(l);
     return l;
   });
