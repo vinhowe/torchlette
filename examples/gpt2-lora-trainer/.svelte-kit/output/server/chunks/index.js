@@ -946,6 +946,12 @@ function attr_class(value, hash, directives) {
   var result = to_class(value, hash, directives);
   return result ? ` class="${escape_html(result, true)}"` : "";
 }
+function ensure_array_like(array_like_or_iterator) {
+  if (array_like_or_iterator) {
+    return array_like_or_iterator.length !== void 0 ? array_like_or_iterator : Array.from(array_like_or_iterator);
+  }
+  return [];
+}
 export {
   ASYNC as A,
   BOUNDARY_EFFECT as B,
@@ -984,5 +990,6 @@ export {
   render as v,
   attr as w,
   attr_class as x,
-  stringify as y
+  ensure_array_like as y,
+  stringify as z
 };

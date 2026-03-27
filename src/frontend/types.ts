@@ -106,4 +106,8 @@ export type TorchletteOptions = {
    * Default: false
    */
   enableTrueSegmentation?: boolean;
+  /** Disable the buffer arena (persistent GPU buffers for bind group cache
+   *  stability). Saves significant memory for large-batch pretraining at
+   *  the cost of bind group cache misses. Default: false */
+  disableArena?: boolean;
 };

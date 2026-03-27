@@ -240,6 +240,8 @@ export class GPT2WithLoRA {
 
   private training = false;
   private checkpointingEnabled = false;
+  /** When true, checkpoint entire blocks (more recompute, less memory). */
+  fullCheckpoint = false;
 
   constructor(
     api: Torchlette,
@@ -318,23 +320,29 @@ export class GPT2WithLoRA {
 
     // Transformer blocks
     if (this.checkpointingEnabled && this.training) {
-      // Selective checkpointing: attention runs outside checkpoint (fused
-      // kernel is already memory-efficient), MLP runs inside checkpoint
-      // (recomputes 4x-expanded activations). This avoids 6 expensive
-      // fusedAttention recomputes during backward.
       for (const block of this.h) {
-        // Attention: NOT checkpointed
-        const attnOut = block.attn.forward(block.ln1.forward(x));
-        const h = this.api.add(x, attnOut);
-        // MLP: checkpointed
-        x = checkpoint(
-          this.api,
-          (input: Tensor) => {
-            const mlpOut = block.mlp.forward(block.ln2.forward(input));
-            return this.api.add(input, mlpOut);
-          },
-          [h],
-        );
+        if (this.fullCheckpoint) {
+          // Full checkpointing: recompute entire block during backward.
+          // Trades more compute for less memory — enables larger batches.
+          x = checkpoint(this.api, (input: Tensor) => block.forward(input), [
+            x,
+          ]);
+        } else {
+          // Selective checkpointing: attention runs outside checkpoint (fused
+          // kernel is already memory-efficient), MLP runs inside checkpoint
+          // (recomputes 4x-expanded activations). This avoids 6 expensive
+          // fusedAttention recomputes during backward.
+          const attnOut = block.attn.forward(block.ln1.forward(x));
+          const h = this.api.add(x, attnOut);
+          x = checkpoint(
+            this.api,
+            (input: Tensor) => {
+              const mlpOut = block.mlp.forward(block.ln2.forward(input));
+              return this.api.add(input, mlpOut);
+            },
+            [h],
+          );
+        }
       }
     } else {
       for (const block of this.h) {
