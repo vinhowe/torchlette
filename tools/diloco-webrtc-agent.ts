@@ -323,9 +323,13 @@ async function main() {
   for (let round = 0; round < OUTER_ROUNDS; round++) {
     const roundStart = performance.now();
 
+    // Only snapshot if we have peers (outer update needs snapshot to restore)
+    const hasPeers = peerCount > 0;
     const globalSnapshot: Float32Array[] = [];
-    for (const p of params)
-      globalSnapshot.push(new Float32Array(await p.cpu()));
+    if (hasPeers) {
+      for (const p of params)
+        globalSnapshot.push(new Float32Array(await p.cpu()));
+    }
 
     const losses: number[] = [];
     for (let step = 0; step < INNER_STEPS; step++) {
@@ -341,72 +345,75 @@ async function main() {
       if (step % 10 === 0) log(`  step ${step}: loss=${l.toFixed(4)}`);
     }
 
-    // Compute pseudo-gradients
-    const pseudoGrads: Float32Array[] = [];
-    for (let i = 0; i < params.length; i++) {
-      const local = await params[i].cpu();
-      const delta = new Float32Array(local.length);
-      for (let j = 0; j < delta.length; j++)
-        delta[j] = local[j] - globalSnapshot[i][j];
-      pseudoGrads.push(delta);
-    }
-
-    // Request neighbors + send gradients
-    ws.send(JSON.stringify({ type: "request-neighbors", round }));
-    const compressed = serializePseudoGrads(pseudoGrads);
-    ws.send(compressed);
-    log(
-      `Sent ${(compressed.length / 1024 / 1024).toFixed(1)}MB gradients (round ${round})`,
-    );
-
-    // Wait briefly for peer grads
-    await new Promise((r) => setTimeout(r, 3000));
-
-    // Average with received peer grads
-    const avgGrads = pseudoGrads.map((pg) => new Float32Array(pg.length));
-    let numContributors = 1;
-    for (let p = 0; p < pseudoGrads.length; p++)
-      for (let j = 0; j < pseudoGrads[p].length; j++)
-        avgGrads[p][j] += pseudoGrads[p][j];
-
-    if (peerGrads && peerGrads.length === params.length) {
-      for (let p = 0; p < peerGrads.length; p++)
-        for (let j = 0; j < peerGrads[p].length; j++)
-          avgGrads[p][j] += peerGrads[p][j];
-      numContributors++;
-      peerGrads = null;
-    }
-
-    if (numContributors > 1) {
-      for (let p = 0; p < avgGrads.length; p++)
-        for (let j = 0; j < avgGrads[p].length; j++)
-          avgGrads[p][j] /= numContributors;
-    }
-
-    // Outer update (skip if solo)
-    if (numContributors <= 1) {
-      log("  solo round — keeping local params");
+    // Skip gradient exchange entirely when solo — just keep training
+    if (!hasPeers && !peerGrads) {
+      log(`  solo (no peers) — continuing training`);
     } else {
-      await api.beginStep();
+      // Compute pseudo-gradients
+      const pseudoGrads: Float32Array[] = [];
       for (let i = 0; i < params.length; i++) {
-        api.copy_(
-          params[i],
-          api.tensorFromArray(globalSnapshot[i], params[i].shape, {
-            device: "webgpu",
-          }),
-        );
+        const local = await params[i].cpu();
+        const delta = new Float32Array(local.length);
+        for (let j = 0; j < delta.length; j++)
+          delta[j] = local[j] - globalSnapshot[i][j];
+        pseudoGrads.push(delta);
       }
-      const avgTensors = avgGrads.map((pg, i) =>
-        api.tensorFromArray(pg, params[i].shape, { device: "webgpu" }),
+
+      // Send gradients to neighbors
+      ws.send(JSON.stringify({ type: "request-neighbors", round }));
+      const compressed = serializePseudoGrads(pseudoGrads);
+      ws.send(compressed);
+      log(
+        `Sent ${(compressed.length / 1024 / 1024).toFixed(1)}MB gradients (round ${round})`,
       );
-      // Force copy_ ops before outer optimizer reads params
-      await api._runtime().forceAllPending();
-      await outerOpt.step(params, avgTensors);
-      api.endStep();
-      await api.markStep();
+
+      // Wait briefly for peer grads
+      await new Promise((r) => setTimeout(r, 3000));
+
+      // Average with received peer grads
+      let numContributors = 1;
+      const avgGrads = pseudoGrads.map((pg) => new Float32Array(pg.length));
+      for (let p = 0; p < pseudoGrads.length; p++)
+        for (let j = 0; j < pseudoGrads[p].length; j++)
+          avgGrads[p][j] += pseudoGrads[p][j];
+
+      if (peerGrads && peerGrads.length === params.length) {
+        for (let p = 0; p < peerGrads.length; p++)
+          for (let j = 0; j < peerGrads[p].length; j++)
+            avgGrads[p][j] += peerGrads[p][j];
+        numContributors++;
+        peerGrads = null;
+      }
+
+      if (numContributors > 1) {
+        for (let p = 0; p < avgGrads.length; p++)
+          for (let j = 0; j < avgGrads[p].length; j++)
+            avgGrads[p][j] /= numContributors;
+
+        // Outer Nesterov update
+        await api.beginStep();
+        for (let i = 0; i < params.length; i++) {
+          api.copy_(
+            params[i],
+            api.tensorFromArray(globalSnapshot[i], params[i].shape, {
+              device: "webgpu",
+            }),
+          );
+        }
+        const avgTensors = avgGrads.map((pg, i) =>
+          api.tensorFromArray(pg, params[i].shape, { device: "webgpu" }),
+        );
+        await api._runtime().forceAllPending();
+        await outerOpt.step(params, avgTensors);
+        api.endStep();
+        await api.markStep();
+        log(`  averaged with ${numContributors} contributors`);
+      } else {
+        log("  solo round — keeping local params");
+      }
     }
 
-    // Save checkpoint from the snapshot we already have (no extra GPU readback)
+    // Save checkpoint (reuse snapshot if we have it, otherwise read fresh)
     const ckptParts: Buffer[] = [];
     const ckptHeader = Buffer.alloc(4);
     ckptHeader.writeUInt32LE(params.length, 0);
@@ -417,7 +424,8 @@ async function main() {
       for (let d = 0; d < params[i].shape.length; d++)
         shapeBuf.writeUInt32LE(params[i].shape[d], 4 + d * 4);
       ckptParts.push(shapeBuf);
-      ckptParts.push(Buffer.from(globalSnapshot[i].buffer));
+      const data = globalSnapshot[i] ?? new Float32Array(await params[i].cpu());
+      ckptParts.push(Buffer.from(data.buffer));
     }
     fs.writeFileSync(
       "/tmp/diloco-webrtc-checkpoint.bin",
