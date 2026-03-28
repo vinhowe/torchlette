@@ -555,6 +555,8 @@ async function main() {
     const avgTensors = avgGrads.map((pg, i) =>
       api.tensorFromArray(pg, params[i].shape, { device: "webgpu" }),
     );
+    // Force copy_ ops before outer optimizer reads params
+    await api._runtime().forceAllPending();
     await outerOpt.step(params, avgTensors);
     api.endStep();
     await api.markStep();
