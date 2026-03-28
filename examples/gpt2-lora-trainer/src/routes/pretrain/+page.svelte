@@ -368,6 +368,7 @@ async function startPretraining() {
           const avgTensors = avgGrads.map((g, i) =>
             api.tensorFromArray(g, params[i].shape, { device: "webgpu" }),
           );
+          await api._runtime().forceAllPending();
           await outerOpt.step(params, avgTensors);
           api.endStep();
           await api.markStep();

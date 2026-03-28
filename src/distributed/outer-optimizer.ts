@@ -82,8 +82,17 @@ export class NesterovOuterOptimizer {
         updated[j] = paramData[j] + this.lr * v[j];
       }
 
+      // Debug: check for NaN
+      if (i === 0) {
+        const hasNaN = updated.some((v) => !isFinite(v));
+        const maxAbs = updated.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+        if (hasNaN || maxAbs > 1e6)
+          console.error(
+            `[outer-opt] param 0: hasNaN=${hasNaN} maxAbs=${maxAbs.toFixed(2)} paramMax=${Math.max(...Array.from(paramData.slice(0, 100)).map(Math.abs)).toFixed(4)} deltaMax=${Math.max(...Array.from(deltaData.slice(0, 100)).map(Math.abs)).toFixed(4)}`,
+          );
+      }
       // Write back to GPU
-      const t = api.tensorFromArray(Array.from(updated), param.shape, {
+      const t = api.tensorFromArray(updated, param.shape, {
         device: param.device,
       });
       api.copy_(param, t);
