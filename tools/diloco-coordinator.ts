@@ -10,14 +10,18 @@
 
 import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as path from "node:path";
 
 const NUM_AGENTS = parseInt(process.env.AGENTS ?? "8", 10);
 const ROUNDS = parseInt(process.env.ROUNDS ?? "10", 10);
 const STEPS = parseInt(process.env.STEPS ?? "50", 10);
 const SEED = parseInt(process.env.SEED ?? "42", 10);
 const LR = process.env.LR ?? "1e-4";
-const OUTER_LR = process.env.OUTER_LR ?? "1.0";
-const OUTER_MU = process.env.OUTER_MU ?? "0.0";
+const OUTER_LR = process.env.OUTER_LR ?? "0.7";
+const OUTER_MU = process.env.OUTER_MU ?? "0.9";
+const SEQ_LEN = process.env.SEQ_LEN ?? "512";
+const BATCH_SIZE = process.env.BATCH_SIZE ?? "4";
+const ACCUM_STEPS = process.env.ACCUM_STEPS ?? "2";
 const SYNC_DIR = `/tmp/diloco-${Date.now()}`;
 
 /** Get PCI bus addresses of all GPUs via Mesa Vulkan layer. */
@@ -81,11 +85,24 @@ async function main() {
 
   fs.mkdirSync(SYNC_DIR, { recursive: true });
 
-  // Spawn agents — one per GPU
+  // Spawn agents — one per GPU using Vulkan device filter shim
+  const vkShimPath = path.join(process.cwd(), "tools", "vk-shim");
+  const hasVkShim = fs.existsSync(path.join(vkShimPath, "libvulkan.so.1"));
+  if (!hasVkShim) {
+    console.warn(
+      "WARNING: Vulkan shim not found at tools/vk-shim/libvulkan.so.1",
+    );
+    console.warn(
+      "Multi-GPU may not work. Build with: cd tools && gcc -shared -fPIC -o vk-shim/libvulkan.so.1 vk-device-filter.c -ldl",
+    );
+  }
+
   const procs = [];
   for (let i = 0; i < NUM_AGENTS; i++) {
     const gpuIdx = selectedGPUs[i];
-    const pciAddr = gpuAddresses[gpuIdx];
+    const ldPath = hasVkShim
+      ? `${vkShimPath}:${process.env.LD_LIBRARY_PATH ?? ""}`
+      : (process.env.LD_LIBRARY_PATH ?? "");
     const proc = spawn("npx", ["tsx", "tools/diloco-agent.ts"], {
       env: {
         ...process.env,
@@ -95,17 +112,27 @@ async function main() {
         LR,
         OUTER_LR,
         OUTER_MU,
+        SEQ_LEN,
+        BATCH_SIZE,
+        ACCUM_STEPS,
         AGENT_ID: String(i),
         NUM_AGENTS: String(NUM_AGENTS),
         SYNC_DIR,
-        // Pin to specific GPU via Mesa Vulkan device selection
-        MESA_VK_DEVICE_SELECT: `10de:1db8!${pciAddr}`,
-        MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE: "1",
+        TORCHLETTE_LIVENESS_RELEASE: "1",
+        TORCHLETTE_POOL_BUDGET_MB: "2000",
+        // Pin to specific GPU via Vulkan device filter shim
+        VULKAN_DEVICE_INDEX: String(gpuIdx),
+        LD_LIBRARY_PATH: ldPath,
       },
-      stdio: ["ignore", "ignore", "inherit"],
+      stdio: ["ignore", "pipe", "pipe"],
     });
+    // Prefix agent output
+    proc.stdout?.on("data", (d: Buffer) =>
+      process.stdout.write(`[agent-${i}] ${d}`),
+    );
+    proc.stderr?.on("data", (d: Buffer) => process.stderr.write(`${d}`));
     procs.push(proc);
-    console.log(`  Agent ${i} → GPU ${gpuIdx} (${pciAddr})`);
+    console.log(`  Agent ${i} → GPU ${gpuIdx}`);
   }
 
   // Wait for all to exit

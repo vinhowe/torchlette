@@ -27,6 +27,8 @@ export {
 export {
   clearBufferPool,
   deferredDestroyBuffer,
+  destroyPendingGPUBuffers,
+  evictAllPoolBuffers,
   flushBufferPool,
   getBufferPoolDetailedStats,
   getBufferPoolStats,

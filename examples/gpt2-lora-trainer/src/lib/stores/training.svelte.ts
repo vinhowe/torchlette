@@ -1,5 +1,5 @@
 /**
- * Training store -- config, data, training loop, LoRA export.
+ * Training store -- config, data, training loop, LoRA export, DiLoCo peer sync.
  */
 
 import {
@@ -9,6 +9,73 @@ import {
 } from "$lib/torchlette/trainer";
 import { serializeLoRAToSafetensors } from "$lib/torchlette/weights";
 import { modelStore } from "./model.svelte";
+
+// DiLoCo peer state
+let peerConnected = $state(false);
+let peerCount = $state(0);
+let peerId = $state("");
+// biome-ignore lint/style/useConst: Svelte $state rune
+let peerServerId = $state("torchlette-server");
+let peerStatus = $state("");
+let peerReceivedGrads: Float32Array[] | null = null;
+// biome-ignore lint/style/useConst: mutable
+let _gossipNet: any = null;
+
+async function connectToPeer(): Promise<void> {
+  if (_gossipNet || !peerServerId) return;
+  peerStatus = "Connecting...";
+  try {
+    const { GossipNetwork } = await import(
+      "../../../../../src/distributed/gossip"
+    );
+    _gossipNet = new GossipNetwork({
+      connectTo: [peerServerId],
+      targetPeers: 1,
+      // PeerJS signaling via Vite proxy → sivri:9000
+      peerServer: {
+        host: location.hostname,
+        port: Number(location.port) || 443,
+        path: "/peer-signal",
+        secure: location.protocol === "https:",
+      },
+      // TURN relay for NAT traversal (Hetzner VPS)
+      iceConfig: {
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          {
+            urls: "turn:5.78.181.14:3478",
+            username: "torchlette",
+            credential: "torchlette123",
+          },
+        ],
+      },
+      onReceive: (grads, senderId, outerStep) => {
+        peerReceivedGrads = grads;
+        peerStatus = `Got grads from ${senderId} (round ${outerStep})`;
+      },
+      onPeerCountChange: (count) => {
+        peerCount = count;
+        peerConnected = count > 0;
+      },
+      onStatus: (msg) => {
+        peerStatus = msg;
+      },
+    });
+    peerId = await _gossipNet.join();
+    peerStatus = `Joined as ${peerId}, connecting to ${peerServerId}...`;
+  } catch (e) {
+    peerStatus = `Failed: ${e instanceof Error ? e.message : e}`;
+  }
+}
+
+function disconnectPeer(): void {
+  _gossipNet?.destroy();
+  _gossipNet = null;
+  peerConnected = false;
+  peerCount = 0;
+  peerId = "";
+  peerStatus = "";
+}
 
 const TINY_SHAKESPEARE_URL =
   "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt";
@@ -324,6 +391,26 @@ export const trainingStore = {
     return loraBlob;
   },
 
+  // DiLoCo peer
+  get peerConnected() {
+    return peerConnected;
+  },
+  get peerCount() {
+    return peerCount;
+  },
+  get peerId() {
+    return peerId;
+  },
+  get peerServerId() {
+    return peerServerId;
+  },
+  set peerServerId(v: string) {
+    peerServerId = v;
+  },
+  get peerStatus() {
+    return peerStatus;
+  },
+
   // Actions
   fetchShakespeare,
   loadDataset,
@@ -332,4 +419,6 @@ export const trainingStore = {
   startTraining,
   stopTraining,
   downloadLoRA,
+  connectToPeer,
+  disconnectPeer,
 };

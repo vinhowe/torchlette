@@ -255,6 +255,43 @@ function handleLoadModel() {
         </label>
       </div>
 
+      <!-- DiLoCo peer connection -->
+      <div class="border border-slate-800 px-2 py-1.5 text-xs flex flex-col gap-1">
+        <div class="flex items-center gap-2">
+          <span class="text-slate-500 text-[10px] uppercase tracking-wider">DiLoCo</span>
+          {#if trainingStore.peerConnected}
+            <span class="w-1.5 h-1.5 rounded-full bg-green-500 inline-block"></span>
+            <span class="text-green-400 font-mono">{trainingStore.peerCount} peer(s)</span>
+          {:else}
+            <span class="w-1.5 h-1.5 rounded-full bg-slate-600 inline-block"></span>
+          {/if}
+        </div>
+        <div class="flex gap-1 items-center">
+          <input
+            type="text"
+            class="flex-1 bg-slate-900 border border-slate-700 text-xs text-slate-300 font-mono px-1 py-0.5 focus:outline-none focus:border-blue-600"
+            placeholder="Server peer ID"
+            value={trainingStore.peerServerId}
+            oninput={(e) => { trainingStore.peerServerId = (e.target as HTMLInputElement).value; }}
+            disabled={trainingStore.peerConnected}
+          />
+          {#if !trainingStore.peerConnected}
+            <button
+              onclick={() => trainingStore.connectToPeer()}
+              class="px-1.5 py-0.5 bg-blue-700 hover:bg-blue-600 text-white text-[10px]"
+            >Connect</button>
+          {:else}
+            <button
+              onclick={() => trainingStore.disconnectPeer()}
+              class="px-1.5 py-0.5 bg-slate-700 hover:bg-slate-600 text-slate-300 text-[10px]"
+            >Disconnect</button>
+          {/if}
+        </div>
+        {#if trainingStore.peerStatus}
+          <div class="text-[10px] text-slate-500 font-mono truncate">{trainingStore.peerStatus}</div>
+        {/if}
+      </div>
+
       <!-- Train / Stop buttons -->
       <div class="flex gap-2 items-center">
         {#if !trainingStore.running}

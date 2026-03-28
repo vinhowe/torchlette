@@ -648,6 +648,11 @@ class SimpleBufferPool {
     return bytesFreed;
   }
 
+  /** Evict ALL pooled buffers, freeing GPU memory. */
+  evictAll(): number {
+    return this.evictBuffers(Infinity);
+  }
+
   /**
    * Enable or disable buffer pooling.
    */
@@ -768,6 +773,11 @@ export function flushBufferPool(): void {
 /** Destroy all buffers in the pending-destroy queue. */
 export function destroyPendingGPUBuffers(): void {
   bufferPool.destroyPendingBuffers();
+}
+
+/** Evict all pooled buffers to free GPU memory. Call after GPU fence. */
+export function evictAllPoolBuffers(): number {
+  return bufferPool.evictAll();
 }
 
 /**

@@ -46,8 +46,13 @@
   ],
   "dependencies": {
     "@esbuild/linux-x64": "^0.25.9",
+    "@roamhq/wrtc": "^0.10.0",
     "@rollup/rollup-linux-x64-gnu": "^4.59.0",
-    "webgpu": "latest"
+    "node-datachannel": "^0.32.1",
+    "peer": "^1.0.2",
+    "peerjs": "^1.5.5",
+    "webgpu": "latest",
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "@biomejs/biome": "2.2.3",

@@ -12,7 +12,14 @@ import type {
   SumOptions,
   TransposeOptions,
 } from "../backend/types";
-import { isAutotuneEnabled, setAutotuneEnabled } from "../backend/webgpu";
+import {
+  destroyPendingGPUBuffers,
+  evictAllPoolBuffers,
+  flushBufferPool,
+  flushSharedEncoder,
+  isAutotuneEnabled,
+  setAutotuneEnabled,
+} from "../backend/webgpu";
 import {
   awaitDeferredFence,
   issueDeferredFence,
@@ -1580,6 +1587,46 @@ export class Torchlette {
 
   endStep(): void {
     this.runtime.endStep();
+  }
+
+  /**
+   * Flush GPU work and reclaim buffers mid-step without destroying step-scoped
+   * tensors. Use between gradient accumulation micro-batches to prevent
+   * GPU memory from growing unbounded.
+   *
+   * Unlike markStep(), this does NOT run step-scoped cleanup, so gradient
+   * tensors on parameters survive across flushes.
+   *
+   * The flush sequence:
+   * 1. Force pending tensors → destroy unreachable storages
+   * 2. Flush shared encoder → submit command buffer to GPU
+   * 3. Issue + await GPU fence → wait for GPU to finish
+   * 4. Flush pending buffers to pool → destroy pending-destroy queue
+   * 5. Evict pool buffers → free GPU memory held by the cache
+   */
+  async flushStep(): Promise<void> {
+    // Force all pending lazy tensors + destroy unreachable
+    await this.runtime.forceAllPending();
+    storageTracker.destroyUnreachable();
+    try {
+      // Submit GPU work
+      flushSharedEncoder();
+      // Wait for GPU completion so buffers are safe to reuse/destroy
+      issueDeferredFence();
+      await awaitDeferredFence();
+      // Now safe: promote pending → pool, destroy pending-destroy queue
+      flushBufferPool();
+      destroyPendingGPUBuffers();
+      // Evict pool buffers to actually free GPU memory
+      const evicted = evictAllPoolBuffers();
+      if (process.env.TORCHLETTE_DEBUG_FLUSH) {
+        console.error(
+          `[flushStep] evicted ${Math.round(evicted / 1e6)}MB from pool`,
+        );
+      }
+    } catch {
+      // Safe to ignore if WebGPU backend not initialized
+    }
   }
 
   _runtime(): RuntimeEngine {
