@@ -256,6 +256,26 @@ export function getFusionAnalysisTemplate(
   return fusionAnalysisCache.get(fingerprint);
 }
 
+/**
+ * Destroy all buffer arenas across cached templates, freeing GPU memory.
+ * The arenas will be rebuilt on the next execution (one slow step, then
+ * back to compiled plan speed). Call between training rounds to prevent
+ * unbounded GPU memory growth in long-running training.
+ */
+export function evictAllArenas(): void {
+  const { destroyArena } = require("../backend/webgpu/buffer-arena");
+  for (const [, template] of fusionAnalysisCache) {
+    if (template.bufferArena) {
+      destroyArena(template.bufferArena);
+      template.bufferArena = undefined;
+    }
+    // Also invalidate compiled plan (it depends on arena buffer identities)
+    if (template.loweredPlan?.compiledPlan) {
+      template.loweredPlan.compiledPlan = undefined;
+    }
+  }
+}
+
 type AdamStepFn = NonNullable<
   import("../backend/types").Backend["ops"]["adamStep"]
 >;

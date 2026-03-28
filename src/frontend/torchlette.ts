@@ -1629,6 +1629,16 @@ export class Torchlette {
     }
   }
 
+  /**
+   * Evict all buffer arenas and compiled plans, freeing GPU memory.
+   * Call between training rounds to prevent unbounded growth in long sessions.
+   * One-time cost: next step rebuilds the arena (~100ms), then back to full speed.
+   */
+  evictArenas(): void {
+    const { evictAllArenas } = require("../executor/executor");
+    evictAllArenas();
+  }
+
   _runtime(): RuntimeEngine {
     return this.runtime;
   }

@@ -432,6 +432,9 @@ async function main() {
       Buffer.concat(ckptParts),
     );
 
+    // Evict arenas between rounds to prevent unbounded GPU memory growth
+    api.evictArenas();
+
     const elapsed = ((performance.now() - roundStart) / 1000).toFixed(1);
     const avgLoss = losses.reduce((a, b) => a + b, 0) / losses.length;
     log(
