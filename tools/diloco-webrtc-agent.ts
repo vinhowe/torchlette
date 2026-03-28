@@ -219,7 +219,7 @@ async function main() {
   const { setGPUMemoryLimit } = await import(
     "../src/backend/webgpu/memory-tracker"
   );
-  setGPUMemoryLimit(25 * 1024 * 1024 * 1024);
+  setGPUMemoryLimit(30 * 1024 * 1024 * 1024);
 
   const api = new Torchlette("webgpu", { enableFusion: true });
   api.manualSeed(SEED);
@@ -435,7 +435,7 @@ async function main() {
     const elapsed = ((performance.now() - roundStart) / 1000).toFixed(1);
     const avgLoss = losses.reduce((a, b) => a + b, 0) / losses.length;
     log(
-      `round ${round}: loss=${avgLoss.toFixed(4)}, ${elapsed}s, peers=${peerCount + 1}, contributors=${numContributors}`,
+      `round ${round}: loss=${avgLoss.toFixed(4)}, ${elapsed}s, peers=${peerCount + 1}`,
     );
   }
 
