@@ -28,6 +28,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
 import { e3m0Dequantize, e3m0Quantize } from "../src/distributed";
 import { NesterovOuterOptimizer } from "../src/distributed/outer-optimizer";
@@ -41,18 +42,20 @@ import { Adam } from "../src/optim";
 // ============================================================================
 
 const SEED = parseInt(process.env.SEED ?? "42", 10);
-const INNER_STEPS = parseInt(process.env.STEPS ?? "100", 10);
+const INNER_STEPS = parseInt(process.env.STEPS ?? "50", 10);
 const OUTER_ROUNDS = parseInt(process.env.ROUNDS ?? "10", 10);
-const LR = parseFloat(process.env.LR ?? "4e-4");
+const LR = parseFloat(process.env.LR ?? "1e-4");
 const OUTER_LR = parseFloat(process.env.OUTER_LR ?? "0.7");
 const OUTER_MU = parseFloat(process.env.OUTER_MU ?? "0.9");
-const SEQ_LEN = parseInt(process.env.SEQ_LEN ?? "1024", 10);
-const BATCH_SIZE = parseInt(process.env.BATCH_SIZE ?? "64", 10);
+const SEQ_LEN = parseInt(process.env.SEQ_LEN ?? "512", 10);
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE ?? "4", 10);
+const ACCUM_STEPS = parseInt(process.env.ACCUM_STEPS ?? "2", 10);
 const MODEL_DIR = process.env.MODEL ?? "gpt2";
 const AGENT_ID = parseInt(process.env.AGENT_ID ?? "0", 10);
 const NUM_AGENTS = parseInt(process.env.NUM_AGENTS ?? "2", 10);
 const SYNC_DIR = process.env.SYNC_DIR ?? "/tmp/diloco";
 const PRETRAINED = process.env.PRETRAINED === "1";
+const EFFECTIVE_BATCH = BATCH_SIZE * ACCUM_STEPS;
 
 const GPT2_CONFIG = {
   vocabSize: 50257,
@@ -134,7 +137,6 @@ function waitForFile(filePath: string, timeoutMs = 600000): Promise<void> {
       resolve();
       return;
     }
-    // Use fs.watch for efficiency, fall back to polling
     try {
       const dir = path.dirname(filePath);
       const base = path.basename(filePath);
@@ -149,7 +151,6 @@ function waitForFile(filePath: string, timeoutMs = 600000): Promise<void> {
         reject(new Error(`Timeout: ${filePath}`));
       }, timeoutMs);
     } catch {
-      // Fallback to polling if fs.watch fails
       const start = Date.now();
       const check = () => {
         if (fs.existsSync(filePath)) {
@@ -189,7 +190,6 @@ async function loadTokenizer(modelDir: string) {
 }
 
 function loadTrainingTokens(tokenizer: any): number[] {
-  // Try FineWeb shard first (one unique shard per agent)
   const finewebPath = `/tmp/fineweb-shards/shard-${AGENT_ID}.txt`;
   if (fs.existsSync(finewebPath)) {
     const text = fs.readFileSync(finewebPath, "utf-8");
@@ -199,7 +199,6 @@ function loadTrainingTokens(tokenizer: any): number[] {
     return tokenizer.encode(text);
   }
 
-  // Fallback to local dataset files
   const textFiles = [
     "examples/gpt2-lora-trainer/static/datasets/austen.txt",
     "examples/gpt2-lora-trainer/static/datasets/lovecraft.txt",
@@ -238,7 +237,6 @@ async function createModel(api: Torchlette, modelDir: string) {
   );
 
   if (PRETRAINED) {
-    // Finetune: load pretrained weights
     const modelPath = path.join(
       process.cwd(),
       "models",
@@ -288,14 +286,11 @@ async function createModel(api: Torchlette, modelDir: string) {
     model.loadBaseWeights(weights);
     log("Loaded pretrained weights");
   } else {
-    // Pretrain from scratch: GPT-2 init scheme (normal_(0, 0.02), scaled residual)
-    // manualSeed was already called — all agents get the same init
     const params = model.getAllParameters();
     for (const p of params) {
       if (p.shape.length >= 2) {
         normal_(api, p, 0, 0.02);
       }
-      // 1-D params (biases, layernorm) keep their default zero/ones init
     }
     log("Initialized from scratch (normal 0.02)");
   }
@@ -304,9 +299,17 @@ async function createModel(api: Torchlette, modelDir: string) {
 }
 
 // ============================================================================
-// Training Step
+// Training Step (with gradient accumulation)
 // ============================================================================
 
+/**
+ * Run one micro-batch: forward → backward. Returns loss value.
+ * Each micro-batch is a full step cycle so GPU memory is reclaimed between them.
+ * Gradient accumulation strategy: each micro-batch is a full step cycle
+ * (beginStep → forward → backward → zeroGrad → endStep → markStep) so GPU
+ * memory is fully reclaimed. Gradients are accumulated in separate GPU
+ * tensors via add_, then written back to params for the optimizer step.
+ */
 async function trainStep(
   api: Torchlette,
   model: any,
@@ -315,45 +318,94 @@ async function trainStep(
   tokens: number[],
   offset: number,
 ): Promise<number> {
-  // Build batch: BATCH_SIZE sequences of SEQ_LEN tokens
-  const inputData: number[] = [];
-  const targetData: number[] = [];
+  trainStep._callCount = (trainStep._callCount ?? 0) + 1;
   const maxStart = Math.max(1, tokens.length - SEQ_LEN - 1);
-  for (let b = 0; b < BATCH_SIZE; b++) {
-    const start = (offset + b * SEQ_LEN) % maxStart;
-    for (let i = 0; i < SEQ_LEN; i++) {
-      inputData.push(tokens[start + i]);
-      targetData.push(tokens[start + i + 1]);
+  let totalLoss = 0;
+
+  // Persistent GPU accumulator tensors (survive across micro-batch step cycles)
+  let accumGrads: import("../src/frontend/tensor").Tensor[] | null = null;
+
+  for (let acc = 0; acc < ACCUM_STEPS; acc++) {
+    const microOffset = offset + acc * BATCH_SIZE * SEQ_LEN;
+    const inputData: number[] = [];
+    const targetData: number[] = [];
+    for (let b = 0; b < BATCH_SIZE; b++) {
+      const start = (microOffset + b * SEQ_LEN) % maxStart;
+      for (let i = 0; i < SEQ_LEN; i++) {
+        inputData.push(tokens[start + i]);
+        targetData.push(tokens[start + i + 1]);
+      }
+    }
+
+    const _t: Record<string, number> = {};
+    let _tt = performance.now();
+    await api.beginStep();
+    const input = api.tensorFromArray(inputData, [BATCH_SIZE, SEQ_LEN], {
+      device: "webgpu",
+    });
+    const target = api.tensorFromArray(targetData, [BATCH_SIZE, SEQ_LEN], {
+      device: "webgpu",
+    });
+    _t.data = performance.now() - _tt;
+    _tt = performance.now();
+
+    const loss = api.tidy(() => {
+      const l = api.autocast(() => model.forwardWithLoss(input, target).loss);
+      api.keep(l);
+      return l;
+    });
+
+    totalLoss += await loss.item();
+    _t.fwd = performance.now() - _tt;
+    _tt = performance.now();
+    await loss.backward();
+    _t.bwd = performance.now() - _tt;
+    _tt = performance.now();
+
+    // Accumulate gradients on GPU before zeroGrad clears them.
+    if (!accumGrads) {
+      accumGrads = params.map((p) =>
+        p.grad
+          ? api.mul(p.grad, 1 / ACCUM_STEPS)
+          : api.zeros(p.shape, { device: "webgpu" }),
+      );
+    } else {
+      for (let i = 0; i < params.length; i++) {
+        if (params[i].grad) {
+          api.add_(accumGrads[i], api.mul(params[i].grad, 1 / ACCUM_STEPS));
+        }
+      }
+    }
+    _t.accum = performance.now() - _tt;
+    _tt = performance.now();
+    // Force all lazy accum ops so they don't reference soon-to-be-destroyed grads
+    await api._runtime().forceAllPending();
+    _t.force = performance.now() - _tt;
+    _tt = performance.now();
+    optimizer.zeroGrad();
+    input.dispose();
+    target.dispose();
+    api.endStep();
+    await api.markStep();
+    _t.cleanup = performance.now() - _tt;
+    if (acc === 0 && trainStep._callCount >= 2 && trainStep._callCount <= 3) {
+      log(
+        `    micro ${acc}: data=${(_t.data / 1000).toFixed(1)}s fwd=${(_t.fwd / 1000).toFixed(1)}s bwd=${(_t.bwd / 1000).toFixed(1)}s accum=${(_t.accum / 1000).toFixed(1)}s force=${(_t.force / 1000).toFixed(1)}s cleanup=${(_t.cleanup / 1000).toFixed(1)}s`,
+      );
     }
   }
 
+  // Write accumulated grads to params and step
   await api.beginStep();
-  const input = api.tensorFromArray(inputData, [BATCH_SIZE, SEQ_LEN], {
-    device: "webgpu",
-  });
-  const target = api.tensorFromArray(targetData, [BATCH_SIZE, SEQ_LEN], {
-    device: "webgpu",
-  });
-
-  const loss = api.tidy(() => {
-    // AMP: autocast runs matmuls in f16, accumulates in f32
-    const l = api.autocast(() => {
-      const { loss } = model.forwardWithLoss(input, target);
-      return loss;
-    });
-    api.keep(l);
-    return l;
-  });
-  const lossVal = await loss.item();
-  await loss.backward();
+  for (let i = 0; i < params.length; i++) {
+    params[i]._setGrad(accumGrads![i]);
+  }
   clipGradNorm_(api, params, 1.0);
   optimizer.step();
   optimizer.zeroGrad();
-  input.dispose();
-  target.dispose();
   api.endStep();
   await api.markStep();
-  return lossVal;
+  return totalLoss / ACCUM_STEPS;
 }
 
 // ============================================================================
@@ -369,6 +421,16 @@ async function main() {
     process.exit(1);
   }
 
+  // Set GPU memory limit to 30GB (leave 2GB headroom on 32GB V100).
+  // createTrackedBuffer throws GPUMemoryLimitExceededError when exceeded,
+  // which is catchable — unlike Dawn's native OOM which silently corrupts.
+  const { setGPUMemoryLimit } = await import(
+    "../src/backend/webgpu/memory-tracker"
+  );
+  // 25GB tracked limit — leaves headroom for untracked allocations
+  // (arenas, pipelines, command buffers) on 32GB V100.
+  setGPUMemoryLimit(25 * 1024 * 1024 * 1024);
+
   const api = new Torchlette("webgpu", { enableFusion: true });
 
   // [Fix #1] All agents use same seed → identical random init
@@ -378,6 +440,7 @@ async function main() {
   const model = await createModel(api, MODEL_DIR);
   model.train(true);
   model.enableCheckpointing(true);
+  model.fullCheckpoint = true;
   model.setFullFinetuning(true);
   const params = model.getAllParameters();
   const totalParams = params.reduce(
@@ -403,8 +466,9 @@ async function main() {
   for (let i = 0; i < NUM_AGENTS; i++) {
     await waitForFile(path.join(SYNC_DIR, `ready-${i}`));
   }
+  const tokensPerStep = EFFECTIVE_BATCH * SEQ_LEN;
   log(
-    `All ${NUM_AGENTS} agents ready. Training: ${OUTER_ROUNDS} rounds × ${INNER_STEPS} steps`,
+    `All ${NUM_AGENTS} agents ready. Training: ${OUTER_ROUNDS} rounds × ${INNER_STEPS} steps (batch=${BATCH_SIZE}×${ACCUM_STEPS}accum=${EFFECTIVE_BATCH}, seq=${SEQ_LEN}, ${tokensPerStep} tok/step)`,
   );
 
   for (let round = 0; round < OUTER_ROUNDS; round++) {
@@ -417,22 +481,32 @@ async function main() {
 
     // Inner training loop
     const losses: number[] = [];
+    const stepTimes: number[] = [];
     for (let step = 0; step < INNER_STEPS; step++) {
+      const t0 = performance.now();
       const l = await trainStep(
         api,
         model,
         innerOpt,
         params,
         tokens,
-        (round * INNER_STEPS + step) * SEQ_LEN,
+        (round * INNER_STEPS + step) * tokensPerStep,
       );
+      const stepMs = performance.now() - t0;
       losses.push(l);
-      if (step % 25 === 0) {
-        const avg =
-          losses.slice(-10).reduce((a, b) => a + b, 0) /
-          Math.min(10, losses.length);
-        log(`  step ${step}: loss=${avg.toFixed(4)}`);
+      stepTimes.push(stepMs);
+      if (step % 10 === 0 || step < 3) {
+        log(
+          `  step ${step}: loss=${l.toFixed(4)} ${(stepMs / 1000).toFixed(1)}s (${Math.round(tokensPerStep / (stepMs / 1000))} tok/s)`,
+        );
       }
+    }
+    const steadyTimes = stepTimes.slice(1); // skip cold step 0
+    if (steadyTimes.length > 0) {
+      const avgMs = steadyTimes.reduce((a, b) => a + b, 0) / steadyTimes.length;
+      log(
+        `  steady-state: ${(avgMs / 1000).toFixed(2)}s/step, ${Math.round(tokensPerStep / (avgMs / 1000))} tok/s`,
+      );
     }
 
     // Compute pseudo-gradients: local_params - snapshot
@@ -469,10 +543,8 @@ async function main() {
     }
 
     // [Fix #4] Restore snapshot, apply outer Nesterov update
-    // Build pseudo-grad tensors for the outer optimizer
     await api.beginStep();
     for (let i = 0; i < params.length; i++) {
-      // [Fix #5] Pass Float32Array directly — no Array.from()
       api.copy_(
         params[i],
         api.tensorFromArray(globalSnapshot[i], params[i].shape, {
@@ -510,7 +582,6 @@ async function main() {
         Buffer.from(f32.buffer),
       );
     }
-    // Save param shapes for loading
     const shapes = params.map((p) => p.shape);
     fs.writeFileSync(
       path.join(checkpointDir, "shapes.json"),

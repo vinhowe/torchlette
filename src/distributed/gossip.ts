@@ -53,6 +53,16 @@ export type OnReceiveCallback = (
 export interface GossipConfig {
   /** Target number of peer connections (default: 5) */
   targetPeers?: number;
+  /** Explicit PeerJS ID (default: random). Set for server agents so browsers can connect by known ID. */
+  peerId?: string;
+  /** PeerJS IDs to connect to on startup (skip discovery). */
+  connectTo?: string[];
+  /** Custom PeerJS server config. Default: PeerJS cloud. */
+  peerServer?: { host: string; port: number; path: string; secure?: boolean };
+  /** ICE configuration (STUN/TURN servers). */
+  iceConfig?: {
+    iceServers: Array<{ urls: string; username?: string; credential?: string }>;
+  };
   /** Callback when pseudo-gradients are received */
   onReceive: OnReceiveCallback;
   /** Callback when peer count changes */
@@ -161,8 +171,17 @@ export class GossipNetwork {
   private myId = "";
   private destroyed = false;
 
+  private readonly explicitPeerId?: string;
+  private readonly connectTo?: string[];
+  private readonly peerServerConfig?: GossipConfig["peerServer"];
+  private readonly iceConfig?: GossipConfig["iceConfig"];
+
   constructor(config: GossipConfig) {
     this.targetPeers = config.targetPeers ?? 5;
+    this.explicitPeerId = config.peerId;
+    this.connectTo = config.connectTo;
+    this.peerServerConfig = config.peerServer;
+    this.iceConfig = config.iceConfig;
     this.onReceive = config.onReceive;
     this.onPeerCountChange = config.onPeerCountChange;
     this.onStatus = config.onStatus;
@@ -170,21 +189,47 @@ export class GossipNetwork {
 
   /** Join the gossip network. Returns this peer's ID. */
   async join(): Promise<string> {
+    // Polyfill WebRTC for Node.js if not in browser
+    if (typeof globalThis.RTCPeerConnection === "undefined") {
+      try {
+        const wrtc = await import("@roamhq/wrtc");
+        (globalThis as any).RTCPeerConnection =
+          (wrtc as any).default?.RTCPeerConnection ?? wrtc.RTCPeerConnection;
+        (globalThis as any).RTCSessionDescription =
+          (wrtc as any).default?.RTCSessionDescription ??
+          wrtc.RTCSessionDescription;
+        (globalThis as any).RTCIceCandidate =
+          (wrtc as any).default?.RTCIceCandidate ?? wrtc.RTCIceCandidate;
+      } catch (e) {
+        this.onStatus?.(`WebRTC polyfill failed: ${e}`);
+      }
+    }
     const { Peer } = await import("peerjs");
 
     return new Promise((resolve, reject) => {
       // Generate a deterministic-ish prefix so peers can find each other
       // by listing peers with this prefix on the PeerJS server.
       const prefix = "torchlette-diloco-";
-      const id = prefix + Math.random().toString(36).slice(2, 10);
+      const id =
+        this.explicitPeerId ?? prefix + Math.random().toString(36).slice(2, 10);
 
       this.peer = new Peer(id, {
         debug: 0, // silent
+        ...(this.peerServerConfig ?? {}),
+        ...(this.iceConfig ? { config: this.iceConfig } : {}),
       });
 
       this.peer.on("open", (myId: string) => {
         this.myId = myId;
         this.onStatus?.(`Joined as ${myId}`);
+        // Connect to explicit peers first, then discover
+        if (this.connectTo) {
+          for (const peerId of this.connectTo) {
+            if (peerId === myId) continue;
+            const conn = this.peer.connect(peerId, { reliable: true });
+            this.setupConnection(conn);
+          }
+        }
         this.discoverPeers();
         resolve(myId);
       });

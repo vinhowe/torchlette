@@ -27,5 +27,19 @@ export default defineConfig({
       "Cross-Origin-Opener-Policy": "same-origin",
       "Cross-Origin-Embedder-Policy": "require-corp",
     },
+    proxy: {
+      // PeerJS signaling server on host (sivri) via Docker gateway
+      "/peer-signal": {
+        target: "http://172.17.0.1:9000",
+        ws: true,
+        rewrite: (path: string) => path.replace(/^\/peer-signal/, ""),
+      },
+      // WebSocket relay for Docker↔host gradient bridge
+      "/ws-relay": {
+        target: "ws://172.17.0.1:9876",
+        ws: true,
+        rewrite: (path: string) => path.replace(/^\/ws-relay/, ""),
+      },
+    },
   },
 });

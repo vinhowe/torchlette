@@ -353,7 +353,7 @@ function mergeBatchableReductions(
 }
 
 /** Get all plan-node indices referenced by an action. */
-function getActionNodeIndices(action: LoweredAction): number[] {
+export function getActionNodeIndices(action: LoweredAction): number[] {
   switch (action.kind) {
     case "sequential":
     case "view":

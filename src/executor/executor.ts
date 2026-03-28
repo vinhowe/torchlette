@@ -63,7 +63,10 @@ import {
   recordPlanAnalysis,
   setProfileModule,
 } from "../graph/profiler";
-import { storageTracker } from "../graph/storage-tracker";
+import {
+  canSafelyRelease,
+  releaseBufferImmediate,
+} from "../graph/storage-tracker";
 import type {
   ExecutionPlan,
   LazyIRNode,
@@ -74,6 +77,7 @@ import {
   dispatchPackedOptimizer,
   type PackedOptimizerItem,
 } from "../optim/packed-dispatch";
+import { getLivePendingNodeIds } from "../runtime/tensor";
 import {
   assignSlot,
   buildCompiledPlan,
@@ -85,7 +89,11 @@ import {
   startCompilationRecording,
   stopCompilationRecording,
 } from "./compiled-plan";
-import { buildLoweredPlanFromAnalysis, type LoweredPlan } from "./lowered-plan";
+import {
+  buildLoweredPlanFromAnalysis,
+  getActionNodeIndices,
+  type LoweredPlan,
+} from "./lowered-plan";
 import {
   executeOpSync,
   getInputStorage,
@@ -806,85 +814,75 @@ export async function executeLoweredPlan(
   await ensureFusionImports();
 
   // =========================================================================
-  // Liveness analysis: compute when each node's output is last consumed.
-  // After an action executes, any input node whose last consumer was this
-  // action can have its buffer freed immediately instead of waiting for
-  // end-of-step cleanup. Saves ~8GB peak memory for GPT-2 124M training.
+  // Liveness analysis: free intermediate buffers as soon as their last
+  // consuming action completes. After release, buffers go to the pool's
+  // pendingRelease queue and become reusable at the next reclaim point.
+  //
+  // Key insight: the lowered plan's action order does NOT match plan-node
+  // step order (fused groups can cover non-contiguous positions). So we
+  // track the last ACTION INDEX that reads each node, not the last step.
   // =========================================================================
   const enableLivenessRelease = !!process.env.TORCHLETTE_LIVENESS_RELEASE;
-  let lastConsumerAction: Int32Array | null = null;
-  // Nodes that are plan outputs or already had results before execution — never free
-  const protectedNodes = new Set<number>();
+  let livenessOutputIds: Set<number> | null = null;
+  let livenessReleased: Set<number> | null = null;
+  let livenessNodeToStorage: Map<number, StorageHandle> | null = null;
+  let livenessNodeIdToIndex: Map<number, number> | null = null;
+  // nodeId → last action index that reads from this node
+  let livenessLastAction: Map<number, number> | null = null;
+  // actionIndex → [nodeIds to release after this action]
+  let livenessReleaseSchedule: Map<number, number[]> | null = null;
+
   if (enableLivenessRelease) {
-    // Build node ID → plan index map for O(1) lookup
-    const nodeIdToIdx = new Map<number, number>();
+    const nodeIdSet = new Set(planNodes.map((n) => n.id));
+
+    // Protected nodes: plan terminals + already-materialized + live RuntimeTensors
+    livenessOutputIds = new Set<number>();
+    livenessOutputIds.add(planNodes[planNodes.length - 1].id);
+    const livePendingIds = getLivePendingNodeIds();
+    for (const node of planNodes) {
+      if (node.result) livenessOutputIds.add(node.id);
+      if (livePendingIds.has(node.id)) livenessOutputIds.add(node.id);
+    }
+
+    // Map nodeId → plan index for O(1) lookup
+    livenessNodeIdToIndex = new Map();
     for (let i = 0; i < planNodes.length; i++) {
-      nodeIdToIdx.set(planNodes[i].id, i);
-      // Protect nodes that already have results (external inputs from prior plans)
-      if (planNodes[i].result) protectedNodes.add(i);
+      livenessNodeIdToIndex.set(planNodes[i].id, i);
     }
-    // Protect the last node (plan output) and any node referenced by
-    // saved-for-backward (these are kept alive by the autograd graph
-    // and must not be freed mid-plan).
-    protectedNodes.add(planNodes.length - 1);
-    // Also protect any node that has no consumers within this plan
-    // (lastConsumerAction stays -1) — these might be outputs or
-    // saved-for-backward tensors.
 
-    // For each plan node, find the last action index that reads it as input.
-    // -1 means the node is a final output or has no consumers in this plan.
-    lastConsumerAction = new Int32Array(planNodes.length).fill(-1);
-
+    // For each plan node, find the last action that reads it as an input.
+    // This operates in ACTION-INDEX space (not plan-step space), which is
+    // correct because actions can cover non-contiguous plan positions.
+    livenessLastAction = new Map<number, number>();
     for (let ai = 0; ai < loweredPlan.actions.length; ai++) {
-      const a = loweredPlan.actions[ai];
-      // Collect all plan node indices that this action reads as inputs
-      const consumedNodeIndices: number[] = [];
-      switch (a.kind) {
-        case "sequential":
-        case "view":
-        case "data-source":
-        case "prologue-skip": {
-          const node = planNodes[a.nodeIndex];
-          for (const ref of node.inputs) {
-            if (ref.kind === "pending") {
-              const idx = nodeIdToIdx.get(ref.node.id);
-              if (idx !== undefined) consumedNodeIndices.push(idx);
+      const actionNodeIndices = getActionNodeIndices(loweredPlan.actions[ai]);
+      for (const ni of actionNodeIndices) {
+        const node = planNodes[ni];
+        for (const ref of node.inputs) {
+          if (ref.kind === "pending" && nodeIdSet.has(ref.node.id)) {
+            const cur = livenessLastAction.get(ref.node.id);
+            if (cur === undefined || ai > cur) {
+              livenessLastAction.set(ref.node.id, ai);
             }
           }
-          break;
         }
-        case "fused":
-        case "matmul-epilogue":
-        case "row-program": {
-          for (const ni of a.coveredNodeIndices) {
-            const node = planNodes[ni];
-            for (const ref of node.inputs) {
-              if (ref.kind === "pending") {
-                const idx = planNodes.indexOf(ref.node);
-                if (idx >= 0) consumedNodeIndices.push(idx);
-              }
-            }
-          }
-          break;
-        }
-        case "adam-batch":
-        case "batched-reduction": {
-          for (const ni of a.nodeIndices) {
-            const node = planNodes[ni];
-            for (const ref of node.inputs) {
-              if (ref.kind === "pending") {
-                const idx = planNodes.indexOf(ref.node);
-                if (idx >= 0) consumedNodeIndices.push(idx);
-              }
-            }
-          }
-          break;
-        }
-      }
-      for (const ni of consumedNodeIndices) {
-        lastConsumerAction[ni] = ai; // Update: this action is a later consumer
       }
     }
+
+    // Build release schedule: after action[i] completes, release these nodes
+    livenessReleaseSchedule = new Map();
+    for (const [nodeId, lastAi] of livenessLastAction) {
+      if (livenessOutputIds.has(nodeId)) continue;
+      let list = livenessReleaseSchedule.get(lastAi);
+      if (!list) {
+        list = [];
+        livenessReleaseSchedule.set(lastAi, list);
+      }
+      list.push(nodeId);
+    }
+
+    livenessReleased = new Set();
+    livenessNodeToStorage = new Map();
   }
 
   try {
@@ -1297,36 +1295,44 @@ export async function executeLoweredPlan(
         }
       }
 
-      // Liveness-based early release: free buffers whose last consumer
-      // was this action. The buffer is returned to the pool immediately,
-      // reducing peak memory during backward pass.
-      if (lastConsumerAction && !compilationRecording) {
-        for (let ni = 0; ni < planNodes.length; ni++) {
-          if (
-            lastConsumerAction[ni] === actionIndex &&
-            !protectedNodes.has(ni)
-          ) {
-            const node = planNodes[ni];
-            if (node.result && !(node.result as any).released) {
-              // Only free if the storage's RuntimeTensor has no external refs.
-              // Saved-for-backward tensors are kept alive by the autograd graph
-              // via keep() — their RuntimeTensor.refCount > 0 or they're marked
-              // as externally reachable in the storageTracker.
-              const storage = node.result;
-              if (!storageTracker.isReachable(storage.id)) {
-                const bt = storage.backendTensor as {
-                  destroy?: () => void;
-                  ownsBuffer?: boolean;
-                };
-                if (bt.ownsBuffer !== false && bt.destroy) {
-                  bt.destroy();
-                  (storage as any).released = true;
-                }
-              }
+      // Liveness-based early release: free dead buffers after each action.
+      // Uses the pre-built release schedule (action-index based, not step based).
+      if (livenessReleaseSchedule && !compilationRecording) {
+        // Register newly-produced storages for release tracking
+        const covered = getActionNodeIndices(action);
+        for (const ni of covered) {
+          const node = planNodes[ni];
+          if (node.result) {
+            livenessNodeToStorage!.set(node.id, node.result);
+          }
+        }
+
+        // Release nodes scheduled for this action index
+        const toRelease = livenessReleaseSchedule.get(actionIndex);
+        if (toRelease) {
+          for (const nodeId of toRelease) {
+            if (livenessReleased!.has(nodeId)) continue;
+            const storage = livenessNodeToStorage!.get(nodeId);
+            if (storage && canSafelyRelease(storage, livenessNodeToStorage!)) {
+              releaseBufferImmediate(storage);
+              livenessNodeToStorage!.delete(nodeId);
+              const idx = livenessNodeIdToIndex!.get(nodeId);
+              if (idx !== undefined) planNodes[idx].result = undefined;
+              livenessReleased!.add(nodeId);
             }
           }
         }
       }
+    }
+    if (livenessReleased?.size && process.env.TORCHLETTE_DEBUG_LIVENESS) {
+      const outputCount = livenessOutputIds?.size ?? 0;
+      const totalNodes = planNodes.length;
+      const reclaimCount = loweredPlan.actions.filter(
+        (a) => a.kind === "reclaim",
+      ).length;
+      console.log(
+        `[liveness] released=${livenessReleased.size}/${totalNodes} (${outputCount} protected, ${reclaimCount} reclaims)`,
+      );
     }
   } finally {
     // Build compiled plan from recording
@@ -1650,6 +1656,11 @@ export async function executePlanOptimized(
       rowProgramMatches: analysis.rowProgramMatches,
       matmulDirectives: analysis.matmulDirectives,
       enableVectorization,
+      // When liveness release is enabled, insert frequent reclaim points so
+      // released buffers get promoted from pendingRelease to the available pool.
+      reclaimInterval: process.env.TORCHLETTE_LIVENESS_RELEASE
+        ? 300
+        : undefined,
     });
     template.loweredPlan = loweredPlan;
 

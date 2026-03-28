@@ -123,6 +123,15 @@ export function getPendingNodeIds(): Set<number> {
 }
 
 /**
+ * Get node IDs with live (non-disposed) pending tensors only.
+ * Unlike getPendingNodeIds(), excludes disposed tensors — their buffers can be
+ * reused after their last in-plan consumer. Used by liveness-based buffer release.
+ */
+export function getLivePendingNodeIds(): Set<number> {
+  return new Set(pendingTensorsByNodeId.keys());
+}
+
+/**
  * Clear the disposed pending node IDs set.
  * Called after plan execution to prevent unbounded growth.
  */
