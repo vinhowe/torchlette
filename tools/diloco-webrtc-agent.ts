@@ -33,7 +33,7 @@ const OUTER_MU = parseFloat(process.env.OUTER_MU ?? "0.9");
 const SEQ_LEN = parseInt(process.env.SEQ_LEN ?? "512", 10);
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE ?? "6", 10);
 const MODEL_DIR = process.env.MODEL ?? "gpt2";
-const BRIDGE_URL = process.env.BRIDGE_URL ?? "ws://172.17.0.1:9876";
+const SERVER_URL = process.env.SERVER_URL ?? "ws://5.78.181.14:443";
 
 const GPT2_CONFIG = {
   vocabSize: 50257,
@@ -245,34 +245,83 @@ async function main() {
     momentum: OUTER_MU,
   });
 
-  // ── Connect to bridge ──
-  const ws = new WebSocket(BRIDGE_URL);
+  // ── Connect to coordination server ──
+  const ws = new WebSocket(SERVER_URL);
   let peerGrads: Float32Array[] | null = null;
   let peerCount = 0;
+  let myPeerId = "";
 
   await new Promise<void>((resolve, reject) => {
     ws.on("open", () => {
-      log(`Connected to bridge at ${BRIDGE_URL}`);
-      resolve();
+      ws.send(
+        JSON.stringify({
+          type: "register",
+          peerId: "v100-" + Date.now(),
+          model: "gpt2-124m",
+        }),
+      );
+      log(`Connected to ${SERVER_URL}`);
+    });
+    ws.on("message", (data: Buffer) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === "registered") {
+          myPeerId = msg.peerId;
+          peerCount = msg.peers - 1;
+          log(`Registered as ${myPeerId} (${msg.peers} peers total)`);
+          resolve();
+        }
+      } catch {}
     });
     ws.on("error", (e) => reject(e));
-    setTimeout(() => reject(new Error("Bridge connection timeout")), 10000);
+    setTimeout(() => reject(new Error("Server timeout")), 10000);
   });
 
-  ws.on("message", (data: Buffer) => {
+  ws.on("message", async (data: Buffer) => {
     try {
       const msg = JSON.parse(data.toString());
       if (msg.type === "peer-joined") {
-        peerCount++;
-        log(`Peer joined: ${msg.peer} (${peerCount} peers)`);
+        peerCount = msg.peers - 1;
+        log(`Peer joined: ${msg.peerId} (${msg.peers} total)`);
       } else if (msg.type === "peer-left") {
-        peerCount = Math.max(0, peerCount - 1);
-        log(`Peer left: ${msg.peer} (${peerCount} peers)`);
+        peerCount = msg.peers;
+        log(`Peer left: ${msg.peerId} (${msg.peers} total)`);
+      } else if (msg.type === "send-weights") {
+        // New peer needs our current weights — send raw f32 (not E3M0)
+        log(`Sending weights to ${msg.target}...`);
+        // Serialize: numParams(u32) + [shape_rank(u32) + shape(u32[]) + data(f32[])] per param
+        const parts: Buffer[] = [];
+        const numParamsBuf = Buffer.alloc(4);
+        numParamsBuf.writeUInt32LE(params.length, 0);
+        parts.push(numParamsBuf);
+        for (const p of params) {
+          const data = new Float32Array(await p.cpu());
+          const shapeBuf = Buffer.alloc(4 + p.shape.length * 4);
+          shapeBuf.writeUInt32LE(p.shape.length, 0);
+          for (let d = 0; d < p.shape.length; d++)
+            shapeBuf.writeUInt32LE(p.shape[d], 4 + d * 4);
+          parts.push(shapeBuf);
+          parts.push(
+            Buffer.from(data.buffer, data.byteOffset, data.byteLength),
+          );
+        }
+        const payload = Buffer.concat(parts);
+        // Prefix with "WGHT" + target ID so server routes it
+        const targetBuf = Buffer.from(msg.target, "utf8");
+        const header = Buffer.alloc(6 + targetBuf.length);
+        header.write("WGHT", 0);
+        header.writeUInt16LE(targetBuf.length, 4);
+        targetBuf.copy(header, 6);
+        ws.send(Buffer.concat([header, payload]));
+        log(
+          `Sent ${(payload.length / 1024 / 1024).toFixed(1)}MB raw weights to ${msg.target}`,
+        );
       }
+      return;
     } catch {
-      // Binary data = gradient blob from a browser peer
+      // Binary = gradient blob from neighbor
       log(
-        `Received ${(data.length / 1024 / 1024).toFixed(1)}MB gradient from peer`,
+        `Received ${(data.length / 1024 / 1024).toFixed(1)}MB gradient from neighbor`,
       );
       peerGrads = deserializePseudoGrads(Buffer.from(data));
     }
@@ -283,23 +332,14 @@ async function main() {
     `Training: ${OUTER_ROUNDS} rounds × ${INNER_STEPS} steps, batch=${BATCH_SIZE}, seq=${SEQ_LEN}, ${tokensPerStep} tok/step`,
   );
 
-  // Wait for at least one peer before starting
-  log("Waiting for browser peer to connect...");
-  while (peerCount === 0) {
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-  log(`${peerCount} peer(s) connected. Starting training.`);
-
   // ── Training loop ──
   for (let round = 0; round < OUTER_ROUNDS; round++) {
     const roundStart = performance.now();
 
-    // Snapshot
     const globalSnapshot: Float32Array[] = [];
     for (const p of params)
       globalSnapshot.push(new Float32Array(await p.cpu()));
 
-    // Inner training
     const losses: number[] = [];
     for (let step = 0; step < INNER_STEPS; step++) {
       const l = await trainStep(
@@ -311,9 +351,7 @@ async function main() {
         (round * INNER_STEPS + step) * tokensPerStep,
       );
       losses.push(l);
-      if (step % 10 === 0) {
-        log(`  step ${step}: loss=${l.toFixed(4)}`);
-      }
+      if (step % 10 === 0) log(`  step ${step}: loss=${l.toFixed(4)}`);
     }
 
     // Compute pseudo-gradients
@@ -326,14 +364,18 @@ async function main() {
       pseudoGrads.push(delta);
     }
 
-    // Send E3M0-compressed pseudo-gradients to browser peers
+    // Request neighbors + send gradients
+    ws.send(JSON.stringify({ type: "request-neighbors", round }));
     const compressed = serializePseudoGrads(pseudoGrads);
     ws.send(compressed);
     log(
-      `Broadcast ${(compressed.length / 1024 / 1024).toFixed(1)}MB to ${peerCount} peers`,
+      `Sent ${(compressed.length / 1024 / 1024).toFixed(1)}MB gradients (round ${round})`,
     );
 
-    // Average with any received peer grads
+    // Wait briefly for peer grads
+    await new Promise((r) => setTimeout(r, 3000));
+
+    // Average with received peer grads
     const avgGrads = pseudoGrads.map((pg) => new Float32Array(pg.length));
     let numContributors = 1;
     for (let p = 0; p < pseudoGrads.length; p++)
@@ -354,9 +396,9 @@ async function main() {
           avgGrads[p][j] /= numContributors;
     }
 
-    // Restore snapshot + outer Nesterov update (skip if solo — no averaging to do)
+    // Outer update (skip if solo)
     if (numContributors <= 1) {
-      log(`  solo round — keeping local params (no outer update)`);
+      log("  solo round — keeping local params");
     } else {
       await api.beginStep();
       for (let i = 0; i < params.length; i++) {
@@ -378,13 +420,12 @@ async function main() {
     const elapsed = ((performance.now() - roundStart) / 1000).toFixed(1);
     const avgLoss = losses.reduce((a, b) => a + b, 0) / losses.length;
     log(
-      `round ${round}: loss=${avgLoss.toFixed(4)}, ${elapsed}s, peers=${peerCount}, contributors=${numContributors}`,
+      `round ${round}: loss=${avgLoss.toFixed(4)}, ${elapsed}s, peers=${peerCount + 1}, contributors=${numContributors}`,
     );
   }
 
-  // Wait for bridge to finish forwarding chunks before closing
-  log("Training done. Waiting for gradient delivery...");
-  await new Promise((r) => setTimeout(r, 30000));
+  log("Training complete.");
+  await new Promise((r) => setTimeout(r, 5000));
   ws.close();
   outerOpt.dispose();
   await destroyWebGPU();

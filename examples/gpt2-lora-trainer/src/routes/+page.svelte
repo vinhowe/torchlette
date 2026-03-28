@@ -270,7 +270,7 @@ function handleLoadModel() {
           <input
             type="text"
             class="flex-1 bg-slate-900 border border-slate-700 text-xs text-slate-300 font-mono px-1 py-0.5 focus:outline-none focus:border-blue-600"
-            placeholder="Server peer ID"
+            placeholder="ws://server:port"
             value={trainingStore.peerServerId}
             oninput={(e) => { trainingStore.peerServerId = (e.target as HTMLInputElement).value; }}
             disabled={trainingStore.peerConnected}

@@ -97,6 +97,71 @@ async function load(loraRank: number, loraAlpha: number): Promise<void> {
   }
 }
 
+/**
+ * Load model for pretraining from scratch.
+ * Skips 500MB weight download. Initializes randomly with seed 42
+ * (matching V100 DiLoCo agent for identical starting weights).
+ */
+async function loadForPretraining(): Promise<void> {
+  if (status === "loading" || status === "ready") return;
+
+  status = "loading";
+  errorMsg = "";
+  progress = 0;
+  progressText = "Checking WebGPU...";
+
+  try {
+    webgpuOk = await checkWebGPU();
+    if (!webgpuOk)
+      throw new Error("WebGPU not supported. Use Chrome 113+ or Edge 113+.");
+
+    progressText = "Initializing WebGPU...";
+    progress = 10;
+    const ok = await initWebGPU();
+    if (!ok) throw new Error(getWebGPUInitError() || "WebGPU init failed");
+
+    setGPUMemoryLimit(8 * 1024 * 1024 * 1024);
+
+    api = new Torchlette("webgpu", { enableFusion: true });
+    api.manualSeed(42); // Must match V100 agent seed
+    progress = 20;
+
+    progressText = "Loading tokenizer...";
+    const tokData = await fetchTokenizer((_, __, s) => {
+      progressText = s;
+    });
+    tokenizer = new GPT2Tokenizer();
+    tokenizer.load(tokData.vocab, tokData.merges);
+    progress = 40;
+
+    progressText = "Initializing random weights (seed 42)...";
+    const loraConfig = createLoRAConfig(1, 1); // rank=1 alpha=1 to match V100
+    model = new GPT2WithLoRA(api, GPT2_SMALL_CONFIG, loraConfig, "webgpu");
+
+    // Random init matching V100: normal_(0, 0.02) for 2D+ params
+    const { normal_ } = await import("../../../../../src/nn/init");
+    const params = model.getAllParameters();
+    for (const p of params) {
+      if (p.shape.length >= 2) {
+        normal_(api, p, 0, 0.02);
+      }
+    }
+    progress = 80;
+
+    model.setFullFinetuning(true);
+    await api.markStep();
+
+    progress = 100;
+    progressText = "Ready (from scratch)";
+    status = "ready";
+  } catch (e) {
+    errorMsg = e instanceof Error ? e.message : String(e);
+    status = "error";
+    progress = 0;
+    progressText = "";
+  }
+}
+
 export const modelStore = {
   get status() {
     return status;
@@ -127,5 +192,6 @@ export const modelStore = {
   },
 
   load,
+  loadForPretraining,
   checkWebGPU,
 };
