@@ -287,35 +287,22 @@ async function main() {
         peerCount = msg.peers;
         log(`Peer left: ${msg.peerId} (${msg.peers} total)`);
       } else if (msg.type === "send-weights") {
-        // New peer needs our current weights — send raw f32 (not E3M0)
-        log(`Sending weights to ${msg.target}...`);
-        // Serialize: numParams(u32) + [shape_rank(u32) + shape(u32[]) + data(f32[])] per param
-        const parts: Buffer[] = [];
-        const numParamsBuf = Buffer.alloc(4);
-        numParamsBuf.writeUInt32LE(params.length, 0);
-        parts.push(numParamsBuf);
-        for (const p of params) {
-          const data = new Float32Array(await p.cpu());
-          const shapeBuf = Buffer.alloc(4 + p.shape.length * 4);
-          shapeBuf.writeUInt32LE(p.shape.length, 0);
-          for (let d = 0; d < p.shape.length; d++)
-            shapeBuf.writeUInt32LE(p.shape[d], 4 + d * 4);
-          parts.push(shapeBuf);
-          parts.push(
-            Buffer.from(data.buffer, data.byteOffset, data.byteLength),
+        // Send last checkpoint file (no GPU memory cost)
+        const ckptPath = "/tmp/diloco-webrtc-checkpoint.bin";
+        if (fs.existsSync(ckptPath)) {
+          const payload = fs.readFileSync(ckptPath);
+          const targetBuf = Buffer.from(msg.target, "utf8");
+          const header = Buffer.alloc(6 + targetBuf.length);
+          header.write("WGHT", 0);
+          header.writeUInt16LE(targetBuf.length, 4);
+          targetBuf.copy(header, 6);
+          ws.send(Buffer.concat([header, payload]));
+          log(
+            `Sent ${(payload.length / 1024 / 1024).toFixed(1)}MB checkpoint to ${msg.target}`,
           );
+        } else {
+          log(`No checkpoint yet, ${msg.target} will use random init`);
         }
-        const payload = Buffer.concat(parts);
-        // Prefix with "WGHT" + target ID so server routes it
-        const targetBuf = Buffer.from(msg.target, "utf8");
-        const header = Buffer.alloc(6 + targetBuf.length);
-        header.write("WGHT", 0);
-        header.writeUInt16LE(targetBuf.length, 4);
-        targetBuf.copy(header, 6);
-        ws.send(Buffer.concat([header, payload]));
-        log(
-          `Sent ${(payload.length / 1024 / 1024).toFixed(1)}MB raw weights to ${msg.target}`,
-        );
       }
       return;
     } catch {
@@ -416,6 +403,24 @@ async function main() {
       api.endStep();
       await api.markStep();
     }
+
+    // Save checkpoint from the snapshot we already have (no extra GPU readback)
+    const ckptParts: Buffer[] = [];
+    const ckptHeader = Buffer.alloc(4);
+    ckptHeader.writeUInt32LE(params.length, 0);
+    ckptParts.push(ckptHeader);
+    for (let i = 0; i < params.length; i++) {
+      const shapeBuf = Buffer.alloc(4 + params[i].shape.length * 4);
+      shapeBuf.writeUInt32LE(params[i].shape.length, 0);
+      for (let d = 0; d < params[i].shape.length; d++)
+        shapeBuf.writeUInt32LE(params[i].shape[d], 4 + d * 4);
+      ckptParts.push(shapeBuf);
+      ckptParts.push(Buffer.from(globalSnapshot[i].buffer));
+    }
+    fs.writeFileSync(
+      "/tmp/diloco-webrtc-checkpoint.bin",
+      Buffer.concat(ckptParts),
+    );
 
     const elapsed = ((performance.now() - roundStart) / 1000).toFixed(1);
     const avgLoss = losses.reduce((a, b) => a + b, 0) / losses.length;
