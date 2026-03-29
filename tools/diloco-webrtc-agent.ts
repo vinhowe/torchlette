@@ -202,6 +202,19 @@ async function trainStep(
   target.dispose();
   api.endStep();
   await api.markStep();
+  // Memory diagnostic
+  const { getGPUMemoryStats } = await import(
+    "../src/backend/webgpu/memory-tracker"
+  );
+  const { bufferPool: bp } = await import("../src/backend/webgpu/buffer-pool");
+  const ms = getGPUMemoryStats();
+  const ps = bp.stats();
+  if (trainStep._stepCount % 5 === 0) {
+    log(
+      `    mem: tracked=${Math.round(ms.currentBytes / 1e6)}MB peak=${Math.round(ms.peakBytes / 1e6)}MB pool=${Math.round(ps.pooledBytes / 1e6)}MB`,
+    );
+  }
+  trainStep._stepCount = (trainStep._stepCount ?? 0) + 1;
   return lossVal;
 }
 
@@ -323,13 +336,11 @@ async function main() {
   for (let round = 0; round < OUTER_ROUNDS; round++) {
     const roundStart = performance.now();
 
-    // Only snapshot if we have peers (outer update needs snapshot to restore)
+    // Always snapshot (the CPU readback also serves as a force/sync point)
     const hasPeers = peerCount > 0;
     const globalSnapshot: Float32Array[] = [];
-    if (hasPeers) {
-      for (const p of params)
-        globalSnapshot.push(new Float32Array(await p.cpu()));
-    }
+    for (const p of params)
+      globalSnapshot.push(new Float32Array(await p.cpu()));
 
     const losses: number[] = [];
     for (let step = 0; step < INNER_STEPS; step++) {
@@ -345,13 +356,14 @@ async function main() {
       if (step % 10 === 0) log(`  step ${step}: loss=${l.toFixed(4)}`);
     }
 
-    // Free GPU memory before any CPU readback (checkpoint, pseudo-grads)
-    await api.evictArenas();
-    await api.flushStep();
+    // (eviction disabled for debugging)
 
     // Skip gradient exchange entirely when solo — just keep training
     if (!hasPeers && !peerGrads) {
       log(`  solo (no peers) — continuing training`);
+      // Force any pending lazy ops — without the snapshot CPU readback,
+      // stale lazy refs from the training loop could corrupt the next round
+      await api._runtime().forceAllPending();
     } else {
       // Compute pseudo-gradients
       const pseudoGrads: Float32Array[] = [];
