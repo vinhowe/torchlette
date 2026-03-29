@@ -1634,8 +1634,8 @@ export class Torchlette {
    * Call between training rounds to prevent unbounded growth in long sessions.
    * One-time cost: next step rebuilds the arena (~100ms), then back to full speed.
    */
-  evictArenas(): void {
-    const { evictAllArenas } = require("../executor/executor");
+  async evictArenas(): Promise<void> {
+    const { evictAllArenas } = await import("../executor/executor");
     evictAllArenas();
   }
 

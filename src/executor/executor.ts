@@ -12,6 +12,7 @@ import {
   clearActiveArena,
   clearArenaConflictDetected,
   clearArenaExternalInputBuffers,
+  destroyArena,
   endSharedEncoder,
   flushBufferPool,
   flushSharedEncoder,
@@ -263,7 +264,7 @@ export function getFusionAnalysisTemplate(
  * unbounded GPU memory growth in long-running training.
  */
 export function evictAllArenas(): void {
-  const { destroyArena } = require("../backend/webgpu/buffer-arena");
+  // Import is at top of file — destroyArena is already available
   for (const [, template] of fusionAnalysisCache) {
     if (template.bufferArena) {
       destroyArena(template.bufferArena);

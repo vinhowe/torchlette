@@ -345,6 +345,10 @@ async function main() {
       if (step % 10 === 0) log(`  step ${step}: loss=${l.toFixed(4)}`);
     }
 
+    // Free GPU memory before any CPU readback (checkpoint, pseudo-grads)
+    await api.evictArenas();
+    await api.flushStep();
+
     // Skip gradient exchange entirely when solo — just keep training
     if (!hasPeers && !peerGrads) {
       log(`  solo (no peers) — continuing training`);
@@ -431,9 +435,6 @@ async function main() {
       "/tmp/diloco-webrtc-checkpoint.bin",
       Buffer.concat(ckptParts),
     );
-
-    // Evict arenas between rounds to prevent unbounded GPU memory growth
-    api.evictArenas();
 
     const elapsed = ((performance.now() - roundStart) / 1000).toFixed(1);
     const avgLoss = losses.reduce((a, b) => a + b, 0) / losses.length;
