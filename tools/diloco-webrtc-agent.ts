@@ -417,24 +417,25 @@ async function main() {
       }
     }
 
-    // Save checkpoint (reuse snapshot if we have it, otherwise read fresh)
-    const ckptParts: Buffer[] = [];
-    const ckptHeader = Buffer.alloc(4);
-    ckptHeader.writeUInt32LE(params.length, 0);
-    ckptParts.push(ckptHeader);
-    for (let i = 0; i < params.length; i++) {
-      const shapeBuf = Buffer.alloc(4 + params[i].shape.length * 4);
-      shapeBuf.writeUInt32LE(params[i].shape.length, 0);
-      for (let d = 0; d < params[i].shape.length; d++)
-        shapeBuf.writeUInt32LE(params[i].shape[d], 4 + d * 4);
-      ckptParts.push(shapeBuf);
-      const data = globalSnapshot[i] ?? new Float32Array(await params[i].cpu());
-      ckptParts.push(Buffer.from(data.buffer));
+    // Save checkpoint only when we have snapshot data (i.e., peers are connected)
+    if (globalSnapshot.length > 0) {
+      const ckptParts: Buffer[] = [];
+      const ckptHeader = Buffer.alloc(4);
+      ckptHeader.writeUInt32LE(params.length, 0);
+      ckptParts.push(ckptHeader);
+      for (let i = 0; i < params.length; i++) {
+        const shapeBuf = Buffer.alloc(4 + params[i].shape.length * 4);
+        shapeBuf.writeUInt32LE(params[i].shape.length, 0);
+        for (let d = 0; d < params[i].shape.length; d++)
+          shapeBuf.writeUInt32LE(params[i].shape[d], 4 + d * 4);
+        ckptParts.push(shapeBuf);
+        ckptParts.push(Buffer.from(globalSnapshot[i].buffer));
+      }
+      fs.writeFileSync(
+        "/tmp/diloco-webrtc-checkpoint.bin",
+        Buffer.concat(ckptParts),
+      );
     }
-    fs.writeFileSync(
-      "/tmp/diloco-webrtc-checkpoint.bin",
-      Buffer.concat(ckptParts),
-    );
 
     const elapsed = ((performance.now() - roundStart) / 1000).toFixed(1);
     const avgLoss = losses.reduce((a, b) => a + b, 0) / losses.length;
