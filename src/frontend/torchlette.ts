@@ -1614,16 +1614,9 @@ export class Torchlette {
       // Wait for GPU completion so buffers are safe to reuse/destroy
       issueDeferredFence();
       await awaitDeferredFence();
-      // Now safe: promote pending → pool, destroy pending-destroy queue
+      // Promote pending → pool (makes them reusable), destroy pending-destroy
       flushBufferPool();
       destroyPendingGPUBuffers();
-      // Evict pool buffers to actually free GPU memory
-      const evicted = evictAllPoolBuffers();
-      if (process.env.TORCHLETTE_DEBUG_FLUSH) {
-        console.error(
-          `[flushStep] evicted ${Math.round(evicted / 1e6)}MB from pool`,
-        );
-      }
     } catch {
       // Safe to ignore if WebGPU backend not initialized
     }
