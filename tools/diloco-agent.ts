@@ -561,6 +561,8 @@ async function main() {
     api.endStep();
     await api.markStep();
 
+    await api.evictArenas();
+
     const elapsed = ((performance.now() - roundStart) / 1000).toFixed(1);
     const avgLoss = losses.reduce((a, b) => a + b, 0) / losses.length;
     const gradSize = fs.statSync(
