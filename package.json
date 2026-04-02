@@ -1,6 +1,6 @@
 {
   "name": "torchlette",
-  "version": "0.0.0",
+  "version": "1.0.3",
   "description": "Torchlette core library",
   "type": "module",
   "exports": {
