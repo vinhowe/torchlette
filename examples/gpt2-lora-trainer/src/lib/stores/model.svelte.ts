@@ -136,7 +136,16 @@ async function loadForPretraining(): Promise<void> {
 
     progressText = "Initializing random weights (seed 42)...";
     const loraConfig = createLoRAConfig(1, 1); // rank=1 alpha=1 to match V100
-    model = new GPT2WithLoRA(api, GPT2_SMALL_CONFIG, loraConfig, "webgpu");
+    // Half-size GPT-2 for TinyStories (must match V100 agent config)
+    const PRETRAIN_CONFIG = {
+      vocabSize: 50257,
+      blockSize: 1024,
+      numLayers: 6,
+      numHeads: 6,
+      embedDim: 384,
+      dropoutRate: 0,
+    };
+    model = new GPT2WithLoRA(api, PRETRAIN_CONFIG, loraConfig, "webgpu");
 
     // Random init matching V100: normal_(0, 0.02) for 2D+ params
     const { normal_ } = await import("../../../../../src/nn/init");
@@ -149,6 +158,16 @@ async function loadForPretraining(): Promise<void> {
     progress = 80;
 
     model.setFullFinetuning(true);
+    await api._runtime().forceAllPending();
+    const p0Init = await params[0].cpu();
+    console.log(
+      "[init-check] browser param[0] first4:",
+      Array.from(p0Init.slice(0, 4)).map((v: number) => v.toFixed(8)),
+    );
+    console.log(
+      "[init-check] expected V100:  [-0.00575741,-0.02528063,0.01242364,-0.00770933]",
+    );
+    console.log("[init-check] nParams:", params.length);
     await api.markStep();
 
     progress = 100;

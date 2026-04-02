@@ -277,6 +277,25 @@ export function evictAllArenas(): void {
   }
 }
 
+/**
+ * Invalidate compiled plans without destroying arena buffers.
+ * Use after param buffers change (e.g., outer optimizer step) to force
+ * recompilation on the next step. Lighter than evictAllArenas() — avoids
+ * the transient OOM from arena rebuild.
+ */
+export function invalidateCompiledPlans(): void {
+  for (const [, template] of fusionAnalysisCache) {
+    if (template.loweredPlan?.compiledPlan) {
+      template.loweredPlan.compiledPlan = undefined;
+    }
+    // Clear arena too — its bind groups reference stale param buffers
+    if (template.bufferArena) {
+      destroyArena(template.bufferArena);
+      template.bufferArena = undefined;
+    }
+  }
+}
+
 type AdamStepFn = NonNullable<
   import("../backend/types").Backend["ops"]["adamStep"]
 >;
@@ -843,7 +862,9 @@ export async function executeLoweredPlan(
   // step order (fused groups can cover non-contiguous positions). So we
   // track the last ACTION INDEX that reads each node, not the last step.
   // =========================================================================
-  const enableLivenessRelease = !!process.env.TORCHLETTE_LIVENESS_RELEASE;
+  // Liveness-based buffer release: free intermediate buffers mid-plan execution.
+  // Enabled by default; opt out with TORCHLETTE_LIVENESS_RELEASE=0.
+  const enableLivenessRelease = process.env.TORCHLETTE_LIVENESS_RELEASE !== "0";
   let livenessOutputIds: Set<number> | null = null;
   let livenessReleased: Set<number> | null = null;
   let livenessNodeToStorage: Map<number, StorageHandle> | null = null;
@@ -856,7 +877,11 @@ export async function executeLoweredPlan(
   if (enableLivenessRelease) {
     const nodeIdSet = new Set(planNodes.map((n) => n.id));
 
-    // Protected nodes: plan terminals + already-materialized + live RuntimeTensors
+    // Protected nodes: plan terminals + already-materialized + live RuntimeTensors.
+    // Materialized nodes (node.result) MUST stay protected — their buffers may be
+    // read by subsequent plan actions even after the liveness analysis thinks they're
+    // dead (the analysis only sees plan-internal references, not external ones like
+    // compiled plan cache slots or arena bindings).
     livenessOutputIds = new Set<number>();
     livenessOutputIds.add(planNodes[planNodes.length - 1].id);
     const livePendingIds = getLivePendingNodeIds();
@@ -1677,15 +1702,31 @@ export async function executePlanOptimized(
       rowProgramMatches: analysis.rowProgramMatches,
       matmulDirectives: analysis.matmulDirectives,
       enableVectorization,
-      // When liveness release is enabled, insert frequent reclaim points so
-      // released buffers get promoted from pendingRelease to the available pool.
-      reclaimInterval: process.env.TORCHLETTE_LIVENESS_RELEASE
-        ? 300
-        : undefined,
+      // Insert reclaim points so released buffers get promoted to the available pool.
+      // Matches the enableLivenessRelease default-on behavior.
+      reclaimInterval:
+        process.env.TORCHLETTE_LIVENESS_RELEASE !== "0" ? 300 : undefined,
     });
     template.loweredPlan = loweredPlan;
 
     fusionAnalysisCache.set(fingerprint, template);
+
+    // Evict old templates if cache grows too large (each has a GPU arena)
+    const MAX_CACHED_TEMPLATES = 16;
+    if (fusionAnalysisCache.size > MAX_CACHED_TEMPLATES) {
+      // Remove oldest entries (first in map insertion order)
+      const toRemove = fusionAnalysisCache.size - MAX_CACHED_TEMPLATES;
+      let removed = 0;
+      for (const [fp, tmpl] of fusionAnalysisCache) {
+        if (removed >= toRemove) break;
+        if (fp === fingerprint) continue; // don't evict the one we just added
+        if (tmpl.bufferArena) {
+          destroyArena(tmpl.bufferArena);
+        }
+        fusionAnalysisCache.delete(fp);
+        removed++;
+      }
+    }
 
     if (process.env.TORCHLETTE_DEBUG_COMPILED) {
       // Log op histogram for structural comparison

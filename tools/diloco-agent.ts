@@ -49,7 +49,7 @@ const OUTER_LR = parseFloat(process.env.OUTER_LR ?? "0.7");
 const OUTER_MU = parseFloat(process.env.OUTER_MU ?? "0.9");
 const SEQ_LEN = parseInt(process.env.SEQ_LEN ?? "512", 10);
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE ?? "4", 10);
-const ACCUM_STEPS = parseInt(process.env.ACCUM_STEPS ?? "2", 10);
+const ACCUM_STEPS = parseInt(process.env.ACCUM_STEPS ?? "1", 10);
 const MODEL_DIR = process.env.MODEL ?? "gpt2";
 const AGENT_ID = parseInt(process.env.AGENT_ID ?? "0", 10);
 const NUM_AGENTS = parseInt(process.env.NUM_AGENTS ?? "2", 10);
@@ -317,13 +317,14 @@ async function trainStep(
   params: any[],
   tokens: number[],
   offset: number,
+  accumGrads: import("../src/frontend/tensor").Tensor[],
 ): Promise<number> {
   trainStep._callCount = (trainStep._callCount ?? 0) + 1;
   const maxStart = Math.max(1, tokens.length - SEQ_LEN - 1);
   let totalLoss = 0;
 
-  // Persistent GPU accumulator tensors (survive across micro-batch step cycles)
-  let accumGrads: import("../src/frontend/tensor").Tensor[] | null = null;
+  // Zero persistent accum buffers (created outside any step, survive markStep)
+  for (const ag of accumGrads) api.zero_(ag);
 
   for (let acc = 0; acc < ACCUM_STEPS; acc++) {
     const microOffset = offset + acc * BATCH_SIZE * SEQ_LEN;
@@ -362,18 +363,10 @@ async function trainStep(
     _t.bwd = performance.now() - _tt;
     _tt = performance.now();
 
-    // Accumulate gradients on GPU before zeroGrad clears them.
-    if (!accumGrads) {
-      accumGrads = params.map((p) =>
-        p.grad
-          ? api.mul(p.grad, 1 / ACCUM_STEPS)
-          : api.zeros(p.shape, { device: "webgpu" }),
-      );
-    } else {
-      for (let i = 0; i < params.length; i++) {
-        if (params[i].grad) {
-          api.add_(accumGrads[i], api.mul(params[i].grad, 1 / ACCUM_STEPS));
-        }
+    // Accumulate grads into persistent buffers: accum += grad / N
+    for (let i = 0; i < params.length; i++) {
+      if (params[i].grad) {
+        api.add_(accumGrads[i], api.mul(params[i].grad, 1 / ACCUM_STEPS));
       }
     }
     _t.accum = performance.now() - _tt;
@@ -395,10 +388,10 @@ async function trainStep(
     }
   }
 
-  // Write accumulated grads to params and step
+  // Write accumulated grads to params and step (clone so zeroGrad doesn't dispose accum)
   await api.beginStep();
   for (let i = 0; i < params.length; i++) {
-    params[i]._setGrad(accumGrads![i]);
+    params[i]._setGrad(api.mul(accumGrads[i], 1));
   }
   clipGradNorm_(api, params, 1.0);
   optimizer.step();
@@ -414,6 +407,9 @@ async function trainStep(
 
 async function main() {
   fs.mkdirSync(SYNC_DIR, { recursive: true });
+
+  // Cap pool budget (must be set before initWebGPU)
+  process.env.TORCHLETTE_POOL_BUDGET_MB ??= "2000";
 
   const ok = await initWebGPU();
   if (!ok) {
@@ -471,6 +467,13 @@ async function main() {
     `All ${NUM_AGENTS} agents ready. Training: ${OUTER_ROUNDS} rounds × ${INNER_STEPS} steps (batch=${BATCH_SIZE}×${ACCUM_STEPS}accum=${EFFECTIVE_BATCH}, seq=${SEQ_LEN}, ${tokensPerStep} tok/step)`,
   );
 
+  // Create persistent gradient accumulators BEFORE any beginStep
+  // so they're in the snapshot and survive step-scoped cleanup
+  const accumGrads = params.map((p) =>
+    api.zeros(p.shape, { device: "webgpu" }),
+  );
+  await api._runtime().forceAllPending();
+
   for (let round = 0; round < OUTER_ROUNDS; round++) {
     const roundStart = performance.now();
 
@@ -491,6 +494,7 @@ async function main() {
         params,
         tokens,
         (round * INNER_STEPS + step) * tokensPerStep,
+        accumGrads,
       );
       const stepMs = performance.now() - t0;
       losses.push(l);
