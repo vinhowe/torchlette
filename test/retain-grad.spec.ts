@@ -5,8 +5,8 @@
  * on non-leaf tensors during backward.
  */
 
-import { describe, expect, it, beforeEach } from "vitest";
-import { Torchlette } from "../src/frontend";
+import { beforeEach, describe, expect, it } from "vitest";
+import { Torchlette } from "../src/frontend/torchlette";
 
 describe("retainGrad", () => {
   let torch: Torchlette;
@@ -50,7 +50,9 @@ describe("retainGrad", () => {
   describe("Gradient Retention", () => {
     it("retains gradient on non-leaf tensor when retainGrad is called", async () => {
       // x is a leaf tensor
-      const x = torch.tensorFromArray([1, 2, 3, 4], [4], { requiresGrad: true });
+      const x = torch.tensorFromArray([1, 2, 3, 4], [4], {
+        requiresGrad: true,
+      });
 
       // y = x * 2 is a non-leaf tensor
       const y = x.mul(torch.tensorFromArray([2, 2, 2, 2], [4]));
@@ -67,14 +69,16 @@ describe("retainGrad", () => {
       expect(y.grad).not.toBeNull();
 
       // x.grad = d(sum(y))/dx = d(sum(2x))/dx = [2, 2, 2, 2]
-      expect(await x.grad!.cpu()).toEqual([2, 2, 2, 2]);
+      expect(await x.grad?.cpu()).toEqual([2, 2, 2, 2]);
 
       // y.grad = d(sum(y))/dy = [1, 1, 1, 1]
-      expect(await y.grad!.cpu()).toEqual([1, 1, 1, 1]);
+      expect(await y.grad?.cpu()).toEqual([1, 1, 1, 1]);
     });
 
     it("does not retain gradient on non-leaf without retainGrad", async () => {
-      const x = torch.tensorFromArray([1, 2, 3, 4], [4], { requiresGrad: true });
+      const x = torch.tensorFromArray([1, 2, 3, 4], [4], {
+        requiresGrad: true,
+      });
       const y = x.mul(torch.tensorFromArray([2, 2, 2, 2], [4]));
 
       // Don't call retainGrad on y
@@ -91,7 +95,9 @@ describe("retainGrad", () => {
     });
 
     it("works with multiple intermediate tensors", async () => {
-      const x = torch.tensorFromArray([1, 2, 3, 4], [4], { requiresGrad: true });
+      const x = torch.tensorFromArray([1, 2, 3, 4], [4], {
+        requiresGrad: true,
+      });
 
       // Chain: x -> a -> b -> c -> sum
       const a = x.mul(torch.tensorFromArray([2, 2, 2, 2], [4]));
@@ -119,7 +125,7 @@ describe("retainGrad", () => {
       expect(c.grad).toBeNull();
 
       // b.grad = d(sum(c))/db = d(sum(3*b))/db = [3, 3, 3, 3]
-      expect(await b.grad!.cpu()).toEqual([3, 3, 3, 3]);
+      expect(await b.grad?.cpu()).toEqual([3, 3, 3, 3]);
     });
   });
 
@@ -136,7 +142,9 @@ describe("retainGrad", () => {
     });
 
     it("retainGrad on leaf tensor still works", async () => {
-      const x = torch.tensorFromArray([1, 2, 3, 4], [4], { requiresGrad: true });
+      const x = torch.tensorFromArray([1, 2, 3, 4], [4], {
+        requiresGrad: true,
+      });
       x.retainGrad(); // retainGrad on leaf is a no-op but should work
 
       const y = x.sum();
@@ -145,7 +153,7 @@ describe("retainGrad", () => {
       await y.backward();
 
       expect(x.grad).not.toBeNull();
-      expect(await x.grad!.cpu()).toEqual([1, 1, 1, 1]);
+      expect(await x.grad?.cpu()).toEqual([1, 1, 1, 1]);
     });
 
     it("works with matmul backward", async () => {
@@ -171,13 +179,15 @@ describe("retainGrad", () => {
       expect(z.grad).not.toBeNull();
 
       // z.grad should be all ones (from sum backward)
-      expect(await z.grad!.cpu()).toEqual([1, 1, 1, 1]);
+      expect(await z.grad?.cpu()).toEqual([1, 1, 1, 1]);
     });
   });
 
   describe("Memory Behavior", () => {
     it("non-retained gradients are disposed (no memory leak)", async () => {
-      const x = torch.tensorFromArray([1, 2, 3, 4], [4], { requiresGrad: true });
+      const x = torch.tensorFromArray([1, 2, 3, 4], [4], {
+        requiresGrad: true,
+      });
 
       // Create many intermediate tensors without retainGrad
       let current = x;
@@ -211,15 +221,19 @@ describe("retainGrad", () => {
       await loss.backward();
 
       // y.grad = [1, 1, 1, 1] (from sum)
-      expect(await y.grad!.cpu()).toEqual([1, 1, 1, 1]);
+      expect(await y.grad?.cpu()).toEqual([1, 1, 1, 1]);
 
       // x.grad = [0, 1, 0, 1] (relu derivative: 0 where x <= 0, 1 where x > 0)
-      expect(await x.grad!.cpu()).toEqual([0, 1, 0, 1]);
+      expect(await x.grad?.cpu()).toEqual([0, 1, 0, 1]);
     });
 
     it("works with add backward", async () => {
-      const a = torch.tensorFromArray([1, 2, 3, 4], [4], { requiresGrad: true });
-      const b = torch.tensorFromArray([5, 6, 7, 8], [4], { requiresGrad: true });
+      const a = torch.tensorFromArray([1, 2, 3, 4], [4], {
+        requiresGrad: true,
+      });
+      const b = torch.tensorFromArray([5, 6, 7, 8], [4], {
+        requiresGrad: true,
+      });
 
       const c = a.add(b);
       c.retainGrad();
@@ -229,9 +243,9 @@ describe("retainGrad", () => {
 
       await loss.backward();
 
-      expect(await a.grad!.cpu()).toEqual([1, 1, 1, 1]);
-      expect(await b.grad!.cpu()).toEqual([1, 1, 1, 1]);
-      expect(await c.grad!.cpu()).toEqual([1, 1, 1, 1]);
+      expect(await a.grad?.cpu()).toEqual([1, 1, 1, 1]);
+      expect(await b.grad?.cpu()).toEqual([1, 1, 1, 1]);
+      expect(await c.grad?.cpu()).toEqual([1, 1, 1, 1]);
     });
   });
 });

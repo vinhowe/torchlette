@@ -1,12 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  DisposedTensorError,
-  FrontendTensor,
-  SavedTensorModifiedError,
-  Torchlette,
-  torch,
-} from "../src";
+import { DisposedTensorError, FrontendTensor, Torchlette, torch } from "../src";
+import { Linear, Module } from "../src/nn";
+import { SavedTensorModifiedError } from "../src/runtime/engine";
 
 describe("frontend api: Tensor wrapper", () => {
   it("creates tensors and runs elementwise ops", async () => {
@@ -182,7 +178,9 @@ describe("frontend api: gather autograd", () => {
     // input: [1, 2, 3, 4] shape [2, 2]
     // index: [0, 1] shape [2] along dim 1
     // output: [1, 4] (gathered from row 0 col 0, row 1 col 1)
-    const a = torch.tensorFromArray([1, 2, 3, 4], [2, 2], { requiresGrad: true });
+    const a = torch.tensorFromArray([1, 2, 3, 4], [2, 2], {
+      requiresGrad: true,
+    });
     const index = torch.tensorFromArray([0, 1], [2, 1]);
     const gathered = torch.gather(a, index, { dim: 1 });
     const loss = gathered.sum();
@@ -424,7 +422,9 @@ describe("frontend api: where", () => {
 describe("frontend api: where autograd", () => {
   it("where backward computes gradient for x", async () => {
     const condition = torch.tensorFromArray([1, 0, 1, 0], [4]);
-    const x = torch.tensorFromArray([10, 20, 30, 40], [4], { requiresGrad: true });
+    const x = torch.tensorFromArray([10, 20, 30, 40], [4], {
+      requiresGrad: true,
+    });
     const y = torch.tensorFromArray([1, 2, 3, 4], [4]);
 
     const result = torch.where(condition, x, y);
@@ -476,5 +476,328 @@ describe("frontend api: where autograd", () => {
     expect(await x.grad?.cpu()).toEqual([2]);
     // y was selected at position 1
     expect(await y.grad?.cpu()).toEqual([0, 1, 0]);
+  });
+});
+
+describe("frontend api: chunk and split", () => {
+  it("chunk splits evenly", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5, 6], [6]);
+    const parts = x.chunk(3, 0);
+
+    expect(parts).toHaveLength(3);
+    expect(parts[0].shape).toEqual([2]);
+    expect(parts[1].shape).toEqual([2]);
+    expect(parts[2].shape).toEqual([2]);
+    expect(await parts[0].cpu()).toEqual([1, 2]);
+    expect(await parts[1].cpu()).toEqual([3, 4]);
+    expect(await parts[2].cpu()).toEqual([5, 6]);
+  });
+
+  it("chunk with uneven division returns fewer chunks", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5], [5]);
+    const parts = x.chunk(3, 0);
+
+    expect(parts).toHaveLength(3);
+    expect(parts[0].shape).toEqual([2]);
+    expect(parts[1].shape).toEqual([2]);
+    expect(parts[2].shape).toEqual([1]);
+    expect(await parts[2].cpu()).toEqual([5]);
+  });
+
+  it("chunk returns views sharing baseId", () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4], [4]);
+    const [a, b] = x.chunk(2, 0);
+
+    expect(a.baseId).toBe(x.baseId);
+    expect(b.baseId).toBe(x.baseId);
+  });
+
+  it("chunk along non-zero dim", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5, 6], [2, 3]);
+    const [a, b] = x.chunk(2, 0);
+
+    expect(a.shape).toEqual([1, 3]);
+    expect(b.shape).toEqual([1, 3]);
+    expect(await a.cpu()).toEqual([1, 2, 3]);
+    expect(await b.cpu()).toEqual([4, 5, 6]);
+  });
+
+  it("chunk supports negative dim", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5, 6], [2, 3]);
+    const parts = x.chunk(3, -1); // last dim, size 3 → 3 chunks of 1
+
+    expect(parts).toHaveLength(3);
+    expect(parts[0].shape).toEqual([2, 1]);
+  });
+
+  it("chunk more chunks than dim size", async () => {
+    const x = torch.tensorFromArray([1, 2, 3], [3]);
+    const parts = x.chunk(5, 0);
+
+    // ceil(3/5) = 1, so each chunk is size 1, only 3 returned
+    expect(parts).toHaveLength(3);
+    expect(parts[0].shape).toEqual([1]);
+    expect(parts[1].shape).toEqual([1]);
+    expect(parts[2].shape).toEqual([1]);
+  });
+
+  it("split with uniform size", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5, 6], [6]);
+    const parts = x.split(2, 0);
+
+    expect(parts).toHaveLength(3);
+    expect(await parts[0].cpu()).toEqual([1, 2]);
+    expect(await parts[1].cpu()).toEqual([3, 4]);
+    expect(await parts[2].cpu()).toEqual([5, 6]);
+  });
+
+  it("split with remainder", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5], [5]);
+    const parts = x.split(2, 0);
+
+    expect(parts).toHaveLength(3);
+    expect(parts[0].shape).toEqual([2]);
+    expect(parts[1].shape).toEqual([2]);
+    expect(parts[2].shape).toEqual([1]);
+  });
+
+  it("split with explicit size list", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5], [5]);
+    const [a, b] = x.split([2, 3], 0);
+
+    expect(a.shape).toEqual([2]);
+    expect(b.shape).toEqual([3]);
+    expect(await a.cpu()).toEqual([1, 2]);
+    expect(await b.cpu()).toEqual([3, 4, 5]);
+  });
+
+  it("split returns views sharing baseId", () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4], [4]);
+    const [a, b] = x.split(2, 0);
+
+    expect(a.baseId).toBe(x.baseId);
+    expect(b.baseId).toBe(x.baseId);
+  });
+
+  it("split throws for mismatched sizes", () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5], [5]);
+    expect(() => x.split([2, 2], 0)).toThrow();
+  });
+
+  it("chunk backward propagates gradients", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5, 6], [6], {
+      requiresGrad: true,
+    });
+    const [a, b, c] = x.chunk(3, 0);
+
+    // Use each chunk differently: sum first, double second, ignore third
+    const scale = torch.tensorFromArray([2, 2], [2]);
+    const loss = a.sum().add(b.mul(scale).sum());
+    await loss.backward();
+
+    // grad for a: [1, 1] (from sum)
+    // grad for b: [2, 2] (from mul(2).sum())
+    // grad for c: [0, 0] (unused)
+    expect(await x.grad?.cpu()).toEqual([1, 1, 2, 2, 0, 0]);
+  });
+
+  it("split backward propagates gradients", async () => {
+    const x = torch.tensorFromArray([1, 2, 3, 4, 5], [5], {
+      requiresGrad: true,
+    });
+    const [a, b] = x.split([2, 3], 0);
+
+    const loss = a.sum().add(b.sum());
+    await loss.backward();
+
+    expect(await x.grad?.cpu()).toEqual([1, 1, 1, 1, 1]);
+  });
+
+  // ==========================================================================
+  // embedding()
+  // ==========================================================================
+
+  it("embedding lookup returns correct rows", async () => {
+    const weight = torch.tensorFromArray(
+      [10, 11, 20, 21, 30, 31, 40, 41],
+      [4, 2],
+    );
+    const indices = torch.tensorFromArray([0, 2, 3], [3]);
+    const result = torch.embedding(weight, indices);
+
+    expect(result.shape).toEqual([3, 2]);
+    expect(await result.cpu()).toEqual([10, 11, 30, 31, 40, 41]);
+  });
+
+  it("embedding handles 2D indices", async () => {
+    const weight = torch.tensorFromArray([1, 2, 3, 4, 5, 6], [3, 2]);
+    const indices = torch.tensorFromArray([0, 2, 1, 0], [2, 2]);
+    const result = torch.embedding(weight, indices);
+
+    expect(result.shape).toEqual([2, 2, 2]);
+    expect(await result.cpu()).toEqual([1, 2, 5, 6, 3, 4, 1, 2]);
+  });
+
+  it("embedding backward accumulates to weight rows", async () => {
+    const weight = torch.tensorFromArray([0, 0, 0, 0, 0, 0], [3, 2], {
+      requiresGrad: true,
+    });
+    const indices = torch.tensorFromArray([0, 2, 0], [3]);
+    const result = torch.embedding(weight, indices);
+    // result shape: [3, 2]
+    const loss = result.sum() as FrontendTensor;
+    await loss.backward();
+
+    // Row 0 selected twice, row 2 once → grad weight row 0 = [2,2], row 1 = [0,0], row 2 = [1,1]
+    expect(await weight.grad?.cpu()).toEqual([2, 2, 0, 0, 1, 1]);
+  });
+
+  // ==========================================================================
+  // requires_grad_()
+  // ==========================================================================
+
+  it("requires_grad_ enables grad on tensor", async () => {
+    const a = torch.tensorFromArray([1, 2, 3], [3]);
+    expect(a.requiresGrad).toBe(false);
+
+    a.requires_grad_(true);
+    expect(a.requiresGrad).toBe(true);
+
+    const b = a.mul(2);
+    const loss = b.sum() as FrontendTensor;
+    await loss.backward();
+    expect(await a.grad?.cpu()).toEqual([2, 2, 2]);
+  });
+
+  it("requires_grad_ disables grad on tensor", () => {
+    const a = torch.tensorFromArray([1, 2], [2], { requiresGrad: true });
+    expect(a.requiresGrad).toBe(true);
+
+    a.requires_grad_(false);
+    expect(a.requiresGrad).toBe(false);
+  });
+
+  it("requires_grad_ returns this for chaining", () => {
+    const a = torch.tensorFromArray([1], [1]);
+    const b = a.requires_grad_(true);
+    expect(b).toBe(a);
+  });
+});
+
+// =============================================================================
+// Module system tests
+// =============================================================================
+
+describe("Module system", () => {
+  it("registerParameter stores params and sets property", () => {
+    const linear = new Linear(torch, 4, 2);
+    expect(linear.weight).toBeDefined();
+    expect(linear.weight.shape).toEqual([2, 4]);
+    expect(linear.bias).toBeDefined();
+    expect(linear.bias!.shape).toEqual([2]);
+  });
+
+  it("base parameters() collects own + child params", () => {
+    class TwoLinear extends Module {
+      declare fc1: any;
+      declare fc2: any;
+      constructor() {
+        super(torch);
+        this.fc1 = new Linear(torch, 4, 3);
+        this.fc2 = new Linear(torch, 3, 2);
+      }
+      forward(x: FrontendTensor) {
+        return this.fc2.forward(this.fc1.forward(x));
+      }
+    }
+    const model = new TwoLinear();
+    const params = model.parameters();
+    // fc1: weight + bias = 2, fc2: weight + bias = 2 → 4 total
+    expect(params.length).toBe(4);
+  });
+
+  it("namedParameters returns dotted paths", () => {
+    class TwoLinear extends Module {
+      declare fc1: any;
+      declare fc2: any;
+      constructor() {
+        super(torch);
+        this.fc1 = new Linear(torch, 4, 3);
+        this.fc2 = new Linear(torch, 3, 2);
+      }
+      forward(x: FrontendTensor) {
+        return this.fc2.forward(this.fc1.forward(x));
+      }
+    }
+    const model = new TwoLinear();
+    const named = model.namedParameters();
+    const names = named.map(([n]) => n);
+    expect(names).toEqual(["fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"]);
+  });
+
+  it("stateDict returns named tensor map", () => {
+    const linear = new Linear(torch, 3, 2);
+    const sd = linear.stateDict();
+    expect(Object.keys(sd)).toEqual(["weight", "bias"]);
+    expect(sd.weight.shape).toEqual([2, 3]);
+    expect(sd.bias.shape).toEqual([2]);
+  });
+
+  it("loadStateDict copies values in-place", async () => {
+    const linear = new Linear(torch, 2, 2, { bias: false });
+    // Create a known weight
+    const newWeight = torch.tensorFromArray([1, 2, 3, 4], [2, 2]);
+    linear.loadStateDict({ weight: newWeight });
+    expect(await linear.weight.cpu()).toEqual([1, 2, 3, 4]);
+  });
+
+  it("Linear without bias has null bias in stateDict", () => {
+    const linear = new Linear(torch, 3, 2, { bias: false });
+    const sd = linear.stateDict();
+    // Only weight, no bias since bias=null
+    expect(Object.keys(sd)).toEqual(["weight"]);
+  });
+});
+
+describe("frontend api: noGrad", () => {
+  it("skips autograd recording inside noGrad", async () => {
+    const a = torch.tensorFromArray([1, 2, 3], [3], { requiresGrad: true });
+    const b = torch.tensorFromArray([4, 5, 6], [3]);
+
+    const result = torch.noGrad(() => a.add(b));
+
+    expect(result.requiresGrad).toBe(false);
+    expect(await result.cpu()).toEqual([5, 7, 9]);
+  });
+
+  it("restores grad recording after noGrad", async () => {
+    const a = torch.tensorFromArray([1, 2], [2], { requiresGrad: true });
+    const b = torch.tensorFromArray([3, 4], [2]);
+
+    // Inside noGrad — no grad
+    const noGradResult = torch.noGrad(() => a.add(b));
+    expect(noGradResult.requiresGrad).toBe(false);
+
+    // Outside noGrad — grad is recorded
+    const gradResult = a.add(b);
+    expect(gradResult.requiresGrad).toBe(true);
+  });
+
+  it("isGradEnabled reflects noGrad context", () => {
+    expect(torch.isGradEnabled()).toBe(true);
+    torch.noGrad(() => {
+      expect(torch.isGradEnabled()).toBe(false);
+    });
+    expect(torch.isGradEnabled()).toBe(true);
+  });
+
+  it("restores state even if fn throws", () => {
+    expect(torch.isGradEnabled()).toBe(true);
+    expect(() =>
+      torch.noGrad(() => {
+        throw new Error("test");
+      }),
+    ).toThrow("test");
+    expect(torch.isGradEnabled()).toBe(true);
   });
 });

@@ -7,12 +7,11 @@
  * - §15.3: Memory coalescing via vectorization
  * - §15.4: Random ops as fusion barriers
  */
-import { describe, expect, it, beforeAll, afterAll } from "vitest";
-import { Torchlette } from "../../src/frontend";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  getWebGPUDevice,
   initWebGPU,
   webgpuBackend,
-  getWebGPUDevice,
 } from "../../src/backend/webgpu";
 import {
   dispatchFusedKernel,
@@ -20,12 +19,10 @@ import {
   getFusionCache,
   resetFusionCache,
 } from "../../src/backend/webgpu/fusion-dispatch";
-import {
-  generateFusedKernel,
-  buildRecipeFromIR,
-  type FusedKernelRecipe,
-} from "../../src/backend/webgpu/fusion-codegen";
-import type { IRNode } from "../../src/engine/ir";
+import { generateFusedKernelTileIR } from "../../src/backend/webgpu/fusion-tile-ir";
+import type { FusedKernelRecipe } from "../../src/backend/webgpu/fusion-types";
+import type { GPUDevice } from "../../src/backend/webgpu/gpu-types";
+import { Torchlette } from "../../src/frontend/torchlette";
 
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -65,19 +62,28 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
     it("getWebGPUDevice returns device and queue", () => {
       const result = getWebGPUDevice();
       expect(result).not.toBeNull();
-      expect(result!.device).toBeDefined();
-      expect(result!.queue).toBeDefined();
+      expect(result?.device).toBeDefined();
+      expect(result?.queue).toBeDefined();
     });
   });
 
   describe("FusionKernelCache", () => {
     it("caches pipelines by key", () => {
       const cache = new FusionKernelCache();
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
       const recipe: FusedKernelRecipe = {
         id: "test_cache",
-        nodes: [{ id: 1, op: "relu", inputs: [-1], shape: [16], dtype: "f32", isOutput: true }],
+        nodes: [
+          {
+            id: 1,
+            op: "relu",
+            inputs: [-1],
+            shape: [16],
+            dtype: "f32",
+            isOutput: true,
+          },
+        ],
         inputs: [{ id: 100, index: 0, shape: [16], dtype: "f32" }],
         outputs: [{ nodeId: 1, index: 0, shape: [16], dtype: "f32" }],
       };
@@ -92,11 +98,20 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
 
     it("evicts oldest on overflow", () => {
       const cache = new FusionKernelCache(2); // max 2 entries
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
       const makeRecipe = (id: number): FusedKernelRecipe => ({
         id: `test_${id}`,
-        nodes: [{ id: 1, op: "relu", inputs: [-1], shape: [id * 16], dtype: "f32", isOutput: true }],
+        nodes: [
+          {
+            id: 1,
+            op: "relu",
+            inputs: [-1],
+            shape: [id * 16],
+            dtype: "f32",
+            isOutput: true,
+          },
+        ],
         inputs: [{ id: 100, index: 0, shape: [id * 16], dtype: "f32" }],
         outputs: [{ nodeId: 1, index: 0, shape: [id * 16], dtype: "f32" }],
       });
@@ -118,18 +133,31 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
 
   describe("§15.1 Elementwise Fusion", () => {
     it("fuses add + relu into single kernel", async () => {
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
       // Create input tensors using backend directly
-      const a = webgpuBackend.ops.tensorFromArray([1, -2, 3, -4], [4]) as WebGPUTensor;
-      const b = webgpuBackend.ops.tensorFromArray([1, 1, 1, 1], [4]) as WebGPUTensor;
+      const a = webgpuBackend.ops.tensorFromArray(
+        [1, -2, 3, -4],
+        [4],
+      ) as WebGPUTensor;
+      const b = webgpuBackend.ops.tensorFromArray(
+        [1, 1, 1, 1],
+        [4],
+      ) as WebGPUTensor;
 
       // Create recipe for add -> relu
       const recipe: FusedKernelRecipe = {
         id: "add_relu",
         nodes: [
           { id: 1, op: "add", inputs: [-1, -2], shape: [4], dtype: "f32" },
-          { id: 2, op: "relu", inputs: [1], shape: [4], dtype: "f32", isOutput: true },
+          {
+            id: 2,
+            op: "relu",
+            inputs: [1],
+            shape: [4],
+            dtype: "f32",
+            isOutput: true,
+          },
         ],
         inputs: [
           { id: 100, index: 0, shape: [4], dtype: "f32" },
@@ -166,9 +194,12 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
     });
 
     it("fuses chain of 3+ ops", async () => {
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
-      const a = webgpuBackend.ops.tensorFromArray([1, 2, 3, 4], [4]) as WebGPUTensor;
+      const a = webgpuBackend.ops.tensorFromArray(
+        [1, 2, 3, 4],
+        [4],
+      ) as WebGPUTensor;
 
       // neg -> abs -> relu (should be identity for positive after abs)
       const recipe: FusedKernelRecipe = {
@@ -176,7 +207,14 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
         nodes: [
           { id: 1, op: "neg", inputs: [-1], shape: [4], dtype: "f32" },
           { id: 2, op: "abs", inputs: [1], shape: [4], dtype: "f32" },
-          { id: 3, op: "relu", inputs: [2], shape: [4], dtype: "f32", isOutput: true },
+          {
+            id: 3,
+            op: "relu",
+            inputs: [2],
+            shape: [4],
+            dtype: "f32",
+            isOutput: true,
+          },
         ],
         inputs: [{ id: 100, index: 0, shape: [4], dtype: "f32" }],
         outputs: [{ nodeId: 3, index: 0, shape: [4], dtype: "f32" }],
@@ -208,16 +246,29 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
     });
 
     it("handles broadcasting in fused kernels", async () => {
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
       // [2, 4] + [4] with broadcast
-      const a = webgpuBackend.ops.tensorFromArray([1, 2, 3, 4, 5, 6, 7, 8], [2, 4]) as WebGPUTensor;
-      const b = webgpuBackend.ops.tensorFromArray([10, 20, 30, 40], [4]) as WebGPUTensor;
+      const a = webgpuBackend.ops.tensorFromArray(
+        [1, 2, 3, 4, 5, 6, 7, 8],
+        [2, 4],
+      ) as WebGPUTensor;
+      const b = webgpuBackend.ops.tensorFromArray(
+        [10, 20, 30, 40],
+        [4],
+      ) as WebGPUTensor;
 
       const recipe: FusedKernelRecipe = {
         id: "broadcast_add",
         nodes: [
-          { id: 1, op: "add", inputs: [-1, -2], shape: [2, 4], dtype: "f32", isOutput: true },
+          {
+            id: 1,
+            op: "add",
+            inputs: [-1, -2],
+            shape: [2, 4],
+            dtype: "f32",
+            isOutput: true,
+          },
         ],
         inputs: [
           { id: 100, index: 0, shape: [2, 4], dtype: "f32" },
@@ -255,16 +306,33 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
 
   describe("§15.2 Multi-Output Fusion", () => {
     it("generates kernel with multiple outputs", async () => {
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
-      const a = webgpuBackend.ops.tensorFromArray([1, 2, 3, 4], [4]) as WebGPUTensor;
+      const a = webgpuBackend.ops.tensorFromArray(
+        [1, 2, 3, 4],
+        [4],
+      ) as WebGPUTensor;
 
       // Two outputs sharing common input
       const recipe: FusedKernelRecipe = {
         id: "multi_output",
         nodes: [
-          { id: 1, op: "relu", inputs: [-1], shape: [4], dtype: "f32", isOutput: true },
-          { id: 2, op: "neg", inputs: [-1], shape: [4], dtype: "f32", isOutput: true },
+          {
+            id: 1,
+            op: "relu",
+            inputs: [-1],
+            shape: [4],
+            dtype: "f32",
+            isOutput: true,
+          },
+          {
+            id: 2,
+            op: "neg",
+            inputs: [-1],
+            shape: [4],
+            dtype: "f32",
+            isOutput: true,
+          },
         ],
         inputs: [{ id: 100, index: 0, shape: [4], dtype: "f32" }],
         outputs: [
@@ -311,27 +379,46 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
     it("uses vec4 for aligned shapes", () => {
       const recipe: FusedKernelRecipe = {
         id: "vec4_test",
-        nodes: [{ id: 1, op: "relu", inputs: [-1], shape: [256], dtype: "f32", isOutput: true }],
+        nodes: [
+          {
+            id: 1,
+            op: "relu",
+            inputs: [-1],
+            shape: [256],
+            dtype: "f32",
+            isOutput: true,
+          },
+        ],
         inputs: [{ id: 100, index: 0, shape: [256], dtype: "f32" }],
         outputs: [{ nodeId: 1, index: 0, shape: [256], dtype: "f32" }],
       };
 
-      const kernel = generateFusedKernel(recipe, { vectorize: true });
+      const kernel = generateFusedKernelTileIR(recipe, { vectorize: true });
 
       expect(kernel.vectorWidth).toBe(4);
       expect(kernel.workItems).toBe(64); // 256 / 4
-      expect(kernel.source).toContain("vec4");
+      // Tile-IR vectorization uses scalar unrolling (gid.x * 4u + offset), not vec4 types
+      expect(kernel.source).toContain("* 4u");
     });
 
     it("uses vec2 for 2-aligned shapes", () => {
       const recipe: FusedKernelRecipe = {
         id: "vec2_test",
-        nodes: [{ id: 1, op: "relu", inputs: [-1], shape: [66], dtype: "f32", isOutput: true }],
+        nodes: [
+          {
+            id: 1,
+            op: "relu",
+            inputs: [-1],
+            shape: [66],
+            dtype: "f32",
+            isOutput: true,
+          },
+        ],
         inputs: [{ id: 100, index: 0, shape: [66], dtype: "f32" }],
         outputs: [{ nodeId: 1, index: 0, shape: [66], dtype: "f32" }],
       };
 
-      const kernel = generateFusedKernel(recipe, { vectorize: true });
+      const kernel = generateFusedKernelTileIR(recipe, { vectorize: true });
 
       expect(kernel.vectorWidth).toBe(2);
       expect(kernel.workItems).toBe(33); // 66 / 2
@@ -340,34 +427,58 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
     it("falls back to scalar for odd shapes", () => {
       const recipe: FusedKernelRecipe = {
         id: "scalar_test",
-        nodes: [{ id: 1, op: "relu", inputs: [-1], shape: [33], dtype: "f32", isOutput: true }],
+        nodes: [
+          {
+            id: 1,
+            op: "relu",
+            inputs: [-1],
+            shape: [33],
+            dtype: "f32",
+            isOutput: true,
+          },
+        ],
         inputs: [{ id: 100, index: 0, shape: [33], dtype: "f32" }],
         outputs: [{ nodeId: 1, index: 0, shape: [33], dtype: "f32" }],
       };
 
-      const kernel = generateFusedKernel(recipe, { vectorize: true });
+      const kernel = generateFusedKernelTileIR(recipe, { vectorize: true });
 
       expect(kernel.vectorWidth).toBe(1);
       expect(kernel.workItems).toBe(33);
     });
 
     it("vectorized dispatch produces correct results", async () => {
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
       // Use 256 elements to ensure vec4
       const inputData = new Array(256).fill(0).map((_, i) => i - 128);
-      const a = webgpuBackend.ops.tensorFromArray(inputData, [256]) as WebGPUTensor;
+      const a = webgpuBackend.ops.tensorFromArray(
+        inputData,
+        [256],
+      ) as WebGPUTensor;
 
       const recipe: FusedKernelRecipe = {
         id: "vec4_relu",
-        nodes: [{ id: 1, op: "relu", inputs: [-1], shape: [256], dtype: "f32", isOutput: true }],
+        nodes: [
+          {
+            id: 1,
+            op: "relu",
+            inputs: [-1],
+            shape: [256],
+            dtype: "f32",
+            isOutput: true,
+          },
+        ],
         inputs: [{ id: 100, index: 0, shape: [256], dtype: "f32" }],
         outputs: [{ nodeId: 1, index: 0, shape: [256], dtype: "f32" }],
       };
 
-      const result = dispatchFusedKernel(device, recipe, [
-        { buffer: a.buffer, shape: [256], dtype: "f32" },
-      ], { vectorize: true });
+      const result = dispatchFusedKernel(
+        device,
+        recipe,
+        [{ buffer: a.buffer, shape: [256], dtype: "f32" }],
+        { vectorize: true },
+      );
 
       const staging = device.createBuffer({
         size: 1024,
@@ -375,7 +486,13 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
       });
 
       const encoder = device.createCommandEncoder();
-      encoder.copyBufferToBuffer(result.buffer as GPUBuffer, 0, staging, 0, 1024);
+      encoder.copyBufferToBuffer(
+        result.buffer as GPUBuffer,
+        0,
+        staging,
+        0,
+        1024,
+      );
       device.queue.submit([encoder.finish()]);
 
       await staging.mapAsync(GPUMapMode.READ);
@@ -384,57 +501,16 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
       staging.destroy();
 
       // Verify relu: max(0, x)
-      const expected = inputData.map(x => Math.max(0, x));
+      const expected = inputData.map((x) => Math.max(0, x));
       for (let i = 0; i < 256; i++) {
         expect(data[i]).toBeCloseTo(expected[i], 5);
       }
     });
   });
 
-  describe("§15.4 Fusion Barriers", () => {
-    it("fusion detection identifies fusible chains", () => {
-      // Create mock IR nodes
-      const nodes: IRNode[] = [
-        { id: 0, op: "input", inputs: [], shape: [4], dtype: "f32", epoch: 1, kind: "lazy_op" as const },
-        { id: 1, op: "relu", inputs: [0], shape: [4], dtype: "f32", epoch: 1, kind: "lazy_op" as const },
-        { id: 2, op: "neg", inputs: [1], shape: [4], dtype: "f32", epoch: 1, kind: "lazy_op" as const },
-      ];
-
-      const nodeById = new Map(nodes.map(n => [n.id, n]));
-
-      // Build recipe - relu and neg should fuse
-      const recipe = buildRecipeFromIR([1, 2], nodeById, [0]);
-
-      expect(recipe.nodes).toHaveLength(2);
-      expect(recipe.nodes[0].op).toBe("relu");
-      expect(recipe.nodes[1].op).toBe("neg");
-    });
-
-    it("non-fusible ops break chains", () => {
-      // Matmul is not fusible
-      const nodes: IRNode[] = [
-        { id: 0, op: "input", inputs: [], shape: [4, 4], dtype: "f32", epoch: 1, kind: "lazy_op" as const },
-        { id: 1, op: "relu", inputs: [0], shape: [4, 4], dtype: "f32", epoch: 1, kind: "lazy_op" as const },
-        { id: 2, op: "matmul", inputs: [1, 0], shape: [4, 4], dtype: "f32", epoch: 1, kind: "lazy_op" as const },
-        { id: 3, op: "neg", inputs: [2], shape: [4, 4], dtype: "f32", epoch: 1, kind: "lazy_op" as const },
-      ];
-
-      // Can't fuse across matmul
-      const nodeById = new Map(nodes.map(n => [n.id, n]));
-
-      // Only relu can fuse with input
-      const recipe1 = buildRecipeFromIR([1], nodeById, [0]);
-      expect(recipe1.nodes).toHaveLength(1);
-
-      // Only neg can be after matmul
-      const recipe2 = buildRecipeFromIR([3], nodeById, [2]);
-      expect(recipe2.nodes).toHaveLength(1);
-    });
-  });
-
   describe("End-to-End Fusion", () => {
     it("fusion produces same results as sequential execution", async () => {
-      const device = webgpuBackend.device!;
+      const device = webgpuBackend.device as GPUDevice;
 
       // Input data
       const aData = [1, -2, 3, -4, 5, -6, 7, -8];
@@ -453,7 +529,14 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
         id: "add_relu_e2e",
         nodes: [
           { id: 1, op: "add", inputs: [-1, -2], shape: [8], dtype: "f32" },
-          { id: 2, op: "relu", inputs: [1], shape: [8], dtype: "f32", isOutput: true },
+          {
+            id: 2,
+            op: "relu",
+            inputs: [1],
+            shape: [8],
+            dtype: "f32",
+            isOutput: true,
+          },
         ],
         inputs: [
           { id: 100, index: 0, shape: [8], dtype: "f32" },
@@ -474,7 +557,13 @@ describe.skipIf(SKIP)("Fusion Integration (§15)", () => {
       });
 
       const encoder = device.createCommandEncoder();
-      encoder.copyBufferToBuffer(fusedResult.buffer as GPUBuffer, 0, staging, 0, 32);
+      encoder.copyBufferToBuffer(
+        fusedResult.buffer as GPUBuffer,
+        0,
+        staging,
+        0,
+        32,
+      );
       device.queue.submit([encoder.finish()]);
 
       await staging.mapAsync(GPUMapMode.READ);

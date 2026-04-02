@@ -6,9 +6,8 @@
  */
 
 import type { DType } from "../types";
-import { computeContiguousStrides } from "../types";
-export { sizeOf, broadcastShapes, shapesEqual } from "../../core/shape";
-export { computeContiguousStrides as contiguousStrides } from "../types";
+
+export { broadcastShapes, contiguousStrides, sizeOf } from "../../core/shape";
 
 // ============================================================================
 // Constants
@@ -19,11 +18,14 @@ export const WORKGROUP_SIZE = 256;
 /** Maximum workgroups per dimension in WebGPU (per spec) */
 export const MAX_WORKGROUPS_PER_DIM = 65535;
 
-/** WebGPU spec default for maxStorageBufferBindingSize (128 MB). */
-export const DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE = 128 * 1024 * 1024;
+/** IEEE 754 negative float max — used as -infinity identity for max reduction. */
+export const F32_NEG_MAX = -3.402823e38;
 
-/** Bytes per f32 element. Use instead of magic `* 4` in buffer size calculations. */
-export const F32_BYTES = 4;
+/** IEEE 754 positive float max — used as +infinity identity for min reduction. */
+export const F32_POS_MAX = 3.402823e38;
+
+/** IEEE 754 bit pattern of 1.0f as u32 — for atomicMax-based infinity detection. */
+export const F32_ONE_BITS = 1065353216; // bitcast<u32>(1.0f) = 0x3F800000
 
 /**
  * Greatest common divisor using Euclidean algorithm.
@@ -42,38 +44,24 @@ export function lcm(a: number, b: number): number {
   return (a * b) / gcd(a, b);
 }
 
-// broadcastShapes re-exported from core/shape
+/**
+ * Compute the largest chunk size ≤ maxUnits that satisfies GPU buffer offset alignment.
+ * Used for chunked dispatch when tensors exceed maxStorageBufferBindingSize.
+ */
+export function alignedChunkSize(
+  bytesPerUnit: number,
+  maxUnits: number,
+  minAlignment: number,
+): number {
+  const unitAlignment = minAlignment / gcd(bytesPerUnit, minAlignment);
+  return Math.max(
+    unitAlignment,
+    Math.floor(maxUnits / unitAlignment) * unitAlignment,
+  );
+}
 
 export function toIndexShape(shape: number[]): number[] {
   return shape.length === 0 ? [1] : shape;
-}
-
-// contiguousStrides re-exported from ../types above
-
-export function broadcastStrides(shape: number[], outShape: number[]): number[] {
-  if (shape.length > outShape.length) {
-    throw new Error("webgpu broadcast target has fewer dimensions than input");
-  }
-  const pad = outShape.length - shape.length;
-  const inStrides = computeContiguousStrides(shape);
-  const outStrides = new Array<number>(outShape.length);
-  for (let axis = 0; axis < outShape.length; axis += 1) {
-    const inAxis = axis - pad;
-    if (inAxis < 0) {
-      outStrides[axis] = 0;
-      continue;
-    }
-    const inDim = shape[inAxis];
-    const outDim = outShape[axis];
-    if (inDim === outDim) {
-      outStrides[axis] = inStrides[inAxis];
-    } else if (inDim === 1) {
-      outStrides[axis] = 0;
-    } else {
-      throw new Error("webgpu broadcast target shape is incompatible");
-    }
-  }
-  return outStrides;
 }
 
 /**
@@ -117,92 +105,28 @@ export function computeEffectiveBroadcastStrides(
 }
 
 // ============================================================================
-// WGSL Code Generation Helpers
-// ============================================================================
-
-export function wgslArray(values: number[]): string {
-  return values.map((value) => `${value}u`).join(", ");
-}
-
-export function buildBroadcastIndexing(
-  indexShape: number[],
-  inputStrides: number[][],
-): {
-  declarations: string;
-  compute: string;
-  offsets: string[];
-} {
-  const rank = indexShape.length;
-  const outShapeDecl = `const OUT_SHAPE: array<u32, ${rank}> = array<u32, ${rank}>(${wgslArray(indexShape)});`;
-  const strideDecls = inputStrides.map(
-    (strides, index) =>
-      `const IN${index}_STRIDES: array<u32, ${rank}> = array<u32, ${rank}>(${wgslArray(strides)});`,
-  );
-  const compute = `
-  var remaining = idx;
-  var coords: array<u32, ${rank}>;
-  for (var axis = 0u; axis < ${rank}u; axis = axis + 1u) {
-    let rev = ${rank}u - 1u - axis;
-    let dim = OUT_SHAPE[rev];
-    let coord = remaining % dim;
-    coords[rev] = coord;
-    remaining = remaining / dim;
-  }
-`;
-  const offsets = inputStrides.map((_, index) => {
-    const terms = indexShape.map(
-      (_, axis) => `coords[${axis}u] * IN${index}_STRIDES[${axis}u]`,
-    );
-    return `  let offset${index} = ${terms.join(" + ")};`;
-  });
-  return {
-    declarations: [outShapeDecl, ...strideDecls].join("\n"),
-    compute,
-    offsets,
-  };
-}
-
-// ============================================================================
 // Shape Comparison & Contiguity Checks
 // ============================================================================
 
-/**
- * Check if strides represent contiguous memory layout.
- */
-export function checkContiguousStrides(shape: number[], strides: number[]): boolean {
-  const expected = computeContiguousStrides(shape);
-  for (let i = 0; i < shape.length; i++) {
-    // Size-1 dims don't affect contiguity
-    if (shape[i] <= 1) continue;
-    if (strides[i] !== expected[i]) return false;
-  }
-  return true;
-}
-
-// shapesEqual re-exported from core/shape
+export { checkContiguous as checkContiguousStrides } from "../../core/shape";
 
 // ============================================================================
 // Dtype Helpers
 // ============================================================================
 
+const DTYPE_BYTES: Record<string, number> = {
+  f16: 2,
+  f32: 4,
+  i32: 4,
+  u32: 4,
+  bool: 1,
+};
+
 /**
  * Get bytes per element for a dtype.
  */
 export function dtypeBytes(dtype: DType): number {
-  switch (dtype) {
-    case "f16":
-      return 2;
-    case "f32":
-      return 4;
-    case "i32":
-      return 4;
-    case "u32":
-      return 4;
-    case "bool":
-      return 1;
-    default:
-      return 4;
-  }
+  return DTYPE_BYTES[dtype] ?? 4;
 }
 
 /**
@@ -210,35 +134,6 @@ export function dtypeBytes(dtype: DType): number {
  */
 export function alignBufferSize(bytes: number): number {
   return Math.ceil(bytes / 4) * 4;
-}
-
-/**
- * Convert dtype to WGSL type string.
- */
-export function dtypeToWgsl(dtype: DType): string {
-  switch (dtype) {
-    case "f16":
-      return "f16";
-    case "f32":
-      return "f32";
-    case "i32":
-      return "i32";
-    case "u32":
-      return "u32";
-    case "bool":
-      return "bool";
-    default:
-      return "f32";
-  }
-}
-
-/**
- * Convert dtype to WGSL storage type. Like dtypeToWgsl but maps bool to u32
- * since WGSL doesn't support bool in storage arrays.
- */
-export function dtypeToWgslStorage(dtype: DType): string {
-  if (dtype === "bool") return "u32";
-  return dtypeToWgsl(dtype);
 }
 
 // ============================================================================

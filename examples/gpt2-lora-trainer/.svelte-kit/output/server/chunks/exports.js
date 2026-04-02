@@ -1,4 +1,4 @@
-import { n as noop, k as safe_not_equal } from "./equality.js";
+import { n as noop, s as safe_not_equal } from "./equality.js";
 const SCHEME = /^[a-z][a-z\d+\-.]+:/i;
 const internal = new URL("sveltekit-internal://");
 function resolve(base, path) {

@@ -38,35 +38,7 @@ export type ViewMeta = {
   isContiguous: boolean;
 };
 
-/**
- * Compute strides in elements for a contiguous tensor.
- * Returns row-major (C-style) strides: last dimension is contiguous.
- */
-export function computeContiguousStrides(shape: number[]): number[] {
-  if (shape.length === 0) return [];
-  const strides = new Array<number>(shape.length);
-  let stride = 1;
-  for (let i = shape.length - 1; i >= 0; i--) {
-    strides[i] = stride;
-    stride *= shape[i];
-  }
-  return strides;
-}
-
-/**
- * Check if strides represent a contiguous layout for the given shape.
- * Size-1 dimensions don't affect contiguity since stride doesn't matter.
- */
-export function checkContiguous(shape: number[], strides: number[]): boolean {
-  if (shape.length !== strides.length) return false;
-  const expected = computeContiguousStrides(shape);
-  for (let i = 0; i < shape.length; i++) {
-    // Size-1 dims don't matter for contiguity
-    if (shape[i] <= 1) continue;
-    if (strides[i] !== expected[i]) return false;
-  }
-  return true;
-}
+export { checkContiguous } from "../core/shape";
 
 /**
  * Normalize a possibly-negative dimension index to a non-negative one.
@@ -118,18 +90,15 @@ export function ensureDType(value: DType | undefined): DType {
  */
 export type OpExecOptions = { outBuffer?: unknown };
 
-export type SumOptions = {
+export type ReduceDimOptions = {
   dim?: number | number[] | null;
   keepdim?: boolean;
-  dtype?: DType | null;
 };
 
+export type SumOptions = ReduceDimOptions & { dtype?: DType | null };
 export type MeanOptions = SumOptions;
-
-export type MaxOptions = {
-  dim?: number | number[] | null;
-  keepdim?: boolean;
-};
+export type MaxOptions = ReduceDimOptions;
+export type MinOptions = ReduceDimOptions;
 
 export type ArgReduceOptions = {
   dim: number;
@@ -149,6 +118,10 @@ export type GatherOptions = {
 };
 
 export type ScatterAddOptions = {
+  dim: number;
+};
+
+export type CatOptions = {
   dim: number;
 };
 
@@ -196,8 +169,14 @@ export type FusedCrossEntropyConfig = {
 };
 
 export type FusedLayerNormConfig = {
-  numRows: number;     // product of all dims except last (B*S for [B,S,D])
-  featureDim: number;  // last dim size (D)
+  numRows: number; // product of all dims except last (B*S for [B,S,D])
+  featureDim: number; // last dim size (D)
+  eps: number;
+};
+
+export type FusedRMSNormConfig = {
+  numRows: number; // product of all dims except last (B*S for [B,S,D])
+  featureDim: number; // last dim size (D)
   eps: number;
 };
 
@@ -234,11 +213,31 @@ export interface BackendOps {
   randn?(shape: Shape, seed: number): BackendTensor;
   /** Create a tensor with Bernoulli-distributed values (1 with probability p, else 0). */
   bernoulli?(shape: Shape, p: number, seed: number): BackendTensor;
-  add(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
-  sub(a: BackendTensor, b: BackendTensor, options?: SubOptions & OpExecOptions): BackendTensor;
-  div(a: BackendTensor, b: BackendTensor, options?: DivOptions & OpExecOptions): BackendTensor;
-  mul(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
-  matmul(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  add(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
+  sub(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: SubOptions & OpExecOptions,
+  ): BackendTensor;
+  div(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: DivOptions & OpExecOptions,
+  ): BackendTensor;
+  mul(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
+  matmul(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   sqrt(a: BackendTensor, options?: OpExecOptions): BackendTensor;
   relu(a: BackendTensor, options?: OpExecOptions): BackendTensor;
   exp?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
@@ -249,6 +248,24 @@ export interface BackendOps {
   sigmoid?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
   gelu?(a: BackendTensor, options?: GeluOptions & OpExecOptions): BackendTensor;
   silu?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  sin?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  cos?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  rsqrt?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  floor?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  ceil?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  round?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  sign?(a: BackendTensor, options?: OpExecOptions): BackendTensor;
+  clamp?(
+    a: BackendTensor,
+    min: number | null,
+    max: number | null,
+    options?: OpExecOptions,
+  ): BackendTensor;
+  pow?(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   /** Check if values are finite (not NaN and not Inf). Returns 1.0 where finite, 0.0 elsewhere. */
   isfinite?(a: BackendTensor): BackendTensor;
   expand(a: BackendTensor, shape: Shape): BackendTensor;
@@ -257,16 +274,37 @@ export interface BackendOps {
   /** Permute dimensions according to the given order. Returns a view. */
   permute(a: BackendTensor, dims: number[]): BackendTensor;
   /** Select a contiguous sub-range along one dimension. Returns a view (zero cost). */
-  narrow?(a: BackendTensor, dim: number, start: number, length: number): BackendTensor;
+  narrow?(
+    a: BackendTensor,
+    dim: number,
+    start: number,
+    length: number,
+  ): BackendTensor;
   /**
    * Backward for narrow: pads gradient back to original shape.
    * Copies grad into [start, start+length) along dim, zeros elsewhere.
    */
-  narrowBackward?(grad: BackendTensor, dim: number, start: number, originalLength: number): BackendTensor;
+  narrowBackward?(
+    grad: BackendTensor,
+    dim: number,
+    start: number,
+    originalLength: number,
+  ): BackendTensor;
   /** Materialize non-contiguous tensor to contiguous buffer. Returns same tensor if already contiguous. */
   contiguous(a: BackendTensor): BackendTensor;
   /** Cast tensor to a different dtype. Returns same tensor if already target dtype. */
   cast?(a: BackendTensor, dtype: DType): BackendTensor;
+  /** 2D convolution. Input: [N,C,H,W], Weight: [Cout,Cin,kH,kW], Bias: [Cout]. */
+  conv2d?(
+    input: BackendTensor,
+    weight: BackendTensor,
+    bias: BackendTensor | undefined,
+    options?: {
+      stride?: number | [number, number];
+      padding?: number | [number, number];
+      outBuffer?: unknown;
+    },
+  ): BackendTensor;
   gather(
     a: BackendTensor,
     index: BackendTensor,
@@ -278,10 +316,14 @@ export interface BackendOps {
     src: BackendTensor,
     options: ScatterAddOptions,
   ): BackendTensor;
+  /** Concatenate tensors along an existing dimension. */
+  cat?(tensors: BackendTensor[], options: CatOptions): BackendTensor;
   /** Sum reduction. Returns 0-d tensor for full reduction (no dim). */
   sum(a: BackendTensor, options?: SumOptions): BackendTensor;
   /** Max reduction. Returns 0-d tensor for full reduction (no dim). */
   max(a: BackendTensor, options?: MaxOptions): BackendTensor;
+  /** Min reduction. Returns 0-d tensor for full reduction (no dim). */
+  min?(a: BackendTensor, options?: MaxOptions): BackendTensor;
   /** Mean reduction. Returns 0-d tensor for full reduction (no dim). */
   mean(a: BackendTensor, options?: MeanOptions): BackendTensor;
   /** Argmax reduction. Returns indices of maximum values along dimension. */
@@ -289,17 +331,41 @@ export interface BackendOps {
   /** Argmin reduction. Returns indices of minimum values along dimension. */
   argmin?(a: BackendTensor, options: ArgReduceOptions): BackendTensor;
   /** Greater than comparison. Returns 1.0 where a > b, 0.0 elsewhere. */
-  gt?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  gt?(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   /** Less than comparison. Returns 1.0 where a < b, 0.0 elsewhere. */
-  lt?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  lt?(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   /** Greater than or equal comparison. Returns 1.0 where a >= b, 0.0 elsewhere. */
-  ge?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  ge?(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   /** Less than or equal comparison. Returns 1.0 where a <= b, 0.0 elsewhere. */
-  le?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  le?(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   /** Equal comparison. Returns 1.0 where a == b, 0.0 elsewhere. */
-  eq?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  eq?(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   /** Not equal comparison. Returns 1.0 where a != b, 0.0 elsewhere. */
-  ne?(a: BackendTensor, b: BackendTensor, options?: OpExecOptions): BackendTensor;
+  ne?(
+    a: BackendTensor,
+    b: BackendTensor,
+    options?: OpExecOptions,
+  ): BackendTensor;
   /** Ternary select: where(condition, x, y) -> x if condition else y */
   where(
     condition: BackendTensor,
@@ -328,6 +394,13 @@ export interface BackendOps {
     options: StridedScatterOptions,
   ): BackendTensor;
   /** Fused Adam/AdamW optimizer step. Returns updated param, m, v. */
+  /** Batched reduction: N independent same-config reductions in one kernel. */
+  batchedReduction?(
+    op: string,
+    inputs: BackendTensor[],
+    dim: number | number[],
+    keepdim?: boolean,
+  ): BackendTensor[];
   adamStep?(
     grad: BackendTensor,
     param: BackendTensor,
@@ -393,11 +466,33 @@ export interface BackendOps {
     x: BackendTensor,
     config: FusedLayerNormConfig,
   ): { gradWeight: BackendTensor; gradBias: BackendTensor };
+  /** Fused RMSNorm forward: x [N,D] + weight [D] → output [N,D]. */
+  fusedRMSNormForward?(
+    x: BackendTensor,
+    weight: BackendTensor,
+    config: FusedRMSNormConfig,
+  ): BackendTensor;
+  /** Fused RMSNorm backward gradX: grad [N,D] + x [N,D] + weight [D] → gradX [N,D]. */
+  fusedRMSNormBackwardGradX?(
+    gradOutput: BackendTensor,
+    x: BackendTensor,
+    weight: BackendTensor,
+    config: FusedRMSNormConfig,
+  ): BackendTensor;
+  /** Fused RMSNorm backward gradWeight: grad [N,D] + x [N,D] + weight [D] → gradWeight [D]. */
+  fusedRMSNormBackwardGradWeight?(
+    gradOutput: BackendTensor,
+    x: BackendTensor,
+    weight: BackendTensor,
+    config: FusedRMSNormConfig,
+  ): BackendTensor;
   /** Create a zeroed inf-flag buffer for unscaleGrad. */
   createInfCountBuffer?(): unknown;
   /** Read inf flag (0.0 or 1.0) and destroy buffer. */
   readAndDestroyInfCount?(buffer: unknown): Promise<number>;
   read(a: BackendTensor): Promise<number[]>;
+  /** Start async scalar readback: copy to staging buffer, return finish function. */
+  startScalarReadback?(a: BackendTensor): () => Promise<number>;
 }
 
 export interface Backend {
@@ -415,4 +510,56 @@ export interface Backend {
    */
   beginStep?(): void | Promise<void>;
   endStep?(): void;
+}
+
+// ============================================================================
+// FusedBackend — extended interface for backends with fused execution support
+// ============================================================================
+
+/**
+ * Extended backend interface for backends that support fused kernel dispatch.
+ *
+ * Adds shared command encoder lifecycle, buffer pool management, and arena
+ * support that enable the engine to orchestrate optimized execution without
+ * importing backend-specific modules directly.
+ *
+ * Currently implemented by the WebGPU backend. A future Metal or Vulkan
+ * backend could implement this interface to get fusion/batching/arena
+ * support from the engine layer automatically.
+ */
+export interface FusedBackend extends Backend {
+  /** Begin a shared command encoder scope. Nested calls increment a depth counter. */
+  beginSharedEncoder(): void;
+  /** End a shared command encoder scope. Submits when depth reaches 0. */
+  endSharedEncoder(): void;
+  /** Flush the current shared encoder (submit commands) without closing the scope. */
+  flushSharedEncoder(): void;
+  /** Move pending-release buffers back to the main pool for reuse. */
+  flushBufferPool(): void;
+
+  /** Enable/disable Adam batch mode (suppresses per-op encoder flushes). */
+  setAdamBatchMode(enabled: boolean): void;
+
+  /** Activate a buffer arena for stable buffer identity across steps. */
+  setActiveArena(arena: unknown): void;
+  /** Deactivate the buffer arena. */
+  clearActiveArena(): void;
+  /** Set external input buffer mappings for arena resolution. */
+  setArenaExternalInputBuffers(buffers: unknown[]): void;
+  /** Clear external input buffer mappings. */
+  clearArenaExternalInputBuffers(): void;
+
+  /** Begin a batch execution scope (for checkpoint segmentation with GPU sync). */
+  beginBatchExecution(): void;
+  /** End batch execution and wait for GPU completion. */
+  endBatchExecution(): Promise<void>;
+  /** Check if a batch execution scope is active. */
+  isBatchActive(): boolean;
+  /** Abort the current batch execution scope. */
+  abortBatch(): void;
+}
+
+/** Type guard: check if a backend supports fused execution (shared encoder, arena, etc.). */
+export function isFusedBackend(backend: Backend): backend is FusedBackend {
+  return "beginSharedEncoder" in backend;
 }

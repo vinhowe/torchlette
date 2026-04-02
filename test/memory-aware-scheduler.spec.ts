@@ -6,14 +6,17 @@
  * allowing for better memory reuse within a single plan execution.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { RuntimeEngine } from "../src/runtime/engine";
-import { storageTracker, resetNodeIdCounter, resetStorageIdCounter } from "../src/engine/lazy";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   analyzeLifetimes,
   findDeadTensorsAtStep,
-  computeBufferSize,
-} from "../src/engine/memory-planning";
+} from "../src/graph/lifetime-analysis";
+import {
+  resetNodeIdCounter,
+  resetStorageIdCounter,
+} from "../src/graph/node-factory";
+import { storageTracker } from "../src/graph/storage-tracker";
+import { RuntimeEngine } from "../src/runtime/engine";
 
 describe("Memory-Aware Scheduler", () => {
   beforeEach(() => {
@@ -32,10 +35,10 @@ describe("Memory-Aware Scheduler", () => {
       // Node 1 produces a, node 2 uses a to produce b, etc.
       const nodeOrder = [1, 2, 3, 4];
       const nodeInputs = new Map<number, number[]>([
-        [1, []],      // a: no inputs
-        [2, [1]],     // b: uses a
-        [3, [2]],     // c: uses b
-        [4, [3]],     // d: uses c
+        [1, []], // a: no inputs
+        [2, [1]], // b: uses a
+        [3, [2]], // c: uses b
+        [4, [3]], // d: uses c
       ]);
       const outputNodeIds = new Set([4]); // d is output
       const nodeSizes = new Map<number, number>([
@@ -45,7 +48,12 @@ describe("Memory-Aware Scheduler", () => {
         [4, 1024],
       ]);
 
-      const lifetimes = analyzeLifetimes(nodeOrder, nodeInputs, outputNodeIds, nodeSizes);
+      const lifetimes = analyzeLifetimes(
+        nodeOrder,
+        nodeInputs,
+        outputNodeIds,
+        nodeSizes,
+      );
 
       // After step 0 (node 1 executed): nothing dead yet
       // After step 1 (node 2 executed): node 1 (a) is dead (lastUse=1, currentStep=2)
@@ -55,7 +63,12 @@ describe("Memory-Aware Scheduler", () => {
       const alreadyReleased = new Set<number>();
 
       // After step 1
-      const deadAfterStep1 = findDeadTensorsAtStep(lifetimes, 2, outputNodeIds, alreadyReleased);
+      const deadAfterStep1 = findDeadTensorsAtStep(
+        lifetimes,
+        2,
+        outputNodeIds,
+        alreadyReleased,
+      );
       expect(deadAfterStep1).toContain(1);
       expect(deadAfterStep1).not.toContain(2);
 
@@ -63,7 +76,12 @@ describe("Memory-Aware Scheduler", () => {
       alreadyReleased.add(1);
 
       // After step 2
-      const deadAfterStep2 = findDeadTensorsAtStep(lifetimes, 3, outputNodeIds, alreadyReleased);
+      const deadAfterStep2 = findDeadTensorsAtStep(
+        lifetimes,
+        3,
+        outputNodeIds,
+        alreadyReleased,
+      );
       expect(deadAfterStep2).toContain(2);
       expect(deadAfterStep2).not.toContain(1); // Already released
 
@@ -71,7 +89,12 @@ describe("Memory-Aware Scheduler", () => {
       alreadyReleased.add(2);
 
       // After step 3
-      const deadAfterStep3 = findDeadTensorsAtStep(lifetimes, 4, outputNodeIds, alreadyReleased);
+      const deadAfterStep3 = findDeadTensorsAtStep(
+        lifetimes,
+        4,
+        outputNodeIds,
+        alreadyReleased,
+      );
       expect(deadAfterStep3).toContain(3);
       expect(deadAfterStep3).not.toContain(4); // Output, never dead
     });
@@ -82,11 +105,11 @@ describe("Memory-Aware Scheduler", () => {
       // Where 'a' is used by both b and d
       const nodeOrder = [1, 2, 3, 4, 5];
       const nodeInputs = new Map<number, number[]>([
-        [1, []],      // a: no inputs
-        [2, [1]],     // b: uses a
-        [3, [2]],     // c: uses b
-        [4, [1]],     // d: uses a (branch)
-        [5, [3, 4]],  // e: uses c and d
+        [1, []], // a: no inputs
+        [2, [1]], // b: uses a
+        [3, [2]], // c: uses b
+        [4, [1]], // d: uses a (branch)
+        [5, [3, 4]], // e: uses c and d
       ]);
       const outputNodeIds = new Set([5]); // e is output
       const nodeSizes = new Map<number, number>([
@@ -97,7 +120,12 @@ describe("Memory-Aware Scheduler", () => {
         [5, 1024],
       ]);
 
-      const lifetimes = analyzeLifetimes(nodeOrder, nodeInputs, outputNodeIds, nodeSizes);
+      const lifetimes = analyzeLifetimes(
+        nodeOrder,
+        nodeInputs,
+        outputNodeIds,
+        nodeSizes,
+      );
 
       // Node 1 (a) is used by nodes 2 and 4, so lastUse = max(step of 2, step of 4) = step 3
       // Node 2 (b) is used by node 3, lastUse = step 2
@@ -107,12 +135,22 @@ describe("Memory-Aware Scheduler", () => {
       const alreadyReleased = new Set<number>();
 
       // After executing node 2 (step 1), nothing should be dead yet
-      const deadAfterStep1 = findDeadTensorsAtStep(lifetimes, 2, outputNodeIds, alreadyReleased);
+      const deadAfterStep1 = findDeadTensorsAtStep(
+        lifetimes,
+        2,
+        outputNodeIds,
+        alreadyReleased,
+      );
       // Node 1 still needed (by node 4), node 2 still needed (by node 3)
       expect(deadAfterStep1).toHaveLength(0);
 
       // After executing node 3 (step 2), node 2 should be dead
-      const deadAfterStep2 = findDeadTensorsAtStep(lifetimes, 3, outputNodeIds, alreadyReleased);
+      const deadAfterStep2 = findDeadTensorsAtStep(
+        lifetimes,
+        3,
+        outputNodeIds,
+        alreadyReleased,
+      );
       expect(deadAfterStep2).toContain(2);
     });
 
@@ -128,11 +166,21 @@ describe("Memory-Aware Scheduler", () => {
         [2, 1024],
       ]);
 
-      const lifetimes = analyzeLifetimes(nodeOrder, nodeInputs, outputNodeIds, nodeSizes);
+      const lifetimes = analyzeLifetimes(
+        nodeOrder,
+        nodeInputs,
+        outputNodeIds,
+        nodeSizes,
+      );
       const alreadyReleased = new Set<number>();
 
       // After all steps, output should never be dead
-      const deadAfterAll = findDeadTensorsAtStep(lifetimes, 100, outputNodeIds, alreadyReleased);
+      const deadAfterAll = findDeadTensorsAtStep(
+        lifetimes,
+        100,
+        outputNodeIds,
+        alreadyReleased,
+      );
       expect(deadAfterAll).not.toContain(2);
     });
   });
@@ -171,21 +219,37 @@ describe("Memory-Aware Scheduler", () => {
     });
 
     it("should produce identical results with and without early release", async () => {
-      const engineWithEarlyRelease = new RuntimeEngine("cpu", { enableEarlyRelease: true });
-      const engineWithoutEarlyRelease = new RuntimeEngine("cpu", { enableEarlyRelease: false });
+      const engineWithEarlyRelease = new RuntimeEngine("cpu", {
+        enableEarlyRelease: true,
+      });
+      const engineWithoutEarlyRelease = new RuntimeEngine("cpu", {
+        enableEarlyRelease: false,
+      });
 
       // Complex computation
       const makeComputation = (engine: RuntimeEngine) => {
-        const x = engine.tensorFromArray([1, 2, 3, 4, 5, 6, 7, 8], [2, 4], "cpu");
-        const y = engine.tensorFromArray([0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0], [2, 4], "cpu");
+        const x = engine.tensorFromArray(
+          [1, 2, 3, 4, 5, 6, 7, 8],
+          [2, 4],
+          "cpu",
+        );
+        const y = engine.tensorFromArray(
+          [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+          [2, 4],
+          "cpu",
+        );
         const z = engine.add(x, y);
         const w = engine.mul(z, z);
         const result = engine.sqrt(w);
         return result;
       };
 
-      const resultWith = await engineWithEarlyRelease.cpu(makeComputation(engineWithEarlyRelease));
-      const resultWithout = await engineWithoutEarlyRelease.cpu(makeComputation(engineWithoutEarlyRelease));
+      const resultWith = await engineWithEarlyRelease.cpu(
+        makeComputation(engineWithEarlyRelease),
+      );
+      const resultWithout = await engineWithoutEarlyRelease.cpu(
+        makeComputation(engineWithoutEarlyRelease),
+      );
 
       expect(resultWith).toEqual(resultWithout);
     });
@@ -270,8 +334,6 @@ describe("Memory-Aware Scheduler with Fusion", () => {
 describe("Memory-Aware Scheduler with Memory Planning", () => {
   it("should work correctly with memory planning and early release", async () => {
     const engine = new RuntimeEngine("cpu", {
-      enableMemoryPlanning: true,
-      enableDonation: true,
       enableEarlyRelease: true,
     });
 
@@ -308,20 +370,36 @@ describe("Memory-Aware Scheduler with WebGPU", { skip: cpuOnly }, () => {
   });
 
   it("should produce identical results with and without early release on WebGPU", async () => {
-    const engineWithEarlyRelease = new RuntimeEngine("webgpu", { enableEarlyRelease: true });
-    const engineWithoutEarlyRelease = new RuntimeEngine("webgpu", { enableEarlyRelease: false });
+    const engineWithEarlyRelease = new RuntimeEngine("webgpu", {
+      enableEarlyRelease: true,
+    });
+    const engineWithoutEarlyRelease = new RuntimeEngine("webgpu", {
+      enableEarlyRelease: false,
+    });
 
     const makeComputation = (engine: RuntimeEngine) => {
-      const x = engine.tensorFromArray([1, 2, 3, 4, 5, 6, 7, 8], [2, 4], "webgpu");
-      const y = engine.tensorFromArray([0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0], [2, 4], "webgpu");
+      const x = engine.tensorFromArray(
+        [1, 2, 3, 4, 5, 6, 7, 8],
+        [2, 4],
+        "webgpu",
+      );
+      const y = engine.tensorFromArray(
+        [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+        [2, 4],
+        "webgpu",
+      );
       const z = engine.add(x, y);
       const w = engine.mul(z, z);
       const result = engine.sqrt(w);
       return result;
     };
 
-    const resultWith = await engineWithEarlyRelease.cpu(makeComputation(engineWithEarlyRelease));
-    const resultWithout = await engineWithoutEarlyRelease.cpu(makeComputation(engineWithoutEarlyRelease));
+    const resultWith = await engineWithEarlyRelease.cpu(
+      makeComputation(engineWithEarlyRelease),
+    );
+    const resultWithout = await engineWithoutEarlyRelease.cpu(
+      makeComputation(engineWithoutEarlyRelease),
+    );
 
     expect(resultWith).toEqual(resultWithout);
   });
@@ -345,8 +423,6 @@ describe("Memory-Aware Scheduler with WebGPU", { skip: cpuOnly }, () => {
 
   it("should work with memory planning and early release on WebGPU", async () => {
     const engine = new RuntimeEngine("webgpu", {
-      enableMemoryPlanning: true,
-      enableDonation: true,
       enableEarlyRelease: true,
     });
 

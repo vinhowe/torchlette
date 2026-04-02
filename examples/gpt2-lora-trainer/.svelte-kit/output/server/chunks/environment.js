@@ -23,12 +23,12 @@ function set_prerendering() {
 }
 export {
   BROWSER as B,
-  assets as a,
+  app_dir as a,
   base as b,
-  app_dir as c,
-  reset as d,
-  set_building as e,
-  set_prerendering as f,
+  set_building as c,
+  set_prerendering as d,
+  assets as e,
+  reset as f,
   override as o,
   prerendering as p,
   relative as r,

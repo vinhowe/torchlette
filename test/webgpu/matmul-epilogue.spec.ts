@@ -6,13 +6,13 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  dispatchMatmulWithEpilogue,
+  dispatchMatmul,
   getWebGPUInitError,
   initWebGPU,
   syncWebGPU,
   webgpuBackend,
 } from "../../src/backend/webgpu";
-import type { EpilogueConfig } from "../../src/backend/webgpu/matmul";
+import type { EpilogueConfig } from "../../src/backend/webgpu/matmul/types";
 
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -120,9 +120,9 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
       const bVals = makeValues(k * n, 1);
       const biasVals = makeValues(n, 2);
 
-      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]) as any;
-      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]) as any;
-      const bias = webgpuBackend.ops.tensorFromArray(biasVals, [n]) as any;
+      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]);
+      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]);
+      const bias = webgpuBackend.ops.tensorFromArray(biasVals, [n]);
 
       const epilogue: EpilogueConfig = {
         ops: [{ kind: "bias", inputIndex: 0 }],
@@ -130,7 +130,10 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmulWithEpilogue(a, b, epilogue, [bias]);
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [bias],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);
@@ -150,9 +153,9 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
       const bVals = makeValues(k * n, 1);
       const biasVals = makeValues(n, 2);
 
-      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]) as any;
-      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]) as any;
-      const bias = webgpuBackend.ops.tensorFromArray(biasVals, [n]) as any;
+      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]);
+      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]);
+      const bias = webgpuBackend.ops.tensorFromArray(biasVals, [n]);
 
       const epilogue: EpilogueConfig = {
         ops: [{ kind: "bias", inputIndex: 0 }],
@@ -160,7 +163,10 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmulWithEpilogue(a, b, epilogue, [bias]);
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [bias],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);
@@ -180,16 +186,19 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
       const aVals = makeValues(m * k, 0);
       const bVals = makeValues(k * n, 1);
 
-      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]) as any;
-      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]) as any;
+      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]);
+      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]);
 
       const epilogue: EpilogueConfig = {
-        ops: [{ kind: "relu" }],
+        ops: [{ kind: "unary", op: "relu" }],
         additionalInputCount: 0,
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmulWithEpilogue(a, b, epilogue, []);
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);
@@ -208,16 +217,19 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
       const aVals = makeValues(m * k, 0).map((x) => x * 0.1);
       const bVals = makeValues(k * n, 1).map((x) => x * 0.1);
 
-      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]) as any;
-      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]) as any;
+      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]);
+      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]);
 
       const epilogue: EpilogueConfig = {
-        ops: [{ kind: "gelu" }],
+        ops: [{ kind: "unary", op: "gelu" }],
         additionalInputCount: 0,
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmulWithEpilogue(a, b, epilogue, []);
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);
@@ -236,16 +248,19 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
       const aVals = makeValues(m * k, 0).map((x) => x * 0.1);
       const bVals = makeValues(k * n, 1).map((x) => x * 0.1);
 
-      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]) as any;
-      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]) as any;
+      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]);
+      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]);
 
       const epilogue: EpilogueConfig = {
-        ops: [{ kind: "silu" }],
+        ops: [{ kind: "unary", op: "silu" }],
         additionalInputCount: 0,
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmulWithEpilogue(a, b, epilogue, []);
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);
@@ -266,17 +281,23 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
       const bVals = makeValues(k * n, 1);
       const biasVals = makeValues(n, 2);
 
-      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]) as any;
-      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]) as any;
-      const bias = webgpuBackend.ops.tensorFromArray(biasVals, [n]) as any;
+      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]);
+      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]);
+      const bias = webgpuBackend.ops.tensorFromArray(biasVals, [n]);
 
       const epilogue: EpilogueConfig = {
-        ops: [{ kind: "bias", inputIndex: 0 }, { kind: "relu" }],
+        ops: [
+          { kind: "bias", inputIndex: 0 },
+          { kind: "unary", op: "relu" },
+        ],
         additionalInputCount: 1,
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmulWithEpilogue(a, b, epilogue, [bias]);
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [bias],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);
@@ -297,17 +318,23 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
       const bVals = makeValues(k * n, 1).map((x) => x * 0.1);
       const biasVals = makeValues(n, 2).map((x) => x * 0.1);
 
-      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]) as any;
-      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]) as any;
-      const bias = webgpuBackend.ops.tensorFromArray(biasVals, [n]) as any;
+      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]);
+      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]);
+      const bias = webgpuBackend.ops.tensorFromArray(biasVals, [n]);
 
       const epilogue: EpilogueConfig = {
-        ops: [{ kind: "bias", inputIndex: 0 }, { kind: "gelu" }],
+        ops: [
+          { kind: "bias", inputIndex: 0 },
+          { kind: "unary", op: "gelu" },
+        ],
         additionalInputCount: 1,
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmulWithEpilogue(a, b, epilogue, [bias]);
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [bias],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);
@@ -329,9 +356,9 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
       const bVals = makeValues(k * n, 1);
       const biasVals = makeValues(n, 2);
 
-      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]) as any;
-      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]) as any;
-      const bias = webgpuBackend.ops.tensorFromArray(biasVals, [n]) as any;
+      const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]);
+      const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]);
+      const bias = webgpuBackend.ops.tensorFromArray(biasVals, [n]);
 
       const epilogue: EpilogueConfig = {
         ops: [{ kind: "bias", inputIndex: 0 }],
@@ -339,7 +366,10 @@ describe.runIf(isWebGPUEnabled)("matmul epilogue fusion (webgpu)", () => {
         outputDtype: "f32",
       };
 
-      const c = dispatchMatmulWithEpilogue(a, b, epilogue, [bias]);
+      const c = dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [bias],
+      });
 
       await syncWebGPU();
       const result = await webgpuBackend.ops.read(c);

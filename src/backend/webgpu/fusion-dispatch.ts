@@ -5,26 +5,26 @@
  * Supports vectorized memory coalescing (§15.3) for improved bandwidth.
  */
 
-import { dispatchComputePass, createParamsBuffer, releaseParamsBuffer, allocateOutputBuffer, trackSharedEncoderWrite, cachedCreateBindGroup, type RecordedDispatch } from "./index";
-
-/** Module-level recording buffer (shared with index.ts recording system). */
-let fusionRecordingBuffer: RecordedDispatch[] | null = null;
-export function setFusionRecordingBuffer(buf: RecordedDispatch[] | null): void {
-  fusionRecordingBuffer = buf;
-}
-
-import type { DType } from "../types";
-import { dtypeBytes, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
 import { sizeOf } from "../../core/shape";
+import type { DType } from "../types";
 import {
+  cachedCreateBindGroup,
+  createParamsBuffer,
+  releaseParamsBuffer,
+} from "./bind-group-cache";
+import { allocateOutputBuffer, resolveOutputBuffer } from "./buffer-arena";
+import { dispatchComputePass } from "./dispatch";
+import { generateFusedKernelTileIR } from "./fusion-tile-ir";
+import {
+  computeKernelMeta,
   type FusedKernelRecipe,
   type GeneratedKernel,
-  generateFusedKernel,
-  computeKernelMeta,
   type KernelGenOptions,
-} from "./fusion-codegen";
-import type { GPUBuffer, GPUDevice, GPUComputePipeline } from "./gpu-types";
-import { GPUBufferUsage } from "./gpu-types";
+} from "./fusion-types";
+import type { GPUBuffer, GPUComputePipeline, GPUDevice } from "./gpu-types";
+import { getWarmupPipeline, recordPipeline } from "./pipeline-warmup";
+import { dtypeBytes, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
+import { onTeardown, trackSharedEncoderWrite } from "./webgpu-state";
 
 // ============================================================================
 // Kernel Cache
@@ -33,7 +33,6 @@ import { GPUBufferUsage } from "./gpu-types";
 interface CachedPipeline {
   pipeline: GPUComputePipeline;
   kernel: GeneratedKernel;
-  createdAt: number;
 }
 
 /**
@@ -65,35 +64,26 @@ export class FusionKernelCache {
     }
 
     // Cache miss: do full WGSL codegen + shader compilation
-    const kernel = generateFusedKernel(recipe, options);
+    const kernel = generateFusedKernelTileIR(recipe, options);
 
-    const module = device.createShaderModule({ code: kernel.source });
-    const pipeline = device.createComputePipeline({
-      layout: "auto",
-      compute: { module, entryPoint: "main" },
-    });
-
-    // Cache it
-    if (this.cache.size >= this.maxSize) {
-      // Evict oldest entry
-      let oldest: string | null = null;
-      let oldestTime = Infinity;
-      for (const [key, entry] of this.cache) {
-        if (entry.createdAt < oldestTime) {
-          oldestTime = entry.createdAt;
-          oldest = key;
-        }
-      }
-      if (oldest) {
-        this.cache.delete(oldest);
-      }
+    // Check warmup cache before synchronous compilation
+    let pipeline = getWarmupPipeline(meta.cacheKey);
+    if (!pipeline) {
+      recordPipeline(meta.cacheKey, kernel.source);
+      const module = device.createShaderModule({ code: kernel.source });
+      pipeline = device.createComputePipeline({
+        layout: "auto",
+        compute: { module, entryPoint: "main" },
+      });
     }
 
-    this.cache.set(meta.cacheKey, {
-      pipeline,
-      kernel,
-      createdAt: Date.now(),
-    });
+    // Cache it (Map preserves insertion order — first key is oldest)
+    if (this.cache.size >= this.maxSize) {
+      const oldest = this.cache.keys().next().value;
+      if (oldest !== undefined) this.cache.delete(oldest);
+    }
+
+    this.cache.set(meta.cacheKey, { pipeline, kernel });
 
     return { pipeline, kernel };
   }
@@ -133,6 +123,7 @@ export function resetFusionCache(): void {
   globalKernelCache?.clear();
   globalKernelCache = null;
 }
+onTeardown(resetFusionCache);
 
 // ============================================================================
 // Dispatch
@@ -195,7 +186,9 @@ export function dispatchFusedKernel(
   options: FusedDispatchOptions = {},
 ): FusedDispatchResult {
   // Count non-inlined inputs (inlined constants don't need buffer bindings)
-  const nonInlinedCount = recipe.inputs.filter(inp => !inp.isInlinedConstant).length;
+  const nonInlinedCount = recipe.inputs.filter(
+    (inp) => !inp.isInlinedConstant,
+  ).length;
 
   // Validate inputs — caller should pass only non-inlined input buffers
   if (inputs.length !== nonInlinedCount) {
@@ -207,7 +200,7 @@ export function dispatchFusedKernel(
   // Check storage buffer binding count against device limits BEFORE creating pipeline.
   const storageBindingCount = nonInlinedCount + recipe.outputs.length;
   const maxStorageBuffers = device.limits.maxStorageBuffersPerShaderStage;
-  if (storageBindingCount > maxStorageBuffers) {
+  if (storageBindingCount > maxStorageBuffers!) {
     throw new Error(
       `Fused kernel requires ${storageBindingCount} storage buffers but device limit is ${maxStorageBuffers}`,
     );
@@ -222,12 +215,16 @@ export function dispatchFusedKernel(
   const primaryOutput = recipe.outputs[0];
   const totalElements = sizeOf(primaryOutput.shape);
 
-  // Create output buffers for all outputs (via shared buffer pool)
+  // Create output buffers for all outputs.
+  // Use resolveOutputBuffer (not allocateOutputBuffer) so the arena aliasing
+  // check prevents returning an input buffer as the output — that would create
+  // a read/read_write conflict within the same compute pass.
+  const inputGPUBuffers = inputs.map((inp) => inp.buffer);
   const outputBuffers: GPUBuffer[] = [];
   const outputTensors: FusedOutputTensor[] = [];
   for (const output of recipe.outputs) {
     const outputBytes = totalElements * dtypeBytes(output.dtype);
-    const buffer = allocateOutputBuffer(outputBytes);
+    const buffer = resolveOutputBuffer(device, outputBytes, inputGPUBuffers);
     trackSharedEncoderWrite(buffer);
     outputBuffers.push(buffer);
     outputTensors.push({
@@ -238,7 +235,10 @@ export function dispatchFusedKernel(
   }
 
   // Create uniform buffer for params via shared pool
-  const paramsBuffer = createParamsBuffer(device, new Uint32Array([totalElements]));
+  const paramsBuffer = createParamsBuffer(
+    device,
+    new Uint32Array([totalElements]),
+  );
 
   // Build flat buffer array: non-inlined inputs, then outputs, then params
   const bgBuffers: GPUBuffer[] = [];
@@ -255,9 +255,12 @@ export function dispatchFusedKernel(
   // Use 2D dispatch when workgroups exceed WebGPU per-dimension limit (65535)
   const totalWorkgroups = Math.ceil(kernel.workItems / kernel.workgroupSize);
   const workgroupsX = Math.min(totalWorkgroups, MAX_WORKGROUPS_PER_DIM);
-  const workgroupsY = totalWorkgroups <= MAX_WORKGROUPS_PER_DIM ? 1 : Math.ceil(totalWorkgroups / MAX_WORKGROUPS_PER_DIM);
+  const workgroupsY =
+    totalWorkgroups <= MAX_WORKGROUPS_PER_DIM
+      ? 1
+      : Math.ceil(totalWorkgroups / MAX_WORKGROUPS_PER_DIM);
 
-  dispatchComputePass(pipeline, bindGroup, workgroupsX, workgroupsY, 1, fusionRecordingBuffer);
+  dispatchComputePass(pipeline, bindGroup, workgroupsX, workgroupsY, 1);
 
   // Release the params uniform buffer via the params buffer pool (handles deferred destruction)
   releaseParamsBuffer(paramsBuffer);

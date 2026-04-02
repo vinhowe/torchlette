@@ -1,0 +1,68 @@
+{
+  "name": "hyparquet",
+  "version": "1.25.1",
+  "description": "Parquet file parser for JavaScript",
+  "author": "Hyperparam",
+  "homepage": "https://hyperparam.app",
+  "keywords": [
+    "ai",
+    "data",
+    "dataset",
+    "hyperparam",
+    "hyparquet",
+    "geoparquet",
+    "llm",
+    "ml",
+    "parquet",
+    "parquetjs",
+    "parser",
+    "snappy",
+    "thrift"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hyparam/hyparquet.git"
+  },
+  "files": [
+    "src",
+    "types"
+  ],
+  "type": "module",
+  "types": "types/index.d.ts",
+  "main": "src/index.js",
+  "exports": {
+    ".": {
+      "browser": {
+        "types": "./types/index.d.ts",
+        "import": "./src/index.js"
+      },
+      "default": {
+        "types": "./types/node.d.ts",
+        "import": "./src/node.js"
+      }
+    },
+    "./src/*.js": {
+      "types": "./types/*.d.ts",
+      "import": "./src/*.js"
+    }
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build:types": "tsc -p ./tsconfig.build.json",
+    "coverage": "vitest run --coverage --coverage.include=src",
+    "lint": "eslint",
+    "lint:fix": "eslint --fix",
+    "prepare": "npm run build:types",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "25.3.1",
+    "@vitest/coverage-v8": "4.0.18",
+    "eslint": "9.39.2",
+    "eslint-plugin-jsdoc": "62.7.1",
+    "hyparquet-compressors": "1.1.1",
+    "typescript": "5.9.3",
+    "vitest": "4.0.18"
+  }
+}

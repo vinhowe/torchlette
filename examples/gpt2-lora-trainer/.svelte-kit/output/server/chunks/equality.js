@@ -33,19 +33,19 @@ function safe_equals(value) {
   return !safe_not_equal(value, this.v);
 }
 export {
-  array_prototype as a,
-  get_prototype_of as b,
-  is_extensible as c,
+  safe_equals as a,
+  array_prototype as b,
+  get_prototype_of as c,
   deferred as d,
   equals as e,
-  index_of as f,
+  is_extensible as f,
   get_descriptor as g,
-  define_property as h,
+  index_of as h,
   is_array as i,
-  array_from as j,
-  safe_not_equal as k,
+  define_property as j,
+  array_from as k,
   noop as n,
   object_prototype as o,
   run_all as r,
-  safe_equals as s
+  safe_not_equal as s
 };

@@ -4,24 +4,22 @@
  */
 
 import * as path from "node:path";
-import { Torchlette, type Tensor } from "../src/frontend";
+import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
 import {
-  initWebGPU,
-  getGPUMemoryStats,
-  getBufferPoolStats,
-  getBufferPoolDetailedStats,
-  setGPUMemoryLimit,
   enableAllAllocDebug,
   getAndResetFlowCounters,
+  getBufferPoolStats,
+  getGPUAllocationHistogram,
+  getGPUMemoryStats,
   getLeakedAllocCount,
   getLeakedAllocCountForStep,
-  snapshotLeakedAllocsForStep,
+  initWebGPU,
   setAllocStep,
-  getTrackedBuffers,
-  getGPUAllocationHistogram,
+  setGPUMemoryLimit,
+  snapshotLeakedAllocs,
 } from "../src/backend/webgpu";
-import { storageTracker } from "../src/engine/lazy";
-import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
+import { storageTracker } from "../src/graph/storage-tracker";
+import { type Tensor, Torchlette } from "../src/frontend/torchlette";
 import { Adam, GradScaler } from "../src/optim";
 
 async function main() {
@@ -37,16 +35,25 @@ async function main() {
   });
 
   const modelDir = path.join(process.cwd(), "models", "distilgpt2");
-  const model = await loadPretrainedGPT2(api, modelDir, { dropoutRate: 0.0 }, { device: "webgpu" });
+  const model = await loadPretrainedGPT2(
+    api,
+    modelDir,
+    { dropoutRate: 0.0 },
+    { device: "webgpu" },
+  );
   model.train();
 
-  const optimizer = new Adam(model.parameters(), {
-    lr: 5e-4,
-    betas: [0.9, 0.999],
-    eps: 1e-8,
-    weightDecay: 0.01,
-    adamW: true,
-  }, api);
+  const optimizer = new Adam(
+    model.parameters(),
+    {
+      lr: 5e-4,
+      betas: [0.9, 0.999],
+      eps: 1e-8,
+      weightDecay: 0.01,
+      adamW: true,
+    },
+    api,
+  );
 
   const scaler = new GradScaler(api);
 
@@ -55,7 +62,9 @@ async function main() {
 
   const compiledForward = api.compile((input: Tensor, target: Tensor) => {
     return api.autocast(() => {
-      const result = model.forwardWithLoss(input, target, { useCheckpoint: true });
+      const result = model.forwardWithLoss(input, target, {
+        useCheckpoint: true,
+      });
       if (!result.loss) throw new Error("Loss is null");
       return result.loss;
     });
@@ -69,7 +78,9 @@ async function main() {
   // Get initial state
   const memBefore = getGPUMemoryStats();
   const poolBefore = getBufferPoolStats();
-  console.log(`Initial: ${(memBefore.currentBytes / 1e9).toFixed(3)}GB tracked, ${memBefore.allocationCount} allocs, pool: ${poolBefore.pooledBuffers} buffers (${(poolBefore.pooledBytes / 1e6).toFixed(1)}MB)`);
+  console.log(
+    `Initial: ${(memBefore.currentBytes / 1e9).toFixed(3)}GB tracked, ${memBefore.allocationCount} allocs, pool: ${poolBefore.pooledBuffers} buffers (${(poolBefore.pooledBytes / 1e6).toFixed(1)}MB)`,
+  );
 
   // Reset flow counters
   getAndResetFlowCounters();
@@ -77,8 +88,12 @@ async function main() {
   for (let step = 0; step < 5; step++) {
     setAllocStep(step);
 
-    const input = api.tensorFromArray(inputData, [1, inputData.length], { device: "webgpu" });
-    const target = api.tensorFromArray(targetData, [1, targetData.length], { device: "webgpu" });
+    const input = api.tensorFromArray(inputData, [1, inputData.length], {
+      device: "webgpu",
+    });
+    const target = api.tensorFromArray(targetData, [1, targetData.length], {
+      device: "webgpu",
+    });
 
     const loss = compiledForward(input, target);
     const lossValue = await loss.item();
@@ -100,28 +115,49 @@ async function main() {
 
     // Collect stats
     const mem = getGPUMemoryStats();
-    const pool = getBufferPoolStats() as any;
+    const pool = getBufferPoolStats() as ReturnType<
+      typeof getBufferPoolStats
+    > & {
+      pendingRelease?: number;
+      pendingDestroy?: number;
+    };
     const flow = getAndResetFlowCounters();
     const storageStats = storageTracker.stats();
 
     console.log(`\nStep ${step}: loss=${lossValue.toFixed(4)}`);
-    console.log(`  Tracker: ${(mem.currentBytes / 1e9).toFixed(3)}GB, ${mem.allocationCount} live allocs, ${mem.bufferSizesCount} bufferSizes entries`);
-    console.log(`  Flow: +${flow.allocs} allocs, -${flow.deallocs} deallocs, ${flow.deallocMisses} misses, ${flow.doubleTracked} doubles`);
-    console.log(`  Net flow: ${flow.allocs - flow.deallocs} (should be ~0 at steady state)`);
-    console.log(`  Pool: ${pool.pooledBuffers} pooled (${(pool.pooledBytes / 1e6).toFixed(1)}MB), ${pool.pendingRelease ?? pool.pendingBuffers} pending-release, ${pool.pendingDestroy ?? '?'} pending-destroy`);
-    console.log(`  Pool reuse: ${pool.reuseCount} reuses / ${pool.allocCount} new allocs (${(pool.reuseRate * 100).toFixed(1)}%)`);
-    console.log(`  Storages: total=${storageStats.totalStorages}, reachable=${storageStats.reachableStorages}`);
+    console.log(
+      `  Tracker: ${(mem.currentBytes / 1e9).toFixed(3)}GB, ${mem.allocationCount} live allocs, ${mem.bufferSizesCount} bufferSizes entries`,
+    );
+    console.log(
+      `  Flow: +${flow.allocs} allocs, -${flow.deallocs} deallocs, ${flow.deallocMisses} misses, ${flow.doubleTracked} doubles`,
+    );
+    console.log(
+      `  Net flow: ${flow.allocs - flow.deallocs} (should be ~0 at steady state)`,
+    );
+    console.log(
+      `  Pool: ${pool.pooledBuffers} pooled (${(pool.pooledBytes / 1e6).toFixed(1)}MB), ${pool.pendingRelease ?? pool.pendingBuffers} pending-release, ${pool.pendingDestroy ?? "?"} pending-destroy`,
+    );
+    console.log(
+      `  Pool reuse: ${pool.reuseCount} reuses / ${pool.allocCount} new allocs (${(pool.reuseRate * 100).toFixed(1)}%)`,
+    );
+    console.log(
+      `  Storages: total=${storageStats.totalStorages}, reachable=${storageStats.reachableStorages}`,
+    );
 
     // Per-step leaked allocs
     const leakedThisStep = getLeakedAllocCountForStep(step);
     console.log(`  Leaked allocs this step: ${leakedThisStep}`);
     if (step >= 1 && leakedThisStep > 0) {
-      const leaked = snapshotLeakedAllocsForStep(step);
-      const sorted = [...leaked.entries()].sort((a, b) => b[1].totalBytes - a[1].totalBytes);
+      const leaked = snapshotLeakedAllocs(step);
+      const sorted = [...leaked.entries()].sort(
+        (a, b) => b[1].totalBytes - a[1].totalBytes,
+      );
       console.log(`  Top leaked allocation sites (step ${step}):`);
       for (const [site, info] of sorted.slice(0, 5)) {
-        console.log(`    ${info.count}x (${(info.totalBytes / 1e6).toFixed(2)}MB total):`);
-        const lines = site.split('\n');
+        console.log(
+          `    ${info.count}x (${(info.totalBytes / 1e6).toFixed(2)}MB total):`,
+        );
+        const lines = site.split("\n");
         for (const line of lines) {
           console.log(`      ${line.trim()}`);
         }
@@ -133,7 +169,9 @@ async function main() {
       const histogram = getGPUAllocationHistogram();
       console.log(`  Allocation histogram:`);
       for (const [label, info] of histogram) {
-        console.log(`    ${label}: ${info.count} allocs (${(info.totalBytes / 1e6).toFixed(1)}MB)`);
+        console.log(
+          `    ${label}: ${info.count} allocs (${(info.totalBytes / 1e6).toFixed(1)}MB)`,
+        );
       }
     }
   }

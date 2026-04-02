@@ -8,24 +8,24 @@
  */
 
 import * as path from "node:path";
-import { Torchlette, type Tensor } from "../src/frontend";
+import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
 import {
-  initWebGPU,
   destroyWebGPU,
-  getGPUMemoryStats,
   getBufferPoolStats,
+  getGPUMemoryStats,
+  initWebGPU,
   setGPUMemoryLimit,
 } from "../src/backend/webgpu";
 import {
-  getAndResetFlowCounters,
   enableAllAllocDebug,
-  setAllocStep,
-  snapshotLeakedAllocsForStep,
-  getTrackedBuffers,
+  getAndResetFlowCounters,
   getLeakedSizeHistogramForStep,
+  getTrackedBuffers,
+  setAllocStep,
+  snapshotLeakedAllocs,
 } from "../src/backend/webgpu/memory-tracker";
-import { storageTracker } from "../src/engine/lazy";
-import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
+import { storageTracker } from "../src/graph/storage-tracker";
+import { type Tensor, Torchlette } from "../src/frontend/torchlette";
 import { Adam, GradScaler } from "../src/optim";
 
 // Parse --steps N from CLI args
@@ -35,7 +35,7 @@ function parseArgs(): { steps: number } {
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--steps" && i + 1 < args.length) {
       steps = parseInt(args[i + 1], 10);
-      if (isNaN(steps) || steps < 1) steps = 5;
+      if (Number.isNaN(steps) || steps < 1) steps = 5;
     }
   }
   return { steps };
@@ -58,28 +58,39 @@ async function main() {
 
   // Load model
   const modelDir = path.join(process.cwd(), "models", "distilgpt2");
-  const model = await loadPretrainedGPT2(api, modelDir, { dropoutRate: 0.0 }, { device: "webgpu" });
+  const model = await loadPretrainedGPT2(
+    api,
+    modelDir,
+    { dropoutRate: 0.0 },
+    { device: "webgpu" },
+  );
   model.train();
 
   // Create optimizer and scaler
-  const optimizer = new Adam(model.parameters(), {
-    lr: 5e-4,
-    betas: [0.9, 0.999],
-    eps: 1e-8,
-    weightDecay: 0.01,
-    adamW: true,
-  }, api);
+  const optimizer = new Adam(
+    model.parameters(),
+    {
+      lr: 5e-4,
+      betas: [0.9, 0.999],
+      eps: 1e-8,
+      weightDecay: 0.01,
+      adamW: true,
+    },
+    api,
+  );
 
   const scaler = new GradScaler(api);
 
   // Prepare a single small training sequence
   const inputData = [50256, 1820, 4238, 338, 257, 5765, 1110]; // "The sun is a beautiful day"
-  const targetData = [1820, 4238, 338, 257, 5765, 1110, 764];  // shifted by 1
+  const targetData = [1820, 4238, 338, 257, 5765, 1110, 764]; // shifted by 1
 
   // Compiled forward
   const compiledForward = api.compile((input: Tensor, target: Tensor) => {
     return api.autocast(() => {
-      const result = model.forwardWithLoss(input, target, { useCheckpoint: true });
+      const result = model.forwardWithLoss(input, target, {
+        useCheckpoint: true,
+      });
       if (!result.loss) throw new Error("Loss is null");
       return result.loss;
     });
@@ -109,8 +120,12 @@ async function main() {
 
   for (let step = 0; step < steps; step++) {
     setAllocStep(step);
-    const input = api.tensorFromArray(inputData, [1, inputData.length], { device: "webgpu" });
-    const target = api.tensorFromArray(targetData, [1, targetData.length], { device: "webgpu" });
+    const input = api.tensorFromArray(inputData, [1, inputData.length], {
+      device: "webgpu",
+    });
+    const target = api.tensorFromArray(targetData, [1, targetData.length], {
+      device: "webgpu",
+    });
 
     // Forward
     const loss = compiledForward(input, target);
@@ -142,22 +157,38 @@ async function main() {
     const poolStats = getBufferPoolStats();
     const flowCounters = getAndResetFlowCounters();
 
+    const poolStatsExt = poolStats as typeof poolStats & {
+      pendingDestroy?: number;
+      pendingRelease?: number;
+    };
     stepData.push({
       storages: stats.totalStorages,
       reachable: stats.reachableStorages,
       trackerBytes: memStats.currentBytes,
       allocCount: memStats.allocationCount,
-      pendingDestroy: (poolStats as any).pendingDestroy ?? 0,
-      pendingRelease: (poolStats as any).pendingRelease ?? 0,
+      pendingDestroy: poolStatsExt.pendingDestroy ?? 0,
+      pendingRelease: poolStatsExt.pendingRelease ?? 0,
     });
 
     console.log(`Step ${step}: loss=${lossValue.toFixed(4)}`);
-    console.log(`  Storages: total=${stats.totalStorages}, reachable=${stats.reachableStorages}, unreachable=${stats.unreachableStorages}`);
-    console.log(`  Counters: registered=${counters.registered}, reachable=${counters.reachable}, unreachable=${counters.unreachable}, destroyed=${counters.destroyed}`);
-    console.log(`  Delta: registered-destroyed=${counters.registered - counters.destroyed}, reachable-unreachable=${counters.reachable - counters.unreachable}`);
-    console.log(`  Memory: ${(memStats.currentBytes / 1e9).toFixed(3)}GB, tracked buffers=${memStats.bufferSizesCount}`);
-    console.log(`  Pool: pooled=${poolStats.pooledBuffers} (${(poolStats.pooledBytes / 1e6).toFixed(1)}MB), pending-release=${(poolStats as any).pendingRelease}, pending-destroy=${(poolStats as any).pendingDestroy}`);
-    console.log(`  Flow: +${flowCounters.allocs} allocs, -${flowCounters.deallocs} deallocs, net=${flowCounters.allocs - flowCounters.deallocs}`);
+    console.log(
+      `  Storages: total=${stats.totalStorages}, reachable=${stats.reachableStorages}, unreachable=${stats.unreachableStorages}`,
+    );
+    console.log(
+      `  Counters: registered=${counters.registered}, reachable=${counters.reachable}, unreachable=${counters.unreachable}, destroyed=${counters.destroyed}`,
+    );
+    console.log(
+      `  Delta: registered-destroyed=${counters.registered - counters.destroyed}, reachable-unreachable=${counters.reachable - counters.unreachable}`,
+    );
+    console.log(
+      `  Memory: ${(memStats.currentBytes / 1e9).toFixed(3)}GB, tracked buffers=${memStats.bufferSizesCount}`,
+    );
+    console.log(
+      `  Pool: pooled=${poolStats.pooledBuffers} (${(poolStats.pooledBytes / 1e6).toFixed(1)}MB), pending-release=${poolStatsExt.pendingRelease}, pending-destroy=${poolStatsExt.pendingDestroy}`,
+    );
+    console.log(
+      `  Flow: +${flowCounters.allocs} allocs, -${flowCounters.deallocs} deallocs, net=${flowCounters.allocs - flowCounters.deallocs}`,
+    );
 
     // Find NEW reachable storage IDs using getNewReachableSince
     const newReachable = storageTracker.getNewReachableSince(prevReachableIds);
@@ -168,7 +199,9 @@ async function main() {
         lostReachableIds.push(id);
       }
     }
-    console.log(`  New reachable: ${newReachable.length}, Lost reachable: ${lostReachableIds.length}`);
+    console.log(
+      `  New reachable: ${newReachable.length}, Lost reachable: ${lostReachableIds.length}`,
+    );
 
     // Count live vs orphaned
     let orphanedCount = 0;
@@ -185,13 +218,18 @@ async function main() {
     }
     console.log(`  Live refs: ${liveRefCount}, Orphaned: ${orphanedCount}`);
     if (byType.size > 0) {
-      const typeStr = [...byType.entries()].map(([k, v]) => `${k}=${v}`).join(", ");
+      const typeStr = [...byType.entries()]
+        .map(([k, v]) => `${k}=${v}`)
+        .join(", ");
       console.log(`  By type: ${typeStr}`);
     }
 
     // For step >= 1, print detailed shape distribution
     if (step >= 1) {
-      const shapeGroups = new Map<string, { count: number; sizeBytes: number; disposedCount: number }>();
+      const shapeGroups = new Map<
+        string,
+        { count: number; sizeBytes: number; disposedCount: number }
+      >();
       let totalDisposed = 0;
       let totalNotDisposed = 0;
       for (const entry of newReachable) {
@@ -199,13 +237,20 @@ async function main() {
         const storage = storageTracker.getStorage(entry.id);
         let sizeBytes = 0;
         if (storage) {
-          const bt = storage.backendTensor as any;
+          const bt = storage.backendTensor as {
+            size?: number;
+            buffer?: { size?: number };
+          };
           sizeBytes = bt.size ?? bt.buffer?.size ?? 0;
         }
         const shapeKey = info?.shape ? `[${info.shape.join(",")}]` : "unknown";
         const typeKey = info?.type ?? "unknown";
         const key = `${typeKey}:${shapeKey}:${info?.dtype ?? "?"}`;
-        const existing = shapeGroups.get(key) || { count: 0, sizeBytes: 0, disposedCount: 0 };
+        const existing = shapeGroups.get(key) || {
+          count: 0,
+          sizeBytes: 0,
+          disposedCount: 0,
+        };
         existing.count++;
         existing.sizeBytes += sizeBytes;
         if (info?.disposed) {
@@ -216,15 +261,27 @@ async function main() {
         }
         shapeGroups.set(key, existing);
       }
-      const sorted = [...shapeGroups.entries()].sort((a, b) => b[1].count - a[1].count);
-      console.log(`  Disposed: ${totalDisposed}, Not disposed: ${totalNotDisposed}`);
-      console.log(`  Shape distribution of ${newReachable.length} new reachable storages:`);
+      const sorted = [...shapeGroups.entries()].sort(
+        (a, b) => b[1].count - a[1].count,
+      );
+      console.log(
+        `  Disposed: ${totalDisposed}, Not disposed: ${totalNotDisposed}`,
+      );
+      console.log(
+        `  Shape distribution of ${newReachable.length} new reachable storages:`,
+      );
       for (const [key, val] of sorted.slice(0, 25)) {
-        const sizeLabel = val.sizeBytes > 1024 * 1024 ? `${(val.sizeBytes / 1e6).toFixed(1)}MB` :
-                          val.sizeBytes > 1024 ? `${(val.sizeBytes / 1024).toFixed(1)}KB` :
-                          `${val.sizeBytes}B`;
-        const dispInfo = val.disposedCount > 0 ? ` (${val.disposedCount} disposed)` : "";
-        console.log(`    ${key}: x${val.count}${dispInfo} (${sizeLabel} total)`);
+        const sizeLabel =
+          val.sizeBytes > 1024 * 1024
+            ? `${(val.sizeBytes / 1e6).toFixed(1)}MB`
+            : val.sizeBytes > 1024
+              ? `${(val.sizeBytes / 1024).toFixed(1)}KB`
+              : `${val.sizeBytes}B`;
+        const dispInfo =
+          val.disposedCount > 0 ? ` (${val.disposedCount} disposed)` : "";
+        console.log(
+          `    ${key}: x${val.count}${dispInfo} (${sizeLabel} total)`,
+        );
       }
     }
 
@@ -251,7 +308,9 @@ async function main() {
       for (const [key, newCount] of newShapes) {
         const lostCount = lostShapes.get(key) ?? 0;
         if (newCount > lostCount) {
-          extraShapes.push(`${key}: new=${newCount}, lost=${lostCount} (delta=+${newCount - lostCount})`);
+          extraShapes.push(
+            `${key}: new=${newCount}, lost=${lostCount} (delta=+${newCount - lostCount})`,
+          );
         }
       }
       if (extraShapes.length > 0) {
@@ -269,7 +328,9 @@ async function main() {
         const lostCount = lostShapes.get(key) ?? 0;
         const newCount = newShapes.get(key) ?? 0;
         if (newCount > lostCount) {
-          console.log(`    storageId=${entry.id} shape=${shapeKey} dtype=${info?.dtype} disposed=${info?.disposed} liveRef=${entry.hasLiveTensorRef}`);
+          console.log(
+            `    storageId=${entry.id} shape=${shapeKey} dtype=${info?.dtype} disposed=${info?.disposed} liveRef=${entry.hasLiveTensorRef}`,
+          );
         }
       }
     }
@@ -279,13 +340,23 @@ async function main() {
       const suspectStorages: string[] = [];
       for (const id of currentReachableIds) {
         const info = storageTracker.getTensorRefDebugInfo(id);
-        if (info?.type === 'tensor' && (info.dtype === 'f16' || (info.shape && info.shape.join(',') === '7,50257'))) {
-          const shapeKey = info?.shape ? `[${info.shape.join(",")}]` : "unknown";
-          suspectStorages.push(`storageId=${id} shape=${shapeKey} dtype=${info?.dtype} disposed=${info?.disposed}`);
+        if (
+          info?.type === "tensor" &&
+          (info.dtype === "f16" ||
+            (info.shape && info.shape.join(",") === "7,50257"))
+        ) {
+          const shapeKey = info?.shape
+            ? `[${info.shape.join(",")}]`
+            : "unknown";
+          suspectStorages.push(
+            `storageId=${id} shape=${shapeKey} dtype=${info?.dtype} disposed=${info?.disposed}`,
+          );
         }
       }
       if (suspectStorages.length > 0) {
-        console.log(`  ALL reachable f16/logits tensor storages: ${suspectStorages.length}`);
+        console.log(
+          `  ALL reachable f16/logits tensor storages: ${suspectStorages.length}`,
+        );
         for (const s of suspectStorages) {
           console.log(`    ${s}`);
         }
@@ -294,9 +365,13 @@ async function main() {
 
     // Cross-reference: find GPU buffers tracked by memory tracker but not owned by any storage
     const liveOwnedBuffers = storageTracker.getLiveOwnedBuffers();
-    console.log(`  Storage-owned buffers: ${liveOwnedBuffers.size}, Tracker tracked: ${memStats.bufferSizesCount}`);
+    console.log(
+      `  Storage-owned buffers: ${liveOwnedBuffers.size}, Tracker tracked: ${memStats.bufferSizesCount}`,
+    );
     if (memStats.bufferSizesCount > liveOwnedBuffers.size) {
-      console.log(`  => ${memStats.bufferSizesCount - liveOwnedBuffers.size} tracked buffers have no owning storage (orphaned GPU buffers)`);
+      console.log(
+        `  => ${memStats.bufferSizesCount - liveOwnedBuffers.size} tracked buffers have no owning storage (orphaned GPU buffers)`,
+      );
     }
 
     prevReachableIds = currentReachableIds;
@@ -308,23 +383,49 @@ async function main() {
   {
     const trackedBuffers = getTrackedBuffers();
     const ownedBuffers = storageTracker.getLiveOwnedBuffers();
-    const orphanedBuffers = [...trackedBuffers].filter(b => !ownedBuffers.has(b));
+    const orphanedBuffers = [...trackedBuffers].filter(
+      (b) => !ownedBuffers.has(b),
+    );
     console.log(`Tracked buffers: ${trackedBuffers.size}`);
     console.log(`Storage-owned buffers: ${ownedBuffers.size}`);
-    console.log(`Orphaned (tracked but no owning storage): ${orphanedBuffers.length}`);
+    console.log(
+      `Orphaned (tracked but no owning storage): ${orphanedBuffers.length}`,
+    );
 
     // Dump alloc stacks for orphaned buffers from the _allocStacks debug map
     // We need to cross-reference orphaned buffer objects with their alloc stacks
-    const { gpuMemoryTracker } = await import("../src/backend/webgpu/memory-tracker");
-    const allocStacks = (gpuMemoryTracker as any)._allocStacks as Map<unknown, { size: number; stack: string; step: number }>;
+    const { gpuMemoryTracker } = await import(
+      "../src/backend/webgpu/memory-tracker"
+    );
+    const allocStacks = (
+      gpuMemoryTracker as unknown as {
+        _allocStacks: Map<
+          unknown,
+          { size: number; stack: string; step: number }
+        >;
+      }
+    )._allocStacks;
     if (allocStacks && allocStacks.size > 0) {
       // Group orphaned buffer alloc stacks by call site
-      const orphanedByCallSite = new Map<string, { count: number; totalBytes: number; steps: Set<number>; exampleStack: string }>();
+      const orphanedByCallSite = new Map<
+        string,
+        {
+          count: number;
+          totalBytes: number;
+          steps: Set<number>;
+          exampleStack: string;
+        }
+      >();
       for (const buf of orphanedBuffers) {
         const info = allocStacks.get(buf);
         if (!info) continue;
-        const key = info.stack.split('\n').slice(0, 3).join('\n');
-        const existing = orphanedByCallSite.get(key) || { count: 0, totalBytes: 0, steps: new Set<number>(), exampleStack: info.stack };
+        const key = info.stack.split("\n").slice(0, 3).join("\n");
+        const existing = orphanedByCallSite.get(key) || {
+          count: 0,
+          totalBytes: 0,
+          steps: new Set<number>(),
+          exampleStack: info.stack,
+        };
         existing.count++;
         existing.totalBytes += info.size;
         existing.steps.add(info.step);
@@ -333,26 +434,55 @@ async function main() {
       if (orphanedByCallSite.size > 0) {
         console.log(`\n  Orphaned buffer allocation sites:`);
         // Use deeper stack grouping (up to 8 frames) to differentiate callers
-        const orphanedByDeepSite = new Map<string, { count: number; totalBytes: number; steps: Set<number>; exampleStack: string; sizes: number[] }>();
+        const orphanedByDeepSite = new Map<
+          string,
+          {
+            count: number;
+            totalBytes: number;
+            steps: Set<number>;
+            exampleStack: string;
+            sizes: number[];
+          }
+        >();
         for (const buf of orphanedBuffers) {
           const info = allocStacks.get(buf);
           if (!info) continue;
-          const key = info.stack.split('\n').slice(0, 6).join('\n');
-          const existing = orphanedByDeepSite.get(key) || { count: 0, totalBytes: 0, steps: new Set<number>(), exampleStack: info.stack, sizes: [] };
+          const key = info.stack.split("\n").slice(0, 6).join("\n");
+          const existing = orphanedByDeepSite.get(key) || {
+            count: 0,
+            totalBytes: 0,
+            steps: new Set<number>(),
+            exampleStack: info.stack,
+            sizes: [],
+          };
           existing.count++;
           existing.totalBytes += info.size;
           existing.steps.add(info.step);
           existing.sizes.push(info.size);
           orphanedByDeepSite.set(key, existing);
         }
-        const sorted = [...orphanedByDeepSite.entries()].sort((a, b) => b[1].count - a[1].count);
+        const sorted = [...orphanedByDeepSite.entries()].sort(
+          (a, b) => b[1].count - a[1].count,
+        );
         for (const [, info] of sorted) {
           const stepList = [...info.steps].sort((a, b) => a - b);
           // Show unique sizes
           const uniqueSizes = [...new Set(info.sizes)].sort((a, b) => a - b);
-          const sizeStr = uniqueSizes.map(s => s >= 1024*1024 ? `${(s/1e6).toFixed(1)}MB` : s >= 1024 ? `${(s/1024).toFixed(1)}KB` : `${s}B`).join(", ");
-          console.log(`  ${info.count}x (${(info.totalBytes / 1e6).toFixed(1)}MB, steps: ${stepList.join(",")}, sizes: [${sizeStr}]):`);
-          console.log(`    ${info.exampleStack.split('\n').slice(0, 12).join('\n    ')}`);
+          const sizeStr = uniqueSizes
+            .map((s) =>
+              s >= 1024 * 1024
+                ? `${(s / 1e6).toFixed(1)}MB`
+                : s >= 1024
+                  ? `${(s / 1024).toFixed(1)}KB`
+                  : `${s}B`,
+            )
+            .join(", ");
+          console.log(
+            `  ${info.count}x (${(info.totalBytes / 1e6).toFixed(1)}MB, steps: ${stepList.join(",")}, sizes: [${sizeStr}]):`,
+          );
+          console.log(
+            `    ${info.exampleStack.split("\n").slice(0, 12).join("\n    ")}`,
+          );
         }
       }
     }
@@ -362,14 +492,20 @@ async function main() {
   const analyzeStep = Math.min(3, steps - 1);
   console.log(`\n=== Leaked Alloc Stacks (step ${analyzeStep}) ===`);
   {
-    const leaked = snapshotLeakedAllocsForStep(analyzeStep);
+    const leaked = snapshotLeakedAllocs(analyzeStep);
     if (leaked.size === 0) {
       console.log("  No leaked allocations for this step.");
     } else {
-      const sorted = [...leaked.entries()].sort((a, b) => b[1].count - a[1].count);
+      const sorted = [...leaked.entries()].sort(
+        (a, b) => b[1].count - a[1].count,
+      );
       for (const [, info] of sorted) {
-        console.log(`  ${info.count}x (${(info.totalBytes / 1e6).toFixed(1)}MB):`);
-        console.log(`    ${info.exampleStack.split('\n').slice(0, 5).join('\n    ')}`);
+        console.log(
+          `  ${info.count}x (${(info.totalBytes / 1e6).toFixed(1)}MB):`,
+        );
+        console.log(
+          `    ${info.exampleStack.split("\n").slice(0, 5).join("\n    ")}`,
+        );
       }
     }
 
@@ -379,9 +515,12 @@ async function main() {
       console.log(`\n  Size histogram (step ${analyzeStep}):`);
       const sortedHist = [...histogram.entries()].sort((a, b) => b[1] - a[1]);
       for (const [size, count] of sortedHist) {
-        const label = size >= 1024 * 1024 ? `${(size / 1e6).toFixed(1)}MB` :
-                      size >= 1024 ? `${(size / 1024).toFixed(1)}KB` :
-                      `${size}B`;
+        const label =
+          size >= 1024 * 1024
+            ? `${(size / 1e6).toFixed(1)}MB`
+            : size >= 1024
+              ? `${(size / 1024).toFixed(1)}KB`
+              : `${size}B`;
         console.log(`    ${label}: x${count}`);
       }
     }
@@ -389,8 +528,12 @@ async function main() {
 
   // === Trend Summary ===
   console.log("\n=== Trend Summary ===\n");
-  console.log("| Step | Storages | Reachable | PendingDestroy | TrackerMB | Allocs |");
-  console.log("|------|----------|-----------|----------------|-----------|--------|");
+  console.log(
+    "| Step | Storages | Reachable | PendingDestroy | TrackerMB | Allocs |",
+  );
+  console.log(
+    "|------|----------|-----------|----------------|-----------|--------|",
+  );
   for (let i = 0; i < stepData.length; i++) {
     const d = stepData[i];
     console.log(
@@ -404,26 +547,47 @@ async function main() {
     const steadyEnd = stepData.length - 1;
     const n = steadyEnd - steadyStart;
     if (n > 0) {
-      const storagesDelta = (stepData[steadyEnd].storages - stepData[steadyStart].storages) / n;
-      const reachableDelta = (stepData[steadyEnd].reachable - stepData[steadyStart].reachable) / n;
-      const trackerDelta = (stepData[steadyEnd].trackerBytes - stepData[steadyStart].trackerBytes) / n / 1e6;
-      const allocDelta = (stepData[steadyEnd].allocCount - stepData[steadyStart].allocCount) / n;
+      const storagesDelta =
+        (stepData[steadyEnd].storages - stepData[steadyStart].storages) / n;
+      const reachableDelta =
+        (stepData[steadyEnd].reachable - stepData[steadyStart].reachable) / n;
+      const trackerDelta =
+        (stepData[steadyEnd].trackerBytes -
+          stepData[steadyStart].trackerBytes) /
+        n /
+        1e6;
+      const allocDelta =
+        (stepData[steadyEnd].allocCount - stepData[steadyStart].allocCount) / n;
       const pdStart = stepData[steadyStart].pendingDestroy;
       const pdEnd = stepData[steadyEnd].pendingDestroy;
       const pdGrowing = pdEnd > pdStart + 10;
 
       console.log(`\nSteady-state delta (steps ${steadyStart}-${steadyEnd}):`);
-      console.log(`  Storages/step: ${storagesDelta >= 0 ? "+" : ""}${storagesDelta.toFixed(1)}`);
-      console.log(`  Reachable/step: ${reachableDelta >= 0 ? "+" : ""}${reachableDelta.toFixed(1)}`);
-      console.log(`  TrackerMB/step: ${trackerDelta >= 0 ? "+" : ""}${trackerDelta.toFixed(1)}`);
-      console.log(`  Allocs/step: ${allocDelta >= 0 ? "+" : ""}${allocDelta.toFixed(1)}`);
-      console.log(`  PendingDestroy: ${pdStart} -> ${pdEnd} (${pdGrowing ? "GROWING" : "stable"})`);
+      console.log(
+        `  Storages/step: ${storagesDelta >= 0 ? "+" : ""}${storagesDelta.toFixed(1)}`,
+      );
+      console.log(
+        `  Reachable/step: ${reachableDelta >= 0 ? "+" : ""}${reachableDelta.toFixed(1)}`,
+      );
+      console.log(
+        `  TrackerMB/step: ${trackerDelta >= 0 ? "+" : ""}${trackerDelta.toFixed(1)}`,
+      );
+      console.log(
+        `  Allocs/step: ${allocDelta >= 0 ? "+" : ""}${allocDelta.toFixed(1)}`,
+      );
+      console.log(
+        `  PendingDestroy: ${pdStart} -> ${pdEnd} (${pdGrowing ? "GROWING" : "stable"})`,
+      );
 
       // Verdict
       if (pdGrowing) {
-        console.log("\nLEAK STATUS: FAIL - pendingDestroy is growing (physical GPU buffer leak)");
+        console.log(
+          "\nLEAK STATUS: FAIL - pendingDestroy is growing (physical GPU buffer leak)",
+        );
       } else if (allocDelta > 5 || reachableDelta > 5) {
-        console.log(`\nLEAK STATUS: WARNING - +${allocDelta.toFixed(0)} allocs/step, +${reachableDelta.toFixed(0)} reachable/step`);
+        console.log(
+          `\nLEAK STATUS: WARNING - +${allocDelta.toFixed(0)} allocs/step, +${reachableDelta.toFixed(0)} reachable/step`,
+        );
       } else {
         console.log("\nLEAK STATUS: OK");
       }

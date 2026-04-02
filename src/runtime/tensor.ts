@@ -1,6 +1,7 @@
 import type { BackendTensor, DeviceKind, DType, Shape } from "../backend/types";
-import type { LazyRef, StorageHandle } from "../engine/lazy";
-import { isMaterialized, storageTracker } from "../engine/lazy";
+import { storageTracker } from "../graph/storage-tracker";
+import type { LazyRef, StorageHandle } from "../graph/types";
+import { isMaterialized } from "../graph/types";
 
 export type BaseId = number;
 
@@ -27,6 +28,14 @@ const tensorFinalizationRegistry = new FinalizationRegistry<{
  * Used to materialize all tensors whose nodes were executed during force().
  */
 const pendingTensorsByNodeId = new Map<number, Set<Tensor>>();
+
+/**
+ * Node IDs whose pending tensors were disposed (e.g., by checkpoint's tidy()).
+ * These IDs must still appear in getPendingNodeIds() so fusion analysis treats
+ * them as external, but we don't keep full Tensor references (that would leak).
+ * Cleared after each plan execution via clearDisposedPendingNodeIds().
+ */
+const disposedPendingNodeIds = new Set<number>();
 
 /**
  * Register a tensor as pending on a node ID.
@@ -60,27 +69,24 @@ function unregisterPendingTensor(nodeId: number, tensor: Tensor): void {
 export function materializePendingTensors(
   nodeId: number,
   storage: StorageHandle,
+  allResults?: StorageHandle[],
 ): void {
   const tensors = pendingTensorsByNodeId.get(nodeId);
   if (tensors) {
     for (const tensor of tensors) {
       if (!tensor.isMaterialized() && !tensor.disposed) {
-        tensor._materialize(storage);
+        // Multi-output: use the correct result based on outputIndex
+        const ref = tensor.lazyRef;
+        const outputIdx = ref.kind === "pending" ? (ref.outputIndex ?? 0) : 0;
+        const targetStorage =
+          outputIdx > 0 && allResults?.[outputIdx]
+            ? allResults[outputIdx]
+            : storage;
+        tensor._materialize(targetStorage);
       }
     }
     // Don't delete from map - tensors will unregister themselves
   }
-}
-
-/**
- * Get the number of pending tensors (for debugging/testing).
- */
-function getPendingTensorCount(): number {
-  let count = 0;
-  for (const tensors of pendingTensorsByNodeId.values()) {
-    count += tensors.size;
-  }
-  return count;
 }
 
 /**
@@ -90,7 +96,9 @@ export function getAllPendingTensors(): Tensor[] {
   const result: Tensor[] = [];
   for (const tensors of pendingTensorsByNodeId.values()) {
     for (const tensor of tensors) {
-      result.push(tensor);
+      if (!tensor.disposed) {
+        result.push(tensor);
+      }
     }
   }
   return result;
@@ -104,11 +112,68 @@ export function hasPendingTensors(): boolean {
 }
 
 /**
- * Get the set of node IDs that have live pending tensors.
+ * Get the set of node IDs that have pending tensors (live or recently disposed).
  * Used by fusion detection to avoid fusing across saved-for-backward boundaries.
+ * Includes disposedPendingNodeIds so checkpoint's tidy() doesn't hide nodes.
  */
 export function getPendingNodeIds(): Set<number> {
+  const ids = new Set(pendingTensorsByNodeId.keys());
+  for (const id of disposedPendingNodeIds) ids.add(id);
+  return ids;
+}
+
+/**
+ * Get node IDs with live (non-disposed) pending tensors only.
+ * Unlike getPendingNodeIds(), excludes disposed tensors — their buffers can be
+ * reused after their last in-plan consumer. Used by liveness-based buffer release.
+ */
+export function getLivePendingNodeIds(): Set<number> {
   return new Set(pendingTensorsByNodeId.keys());
+}
+
+/**
+ * Clear the disposed pending node IDs set.
+ * Called after plan execution to prevent unbounded growth.
+ */
+export function clearDisposedPendingNodeIds(): void {
+  disposedPendingNodeIds.clear();
+}
+
+/** Debug: track live tensors to find leaks. Enable via Tensor._debugTracking = true. */
+// biome-ignore lint/style/useLet: toggled at runtime
+let _debugTracking = false;
+const _debugLiveTensors = new Set<Tensor>();
+
+/** Snapshot live tensor shapes for leak analysis. */
+export function getDebugLiveTensors(): Array<{
+  shape: string;
+  dtype: string;
+  materialized: boolean;
+  disposed: boolean;
+  creationSite?: string;
+}> {
+  const result: Array<{
+    shape: string;
+    dtype: string;
+    materialized: boolean;
+    disposed: boolean;
+    creationSite?: string;
+  }> = [];
+  for (const t of _debugLiveTensors) {
+    result.push({
+      shape: t.shape.join("x") || "scalar",
+      dtype: t.dtype,
+      materialized: t.isMaterialized(),
+      disposed: t.disposed,
+      creationSite: t._debugCreationSite,
+    });
+  }
+  return result;
+}
+
+export function setDebugTracking(enabled: boolean): void {
+  _debugTracking = enabled;
+  if (!enabled) _debugLiveTensors.clear();
 }
 
 export class Tensor {
@@ -119,7 +184,9 @@ export class Tensor {
   private _lazyRef: LazyRef;
   private _pendingNodeId: number | null = null;
   /** Mutable object for FinalizationRegistry - updated when tensor materializes */
-  private readonly _held: { storageId: number };
+  private readonly _held: { storageId: number; pendingNodeId: number | null };
+  /** Debug: creation callsite (only when debug tracking is enabled) */
+  _debugCreationSite?: string;
 
   constructor(
     baseId: BaseId,
@@ -133,11 +200,25 @@ export class Tensor {
     this.device = device;
     this.shape = shape.slice();
     this.dtype = dtype;
+    if (_debugTracking) {
+      _debugLiveTensors.add(this);
+      // Capture creation stack for leak tracing
+      const stack = new Error().stack;
+      if (stack) {
+        // Skip "Error" + constructor frame, take next 6 useful frames
+        this._debugCreationSite = stack
+          .split("\n")
+          .slice(2, 8)
+          .map((l) => l.trim())
+          .join(" | ");
+      }
+    }
 
     // Initialize held value for finalization registry
     // storageId = -1 means not yet materialized
     this._held = {
       storageId: lazyRef.kind === "materialized" ? lazyRef.storage.id : -1,
+      pendingNodeId: lazyRef.kind === "pending" ? lazyRef.node.id : null,
     };
 
     // Register with FinalizationRegistry for automatic cleanup on GC
@@ -274,14 +355,20 @@ export class Tensor {
     if (this._disposed) return;
     this._disposed = true;
     tensorDisposedCount++;
+    if (_debugTracking) _debugLiveTensors.delete(this);
 
     // Unregister from FinalizationRegistry to prevent double cleanup
     tensorFinalizationRegistry.unregister(this);
     // Clear held value so finalization callback is a no-op if it runs anyway
     this._held.storageId = -1;
 
-    // Unregister from pending tensors if still pending
+    // Unregister from pending tensors if still pending.
+    // Also record the node ID in disposedPendingNodeIds so that
+    // getPendingNodeIds() still includes it for fusion analysis.
+    // Without this, checkpoint's tidy() would make nodes invisible
+    // to the matmul epilogue detector, causing incorrect fusion.
     if (this._pendingNodeId !== null) {
+      disposedPendingNodeIds.add(this._pendingNodeId);
       unregisterPendingTensor(this._pendingNodeId, this);
       this._pendingNodeId = null;
     }
@@ -315,7 +402,11 @@ let tensorDisposedCount = 0;
 let tensorMaterializedCount = 0;
 
 export function getTensorDebugStats() {
-  return { created: tensorCreatedCount, disposed: tensorDisposedCount, materialized: tensorMaterializedCount };
+  return {
+    created: tensorCreatedCount,
+    disposed: tensorDisposedCount,
+    materialized: tensorMaterializedCount,
+  };
 }
 
 export function resetTensorDebugStats() {

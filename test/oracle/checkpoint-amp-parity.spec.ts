@@ -8,113 +8,86 @@
 import { describe, expect, test } from "vitest";
 import { Torchlette } from "../../src";
 import { checkpoint } from "../../src/nn/checkpoint";
-import { runTorchOracleFullBatch, type OracleCase } from "./torch-oracle";
-
-type Payload = { shape: number[]; values: number[] };
-
-const DEFAULT_ATOL = 1e-5;
-const DEFAULT_RTOL = 1e-4;
+import { assertClose } from "../helpers/assertions";
+import { type OracleCase, runTorchOracleFullBatch } from "./torch-oracle";
 
 // Looser tolerance for AMP (f16 precision)
 const AMP_ATOL = 1e-2;
 const AMP_RTOL = 1e-2;
 
-function assertClose(
-  actual: Payload,
-  expected: Payload,
-  atol = DEFAULT_ATOL,
-  rtol = DEFAULT_RTOL,
-): void {
-  expect(actual.shape).toEqual(expected.shape);
-  expect(actual.values.length).toBe(expected.values.length);
-  for (let i = 0; i < actual.values.length; i += 1) {
-    const a = actual.values[i];
-    const b = expected.values[i];
-    // Handle null values (NaN/Inf from oracle)
-    if (b === null) {
-      // Skip comparison for NaN/Inf
-      continue;
-    }
-    const diff = Math.abs(a - b);
-    const tol = atol + rtol * Math.abs(b);
-    if (diff > tol) {
-      throw new Error(
-        `Mismatch at index ${i}: actual=${a}, expected=${b}, diff=${diff}, tol=${tol}`,
-      );
-    }
-  }
-}
-
 describe("Checkpoint Parity with PyTorch", () => {
-  test("simple checkpoint grads match PyTorch", { timeout: 15000 }, async () => {
-    // Fixed test data
-    const xValues = [0.1, 0.2, 0.3, 0.4];
-    const wValues = [
-      0.01, 0.02, 0.03, 0.04,
-      0.05, 0.06, 0.07, 0.08,
-      0.09, 0.10, 0.11, 0.12,
-      0.13, 0.14, 0.15, 0.16,
-    ];
-    const bValues = [0.01, 0.02, 0.03, 0.04];
+  test(
+    "simple checkpoint grads match PyTorch",
+    { timeout: 15000 },
+    async () => {
+      // Fixed test data
+      const xValues = [0.1, 0.2, 0.3, 0.4];
+      const wValues = [
+        0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.11, 0.12,
+        0.13, 0.14, 0.15, 0.16,
+      ];
+      const bValues = [0.01, 0.02, 0.03, 0.04];
 
-    // Run in torchlette with checkpoint
-    const api = new Torchlette("cpu");
-    const x = api.tensorFromArray(xValues, [1, 4], { requiresGrad: true });
-    const w = api.tensorFromArray(wValues, [4, 4], { requiresGrad: true });
-    const b = api.tensorFromArray(bValues, [4], { requiresGrad: true });
+      // Run in torchlette with checkpoint
+      const api = new Torchlette("cpu");
+      const x = api.tensorFromArray(xValues, [1, 4], { requiresGrad: true });
+      const w = api.tensorFromArray(wValues, [4, 4], { requiresGrad: true });
+      const b = api.tensorFromArray(bValues, [4], { requiresGrad: true });
 
-    // Simple layer function: relu(x @ w + b)
-    function layerFn(input: typeof x, weight: typeof w, bias: typeof b) {
-      return input.matmul(weight).add(bias).relu();
-    }
+      // Simple layer function: relu(x @ w + b)
+      function layerFn(input: typeof x, weight: typeof w, bias: typeof b) {
+        return input.matmul(weight).add(bias).relu();
+      }
 
-    // Apply 2 layers with checkpoint
-    let h = x;
-    for (let i = 0; i < 2; i++) {
-      h = checkpoint(api, (inp) => layerFn(inp, w, b), [h]);
-    }
-    const loss = h.sum();
-    if (typeof loss === "number") throw new Error("Expected tensor");
+      // Apply 2 layers with checkpoint
+      let h = x;
+      for (let i = 0; i < 2; i++) {
+        h = checkpoint(api, (inp) => layerFn(inp, w, b), [h]);
+      }
+      const loss = h.sum();
+      if (typeof loss === "number") throw new Error("Expected tensor");
 
-    await loss.backward();
+      await loss.backward();
 
-    // Get torchlette gradients
-    const torchletteGrads = {
-      x: { shape: x.grad!.shape, values: await x.grad!.cpu() },
-      w: { shape: w.grad!.shape, values: await w.grad!.cpu() },
-      b: { shape: b.grad!.shape, values: await b.grad!.cpu() },
-    };
+      // Get torchlette gradients
+      const torchletteGrads = {
+        x: { shape: x.grad?.shape, values: await x.grad?.cpu() },
+        w: { shape: w.grad?.shape, values: await w.grad?.cpu() },
+        b: { shape: b.grad?.shape, values: await b.grad?.cpu() },
+      };
 
-    // Run in PyTorch via oracle
-    const oracleCase: OracleCase = {
-      op: "checkpoint_forward_backward",
-      caseName: "checkpoint_simple",
-      inputs: [
-        { values: xValues, shape: [1, 4] },
-        { values: wValues, shape: [4, 4] },
-        { values: bValues, shape: [4] },
-      ],
-      options: {
-        numLayers: 2,
-        useCheckpoint: true,
-      },
-    };
+      // Run in PyTorch via oracle
+      const oracleCase: OracleCase = {
+        op: "checkpoint_forward_backward",
+        caseName: "checkpoint_simple",
+        inputs: [
+          { values: xValues, shape: [1, 4] },
+          { values: wValues, shape: [4, 4] },
+          { values: bValues, shape: [4] },
+        ],
+        options: {
+          numLayers: 2,
+          useCheckpoint: true,
+        },
+      };
 
-    const [oracleResult] = await runTorchOracleFullBatch([oracleCase]);
+      const [oracleResult] = await runTorchOracleFullBatch([oracleCase]);
+      const grads = oracleResult.grads;
+      expect(grads).toBeDefined();
+      if (!grads) throw new Error("grads is undefined");
 
-    // Compare gradients
-    assertClose(torchletteGrads.x, oracleResult.grads![0]!);
-    assertClose(torchletteGrads.w, oracleResult.grads![1]!);
-    assertClose(torchletteGrads.b, oracleResult.grads![2]!);
-  });
+      // Compare gradients
+      assertClose(torchletteGrads.x, grads[0]);
+      assertClose(torchletteGrads.w, grads[1]);
+      assertClose(torchletteGrads.b, grads[2]);
+    },
+  );
 
   test("checkpoint grads equal non-checkpoint grads in torchlette", async () => {
     // This verifies checkpoint doesn't change gradient values
     const xValues = [0.1, 0.2, 0.3, 0.4];
     const wValues = [
-      0.01, 0.02, 0.03, 0.04,
-      0.05, 0.06, 0.07, 0.08,
-      0.09, 0.10, 0.11, 0.12,
+      0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.11, 0.12,
       0.13, 0.14, 0.15, 0.16,
     ];
     const bValues = [0.01, 0.02, 0.03, 0.04];
@@ -149,14 +122,14 @@ describe("Checkpoint Parity with PyTorch", () => {
 
     // Compare gradients
     const grads1 = {
-      x: { shape: x1.grad!.shape, values: await x1.grad!.cpu() },
-      w: { shape: w1.grad!.shape, values: await w1.grad!.cpu() },
-      b: { shape: b1.grad!.shape, values: await b1.grad!.cpu() },
+      x: { shape: x1.grad?.shape, values: await x1.grad?.cpu() },
+      w: { shape: w1.grad?.shape, values: await w1.grad?.cpu() },
+      b: { shape: b1.grad?.shape, values: await b1.grad?.cpu() },
     };
     const grads2 = {
-      x: { shape: x2.grad!.shape, values: await x2.grad!.cpu() },
-      w: { shape: w2.grad!.shape, values: await w2.grad!.cpu() },
-      b: { shape: b2.grad!.shape, values: await b2.grad!.cpu() },
+      x: { shape: x2.grad?.shape, values: await x2.grad?.cpu() },
+      w: { shape: w2.grad?.shape, values: await w2.grad?.cpu() },
+      b: { shape: b2.grad?.shape, values: await b2.grad?.cpu() },
     };
 
     assertClose(grads2.x, grads1.x);
@@ -169,9 +142,7 @@ describe("AMP Parity with PyTorch", () => {
   test("autocast forward matches PyTorch", async () => {
     const xValues = [0.1, 0.2, 0.3, 0.4];
     const wValues = [
-      0.01, 0.02, 0.03, 0.04,
-      0.05, 0.06, 0.07, 0.08,
-      0.09, 0.10, 0.11, 0.12,
+      0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.11, 0.12,
       0.13, 0.14, 0.15, 0.16,
     ];
     const bValues = [0.01, 0.02, 0.03, 0.04];
@@ -192,9 +163,9 @@ describe("AMP Parity with PyTorch", () => {
     await loss.backward();
 
     const torchletteGrads = {
-      x: { shape: x.grad!.shape, values: await x.grad!.cpu() },
-      w: { shape: w.grad!.shape, values: await w.grad!.cpu() },
-      b: { shape: b.grad!.shape, values: await b.grad!.cpu() },
+      x: { shape: x.grad?.shape, values: await x.grad?.cpu() },
+      w: { shape: w.grad?.shape, values: await w.grad?.cpu() },
+      b: { shape: b.grad?.shape, values: await b.grad?.cpu() },
     };
 
     // Run in PyTorch via oracle
@@ -213,11 +184,14 @@ describe("AMP Parity with PyTorch", () => {
     };
 
     const [oracleResult] = await runTorchOracleFullBatch([oracleCase]);
+    const grads = oracleResult.grads;
+    expect(grads).toBeDefined();
+    if (!grads) throw new Error("grads is undefined");
 
     // Compare gradients (with looser tolerance for AMP)
-    assertClose(torchletteGrads.x, oracleResult.grads![0]!, AMP_ATOL, AMP_RTOL);
-    assertClose(torchletteGrads.w, oracleResult.grads![1]!, AMP_ATOL, AMP_RTOL);
-    assertClose(torchletteGrads.b, oracleResult.grads![2]!, AMP_ATOL, AMP_RTOL);
+    assertClose(torchletteGrads.x, grads[0], AMP_ATOL, AMP_RTOL);
+    assertClose(torchletteGrads.w, grads[1], AMP_ATOL, AMP_RTOL);
+    assertClose(torchletteGrads.b, grads[2], AMP_ATOL, AMP_RTOL);
   });
 });
 
@@ -225,9 +199,7 @@ describe("Checkpoint + AMP Combined Parity", () => {
   test("checkpoint + autocast grads match PyTorch", async () => {
     const xValues = [0.1, 0.2, 0.3, 0.4];
     const wValues = [
-      0.01, 0.02, 0.03, 0.04,
-      0.05, 0.06, 0.07, 0.08,
-      0.09, 0.10, 0.11, 0.12,
+      0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.11, 0.12,
       0.13, 0.14, 0.15, 0.16,
     ];
     const bValues = [0.01, 0.02, 0.03, 0.04];
@@ -251,9 +223,9 @@ describe("Checkpoint + AMP Combined Parity", () => {
     await loss.backward();
 
     const torchletteGrads = {
-      x: { shape: x.grad!.shape, values: await x.grad!.cpu() },
-      w: { shape: w.grad!.shape, values: await w.grad!.cpu() },
-      b: { shape: b.grad!.shape, values: await b.grad!.cpu() },
+      x: { shape: x.grad?.shape, values: await x.grad?.cpu() },
+      w: { shape: w.grad?.shape, values: await w.grad?.cpu() },
+      b: { shape: b.grad?.shape, values: await b.grad?.cpu() },
     };
 
     // Run in PyTorch via oracle
@@ -274,11 +246,14 @@ describe("Checkpoint + AMP Combined Parity", () => {
     };
 
     const [oracleResult] = await runTorchOracleFullBatch([oracleCase]);
+    const grads = oracleResult.grads;
+    expect(grads).toBeDefined();
+    if (!grads) throw new Error("grads is undefined");
 
     // Compare gradients (with looser tolerance for AMP)
-    assertClose(torchletteGrads.x, oracleResult.grads![0]!, AMP_ATOL, AMP_RTOL);
-    assertClose(torchletteGrads.w, oracleResult.grads![1]!, AMP_ATOL, AMP_RTOL);
-    assertClose(torchletteGrads.b, oracleResult.grads![2]!, AMP_ATOL, AMP_RTOL);
+    assertClose(torchletteGrads.x, grads[0], AMP_ATOL, AMP_RTOL);
+    assertClose(torchletteGrads.w, grads[1], AMP_ATOL, AMP_RTOL);
+    assertClose(torchletteGrads.b, grads[2], AMP_ATOL, AMP_RTOL);
   });
 });
 
@@ -288,15 +263,24 @@ describe("Multi-layer MLP Parity", () => {
     const xValues = Array.from({ length: 8 }, (_, i) => (i + 1) * 0.1);
 
     // Layer 1: 8 -> 16
-    const w1Values = Array.from({ length: 8 * 16 }, (_, i) => ((i % 10) - 5) * 0.01);
+    const w1Values = Array.from(
+      { length: 8 * 16 },
+      (_, i) => ((i % 10) - 5) * 0.01,
+    );
     const b1Values = Array.from({ length: 16 }, (_, i) => i * 0.001);
 
     // Layer 2: 16 -> 16
-    const w2Values = Array.from({ length: 16 * 16 }, (_, i) => ((i % 7) - 3) * 0.01);
+    const w2Values = Array.from(
+      { length: 16 * 16 },
+      (_, i) => ((i % 7) - 3) * 0.01,
+    );
     const b2Values = Array.from({ length: 16 }, (_, i) => -i * 0.001);
 
     // Layer 3: 16 -> 4
-    const w3Values = Array.from({ length: 16 * 4 }, (_, i) => ((i % 5) - 2) * 0.01);
+    const w3Values = Array.from(
+      { length: 16 * 4 },
+      (_, i) => ((i % 5) - 2) * 0.01,
+    );
     const b3Values = Array.from({ length: 4 }, (_, i) => i * 0.002);
 
     // Run in torchlette
@@ -337,27 +321,30 @@ describe("Multi-layer MLP Parity", () => {
     };
 
     const [oracleResult] = await runTorchOracleFullBatch([oracleCase]);
+    const grads = oracleResult.grads;
+    expect(grads).toBeDefined();
+    if (!grads) throw new Error("grads is undefined");
 
     // Compare x gradient
-    const xGrad = { shape: x.grad!.shape, values: await x.grad!.cpu() };
-    assertClose(xGrad, oracleResult.grads![0]!);
+    const xGrad = { shape: x.grad?.shape, values: await x.grad?.cpu() };
+    assertClose(xGrad, grads[0]);
 
     // Compare w1, b1
-    const w1Grad = { shape: w1.grad!.shape, values: await w1.grad!.cpu() };
-    const b1Grad = { shape: b1.grad!.shape, values: await b1.grad!.cpu() };
-    assertClose(w1Grad, oracleResult.grads![1]!);
-    assertClose(b1Grad, oracleResult.grads![2]!);
+    const w1Grad = { shape: w1.grad?.shape, values: await w1.grad?.cpu() };
+    const b1Grad = { shape: b1.grad?.shape, values: await b1.grad?.cpu() };
+    assertClose(w1Grad, grads[1]);
+    assertClose(b1Grad, grads[2]);
 
     // Compare w2, b2
-    const w2Grad = { shape: w2.grad!.shape, values: await w2.grad!.cpu() };
-    const b2Grad = { shape: b2.grad!.shape, values: await b2.grad!.cpu() };
-    assertClose(w2Grad, oracleResult.grads![3]!);
-    assertClose(b2Grad, oracleResult.grads![4]!);
+    const w2Grad = { shape: w2.grad?.shape, values: await w2.grad?.cpu() };
+    const b2Grad = { shape: b2.grad?.shape, values: await b2.grad?.cpu() };
+    assertClose(w2Grad, grads[3]);
+    assertClose(b2Grad, grads[4]);
 
     // Compare w3, b3
-    const w3Grad = { shape: w3.grad!.shape, values: await w3.grad!.cpu() };
-    const b3Grad = { shape: b3.grad!.shape, values: await b3.grad!.cpu() };
-    assertClose(w3Grad, oracleResult.grads![5]!);
-    assertClose(b3Grad, oracleResult.grads![6]!);
+    const w3Grad = { shape: w3.grad?.shape, values: await w3.grad?.cpu() };
+    const b3Grad = { shape: b3.grad?.shape, values: await b3.grad?.cpu() };
+    assertClose(w3Grad, grads[5]);
+    assertClose(b3Grad, grads[6]);
   });
 });

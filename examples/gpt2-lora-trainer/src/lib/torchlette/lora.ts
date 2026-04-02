@@ -11,7 +11,7 @@
  * - alpha: Scaling factor (typically equal to rank)
  */
 
-import type { FrontendTensor as Tensor, Torchlette } from 'torchlette';
+import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
 
 export type LoRAConfig = {
   rank: number;
@@ -45,7 +45,7 @@ export class LoRALinear {
     inFeatures: number,
     outFeatures: number,
     config: LoRAConfig,
-    options?: { device?: 'cpu' | 'webgpu' }
+    options?: { device?: "cpu" | "webgpu" },
   ) {
     this.api = api;
     this.inFeatures = inFeatures;
@@ -54,7 +54,7 @@ export class LoRALinear {
     this.alpha = config.alpha;
     this.scaling = config.alpha / config.rank;
 
-    const device = options?.device ?? 'webgpu';
+    const device = options?.device ?? "webgpu";
 
     // Initialize base weights (will be loaded from pretrained)
     // These are placeholders - actual values come from loadBaseWeights()
@@ -67,18 +67,20 @@ export class LoRALinear {
       requiresGrad: false,
     });
 
-    // Initialize LoRA A with Kaiming uniform (like PyTorch)
-    // A is [rank, in_features]
-    const stdA = Math.sqrt(1.0 / inFeatures);
-    const loraAData = new Float32Array(config.rank * inFeatures);
-    for (let i = 0; i < loraAData.length; i++) {
-      // Kaiming uniform initialization
-      loraAData[i] = (Math.random() * 2 - 1) * stdA * Math.sqrt(3);
-    }
-    this.loraA = api.tensorFromArray(loraAData, [config.rank, inFeatures], {
+    // Initialize LoRA A with small random normal (std=0.01).
+    // This matches the standard LoRA init and produces stable training
+    // dynamics with Adam. Kaiming uniform gives 2x larger values which
+    // can cause Adam to overshoot on small datasets.
+    this.loraA = api.randn([config.rank, inFeatures], {
       device,
       requiresGrad: true,
     });
+    // Scale to std=0.01
+    const runtime = api._runtime();
+    runtime.copy_(
+      this.loraA._unwrap(),
+      runtime.mul(this.loraA._unwrap(), 0.01),
+    );
 
     // Initialize LoRA B to zeros (so LoRA starts as identity)
     // B is [out_features, rank]
@@ -102,41 +104,21 @@ export class LoRALinear {
   }
 
   /**
-   * Forward pass: y = Wx + b + scaling * (x @ A^T @ B^T)
+   * Forward pass: y = linear(x, W, b) + scaling * linear(linear(x, A), B)
    */
   forward(x: Tensor): Tensor {
-    // Base linear: y = x @ W^T + b
-    // W is [out, in], so W^T is [in, out]
-    const baseOut = this.api.matmul(
-      x,
-      this.baseWeight.transpose({ dim0: 0, dim1: 1 })
-    );
-
-    const withBias = this.baseBias
-      ? this.api.add(baseOut, this.baseBias)
-      : baseOut;
-
-    // IMPORTANT: Detach base output to prevent autograd from building a computation
-    // graph through the frozen base weights. This significantly reduces GPU memory
-    // usage during LoRA training by not retaining intermediate activations for
-    // gradients that will never be computed (base weights are frozen).
-    const detachedBase = withBias.detach();
+    // Base linear: y = x @ W^T + b (fused, optimized backward)
+    const baseOut = this.api.linear(x, this.baseWeight, this.baseBias);
 
     // LoRA path: scaling * (x @ A^T @ B^T)
-    // A is [rank, in], A^T is [in, rank]
-    // B is [out, rank], B^T is [rank, out]
-    // So: x @ A^T @ B^T = [batch, seq, in] @ [in, rank] @ [rank, out]
-    //                    = [batch, seq, out]
-    const loraOut = this.api.matmul(
-      this.api.matmul(x, this.loraA.transpose({ dim0: 0, dim1: 1 })),
-      this.loraB.transpose({ dim0: 0, dim1: 1 })
+    const loraOut = this.api.linear(
+      this.api.linear(x, this.loraA, null),
+      this.loraB,
+      null,
     );
+    const scaledLora = this.api.mul(loraOut, this.scaling);
 
-    // Scale and add
-    const scalingTensor = this.api.tensorFromArray([this.scaling], []);
-    const scaledLora = this.api.mul(loraOut, scalingTensor);
-
-    return this.api.add(detachedBase, scaledLora);
+    return this.api.add(baseOut, scaledLora);
   }
 
   /**
@@ -159,10 +141,7 @@ export class LoRALinear {
 /**
  * Create LoRA config with sensible defaults.
  */
-export function createLoRAConfig(
-  rank: number = 8,
-  alpha?: number
-): LoRAConfig {
+export function createLoRAConfig(rank: number = 8, alpha?: number): LoRAConfig {
   return {
     rank,
     alpha: alpha ?? rank,

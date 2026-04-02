@@ -2,100 +2,328 @@ import { getActiveBackend, getBackend } from "../backend/registry";
 import {
   type ArgReduceOptions,
   type Backend,
-  type BackendTensor,
-  computeContiguousStrides,
+  type CatOptions,
   type DeviceKind,
   type DivOptions,
   type DType,
-  normalizeDim,
+  type FusedAttentionConfig,
+  type FusedCrossEntropyConfig,
+  type FusedLayerNormConfig,
+  type FusedRMSNormConfig,
   type GatherOptions,
   type GeluOptions,
   type MaxOptions,
   type MeanOptions,
+  type MinOptions,
+  normalizeDim,
   type ScatterAddOptions,
   type StridedScatterOptions,
-  type FusedAttentionConfig,
-  type FusedCrossEntropyConfig,
-  type FusedLayerNormConfig,
   type SubOptions,
   type SumOptions,
   type TransposeOptions,
 } from "../backend/types";
-import {
-  buildMergedPlan,
-  buildPlan,
-  createLazyIRNode,
-  createMaterializedRef,
-  createPendingRef,
-  createScalarRef,
-  createStorageHandle,
-  executePlan,
-  executePlanOptimized,
-  executePlanWithCheckpointSegments,
-  executePlanWithTrueSegments,
-  type LazyIRNode,
-  type LazyOpCode,
-  type LazyRef,
-  type OptimizedExecutionStats,
-  storageTracker,
-  executeLoweredPlan,
-  getFusionAnalysisTemplate,
-} from "../engine/lazy";
-import { computePlanFingerprint } from "../engine/fusion-detect";
-import { isDataSourceOp } from "../engine/lowered-plan";
-import { OP_DTYPE_RULES, promoteDtype } from "../engine/dtype-rules";
-import {
-  executeWithMemoryPlanning,
-  getMemoryPlannerStats,
-  type MemoryPlanningStats,
-} from "../engine/memory-planned-executor";
-import { type BaseId, createBaseId, materializePendingTensors, Tensor } from "./tensor";
-import {
-  type DispatchMode,
-  IntermediateTrackingMode,
-  type OpInput,
-  type RuntimeEngineOptions,
-} from "./engine-types";
+import type { AutocastContext } from "../compiler/amp";
 import {
   broadcastShapes,
   broadcastThreeShapes,
-  matmulShape,
-  reduceShape,
-  transposeShape,
-} from "./shape-helpers";
+  contiguousStrides,
+} from "../core/shape";
 import {
-  extractAttentionDKOp,
-  extractAttentionDVOp,
-  extractAttentionLogsumexpOp,
-  extractLnBwdGradBiasOp,
-  fusedAttentionBackwardOp,
-  fusedAttentionForwardOp,
-  fusedCrossEntropyBackwardOp,
-  fusedCrossEntropyForwardOp,
-  fusedLayerNormBackwardGradWeightBiasOp,
-  fusedLayerNormBackwardGradXOp,
-  fusedLayerNormForwardOp,
-} from "./engine-fused";
+  executePlanOptimized,
+  type OptimizedExecutionStats,
+} from "../executor/executor";
+import { isDataSourceOp } from "../executor/lowered-plan";
+import { buildMergedPlan } from "../executor/plan-builder";
+import {
+  executePlanSegmented,
+  executePlanSequential,
+} from "../executor/sequential";
+import { createLazyIRNode } from "../graph/node-factory";
+import { storageTracker } from "../graph/storage-tracker";
+import {
+  createMaterializedRef,
+  createPendingRef,
+  createScalarRef,
+  type LazyIRNode,
+  type LazyOpCode,
+  type LazyRef,
+} from "../graph/types";
+import { OP_DTYPE_RULES, promoteDtype } from "../ops/registry";
+import { type BaseId, createBaseId, Tensor } from "./tensor";
 
-// Re-export types and shape helpers for backward compatibility.
-// NOTE: engine-facade.ts is NOT re-exported here to avoid circular dependencies
-// (facade imports RuntimeEngine from this file). Facade functions are re-exported
-// via src/engine/index.ts barrel instead.
-export * from "./engine-types";
-export * from "./shape-helpers";
+// Re-export all types from engine-types (EngineTensor, SavedTensorRecord, etc.)
+export * from "../graph/engine-types";
+
+// Local imports from engine-types (used by Engine methods merged into RuntimeEngine)
+import {
+  type AsyncScope,
+  type BaseState,
+  type BaseStateInfo,
+  type BaseId as EngineBaseId,
+  type EngineMemoryStats,
+  EngineTensor,
+  type ExecLock,
+  type MemorySnapshot,
+  type MemoryStatsProvider,
+  type RngBasis,
+  type RngDrawRecord,
+  type RngDrawResult,
+  type SavedTensorInfo,
+  type SavedTensorRecord,
+  type TensorOrigin,
+  type TidyScope,
+} from "../graph/engine-types";
+
+// ── Engine helpers ──────────────────────────────────────────────────────────
+/**
+ * Collect EngineTensor handles from a tidy() return value.
+ *
+ * Objects that implement `_engineTensor(): EngineTensor` (like the frontend
+ * Tensor class) return their handle without deep-recursing into internal
+ * fields. This prevents walking the autograd graph (gradNode → inputs →
+ * savedSlots → ...) which would mark every reachable tensor as "escaped",
+ * causing an O(graph_size) per-step _basePinCount leak.
+ *
+ * Plain objects and arrays are recursed into as before (for returning
+ * `{ loss, logits }` from tidy).
+ */
+function collectTensorHandles(value: unknown): EngineTensor[] {
+  const out: EngineTensor[] = [];
+  const seen = new Set<unknown>();
+  const visit = (current: unknown) => {
+    if (current == null) return;
+    if (current instanceof EngineTensor) {
+      out.push(current);
+      return;
+    }
+    if (typeof current !== "object") return;
+    if (seen.has(current)) return;
+    seen.add(current);
+
+    // Protocol: objects with _engineTensor() return their handle directly
+    // without deep-recursing into internal properties (autograd graph, etc.)
+    const obj = current as Record<string, unknown>;
+    if (typeof obj._engineTensor === "function") {
+      const handle = (obj._engineTensor as () => EngineTensor)();
+      if (handle instanceof EngineTensor) {
+        out.push(handle);
+      }
+      return; // Don't recurse into the tensor's internal fields
+    }
+
+    if (Array.isArray(current)) {
+      for (const entry of current) visit(entry);
+      return;
+    }
+    // Plain objects (e.g., { loss, logits }) — recurse into values
+    for (const entry of Object.values(obj)) visit(entry);
+  };
+  visit(value);
+  return out;
+}
+
+function computeRngValue(
+  basis: RngBasis,
+  opNonce: number,
+  drawNonce: number,
+): number {
+  const seed = basis.seed >>> 0;
+  const algo = basis.algorithmId >>> 0;
+  const op = opNonce >>> 0;
+  const draw = drawNonce >>> 0;
+  let v =
+    (seed ^ Math.imul(algo, 0x9e3779b9) ^ op ^ Math.imul(draw, 0x85ebca6b)) >>>
+    0;
+  v ^= v >>> 16;
+  v = Math.imul(v, 0x7feb352d);
+  v ^= v >>> 15;
+  v = Math.imul(v, 0x846ca68b);
+  v ^= v >>> 16;
+  return (v >>> 0) / 2 ** 32;
+}
+
+// ── Error classes (from Engine) ─────────────────────────────────────────────
+export class EngineBusyError extends Error {
+  name = "EngineBusyError";
+}
+export class AsyncInCompileError extends Error {
+  name = "AsyncInCompileError";
+}
+export class SavedTensorModifiedError extends Error {
+  name = "SavedTensorModifiedError";
+}
+export class NonReentrantBackwardError extends Error {
+  name = "NonReentrantBackwardError";
+}
+export class PoisonedEngineError extends Error {
+  name = "PoisonedEngineError";
+}
+export class RngReplayExhaustedError extends Error {
+  name = "RngReplayExhaustedError";
+}
+export class RngReplayMismatchError extends Error {
+  name = "RngReplayMismatchError";
+}
+
+// ── Engine types (merged from engine-types.ts) ─────────────────────────────
+/** A tensor or a numeric scalar (will be inlined as a constant in fused kernels). */
+export type TensorOrScalar = Tensor | number;
+
+/** Lightweight reference to a lazy computation with shape/dtype metadata. */
+type OpInput = Pick<Tensor, "lazyRef" | "shape" | "dtype" | "device">;
+
+/** Dispatch mode: receives notifications when RuntimeTensors are created or escape a scope. */
+export interface DispatchMode {
+  onTensorCreated(tensor: Tensor): void;
+  onTensorEscaped?(tensor: Tensor): void;
+}
+
+/** Dispatch mode that tracks RuntimeTensors created within a tidy scope. */
+export class TidyDispatchMode implements DispatchMode {
+  readonly tracked = new Set<Tensor>();
+  readonly escaped = new Set<Tensor>();
+  onTensorCreated(tensor: Tensor): void {
+    this.tracked.add(tensor);
+  }
+  onTensorEscaped(tensor: Tensor): void {
+    this.escaped.add(tensor);
+  }
+  disposeNonEscaped(): number {
+    let disposed = 0;
+    for (const t of this.tracked) {
+      if (!this.escaped.has(t) && !t.disposed) {
+        t.dispose();
+        disposed++;
+      }
+    }
+    // Release references so GC can collect disposed RuntimeTensors immediately.
+    this.tracked.clear();
+    this.escaped.clear();
+    return disposed;
+  }
+}
+
+export interface RuntimeEngineOptions {
+  enableFusion?: boolean;
+  enableVectorization?: boolean;
+  enableEarlyRelease?: boolean;
+  enableCheckpointSegmentation?: boolean;
+  enableTrueSegmentation?: boolean;
+}
+
+/** Internal dispatch mode used by startIntermediateTracking/stopIntermediateTracking. */
+class IntermediateTrackingMode implements DispatchMode {
+  readonly tracked = new Set<Tensor>();
+  onTensorCreated(tensor: Tensor): void {
+    this.tracked.add(tensor);
+  }
+}
+
+// ── Shape helpers (merged from shape-helpers.ts) ────────────────────────────
+export { broadcastShapes };
+
+function matmulShape(a: number[], b: number[]): number[] {
+  if (a.length < 1 || b.length < 1)
+    throw new Error("matmul requires at least 1D tensors");
+  // Validate inner dimension match
+  const kA = a[a.length - 1];
+  const kB = b.length === 1 ? b[0] : b[b.length - 2];
+  if (kA !== kB) {
+    throw new Error(
+      `matmul: inner dimension mismatch — [${a.join(",")}] @ [${b.join(",")}] (${kA} != ${kB})`,
+    );
+  }
+  if (a.length === 1 && b.length === 1) return [];
+  if (a.length === 1) return [...b.slice(0, -2), b[b.length - 1]];
+  if (b.length === 1) return a.slice(0, -1);
+  const m = a[a.length - 2];
+  const n = b[b.length - 1];
+  const batch = broadcastShapes(a.slice(0, -2), b.slice(0, -2));
+  return [...batch, m, n];
+}
+
+function transposeShape(shape: number[], options: TransposeOptions): number[] {
+  const result = shape.slice();
+  const temp = result[options.dim0];
+  result[options.dim0] = result[options.dim1];
+  result[options.dim1] = temp;
+  return result;
+}
+
+function reduceShape(
+  shape: number[],
+  dim: number | number[] | null | undefined,
+  keepdim: boolean,
+): number[] {
+  if (dim == null) return keepdim ? shape.map(() => 1) : [];
+  const dims = Array.isArray(dim) ? dim : [dim];
+  const normalizedDims = dims.map((d) => (d < 0 ? shape.length + d : d));
+  if (keepdim) return shape.map((s, i) => (normalizedDims.includes(i) ? 1 : s));
+  return shape.filter((_, i) => !normalizedDims.includes(i));
+}
 
 /** Build a cast LazyRef without creating a Tensor (no lifecycle, no registration). */
 function castRef(input: OpInput, toDtype: DType): OpInput {
-  const node = createLazyIRNode("cast", [input.lazyRef], input.shape.slice(), toDtype, input.device, { dtype: toDtype });
-  return { lazyRef: createPendingRef(node), shape: input.shape, dtype: toDtype, device: input.device };
+  const node = createLazyIRNode(
+    "cast",
+    [input.lazyRef],
+    input.shape.slice(),
+    toDtype,
+    input.device,
+    { dtype: toDtype },
+  );
+  return {
+    lazyRef: createPendingRef(node),
+    shape: input.shape,
+    dtype: toDtype,
+    device: input.device,
+  };
+}
+
+// ── Force-method helpers ────────────────────────────────────────────────────
+
+/** Collect pending lazy nodes from tensors that still need execution. */
+function collectPendingRoots(tensors: readonly Tensor[]): LazyIRNode[] {
+  const roots: LazyIRNode[] = [];
+  for (const t of tensors) {
+    if (t.isMaterialized() || t.disposed) continue;
+    const ref = t.lazyRef;
+    if (ref.kind === "pending") roots.push(ref.node);
+  }
+  return roots;
+}
+
+/** Find the device of the first non-materialized tensor (defaults to "cpu"). */
+function resolveDeviceFromTensors(tensors: readonly Tensor[]): DeviceKind {
+  for (const t of tensors) {
+    if (!t.isMaterialized()) return t.device;
+  }
+  return "cpu";
+}
+
+/**
+ * Materialize tensors whose lazy nodes have results but haven't been materialized yet.
+ * Returns any nodes that were materialized (for cleanup of skipped nodes).
+ */
+function materializeRemaining(tensors: readonly Tensor[]): LazyIRNode[] {
+  const materialized: LazyIRNode[] = [];
+  for (const t of tensors) {
+    if (t.isMaterialized() || t.disposed) continue;
+    const ref = t.lazyRef;
+    if (ref.kind === "pending") {
+      const idx = ref.outputIndex ?? 0;
+      const storage = idx === 0 ? ref.node.result : ref.node.results?.[idx];
+      if (storage) {
+        t._materialize(storage);
+        materialized.push(ref.node);
+      }
+    }
+  }
+  return materialized;
 }
 
 export class RuntimeEngine {
   private defaultDevice: DeviceKind | null = null;
-  private memoryPlanningEnabled = false;
-  private donationEnabled = true;
-  private trackStats = false;
-  private lastStats: MemoryPlanningStats | null = null;
   private fusionEnabled = false;
   private vectorizationEnabled = false;
   private lastFusionStats: OptimizedExecutionStats | null = null;
@@ -107,23 +335,50 @@ export class RuntimeEngine {
   private _webgpuFlushBufferPool: (() => void) | null = null;
 
   /** Cache plan fingerprints by cheap structural key to avoid O(N) hashing. */
-  private planFingerprintCache = new Map<string, number>();
 
   /** Stack of active dispatch modes (notified on tensor creation/escape). */
   private dispatchModes: DispatchMode[] = [];
 
+  // ── Engine fields (merged from Engine class) ──────────────────────────────
+  private readonly _baseState = new Map<EngineBaseId, BaseState>();
+  private readonly _execLock: ExecLock = { held: false, ownerId: 0, depth: 0 };
+  private _nextOwnerId = 1;
+  private _poisoned = false;
+  private _nextSavedTensorId = 1;
+  private _backwardActive = false;
+  private _nextTensorId = 1;
+  private _nextBaseId = 1;
+  private _nextScopeId = 1;
+  private _nextMutIdValue = 1;
+  private readonly _tidyScopes: TidyScope[] = [];
+  private _asyncScopeContext: AsyncScope | null = null;
+  private readonly _basePinCount = new Map<EngineBaseId, number>();
+  /** Auto-cleanup for EngineTensors GC'd without being disposed.
+   *  Handles saved-for-backward tensors that escape tidy and become
+   *  unreachable after backward clears autograd graph references. */
+  private readonly _etFinalizer = new FinalizationRegistry<EngineBaseId>(
+    (baseId) => {
+      const count = this._basePinCount.get(baseId) ?? 0;
+      if (count <= 1) {
+        this._basePinCount.delete(baseId);
+      } else {
+        this._basePinCount.set(baseId, count - 1);
+      }
+    },
+  );
+  private _rngBasis: RngBasis = { algorithmId: 0, seed: 0 };
+  private _rngDrawNonce = 0;
+  private _rngCheckpointMode: "record" | "replay" | null = null;
+  private _rngCheckpointDraws: RngDrawRecord[] = [];
+  private _rngCheckpointIndex = 0;
+  private _autocastContext: AutocastContext | null = null;
+  private readonly _savedTensors = new Map<number, SavedTensorInfo>();
+  private readonly _memorySnapshots: MemorySnapshot[] = [];
+  private _memoryStatsProvider: MemoryStatsProvider | null = null;
+
   constructor(backendName?: DeviceKind, options?: RuntimeEngineOptions) {
     if (backendName) {
       this.defaultDevice = backendName;
-    }
-    if (options?.enableMemoryPlanning) {
-      this.memoryPlanningEnabled = true;
-    }
-    if (options?.enableDonation !== undefined) {
-      this.donationEnabled = options.enableDonation;
-    }
-    if (options?.trackStats) {
-      this.trackStats = true;
     }
     if (options?.enableFusion !== undefined) {
       this.fusionEnabled = options.enableFusion;
@@ -143,34 +398,6 @@ export class RuntimeEngine {
   }
 
   /**
-   * Enable or disable memory planning.
-   */
-  setMemoryPlanning(enabled: boolean): void {
-    this.memoryPlanningEnabled = enabled;
-  }
-
-  /**
-   * Check if memory planning is enabled.
-   */
-  isMemoryPlanningEnabled(): boolean {
-    return this.memoryPlanningEnabled;
-  }
-
-  /**
-   * Get statistics from the last memory-planned execution.
-   */
-  getLastMemoryStats(): MemoryPlanningStats | null {
-    return this.lastStats;
-  }
-
-  /**
-   * Get overall memory planner statistics.
-   */
-  getMemoryPlannerStats(): ReturnType<typeof getMemoryPlannerStats> {
-    return getMemoryPlannerStats();
-  }
-
-  /**
    * Enable or disable fusion optimization (§15).
    */
   setFusionEnabled(enabled: boolean): void {
@@ -182,20 +409,6 @@ export class RuntimeEngine {
    */
   isFusionEnabled(): boolean {
     return this.fusionEnabled;
-  }
-
-  /**
-   * Enable or disable vectorization for fused kernels.
-   */
-  setVectorizationEnabled(enabled: boolean): void {
-    this.vectorizationEnabled = enabled;
-  }
-
-  /**
-   * Check if vectorization is enabled.
-   */
-  isVectorizationEnabled(): boolean {
-    return this.vectorizationEnabled;
   }
 
   /**
@@ -252,38 +465,6 @@ export class RuntimeEngine {
     return this.earlyReleaseEnabled;
   }
 
-  /**
-   * Enable or disable segmented execution at checkpoint boundaries.
-   * When enabled, the executor will flush buffers between checkpoint segments,
-   * enabling memory savings for large models that don't fit in GPU memory.
-   */
-  setCheckpointSegmentationEnabled(enabled: boolean): void {
-    this.checkpointSegmentationEnabled = enabled;
-  }
-
-  /**
-   * Check if checkpoint segmentation is enabled.
-   */
-  isCheckpointSegmentationEnabled(): boolean {
-    return this.checkpointSegmentationEnabled;
-  }
-
-  /**
-   * Enable or disable true segmented execution with GPU synchronization.
-   * This provides actual memory savings for checkpointed models by waiting
-   * for GPU completion between segments before releasing buffers.
-   */
-  setTrueSegmentationEnabled(enabled: boolean): void {
-    this.trueSegmentationEnabled = enabled;
-  }
-
-  /**
-   * Check if true segmentation is enabled.
-   */
-  isTrueSegmentationEnabled(): boolean {
-    return this.trueSegmentationEnabled;
-  }
-
   // ============================================================================
   // Dispatch Mode Stack
   // ============================================================================
@@ -296,6 +477,10 @@ export class RuntimeEngine {
     const mode = this.dispatchModes.pop();
     if (!mode) throw new Error("No dispatch mode to pop");
     return mode;
+  }
+
+  hasDispatchMode(): boolean {
+    return this.dispatchModes.length > 0;
   }
 
   markEscaped(tensor: Tensor): void {
@@ -323,7 +508,9 @@ export class RuntimeEngine {
   stopIntermediateTracking(): Set<Tensor> {
     const mode = this.popDispatchMode();
     if (!(mode instanceof IntermediateTrackingMode)) {
-      throw new Error("Expected IntermediateTrackingMode on dispatch mode stack");
+      throw new Error(
+        "Expected IntermediateTrackingMode on dispatch mode stack",
+      );
     }
     return mode.tracked;
   }
@@ -344,6 +531,26 @@ export class RuntimeEngine {
       this.dispatchModes[i].onTensorCreated(tensor);
     }
     return tensor;
+  }
+
+  /** Shorthand: create a tracked tensor from a lazy ref. */
+  private trackRef(
+    ref: LazyRef,
+    shape: number[],
+    device: DeviceKind,
+    dtype?: DType,
+  ): Tensor {
+    return this.createAndTrack(createBaseId(), ref, shape, device, dtype);
+  }
+
+  /** Shorthand: create a tracked tensor from a lazy IR node. */
+  private trackNode(
+    node: LazyIRNode,
+    shape: number[],
+    device: DeviceKind,
+    dtype?: DType,
+  ): Tensor {
+    return this.trackRef(createPendingRef(node), shape, device, dtype);
   }
 
   setBackend(name: DeviceKind): Backend {
@@ -404,138 +611,12 @@ export class RuntimeEngine {
   }
 
   /**
-   * Ensure all tensors are on the same device, auto-transferring if needed.
-   * Returns the tensors (possibly transferred) and the target device.
-   */
-  private ensureSameDevice(...tensors: Tensor[]): {
-    tensors: Tensor[];
-    device: DeviceKind;
-  } {
-    if (tensors.length === 0) {
-      return { tensors: [], device: this.getDevice() };
-    }
-
-    // Determine target device - prefer GPU if any tensor is on GPU
-    let targetDevice = tensors[0].device;
-    for (const tensor of tensors) {
-      if (tensor.device === "webgpu") {
-        targetDevice = "webgpu";
-        break;
-      }
-    }
-
-    // Transfer any tensors not on target device
-    const result: Tensor[] = [];
-    for (const tensor of tensors) {
-      if (tensor.device !== targetDevice) {
-        result.push(this.transfer(tensor, targetDevice));
-      } else {
-        result.push(tensor);
-      }
-    }
-
-    return { tensors: result, device: targetDevice };
-  }
-
-  /**
    * Force a tensor to materialize by executing its computation graph.
    */
   async force(tensor: Tensor): Promise<void> {
-    if (tensor.isMaterialized() || tensor.disposed) {
-      return;
-    }
-
-    const lazyRef = tensor.lazyRef;
-    if (lazyRef.kind !== "pending") {
-      return;
-    }
-
-    const _forceTiming = process.env.TORCHLETTE_REPLAY_TIMING === "1";
-    const _forceT0 = _forceTiming ? performance.now() : 0;
-    const plan = buildPlan(lazyRef.node);
-    const _buildT = _forceTiming ? performance.now() - _forceT0 : 0;
-    const backend = this.getBackend(tensor.device);
-
-    // Data-source-only plans (e.g. weight loading: all tensorFromArray) skip the
-    // template/arena/lowered-plan path — they have no compute dispatches, no bind
-    // groups to cache, and their outputs persist as model weights.
-    const allDataSource = plan.nodes.every(n => isDataSourceOp(n.op));
-
-    // --- Lowered Plan Fast-Path ---
-    // Try cached lowered execution plan first.
-    if (!allDataSource && tensor.device === "webgpu" && this.fusionEnabled) {
-      const _lpT0 = _forceTiming ? performance.now() : 0;
-      const executed = await this.tryLoweredPlanExecution(plan, [tensor], tensor.device);
-      if (_forceTiming) console.log(`[force-timing] nodes=${plan.nodes.length} buildPlan=${_buildT.toFixed(1)}ms lowered=${executed ? "HIT" : "MISS"} loweredTime=${(performance.now() - _lpT0).toFixed(1)}ms`);
-      if (executed) return;
-    }
-
-    // Get buffer pool flush function for checkpoint segmentation
-    const flushBufferPool = this.getBufferPoolFlushFn(tensor.device);
-
-    let result;
-    if (this.fusionEnabled && !allDataSource) {
-      // Use optimized execution with fusion (§15)
-      // executePlanOptimized supports enableEarlyRelease for memory management
-      // On non-WebGPU backends, fusion is automatically skipped inside executePlanOptimized
-      const optimizedResult = await executePlanOptimized(plan, backend, {
-        enableFusion: true,
-        enableVectorization: this.vectorizationEnabled,
-        enableEarlyRelease: this.earlyReleaseEnabled,
-      });
-      result = optimizedResult.result;
-      this.lastFusionStats = optimizedResult.stats;
-      this.accumulateFusionStats(optimizedResult.stats);
-    } else if (this.memoryPlanningEnabled) {
-      // Use memory-planned execution (for non-fusion or CPU)
-      const memResult = await executeWithMemoryPlanning(plan, backend, {
-        enableDonation: this.donationEnabled,
-        trackStats: this.trackStats,
-        enableEarlyRelease: this.earlyReleaseEnabled,
-      });
-      result = memResult.result;
-      this.lastStats = memResult.stats;
-    } else if (this.trueSegmentationEnabled && tensor.device === "webgpu") {
-      // Use true segmented execution with GPU synchronization
-      // This provides actual memory savings by waiting for GPU completion
-      // between segments before releasing buffers
-      result = await executePlanWithTrueSegments(
-        plan,
-        backend,
-        { enableEarlyRelease: this.earlyReleaseEnabled },
-      );
-    } else if (this.checkpointSegmentationEnabled) {
-      // Use segmented execution at checkpoint boundaries
-      result = await executePlanWithCheckpointSegments(
-        plan,
-        backend,
-        { enableEarlyRelease: this.earlyReleaseEnabled },
-        flushBufferPool,
-      );
-    } else {
-      // Use standard execution
-      result = await executePlan(plan, backend, {
-        enableEarlyRelease: this.earlyReleaseEnabled,
-      });
-    }
-
-    // Materialize ALL tensors that were pending on executed nodes.
-    // This ensures model parameters and other user-held tensors get their
-    // storages marked as externally reachable.
-    for (const node of plan.nodes) {
-      if (node.result) {
-        materializePendingTensors(node.id, node.result);
-      }
-    }
-
-    // Materialize this tensor (in case it wasn't already handled above)
-    if (!tensor.isMaterialized()) {
-      tensor._materialize(result);
-    }
-
-    // Results are preserved so later plans skip already-executed nodes.
-    // Early-released nodes have their results cleared in the executor.
-
+    if (tensor.isMaterialized() || tensor.disposed) return;
+    if (tensor.lazyRef.kind !== "pending") return;
+    await this.forceAllMerged(tensor);
   }
 
   /**
@@ -557,135 +638,6 @@ export class RuntimeEngine {
     return () => {};
   }
 
-  // --- Lowered Plan Execution ---
-
-  /**
-   * Try to execute a plan using a cached lowered execution plan.
-   * On cache hit with a lowered plan, executes the plan and materializes all
-   * tensors, returning true. On miss, returns false for fallback to normal execution.
-   */
-  private async tryLoweredPlanExecution(
-    plan: { nodes: LazyIRNode[] },
-    tensors: Tensor[],
-    device: DeviceKind,
-  ): Promise<boolean> {
-    // Quick structural key for fingerprint cache lookup
-    const structKey = `${plan.nodes.length}:${plan.nodes[plan.nodes.length - 1].op}`;
-    let fingerprint = this.planFingerprintCache.get(structKey);
-
-    if (fingerprint === undefined) {
-      // First time — compute full O(N) fingerprint
-      let externalNodeIds: Set<number> | undefined;
-      try {
-        const { getPendingNodeIds } = await import("./tensor");
-        const pending = getPendingNodeIds();
-        if (pending.size > 0) {
-          externalNodeIds = pending;
-        }
-      } catch {
-        // tensor module not available
-      }
-      fingerprint = computePlanFingerprint(plan.nodes, externalNodeIds);
-    }
-
-    const template = getFusionAnalysisTemplate(fingerprint);
-    if (!template?.loweredPlan) {
-      return false;
-    }
-
-    // Validate plan node count
-    if (plan.nodes.length !== template.finalPerm.length) {
-      return false;
-    }
-
-    // Reconstruct reordered plan nodes from template
-    const planNodes = template.finalPerm.map(i => plan.nodes[i]);
-
-    const backend = this.getBackend(device);
-
-    // Get or create buffer arena for this plan (persists across steps).
-    // Arena stabilizes buffer identities for bind group cache hits.
-    const useArena = process.env.TORCHLETTE_USE_ARENA !== "0";
-    if (useArena && !template.bufferArena) {
-      template.bufferArena = { resolve: [], alloc: [] };
-    }
-
-    // Save dispatch sequence counters before attempting lowered plan execution.
-    // If the lowered plan fails, we restore them so the fallback executePlanOptimized
-    // starts at the same dispatch position — preserving bind group cache alignment.
-    let savedCounters: { dispatch: number; params: number; output: number } | undefined;
-    if (device === "webgpu") {
-      try {
-        const { getDispatchSequenceCounters } = await import("../backend/webgpu/index");
-        savedCounters = getDispatchSequenceCounters();
-      } catch { /* non-WebGPU runtime */ }
-    }
-
-    try {
-      const { result, stats: loweredStats } = await executeLoweredPlan(
-        plan as { nodes: LazyIRNode[] },
-        planNodes,
-        template.loweredPlan,
-        backend,
-        {
-          enableEarlyRelease: this.earlyReleaseEnabled,
-          enableVectorization: this.vectorizationEnabled,
-          bufferArena: useArena ? template.bufferArena : undefined,
-          enableReplay: true,
-        },
-      );
-
-      // Update fusion stats for consistency with normal execution path
-      this.lastFusionStats = loweredStats;
-      this.accumulateFusionStats(loweredStats);
-
-      // Materialize ALL tensors that were pending on executed nodes
-      const { materializePendingTensors: materialize } = await import("./tensor");
-      for (const node of plan.nodes) {
-        if (node.result) {
-          materialize(node.id, node.result);
-        }
-      }
-
-      // Materialize the primary tensors
-      for (const tensor of tensors) {
-        if (!tensor.isMaterialized() && !tensor.disposed) {
-          const lazyRef = tensor.lazyRef;
-          if (lazyRef.kind === "pending" && lazyRef.node.result) {
-            tensor._materialize(lazyRef.node.result);
-          }
-        }
-      }
-
-      // Cache fingerprint for this structural key on success
-      this.planFingerprintCache.set(structKey, fingerprint);
-
-      return true;
-    } catch (err) {
-      // Lowered plan execution failed — clean up and fall through.
-      // Disable lowered plan for this fingerprint so we don't retry every step.
-      // The template's bufferArena is preserved so executePlanOptimized can use it.
-      if (process.env.TORCHLETTE_REPLAY_TIMING === "1") {
-        console.log(`[lowered-plan-fail] nodes=${plan.nodes.length} fingerprint=${fingerprint} error=${err instanceof Error ? err.message : String(err)}`);
-      }
-      template.loweredPlan = undefined;
-
-      // Restore dispatch sequence counters so the fallback executePlanOptimized
-      // starts at the same position, keeping bind group cache indices aligned.
-      if (savedCounters && device === "webgpu") {
-        try {
-          const { setDispatchSequenceCounters } = await import("../backend/webgpu/index");
-          setDispatchSequenceCounters(savedCounters.dispatch, savedCounters.params, savedCounters.output);
-        } catch { /* non-WebGPU runtime */ }
-      }
-
-      for (const node of plan.nodes) {
-        node.result = undefined;
-      }
-      return false;
-    }
-  }
-
   /**
    * Force multiple tensors to materialize using a single merged execution plan.
    *
@@ -697,58 +649,23 @@ export class RuntimeEngine {
    * memory savings.
    */
   async forceAllMerged(...tensors: Tensor[]): Promise<void> {
-    // Collect all pending nodes
-    const pendingRoots: LazyIRNode[] = [];
+    const pendingRoots = collectPendingRoots(tensors);
+    if (pendingRoots.length === 0) return;
 
-    for (const tensor of tensors) {
-      if (tensor.isMaterialized() || tensor.disposed) {
-        continue;
-      }
-      const lazyRef = tensor.lazyRef;
-      if (lazyRef.kind === "pending") {
-        pendingRoots.push(lazyRef.node);
-      }
-    }
-
-    if (pendingRoots.length === 0) {
-      return;
-    }
-
-    // Build ONE merged plan from all pending roots
-    const _famTiming = process.env.TORCHLETTE_REPLAY_TIMING === "1";
-    const _famT0 = _famTiming ? performance.now() : 0;
     const plan = buildMergedPlan(pendingRoots);
-    const _famBuildT = _famTiming ? performance.now() - _famT0 : 0;
+    if (plan.nodes.length === 0) return;
 
-    if (plan.nodes.length === 0) {
-      return;
-    }
-
-
-    // Determine device from first pending tensor
-    let device: DeviceKind = "cpu";
-    for (const tensor of tensors) {
-      if (!tensor.isMaterialized()) {
-        device = tensor.device;
-        break;
-      }
-    }
+    const device = resolveDeviceFromTensors(tensors);
 
     // Data-source-only plans skip the template/arena/lowered-plan path.
-    const allDataSource = plan.nodes.every(n => isDataSourceOp(n.op));
-
-    // Lowered plan fast-path for forceAllMerged
-    if (!allDataSource && device === "webgpu" && this.fusionEnabled) {
-      const _famLpT0 = _famTiming ? performance.now() : 0;
-      const executed = await this.tryLoweredPlanExecution(plan, tensors, device);
-      if (_famTiming) console.log(`[forceAllMerged-timing] nodes=${plan.nodes.length} pendingRoots=${pendingRoots.length} buildPlan=${_famBuildT.toFixed(1)}ms lowered=${executed ? "HIT" : "MISS"} loweredTime=${(performance.now() - _famLpT0).toFixed(1)}ms`);
-      if (executed) return;
-    }
+    const allDataSource = plan.nodes.every((n) => isDataSourceOp(n.op));
 
     const backend = this.getBackend(device);
 
     // Check if plan has checkpoint boundaries - only segment if checkpointing is used
-    const hasCheckpointBoundaries = plan.nodes.some((n) => n.isCheckpointBoundary);
+    const hasCheckpointBoundaries = plan.nodes.some(
+      (n) => n.isCheckpointBoundary,
+    );
 
     // Use fusion when enabled and on WebGPU, regardless of segmentation settings.
     // executePlanOptimized supports enableEarlyRelease for memory management.
@@ -760,60 +677,45 @@ export class RuntimeEngine {
       });
       this.lastFusionStats = optimizedResult.stats;
       this.accumulateFusionStats(optimizedResult.stats);
-    } else if (this.trueSegmentationEnabled && hasCheckpointBoundaries && device === "webgpu") {
+    } else if (
+      this.trueSegmentationEnabled &&
+      hasCheckpointBoundaries &&
+      device === "webgpu"
+    ) {
       // True segmentation with GPU sync between segments
-      await executePlanWithTrueSegments(plan, backend, {
+      await executePlanSegmented(plan, backend, {
         enableEarlyRelease: this.earlyReleaseEnabled,
+        gpuSync: true,
       });
     } else if (this.checkpointSegmentationEnabled && hasCheckpointBoundaries) {
-      // Use checkpoint segmentation (buffer pool flush only, no GPU sync)
-      const flushBufferPool = this.getBufferPoolFlushFn(device);
-      await executePlanWithCheckpointSegments(
-        plan,
-        backend,
-        { enableEarlyRelease: this.earlyReleaseEnabled },
-        flushBufferPool,
-      );
+      // Checkpoint segmentation (buffer pool flush only, no GPU sync)
+      await executePlanSegmented(plan, backend, {
+        enableEarlyRelease: this.earlyReleaseEnabled,
+        flushBufferPoolFn: this.getBufferPoolFlushFn(device),
+      });
     } else {
       // Standard execution - no segmentation overhead
-      await executePlan(plan, backend, {
+      await executePlanSequential(plan, backend, {
         enableEarlyRelease: this.earlyReleaseEnabled,
       });
     }
 
     // Materialize ALL tensors that were pending on executed nodes.
     // This ensures all user-held tensors get their storages marked as externally reachable.
-    const { materializePendingTensors } = await import("./tensor");
+    const { materializePendingTensors, clearDisposedPendingNodeIds } =
+      await import("./tensor");
     for (const node of plan.nodes) {
       if (node.result) {
-        materializePendingTensors(node.id, node.result);
+        materializePendingTensors(node.id, node.result, node.results);
       }
     }
 
-    // Update tensor refs to point to results for any tensors not yet materialized
-    // Use isMaterialized() to check (not lazyRef.kind) because materializePendingTensors
-    // above may have already updated some tensors.
-    // IMPORTANT: Skip disposed tensors - materializing a disposed tensor marks its storage
-    // reachable, but since the tensor is disposed, no one will ever mark it unreachable,
-    // causing a permanent storage leak.
-    for (const tensor of tensors) {
-      if (!tensor.isMaterialized() && !tensor.disposed) {
-        const lazyRef = tensor.lazyRef;
-        if (lazyRef.kind === "pending" && lazyRef.node.result) {
-          tensor._materialize(lazyRef.node.result);
-        }
-      }
-    }
+    // Clear disposed pending node IDs — they were needed for fusion analysis
+    // but must not accumulate across steps (memory leak).
+    clearDisposedPendingNodeIds();
 
-  }
-
-  /**
-   * Force multiple tensors to materialize using a single merged execution plan.
-   * This is always more efficient than forcing individually, and enables proper
-   * checkpoint segmentation when checkpoint boundaries are present.
-   */
-  async forceAll(...tensors: Tensor[]): Promise<void> {
-    await this.forceAllMerged(...tensors);
+    // Materialize any remaining tensors whose nodes were already executed
+    materializeRemaining(tensors);
   }
 
   /**
@@ -825,42 +727,33 @@ export class RuntimeEngine {
    * are still accessible via node.result in getInputStorage().
    */
   async forceAllPending(): Promise<void> {
-    const { getAllPendingTensors, materializePendingTensors: materialize } = await import("./tensor");
+    const {
+      getAllPendingTensors,
+      materializePendingTensors: materialize,
+      clearDisposedPendingNodeIds,
+    } = await import("./tensor");
     const pendingTensors = getAllPendingTensors();
     if (pendingTensors.length === 0) {
       return;
     }
 
-    // Collect pending roots
-    const pendingRoots: LazyIRNode[] = [];
-    for (const tensor of pendingTensors) {
-      if (tensor.isMaterialized() || tensor.disposed) continue;
-      const lazyRef = tensor.lazyRef;
-      if (lazyRef.kind === "pending") {
-        pendingRoots.push(lazyRef.node);
-      }
-    }
+    const pendingRoots = collectPendingRoots(pendingTensors);
     if (pendingRoots.length === 0) return;
 
-    // Build merged plan, skipping already-executed nodes
     const plan = buildMergedPlan(pendingRoots, /* skipExecuted */ true);
     if (plan.nodes.length === 0) return;
 
-    // Destroy storages from prior steps (e.g., old Adam m/v states
-    // disposed by _resolvePendingState). Frees GPU buffers into pool
-    // before the new plan allocates output buffers.
-    storageTracker.destroyUnreachable();
+    // NOTE: Do NOT call storageTracker.destroyUnreachable() here.
+    // Disposed tensors (e.g., old Adam m/v states) may have buffers that
+    // are still referenced by pending lazy nodes in the plan about to execute.
+    // Destroying them before plan execution causes buffer reuse corruption
+    // on GPUs with fast buffer reclamation (Chrome/Metal WebGPU).
+    // Unreachable storages are cleaned up AFTER plan execution instead.
 
-    let device: DeviceKind = "cpu";
-    for (const tensor of pendingTensors) {
-      if (!tensor.isMaterialized()) {
-        device = tensor.device;
-        break;
-      }
-    }
+    const device = resolveDeviceFromTensors(pendingTensors);
 
     // Flush recycled GPU buffers from pendingRelease to the main pool.
-    // Must happen BEFORE the shared encoder opens (executePlan opens one),
+    // Must happen BEFORE the shared encoder opens (executePlanSequential opens one),
     // so that acquire() can find them in the main pool during plan execution
     // (acquire() skips pendingRelease when sharedEncoder is active).
     const flushBufferPool = this.getBufferPoolFlushFn(device);
@@ -868,24 +761,6 @@ export class RuntimeEngine {
 
     // Snapshot storage ID before execution to scope cleanup of orphaned intermediates
     const storageSnapshot = storageTracker.getNextStorageId();
-
-    // Lowered plan fast-path for forceAllPending
-    if (device === "webgpu" && this.fusionEnabled) {
-      const executed = await this.tryLoweredPlanExecution(plan, pendingTensors, device);
-      if (executed) {
-        // Handle skipped nodes (already executed from prior force() calls)
-        for (const tensor of pendingTensors) {
-          if (!tensor.isMaterialized() && !tensor.disposed) {
-            const lazyRef = tensor.lazyRef;
-            if (lazyRef.kind === "pending" && lazyRef.node.result) {
-              tensor._materialize(lazyRef.node.result);
-            }
-          }
-        }
-        storageTracker.destroyUnreachableSince(storageSnapshot);
-        return;
-      }
-    }
 
     const backend = this.getBackend(device);
 
@@ -899,7 +774,7 @@ export class RuntimeEngine {
       this.lastFusionStats = optimizedResult.stats;
       this.accumulateFusionStats(optimizedResult.stats);
     } else {
-      await executePlan(plan, backend, {
+      await executePlanSequential(plan, backend, {
         enableEarlyRelease: this.earlyReleaseEnabled,
       });
     }
@@ -907,28 +782,19 @@ export class RuntimeEngine {
     // Materialize all tensors pending on executed nodes
     for (const node of plan.nodes) {
       if (node.result) {
-        materialize(node.id, node.result);
+        materialize(node.id, node.result, node.results);
       }
     }
-    // Materialize any remaining tensors whose nodes were already executed
-    // (skipped by buildMergedPlan because they already had results).
-    // Also collect these skipped nodes so we can clear their results below.
-    const skippedNodes: LazyIRNode[] = [];
-    for (const tensor of pendingTensors) {
-      if (!tensor.isMaterialized() && !tensor.disposed) {
-        const lazyRef = tensor.lazyRef;
-        if (lazyRef.kind === "pending" && lazyRef.node.result) {
-          tensor._materialize(lazyRef.node.result);
-          skippedNodes.push(lazyRef.node);
-        }
-      }
-    }
+    clearDisposedPendingNodeIds();
+
+    // Materialize remaining tensors and collect skipped nodes (already executed
+    // by prior force() calls but not in plan.nodes) for result cleanup.
+    const skippedNodes = materializeRemaining(pendingTensors);
 
     // Drop node.result references to allow GC of unclaimed intermediate storages.
-    // Without this, lazy nodes keep StorageHandles alive via node.result references,
-    // preventing storageTracker.destroyUnreachable() from freeing their buffers.
-    // Must clear BOTH plan nodes AND skipped nodes (which were already executed
-    // by a prior force() call but not in plan.nodes).
+    // Note: node.results is NOT cleared here — multi-output ops (e.g., adamStep,
+    // fusedAttention) store side outputs in node.results that are consumed by
+    // materializePendingTensors when RuntimeTensors reference outputIndex > 0.
     for (const node of plan.nodes) {
       node.result = undefined;
     }
@@ -936,10 +802,11 @@ export class RuntimeEngine {
       node.result = undefined;
     }
 
-    // Destroy orphaned intermediates created during this plan execution.
-    // At markStep time, all pending tensors have been materialized, so
-    // any unreachable storages created during execution are truly orphaned.
-    storageTracker.destroyUnreachableSince(storageSnapshot);
+    // Destroy orphaned intermediates created during this plan execution,
+    // PLUS any storages from prior steps that were marked unreachable
+    // (e.g., old Adam m/v states). This is safe now because the plan
+    // has finished executing — no pending nodes reference these buffers.
+    storageTracker.destroyUnreachable();
   }
 
   tensorFromArray(
@@ -960,104 +827,102 @@ export class RuntimeEngine {
       resolvedDevice,
       { values: payload },
     );
-    const lazyRef: LazyRef = createPendingRef(node);
-    return this.createAndTrack(createBaseId(), lazyRef, shape, resolvedDevice);
+    return this.trackNode(node, shape, resolvedDevice);
   }
 
-  /**
-   * Create a zero-filled tensor efficiently without allocating a large JS array.
-   * Uses the "zeros" lazy op so the backend can create a zero-initialized buffer directly.
-   */
+  /** Helper: create a data-source op (no inputs, f32 output). */
+  private _creationOp(
+    op: LazyOpCode,
+    shape: number[],
+    device?: DeviceKind,
+    payload?: unknown,
+  ): Tensor {
+    const resolvedDevice = this.getDevice(device);
+    const node = createLazyIRNode(
+      op,
+      [],
+      shape,
+      "f32",
+      resolvedDevice,
+      payload,
+    );
+    return this.trackNode(node, shape, resolvedDevice);
+  }
+
   zeros(shape: number[], device?: DeviceKind): Tensor {
-    const resolvedDevice = this.getDevice(device);
-    const node = createLazyIRNode(
-      "zeros",
-      [],
-      shape,
-      "f32",
-      resolvedDevice,
-    );
-    const lazyRef: LazyRef = createPendingRef(node);
-    return this.createAndTrack(createBaseId(), lazyRef, shape, resolvedDevice);
+    return this._creationOp("zeros", shape, device);
   }
 
-  /**
-   * Create a tensor filled with a constant value.
-   * Uses the "full" lazy op so the backend can create the buffer directly.
-   */
   full(shape: number[], fillValue: number, device?: DeviceKind): Tensor {
-    const resolvedDevice = this.getDevice(device);
-    const node = createLazyIRNode(
-      "full",
-      [],
-      shape,
-      "f32",
-      resolvedDevice,
-      { fillValue },
-    );
-    const lazyRef: LazyRef = createPendingRef(node);
-    return this.createAndTrack(createBaseId(), lazyRef, shape, resolvedDevice);
+    return this._creationOp("full", shape, device, { fillValue });
   }
 
-  /**
-   * Create a 1-D tensor of evenly spaced values.
-   * Uses the "arange" lazy op so the backend can compute values on device.
-   */
   arange(end: number, start = 0, step = 1, device?: DeviceKind): Tensor {
-    const resolvedDevice = this.getDevice(device);
     const numElements = Math.max(0, Math.ceil((end - start) / step));
-    const shape = [numElements];
-    const node = createLazyIRNode(
-      "arange",
-      [],
-      shape,
-      "f32",
-      resolvedDevice,
-      { end, start, step },
-    );
-    const lazyRef: LazyRef = createPendingRef(node);
-    return this.createAndTrack(createBaseId(), lazyRef, shape, resolvedDevice);
+    return this._creationOp("arange", [numElements], device, {
+      end,
+      start,
+      step,
+    });
   }
 
-  /**
-   * Return the lower-triangular part of a matrix (or batch of matrices).
-   * Elements above the k-th diagonal are zeroed.
-   */
   tril(a: Tensor, k = 0): Tensor {
-    if (a.shape.length < 2) throw new Error("tril requires at least 2 dimensions");
-    const node = createLazyIRNode("tril", [a.lazyRef], a.shape, a.dtype, a.device, { k });
-    return this.createAndTrack(createBaseId(), createPendingRef(node), a.shape, a.device, a.dtype);
+    if (a.shape.length < 2)
+      throw new Error("tril requires at least 2 dimensions");
+    return this._unaryOp("tril", a, { k });
   }
 
-  /**
-   * Return the upper-triangular part of a matrix (or batch of matrices).
-   * Elements below the k-th diagonal are zeroed.
-   */
   triu(a: Tensor, k = 0): Tensor {
-    if (a.shape.length < 2) throw new Error("triu requires at least 2 dimensions");
-    const node = createLazyIRNode("triu", [a.lazyRef], a.shape, a.dtype, a.device, { k });
-    return this.createAndTrack(createBaseId(), createPendingRef(node), a.shape, a.device, a.dtype);
+    if (a.shape.length < 2)
+      throw new Error("triu requires at least 2 dimensions");
+    return this._unaryOp("triu", a, { k });
   }
 
   rand(shape: number[], device?: DeviceKind): Tensor {
-    const resolvedDevice = this.getDevice(device);
-    const seed = this._rngCounter++;
-    const node = createLazyIRNode("rand", [], shape, "f32", resolvedDevice, { seed });
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, resolvedDevice);
+    return this._creationOp("rand", shape, device, {
+      seed: this._rngCounter++,
+    });
   }
 
   randn(shape: number[], device?: DeviceKind): Tensor {
-    const resolvedDevice = this.getDevice(device);
-    const seed = this._rngCounter++;
-    const node = createLazyIRNode("randn", [], shape, "f32", resolvedDevice, { seed });
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, resolvedDevice);
+    return this._creationOp("randn", shape, device, {
+      seed: this._rngCounter++,
+    });
   }
 
   bernoulli(shape: number[], p: number, device?: DeviceKind): Tensor {
-    const resolvedDevice = this.getDevice(device);
-    const seed = this._rngCounter++;
-    const node = createLazyIRNode("bernoulli", [], shape, "f32", resolvedDevice, { seed, p });
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, resolvedDevice);
+    return this._creationOp("bernoulli", shape, device, {
+      seed: this._rngCounter++,
+      p,
+    });
+  }
+
+  /** Helper: create a simple unary lazy op node.
+   *  Automatically handles dtype safety from OP_DTYPE_RULES:
+   *  - f32_required: casts f16 input to f32
+   *  - always_f32: forces f32 output dtype
+   */
+  _unaryOp(op: LazyOpCode, a: OpInput, payload?: unknown): Tensor {
+    let input: OpInput = a;
+    let outDtype = a.dtype;
+    const rule = OP_DTYPE_RULES[op];
+    if (rule) {
+      if (rule.category === "f32_required" && a.dtype === "f16") {
+        input = castRef(a, "f32");
+        outDtype = "f32";
+      } else if (rule.category === "always_f32") {
+        outDtype = "f32";
+      }
+    }
+    const node = createLazyIRNode(
+      op,
+      [input.lazyRef],
+      a.shape.slice(),
+      outDtype,
+      a.device,
+      payload,
+    );
+    return this.trackNode(node, a.shape.slice(), a.device, outDtype);
   }
 
   /**
@@ -1086,7 +951,7 @@ export class RuntimeEngine {
     }
 
     if (rule.category === "f32_required") {
-      return inputs.map(t => t.dtype === "f16" ? castRef(t, "f32") : t);
+      return inputs.map((t) => (t.dtype === "f16" ? castRef(t, "f32") : t));
     }
 
     return inputs;
@@ -1097,7 +962,10 @@ export class RuntimeEngine {
    * Numbers become scalar LazyRefs (no graph node, no GPU buffer).
    * The refTensor provides dtype/device context for the scalar.
    */
-  private resolveOperand(value: OpInput | number, ref: OpInput): { ref: LazyRef; shape: number[] } {
+  private resolveOperand(
+    value: OpInput | number,
+    ref: OpInput,
+  ): { ref: LazyRef; shape: number[] } {
     if (typeof value === "number") {
       return { ref: createScalarRef(value, ref.dtype), shape: [] };
     }
@@ -1122,7 +990,13 @@ export class RuntimeEngine {
     op: LazyOpCode,
     a: TensorOrScalar,
     b: TensorOrScalar,
-  ): { refA: LazyRef; refB: LazyRef; shape: number[]; dtype: DType; device: DeviceKind } {
+  ): {
+    refA: LazyRef;
+    refB: LazyRef;
+    shape: number[];
+    dtype: DType;
+    device: DeviceKind;
+  } {
     // Apply dtype safety only when both operands are tensors
     let opA: OpInput | number = a;
     let opB: OpInput | number = b;
@@ -1134,64 +1008,81 @@ export class RuntimeEngine {
     const resA = this.resolveOperand(opA, ref);
     const resB = this.resolveOperand(opB, ref);
     const shape = broadcastShapes(resA.shape, resB.shape);
-    return { refA: resA.ref, refB: resB.ref, shape, dtype: ref.dtype, device: ref.device };
+    // Check if this op always produces f32 (comparisons, etc.)
+    const rule = OP_DTYPE_RULES[op];
+    const dtype = rule?.category === "always_f32" ? "f32" : ref.dtype;
+    return {
+      refA: resA.ref,
+      refB: resB.ref,
+      shape,
+      dtype,
+      device: ref.device,
+    };
   }
 
-  add(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp("add", a, b);
-    const node = createLazyIRNode("add", [refA, refB], shape, dtype, device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
+  _binaryOp(
+    op: LazyOpCode,
+    a: TensorOrScalar,
+    b: TensorOrScalar,
+    payload?: unknown,
+  ): Tensor {
+    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp(op, a, b);
+    const node = createLazyIRNode(
+      op,
+      [refA, refB],
+      shape,
+      dtype,
+      device,
+      payload,
+    );
+    return this.trackNode(node, shape, device, dtype);
   }
 
   sub(a: TensorOrScalar, b: TensorOrScalar, options?: SubOptions): Tensor {
-    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp("sub", a, b);
-    const node = createLazyIRNode("sub", [refA, refB], shape, dtype, device, options);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
+    return this._binaryOp("sub", a, b, options);
   }
-
   div(a: TensorOrScalar, b: TensorOrScalar, options?: DivOptions): Tensor {
-    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp("div", a, b);
-    const node = createLazyIRNode("div", [refA, refB], shape, dtype, device, options);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
+    return this._binaryOp("div", a, b, options);
   }
 
-  mul(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp("mul", a, b);
-    const node = createLazyIRNode("mul", [refA, refB], shape, dtype, device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
+  /** Create a view op node that shares baseId with the input tensor. */
+  private _viewOp(
+    op: LazyOpCode,
+    a: Tensor,
+    shape: number[],
+    payload?: unknown,
+  ): Tensor {
+    const node = createLazyIRNode(
+      op,
+      [a.lazyRef],
+      shape,
+      a.dtype,
+      a.device,
+      payload,
+    );
+    return this.createAndTrack(
+      a.baseId,
+      createPendingRef(node),
+      shape,
+      a.device,
+      a.dtype,
+    );
   }
 
   view(a: Tensor, shape: number[]): Tensor {
-    const node = createLazyIRNode(
-      "reshape",
-      [a.lazyRef],
-      shape,
-      a.dtype,
-      a.device,
-      { targetShape: shape },
-    );
-    // View shares baseId with input
-    return this.createAndTrack(a.baseId, createPendingRef(node), shape, a.device, a.dtype);
+    return this.reshape(a, shape);
   }
 
   reshape(a: Tensor, shape: number[]): Tensor {
-    const node = createLazyIRNode(
-      "reshape",
-      [a.lazyRef],
-      shape,
-      a.dtype,
-      a.device,
-      { targetShape: shape },
-    );
-    // Reshape shares baseId with input
-    return this.createAndTrack(a.baseId, createPendingRef(node), shape, a.device, a.dtype);
+    return this._viewOp("reshape", a, shape, { targetShape: shape });
   }
 
   matmul(a: Tensor, b: Tensor): Tensor {
     const device = this.assertSameDevice(a, b);
     const shape = matmulShape(a.shape, b.shape);
     // Output dtype = higher precision of inputs (f32 if mixed)
-    const dtype = (a.dtype === "f32" || b.dtype === "f32") ? "f32" as const : a.dtype;
+    const dtype =
+      a.dtype === "f32" || b.dtype === "f32" ? ("f32" as const) : a.dtype;
     const node = createLazyIRNode(
       "matmul",
       [a.lazyRef, b.lazyRef],
@@ -1199,227 +1090,27 @@ export class RuntimeEngine {
       dtype,
       device,
     );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
-  }
-
-  sqrt(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "sqrt",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
-  }
-
-  relu(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "relu",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
-  }
-
-  exp(a: Tensor): Tensor {
-    const [op] = this.ensureDtypeSafety("exp", [a]);
-    const node = createLazyIRNode(
-      "exp",
-      [op.lazyRef],
-      op.shape.slice(),
-      op.dtype,
-      op.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      op.shape.slice(),
-      op.device,
-      op.dtype,
-    );
-  }
-
-  log(a: Tensor): Tensor {
-    const [op] = this.ensureDtypeSafety("log", [a]);
-    const node = createLazyIRNode(
-      "log",
-      [op.lazyRef],
-      op.shape.slice(),
-      op.dtype,
-      op.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      op.shape.slice(),
-      op.device,
-      op.dtype,
-    );
-  }
-
-  neg(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "neg",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
-  }
-
-  abs(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "abs",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
-  }
-
-  tanh(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "tanh",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
-  }
-
-  sigmoid(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "sigmoid",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
+    return this.trackNode(node, shape, device, dtype);
   }
 
   gelu(a: Tensor, options?: GeluOptions): Tensor {
-    const node = createLazyIRNode(
-      "gelu",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-      options, // Pass options as payload
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
+    return this._unaryOp("gelu", a, options);
   }
-
-  silu(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "silu",
-      [a.lazyRef],
-      a.shape.slice(),
-      a.dtype,
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-      a.dtype,
-    );
-  }
-
-  /**
-   * Check if values are finite (not NaN and not Inf).
-   * Returns 1.0 where finite, 0.0 where NaN or Inf.
-   */
-  isfinite(a: Tensor): Tensor {
-    const node = createLazyIRNode(
-      "isfinite",
-      [a.lazyRef],
-      a.shape.slice(),
-      "f32",
-      a.device,
-    );
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      a.device,
-    );
+  clamp(a: Tensor, min: number | null, max: number | null): Tensor {
+    return this._unaryOp("clamp", a, { min, max });
   }
 
   expand(a: Tensor, shape: number[]): Tensor {
-    const node = createLazyIRNode(
-      "expand",
-      [a.lazyRef],
-      shape,
-      a.dtype,
-      a.device,
-      { targetShape: shape },
-    );
-    // Expand shares baseId with input
-    return this.createAndTrack(a.baseId, createPendingRef(node), shape, a.device, a.dtype);
+    return this._viewOp("expand", a, shape, { targetShape: shape });
   }
 
   transpose(a: Tensor, options: TransposeOptions): Tensor {
-    const shape = transposeShape(a.shape, options);
-    const node = createLazyIRNode(
+    return this._viewOp(
       "transpose",
-      [a.lazyRef],
-      shape,
-      a.dtype,
-      a.device,
+      a,
+      transposeShape(a.shape, options),
       options,
     );
-    // Transpose shares baseId with input
-    return this.createAndTrack(a.baseId, createPendingRef(node), shape, a.device, a.dtype);
   }
 
   permute(a: Tensor, dims: number[]): Tensor {
@@ -1446,36 +1137,7 @@ export class RuntimeEngine {
     const normalizedDims = dims.map((d) => normalizeDim(d, rank));
     const shape = normalizedDims.map((d) => a.shape[d]);
 
-    const node = createLazyIRNode(
-      "permute",
-      [a.lazyRef],
-      shape,
-      a.dtype,
-      a.device,
-      { dims: normalizedDims },
-    );
-    // Permute shares baseId with input (it's a view)
-    return this.createAndTrack(a.baseId, createPendingRef(node), shape, a.device, a.dtype);
-  }
-
-  contiguous(a: Tensor): Tensor {
-    // contiguous materializes non-contiguous tensors to new contiguous buffer
-    const node = createLazyIRNode(
-      "contiguous",
-      [a.lazyRef],
-      a.shape,
-      a.dtype,
-      a.device,
-      undefined,
-    );
-    // contiguous may create new storage, so gets new baseId
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape,
-      a.device,
-      a.dtype,
-    );
+    return this._viewOp("permute", a, shape, { dims: normalizedDims });
   }
 
   narrow(a: Tensor, dim: number, start: number, length: number): Tensor {
@@ -1484,23 +1146,21 @@ export class RuntimeEngine {
       throw new Error(`narrow: dim ${dim} out of range for rank ${rank}`);
     }
     if (start < 0 || start + length > a.shape[dim]) {
-      throw new Error(`narrow: range [${start}, ${start + length}) out of bounds for dim size ${a.shape[dim]}`);
+      throw new Error(
+        `narrow: range [${start}, ${start + length}) out of bounds for dim size ${a.shape[dim]}`,
+      );
     }
     const shape = a.shape.slice();
     shape[dim] = length;
-    const node = createLazyIRNode(
-      "narrow",
-      [a.lazyRef],
-      shape,
-      a.dtype,
-      a.device,
-      { dim, start, length },
-    );
-    // narrow is a view, shares baseId with input
-    return this.createAndTrack(a.baseId, createPendingRef(node), shape, a.device, a.dtype);
+    return this._viewOp("narrow", a, shape, { dim, start, length });
   }
 
-  narrowBackward(grad: Tensor, dim: number, start: number, originalLength: number): Tensor {
+  narrowBackward(
+    grad: Tensor,
+    dim: number,
+    start: number,
+    originalLength: number,
+  ): Tensor {
     const shape = grad.shape.slice();
     shape[dim] = originalLength;
     const node = createLazyIRNode(
@@ -1511,46 +1171,33 @@ export class RuntimeEngine {
       grad.device,
       { dim, start, originalLength },
     );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, grad.device, grad.dtype);
+    return this.trackNode(node, shape, grad.device, grad.dtype);
   }
 
-  /**
-   * Cast tensor to a different dtype.
-   * Returns a new tensor with the specified dtype.
-   */
   cast(a: Tensor, dtype: DType): Tensor {
     const node = createLazyIRNode(
       "cast",
       [a.lazyRef],
-      a.shape,
+      a.shape.slice(),
       dtype,
       a.device,
       { dtype },
     );
-    // cast creates new storage with different dtype
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape,
-      a.device,
-      dtype,
-    );
+    return this.trackNode(node, a.shape.slice(), a.device, dtype);
   }
 
   gather(a: Tensor, index: Tensor, options: GatherOptions): Tensor {
     const device = this.assertSameDevice(a, index);
-    // Gather output shape matches index shape
     const shape = index.shape.slice();
-    const dtype = a.dtype;
     const node = createLazyIRNode(
       "gather",
       [a.lazyRef, index.lazyRef],
       shape,
-      dtype,
+      a.dtype,
       device,
       options,
     );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
+    return this.trackNode(node, shape, device, a.dtype);
   }
 
   scatterAdd(
@@ -1571,140 +1218,69 @@ export class RuntimeEngine {
       device,
       options,
     );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
+    return this.trackNode(node, shape, device, dtype);
   }
 
-  sum(a: Tensor, options?: SumOptions): Tensor {
-    const [op] = this.ensureDtypeSafety("sum", [a]);
-    const shape = reduceShape(op.shape, options?.dim, options?.keepdim ?? false);
-
-    // If reducing to scalar and no keepdim, return number
-    // But we can't know the actual value without forcing - return a tensor
-    const dtype = op.dtype;
+  cat(tensors: Tensor[], options?: CatOptions): Tensor {
+    if (tensors.length === 0) throw new Error("cat: empty tensor list");
+    const dim = options?.dim ?? 0;
+    const rank = tensors[0].shape.length;
+    const d = dim < 0 ? dim + rank : dim;
+    // Compute output shape
+    const outShape = tensors[0].shape.slice();
+    for (let i = 1; i < tensors.length; i++) {
+      outShape[d] += tensors[i].shape[d];
+    }
+    const device = tensors[0].device;
+    const dtype = tensors[0].dtype;
     const node = createLazyIRNode(
-      "sum",
-      [op.lazyRef],
-      shape,
+      "cat",
+      tensors.map((t) => t.lazyRef),
+      outShape,
       dtype,
-      op.device,
+      device,
+      { dim: d } satisfies CatOptions,
+    );
+    return this.trackNode(node, outShape, device, dtype);
+  }
+
+  _reductionOp(
+    op: LazyOpCode,
+    a: Tensor,
+    options?: { dim?: number | number[] | null; keepdim?: boolean },
+  ): Tensor {
+    const [safe] = this.ensureDtypeSafety(op, [a]);
+    const shape = reduceShape(
+      safe.shape,
+      options?.dim,
+      options?.keepdim ?? false,
+    );
+    const node = createLazyIRNode(
+      op,
+      [safe.lazyRef],
+      shape,
+      safe.dtype,
+      safe.device,
       options,
     );
-
-    // If output is scalar [], we still return a Tensor for lazy evaluation
-    // The frontend will handle scalar conversion at force time
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, op.device, dtype);
+    return this.trackNode(node, shape, safe.device, safe.dtype);
   }
 
-  max(a: Tensor, options?: MaxOptions): number | Tensor {
-    const [op] = this.ensureDtypeSafety("max", [a]);
-    const shape = reduceShape(op.shape, options?.dim, options?.keepdim ?? false);
-    const dtype = op.dtype;
-
-    const node = createLazyIRNode(
-      "max",
-      [op.lazyRef],
-      shape,
-      dtype,
-      op.device,
-      options,
-    );
-
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, op.device, dtype);
-  }
-
-  mean(a: Tensor, options?: MeanOptions): number | Tensor {
-    const [op] = this.ensureDtypeSafety("mean", [a]);
-    const shape = reduceShape(op.shape, options?.dim, options?.keepdim ?? false);
-    const dtype = op.dtype;
-
-    const node = createLazyIRNode(
-      "mean",
-      [op.lazyRef],
-      shape,
-      dtype,
-      op.device,
-      options,
-    );
-
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, op.device, dtype);
-  }
-
-  argmax(a: Tensor, options: ArgReduceOptions): Tensor {
-    const normalizedDim =
-      options.dim < 0 ? a.shape.length + options.dim : options.dim;
+  _argReduceOp(op: LazyOpCode, a: Tensor, options: ArgReduceOptions): Tensor {
+    const dim = options.dim < 0 ? a.shape.length + options.dim : options.dim;
     const shape = options.keepdim
-      ? a.shape.map((s, i) => (i === normalizedDim ? 1 : s))
-      : a.shape.filter((_, i) => i !== normalizedDim);
-
-    const node = createLazyIRNode(
-      "argmax",
-      [a.lazyRef],
-      shape,
-      "f32",
-      a.device,
-      { dim: normalizedDim, keepdim: options.keepdim },
-    );
-
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, a.device);
-  }
-
-  argmin(a: Tensor, options: ArgReduceOptions): Tensor {
-    const normalizedDim =
-      options.dim < 0 ? a.shape.length + options.dim : options.dim;
-    const shape = options.keepdim
-      ? a.shape.map((s, i) => (i === normalizedDim ? 1 : s))
-      : a.shape.filter((_, i) => i !== normalizedDim);
-
-    const node = createLazyIRNode(
-      "argmin",
-      [a.lazyRef],
-      shape,
-      "f32",
-      a.device,
-      { dim: normalizedDim, keepdim: options.keepdim },
-    );
-
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, a.device);
-  }
-
-  gt(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, device } = this.resolveBinaryOp("gt", a, b);
-    const node = createLazyIRNode("gt", [refA, refB], shape, "f32", device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device);
-  }
-
-  lt(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, device } = this.resolveBinaryOp("lt", a, b);
-    const node = createLazyIRNode("lt", [refA, refB], shape, "f32", device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device);
-  }
-
-  ge(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, device } = this.resolveBinaryOp("ge", a, b);
-    const node = createLazyIRNode("ge", [refA, refB], shape, "f32", device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device);
-  }
-
-  le(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, device } = this.resolveBinaryOp("le", a, b);
-    const node = createLazyIRNode("le", [refA, refB], shape, "f32", device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device);
-  }
-
-  eq(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, device } = this.resolveBinaryOp("eq", a, b);
-    const node = createLazyIRNode("eq", [refA, refB], shape, "f32", device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device);
-  }
-
-  ne(a: TensorOrScalar, b: TensorOrScalar): Tensor {
-    const { refA, refB, shape, device } = this.resolveBinaryOp("ne", a, b);
-    const node = createLazyIRNode("ne", [refA, refB], shape, "f32", device);
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device);
+      ? a.shape.map((s, i) => (i === dim ? 1 : s))
+      : a.shape.filter((_, i) => i !== dim);
+    const node = createLazyIRNode(op, [a.lazyRef], shape, "f32", a.device, {
+      dim,
+      keepdim: options.keepdim,
+    });
+    return this.trackNode(node, shape, a.device);
   }
 
   where(condition: Tensor, x: TensorOrScalar, y: TensorOrScalar): Tensor {
-    const refT = typeof x !== "number" ? x : typeof y !== "number" ? y : condition;
+    const refT =
+      typeof x !== "number" ? x : typeof y !== "number" ? y : condition;
     if (typeof x !== "number" && typeof y !== "number") {
       this.assertSameDevice(condition, x, y);
     }
@@ -1720,7 +1296,7 @@ export class RuntimeEngine {
       dtype,
       device,
     );
-    return this.createAndTrack(createBaseId(), createPendingRef(node), shape, device, dtype);
+    return this.trackNode(node, shape, device, dtype);
   }
 
   async cpu(a: Tensor): Promise<number[]> {
@@ -1735,6 +1311,23 @@ export class RuntimeEngine {
       throw new Error("item() requires a single-element tensor");
     }
     return values[0];
+  }
+
+  /**
+   * Start an async scalar readback: force the tensor, copy its value to a
+   * staging buffer, and return a finish function. The staging buffer is
+   * excluded from the pool, so backward can reuse the source buffer freely.
+   * Call the returned function after backward to get the scalar value.
+   */
+  async startItemReadback(a: Tensor): Promise<() => Promise<number>> {
+    await this.force(a);
+    const backend = this.getBackend(a.device);
+    if (backend.ops.startScalarReadback) {
+      return backend.ops.startScalarReadback(a.backendTensor);
+    }
+    // Fallback for backends without staging support (CPU)
+    const values = await backend.ops.read(a.backendTensor);
+    return async () => values[0];
   }
 
   /**
@@ -1754,13 +1347,7 @@ export class RuntimeEngine {
       { sourceDevice: a.device },
     );
     // Transfer creates a new tensor with new baseId on target device
-    return this.createAndTrack(
-      createBaseId(),
-      createPendingRef(node),
-      a.shape.slice(),
-      device,
-      a.dtype,
-    );
+    return this.trackNode(node, a.shape.slice(), device, a.dtype);
   }
 
   /**
@@ -1780,131 +1367,104 @@ export class RuntimeEngine {
   // In-place operations (§4.3-4.4)
   // ============================================================================
 
-  /**
-   * Copy src values into dst tensor in-place.
-   * Returns dst (same tensor object) with updated lazyRef.
-   *
-   * Per spec §4.4, this uses strided_scatter_copy to copy src into dst.
-   */
+  /** Shared logic for in-place scatter ops (copy_, add_). */
+  private _scatterInPlace(
+    op: "stridedScatterCopy" | "stridedScatterAdd",
+    label: string,
+    dst: Tensor,
+    src: Tensor,
+  ): Tensor {
+    this.assertSameDevice(dst, src);
+    this.assertShapeMatch(label, dst, src);
+    const payload: StridedScatterOptions = {
+      offset: 0,
+      viewShape: dst.shape.slice(),
+      viewStrides: contiguousStrides(dst.shape),
+    };
+    const node = createLazyIRNode(
+      op,
+      [dst.lazyRef, src.lazyRef],
+      dst.shape,
+      dst.dtype,
+      dst.device,
+      payload,
+    );
+    dst._updateLazyRef(createPendingRef(node));
+    return dst;
+  }
+
   copy_(dst: Tensor, src: Tensor): Tensor {
-    this.assertSameDevice(dst, src);
-    this.assertShapeMatch("copy_", dst, src);
-
-    // Create strided scatter copy node
-    // For full tensor copy: offset=0, viewShape=dst.shape, viewStrides=contiguous
-    const viewStrides = computeContiguousStrides(dst.shape);
-    const payload: StridedScatterOptions = {
-      offset: 0,
-      viewShape: dst.shape.slice(),
-      viewStrides,
-    };
-
-    const node = createLazyIRNode(
-      "stridedScatterCopy",
-      [dst.lazyRef, src.lazyRef],
-      dst.shape,
-      dst.dtype,
-      dst.device,
-      payload,
-    );
-
-    // Update dst's lazyRef to the new node
-    dst._updateLazyRef(createPendingRef(node));
-
-    return dst;
+    return this._scatterInPlace("stridedScatterCopy", "copy_", dst, src);
   }
-
-  /**
-   * Add src values to dst tensor in-place.
-   * Returns dst (same tensor object) with updated lazyRef.
-   *
-   * Per spec §4.4, this uses strided_scatter_add to add src into dst.
-   */
   add_(dst: Tensor, src: Tensor): Tensor {
-    this.assertSameDevice(dst, src);
-    this.assertShapeMatch("add_", dst, src);
+    return this._scatterInPlace("stridedScatterAdd", "add_", dst, src);
+  }
 
-    // Create strided scatter add node
-    const viewStrides = computeContiguousStrides(dst.shape);
+  zero_(dst: Tensor): Tensor {
+    // Create source node directly — no RuntimeTensor wrapper needed.
+    // The zeros node is a plan-internal intermediate consumed by the scatter.
+    const srcNode = createLazyIRNode(
+      "tensorFromArray",
+      [],
+      dst.shape,
+      dst.dtype,
+      dst.device,
+      { values: new Float32Array(dst.shape.reduce((a, b) => a * b, 1)) },
+    );
+    return this._scatterFromNode(dst, srcNode);
+  }
+  fill_(dst: Tensor, value: number): Tensor {
+    const size = dst.shape.reduce((a, b) => a * b, 1);
+    const values = new Float32Array(size);
+    values.fill(value);
+    const srcNode = createLazyIRNode(
+      "tensorFromArray",
+      [],
+      dst.shape,
+      dst.dtype,
+      dst.device,
+      { values },
+    );
+    return this._scatterFromNode(dst, srcNode);
+  }
+  mul_(dst: Tensor, value: number): Tensor {
+    // Create mul node directly — no RuntimeTensor wrapper. The intermediate
+    // is consumed by the scatter node within the same plan execution.
+    // Previously, trackNode() created a RuntimeTensor here that persisted
+    // until GC, causing ~2 leaked JS objects/step and progressive slowdown.
+    const { refA, refB, shape, dtype, device } = this.resolveBinaryOp(
+      "mul",
+      dst,
+      value,
+    );
+    const mulNode = createLazyIRNode("mul", [refA, refB], shape, dtype, device);
+    return this._scatterFromNode(dst, mulNode);
+  }
+
+  /** Wire an untracked source node into a scatter-copy on dst. */
+  private _scatterFromNode(dst: Tensor, srcNode: LazyIRNode): Tensor {
     const payload: StridedScatterOptions = {
       offset: 0,
       viewShape: dst.shape.slice(),
-      viewStrides,
+      viewStrides: contiguousStrides(dst.shape),
     };
-
-    const node = createLazyIRNode(
-      "stridedScatterAdd",
-      [dst.lazyRef, src.lazyRef],
+    const scatterNode = createLazyIRNode(
+      "stridedScatterCopy",
+      [dst.lazyRef, createPendingRef(srcNode)],
       dst.shape,
       dst.dtype,
       dst.device,
       payload,
     );
-
-    // Update dst's lazyRef to the new node
-    dst._updateLazyRef(createPendingRef(node));
-
+    dst._updateLazyRef(createPendingRef(scatterNode));
     return dst;
   }
 
-  /**
-   * Zero out a tensor in-place.
-   * Returns dst (same tensor object) with updated lazyRef.
-   */
-  zero_(dst: Tensor): Tensor {
-    // Create a zeros tensor and copy it into dst
-    const zerosTensor = this.zeros(dst.shape, dst.device);
-    return this.copy_(dst, zerosTensor);
-  }
-
-  /**
-   * Fill a tensor with a scalar value in-place.
-   * Returns dst (same tensor object) with updated lazyRef.
-   */
-  fill_(dst: Tensor, value: number): Tensor {
-    const valuesTensor = this.full(dst.shape, value, dst.device);
-    return this.copy_(dst, valuesTensor);
-  }
-
-  /**
-   * Multiply tensor by scalar in-place.
-   * Returns dst (same tensor object) with updated lazyRef.
-   */
-  mul_(dst: Tensor, value: number): Tensor {
-    // Multiply by scalar and copy result back to dst
-    const scaledTensor = this.mul(dst, value);
-    return this.copy_(dst, scaledTensor);
-  }
-
-  /**
-   * Begin step-level shared encoder scope.
-   * Keeps GPU command encoder open across force() boundaries.
-   */
   async beginStep(): Promise<void> {
     await this.getBackend().beginStep?.();
   }
-
-  /**
-   * End step-level shared encoder scope.
-   * Submits all remaining encoded GPU work.
-   */
   endStep(): void {
     this.getBackend().endStep?.();
-  }
-
-  /**
-   * Wrap a raw BackendTensor into a tracked RuntimeTensor.
-   * Creates a new StorageHandle for tracking.
-   */
-  createFromBackendTensor(
-    bt: BackendTensor,
-    shape: number[],
-    device: DeviceKind,
-    dtype: DType = "f32",
-  ): Tensor {
-    const storage = createStorageHandle(device, bt);
-    const ref: LazyRef = createMaterializedRef(storage);
-    return this.createAndTrack(createBaseId(), ref, shape, device, dtype);
   }
 
   /**
@@ -1913,68 +1473,891 @@ export class RuntimeEngine {
    * Used by the fused Adam kernel to create tensors for side outputs (m, v).
    */
   createFromStorageHandle(
-    storage: import("../engine/lazy").StorageHandle,
+    storage: import("../graph/types").StorageHandle,
     shape: number[],
     device: DeviceKind,
     dtype: DType = "f32",
   ): Tensor {
     const ref: LazyRef = createMaterializedRef(storage);
-    return this.createAndTrack(createBaseId(), ref, shape, device, dtype);
+    return this.trackRef(ref, shape, device, dtype);
   }
 
-  fusedCrossEntropyForward(logits: Tensor, targets: Tensor, config: FusedCrossEntropyConfig): Tensor {
-    const { ref, shape } = fusedCrossEntropyForwardOp(logits.lazyRef, targets.lazyRef, logits.device, config);
-    return this.createAndTrack(createBaseId(), ref, shape, logits.device);
+  /** Create a fused kernel op node and track it as a new Tensor. */
+  private fusedOp(
+    op: LazyOpCode,
+    tensors: Tensor[],
+    shape: number[],
+    device: DeviceKind,
+    config?: unknown,
+  ): Tensor {
+    const node = createLazyIRNode(
+      op,
+      tensors.map((t) => t.lazyRef),
+      shape,
+      "f32",
+      device,
+      config,
+    );
+    return this.trackRef(createPendingRef(node), shape, device);
   }
 
-  fusedCrossEntropyBackward(logits: Tensor, targets: Tensor, gradOutput: Tensor, config: FusedCrossEntropyConfig): Tensor {
-    const { ref, shape } = fusedCrossEntropyBackwardOp(logits.lazyRef, targets.lazyRef, gradOutput.lazyRef, logits.device, config);
-    return this.createAndTrack(createBaseId(), ref, shape, logits.device);
+  fusedCrossEntropyForward(
+    logits: Tensor,
+    targets: Tensor,
+    config: FusedCrossEntropyConfig,
+  ): Tensor {
+    return this.fusedOp(
+      "fusedCrossEntropyForward",
+      [logits, targets],
+      [config.batchSize],
+      logits.device,
+      config,
+    );
   }
 
-  fusedLayerNormForward(x: Tensor, weight: Tensor, bias: Tensor, config: FusedLayerNormConfig): Tensor {
-    const { ref, shape } = fusedLayerNormForwardOp(x.lazyRef, weight.lazyRef, bias.lazyRef, x.shape, x.device, config);
-    return this.createAndTrack(createBaseId(), ref, shape, x.device);
+  fusedCrossEntropyBackward(
+    logits: Tensor,
+    targets: Tensor,
+    gradOutput: Tensor,
+    config: FusedCrossEntropyConfig,
+  ): Tensor {
+    return this.fusedOp(
+      "fusedCrossEntropyBackward",
+      [logits, targets, gradOutput],
+      [config.batchSize, config.vocabSize],
+      logits.device,
+      config,
+    );
   }
 
-  fusedLayerNormBackwardGradX(gradOutput: Tensor, x: Tensor, weight: Tensor, config: FusedLayerNormConfig): Tensor {
-    const { ref, shape } = fusedLayerNormBackwardGradXOp(gradOutput.lazyRef, x.lazyRef, weight.lazyRef, x.shape, x.device, config);
-    return this.createAndTrack(createBaseId(), ref, shape, x.device);
+  fusedLayerNormForward(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    config: FusedLayerNormConfig,
+  ): Tensor {
+    return this.fusedOp(
+      "fusedLayerNormForward",
+      [x, weight, bias],
+      x.shape.slice(),
+      x.device,
+      config,
+    );
   }
 
-  fusedLayerNormBackwardGradWeightBias(gradOutput: Tensor, x: Tensor, config: FusedLayerNormConfig): Tensor {
-    const { ref, shape } = fusedLayerNormBackwardGradWeightBiasOp(gradOutput.lazyRef, x.lazyRef, gradOutput.device, config);
-    return this.createAndTrack(createBaseId(), ref, shape, gradOutput.device);
+  fusedLayerNormBackwardGradX(
+    gradOutput: Tensor,
+    x: Tensor,
+    weight: Tensor,
+    config: FusedLayerNormConfig,
+  ): Tensor {
+    return this.fusedOp(
+      "fusedLayerNormBackwardGradX",
+      [gradOutput, x, weight],
+      x.shape.slice(),
+      x.device,
+      config,
+    );
   }
 
-  fusedAttentionForward(q: Tensor, k: Tensor, v: Tensor, config: FusedAttentionConfig): Tensor {
-    const { ref, shape } = fusedAttentionForwardOp(q.lazyRef, k.lazyRef, v.lazyRef, q.device, config);
-    return this.createAndTrack(createBaseId(), ref, shape, q.device);
+  fusedLayerNormBackwardGradWeightBias(
+    gradOutput: Tensor,
+    x: Tensor,
+    config: FusedLayerNormConfig,
+  ): Tensor {
+    return this.fusedOp(
+      "fusedLayerNormBackwardGradWeightBias",
+      [gradOutput, x],
+      [config.featureDim],
+      gradOutput.device,
+      config,
+    );
   }
 
-  extractAttentionLogsumexp(fwdOutput: Tensor, config: FusedAttentionConfig): Tensor {
-    const { ref, shape } = extractAttentionLogsumexpOp(fwdOutput.lazyRef, fwdOutput.device, config);
-    return this.createAndTrack(createBaseId(), ref, shape, fwdOutput.device);
+  fusedRMSNormForward(
+    x: Tensor,
+    weight: Tensor,
+    config: FusedRMSNormConfig,
+  ): Tensor {
+    return this.fusedOp(
+      "fusedRMSNormForward",
+      [x, weight],
+      x.shape.slice(),
+      x.device,
+      config,
+    );
   }
 
-  fusedAttentionBackward(q: Tensor, k: Tensor, v: Tensor, logsumexp: Tensor, dO: Tensor, output: Tensor, config: FusedAttentionConfig): Tensor {
-    const { ref, shape } = fusedAttentionBackwardOp(q.lazyRef, k.lazyRef, v.lazyRef, logsumexp.lazyRef, dO.lazyRef, output.lazyRef, q.device, config);
-    return this.createAndTrack(createBaseId(), ref, shape, q.device);
+  fusedRMSNormBackwardGradX(
+    gradOutput: Tensor,
+    x: Tensor,
+    weight: Tensor,
+    config: FusedRMSNormConfig,
+  ): Tensor {
+    return this.fusedOp(
+      "fusedRMSNormBackwardGradX",
+      [gradOutput, x, weight],
+      x.shape.slice(),
+      x.device,
+      config,
+    );
+  }
+
+  fusedRMSNormBackwardGradWeight(
+    gradOutput: Tensor,
+    x: Tensor,
+    weight: Tensor,
+    config: FusedRMSNormConfig,
+  ): Tensor {
+    return this.fusedOp(
+      "fusedRMSNormBackwardGradWeight",
+      [gradOutput, x, weight],
+      [config.featureDim],
+      x.device,
+      config,
+    );
+  }
+
+  fusedAttentionForward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    config: FusedAttentionConfig,
+  ): Tensor {
+    return this.fusedOp(
+      "fusedAttentionForward",
+      [q, k, v],
+      [config.batchSize, config.numHeads, config.seqLen, config.headDim],
+      q.device,
+      config,
+    );
+  }
+
+  extractAttentionLogsumexp(
+    fwdOutput: Tensor,
+    config: FusedAttentionConfig,
+  ): Tensor {
+    // Multi-output: logsumexp is output index 1 of fusedAttentionForward
+    const parentRef = fwdOutput.lazyRef;
+    if (parentRef.kind !== "pending")
+      throw new Error("extractAttentionLogsumexp: expected pending ref");
+    const ref = createPendingRef(parentRef.node, 1);
+    return this.trackRef(
+      ref,
+      [config.batchSize, config.numHeads, config.seqLen],
+      fwdOutput.device,
+    );
+  }
+
+  fusedAttentionBackward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    logsumexp: Tensor,
+    dO: Tensor,
+    output: Tensor,
+    config: FusedAttentionConfig,
+  ): Tensor {
+    return this.fusedOp(
+      "fusedAttentionBackward",
+      [q, k, v, logsumexp, dO, output],
+      [config.batchSize, config.numHeads, config.seqLen, config.headDim],
+      q.device,
+      config,
+    );
   }
 
   extractAttentionDK(bwdDQ: Tensor, config: FusedAttentionConfig): Tensor {
-    const { ref, shape } = extractAttentionDKOp(bwdDQ.lazyRef, bwdDQ.device, config);
-    return this.createAndTrack(createBaseId(), ref, shape, bwdDQ.device);
+    // Multi-output: dK is output index 1 of fusedAttentionBackward
+    const parentRef = bwdDQ.lazyRef;
+    if (parentRef.kind !== "pending")
+      throw new Error("extractAttentionDK: expected pending ref");
+    const ref = createPendingRef(parentRef.node, 1);
+    return this.trackRef(
+      ref,
+      [config.batchSize, config.numHeads, config.seqLen, config.headDim],
+      bwdDQ.device,
+    );
   }
 
   extractAttentionDV(bwdDQ: Tensor, config: FusedAttentionConfig): Tensor {
-    const { ref, shape } = extractAttentionDVOp(bwdDQ.lazyRef, bwdDQ.device, config);
-    return this.createAndTrack(createBaseId(), ref, shape, bwdDQ.device);
+    // Multi-output: dV is output index 2 of fusedAttentionBackward
+    const parentRef = bwdDQ.lazyRef;
+    if (parentRef.kind !== "pending")
+      throw new Error("extractAttentionDV: expected pending ref");
+    const ref = createPendingRef(parentRef.node, 2);
+    return this.trackRef(
+      ref,
+      [config.batchSize, config.numHeads, config.seqLen, config.headDim],
+      bwdDQ.device,
+    );
   }
 
   extractLnBwdGradBias(gradWeight: Tensor, featureDim: number): Tensor {
-    const { ref, shape } = extractLnBwdGradBiasOp(gradWeight.lazyRef, gradWeight.device, featureDim);
-    return this.createAndTrack(createBaseId(), ref, shape, gradWeight.device);
+    // Multi-output: gradBias is output index 1 of fusedLayerNormBackwardGradWeightBias
+    const parentRef = gradWeight.lazyRef;
+    if (parentRef.kind !== "pending")
+      throw new Error("extractLnBwdGradBias: expected pending ref");
+    const ref = createPendingRef(parentRef.node, 1);
+    return this.trackRef(ref, [featureDim], gradWeight.device);
   }
 
+  // ============================================================================
+  // Engine methods (merged from Engine class)
+  // ============================================================================
+
+  /**
+   * Set the autocast context for AMP transforms in compiled regions.
+   * This should be called by the frontend when entering an autocast block.
+   */
+  setAutocastContext(ctx: AutocastContext | null): void {
+    this._autocastContext = ctx;
+  }
+
+  /**
+   * Get the current autocast context.
+   */
+  getAutocastContext(): AutocastContext | null {
+    return this._autocastContext;
+  }
+
+  _debug_publishSave(_baseId: EngineBaseId): void {
+    // No-op: token algebra removed. Kept for frontend.ts call site.
+  }
+
+  /** Set the global RNG seed for random tensor creation ops
+   *  (rand, randn, bernoulli). Resets the counter so subsequent
+   *  ops produce a deterministic sequence from this seed.
+   *
+   *  Note: this controls GPU random ops only. Checkpoint RNG replay
+   *  uses a separate system (_rngBasis) that is not affected. */
+  setRngSeed(seed: number): void {
+    this._rngCounter = seed;
+  }
+
+  /** @deprecated Use setRngSeed() instead. */
+  _debug_setRngBasis(basis: RngBasis): void {
+    this._rngBasis = { ...basis };
+    this._rngDrawNonce = 0;
+  }
+
+  _debug_getRngDrawNonce(): number {
+    return this._rngDrawNonce;
+  }
+
+  _debug_startCheckpointRecord(): void {
+    if (this._rngCheckpointMode) {
+      throw new Error("Checkpoint RNG already active");
+    }
+    this._rngCheckpointMode = "record";
+    this._rngCheckpointDraws = [];
+    this._rngCheckpointIndex = 0;
+  }
+
+  _debug_finishCheckpointRecord(): RngDrawRecord[] {
+    if (this._rngCheckpointMode !== "record") {
+      throw new Error("Checkpoint RNG record not active");
+    }
+    const draws = this._rngCheckpointDraws.slice();
+    this._rngCheckpointMode = null;
+    this._rngCheckpointDraws = [];
+    this._rngCheckpointIndex = 0;
+    return draws;
+  }
+
+  _debug_startCheckpointReplay(draws: RngDrawRecord[]): void {
+    if (this._rngCheckpointMode) {
+      throw new Error("Checkpoint RNG already active");
+    }
+    this._rngCheckpointMode = "replay";
+    this._rngCheckpointDraws = draws.slice();
+    this._rngCheckpointIndex = 0;
+  }
+
+  _debug_finishCheckpointReplay(): void {
+    if (this._rngCheckpointMode !== "replay") {
+      throw new Error("Checkpoint RNG replay not active");
+    }
+    this._rngCheckpointMode = null;
+    this._rngCheckpointDraws = [];
+    this._rngCheckpointIndex = 0;
+  }
+
+  _debug_random(opNonce: number, drawNonce?: number): RngDrawResult {
+    if (this._rngCheckpointMode === "replay") {
+      const record = this._rngCheckpointDraws[this._rngCheckpointIndex];
+      if (!record) {
+        throw new RngReplayExhaustedError("RNG replay exhausted");
+      }
+      if (record.opNonce !== opNonce) {
+        throw new RngReplayMismatchError("RNG replay opNonce mismatch");
+      }
+      if (drawNonce !== undefined && drawNonce !== record.drawNonce) {
+        throw new RngReplayMismatchError("RNG replay drawNonce mismatch");
+      }
+      this._rngCheckpointIndex += 1;
+      return { drawNonce: record.drawNonce, value: record.value };
+    }
+
+    const assignedDrawNonce = drawNonce ?? this._nextRngDrawNonce();
+    if (drawNonce !== undefined && drawNonce > this._rngDrawNonce) {
+      this._rngDrawNonce = drawNonce;
+    }
+    const value = computeRngValue(this._rngBasis, opNonce, assignedDrawNonce);
+
+    if (this._rngCheckpointMode === "record") {
+      this._rngCheckpointDraws.push({
+        opNonce,
+        drawNonce: assignedDrawNonce,
+        value,
+      });
+    }
+
+    return { drawNonce: assignedDrawNonce, value };
+  }
+
+  _debug_backward<T>(fn: () => T): T {
+    if (this._backwardActive) {
+      throw new NonReentrantBackwardError("Backward is already running");
+    }
+    this._backwardActive = true;
+    try {
+      return fn();
+    } finally {
+      this._backwardActive = false;
+    }
+  }
+
+  _debug_saveForBackward(baseId: EngineBaseId): SavedTensorRecord {
+    const state = this._getOrCreateBaseState(baseId);
+    const id = this._nextSavedTensorId++;
+    const record = {
+      id,
+      baseId,
+      baseCommitVersionAtSave: state.baseCommitVersion,
+    };
+
+    // Track for visibility
+    this._savedTensors.set(id, {
+      id,
+      baseId,
+      commitVersionAtSave: state.baseCommitVersion,
+      savedAt: Date.now(),
+    });
+
+    return record;
+  }
+
+  _debug_useSavedTensor(record: SavedTensorRecord): void {
+    const state = this._getOrCreateBaseState(record.baseId);
+    if (state.baseCommitVersion !== record.baseCommitVersionAtSave) {
+      throw new SavedTensorModifiedError(
+        `Saved tensor modified for baseId ${record.baseId}`,
+      );
+    }
+  }
+
+  /**
+   * Release a saved tensor from tracking (called after backward completes).
+   */
+  _debug_releaseSavedTensor(id: number): void {
+    this._savedTensors.delete(id);
+  }
+
+  /**
+   * Clear all saved tensor tracking (for cleanup after backward).
+   */
+  _debug_clearSavedTensors(): void {
+    this._savedTensors.clear();
+  }
+
+  compile<Args extends unknown[], R>(
+    fn: (...args: Args) => R,
+  ): (...args: Args) => R {
+    return (...args: Args) => {
+      let result: R;
+      result = fn(...args);
+
+      if (
+        result &&
+        typeof (result as unknown as Promise<unknown>).then === "function"
+      ) {
+        throw new AsyncInCompileError("Async work is not allowed in compile");
+      }
+
+      return result;
+    };
+  }
+
+  createTensor(baseId?: EngineBaseId): EngineTensor {
+    const resolvedBaseId = baseId ?? this._nextBaseId++;
+    if (resolvedBaseId >= this._nextBaseId) {
+      this._nextBaseId = resolvedBaseId + 1;
+    }
+    const origin: TensorOrigin =
+      this._tidyScopes.length > 0
+        ? {
+            kind: "tidy",
+            scopeId: this._tidyScopes[this._tidyScopes.length - 1].id,
+          }
+        : { kind: "global" };
+    const tensor = new EngineTensor(
+      this._nextTensorId++,
+      resolvedBaseId,
+      origin,
+    );
+    this._registerTensor(tensor);
+    this._etFinalizer.register(tensor, tensor.baseId, tensor);
+
+    return tensor;
+  }
+
+  forceRead(_baseId: EngineBaseId): void {
+    // No-op: token algebra and loc bindings removed.
+    // Callers use this as a barrier; actual read is done by the runtime.
+  }
+
+  tidy<T>(fn: () => T): T {
+    const scope: TidyScope = { id: this._nextScopeId++, tensors: new Set() };
+    this._tidyScopes.push(scope);
+    let result!: T;
+    let succeeded = false;
+
+    try {
+      result = fn();
+      succeeded = true;
+    } finally {
+      const escaped = succeeded ? collectTensorHandles(result) : [];
+      for (const tensor of escaped) {
+        tensor.escapes = true;
+      }
+
+      // Convert to array first since dispose() modifies scope.tensors
+      const tensorsToProcess = Array.from(scope.tensors);
+      for (const tensor of tensorsToProcess) {
+        if (!tensor.escapes) {
+          this.dispose(tensor);
+        }
+      }
+      this._tidyScopes.pop();
+    }
+
+    return result;
+  }
+
+  keep(tensor: EngineTensor): void {
+    if (tensor.disposed) {
+      return;
+    }
+    tensor.escapes = true;
+  }
+
+  dispose(tensor: EngineTensor): void {
+    if (tensor.disposed) {
+      return;
+    }
+    tensor.disposed = true;
+    // Unregister from FinalizationRegistry — we're handling cleanup explicitly
+    this._etFinalizer.unregister(tensor);
+    // Call disposal callback to free backend resources (GPU buffers, etc.)
+    if (tensor.onDispose) {
+      tensor.onDispose();
+    }
+    const count = this._basePinCount.get(tensor.baseId) ?? 0;
+    if (count <= 1) {
+      this._basePinCount.delete(tensor.baseId);
+    } else {
+      this._basePinCount.set(tensor.baseId, count - 1);
+    }
+    for (const scope of this._tidyScopes) {
+      scope.tensors.delete(tensor);
+    }
+  }
+
+  async markStep(): Promise<void> {
+    this._debug_runEntryPoint(() => {
+      // Clean up engine state that grows unboundedly across steps.
+      // _baseState: ~2000 entries/step from temporary tensors. Keep only
+      // entries with active pins (model params, optimizer state).
+      for (const [baseId] of this._baseState) {
+        if (!this._basePinCount.has(baseId)) {
+          this._baseState.delete(baseId);
+        }
+      }
+      // committed: mutation ID sets grow ~3/param/step. Clear them — the
+      // baseCommitVersion is preserved for saved-tensor version checking.
+      for (const [, state] of this._baseState) {
+        state.committed.clear();
+      }
+      // savedTensors: should be empty after backward, but ensure cleanup.
+      this._savedTensors.clear();
+    });
+  }
+
+  private _acquireExecLock(): void {
+    if (this._execLock.held) throw new EngineBusyError("Engine is busy");
+    this._execLock.held = true;
+    this._execLock.ownerId = this._nextOwnerId++;
+    this._execLock.depth = 1;
+    this._ensureNotPoisoned();
+  }
+
+  private _releaseExecLock(): void {
+    this._execLock.held = false;
+    this._execLock.ownerId = 0;
+    this._execLock.depth = 0;
+  }
+
+  _debug_runEntryPoint<T>(fn: () => T): T {
+    this._acquireExecLock();
+    try {
+      return fn();
+    } finally {
+      this._releaseExecLock();
+    }
+  }
+
+  async runEntryPoint<T>(fn: () => Promise<T>): Promise<T> {
+    this._acquireExecLock();
+    try {
+      return await fn();
+    } finally {
+      this._releaseExecLock();
+    }
+  }
+
+  /**
+   * Run an async function with an async scope context that tracks tensors
+   * across await boundaries. Tensors created during the async operation
+   * (but not within a synchronous tidy scope) are tracked and disposed
+   * when the scope exits, unless explicitly kept.
+   */
+  async runWithAsyncScope<T>(fn: () => Promise<T>): Promise<T> {
+    const scope: AsyncScope = {
+      id: this._nextScopeId++,
+      tensors: new Set(),
+    };
+
+    const previous = this._asyncScopeContext;
+    this._asyncScopeContext = scope;
+
+    try {
+      return await fn();
+    } finally {
+      this._asyncScopeContext = previous;
+
+      // Dispose all tensors in this scope that weren't kept
+      for (const tensor of scope.tensors) {
+        if (!tensor.escapes && !tensor.disposed) {
+          this.dispose(tensor);
+        }
+      }
+      // Release references so GC can collect disposed/escaped EngineTensors
+      // and their RuntimeTensors immediately. Without this, the scope.tensors
+      // Set holds strong refs until the scope local is GC'd, which may take
+      // many steps — causing a multi-step memory oscillation as storages
+      // accumulate between GC sweeps.
+      scope.tensors.clear();
+    }
+  }
+
+  _debug_poison(): void {
+    this._poisoned = true;
+  }
+
+  _debug_getBasePinCount(baseId: EngineBaseId): number {
+    return this._basePinCount.get(baseId) ?? 0;
+  }
+
+  /**
+   * Get the next unique mutation ID for in-place operations.
+   * Per spec §4.3, each in-place mutation needs a unique mutId.
+   */
+  nextMutId(): number {
+    return this._nextMutIdValue++;
+  }
+
+  _debug_baseCommit(baseId: EngineBaseId, mutId: number): void {
+    const state = this._getOrCreateBaseState(baseId);
+    if (state.committed.has(mutId)) {
+      throw new Error(`base_commit already recorded for mutId ${mutId}`);
+    }
+    state.committed.add(mutId);
+    state.baseCommitVersion += 1;
+  }
+
+  private _ensureNotPoisoned(): void {
+    if (this._poisoned) {
+      throw new PoisonedEngineError("Engine is poisoned");
+    }
+  }
+
+  private _nextRngDrawNonce(): number {
+    this._rngDrawNonce += 1;
+    return this._rngDrawNonce;
+  }
+
+  private _registerTensor(tensor: EngineTensor): void {
+    const count = this._basePinCount.get(tensor.baseId) ?? 0;
+    this._basePinCount.set(tensor.baseId, count + 1);
+
+    // Register in all active tidy scopes
+    for (const scope of this._tidyScopes) {
+      scope.tensors.add(tensor);
+    }
+
+    // If no tidy scope is active but async scope is, register there
+    if (this._tidyScopes.length === 0 && this._asyncScopeContext !== null) {
+      this._asyncScopeContext.tensors.add(tensor);
+    }
+  }
+
+  private _getOrCreateBaseState(baseId: EngineBaseId): BaseState {
+    const existing = this._baseState.get(baseId);
+    if (existing) {
+      return existing;
+    }
+    const initial: BaseState = {
+      baseCommitVersion: 0,
+      committed: new Set<number>(),
+    };
+    this._baseState.set(baseId, initial);
+    return initial;
+  }
+
+  // ============================================================================
+  // Engine Visibility Methods (Phase 1)
+  // ============================================================================
+
+  /**
+   * Set the memory stats provider for external memory tracking.
+   * This should be called by the runtime during initialization.
+   */
+  setMemoryStatsProvider(provider: MemoryStatsProvider): void {
+    this._memoryStatsProvider = provider;
+  }
+
+  /**
+   * Get comprehensive memory statistics.
+   */
+  _debug_getMemoryStats(): EngineMemoryStats {
+    const p = this._memoryStatsProvider;
+    const gpu = p?.getGPUStats?.() ?? {
+      currentBytes: 0,
+      peakBytes: 0,
+      limitBytes: 0,
+    };
+    const pool = p?.getBufferPoolStats?.() ?? {
+      pooledBuffers: 0,
+      inUseBuffers: 0,
+      pendingFenceBuffers: 0,
+    };
+    const plan = p?.getPlanStats?.() ?? { activePlans: 0, completedPlans: 0 };
+    let totalPinCount = 0;
+    for (const count of this._basePinCount.values()) totalPinCount += count;
+
+    return {
+      gpuCurrentBytes: gpu.currentBytes,
+      gpuPeakBytes: gpu.peakBytes,
+      gpuLimitBytes: gpu.limitBytes,
+      pooledBuffers: pool.pooledBuffers,
+      inUseBuffers: pool.inUseBuffers,
+      pendingFenceBuffers: pool.pendingFenceBuffers,
+      activeBases: this._basePinCount.size,
+      totalPinCount,
+      savedTensorCount: this._savedTensors.size,
+      pendingTensorCount: p?.getPendingTensorCount?.() ?? 0,
+      activePlans: plan.activePlans,
+      completedPlans: plan.completedPlans,
+    };
+  }
+
+  /**
+   * Get information about all currently saved tensors.
+   */
+  _debug_getSavedTensorsInfo(): SavedTensorInfo[] {
+    return Array.from(this._savedTensors.values());
+  }
+
+  /**
+   * Get information about all base states.
+   */
+  _debug_getBaseStatesInfo(): BaseStateInfo[] {
+    const infos: BaseStateInfo[] = [];
+
+    for (const [baseId, count] of this._basePinCount) {
+      infos.push({
+        baseId,
+        pinCount: count,
+        binding: "ssa",
+        locId: null,
+        hasValue: false,
+        commitVersion: this._baseState.get(baseId)?.baseCommitVersion ?? 0,
+      });
+    }
+
+    return infos;
+  }
+
+  /**
+   * Take a memory snapshot with a label.
+   */
+  _debug_takeMemorySnapshot(label: string): void {
+    this._memorySnapshots.push({
+      label,
+      timestamp: Date.now(),
+      stats: this._debug_getMemoryStats(),
+    });
+  }
+
+  /**
+   * Get all memory snapshots.
+   */
+  _debug_getMemorySnapshots(): MemorySnapshot[] {
+    return this._memorySnapshots.slice();
+  }
+
+  /**
+   * Clear all memory snapshots.
+   */
+  _debug_clearMemorySnapshots(): void {
+    this._memorySnapshots.length = 0;
+  }
+}
+
+// ============================================================================
+// Table-driven method generation — typed declarations + prototype installation
+// ============================================================================
+
+// Simple unary ops: all delegate to _unaryOp with no payload.
+const SIMPLE_UNARY_OPS = [
+  "sqrt",
+  "relu",
+  "exp",
+  "log",
+  "neg",
+  "abs",
+  "tanh",
+  "sigmoid",
+  "silu",
+  "sin",
+  "cos",
+  "rsqrt",
+  "floor",
+  "ceil",
+  "round",
+  "sign",
+  "isfinite",
+  "contiguous",
+] as const;
+
+export interface RuntimeEngine {
+  sqrt(a: Tensor): Tensor;
+  relu(a: Tensor): Tensor;
+  exp(a: Tensor): Tensor;
+  log(a: Tensor): Tensor;
+  neg(a: Tensor): Tensor;
+  abs(a: Tensor): Tensor;
+  tanh(a: Tensor): Tensor;
+  sigmoid(a: Tensor): Tensor;
+  silu(a: Tensor): Tensor;
+  sin(a: Tensor): Tensor;
+  cos(a: Tensor): Tensor;
+  rsqrt(a: Tensor): Tensor;
+  floor(a: Tensor): Tensor;
+  ceil(a: Tensor): Tensor;
+  round(a: Tensor): Tensor;
+  sign(a: Tensor): Tensor;
+  isfinite(a: Tensor): Tensor;
+  contiguous(a: Tensor): Tensor;
+}
+
+for (const op of SIMPLE_UNARY_OPS) {
+  (RuntimeEngine.prototype as any)[op] = function (
+    this: RuntimeEngine,
+    a: Tensor,
+  ) {
+    return this._unaryOp(op, a);
+  };
+}
+
+// Comparison ops: all delegate to _binaryOp.
+const COMPARISON_OPS = ["gt", "lt", "ge", "le", "eq", "ne"] as const;
+
+export interface RuntimeEngine {
+  gt(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  lt(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  ge(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  le(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  eq(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  ne(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+}
+
+for (const op of COMPARISON_OPS) {
+  (RuntimeEngine.prototype as any)[op] = function (
+    this: RuntimeEngine,
+    a: TensorOrScalar,
+    b: TensorOrScalar,
+  ) {
+    return this._binaryOp(op, a, b);
+  };
+}
+
+// Simple binary ops: gradient specs live in OP_REGISTRY, dispatch via _binaryOp.
+const SIMPLE_BINARY_OPS = ["add", "mul", "pow", "minimum", "maximum"] as const;
+
+export interface RuntimeEngine {
+  add(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  mul(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  pow(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  minimum(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+  maximum(a: TensorOrScalar, b: TensorOrScalar): Tensor;
+}
+
+for (const op of SIMPLE_BINARY_OPS) {
+  (RuntimeEngine.prototype as any)[op] = function (
+    this: RuntimeEngine,
+    a: TensorOrScalar,
+    b: TensorOrScalar,
+  ) {
+    return this._binaryOp(op, a, b);
+  };
+}
+
+// Reduction ops: dispatch via _reductionOp.
+const SIMPLE_REDUCTION_OPS = ["sum", "max", "min", "mean"] as const;
+
+export interface RuntimeEngine {
+  sum(a: Tensor, options?: SumOptions): Tensor;
+  max(a: Tensor, options?: MaxOptions): number | Tensor;
+  min(a: Tensor, options?: MinOptions): number | Tensor;
+  mean(a: Tensor, options?: MeanOptions): number | Tensor;
+}
+
+for (const op of SIMPLE_REDUCTION_OPS) {
+  (RuntimeEngine.prototype as any)[op] = function (
+    this: RuntimeEngine,
+    a: Tensor,
+    options?: any,
+  ) {
+    return this._reductionOp(op, a, options);
+  };
+}
+
+// Arg-reduce ops: dispatch via _argReduceOp.
+const ARG_REDUCE_OPS = ["argmax", "argmin"] as const;
+
+export interface RuntimeEngine {
+  argmax(a: Tensor, options: ArgReduceOptions): Tensor;
+  argmin(a: Tensor, options: ArgReduceOptions): Tensor;
+}
+
+for (const op of ARG_REDUCE_OPS) {
+  (RuntimeEngine.prototype as any)[op] = function (
+    this: RuntimeEngine,
+    a: Tensor,
+    options: ArgReduceOptions,
+  ) {
+    return this._argReduceOp(op, a, options);
+  };
 }

@@ -1,43 +1,37 @@
 /**
- * Integration tests for §15 - IR Optimization and Fusion
+ * Integration tests for §15 - Fusion Detection and Optimized Execution
  *
  * These tests verify:
- * - CSE (Common Subexpression Elimination) works
- * - DCE (Dead Code Elimination) works
  * - Fusion detection identifies fusible op chains
  * - Optimized execution produces correct results
  */
 
-import { describe, expect, it, beforeEach } from "vitest";
-import { RuntimeEngine } from "../src/runtime/engine";
-import { tensorFromArray } from "../src/runtime/engine-facade";
-import { createBaseId, Tensor, resetBaseIdCounter } from "../src/runtime/tensor";
-import {
-  buildPlan,
-  createLazyIRNode,
-  createPendingRef,
-  executePlanOptimized,
-  resetNodeIdCounter,
-  resetStorageIdCounter,
-  type LazyIRNode,
-} from "../src/engine/lazy";
+import { beforeEach, describe, expect, it } from "vitest";
+import { getBackend } from "../src/backend/registry";
+import type { Backend } from "../src/backend/types";
+import { executePlanOptimized } from "../src/executor/executor";
 import {
   detectFusionGroups,
   groupToRecipe,
-  hasFusionOpportunities,
-  hasFusionPotential,
+  isFusibleOp,
   reorderPlanForFusion,
   segmentPlanForExecution,
-  isFusibleOp,
-} from "../src/engine/fusion-detect";
+} from "../src/compiler/fusion-detect";
+import type { LazyIRNode, LazyRef } from "../src/graph/types";
+import { createPendingRef } from "../src/graph/types";
 import {
-  lazyPlanToIR,
-  detectFusionGroups as detectFusionGroupsIR,
-  isFusibleElementwise,
-} from "../src/engine/lazy-to-ir";
-import { performCSE, performDCE, optimizeIR } from "../src/engine/ir-optimize";
-import type { IRGraph, IRNode } from "../src/engine/ir";
-import { getBackend } from "../src/backend/registry";
+  createLazyIRNode,
+  resetNodeIdCounter,
+  resetStorageIdCounter,
+} from "../src/graph/node-factory";
+import { buildPlan } from "../src/executor/plan-builder";
+import { RuntimeEngine } from "../src/runtime/engine";
+import { resetBaseIdCounter, type Tensor } from "../src/runtime/tensor";
+
+function getPendingNode(ref: LazyRef): LazyIRNode {
+  if (ref.kind !== "pending") throw new Error("Expected pending LazyRef");
+  return ref.node;
+}
 
 describe("§15 Fusion Detection", () => {
   beforeEach(() => {
@@ -67,11 +61,33 @@ describe("§15 Fusion Detection", () => {
 
   describe("detectFusionGroups", () => {
     it("detects consecutive elementwise ops", () => {
-      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const b = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [5, 6, 7, 8] });
-      const add = createLazyIRNode("add", [createPendingRef(a), createPendingRef(b)], [4], "f32", "cpu");
-      const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(b)], [4], "f32", "cpu");
-      const sqrt = createLazyIRNode("sqrt", [createPendingRef(mul)], [4], "f32", "cpu");
+      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [1, 2, 3, 4],
+      });
+      const b = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [5, 6, 7, 8],
+      });
+      const add = createLazyIRNode(
+        "add",
+        [createPendingRef(a), createPendingRef(b)],
+        [4],
+        "f32",
+        "cpu",
+      );
+      const mul = createLazyIRNode(
+        "mul",
+        [createPendingRef(add), createPendingRef(b)],
+        [4],
+        "f32",
+        "cpu",
+      );
+      const sqrt = createLazyIRNode(
+        "sqrt",
+        [createPendingRef(mul)],
+        [4],
+        "f32",
+        "cpu",
+      );
 
       const nodes = [a, b, add, mul, sqrt];
       const result = detectFusionGroups(nodes);
@@ -83,11 +99,37 @@ describe("§15 Fusion Detection", () => {
     });
 
     it("breaks groups on non-fusible ops", () => {
-      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const add = createLazyIRNode("add", [createPendingRef(a), createPendingRef(a)], [4], "f32", "cpu");
-      const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(a)], [4], "f32", "cpu");
-      const sum = createLazyIRNode("sum", [createPendingRef(mul)], [], "f32", "cpu"); // Non-fusible
-      const sqrt = createLazyIRNode("sqrt", [createPendingRef(sum)], [], "f32", "cpu");
+      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [1, 2, 3, 4],
+      });
+      const add = createLazyIRNode(
+        "add",
+        [createPendingRef(a), createPendingRef(a)],
+        [4],
+        "f32",
+        "cpu",
+      );
+      const mul = createLazyIRNode(
+        "mul",
+        [createPendingRef(add), createPendingRef(a)],
+        [4],
+        "f32",
+        "cpu",
+      );
+      const sum = createLazyIRNode(
+        "sum",
+        [createPendingRef(mul)],
+        [],
+        "f32",
+        "cpu",
+      ); // Non-fusible
+      const sqrt = createLazyIRNode(
+        "sqrt",
+        [createPendingRef(sum)],
+        [],
+        "f32",
+        "cpu",
+      );
 
       const nodes = [a, add, mul, sum, sqrt];
       const result = detectFusionGroups(nodes);
@@ -99,8 +141,16 @@ describe("§15 Fusion Detection", () => {
     });
 
     it("requires minimum 2 ops for a group", () => {
-      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const sqrt = createLazyIRNode("sqrt", [createPendingRef(a)], [4], "f32", "cpu");
+      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [1, 2, 3, 4],
+      });
+      const sqrt = createLazyIRNode(
+        "sqrt",
+        [createPendingRef(a)],
+        [4],
+        "f32",
+        "cpu",
+      );
 
       const nodes = [a, sqrt];
       const result = detectFusionGroups(nodes);
@@ -111,31 +161,28 @@ describe("§15 Fusion Detection", () => {
     });
   });
 
-  describe("hasFusionOpportunities", () => {
-    it("returns true when 2+ consecutive fusible ops exist", () => {
-      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1] });
-      const add = createLazyIRNode("add", [createPendingRef(a), createPendingRef(a)], [4], "f32", "cpu");
-      const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(a)], [4], "f32", "cpu");
-
-      expect(hasFusionOpportunities([a, add, mul])).toBe(true);
-    });
-
-    it("returns false when no consecutive fusible ops", () => {
-      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1] });
-      const add = createLazyIRNode("add", [createPendingRef(a), createPendingRef(a)], [4], "f32", "cpu");
-      const sum = createLazyIRNode("sum", [createPendingRef(add)], [], "f32", "cpu");
-      const sqrt = createLazyIRNode("sqrt", [createPendingRef(sum)], [], "f32", "cpu");
-
-      expect(hasFusionOpportunities([a, add, sum, sqrt])).toBe(false);
-    });
-  });
-
   describe("segmentPlanForExecution", () => {
     it("segments plan into fused and sequential parts", () => {
-      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const b = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [5, 6, 7, 8] });
-      const add = createLazyIRNode("add", [createPendingRef(a), createPendingRef(b)], [4], "f32", "cpu");
-      const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(b)], [4], "f32", "cpu");
+      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [1, 2, 3, 4],
+      });
+      const b = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [5, 6, 7, 8],
+      });
+      const add = createLazyIRNode(
+        "add",
+        [createPendingRef(a), createPendingRef(b)],
+        [4],
+        "f32",
+        "cpu",
+      );
+      const mul = createLazyIRNode(
+        "mul",
+        [createPendingRef(add), createPendingRef(b)],
+        [4],
+        "f32",
+        "cpu",
+      );
 
       const nodes = [a, b, add, mul];
       const segments = segmentPlanForExecution(nodes);
@@ -153,15 +200,49 @@ describe("§15 Fusion Detection", () => {
       // ext0, ext1 → add → (+ ext2) mul → (+ ext3) add → (+ ext4) mul → output
       // That's 5 external inputs + 1 output = 6 buffers.
       // With maxStorageBuffers=4, max 3 external inputs, should split.
-      const ext0 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const ext1 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const ext2 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const ext3 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const ext4 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const add1 = createLazyIRNode("add", [createPendingRef(ext0), createPendingRef(ext1)], [4], "f32", "cpu");
-      const mul1 = createLazyIRNode("mul", [createPendingRef(add1), createPendingRef(ext2)], [4], "f32", "cpu");
-      const add2 = createLazyIRNode("add", [createPendingRef(mul1), createPendingRef(ext3)], [4], "f32", "cpu");
-      const mul2 = createLazyIRNode("mul", [createPendingRef(add2), createPendingRef(ext4)], [4], "f32", "cpu");
+      const ext0 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [1, 2, 3, 4],
+      });
+      const ext1 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [1, 2, 3, 4],
+      });
+      const ext2 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [1, 2, 3, 4],
+      });
+      const ext3 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [1, 2, 3, 4],
+      });
+      const ext4 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [1, 2, 3, 4],
+      });
+      const add1 = createLazyIRNode(
+        "add",
+        [createPendingRef(ext0), createPendingRef(ext1)],
+        [4],
+        "f32",
+        "cpu",
+      );
+      const mul1 = createLazyIRNode(
+        "mul",
+        [createPendingRef(add1), createPendingRef(ext2)],
+        [4],
+        "f32",
+        "cpu",
+      );
+      const add2 = createLazyIRNode(
+        "add",
+        [createPendingRef(mul1), createPendingRef(ext3)],
+        [4],
+        "f32",
+        "cpu",
+      );
+      const mul2 = createLazyIRNode(
+        "mul",
+        [createPendingRef(add2), createPendingRef(ext4)],
+        [4],
+        "f32",
+        "cpu",
+      );
 
       const nodes = [ext0, ext1, ext2, ext3, ext4, add1, mul1, add2, mul2];
 
@@ -173,7 +254,9 @@ describe("§15 Fusion Detection", () => {
 
       // With maxStorageBuffers=4 (max 3 external inputs per group):
       // Should split into sub-groups that each fit
-      const limited = detectFusionGroups(nodes, undefined, { maxStorageBuffers: 4 });
+      const limited = detectFusionGroups(nodes, undefined, {
+        maxStorageBuffers: 4,
+      });
       expect(limited.groups.length).toBeGreaterThan(1);
       for (const group of limited.groups) {
         expect(group.externalInputs.length).toBeLessThanOrEqual(3);
@@ -182,14 +265,32 @@ describe("§15 Fusion Detection", () => {
     });
 
     it("does not split groups that fit within limit", () => {
-      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const b = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [5, 6, 7, 8] });
-      const add = createLazyIRNode("add", [createPendingRef(a), createPendingRef(b)], [4], "f32", "cpu");
-      const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(b)], [4], "f32", "cpu");
+      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [1, 2, 3, 4],
+      });
+      const b = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [5, 6, 7, 8],
+      });
+      const add = createLazyIRNode(
+        "add",
+        [createPendingRef(a), createPendingRef(b)],
+        [4],
+        "f32",
+        "cpu",
+      );
+      const mul = createLazyIRNode(
+        "mul",
+        [createPendingRef(add), createPendingRef(b)],
+        [4],
+        "f32",
+        "cpu",
+      );
 
       const nodes = [a, b, add, mul];
       // 2 external inputs + 1 output = 3 buffers, limit is 8
-      const result = detectFusionGroups(nodes, undefined, { maxStorageBuffers: 8 });
+      const result = detectFusionGroups(nodes, undefined, {
+        maxStorageBuffers: 8,
+      });
       expect(result.groups.length).toBe(1);
       expect(result.groups[0].nodes.length).toBe(2);
     });
@@ -197,10 +298,26 @@ describe("§15 Fusion Detection", () => {
 
   describe("groupToRecipe", () => {
     it("converts fusion group to recipe", () => {
-      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const b = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [5, 6, 7, 8] });
-      const add = createLazyIRNode("add", [createPendingRef(a), createPendingRef(b)], [4], "f32", "cpu");
-      const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(b)], [4], "f32", "cpu");
+      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [1, 2, 3, 4],
+      });
+      const b = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [5, 6, 7, 8],
+      });
+      const add = createLazyIRNode(
+        "add",
+        [createPendingRef(a), createPendingRef(b)],
+        [4],
+        "f32",
+        "cpu",
+      );
+      const mul = createLazyIRNode(
+        "mul",
+        [createPendingRef(add), createPendingRef(b)],
+        [4],
+        "f32",
+        "cpu",
+      );
 
       const nodes = [a, b, add, mul];
       const result = detectFusionGroups(nodes);
@@ -212,149 +329,6 @@ describe("§15 Fusion Detection", () => {
       expect(recipe.inputs.length).toBeGreaterThan(0);
       expect(recipe.outputs.length).toBe(1);
       expect(recipe.outputs[0].nodeId).toBe(mul.id);
-    });
-  });
-});
-
-describe("§15 IR Optimization", () => {
-  describe("CSE (Common Subexpression Elimination)", () => {
-    it("eliminates duplicate pure ops", () => {
-      const graph: IRGraph = {
-        epoch: 1,
-        nodes: [
-          { id: 1, op: "add", epoch: 1, kind: "lazy_op", inputs: [], shape: [4], dtype: "f32" },
-          { id: 2, op: "add", epoch: 1, kind: "lazy_op", inputs: [], shape: [4], dtype: "f32" }, // Duplicate
-          { id: 3, op: "mul", epoch: 1, kind: "lazy_op", inputs: [1], shape: [4], dtype: "f32" },
-        ],
-        fusionGroups: [],
-      };
-
-      const result = performCSE(graph);
-
-      expect(result.eliminatedNodes.length).toBe(1);
-      expect(result.eliminatedNodes).toContain(2);
-      expect(result.stats.eliminatedCount).toBe(1);
-    });
-
-    it("does not eliminate random ops", () => {
-      const graph: IRGraph = {
-        epoch: 1,
-        nodes: [
-          { id: 1, op: "rand", epoch: 1, kind: "lazy_op", inputs: [], shape: [4], dtype: "f32" },
-          { id: 2, op: "rand", epoch: 1, kind: "lazy_op", inputs: [], shape: [4], dtype: "f32" }, // Same but random
-        ],
-        fusionGroups: [],
-      };
-
-      const result = performCSE(graph);
-
-      expect(result.eliminatedNodes.length).toBe(0);
-      expect(result.optimizedGraph.nodes.length).toBe(2);
-    });
-  });
-
-  describe("DCE (Dead Code Elimination)", () => {
-    it("removes unreachable nodes", () => {
-      const graph: IRGraph = {
-        epoch: 1,
-        nodes: [
-          { id: 1, op: "add", epoch: 1, kind: "lazy_op", inputs: [], shape: [4], dtype: "f32" },
-          { id: 2, op: "mul", epoch: 1, kind: "lazy_op", inputs: [1], shape: [4], dtype: "f32" },
-          { id: 3, op: "sqrt", epoch: 1, kind: "lazy_op", inputs: [], shape: [4], dtype: "f32" }, // Dead
-        ],
-        fusionGroups: [],
-      };
-
-      const result = performDCE(graph, [2]); // Only node 2 is output
-
-      expect(result.eliminatedNodes).toContain(3);
-      expect(result.optimizedGraph.nodes.length).toBe(2);
-    });
-
-    it("keeps effectful ops", () => {
-      const graph: IRGraph = {
-        epoch: 1,
-        nodes: [
-          { id: 1, op: "add", epoch: 1, kind: "lazy_op", inputs: [], shape: [4], dtype: "f32" },
-          { id: 2, op: "add_", epoch: 1, kind: "lazy_op", inputs: [1], shape: [4], dtype: "f32" }, // Effectful
-        ],
-        fusionGroups: [],
-      };
-
-      const result = performDCE(graph, [1]);
-
-      // add_ is effectful, so should be kept
-      expect(result.optimizedGraph.nodes.length).toBe(2);
-    });
-  });
-
-  describe("optimizeIR (full pipeline)", () => {
-    it("applies CSE and DCE together", () => {
-      const graph: IRGraph = {
-        epoch: 1,
-        nodes: [
-          { id: 1, op: "add", epoch: 1, kind: "lazy_op", inputs: [], shape: [4], dtype: "f32" },
-          { id: 2, op: "add", epoch: 1, kind: "lazy_op", inputs: [], shape: [4], dtype: "f32" }, // CSE target
-          { id: 3, op: "mul", epoch: 1, kind: "lazy_op", inputs: [1], shape: [4], dtype: "f32" }, // Uses 1
-          { id: 4, op: "sqrt", epoch: 1, kind: "lazy_op", inputs: [], shape: [4], dtype: "f32" }, // DCE target
-        ],
-        fusionGroups: [],
-      };
-
-      const result = optimizeIR(graph, { outputNodeIds: [3] });
-
-      expect(result.stats.cseEliminated).toBe(1);
-      expect(result.stats.dceEliminated).toBe(1);
-      expect(result.stats.finalNodeCount).toBe(2);
-    });
-  });
-});
-
-describe("§15 Lazy Plan to IR Conversion", () => {
-  beforeEach(() => {
-    resetNodeIdCounter();
-    resetStorageIdCounter();
-  });
-
-  describe("lazyPlanToIR", () => {
-    it("converts lazy plan nodes to IR graph", () => {
-      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const b = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [5, 6, 7, 8] });
-      const add = createLazyIRNode("add", [createPendingRef(a), createPendingRef(b)], [4], "f32", "cpu");
-
-      const plan = { nodes: [a, b, add] };
-      const result = lazyPlanToIR(plan);
-
-      expect(result.graph.nodes.length).toBe(3);
-      expect(result.outputNodeIds).toEqual([add.id]);
-    });
-
-    it("detects fusion groups in converted IR", () => {
-      const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-      const add = createLazyIRNode("add", [createPendingRef(a), createPendingRef(a)], [4], "f32", "cpu");
-      const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(a)], [4], "f32", "cpu");
-
-      const plan = { nodes: [a, add, mul] };
-      const result = lazyPlanToIR(plan);
-
-      expect(result.graph.fusionGroups.length).toBe(1);
-      expect(result.graph.fusionGroups[0].nodeIds).toContain(add.id);
-      expect(result.graph.fusionGroups[0].nodeIds).toContain(mul.id);
-    });
-  });
-
-  describe("isFusibleElementwise", () => {
-    it("identifies fusible ops", () => {
-      expect(isFusibleElementwise("add")).toBe(true);
-      expect(isFusibleElementwise("mul")).toBe(true);
-      expect(isFusibleElementwise("sqrt")).toBe(true);
-      expect(isFusibleElementwise("relu")).toBe(true);
-    });
-
-    it("rejects non-fusible ops", () => {
-      expect(isFusibleElementwise("matmul")).toBe(false);
-      expect(isFusibleElementwise("sum")).toBe(false);
-      expect(isFusibleElementwise("reshape")).toBe(false);
     });
   });
 });
@@ -375,10 +349,12 @@ describe("§15 Optimized Execution", () => {
       const b = engine.tensorFromArray([5, 6, 7, 8], [4]);
       const c = engine.add(a, b);
 
-      const plan = buildPlan(c.lazyRef.kind === "pending" ? c.lazyRef.node : null as any);
-      const backend = getBackend("cpu")!;
+      const plan = buildPlan(getPendingNode(c.lazyRef));
+      const backend = getBackend("cpu") as Backend;
 
-      const result = await executePlanOptimized(plan, backend, { enableFusion: false });
+      const result = await executePlanOptimized(plan, backend, {
+        enableFusion: false,
+      });
 
       expect(result.stats.fusionEnabled).toBe(false);
       expect(result.stats.sequentialNodes).toBe(plan.nodes.length);
@@ -390,11 +366,13 @@ describe("§15 Optimized Execution", () => {
       const c = engine.add(a, b);
       const d = engine.mul(c, b);
 
-      const plan = buildPlan(d.lazyRef.kind === "pending" ? d.lazyRef.node : null as any);
-      const backend = getBackend("cpu")!;
+      const plan = buildPlan(getPendingNode(d.lazyRef));
+      const backend = getBackend("cpu") as Backend;
 
       // CPU backend doesn't support fusion, but should detect the opportunity
-      const result = await executePlanOptimized(plan, backend, { enableFusion: true });
+      const result = await executePlanOptimized(plan, backend, {
+        enableFusion: true,
+      });
 
       expect(result.stats.fusionEnabled).toBe(true);
       // Stats will show what was attempted
@@ -404,16 +382,17 @@ describe("§15 Optimized Execution", () => {
     it("produces correct results with fusion detection", async () => {
       const a = engine.tensorFromArray([1, 2, 3, 4], [4]);
       const b = engine.tensorFromArray([2, 2, 2, 2], [4]);
-      const c = engine.add(a, b);   // [3, 4, 5, 6]
-      const d = engine.mul(c, b);   // [6, 8, 10, 12]
+      const c = engine.add(a, b); // [3, 4, 5, 6]
+      const d = engine.mul(c, b); // [6, 8, 10, 12]
 
-      const plan = buildPlan(d.lazyRef.kind === "pending" ? d.lazyRef.node : null as any);
-      const backend = getBackend("cpu")!;
+      const plan = buildPlan(getPendingNode(d.lazyRef));
+      const backend = getBackend("cpu") as Backend;
 
       await executePlanOptimized(plan, backend, { enableFusion: true });
 
       // Verify result
-      const result = await backend.ops.read(d.lazyRef.kind === "pending" ? d.lazyRef.node.result!.backendTensor : (d.lazyRef as any).storage.backendTensor);
+      const node = getPendingNode(d.lazyRef);
+      const result = await backend.ops.read(node.result?.backendTensor);
       expect(result).toEqual([6, 8, 10, 12]);
     });
   });
@@ -450,14 +429,14 @@ describe("§15 RuntimeEngine Fusion Integration", () => {
 
     const stats = engine.getLastFusionStats();
     expect(stats).not.toBeNull();
-    expect(stats!.totalNodes).toBeGreaterThan(0);
+    expect(stats?.totalNodes).toBeGreaterThan(0);
   });
 
   it("produces correct results with fusion enabled", async () => {
     const a = engine.tensorFromArray([1, 2, 3, 4], [4]);
     const b = engine.tensorFromArray([2, 2, 2, 2], [4]);
-    const c = engine.add(a, b);   // [3, 4, 5, 6]
-    const d = engine.mul(c, b);   // [6, 8, 10, 12]
+    const c = engine.add(a, b); // [3, 4, 5, 6]
+    const d = engine.mul(c, b); // [6, 8, 10, 12]
 
     const result = await engine.cpu(d);
     expect(result).toEqual([6, 8, 10, 12]);
@@ -468,11 +447,11 @@ describe("§15 RuntimeEngine Fusion Integration", () => {
     const b = engine.tensorFromArray([2, 2, 2, 2], [4]);
 
     // Chain: add -> mul -> sqrt -> add -> mul
-    const c1 = engine.add(a, b);     // [3, 4, 5, 6]
-    const c2 = engine.mul(c1, b);    // [6, 8, 10, 12]
-    const c3 = engine.sqrt(c2);      // [2.45, 2.83, 3.16, 3.46]
-    const c4 = engine.add(c3, a);    // [3.45, 4.83, 6.16, 7.46]
-    const c5 = engine.mul(c4, b);    // [6.9, 9.66, 12.32, 14.93]
+    const c1 = engine.add(a, b); // [3, 4, 5, 6]
+    const c2 = engine.mul(c1, b); // [6, 8, 10, 12]
+    const c3 = engine.sqrt(c2); // [2.45, 2.83, 3.16, 3.46]
+    const c4 = engine.add(c3, a); // [3.45, 4.83, 6.16, 7.46]
+    const c5 = engine.mul(c4, b); // [6.9, 9.66, 12.32, 14.93]
 
     const result = await engine.cpu(c5);
 
@@ -488,9 +467,9 @@ describe("§15 RuntimeEngine Fusion Integration", () => {
     const b = engine.tensorFromArray([2, 2, 2, 2], [4]);
 
     // Chain with sum (non-fusible) in the middle
-    const c1 = engine.add(a, b);     // [3, 4, 5, 6] - fusible
-    const c2 = engine.mul(c1, b);    // [6, 8, 10, 12] - fusible
-    const sumResult = engine.sum(c2) as Tensor;  // 36 - breaks fusion
+    const c1 = engine.add(a, b); // [3, 4, 5, 6] - fusible
+    const c2 = engine.mul(c1, b); // [6, 8, 10, 12] - fusible
+    const sumResult = engine.sum(c2) as Tensor; // 36 - breaks fusion
 
     const result = await engine.cpu(sumResult);
     expect(result).toEqual([36]);
@@ -509,11 +488,33 @@ describe("§15 reorderPlanForFusion", () => {
     //        ext1 → sum (non-fusible, independent)
     // DFS order might interleave: [ext0, ext1, add, sum, mul]
     // Reordering should cluster: [ext0, ext1, add, mul, sum] or similar valid order
-    const ext0 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const ext1 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [5, 6, 7, 8] });
-    const add = createLazyIRNode("add", [createPendingRef(ext0), createPendingRef(ext1)], [4], "f32", "cpu");
-    const sum = createLazyIRNode("sum", [createPendingRef(ext1)], [], "f32", "cpu");
-    const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(ext0)], [4], "f32", "cpu");
+    const ext0 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const ext1 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [5, 6, 7, 8],
+    });
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(ext0), createPendingRef(ext1)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const sum = createLazyIRNode(
+      "sum",
+      [createPendingRef(ext1)],
+      [],
+      "f32",
+      "cpu",
+    );
+    const mul = createLazyIRNode(
+      "mul",
+      [createPendingRef(add), createPendingRef(ext0)],
+      [4],
+      "f32",
+      "cpu",
+    );
 
     // Simulate DFS order that interleaves: ext0, ext1, add, sum, mul
     const dfsOrder = [ext0, ext1, add, sum, mul];
@@ -530,10 +531,30 @@ describe("§15 reorderPlanForFusion", () => {
 
   it("preserves topological order", () => {
     // Diamond: a → b, a → c, b → d, c → d
-    const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const b = createLazyIRNode("add", [createPendingRef(a), createPendingRef(a)], [4], "f32", "cpu");
-    const c = createLazyIRNode("mul", [createPendingRef(a), createPendingRef(a)], [4], "f32", "cpu");
-    const d = createLazyIRNode("add", [createPendingRef(b), createPendingRef(c)], [4], "f32", "cpu");
+    const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const b = createLazyIRNode(
+      "add",
+      [createPendingRef(a), createPendingRef(a)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const c = createLazyIRNode(
+      "mul",
+      [createPendingRef(a), createPendingRef(a)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const d = createLazyIRNode(
+      "add",
+      [createPendingRef(b), createPendingRef(c)],
+      [4],
+      "f32",
+      "cpu",
+    );
 
     const nodes = [a, b, c, d];
     const reordered = reorderPlanForFusion(nodes);
@@ -545,14 +566,16 @@ describe("§15 reorderPlanForFusion", () => {
     }
 
     // All dependencies come before dependents
-    expect(pos.get(a.id)!).toBeLessThan(pos.get(b.id)!);
-    expect(pos.get(a.id)!).toBeLessThan(pos.get(c.id)!);
-    expect(pos.get(b.id)!).toBeLessThan(pos.get(d.id)!);
-    expect(pos.get(c.id)!).toBeLessThan(pos.get(d.id)!);
+    expect(pos.get(a.id) as number).toBeLessThan(pos.get(b.id) as number);
+    expect(pos.get(a.id) as number).toBeLessThan(pos.get(c.id) as number);
+    expect(pos.get(b.id) as number).toBeLessThan(pos.get(d.id) as number);
+    expect(pos.get(c.id) as number).toBeLessThan(pos.get(d.id) as number);
   });
 
   it("returns unchanged plan when no fusible ops", () => {
-    const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
+    const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
     const s = createLazyIRNode("sum", [createPendingRef(a)], [], "f32", "cpu");
     const m = createLazyIRNode("mean", [createPendingRef(a)], [], "f32", "cpu");
 
@@ -567,10 +590,18 @@ describe("§15 reorderPlanForFusion", () => {
   it("handles empty and single-node plans", () => {
     expect(reorderPlanForFusion([])).toEqual([]);
 
-    const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1] });
+    const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1],
+    });
     expect(reorderPlanForFusion([a])).toEqual([a]);
 
-    const b = createLazyIRNode("add", [createPendingRef(a), createPendingRef(a)], [4], "f32", "cpu");
+    const b = createLazyIRNode(
+      "add",
+      [createPendingRef(a), createPendingRef(a)],
+      [4],
+      "f32",
+      "cpu",
+    );
     expect(reorderPlanForFusion([a, b])).toEqual([a, b]);
   });
 
@@ -614,12 +645,36 @@ describe("§15 reorderPlanForFusion", () => {
     // The fundamental issue: generalized pass-through eliminates most cases
     // where reorder was needed. Keep the test simpler and just verify
     // reorder >= detect-alone (the old invariant, now often equal).
-    const ext0 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const ext1 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [5, 6, 7, 8] });
-    const ext2 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [9, 10, 11, 12] });
-    const add = createLazyIRNode("add", [createPendingRef(ext0), createPendingRef(ext1)], [4], "f32", "cpu");
-    const sum = createLazyIRNode("sum", [createPendingRef(ext2)], [], "f32", "cpu");
-    const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(ext0)], [4], "f32", "cpu");
+    const ext0 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const ext1 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [5, 6, 7, 8],
+    });
+    const ext2 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [9, 10, 11, 12],
+    });
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(ext0), createPendingRef(ext1)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const sum = createLazyIRNode(
+      "sum",
+      [createPendingRef(ext2)],
+      [],
+      "f32",
+      "cpu",
+    );
+    const mul = createLazyIRNode(
+      "mul",
+      [createPendingRef(add), createPendingRef(ext0)],
+      [4],
+      "f32",
+      "cpu",
+    );
 
     // DFS order that separates add and mul with sum
     const dfsOrder = [ext0, ext1, ext2, add, sum, mul];
@@ -637,57 +692,66 @@ describe("§15 reorderPlanForFusion", () => {
   });
 
   it("deterministic ordering", () => {
-    const ext0 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1] });
-    const ext1 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [2] });
-    const add = createLazyIRNode("add", [createPendingRef(ext0), createPendingRef(ext1)], [4], "f32", "cpu");
-    const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(ext0)], [4], "f32", "cpu");
-    const sum = createLazyIRNode("sum", [createPendingRef(ext1)], [], "f32", "cpu");
+    const ext0 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1],
+    });
+    const ext1 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [2],
+    });
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(ext0), createPendingRef(ext1)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const mul = createLazyIRNode(
+      "mul",
+      [createPendingRef(add), createPendingRef(ext0)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const sum = createLazyIRNode(
+      "sum",
+      [createPendingRef(ext1)],
+      [],
+      "f32",
+      "cpu",
+    );
 
     const nodes = [ext0, ext1, add, sum, mul];
 
     const r1 = reorderPlanForFusion(nodes);
     const r2 = reorderPlanForFusion(nodes);
 
-    expect(r1.map(n => n.id)).toEqual(r2.map(n => n.id));
+    expect(r1.map((n) => n.id)).toEqual(r2.map((n) => n.id));
   });
 
   it("handles materialized refs correctly", () => {
     // Node with a materialized input (already computed)
-    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const add = createLazyIRNode("add", [createPendingRef(ext), createPendingRef(ext)], [4], "f32", "cpu");
-    const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(ext)], [4], "f32", "cpu");
+    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(ext), createPendingRef(ext)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const mul = createLazyIRNode(
+      "mul",
+      [createPendingRef(add), createPendingRef(ext)],
+      [4],
+      "f32",
+      "cpu",
+    );
 
     // Should not crash with materialized refs
     const nodes = [ext, add, mul];
     const reordered = reorderPlanForFusion(nodes);
     expect(reordered.length).toBe(3);
-  });
-});
-
-describe("§15 hasFusionPotential", () => {
-  beforeEach(() => {
-    resetNodeIdCounter();
-    resetStorageIdCounter();
-  });
-
-  it("returns true when 2+ fusible ops exist anywhere", () => {
-    const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1] });
-    const add = createLazyIRNode("add", [createPendingRef(a), createPendingRef(a)], [4], "f32", "cpu");
-    const sum = createLazyIRNode("sum", [createPendingRef(add)], [], "f32", "cpu");
-    const mul = createLazyIRNode("mul", [createPendingRef(sum), createPendingRef(sum)], [], "f32", "cpu");
-
-    // add and mul are NOT consecutive (sum breaks them), but hasFusionPotential returns true
-    expect(hasFusionPotential([a, add, sum, mul])).toBe(true);
-    // hasFusionOpportunities requires consecutive — returns false
-    expect(hasFusionOpportunities([a, add, sum, mul])).toBe(false);
-  });
-
-  it("returns false when fewer than 2 fusible ops", () => {
-    const a = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1] });
-    const add = createLazyIRNode("add", [createPendingRef(a), createPendingRef(a)], [4], "f32", "cpu");
-    const sum = createLazyIRNode("sum", [createPendingRef(add)], [], "f32", "cpu");
-
-    expect(hasFusionPotential([a, add, sum])).toBe(false);
   });
 });
 
@@ -699,51 +763,117 @@ describe("§15 Multi-output Fusion Groups", () => {
   });
 
   it("keeps group intact when intermediate is externally referenced with same shape", () => {
-    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const add = createLazyIRNode("add", [createPendingRef(ext), createPendingRef(ext)], [4], "f32", "cpu");
-    const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(ext)], [4], "f32", "cpu");
-    const sqrt = createLazyIRNode("sqrt", [createPendingRef(mul)], [4], "f32", "cpu");
+    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(ext), createPendingRef(ext)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const mul = createLazyIRNode(
+      "mul",
+      [createPendingRef(add), createPendingRef(ext)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const sqrt = createLazyIRNode(
+      "sqrt",
+      [createPendingRef(mul)],
+      [4],
+      "f32",
+      "cpu",
+    );
 
     const nodes = [ext, add, mul, sqrt];
 
     // Without multi-output: add is external → group gets split
     const external = new Set([add.id]);
-    const withoutMO = detectFusionGroups(nodes, external, { enableMultiOutput: false });
+    const withoutMO = detectFusionGroups(nodes, external, {
+      enableMultiOutput: false,
+    });
     // Should split: [add] alone is too small, [mul, sqrt] is 2 ops
-    expect(withoutMO.groups.some(g => g.nodes.length === 3)).toBe(false);
+    expect(withoutMO.groups.some((g) => g.nodes.length === 3)).toBe(false);
 
     // With multi-output: add becomes additional output, group stays intact
-    const withMO = detectFusionGroups(nodes, external, { enableMultiOutput: true });
+    const withMO = detectFusionGroups(nodes, external, {
+      enableMultiOutput: true,
+    });
     expect(withMO.groups.length).toBe(1);
     expect(withMO.groups[0].nodes.length).toBe(3);
     expect(withMO.groups[0].additionalOutputNodes).toBeDefined();
-    expect(withMO.groups[0].additionalOutputNodes!.length).toBe(1);
-    expect(withMO.groups[0].additionalOutputNodes![0].id).toBe(add.id);
+    expect(withMO.groups[0].additionalOutputNodes?.length).toBe(1);
+    expect(withMO.groups[0].additionalOutputNodes?.[0].id).toBe(add.id);
   });
 
   it("falls back to split when shapes differ", () => {
     // Primary output has shape [4], intermediate has shape [2, 2]
-    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const add = createLazyIRNode("add", [createPendingRef(ext), createPendingRef(ext)], [2, 2], "f32", "cpu");
-    const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(add)], [2, 2], "f32", "cpu");
-    const sqrt = createLazyIRNode("sqrt", [createPendingRef(mul)], [4], "f32", "cpu");
+    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(ext), createPendingRef(ext)],
+      [2, 2],
+      "f32",
+      "cpu",
+    );
+    const mul = createLazyIRNode(
+      "mul",
+      [createPendingRef(add), createPendingRef(add)],
+      [2, 2],
+      "f32",
+      "cpu",
+    );
+    const sqrt = createLazyIRNode(
+      "sqrt",
+      [createPendingRef(mul)],
+      [4],
+      "f32",
+      "cpu",
+    );
 
     const nodes = [ext, add, mul, sqrt];
     const external = new Set([add.id]);
 
-    const result = detectFusionGroups(nodes, external, { enableMultiOutput: true });
+    const result = detectFusionGroups(nodes, external, {
+      enableMultiOutput: true,
+    });
     // Should fall back to split because add has shape [2,2] but sqrt has shape [4]
-    expect(result.groups.every(g => !g.additionalOutputNodes)).toBe(true);
+    expect(result.groups.every((g) => !g.additionalOutputNodes)).toBe(true);
   });
 
   it("falls back to split when bindings exceed limit", () => {
     // Create a group with many external inputs
     const exts = Array.from({ length: 6 }, (_, i) =>
-      createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [i] })
+      createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [i],
+      }),
     );
-    const add = createLazyIRNode("add", [createPendingRef(exts[0]), createPendingRef(exts[1])], [4], "f32", "cpu");
-    const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(exts[2])], [4], "f32", "cpu");
-    const sub = createLazyIRNode("sub", [createPendingRef(mul), createPendingRef(exts[3])], [4], "f32", "cpu");
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(exts[0]), createPendingRef(exts[1])],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const mul = createLazyIRNode(
+      "mul",
+      [createPendingRef(add), createPendingRef(exts[2])],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const sub = createLazyIRNode(
+      "sub",
+      [createPendingRef(mul), createPendingRef(exts[3])],
+      [4],
+      "f32",
+      "cpu",
+    );
 
     const nodes = [...exts, add, mul, sub];
     const external = new Set([add.id]);
@@ -754,18 +884,40 @@ describe("§15 Multi-output Fusion Groups", () => {
       maxStorageBuffers: 4,
     });
     // Should fall back to split
-    expect(result.groups.every(g => !g.additionalOutputNodes)).toBe(true);
+    expect(result.groups.every((g) => !g.additionalOutputNodes)).toBe(true);
   });
 
   it("generates correct multi-output recipe", () => {
-    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const add = createLazyIRNode("add", [createPendingRef(ext), createPendingRef(ext)], [4], "f32", "cpu");
-    const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(ext)], [4], "f32", "cpu");
-    const sqrt = createLazyIRNode("sqrt", [createPendingRef(mul)], [4], "f32", "cpu");
+    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(ext), createPendingRef(ext)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const mul = createLazyIRNode(
+      "mul",
+      [createPendingRef(add), createPendingRef(ext)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const sqrt = createLazyIRNode(
+      "sqrt",
+      [createPendingRef(mul)],
+      [4],
+      "f32",
+      "cpu",
+    );
 
     const nodes = [ext, add, mul, sqrt];
     const external = new Set([add.id]);
-    const result = detectFusionGroups(nodes, external, { enableMultiOutput: true });
+    const result = detectFusionGroups(nodes, external, {
+      enableMultiOutput: true,
+    });
     expect(result.groups.length).toBe(1);
 
     const recipe = groupToRecipe(result.groups[0]);
@@ -774,13 +926,13 @@ describe("§15 Multi-output Fusion Groups", () => {
     expect(recipe.outputs[1].nodeId).toBe(add.id);
 
     // Check isOutput flags
-    const addNode = recipe.nodes.find(n => n.id === add.id);
-    const sqrtNode = recipe.nodes.find(n => n.id === sqrt.id);
+    const addNode = recipe.nodes.find((n) => n.id === add.id);
+    const sqrtNode = recipe.nodes.find((n) => n.id === sqrt.id);
     expect(addNode?.isOutput).toBe(true);
     expect(sqrtNode?.isOutput).toBe(true);
 
     // Non-output intermediate
-    const mulNode = recipe.nodes.find(n => n.id === mul.id);
+    const mulNode = recipe.nodes.find((n) => n.id === mul.id);
     expect(mulNode?.isOutput).toBe(false);
   });
 });
@@ -796,16 +948,50 @@ describe("§15 Reorder + Detect Integration", () => {
     // Realistic AMP-like pattern:
     // matmul → cast → add → gelu → cast
     // The casts are fusible but DFS might interleave unrelated ops
-    const ext0 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const ext1 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [5, 6, 7, 8] });
+    const ext0 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const ext1 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [5, 6, 7, 8],
+    });
     // Matmul (non-fusible)
-    const mm = createLazyIRNode("matmul", [createPendingRef(ext0), createPendingRef(ext1)], [4], "f32", "cpu");
+    const mm = createLazyIRNode(
+      "matmul",
+      [createPendingRef(ext0), createPendingRef(ext1)],
+      [4],
+      "f32",
+      "cpu",
+    );
     // Fusible chain: cast → add → gelu
-    const cast1 = createLazyIRNode("cast", [createPendingRef(mm)], [4], "f16", "cpu");
+    const cast1 = createLazyIRNode(
+      "cast",
+      [createPendingRef(mm)],
+      [4],
+      "f16",
+      "cpu",
+    );
     // Independent non-fusible op (sum of ext1)
-    const sum = createLazyIRNode("sum", [createPendingRef(ext1)], [], "f32", "cpu");
-    const add = createLazyIRNode("add", [createPendingRef(cast1), createPendingRef(cast1)], [4], "f16", "cpu");
-    const gelu = createLazyIRNode("gelu", [createPendingRef(add)], [4], "f16", "cpu");
+    const sum = createLazyIRNode(
+      "sum",
+      [createPendingRef(ext1)],
+      [],
+      "f32",
+      "cpu",
+    );
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(cast1), createPendingRef(cast1)],
+      [4],
+      "f16",
+      "cpu",
+    );
+    const gelu = createLazyIRNode(
+      "gelu",
+      [createPendingRef(add)],
+      [4],
+      "f16",
+      "cpu",
+    );
 
     // DFS order that breaks fusion: cast1, sum (interleaved), add, gelu
     const dfsOrder = [ext0, ext1, mm, cast1, sum, add, gelu];
@@ -821,16 +1007,16 @@ describe("§15 Reorder + Detect Integration", () => {
     const afterFused = afterGroups.stats.nodesInGroups;
 
     expect(afterFused).toBeGreaterThanOrEqual(beforeFused);
-    expect(afterGroups.groups.some(g => g.nodes.length >= 3)).toBe(true);
+    expect(afterGroups.groups.some((g) => g.nodes.length >= 3)).toBe(true);
   });
 
   it("numerical correctness with RuntimeEngine", async () => {
     const engine = new RuntimeEngine("cpu", { enableFusion: true });
     const a = engine.tensorFromArray([1, 2, 3, 4], [4]);
     const b = engine.tensorFromArray([2, 3, 4, 5], [4]);
-    const c = engine.add(a, b);     // [3, 5, 7, 9]
-    const d = engine.mul(c, a);     // [3, 10, 21, 36]
-    const e = engine.sqrt(d);       // [1.73, 3.16, 4.58, 6.0]
+    const c = engine.add(a, b); // [3, 5, 7, 9]
+    const d = engine.mul(c, a); // [3, 10, 21, 36]
+    const e = engine.sqrt(d); // [1.73, 3.16, 4.58, 6.0]
 
     const result = await engine.cpu(e);
     expect(result[0]).toBeCloseTo(Math.sqrt(3), 4);
@@ -851,11 +1037,33 @@ describe("§15 Generalized Phase 1 Pass-Through", () => {
     // Plan: ext0, ext1 → add → [sum(ext1)] → mul(add, ext0)
     // sum depends only on ext1 (not on add), so it should NOT flush the group.
     // add and mul should end up in the same fusion group.
-    const ext0 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const ext1 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [5, 6, 7, 8] });
-    const add = createLazyIRNode("add", [createPendingRef(ext0), createPendingRef(ext1)], [4], "f32", "cpu");
-    const sum = createLazyIRNode("sum", [createPendingRef(ext1)], [], "f32", "cpu");
-    const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(ext0)], [4], "f32", "cpu");
+    const ext0 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const ext1 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [5, 6, 7, 8],
+    });
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(ext0), createPendingRef(ext1)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const sum = createLazyIRNode(
+      "sum",
+      [createPendingRef(ext1)],
+      [],
+      "f32",
+      "cpu",
+    );
+    const mul = createLazyIRNode(
+      "mul",
+      [createPendingRef(add), createPendingRef(ext0)],
+      [4],
+      "f32",
+      "cpu",
+    );
 
     const nodes = [ext0, ext1, add, sum, mul];
     const result = detectFusionGroups(nodes);
@@ -870,10 +1078,30 @@ describe("§15 Generalized Phase 1 Pass-Through", () => {
   it("flushes when non-fusible node depends on candidate group", () => {
     // Plan: ext → add → sum(add) → mul(sum, ext)
     // sum depends on add (which is in the candidate group), so it MUST flush.
-    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const add = createLazyIRNode("add", [createPendingRef(ext), createPendingRef(ext)], [4], "f32", "cpu");
-    const sum = createLazyIRNode("sum", [createPendingRef(add)], [], "f32", "cpu");
-    const mul = createLazyIRNode("mul", [createPendingRef(sum), createPendingRef(sum)], [], "f32", "cpu");
+    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(ext), createPendingRef(ext)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const sum = createLazyIRNode(
+      "sum",
+      [createPendingRef(add)],
+      [],
+      "f32",
+      "cpu",
+    );
+    const mul = createLazyIRNode(
+      "mul",
+      [createPendingRef(sum), createPendingRef(sum)],
+      [],
+      "f32",
+      "cpu",
+    );
 
     const nodes = [ext, add, sum, mul];
     const result = detectFusionGroups(nodes);
@@ -885,11 +1113,33 @@ describe("§15 Generalized Phase 1 Pass-Through", () => {
   it("passes through reshape between fusible ops", () => {
     // Plan: ext0, ext1 → add → [reshape(ext1)] → mul(add, ext0)
     // reshape depends on ext1 (not on add), so add and mul should fuse.
-    const ext0 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const ext1 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [5, 6, 7, 8] });
-    const add = createLazyIRNode("add", [createPendingRef(ext0), createPendingRef(ext1)], [4], "f32", "cpu");
-    const reshape = createLazyIRNode("reshape", [createPendingRef(ext1)], [2, 2], "f32", "cpu");
-    const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(ext0)], [4], "f32", "cpu");
+    const ext0 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const ext1 = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [5, 6, 7, 8],
+    });
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(ext0), createPendingRef(ext1)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const reshape = createLazyIRNode(
+      "reshape",
+      [createPendingRef(ext1)],
+      [2, 2],
+      "f32",
+      "cpu",
+    );
+    const mul = createLazyIRNode(
+      "mul",
+      [createPendingRef(add), createPendingRef(ext0)],
+      [4],
+      "f32",
+      "cpu",
+    );
 
     const nodes = [ext0, ext1, add, reshape, mul];
     const result = detectFusionGroups(nodes);
@@ -900,11 +1150,37 @@ describe("§15 Generalized Phase 1 Pass-Through", () => {
 
   it("passes through multiple independent non-fusible nodes", () => {
     // Plan: ext → add → [sum(ext), mean(ext)] → mul(add, ext)
-    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const add = createLazyIRNode("add", [createPendingRef(ext), createPendingRef(ext)], [4], "f32", "cpu");
-    const sum = createLazyIRNode("sum", [createPendingRef(ext)], [], "f32", "cpu");
-    const mean = createLazyIRNode("mean", [createPendingRef(ext)], [], "f32", "cpu");
-    const mul = createLazyIRNode("mul", [createPendingRef(add), createPendingRef(ext)], [4], "f32", "cpu");
+    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(ext), createPendingRef(ext)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const sum = createLazyIRNode(
+      "sum",
+      [createPendingRef(ext)],
+      [],
+      "f32",
+      "cpu",
+    );
+    const mean = createLazyIRNode(
+      "mean",
+      [createPendingRef(ext)],
+      [],
+      "f32",
+      "cpu",
+    );
+    const mul = createLazyIRNode(
+      "mul",
+      [createPendingRef(add), createPendingRef(ext)],
+      [4],
+      "f32",
+      "cpu",
+    );
 
     const nodes = [ext, add, sum, mean, mul];
     const result = detectFusionGroups(nodes);
@@ -927,30 +1203,76 @@ describe("§15 Global Singleton Batching (Phase 4)", () => {
     // Plan: ext → [cast1(ext, f16), matmul(ext, ext), cast2(ext, f16)]
     // cast1 and cast2 are fusible singletons with same shape, separated by matmul.
     // Phase 4 should batch them.
-    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const cast1 = createLazyIRNode("cast", [createPendingRef(ext)], [4], "f16", "cpu");
-    const mm = createLazyIRNode("matmul", [createPendingRef(ext), createPendingRef(ext)], [4], "f32", "cpu");
-    const cast2 = createLazyIRNode("cast", [createPendingRef(ext)], [4], "f16", "cpu");
+    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const cast1 = createLazyIRNode(
+      "cast",
+      [createPendingRef(ext)],
+      [4],
+      "f16",
+      "cpu",
+    );
+    const mm = createLazyIRNode(
+      "matmul",
+      [createPendingRef(ext), createPendingRef(ext)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const cast2 = createLazyIRNode(
+      "cast",
+      [createPendingRef(ext)],
+      [4],
+      "f16",
+      "cpu",
+    );
 
     const nodes = [ext, cast1, mm, cast2];
-    const result = detectFusionGroups(nodes, undefined, { enableMultiOutput: true });
+    const result = detectFusionGroups(nodes, undefined, {
+      enableMultiOutput: true,
+    });
 
     // cast1 and cast2 should be batched into a multi-output group
     expect(result.groups.length).toBe(1);
     expect(result.groups[0].nodes.length).toBe(2);
     expect(result.groups[0].additionalOutputNodes).toBeDefined();
-    expect(result.groups[0].additionalOutputNodes!.length).toBe(1);
+    expect(result.groups[0].additionalOutputNodes?.length).toBe(1);
   });
 
   it("does not batch singletons with different shapes", () => {
-    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const ext2 = createLazyIRNode("tensorFromArray", [], [8], "f32", "cpu", { values: [1, 2, 3, 4, 5, 6, 7, 8] });
-    const cast1 = createLazyIRNode("cast", [createPendingRef(ext)], [4], "f16", "cpu");
-    const mm = createLazyIRNode("matmul", [createPendingRef(ext), createPendingRef(ext)], [4], "f32", "cpu");
-    const cast2 = createLazyIRNode("cast", [createPendingRef(ext2)], [8], "f16", "cpu");
+    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const ext2 = createLazyIRNode("tensorFromArray", [], [8], "f32", "cpu", {
+      values: [1, 2, 3, 4, 5, 6, 7, 8],
+    });
+    const cast1 = createLazyIRNode(
+      "cast",
+      [createPendingRef(ext)],
+      [4],
+      "f16",
+      "cpu",
+    );
+    const mm = createLazyIRNode(
+      "matmul",
+      [createPendingRef(ext), createPendingRef(ext)],
+      [4],
+      "f32",
+      "cpu",
+    );
+    const cast2 = createLazyIRNode(
+      "cast",
+      [createPendingRef(ext2)],
+      [8],
+      "f16",
+      "cpu",
+    );
 
     const nodes = [ext, ext2, cast1, mm, cast2];
-    const result = detectFusionGroups(nodes, undefined, { enableMultiOutput: true });
+    const result = detectFusionGroups(nodes, undefined, {
+      enableMultiOutput: true,
+    });
 
     // Different shapes → no batching
     expect(result.groups.length).toBe(0);
@@ -961,20 +1283,50 @@ describe("§15 Global Singleton Batching (Phase 4)", () => {
     // Batching at position 4 is safe because consumer of cast1 is at position 3 (before 4).
     // Wait — consumer at position 3 which is BEFORE the batch position 4 means the consumer
     // would need the result before the batch runs. So cast1 can NOT be batched.
-    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [1, 2, 3, 4] });
-    const cast1 = createLazyIRNode("cast", [createPendingRef(ext)], [4], "f16", "cpu");
-    const mm = createLazyIRNode("matmul", [createPendingRef(ext), createPendingRef(ext)], [4], "f32", "cpu");
+    const ext = createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+      values: [1, 2, 3, 4],
+    });
+    const cast1 = createLazyIRNode(
+      "cast",
+      [createPendingRef(ext)],
+      [4],
+      "f16",
+      "cpu",
+    );
+    const mm = createLazyIRNode(
+      "matmul",
+      [createPendingRef(ext), createPendingRef(ext)],
+      [4],
+      "f32",
+      "cpu",
+    );
     // consumer of cast1: add uses cast1 as input (at plan position 3)
-    const add = createLazyIRNode("add", [createPendingRef(cast1), createPendingRef(cast1)], [4], "f16", "cpu");
-    const cast2 = createLazyIRNode("cast", [createPendingRef(ext)], [4], "f16", "cpu");
+    const add = createLazyIRNode(
+      "add",
+      [createPendingRef(cast1), createPendingRef(cast1)],
+      [4],
+      "f16",
+      "cpu",
+    );
+    const cast2 = createLazyIRNode(
+      "cast",
+      [createPendingRef(ext)],
+      [4],
+      "f16",
+      "cpu",
+    );
 
     const nodes = [ext, cast1, mm, add, cast2];
-    const result = detectFusionGroups(nodes, undefined, { enableMultiOutput: true });
+    const result = detectFusionGroups(nodes, undefined, {
+      enableMultiOutput: true,
+    });
 
     // cast1's consumer (add) is at position 3, but batch would execute at position 4
     // So cast1 can't be delayed to position 4 — ordering constraint prevents batching.
     // Only cast2 remains as singleton, which alone can't form a group.
-    const phase4Groups = result.groups.filter(g => g.additionalOutputNodes && g.additionalOutputNodes.length > 0);
+    const phase4Groups = result.groups.filter(
+      (g) => g.additionalOutputNodes && g.additionalOutputNodes.length > 0,
+    );
     // No multi-output groups from phase 4 — add+cast1 pair might form phase1 group though
     expect(phase4Groups.length).toBe(0);
   });
@@ -982,10 +1334,12 @@ describe("§15 Global Singleton Batching (Phase 4)", () => {
   it("respects binding limits in singleton batching", () => {
     // Create many singletons that share an input
     const exts = Array.from({ length: 6 }, (_, i) =>
-      createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", { values: [i] })
+      createLazyIRNode("tensorFromArray", [], [4], "f32", "cpu", {
+        values: [i],
+      }),
     );
-    const casts = exts.map(e =>
-      createLazyIRNode("cast", [createPendingRef(e)], [4], "f16", "cpu")
+    const casts = exts.map((e) =>
+      createLazyIRNode("cast", [createPendingRef(e)], [4], "f16", "cpu"),
     );
     // Interleave with non-fusible ops so no Phase 1 groups form
     const interleavedNodes: LazyIRNode[] = [];
@@ -994,7 +1348,13 @@ describe("§15 Global Singleton Batching (Phase 4)", () => {
       interleavedNodes.push(casts[i]);
       if (i < exts.length - 1) {
         interleavedNodes.push(
-          createLazyIRNode("sum", [createPendingRef(exts[i])], [], "f32", "cpu")
+          createLazyIRNode(
+            "sum",
+            [createPendingRef(exts[i])],
+            [],
+            "f32",
+            "cpu",
+          ),
         );
       }
     }
@@ -1006,7 +1366,10 @@ describe("§15 Global Singleton Batching (Phase 4)", () => {
 
     // Each batch should respect the binding limit
     for (const group of result.groups) {
-      const totalBindings = group.externalInputs.length + 1 + (group.additionalOutputNodes?.length ?? 0);
+      const totalBindings =
+        group.externalInputs.length +
+        1 +
+        (group.additionalOutputNodes?.length ?? 0);
       expect(totalBindings).toBeLessThanOrEqual(5);
     }
   });

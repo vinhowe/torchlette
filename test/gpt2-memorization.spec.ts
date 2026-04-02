@@ -8,12 +8,12 @@
  * (WebGPU auto-detected; skip with TORCHLETTE_CPU_ONLY=1)
  */
 
-import { describe, expect, test, beforeAll } from "vitest";
-import { Torchlette, type Tensor } from "../src/frontend";
-import { initWebGPU } from "../src/backend/webgpu";
+import { beforeAll, describe, expect, test } from "vitest";
 import { GPT2, type GPT2Config } from "../examples/gpt2/model";
+import { Torchlette } from "../src/frontend/torchlette";
 import { Adam } from "../src/optim";
-import { cpuOnly, canUseWebGPU } from "./helpers/webgpu";
+import { canUseWebGPU, cpuOnly } from "./helpers/webgpu";
+
 const hasWebGPU = !cpuOnly;
 
 // Simple character-level tokenizer
@@ -65,243 +65,277 @@ const TRAINING_DATA = [
 // Build vocabulary from all training data
 const ALL_CHARS = TRAINING_DATA.join("");
 
-describe("GPT-2 Memorization Test", { skip: !hasWebGPU, timeout: 300000 }, () => {
-  let webgpuAvailable = false;
+describe(
+  "GPT-2 Memorization Test",
+  { skip: !hasWebGPU, timeout: 300000 },
+  () => {
+    let webgpuAvailable = false;
 
-  beforeAll(async () => {
-    const success = await canUseWebGPU();
-    webgpuAvailable = success;
-    if (!success) {
-      console.warn("WebGPU not available - tests will be skipped");
-    }
-  });
-
-  test("trains GPT-2 to memorize sequences and generates correct completions", async () => {
-    if (!webgpuAvailable) return;
-
-    console.log("\n=== GPT-2 Memorization Test ===\n");
-
-    // Create tokenizer
-    const tokenizer = new CharTokenizer(ALL_CHARS);
-    console.log(`Vocabulary size: ${tokenizer.vocabSize}`);
-
-    // Find max sequence length
-    const maxLen = Math.max(...TRAINING_DATA.map((s) => s.length));
-    console.log(`Max sequence length: ${maxLen}`);
-
-    // GPT-2 config sized for memorizing 5 short sequences
-    const config: GPT2Config = {
-      vocabSize: tokenizer.vocabSize,
-      blockSize: maxLen + 1,
-      numLayers: 2,
-      numHeads: 4,
-      embedDim: 128,
-      dropoutRate: 0.0, // Disable dropout for memorization
-    };
-
-    console.log(`Model config: ${config.numLayers} layers, ${config.embedDim} embed dim`);
-
-    // Create model and optimizer
-    const api = new Torchlette("webgpu", {
-      enableFusion: false,
-      enableMemoryPlanning: true,
-    });
-
-    const model = new GPT2(api, config, { device: "webgpu" });
-    model.train();
-
-    const optimizer = new Adam(model.parameters(), { lr: 0.01 }, api);
-
-    // Prepare training data
-    const encodedSequences = TRAINING_DATA.map((s) => tokenizer.encode(s));
-
-    // Pad sequences to same length
-    const paddedSequences = encodedSequences.map((seq) => {
-      const padded = [...seq];
-      while (padded.length < maxLen) {
-        padded.push(tokenizer.padToken);
+    beforeAll(async () => {
+      const success = await canUseWebGPU();
+      webgpuAvailable = success;
+      if (!success) {
+        console.warn("WebGPU not available - tests will be skipped");
       }
-      return padded;
     });
 
-    // Create input (all but last token) and target (all but first token)
-    const batchSize = TRAINING_DATA.length;
-    const seqLen = maxLen - 1;
+    test("trains GPT-2 to memorize sequences and generates correct completions", async () => {
+      if (!webgpuAvailable) return;
 
-    const inputData: number[] = [];
-    const targetData: number[] = [];
+      console.log("\n=== GPT-2 Memorization Test ===\n");
 
-    for (const seq of paddedSequences) {
-      inputData.push(...seq.slice(0, -1));
-      targetData.push(...seq.slice(1));
-    }
+      // Create tokenizer
+      const tokenizer = new CharTokenizer(ALL_CHARS);
+      console.log(`Vocabulary size: ${tokenizer.vocabSize}`);
 
-    const inputTensor = api.tensorFromArray(inputData, [batchSize, seqLen], {
-      device: "webgpu",
-    });
-    const targetTensor = api.tensorFromArray(targetData, [batchSize, seqLen], {
-      device: "webgpu",
-    });
+      // Find max sequence length
+      const maxLen = Math.max(...TRAINING_DATA.map((s) => s.length));
+      console.log(`Max sequence length: ${maxLen}`);
 
-    // Training loop
-    const NUM_STEPS = 300;
-    const LOG_EVERY = 50;
-    const TARGET_LOSS = 0.005;
+      // GPT-2 config sized for memorizing 5 short sequences
+      const config: GPT2Config = {
+        vocabSize: tokenizer.vocabSize,
+        blockSize: maxLen + 1,
+        numLayers: 2,
+        numHeads: 4,
+        embedDim: 128,
+        dropoutRate: 0.0, // Disable dropout for memorization
+      };
 
-    console.log(`\nTraining for up to ${NUM_STEPS} steps (target loss: ${TARGET_LOSS})...\n`);
+      console.log(
+        `Model config: ${config.numLayers} layers, ${config.embedDim} embed dim`,
+      );
 
-    let finalLoss = Infinity;
-    let step = 0;
+      // Create model and optimizer
+      const api = new Torchlette("webgpu", {
+        enableFusion: false,
+        enableMemoryPlanning: true,
+      });
 
-    for (step = 0; step < NUM_STEPS; step++) {
-      // Forward pass
-      const { loss } = model.forwardWithLoss(inputTensor, targetTensor);
-      if (!loss) throw new Error("Loss is null");
+      const model = new GPT2(api, config, { device: "webgpu" });
+      model.train();
 
-      const lossValue = await loss.item();
+      const optimizer = new Adam(model.parameters(), { lr: 0.01 }, api);
 
-      // Backward pass
-      await loss.backward();
+      // Prepare training data
+      const encodedSequences = TRAINING_DATA.map((s) => tokenizer.encode(s));
 
-      // Use stepAsync to force parameter updates immediately.
-      // This ensures gradient buffers are read before zeroGrad disposes them.
-      await optimizer.stepAsync();
-      optimizer.zeroGrad();
+      // Pad sequences to same length
+      const paddedSequences = encodedSequences.map((seq) => {
+        const padded = [...seq];
+        while (padded.length < maxLen) {
+          padded.push(tokenizer.padToken);
+        }
+        return padded;
+      });
 
-      // Dispose loss tensor
-      loss.dispose();
+      // Create input (all but last token) and target (all but first token)
+      const batchSize = TRAINING_DATA.length;
+      const seqLen = maxLen - 1;
 
-      finalLoss = lossValue;
+      const inputData: number[] = [];
+      const targetData: number[] = [];
 
-      if ((step + 1) % LOG_EVERY === 0) {
-        console.log(`Step ${step + 1}: loss = ${lossValue.toFixed(4)}`);
+      for (const seq of paddedSequences) {
+        inputData.push(...seq.slice(0, -1));
+        targetData.push(...seq.slice(1));
       }
 
-      // Early stopping if loss is low enough
-      if (lossValue < TARGET_LOSS) {
-        console.log(`\nReached target loss at step ${step + 1}`);
-        break;
-      }
-    }
+      const inputTensor = api.tensorFromArray(inputData, [batchSize, seqLen], {
+        device: "webgpu",
+      });
+      const targetTensor = api.tensorFromArray(
+        targetData,
+        [batchSize, seqLen],
+        {
+          device: "webgpu",
+        },
+      );
 
-    console.log(`\nFinal loss: ${finalLoss.toFixed(4)} after ${step + 1} steps`);
+      // Training loop
+      const NUM_STEPS = 300;
+      const LOG_EVERY = 50;
+      const TARGET_LOSS = 0.005;
 
-    // Test generation
-    model.eval();
-    console.log("\n=== Testing Generation ===\n");
+      console.log(
+        `\nTraining for up to ${NUM_STEPS} steps (target loss: ${TARGET_LOSS})...\n`,
+      );
 
-    // Test prompts and expected completions
-    const testCases = [
-      { prompt: "The capital of France is ", expected: "Paris." },
-      { prompt: "The capital of Germany is ", expected: "Berlin." },
-      { prompt: "The capital of Japan is ", expected: "Tokyo." },
-    ];
+      let finalLoss = Infinity;
+      let step = 0;
 
-    let passCount = 0;
+      for (step = 0; step < NUM_STEPS; step++) {
+        // Forward pass
+        const { loss } = model.forwardWithLoss(inputTensor, targetTensor);
+        if (!loss) throw new Error("Loss is null");
 
-    for (const { prompt, expected } of testCases) {
-      const generated = await generateText(api, model, tokenizer, prompt, prompt.length + expected.length + 2);
-      const completion = generated.slice(prompt.length);
+        const lossValue = await loss.item();
 
-      const passed = completion.startsWith(expected.slice(0, -1)); // Allow slight variation
-      if (passed) passCount++;
+        // Backward pass
+        await loss.backward();
 
-      console.log(`Prompt: "${prompt}"`);
-      console.log(`Expected: "${expected}"`);
-      console.log(`Generated: "${completion}"`);
-      console.log(`Status: ${passed ? "PASS" : "FAIL"}\n`);
-    }
+        // Use stepAsync to force parameter updates immediately.
+        // This ensures gradient buffers are read before zeroGrad disposes them.
+        await optimizer.stepAsync();
+        optimizer.zeroGrad();
 
-    console.log(`\nResults: ${passCount}/${testCases.length} passed`);
+        // Dispose loss tensor
+        loss.dispose();
 
-    // Assert at least 2/3 pass (allow some tolerance)
-    expect(passCount).toBeGreaterThanOrEqual(2);
-    expect(finalLoss).toBeLessThan(1.0);
-  });
+        finalLoss = lossValue;
 
-  test("overfits on a single sequence", async () => {
-    if (!webgpuAvailable) return;
+        if ((step + 1) % LOG_EVERY === 0) {
+          console.log(`Step ${step + 1}: loss = ${lossValue.toFixed(4)}`);
+        }
 
-    console.log("\n=== Single Sequence Overfit Test ===\n");
-
-    const sequence = "Hello World!";
-    const tokenizer = new CharTokenizer(sequence);
-
-    const config: GPT2Config = {
-      vocabSize: tokenizer.vocabSize,
-      blockSize: sequence.length + 1,
-      numLayers: 2,
-      numHeads: 4,
-      embedDim: 128,
-      dropoutRate: 0.0,
-    };
-
-    const api = new Torchlette("webgpu", {
-      enableFusion: false,
-      enableMemoryPlanning: true,
-    });
-
-    const model = new GPT2(api, config, { device: "webgpu" });
-    model.train();
-
-    const optimizer = new Adam(model.parameters(), { lr: 0.01 }, api);
-
-    const encoded = tokenizer.encode(sequence);
-    const inputData = encoded.slice(0, -1);
-    const targetData = encoded.slice(1);
-
-    const inputTensor = api.tensorFromArray(inputData, [1, inputData.length], {
-      device: "webgpu",
-    });
-    const targetTensor = api.tensorFromArray(targetData, [1, targetData.length], {
-      device: "webgpu",
-    });
-
-    // Train (1000 steps max for reliable convergence on different GPU backends)
-    const NUM_STEPS = 1000;
-    let finalLoss = Infinity;
-
-    console.log(`Training on: "${sequence}"`);
-    console.log(`Sequence length: ${sequence.length}`);
-
-    for (let step = 0; step < NUM_STEPS; step++) {
-      const { loss } = model.forwardWithLoss(inputTensor, targetTensor);
-      if (!loss) throw new Error("Loss is null");
-
-      const lossValue = await loss.item();
-      await loss.backward();
-      await optimizer.stepAsync();
-      optimizer.zeroGrad();
-      loss.dispose();
-
-      finalLoss = lossValue;
-
-      if ((step + 1) % 100 === 0) {
-        console.log(`Step ${step + 1}: loss = ${lossValue.toFixed(4)}`);
+        // Early stopping if loss is low enough
+        if (lossValue < TARGET_LOSS) {
+          console.log(`\nReached target loss at step ${step + 1}`);
+          break;
+        }
       }
 
-      if (lossValue < 0.0001) {
-        console.log(`Converged at step ${step + 1}`);
-        break;
+      console.log(
+        `\nFinal loss: ${finalLoss.toFixed(4)} after ${step + 1} steps`,
+      );
+
+      // Test generation
+      model.eval();
+      console.log("\n=== Testing Generation ===\n");
+
+      // Test prompts and expected completions
+      const testCases = [
+        { prompt: "The capital of France is ", expected: "Paris." },
+        { prompt: "The capital of Germany is ", expected: "Berlin." },
+        { prompt: "The capital of Japan is ", expected: "Tokyo." },
+      ];
+
+      let passCount = 0;
+
+      for (const { prompt, expected } of testCases) {
+        const generated = await generateText(
+          api,
+          model,
+          tokenizer,
+          prompt,
+          prompt.length + expected.length + 2,
+        );
+        const completion = generated.slice(prompt.length);
+
+        const passed = completion.startsWith(expected.slice(0, -1)); // Allow slight variation
+        if (passed) passCount++;
+
+        console.log(`Prompt: "${prompt}"`);
+        console.log(`Expected: "${expected}"`);
+        console.log(`Generated: "${completion}"`);
+        console.log(`Status: ${passed ? "PASS" : "FAIL"}\n`);
       }
-    }
 
-    console.log(`Final loss: ${finalLoss.toFixed(4)}`);
+      console.log(`\nResults: ${passCount}/${testCases.length} passed`);
 
-    // Test
-    model.eval();
-    const generated = await generateText(api, model, tokenizer, "H", sequence.length);
-    console.log(`\nPrompt: "H"`);
-    console.log(`Expected: "${sequence}"`);
-    console.log(`Generated: "${generated}"`);
+      // Assert at least 2/3 pass (allow some tolerance)
+      expect(passCount).toBeGreaterThanOrEqual(2);
+      expect(finalLoss).toBeLessThan(1.0);
+    });
 
-    // Verify loss convergence: the model should memorize the single sequence.
-    // Note: autoregressive generation from a single character is unreliable with
-    // tiny models (error compounding), so we only check loss convergence here.
-    // The multi-sequence test above verifies full generation correctness.
-    expect(finalLoss).toBeLessThan(0.01);
-  });
-});
+    test("overfits on a single sequence", async () => {
+      if (!webgpuAvailable) return;
+
+      console.log("\n=== Single Sequence Overfit Test ===\n");
+
+      const sequence = "Hello World!";
+      const tokenizer = new CharTokenizer(sequence);
+
+      const config: GPT2Config = {
+        vocabSize: tokenizer.vocabSize,
+        blockSize: sequence.length + 1,
+        numLayers: 2,
+        numHeads: 4,
+        embedDim: 128,
+        dropoutRate: 0.0,
+      };
+
+      const api = new Torchlette("webgpu", {
+        enableFusion: false,
+        enableMemoryPlanning: true,
+      });
+
+      const model = new GPT2(api, config, { device: "webgpu" });
+      model.train();
+
+      const optimizer = new Adam(model.parameters(), { lr: 0.01 }, api);
+
+      const encoded = tokenizer.encode(sequence);
+      const inputData = encoded.slice(0, -1);
+      const targetData = encoded.slice(1);
+
+      const inputTensor = api.tensorFromArray(
+        inputData,
+        [1, inputData.length],
+        {
+          device: "webgpu",
+        },
+      );
+      const targetTensor = api.tensorFromArray(
+        targetData,
+        [1, targetData.length],
+        {
+          device: "webgpu",
+        },
+      );
+
+      // Train (1000 steps max for reliable convergence on different GPU backends)
+      const NUM_STEPS = 1000;
+      let finalLoss = Infinity;
+
+      console.log(`Training on: "${sequence}"`);
+      console.log(`Sequence length: ${sequence.length}`);
+
+      for (let step = 0; step < NUM_STEPS; step++) {
+        const { loss } = model.forwardWithLoss(inputTensor, targetTensor);
+        if (!loss) throw new Error("Loss is null");
+
+        const lossValue = await loss.item();
+        await loss.backward();
+        await optimizer.stepAsync();
+        optimizer.zeroGrad();
+        loss.dispose();
+
+        finalLoss = lossValue;
+
+        if ((step + 1) % 100 === 0) {
+          console.log(`Step ${step + 1}: loss = ${lossValue.toFixed(4)}`);
+        }
+
+        if (lossValue < 0.0001) {
+          console.log(`Converged at step ${step + 1}`);
+          break;
+        }
+      }
+
+      console.log(`Final loss: ${finalLoss.toFixed(4)}`);
+
+      // Test
+      model.eval();
+      const generated = await generateText(
+        api,
+        model,
+        tokenizer,
+        "H",
+        sequence.length,
+      );
+      console.log(`\nPrompt: "H"`);
+      console.log(`Expected: "${sequence}"`);
+      console.log(`Generated: "${generated}"`);
+
+      // Verify loss convergence: the model should memorize the single sequence.
+      // Note: autoregressive generation from a single character is unreliable with
+      // tiny models (error compounding), so we only check loss convergence here.
+      // The multi-sequence test above verifies full generation correctness.
+      expect(finalLoss).toBeLessThan(0.01);
+    });
+  },
+);
 
 /**
  * Generate text using the model.
@@ -312,7 +346,7 @@ async function generateText(
   tokenizer: CharTokenizer,
   prompt: string,
   maxLen: number,
-  debug = false
+  debug = false,
 ): Promise<string> {
   const tokens = tokenizer.encode(prompt);
   const generated = [...tokens];
@@ -344,11 +378,21 @@ async function generateText(
     // We want logits[0, -1, :vocabSize] at offset (seqLen-1) * paddedVocabSize
     const seqLen = generated.length;
     const startIdx = (seqLen - 1) * stride;
-    const lastLogits = Array.from(logitsData).slice(startIdx, startIdx + vocabSize);
+    const lastLogits = Array.from(logitsData).slice(
+      startIdx,
+      startIdx + vocabSize,
+    );
 
     if (debug && i === 0) {
-      console.log(`  [gen] startIdx: ${startIdx}, lastLogits length: ${lastLogits.length}`);
-      console.log(`  [gen] lastLogits first 5: [${lastLogits.slice(0, 5).map(v => v.toFixed(2)).join(", ")}]`);
+      console.log(
+        `  [gen] startIdx: ${startIdx}, lastLogits length: ${lastLogits.length}`,
+      );
+      console.log(
+        `  [gen] lastLogits first 5: [${lastLogits
+          .slice(0, 5)
+          .map((v) => v.toFixed(2))
+          .join(", ")}]`,
+      );
     }
 
     // Greedy sampling: pick the token with highest logit
@@ -362,7 +406,9 @@ async function generateText(
     }
 
     if (debug) {
-      console.log(`  [gen] step ${i}: maxIdx=${maxIdx}, maxVal=${maxVal.toFixed(2)}, char="${tokenizer.decode([maxIdx])}"`);
+      console.log(
+        `  [gen] step ${i}: maxIdx=${maxIdx}, maxVal=${maxVal.toFixed(2)}, char="${tokenizer.decode([maxIdx])}"`,
+      );
     }
 
     generated.push(maxIdx);

@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { Torchlette } from "../src/frontend/torchlette";
 import {
   type DispatchMode,
   RuntimeEngine,
   TidyDispatchMode,
 } from "../src/runtime/engine";
 import type { Tensor } from "../src/runtime/tensor";
-import { Torchlette } from "../src/frontend";
 
 describe("dispatch mode infrastructure", () => {
   it("push/pop basic stack operation", () => {
@@ -230,33 +230,28 @@ describe("TidyDispatchMode", () => {
 });
 
 describe("asyncTidy", () => {
-  it("disposes unwrapped intermediates across awaits", async () => {
+  it("disposes non-kept tensors across awaits", async () => {
     const api = new Torchlette();
-    const created: Tensor[] = [];
-    const mode: DispatchMode = {
-      onTensorCreated: (t) => created.push(t),
-    };
 
-    // Track at runtime level to observe what asyncTidy cleans up
-    api.runtime.pushDispatchMode(mode);
+    // Track Frontend Tensors created inside asyncTidy
+    const innerTensors: import("../src/frontend/tensor").Tensor[] = [];
 
     await api.asyncTidy(async () => {
-      // Create runtime tensors directly (unwrapped)
-      const rt1 = api.runtime.tensorFromArray([1, 2], [2]);
-      const rt2 = api.runtime.tensorFromArray([3, 4], [2]);
-      const rt3 = api.runtime.add(rt1, rt2);
+      // Create Frontend tensors (wrapped, tracked by async scope)
+      const t1 = api.tensorFromArray([1, 2], [2]);
+      const t2 = api.tensorFromArray([3, 4], [2]);
+      const t3 = t1.add(t2);
+      innerTensors.push(t1, t2, t3);
 
       // Simulate async boundary
       await Promise.resolve();
 
-      // rt1, rt2, rt3 are unwrapped — should be disposed at scope exit
+      // t1, t2, t3 are not returned/kept — should be disposed at scope exit
     });
 
-    api.runtime.popDispatchMode();
-
-    // All 3 runtime tensors should be disposed (unwrapped, never escaped)
-    expect(created.length).toBeGreaterThanOrEqual(3);
-    for (const t of created) {
+    // All 3 tensors should be disposed (not kept, not returned)
+    expect(innerTensors.length).toBe(3);
+    for (const t of innerTensors) {
       expect(t.disposed).toBe(true);
     }
   });

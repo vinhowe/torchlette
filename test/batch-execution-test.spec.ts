@@ -2,15 +2,14 @@
  * Simple test to verify batch execution works correctly.
  */
 
-import { describe, expect, it, beforeAll } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
-  initWebGPU,
+  abortBatch,
   beginBatchExecution,
   endBatchExecution,
   isBatchActive,
-  abortBatch,
-  webgpuBackend,
   tensorFromArrayWithDtype,
+  webgpuBackend,
 } from "../src/backend/webgpu";
 import { canUseWebGPU } from "./helpers/webgpu";
 
@@ -59,8 +58,8 @@ describe("Batch Execution", { timeout: 60000 }, () => {
     beginBatchExecution();
 
     try {
-      const sum1 = webgpuBackend.ops.add(a, b);  // [2, 3, 4, 5]
-      const sum2 = webgpuBackend.ops.add(sum1, sum1);  // [4, 6, 8, 10] - uses sum1 twice
+      const sum1 = webgpuBackend.ops.add(a, b); // [2, 3, 4, 5]
+      const sum2 = webgpuBackend.ops.add(sum1, sum1); // [4, 6, 8, 10] - uses sum1 twice
 
       await endBatchExecution();
 

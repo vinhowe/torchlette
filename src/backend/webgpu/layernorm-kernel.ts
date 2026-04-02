@@ -11,31 +11,28 @@
  * Backward: grad [N, D] + x [N, D] + weight [D] → gradX [N, D] + gradWeight [D] + gradBias [D]
  */
 
-import {
-  dispatchComputePass,
-  allocateOutputBuffer,
-  cachedCreateBindGroup,
-  getPipeline,
-} from "./index";
-import { requireContext } from "./webgpu-state";
+import { allocateOutputBuffer } from "./buffer-arena";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
-import { WORKGROUP_SIZE, F32_BYTES } from "./shape-utils";
-import { wgslSumReduction, wgslDualSumReduction, trackBuffers } from "./wgsl-helpers";
-
-// Shared WGSL struct for LayerNorm config (16 bytes, 4 fields)
-const WGSL_LN_CONFIG = `struct LNConfig {
-  num_rows: u32,
-  feature_dim: u32,
-  eps: f32,
-  _pad: u32,
-};`;
+import { WORKGROUP_SIZE } from "./shape-utils";
+import { createTileKernelDispatcher } from "./tile-dispatch";
+import {
+  ceilDivGrid,
+  perRowKernel,
+  type TileKernelSpec,
+  tiledGrid,
+} from "./tile-ir";
+import { onTeardown, requireContext } from "./webgpu-state";
 
 // ============================================================================
-// Row Stats Temp Buffer Cache (persistent, keyed by numRows)
+// Temp Buffer Caches (persistent, reused across steps)
 // ============================================================================
 
-const rowStatsTempCache = new Map<number, { meanBuffer: GPUBuffer; invStdBuffer: GPUBuffer }>();
+/** Row stats (mean, inv_std): keyed by numRows. */
+const rowStatsTempCache = new Map<
+  number,
+  { meanBuffer: GPUBuffer; invStdBuffer: GPUBuffer }
+>();
 
 function getOrCreateRowStatsTempBuffers(
   device: GPUDevice,
@@ -59,251 +56,308 @@ function getOrCreateRowStatsTempBuffers(
   return entry;
 }
 
-// ============================================================================
-// WGSL Shaders
-// ============================================================================
+/** GradWB partial sums: keyed by `${numRowTiles}:${featureDim}`. */
+const gradWBPartialCache = new Map<
+  string,
+  { partialGW: GPUBuffer; partialGB: GPUBuffer }
+>();
 
-function layerNormForwardShader(): string {
-  return `
-${WGSL_LN_CONFIG}
-
-@group(0) @binding(0) var<storage, read> x: array<f32>;
-@group(0) @binding(1) var<storage, read> weight: array<f32>;
-@group(0) @binding(2) var<storage, read> bias: array<f32>;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
-@group(0) @binding(4) var<uniform> config: LNConfig;
-
-var<workgroup> sdata: array<f32, ${WORKGROUP_SIZE}>;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let row = wid.x;
-  let tid = lid.x;
-  let D = config.feature_dim;
-  let base = row * D;
-
-  // Phase 1: Parallel sum for mean
-  var local_sum = 0.0;
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    local_sum += x[base + i];
-  }
-  sdata[tid] = local_sum;
-  workgroupBarrier();
-
-  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
-  let mean = sdata[0] / f32(D);
-
-  // Phase 2: Parallel sum for variance
-  var local_var = 0.0;
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    let diff = x[base + i] - mean;
-    local_var += diff * diff;
-  }
-  sdata[tid] = local_var;
-  workgroupBarrier();
-
-  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
-  let inv_std = inverseSqrt(sdata[0] / f32(D) + config.eps);
-
-  // Phase 3: Normalize + affine transform
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    let normalized = (x[base + i] - mean) * inv_std;
-    output[base + i] = normalized * weight[i] + bias[i];
-  }
-}
-`;
-}
-
-function layerNormBackwardGradXShader(): string {
-  return `
-${WGSL_LN_CONFIG}
-
-@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
-@group(0) @binding(1) var<storage, read> x: array<f32>;
-@group(0) @binding(2) var<storage, read> weight: array<f32>;
-@group(0) @binding(3) var<storage, read_write> grad_x: array<f32>;
-@group(0) @binding(4) var<uniform> config: LNConfig;
-
-var<workgroup> sdata: array<f32, ${WORKGROUP_SIZE}>;
-var<workgroup> sdata2: array<f32, ${WORKGROUP_SIZE}>;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let row = wid.x;
-  let tid = lid.x;
-  let D = config.feature_dim;
-  let Df = f32(D);
-  let base = row * D;
-
-  // Recompute mean
-  var local_sum = 0.0;
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    local_sum += x[base + i];
-  }
-  sdata[tid] = local_sum;
-  workgroupBarrier();
-  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
-  let mean = sdata[0] / Df;
-
-  // Recompute variance + inv_std
-  var local_var = 0.0;
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    let diff = x[base + i] - mean;
-    local_var += diff * diff;
-  }
-  sdata[tid] = local_var;
-  workgroupBarrier();
-  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
-  let inv_std = inverseSqrt(sdata[0] / Df + config.eps);
-
-  // Compute grad_normalized = grad_output * weight
-  // Then reduce: c1 = mean(grad_normalized), c2 = mean(grad_normalized * normalized)
-  var local_c1 = 0.0;
-  var local_c2 = 0.0;
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    let gn = grad_output[base + i] * weight[i];
-    let norm_i = (x[base + i] - mean) * inv_std;
-    local_c1 += gn;
-    local_c2 += gn * norm_i;
-  }
-  sdata[tid] = local_c1;
-  sdata2[tid] = local_c2;
-  workgroupBarrier();
-  ${wgslDualSumReduction("sdata", "sdata2", WORKGROUP_SIZE / 2)}
-  let c1 = sdata[0] / Df;
-  let c2 = sdata2[0] / Df;
-
-  // Output: grad_x[i] = (grad_normalized[i] - c1 - normalized[i] * c2) * inv_std
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    let gn = grad_output[base + i] * weight[i];
-    let norm_i = (x[base + i] - mean) * inv_std;
-    grad_x[base + i] = (gn - c1 - norm_i * c2) * inv_std;
-  }
-}
-`;
-}
-
-function layerNormRowStatsShader(): string {
-  return `
-${WGSL_LN_CONFIG}
-
-@group(0) @binding(0) var<storage, read> x: array<f32>;
-@group(0) @binding(1) var<storage, read_write> row_mean: array<f32>;
-@group(0) @binding(2) var<storage, read_write> row_inv_std: array<f32>;
-@group(0) @binding(3) var<uniform> config: LNConfig;
-
-var<workgroup> sdata: array<f32, ${WORKGROUP_SIZE}>;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let row = wid.x;
-  let tid = lid.x;
-  let D = config.feature_dim;
-  let Df = f32(D);
-  let base = row * D;
-
-  // Phase 1: Parallel sum for mean
-  var local_sum = 0.0;
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    local_sum += x[base + i];
-  }
-  sdata[tid] = local_sum;
-  workgroupBarrier();
-  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
-  let mean = sdata[0] / Df;
-
-  // Phase 2: Parallel sum for variance → inv_std
-  var local_var = 0.0;
-  for (var i = tid; i < D; i += ${WORKGROUP_SIZE}u) {
-    let diff = x[base + i] - mean;
-    local_var += diff * diff;
-  }
-  sdata[tid] = local_var;
-  workgroupBarrier();
-  ${wgslSumReduction("sdata", WORKGROUP_SIZE / 2)}
-  let inv_std = inverseSqrt(sdata[0] / Df + config.eps);
-
-  // Write row stats (only thread 0 writes)
-  if (tid == 0u) {
-    row_mean[row] = mean;
-    row_inv_std[row] = inv_std;
-  }
-}
-`;
-}
-
-function layerNormBackwardGradWeightBiasShader(): string {
-  return `
-${WGSL_LN_CONFIG}
-
-@group(0) @binding(0) var<storage, read> grad_output: array<f32>;
-@group(0) @binding(1) var<storage, read> x: array<f32>;
-@group(0) @binding(2) var<storage, read> row_mean: array<f32>;
-@group(0) @binding(3) var<storage, read> row_inv_std: array<f32>;
-@group(0) @binding(4) var<storage, read_write> grad_weight: array<f32>;
-@group(0) @binding(5) var<storage, read_write> grad_bias: array<f32>;
-@group(0) @binding(6) var<uniform> config: LNConfig;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let feature_idx = wid.x * ${WORKGROUP_SIZE}u + lid.x;
-  let D = config.feature_dim;
-  let N = config.num_rows;
-
-  if (feature_idx >= D) { return; }
-
-  var acc_gw = 0.0;
-  var acc_gb = 0.0;
-  for (var row = 0u; row < N; row++) {
-    let base = row * D;
-    let go = grad_output[base + feature_idx];
-    let normalized = (x[base + feature_idx] - row_mean[row]) * row_inv_std[row];
-    acc_gw += go * normalized;
-    acc_gb += go;
-  }
-  grad_weight[feature_idx] = acc_gw;
-  grad_bias[feature_idx] = acc_gb;
-}
-`;
-}
-
-// ============================================================================
-// Config Buffer (cached per numRows x featureDim)
-// ============================================================================
-
-const configCache = new Map<string, GPUBuffer>();
-// Reusable typed arrays for config writes
-const configArrayBuffer = new ArrayBuffer(16);
-const configU32View = new Uint32Array(configArrayBuffer);
-const configF32View = new Float32Array(configArrayBuffer);
-const configU8View = new Uint8Array(configArrayBuffer);
-
-function getOrCreateConfigBuffer(
+function getOrCreateGradWBPartials(
   device: GPUDevice,
-  numRows: number,
+  numRowTiles: number,
   featureDim: number,
-  eps: number,
-): GPUBuffer {
-  const key = `${numRows}:${featureDim}`;
-  let buf = configCache.get(key);
-  if (!buf) {
-    buf = device.createBuffer({
-      size: 16, // { num_rows: u32, feature_dim: u32, eps: f32, _pad: u32 }
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    configCache.set(key, buf);
+): { partialGW: GPUBuffer; partialGB: GPUBuffer } {
+  const key = `${numRowTiles}:${featureDim}`;
+  let entry = gradWBPartialCache.get(key);
+  if (!entry) {
+    const size = numRowTiles * featureDim * 4; // f32
+    entry = {
+      partialGW: device.createBuffer({
+        size,
+        usage: GPUBufferUsage.STORAGE,
+      }),
+      partialGB: device.createBuffer({
+        size,
+        usage: GPUBufferUsage.STORAGE,
+      }),
+    };
+    gradWBPartialCache.set(key, entry);
   }
-  configU32View[0] = numRows;
-  configU32View[1] = featureDim;
-  configF32View[2] = eps;
-  configU32View[3] = 0; // padding
-  device.queue.writeBuffer(buf, 0, configU8View);
-  return buf;
+  return entry;
 }
+
+// ============================================================================
+// Tile IR Forward Kernel
+// ============================================================================
+
+const WG = WORKGROUP_SIZE; // 256
+
+const layerNormFwdSpec = perRowKernel({
+  name: "layerNormFwd",
+  bindings: {
+    x: { storage: "read", type: "f32" },
+    weight: { storage: "read", type: "f32" },
+    bias: { storage: "read", type: "f32" },
+    output: { storage: "read_write", type: "f32" },
+  },
+  uniforms: { eps: "f32" },
+
+  kernel(ctx, _row, tid, D, base) {
+    const Df = D.toF32();
+
+    // Compute mean
+    const mean = ctx.emitLet(
+      "mean",
+      ctx
+        .wgReduce("sum", tid, D, WG, (i) => ctx.load("x", base.add(i)))
+        .div(Df),
+    );
+
+    // Compute variance → inv_std
+    const invStd = ctx.emitLet(
+      "inv_std",
+      ctx
+        .wgReduce("sum", tid, D, WG, (i) => {
+          const diff = ctx.load("x", base.add(i)).sub(mean);
+          return diff.mul(diff);
+        })
+        .div(Df)
+        .add(ctx.uniform("eps").toF32())
+        .rsqrt(),
+    );
+
+    // Normalize + affine + store
+    ctx.stridedFor(tid, D, WG, (i) => {
+      const normI = ctx.load("x", base.add(i)).sub(mean).mul(invStd);
+      const out = normI.mul(ctx.load("weight", i)).add(ctx.load("bias", i));
+      ctx.emitStore("output", base.add(i), out);
+    });
+  },
+});
+
+const fwdTileKernel = createTileKernelDispatcher(layerNormFwdSpec);
+
+// ============================================================================
+// Tile IR Backward Kernels
+// ============================================================================
+
+/**
+ * LayerNorm backward gradX kernel (tile-IR).
+ * One workgroup per row. Recomputes mean/variance in shared memory,
+ * then computes gradX with dual reduction coefficients.
+ */
+const layerNormBackwardGradXSpec = perRowKernel({
+  name: "lnBwdGradX",
+  bindings: {
+    grad_output: { storage: "read", type: "f32" },
+    x: { storage: "read", type: "f32" },
+    weight: { storage: "read", type: "f32" },
+    grad_x: { storage: "read_write", type: "f32" },
+  },
+  uniforms: { eps: "f32" },
+
+  kernel(ctx, _row, tid, D, base) {
+    const Df = D.toF32();
+
+    // Recompute mean
+    const mean = ctx.emitLet(
+      "mean",
+      ctx
+        .wgReduce("sum", tid, D, WG, (i) => ctx.load("x", base.add(i)))
+        .div(Df),
+    );
+
+    // Recompute variance → inv_std
+    const invStd = ctx.emitLet(
+      "inv_std",
+      ctx
+        .wgReduce("sum", tid, D, WG, (i) => {
+          const diff = ctx.load("x", base.add(i)).sub(mean);
+          return diff.mul(diff);
+        })
+        .div(Df)
+        .add(ctx.uniform("eps").toF32())
+        .rsqrt(),
+    );
+
+    // Dual reduction for c1, c2
+    const [sumC1, sumC2] = ctx.dualWgReduce(tid, D, WG, (i) => {
+      const gn = ctx
+        .load("grad_output", base.add(i))
+        .mul(ctx.load("weight", i));
+      const normI = ctx.load("x", base.add(i)).sub(mean).mul(invStd);
+      return [gn, gn.mul(normI)];
+    });
+    const c1 = ctx.emitLet("c1", sumC1.div(Df));
+    const c2 = ctx.emitLet("c2", sumC2.div(Df));
+
+    // Output gradX
+    ctx.stridedFor(tid, D, WG, (i) => {
+      const gn = ctx
+        .load("grad_output", base.add(i))
+        .mul(ctx.load("weight", i));
+      const normI = ctx.load("x", base.add(i)).sub(mean).mul(invStd);
+      ctx.emitStore(
+        "grad_x",
+        base.add(i),
+        gn.sub(c1).sub(normI.mul(c2)).mul(invStd),
+      );
+    });
+  },
+});
+
+/**
+ * LayerNorm row stats kernel (tile-IR).
+ * Computes per-row mean and inv_std for use by gradWeight/gradBias pass.
+ */
+const layerNormRowStatsSpec = perRowKernel({
+  name: "lnRowStats",
+  bindings: {
+    x: { storage: "read", type: "f32" },
+    row_mean: { storage: "read_write", type: "f32" },
+    row_inv_std: { storage: "read_write", type: "f32" },
+  },
+  uniforms: { eps: "f32" },
+
+  kernel(ctx, row, tid, D, base) {
+    const Df = D.toF32();
+
+    // Mean
+    const mean = ctx.emitLet(
+      "mean",
+      ctx
+        .wgReduce("sum", tid, D, WG, (i) => ctx.load("x", base.add(i)))
+        .div(Df),
+    );
+
+    // Variance → inv_std
+    const invStd = ctx.emitLet(
+      "inv_std",
+      ctx
+        .wgReduce("sum", tid, D, WG, (i) => {
+          const diff = ctx.load("x", base.add(i)).sub(mean);
+          return diff.mul(diff);
+        })
+        .div(Df)
+        .add(ctx.uniform("eps").toF32())
+        .rsqrt(),
+    );
+
+    // Thread 0 writes row stats
+    const isThread0 = tid.eq(ctx.u32(0));
+    ctx.guardedStore("row_mean", isThread0, row, mean);
+    ctx.guardedStore("row_inv_std", isThread0, row, invStd);
+  },
+});
+
+/**
+ * LayerNorm backward gradWeight + gradBias: partial accumulation (tile-IR).
+ * 2D grid: [ceil(D/WG), numRowTiles]. Each workgroup accumulates over a
+ * tile of rows for WG features, writing partials to temp buffers.
+ */
+const ROWS_PER_TILE = 32;
+
+const lnBwdGradWBPartialSpec: TileKernelSpec = {
+  name: "lnBwdGradWBPartial",
+  workgroupSize: WG,
+  bindings: {
+    grad_output: { storage: "read", type: "f32" },
+    x: { storage: "read", type: "f32" },
+    row_mean: { storage: "read", type: "f32" },
+    row_inv_std: { storage: "read", type: "f32" },
+    partial_gw: { storage: "read_write", type: "f32" },
+    partial_gb: { storage: "read_write", type: "f32" },
+  },
+  uniforms: {
+    num_rows: "u32",
+    feature_dim: "u32",
+    num_row_tiles: "u32",
+  },
+  grid: tiledGrid({
+    x: { uniform: "feature_dim", tileSize: WG },
+    y: "num_row_tiles",
+  }),
+
+  kernel(ctx) {
+    const featureIdx = ctx.globalId(0);
+    const rowTileIdx = ctx.programId(1);
+    const D = ctx.uniform("feature_dim");
+    const N = ctx.uniform("num_rows");
+    const RPT = ctx.u32(ROWS_PER_TILE);
+
+    ctx.ifThen(featureIdx.ge(D), () => ctx.emitReturn());
+
+    const rowStart = rowTileIdx.mul(RPT);
+    const rowEnd = rowStart.add(RPT).min(N);
+
+    const accGW = ctx.emitVar("acc_gw", "f32", ctx.f32(0.0));
+    const accGB = ctx.emitVar("acc_gb", "f32", ctx.f32(0.0));
+
+    ctx.forRange(rowStart, rowEnd, (row) => {
+      const base = row.mul(D);
+      const go = ctx.load("grad_output", base.add(featureIdx));
+      const normalized = ctx
+        .load("x", base.add(featureIdx))
+        .sub(ctx.load("row_mean", row))
+        .mul(ctx.load("row_inv_std", row));
+      accGW.addAssign(go.mul(normalized));
+      accGB.addAssign(go);
+    });
+
+    const partialIdx = rowTileIdx.mul(D).add(featureIdx);
+    ctx.emitStore("partial_gw", partialIdx, accGW.get());
+    ctx.emitStore("partial_gb", partialIdx, accGB.get());
+  },
+};
+
+/**
+ * LayerNorm backward gradWeight + gradBias: reduction (tile-IR).
+ * 1D grid: [ceil(D/WG)]. Each thread sums partials across all row tiles.
+ */
+const lnBwdGradWBReduceSpec: TileKernelSpec = {
+  name: "lnBwdGradWBReduce",
+  workgroupSize: WG,
+  bindings: {
+    partial_gw: { storage: "read", type: "f32" },
+    partial_gb: { storage: "read", type: "f32" },
+    grad_weight: { storage: "read_write", type: "f32" },
+    grad_bias: { storage: "read_write", type: "f32" },
+  },
+  uniforms: {
+    feature_dim: "u32",
+    num_row_tiles: "u32",
+  },
+  grid: ceilDivGrid(WG, "feature_dim"),
+
+  kernel(ctx) {
+    const featureIdx = ctx.globalId(0);
+    const D = ctx.uniform("feature_dim");
+    const numTiles = ctx.uniform("num_row_tiles");
+
+    ctx.ifThen(featureIdx.ge(D), () => ctx.emitReturn());
+
+    const sumGW = ctx.emitVar("sum_gw", "f32", ctx.f32(0.0));
+    const sumGB = ctx.emitVar("sum_gb", "f32", ctx.f32(0.0));
+
+    ctx.forRange(ctx.u32(0), numTiles, (t) => {
+      const idx = t.mul(D).add(featureIdx);
+      sumGW.addAssign(ctx.load("partial_gw", idx));
+      sumGB.addAssign(ctx.load("partial_gb", idx));
+    });
+
+    ctx.emitStore("grad_weight", featureIdx, sumGW.get());
+    ctx.emitStore("grad_bias", featureIdx, sumGB.get());
+  },
+};
+
+const gradXTileKernel = createTileKernelDispatcher(layerNormBackwardGradXSpec);
+const rowStatsTileKernel = createTileKernelDispatcher(layerNormRowStatsSpec);
+const gradWBPartialTileKernel = createTileKernelDispatcher(
+  lnBwdGradWBPartialSpec,
+);
+const gradWBReduceTileKernel = createTileKernelDispatcher(
+  lnBwdGradWBReduceSpec,
+);
 
 // ============================================================================
 // Dispatch Functions
@@ -312,6 +366,8 @@ function getOrCreateConfigBuffer(
 /**
  * Dispatch fused LayerNorm forward kernel.
  * x [N, D] + weight [D] + bias [D] → output [N, D]
+ *
+ * Uses the tile IR compiler to generate the WGSL shader.
  */
 export function dispatchLayerNormForward(
   xBuffer: GPUBuffer,
@@ -321,29 +377,12 @@ export function dispatchLayerNormForward(
   featureDim: number,
   eps: number,
 ): GPUBuffer {
-  const ctx = requireContext();
-  const device = ctx.device;
-
-  const outputSizeBytes = numRows * featureDim * F32_BYTES;
+  const outputSizeBytes = numRows * featureDim * 4; // f32
   const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
-  const configBuf = getOrCreateConfigBuffer(device, numRows, featureDim, eps);
-
-  const pipeline = getPipeline(
-    ctx,
-    "layerNormFwd",
-    layerNormForwardShader(),
-  );
-
-  const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [xBuffer, weightBuffer, biasBuffer, outBuffer, configBuf]);
-
-  trackBuffers(xBuffer, weightBuffer, biasBuffer, outBuffer);
-
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    numRows, // one workgroup per row
+  fwdTileKernel.dispatch(
+    { x: xBuffer, weight: weightBuffer, bias: biasBuffer, output: outBuffer },
+    { num_rows: numRows, feature_dim: featureDim, eps },
   );
 
   return outBuffer;
@@ -361,29 +400,17 @@ export function dispatchLayerNormBackwardGradX(
   featureDim: number,
   eps: number,
 ): GPUBuffer {
-  const ctx = requireContext();
-  const device = ctx.device;
-
-  const outputSizeBytes = numRows * featureDim * F32_BYTES;
+  const outputSizeBytes = numRows * featureDim * 4;
   const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
-  const configBuf = getOrCreateConfigBuffer(device, numRows, featureDim, eps);
-
-  const pipeline = getPipeline(
-    ctx,
-    "layerNormBwdGradX",
-    layerNormBackwardGradXShader(),
-  );
-
-  const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [gradOutputBuffer, xBuffer, weightBuffer, outBuffer, configBuf]);
-
-  trackBuffers(gradOutputBuffer, xBuffer, weightBuffer, outBuffer);
-
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    numRows,
+  gradXTileKernel.dispatch(
+    {
+      grad_output: gradOutputBuffer,
+      x: xBuffer,
+      weight: weightBuffer,
+      grad_x: outBuffer,
+    },
+    { num_rows: numRows, feature_dim: featureDim, eps },
   );
 
   return outBuffer;
@@ -391,9 +418,11 @@ export function dispatchLayerNormBackwardGradX(
 
 /**
  * Dispatch fused LayerNorm backward gradWeight + gradBias kernel.
- * Two-pass approach:
+ * Three-pass approach:
  *   Pass 1: Compute row stats (mean, inv_std) for all N rows
- *   Pass 2: Accumulate gradWeight/gradBias using precomputed stats (no barriers)
+ *   Pass 2: 2D partial accumulation — each workgroup handles ROWS_PER_TILE rows
+ *           for WG features, writing partials to temp buffers
+ *   Pass 3: Reduce partials across row tiles → final gradWeight/gradBias
  *
  * grad_output [N, D] + x [N, D] → grad_weight [D] + grad_bias [D]
  */
@@ -407,51 +436,51 @@ export function dispatchLayerNormBackwardGradWeightBias(
   const ctx = requireContext();
   const device = ctx.device;
 
-  const configBuf = getOrCreateConfigBuffer(device, numRows, featureDim, eps);
-
   // Pass 1: Compute row stats (mean[N], inv_std[N])
-  // Use persistent cached buffers (same pattern as K-split temp buffers)
-  const { meanBuffer, invStdBuffer } = getOrCreateRowStatsTempBuffers(device, numRows);
-
-  const statsPipeline = getPipeline(
-    ctx,
-    "layerNormRowStats",
-    layerNormRowStatsShader(),
+  const { meanBuffer, invStdBuffer } = getOrCreateRowStatsTempBuffers(
+    device,
+    numRows,
   );
 
-  const statsBindGroup = cachedCreateBindGroup(device, statsPipeline,
-    [xBuffer, meanBuffer, invStdBuffer, configBuf]);
-
-  trackBuffers(xBuffer, meanBuffer, invStdBuffer);
-
-  dispatchComputePass(
-    statsPipeline,
-    statsBindGroup,
-    numRows, // one workgroup per row
+  rowStatsTileKernel.dispatch(
+    { x: xBuffer, row_mean: meanBuffer, row_inv_std: invStdBuffer },
+    { num_rows: numRows, feature_dim: featureDim, eps },
   );
 
-  // Pass 2: Accumulate gradWeight/gradBias using precomputed stats
-  const featureSizeBytes = featureDim * F32_BYTES;
+  const numRowTiles = Math.ceil(numRows / ROWS_PER_TILE);
+
+  // Pass 2: 2D partial accumulation
+  const { partialGW, partialGB } = getOrCreateGradWBPartials(
+    device,
+    numRowTiles,
+    featureDim,
+  );
+
+  gradWBPartialTileKernel.dispatch(
+    {
+      grad_output: gradOutputBuffer,
+      x: xBuffer,
+      row_mean: meanBuffer,
+      row_inv_std: invStdBuffer,
+      partial_gw: partialGW,
+      partial_gb: partialGB,
+    },
+    { num_rows: numRows, feature_dim: featureDim, num_row_tiles: numRowTiles },
+  );
+
+  // Pass 3: Reduce partials → final output
+  const featureSizeBytes = featureDim * 4;
   const gradWeightBuffer = allocateOutputBuffer(featureSizeBytes);
   const gradBiasBuffer = allocateOutputBuffer(featureSizeBytes);
 
-  const gradPipeline = getPipeline(
-    ctx,
-    "layerNormBwdGradWBv2",
-    layerNormBackwardGradWeightBiasShader(),
-  );
-
-  const numWorkgroups = Math.ceil(featureDim / WORKGROUP_SIZE);
-
-  const gradBindGroup = cachedCreateBindGroup(device, gradPipeline,
-    [gradOutputBuffer, xBuffer, meanBuffer, invStdBuffer, gradWeightBuffer, gradBiasBuffer, configBuf]);
-
-  trackBuffers(gradOutputBuffer, gradWeightBuffer, gradBiasBuffer);
-
-  dispatchComputePass(
-    gradPipeline,
-    gradBindGroup,
-    numWorkgroups,
+  gradWBReduceTileKernel.dispatch(
+    {
+      partial_gw: partialGW,
+      partial_gb: partialGB,
+      grad_weight: gradWeightBuffer,
+      grad_bias: gradBiasBuffer,
+    },
+    { feature_dim: featureDim, num_row_tiles: numRowTiles },
   );
 
   return { gradWeightBuffer, gradBiasBuffer };
@@ -461,10 +490,20 @@ export function dispatchLayerNormBackwardGradWeightBias(
  * Reset all module-local mutable state (pipeline cache, row stats temp buffers).
  */
 export function resetLayerNormKernelState(): void {
-  configCache.clear();
+  fwdTileKernel.reset();
+  gradXTileKernel.reset();
+  rowStatsTileKernel.reset();
+  gradWBPartialTileKernel.reset();
+  gradWBReduceTileKernel.reset();
   for (const entry of rowStatsTempCache.values()) {
     entry.meanBuffer.destroy();
     entry.invStdBuffer.destroy();
   }
   rowStatsTempCache.clear();
+  for (const entry of gradWBPartialCache.values()) {
+    entry.partialGW.destroy();
+    entry.partialGB.destroy();
+  }
+  gradWBPartialCache.clear();
 }
+onTeardown(resetLayerNormKernelState);

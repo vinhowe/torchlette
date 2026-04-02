@@ -1,7 +1,6 @@
-import { describe, expect, it, beforeAll } from "vitest";
-import { Torchlette } from "../../src/frontend";
+import { beforeAll, describe, expect, it } from "vitest";
+import { Torchlette } from "../../src/frontend/torchlette";
 import { Adam, GradScaler } from "../../src/optim";
-import { initWebGPU } from "../../src/backend/webgpu";
 import { canUseWebGPU } from "../helpers/webgpu";
 
 describe("GradScaler", () => {
@@ -19,7 +18,7 @@ describe("GradScaler", () => {
     const scaler = new GradScaler(api, { initScale: 1024 });
 
     const loss = api.tensorFromArray([2.0], [], { device });
-    const scaled = scaler.scale(loss);
+    const _scaled = scaler.scale(loss);
 
     expect(scaler.getScale()).toBe(1024);
     // scaled should be 2.0 * 1024 = 2048
@@ -41,7 +40,7 @@ describe("GradScaler", () => {
     await scaledLoss.backward();
 
     // Gradients should be scaled by 4.0 (all 4.0 for sum backward)
-    const gradBefore = await param.grad!.cpu();
+    const gradBefore = await param.grad?.cpu();
     expect(gradBefore[0]).toBeCloseTo(4.0, 4);
 
     // Unscale
@@ -49,7 +48,7 @@ describe("GradScaler", () => {
 
     if (device !== "webgpu") {
       // CPU path: grads are unscaled immediately by unscale_()
-      const gradAfter = await param.grad!.cpu();
+      const gradAfter = await param.grad?.cpu();
       expect(gradAfter[0]).toBeCloseTo(1.0, 4);
     }
     // On WebGPU with fused Adam+unscale, grads are unscaled inside the Adam kernel
@@ -277,14 +276,14 @@ describe("GradScaler", () => {
     await loss.backward();
 
     // Gradient should be -Inf before unscale
-    const gradBefore = await param.grad!.cpu();
+    const gradBefore = await param.grad?.cpu();
     expect(Number.isFinite(gradBefore[0])).toBe(false);
 
     scaler.unscale_(optimizer);
 
     if (device !== "webgpu") {
       // CPU path: grads are zeroed immediately by unscale_() (inf detected → mask applied)
-      const gradAfter = await param.grad!.cpu();
+      const gradAfter = await param.grad?.cpu();
       expect(gradAfter[0]).toBe(0);
     }
     // On WebGPU with fused Adam+unscale, inf detection and zeroing
@@ -323,8 +322,8 @@ describe("GradScaler", () => {
     await totalLoss.backward();
 
     // param1.grad should be 4.0 (scaled), param2.grad should be -Inf
-    const grad1Before = await param1.grad!.cpu();
-    const grad2Before = await param2.grad!.cpu();
+    const grad1Before = await param1.grad?.cpu();
+    const grad2Before = await param2.grad?.cpu();
     expect(grad1Before[0]).toBeCloseTo(4.0, 4);
     expect(Number.isFinite(grad2Before[0])).toBe(false);
 
@@ -332,8 +331,8 @@ describe("GradScaler", () => {
 
     if (device !== "webgpu") {
       // Elementwise path: ALL grads are zeroed when any inf detected
-      const grad1After = await param1.grad!.cpu();
-      const grad2After = await param2.grad!.cpu();
+      const grad1After = await param1.grad?.cpu();
+      const grad2After = await param2.grad?.cpu();
       expect(grad1After[0]).toBe(0);
       expect(grad1After[1]).toBe(0);
       expect(grad2After[0]).toBe(0);
@@ -363,7 +362,7 @@ describe("GradScaler", () => {
     await scaledLoss.backward();
 
     // Gradient should NOT be scaled (enabled=false)
-    const gradBefore = await param.grad!.cpu();
+    const gradBefore = await param.grad?.cpu();
     expect(gradBefore[0]).toBeCloseTo(1.0, 4);
 
     scaler.unscale_(optimizer);

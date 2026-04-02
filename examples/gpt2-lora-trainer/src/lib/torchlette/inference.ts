@@ -2,9 +2,9 @@
  * Text generation/inference for GPT-2 with LoRA.
  */
 
-import type { FrontendTensor as Tensor, Torchlette } from 'torchlette';
-import type { GPT2WithLoRA } from './gpt2-lora';
-import type { GPT2Tokenizer } from './tokenizer';
+import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
+import type { GPT2WithLoRA } from "./gpt2-lora";
+import type { GPT2Tokenizer } from "./tokenizer";
 
 export type GenerateOptions = {
   maxNewTokens?: number;
@@ -24,31 +24,34 @@ export async function* generateTokens(
   model: GPT2WithLoRA,
   tokenizer: GPT2Tokenizer,
   prompt: string,
-  options: GenerateOptions = {}
+  options: GenerateOptions = {},
 ): AsyncGenerator<string, void, unknown> {
   const {
     maxNewTokens = 100,
     temperature = 0.7,
     topK = 50,
-    stopSequences = ['\n\n'],
+    stopSequences = ["\n\n"],
   } = options;
 
   // Tokenize prompt
-  let tokens = tokenizer.encode(prompt);
+  const tokens = tokenizer.encode(prompt);
   const maxLen = model.config.blockSize;
 
   // Set model to eval mode
   model.eval();
 
-  let generatedText = '';
+  let generatedText = "";
 
   for (let i = 0; i < maxNewTokens; i++) {
     // Truncate to max context length
     const inputTokens = tokens.slice(-maxLen);
 
+    // Begin step lifecycle (required for lazy evaluation context)
+    await api.beginStep();
+
     // Create input tensor
     const input = api.tensorFromArray(inputTokens, [1, inputTokens.length], {
-      device: 'webgpu',
+      device: "webgpu",
     });
 
     // Forward pass
@@ -59,6 +62,9 @@ export async function* generateTokens(
 
     // Sample next token
     const nextToken = await sampleToken(lastLogits, temperature, topK);
+
+    // End step lifecycle
+    api.endStep();
 
     // Decode single token
     const tokenStr = tokenizer.decode([nextToken]);
@@ -92,11 +98,17 @@ export async function generateText(
   model: GPT2WithLoRA,
   tokenizer: GPT2Tokenizer,
   prompt: string,
-  options: GenerateOptions = {}
+  options: GenerateOptions = {},
 ): Promise<string> {
-  let result = '';
+  let result = "";
 
-  for await (const token of generateTokens(api, model, tokenizer, prompt, options)) {
+  for await (const token of generateTokens(
+    api,
+    model,
+    tokenizer,
+    prompt,
+    options,
+  )) {
     result += token;
   }
 
@@ -109,7 +121,7 @@ export async function generateText(
 async function getLastLogits(
   api: Torchlette,
   logits: Tensor,
-  lastIdx: number
+  lastIdx: number,
 ): Promise<Float32Array> {
   // logits shape: [1, seqLen, vocabSize]
   const [_batch, seqLen, vocabSize] = logits.shape;
@@ -128,7 +140,7 @@ async function getLastLogits(
 async function sampleToken(
   logits: Float32Array,
   temperature: number,
-  topK: number
+  topK: number,
 ): Promise<number> {
   // Apply temperature
   const scaledLogits = new Float32Array(logits.length);

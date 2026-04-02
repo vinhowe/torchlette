@@ -1,40 +1,36 @@
 /**
  * GPU context management: initialization, device lifecycle, f16 support.
- * Extracted from index.ts — purely structural refactoring.
  */
 
+import { clearBindGroupCache } from "./bind-group-cache";
+import { bufferPool, destroyProfilingFenceBuffer } from "./buffer-pool";
 import type {
+  GPUAdapter,
   GPUBuffer,
   GPUDevice,
   GPUQueue,
-  GPUAdapter,
-  GPUAdapterLimits,
-  GPUComputePipeline,
-  WebGPUProvider,
   WebGPUModule,
-  WebGPUContext,
-  WebGPUTensor,
+  WebGPUProvider,
 } from "./gpu-types";
-import { gpuContext, setGpuContext, requireContext } from "./webgpu-state";
-import { DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE } from "./shape-utils";
-import { bufferPool } from "./buffer-pool";
-import { isProfilingEnabled, initGpuTimestamps } from "./profiler";
-import { setSubgroupSupport, type SubgroupSupport } from "./matmul";
-import { registerWebGPUDonation } from "../../engine/memory-planned-executor";
-import { resetUnscaleKernelState } from "./unscale-kernel";
-import { destroyProfilingFenceBuffer } from "./buffer-pool";
-import { resetAttentionKernelState } from "./attention-kernel";
-import { resetLayerNormKernelState } from "./layernorm-kernel";
-import { resetCrossEntropyKernelState } from "./cross-entropy-kernel";
-import { resetMatmulState } from "./matmul";
-import { resetFusionCache } from "./fusion-dispatch";
-
-import { donateBuffer, getBufferSize } from "./buffer-arena";
+import { type SubgroupSupport, setSubgroupSupport } from "./matmul/types";
+import {
+  clearWarmupCache,
+  startPipelineRecording,
+  stopPipelineRecording,
+  warmupPipelines,
+} from "./pipeline-warmup";
+import { initGpuTimestamps, isProfilingEnabled } from "./profiler";
 import { setSharedEncoderEnabled } from "./shared-encoder";
-import { clearBindGroupCache } from "./bind-group-cache";
+import {
+  gpuContext,
+  requireContext,
+  runTeardownCallbacks,
+  setGpuContext,
+} from "./webgpu-state";
 
-// Re-exports from webgpu-state for backward compatibility
-export { gpuContext as context, requireContext } from "./webgpu-state";
+// Re-export from webgpu-state
+export { requireContext } from "./webgpu-state";
+
 let lastInitError: string | null = null;
 
 // ============================================================================
@@ -47,20 +43,6 @@ let lastInitError: string | null = null;
  * Checked in cast() to skip standalone f32→f16 dispatches for AMP weights.
  */
 export const f16WeightCache = new Map<GPUBuffer, GPUBuffer>();
-
-/** Set an entry in the f16 weight cache (used by packed Adam). */
-export function setF16WeightCacheEntry(paramBuffer: GPUBuffer, f16Buffer: GPUBuffer): void {
-  f16WeightCache.set(paramBuffer, f16Buffer);
-}
-
-/** Evict and optionally destroy an f16 weight cache entry (used by packed Adam). */
-export function evictF16WeightCacheEntry(paramBuffer: GPUBuffer): GPUBuffer | undefined {
-  const old = f16WeightCache.get(paramBuffer);
-  if (old) {
-    f16WeightCache.delete(paramBuffer);
-  }
-  return old;
-}
 
 // ============================================================================
 // Internal Helpers
@@ -82,7 +64,7 @@ async function loadWebGPU(): Promise<WebGPUModule | null> {
     return null;
   }
   try {
-    const mod = (await import("webgpu")) as WebGPUModule;
+    const mod = (await import("webgpu")) as unknown as WebGPUModule;
     return mod;
   } catch {
     return null;
@@ -144,7 +126,7 @@ export function isF16Supported(): boolean {
  * Convert a f32 value to f16 (IEEE 754 half-precision).
  * Returns a 16-bit unsigned integer representing the f16 value.
  */
-export function f32ToF16(value: number): number {
+function f32ToF16(value: number): number {
   const floatView = new Float32Array(1);
   const int32View = new Int32Array(floatView.buffer);
 
@@ -195,7 +177,7 @@ export function f32ToF16(value: number): number {
 /**
  * Convert a f16 value (16-bit unsigned int) to f32.
  */
-export function f16ToF32(h: number): number {
+function f16ToF32(h: number): number {
   const sign = (h >>> 15) & 0x1;
   const exp = (h >>> 10) & 0x1f;
   const frac = h & 0x3ff;
@@ -207,7 +189,7 @@ export function f16ToF32(h: number): number {
       f = sign ? -0 : 0;
     } else {
       // Denormalized
-      f = (sign ? -1 : 1) * Math.pow(2, -14) * (frac / 1024);
+      f = (sign ? -1 : 1) * 2 ** -14 * (frac / 1024);
     }
   } else if (exp === 0x1f) {
     if (frac === 0) {
@@ -219,7 +201,7 @@ export function f16ToF32(h: number): number {
     }
   } else {
     // Normalized
-    f = (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + frac / 1024);
+    f = (sign ? -1 : 1) * 2 ** (exp - 15) * (1 + frac / 1024);
   }
   return f;
 }
@@ -254,7 +236,10 @@ export function f16ArrayToF32Array(data: Uint16Array): number[] {
  * Acquire a GPU adapter from the browser or Node.js WebGPU module.
  * Returns the adapter and provider, or sets lastInitError and returns null.
  */
-async function acquireAdapter(): Promise<{ adapter: GPUAdapter; provider: WebGPUProvider } | null> {
+async function acquireAdapter(): Promise<{
+  adapter: GPUAdapter;
+  provider: WebGPUProvider;
+} | null> {
   if (isBrowserWithWebGPU()) {
     const gpu = (navigator as { gpu: WebGPUProvider }).gpu;
     try {
@@ -286,7 +271,8 @@ async function acquireAdapter(): Promise<{ adapter: GPUAdapter; provider: WebGPU
   try {
     const adapter = await nodeProvider.requestAdapter();
     if (!adapter) {
-      lastInitError = `No WebGPU adapter found` +
+      lastInitError =
+        `No WebGPU adapter found` +
         (options.length > 0 ? ` (options: ${options.join(", ")})` : "");
       return null;
     }
@@ -307,13 +293,16 @@ async function requestDeviceWithFallback(
   subgroupSupport: SubgroupSupport,
 ): Promise<{ device: GPUDevice; actualF16Supported: boolean } | null> {
   const adapterMaxStorage =
-    adapter.limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
-  const adapterMaxBuffer =
-    adapter.limits?.maxBufferSize ?? 256 * 1024 * 1024;
+    adapter.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const adapterMaxBuffer = adapter.limits?.maxBufferSize ?? 256 * 1024 * 1024;
   const adapterMaxStorageBuffers =
     adapter.limits?.maxStorageBuffersPerShaderStage ?? 8;
 
-  console.log(`[WebGPU] Adapter limits: maxStorageBufferBindingSize=${adapterMaxStorage}, maxBufferSize=${adapterMaxBuffer}, maxStorageBuffersPerShaderStage=${adapterMaxStorageBuffers}`);
+  if (isProfilingEnabled()) {
+    console.log(
+      `[WebGPU] Adapter limits: maxStorageBufferBindingSize=${adapterMaxStorage}, maxBufferSize=${adapterMaxBuffer}, maxStorageBuffersPerShaderStage=${adapterMaxStorageBuffers}`,
+    );
+  }
 
   const requiredLimits: Record<string, number> = {
     maxStorageBufferBindingSize: adapterMaxStorage,
@@ -326,11 +315,15 @@ async function requestDeviceWithFallback(
     const requiredFeatures: string[] = [];
     if (subgroupSupport.supported) requiredFeatures.push("subgroups");
     if (f16Supported) requiredFeatures.push("shader-f16");
-    if (isProfilingEnabled() && adapter.features?.has("timestamp-query")) {
+    // Always request timestamp-query if available — profiling can be
+    // enabled at runtime (e.g., from the browser console) and the device
+    // can't be re-created with new features after initialization.
+    if (adapter.features?.has("timestamp-query")) {
       requiredFeatures.push("timestamp-query");
     }
     const device = await adapter.requestDevice({
-      requiredFeatures: requiredFeatures.length > 0 ? requiredFeatures : undefined,
+      requiredFeatures:
+        requiredFeatures.length > 0 ? requiredFeatures : undefined,
       requiredLimits,
     });
     return { device, actualF16Supported: f16Supported };
@@ -343,7 +336,8 @@ async function requestDeviceWithFallback(
     const fallbackFeatures: string[] = [];
     if (subgroupSupport.supported) fallbackFeatures.push("subgroups");
     const device = await adapter.requestDevice({
-      requiredFeatures: fallbackFeatures.length > 0 ? fallbackFeatures : undefined,
+      requiredFeatures:
+        fallbackFeatures.length > 0 ? fallbackFeatures : undefined,
       requiredLimits,
     });
     return { device, actualF16Supported: false };
@@ -372,12 +366,18 @@ export async function initWebGPU(): Promise<boolean> {
   if (!acquired) return false;
   const { adapter, provider } = acquired;
 
-  const subgroupSupport = detectSubgroupSupport(adapter);
+  const subgroupSupport: SubgroupSupport = adapter.features?.has("subgroups")
+    ? { supported: true, subgroupSize: 32 }
+    : { supported: false };
   setSubgroupSupport(subgroupSupport);
 
   const f16Supported = adapter.features?.has("shader-f16") ?? false;
 
-  const deviceResult = await requestDeviceWithFallback(adapter, f16Supported, subgroupSupport);
+  const deviceResult = await requestDeviceWithFallback(
+    adapter,
+    f16Supported,
+    subgroupSupport,
+  );
   if (!deviceResult) return false;
   const { device, actualF16Supported } = deviceResult;
 
@@ -389,62 +389,32 @@ export async function initWebGPU(): Promise<boolean> {
     f16Supported: actualF16Supported,
   });
 
-  bufferPool.setQueue(device.queue);
-
-  if (typeof process !== "undefined" && process.env?.TORCHLETTE_POOL_BUDGET_MB) {
+  if (
+    typeof process !== "undefined" &&
+    process.env?.TORCHLETTE_POOL_BUDGET_MB
+  ) {
     const mb = Number(process.env.TORCHLETTE_POOL_BUDGET_MB);
     if (Number.isFinite(mb) && mb > 0) {
       bufferPool.setMaxPoolBytes(mb * 1024 * 1024);
     }
   }
 
-  if (isProfilingEnabled() && device.features.has("timestamp-query")) {
+  if (
+    isProfilingEnabled() &&
+    (
+      device as unknown as { features: { has(s: string): boolean } }
+    ).features.has("timestamp-query")
+  ) {
     initGpuTimestamps(device);
   }
 
-  registerWebGPUDonation(donateBuffer, getBufferSize);
-
-  const batchSubmits = typeof process !== "undefined"
-    ? process.env?.TORCHLETTE_BATCH_SUBMITS
-    : undefined;
+  const batchSubmits =
+    typeof process !== "undefined"
+      ? process.env?.TORCHLETTE_BATCH_SUBMITS
+      : undefined;
   setSharedEncoderEnabled(batchSubmits !== "0");
 
   return true;
-}
-
-// ============================================================================
-// Subgroup Detection
-// ============================================================================
-
-/**
- * Detect subgroup support from the GPU adapter.
- */
-function detectSubgroupSupport(adapter: GPUAdapter): SubgroupSupport {
-  // Check if adapter has features and if subgroups is in the set
-  if (adapter.features?.has("subgroups")) {
-    // Typical subgroup sizes: 32 (NVIDIA/AMD), 16 (Intel/mobile)
-    // We assume 32 as default since that's most common
-    return { supported: true, subgroupSize: 32 };
-  }
-  return { supported: false };
-}
-
-// ============================================================================
-// Kernel Cache Reset
-// ============================================================================
-
-/**
- * Reset all kernel pipeline caches and associated mutable state.
- * Called by destroyWebGPU() for full cleanup, and can be called
- * independently for test isolation.
- */
-export function resetAllKernelCaches(): void {
-  resetAttentionKernelState();
-  resetLayerNormKernelState();
-  resetCrossEntropyKernelState();
-  resetUnscaleKernelState();
-  resetMatmulState();
-  resetFusionCache();
 }
 
 // ============================================================================
@@ -472,9 +442,10 @@ export function destroyWebGPU(): void {
   }
   f16WeightCache.clear();
   clearBindGroupCache();
-  resetAllKernelCaches();
+  runTeardownCallbacks();
+  clearWarmupCache();
   destroyProfilingFenceBuffer();
-  gpuContext.device.destroy();
+  (gpuContext.device as unknown as { destroy(): void }).destroy();
   gpuContext.pipelines.clear();
   setGpuContext(null);
 }
@@ -499,4 +470,34 @@ export function getMaxStorageBufferBindingSize(): number {
   const ctx = requireContext();
   const limits = ctx.device.limits;
   return limits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
+}
+
+// ============================================================================
+// Pipeline Warmup
+// ============================================================================
+
+/**
+ * Run fn() once (typically a full training step), recording all pipeline
+ * compilations. Then return the registry for future warmup.
+ *
+ * On the first call, pipelines compile synchronously as normal.
+ * Pass the returned registry to warmupPipelines() before step 0 on future runs.
+ */
+export async function warmupFromStep(
+  fn: () => void | Promise<void>,
+): Promise<Array<{ key: string; wgsl: string }>> {
+  startPipelineRecording();
+  await fn();
+  return stopPipelineRecording();
+}
+
+/**
+ * Pre-compile all pipelines from a registry in parallel.
+ * Convenience wrapper that calls warmupPipelines with the current device.
+ */
+export async function warmupFromRegistry(
+  entries: Array<{ key: string; wgsl: string }>,
+): Promise<{ compiled: number; skipped: number; timeMs: number }> {
+  const ctx = requireContext();
+  return warmupPipelines(ctx.device, entries);
 }

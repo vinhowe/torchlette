@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
-
-import { Torchlette } from "../src/frontend";
-import { DEFAULT_AMP_POLICY, DISABLED_AMP_POLICY } from "../src/engine/amp";
+import { DEFAULT_AMP_POLICY } from "../src/compiler/amp";
+import { Torchlette } from "../src/frontend/torchlette";
 
 describe("Frontend Autocast", () => {
   it("isAutocastEnabled is false by default", () => {
@@ -290,18 +289,22 @@ describe("Frontend Autocast dtype promotion", () => {
       return sum.sum();
     });
 
-    await (loss as any).backward();
+    await loss.backward();
     const xGrad = await x.grad?.cpu();
     const wGrad = await w.grad?.cpu();
 
     // Gradients should be finite and in f32
     expect(xGrad).toBeTruthy();
     expect(wGrad).toBeTruthy();
-    for (const v of xGrad!) {
-      expect(Number.isFinite(v)).toBe(true);
+    if (xGrad) {
+      for (const v of xGrad) {
+        expect(Number.isFinite(v)).toBe(true);
+      }
     }
-    for (const v of wGrad!) {
-      expect(Number.isFinite(v)).toBe(true);
+    if (wGrad) {
+      for (const v of wGrad) {
+        expect(Number.isFinite(v)).toBe(true);
+      }
     }
   });
 });

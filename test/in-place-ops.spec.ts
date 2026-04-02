@@ -10,17 +10,12 @@
  * - base_commit tracking for mutations
  */
 
-import { describe, expect, it, beforeEach } from "vitest";
-import { RuntimeEngine } from "../src/runtime/engine";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
-  tensorFromArray,
-  copy_,
-  add_,
-  zero_,
-  fill_,
-  mul_,
-} from "../src/runtime/engine-facade";
-import { resetNodeIdCounter, resetStorageIdCounter } from "../src/engine/lazy";
+  resetNodeIdCounter,
+  resetStorageIdCounter,
+} from "../src/graph/node-factory";
+import { RuntimeEngine } from "../src/runtime/engine";
 import { resetBaseIdCounter } from "../src/runtime/tensor";
 
 describe("in-place operations (runtime)", () => {
@@ -153,10 +148,7 @@ describe("in-place operations (runtime)", () => {
     });
 
     it("works on 3D tensors", async () => {
-      const dst = engine.tensorFromArray(
-        [1, 2, 3, 4, 5, 6, 7, 8],
-        [2, 2, 2],
-      );
+      const dst = engine.tensorFromArray([1, 2, 3, 4, 5, 6, 7, 8], [2, 2, 2]);
 
       engine.zero_(dst);
       await engine.force(dst);
@@ -226,55 +218,6 @@ describe("in-place operations (runtime)", () => {
       await engine.force(dst);
       const values = await engine.cpu(dst);
       expect(values).toEqual([-3, -6, -9]);
-    });
-  });
-
-  describe("module-level functions", () => {
-    it("copy_ function works", async () => {
-      const dst = tensorFromArray([1, 2], [2]);
-      const src = tensorFromArray([3, 4], [2]);
-
-      copy_(dst, src);
-      await new RuntimeEngine().force(dst);
-      const values = dst.toArray();
-      expect(values).toEqual([3, 4]);
-    });
-
-    it("add_ function works", async () => {
-      const dst = tensorFromArray([1, 2], [2]);
-      const src = tensorFromArray([10, 20], [2]);
-
-      add_(dst, src);
-      await new RuntimeEngine().force(dst);
-      const values = dst.toArray();
-      expect(values).toEqual([11, 22]);
-    });
-
-    it("zero_ function works", async () => {
-      const dst = tensorFromArray([1, 2, 3], [3]);
-
-      zero_(dst);
-      await new RuntimeEngine().force(dst);
-      const values = dst.toArray();
-      expect(values).toEqual([0, 0, 0]);
-    });
-
-    it("fill_ function works", async () => {
-      const dst = tensorFromArray([1, 2], [2]);
-
-      fill_(dst, 99);
-      await new RuntimeEngine().force(dst);
-      const values = dst.toArray();
-      expect(values).toEqual([99, 99]);
-    });
-
-    it("mul_ function works", async () => {
-      const dst = tensorFromArray([2, 4], [2]);
-
-      mul_(dst, 3);
-      await new RuntimeEngine().force(dst);
-      const values = dst.toArray();
-      expect(values).toEqual([6, 12]);
     });
   });
 });

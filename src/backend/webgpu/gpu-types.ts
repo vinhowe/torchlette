@@ -4,7 +4,7 @@
  * original definitions in index.ts.
  */
 
-import type { DType, BackendTensor } from "../types";
+import type { BackendTensor, DType } from "../types";
 
 export type GPUBuffer = {
   getMappedRange(): ArrayBuffer;
@@ -27,7 +27,10 @@ type GPUComputePass = {
 };
 
 export type GPUCommandEncoder = {
-  beginComputePass(descriptor?: { label?: string; timestampWrites?: unknown }): GPUComputePass;
+  beginComputePass(descriptor?: {
+    label?: string;
+    timestampWrites?: unknown;
+  }): GPUComputePass;
   copyBufferToBuffer(
     source: GPUBuffer,
     sourceOffset: number,
@@ -35,11 +38,24 @@ export type GPUCommandEncoder = {
     destinationOffset: number,
     size: number,
   ): void;
+  clearBuffer(buffer: GPUBuffer, offset?: number, size?: number): void;
+  resolveQuerySet(
+    querySet: unknown,
+    firstQuery: number,
+    queryCount: number,
+    destination: GPUBuffer,
+    destinationOffset: number,
+  ): void;
   finish(): GPUCommandBuffer;
 };
 
 export type GPUCommandBuffer = unknown;
 export type GPUBindGroup = unknown;
+export type GPUBufferBinding = {
+  buffer: GPUBuffer;
+  offset?: number;
+  size?: number;
+};
 
 export type GPUQueue = {
   onSubmittedWorkDone?: () => Promise<void>;
@@ -61,7 +77,10 @@ export type GPUDeviceLimits = {
 export type GPUDevice = {
   createBindGroup(descriptor: {
     layout: unknown;
-    entries: Array<{ binding: number; resource: { buffer: GPUBuffer; offset?: number; size?: number } }>;
+    entries: Array<{
+      binding: number;
+      resource: { buffer: GPUBuffer; offset?: number; size?: number };
+    }>;
   }): GPUBindGroup;
   createBuffer(descriptor: {
     size: number;
@@ -73,7 +92,12 @@ export type GPUDevice = {
     layout: "auto";
     compute: { module: unknown; entryPoint: string };
   }): GPUComputePipeline;
+  createComputePipelineAsync?(descriptor: {
+    layout: "auto";
+    compute: { module: unknown; entryPoint: string };
+  }): Promise<GPUComputePipeline>;
   createShaderModule(descriptor: { code: string }): unknown;
+  createQuerySet(descriptor: { type: unknown; count: number }): unknown;
   queue: GPUQueue;
   limits: GPUDeviceLimits;
 };
@@ -151,7 +175,3 @@ export function asGPUTensor(tensor: BackendTensor): WebGPUTensor {
 export function gpuBuffer(tensor: BackendTensor): GPUBuffer {
   return asGPUTensor(tensor).buffer;
 }
-
-/** Legacy matmul constants (kept for reference, now using tiled matmul) */
-export const MATMUL_WORKGROUP_X = 8;
-export const MATMUL_WORKGROUP_Y = 8;

@@ -1,17 +1,19 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { cpuBackend } from "../src/backend/cpu";
+import { executePlanSequential } from "../src/executor/sequential";
 import {
-  buildPlan,
-  createLazyIRNode,
   createMaterializedRef,
   createPendingRef,
-  createStorageHandle,
-  executePlan,
   isMaterialized,
   isPending,
+} from "../src/graph/types";
+import {
+  createLazyIRNode,
+  createStorageHandle,
   resetNodeIdCounter,
   resetStorageIdCounter,
-} from "../src/engine/lazy";
+} from "../src/graph/node-factory";
+import { buildPlan } from "../src/executor/plan-builder";
 
 describe("lazy value system", () => {
   beforeEach(() => {
@@ -538,7 +540,7 @@ describe("force and execute", () => {
       );
 
       const plan = buildPlan(node);
-      const result = await executePlan(plan, cpuBackend);
+      const result = await executePlanSequential(plan, cpuBackend);
 
       expect(result).toBeDefined();
       expect(result.device).toBe("cpu");
@@ -561,7 +563,7 @@ describe("force and execute", () => {
       const sqrtNode = createLazyIRNode("sqrt", [createRef], [4], "f32", "cpu");
 
       const plan = buildPlan(sqrtNode);
-      const result = await executePlan(plan, cpuBackend);
+      const result = await executePlanSequential(plan, cpuBackend);
 
       expect(result.backendTensor.toArray()).toEqual([1, 2, 3, 4]);
     });
@@ -580,7 +582,7 @@ describe("force and execute", () => {
       const addNode = createLazyIRNode("add", [aRef, bRef], [3], "f32", "cpu");
 
       const plan = buildPlan(addNode);
-      const result = await executePlan(plan, cpuBackend);
+      const result = await executePlanSequential(plan, cpuBackend);
 
       expect(result.backendTensor.toArray()).toEqual([5, 7, 9]);
     });
@@ -611,7 +613,7 @@ describe("force and execute", () => {
       );
 
       const plan = buildPlan(addNode);
-      const result = await executePlan(plan, cpuBackend);
+      const result = await executePlanSequential(plan, cpuBackend);
 
       const values = result.backendTensor.toArray();
       expect(values[0]).toBeCloseTo(Math.sqrt(2) + 2, 5);
@@ -626,7 +628,7 @@ describe("force and execute", () => {
       expect(node.result).toBeUndefined();
 
       const plan = buildPlan(node);
-      const result = await executePlan(plan, cpuBackend);
+      const result = await executePlanSequential(plan, cpuBackend);
 
       expect(node.result).toBeDefined();
       expect(node.result).toBe(result);
@@ -650,7 +652,7 @@ describe("force and execute", () => {
       const plan = buildPlan(reluNode);
       expect(plan.nodes).toHaveLength(1); // Only the relu node
 
-      const result = await executePlan(plan, cpuBackend);
+      const result = await executePlanSequential(plan, cpuBackend);
       expect(result.backendTensor.toArray()).toEqual([10, 20]);
     });
 
@@ -687,7 +689,7 @@ describe("force and execute", () => {
       );
 
       const plan = buildPlan(mmNode);
-      const result = await executePlan(plan, cpuBackend);
+      const result = await executePlanSequential(plan, cpuBackend);
 
       expect(result.backendTensor.shape).toEqual([1, 1]);
       expect(result.backendTensor.toArray()).toEqual([5]);
@@ -707,7 +709,7 @@ describe("force and execute", () => {
       const mulNode = createLazyIRNode("mul", [aRef, bRef], [3], "f32", "cpu");
 
       const plan = buildPlan(mulNode);
-      const result = await executePlan(plan, cpuBackend);
+      const result = await executePlanSequential(plan, cpuBackend);
 
       expect(result.backendTensor.toArray()).toEqual([10, 18, 28]);
     });
@@ -726,7 +728,7 @@ describe("force and execute", () => {
       const subNode = createLazyIRNode("sub", [aRef, bRef], [3], "f32", "cpu");
 
       const plan = buildPlan(subNode);
-      const result = await executePlan(plan, cpuBackend);
+      const result = await executePlanSequential(plan, cpuBackend);
 
       expect(result.backendTensor.toArray()).toEqual([9, 18, 27]);
     });
@@ -745,7 +747,7 @@ describe("force and execute", () => {
       const divNode = createLazyIRNode("div", [aRef, bRef], [3], "f32", "cpu");
 
       const plan = buildPlan(divNode);
-      const result = await executePlan(plan, cpuBackend);
+      const result = await executePlanSequential(plan, cpuBackend);
 
       expect(result.backendTensor.toArray()).toEqual([5, 5, 6]);
     });
@@ -766,7 +768,7 @@ describe("force and execute", () => {
       );
 
       const plan = buildPlan(reshapeNode);
-      const result = await executePlan(plan, cpuBackend);
+      const result = await executePlanSequential(plan, cpuBackend);
 
       expect(result.backendTensor.shape).toEqual([2, 3]);
       expect(result.backendTensor.toArray()).toEqual([1, 2, 3, 4, 5, 6]);
@@ -807,7 +809,7 @@ describe("force and execute", () => {
       const plan = buildPlan(mulNode);
       expect(plan.nodes).toHaveLength(6); // a, b, c, add, sqrt, mul
 
-      const result = await executePlan(plan, cpuBackend);
+      const result = await executePlanSequential(plan, cpuBackend);
       expect(result.backendTensor.toArray()).toEqual([8, 18]);
     });
   });
@@ -815,9 +817,9 @@ describe("force and execute", () => {
   describe("error handling", () => {
     it("throws when plan is empty", async () => {
       const emptyPlan = { nodes: [] };
-      await expect(executePlan(emptyPlan, cpuBackend)).rejects.toThrow(
-        "Cannot execute empty plan",
-      );
+      await expect(
+        executePlanSequential(emptyPlan, cpuBackend),
+      ).rejects.toThrow("Cannot execute empty plan");
     });
 
     it("throws when input is not ready", async () => {
@@ -837,7 +839,7 @@ describe("force and execute", () => {
       // Create a plan with only reluNode (missing orphanNode)
       const badPlan = { nodes: [reluNode] };
 
-      await expect(executePlan(badPlan, cpuBackend)).rejects.toThrow(
+      await expect(executePlanSequential(badPlan, cpuBackend)).rejects.toThrow(
         "Input not ready",
       );
     });

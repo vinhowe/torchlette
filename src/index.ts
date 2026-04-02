@@ -1,4 +1,37 @@
-export * from "./engine";
+// Tile-IR custom kernel API + WebGPU init
+export {
+  type BindingSpec,
+  ceilDivGrid,
+  compileTileKernel,
+  createTileKernelDispatcher,
+  type DataType,
+  disableProfiling,
+  elementwiseGrid,
+  enableAllAllocDebug,
+  enableProfiling,
+  getAndResetFlowCounters,
+  getGPUMemoryStats,
+  getLeakedAllocCount,
+  getLeakedAllocCountForStep,
+  getProfileJSON,
+  getWebGPUDevice,
+  getWebGPUInitError,
+  initGpuTimestamps,
+  initWebGPU,
+  KernelContext,
+  readGpuTimestamps,
+  resetProfileStats,
+  setAllocStep,
+  setGPUMemoryLimit,
+  setProfilePhase,
+  singleWorkgroup,
+  snapshotLeakedAllocs,
+  syncWebGPU,
+  type TileKernelInstance,
+  type TileKernelSpec,
+  type UniformType,
+  webgpuBackend,
+} from "./backend/webgpu";
 export {
   type DeviceKind,
   DisposedTensorError,
@@ -6,13 +39,26 @@ export {
   type TensorCreateOptions,
   Torchlette,
   torch,
-} from "./frontend";
+} from "./frontend/torchlette";
+export { storageTracker } from "./graph/storage-tracker";
+export * as nn from "./nn";
 export {
   Adam,
   type AdamOptions,
-  SGD,
-  type SGDOptions,
+  CosineAnnealingLR,
+  ExponentialLR,
   GradScaler,
   type GradScalerOptions,
+  type HasLR,
+  type LRScheduler,
+  PolynomialLR,
+  SGD,
+  type SGDOptions,
+  StepLR,
 } from "./optim";
-export * as nn from "./nn";
+export {
+  getDebugLiveTensors,
+  getTensorDebugStats,
+  resetTensorDebugStats,
+  setDebugTracking,
+} from "./runtime/tensor";

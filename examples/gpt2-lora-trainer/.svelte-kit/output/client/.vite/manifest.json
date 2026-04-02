@@ -1,43 +1,70 @@
 {
-  "../../dist/fusion-dispatch-BPOVQPxj.js": {
-    "file": "_app/immutable/chunks/BczbaFgV.js",
-    "name": "fusion-dispatch-BPOVQPxj",
-    "src": "../../dist/fusion-dispatch-BPOVQPxj.js",
+  "../../dist/buffer-pool-BANCNxXy.js": {
+    "file": "_app/immutable/chunks/D1IJvTBw.js",
+    "name": "buffer-pool-BANCNxXy",
+    "src": "../../dist/buffer-pool-BANCNxXy.js",
     "isDynamicEntry": true,
     "imports": [
-      "_CNEoBiV9.js"
+      "_BFmezKYF.js"
     ]
   },
-  "../../dist/fusion-dispatch-DXF9kxAE.js": {
-    "file": "_app/immutable/chunks/CJ6vKN7B.js",
-    "name": "fusion-dispatch-DXF9kxAE",
-    "src": "../../dist/fusion-dispatch-DXF9kxAE.js",
+  "../../dist/dispatch-RO6qzdR4.js": {
+    "file": "_app/immutable/chunks/DoYp_Mtd.js",
+    "name": "dispatch-RO6qzdR4",
+    "src": "../../dist/dispatch-RO6qzdR4.js",
     "isDynamicEntry": true,
     "imports": [
-      "_CNEoBiV9.js"
+      "_BFmezKYF.js"
     ]
   },
-  "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types_b60a6125d0c95863c0ed2c3954d1cbca/node_modules/@sveltejs/kit/src/runtime/client/entry.js": {
-    "file": "_app/immutable/entry/start.C20lYnFV.js",
+  "../../dist/fusion-dispatch-BLS1s3O4.js": {
+    "file": "_app/immutable/chunks/HRxpMvp9.js",
+    "name": "fusion-dispatch-BLS1s3O4",
+    "src": "../../dist/fusion-dispatch-BLS1s3O4.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "_BFmezKYF.js"
+    ]
+  },
+  "../../dist/row-program-dispatch-HNv20MIc.js": {
+    "file": "_app/immutable/chunks/CCjjGEQt.js",
+    "name": "row-program-dispatch-HNv20MIc",
+    "src": "../../dist/row-program-dispatch-HNv20MIc.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "_BFmezKYF.js"
+    ]
+  },
+  "../../dist/webgpu-WztPj-Yw.js": {
+    "file": "_app/immutable/chunks/DcbAmXV3.js",
+    "name": "webgpu-WztPj-Yw",
+    "src": "../../dist/webgpu-WztPj-Yw.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "_BFmezKYF.js"
+    ]
+  },
+  "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types+node@_2sduqbq5h4cbrunoshjxrvpfae/node_modules/@sveltejs/kit/src/runtime/client/entry.js": {
+    "file": "_app/immutable/entry/start.Gh3DlNQN.js",
     "name": "entry/start",
-    "src": "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types_b60a6125d0c95863c0ed2c3954d1cbca/node_modules/@sveltejs/kit/src/runtime/client/entry.js",
+    "src": "../../node_modules/.pnpm/@sveltejs+kit@2.49.4_@sveltejs+vite-plugin-svelte@5.1.1_svelte@5.46.1_vite@6.4.1_@types+node@_2sduqbq5h4cbrunoshjxrvpfae/node_modules/@sveltejs/kit/src/runtime/client/entry.js",
     "isEntry": true,
     "imports": [
-      "_t0dpMB91.js"
+      "_CXMw5cI8.js"
     ]
   },
   ".svelte-kit/generated/client-optimized/app.js": {
-    "file": "_app/immutable/entry/app.Do0iGl4s.js",
+    "file": "_app/immutable/entry/app.B47v30Gr.js",
     "name": "entry/app",
     "src": ".svelte-kit/generated/client-optimized/app.js",
     "isEntry": true,
     "imports": [
-      "_BxLj5Vw_.js",
-      "_Dg8bTafm.js",
-      "_Bhr74y56.js",
-      "_Dnu1u84q.js",
-      "_NCSuz3cp.js",
-      "_97Z11XPK.js"
+      "_DtExVYyI.js",
+      "_Cft5xwsY.js",
+      "_DH20m1UJ.js",
+      "_D7odF2t9.js",
+      "_C679vkDn.js",
+      "_BYO0Wanp.js"
     ],
     "dynamicImports": [
       ".svelte-kit/generated/client-optimized/nodes/0.js",
@@ -46,116 +73,118 @@
     ]
   },
   ".svelte-kit/generated/client-optimized/nodes/0.js": {
-    "file": "_app/immutable/nodes/0.CAkD5XWs.js",
+    "file": "_app/immutable/nodes/0.Q6OdBz6X.js",
     "name": "nodes/0",
     "src": ".svelte-kit/generated/client-optimized/nodes/0.js",
     "isEntry": true,
     "isDynamicEntry": true,
     "imports": [
-      "_Dnu1u84q.js",
-      "_Dg8bTafm.js",
-      "_97Z11XPK.js"
+      "_D7odF2t9.js",
+      "_Cft5xwsY.js",
+      "_BYO0Wanp.js"
     ],
     "css": [
-      "_app/immutable/assets/0.DupwL_S5.css"
+      "_app/immutable/assets/0.3jRTbWuF.css"
     ]
   },
   ".svelte-kit/generated/client-optimized/nodes/1.js": {
-    "file": "_app/immutable/nodes/1.OLb_VPGd.js",
+    "file": "_app/immutable/nodes/1.DsP8DkL1.js",
     "name": "nodes/1",
     "src": ".svelte-kit/generated/client-optimized/nodes/1.js",
     "isEntry": true,
     "isDynamicEntry": true,
     "imports": [
-      "_Dnu1u84q.js",
-      "_CePjyyUQ.js",
-      "_Dg8bTafm.js",
-      "_Bhr74y56.js",
-      "_t0dpMB91.js"
+      "_D7odF2t9.js",
+      "_Cft5xwsY.js",
+      "_DH20m1UJ.js",
+      "_CXMw5cI8.js"
     ]
   },
   ".svelte-kit/generated/client-optimized/nodes/2.js": {
-    "file": "_app/immutable/nodes/2.tiG35_vP.js",
+    "file": "_app/immutable/nodes/2.BC7jBwEy.js",
     "name": "nodes/2",
     "src": ".svelte-kit/generated/client-optimized/nodes/2.js",
     "isEntry": true,
     "imports": [
-      "_CNEoBiV9.js"
+      "_BFmezKYF.js"
     ]
   },
-  "_97Z11XPK.js": {
-    "file": "_app/immutable/chunks/97Z11XPK.js",
-    "name": "branches",
-    "imports": [
-      "_Dg8bTafm.js"
-    ]
-  },
-  "_Bhr74y56.js": {
-    "file": "_app/immutable/chunks/Bhr74y56.js",
-    "name": "render",
-    "imports": [
-      "_Dg8bTafm.js",
-      "_Dnu1u84q.js"
-    ]
-  },
-  "_BxLj5Vw_.js": {
-    "file": "_app/immutable/chunks/BxLj5Vw_.js",
-    "name": "preload-helper",
-    "imports": [
-      "_Dg8bTafm.js",
-      "_97Z11XPK.js"
-    ]
-  },
-  "_CNEoBiV9.js": {
-    "file": "_app/immutable/chunks/CNEoBiV9.js",
-    "name": "tensor-DeBod2ZW",
+  "_BFmezKYF.js": {
+    "file": "_app/immutable/chunks/BFmezKYF.js",
+    "name": "tensor-DNI3XZeL",
     "isDynamicEntry": true,
     "imports": [
-      "_Dnu1u84q.js",
-      "_CePjyyUQ.js",
-      "_Dg8bTafm.js",
-      "_Bhr74y56.js",
-      "_BxLj5Vw_.js",
-      "_NCSuz3cp.js"
+      "_DtExVYyI.js",
+      "_D7odF2t9.js",
+      "_C679vkDn.js",
+      "_Cft5xwsY.js",
+      "_DH20m1UJ.js"
     ],
     "dynamicImports": [
-      "../../dist/fusion-dispatch-DXF9kxAE.js",
-      "../../dist/fusion-dispatch-BPOVQPxj.js",
-      "src/lib/webgpu-stub.ts"
+      "../../dist/buffer-pool-BANCNxXy.js",
+      "__vite-browser-external",
+      "../../dist/webgpu-WztPj-Yw.js",
+      "../../dist/dispatch-RO6qzdR4.js",
+      "src/lib/webgpu-stub.ts",
+      "../../dist/fusion-dispatch-BLS1s3O4.js",
+      "../../dist/row-program-dispatch-HNv20MIc.js",
+      "../../dist/webgpu-WztPj-Yw.js"
     ]
   },
-  "_CePjyyUQ.js": {
-    "file": "_app/immutable/chunks/CePjyyUQ.js",
-    "name": "legacy",
+  "_BYO0Wanp.js": {
+    "file": "_app/immutable/chunks/BYO0Wanp.js",
+    "name": "branches",
     "imports": [
-      "_Dg8bTafm.js"
+      "_Cft5xwsY.js"
     ]
   },
-  "_Dg8bTafm.js": {
-    "file": "_app/immutable/chunks/Dg8bTafm.js",
-    "name": "runtime"
-  },
-  "_Dnu1u84q.js": {
-    "file": "_app/immutable/chunks/Dnu1u84q.js",
-    "name": "disclose-version",
-    "imports": [
-      "_Dg8bTafm.js"
-    ]
-  },
-  "_NCSuz3cp.js": {
-    "file": "_app/immutable/chunks/NCSuz3cp.js",
+  "_C679vkDn.js": {
+    "file": "_app/immutable/chunks/C679vkDn.js",
     "name": "index-client",
     "imports": [
-      "_Dg8bTafm.js"
+      "_Cft5xwsY.js"
     ]
   },
-  "_t0dpMB91.js": {
-    "file": "_app/immutable/chunks/t0dpMB91.js",
+  "_CXMw5cI8.js": {
+    "file": "_app/immutable/chunks/CXMw5cI8.js",
     "name": "entry",
     "imports": [
-      "_Dg8bTafm.js",
-      "_NCSuz3cp.js"
+      "_Cft5xwsY.js",
+      "_C679vkDn.js"
     ]
+  },
+  "_Cft5xwsY.js": {
+    "file": "_app/immutable/chunks/Cft5xwsY.js",
+    "name": "runtime"
+  },
+  "_D7odF2t9.js": {
+    "file": "_app/immutable/chunks/D7odF2t9.js",
+    "name": "disclose-version",
+    "imports": [
+      "_Cft5xwsY.js"
+    ]
+  },
+  "_DH20m1UJ.js": {
+    "file": "_app/immutable/chunks/DH20m1UJ.js",
+    "name": "render",
+    "imports": [
+      "_Cft5xwsY.js",
+      "_D7odF2t9.js"
+    ]
+  },
+  "_DtExVYyI.js": {
+    "file": "_app/immutable/chunks/DtExVYyI.js",
+    "name": "preload-helper",
+    "imports": [
+      "_Cft5xwsY.js",
+      "_BYO0Wanp.js"
+    ]
+  },
+  "__vite-browser-external": {
+    "file": "_app/immutable/chunks/BIHI7g3E.js",
+    "name": "__vite-browser-external",
+    "src": "__vite-browser-external",
+    "isDynamicEntry": true
   },
   "src/lib/webgpu-stub.ts": {
     "file": "_app/immutable/chunks/_9UqjFoi.js",

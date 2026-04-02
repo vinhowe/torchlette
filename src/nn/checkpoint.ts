@@ -24,8 +24,38 @@
  * linearly with sequence length and layer count.
  */
 
-import type { PackHook, Tensor, Torchlette, UnpackHook } from "../frontend";
-import { markAsCheckpointBoundary } from "../engine/lazy";
+import { markAsCheckpointBoundary } from "../executor/plan-builder";
+import type {
+  PackHook,
+  Tensor,
+  Torchlette,
+  UnpackHook,
+} from "../frontend/torchlette";
+import type { RngDrawRecord } from "../graph/engine-types";
+
+/**
+ * Pending checkpoint disposal scopes. Each checkpoint recomputation pushes
+ * a Set of recomputed intermediate tensors. After backward finishes,
+ * disposeCheckpointIntermediates() disposes and clears all pending scopes.
+ *
+ * This is the ONLY mechanism for checkpoint tensor cleanup — no heuristics
+ * in the autograd cleanup. The checkpoint creates the tensors, the checkpoint
+ * owns their disposal.
+ */
+export const _pendingCheckpointScopes: Array<Set<Tensor>> = [];
+
+/**
+ * Dispose all checkpoint-recomputed intermediates and clear pending scopes.
+ * Called by the autograd backward after all gradient computation is done.
+ */
+export function disposeCheckpointIntermediates(): void {
+  for (const scope of _pendingCheckpointScopes) {
+    for (const t of scope) {
+      if (!t.isDisposed) t.dispose();
+    }
+  }
+  _pendingCheckpointScopes.length = 0;
+}
 
 // ============================================================================
 // Types
@@ -37,13 +67,6 @@ export type CheckpointOptions = {
    * Default: true
    */
   preserveRngState?: boolean;
-
-  /**
-   * Whether to use reentrant checkpointing (PyTorch-style).
-   * When false, uses simpler non-reentrant implementation.
-   * Default: false (non-reentrant is more efficient and recommended)
-   */
-  useReentrant?: boolean;
 };
 
 /**
@@ -92,12 +115,7 @@ export function checkpoint<T extends Tensor>(
   inputs: Tensor[],
   options: CheckpointOptions = {},
 ): T {
-  const { preserveRngState = true, useReentrant = false } = options;
-
-  if (useReentrant) {
-    // Reentrant falls back to non-reentrant for now
-    return checkpointNonReentrant(api, fn, inputs, preserveRngState);
-  }
+  const { preserveRngState = true } = options;
   return checkpointNonReentrant(api, fn, inputs, preserveRngState);
 }
 
@@ -119,16 +137,19 @@ function checkpointNonReentrant<T extends Tensor>(
   inputs: Tensor[],
   preserveRngState: boolean,
 ): T {
-  // Get the underlying engine for checkpoint primitives
-  const engine = api.engine;
+  // Get the underlying runtime for checkpoint primitives
+  const engine = api.runtime;
 
-  // Keep inputs alive for recomputation
+  // Keep inputs alive for recomputation.
+  // Also register them for disposal after backward — they're only needed
+  // for recomputation and shouldn't survive beyond the backward pass.
   for (const input of inputs) {
     api.keep(input);
   }
+  _pendingCheckpointScopes.push(new Set(inputs));
 
   // Record RNG state if needed for deterministic recomputation
-  let rngDraws: unknown[] | null = null;
+  let rngDraws: RngDrawRecord[] | null = null;
   if (preserveRngState) {
     engine._debug_startCheckpointRecord();
   }
@@ -161,11 +182,11 @@ function checkpointNonReentrant<T extends Tensor>(
       let captureIndex = 0;
       let lastCapturedTensor: Tensor | null = null;
 
-      // Capture tensors during recomputation
+      // Capture tensors during recomputation.
       const captureHook: PackHook = (t: Tensor): Tensor => {
-        recomputedTensors!.set(captureIndex++, t);
+        recomputedTensors?.set(captureIndex++, t);
         lastCapturedTensor = t;
-        return t; // Return tensor directly during recompute (no placeholder)
+        return t;
       };
 
       // Recompute with capture hooks inside tidy() to dispose non-captured
@@ -173,11 +194,15 @@ function checkpointNonReentrant<T extends Tensor>(
       // whose autograd graph chains keep RuntimeTensors alive until GC,
       // causing ~150 StorageHandle leaks per training step.
       api.tidy(() => {
-        api.saved_tensors_hooks(captureHook, (t) => t as Tensor, () => {
-          fn(...inputs);
-        });
+        api.saved_tensors_hooks(
+          captureHook,
+          (t) => t as Tensor,
+          () => {
+            fn(...inputs);
+          },
+        );
         // Keep captured tensors so they survive tidy disposal
-        for (const t of recomputedTensors!.values()) {
+        for (const t of recomputedTensors?.values() ?? []) {
           api.keep(t);
         }
       });
@@ -191,7 +216,7 @@ function checkpointNonReentrant<T extends Tensor>(
       // This tells the segmented executor to flush buffers after this
       // checkpoint region, enabling memory reuse for subsequent segments.
       if (lastCapturedTensor) {
-        const lazyRef = lastCapturedTensor._runtimeTensor().lazyRef;
+        const lazyRef = (lastCapturedTensor as Tensor)._runtimeTensor().lazyRef;
         if (lazyRef?.kind === "pending" && lazyRef.node) {
           markAsCheckpointBoundary(lazyRef.node);
         }
@@ -200,13 +225,15 @@ function checkpointNonReentrant<T extends Tensor>(
 
     const result = recomputedTensors.get(checkpointIndex);
     if (!result) {
-      throw new Error(`Checkpoint: no tensor at index ${checkpointIndex} after recomputation`);
+      throw new Error(
+        `Checkpoint: no tensor at index ${checkpointIndex} after recomputation`,
+      );
     }
     return result;
   };
 
-  // Run forward with pack/unpack hooks inside tidy() to dispose intermediates
-  // The output tensor is kept, but all other tensors created inside fn() are disposed
+  // Run forward with pack/unpack hooks inside tidy() to dispose intermediates.
+  // The output tensor is kept, but all other tensors created inside fn() are disposed.
   const output = api.tidy(() => {
     const result = api.saved_tensors_hooks(packHook, unpackHook, () => {
       return fn(...inputs);

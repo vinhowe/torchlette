@@ -1,13 +1,11 @@
-import { describe, expect, it, beforeAll } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
-  initWebGPU,
-  getWebGPUInitError,
-  webgpuBackend,
   getMaxStorageBufferBindingSize,
+  getWebGPUInitError,
+  initWebGPU,
+  webgpuBackend,
 } from "../../src/backend/webgpu";
 import { cpuOnly } from "../helpers/webgpu";
-
-type WebGPUTensor = ReturnType<typeof webgpuBackend.ops.tensorFromArray>;
 
 describe.skipIf(cpuOnly)("Chunked gather for large tensors", () => {
   let maxBindingSize: number;
@@ -164,7 +162,10 @@ describe("Chunked scatterAdd for large tensors", () => {
     it("scatters to 2D tensor along dim 0", async () => {
       // Output: [3, 2] zeros
       // Scatter src [2, 2] with indices [[1, 0], [2, 1]] along dim 0
-      const output = webgpuBackend.ops.tensorFromArray(Array(6).fill(0), [3, 2]);
+      const output = webgpuBackend.ops.tensorFromArray(
+        Array(6).fill(0),
+        [3, 2],
+      );
       const src = webgpuBackend.ops.tensorFromArray([1, 2, 3, 4], [2, 2]);
       const indices = webgpuBackend.ops.tensorFromArray([1, 0, 2, 1], [2, 2]);
 
@@ -374,14 +375,16 @@ describe("Integration: gather/scatterAdd roundtrip", () => {
     expect(gathered.shape).toEqual([3, 4]);
     const gatheredValues = await webgpuBackend.ops.read(gathered);
     // Row 1: [4,5,6,7], Row 3: [12,13,14,15], Row 5: [20,21,22,23]
-    expect(gatheredValues).toEqual([4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23]);
+    expect(gatheredValues).toEqual([
+      4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23,
+    ]);
 
     // Now scatter back to a zero tensor
     const zeros = webgpuBackend.ops.tensorFromArray(Array(32).fill(0), [8, 4]);
-    const scatterIndices = webgpuBackend.ops.tensorFromArray(gatherIndices, [
-      3,
-      4,
-    ]);
+    const scatterIndices = webgpuBackend.ops.tensorFromArray(
+      gatherIndices,
+      [3, 4],
+    );
     const scattered = webgpuBackend.ops.scatterAdd(
       zeros,
       scatterIndices,

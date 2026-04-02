@@ -13,29 +13,37 @@
  * step-level scope management (beginStep/endStep).
  */
 
-import type { GPUBuffer, GPUCommandBuffer, GPUCommandEncoder, GPUComputePipeline, GPUBindGroup, WebGPUContext } from "./gpu-types";
-import {
-  activeBatch, setActiveBatch,
-  sharedEncoderActive, setSharedEncoderActive,
-  sharedEncoderWriteSet, resetSharedEncoderWriteSet, trackSharedEncoderWrite,
-  replayPinnedBufferSet,
-  requireContext,
-  incrementSubmitCount,
-  paramsBufferSizeClass, paramsBufferPools, MAX_PARAMS_POOL_SIZE_PER_CLASS,
-} from "./webgpu-state";
-import { bufferPool, awaitDeferredFence } from "./buffer-pool";
-import { resolveGpuTimestamps, profileApiCall } from "./profiler";
-import { getSizeClass } from "../../engine/memory-planning";
-
+import { getSizeClass } from "../../graph/lifetime-analysis";
 import { resetDispatchSequence } from "./bind-group-cache";
-import { prePinOutputBuffers, pinnedOutputBuffers } from "./buffer-arena";
+import { pinnedOutputBuffers, prePinOutputBuffers } from "./buffer-arena";
+import { awaitDeferredFence, bufferPool } from "./buffer-pool";
+import type {
+  GPUBuffer,
+  GPUCommandBuffer,
+  GPUCommandEncoder,
+} from "./gpu-types";
+import { profileApiCall, resolveGpuTimestamps } from "./profiler";
+import {
+  activeBatch,
+  incrementSubmitCount,
+  MAX_PARAMS_POOL_SIZE_PER_CLASS,
+  paramsBufferPools,
+  paramsBufferSizeClass,
+  requireContext,
+  resetSharedEncoderWriteSet,
+  setActiveBatch,
+  setSharedEncoderActive,
+  sharedEncoderActive,
+  sharedEncoderWriteSet,
+} from "./webgpu-state";
 
-// Re-exports from webgpu-state for backward compatibility
-export type { BatchExecutionContext } from "./webgpu-state";
-export { activeBatch } from "./webgpu-state";
-export { sharedEncoderActive as sharedEncoder } from "./webgpu-state";
-export { sharedEncoderWriteSet, trackSharedEncoderWrite } from "./webgpu-state";
-export { getSubmitCount, resetSubmitCount, incrementSubmitCount, gpuSubmitCount } from "./webgpu-state";
+// Re-exports from webgpu-state
+export {
+  getSubmitCount,
+  incrementSubmitCount,
+  resetSubmitCount,
+  trackSharedEncoderWrite,
+} from "./webgpu-state";
 
 // ============================================================================
 // Batch Execution Context for True Segmented Execution
@@ -83,8 +91,6 @@ export async function endBatchExecution(): Promise<void> {
 
   // Now safe to destroy deferred buffers (GPU is done with them)
   for (const buffer of batch.deferredDestroyBuffers) {
-    // Replay-pinned buffers must survive — referenced by recorded bind groups.
-    if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buffer)) continue;
     buffer.destroy();
   }
   // Also flush any pending pool buffers since GPU work is complete
@@ -105,37 +111,10 @@ export function abortBatch(): void {
   setActiveBatch(null);
 }
 
-/**
- * Get the current batch encoder if active, otherwise null.
- * DEPRECATED: Use dispatchComputePass or submitOrCollect instead.
- */
-export function getActiveBatchEncoder(): GPUCommandEncoder | null {
-  // Return null to indicate batch mode uses collected buffers, not shared encoder
-  return null;
-}
-
 // ============================================================================
 // Shared Encoder — Command Buffer Consolidation
 // ============================================================================
-//
-// Multiple compute passes are encoded into a shared GPUCommandEncoder to reduce
-// queue.submit() calls. A write-set tracks all buffers written during the current
-// encoder scope so the buffer pool never returns a buffer that was already written
-// in this scope (preventing the aliasing corruption that broke previous attempts).
-//
-// Ops that create their own encoders (matmul, reductions) flush the shared encoder
-// first, then their command buffer is collected and submitted alongside the
-// shared encoder's CB at flush/end time.
 
-// True Shared Encoder: a single GPUCommandEncoder is shared across multiple ops.
-// Each op encodes its compute pass directly onto the shared encoder instead of
-// creating its own encoder + command buffer. This eliminates ~3700 encoder
-// creations per DistilGPT-2 training step.
-//
-// The write set tracks buffers written during the current shared encoder scope
-// to prevent buffer pool aliasing — ensuring a buffer written by an earlier op
-// is not reused as output for a later op within the same scope.
-//
 /**
  * Shared encoder mutable state — groups all module-level let variables
  * into a single typed object for debuggability and explicit reset.
@@ -173,15 +152,21 @@ const SHARED_ENCODER_MAX_PASSES = 2000;
 const PARAMS_FLUSH_THRESHOLD = 2000;
 
 // Debug flag: set TORCHLETTE_DEBUG_SHARED_ENCODER=1 to enable verbose logging
-const DEBUG_SHARED_ENCODER = typeof process !== "undefined" && !!process.env?.TORCHLETTE_DEBUG_SHARED_ENCODER;
+const DEBUG_SHARED_ENCODER =
+  typeof process !== "undefined" &&
+  !!process.env?.TORCHLETTE_DEBUG_SHARED_ENCODER;
 
 // currentOpLabel + get/set moved to webgpu-state.ts, re-exported here for backward compat.
-export { setCurrentOpLabel, getCurrentOpLabel } from "./webgpu-state";
+export { getCurrentOpLabel, setCurrentOpLabel } from "./webgpu-state";
 
 // Adam batch mode: when true, adamStep() skips its pre-dispatch flushSharedEncoder().
 // The caller (lazy.ts) is responsible for a single flush before the Adam batch.
-export function setAdamBatchMode(active: boolean): void { encoderState.adamBatchMode = active; }
-export function isAdamBatchMode(): boolean { return encoderState.adamBatchMode; }
+export function setAdamBatchMode(active: boolean): void {
+  encoderState.adamBatchMode = active;
+}
+export function isAdamBatchMode(): boolean {
+  return encoderState.adamBatchMode;
+}
 
 export function beginSharedEncoder(): void {
   if (!encoderState.enabled) return;
@@ -199,24 +184,26 @@ export function beginSharedEncoder(): void {
 }
 
 /**
- * Flush the shared encoder: finish current encoder into a CB, combine with
- * any collected CBs, submit all, then create a fresh encoder.
+ * Finish current encoder, combine with collected CBs, submit, and reset state.
+ * When createNew is true (flush), a fresh encoder is created for continued encoding.
+ * When createNew is false (end), the encoder is nulled out.
  */
-export function flushSharedEncoder(): void {
-  if (!sharedEncoderActive) return;
+function finishAndSubmitEncoder(createNew: boolean): void {
   const ctx = requireContext();
-
-  // Finish the shared encoder into a command buffer
   const cbs: GPUCommandBuffer[] = [];
   if (encoderState.instance) {
-    resolveGpuTimestamps(encoderState.instance);
+    resolveGpuTimestamps();
     cbs.push(encoderState.instance.finish());
+    encoderState.instance = createNew
+      ? ctx.device.createCommandEncoder()
+      : null;
   }
-  // Add any collected CBs (from ops that bypassed the shared encoder)
   cbs.push(...encoderState.collectedCommandBuffers);
 
   if (DEBUG_SHARED_ENCODER && cbs.length > 0) {
-    console.log(`[shared-enc] FLUSH: ${encoderState.passCount} passes on encoder, ${encoderState.collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`);
+    console.log(
+      `[shared-enc] ${createNew ? "FLUSH" : "END"}: ${encoderState.passCount} passes, ${encoderState.collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`,
+    );
   }
 
   if (cbs.length > 0) {
@@ -224,22 +211,13 @@ export function flushSharedEncoder(): void {
     incrementSubmitCount();
   }
 
-  // Reset state and create fresh encoder
   encoderState.collectedCommandBuffers = [];
   resetSharedEncoderWriteSet();
-  encoderState.instance = ctx.device.createCommandEncoder();
   encoderState.passCount = 0;
-
-  // Return deferred uniform buffers to pool so subsequent passes can reuse them.
-  // This is critical for step-level scope where the encoder stays open across flushes.
-  // Reverse iteration: buffers were deferred in forward order (A,B,C...), so pushing
-  // them in reverse (C,B,A) means the next LIFO pop() sequence returns A,B,C —
-  // matching the original acquisition order for bind group cache stability.
+  // Return deferred uniform buffers to pool. Reverse iteration preserves LIFO
+  // acquisition order for bind group cache stability.
   for (let i = encoderState.deferredUniformBuffers.length - 1; i >= 0; i--) {
     const buf = encoderState.deferredUniformBuffers[i];
-    // Replay-pinned buffers must stay alive — referenced by recorded bind groups.
-    // Don't return them to the pool (prevents reuse and data corruption).
-    if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buf)) continue;
     const sc = paramsBufferSizeClass(buf.size);
     const pool = paramsBufferPools.get(sc);
     if (pool) {
@@ -253,12 +231,20 @@ export function flushSharedEncoder(): void {
     }
   }
   encoderState.deferredUniformBuffers = [];
+}
 
-  // NOTE: Do NOT flush pendingRelease to pool here (§14.1). Mid-step buffer
-  // reclamation causes corruption — buffers released during a step (e.g.
-  // forward-pass intermediates) may still be in-flight on the GPU when
-  // reacquired by a subsequent op in the same step. Pending buffers are
-  // safely flushed at endSharedEncoder() (end-of-step).
+/**
+ * Flush the shared encoder: finish current encoder into a CB, combine with
+ * any collected CBs, submit all, then create a fresh encoder.
+ *
+ * NOTE: Does NOT flush pendingRelease to pool (§14.1). Mid-step buffer
+ * reclamation causes corruption — buffers released during a step may still
+ * be in-flight on the GPU when reacquired. Pending buffers are safely
+ * flushed at endSharedEncoder() (end-of-step).
+ */
+export function flushSharedEncoder(): void {
+  if (!sharedEncoderActive) return;
+  finishAndSubmitEncoder(true);
 }
 
 export function endSharedEncoder(): void {
@@ -273,55 +259,12 @@ export function endSharedEncoder(): void {
     }
 
     setSharedEncoderActive(false);
-    const ctx = requireContext();
-
-    // Finish the shared encoder and submit everything
-    const cbs: GPUCommandBuffer[] = [];
-    if (encoderState.instance) {
-      resolveGpuTimestamps(encoderState.instance);
-      cbs.push(encoderState.instance.finish());
-      encoderState.instance = null;
-    }
-    cbs.push(...encoderState.collectedCommandBuffers);
-
-    if (DEBUG_SHARED_ENCODER && cbs.length > 0) {
-      console.log(`[shared-enc] END: ${encoderState.passCount} passes on encoder, ${encoderState.collectedCommandBuffers.length} collected CBs, ${sharedEncoderWriteSet.size} writes`);
-    }
-
-    if (cbs.length > 0) {
-      profileApiCall("queue.submit", () => ctx.queue.submit(cbs));
-      incrementSubmitCount();
-    }
-
-    encoderState.collectedCommandBuffers = [];
-    resetSharedEncoderWriteSet();
-
-    encoderState.passCount = 0;
-
-    // Return deferred uniform buffers to pool now that all CBs are submitted.
-    // Reverse iteration for LIFO stability (see flushSharedEncoder comment).
-    for (let i = encoderState.deferredUniformBuffers.length - 1; i >= 0; i--) {
-      const buf = encoderState.deferredUniformBuffers[i];
-      // Replay-pinned buffers must stay alive — referenced by recorded bind groups.
-      if (replayPinnedBufferSet !== null && replayPinnedBufferSet.has(buf)) continue;
-      const sc = paramsBufferSizeClass(buf.size);
-      const pool = paramsBufferPools.get(sc);
-      if (pool) {
-        if (pool.length < MAX_PARAMS_POOL_SIZE_PER_CLASS) {
-          pool.push(buf);
-        } else {
-          bufferPool.deferredDestroyUntracked(buf);
-        }
-      } else {
-        paramsBufferPools.set(sc, [buf]);
-      }
-    }
-    encoderState.deferredUniformBuffers = [];
+    finishAndSubmitEncoder(false);
 
     // Flush storage buffer pendingRelease → main pool. The encoder was just
     // submitted, so buffers released by earlier passes are safe to reuse.
     bufferPool.flushPendingToAvailable();
-    bufferPool.beginWindow();  // End-of-step is also a window boundary
+    bufferPool.beginWindow(); // End-of-step is also a window boundary
   }
 }
 
@@ -333,26 +276,19 @@ export function endSharedEncoder(): void {
 export async function beginStep(): Promise<void> {
   if (encoderState.stepLevelScope) return; // already in step scope
   encoderState.stepLevelScope = true;
-  // Await any deferred fence from the previous markStep BEFORE opening the
-  // shared encoder.  This flushes pendingRelease buffers into the main pool
-  // so the upcoming training step can reuse them, eliminating the 2-step lag
-  // that previously caused hundreds of unnecessary createBuffer() calls.
+
+  // Fence is already awaited by markStep — just do buffer pool maintenance.
+  // awaitDeferredFence() is a no-op here (fence already consumed), but call
+  // it for safety in case beginStep is called without a prior markStep.
   await awaitDeferredFence();
-  // End the previous step's window tracking (if any) and compute reservation.
-  // This must happen AFTER awaitDeferredFence (which may trigger pool operations)
-  // and BEFORE reserve() (which uses the computed reservation).
-  // We end tracking here (not in endStep) so that post-step cleanup acquires
-  // (from markStep/GC) are captured in the recording.
+  bufferPool.destroyPendingBuffers();
   bufferPool.endWindowTracking();
-  // Reserve buffers based on window-demand recording from previous step.
-  // Falls back to prewarm() on the first step (no recording yet).
-  // Must happen BEFORE opening the shared encoder (no writeSet conflicts).
   bufferPool.reserve(requireContext().device);
-  bufferPool.sortPoolBuckets(); // deterministic acquire order for bind group cache
-  prePinOutputBuffers(); // pre-extract hinted output buffers before any dispatches
-  bufferPool.beginWindowTracking();  // Start recording this step's demand
-  beginSharedEncoder(); // open the shared encoder for the whole step
-  resetDispatchSequence(); // reset bind group cache sequence counter for this step
+  bufferPool.sortPoolBuckets();
+  prePinOutputBuffers();
+  bufferPool.beginWindowTracking();
+  beginSharedEncoder();
+  resetDispatchSequence();
 }
 
 /**
@@ -365,7 +301,7 @@ export function endStep(): void {
   // Return any unconsumed pre-pinned buffers to the pool
   for (let i = 0; i < pinnedOutputBuffers.length; i++) {
     const buf = pinnedOutputBuffers[i];
-    if (buf !== null && buf !== undefined) {
+    if (buf != null) {
       bufferPool.returnToPool(buf, getSizeClass(buf.size));
       pinnedOutputBuffers[i] = null;
     }
@@ -379,7 +315,6 @@ export function endStep(): void {
 export function isSharedEncoderActive(): boolean {
   return sharedEncoderActive;
 }
-
 
 export function setSharedEncoderEnabled(enabled: boolean): void {
   encoderState.enabled = enabled;
@@ -403,10 +338,11 @@ export function incrementSharedEncoderPassCount(): void {
  * This prevents extremely large command buffers and bounds the write/read sets.
  */
 export function autoFlushSharedEncoder(): void {
-  if (sharedEncoderActive && (
-    encoderState.passCount >= SHARED_ENCODER_MAX_PASSES ||
-    encoderState.deferredUniformBuffers.length >= PARAMS_FLUSH_THRESHOLD
-  )) {
+  if (
+    sharedEncoderActive &&
+    (encoderState.passCount >= SHARED_ENCODER_MAX_PASSES ||
+      encoderState.deferredUniformBuffers.length >= PARAMS_FLUSH_THRESHOLD)
+  ) {
     flushSharedEncoder();
   }
 }
@@ -414,13 +350,6 @@ export function autoFlushSharedEncoder(): void {
 /** Defer a uniform buffer for destruction at end of shared encoder scope. */
 export function deferUniformBufferForSharedEncoder(buffer: GPUBuffer): void {
   encoderState.deferredUniformBuffers.push(buffer);
-}
-
-/**
- * Check if a buffer was written during the current shared encoder scope.
- */
-export function isInSharedEncoderWriteSet(buffer: GPUBuffer): boolean {
-  return sharedEncoderWriteSet.has(buffer);
 }
 
 /**

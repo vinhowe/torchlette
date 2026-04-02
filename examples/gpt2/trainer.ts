@@ -4,7 +4,7 @@
  * Training loop with compile() wrapping forward + backward + optimizer + zeroGrad.
  */
 
-import type { Tensor, Torchlette, DeviceKind } from "../../src/frontend";
+import type { Tensor, Torchlette, DeviceKind } from "../../src/frontend/torchlette";
 import { Adam, type AdamOptions } from "../../src/optim";
 import { GPT2 } from "./model";
 import { FineWebDataLoader } from "./data";

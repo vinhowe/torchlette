@@ -5,8 +5,8 @@
  * with a simplified transformer-like model structure.
  */
 
-import { describe, expect, it, beforeEach } from "vitest";
-import { Torchlette, type FrontendTensor as Tensor } from "../src/frontend";
+import { beforeEach, describe, expect, it } from "vitest";
+import { type FrontendTensor as Tensor, Torchlette } from "../src/frontend/torchlette";
 import { checkpoint } from "../src/nn/checkpoint";
 
 /**
@@ -19,19 +19,25 @@ class ResidualMLP {
   private w2: Tensor;
   private b2: Tensor;
 
-  constructor(
-    private api: Torchlette,
-    dim: number,
-    hiddenDim: number,
-  ) {
+  constructor(api: Torchlette, dim: number, hiddenDim: number) {
     // Initialize with small random values for numerical stability
     const scale = 0.1 / Math.sqrt(dim);
-    const w1Data = Array.from({ length: dim * hiddenDim }, () => (Math.random() - 0.5) * scale);
-    const w2Data = Array.from({ length: hiddenDim * dim }, () => (Math.random() - 0.5) * scale);
+    const w1Data = Array.from(
+      { length: dim * hiddenDim },
+      () => (Math.random() - 0.5) * scale,
+    );
+    const w2Data = Array.from(
+      { length: hiddenDim * dim },
+      () => (Math.random() - 0.5) * scale,
+    );
 
-    this.w1 = api.tensorFromArray(w1Data, [dim, hiddenDim], { requiresGrad: true });
+    this.w1 = api.tensorFromArray(w1Data, [dim, hiddenDim], {
+      requiresGrad: true,
+    });
     this.b1 = api.zeros([hiddenDim], { requiresGrad: true });
-    this.w2 = api.tensorFromArray(w2Data, [hiddenDim, dim], { requiresGrad: true });
+    this.w2 = api.tensorFromArray(w2Data, [hiddenDim, dim], {
+      requiresGrad: true,
+    });
     this.b2 = api.zeros([dim], { requiresGrad: true });
   }
 
@@ -60,10 +66,10 @@ class StackedMLP {
 
   constructor(
     private api: Torchlette,
-    private inputDim: number,
-    private hiddenDim: number,
-    private outputDim: number,
-    private numLayers: number,
+    inputDim: number,
+    hiddenDim: number,
+    outputDim: number,
+    numLayers: number,
   ) {
     // Residual MLP blocks
     this.blocks = [];
@@ -73,8 +79,13 @@ class StackedMLP {
 
     // Output projection
     const scale = 0.1 / Math.sqrt(inputDim);
-    const projData = Array.from({ length: inputDim * outputDim }, () => (Math.random() - 0.5) * scale);
-    this.outputProj = api.tensorFromArray(projData, [inputDim, outputDim], { requiresGrad: true });
+    const projData = Array.from(
+      { length: inputDim * outputDim },
+      () => (Math.random() - 0.5) * scale,
+    );
+    this.outputProj = api.tensorFromArray(projData, [inputDim, outputDim], {
+      requiresGrad: true,
+    });
     this.outputBias = api.zeros([outputDim], { requiresGrad: true });
   }
 
@@ -135,9 +146,13 @@ describe("Model Checkpoint + AMP Integration", () => {
         { length: BATCH_SIZE * SEQ_LEN * INPUT_DIM },
         () => Math.random() - 0.5,
       );
-      const input = torch.tensorFromArray(inputData, [BATCH_SIZE, SEQ_LEN, INPUT_DIM], {
-        requiresGrad: true,
-      });
+      const input = torch.tensorFromArray(
+        inputData,
+        [BATCH_SIZE, SEQ_LEN, INPUT_DIM],
+        {
+          requiresGrad: true,
+        },
+      );
 
       // Forward
       const output = model.forward(input, false);
@@ -154,7 +169,7 @@ describe("Model Checkpoint + AMP Integration", () => {
         expect(param.grad).not.toBeNull();
 
         // Gradient should not contain NaN
-        const gradData = await param.grad!.cpu();
+        const gradData = await param.grad?.cpu();
         for (const val of gradData) {
           expect(Number.isFinite(val)).toBe(true);
         }
@@ -174,9 +189,13 @@ describe("Model Checkpoint + AMP Integration", () => {
         { length: BATCH_SIZE * SEQ_LEN * INPUT_DIM },
         () => Math.random() - 0.5,
       );
-      const input = torch.tensorFromArray(inputData, [BATCH_SIZE, SEQ_LEN, INPUT_DIM], {
-        requiresGrad: true,
-      });
+      const input = torch.tensorFromArray(
+        inputData,
+        [BATCH_SIZE, SEQ_LEN, INPUT_DIM],
+        {
+          requiresGrad: true,
+        },
+      );
 
       // Forward with checkpointing
       const output = model.forward(input, true);
@@ -191,7 +210,7 @@ describe("Model Checkpoint + AMP Integration", () => {
       for (const param of model.parameters()) {
         expect(param.grad).not.toBeNull();
 
-        const gradData = await param.grad!.cpu();
+        const gradData = await param.grad?.cpu();
         for (const val of gradData) {
           expect(Number.isFinite(val)).toBe(true);
         }
@@ -202,16 +221,27 @@ describe("Model Checkpoint + AMP Integration", () => {
   describe("Checkpoint Gradient Correctness", () => {
     it("both checkpoint and non-checkpoint produce valid gradients", async () => {
       // Use fixed input data for reproducibility
-      const inputData = Array.from({ length: BATCH_SIZE * SEQ_LEN * INPUT_DIM }, (_, i) =>
-        Math.sin(i * 0.1) * 0.1
+      const inputData = Array.from(
+        { length: BATCH_SIZE * SEQ_LEN * INPUT_DIM },
+        (_, i) => Math.sin(i * 0.1) * 0.1,
       );
 
       // Model 1: without checkpoint
       const torch1 = new Torchlette("cpu");
-      const model1 = new StackedMLP(torch1, INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, 1);
-      const input1 = torch1.tensorFromArray(inputData, [BATCH_SIZE, SEQ_LEN, INPUT_DIM], {
-        requiresGrad: true,
-      });
+      const model1 = new StackedMLP(
+        torch1,
+        INPUT_DIM,
+        HIDDEN_DIM,
+        OUTPUT_DIM,
+        1,
+      );
+      const input1 = torch1.tensorFromArray(
+        inputData,
+        [BATCH_SIZE, SEQ_LEN, INPUT_DIM],
+        {
+          requiresGrad: true,
+        },
+      );
 
       const output1 = model1.forward(input1, false);
       const loss1 = output1.sum();
@@ -220,10 +250,20 @@ describe("Model Checkpoint + AMP Integration", () => {
 
       // Model 2: with checkpoint
       const torch2 = new Torchlette("cpu");
-      const model2 = new StackedMLP(torch2, INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, 1);
-      const input2 = torch2.tensorFromArray(inputData, [BATCH_SIZE, SEQ_LEN, INPUT_DIM], {
-        requiresGrad: true,
-      });
+      const model2 = new StackedMLP(
+        torch2,
+        INPUT_DIM,
+        HIDDEN_DIM,
+        OUTPUT_DIM,
+        1,
+      );
+      const input2 = torch2.tensorFromArray(
+        inputData,
+        [BATCH_SIZE, SEQ_LEN, INPUT_DIM],
+        {
+          requiresGrad: true,
+        },
+      );
 
       const output2 = model2.forward(input2, true);
       const loss2 = output2.sum();
@@ -235,8 +275,8 @@ describe("Model Checkpoint + AMP Integration", () => {
       const params2 = model2.parameters();
 
       for (let i = 0; i < params1.length; i++) {
-        const grad1 = await params1[i].grad!.cpu();
-        const grad2 = await params2[i].grad!.cpu();
+        const grad1 = await params1[i].grad?.cpu();
+        const grad2 = await params2[i].grad?.cpu();
 
         // Both should have same shape
         expect(params1[i].shape).toEqual(params2[i].shape);
@@ -266,9 +306,13 @@ describe("Model Checkpoint + AMP Integration", () => {
         { length: BATCH_SIZE * SEQ_LEN * INPUT_DIM },
         () => Math.random() - 0.5,
       );
-      const input = torch.tensorFromArray(inputData, [BATCH_SIZE, SEQ_LEN, INPUT_DIM], {
-        requiresGrad: true,
-      });
+      const input = torch.tensorFromArray(
+        inputData,
+        [BATCH_SIZE, SEQ_LEN, INPUT_DIM],
+        {
+          requiresGrad: true,
+        },
+      );
 
       // Forward with autocast
       const output = await torch.autocastAsync(async () => {
@@ -284,7 +328,7 @@ describe("Model Checkpoint + AMP Integration", () => {
       for (const param of model.parameters()) {
         expect(param.grad).not.toBeNull();
 
-        const gradData = await param.grad!.cpu();
+        const gradData = await param.grad?.cpu();
         for (const val of gradData) {
           expect(Number.isFinite(val)).toBe(true);
         }
@@ -306,9 +350,13 @@ describe("Model Checkpoint + AMP Integration", () => {
         { length: BATCH_SIZE * SEQ_LEN * INPUT_DIM },
         () => Math.random() - 0.5,
       );
-      const input = torch.tensorFromArray(inputData, [BATCH_SIZE, SEQ_LEN, INPUT_DIM], {
-        requiresGrad: true,
-      });
+      const input = torch.tensorFromArray(
+        inputData,
+        [BATCH_SIZE, SEQ_LEN, INPUT_DIM],
+        {
+          requiresGrad: true,
+        },
+      );
 
       // Forward with both checkpoint and autocast
       const output = await torch.autocastAsync(async () => {
@@ -324,7 +372,7 @@ describe("Model Checkpoint + AMP Integration", () => {
       for (const param of model.parameters()) {
         expect(param.grad).not.toBeNull();
 
-        const gradData = await param.grad!.cpu();
+        const gradData = await param.grad?.cpu();
         for (const val of gradData) {
           expect(Number.isFinite(val)).toBe(true);
         }
@@ -355,9 +403,13 @@ describe("Model Checkpoint + AMP Integration", () => {
           { length: BATCH_SIZE * SEQ_LEN * INPUT_DIM },
           () => Math.random() - 0.5,
         );
-        const input = torch.tensorFromArray(inputData, [BATCH_SIZE, SEQ_LEN, INPUT_DIM], {
-          requiresGrad: true,
-        });
+        const input = torch.tensorFromArray(
+          inputData,
+          [BATCH_SIZE, SEQ_LEN, INPUT_DIM],
+          {
+            requiresGrad: true,
+          },
+        );
 
         // Forward with checkpoint + AMP
         const output = await torch.autocastAsync(async () => {
@@ -375,7 +427,7 @@ describe("Model Checkpoint + AMP Integration", () => {
         // Verify gradients are valid
         for (const param of model.parameters()) {
           expect(param.grad).not.toBeNull();
-          const gradData = await param.grad!.cpu();
+          const gradData = await param.grad?.cpu();
           for (const val of gradData) {
             expect(Number.isFinite(val)).toBe(true);
           }
@@ -391,21 +443,19 @@ describe("Model Checkpoint + AMP Integration", () => {
 
   describe("retainGrad with Checkpoint", () => {
     it("retainGrad works on intermediate tensor with checkpoint", async () => {
-      const model = new StackedMLP(
-        torch,
-        INPUT_DIM,
-        HIDDEN_DIM,
-        OUTPUT_DIM,
-        2,
-      );
+      const model = new StackedMLP(torch, INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, 2);
 
       const inputData = Array.from(
         { length: BATCH_SIZE * SEQ_LEN * INPUT_DIM },
         () => Math.random() - 0.5,
       );
-      const input = torch.tensorFromArray(inputData, [BATCH_SIZE, SEQ_LEN, INPUT_DIM], {
-        requiresGrad: true,
-      });
+      const input = torch.tensorFromArray(
+        inputData,
+        [BATCH_SIZE, SEQ_LEN, INPUT_DIM],
+        {
+          requiresGrad: true,
+        },
+      );
 
       // Forward with checkpoint
       const output = model.forward(input, true);
@@ -421,7 +471,7 @@ describe("Model Checkpoint + AMP Integration", () => {
       expect(output.isRetainGrad).toBe(true);
 
       // Gradient should be all 1s from sum backward
-      const outputGrad = await output.grad!.cpu();
+      const outputGrad = await output.grad?.cpu();
       for (const val of outputGrad) {
         expect(val).toBeCloseTo(1.0, 5);
       }

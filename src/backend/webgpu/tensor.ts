@@ -1,29 +1,21 @@
 /**
  * Tensor construction helpers: createTensor, createTrackedBuffer, createBufferWithData.
- * Extracted from index.ts — purely structural refactoring.
  */
 
+import { getSizeClass, getSizeForClass } from "../../graph/lifetime-analysis";
 import type { DType } from "../types";
-import type { GPUBuffer, GPUDevice, GPUQueue } from "./gpu-types";
-import { GPUBufferUsage, STORAGE_BUFFER_USAGE } from "./gpu-types";
-import type { WebGPUTensor } from "./gpu-types";
-import {
-  sizeOf,
-  contiguousStrides,
-  checkContiguousStrides,
-  dtypeBytes,
-  alignBufferSize,
-  DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE,
-} from "./shape-utils";
 import { bufferPool } from "./buffer-pool";
-import { arenaBufferSet } from "./webgpu-state";
-import { profileApiCall } from "./profiler";
-import { getSizeClass, getSizeForClass } from "../../engine/memory-planning";
+import type { GPUBuffer, GPUDevice, GPUQueue, WebGPUTensor } from "./gpu-types";
+import { GPUBufferUsage, STORAGE_BUFFER_USAGE } from "./gpu-types";
 import { gpuMemoryTracker } from "./memory-tracker";
-
-function toArrayUnsupported(): number[] {
-  throw new Error("Use cpu() to read back WebGPU tensors");
-}
+import { profileApiCall } from "./profiler";
+import {
+  alignBufferSize,
+  checkContiguousStrides,
+  contiguousStrides,
+  sizeOf,
+} from "./shape-utils";
+import { arenaBufferSet } from "./webgpu-state";
 
 /**
  * Create a WebGPU tensor with optional stride info.
@@ -70,7 +62,9 @@ export function createTensor(
     isContiguous: isContiguousLayout,
     dtype,
     ownsBuffer,
-    toArray: toArrayUnsupported,
+    toArray: () => {
+      throw new Error("Use cpu() to read back WebGPU tensors");
+    },
     destroy(): void {
       if (destroyed) return;
       destroyed = true;
@@ -135,7 +129,8 @@ export function createTrackedBuffer(
 
   // Check if this is a small UNIFORM-only buffer (params buffers)
   // These are temporary and don't need memory tracking to avoid memory leaks
-  const isUniformOnly = (descriptor.usage & GPUBufferUsage.UNIFORM) !== 0 &&
+  const isUniformOnly =
+    (descriptor.usage & GPUBufferUsage.UNIFORM) !== 0 &&
     (descriptor.usage & GPUBufferUsage.STORAGE) === 0;
   const isSmallBuffer = alignedSize <= 64; // Params buffers are typically 4-32 bytes
   const skipTracking = isUniformOnly && isSmallBuffer;
@@ -163,7 +158,8 @@ export function createTrackedBuffer(
     // are tracked as deallocated but still occupy GPU memory. We must account for
     // pool-held bytes to prevent Vulkan OOM errors.
     const poolHeldBytes = bufferPool.getTotalHeldBytes();
-    const physicalUsage = gpuMemoryTracker.getCurrentAllocatedBytes() + poolHeldBytes;
+    const physicalUsage =
+      gpuMemoryTracker.getCurrentAllocatedBytes() + poolHeldBytes;
     if (physicalUsage + actualSize > gpuMemoryTracker.getMemoryLimit()) {
       // Evict enough pool buffers to make room. evictBuffers actually destroys
       // the GPU buffers (not just drops references), freeing physical GPU memory.
@@ -173,10 +169,12 @@ export function createTrackedBuffer(
   }
 
   try {
-    const buffer = profileApiCall("createBuffer", () => device.createBuffer({
-      ...descriptor,
-      size: actualSize,
-    }));
+    const buffer = profileApiCall("createBuffer", () =>
+      device.createBuffer({
+        ...descriptor,
+        size: actualSize,
+      }),
+    );
     // Re-track with the actual buffer reference for deallocation tracking
     if (!skipTracking) {
       gpuMemoryTracker.trackDeallocation(null);
@@ -220,11 +218,14 @@ export function createBufferWithData(
   // Cap at maxStorageBufferBindingSize to avoid oversized pooled buffers
   const rawPoolSize = getSizeForClass(getSizeClass(alignedSize));
   const devLimits = device.limits;
-  const maxBindingSizeForPool = devLimits?.maxStorageBufferBindingSize ?? DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE;
-  const poolSize = rawPoolSize <= maxBindingSizeForPool ? rawPoolSize : alignedSize;
+  const maxBindingSizeForPool =
+    devLimits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  const poolSize =
+    rawPoolSize <= maxBindingSizeForPool ? rawPoolSize : alignedSize;
 
   // Try to acquire from pool first (only if pool size is power-of-2, i.e. not capped)
-  const pooled = rawPoolSize <= maxBindingSizeForPool ? bufferPool.acquire(poolSize) : null;
+  const pooled =
+    rawPoolSize <= maxBindingSizeForPool ? bufferPool.acquire(poolSize) : null;
   if (pooled && queue) {
     // Reusing a pooled buffer - write data via queue
     // NOTE: Don't call trackAllocation here! The buffer was already tracked
@@ -256,4 +257,3 @@ export function createBufferWithData(
   buffer.unmap();
   return buffer;
 }
-

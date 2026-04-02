@@ -3,9 +3,8 @@
  * Similar to PyTorch's nn.Embedding.
  */
 
-import type { Tensor, Torchlette, DeviceKind } from "../frontend";
+import type { DeviceKind, Tensor, Torchlette } from "../frontend/torchlette";
 import { Module } from "./module";
-import { sizeOf } from "../core/shape";
 
 export type EmbeddingOptions = {
   /** Device to create parameters on */
@@ -29,7 +28,7 @@ export type EmbeddingOptions = {
 export class Embedding extends Module {
   readonly numEmbeddings: number;
   readonly embeddingDim: number;
-  readonly weight: Tensor;
+  declare readonly weight: Tensor;
 
   constructor(
     api: Torchlette,
@@ -44,10 +43,10 @@ export class Embedding extends Module {
     const device = options?.device;
 
     // Initialize with standard normal distribution
-    this.weight = api.randn([numEmbeddings, embeddingDim], {
-      requiresGrad: true,
-      device,
-    });
+    this.registerParameter(
+      "weight",
+      api.randn([numEmbeddings, embeddingDim], { requiresGrad: true, device }),
+    );
   }
 
   /**
@@ -57,37 +56,6 @@ export class Embedding extends Module {
    * @returns Tensor of embeddings, shape [..., embeddingDim]
    */
   forward(input: Tensor): Tensor {
-    // input: [...] containing token indices
-    // weight: [numEmbeddings, embeddingDim]
-    // output: [..., embeddingDim]
-
-    const inputShape = input.shape;
-    const numElements = sizeOf(inputShape);
-
-    // Flatten input to [numElements]
-    const flatInput = input.reshape([numElements]);
-
-    // Expand indices to [numElements, embeddingDim] for gather
-    // Each index is repeated embeddingDim times across dim 1
-    const expandedInput = flatInput
-      .reshape([numElements, 1])
-      .expand([numElements, this.embeddingDim])
-      .contiguous(); // Required: gather doesn't handle strided tensors correctly
-
-    // Gather from weight: output[i][j] = weight[expandedInput[i][j]][j]
-    // Since expandedInput[i][j] = flatInput[i] for all j,
-    // this gives us weight[flatInput[i]][j] for each position
-    const gathered = this.weight.gather(expandedInput, { dim: 0 });
-
-    // Reshape to [..., embeddingDim]
-    const outputShape = [...inputShape, this.embeddingDim];
-    return gathered.reshape(outputShape);
-  }
-
-  /**
-   * Get all learnable parameters.
-   */
-  parameters(): Tensor[] {
-    return [this.weight];
+    return this.api.embedding(this.weight, input);
   }
 }

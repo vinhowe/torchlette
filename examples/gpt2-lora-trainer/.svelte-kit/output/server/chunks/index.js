@@ -1,4 +1,4 @@
-import { e as escape_html, a as set_ssr_context, b as ssr_context, p as push, c as pop } from "./context.js";
+import { e as escape_html, s as set_ssr_context, a as ssr_context, p as push, b as pop } from "./context.js";
 const DERIVED = 1 << 1;
 const EFFECT = 1 << 2;
 const RENDER_EFFECT = 1 << 3;
@@ -946,10 +946,6 @@ function attr_class(value, hash, directives) {
   var result = to_class(value, hash, directives);
   return result ? ` class="${escape_html(result, true)}"` : "";
 }
-function attr_style(value, directives) {
-  var result = to_style(value, directives);
-  return result ? ` style="${escape_html(result, true)}"` : "";
-}
 function ensure_array_like(array_like_or_iterator) {
   if (array_like_or_iterator) {
     return array_like_or_iterator.length !== void 0 ? array_like_or_iterator : Array.from(array_like_or_iterator);
@@ -962,7 +958,6 @@ export {
   COMMENT_NODE as C,
   DIRTY as D,
   ERROR_VALUE as E,
-  attr_style as F,
   HYDRATION_ERROR as H,
   INERT as I,
   LEGACY_PROPS as L,
@@ -993,8 +988,8 @@ export {
   REACTION_IS_UPDATING as t,
   is_passive_event as u,
   render as v,
-  attr_class as w,
-  attr as x,
+  attr as w,
+  attr_class as x,
   ensure_array_like as y,
   stringify as z
 };
