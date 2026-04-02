@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { Torchlette } from "../src/frontend";
+import { Torchlette } from "../src/frontend/torchlette";
 
 describe("Sprint 3 ops (CPU)", () => {
   const api = new Torchlette("cpu");
@@ -206,10 +206,19 @@ describe("Sprint 3 ops (CPU)", () => {
 
     it("handles 3D input (transformer style)", async () => {
       // [batch, seq, hidden]
-      const x = api.tensorFromArray([
-        1, 2, 3, 4,  // seq 0
-        5, 6, 7, 8,  // seq 1
-      ], [1, 2, 4]);
+      const x = api.tensorFromArray(
+        [
+          1,
+          2,
+          3,
+          4, // seq 0
+          5,
+          6,
+          7,
+          8, // seq 1
+        ],
+        [1, 2, 4],
+      );
       const weight = api.tensorFromArray([1, 1, 1, 1], [4]);
       const bias = api.tensorFromArray([0, 0, 0, 0], [4]);
       const result = x.layernorm(weight, bias);
@@ -225,8 +234,12 @@ describe("Sprint 3 ops (CPU)", () => {
 
     it("backward pass computes gradients", async () => {
       const x = api.tensorFromArray([1, 2, 3, 4], [4], { requiresGrad: true });
-      const weight = api.tensorFromArray([1, 1, 1, 1], [4], { requiresGrad: true });
-      const bias = api.tensorFromArray([0, 0, 0, 0], [4], { requiresGrad: true });
+      const weight = api.tensorFromArray([1, 1, 1, 1], [4], {
+        requiresGrad: true,
+      });
+      const bias = api.tensorFromArray([0, 0, 0, 0], [4], {
+        requiresGrad: true,
+      });
       const result = x.layernorm(weight, bias);
       const loss = result.sum();
       if (typeof loss === "number") throw new Error("Expected tensor");
@@ -274,7 +287,7 @@ describe("Sprint 3 ops (CPU)", () => {
       // grad = [0.5/1, 0.5/2, 0.5/3, 0.5/4] = [0.5, 0.25, 0.1667, 0.125]
       expect(grad?.[0]).toBeCloseTo(0.5, 4);
       expect(grad?.[1]).toBeCloseTo(0.25, 4);
-      expect(grad?.[2]).toBeCloseTo(1/6, 4);
+      expect(grad?.[2]).toBeCloseTo(1 / 6, 4);
       expect(grad?.[3]).toBeCloseTo(0.125, 4);
     });
   });

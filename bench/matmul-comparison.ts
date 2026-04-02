@@ -6,12 +6,13 @@
  */
 
 import {
-  dispatchMatmulWithEpilogue,
+  dispatchMatmul,
   getWebGPUDevice,
   initWebGPU,
   syncWebGPU,
   webgpuBackend,
 } from "../src/backend/webgpu";
+import type { WebGPUTensor } from "../src/backend/webgpu/gpu-types";
 import {
   classifyShape,
   DEFAULT_CONFIG,
@@ -138,11 +139,11 @@ async function runSubgroupComparisonBenchmark(
       // Warmup
       for (let i = 0; i < warmup; i++) {
         dispatchTiledMatmul({
-          device: device as any,
-          queue: queue as any,
-          a: aBuffer as any,
-          b: bBuffer as any,
-          out: outBuffer as any,
+          device,
+          queue,
+          a: aBuffer,
+          b: bBuffer,
+          out: outBuffer,
           m,
           n,
           k,
@@ -157,11 +158,11 @@ async function runSubgroupComparisonBenchmark(
       for (let i = 0; i < iters; i++) {
         const start = performance.now();
         dispatchTiledMatmul({
-          device: device as any,
-          queue: queue as any,
-          a: aBuffer as any,
-          b: bBuffer as any,
-          out: outBuffer as any,
+          device,
+          queue,
+          a: aBuffer,
+          b: bBuffer,
+          out: outBuffer,
           m,
           n,
           k,
@@ -283,11 +284,11 @@ async function runDtypeComparisonBenchmark(
       // Warmup
       for (let i = 0; i < warmup; i++) {
         dispatchTiledMatmul({
-          device: device as any,
-          queue: queue as any,
-          a: aBuffer as any,
-          b: bBuffer as any,
-          out: outBuffer as any,
+          device,
+          queue,
+          a: aBuffer,
+          b: bBuffer,
+          out: outBuffer,
           m,
           n,
           k,
@@ -302,11 +303,11 @@ async function runDtypeComparisonBenchmark(
       for (let i = 0; i < iters; i++) {
         const start = performance.now();
         dispatchTiledMatmul({
-          device: device as any,
-          queue: queue as any,
-          a: aBuffer as any,
-          b: bBuffer as any,
-          out: outBuffer as any,
+          device,
+          queue,
+          a: aBuffer,
+          b: bBuffer,
+          out: outBuffer,
           m,
           n,
           k,
@@ -449,9 +450,9 @@ async function runFusedVsUnfusedBenchmark(
   const bVals = makeValues(k * n);
   const biasVals = makeValues(n);
 
-  const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]) as any;
-  const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]) as any;
-  const bias = webgpuBackend.ops.tensorFromArray(biasVals, [n]) as any;
+  const a = webgpuBackend.ops.tensorFromArray(aVals, [m, k]) as WebGPUTensor;
+  const b = webgpuBackend.ops.tensorFromArray(bVals, [k, n]) as WebGPUTensor;
+  const bias = webgpuBackend.ops.tensorFromArray(biasVals, [n]) as WebGPUTensor;
 
   // Unfused: matmul + add (separate ops)
   const unfusedMs = await benchmark(
@@ -482,7 +483,11 @@ async function runFusedVsUnfusedBenchmark(
   };
   const fusedMs = await benchmark(
     "fused",
-    () => dispatchMatmulWithEpilogue(a, b, epilogue, [bias]),
+    () =>
+      dispatchMatmul(a, b, false, false, undefined, {
+        epilogue,
+        epilogueInputs: [bias],
+      }),
     warmup,
     iters,
   );
@@ -505,7 +510,11 @@ async function runFusedVsUnfusedBenchmark(
   };
   const fusedReluMs = await benchmark(
     "fused-relu",
-    () => dispatchMatmulWithEpilogue(a, b, epilogueRelu, [bias]),
+    () =>
+      dispatchMatmul(a, b, false, false, undefined, {
+        epilogue: epilogueRelu,
+        epilogueInputs: [bias],
+      }),
     warmup,
     iters,
   );
@@ -528,7 +537,11 @@ async function runFusedVsUnfusedBenchmark(
   };
   const fusedGeluMs = await benchmark(
     "fused-gelu",
-    () => dispatchMatmulWithEpilogue(a, b, epilogueGelu, [bias]),
+    () =>
+      dispatchMatmul(a, b, false, false, undefined, {
+        epilogue: epilogueGelu,
+        epilogueInputs: [bias],
+      }),
     warmup,
     iters,
   );

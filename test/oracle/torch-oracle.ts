@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -99,7 +99,7 @@ class OracleServer {
 
       proc.on("error", onStartupError);
 
-      proc.stderr!.on("data", (chunk: Buffer) => {
+      proc.stderr?.on("data", (chunk: Buffer) => {
         startupStderr += chunk.toString();
       });
 
@@ -117,9 +117,9 @@ class OracleServer {
           if (msg.ready) {
             this.ready = true;
             // Switch to normal data handler
-            proc.stdout!.removeListener("data", onData);
+            proc.stdout?.removeListener("data", onData);
             proc.removeListener("error", onStartupError);
-            proc.stdout!.on("data", this.onData);
+            proc.stdout?.on("data", this.onData);
             proc.on("error", this.onError);
             proc.on("close", this.onClose);
             resolve();
@@ -140,7 +140,7 @@ class OracleServer {
         );
       };
 
-      proc.stdout!.on("data", onData);
+      proc.stdout?.on("data", onData);
 
       // Handle early close during startup
       proc.on("close", (code) => {
@@ -190,9 +190,7 @@ class OracleServer {
 
   private onError = (err: Error) => {
     this.dead = true;
-    this.rejectAll(
-      new Error(`Torch oracle server error: ${err.message}`),
-    );
+    this.rejectAll(new Error(`Torch oracle server error: ${err.message}`));
   };
 
   private onClose = (_code: number | null) => {
@@ -214,7 +212,7 @@ class OracleServer {
     return new Promise((resolve, reject) => {
       this.pending.push({ resolve, reject });
       const line = JSON.stringify(payload) + "\n";
-      this.proc!.stdin!.write(line, (err) => {
+      this.proc?.stdin?.write(line, (err) => {
         if (err) {
           // Remove from pending and reject
           const idx = this.pending.findIndex((p) => p.resolve === resolve);
@@ -227,7 +225,7 @@ class OracleServer {
 
   shutdown() {
     if (this.proc) {
-      this.proc.stdin!.end();
+      this.proc.stdin?.end();
       this.proc.kill();
       this.proc = null;
     }

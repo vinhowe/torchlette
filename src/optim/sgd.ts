@@ -1,6 +1,5 @@
-import type { DeviceKind } from "../backend/types";
-import type { Tensor, Torchlette } from "../frontend";
-import type { RuntimeTensor } from "../runtime/tensor";
+import type { Tensor, Torchlette } from "../frontend/torchlette";
+import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import { validateOptimizerParams } from "./validate";
 
 export type SGDOptions = {
@@ -9,31 +8,99 @@ export type SGDOptions = {
   weightDecay?: number;
 };
 
+/** Per-group overrides for SGD. Unset fields inherit from defaults. */
+export type SGDParamGroup = {
+  params: Tensor[];
+  lr?: number;
+  weightDecay?: number;
+};
+
+type ResolvedSGDGroup = {
+  params: Tensor[];
+  lr: number;
+  weightDecay: number;
+};
+
 export class SGD {
   private params: Tensor[];
   private readonly api: Torchlette;
-  private readonly lr: number;
   private readonly momentum: number;
-  private readonly weightDecay: number;
-  private readonly device: DeviceKind;
+  private _groups: ResolvedSGDGroup[];
+  private _groupIndex: number[];
   private velocity: Array<RuntimeTensor | null>;
 
-  constructor(params: Tensor[], options: SGDOptions, api?: Torchlette) {
-    const { api: engine, device } = validateOptimizerParams("SGD", params, api);
+  constructor(
+    params: Tensor[] | SGDParamGroup[],
+    options: SGDOptions,
+    api?: Torchlette,
+  ) {
+    const isGroups =
+      params.length > 0 &&
+      typeof params[0] === "object" &&
+      "params" in params[0] &&
+      Array.isArray((params[0] as SGDParamGroup).params);
+
+    const flatParams: Tensor[] = isGroups
+      ? (params as SGDParamGroup[]).flatMap((g) => g.params)
+      : (params as Tensor[]);
+
+    const { api: engine } = validateOptimizerParams("SGD", flatParams, api);
     if (options.lr <= 0) {
       throw new Error("SGD learning rate must be > 0");
     }
     this.api = engine;
-    this.lr = options.lr;
-    this.params = params.slice();
+    this.params = flatParams;
     this.momentum = options.momentum ?? 0;
-    this.weightDecay = options.weightDecay ?? 0;
-    this.device = device;
-    this.velocity = new Array(params.length).fill(null);
+
+    if (isGroups) {
+      const groups = params as SGDParamGroup[];
+      this._groups = groups.map((g) => ({
+        params: g.params,
+        lr: g.lr ?? options.lr,
+        weightDecay: g.weightDecay ?? options.weightDecay ?? 0,
+      }));
+      this._groupIndex = [];
+      for (let gi = 0; gi < groups.length; gi++) {
+        for (let pi = 0; pi < groups[gi].params.length; pi++) {
+          this._groupIndex.push(gi);
+        }
+      }
+    } else {
+      this._groups = [
+        {
+          params: flatParams,
+          lr: options.lr,
+          weightDecay: options.weightDecay ?? 0,
+        },
+      ];
+      this._groupIndex = flatParams.map(() => 0);
+    }
+
+    this.velocity = new Array(flatParams.length).fill(null);
   }
 
   getParams(): Tensor[] {
     return this.params.slice();
+  }
+
+  getLR(): number {
+    return this._groups[0].lr;
+  }
+
+  setLR(lr: number): void {
+    for (const g of this._groups) g.lr = lr;
+  }
+
+  getParamGroupLRs(): number[] {
+    return this._groups.map((g) => g.lr);
+  }
+
+  setGroupLR(groupIndex: number, lr: number): void {
+    this._groups[groupIndex].lr = lr;
+  }
+
+  get numGroups(): number {
+    return this._groups.length;
   }
 
   step(): Tensor[] {
@@ -46,9 +113,10 @@ export class SGD {
         updated.push(param);
         continue;
       }
+      const group = this._groups[this._groupIndex[i]];
       let gradAdj = grad;
-      if (this.weightDecay !== 0) {
-        const decay = runtime.mul(param._unwrap(), this.weightDecay);
+      if (group.weightDecay !== 0) {
+        const decay = runtime.mul(param._unwrap(), group.weightDecay);
         gradAdj = runtime.add(gradAdj, decay);
       }
       let update = gradAdj;
@@ -63,14 +131,11 @@ export class SGD {
         this.velocity[i] = update;
       }
       const next = runtime.sub(param._unwrap(), update, {
-        alpha: this.lr,
+        alpha: group.lr,
       });
-      // Update parameter IN-PLACE to preserve tensor identity
-      // This is critical for GradScaler - backward() writes to the same tensor
       runtime.copy_(param._unwrap(), next);
       updated.push(param);
     }
-    // Don't replace this.params - keep original tensor objects
     return updated;
   }
 

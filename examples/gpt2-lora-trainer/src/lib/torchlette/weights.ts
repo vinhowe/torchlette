@@ -6,59 +6,65 @@
  */
 
 import {
-  cacheWeights,
-  getCachedWeights,
   cacheTokenizer,
-  getCachedTokenizer,
+  cacheWeights,
   clearCache,
+  getCachedTokenizer,
+  getCachedWeights,
   getCacheInfo,
-} from './cache';
+} from "./cache";
 
 // Re-export cache utilities for UI
 export { clearCache, getCacheInfo };
 
-const HF_BASE_URL = 'https://huggingface.co/openai-community/gpt2/resolve/main';
+const HF_BASE_URL = "https://huggingface.co/openai-community/gpt2/resolve/main";
 
 export type WeightData = {
   data: Float32Array;
   shape: number[];
 };
 
-export type ProgressCallback = (loaded: number, total: number, status: string) => void;
+export type ProgressCallback = (
+  loaded: number,
+  total: number,
+  status: string,
+) => void;
 
 /**
  * Fetch GPT-2 weights from HuggingFace CDN (with local caching).
  */
 export async function fetchGPT2Weights(
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
 ): Promise<Map<string, WeightData>> {
   // Check cache first
-  onProgress?.(0, 100, 'Checking local cache...');
+  onProgress?.(0, 100, "Checking local cache...");
 
   const cachedBuffer = await getCachedWeights();
   if (cachedBuffer) {
-    onProgress?.(100, 100, 'Loading from cache...');
+    onProgress?.(100, 100, "Loading from cache...");
     const weights = parseSafetensors(cachedBuffer, onProgress);
-    onProgress?.(100, 100, 'Loaded from cache!');
+    onProgress?.(100, 100, "Loaded from cache!");
     return weights;
   }
 
   // Not cached, download from HuggingFace
-  onProgress?.(0, 100, 'Downloading model weights (~500MB)...');
+  onProgress?.(0, 100, "Downloading model weights (~500MB)...");
 
   const response = await fetch(`${HF_BASE_URL}/model.safetensors`);
 
   if (!response.ok) {
-    throw new Error(`Failed to fetch weights: ${response.status} ${response.statusText}`);
+    throw new Error(
+      `Failed to fetch weights: ${response.status} ${response.statusText}`,
+    );
   }
 
-  const contentLength = response.headers.get('content-length');
+  const contentLength = response.headers.get("content-length");
   const total = contentLength ? parseInt(contentLength, 10) : 0;
 
   // Stream the response for progress tracking
   const reader = response.body?.getReader();
   if (!reader) {
-    throw new Error('Failed to get response reader');
+    throw new Error("Failed to get response reader");
   }
 
   const chunks: Uint8Array[] = [];
@@ -73,7 +79,11 @@ export async function fetchGPT2Weights(
 
     if (total > 0) {
       const percent = Math.round((loaded / total) * 100);
-      onProgress?.(loaded, total, `Downloading: ${percent}% (${formatBytes(loaded)} / ${formatBytes(total)})`);
+      onProgress?.(
+        loaded,
+        total,
+        `Downloading: ${percent}% (${formatBytes(loaded)} / ${formatBytes(total)})`,
+      );
     } else {
       onProgress?.(loaded, 0, `Downloading: ${formatBytes(loaded)}`);
     }
@@ -90,14 +100,14 @@ export async function fetchGPT2Weights(
   }
 
   // Cache the buffer for next time
-  onProgress?.(total, total, 'Caching locally...');
+  onProgress?.(total, total, "Caching locally...");
   try {
     await cacheWeights(buffer);
   } catch (e) {
-    console.warn('Failed to cache weights:', e);
+    console.warn("Failed to cache weights:", e);
   }
 
-  onProgress?.(total, total, 'Parsing weights...');
+  onProgress?.(total, total, "Parsing weights...");
 
   // Parse safetensors
   return parseSafetensors(buffer, onProgress);
@@ -107,16 +117,16 @@ export async function fetchGPT2Weights(
  * Fetch tokenizer files from HuggingFace (with local caching).
  */
 export async function fetchTokenizer(
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
 ): Promise<{ vocab: Record<string, number>; merges: string[] }> {
   // Check cache first
   const cachedTokenizer = await getCachedTokenizer();
   if (cachedTokenizer) {
-    onProgress?.(2, 2, 'Tokenizer loaded from cache!');
+    onProgress?.(2, 2, "Tokenizer loaded from cache!");
     return cachedTokenizer;
   }
 
-  onProgress?.(0, 2, 'Fetching tokenizer...');
+  onProgress?.(0, 2, "Fetching tokenizer...");
 
   const [vocabResponse, mergesResponse] = await Promise.all([
     fetch(`${HF_BASE_URL}/vocab.json`),
@@ -124,25 +134,28 @@ export async function fetchTokenizer(
   ]);
 
   if (!vocabResponse.ok || !mergesResponse.ok) {
-    throw new Error('Failed to fetch tokenizer files');
+    throw new Error("Failed to fetch tokenizer files");
   }
 
-  onProgress?.(1, 2, 'Parsing tokenizer...');
+  onProgress?.(1, 2, "Parsing tokenizer...");
 
   const vocab = await vocabResponse.json();
   const mergesText = await mergesResponse.text();
 
   // Parse merges (skip first line which is a version comment)
-  const merges = mergesText.split('\n').slice(1).filter((line) => line.trim());
+  const merges = mergesText
+    .split("\n")
+    .slice(1)
+    .filter((line) => line.trim());
 
   // Cache for next time
   try {
     await cacheTokenizer({ vocab, merges });
   } catch (e) {
-    console.warn('Failed to cache tokenizer:', e);
+    console.warn("Failed to cache tokenizer:", e);
   }
 
-  onProgress?.(2, 2, 'Tokenizer ready');
+  onProgress?.(2, 2, "Tokenizer ready");
 
   return { vocab, merges };
 }
@@ -152,7 +165,7 @@ export async function fetchTokenizer(
  */
 function parseSafetensors(
   buffer: ArrayBuffer,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
 ): Map<string, WeightData> {
   const view = new DataView(buffer);
 
@@ -167,7 +180,9 @@ function parseSafetensors(
   const dataOffset = 8 + headerLength;
   const weights = new Map<string, WeightData>();
 
-  const entries = Object.entries(header).filter(([key]) => key !== '__metadata__');
+  const entries = Object.entries(header).filter(
+    ([key]) => key !== "__metadata__",
+  );
   let processed = 0;
 
   for (const [name, info] of entries) {
@@ -181,7 +196,7 @@ function parseSafetensors(
     const tensorData = new Uint8Array(
       buffer,
       dataOffset + startOffset,
-      endOffset - startOffset
+      endOffset - startOffset,
     );
 
     // Convert to Float32Array based on dtype
@@ -190,17 +205,17 @@ function parseSafetensors(
     let float32Data: Float32Array;
 
     switch (tensorInfo.dtype) {
-      case 'F32': {
+      case "F32": {
         // Copy to aligned buffer
         const alignedBuffer = new ArrayBuffer(tensorData.length);
         new Uint8Array(alignedBuffer).set(tensorData);
         float32Data = new Float32Array(alignedBuffer);
         break;
       }
-      case 'F16':
+      case "F16":
         float32Data = convertFloat16ToFloat32(tensorData);
         break;
-      case 'BF16':
+      case "BF16":
         float32Data = convertBFloat16ToFloat32(tensorData);
         break;
       default:
@@ -208,14 +223,21 @@ function parseSafetensors(
         continue;
     }
 
-    weights.set(name, {
+    // Strip "transformer." prefix — HuggingFace GPT-2 safetensors uses
+    // "transformer.wte.weight" but model.loadBaseWeights expects "wte.weight"
+    const cleanName = name.replace(/^transformer\./, "");
+    weights.set(cleanName, {
       data: float32Data,
       shape: tensorInfo.shape,
     });
 
     processed++;
     if (onProgress && processed % 10 === 0) {
-      onProgress(processed, entries.length, `Loading tensors: ${processed}/${entries.length}`);
+      onProgress(
+        processed,
+        entries.length,
+        `Loading tensors: ${processed}/${entries.length}`,
+      );
     }
   }
 
@@ -252,7 +274,7 @@ function float16ToFloat32(h: number): number {
       return sign ? -0 : 0;
     }
     // Subnormal
-    return (sign ? -1 : 1) * Math.pow(2, -14) * (fraction / 1024);
+    return (sign ? -1 : 1) * 2 ** -14 * (fraction / 1024);
   } else if (exponent === 0x1f) {
     if (fraction === 0) {
       return sign ? -Infinity : Infinity;
@@ -260,7 +282,7 @@ function float16ToFloat32(h: number): number {
     return NaN;
   }
 
-  return (sign ? -1 : 1) * Math.pow(2, exponent - 15) * (1 + fraction / 1024);
+  return (sign ? -1 : 1) * 2 ** (exponent - 15) * (1 + fraction / 1024);
 }
 
 /**
@@ -290,7 +312,8 @@ function convertBFloat16ToFloat32(data: Uint8Array): Float32Array {
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes < 1024 * 1024 * 1024)
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
@@ -299,7 +322,7 @@ function formatBytes(bytes: number): string {
  */
 export function serializeLoRAToSafetensors(
   tensors: Map<string, { data: Float32Array; shape: number[] }>,
-  metadata: Record<string, string>
+  metadata: Record<string, string>,
 ): ArrayBuffer {
   // Build header
   const header: Record<string, unknown> = {
@@ -315,7 +338,7 @@ export function serializeLoRAToSafetensors(
     dataSize += byteLength;
 
     header[name] = {
-      dtype: 'F32',
+      dtype: "F32",
       shape,
       data_offsets: [startOffset, startOffset + byteLength],
     };

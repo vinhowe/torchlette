@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { Torchlette } from "../src/frontend";
+import { Torchlette } from "../src/frontend/torchlette";
 
 describe("Unary ops (CPU)", () => {
   const api = new Torchlette("cpu");
@@ -105,10 +105,10 @@ describe("Unary ops (CPU)", () => {
 
       expect(a.grad).not.toBeNull();
       const grad = await a.grad?.cpu();
-      // d/dx |x| = sign(x)
+      // d/dx |x| = sign(x), with sign(0) = 0 (PyTorch convention)
       expect(grad?.[0]).toBe(1); // positive
       expect(grad?.[1]).toBe(-1); // negative
-      expect(grad?.[2]).toBe(1); // zero (we use >= 0)
+      expect(grad?.[2]).toBe(0); // zero: subgradient = 0
     });
   });
 
@@ -174,7 +174,10 @@ describe("Unary ops (CPU)", () => {
       // GELU(0) ≈ 0
       expect(data[0]).toBeCloseTo(0, 3);
       // GELU(x) ≈ x for large positive x
-      expect(data[3]).toBeCloseTo(2 * 0.5 * (1 + Math.tanh(0.7978845608 * (2 + 0.044715 * 8))), 3);
+      expect(data[3]).toBeCloseTo(
+        2 * 0.5 * (1 + Math.tanh(0.7978845608 * (2 + 0.044715 * 8))),
+        3,
+      );
     });
 
     it("gelu backward pass", async () => {

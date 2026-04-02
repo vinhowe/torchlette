@@ -7,7 +7,9 @@ describe.skipIf(cpuOnly)("fused layernorm", { timeout: 30000 }, () => {
   it("forward matches CPU decomposed path (small)", async () => {
     await initWebGPU();
 
-    const data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+    const data = [
+      1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+    ];
     const shape: [number, number] = [3, 4];
     const weightData = [1.0, 1.0, 1.0, 1.0];
     const biasData = [0.0, 0.0, 0.0, 0.0];
@@ -113,9 +115,9 @@ describe.skipIf(cpuOnly)("fused layernorm", { timeout: 30000 }, () => {
     const gpuResult = gpu.layernorm(xGpu, wGpu, bGpu);
     const gpuLoss = gpu.sum(gpuResult);
     await gpuLoss.backward();
-    const gpuGradX = await xGpu.grad!.cpu();
-    const gpuGradW = await wGpu.grad!.cpu();
-    const gpuGradB = await bGpu.grad!.cpu();
+    const gpuGradX = await xGpu.grad?.cpu();
+    const gpuGradW = await wGpu.grad?.cpu();
+    const gpuGradB = await bGpu.grad?.cpu();
 
     // CPU
     const cpu = new Torchlette("cpu");
@@ -125,9 +127,9 @@ describe.skipIf(cpuOnly)("fused layernorm", { timeout: 30000 }, () => {
     const cpuResult = cpu.layernorm(xCpu, wCpu, bCpu);
     const cpuLoss = cpu.sum(cpuResult);
     await cpuLoss.backward();
-    const cpuGradX = await xCpu.grad!.cpu();
-    const cpuGradW = await wCpu.grad!.cpu();
-    const cpuGradB = await bCpu.grad!.cpu();
+    const cpuGradX = await xCpu.grad?.cpu();
+    const cpuGradW = await wCpu.grad?.cpu();
+    const cpuGradB = await bCpu.grad?.cpu();
 
     for (let i = 0; i < gpuGradX.length; i++) {
       expect(Math.abs(gpuGradX[i] - cpuGradX[i])).toBeLessThan(1e-3);
@@ -149,7 +151,10 @@ describe.skipIf(cpuOnly)("fused layernorm", { timeout: 30000 }, () => {
     const gpu = new Torchlette("webgpu");
 
     for (let step = 0; step < 3; step++) {
-      const data = Array.from({ length: 12 }, (_, i) => (i + 1) * (step + 1) * 0.1);
+      const data = Array.from(
+        { length: 12 },
+        (_, i) => (i + 1) * (step + 1) * 0.1,
+      );
       const shape: [number, number] = [3, 4];
       const weightData = [1.0, 1.0, 1.0, 1.0];
       const biasData = [0.0, 0.0, 0.0, 0.0];
@@ -162,7 +167,7 @@ describe.skipIf(cpuOnly)("fused layernorm", { timeout: 30000 }, () => {
 
       // Verify output is reasonable (not NaN, has variance)
       for (const val of gpuArr) {
-        expect(isFinite(val)).toBe(true);
+        expect(Number.isFinite(val)).toBe(true);
       }
 
       await gpu.markStep();

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { Torchlette } from "../../src";
 import { initWebGPU } from "../../src/backend/webgpu";
-import { cpuOnly } from "../helpers/webgpu";
 import { crossEntropy } from "../../src/nn/functional";
+import { cpuOnly } from "../helpers/webgpu";
 
 describe.skipIf(cpuOnly)("fused cross-entropy", { timeout: 30000 }, () => {
   it("forward matches CPU decomposed path", async () => {
@@ -89,7 +89,7 @@ describe.skipIf(cpuOnly)("fused cross-entropy", { timeout: 30000 }, () => {
       reduction: "mean",
     });
     await gpuLoss.backward();
-    const gpuGrad = await logitsGpu.grad!.cpu();
+    const gpuGrad = await logitsGpu.grad?.cpu();
 
     const cpu = new Torchlette("cpu");
     const logitsCpu = cpu.tensorFromArray(
@@ -102,7 +102,7 @@ describe.skipIf(cpuOnly)("fused cross-entropy", { timeout: 30000 }, () => {
       reduction: "mean",
     });
     await cpuLoss.backward();
-    const cpuGrad = await logitsCpu.grad!.cpu();
+    const cpuGrad = await logitsCpu.grad?.cpu();
 
     console.log("GPU grad:", gpuGrad);
     console.log("CPU grad:", cpuGrad);

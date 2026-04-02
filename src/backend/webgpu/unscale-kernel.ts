@@ -11,94 +11,101 @@
  * The inf flag is a shared 4-byte GPUBuffer (atomic<u32>) across all parameter
  * dispatches within a single unscale_() call.
  *
- * Handles large buffers (>maxStorageBufferBindingSize) via chunked dispatch.
+ * Handles large buffers (>maxStorageBufferBindingSize) via tile-IR dispatchChunked.
  */
 
-import {
-  dispatchComputePass,
-  getMaxStorageBufferBindingSize,
-  trackSharedEncoderWrite,
-  createParamsBuffer,
-  releaseParamsBuffer,
-  flushSharedEncoder,
-  cachedCreateBindGroup,
-  awaitDeferredFence,
-  getPipeline,
-} from "./index";
-import { requireContext } from "./webgpu-state";
-import { isProfilingEnabled } from "./profiler";
-import { gpuMemoryTracker } from "./memory-tracker";
-import type { GPUBuffer, GPUBindGroup, GPUDevice, GPUCommandEncoder } from "./gpu-types";
+import { awaitDeferredFence } from "./buffer-pool";
+import { computeFlatChunkLayout } from "./chunked-dispatch";
+import { getMaxStorageBufferBindingSize, requireContext } from "./gpu-context";
+import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage, GPUMapMode } from "./gpu-types";
-import { WORKGROUP_SIZE, MAX_WORKGROUPS_PER_DIM } from "./shape-utils";
+import { gpuMemoryTracker } from "./memory-tracker";
+import { isProfilingEnabled } from "./profiler";
+import {
+  F32_ONE_BITS,
+  MAX_WORKGROUPS_PER_DIM,
+  WORKGROUP_SIZE,
+} from "./shape-utils";
+import { trackSharedEncoderWrite } from "./shared-encoder";
+import {
+  createTileKernelDispatcher,
+  type TileKernelInstance,
+} from "./tile-dispatch";
+import type { TileKernelSpec } from "./tile-ir";
+import { onTeardown } from "./webgpu-state";
 
 // ============================================================================
-// WGSL Shader
+// Tile-IR Unscale Spec
 // ============================================================================
 
-function unscaleGradShader(use2D: boolean, gridSizeX: number): string {
-  const idxCompute = use2D
-    ? `let idx = gid.x + gid.y * ${gridSizeX}u * ${WORKGROUP_SIZE}u;`
-    : `let idx = gid.x;`;
+function makeUnscaleSpec(): TileKernelSpec {
+  return {
+    name: "unscaleGrad",
+    workgroupSize: WORKGROUP_SIZE,
+    bindings: {
+      grad_in: { storage: "read", type: "f32" },
+      grad_out: { storage: "read_write", type: "f32" },
+      inf_flag: { storage: "atomic", type: "u32" },
+    },
+    uniforms: {
+      inv_scale: "f32",
+      num_elements: "u32",
+      grid_stride: "u32",
+      _pad0: "u32",
+    },
+    uniformBindingIndex: 3,
+    grid: (u) => {
+      const wg = Math.ceil(u.num_elements / WORKGROUP_SIZE);
+      if (wg <= MAX_WORKGROUPS_PER_DIM) return [wg];
+      const x = Math.min(wg, MAX_WORKGROUPS_PER_DIM);
+      return [x, Math.ceil(wg / x)];
+    },
+    kernel(ctx) {
+      // 2D-safe indexing: grid_stride = gridSizeX * WORKGROUP_SIZE.
+      // For 1D dispatch, globalId(1) = 0 so grid_stride is irrelevant.
+      const gridStride = ctx.uniform("grid_stride");
+      const idx = ctx.emitLet(
+        "idx",
+        ctx.globalId(0).add(ctx.globalId(1).mul(gridStride)),
+      );
+      const numElements = ctx.uniform("num_elements");
+      ctx.ifThen(idx.ge(numElements), () => {
+        ctx.emitReturn();
+      });
 
-  return `
-struct UnscaleConfig {
-  inv_scale: f32,
-  num_elements: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
+      const invScale = ctx.uniform("inv_scale").bitcastTo("f32");
+      const g = ctx.emitLet("g", ctx.load("grad_in", idx).mul(invScale));
 
-@group(0) @binding(0) var<storage, read> grad_in: array<f32>;
-@group(0) @binding(1) var<storage, read_write> grad_out: array<f32>;
-@group(0) @binding(2) var<storage, read_write> inf_flag: array<atomic<u32>>;
-@group(0) @binding(3) var<uniform> config: UnscaleConfig;
+      // Check finite via bit pattern
+      const bits = g.bitcastTo("u32");
+      const exponent = bits.shr(ctx.u32(23)).and(ctx.u32(0xff));
+      const isFiniteVal = exponent.ne(ctx.u32(0xff));
 
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  ${idxCompute}
-  if (idx >= config.num_elements) { return; }
+      ctx.ifThenElse(
+        isFiniteVal,
+        () => {
+          ctx.emitStore("grad_out", idx, g);
+        },
+        () => {
+          ctx.atomicOp("inf_flag", ctx.u32(0), "max", ctx.u32(F32_ONE_BITS));
+          ctx.emitStore("grad_out", idx, ctx.f32(0.0));
+        },
+      );
+    },
+  };
+}
 
-  let g = grad_in[idx] * config.inv_scale;
+// ============================================================================
+// Dispatcher (singleton, created on first use)
+// ============================================================================
 
-  // Check finite via bit pattern: f32 exponent bits are [30:23].
-  // Inf and NaN have all exponent bits set (exponent = 0xFF = 255).
-  // Finite values have exponent < 255.
-  let bits = bitcast<u32>(g);
-  let exponent = (bits >> 23u) & 0xFFu;
-  let is_finite = (exponent != 0xFFu);
-  if (!is_finite) {
-    // Set flag to 1.0f bit pattern via atomicMax
-    // bitcast<u32>(1.0f) = 0x3F800000 = 1065353216
-    atomicMax(&inf_flag[0], 1065353216u);
-    grad_out[idx] = 0.0;
-  } else {
-    grad_out[idx] = g;
+let unscaleDispatcher: TileKernelInstance | null = null;
+
+function getUnscaleDispatcher(): TileKernelInstance {
+  if (!unscaleDispatcher) {
+    unscaleDispatcher = createTileKernelDispatcher(makeUnscaleSpec());
   }
-}
-`;
-}
-
-// ============================================================================
-// Config Buffer
-// ============================================================================
-
-function createUnscaleConfigBuffer(
-  device: GPUDevice,
-  invScale: number,
-  numElements: number,
-): GPUBuffer {
-  // 4 x f32/u32 = 16 bytes
-  const data = new ArrayBuffer(16);
-  const f32 = new Float32Array(data);
-  const u32 = new Uint32Array(data);
-
-  f32[0] = invScale;
-  u32[1] = numElements;
-  u32[2] = 0; // pad
-  u32[3] = 0; // pad
-
-  return createParamsBuffer(device, u32);
+  return unscaleDispatcher;
 }
 
 // ============================================================================
@@ -123,11 +130,11 @@ const infFlagZeroData = new Float32Array([0.0]);
  */
 export function allocateInfFlagBuffer(device?: GPUDevice): GPUBuffer {
   if (persistentInfFlagBuffer) {
-    const dev = device ?? (requireContext().device);
+    const dev = device ?? requireContext().device;
     dev.queue.writeBuffer(persistentInfFlagBuffer, 0, infFlagZeroData);
     return persistentInfFlagBuffer;
   }
-  const dev = device ?? (requireContext().device);
+  const dev = device ?? requireContext().device;
   persistentInfFlagBuffer = dev.createBuffer({
     size: 4,
     usage:
@@ -195,16 +202,20 @@ export async function readInfFlag(infFlagBuffer: GPUBuffer): Promise<number> {
   try {
     const mapResult = await Promise.race([
       staging.mapAsync(GPUMapMode.READ).then(() => true),
-      new Promise<false>((resolve) => setTimeout(() => resolve(false), MAPASYNC_TIMEOUT_MS)),
+      new Promise<false>((resolve) =>
+        setTimeout(() => resolve(false), MAPASYNC_TIMEOUT_MS),
+      ),
     ]);
     mapOk = mapResult;
-  } catch (e) {
+  } catch (_e) {
     staging.destroy();
     return 1.0; // Safe default: assume inf found
   }
 
   if (!mapOk) {
-    console.warn("[readInfFlag] mapAsync timed out (V100/Dawn timestamp corruption). Assuming inf found (safe default).");
+    console.warn(
+      "[readInfFlag] mapAsync timed out (V100/Dawn timestamp corruption). Assuming inf found (safe default).",
+    );
     // Destroy the staging buffer to cancel the pending mapAsync in Dawn's queue.
     // Leaving it alive corrupts subsequent mapAsync calls.
     staging.destroy();
@@ -227,7 +238,7 @@ export async function readInfFlag(infFlagBuffer: GPUBuffer): Promise<number> {
 /**
  * Destroy the persistent inf flag buffer (cleanup on WebGPU teardown).
  */
-export function destroyPersistentInfFlagBuffer(): void {
+function destroyPersistentInfFlagBuffer(): void {
   if (persistentInfFlagBuffer) {
     persistentInfFlagBuffer.destroy();
     persistentInfFlagBuffer = null;
@@ -265,7 +276,7 @@ interface UnscaleGradResult {
 /**
  * Dispatch the fused unscale+inf-check kernel.
  *
- * Handles chunking for buffers larger than maxStorageBufferBindingSize.
+ * Uses tile-IR dispatchChunked for buffers exceeding maxStorageBufferBindingSize.
  * All chunks share the same infFlagBuffer (atomic writes).
  */
 export function dispatchUnscaleGrad(
@@ -274,93 +285,49 @@ export function dispatchUnscaleGrad(
   invScale: number,
   infFlagBuffer: GPUBuffer,
 ): UnscaleGradResult {
-  const ctx = requireContext();
-  const device = ctx.device;
-
   const bytesPerElement = 4; // f32
   const totalBytes = numElements * bytesPerElement;
   const maxBindingSize = getMaxStorageBufferBindingSize();
-
-  // Determine if chunking is needed
   const needsChunking = totalBytes > maxBindingSize;
-
-  // Align chunk size for sub-range bindings
-  const minAlignment = 256; // minStorageBufferOffsetAlignment
-  const elementsPerAlignment = minAlignment / bytesPerElement; // 64
-  const maxElementsPerChunk = Math.floor(maxBindingSize / bytesPerElement);
-  const elementsPerChunk = needsChunking
-    ? Math.floor(maxElementsPerChunk / elementsPerAlignment) *
-      elementsPerAlignment
-    : numElements;
-  const numChunks = Math.ceil(numElements / elementsPerChunk);
 
   // Allocate output buffer (fresh, no pool reuse)
   const alignedBytes = roundUpToPowerOfTwo(totalBytes);
-  const gradOut = allocateFreshOutputBuffer(device, alignedBytes);
+  const gradOut = allocateFreshOutputBuffer(
+    requireContext().device,
+    alignedBytes,
+  );
 
-  // Determine dispatch dimensions
-  const maxWorkgroups = Math.ceil(elementsPerChunk / WORKGROUP_SIZE);
-  const use2D = maxWorkgroups > MAX_WORKGROUPS_PER_DIM;
-  const gridSizeX = use2D
-    ? Math.min(maxWorkgroups, MAX_WORKGROUPS_PER_DIM)
-    : maxWorkgroups;
+  // Compute grid_stride for 2D-safe indexing based on per-chunk element count
+  const elemPerChunk = needsChunking
+    ? computeFlatChunkLayout(numElements, bytesPerElement, maxBindingSize, 256)
+        .elementsPerChunk
+    : numElements;
+  const workgroups = Math.ceil(elemPerChunk / WORKGROUP_SIZE);
+  const gridSizeX = Math.min(workgroups, MAX_WORKGROUPS_PER_DIM);
+  const gridStride = gridSizeX * WORKGROUP_SIZE;
 
-  // Get or create pipeline
-  const key = `unscaleGrad:${use2D ? `2d:${gridSizeX}` : "1d"}`;
-  const code = unscaleGradShader(use2D, gridSizeX);
-  const pipeline = getPipeline(ctx, key, code);
+  const dispatcher = getUnscaleDispatcher();
+  const buffers = {
+    grad_in: gradBuffer,
+    grad_out: gradOut,
+    inf_flag: infFlagBuffer,
+  };
+  const uniforms = {
+    inv_scale: invScale,
+    num_elements: numElements,
+    grid_stride: gridStride,
+    _pad0: 0,
+  };
 
-  for (let chunk = 0; chunk < numChunks; chunk++) {
-    const chunkStart = chunk * elementsPerChunk;
-    const chunkEnd = Math.min(chunkStart + elementsPerChunk, numElements);
-    const chunkSize = chunkEnd - chunkStart;
-    const chunkByteOffset = chunkStart * bytesPerElement;
-    const chunkByteSize = chunkSize * bytesPerElement;
-
-    // Create config buffer for this chunk
-    const configBuf = createUnscaleConfigBuffer(device, invScale, chunkSize);
-
-    // Build bind group entries with sub-range bindings for chunked access
-    const mkBinding = (buf: GPUBuffer) =>
-      needsChunking
-        ? { buffer: buf, offset: chunkByteOffset, size: chunkByteSize }
-        : { buffer: buf };
-
-    const entries = [
-      { binding: 0, resource: mkBinding(gradBuffer) },
-      { binding: 1, resource: mkBinding(gradOut) },
-      { binding: 2, resource: { buffer: infFlagBuffer } }, // always full 4 bytes
-      { binding: 3, resource: { buffer: configBuf } },
-    ];
-
-    let bindGroup: GPUBindGroup;
-    if (needsChunking) {
-      bindGroup = device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries,
-      });
-    } else {
-      bindGroup = cachedCreateBindGroup(device, pipeline,
-        [gradBuffer, gradOut, infFlagBuffer, configBuf]);
-    }
-
-    const chunkWorkgroups = Math.ceil(chunkSize / WORKGROUP_SIZE);
-    const dispatchX = use2D
-      ? Math.min(chunkWorkgroups, MAX_WORKGROUPS_PER_DIM)
-      : chunkWorkgroups;
-    const dispatchY = use2D
-      ? Math.ceil(chunkWorkgroups / dispatchX)
-      : 1;
-
-    dispatchComputePass(
-      pipeline,
-      bindGroup,
-      dispatchX,
-      dispatchY,
-    );
-
-    // Config buffer deferred destruction (shared encoder still active)
-    releaseParamsBuffer(configBuf);
+  if (needsChunking) {
+    dispatcher.dispatchChunked(buffers, uniforms, {
+      modes: { grad_in: "chunked", grad_out: "chunked", inf_flag: "scalar" },
+      sizeUniform: "num_elements",
+      totalElements: numElements,
+      maxBytesPerElement: bytesPerElement,
+    });
+  } else {
+    dispatcher.dispatch(buffers, uniforms);
   }
 
   return { gradOutBuffer: gradOut };
@@ -379,8 +346,13 @@ function roundUpToPowerOfTwo(size: number): number {
 }
 
 /**
- * Reset all module-local mutable state (pipeline cache, persistent inf flag buffer).
+ * Reset all module-local mutable state (dispatcher, persistent inf flag buffer).
  */
 export function resetUnscaleKernelState(): void {
   destroyPersistentInfFlagBuffer();
+  if (unscaleDispatcher) {
+    unscaleDispatcher.reset();
+    unscaleDispatcher = null;
+  }
 }
+onTeardown(resetUnscaleKernelState);

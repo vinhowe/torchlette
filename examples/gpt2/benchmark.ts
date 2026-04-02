@@ -10,7 +10,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import * as path from "node:path";
-import type { Tensor, Torchlette, DeviceKind } from "../../src/frontend";
+import type { Tensor, Torchlette, DeviceKind } from "../../src/frontend/torchlette";
 import { GPT2, type GPT2Config } from "./model";
 import { GPT2Trainer, type GPT2TrainerConfig } from "./trainer";
 import { createSyntheticDataLoader } from "./data";

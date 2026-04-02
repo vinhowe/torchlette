@@ -2,9 +2,9 @@
  * Frontend dtype casting tests
  */
 
-import { describe, expect, it, beforeAll } from "vitest";
-import { Torchlette } from "../src/frontend";
+import { beforeAll, describe, expect, it } from "vitest";
 import { initWebGPU, isF16Supported } from "../src/backend/webgpu/index";
+import { Torchlette } from "../src/frontend/torchlette";
 import { cpuOnly } from "./helpers/webgpu";
 
 describe("Frontend dtype casting", () => {
@@ -98,7 +98,9 @@ describe("Frontend dtype casting", () => {
 
     it("dtype cast does not preserve autograd", async () => {
       const api = new Torchlette("webgpu");
-      const tensor = api.tensorFromArray([1, 2, 3, 4], [2, 2], { requiresGrad: true });
+      const tensor = api.tensorFromArray([1, 2, 3, 4], [2, 2], {
+        requiresGrad: true,
+      });
       const casted = tensor.toDtype("i32");
 
       // Casted tensor should not require grad (autograd detaches)

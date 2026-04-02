@@ -1,19 +1,30 @@
 // WebGPU backend exports for browser benchmarking
+// Tile-IR custom kernel API
 export {
-  dispatchMatmulWithEpilogue,
+  type BindingSpec,
+  compileTileKernel,
+  createTileKernelDispatcher,
+  type DataType,
+  elementwiseGrid,
+  enableAllAllocDebug,
+  getAndResetFlowCounters,
+  getGPUMemoryStats,
   getWebGPUDevice,
   getWebGPUInitError,
   initWebGPU,
+  KernelContext,
   syncWebGPU,
+  type TileKernelInstance,
+  type TileKernelSpec,
+  type UniformType,
   webgpuBackend,
 } from "./backend/webgpu";
+export { dispatchTiledMatmul } from "./backend/webgpu/matmul/dispatch";
 export {
   DEFAULT_CONFIG,
-  dispatchTiledMatmul,
   getSubgroupSupport,
   type MatmulKernelConfig,
-} from "./backend/webgpu/matmul";
-export * from "./engine";
+} from "./backend/webgpu/matmul/types";
 export {
   type DeviceKind,
   DisposedTensorError,
@@ -21,5 +32,18 @@ export {
   type TensorCreateOptions,
   Torchlette,
   torch,
-} from "./frontend";
-export { Adam, type AdamOptions, SGD, type SGDOptions } from "./optim";
+} from "./frontend/torchlette";
+export { storageTracker } from "./graph/storage-tracker";
+export * as nn from "./nn";
+export {
+  Adam,
+  type AdamOptions,
+  GradScaler,
+  type GradScalerOptions,
+  SGD,
+  type SGDOptions,
+} from "./optim";
+export {
+  getTensorDebugStats,
+  resetTensorDebugStats,
+} from "./runtime/tensor";

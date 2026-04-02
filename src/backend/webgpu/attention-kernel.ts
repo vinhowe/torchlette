@@ -10,55 +10,48 @@
  * Forward:  Q,K,V [B,H,N,D] → O [B,H,N,D] + L [B,H,N] (logsumexp)
  * Backward: Q,K,V,L,dO → dQ,dK,dV
  *
- * Tiling: BR=64 Q rows per workgroup, BC=32 KV rows per tile.
- * Scalar mode: Each thread handles one row (workgroup_size = 64).
- * Subgroup mode: 4 threads per row (workgroup_size = 256), each thread
- * handles 1/4 of headDim. Dot products reduced via subgroupShuffleXor.
+ * Kernel specs use the tile-IR block API: cooperative loads, block dot products
+ * (auto-vec4), block reductions, and block stores. No manual vec4 or shared
+ * memory code. Auto-CSE handles all sub-expression sharing.
  */
 
-import {
-  dispatchComputePass,
-  allocateOutputBuffer,
-  cachedCreateBindGroup,
-  getPipeline,
-} from "./index";
-import { requireContext } from "./webgpu-state";
-
-import { getSubgroupSupport } from "./matmul/types";
+import { cachedCreateBindGroup } from "./bind-group-cache";
+import { allocateOutputBuffer } from "./buffer-arena";
+import { dispatchComputePass, getPipeline } from "./dispatch";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { GPUBufferUsage } from "./gpu-types";
-import { wgslSumReduction, trackBuffers } from "./wgsl-helpers";
-
-// Pre-allocated typed array views for attention config buffer writing (avoids per-call allocation)
-const _attnConfigBuf = new ArrayBuffer(32);
-const _attnConfigU32 = new Uint32Array(_attnConfigBuf);
-const _attnConfigF32 = new Float32Array(_attnConfigBuf);
-const _attnConfigBytes = new Uint8Array(_attnConfigBuf);
-
-// Tiling parameters
-const BR = 64;  // Q rows per workgroup (also workgroup size in scalar mode)
-const BC = 32;  // KV rows per tile
-const BQ_BW = 16; // Q rows per tile in backward dKV kernel
-
-// Subgroup cooperative parameters
-const THREADS_PER_ROW = 4; // threads cooperating on one row's dot product
-const WG_SG = 256;  // workgroup size in subgroup mode (BR * THREADS_PER_ROW)
-
-// Shared WGSL struct for flash attention config (32 bytes, 8 fields)
-const WGSL_FA_CONFIG = `struct FAConfig {
-  batch_size: u32,
-  num_heads: u32,
-  seq_len: u32,
-  head_dim: u32,
-  scale: f32,
-  is_causal: u32,
-  _pad0: u32,
-  _pad1: u32,
-};`;
+import { F32_NEG_MAX, WORKGROUP_SIZE } from "./shape-utils";
+import { compileTileKernel } from "./tile-compiler";
+import type { TileKernelSpec } from "./tile-ir";
+import { tiledGrid } from "./tile-ir";
+import {
+  onTeardown,
+  requireContext,
+  trackSharedEncoderWrite,
+} from "./webgpu-state";
 
 // ============================================================================
-// Config Buffer Cache
+// Tiling Parameters
 // ============================================================================
+
+const BR = 64; // Q rows per workgroup (forward, dQ)
+const BC = 32; // KV rows per tile (forward, dQ)
+const BQ_BW = 16; // Q rows per tile (backward dKV)
+const BC_BW = 64; // KV rows per workgroup (backward dKV)
+
+// ============================================================================
+// WGSL Cache & Config Buffer Cache
+// ============================================================================
+
+const tileIRWGSLCache = new Map<string, string>();
+function getTileIRWGSL(key: string, specFactory: () => TileKernelSpec): string {
+  let wgsl = tileIRWGSLCache.get(key);
+  if (!wgsl) {
+    wgsl = compileTileKernel(specFactory());
+    tileIRWGSLCache.set(key, wgsl);
+  }
+  return wgsl;
+}
 
 const configCache = new Map<string, GPUBuffer>();
 
@@ -71,1047 +64,493 @@ function getOrCreateConfigBuffer(
   scale: number,
   isCausal: number,
 ): GPUBuffer {
-  const key = `fa:${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${isCausal}`;
+  const key = `${batchSize}:${numHeads}:${seqLen}:${headDim}:${scale}:${isCausal}`;
   let buf = configCache.get(key);
-  if (!buf) {
-    buf = device.createBuffer({
-      size: 32, // 8 x u32/f32
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    configCache.set(key, buf);
-  }
-  // Pack config: 4 u32s + 1 f32 + 1 u32 + 2 padding
-  _attnConfigU32[0] = batchSize;
-  _attnConfigU32[1] = numHeads;
-  _attnConfigU32[2] = seqLen;
-  _attnConfigU32[3] = headDim;
-  _attnConfigF32[4] = scale;
-  _attnConfigU32[5] = isCausal;
-  _attnConfigU32[6] = 0; // pad
-  _attnConfigU32[7] = 0; // pad
-  device.queue.writeBuffer(buf, 0, _attnConfigBytes);
+  if (buf) return buf;
+
+  buf = device.createBuffer({
+    size: 32,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: false,
+  });
+
+  const data = new ArrayBuffer(32);
+  const u32View = new Uint32Array(data);
+  const f32View = new Float32Array(data);
+  u32View[0] = batchSize;
+  u32View[1] = numHeads;
+  u32View[2] = seqLen;
+  u32View[3] = headDim;
+  f32View[4] = scale;
+  u32View[5] = isCausal;
+  u32View[6] = 0; // pad
+  u32View[7] = 0; // pad
+  device.queue.writeBuffer(buf, 0, new Uint8Array(data));
   return buf;
 }
 
 // ============================================================================
-// Subgroup support detection for attention kernels
+// Kernel Specs (tile-IR)
 // ============================================================================
 
-/**
- * Check if subgroup cooperative attention is usable for given headDim.
- * Requires: subgroups feature supported AND HD4 divisible by THREADS_PER_ROW.
- */
-function useSubgroupAttention(headDim: number): boolean {
-  const sg = getSubgroupSupport();
-  if (!sg?.supported) return false;
-  const HD4 = headDim / 4;
-  // Need HD4 divisible by THREADS_PER_ROW so each thread gets equal vec4 elements.
-  // Also require at least 4 vec4 elements per thread (headDim >= 64) for the
-  // register reduction to meaningfully outweigh shuffle overhead.
-  const D4_COUNT = HD4 / THREADS_PER_ROW;
-  return HD4 % THREADS_PER_ROW === 0 && D4_COUNT >= 4;
+function makeForwardAttentionSpec(headDim: number): TileKernelSpec {
+  if (headDim % 4 !== 0)
+    throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  const D = headDim;
+  const WG = BR;
+
+  return {
+    name: `tileAttnFwd_D${D}`,
+    workgroupSize: WG,
+    autoBarriers: true,
+    bindings: {
+      Q: { storage: "read", type: "f32" },
+      K: { storage: "read", type: "f32" },
+      V: { storage: "read", type: "f32" },
+      O: { storage: "read_write", type: "f32" },
+      L: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      is_causal: "u32",
+    },
+    grid: tiledGrid({
+      x: { uniform: "seq_len", tileSize: BR },
+      y: "num_heads",
+      z: "batch_size",
+    }),
+
+    kernel(ctx) {
+      const tidx = ctx.localIndex();
+      const qBlock = ctx.programId(0);
+      const hIdx = ctx.programId(1);
+      const bIdx = ctx.programId(2);
+
+      const N = ctx.uniform("seq_len");
+      const Dim = ctx.u32(D);
+      const numHeads = ctx.uniform("num_heads");
+      const isCausal = ctx.uniform("is_causal");
+      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
+
+      const qRow = qBlock.mul(ctx.u32(BR)).add(tidx);
+      const valid = qRow.lt(N);
+
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const qBase = bhOff.add(qRow.mul(Dim));
+
+      const Q = ctx.tileLoad(
+        "Q",
+        {
+          kind: "thread",
+          base: qBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
+
+      const mPrev = ctx.full(1, 1, F32_NEG_MAX);
+      const lPrev = ctx.full(1, 1, 0);
+      const oAcc = ctx.zeros(1, D);
+
+      const numKVTiles = N.add(ctx.u32(BC - 1)).div(ctx.u32(BC));
+
+      ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
+        const kvStart = tile.mul(ctx.u32(BC));
+
+        const offsR = ctx.arange(kvStart, BC);
+        const offsD = ctx.arange(ctx.u32(0), D);
+        const tilePtr = ctx.tilePtr(
+          bhOff,
+          offsR.outer(Dim),
+          offsD.inner(ctx.u32(1)),
+        );
+        const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+        const K = ctx.load2D("K", tilePtr, tileMask);
+
+        const scores = ctx.dot(Q, K.T());
+
+        ctx.range(0, BC, (j) => {
+          const kvPos = kvStart.add(j);
+          const isActive = valid
+            .and(kvPos.lt(N))
+            .and(isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)));
+          scores.set(
+            j,
+            isActive.select(scores.get(j).mul(scale), ctx.f32(F32_NEG_MAX)),
+          );
+        });
+
+        const mNew = scores.max(1);
+        const mMax = mNew.max(mPrev);
+        const correction = mPrev.sub(mMax).exp();
+
+        oAcc.mul_(correction);
+        lPrev.mul_(correction);
+
+        scores.sub_(mMax);
+        scores.exp_();
+        lPrev.add_(scores.sum(1));
+        mPrev.assign(mMax);
+
+        const V = ctx.load2D("V", tilePtr, tileMask, { reuseShared: K });
+        ctx.dotAccum(scores, V, oAcc);
+      });
+
+      ctx.ifThen(valid, () => {
+        const l = lPrev.get(ctx.u32(0));
+        const invL = l.gt(ctx.f32(0)).select(ctx.f32(1).div(l), ctx.f32(0));
+        oAcc.mul_(invL);
+        ctx.tileStore("O", oAcc, { base: qBase, stride: ctx.u32(1) });
+
+        const m = mPrev.get(ctx.u32(0));
+        const lse = m.add(l.max(ctx.f32(1e-10)).log());
+        ctx.emitStore("L", bhOffL.add(qRow), lse);
+      });
+    },
+  };
 }
 
-// ============================================================================
-// WGSL Shaders
-// ============================================================================
+function makeDPrecomputeSpec(headDim: number): TileKernelSpec {
+  const D = headDim;
+  const WG = WORKGROUP_SIZE;
 
-/**
- * FlashAttention Forward Shader
- *
- * One workgroup per (q_block, head, batch). BR rows per workgroup.
- * Scalar mode: 64 threads, 1 per row.
- * Subgroup mode: 256 threads, 4 per row. Dot products via subgroupShuffleXor.
- *
- * Input: Q,K,V [B,H,N,D] (flattened as storage arrays)
- * Output: O [B,H,N,D], L [B,H,N] (logsumexp per row)
- */
-function flashAttentionForwardShader(headDim: number, useSubgroups: boolean): string {
-  if (headDim % 4 !== 0) throw new Error(`flashAttentionForwardShader requires headDim divisible by 4, got ${headDim}`);
-  const HD4 = headDim / 4;
+  return {
+    name: `tileAttnDPrecompute_D${D}`,
+    workgroupSize: WG,
+    bindings: {
+      dO: { storage: "read", type: "f32" },
+      Out: { storage: "read", type: "f32" },
+      D_val: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      is_causal: "u32",
+    },
+    grid: (u) => [u.batch_size * u.num_heads * u.seq_len],
 
-  if (useSubgroups) {
-    const D4_COUNT = HD4 / THREADS_PER_ROW; // vec4 elements per thread
-    const WG = WG_SG;
-    return `
-enable subgroups;
+    kernel(ctx) {
+      const row = ctx.programId(0);
+      const tid = ctx.localIndex();
+      const Dim = ctx.uniform("head_dim");
+      const base = row.mul(Dim);
 
-${WGSL_FA_CONFIG}
-
-@group(0) @binding(0) var<storage, read> Q: array<f32>;
-@group(0) @binding(1) var<storage, read> K: array<f32>;
-@group(0) @binding(2) var<storage, read> V: array<f32>;
-@group(0) @binding(3) var<storage, read_write> O: array<f32>;
-@group(0) @binding(4) var<storage, read_write> L: array<f32>;
-@group(0) @binding(5) var<uniform> config: FAConfig;
-
-// Shared memory for K and V tiles: [BC, HD/4] as vec4
-var<workgroup> k_tile: array<vec4<f32>, ${BC * HD4}>;
-var<workgroup> v_tile: array<vec4<f32>, ${BC * HD4}>;
-
-@compute @workgroup_size(${WG})
-fn main(@builtin(local_invocation_index) tidx: u32,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let q_block = wid.x;
-  let h = wid.y;
-  let b = wid.z;
-
-  let row_lane = tidx / ${THREADS_PER_ROW}u;  // which row (0..63)
-  let d4_lane = tidx % ${THREADS_PER_ROW}u;   // which portion of headDim (0..3)
-  let d4_start = d4_lane * ${D4_COUNT}u;       // starting vec4 index
-
-  let N = config.seq_len;
-  let D = config.head_dim;
-  let scale = config.scale;
-
-  let q_row = q_block * ${BR}u + row_lane;
-  let valid = q_row < N;
-
-  let bh_offset = (b * config.num_heads + h) * N * D;
-  let bh_offset_L = (b * config.num_heads + h) * N;
-
-  // Load Q row slice into registers (each thread loads 1/4 of headDim)
-  // var is zero-initialized; invalid threads keep zeros → dot products = 0
-  var q_reg: array<vec4<f32>, ${D4_COUNT}>;
-  if (valid) {
-    let q_base = bh_offset + q_row * D;
-    for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-      let off = q_base + (d4_start + d4) * 4u;
-      q_reg[d4] = vec4<f32>(Q[off], Q[off+1u], Q[off+2u], Q[off+3u]);
-    }
-  }
-
-  // Running online softmax state
-  var m_i = -3.402823e+38f;
-  var l_i = 0.0f;
-  var o_acc: array<vec4<f32>, ${D4_COUNT}>;
-  for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-    o_acc[d4] = vec4<f32>(0.0);
-  }
-
-  let num_kv_tiles = (N + ${BC - 1}u) / ${BC}u;
-
-  for (var tile = 0u; tile < num_kv_tiles; tile++) {
-    let kv_start = tile * ${BC}u;
-
-    // Cooperatively load K tile (256 threads loading BC*HD4 elements)
-    for (var idx = tidx; idx < ${BC * HD4}u; idx += ${WG}u) {
-      let row = idx / ${HD4}u;
-      let d4 = idx % ${HD4}u;
-      let kv_row = kv_start + row;
-      if (kv_row < N) {
-        let off = bh_offset + kv_row * D + d4 * 4u;
-        k_tile[idx] = vec4<f32>(K[off], K[off+1u], K[off+2u], K[off+3u]);
-      } else {
-        k_tile[idx] = vec4<f32>(0.0);
-      }
-    }
-
-    // Cooperatively load V tile
-    for (var idx = tidx; idx < ${BC * HD4}u; idx += ${WG}u) {
-      let row = idx / ${HD4}u;
-      let d4 = idx % ${HD4}u;
-      let kv_row = kv_start + row;
-      if (kv_row < N) {
-        let off = bh_offset + kv_row * D + d4 * 4u;
-        v_tile[idx] = vec4<f32>(V[off], V[off+1u], V[off+2u], V[off+3u]);
-      } else {
-        v_tile[idx] = vec4<f32>(0.0);
-      }
-    }
-
-    workgroupBarrier();
-
-    // Score computation — ALL threads participate (subgroup-uniform control flow)
-    // Invalid/masked threads have q_reg=0 so their partial sums are 0
-    var tile_max = -3.402823e+38f;
-    var scores: array<f32, ${BC}>;
-
-    for (var j = 0u; j < ${BC}u; j++) {
-      let kv_pos = kv_start + j;
-      let is_active = valid && kv_pos < N && (config.is_causal == 0u || kv_pos <= q_row);
-
-      // All threads compute partial dot (0 for invalid/masked via zero q_reg)
-      var s_partial = 0.0f;
-      for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-        s_partial += dot(q_reg[d4], k_tile[j * ${HD4}u + d4_start + d4]);
-      }
-      // Tree reduction — subgroup-uniform, all threads execute
-      s_partial += subgroupShuffleXor(s_partial, 1u);
-      s_partial += subgroupShuffleXor(s_partial, 2u);
-
-      let s = s_partial * scale;
-      scores[j] = select(-3.402823e+38f, s, is_active);
-      tile_max = select(tile_max, max(tile_max, s), is_active);
-    }
-
-    // Online softmax update (safe for invalid: m_i=-inf, correction=1, p=0)
-    let m_new = max(m_i, tile_max);
-    let correction = exp(m_i - m_new);
-
-    l_i = l_i * correction;
-    for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-      o_acc[d4] = o_acc[d4] * correction;
-    }
-
-    for (var j = 0u; j < ${BC}u; j++) {
-      let p = exp(scores[j] - m_new);
-      l_i += p;
-      for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-        o_acc[d4] += p * v_tile[j * ${HD4}u + d4_start + d4];
-      }
-    }
-
-    m_i = m_new;
-
-    workgroupBarrier();
-  }
-
-  // Final normalization and write output
-  if (valid) {
-    let inv_l = select(0.0, 1.0 / l_i, l_i > 0.0);
-    let o_base = bh_offset + q_row * D;
-    for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-      let v = o_acc[d4] * inv_l;
-      let off = o_base + (d4_start + d4) * 4u;
-      O[off] = v.x;
-      O[off+1u] = v.y;
-      O[off+2u] = v.z;
-      O[off+3u] = v.w;
-    }
-
-    // Only one thread per row writes L
-    if (d4_lane == 0u) {
-      let logsumexp = m_i + log(max(l_i, 1e-10f));
-      L[bh_offset_L + q_row] = logsumexp;
-    }
-  }
-}
-`;
-  }
-
-  // Scalar (non-subgroup) path — original implementation
-  return `
-${WGSL_FA_CONFIG}
-
-@group(0) @binding(0) var<storage, read> Q: array<f32>;
-@group(0) @binding(1) var<storage, read> K: array<f32>;
-@group(0) @binding(2) var<storage, read> V: array<f32>;
-@group(0) @binding(3) var<storage, read_write> O: array<f32>;
-@group(0) @binding(4) var<storage, read_write> L: array<f32>;
-@group(0) @binding(5) var<uniform> config: FAConfig;
-
-// Shared memory for K and V tiles: [BC, HD/4] as vec4
-var<workgroup> k_tile: array<vec4<f32>, ${BC * HD4}>;
-var<workgroup> v_tile: array<vec4<f32>, ${BC * HD4}>;
-
-@compute @workgroup_size(${BR})
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let q_block = wid.x;
-  let h = wid.y;
-  let b = wid.z;
-  let tid = lid.x;
-
-  let N = config.seq_len;
-  let D = config.head_dim;
-  let scale = config.scale;
-
-  let q_row = q_block * ${BR}u + tid;
-  let valid = q_row < N;
-
-  let bh_offset = (b * config.num_heads + h) * N * D;
-  let bh_offset_L = (b * config.num_heads + h) * N;
-
-  // Load Q row into vec4 registers
-  var q_reg: array<vec4<f32>, ${HD4}>;
-  if (valid) {
-    let q_base = bh_offset + q_row * D;
-    for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-      let off = q_base + d4 * 4u;
-      q_reg[d4] = vec4<f32>(Q[off], Q[off+1u], Q[off+2u], Q[off+3u]);
-    }
-  }
-
-  // Running online softmax state
-  var m_i = -3.402823e+38f;
-  var l_i = 0.0f;
-  var o_acc: array<vec4<f32>, ${HD4}>;
-  for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-    o_acc[d4] = vec4<f32>(0.0);
-  }
-
-  let num_kv_tiles = (N + ${BC - 1}u) / ${BC}u;
-
-  for (var tile = 0u; tile < num_kv_tiles; tile++) {
-    let kv_start = tile * ${BC}u;
-
-    // Cooperatively load K tile into shared memory as vec4
-    for (var row = tid; row < ${BC}u; row += ${BR}u) {
-      let kv_row = kv_start + row;
-      if (kv_row < N) {
-        let k_base = bh_offset + kv_row * D;
-        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-          let off = k_base + d4 * 4u;
-          k_tile[row * ${HD4}u + d4] = vec4<f32>(K[off], K[off+1u], K[off+2u], K[off+3u]);
-        }
-      } else {
-        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-          k_tile[row * ${HD4}u + d4] = vec4<f32>(0.0);
-        }
-      }
-    }
-
-    // Cooperatively load V tile into shared memory as vec4
-    for (var row = tid; row < ${BC}u; row += ${BR}u) {
-      let kv_row = kv_start + row;
-      if (kv_row < N) {
-        let v_base = bh_offset + kv_row * D;
-        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-          let off = v_base + d4 * 4u;
-          v_tile[row * ${HD4}u + d4] = vec4<f32>(V[off], V[off+1u], V[off+2u], V[off+3u]);
-        }
-      } else {
-        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-          v_tile[row * ${HD4}u + d4] = vec4<f32>(0.0);
-        }
-      }
-    }
-
-    workgroupBarrier();
-
-    if (valid) {
-      var tile_end = min(${BC}u, N - kv_start);
-
-      var tile_max = -3.402823e+38f;
-      var scores: array<f32, ${BC}>;
-
-      for (var j = 0u; j < tile_end; j++) {
-        let kv_pos = kv_start + j;
-        if (config.is_causal != 0u && kv_pos > q_row) {
-          scores[j] = -3.402823e+38f;
-          continue;
-        }
-
-        // Vec4 dot product: Q_row . K_tile[j]
-        var s = 0.0f;
-        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-          s += dot(q_reg[d4], k_tile[j * ${HD4}u + d4]);
-        }
-        scores[j] = s * scale;
-        tile_max = max(tile_max, scores[j]);
-      }
-
-      for (var j = tile_end; j < ${BC}u; j++) {
-        scores[j] = -3.402823e+38f;
-      }
-
-      let m_new = max(m_i, tile_max);
-      let correction = exp(m_i - m_new);
-
-      l_i = l_i * correction;
-      for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-        o_acc[d4] = o_acc[d4] * correction;
-      }
-
-      for (var j = 0u; j < tile_end; j++) {
-        let p = exp(scores[j] - m_new);
-        l_i += p;
-        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-          o_acc[d4] += p * v_tile[j * ${HD4}u + d4];
-        }
-      }
-
-      m_i = m_new;
-    }
-
-    workgroupBarrier();
-  }
-
-  // Final normalization and write output
-  if (valid) {
-    let inv_l = select(0.0, 1.0 / l_i, l_i > 0.0);
-    let o_base = bh_offset + q_row * D;
-    for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-      let v = o_acc[d4] * inv_l;
-      let off = o_base + d4 * 4u;
-      O[off] = v.x;
-      O[off+1u] = v.y;
-      O[off+2u] = v.z;
-      O[off+3u] = v.w;
-    }
-
-    let logsumexp = m_i + log(max(l_i, 1e-10f));
-    L[bh_offset_L + q_row] = logsumexp;
-  }
-}
-`;
+      const dotProd = ctx.wgReduce("sum", tid, Dim, WG, (i) =>
+        ctx.load("dO", base.add(i)).mul(ctx.load("Out", base.add(i))),
+      );
+      ctx.guardedStore("D_val", tid.eq(ctx.u32(0)), row, dotProd);
+    },
+  };
 }
 
-/**
- * FlashAttention Backward D Precompute Shader
- *
- * D[i] = sum_d(dO[i,d] * O[i,d]) for each row i.
- * One thread per head_dim element, one workgroup per row.
- *
- * Input: dO [B,H,N,D], O [B,H,N,D]
- * Output: D [B,H,N]
- */
-function flashAttentionBackwardDShader(headDim: number): string {
-  // Use headDim threads per workgroup for reduction
-  const WG = Math.max(headDim, 32); // at least 32 for reduction
-  return `
-${WGSL_FA_CONFIG}
+function makeBackwardDQSpec(headDim: number): TileKernelSpec {
+  if (headDim % 4 !== 0)
+    throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  const D = headDim;
+  const WG = BR;
 
-@group(0) @binding(0) var<storage, read> dO: array<f32>;
-@group(0) @binding(1) var<storage, read> Out: array<f32>;
-@group(0) @binding(2) var<storage, read_write> D: array<f32>;
-@group(0) @binding(3) var<uniform> config: FAConfig;
+  return {
+    name: `tileAttnBwdDQ_D${D}`,
+    workgroupSize: WG,
+    autoBarriers: true,
+    bindings: {
+      Q: { storage: "read", type: "f32" },
+      K: { storage: "read", type: "f32" },
+      V: { storage: "read", type: "f32" },
+      L_buf: { storage: "read", type: "f32" },
+      D_buf: { storage: "read", type: "f32" },
+      dO: { storage: "read", type: "f32" },
+      dQ: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      is_causal: "u32",
+    },
+    grid: tiledGrid({
+      x: { uniform: "seq_len", tileSize: BR },
+      y: "num_heads",
+      z: "batch_size",
+    }),
 
-var<workgroup> sdata: array<f32, ${WG}>;
+    kernel(ctx) {
+      const tidx = ctx.localIndex();
+      const qBlock = ctx.programId(0);
+      const hIdx = ctx.programId(1);
+      const bIdx = ctx.programId(2);
 
-@compute @workgroup_size(${WG})
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let row_idx = wid.x;  // flattened row in [B*H*N]
-  let tid = lid.x;
+      const N = ctx.uniform("seq_len");
+      const Dim = ctx.u32(D);
+      const numHeads = ctx.uniform("num_heads");
+      const isCausal = ctx.uniform("is_causal");
+      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
 
-  let N = config.seq_len;
-  let D_dim = config.head_dim;
-  let total_rows = config.batch_size * config.num_heads * N;
+      const qRow = qBlock.mul(ctx.u32(BR)).add(tidx);
+      const valid = qRow.lt(N);
 
-  if (row_idx >= total_rows) {
-    return;
-  }
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const rowBase = bhOff.add(qRow.mul(Dim));
 
-  // Compute base offset for this row
-  let base = row_idx * D_dim;
+      const Q = ctx.tileLoad(
+        "Q",
+        {
+          kind: "thread",
+          base: rowBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
 
-  // Each thread accumulates partial dot product
-  var local_sum = 0.0f;
-  for (var d = tid; d < D_dim; d += ${WG}u) {
-    local_sum += dO[base + d] * Out[base + d];
-  }
+      const dO = ctx.tileLoad(
+        "dO",
+        {
+          kind: "thread",
+          base: rowBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
 
-  sdata[tid] = local_sum;
-  workgroupBarrier();
+      const lVar = ctx.emitVar("_Li", "f32", ctx.f32(0));
+      const dVar = ctx.emitVar("_Di", "f32", ctx.f32(0));
+      ctx.ifThen(valid, () => {
+        lVar.set(ctx.load("L_buf", bhOffL.add(qRow)));
+        dVar.set(ctx.load("D_buf", bhOffL.add(qRow)));
+      });
 
-  // Tree reduction
-  ${wgslSumReduction("sdata", WG / 2)}
+      const dqAcc = ctx.zeros(1, D);
 
-  if (tid == 0u) {
-    D[row_idx] = sdata[0];
-  }
-}
-`;
-}
+      const numKVTiles = N.add(ctx.u32(BC - 1)).div(ctx.u32(BC));
 
-/**
- * FlashAttention Backward dQ Shader
- *
- * Same tiling structure as forward. One workgroup per Q block.
- * Loop over KV tiles, recompute attention from saved logsumexp.
- *
- * dS = P * (dO@V^T_row - D[i])  ... but we compute row-wise
- * dQ[i] += sum_j(dS[i,j] * K[j])
- *
- * Input: Q,K,V [B,H,N,D], L [B,H,N], D_buf [B,H,N], dO [B,H,N,D]
- * Output: dQ [B,H,N,D]
- */
-function flashAttentionBackwardDQShader(headDim: number, useSubgroups: boolean): string {
-  if (headDim % 4 !== 0) throw new Error(`flashAttentionBackwardDQShader requires headDim divisible by 4, got ${headDim}`);
-  const HD4 = headDim / 4;
+      ctx.forRange(ctx.u32(0), numKVTiles, (tile) => {
+        const kvStart = tile.mul(ctx.u32(BC));
 
-  if (useSubgroups) {
-    const D4_COUNT = HD4 / THREADS_PER_ROW;
-    const WG = WG_SG;
-    return `
-enable subgroups;
+        const offsR = ctx.arange(kvStart, BC);
+        const offsD = ctx.arange(ctx.u32(0), D);
+        const tilePtr = ctx.tilePtr(
+          bhOff,
+          offsR.outer(Dim),
+          offsD.inner(ctx.u32(1)),
+        );
+        const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+        const K = ctx.load2D("K", tilePtr, tileMask);
+        const V = ctx.load2D("V", tilePtr, tileMask);
 
-${WGSL_FA_CONFIG}
+        // Fused single-loop: compute score, p, ds per KV-row, accumulate dQ inline
+        ctx.range(0, BC, (j) => {
+          const kvPos = kvStart.add(j);
+          const isActive = valid
+            .and(kvPos.lt(N))
+            .and(isCausal.eq(ctx.u32(0)).or(kvPos.le(qRow)));
+          const s = ctx.dotRow(Q, K, j).mul(scale);
+          const dov = ctx.dotRow(dO, V, j);
+          const p = isActive.select(s.sub(lVar.get()).exp(), ctx.f32(0));
+          const ds = p.mul(dov.sub(dVar.get()));
+          ctx.accumRow(dqAcc, ds, K, j);
+        });
+      });
 
-@group(0) @binding(0) var<storage, read> Q: array<f32>;
-@group(0) @binding(1) var<storage, read> K: array<f32>;
-@group(0) @binding(2) var<storage, read> V: array<f32>;
-@group(0) @binding(3) var<storage, read> L_buf: array<f32>;
-@group(0) @binding(4) var<storage, read> D_buf: array<f32>;
-@group(0) @binding(5) var<storage, read> dO: array<f32>;
-@group(0) @binding(6) var<storage, read_write> dQ: array<f32>;
-@group(0) @binding(7) var<uniform> config: FAConfig;
-
-var<workgroup> k_tile: array<vec4<f32>, ${BC * HD4}>;
-var<workgroup> v_tile: array<vec4<f32>, ${BC * HD4}>;
-
-@compute @workgroup_size(${WG})
-fn main(@builtin(local_invocation_index) tidx: u32,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let q_block = wid.x;
-  let h = wid.y;
-  let b = wid.z;
-
-  let row_lane = tidx / ${THREADS_PER_ROW}u;
-  let d4_lane = tidx % ${THREADS_PER_ROW}u;
-  let d4_start = d4_lane * ${D4_COUNT}u;
-
-  let N = config.seq_len;
-  let D = config.head_dim;
-  let scale = config.scale;
-
-  let q_row = q_block * ${BR}u + row_lane;
-  let valid = q_row < N;
-
-  let bh_offset = (b * config.num_heads + h) * N * D;
-  let bh_offset_L = (b * config.num_heads + h) * N;
-
-  // Load Q row slice, dO row slice into registers
-  var q_reg: array<vec4<f32>, ${D4_COUNT}>;
-  var dO_reg: array<vec4<f32>, ${D4_COUNT}>;
-  var dq_acc: array<vec4<f32>, ${D4_COUNT}>;
-  var L_i = 0.0f;
-  var D_i = 0.0f;
-
-  if (valid) {
-    let base = bh_offset + q_row * D;
-    for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-      let off = base + (d4_start + d4) * 4u;
-      q_reg[d4] = vec4<f32>(Q[off], Q[off+1u], Q[off+2u], Q[off+3u]);
-      dO_reg[d4] = vec4<f32>(dO[off], dO[off+1u], dO[off+2u], dO[off+3u]);
-      dq_acc[d4] = vec4<f32>(0.0);
-    }
-    L_i = L_buf[bh_offset_L + q_row];
-    D_i = D_buf[bh_offset_L + q_row];
-  }
-
-  let num_kv_tiles = (N + ${BC - 1}u) / ${BC}u;
-
-  for (var tile = 0u; tile < num_kv_tiles; tile++) {
-    let kv_start = tile * ${BC}u;
-
-    // Cooperatively load K and V tiles (256 threads)
-    for (var idx = tidx; idx < ${BC * HD4}u; idx += ${WG}u) {
-      let row = idx / ${HD4}u;
-      let d4 = idx % ${HD4}u;
-      let kv_row = kv_start + row;
-      if (kv_row < N) {
-        let off = bh_offset + kv_row * D + d4 * 4u;
-        k_tile[idx] = vec4<f32>(K[off], K[off+1u], K[off+2u], K[off+3u]);
-        v_tile[idx] = vec4<f32>(V[off], V[off+1u], V[off+2u], V[off+3u]);
-      } else {
-        k_tile[idx] = vec4<f32>(0.0);
-        v_tile[idx] = vec4<f32>(0.0);
-      }
-    }
-
-    workgroupBarrier();
-
-    // ALL threads participate in shuffle — subgroup-uniform control flow
-    // Invalid/masked threads have q_reg=0 and dO_reg=0 so partials are 0
-    for (var j = 0u; j < ${BC}u; j++) {
-      let kv_pos = kv_start + j;
-      let is_active =valid && kv_pos < N && (config.is_causal == 0u || kv_pos <= q_row);
-
-      // Partial dot product: Q[i] . K[j]
-      var s_partial = 0.0f;
-      for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-        s_partial += dot(q_reg[d4], k_tile[j * ${HD4}u + d4_start + d4]);
-      }
-      s_partial += subgroupShuffleXor(s_partial, 1u);
-      s_partial += subgroupShuffleXor(s_partial, 2u);
-      let s = s_partial * scale;
-
-      // p=0 for masked (s*scale is arbitrary but exp(anything - L_i) for invalid
-      // doesn't matter since we gate accumulation below)
-      let p = select(0.0f, exp(s - L_i), is_active);
-
-      // Partial dot product: dO[i] . V[j]
-      var dov_partial = 0.0f;
-      for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-        dov_partial += dot(dO_reg[d4], v_tile[j * ${HD4}u + d4_start + d4]);
-      }
-      dov_partial += subgroupShuffleXor(dov_partial, 1u);
-      dov_partial += subgroupShuffleXor(dov_partial, 2u);
-
-      let ds = p * (dov_partial - D_i);
-
-      // dQ[i] += dS[i,j] * K[j] (each thread accumulates its slice)
-      // ds=0 for inactive, so accumulation is a no-op
-      for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-        dq_acc[d4] += ds * k_tile[j * ${HD4}u + d4_start + d4];
-      }
-    }
-
-    workgroupBarrier();
-  }
-
-  // Write dQ (each thread writes its slice)
-  if (valid) {
-    let base = bh_offset + q_row * D;
-    for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-      let v = dq_acc[d4] * scale;
-      let off = base + (d4_start + d4) * 4u;
-      dQ[off] = v.x;
-      dQ[off+1u] = v.y;
-      dQ[off+2u] = v.z;
-      dQ[off+3u] = v.w;
-    }
-  }
-}
-`;
-  }
-
-  // Scalar (non-subgroup) path
-  return `
-${WGSL_FA_CONFIG}
-
-@group(0) @binding(0) var<storage, read> Q: array<f32>;
-@group(0) @binding(1) var<storage, read> K: array<f32>;
-@group(0) @binding(2) var<storage, read> V: array<f32>;
-@group(0) @binding(3) var<storage, read> L_buf: array<f32>;
-@group(0) @binding(4) var<storage, read> D_buf: array<f32>;
-@group(0) @binding(5) var<storage, read> dO: array<f32>;
-@group(0) @binding(6) var<storage, read_write> dQ: array<f32>;
-@group(0) @binding(7) var<uniform> config: FAConfig;
-
-var<workgroup> k_tile: array<vec4<f32>, ${BC * HD4}>;
-var<workgroup> v_tile: array<vec4<f32>, ${BC * HD4}>;
-
-@compute @workgroup_size(${BR})
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let q_block = wid.x;
-  let h = wid.y;
-  let b = wid.z;
-  let tid = lid.x;
-
-  let N = config.seq_len;
-  let D = config.head_dim;
-  let scale = config.scale;
-
-  let q_row = q_block * ${BR}u + tid;
-  let valid = q_row < N;
-
-  let bh_offset = (b * config.num_heads + h) * N * D;
-  let bh_offset_L = (b * config.num_heads + h) * N;
-
-  // Load Q row, dO row into vec4 registers
-  var q_reg: array<vec4<f32>, ${HD4}>;
-  var dO_reg: array<vec4<f32>, ${HD4}>;
-  var dq_acc: array<vec4<f32>, ${HD4}>;
-  var L_i = 0.0f;
-  var D_i = 0.0f;
-
-  if (valid) {
-    let base = bh_offset + q_row * D;
-    for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-      let off = base + d4 * 4u;
-      q_reg[d4] = vec4<f32>(Q[off], Q[off+1u], Q[off+2u], Q[off+3u]);
-      dO_reg[d4] = vec4<f32>(dO[off], dO[off+1u], dO[off+2u], dO[off+3u]);
-      dq_acc[d4] = vec4<f32>(0.0);
-    }
-    L_i = L_buf[bh_offset_L + q_row];
-    D_i = D_buf[bh_offset_L + q_row];
-  }
-
-  let num_kv_tiles = (N + ${BC - 1}u) / ${BC}u;
-
-  for (var tile = 0u; tile < num_kv_tiles; tile++) {
-    let kv_start = tile * ${BC}u;
-
-    // Cooperatively load K and V tiles as vec4
-    for (var row = tid; row < ${BC}u; row += ${BR}u) {
-      let kv_row = kv_start + row;
-      if (kv_row < N) {
-        let k_base = bh_offset + kv_row * D;
-        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-          let off = k_base + d4 * 4u;
-          k_tile[row * ${HD4}u + d4] = vec4<f32>(K[off], K[off+1u], K[off+2u], K[off+3u]);
-          v_tile[row * ${HD4}u + d4] = vec4<f32>(V[off], V[off+1u], V[off+2u], V[off+3u]);
-        }
-      } else {
-        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-          k_tile[row * ${HD4}u + d4] = vec4<f32>(0.0);
-          v_tile[row * ${HD4}u + d4] = vec4<f32>(0.0);
-        }
-      }
-    }
-
-    workgroupBarrier();
-
-    if (valid) {
-      let tile_end = min(${BC}u, N - kv_start);
-
-      for (var j = 0u; j < tile_end; j++) {
-        let kv_pos = kv_start + j;
-        if (config.is_causal != 0u && kv_pos > q_row) {
-          continue;
-        }
-
-        // Vec4 dot product: Q[i] . K[j] * scale
-        var s = 0.0f;
-        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-          s += dot(q_reg[d4], k_tile[j * ${HD4}u + d4]);
-        }
-        s = s * scale;
-
-        let p = exp(s - L_i);
-
-        // Vec4 dot product: dO[i] . V[j]
-        var dov = 0.0f;
-        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-          dov += dot(dO_reg[d4], v_tile[j * ${HD4}u + d4]);
-        }
-
-        let ds = p * (dov - D_i);
-
-        // dQ[i] += dS[i,j] * K[j]
-        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-          dq_acc[d4] += ds * k_tile[j * ${HD4}u + d4];
-        }
-      }
-    }
-
-    workgroupBarrier();
-  }
-
-  // Write dQ (scale applied once at write)
-  if (valid) {
-    let base = bh_offset + q_row * D;
-    for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-      let v = dq_acc[d4] * scale;
-      let off = base + d4 * 4u;
-      dQ[off] = v.x;
-      dQ[off+1u] = v.y;
-      dQ[off+2u] = v.z;
-      dQ[off+3u] = v.w;
-    }
-  }
-}
-`;
+      ctx.ifThen(valid, () => {
+        dqAcc.mul_(scale);
+        ctx.tileStore("dQ", dqAcc, { base: rowBase, stride: ctx.u32(1) });
+      });
+    },
+  };
 }
 
-/**
- * FlashAttention Backward dKV Shader
- *
- * One workgroup per KV block (BC_BW=64 KV rows).
- * Scalar mode: 64 threads, 1 per KV row.
- * Subgroup mode: 256 threads, 4 per KV row. Dot products via subgroupShuffleXor.
- *
- * Input: Q,K,V [B,H,N,D], L [B,H,N], D_buf [B,H,N], dO [B,H,N,D]
- * Output: dK [B,H,N,D], dV [B,H,N,D]
- */
-function flashAttentionBackwardDKVShader(headDim: number, useSubgroups: boolean): string {
-  if (headDim % 4 !== 0) throw new Error(`flashAttentionBackwardDKVShader requires headDim divisible by 4, got ${headDim}`);
-  const BC_BW = 64; // KV rows per workgroup for backward
-  const HD4 = headDim / 4;
+function makeBackwardDKVSpec(headDim: number): TileKernelSpec {
+  if (headDim % 4 !== 0)
+    throw new Error(`headDim must be divisible by 4, got ${headDim}`);
+  const D = headDim;
+  const WG = BC_BW;
 
-  if (useSubgroups) {
-    const D4_COUNT = HD4 / THREADS_PER_ROW;
-    const WG = BC_BW * THREADS_PER_ROW; // 256
-    return `
-enable subgroups;
+  return {
+    name: `tileAttnBwdDKV_D${D}`,
+    workgroupSize: WG,
+    autoBarriers: true,
+    bindings: {
+      Q: { storage: "read", type: "f32" },
+      K: { storage: "read", type: "f32" },
+      V: { storage: "read", type: "f32" },
+      L_buf: { storage: "read", type: "f32" },
+      D_buf: { storage: "read", type: "f32" },
+      dO: { storage: "read", type: "f32" },
+      dK: { storage: "read_write", type: "f32" },
+      dV: { storage: "read_write", type: "f32" },
+    },
+    uniforms: {
+      batch_size: "u32",
+      num_heads: "u32",
+      seq_len: "u32",
+      head_dim: "u32",
+      scale_u32: "u32",
+      is_causal: "u32",
+    },
+    grid: tiledGrid({
+      x: { uniform: "seq_len", tileSize: BC_BW },
+      y: "num_heads",
+      z: "batch_size",
+    }),
 
-${WGSL_FA_CONFIG}
+    kernel(ctx) {
+      const tidx = ctx.localIndex();
+      const kvBlock = ctx.programId(0);
+      const hIdx = ctx.programId(1);
+      const bIdx = ctx.programId(2);
 
-@group(0) @binding(0) var<storage, read> Q: array<f32>;
-@group(0) @binding(1) var<storage, read> K: array<f32>;
-@group(0) @binding(2) var<storage, read> V: array<f32>;
-@group(0) @binding(3) var<storage, read> L_buf: array<f32>;
-@group(0) @binding(4) var<storage, read> D_buf: array<f32>;
-@group(0) @binding(5) var<storage, read> dO: array<f32>;
-@group(0) @binding(6) var<storage, read_write> dK: array<f32>;
-@group(0) @binding(7) var<storage, read_write> dV: array<f32>;
-@group(0) @binding(8) var<uniform> config: FAConfig;
+      const N = ctx.uniform("seq_len");
+      const Dim = ctx.u32(D);
+      const numHeads = ctx.uniform("num_heads");
+      const isCausal = ctx.uniform("is_causal");
+      const scale = ctx.uniform("scale_u32").bitcastTo("f32");
 
-// Tiled shared memory as vec4: BQ_BW=${BQ_BW} Q rows, HD/4 vec4s per row
-var<workgroup> q_tile: array<vec4<f32>, ${BQ_BW * HD4}>;
-var<workgroup> dO_tile: array<vec4<f32>, ${BQ_BW * HD4}>;
-var<workgroup> L_tile: array<f32, ${BQ_BW}>;
-var<workgroup> D_tile: array<f32, ${BQ_BW}>;
+      const kvRow = kvBlock.mul(ctx.u32(BC_BW)).add(tidx);
+      const valid = kvRow.lt(N);
 
-@compute @workgroup_size(${WG})
-fn main(@builtin(local_invocation_index) tidx: u32,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let kv_block = wid.x;
-  let h = wid.y;
-  let b = wid.z;
+      const bhOff = bIdx.mul(numHeads).add(hIdx).mul(N).mul(Dim);
+      const bhOffL = bIdx.mul(numHeads).add(hIdx).mul(N);
+      const rowBase = bhOff.add(kvRow.mul(Dim));
 
-  let row_lane = tidx / ${THREADS_PER_ROW}u;  // which KV row (0..63)
-  let d4_lane = tidx % ${THREADS_PER_ROW}u;   // which portion (0..3)
-  let d4_start = d4_lane * ${D4_COUNT}u;
+      const K = ctx.tileLoad(
+        "K",
+        {
+          kind: "thread",
+          base: rowBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
 
-  let N = config.seq_len;
-  let D = config.head_dim;
-  let scale = config.scale;
+      const V = ctx.tileLoad(
+        "V",
+        {
+          kind: "thread",
+          base: rowBase,
+          stride: ctx.u32(1),
+        },
+        { rows: 1, cols: D, guard: valid },
+      );
 
-  let kv_row = kv_block * ${BC_BW}u + row_lane;
-  let valid = kv_row < N;
+      const dkAcc = ctx.zeros(1, D);
+      const dvAcc = ctx.zeros(1, D);
 
-  let bh_offset = (b * config.num_heads + h) * N * D;
-  let bh_offset_L = (b * config.num_heads + h) * N;
+      const lTile = ctx.sharedArray("L_tile", BQ_BW, "f32");
+      const dTile = ctx.sharedArray("D_tile", BQ_BW, "f32");
 
-  // Load this thread's K and V row slice into registers
-  var k_reg: array<vec4<f32>, ${D4_COUNT}>;
-  var v_reg: array<vec4<f32>, ${D4_COUNT}>;
-  var dk_acc: array<vec4<f32>, ${D4_COUNT}>;
-  var dv_acc: array<vec4<f32>, ${D4_COUNT}>;
+      const numQTiles = N.add(ctx.u32(BQ_BW - 1)).div(ctx.u32(BQ_BW));
 
-  if (valid) {
-    let base = bh_offset + kv_row * D;
-    for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-      let off = base + (d4_start + d4) * 4u;
-      k_reg[d4] = vec4<f32>(K[off], K[off+1u], K[off+2u], K[off+3u]);
-      v_reg[d4] = vec4<f32>(V[off], V[off+1u], V[off+2u], V[off+3u]);
-      dk_acc[d4] = vec4<f32>(0.0);
-      dv_acc[d4] = vec4<f32>(0.0);
-    }
-  }
+      ctx.forRange(ctx.u32(0), numQTiles, (qt) => {
+        const qStart = qt.mul(ctx.u32(BQ_BW));
 
-  // Loop over Q positions in tiles of BQ_BW=${BQ_BW}
-  let num_q_tiles = (N + ${BQ_BW - 1}u) / ${BQ_BW}u;
-  for (var qt = 0u; qt < num_q_tiles; qt++) {
-    let q_start = qt * ${BQ_BW}u;
+        const skipTile = isCausal
+          .ne(ctx.u32(0))
+          .and(qStart.add(ctx.u32(BQ_BW - 1)).lt(kvBlock.mul(ctx.u32(BC_BW))));
 
-    // Causal early exit: skip entire tile if max qi in tile < min kv_row in block
-    if (config.is_causal != 0u && q_start + ${BQ_BW - 1}u < kv_block * ${BC_BW}u) {
-      continue;
-    }
+        ctx.ifThen(skipTile.not(), () => {
+          const offsR = ctx.arange(qStart, BQ_BW);
+          const offsD = ctx.arange(ctx.u32(0), D);
+          const tilePtr = ctx.tilePtr(
+            bhOff,
+            offsR.outer(Dim),
+            offsD.inner(ctx.u32(1)),
+          );
+          const tileMask = ctx.tileMask(offsR.lt(N), offsD.lt(Dim));
+          const QTile = ctx.load2D("Q", tilePtr, tileMask);
+          const dOTile = ctx.load2D("dO", tilePtr, tileMask);
 
-    // Cooperative load: all ${WG} threads load vec4s
-    for (var idx = tidx; idx < ${BQ_BW * HD4}u; idx += ${WG}u) {
-      let row = idx / ${HD4}u;
-      let d4 = idx % ${HD4}u;
-      let qi = q_start + row;
-      if (qi < N) {
-        let base = bh_offset + qi * D + d4 * 4u;
-        q_tile[idx] = vec4<f32>(Q[base], Q[base+1u], Q[base+2u], Q[base+3u]);
-        dO_tile[idx] = vec4<f32>(dO[base], dO[base+1u], dO[base+2u], dO[base+3u]);
-      } else {
-        q_tile[idx] = vec4<f32>(0.0);
-        dO_tile[idx] = vec4<f32>(0.0);
-      }
-    }
-    // Load L and D values (first BQ_BW threads); zero for out-of-range
-    if (tidx < ${BQ_BW}u) {
-      let qi = q_start + tidx;
-      if (qi < N) {
-        L_tile[tidx] = L_buf[bh_offset_L + qi];
-        D_tile[tidx] = D_buf[bh_offset_L + qi];
-      } else {
-        L_tile[tidx] = 0.0f;
-        D_tile[tidx] = 0.0f;
-      }
-    }
+          ctx.ifThen(tidx.lt(ctx.u32(BQ_BW)), () => {
+            const qi = qStart.add(tidx);
+            const inBounds = qi.lt(N);
+            const lIdx = bhOffL.add(qi);
+            lTile.write(
+              tidx,
+              inBounds.select(ctx.load("L_buf", lIdx), ctx.f32(0)),
+            );
+            dTile.write(
+              tidx,
+              inBounds.select(ctx.load("D_buf", lIdx), ctx.f32(0)),
+            );
+          });
 
-    workgroupBarrier();
+          ctx.barrier();
 
-    // ALL threads participate in shuffle — subgroup-uniform control flow
-    // Invalid/masked threads have k_reg=0 and v_reg=0 so partials are 0
-    for (var j = 0u; j < ${BQ_BW}u; j++) {
-      let qi = q_start + j;
-      let is_active =valid && qi < N && (config.is_causal == 0u || kv_row <= qi);
+          // Fused single-loop: compute score, p, ds per Q-row, accumulate dK/dV inline
+          ctx.range(0, BQ_BW, (j) => {
+            const qi = qStart.add(j);
+            const isActive = valid
+              .and(qi.lt(N))
+              .and(isCausal.eq(ctx.u32(0)).or(kvRow.le(qi)));
+            const s = ctx.dotRow(K, QTile, j).mul(scale);
+            const p = isActive.select(s.sub(lTile.read(j)).exp(), ctx.f32(0));
+            const dov = ctx.dotRow(V, dOTile, j);
+            const ds = p.mul(dov.sub(dTile.read(j))).mul(scale);
+            ctx.accumRow(dkAcc, ds, QTile, j);
+            ctx.accumRow(dvAcc, p, dOTile, j);
+          });
 
-      // Partial dot product: Q[qi] . K[kv_row]
-      var s_partial = 0.0f;
-      for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-        s_partial += dot(q_tile[j * ${HD4}u + d4_start + d4], k_reg[d4]);
-      }
-      s_partial += subgroupShuffleXor(s_partial, 1u);
-      s_partial += subgroupShuffleXor(s_partial, 2u);
-      let s = s_partial * scale;
+          ctx.barrier();
+        });
+      });
 
-      let p = select(0.0f, exp(s - L_tile[j]), is_active);
-
-      // Partial dot product: dO[qi] . V[kv_row]
-      var dov_partial = 0.0f;
-      for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-        dov_partial += dot(dO_tile[j * ${HD4}u + d4_start + d4], v_reg[d4]);
-      }
-      dov_partial += subgroupShuffleXor(dov_partial, 1u);
-      dov_partial += subgroupShuffleXor(dov_partial, 2u);
-
-      let ds = p * (dov_partial - D_tile[j]);
-      let ds_scale = ds * scale;
-
-      // ds=0 for inactive, so accumulation is a no-op
-      for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-        dk_acc[d4] += ds_scale * q_tile[j * ${HD4}u + d4_start + d4];
-        dv_acc[d4] += p * dO_tile[j * ${HD4}u + d4_start + d4];
-      }
-    }
-
-    workgroupBarrier();
-  }
-
-  // Write dK and dV (each thread writes its slice)
-  if (valid) {
-    let base = bh_offset + kv_row * D;
-    for (var d4 = 0u; d4 < ${D4_COUNT}u; d4++) {
-      let off = base + (d4_start + d4) * 4u;
-      dK[off] = dk_acc[d4].x;
-      dK[off+1u] = dk_acc[d4].y;
-      dK[off+2u] = dk_acc[d4].z;
-      dK[off+3u] = dk_acc[d4].w;
-      dV[off] = dv_acc[d4].x;
-      dV[off+1u] = dv_acc[d4].y;
-      dV[off+2u] = dv_acc[d4].z;
-      dV[off+3u] = dv_acc[d4].w;
-    }
-  }
-}
-`;
-  }
-
-  // Scalar (non-subgroup) path
-  return `
-${WGSL_FA_CONFIG}
-
-@group(0) @binding(0) var<storage, read> Q: array<f32>;
-@group(0) @binding(1) var<storage, read> K: array<f32>;
-@group(0) @binding(2) var<storage, read> V: array<f32>;
-@group(0) @binding(3) var<storage, read> L_buf: array<f32>;
-@group(0) @binding(4) var<storage, read> D_buf: array<f32>;
-@group(0) @binding(5) var<storage, read> dO: array<f32>;
-@group(0) @binding(6) var<storage, read_write> dK: array<f32>;
-@group(0) @binding(7) var<storage, read_write> dV: array<f32>;
-@group(0) @binding(8) var<uniform> config: FAConfig;
-
-// Tiled shared memory as vec4: BQ_BW=${BQ_BW} Q rows, HD/4 vec4s per row
-var<workgroup> q_tile: array<vec4<f32>, ${BQ_BW * HD4}>;
-var<workgroup> dO_tile: array<vec4<f32>, ${BQ_BW * HD4}>;
-var<workgroup> L_tile: array<f32, ${BQ_BW}>;
-var<workgroup> D_tile: array<f32, ${BQ_BW}>;
-
-@compute @workgroup_size(${BC_BW})
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-  let kv_block = wid.x;
-  let h = wid.y;
-  let b = wid.z;
-  let tid = lid.x;
-
-  let N = config.seq_len;
-  let D = config.head_dim;
-  let scale = config.scale;
-
-  let kv_row = kv_block * ${BC_BW}u + tid;
-  let valid = kv_row < N;
-
-  let bh_offset = (b * config.num_heads + h) * N * D;
-  let bh_offset_L = (b * config.num_heads + h) * N;
-
-  // Load this thread's K and V rows into vec4 registers
-  var k_reg: array<vec4<f32>, ${HD4}>;
-  var v_reg: array<vec4<f32>, ${HD4}>;
-  var dk_acc: array<vec4<f32>, ${HD4}>;
-  var dv_acc: array<vec4<f32>, ${HD4}>;
-
-  if (valid) {
-    let base = bh_offset + kv_row * D;
-    for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-      let off = base + d4 * 4u;
-      k_reg[d4] = vec4<f32>(K[off], K[off+1u], K[off+2u], K[off+3u]);
-      v_reg[d4] = vec4<f32>(V[off], V[off+1u], V[off+2u], V[off+3u]);
-      dk_acc[d4] = vec4<f32>(0.0);
-      dv_acc[d4] = vec4<f32>(0.0);
-    }
-  }
-
-  // Loop over Q positions in tiles of BQ_BW=${BQ_BW}
-  let num_q_tiles = (N + ${BQ_BW - 1}u) / ${BQ_BW}u;
-  for (var qt = 0u; qt < num_q_tiles; qt++) {
-    let q_start = qt * ${BQ_BW}u;
-
-    // Causal early exit: skip entire tile if max qi in tile < min kv_row in block
-    if (config.is_causal != 0u && q_start + ${BQ_BW - 1}u < kv_block * ${BC_BW}u) {
-      continue;
-    }
-
-    // Cooperative load: all ${BC_BW} threads load vec4s
-    for (var idx = tid; idx < ${BQ_BW * HD4}u; idx += ${BC_BW}u) {
-      let row = idx / ${HD4}u;
-      let d4 = idx % ${HD4}u;
-      let qi = q_start + row;
-      if (qi < N) {
-        let base = bh_offset + qi * D + d4 * 4u;
-        q_tile[idx] = vec4<f32>(Q[base], Q[base+1u], Q[base+2u], Q[base+3u]);
-        dO_tile[idx] = vec4<f32>(dO[base], dO[base+1u], dO[base+2u], dO[base+3u]);
-      } else {
-        q_tile[idx] = vec4<f32>(0.0);
-        dO_tile[idx] = vec4<f32>(0.0);
-      }
-    }
-    // Load L and D values (first BQ_BW threads)
-    if (tid < ${BQ_BW}u) {
-      let qi = q_start + tid;
-      if (qi < N) {
-        L_tile[tid] = L_buf[bh_offset_L + qi];
-        D_tile[tid] = D_buf[bh_offset_L + qi];
-      }
-    }
-
-    workgroupBarrier();
-
-    // Inner loop over BQ_BW Q rows
-    if (valid) {
-      let tile_end = min(${BQ_BW}u, N - q_start);
-      for (var j = 0u; j < tile_end; j++) {
-        let qi = q_start + j;
-        if (config.is_causal != 0u && kv_row > qi) { continue; }
-
-        // Vec4 dot product: Q[qi] . K[kv_row] * scale
-        var s = 0.0f;
-        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-          s += dot(q_tile[j * ${HD4}u + d4], k_reg[d4]);
-        }
-        s = s * scale;
-
-        let p = exp(s - L_tile[j]);
-
-        var dov = 0.0f;
-        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-          dov += dot(dO_tile[j * ${HD4}u + d4], v_reg[d4]);
-        }
-
-        let ds = p * (dov - D_tile[j]);
-        let ds_scale = ds * scale;
-
-        for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-          dk_acc[d4] += ds_scale * q_tile[j * ${HD4}u + d4];
-          dv_acc[d4] += p * dO_tile[j * ${HD4}u + d4];
-        }
-      }
-    }
-
-    workgroupBarrier();
-  }
-
-  // Write dK and dV
-  if (valid) {
-    let base = bh_offset + kv_row * D;
-    for (var d4 = 0u; d4 < ${HD4}u; d4++) {
-      let off = base + d4 * 4u;
-      dK[off] = dk_acc[d4].x;
-      dK[off+1u] = dk_acc[d4].y;
-      dK[off+2u] = dk_acc[d4].z;
-      dK[off+3u] = dk_acc[d4].w;
-      dV[off] = dv_acc[d4].x;
-      dV[off+1u] = dv_acc[d4].y;
-      dV[off+2u] = dv_acc[d4].z;
-      dV[off+3u] = dv_acc[d4].w;
-    }
-  }
-}
-`;
+      ctx.ifThen(valid, () => {
+        ctx.tileStore("dK", dkAcc, { base: rowBase, stride: ctx.u32(1) });
+        ctx.tileStore("dV", dvAcc, { base: rowBase, stride: ctx.u32(1) });
+      });
+    },
+  };
 }
 
 // ============================================================================
 // Dispatch Functions
 // ============================================================================
 
-/**
- * Dispatch FlashAttention forward kernel.
- * Q,K,V: [B, H, N, D] → O: [B, H, N, D], L: [B, H, N]
- */
+/** Shared attention dispatch: config buffer + WGSL cache + pipeline + bind group + tracking. */
+function dispatchAttention(
+  wgslKey: string,
+  pipelinePrefix: string,
+  specFactory: () => TileKernelSpec,
+  headDim: number,
+  batchSize: number,
+  numHeads: number,
+  seqLen: number,
+  scale: number,
+  isCausal: boolean,
+  buffers: GPUBuffer[], // all data buffers (config appended automatically)
+  ...grid: number[]
+): void {
+  const ctx = requireContext();
+  const configBuf = getOrCreateConfigBuffer(
+    ctx.device,
+    batchSize,
+    numHeads,
+    seqLen,
+    headDim,
+    scale,
+    isCausal ? 1 : 0,
+  );
+  const wgsl = getTileIRWGSL(wgslKey, specFactory);
+  const pipeline = getPipeline(ctx, `${pipelinePrefix}:tile:${headDim}`, wgsl);
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
+    ...buffers,
+    configBuf,
+  ]);
+  for (const b of buffers) trackSharedEncoderWrite(b);
+  dispatchComputePass(pipeline, bindGroup, grid[0], grid[1] ?? 1, grid[2] ?? 1);
+}
+
+/** Q,K,V: [B, H, N, D] → O: [B, H, N, D], L: [B, H, N] */
 export function dispatchFlashAttentionForward(
   qBuffer: GPUBuffer,
   kBuffer: GPUBuffer,
@@ -1123,47 +562,29 @@ export function dispatchFlashAttentionForward(
   scale: number,
   isCausal: boolean,
 ): { outputBuffer: GPUBuffer; logsumexpBuffer: GPUBuffer } {
-  const ctx = requireContext();
-  const device = ctx.device;
-
-  const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4; // f32
-  const logsumexpSizeBytes = batchSize * numHeads * seqLen * 4; // f32
-
-  const outBuffer = allocateOutputBuffer(outputSizeBytes);
-  const lseBuffer = allocateOutputBuffer(logsumexpSizeBytes);
-
-  const configBuf = getOrCreateConfigBuffer(
-    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
+  const outBuffer = allocateOutputBuffer(
+    batchSize * numHeads * seqLen * headDim * 4,
   );
-
-  const sg = useSubgroupAttention(headDim);
-  const pipeline = getPipeline(
-    ctx,
-    `faFwd:${headDim}${sg ? ":sg" : ""}`,
-    flashAttentionForwardShader(headDim, sg),
-  );
-
-  const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer, configBuf]);
-
-  trackBuffers(qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer);
-
-  const numQBlocks = Math.ceil(seqLen / BR);
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    numQBlocks,
+  const lseBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * 4);
+  dispatchAttention(
+    `fwd:${headDim}`,
+    "faFwd",
+    () => makeForwardAttentionSpec(headDim),
+    headDim,
+    batchSize,
+    numHeads,
+    seqLen,
+    scale,
+    isCausal,
+    [qBuffer, kBuffer, vBuffer, outBuffer, lseBuffer],
+    Math.ceil(seqLen / BR),
     numHeads,
     batchSize,
   );
-
   return { outputBuffer: outBuffer, logsumexpBuffer: lseBuffer };
 }
 
-/**
- * Dispatch FlashAttention backward D precompute kernel.
- * dO,O: [B,H,N,D] → D: [B,H,N]
- */
+/** dO,O: [B,H,N,D] → D: [B,H,N] */
 export function dispatchFlashAttentionBackwardD(
   dOBuffer: GPUBuffer,
   oBuffer: GPUBuffer,
@@ -1174,43 +595,24 @@ export function dispatchFlashAttentionBackwardD(
   scale: number,
   isCausal: boolean,
 ): GPUBuffer {
-  const ctx = requireContext();
-  const device = ctx.device;
-
-  const totalRows = batchSize * numHeads * seqLen;
-  const outputSizeBytes = totalRows * 4; // f32
-
-  const outBuffer = allocateOutputBuffer(outputSizeBytes);
-
-  const configBuf = getOrCreateConfigBuffer(
-    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
+  const outBuffer = allocateOutputBuffer(batchSize * numHeads * seqLen * 4);
+  dispatchAttention(
+    `bwdD:${headDim}`,
+    "faBwdD",
+    () => makeDPrecomputeSpec(headDim),
+    headDim,
+    batchSize,
+    numHeads,
+    seqLen,
+    scale,
+    isCausal,
+    [dOBuffer, oBuffer, outBuffer],
+    batchSize * numHeads * seqLen,
   );
-
-  const WG = Math.max(headDim, 32);
-  const pipeline = getPipeline(
-    ctx,
-    `faBwdD:${headDim}`,
-    flashAttentionBackwardDShader(headDim),
-  );
-
-  const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [dOBuffer, oBuffer, outBuffer, configBuf]);
-
-  trackBuffers(dOBuffer, oBuffer, outBuffer);
-
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    totalRows,
-  );
-
   return outBuffer;
 }
 
-/**
- * Dispatch FlashAttention backward dQ kernel.
- * Q,K,V,L,D,dO → dQ: [B,H,N,D]
- */
+/** Q,K,V,L,D,dO → dQ: [B,H,N,D] */
 export function dispatchFlashAttentionBackwardDQ(
   qBuffer: GPUBuffer,
   kBuffer: GPUBuffer,
@@ -1225,52 +627,28 @@ export function dispatchFlashAttentionBackwardDQ(
   scale: number,
   isCausal: boolean,
 ): GPUBuffer {
-  const ctx = requireContext();
-  const device = ctx.device;
-
-  const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4;
-
-  const outBuffer = allocateOutputBuffer(outputSizeBytes);
-
-  const configBuf = getOrCreateConfigBuffer(
-    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
+  const outBuffer = allocateOutputBuffer(
+    batchSize * numHeads * seqLen * headDim * 4,
   );
-
-  const sg = useSubgroupAttention(headDim);
-  const pipeline = getPipeline(
-    ctx,
-    `faBwdDQ:${headDim}${sg ? ":sg" : ""}`,
-    flashAttentionBackwardDQShader(headDim, sg),
-  );
-
-  const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer, configBuf]);
-
-  trackBuffers(qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer);
-
-  const numQBlocks = Math.ceil(seqLen / BR);
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    numQBlocks,
+  dispatchAttention(
+    `bwdDQ:${headDim}`,
+    "faBwdDQ",
+    () => makeBackwardDQSpec(headDim),
+    headDim,
+    batchSize,
+    numHeads,
+    seqLen,
+    scale,
+    isCausal,
+    [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, outBuffer],
+    Math.ceil(seqLen / BR),
     numHeads,
     batchSize,
   );
-
   return outBuffer;
 }
 
-/**
- * Dispatch FlashAttention backward dKV kernel.
- * Q,K,V,L,D,dO → dK: [B,H,N,D], dV: [B,H,N,D]
- */
-/**
- * Reset all module-local mutable state (pipeline cache, config buffer cache).
- */
-export function resetAttentionKernelState(): void {
-  configCache.clear();
-}
-
+/** Q,K,V,L,D,dO → dK: [B,H,N,D], dV: [B,H,N,D] */
 export function dispatchFlashAttentionBackwardDKV(
   qBuffer: GPUBuffer,
   kBuffer: GPUBuffer,
@@ -1285,39 +663,33 @@ export function dispatchFlashAttentionBackwardDKV(
   scale: number,
   isCausal: boolean,
 ): { dKBuffer: GPUBuffer; dVBuffer: GPUBuffer } {
-  const ctx = requireContext();
-  const device = ctx.device;
-
-  const outputSizeBytes = batchSize * numHeads * seqLen * headDim * 4;
-
-  const dKBuffer = allocateOutputBuffer(outputSizeBytes);
-  const dVBuffer = allocateOutputBuffer(outputSizeBytes);
-
-  const configBuf = getOrCreateConfigBuffer(
-    device, batchSize, numHeads, seqLen, headDim, scale, isCausal ? 1 : 0,
+  const dKBuffer = allocateOutputBuffer(
+    batchSize * numHeads * seqLen * headDim * 4,
   );
-
-  const BC_BW = 64;
-  const sg = useSubgroupAttention(headDim);
-  const pipeline = getPipeline(
-    ctx,
-    `faBwdDKV:${headDim}${sg ? ":sg" : ""}`,
-    flashAttentionBackwardDKVShader(headDim, sg),
+  const dVBuffer = allocateOutputBuffer(
+    batchSize * numHeads * seqLen * headDim * 4,
   );
-
-  const bindGroup = cachedCreateBindGroup(device, pipeline,
-    [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer, configBuf]);
-
-  trackBuffers(qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer);
-
-  const numKVBlocks = Math.ceil(seqLen / BC_BW);
-  dispatchComputePass(
-    pipeline,
-    bindGroup,
-    numKVBlocks,
+  dispatchAttention(
+    `bwdDKV:${headDim}`,
+    "faBwdDKV",
+    () => makeBackwardDKVSpec(headDim),
+    headDim,
+    batchSize,
+    numHeads,
+    seqLen,
+    scale,
+    isCausal,
+    [qBuffer, kBuffer, vBuffer, lBuffer, dBuffer, dOBuffer, dKBuffer, dVBuffer],
+    Math.ceil(seqLen / BC_BW),
     numHeads,
     batchSize,
   );
-
   return { dKBuffer, dVBuffer };
 }
+
+/** Reset all module-local mutable state (pipeline cache, config buffer cache). */
+export function resetAttentionKernelState(): void {
+  configCache.clear();
+  tileIRWGSLCache.clear();
+}
+onTeardown(resetAttentionKernelState);

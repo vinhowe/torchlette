@@ -7,14 +7,24 @@
  * Run with: TORCHLETTE_WEBGPU=1 npx tsx examples/gpt2/finetune-demo.ts
  */
 
+import * as fs from "node:fs";
 import * as path from "node:path";
-import { Torchlette, type Tensor } from "../../src/frontend";
-import { initWebGPU, getBufferPoolStats, getGPUMemoryStats } from "../../src/backend/webgpu";
-import { storageTracker } from "../../src/engine/lazy";
-import { GPT2, DISTILGPT2_CONFIG } from "./model";
+import {
+  deserializeRegistry,
+  getBufferPoolStats,
+  getGPUMemoryStats,
+  initWebGPU,
+  serializeRegistry,
+  startPipelineRecording,
+  stopPipelineRecording,
+  warmupFromRegistry,
+} from "../../src/backend/webgpu";
+import { storageTracker } from "../../src/graph/storage-tracker";
+import { type Tensor, Torchlette } from "../../src/frontend/torchlette";
+import { Adam, GradScaler } from "../../src/optim";
 import { GPT2Tokenizer } from "./data";
 import { loadPretrainedGPT2 } from "./loader";
-import { Adam, GradScaler } from "../../src/optim";
+import { DISTILGPT2_CONFIG, type GPT2, type KVCache } from "./model";
 
 // ============================================================================
 // Shakespeare Training Data
@@ -72,70 +82,82 @@ async function generateText(
   tokenizer: GPT2Tokenizer,
   prompt: string,
   maxTokens: number,
-  temperature = 0.8
+  temperature = 0.8,
 ): Promise<string> {
   const tokens = tokenizer.encode(prompt);
   const generated = [...tokens];
+  const vocabSize = tokenizer.vocabSize;
+  const stride = model.paddedVocabSize;
 
-  for (let i = 0; i < maxTokens; i++) {
-    // Truncate to block size if needed
-    const contextTokens = generated.slice(-DISTILGPT2_CONFIG.blockSize);
-
-    // Use tidy to automatically clean up intermediate tensors from forward pass
-    const logits = api.tidy(() => {
-      const inputTensor = api.tensorFromArray(contextTokens, [1, contextTokens.length], {
-        device: "webgpu",
-      });
-      // Forward pass creates many intermediate tensors that will be auto-disposed
-      return model.forward(inputTensor);
+  // Prefill: process the full prompt, get initial KV cache
+  let kvCache: KVCache[] | undefined;
+  {
+    const { logits, presentKVs } = api.noGrad(() => {
+      const inputTensor = api.tensorFromArray(tokens, [1, tokens.length]);
+      return model.forwardCached(inputTensor);
     });
-
+    kvCache = presentKVs;
     const logitsData = await logits.cpu();
-
-    // Get last position logits (stride is paddedVocabSize, take first vocabSize)
-    const seqLen = contextTokens.length;
-    const vocabSize = tokenizer.vocabSize;
-    const stride = model.paddedVocabSize;
-    const startIdx = (seqLen - 1) * stride;
-    const lastLogits = Array.from(logitsData).slice(startIdx, startIdx + vocabSize);
-
-    // Apply temperature
-    const scaledLogits = lastLogits.map((x) => x / temperature);
-
-    // Softmax
-    const maxLogit = Math.max(...scaledLogits);
-    const expLogits = scaledLogits.map((x) => Math.exp(x - maxLogit));
-    const sumExp = expLogits.reduce((a, b) => a + b, 0);
-    const probs = expLogits.map((x) => x / sumExp);
-
-    // Sample from distribution
-    const r = Math.random();
-    let cumsum = 0;
-    let nextToken = 0;
-    for (let j = 0; j < probs.length; j++) {
-      cumsum += probs[j];
-      if (r < cumsum) {
-        nextToken = j;
-        break;
-      }
-    }
-
-    generated.push(nextToken);
-
-    // Cleanup the logits tensor (tidy already cleaned up intermediates)
     logits.dispose();
 
-    // Call markStep to trigger GPU buffer cleanup
-    // This is necessary because lazy execution defers buffer destruction until markStep
+    // Sample first token from last position of prefill
+    const startIdx = (tokens.length - 1) * stride;
+    const nextToken = sampleToken(logitsData, startIdx, vocabSize, temperature);
+    generated.push(nextToken);
+    if (nextToken === tokenizer.eosToken) return tokenizer.decode(generated);
+    await api.markStep();
+  }
+
+  // Decode: one token at a time with KV cache
+  for (let i = 1; i < maxTokens; i++) {
+    const lastToken = generated[generated.length - 1];
+    const posOffset = generated.length - 1; // position of the new token
+
+    const { logits, presentKVs } = api.noGrad(() => {
+      const inputTensor = api.tensorFromArray([lastToken], [1, 1]);
+      return model.forwardCached(inputTensor, kvCache, posOffset);
+    });
+    kvCache = presentKVs;
+
+    const logitsData = await logits.cpu();
+    logits.dispose();
+
+    // logits shape is [1, 1, paddedVocabSize], so last-position offset is 0
+    const nextToken = sampleToken(logitsData, 0, vocabSize, temperature);
+    generated.push(nextToken);
+
     await api.markStep();
 
-    // Stop on EOS
-    if (nextToken === tokenizer.eosToken) {
-      break;
-    }
+    if (nextToken === tokenizer.eosToken) break;
   }
 
   return tokenizer.decode(generated);
+}
+
+/** Sample a token from logits at a given offset using temperature scaling. */
+function sampleToken(
+  logitsData: Float32Array | Float64Array | number[],
+  startIdx: number,
+  vocabSize: number,
+  temperature: number,
+): number {
+  const lastLogits = Array.from(logitsData).slice(
+    startIdx,
+    startIdx + vocabSize,
+  );
+  const scaledLogits = lastLogits.map((x) => x / temperature);
+  const maxLogit = Math.max(...scaledLogits);
+  const expLogits = scaledLogits.map((x) => Math.exp(x - maxLogit));
+  const sumExp = expLogits.reduce((a, b) => a + b, 0);
+  const probs = expLogits.map((x) => x / sumExp);
+
+  const r = Math.random();
+  let cumsum = 0;
+  for (let j = 0; j < probs.length; j++) {
+    cumsum += probs[j];
+    if (r < cumsum) return j;
+  }
+  return 0;
 }
 
 // ============================================================================
@@ -170,16 +192,11 @@ async function main() {
     enableCheckpointSegmentation: true,
   });
 
-  const model = await loadPretrainedGPT2(api, modelDir, { dropoutRate: 0.0 }, { device: "webgpu" });
+  const model = await loadPretrainedGPT2(api, modelDir, { dropoutRate: 0.0 });
   model.eval();
 
   // Test prompts
-  const prompts = [
-    "To be or not to be",
-    "The summer sun",
-    "Love is",
-    "When I",
-  ];
+  const prompts = ["To be or not to be", "The summer sun", "Love is", "When I"];
 
   // Show original outputs
   console.log("\n" + "=".repeat(60));
@@ -204,7 +221,9 @@ async function main() {
   // AMP: autocast wraps the compiled forward to use f16 for matmul, f32 for reductions
   const compiledForward = api.compile((input: Tensor, target: Tensor) => {
     return api.autocast(() => {
-      const result = model.forwardWithLoss(input, target, { useCheckpoint: true });
+      const result = model.forwardWithLoss(input, target, {
+        useCheckpoint: true,
+      });
       if (!result.loss) throw new Error("Loss is null");
       return result.loss;
     });
@@ -215,12 +234,27 @@ async function main() {
   console.log(`\nTraining tokens: ${trainingTokens.length}`);
 
   // Create training sequences (shorter for faster iteration)
-  const seqLen = 512;  // Longer sequences for realistic profiling
+  const seqLen = 512; // Longer sequences for realistic profiling
   const sequences: number[][] = [];
   for (let i = 0; i < trainingTokens.length - seqLen; i += seqLen / 2) {
     sequences.push(trainingTokens.slice(i, i + seqLen));
   }
   console.log(`Training sequences: ${sequences.length}`);
+
+  // Pipeline warmup: pre-compile cached pipelines from previous run
+  const warmupFile = "/tmp/torchlette-pipeline-registry-finetune.json";
+  if (fs.existsSync(warmupFile)) {
+    try {
+      const json = fs.readFileSync(warmupFile, "utf-8");
+      const entries = deserializeRegistry(json);
+      const result = await warmupFromRegistry(entries);
+      console.log(
+        `Pipeline warmup: ${result.compiled} compiled, ${result.skipped} skipped (${result.timeMs.toFixed(0)}ms)`,
+      );
+    } catch {
+      console.log("Pipeline warmup failed (stale cache?)");
+    }
+  }
 
   // Training loop - just train, show loss, skip intermediate generation
   const NUM_EPOCHS = 3;
@@ -230,50 +264,71 @@ async function main() {
     console.log(`\n--- Epoch ${epoch + 1}/${NUM_EPOCHS} ---`);
 
     for (let i = 0; i < sequences.length; i++) {
+      // Record pipelines during very first step for warmup cache
+      if (globalStep === 0) startPipelineRecording();
+
       const seq = sequences[i];
       const inputData = seq.slice(0, -1);
       const targetData = seq.slice(1);
 
-      const input = api.tensorFromArray(inputData, [1, inputData.length], { device: "webgpu" });
-      const target = api.tensorFromArray(targetData, [1, targetData.length], { device: "webgpu" });
+      // asyncTidy auto-disposes all per-step tensors (input, target, loss, scaledLoss,
+      // gradients) — no manual dispose() calls needed.
+      const { lossValue, t0, t1, t2, t3, t4 } = await api.asyncTidy(
+        async () => {
+          const input = api.tensorFromArray(inputData, [1, inputData.length]);
+          const target = api.tensorFromArray(targetData, [
+            1,
+            targetData.length,
+          ]);
 
-      const t0 = performance.now();
-      // Forward pass inside compile region with AMP autocast
-      const loss = compiledForward(input, target);
+          const t0 = performance.now();
+          const loss = compiledForward(input, target);
+          const lossValue = await loss.item();
+          const t1 = performance.now();
 
-      const lossValue = await loss.item();
-      const t1 = performance.now();
+          const scaledLoss = scaler.scale(loss);
+          await scaledLoss.backward();
+          const t2 = performance.now();
 
-      // Scale loss for mixed precision, then backward
-      const scaledLoss = scaler.scale(loss);
-      await scaledLoss.backward();
-      const t2 = performance.now();
+          scaler.unscale_(optimizer);
+          scaler.step(optimizer);
+          scaler.update();
+          optimizer.zeroGrad();
+          const t3 = performance.now();
 
-      // Unscale gradients, check for NaN/Inf, step optimizer
-      scaler.unscale_(optimizer);
-      scaler.step(optimizer);
-      scaler.update();
-      optimizer.zeroGrad();
-      const t3 = performance.now();
+          await api.markStep();
+          const t4 = performance.now();
 
-      scaledLoss.dispose();
-      loss.dispose();
-      input.dispose();
-      target.dispose();
+          return { lossValue, t0, t1, t2, t3, t4 };
+        },
+      );
 
-      // Call markStep to trigger GPU buffer cleanup
-      await api.markStep();
-      const t4 = performance.now();
+      // Save pipeline registry after first step
+      if (globalStep === 0) {
+        const pipelineRegistry = stopPipelineRecording();
+        fs.writeFileSync(warmupFile, serializeRegistry(pipelineRegistry));
+        console.log(
+          `  Pipeline registry: ${pipelineRegistry.length} pipelines saved`,
+        );
+      }
 
       // Log loss and timing every 5 steps
       if (globalStep % 5 === 0) {
         const memStats = getGPUMemoryStats();
         const poolStats = getBufferPoolStats();
         const storageStats = storageTracker.stats();
-        console.log(`Step ${globalStep}: loss = ${lossValue.toFixed(4)} | scale=${scaler.getScale().toFixed(0)} (fwd: ${(t1-t0).toFixed(0)}ms, bwd: ${(t2-t1).toFixed(0)}ms, opt: ${(t3-t2).toFixed(0)}ms, cleanup: ${(t4-t3).toFixed(0)}ms)`);
-        console.log(`  Memory: ${(memStats.currentBytes / 1e9).toFixed(2)}GB / ${(memStats.limitBytes / 1e9).toFixed(2)}GB (${memStats.usagePercent.toFixed(1)}%), allocations: ${memStats.allocationCount}`);
-        console.log(`  Pool: ${poolStats.pooledBuffers} buffers (${(poolStats.pooledBytes / 1e6).toFixed(1)}MB), pending: ${poolStats.pendingBuffers}`);
-        console.log(`  Storages: total=${storageStats.totalStorages}, reachable=${storageStats.reachableStorages}`);
+        console.log(
+          `Step ${globalStep}: loss = ${lossValue.toFixed(4)} | scale=${scaler.getScale().toFixed(0)} (fwd: ${(t1 - t0).toFixed(0)}ms, bwd: ${(t2 - t1).toFixed(0)}ms, opt: ${(t3 - t2).toFixed(0)}ms, cleanup: ${(t4 - t3).toFixed(0)}ms)`,
+        );
+        console.log(
+          `  Memory: ${(memStats.currentBytes / 1e9).toFixed(2)}GB / ${(memStats.limitBytes / 1e9).toFixed(2)}GB (${memStats.usagePercent.toFixed(1)}%), allocations: ${memStats.allocationCount}`,
+        );
+        console.log(
+          `  Pool: ${poolStats.pooledBuffers} buffers (${(poolStats.pooledBytes / 1e6).toFixed(1)}MB), pending: ${poolStats.pendingBuffers}`,
+        );
+        console.log(
+          `  Storages: total=${storageStats.totalStorages}, reachable=${storageStats.reachableStorages}`,
+        );
       }
 
       globalStep++;
@@ -297,4 +352,9 @@ async function main() {
   console.log("=".repeat(60));
 }
 
-main().then(() => process.exit(0)).catch(e => { console.error(e); process.exit(1); });
+main()
+  .then(() => process.exit(0))
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });

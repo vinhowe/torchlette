@@ -15,9 +15,14 @@ async function main() {
 
   let device: GPUDevice;
   try {
-    device = await adapter.requestDevice({ requiredFeatures: ["timestamp-query"] });
-  } catch (e: any) {
-    console.error("Device creation failed:", e.message);
+    device = await adapter.requestDevice({
+      requiredFeatures: ["timestamp-query"],
+    });
+  } catch (e: unknown) {
+    console.error(
+      "Device creation failed:",
+      e instanceof Error ? e.message : String(e),
+    );
     process.exit(1);
   }
   console.log("Device created with timestamp-query");
@@ -85,8 +90,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   });
   const copyBindGroupLayout = device.createBindGroupLayout({
     entries: [
-      { binding: 0, visibility: 0x4, buffer: { type: "read-only-storage" as GPUBufferBindingType } },
-      { binding: 1, visibility: 0x4, buffer: { type: "storage" as GPUBufferBindingType } },
+      {
+        binding: 0,
+        visibility: 0x4,
+        buffer: { type: "read-only-storage" as GPUBufferBindingType },
+      },
+      {
+        binding: 1,
+        visibility: 0x4,
+        buffer: { type: "storage" as GPUBufferBindingType },
+      },
     ],
   });
   const copyPipelineLayout = device.createPipelineLayout({
@@ -111,7 +124,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     });
     pass.setPipeline(workPipeline);
     pass.setBindGroup(0, workBindGroup);
-    pass.dispatchWorkgroups(Math.ceil(1024 * 1024 / 4 / 256));
+    pass.dispatchWorkgroups(Math.ceil((1024 * 1024) / 4 / 256));
     pass.end();
   }
 
@@ -129,14 +142,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   console.log("Fence drained — GPU work complete");
 
   // === Test 1: Direct copyBufferToBuffer (expected to deadlock) ===
-  console.log("\n--- Test 1: Direct copyBufferToBuffer from resolve buffer ---");
+  console.log(
+    "\n--- Test 1: Direct copyBufferToBuffer from resolve buffer ---",
+  );
   const byteSize = NUM_PASSES * 2 * 8;
-  const directStaging = device.createBuffer({ size: byteSize, usage: MAP_READ | COPY_DST });
+  const directStaging = device.createBuffer({
+    size: byteSize,
+    usage: MAP_READ | COPY_DST,
+  });
   const directEncoder = device.createCommandEncoder();
-  directEncoder.copyBufferToBuffer(resolveBuffer, 0, directStaging, 0, byteSize);
+  directEncoder.copyBufferToBuffer(
+    resolveBuffer,
+    0,
+    directStaging,
+    0,
+    byteSize,
+  );
   device.queue.submit([directEncoder.finish()]);
 
-  const directFence = device.createBuffer({ size: 4, usage: COPY_DST | MAP_READ });
+  const directFence = device.createBuffer({
+    size: 4,
+    usage: COPY_DST | MAP_READ,
+  });
   device.queue.writeBuffer(directFence, 0, new Uint8Array([1, 2, 3, 4]));
 
   let directOk = false;
@@ -149,7 +176,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   } catch {}
   if (directOk) {
     const data = new BigInt64Array(directStaging.getMappedRange());
-    console.log(`  SUCCESS! First timestamp: ${data[0]}, Last: ${data[NUM_PASSES * 2 - 1]}`);
+    console.log(
+      `  SUCCESS! First timestamp: ${data[0]}, Last: ${data[NUM_PASSES * 2 - 1]}`,
+    );
     directStaging.unmap();
   } else {
     console.log("  DEADLOCKED (as expected on V100/Dawn) — timed out after 3s");
@@ -159,8 +188,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   // === Test 2: Compute shader copy (our fix) ===
   console.log("\n--- Test 2: Compute shader copy from resolve buffer ---");
-  const intermediate = device.createBuffer({ size: byteSize, usage: STORAGE | COPY_SRC });
-  const staging = device.createBuffer({ size: byteSize, usage: MAP_READ | COPY_DST });
+  const intermediate = device.createBuffer({
+    size: byteSize,
+    usage: STORAGE | COPY_SRC,
+  });
+  const staging = device.createBuffer({
+    size: byteSize,
+    usage: MAP_READ | COPY_DST,
+  });
 
   const copyBindGroup = device.createBindGroup({
     layout: copyBindGroupLayout,

@@ -1,153 +1,216 @@
 /**
- * Model loading state store using Svelte 5 runes.
+ * Model store -- WebGPU init, weight download, model + tokenizer creation.
  */
 
-import { Torchlette, initWebGPU, getWebGPUInitError } from 'torchlette/browser';
-import { GPT2WithLoRA, GPT2_SMALL_CONFIG } from '$lib/torchlette/gpt2-lora';
-import { createLoRAConfig } from '$lib/torchlette/lora';
-import { GPT2Tokenizer } from '$lib/torchlette/tokenizer';
-import { fetchGPT2Weights, fetchTokenizer } from '$lib/torchlette/weights';
+import {
+  getWebGPUInitError,
+  initWebGPU,
+  setGPUMemoryLimit,
+  Torchlette,
+} from "torchlette";
+import { GPT2_SMALL_CONFIG, GPT2WithLoRA } from "$lib/torchlette/gpt2-lora";
+import { createLoRAConfig } from "$lib/torchlette/lora";
+import { GPT2Tokenizer } from "$lib/torchlette/tokenizer";
+import { fetchGPT2Weights, fetchTokenizer } from "$lib/torchlette/weights";
 
-// State
-let isLoading = $state(false);
-let isLoaded = $state(false);
-let loadProgress = $state(0);
-let loadStatus = $state('');
-let error = $state<string | null>(null);
-let webgpuSupported = $state<boolean | null>(null);
+type Status = "idle" | "loading" | "ready" | "error";
 
-// Model instances
+let status = $state<Status>("idle");
+let progress = $state(0); // 0-100
+let progressText = $state("");
+let errorMsg = $state("");
+let webgpuOk = $state<boolean | null>(null);
+
 let api = $state<Torchlette | null>(null);
 let model = $state<GPT2WithLoRA | null>(null);
 let tokenizer = $state<GPT2Tokenizer | null>(null);
 
-// LoRA config
-let loraRank = $state(8);
-let loraAlpha = $state(16);
-
-/**
- * Check if WebGPU is supported.
- */
 async function checkWebGPU(): Promise<boolean> {
-  if (typeof navigator === 'undefined') return false;
-  if (!('gpu' in navigator)) return false;
-
+  if (typeof navigator === "undefined" || !("gpu" in navigator)) return false;
   try {
-    const adapter = await navigator.gpu.requestAdapter();
-    return adapter !== null;
+    return (await navigator.gpu.requestAdapter()) !== null;
   } catch {
     return false;
   }
 }
 
-/**
- * Load the GPT-2 model with LoRA.
- */
-async function loadModel(): Promise<void> {
-  if (isLoading || isLoaded) return;
+async function load(loraRank: number, loraAlpha: number): Promise<void> {
+  if (status === "loading" || status === "ready") return;
 
-  isLoading = true;
-  error = null;
-  loadProgress = 0;
-  loadStatus = 'Checking WebGPU support...';
+  status = "loading";
+  errorMsg = "";
+  progress = 0;
+  progressText = "Checking WebGPU...";
 
   try {
-    // Check WebGPU
-    webgpuSupported = await checkWebGPU();
-    if (!webgpuSupported) {
-      throw new Error('WebGPU is not supported in this browser. Please use Chrome 113+ or Edge 113+.');
-    }
+    webgpuOk = await checkWebGPU();
+    if (!webgpuOk)
+      throw new Error("WebGPU not supported. Use Chrome 113+ or Edge 113+.");
 
-    // Initialize WebGPU
-    loadStatus = 'Initializing WebGPU...';
-    loadProgress = 5;
+    progressText = "Initializing WebGPU...";
+    progress = 5;
     const ok = await initWebGPU();
-    if (!ok) {
-      throw new Error(getWebGPUInitError() || 'Failed to initialize WebGPU');
-    }
+    if (!ok) throw new Error(getWebGPUInitError() || "WebGPU init failed");
 
-    // Create Torchlette instance with optimizations enabled
-    // - enableFusion: fuse elementwise ops into single kernels
-    // - enableMemoryPlanning: reuse buffers to reduce memory
-    api = new Torchlette('webgpu', {
+    // Limit GPU memory to 8 GB to avoid browser OOM
+    setGPUMemoryLimit(8 * 1024 * 1024 * 1024);
+
+    api = new Torchlette("webgpu", {
       enableFusion: true,
-      enableMemoryPlanning: true,
     });
-    loadProgress = 10;
+    progress = 10;
 
-    // Load tokenizer
-    loadStatus = 'Loading tokenizer...';
-    const tokenizerData = await fetchTokenizer((loaded, total, status) => {
-      loadStatus = status;
+    progressText = "Loading tokenizer...";
+    const tokData = await fetchTokenizer((_, __, s) => {
+      progressText = s;
     });
-
     tokenizer = new GPT2Tokenizer();
-    tokenizer.load(tokenizerData.vocab, tokenizerData.merges);
-    loadProgress = 15;
+    tokenizer.load(tokData.vocab, tokData.merges);
+    progress = 15;
 
-    // Load weights
-    loadStatus = 'Downloading model weights (~500MB)...';
-    const weights = await fetchGPT2Weights((loaded, total, status) => {
-      loadStatus = status;
-      if (total > 0) {
-        loadProgress = 15 + Math.round((loaded / total) * 75);
-      }
+    progressText = "Downloading weights (~500 MB)...";
+    const weights = await fetchGPT2Weights((loaded, total, s) => {
+      progressText = s;
+      if (total > 0) progress = 15 + Math.round((loaded / total) * 75);
     });
 
-    loadProgress = 90;
-    loadStatus = 'Initializing model...';
+    progress = 90;
+    progressText = "Initializing model...";
 
-    // Create model with LoRA
     const loraConfig = createLoRAConfig(loraRank, loraAlpha);
-    model = new GPT2WithLoRA(api, GPT2_SMALL_CONFIG, loraConfig, 'webgpu');
-
-    // Load base weights
+    model = new GPT2WithLoRA(api, GPT2_SMALL_CONFIG, loraConfig, "webgpu");
     model.loadBaseWeights(weights);
 
-    loadProgress = 100;
-    loadStatus = 'Ready!';
-    isLoaded = true;
+    // Materialize all weight tensors on GPU before declaring ready.
+    // Without this, the lazy copy_ nodes from loadBaseWeights remain pending
+    // and can fail with "Input not ready" when training starts later.
+    await api.markStep();
+
+    progress = 100;
+    progressText = "Ready";
+    status = "ready";
   } catch (e) {
-    error = e instanceof Error ? e.message : 'Unknown error occurred';
-    loadProgress = 0;
-    loadStatus = '';
-  } finally {
-    isLoading = false;
+    errorMsg = e instanceof Error ? e.message : String(e);
+    status = "error";
+    progress = 0;
+    progressText = "";
   }
 }
 
 /**
- * Reset the model (for retraining with different config).
+ * Load model for pretraining from scratch.
+ * Skips 500MB weight download. Initializes randomly with seed 42
+ * (matching V100 DiLoCo agent for identical starting weights).
  */
-function resetModel(): void {
-  model = null;
-  isLoaded = false;
-  loadProgress = 0;
-  loadStatus = '';
-  error = null;
+async function loadForPretraining(): Promise<void> {
+  if (status === "loading" || status === "ready") return;
+
+  status = "loading";
+  errorMsg = "";
+  progress = 0;
+  progressText = "Checking WebGPU...";
+
+  try {
+    webgpuOk = await checkWebGPU();
+    if (!webgpuOk)
+      throw new Error("WebGPU not supported. Use Chrome 113+ or Edge 113+.");
+
+    progressText = "Initializing WebGPU...";
+    progress = 10;
+    const ok = await initWebGPU();
+    if (!ok) throw new Error(getWebGPUInitError() || "WebGPU init failed");
+
+    setGPUMemoryLimit(8 * 1024 * 1024 * 1024);
+
+    api = new Torchlette("webgpu", { enableFusion: true });
+    api.manualSeed(42); // Must match V100 agent seed
+    progress = 20;
+
+    progressText = "Loading tokenizer...";
+    const tokData = await fetchTokenizer((_, __, s) => {
+      progressText = s;
+    });
+    tokenizer = new GPT2Tokenizer();
+    tokenizer.load(tokData.vocab, tokData.merges);
+    progress = 40;
+
+    progressText = "Initializing random weights (seed 42)...";
+    const loraConfig = createLoRAConfig(1, 1); // rank=1 alpha=1 to match V100
+    // Half-size GPT-2 for TinyStories (must match V100 agent config)
+    const PRETRAIN_CONFIG = {
+      vocabSize: 50257,
+      blockSize: 1024,
+      numLayers: 6,
+      numHeads: 6,
+      embedDim: 384,
+      dropoutRate: 0,
+    };
+    model = new GPT2WithLoRA(api, PRETRAIN_CONFIG, loraConfig, "webgpu");
+
+    // Random init matching V100: normal_(0, 0.02) for 2D+ params
+    const { normal_ } = await import("../../../../../src/nn/init");
+    const params = model.getAllParameters();
+    for (const p of params) {
+      if (p.shape.length >= 2) {
+        normal_(api, p, 0, 0.02);
+      }
+    }
+    progress = 80;
+
+    model.setFullFinetuning(true);
+    await api._runtime().forceAllPending();
+    const p0Init = await params[0].cpu();
+    console.log(
+      "[init-check] browser param[0] first4:",
+      Array.from(p0Init.slice(0, 4)).map((v: number) => v.toFixed(8)),
+    );
+    console.log(
+      "[init-check] expected V100:  [-0.00575741,-0.02528063,0.01242364,-0.00770933]",
+    );
+    console.log("[init-check] nParams:", params.length);
+    await api.markStep();
+
+    progress = 100;
+    progressText = "Ready (from scratch)";
+    status = "ready";
+  } catch (e) {
+    errorMsg = e instanceof Error ? e.message : String(e);
+    status = "error";
+    progress = 0;
+    progressText = "";
+  }
 }
 
-// Export store
 export const modelStore = {
-  // Getters
-  get isLoading() { return isLoading; },
-  get isLoaded() { return isLoaded; },
-  get loadProgress() { return loadProgress; },
-  get loadStatus() { return loadStatus; },
-  get error() { return error; },
-  get webgpuSupported() { return webgpuSupported; },
-  get api() { return api; },
-  get model() { return model; },
-  get tokenizer() { return tokenizer; },
-  get loraRank() { return loraRank; },
-  get loraAlpha() { return loraAlpha; },
+  get status() {
+    return status;
+  },
+  get progress() {
+    return progress;
+  },
+  get progressText() {
+    return progressText;
+  },
+  get error() {
+    return errorMsg;
+  },
+  get webgpuOk() {
+    return webgpuOk;
+  },
+  get api() {
+    return api;
+  },
+  get model() {
+    return model;
+  },
+  get tokenizer() {
+    return tokenizer;
+  },
+  get isReady() {
+    return status === "ready";
+  },
 
-  // Setters
-  set loraRank(v: number) { loraRank = v; },
-  set loraAlpha(v: number) { loraAlpha = v; },
-
-  // Actions
-  loadModel,
-  resetModel,
+  load,
+  loadForPretraining,
   checkWebGPU,
 };

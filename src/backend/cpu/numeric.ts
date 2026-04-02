@@ -1,5 +1,11 @@
-import { normalizeDim as normalizeDimBase, type GeluOptions } from "../types";
-import { sizeOf, broadcastShapes } from "../../core/shape";
+import {
+  broadcastShapes,
+  broadcastThreeShapes,
+  contiguousStrides as computeStrides,
+  inferReshapeStrides,
+  sizeOf,
+} from "../../core/shape";
+import { type GeluOptions, normalizeDim as normalizeDimShared } from "../types";
 
 export type Shape = number[];
 
@@ -39,7 +45,7 @@ export class Tensor {
     }
     if (isContiguous(this)) {
       const strides = computeStrides(shape);
-      return new Tensor(shape, this.data, strides, this.offset);
+      return new Tensor(shape, this.data, strides, this.offset, false);
     }
     // Non-contiguous: try to compute valid strides
     const newStrides = inferReshapeStrides(this.shape, this.strides, shape);
@@ -49,7 +55,7 @@ export class Tensor {
     // Incompatible: materialize first
     const contig = this.contiguous();
     const strides = computeStrides(shape);
-    return new Tensor(shape, contig.data, strides, contig.offset);
+    return new Tensor(shape, contig.data, strides, contig.offset, false);
   }
 
   /**
@@ -90,14 +96,52 @@ export class Tensor {
   }
 }
 
-export function tensorFromArray(values: number[] | Float32Array, shape: Shape): Tensor {
-  return new Tensor(shape, values instanceof Float32Array ? values.slice() : Float32Array.from(values));
+export function tensorFromArray(
+  values: number[] | Float32Array,
+  shape: Shape,
+): Tensor {
+  return new Tensor(
+    shape,
+    values instanceof Float32Array ? values.slice() : Float32Array.from(values),
+  );
+}
+
+export function zeros(shape: Shape): Tensor {
+  return new Tensor(shape, new Float32Array(sizeOf(shape)));
 }
 
 export function full(shape: Shape, fillValue: number): Tensor {
   const numElements = sizeOf(shape);
   const data = new Float32Array(numElements);
   data.fill(fillValue);
+  return new Tensor(shape, data);
+}
+
+export function rand(shape: Shape): Tensor {
+  const n = sizeOf(shape);
+  const data = new Float32Array(n);
+  for (let i = 0; i < n; i++) data[i] = Math.random();
+  return new Tensor(shape, data);
+}
+
+export function randn(shape: Shape): Tensor {
+  const n = sizeOf(shape);
+  const data = new Float32Array(n);
+  // Box-Muller transform
+  for (let i = 0; i < n; i += 2) {
+    const u1 = Math.random() || 1e-10;
+    const u2 = Math.random();
+    const r = Math.sqrt(-2 * Math.log(u1));
+    data[i] = r * Math.cos(2 * Math.PI * u2);
+    if (i + 1 < n) data[i + 1] = r * Math.sin(2 * Math.PI * u2);
+  }
+  return new Tensor(shape, data);
+}
+
+export function bernoulli(shape: Shape, p: number, _seed?: number): Tensor {
+  const n = sizeOf(shape);
+  const data = new Float32Array(n);
+  for (let i = 0; i < n; i++) data[i] = Math.random() < p ? 1 : 0;
   return new Tensor(shape, data);
 }
 
@@ -110,8 +154,14 @@ export function arange(end: number, start = 0, step = 1): Tensor {
   return new Tensor([numElements], data);
 }
 
-export function tril(a: Tensor, k = 0): Tensor {
-  if (a.shape.length < 2) throw new Error("tril requires at least 2 dimensions");
+/** Shared impl for tril/triu: zero elements where zeroWhen(col, row, k) is true. */
+function triangularMask(
+  a: Tensor,
+  k: number,
+  zeroWhen: (c: number, r: number, k: number) => boolean,
+): Tensor {
+  if (a.shape.length < 2)
+    throw new Error("tril/triu requires at least 2 dimensions");
   const data = Float32Array.from(a.data);
   const H = a.shape[a.shape.length - 2];
   const W = a.shape[a.shape.length - 1];
@@ -119,27 +169,19 @@ export function tril(a: Tensor, k = 0): Tensor {
   for (let b = 0; b < batchSize; b++) {
     for (let r = 0; r < H; r++) {
       for (let c = 0; c < W; c++) {
-        if (c > r + k) data[b * H * W + r * W + c] = 0;
+        if (zeroWhen(c, r, k)) data[b * H * W + r * W + c] = 0;
       }
     }
   }
   return new Tensor(a.shape.slice(), data);
 }
 
+export function tril(a: Tensor, k = 0): Tensor {
+  return triangularMask(a, k, (c, r, k) => c > r + k);
+}
+
 export function triu(a: Tensor, k = 0): Tensor {
-  if (a.shape.length < 2) throw new Error("triu requires at least 2 dimensions");
-  const data = Float32Array.from(a.data);
-  const H = a.shape[a.shape.length - 2];
-  const W = a.shape[a.shape.length - 1];
-  const batchSize = data.length / (H * W);
-  for (let b = 0; b < batchSize; b++) {
-    for (let r = 0; r < H; r++) {
-      for (let c = 0; c < W; c++) {
-        if (c < r + k) data[b * H * W + r * W + c] = 0;
-      }
-    }
-  }
-  return new Tensor(a.shape.slice(), data);
+  return triangularMask(a, k, (c, r, k) => c < r + k);
 }
 
 export function expand(a: Tensor, shape: Shape): Tensor {
@@ -152,18 +194,7 @@ export type SubOptions = {
 
 export function sub(a: Tensor, b: Tensor, options?: SubOptions): Tensor {
   const alpha = options?.alpha ?? 1;
-  const outShape = broadcastShapes(a.shape, b.shape);
-  const aBroadcast = broadcastTo(a, outShape);
-  const bBroadcast = broadcastTo(b, outShape);
-  const outSize = sizeOf(outShape);
-  const out = new Float32Array(outSize);
-  const shapeStrides = computeStrides(outShape);
-  for (let i = 0; i < outSize; i += 1) {
-    out[i] =
-      readAtLinear(aBroadcast, i, shapeStrides) -
-      alpha * readAtLinear(bBroadcast, i, shapeStrides);
-  }
-  return new Tensor(outShape, out);
+  return applyBinaryOp(a, b, (x, y) => x - alpha * y);
 }
 
 export type DivOptions = {
@@ -172,24 +203,12 @@ export type DivOptions = {
 
 export function div(a: Tensor, b: Tensor, options?: DivOptions): Tensor {
   const rounding = options?.roundingMode ?? null;
-  const outShape = broadcastShapes(a.shape, b.shape);
-  const aBroadcast = broadcastTo(a, outShape);
-  const bBroadcast = broadcastTo(b, outShape);
-  const outSize = sizeOf(outShape);
-  const out = new Float32Array(outSize);
-  const shapeStrides = computeStrides(outShape);
-  for (let i = 0; i < outSize; i += 1) {
-    let value =
-      readAtLinear(aBroadcast, i, shapeStrides) /
-      readAtLinear(bBroadcast, i, shapeStrides);
-    if (rounding === "floor") {
-      value = Math.floor(value);
-    } else if (rounding === "trunc") {
-      value = Math.trunc(value);
-    }
-    out[i] = value;
-  }
-  return new Tensor(outShape, out);
+  return applyBinaryOp(a, b, (x, y) => {
+    let v = x / y;
+    if (rounding === "floor") v = Math.floor(v);
+    else if (rounding === "trunc") v = Math.trunc(v);
+    return v;
+  });
 }
 
 export function reshape(a: Tensor, shape: Shape): Tensor {
@@ -207,13 +226,20 @@ export function contiguous(a: Tensor): Tensor {
 /**
  * Select a contiguous sub-range along one dimension. Returns a view.
  */
-export function narrow(a: Tensor, dim: number, start: number, length: number): Tensor {
+export function narrow(
+  a: Tensor,
+  dim: number,
+  start: number,
+  length: number,
+): Tensor {
   const rank = a.shape.length;
   if (dim < 0 || dim >= rank) {
     throw new Error(`narrow: dim ${dim} out of range for rank ${rank}`);
   }
   if (start < 0 || start + length > a.shape[dim]) {
-    throw new Error(`narrow: range [${start}, ${start + length}) out of bounds for dim size ${a.shape[dim]}`);
+    throw new Error(
+      `narrow: range [${start}, ${start + length}) out of bounds for dim size ${a.shape[dim]}`,
+    );
   }
   const newShape = a.shape.slice();
   newShape[dim] = length;
@@ -224,7 +250,12 @@ export function narrow(a: Tensor, dim: number, start: number, length: number): T
 /**
  * Backward for narrow: pad gradient back to original shape.
  */
-export function narrowBackward(grad: Tensor, dim: number, start: number, originalLength: number): Tensor {
+export function narrowBackward(
+  grad: Tensor,
+  dim: number,
+  start: number,
+  originalLength: number,
+): Tensor {
   const outShape = grad.shape.slice();
   outShape[dim] = originalLength;
   const outSize = sizeOf(outShape);
@@ -240,7 +271,8 @@ export function narrowBackward(grad: Tensor, dim: number, start: number, origina
     for (let d = 0; d < gradDimSize; d++) {
       for (let i = 0; i < innerSize; i++) {
         const gradIdx = getStridedIndex(grad, o, d, i, dim);
-        const outIdx = o * originalLength * innerSize + (start + d) * innerSize + i;
+        const outIdx =
+          o * originalLength * innerSize + (start + d) * innerSize + i;
         result[outIdx] = grad.data[gradIdx];
       }
     }
@@ -249,7 +281,51 @@ export function narrowBackward(grad: Tensor, dim: number, start: number, origina
   return new Tensor(outShape, result);
 }
 
-function getStridedIndex(t: Tensor, outer: number, dimIdx: number, inner: number, dim: number): number {
+export function cat(tensors: Tensor[], options: { dim: number }): Tensor {
+  if (tensors.length === 0) throw new Error("cat: empty tensor list");
+  const dim =
+    options.dim < 0 ? options.dim + tensors[0].shape.length : options.dim;
+  const rank = tensors[0].shape.length;
+  // Validate shapes match on all non-cat dims
+  for (let i = 1; i < tensors.length; i++) {
+    if (tensors[i].shape.length !== rank) throw new Error("cat: rank mismatch");
+    for (let d = 0; d < rank; d++) {
+      if (d !== dim && tensors[i].shape[d] !== tensors[0].shape[d]) {
+        throw new Error(`cat: shape mismatch at dim ${d}`);
+      }
+    }
+  }
+  const outShape = tensors[0].shape.slice();
+  outShape[dim] = tensors.reduce((s, t) => s + t.shape[dim], 0);
+  const outSize = sizeOf(outShape);
+  const result = new Float32Array(outSize);
+  const outerSize = dim === 0 ? 1 : sizeOf(outShape.slice(0, dim));
+  const innerSize = dim === rank - 1 ? 1 : sizeOf(outShape.slice(dim + 1));
+  let dimOffset = 0;
+  for (const t of tensors) {
+    const tDimSize = t.shape[dim];
+    for (let o = 0; o < outerSize; o++) {
+      for (let d = 0; d < tDimSize; d++) {
+        for (let i = 0; i < innerSize; i++) {
+          const srcIdx = getStridedIndex(t, o, d, i, dim);
+          const outIdx =
+            o * outShape[dim] * innerSize + (dimOffset + d) * innerSize + i;
+          result[outIdx] = t.data[srcIdx];
+        }
+      }
+    }
+    dimOffset += tDimSize;
+  }
+  return new Tensor(outShape, result);
+}
+
+function getStridedIndex(
+  t: Tensor,
+  outer: number,
+  dimIdx: number,
+  inner: number,
+  dim: number,
+): number {
   // Compute strided index for [outer, dimIdx, inner] where dim splits the dimensions
   let idx = t.offset;
   // Outer dimensions
@@ -327,44 +403,84 @@ export function permute(a: Tensor, dims: number[]): Tensor {
   return new Tensor(newShape, a.data, newStrides, a.offset, false);
 }
 
-export function add(a: Tensor, b: Tensor): Tensor {
-  const outShape = broadcastShapes(a.shape, b.shape);
-  const aBroadcast = broadcastTo(a, outShape);
-  const bBroadcast = broadcastTo(b, outShape);
-  const outSize = sizeOf(outShape);
-  const out = new Float32Array(outSize);
-  const shapeStrides = computeStrides(outShape);
-  for (let i = 0; i < outSize; i += 1) {
-    out[i] =
-      readAtLinear(aBroadcast, i, shapeStrides) +
-      readAtLinear(bBroadcast, i, shapeStrides);
-  }
-  return new Tensor(outShape, out);
-}
-
-export function mul(a: Tensor, b: Tensor): Tensor {
-  const outShape = broadcastShapes(a.shape, b.shape);
-  const aBroadcast = broadcastTo(a, outShape);
-  const bBroadcast = broadcastTo(b, outShape);
-  const outSize = sizeOf(outShape);
-  const out = new Float32Array(outSize);
-  const shapeStrides = computeStrides(outShape);
-  for (let i = 0; i < outSize; i += 1) {
-    out[i] =
-      readAtLinear(aBroadcast, i, shapeStrides) *
-      readAtLinear(bBroadcast, i, shapeStrides);
-  }
-  return new Tensor(outShape, out);
-}
-
-export function relu(a: Tensor): Tensor {
+function applyUnaryOp(a: Tensor, fn: (x: number) => number): Tensor {
   const out = new Float32Array(a.size);
   const shapeStrides = computeStrides(a.shape);
   for (let i = 0; i < a.size; i += 1) {
-    const value = readAtLinear(a, i, shapeStrides);
-    out[i] = value > 0 ? value : 0;
+    out[i] = fn(readAtLinear(a, i, shapeStrides));
   }
   return new Tensor(a.shape, out);
+}
+
+function applyBinaryOp(
+  a: Tensor,
+  b: Tensor,
+  fn: (x: number, y: number) => number,
+): Tensor {
+  const outShape = broadcastShapes(a.shape, b.shape);
+  const aBroadcast = broadcastTo(a, outShape);
+  const bBroadcast = broadcastTo(b, outShape);
+  const outSize = sizeOf(outShape);
+  const out = new Float32Array(outSize);
+  const shapeStrides = computeStrides(outShape);
+  for (let i = 0; i < outSize; i += 1) {
+    out[i] = fn(
+      readAtLinear(aBroadcast, i, shapeStrides),
+      readAtLinear(bBroadcast, i, shapeStrides),
+    );
+  }
+  return new Tensor(outShape, out);
+}
+
+// ============================================================================
+// Table-driven elementwise ops
+// ============================================================================
+
+/** Unary CPU implementations: op name → scalar function. */
+const UNARY_OPS: Record<string, (x: number) => number> = {
+  sqrt: Math.sqrt,
+  exp: Math.exp,
+  log: Math.log,
+  neg: (x) => -x,
+  abs: Math.abs,
+  tanh: Math.tanh,
+  sigmoid: (x) => 1.0 / (1.0 + Math.exp(-x)),
+  silu: (x) => x / (1.0 + Math.exp(-x)),
+  sin: Math.sin,
+  cos: Math.cos,
+  rsqrt: (x) => 1.0 / Math.sqrt(x),
+  floor: Math.floor,
+  ceil: Math.ceil,
+  round: Math.round,
+  sign: Math.sign,
+  isfinite: (x) => (Number.isFinite(x) ? 1.0 : 0.0),
+  relu: (x) => (x > 0 ? x : 0),
+};
+
+/** Binary CPU implementations: op name → scalar function. */
+const BINARY_OPS: Record<string, (x: number, y: number) => number> = {
+  add: (x, y) => x + y,
+  mul: (x, y) => x * y,
+  pow: Math.pow,
+  minimum: Math.min,
+  maximum: Math.max,
+};
+
+// Generate exports from tables
+export function add(a: Tensor, b: Tensor): Tensor {
+  return applyBinaryOp(a, b, BINARY_OPS.add);
+}
+export function mul(a: Tensor, b: Tensor): Tensor {
+  return applyBinaryOp(a, b, BINARY_OPS.mul);
+}
+export function minimum(a: Tensor, b: Tensor): Tensor {
+  return applyBinaryOp(a, b, BINARY_OPS.minimum);
+}
+export function maximum(a: Tensor, b: Tensor): Tensor {
+  return applyBinaryOp(a, b, BINARY_OPS.maximum);
+}
+export function relu(a: Tensor): Tensor {
+  return applyUnaryOp(a, UNARY_OPS.relu);
 }
 
 export function matmul(a: Tensor, b: Tensor): Tensor {
@@ -455,67 +571,25 @@ export function matmul(a: Tensor, b: Tensor): Tensor {
 }
 
 export function sqrt(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.sqrt(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
+  return applyUnaryOp(a, UNARY_OPS.sqrt);
 }
-
 export function exp(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.exp(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
+  return applyUnaryOp(a, UNARY_OPS.exp);
 }
-
 export function log(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.log(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
+  return applyUnaryOp(a, UNARY_OPS.log);
 }
-
 export function neg(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = -readAtLinear(a, i, shapeStrides);
-  }
-  return new Tensor(a.shape, out);
+  return applyUnaryOp(a, UNARY_OPS.neg);
 }
-
 export function abs(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.abs(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
+  return applyUnaryOp(a, UNARY_OPS.abs);
 }
-
 export function tanh(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    out[i] = Math.tanh(readAtLinear(a, i, shapeStrides));
-  }
-  return new Tensor(a.shape, out);
+  return applyUnaryOp(a, UNARY_OPS.tanh);
 }
-
 export function sigmoid(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    const x = readAtLinear(a, i, shapeStrides);
-    out[i] = 1.0 / (1.0 + Math.exp(-x));
-  }
-  return new Tensor(a.shape, out);
+  return applyUnaryOp(a, UNARY_OPS.sigmoid);
 }
 
 /**
@@ -535,7 +609,8 @@ function erf(x: number): number {
   x = Math.abs(x);
 
   const t = 1.0 / (1.0 + p * x);
-  const y = 1.0 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+  const y =
+    1.0 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
 
   return sign * y;
 }
@@ -551,12 +626,13 @@ export function gelu(a: Tensor, options?: GeluOptions): Tensor {
     const sqrt2OverPi = 0.7978845608; // sqrt(2/pi)
     for (let i = 0; i < a.size; i += 1) {
       const x = readAtLinear(a, i, shapeStrides);
-      out[i] = x * 0.5 * (1.0 + Math.tanh(sqrt2OverPi * (x + 0.044715 * x * x * x)));
+      out[i] =
+        x * 0.5 * (1.0 + Math.tanh(sqrt2OverPi * (x + 0.044715 * x * x * x)));
     }
   } else {
     // Exact formula using erf:
     // x * 0.5 * (1 + erf(x / sqrt(2)))
-    const sqrt2Inv = 0.7071067811865476; // 1/sqrt(2)
+    const sqrt2Inv = Math.SQRT1_2; // 1/sqrt(2)
     for (let i = 0; i < a.size; i += 1) {
       const x = readAtLinear(a, i, shapeStrides);
       out[i] = x * 0.5 * (1.0 + erf(x * sqrt2Inv));
@@ -567,28 +643,47 @@ export function gelu(a: Tensor, options?: GeluOptions): Tensor {
 }
 
 export function silu(a: Tensor): Tensor {
-  // SiLU/Swish: x * sigmoid(x) = x / (1 + exp(-x))
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    const x = readAtLinear(a, i, shapeStrides);
-    out[i] = x / (1.0 + Math.exp(-x));
-  }
-  return new Tensor(a.shape, out);
+  return applyUnaryOp(a, UNARY_OPS.silu);
+}
+export function sin(a: Tensor): Tensor {
+  return applyUnaryOp(a, UNARY_OPS.sin);
+}
+export function cos(a: Tensor): Tensor {
+  return applyUnaryOp(a, UNARY_OPS.cos);
+}
+export function rsqrt(a: Tensor): Tensor {
+  return applyUnaryOp(a, UNARY_OPS.rsqrt);
+}
+export function floor(a: Tensor): Tensor {
+  return applyUnaryOp(a, UNARY_OPS.floor);
+}
+export function ceil(a: Tensor): Tensor {
+  return applyUnaryOp(a, UNARY_OPS.ceil);
+}
+export function round(a: Tensor): Tensor {
+  return applyUnaryOp(a, UNARY_OPS.round);
+}
+export function sign(a: Tensor): Tensor {
+  return applyUnaryOp(a, UNARY_OPS.sign);
+}
+export function isfinite(a: Tensor): Tensor {
+  return applyUnaryOp(a, UNARY_OPS.isfinite);
 }
 
-/**
- * Check if values are finite (not NaN and not Inf).
- * Returns 1.0 where finite, 0.0 where NaN or Inf.
- */
-export function isfinite(a: Tensor): Tensor {
-  const out = new Float32Array(a.size);
-  const shapeStrides = computeStrides(a.shape);
-  for (let i = 0; i < a.size; i += 1) {
-    const x = readAtLinear(a, i, shapeStrides);
-    out[i] = Number.isFinite(x) ? 1.0 : 0.0;
-  }
-  return new Tensor(a.shape, out);
+export function clamp(
+  a: Tensor,
+  min: number | null,
+  max: number | null,
+): Tensor {
+  return applyUnaryOp(a, (v) => {
+    if (min !== null && v < min) v = min;
+    if (max !== null && v > max) v = max;
+    return v;
+  });
+}
+
+export function pow(a: Tensor, b: Tensor): Tensor {
+  return applyBinaryOp(a, b, BINARY_OPS.pow);
 }
 
 export type SumOptions = {
@@ -598,86 +693,6 @@ export type SumOptions = {
 };
 
 export type MeanOptions = SumOptions;
-
-function computeStrides(shape: Shape): number[] {
-  const strides = new Array(shape.length);
-  let stride = 1;
-  for (let i = shape.length - 1; i >= 0; i -= 1) {
-    strides[i] = stride;
-    stride *= shape[i];
-  }
-  return strides;
-}
-
-// sizeOf imported from core/shape
-
-/**
- * Infer strides for a new shape given old shape/strides, without copying data.
- * Returns null if the reshape requires a contiguous copy.
- */
-function inferReshapeStrides(
-  oldShape: number[],
-  oldStrides: number[],
-  newShape: number[],
-): number[] | null {
-  if (newShape.length === 0) return [];
-  if (oldShape.length === 0) return computeStrides(newShape);
-
-  const newStrides = new Array<number>(newShape.length);
-  let oldIdx = 0;
-  let newIdx = 0;
-  const oldN = oldShape.length;
-  const newN = newShape.length;
-
-  while (newIdx < newN) {
-    if (newShape[newIdx] === 1) {
-      newStrides[newIdx] = newIdx + 1 < newN ? newStrides[newIdx + 1] || 1 : 1;
-      newIdx++;
-      continue;
-    }
-    while (oldIdx < oldN && oldShape[oldIdx] === 1) oldIdx++;
-    if (oldIdx >= oldN) return null;
-
-    let oldProduct = oldShape[oldIdx];
-    let newProduct = newShape[newIdx];
-    const groupStart = oldIdx;
-    while (oldProduct < newProduct && oldIdx + 1 < oldN) {
-      if (oldStrides[oldIdx] !== oldStrides[oldIdx + 1] * oldShape[oldIdx + 1]) {
-        return null;
-      }
-      oldIdx++;
-      if (oldShape[oldIdx] === 1) continue;
-      oldProduct *= oldShape[oldIdx];
-    }
-    const newGroupStart = newIdx;
-    while (newProduct < oldProduct && newIdx + 1 < newN) {
-      newIdx++;
-      if (newShape[newIdx] === 1) {
-        newStrides[newIdx] = 1;
-        continue;
-      }
-      newProduct *= newShape[newIdx];
-    }
-    if (oldProduct !== newProduct) return null;
-
-    let stride = oldStrides[oldIdx];
-    for (let i = newIdx; i >= newGroupStart; i--) {
-      if (newShape[i] === 1) {
-        newStrides[i] = stride;
-        continue;
-      }
-      newStrides[i] = stride;
-      stride *= newShape[i];
-    }
-    oldIdx++;
-    newIdx++;
-  }
-  while (oldIdx < oldN) {
-    if (oldShape[oldIdx] !== 1) return null;
-    oldIdx++;
-  }
-  return newStrides;
-}
 
 function isContiguous(tensor: Tensor): boolean {
   const expected = computeStrides(tensor.shape);
@@ -779,6 +794,77 @@ function readIndexValue(value: number, limit: number): number {
     throw new Error("index out of range");
   }
   return value;
+}
+
+// ============================================================================
+// Conv2d
+// ============================================================================
+
+export function conv2d(
+  input: Tensor,
+  weight: Tensor,
+  bias: Tensor | undefined,
+  options?: {
+    stride?: number | [number, number];
+    padding?: number | [number, number];
+  },
+): Tensor {
+  const [N, Cin, H, W] = input.shape;
+  const [Cout, CinK, KH, KW] = weight.shape;
+  if (Cin !== CinK)
+    throw new Error(`conv2d: input channels ${Cin} != weight channels ${CinK}`);
+
+  const stride = normalizePair(options?.stride, 1);
+  const padding = normalizePair(options?.padding, 0);
+  const [sH, sW] = stride;
+  const [pH, pW] = padding;
+
+  const outH = Math.floor((H + 2 * pH - KH) / sH + 1);
+  const outW = Math.floor((W + 2 * pW - KW) / sW + 1);
+  const out = new Float32Array(N * Cout * outH * outW);
+
+  for (let n = 0; n < N; n++) {
+    for (let co = 0; co < Cout; co++) {
+      for (let oh = 0; oh < outH; oh++) {
+        for (let ow = 0; ow < outW; ow++) {
+          let acc = bias ? readElement(bias, [co]) : 0;
+          for (let ci = 0; ci < Cin; ci++) {
+            for (let ky = 0; ky < KH; ky++) {
+              for (let kx = 0; kx < KW; kx++) {
+                const ih = oh * sH - pH + ky;
+                const iw = ow * sW - pW + kx;
+                if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                  acc +=
+                    readElement(input, [n, ci, ih, iw]) *
+                    readElement(weight, [co, ci, ky, kx]);
+                }
+              }
+            }
+          }
+          out[n * Cout * outH * outW + co * outH * outW + oh * outW + ow] = acc;
+        }
+      }
+    }
+  }
+
+  return new Tensor([N, Cout, outH, outW], out);
+}
+
+function normalizePair(
+  p: number | [number, number] | undefined,
+  fallback: number,
+): [number, number] {
+  if (p === undefined) return [fallback, fallback];
+  if (typeof p === "number") return [p, p];
+  return p;
+}
+
+function readElement(t: Tensor, indices: number[]): number {
+  let offset = t.offset;
+  for (let i = 0; i < indices.length; i++) {
+    offset += indices[i] * t.strides[i];
+  }
+  return t.data[offset];
 }
 
 export type GatherOptions = {
@@ -1050,7 +1136,78 @@ export function max(a: Tensor, options?: MaxOptions): Tensor {
   return new Tensor(outShape, out);
 }
 
-function normalizeDimsForReduce(dim: number | number[], rank: number, opName: string): number[] {
+function minAll(a: Tensor): number {
+  let minVal = Infinity;
+  const shapeStrides = computeStrides(a.shape);
+  for (let i = 0; i < a.size; i += 1) {
+    const val = readAtLinear(a, i, shapeStrides);
+    if (val < minVal) {
+      minVal = val;
+    }
+  }
+  return minVal;
+}
+
+export function min(a: Tensor, options?: MaxOptions): Tensor {
+  if (!options || options.dim == null) {
+    return new Tensor([], new Float32Array([minAll(a)]));
+  }
+
+  const rank = a.shape.length;
+  const dims = normalizeDimsForReduce(options.dim, rank, "min");
+  const keepdim = options.keepdim ?? false;
+  const reduceSet = new Set(dims);
+
+  const outShape = keepdim
+    ? a.shape.map((dim, index) => (reduceSet.has(index) ? 1 : dim))
+    : a.shape.filter((_, index) => !reduceSet.has(index));
+
+  const outSize = outShape.reduce((acc, dim) => acc * dim, 1) || 1;
+  const out = new Float32Array(outSize);
+  out.fill(Infinity);
+  const inShapeStrides = computeStrides(a.shape);
+  const outStrides = computeStrides(outShape);
+
+  for (let linear = 0; linear < a.size; linear += 1) {
+    let remainder = linear;
+    let outOffset = 0;
+
+    if (keepdim) {
+      for (let dim = 0; dim < rank; dim += 1) {
+        const stride = inShapeStrides[dim];
+        const coord = Math.floor(remainder / stride);
+        remainder -= coord * stride;
+        if (!reduceSet.has(dim)) {
+          outOffset += coord * outStrides[dim];
+        }
+      }
+    } else {
+      let outDim = 0;
+      for (let dim = 0; dim < rank; dim += 1) {
+        const stride = inShapeStrides[dim];
+        const coord = Math.floor(remainder / stride);
+        remainder -= coord * stride;
+        if (!reduceSet.has(dim)) {
+          outOffset += coord * outStrides[outDim];
+          outDim += 1;
+        }
+      }
+    }
+
+    const val = readAtLinear(a, linear, inShapeStrides);
+    if (val < out[outOffset]) {
+      out[outOffset] = val;
+    }
+  }
+
+  return new Tensor(outShape, out);
+}
+
+function normalizeDimsForReduce(
+  dim: number | number[],
+  rank: number,
+  opName: string,
+): number[] {
   const dims = Array.isArray(dim) ? dim.slice() : [dim];
   const normalized = dims.map((value) => normalizeDimBase(value, rank));
   const unique = new Set<number>();
@@ -1068,11 +1225,20 @@ function normalizeDimsForReduce(dim: number | number[], rank: number, opName: st
 
 export type ArgReduceOptions = { dim: number; keepdim?: boolean };
 
-export function argmax(a: Tensor, options: ArgReduceOptions): Tensor {
+/** Shared argmax/argmin implementation parameterized by comparison direction. */
+function argReduce(
+  a: Tensor,
+  opName: string,
+  options: ArgReduceOptions,
+  initVal: number,
+  isBetter: (val: number, best: number) => boolean,
+): Tensor {
   const rank = a.shape.length;
   const dim = options.dim < 0 ? options.dim + rank : options.dim;
   if (dim < 0 || dim >= rank) {
-    throw new Error(`argmax: dim ${options.dim} out of range for tensor of rank ${rank}`);
+    throw new Error(
+      `${opName}: dim ${options.dim} out of range for tensor of rank ${rank}`,
+    );
   }
   const keepdim = options.keepdim ?? false;
 
@@ -1082,12 +1248,11 @@ export function argmax(a: Tensor, options: ArgReduceOptions): Tensor {
 
   const outSize = outShape.reduce((acc, d) => acc * d, 1) || 1;
   const out = new Float32Array(outSize);
-  const maxVals = new Float32Array(outSize);
-  maxVals.fill(-Infinity);
+  const bestVals = new Float32Array(outSize);
+  bestVals.fill(initVal);
 
   const inShapeStrides = computeStrides(a.shape);
   const outStrides = computeStrides(outShape);
-  const dimSize = a.shape[dim];
 
   for (let linear = 0; linear < a.size; linear += 1) {
     let remainder = linear;
@@ -1121,8 +1286,8 @@ export function argmax(a: Tensor, options: ArgReduceOptions): Tensor {
     }
 
     const val = readAtLinear(a, linear, inShapeStrides);
-    if (val > maxVals[outOffset]) {
-      maxVals[outOffset] = val;
+    if (isBetter(val, bestVals[outOffset])) {
+      bestVals[outOffset] = val;
       out[outOffset] = dimCoord;
     }
   }
@@ -1130,145 +1295,43 @@ export function argmax(a: Tensor, options: ArgReduceOptions): Tensor {
   return new Tensor(outShape, out);
 }
 
+export function argmax(a: Tensor, options: ArgReduceOptions): Tensor {
+  return argReduce(a, "argmax", options, -Infinity, (v, b) => v > b);
+}
+
 export function argmin(a: Tensor, options: ArgReduceOptions): Tensor {
-  const rank = a.shape.length;
-  const dim = options.dim < 0 ? options.dim + rank : options.dim;
-  if (dim < 0 || dim >= rank) {
-    throw new Error(`argmin: dim ${options.dim} out of range for tensor of rank ${rank}`);
-  }
-  const keepdim = options.keepdim ?? false;
-
-  const outShape = keepdim
-    ? a.shape.map((d, i) => (i === dim ? 1 : d))
-    : a.shape.filter((_, i) => i !== dim);
-
-  const outSize = outShape.reduce((acc, d) => acc * d, 1) || 1;
-  const out = new Float32Array(outSize);
-  const minVals = new Float32Array(outSize);
-  minVals.fill(Infinity);
-
-  const inShapeStrides = computeStrides(a.shape);
-  const outStrides = computeStrides(outShape);
-
-  for (let linear = 0; linear < a.size; linear += 1) {
-    let remainder = linear;
-    let outOffset = 0;
-    let dimCoord = 0;
-
-    if (keepdim) {
-      for (let d = 0; d < rank; d += 1) {
-        const stride = inShapeStrides[d];
-        const coord = Math.floor(remainder / stride);
-        remainder -= coord * stride;
-        if (d === dim) {
-          dimCoord = coord;
-        } else {
-          outOffset += coord * outStrides[d];
-        }
-      }
-    } else {
-      let outDim = 0;
-      for (let d = 0; d < rank; d += 1) {
-        const stride = inShapeStrides[d];
-        const coord = Math.floor(remainder / stride);
-        remainder -= coord * stride;
-        if (d === dim) {
-          dimCoord = coord;
-        } else {
-          outOffset += coord * outStrides[outDim];
-          outDim += 1;
-        }
-      }
-    }
-
-    const val = readAtLinear(a, linear, inShapeStrides);
-    if (val < minVals[outOffset]) {
-      minVals[outOffset] = val;
-      out[outOffset] = dimCoord;
-    }
-  }
-
-  return new Tensor(outShape, out);
+  return argReduce(a, "argmin", options, Infinity, (v, b) => v < b);
 }
 
 // ============================================================================
 // Comparison ops - return 1.0 for true, 0.0 for false
 // ============================================================================
 
+function comparisonOp(
+  a: Tensor,
+  b: Tensor,
+  cmp: (x: number, y: number) => boolean,
+): Tensor {
+  return applyBinaryOp(a, b, (x, y) => (cmp(x, y) ? 1.0 : 0.0));
+}
+
 export function gt(a: Tensor, b: Tensor): Tensor {
-  const { aBroadcast, bBroadcast, outShape, outSize, shapeStrides } = broadcastBinary(a, b);
-  const out = new Float32Array(outSize);
-  for (let i = 0; i < outSize; i += 1) {
-    const aVal = readAtLinear(aBroadcast, i, shapeStrides);
-    const bVal = readAtLinear(bBroadcast, i, shapeStrides);
-    out[i] = aVal > bVal ? 1.0 : 0.0;
-  }
-  return new Tensor(outShape, out);
+  return comparisonOp(a, b, (x, y) => x > y);
 }
-
 export function lt(a: Tensor, b: Tensor): Tensor {
-  const { aBroadcast, bBroadcast, outShape, outSize, shapeStrides } = broadcastBinary(a, b);
-  const out = new Float32Array(outSize);
-  for (let i = 0; i < outSize; i += 1) {
-    const aVal = readAtLinear(aBroadcast, i, shapeStrides);
-    const bVal = readAtLinear(bBroadcast, i, shapeStrides);
-    out[i] = aVal < bVal ? 1.0 : 0.0;
-  }
-  return new Tensor(outShape, out);
+  return comparisonOp(a, b, (x, y) => x < y);
 }
-
 export function ge(a: Tensor, b: Tensor): Tensor {
-  const { aBroadcast, bBroadcast, outShape, outSize, shapeStrides } = broadcastBinary(a, b);
-  const out = new Float32Array(outSize);
-  for (let i = 0; i < outSize; i += 1) {
-    const aVal = readAtLinear(aBroadcast, i, shapeStrides);
-    const bVal = readAtLinear(bBroadcast, i, shapeStrides);
-    out[i] = aVal >= bVal ? 1.0 : 0.0;
-  }
-  return new Tensor(outShape, out);
+  return comparisonOp(a, b, (x, y) => x >= y);
 }
-
 export function le(a: Tensor, b: Tensor): Tensor {
-  const { aBroadcast, bBroadcast, outShape, outSize, shapeStrides } = broadcastBinary(a, b);
-  const out = new Float32Array(outSize);
-  for (let i = 0; i < outSize; i += 1) {
-    const aVal = readAtLinear(aBroadcast, i, shapeStrides);
-    const bVal = readAtLinear(bBroadcast, i, shapeStrides);
-    out[i] = aVal <= bVal ? 1.0 : 0.0;
-  }
-  return new Tensor(outShape, out);
+  return comparisonOp(a, b, (x, y) => x <= y);
 }
-
 export function eq(a: Tensor, b: Tensor): Tensor {
-  const { aBroadcast, bBroadcast, outShape, outSize, shapeStrides } = broadcastBinary(a, b);
-  const out = new Float32Array(outSize);
-  for (let i = 0; i < outSize; i += 1) {
-    const aVal = readAtLinear(aBroadcast, i, shapeStrides);
-    const bVal = readAtLinear(bBroadcast, i, shapeStrides);
-    out[i] = aVal === bVal ? 1.0 : 0.0;
-  }
-  return new Tensor(outShape, out);
+  return comparisonOp(a, b, (x, y) => x === y);
 }
-
 export function ne(a: Tensor, b: Tensor): Tensor {
-  const { aBroadcast, bBroadcast, outShape, outSize, shapeStrides } = broadcastBinary(a, b);
-  const out = new Float32Array(outSize);
-  for (let i = 0; i < outSize; i += 1) {
-    const aVal = readAtLinear(aBroadcast, i, shapeStrides);
-    const bVal = readAtLinear(bBroadcast, i, shapeStrides);
-    out[i] = aVal !== bVal ? 1.0 : 0.0;
-  }
-  return new Tensor(outShape, out);
-}
-
-/** Helper for binary broadcast */
-function broadcastBinary(a: Tensor, b: Tensor) {
-  const outShape = broadcastShapes(a.shape, b.shape);
-  const aBroadcast = broadcastTo(a, outShape);
-  const bBroadcast = broadcastTo(b, outShape);
-  const outSize = sizeOf(outShape);
-  const shapeStrides = computeStrides(outShape);
-  return { aBroadcast, bBroadcast, outShape, outSize, shapeStrides };
+  return comparisonOp(a, b, (x, y) => x !== y);
 }
 
 /**
@@ -1295,31 +1358,6 @@ export function where(condition: Tensor, x: Tensor, y: Tensor): Tensor {
 }
 
 /**
- * Broadcast three shapes together.
- */
-function broadcastThreeShapes(a: Shape, b: Shape, c: Shape): Shape {
-  const outRank = Math.max(a.length, b.length, c.length);
-  const out = new Array<number>(outRank);
-  for (let i = 0; i < outRank; i += 1) {
-    const aDim = a[a.length - 1 - i] ?? 1;
-    const bDim = b[b.length - 1 - i] ?? 1;
-    const cDim = c[c.length - 1 - i] ?? 1;
-    // Check all pairs for broadcast compatibility
-    if (aDim !== bDim && aDim !== 1 && bDim !== 1) {
-      throw new Error("shapes are not broadcastable");
-    }
-    if (aDim !== cDim && aDim !== 1 && cDim !== 1) {
-      throw new Error("shapes are not broadcastable");
-    }
-    if (bDim !== cDim && bDim !== 1 && cDim !== 1) {
-      throw new Error("shapes are not broadcastable");
-    }
-    out[outRank - 1 - i] = Math.max(aDim, bDim, cDim);
-  }
-  return out;
-}
-
-/**
  * Options for strided scatter operations.
  * Describes where within a base tensor to write values.
  */
@@ -1333,113 +1371,98 @@ export type StridedScatterOptions = {
 };
 
 /**
- * Copy src values into base tensor at positions defined by view metadata.
+ * Scatter src values into base tensor at positions defined by view metadata.
  * Returns a new tensor (does not mutate base).
  *
  * This is the fundamental operation for view mutation lowering (§4.4):
- * When mutating a view, we load the base, scatter-copy the new values
+ * When mutating a view, we load the base, scatter the new values
  * into the view positions, and store back.
  */
-export function stridedScatterCopy(
+function stridedScatterImpl(
+  opName: string,
   base: Tensor,
   src: Tensor,
   options: StridedScatterOptions,
+  combine: (existing: number, srcVal: number) => number,
 ): Tensor {
   const { offset, viewShape, viewStrides } = options;
 
-  // Validate src shape matches view shape
   if (src.shape.length !== viewShape.length) {
     throw new Error(
-      `stridedScatterCopy: src rank ${src.shape.length} doesn't match view rank ${viewShape.length}`,
+      `${opName}: src rank ${src.shape.length} doesn't match view rank ${viewShape.length}`,
     );
   }
   for (let i = 0; i < viewShape.length; i++) {
     if (src.shape[i] !== viewShape[i]) {
       throw new Error(
-        `stridedScatterCopy: src shape [${src.shape}] doesn't match view shape [${viewShape}]`,
+        `${opName}: src shape [${src.shape}] doesn't match view shape [${viewShape}]`,
       );
     }
   }
 
-  // Clone base data (we don't mutate the original)
-  const out = new Float32Array(base.data.length);
-  out.set(base.data);
+  // Create output matching base's logical size, not its backing buffer size.
+  // The base may be a view into a larger buffer (offset > 0 or data.length > size).
+  const baseSize = sizeOf(base.shape);
+  const out = new Float32Array(baseSize);
+  // Read base values through strides (handles non-contiguous views)
+  const baseStrides = computeStrides(base.shape);
+  for (let i = 0; i < baseSize; i++) {
+    let remainder = i;
+    let idx = base.offset;
+    for (let axis = 0; axis < base.shape.length; axis++) {
+      const coord = Math.floor(remainder / baseStrides[axis]);
+      remainder -= coord * baseStrides[axis];
+      idx += coord * base.strides[axis];
+    }
+    out[i] = base.data[idx];
+  }
 
-  // Iterate over src and write each value to the corresponding position in base
   const srcSize = sizeOf(viewShape);
   const srcShapeStrides = computeStrides(viewShape);
 
   for (let linear = 0; linear < srcSize; linear++) {
-    // Convert linear index to coordinates in view shape
     let remainder = linear;
     let baseOffset = offset;
     for (let axis = 0; axis < viewShape.length; axis++) {
       const stride = srcShapeStrides[axis];
       const coord = Math.floor(remainder / stride);
       remainder -= coord * stride;
-      // Map to base using view strides
       baseOffset += coord * viewStrides[axis];
     }
 
-    // Read from src (handling src's own strides)
     const srcVal = readAtLinear(src, linear, srcShapeStrides);
-    out[baseOffset] = srcVal;
+    out[baseOffset] = combine(out[baseOffset], srcVal);
   }
 
   return new Tensor(base.shape, out, computeStrides(base.shape), 0);
 }
 
-/**
- * Add src values into base tensor at positions defined by view metadata.
- * Returns a new tensor (does not mutate base).
- */
+export function stridedScatterCopy(
+  base: Tensor,
+  src: Tensor,
+  options: StridedScatterOptions,
+): Tensor {
+  return stridedScatterImpl(
+    "stridedScatterCopy",
+    base,
+    src,
+    options,
+    (_, v) => v,
+  );
+}
+
 export function stridedScatterAdd(
   base: Tensor,
   src: Tensor,
   options: StridedScatterOptions,
 ): Tensor {
-  const { offset, viewShape, viewStrides } = options;
-
-  // Validate src shape matches view shape
-  if (src.shape.length !== viewShape.length) {
-    throw new Error(
-      `stridedScatterAdd: src rank ${src.shape.length} doesn't match view rank ${viewShape.length}`,
-    );
-  }
-  for (let i = 0; i < viewShape.length; i++) {
-    if (src.shape[i] !== viewShape[i]) {
-      throw new Error(
-        `stridedScatterAdd: src shape [${src.shape}] doesn't match view shape [${viewShape}]`,
-      );
-    }
-  }
-
-  // Clone base data (we don't mutate the original)
-  const out = new Float32Array(base.data.length);
-  out.set(base.data);
-
-  // Iterate over src and add each value to the corresponding position in base
-  const srcSize = sizeOf(viewShape);
-  const srcShapeStrides = computeStrides(viewShape);
-
-  for (let linear = 0; linear < srcSize; linear++) {
-    // Convert linear index to coordinates in view shape
-    let remainder = linear;
-    let baseOffset = offset;
-    for (let axis = 0; axis < viewShape.length; axis++) {
-      const stride = srcShapeStrides[axis];
-      const coord = Math.floor(remainder / stride);
-      remainder -= coord * stride;
-      // Map to base using view strides
-      baseOffset += coord * viewStrides[axis];
-    }
-
-    // Read from src (handling src's own strides)
-    const srcVal = readAtLinear(src, linear, srcShapeStrides);
-    out[baseOffset] += srcVal;
-  }
-
-  return new Tensor(base.shape, out, computeStrides(base.shape), 0);
+  return stridedScatterImpl(
+    "stridedScatterAdd",
+    base,
+    src,
+    options,
+    (e, v) => e + v,
+  );
 }
 
 export function mean(a: Tensor, options?: MeanOptions): Tensor {

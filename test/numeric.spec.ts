@@ -3,32 +3,27 @@ import {
   add,
   cpuBackend,
   gather,
-  getActiveBackend,
   matmul,
   mean,
-  mockBackend,
   mul,
-  ops,
-  RuntimeEngine,
-  RuntimeTensor,
   relu,
-  runtimeAdd,
-  runtimeCpu,
-  runtimeExpand,
-  runtimeMean,
-  runtimeRelu,
-  runtimeSub,
-  runtimeTensorFromArray,
-  runtimeTranspose,
   scatterAdd,
-  setBackend,
   sqrt,
   sub,
   sum,
   tensorFromArray,
   transpose,
+} from "../src/backend/cpu";
+import { mockBackend } from "../src/backend/mock";
+import {
+  getActiveBackend,
+  ops,
+  setBackend,
   withBackend,
-} from "../src";
+} from "../src/backend/registry";
+import { RuntimeEngine } from "../src/runtime/engine";
+import { Tensor as RuntimeTensor } from "../src/runtime/tensor";
+import { rt } from "./helpers/runtime";
 
 describe("numeric ring-2: add", () => {
   it("adds two tensors elementwise", () => {
@@ -243,44 +238,44 @@ describe("numeric ring-2: sum", () => {
   });
 
   it("creates new BaseIds for runtime ops", () => {
-    const a = runtimeTensorFromArray([1, 2], [2]);
-    const b = runtimeTensorFromArray([3, 4], [2]);
-    const out = runtimeAdd(a, b);
+    const a = rt.tensorFromArray([1, 2], [2]);
+    const b = rt.tensorFromArray([3, 4], [2]);
+    const out = rt.add(a, b);
     expect(out.baseId).not.toBe(a.baseId);
     expect(out.baseId).not.toBe(b.baseId);
   });
 
   it("preserves BaseId for runtime expand", async () => {
-    const a = runtimeTensorFromArray([1, 2, 3], [1, 3]);
-    const expanded = runtimeExpand(a, [2, 3]);
+    const a = rt.tensorFromArray([1, 2, 3], [1, 3]);
+    const expanded = rt.expand(a, [2, 3]);
 
     expect(expanded.baseId).toBe(a.baseId);
-    expect(await runtimeCpu(expanded)).toEqual([1, 2, 3, 1, 2, 3]);
+    expect(await rt.cpu(expanded)).toEqual([1, 2, 3, 1, 2, 3]);
   });
 
   it("exposes runtime sub/mean/relu helpers", async () => {
-    const a = runtimeTensorFromArray([5, 6], [2]);
-    const b = runtimeTensorFromArray([2, 4], [2]);
+    const a = rt.tensorFromArray([5, 6], [2]);
+    const b = rt.tensorFromArray([2, 4], [2]);
 
-    const subOut = runtimeSub(a, b);
-    expect(await runtimeCpu(subOut)).toEqual([3, 2]);
+    const subOut = rt.sub(a, b);
+    expect(await rt.cpu(subOut)).toEqual([3, 2]);
 
-    const reluOut = runtimeRelu(runtimeTensorFromArray([-1, 3], [2]));
-    expect(await runtimeCpu(reluOut)).toEqual([0, 3]);
+    const reluOut = rt.relu(rt.tensorFromArray([-1, 3], [2]));
+    expect(await rt.cpu(reluOut)).toEqual([0, 3]);
 
-    const meanOut = runtimeMean(a, { dim: 0 });
+    const meanOut = rt.mean(a, { dim: 0 });
     if (typeof meanOut === "number") {
       throw new Error("Expected mean to return a tensor");
     }
-    expect(await runtimeCpu(meanOut)).toEqual([5.5]);
+    expect(await rt.cpu(meanOut)).toEqual([5.5]);
   });
 
   it("preserves BaseId for runtime transpose", async () => {
-    const a = runtimeTensorFromArray([1, 2, 3, 4], [2, 2]);
-    const transposed = runtimeTranspose(a, { dim0: 0, dim1: 1 });
+    const a = rt.tensorFromArray([1, 2, 3, 4], [2, 2]);
+    const transposed = rt.transpose(a, { dim0: 0, dim1: 1 });
 
     expect(transposed.baseId).toBe(a.baseId);
-    expect(await runtimeCpu(transposed)).toEqual([1, 3, 2, 4]);
+    expect(await rt.cpu(transposed)).toEqual([1, 3, 2, 4]);
   });
 
   it("exposes RuntimeEngine view/reshape helpers", () => {

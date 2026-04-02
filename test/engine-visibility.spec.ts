@@ -5,23 +5,14 @@
  * memory usage, saved tensors, and base state.
  */
 
-import { describe, expect, it, beforeEach } from "vitest";
-import {
-  Engine,
-  type EngineMemoryStats,
-  type SavedTensorInfo,
-  type BaseStateInfo,
-  type MemoryStatsProvider,
-} from "../src/engine/engine";
-import { TraceRecorder } from "../src/engine/trace";
+import { beforeEach, describe, expect, it } from "vitest";
+import { type MemoryStatsProvider, RuntimeEngine } from "../src/runtime/engine";
 
 describe("Engine Visibility Tools", () => {
-  let engine: Engine;
-  let trace: TraceRecorder;
+  let engine: RuntimeEngine;
 
   beforeEach(() => {
-    trace = new TraceRecorder();
-    engine = new Engine(trace);
+    engine = new RuntimeEngine();
   });
 
   describe("Memory Stats", () => {
@@ -95,9 +86,9 @@ describe("Engine Visibility Tools", () => {
 
     it("tracks active bases and pin counts", () => {
       // Create some tensors
-      const tensor1 = engine.createTensor(1);
-      const tensor2 = engine.createTensor(2);
-      const tensor3 = engine.createTensor(1); // Same base as tensor1
+      const _tensor1 = engine.createTensor(1);
+      const _tensor2 = engine.createTensor(2);
+      const _tensor3 = engine.createTensor(1); // Same base as tensor1
 
       const stats = engine._debug_getMemoryStats();
 
@@ -107,7 +98,7 @@ describe("Engine Visibility Tools", () => {
 
     it("updates pin count when tensors are disposed", () => {
       const tensor1 = engine.createTensor(1);
-      const tensor2 = engine.createTensor(1);
+      const _tensor2 = engine.createTensor(1);
 
       let stats = engine._debug_getMemoryStats();
       expect(stats.totalPinCount).toBe(2);
@@ -125,7 +116,7 @@ describe("Engine Visibility Tools", () => {
 
       // Save a tensor
       const record1 = engine._debug_saveForBackward(1);
-      const record2 = engine._debug_saveForBackward(2);
+      const _record2 = engine._debug_saveForBackward(2);
 
       const savedTensors = engine._debug_getSavedTensorsInfo();
       expect(savedTensors).toHaveLength(2);
@@ -177,8 +168,8 @@ describe("Engine Visibility Tools", () => {
 
   describe("Base State Info", () => {
     it("returns base state information", () => {
-      const tensor1 = engine.createTensor(1);
-      const tensor2 = engine.createTensor(2);
+      const _tensor1 = engine.createTensor(1);
+      const _tensor2 = engine.createTensor(2);
 
       const baseStates = engine._debug_getBaseStatesInfo();
 
@@ -215,7 +206,7 @@ describe("Engine Visibility Tools", () => {
     });
 
     it("captures current stats in snapshot", () => {
-      const tensor = engine.createTensor(1);
+      const _tensor = engine.createTensor(1);
       engine._debug_saveForBackward(1);
 
       engine._debug_takeMemorySnapshot("with_tensor");
@@ -262,8 +253,8 @@ describe("Engine Visibility Tools", () => {
   describe("Integration with Tidy Scopes", () => {
     it("tracks tensors created in tidy scope", () => {
       engine.tidy(() => {
-        const t1 = engine.createTensor(1);
-        const t2 = engine.createTensor(2);
+        const _t1 = engine.createTensor(1);
+        const _t2 = engine.createTensor(2);
 
         const stats = engine._debug_getMemoryStats();
         expect(stats.activeBases).toBe(2);
@@ -279,9 +270,9 @@ describe("Engine Visibility Tools", () => {
     });
 
     it("tracks kept tensors that escape tidy", () => {
-      const escaped = engine.tidy(() => {
+      const _escaped = engine.tidy(() => {
         const t1 = engine.createTensor(1);
-        const t2 = engine.createTensor(2);
+        const _t2 = engine.createTensor(2);
         engine.keep(t1);
         return t1;
       });

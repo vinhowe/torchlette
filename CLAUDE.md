@@ -14,15 +14,9 @@ WebGPU is auto-detected at runtime. Use `TORCHLETTE_CPU_ONLY=1` to force CPU-onl
 
 For WebGPU backend changes, also run the relevant integration test (e.g. `npx tsx examples/gpt2/finetune-demo.ts` for training-related fixes).
 
-**Zero test failures policy.** There are currently no known test failures — all 1310 tests pass (2 skipped). Never accept test failures. If a test fails after your change, fix it before moving on. Do not skip, disable, or mark tests as expected-to-fail. If a test is genuinely flaky (e.g. GPU timing), investigate and fix the flakiness rather than ignoring it.
+**Zero test failures policy.** Currently 852 tests pass across 55 test files. Never accept test failures. Fix before moving on.
 
 **Important:** Any standalone script or tool that uses WebGPU (Dawn) must call `process.exit(0)` at the end of `main()`. Dawn holds background threads that prevent Node from exiting naturally.
-
-## Specification Documents
-
-- **Working Spec**: [torchlette-working-spec.md](torchlette-working-spec.md) - Full runtime semantics (v1.22)
-- **Testing Spec**: [torchlette-testing-spec.md](torchlette-testing-spec.md) - Test-driven development plan
-- **Refactoring Targets**: [refactoring-targets.md](refactoring-targets.md) - Identified cleanup opportunities
 
 ## Development Commands
 
@@ -31,517 +25,136 @@ npm run build          # Build the library
 npm run test           # Run all tests (CPU + GPU projects concurrently)
 npm run test:coverage  # Run all tests with Istanbul coverage
 npm run lint           # Run linter
+npm run test:webgpu    # WebGPU-specific tests (Node.js/Dawn)
+npm run test:browser   # Browser tests (Playwright)
 
-# WebGPU tests (auto-detected; skip with TORCHLETTE_CPU_ONLY=1)
-npm run test:webgpu                         # Node.js (Dawn)
-npm run test:browser                        # Browser (Playwright)
+# Profiling (V100)
+TORCHLETTE_PROFILE=1 npx tsx tools/profile-training.ts
+TORCHLETTE_MODEL=gpt2-medium TORCHLETTE_SEQ_LEN=512 TORCHLETTE_PROFILE=1 npx tsx tools/profile-training.ts
 
 # Benchmarks
 BENCH_WARMUP=3 BENCH_ITERS=7 npx tsx bench/matmul-comparison.ts
-npm run bench:browser  # Then open http://localhost:8080/bench/browser/
 ```
-
-## Profiling
-
-### GPU Profiling (per-op/per-module/per-phase GPU timing)
-
-```bash
-# Run with GPU timestamp queries enabled
-TORCHLETTE_PROFILE=1 npx tsx tools/profile-training.ts
-
-# Output: per-phase timing, per-module GPU timing, per-op kernel timing,
-# fusion stats, memory stats. Also writes JSON to /tmp/torchlette-profile-step4.json
-```
-
-### CPU Profiling (V8 CPU profiler with source-mapped attribution)
-
-```bash
-# Step 1: Bundle with esbuild (source maps needed for attribution)
-npx esbuild tools/profile-training.ts --bundle --platform=node --sourcemap \
-  --outfile=/tmp/profile-bundle.mjs --format=esm --external:webgpu
-
-# Step 2: Symlink model files (bundle runs from /tmp)
-ln -sfn "$(pwd)/models/distilgpt2" /tmp/models/distilgpt2
-
-# Step 3: Run with V8 CPU profiler + GPU profiling
-TORCHLETTE_PROFILE=1 node --cpu-prof --cpu-prof-dir=/tmp --cpu-prof-interval=100 \
-  /tmp/profile-bundle.mjs
-
-# Step 4: Analyze with source-map resolution (steady-state window: 70-95% of samples)
-node tools/analyze-cpu-profile.cjs /tmp/CPU.*.cpuprofile
-```
-
-The analyze script (`tools/analyze-cpu-profile.cjs`) uses `@jridgewell/trace-mapping` to map V8 sample positions back to original TypeScript source files/line numbers, and reports self-time percentages for the steady-state window.
-
-### Profile Analysis Guide
-
-Use `/profile` to run the profiler and produce a full report automatically. The report should cover:
-
-**Key metrics to extract from profiler output:**
-
-1. **Wall clock** — Per-step timings from the WALL CLOCK SUMMARY table. Steady-state = step 4 (steps 0-2 have compilation/pool warmup). Step 0 is pipeline warmup (expect 100x+ slower). Breakdown: forward, backward, optimizer, cleanup as % of total.
-
-2. **GPU time budget** — From the Phase table (`Phase | Ops | CPU(ms) | GPU(ms)`). Sum GPU(ms) across forward+backward+cleanup for total GPU time. At 512 tokens the workload is GPU-bound (145ms GPU vs 54ms CPU dispatch). At 31 tokens it was CPU-dispatch-bound (~85% utilization).
-
-3. **Top GPU kernels** — From `GPU Kernel Time` table. Rank by Total(ms). At 512 tokens: `matmul` (24.8ms, 38.8%), `matmul++cast+bias+binary` (9.1ms, 14.2%), `fusedAttentionBackward` (5.4ms, 8.4%), `adamStep` (4.8ms, 7.5%), `matmul++cast+bias+unary+cast` (4.0ms, 6.3%), `matmul++cast+bias` (3.6ms, 5.6%), `fusedAttentionForward` (2.5ms, 3.9%), `matmul++bias` (2.2ms, 3.4%).
-
-4. **Cross-entropy** — Fused kernel implemented. 1.1ms/1.1% of GPU time at 512 tokens. No longer a bottleneck.
-
-5. **CPU dispatch overhead** — From `CPU API Call` table. Bind group cache at 100.0% (0 misses). 10 submits/step.
-
-6. **Fusion rate** — From Plan Analysis. Total: 1124 nodes, 183 fused (16.3%), 20 fusion groups, 645 sequential. Note: fused LayerNorm/cross-entropy/attention ops replace many decomposed ops each, so effective fusion is higher than the raw percentage.
-
-7. **Memory** — From Memory Stats section. Track: current/peak MB, buffer pool reuse rate. At 512 tokens: 4871MB current, 6194MB peak, pool reuse 56.8%, 1 new alloc/step steady-state.
-
-8. **Leak status** — From MEMORY LEAK REPORT. Storages and reachable should stabilize. PendingDestroy should not grow. CurrentMB should not monotonically increase. "LEAK STATUS: OK" = pass.
-
-**When to update baselines:** If steady-state ms/step drifts >10% from the value in "Remaining Performance Optimizations", or if a bottleneck's % share changes significantly, update CLAUDE.md.
 
 ## Project Structure
 
-- `src/` - Source code
-  - `backend/webgpu/` - WebGPU backend
-  - `backend/webgpu/matmul/` - Tiled matmul with autotuning
-  - `engine/` - Tensor engine core
-  - `frontend/` - User-facing API
-- `test/` - Test suites
-- `bench/` - Benchmarks
+- `src/backend/webgpu/` - WebGPU backend (dispatch, buffer pool, pipeline warmup)
+  - `ops/` - Op implementations (elementwise, reductions, views, fused kernels, registry)
+  - `matmul/` - Tiled matmul with shape-class tuning and K-split
+  - `tile-*.ts` - Tile-IR compiler (IR, lowering, compiler, ops, dispatch)
+- `src/engine/` - Tensor engine core (lazy execution, graph compiler, fusion, plan building)
+- `src/frontend/` - User-facing API (table-driven ops, autograd, autocast, noGrad)
+  - `custom-backward.ts` - Extracted backward functions (matmul, linear, gelu) with BackwardContext
+- `src/runtime/` - RuntimeEngine (lazy IR node creation, dtype rules, table-driven ops)
+- `src/nn/` - Module system (auto parameters, linear, embedding, layernorm, init, grad clipping)
+- `src/optim/` - Optimizers (Adam/AdamW with fused GPU kernel, SGD, GradScaler, LR schedulers, parameter groups)
+- `test/` - 55 test files, 852 tests
+- `examples/gpt2/` - GPT-2 model, loader, tokenizer, finetune demo
+- `tools/profile-training.ts` - GPU training profiler (supports distilgpt2, gpt2, gpt2-medium)
 
-## Current Implementation Status
-
-### Engine Core (src/engine/) - COMPLETE
-- Token algebra with afterAll, join rule (§3 of spec)
-- Version tracking: locLogicalVersion, locVersion, baseCommitVersion
-- Plan building with deterministic linearization (PlanLinearOrder)
-- markStep() with token reset, loc finalization
-- Execution lock for non-reentrancy
-- RNG system with keyed randomness, checkpoint replay (§11)
-- Checkpoint infrastructure with purity fences (§10)
-- **Lazy execution** (src/engine/lazy.ts, src/runtime/engine.ts):
-  - LazyRef/LazyIRNode types for pending computations
-  - buildPlan() for topological ordering
-  - executePlan() for backend dispatch
-  - RuntimeEngine ops create LazyIRNodes (deferred execution)
-  - Force boundaries: cpu(), item(), markStep()
-- **Compiled region caching** (src/engine/compile-cache.ts):
-  - Normalized IR structural hashing (§8.2)
-  - Cache key: IR hash + input signatures (shapes/dtypes)
-  - LRU eviction with configurable max size
-  - Cache hit tracking for diagnostics
-- **Advanced compiled region features** (src/engine/compiled-region.ts):
-  - Arg alias groups (§8.3): Track aliased input arguments
-  - StateIfaceSig (§8.4): Ordered state access signatures
-  - State-slot alias patterns (§8.5): Bind-time alias tracking
-  - Auto-externalize (§8.7): SSA to pending_loc conversion
-  - Null-state sentinels (§8.8): Stable missing state representation
-  - Functionalization (§8.10): In-place to out-of-place conversion
-  - Region-exit persistence (§8.11): Commit and writeback tracking
-- **IR optimization** (src/engine/ir-optimize.ts):
-  - CSE with RNG exclusion (§15): Random ops never merged
-  - Dead code elimination: Removes unreachable nodes
-  - tok_after analysis (§15): Redundant load detection
-- **§15 Integration** (src/engine/lazy-to-ir.ts, src/engine/fusion-detect.ts):
-  - Lazy plan to IR conversion: Convert LazyIRNode graphs to IRGraph
-  - Fusion group detection: Identify consecutive elementwise ops
-  - Optimized execution: `executePlanOptimized()` with automatic fusion
-  - RuntimeEngine integration: `enableFusion` option for opt-in fusion
-  - Segmented execution: Mix fused and sequential execution for non-fusible ops
-- **Memory planning** (src/engine/memory-planning.ts, src/engine/memory-planned-executor.ts) - COMPLETE:
-  - In-flight plan strong rooting (§14): Plans hold refs to all touched tensors
-  - Allocator fencing: Track GPU completion before buffer reuse
-  - Lifetime analysis: Determine when tensors can be freed
-  - Memory donation: Reuse input buffers for outputs when safe
-  - Buffer pooling: Pre-allocate and reuse buffers by size class
-  - RuntimeEngine integration: `enableMemoryPlanning` option for opt-in buffer pooling
-  - GPU buffer pool (src/backend/webgpu/buffer-pool.ts): WebGPU-specific buffer management
-- **Cross-device execution** (src/engine/cross-device.ts, §13):
-  - Lazy transfer op: `tensor.to(device)` defers transfer until forced
-  - Transfer path resolution: Determines optimal route (via_cpu, direct, noop)
-  - Multi-device graph analysis: Detects cross-device ops and transfer points
-  - Auto-transfer support: `ensureSameDevice()` for ops with mixed device inputs
-  - Transfer statistics: Track bytes transferred and paths used
-
-### Frontend API (src/frontend/) - COMPLETE
-- Tensor class with full PyTorch-like API
-- tidy/keep/dispose lifecycle management
-- Autograd with async backward pass, saved-for-backward
-- Gradient accumulation and version checking
-- Lazy execution integrated: ops return immediately, force at cpu()/item()
-
-### Backends (src/backend/)
-- **CPU**: Full reference implementation of all ops
-- **WebGPU**: Optimized tiled matmul with:
-  - Shared memory tiling (32x32, 64x64, etc.)
-  - Subgroup acceleration (when hardware supports)
-  - f16/f32 mixed precision
-  - ND batched broadcasting
-  - Epilogue fusion (bias, relu, gelu, silu)
-  - Runtime autotuning
-
-### Fused Kernel Generation (src/backend/webgpu/fusion-*.ts) - COMPLETE
-- **Expression-based SSA codegen**: Single source of truth for op → WGSL expression mapping
-- **Elementwise fusion**: Arbitrary chains of unary/binary ops fused into single kernel
-- **Broadcasting support**: Automatic broadcast index calculation for mixed shapes
-- **Kernel caching**: LRU cache for compiled pipelines by recipe signature
-- **Supported ops**: relu, gelu, silu, sigmoid, tanh, neg, abs, exp, log, sqrt, add, sub, mul, div, pow, min, max, comparisons, casts
-
-### Test Coverage - 51 spec files, 758 tests (756 passing, 2 skipped)
-- tokens.spec.ts, versioning.spec.ts, planning.spec.ts
-- checkpoint.spec.ts, rng.spec.ts, exec-lock.spec.ts
-- lifecycle.spec.ts, backward.spec.ts, compile.spec.ts
-- compile-cache.spec.ts, compiled-region.spec.ts, ir-optimize.spec.ts, compile-fusion-integration.spec.ts
-- memory-planning.spec.ts, memory-planning-integration.spec.ts, cross-device.spec.ts
-- amp.spec.ts, frontend-amp.spec.ts, amp-ir-transform.spec.ts, amp-compile-integration.spec.ts
-- webgpu/matmul-*.spec.ts, webgpu/cross-device-transfer.spec.ts, webgpu/fusion-codegen.spec.ts
-- oracle/*.spec.ts, etc.
-
-### AMP inside compile (§12) - COMPLETE
-- **src/engine/amp.ts**: AMPPolicy, AutocastContext, F16/F32 eligible ops, select-gated commit helpers
-- **src/engine/amp-ir-transform.ts**: IR graph transformation for automatic dtype casting
-- **src/frontend.ts**: `autocast()` and `autocastAsync()` methods for frontend usage
-- **src/engine/engine.ts**: AMP transforms applied during compile staging, cache key includes AMP policy hash
-- **src/optim/grad-scaler.ts**: GradScaler for gradient scaling with NaN/Inf detection and dynamic rescaling
-
-## Detailed Spec Compliance (v1.22)
-
-### §0 Goals and Invariants - IMPLEMENTED
-- ✅ Global laziness
-- ✅ Explicit optimization boundary (fusion only in compiled regions)
-- ✅ tidy/keep/dispose lifecycle
-- ✅ PyTorch-like mutation/view semantics
-- ✅ Lazy backward
-- ✅ Keyed RNG
-- ✅ Compilation caching
-- ✅ Engine execution lock
-
-### §1 Runtime Surface API - IMPLEMENTED
-- ✅ `1.1` BaseId identity model
-- ✅ `1.2` Laziness and materialization
-- ✅ `1.3` Host coercion traps (`TensorHostCoercionError`)
-- ✅ `1.4` tidy/keep/dispose + FinalizationRegistry (`finalizeQueue`)
-- ✅ `1.5` retainGrad
-- ✅ `1.6` compile() staging
-- ✅ `1.7` markStep()
-
-### §2 Core Data Types - PARTIAL (divergences noted)
-- ✅ `2.1` DType, DeviceKind
-- ⚠️ `2.2` BaseEntry - uses `number` instead of spec's `bigint` for versions
-- ⚠️ `2.3` ViewMeta - simplified, no `offsetBytes`/`stridesBytes` structure
-- ⚠️ `2.4` LocEntry - 2 roles (`ephemeral`|`persistent`) vs spec's 6 roles
-- ⚠️ `2.4` Tombstone - not implemented (simpler disposal model)
-- ✅ `2.5` Tensor object (mostly matches)
-- ✅ `2.6` Graph IR
-
-### §3 Effects, Tokens, External State - IMPLEMENTED
-- ✅ `3.1` Token algebra (afterAll, tok_after)
-- ✅ `3.2` tokGlobal/tokLoc threading
-- ✅ `3.3` Join rule
-- ✅ `3.4` Deterministic plan linearization (EventKey, PlanLinearOrder)
-- ✅ `3.5` Token-order commit semantics
-- ✅ `3.6` loc_load/loc_store/base_commit
-- ✅ `3.7` pending-loc initTok
-
-### §4 Alias Model, Views, Mutation - IMPLEMENTED
-- ✅ `4.1` BaseId propagation
-- ✅ `4.2` Representable views - WebGPU has strides/offset/isContiguous, CPU tracks strides
-- ✅ `4.3` In-place mutation + base_commit (copy_, add_, zero_, fill_, mul_)
-- ✅ `4.4` View mutation lowering - stridedScatterCopy/stridedScatterAdd ops
-
-### §5 Caching, Freshness, Versioning - IMPLEMENTED
-- ✅ Version tracking for cache guards
-
-### §6 markStep() Semantics - IMPLEMENTED
-- ✅ `6.1-6.6` All steps (force, compaction, finalize, retention, GC, reset)
-- ✅ `6.7` Poisoning (poisoned engine throws on further ops)
-- ✅ `6.8` Execution lock + drainFinalizeQueueCleanupOnly
-
-### §7 Optimization Boundary - IMPLEMENTED
-- ✅ No fusion outside compile regions
-
-### §8 Compiled Regions - IMPLEMENTED
-- ✅ `8.1` Deterministic staging
-- ✅ `8.2` Cache keys + scalar canonicalization (§8.2.1)
-- ✅ `8.3` Alias groups
-- ✅ `8.4` StateIfaceSig
-- ✅ `8.5` State-slot alias patterns
-- ✅ `8.6` Token ABI reconciliation
-- ✅ `8.6.0` SemanticSubeventSchedule
-- ✅ `8.7` Auto-externalize
-- ✅ `8.8` Null-state sentinels
-- ✅ `8.10` Functionalization
-- ✅ `8.11` Region-exit persistence
-
-### §9 Autograd - IMPLEMENTED
-- ✅ `9.1` Lazy backward (rooted under tokGlobal)
-- ✅ `9.2` Two autograd modes
-- ✅ `9.3` Saved-for-backward + commit guards
-- ✅ `9.4-9.8` Leaf grads, zeroGrad, retainGrad, multiple backward, saved_state
-
-### §10 Checkpointing - IMPLEMENTED
-- ✅ Whole-body replay
-- ✅ Purity fence (no persistent writes during recompute)
-- ✅ Pending-loc init rule during recompute
-
-### §11 RNG - IMPLEMENTED
-- ✅ Keyed RNG (algorithmId + seed + drawNonce + opNonce)
-- ✅ Draw nonces
-- ✅ Checkpoint RNG replay (no double-advance)
-
-### §12 AMP - IMPLEMENTED
-- ✅ AMP transforms inside compile
-- ✅ Select-gated commits
-- ✅ GradScaler with NaN/Inf detection and dynamic rescaling
-
-### §13 Cross-device - IMPLEMENTED
-- ✅ Lazy transfers
-- ✅ Transfer path resolution
-
-### §14 Memory Planning - IMPLEMENTED
-- ✅ Buffer pooling
-- ✅ Allocator fencing
-- ✅ In-flight plan retention
-
-### §15 IR Optimization + Fusion - COMPLETE
-- ✅ `15.1` Elementwise fusion (single-output) - IMPLEMENTED
-- ✅ `15.2` Multi-output fusion - IMPLEMENTED (multiple output bindings, shared subexpression detection)
-- ✅ `15.3` Memory coalescing/vectorization - IMPLEMENTED (vec4/vec2 loads/stores, automatic width selection)
-- ✅ `15.4` Random ops non-fusible
-
-### Summary
+## Spec Compliance Summary
 
 | Category | Status |
 |----------|--------|
-| Core engine semantics (§1, §3, §6) | ✅ Implemented |
-| Token algebra & planning | ✅ Implemented |
-| Compiled regions (§8) | ✅ Implemented |
-| Autograd (§9) | ✅ Implemented |
-| Checkpointing (§10) | ✅ Implemented |
-| RNG (§11) | ✅ Implemented |
-| AMP (§12) | ✅ Implemented |
-| Cross-device (§13) | ✅ Implemented |
-| Memory planning (§14) | ✅ Implemented |
-| Elementwise fusion (§15.1) | ✅ Implemented |
-| Multi-output fusion (§15.2) | ✅ Implemented |
-| Memory coalescing (§15.3) | ✅ Implemented |
+| Core engine semantics (§1, §3, §6) | Implemented |
+| Token algebra & planning | Implemented |
+| Compiled regions (§8) | Partial (caching only; §8.3-8.11 removed) |
+| Autograd (§9) | Implemented |
+| Checkpointing (§10) | Implemented |
+| RNG (§11) | Implemented |
+| AMP (§12) | Implemented |
+| Cross-device (§13) | Removed (unused) |
+| Memory planning (§14) | Removed (replaced by arena + pool) |
+| Elementwise fusion (§15.1-15.3) | Implemented |
 
-### Known Divergences from Spec
+Known divergences: `number` not `bigint` for versions, 2 LocRoles not 6, no tombstones.
 
-These are intentional simplifications, not bugs:
+## Step-Scoped Storage Cleanup
 
-1. **Version types**: Spec uses `bigint`, implementation uses `number` - functionally equivalent for realistic workloads
-2. **LocRole granularity**: Spec has 6 roles (`tensor_state`, `grad_state`, `rng_state`, `engine_state`, `saved_state`, `internal_scratch`), implementation has 2 (`ephemeral`, `persistent`)
-3. **Tombstone types**: Not implemented - disposal uses simpler model
+GPU memory is managed deterministically via two-tier reachability — no GC dependency.
 
-### WebGPU Op Limitations vs PyTorch
+**At `beginStep()`**: all pending tensors are forced (materializes model weights on first call), then `snapshotForStep()` captures which RuntimeTensor objects are alive. These are "persistent" (model params, optimizer state).
 
-Current implementations have the following limitations compared to PyTorch:
+**At `markStep()`**: after normal `destroyUnreachable()`, `destroyStepScoped()` demotes any reachable storage whose RuntimeTensor was NOT in the snapshot (created during the step as a temporary). This gives flat memory without depending on JavaScript GC timing.
 
-#### Op-Specific Limitations
+**Adam m/v lifecycle**: The fused Adam kernel writes m/v to SEPARATE output buffers (not in-place). This means old and new m/v have independent buffer lifecycles. Adam uses `_updateLazyRef(createPendingRef(adamNode, outputIndex))` for m/v — the existing multi-output `outputIndex` infrastructure handles materialization automatically via `materializePendingTensors`. No protect/unprotect needed.
 
-| Op | Current | PyTorch | Gap |
-|----|---------|---------|-----|
-| **transpose** | ✅ Returns view (no copy) | Returns view (no copy) | Parity achieved |
-| **permute** | ✅ Returns view (no copy) | Returns view (no copy) | Parity achieved |
-| **expand** | ✅ Returns view (stride=0 for broadcast) | Returns view (no copy) | Parity achieved |
-| **contiguous** | ✅ Materializes strided tensor | Materializes non-contiguous | Parity achieved |
-| **sum** | ✅ Returns 0-d tensor for full reduction | Returns 0-d tensor | Parity achieved |
-| **mean** | ✅ Returns 0-d tensor for full reduction | Has `correction` param (ddof) | Missing correction/ddof parameter |
-| **item()** | ✅ Async scalar extraction | Sync scalar extraction | Async due to GPU readback |
-| **gather** | ✅ Basic + autograd | Has `sparse_grad`, `out` param | Missing sparse_grad optimization |
-| **scatterAdd** | ✅ Basic + autograd | Uses atomics for correctness | No f32 atomics; overlapping indices undefined |
+**Key invariant**: tensors created via public API (`tensorFromArray`, `zeros`, etc.) persist across steps because they're held by user code → in the snapshot. Tensors created by autograd-wrapped ops (activations, views, gradients) are step-scoped → cleaned up deterministically at markStep.
 
-#### View Memory Aliasing (Implemented)
+## Op Dispatch Architecture
 
-WebGPU tensors now support strided views:
-- **WebGPUTensor** has `strides`, `offset`, and `isContiguous` fields
-- **transpose()** returns a view sharing the same buffer (no data copy)
-- **permute()** returns a view with reordered dimensions (no data copy)
-- **expand()** returns a view with stride=0 for broadcast dimensions (no data copy)
-- **contiguous()** materializes non-contiguous tensors to new buffer
-- **read()** automatically materializes non-contiguous tensors before readback
+**Table-driven ops**: Simple unary ops (relu, exp, sqrt, etc.), binary ops (add, mul, pow), comparison ops (gt, lt, etc.), reduction ops (sum, max, min, mean), and arg-reduce ops (argmax, argmin) are all table-driven via interface augmentation + prototype loop at the bottom of their respective files. This preserves TypeScript autocomplete while eliminating boilerplate.
 
-#### Strided Elementwise Kernels (Implemented)
+**Custom backward extraction**: Complex backward functions (matmul, linear, gelu tanh, gelu erf) are extracted to `src/frontend/custom-backward.ts` with a `BackwardContext` interface. The frontend methods become thin dispatch stubs. Add new custom backward functions to this file following the same pattern.
 
-Binary and unary ops now work directly on strided (non-contiguous) tensors:
-- **Binary ops** (add, sub, mul, div) use `computeEffectiveBroadcastStrides()` to handle non-contiguous inputs
-- **Unary ops** (sqrt, relu, etc.) use `unaryStridedShader()` to read strided input
-- **No materialization needed** - operations on transposed/expanded views work without calling `contiguous()` first
-- **Chained views** - transpose + expand + binary op chains work correctly
-
-#### Dtype Support (Implemented)
-
-WebGPU backend supports multiple dtypes for elementwise ops:
-- **Supported dtypes**: f32 (default), f16 (requires device support), i32, u32
-- **WebGPUTensor** has `dtype` field tracking element type
-- **tensorFromArrayWithDtype()** creates typed tensors: `tensorFromArrayWithDtype([1, 2, 3], [3], "i32")`
-- **Binary ops** (add, sub, mul, div) work on all supported dtypes
-- **View ops** (reshape, transpose, expand, permute) preserve dtype
-- **Dtype mismatch throws** - mixing dtypes in binary ops is not allowed
-- **f16 support**: Requires `shader-f16` device feature; use `isF16Supported()` to check availability
-
-```typescript
-import { tensorFromArrayWithDtype, initWebGPU, webgpuBackend, isF16Supported } from "torchlette/backend/webgpu";
-
-await initWebGPU();
-
-// Integer tensors
-const a = tensorFromArrayWithDtype([1, 2, 3, 4], [2, 2], "i32");
-const b = tensorFromArrayWithDtype([10, 20, 30, 40], [2, 2], "i32");
-const result = webgpuBackend.ops.add(a, b);  // [11, 22, 33, 44] as i32
-
-// Half-precision tensors (requires shader-f16)
-if (isF16Supported()) {
-  const x = tensorFromArrayWithDtype([1.0, 2.0, 3.0, 4.0], [2, 2], "f16");
-  const y = tensorFromArrayWithDtype([0.5, 1.5, 2.5, 3.5], [2, 2], "f16");
-  const z = webgpuBackend.ops.add(x, y);  // [1.5, 3.5, 5.5, 7.5] as f16
-}
-```
-
-#### 0-d Tensors (Scalars)
-
-Full reductions now return 0-d tensors (shape `[]`) like PyTorch:
-- **sum()** without dim returns 0-d tensor with the total sum
-- **mean()** without dim returns 0-d tensor with the mean
-- **item()** extracts the scalar value asynchronously: `const value = await tensor.sum().item()`
-- 0-d tensors can be expanded to any shape for broadcasting
-
-```typescript
-// PyTorch-like scalar handling
-const loss = output.sum();           // 0-d tensor (shape [])
-const value = await loss.item();     // JavaScript number
-```
-
-#### Architectural Limitations
-
-1. **f16 device support** - f16 dtype requires the `shader-f16` WebGPU device feature. Not all GPUs/browsers support this. Use `isF16Supported()` to check availability at runtime.
-
-2. **scatterAdd correctness** - WebGPU lacks f32 atomics. Concurrent writes to same output index produce undefined results. Works correctly only when indices don't overlap.
-
-#### Missing Ops for PyTorch Parity
-
-```
-Medium Priority:
-- scatter_reduce(mode)              # reduce modes: sum, prod, mean, max, min
-- dtype parameter on reductions     # sum(..., dtype='f16')
-- negative dim in expand (-1)       # keep dimension unchanged
-- sparse_grad for gather            # gradient sparsity optimization
-
-Lower Priority:
-- index_select                      # simpler than gather for 1D indices
-- index_add / index_copy            # variants of scatter
-- clamp / clip                      # bounds clamping
-```
-
-#### Autograd Coverage
-
-| Op | Forward | Backward | Notes |
-|----|---------|----------|-------|
-| add/sub/mul/div | ✅ | ✅ | Full support |
-| matmul | ✅ | ✅ | Full support |
-| linear | ✅ | ✅ | Custom backward: dW = dY.T @ X (no transpose) |
-| relu | ✅ | ✅ | Full support |
-| sqrt | ✅ | ✅ | Full support |
-| sum | ✅ | ✅ | Via frontend |
-| mean | ✅ | ✅ | Via frontend |
-| expand | ✅ | ✅ | Via frontend (sumToShape) |
-| transpose | ✅ | ✅ | Inverse transpose |
-| permute | ✅ | ✅ | Inverse permutation |
-| gather | ✅ | ✅ | Uses scatterAdd |
-| scatterAdd | ✅ | ✅ | Uses gather for src grad |
-| where | ✅ | ✅ | Conditional select |
-
-#### In-place Operations (§4.3-4.4)
-
-| Op | Description |
-|----|-------------|
-| copy_(src) | Copy values from src into tensor |
-| add_(src) | Add src values in-place |
-| zero_() | Set all values to zero |
-| fill_(value) | Fill with scalar value |
-| mul_(value) | Multiply by scalar in-place |
+**Gradient specs**: Simple ops (elementwise) define gradients in `src/ops/registry.ts` (UnaryGradFn, BinaryTTGradFn, BinaryTSGradFn). Complex ops define gradients in `custom-backward.ts`. Don't add complex backward logic to `torchlette.ts`.
 
 ## WebGPU Buffer Pool Invariants
 
-**Buffer recycling must align with encoder scope boundaries.**
-
-The buffer pool has a `pendingRelease` queue: when a tensor is destroyed, its buffer goes to `pendingRelease` rather than immediately back to the main pool. Buffers are moved from `pendingRelease` to the main pool (making them acquirable) only at `endSharedEncoder()` — the end of a step's encoder scope.
-
-**Do NOT flush `pendingRelease` to pool mid-step** (i.e., inside `flushSharedEncoder()`). This was attempted for intra-step buffer reclamation and causes deterministic numerical corruption. The corruption manifests as ~2% loss drift (e.g., step 1 loss 6.25 vs expected 6.12 on DistilGPT-2).
-
-Why: Within a step, multiple plan executions share the same encoder scope (forward, backward, optimizer). Buffers released by earlier plans (e.g., forward-pass intermediates) may be in `pendingRelease` while the GPU is still reading them from a previously submitted command buffer. Flushing them to pool mid-step allows a later op to acquire and write to a buffer the GPU hasn't finished reading. Neither CPU-side lifetime analysis, active-tensor-registry checks, nor `queue.onSubmittedWorkDone()` prevents this — the root cause is structural to how WebGPU command buffer scoping interacts with buffer pool recycling.
+**Do NOT flush `pendingRelease` to pool mid-step.** Causes deterministic numerical corruption (~2% loss drift). Root cause: buffers released by earlier plans may still be read by GPU from a prior command buffer.
 
 **Safe reclamation patterns:**
-- End-of-step flush (`endSharedEncoder()` → `flushPendingToAvailable()`) — buffers available next step
-- Periodic reclamation between plan segments (`flushSharedEncoder()` + `flushBufferPool()` as separate calls between segments) — works because each segment's encoder is fully submitted before the next segment begins
-- Intra-segment periodic reclamation (every 25 nodes in `executeSequentialSegmentWithEarlyRelease`) — same mechanism, `flushSharedEncoder()` submits then `flushBufferPool()` moves pending→pool. Safe because subsequent dispatches encode on a fresh encoder and WebGPU queue ordering guarantees prior work completes first
-- The `sharedEncoderWriteSet` WAW check in `createTrackedBuffer` is orthogonal and must be kept — it prevents write-after-write hazards within a single encoder
+- End-of-step flush (`endSharedEncoder()` → `flushPendingToAvailable()`)
+- Periodic reclamation between plan segments (flush + pool flush as separate calls)
+- The `sharedEncoderWriteSet` WAW check must be kept
 
-## Remaining Performance Optimizations
+## Performance Baselines (2026-03-25)
 
-Profiled on DistilGPT-2 training. Two baseline configurations:
+### Baseline A: DistilGPT-2, 512 tokens, Node/Dawn (V100)
+Steady-state ~213ms/step wall clock. Memory: 1645MB steady, zero leak. Pool reuse 68%. 525 dispatches/step. Top GPU: matmul 40ms (61%), fusedAttentionBwd 5.7ms, adamStep 3.2ms (8 dispatches, packed). Fusion: 15.7% forward, 7.3% backward (limited by V100's 10 storage buffer limit).
 
-### Baseline A: 31 tokens (original)
-Steady-state ~32ms/step with dispatch replay, 24ms GPU, ~85% GPU utilization. CPU-dispatch-bound.
+### Baseline B: DistilGPT-2, 128 tokens, Browser/Chrome (V100)
+**LoRA:** ~1050 tok/s peak, ~800 steady (GC degradation). fwd=5ms, bwd=80ms. Uses fused LayerNorm, Embedding, Linear, scaledDotProductAttention, api.linear(). Selective checkpointing (MLP-only). GPU-only gradient clipping (no CPU readback). Staging buffer loss readback overlaps with backward.
 
-### Baseline B: 512 tokens (current default)
-Steady-state ~49ms/step wall clock (profiler step 4, lowered plan cached, no replay). GPU: ~64ms total. Top GPU kernels: `matmul` 24.8ms (38.8%), `matmul++cast+bias+binary` 9.1ms (14.2%), `fusedAttentionBackward` 5.4ms (8.4%), `adamStep` 4.8ms (7.5%), `matmul++cast+bias+unary+cast` 4.0ms (6.3%), `matmul++cast+bias` 3.6ms (5.6%), `fusedAttentionForward` 2.5ms (3.9%), `matmul++bias` 2.2ms (3.4%). Cross-entropy fwd+bwd 1.1ms (1.7%). Bind group cache 100.0% (0 misses). 10 submits/step. Fusion: 1156 nodes, 183 fused (15.8%), 20 groups. Memory: 5489MB current / 5489MB peak / 32GB limit. Pool reuse 52.1%. 1 new alloc/step. Leak status: OK (storages +0.0/step).
+**Full FT:** ~308 tok/s peak, ~160 steady (GC degradation). fwd=80ms, bwd=171ms. No CPU fences in training loop — all computation stays lazy on GPU. Fence awaited in markStep for honest phase timing.
 
-Targets ranked by impact:
+**Progressive slowdown:** Reduced from 50%/200 steps to 20%/1000 steps by eliminating RuntimeTensor wrappers for in-place op intermediates (mul_, zero_, fill_). Remaining ~0.8 RT/step from autograd-escaped forward tensors — GC-eligible but V8 collects slowly. GPU storage flat at 292.
 
-**Completed optimizations:**
-1. ~~**Intra-plan buffer reclamation**~~ — DONE. `createBuffer` avg cost dropped 365µs→81µs.
-2. ~~**In-place Adam kernel**~~ — DONE. adam.allocBufs 112ms→12ms, opt phase 162ms→1ms.
-3. ~~**Fused cross-entropy kernel**~~ — DONE. 0.4ms GPU (was 34ms). Single-pass `log_softmax+nll_loss` kernel.
-4. ~~**Adam batch submission**~~ — DONE. Submits dropped 168→121/step. Adam pre/post-flush eliminated. `queue.submit` cost 52ms→13ms.
-5. ~~**Buffer pool reclamation**~~ — DONE. Intra-segment periodic reclaim (every 25 nodes). `createBuffer` cost 92ms→66ms. Backward pass 163ms→124ms.
-6. ~~**Window-based buffer reservation**~~ — DONE. Empirical per-window demand recording computes exact per-size-class pool reservation. `createBuffer` 66ms→0.7ms (1 alloc/step). Pool reuse 59%→99.9%. Unlimited pool budget (PyTorch-like). Configurable via `setBufferPoolBudget()` or `TORCHLETTE_POOL_BUDGET_MB` env var.
-7. ~~**Adam ensureContig**~~ — DONE. 43ms→2ms/step. Params contiguous after first step.
-8. ~~**Params writeBuffer skip**~~ — DONE. Params data cached; identical data skips `writeBuffer`. 710→83 calls/step, 8.8ms→1.0ms. ~7.8ms saved.
-9. ~~**Params array pooling**~~ — DONE. Pre-allocated `Uint32Array` pool for 1-8 word params. Eliminates ~700 short-lived allocations/step.
-10. ~~**Output buffer pre-pinning**~~ — DONE. Pre-extract hinted output buffers from pool at step start. 296/454 buffers pinned (65%). Eliminates contention in pool acquire. Marginal bind group cache improvement (22% vs 21%).
-11. ~~**Pool acquire writeSet removal**~~ — DONE. WriteSet check in `acquire()` and `acquirePreferred()` was unreachable (pool buffers can't be in writeSet). Removed scan loop, `pop()` used directly.
+### Baseline C: GPT-2 Medium, 512 tokens, Node/Dawn (V100)
+Steady-state ~162ms/step wall clock. Memory: 14.7GB steady, zero leak. Pool reuse 58%. 741/4449 nodes fused (16.7%). Top GPU: bare matmul 125ms (bwd), epilogue matmul ~49ms (fwd) + ~47ms (bwd), fusedAttentionBwd 22.5ms, adamStep 14.3ms (14 dispatches, packed). GPU is 81% matmul.
 
-12. ~~**Per-lowered-plan buffer arena**~~ — DONE. Each cached lowered plan gets its own buffer arena: persistent GPUBuffers never returned to pool. `resolveOutputBuffer` and `allocateOutputBuffer` return arena buffers during lowered plan execution. Bind group cache hit rate 22%→63.3%. `createBindGroup` cost 20ms→11ms (259 calls vs ~700). ~9ms/step saved. Arena check in pool's `deferredDestroy` prevents arena buffer destruction from any call site. Disable with `TORCHLETTE_USE_ARENA=0`.
-13. ~~**Matmul outputs through arena**~~ — DONE. `dispatchMatmul` and `dispatchMatmulWithEpilogue` now use `resolveOutputBuffer` instead of `createTrackedBuffer`, routing matmul outputs through the arena. Bind group cache 63.3%→75.3% (531 hits / 174 misses). `createBindGroup` 11ms→9.5ms (259→174 calls). ~1.5ms/step saved.
-14. ~~**FusionGroup external input caching**~~ — DONE. Cached `(nodeLocalIdx, inputIdx)` pattern on first lowered-plan execution. Subsequent steps skip O(n²) dedup across 119 fusion groups, using O(n) cached pattern lookup instead.
-15. ~~**Matmul epilogue label caching**~~ — DONE. Label string (`matmul+prologue+cast+bias` etc.) computed once and cached on `LoweredMatmulEpilogueAction`. Skips string construction for ~30 matmul dispatches/step.
-16. ~~**Fused LayerNorm forward kernel**~~ — DONE. Single WGSL kernel per LayerNorm instance (was 9 ops: 2 reductions + 7 elementwise). 13 instances in DistilGPT-2. `mean` dispatches reduced 106→54. Forward GPU time reduced. ~80 fewer dispatches.
-17. ~~**Fused LayerNorm backward kernel**~~ — DONE. Two kernels per instance: gradX (single workgroup per row with recomputed forward stats) and gradWeight+gradBias (cross-row reduction). Uses side-output pattern for multi-tensor returns. ~20 ops per instance → 2 dispatches.
-18. ~~**Adam CPU quick wins**~~ — DONE. Persistent `infFlagBuffer` (eliminates `createBuffer`+`destroy` per step). Pre-allocated typed arrays for config buffer construction (eliminates 228 short-lived allocations/step). Inlined adam-batch dispatch bypasses `executeOp` switch. ~1-2ms saved.
-19. ~~**Optimizer plan lowered path**~~ — DONE. Removed `!hasFusionPotential` early return in `executePlanOptimized`. All plans (including the 76-node Adam optimizer plan) now get lowered plan templates, buffer arenas, and adam-batch optimization. This was the root cause of 150 bind group cache misses: the optimizer plan allocated F16 weight buffers from the pool (changing identity each step), then forward/backward plans used those as matmul inputs. Now F16 buffers are arena-managed (stable identity). Bind group cache 75.3%→96.2% (174→24 misses). `createBindGroup` 9.5ms→1.0ms. `queue.submit` 102→24 calls (optimizer plan now uses single shared encoder). ~15ms/step saved.
-20. ~~**Matmul epilogue CPU fast path**~~ — DONE. On lowered plan replay, cache all structural decisions (prologue resolution, matmul geometry, transpose detection, dtype computation, epilogue config) on first execution. Subsequent steps resolve only buffer pointers and call `dispatchTiledMatmul` directly via `dispatchMatmulDirect`, bypassing `executeMatmulWithEpilogue`, `dispatchMatmulWithEpilogue`, dynamic imports, shape computation, transpose detection, and contiguous checks. `matmul++cast+bias` CPU: 730µs→63µs avg (11.6x improvement). Total: 17.5ms→1.6ms for 24 dispatches. ~16ms/step saved.
-21. ~~**Adam batch CPU fast path**~~ — DONE. Ported tight loop from dispatch replay path to normal lowered plan path. Eliminates per-node overhead: `.map()` array allocations, `executeOp` switch dispatch, `findIndex` alias scan, per-node profiling. Single `profileOpBegin/End` for entire batch. Direct `adamOp()` call with indexed `getInputStorage`. Adam CPU: 10.7ms→5.3ms. ~5.4ms/step saved.
-22. ~~**Reclaim interval tuning**~~ — DONE. Default reclaim interval 50→100. Submits: 24→15 (−37%). `queue.submit` calls reduced. Loss trajectory unchanged. Configurable via `TORCHLETTE_RECLAIM_INTERVAL` env var.
-23. ~~**Bind group cache miss fix**~~ — DONE. Forward plan's `executeLoweredPlan` consistently failed with "Input not ready" (ordering mismatch), falling back to `executePlanOptimized` without arena — causing 76 extra bind group misses. Fix: (1) disable lowered plan after first failure (stop retrying each step), (2) activate template's buffer arena in fallback `executePlanOptimized`, (3) save/restore dispatch sequence counters on failure to maintain bind group cache alignment. Bind group cache 84.9%→96.2% (98→24 misses). `createBindGroup` 3.7ms→1.0ms. ~2.7ms/step saved.
-24. ~~**Linear op + backward `add` fusion**~~ — DONE. Added `linear(input, weight, bias?)` frontend op with custom backward computing `dW = dY.T @ X` directly in weight's shape (eliminates transpose). Taught epilogue detection to skip reshape that removes leading size-1 dims (`[1,M,N]→[M,N]`), enabling the wte gradient `add` to fuse into the preceding backward matmul. `add` GPU: 4.5ms→0.8ms (max 4380µs→621µs). ~3.7ms GPU/step saved. Submits: 15→14.
-25. ~~**Matmul shape-class config fix + small_k**~~ — DONE. Fixed dead-code bug: `getConfigForShape()` ignored shape class entirely, always returning `DEFAULT_CONFIG` (32×32×16). Shape-specific defaults in `getDefaultConfigForShape()` were never used. Added `small_k` shape class for K<64 with large output (lm_head backward dW). Max matmul GPU: 14.6ms→11ms.
-26. ~~**K-split matmul**~~ — DONE. For small-M backward matmuls (M=31) with large K, the output tile grid (12 workgroups) severely underutilizes the GPU. K-split divides K-reduction across P workgroups in the Z dimension: each Z-slice computes partial sums, then a lightweight reduction kernel sums them. Activated when `baseWorkgroups < 64 && K > 512 && batchSize == 1 && no epilogue`. 25 backward dX matmuls across all 6 transformer layers use K-split. Max matmul GPU: 11ms→1.4ms (−88%). Backward GPU: 28ms→12ms (−57%). Total GPU: 43ms→27ms (−37%). Submits: 14→12.
-27. ~~**Dispatch replay cache**~~ — DONE. Enabled by default. Records full GPU dispatch sequence on first execution, replays bind groups directly on subsequent steps — bypasses all JS dispatch logic. Two fixes: (1) arena counter sync — `arenaResolveIndex` recorded before data-source/view/sequential execution and restored during replay, preventing buffer identity desync; (2) encoder-copy ops (scatterAdd) re-executed during replay — `copyBufferToBuffer` commands are invisible to compute dispatch recording, so ops using them must re-run instead of replaying stale bind groups. Loss parity verified bit-exact on DistilGPT-2 (50 steps, all losses identical). Disable with `TORCHLETTE_DISPATCH_REPLAY=0`. Auto-disabled when `TORCHLETTE_PROFILE=1`.
-28. ~~**Forward plan lowered execution fix**~~ — DONE. Forward plan (392 nodes) was permanently falling back to full JS dispatch after the first `executeLoweredPlan` attempt failed with "Input not ready". Root cause: matmul epilogue chain reconstruction in `executeLoweredPlan` always took `inputs[1]` as the external epilogue input ref, but when the chain connects via `inputs[1]` (commutative add for residual connections), the external input is actually at `inputs[0]`. Fix: detect which input is the chain node (by checking against previous chain node ID) and use the other input as the external ref. Forward plan now replays successfully. Combined with dispatch replay: steady-state 68ms→43ms/step (−37%). Finetune-demo verified stable over 60+ steps with correct loss convergence.
-29. ~~**View result caching in dispatch replay**~~ — DONE. During replay, view ops (reshape, transpose, permute, expand, narrow) produce deterministic results because arena buffers are stable across steps. Cache view metadata (buffer, shape, strides, offset) on first recording, reconstruct directly on replay bypassing `executeOp`, `getInputStorage`, and alias detection. Backward view time 2.1ms→0.1ms (95% reduction). Steady-state 43ms→32ms/step.
-30. ~~**Packed Adam dispatches**~~ — DONE. Groups same-element-count optimizer parameters into contiguous packed GPU buffers, dispatches one Adam kernel per size class instead of one per parameter. 76→8 dispatches. Adam GPU: 5.4ms→1.9ms (−65%). ~3.5ms GPU/step saved. Works during profiling (guards removed).
-31. ~~**Bind group cache: max + narrowBackward arena routing**~~ — DONE. `max()` and `narrowBackward()` used `createTrackedBuffer` directly, bypassing the buffer arena. Replaced with `resolveOutputBuffer` (max) and let `dispatchElementwise` handle allocation (narrowBackward). Bind group cache 91.0%→99.6% (40→2 misses). `createBindGroup` 1.9ms→0.1ms. ~1.8ms/step saved.
-32. ~~**Submit reduction: eliminate periodic reclamation**~~ — DONE. With arena-managed buffers (335 hits/step) and pool reservation (1 new alloc/step), intra-step buffer reclamation via periodic `flushSharedEncoder` is unnecessary. Increased `DEFAULT_RECLAIM_INTERVAL` 100→10000 (effectively disabled for plans <10k nodes). Also increased `PARAMS_FLUSH_THRESHOLD` 256→2000 to prevent auto-flush from params buffer accumulation. `queue.submit` calls: 14→7/step (profiler), ~4/step (replay). Total submit CPU: 3.9ms→3.1ms. ~0.8ms/step saved. Configurable via `TORCHLETTE_RECLAIM_INTERVAL` env var.
-33. ~~**dKV backward Q-tiling**~~ — DONE. Replaced per-Q-row loop (512 iterations, 1024 barriers) with tiled loop (BQ=16, 32 iterations, 64 barriers). Cooperative shared memory loading: all 64 threads load Q/dO tiles in parallel (was thread-0 broadcast). Causal tile-level early exit. `fusedAttentionBackward` GPU: 58.8ms→15.7ms (−73%). Backward GPU: ~120ms→73ms. ~43ms GPU/step saved.
-34. ~~**Graph snipping: eliminate forward recompute in backward**~~ — DONE. After executing a plan, preserve `node.result` on all executed nodes and clear `node.inputs` instead. Plan builder treats result-bearing nodes as data leaves (skips them). Backward plan no longer re-includes already-executed forward nodes. Replaced attention-specific `_attnSideOutput` hacks in engine.ts with general mechanism in lifetime analysis: `getPendingNodeIds()` added to `outputNodeIds` set prevents early-release from destroying externally-referenced buffers. `fusedAttentionForward` dispatches: 12→6 (forward only, 0 in backward). `matmul++cast` (forward recompute matmuls) eliminated. ~6ms GPU/step saved.
+## Open Performance Targets
 
-35. ~~**Matmul shape-class tile optimization**~~ — DONE. Benchmarked all 156 valid tile configs for lm_head shapes. Added `large_k` shape class (K/max(M,N) > 4) with 128×128×16 t8×8 tiles — maximizes arithmetic intensity for large-K matmuls. Updated `short_wide` to 64×128×8 t8×4 and `tall_skinny` to 64×128×8 t8×4 based on benchmark results. The `large_k` 128×128 tile reduces workgroup count enough to trigger K-split (factor 6) for lm_head backward dX (512×768×50304). `matmul` (bare) GPU: 45.2ms→32.5ms (−28%). `final.lm_head`: 15.8ms→9.4ms (−41%). Max matmul: 10,529µs→5,461µs (−48%). Total GPU: ~100ms→~88ms (−12%). Forward GPU: 24.0ms→22.6ms. Backward GPU: 71.3ms→60.1ms.
-36. ~~**square_large tileK=8 optimization**~~ — DONE. Changed `square_large` default from 64×64×16 t4×4 to 64×64×8 t4×4. Half the shared memory (4KB vs 8KB) improves GPU occupancy. Keeps t4×4 thread tiles to avoid register pressure with epilogue-fused kernels (t8×4 caused +50% regression on epilogue matmuls). Benchmarked on MLP shapes (512×3072×768, 512×768×3072): +12% to +27% improvement on bare matmul. `matmul` (bare): 32.5ms→28.1ms (−14%). `matmul++cast+bias+unary+cast`: 4.5ms→4.0ms (−11%). `matmul++bias`: 2.7ms→2.2ms (−19%). Total GPU: ~88ms→~81ms (−8%). Forward GPU: 22.6ms→22.2ms. Backward GPU: 60.1ms→54.4ms.
+### Browser training targets (ranked by impact)
 
-37. ~~**Epilogue-aware tile selection**~~ — DONE. `getDefaultConfigForShape` now accepts `hasEpilogue` parameter. Bare matmuls use larger thread tiles (t8×4 for `square_large`, 64×64×8 for `square_medium`), while epilogue matmuls keep conservative configs (t4×4 for `square_large`, 32×32×16 for `square_medium`). `hasEpilogue` computed before config selection in `dispatchTiledMatmul`. Tuning cache key includes epilogue status. `matmul` (bare): 28.1ms→24.8ms (−12%). Epilogue matmuls stable (t4×4 preserved). 13 backward bare matmuls now trigger K-split with larger tiles (+0.2ms reduction overhead). Forward GPU: 22.2ms→22.0ms. Backward GPU: 54.4ms→51.2ms. Total GPU: ~81ms→~78ms (−4%).
+1. **Fix progressive slowdown** — ~2 RuntimeTensors/step accumulate because V8 GC doesn't collect them promptly. After ~200 steps, LoRA drops from 1050→800 tok/s. Root cause: `mul_` intermediates and transpose views created outside tidy scopes are GC-eligible but not promptly collected. Skipping RuntimeTensor wrappers for intermediates leaks GPU storage (FinalizationRegistry needs the wrapper). Needs a different approach — possibly explicit disposal of in-place op intermediates after plan execution.
 
-38. ~~**Vec4 attention kernels**~~ — DONE. All three fused attention shaders (forward, backward dQ, backward dKV) converted from scalar f32 to `vec4<f32>` operations. Shared memory tiles and register arrays use vec4, inner loops iterate headDim/4 with WGSL `dot()` for score computation and vec4 FMA for accumulation. Also factored out `ds*scale` in dKV to eliminate redundant per-element multiply. Runtime assertion: headDim must be divisible by 4. `fusedAttentionBackward`: 15.5ms→7.0ms (−55%). `fusedAttentionForward`: 5.9ms→2.5ms (−58%). Combined attention: 21.4ms→9.5ms (−56%). Forward GPU: 22.0ms→18.6ms. Backward GPU: 51.2ms→42.7ms. Total GPU: ~78ms→~66ms (−15%).
+2. **Add ternary op support to tile-IR** — `clamp(x, min, max)` is a WGSL built-in but not in the op registry. clipGradNorm works around this with le/gt/mul/add (4 ops instead of 1). Adding ternary op support would simplify this and enable other three-input ops.
 
-39. ~~**Subgroup cooperative dot products for attention**~~ — DONE. Assigns 4 threads per row (THREADS_PER_ROW=4) instead of 1, each handling 1/4 of headDim. Dot products reduced across 4 threads via `subgroupShuffleXor` tree reduction (XOR masks 1 and 2). Workgroup size 64→256. Per-thread registers cut ~4× (16 vec4 → 4 vec4 for headDim=64), improving GPU occupancy. All three shaders (forward, dQ, dKV) gain `useSubgroups` parameter. Minimum headDim=64 for subgroup path (small test models use scalar fallback). Pipeline cache key includes `:sg` suffix. `fusedAttentionBackward`: 7.0ms→5.4ms (−23%). `fusedAttentionForward`: 2.5ms→2.5ms (unchanged). Combined attention: ~9.5ms→~7.9ms (−17%). Total GPU: ~66ms→~64ms (−3%).
+3. **Fuse bias-gradient sums** — 244 sum dispatches in Full FT (22% of GPU time). Each `dBias = sum(gradOut, dims)` is a separate dispatch. Would need multi-output reduction support in tile-IR to batch independent same-dim reductions.
 
-**Attempted but did not improve:**
-- **Inline D precompute into dQ/dKV kernels** — Eliminated 6 D precompute dispatches by computing D[i]=dot(dO,O) inline: register-based in dQ (with subgroup reduction), shared-memory-based in dKV (extra O_tile + workgroupBarrier per Q tile). Result: 5.7ms vs 5.4ms baseline (+6%). D precompute was only ~0.3ms (6×50µs); inline overhead (extra global reads, extra barrier) exceeded savings. Reverted.
-- **Fused single-pass dQ+dKV** — Not feasible on WebGPU: requires f32 atomics (only i32/u32 available) for inter-workgroup dQ accumulation, or partials buffer that reads MORE data than two-pass approach.
-- **Vec4 inner compute loop for matmul** — Replaced scalar kk loop (`for kk in 0..TILE_K`) with vec4 loop (`for kk4 in 0..TILE_K/4`) using `dot(vec4, vec4)` for accumulation. All matmul kernels regressed ~9%: bare `matmul` 24.8ms→27.1ms, `matmul++cast+bias+binary` 9.1ms→10.7ms. Total GPU 64ms→70ms. `dot()` doesn't map to a fused instruction on this GPU — expands to the same 4 MADs. Vec4 construction from scalar shared memory loads adds register pressure and instruction overhead. B-tile strided gather (4 rows × TILE_N apart) is particularly expensive to pack into vec4. Reverted.
-- **Double-buffered K-loop for matmul** — Ping-pong shared memory (2× allocation) to overlap next tile's global→shared load with current tile's compute, reducing barriers from 2→1 per K-tile iteration. Enabled when doubled shared memory fits in 16KB (9/11 shape classes). All matmul kernels regressed ~13%: bare `matmul` 24.8ms→28.4ms, `matmul++cast+bias+binary` 9.1ms→10.3ms, `matmul++cast+bias+unary+cast` 4.0ms→5.1ms, `matmul++bias` 2.2ms→3.1ms. Total GPU ~64ms→~72ms. The 2× shared memory reduces GPU occupancy (fewer warps per SM), and this GPU already has effective warp-level latency hiding — occupancy loss outweighs barrier reduction. Reverted.
-- **Per-shape matmul autotuning** — Per-shape cache (`m_n_k_dtype` keys instead of shape-class), ~12 neighbor configs benchmarked per shape with K-split-aware dispatch (full matmul+reduction path). Self-contained benchmark avoids shared state pollution. For 512-token DistilGPT-2 shapes, autotuner selects configs with identical GPU kernel times to hand-tuned defaults (bare matmul 24.8ms vs 24.9ms). Adds ~5s to step 0 with no steady-state benefit. The hand-tuned shape-class defaults are already near-optimal for standard transformer shapes. Infrastructure kept (disabled by default): enable with `TORCHLETTE_AUTOTUNE=1` env var or `compile({ autotune: true })` for non-standard shapes.
+### Node/Dawn targets (GPT-2 Medium, ranked)
 
-**Open targets (ranked by estimated savings at 512 tokens):**
-1. **Matmul kernel optimization** — 45.0ms GPU (68% of total). Bare backward matmuls alone are 25.5ms (39%).
-2. **GC pressure** — Object pooling for Tensor metadata.
-3. **Pipeline cache warmup** — Step 0 is 3.4s (68× steady-state) due to pipeline compilation. Pre-compile pipeline variants during model load.
+4. **Per-shape matmul autotuning** — Infrastructure exists (`TORCHLETTE_AUTOTUNE=1`). Pre-seed cache for Medium shapes. ~5-10ms potential from sub-optimal tile configs on 1024-embed shapes.
+
+5. **Backward elementwise fusion** — 7.3% fusion rate on V100 (limited by 10 storage buffer limit). Apple Metal (96 buffers) would get much better fusion. Not actionable on V100.
+
+### Framework completeness targets
+
+6. **LR Schedulers** — StepLR, CosineAnnealingLR, etc. ~300 lines, pure math, zero risk.
+7. **Weight initialization** — kaiming_normal_, xavier_uniform_. ~200 lines.
+8. ~~**Gradient clipping**~~ — Implemented. Fully GPU (no CPU readback).
+9. **Parameter groups** — per-layer LR in Adam/SGD. ~150 lines.
+
+### Architecture targets (long-term)
+
+10. **Serializable compiled plans** — Pre-compile full dispatch sequence to disk. Eliminates ~700ms cold start.
+11. **Forward/backward overlap via loss tensor preservation** — 4 approaches tried, all failed (see "What didn't work"). Needs dedicated readback staging buffer excluded from pool — `startScalarReadback` primitive added but only helps for loss readback, not clipGradNorm (which is now fully GPU anyway).
+
+## What didn't work (don't re-attempt)
+
+- **Vec4 shared memory for matmul K-loop** — 3 approaches benchmarked, all regressed 9-36%. Scalar shared mem is faster for shared×shared dot. Vec4 kept for attention (register×shared dot).
+- **Double-buffered K-loop** — 2× shared memory reduces occupancy, outweighing barrier reduction. −13%.
+- **Fused single-pass dQ+dKV** — Requires f32 atomics (WebGPU only has i32/u32).
+- **Inline D precompute into attention** — D precompute is only 0.3ms; inline overhead exceeds savings.
+- **Per-shape matmul autotuning on DistilGPT-2** — Hand-tuned defaults already optimal for 768-dim. Infrastructure kept for larger models.
+- **Matmul input cast absorption in training** — Backward needs f16 tensors materialized; can't skip the cast.
+- **Bypassed-node transparency in fusion grouping** — Making CSE-bypassed nodes transparent in `buildCandidateGroups` (so they don't break fusible runs) caused "Input not ready" errors in the browser. The bypassed nodes' plan positions still matter for execution ordering. Bypassed nodes must remain opaque barriers.
+- **Skipping RuntimeTensor for in-place op intermediates** — `mul_` creates `copy_(dst, mul(dst, value))` with an intermediate RuntimeTensor. Tried creating the mul lazy node directly without a RuntimeTensor wrapper to avoid GC pressure. Caused GPU storage leak — the intermediate's StorageHandle had no RuntimeTensor owner, so FinalizationRegistry never cleaned it up.
+- **Moving loss.item() after backward** — Tried 4 approaches to overlap forward GPU with backward CPU: (1) `retainGrad()` doesn't prevent `cleanupAutogradGraph` disposal. (2) Adding root to `preserved` set causes buffer aliasing errors (shared encoder read-write conflict). (3) Concurrent `item()` promise + backward hits "Engine is busy" (exec lock). (4) `force()` then non-awaited `runtime.item()` causes data race — backward reuses the loss buffer before `mapAsync` reads it, returning garbage values. Safe overlap requires a dedicated readback staging buffer excluded from the pool.
+
+## Known Semantic Limitations
+
+- **In-place self-aliasing crashes** — `tensor.mul_(tensor)` (same tensor as both operands) creates a broken lazy graph node. `add_(self)` works because the lazy system doesn't read-after-write, but `mul_` needs both input values before writing. Use `api.mul(a, a)` (non-in-place) instead. Not worth fixing: would require aliasing detection on every in-place op for a case that never occurs in real training.
+- **Disposing intermediates breaks autograd** — If you manually `dispose()` a tensor that's part of an active backward graph, the saved-for-backward reference is killed and gradients will be silently wrong or null. Unlike PyTorch, saved tensors share lifecycle with the user handle (no independent refcounting). In practice this doesn't occur: `tidy()`, `compile()`, and `beginStep()`/`endStep()` manage lifecycle automatically. Don't manually dispose tensors between forward and backward.
+- **No double backward** — Calling `backward()` clears the autograd graph. A second call does nothing (no `retain_graph` equivalent). This is by design for memory efficiency.

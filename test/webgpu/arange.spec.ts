@@ -1,7 +1,7 @@
-import { describe, expect, it, beforeAll } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
-  initWebGPU,
   getWebGPUInitError,
+  initWebGPU,
   webgpuBackend,
 } from "../../src/backend/webgpu";
 import { cpuOnly } from "../helpers/webgpu";
@@ -16,14 +16,14 @@ describe.skipIf(cpuOnly)("WebGPU arange", () => {
   });
 
   it("basic arange(10)", async () => {
-    const t = webgpuBackend.ops.arange!(10);
+    const t = webgpuBackend.ops.arange?.(10);
     expect(t.shape).toEqual([10]);
     const data = await webgpuBackend.ops.read(t);
     expect(data).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
   });
 
   it("arange with start and step", async () => {
-    const t = webgpuBackend.ops.arange!(10, 2, 3);
+    const t = webgpuBackend.ops.arange?.(10, 2, 3);
     expect(t.shape).toEqual([3]); // [2, 5, 8]
     const data = await webgpuBackend.ops.read(t);
     expect(data[0]).toBeCloseTo(2);
@@ -32,7 +32,7 @@ describe.skipIf(cpuOnly)("WebGPU arange", () => {
   });
 
   it("arange with float step", async () => {
-    const t = webgpuBackend.ops.arange!(2, 0, 0.5);
+    const t = webgpuBackend.ops.arange?.(2, 0, 0.5);
     expect(t.shape).toEqual([4]); // [0, 0.5, 1.0, 1.5]
     const data = await webgpuBackend.ops.read(t);
     expect(data[0]).toBeCloseTo(0);
@@ -43,7 +43,7 @@ describe.skipIf(cpuOnly)("WebGPU arange", () => {
 
   it("large arange for position indices", async () => {
     const n = 1024;
-    const t = webgpuBackend.ops.arange!(n);
+    const t = webgpuBackend.ops.arange?.(n);
     expect(t.shape).toEqual([n]);
     const data = await webgpuBackend.ops.read(t);
     for (let i = 0; i < n; i++) {
@@ -52,8 +52,8 @@ describe.skipIf(cpuOnly)("WebGPU arange", () => {
   });
 
   it("arange result can be used in binary ops", async () => {
-    const a = webgpuBackend.ops.arange!(5);
-    const b = webgpuBackend.ops.arange!(5);
+    const a = webgpuBackend.ops.arange?.(5);
+    const b = webgpuBackend.ops.arange?.(5);
     const sum = webgpuBackend.ops.add(a, b);
     const data = await webgpuBackend.ops.read(sum);
     expect(data).toEqual([0, 2, 4, 6, 8]);

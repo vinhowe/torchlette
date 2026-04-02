@@ -1,8 +1,16 @@
-export { Adam, type AdamOptions } from "./adam";
+export { Adam, type AdamOptions, type AdamParamGroup } from "./adam";
 export {
   GradScaler,
   type GradScalerOptions,
   type GradScalerState,
   type Optimizer,
 } from "./grad-scaler";
-export { SGD, type SGDOptions } from "./sgd";
+export {
+  CosineAnnealingLR,
+  ExponentialLR,
+  type HasLR,
+  type LRScheduler,
+  PolynomialLR,
+  StepLR,
+} from "./lr-scheduler";
+export { SGD, type SGDOptions, type SGDParamGroup } from "./sgd";

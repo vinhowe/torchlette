@@ -6,9 +6,8 @@
  * - base_commit is tracked for mutations per spec §4.3
  */
 
-import { describe, expect, it, beforeEach } from "vitest";
-import { torch, Torchlette, Tensor } from "../src/frontend";
-import { Engine } from "../src/engine/engine";
+import { beforeEach, describe, expect, it } from "vitest";
+import { Torchlette } from "../src/frontend/torchlette";
 
 describe("in-place operations (frontend)", () => {
   let t: Torchlette;
@@ -148,9 +147,9 @@ describe("in-place operations (frontend)", () => {
     it("can chain multiple in-place ops", async () => {
       const a = t.tensorFromArray([1, 2, 3, 4], [4]);
 
-      a.mul_(2)      // [2, 4, 6, 8]
-       .add_(t.tensorFromArray([1, 1, 1, 1], [4]))  // [3, 5, 7, 9]
-       .mul_(0);     // [0, 0, 0, 0]
+      a.mul_(2) // [2, 4, 6, 8]
+        .add_(t.tensorFromArray([1, 1, 1, 1], [4])) // [3, 5, 7, 9]
+        .mul_(0); // [0, 0, 0, 0]
 
       const values = await a.cpu();
       expect(values).toEqual([0, 0, 0, 0]);
@@ -173,8 +172,8 @@ describe("in-place operations (frontend)", () => {
       const a = t.tensorFromArray([1, 2, 3], [3]);
       const b = t.tensorFromArray([1, 1, 1], [3]);
 
-      a.add_(b);  // [2, 3, 4]
-      const c = a.mul(t.tensorFromArray([2, 2, 2], [3]));  // [4, 6, 8]
+      a.add_(b); // [2, 3, 4]
+      const c = a.mul(t.tensorFromArray([2, 2, 2], [3])); // [4, 6, 8]
 
       const aValues = await a.cpu();
       const cValues = await c.cpu();
@@ -199,6 +198,6 @@ describe("base_commit tracking (§4.3)", () => {
 
     // Both mutations should have committed - we verify by checking values work
     const values = await a.cpu();
-    expect(values).toEqual([3, 4, 5]);  // 1+1+1, 2+1+1, 3+1+1
+    expect(values).toEqual([3, 4, 5]); // 1+1+1, 2+1+1, 3+1+1
   });
 });

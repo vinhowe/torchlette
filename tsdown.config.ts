@@ -18,7 +18,9 @@ export default defineConfig([
     entry: ["./src/browser.ts"],
     platform: "browser",
     dts: true,
-    minify: true,
+    // minify disabled: esbuild converts Math.pow(await x, y) → (await x)**y
+    // which is a SyntaxError in browsers (unary before exponentiation)
+    minify: false,
     sourcemap: true,
   },
 ]);

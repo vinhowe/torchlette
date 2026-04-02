@@ -1,23 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { Engine, PoisonedEngineError } from "../src";
+import { PoisonedEngineError, RuntimeEngine } from "../src/runtime/engine";
 
 describe("poisoning", () => {
   it("throws on execution-affecting ops after poison", () => {
-    const engine = new Engine();
+    const engine = new RuntimeEngine();
     engine._debug_poison();
 
-    expect(() => engine.emitEffect("noop")).toThrow(PoisonedEngineError);
-    expect(() => engine.orderedAccess(1, "load")).toThrow(PoisonedEngineError);
     expect(() => engine._debug_runEntryPoint(() => undefined)).toThrow(
       PoisonedEngineError,
     );
   });
 
-  it("allows cleanup-only operations when poisoned", () => {
-    const engine = new Engine();
-    engine._debug_enqueueFinalize({ id: 1 });
+  it("allows disposal when poisoned", () => {
+    const engine = new RuntimeEngine();
+    const tensor = engine.createTensor();
     engine._debug_poison();
-
-    expect(() => engine._debug_drainFinalizeQueueCleanupOnly()).not.toThrow();
+    expect(() => engine.dispose(tensor)).not.toThrow();
   });
 });

@@ -97,12 +97,84 @@ export function generateTuningConfigs(
 export function getDefaultConfigForShape(
   shapeClass: ShapeClass,
   hasEpilogue: boolean = false,
+  m?: number,
+  n?: number,
+  k?: number,
 ): MatmulKernelConfig {
   switch (shapeClass) {
     case "square_large":
       if (hasEpilogue) {
         // Epilogue matmuls: t4x4 avoids register pressure from extra per-element ops
-        // Benchmarked: 64x64x8 t4x4 is +50% faster than 64x128x8 t8x4 with epilogue
+        // tileK=16 halves K-loop iterations while keeping 8KB smem budget
+        // Benchmarked: 64x64 t4x4 is +50% faster than 64x128 t8x4 with epilogue
+        return {
+          ...DEFAULT_CONFIG,
+          tileM: 64,
+          tileN: 64,
+          tileK: 16,
+        };
+      }
+      // Bare matmuls with small M and large K (backward dX shapes like 512×1024×3072):
+      // 64×64×16 t4×4 is 29-31% faster — higher occupancy from smaller tiles wins
+      // when the output grid is modest but K-loop is long.
+      // Tall shapes (dW like 3072×1024×512) still prefer 64×128×16 t8×4.
+      if (m !== undefined && k !== undefined && m <= 512 && k >= m * 2) {
+        return {
+          ...DEFAULT_CONFIG,
+          tileM: 64,
+          tileN: 64,
+          tileK: 16,
+        };
+      }
+      // Default bare: larger thread tiles (t8x4) give better register reuse
+      // tileK=16 halves K-loop iterations and barriers for large-K backward matmuls
+      return {
+        ...DEFAULT_CONFIG,
+        tileM: 64,
+        tileN: 128,
+        tileK: 16,
+        threadTileM: 8,
+        threadTileN: 4,
+      };
+
+    case "square_medium":
+      if (hasEpilogue) {
+        // Epilogue matmuls: 64x64x16 t4x4 outperforms 32x32x16 by 30% on 1024-embed shapes
+        // (e.g. attn.cProj fwd 512x1024x1024: 0.32ms vs 0.45ms). The epilogue overhead
+        // from cast+bias is small enough that larger tiles win via better throughput.
+        return {
+          ...DEFAULT_CONFIG,
+          tileM: 64,
+          tileN: 64,
+          tileK: 16,
+        };
+      }
+      // Bare matmuls: step up from 32x32x16 for better throughput
+      // tileK=16 halves K-loop iterations; same shared memory as 64x64x8
+      return {
+        ...DEFAULT_CONFIG,
+        tileM: 64,
+        tileN: 64,
+        tileK: 16,
+      };
+
+    case "large_k":
+      // Large K dimension (e.g. lm_head backward dX: M=512, N=768, K=50304)
+      // tileK=8 halves shared memory (4KB vs 8KB), doubling GPU occupancy.
+      // K-split factor stays the same; occupancy gain outweighs 2× K-loop iterations.
+      // Benchmarked: 128×128×8 t8×8 is +13% faster than 128×128×16 t8×8 on lm_head dX
+      return {
+        ...DEFAULT_CONFIG,
+        tileM: 128,
+        tileN: 128,
+        tileK: 8,
+        threadTileM: 8,
+        threadTileN: 8,
+      };
+
+    case "tall_skinny":
+      if (hasEpilogue) {
+        // Epilogue: conservative thread tiles to avoid register pressure
         return {
           ...DEFAULT_CONFIG,
           tileM: 64,
@@ -110,67 +182,36 @@ export function getDefaultConfigForShape(
           tileK: 8,
         };
       }
-      // Bare matmuls: larger thread tiles (t8x4) give better register reuse
-      // Benchmarked on MLP shapes (512x3072x768, 512x768x3072): +11% to +100% vs t4x4
+      // Tall matrices (e.g. lm_head backward dW: M=50304, N=768, K=512)
+      // tileK=16 halves K-loop iterations (32→16 for K=512); 6KB shared memory
+      // Benchmarked: 64×128×16 t8×4 is +6% faster than 64×128×8 t8×4 on lm_head dW
       return {
         ...DEFAULT_CONFIG,
         tileM: 64,
-        tileN: 128,
-        tileK: 8,
-        threadTileM: 8,
-        threadTileN: 4,
-      };
-
-    case "square_medium":
-      if (hasEpilogue) {
-        // Epilogue matmuls: conservative config to avoid register pressure
-        return {
-          ...DEFAULT_CONFIG,
-          tileM: 32,
-          tileN: 32,
-          tileK: 16,
-        };
-      }
-      // Bare matmuls: step up from 32x32x16 for better throughput
-      return {
-        ...DEFAULT_CONFIG,
-        tileM: 64,
-        tileN: 64,
-        tileK: 8,
-      };
-
-    case "large_k":
-      // Large K dimension (e.g. lm_head backward dX: M=512, N=768, K=50304)
-      // Maximize tile size for arithmetic intensity; 16KB shared memory
-      return {
-        ...DEFAULT_CONFIG,
-        tileM: 128,
         tileN: 128,
         tileK: 16,
-        threadTileM: 8,
-        threadTileN: 8,
-      };
-
-    case "tall_skinny":
-      // Tall matrices (e.g. lm_head backward dW: M=50304, N=768, K=512)
-      // Large output tile with tileK=8 for better occupancy; 256 threads
-      return {
-        ...DEFAULT_CONFIG,
-        tileM: 64,
-        tileN: 128,
-        tileK: 8,
         threadTileM: 8,
         threadTileN: 4,
       };
 
     case "short_wide":
+      if (hasEpilogue) {
+        // Epilogue: conservative thread tiles to avoid register pressure
+        return {
+          ...DEFAULT_CONFIG,
+          tileM: 64,
+          tileN: 64,
+          tileK: 8,
+        };
+      }
       // Wide matrices (e.g. lm_head: M=512, N=50304, K=768)
-      // Large output tile with tileK=8 for better occupancy; 256 threads
+      // Large output tile with tileK=16 for fewer K-loop iterations; 256 threads
+      // f16 shared memory halves tile footprint, making tileK=16 fit in same budget as tileK=8 with f32
       return {
         ...DEFAULT_CONFIG,
         tileM: 64,
         tileN: 128,
-        tileK: 8,
+        tileK: 16,
         threadTileM: 8,
         threadTileN: 4,
       };
@@ -331,7 +372,9 @@ export async function autotune(
           dtype,
         };
       }
-    } catch {}
+    } catch {
+      // Config failed to compile or dispatch — skip and try next
+    }
   }
 
   // If no config worked, use default
@@ -375,7 +418,12 @@ export function generateNeighborConfigs(
     if (newTileK !== tileK) configs.push({ ...baseConfig, tileK: newTileK });
   }
   // Thread tile variants
-  for (const [ttm, ttn] of [[4, 4], [8, 4], [4, 8], [8, 8]] as const) {
+  for (const [ttm, ttn] of [
+    [4, 4],
+    [8, 4],
+    [4, 8],
+    [8, 8],
+  ] as const) {
     if (ttm !== baseConfig.threadTileM || ttn !== baseConfig.threadTileN) {
       configs.push({ ...baseConfig, threadTileM: ttm, threadTileN: ttn });
     }
@@ -387,11 +435,16 @@ export function generateNeighborConfigs(
 
   // Validate and deduplicate
   const seen = new Set<string>();
-  return configs.filter(c => {
+  return configs.filter((c) => {
     const key = `${c.tileM}_${c.tileN}_${c.tileK}_${c.threadTileM}_${c.threadTileN}_${c.vectorWidth}_${c.useSubgroups}`;
     if (seen.has(key)) return false;
     seen.add(key);
-    try { validateConfig(c); return true; } catch { return false; }
+    try {
+      validateConfig(c);
+      return true;
+    } catch {
+      return false;
+    }
   });
 }
 
@@ -458,7 +511,9 @@ export async function quickAutotune(
           dtype,
         };
       }
-    } catch {}
+    } catch {
+      // Config failed to compile or dispatch — skip and try next
+    }
   }
 
   if (!bestResult) {

@@ -7,6 +7,40 @@ import { F32_BYTES } from "../shape-utils";
 export type DType = "f16" | "f32";
 
 /**
+ * Epilogue operation to fuse into matmul output.
+ * Supports arbitrary chains of elementwise operations from the unified op registry.
+ */
+type EpilogueOp =
+  | { kind: "none" }
+  | { kind: "bias"; inputIndex: number }
+  | { kind: "unary"; op: string }
+  | { kind: "binary"; op: string; inputIndex: number }
+  | { kind: "cast"; toDtype: DType };
+
+export type EpilogueConfig = {
+  ops: EpilogueOp[];
+  additionalInputCount: number;
+  outputDtype: DType;
+};
+
+/**
+ * Options for matmul shader generation.
+ */
+export type CodegenOptions = {
+  config: MatmulKernelConfig;
+  transposeMode: TransposeMode;
+  dtype: DType;
+  dtypeB?: DType;
+  epilogue?: EpilogueConfig;
+  batched?: boolean;
+  inputCastA?: DType;
+  inputCastB?: DType;
+  kSplit?: number;
+  /** Swap grid X/Y axes so M is fast and N is slow. Improves L2 cache reuse for wide shapes. */
+  swapGrid?: boolean;
+};
+
+/**
  * Kernel configuration for tiled matrix multiplication.
  * These parameters control tiling, threading, and optimization strategies.
  */
@@ -37,27 +71,6 @@ export type MatmulKernelConfig = {
 export type TransposeMode = "NN" | "NT" | "TN" | "TT";
 
 /**
- * Parameters passed to the matmul shader as uniforms.
- */
-type MatmulParams = {
-  m: number;
-  n: number;
-  k: number;
-  /** Transpose mode encoded as integer: 0=NN, 1=NT, 2=TN, 3=TT */
-  transposeMode: number;
-  /** Batch size (total number of batch elements after broadcasting) */
-  batchSize: number;
-  /** Leading dimension of A (stride between rows) */
-  lda: number;
-  /** Leading dimension of B (stride between rows) */
-  ldb: number;
-  /** Leading dimension of output (stride between rows) */
-  ldc: number;
-  /** Alpha scaling factor (output = alpha * A @ B) */
-  alpha: number;
-};
-
-/**
  * Shape class for autotuning cache keys.
  * Different shape classes may have different optimal configurations.
  */
@@ -86,29 +99,6 @@ export type TuneResult = {
 /**
  * Matmul dispatch options passed by the caller.
  */
-type MatmulOptions = {
-  /** Whether A is transposed */
-  transA?: boolean;
-  /** Whether B is transposed */
-  transB?: boolean;
-  /** Alpha scaling factor */
-  alpha?: number;
-  /** Specific kernel config (overrides autotuning) */
-  config?: MatmulKernelConfig;
-};
-
-/**
- * AMP (Automatic Mixed Precision) configuration.
- */
-type AMPConfig = {
-  /** Dtype for computation (f16 for speed, f32 for accuracy) */
-  computeDtype: DType;
-  /** Dtype for accumulation (always f32 for numerical stability) */
-  accumulateDtype: "f32";
-  /** Dtype for output */
-  outputDtype: DType;
-};
-
 /**
  * Default kernel configuration optimized for broad compatibility.
  * Conservative tile sizes (32x32) work across most devices.
@@ -147,22 +137,6 @@ export function getTransposeMode(
   if (!transA && transB) return "NT";
   if (transA && !transB) return "TN";
   return "TT";
-}
-
-/**
- * Convert TransposeMode to integer for shader uniforms.
- */
-function transposeModeToInt(mode: TransposeMode): number {
-  switch (mode) {
-    case "NN":
-      return 0;
-    case "NT":
-      return 1;
-    case "TN":
-      return 2;
-    case "TT":
-      return 3;
-  }
 }
 
 /**
@@ -307,4 +281,42 @@ export function getSubgroupSupport(): SubgroupSupport | null {
  */
 export function clearSubgroupSupport(): void {
   cachedSubgroupSupport = null;
+}
+
+/**
+ * Generate a cache key for a matmul shader configuration.
+ */
+export function getShaderCacheKey(options: CodegenOptions): string {
+  const {
+    config,
+    transposeMode,
+    dtype,
+    dtypeB,
+    epilogue,
+    batched,
+    inputCastA,
+    inputCastB,
+    kSplit,
+  } = options;
+  const epilogueKey = epilogue
+    ? `${epilogue.ops.map((op: Record<string, unknown>) => `${op.kind}:${op.op ?? ""}:${op.toDtype ?? ""}`).join(",")}_${epilogue.outputDtype}`
+    : "none";
+  return [
+    `tiled`,
+    `${config.tileM}x${config.tileN}x${config.tileK}`,
+    `t${config.threadTileM}x${config.threadTileN}`,
+    `v${config.vectorWidth}`,
+    config.useSubgroups ? "sg" : "nosg",
+    transposeMode,
+    dtype,
+    dtypeB && dtypeB !== dtype ? `dtypeB_${dtypeB}` : "",
+    batched ? "batch" : "nobatch",
+    epilogueKey,
+    inputCastA ? `castA_${inputCastA}` : "",
+    inputCastB ? `castB_${inputCastB}` : "",
+    kSplit ? `ksplit${kSplit}` : "",
+    options.swapGrid ? "swapgrid" : "",
+  ]
+    .filter(Boolean)
+    .join("_");
 }

@@ -27,11 +27,13 @@
  * }
  * ```
  */
-import type { Tensor, Torchlette } from "../frontend";
+
+import type { Backend, DeviceKind } from "../backend/types";
+import type { Tensor, Torchlette } from "../frontend/torchlette";
+import { createLazyIRNode } from "../graph/node-factory";
+import { createPendingRef } from "../graph/types";
 import type { Adam } from "./adam";
 import type { SGD } from "./sgd";
-import { createLazyIRNode, createPendingRef } from "../engine/lazy";
-import type { Backend, DeviceKind } from "../backend/types";
 
 export type Optimizer = Adam | SGD;
 
@@ -139,24 +141,27 @@ export class GradScaler {
     if (this._pendingInfBuffer) {
       // Fused path: force all pending GPU work so the unscaleGrad kernels
       // have written to the infFlagBuffer before we read it back.
-      // In the normal training loop, markStep() is called before resolveDeferred(),
-      // but we handle the case where it wasn't called explicitly.
       await this.api.markStep();
-      const val = await this._pendingInfBackend!.ops.readAndDestroyInfCount!(this._pendingInfBuffer);
-      this._foundInfThisStep = val > 0.5;
+      const val = await this._pendingInfBackend?.ops.readAndDestroyInfCount?.(
+        this._pendingInfBuffer,
+      );
+      this._foundInfThisStep = val! > 0.5;
       this._pendingInfBuffer = null;
       this._pendingInfBackend = null;
+      this._applyScaleAdjustment();
     } else if (this._pendingInfAccum) {
-      // Elementwise path: read tensor
+      // Elementwise path: should have been resolved in update().
+      // Fallback if update() wasn't called or wasn't awaited.
       const totalInfCount = await this._pendingInfAccum.item();
       this._foundInfThisStep = totalInfCount > 0.5;
       this._pendingInfAccum.dispose();
       this._pendingInfAccum = null;
-    } else {
-      return; // First step, no-op
+      this._applyScaleAdjustment();
     }
+  }
 
-    // Apply scale adjustment (deferred from the previous step's update())
+  /** Adjust scale based on whether inf was found this step. */
+  private _applyScaleAdjustment(): void {
     if (this._foundInfThisStep) {
       this._scale *= this.backoffFactor;
       this._growthTracker = 0;
@@ -210,7 +215,10 @@ export class GradScaler {
     // Determine device from first param with a grad
     let device: DeviceKind = "cpu";
     for (const p of params) {
-      if (p.grad) { device = p.device; break; }
+      if (p.grad) {
+        device = p.device;
+        break;
+      }
     }
 
     const backend = runtime.getBackend(device);
@@ -223,7 +231,7 @@ export class GradScaler {
       isFusedOptimizer(optimizer) &&
       optimizer.hasFusedKernel()
     ) {
-      const infFlagBuffer = backend.ops.createInfCountBuffer!();
+      const infFlagBuffer = backend.ops.createInfCountBuffer?.();
       optimizer.setUnscaleConfig(invScale, infFlagBuffer);
       this._pendingInfBuffer = infFlagBuffer;
       this._pendingInfBackend = backend;
@@ -247,7 +255,7 @@ export class GradScaler {
     backend: Backend,
     device: DeviceKind,
   ): void {
-    const infFlagBuffer = backend.ops.createInfCountBuffer!();
+    const infFlagBuffer = backend.ops.createInfCountBuffer?.();
     const sharedPayload = { invScale, infFlagBuffer };
 
     for (const param of params) {
@@ -302,23 +310,36 @@ export class GradScaler {
 
       // Count non-finite elements: (1 - isfinite(x)) gives 1.0 for inf/nan, 0.0 for finite.
       const finiteFlags = this.api.isfinite(unscaledGrad);
-      const nonFiniteFlags = this.api.sub(1.0, finiteFlags);
+      const one = this.api.full([], 1);
+      const nonFiniteFlags = this.api.sub(one, finiteFlags);
       const paramInfCount = this.api.sum(nonFiniteFlags);
 
       // Accumulate on GPU — no item() call in the loop
       const prevAccum = infAccum;
       infAccum = this.api.add(infAccum, paramInfCount);
 
-      toDispose.push(finiteFlags, nonFiniteFlags, paramInfCount, prevAccum);
+      toDispose.push(
+        one,
+        finiteFlags,
+        nonFiniteFlags,
+        paramInfCount,
+        prevAccum,
+      );
     }
 
     // Build shouldZero flag from final infAccum (lazy, 0-d tensor)
-    const shouldZero = this.api.gt(infAccum, 0.5);
-    toDispose.push(shouldZero);
+    const threshold = this.api.full([], 0.5);
+    const shouldZero = this.api.gt(infAccum, threshold);
+    const zeroTensor = this.api.full([], 0);
+    toDispose.push(shouldZero, threshold, zeroTensor);
 
     // Loop 2: Mask grads and write back (all lazy)
     for (let i = 0; i < unscaledGrads.length; i++) {
-      const maskedGrad = this.api.where(shouldZero, 0.0, unscaledGrads[i]);
+      const maskedGrad = this.api.where(
+        shouldZero,
+        zeroTensor,
+        unscaledGrads[i],
+      );
       runtime.copy_(gradTensors[i]._unwrap(), maskedGrad._unwrap());
       toDispose.push(maskedGrad);
     }
@@ -367,11 +388,13 @@ export class GradScaler {
   }
 
   /**
-   * Update flags after step(). Scale adjustment is deferred to resolveDeferred().
+   * Update scale after step(). Reads back the inf detection result for the
+   * elementwise unscale path immediately (not deferred) so the infAccum
+   * tensor doesn't need to survive across step boundaries.
    *
-   * Call after step() at the end of each training iteration.
+   * Call after step() at the end of each training iteration, before markStep().
    */
-  update(): void {
+  async update(): Promise<void> {
     if (!this.enabled) {
       this._unscaleCalled = false;
       return;
@@ -383,7 +406,17 @@ export class GradScaler {
       );
     }
 
-    // Reset for next step — scale adjustment happens in resolveDeferred()
+    // Elementwise path: read infAccum NOW (before markStep destroys it).
+    // The fused path uses a raw GPU buffer (_pendingInfBuffer) which is not
+    // affected by step-scoped cleanup — it's resolved in resolveDeferred().
+    if (this._pendingInfAccum) {
+      const totalInfCount = await this._pendingInfAccum.item();
+      this._foundInfThisStep = totalInfCount > 0.5;
+      this._pendingInfAccum.dispose();
+      this._pendingInfAccum = null;
+      this._applyScaleAdjustment();
+    }
+
     this._unscaleCalled = false;
   }
 

@@ -2,38 +2,44 @@
  * Matmul dispatch: kernel selection, pipeline caching, and execution.
  */
 
-import { dispatchComputePass, getCurrentOpLabel, createParamsBuffer as sharedCreateParamsBuffer, releaseParamsBuffer, cachedCreateBindGroup, type RecordedDispatch } from "../index";
-import { F32_BYTES } from "../shape-utils";
-
-/** Module-level recording buffer (shared with index.ts recording system). */
-let matmulRecordingBuffer: RecordedDispatch[] | null = null;
-export function setMatmulRecordingBuffer(buf: RecordedDispatch[] | null): void {
-  matmulRecordingBuffer = buf;
-}
-
+import {
+  cachedCreateBindGroup,
+  releaseParamsBuffer,
+  createParamsBuffer as sharedCreateParamsBuffer,
+} from "../bind-group-cache";
+import { dispatchComputePass } from "../dispatch";
+import type {
+  GPUBuffer,
+  GPUComputePipeline,
+  GPUDevice,
+  GPUQueue,
+} from "../gpu-types";
+import { GPUBufferUsage } from "../gpu-types";
+import { getWarmupPipeline, recordPipeline } from "../pipeline-warmup";
+import { getCurrentOpLabel } from "../shared-encoder";
+import { onTeardown } from "../webgpu-state";
+import {
+  cacheTuningResult,
+  generateNeighborConfigs,
+  getDefaultConfigForShape,
+} from "./autotune";
+import {
+  generateKSplitReductionShaderTileIR,
+  generateTiledMatmulShaderTileIR,
+} from "./tile-matmul";
 import {
   type CodegenOptions,
-  type EpilogueConfig,
-  generateTiledMatmulShader,
-  getShaderCacheKey,
-  generateKSplitReductionShader,
-  getKSplitReductionCacheKey,
-} from "./codegen";
-import {
   classifyShape,
   DEFAULT_CONFIG,
   type DType,
+  type EpilogueConfig,
+  getShaderCacheKey,
   getSubgroupSupport,
   getTransposeMode,
-  getWorkgroupSize,
   type MatmulKernelConfig,
   type ShapeClass,
   validateConfig,
 } from "./types";
-import { getDefaultConfigForShape, generateNeighborConfigs } from "./autotune";
-import { autotune, type BenchmarkFn, cacheTuningResult } from "./autotune";
-import type { GPUBuffer, GPUDevice, GPUComputePipeline, GPUCommandEncoder, GPUQueue } from "../gpu-types";
-import { GPUBufferUsage } from "../gpu-types";
 
 /**
  * Pipeline cache for compiled matmul kernels.
@@ -53,13 +59,6 @@ const perShapeTuningCache = new Map<string, MatmulKernelConfig>();
 
 function getPerShapeKey(m: number, n: number, k: number, dtype: DType): string {
   return `${m}_${n}_${k}_${dtype}`;
-}
-
-/**
- * Clear the per-shape tuning cache.
- */
-function clearPerShapeTuningCache(): void {
-  perShapeTuningCache.clear();
 }
 
 /**
@@ -95,20 +94,6 @@ export function isAutotuneEnabled(): boolean {
 }
 
 /**
- * Clear the pipeline cache.
- */
-function clearPipelineCache(): void {
-  pipelineCache.clear();
-}
-
-/**
- * Get tuning cache key.
- */
-function getTuningKey(shapeClass: ShapeClass, dtype: DType, hasEpilogue: boolean = false): string {
-  return `${shapeClass}_${dtype}_${hasEpilogue ? "epilogue" : "bare"}`;
-}
-
-/**
  * Get the best kernel config for a shape class (from cache or default).
  * For bare matmuls, also checks the per-shape tuning cache when M,N,K are provided.
  */
@@ -126,25 +111,12 @@ function getConfigForShape(
     if (perShapeHit) return perShapeHit;
   }
   // Fall through to shape-class cache → defaults
-  const key = getTuningKey(shapeClass, dtype, hasEpilogue);
+  const key = `${shapeClass}_${dtype}_${hasEpilogue ? "epilogue" : "bare"}`;
   const cached = tuningCache.get(key);
   if (cached) {
     return cached;
   }
-  return getDefaultConfigForShape(shapeClass, hasEpilogue);
-}
-
-/**
- * Store a tuning result.
- */
-function setTuningResult(
-  shapeClass: ShapeClass,
-  dtype: DType,
-  config: MatmulKernelConfig,
-  hasEpilogue: boolean = false,
-): void {
-  const key = getTuningKey(shapeClass, dtype, hasEpilogue);
-  tuningCache.set(key, config);
+  return getDefaultConfigForShape(shapeClass, hasEpilogue, m, n, k);
 }
 
 /**
@@ -157,6 +129,7 @@ export function resetMatmulState(): void {
   autotuneCounter = 0;
   autotuningInProgress.clear();
 }
+onTeardown(resetMatmulState);
 
 /**
  * Clear the dispatch tuning cache.
@@ -187,7 +160,8 @@ function benchmarkDispatch(
   a: GPUBuffer,
   b: GPUBuffer,
   out: GPUBuffer,
-  m: number, n: number, k: number,
+  m: number,
+  n: number,
   config: MatmulKernelConfig,
   paramsBuffer: GPUBuffer,
   kSplitFactor: number,
@@ -198,7 +172,12 @@ function benchmarkDispatch(
   const workgroupsX = Math.ceil(n / config.tileN);
   const workgroupsY = Math.ceil(m / config.tileM);
 
-  if (kSplitFactor >= 2 && kSplitTempBuffer && reductionPipeline && reduceParamsBuffer) {
+  if (
+    kSplitFactor >= 2 &&
+    kSplitTempBuffer &&
+    reductionPipeline &&
+    reduceParamsBuffer
+  ) {
     // K-split path: matmul partials + reduction
     const matmulBG = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
@@ -226,7 +205,7 @@ function benchmarkDispatch(
     const pass2 = encoder.beginComputePass();
     pass2.setPipeline(reductionPipeline);
     pass2.setBindGroup(0, reduceBG);
-    pass2.dispatchWorkgroups(Math.ceil(m * n / 256));
+    pass2.dispatchWorkgroups(Math.ceil((m * n) / 256));
     pass2.end();
     queue.submit([encoder.finish()]);
   } else {
@@ -278,29 +257,54 @@ async function autotuneIfNeeded(
 
   try {
     const shapeClass = classifyShape(m, n, k, 1);
-    const baseConfig = getDefaultConfigForShape(shapeClass, false);
+    const baseConfig = getDefaultConfigForShape(shapeClass, false, m, n, k);
     const candidates = generateNeighborConfigs(baseConfig, includeSubgroups);
     // Add DEFAULT_CONFIG if not already included
-    const candidateKeys = new Set(candidates.map(c =>
-      `${c.tileM}_${c.tileN}_${c.tileK}_${c.threadTileM}_${c.threadTileN}_${c.vectorWidth}_${c.useSubgroups}`));
+    const candidateKeys = new Set(
+      candidates.map(
+        (c) =>
+          `${c.tileM}_${c.tileN}_${c.tileK}_${c.threadTileM}_${c.threadTileN}_${c.vectorWidth}_${c.useSubgroups}`,
+      ),
+    );
     const defaultKey = `${DEFAULT_CONFIG.tileM}_${DEFAULT_CONFIG.tileN}_${DEFAULT_CONFIG.tileK}_${DEFAULT_CONFIG.threadTileM}_${DEFAULT_CONFIG.threadTileN}_${DEFAULT_CONFIG.vectorWidth}_${DEFAULT_CONFIG.useSubgroups}`;
     if (!candidateKeys.has(defaultKey)) {
       candidates.push(DEFAULT_CONFIG);
     }
 
     // Create test buffers (reused across all candidates)
-    const aSize = m * k * F32_BYTES;
-    const bSize = k * n * F32_BYTES;
-    const outSize = m * n * F32_BYTES;
-    const aBuffer = device.createBuffer({ size: aSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    const bBuffer = device.createBuffer({ size: bSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    const outBuffer = device.createBuffer({ size: outSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const aSize = m * k * 4;
+    const bSize = k * n * 4;
+    const outSize = m * n * 4;
+    const aBuffer = device.createBuffer({
+      size: aSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    const bBuffer = device.createBuffer({
+      size: bSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    const outBuffer = device.createBuffer({
+      size: outSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
 
     // Create params buffer (shared across all candidates — M,N,K are the same)
     const lda = k; // NN transpose mode
     const ldb = n;
     const ldc = n;
-    const paramsData = packMatmulParams(m, n, k, lda, ldb, ldc, 1.0, 1, m * k, k * n, m * n);
+    const paramsData = packMatmulParams(
+      m,
+      n,
+      k,
+      lda,
+      ldb,
+      ldc,
+      1.0,
+      1,
+      m * k,
+      k * n,
+      m * n,
+    );
     const paramsBuffer = device.createBuffer({
       size: Math.max(paramsData.byteLength, 48),
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -320,8 +324,11 @@ async function autotuneIfNeeded(
     let kSplitTempBuffer: GPUBuffer | undefined;
     let reduceParamsBuffer: GPUBuffer | undefined;
     if (maxKSplitFactor >= 2) {
-      const tempBytes = maxKSplitFactor * totalElements * F32_BYTES;
-      kSplitTempBuffer = device.createBuffer({ size: tempBytes, usage: GPUBufferUsage.STORAGE });
+      const tempBytes = maxKSplitFactor * totalElements * 4;
+      kSplitTempBuffer = device.createBuffer({
+        size: tempBytes,
+        usage: GPUBufferUsage.STORAGE,
+      });
       const reduceParamsBuf = new ArrayBuffer(8);
       const reduceU32 = new Uint32Array(reduceParamsBuf);
       const reduceF32 = new Float32Array(reduceParamsBuf);
@@ -345,35 +352,81 @@ async function autotuneIfNeeded(
           const workgroupsX = Math.ceil(n / config.tileN);
           const workgroupsY = Math.ceil(m / config.tileM);
           const baseWorkgroups = workgroupsX * workgroupsY;
-          const kSplitFactor = computeKSplitFactor(baseWorkgroups, k, config.tileK, 1, false);
+          const kSplitFactor = computeKSplitFactor(
+            baseWorkgroups,
+            k,
+            config.tileK,
+            1,
+            false,
+          );
 
           // Get or create pipeline (uses shared pipeline cache — this is safe,
           // pipeline cache is content-addressed and doesn't have sequence state)
-          const pipeline = getOrCreatePipeline(device, kSplitFactor >= 2
-            ? { config, transposeMode, dtype, batched: false, kSplit: kSplitFactor }
-            : { config, transposeMode, dtype, batched: false }
+          const pipeline = getOrCreatePipeline(
+            device,
+            kSplitFactor >= 2
+              ? {
+                  config,
+                  transposeMode,
+                  dtype,
+                  batched: false,
+                  kSplit: kSplitFactor,
+                }
+              : { config, transposeMode, dtype, batched: false },
           );
 
           // Get reduction pipeline if K-split
           let reductionPipeline: GPUComputePipeline | undefined;
           if (kSplitFactor >= 2) {
-            reductionPipeline = getOrCreateReductionPipeline(device, kSplitFactor, dtype);
+            reductionPipeline = getOrCreateReductionPipeline(
+              device,
+              kSplitFactor,
+              dtype,
+            );
           }
 
           // Warmup
           for (let i = 0; i < 2; i++) {
-            benchmarkDispatch(device, queue, pipeline, aBuffer, bBuffer, outBuffer, m, n, k, config, paramsBuffer,
-              kSplitFactor, kSplitTempBuffer, reductionPipeline, reduceParamsBuffer);
+            benchmarkDispatch(
+              device,
+              queue,
+              pipeline,
+              aBuffer,
+              bBuffer,
+              outBuffer,
+              m,
+              n,
+              config,
+              paramsBuffer,
+              kSplitFactor,
+              kSplitTempBuffer,
+              reductionPipeline,
+              reduceParamsBuffer,
+            );
           }
-          await queue.onSubmittedWorkDone();
+          await queue.onSubmittedWorkDone?.();
 
           // Timed iterations
           const times: number[] = [];
           for (let i = 0; i < 3; i++) {
             const start = performance.now();
-            benchmarkDispatch(device, queue, pipeline, aBuffer, bBuffer, outBuffer, m, n, k, config, paramsBuffer,
-              kSplitFactor, kSplitTempBuffer, reductionPipeline, reduceParamsBuffer);
-            await queue.onSubmittedWorkDone();
+            benchmarkDispatch(
+              device,
+              queue,
+              pipeline,
+              aBuffer,
+              bBuffer,
+              outBuffer,
+              m,
+              n,
+              config,
+              paramsBuffer,
+              kSplitFactor,
+              kSplitTempBuffer,
+              reductionPipeline,
+              reduceParamsBuffer,
+            );
+            await queue.onSubmittedWorkDone?.();
             times.push(performance.now() - start);
           }
 
@@ -431,7 +484,8 @@ export async function pretuneMatmulShapes(
 ): Promise<void> {
   // Autotuning requires either env var TORCHLETTE_AUTOTUNE=1 or programmatic
   // setAutotuneEnabled(true) (used by compile({ autotune: true }))
-  const envEnabled = typeof process !== "undefined" && process.env?.TORCHLETTE_AUTOTUNE === "1";
+  const envEnabled =
+    typeof process !== "undefined" && process.env?.TORCHLETTE_AUTOTUNE === "1";
   if (!envEnabled && !isAutotuneEnabled()) {
     return;
   }
@@ -452,6 +506,33 @@ export async function pretuneMatmulShapes(
   }
 }
 
+/** Shared pipeline-cache-or-compile logic for matmul and K-split reduction. */
+function cachedPipeline(
+  device: GPUDevice,
+  cache: Map<string, GPUComputePipeline>,
+  cacheKey: string,
+  generateShader: () => string,
+): GPUComputePipeline {
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+
+  const warmed = getWarmupPipeline(cacheKey);
+  if (warmed) {
+    cache.set(cacheKey, warmed);
+    return warmed;
+  }
+
+  const shaderCode = generateShader();
+  recordPipeline(cacheKey, shaderCode);
+  const module = device.createShaderModule({ code: shaderCode });
+  const pipeline = device.createComputePipeline({
+    layout: "auto",
+    compute: { module, entryPoint: "main" },
+  });
+  cache.set(cacheKey, pipeline);
+  return pipeline;
+}
+
 /**
  * Get or create a compute pipeline for the given options.
  */
@@ -459,21 +540,9 @@ function getOrCreatePipeline(
   device: GPUDevice,
   options: CodegenOptions,
 ): GPUComputePipeline {
-  const cacheKey = getShaderCacheKey(options);
-  const cached = pipelineCache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  const shaderCode = generateTiledMatmulShader(options);
-  const module = device.createShaderModule({ code: shaderCode });
-  const pipeline = device.createComputePipeline({
-    layout: "auto",
-    compute: { module, entryPoint: "main" },
-  });
-
-  pipelineCache.set(cacheKey, pipeline);
-  return pipeline;
+  return cachedPipeline(device, pipelineCache, getShaderCacheKey(options), () =>
+    generateTiledMatmulShaderTileIR(options),
+  );
 }
 
 /**
@@ -547,80 +616,6 @@ type DispatchMatmulOptions = {
   inputCastB?: DType;
 };
 
-/**
- * Internal matmul dispatch that requires a config.
- * Used by autotuning benchmarks to avoid recursive autotuning.
- */
-function dispatchTiledMatmulInternal(options: DispatchMatmulOptions & { config: MatmulKernelConfig }): void {
-  const {
-    device,
-    queue,
-    a,
-    b,
-    out,
-    m,
-    n,
-    k,
-    batchSize = 1,
-    transA = false,
-    transB = false,
-    alpha = 1.0,
-    dtype = "f32",
-    dtypeB,
-    config,
-    epilogue,
-    epilogueInputs = [],
-  } = options;
-
-  // Validate config
-  validateConfig(config);
-
-  // Get transpose mode
-  const transposeMode = getTransposeMode(transA, transB);
-
-  // Compute leading dimensions
-  const lda = transA ? m : k;
-  const ldb = transB ? k : n;
-  const ldc = n;
-
-  // Compute batch strides
-  const batchStrideA = options.batchStrideA ?? m * k;
-  const batchStrideB = options.batchStrideB ?? k * n;
-  const batchStrideC = options.batchStrideC ?? m * n;
-
-  // Build codegen options
-  const codegenOptions: CodegenOptions = {
-    config,
-    transposeMode,
-    dtype,
-    dtypeB,
-    epilogue,
-    batched: batchSize > 1,
-  };
-
-  // Get or create pipeline
-  const pipeline = getOrCreatePipeline(device, codegenOptions);
-
-  // Create params buffer via shared pool
-  const paramsData = packMatmulParams(m, n, k, lda, ldb, ldc, alpha, batchSize, batchStrideA, batchStrideB, batchStrideC);
-  const paramsBuffer = sharedCreateParamsBuffer(device, paramsData);
-
-  // Build flat buffer array for cached bind group
-  const bgBuffers = [a, b, out, paramsBuffer, ...epilogueInputs];
-  const bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers);
-
-  // Compute dispatch dimensions
-  const workgroupsX = Math.ceil(n / config.tileN);
-  const workgroupsY = Math.ceil(m / config.tileM);
-  const workgroupsZ = batchSize;
-
-  // Encode and submit
-  dispatchComputePass(pipeline, bindGroup, workgroupsX, workgroupsY, workgroupsZ, matmulRecordingBuffer);
-
-  // Release params buffer back to shared pool
-  releaseParamsBuffer(paramsBuffer);
-}
-
 // --- K-split infrastructure ---
 
 /** Cached temp buffers for K-split partial results, keyed by byte size. */
@@ -648,19 +643,12 @@ function getOrCreateReductionPipeline(
   kSplitCount: number,
   outputDtype: DType,
 ): GPUComputePipeline {
-  const cacheKey = getKSplitReductionCacheKey(kSplitCount, outputDtype);
-  const cached = reductionPipelineCache.get(cacheKey);
-  if (cached) return cached;
-
-  const shaderCode = generateKSplitReductionShader(kSplitCount, outputDtype);
-  const module = device.createShaderModule({ code: shaderCode });
-  const pipeline = device.createComputePipeline({
-    layout: "auto",
-    compute: { module, entryPoint: "main" },
-  });
-
-  reductionPipelineCache.set(cacheKey, pipeline);
-  return pipeline;
+  return cachedPipeline(
+    device,
+    reductionPipelineCache,
+    `ksplit_reduce_${kSplitCount}_${outputDtype}`,
+    () => generateKSplitReductionShaderTileIR(kSplitCount, outputDtype),
+  );
 }
 
 /** Minimum workgroups before considering K-split. */
@@ -704,7 +692,6 @@ function computeKSplitFactor(
 export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
   const {
     device,
-    queue,
     a,
     b,
     out,
@@ -724,11 +711,16 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
   } = options;
 
   // Check if epilogue is non-trivial (needed for config selection and K-split)
-  const hasEpilogue = !!epilogue && epilogue.ops.length > 0 && epilogue.ops.some(op => op.kind !== "none");
+  const hasEpilogue =
+    !!epilogue &&
+    epilogue.ops.length > 0 &&
+    epilogue.ops.some((op) => op.kind !== "none");
 
   // Select kernel config (epilogue-aware: bare matmuls use larger thread tiles)
   const shapeClass = classifyShape(m, n, k, batchSize);
-  const config = options.config ?? getConfigForShape(shapeClass, dtype, hasEpilogue, m, n, k);
+  const config =
+    options.config ??
+    getConfigForShape(shapeClass, dtype, hasEpilogue, m, n, k);
 
   // Validate config
   validateConfig(config);
@@ -752,11 +744,19 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
   const baseWorkgroups = workgroupsX * workgroupsY;
 
   // Determine K-split factor
-  const kSplitFactor = computeKSplitFactor(baseWorkgroups, k, config.tileK, batchSize, hasEpilogue);
+  const kSplitFactor = computeKSplitFactor(
+    baseWorkgroups,
+    k,
+    config.tileK,
+    batchSize,
+    hasEpilogue,
+  );
 
   if (kSplitFactor >= 2) {
     // --- K-split path: two dispatches ---
-    const outputDtype = epilogue?.outputDtype ?? (dtype === "f32" || (dtypeB ?? dtype) === "f32" ? "f32" : dtype);
+    const outputDtype =
+      epilogue?.outputDtype ??
+      (dtype === "f32" || (dtypeB ?? dtype) === "f32" ? "f32" : dtype);
 
     // 1. K-split matmul: partials[P * M * N] in f32
     const totalElements = m * n;
@@ -775,20 +775,50 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
     };
 
     const kSplitPipeline = getOrCreatePipeline(device, kSplitCodegenOptions);
-    const kSplitParamsData = packMatmulParams(m, n, k, lda, ldb, ldc, 1.0, 1, batchStrideA, batchStrideB, batchStrideC);
-    const kSplitParamsBuffer = sharedCreateParamsBuffer(device, kSplitParamsData);
+    const kSplitParamsData = packMatmulParams(
+      m,
+      n,
+      k,
+      lda,
+      ldb,
+      ldc,
+      1.0,
+      1,
+      batchStrideA,
+      batchStrideB,
+      batchStrideC,
+    );
+    const kSplitParamsBuffer = sharedCreateParamsBuffer(
+      device,
+      kSplitParamsData,
+    );
 
     const kSplitBgBuffers = [a, b, tempBuffer, kSplitParamsBuffer];
-    const kSplitBindGroup = cachedCreateBindGroup(device, kSplitPipeline, kSplitBgBuffers);
+    const kSplitBindGroup = cachedCreateBindGroup(
+      device,
+      kSplitPipeline,
+      kSplitBgBuffers,
+    );
 
     // Dispatch K-split matmul
     const opLabel = getCurrentOpLabel() ?? "matmul";
-    dispatchComputePass(kSplitPipeline, kSplitBindGroup, workgroupsX, workgroupsY, kSplitFactor, matmulRecordingBuffer, opLabel);
+    dispatchComputePass(
+      kSplitPipeline,
+      kSplitBindGroup,
+      workgroupsX,
+      workgroupsY,
+      kSplitFactor,
+      opLabel,
+    );
 
     releaseParamsBuffer(kSplitParamsBuffer);
 
     // 2. Reduction: sum P partials → final output with alpha
-    const reductionPipeline = getOrCreateReductionPipeline(device, kSplitFactor, outputDtype as DType);
+    const reductionPipeline = getOrCreateReductionPipeline(
+      device,
+      kSplitFactor,
+      outputDtype as DType,
+    );
 
     // Pack reduction params: totalElements, alpha
     const reduceParamsBuf = new ArrayBuffer(8);
@@ -799,17 +829,33 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
     const reduceParamsBuffer = sharedCreateParamsBuffer(device, reduceU32);
 
     const reduceBgBuffers = [tempBuffer, out, reduceParamsBuffer];
-    const reduceBindGroup = cachedCreateBindGroup(device, reductionPipeline, reduceBgBuffers);
+    const reduceBindGroup = cachedCreateBindGroup(
+      device,
+      reductionPipeline,
+      reduceBgBuffers,
+    );
 
     const reduceWorkgroups = Math.ceil(totalElements / 256);
 
-    dispatchComputePass(reductionPipeline, reduceBindGroup, reduceWorkgroups, 1, 1, matmulRecordingBuffer, opLabel + "_ksplit_reduce");
+    dispatchComputePass(
+      reductionPipeline,
+      reduceBindGroup,
+      reduceWorkgroups,
+      1,
+      1,
+      opLabel + "_ksplit_reduce",
+    );
 
     releaseParamsBuffer(reduceParamsBuffer);
     return;
   }
 
   // --- Standard path (no K-split) ---
+
+  // Swap grid axes for L2 cache reuse when the N-grid is much wider than M-grid.
+  // Consecutive workgroups then iterate over M (sharing B column tiles in L2).
+  const swapGrid =
+    batchSize === 1 && workgroupsX > workgroupsY * 4 ? true : undefined;
 
   // Build codegen options
   const codegenOptions: CodegenOptions = {
@@ -821,13 +867,26 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
     batched: batchSize > 1,
     inputCastA,
     inputCastB,
+    swapGrid,
   };
 
   // Get or create pipeline
   const pipeline = getOrCreatePipeline(device, codegenOptions);
 
   // Create params buffer via shared pool
-  const paramsData = packMatmulParams(m, n, k, lda, ldb, ldc, alpha, batchSize, batchStrideA, batchStrideB, batchStrideC);
+  const paramsData = packMatmulParams(
+    m,
+    n,
+    k,
+    lda,
+    ldb,
+    ldc,
+    alpha,
+    batchSize,
+    batchStrideA,
+    batchStrideB,
+    batchStrideC,
+  );
   const paramsBuffer = sharedCreateParamsBuffer(device, paramsData);
 
   // Build flat buffer array for cached bind group
@@ -836,8 +895,12 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
 
   const workgroupsZ = batchSize;
 
+  // When grid is swapped, X iterates over M and Y over N
+  const dispatchX = swapGrid ? workgroupsY : workgroupsX;
+  const dispatchY = swapGrid ? workgroupsX : workgroupsY;
+
   // Encode and submit
-  dispatchComputePass(pipeline, bindGroup, workgroupsX, workgroupsY, workgroupsZ, matmulRecordingBuffer);
+  dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY, workgroupsZ);
 
   // Release params buffer back to shared pool
   releaseParamsBuffer(paramsBuffer);

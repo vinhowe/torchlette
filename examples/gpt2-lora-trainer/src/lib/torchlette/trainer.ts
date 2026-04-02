@@ -7,10 +7,10 @@
  * - Gradient checkpointing to trade compute for memory
  */
 
-import type { FrontendTensor as Tensor, Torchlette } from 'torchlette';
-import { Adam, GradScaler } from 'torchlette';
-import type { GPT2WithLoRA } from './gpt2-lora';
-import type { GPT2Tokenizer } from './tokenizer';
+import type { FrontendTensor as Tensor, Torchlette } from "torchlette";
+import { Adam, GradScaler, nn, setProfilePhase } from "torchlette";
+import type { GPT2WithLoRA } from "./gpt2-lora";
+import type { GPT2Tokenizer } from "./tokenizer";
 
 export type TrainingConfig = {
   maxSteps: number;
@@ -21,11 +21,26 @@ export type TrainingConfig = {
   useAMP?: boolean;
   /** Enable gradient checkpointing (trade compute for memory) */
   useCheckpointing?: boolean;
+  /** Train ALL parameters, not just LoRA adapters */
+  fullFinetune?: boolean;
+};
+
+export type StepPhaseTimings = {
+  forward: number;
+  backward: number;
+  optimizer: number;
+  cleanup: number;
 };
 
 export type TrainingCallbacks = {
   onStepStart?: (step: number) => void;
-  onStepEnd?: (step: number, loss: number, timeMs: number) => void;
+  onStepEnd?: (
+    step: number,
+    loss: number,
+    timeMs: number,
+    memoryMB?: number,
+    phases?: StepPhaseTimings,
+  ) => void;
   shouldStop?: () => boolean;
 };
 
@@ -46,7 +61,7 @@ class SimpleDataLoader {
     private api: Torchlette,
     tokens: number[],
     private batchSize: number,
-    private seqLength: number
+    private seqLength: number,
   ) {
     this.tokens = new Uint32Array(tokens);
   }
@@ -64,27 +79,31 @@ class SimpleDataLoader {
     const targetData: number[] = [];
 
     for (let b = 0; b < this.batchSize; b++) {
-      // Wrap around if we've exhausted the data
-      if (this.currentIdx + this.seqLength + 1 > this.tokens.length) {
-        this.currentIdx = Math.floor(Math.random() * (this.tokens.length - this.seqLength - 1));
-      }
+      // Random starting position for diverse data exposure
+      const maxStart = this.tokens.length - this.seqLength - 1;
+      const start = Math.floor(Math.random() * maxStart);
 
       for (let i = 0; i < this.seqLength; i++) {
-        inputData.push(this.tokens[this.currentIdx + i]);
-        targetData.push(this.tokens[this.currentIdx + i + 1]);
+        inputData.push(this.tokens[start + i]);
+        targetData.push(this.tokens[start + i + 1]);
       }
-
-      // Move to next random position for variety
-      this.currentIdx = Math.floor(Math.random() * (this.tokens.length - this.seqLength - 1));
     }
 
     return {
-      input: this.api.tensorFromArray(inputData, [this.batchSize, this.seqLength], {
-        device: 'webgpu',
-      }),
-      target: this.api.tensorFromArray(targetData, [this.batchSize, this.seqLength], {
-        device: 'webgpu',
-      }),
+      input: this.api.tensorFromArray(
+        inputData,
+        [this.batchSize, this.seqLength],
+        {
+          device: "webgpu",
+        },
+      ),
+      target: this.api.tensorFromArray(
+        targetData,
+        [this.batchSize, this.seqLength],
+        {
+          device: "webgpu",
+        },
+      ),
     };
   }
 }
@@ -99,11 +118,7 @@ export class LoRATrainer {
   private optimizer: Adam | null = null;
   private gradScaler: GradScaler | null = null;
 
-  constructor(
-    api: Torchlette,
-    model: GPT2WithLoRA,
-    tokenizer: GPT2Tokenizer
-  ) {
+  constructor(api: Torchlette, model: GPT2WithLoRA, tokenizer: GPT2Tokenizer) {
     this.api = api;
     this.model = model;
     this.tokenizer = tokenizer;
@@ -115,7 +130,7 @@ export class LoRATrainer {
   async train(
     trainingText: string,
     config: TrainingConfig,
-    callbacks: TrainingCallbacks = {}
+    callbacks: TrainingCallbacks = {},
   ): Promise<TrainingResult> {
     const useAMP = config.useAMP ?? false;
     const useCheckpointing = config.useCheckpointing ?? false;
@@ -125,7 +140,7 @@ export class LoRATrainer {
 
     if (tokens.length < config.batchSize * (config.seqLength + 1)) {
       throw new Error(
-        `Training text too short. Need at least ${config.batchSize * (config.seqLength + 1)} tokens, got ${tokens.length}`
+        `Training text too short. Need at least ${config.batchSize * (config.seqLength + 1)} tokens, got ${tokens.length}`,
       );
     }
 
@@ -134,20 +149,29 @@ export class LoRATrainer {
       this.api,
       tokens,
       config.batchSize,
-      config.seqLength
+      config.seqLength,
     );
 
-    // Create optimizer for LoRA parameters only
-    const loraParams = this.model.getLoRAParameters();
-    this.optimizer = new Adam(loraParams, { lr: config.learningRate }, this.api);
+    // Create optimizer — full finetune trains all params, otherwise just LoRA
+    const trainableParams = config.fullFinetune
+      ? (this.model.setFullFinetuning(true), this.model.getAllParameters())
+      : this.model.getLoRAParameters();
+    this.optimizer = new Adam(
+      trainableParams,
+      { lr: config.learningRate },
+      this.api,
+    );
 
     // Create gradient scaler for AMP
     if (useAMP) {
       this.gradScaler = new GradScaler(this.api, {
-        initScale: 65536.0,
+        // Start at 1 (no scaling) — LoRA gradients are small and don't need
+        // amplification. The scaler will grow conservatively if stable.
+        // PyTorch's default of 65536 immediately overflows f16 for LoRA.
+        initScale: 1.0,
         growthFactor: 2.0,
         backoffFactor: 0.5,
-        growthInterval: 2000,
+        growthInterval: 1000,
       });
     }
 
@@ -162,6 +186,7 @@ export class LoRATrainer {
     let totalLoss = 0;
     let lastLoss = 0;
     const startTime = performance.now();
+    let emaLoss = 0; // biome-ignore
 
     // Create compiled forward function for AMP, fusion, and memory planning
     // The compile() region enables:
@@ -175,10 +200,13 @@ export class LoRATrainer {
     const compiledForwardWithLoss = useAMP
       ? api.compile((batchInput: Tensor, batchTarget: Tensor) => {
           // autocast inside compile enables f16 for matmuls
-          return api.autocast(() => {
-            const { loss } = model.forwardWithLoss(batchInput, batchTarget);
-            return loss;
-          }, { deviceType: 'webgpu' });
+          return api.autocast(
+            () => {
+              const { loss } = model.forwardWithLoss(batchInput, batchTarget);
+              return loss;
+            },
+            { deviceType: "webgpu" },
+          );
         })
       : null;
 
@@ -191,45 +219,77 @@ export class LoRATrainer {
       callbacks.onStepStart?.(step);
       const stepStart = performance.now();
 
+      // Begin step lifecycle (enables fusion, buffer arena, compiled plans)
+      await this.api.beginStep();
+
       // Get batch
       const { input, target } = dataLoader.nextBatch();
 
-      // Forward pass with loss - use compiled region for AMP
+      setProfilePhase("forward");
+      // Forward pass with loss.
+      // Wrap in tidy() to dispose intermediate FrontendTensors (layernorm
+      // outputs, attention scores, etc.) immediately. The underlying lazy
+      // nodes survive for backward — only the frontend wrappers are freed.
+      // Without this, ~100 FrontendTensors per step accumulate until GC,
+      // causing a multi-step memory sawtooth.
       let loss: Tensor;
       if (useAMP && compiledForwardWithLoss) {
-        // Run forward pass in compiled region with AMP + fusion + memory planning
-        loss = compiledForwardWithLoss(input, target);
-
-        // Scale loss for gradient scaling
-        loss = this.gradScaler!.scale(loss);
+        loss = this.api.tidy(() => {
+          let l = compiledForwardWithLoss(input, target);
+          if (this.gradScaler) l = this.gradScaler.scale(l);
+          this.api.keep(l);
+          return l;
+        });
       } else {
-        const result = this.model.forwardWithLoss(input, target);
-        loss = result.loss;
+        loss = this.api.tidy(() => {
+          const result = this.model.forwardWithLoss(input, target);
+          this.api.keep(result.loss);
+          return result.loss;
+        });
       }
 
-      // Backward pass
+      const fwdEnd = performance.now();
+
+      // Start loss readback: force forward plan, copy scalar to staging
+      // buffer, return a finish function. The staging buffer is separate
+      // from the pool, so backward can reuse the source buffer freely.
+      const finishLossRead = await this.api
+        ._runtime()
+        .startItemReadback(loss._unwrap());
+
+      setProfilePhase("backward");
+      const bwdStart = performance.now();
       await loss.backward();
 
-      // Optimizer step - with gradient unscaling for AMP
-      if (useAMP && this.gradScaler) {
+      // Finish reading loss — staging buffer mapAsync completed during
+      // backward graph construction (CPU work gave it time).
+      let lossValue = await finishLossRead();
+      if (this.gradScaler) {
+        lossValue = lossValue / this.gradScaler.getScale();
+      }
+
+      // Gradient clipping
+      await nn.clipGradNorm_(this.api, trainableParams, 1.0);
+      const bwdEnd = performance.now();
+
+      setProfilePhase("optimizer");
+      // Optimizer step
+      if (this.gradScaler) {
         await this.gradScaler.unscale_(this.optimizer!);
         const stepped = await this.gradScaler.step(this.optimizer!);
-        this.gradScaler.update();
-
+        await this.gradScaler.update();
         if (!stepped) {
-          // Skip this step due to NaN/Inf gradients
-          console.warn(`Step ${step}: Skipped due to NaN/Inf gradients, scale=${this.gradScaler.getScale()}`);
+          console.warn(
+            `Step ${step}: Skipped (scale=${this.gradScaler.getScale()})`,
+          );
         }
       } else {
         this.optimizer!.step();
       }
       this.optimizer!.zeroGrad();
+      const optEnd = performance.now();
 
-      // Get loss value (unscale if AMP was used)
-      let lossValue = await loss.item();
-      if (useAMP && this.gradScaler) {
-        lossValue = lossValue / this.gradScaler.getScale();
-      }
+      emaLoss = lossValue;
       totalLoss += lossValue;
       lastLoss = lossValue;
 
@@ -237,18 +297,37 @@ export class LoRATrainer {
       input.dispose();
       target.dispose();
 
+      setProfilePhase("cleanup");
+      // End step lifecycle (flush shared encoder, release buffers)
+      this.api.endStep();
+
       const stepTime = performance.now() - stepStart;
 
-      callbacks.onStepEnd?.(step, lossValue, stepTime);
-
-      // Memory cleanup - finalize the step and free intermediate tensors
       await this.api.markStep();
+
+      let memoryMB: number | undefined;
+      try {
+        const { getGPUMemoryStats } = await import("torchlette");
+        const stats = getGPUMemoryStats();
+        memoryMB = stats.currentBytes / (1024 * 1024);
+      } catch {}
+
+      const phases: StepPhaseTimings = {
+        forward: fwdEnd - stepStart,
+        backward: bwdEnd - bwdStart,
+        optimizer: optEnd - bwdEnd,
+        cleanup: stepTime - (optEnd - stepStart),
+      };
+      callbacks.onStepEnd?.(step, emaLoss, stepTime, memoryMB, phases);
     }
 
-    // Set model to eval mode and disable checkpointing
+    // Set model to eval mode, disable checkpointing and full finetuning
     this.model.train(false);
     if (useCheckpointing) {
       this.model.enableCheckpointing(false);
+    }
+    if (config.fullFinetune) {
+      this.model.setFullFinetuning(false);
     }
 
     const totalTime = performance.now() - startTime;
@@ -290,7 +369,9 @@ export class LoRATrainer {
   /**
    * Export LoRA weights asynchronously.
    */
-  async exportLoRAWeights(): Promise<Map<string, { data: Float32Array; shape: number[] }>> {
+  async exportLoRAWeights(): Promise<
+    Map<string, { data: Float32Array; shape: number[] }>
+  > {
     const weights = new Map<string, { data: Float32Array; shape: number[] }>();
     const loraParams = this.model.getLoRAParameters();
 

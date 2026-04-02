@@ -5,15 +5,16 @@
  * Based on the original OpenAI GPT-2 architecture.
  */
 
-import type { Tensor, Torchlette, DeviceKind } from "../../src/frontend";
+import type { DeviceKind, Tensor, Torchlette } from "../../src/frontend/torchlette";
 import {
-  Module,
-  Linear,
+  checkpoint,
+  crossEntropy,
+  Dropout,
   Embedding,
   LayerNorm,
-  Dropout,
-  crossEntropy,
-  checkpoint,
+  Linear,
+  Module,
+  ModuleList,
 } from "../../src/nn";
 
 // ============================================================================
@@ -66,6 +67,13 @@ export const DISTILGPT2_CONFIG: GPT2Config = {
 };
 
 // ============================================================================
+// KV Cache Types
+// ============================================================================
+
+/** Per-layer KV cache: cached key and value tensors from previous positions. */
+export type KVCache = { k: Tensor; v: Tensor };
+
+// ============================================================================
 // Causal Self-Attention
 // ============================================================================
 
@@ -73,7 +81,8 @@ export const DISTILGPT2_CONFIG: GPT2Config = {
  * Multi-head causal (masked) self-attention.
  *
  * Uses combined QKV projection for efficiency, applies causal mask to prevent
- * attending to future positions.
+ * attending to future positions. Supports optional KV caching for efficient
+ * autoregressive generation.
  */
 export class CausalSelfAttention extends Module {
   private readonly numHeads: number;
@@ -118,65 +127,67 @@ export class CausalSelfAttention extends Module {
     this.residDropout = new Dropout(api, { p: config.dropoutRate });
 
     // Cache causal mask: upper-triangular -1e9 values (0 on/below diagonal)
-    const causalBias = api.triu(api.full([1, 1, config.blockSize, config.blockSize], -1e9), 1);
+    const causalBias = api.triu(
+      api.full([1, 1, config.blockSize, config.blockSize], -1e9),
+      1,
+    );
     this.registerBuffer("causalBias", causalBias);
-
-    // Register child modules for recursive train()/eval()
-    this.registerModule("cAttn", this.cAttn);
-    this.registerModule("cProj", this.cProj);
-    this.registerModule("attnDropout", this.attnDropout);
-    this.registerModule("residDropout", this.residDropout);
   }
 
   /**
    * Forward pass for causal self-attention.
    *
    * @param x - Input tensor of shape [batch, seqLen, embedDim]
-   * @returns Output tensor of shape [batch, seqLen, embedDim]
+   * @param pastKV - Optional cached K/V from previous positions
+   * @returns Output tensor and present KV cache (if pastKV was provided)
    */
-  forward(x: Tensor): Tensor {
+  forward(x: Tensor, pastKV?: KVCache): { out: Tensor; presentKV?: KVCache } {
     const [batch, seqLen, _embedDim] = x.shape;
 
     // Combined QKV projection: [batch, seqLen, 3 * embedDim]
     const qkv = this.cAttn.forward(x);
 
-    // Split QKV using narrow (zero-cost view ops)
-    // qkv: [batch, seqLen, 3 * embedDim]
-    // Reshape to [batch, seqLen, 3, embedDim], then narrow along dim 2
-    const qkvFor3 = qkv.reshape([batch, seqLen, 3, this.embedDim]);
-    const qSlice = qkvFor3.narrow(2, 0, 1); // [batch, seqLen, 1, embedDim] view
-    const kSlice = qkvFor3.narrow(2, 1, 1); // [batch, seqLen, 1, embedDim] view
-    const vSlice = qkvFor3.narrow(2, 2, 1); // [batch, seqLen, 1, embedDim] view
+    // Split QKV into [batch, seqLen, embedDim] chunks, then reshape to multi-head
+    const [qFlat, kFlat, vFlat] = qkv.chunk(3, -1);
+    const toHeads = (t: Tensor, tSeqLen: number) =>
+      t
+        .reshape([batch, tSeqLen, this.numHeads, this.headDim])
+        .permute([0, 2, 1, 3])
+        .contiguous();
+    const q = toHeads(qFlat, seqLen);
+    let k = toHeads(kFlat, seqLen);
+    let v = toHeads(vFlat, seqLen);
 
-    // Reshape narrow views to multi-head layout
-    // inferReshapeStrides handles the non-contiguous narrow views (zero-cost)
-    const q = qSlice
-      .reshape([batch, seqLen, this.numHeads, this.headDim])
-      .permute([0, 2, 1, 3])
-      .contiguous();
-    const k = kSlice
-      .reshape([batch, seqLen, this.numHeads, this.headDim])
-      .permute([0, 2, 1, 3])
-      .contiguous();
-    const v = vSlice
-      .reshape([batch, seqLen, this.numHeads, this.headDim])
-      .permute([0, 2, 1, 3])
-      .contiguous();
+    // KV cache: concatenate past K/V with current K/V
+    let presentKV: KVCache | undefined;
+    if (pastKV) {
+      k = this.api.cat([pastKV.k, k], 2); // concat along seqLen dim
+      v = this.api.cat([pastKV.v, v], 2);
+      presentKV = { k, v };
+    }
+
+    const kvSeqLen = k.shape[2]; // total sequence length (past + current)
 
     // Scaled dot-product attention
-    // Use fused FlashAttention when dropout is disabled (eval mode or rate=0)
     let attnOutput: Tensor;
-    if (!this.attnDropout.training || this.dropoutRate === 0) {
-      // Fused path: single kernel for Q@K^T + scale + causal_mask + softmax + attn@V
+    // Use fused FlashAttention only when Q/K/V have the same seqLen
+    // (no KV cache) and dropout is disabled
+    if (!pastKV && (!this.attnDropout.training || this.dropoutRate === 0)) {
       const scale = 1.0 / Math.sqrt(this.headDim);
       attnOutput = this.api.scaledDotProductAttention(q, k, v, scale, true);
     } else {
-      // Decomposed path (needed when dropout is active)
+      // Decomposed path: needed when KV cache makes Q/K seqLen differ,
+      // or when dropout is active during training
       const kT = k.transpose({ dim0: 2, dim1: 3 });
-      const scores = q.matmul(kT);
+      const scores = q.matmul(kT); // [batch, heads, seqLen, kvSeqLen]
       const scaledScores = scores.mul(1.0 / Math.sqrt(this.headDim));
 
-      const mask = this.causalBias.narrow(2, 0, seqLen).narrow(3, 0, seqLen);
+      // Causal mask: slice to [seqLen, kvSeqLen] window
+      // For cached inference: Q positions are [kvSeqLen-seqLen, kvSeqLen),
+      // K positions are [0, kvSeqLen). We need the mask rows for Q's positions.
+      const mask = this.causalBias
+        .narrow(2, kvSeqLen - seqLen, seqLen)
+        .narrow(3, 0, kvSeqLen);
       const maskedScores = this.api.add(scaledScores, mask);
       const attnWeights = maskedScores.softmax(-1);
       const attnDropped = this.attnDropout.forward(attnWeights);
@@ -184,24 +195,16 @@ export class CausalSelfAttention extends Module {
     }
 
     // Concatenate heads: [batch, numHeads, seqLen, headDim] -> [batch, seqLen, embedDim]
-    // Note: permute creates non-contiguous tensor, need contiguous before reshape
     const attnConcat = attnOutput
       .permute([0, 2, 1, 3])
       .contiguous()
       .reshape([batch, seqLen, this.embedDim]);
 
-    // Output projection
+    // Output projection + residual dropout
     const output = this.cProj.forward(attnConcat);
+    const out = this.residDropout.forward(output);
 
-    // Residual dropout
-    return this.residDropout.forward(output);
-  }
-
-  /**
-   * Get all learnable parameters.
-   */
-  parameters(): Tensor[] {
-    return [...this.cAttn.parameters(), ...this.cProj.parameters()];
+    return { out, presentKV };
   }
 }
 
@@ -232,11 +235,6 @@ export class MLP extends Module {
       device,
     });
     this.dropout = new Dropout(api, { p: config.dropoutRate });
-
-    // Register child modules for recursive train()/eval()
-    this.registerModule("cFc", this.cFc);
-    this.registerModule("cProj", this.cProj);
-    this.registerModule("dropout", this.dropout);
   }
 
   /**
@@ -247,13 +245,6 @@ export class MLP extends Module {
     h = h.gelu();
     h = this.cProj.forward(h);
     return this.dropout.forward(h);
-  }
-
-  /**
-   * Get all learnable parameters.
-   */
-  parameters(): Tensor[] {
-    return [...this.cFc.parameters(), ...this.cProj.parameters()];
   }
 }
 
@@ -282,12 +273,6 @@ export class TransformerBlock extends Module {
     this.attn = new CausalSelfAttention(api, config, { device });
     this.ln2 = new LayerNorm(api, config.embedDim, { device });
     this.mlp = new MLP(api, config, { device });
-
-    // Register child modules for recursive train()/eval()
-    this.registerModule("ln1", this.ln1);
-    this.registerModule("attn", this.attn);
-    this.registerModule("ln2", this.ln2);
-    this.registerModule("mlp", this.mlp);
   }
 
   /**
@@ -295,28 +280,19 @@ export class TransformerBlock extends Module {
    * x = x + attn(ln1(x))
    * x = x + mlp(ln2(x))
    */
-  forward(x: Tensor): Tensor {
+  forward(x: Tensor, pastKV?: KVCache): { out: Tensor; presentKV?: KVCache } {
     // Attention block with residual
-    const attnOut = this.attn.forward(this.ln1.forward(x));
+    const { out: attnOut, presentKV } = this.attn.forward(
+      this.ln1.forward(x),
+      pastKV,
+    );
     let h = this.api.add(x, attnOut);
 
     // MLP block with residual
     const mlpOut = this.mlp.forward(this.ln2.forward(h));
     h = this.api.add(h, mlpOut);
 
-    return h;
-  }
-
-  /**
-   * Get all learnable parameters.
-   */
-  parameters(): Tensor[] {
-    return [
-      ...this.ln1.parameters(),
-      ...this.attn.parameters(),
-      ...this.ln2.parameters(),
-      ...this.mlp.parameters(),
-    ];
+    return { out: h, presentKV };
   }
 }
 
@@ -335,7 +311,7 @@ export class GPT2 extends Module {
   readonly wte: Embedding; // Token embeddings [paddedVocabSize, embedDim]
   readonly wpe: Embedding; // Position embeddings [blockSize, embedDim]
   readonly drop: Dropout;
-  readonly h: TransformerBlock[]; // Transformer blocks
+  readonly h: ModuleList; // Transformer blocks
   readonly lnF: LayerNorm; // Final layer norm
   declare readonly posIndices: Tensor; // Cached position indices [1, blockSize]
   // Note: lmHead shares weights with wte (weight tying)
@@ -363,25 +339,18 @@ export class GPT2 extends Module {
     this.drop = new Dropout(api, { p: config.dropoutRate });
 
     // Create transformer blocks
-    this.h = [];
+    this.h = new ModuleList(api);
     for (let i = 0; i < config.numLayers; i++) {
-      this.h.push(new TransformerBlock(api, config, { device }));
+      this.h.append(new TransformerBlock(api, config, { device }));
     }
 
     this.lnF = new LayerNorm(api, config.embedDim, { device });
 
     // Cache position indices: [0, 1, 2, ..., blockSize-1] reshaped to [1, blockSize]
-    const posIndices = api.arange(config.blockSize).reshape([1, config.blockSize]);
+    const posIndices = api
+      .arange(config.blockSize)
+      .reshape([1, config.blockSize]);
     this.registerBuffer("posIndices", posIndices);
-
-    // Register child modules for recursive train()/eval()
-    this.registerModule("wte", this.wte);
-    this.registerModule("wpe", this.wpe);
-    this.registerModule("drop", this.drop);
-    for (let i = 0; i < this.h.length; i++) {
-      this.registerModule(`h.${i}`, this.h[i]);
-    }
-    this.registerModule("lnF", this.lnF);
   }
 
   /**
@@ -392,8 +361,55 @@ export class GPT2 extends Module {
    * @param options - Optional forward options
    * @returns Logits tensor of shape [batch, seqLen, vocabSize]
    */
-  forward(idx: Tensor, options?: { useCheckpoint?: boolean; selectiveCheckpoint?: boolean }): Tensor {
+  forward(
+    idx: Tensor,
+    options?: { useCheckpoint?: boolean; selectiveCheckpoint?: boolean },
+  ): Tensor {
     return this.forwardWithLoss(idx, undefined, options).logits;
+  }
+
+  /**
+   * Forward pass with KV cache for efficient autoregressive generation.
+   *
+   * @param idx - Token indices of shape [batch, seqLen]
+   * @param pastKVs - Optional per-layer KV cache from previous positions
+   * @param posOffset - Position offset for position embeddings (= past sequence length)
+   * @returns Logits and updated KV cache
+   */
+  forwardCached(
+    idx: Tensor,
+    pastKVs?: KVCache[],
+    posOffset = 0,
+  ): { logits: Tensor; presentKVs: KVCache[] } {
+    const [_batch, seqLen] = idx.shape;
+
+    if (posOffset + seqLen > this.config.blockSize) {
+      throw new Error(
+        `Sequence length ${posOffset + seqLen} exceeds block size ${this.config.blockSize}`,
+      );
+    }
+
+    // Position indices offset by past sequence length
+    const pos = this.posIndices.narrow(1, posOffset, seqLen);
+
+    const tokEmb = this.wte.forward(idx);
+    const posEmb = this.wpe.forward(pos);
+    let x = this.api.add(tokEmb, posEmb);
+    x = this.drop.forward(x);
+
+    const presentKVs: KVCache[] = [];
+    for (let i = 0; i < this.h.length; i++) {
+      const block = this.h.get(i) as TransformerBlock;
+      const layerPast = pastKVs?.[i];
+      const { out, presentKV } = block.forward(x, layerPast);
+      x = out;
+      if (presentKV) presentKVs.push(presentKV);
+    }
+
+    x = this.lnF.forward(x);
+    const logits = this.api.linear(x, this.wte.weight, null);
+
+    return { logits, presentKVs };
   }
 
   /**
@@ -440,9 +456,9 @@ export class GPT2 extends Module {
       // This eliminates 6 expensive fusedAttentionForward recomputes during
       // backward while still saving the bulk of memory from MLP checkpointing.
       for (let i = 0; i < this.h.length; i++) {
-        const block = this.h[i];
+        const block = this.h.get(i) as TransformerBlock;
         // Attention block: NOT checkpointed
-        const attnOut = block.attn.forward(block.ln1.forward(x));
+        const { out: attnOut } = block.attn.forward(block.ln1.forward(x));
         const h = this.api.add(x, attnOut);
         // MLP block: checkpointed
         x = checkpoint(
@@ -458,12 +474,14 @@ export class GPT2 extends Module {
       // Full-block checkpointing: entire transformer block is checkpointed.
       // All activations (including attention O and L) are recomputed during backward.
       for (const block of this.h) {
-        x = checkpoint(this.api, (input: Tensor) => block.forward(input), [x]);
+        x = checkpoint(this.api, (input: Tensor) => block.forward(input).out, [
+          x,
+        ]);
       }
     } else {
       // Standard forward pass - store all activations
       for (const block of this.h) {
-        x = block.forward(x);
+        x = block.forward(x).out;
       }
     }
 
@@ -486,30 +504,20 @@ export class GPT2 extends Module {
       // The lm_head matmul uses paddedVocabSize for tile alignment, but cross-entropy
       // must only see vocabSize classes (padding logits at 0 would dominate softmax).
       const [batch, seqLenT] = targets.shape;
-      const flatLogits = logits.reshape([batch * seqLenT, this.paddedVocabSize]);
-      const realLogits = this.paddedVocabSize > this.config.vocabSize
-        ? flatLogits.narrow(1, 0, this.config.vocabSize)
-        : flatLogits;
+      const flatLogits = logits.reshape([
+        batch * seqLenT,
+        this.paddedVocabSize,
+      ]);
+      const realLogits =
+        this.paddedVocabSize > this.config.vocabSize
+          ? flatLogits.narrow(1, 0, this.config.vocabSize)
+          : flatLogits;
       const flatTargets = targets.reshape([batch * seqLenT]);
       loss = crossEntropy(this.api, realLogits, flatTargets);
     }
 
     return { logits, loss };
   }
-
-  /**
-   * Get all learnable parameters.
-   */
-  parameters(): Tensor[] {
-    const params: Tensor[] = [];
-    params.push(...this.wte.parameters());
-    params.push(...this.wpe.parameters());
-    for (const block of this.h) {
-      params.push(...block.parameters());
-    }
-    params.push(...this.lnF.parameters());
-    // Note: lmHead weight is tied to wte.weight, so we don't add it separately
-    return params;
-  }
-
+  // Note: parameters() inherited from Module base class.
+  // lm_head weight is tied to wte.weight, so not registered separately.
 }

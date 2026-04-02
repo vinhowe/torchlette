@@ -8,7 +8,7 @@
  *
  * This eliminates injection callbacks that were previously used to break
  * circular dependencies between buffer-pool, shared-encoder, gpu-context,
- * buffer-arena, dispatch-recording, and bind-group-cache.
+ * buffer-arena, and bind-group-cache.
  *
  * All setter functions are called only at lifecycle boundaries (step start/end),
  * not in hot dispatch loops. ESM live bindings make accessing these variables
@@ -24,7 +24,7 @@ import type { GPUBuffer, GPUCommandBuffer, WebGPUContext } from "./gpu-types";
 /**
  * Batch execution context - collects command buffers for deferred submission.
  */
-export interface BatchExecutionContext {
+interface BatchExecutionContext {
   /** Collected command buffers to submit together */
   commandBuffers: GPUCommandBuffer[];
   /** Buffers to destroy after the batch submits (deferred from mid-batch destroy calls) */
@@ -36,6 +36,26 @@ export let activeBatch: BatchExecutionContext | null = null;
 
 export function setActiveBatch(batch: BatchExecutionContext | null): void {
   activeBatch = batch;
+}
+
+// ============================================================================
+// Compilation Recording Flag
+// ============================================================================
+
+/**
+ * Whether compilation recording is active. Backend ops check this to bypass
+ * optimization caches (e.g., f16WeightCache) that return pre-existing buffers —
+ * such buffers wouldn't be tracked in bufferToSlot and would be silently
+ * dropped from the compiled plan's results.
+ */
+let compilationRecordingActive = false;
+
+export function isCompilationRecording(): boolean {
+  return compilationRecordingActive;
+}
+
+export function setCompilationRecording(active: boolean): void {
+  compilationRecordingActive = active;
 }
 
 // ============================================================================
@@ -96,24 +116,10 @@ export function requireContext(): WebGPUContext {
 export const arenaBufferSet = new Set<GPUBuffer>();
 
 // ============================================================================
-// Replay Pinned Buffer Set (moved from dispatch-recording.ts)
-// ============================================================================
-
-/**
- * When dispatch replay caches exist, buffers referenced by recorded bind groups
- * must not be destroyed between steps. This set accumulates all such buffers.
- */
-export let replayPinnedBufferSet: Set<GPUBuffer> | null = null;
-
-export function setReplayPinnedBufferSet(set: Set<GPUBuffer> | null): void {
-  replayPinnedBufferSet = set;
-}
-
-// ============================================================================
 // GPU Submit Counter (moved from shared-encoder.ts)
 // ============================================================================
 
-export let gpuSubmitCount = 0;
+let gpuSubmitCount = 0;
 
 export function getSubmitCount(): number {
   return gpuSubmitCount;
@@ -156,8 +162,33 @@ export const paramsSequenceSet = new Set<GPUBuffer>();
 // ============================================================================
 
 export let outputSeqIndex = 0;
-export function getOutputSeqIndex(): number { return outputSeqIndex; }
-export function setOutputSeqIndex(v: number): void { outputSeqIndex = v; }
+export function getOutputSeqIndex(): number {
+  return outputSeqIndex;
+}
+export function setOutputSeqIndex(v: number): void {
+  outputSeqIndex = v;
+}
+
+// ============================================================================
+// Teardown Registry (used by destroyWebGPU for test isolation)
+// ============================================================================
+
+/**
+ * Modules register cleanup callbacks here (e.g. to clear kernel caches,
+ * destroy persistent GPU buffers). Called by destroyWebGPU() before
+ * device.destroy(). Each module self-registers at import time — gpu-context.ts
+ * doesn't need to know about every kernel module.
+ */
+const teardownCallbacks: Array<() => void> = [];
+
+export function onTeardown(cb: () => void): void {
+  teardownCallbacks.push(cb);
+}
+
+export function runTeardownCallbacks(): void {
+  for (const cb of teardownCallbacks) cb();
+  teardownCallbacks.length = 0;
+}
 
 // ============================================================================
 // Current Op Label (moved from shared-encoder.ts)
@@ -165,5 +196,9 @@ export function setOutputSeqIndex(v: number): void { outputSeqIndex = v; }
 
 /** Current op label for GPU timestamp profiling (set from lazy.ts). */
 let currentOpLabel: string | null = null;
-export function setCurrentOpLabel(label: string | null): void { currentOpLabel = label; }
-export function getCurrentOpLabel(): string | null { return currentOpLabel; }
+export function setCurrentOpLabel(label: string | null): void {
+  currentOpLabel = label;
+}
+export function getCurrentOpLabel(): string | null {
+  return currentOpLabel;
+}

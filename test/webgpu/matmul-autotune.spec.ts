@@ -8,34 +8,29 @@
  * - Tuning cache operations
  * - Full autotune with mock benchmarks
  */
-import { describe, expect, it, beforeAll, beforeEach, afterEach } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { getWebGPUDevice, initWebGPU } from "../../src/backend/webgpu";
 import {
-  initWebGPU,
-  getWebGPUDevice,
-  webgpuBackend,
-} from "../../src/backend/webgpu";
-import {
-  generateTuningConfigs,
-  getDefaultConfigForShape,
-  getCachedTuningResult,
+  autotune,
+  type BenchmarkFn,
   cacheTuningResult,
   clearTuningCache,
   exportTuningCache,
+  generateTuningConfigs,
+  getCachedTuningResult,
+  getDefaultConfigForShape,
   importTuningCache,
-  autotune,
   quickAutotune,
-  type BenchmarkFn,
 } from "../../src/backend/webgpu/matmul/autotune";
+import { dispatchTiledMatmul } from "../../src/backend/webgpu/matmul/dispatch";
 import {
   classifyShape,
-  validateConfig,
   DEFAULT_CONFIG,
-  TUNING_SPACE,
-  type MatmulKernelConfig,
   type ShapeClass,
+  TUNING_SPACE,
   type TuneResult,
+  validateConfig,
 } from "../../src/backend/webgpu/matmul/types";
-import { dispatchTiledMatmul } from "../../src/backend/webgpu/matmul/dispatch";
 
 import { cpuOnly } from "../helpers/webgpu";
 
@@ -211,40 +206,58 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       expect(largeK.tileN).toBe(128);
     });
 
-    it("square_large bare uses larger thread tiles (t8x4)", () => {
+    it("square_large bare uses larger thread tiles (t8x4) with tileK=16", () => {
       const config = getDefaultConfigForShape("square_large", false);
       expect(config.tileM).toBe(64);
       expect(config.tileN).toBe(128);
-      expect(config.tileK).toBe(8);
+      expect(config.tileK).toBe(16);
       expect(config.threadTileM).toBe(8);
       expect(config.threadTileN).toBe(4);
     });
 
-    it("square_large epilogue uses smaller thread tiles (t4x4)", () => {
+    it("square_large epilogue uses smaller thread tiles (t4x4) with tileK=16", () => {
       const config = getDefaultConfigForShape("square_large", true);
       expect(config.tileM).toBe(64);
       expect(config.tileN).toBe(64);
-      expect(config.tileK).toBe(8);
+      expect(config.tileK).toBe(16);
       expect(config.threadTileM).toBe(4);
       expect(config.threadTileN).toBe(4);
     });
 
-    it("square_medium bare uses 64x64x8 config", () => {
+    it("square_medium bare uses 64x64x16 config", () => {
       const config = getDefaultConfigForShape("square_medium", false);
       expect(config.tileM).toBe(64);
       expect(config.tileN).toBe(64);
-      expect(config.tileK).toBe(8);
-    });
-
-    it("square_medium epilogue uses 32x32x16 config", () => {
-      const config = getDefaultConfigForShape("square_medium", true);
-      expect(config.tileM).toBe(32);
-      expect(config.tileN).toBe(32);
       expect(config.tileK).toBe(16);
     });
 
+    it("square_medium epilogue uses 64x64x16 config", () => {
+      const config = getDefaultConfigForShape("square_medium", true);
+      expect(config.tileM).toBe(64);
+      expect(config.tileN).toBe(64);
+      expect(config.tileK).toBe(16);
+    });
+
+    it("tall_skinny and short_wide have epilogue-specific configs", () => {
+      for (const sc of ["tall_skinny", "short_wide"] as ShapeClass[]) {
+        const bare = getDefaultConfigForShape(sc, false);
+        const epilogue = getDefaultConfigForShape(sc, true);
+        // Epilogue: conservative t4x4 to avoid register pressure
+        expect(epilogue.threadTileM).toBe(4);
+        expect(epilogue.threadTileN).toBe(4);
+        // Bare: larger thread tiles for better register reuse
+        expect(bare.threadTileM).toBe(8);
+        expect(bare.threadTileN).toBe(4);
+      }
+    });
+
     it("other shape classes return same config regardless of hasEpilogue", () => {
-      const otherClasses: ShapeClass[] = ["tall_skinny", "short_wide", "large_k", "gemv", "batched_small", "square_small"];
+      const otherClasses: ShapeClass[] = [
+        "large_k",
+        "gemv",
+        "batched_small",
+        "square_small",
+      ];
       for (const sc of otherClasses) {
         const bare = getDefaultConfigForShape(sc, false);
         const epilogue = getDefaultConfigForShape(sc, true);
@@ -322,7 +335,7 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
 
     it("throws on invalid import JSON", () => {
       expect(() => importTuningCache("invalid json")).toThrow(
-        "Invalid tuning cache JSON"
+        "Invalid tuning cache JSON",
       );
     });
 
@@ -357,7 +370,7 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
   describe("autotune", () => {
     it("runs autotune with mock benchmark", async () => {
       // Mock benchmark that returns decreasing time for configs with larger tiles
-      const mockBenchmark: BenchmarkFn = async (config, warmup, iters) => {
+      const mockBenchmark: BenchmarkFn = async (config, _warmup, _iters) => {
         // Larger tiles = better performance (lower time)
         const baseTime = 10.0;
         const tileBonus = (config.tileM + config.tileN) / 256;
@@ -407,14 +420,9 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
         return 5.0;
       };
 
-      const result = await autotune(
-        failingBenchmark,
-        256,
-        256,
-        256,
-        "f32",
-        { maxTrials: 5 }
-      );
+      const result = await autotune(failingBenchmark, 256, 256, 256, "f32", {
+        maxTrials: 5,
+      });
 
       // Should still return a result (either from successful benchmark or default)
       expect(result).toBeDefined();
@@ -464,7 +472,7 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
         1024,
         1024,
         1024,
-        "f32"
+        "f32",
       );
 
       expect(result.config.tileM).toBe(64);
@@ -479,7 +487,7 @@ describe.skipIf(SKIP)("Matmul Autotuning", () => {
       };
 
       await quickAutotune(mockBenchmark, 512, 512, 512, "f32");
-      const afterFirst = callCount;
+      const _afterFirst = callCount;
 
       // Clear and run autotune - should use same cache key
       const cached = getCachedTuningResult("square_medium", "f32");

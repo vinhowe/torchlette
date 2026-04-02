@@ -1,11 +1,11 @@
 /**
  * Tests for nn modules: Linear, LayerNorm, Embedding
  */
-import { describe, expect, it, beforeEach } from "vitest";
-import { Torchlette } from "../../src/frontend";
-import { Linear } from "../../src/nn/linear";
-import { LayerNorm } from "../../src/nn/layernorm";
+import { beforeEach, describe, expect, it } from "vitest";
+import { Torchlette } from "../../src/frontend/torchlette";
 import { Embedding } from "../../src/nn/embedding";
+import { LayerNorm } from "../../src/nn/layernorm";
+import { Linear } from "../../src/nn/linear";
 
 describe("nn.Linear", () => {
   let api: Torchlette;
@@ -21,7 +21,7 @@ describe("nn.Linear", () => {
     expect(linear.outFeatures).toBe(8);
     expect(linear.weight.shape).toEqual([8, 4]); // [outFeatures, inFeatures]
     expect(linear.bias).not.toBeNull();
-    expect(linear.bias!.shape).toEqual([8]);
+    expect(linear.bias?.shape).toEqual([8]);
   });
 
   it("creates without bias when bias=false", () => {
@@ -79,7 +79,7 @@ describe("nn.Linear", () => {
     const linear = new Linear(api, 4, 8);
 
     expect(linear.weight.requiresGrad).toBe(true);
-    expect(linear.bias!.requiresGrad).toBe(true);
+    expect(linear.bias?.requiresGrad).toBe(true);
   });
 });
 
@@ -96,9 +96,9 @@ describe("nn.LayerNorm", () => {
     expect(ln.normalizedShape).toBe(8);
     expect(ln.eps).toBe(1e-5);
     expect(ln.weight).not.toBeNull();
-    expect(ln.weight!.shape).toEqual([8]);
+    expect(ln.weight?.shape).toEqual([8]);
     expect(ln.bias).not.toBeNull();
-    expect(ln.bias!.shape).toEqual([8]);
+    expect(ln.bias?.shape).toEqual([8]);
   });
 
   it("allows custom eps", () => {
@@ -165,8 +165,8 @@ describe("nn.LayerNorm", () => {
   it("weight and bias have requiresGrad=true", () => {
     const ln = new LayerNorm(api, 8);
 
-    expect(ln.weight!.requiresGrad).toBe(true);
-    expect(ln.bias!.requiresGrad).toBe(true);
+    expect(ln.weight?.requiresGrad).toBe(true);
+    expect(ln.bias?.requiresGrad).toBe(true);
   });
 });
 
