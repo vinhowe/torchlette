@@ -218,6 +218,8 @@ export function reduction(
   outputDtype?: DType,
 ): BackendTensor {
   const ctx = requireContext();
+  let tensor = asGPUTensor(a);
+  let contiguousCopy: ReturnType<typeof asGPUTensor> | null = null;
 
   if (!tensor.isContiguous) {
     tensor = asGPUTensor(contiguous(tensor));
