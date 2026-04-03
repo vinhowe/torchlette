@@ -25,7 +25,7 @@ import { dispatchComputePass, getPipeline } from "../dispatch";
 import { requireContext } from "../gpu-context";
 import type { GPUBufferBinding } from "../gpu-types";
 import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
-import { compute2DDispatch, dtypeBytes, WORKGROUP_SIZE } from "../shape-utils";
+import { compute2DDispatch, dtypeBytes, F32_BYTES, WORKGROUP_SIZE } from "../shape-utils";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
 import { createTensor, createTrackedBuffer } from "../tensor";
 import {
@@ -81,7 +81,7 @@ export function gather(
 
   // --- Direct path ---
   if (!chunked) {
-    const outBuffer = resolveOutputBuffer(ctx.device, outSize * 4, [
+    const outBuffer = resolveOutputBuffer(ctx.device, outSize * F32_BYTES, [
       tensorA.buffer,
       tensorIndex.buffer,
     ]);
@@ -109,7 +109,7 @@ export function gather(
   );
 
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: outSize * F32_BYTES,
     usage:
       GPUBufferUsage.STORAGE |
       GPUBufferUsage.COPY_SRC |
@@ -198,13 +198,13 @@ export function scatterAdd(
   // Copy input to output (both paths need this)
   const outBuffer = chunked
     ? createTrackedBuffer(ctx.device, {
-        size: outSize * 4,
+        size: outSize * F32_BYTES,
         usage:
           GPUBufferUsage.STORAGE |
           GPUBufferUsage.COPY_SRC |
           GPUBufferUsage.COPY_DST,
       })
-    : resolveOutputBuffer(ctx.device, outSize * 4, [
+    : resolveOutputBuffer(ctx.device, outSize * F32_BYTES, [
         tensorA.buffer,
         tensorIndex.buffer,
         tensorSrc.buffer,

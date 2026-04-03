@@ -18,6 +18,7 @@ import { profileApiCall } from "../profiler";
 import {
   alignBufferSize,
   compute2DDispatch,
+  F32_BYTES,
   sizeOf,
   WORKGROUP_SIZE,
 } from "../shape-utils";
@@ -97,7 +98,7 @@ function dispatchCreationKernel(
   const totalWorkgroups = Math.ceil(threads / WORKGROUP_SIZE);
   const { x, y } = compute2DDispatch(totalWorkgroups);
   const pipeline = getPipeline(ctx, cacheKey, shader);
-  const outBuffer = resolveOutputBuffer(ctx.device, numElements * 4, []);
+  const outBuffer = resolveOutputBuffer(ctx.device, numElements * F32_BYTES, []);
   const paramsBuffer = createParamsBuffer(ctx.device, paramsData);
   const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
     outBuffer,
