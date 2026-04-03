@@ -15,6 +15,12 @@ export { broadcastShapes, contiguousStrides, sizeOf } from "../../core/shape";
 
 export const WORKGROUP_SIZE = 256;
 
+/** Bytes per f32 element */
+export const F32_BYTES = 4;
+
+/** Default maxStorageBufferBindingSize when device limits are unavailable (128 MiB) */
+export const DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE = 128 * 1024 * 1024;
+
 /** Maximum workgroups per dimension in WebGPU (per spec) */
 export const MAX_WORKGROUPS_PER_DIM = 65535;
 
@@ -130,10 +136,10 @@ export function dtypeBytes(dtype: DType): number {
 }
 
 /**
- * Align buffer size to 4 bytes (WebGPU requirement).
+ * Align buffer size to 4 bytes and enforce 16-byte minimum (WebGPU minBindingSize).
  */
 export function alignBufferSize(bytes: number): number {
-  return Math.ceil(bytes / 4) * 4;
+  return Math.max(16, Math.ceil(bytes / 4) * 4);
 }
 
 // ============================================================================

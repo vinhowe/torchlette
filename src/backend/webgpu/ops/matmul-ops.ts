@@ -19,6 +19,7 @@ import {
   broadcastShapes,
   compute2DDispatch,
   dtypeBytes,
+  F32_BYTES,
   gcd,
   sizeOf,
   WORKGROUP_SIZE,
@@ -106,7 +107,7 @@ function sliceColumns(
   const needsChunking = inputSizeBytes > maxBindingSize;
 
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: outSize * F32_BYTES,
     usage:
       GPUBufferUsage.STORAGE |
       GPUBufferUsage.COPY_SRC |
@@ -236,8 +237,8 @@ function scatterColumnsToOutput(
     releaseParamsBuffer(paramsBuffer);
   } else {
     // Chunked path: process rows in chunks
-    const outputBytesPerRow = N * 4;
-    const inputBytesPerRow = sliceWidth * 4;
+    const outputBytesPerRow = N * F32_BYTES;
+    const inputBytesPerRow = sliceWidth * F32_BYTES;
 
     // Find row chunk size that fits both input and output in binding limit
     const maxRowsPerChunk = Math.min(
@@ -512,7 +513,7 @@ function matmulChunkedTransposed(
   // Each partial is [batchSize * M, chunkWidth] and goes to columns [colStart, colEnd)
   const outSize = sizeOf(outShape);
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: outSize * F32_BYTES,
     usage:
       GPUBufferUsage.STORAGE |
       GPUBufferUsage.COPY_SRC |
@@ -594,7 +595,7 @@ function matmulChunkedContiguous(
   // Assemble final output
   const outSize = sizeOf(outShape);
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: outSize * F32_BYTES,
     usage:
       GPUBufferUsage.STORAGE |
       GPUBufferUsage.COPY_SRC |
@@ -661,7 +662,7 @@ function matmulChunkedOutput(
   // Create output buffer
   const outSize = sizeOf(outShape);
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: outSize * F32_BYTES,
     usage:
       GPUBufferUsage.STORAGE |
       GPUBufferUsage.COPY_SRC |
@@ -732,7 +733,7 @@ function sliceBColumns(
   const outSize = batch * K * chunkWidth;
 
   const outBuffer = createTrackedBuffer(ctx.device, {
-    size: outSize * 4,
+    size: outSize * F32_BYTES,
     usage:
       GPUBufferUsage.STORAGE |
       GPUBufferUsage.COPY_SRC |

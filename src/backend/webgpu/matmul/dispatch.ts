@@ -17,6 +17,7 @@ import type {
 import { GPUBufferUsage } from "../gpu-types";
 import { getWarmupPipeline, recordPipeline } from "../pipeline-warmup";
 import { getCurrentOpLabel } from "../shared-encoder";
+import { F32_BYTES } from "../shape-utils";
 import { onTeardown } from "../webgpu-state";
 import {
   cacheTuningResult,
@@ -272,9 +273,9 @@ async function autotuneIfNeeded(
     }
 
     // Create test buffers (reused across all candidates)
-    const aSize = m * k * 4;
-    const bSize = k * n * 4;
-    const outSize = m * n * 4;
+    const aSize = m * k * F32_BYTES;
+    const bSize = k * n * F32_BYTES;
+    const outSize = m * n * F32_BYTES;
     const aBuffer = device.createBuffer({
       size: aSize,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
@@ -324,7 +325,7 @@ async function autotuneIfNeeded(
     let kSplitTempBuffer: GPUBuffer | undefined;
     let reduceParamsBuffer: GPUBuffer | undefined;
     if (maxKSplitFactor >= 2) {
-      const tempBytes = maxKSplitFactor * totalElements * 4;
+      const tempBytes = maxKSplitFactor * totalElements * F32_BYTES;
       kSplitTempBuffer = device.createBuffer({
         size: tempBytes,
         usage: GPUBufferUsage.STORAGE,
