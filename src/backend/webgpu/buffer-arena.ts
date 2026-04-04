@@ -15,6 +15,7 @@
 import { recordAlloc } from "../../executor/compiled-plan";
 import { getSizeClass, getSizeForClass } from "../../graph/lifetime-analysis";
 import type { BackendTensor } from "../types";
+import { bufAcquire, bufRegister } from "./buffer-debug";
 import { bufferPool } from "./buffer-pool";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
 import { asGPUTensor, GPUBufferUsage, STORAGE_BUFFER_USAGE } from "./gpu-types";
@@ -316,6 +317,7 @@ function arenaAllocAt(
 
   arr[idx] = buffer;
   arenaBufferSet.add(buffer);
+  bufRegister(buffer, pooledSize, "arena");
   trackSharedEncoderWrite(buffer);
   return buffer;
 }
@@ -427,6 +429,7 @@ export function resolveOutputBuffer(
           getSizeForClass(pinnedSizeClass),
         );
         bufferPool.markAsFromPool(pinned);
+        bufAcquire(pinned, "resolveOutputBuffer.pinned");
         outputSequenceHints[outIdx] = pinned;
         pinnedOutputBuffers[outIdx] = null; // consumed
         recordAlloc(pinned, sizeBytes, 0, inputBuffers);
@@ -455,6 +458,7 @@ export function resolveOutputBuffer(
     bufferPool.trackAllocation(outBuffer, pooledSize);
     bufferPool.markAsFromPool(outBuffer);
     bufferPool.trackNewAllocation(pooledSize);
+    bufRegister(outBuffer, pooledSize, "resolveOutputBuffer.alias-replace");
   }
 
   // Track this buffer as written in the current shared encoder scope

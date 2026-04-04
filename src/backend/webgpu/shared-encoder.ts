@@ -16,6 +16,7 @@
 import { getSizeClass } from "../../graph/lifetime-analysis";
 import { resetDispatchSequence } from "./bind-group-cache";
 import { pinnedOutputBuffers, prePinOutputBuffers } from "./buffer-arena";
+import { bufBeginScope, bufEndScope } from "./buffer-debug";
 import { awaitDeferredFence, bufferPool } from "./buffer-pool";
 import type {
   GPUBuffer,
@@ -179,6 +180,7 @@ export function beginSharedEncoder(): void {
     resetSharedEncoderWriteSet();
 
     encoderState.deferredUniformBuffers = [];
+    bufBeginScope("shared-encoder");
   }
   encoderState.depth++;
 }
@@ -260,6 +262,7 @@ export function endSharedEncoder(): void {
 
     setSharedEncoderActive(false);
     finishAndSubmitEncoder(false);
+    bufEndScope("shared-encoder");
 
     // Flush storage buffer pendingRelease → main pool. The encoder was just
     // submitted, so buffers released by earlier passes are safe to reuse.
