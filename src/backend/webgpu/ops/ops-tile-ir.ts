@@ -694,6 +694,8 @@ function gatherTileIRImpl(
   indexShape: number[],
   dim: number,
   chunked: boolean,
+  indexDtype: DataType,
+  dataDtype: DataType,
 ): string {
   const inputStrides = contiguousStrides(inputShape);
   const uniforms: Record<string, "u32"> = {};
@@ -704,11 +706,13 @@ function gatherTileIRImpl(
 
   return compileTileKernel(
     elementwiseKernel({
-      name: chunked ? `gather_chunked_d${dim}` : `gather_d${dim}`,
+      name: chunked
+        ? `gather_chunked_d${dim}_${indexDtype}_${dataDtype}`
+        : `gather_d${dim}_${indexDtype}_${dataDtype}`,
       bindings: {
-        input: { storage: "read", type: "f32" },
-        indices: { storage: "read", type: "f32" },
-        out: { storage: "read_write", type: "f32" },
+        input: { storage: "read", type: dataDtype },
+        indices: { storage: "read", type: indexDtype },
+        out: { storage: "read_write", type: dataDtype },
       },
       uniforms,
       kernel(ctx, idx) {
@@ -734,16 +738,34 @@ export function gatherTileIR(
   inputShape: number[],
   indexShape: number[],
   dim: number,
+  indexDtype: DataType = "f32",
+  dataDtype: DataType = "f32",
 ): string {
-  return gatherTileIRImpl(inputShape, indexShape, dim, false);
+  return gatherTileIRImpl(
+    inputShape,
+    indexShape,
+    dim,
+    false,
+    indexDtype,
+    dataDtype,
+  );
 }
 
 export function chunkedGatherTileIR(
   inputShape: number[],
   indexShape: number[],
   dim: number,
+  indexDtype: DataType = "f32",
+  dataDtype: DataType = "f32",
 ): string {
-  return gatherTileIRImpl(inputShape, indexShape, dim, true);
+  return gatherTileIRImpl(
+    inputShape,
+    indexShape,
+    dim,
+    true,
+    indexDtype,
+    dataDtype,
+  );
 }
 
 /**
@@ -755,6 +777,7 @@ function scatterAddTileIRImpl(
   srcShape: number[],
   dim: number,
   chunked: boolean,
+  indexDtype: DataType,
 ): string {
   const outStrides = contiguousStrides(inputShape);
   const uniforms: Record<string, "u32"> = {};
@@ -765,9 +788,11 @@ function scatterAddTileIRImpl(
 
   return compileTileKernel(
     elementwiseKernel({
-      name: chunked ? `scatterAdd_chunked_d${dim}` : `scatterAdd_d${dim}`,
+      name: chunked
+        ? `scatterAdd_chunked_d${dim}_${indexDtype}`
+        : `scatterAdd_d${dim}_${indexDtype}`,
       bindings: {
-        indices: { storage: "read", type: "f32" },
+        indices: { storage: "read", type: indexDtype },
         src: { storage: "read", type: "f32" },
         out: { storage: "read_write", type: "f32" },
       },
@@ -797,16 +822,18 @@ export function scatterAddTileIR(
   inputShape: number[],
   srcShape: number[],
   dim: number,
+  indexDtype: DataType = "f32",
 ): string {
-  return scatterAddTileIRImpl(inputShape, srcShape, dim, false);
+  return scatterAddTileIRImpl(inputShape, srcShape, dim, false, indexDtype);
 }
 
 export function chunkedScatterAddTileIR(
   inputShape: number[],
   srcShape: number[],
   dim: number,
+  indexDtype: DataType = "f32",
 ): string {
-  return scatterAddTileIRImpl(inputShape, srcShape, dim, true);
+  return scatterAddTileIRImpl(inputShape, srcShape, dim, true, indexDtype);
 }
 
 // ============================================================================
