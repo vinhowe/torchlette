@@ -106,13 +106,19 @@ export function crossEntropyFusedImpl(
     castLogits = autocastCastImpl(torch, logits, "f32");
   }
 
+  // Fused CE kernels read targets as native i32. If the caller passed f32
+  // targets (e.g. legacy code that predates the dtype creation option),
+  // insert a lazy cast so the kernel sees i32.
+  const i32Targets =
+    targets.dtype === "i32" ? targets : torch.toDtype(targets, "i32");
+
   const B = castLogits.shape[0];
   const V = castLogits.shape[1];
   const config = { batchSize: B, vocabSize: V, ignoreIndex: ignoreIndex ?? -100 };
 
   const result = torch.runtime.fusedCrossEntropyForward(
     castLogits._unwrap(),
-    targets._unwrap(),
+    i32Targets._unwrap(),
     config,
   );
 
@@ -120,7 +126,7 @@ export function crossEntropyFusedImpl(
   // Targets are captured via closure — they don't require grad and aren't
   // modified between forward and backward, so keep() is unnecessary.
   const tensorsToSave = logits.requiresGrad ? [castLogits] : [];
-  const targetsInner = targets._unwrap();
+  const targetsInner = i32Targets._unwrap();
   return torch._wrapWithGrad(
     result,
     [logits],

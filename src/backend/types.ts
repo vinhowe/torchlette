@@ -197,11 +197,15 @@ export type AdamStepConfig = {
 };
 
 export interface BackendOps {
-  tensorFromArray(values: number[] | Float32Array, shape: Shape): BackendTensor;
+  tensorFromArray(
+    values: number[] | Float32Array | Int32Array | Uint32Array,
+    shape: Shape,
+    dtype?: DType,
+  ): BackendTensor;
   /** Create a zero-filled tensor. More efficient than tensorFromArray with a zeros array. */
-  zeros?(shape: Shape): BackendTensor;
+  zeros?(shape: Shape, dtype?: DType): BackendTensor;
   /** Create a tensor filled with a constant value. */
-  full?(shape: Shape, fillValue: number): BackendTensor;
+  full?(shape: Shape, fillValue: number, dtype?: DType): BackendTensor;
   /** Create a 1-D tensor of evenly spaced values. */
   arange?(end: number, start?: number, step?: number): BackendTensor;
   /** Lower-triangular: zero elements above the k-th diagonal (last 2 dims). */

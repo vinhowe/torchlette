@@ -29,9 +29,10 @@ function gatherTargets(
   targets: Tensor,
 ): Tensor {
   const isBatched = input.shape.length >= 2;
+  // gather kernel accepts f32/i32/u32 index tensors natively — no cast needed.
   let targetsForGather = targets;
   if (isBatched && targets.shape.length === input.shape.length - 1) {
-    targetsForGather = targets.reshape([...targets.shape, 1]);
+    targetsForGather = targetsForGather.reshape([...targets.shape, 1]);
   }
   const gathered = api.gather(input, targetsForGather, {
     dim: input.shape.length - 1,
