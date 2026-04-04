@@ -37,17 +37,19 @@ const crossEntropyForwardSpec = perRowKernel({
   },
   rowUniform: "batch_size",
   dimUniform: "vocab_size",
-  uniforms: { ignore_index: "i32" },
+  uniforms: { ignore_index: "f32" },
 
   kernel(ctx, row, tid, V, base) {
-    const t = ctx.emitLet("t", ctx.load("targets", row).toU32());
-    const ignoreIdx = ctx.uniform("ignore_index").cast("u32");
+    const tF = ctx.emitLet("t_f", ctx.load("targets", row));
+    const ignoreIdx = ctx.uniform("ignore_index");
 
     // If target == ignoreIndex, write 0 and skip
-    ctx.ifThen(t.eq(ignoreIdx), () => {
+    ctx.ifThen(tF.eq(ignoreIdx), () => {
       ctx.guardedStore("loss", tid.eq(ctx.u32(0)), row, ctx.f32(0.0));
       ctx.emitReturn();
     });
+
+    const t = ctx.emitLet("t", tF.toU32());
 
     // Parallel max reduction
     const rowMax = ctx.emitLet(
@@ -89,19 +91,21 @@ const crossEntropyBackwardSpec = perRowKernel({
   },
   rowUniform: "batch_size",
   dimUniform: "vocab_size",
-  uniforms: { ignore_index: "i32" },
+  uniforms: { ignore_index: "f32" },
 
   kernel(ctx, row, tid, V, base) {
-    const t = ctx.emitLet("t", ctx.load("targets", row).toU32());
-    const ignoreIdx = ctx.uniform("ignore_index").cast("u32");
+    const tF = ctx.emitLet("t_f", ctx.load("targets", row));
+    const ignoreIdx = ctx.uniform("ignore_index");
 
     // If target == ignoreIndex, write zero gradients
-    ctx.ifThen(t.eq(ignoreIdx), () => {
+    ctx.ifThen(tF.eq(ignoreIdx), () => {
       ctx.stridedFor(tid, V, WG, (i) => {
         ctx.emitStore("grad_logits", base.add(i), ctx.f32(0.0));
       });
       ctx.emitReturn();
     });
+
+    const t = ctx.emitLet("t", tF.toU32());
 
     // Parallel max reduction
     const rowMax = ctx.emitLet(
