@@ -15,6 +15,7 @@
  * identical in cost to accessing them from their original declaring modules.
  */
 
+import { bufMarkWrite } from "./buffer-debug";
 import type { GPUBuffer, GPUCommandBuffer, WebGPUContext } from "./gpu-types";
 
 // ============================================================================
@@ -88,6 +89,7 @@ export function trackSharedEncoderWrite(buffer: GPUBuffer): void {
   if (sharedEncoderActive) {
     sharedEncoderWriteSet.add(buffer);
   }
+  bufMarkWrite(buffer);
 }
 
 // ============================================================================
