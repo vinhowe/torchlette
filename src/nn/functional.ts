@@ -122,7 +122,10 @@ export function crossEntropy(
       // The kernel writes 0 for ignored rows, so sum gives the correct total.
       // Use 'sum' reduction and divide by valid count on the GPU.
       const lossSum = perSample.sum();
-      const validCount = api.ne(targets, api.full(targets.shape, ignoreIndex, { device: logits.device, dtype: targets.dtype })).cast("f32").sum();
+      // Count valid (non-ignored) targets
+      const ignoreT = api.full(targets.shape, ignoreIndex, { device: logits.device, dtype: targets.dtype });
+      const mask = api.ne(targets, ignoreT);
+      const validCount = api.mul(mask, 1.0).sum();
       return api.div(lossSum, api.add(validCount, 1e-8));
     }
     return applyReduction(api, perSample, reduction, logits.device);
