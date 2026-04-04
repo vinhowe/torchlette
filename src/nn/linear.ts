@@ -4,6 +4,7 @@
  */
 
 import type { DeviceKind, Tensor, Torchlette } from "../frontend/torchlette";
+import { uniform_ } from "./init";
 import { Module } from "./module";
 
 export type LinearOptions = {
@@ -41,19 +42,26 @@ export class Linear extends Module {
     const hasBias = options?.bias ?? true;
     const device = options?.device;
 
-    // Initialize weight with standard normal distribution.
-    // Uses lazy GPU-side randn to avoid allocating large JS arrays on CPU.
+    // PyTorch default init:
+    //   weight ~ kaiming_uniform(a=sqrt(5)) ≡ U(-1/sqrt(fan_in), 1/sqrt(fan_in))
+    //   bias   ~ U(-1/sqrt(fan_in), 1/sqrt(fan_in))
+    // See https://github.com/pytorch/pytorch/blob/main/torch/nn/modules/linear.py
     // Note: for pretrained models, weights are overwritten by copy_ during loading.
-    this.registerParameter(
-      "weight",
-      api.randn([outFeatures, inFeatures], { requiresGrad: true, device }),
-    );
+    const bound = inFeatures > 0 ? 1 / Math.sqrt(inFeatures) : 0;
+    const weight = api.zeros([outFeatures, inFeatures], {
+      requiresGrad: true,
+      device,
+    });
+    if (bound > 0) uniform_(api, weight, -bound, bound);
+    this.registerParameter("weight", weight);
 
     // Bias shape: [outFeatures]
-    this.registerParameter(
-      "bias",
-      hasBias ? api.zeros([outFeatures], { requiresGrad: true, device }) : null,
-    );
+    let bias: Tensor | null = null;
+    if (hasBias) {
+      bias = api.zeros([outFeatures], { requiresGrad: true, device });
+      if (bound > 0) uniform_(api, bias, -bound, bound);
+    }
+    this.registerParameter("bias", bias);
   }
 
   /**
