@@ -5,7 +5,7 @@ import {
   inferReshapeStrides,
   sizeOf,
 } from "../../core/shape";
-import { type GeluOptions, normalizeDim as normalizeDimShared } from "../types";
+import { type GeluOptions, normalizeDim as normalizeDimBase } from "../types";
 
 export type Shape = number[];
 
