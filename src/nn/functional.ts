@@ -103,9 +103,11 @@ export function crossEntropy(
   targets: Tensor,
   options?: {
     reduction?: "none" | "mean" | "sum";
+    ignoreIndex?: number;
   },
 ): Tensor {
   const reduction = options?.reduction ?? "mean";
+  const ignoreIndex = options?.ignoreIndex;
 
   // Ensure logits has at least 1 dimension
   if (logits.shape.length === 0) {
@@ -114,12 +116,16 @@ export function crossEntropy(
 
   // Fused path for WebGPU (single kernel instead of 9 ops)
   if (logits.device === "webgpu" && logits.shape.length === 2) {
-    return applyReduction(
-      api,
-      api._crossEntropyFused(logits, targets),
-      reduction,
-      logits.device,
-    );
+    const perSample = api._crossEntropyFused(logits, targets, ignoreIndex);
+    if (ignoreIndex !== undefined && reduction === "mean") {
+      // Mean over non-ignored samples: sum(loss) / count_valid.
+      // The kernel writes 0 for ignored rows, so sum gives the correct total.
+      // Use 'sum' reduction and divide by valid count on the GPU.
+      const lossSum = perSample.sum();
+      const validCount = api.ne(targets, api.full(targets.shape, ignoreIndex, { device: logits.device, dtype: targets.dtype })).cast("f32").sum();
+      return api.div(lossSum, api.add(validCount, 1e-8));
+    }
+    return applyReduction(api, perSample, reduction, logits.device);
   }
 
   // Fallback: decomposed cross-entropy via log-softmax + gather

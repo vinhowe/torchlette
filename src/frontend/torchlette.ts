@@ -923,8 +923,8 @@ export class Torchlette {
     return softmaxImpl(this, a, dim);
   }
 
-  _crossEntropyFused(logits: Tensor, targets: Tensor): Tensor {
-    return crossEntropyFusedImpl(this, logits, targets);
+  _crossEntropyFused(logits: Tensor, targets: Tensor, ignoreIndex?: number): Tensor {
+    return crossEntropyFusedImpl(this, logits, targets, ignoreIndex);
   }
 
   scaledDotProductAttention(

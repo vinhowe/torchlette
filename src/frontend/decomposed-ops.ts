@@ -96,6 +96,7 @@ export function crossEntropyFusedImpl(
   torch: Torchlette,
   logits: Tensor,
   targets: Tensor,
+  ignoreIndex?: number,
 ): Tensor {
   torch._assertUsable(logits, targets);
 
@@ -107,7 +108,7 @@ export function crossEntropyFusedImpl(
 
   const B = castLogits.shape[0];
   const V = castLogits.shape[1];
-  const config = { batchSize: B, vocabSize: V };
+  const config = { batchSize: B, vocabSize: V, ignoreIndex: ignoreIndex ?? -100 };
 
   const result = torch.runtime.fusedCrossEntropyForward(
     castLogits._unwrap(),
