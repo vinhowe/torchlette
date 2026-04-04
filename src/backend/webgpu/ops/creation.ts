@@ -51,13 +51,24 @@ function getContiguous(a: WebGPUTensor): WebGPUTensor {
 }
 
 export function tensorFromArray(
-  values: number[] | Float32Array,
+  values: number[] | Float32Array | Int32Array | Uint32Array,
   shape: number[],
+  dtype: DType = "f32",
 ): WebGPUTensor {
   const ctx = requireContext();
   const expected = sizeOf(shape);
   if (expected !== values.length) {
     throw new Error("Tensor data length does not match shape");
+  }
+  // Non-f32 dtypes go through the typed-buffer path (supports i32/u32/f16).
+  if (dtype !== "f32") {
+    const arr =
+      values instanceof Float32Array ||
+      values instanceof Int32Array ||
+      values instanceof Uint32Array
+        ? Array.from(values)
+        : values;
+    return tensorFromArrayWithDtype(arr, shape, dtype);
   }
   const f32data =
     values instanceof Float32Array ? values : Float32Array.from(values);
@@ -115,11 +126,20 @@ function dispatchCreationKernel(
  * If the buffer comes from the pool (stale data), clears it with clearBuffer.
  * Fresh buffers are zero-initialized by the WebGPU spec.
  */
-export function zeros(shape: number[]): WebGPUTensor {
+export function zeros(shape: number[], dtype: DType = "f32"): WebGPUTensor {
   const ctx = requireContext();
   const numElements = sizeOf(shape);
   if (numElements === 0) {
     throw new Error("webgpu tensors cannot be empty yet");
+  }
+  // Non-f32 dtypes: allocate via typed-buffer path (bitwise zero is a valid
+  // zero for all current DTypes: f32, f16, i32, u32).
+  if (dtype !== "f32") {
+    return tensorFromArrayWithDtype(
+      new Array(numElements).fill(0),
+      shape,
+      dtype,
+    );
   }
   const sizeBytes = numElements * F32_BYTES;
   const alignedSize = alignBufferSize(sizeBytes);
@@ -147,9 +167,20 @@ export function zeros(shape: number[]): WebGPUTensor {
  * Uses a GPU compute shader to fill the buffer — no JS array allocation.
  * fillValue === 0 is special-cased to use the zero-cost zeros() path.
  */
-export function full(shape: number[], fillValue: number): WebGPUTensor {
+export function full(
+  shape: number[],
+  fillValue: number,
+  dtype: DType = "f32",
+): WebGPUTensor {
   const numElements = sizeOf(shape);
   if (numElements === 0) throw new Error("webgpu tensors cannot be empty yet");
+  if (dtype !== "f32") {
+    return tensorFromArrayWithDtype(
+      new Array(numElements).fill(fillValue),
+      shape,
+      dtype,
+    );
+  }
   if (fillValue === 0) return zeros(shape);
 
   const paramsData = new Uint32Array(2);

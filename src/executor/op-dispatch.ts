@@ -106,26 +106,41 @@ type CreationHandler = (
 
 const CREATION_OP_TABLE: Record<string, CreationHandler> = {
   tensorFromArray(node, _bi, backend) {
-    const payload = getPayload<{ values: number[] | Float32Array }>(node);
+    const payload = getPayload<{
+      values: number[] | Float32Array | Int32Array | Uint32Array;
+      dtype?: DType;
+    }>(node);
     if (!payload?.values)
       throw new Error("tensorFromArray requires values in payload");
-    return backend.ops.tensorFromArray(payload.values, node.shape);
+    return backend.ops.tensorFromArray(
+      payload.values,
+      node.shape,
+      payload.dtype ?? node.dtype,
+    );
   },
 
   zeros(node, _bi, backend) {
-    if (backend.ops.zeros) return backend.ops.zeros(node.shape);
+    const payload = getPayload<{ dtype?: DType }>(node);
+    const dtype = payload?.dtype ?? node.dtype;
+    if (backend.ops.zeros) return backend.ops.zeros(node.shape, dtype);
     const numEl = sizeOf(node.shape);
-    return backend.ops.tensorFromArray(new Array(numEl).fill(0), node.shape);
+    return backend.ops.tensorFromArray(
+      new Array(numEl).fill(0),
+      node.shape,
+      dtype,
+    );
   },
 
   full(node, _bi, backend) {
-    const payload = requirePayload<{ fillValue: number }>(node);
+    const payload = requirePayload<{ fillValue: number; dtype?: DType }>(node);
+    const dtype = payload.dtype ?? node.dtype;
     if (backend.ops.full)
-      return backend.ops.full(node.shape, payload.fillValue);
+      return backend.ops.full(node.shape, payload.fillValue, dtype);
     const numEl = sizeOf(node.shape);
     return backend.ops.tensorFromArray(
       new Array(numEl).fill(payload.fillValue),
       node.shape,
+      dtype,
     );
   },
 
