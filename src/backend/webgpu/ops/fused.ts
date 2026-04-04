@@ -32,7 +32,7 @@ import { createTileKernelDispatcher } from "../tile-dispatch";
 import type { TileKernelSpec } from "../tile-ir";
 import { elementwiseGrid } from "../tile-ir";
 import { gpuContext, sharedEncoderActive } from "../webgpu-state";
-import { asContiguous, ensureContiguous } from "./views";
+import { asContiguous, cast as castOp, ensureContiguous } from "./views";
 
 /** Destroy contiguous copies that differ from their originals. */
 function cleanupContiguous(...pairs: [BackendTensor, WebGPUTensor][]) {
@@ -235,7 +235,8 @@ export function fusedCrossEntropyForward(
   config: import("../../types").FusedCrossEntropyConfig,
 ): BackendTensor {
   const logitsT = asContiguous(logits);
-  const targetsT = asContiguous(targets);
+  const targetsRaw = asContiguous(targets);
+  const targetsT = ensureI32Targets(targetsRaw);
   const outBuf = dispatchCEForwardKernel(
     logitsT.buffer,
     targetsT.buffer,
@@ -243,7 +244,8 @@ export function fusedCrossEntropyForward(
     config.vocabSize,
     config.ignoreIndex ?? -100,
   );
-  cleanupContiguous([logits, logitsT], [targets, targetsT]);
+  cleanupContiguous([logits, logitsT], [targets, targetsRaw]);
+  if (targetsT !== targetsRaw) destroyCopy(targetsT);
   return createTensor([config.batchSize], outBuf);
 }
 
@@ -254,7 +256,8 @@ export function fusedCrossEntropyBackward(
   config: import("../../types").FusedCrossEntropyConfig,
 ): BackendTensor {
   const logitsT = asContiguous(logits);
-  const targetsT = asContiguous(targets);
+  const targetsRaw = asContiguous(targets);
+  const targetsT = ensureI32Targets(targetsRaw);
   const gradT = asContiguous(gradOutput);
   const outBuf = dispatchCEBackwardKernel(
     logitsT.buffer,
@@ -266,10 +269,21 @@ export function fusedCrossEntropyBackward(
   );
   cleanupContiguous(
     [logits, logitsT],
-    [targets, targetsT],
+    [targets, targetsRaw],
     [gradOutput, gradT],
   );
+  if (targetsT !== targetsRaw) destroyCopy(targetsT);
   return createTensor([config.batchSize, config.vocabSize], outBuf);
+}
+
+/**
+ * Transitional compatibility shim: CE kernels expect i32 targets, but some
+ * callers may still pass f32 (legacy tests, user code that predates the
+ * dtype option on creation ops). If targets arrive as f32, cast to i32.
+ */
+function ensureI32Targets(targets: WebGPUTensor): WebGPUTensor {
+  if (targets.dtype === "i32" || targets.dtype === "u32") return targets;
+  return asGPUTensor(castOp(targets, "i32"));
 }
 
 // ============================================================================

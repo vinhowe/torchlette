@@ -27,29 +27,34 @@ const WG = WORKGROUP_SIZE; // 256
 /**
  * Cross-entropy forward kernel (tile-IR).
  * One workgroup per batch row: max reduction, sum-exp reduction, thread 0 writes loss.
+ *
+ * Targets are read as native i32 (PyTorch convention). ignore_index is an i32
+ * uniform so negative sentinels (e.g. -100, -1) are handled without any f32→u32
+ * undefined-behavior conversions.
  */
 const crossEntropyForwardSpec = perRowKernel({
   name: "ceFwd",
   bindings: {
     logits: { storage: "read", type: "f32" },
-    targets: { storage: "read", type: "f32" },
+    targets: { storage: "read", type: "i32" },
     loss: { storage: "read_write", type: "f32" },
   },
   rowUniform: "batch_size",
   dimUniform: "vocab_size",
-  uniforms: { ignore_index: "f32" },
+  uniforms: { ignore_index: "i32" },
 
   kernel(ctx, row, tid, V, base) {
-    const tF = ctx.emitLet("t_f", ctx.load("targets", row));
-    const ignoreIdx = ctx.uniform("ignore_index");
+    const tI = ctx.emitLet("t_i", ctx.load("targets", row));
+    const ignoreIdx = ctx.uniform("ignore_index", "i32");
 
     // If target == ignoreIndex, write 0 and skip
-    ctx.ifThen(tF.eq(ignoreIdx), () => {
+    ctx.ifThen(tI.eq(ignoreIdx), () => {
       ctx.guardedStore("loss", tid.eq(ctx.u32(0)), row, ctx.f32(0.0));
       ctx.emitReturn();
     });
 
-    const t = ctx.emitLet("t", tF.toU32());
+    // Safe u32 conversion: guard has filtered negatives, and targets < V.
+    const t = ctx.emitLet("t", tI.toU32());
 
     // Parallel max reduction
     const rowMax = ctx.emitLet(
@@ -85,27 +90,27 @@ const crossEntropyBackwardSpec = perRowKernel({
   name: "ceBwd",
   bindings: {
     logits: { storage: "read", type: "f32" },
-    targets: { storage: "read", type: "f32" },
+    targets: { storage: "read", type: "i32" },
     grad_output: { storage: "read", type: "f32" },
     grad_logits: { storage: "read_write", type: "f32" },
   },
   rowUniform: "batch_size",
   dimUniform: "vocab_size",
-  uniforms: { ignore_index: "f32" },
+  uniforms: { ignore_index: "i32" },
 
   kernel(ctx, row, tid, V, base) {
-    const tF = ctx.emitLet("t_f", ctx.load("targets", row));
-    const ignoreIdx = ctx.uniform("ignore_index");
+    const tI = ctx.emitLet("t_i", ctx.load("targets", row));
+    const ignoreIdx = ctx.uniform("ignore_index", "i32");
 
     // If target == ignoreIndex, write zero gradients
-    ctx.ifThen(tF.eq(ignoreIdx), () => {
+    ctx.ifThen(tI.eq(ignoreIdx), () => {
       ctx.stridedFor(tid, V, WG, (i) => {
         ctx.emitStore("grad_logits", base.add(i), ctx.f32(0.0));
       });
       ctx.emitReturn();
     });
 
-    const t = ctx.emitLet("t", tF.toU32());
+    const t = ctx.emitLet("t", tI.toU32());
 
     // Parallel max reduction
     const rowMax = ctx.emitLet(
