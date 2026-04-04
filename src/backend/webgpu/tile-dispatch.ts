@@ -71,6 +71,7 @@ function packUniforms(
   const buffer = new ArrayBuffer(sizeBytes);
   const f32 = new Float32Array(buffer);
   const u32 = new Uint32Array(buffer);
+  const i32 = new Int32Array(buffer);
 
   for (let i = 0; i < entries.length; i++) {
     const [name, type] = entries[i];
@@ -80,6 +81,8 @@ function packUniforms(
     }
     if (type === "f32") {
       f32[i] = val;
+    } else if (type === "i32") {
+      i32[i] = val;
     } else {
       u32[i] = val;
     }

@@ -1674,15 +1674,15 @@ export class KernelContext {
     return new BlockExpr(this.trackNode(makeNode<LoadNode>(partial)));
   }
 
-  /** Read a uniform config value. */
-  uniform(name: string): BlockExpr {
+  /** Read a uniform config value. Defaults to u32; pass dtype for i32 or f32 uniforms. */
+  uniform(name: string, dataType: DataType = "u32"): BlockExpr {
     return new BlockExpr(
       this.trackNode(
         makeNode<UniformNode>({
           kind: "uniform",
           name,
           valueType: "scalar",
-          dataType: "u32",
+          dataType,
         }),
       ),
     );

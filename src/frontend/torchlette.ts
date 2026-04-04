@@ -378,12 +378,17 @@ export class Torchlette {
   // ============================================================================
 
   tensorFromArray(
-    values: number[] | Float32Array,
+    values: number[] | Float32Array | Int32Array | Uint32Array,
     shape: number[],
     options?: TensorCreateOptions,
   ): Tensor {
     return this._wrap(
-      this.runtime.tensorFromArray(values, shape, options?.device),
+      this.runtime.tensorFromArray(
+        values,
+        shape,
+        options?.device,
+        options?.dtype,
+      ),
       options?.requiresGrad ?? false,
     );
   }
@@ -426,7 +431,7 @@ export class Torchlette {
 
   zeros(shape: number[], options?: TensorCreateOptions): Tensor {
     return this._wrap(
-      this.runtime.zeros(shape, options?.device),
+      this.runtime.zeros(shape, options?.device, options?.dtype),
       options?.requiresGrad ?? false,
     );
   }
@@ -441,7 +446,7 @@ export class Torchlette {
     options?: TensorCreateOptions,
   ): Tensor {
     return this._wrap(
-      this.runtime.full(shape, fillValue, options?.device),
+      this.runtime.full(shape, fillValue, options?.device, options?.dtype),
       options?.requiresGrad ?? false,
     );
   }
@@ -777,6 +782,7 @@ export class Torchlette {
     const embDim = weight.shape[1];
     const numElements = sizeOf(inputShape);
 
+    // Gather kernel accepts f32/i32/u32 index tensors natively — no cast needed.
     // Flatten → expand → contiguous → gather → reshape
     // Uses existing gather autograd (scatterAdd backward)
     const flat = this.reshape(indices, [numElements]);

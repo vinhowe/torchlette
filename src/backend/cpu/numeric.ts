@@ -5,6 +5,7 @@ import {
   inferReshapeStrides,
   sizeOf,
 } from "../../core/shape";
+import type { DType } from "../types";
 import { type GeluOptions, normalizeDim as normalizeDimBase } from "../types";
 
 export type Shape = number[];
@@ -14,6 +15,7 @@ export class Tensor {
   readonly strides: number[];
   readonly data: Float32Array;
   readonly offset: number;
+  readonly dtype: DType;
   private readonly sizeValue: number;
 
   constructor(
@@ -22,6 +24,7 @@ export class Tensor {
     strides?: number[],
     offset = 0,
     validateLength = true,
+    dtype: DType = "f32",
   ) {
     const expected = sizeOf(shape);
     if (validateLength && expected !== data.length) {
@@ -31,6 +34,7 @@ export class Tensor {
     this.strides = (strides ?? computeStrides(shape)).slice();
     this.data = data;
     this.offset = offset;
+    this.dtype = dtype;
     this.sizeValue = expected;
   }
 
@@ -97,24 +101,35 @@ export class Tensor {
 }
 
 export function tensorFromArray(
-  values: number[] | Float32Array,
+  values: number[] | Float32Array | Int32Array | Uint32Array,
   shape: Shape,
+  dtype: DType = "f32",
 ): Tensor {
+  const f32 =
+    values instanceof Float32Array ? values.slice() : Float32Array.from(values);
+  return new Tensor(shape, f32, undefined, 0, true, dtype);
+}
+
+export function zeros(shape: Shape, dtype: DType = "f32"): Tensor {
   return new Tensor(
     shape,
-    values instanceof Float32Array ? values.slice() : Float32Array.from(values),
+    new Float32Array(sizeOf(shape)),
+    undefined,
+    0,
+    true,
+    dtype,
   );
 }
 
-export function zeros(shape: Shape): Tensor {
-  return new Tensor(shape, new Float32Array(sizeOf(shape)));
-}
-
-export function full(shape: Shape, fillValue: number): Tensor {
+export function full(
+  shape: Shape,
+  fillValue: number,
+  dtype: DType = "f32",
+): Tensor {
   const numElements = sizeOf(shape);
   const data = new Float32Array(numElements);
   data.fill(fillValue);
-  return new Tensor(shape, data);
+  return new Tensor(shape, data, undefined, 0, true, dtype);
 }
 
 export function rand(shape: Shape): Tensor {

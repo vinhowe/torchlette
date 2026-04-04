@@ -70,13 +70,26 @@ export function gather(
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
+  // Index dtype: gather kernel reads indices as native i32/u32/f32 to avoid
+  // round-trip casts at call sites (e.g. i32 token ids from embedding).
+  const indexDtype = tensorIndex.dtype;
+  if (
+    indexDtype !== "f32" &&
+    indexDtype !== "i32" &&
+    indexDtype !== "u32"
+  ) {
+    throw new Error(
+      `gather: index dtype must be f32/i32/u32, got ${indexDtype}`,
+    );
+  }
+
   // Generate shader via tile-IR (both direct and chunked paths)
   const code = chunked
-    ? chunkedGatherTileIR(inputShape, indexShape, dim)
-    : gatherTileIR(inputShape, indexShape, dim);
+    ? chunkedGatherTileIR(inputShape, indexShape, dim, indexDtype)
+    : gatherTileIR(inputShape, indexShape, dim, indexDtype);
 
   const keyPrefix = chunked ? "gatherChunked" : "gather";
-  const pipelineKey = `${keyPrefix}:${inputShape.join(",")}:${indexShape.join(",")}:${dim}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
+  const pipelineKey = `${keyPrefix}:${inputShape.join(",")}:${indexShape.join(",")}:${dim}:${indexDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   const pipeline = getPipeline(ctx, pipelineKey, code);
 
   // --- Direct path ---
@@ -186,13 +199,25 @@ export function scatterAdd(
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
 
+  // Index dtype: scatterAdd kernel reads indices as native i32/u32/f32.
+  const indexDtype = tensorIndex.dtype;
+  if (
+    indexDtype !== "f32" &&
+    indexDtype !== "i32" &&
+    indexDtype !== "u32"
+  ) {
+    throw new Error(
+      `scatterAdd: index dtype must be f32/i32/u32, got ${indexDtype}`,
+    );
+  }
+
   // Generate shader via tile-IR (both direct and chunked paths)
   const code = chunked
-    ? chunkedScatterAddTileIR(inputShape, tensorSrc.shape, dim)
-    : scatterAddTileIR(inputShape, tensorSrc.shape, dim);
+    ? chunkedScatterAddTileIR(inputShape, tensorSrc.shape, dim, indexDtype)
+    : scatterAddTileIR(inputShape, tensorSrc.shape, dim, indexDtype);
 
   const keyPrefix = chunked ? "scatterAddChunked" : "scatterAdd";
-  const pipelineKey = `${keyPrefix}:${inputShape.join(",")}:${tensorSrc.shape.join(",")}:${dim}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
+  const pipelineKey = `${keyPrefix}:${inputShape.join(",")}:${tensorSrc.shape.join(",")}:${dim}:${indexDtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
   const pipeline = getPipeline(ctx, pipelineKey, code);
 
   // Copy input to output (both paths need this)

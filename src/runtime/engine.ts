@@ -810,51 +810,69 @@ export class RuntimeEngine {
   }
 
   tensorFromArray(
-    values: number[] | Float32Array,
+    values: number[] | Float32Array | Int32Array | Uint32Array,
     shape: number[],
     device?: DeviceKind,
+    dtype: DType = "f32",
   ): Tensor {
     const resolvedDevice = this.getDevice(device);
-    // For Float32Array, skip the defensive copy — the typed array buffer will be consumed
+    // For typed arrays, skip the defensive copy — the buffer will be consumed
     // by the GPU backend at the next force boundary. Avoids doubling memory for large models.
     // For number[], copy to prevent aliasing issues with mutable JS arrays.
-    const payload = values instanceof Float32Array ? values : values.slice();
+    const payload =
+      values instanceof Float32Array ||
+      values instanceof Int32Array ||
+      values instanceof Uint32Array
+        ? values
+        : values.slice();
     const node = createLazyIRNode(
       "tensorFromArray",
       [],
       shape,
-      "f32",
+      dtype,
       resolvedDevice,
-      { values: payload },
+      { values: payload, dtype },
     );
-    return this.trackNode(node, shape, resolvedDevice);
+    return this.trackNode(node, shape, resolvedDevice, dtype);
   }
 
-  /** Helper: create a data-source op (no inputs, f32 output). */
+  /** Helper: create a data-source op (no inputs, configurable output dtype). */
   private _creationOp(
     op: LazyOpCode,
     shape: number[],
     device?: DeviceKind,
     payload?: unknown,
+    dtype: DType = "f32",
   ): Tensor {
     const resolvedDevice = this.getDevice(device);
     const node = createLazyIRNode(
       op,
       [],
       shape,
-      "f32",
+      dtype,
       resolvedDevice,
       payload,
     );
-    return this.trackNode(node, shape, resolvedDevice);
+    return this.trackNode(node, shape, resolvedDevice, dtype);
   }
 
-  zeros(shape: number[], device?: DeviceKind): Tensor {
-    return this._creationOp("zeros", shape, device);
+  zeros(shape: number[], device?: DeviceKind, dtype: DType = "f32"): Tensor {
+    return this._creationOp("zeros", shape, device, { dtype }, dtype);
   }
 
-  full(shape: number[], fillValue: number, device?: DeviceKind): Tensor {
-    return this._creationOp("full", shape, device, { fillValue });
+  full(
+    shape: number[],
+    fillValue: number,
+    device?: DeviceKind,
+    dtype: DType = "f32",
+  ): Tensor {
+    return this._creationOp(
+      "full",
+      shape,
+      device,
+      { fillValue, dtype },
+      dtype,
+    );
   }
 
   arange(end: number, start = 0, step = 1, device?: DeviceKind): Tensor {
