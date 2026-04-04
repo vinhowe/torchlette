@@ -29,9 +29,8 @@ function gatherTargets(
   targets: Tensor,
 ): Tensor {
   const isBatched = input.shape.length >= 2;
-  // gather kernel reads indices from an f32 binding; cast i32/u32 → f32 if needed.
-  let targetsForGather =
-    targets.dtype === "f32" ? targets : api.toDtype(targets, "f32");
+  // gather kernel accepts f32/i32/u32 index tensors natively — no cast needed.
+  let targetsForGather = targets;
   if (isBatched && targets.shape.length === input.shape.length - 1) {
     targetsForGather = targetsForGather.reshape([...targets.shape, 1]);
   }

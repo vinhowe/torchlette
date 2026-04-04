@@ -782,12 +782,10 @@ export class Torchlette {
     const embDim = weight.shape[1];
     const numElements = sizeOf(inputShape);
 
-    // Gather kernel reads indices from an f32 binding; cast i32/u32 if needed.
-    const f32Indices =
-      indices.dtype === "f32" ? indices : this.toDtype(indices, "f32");
+    // Gather kernel accepts f32/i32/u32 index tensors natively — no cast needed.
     // Flatten → expand → contiguous → gather → reshape
     // Uses existing gather autograd (scatterAdd backward)
-    const flat = this.reshape(f32Indices, [numElements]);
+    const flat = this.reshape(indices, [numElements]);
     const expanded = this.expand(this.reshape(flat, [numElements, 1]), [
       numElements,
       embDim,
