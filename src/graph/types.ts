@@ -83,6 +83,8 @@ export interface LazyIRNode {
   result?: StorageHandle;
   /** All outputs for multi-output ops. results[0] === result. */
   results?: StorageHandle[];
+  /** True while input rc is retained by the plan executor (prevents double-retain). */
+  _inputsRetained?: boolean;
   payload?: unknown;
   /** Module label for profiling (set via setProfileModule during graph construction) */
   module?: string;
