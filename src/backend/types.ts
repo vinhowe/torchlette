@@ -166,6 +166,7 @@ export type FusedAttentionConfig = {
 export type FusedCrossEntropyConfig = {
   batchSize: number;
   vocabSize: number;
+  ignoreIndex?: number;
 };
 
 export type FusedLayerNormConfig = {

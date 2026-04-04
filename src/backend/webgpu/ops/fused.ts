@@ -241,6 +241,7 @@ export function fusedCrossEntropyForward(
     targetsT.buffer,
     config.batchSize,
     config.vocabSize,
+    config.ignoreIndex ?? -100,
   );
   cleanupContiguous([logits, logitsT], [targets, targetsT]);
   return createTensor([config.batchSize], outBuf);
@@ -261,6 +262,7 @@ export function fusedCrossEntropyBackward(
     gradT.buffer,
     config.batchSize,
     config.vocabSize,
+    config.ignoreIndex ?? -100,
   );
   cleanupContiguous(
     [logits, logitsT],

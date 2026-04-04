@@ -37,8 +37,18 @@ const crossEntropyForwardSpec = perRowKernel({
   },
   rowUniform: "batch_size",
   dimUniform: "vocab_size",
+  uniforms: { ignore_index: "i32" },
 
   kernel(ctx, row, tid, V, base) {
+    const t = ctx.emitLet("t", ctx.load("targets", row).toU32());
+    const ignoreIdx = ctx.uniform("ignore_index").cast("u32");
+
+    // If target == ignoreIndex, write 0 and skip
+    ctx.ifThen(t.eq(ignoreIdx), () => {
+      ctx.guardedStore("loss", tid.eq(ctx.u32(0)), row, ctx.f32(0.0));
+      ctx.emitReturn();
+    });
+
     // Parallel max reduction
     const rowMax = ctx.emitLet(
       "row_max",
@@ -56,7 +66,6 @@ const crossEntropyForwardSpec = perRowKernel({
     );
 
     // Output (thread 0 only)
-    const t = ctx.emitLet("t", ctx.load("targets", row).toU32());
     ctx.guardedStore(
       "loss",
       tid.eq(ctx.u32(0)),
@@ -80,8 +89,20 @@ const crossEntropyBackwardSpec = perRowKernel({
   },
   rowUniform: "batch_size",
   dimUniform: "vocab_size",
+  uniforms: { ignore_index: "i32" },
 
   kernel(ctx, row, tid, V, base) {
+    const t = ctx.emitLet("t", ctx.load("targets", row).toU32());
+    const ignoreIdx = ctx.uniform("ignore_index").cast("u32");
+
+    // If target == ignoreIndex, write zero gradients
+    ctx.ifThen(t.eq(ignoreIdx), () => {
+      ctx.stridedFor(tid, V, WG, (i) => {
+        ctx.emitStore("grad_logits", base.add(i), ctx.f32(0.0));
+      });
+      ctx.emitReturn();
+    });
+
     // Parallel max reduction
     const rowMax = ctx.emitLet(
       "row_max",
@@ -99,7 +120,6 @@ const crossEntropyBackwardSpec = perRowKernel({
     );
 
     // Write gradients
-    const t = ctx.emitLet("t", ctx.load("targets", row).toU32());
     const g = ctx.emitLet("g", ctx.load("grad_output", row));
     ctx.stridedFor(tid, V, WG, (i) => {
       const softmaxI = ctx
@@ -129,13 +149,14 @@ export function dispatchCrossEntropyForward(
   targetsBuffer: GPUBuffer,
   batchSize: number,
   vocabSize: number,
+  ignoreIndex = -100,
 ): GPUBuffer {
   const outputSizeBytes = batchSize * 4; // f32
   const outBuffer = allocateOutputBuffer(outputSizeBytes);
 
   ceFwdTileKernel.dispatch(
     { logits: logitsBuffer, targets: targetsBuffer, loss: outBuffer },
-    { batch_size: batchSize, vocab_size: vocabSize },
+    { batch_size: batchSize, vocab_size: vocabSize, ignore_index: ignoreIndex },
   );
 
   return outBuffer;
@@ -151,6 +172,7 @@ export function dispatchCrossEntropyBackward(
   gradOutputBuffer: GPUBuffer,
   batchSize: number,
   vocabSize: number,
+  ignoreIndex = -100,
 ): GPUBuffer {
   const outputSizeBytes = batchSize * vocabSize * 4; // f32
   const outBuffer = allocateOutputBuffer(outputSizeBytes);
@@ -162,7 +184,7 @@ export function dispatchCrossEntropyBackward(
       grad_output: gradOutputBuffer,
       grad_logits: outBuffer,
     },
-    { batch_size: batchSize, vocab_size: vocabSize },
+    { batch_size: batchSize, vocab_size: vocabSize, ignore_index: ignoreIndex },
   );
 
   return outBuffer;
