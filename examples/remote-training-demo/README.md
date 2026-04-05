@@ -72,6 +72,7 @@ npx esbuild examples/remote-training-demo/client/client.ts \
 
 # 2. Start the server (pick a free port)
 npx tsx examples/remote-training-demo/server.ts --port 9882
+# Uses WebGPU by default (via Dawn in Node). Pass --cpu to force CPU.
 
 # 3. Open http://localhost:9882 in a browser (or over SSH port-forward).
 #    Click "Start training" and watch the loss curve.
@@ -112,8 +113,12 @@ been explicitly released back to the server across the run. Expect
 
 ## Known limitations of this demo
 
-- **CPU backend server-side.** For realistic training throughput, swap for
-  a WebGPU server backend. The wire format is backend-agnostic.
+- **Tiny transformer.** 2 layers × D=32 × 4 heads × 30K params. On this
+  model size, WebGPU kernel-dispatch overhead dominates matmul cost so
+  CPU and WebGPU run at roughly the same ~100-140ms/step. The wire
+  format is backend-agnostic; bigger models show GPU winning. The tiny
+  model is intentional — it keeps the per-step latency snappy for the
+  demo and validates the protocol end-to-end.
 - **Single session per connection.** No auth, no multi-tenancy.
 - **JSON values for upload/download.** No binary frames yet — okay for
   small tensors, slow for anything large. Binary framing is an obvious

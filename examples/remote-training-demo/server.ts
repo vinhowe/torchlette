@@ -16,9 +16,9 @@ import { WebSocketServer, type WebSocket } from "ws";
 
 import { cpuBackend } from "../../src/backend/cpu/index.js";
 import { registerBackend } from "../../src/backend/registry.js";
+import type { Backend } from "../../src/backend/types.js";
 import { executePlanSequential } from "../../src/executor/sequential.js";
-import { createStorageHandle, wrapResultAsStorage } from "../../src/graph/node-factory.js";
-import { storageTracker } from "../../src/graph/storage-tracker.js";
+import { createStorageHandle } from "../../src/graph/node-factory.js";
 import type { StorageHandle } from "../../src/graph/types.js";
 import { deserializePlan } from "../../src/remote/serialize.js";
 import type {
@@ -39,7 +39,29 @@ import type {
 } from "../../src/remote/rpc.js";
 import type { HandleRef, NodeIdx } from "../../src/remote/wire.js";
 
+/** Active compute backend — set during startup by initBackend(). */
+let backend: Backend = cpuBackend;
 registerBackend(cpuBackend);
+
+async function initBackend(preferWebGPU: boolean): Promise<string> {
+  if (!preferWebGPU) return "cpu";
+  try {
+    const { initWebGPU, webgpuBackend } = await import(
+      "../../src/backend/webgpu/index.js"
+    );
+    const ok = await initWebGPU();
+    if (!ok) {
+      console.log("[server] WebGPU init failed, falling back to CPU");
+      return "cpu";
+    }
+    registerBackend(webgpuBackend);
+    backend = webgpuBackend;
+    return "webgpu";
+  } catch (e) {
+    console.log(`[server] WebGPU not available (${(e as Error).message}), using CPU`);
+    return "cpu";
+  }
+}
 
 // ============================================================================
 // Session state
@@ -87,7 +109,15 @@ async function executeHandler(
   const plan = deserializePlan(params.plan, {
     resolveHandle: (h) => session.resolve(h),
   });
-  await executePlanSequential(plan, cpuBackend);
+  // The client builds nodes with its own device label (usually "cpu" since
+  // clients don't compute locally). The server runs on whichever backend
+  // it's using; rewrite node devices so getBackend(node.device) routes to
+  // the correct backend in the executor.
+  const serverDevice = backend.name as "cpu" | "webgpu";
+  for (const node of plan.nodes) {
+    node.device = serverDevice;
+  }
+  await executePlanSequential(plan, backend);
 
   const outputs: Record<NodeIdx, HandleRef> = {};
   const outputSet = params.plan.outputNodes
@@ -105,8 +135,8 @@ async function executeHandler(
 }
 
 function uploadHandler(session: Session, params: UploadParams): UploadResult {
-  const backendTensor = cpuBackend.ops.tensorFromArray(params.values, params.shape);
-  const storage = createStorageHandle("cpu", backendTensor);
+  const backendTensor = backend.ops.tensorFromArray(params.values, params.shape);
+  const storage = createStorageHandle(backend.name as "cpu" | "webgpu", backendTensor);
   return { handle: session.allocHandle(storage) };
 }
 
@@ -115,7 +145,7 @@ async function downloadHandler(
   params: DownloadParams,
 ): Promise<DownloadResult> {
   const storage = session.resolve(params.handle);
-  const values = await cpuBackend.ops.read(storage.backendTensor);
+  const values = await backend.ops.read(storage.backendTensor);
   return { values };
 }
 
@@ -124,7 +154,7 @@ async function readScalarHandler(
   params: ReadScalarParams,
 ): Promise<ReadScalarResult> {
   const storage = session.resolve(params.handle);
-  const values = await cpuBackend.ops.read(storage.backendTensor);
+  const values = await backend.ops.read(storage.backendTensor);
   if (values.length !== 1) {
     throw new Error(
       `readScalar: tensor has ${values.length} elements, expected 1`,
@@ -165,6 +195,8 @@ async function dispatch(
     return { id: req.id, result };
   } catch (err) {
     const e = err as Error;
+    console.error(`[rpc] ${req.method} failed: ${e.message}`);
+    if (e.stack) console.error(e.stack.split("\n").slice(0, 5).join("\n"));
     return {
       id: req.id,
       error: { message: e.message, stack: e.stack },
@@ -254,17 +286,21 @@ function handleHttp(req: IncomingMessage, res: ServerResponse): void {
 // Entry point
 // ============================================================================
 
-function parseArgs(): { port: number } {
+function parseArgs(): { port: number; cpu: boolean } {
   let port = 9876;
+  let cpu = false;
   const args = process.argv.slice(2);
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--port") port = Number(args[++i]);
+    else if (args[i] === "--cpu") cpu = true;
   }
-  return { port };
+  return { port, cpu };
 }
 
-function main(): void {
-  const { port } = parseArgs();
+async function main(): Promise<void> {
+  const { port, cpu } = parseArgs();
+  const backendName = await initBackend(!cpu);
+  console.log(`[server] backend: ${backendName}`);
 
   const server = createServer(handleHttp);
   const wss = new WebSocketServer({ server, path: "/ws" });
@@ -274,6 +310,19 @@ function main(): void {
     console.log(`[server] http://localhost:${port}/ (WebSocket at /ws)`);
     console.log(`[server] static root: ${STATIC_ROOT}`);
   });
+
+  // Dawn (used by WebGPU backend on Node) holds background threads that
+  // prevent clean exit — force termination on SIGTERM/SIGINT.
+  const shutdown = (sig: string) => {
+    console.log(`[server] ${sig} — shutting down`);
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 500).unref();
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
-main();
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
