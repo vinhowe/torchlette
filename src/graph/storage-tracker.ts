@@ -72,31 +72,35 @@ class StorageTracker {
       }
     }
 
-    // Collect dead storages (rc <= 0), but protect view base chains.
-    // A live storage (rc > 0) with baseStorageId keeps its base alive
-    // even if the base itself has rc=0 (e.g., unclaimed intermediate base
-    // only kept alive by the view's retain). This mirrors the old
-    // findNeededByViews check.
-    const protectedBases = new Set<number>();
-    for (const [, storage] of this.allStorages) {
-      if (storage.baseStorageId !== undefined) {
-        let baseId: number | undefined = storage.baseStorageId;
-        while (baseId !== undefined && !protectedBases.has(baseId)) {
-          protectedBases.add(baseId);
-          baseId = this.allStorages.get(baseId)?.baseStorageId;
+    // Worklist-based cascading destruction. Each destroy can release a base
+    // ref (rcRelease "view.destroyed"), potentially making the base dead too.
+    // We re-collect dead storages until fixed point — single call, no caller loop.
+    let totalDestroyed = 0;
+    while (true) {
+      // Only LIVE views protect their bases — dead views will release the
+      // base retain when destroyed in this pass.
+      const protectedBases = new Set<number>();
+      for (const [id, storage] of this.allStorages) {
+        if (storage.baseStorageId !== undefined && rcGet(id) > 0) {
+          let baseId: number | undefined = storage.baseStorageId;
+          while (baseId !== undefined && !protectedBases.has(baseId)) {
+            protectedBases.add(baseId);
+            baseId = this.allStorages.get(baseId)?.baseStorageId;
+          }
         }
       }
-    }
 
-    const toDestroy: number[] = [];
-    for (const [id] of this.allStorages) {
-      if (rcGet(id) <= 0 && !protectedBases.has(id)) {
-        toDestroy.push(id);
+      const toDestroy: number[] = [];
+      for (const [id] of this.allStorages) {
+        if (rcGet(id) <= 0 && !protectedBases.has(id)) {
+          toDestroy.push(id);
+        }
       }
-    }
 
-    if (toDestroy.length === 0) return 0;
-    return this.destroyStorageIds(toDestroy);
+      if (toDestroy.length === 0) break;
+      totalDestroyed += this.destroyStorageIds(toDestroy);
+    }
+    return totalDestroyed;
   }
 
   /** Destroy storages with rc <= 0, scoped to ids >= sinceId. */
