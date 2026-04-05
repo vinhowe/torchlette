@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Torchlette Remote Training Demo</title>
+    <style>
+      :root {
+        color-scheme: dark light;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+        max-width: 900px;
+        margin-inline: auto;
+        background: #0b0d10;
+        color: #e0e4e8;
+      }
+      h1 {
+        font-size: 18px;
+        font-weight: 600;
+        margin: 0 0 8px;
+      }
+      .subtitle {
+        font-size: 12px;
+        opacity: 0.6;
+        margin-bottom: 24px;
+      }
+      .panel {
+        background: #15181c;
+        border: 1px solid #23272e;
+        border-radius: 6px;
+        padding: 16px;
+        margin-bottom: 16px;
+      }
+      .controls {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      button {
+        background: #2a7fff;
+        color: white;
+        border: 0;
+        padding: 8px 16px;
+        border-radius: 4px;
+        font-family: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button:hover { background: #3a8fff; }
+      button:disabled { background: #2a2a2a; color: #666; cursor: not-allowed; }
+      button.secondary { background: #2a2e35; color: #e0e4e8; }
+      button.secondary:hover { background: #3a3e45; }
+      .status {
+        margin-left: auto;
+        font-size: 12px;
+        padding: 4px 10px;
+        border-radius: 4px;
+        background: #23272e;
+      }
+      .status.connected { background: #1a3a1a; color: #7fe87f; }
+      .status.disconnected { background: #3a1a1a; color: #ff7a7a; }
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 16px;
+        margin-top: 12px;
+      }
+      .stat { font-size: 12px; }
+      .stat-label { opacity: 0.5; }
+      .stat-value { font-size: 18px; font-weight: 600; margin-top: 2px; }
+      canvas {
+        display: block;
+        width: 100%;
+        height: 240px;
+        background: #0b0d10;
+        border: 1px solid #23272e;
+        border-radius: 4px;
+      }
+      .log {
+        font-size: 11px;
+        max-height: 120px;
+        overflow-y: auto;
+        font-family: ui-monospace, monospace;
+        background: #0b0d10;
+        padding: 8px;
+        border: 1px solid #23272e;
+        border-radius: 4px;
+        white-space: pre-wrap;
+      }
+      .log-line { opacity: 0.7; }
+      .log-line.err { color: #ff7a7a; }
+      .sample {
+        font-family: ui-monospace, monospace;
+        white-space: pre-wrap;
+        font-size: 12px;
+        padding: 8px;
+        background: #0b0d10;
+        border: 1px solid #23272e;
+        border-radius: 4px;
+        min-height: 60px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Torchlette — Remote Training Demo</h1>
+    <div class="subtitle">
+      Browser client builds plans; Node server (via WebSocket) runs them on its
+      CPU backend. Training a tiny char-level transformer.
+    </div>
+
+    <div class="panel">
+      <div class="controls">
+        <button id="btn-train">Start training</button>
+        <button id="btn-stop" class="secondary" disabled>Stop</button>
+        <button id="btn-sample" class="secondary" disabled>Sample</button>
+        <span id="status" class="status disconnected">disconnected</span>
+      </div>
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-label">step</div>
+          <div class="stat-value" id="stat-step">0</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">loss</div>
+          <div class="stat-value" id="stat-loss">—</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">tok/s</div>
+          <div class="stat-value" id="stat-tps">—</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">plans/step</div>
+          <div class="stat-value" id="stat-plans">—</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <canvas id="chart" width="860" height="240"></canvas>
+    </div>
+
+    <div class="panel">
+      <div class="stat-label" style="margin-bottom: 8px">sample</div>
+      <div id="sample" class="sample">(train first, then click Sample)</div>
+    </div>
+
+    <div class="panel">
+      <div class="stat-label" style="margin-bottom: 8px">log</div>
+      <div id="log" class="log"></div>
+    </div>
+
+    <script type="module" src="/client.js"></script>
+  </body>
+</html>
