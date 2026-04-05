@@ -782,7 +782,12 @@ export function chunkedGatherTileIR(
 }
 
 /**
- * Unified scatter_add kernel: regular or chunked.
+ * Unified scatter_add kernel: regular or chunked. Uses `atomicAddF32` to
+ * handle the classic race where multiple src rows target the same output
+ * index (e.g. embedding backward where the same token appears many times
+ * in a batch). WebGPU has no native f32 atomic-add, so atomicAddF32 emits
+ * a CAS loop over `atomic<u32>` with f32 bitcast.
+ *
  * Caller must copy input→output before dispatching this kernel.
  */
 function scatterAddTileIRImpl(
@@ -807,7 +812,8 @@ function scatterAddTileIRImpl(
       bindings: {
         indices: { storage: "read", type: indexDtype },
         src: { storage: "read", type: "f32" },
-        out: { storage: "read_write", type: "f32" },
+        // f32-valued but bound as atomic<u32> so atomicAddF32 can CAS on it
+        out: { storage: "atomic", type: "u32" },
       },
       uniforms,
       sizeUniform: "srcSize",
@@ -821,11 +827,7 @@ function scatterAddTileIRImpl(
         const coords = ctx.decomposeIndex(srcIdx, srcShape);
         const outCoords = coords.map((c, d) => (d === dim ? dimIdx : c));
         const outOffset = ctx.linearizeIndex(outCoords, outStrides);
-        ctx.emitStore(
-          "out",
-          outOffset,
-          ctx.load("out", outOffset).add(ctx.load("src", srcIdx)),
-        );
+        ctx.atomicAddF32("out", outOffset, ctx.load("src", srcIdx));
       },
     }),
   );
