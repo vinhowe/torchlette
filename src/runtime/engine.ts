@@ -39,6 +39,7 @@ import { rewritePlan } from "../compiler/rewriter/plan-rewrite";
 import { doubleTransposeRule } from "../compiler/rewriter/rules/double-transpose";
 import { fuseMatmulSumRule } from "../compiler/rewriter/rules/fuse-matmul-sum";
 import { transitiveReshapeRule } from "../compiler/rewriter/rules/transitive-reshape";
+import { auditPlan } from "../compiler/scheduler/audit";
 import { getPendingNodeIds } from "./tensor";
 
 const DSL_RULES = [
@@ -673,7 +674,11 @@ export class RuntimeEngine {
 
     // Apply DSL rewrites (node-insertion rules) before the template cache
     // sees the plan. Runs every step but is cheap (few patterns, <1ms).
-    rewritePlan(plan, DSL_RULES, getPendingNodeIds());
+    const pendingIds = getPendingNodeIds();
+    rewritePlan(plan, DSL_RULES, pendingIds);
+
+    // Scheduler audit (no-op unless TORCHLETTE_SCHEDULER_AUDIT=1).
+    auditPlan(plan, pendingIds);
 
     // Retain rc on all materialized inputs used by the plan. Keeps storages
     // alive through execution even if owning tensors are disposed mid-step.
@@ -772,7 +777,11 @@ export class RuntimeEngine {
     if (plan.nodes.length === 0) return;
 
     // Apply DSL rewrites before template cache
-    rewritePlan(plan, DSL_RULES, getPendingNodeIds());
+    const pendingIds = getPendingNodeIds();
+    rewritePlan(plan, DSL_RULES, pendingIds);
+
+    // Scheduler audit (no-op unless TORCHLETTE_SCHEDULER_AUDIT=1).
+    auditPlan(plan, pendingIds);
 
     retainPlanInputRefs(plan.nodes);
 
