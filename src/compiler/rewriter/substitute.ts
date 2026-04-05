@@ -38,11 +38,19 @@ export interface RewriteContext {
   ): LazyIRNode;
   /** Shorthand: wrap a node as a pending ref. */
   pendingRef(node: LazyIRNode, outputIndex?: number): LazyRef;
+  /** Mark a node as explicitly dead — the caller knows its output is no
+   *  longer needed. Used by in-place mutation rules to mark the upstream
+   *  chain (e.g., the original matmul/transpose nodes) as removable. */
+  markDead(node: LazyIRNode): void;
 }
 
 /** A rewrite receives bindings from the matcher and returns the ref that
  *  replaces the matched root. */
-export type RewriteFn = (bindings: Bindings, ctx: RewriteContext) => LazyRef;
+export type RewriteFn = (
+  bindings: Bindings,
+  ctx: RewriteContext,
+  root: import("../../graph/types").LazyIRNode,
+) => LazyRef;
 
 // ============================================================================
 // Builder-context (tracks new nodes)
@@ -52,8 +60,10 @@ export type RewriteFn = (bindings: Bindings, ctx: RewriteContext) => LazyRef;
 export function makeRewriteContext(): {
   ctx: RewriteContext;
   newNodes: LazyIRNode[];
+  killedNodes: Set<LazyIRNode>;
 } {
   const newNodes: LazyIRNode[] = [];
+  const killedNodes = new Set<LazyIRNode>();
   const ctx: RewriteContext = {
     createNode(op, inputs, shape, dtype, device, payload) {
       const node = createLazyIRNode(op, inputs, shape, dtype, device, payload);
@@ -65,8 +75,11 @@ export function makeRewriteContext(): {
         ? { kind: "pending", node, outputIndex }
         : { kind: "pending", node };
     },
+    markDead(node) {
+      killedNodes.add(node);
+    },
   };
-  return { ctx, newNodes };
+  return { ctx, newNodes, killedNodes };
 }
 
 // ============================================================================
@@ -120,17 +133,11 @@ export function applySubstitution(
   replacement: LazyRef,
   newNodes: readonly LazyIRNode[],
   maps: ConsumerMaps,
+  /** Snapshot of matchedRoot.inputs BEFORE the rewrite fn ran. Needed for
+   *  the in-place mutation case so we can decrement consumer counts on
+   *  the old producers. If omitted, matchedRoot.inputs is used. */
+  preInputs?: readonly LazyRef[],
 ): void {
-  // Guard: replacement must not be the same as matchedRoot's output ref.
-  if (
-    replacement.kind === "pending" &&
-    replacement.node.id === matchedRoot.id
-  ) {
-    throw new Error(
-      `applySubstitution: replacement is the same node (#${matchedRoot.id}) as matchedRoot`,
-    );
-  }
-
   // 1. Find insertion point for new nodes (before matchedRoot).
   const rootIdx = plan.indexOf(matchedRoot);
   if (rootIdx < 0) {
@@ -149,6 +156,43 @@ export function applySubstitution(
     for (const inputRef of node.inputs) {
       addConsumer(maps, inputRef, node);
     }
+  }
+
+  // In-place mutation case: replacement refers back to matchedRoot.
+  // The rewrite has mutated matchedRoot's op/inputs in place. We need
+  // to transfer matchedRoot's consumer membership from its OLD inputs
+  // to its NEW inputs.
+  if (
+    replacement.kind === "pending" &&
+    replacement.node.id === matchedRoot.id
+  ) {
+    const oldInputs = preInputs ?? matchedRoot.inputs;
+    // Decrement consumer counts on OLD inputs (matchedRoot is no longer
+    // one of their consumers).
+    for (const inputRef of oldInputs) {
+      if (inputRef.kind !== "pending") continue;
+      const id = inputRef.node.id;
+      const list = maps.consumers.get(id);
+      if (!list) continue;
+      const i = list.findIndex((n) => n === matchedRoot);
+      if (i >= 0) {
+        list.splice(i, 1);
+        maps.consumers.set(id, list);
+        maps.consumerCount.set(id, list.length);
+      }
+    }
+    // Add matchedRoot as consumer of its NEW inputs.
+    for (const inputRef of matchedRoot.inputs) {
+      if (inputRef.kind !== "pending") continue;
+      const id = inputRef.node.id;
+      const list = maps.consumers.get(id) ?? [];
+      if (!list.includes(matchedRoot)) {
+        list.push(matchedRoot);
+        maps.consumers.set(id, list);
+        maps.consumerCount.set(id, list.length);
+      }
+    }
+    return;
   }
 
   // 4. Rewire consumers of matchedRoot → replacement.

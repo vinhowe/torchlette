@@ -300,8 +300,9 @@ describe("engine / check predicate", () => {
 // Infinite-loop guard
 // ============================================================================
 
-describe("engine / loop guard", () => {
-  it("skips rule that returns the matched root", () => {
+describe("engine / in-place mutation", () => {
+  it("allows rule to mutate the matched root and return ref to it", () => {
+    // Rule mutates neg → relu (hypothetical in-place op change).
     const n = negNode(matRef(1));
     const final = createLazyIRNode(
       "relu",
@@ -314,12 +315,18 @@ describe("engine / loop guard", () => {
     const maps = buildMaps(plan);
 
     const rule: Rule = {
-      name: "self-return",
+      name: "neg-to-relu",
       pattern: op("neg"),
-      rewrite: (_bindings, ctx) => ctx.pendingRef(n), // same node!
+      rewrite: (_bindings, ctx, root) => {
+        (root as unknown as { op: string }).op = "relu";
+        return ctx.pendingRef(root);
+      },
     };
 
     const stats = applyRules(plan, [rule], maps);
-    expect(stats.applied).toBe(0);
+    expect(stats.applied).toBe(1);
+    expect(n.op).toBe("relu");
+    // `final` still points to n (id unchanged)
+    expect((final.inputs[0] as { node: { id: number } }).node.id).toBe(n.id);
   });
 });

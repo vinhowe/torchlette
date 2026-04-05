@@ -102,15 +102,24 @@ describe("substitute / minimal", () => {
     assertMapsConsistent(maps);
   });
 
-  it("throws if replacement refers back to matchedRoot", () => {
+  it("handles in-place mutation: replacement refers back to matchedRoot", () => {
+    // Simulate rule that mutates add → sub in place.
     const add = addNode(matRef(1), matRef(2));
     const mul = mulNode(pendingRef(add), matRef(3));
     const plan = [add, mul];
     const maps = buildMaps(plan);
 
-    expect(() =>
-      applySubstitution(plan, add, pendingRef(add), [], maps),
-    ).toThrow(/same node/i);
+    // Mutate add's op. Don't add any new nodes. Return pendingRef(add).
+    (add as unknown as { op: string }).op = "sub";
+    applySubstitution(plan, add, pendingRef(add), [], maps);
+
+    // mul should still reference add (unchanged), and maps should be consistent.
+    expect(mul.inputs[0].kind).toBe("pending");
+    if (mul.inputs[0].kind === "pending") {
+      expect(mul.inputs[0].node).toBe(add);
+    }
+    expect(maps.consumerCount.get(add.id)).toBe(1);
+    assertMapsConsistent(maps);
   });
 
   it("throws if matchedRoot is not in plan", () => {
