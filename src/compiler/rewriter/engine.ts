@@ -1,13 +1,42 @@
 /**
  * Rewrite engine: apply a set of Rules to a plan, iterating to fixed point.
  *
- * Each rule has a Pattern + RewriteFn. The engine walks the plan in reverse,
+ * Each rule has a Pattern + RewriteFn. The engine walks the plan forward,
  * tries each rule at each node, and applies the first match. Fixed-point
  * iteration lets rules chain: one rule's output can trigger another rule.
  *
  * The engine is pure-ish: it mutates `plan` and the consumer maps, but
  * doesn't touch any module-level state except via `createLazyIRNode`
  * (for fresh node IDs).
+ *
+ * # Rewrite output contract
+ *
+ * A rule's `rewrite` function returns a `LazyRef` that replaces the
+ * matched root. There are two supported forms:
+ *
+ * 1. **New-node replacement** (usual case): return a ref to a freshly-
+ *    created node (via `ctx.createNode` / `ctx.pendingRef`). The engine
+ *    splices the new nodes into the plan before the matched root and
+ *    rewires every downstream consumer to reference the new ref.
+ *
+ * 2. **In-place mutation**: return a ref to the matched root itself,
+ *    after mutating its `op`, `inputs`, and/or `payload` in place. This
+ *    preserves the node's identity (its id). Use this when an external
+ *    system — notably torchlette's pending-RuntimeTensor registry —
+ *    holds references by node id and shouldn't need to be re-pointed.
+ *    The engine detects this case via `replacement.node.id === root.id`
+ *    and transfers consumer-map membership from the root's pre-rewrite
+ *    inputs to its new inputs. The rule is responsible for:
+ *      - Ensuring the mutated node's shape/dtype still matches what
+ *        downstream consumers expect.
+ *      - Ensuring the mutated node's pattern no longer matches the
+ *        rule that produced it (to avoid infinite re-matching).
+ *      - Calling `ctx.markDead` on any upstream nodes whose outputs
+ *        are orphaned by the mutation but can't be auto-detected as
+ *        dead (e.g., nodes with pending RuntimeTensors).
+ *
+ * Either form may create helper nodes via `ctx.createNode`; those are
+ * spliced into the plan regardless of which form the rewrite takes.
  */
 import type { LazyIRNode, LazyRef } from "../../graph/types";
 import { match } from "./matcher";
