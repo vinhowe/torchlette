@@ -409,6 +409,12 @@ export function getGPUMemoryStats(): ReturnType<GPUMemoryTracker["stats"]> {
   return gpuMemoryTracker.stats();
 }
 
+/** Reset the GPU memory peak high-water mark (e.g. per-step diagnostics). */
+export function resetGPUMemoryPeak(): void {
+  // @ts-expect-error private field — diagnostics only
+  gpuMemoryTracker.peakUsageBytes = gpuMemoryTracker.currentAllocatedBytes;
+}
+
 /**
  * Get allocation size histogram for diagnostics.
  */

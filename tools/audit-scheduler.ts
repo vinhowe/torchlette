@@ -22,6 +22,7 @@ import {
   initWebGPU,
   isF16Supported,
 } from "../src/backend/webgpu";
+import { resetGPUMemoryPeak } from "../src/backend/webgpu/memory-tracker";
 import {
   getMaxFirstFitBytes,
   getMaxPeakLiveBytes,
@@ -78,6 +79,7 @@ async function main(): Promise<void> {
   });
 
   for (let step = 0; step < NUM_STEPS; step++) {
+    resetGPUMemoryPeak();
     if (scaler) await scaler.resolveDeferred();
     await api.beginStep();
     const input = api.tensorFromArray(inputTokens, [1, SEQ_LEN], {

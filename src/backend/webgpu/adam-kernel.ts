@@ -1,10 +1,10 @@
 /**
  * Fused Adam/AdamW Optimizer Kernel
  *
- * A single WGSL compute shader that updates param in-place and writes new m/v
- * to separate output buffers. Supports both Adam (L2 decay on gradient) and
- * AdamW (decoupled decay on parameter). grad, m_in, v_in are read-only;
- * param is read_write; m_out, v_out are write-only outputs.
+ * A single WGSL compute shader that updates param, m, and v in-place in one
+ * dispatch per parameter. Supports both Adam (L2 decay on gradient) and
+ * AdamW (decoupled decay on parameter). grad is read-only; param/m/v are
+ * read_write (each thread touches only its own index → no cross-thread race).
  *
  * Handles large buffers (>maxStorageBufferBindingSize) via tile-IR dispatchChunked.
  */
@@ -46,10 +46,8 @@ function makeAdamStepSpec(
   const bindings: Record<string, BindingSpec> = {
     grad: { storage: "read", type: "f32" },
     param: { storage: "read_write", type: "f32" },
-    m_in: { storage: "read", type: "f32" },
-    v_in: { storage: "read", type: "f32" },
-    m_out: { storage: "read_write", type: "f32" },
-    v_out: { storage: "read_write", type: "f32" },
+    m: { storage: "read_write", type: "f32" },
+    v: { storage: "read_write", type: "f32" },
   };
   if (emitF16) {
     bindings.param_f16 = { storage: "read_write", type: "f16" };
@@ -219,11 +217,11 @@ function emitAdamScalarBody(
   const g = gVar.get();
   const mNew = ctx.emitLet(
     `m_new${suffix}`,
-    beta1.mul(ctx.load("m_in", idx)).add(ctx.f32(1.0).sub(beta1).mul(g)),
+    beta1.mul(ctx.load("m", idx)).add(ctx.f32(1.0).sub(beta1).mul(g)),
   );
   const vNew = ctx.emitLet(
     `v_new${suffix}`,
-    beta2.mul(ctx.load("v_in", idx)).add(ctx.f32(1.0).sub(beta2).mul(g).mul(g)),
+    beta2.mul(ctx.load("v", idx)).add(ctx.f32(1.0).sub(beta2).mul(g).mul(g)),
   );
 
   const pNewVar = ctx.emitVar(
@@ -239,8 +237,8 @@ function emitAdamScalarBody(
 
   // Write outputs
   ctx.emitStore("param", idx, pNewVar.get());
-  ctx.emitStore("m_out", idx, mNew);
-  ctx.emitStore("v_out", idx, vNew);
+  ctx.emitStore("m", idx, mNew);
+  ctx.emitStore("v", idx, vNew);
 
   if (emitF16) {
     ctx.emitStore("param_f16", idx, pNewVar.get().toF16());
@@ -307,19 +305,13 @@ export function dispatchAdamStep(
   const maxBindingSize = getMaxStorageBufferBindingSize();
   const needsChunking = totalBytes > maxBindingSize;
 
-  // Track ALL input buffers in the write set BEFORE any allocation, so the
-  // pool won't hand back these buffers for output allocation.
+  // Track all in-place buffers in the write set so the pool won't hand
+  // them back for output allocation within this shared-encoder scope.
   let _st = profileSubOpBegin();
   trackSharedEncoderWrite(gradBuffer);
   trackSharedEncoderWrite(paramBuffer);
   trackSharedEncoderWrite(mBuffer);
   trackSharedEncoderWrite(vBuffer);
-
-  // Allocate separate output buffers for m and v (no longer in-place).
-  const mOutBuffer = allocateOutputBuffer(totalBytes);
-  trackSharedEncoderWrite(mOutBuffer);
-  const vOutBuffer = allocateOutputBuffer(totalBytes);
-  trackSharedEncoderWrite(vOutBuffer);
 
   // Allocate f16 output buffer if needed.
   let paramF16Out: GPUBuffer | null = null;
@@ -332,14 +324,12 @@ export function dispatchAdamStep(
   // Vec4 coalescing for unscale path (non-unscale uses autoVectorize)
   const useVec4 = doUnscale && numElements % 4 === 0;
 
-  // Build buffers map
+  // Build buffers map — all in-place (param/m/v modified in the same buffer).
   const buffers: Record<string, GPUBuffer> = {
     grad: gradBuffer,
     param: paramBuffer,
-    m_in: mBuffer,
-    v_in: vBuffer,
-    m_out: mOutBuffer,
-    v_out: vOutBuffer,
+    m: mBuffer,
+    v: vBuffer,
   };
   if (doF16 && paramF16Out) buffers.param_f16 = paramF16Out;
   if (doUnscale && infFlagBuffer) buffers.inf_flag = infFlagBuffer;
@@ -389,10 +379,8 @@ export function dispatchAdamStep(
     const modes: Record<string, "scalar" | "chunked"> = {
       grad: "chunked",
       param: "chunked",
-      m_in: "chunked",
-      v_in: "chunked",
-      m_out: "chunked",
-      v_out: "chunked",
+      m: "chunked",
+      v: "chunked",
     };
     if (doF16) modes.param_f16 = "chunked";
     if (doUnscale) modes.inf_flag = "scalar";
@@ -414,11 +402,11 @@ export function dispatchAdamStep(
   }
   profileSubOpEnd("adam.dispatch", _st);
 
-  // param is updated in-place; m/v are fresh output buffers
+  // param/m/v are all updated in-place — return the same input buffers.
   const result: AdamStepResult = {
     paramBuffer,
-    mBuffer: mOutBuffer,
-    vBuffer: vOutBuffer,
+    mBuffer,
+    vBuffer,
   };
   if (paramF16Out) {
     result.paramF16Buffer = paramF16Out;
