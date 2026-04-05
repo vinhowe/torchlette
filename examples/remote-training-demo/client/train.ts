@@ -8,7 +8,7 @@ import { crossEntropy } from "../../../src/nn/functional.ts";
 import type { Tensor, Torchlette } from "../../../src/frontend/torchlette.ts";
 import type { Dataset, ModelConfig, TransformerModel } from "./model.ts";
 import { forward, parameters, sampleBatch } from "./model.ts";
-import type { RemoteEngine } from "./engine.ts";
+import type { RemoteEngine } from "../../../src/remote/client-engine.ts";
 
 export interface TrainConfig {
   lr: number;

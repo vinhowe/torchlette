@@ -10,7 +10,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { createRemoteEngine } from "./client/engine.ts";
+import { createRemoteEngine } from "../../src/remote/client-engine.ts";
 import { RpcClient } from "./client/transport.ts";
 
 // Node 22+ has WebSocket globally.

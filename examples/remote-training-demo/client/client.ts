@@ -5,7 +5,10 @@
  * Every plan goes over the wire — the browser only builds the autograd graph.
  */
 
-import { createRemoteEngine, type RemoteEngine } from "./engine.ts";
+import {
+  createRemoteEngine,
+  type RemoteEngine,
+} from "../../../src/remote/client-engine.ts";
 import { buildCharDataset, createModel, forward, parameters } from "./model.ts";
 import { modelConfigSmall, type TrainConfig, trainStep } from "./train.ts";
 import { RpcClient } from "./transport.ts";

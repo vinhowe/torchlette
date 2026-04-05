@@ -7,7 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { createRemoteEngine } from "./client/engine.ts";
+import { createRemoteEngine } from "../../src/remote/client-engine.ts";
 import { buildCharDataset, createModel, parameters } from "./client/model.ts";
 import { modelConfigSmall, trainStep } from "./client/train.ts";
 import { RpcClient } from "./client/transport.ts";
