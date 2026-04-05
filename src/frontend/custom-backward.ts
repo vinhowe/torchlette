@@ -71,16 +71,48 @@ export function linearBackward(
       resultInput = ctx.sumToShape(gradInput, inputShape);
     }
 
-    // dW = dY^T @ X → [out, in] = weight's shape directly
+    // dW = dY^T @ X → [out, in] = weight's shape directly.
+    // When input has batch dims, flatten them into the row dim to avoid a
+    // [batch, out, in] intermediate (400-600MB at distilgpt2 batch=4 seq=512).
     let resultWeight: RuntimeTensor | null = null;
     if (needsWeightGrad) {
       const savedInput = getSaved(savedIdx++)._unwrap();
-      const gradT = ctx.rt.transpose(grad, {
-        dim0: grad.shape.length - 2,
-        dim1: grad.shape.length - 1,
-      });
-      const gradWeight = ctx.rt.matmul(gradT, savedInput);
-      resultWeight = ctx.sumToShape(gradWeight, weightShape);
+      const gradRank = grad.shape.length;
+      const inRank = savedInput.shape.length;
+      if (
+        gradRank > 2 &&
+        inRank === gradRank &&
+        weightShape.length === 2 &&
+        savedInput.shape[inRank - 2] === grad.shape[gradRank - 2]
+      ) {
+        const outDim = grad.shape[gradRank - 1];
+        const seqDim = grad.shape[gradRank - 2];
+        const inDim = savedInput.shape[inRank - 1];
+        let batchProd = 1;
+        let mismatch = false;
+        for (let i = 0; i < gradRank - 2; i++) {
+          if (savedInput.shape[i] !== grad.shape[i]) {
+            mismatch = true;
+            break;
+          }
+          batchProd *= grad.shape[i];
+        }
+        if (!mismatch) {
+          const totalRows = batchProd * seqDim;
+          const gradFlat = ctx.rt.reshape(grad, [totalRows, outDim]);
+          const inputFlat = ctx.rt.reshape(savedInput, [totalRows, inDim]);
+          const gradFlatT = ctx.rt.transpose(gradFlat, { dim0: 0, dim1: 1 });
+          resultWeight = ctx.rt.matmul(gradFlatT, inputFlat);
+        }
+      }
+      if (!resultWeight) {
+        const gradT = ctx.rt.transpose(grad, {
+          dim0: grad.shape.length - 2,
+          dim1: grad.shape.length - 1,
+        });
+        const gradWeight = ctx.rt.matmul(gradT, savedInput);
+        resultWeight = ctx.sumToShape(gradWeight, weightShape);
+      }
     }
 
     // dBias = sum(dY, all dims except last)
