@@ -14,6 +14,7 @@ export interface ModelConfig {
   numHeads: number;
   numLayers: number;
   mlpRatio: number; // MLP hidden = embedDim * mlpRatio
+  device?: "cpu" | "webgpu";
 }
 
 /** Holds model parameters — client-side Tensor handles. */
@@ -81,7 +82,7 @@ export function createModel(
   const { vocabSize, blockSize, embedDim: D, numLayers, mlpRatio } = config;
   const H = Math.floor(D * mlpRatio);
   const rng = makePrng(seed);
-  const opts = { device: "cpu" as const };
+  const opts = { device: config.device ?? ("cpu" as const) };
 
   const scale = 1 / Math.sqrt(D);
   const draw = (n: number) => Array.from({ length: n }, () => rng() * scale);
@@ -167,7 +168,7 @@ export function forward(
   // Positional: slice first `seq` rows, add to tok
   // posEmb is [blockSize, D]; we need [seq, D] then broadcast to [B, seq, D]
   const posIdsArr = Array.from({ length: seq }, (_, i) => i);
-  const posIds = api.tensorFromArray(posIdsArr, [seq], { device: "cpu", dtype: "i32" });
+  const posIds = api.tensorFromArray(posIdsArr, [seq], { device: m.config.device ?? "cpu", dtype: "i32" });
   const posE = api.embedding(m.posEmb, posIds); // [seq, D]
   // Broadcast: add via expand
   const posEExpanded = api.expand(api.reshape(posE, [1, seq, D]), [B, seq, D]);
