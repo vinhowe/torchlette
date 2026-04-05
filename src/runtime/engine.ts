@@ -35,6 +35,11 @@ import {
 } from "../executor/executor";
 import { isDataSourceOp } from "../executor/lowered-plan";
 import { buildMergedPlan } from "../executor/plan-builder";
+import { rewritePlan } from "../compiler/rewriter/plan-rewrite";
+import { fuseMatmulSumRule } from "../compiler/rewriter/rules/fuse-matmul-sum";
+import { getPendingNodeIds } from "./tensor";
+
+const DSL_RULES = [fuseMatmulSumRule];
 import {
   executePlanSegmented,
   executePlanSequential,
@@ -660,6 +665,10 @@ export class RuntimeEngine {
     const plan = buildMergedPlan(pendingRoots);
     if (plan.nodes.length === 0) return;
 
+    // Apply DSL rewrites (node-insertion rules) before the template cache
+    // sees the plan. Runs every step but is cheap (few patterns, <1ms).
+    rewritePlan(plan, DSL_RULES, getPendingNodeIds());
+
     // Retain rc on all materialized inputs used by the plan. Keeps storages
     // alive through execution even if owning tensors are disposed mid-step.
     retainPlanInputRefs(plan.nodes);
@@ -755,6 +764,9 @@ export class RuntimeEngine {
 
     const plan = buildMergedPlan(pendingRoots, /* skipExecuted */ true);
     if (plan.nodes.length === 0) return;
+
+    // Apply DSL rewrites before template cache
+    rewritePlan(plan, DSL_RULES, getPendingNodeIds());
 
     retainPlanInputRefs(plan.nodes);
 
