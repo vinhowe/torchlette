@@ -119,7 +119,7 @@ describe("StorageTracker", () => {
       expect(base.destroyed).toBe(false);
     });
 
-    it("destroys base on next call after view releases its ref", () => {
+    it("destroys base in same call after view releases its ref (cascading)", () => {
       const base = mockStorage(10);
       const view = mockStorage(20, { ownsBuffer: false, baseStorageId: 10 });
       storageTracker.register(base);
@@ -127,15 +127,12 @@ describe("StorageTracker", () => {
       rcRetain(10, "view.baseStorageId");
       // View has rc=0, base has rc=1 (from view retain)
 
-      // First call: destroys view, which releases base → base rc=0
-      // But base wasn't in the toDestroy list (collected before view was processed)
-      expect(storageTracker.destroyUnreachable()).toBe(1);
-      expect(base.destroyed).toBe(false);
-      expect(storageTracker.stats().totalStorages).toBe(1); // only base remains
-
-      // Second call: base now has rc=0 and is destroyed
-      expect(storageTracker.destroyUnreachable()).toBe(1);
+      // Single call cascades: unregisters view (ownsBuffer=false so no
+      // destroy() call), view.destroyed release drops base to rc=0, then
+      // base is destroyed in the same call.
+      expect(storageTracker.destroyUnreachable()).toBe(2);
       expect(base.destroyed).toBe(true);
+      expect(storageTracker.stats().totalStorages).toBe(0);
     });
   });
 

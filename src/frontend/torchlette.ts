@@ -1598,10 +1598,8 @@ export class Torchlette {
 
     // Step 3.5: Release refs for step-scoped temporaries, then destroy.
     storageTracker.releaseStepTemps();
-    storageTracker.destroyUnreachable();
 
-    // Step 3.6: Clean up orphaned views (views with rc <= 0 whose base refs
-    // were already released). Run again to catch cascades.
+    // Step 3.6: Final cleanup after releasing step-scoped refs.
     storageTracker.destroyUnreachable();
 
     // Step 4: Reset cumulative fusion stats for the next step
