@@ -28,9 +28,9 @@ export interface Rule {
   readonly pattern: Pattern;
   readonly rewrite: RewriteFn;
   /** Cross-capture predicate that runs AFTER a successful match. Returning
-   *  false rejects the match. Useful for shape/dtype constraints that span
-   *  multiple bindings. */
-  readonly check?: (bindings: Bindings) => boolean;
+   *  false rejects the match. Receives the matched root node for access
+   *  to its payload/shape/dtype. */
+  readonly check?: (bindings: Bindings, root: LazyIRNode) => boolean;
 }
 
 export interface ApplyStats {
@@ -47,17 +47,23 @@ export interface ApplyStats {
 // ============================================================================
 
 /** Apply `rules` to `plan`, iterating to fixed point. Mutates `plan` and
- *  `maps` in place. `replaced` (optional) collects the ids of nodes whose
- *  outputs were rewired away — callers can pass the same set to DCE or
- *  other passes. */
+ *  `maps` in place.
+ *  - `replaced`: ids of nodes whose outputs were rewired away.
+ *  - `killed`: nodes explicitly marked dead by a rule (via ctx.markDead).
+ *    Callers can physically remove these from plan.nodes. */
 export function applyRules(
   plan: LazyIRNode[],
   rules: readonly Rule[],
   maps: ConsumerMaps,
-  options?: { maxPasses?: number; replaced?: Set<number> },
+  options?: {
+    maxPasses?: number;
+    replaced?: Set<number>;
+    killed?: Set<LazyIRNode>;
+  },
 ): ApplyStats {
   const maxPasses = options?.maxPasses ?? 10;
   const replaced = options?.replaced ?? new Set<number>();
+  const killed = options?.killed ?? new Set<LazyIRNode>();
   const stats: ApplyStats = {
     applied: 0,
     byRule: new Map(),
@@ -86,22 +92,23 @@ export function applyRules(
       for (const rule of rules) {
         const bindings = match(rule.pattern, rootRef);
         if (!bindings) continue;
-        if (rule.check && !rule.check(bindings)) continue;
+        if (rule.check && !rule.check(bindings, node)) continue;
+
+        // Snapshot the matched root's inputs BEFORE calling the rewrite.
+        // In-place mutation rules change node.inputs; we need the pre-rewrite
+        // inputs to correctly decrement consumer counts on the old producers.
+        const preInputs = node.inputs.slice();
 
         // Build replacement nodes + ref.
-        const { ctx, newNodes } = makeRewriteContext();
-        const replacement = rule.rewrite(bindings, ctx);
+        const { ctx, newNodes, killedNodes } = makeRewriteContext();
+        const replacement = rule.rewrite(bindings, ctx, node);
+        for (const k of killedNodes) killed.add(k);
 
-        // Guard: replacement must not be the same as matched root.
-        if (
-          replacement.kind === "pending" &&
-          replacement.node.id === node.id
-        ) {
-          // Malformed rule — would cause infinite loop. Skip.
-          continue;
-        }
-
-        applySubstitution(plan, node, replacement, newNodes, maps);
+        // In-place mutation case: a rule may MUTATE the matched root in
+        // place (change its op/inputs) and return a ref to it. applySubstitution
+        // handles that specially. To avoid infinite rematching, the mutated
+        // node's new op/shape must no longer match the rule's pattern.
+        applySubstitution(plan, node, replacement, newNodes, maps, preInputs);
         replaced.add(node.id);
         stats.applied++;
         stats.byRule.set(
