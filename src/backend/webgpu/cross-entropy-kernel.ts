@@ -46,17 +46,17 @@ const crossEntropyForwardSpec = perRowKernel({
   kernel(ctx, row, tid, V, base) {
     const tI = ctx.emitLet("t_i", ctx.load("targets", row));
     const ignoreIdx = ctx.uniform("ignore_index", "i32");
+    const isIgnored = ctx.emitLet("is_ignored", tI.eq(ignoreIdx));
 
-    // If target == ignoreIndex, write 0 and skip
-    ctx.ifThen(tI.eq(ignoreIdx), () => {
-      ctx.guardedStore("loss", tid.eq(ctx.u32(0)), row, ctx.f32(0.0));
-      ctx.emitReturn();
-    });
+    // Use tSafe=0 for ignored rows so the OOB read below doesn't happen.
+    // All threads participate in the reductions (avoids uniformity violation
+    // when barriers/subgroups follow an early return).
+    const tSafe = ctx.emitLet(
+      "t_safe",
+      isIgnored.select(ctx.u32(0), tI.toU32()),
+    );
 
-    // Safe u32 conversion: guard has filtered negatives, and targets < V.
-    const t = ctx.emitLet("t", tI.toU32());
-
-    // Parallel max reduction
+    // Parallel max reduction (runs for all rows)
     const rowMax = ctx.emitLet(
       "row_max",
       ctx.wgReduce("max", tid, V, WG, (i) => ctx.load("logits", base.add(i))),
@@ -72,12 +72,17 @@ const crossEntropyForwardSpec = perRowKernel({
         .log(),
     );
 
-    // Output (thread 0 only)
+    // Thread 0 writes final loss: 0 if ignored, else -log p(target).
+    const rawLoss = ctx
+      .load("logits", base.add(tSafe))
+      .sub(rowMax)
+      .sub(logSumExp)
+      .neg();
     ctx.guardedStore(
       "loss",
       tid.eq(ctx.u32(0)),
       row,
-      ctx.load("logits", base.add(t)).sub(rowMax).sub(logSumExp).neg(),
+      isIgnored.select(ctx.f32(0.0), rawLoss),
     );
   },
 });
@@ -101,16 +106,10 @@ const crossEntropyBackwardSpec = perRowKernel({
   kernel(ctx, row, tid, V, base) {
     const tI = ctx.emitLet("t_i", ctx.load("targets", row));
     const ignoreIdx = ctx.uniform("ignore_index", "i32");
-
-    // If target == ignoreIndex, write zero gradients
-    ctx.ifThen(tI.eq(ignoreIdx), () => {
-      ctx.stridedFor(tid, V, WG, (i) => {
-        ctx.emitStore("grad_logits", base.add(i), ctx.f32(0.0));
-      });
-      ctx.emitReturn();
-    });
-
-    const t = ctx.emitLet("t", tI.toU32());
+    const isIgnored = ctx.emitLet("is_ignored", tI.eq(ignoreIdx));
+    // Clamp to 0 so the one-hot i.eq(t) never spuriously matches at a
+    // negative/OOB index; gradients are zeroed out via select() below.
+    const t = ctx.emitLet("t", isIgnored.select(ctx.u32(0), tI.toU32()));
 
     // Parallel max reduction
     const rowMax = ctx.emitLet(
@@ -128,8 +127,12 @@ const crossEntropyBackwardSpec = perRowKernel({
         .log(),
     );
 
-    // Write gradients
+    // Write gradients: zero for ignored rows, else grad_output * (softmax - one_hot).
     const g = ctx.emitLet("g", ctx.load("grad_output", row));
+    const gScaled = ctx.emitLet(
+      "g_scaled",
+      isIgnored.select(ctx.f32(0.0), g),
+    );
     ctx.stridedFor(tid, V, WG, (i) => {
       const softmaxI = ctx
         .load("logits", base.add(i))
@@ -137,7 +140,11 @@ const crossEntropyBackwardSpec = perRowKernel({
         .sub(logSumExp)
         .exp();
       const oneHotI = i.eq(t).select(ctx.f32(1.0), ctx.f32(0.0));
-      ctx.emitStore("grad_logits", base.add(i), g.mul(softmaxI.sub(oneHotI)));
+      ctx.emitStore(
+        "grad_logits",
+        base.add(i),
+        gScaled.mul(softmaxI.sub(oneHotI)),
+      );
     });
   },
 });
