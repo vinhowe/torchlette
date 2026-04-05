@@ -15,8 +15,17 @@
  */
 import * as path from "node:path";
 import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
-import { destroyWebGPU, initWebGPU, isF16Supported } from "../src/backend/webgpu";
 import {
+  destroyWebGPU,
+  getBufferPoolStats,
+  getGPUMemoryStats,
+  initWebGPU,
+  isF16Supported,
+} from "../src/backend/webgpu";
+import {
+  getMaxFirstFitBytes,
+  getMaxPeakLiveBytes,
+  printSchedulerAuditPerPlan,
   printSchedulerAuditSummary,
   resetSchedulerAudit,
 } from "../src/compiler/scheduler/audit";
@@ -27,6 +36,11 @@ import { Adam, GradScaler } from "../src/optim";
 process.env.TORCHLETTE_SCHEDULER_AUDIT =
   process.env.TORCHLETTE_SCHEDULER_AUDIT ?? "1";
 
+const MODEL_NAME = process.env.TORCHLETTE_MODEL ?? "distilgpt2";
+const SEQ_LEN = parseInt(process.env.TORCHLETTE_SEQ_LEN ?? "512", 10);
+const NUM_STEPS = parseInt(process.env.NUM_STEPS ?? "3", 10);
+const VERBOSE = !!process.env.VERBOSE;
+
 async function main(): Promise<void> {
   await initWebGPU();
   const api = new Torchlette("webgpu", {
@@ -35,7 +49,7 @@ async function main(): Promise<void> {
     enableCheckpointSegmentation: true,
   });
 
-  const modelDir = path.join(process.cwd(), "models", "distilgpt2");
+  const modelDir = path.join(process.cwd(), "models", MODEL_NAME);
   const model = await loadPretrainedGPT2(api, modelDir, { dropoutRate: 0.0 });
   model.train();
 
@@ -48,7 +62,6 @@ async function main(): Promise<void> {
     1242, 517, 8855, 290, 517, 29815, 13, 198, 49, 619, 9985, 466, 13508, 262,
     38482, 31007, 286, 1737,
   ];
-  const SEQ_LEN = 512;
   const tokens: number[] = [];
   for (let i = 0; i < SEQ_LEN + 1; i++) tokens.push(BASE[i % BASE.length]);
   const inputTokens = tokens.slice(0, -1);
@@ -64,7 +77,6 @@ async function main(): Promise<void> {
     });
   });
 
-  const NUM_STEPS = 3;
   for (let step = 0; step < NUM_STEPS; step++) {
     if (scaler) await scaler.resolveDeferred();
     await api.beginStep();
@@ -96,10 +108,50 @@ async function main(): Promise<void> {
     api.endStep();
     await api.markStep();
 
-    console.log(`step ${step}: loss=${lossValue.toFixed(4)}`);
+    const gpu = getGPUMemoryStats();
+    console.log(
+      `step ${step}: loss=${lossValue.toFixed(4)} ` +
+        `gpu=${(gpu.currentBytes / 1024 / 1024).toFixed(0)}MB ` +
+        `peak=${(gpu.peakBytes / 1024 / 1024).toFixed(0)}MB`,
+    );
   }
 
+  if (VERBOSE) printSchedulerAuditPerPlan();
   printSchedulerAuditSummary();
+
+  // GPU vs theoretical floor comparison.
+  const mb = (b: number) => (b / 1024 / 1024).toFixed(0);
+  const gpu = getGPUMemoryStats();
+  const pool = getBufferPoolStats();
+  const maxPeak = getMaxPeakLiveBytes();
+  const maxFf = getMaxFirstFitBytes();
+  console.error("");
+  console.error(`model: ${MODEL_NAME}, seq_len=${SEQ_LEN}`);
+  console.error(
+    `GPU steady-state:    ${mb(gpu.currentBytes).padStart(6)}MB total allocated ` +
+      `(${gpu.allocationCount} live buffers)`,
+  );
+  console.error(
+    `GPU peak (ever):     ${mb(gpu.peakBytes).padStart(6)}MB ` +
+      `(high-water across entire run)`,
+  );
+  console.error(
+    `pool reuse rate:     ${(pool.reuseRate * 100).toFixed(0)}% ` +
+      `(${pool.reuseCount} reuses, ${pool.allocCount} fresh allocs)`,
+  );
+  console.error(
+    `max per-plan peak:   ${mb(maxPeak).padStart(6)}MB ` +
+      `(theoretical floor inside the worst plan)`,
+  );
+  console.error(
+    `max per-plan 1st-fit:${mb(maxFf).padStart(6)}MB ` +
+      `(what static first-fit would reserve for the worst plan)`,
+  );
+  console.error(
+    `steady-state - peak: ${mb(gpu.currentBytes - maxPeak).padStart(6)}MB slack ` +
+      `(persistent weights/state + pool cache + saved-for-backward)`,
+  );
+
   resetSchedulerAudit();
 
   destroyWebGPU();
