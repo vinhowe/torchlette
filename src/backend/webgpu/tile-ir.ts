@@ -551,6 +551,7 @@ export type Statement =
   | DirectStoreStmt
   | AtomicOpStmt
   | AtomicCASStmt
+  | AtomicAddF32Stmt
   // Vec4 array statements
   | Vec4VarArrayStmt
   | Vec4SharedArrayStmt
@@ -705,6 +706,23 @@ interface AtomicCASStmt {
   oldValueVar: string;
   /** Variable name to store the exchanged flag (bool). */
   exchangedVar: string;
+}
+
+/**
+ * Atomic f32 add emulated via CAS loop on `atomic<u32>` storage. The target
+ * binding must be declared as `{ storage: "atomic", type: "u32" }`; the
+ * underlying buffer is f32-valued but bitcast through CAS.
+ *
+ * WebGPU has no native f32 atomic add. The standard workaround is the
+ * compare-exchange spin loop this lowers to.
+ */
+interface AtomicAddF32Stmt {
+  kind: "atomicAddF32";
+  binding: string;
+  idx: IRNode;
+  addend: IRNode;
+  /** Unique suffix for loop-local var names (CAS loop emits several). */
+  id: number;
 }
 
 // -- Vec4 array statement types --
@@ -2401,6 +2419,22 @@ export class KernelContext {
       oldValue: new BlockExpr(oldNode),
       exchanged: new BlockExpr(exchNode),
     };
+  }
+
+  /**
+   * Atomic f32 add: `binding[idx] += addend` using a CAS loop on atomic<u32>.
+   * `binding` must be declared as `{ storage: "atomic", type: "u32" }`; the
+   * buffer is f32-valued under the covers. WebGPU has no native f32 atomic
+   * add, so this is the standard workaround.
+   */
+  atomicAddF32(binding: string, idx: BlockExpr, addend: BlockExpr): void {
+    this.pushStatement({
+      kind: "atomicAddF32",
+      binding,
+      idx: idx.node,
+      addend: addend.node,
+      id: this.reduceCounter++,
+    });
   }
 
   /** Emit an unconditional scalar store: `binding[idx] = val;`. */
