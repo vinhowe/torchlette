@@ -169,6 +169,15 @@ export type FusedCrossEntropyConfig = {
   ignoreIndex?: number;
 };
 
+export type FusedRoPEConfig = {
+  /** Total element count in qk (and output). */
+  total: number;
+  seqLen: number;
+  headDim: number;
+  /** +1 for forward, -1 for backward (inverse rotation). */
+  sinScale: number;
+};
+
 export type FusedLayerNormConfig = {
   numRows: number; // product of all dims except last (B*S for [B,S,D])
   featureDim: number; // last dim size (D)
@@ -438,6 +447,13 @@ export interface BackendOps {
     output: BackendTensor,
     config: FusedAttentionConfig,
   ): { dQ: BackendTensor; dK: BackendTensor; dV: BackendTensor };
+  /** Fused RoPE: rotate Q/K by position. qk [*,S,D] + cos [S,D/2] + sin [S,D/2]. */
+  fusedRoPE?(
+    qk: BackendTensor,
+    cos: BackendTensor,
+    sin: BackendTensor,
+    config: FusedRoPEConfig,
+  ): BackendTensor;
   /** Fused cross-entropy forward: logits [B,V] + targets [B] → per-sample loss [B]. */
   fusedCrossEntropyForward?(
     logits: BackendTensor,

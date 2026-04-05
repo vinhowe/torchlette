@@ -933,6 +933,46 @@ export class Torchlette {
     return crossEntropyFusedImpl(this, logits, targets, ignoreIndex);
   }
 
+  /**
+   * Apply Rotary Position Embedding (RoPE) to a Q or K tensor.
+   * Input `qk` has shape [..., seqLen, headDim] (contiguous, headDim even).
+   * `cos`/`sin` are precomputed tables of shape [seqLen, headDim/2].
+   *
+   * Uses the half-split convention: first half rotates with -sin, second
+   * half rotates with +sin. Backward is the same kernel with sin negated.
+   *
+   * Single fused GPU dispatch.
+   */
+  applyRoPE(qk: Tensor, cos: Tensor, sin: Tensor): Tensor {
+    this._assertUsable(qk, cos, sin);
+    const shape = qk.shape;
+    const headDim = shape[shape.length - 1];
+    const seqLen = shape[shape.length - 2];
+    if (headDim % 2 !== 0) {
+      throw new Error(`applyRoPE: headDim must be even, got ${headDim}`);
+    }
+    const total = shape.reduce((a, b) => a * b, 1);
+    const fwdConfig = { total, seqLen, headDim, sinScale: 1 };
+    const bwdConfig = { total, seqLen, headDim, sinScale: -1 };
+    const result = this.runtime.fusedRoPE(
+      qk._unwrap(),
+      cos._unwrap(),
+      sin._unwrap(),
+      fwdConfig,
+    );
+    const cosInner = cos._unwrap();
+    const sinInner = sin._unwrap();
+    return this._wrapWithGrad(result, [qk], (grad, _getSaved) => {
+      const gradQK = this.runtime.fusedRoPE(
+        grad,
+        cosInner,
+        sinInner,
+        bwdConfig,
+      );
+      return [gradQK];
+    });
+  }
+
   scaledDotProductAttention(
     q: Tensor,
     k: Tensor,

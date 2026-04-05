@@ -10,6 +10,7 @@ import {
   type FusedCrossEntropyConfig,
   type FusedLayerNormConfig,
   type FusedRMSNormConfig,
+  type FusedRoPEConfig,
   type GatherOptions,
   type GeluOptions,
   type MaxOptions,
@@ -1529,6 +1530,21 @@ export class RuntimeEngine {
       [logits, targets],
       [config.batchSize],
       logits.device,
+      config,
+    );
+  }
+
+  fusedRoPE(
+    qk: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    config: FusedRoPEConfig,
+  ): Tensor {
+    return this.fusedOp(
+      "fusedRoPE",
+      [qk, cos, sin],
+      qk.shape.slice(),
+      qk.device,
       config,
     );
   }

@@ -401,6 +401,7 @@ const FUSED_OP_TABLE: Record<string, FusedOpDesc> = {
   fusedRMSNormForward: { kind: "dispatch" },
   fusedRMSNormBackwardGradX: { kind: "dispatch" },
   fusedRMSNormBackwardGradWeight: { kind: "dispatch" },
+  fusedRoPE: { kind: "dispatch" },
   fusedAttentionForward: {
     kind: "multiOutput",
     returnField: "output",
