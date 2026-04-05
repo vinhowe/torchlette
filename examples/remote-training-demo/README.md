@@ -99,13 +99,22 @@ Wire format: `src/remote/wire.ts` (types), `src/remote/serialize.ts`
 
 Messages (request/response over single WebSocket):
 
-| method | params | result |
+| method | request | response |
 |---|---|---|
-| `execute` | `{plan: SerializedPlan}` | `{outputs: {nodeIdx: HandleRef}}` |
-| `upload` | `{values, shape, dtype}` | `{handle: HandleRef}` |
-| `download` | `{handle}` | `{values: number[]}` |
-| `readScalar` | `{handle}` | `{value: number}` |
-| `release` | `{handles: HandleRef[]}` | `{releasedCount}` |
+| `execute` | text JSON | text JSON |
+| `upload` | binary frame | text JSON |
+| `download` | text JSON | binary frame |
+| `readScalar` | text JSON | text JSON |
+| `release` | text JSON | text JSON |
+
+Binary frame layout (little-endian):
+
+```
+[4B id][1B dtype][1B rank][2B pad][rank × 4B shape][raw bytes]
+```
+
+dtype enum: 0=f32, 1=f16, 2=i32, 3=u32, 4=bool. See
+`src/remote/binary-frame.ts`.
 
 The `handlesReleased` counter on `RemoteEngine.stats` tracks how many have
 been explicitly released back to the server across the run. Expect
@@ -120,9 +129,7 @@ been explicitly released back to the server across the run. Expect
   model is intentional — it keeps the per-step latency snappy for the
   demo and validates the protocol end-to-end.
 - **Single session per connection.** No auth, no multi-tenancy.
-- **JSON values for upload/download.** No binary frames yet — okay for
-  small tensors, slow for anything large. Binary framing is an obvious
-  extension.
+- **No auth / no multi-tenancy.** One session per WebSocket connection.
 - **No snapshot/restore yet.** Checkpointing would be `snapshot(name, [handles])`
   that dumps to server disk without touching the wire, plus `restore(name)`.
 - **No fused kernels used.** The CPU backend doesn't have fused attention,

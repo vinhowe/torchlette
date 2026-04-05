@@ -16,10 +16,15 @@ import { WebSocketServer, type WebSocket } from "ws";
 
 import { cpuBackend } from "../../src/backend/cpu/index.js";
 import { registerBackend } from "../../src/backend/registry.js";
-import type { Backend } from "../../src/backend/types.js";
+import type { Backend, DType } from "../../src/backend/types.js";
 import { executePlanSequential } from "../../src/executor/sequential.js";
 import { createStorageHandle } from "../../src/graph/node-factory.js";
 import type { StorageHandle } from "../../src/graph/types.js";
+import {
+  decodeBinaryFrame,
+  encodeBinaryFrame,
+  valuesToTypedArray,
+} from "../../src/remote/binary-frame.js";
 import { deserializePlan } from "../../src/remote/serialize.js";
 import type {
   DownloadParams,
@@ -134,10 +139,19 @@ async function executeHandler(
   return { outputs };
 }
 
-function uploadHandler(session: Session, params: UploadParams): UploadResult {
-  const backendTensor = backend.ops.tensorFromArray(params.values, params.shape);
+function uploadRaw(
+  session: Session,
+  values: number[] | Float32Array | Int32Array | Uint32Array | Uint8Array,
+  shape: number[],
+): UploadResult {
+  const nums = Array.isArray(values) ? values : Array.from(values);
+  const backendTensor = backend.ops.tensorFromArray(nums, shape);
   const storage = createStorageHandle(backend.name as "cpu" | "webgpu", backendTensor);
   return { handle: session.allocHandle(storage) };
+}
+
+function uploadHandler(session: Session, params: UploadParams): UploadResult {
+  return uploadRaw(session, params.values, params.shape);
 }
 
 async function downloadHandler(
@@ -147,6 +161,22 @@ async function downloadHandler(
   const storage = session.resolve(params.handle);
   const values = await backend.ops.read(storage.backendTensor);
   return { values };
+}
+
+/** Read a handle's data as a binary frame for the wire. */
+async function downloadBinary(
+  session: Session,
+  id: number,
+  handle: string,
+): Promise<ArrayBuffer> {
+  const storage = session.resolve(handle);
+  const values = await backend.ops.read(storage.backendTensor);
+  // All current backends read as number[]; dtype comes from the tensor.
+  const dtype = ((storage.backendTensor as { dtype?: DType }).dtype ??
+    "f32") as DType;
+  const typed = valuesToTypedArray(values, dtype);
+  const shape = (storage.backendTensor as { shape: number[] }).shape;
+  return encodeBinaryFrame({ id, dtype, shape, values: typed });
 }
 
 async function readScalarHandler(
@@ -218,12 +248,49 @@ function attachWebSocketHandlers(ws: WebSocket): void {
   };
   ws.send(JSON.stringify(hello));
 
-  ws.on("message", async (data) => {
+  ws.on("message", async (data, isBinary) => {
+    if (isBinary) {
+      // Binary frame = upload.
+      const bytes = data as Buffer;
+      const buf = bytes.buffer.slice(
+        bytes.byteOffset,
+        bytes.byteOffset + bytes.byteLength,
+      );
+      try {
+        const frame = decodeBinaryFrame(buf);
+        const result = uploadRaw(session, frame.values, frame.shape);
+        ws.send(JSON.stringify({ id: frame.id, result }));
+      } catch (err) {
+        const e = err as Error;
+        console.error("[ws] binary upload failed:", e.message);
+        // No id to reply to; log and move on.
+      }
+      return;
+    }
+    // Text frame.
     let req: RpcRequest;
     try {
       req = JSON.parse(data.toString()) as RpcRequest;
     } catch (e) {
       console.error("[ws] bad JSON:", e);
+      return;
+    }
+    // Download: respond with a binary frame carrying the bytes.
+    if (req.method === "download") {
+      try {
+        const params = req.params as { handle: string };
+        const frame = await downloadBinary(session, req.id, params.handle);
+        ws.send(frame, { binary: true });
+      } catch (err) {
+        const e = err as Error;
+        console.error(`[rpc] download failed: ${e.message}`);
+        ws.send(
+          JSON.stringify({
+            id: req.id,
+            error: { message: e.message, stack: e.stack },
+          }),
+        );
+      }
       return;
     }
     const response = await dispatch(session, req);
