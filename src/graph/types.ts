@@ -61,7 +61,8 @@ export type LazyOpCode =
   | "fusedLayerNormBackwardGradWeightBias"
   | "fusedRMSNormForward"
   | "fusedRMSNormBackwardGradX"
-  | "fusedRMSNormBackwardGradWeight";
+  | "fusedRMSNormBackwardGradWeight"
+  | "fusedRoPE";
 
 export interface StorageHandle {
   id: number;

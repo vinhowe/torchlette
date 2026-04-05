@@ -62,6 +62,7 @@ import {
   dispatchRMSNormBackwardGradX as dispatchRMSBwdGradXKernel,
   dispatchRMSNormForward as dispatchRMSForwardKernel,
 } from "../rmsnorm-kernel";
+import { dispatchRoPE as dispatchRoPEKernel } from "../rope-kernel";
 import {
   allocateInfFlagBuffer,
   dispatchUnscaleGrad as dispatchUnscaleGradKernel,
@@ -415,6 +416,32 @@ export function fusedRMSNormBackwardGradWeight(
   );
   cleanupContiguous([gradOutput, goT], [x, xT]);
   return createTensor([config.featureDim], outBuf);
+}
+
+// ============================================================================
+// Fused RoPE
+// ============================================================================
+
+export function fusedRoPE(
+  qk: BackendTensor,
+  cos: BackendTensor,
+  sin: BackendTensor,
+  config: import("../../types").FusedRoPEConfig,
+): BackendTensor {
+  const qkT = asContiguous(qk);
+  const cosT = asContiguous(cos);
+  const sinT = asContiguous(sin);
+  const outBuf = dispatchRoPEKernel(
+    qkT.buffer,
+    cosT.buffer,
+    sinT.buffer,
+    config.total,
+    config.seqLen,
+    config.headDim,
+    config.sinScale,
+  );
+  cleanupContiguous([qk, qkT], [cos, cosT], [sin, sinT]);
+  return createTensor(qkT.shape.slice(), outBuf);
 }
 
 // ============================================================================
