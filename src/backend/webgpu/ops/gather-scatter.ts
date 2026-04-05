@@ -28,6 +28,7 @@ import { asGPUTensor, GPUBufferUsage } from "../gpu-types";
 import { compute2DDispatch, dtypeBytes, F32_BYTES, WORKGROUP_SIZE } from "../shape-utils";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
 import { createTensor, createTrackedBuffer } from "../tensor";
+import { ensureContiguous } from "./views";
 import {
   chunkedGatherTileIR,
   chunkedScatterAddTileIR,
@@ -46,7 +47,8 @@ export function gather(
 ): BackendTensor {
   const ctx = requireContext();
   const tensorA = asGPUTensor(a);
-  const tensorIndex = asGPUTensor(index);
+  // Index is read as a flat contiguous array; materialize any view first.
+  const tensorIndex = ensureContiguous(asGPUTensor(index));
   const { dim } = options;
   const inputShape = tensorA.shape;
   const indexShape = tensorIndex.shape;
@@ -174,8 +176,11 @@ export function scatterAdd(
 ): BackendTensor {
   const ctx = requireContext();
   const tensorA = asGPUTensor(a);
-  const tensorIndex = asGPUTensor(index);
-  const tensorSrc = asGPUTensor(src);
+  // Kernel reads `src` and `indices` as flat contiguous arrays. If the caller
+  // passes a broadcasted/strided view (common when gradients come in from an
+  // expand()/sum-backward path), force materialization first.
+  const tensorIndex = ensureContiguous(asGPUTensor(index));
+  const tensorSrc = ensureContiguous(asGPUTensor(src));
   const { dim } = options;
   const inputShape = tensorA.shape;
   const rank = inputShape.length;
