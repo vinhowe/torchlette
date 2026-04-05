@@ -851,6 +851,7 @@ export async function executeLoweredPlan(
   const enableLivenessRelease = process.env.TORCHLETTE_LIVENESS_RELEASE !== "0";
   let livenessOutputIds: Set<number> | null = null;
   let livenessReleased: Set<number> | null = null;
+  let livenessDeferred: Set<number> | null = null;
   let livenessNodeToStorage: Map<number, StorageHandle> | null = null;
   let livenessNodeIdToIndex: Map<number, number> | null = null;
   // nodeId → last action index that reads from this node
@@ -912,6 +913,7 @@ export async function executeLoweredPlan(
     }
 
     livenessReleased = new Set();
+    livenessDeferred = new Set();
     livenessNodeToStorage = new Map();
   }
 
@@ -1349,6 +1351,30 @@ export async function executeLoweredPlan(
               const idx = livenessNodeIdToIndex!.get(nodeId);
               if (idx !== undefined) planNodes[idx].result = undefined;
               livenessReleased!.add(nodeId);
+            } else if (storage) {
+              // Node is liveness-dead but canSafelyRelease rejected (view base
+              // with rc > 0). Defer for retry — once the view is released and
+              // rc drops to 0, the base can be freed.
+              livenessDeferred!.add(nodeId);
+            }
+          }
+        }
+
+        // Retry deferred nodes whose rc may have dropped since last attempt.
+        if (livenessDeferred!.size > 0) {
+          for (const nodeId of livenessDeferred!) {
+            if (livenessReleased!.has(nodeId)) {
+              livenessDeferred!.delete(nodeId);
+              continue;
+            }
+            const storage = livenessNodeToStorage!.get(nodeId);
+            if (storage && canSafelyRelease(storage, livenessNodeToStorage!)) {
+              releaseBufferImmediate(storage);
+              livenessNodeToStorage!.delete(nodeId);
+              const idx = livenessNodeIdToIndex!.get(nodeId);
+              if (idx !== undefined) planNodes[idx].result = undefined;
+              livenessReleased!.add(nodeId);
+              livenessDeferred!.delete(nodeId);
             }
           }
         }
