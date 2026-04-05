@@ -26165,7 +26165,7 @@ var init_executor = __esm({
   }
 });
 
-// examples/remote-training-demo/client/engine.ts
+// src/remote/client-engine.ts
 init_cpu();
 init_registry();
 init_plan_builder();
@@ -30661,9 +30661,8 @@ function collectEngineTensors(value) {
   return out;
 }
 
-// examples/remote-training-demo/client/engine.ts
+// src/remote/client-engine.ts
 init_node_factory();
-init_storage_tracker();
 init_tensor2();
 
 // src/remote/serialize.ts
@@ -30760,24 +30759,9 @@ function mapDeep(value, transform) {
   return out;
 }
 
-// examples/remote-training-demo/client/engine.ts
-registerBackend(cpuBackend);
-function makeStub(shape, dtype) {
-  return {
-    shape,
-    dtype,
-    ownsBuffer: false,
-    toArray() {
-      throw new Error(
-        "Stub backendTensor: data lives on the server. Use async api.cpu() / api.item() instead of .toArray()."
-      );
-    }
-  };
-}
+// src/remote/client-engine.ts
 var ClientHandleMap = class {
-  /** storageId → HandleRef on server. */
   idToHandle = /* @__PURE__ */ new Map();
-  /** Inverse, for release tracking. */
   handleToId = /* @__PURE__ */ new Map();
   bind(storageId, handle) {
     this.idToHandle.set(storageId, handle);
@@ -30806,12 +30790,25 @@ var ClientHandleMap = class {
   size() {
     return this.idToHandle.size;
   }
-  allHandles() {
-    return [...this.idToHandle.values()];
+  entries() {
+    return this.idToHandle.entries();
   }
 };
-function createRemoteEngine(rpc) {
-  const torch2 = new Torchlette("cpu");
+function makeStub(shape, dtype) {
+  return {
+    shape,
+    dtype,
+    ownsBuffer: false,
+    toArray() {
+      throw new Error(
+        "Stub backendTensor: data lives on the server. Use async tensor.cpu() / tensor.item() instead of .toArray()."
+      );
+    }
+  };
+}
+function createRemoteEngine(transport, options = {}) {
+  registerBackend(cpuBackend);
+  const torch2 = new Torchlette(options.device ?? "cpu");
   const handles = new ClientHandleMap();
   const stats = {
     executes: 0,
@@ -30830,9 +30827,8 @@ function createRemoteEngine(rpc) {
     });
     stats.executes++;
     stats.nodesShipped += plan.nodes.length;
-    const json = JSON.stringify({ plan: wire });
-    stats.bytesUp += json.length;
-    const result = await rpc.execute({ plan: wire });
+    stats.bytesUp += JSON.stringify(wire).length;
+    const result = await transport.execute({ plan: wire });
     for (const [idxStr, handleRef] of Object.entries(result.outputs)) {
       const idx = Number(idxStr);
       const node = plan.nodes[idx];
@@ -30872,9 +30868,9 @@ function createRemoteEngine(rpc) {
     materializeRemaining2(tensors);
   }
   runtime.forceAllMerged = async (...tensors) => {
-    const pendingRoots = collectPendingRoots2(tensors);
-    if (pendingRoots.length === 0) return;
-    const plan = buildMergedPlan(pendingRoots);
+    const roots = collectPendingRoots2(tensors);
+    if (roots.length === 0) return;
+    const plan = buildMergedPlan(roots);
     if (plan.nodes.length === 0) return;
     await shipPlan(plan);
     postExecuteBookkeeping(plan, tensors);
@@ -30885,18 +30881,18 @@ function createRemoteEngine(rpc) {
     await runtime.forceAllMerged(tensor);
   };
   runtime.forceAllPending = async () => {
-    const pendingTensors = getAllPendingTensors();
-    if (pendingTensors.length === 0) return;
-    const pendingRoots = collectPendingRoots2(pendingTensors);
-    if (pendingRoots.length === 0) return;
+    const pending = getAllPendingTensors();
+    if (pending.length === 0) return;
+    const roots = collectPendingRoots2(pending);
+    if (roots.length === 0) return;
     const plan = buildMergedPlan(
-      pendingRoots,
+      roots,
       /* skipExecuted */
       true
     );
     if (plan.nodes.length === 0) return;
     await shipPlan(plan);
-    postExecuteBookkeeping(plan, pendingTensors);
+    postExecuteBookkeeping(plan, pending);
     for (const node of plan.nodes) {
       node.result = void 0;
     }
@@ -30906,8 +30902,8 @@ function createRemoteEngine(rpc) {
     const storage = a.lazyRef.storage;
     const handle = handles.requireHandle(storage.id);
     stats.downloads++;
-    const result = await rpc.download({ handle });
-    stats.bytesDown += JSON.stringify(result.values).length;
+    const result = await transport.download({ handle });
+    stats.bytesDown += result.values.length * 4;
     return result.values;
   };
   runtime.item = async (a) => {
@@ -30915,7 +30911,7 @@ function createRemoteEngine(rpc) {
     const storage = a.lazyRef.storage;
     const handle = handles.requireHandle(storage.id);
     stats.scalarReads++;
-    const result = await rpc.readScalar({ handle });
+    const result = await transport.readScalar({ handle });
     return result.value;
   };
   async function markStep(keep) {
@@ -30928,24 +30924,22 @@ function createRemoteEngine(rpc) {
         keepIds.add(ref2.storage.id);
       }
     }
-    const idToHandle = handles.idToHandle;
     const toRelease = [];
     const idsToUnbind = [];
-    for (const [id, handle] of idToHandle) {
+    for (const [id, handle] of handles.entries()) {
       if (!keepIds.has(id)) {
         toRelease.push(handle);
         idsToUnbind.push(id);
       }
     }
     if (toRelease.length > 0) {
-      await rpc.release({ handles: toRelease });
+      await transport.release({ handles: toRelease });
       for (const id of idsToUnbind) handles.unbind(id);
       stats.handlesReleased += toRelease.length;
     }
     return toRelease.length;
   }
-  void storageTracker;
-  return { torch: torch2, handles, rpc, stats, markStep };
+  return { torch: torch2, handles, transport, stats, markStep };
 }
 
 // examples/remote-training-demo/client/model.ts

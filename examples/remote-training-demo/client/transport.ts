@@ -5,6 +5,7 @@
  * a request with a unique id and awaits a response carrying the same id.
  */
 
+import type { Transport } from "../../../src/remote/client-engine.ts";
 import type {
   DownloadParams,
   DownloadResult,
@@ -27,7 +28,7 @@ export interface ConnectOptions {
   onLog?: (msg: string) => void;
 }
 
-export class RpcClient {
+export class RpcClient implements Transport {
   private ws: WebSocket | null = null;
   private nextId = 1;
   private readonly pending = new Map<number, Resolver>();

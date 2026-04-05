@@ -1,61 +1,73 @@
 /**
- * Client-side RemoteRuntimeEngine setup. Wraps a local Torchlette whose
- * runtime is patched to route every plan execution + readback through the
- * RpcClient. Everything computes server-side; the client only builds plans.
+ * Client-side remote engine: wraps a Torchlette whose runtime is patched so
+ * every plan execution and readback goes through a Transport instead of a
+ * local backend. User code calls `api.matmul(a, b)`, `loss.backward()`,
+ * `tensor.item()` etc. exactly like local Torchlette; the plans build up
+ * locally, then get shipped as SerializedPlan JSON to whatever implements
+ * the Transport.
  *
- * Key mechanism: client maintains Map<localStorageId, HandleRef>. When
- * serializing a plan, materialized refs are translated via this map. When
- * `execute` returns HandleRefs for output nodes, we allocate fresh local
- * stub StorageHandles and register them in the map — subsequent plans can
- * reference them as materialized inputs.
+ * Handle bridging: the server issues opaque HandleRef strings for each
+ * output; the client allocates a local StorageHandle (with a stub
+ * BackendTensor that never computes) and maps its id → HandleRef in
+ * ClientHandleMap. Subsequent plans that reference the tensor become
+ * `materialized` refs whose storage id is translated back to a HandleRef
+ * during serialization.
  */
 
-import { cpuBackend } from "../../../src/backend/cpu/index.ts";
-import { registerBackend } from "../../../src/backend/registry.ts";
-import type { BackendTensor } from "../../../src/backend/types.ts";
-import { buildMergedPlan } from "../../../src/executor/plan-builder.ts";
-import type { Tensor as FrontendTensor } from "../../../src/frontend/tensor.ts";
-import { Torchlette } from "../../../src/frontend/torchlette.ts";
-import { createStorageHandle } from "../../../src/graph/node-factory.ts";
-import { storageTracker } from "../../../src/graph/storage-tracker.ts";
-import type { LazyIRNode, StorageHandle } from "../../../src/graph/types.ts";
-import type { Tensor as RuntimeTensor } from "../../../src/runtime/tensor.ts";
+import { cpuBackend } from "../backend/cpu";
+import { registerBackend } from "../backend/registry";
+import type { BackendTensor, DType } from "../backend/types";
+import { buildMergedPlan } from "../executor/plan-builder";
+import type { Tensor as FrontendTensor } from "../frontend/tensor";
+import { Torchlette } from "../frontend/torchlette";
+import { createStorageHandle } from "../graph/node-factory";
+import type { LazyIRNode, StorageHandle } from "../graph/types";
+import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import {
   clearDisposedPendingNodeIds,
   getAllPendingTensors,
   materializePendingTensors,
-} from "../../../src/runtime/tensor.ts";
-import { serializePlan } from "../../../src/remote/serialize.ts";
-import type { HandleRef, NodeIdx } from "../../../src/remote/wire.ts";
-import type { RpcClient } from "./transport.ts";
-
-registerBackend(cpuBackend);
+} from "../runtime/tensor";
+import type {
+  DownloadParams,
+  DownloadResult,
+  ExecuteParams,
+  ExecuteResult,
+  ReadScalarParams,
+  ReadScalarResult,
+  ReleaseParams,
+  ReleaseResult,
+  UploadParams,
+  UploadResult,
+} from "./rpc";
+import { serializePlan } from "./serialize";
+import type { HandleRef } from "./wire";
 
 // ============================================================================
-// Stub backend tensors — client never computes, never reads from these.
+// Transport
 // ============================================================================
 
-function makeStub(shape: number[], dtype: import("../../../src/backend/types.ts").DType): BackendTensor {
-  return {
-    shape,
-    dtype,
-    ownsBuffer: false,
-    toArray(): number[] {
-      throw new Error(
-        "Stub backendTensor: data lives on the server. Use async api.cpu() / api.item() instead of .toArray().",
-      );
-    },
-  };
+/**
+ * A Transport speaks the five remote-training RPC methods. Implementations
+ * include: a WebSocket client (browser/Node), an HTTP/2 client, an
+ * in-process fake for tests, or anything else that can move plans and bytes
+ * between the caller and a handle-registry owner.
+ */
+export interface Transport {
+  execute(params: ExecuteParams): Promise<ExecuteResult>;
+  upload(params: UploadParams): Promise<UploadResult>;
+  download(params: DownloadParams): Promise<DownloadResult>;
+  readScalar(params: ReadScalarParams): Promise<ReadScalarResult>;
+  release(params: ReleaseParams): Promise<ReleaseResult>;
 }
 
 // ============================================================================
 // Client-side handle registry
 // ============================================================================
 
+/** Maps local StorageHandle.id ↔ server-issued HandleRef. */
 export class ClientHandleMap {
-  /** storageId → HandleRef on server. */
   private readonly idToHandle = new Map<number, HandleRef>();
-  /** Inverse, for release tracking. */
   private readonly handleToId = new Map<HandleRef, number>();
 
   bind(storageId: number, handle: HandleRef): void {
@@ -91,40 +103,93 @@ export class ClientHandleMap {
     return this.idToHandle.size;
   }
 
-  allHandles(): HandleRef[] {
-    return [...this.idToHandle.values()];
+  entries(): IterableIterator<[number, HandleRef]> {
+    return this.idToHandle.entries();
   }
 }
 
 // ============================================================================
-// Patch Torchlette's runtime with remote execution
+// Stub backend tensors — client never executes against them.
 // ============================================================================
 
-export interface RemoteEngine {
-  torch: Torchlette;
-  handles: ClientHandleMap;
-  rpc: RpcClient;
-  /**
-   * Release server-side handles for any storage NOT held by one of the
-   * `keep` tensors. Call at end of each training step to prevent unbounded
-   * server memory growth.
-   */
-  markStep(keep: FrontendTensor[]): Promise<number>;
-  stats: {
-    executes: number;
-    nodesShipped: number;
-    downloads: number;
-    scalarReads: number;
-    bytesUp: number;
-    bytesDown: number;
-    handlesReleased: number;
+function makeStub(shape: number[], dtype: DType): BackendTensor {
+  return {
+    shape,
+    dtype,
+    ownsBuffer: false,
+    toArray(): number[] {
+      throw new Error(
+        "Stub backendTensor: data lives on the server. Use async " +
+          "tensor.cpu() / tensor.item() instead of .toArray().",
+      );
+    },
   };
 }
 
-export function createRemoteEngine(rpc: RpcClient): RemoteEngine {
-  const torch = new Torchlette("cpu");
+// ============================================================================
+// RemoteEngine
+// ============================================================================
+
+export interface RemoteEngineStats {
+  executes: number;
+  nodesShipped: number;
+  downloads: number;
+  scalarReads: number;
+  bytesUp: number;
+  bytesDown: number;
+  handlesReleased: number;
+}
+
+export interface RemoteEngine {
+  /** Torchlette frontend — user code calls api.matmul, loss.backward, etc. */
+  torch: Torchlette;
+  /** Client-side mapping of local storage ids to server HandleRefs. */
+  handles: ClientHandleMap;
+  /** Transport used to ship plans and read results. */
+  transport: Transport;
+  /** Cumulative stats across the session. */
+  stats: RemoteEngineStats;
+  /**
+   * Release server-side handles for any storage NOT held by one of the
+   * `keep` tensors. Call at end of each training step to prevent unbounded
+   * server memory growth. Returns the number of handles released.
+   *
+   * **`keep` must include every tensor the caller still holds a reference
+   * to past this boundary** — model parameters, optimizer state, any
+   * batch/target tensors created outside the step, etc. Anything not in
+   * `keep` is assumed to be a step-scoped intermediate safe to drop.
+   * Forgetting a persistent tensor will break the next plan that
+   * references it with "no HandleRef for storage id=…".
+   */
+  markStep(keep: FrontendTensor[]): Promise<number>;
+}
+
+export interface CreateRemoteEngineOptions {
+  /**
+   * Device tag used on the client-side Torchlette. This only affects how
+   * the client labels nodes — the server's backend does the actual compute.
+   * Default: "cpu".
+   */
+  device?: "cpu" | "webgpu";
+}
+
+/**
+ * Create a Torchlette instance whose runtime executes every plan through
+ * the given Transport. The client does no computation locally; it only
+ * builds autograd graphs and serializes them.
+ */
+export function createRemoteEngine(
+  transport: Transport,
+  options: CreateRemoteEngineOptions = {},
+): RemoteEngine {
+  // The client's Torchlette needs *some* registered backend to satisfy
+  // initialization; we register CPU as a no-op target. All force methods
+  // below are overridden, so the backend is never actually invoked.
+  registerBackend(cpuBackend);
+
+  const torch = new Torchlette(options.device ?? "cpu");
   const handles = new ClientHandleMap();
-  const stats = {
+  const stats: RemoteEngineStats = {
     executes: 0,
     nodesShipped: 0,
     downloads: 0,
@@ -136,26 +201,22 @@ export function createRemoteEngine(rpc: RpcClient): RemoteEngine {
 
   const runtime = torch.runtime;
 
-  /** Ship one plan to the server and patch its outputs as local storages. */
+  /** Ship one plan to the server, patching outputs as local stub storages. */
   async function shipPlan(plan: { nodes: LazyIRNode[] }): Promise<void> {
     if (plan.nodes.length === 0) return;
 
-    // Serialize, using the client map to translate materialized refs.
     const wire = serializePlan(plan, {
       resolveHandle: (id: number) => handles.requireHandle(id),
     });
-
     stats.executes++;
     stats.nodesShipped += plan.nodes.length;
-    const json = JSON.stringify({ plan: wire });
-    stats.bytesUp += json.length;
+    // Rough cost accounting; not the same as the transport's real payload.
+    stats.bytesUp += JSON.stringify(wire).length;
 
-    // Execute on server.
-    const result = await rpc.execute({ plan: wire });
+    const result = await transport.execute({ plan: wire });
 
-    // For each output node in the plan, allocate a local stub StorageHandle
-    // and bind it to the server's HandleRef. Update the plan's nodes so the
-    // engine's bookkeeping finds them via node.result.
+    // Bind each server HandleRef to a fresh local stub StorageHandle so
+    // subsequent plans can reference these outputs as materialized inputs.
     for (const [idxStr, handleRef] of Object.entries(result.outputs)) {
       const idx = Number(idxStr);
       const node = plan.nodes[idx];
@@ -203,13 +264,17 @@ export function createRemoteEngine(rpc: RpcClient): RemoteEngine {
     materializeRemaining(tensors);
   }
 
+  // Override runtime force methods. These are not normally callable from
+  // outside the engine, but they're the interception points where
+  // autograd + user code delegate to the backend.
+
   // biome-ignore lint/suspicious/noExplicitAny: overriding private methods
   (runtime as any).forceAllMerged = async (
     ...tensors: RuntimeTensor[]
   ): Promise<void> => {
-    const pendingRoots = collectPendingRoots(tensors);
-    if (pendingRoots.length === 0) return;
-    const plan = buildMergedPlan(pendingRoots);
+    const roots = collectPendingRoots(tensors);
+    if (roots.length === 0) return;
+    const plan = buildMergedPlan(roots);
     if (plan.nodes.length === 0) return;
     await shipPlan(plan);
     postExecuteBookkeeping(plan, tensors);
@@ -225,14 +290,14 @@ export function createRemoteEngine(rpc: RpcClient): RemoteEngine {
 
   // biome-ignore lint/suspicious/noExplicitAny: overriding private methods
   (runtime as any).forceAllPending = async (): Promise<void> => {
-    const pendingTensors = getAllPendingTensors();
-    if (pendingTensors.length === 0) return;
-    const pendingRoots = collectPendingRoots(pendingTensors);
-    if (pendingRoots.length === 0) return;
-    const plan = buildMergedPlan(pendingRoots, /* skipExecuted */ true);
+    const pending = getAllPendingTensors();
+    if (pending.length === 0) return;
+    const roots = collectPendingRoots(pending);
+    if (roots.length === 0) return;
+    const plan = buildMergedPlan(roots, /* skipExecuted */ true);
     if (plan.nodes.length === 0) return;
     await shipPlan(plan);
-    postExecuteBookkeeping(plan, pendingTensors);
+    postExecuteBookkeeping(plan, pending);
     for (const node of plan.nodes) {
       node.result = undefined;
     }
@@ -246,8 +311,8 @@ export function createRemoteEngine(rpc: RpcClient): RemoteEngine {
       .lazyRef.storage;
     const handle = handles.requireHandle(storage.id);
     stats.downloads++;
-    const result = await rpc.download({ handle });
-    stats.bytesDown += JSON.stringify(result.values).length;
+    const result = await transport.download({ handle });
+    stats.bytesDown += result.values.length * 4; // rough: f32
     return result.values;
   };
 
@@ -259,20 +324,19 @@ export function createRemoteEngine(rpc: RpcClient): RemoteEngine {
       .lazyRef.storage;
     const handle = handles.requireHandle(storage.id);
     stats.scalarReads++;
-    const result = await rpc.readScalar({ handle });
+    const result = await transport.readScalar({ handle });
     return result.value;
   };
 
   async function markStep(keep: FrontendTensor[]): Promise<number> {
-    // Force all params to materialize any pending updates (e.g. copy_ after
-    // an optimizer step). Without this, a param's lazyRef is still pending
-    // and we can't identify its storage for the keep set — which leads us
-    // to release storages that the pending chain still references.
+    // Force all params to materialize any pending updates (e.g. from a
+    // copy_ after an optimizer step). Without this, a param's lazyRef is
+    // still pending and we can't identify its storage for the keep set —
+    // we'd release storages that the pending chain still references.
     const runtimeTensors = keep.map((t) => t._unwrap());
     // biome-ignore lint/suspicious/noExplicitAny: calling patched method
     await (runtime as any).forceAllMerged(...runtimeTensors);
 
-    // Collect storage IDs of all "keep" tensors.
     const keepIds = new Set<number>();
     for (const t of keep) {
       const ref = t._unwrap().lazyRef;
@@ -281,11 +345,9 @@ export function createRemoteEngine(rpc: RpcClient): RemoteEngine {
       }
     }
 
-    // biome-ignore lint/suspicious/noExplicitAny: reading private field for cleanup
-    const idToHandle = (handles as any).idToHandle as Map<number, HandleRef>;
     const toRelease: HandleRef[] = [];
     const idsToUnbind: number[] = [];
-    for (const [id, handle] of idToHandle) {
+    for (const [id, handle] of handles.entries()) {
       if (!keepIds.has(id)) {
         toRelease.push(handle);
         idsToUnbind.push(id);
@@ -293,14 +355,12 @@ export function createRemoteEngine(rpc: RpcClient): RemoteEngine {
     }
 
     if (toRelease.length > 0) {
-      await rpc.release({ handles: toRelease });
+      await transport.release({ handles: toRelease });
       for (const id of idsToUnbind) handles.unbind(id);
       stats.handlesReleased += toRelease.length;
     }
     return toRelease.length;
   }
 
-  void storageTracker; // keep import even if unused at runtime
-
-  return { torch, handles, rpc, stats, markStep };
+  return { torch, handles, transport, stats, markStep };
 }
