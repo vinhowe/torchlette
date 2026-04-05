@@ -556,6 +556,38 @@ class SimpleBufferPool {
     this.recordWindowDemand(sizeClass, "acquires");
   }
 
+  /** Debug: dump pool size-class breakdown. Keys are log2(bytes) classes. */
+  debugDumpSizeClasses(): void {
+    const classes: Array<[number, number, number]> = []; // [sizeClass, count, bytes]
+    for (const [sizeClass, buffers] of this.pool) {
+      const bufSize = getSizeForClass(sizeClass);
+      classes.push([sizeClass, buffers.length, bufSize * buffers.length]);
+    }
+    classes.sort((a, b) => b[2] - a[2]);
+    let totalBytes = 0;
+    let totalCount = 0;
+    for (const [, count, bytes] of classes) {
+      totalBytes += bytes;
+      totalCount += count;
+    }
+    console.log("Pool size-class breakdown (top 20):");
+    for (const [sizeClass, count, bytes] of classes.slice(0, 20)) {
+      const bufSize = getSizeForClass(sizeClass);
+      const sizeStr =
+        bufSize >= 1024 * 1024
+          ? `${(bufSize / 1024 / 1024).toFixed(0)}MB`
+          : bufSize >= 1024
+            ? `${(bufSize / 1024).toFixed(0)}KB`
+            : `${bufSize}B`;
+      console.log(
+        `  ${sizeStr.padStart(10)} × ${String(count).padStart(5)} = ${(bytes / 1024 / 1024).toFixed(1).padStart(8)}MB (${((bytes / totalBytes) * 100).toFixed(1)}%)`,
+      );
+    }
+    console.log(
+      `Total: ${totalCount} buffers, ${(totalBytes / 1024 / 1024).toFixed(0)}MB across ${classes.length} size classes`,
+    );
+  }
+
   /**
    * Get pool statistics.
    */
