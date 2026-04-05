@@ -256,9 +256,12 @@ export function releaseBufferImmediate(storage: StorageHandle): void {
 
   // Views: release base ref but don't destroy (don't own buffer).
   // Don't unregister — the view may still be referenced by the shared encoder.
+  // Clear baseStorageId to prevent double-release when destroyStorageIds
+  // later processes this view at destroyUnreachable time.
   if (bt.ownsBuffer === false) {
     if (storage.baseStorageId !== undefined) {
       rcRelease(storage.baseStorageId, "earlyRelease.viewBase");
+      storage.baseStorageId = undefined;
     }
     return;
   }
@@ -266,6 +269,7 @@ export function releaseBufferImmediate(storage: StorageHandle): void {
   // Owning storage: release base ref if view, unregister, destroy.
   if (storage.baseStorageId !== undefined) {
     rcRelease(storage.baseStorageId, "earlyRelease.base");
+    storage.baseStorageId = undefined;
   }
   rcDelete(storage.id);
   storageTracker.unregister(storage.id);
