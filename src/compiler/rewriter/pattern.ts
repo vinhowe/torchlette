@@ -13,6 +13,7 @@
  *   - Cross-capture constraints are expressed as rule-level predicates,
  *     not inside patterns.
  */
+import type { DType } from "../../backend/types";
 import type { LazyOpCode, LazyIRNode, LazyRef } from "../../graph/types";
 
 /** A pattern matches a single LazyRef; sub-patterns match the inputs of
@@ -99,3 +100,29 @@ export type Bindings = ReadonlyMap<string, LazyRef>;
 
 /** Mutable version used internally by the matcher. */
 export type MutableBindings = Map<string, LazyRef>;
+
+// ============================================================================
+// Ref inspection helpers — for use inside check/rewrite functions
+// ============================================================================
+
+/** Get the static shape of whatever `ref` points to. Returns null for
+ *  refs that don't have a shape (should be unreachable in practice). */
+export function refShape(ref: LazyRef): number[] | null {
+  if (ref.kind === "pending") return ref.node.shape;
+  if (ref.kind === "materialized") return ref.storage.backendTensor.shape;
+  if (ref.kind === "scalar") return [];
+  return null;
+}
+
+/** Get the dtype of whatever `ref` points to. */
+export function refDtype(ref: LazyRef): DType | null {
+  if (ref.kind === "pending") return ref.node.dtype;
+  if (ref.kind === "materialized") return ref.storage.backendTensor.dtype;
+  if (ref.kind === "scalar") return ref.dtype;
+  return null;
+}
+
+/** Get the node behind a pending ref, or null. */
+export function refNode(ref: LazyRef): LazyIRNode | null {
+  return ref.kind === "pending" ? ref.node : null;
+}

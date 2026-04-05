@@ -15,49 +15,51 @@
  *     = Σ_(b, m) X[b, m, k] · Y[b, m, n]
  *     = (reshape(X, [B*M, K])^T @ reshape(Y, [B*M, N]))[k, n]
  */
-import type { LazyIRNode, LazyRef } from "../../../graph/types";
+import type { LazyIRNode } from "../../../graph/types";
 import type { Rule } from "../engine";
-import { capture, op } from "../pattern";
+import { capture, op, refDtype, refNode, refShape } from "../pattern";
 
 export const fuseMatmulSumRule: Rule = {
   name: "fuse-matmul-sum",
   pattern: op("sum", {
     where: isLeadingBatchSum,
     inputs: [
-      op("matmul", {
-        inputs: [
-          op("transpose", {
-            where: isLastTwoDimTranspose,
-            inputs: [capture("X")],
-          }),
-          capture("Y"),
-        ],
-      }),
+      capture(
+        "mm",
+        op("matmul", {
+          inputs: [
+            capture(
+              "tx",
+              op("transpose", {
+                where: isLastTwoDimTranspose,
+                inputs: [capture("X")],
+              }),
+            ),
+            capture("Y"),
+          ],
+        }),
+      ),
     ],
   }),
-  check: (bindings, node) => {
+  check: (bindings) => {
     const X = bindings.get("X")!;
     const Y = bindings.get("Y")!;
+    const mm = refNode(bindings.get("mm")!);
+    if (!mm) return false;
     const xShape = refShape(X);
     const yShape = refShape(Y);
     if (!xShape || !yShape) return false;
 
-    const mmRef = node.inputs[0];
-    if (mmRef.kind !== "pending") return false;
-    const matmulNode = mmRef.node;
-    const rank = matmulNode.shape.length;
+    const rank = mm.shape.length;
     if (rank < 3) return false; // need at least one batch dim
     if (xShape.length !== rank || yShape.length !== rank) return false;
 
+    // M dims must match (contraction dim of the original matmul).
+    if (xShape[rank - 2] !== yShape[rank - 2]) return false;
     // Batch dims must match elementwise between X and Y.
-    const payload = node.payload as { dim?: number | number[] };
-    const sumDims = Array.isArray(payload.dim) ? payload.dim : [payload.dim!];
-    if (sumDims.length !== rank - 2) return false;
     for (let i = 0; i < rank - 2; i++) {
       if (xShape[i] !== yShape[i]) return false;
     }
-    // M dims must match.
-    if (xShape[rank - 2] !== yShape[rank - 2]) return false;
     return true;
   },
   rewrite: (bindings, ctx, node) => {
@@ -67,7 +69,6 @@ export const fuseMatmulSumRule: Rule = {
     const yShape = refShape(Y)!;
     const xDtype = refDtype(X)!;
     const yDtype = refDtype(Y)!;
-    const outDtype = node.dtype;
     const device = node.device;
 
     const rank = xShape.length;
@@ -79,7 +80,7 @@ export const fuseMatmulSumRule: Rule = {
     for (let i = 0; i < rank - 2; i++) batchProd *= xShape[i];
     const totalRows = batchProd * M;
 
-    // reshape(X, [batch*M, K])
+    // reshape(X, [B*M, K]) → transpose → [K, B*M]
     const xReshape = ctx.createNode(
       "reshape",
       [X],
@@ -88,16 +89,6 @@ export const fuseMatmulSumRule: Rule = {
       device,
       { targetShape: [totalRows, K] },
     );
-    // reshape(Y, [batch*M, N])
-    const yReshape = ctx.createNode(
-      "reshape",
-      [Y],
-      [totalRows, N],
-      yDtype,
-      device,
-      { targetShape: [totalRows, N] },
-    );
-    // transpose(xReshape, 0, 1) → [K, batch*M]
     const xTranspose = ctx.createNode(
       "transpose",
       [ctx.pendingRef(xReshape)],
@@ -106,24 +97,26 @@ export const fuseMatmulSumRule: Rule = {
       device,
       { dim0: 0, dim1: 1 },
     );
+    // reshape(Y, [B*M, N])
+    const yReshape = ctx.createNode(
+      "reshape",
+      [Y],
+      [totalRows, N],
+      yDtype,
+      device,
+      { targetShape: [totalRows, N] },
+    );
+
+    // Remove the orphaned upstream chain. Pending tensors on the old
+    // matmul/transpose were autograd saved-for-backward artifacts; by
+    // the time backward is computing, they're no longer needed.
+    ctx.markDead(refNode(bindings.get("mm")!)!);
+    ctx.markDead(refNode(bindings.get("tx")!)!);
+
     // Mutate the matched sum node into a matmul in place. Preserves the
-    // node ID so RuntimeTensors that pend on it (gradient outputs)
-    // continue to work, and downstream consumers don't need rewiring.
-    // The sum's shape [K, N] matches the matmul result shape.
-    void outDtype;
-    // Before overwriting inputs, tell the engine to remove the orphaned
-    // upstream chain (matmul → transpose). Their pending tensors were
-    // autograd saved-for-backward artifacts; by this point backward is
-    // computing so they're no longer needed.
-    const oldMatmulRef = node.inputs[0];
-    if (oldMatmulRef.kind === "pending") {
-      const oldMatmul = oldMatmulRef.node;
-      ctx.markDead(oldMatmul);
-      const oldTransposeRef = oldMatmul.inputs[0];
-      if (oldTransposeRef.kind === "pending") {
-        ctx.markDead(oldTransposeRef.node);
-      }
-    }
+    // node id so RuntimeTensors pending on it (gradient outputs) keep
+    // working, and downstream consumers don't need rewiring. See
+    // engine.ts for the in-place-mutation contract.
     node.op = "matmul";
     node.inputs = [ctx.pendingRef(xTranspose), ctx.pendingRef(yReshape)];
     node.payload = undefined;
@@ -132,7 +125,7 @@ export const fuseMatmulSumRule: Rule = {
 };
 
 // ============================================================================
-// Constraint predicates (local to this rule)
+// Per-node predicates
 // ============================================================================
 
 function isLeadingBatchSum(node: LazyIRNode): boolean {
@@ -164,18 +157,4 @@ function isLastTwoDimTranspose(node: LazyIRNode): boolean {
     (d0 === rank - 2 && d1 === rank - 1) ||
     (d0 === rank - 1 && d1 === rank - 2)
   );
-}
-
-function refShape(ref: LazyRef): number[] | null {
-  if (ref.kind === "pending") return ref.node.shape;
-  if (ref.kind === "materialized") return ref.storage.backendTensor.shape;
-  if (ref.kind === "scalar") return [];
-  return null;
-}
-
-function refDtype(ref: LazyRef) {
-  if (ref.kind === "pending") return ref.node.dtype;
-  if (ref.kind === "materialized") return ref.storage.backendTensor.dtype;
-  if (ref.kind === "scalar") return ref.dtype;
-  return null;
 }
