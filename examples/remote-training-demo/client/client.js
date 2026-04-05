@@ -31194,6 +31194,106 @@ function modelConfigSmall(vocabSize) {
   };
 }
 
+// src/remote/binary-frame.ts
+var HEADER_FIXED_SIZE = 8;
+var DTYPE_CODES = {
+  f32: 0,
+  f16: 1,
+  i32: 2,
+  u32: 3,
+  bool: 4
+};
+var DTYPE_BY_CODE = ["f32", "f16", "i32", "u32", "bool"];
+function dtypeToCode(dt) {
+  const code = DTYPE_CODES[dt];
+  if (code === void 0) throw new Error(`unsupported dtype: ${dt}`);
+  return code;
+}
+function codeToDtype(code) {
+  const dt = DTYPE_BY_CODE[code];
+  if (!dt) throw new Error(`unknown dtype code: ${code}`);
+  return dt;
+}
+function typedArrayFor(dt, buffer, byteOffset, byteLength) {
+  switch (dt) {
+    case "f32":
+      return new Float32Array(buffer, byteOffset, byteLength / 4);
+    case "f16":
+      throw new Error("f16 binary framing not yet implemented");
+    case "i32":
+      return new Int32Array(buffer, byteOffset, byteLength / 4);
+    case "u32":
+      return new Uint32Array(buffer, byteOffset, byteLength / 4);
+    case "bool":
+      return new Uint8Array(buffer, byteOffset, byteLength);
+  }
+}
+function encodeBinaryFrame(frame) {
+  const rank = frame.shape.length;
+  if (rank > 255) throw new Error("tensor rank exceeds 255");
+  const shapeBytes = rank * 4;
+  const valueBytes = frame.values.byteLength;
+  const total = HEADER_FIXED_SIZE + shapeBytes + valueBytes;
+  const buf = new ArrayBuffer(total);
+  const view = new DataView(buf);
+  view.setUint32(0, frame.id >>> 0, true);
+  view.setUint8(4, dtypeToCode(frame.dtype));
+  view.setUint8(5, rank);
+  for (let i = 0; i < rank; i++) {
+    view.setUint32(HEADER_FIXED_SIZE + i * 4, frame.shape[i] >>> 0, true);
+  }
+  new Uint8Array(buf).set(
+    new Uint8Array(
+      frame.values.buffer,
+      frame.values.byteOffset,
+      frame.values.byteLength
+    ),
+    HEADER_FIXED_SIZE + shapeBytes
+  );
+  return buf;
+}
+function decodeBinaryFrame(buffer) {
+  if (buffer.byteLength < HEADER_FIXED_SIZE) {
+    throw new Error(
+      `binary frame too small: ${buffer.byteLength} < ${HEADER_FIXED_SIZE}`
+    );
+  }
+  const view = new DataView(buffer);
+  const id = view.getUint32(0, true);
+  const dtype = codeToDtype(view.getUint8(4));
+  const rank = view.getUint8(5);
+  const shapeBytes = rank * 4;
+  if (buffer.byteLength < HEADER_FIXED_SIZE + shapeBytes) {
+    throw new Error("binary frame truncated at shape");
+  }
+  const shape = new Array(rank);
+  for (let i = 0; i < rank; i++) {
+    shape[i] = view.getUint32(HEADER_FIXED_SIZE + i * 4, true);
+  }
+  const payloadOffset = HEADER_FIXED_SIZE + shapeBytes;
+  const payloadLen = buffer.byteLength - payloadOffset;
+  const values = typedArrayFor(dtype, buffer, payloadOffset, payloadLen);
+  return { id, dtype, shape, values };
+}
+function valuesToTypedArray(values, dtype) {
+  if (typeof values !== "object") {
+    throw new Error("values must be an array or typed array");
+  }
+  if (ArrayBuffer.isView(values)) return values;
+  switch (dtype) {
+    case "f32":
+      return new Float32Array(values);
+    case "i32":
+      return new Int32Array(values);
+    case "u32":
+      return new Uint32Array(values);
+    case "bool":
+      return new Uint8Array(values);
+    case "f16":
+      throw new Error("f16 binary framing not yet implemented");
+  }
+}
+
 // examples/remote-training-demo/client/transport.ts
 var RpcClient = class {
   constructor(opts) {
@@ -31204,7 +31304,8 @@ var RpcClient = class {
   opts;
   ws = null;
   nextId = 1;
-  pending = /* @__PURE__ */ new Map();
+  pendingText = /* @__PURE__ */ new Map();
+  pendingBinary = /* @__PURE__ */ new Map();
   log;
   _sessionId = "";
   _onClose = null;
@@ -31217,24 +31318,41 @@ var RpcClient = class {
   connect() {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(this.opts.url);
+      ws.binaryType = "arraybuffer";
       this.ws = ws;
       let helloed = false;
       ws.addEventListener("open", () => {
         this.log(`[rpc] connected to ${this.opts.url}`);
       });
       ws.addEventListener("message", (ev) => {
-        const msg = JSON.parse(ev.data);
-        if (!helloed && msg.id === 0 && "result" in msg) {
-          this._sessionId = msg.result.sessionId;
-          this.log(`[rpc] session ${this._sessionId}`);
-          helloed = true;
-          resolve();
+        if (typeof ev.data === "string") {
+          const msg = JSON.parse(ev.data);
+          if (!helloed && msg.id === 0 && "result" in msg) {
+            this._sessionId = msg.result.sessionId;
+            this.log(`[rpc] session ${this._sessionId}`);
+            helloed = true;
+            resolve();
+            return;
+          }
+          const textResolver = this.pendingText.get(msg.id);
+          if (textResolver) {
+            this.pendingText.delete(msg.id);
+            textResolver(msg);
+            return;
+          }
+          const binaryResolver = this.pendingBinary.get(msg.id);
+          if (binaryResolver && "error" in msg) {
+            this.pendingBinary.delete(msg.id);
+            throw new Error(`[rpc] ${msg.error.message}`);
+          }
           return;
         }
-        const resolver = this.pending.get(msg.id);
+        const buffer = ev.data instanceof ArrayBuffer ? ev.data : ev.data.buffer;
+        const frame = decodeBinaryFrame(buffer);
+        const resolver = this.pendingBinary.get(frame.id);
         if (resolver) {
-          this.pending.delete(msg.id);
-          resolver(msg);
+          this.pendingBinary.delete(frame.id);
+          resolver(frame);
         }
       });
       ws.addEventListener("error", (e) => {
@@ -31253,37 +31371,65 @@ var RpcClient = class {
   close() {
     this.ws?.close();
   }
-  async rpc(method, params2) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+  /** Send a JSON RPC, await a JSON response. */
+  async rpcText(method, params2) {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
       throw new Error("Not connected");
     }
     const id = this.nextId++;
-    const req = { id, method, params: params2 };
     const p = new Promise((resolve) => {
-      this.pending.set(id, resolve);
+      this.pendingText.set(id, resolve);
     });
-    this.ws.send(JSON.stringify(req));
+    ws.send(JSON.stringify({ id, method, params: params2 }));
     const resp = await p;
-    if ("error" in resp) {
-      throw new Error(`[${method}] ${resp.error.message}`);
-    }
+    if ("error" in resp) throw new Error(`[${method}] ${resp.error.message}`);
     return resp.result;
   }
-  // Typed convenience wrappers
   execute(params2) {
-    return this.rpc("execute", params2);
-  }
-  upload(params2) {
-    return this.rpc("upload", params2);
-  }
-  download(params2) {
-    return this.rpc("download", params2);
+    return this.rpcText("execute", params2);
   }
   readScalar(params2) {
-    return this.rpc("readScalar", params2);
+    return this.rpcText("readScalar", params2);
   }
   release(params2) {
-    return this.rpc("release", params2);
+    return this.rpcText("release", params2);
+  }
+  /** Upload: single binary frame from client, text response from server. */
+  async upload(params2) {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      throw new Error("Not connected");
+    }
+    const id = this.nextId++;
+    const values = valuesToTypedArray(params2.values, params2.dtype);
+    const frame = encodeBinaryFrame({
+      id,
+      dtype: params2.dtype,
+      shape: params2.shape,
+      values
+    });
+    const p = new Promise((resolve) => {
+      this.pendingText.set(id, resolve);
+    });
+    ws.send(frame);
+    const resp = await p;
+    if ("error" in resp) throw new Error(`[upload] ${resp.error.message}`);
+    return resp.result;
+  }
+  /** Download: text request from client, binary frame response from server. */
+  async download(params2) {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      throw new Error("Not connected");
+    }
+    const id = this.nextId++;
+    const p = new Promise((resolve) => {
+      this.pendingBinary.set(id, resolve);
+    });
+    ws.send(JSON.stringify({ id, method: "download", params: params2 }));
+    const frame = await p;
+    return { values: Array.from(frame.values) };
   }
 };
 
