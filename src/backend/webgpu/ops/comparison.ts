@@ -57,9 +57,11 @@ function comparisonOp(
     bStrides,
     aTensor.offset,
     bTensor.offset,
+    aTensor.dtype,
+    bTensor.dtype,
   );
 
-  const key = `${opName}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${aTensor.offset}:${bTensor.offset}`;
+  const key = `${opName}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${aTensor.offset}:${bTensor.offset}:${aTensor.dtype}:${bTensor.dtype}`;
 
   const outBuffer = dispatchElementwise({
     key,
