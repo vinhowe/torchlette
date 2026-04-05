@@ -390,9 +390,9 @@ describe("Frontend dtype casting", () => {
         });
         await loss.backward();
         const grad = await logits.grad?.cpu();
-        // Gradients for ignored row (index 1) should be zero.
-        expect(grad?.[2]).toBe(0);
-        expect(grad?.[3]).toBe(0);
+        // Gradients for ignored row (index 1) should be zero. (±0 both acceptable.)
+        expect(grad?.[2]).toBeCloseTo(0, 10);
+        expect(grad?.[3]).toBeCloseTo(0, 10);
 
         api.markStep();
       });
