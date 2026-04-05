@@ -338,8 +338,28 @@ export async function backwardImpl(
         disposeCheckpointIntermediates();
         allUnpackedTensors.clear();
 
-        // Force ALL final gradients in one merged plan.
-        const allGrads = [...gradMap.values()].filter(
+        // Drop non-leaf, non-retained grads from gradMap before force.
+        // Their values did their accumulation work during runBackwardFunctions
+        // and are now dead. Removing their live RuntimeTensor refs lets the
+        // liveness-based early release reclaim their buffers inside the plan.
+        //
+        // A single RuntimeTensor can be the value for multiple keys (e.g.
+        // add's backward returns dA = dB = dOut). Only dispose a grad if
+        // NONE of its keys are leaves or retained.
+        const survivorSet = new Set<RuntimeTensor>();
+        for (const [tensor, gradRt] of gradMap) {
+          if (leafTensors.has(tensor) || retainTensors.has(tensor)) {
+            survivorSet.add(gradRt);
+          }
+        }
+        for (const [, gradRt] of gradMap) {
+          if (!survivorSet.has(gradRt) && !gradRt.disposed) {
+            gradRt.dispose();
+          }
+        }
+
+        // Force the surviving gradients in one merged plan.
+        const allGrads = [...survivorSet].filter(
           (g) => !g.isMaterialized() && !g.disposed,
         );
         if (allGrads.length > 0) {
