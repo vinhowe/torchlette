@@ -137,6 +137,8 @@ export function comparisonWGSL(
   bStrides: number[],
   aOffset: number,
   bOffset: number,
+  aDtype: DataType = "f32",
+  bDtype: DataType = "f32",
 ): string {
   const opToMethod: Record<string, (a: BlockExpr, b: BlockExpr) => BlockExpr> =
     {
@@ -152,15 +154,26 @@ export function comparisonWGSL(
 
   return compileTileKernel(
     elementwiseKernel({
-      name: `cmp_${wgslOp}`,
+      name: `cmp_${wgslOp}_${aDtype}_${bDtype}`,
       bindings: {
-        a: { storage: "read", type: "f32" },
-        b: { storage: "read", type: "f32" },
+        a: { storage: "read", type: aDtype },
+        b: { storage: "read", type: bDtype },
         out: { storage: "read_write", type: "f32" },
       },
       kernel(ctx, idx) {
-        const aVal = ctx.stridedLoad("a", idx, indexShape, aStrides, aOffset);
-        const bVal = ctx.stridedLoad("b", idx, indexShape, bStrides, bOffset);
+        let aVal = ctx.stridedLoad("a", idx, indexShape, aStrides, aOffset);
+        let bVal = ctx.stridedLoad("b", idx, indexShape, bStrides, bOffset);
+        // Promote to a common compare type: f32 if either is f32, else i32.
+        const commonType: DataType =
+          aDtype === "f32" || bDtype === "f32" ? "f32" : "i32";
+        const toCommon = (v: BlockExpr, d: DataType): BlockExpr => {
+          if (d === commonType) return v;
+          if (commonType === "f32") return v.toF32();
+          if (commonType === "i32") return v.toI32();
+          return v.toU32();
+        };
+        aVal = toCommon(aVal, aDtype);
+        bVal = toCommon(bVal, bDtype);
         ctx.emitStore(
           "out",
           idx,
