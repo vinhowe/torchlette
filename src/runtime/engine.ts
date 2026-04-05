@@ -36,10 +36,16 @@ import {
 import { isDataSourceOp } from "../executor/lowered-plan";
 import { buildMergedPlan } from "../executor/plan-builder";
 import { rewritePlan } from "../compiler/rewriter/plan-rewrite";
+import { doubleTransposeRule } from "../compiler/rewriter/rules/double-transpose";
 import { fuseMatmulSumRule } from "../compiler/rewriter/rules/fuse-matmul-sum";
+import { transitiveReshapeRule } from "../compiler/rewriter/rules/transitive-reshape";
 import { getPendingNodeIds } from "./tensor";
 
-const DSL_RULES = [fuseMatmulSumRule];
+const DSL_RULES = [
+  fuseMatmulSumRule,
+  doubleTransposeRule,
+  transitiveReshapeRule,
+];
 import {
   executePlanSegmented,
   executePlanSequential,

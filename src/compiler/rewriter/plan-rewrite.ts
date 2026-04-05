@@ -40,19 +40,36 @@ export function rewritePlan(
 
   const maps: ConsumerMaps = { consumers, consumerCount };
   const killed = new Set<LazyIRNode>();
-  const stats = applyRules(plan.nodes, rules, maps, { killed });
+  const replaced = new Set<number>();
+  const stats = applyRules(plan.nodes, rules, maps, { killed, replaced });
   if (stats.applied === 0) return 0;
 
-  // Compact: physically remove explicitly-killed nodes and any transitively
-  // dead nodes (0 in-plan consumers after removal). Killed nodes may still
-  // be in externalNodeIds (their pending tensors were autograd saved-for-
-  // backward artifacts); trust the rule's assertion that they're no longer
-  // needed.
+  // Compact: physically remove dead nodes. Seed the worklist from two sources:
+  //  1. Rule-declared killed nodes (explicit `ctx.markDead` calls) — the rule
+  //     asserts these are no longer needed, ignoring externalNodeIds.
+  //  2. Matched roots whose consumers were rewired away and that are NOT
+  //     externally referenced. These are the roots of new-node replacement
+  //     rewrites like double-transpose.
+  // Then walk transitive inputs whose consumer count drops to zero, stopping
+  // at externalNodeIds (nodes with pending RuntimeTensors that must survive).
   const dead = new Set<number>();
   const worklist: LazyIRNode[] = [];
   for (const n of killed) {
     dead.add(n.id);
     worklist.push(n);
+  }
+  // Seed from replaced roots (matched nodes whose output was rewired away).
+  // These have 0 consumerCount post-rewrite and we want to transitively
+  // reclaim their upstream chain if it's not externally referenced.
+  for (const id of replaced) {
+    if (dead.has(id)) continue;
+    if (externalNodeIds?.has(id)) continue;
+    if ((consumerCount.get(id) ?? 0) !== 0) continue;
+    dead.add(id);
+    // Find the node to walk from (need the LazyIRNode, not just id).
+    // Build a quick index once.
+    const node = plan.nodes.find((n) => n.id === id);
+    if (node) worklist.push(node);
   }
   while (worklist.length > 0) {
     const node = worklist.pop()!;
