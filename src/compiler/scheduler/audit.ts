@@ -82,6 +82,35 @@ export function isSchedulerAuditEnabled(): boolean {
   return isEnabled();
 }
 
+/** Dump per-plan table to stderr (for verbose investigation). */
+export function printSchedulerAuditPerPlan(): void {
+  if (!isEnabled()) return;
+  if (samples.length === 0) return;
+  const mb = (b: number) => (b / (1024 * 1024)).toFixed(1).padStart(7);
+  console.error("");
+  console.error("[scheduler-audit] per-plan breakdown:");
+  console.error(
+    "   idx nodes ext  trivMB  ffMB   bfMB  peakMB  schedulableMB  ff-save%",
+  );
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    const schedTrivial = s.trivialTotalBytes - s.externalBytes;
+    const schedFf = s.firstFitTotalBytes - s.externalBytes;
+    const savePct =
+      schedTrivial > 0
+        ? (((schedTrivial - schedFf) / schedTrivial) * 100).toFixed(0)
+        : "--";
+    console.error(
+      `   ${String(i).padStart(3)} ${String(s.nodes).padStart(5)} ` +
+        `${String(s.externalCount).padStart(4)} ` +
+        `${mb(s.trivialTotalBytes)} ${mb(s.firstFitTotalBytes)} ` +
+        `${mb(s.bestFitTotalBytes)} ${mb(s.peakLiveBytes)} ` +
+        `${mb(schedTrivial)}→${mb(schedFf)} ${savePct.padStart(7)}%`,
+    );
+  }
+  console.error("");
+}
+
 /** Pretty-print an aggregate summary to stderr. */
 export function printSchedulerAuditSummary(): void {
   if (!isEnabled()) return;
@@ -103,6 +132,8 @@ export function printSchedulerAuditSummary(): void {
   let maxPlanNodes = 0;
   let maxTrivial = 0;
   let maxFirstFit = 0;
+  let maxPeakLive = 0;
+  let maxExternalBytes = 0;
   for (const s of steady) {
     totalNodes += s.nodes;
     totalExternal += s.externalCount;
@@ -114,6 +145,8 @@ export function printSchedulerAuditSummary(): void {
     if (s.nodes > maxPlanNodes) maxPlanNodes = s.nodes;
     if (s.trivialTotalBytes > maxTrivial) maxTrivial = s.trivialTotalBytes;
     if (s.firstFitTotalBytes > maxFirstFit) maxFirstFit = s.firstFitTotalBytes;
+    if (s.peakLiveBytes > maxPeakLive) maxPeakLive = s.peakLiveBytes;
+    if (s.externalBytes > maxExternalBytes) maxExternalBytes = s.externalBytes;
   }
 
   const n = steady.length;
@@ -170,11 +203,31 @@ export function printSchedulerAuditSummary(): void {
   );
   console.error("");
   console.error("  Max plan:");
-  console.error(`    trivial:   ${mb(maxTrivial).padStart(8)}MB`);
+  console.error(`    trivial:     ${mb(maxTrivial).padStart(8)}MB`);
   console.error(
-    `    first-fit: ${mb(maxFirstFit).padStart(8)}MB ` +
+    `    first-fit:   ${mb(maxFirstFit).padStart(8)}MB ` +
       `(saved ${pct(maxTrivial - maxFirstFit, maxTrivial)}%)`,
   );
+  console.error(`    peak live:   ${mb(maxPeakLive).padStart(8)}MB`);
+  console.error(`    external:    ${mb(maxExternalBytes).padStart(8)}MB`);
   console.error("=".repeat(72));
   console.error("");
+}
+
+/** Max peak-live across all recorded plans (theoretical GPU floor). */
+export function getMaxPeakLiveBytes(): number {
+  let max = 0;
+  for (const s of samples) {
+    if (s.peakLiveBytes > max) max = s.peakLiveBytes;
+  }
+  return max;
+}
+
+/** Max first-fit totalBytes across all recorded plans. */
+export function getMaxFirstFitBytes(): number {
+  let max = 0;
+  for (const s of samples) {
+    if (s.firstFitTotalBytes > max) max = s.firstFitTotalBytes;
+  }
+  return max;
 }
