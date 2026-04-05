@@ -963,6 +963,32 @@ function emitStatement(
       );
       break;
     }
+    case "atomicAddF32": {
+      // f32 atomic-add via CAS loop on atomic<u32>. WebGPU has no f32
+      // atomics; emit a compare-exchange spin loop with bitcast.
+      const idx = exprFor(stmt.idx, bindings);
+      const addend = exprFor(stmt.addend, bindings);
+      const expectedVar = `_addf_expected_${stmt.id}`;
+      const addendVar = `_addf_addend_${stmt.id}`;
+      const resultVar = `_addf_res_${stmt.id}`;
+      const sumVar = `_addf_sum_${stmt.id}`;
+      const ptrExpr = `&${stmt.binding}[${idx}]`;
+      lines.push(`${indent}let ${addendVar}: f32 = ${addend};`);
+      lines.push(
+        `${indent}var ${expectedVar}: u32 = atomicLoad(${ptrExpr});`,
+      );
+      lines.push(`${indent}loop {`);
+      lines.push(
+        `${indent}  let ${sumVar}: f32 = bitcast<f32>(${expectedVar}) + ${addendVar};`,
+      );
+      lines.push(
+        `${indent}  let ${resultVar} = atomicCompareExchangeWeak(${ptrExpr}, ${expectedVar}, bitcast<u32>(${sumVar}));`,
+      );
+      lines.push(`${indent}  if (${resultVar}.exchanged) { break; }`);
+      lines.push(`${indent}  ${expectedVar} = ${resultVar}.old_value;`);
+      lines.push(`${indent}}`);
+      break;
+    }
     case "return": {
       lines.push(`${indent}return;`);
       break;
@@ -1065,6 +1091,10 @@ function forEachStmtExpr(stmt: Statement, fn: (expr: IRNode) => void): void {
       fn(stmt.idx);
       fn(stmt.expected);
       fn(stmt.desired);
+      break;
+    case "atomicAddF32":
+      fn(stmt.idx);
+      fn(stmt.addend);
       break;
     case "vec4ArrayWrite":
     case "vec4ArrayAddAssign":
