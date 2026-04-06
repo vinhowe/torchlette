@@ -21,6 +21,7 @@ import { buildMergedPlan } from "../executor/plan-builder";
 import type { Tensor as FrontendTensor } from "../frontend/tensor";
 import { Torchlette } from "../frontend/torchlette";
 import { createStorageHandle } from "../graph/node-factory";
+import { storageTracker } from "../graph/storage-tracker";
 import type { LazyIRNode, StorageHandle } from "../graph/types";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import {
@@ -138,6 +139,10 @@ export interface RemoteEngineStats {
   bytesUp: number;
   bytesDown: number;
   handlesReleased: number;
+  /** Per-phase cumulative timing (ms). */
+  serializeMs: number;
+  transportMs: number;
+  bookkeepingMs: number;
 }
 
 export interface RemoteEngine {
@@ -162,6 +167,17 @@ export interface RemoteEngine {
    * references it with "no HandleRef for storage id=…".
    */
   markStep(keep: FrontendTensor[]): Promise<number>;
+  /**
+   * Pre-upload pending `tensorFromArray` tensors via binary transport,
+   * bypassing JSON plan serialization. Call once before the first training
+   * step to eliminate the cold-start payload (~40-60MB of inline weights
+   * for a large model → ~100KB of handle refs in subsequent plans).
+   *
+   * For each tensor: extracts the Float32Array from its pending node's
+   * payload, uploads via `transport.upload()` (binary frame), and patches
+   * the node to look "already executed" so `buildMergedPlan` skips it.
+   */
+  preUpload(tensors: FrontendTensor[]): Promise<number>;
 }
 
 export interface CreateRemoteEngineOptions {
@@ -197,6 +213,9 @@ export function createRemoteEngine(
     bytesUp: 0,
     bytesDown: 0,
     handlesReleased: 0,
+    serializeMs: 0,
+    transportMs: 0,
+    bookkeepingMs: 0,
   };
 
   const runtime = torch.runtime;
@@ -205,15 +224,19 @@ export function createRemoteEngine(
   async function shipPlan(plan: { nodes: LazyIRNode[] }): Promise<void> {
     if (plan.nodes.length === 0) return;
 
+    const t0 = performance.now();
     const wire = serializePlan(plan, {
       resolveHandle: (id: number) => handles.requireHandle(id),
     });
     stats.executes++;
     stats.nodesShipped += plan.nodes.length;
-    // Rough cost accounting; not the same as the transport's real payload.
     stats.bytesUp += JSON.stringify(wire).length;
+    const t1 = performance.now();
+    stats.serializeMs += t1 - t0;
 
     const result = await transport.execute({ plan: wire });
+    const t2 = performance.now();
+    stats.transportMs += t2 - t1;
 
     // Bind each server HandleRef to a fresh local stub StorageHandle so
     // subsequent plans can reference these outputs as materialized inputs.
@@ -225,6 +248,7 @@ export function createRemoteEngine(
       handles.bind(storage.id, handleRef);
       node.result = storage;
     }
+    stats.bookkeepingMs += performance.now() - t2;
   }
 
   function collectPendingRoots(
@@ -356,11 +380,55 @@ export function createRemoteEngine(
 
     if (toRelease.length > 0) {
       await transport.release({ handles: toRelease });
-      for (const id of idsToUnbind) handles.unbind(id);
+      for (const id of idsToUnbind) {
+        handles.unbind(id);
+        // Unregister the stub StorageHandle from the global tracker so it
+        // doesn't accumulate across steps (causes growing overhead).
+        storageTracker.unregister(id);
+      }
       stats.handlesReleased += toRelease.length;
     }
     return toRelease.length;
   }
 
-  return { torch, handles, transport, stats, markStep };
+  async function preUpload(tensors: FrontendTensor[]): Promise<number> {
+    let uploaded = 0;
+    for (const t of tensors) {
+      const rt = t._unwrap();
+      const ref = rt.lazyRef;
+      if (ref.kind !== "pending") continue; // already materialized
+      const node = ref.node;
+      if (node.op !== "tensorFromArray") continue; // not an inline-data node
+
+      const payload = node.payload as
+        | { values: Float32Array | Int32Array | Uint32Array | number[] }
+        | undefined;
+      if (!payload?.values) continue;
+
+      // Convert to number[] for the transport upload interface.
+      const values = Array.isArray(payload.values)
+        ? payload.values
+        : Array.from(payload.values);
+
+      const result = await transport.upload({
+        values,
+        shape: node.shape,
+        dtype: node.dtype,
+      });
+
+      // Create a local stub and bind it to the server handle.
+      const stub = makeStub(node.shape, node.dtype);
+      const storage = createStorageHandle(node.device, stub);
+      handles.bind(storage.id, result.handle);
+
+      // Mark the node as "already executed" so buildMergedPlan skips it.
+      node.result = storage;
+      // Materialize the RuntimeTensor so subsequent ops see it as resolved.
+      rt._materialize(storage);
+      uploaded++;
+    }
+    return uploaded;
+  }
+
+  return { torch, handles, transport, stats, markStep, preUpload };
 }

@@ -30663,6 +30663,7 @@ function collectEngineTensors(value) {
 
 // src/remote/client-engine.ts
 init_node_factory();
+init_storage_tracker();
 init_tensor2();
 
 // src/remote/serialize.ts
@@ -30817,18 +30818,26 @@ function createRemoteEngine(transport, options = {}) {
     scalarReads: 0,
     bytesUp: 0,
     bytesDown: 0,
-    handlesReleased: 0
+    handlesReleased: 0,
+    serializeMs: 0,
+    transportMs: 0,
+    bookkeepingMs: 0
   };
   const runtime = torch2.runtime;
   async function shipPlan(plan) {
     if (plan.nodes.length === 0) return;
+    const t0 = performance.now();
     const wire = serializePlan(plan, {
       resolveHandle: (id) => handles.requireHandle(id)
     });
     stats.executes++;
     stats.nodesShipped += plan.nodes.length;
     stats.bytesUp += JSON.stringify(wire).length;
+    const t1 = performance.now();
+    stats.serializeMs += t1 - t0;
     const result = await transport.execute({ plan: wire });
+    const t2 = performance.now();
+    stats.transportMs += t2 - t1;
     for (const [idxStr, handleRef] of Object.entries(result.outputs)) {
       const idx = Number(idxStr);
       const node = plan.nodes[idx];
@@ -30837,6 +30846,7 @@ function createRemoteEngine(transport, options = {}) {
       handles.bind(storage.id, handleRef);
       node.result = storage;
     }
+    stats.bookkeepingMs += performance.now() - t2;
   }
   function collectPendingRoots2(tensors) {
     const roots = [];
@@ -30934,12 +30944,40 @@ function createRemoteEngine(transport, options = {}) {
     }
     if (toRelease.length > 0) {
       await transport.release({ handles: toRelease });
-      for (const id of idsToUnbind) handles.unbind(id);
+      for (const id of idsToUnbind) {
+        handles.unbind(id);
+        storageTracker.unregister(id);
+      }
       stats.handlesReleased += toRelease.length;
     }
     return toRelease.length;
   }
-  return { torch: torch2, handles, transport, stats, markStep };
+  async function preUpload(tensors) {
+    let uploaded = 0;
+    for (const t of tensors) {
+      const rt = t._unwrap();
+      const ref2 = rt.lazyRef;
+      if (ref2.kind !== "pending") continue;
+      const node = ref2.node;
+      if (node.op !== "tensorFromArray") continue;
+      const payload = node.payload;
+      if (!payload?.values) continue;
+      const values = Array.isArray(payload.values) ? payload.values : Array.from(payload.values);
+      const result = await transport.upload({
+        values,
+        shape: node.shape,
+        dtype: node.dtype
+      });
+      const stub = makeStub(node.shape, node.dtype);
+      const storage = createStorageHandle(node.device, stub);
+      handles.bind(storage.id, result.handle);
+      node.result = storage;
+      rt._materialize(storage);
+      uploaded++;
+    }
+    return uploaded;
+  }
+  return { torch: torch2, handles, transport, stats, markStep, preUpload };
 }
 
 // examples/remote-training-demo/client/model.ts
@@ -30975,7 +31013,7 @@ function createModel(api, config, seed = 1337) {
   const { vocabSize, blockSize, embedDim: D, numLayers, mlpRatio } = config;
   const H = Math.floor(D * mlpRatio);
   const rng = makePrng(seed);
-  const opts = { device: "cpu" };
+  const opts = { device: config.device ?? "cpu" };
   const scale = 1 / Math.sqrt(D);
   const draw = (n) => Array.from({ length: n }, () => rng() * scale);
   const zeros3 = (n) => new Array(n).fill(0);
@@ -31028,7 +31066,7 @@ function forward(api, m, tokenIds) {
   const [B, seq] = tokenIds.shape;
   const tokE = api.embedding(m.tokEmb, tokenIds);
   const posIdsArr = Array.from({ length: seq }, (_, i) => i);
-  const posIds = api.tensorFromArray(posIdsArr, [seq], { device: "cpu", dtype: "i32" });
+  const posIds = api.tensorFromArray(posIdsArr, [seq], { device: m.config.device ?? "cpu", dtype: "i32" });
   const posE = api.embedding(m.posEmb, posIds);
   const posEExpanded = api.expand(api.reshape(posE, [1, seq, D]), [B, seq, D]);
   let x = api.add(tokE, posEExpanded);
