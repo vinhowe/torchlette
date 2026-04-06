@@ -1593,13 +1593,14 @@ export class Torchlette {
     // Step 2: Force all pending tensors to materialize
     await this.runtime.forceAllPending();
 
-    // Step 3: Destroy all unreachable storages (intermediate buffers).
+    // Step 3: Destroy all storages with rc <= 0.
     storageTracker.destroyUnreachable();
 
-    // Step 3.5: Deterministic step-scoped cleanup. Demotes reachable storages
-    // for tensors created during this step (not in the beginStep snapshot),
-    // so they're destroyed immediately rather than lingering until GC runs.
-    storageTracker.destroyStepScoped();
+    // Step 3.5: Release refs for step-scoped temporaries, then destroy.
+    storageTracker.releaseStepTemps();
+
+    // Step 3.6: Final cleanup after releasing step-scoped refs.
+    storageTracker.destroyUnreachable();
 
     // Step 4: Reset cumulative fusion stats for the next step
     this.runtime.resetCumulativeFusionStats();
@@ -1625,8 +1626,6 @@ export class Torchlette {
     // storages exist before the snapshot. Without this, lazy model-init tensors
     // would materialize during the step and be treated as step-scoped.
     await this.runtime.forceAllPending();
-    // Snapshot which RuntimeTensor objects are alive now. These are persistent
-    // (model params, optimizer state) and their storages survive step cleanup.
     storageTracker.snapshotForStep();
     await this.runtime.beginStep();
   }

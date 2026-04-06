@@ -3,160 +3,148 @@ import {
   type TensorLifetime,
 } from "./lifetime-analysis";
 import { getNextStorageId } from "./node-factory";
+import { rcDelete, rcGet, rcRelease } from "./refcount";
 import type { StorageHandle } from "./types";
 
 /**
- * Step-scoped storage tracker for memory management (§14).
+ * Storage tracker — manages StorageHandle lifecycle via reference counting.
  *
- * Tracks all StorageHandles created during execution and which are
- * externally reachable (linked to user-visible Tensors).
- * At markStep(), unreachable storages can be destroyed.
+ * Liveness is determined by rc (reference count):
+ *   rc > 0  →  alive (some tensor or view holds a reference)
+ *   rc <= 0 →  dead (eligible for destruction)
+ *
+ * Views keep their base alive through rcRetain on the base storage.
+ * No separate "needed by views" walk is required.
+ *
+ * WeakRefs are kept as a safety net: when a tensor is GC'd without being
+ * disposed, the WeakRef scan in destroyUnreachable() detects this and
+ * releases the tensor's claim (rcRelease). This ensures storages are
+ * eventually freed even without explicit dispose() or `using`.
  */
 class StorageTracker {
   /** All storages created and not yet destroyed */
   private allStorages = new Map<number, StorageHandle>();
 
-  /** Storage IDs that are externally reachable (linked to Tensors) */
-  private externallyReachable = new Set<number>();
-
-  /** WeakRefs to owning tensors — used to detect GC'd tensors at cleanup time */
+  /** WeakRefs to owning tensors — safety net for GC'd undisposed tensors */
   private tensorWeakRefs = new Map<number, WeakRef<object>>();
 
-  /** Storage IDs that recently became unreachable (for incremental scanning) */
-  private recentlyUnreachable = new Set<number>();
-
-  /** Snapshot of RuntimeTensor objects that were alive at the start of the step.
-   *  Used by destroyStepScoped() to distinguish persistent tensors (model params,
-   *  optimizer state) from step-scoped temporaries (activations, views). */
+  /** Tensors alive at beginStep — these are "persistent" across the step.
+   *  A tensor's storage can change within a step (via _updateLazyRef), but
+   *  the tensor object is stable. Tracking the tensor (not the storage id)
+   *  ensures persistence survives storage replacement (e.g., Adam m/v updates). */
   private _stepStartTensors: WeakSet<object> | null = null;
 
-  /** Debug counters for tracking reachability changes per step */
-  private _debugRegisterCount = 0;
-  private _debugReachableCount = 0;
-  private _debugUnreachableCount = 0;
+  /** Debug counters */
   private _debugDestroyCount = 0;
 
-  /**
-   * Register a newly created storage.
-   */
+  /** Register a newly created storage. */
   register(storage: StorageHandle): void {
     this.allStorages.set(storage.id, storage);
-    this._debugRegisterCount++;
   }
 
   /**
-   * Mark a storage as externally reachable (linked to a user-visible Tensor).
-   * Optionally pass the owning tensor object so we can track it via WeakRef
-   * and detect when it has been garbage collected.
+   * Register a WeakRef to the tensor that owns this storage.
+   * Used by destroyUnreachable() to detect GC'd tensors.
    */
-  markReachable(storageId: number, tensorRef?: object): void {
-    const wasNew = !this.externallyReachable.has(storageId);
-    this.externallyReachable.add(storageId);
-    if (wasNew) this._debugReachableCount++;
-    if (tensorRef) {
-      this.tensorWeakRefs.set(storageId, new WeakRef(tensorRef));
-    }
+  trackTensor(storageId: number, tensorRef: object): void {
+    this.tensorWeakRefs.set(storageId, new WeakRef(tensorRef));
   }
 
-  /**
-   * Mark a storage as no longer externally reachable (Tensor disposed).
-   */
-  markUnreachable(storageId: number): void {
-    const wasReachable = this.externallyReachable.has(storageId);
-    this.externallyReachable.delete(storageId);
-    this.tensorWeakRefs.delete(storageId);
-    if (wasReachable) {
-      this._debugUnreachableCount++;
-      this.recentlyUnreachable.add(storageId);
-    }
-  }
-
-  /**
-   * Check if a storage is externally reachable.
-   */
-  isReachable(storageId: number): boolean {
-    return this.externallyReachable.has(storageId);
-  }
-
-  /**
-   * Unregister a storage (after it's been destroyed).
-   */
+  /** Unregister a storage (after it's been destroyed or early-released). */
   unregister(storageId: number): void {
     this.allStorages.delete(storageId);
-    this.externallyReachable.delete(storageId);
     this.tensorWeakRefs.delete(storageId);
   }
 
-  /** Find base storage IDs transitively needed by reachable view storages. */
-  private findNeededByViews(): Set<number> {
-    const neededByViews = new Set<number>();
-    const worklist = [...this.externallyReachable];
-    while (worklist.length > 0) {
-      const id = worklist.pop() as number;
-      const storage = this.allStorages.get(id);
-      if (
-        storage?.baseStorageId !== undefined &&
-        !neededByViews.has(storage.baseStorageId)
-      ) {
-        neededByViews.add(storage.baseStorageId);
-        worklist.push(storage.baseStorageId);
+  /**
+   * Destroy all storages with rc <= 0.
+   *
+   * First scans WeakRefs to detect GC'd tensors and release their claims,
+   * which may push more storages to rc=0. Then collects and destroys all
+   * dead storages.
+   */
+  destroyUnreachable(): number {
+    // Safety net: detect GC'd tensors and release their claims
+    for (const [id, ref] of this.tensorWeakRefs) {
+      if (ref.deref() === undefined) {
+        this.tensorWeakRefs.delete(id);
+        if (rcGet(id) > 0) rcRelease(id, "gc");
       }
     }
-    return neededByViews;
+
+    // Worklist-based cascading destruction. Each destroy can release a base
+    // ref (rcRelease "view.destroyed"), potentially making the base dead too.
+    // We re-collect dead storages until fixed point — single call, no caller loop.
+    let totalDestroyed = 0;
+    while (true) {
+      // Only LIVE views protect their bases — dead views will release the
+      // base retain when destroyed in this pass.
+      const protectedBases = new Set<number>();
+      for (const [id, storage] of this.allStorages) {
+        if (storage.baseStorageId !== undefined && rcGet(id) > 0) {
+          let baseId: number | undefined = storage.baseStorageId;
+          while (baseId !== undefined && !protectedBases.has(baseId)) {
+            protectedBases.add(baseId);
+            baseId = this.allStorages.get(baseId)?.baseStorageId;
+          }
+        }
+      }
+
+      const toDestroy: number[] = [];
+      for (const [id] of this.allStorages) {
+        if (rcGet(id) <= 0 && !protectedBases.has(id)) {
+          toDestroy.push(id);
+        }
+      }
+
+      if (toDestroy.length === 0) break;
+      totalDestroyed += this.destroyStorageIds(toDestroy);
+    }
+    return totalDestroyed;
   }
 
-  /** Destroy a list of storage IDs and return the count destroyed. */
+  /** Destroy storages with rc <= 0, scoped to ids >= sinceId. */
+  destroyUnreachableSince(sinceId: number): number {
+    const toDestroy: number[] = [];
+    for (const [id] of this.allStorages) {
+      if (id < sinceId) continue;
+      if (rcGet(id) <= 0) {
+        toDestroy.push(id);
+      }
+    }
+    if (toDestroy.length === 0) return 0;
+    return this.destroyStorageIds(toDestroy);
+  }
+
+  /** Destroy a list of storage IDs. Returns count destroyed. */
   private destroyStorageIds(ids: number[]): number {
     let count = 0;
     for (const id of ids) {
       const storage = this.allStorages.get(id);
-      if (storage) {
-        const tensor = storage.backendTensor;
-        if (tensor.ownsBuffer !== false && tensor.destroy) {
-          tensor.destroy();
-        }
-        this.allStorages.delete(id);
-        count++;
-        this._debugDestroyCount++;
+      if (!storage) continue;
+
+      // Release view base ref (view is being destroyed → base loses a reference)
+      if (storage.baseStorageId !== undefined) {
+        rcRelease(storage.baseStorageId, "view.destroyed");
       }
+      rcDelete(id);
+
+      const bt = storage.backendTensor;
+      if (bt.ownsBuffer !== false && bt.destroy) {
+        bt.destroy();
+      }
+      this.allStorages.delete(id);
+      this.tensorWeakRefs.delete(id);
+      count++;
+      this._debugDestroyCount++;
     }
     return count;
   }
 
   /**
-   * Destroy all unreachable storages (called at markStep after GPU fence).
-   * Returns the number of storages destroyed.
-   *
-   * Note: Only destroys storages whose backend tensors own their buffers.
-   * Views (tensors that borrow buffers) are unregistered but not destroyed.
-   * Base storages that are needed by reachable views are kept alive.
-   */
-  destroyUnreachable(): number {
-    // Check WeakRefs — if the owning tensor was GC'd, demote to unreachable
-    for (const [id, ref] of this.tensorWeakRefs) {
-      if (ref.deref() === undefined) {
-        this.externallyReachable.delete(id);
-        this.tensorWeakRefs.delete(id);
-        this.recentlyUnreachable.add(id);
-      }
-    }
-
-    // Early exit: if all storages are reachable and none recently unreachable, skip scan
-    if (
-      this.recentlyUnreachable.size === 0 &&
-      this.allStorages.size === this.externallyReachable.size
-    ) {
-      return 0;
-    }
-
-    this.recentlyUnreachable.clear();
-    return this._destroyUnreachableFrom();
-  }
-
-  /**
-   * Snapshot the RuntimeTensor objects currently holding storages reachable.
-   * Call at beginStep() — these tensors are "persistent" (model params, optimizer
-   * state) and their storages survive step-scoped cleanup.
+   * Snapshot tensors alive at the start of the step. These are "persistent"
+   * (model params, optimizer state). Tensors created during the step are
+   * step-scoped temporaries and will have their refs released at markStep.
    */
   snapshotForStep(): void {
     this._stepStartTensors = new WeakSet();
@@ -167,213 +155,73 @@ class StorageTracker {
   }
 
   /**
-   * Deterministic step-scoped cleanup. Demotes reachable storages whose owning
-   * RuntimeTensor was NOT alive at the start of the step (i.e., created during
-   * the step as a temporary). Protected storages (optimizer state) are kept.
-   *
-   * Call once at the end of markStep(). This eliminates the memory oscillation
-   * caused by non-deterministic GC — temporary tensors (activations, transpose
-   * views, scalar constants) are cleaned up immediately instead of lingering
-   * until the JS garbage collector runs.
+   * Release tensor refs for step-scoped temporaries.
+   * For each tracked storage: if its owning tensor is alive but was NOT
+   * in the beginStep snapshot, release the ref — it's a step-scoped temp.
+   * Persistent tensors whose storages changed within the step (e.g., Adam
+   * m/v via _updateLazyRef) stay alive because the tensor OBJECT is in
+   * the snapshot, even if the storage id is new.
    */
-  destroyStepScoped(): number {
+  releaseStepTemps(): number {
     if (!this._stepStartTensors) return 0;
+    let released = 0;
     for (const [id, ref] of this.tensorWeakRefs) {
       const target = ref.deref();
-      if (target === undefined || !this._stepStartTensors.has(target)) {
-        this.externallyReachable.delete(id);
-        this.tensorWeakRefs.delete(id);
-        this.recentlyUnreachable.add(id);
+      // GC'd tensor: skip (will be handled by FR or gc scan in destroyUnreachable)
+      if (target === undefined) continue;
+      // Persistent tensor: skip
+      if (this._stepStartTensors.has(target)) continue;
+      // Step-scoped tensor with live ref: release its claim
+      if (rcGet(id) > 0) {
+        rcRelease(id, "stepScoped");
+        released++;
       }
     }
-    // Demote reachable storages that have no WeakRef (markReachable called
-    // without tensorRef) — no way to snapshot-check them.
-    for (const id of this.externallyReachable) {
-      if (!this.tensorWeakRefs.has(id)) {
-        this.externallyReachable.delete(id);
-        this.recentlyUnreachable.add(id);
-      }
-    }
-    if (this.recentlyUnreachable.size === 0) return 0;
-    this.recentlyUnreachable.clear();
-    return this._destroyUnreachableFrom();
+    this._stepStartTensors = null;
+    return released;
   }
 
-  /**
-   * Get the next storage ID that will be assigned.
-   * Used to scope destroyUnreachableSince() to only affect newly created storages.
-   */
   getNextStorageId(): number {
     return getNextStorageId();
   }
 
-  /**
-   * Destroy unreachable storages created at or after the given storage ID.
-   * This is a scoped version of destroyUnreachable() that only affects
-   * storages created within a specific time window (e.g., during backward pass
-   * gradient computation). Pre-existing unreachable storages are left alone.
-   */
-  destroyUnreachableSince(sinceId: number): number {
-    return this._destroyUnreachableFrom(sinceId);
-  }
-
-  /** Collect and destroy unreachable storages, optionally scoped to ids >= sinceId. */
-  private _destroyUnreachableFrom(sinceId?: number): number {
-    const neededByViews = this.findNeededByViews();
-    const toDestroy: number[] = [];
-    for (const [id] of this.allStorages) {
-      if (sinceId !== undefined && id < sinceId) continue;
-      if (!this.externallyReachable.has(id) && !neededByViews.has(id)) {
-        toDestroy.push(id);
-      }
-    }
-    return this.destroyStorageIds(toDestroy);
-  }
-
-  /**
-   * Get statistics about tracked storages.
-   */
   stats(): {
     totalStorages: number;
     reachableStorages: number;
     unreachableStorages: number;
   } {
+    let reachable = 0;
+    for (const [id] of this.allStorages) {
+      if (rcGet(id) > 0) reachable++;
+    }
     return {
       totalStorages: this.allStorages.size,
-      reachableStorages: this.externallyReachable.size,
-      unreachableStorages:
-        this.allStorages.size - this.externallyReachable.size,
+      reachableStorages: reachable,
+      unreachableStorages: this.allStorages.size - reachable,
     };
   }
 
-  /**
-   * Get and reset debug counters.
-   */
-  debugCounters(): {
-    registered: number;
-    reachable: number;
-    unreachable: number;
-    destroyed: number;
-  } {
-    const result = {
-      registered: this._debugRegisterCount,
-      reachable: this._debugReachableCount,
-      unreachable: this._debugUnreachableCount,
-      destroyed: this._debugDestroyCount,
-    };
-    this._debugRegisterCount = 0;
-    this._debugReachableCount = 0;
-    this._debugUnreachableCount = 0;
+  debugCounters(): { destroyed: number } {
+    const d = this._debugDestroyCount;
     this._debugDestroyCount = 0;
-    return result;
+    return { destroyed: d };
   }
 
-  /**
-   * Reset the tracker (for testing).
-   */
   reset(): void {
     this.allStorages.clear();
-    this.externallyReachable.clear();
     this.tensorWeakRefs.clear();
-    this.recentlyUnreachable.clear();
-    this._stepStartTensors = null;
   }
 
-  /**
-   * Get the set of externally reachable storage IDs.
-   */
-  getReachableIds(): Set<number> {
-    return new Set(this.externallyReachable);
-  }
-
-  /**
-   * Check if a storage has a live (not GC'd) tensor WeakRef.
-   */
-  hasLiveTensorRef(storageId: number): boolean {
-    const ref = this.tensorWeakRefs.get(storageId);
-    if (!ref) return false;
-    return ref.deref() !== undefined;
-  }
-
-  /**
-   * Get a storage by ID.
-   */
   getStorage(storageId: number): StorageHandle | undefined {
     return this.allStorages.get(storageId);
   }
 
-  /**
-   * Get debug info about the tensor ref holding a storage reachable.
-   * Returns shape/dtype if the ref is a RuntimeTensor, or a description otherwise.
-   */
-  getTensorRefDebugInfo(storageId: number): {
-    shape?: number[];
-    dtype?: string;
-    type: string;
-    disposed?: boolean;
-  } | null {
-    const ref = this.tensorWeakRefs.get(storageId);
-    if (!ref) return null;
-    const obj = ref.deref();
-    if (!obj) return null;
-    // Check if it's a RuntimeTensor (has shape and dtype fields)
-    if ("shape" in obj && "dtype" in obj) {
-      const t = obj as {
-        shape: number[];
-        dtype: string;
-        disposed?: boolean;
-        _disposed?: boolean;
-      };
-      return {
-        shape: t.shape,
-        dtype: t.dtype,
-        type: "tensor",
-        disposed: t.disposed ?? t._disposed,
-      };
-    }
-    // Multi-output results array or other ref
-    if (Array.isArray(obj)) {
-      return { type: "resultsArray" };
-    }
-    return { type: typeof obj };
-  }
-
-  /**
-   * Get storages that became reachable since a given snapshot.
-   * Returns entries for IDs present in current reachable set but absent from prevIds.
-   */
-  getNewReachableSince(prevIds: Set<number>): Array<{
-    id: number;
-    hasLiveTensorRef: boolean;
-    debugInfo: ReturnType<StorageTracker["getTensorRefDebugInfo"]>;
-  }> {
-    const result: Array<{
-      id: number;
-      hasLiveTensorRef: boolean;
-      debugInfo: ReturnType<StorageTracker["getTensorRefDebugInfo"]>;
-    }> = [];
-    for (const id of this.externallyReachable) {
-      if (!prevIds.has(id)) {
-        result.push({
-          id,
-          hasLiveTensorRef: this.hasLiveTensorRef(id),
-          debugInfo: this.getTensorRefDebugInfo(id),
-        });
-      }
-    }
-    return result;
-  }
-
-  /**
-   * Get all buffer objects from live storages that own their buffer.
-   * For cross-referencing with memory tracker to find orphaned buffers.
-   */
   getLiveOwnedBuffers(): Set<unknown> {
     const buffers = new Set<unknown>();
     for (const [, storage] of this.allStorages) {
-      const tensor = storage.backendTensor;
-      const buf = (tensor as { buffer?: unknown }).buffer;
-      if (tensor.ownsBuffer !== false && buf) {
+      const bt = storage.backendTensor;
+      const buf = (bt as { buffer?: unknown }).buffer;
+      if (bt.ownsBuffer !== false && buf) {
         buffers.add(buf);
       }
     }
@@ -385,72 +233,55 @@ class StorageTracker {
 export const storageTracker = new StorageTracker();
 
 // ============================================================================
-// Early Release Helpers for Memory-Aware Execution
+// Early Release Helpers
 // ============================================================================
 
 /**
  * Check if a storage can be safely released during plan execution.
- *
- * A storage can be safely released if:
- * 1. It's not externally reachable (not linked to a user-visible Tensor)
- * 2. No other active storage uses it as a base (view aliasing)
- *
- * @param storage - The storage to check
- * @param activeStorages - Map of all storages that are still active in the plan
+ * Uses refcount: rc <= 0 means no one references it.
+ * Also checks view aliasing (another active storage uses this as base).
  */
 export function canSafelyRelease(
   storage: StorageHandle,
   activeStorages: Map<number, StorageHandle>,
 ): boolean {
-  // Cannot release if externally reachable (linked to user tensor)
-  if (storageTracker.isReachable(storage.id)) {
-    return false;
+  if (rcGet(storage.id) > 0) return false;
+  for (const [, active] of activeStorages) {
+    if (active.baseStorageId === storage.id) return false;
   }
-
-  // Cannot release if this storage is the base for another active storage (view aliasing)
-  for (const [, activeStorage] of activeStorages) {
-    if (activeStorage.baseStorageId === storage.id) {
-      return false;
-    }
-  }
-
   return true;
 }
 
 /**
  * Release a buffer during plan execution.
- *
- * For WebGPU: The buffer pool uses deferred destruction - buffers are queued
- * for destruction after the GPU fence signals that work is complete. This
- * prevents "buffer destroyed while in use" validation errors.
- *
- * For CPU: Buffers are destroyed immediately since operations are synchronous.
- *
- * @param storage - The storage handle to release
  */
 export function releaseBufferImmediate(storage: StorageHandle): void {
-  const tensor = storage.backendTensor;
+  const bt = storage.backendTensor;
 
-  // Don't release views (they don't own buffers)
-  if (tensor.ownsBuffer === false) {
+  // Views: release base ref but don't destroy (don't own buffer).
+  // Don't unregister — the view may still be referenced by the shared encoder.
+  // Clear baseStorageId to prevent double-release when destroyStorageIds
+  // later processes this view at destroyUnreachable time.
+  if (bt.ownsBuffer === false) {
+    if (storage.baseStorageId !== undefined) {
+      rcRelease(storage.baseStorageId, "earlyRelease.viewBase");
+      storage.baseStorageId = undefined;
+    }
     return;
   }
 
-  // Unregister from storage tracker to prevent double-free at markStep
-  storageTracker.unregister(storage.id);
-
-  // Call destroy() - for WebGPU, this uses deferred destruction via the buffer pool
-  // which waits for the GPU fence before actually destroying the buffer
-  if (tensor.destroy) {
-    tensor.destroy();
+  // Owning storage: release base ref if view, unregister, destroy.
+  if (storage.baseStorageId !== undefined) {
+    rcRelease(storage.baseStorageId, "earlyRelease.base");
+    storage.baseStorageId = undefined;
   }
+  rcDelete(storage.id);
+  storageTracker.unregister(storage.id);
+  if (bt.destroy) bt.destroy();
 }
 
 /**
- * Find and release all tensors that are dead at a given execution step.
- *
- * Combines findDeadTensorsAtStep + canSafelyRelease + releaseBufferImmediate
- * into a single call. No-ops if lifetimes or outputNodeIds are null.
+ * Find and release all dead tensors at a given execution step.
  */
 export function releaseDeadTensors(
   lifetimes: Map<number, TensorLifetime> | null,

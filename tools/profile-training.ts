@@ -516,6 +516,8 @@ async function main() {
           `  Pooled: ${poolStats.pooledBuffers} buffers (${(poolStats.pooledBytes / 1024 / 1024).toFixed(1)}MB)`,
         );
         console.log(`  Pending release: ${poolStats.pendingBuffers} buffers`);
+        const { bufferPool } = await import("../src/backend/webgpu/buffer-pool");
+        bufferPool.debugDumpSizeClasses();
         console.log(
           `  Reuse rate: ${(poolStats.reuseRate * 100).toFixed(1)}% (reuse: ${poolStats.reuseCount}, new alloc: ${poolStats.allocCount})`,
         );
