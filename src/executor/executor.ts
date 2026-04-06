@@ -73,6 +73,12 @@ import type {
   LazyRef,
   StorageHandle,
 } from "../graph/types";
+/** Mark a storage's GPU buffer as liveness-safe for immediate pool reuse. */
+function markLivenessSafe(storage: StorageHandle): void {
+  const buf = (storage.backendTensor as { buffer?: GPUBuffer }).buffer;
+  if (buf) bufferPool.markLivenessSafe(buf);
+}
+
 import {
   dispatchPackedOptimizer,
   type PackedOptimizerItem,
@@ -1346,15 +1352,13 @@ export async function executeLoweredPlan(
             if (livenessReleased!.has(nodeId)) continue;
             const storage = livenessNodeToStorage!.get(nodeId);
             if (storage && canSafelyRelease(storage, livenessNodeToStorage!)) {
+              markLivenessSafe(storage);
               releaseBufferImmediate(storage);
               livenessNodeToStorage!.delete(nodeId);
               const idx = livenessNodeIdToIndex!.get(nodeId);
               if (idx !== undefined) planNodes[idx].result = undefined;
               livenessReleased!.add(nodeId);
             } else if (storage) {
-              // Node is liveness-dead but canSafelyRelease rejected (view base
-              // with rc > 0). Defer for retry — once the view is released and
-              // rc drops to 0, the base can be freed.
               livenessDeferred!.add(nodeId);
             }
           }
@@ -1369,6 +1373,7 @@ export async function executeLoweredPlan(
             }
             const storage = livenessNodeToStorage!.get(nodeId);
             if (storage && canSafelyRelease(storage, livenessNodeToStorage!)) {
+              markLivenessSafe(storage);
               releaseBufferImmediate(storage);
               livenessNodeToStorage!.delete(nodeId);
               const idx = livenessNodeIdToIndex!.get(nodeId);

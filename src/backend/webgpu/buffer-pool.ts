@@ -75,6 +75,13 @@ class SimpleBufferPool {
   // the buffer is eligible for pool promotion or reuse from pendingRelease.
   private bufferLiveCount = new Map<GPUBuffer, number>();
 
+  // Buffers released by liveness-based early release within a plan. These are
+  // provably safe to reuse during the shared encoder — liveness guarantees no
+  // future action in the plan reads them. Within a single WebGPU queue,
+  // dispatches execute sequentially, so the releasing dispatch has completed
+  // by the time the acquiring dispatch runs.
+  private livenessSafeBuffers = new Set<GPUBuffer>();
+
   // Stats for understanding buffer reuse patterns
   private acquireFromPool = 0;
   private acquireFromPending = 0;
@@ -131,6 +138,11 @@ class SimpleBufferPool {
   /** Check if a buffer is still referenced by any owning tensor. */
   isLive(buffer: GPUBuffer): boolean {
     return this.bufferLiveCount.has(buffer);
+  }
+
+  /** Mark a buffer as liveness-safe for immediate reuse during shared encoder. */
+  markLivenessSafe(buffer: GPUBuffer): void {
+    this.livenessSafeBuffers.add(buffer);
   }
 
   /**
@@ -220,15 +232,16 @@ class SimpleBufferPool {
     // collected command buffers that haven't been submitted yet.
     // Also skip when a deferred fence is outstanding — those pending buffers
     // are from a previous step and the GPU may still be using them.
-    // Also skip during shared encoder scope — pending buffers may have been
-    // written by earlier passes and their command buffers not yet submitted.
-    if (
-      !activeBatch &&
-      !fenceState.pendingFencePromise &&
-      !sharedEncoderActive
-    ) {
+    //
+    // During shared encoder: only allow liveness-safe buffers (released by
+    // the liveness analysis within the current plan — provably dead).
+    if (!activeBatch && !fenceState.pendingFencePromise) {
+      const livenessOnly = sharedEncoderActive;
       const pendingIdx = this.pendingRelease.findIndex(
-        (p) => p.sizeClass === sizeClass && !this.bufferLiveCount.has(p.buffer),
+        (p) =>
+          p.sizeClass === sizeClass &&
+          !this.bufferLiveCount.has(p.buffer) &&
+          (!livenessOnly || this.livenessSafeBuffers.has(p.buffer)),
       );
       if (pendingIdx !== -1) {
         const { buffer, size } = this.pendingRelease.splice(pendingIdx, 1)[0];
@@ -237,11 +250,12 @@ class SimpleBufferPool {
         this.acquireFromPending++;
         this.recordWindowDemand(sizeClass, "acquires");
         this.pooledBufferSet.add(buffer);
+        this.livenessSafeBuffers.delete(buffer);
         // Re-track allocation (was deallocated when added to pending)
         gpuMemoryTracker.trackAllocation(buffer, size);
         if (this.debugTrace) {
           console.log(
-            `[pool] acquire from PENDING: ${(size / 1e6).toFixed(2)} MB (${this.pendingRelease.length} remaining)`,
+            `[pool] acquire from PENDING${livenessOnly ? " (liveness-safe)" : ""}: ${(size / 1e6).toFixed(2)} MB (${this.pendingRelease.length} remaining)`,
           );
         }
         return buffer;
@@ -474,6 +488,7 @@ class SimpleBufferPool {
         remainingBytes += entry.size;
         continue;
       }
+      this.livenessSafeBuffers.delete(entry.buffer);
       this.getBucket(entry.sizeClass).push(entry.buffer);
       this.pooledBytes += entry.size;
       // Record at promotion time (not release time) so the reservation formula
@@ -631,6 +646,7 @@ class SimpleBufferPool {
     this.pendingReleaseBytes = 0;
     this.pendingDestroy = [];
     this.bufferLiveCount.clear();
+    this.livenessSafeBuffers.clear();
   }
 
   /**
