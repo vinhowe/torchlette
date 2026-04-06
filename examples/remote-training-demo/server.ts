@@ -370,7 +370,11 @@ async function main(): Promise<void> {
   console.log(`[server] backend: ${backendName}`);
 
   const server = createServer(handleHttp);
-  const wss = new WebSocketServer({ server, path: "/ws" });
+  const wss = new WebSocketServer({
+    server,
+    path: "/ws",
+    perMessageDeflate: true, // Compress JSON plan payloads (~60-80% smaller)
+  });
   wss.on("connection", (ws) => attachWebSocketHandlers(ws));
 
   server.listen(port, () => {

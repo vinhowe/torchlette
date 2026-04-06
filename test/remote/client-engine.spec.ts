@@ -235,6 +235,49 @@ describe("RemoteEngine (in-process Transport)", () => {
     expect(engine.handles.size()).toBeLessThanOrEqual(4);
   });
 
+  it("preUpload sends tensorFromArray data via binary upload, not plan JSON", async () => {
+    const transport = new InProcessTransport();
+    const engine = createRemoteEngine(transport);
+    const { torch, preUpload } = engine;
+
+    // Create a large-ish tensor inline.
+    const bigValues = Array.from({ length: 1024 }, (_, i) => i * 0.001);
+    const W = torch.tensorFromArray(bigValues, [32, 32]).requires_grad_(true);
+
+    // Pre-upload it.
+    const count = await preUpload([W]);
+    expect(count).toBe(1);
+    // W should now be materialized.
+    expect(engine.handles.size()).toBe(1);
+
+    // Use W in a computation — it should be referenced as a materialized
+    // handle, NOT re-sent as inline data in the plan.
+    const x = torch.tensorFromArray(
+      Array.from({ length: 32 }, () => 1),
+      [1, 32],
+    );
+    const y = torch.matmul(x, W);
+    const result = await y.cpu();
+
+    // Verify correctness: row 0 of W is [0, 0.001, 0.002, ..., 0.031]
+    // x = [1,1,...,1], so y[0,j] = sum(W[:,j]) = sum of column j
+    expect(result.length).toBe(32);
+    expect(result[0]).toBeCloseTo(
+      bigValues.filter((_, i) => i % 32 === 0).reduce((a, b) => a + b, 0),
+      4,
+    );
+  });
+
+  it("preUpload skips already-materialized tensors", async () => {
+    const transport = new InProcessTransport();
+    const { torch, preUpload } = createRemoteEngine(transport);
+
+    const a = torch.tensorFromArray([1, 2, 3], [3]);
+    await a.cpu(); // forces → now materialized
+    const count = await preUpload([a]);
+    expect(count).toBe(0); // skipped, already materialized
+  });
+
   it("transport.release() keeps client and server registries in sync", async () => {
     const transport = new InProcessTransport();
     const { torch, handles, markStep } = createRemoteEngine(transport);

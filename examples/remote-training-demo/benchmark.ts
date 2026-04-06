@@ -227,6 +227,10 @@ async function benchRemote(
     const batchSize = 4;
     const lr = 0.01;
 
+    // Pre-upload model weights via binary (eliminates cold-start JSON spike).
+    const uploaded = await engine.preUpload(params);
+    console.log(`  [remote] pre-uploaded ${uploaded} param tensors`);
+
     // Warmup
     for (let i = 0; i < warmup; i++) {
       await trainStep(api, model, ds, params, batchSize, lr, rng);
@@ -293,11 +297,20 @@ function report(
 
   const stats = remoteStats as Record<string, number>;
   if (stats) {
+    const totalSteps = localMs.length;
     console.log(
       `  Remote stats: executes=${stats.executes} nodes=${stats.nodesShipped} ` +
         `reads=${stats.scalarReads} released=${stats.handlesReleased} ` +
         `up=${((stats.bytesUp || 0) / 1024).toFixed(0)}KB`,
     );
+    if (stats.serializeMs !== undefined) {
+      console.log(
+        `  Per-step phase breakdown (total / ${totalSteps} steps):` +
+          `  serialize=${(stats.serializeMs / totalSteps).toFixed(1)}ms` +
+          `  transport=${(stats.transportMs / totalSteps).toFixed(1)}ms` +
+          `  bookkeep=${(stats.bookkeepingMs / totalSteps).toFixed(1)}ms`,
+      );
+    }
   }
 
   console.log(`  Per-step detail:`);
