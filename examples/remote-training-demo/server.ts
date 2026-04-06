@@ -17,6 +17,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { cpuBackend } from "../../src/backend/cpu/index.js";
 import { registerBackend } from "../../src/backend/registry.js";
 import type { Backend, DType } from "../../src/backend/types.js";
+import { executePlanOptimized } from "../../src/executor/executor.js";
 import { executePlanSequential } from "../../src/executor/sequential.js";
 import { createStorageHandle } from "../../src/graph/node-factory.js";
 import type { StorageHandle } from "../../src/graph/types.js";
@@ -93,7 +94,14 @@ class Session {
   release(handles: HandleRef[]): number {
     let n = 0;
     for (const h of handles) {
-      if (this.handles.delete(h)) n++;
+      const storage = this.handles.get(h);
+      if (storage) {
+        this.handles.delete(h);
+        // Destroy the GPU buffer to reclaim VRAM. Without this, every
+        // released handle leaks its buffer and the GPU fills up.
+        storage.backendTensor.destroy?.();
+        n++;
+      }
     }
     return n;
   }
@@ -122,6 +130,10 @@ async function executeHandler(
   for (const node of plan.nodes) {
     node.device = serverDevice;
   }
+  // NOTE: executePlanOptimized (fusion) has significant per-plan CPU overhead
+  // (graph analysis, codegen, cache lookups) that exceeds dispatch savings for
+  // short runs. Stick with sequential for now; fusion becomes worthwhile once
+  // the server caches compiled pipelines across sessions or plans get larger.
   await executePlanSequential(plan, backend);
 
   const outputs: Record<NodeIdx, HandleRef> = {};

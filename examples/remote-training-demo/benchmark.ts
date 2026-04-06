@@ -135,7 +135,7 @@ async function benchLocal(
   const ok = await initWebGPU();
   if (!ok) throw new Error("WebGPU init failed");
 
-  const api = new Torchlette("webgpu");
+  const api = new Torchlette("webgpu", { enableFusion: true });
   const ds = buildCharDataset(TRAIN_TEXT);
   cfg = { ...cfg, vocabSize: ds.vocabSize, device: "webgpu" };
   const model = createModel(api, cfg, 42);
