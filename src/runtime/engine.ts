@@ -35,11 +35,27 @@ import {
 } from "../executor/executor";
 import { isDataSourceOp } from "../executor/lowered-plan";
 import { buildMergedPlan } from "../executor/plan-builder";
+import { rewritePlan } from "../compiler/rewriter/plan-rewrite";
+import { doubleTransposeRule } from "../compiler/rewriter/rules/double-transpose";
+import { fuseMatmulSumRule } from "../compiler/rewriter/rules/fuse-matmul-sum";
+import { transitiveReshapeRule } from "../compiler/rewriter/rules/transitive-reshape";
+import { auditPlan } from "../compiler/scheduler/audit";
+import { getPendingNodeIds } from "./tensor";
+
+const DSL_RULES = [
+  fuseMatmulSumRule,
+  doubleTransposeRule,
+  transitiveReshapeRule,
+];
 import {
   executePlanSegmented,
   executePlanSequential,
 } from "../executor/sequential";
-import { createLazyIRNode } from "../graph/node-factory";
+import {
+  createLazyIRNode,
+  releaseNodeInputRefs,
+  retainPlanInputRefs,
+} from "../graph/node-factory";
 import { storageTracker } from "../graph/storage-tracker";
 import {
   createMaterializedRef,
@@ -656,6 +672,18 @@ export class RuntimeEngine {
     const plan = buildMergedPlan(pendingRoots);
     if (plan.nodes.length === 0) return;
 
+    // Apply DSL rewrites (node-insertion rules) before the template cache
+    // sees the plan. Runs every step but is cheap (few patterns, <1ms).
+    const pendingIds = getPendingNodeIds();
+    rewritePlan(plan, DSL_RULES, pendingIds);
+
+    // Scheduler audit (no-op unless TORCHLETTE_SCHEDULER_AUDIT=1).
+    auditPlan(plan, pendingIds);
+
+    // Retain rc on all materialized inputs used by the plan. Keeps storages
+    // alive through execution even if owning tensors are disposed mid-step.
+    retainPlanInputRefs(plan.nodes);
+
     const device = resolveDeviceFromTensors(tensors);
 
     // Data-source-only plans skip the template/arena/lowered-plan path.
@@ -716,7 +744,11 @@ export class RuntimeEngine {
     clearDisposedPendingNodeIds();
 
     // Materialize any remaining tensors whose nodes were already executed
-    materializeRemaining(tensors);
+    const skippedNodes = materializeRemaining(tensors);
+
+    // Release the plan-input retains now that execution is done
+    for (const node of plan.nodes) releaseNodeInputRefs(node);
+    for (const node of skippedNodes) releaseNodeInputRefs(node);
   }
 
   /**
@@ -743,6 +775,15 @@ export class RuntimeEngine {
 
     const plan = buildMergedPlan(pendingRoots, /* skipExecuted */ true);
     if (plan.nodes.length === 0) return;
+
+    // Apply DSL rewrites before template cache
+    const pendingIds = getPendingNodeIds();
+    rewritePlan(plan, DSL_RULES, pendingIds);
+
+    // Scheduler audit (no-op unless TORCHLETTE_SCHEDULER_AUDIT=1).
+    auditPlan(plan, pendingIds);
+
+    retainPlanInputRefs(plan.nodes);
 
     // NOTE: Do NOT call storageTracker.destroyUnreachable() here.
     // Disposed tensors (e.g., old Adam m/v states) may have buffers that
@@ -797,16 +838,19 @@ export class RuntimeEngine {
     // fusedAttention) store side outputs in node.results that are consumed by
     // materializePendingTensors when RuntimeTensors reference outputIndex > 0.
     for (const node of plan.nodes) {
+      // Release rc on materialized inputs — the node has executed and
+      // no longer needs its inputs alive.
+      releaseNodeInputRefs(node);
       node.result = undefined;
     }
     for (const node of skippedNodes) {
+      releaseNodeInputRefs(node); // idempotent
       node.result = undefined;
     }
 
-    // Destroy orphaned intermediates created during this plan execution,
-    // PLUS any storages from prior steps that were marked unreachable
-    // (e.g., old Adam m/v states). This is safe now because the plan
-    // has finished executing — no pending nodes reference these buffers.
+    // Destroy orphaned intermediates (rc <= 0). Safe here because plan execution
+    // is complete and no pending nodes reference these buffers. Uses the full
+    // destroyUnreachable which also scans WeakRefs for GC'd tensors.
     storageTracker.destroyUnreachable();
   }
 

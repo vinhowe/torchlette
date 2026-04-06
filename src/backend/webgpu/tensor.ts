@@ -4,6 +4,7 @@
 
 import { getSizeClass, getSizeForClass } from "../../graph/lifetime-analysis";
 import type { DType } from "../types";
+import { bufAcquire, bufRelease, bufRegister } from "./buffer-debug";
 import { bufferPool } from "./buffer-pool";
 import type { GPUBuffer, GPUDevice, GPUQueue, WebGPUTensor } from "./gpu-types";
 import { GPUBufferUsage, STORAGE_BUFFER_USAGE } from "./gpu-types";
@@ -70,6 +71,7 @@ export function createTensor(
       destroyed = true;
       // Only release/destroy if we own the buffer (not a view)
       if (ownsBuffer) {
+        bufRelease(buffer, "tensor.destroy");
         // Release our owning reference before pool/destroy
         bufferPool.decRef(buffer);
 
@@ -118,11 +120,13 @@ export function createTrackedBuffer(
     if (preferredBuffer) {
       const pooled = bufferPool.acquirePreferred(alignedSize, preferredBuffer);
       if (pooled) {
+        bufAcquire(pooled, "createTrackedBuffer.preferred");
         return pooled;
       }
     }
     const pooled = bufferPool.acquire(alignedSize);
     if (pooled) {
+      bufAcquire(pooled, "createTrackedBuffer.acquire");
       return pooled;
     }
   }
@@ -191,6 +195,7 @@ export function createTrackedBuffer(
     if (!skipTracking) {
       bufferPool.trackNewAllocation(actualSize);
     }
+    bufRegister(buffer, actualSize, "createTrackedBuffer");
     return buffer;
   } catch (e) {
     // If buffer creation fails, undo the tracking

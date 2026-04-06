@@ -32,7 +32,6 @@ import {
   gpuBuffer,
 } from "../backend/webgpu/gpu-types";
 import type { EpilogueConfig } from "../backend/webgpu/matmul/types";
-import { getSharedEncoderInstance } from "../backend/webgpu/shared-encoder";
 import { createTensor } from "../backend/webgpu/tensor";
 import type { FusionGroup } from "../compiler/fusion-detect";
 import {
@@ -74,6 +73,12 @@ import type {
   LazyRef,
   StorageHandle,
 } from "../graph/types";
+/** Mark a storage's GPU buffer as liveness-safe for immediate pool reuse. */
+function markLivenessSafe(storage: StorageHandle): void {
+  const buf = (storage.backendTensor as { buffer?: GPUBuffer }).buffer;
+  if (buf) bufferPool.markLivenessSafe(buf);
+}
+
 import {
   dispatchPackedOptimizer,
   type PackedOptimizerItem,
@@ -346,18 +351,16 @@ async function executeAdamBatchInner(
 
   if (packedItems.length === 0) return;
 
-  // Packed dispatch: scatter→dispatch→gather for groups of ≥2 same-size params
-  // With the m/v buffer split, dispatchAdamStep writes m/v to fresh output
-  // buffers. Inside the dispatch callback, we copy the fresh m_out/v_out back
-  // to the packed m_in/v_in buffers (packed[2]/packed[3]) so that the normal
-  // gather path can scatter them back to individual m/v buffers.
+  // Packed dispatch: scatter→dispatch→gather for groups of ≥2 same-size params.
+  // The Adam kernel writes param/m/v in-place on the packed buffers, so no
+  // intermediate copy is needed — gather reads directly from packed[1..3].
   const config = nodes[0].payload as AdamStepConfig;
   const infFlagBuffer = (config.infFlagBuffer as GPUBuffer | null) ?? null;
   const handled = dispatchPackedOptimizer({
     items: packedItems,
     gatherIndices: [1, 2, 3], // gather param, m, v (not grad)
     dispatch(packed, totalElements) {
-      const result = dispatchAdamStep(
+      dispatchAdamStep(
         packed[0],
         packed[1],
         packed[2],
@@ -367,19 +370,6 @@ async function executeAdamBatchInner(
         false,
         infFlagBuffer,
       );
-      // The kernel wrote new m/v to fresh packed buffers (result.mBuffer,
-      // result.vBuffer). Copy them back to packed[2]/packed[3] so the gather
-      // phase can scatter the updated values to individual per-param buffers.
-      const enc = getSharedEncoderInstance();
-      if (enc) {
-        const mBytes = totalElements * 4;
-        enc.copyBufferToBuffer(result.mBuffer, 0, packed[2], 0, mBytes);
-        enc.copyBufferToBuffer(result.vBuffer, 0, packed[3], 0, mBytes);
-      }
-      // The temporary m_out/v_out packed buffers are no longer needed after
-      // the copy. Use deferred destroy so the GPU can finish reading them.
-      bufferPool.deferredDestroy(result.mBuffer, result.mBuffer.size);
-      bufferPool.deferredDestroy(result.vBuffer, result.vBuffer.size);
     },
     label: "packedAdam",
   });
@@ -867,6 +857,7 @@ export async function executeLoweredPlan(
   const enableLivenessRelease = process.env.TORCHLETTE_LIVENESS_RELEASE !== "0";
   let livenessOutputIds: Set<number> | null = null;
   let livenessReleased: Set<number> | null = null;
+  let livenessDeferred: Set<number> | null = null;
   let livenessNodeToStorage: Map<number, StorageHandle> | null = null;
   let livenessNodeIdToIndex: Map<number, number> | null = null;
   // nodeId → last action index that reads from this node
@@ -928,6 +919,7 @@ export async function executeLoweredPlan(
     }
 
     livenessReleased = new Set();
+    livenessDeferred = new Set();
     livenessNodeToStorage = new Map();
   }
 
@@ -1360,11 +1352,34 @@ export async function executeLoweredPlan(
             if (livenessReleased!.has(nodeId)) continue;
             const storage = livenessNodeToStorage!.get(nodeId);
             if (storage && canSafelyRelease(storage, livenessNodeToStorage!)) {
+              markLivenessSafe(storage);
               releaseBufferImmediate(storage);
               livenessNodeToStorage!.delete(nodeId);
               const idx = livenessNodeIdToIndex!.get(nodeId);
               if (idx !== undefined) planNodes[idx].result = undefined;
               livenessReleased!.add(nodeId);
+            } else if (storage) {
+              livenessDeferred!.add(nodeId);
+            }
+          }
+        }
+
+        // Retry deferred nodes whose rc may have dropped since last attempt.
+        if (livenessDeferred!.size > 0) {
+          for (const nodeId of livenessDeferred!) {
+            if (livenessReleased!.has(nodeId)) {
+              livenessDeferred!.delete(nodeId);
+              continue;
+            }
+            const storage = livenessNodeToStorage!.get(nodeId);
+            if (storage && canSafelyRelease(storage, livenessNodeToStorage!)) {
+              markLivenessSafe(storage);
+              releaseBufferImmediate(storage);
+              livenessNodeToStorage!.delete(nodeId);
+              const idx = livenessNodeIdToIndex!.get(nodeId);
+              if (idx !== undefined) planNodes[idx].result = undefined;
+              livenessReleased!.add(nodeId);
+              livenessDeferred!.delete(nodeId);
             }
           }
         }

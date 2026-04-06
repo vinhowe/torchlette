@@ -22,6 +22,7 @@ import {
   resetArenaState,
 } from "./buffer-arena";
 import { bufferPool } from "./buffer-pool";
+import { bufLogBindings } from "./buffer-debug";
 import type {
   GPUBindGroup,
   GPUBuffer,
@@ -280,6 +281,9 @@ export function cachedCreateBindGroup(
 ): GPUBindGroup {
   const idx = cacheState.dispatchIndex++;
   const entry = cacheState.sequenceEntries[idx];
+
+  // Log dispatch bindings for debug tool (no-op when disabled)
+  bufLogBindings(getCurrentOpLabel() ?? "unknown", buffers);
 
   if (
     entry != null &&

@@ -1,5 +1,6 @@
 import type { BackendTensor, DeviceKind, DType, Shape } from "../backend/types";
 import { storageTracker } from "../graph/storage-tracker";
+import { rcGet, rcRelease, rcRetain } from "../graph/refcount";
 import type { LazyRef, StorageHandle } from "../graph/types";
 import { isMaterialized } from "../graph/types";
 
@@ -15,9 +16,10 @@ const tensorFinalizationRegistry = new FinalizationRegistry<{
   storageId: number;
   pendingNodeId: number | null;
 }>((held) => {
-  // Mark storage as unreachable when tensor is GC'd
-  if (held.storageId >= 0) {
-    storageTracker.markUnreachable(held.storageId);
+  // Release tensor's claim when GC'd (safety net for undisposed tensors).
+  // Guard: the WeakRef scan in destroyUnreachable() may have already released.
+  if (held.storageId >= 0 && rcGet(held.storageId) > 0) {
+    rcRelease(held.storageId, "gc.fr");
   }
   // Note: pending tensor unregistration is handled in dispose()
   // By the time finalization runs, the tensor is already gone from pending registry
@@ -230,8 +232,8 @@ export class Tensor {
       this._pendingNodeId = lazyRef.node.id;
       registerPendingTensor(lazyRef.node.id, this);
     } else if (lazyRef.kind === "materialized") {
-      // Already materialized - mark storage as externally reachable
-      storageTracker.markReachable(lazyRef.storage.id, this);
+      rcRetain(lazyRef.storage.id, "tensor.ctor");
+      storageTracker.trackTensor(lazyRef.storage.id, this);
     }
   }
 
@@ -276,9 +278,8 @@ export class Tensor {
     this._lazyRef = { kind: "materialized", storage };
     // Update held value so FinalizationRegistry knows which storage to clean up
     this._held.storageId = storage.id;
-    // Mark storage as externally reachable (linked to user-visible Tensor)
-    // Pass `this` so StorageTracker can track via WeakRef and detect GC'd tensors
-    storageTracker.markReachable(storage.id, this);
+    rcRetain(storage.id, "tensor.materialize");
+    storageTracker.trackTensor(storage.id, this);
     tensorMaterializedCount++;
   }
 
@@ -293,7 +294,7 @@ export class Tensor {
     // referenced by this tensor, so it must be marked unreachable to avoid
     // permanently orphaning it in externallyReachable.
     if (isMaterialized(this._lazyRef)) {
-      storageTracker.markUnreachable(this._lazyRef.storage.id);
+      rcRelease(this._lazyRef.storage.id, "tensor.updateRef");
       this._held.storageId = -1;
     }
 
@@ -378,7 +379,7 @@ export class Tensor {
       // Mark as unreachable - will be destroyed at next markStep() after GPU fence
       // Per §1.4: "Any reclamation of underlying buffers must respect allocator
       // fencing and in-flight plan retention (§14)"
-      storageTracker.markUnreachable(storage.id);
+      rcRelease(storage.id, "tensor.dispose");
       // Note: Do NOT destroy immediately - lazy execution means GPU work may
       // not have been submitted yet. Destruction is deferred to markStep().
     }

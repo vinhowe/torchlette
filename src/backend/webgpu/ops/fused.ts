@@ -120,28 +120,36 @@ export async function adamStep(
     trackSharedEncoderWrite(gradT.buffer);
 
     // WebGPU forbids binding the same buffer as read_write at multiple
-    // binding points. param is read_write, so de-alias it from read-only
-    // inputs (grad, m, v) if pool recycling caused buffer sharing.
-    // m_in/v_in are read-only, so they can safely alias each other or grad.
-    // m_out/v_out are fresh allocations and cannot alias.
+    // binding points and forbids read_write ↔ read aliasing. All three of
+    // param/m/v are read_write, grad is read — so each pair must have a
+    // distinct buffer. Pool recycling can cause collisions.
     let paramBuf = paramT.buffer;
-    const mBuf = mT.buffer;
-    const vBuf = vT.buffer;
+    let mBuf = mT.buffer;
+    let vBuf = vT.buffer;
     const gradBuf = gradT.buffer;
     const bufSize = gradT.size * dtypeBytes(gradT.dtype);
-    if (paramBuf === gradBuf || paramBuf === mBuf || paramBuf === vBuf) {
+    const copyTo = (src: GPUBuffer): GPUBuffer => {
       const dst = allocateOutputBuffer(bufSize);
       const enc = getSharedEncoderInstance();
       if (enc) {
-        enc.copyBufferToBuffer(paramBuf, 0, dst, 0, bufSize);
+        enc.copyBufferToBuffer(src, 0, dst, 0, bufSize);
       } else {
         const ctx2 = requireContext();
         const tmpEnc = ctx2.device.createCommandEncoder();
-        tmpEnc.copyBufferToBuffer(paramBuf, 0, dst, 0, bufSize);
+        tmpEnc.copyBufferToBuffer(src, 0, dst, 0, bufSize);
         ctx2.queue.submit([tmpEnc.finish()]);
       }
-      paramBuf = dst;
       flushSharedEncoder();
+      return dst;
+    };
+    if (paramBuf === gradBuf || paramBuf === mBuf || paramBuf === vBuf) {
+      paramBuf = copyTo(paramBuf);
+    }
+    if (mBuf === gradBuf || mBuf === vBuf) {
+      mBuf = copyTo(mBuf);
+    }
+    if (vBuf === gradBuf) {
+      vBuf = copyTo(vBuf);
     }
 
     const emitF16 = config.emitF16 ?? false;
@@ -174,11 +182,15 @@ export async function adamStep(
       f16WeightCache.set(result.paramBuffer, result.paramF16Buffer);
     }
 
-    // param is updated in-place — transfer ownership from old tensor to result.
-    // m/v are fresh output buffers — no ownership transfer needed.
+    // param/m/v are all updated in-place — transfer ownership from the old
+    // BackendTensors to the results (noop their destroy, decRef their buffers).
     _st = profileSubOpBegin();
     if (paramT.ownsBuffer) bufferPool.decRef(paramT.buffer);
     paramT.destroy = () => {};
+    if (mT.ownsBuffer) bufferPool.decRef(mT.buffer);
+    mT.destroy = () => {};
+    if (vT.ownsBuffer) bufferPool.decRef(vT.buffer);
+    vT.destroy = () => {};
     const ret = {
       param: createTensor(
         paramT.shape,

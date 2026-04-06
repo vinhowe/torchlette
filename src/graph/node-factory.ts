@@ -1,5 +1,6 @@
 import type { BackendTensor, DeviceKind, DType } from "../backend/types";
 import { getProfileModule } from "./profiler";
+import { rcRelease, rcRetain } from "./refcount";
 import { storageTracker } from "./storage-tracker";
 import type { LazyIRNode, LazyOpCode, LazyRef, StorageHandle } from "./types";
 
@@ -34,6 +35,34 @@ export function createLazyIRNode(
   const mod = getProfileModule();
   if (mod !== "unknown") node.module = mod;
   return node;
+}
+
+/**
+ * Retain rc on all materialized inputs of the nodes in a plan.
+ * Keeps those storages alive through plan execution, even if their owning
+ * tensors are disposed mid-step. Pair with releasePlanInputRefs.
+ */
+export function retainPlanInputRefs(nodes: readonly LazyIRNode[]): void {
+  for (const node of nodes) {
+    if (node._inputsRetained) continue;
+    node._inputsRetained = true;
+    for (const input of node.inputs) {
+      if (input.kind === "materialized") {
+        rcRetain(input.storage.id, "plan.input");
+      }
+    }
+  }
+}
+
+/** Release retained refs on a node's materialized inputs (idempotent). */
+export function releaseNodeInputRefs(node: LazyIRNode): void {
+  if (!node._inputsRetained) return;
+  node._inputsRetained = false;
+  for (const input of node.inputs) {
+    if (input.kind === "materialized") {
+      rcRelease(input.storage.id, "plan.inputConsumed");
+    }
+  }
 }
 
 let nextStorageId = 1;
@@ -77,6 +106,9 @@ export function createStorageHandle(
   };
   // Register in the global tracker
   storageTracker.register(storage);
+  // Note: NO rcRetain here. rc starts at 0 (no owner yet).
+  // Ownership is claimed by tensor._materialize/constructor (retain)
+  // and by view.baseStorageId (retain on base).
   return storage;
 }
 
@@ -122,6 +154,7 @@ export function wrapResultAsStorage(
     }
     if (baseIdx >= 0) {
       storage.baseStorageId = inputStorages[baseIdx].id;
+      rcRetain(inputStorages[baseIdx].id, "view.baseStorageId");
     }
   }
   return storage;
