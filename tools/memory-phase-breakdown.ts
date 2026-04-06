@@ -11,6 +11,7 @@ import * as path from "node:path";
 import { loadPretrainedGPT2 } from "../examples/gpt2/loader";
 import {
   destroyWebGPU,
+  getBufferPoolStats,
   getGPUMemoryStats,
   initWebGPU,
   isF16Supported,
@@ -25,9 +26,15 @@ const NUM_STEPS = parseInt(process.env.NUM_STEPS ?? "3", 10);
 
 function mark(label: string): void {
   const s = getGPUMemoryStats();
+  const pool = getBufferPoolStats();
   const cur = (s.currentBytes / 1024 / 1024).toFixed(0).padStart(5);
   const peak = (s.peakBytes / 1024 / 1024).toFixed(0).padStart(5);
-  console.error(`  ${label.padEnd(28)} cur=${cur}MB  peak_since_reset=${peak}MB`);
+  // Physical = tracked + pending + pooled (all consume actual GPU memory)
+  const physical = s.currentBytes + pool.pooledBytes;
+  const phys = (physical / 1024 / 1024).toFixed(0).padStart(5);
+  console.error(
+    `  ${label.padEnd(28)} cur=${cur}MB  peak=${peak}MB  phys=${phys}MB`,
+  );
   resetGPUMemoryPeak();
 }
 
