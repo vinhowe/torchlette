@@ -220,12 +220,34 @@ export class TidyDispatchMode implements DispatchMode {
   }
 }
 
+/**
+ * Hook that replaces the local plan executor. Receives a built plan and must
+ * set `node.result` (a StorageHandle) on each executed node before returning.
+ * The engine's post-execution bookkeeping (materialize, cleanup, lifecycle)
+ * runs normally after the hook returns.
+ */
+export type ExecutionHook = (
+  plan: ExecutionPlan,
+  backend: Backend,
+) => Promise<void>;
+
+/**
+ * Hook that replaces backend.ops.read() for tensor readback. Called by cpu()
+ * and item() after force(). The BackendTensor may be a remote stub — the
+ * hook is responsible for fetching the data (e.g., via an RPC).
+ */
+export type ReadHook = (backendTensor: BackendTensor) => Promise<number[]>;
+
 export interface RuntimeEngineOptions {
   enableFusion?: boolean;
   enableVectorization?: boolean;
   enableEarlyRelease?: boolean;
   enableCheckpointSegmentation?: boolean;
   enableTrueSegmentation?: boolean;
+  /** Replace local plan execution with a custom hook (e.g., remote execution). */
+  executionHook?: ExecutionHook;
+  /** Replace local tensor readback with a custom hook (e.g., remote download). */
+  readHook?: ReadHook;
 }
 
 /** Internal dispatch mode used by startIntermediateTracking/stopIntermediateTracking. */
@@ -350,6 +372,8 @@ export class RuntimeEngine {
   private _rngCounter = 0;
   private trueSegmentationEnabled = false;
   private _webgpuFlushBufferPool: (() => void) | null = null;
+  private _executionHook: ExecutionHook | null = null;
+  private _readHook: ReadHook | null = null;
 
   /** Cache plan fingerprints by cheap structural key to avoid O(N) hashing. */
 
@@ -411,6 +435,12 @@ export class RuntimeEngine {
     }
     if (options?.enableTrueSegmentation !== undefined) {
       this.trueSegmentationEnabled = options.enableTrueSegmentation;
+    }
+    if (options?.executionHook) {
+      this._executionHook = options.executionHook;
+    }
+    if (options?.readHook) {
+      this._readHook = options.readHook;
     }
   }
 
@@ -696,9 +726,10 @@ export class RuntimeEngine {
       (n) => n.isCheckpointBoundary,
     );
 
-    // Use fusion when enabled and on WebGPU, regardless of segmentation settings.
-    // executePlanOptimized supports enableEarlyRelease for memory management.
-    if (this.fusionEnabled && !allDataSource) {
+    // Execution hook: replace local execution with a custom path (e.g., remote).
+    if (this._executionHook) {
+      await this._executionHook(plan, backend);
+    } else if (this.fusionEnabled && !allDataSource) {
       const optimizedResult = await executePlanOptimized(plan, backend, {
         enableFusion: true,
         enableVectorization: this.vectorizationEnabled,
@@ -806,8 +837,10 @@ export class RuntimeEngine {
 
     const backend = this.getBackend(device);
 
-    // Use optimized execution with fusion when enabled
-    if (this.fusionEnabled) {
+    // Execution hook: replace local execution with a custom path (e.g., remote).
+    if (this._executionHook) {
+      await this._executionHook(plan, backend);
+    } else if (this.fusionEnabled) {
       const optimizedResult = await executePlanOptimized(plan, backend, {
         enableFusion: true,
         enableVectorization: this.vectorizationEnabled,
@@ -1364,6 +1397,7 @@ export class RuntimeEngine {
 
   async cpu(a: Tensor): Promise<number[]> {
     await this.force(a);
+    if (this._readHook) return this._readHook(a.backendTensor);
     const backend = this.getBackend(a.device);
     return backend.ops.read(a.backendTensor);
   }
@@ -1384,6 +1418,11 @@ export class RuntimeEngine {
    */
   async startItemReadback(a: Tensor): Promise<() => Promise<number>> {
     await this.force(a);
+    if (this._readHook) {
+      const hook = this._readHook;
+      const bt = a.backendTensor;
+      return async () => (await hook(bt))[0];
+    }
     const backend = this.getBackend(a.device);
     if (backend.ops.startScalarReadback) {
       return backend.ops.startScalarReadback(a.backendTensor);

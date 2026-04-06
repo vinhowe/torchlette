@@ -111,4 +111,8 @@ export type TorchletteOptions = {
    *  stability). Saves significant memory for large-batch pretraining at
    *  the cost of bind group cache misses. Default: false */
   disableArena?: boolean;
+  /** Replace local plan execution with a custom hook (e.g., remote execution). */
+  executionHook?: import("../runtime/engine").ExecutionHook;
+  /** Replace local tensor readback with a custom hook (e.g., remote download). */
+  readHook?: import("../runtime/engine").ReadHook;
 };
