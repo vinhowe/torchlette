@@ -134,13 +134,12 @@ export class Torchlette {
     }
     this.runtime = new RuntimeEngine(backendName, {
       enableFusion: options?.enableFusion ?? false,
-      // Early release can be enabled globally for memory savings
       enableEarlyRelease: options?.enableEarlyRelease ?? false,
-      // Checkpoint segmentation for large model memory savings
       enableCheckpointSegmentation:
         options?.enableCheckpointSegmentation ?? false,
-      // True segmentation with GPU sync for actual memory savings
       enableTrueSegmentation: options?.enableTrueSegmentation ?? false,
+      executionHook: options?.executionHook,
+      readHook: options?.readHook,
     });
     this.autocastContext = createAutocastContext();
   }
