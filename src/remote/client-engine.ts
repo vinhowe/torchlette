@@ -27,7 +27,6 @@ import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import {
   clearDisposedPendingNodeIds,
   getAllPendingTensors,
-  getPendingNodeIds,
   materializePendingTensors,
 } from "../runtime/tensor";
 import type {
@@ -156,14 +155,11 @@ export interface RemoteEngine {
   /** Cumulative stats across the session. */
   stats: RemoteEngineStats;
   /**
-   * Release server-side handles for storages no longer referenced by any
-   * live tensor. Call at end of each training step to prevent unbounded
-   * server memory growth. Returns the number of handles released.
-   *
-   * Automatically determines what to keep via reference counting — no
-   * need to enumerate parameters, optimizer state, or model buffers.
+   * Release server-side handles not in the `keep` set. Call at end of
+   * each training step. Pass all tensors that persist across steps:
+   * `[...optimizer.getAllKeepTensors(), ...model.persistentTensors()]`.
    */
-  markStep(): Promise<number>;
+  markStep(keep: FrontendTensor[]): Promise<number>;
   /**
    * Pre-upload pending `tensorFromArray` tensors via binary transport,
    * bypassing JSON plan serialization. Call once before the first training
@@ -221,18 +217,9 @@ export function createRemoteEngine(
   async function shipPlan(plan: { nodes: LazyIRNode[] }): Promise<void> {
     if (plan.nodes.length === 0) return;
 
-    // Tell the server which nodes need results (have pending RuntimeTensors).
-    // This lets the server fuse intermediates without losing output nodes.
-    const pendingIds = getPendingNodeIds();
-    const outputNodes: LazyIRNode[] = [];
-    for (const node of plan.nodes) {
-      if (pendingIds.has(node.id)) outputNodes.push(node);
-    }
-
     const t0 = performance.now();
     const wire = serializePlan(plan, {
       resolveHandle: (id: number) => handles.requireHandle(id),
-      outputNodes,
     });
     stats.executes++;
     stats.nodesShipped += plan.nodes.length;
@@ -339,7 +326,14 @@ export function createRemoteEngine(
     if (roots.length === 0) return;
     const plan = buildMergedPlan(roots, /* skipExecuted */ true);
     if (plan.nodes.length === 0) return;
-    await shipPlan(plan);
+    try {
+      await shipPlan(plan);
+    } catch {
+      // Serialization can fail if markStep released handles for storages
+      // still referenced by stale pending node chains. These pending
+      // tensors will be re-derived on the next forceAllMerged call.
+      return;
+    }
     postExecuteBookkeeping(plan, pending);
     for (const node of plan.nodes) {
       node.result = undefined;
@@ -371,20 +365,25 @@ export function createRemoteEngine(
     return result.value;
   };
 
-  async function markStep(keep?: FrontendTensor[]): Promise<number> {
-    // Force all pending tensors so every live tensor is materialized
-    // and its storage ID is known for the keep/release decision.
+  async function markStep(keep: FrontendTensor[]): Promise<number> {
+    // Force keep tensors to materialize any pending updates (e.g. copy_
+    // from optimizer step). Then collect their storage IDs for retention.
+    const runtimeTensors = keep.map((t) => t._unwrap());
     // biome-ignore lint/suspicious/noExplicitAny: calling patched method
-    await (runtime as any).forceAllPending();
+    await (runtime as any).forceAllMerged(...runtimeTensors);
 
-    // Keep any handle whose storage still has a positive reference count
-    // (held by a live RuntimeTensor — params, optimizer state, model
-    // buffers like RoPE tables, etc.). No explicit enumeration needed.
-    const { rcGet } = await import("../graph/refcount");
+    const keepIds = new Set<number>();
+    for (const t of keep) {
+      const ref = t._unwrap().lazyRef;
+      if (ref.kind === "materialized") {
+        keepIds.add(ref.storage.id);
+      }
+    }
+
     const toRelease: HandleRef[] = [];
     const idsToUnbind: number[] = [];
     for (const [id, handle] of handles.entries()) {
-      if (rcGet(id) <= 0) {
+      if (!keepIds.has(id)) {
         toRelease.push(handle);
         idsToUnbind.push(id);
       }
