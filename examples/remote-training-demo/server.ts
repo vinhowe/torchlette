@@ -47,6 +47,7 @@ import type { HandleRef, NodeIdx } from "../../src/remote/wire.js";
 
 /** Active compute backend — set during startup by initBackend(). */
 let backend: Backend = cpuBackend;
+let gpuMemoryStatsFn: (() => { currentBytes: number; peakBytes: number }) | null = null;
 registerBackend(cpuBackend);
 
 async function initBackend(preferWebGPU: boolean): Promise<string> {
@@ -62,6 +63,8 @@ async function initBackend(preferWebGPU: boolean): Promise<string> {
     }
     registerBackend(webgpuBackend);
     backend = webgpuBackend;
+    const { getGPUMemoryStats } = await import("../../src/backend/webgpu/memory-tracker.js");
+    gpuMemoryStatsFn = getGPUMemoryStats;
     return "webgpu";
   } catch (e) {
     console.log(`[server] WebGPU not available (${(e as Error).message}), using CPU`);
@@ -112,6 +115,38 @@ class Session {
 }
 
 // ============================================================================
+// Plan toposort (for safe use with executePlanOptimized)
+// ============================================================================
+
+import type { ExecutionPlan, LazyIRNode } from "../../src/graph/types.js";
+
+/**
+ * Re-sort plan nodes so every node appears after all its pending-ref inputs.
+ * The optimized executor assumes this invariant for fusion segmentation.
+ * Deserialized plans from the wire may not satisfy it if the client's plan
+ * builder used a different traversal order.
+ */
+function toposortPlan(plan: ExecutionPlan): void {
+  const nodeSet = new Set(plan.nodes);
+  const sorted: LazyIRNode[] = [];
+  const visited = new Set<LazyIRNode>();
+
+  function visit(node: LazyIRNode) {
+    if (visited.has(node)) return;
+    visited.add(node);
+    for (const ref of node.inputs) {
+      if (ref.kind === "pending" && nodeSet.has(ref.node)) {
+        visit(ref.node);
+      }
+    }
+    sorted.push(node);
+  }
+
+  for (const node of plan.nodes) visit(node);
+  plan.nodes = sorted;
+}
+
+// ============================================================================
 // RPC handlers (all async)
 // ============================================================================
 
@@ -119,9 +154,11 @@ async function executeHandler(
   session: Session,
   params: ExecuteParams,
 ): Promise<ExecuteResult> {
+  const t0 = performance.now();
   const plan = deserializePlan(params.plan, {
     resolveHandle: (h) => session.resolve(h),
   });
+  const tDeser = performance.now();
   // The client builds nodes with its own device label (usually "cpu" since
   // clients don't compute locally). The server runs on whichever backend
   // it's using; rewrite node devices so getBackend(node.device) routes to
@@ -130,25 +167,59 @@ async function executeHandler(
   for (const node of plan.nodes) {
     node.device = serverDevice;
   }
-  // NOTE: executePlanOptimized (fusion) has significant per-plan CPU overhead
-  // (graph analysis, codegen, cache lookups) that exceeds dispatch savings for
-  // short runs. Stick with sequential for now; fusion becomes worthwhile once
-  // the server caches compiled pipelines across sessions or plans get larger.
-  await executePlanSequential(plan, backend);
-
-  const outputs: Record<NodeIdx, HandleRef> = {};
-  const outputSet = params.plan.outputNodes
-    ? new Set(params.plan.outputNodes)
-    : null;
-
+  // Build node id → wire index map BEFORE toposort (response indices must
+  // match the client's wire order, not the server's execution order).
+  const nodeIdToWireIdx = new Map<number, number>();
   for (let i = 0; i < plan.nodes.length; i++) {
-    const node = plan.nodes[i];
-    if (!node.result) continue;
-    if (outputSet === null || outputSet.has(i)) {
-      outputs[i] = session.allocHandle(node.result);
+    nodeIdToWireIdx.set(plan.nodes[i].id, i);
+  }
+
+  // Build the set of output node IDs the client needs results for.
+  const outputNodeIds = new Set<number>();
+  if (params.plan.outputNodes) {
+    for (const wireIdx of params.plan.outputNodes) {
+      outputNodeIds.add(plan.nodes[wireIdx].id);
     }
   }
-  return { outputs };
+
+  // Re-toposort the deserialized plan so executePlanOptimized's fusion
+  // and segmentation can safely reorder nodes. Without this, the optimized
+  // executor hits "Input not ready" errors because the wire order doesn't
+  // match the local plan builder's invariants.
+  toposortPlan(plan);
+
+  // Use optimized when client provides outputNodes, sequential otherwise.
+  if (backend.name === "webgpu" && outputNodeIds.size > 0) {
+    await executePlanOptimized(plan, backend, {
+      enableFusion: true,
+      externalNodeIds: outputNodeIds,
+    });
+  } else {
+    await executePlanSequential(plan, backend);
+  }
+  const tExec = performance.now();
+
+  const outputs: Record<NodeIdx, HandleRef> = {};
+  const sideOutputs: Record<string, HandleRef> = {};
+
+  for (const node of plan.nodes) {
+    if (!node.result) continue;
+    const wireIdx = nodeIdToWireIdx.get(node.id)!;
+    outputs[wireIdx] = session.allocHandle(node.result);
+    // Multi-output side results (e.g., adamStep m_new/v_new, fusedAttention lse/rng)
+    if (node.results) {
+      for (let j = 0; j < node.results.length; j++) {
+        const r = node.results[j];
+        if (r) sideOutputs[`${wireIdx}:${j}`] = session.allocHandle(r);
+      }
+    }
+  }
+  const tMarshal = performance.now();
+  const nSide = Object.keys(sideOutputs).length;
+  if (plan.nodes.length > 100) {
+    console.log(`[exec] ${plan.nodes.length} nodes: deser=${(tDeser-t0).toFixed(0)}ms exec=${(tExec-tDeser).toFixed(0)}ms marshal=${(tMarshal-tExec).toFixed(0)}ms total=${(tMarshal-t0).toFixed(0)}ms handles=${Object.keys(outputs).length}+${nSide} side`);
+  }
+  return nSide > 0 ? { outputs, sideOutputs } : { outputs };
 }
 
 function uploadRaw(
@@ -209,6 +280,20 @@ function releaseHandler(session: Session, params: ReleaseParams): ReleaseResult 
   return { releasedCount: session.release(params.handles) };
 }
 
+function statsHandler(session: Session): Record<string, unknown> {
+  let gpu: Record<string, number> | null = null;
+  if (gpuMemoryStatsFn) {
+    const mem = gpuMemoryStatsFn();
+    gpu = {
+      currentBytes: mem.currentBytes,
+      peakBytes: mem.peakBytes,
+      currentMB: Math.round(mem.currentBytes / (1024 * 1024)),
+      peakMB: Math.round(mem.peakBytes / (1024 * 1024)),
+    };
+  }
+  return { handles: session.handleCount(), gpu };
+}
+
 async function dispatch(
   session: Session,
   req: RpcRequest,
@@ -230,6 +315,9 @@ async function dispatch(
         break;
       case "release":
         result = releaseHandler(session, req.params as ReleaseParams);
+        break;
+      case "stats":
+        result = statsHandler(session);
         break;
       default:
         throw new Error(`Unknown method: ${req.method}`);

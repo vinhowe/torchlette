@@ -1082,12 +1082,20 @@ export function segmentPlanForExecution(
     }
   }
 
+  // Build node ID → group for direct group membership check
+  const nodeIdToGroup = new Map<number, FusionGroup>();
+  for (const group of groups) {
+    for (const node of group.nodes) {
+      nodeIdToGroup.set(node.id, group);
+    }
+  }
+
   // Track which groups have been emitted.
   const emittedGroups = new Set<FusionGroup>();
 
   // Pre-compute max plan index for each group so we can emit at the last
-  // member's position. This ensures all gap nodes (including those in other
-  // groups) are processed before the fused segment.
+  // member's position. Gap-dependency check below handles cases where gap
+  // nodes depend on group outputs.
   const groupMaxIdx = new Map<FusionGroup, number>();
   for (const group of groups) {
     groupMaxIdx.set(group, Math.max(...group.planIndices));
@@ -1110,10 +1118,39 @@ export function segmentPlanForExecution(
       }
       i++;
     } else {
-      // Sequential execution - collect consecutive non-grouped nodes
+      // Sequential execution - collect consecutive non-grouped nodes.
+      // Before adding a node, check if it depends on a not-yet-emitted
+      // fusion group. If so, flush that group first so its outputs are
+      // available. This handles "gap nodes" between non-contiguous group
+      // members that depend on earlier group members.
       const seqNodes: LazyIRNode[] = [];
       while (i < nodes.length && !isGroupMember(i)) {
-        seqNodes.push(nodes[i]);
+        const node = nodes[i];
+        // Check if this gap node (or any ancestor) depends on a
+        // not-yet-emitted fusion group. Walk the dependency chain.
+        const visited = new Set<number>();
+        const stack = [node];
+        while (stack.length > 0) {
+          const cur = stack.pop()!;
+          if (visited.has(cur.id)) continue;
+          visited.add(cur.id);
+          for (const inp of cur.inputs) {
+            if (inp.kind !== "pending") continue;
+            const depGroup = nodeIdToGroup.get(inp.node.id);
+            if (depGroup && !emittedGroups.has(depGroup)) {
+              if (seqNodes.length > 0) {
+                segments.push({ kind: "sequential", nodes: [...seqNodes] });
+                seqNodes.length = 0;
+              }
+              emittedGroups.add(depGroup);
+              segments.push({ kind: "fused", group: depGroup, recipe: groupToRecipe(depGroup) });
+            } else if (!depGroup && !inp.node.result) {
+              // Non-group, non-materialized ancestor — keep walking
+              stack.push(inp.node);
+            }
+          }
+        }
+        seqNodes.push(node);
         i++;
       }
       if (seqNodes.length > 0) {

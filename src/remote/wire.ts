@@ -118,4 +118,10 @@ export interface SerializedPlan {
 export interface ExecuteResponse {
   /** For each requested output node idx: the server's handle for its result. */
   outputs: Record<NodeIdx, HandleRef>;
+  /**
+   * Multi-output side results. For nodes that produce additional outputs
+   * (e.g., adamStep → [param_new, m_new, v_new], fusedAttention → [output, lse, rng]),
+   * this maps "nodeIdx:outputIndex" → HandleRef for each side output (outputIndex > 0).
+   */
+  sideOutputs?: Record<string, HandleRef>;
 }

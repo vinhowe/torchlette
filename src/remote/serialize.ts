@@ -123,6 +123,13 @@ function serializeRef(
   // pending
   const idx = nodeToIdx.get(ref.node);
   if (idx === undefined) {
+    // Node was already executed (has a result) but excluded from the plan
+    // by buildMergedPlan's skipExecuted optimization. Treat as materialized.
+    if (ref.node.result) {
+      const handle = resolveHandle(ref.node.result.id);
+      externalHandles.add(handle);
+      return { kind: "materialized", handle };
+    }
     throw new Error(
       `serializePlan: pending ref points to node id=${ref.node.id} op=${ref.node.op} not in plan`,
     );

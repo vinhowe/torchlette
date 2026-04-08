@@ -127,6 +127,13 @@ interface OptimizedExecutionOptions {
   enableVectorization?: boolean;
   /** Enable early buffer release based on lifetime analysis */
   enableEarlyRelease?: boolean;
+  /**
+   * Externally-supplied node IDs that must not be fused as intermediates.
+   * Used by the remote training server, which doesn't have local
+   * RuntimeTensors but knows which nodes the client needs results for.
+   * Merged with any IDs from getPendingNodeIds().
+   */
+  externalNodeIds?: Set<number>;
 }
 
 /**
@@ -204,6 +211,8 @@ export interface FusionAnalysisTemplate {
   planAnalysis?: PlanAnalysis;
   /** Generation at which planAnalysis was last replayed (prevents per-step accumulation). */
   replayedGeneration?: number;
+  /** Op signature for cache hit validation (catches FNV-1a hash collisions). */
+  opSignature?: string;
 }
 
 type CachedSegmentDesc =
@@ -710,6 +719,8 @@ export async function executeLoweredPlan(
   backend: Backend,
   options: {
     bufferArena?: BufferArena;
+    /** External node IDs that must have results after execution. */
+    externalNodeIds?: Set<number>;
   } = {},
 ): Promise<OptimizedExecutionResult> {
   // Validate plan node count matches
@@ -1261,9 +1272,52 @@ export async function executeLoweredPlan(
           if (node.result) break;
 
           setProfileModule(node.module ?? "unknown");
-          const inputs = node.inputs.map((ref) =>
-            getInputStorage(ref, backend),
-          );
+          let inputs;
+          try {
+            inputs = node.inputs.map((ref) =>
+              getInputStorage(ref, backend),
+            );
+          } catch (e) {
+            // Dump context for debugging
+            const err = e as Error;
+            console.error(`[lowered-plan] Action #${actionIndex} kind=${action.kind} nodeIdx=${nodeIdx} node=${node.id}:${node.op} shape=${JSON.stringify(node.shape)}`);
+            for (let ii = 0; ii < node.inputs.length; ii++) {
+              const ref = node.inputs[ii];
+              if (ref.kind === "pending") {
+                // Check all action types for the dependency
+              let depInfo = "NOT_FOUND";
+              for (let ai = 0; ai < loweredPlan.actions.length; ai++) {
+                const a = loweredPlan.actions[ai] as any;
+                if (a.nodeIndex !== undefined && planNodes[a.nodeIndex]?.id === ref.node.id) {
+                  depInfo = `action#${ai} kind=${a.kind}`;
+                  break;
+                }
+                if (a.coveredNodeIndices) {
+                  for (const ci of a.coveredNodeIndices) {
+                    if (planNodes[ci]?.id === ref.node.id) {
+                      depInfo = `action#${ai} kind=${a.kind} (covered)`;
+                      break;
+                    }
+                  }
+                  if (depInfo !== "NOT_FOUND") break;
+                }
+                if (a.kind === "fused" && a.nodeIndices) {
+                  for (const fi of a.nodeIndices) {
+                    if (planNodes[fi]?.id === ref.node.id) {
+                      depInfo = `action#${ai} kind=fused (member)`;
+                      break;
+                    }
+                  }
+                  if (depInfo !== "NOT_FOUND") break;
+                }
+              }
+              // Find the dep's position in planNodes
+              const depPlanIdx = planNodes.findIndex(n => n.id === ref.node.id);
+              console.error(`[lowered-plan]   input[${ii}]: pending node=${ref.node.id}:${ref.node.op} result=${!!ref.node.result} planIdx=${depPlanIdx} ${depInfo}`);
+              }
+            }
+            throw e;
+          }
           const backendInputs = inputs.map((s) => s.backendTensor);
 
           // Use synchronous dispatch to avoid microtask overhead (~5-15µs/await).
@@ -1487,11 +1541,36 @@ export async function executeLoweredPlan(
       clearArenaConflictDetected();
     }
 
-    // Deactivate buffer arena before closing encoder
+    // Deactivate buffer arena before any patch-up work
     if (options.bufferArena && useTopLevelSharedEncoder) {
       clearActiveArena();
       clearArenaExternalInputBuffers();
     }
+
+    // Patch up external nodes missing results. Various lowered-plan
+    // optimizations (fusion intermediates, matmul epilogue intermediates,
+    // bypassed graph-rewrite nodes) don't set node.result on subsumed
+    // nodes. Run inside the shared encoder (after arena deactivation)
+    // so GPU dispatches use the correct command buffer and fresh pool
+    // buffers (no arena aliasing).
+    if (options.externalNodeIds && options.externalNodeIds.size > 0) {
+      const { executeNode: execNode } = await import("./sequential");
+      const forceWithDeps = async (node: LazyIRNode): Promise<void> => {
+        if (node.result) return;
+        for (const inp of node.inputs) {
+          if (inp.kind === "pending" && !inp.node.result) {
+            await forceWithDeps(inp.node);
+          }
+        }
+        await execNode(node, backend);
+      };
+      for (const node of planNodes) {
+        if (options.externalNodeIds.has(node.id) && !node.result) {
+          await forceWithDeps(node);
+        }
+      }
+    }
+
     if (useTopLevelSharedEncoder) {
       endSharedEncoder();
     }
@@ -1564,15 +1643,22 @@ export async function executePlanOptimized(
   //
   // Note: RuntimeTensor.dispose() no longer unregisters from the pending map,
   // so checkpoint's tidy() disposal won't hide nodes from this set.
-  let externalNodeIds: Set<number> | undefined;
-  try {
-    const { getPendingNodeIds } = await import("../runtime/tensor");
-    const pending = getPendingNodeIds();
-    if (pending.size > 0) {
-      externalNodeIds = pending;
+  // When the caller provides externalNodeIds explicitly (e.g., remote
+  // training server), use it as-is. Only auto-detect from the runtime's
+  // pending tensor map when no explicit set is provided. Merging the two
+  // inflates the set with unrelated IDs from the runtime, masking bugs
+  // where optimization passes don't respect externalNodeIds.
+  let externalNodeIds: Set<number> | undefined = options.externalNodeIds;
+  if (!externalNodeIds) {
+    try {
+      const { getPendingNodeIds } = await import("../runtime/tensor");
+      const pending = getPendingNodeIds();
+      if (pending.size > 0) {
+        externalNodeIds = pending;
+      }
+    } catch {
+      // If runtime/tensor is not available, skip external node tracking
     }
-  } catch {
-    // If runtime/tensor is not available, skip external node tracking
   }
 
   // Query device storage buffer limit to constrain fusion group size.
@@ -1586,17 +1672,34 @@ export async function executePlanOptimized(
   let planNodes: LazyIRNode[];
   let loweredPlan: LoweredPlan;
 
-  if (cachedTemplate?.loweredPlan) {
+  // Validate cache hit: recompute fingerprint from permuted nodes to catch
+  // FNV-1a collisions (two plans with same hash but different structures).
+  let validatedTemplate = cachedTemplate;
+  if (validatedTemplate?.loweredPlan) {
+    const perm = validatedTemplate.finalPerm;
+    if (perm.length !== plan.nodes.length) {
+      validatedTemplate = undefined;
+    } else {
+      // Build permuted node array and recompute fingerprint
+      const permutedNodes = perm.map((i) => plan.nodes[i]);
+      const recheck = computePlanFingerprint(permutedNodes, externalNodeIds);
+      if (recheck !== (validatedTemplate as any)._permFingerprint) {
+        validatedTemplate = undefined;
+      }
+    }
+  }
+
+  if (validatedTemplate?.loweredPlan) {
     // ── Cache hit: reuse existing lowered plan ──
-    planNodes = cachedTemplate.finalPerm.map((i) => plan.nodes[i]);
-    loweredPlan = cachedTemplate.loweredPlan;
+    planNodes = validatedTemplate.finalPerm.map((i) => plan.nodes[i]);
+    loweredPlan = validatedTemplate.loweredPlan;
     // Replay stored plan analysis on cache hits when profiling is enabled.
     // Only replay once per profiler reset (tracked via generation counter).
-    if (isProfilingEnabled() && cachedTemplate.planAnalysis) {
+    if (isProfilingEnabled() && validatedTemplate.planAnalysis) {
       const gen = getPlanAnalysisGeneration();
-      if (cachedTemplate.replayedGeneration !== gen) {
-        cachedTemplate.replayedGeneration = gen;
-        recordPlanAnalysis({ ...cachedTemplate.planAnalysis });
+      if (validatedTemplate.replayedGeneration !== gen) {
+        validatedTemplate.replayedGeneration = gen;
+        recordPlanAnalysis({ ...validatedTemplate.planAnalysis });
       }
     }
     if (process.env.TORCHLETTE_DEBUG_COMPILED) {
@@ -1724,6 +1827,9 @@ export async function executePlanOptimized(
     });
     template.loweredPlan = loweredPlan;
 
+    // Store permuted fingerprint for cache hit validation
+    (template as any)._permFingerprint = computePlanFingerprint(planNodes, externalNodeIds);
+
     fusionAnalysisCache.set(fingerprint, template);
 
     // Evict old templates if cache grows too large (each has a GPU arena)
@@ -1824,15 +1930,18 @@ export async function executePlanOptimized(
   }
 
   // Execute via the lowered plan — the sole execution engine
-  // Arena disabled by env var for memory-constrained pretraining
-  const arenaDisabled = !!process.env.TORCHLETTE_NO_ARENA;
+  // Arena disabled by env var, or when external node IDs are provided
+  // (the arena's lifetime analysis doesn't account for the external-node
+  // patch-up pass, which reads buffers the arena may have recycled).
+  const arenaDisabled = !!process.env.TORCHLETTE_NO_ARENA || !!options.externalNodeIds;
   const bufferArena = arenaDisabled
     ? undefined
-    : ((cachedTemplate ?? fusionAnalysisCache.get(fingerprint))?.bufferArena as
+    : ((validatedTemplate ?? fusionAnalysisCache.get(fingerprint))?.bufferArena as
         | BufferArena
         | undefined);
   return executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
     bufferArena,
+    externalNodeIds,
   });
 }
 

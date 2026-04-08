@@ -16,7 +16,7 @@ import {
   contiguousStrides,
   sizeOf,
 } from "./shape-utils";
-import { arenaBufferSet } from "./webgpu-state";
+import { arenaBufferSet, sharedEncoderActive } from "./webgpu-state";
 
 /**
  * Create a WebGPU tensor with optional stride info.
@@ -231,13 +231,22 @@ export function createBufferWithData(
   // Try to acquire from pool first (only if pool size is power-of-2, i.e. not capped)
   const pooled =
     rawPoolSize <= maxBindingSizeForPool ? bufferPool.acquire(poolSize) : null;
-  if (pooled && queue) {
+  // Don't reuse pooled buffers for non-f32 data when a shared encoder is
+  // active. The fused kernel dispatch allocates output buffers from the same
+  // pool; if the size class matches, it may return the same buffer (pool
+  // acquire races with createTrackedBuffer). Use mappedAtCreation for safety.
+  const isNonF32 = data instanceof Int32Array || data instanceof Uint32Array || data instanceof Uint16Array;
+  if (pooled && queue && !(isNonF32 && sharedEncoderActive)) {
     // Reusing a pooled buffer - write data via queue
     // NOTE: Don't call trackAllocation here! The buffer was already tracked
     // when it was first created, and we don't call trackDeallocation when
     // releasing to pool. Memory tracking stays consistent throughout pool lifecycle.
     profileApiCall("writeBuffer", () => queue.writeBuffer(pooled, 0, data));
     return pooled;
+  }
+  // Release back to pool if we acquired but didn't use
+  if (pooled) {
+    bufferPool.deferredDestroy(pooled, pooled.size);
   }
 
   // Create new buffer with mappedAtCreation for efficient initial write.

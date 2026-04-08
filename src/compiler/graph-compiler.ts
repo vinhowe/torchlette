@@ -106,7 +106,7 @@ function detectMatmulEpilogueChains(
     for (let depth = 0; depth < 4; depth++) {
       const cc = consumerCount.get(current.id) ?? 0;
       if (cc !== 1) break;
-      if (externalNodeIds?.has(current.id) && !chainIds.includes(current.id)) {
+      if (externalNodeIds?.has(current.id)) {
         break;
       }
 
@@ -287,6 +287,12 @@ export function analyzeGraph(
     rewriteBypassedIds,
     SIMPLIFICATION_PASSES,
   );
+  // Un-bypass external nodes: they need individual results for materialization.
+  if (externalNodeIds) {
+    for (const id of externalNodeIds) {
+      rewriteBypassedIds.delete(id);
+    }
+  }
 
   // Log pass stats when TORCHLETTE_LOG_REWRITES=1
   if (
@@ -368,6 +374,27 @@ export function analyzeGraph(
       }
     }
     reorderedNodes = relocated;
+
+    // Validate topological order after relocation
+    const posAfterReloc = new Map<number, number>();
+    for (let i = 0; i < reorderedNodes.length; i++) {
+      posAfterReloc.set(reorderedNodes[i].id, i);
+    }
+    for (let i = 0; i < reorderedNodes.length; i++) {
+      const node = reorderedNodes[i];
+      for (const inp of node.inputs) {
+        if (inp.kind === "pending") {
+          const depPos = posAfterReloc.get(inp.node.id);
+          if (depPos !== undefined && depPos > i) {
+            console.error(
+              `[TOPOSORT VIOLATION] node ${node.id} op=${node.op} at pos ${i} ` +
+              `depends on ${inp.node.id} op=${inp.node.op} at pos ${depPos} ` +
+              `(epilogueClaimed=${epilogueClaimedIds.has(inp.node.id)})`,
+            );
+          }
+        }
+      }
+    }
   }
 
   // Build matmul directives: full epilogue plans for execution.
