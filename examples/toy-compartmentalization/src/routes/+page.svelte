@@ -490,11 +490,10 @@
 
     step++;
     await api.endStep();
-    // TODO: markStep handle release — disabled pending stale-ref fix
-    // if (remoteEngine && optimizer && model) {
-    //   const keep = [...optimizer.getAllKeepTensors(), ...model.persistentTensors()];
-    //   await remoteEngine.markStep(keep);
-    // }
+    if (remoteEngine && optimizer && model) {
+      const keep = [...optimizer.getAllKeepTensors(), ...model.persistentTensors()];
+      await remoteEngine.markStep(keep);
+    }
     const tEnd = performance.now();
 
     if (shouldLog && getGPUMemoryStats && !isRemote) {

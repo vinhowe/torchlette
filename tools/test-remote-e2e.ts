@@ -141,8 +141,7 @@ async function main() {
     o.step(); o.zeroGrad();
 
     await api.endStep();
-    // Debug: check if storage 55 exists
-    console.log(`  handle 55: ${engine.handles.getHandle(55) ?? 'MISSING'}`);
+    await engine.markStep([...o.getAllKeepTensors(), ...m.persistentTensors()]);
     const elapsed = performance.now() - t0;
     console.log(`step ${step}: ${elapsed.toFixed(0)}ms, handles=${engine.handles.size()}`);
   }
