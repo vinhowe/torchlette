@@ -85,6 +85,9 @@ export interface LazyIRNode {
   results?: StorageHandle[];
   /** True while input rc is retained by the plan executor (prevents double-retain). */
   _inputsRetained?: boolean;
+  /** Set after execution. Survives node.result cleanup so buildMergedPlan's
+   *  skipExecuted can distinguish "executed but result cleared" from "never executed". */
+  _executed?: boolean;
   payload?: unknown;
   /** Module label for profiling (set via setProfileModule during graph construction) */
   module?: string;

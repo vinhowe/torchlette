@@ -777,17 +777,16 @@ export class RuntimeEngine {
     // Materialize any remaining tensors whose nodes were already executed
     const skippedNodes = materializeRemaining(tensors);
 
-    // Release plan-input retains and clear node.result to prevent stale
-    // results from accumulating across steps. Without this, the execution
-    // hook path creates stubs that persist on node.result, causing plan
-    // sizes to grow linearly per step.
+    // Mark nodes as executed so skipExecuted won't re-include them.
+    // Release input ref retains. node.result is kept (not cleared) so
+    // serializeRef can resolve skipped nodes as materialized refs.
     for (const node of plan.nodes) {
       releaseNodeInputRefs(node);
-      node.result = undefined;
+      node._executed = true;
     }
     for (const node of skippedNodes) {
       releaseNodeInputRefs(node);
-      node.result = undefined;
+      node._executed = true;
     }
   }
 
@@ -880,14 +879,12 @@ export class RuntimeEngine {
     // fusedAttention) store side outputs in node.results that are consumed by
     // materializePendingTensors when RuntimeTensors reference outputIndex > 0.
     for (const node of plan.nodes) {
-      // Release rc on materialized inputs — the node has executed and
-      // no longer needs its inputs alive.
       releaseNodeInputRefs(node);
-      node.result = undefined;
+      node._executed = true;
     }
     for (const node of skippedNodes) {
-      releaseNodeInputRefs(node); // idempotent
-      node.result = undefined;
+      releaseNodeInputRefs(node);
+      node._executed = true;
     }
 
     // Destroy orphaned intermediates (rc <= 0). Safe here because plan execution
