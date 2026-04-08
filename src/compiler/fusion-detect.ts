@@ -635,49 +635,26 @@ function batchGlobalSingletons(
 function promoteIntermediates(
   nodes: LazyIRNode[],
   finalGroups: FusionGroup[],
-  externalNodeIds: Set<number> | undefined,
+  _externalNodeIds: Set<number> | undefined,
   maxBuffers: number,
 ): void {
-  // Build reverse dependency map for O(1) lookups
-  const consumers = new Map<number, number[]>();
-  for (const planNode of nodes) {
-    for (const input of planNode.inputs) {
-      if (input.kind === "pending") {
-        let arr = consumers.get(input.node.id);
-        if (!arr) {
-          arr = [];
-          consumers.set(input.node.id, arr);
-        }
-        arr.push(planNode.id);
-      }
-    }
-  }
-
   for (const group of finalGroups) {
-    const groupNodeIds = nodeIdSet(group.nodes);
     const outputIds = groupOutputIds(group);
 
-    const neededIntermediates: LazyIRNode[] = [];
+    // ALL non-output group nodes need individual results. The fused kernel
+    // only writes the primary + additional outputs. Everything else must be
+    // either promoted (kernel writes it) or re-executed sequentially.
+    // This ensures executePlanOptimized produces node.result for every node,
+    // matching executePlanSequential — critical for remote training where
+    // the server must return handles for all executed nodes.
+    const allIntermediates: LazyIRNode[] = [];
     for (const gnode of group.nodes) {
-      if (outputIds.has(gnode.id)) continue;
-      let isExternal = externalNodeIds?.has(gnode.id) ?? false;
-      if (!isExternal) {
-        const cons = consumers.get(gnode.id);
-        if (cons) {
-          for (const cid of cons) {
-            if (!groupNodeIds.has(cid)) {
-              isExternal = true;
-              break;
-            }
-          }
-        }
-      }
-      if (isExternal) neededIntermediates.push(gnode);
+      if (!outputIds.has(gnode.id)) allIntermediates.push(gnode);
     }
 
-    if (neededIntermediates.length > 0) {
+    if (allIntermediates.length > 0) {
       const primaryShape = group.outputNode.shape;
-      const promotable = neededIntermediates.filter((n) =>
+      const promotable = allIntermediates.filter((n) =>
         shapesEqual(n.shape, primaryShape),
       );
       const currentOutputs = 1 + (group.additionalOutputNodes?.length ?? 0);
@@ -686,16 +663,20 @@ function promoteIntermediates(
         countNonInlinableInputs(group.externalInputs) -
         currentOutputs;
 
-      if (
-        promotable.length === neededIntermediates.length &&
-        promotable.length <= availableSlots
-      ) {
+      // Promote what fits as additional kernel outputs; re-execute the rest.
+      const toPromote = promotable.slice(0, Math.max(0, availableSlots));
+      const toReexecute = allIntermediates.filter(
+        (n) => !toPromote.includes(n),
+      );
+
+      if (toPromote.length > 0) {
         group.additionalOutputNodes = [
           ...(group.additionalOutputNodes ?? []),
-          ...promotable,
+          ...toPromote,
         ];
-      } else {
-        group.neededIntermediates = neededIntermediates;
+      }
+      if (toReexecute.length > 0) {
+        group.neededIntermediates = toReexecute;
       }
     }
   }

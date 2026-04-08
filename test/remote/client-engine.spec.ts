@@ -169,8 +169,7 @@ describe("RemoteEngine (in-process Transport)", () => {
     expect(before).toBeGreaterThan(1);
 
     // Dispose temporaries — only `a` remains alive.
-    d.dispose(); c.dispose(); b.dispose();
-    const released = await markStep();
+    const released = await markStep([a]);
     expect(released).toBeGreaterThan(0);
     expect(handles.size()).toBeLessThan(before);
     expect(engine.stats.handlesReleased).toBe(released);
@@ -226,14 +225,12 @@ describe("RemoteEngine (in-process Transport)", () => {
         });
         p.zeroGrad();
       }
-      await markStep();
+      await markStep([W, b, X, T]);
     }
 
     expect(losses[losses.length - 1]).toBeLessThan(losses[0]);
-    // Handle count should be bounded — rc-based markStep keeps live tensors.
-    // Without tidy(), loop intermediates stay alive until GC, so count may
-    // exceed the 4 persistent tensors. Just verify it's not unbounded.
-    expect(engine.handles.size()).toBeLessThan(200);
+    // Handle registry should be stable at the `keep` count after markStep.
+    expect(engine.handles.size()).toBeLessThanOrEqual(4);
   });
 
   it("preUpload sends tensorFromArray data via binary upload, not plan JSON", async () => {
@@ -288,8 +285,7 @@ describe("RemoteEngine (in-process Transport)", () => {
     const c = torch.add(b, 2);
     await c.cpu();
 
-    c.dispose(); b.dispose();
-    await markStep();
+    await markStep([a]);
     expect(handles.size()).toBe(transport.handleCount());
   });
 });

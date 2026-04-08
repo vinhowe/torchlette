@@ -115,36 +115,7 @@ class Session {
 }
 
 // ============================================================================
-// Plan toposort (for safe use with executePlanOptimized)
-// ============================================================================
-
 import type { ExecutionPlan, LazyIRNode } from "../../src/graph/types.js";
-
-/**
- * Re-sort plan nodes so every node appears after all its pending-ref inputs.
- * The optimized executor assumes this invariant for fusion segmentation.
- * Deserialized plans from the wire may not satisfy it if the client's plan
- * builder used a different traversal order.
- */
-function toposortPlan(plan: ExecutionPlan): void {
-  const nodeSet = new Set(plan.nodes);
-  const sorted: LazyIRNode[] = [];
-  const visited = new Set<LazyIRNode>();
-
-  function visit(node: LazyIRNode) {
-    if (visited.has(node)) return;
-    visited.add(node);
-    for (const ref of node.inputs) {
-      if (ref.kind === "pending" && nodeSet.has(ref.node)) {
-        visit(ref.node);
-      }
-    }
-    sorted.push(node);
-  }
-
-  for (const node of plan.nodes) visit(node);
-  plan.nodes = sorted;
-}
 
 // ============================================================================
 // RPC handlers (all async)
@@ -159,58 +130,36 @@ async function executeHandler(
     resolveHandle: (h) => session.resolve(h),
   });
   const tDeser = performance.now();
-  // The client builds nodes with its own device label (usually "cpu" since
-  // clients don't compute locally). The server runs on whichever backend
-  // it's using; rewrite node devices so getBackend(node.device) routes to
-  // the correct backend in the executor.
+  // Rewrite device labels — client uses "cpu", server uses its backend.
   const serverDevice = backend.name as "cpu" | "webgpu";
   for (const node of plan.nodes) {
     node.device = serverDevice;
   }
-  // Build node id → wire index map BEFORE toposort (response indices must
-  // match the client's wire order, not the server's execution order).
-  const nodeIdToWireIdx = new Map<number, number>();
-  for (let i = 0; i < plan.nodes.length; i++) {
-    nodeIdToWireIdx.set(plan.nodes[i].id, i);
-  }
 
-  // Build the set of output node IDs the client needs results for.
-  const outputNodeIds = new Set<number>();
-  if (params.plan.outputNodes) {
-    for (const wireIdx of params.plan.outputNodes) {
-      outputNodeIds.add(plan.nodes[wireIdx].id);
-    }
-  }
-
-  // Re-toposort the deserialized plan so executePlanOptimized's fusion
-  // and segmentation can safely reorder nodes. Without this, the optimized
-  // executor hits "Input not ready" errors because the wire order doesn't
-  // match the local plan builder's invariants.
-  toposortPlan(plan);
-
-  // Use optimized when client provides outputNodes, sequential otherwise.
-  if (backend.name === "webgpu" && outputNodeIds.size > 0) {
-    await executePlanOptimized(plan, backend, {
-      enableFusion: true,
-      externalNodeIds: outputNodeIds,
-    });
+  // Execute with fusion. The deserialized plan is already in topological
+  // order (preserved from the client's buildMergedPlan). The optimized
+  // executor produces node.result for ALL nodes (including fused intermediates
+  // via unconditional promotion + re-execution).
+  if (backend.name === "webgpu") {
+    await executePlanOptimized(plan, backend, { enableFusion: true });
   } else {
     await executePlanSequential(plan, backend);
   }
   const tExec = performance.now();
 
+  // Return handles for ALL nodes with results. Wire indices match plan
+  // order (no toposort reordering).
   const outputs: Record<NodeIdx, HandleRef> = {};
   const sideOutputs: Record<string, HandleRef> = {};
 
-  for (const node of plan.nodes) {
+  for (let i = 0; i < plan.nodes.length; i++) {
+    const node = plan.nodes[i];
     if (!node.result) continue;
-    const wireIdx = nodeIdToWireIdx.get(node.id)!;
-    outputs[wireIdx] = session.allocHandle(node.result);
-    // Multi-output side results (e.g., adamStep m_new/v_new, fusedAttention lse/rng)
+    outputs[i] = session.allocHandle(node.result);
     if (node.results) {
       for (let j = 0; j < node.results.length; j++) {
         const r = node.results[j];
-        if (r) sideOutputs[`${wireIdx}:${j}`] = session.allocHandle(r);
+        if (r) sideOutputs[`${i}:${j}`] = session.allocHandle(r);
       }
     }
   }

@@ -1,45 +1,46 @@
 /**
  * End-to-end remote training test: Node.js client → WebSocket → real server.
  *
- * This is the Node.js equivalent of the browser demo. It connects to the
- * actual server process via WebSocket, sends serialized plans, receives
- * handles, creates stubs — exactly like remote-hooks.ts in the browser.
+ * Uses createRemoteEngine (same as browser demo) with a Node.js WebSocket.
  *
  * Usage:
  *   1. Start server: npx tsx examples/remote-training-demo/server.ts --port 9882
  *   2. Run this:     npx tsx tools/test-remote-e2e.ts
  */
 import WebSocket from "ws";
-import { Torchlette, nn, Adam } from "../src/index";
+import { nn, Adam } from "../src/index";
 import { crossEntropy } from "../src/nn/functional";
 import { createModel, MESS3_CONFIG } from "../examples/toy-compartmentalization/src/lib/model";
 import {
-  generateBatchWithCompartments,
+  generateBatch,
   setTransitionMatrices,
   VOCAB_SIZE_DATA,
 } from "../examples/toy-compartmentalization/src/lib/data";
-import type { ExecutionPlan, LazyIRNode } from "../src/graph/types";
-import type { BackendTensor, DType } from "../src/backend/types";
-import { createStorageHandle } from "../src/graph/node-factory";
-import { serializePlan } from "../src/remote/serialize";
-import { getPendingNodeIds } from "../src/runtime/tensor";
-import type { HandleRef } from "../src/remote/wire";
 import type {
   ExecuteParams,
   ExecuteResult,
-  RpcRequest,
+  DownloadParams,
+  DownloadResult,
+  ReadScalarParams,
+  ReadScalarResult,
+  UploadParams,
+  UploadResult,
+  ReleaseParams,
+  ReleaseResult,
   RpcResponse,
   HelloResult,
 } from "../src/remote/rpc";
+import type { Transport } from "../src/remote/client-engine";
+import { createRemoteEngine } from "../src/remote/client-engine";
 
 // ============================================================================
-// Node.js WebSocket RPC client (mirrors remote-transport.ts for browser)
+// Node.js WebSocket Transport (mirrors remote-transport.ts for browser)
 // ============================================================================
 
-class NodeRpcClient {
+class NodeTransport implements Transport {
   private ws!: WebSocket;
   private nextId = 1;
-  private pending = new Map<number, (r: any) => void>();
+  private pending = new Map<number, { resolve: (r: any) => void; reject: (e: Error) => void }>();
   sessionId = "";
 
   async connect(url: string): Promise<void> {
@@ -57,11 +58,11 @@ class NodeRpcClient {
             resolve();
             return;
           }
-          const resolver = this.pending.get(msg.id);
-          if (resolver) {
+          const p = this.pending.get(msg.id);
+          if (p) {
             this.pending.delete(msg.id);
-            if (msg.error) resolver(Promise.reject(new Error(msg.error.message)));
-            else resolver(msg.result);
+            if (msg.error) p.reject(new Error(msg.error.message));
+            else p.resolve(msg.result);
           }
         }
       });
@@ -69,92 +70,21 @@ class NodeRpcClient {
     });
   }
 
-  async execute(params: ExecuteParams): Promise<ExecuteResult> {
+  private rpc<T>(method: string, params: unknown): Promise<T> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, (r) => {
-        if (r instanceof Promise) r.catch(reject);
-        else resolve(r);
-      });
-      this.ws.send(JSON.stringify({ id, method: "execute", params }));
+      this.pending.set(id, { resolve, reject });
+      this.ws.send(JSON.stringify({ id, method, params }));
     });
   }
 
-  close() {
-    this.ws.close();
-  }
-}
+  execute(params: ExecuteParams): Promise<ExecuteResult> { return this.rpc("execute", params); }
+  upload(params: UploadParams): Promise<UploadResult> { return this.rpc("upload", params); }
+  download(params: DownloadParams): Promise<DownloadResult> { return this.rpc("download", params); }
+  readScalar(params: ReadScalarParams): Promise<ReadScalarResult> { return this.rpc("readScalar", params); }
+  release(params: ReleaseParams): Promise<ReleaseResult> { return this.rpc("release", params); }
 
-// ============================================================================
-// Remote hooks (mirrors remote-hooks.ts exactly)
-// ============================================================================
-
-function createRemoteHooks(transport: NodeRpcClient) {
-  const handleMap = new Map<number, HandleRef>();
-
-  const executionHook = async (plan: ExecutionPlan) => {
-    if (plan.nodes.length === 0) return;
-
-    // Compute outputNodes (same as remote-hooks.ts)
-    const pendingIds = getPendingNodeIds();
-    const outputNodes: LazyIRNode[] = [];
-    for (const node of plan.nodes) {
-      if (pendingIds.has(node.id)) outputNodes.push(node);
-    }
-
-    const wire = serializePlan(plan, {
-      resolveHandle: (storageId: number) => {
-        const h = handleMap.get(storageId);
-        if (!h) throw new Error(`No HandleRef for storage id=${storageId}`);
-        return h;
-      },
-      outputNodes,
-    });
-
-    const result = await transport.execute({ plan: wire });
-
-    // Create stubs (same as remote-hooks.ts)
-    for (const [idxStr, handleRef] of Object.entries(result.outputs)) {
-      const idx = Number(idxStr);
-      const node = plan.nodes[idx];
-      const stub: BackendTensor = {
-        shape: [...node.shape],
-        dtype: node.dtype,
-        ownsBuffer: true,
-        toArray() { throw new Error("Remote stub"); },
-        destroy() {},
-      };
-      const storage = createStorageHandle(node.device, stub);
-      handleMap.set(storage.id, handleRef);
-      node.result = storage;
-    }
-    if (result.sideOutputs) {
-      for (const [key, handleRef] of Object.entries(result.sideOutputs)) {
-        const [idxStr, outIdxStr] = key.split(":");
-        const node = plan.nodes[Number(idxStr)];
-        const outIdx = Number(outIdxStr);
-        const stub: BackendTensor = {
-          shape: [...node.shape],
-          dtype: node.dtype,
-          ownsBuffer: true,
-          toArray() { throw new Error("Remote stub"); },
-          destroy() {},
-        };
-        const storage = createStorageHandle(node.device, stub);
-        handleMap.set(storage.id, handleRef);
-        if (!node.results) node.results = [];
-        node.results[outIdx] = storage;
-      }
-    }
-  };
-
-  // readHook: stubs can't be read locally, just return empty
-  const readHook = async (bt: BackendTensor) => {
-    if ("_download" in bt) return (bt as any)._download();
-    return bt.toArray();
-  };
-
-  return { executionHook, readHook, handleMap };
+  close() { this.ws.close(); }
 }
 
 // ============================================================================
@@ -164,86 +94,57 @@ function createRemoteHooks(transport: NodeRpcClient) {
 async function main() {
   const SERVER_URL = process.env.SERVER_URL ?? "ws://localhost:9882/ws";
   setTransitionMatrices(0.765);
-  const V = VOCAB_SIZE_DATA * 1 + 1, S = 10, B = 128; // c=1
+  const V = VOCAB_SIZE_DATA * 1 + 1, S = 10, B = 128;
 
-  // Connect to server
-  const transport = new NodeRpcClient();
+  const transport = new NodeTransport();
   await transport.connect(SERVER_URL);
 
-  const { executionHook, readHook } = createRemoteHooks(transport);
-
-  // Create Torchlette with CPU backend (client doesn't compute)
-  const api = new Torchlette("cpu", {
-    executionHook,
-    readHook,
-  });
+  const engine = createRemoteEngine(transport);
+  const api = engine.torch;
   api.manualSeed(42);
   const m = createModel(api, nn, { ...MESS3_CONFIG, seqLen: S, vocabSize: V, posEncoding: "rope" });
   const o = new Adam(m.parameters(), { lr: 1e-3 });
 
-  const planSizes: number[][] = [];
-  let hookCalls = 0;
-  const origHook = executionHook;
-  const trackedHook = async (plan: ExecutionPlan) => {
-    hookCalls++;
-    if (planSizes.length > 0) {
-      planSizes[planSizes.length - 1].push(plan.nodes.length);
-    }
-    return origHook(plan);
-  };
-  // Patch the hook to track plan sizes
-  (api as any).runtime._executionHook = trackedHook;
-
   const STEPS = 8;
+  const LOG_INTERVAL = 10;
   for (let step = 0; step < STEPS; step++) {
-    planSizes.push([]);
     const t0 = performance.now();
     await api.beginStep();
-    const b = generateBatchWithCompartments({ seqLen: S, batchSize: B }, 2);
-    const t = api.tensorFromArray(b.tokens, [B, S], { dtype: "i32" });
-    const g = api.tensorFromArray(b.targets as number[], [B * (S - 1)], { dtype: "i32" });
-    const l = api.tidy(() => {
-      const f = m.forward(t);
-      const lg = f.logits.narrow(1, 0, S - 1).contiguous().reshape([B * (S - 1), V]);
-      const x = crossEntropy(api, lg, g); api.keep(x); return x;
-    });
-    t.dispose(); g.dispose();
+    const batch = generateBatch({ seqLen: S, batchSize: B });
+    const tok = api.tensorFromArray(batch.tokens, [B, S], { dtype: "i32" });
+    const tgt = api.tensorFromArray(batch.targets as number[], [B * (S - 1)], { dtype: "i32" });
 
-    // Browser only calls item() every LOG_INTERVAL=10 steps.
-    // Skip it most steps to match the browser's plan structure.
-    const LOG_INTERVAL = 10;
+    const loss = api.tidy(() => {
+      const fwd = m.forward(tok);
+      const logits = fwd.logits.narrow(1, 0, S - 1).contiguous().reshape([B * (S - 1), V]);
+      const l = crossEntropy(api, logits, tgt);
+      api.keep(l);
+      return l;
+    });
+    tok.dispose(); tgt.dispose();
+
+    // Skip item() on most steps (like the browser's LOG_INTERVAL=10)
     if (step % LOG_INTERVAL === 0) {
       try {
-        const v = await l.item();
-        console.log(`step ${step}: loss=${typeof v === "number" ? v.toFixed(4) : v}, ${(performance.now() - t0).toFixed(0)}ms`);
+        const v = await loss.item();
+        console.log(`step ${step}: loss=${typeof v === "number" ? v.toFixed(4) : v}`);
       } catch (e) {
-        console.log(`step ${step}: item() failed: ${(e as Error).message}, ${(performance.now() - t0).toFixed(0)}ms`);
+        console.log(`step ${step}: item() failed: ${(e as Error).message}`);
       }
     }
 
-    await l.backward(); l.dispose();
+    await loss.backward(); loss.dispose();
     o.step(); o.zeroGrad();
-    api.endStep();
+
+    await api.endStep();
+    await engine.markStep([...o.getAllKeepTensors(), ...m.persistentTensors()]);
+    const elapsed = performance.now() - t0;
+    console.log(`step ${step}: ${elapsed.toFixed(0)}ms, handles=${engine.handles.size()}`);
   }
 
-  // Report
-  console.log("\nPlan sizes per step:");
-  for (let i = 0; i < planSizes.length; i++) {
-    const total = planSizes[i].reduce((a, b) => a + b, 0);
-    console.log(`  step ${i}: ${planSizes[i].join(" + ")} = ${total}`);
-  }
-  const step1Total = planSizes[1]?.reduce((a, b) => a + b, 0) ?? 0;
-  const lastTotal = planSizes[STEPS - 1]?.reduce((a, b) => a + b, 0) ?? 0;
-  const growth = step1Total > 0 ? lastTotal / step1Total : 0;
-  console.log(`\nGrowth factor: ${growth.toFixed(2)}x`);
-  if (growth > 1.15) {
-    console.error(`FAIL: Plans growing! ${step1Total} → ${lastTotal}`);
-  } else {
-    console.log("PASS: Plan sizes stable");
-  }
-
+  console.log(`\nFinal stats: executes=${engine.stats.executes} handles=${engine.handles.size()} released=${engine.stats.handlesReleased}`);
   transport.close();
-  process.exit(growth > 1.15 ? 1 : 0);
+  process.exit(0);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });

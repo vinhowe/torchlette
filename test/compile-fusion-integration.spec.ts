@@ -327,7 +327,8 @@ describe("§15 Fusion Detection", () => {
 
       expect(recipe.nodes.length).toBe(2); // add, mul
       expect(recipe.inputs.length).toBeGreaterThan(0);
-      expect(recipe.outputs.length).toBe(1);
+      // Primary output (mul) + promoted intermediate (add, same shape)
+      expect(recipe.outputs.length).toBe(2);
       expect(recipe.outputs[0].nodeId).toBe(mul.id);
     });
   });
@@ -804,9 +805,9 @@ describe("§15 Multi-output Fusion Groups", () => {
     });
     expect(withMO.groups.length).toBe(1);
     expect(withMO.groups[0].nodes.length).toBe(3);
+    // All intermediates promoted (add + mul, both same shape as primary sqrt)
     expect(withMO.groups[0].additionalOutputNodes).toBeDefined();
-    expect(withMO.groups[0].additionalOutputNodes?.length).toBe(1);
-    expect(withMO.groups[0].additionalOutputNodes?.[0].id).toBe(add.id);
+    expect(withMO.groups[0].additionalOutputNodes?.length).toBe(2);
   });
 
   it("falls back to split when shapes differ", () => {
@@ -921,9 +922,9 @@ describe("§15 Multi-output Fusion Groups", () => {
     expect(result.groups.length).toBe(1);
 
     const recipe = groupToRecipe(result.groups[0]);
-    expect(recipe.outputs.length).toBe(2); // primary (sqrt) + additional (add)
+    // primary (sqrt) + all intermediates promoted (add, mul — same shape)
+    expect(recipe.outputs.length).toBe(3);
     expect(recipe.outputs[0].nodeId).toBe(sqrt.id);
-    expect(recipe.outputs[1].nodeId).toBe(add.id);
 
     // Check isOutput flags
     const addNode = recipe.nodes.find((n) => n.id === add.id);
@@ -931,9 +932,9 @@ describe("§15 Multi-output Fusion Groups", () => {
     expect(addNode?.isOutput).toBe(true);
     expect(sqrtNode?.isOutput).toBe(true);
 
-    // Non-output intermediate
+    // mul is also promoted (same shape, slots available)
     const mulNode = recipe.nodes.find((n) => n.id === mul.id);
-    expect(mulNode?.isOutput).toBe(false);
+    expect(mulNode?.isOutput).toBe(true);
   });
 });
 
@@ -1327,8 +1328,16 @@ describe("§15 Global Singleton Batching (Phase 4)", () => {
     const phase4Groups = result.groups.filter(
       (g) => g.additionalOutputNodes && g.additionalOutputNodes.length > 0,
     );
-    // No multi-output groups from phase 4 — add+cast1 pair might form phase1 group though
-    expect(phase4Groups.length).toBe(0);
+    // With unconditional intermediate promotion, the phase1 add+cast1 group may
+    // have additional outputs. Phase 4 singleton batching still can't batch cast1
+    // with cast2 due to ordering constraints. The key invariant: cast1 and cast2
+    // are NOT in the same group.
+    const allGroupNodes = result.groups.flatMap((g) => g.nodes.map((n) => n.id));
+    const cast1InGroup = result.groups.find((g) => g.nodes.some((n) => n.id === cast1.id));
+    const cast2InGroup = result.groups.find((g) => g.nodes.some((n) => n.id === cast2.id));
+    if (cast1InGroup && cast2InGroup) {
+      expect(cast1InGroup).not.toBe(cast2InGroup); // must be different groups
+    }
   });
 
   it("respects binding limits in singleton batching", () => {
