@@ -129,6 +129,20 @@ export class Adam {
     return this.params.slice();
   }
 
+  /**
+   * Return all tensors that must survive across step boundaries:
+   * parameters + optimizer state (momentum m, variance v).
+   * Used by remote engines for markStep() handle retention.
+   */
+  getAllKeepTensors(): Tensor[] {
+    const keep: Tensor[] = [...this.params];
+    for (let i = 0; i < this.expAvg.length; i++) {
+      keep.push(this.api._wrapRuntime(this.expAvg[i], false));
+      keep.push(this.api._wrapRuntime(this.expAvgSq[i], false));
+    }
+    return keep;
+  }
+
   /** Get the default (first group) learning rate. */
   getLR(): number {
     return this._groups[0].lr;
