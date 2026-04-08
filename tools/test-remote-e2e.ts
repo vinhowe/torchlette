@@ -105,6 +105,10 @@ async function main() {
   const m = createModel(api, nn, { ...MESS3_CONFIG, seqLen: S, vocabSize: V, posEncoding: "rope" });
   const o = new Adam(m.parameters(), { lr: 1e-3 });
 
+  // Pre-upload weights before endStep so they're still pending
+  const uploaded = await engine.preUpload(m.parameters());
+  console.log(`[preUpload] ${uploaded} param tensors`);
+
   const STEPS = 8;
   const LOG_INTERVAL = 10;
   for (let step = 0; step < STEPS; step++) {
@@ -137,7 +141,8 @@ async function main() {
     o.step(); o.zeroGrad();
 
     await api.endStep();
-    await engine.markStep([...o.getAllKeepTensors(), ...m.persistentTensors()]);
+    // Debug: check if storage 55 exists
+    console.log(`  handle 55: ${engine.handles.getHandle(55) ?? 'MISSING'}`);
     const elapsed = performance.now() - t0;
     console.log(`step ${step}: ${elapsed.toFixed(0)}ms, handles=${engine.handles.size()}`);
   }

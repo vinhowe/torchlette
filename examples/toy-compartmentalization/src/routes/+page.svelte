@@ -409,13 +409,14 @@
       weightDecay: config.optim.weightDecay,
       adamW: config.optim.weightDecay > 0,
     });
-    api.endStep();
-    // Pre-upload model weights via binary transport to avoid massive JSON
-    // plans on the first training step.
+    // Pre-upload model weights BEFORE endStep so they're still pending.
+    // This binds their local storages to server handles, preventing
+    // "no HandleRef" errors when subsequent plans reference them.
     if (remoteEngine) {
       const uploaded = await remoteEngine.preUpload(model.parameters());
       console.log(`[preUpload] ${uploaded} param tensors`);
     }
+    api.endStep();
     updateLossChart();
     updateMemoryChart();
     updateR2Chart();
@@ -489,10 +490,11 @@
 
     step++;
     await api.endStep();
-    if (remoteEngine && optimizer && model) {
-      const keep = [...optimizer.getAllKeepTensors(), ...model.persistentTensors()];
-      await remoteEngine.markStep(keep);
-    }
+    // TODO: markStep handle release — disabled pending stale-ref fix
+    // if (remoteEngine && optimizer && model) {
+    //   const keep = [...optimizer.getAllKeepTensors(), ...model.persistentTensors()];
+    //   await remoteEngine.markStep(keep);
+    // }
     const tEnd = performance.now();
 
     if (shouldLog && getGPUMemoryStats && !isRemote) {

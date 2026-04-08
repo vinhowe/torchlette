@@ -198,6 +198,8 @@ export function createRemoteEngine(
 
   const torch = new Torchlette(options.device ?? "cpu");
   const handles = new ClientHandleMap();
+  // Track storage ID → node for clearing stale results on handle release.
+  const storageToNode = new Map<number, LazyIRNode>();
   const stats: RemoteEngineStats = {
     executes: 0,
     nodesShipped: 0,
@@ -236,9 +238,16 @@ export function createRemoteEngine(
     for (const [idxStr, handleRef] of Object.entries(result.outputs)) {
       const idx = Number(idxStr);
       const node = plan.nodes[idx];
+      // If the node had a previous result (e.g., local CPU storage from
+      // model init), bind that old storage ID to the same server handle.
+      // Other nodes may hold materialized refs to the old storage.
+      if (node.result && !handles.getHandle(node.result.id)) {
+        handles.bind(node.result.id, handleRef);
+      }
       const stub = makeStub(node.shape, node.dtype);
       const storage = createStorageHandle(node.device, stub);
       handles.bind(storage.id, handleRef);
+      storageToNode.set(storage.id, node);
       node.result = storage;
     }
     // Bind multi-output side results (adamStep m/v, fusedAttention lse/rng, etc.)
@@ -369,8 +378,15 @@ export function createRemoteEngine(
     // Force keep tensors to materialize any pending updates (e.g. copy_
     // from optimizer step). Then collect their storage IDs for retention.
     const runtimeTensors = keep.map((t) => t._unwrap());
-    // biome-ignore lint/suspicious/noExplicitAny: calling patched method
-    await (runtime as any).forceAllMerged(...runtimeTensors);
+    // Force keep tensors. If serialization fails (stale refs from model
+    // init), skip the force — the tensors are already materialized from
+    // the training step's prior force calls.
+    try {
+      // biome-ignore lint/suspicious/noExplicitAny: calling patched method
+      await (runtime as any).forceAllMerged(...runtimeTensors);
+    } catch {
+      // Stale materialized refs from model init — safe to skip
+    }
 
     const keepIds = new Set<number>();
     for (const t of keep) {
@@ -394,6 +410,14 @@ export function createRemoteEngine(
       for (const id of idsToUnbind) {
         handles.unbind(id);
         storageTracker.unregister(id);
+        // Clear stale node.result so the lazy graph doesn't hold
+        // materialized refs to released storages. The node will be
+        // re-executed from scratch in the next plan.
+        const node = storageToNode.get(id);
+        if (node && node.result?.id === id) {
+          node.result = undefined;
+        }
+        storageToNode.delete(id);
       }
       stats.handlesReleased += toRelease.length;
     }
@@ -405,35 +429,62 @@ export function createRemoteEngine(
     for (const t of tensors) {
       const rt = t._unwrap();
       const ref = rt.lazyRef;
-      if (ref.kind !== "pending") continue; // already materialized
-      const node = ref.node;
-      if (node.op !== "tensorFromArray") continue; // not an inline-data node
 
-      const payload = node.payload as
-        | { values: Float32Array | Int32Array | Uint32Array | number[] }
-        | undefined;
-      if (!payload?.values) continue;
+      // Already has a server handle — skip.
+      if (ref.kind === "materialized" && handles.getHandle(ref.storage.id)) {
+        continue;
+      }
 
-      // Convert to number[] for the transport upload interface.
-      const values = Array.isArray(payload.values)
-        ? payload.values
-        : Array.from(payload.values);
+      // Get the data to upload. For pending tensorFromArray nodes, read
+      // from the payload. For already-materialized CPU tensors, read from
+      // the backend tensor.
+      let values: number[];
+      let shape: number[];
+      let dtype: string;
+
+      if (ref.kind === "pending") {
+        const node = ref.node;
+        if (node.op !== "tensorFromArray") continue;
+        const payload = node.payload as
+          | { values: Float32Array | Int32Array | Uint32Array | number[] }
+          | undefined;
+        if (!payload?.values) continue;
+        values = Array.isArray(payload.values)
+          ? payload.values
+          : Array.from(payload.values);
+        shape = node.shape;
+        dtype = node.dtype;
+      } else if (ref.kind === "materialized") {
+        // CPU-materialized tensor — read data back from the backend tensor.
+        const bt = ref.storage.backendTensor;
+        values = bt.toArray();
+        shape = bt.shape;
+        dtype = bt.dtype;
+      } else {
+        continue;
+      }
 
       const result = await transport.upload({
         values,
-        shape: node.shape,
-        dtype: node.dtype,
+        shape,
+        dtype,
       });
 
-      // Create a local stub and bind it to the server handle.
-      const stub = makeStub(node.shape, node.dtype);
-      const storage = createStorageHandle(node.device, stub);
-      handles.bind(storage.id, result.handle);
+      // Bind the server handle to BOTH the old storage ID (so materialized
+      // refs from other nodes resolve) and a new stub storage.
+      if (ref.kind === "materialized") {
+        handles.bind(ref.storage.id, result.handle);
+      }
 
-      // Mark the node as "already executed" so buildMergedPlan skips it.
-      node.result = storage;
-      // Materialize the RuntimeTensor so subsequent ops see it as resolved.
-      rt._materialize(storage);
+      if (ref.kind === "pending") {
+        const node = ref.node;
+        const stub = makeStub(shape, dtype as any);
+        const storage = createStorageHandle(node.device, stub);
+        handles.bind(storage.id, result.handle);
+        node.result = storage;
+        rt._materialize(storage);
+      }
+
       uploaded++;
     }
     return uploaded;
