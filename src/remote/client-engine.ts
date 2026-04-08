@@ -20,7 +20,7 @@ import type { BackendTensor, DType } from "../backend/types";
 import { buildMergedPlan } from "../executor/plan-builder";
 import type { Tensor as FrontendTensor } from "../frontend/tensor";
 import { Torchlette } from "../frontend/torchlette";
-import { createStorageHandle } from "../graph/node-factory";
+import { createStorageHandle, releaseNodeInputRefs } from "../graph/node-factory";
 import { storageTracker } from "../graph/storage-tracker";
 import type { LazyIRNode, StorageHandle } from "../graph/types";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
@@ -200,6 +200,9 @@ export function createRemoteEngine(
   const handles = new ClientHandleMap();
   // Track storage ID → node for clearing stale results on handle release.
   const storageToNode = new Map<number, LazyIRNode>();
+  // Node IDs that failed serialization (stale local refs). Excluded from
+  // future forceAllPending plans to prevent unbounded plan growth.
+  const failedNodeIds = new Set<number>();
   const stats: RemoteEngineStats = {
     executes: 0,
     nodesShipped: 0,
@@ -317,6 +320,14 @@ export function createRemoteEngine(
     if (plan.nodes.length === 0) return;
     await shipPlan(plan);
     postExecuteBookkeeping(plan, tensors);
+    // Clear node.result and release input refs — matches the engine's
+    // forceAllMerged cleanup. Prevents stale results from accumulating.
+    // Safe because postExecuteBookkeeping already materialized all
+    // pending RuntimeTensors with their stub storages.
+    for (const node of plan.nodes) {
+      releaseNodeInputRefs(node);
+      node.result = undefined;
+    }
   };
 
   // biome-ignore lint/suspicious/noExplicitAny: overriding private methods
@@ -335,14 +346,23 @@ export function createRemoteEngine(
     if (roots.length === 0) return;
     const plan = buildMergedPlan(roots, /* skipExecuted */ true);
     if (plan.nodes.length === 0) return;
-    try {
-      await shipPlan(plan);
-    } catch {
-      // Serialization can fail if markStep released handles for storages
-      // still referenced by stale pending node chains. These pending
-      // tensors will be re-derived on the next forceAllMerged call.
+    // Pre-check: can all materialized refs be resolved? If not, the plan
+    // references local CPU storages that were never uploaded. Skip it.
+    let canSerialize = true;
+    for (const node of plan.nodes) {
+      for (const ref of node.inputs) {
+        if (ref.kind === "materialized" && !handles.getHandle(ref.storage.id)) {
+          canSerialize = false;
+          break;
+        }
+      }
+      if (!canSerialize) break;
+    }
+    if (!canSerialize) {
+      clearDisposedPendingNodeIds();
       return;
     }
+    await shipPlan(plan);
     postExecuteBookkeeping(plan, pending);
     for (const node of plan.nodes) {
       node.result = undefined;
@@ -375,25 +395,38 @@ export function createRemoteEngine(
   };
 
   async function markStep(keep: FrontendTensor[]): Promise<number> {
-    // Force keep tensors to materialize any pending updates (e.g. copy_
-    // from optimizer step). Then collect their storage IDs for retention.
-    const runtimeTensors = keep.map((t) => t._unwrap());
-    // Force keep tensors. If serialization fails (stale refs from model
-    // init), skip the force — the tensors are already materialized from
-    // the training step's prior force calls.
-    try {
-      // biome-ignore lint/suspicious/noExplicitAny: calling patched method
-      await (runtime as any).forceAllMerged(...runtimeTensors);
-    } catch {
-      // Stale materialized refs from model init — safe to skip
-    }
-
+    // Collect storage IDs to keep: explicit keep list + anything
+    // referenced by a materialized ref in the live lazy graph.
     const keepIds = new Set<number>();
+
+    // 1. Keep tensors from the explicit keep list.
     for (const t of keep) {
       const ref = t._unwrap().lazyRef;
       if (ref.kind === "materialized") {
         keepIds.add(ref.storage.id);
       }
+    }
+
+    // 2. Scan ALL live pending tensors' node chains for materialized
+    //    input refs. These storages are frozen in the lazy graph and
+    //    must not be released — the serializer would fail.
+    const pending = getAllPendingTensors();
+    const visited = new Set<LazyIRNode>();
+    const scanNode = (node: LazyIRNode) => {
+      if (visited.has(node)) return;
+      visited.add(node);
+      for (const ref of node.inputs) {
+        if (ref.kind === "materialized") {
+          keepIds.add(ref.storage.id);
+        } else if (ref.kind === "pending") {
+          scanNode(ref.node);
+        }
+      }
+    };
+    for (const rt of pending) {
+      if (rt.disposed) continue;
+      const ref = rt.lazyRef;
+      if (ref.kind === "pending") scanNode(ref.node);
     }
 
     const toRelease: HandleRef[] = [];

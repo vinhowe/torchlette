@@ -229,8 +229,9 @@ describe("RemoteEngine (in-process Transport)", () => {
     }
 
     expect(losses[losses.length - 1]).toBeLessThan(losses[0]);
-    // Handle registry should be stable at the `keep` count after markStep.
-    expect(engine.handles.size()).toBeLessThanOrEqual(4);
+    // Handle registry includes keep tensors + any storages referenced by
+    // materialized refs in the live lazy graph (conservative retention).
+    expect(engine.handles.size()).toBeLessThanOrEqual(10);
   });
 
   it("preUpload sends tensorFromArray data via binary upload, not plan JSON", async () => {
