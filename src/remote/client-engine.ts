@@ -27,6 +27,7 @@ import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import {
   clearDisposedPendingNodeIds,
   getAllPendingTensors,
+  getPendingNodeIds,
   materializePendingTensors,
 } from "../runtime/tensor";
 import type {
@@ -224,9 +225,18 @@ export function createRemoteEngine(
   async function shipPlan(plan: { nodes: LazyIRNode[] }): Promise<void> {
     if (plan.nodes.length === 0) return;
 
+    // Tell the server which nodes need results (have pending RuntimeTensors).
+    // This lets the server fuse intermediates without losing output nodes.
+    const pendingIds = getPendingNodeIds();
+    const outputNodes: LazyIRNode[] = [];
+    for (const node of plan.nodes) {
+      if (pendingIds.has(node.id)) outputNodes.push(node);
+    }
+
     const t0 = performance.now();
     const wire = serializePlan(plan, {
       resolveHandle: (id: number) => handles.requireHandle(id),
+      outputNodes,
     });
     stats.executes++;
     stats.nodesShipped += plan.nodes.length;
@@ -247,6 +257,19 @@ export function createRemoteEngine(
       const storage = createStorageHandle(node.device, stub);
       handles.bind(storage.id, handleRef);
       node.result = storage;
+    }
+    // Bind multi-output side results (adamStep m/v, fusedAttention lse/rng, etc.)
+    if (result.sideOutputs) {
+      for (const [key, handleRef] of Object.entries(result.sideOutputs)) {
+        const [idxStr, outIdxStr] = key.split(":");
+        const node = plan.nodes[Number(idxStr)];
+        const outIdx = Number(outIdxStr);
+        const stub = makeStub(node.shape, node.dtype);
+        const storage = createStorageHandle(node.device, stub);
+        handles.bind(storage.id, handleRef);
+        if (!node.results) node.results = [];
+        node.results[outIdx] = storage;
+      }
     }
     stats.bookkeepingMs += performance.now() - t2;
   }

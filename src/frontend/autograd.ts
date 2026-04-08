@@ -11,17 +11,16 @@ import type { Torchlette } from "./torchlette";
 import type { AutogradNode, GetSavedFn } from "./types";
 
 /**
- * Collect saved tensors from all autograd nodes (triggers lazy recompute
- * graph construction for checkpointed tensors) and force them all in a
- * single merged plan.
+ * Collect saved tensors from all autograd nodes. Triggers lazy recompute
+ * graph construction for checkpointed segments. Returns the unpacked
+ * tensors and whether any checkpoint recomputation occurred.
  */
-async function collectAndForceSavedTensors(
+function collectSavedTensors(
   torch: Torchlette,
   ordered: AutogradNode[],
-): Promise<Map<AutogradNode, Tensor[]>> {
-  const allUnpackedTensors = new Map<AutogradNode, Tensor[]>();
+): { unpacked: Map<AutogradNode, Tensor[]>; hasCheckpoints: boolean } {
+  const unpacked = new Map<AutogradNode, Tensor[]>();
 
-  // Phase A: Collect all unpacked tensors.
   // Suppress markEscaped during checkpoint recomputation so recomputed
   // RuntimeTensors stay tracked (not escaped) in TidyDispatchMode.
   // This ensures disposeNonEscaped() cleans them up after backward.
@@ -45,13 +44,13 @@ async function collectAndForceSavedTensors(
         const tensor = slot.unpackHook(slot.packed);
         unpackedTensors.push(tensor);
       }
-      allUnpackedTensors.set(node, unpackedTensors);
+      unpacked.set(node, unpackedTensors);
     }
   } finally {
     torch._inCheckpointRecompute = false;
-    // Close the recompute scope BEFORE Phase B. Phase B's forceAllMerged
-    // creates RuntimeTensors during plan execution that are normal outputs,
-    // NOT checkpoint intermediates. Including them in the scope would cause
+    // Close the recompute scope BEFORE any forcing. forceAllMerged creates
+    // RuntimeTensors during plan execution that are normal outputs, NOT
+    // checkpoint intermediates. Including them in the scope would cause
     // massive over-disposal in Full FT mode (588+ tensors/step).
     torch._checkpointRecomputeTensors = null;
     if (recomputeScope.size > 0) {
@@ -59,18 +58,7 @@ async function collectAndForceSavedTensors(
     }
   }
 
-  // Phase B: Force all saved tensors in ONE merged plan.
-  const allPending: RuntimeTensor[] = [];
-  for (const tensors of allUnpackedTensors.values()) {
-    for (const t of tensors) {
-      allPending.push(t._unwrap());
-    }
-  }
-  if (allPending.length > 0) {
-    await torch.runtime.forceAllMerged(...allPending);
-  }
-
-  return allUnpackedTensors;
+  return { unpacked, hasCheckpoints: recomputeScope.size > 0 };
 }
 
 /**
@@ -295,27 +283,43 @@ export async function backwardImpl(
         const rootNode = a._gradNode();
         if (rootNode) visit(rootNode);
 
-        // Force all tensors needed for backward
-        // Skip disposed/materialized tensors to avoid redundant plan building
-        const tensorsToForce: RuntimeTensor[] = [];
-        if (!seed.isMaterialized()) tensorsToForce.push(seed);
-        for (const node of ordered) {
-          for (const input of node.inputs) {
-            const rt = input._unwrap();
-            if (!rt.disposed && !rt.isMaterialized()) {
-              tensorsToForce.push(rt);
+        // Collect saved tensors (triggers checkpoint recomputation if any).
+        const { unpacked: allUnpackedTensors, hasCheckpoints } =
+          collectSavedTensors(torch, ordered);
+
+        if (hasCheckpoints) {
+          // Checkpoint backward needs separate plans: forward tensors first,
+          // then recomputed saved tensors. The saved-tensor plan must only
+          // contain recomputed nodes — mixing in unmaterialized forward nodes
+          // causes DSL rewrites to produce invalid reshape operations.
+          const forwardToForce: RuntimeTensor[] = [];
+          if (!seed.isMaterialized()) forwardToForce.push(seed);
+          for (const node of ordered) {
+            for (const input of node.inputs) {
+              const rt = input._unwrap();
+              if (!rt.disposed && !rt.isMaterialized()) {
+                forwardToForce.push(rt);
+              }
             }
           }
-        }
-        if (tensorsToForce.length > 0) {
-          await torch.runtime.forceAllMerged(...tensorsToForce);
-        }
+          if (forwardToForce.length > 0) {
+            await torch.runtime.forceAllMerged(...forwardToForce);
+          }
 
-        // Collect checkpoint-recomputed saved tensors and force them
-        const allUnpackedTensors = await collectAndForceSavedTensors(
-          torch,
-          ordered,
-        );
+          // Force recomputed saved tensors.
+          const savedToForce: RuntimeTensor[] = [];
+          for (const tensors of allUnpackedTensors.values()) {
+            for (const t of tensors) {
+              savedToForce.push(t._unwrap());
+            }
+          }
+          if (savedToForce.length > 0) {
+            await torch.runtime.forceAllMerged(...savedToForce);
+          }
+        }
+        // Non-checkpoint backward: skip both forces. All backward functions
+        // only build lazy graph nodes (never read tensor values), so the
+        // merged fwd+bwd plan reduces force points from 3 to 1.
 
         // Run backward functions
         await runBackwardFunctions(torch, ordered, gradMap, allUnpackedTensors);

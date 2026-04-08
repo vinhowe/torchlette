@@ -777,9 +777,18 @@ export class RuntimeEngine {
     // Materialize any remaining tensors whose nodes were already executed
     const skippedNodes = materializeRemaining(tensors);
 
-    // Release the plan-input retains now that execution is done
-    for (const node of plan.nodes) releaseNodeInputRefs(node);
-    for (const node of skippedNodes) releaseNodeInputRefs(node);
+    // Release plan-input retains and clear node.result to prevent stale
+    // results from accumulating across steps. Without this, the execution
+    // hook path creates stubs that persist on node.result, causing plan
+    // sizes to grow linearly per step.
+    for (const node of plan.nodes) {
+      releaseNodeInputRefs(node);
+      node.result = undefined;
+    }
+    for (const node of skippedNodes) {
+      releaseNodeInputRefs(node);
+      node.result = undefined;
+    }
   }
 
   /**

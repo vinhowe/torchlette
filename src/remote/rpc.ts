@@ -43,6 +43,8 @@ export interface ExecuteResult {
   /** For each output node idx (from plan.outputNodes, or all nodes), the
    * server-allocated HandleRef. */
   outputs: Record<NodeIdx, HandleRef>;
+  /** Multi-output side results keyed by "nodeIdx:outputIndex". */
+  sideOutputs?: Record<string, HandleRef>;
 }
 
 /** Upload a tensor to the server, registering its handle. */

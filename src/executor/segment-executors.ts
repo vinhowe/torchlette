@@ -302,13 +302,22 @@ export async function executeRowProgram(
       "../backend/webgpu/row-program-dispatch"
     );
 
-    // Force-execute any unresolved pending inputs before dispatch.
-    // This handles the case where the lowered plan's action ordering places
-    // the row-program before a data-source action for one of its external inputs
-    // (e.g., tensorFromArray nodes created during checkpoint recomputation).
+    // Force-execute any unresolved pending inputs (and their transitive
+    // dependencies) before dispatch. The lowered plan may place the
+    // row-program action before data-source or intermediate nodes that
+    // feed into it (e.g., full → triu for attention masks).
+    const forceWithDeps = async (node: LazyIRNode): Promise<void> => {
+      if (node.result) return;
+      for (const inp of node.inputs) {
+        if (inp.kind === "pending" && !inp.node.result) {
+          await forceWithDeps(inp.node);
+        }
+      }
+      await executeNode(node, backend);
+    };
     for (const ref of inputRefs) {
       if (ref.kind === "pending" && !ref.node.result) {
-        await executeNode(ref.node, backend);
+        await forceWithDeps(ref.node);
       }
     }
 
