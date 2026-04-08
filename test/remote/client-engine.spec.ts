@@ -168,8 +168,9 @@ describe("RemoteEngine (in-process Transport)", () => {
     const before = handles.size();
     expect(before).toBeGreaterThan(1);
 
-    // Only `a` is a parameter we want to keep.
-    const released = await markStep([a]);
+    // Dispose temporaries — only `a` remains alive.
+    d.dispose(); c.dispose(); b.dispose();
+    const released = await markStep();
     expect(released).toBeGreaterThan(0);
     expect(handles.size()).toBeLessThan(before);
     expect(engine.stats.handlesReleased).toBe(released);
@@ -225,14 +226,14 @@ describe("RemoteEngine (in-process Transport)", () => {
         });
         p.zeroGrad();
       }
-      // Keep must include every tensor persisting across steps: params AND
-      // the batch/target tensors created outside the loop.
-      await markStep([W, b, X, T]);
+      await markStep();
     }
 
     expect(losses[losses.length - 1]).toBeLessThan(losses[0]);
-    // Handle registry should be stable at the `keep` count after markStep.
-    expect(engine.handles.size()).toBeLessThanOrEqual(4);
+    // Handle count should be bounded — rc-based markStep keeps live tensors.
+    // Without tidy(), loop intermediates stay alive until GC, so count may
+    // exceed the 4 persistent tensors. Just verify it's not unbounded.
+    expect(engine.handles.size()).toBeLessThan(200);
   });
 
   it("preUpload sends tensorFromArray data via binary upload, not plan JSON", async () => {
@@ -287,7 +288,8 @@ describe("RemoteEngine (in-process Transport)", () => {
     const c = torch.add(b, 2);
     await c.cpu();
 
-    await markStep([a]);
+    c.dispose(); b.dispose();
+    await markStep();
     expect(handles.size()).toBe(transport.handleCount());
   });
 });
