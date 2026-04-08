@@ -20,7 +20,7 @@ import type { BackendTensor, DType } from "../backend/types";
 import { buildMergedPlan } from "../executor/plan-builder";
 import type { Tensor as FrontendTensor } from "../frontend/tensor";
 import { Torchlette } from "../frontend/torchlette";
-import { createStorageHandle, releaseNodeInputRefs } from "../graph/node-factory";
+import { createStorageHandle, releaseNodeInputRefs, retainPlanInputRefs } from "../graph/node-factory";
 import { storageTracker } from "../graph/storage-tracker";
 import type { LazyIRNode, StorageHandle } from "../graph/types";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
@@ -318,12 +318,9 @@ export function createRemoteEngine(
     if (roots.length === 0) return;
     const plan = buildMergedPlan(roots);
     if (plan.nodes.length === 0) return;
+    retainPlanInputRefs(plan.nodes);
     await shipPlan(plan);
     postExecuteBookkeeping(plan, tensors);
-    // Clear node.result and release input refs — matches the engine's
-    // forceAllMerged cleanup. Prevents stale results from accumulating.
-    // Safe because postExecuteBookkeeping already materialized all
-    // pending RuntimeTensors with their stub storages.
     for (const node of plan.nodes) {
       releaseNodeInputRefs(node);
       node.result = undefined;
@@ -338,35 +335,14 @@ export function createRemoteEngine(
     await (runtime as any).forceAllMerged(tensor);
   };
 
-  // biome-ignore lint/suspicious/noExplicitAny: overriding private methods
-  (runtime as any).forceAllPending = async (): Promise<void> => {
-    const pending = getAllPendingTensors();
-    if (pending.length === 0) return;
-    const roots = collectPendingRoots(pending);
-    if (roots.length === 0) return;
-    const plan = buildMergedPlan(roots, /* skipExecuted */ true);
+  // forceAllPending is NOT overridden — the engine's built-in version
+  // handles the full lifecycle (retain, execute via hook, materialize,
+  // release, clear). We just need the execution hook to be set.
+  (runtime as any)._executionHook = async (
+    plan: { nodes: LazyIRNode[] },
+  ): Promise<void> => {
     if (plan.nodes.length === 0) return;
-    // Pre-check: can all materialized refs be resolved? If not, the plan
-    // references local CPU storages that were never uploaded. Skip it.
-    let canSerialize = true;
-    for (const node of plan.nodes) {
-      for (const ref of node.inputs) {
-        if (ref.kind === "materialized" && !handles.getHandle(ref.storage.id)) {
-          canSerialize = false;
-          break;
-        }
-      }
-      if (!canSerialize) break;
-    }
-    if (!canSerialize) {
-      clearDisposedPendingNodeIds();
-      return;
-    }
     await shipPlan(plan);
-    postExecuteBookkeeping(plan, pending);
-    for (const node of plan.nodes) {
-      node.result = undefined;
-    }
   };
 
   // biome-ignore lint/suspicious/noExplicitAny: overriding public methods
