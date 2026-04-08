@@ -489,9 +489,8 @@
 
     step++;
     await api.endStep();
-    if (remoteEngine && optimizer && model) {
-      const keep = [...optimizer.getAllKeepTensors(), ...model.persistentTensors()];
-      await remoteEngine.markStep(keep);
+    if (remoteEngine) {
+      await remoteEngine.markStep();
     }
     const tEnd = performance.now();
 

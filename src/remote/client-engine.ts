@@ -156,18 +156,14 @@ export interface RemoteEngine {
   /** Cumulative stats across the session. */
   stats: RemoteEngineStats;
   /**
-   * Release server-side handles for any storage NOT held by one of the
-   * `keep` tensors. Call at end of each training step to prevent unbounded
+   * Release server-side handles for storages no longer referenced by any
+   * live tensor. Call at end of each training step to prevent unbounded
    * server memory growth. Returns the number of handles released.
    *
-   * **`keep` must include every tensor the caller still holds a reference
-   * to past this boundary** — model parameters, optimizer state, any
-   * batch/target tensors created outside the step, etc. Anything not in
-   * `keep` is assumed to be a step-scoped intermediate safe to drop.
-   * Forgetting a persistent tensor will break the next plan that
-   * references it with "no HandleRef for storage id=…".
+   * Automatically determines what to keep via reference counting — no
+   * need to enumerate parameters, optimizer state, or model buffers.
    */
-  markStep(keep: FrontendTensor[]): Promise<number>;
+  markStep(): Promise<number>;
   /**
    * Pre-upload pending `tensorFromArray` tensors via binary transport,
    * bypassing JSON plan serialization. Call once before the first training
@@ -375,27 +371,20 @@ export function createRemoteEngine(
     return result.value;
   };
 
-  async function markStep(keep: FrontendTensor[]): Promise<number> {
-    // Force all params to materialize any pending updates (e.g. from a
-    // copy_ after an optimizer step). Without this, a param's lazyRef is
-    // still pending and we can't identify its storage for the keep set —
-    // we'd release storages that the pending chain still references.
-    const runtimeTensors = keep.map((t) => t._unwrap());
+  async function markStep(keep?: FrontendTensor[]): Promise<number> {
+    // Force all pending tensors so every live tensor is materialized
+    // and its storage ID is known for the keep/release decision.
     // biome-ignore lint/suspicious/noExplicitAny: calling patched method
-    await (runtime as any).forceAllMerged(...runtimeTensors);
+    await (runtime as any).forceAllPending();
 
-    const keepIds = new Set<number>();
-    for (const t of keep) {
-      const ref = t._unwrap().lazyRef;
-      if (ref.kind === "materialized") {
-        keepIds.add(ref.storage.id);
-      }
-    }
-
+    // Keep any handle whose storage still has a positive reference count
+    // (held by a live RuntimeTensor — params, optimizer state, model
+    // buffers like RoPE tables, etc.). No explicit enumeration needed.
+    const { rcGet } = await import("../graph/refcount");
     const toRelease: HandleRef[] = [];
     const idsToUnbind: number[] = [];
     for (const [id, handle] of handles.entries()) {
-      if (!keepIds.has(id)) {
+      if (rcGet(id) <= 0) {
         toRelease.push(handle);
         idsToUnbind.push(id);
       }
@@ -405,8 +394,6 @@ export function createRemoteEngine(
       await transport.release({ handles: toRelease });
       for (const id of idsToUnbind) {
         handles.unbind(id);
-        // Unregister the stub StorageHandle from the global tracker so it
-        // doesn't accumulate across steps (causes growing overhead).
         storageTracker.unregister(id);
       }
       stats.handlesReleased += toRelease.length;
