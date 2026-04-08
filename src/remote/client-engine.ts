@@ -323,7 +323,7 @@ export function createRemoteEngine(
     postExecuteBookkeeping(plan, tensors);
     for (const node of plan.nodes) {
       releaseNodeInputRefs(node);
-      node.result = undefined;
+      node._executed = true;
     }
   };
 

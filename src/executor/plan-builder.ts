@@ -65,7 +65,7 @@ export function buildMergedPlan(
 
   const visit = (ref: LazyRef) => {
     if (ref.kind !== "pending") return;
-    if (skipExecuted && ref.node.result) return;
+    if (skipExecuted && (ref.node.result || ref.node._executed)) return;
     if (visited.has(ref.node)) return;
     visited.add(ref.node);
 
