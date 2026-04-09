@@ -17,18 +17,13 @@
 import { cpuBackend } from "../backend/cpu";
 import { registerBackend } from "../backend/registry";
 import type { BackendTensor, DType } from "../backend/types";
-import { buildMergedPlan } from "../executor/plan-builder";
 import type { Tensor as FrontendTensor } from "../frontend/tensor";
 import { Torchlette } from "../frontend/torchlette";
-import { createStorageHandle, releaseNodeInputRefs, retainPlanInputRefs } from "../graph/node-factory";
+import { createStorageHandle } from "../graph/node-factory";
 import { storageTracker } from "../graph/storage-tracker";
 import type { LazyIRNode, StorageHandle } from "../graph/types";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
-import {
-  clearDisposedPendingNodeIds,
-  getAllPendingTensors,
-  materializePendingTensors,
-} from "../runtime/tensor";
+import { getAllPendingTensors } from "../runtime/tensor";
 import type {
   DownloadParams,
   DownloadResult,
@@ -269,75 +264,8 @@ export function createRemoteEngine(
     stats.bookkeepingMs += performance.now() - t2;
   }
 
-  function collectPendingRoots(
-    tensors: readonly RuntimeTensor[],
-  ): LazyIRNode[] {
-    const roots: LazyIRNode[] = [];
-    for (const t of tensors) {
-      if (t.isMaterialized() || t.disposed) continue;
-      const ref = t.lazyRef;
-      if (ref.kind === "pending") roots.push(ref.node);
-    }
-    return roots;
-  }
-
-  function materializeRemaining(tensors: readonly RuntimeTensor[]): void {
-    for (const t of tensors) {
-      if (t.isMaterialized() || t.disposed) continue;
-      const ref = t.lazyRef;
-      if (ref.kind === "pending") {
-        const idx = ref.outputIndex ?? 0;
-        const storage = idx === 0 ? ref.node.result : ref.node.results?.[idx];
-        if (storage) t._materialize(storage);
-      }
-    }
-  }
-
-  function postExecuteBookkeeping(
-    plan: { nodes: LazyIRNode[] },
-    tensors: readonly RuntimeTensor[],
-  ): void {
-    for (const node of plan.nodes) {
-      if (node.result) {
-        materializePendingTensors(node.id, node.result, node.results);
-      }
-    }
-    clearDisposedPendingNodeIds();
-    materializeRemaining(tensors);
-  }
-
-  // Override runtime force methods. These are not normally callable from
-  // outside the engine, but they're the interception points where
-  // autograd + user code delegate to the backend.
-
-  // biome-ignore lint/suspicious/noExplicitAny: overriding private methods
-  (runtime as any).forceAllMerged = async (
-    ...tensors: RuntimeTensor[]
-  ): Promise<void> => {
-    const roots = collectPendingRoots(tensors);
-    if (roots.length === 0) return;
-    const plan = buildMergedPlan(roots);
-    if (plan.nodes.length === 0) return;
-    retainPlanInputRefs(plan.nodes);
-    await shipPlan(plan);
-    postExecuteBookkeeping(plan, tensors);
-    for (const node of plan.nodes) {
-      releaseNodeInputRefs(node);
-      node._executed = true;
-    }
-  };
-
-  // biome-ignore lint/suspicious/noExplicitAny: overriding private methods
-  (runtime as any).force = async (tensor: RuntimeTensor): Promise<void> => {
-    if (tensor.isMaterialized() || tensor.disposed) return;
-    if (tensor.lazyRef.kind !== "pending") return;
-    // biome-ignore lint/suspicious/noExplicitAny: reusing patched method
-    await (runtime as any).forceAllMerged(tensor);
-  };
-
-  // forceAllPending is NOT overridden — the engine's built-in version
-  // handles the full lifecycle (retain, execute via hook, materialize,
-  // release, clear). We just need the execution hook to be set.
+  // Let the engine manage the full force lifecycle (retain, execute,
+  // materialize, release, mark _executed). The hook just ships plans.
   (runtime as any)._executionHook = async (
     plan: { nodes: LazyIRNode[] },
   ): Promise<void> => {

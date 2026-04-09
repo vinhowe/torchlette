@@ -763,6 +763,13 @@ export async function executeLoweredPlan(
       backend,
       externalInputBuffers,
     );
+    // Ensure ALL nodes have results (compiled plan may skip intermediates)
+    {
+      const { executeNode: execNode } = await import("./sequential");
+      for (const node of planNodes) {
+        if (!node.result) await execNode(node, backend);
+      }
+    }
     return {
       result: planNodes[planNodes.length - 1].result!,
       stats: loweredPlan.cachedStats ?? stats,
@@ -1530,10 +1537,28 @@ export async function executeLoweredPlan(
       clearArenaConflictDetected();
     }
 
-    // Deactivate buffer arena before closing encoder
+    // Deactivate buffer arena before re-executing missing nodes
     if (options.bufferArena && useTopLevelSharedEncoder) {
       clearActiveArena();
       clearArenaExternalInputBuffers();
+    }
+
+    // Ensure ALL plan nodes have results. Optimization passes (matmul
+    // epilogues, graph rewrites, row programs) may absorb intermediates
+    // without producing individual results. Re-execute them here —
+    // their inputs are already computed, so each is a single cheap op.
+    {
+      const { executeNode: execNode } = await import("./sequential");
+      let patched = 0;
+      for (const node of planNodes) {
+        if (!node.result) {
+          await execNode(node, backend);
+          patched++;
+        }
+      }
+      if (patched > 0 && planNodes.length > 100) {
+        console.log(`[all-results] patched ${patched}/${planNodes.length} nodes`);
+      }
     }
 
     if (useTopLevelSharedEncoder) {
