@@ -763,13 +763,6 @@ export async function executeLoweredPlan(
       backend,
       externalInputBuffers,
     );
-    // Ensure ALL nodes have results (compiled plan may skip intermediates)
-    {
-      const { executeNode: execNode } = await import("./sequential");
-      for (const node of planNodes) {
-        if (!node.result) await execNode(node, backend);
-      }
-    }
     return {
       result: planNodes[planNodes.length - 1].result!,
       stats: loweredPlan.cachedStats ?? stats,
@@ -1537,27 +1530,28 @@ export async function executeLoweredPlan(
       clearArenaConflictDetected();
     }
 
-    // Deactivate buffer arena before re-executing missing nodes
+    // Deactivate buffer arena
     if (options.bufferArena && useTopLevelSharedEncoder) {
       clearActiveArena();
       clearArenaExternalInputBuffers();
     }
 
-    // Ensure ALL plan nodes have results. Optimization passes (matmul
-    // epilogues, graph rewrites, row programs) may absorb intermediates
-    // without producing individual results. Re-execute them here —
-    // their inputs are already computed, so each is a single cheap op.
+    // All-results guarantee: re-execute nodes that optimization passes
+    // absorbed without producing individual results. Uses recursive
+    // dependency resolution since intermediates may depend on each other.
     {
       const { executeNode: execNode } = await import("./sequential");
-      let patched = 0;
-      for (const node of planNodes) {
-        if (!node.result) {
-          await execNode(node, backend);
-          patched++;
+      const forceWithDeps = async (node: LazyIRNode): Promise<void> => {
+        if (node.result) return;
+        for (const inp of node.inputs) {
+          if (inp.kind === "pending" && !inp.node.result) {
+            await forceWithDeps(inp.node);
+          }
         }
-      }
-      if (patched > 0 && planNodes.length > 100) {
-        console.log(`[all-results] patched ${patched}/${planNodes.length} nodes`);
+        await execNode(node, backend);
+      };
+      for (const node of planNodes) {
+        if (!node.result) await forceWithDeps(node);
       }
     }
 
