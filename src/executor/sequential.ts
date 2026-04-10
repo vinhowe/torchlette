@@ -2,7 +2,6 @@ import { getBackend } from "../backend/registry";
 import type { Backend } from "../backend/types";
 import { isFusedBackend } from "../backend/types";
 import type { TensorLifetime } from "../graph/lifetime-analysis";
-import { wrapResultAsStorage } from "../graph/node-factory";
 import {
   canSafelyRelease,
   releaseBufferImmediate,
@@ -14,7 +13,7 @@ import type {
   LazyIRNode,
   StorageHandle,
 } from "../graph/types";
-import { executeOp, getInputStorage } from "./op-dispatch";
+import { assignNodeResult, executeOp, getInputStorage } from "./op-dispatch";
 import {
   initLifetimeAnalysis,
   pretunePlanMatmuls,
@@ -33,13 +32,11 @@ export async function executeNode(
   const nodeBackend = getBackend(node.device) ?? backend;
   const inputs = node.inputs.map((ref) => getInputStorage(ref, nodeBackend));
   const backendInputs = inputs.map((s) => s.backendTensor);
-  const resultTensor = await executeOp(node, backendInputs, nodeBackend);
-  node.result = wrapResultAsStorage(
-    node.device,
-    resultTensor,
-    backendInputs,
-    inputs,
-  );
+  const handlerResult = await executeOp(node, backendInputs, nodeBackend);
+  // assignNodeResult handles both single-output (BackendTensor) and
+  // multi-output (MultiOutputResult) returns uniformly, so node.result
+  // and node.results[0] always agree.
+  assignNodeResult(node, handlerResult, backendInputs, inputs);
 }
 
 export async function executePlanSequential(

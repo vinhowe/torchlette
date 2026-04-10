@@ -7,7 +7,10 @@ import type {
   DType,
 } from "../backend/types";
 import { sizeOf } from "../core/shape";
-import { createStorageHandle } from "../graph/node-factory";
+import {
+  createStorageHandle,
+  wrapResultAsStorage,
+} from "../graph/node-factory";
 import {
   getCurrentOpLabel,
   profileOpBegin,
@@ -17,6 +20,82 @@ import {
 } from "../graph/profiler";
 import type { LazyIRNode, LazyRef, StorageHandle } from "../graph/types";
 import { OP_REGISTRY } from "../ops/registry";
+
+// ---------------------------------------------------------------------------
+// Multi-output op protocol
+// ---------------------------------------------------------------------------
+
+/**
+ * Explicit multi-output return value for op handlers like adamStep,
+ * fusedAttentionForward, fusedLayerNormBackwardGradWeightBias, etc.
+ *
+ * Returning this from a handler tells the wrapper "this op has more than one
+ * output buffer; here are all of them in order". The wrapper is then
+ * responsible for creating StorageHandles and assigning both `node.result`
+ * (= results[0]) and `node.results` consistently.
+ *
+ * Before this protocol existed, multi-output handlers poked `node.results`
+ * as a side channel from inside the handler. That was the source of the
+ * "Input not ready: adamStep[0]" bug: executeAdamStep set
+ * `node.results = [null, m, v]` because the param result couldn't be wrapped
+ * until after the handler returned, and any wrapper that forgot to backfill
+ * `node.results[0]` would leave a `null` there, breaking the read fallback.
+ */
+export type MultiOutputResult = {
+  /** Primary output (also bound to node.result and node.results[0]). */
+  primary: BackendTensor;
+  /** Side outputs in order — bound to node.results[1..N]. */
+  extras: BackendTensor[];
+};
+
+export function isMultiOutputResult(
+  v: BackendTensor | MultiOutputResult,
+): v is MultiOutputResult {
+  // BackendTensor objects don't have a `primary` field; MultiOutputResult does.
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    "primary" in v &&
+    "extras" in v
+  );
+}
+
+/**
+ * Assign the result of executing a single op to its lazy node, handling both
+ * single-output (`BackendTensor`) and multi-output (`MultiOutputResult`)
+ * handler returns uniformly. Use this from every callsite that wraps an
+ * op-handler return into the lazy graph; it guarantees `node.result` and
+ * `node.results[0]` agree.
+ */
+export function assignNodeResult(
+  node: LazyIRNode,
+  handlerResult: BackendTensor | MultiOutputResult,
+  backendInputs: BackendTensor[],
+  inputs: StorageHandle[],
+): void {
+  if (isMultiOutputResult(handlerResult)) {
+    const primary = wrapResultAsStorage(
+      node.device,
+      handlerResult.primary,
+      backendInputs,
+      inputs,
+    );
+    node.result = primary;
+    node.results = [
+      primary,
+      ...handlerResult.extras.map((bt) =>
+        createStorageHandle(node.device, bt),
+      ),
+    ];
+    return;
+  }
+  node.result = wrapResultAsStorage(
+    node.device,
+    handlerResult,
+    backendInputs,
+    inputs,
+  );
+}
 
 /**
  * Execute a function within a profiling context.
@@ -69,7 +148,7 @@ export function getInputStorage(
     return ref.node.results[idx];
   }
   throw new Error(
-    `Input not ready: node id=${ref.node.id} op=${ref.node.op}[${idx}] shape=[${ref.node.shape}] caller=${new Error().stack?.split("\n")[2]?.trim()}`,
+    `Input not ready: node id=${ref.node.id} op=${ref.node.op}[${idx}] shape=${JSON.stringify(ref.node.shape)} caller=${new Error().stack?.split("\n")[2]?.trim()}`,
   );
 }
 
@@ -348,12 +427,12 @@ function executeGenericOp(
   return fn(...args) as BackendTensor;
 }
 
-/** adamStep is special-cased: async, multi-output (param, m, v). */
+/** adamStep is async + multi-output (param, m, v). */
 function executeAdamStep(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
-): Promise<BackendTensor> {
+): Promise<MultiOutputResult> {
   assertOpSupported("adamStep", backend.ops.adamStep);
   const payload = requirePayload<AdamStepConfig>(node);
   return (async () => {
@@ -364,14 +443,14 @@ function executeAdamStep(
       backendInputs[3],
       payload,
     );
-    // m/v are fresh output buffers from the kernel. Store in node.results so
-    // that RuntimeTensors referencing outputIndex 1/2 can resolve them via
-    // materializePendingTensors. The param result is returned and wrapped in
-    // an owning StorageHandle by executeNode (→ node.result).
-    const mStorage = createStorageHandle(node.device, adamResult.m);
-    const vStorage = createStorageHandle(node.device, adamResult.v);
-    node.results = [null as unknown as StorageHandle, mStorage, vStorage];
-    return adamResult.param;
+    // Return all three outputs explicitly. The wrapper at the call site
+    // (assignNodeResult) handles wrapping the param into an owning
+    // StorageHandle and creating storage handles for m/v in one place,
+    // so node.result and node.results[0] are guaranteed to agree.
+    return {
+      primary: adamResult.param,
+      extras: [adamResult.m, adamResult.v],
+    };
   })();
 }
 
@@ -420,7 +499,7 @@ function executeFusedOp(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
-): BackendTensor | Promise<BackendTensor> {
+): BackendTensor | MultiOutputResult | Promise<BackendTensor> {
   const desc = FUSED_OP_TABLE[node.op];
   if (desc) {
     const payload = requirePayload(node);
@@ -432,14 +511,15 @@ function executeFusedOp(
 
     if (desc.kind === "dispatch") return result as BackendTensor;
 
-    // Multi-output: store all outputs in node.results
+    // Multi-output: return primary + extras explicitly. The wrapper at
+    // the call site (assignNodeResult) creates StorageHandles for all
+    // outputs uniformly, so node.result and node.results[0] are
+    // guaranteed to agree.
     const r = result as Record<string, BackendTensor>;
-    const primarySH = createStorageHandle(node.device, r[desc.returnField]);
-    const extraSHs = desc.extraFields.map((field) =>
-      createStorageHandle(node.device, r[field]),
-    );
-    node.results = [primarySH, ...extraSHs];
-    return r[desc.returnField];
+    return {
+      primary: r[desc.returnField],
+      extras: desc.extraFields.map((field) => r[field]),
+    } satisfies MultiOutputResult;
   }
 
   // Special case: transfer (multi-backend, async)
@@ -478,7 +558,10 @@ type OpHandler = (
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
-) => BackendTensor | Promise<BackendTensor>;
+) =>
+  | BackendTensor
+  | MultiOutputResult
+  | Promise<BackendTensor | MultiOutputResult>;
 
 function buildOpTable(): Map<string, OpHandler> {
   const t = new Map<string, OpHandler>();
@@ -525,12 +608,16 @@ const OP_TABLE = buildOpTable();
 
 /**
  * Execute a single op on the backend.
+ *
+ * Returns a `BackendTensor` for single-output ops or a `MultiOutputResult`
+ * for multi-output ops (adamStep, fusedAttention*, fusedLayerNormBackward*).
+ * Use `assignNodeResult` at the call site to bind the result to the lazy node.
  */
 export async function executeOp(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
-): Promise<BackendTensor> {
+): Promise<BackendTensor | MultiOutputResult> {
   setCurrentOpLabel(node.op);
   const nodeModule = node.module ?? "unknown";
   setProfileModule(nodeModule);
@@ -551,13 +638,20 @@ export async function executeOp(
  * Synchronous version of executeOp for the lowered plan fast path.
  * Avoids async/Promise overhead (~5-15µs per microtask boundary) for ops
  * that are known to be synchronous (everything except adamStep and transfer).
- * Falls back to executeOp for async ops.
+ * Falls back to the handler's Promise return for async ops.
+ *
+ * Returns a `BackendTensor` for single-output ops or a `MultiOutputResult`
+ * for multi-output ops. Use `assignNodeResult` at the call site to bind the
+ * result to the lazy node.
  */
 export function executeOpSync(
   node: LazyIRNode,
   backendInputs: BackendTensor[],
   backend: Backend,
-): BackendTensor | Promise<BackendTensor> {
+):
+  | BackendTensor
+  | MultiOutputResult
+  | Promise<BackendTensor | MultiOutputResult> {
   setCurrentOpLabel(node.op);
   setProfileModule(node.module ?? "unknown");
   const _profT0 = profileOpBegin(node.op);
