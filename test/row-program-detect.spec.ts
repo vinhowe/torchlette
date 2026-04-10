@@ -1,5 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import type { LazyIRNode, LazyRef } from "../src/graph/types";
+import { LazyIRNode, type LazyRef } from "../src/graph/types";
 import { detectRowPrograms } from "../src/compiler/row-program-detect";
 
 /** Create a minimal LazyIRNode for testing. */
@@ -11,15 +11,15 @@ function makeNode(
   dtype: "f32" | "f16" = "f32",
   payload?: unknown,
 ): LazyIRNode {
-  return {
-    id: nextId++,
-    op: op as LazyIRNode["op"],
+  return new LazyIRNode(
+    nextId++,
+    op as LazyIRNode["op"],
     inputs,
     shape,
     dtype,
-    device: "webgpu",
+    "webgpu",
     payload,
-  } as LazyIRNode;
+  );
 }
 
 function pending(node: LazyIRNode): LazyRef {

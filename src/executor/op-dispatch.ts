@@ -139,14 +139,11 @@ export function getInputStorage(
     setCurrentOpLabel(prevLabel);
     return createStorageHandle("cpu", bt);
   }
-  // Multi-output: check outputIndex for secondary results
+  // node.result is a derived view of node.results[0], so a single lookup
+  // through node.results handles both primary and side outputs uniformly.
   const idx = ref.outputIndex ?? 0;
-  if (idx === 0 && ref.node.result) {
-    return ref.node.result;
-  }
-  if (ref.node.results?.[idx]) {
-    return ref.node.results[idx];
-  }
+  const sh = ref.node.results?.[idx];
+  if (sh) return sh;
   throw new Error(
     `Input not ready: node id=${ref.node.id} op=${ref.node.op}[${idx}] shape=${JSON.stringify(ref.node.shape)} caller=${new Error().stack?.split("\n")[2]?.trim()}`,
   );

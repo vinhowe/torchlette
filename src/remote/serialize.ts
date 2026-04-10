@@ -5,7 +5,7 @@
  */
 
 import type { DType } from "../backend/types";
-import type { ExecutionPlan, LazyIRNode, LazyRef } from "../graph/types";
+import { LazyIRNode, type ExecutionPlan, type LazyRef } from "../graph/types";
 import type {
   HandleRef,
   InlineTensorBytes,
@@ -153,15 +153,15 @@ export function deserializePlan(
     const inputs = wn.inputs.map((ref) =>
       deserializeRef(ref, builtNodes, options.resolveHandle),
     );
-    const node: LazyIRNode = {
-      id: allocId(),
-      op: wn.op,
+    const node = new LazyIRNode(
+      allocId(),
+      wn.op,
       inputs,
-      shape: wn.shape.slice(),
-      dtype: wn.dtype,
-      device: wn.device,
-      payload: wn.payload === undefined ? undefined : decodePayload(wn.payload),
-    };
+      wn.shape.slice(),
+      wn.dtype,
+      wn.device,
+      wn.payload === undefined ? undefined : decodePayload(wn.payload),
+    );
     if (wn.module !== undefined) node.module = wn.module;
     if (wn.isCheckpointBoundary) node.isCheckpointBoundary = true;
     builtNodes.push(node);

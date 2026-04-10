@@ -2,7 +2,7 @@ import type { BackendTensor, DeviceKind, DType } from "../backend/types";
 import { getProfileModule } from "./profiler";
 import { rcRelease, rcRetain } from "./refcount";
 import { storageTracker } from "./storage-tracker";
-import type { LazyIRNode, LazyOpCode, LazyRef, StorageHandle } from "./types";
+import { LazyIRNode, type LazyOpCode, type LazyRef, type StorageHandle } from "./types";
 
 // ============================================================================
 // Node and Storage ID Counters
@@ -22,15 +22,15 @@ export function createLazyIRNode(
   device: DeviceKind,
   payload?: unknown,
 ): LazyIRNode {
-  const node: LazyIRNode = {
-    id: nextNodeId++,
+  const node = new LazyIRNode(
+    nextNodeId++,
     op,
     inputs,
     shape,
     dtype,
     device,
     payload,
-  };
+  );
   // Capture module context for profiling (zero-cost when profiling disabled)
   const mod = getProfileModule();
   if (mod !== "unknown") node.module = mod;
