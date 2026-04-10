@@ -323,8 +323,7 @@ export function createRemoteEngine(
     const pending = getAllPendingTensors();
     const visited = new Set<LazyIRNode>();
     const scanNode = (node: LazyIRNode, outputIndex: number) => {
-      // biome-ignore lint/suspicious/noExplicitAny: _executed flag
-      if ((node as any)._executed) {
+      if (node._executed) {
         // Executed node — don't walk further. Just keep its referenced
         // output storage alive (the chain stops here).
         const storage =
