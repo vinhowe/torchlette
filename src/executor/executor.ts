@@ -102,6 +102,7 @@ import {
   type LoweredPlan,
 } from "./lowered-plan";
 import {
+  assignNodeResult,
   executeOpSync,
   getInputStorage,
   withProfileContext,
@@ -1254,12 +1255,9 @@ export async function executeLoweredPlan(
               );
               const backendInputs = inputs.map((s) => s.backendTensor);
               const result = executeOpSync(node, backendInputs, batchBackend);
-              node.result = wrapResultAsStorage(
-                node.device,
-                result instanceof Promise ? await result : result,
-                backendInputs,
-                inputs,
-              );
+              const handlerResult =
+                result instanceof Promise ? await result : result;
+              assignNodeResult(node, handlerResult, backendInputs, inputs);
               stats.sequentialNodes++;
             }
           }
@@ -1294,19 +1292,15 @@ export async function executeLoweredPlan(
           const backendInputs = inputs.map((s) => s.backendTensor);
 
           // Use synchronous dispatch to avoid microtask overhead (~5-15µs/await).
-          // Only adamStep and transfer are truly async; neither appears in
-          // sequential/view/data-source actions.
+          // Only adamStep and transfer are truly async; adamStep never reaches
+          // this branch because lowered-plan.ts always emits an adam-batch
+          // action for it (see the comment there).
           const resultOrPromise = executeOpSync(node, backendInputs, backend);
-          const resultTensor =
+          const handlerResult =
             resultOrPromise instanceof Promise
               ? await resultOrPromise
               : resultOrPromise;
-          node.result = wrapResultAsStorage(
-            node.device,
-            resultTensor,
-            backendInputs,
-            inputs,
-          );
+          assignNodeResult(node, handlerResult, backendInputs, inputs);
           stats.sequentialNodes++;
 
           // Record data-source for compiled plan (re-executed each step)
@@ -1922,7 +1916,11 @@ export async function executePlanOptimized(
   // Execute via the lowered plan — the sole execution engine.
   // The buffer arena (created at template construction) provides stable buffer
   // identities across steps for bind group cache hits.
-  const arenaDisabled = !!process.env.TORCHLETTE_NO_ARENA;
+  // Allow runtime toggling from the browser via globalThis (env vars don't
+  // exist in browsers and Vite replaces process.env at compile time).
+  const arenaDisabled =
+    !!process.env.TORCHLETTE_NO_ARENA ||
+    !!(globalThis as { __torchletteNoArena?: boolean }).__torchletteNoArena;
   const bufferArena = arenaDisabled
     ? undefined
     : ((cachedTemplate ?? fusionAnalysisCache.get(fingerprint.primary))
