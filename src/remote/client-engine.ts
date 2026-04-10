@@ -14,8 +14,6 @@
  * during serialization.
  */
 
-import { cpuBackend } from "../backend/cpu";
-import { registerBackend } from "../backend/registry";
 import type { BackendTensor, DType } from "../backend/types";
 import type { Tensor as FrontendTensor } from "../frontend/tensor";
 import { Torchlette } from "../frontend/torchlette";
@@ -184,30 +182,24 @@ export interface RemoteEngine {
   preUpload(tensors: FrontendTensor[]): Promise<number>;
 }
 
-export interface CreateRemoteEngineOptions {
-  /**
-   * Device tag used on the client-side Torchlette. This only affects how
-   * the client labels nodes — the server's backend does the actual compute.
-   * Default: "cpu".
-   */
-  device?: "cpu" | "webgpu";
-}
-
 /**
  * Create a Torchlette instance whose runtime executes every plan through
  * the given Transport. The client does no computation locally; it only
  * builds autograd graphs and serializes them.
+ *
+ * The client-side Torchlette uses the WebGPU device label so that
+ * lazy-graph construction (dtype rules, op-variant dispatch) matches what
+ * the server's WebGPU backend will execute. **The caller is responsible
+ * for calling `initWebGPU()` and registering the WebGPU backend before
+ * calling this** — the runtime needs a webgpu backend in the registry to
+ * resolve device-aware metadata even though no GPU dispatch happens
+ * client-side. Using a CPU-flavored client previously caused the
+ * client to build plans that the server's WebGPU executor mis-handled,
+ * with results that looked plausible but converged ~30% slower than
+ * local-only WebGPU training on the same model.
  */
-export function createRemoteEngine(
-  transport: Transport,
-  options: CreateRemoteEngineOptions = {},
-): RemoteEngine {
-  // The client's Torchlette needs *some* registered backend to satisfy
-  // initialization; we register CPU as a no-op target. All force methods
-  // below are overridden, so the backend is never actually invoked.
-  registerBackend(cpuBackend);
-
-  const torch = new Torchlette(options.device ?? "cpu");
+export function createRemoteEngine(transport: Transport): RemoteEngine {
+  const torch = new Torchlette("webgpu");
   const handles = new ClientHandleMap();
   // Track storage ID → node for clearing stale results on handle release.
   const storageToNode = new Map<number, LazyIRNode>();

@@ -214,6 +214,12 @@ async function benchRemote(
   try {
     await waitForServer(url);
 
+    // Init WebGPU client-side: createRemoteEngine builds a webgpu-flavored
+    // client Torchlette so the lazy-graph dtype/op decisions match the
+    // server's webgpu executor. Idempotent if benchLocal already called it.
+    const ok = await initWebGPU();
+    if (!ok) throw new Error("WebGPU init failed for remote client");
+
     const rpc = new RpcClient({ url, onLog: () => {} });
     await rpc.connect();
     const engine = createRemoteEngine(rpc);

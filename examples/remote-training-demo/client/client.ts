@@ -5,6 +5,7 @@
  * Every plan goes over the wire — the browser only builds the autograd graph.
  */
 
+import { initWebGPU } from "../../../src/backend/webgpu/index.ts";
 import {
   createRemoteEngine,
   type RemoteEngine,
@@ -157,6 +158,13 @@ const TRAIN_TEXT = `the quick brown fox jumps over the lazy dog. how vexingly qu
 // ============================================================================
 
 async function connect(): Promise<RemoteEngine> {
+  // Init WebGPU client-side: createRemoteEngine builds a webgpu-flavored
+  // client Torchlette so the lazy-graph dtype/op decisions match what the
+  // server's webgpu executor will run. No actual GPU dispatch happens
+  // here — only the registry needs the webgpu backend entry.
+  const ok = await initWebGPU();
+  if (!ok) throw new Error("WebGPU init failed for remote client");
+
   const wsUrl = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`;
   log(`connecting to ${wsUrl}...`);
   const rpc = new RpcClient({ url: wsUrl, onLog: (m) => log(m) });

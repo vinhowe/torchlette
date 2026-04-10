@@ -10,6 +10,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { initWebGPU } from "../../src/backend/webgpu/index.ts";
 import { createRemoteEngine } from "../../src/remote/client-engine.ts";
 import { RpcClient } from "./client/transport.ts";
 
@@ -72,6 +73,11 @@ async function runRemoteTraining(url: string): Promise<{
   losses: number[];
   stats: ReturnType<typeof createRemoteEngine>["stats"];
 }> {
+  // createRemoteEngine builds a webgpu-flavored client Torchlette,
+  // so the caller must initWebGPU first.
+  const ok = await initWebGPU();
+  if (!ok) throw new Error("WebGPU init failed for remote client");
+
   const rpc = new RpcClient({
     url,
     onLog: (m) => console.log(m),
@@ -83,7 +89,7 @@ async function runRemoteTraining(url: string): Promise<{
   const hidden = 4;
   const steps = 20;
   const lr = 0.1;
-  const opts = { device: "cpu" as const };
+  const opts = { device: "webgpu" as const };
 
   const rng = makePrng(42);
   const draw = (n: number) => Array.from({ length: n }, () => rng() * 0.5);

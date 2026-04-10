@@ -8,7 +8,7 @@
  *   2. Run this:     npx tsx tools/test-remote-e2e.ts
  */
 import WebSocket from "ws";
-import { nn, Adam } from "../src/index";
+import { nn, Adam, initWebGPU } from "../src/index";
 import { crossEntropy } from "../src/nn/functional";
 import { createModel, MESS3_CONFIG } from "../examples/toy-compartmentalization/src/lib/model";
 import {
@@ -95,6 +95,12 @@ async function main() {
   const SERVER_URL = process.env.SERVER_URL ?? "ws://localhost:9882/ws";
   setTransitionMatrices(0.765);
   const V = VOCAB_SIZE_DATA * 1 + 1, S = 10, B = 128;
+
+  // createRemoteEngine builds a webgpu-flavored client Torchlette, so the
+  // caller must initWebGPU first (no GPU dispatch happens here — only the
+  // backend registry needs the webgpu entry).
+  const ok = await initWebGPU();
+  if (!ok) throw new Error("WebGPU init failed for remote client");
 
   const transport = new NodeTransport();
   await transport.connect(SERVER_URL);

@@ -7,6 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { initWebGPU } from "../../src/backend/webgpu/index.ts";
 import { createRemoteEngine } from "../../src/remote/client-engine.ts";
 import { buildCharDataset, createModel, parameters } from "./client/model.ts";
 import { modelConfigSmall, trainStep } from "./client/train.ts";
@@ -50,6 +51,11 @@ async function main(): Promise<void> {
   let exitCode = 1;
   try {
     await waitForServer(url);
+
+    // createRemoteEngine builds a webgpu-flavored client Torchlette,
+    // so the caller must initWebGPU first.
+    const ok = await initWebGPU();
+    if (!ok) throw new Error("WebGPU init failed for remote client");
 
     const rpc = new RpcClient({ url, onLog: () => {} });
     await rpc.connect();

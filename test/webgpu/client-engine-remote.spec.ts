@@ -1,12 +1,19 @@
 /**
  * RemoteEngine exercised against an in-process Transport that runs plans on
- * the local CPU backend. No WebSocket — just the full client/server wire
+ * the local WebGPU backend. No WebSocket — just the full client/server wire
  * dance, compressed into one process, to verify the engine builds plans,
  * routes execution through the transport, and reads back values correctly.
+ *
+ * This test lives in the webgpu project because createRemoteEngine builds
+ * its client-side Torchlette as a webgpu device — the cpu device path was
+ * removed because it caused the client to construct lazy graphs that the
+ * server's WebGPU executor mis-handled (silent ~30% slow-convergence).
+ * The in-process transport here mirrors what the real server does: a real
+ * webgpu executePlanSequential against the registered webgpu backend.
  */
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { cpuBackend } from "../../src/backend/cpu";
+import { initWebGPU, webgpuBackend } from "../../src/backend/webgpu";
 import { registerBackend } from "../../src/backend/registry";
 import { executePlanSequential } from "../../src/executor/sequential";
 import { createStorageHandle } from "../../src/graph/node-factory";
@@ -14,9 +21,13 @@ import type { StorageHandle } from "../../src/graph/types";
 import { createRemoteEngine, type Transport } from "../../src/remote/client-engine";
 import { deserializePlan } from "../../src/remote/serialize";
 import type { HandleRef } from "../../src/remote/wire";
+import { cpuOnly } from "../helpers/webgpu";
 
-beforeAll(() => {
-  registerBackend(cpuBackend);
+beforeAll(async () => {
+  if (cpuOnly) return;
+  const ok = await initWebGPU();
+  if (!ok) throw new Error("WebGPU init failed");
+  registerBackend(webgpuBackend);
 });
 
 // ============================================================================
@@ -48,7 +59,7 @@ class InProcessTransport implements Transport {
         return s;
       },
     });
-    await executePlanSequential(plan, cpuBackend);
+    await executePlanSequential(plan, webgpuBackend);
 
     const outputSet = params.plan.outputNodes
       ? new Set(params.plan.outputNodes)
@@ -68,8 +79,8 @@ class InProcessTransport implements Transport {
     values: number[];
     shape: number[];
   }): Promise<{ handle: HandleRef }> {
-    const bt = cpuBackend.ops.tensorFromArray(params.values, params.shape);
-    const storage = createStorageHandle("cpu", bt);
+    const bt = webgpuBackend.ops.tensorFromArray(params.values, params.shape);
+    const storage = createStorageHandle("webgpu", bt);
     return { handle: this.alloc(storage) };
   }
 
@@ -78,7 +89,7 @@ class InProcessTransport implements Transport {
   }): Promise<{ values: number[] }> {
     const s = this.registry.get(params.handle);
     if (!s) throw new Error(`no storage for handle ${params.handle}`);
-    const values = await cpuBackend.ops.read(s.backendTensor);
+    const values = await webgpuBackend.ops.read(s.backendTensor);
     return { values };
   }
 
@@ -111,7 +122,7 @@ class InProcessTransport implements Transport {
 // Tests
 // ============================================================================
 
-describe("RemoteEngine (in-process Transport)", () => {
+describe.skipIf(cpuOnly)("RemoteEngine (in-process Transport)", () => {
   it("runs a forward pass and reads the result via the transport", async () => {
     const transport = new InProcessTransport();
     const { torch } = createRemoteEngine(transport);
@@ -189,7 +200,7 @@ describe("RemoteEngine (in-process Transport)", () => {
     const engine = createRemoteEngine(transport);
     const { torch, markStep } = engine;
 
-    const opts = { device: "cpu" as const };
+    const opts = { device: "webgpu" as const };
     const W = torch
       .tensorFromArray([0.1, -0.2, 0.3, 0.05], [2, 2], opts)
       .requires_grad_(true);
