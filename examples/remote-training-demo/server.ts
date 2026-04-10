@@ -54,6 +54,8 @@ let gpuMemoryStatsFn: (() => { currentBytes: number; peakBytes: number }) | null
  * many prior sessions. Set during initBackend() once WebGPU is up; null on CPU.
  */
 let recycleExecutorState: (() => void) | null = null;
+/** Pool stats accessor — set after WebGPU init so statsHandler can report. */
+let getBufferPoolStats: (() => Record<string, number>) | null = null;
 registerBackend(cpuBackend);
 
 async function initBackend(preferWebGPU: boolean): Promise<string> {
@@ -111,6 +113,20 @@ async function initBackend(preferWebGPU: boolean): Promise<string> {
     const { drainParamsBufferPools, runTeardownCallbacks } = await import(
       "../../src/backend/webgpu/webgpu-state.js"
     );
+    const { bufferPool } = await import("../../src/backend/webgpu/buffer-pool.js");
+    getBufferPoolStats = (): Record<string, number> => {
+      const s = bufferPool.stats();
+      return {
+        pooledBuffers: s.pooledBuffers,
+        pooledMB: Math.round(s.pooledBytes / (1024 * 1024)),
+        pendingRelease: s.pendingRelease,
+        pendingReleaseMB: Math.round(s.pendingReleaseBytes / (1024 * 1024)),
+        pendingDestroy: s.pendingDestroy,
+        reuseCount: s.reuseCount,
+        allocCount: s.allocCount,
+        liveCount: s.liveCount,
+      };
+    };
     recycleExecutorState = (): void => {
       // 1. Arena buffers (force=true: ignore stale liveness state).
       evictAllArenas(true);
@@ -253,6 +269,32 @@ async function executeHandler(
       }
     }
   }
+
+  // Destroy intermediate node.result storages — those NOT in outputSet and
+  // not bound to any session handle. These are step-scoped temporaries that
+  // the server has no further use for. Without this cleanup the executor's
+  // storageTracker accumulates ~150 storages per training step, which keeps
+  // their underlying buffers' liveCount > 0 and pins them in the buffer
+  // pool's pendingRelease queue forever — the actual root cause of the
+  // batch=1024 OOM and the steady cross-step memory growth observed in
+  // both Node and the browser.
+  //
+  // Arena buffers short-circuit inside backendTensor.destroy() (checked via
+  // arenaBufferSet) so they stay in the arena and get reused next step;
+  // non-arena buffers go through the pool release chain.
+  for (let i = 0; i < plan.nodes.length; i++) {
+    if (outputSet?.has(i)) continue;
+    const node = plan.nodes[i];
+    if (node.result?.backendTensor?.destroy) {
+      node.result.backendTensor.destroy();
+    }
+    if (node.results && node.results.length > 1) {
+      for (let j = 1; j < node.results.length; j++) {
+        const r = node.results[j];
+        if (r?.backendTensor?.destroy) r.backendTensor.destroy();
+      }
+    }
+  }
   const tMarshal = performance.now();
   const nSide = Object.keys(sideOutputs).length;
   if (plan.nodes.length > 100) {
@@ -343,7 +385,11 @@ function statsHandler(session: Session): Record<string, unknown> {
       peakMB: Math.round(mem.peakBytes / (1024 * 1024)),
     };
   }
-  return { handles: session.handleCount(), gpu };
+  // Pool / arena stats so the client can see what the tracker undercounts
+  // (gpuMemoryTracker doesn't include pool-held bytes; pool stats let
+  // a debug client compute real physical-usage = tracker + pool).
+  const pool = getBufferPoolStats ? getBufferPoolStats() : null;
+  return { handles: session.handleCount(), gpu, pool };
 }
 
 async function dispatch(
