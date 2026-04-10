@@ -83,6 +83,24 @@ export function buildMergedPlan(
 }
 
 /**
+ * Tag a plan with the indices of nodes whose results are needed by the caller.
+ *
+ * Called after `buildMergedPlan` to populate `plan.outputIndices` from the set
+ * of node IDs that have live RuntimeTensors. The executor reads `outputIndices`
+ * for liveness analysis and scoped result production; the serializer carries
+ * it through to remote executors.
+ */
+export function tagPlanOutputs(
+  plan: ExecutionPlan,
+  liveNodeIds: Set<number>,
+): void {
+  plan.outputIndices = [];
+  for (let i = 0; i < plan.nodes.length; i++) {
+    if (liveNodeIds.has(plan.nodes[i].id)) plan.outputIndices.push(i);
+  }
+}
+
+/**
  * Extract execution metadata from a plan for lifetime analysis.
  */
 export function extractPlanMetadata(plan: ExecutionPlan): {

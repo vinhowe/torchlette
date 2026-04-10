@@ -1381,25 +1381,41 @@ export function reorderPlanForFusion(nodes: LazyIRNode[]): LazyIRNode[] {
  * and dependency structure (relative input positions). This enables caching
  * fusion analysis results across steps for compiled regions.
  *
- * Uses FNV-1a hashing with structural encoding. Includes external node
- * positions and scalar constant values in the fingerprint.
+ * Returns a 64-bit fingerprint as `{ primary, secondary }` — two independent
+ * 32-bit FNV-1a hashes with different seeds. The primary is used as the
+ * cache map key (fast numeric lookup); the secondary is validated on hit to
+ * detect collisions. Effective collision probability: 2^-64.
+ *
+ * Hashes structural properties only: ops, shapes, dtypes, dependency
+ * positions, payload structure. Excludes scalar values (Adam's beta1^step
+ * changes every step but doesn't affect graph topology).
  */
+export interface PlanFingerprint {
+  primary: number;
+  secondary: number;
+}
+
 export function computePlanFingerprint(
   nodes: LazyIRNode[],
   externalNodeIds?: Set<number>,
-): number {
+): PlanFingerprint {
   // Map node IDs to plan positions for relative input encoding
   const idToPos = new Map<number, number>();
   for (let i = 0; i < nodes.length; i++) {
     idToPos.set(nodes[i].id, i);
   }
 
-  let h = 0x811c9dc5; // FNV-1a 32-bit offset basis
-  const prime = 0x01000193;
+  // Two parallel FNV-1a hashes with different seeds for collision avoidance.
+  let h1 = 0x811c9dc5; // FNV-1a 32-bit offset basis
+  let h2 = 0xcbf29ce4; // alternate seed (FNV-1a 64-bit offset low half)
+  const prime1 = 0x01000193;
+  const prime2 = 0x01000133;
 
   const hashByte = (b: number) => {
-    h ^= b & 0xff;
-    h = Math.imul(h, prime);
+    h1 ^= b & 0xff;
+    h1 = Math.imul(h1, prime1);
+    h2 ^= b & 0xff;
+    h2 = Math.imul(h2, prime2);
   };
   const hashInt = (v: number) => {
     hashByte(v & 0xff);
@@ -1437,11 +1453,9 @@ export function computePlanFingerprint(
         hashByte(0x01); // pending marker
       } else if (inp.kind === "scalar") {
         hashByte(0x02); // scalar marker
-        // Hash scalar value as float64 bytes
-        const buf = new Float64Array(1);
-        buf[0] = inp.value;
-        const bytes = new Uint8Array(buf.buffer);
-        for (let b = 0; b < 8; b++) hashByte(bytes[b]);
+        // Hash dtype only — scalar VALUES (e.g., Adam's beta1^step) change
+        // every step but don't affect graph topology or lowered plan structure.
+        hashStr(inp.dtype);
       } else {
         hashByte(0x03); // materialized marker
         // Hash shape+dtype (not storage.id, which changes across steps)
@@ -1466,5 +1480,5 @@ export function computePlanFingerprint(
     }
   }
 
-  return h >>> 0; // ensure unsigned
+  return { primary: h1 >>> 0, secondary: h2 >>> 0 };
 }

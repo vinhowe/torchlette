@@ -137,6 +137,18 @@ export function isMaterialized(
 
 export interface ExecutionPlan {
   nodes: LazyIRNode[];
+  /**
+   * Indices into `nodes[]` whose results the caller needs.
+   *
+   * Set by the engine from live RuntimeTensor tracking before execution.
+   * Flows through serialization to remote executors. Used by the optimized
+   * executor for buffer lifetime analysis, epilogue safety, and scoped
+   * result production (only output nodes are guaranteed to have `node.result`
+   * after execution).
+   *
+   * If undefined, all nodes are treated as outputs (conservative fallback).
+   */
+  outputIndices?: number[];
 }
 
 /**
