@@ -34,7 +34,7 @@ import {
   type OptimizedExecutionStats,
 } from "../executor/executor";
 import { isDataSourceOp } from "../executor/lowered-plan";
-import { buildMergedPlan } from "../executor/plan-builder";
+import { buildMergedPlan, tagPlanOutputs } from "../executor/plan-builder";
 import { rewritePlan } from "../compiler/rewriter/plan-rewrite";
 import { doubleTransposeRule } from "../compiler/rewriter/rules/double-transpose";
 import { fuseMatmulSumRule } from "../compiler/rewriter/rules/fuse-matmul-sum";
@@ -707,6 +707,11 @@ export class RuntimeEngine {
     const pendingIds = getPendingNodeIds();
     rewritePlan(plan, DSL_RULES, pendingIds);
 
+    // Tag plan outputs: nodes with live pending RuntimeTensors. The plan
+    // carries its own output contract — the executor and serializer read it,
+    // so no side-channel (getPendingNodeIds) is needed downstream.
+    tagPlanOutputs(plan, pendingIds);
+
     // Scheduler audit (no-op unless TORCHLETTE_SCHEDULER_AUDIT=1).
     auditPlan(plan, pendingIds);
 
@@ -818,6 +823,9 @@ export class RuntimeEngine {
     // Apply DSL rewrites before template cache
     const pendingIds = getPendingNodeIds();
     rewritePlan(plan, DSL_RULES, pendingIds);
+
+    // Tag plan outputs (same as forceAllMerged — plan carries its own contract).
+    tagPlanOutputs(plan, pendingIds);
 
     // Scheduler audit (no-op unless TORCHLETTE_SCHEDULER_AUDIT=1).
     auditPlan(plan, pendingIds);

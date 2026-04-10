@@ -41,6 +41,7 @@ import {
   isFusibleOp,
 } from "../compiler/fusion-detect";
 import { analyzeGraph } from "../compiler/graph-compiler";
+import { runPasses, SIMPLIFICATION_PASSES } from "../compiler/graph-rewrites";
 import type { MatmulPrologueInfo } from "../compiler/matmul-epilogue";
 import {
   _detectTransposeView,
@@ -204,6 +205,8 @@ export interface FusionAnalysisTemplate {
   planAnalysis?: PlanAnalysis;
   /** Generation at which planAnalysis was last replayed (prevents per-step accumulation). */
   replayedGeneration?: number;
+  /** Secondary fingerprint hash — used for collision detection on cache hit. */
+  fingerprintSecondary: number;
 }
 
 type CachedSegmentDesc =
@@ -1260,7 +1263,7 @@ export async function executeLoweredPlan(
           const node = planNodes[nodeIdx];
           if (node.result) break;
 
-          setProfileModule(node.module ?? "unknown");
+                  setProfileModule(node.module ?? "unknown");
           let inputs;
           try {
             inputs = node.inputs.map((ref) =>
@@ -1268,41 +1271,12 @@ export async function executeLoweredPlan(
             );
           } catch (e) {
             // Dump context for debugging
-            const err = e as Error;
             console.error(`[lowered-plan] Action #${actionIndex} kind=${action.kind} nodeIdx=${nodeIdx} node=${node.id}:${node.op} shape=${JSON.stringify(node.shape)}`);
             for (let ii = 0; ii < node.inputs.length; ii++) {
               const ref = node.inputs[ii];
               if (ref.kind === "pending") {
-                // Check all action types for the dependency
-              let depInfo = "NOT_FOUND";
-              for (let ai = 0; ai < loweredPlan.actions.length; ai++) {
-                const a = loweredPlan.actions[ai] as any;
-                if (a.nodeIndex !== undefined && planNodes[a.nodeIndex]?.id === ref.node.id) {
-                  depInfo = `action#${ai} kind=${a.kind}`;
-                  break;
-                }
-                if (a.coveredNodeIndices) {
-                  for (const ci of a.coveredNodeIndices) {
-                    if (planNodes[ci]?.id === ref.node.id) {
-                      depInfo = `action#${ai} kind=${a.kind} (covered)`;
-                      break;
-                    }
-                  }
-                  if (depInfo !== "NOT_FOUND") break;
-                }
-                if (a.kind === "fused" && a.nodeIndices) {
-                  for (const fi of a.nodeIndices) {
-                    if (planNodes[fi]?.id === ref.node.id) {
-                      depInfo = `action#${ai} kind=fused (member)`;
-                      break;
-                    }
-                  }
-                  if (depInfo !== "NOT_FOUND") break;
-                }
-              }
-              // Find the dep's position in planNodes
-              const depPlanIdx = planNodes.findIndex(n => n.id === ref.node.id);
-              console.error(`[lowered-plan]   input[${ii}]: pending node=${ref.node.id}:${ref.node.op} result=${!!ref.node.result} planIdx=${depPlanIdx} ${depInfo}`);
+                const depPlanIdx = planNodes.findIndex(n => n.id === ref.node.id);
+                console.error(`[lowered-plan]   input[${ii}]: pending node=${ref.node.id}:${ref.node.op} result=${!!ref.node.result} planIdx=${depPlanIdx}`);
               }
             }
             throw e;
@@ -1536,10 +1510,15 @@ export async function executeLoweredPlan(
       clearArenaExternalInputBuffers();
     }
 
-    // All-results guarantee: re-execute nodes that optimization passes
-    // absorbed without producing individual results. Uses recursive
-    // dependency resolution since intermediates may depend on each other.
+    // Scoped result guarantee: only re-execute output nodes that optimization
+    // passes absorbed without producing individual results. Uses recursive
+    // dependency resolution since absorbed intermediates may depend on each other.
+    // Non-output nodes are internal to the plan — their results are consumed
+    // by fusion groups or epilogues, so no external caller needs them.
     {
+      const outputNodeIds = plan.outputIndices
+        ? new Set(plan.outputIndices.map((i) => plan.nodes[i].id))
+        : null; // null = all nodes (conservative fallback)
       const { executeNode: execNode } = await import("./sequential");
       const forceWithDeps = async (node: LazyIRNode): Promise<void> => {
         if (node.result) return;
@@ -1551,7 +1530,9 @@ export async function executeLoweredPlan(
         await execNode(node, backend);
       };
       for (const node of planNodes) {
-        if (!node.result) await forceWithDeps(node);
+        if (!node.result && (!outputNodeIds || outputNodeIds.has(node.id))) {
+          await forceWithDeps(node);
+        }
       }
     }
 
@@ -1620,42 +1601,76 @@ export async function executePlanOptimized(
     return { result, stats };
   }
 
-  // Get node IDs with live pending tensors (e.g., saved-for-backward).
-  // Used by matmul epilogue detection to avoid absorbing saved tensors,
-  // and by lifetime analysis to keep their buffers alive.
+  // Derive external node IDs from plan.outputIndices (set by the engine or
+  // deserialized from the wire). This replaces the getPendingNodeIds()
+  // side-channel — the plan carries its own output contract.
   let externalNodeIds: Set<number> | undefined;
-  try {
-    const { getPendingNodeIds } = await import("../runtime/tensor");
-    const pending = getPendingNodeIds();
-    if (pending.size > 0) {
-      externalNodeIds = pending;
+  if (plan.outputIndices) {
+    const ids = new Set<number>();
+    for (const idx of plan.outputIndices) ids.add(plan.nodes[idx].id);
+    if (ids.size > 0) externalNodeIds = ids;
+  } else {
+    // Fallback for callers that don't set outputIndices (legacy / tests).
+    try {
+      const { getPendingNodeIds } = await import("../runtime/tensor");
+      const pending = getPendingNodeIds();
+      if (pending.size > 0) externalNodeIds = pending;
+    } catch {
+      // runtime/tensor not available — no external node tracking
     }
-  } catch {
-    // If runtime/tensor is not available, skip external node tracking
   }
 
   // Query device storage buffer limit to constrain fusion group size.
   const maxStorageBuffers: number | undefined =
     backend.device?.limits?.maxStorageBuffersPerShaderStage;
 
-  // Compute structural fingerprint for fusion analysis caching.
+  // Compute 64-bit structural fingerprint (two parallel FNV-1a hashes).
+  // Primary is the cache key for O(1) lookup; secondary is checked on hit
+  // to detect collisions (effective collision probability: 2^-64).
   const fingerprint = computePlanFingerprint(plan.nodes, externalNodeIds);
-  const cachedTemplate = fusionAnalysisCache.get(fingerprint);
+  const cachedTemplate = fusionAnalysisCache.get(fingerprint.primary);
 
   let planNodes: LazyIRNode[];
   let loweredPlan: LoweredPlan;
 
-  if (cachedTemplate?.loweredPlan) {
+  // Validate cache hit via secondary fingerprint.
+  let validatedTemplate = cachedTemplate?.loweredPlan ? cachedTemplate : undefined;
+  if (validatedTemplate && validatedTemplate.fingerprintSecondary !== fingerprint.secondary) {
+    validatedTemplate = undefined;
+    fusionAnalysisCache.delete(fingerprint.primary);
+  }
+
+  if (validatedTemplate) {
     // ── Cache hit: reuse existing lowered plan ──
-    planNodes = cachedTemplate.finalPerm.map((i) => plan.nodes[i]);
-    loweredPlan = cachedTemplate.loweredPlan;
+    planNodes = validatedTemplate.finalPerm.map((i) => plan.nodes[i]);
+
+    // Re-apply graph rewrites to fresh nodes. The lowered plan was built from
+    // rewritten refs (identity-cast bypass, sum-reshape fusion, CSE, etc.).
+    // Fresh nodes from deserialization or new steps have original refs. Re-running
+    // the cheap O(n) passes ensures input refs match the lowered plan's assumptions.
+    {
+      const consumers = new Map<number, LazyIRNode[]>();
+      const consumerCount = new Map<number, number>();
+      for (const node of planNodes) {
+        for (const inp of node.inputs) {
+          if (inp.kind === "pending") {
+            consumerCount.set(inp.node.id, (consumerCount.get(inp.node.id) ?? 0) + 1);
+            if (!consumers.has(inp.node.id)) consumers.set(inp.node.id, []);
+            consumers.get(inp.node.id)!.push(node);
+          }
+        }
+      }
+      runPasses({ planNodes, consumers, consumerCount }, new Set(), SIMPLIFICATION_PASSES);
+    }
+
+    loweredPlan = validatedTemplate.loweredPlan!;
     // Replay stored plan analysis on cache hits when profiling is enabled.
     // Only replay once per profiler reset (tracked via generation counter).
-    if (isProfilingEnabled() && cachedTemplate.planAnalysis) {
+    if (isProfilingEnabled() && validatedTemplate.planAnalysis) {
       const gen = getPlanAnalysisGeneration();
-      if (cachedTemplate.replayedGeneration !== gen) {
-        cachedTemplate.replayedGeneration = gen;
-        recordPlanAnalysis({ ...cachedTemplate.planAnalysis });
+      if (validatedTemplate.replayedGeneration !== gen) {
+        validatedTemplate.replayedGeneration = gen;
+        recordPlanAnalysis({ ...validatedTemplate.planAnalysis });
       }
     }
     if (process.env.TORCHLETTE_DEBUG_COMPILED) {
@@ -1665,7 +1680,7 @@ export async function executePlanOptimized(
         ? `n0=${n0.op}(${n0.dtype},${JSON.stringify(n0.shape)})`
         : "";
       console.log(
-        `[template] HIT fp=0x${(fingerprint >>> 0).toString(16)} nodes=${plan.nodes.length} ext=${extCount} compiled=${!!loweredPlan.compiledPlan?.valid} ${n0Info}`,
+        `[template] HIT fp=0x${fingerprint.primary.toString(16)} nodes=${plan.nodes.length} ext=${extCount} compiled=${!!loweredPlan.compiledPlan?.valid} ${n0Info}`,
       );
     }
   } else {
@@ -1732,6 +1747,7 @@ export async function executePlanOptimized(
     const template: FusionAnalysisTemplate = {
       finalPerm,
       segments: cachedSegments,
+      fingerprintSecondary: fingerprint.secondary,
       epilogueClaimedOrigPoss: [...analysis.epilogueClaimedIds].map(
         (id) => origIdToPos.get(id) as number,
       ),
@@ -1782,9 +1798,13 @@ export async function executePlanOptimized(
         process.env.TORCHLETTE_LIVENESS_RELEASE !== "0" ? 300 : undefined,
     });
     template.loweredPlan = loweredPlan;
+    // Create empty arena for WebGPU — populated during first execution,
+    // reused on subsequent cache hits for stable buffer identities.
+    if (backend.name === "webgpu") {
+      template.bufferArena = { resolve: [], alloc: [] };
+    }
 
-    // Store permuted fingerprint for cache hit validation
-    fusionAnalysisCache.set(fingerprint, template);
+    fusionAnalysisCache.set(fingerprint.primary, template);
 
     // Evict old templates if cache grows too large (each has a GPU arena)
     const MAX_CACHED_TEMPLATES = 16;
@@ -1794,7 +1814,7 @@ export async function executePlanOptimized(
       let removed = 0;
       for (const [fp, tmpl] of fusionAnalysisCache) {
         if (removed >= toRemove) break;
-        if (fp === fingerprint) continue; // don't evict the one we just added
+        if (fp === fingerprint.primary) continue; // don't evict the one we just added
         if (tmpl.bufferArena) {
           destroyArena(tmpl.bufferArena);
         }
@@ -1819,7 +1839,7 @@ export async function executePlanOptimized(
         existingFp,
         existingTemplate,
       ] of fusionAnalysisCache.entries()) {
-        if (existingFp !== fingerprint) {
+        if (existingFp !== fingerprint.primary) {
           const nOld = existingTemplate.finalPerm?.length ?? 0;
           const diff = plan.nodes.length - nOld;
           if (Math.abs(diff) <= 2 && diff !== 0) {
@@ -1866,7 +1886,7 @@ export async function executePlanOptimized(
         }
       }
       console.log(
-        `[template] MISS fp=0x${(fingerprint >>> 0).toString(16)} nodes=${plan.nodes.length} ext=${extCount} actions=${loweredPlan.actions.length} cacheSize=${fusionAnalysisCache.size}${nearMiss}\n  ops: ${opSummary}`,
+        `[template] MISS fp=0x${fingerprint.primary.toString(16)} nodes=${plan.nodes.length} ext=${extCount} actions=${loweredPlan.actions.length} cacheSize=${fusionAnalysisCache.size}${nearMiss}\n  ops: ${opSummary}`,
       );
     }
 
@@ -1879,17 +1899,18 @@ export async function executePlanOptimized(
       analysis.matmulEpilogueChains,
       plan.nodes.length,
     );
-    const storedTemplate = fusionAnalysisCache.get(fingerprint);
+    const storedTemplate = fusionAnalysisCache.get(fingerprint.primary);
     if (storedTemplate) storedTemplate.planAnalysis = pa;
   }
 
-  // Execute via the lowered plan — the sole execution engine
+  // Execute via the lowered plan — the sole execution engine.
+  // The buffer arena (created at template construction) provides stable buffer
+  // identities across steps for bind group cache hits.
   const arenaDisabled = !!process.env.TORCHLETTE_NO_ARENA;
   const bufferArena = arenaDisabled
     ? undefined
-    : ((cachedTemplate ?? fusionAnalysisCache.get(fingerprint))?.bufferArena as
-        | BufferArena
-        | undefined);
+    : ((cachedTemplate ?? fusionAnalysisCache.get(fingerprint.primary))
+        ?.bufferArena as BufferArena | undefined);
   return executeLoweredPlan(plan, planNodes, loweredPlan, backend, {
     bufferArena,
   });

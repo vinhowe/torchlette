@@ -34,8 +34,6 @@ export type HandleToStorage = (
 export interface SerializeOptions {
   /** Map a local materialized StorageHandle.id to a HandleRef the peer understands. */
   resolveHandle: StorageIdToHandle;
-  /** Optional: plan-local node indices whose outputs the peer wants back. */
-  outputNodes?: LazyIRNode[];
 }
 
 export interface DeserializeOptions {
@@ -88,21 +86,11 @@ export function serializePlan(
     return out;
   });
 
-  const outputNodes = options.outputNodes?.map((n) => {
-    const idx = nodeToIdx.get(n);
-    if (idx === undefined) {
-      throw new Error(
-        `serializePlan: outputNode id=${n.id} op=${n.op} is not in the plan`,
-      );
-    }
-    return idx;
-  });
-
   return {
     version: 1,
     nodes: serializedNodes,
     externalHandles: [...externalHandles],
-    outputNodes,
+    outputNodes: plan.outputIndices,
   };
 }
 
@@ -179,7 +167,7 @@ export function deserializePlan(
     builtNodes.push(node);
   }
 
-  return { nodes: builtNodes };
+  return { nodes: builtNodes, outputIndices: wire.outputNodes };
 }
 
 function deserializeRef(

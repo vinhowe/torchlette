@@ -18,7 +18,6 @@ import { cpuBackend } from "../../src/backend/cpu/index.js";
 import { registerBackend } from "../../src/backend/registry.js";
 import type { Backend, DType } from "../../src/backend/types.js";
 import { executePlanOptimized } from "../../src/executor/executor.js";
-import { executePlanSequential } from "../../src/executor/sequential.js";
 import { createStorageHandle } from "../../src/graph/node-factory.js";
 import type { StorageHandle } from "../../src/graph/types.js";
 import {
@@ -115,9 +114,6 @@ class Session {
 }
 
 // ============================================================================
-import type { ExecutionPlan, LazyIRNode } from "../../src/graph/types.js";
-
-// ============================================================================
 // RPC handlers (all async)
 // ============================================================================
 
@@ -136,23 +132,21 @@ async function executeHandler(
     node.device = serverDevice;
   }
 
-  // Execute with fusion. The deserialized plan is already in topological
-  // order (preserved from the client's buildMergedPlan). The optimized
-  // executor produces node.result for ALL nodes (including fused intermediates
-  // via unconditional promotion + re-execution).
-  if (backend.name === "webgpu") {
-    await executePlanOptimized(plan, backend, { enableFusion: true });
-  } else {
-    await executePlanSequential(plan, backend);
-  }
+  // Optimized execution: fusion + arena + compiled plan replay.
+  // The plan carries outputIndices (set by the client) so the executor
+  // scopes its all-results pass to only client-needed nodes.
+  await executePlanOptimized(plan, backend);
   const tExec = performance.now();
 
-  // Return handles for ALL nodes with results. Wire indices match plan
-  // order (no toposort reordering).
+  // Allocate handles only for output nodes (plan.outputIndices).
+  // Non-output nodes are internal to the plan — their GPU buffers are
+  // managed by the arena and reused across steps.
+  const outputSet = plan.outputIndices ? new Set(plan.outputIndices) : null;
   const outputs: Record<NodeIdx, HandleRef> = {};
   const sideOutputs: Record<string, HandleRef> = {};
 
   for (let i = 0; i < plan.nodes.length; i++) {
+    if (outputSet && !outputSet.has(i)) continue;
     const node = plan.nodes[i];
     if (!node.result) continue;
     outputs[i] = session.allocHandle(node.result);

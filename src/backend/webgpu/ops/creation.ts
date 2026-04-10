@@ -13,7 +13,6 @@ import { bufferPool, destroyCopy } from "../buffer-pool";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { f32ArrayToF16Array, requireContext } from "../gpu-context";
 import type { GPUBuffer as LocalGPUBuffer, WebGPUTensor } from "../gpu-types";
-import { GPUBufferUsage } from "../gpu-types";
 import { profileApiCall } from "../profiler";
 import {
   alignBufferSize,
@@ -23,11 +22,7 @@ import {
   WORKGROUP_SIZE,
 } from "../shape-utils";
 import { getSharedEncoderInstance, submitOrCollect } from "../shared-encoder";
-import {
-  createBufferWithData,
-  createTensor,
-  createTrackedBuffer,
-} from "../tensor";
+import { createBufferWithData, createTensor } from "../tensor";
 import { arenaBufferSet } from "../webgpu-state";
 import {
   arangeWGSL,
@@ -246,14 +241,10 @@ function triangularOp(
   const shader = upper ? getTriuWGSL() : getTrilWGSL();
   const pipeline = getPipeline(ctx, upper ? "triu_tile" : "tril_tile", shader);
 
+  // Arena-aware output allocation: stable buffer identity across steps and
+  // tracked by the compilation recorder (matches zeros/arange/full pattern).
   const sizeBytes = numElements * F32_BYTES;
-  const alignedSize = alignBufferSize(sizeBytes);
-  const usage =
-    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
-  const outBuffer = createTrackedBuffer(ctx.device, {
-    size: alignedSize,
-    usage,
-  });
+  const outBuffer = resolveOutputBuffer(ctx.device, sizeBytes, [input.buffer]);
 
   // Params: [numElements as u32, H as u32, W as u32, k as i32]
   const paramsData = new Int32Array(4);

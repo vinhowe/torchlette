@@ -21,7 +21,7 @@ import type { Tensor as FrontendTensor } from "../frontend/tensor";
 import { Torchlette } from "../frontend/torchlette";
 import { createStorageHandle } from "../graph/node-factory";
 import { storageTracker } from "../graph/storage-tracker";
-import type { LazyIRNode, StorageHandle } from "../graph/types";
+import type { ExecutionPlan, LazyIRNode, StorageHandle } from "../graph/types";
 import type { Tensor as RuntimeTensor } from "../runtime/tensor";
 import { getAllPendingTensors } from "../runtime/tensor";
 import type {
@@ -214,7 +214,7 @@ export function createRemoteEngine(
   const runtime = torch.runtime;
 
   /** Ship one plan to the server, patching outputs as local stub storages. */
-  async function shipPlan(plan: { nodes: LazyIRNode[] }): Promise<void> {
+  async function shipPlan(plan: ExecutionPlan): Promise<void> {
     if (plan.nodes.length === 0) return;
 
     const t0 = performance.now();
@@ -267,7 +267,7 @@ export function createRemoteEngine(
   // Let the engine manage the full force lifecycle (retain, execute,
   // materialize, release, mark _executed). The hook just ships plans.
   (runtime as any)._executionHook = async (
-    plan: { nodes: LazyIRNode[] },
+    plan: ExecutionPlan,
   ): Promise<void> => {
     if (plan.nodes.length === 0) return;
     await shipPlan(plan);
