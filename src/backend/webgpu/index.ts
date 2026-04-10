@@ -111,7 +111,6 @@ export {
   getSubmitCount,
   isBatchActive,
   resetSubmitCount,
-  setAdamBatchMode,
   setCurrentOpLabel,
 } from "./shared-encoder";
 export { compileTileKernel } from "./tile-compiler";
@@ -193,6 +192,7 @@ import {
 } from "./ops/elementwise";
 import {
   adamStep,
+  adamStepBatch,
   createInfCountBuffer,
   fusedAttentionBackward,
   fusedAttentionForward,
@@ -237,7 +237,6 @@ import {
   endStep,
   flushSharedEncoder,
   isBatchActive,
-  setAdamBatchMode,
 } from "./shared-encoder";
 import { gpuContext } from "./webgpu-state";
 
@@ -269,7 +268,6 @@ export const webgpuBackend: FusedBackend & {
   endSharedEncoder,
   flushSharedEncoder,
   flushBufferPool,
-  setAdamBatchMode,
 
   // FusedBackend: buffer arena management
   setActiveArena,
@@ -348,6 +346,7 @@ export const webgpuBackend: FusedBackend & {
     stridedScatterAdd,
     batchedReduction,
     adamStep,
+    adamStepBatch,
     unscaleGrad,
     fusedAttentionForward,
     fusedAttentionBackward,

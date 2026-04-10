@@ -18,21 +18,17 @@ import {
   flushSharedEncoder,
   getArenaConflictDetected,
   setActiveArena,
-  setAdamBatchMode,
   setArenaExternalInputBuffers,
   setCurrentOpLabel,
 } from "../backend/webgpu";
-import { dispatchAdamStep } from "../backend/webgpu/adam-kernel";
 import { getDispatchSequenceCounters } from "../backend/webgpu/bind-group-cache";
 import { bufferPool } from "../backend/webgpu/buffer-pool";
-import { f16WeightCache } from "../backend/webgpu/gpu-context";
 import {
   asGPUTensor,
   type GPUBuffer,
   gpuBuffer,
 } from "../backend/webgpu/gpu-types";
 import type { EpilogueConfig } from "../backend/webgpu/matmul/types";
-import { createTensor } from "../backend/webgpu/tensor";
 import type { FusionGroup } from "../compiler/fusion-detect";
 import {
   buildIdPositionMap,
@@ -80,10 +76,6 @@ function markLivenessSafe(storage: StorageHandle): void {
   if (buf) bufferPool.markLivenessSafe(buf);
 }
 
-import {
-  dispatchPackedOptimizer,
-  type PackedOptimizerItem,
-} from "../optim/packed-dispatch";
 import { getLivePendingNodeIds } from "../runtime/tensor";
 import {
   assignSlot,
@@ -303,167 +295,6 @@ export function invalidateCompiledPlans(): void {
       template.bufferArena = undefined;
     }
   }
-}
-
-type AdamStepFn = NonNullable<
-  import("../backend/types").Backend["ops"]["adamStep"]
->;
-
-/**
- * Execute a batch of adamStep nodes using packed dispatch for groups of same-size params.
- * Groups params by element count and dispatches one Adam kernel per group (instead of one
- * per param). Single-param groups fall through to per-param adamOp.
- */
-async function executeAdamBatchInner(
-  planNodes: LazyIRNode[],
-  nodeIndices: number[],
-  adamOp: AdamStepFn,
-  getStorage: (ref: LazyRef) => StorageHandle,
-): Promise<void> {
-  // Pre-resolve all storages and build packed items list
-  const packedItems: PackedOptimizerItem[] = [];
-  const nodes: LazyIRNode[] = [];
-  const storages: Array<
-    [StorageHandle, StorageHandle, StorageHandle, StorageHandle]
-  > = [];
-
-  for (const nodeIdx of nodeIndices) {
-    const adamNode = planNodes[nodeIdx];
-    if (adamNode.result) continue;
-    const inputs = adamNode.inputs;
-    const s0 = getStorage(inputs[0]);
-    const s1 = getStorage(inputs[1]);
-    const s2 = getStorage(inputs[2]);
-    const s3 = getStorage(inputs[3]);
-    const numElements = adamNode.shape.reduce(
-      (a: number, b: number) => a * b,
-      1,
-    );
-
-    packedItems.push({
-      buffers: [
-        gpuBuffer(s0.backendTensor),
-        gpuBuffer(s1.backendTensor),
-        gpuBuffer(s2.backendTensor),
-        gpuBuffer(s3.backendTensor),
-      ],
-      numElements,
-    });
-    nodes.push(adamNode);
-    storages.push([s0, s1, s2, s3]);
-  }
-
-  if (packedItems.length === 0) return;
-
-  // Packed dispatch: scatter→dispatch→gather for groups of ≥2 same-size params.
-  // The Adam kernel writes param/m/v in-place on the packed buffers, so no
-  // intermediate copy is needed — gather reads directly from packed[1..3].
-  const config = nodes[0].payload as AdamStepConfig;
-  const infFlagBuffer = (config.infFlagBuffer as GPUBuffer | null) ?? null;
-  const handled = dispatchPackedOptimizer({
-    items: packedItems,
-    gatherIndices: [1, 2, 3], // gather param, m, v (not grad)
-    dispatch(packed, totalElements) {
-      dispatchAdamStep(
-        packed[0],
-        packed[1],
-        packed[2],
-        packed[3],
-        totalElements,
-        config,
-        false,
-        infFlagBuffer,
-      );
-    },
-    label: "packedAdam",
-  });
-
-  // Create result StorageHandles for packed items (data updated via gather copy)
-  for (const i of handled) {
-    assignPackedAdamResult(nodes[i], storages[i]);
-    // Evict stale f16 weight cache entries (param data changed in-place)
-    const paramBuf = packedItems[i].buffers[1];
-    const oldF16 = f16WeightCache.get(paramBuf);
-    if (oldF16) {
-      bufferPool.deferredDestroy(oldF16, oldF16.size);
-      f16WeightCache.delete(paramBuf);
-    }
-  }
-
-  // Fall through: dispatch remaining singles via per-param adamOp
-  for (let i = 0; i < packedItems.length; i++) {
-    if (handled.has(i)) continue;
-    const adamNode = nodes[i];
-    const [s0, s1, s2, s3] = storages[i];
-    const adamPayload = adamNode.payload as AdamStepConfig;
-    const adamResult = await adamOp(
-      s0.backendTensor,
-      s1.backendTensor,
-      s2.backendTensor,
-      s3.backendTensor,
-      adamPayload,
-    );
-    assignPerParamAdamResult(adamNode, s1, adamResult);
-  }
-}
-
-/** Assign result + side outputs for a param updated by packed dispatch (in-place via gather copy). */
-function assignPackedAdamResult(
-  adamNode: LazyIRNode,
-  [, s1, s2, s3]: [StorageHandle, StorageHandle, StorageHandle, StorageHandle],
-): void {
-  // Param: same buffer, ownsBuffer: false since buffer is shared with s1
-  adamNode.result = createStorageHandle(
-    adamNode.device,
-    {
-      ...(s1.backendTensor as Record<string, unknown>),
-      ownsBuffer: false,
-    } as BackendTensor,
-    s1.id,
-  );
-
-  // m/v: the kernel wrote new values to fresh packed buffers, which were then
-  // copied back to the original individual m/v buffers. Transfer ownership from
-  // old tensors to new ones wrapping the same buffer.
-  const mBT = s2.backendTensor as unknown as {
-    buffer: GPUBuffer;
-    shape: number[];
-    dtype: DType;
-    ownsBuffer?: boolean;
-    destroy?: () => void;
-  };
-  const vBT = s3.backendTensor as unknown as {
-    buffer: GPUBuffer;
-    shape: number[];
-    dtype: DType;
-    ownsBuffer?: boolean;
-    destroy?: () => void;
-  };
-
-  if (mBT.ownsBuffer) bufferPool.decRef(mBT.buffer);
-  if (vBT.ownsBuffer) bufferPool.decRef(vBT.buffer);
-  mBT.destroy = () => {};
-  vBT.destroy = () => {};
-
-  const newM = createTensor(mBT.shape, mBT.buffer, undefined, 0, mBT.dtype);
-  const newV = createTensor(vBT.shape, vBT.buffer, undefined, 0, vBT.dtype);
-
-  const mStorage = createStorageHandle(adamNode.device, newM);
-  const vStorage = createStorageHandle(adamNode.device, newV);
-  adamNode.results = [adamNode.result!, mStorage, vStorage];
-}
-
-/** Assign result + side outputs for a param updated by per-param adamOp (standard path). */
-function assignPerParamAdamResult(
-  adamNode: LazyIRNode,
-  _s1: StorageHandle,
-  adamResult: { param: BackendTensor; m: BackendTensor; v: BackendTensor },
-): void {
-  // The fused Adam kernel returns fresh m/v output buffers and in-place param.
-  adamNode.result = createStorageHandle(adamNode.device, adamResult.param);
-  const mStorage = createStorageHandle(adamNode.device, adamResult.m);
-  const vStorage = createStorageHandle(adamNode.device, adamResult.v);
-  adamNode.results = [adamNode.result, mStorage, vStorage];
 }
 
 /** Collect GPU buffers from all external (materialized/already-resolved) plan inputs. */
@@ -1196,29 +1027,62 @@ export async function executeLoweredPlan(
         case "adam-batch": {
           const useSharedEncoder = backend.name === "webgpu";
           if (useSharedEncoder) {
+            // Flush the shared encoder BEFORE returning pending-release
+            // buffers to the pool — otherwise an encoded-but-not-submitted
+            // command could still be referencing one. backend.ops.adamStepBatch
+            // also flushes internally; this earlier flush exists to make
+            // flushBufferPool() safe.
             flushSharedEncoder();
             flushBufferPool();
             recordBarrier();
           }
 
-          setAdamBatchMode(true);
-          try {
-            const adamBackend =
-              getBackend(planNodes[action.nodeIndices[0]].device) ?? backend;
-            const adamOp = adamBackend.ops.adamStep as NonNullable<
-              typeof adamBackend.ops.adamStep
-            >;
-            await withProfileContext("adamStep", "optimizer.step", () =>
-              executeAdamBatchInner(
-                planNodes,
-                action.nodeIndices,
-                adamOp,
-                (ref) => getInputStorage(ref, adamBackend),
-              ),
+          const adamBackend =
+            getBackend(planNodes[action.nodeIndices[0]].device) ?? backend;
+          const adamStepBatch = adamBackend.ops.adamStepBatch;
+          if (!adamStepBatch) {
+            throw new Error(
+              "adamStepBatch not supported by backend; cannot execute adam-batch action",
             );
-          } finally {
-            setAdamBatchMode(false);
           }
+
+          // Resolve inputs for every adamStep node, then call the backend op
+          // once. The backend handles flushing, packing, and per-item fallback;
+          // it returns BackendTensors which we wrap as StorageHandles via the
+          // shared multi-output protocol.
+          await withProfileContext("adamStep", "optimizer.step", async () => {
+            const nodes: LazyIRNode[] = [];
+            const inputStorages: StorageHandle[][] = [];
+            const items: import("../backend/types").AdamBatchItem[] = [];
+            for (const nodeIdx of action.nodeIndices) {
+              const node = planNodes[nodeIdx];
+              if (node.result) continue;
+              const inputs = node.inputs.map((ref) =>
+                getInputStorage(ref, adamBackend),
+              );
+              const config = node.payload as AdamStepConfig;
+              nodes.push(node);
+              inputStorages.push(inputs);
+              items.push({
+                grad: inputs[0].backendTensor,
+                param: inputs[1].backendTensor,
+                m: inputs[2].backendTensor,
+                v: inputs[3].backendTensor,
+                config,
+              });
+            }
+            if (items.length === 0) return;
+            const results = adamStepBatch(items);
+            for (let i = 0; i < nodes.length; i++) {
+              const r = results[i];
+              assignNodeResult(
+                nodes[i],
+                { primary: r.param, extras: [r.m, r.v] },
+                inputStorages[i].map((s) => s.backendTensor),
+                inputStorages[i],
+              );
+            }
+          });
           break;
         }
 

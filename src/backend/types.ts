@@ -205,6 +205,22 @@ export type AdamStepConfig = {
   infFlagBuffer?: unknown;
 };
 
+/** One parameter's inputs for a batched Adam step. */
+export type AdamBatchItem = {
+  grad: BackendTensor;
+  param: BackendTensor;
+  m: BackendTensor;
+  v: BackendTensor;
+  config: AdamStepConfig;
+};
+
+/** Output tensors for one batched Adam item. */
+export type AdamBatchResult = {
+  param: BackendTensor;
+  m: BackendTensor;
+  v: BackendTensor;
+};
+
 export interface BackendOps {
   tensorFromArray(
     values: number[] | Float32Array | Int32Array | Uint32Array,
@@ -407,7 +423,6 @@ export interface BackendOps {
     src: BackendTensor,
     options: StridedScatterOptions,
   ): BackendTensor;
-  /** Fused Adam/AdamW optimizer step. Returns updated param, m, v. */
   /** Batched reduction: N independent same-config reductions in one kernel. */
   batchedReduction?(
     op: string,
@@ -415,6 +430,7 @@ export interface BackendOps {
     dim: number | number[],
     keepdim?: boolean,
   ): BackendTensor[];
+  /** Fused Adam/AdamW optimizer step. Returns updated param, m, v. */
   adamStep?(
     grad: BackendTensor,
     param: BackendTensor,
@@ -424,6 +440,12 @@ export interface BackendOps {
   ):
     | { param: BackendTensor; m: BackendTensor; v: BackendTensor }
     | Promise<{ param: BackendTensor; m: BackendTensor; v: BackendTensor }>;
+  /**
+   * Batched Adam step: process N adamStep calls in one backend invocation.
+   * Backends are free to fuse same-element-count items into packed kernel
+   * dispatches. Returns results in input order.
+   */
+  adamStepBatch?(items: AdamBatchItem[]): AdamBatchResult[];
   /** Fused unscale + inf-check + zero-mask for GradScaler. */
   unscaleGrad?(
     grad: BackendTensor,
@@ -557,9 +579,6 @@ export interface FusedBackend extends Backend {
   flushSharedEncoder(): void;
   /** Move pending-release buffers back to the main pool for reuse. */
   flushBufferPool(): void;
-
-  /** Enable/disable Adam batch mode (suppresses per-op encoder flushes). */
-  setAdamBatchMode(enabled: boolean): void;
 
   /** Activate a buffer arena for stable buffer identity across steps. */
   setActiveArena(arena: unknown): void;
