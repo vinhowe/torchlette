@@ -40,7 +40,7 @@ import { doubleTransposeRule } from "../compiler/rewriter/rules/double-transpose
 import { fuseMatmulSumRule } from "../compiler/rewriter/rules/fuse-matmul-sum";
 import { transitiveReshapeRule } from "../compiler/rewriter/rules/transitive-reshape";
 import { auditPlan } from "../compiler/scheduler/audit";
-import { getPendingNodeIds } from "./tensor";
+import { getLivePendingNodeIds, getPendingNodeIds } from "./tensor";
 
 const DSL_RULES = [
   fuseMatmulSumRule,
@@ -707,10 +707,11 @@ export class RuntimeEngine {
     const pendingIds = getPendingNodeIds();
     rewritePlan(plan, DSL_RULES, pendingIds);
 
-    // Tag plan outputs: nodes with live pending RuntimeTensors. The plan
-    // carries its own output contract — the executor and serializer read it,
-    // so no side-channel (getPendingNodeIds) is needed downstream.
-    tagPlanOutputs(plan, pendingIds);
+    // Tag plan outputs: nodes with LIVE pending RuntimeTensors only.
+    // The disposed pending IDs (kept for fusion analysis) must NOT be
+    // protected here — their tensors are gone and their buffers should be
+    // releasable. Including them inflates outputIndices and pins memory.
+    tagPlanOutputs(plan, getLivePendingNodeIds());
 
     // Scheduler audit (no-op unless TORCHLETTE_SCHEDULER_AUDIT=1).
     auditPlan(plan, pendingIds);
@@ -824,8 +825,8 @@ export class RuntimeEngine {
     const pendingIds = getPendingNodeIds();
     rewritePlan(plan, DSL_RULES, pendingIds);
 
-    // Tag plan outputs (same as forceAllMerged — plan carries its own contract).
-    tagPlanOutputs(plan, pendingIds);
+    // Tag plan outputs: live pending only (see forceAllMerged comment).
+    tagPlanOutputs(plan, getLivePendingNodeIds());
 
     // Scheduler audit (no-op unless TORCHLETTE_SCHEDULER_AUDIT=1).
     auditPlan(plan, pendingIds);
