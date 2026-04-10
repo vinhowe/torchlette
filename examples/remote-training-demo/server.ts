@@ -5,7 +5,7 @@
  * that speak the remote-training RPC protocol. Each connection is its own
  * session: independent handle registry, independent lifecycle.
  *
- * Run: npx tsx examples/remote-training-demo/server.ts [--port 9876]
+ * Run: npx tsx examples/remote-training-demo/server.ts [--port 9882]
  */
 
 import { randomUUID } from "node:crypto";
@@ -47,6 +47,13 @@ import type { HandleRef, NodeIdx } from "../../src/remote/wire.js";
 /** Active compute backend — set during startup by initBackend(). */
 let backend: Backend = cpuBackend;
 let gpuMemoryStatsFn: (() => { currentBytes: number; peakBytes: number }) | null = null;
+/**
+ * Recycle process-global executor caches (arenas, bind groups, pool buffers,
+ * f16 weight cache) — invoked when the last active session disconnects so a
+ * fresh client doesn't reuse a server that has accumulated GPU resources from
+ * many prior sessions. Set during initBackend() once WebGPU is up; null on CPU.
+ */
+let recycleExecutorState: (() => void) | null = null;
 registerBackend(cpuBackend);
 
 async function initBackend(preferWebGPU: boolean): Promise<string> {
@@ -64,6 +71,30 @@ async function initBackend(preferWebGPU: boolean): Promise<string> {
     backend = webgpuBackend;
     const { getGPUMemoryStats } = await import("../../src/backend/webgpu/memory-tracker.js");
     gpuMemoryStatsFn = getGPUMemoryStats;
+
+    // Resolve all the reset functions once so the close-handler can run them
+    // synchronously without doing dynamic imports on every disconnect. The
+    // order matters: arenas first (they pin GPU buffers via plan templates),
+    // then bind group cache (references those buffers), then the f16 weight
+    // cache, then flush + destroy + evict the buffer pool itself.
+    const { evictAllArenas } = await import("../../src/executor/executor.js");
+    const { clearBindGroupCache } = await import(
+      "../../src/backend/webgpu/bind-group-cache.js"
+    );
+    const { flushBufferPool, destroyPendingGPUBuffers, evictAllPoolBuffers } =
+      await import("../../src/backend/webgpu/buffer-pool.js");
+    const { f16WeightCache } = await import(
+      "../../src/backend/webgpu/gpu-context.js"
+    );
+    recycleExecutorState = (): void => {
+      evictAllArenas();
+      clearBindGroupCache();
+      f16WeightCache.clear();
+      flushBufferPool();
+      destroyPendingGPUBuffers();
+      evictAllPoolBuffers();
+    };
+
     return "webgpu";
   } catch (e) {
     console.log(`[server] WebGPU not available (${(e as Error).message}), using CPU`);
@@ -323,9 +354,19 @@ async function dispatch(
 // WebSocket server
 // ============================================================================
 
+/**
+ * Number of currently-connected WebSocket sessions. The executor state recycle
+ * (arenas, bind groups, pool buffers) only runs when this drops to 0 — running
+ * it while another session is mid-plan would invalidate the buffers it's
+ * dispatching against. Single-tenant by intent for the demo, but the gate
+ * keeps things sane if a second tab connects briefly.
+ */
+let activeSessionCount = 0;
+
 function attachWebSocketHandlers(ws: WebSocket): void {
   const session = new Session();
-  console.log(`[ws] session opened: ${session.id}`);
+  activeSessionCount++;
+  console.log(`[ws] session opened: ${session.id} (active=${activeSessionCount})`);
 
   const hello: { id: number; result: HelloResult } = {
     id: 0,
@@ -388,9 +429,31 @@ function attachWebSocketHandlers(ws: WebSocket): void {
     // not — they leak permanently unless we destroy them explicitly here.
     const heldBefore = session.handleCount();
     const destroyed = session.releaseAll();
+    activeSessionCount--;
     console.log(
-      `[ws] session closed: ${session.id} (held=${heldBefore} destroyed=${destroyed})`,
+      `[ws] session closed: ${session.id} (held=${heldBefore} destroyed=${destroyed} active=${activeSessionCount})`,
     );
+
+    // When no clients remain, recycle process-global executor caches that
+    // would otherwise grow unbounded across sessions: per-template arenas
+    // (compiled plans + their GPU buffers), the bind group cache, the f16
+    // weight cache, and pooled GPUBuffers waiting for fence completion.
+    // Without this, a long-running server eventually exhausts GPU memory
+    // and starts serving Vulkan validation errors instead of plans.
+    if (activeSessionCount === 0 && recycleExecutorState) {
+      const beforeMB = gpuMemoryStatsFn
+        ? Math.round(gpuMemoryStatsFn().currentBytes / (1024 * 1024))
+        : null;
+      recycleExecutorState();
+      const afterMB = gpuMemoryStatsFn
+        ? Math.round(gpuMemoryStatsFn().currentBytes / (1024 * 1024))
+        : null;
+      const memNote =
+        beforeMB !== null && afterMB !== null
+          ? ` gpuMB=${beforeMB}→${afterMB}`
+          : "";
+      console.log(`[ws] executor caches recycled${memNote}`);
+    }
   });
 
   ws.on("error", (e) => console.error(`[ws] error on ${session.id}:`, e));
@@ -442,7 +505,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse): void {
 // ============================================================================
 
 function parseArgs(): { port: number; cpu: boolean } {
-  let port = 9876;
+  let port = 9882;
   let cpu = false;
   const args = process.argv.slice(2);
   for (let i = 0; i < args.length; i++) {
