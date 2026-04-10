@@ -55,9 +55,11 @@ export function allocateOutputBuffer(sizeBytes: number): GPUBuffer {
       if (arenaLocal.externalInputBuffers?.has(arenaBuffer)) {
         // Replace the arena slot with a fresh buffer. The old buffer stays
         // alive (referenced by the external input tensor) but is no longer
-        // in the arena. This permanently resolves the conflict for this slot.
+        // in the arena. Hand it back to the pool's release chain so it gets
+        // properly destroyed once its refcount reaches zero (or reused).
         arenaBufferSet.delete(arenaBuffer);
         arenaLocal.active.alloc[idx] = undefined;
+        bufferPool.release(arenaBuffer, arenaBuffer.size, STORAGE_BUFFER_USAGE);
         const freshBuffer = arenaAllocAt(
           arenaLocal.active.alloc,
           idx,
@@ -291,15 +293,17 @@ function arenaAllocAt(
     }
     // Either size class changed, or buffer is still live (referenced by a persistent
     // tensor, e.g. model weight loaded by a shared plan template). In either case,
-    // remove from arena set and allocate a fresh buffer below.
+    // remove from arena set and hand back to the pool's release chain so it gets
+    // properly destroyed once its refcount reaches zero (or reused if dead).
     arenaBufferSet.delete(existing);
     if (bufferPool.isLive(existing)) {
-      // Live buffer — don't destroy. The owning tensor still references it.
+      // Live buffer — pool's release chain will hold it in pendingRelease
+      // until the owner releases, then destroy or pool it.
       arenaLocal.conflictDetected = true;
+      bufferPool.release(existing, existing.size, STORAGE_BUFFER_USAGE);
     } else {
-      // Dead buffer with wrong size class — destroy
-      gpuMemoryTracker.trackDeallocation(existing);
-      existing.destroy();
+      // Dead buffer — destroy via the deferred queue (safe wrt GPU fences).
+      bufferPool.deferredDestroy(existing, existing.size);
     }
   }
 
@@ -369,9 +373,12 @@ export function resolveOutputBuffer(
       // Check for external input conflict first (structural — replace arena slot).
       if (arenaLocal.externalInputBuffers?.has(arenaBuffer)) {
         // Replace the arena slot with a fresh buffer. The old buffer stays
-        // alive (referenced by the external input tensor).
+        // alive (referenced by the external input tensor) — hand it back to
+        // the pool's release chain so it gets destroyed once its refcount
+        // reaches zero (or reused by another op).
         arenaBufferSet.delete(arenaBuffer);
         arenaLocal.active.resolve[idx] = undefined;
+        bufferPool.release(arenaBuffer, arenaBuffer.size, STORAGE_BUFFER_USAGE);
         const freshBuffer = arenaAllocAt(
           arenaLocal.active.resolve,
           idx,

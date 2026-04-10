@@ -1502,16 +1502,13 @@ export async function executeLoweredPlan(
         );
         compiled.valid = false;
       }
-      // Don't store the compiled plan if any arena conflict happened during
-      // recording. Conflicts cause the arena to allocate fresh buffers
-      // (because the slot's prior buffer is still live), and those orphaned
-      // buffers are NOT destroyed by the current cleanup path. Persisting a
-      // compiled plan that triggered conflicts means the conflict pattern
-      // repeats every replay → unbounded GPU memory growth.
-      // The right long-term fix is to refcount arena buffers so orphans get
-      // destroyed when their owners release. Until then, this guard is the
-      // only thing preventing the leak.
-      if (compiled.valid && !getArenaConflictDetected()) {
+      // Arena conflicts no longer block compiled plan storage. The arena
+      // hands evicted buffers back to the pool's release chain (see
+      // buffer-arena.ts arenaAllocAt + allocateOutputBuffer + resolveOutputBuffer),
+      // so orphaned buffers from conflict resolution get destroyed once their
+      // owners release. The compiled plan's per-command bind group cache
+      // (compiled-plan.ts) handles buffer pointer changes between replays.
+      if (compiled.valid) {
         compiled.endCounters = getDispatchSequenceCounters();
         loweredPlan.compiledPlan = compiled;
       }
