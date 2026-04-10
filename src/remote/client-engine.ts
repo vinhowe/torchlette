@@ -153,8 +153,24 @@ export interface RemoteEngine {
    * Release server-side handles not in the `keep` set. Call at end of
    * each training step. Pass all tensors that persist across steps:
    * `[...optimizer.getAllKeepTensors(), ...model.persistentTensors()]`.
+   *
+   * The actual release RPC is DEFERRED — markStep queues the released
+   * handles and the next `shipPlan` (execute) call piggybacks them onto
+   * its request, eliminating one round-trip per training step. Local-side
+   * cleanup (handle map, storage tracker) still happens immediately.
+   *
+   * Call `flushReleases()` if you need the server to physically release
+   * those handles before the next execute (e.g., for tests or end-of-run
+   * cleanup).
    */
   markStep(keep: FrontendTensor[]): Promise<number>;
+  /**
+   * Force any pending releases (queued by `markStep` but not yet
+   * piggybacked onto an execute) to be flushed via an explicit release
+   * RPC. Normally unnecessary — the next training step's execute will
+   * flush them automatically.
+   */
+  flushReleases(): Promise<number>;
   /**
    * Pre-upload pending `tensorFromArray` tensors via binary transport,
    * bypassing JSON plan serialization. Call once before the first training
@@ -198,6 +214,10 @@ export function createRemoteEngine(
   // Node IDs that failed serialization (stale local refs). Excluded from
   // future forceAllPending plans to prevent unbounded plan growth.
   const failedNodeIds = new Set<number>();
+  // Pending release queue: handles markStep wants released, deferred until
+  // the next shipPlan so they piggyback onto an execute RPC instead of
+  // paying their own round-trip.
+  let pendingReleases: HandleRef[] = [];
   const stats: RemoteEngineStats = {
     executes: 0,
     nodesShipped: 0,
@@ -227,7 +247,14 @@ export function createRemoteEngine(
     const t1 = performance.now();
     stats.serializeMs += t1 - t0;
 
-    const result = await transport.execute({ plan: wire });
+    // Drain the pending-release queue into this execute call so the server
+    // frees those handles before running the plan. Avoids a separate
+    // release RPC round-trip per training step.
+    const releases = pendingReleases;
+    pendingReleases = [];
+    const result = await transport.execute(
+      releases.length > 0 ? { plan: wire, releases } : { plan: wire },
+    );
     const t2 = performance.now();
     stats.transportMs += t2 - t1;
 
@@ -357,7 +384,12 @@ export function createRemoteEngine(
     }
 
     if (toRelease.length > 0) {
-      await transport.release({ handles: toRelease });
+      // Defer the actual release RPC: queue the handles so they piggyback
+      // onto the next shipPlan's execute call. The local-side cleanup
+      // (handle map, storage tracker, stale node.result clearing) still
+      // happens immediately so subsequent plan builds don't see released
+      // storage IDs in the live lazy graph.
+      pendingReleases.push(...toRelease);
       for (const id of idsToUnbind) {
         handles.unbind(id);
         storageTracker.unregister(id);
@@ -441,5 +473,21 @@ export function createRemoteEngine(
     return uploaded;
   }
 
-  return { torch, handles, transport, stats, markStep, preUpload };
+  async function flushReleases(): Promise<number> {
+    if (pendingReleases.length === 0) return 0;
+    const handlesToRelease = pendingReleases;
+    pendingReleases = [];
+    await transport.release({ handles: handlesToRelease });
+    return handlesToRelease.length;
+  }
+
+  return {
+    torch,
+    handles,
+    transport,
+    stats,
+    markStep,
+    flushReleases,
+    preUpload,
+  };
 }

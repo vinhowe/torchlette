@@ -38,6 +38,14 @@ export function isRpcError(r: RpcResponse): r is RpcError {
 /** Execute a plan on the server, registering output handles. */
 export interface ExecuteParams {
   plan: SerializedPlan;
+  /**
+   * Optional handles to release BEFORE executing the plan. Lets the client
+   * piggyback markStep's release set onto the next execute call instead of
+   * paying a separate release RPC round-trip per training step. The server
+   * processes these as if `release({ handles })` had been called first; any
+   * unknown handles are silently ignored (already released).
+   */
+  releases?: HandleRef[];
 }
 export interface ExecuteResult {
   /** For each output node idx (from plan.outputNodes, or all nodes), the

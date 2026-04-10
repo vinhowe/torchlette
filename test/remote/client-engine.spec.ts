@@ -35,7 +35,12 @@ class InProcessTransport implements Transport {
 
   async execute(params: {
     plan: import("../../src/remote/wire").SerializedPlan;
+    releases?: HandleRef[];
   }): Promise<{ outputs: Record<number, HandleRef> }> {
+    // Process piggybacked releases first, mirroring the real server.
+    if (params.releases && params.releases.length > 0) {
+      for (const h of params.releases) this.registry.delete(h);
+    }
     const plan = deserializePlan(params.plan, {
       resolveHandle: (h) => {
         const s = this.registry.get(h);
@@ -156,7 +161,7 @@ describe("RemoteEngine (in-process Transport)", () => {
   it("markStep releases handles not bound to `keep` tensors", async () => {
     const transport = new InProcessTransport();
     const engine = createRemoteEngine(transport);
-    const { torch, handles, markStep } = engine;
+    const { torch, handles, markStep, flushReleases } = engine;
 
     // Build a plan with several outputs, only one of which we "keep".
     const a = torch.tensorFromArray([1, 2, 3, 4], [4]).requires_grad_(true);
@@ -173,6 +178,9 @@ describe("RemoteEngine (in-process Transport)", () => {
     expect(released).toBeGreaterThan(0);
     expect(handles.size()).toBeLessThan(before);
     expect(engine.stats.handlesReleased).toBe(released);
+    // markStep defers the release RPC for piggyback. Flush explicitly so
+    // we can assert the server registry has caught up.
+    await flushReleases();
     expect(transport.handleCount()).toBe(handles.size());
   });
 
@@ -279,7 +287,8 @@ describe("RemoteEngine (in-process Transport)", () => {
 
   it("transport.release() keeps client and server registries in sync", async () => {
     const transport = new InProcessTransport();
-    const { torch, handles, markStep } = createRemoteEngine(transport);
+    const { torch, handles, markStep, flushReleases } =
+      createRemoteEngine(transport);
 
     const a = torch.tensorFromArray([1, 2, 3], [3]).requires_grad_(true);
     const b = torch.add(a, 1);
@@ -287,6 +296,9 @@ describe("RemoteEngine (in-process Transport)", () => {
     await c.cpu();
 
     await markStep([a]);
+    // markStep defers the release RPC for piggyback. Flush explicitly so
+    // the server registry catches up.
+    await flushReleases();
     expect(handles.size()).toBe(transport.handleCount());
   });
 });

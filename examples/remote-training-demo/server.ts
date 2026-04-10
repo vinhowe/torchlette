@@ -138,6 +138,13 @@ async function executeHandler(
   params: ExecuteParams,
 ): Promise<ExecuteResult> {
   const t0 = performance.now();
+  // Process piggybacked releases BEFORE deserializing the plan. The plan
+  // can't reference any handle in `releases` — markStep computes the
+  // release set from handles NOT in the live lazy graph, and the next
+  // execute is built from that same lazy graph.
+  if (params.releases && params.releases.length > 0) {
+    session.release(params.releases);
+  }
   const plan = deserializePlan(params.plan, {
     resolveHandle: (h) => session.resolve(h),
   });
