@@ -256,16 +256,26 @@ export function isArenaBuffer(buffer: GPUBuffer): boolean {
 /**
  * Destroy all buffers in an arena and remove them from the arena set.
  * Called when a lowered plan is evicted from the fusion analysis cache.
+ *
+ * @param force - if true, destroy buffers unconditionally. The default
+ *   path skips destroying buffers still referenced by a live tensor
+ *   (mid-step eviction safety), but cross-session recycle paths must
+ *   pass force=true: by then, every "live" reference is stale state
+ *   from the previous session and refusing to destroy leaks the buffer
+ *   permanently — ~20 MiB per session, observed empirically.
  */
-export function destroyArena(arena: BufferArena): void {
+export function destroyArena(arena: BufferArena, force = false): void {
   for (const arr of [arena.resolve, arena.alloc]) {
     for (const buffer of arr) {
       if (buffer) {
         arenaBufferSet.delete(buffer);
-        // Only destroy if not referenced by a live tensor
-        if (!bufferPool.isLive(buffer)) {
+        if (force || !bufferPool.isLive(buffer)) {
           gpuMemoryTracker.trackDeallocation(buffer);
-          buffer.destroy();
+          try {
+            buffer.destroy();
+          } catch {
+            /* already destroyed */
+          }
         }
       }
     }

@@ -152,6 +152,29 @@ export function paramsBufferSizeClass(byteLength: number): number {
   return 64;
 }
 
+/**
+ * Destroy every uniform buffer in the params pools and clear the pools.
+ * Call this from cross-session state-recycle paths — without it, every
+ * server session leaks the uniform buffers it created for kernel
+ * dispatches, and they accumulate as long as the device is alive.
+ * Returns the number of buffers destroyed.
+ */
+export function drainParamsBufferPools(): number {
+  let destroyed = 0;
+  for (const buffers of paramsBufferPools.values()) {
+    for (const buf of buffers) {
+      try {
+        buf.destroy();
+        destroyed++;
+      } catch {
+        /* already destroyed */
+      }
+    }
+  }
+  paramsBufferPools.clear();
+  return destroyed;
+}
+
 // ============================================================================
 // Params Sequence Set (moved from bind-group-cache.ts)
 // ============================================================================
