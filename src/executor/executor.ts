@@ -878,6 +878,16 @@ export async function executeLoweredPlan(
     // compiled plan cache slots or arena bindings).
     livenessOutputIds = new Set<number>();
     livenessOutputIds.add(planNodes[planNodes.length - 1].id);
+    // Trust plan.outputIndices first — this is the explicit contract from the
+    // engine ("the caller needs these results"). Without this, multi-output ops
+    // like adamStep can have node.result cleared mid-plan even though the new
+    // adamStep node tied to a model parameter still needs it for materialization.
+    if (plan.outputIndices) {
+      for (const idx of plan.outputIndices) {
+        livenessOutputIds.add(plan.nodes[idx].id);
+      }
+    }
+    // Legacy fallback for callers that don't set outputIndices.
     const livePendingIds = getLivePendingNodeIds();
     for (const node of planNodes) {
       if (node.result) livenessOutputIds.add(node.id);
