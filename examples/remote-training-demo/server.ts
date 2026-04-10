@@ -108,6 +108,22 @@ class Session {
     return n;
   }
 
+  /**
+   * Destroy every backend tensor still held by this session and clear the
+   * handle map. Call from `ws.on('close')` so a disconnecting client doesn't
+   * leak its working set on the GPU. Without this every dropped session
+   * permanently consumes VRAM until the server process restarts.
+   */
+  releaseAll(): number {
+    let n = 0;
+    for (const storage of this.handles.values()) {
+      storage.backendTensor.destroy?.();
+      n++;
+    }
+    this.handles.clear();
+    return n;
+  }
+
   handleCount(): number {
     return this.handles.size;
   }
@@ -216,11 +232,24 @@ async function readScalarHandler(
       `readScalar: tensor has ${values.length} elements, expected 1`,
     );
   }
-  return { value: values[0] };
+  const v = values[0];
+  if (!Number.isFinite(v)) {
+    console.log(
+      `[readScalar] non-finite value=${v} handle=${params.handle} session=${session.id.slice(0, 8)}`,
+    );
+  }
+  return { value: v };
 }
 
 function releaseHandler(session: Session, params: ReleaseParams): ReleaseResult {
-  return { releasedCount: session.release(params.handles) };
+  const released = session.release(params.handles);
+  // Log so we can verify the client is actually releasing during training.
+  // (Logged unconditionally because release calls are infrequent — once per
+  //  markStep — but the count tells us whether the loop is healthy.)
+  console.log(
+    `[release] session=${session.id.slice(0, 8)} released=${released}/${params.handles.length} held=${session.handleCount()}`,
+  );
+  return { releasedCount: released };
 }
 
 function statsHandler(session: Session): Record<string, unknown> {
@@ -341,11 +370,14 @@ function attachWebSocketHandlers(ws: WebSocket): void {
   });
 
   ws.on("close", () => {
+    // Destroy every backend tensor before the session goes out of scope.
+    // The JS handle map is GC'd by Node, but Dawn-owned GPU buffers are
+    // not — they leak permanently unless we destroy them explicitly here.
+    const heldBefore = session.handleCount();
+    const destroyed = session.releaseAll();
     console.log(
-      `[ws] session closed: ${session.id} (${session.handleCount()} handles leaked)`,
+      `[ws] session closed: ${session.id} (held=${heldBefore} destroyed=${destroyed})`,
     );
-    // Session dies with the socket; handles become unreachable and GC'd
-    // eventually via storageTracker's reachability sweep.
   });
 
   ws.on("error", (e) => console.error(`[ws] error on ${session.id}:`, e));
