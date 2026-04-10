@@ -74,8 +74,8 @@ import { Adam, GradScaler } from "../src/optim";
 // Configuration
 // ============================================================================
 
-const NUM_STEPS = 5;
-const PROFILE_STEP = 4; // Which step to analyze in detail (steady-state)
+const NUM_STEPS = parseInt(process.env.NUM_STEPS ?? "5", 10);
+const PROFILE_STEP = NUM_STEPS - 1; // Which step to analyze in detail (steady-state)
 const BATCH_SIZE = parseInt(process.env.TORCHLETTE_BATCH_SIZE ?? "1", 10);
 const MODEL_NAME = process.env.TORCHLETTE_MODEL ?? "distilgpt2";
 const MODEL_CONFIGS: Record<
