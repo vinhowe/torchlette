@@ -1502,14 +1502,7 @@ export async function executeLoweredPlan(
         );
         compiled.valid = false;
       }
-      if (compiled.valid) {
-        // Note: arena conflicts are NOT a blocker. The compiled plan's
-        // per-command bind group cache (compiled-plan.ts lines 595-623)
-        // validates buffer pointers on each replay and recreates bind groups
-        // when buffers change due to conflict resolution. The conflict
-        // resolution is deterministic for steady-state training: each step
-        // the same handles are live, the same slot has the same conflict,
-        // and the arena allocates a fresh buffer the same way.
+      if (compiled.valid && !getArenaConflictDetected()) {
         compiled.endCounters = getDispatchSequenceCounters();
         loweredPlan.compiledPlan = compiled;
       }
