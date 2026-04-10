@@ -1,0 +1,26 @@
+{
+  "name": "piston-controls",
+  "version": "0.0.1",
+  "description": "Reusable Svelte controls (sliders, inputs, selects, toggles, checkboxes, radios) extracted from vinhowe/piston.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "types": "./src/lib/index.ts",
+      "svelte": "./src/lib/index.ts",
+      "default": "./src/lib/index.ts"
+    },
+    "./theme.css": "./src/lib/theme.css"
+  },
+  "files": [
+    "src/lib"
+  ],
+  "peerDependencies": {
+    "svelte": "^5.0.0"
+  },
+  "dependencies": {
+    "katex": "^0.16.11",
+    "tailwind-merge": "^2.5.5"
+  }
+}
