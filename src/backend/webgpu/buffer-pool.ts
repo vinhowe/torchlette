@@ -615,6 +615,8 @@ class SimpleBufferPool {
     reuseRate: number;
     pendingRelease: number;
     pendingDestroy: number;
+    liveCount: number;
+    pendingReleaseBytes: number;
   } {
     let totalPooled = 0;
     for (const buffers of this.pool.values()) {
@@ -630,6 +632,8 @@ class SimpleBufferPool {
       reuseRate: total > 0 ? this.reuseCount / total : 0,
       pendingRelease: this.pendingRelease.length,
       pendingDestroy: this.pendingDestroy.length,
+      liveCount: this.bufferLiveCount.size,
+      pendingReleaseBytes: this.pendingReleaseBytes,
     };
   }
 
