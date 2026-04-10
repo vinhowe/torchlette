@@ -263,12 +263,16 @@ export function getFusionAnalysisTemplate(
  * The arenas will be rebuilt on the next execution (one slow step, then
  * back to compiled plan speed). Call between training rounds to prevent
  * unbounded GPU memory growth in long-running training.
+ *
+ * @param force - pass true from cross-session recycle paths to destroy
+ *   buffers even if they appear "live" (the liveness state is stale
+ *   between sessions and refusing to destroy leaks ~20 MiB per session).
  */
-export function evictAllArenas(): void {
+export function evictAllArenas(force = false): void {
   // Import is at top of file — destroyArena is already available
   for (const [, template] of fusionAnalysisCache) {
     if (template.bufferArena) {
-      destroyArena(template.bufferArena);
+      destroyArena(template.bufferArena, force);
       template.bufferArena = undefined;
     }
     // Also invalidate compiled plan (it depends on arena buffer identities)
@@ -1516,6 +1520,17 @@ export async function executePlanOptimized(
 
   if (validatedTemplate) {
     // ── Cache hit: reuse existing lowered plan ──
+    // If a cross-session recycle (or arena eviction) cleared the
+    // bufferArena, recreate it as an empty arena that the executor
+    // will populate during the upcoming plan execution. Without this,
+    // the cache-hit path would proceed with options.bufferArena =
+    // undefined, the shouldCompile check would fail, and compiled-plan
+    // recording would never engage for the rest of the process — every
+    // subsequent session would run 3-4× slower than the first because
+    // every plan would go through the slow normal path forever.
+    if (backend.name === "webgpu" && !validatedTemplate.bufferArena) {
+      validatedTemplate.bufferArena = { resolve: [], alloc: [] };
+    }
     planNodes = validatedTemplate.finalPerm.map((i) => plan.nodes[i]);
 
     // Re-apply graph rewrites to fresh nodes. The lowered plan was built from
