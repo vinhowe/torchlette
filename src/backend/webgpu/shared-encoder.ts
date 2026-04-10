@@ -128,7 +128,6 @@ interface EncoderState {
   collectedCommandBuffers: GPUCommandBuffer[];
   deferredUniformBuffers: GPUBuffer[];
   stepLevelScope: boolean;
-  adamBatchMode: boolean;
 }
 
 const encoderState: EncoderState = {
@@ -139,7 +138,6 @@ const encoderState: EncoderState = {
   collectedCommandBuffers: [],
   deferredUniformBuffers: [],
   stepLevelScope: false,
-  adamBatchMode: false,
 };
 
 // Auto-flush threshold: finish current encoder and start a new one after N passes.
@@ -159,15 +157,6 @@ const DEBUG_SHARED_ENCODER =
 
 // currentOpLabel + get/set moved to webgpu-state.ts, re-exported here for backward compat.
 export { getCurrentOpLabel, setCurrentOpLabel } from "./webgpu-state";
-
-// Adam batch mode: when true, adamStep() skips its pre-dispatch flushSharedEncoder().
-// The caller (lazy.ts) is responsible for a single flush before the Adam batch.
-export function setAdamBatchMode(active: boolean): void {
-  encoderState.adamBatchMode = active;
-}
-export function isAdamBatchMode(): boolean {
-  return encoderState.adamBatchMode;
-}
 
 export function beginSharedEncoder(): void {
   if (!encoderState.enabled) return;

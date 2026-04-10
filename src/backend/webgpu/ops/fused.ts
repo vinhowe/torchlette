@@ -23,7 +23,6 @@ import {
   flushSharedEncoder,
   getSharedEncoderInstance,
   incrementSubmitCount,
-  isAdamBatchMode,
   isSharedEncoderActive,
   trackSharedEncoderWrite,
 } from "../shared-encoder";
@@ -42,6 +41,11 @@ function cleanupContiguous(...pairs: [BackendTensor, WebGPUTensor][]) {
 }
 
 import { dispatchAdamStep as dispatchAdamStepKernel } from "../adam-kernel";
+import {
+  dispatchPackedOptimizer,
+  type PackedOptimizerItem,
+} from "../../../optim/packed-dispatch";
+import type { AdamBatchItem, AdamBatchResult } from "../../types";
 import {
   dispatchFlashAttentionBackwardD as dispatchFABwdDKernel,
   dispatchFlashAttentionBackwardDKV as dispatchFABwdDKVKernel,
@@ -73,6 +77,131 @@ import {
 // Fused Adam/AdamW Step
 // ============================================================================
 
+/**
+ * Per-item Adam step implementation. Does NOT call flushSharedEncoder — the
+ * caller is responsible for ensuring previously-recorded passes that read
+ * the param/m/v buffers have been submitted before invoking this. Use
+ * `adamStep` (which flushes once per call) for standalone calls; use
+ * `adamStepBatch` (which flushes once per batch) for grouped calls.
+ */
+function adamStepInner(
+  grad: BackendTensor,
+  param: BackendTensor,
+  m: BackendTensor,
+  v: BackendTensor,
+  config: import("../../types").AdamStepConfig,
+): { param: BackendTensor; m: BackendTensor; v: BackendTensor } {
+  let _st = profileSubOpBegin();
+  const gradT = asContiguous(grad);
+  const paramT = asContiguous(param);
+  const mT = asContiguous(m);
+  const vT = asContiguous(v);
+  profileSubOpEnd("adam.ensureContig", _st);
+
+  // Evict stale f16 cache entry for the old param buffer before dispatch.
+  // Use deferred destruction since the old f16 buffer may still be referenced
+  // by cast() results from the forward pass in the same command encoder batch.
+  _st = profileSubOpBegin();
+  const oldF16 = f16WeightCache.get(paramT.buffer);
+  if (oldF16) {
+    bufferPool.deferredDestroy(oldF16, oldF16.size);
+    f16WeightCache.delete(paramT.buffer);
+  }
+  profileSubOpEnd("adam.f16evict", _st);
+
+  // Re-protect adam's input buffers in the write set.
+  trackSharedEncoderWrite(paramT.buffer);
+  trackSharedEncoderWrite(mT.buffer);
+  trackSharedEncoderWrite(vT.buffer);
+  trackSharedEncoderWrite(gradT.buffer);
+
+  // WebGPU forbids binding the same buffer as read_write at multiple
+  // binding points and forbids read_write ↔ read aliasing. All three of
+  // param/m/v are read_write, grad is read — so each pair must have a
+  // distinct buffer. Pool recycling can cause collisions.
+  let paramBuf = paramT.buffer;
+  let mBuf = mT.buffer;
+  let vBuf = vT.buffer;
+  const gradBuf = gradT.buffer;
+  const bufSize = gradT.size * dtypeBytes(gradT.dtype);
+  const copyTo = (src: GPUBuffer): GPUBuffer => {
+    const dst = allocateOutputBuffer(bufSize);
+    const enc = getSharedEncoderInstance();
+    if (enc) {
+      enc.copyBufferToBuffer(src, 0, dst, 0, bufSize);
+    } else {
+      const ctx2 = requireContext();
+      const tmpEnc = ctx2.device.createCommandEncoder();
+      tmpEnc.copyBufferToBuffer(src, 0, dst, 0, bufSize);
+      ctx2.queue.submit([tmpEnc.finish()]);
+    }
+    flushSharedEncoder();
+    return dst;
+  };
+  if (paramBuf === gradBuf || paramBuf === mBuf || paramBuf === vBuf) {
+    paramBuf = copyTo(paramBuf);
+  }
+  if (mBuf === gradBuf || mBuf === vBuf) {
+    mBuf = copyTo(mBuf);
+  }
+  if (vBuf === gradBuf) {
+    vBuf = copyTo(vBuf);
+  }
+
+  const emitF16 = config.emitF16 ?? false;
+  const infFlagBuf = (config.infFlagBuffer as GPUBuffer | null) ?? null;
+  const numElements = gradT.size;
+
+  const result = dispatchAdamStepKernel(
+    gradBuf,
+    paramBuf,
+    mBuf,
+    vBuf,
+    numElements,
+    config,
+    emitF16,
+    infFlagBuf,
+  );
+
+  // Post-dispatch flush only needed outside shared encoder mode.
+  // In shared encoder mode, all buffer releases are deferred (deferredDestroy for grad,
+  // sharedEncoderDeferredUniformBuffers for config, noop'd destroy for param).
+  // No buffer destruction occurs during plan execution.
+  if (!isSharedEncoderActive()) {
+    flushSharedEncoder();
+  }
+
+  cleanupContiguous([grad, gradT]);
+
+  // Cache the f16 param buffer (keyed by the param buffer, same as before)
+  if (result.paramF16Buffer) {
+    f16WeightCache.set(result.paramBuffer, result.paramF16Buffer);
+  }
+
+  // param/m/v are all updated in-place — transfer ownership from the old
+  // BackendTensors to the results (noop their destroy, decRef their buffers).
+  _st = profileSubOpBegin();
+  if (paramT.ownsBuffer) bufferPool.decRef(paramT.buffer);
+  paramT.destroy = () => {};
+  if (mT.ownsBuffer) bufferPool.decRef(mT.buffer);
+  mT.destroy = () => {};
+  if (vT.ownsBuffer) bufferPool.decRef(vT.buffer);
+  vT.destroy = () => {};
+  const ret = {
+    param: createTensor(
+      paramT.shape,
+      result.paramBuffer,
+      undefined,
+      0,
+      paramT.dtype,
+    ),
+    m: createTensor(mT.shape, result.mBuffer, undefined, 0, mT.dtype),
+    v: createTensor(vT.shape, result.vBuffer, undefined, 0, vT.dtype),
+  };
+  profileSubOpEnd("adam.createTensor", _st);
+  return ret;
+}
+
 export async function adamStep(
   grad: BackendTensor,
   param: BackendTensor,
@@ -85,125 +214,140 @@ export async function adamStep(
   // while new output buffers are allocated — temporary 2x peak is expected.
   gpuMemoryTracker.suppressLimitCheck();
   try {
-    let _st = profileSubOpBegin();
-    const gradT = asContiguous(grad);
-    const paramT = asContiguous(param);
-    const mT = asContiguous(m);
-    const vT = asContiguous(v);
-    profileSubOpEnd("adam.ensureContig", _st);
-
-    // Evict stale f16 cache entry for the old param buffer before dispatch.
-    // Use deferred destruction since the old f16 buffer may still be referenced
-    // by cast() results from the forward pass in the same command encoder batch.
-    _st = profileSubOpBegin();
-    const oldF16 = f16WeightCache.get(paramT.buffer);
-    if (oldF16) {
-      bufferPool.deferredDestroy(oldF16, oldF16.size);
-      f16WeightCache.delete(paramT.buffer);
-    }
-    profileSubOpEnd("adam.f16evict", _st);
-
     // Flush shared encoder before dispatching the Adam kernel.
     // The forward/backward pass may have used param buffers as read-only
     // inputs in compute passes. The Adam kernel binds param as read_write,
     // which conflicts within the same command encoder synchronization scope.
     // Flushing ensures prior passes are submitted before the in-place writes.
-    // In Adam batch mode, the caller already flushed once for the entire batch.
-    if (!isAdamBatchMode()) {
-      flushSharedEncoder();
-    }
+    flushSharedEncoder();
+    return adamStepInner(grad, param, m, v, config);
+  } finally {
+    gpuMemoryTracker.unsuppressLimitCheck();
+  }
+}
 
-    // Re-protect adam's input buffers in the write set.
-    trackSharedEncoderWrite(paramT.buffer);
-    trackSharedEncoderWrite(mT.buffer);
-    trackSharedEncoderWrite(vT.buffer);
-    trackSharedEncoderWrite(gradT.buffer);
+/**
+ * Batched Adam step. Groups same-element-count items into packed dispatches
+ * (one kernel per size class instead of one per param), with per-item fallback
+ * via `adamStepInner` for any items not handled by packing. The shared encoder
+ * is flushed exactly ONCE for the whole batch, not per item.
+ *
+ * Returns results in the same order as `items`.
+ */
+export function adamStepBatch(items: AdamBatchItem[]): AdamBatchResult[] {
+  if (items.length === 0) return [];
+  gpuMemoryTracker.suppressLimitCheck();
+  try {
+    // Single flush before any item — all items share one logical batch.
+    flushSharedEncoder();
 
-    // WebGPU forbids binding the same buffer as read_write at multiple
-    // binding points and forbids read_write ↔ read aliasing. All three of
-    // param/m/v are read_write, grad is read — so each pair must have a
-    // distinct buffer. Pool recycling can cause collisions.
-    let paramBuf = paramT.buffer;
-    let mBuf = mT.buffer;
-    let vBuf = vT.buffer;
-    const gradBuf = gradT.buffer;
-    const bufSize = gradT.size * dtypeBytes(gradT.dtype);
-    const copyTo = (src: GPUBuffer): GPUBuffer => {
-      const dst = allocateOutputBuffer(bufSize);
-      const enc = getSharedEncoderInstance();
-      if (enc) {
-        enc.copyBufferToBuffer(src, 0, dst, 0, bufSize);
-      } else {
-        const ctx2 = requireContext();
-        const tmpEnc = ctx2.device.createCommandEncoder();
-        tmpEnc.copyBufferToBuffer(src, 0, dst, 0, bufSize);
-        ctx2.queue.submit([tmpEnc.finish()]);
-      }
-      flushSharedEncoder();
-      return dst;
-    };
-    if (paramBuf === gradBuf || paramBuf === mBuf || paramBuf === vBuf) {
-      paramBuf = copyTo(paramBuf);
-    }
-    if (mBuf === gradBuf || mBuf === vBuf) {
-      mBuf = copyTo(mBuf);
-    }
-    if (vBuf === gradBuf) {
-      vBuf = copyTo(vBuf);
-    }
-
-    const emitF16 = config.emitF16 ?? false;
-    const infFlagBuf = (config.infFlagBuffer as GPUBuffer | null) ?? null;
-    const numElements = gradT.size;
-
-    const result = dispatchAdamStepKernel(
-      gradBuf,
-      paramBuf,
-      mBuf,
-      vBuf,
-      numElements,
-      config,
-      emitF16,
-      infFlagBuf,
+    const results: Array<AdamBatchResult | null> = new Array(items.length).fill(
+      null,
     );
 
-    // Post-dispatch flush only needed outside shared encoder mode.
-    // In shared encoder mode, all buffer releases are deferred (deferredDestroy for grad,
-    // sharedEncoderDeferredUniformBuffers for config, noop'd destroy for param).
-    // No buffer destruction occurs during plan execution.
-    if (!isSharedEncoderActive()) {
-      flushSharedEncoder();
+    // Try packed dispatch for groups of size ≥ 2 with the same element count.
+    // dispatchPackedOptimizer requires items.length > 1 to even attempt.
+    if (items.length > 1) {
+      // Pre-resolve contiguous tensors per item, evict f16 caches, build the
+      // packed item descriptors. We hold onto the contiguous tensors so the
+      // fallback path can claim ownership uniformly with adamStepInner.
+      const contig: Array<{
+        gradT: WebGPUTensor;
+        paramT: WebGPUTensor;
+        mT: WebGPUTensor;
+        vT: WebGPUTensor;
+      }> = items.map((item) => ({
+        gradT: asContiguous(item.grad),
+        paramT: asContiguous(item.param),
+        mT: asContiguous(item.m),
+        vT: asContiguous(item.v),
+      }));
+
+      for (const { paramT } of contig) {
+        const oldF16 = f16WeightCache.get(paramT.buffer);
+        if (oldF16) {
+          bufferPool.deferredDestroy(oldF16, oldF16.size);
+          f16WeightCache.delete(paramT.buffer);
+        }
+      }
+
+      const packedItems: PackedOptimizerItem[] = contig.map((c) => ({
+        buffers: [c.gradT.buffer, c.paramT.buffer, c.mT.buffer, c.vT.buffer],
+        numElements: c.gradT.size,
+      }));
+
+      // Packed kernel uses the FIRST item's config; all items in a batch
+      // share the same Adam hyperparameters by construction (Adam.step()
+      // builds the batch).
+      const config = items[0].config;
+      const infFlagBuffer = (config.infFlagBuffer as GPUBuffer | null) ?? null;
+
+      const handled = dispatchPackedOptimizer({
+        items: packedItems,
+        gatherIndices: [1, 2, 3], // gather param, m, v back into original buffers
+        dispatch(packed, totalElements) {
+          dispatchAdamStepKernel(
+            packed[0],
+            packed[1],
+            packed[2],
+            packed[3],
+            totalElements,
+            config,
+            false,
+            infFlagBuffer,
+          );
+        },
+        label: "packedAdam",
+      });
+
+      // For items handled by packed dispatch: param/m/v buffers were updated
+      // in place via the gather copy. Transfer ownership from the input BTs
+      // to fresh BTs wrapping the same buffers — same pattern adamStepInner
+      // uses for its single-item path.
+      for (const i of handled) {
+        const { gradT, paramT, mT, vT } = contig[i];
+        const item = items[i];
+
+        cleanupContiguous([item.grad, gradT]);
+
+        if (paramT.ownsBuffer) bufferPool.decRef(paramT.buffer);
+        paramT.destroy = () => {};
+        if (mT.ownsBuffer) bufferPool.decRef(mT.buffer);
+        mT.destroy = () => {};
+        if (vT.ownsBuffer) bufferPool.decRef(vT.buffer);
+        vT.destroy = () => {};
+
+        results[i] = {
+          param: createTensor(
+            paramT.shape,
+            paramT.buffer,
+            undefined,
+            0,
+            paramT.dtype,
+          ),
+          m: createTensor(mT.shape, mT.buffer, undefined, 0, mT.dtype),
+          v: createTensor(vT.shape, vT.buffer, undefined, 0, vT.dtype),
+        };
+      }
     }
 
-    cleanupContiguous([grad, gradT]);
-
-    // Cache the f16 param buffer (keyed by the param buffer, same as before)
-    if (result.paramF16Buffer) {
-      f16WeightCache.set(result.paramBuffer, result.paramF16Buffer);
+    // Fallback path: for items not handled by packed dispatch (or all items
+    // when items.length === 1), call adamStepInner per item. The encoder was
+    // already flushed at the top, so adamStepInner skipping its own flush is
+    // exactly what we want.
+    for (let i = 0; i < items.length; i++) {
+      if (results[i] !== null) continue;
+      const item = items[i];
+      results[i] = adamStepInner(
+        item.grad,
+        item.param,
+        item.m,
+        item.v,
+        item.config,
+      );
     }
 
-    // param/m/v are all updated in-place — transfer ownership from the old
-    // BackendTensors to the results (noop their destroy, decRef their buffers).
-    _st = profileSubOpBegin();
-    if (paramT.ownsBuffer) bufferPool.decRef(paramT.buffer);
-    paramT.destroy = () => {};
-    if (mT.ownsBuffer) bufferPool.decRef(mT.buffer);
-    mT.destroy = () => {};
-    if (vT.ownsBuffer) bufferPool.decRef(vT.buffer);
-    vT.destroy = () => {};
-    const ret = {
-      param: createTensor(
-        paramT.shape,
-        result.paramBuffer,
-        undefined,
-        0,
-        paramT.dtype,
-      ),
-      m: createTensor(mT.shape, result.mBuffer, undefined, 0, mT.dtype),
-      v: createTensor(vT.shape, result.vBuffer, undefined, 0, vT.dtype),
-    };
-    profileSubOpEnd("adam.createTensor", _st);
-    return ret;
+    return results as AdamBatchResult[];
   } finally {
     gpuMemoryTracker.unsuppressLimitCheck();
   }

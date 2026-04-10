@@ -662,16 +662,13 @@ function emitSequentialActions(
     // Adam batch: count consecutive adamStep nodes.
     //
     // Always emit an adam-batch action for adamStep, even when there's only
-    // one consecutive node (adamCount === 1). adam-batch routes through
-    // executeAdamBatchInner, which assigns node.result AND node.results[0]
-    // consistently (via assignPackedAdamResult / assignPerParamAdamResult).
-    //
-    // Falling through to the generic "sequential" classification was the
-    // root cause of "Input not ready: adamStep[0]": that path went through
-    // executeOpSync → executeAdamStep, which sets node.results[0] = null
-    // and relies on a later wrap-and-backfill that wasn't being done. The
-    // null placeholder then surfaced as Input-not-ready any time
-    // node.result was cleared by liveness or arena slot reuse.
+    // one node. adam-batch routes through backend.ops.adamStepBatch, which
+    // returns BackendTensors that the executor wraps via assignNodeResult
+    // (the shared multi-output protocol). This ensures node.result and
+    // node.results[0] are set together — the historical "Input not ready:
+    // adamStep[0]" bug came from a generic-sequential path that left
+    // node.results[0] = null until a later wrap-and-backfill that wasn't
+    // always reached.
     if (node.op === "adamStep") {
       let adamCount = 1;
       for (let j = nodeIdx + 1; j < nodes.length; j++) {
