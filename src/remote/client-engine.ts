@@ -314,23 +314,38 @@ export function createRemoteEngine(
     // 2. Scan ALL live pending tensors' node chains for materialized
     //    input refs. These storages are frozen in the lazy graph and
     //    must not be released — the serializer would fail.
+    //
+    // The walk STOPS at executed nodes (rather than recursing through
+    // them) but adds their referenced output's storage id to keepIds.
+    // Without this guard, Adam's input chains (each new adamStep holds
+    // pending refs to the prior adamStep's outputs) cause the scan to
+    // walk an O(steps) chain every markStep — quadratic total cost.
     const pending = getAllPendingTensors();
     const visited = new Set<LazyIRNode>();
-    const scanNode = (node: LazyIRNode) => {
+    const scanNode = (node: LazyIRNode, outputIndex: number) => {
+      // biome-ignore lint/suspicious/noExplicitAny: _executed flag
+      if ((node as any)._executed) {
+        // Executed node — don't walk further. Just keep its referenced
+        // output storage alive (the chain stops here).
+        const storage =
+          outputIndex === 0 ? node.result : node.results?.[outputIndex];
+        if (storage) keepIds.add(storage.id);
+        return;
+      }
       if (visited.has(node)) return;
       visited.add(node);
       for (const ref of node.inputs) {
         if (ref.kind === "materialized") {
           keepIds.add(ref.storage.id);
         } else if (ref.kind === "pending") {
-          scanNode(ref.node);
+          scanNode(ref.node, ref.outputIndex ?? 0);
         }
       }
     };
     for (const rt of pending) {
       if (rt.disposed) continue;
       const ref = rt.lazyRef;
-      if (ref.kind === "pending") scanNode(ref.node);
+      if (ref.kind === "pending") scanNode(ref.node, ref.outputIndex ?? 0);
     }
 
     const toRelease: HandleRef[] = [];
