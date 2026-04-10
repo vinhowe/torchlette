@@ -8,7 +8,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { cpuBackend } from "../../src/backend/cpu";
 import { registerBackend } from "../../src/backend/registry";
 import { executePlanSequential } from "../../src/executor/sequential";
-import type { ExecutionPlan, LazyIRNode, LazyRef } from "../../src/graph/types";
+import { LazyIRNode, type ExecutionPlan, type LazyRef } from "../../src/graph/types";
 import { deserializePlan, serializePlan } from "../../src/remote/serialize";
 import type { HandleRef, SerializedPlan } from "../../src/remote/wire";
 
@@ -29,16 +29,7 @@ function makeNodeFactory() {
     payload?: unknown,
     dtype: LazyIRNode["dtype"] = "f32",
   ): LazyIRNode => {
-    const n: LazyIRNode = {
-      id: nextId++,
-      op,
-      inputs,
-      shape,
-      dtype,
-      device: "cpu",
-    };
-    if (payload !== undefined) n.payload = payload;
-    return n;
+    return new LazyIRNode(nextId++, op, inputs, shape, dtype, "cpu", payload);
   };
 }
 

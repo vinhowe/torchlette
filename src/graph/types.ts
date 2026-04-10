@@ -72,21 +72,51 @@ export interface StorageHandle {
   baseStorageId?: number;
 }
 
-export interface LazyIRNode {
+/**
+ * A lazy IR node — one entry in the deferred-execution graph.
+ *
+ * `result` is a derived view of `results[0]`, not an independent field.
+ * Reading `node.result` returns `node.results?.[0]`; assigning `node.result`
+ * mutates `node.results[0]` in place. This makes it impossible for the two
+ * to diverge — the historical "Input not ready: adamStep[0]" bug class came
+ * from code paths that cleared `node.result` while leaving a stale handle in
+ * `node.results[0]`, which the read fallback then silently used.
+ *
+ * Multi-output ops (`adamStep`, `fusedAttention*`, `fusedLayerNormBackwardGradWeightBias`)
+ * populate additional slots `results[1..N]` for their side outputs. Those
+ * slots have INDEPENDENT lifecycles — clearing `node.result` only nulls
+ * `results[0]`, never the side outputs.
+ */
+export class LazyIRNode {
+  /**
+   * Brand field — makes LazyIRNode nominally typed under TypeScript's
+   * structural type system. Without this, code could create an object
+   * literal `{...} as LazyIRNode` and skip the constructor — which would
+   * also skip the `result` getter/setter, breaking the invariant that
+   * `node.result === node.results?.[0]`. The brand forces all instances
+   * to come from `new LazyIRNode(...)` (or via `createLazyIRNode`).
+   */
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: nominal-typing brand
+  private _brand!: undefined;
+
   id: number;
   op: LazyOpCode;
   inputs: LazyRef[];
   shape: number[];
   dtype: DType;
   device: DeviceKind;
-  /** Primary output (index 0). Set after execution. */
-  result?: StorageHandle;
-  /** All outputs for multi-output ops. results[0] === result. */
-  results?: StorageHandle[];
+  /**
+   * All outputs. `results[0]` is the primary output (= `node.result`).
+   * Slots may be sparse: `results[i]` can be undefined while a later slot
+   * is still set (e.g., after liveness clears the primary buffer).
+   */
+  results?: (StorageHandle | undefined)[];
   /** True while input rc is retained by the plan executor (prevents double-retain). */
   _inputsRetained?: boolean;
-  /** Set after execution. Survives node.result cleanup so buildMergedPlan's
-   *  skipExecuted can distinguish "executed but result cleared" from "never executed". */
+  /**
+   * Set after execution. Survives node.result cleanup so buildMergedPlan's
+   * skipExecuted can distinguish "executed but result cleared" from "never executed".
+   */
   _executed?: boolean;
   payload?: unknown;
   /** Module label for profiling (set via setProfileModule during graph construction) */
@@ -98,6 +128,39 @@ export interface LazyIRNode {
    * This enables memory savings for large models that don't fit in GPU memory.
    */
   isCheckpointBoundary?: boolean;
+
+  constructor(
+    id: number,
+    op: LazyOpCode,
+    inputs: LazyRef[],
+    shape: number[],
+    dtype: DType,
+    device: DeviceKind,
+    payload?: unknown,
+  ) {
+    this.id = id;
+    this.op = op;
+    this.inputs = inputs;
+    this.shape = shape;
+    this.dtype = dtype;
+    this.device = device;
+    this.payload = payload;
+  }
+
+  /** Primary output (index 0). Derived view of `results[0]`. */
+  get result(): StorageHandle | undefined {
+    return this.results?.[0];
+  }
+
+  set result(value: StorageHandle | undefined) {
+    if (value === undefined) {
+      if (this.results) this.results[0] = undefined;
+    } else if (!this.results) {
+      this.results = [value];
+    } else {
+      this.results[0] = value;
+    }
+  }
 }
 
 export type LazyRef =
