@@ -73,10 +73,32 @@ async function initBackend(preferWebGPU: boolean): Promise<string> {
     gpuMemoryStatsFn = getGPUMemoryStats;
 
     // Resolve all the reset functions once so the close-handler can run them
-    // synchronously without doing dynamic imports on every disconnect. The
-    // order matters: arenas first (they pin GPU buffers via plan templates),
-    // then bind group cache (references those buffers), then the f16 weight
-    // cache, then flush + destroy + evict the buffer pool itself.
+    // synchronously without doing dynamic imports on every disconnect.
+    //
+    // The first version of this recycle missed several leak sources and let
+    // GPU memory creep up across sessions (~20 MiB/session); each new
+    // session ran 3-4× slower than the first because Dawn was operating
+    // under increasing memory pressure. The fixed version covers all the
+    // process-global GPU buffer caches:
+    //
+    //   1. evictAllArenas(force=true) — destroy ALL arena GPUBuffers,
+    //      ignoring the in-session "live tensor" safety check (which
+    //      uses stale state between sessions and silently leaks).
+    //   2. clearBindGroupCache — drop bind group + sequence cache state.
+    //   3. drainParamsBufferPools — destroy uniform buffers pooled by
+    //      kernel dispatch (createParamsBuffer in bind-group-cache.ts).
+    //      The clearBindGroupCache call alone leaves these alive.
+    //   4. f16WeightCache: iterate values + destroy each, THEN clear the
+    //      Map. Just calling .clear() drops the Map entries but leaks the
+    //      f16 GPUBuffers.
+    //   5. runTeardownCallbacks — drains per-kernel module-local caches
+    //      registered via onTeardown (adam-kernel, attention-kernel,
+    //      cross-entropy-kernel, fusion-dispatch, layernorm-kernel,
+    //      rmsnorm-kernel, rope-kernel, row-program-dispatch,
+    //      unscale-kernel, matmul/dispatch). Each holds its own
+    //      Map<*, GPUBuffer> of config buffers that would otherwise
+    //      accumulate.
+    //   6. flush + destroy + evict the buffer pool itself.
     const { evictAllArenas } = await import("../../src/executor/executor.js");
     const { clearBindGroupCache } = await import(
       "../../src/backend/webgpu/bind-group-cache.js"
@@ -86,10 +108,24 @@ async function initBackend(preferWebGPU: boolean): Promise<string> {
     const { f16WeightCache } = await import(
       "../../src/backend/webgpu/gpu-context.js"
     );
+    const { drainParamsBufferPools, runTeardownCallbacks } = await import(
+      "../../src/backend/webgpu/webgpu-state.js"
+    );
     recycleExecutorState = (): void => {
-      evictAllArenas();
+      // 1. Arena buffers (force=true: ignore stale liveness state).
+      evictAllArenas(true);
+      // 2. Bind-group / params-sequence cache references.
       clearBindGroupCache();
+      // 3. Pooled uniform buffers — must explicitly destroy each.
+      drainParamsBufferPools();
+      // 4. f16 dual-write cache: destroy each buffer, then clear map.
+      for (const buf of f16WeightCache.values()) {
+        try { buf.destroy(); } catch { /* already destroyed */ }
+      }
       f16WeightCache.clear();
+      // 5. Per-kernel module-local config caches.
+      runTeardownCallbacks();
+      // 6. The pool itself.
       flushBufferPool();
       destroyPendingGPUBuffers();
       evictAllPoolBuffers();
@@ -534,14 +570,38 @@ async function main(): Promise<void> {
   });
 
   // Dawn (used by WebGPU backend on Node) holds background threads that
-  // prevent clean exit — force termination on SIGTERM/SIGINT.
-  const shutdown = (sig: string) => {
+  // prevent clean exit — force termination on SIGTERM/SIGINT, but FIRST
+  // explicitly destroy the WebGPU device so the Vulkan device handle
+  // (and its ~few hundred MiB of GPU resident memory) doesn't leak.
+  // Without this, every SIGKILLed-or-SIGTERMed server leaves a zombie
+  // GPU context that nvidia-smi reports as `[Not Found]` PID, eventually
+  // forcing a host reboot to reclaim. SIGKILL still leaks (no chance to
+  // run handlers), so callers should prefer SIGTERM.
+  let shuttingDown = false;
+  const shutdown = async (sig: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log(`[server] ${sig} — shutting down`);
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 500).unref();
+    // Stop accepting new connections.
+    server.close();
+    // Tear down WebGPU before exiting so Dawn can call vkDestroyDevice.
+    if (backend.name === "webgpu") {
+      try {
+        const { destroyWebGPU } = await import("../../src/backend/webgpu/index.js");
+        destroyWebGPU();
+        console.log("[server] WebGPU device destroyed");
+      } catch (e) {
+        console.error(`[server] destroyWebGPU failed: ${(e as Error).message}`);
+      }
+    }
+    process.exit(0);
   };
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => {
+    shutdown("SIGTERM").catch(() => process.exit(1));
+  });
+  process.on("SIGINT", () => {
+    shutdown("SIGINT").catch(() => process.exit(1));
+  });
 }
 
 main().catch((e) => {
