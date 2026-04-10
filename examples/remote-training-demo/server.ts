@@ -166,8 +166,14 @@ async function executeHandler(
     const node = plan.nodes[i];
     if (!node.result) continue;
     outputs[i] = session.allocHandle(node.result);
-    if (node.results) {
-      for (let j = 0; j < node.results.length; j++) {
+    // Side outputs start at j=1: results[0] is the same StorageHandle as
+    // node.result and is already allocated above as outputs[i]. After the
+    // LazyIRNode class refactor that made `result` a derived view of
+    // `results[0]`, every node has results.length >= 1, so iterating from
+    // j=0 here would allocate a duplicate handle for every single-output
+    // node — doubling the per-step bookkeeping cost.
+    if (node.results && node.results.length > 1) {
+      for (let j = 1; j < node.results.length; j++) {
         const r = node.results[j];
         if (r) sideOutputs[`${i}:${j}`] = session.allocHandle(r);
       }
