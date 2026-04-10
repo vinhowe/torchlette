@@ -54,12 +54,16 @@ export function allocateOutputBuffer(sizeBytes: number): GPUBuffer {
       // would overwrite the input data before it's fully consumed.
       if (arenaLocal.externalInputBuffers?.has(arenaBuffer)) {
         // Replace the arena slot with a fresh buffer. The old buffer stays
-        // alive (referenced by the external input tensor) but is no longer
-        // in the arena. Hand it back to the pool's release chain so it gets
-        // properly destroyed once its refcount reaches zero (or reused).
+        // alive — it's referenced by the external input tensor — but it's
+        // no longer owned by the arena. Just remove from arenaBufferSet;
+        // when the input tensor's destroy() eventually runs it will see
+        // the buffer is no longer in arenaBufferSet and route it through
+        // the normal pool release chain (decRef → pendingRelease → pool).
+        // Calling release() here would create a DUPLICATE pendingRelease
+        // entry that's pinned by the still-live owner's refcount, which
+        // never resolves and accumulates as a per-step leak.
         arenaBufferSet.delete(arenaBuffer);
         arenaLocal.active.alloc[idx] = undefined;
-        bufferPool.release(arenaBuffer, arenaBuffer.size, STORAGE_BUFFER_USAGE);
         const freshBuffer = arenaAllocAt(
           arenaLocal.active.alloc,
           idx,
@@ -307,10 +311,12 @@ function arenaAllocAt(
     // properly destroyed once its refcount reaches zero (or reused if dead).
     arenaBufferSet.delete(existing);
     if (bufferPool.isLive(existing)) {
-      // Live buffer — pool's release chain will hold it in pendingRelease
-      // until the owner releases, then destroy or pool it.
+      // Live buffer — owned by some other tensor. Just drop it from the
+      // arena set; when that tensor's destroy() eventually runs, it will
+      // route the buffer through the normal pool release chain.
+      // Calling release() here would create a duplicate pendingRelease
+      // entry pinned by the still-live owner's refcount → permanent leak.
       arenaLocal.conflictDetected = true;
-      bufferPool.release(existing, existing.size, STORAGE_BUFFER_USAGE);
     } else {
       // Dead buffer — destroy via the deferred queue (safe wrt GPU fences).
       bufferPool.deferredDestroy(existing, existing.size);
@@ -383,12 +389,13 @@ export function resolveOutputBuffer(
       // Check for external input conflict first (structural — replace arena slot).
       if (arenaLocal.externalInputBuffers?.has(arenaBuffer)) {
         // Replace the arena slot with a fresh buffer. The old buffer stays
-        // alive (referenced by the external input tensor) — hand it back to
-        // the pool's release chain so it gets destroyed once its refcount
-        // reaches zero (or reused by another op).
+        // alive — referenced by the external input tensor — but it's no
+        // longer owned by the arena. Just remove from arenaBufferSet; the
+        // owner's tensor.destroy() will route it through the pool release
+        // chain later. Calling release() here would create a duplicate
+        // pendingRelease entry pinned by the live refcount → leak.
         arenaBufferSet.delete(arenaBuffer);
         arenaLocal.active.resolve[idx] = undefined;
-        bufferPool.release(arenaBuffer, arenaBuffer.size, STORAGE_BUFFER_USAGE);
         const freshBuffer = arenaAllocAt(
           arenaLocal.active.resolve,
           idx,
