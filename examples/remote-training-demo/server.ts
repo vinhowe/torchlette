@@ -19,6 +19,8 @@ import { registerBackend } from "../../src/backend/registry.js";
 import type { Backend, DType } from "../../src/backend/types.js";
 import { executePlanOptimized } from "../../src/executor/executor.js";
 import { createStorageHandle } from "../../src/graph/node-factory.js";
+import { rcRelease, rcRetain } from "../../src/graph/refcount.js";
+import { storageTracker } from "../../src/graph/storage-tracker.js";
 import type { StorageHandle } from "../../src/graph/types.js";
 import {
   decodeBinaryFrame,
@@ -158,6 +160,16 @@ async function initBackend(preferWebGPU: boolean): Promise<string> {
 // Session state
 // ============================================================================
 
+/**
+ * Per-session handle map.
+ *
+ * Each handle is one ownership of its underlying StorageHandle, accounted via
+ * the engine's refcount system: allocHandle does rcRetain, release does
+ * rcRelease, then storageTracker.destroyUnreachable cleans up storages whose
+ * rc dropped to zero. This is the same ownership protocol that user-facing
+ * Tensor wrappers use locally — the session just plays the role the local
+ * Tensor wrappers would.
+ */
 class Session {
   readonly id: string = randomUUID();
   /** handle → StorageHandle (server-side) */
@@ -167,6 +179,7 @@ class Session {
   allocHandle(storage: StorageHandle): HandleRef {
     const h = `h${this.nextHandle++}`;
     this.handles.set(h, storage);
+    rcRetain(storage.id, "session.handle");
     return h;
   }
 
@@ -182,28 +195,28 @@ class Session {
       const storage = this.handles.get(h);
       if (storage) {
         this.handles.delete(h);
-        // Destroy the GPU buffer to reclaim VRAM. Without this, every
-        // released handle leaks its buffer and the GPU fills up.
-        storage.backendTensor.destroy?.();
+        rcRelease(storage.id, "session.handle");
         n++;
       }
     }
+    if (n > 0) storageTracker.destroyUnreachable();
     return n;
   }
 
   /**
-   * Destroy every backend tensor still held by this session and clear the
-   * handle map. Call from `ws.on('close')` so a disconnecting client doesn't
-   * leak its working set on the GPU. Without this every dropped session
-   * permanently consumes VRAM until the server process restarts.
+   * Drop every handle held by this session. Call from `ws.on('close')` so a
+   * disconnecting client doesn't leak its working set on the GPU. Without
+   * this every dropped session permanently consumes VRAM until the server
+   * process restarts.
    */
   releaseAll(): number {
     let n = 0;
     for (const storage of this.handles.values()) {
-      storage.backendTensor.destroy?.();
+      rcRelease(storage.id, "session.handle");
       n++;
     }
     this.handles.clear();
+    if (n > 0) storageTracker.destroyUnreachable();
     return n;
   }
 
@@ -238,15 +251,22 @@ async function executeHandler(
     node.device = serverDevice;
   }
 
+  // Snapshot storage ID before execution. Anything created during this
+  // plan that doesn't end up rcRetained by the session.allocHandle loop
+  // below is a step-scoped intermediate and gets dropped by
+  // destroyUnreachableSince — the server-side analogue of the local
+  // engine's "force → materialize → destroyUnreachable" sequence.
+  const sinceId = storageTracker.getNextStorageId();
+
   // Optimized execution: fusion + arena + compiled plan replay.
   // The plan carries outputIndices (set by the client) so the executor
   // scopes its all-results pass to only client-needed nodes.
   await executePlanOptimized(plan, backend);
   const tExec = performance.now();
 
-  // Allocate handles only for output nodes (plan.outputIndices).
-  // Non-output nodes are internal to the plan — their GPU buffers are
-  // managed by the arena and reused across steps.
+  // Allocate handles for output nodes (plan.outputIndices). allocHandle
+  // does rcRetain, claiming ownership so destroyUnreachableSince below
+  // doesn't reap the output storage.
   const outputSet = plan.outputIndices ? new Set(plan.outputIndices) : null;
   const outputs: Record<NodeIdx, HandleRef> = {};
   const sideOutputs: Record<string, HandleRef> = {};
@@ -270,31 +290,12 @@ async function executeHandler(
     }
   }
 
-  // Destroy intermediate node.result storages — those NOT in outputSet and
-  // not bound to any session handle. These are step-scoped temporaries that
-  // the server has no further use for. Without this cleanup the executor's
-  // storageTracker accumulates ~150 storages per training step, which keeps
-  // their underlying buffers' liveCount > 0 and pins them in the buffer
-  // pool's pendingRelease queue forever — the actual root cause of the
-  // batch=1024 OOM and the steady cross-step memory growth observed in
-  // both Node and the browser.
-  //
-  // Arena buffers short-circuit inside backendTensor.destroy() (checked via
-  // arenaBufferSet) so they stay in the arena and get reused next step;
-  // non-arena buffers go through the pool release chain.
-  for (let i = 0; i < plan.nodes.length; i++) {
-    if (outputSet?.has(i)) continue;
-    const node = plan.nodes[i];
-    if (node.result?.backendTensor?.destroy) {
-      node.result.backendTensor.destroy();
-    }
-    if (node.results && node.results.length > 1) {
-      for (let j = 1; j < node.results.length; j++) {
-        const r = node.results[j];
-        if (r?.backendTensor?.destroy) r.backendTensor.destroy();
-      }
-    }
-  }
+  // Drop step-scoped intermediates: any storage created during this plan
+  // (id >= sinceId) whose rc is still 0 (not claimed as an output handle,
+  // not held as a view base). Arena buffers short-circuit inside
+  // tensor.destroy() via arenaBufferSet, so they stay in the arena for
+  // next step; non-arena buffers route through the pool release chain.
+  storageTracker.destroyUnreachableSince(sinceId);
   const tMarshal = performance.now();
   const nSide = Object.keys(sideOutputs).length;
   if (plan.nodes.length > 100) {
