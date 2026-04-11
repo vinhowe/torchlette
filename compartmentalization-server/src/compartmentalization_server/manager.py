@@ -360,9 +360,29 @@ class ExperimentManager:
 
     # ── helpers ──
 
-    def get_metrics_history(self, experiment_id: str) -> list[dict[str, Any]]:
+    def get_metrics_history(
+        self,
+        experiment_id: str,
+        max_entries: int | None = 2000,
+    ) -> list[dict[str, Any]]:
+        """Return the metrics history for an experiment.
+
+        `max_entries` caps the returned list length via
+        storage.read_metrics_downsampled's minimal/extended split —
+        eval-only entries (probe_r2, cos_sim, sharpness, …) are
+        always preserved; the per-step loss/grad_norm entries get
+        strided to fit. Pass None to disable downsampling and return
+        every entry.
+
+        Default cap of 2000 is a compromise: enough points for a
+        high-resolution loss curve, small enough that subscribing to
+        a 50k-step experiment doesn't ship 7 MB of JSON and freeze
+        the browser on the initial render cascade.
+        """
         rec = self._require(experiment_id)
-        return storage.read_metrics(rec.paths)
+        if max_entries is None:
+            return storage.read_metrics(rec.paths)
+        return storage.read_metrics_downsampled(rec.paths, max_entries)
 
     def _require(self, experiment_id: str) -> ExperimentRecord:
         rec = self.records.get(experiment_id)
