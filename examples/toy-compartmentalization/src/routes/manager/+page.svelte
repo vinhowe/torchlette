@@ -37,18 +37,67 @@
   let lastError = $derived(client.lastError);
 
   // ── create form state ──
-  let selectedScript = $state<string>("");
-  let totalSteps = $state(5000);
-  let description = $state("");
+  //
+  // Persisted to localStorage so a page reload (or closing and reopening
+  // the browser) doesn't lose what the user was about to launch. The
+  // initial values below are populated from localStorage if present —
+  // we do this synchronously at module init (the route has ssr=false
+  // so this only runs in the browser, and localStorage is available
+  // before any reactive effect fires).
+  type FormValue = number | boolean | string;
+  type PersistedForm = {
+    selectedScript?: string;
+    totalSteps?: number;
+    description?: string;
+    formParams?: Record<string, Record<string, FormValue>>;
+  };
+  const STORAGE_KEY = "experiment-manager-form";
+  function loadPersistedForm(): PersistedForm {
+    if (typeof window === "undefined") return {};
+    try {
+      const raw = window.localStorage.getItem(STORAGE_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (typeof parsed !== "object" || parsed === null) return {};
+      return parsed as PersistedForm;
+    } catch {
+      return {};
+    }
+  }
+  const persisted = loadPersistedForm();
+
+  let selectedScript = $state<string>(persisted.selectedScript ?? "");
+  let totalSteps = $state<number>(persisted.totalSteps ?? 5000);
+  let description = $state<string>(persisted.description ?? "");
   // Per-script param values: keyed by script name so switching scripts
   // and back preserves what you typed. Values can be numbers (Slider),
   // booleans (CheckboxInput), or strings (SelectInput) depending on the
   // script's ParamSpec.type. ensureFormParams populates defaults for
   // every known type.
-  type FormValue = number | boolean | string;
-  let formParams = $state<Record<string, Record<string, FormValue>>>({});
+  let formParams = $state<Record<string, Record<string, FormValue>>>(
+    persisted.formParams ?? {},
+  );
   let creatingError = $state<string | null>(null);
   let creating = $state(false);
+
+  // Persist on every change. localStorage writes are fast (<1ms) so we
+  // don't bother debouncing even though this fires on every slider
+  // drag. Wrapped in try/catch because localStorage can throw on
+  // quota-exceeded / denied / private-mode.
+  $effect(() => {
+    if (typeof window === "undefined") return;
+    const snapshot: PersistedForm = {
+      selectedScript,
+      totalSteps,
+      description,
+      formParams,
+    };
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+    } catch {
+      // storage full / denied — silent fail, form still works in-memory
+    }
+  });
 
   let selectedScriptInfo = $derived<ScriptInfo | undefined>(
     scripts.find((s) => s.name === selectedScript),
@@ -143,6 +192,27 @@
       await client.deleteExperiment(id);
     } catch (e: any) {
       alert(`delete failed: ${e?.message ?? e}`);
+    }
+  }
+
+  /** Copy an existing experiment's settings into the create form so the
+   *  user can launch a new run with the same (or tweaked) parameters.
+   *  Copies script, params, total_steps, description. Any non-number /
+   *  non-boolean / non-string values are skipped (shouldn't happen in
+   *  practice — all ParamSpec-typed values are one of the three). */
+  function cloneSettings(rec: ExperimentRecord) {
+    selectedScript = rec.script;
+    description = rec.description ?? "";
+    totalSteps = rec.total_steps;
+    const copy: Record<string, FormValue> = {};
+    for (const [k, v] of Object.entries(rec.params)) {
+      if (typeof v === "number" || typeof v === "boolean" || typeof v === "string") {
+        copy[k] = v;
+      }
+    }
+    formParams = { ...formParams, [rec.script]: copy };
+    if (typeof window !== "undefined") {
+      window.scrollTo({ top: 0, behavior: "smooth" });
     }
   }
 
@@ -374,7 +444,13 @@
               <td class="py-[6px] pr-3 text-right">{fmtProgress(rec)}</td>
               <td class="py-[6px] pr-3 text-right">{fmtLoss(rec)}</td>
               <td class="py-[6px] pr-3 text-right">{rec.last_checkpoint_step}</td>
-              <td class="py-[6px] pr-3 text-right">
+              <td class="py-[6px] pr-3 text-right space-x-3">
+                <button
+                  type="button"
+                  onclick={() => cloneSettings(rec)}
+                  title="Copy settings into the create form above"
+                  class="text-[rgba(0,0,0,0.54)] underline hover:text-[rgba(0,0,0,0.84)]"
+                >clone</button>
                 {#if rec.status === "running" || rec.status === "stopping"}
                   <button type="button" onclick={() => handleStop(rec.id)} class="text-[rgba(0,0,0,0.54)] underline hover:text-[#c0392b]">stop</button>
                 {:else}
