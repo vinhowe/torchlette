@@ -54,6 +54,95 @@ from compartmentalization_server.models import (
     hessian_lambda_max,
 )
 
+
+# ──────────────────────────────────────────────────────────────────────────
+# Model with per-compartment TR-token embeddings
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class BioTransformer(Transformer):
+    """Transformer with an additional learned compartment embedding added
+    at each TR token position.
+
+    The default bio3 setup plateaus translation_loss at exactly
+    ln(n_compartments) whenever `translation_pct=0` — the model has
+    learned which entity a bio is about but has no way to tell which
+    compartment the target belongs to, so it splits probability
+    uniformly across `n_compartments` copies of each fact.
+
+    This module breaks that symmetry: at every TR position we add a
+    learned per-compartment vector to the token embedding. In mirror
+    mode the first TR announces "partA is in compartment A" and the
+    second announces "partB is in compartment B", giving the model a
+    direct signal for the target's compartment. The compartment
+    embedding is a small nn.Embedding(n_compartments, embed_dim) module
+    initialized to small noise — it's additive to the base TR token
+    embedding, not a replacement, so the rest of the vocab is
+    unaffected.
+
+    The forward pass takes an extra `comp_hint` tensor alongside
+    `tokens`. `comp_hint[b, t] >= 0` at TR positions indicates which
+    compartment to add; `-1` at every other position means "no
+    compartment embedding here". The masked add uses clamp(min=0) +
+    mask multiplication so out-of-range lookups don't crash.
+
+    When `n_compartments=None`, the BioTransformer behaves identically
+    to the plain Transformer — no compartment embedding is allocated
+    and comp_hint is silently ignored. Used when the user wants to
+    disable this feature via `use_compartment_tr_embed=False` to
+    compare against the plain-TR baseline.
+    """
+
+    def __init__(
+        self,
+        cfg: TransformerConfig,
+        n_compartments: int | None = None,
+    ) -> None:
+        super().__init__(cfg)
+        self.n_compartments = n_compartments
+        if n_compartments is not None:
+            self.compartment_embed = nn.Embedding(n_compartments, cfg.embed_dim)
+            # Small init so we don't overwhelm the base TR embedding at
+            # step 0 — the model should start from "TR means TR" and
+            # gradually differentiate the compartment signal.
+            nn.init.normal_(self.compartment_embed.weight, std=0.02)
+        else:
+            self.compartment_embed = None
+
+    def forward(  # type: ignore[override]
+        self,
+        tokens: torch.Tensor,
+        comp_hint: torch.Tensor | None = None,
+        return_residuals: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        B, T = tokens.shape
+        x = self.wte(tokens)
+        if self.wpe is not None:
+            positions = torch.arange(T, device=tokens.device)
+            x = x + self.wpe(positions).unsqueeze(0)
+
+        if self.compartment_embed is not None and comp_hint is not None:
+            # Mask out non-TR positions (comp_hint == -1). clamp(min=0)
+            # gives a safe index for the lookup; the mask zeros out any
+            # contribution from those clamped positions.
+            mask = (comp_hint >= 0).unsqueeze(-1).to(x.dtype)  # [B, T, 1]
+            clamped = comp_hint.clamp(min=0)
+            comp_emb = self.compartment_embed(clamped)  # [B, T, D]
+            x = x + comp_emb * mask
+
+        residuals: list[torch.Tensor] = []
+        for block in self.blocks:
+            x = block(x)
+            if return_residuals:
+                residuals.append(x)
+
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        if return_residuals:
+            return logits, residuals
+        return logits
+
 EVAL_INTERVAL = 50
 # Sharpness is ~45 training-step-equivalents per call (15 power
 # iterations × 3 passes each). Run it much less often than the cheap
@@ -279,8 +368,23 @@ def _generate_translation(
     comp_a: int,
     comp_b: int,
     mode: str = "mirror",
-) -> list[int]:
-    """One translation example between two compartments for a given fact."""
+) -> tuple[list[int], list[tuple[int, int]]]:
+    """One translation example between two compartments.
+
+    Returns (sequence, tr_hints) where tr_hints is a list of
+    (position, compartment) pairs identifying each TR token's
+    compartment association. BioTransformer uses these to add a
+    per-compartment embedding at TR positions.
+
+    Tagging rules:
+      - mirror: `[TR, partA, TR, partB]`
+            first TR announces comp_a (the next partA),
+            second TR announces comp_b (the next partB).
+      - continuation: `[partA[:k], TR, partB[k:]]`
+            TR announces comp_b (the chunk that follows).
+      - dictionary: `[TR, chunkA, chunkB]`
+            TR announces comp_a (the immediately-following tokens).
+    """
     cfg = world.config
     value_id = world.facts[entity_id][attr_id]
     part_a = [
@@ -295,29 +399,39 @@ def _generate_translation(
     ]
 
     if mode == "mirror":
-        return [world.tr_token, *part_a, world.tr_token, *part_b]
+        seq = [world.tr_token, *part_a, world.tr_token, *part_b]
+        hints = [(0, comp_a), (1 + len(part_a), comp_b)]
+        return seq, hints
+
     if mode == "continuation":
         split_idx = 1 + world.batch_rng.randrange(max(1, len(part_a) - 1))
-        return [*part_a[:split_idx], world.tr_token, *part_b[split_idx:]]
+        seq = [*part_a[:split_idx], world.tr_token, *part_b[split_idx:]]
+        hints = [(split_idx, comp_b)]
+        return seq, hints
+
     # dictionary: token-pair only, no fact context
     pair_kind = world.batch_rng.randrange(3)
     if pair_kind == 0:
-        return [
+        seq = [
             world.tr_token,
             *world.entity_tokens[comp_a][entity_id],
             *world.entity_tokens[comp_b][entity_id],
         ]
-    if pair_kind == 1:
-        return [
+    elif pair_kind == 1:
+        seq = [
             world.tr_token,
             world.attr_tokens[comp_a][attr_id],
             world.attr_tokens[comp_b][attr_id],
         ]
-    return [
-        world.tr_token,
-        *world.value_tokens[comp_a][value_id],
-        *world.value_tokens[comp_b][value_id],
-    ]
+    else:
+        seq = [
+            world.tr_token,
+            *world.value_tokens[comp_a][value_id],
+            *world.value_tokens[comp_b][value_id],
+        ]
+    # The TR precedes the first tokens, which are in comp_a.
+    hints = [(0, comp_a)]
+    return seq, hints
 
 
 def generate_training_batch(
@@ -326,8 +440,14 @@ def generate_training_batch(
     seq_len: int,
     translation_frac: float,
     translation_mode: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Produce (tokens [B, T] int64, targets [B, T] int64).
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Produce (tokens [B, T] int64, targets [B, T] int64, comp_hint [B, T] int64).
+
+    `comp_hint` holds the compartment index at TR positions (tagged
+    via `_generate_translation`) and -1 everywhere else. Bio
+    paragraphs and QA pairs contain no TR tokens, so their whole row
+    stays -1. BioTransformer.forward uses this to add a per-
+    compartment embedding at TR positions.
 
     Targets of -1 indicate positions that shouldn't contribute to the
     loss (padding, QA prompt positions, etc.). Matches the JS
@@ -344,10 +464,12 @@ def generate_training_batch(
 
     tokens = torch.zeros((batch_size, seq_len), dtype=torch.long)
     targets = torch.full((batch_size, seq_len), -1, dtype=torch.long)
+    comp_hint = torch.full((batch_size, seq_len), -1, dtype=torch.long)
 
     for b in range(batch_size):
         comp = world.batch_rng.randrange(cfg.n_compartments)
         r = world.batch_rng.random()
+        tr_hints: list[tuple[int, int]] = []
 
         if r < bio_threshold:
             entity_id = world.batch_rng.randrange(cfg.n_entities)
@@ -372,7 +494,7 @@ def generate_training_batch(
                 comp_b = (comp + offset) % cfg.n_compartments
             else:
                 comp_b = comp
-            seq = _generate_translation(
+            seq, tr_hints = _generate_translation(
                 world, entity_id, attr_id, comp, comp_b, translation_mode
             )
             tgt = [-1] * len(seq)
@@ -383,20 +505,23 @@ def generate_training_batch(
         tokens[b, :n] = torch.tensor(seq[:n], dtype=torch.long)
         m = min(len(tgt), seq_len)
         targets[b, :m] = torch.tensor(tgt[:m], dtype=torch.long)
+        for pos, c in tr_hints:
+            if pos < seq_len:
+                comp_hint[b, pos] = c
 
-    return tokens, targets
+    return tokens, targets, comp_hint
 
 
 def generate_eval_qa(
     world: BioWorld, entity_ids: list[int], attr_id: int, seq_len: int
-) -> tuple[list[torch.Tensor], list[torch.Tensor], int, int, int]:
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], int, int, int]:
     """Build per-compartment QA eval batches.
 
-    Returns (tokens[c] [n, seq_len], targets[c] [n, target_len], eval_seq_len,
-    prompt_len, target_len). eval_seq_len is the length of the QA example
-    BEFORE padding to seq_len; prompt_len and target_len are the
-    compartment-agnostic shape (they're identical for all comps because
-    the token banks have the same size per comp).
+    Returns (tokens[c], targets[c], comp_hint[c], eval_seq_len,
+    prompt_len, target_len). QA sequences don't contain TR tokens, so
+    every comp_hint[c] is all -1 — included in the return tuple for
+    uniformity with generate_eval_translation so BioTransformer's
+    forward can be called with a comp_hint argument in either case.
     """
     cfg = world.config
     probe_prompt, probe_target = _generate_qa(world, entity_ids[0], attr_id, 0)
@@ -406,9 +531,11 @@ def generate_eval_qa(
 
     tokens_per_comp: list[torch.Tensor] = []
     targets_per_comp: list[torch.Tensor] = []
+    comp_hint_per_comp: list[torch.Tensor] = []
     for c in range(cfg.n_compartments):
         tok = torch.zeros((len(entity_ids), seq_len), dtype=torch.long)
         tgt = torch.zeros((len(entity_ids), target_len), dtype=torch.long)
+        hint = torch.full((len(entity_ids), seq_len), -1, dtype=torch.long)
         for i, eid in enumerate(entity_ids):
             prompt, target = _generate_qa(world, eid, attr_id, c)
             for t, v in enumerate(prompt):
@@ -418,33 +545,53 @@ def generate_eval_qa(
                 tgt[i, t] = v
         tokens_per_comp.append(tok)
         targets_per_comp.append(tgt)
+        comp_hint_per_comp.append(hint)
 
-    return tokens_per_comp, targets_per_comp, eval_seq_len, prompt_len, target_len
+    return (
+        tokens_per_comp,
+        targets_per_comp,
+        comp_hint_per_comp,
+        eval_seq_len,
+        prompt_len,
+        target_len,
+    )
 
 
 def generate_eval_translation(
     world: BioWorld, entity_ids: list[int], attr_id: int, seq_len: int
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[tuple[int, int]], int, int, int]:
+) -> tuple[
+    list[torch.Tensor],
+    list[torch.Tensor],
+    list[torch.Tensor],
+    list[tuple[int, int]],
+    int,
+    int,
+    int,
+]:
     """Mirror-mode translation eval batch for every directed comp pair.
 
     For each (a, b) with a != b, builds one example per entity:
       [TR, partA, TR, partB]
-    Returns (tokens_per_pair, targets_per_pair, pairs, translation_seq_len,
-    prompt_len, target_len). The "targets" are the partB tokens aligned so
-    the caller can compute CE over the target positions only.
+    Returns (tokens_per_pair, targets_per_pair, comp_hint_per_pair,
+    pairs, translation_seq_len, prompt_len, target_len). Targets
+    contain only the partB tokens aligned so the caller can compute
+    CE over the target positions only. comp_hint has the two TR
+    positions tagged (first = comp a, second = comp b) and -1
+    everywhere else.
     """
     cfg = world.config
     if cfg.n_compartments < 2:
-        return [], [], [], 0, 0, 0
+        return [], [], [], [], 0, 0, 0
 
-    probe = _generate_translation(world, entity_ids[0], attr_id, 0, 1, "mirror")
-    trans_seq_len = len(probe)
+    probe_seq, _ = _generate_translation(world, entity_ids[0], attr_id, 0, 1, "mirror")
+    trans_seq_len = len(probe_seq)
     part_a_len = cfg.tokens_per_entity + 1 + cfg.tokens_per_value
     prompt_len = 1 + part_a_len + 1  # TR + partA + TR
     target_len = trans_seq_len - prompt_len
 
     tokens_per_pair: list[torch.Tensor] = []
     targets_per_pair: list[torch.Tensor] = []
+    comp_hint_per_pair: list[torch.Tensor] = []
     pairs: list[tuple[int, int]] = []
     for a in range(cfg.n_compartments):
         for b in range(cfg.n_compartments):
@@ -452,16 +599,31 @@ def generate_eval_translation(
                 continue
             tok = torch.zeros((len(entity_ids), seq_len), dtype=torch.long)
             tgt = torch.zeros((len(entity_ids), target_len), dtype=torch.long)
+            hint = torch.full((len(entity_ids), seq_len), -1, dtype=torch.long)
             for i, eid in enumerate(entity_ids):
-                seq = _generate_translation(world, eid, attr_id, a, b, "mirror")
+                seq, tr_hints = _generate_translation(
+                    world, eid, attr_id, a, b, "mirror"
+                )
                 for t in range(trans_seq_len):
                     tok[i, t] = seq[t]
                 for t in range(target_len):
                     tgt[i, t] = seq[prompt_len + t]
+                for pos, c in tr_hints:
+                    if pos < seq_len:
+                        hint[i, pos] = c
             tokens_per_pair.append(tok)
             targets_per_pair.append(tgt)
+            comp_hint_per_pair.append(hint)
             pairs.append((a, b))
-    return tokens_per_pair, targets_per_pair, pairs, trans_seq_len, prompt_len, target_len
+    return (
+        tokens_per_pair,
+        targets_per_pair,
+        comp_hint_per_pair,
+        pairs,
+        trans_seq_len,
+        prompt_len,
+        target_len,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -559,6 +721,15 @@ def generate_eval_translation(
             "type": "select", "choices": ["learned", "rope"], "default": "learned",
             "live": False, "description": "Positional encoding",
         },
+        "use_compartment_tr_embed": {
+            "type": "boolean", "default": True, "live": False,
+            "description": (
+                "Add a learned compartment embedding at each TR token. "
+                "Turns on the explicit cross-compartment signal that "
+                "lets the model learn translation; without it, translation_loss "
+                "plateaus at ln(n_compartments)."
+            ),
+        },
         # ── optim ──
         "lr": {
             "type": "number", "default": 1e-4, "min": 1e-5, "max": 1e-1, "scale": "log",
@@ -605,7 +776,17 @@ class Bio3(Experiment):
             mlp_dim=int(self.params["embed_dim"]) * 4,
             pos_encoding=str(self.params["pos_encoding"]),
         )
-        self.model = Transformer(tf_cfg).to(self.device)
+        # BioTransformer with n_compartments=bio_cfg.n_compartments adds
+        # a per-compartment embedding at each TR token, giving the model
+        # an explicit signal for the target compartment. When the param
+        # is off, we pass n_compartments=None which makes BioTransformer
+        # behave exactly like the plain Transformer (no compartment
+        # embed allocated, comp_hint ignored).
+        self.use_comp_tr_embed = bool(self.params.get("use_compartment_tr_embed", True))
+        self.model = BioTransformer(
+            tf_cfg,
+            n_compartments=bio_cfg.n_compartments if self.use_comp_tr_embed else None,
+        ).to(self.device)
         self._apply_init_scaling()
 
         weight_decay = float(self.params["weight_decay"])
@@ -687,7 +868,7 @@ class Bio3(Experiment):
             g["lr"] = lr
             g["weight_decay"] = wd
 
-        tokens, targets = generate_training_batch(
+        tokens, targets, comp_hint = generate_training_batch(
             self.world,
             batch_size=batch_size,
             seq_len=self.seq_len,
@@ -696,12 +877,14 @@ class Bio3(Experiment):
         )
         tokens = tokens.to(self.device, non_blocking=True)
         targets = targets.to(self.device, non_blocking=True)
+        comp_hint = comp_hint.to(self.device, non_blocking=True)
 
         # Next-token CE: predict tokens[:, 1:] from positions [:, :-1],
         # ignoring positions where the batch generator set target=-1.
         inputs = tokens[:, :-1]
         shifted_targets = targets[:, :-1]  # targets already holds shifted values
-        logits = self.model(inputs)  # [B, T-1, V]
+        input_hint = comp_hint[:, :-1]
+        logits = self.model(inputs, comp_hint=input_hint)  # [B, T-1, V]
         loss = F.cross_entropy(
             logits.reshape(-1, self.world.vocab_size),
             shifted_targets.reshape(-1),
@@ -751,7 +934,14 @@ class Bio3(Experiment):
         attr_id = 0
 
         # ── QA accuracy + cross-compartment cosine similarity ──
-        tokens_per_comp, targets_per_comp, eval_sl, prompt_len, target_len = generate_eval_qa(
+        (
+            tokens_per_comp,
+            targets_per_comp,
+            comp_hint_per_comp,
+            eval_sl,
+            prompt_len,
+            target_len,
+        ) = generate_eval_qa(
             self.world, self.eval_entity_ids, attr_id, self.seq_len
         )
 
@@ -759,7 +949,12 @@ class Bio3(Experiment):
         for c in range(cfg.n_compartments):
             tok = tokens_per_comp[c].to(self.device, non_blocking=True)
             tgt = targets_per_comp[c].to(self.device, non_blocking=True)  # [N, target_len]
-            logits, residuals = self.model(tok, return_residuals=True)  # [N, SL, V]
+            hint = comp_hint_per_comp[c].to(self.device, non_blocking=True)
+            # QA sequences have no TR tokens so hint is all -1 here;
+            # passing it anyway keeps the forward call signature uniform.
+            logits, residuals = self.model(
+                tok, comp_hint=hint, return_residuals=True
+            )  # [N, SL, V]
             mid_residuals.append(residuals[len(residuals) // 2])
 
             # Accuracy: argmax at positions [prompt_len-1 .. prompt_len-1+target_len-1]
@@ -784,17 +979,24 @@ class Bio3(Experiment):
 
         # ── Translation loss (mirror mode, averaged over directed pairs) ──
         if cfg.n_compartments >= 2:
-            trans_tokens, trans_targets, pairs, _, trans_prompt_len, trans_target_len = (
-                generate_eval_translation(
-                    self.world, self.eval_entity_ids, attr_id, self.seq_len
-                )
+            (
+                trans_tokens,
+                trans_targets,
+                trans_hints,
+                pairs,
+                _,
+                trans_prompt_len,
+                trans_target_len,
+            ) = generate_eval_translation(
+                self.world, self.eval_entity_ids, attr_id, self.seq_len
             )
             total_nll = 0.0
             total_positions = 0
             for p_idx in range(len(pairs)):
                 tok = trans_tokens[p_idx].to(self.device, non_blocking=True)
                 tgt = trans_targets[p_idx].to(self.device, non_blocking=True)
-                logits = self.model(tok)  # [N, SL, V]
+                hint = trans_hints[p_idx].to(self.device, non_blocking=True)
+                logits = self.model(tok, comp_hint=hint)  # [N, SL, V]
                 for t in range(trans_target_len):
                     pos = trans_prompt_len - 1 + t
                     step_logits = logits[:, pos, :]  # [N, V]
@@ -818,7 +1020,7 @@ class Bio3(Experiment):
         sharpness_bs = 32
 
         def _sharpness_loss() -> torch.Tensor:
-            tokens, targets = generate_training_batch(
+            tokens, targets, comp_hint = generate_training_batch(
                 self.world,
                 batch_size=sharpness_bs,
                 seq_len=self.seq_len,
@@ -827,9 +1029,11 @@ class Bio3(Experiment):
             )
             tokens = tokens.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
+            comp_hint = comp_hint.to(self.device, non_blocking=True)
             inputs = tokens[:, :-1]
             shifted_targets = targets[:, :-1]
-            logits = self.model(inputs)
+            input_hint = comp_hint[:, :-1]
+            logits = self.model(inputs, comp_hint=input_hint)
             return F.cross_entropy(
                 logits.reshape(-1, self.world.vocab_size),
                 shifted_targets.reshape(-1),
@@ -854,7 +1058,21 @@ class Bio3(Experiment):
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        self.model.load_state_dict(state["model"])
+        # strict=False so checkpoints written before the BioTransformer
+        # compartment_embed was added can still be resumed. Missing
+        # compartment_embed.weight gets the fresh random init assigned
+        # in the constructor and the model learns that embedding from
+        # scratch as training continues.
+        missing, unexpected = self.model.load_state_dict(
+            state["model"], strict=False
+        )
+        if unexpected:
+            # Unexpected keys usually mean a newer checkpoint loaded
+            # into an older architecture — fail loudly because that's
+            # an actual incompatibility, not a forward migration.
+            raise RuntimeError(
+                f"checkpoint has unexpected keys: {list(unexpected)}"
+            )
         self.optimizer.load_state_dict(state["optimizer"])
         if "batch_rng_state" in state:
             self.world.batch_rng.setstate(state["batch_rng_state"])
