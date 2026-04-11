@@ -348,11 +348,21 @@
     const min = typeof spec.min === "number" ? spec.min : 0;
     const max = typeof spec.max === "number" ? spec.max : 1;
     const useLog = spec.scale === "log";
+    // Integer-valued params always get step 1 — can't have 2.5
+    // transformer blocks. This check comes BEFORE any span-based
+    // heuristic so tight integer ranges like num_heads (1..16),
+    // num_layers (1..12), n_compartments (1..8), tokens_per_entity
+    // (1..3) all render with whole-number steps.
+    if (
+      Number.isInteger(spec.default) &&
+      Number.isInteger(min) &&
+      Number.isInteger(max)
+    ) {
+      return { min, max, step: 1, useLog };
+    }
     const span = max - min;
     let step = span / 100;
-    if (Number.isInteger(spec.default) && Number.isInteger(min) && Number.isInteger(max) && span >= 16) {
-      step = 1;
-    } else if (useLog) {
+    if (useLog) {
       step = (max - min) / 1000;
     } else if (span <= 1) {
       step = 0.01;
