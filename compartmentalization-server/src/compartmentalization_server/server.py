@@ -271,7 +271,18 @@ async def _handle_ws_message(
             return
 
         # Send the metric history first so the client can backfill its chart.
-        history = mgr.get_metrics_history(exp_id)
+        # Downsample to at most `max_entries` entries on the server — stops
+        # long experiments from shipping multi-MB JSON payloads that freeze
+        # the browser on the reactive cascade. Default 2000; client can
+        # request more (or all, via null) with a `max_history` field.
+        raw_max = msg.get("max_history")
+        if raw_max is None:
+            max_entries: int | None = 2000
+        elif raw_max == 0 or raw_max == "all":
+            max_entries = None
+        else:
+            max_entries = int(raw_max)
+        history = mgr.get_metrics_history(exp_id, max_entries=max_entries)
         rec = mgr.records[exp_id]
         await ws.send_json(
             reply(

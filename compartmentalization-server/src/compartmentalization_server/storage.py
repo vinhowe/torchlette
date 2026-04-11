@@ -200,11 +200,11 @@ def append_metric(
 
 
 def read_metrics(paths: StoragePaths) -> list[dict[str, Any]]:
-    """Load the entire metrics history. Used to seed late subscribers.
+    """Load the entire metrics history (no downsampling).
 
-    For long-running experiments this can grow large (10k steps × 1
-    metric ≈ 80 KB; 100k steps ≈ 800 KB). v0.1 just reads it all; if it
-    becomes painful we can add a `since: step` filter to subscribe.
+    For long experiments this can be large (50k+ entries, several MB).
+    Prefer `read_metrics_downsampled` for subscribe backfills unless
+    the caller specifically needs every point.
     """
     if not paths.metrics.exists():
         return []
@@ -221,6 +221,83 @@ def read_metrics(paths: StoragePaths) -> list[dict[str, Any]]:
                 # writer was killed mid-write before flush.
                 logger.warning("skipping malformed metrics line in %s", paths.metrics)
     return out
+
+
+# The "minimal" metric key set: if an entry's `metrics` dict contains
+# only these keys, it's a pure per-step event and can be safely strided
+# away during downsampling. Any entry carrying a key outside this set
+# (probe_r2, cos_sim, acc_cN, translation_loss, sharpness, ...) is an
+# eval-gated metric that happens rarely and MUST be preserved — those
+# are what disappear when you uniform-stride the whole history.
+_MINIMAL_METRIC_KEYS: frozenset[str] = frozenset({"loss", "grad_norm"})
+
+
+def read_metrics_downsampled(
+    paths: StoragePaths, max_entries: int
+) -> list[dict[str, Any]]:
+    """Read metrics history and downsample to at most `max_entries`.
+
+    Strategy: every entry whose metrics dict contains ONLY keys in
+    `_MINIMAL_METRIC_KEYS` is "dense" (loss + grad_norm per step);
+    everything else is "sparse" (eval output — probe_r2, cos_sim,
+    accuracy, translation_loss, sharpness). Sparse entries are
+    ALWAYS kept; dense entries are strided to fit whatever budget
+    remains. This matches the client's per-family chart downsampling:
+    rare metrics stay visible, common metrics lose resolution where
+    it doesn't matter.
+
+    Returned order is chronological (sorted by step). If the raw
+    history is under the budget we return it unchanged in one pass.
+    """
+    if not paths.metrics.exists():
+        return []
+
+    # Single pass: read everything into memory, classify each entry
+    # as minimal (dense, strideable) or extended (sparse, preserved).
+    minimal: list[dict[str, Any]] = []
+    extended: list[dict[str, Any]] = []
+    with open(paths.metrics) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning("skipping malformed metrics line in %s", paths.metrics)
+                continue
+            metrics = entry.get("metrics") or {}
+            # Entries with only loss+grad_norm (or a subset) are minimal.
+            # Entries with ANY other key are extended.
+            if metrics and set(metrics.keys()) <= _MINIMAL_METRIC_KEYS:
+                minimal.append(entry)
+            else:
+                extended.append(entry)
+
+    total = len(minimal) + len(extended)
+    if total <= max_entries:
+        # Under budget — return everything in step order.
+        merged = minimal + extended
+        merged.sort(key=lambda e: e.get("step", 0))
+        return merged
+
+    # Reserve the budget for extended entries first (they're never
+    # dropped), then stride the minimal ones into whatever's left.
+    budget_for_minimal = max(0, max_entries - len(extended))
+    if budget_for_minimal == 0 or not minimal:
+        kept_minimal: list[dict[str, Any]] = []
+    else:
+        stride = max(1, (len(minimal) + budget_for_minimal - 1) // budget_for_minimal)
+        kept_minimal = minimal[::stride]
+        # Always include the last minimal entry so the tail of the
+        # chart isn't missing; without this the stride can cut off
+        # the most-recent points.
+        if kept_minimal and kept_minimal[-1] is not minimal[-1]:
+            kept_minimal.append(minimal[-1])
+
+    merged = kept_minimal + extended
+    merged.sort(key=lambda e: e.get("step", 0))
+    return merged
 
 
 # ──────────────────────────────────────────────────────────────────────────
