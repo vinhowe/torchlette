@@ -14,7 +14,14 @@
    */
   import "../../app.css";
   import { onMount, onDestroy } from "svelte";
-  import { BorderedGroup, Slider, NumberInput, TextInput } from "piston-controls";
+  import {
+    BorderedGroup,
+    Slider,
+    NumberInput,
+    TextInput,
+    CheckboxInput,
+    SelectInput,
+  } from "piston-controls";
   import { getExperimentClient, type ExperimentClient } from "$lib/experiment-client-singleton.svelte";
   import type { ExperimentRecord, ScriptInfo, ParamSpec } from "$lib/experiment-client.svelte";
 
@@ -33,10 +40,12 @@
   let totalSteps = $state(5000);
   let description = $state("");
   // Per-script param values: keyed by script name so switching scripts
-  // and back preserves what you typed. Typed as numbers-only because
-  // every Slider binding takes a number; non-numeric params would need
-  // a different control (checkbox, select) that v0.1 doesn't support.
-  let formParams = $state<Record<string, Record<string, number>>>({});
+  // and back preserves what you typed. Values can be numbers (Slider),
+  // booleans (CheckboxInput), or strings (SelectInput) depending on the
+  // script's ParamSpec.type. ensureFormParams populates defaults for
+  // every known type.
+  type FormValue = number | boolean | string;
+  let formParams = $state<Record<string, Record<string, FormValue>>>({});
   let creatingError = $state<string | null>(null);
   let creating = $state(false);
 
@@ -44,19 +53,22 @@
     scripts.find((s) => s.name === selectedScript),
   );
 
-  /** Populate formParams[name] with the script's numeric defaults if not
-   *  already set. Non-numeric params are silently skipped — v0.1 assumes
-   *  every param the form renders is a number (Slider). Called
-   *  synchronously from the pre-render effect so the template never sees
-   *  `formParams[selectedScript]` as undefined while trying to bind
-   *  sliders to `formParams[selectedScript][key]`. */
+  /** Populate formParams[name] with every param's default. Handles all
+   *  three types (number / boolean / select) so the template can bind
+   *  Slider / CheckboxInput / SelectInput to the same record slot
+   *  without worrying about undefined intermediaries. Called synchronously
+   *  from the pre-render effect below — a post-render $effect would
+   *  race against the first template pass on script change. */
   function ensureFormParams(name: string) {
     if (!name || formParams[name]) return;
     const info = scripts.find((s) => s.name === name);
     if (!info) return;
-    const init: Record<string, number> = {};
+    const init: Record<string, FormValue> = {};
     for (const [key, spec] of Object.entries(info.params)) {
-      if (typeof spec.default === "number") init[key] = spec.default;
+      const d = spec.default;
+      if (typeof d === "number" || typeof d === "boolean" || typeof d === "string") {
+        init[key] = d;
+      }
     }
     formParams = { ...formParams, [name]: init };
   }
@@ -164,7 +176,6 @@
     const min = typeof spec.min === "number" ? spec.min : 0;
     const max = typeof spec.max === "number" ? spec.max : 1;
     const useLog = spec.scale === "log";
-    // Pick a reasonable step: 1 for integers (range >= 16), small for tight ranges.
     const span = max - min;
     let step = span / 100;
     if (Number.isInteger(spec.default) && Number.isInteger(min) && Number.isInteger(max) && span >= 16) {
@@ -175,6 +186,17 @@
       step = 0.01;
     }
     return { min, max, step, useLog };
+  }
+
+  /** Classify a param spec by control type. Dispatches Slider/Checkbox/Select.
+   *  A spec that declares `type: "select"` is treated as a select regardless
+   *  of the default's JS type (the default is typically one of the choices).
+   */
+  function controlKind(spec: ParamSpec): "number" | "boolean" | "select" | "unknown" {
+    if (spec.type === "select" || Array.isArray(spec.choices)) return "select";
+    if (spec.type === "boolean" || typeof spec.default === "boolean") return "boolean";
+    if (spec.type === "number" || typeof spec.default === "number") return "number";
+    return "unknown";
   }
 </script>
 
@@ -237,32 +259,64 @@
           {#if liveParams.length > 0}
             <BorderedGroup title="Live params (editable mid-run)" id="grp-live" contentClass="p-2 space-y-2">
               {#each liveParams as [key, spec]}
-                {@const range = paramSpecRange(spec)}
-                <Slider
-                  id={`live-${key}`}
-                  label={spec.description || key}
-                  min={range.min}
-                  max={range.max}
-                  step={range.step}
-                  useLog={range.useLog}
-                  bind:value={formParams[selectedScript][key]}
-                />
+                {@const kind = controlKind(spec)}
+                {#if kind === "number"}
+                  {@const range = paramSpecRange(spec)}
+                  <Slider
+                    id={`live-${key}`}
+                    label={spec.description || key}
+                    min={range.min}
+                    max={range.max}
+                    step={range.step}
+                    useLog={range.useLog}
+                    bind:value={formParams[selectedScript][key] as number}
+                  />
+                {:else if kind === "boolean"}
+                  <CheckboxInput
+                    id={`live-${key}`}
+                    label={spec.description || key}
+                    bind:checked={formParams[selectedScript][key] as boolean}
+                  />
+                {:else if kind === "select"}
+                  <SelectInput
+                    id={`live-${key}`}
+                    label={spec.description || key}
+                    options={(spec.choices ?? []).map((c) => ({ value: c }))}
+                    bind:value={formParams[selectedScript][key] as string}
+                  />
+                {/if}
               {/each}
             </BorderedGroup>
           {/if}
           {#if structParams.length > 0}
             <BorderedGroup title="Structural (fixed at creation)" id="grp-struct" contentClass="p-2 space-y-2">
               {#each structParams as [key, spec]}
-                {@const range = paramSpecRange(spec)}
-                <Slider
-                  id={`struct-${key}`}
-                  label={spec.description || key}
-                  min={range.min}
-                  max={range.max}
-                  step={range.step}
-                  useLog={range.useLog}
-                  bind:value={formParams[selectedScript][key]}
-                />
+                {@const kind = controlKind(spec)}
+                {#if kind === "number"}
+                  {@const range = paramSpecRange(spec)}
+                  <Slider
+                    id={`struct-${key}`}
+                    label={spec.description || key}
+                    min={range.min}
+                    max={range.max}
+                    step={range.step}
+                    useLog={range.useLog}
+                    bind:value={formParams[selectedScript][key] as number}
+                  />
+                {:else if kind === "boolean"}
+                  <CheckboxInput
+                    id={`struct-${key}`}
+                    label={spec.description || key}
+                    bind:checked={formParams[selectedScript][key] as boolean}
+                  />
+                {:else if kind === "select"}
+                  <SelectInput
+                    id={`struct-${key}`}
+                    label={spec.description || key}
+                    options={(spec.choices ?? []).map((c) => ({ value: c }))}
+                    bind:value={formParams[selectedScript][key] as string}
+                  />
+                {/if}
               {/each}
             </BorderedGroup>
           {/if}
