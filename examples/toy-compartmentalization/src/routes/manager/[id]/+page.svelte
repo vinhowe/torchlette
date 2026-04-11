@@ -110,6 +110,9 @@
   // bounded [-1, 1], acc is bounded [0, 1]. Anything else gets auto.
   function axisHint(family: string): { yType: "value" | "log"; yMin?: number; yMax?: number } {
     if (family === "loss" || family === "translation_loss") return { yType: "log" };
+    // grad_norm spans orders of magnitude across training; log is the
+    // only axis that's readable end-to-end.
+    if (family === "grad_norm") return { yType: "log" };
     if (family === "probe_r2") return { yType: "value", yMin: -0.2, yMax: 1 };
     if (family === "cos_sim") return { yType: "value", yMin: -1, yMax: 1 };
     if (family === "acc") return { yType: "value", yMin: 0, yMax: 1 };
@@ -118,15 +121,17 @@
 
   let chartFamilies = $derived.by((): ChartFamily[] => {
     if (!rec || rec.history.length === 0) return [];
-    // family → compIdx|null → series data
-    // compIdx=null collapses to a single unnamed series in the family
+
+    // Phase 1: walk the FULL history (no stride) and collect every
+    // (step, value) pair per (family, compartment) bucket. We have to
+    // do this ungated because different metrics land on different
+    // cadences: loss/grad_norm every step, probe_r2/cos_sim/acc_cN
+    // /translation_loss every EVAL_INTERVAL steps. A uniform stride on
+    // `rec.history` would snap to the loss cadence and silently drop
+    // every sparse metric whose index happens to be odd — which was
+    // the bug that made cos_sim disappear past step ~4000.
     const grouped = new Map<string, Map<number | null, [number, number][]>>();
-    // Downsample: cap each series at ~4000 points. Echarts handles more
-    // but interaction gets laggy.
-    const maxPoints = 4000;
-    const stride = Math.max(1, Math.ceil(rec.history.length / maxPoints));
-    for (let i = 0; i < rec.history.length; i += stride) {
-      const entry = rec.history[i] as MetricEntry;
+    for (const entry of rec.history as MetricEntry[]) {
       if (!entry.metrics) continue;
       for (const [k, v] of Object.entries(entry.metrics)) {
         if (typeof v !== "number" || !Number.isFinite(v)) continue;
@@ -137,22 +142,39 @@
         byComp.get(compIdx)!.push([entry.step, v]);
       }
     }
-    // Sort families in a stable order: loss first, then alphabetical.
-    const families: ChartFamily[] = [];
+
+    // Phase 2: downsample each series independently. Sparse metrics
+    // with few points pass through untouched; dense metrics (loss,
+    // grad_norm) get strided down to at most `maxPoints`.
+    const maxPoints = 2500;
+    const downsample = (points: [number, number][]): [number, number][] => {
+      if (points.length <= maxPoints) return points;
+      const stride = Math.ceil(points.length / maxPoints);
+      const out: [number, number][] = [];
+      for (let i = 0; i < points.length; i += stride) out.push(points[i]);
+      // Always include the very last point so the chart tail doesn't
+      // get lopped off just because stride didn't divide cleanly.
+      if (out.length > 0 && out[out.length - 1] !== points[points.length - 1]) {
+        out.push(points[points.length - 1]);
+      }
+      return out;
+    };
+
     const familyOrder = (name: string): number => {
       if (name === "loss") return 0;
-      if (name === "probe_r2") return 1;
-      if (name === "cos_sim") return 2;
-      if (name === "acc") return 3;
-      if (name === "translation_loss") return 4;
+      if (name === "grad_norm") return 1;
+      if (name === "probe_r2") return 2;
+      if (name === "cos_sim") return 3;
+      if (name === "acc") return 4;
+      if (name === "translation_loss") return 5;
       return 100;
     };
     const sortedFams = [...grouped.keys()].sort(
       (a, b) => familyOrder(a) - familyOrder(b) || a.localeCompare(b),
     );
+    const families: ChartFamily[] = [];
     for (const fam of sortedFams) {
       const byComp = grouped.get(fam)!;
-      // Sort compartments numerically; null (plain key) first.
       const compKeys = [...byComp.keys()].sort((a, b) => {
         if (a === null) return -1;
         if (b === null) return 1;
@@ -160,7 +182,7 @@
       });
       const series = compKeys.map((c) => ({
         name: c === null ? fam : `c${c}`,
-        data: byComp.get(c)!,
+        data: downsample(byComp.get(c)!),
       }));
       families.push({ key: fam, series, ...axisHint(fam) });
     }
@@ -188,6 +210,7 @@
   function titleFor(family: string): string {
     switch (family) {
       case "loss": return "Training loss";
+      case "grad_norm": return "Gradient L2 norm";
       case "probe_r2": return "Belief probe R²";
       case "cos_sim": return "Cross-compartment cosine similarity";
       case "acc": return "QA accuracy per compartment";
@@ -341,6 +364,47 @@
     const loss = rec?.latest_metrics?.loss;
     return typeof loss === "number" ? loss.toFixed(4) : "—";
   }
+
+  // ── description editing ──
+  //
+  // The header shows the description as a textbox. While the user is
+  // editing (focused), we don't sync server → local so their typing
+  // doesn't get overwritten. On blur we push to the server. Escape
+  // reverts to the server value.
+  let descDraft = $state("");
+  let descEditing = $state(false);
+
+  $effect(() => {
+    if (!rec) return;
+    if (descEditing) return;
+    const server = rec.description ?? "";
+    if (descDraft !== server) descDraft = server;
+  });
+
+  async function saveDescription() {
+    descEditing = false;
+    if (!rec) return;
+    if (descDraft === (rec.description ?? "")) return;
+    try {
+      await client.setDescription(rec.id, descDraft);
+    } catch (e) {
+      console.error("set_description failed", e);
+    }
+  }
+
+  function cancelDescriptionEdit() {
+    descEditing = false;
+    descDraft = rec?.description ?? "";
+  }
+
+  function onDescriptionKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      (e.currentTarget as HTMLInputElement).blur();
+    } else if (e.key === "Escape") {
+      cancelDescriptionEdit();
+      (e.currentTarget as HTMLInputElement).blur();
+    }
+  }
 </script>
 
 <svelte:head>
@@ -359,12 +423,21 @@
       {#if !connected}Connecting…{:else}Loading experiment {id}…{/if}
     </div>
   {:else}
-    <header class="mb-6 flex items-baseline justify-between">
-      <div>
+    <header class="mb-6 flex items-baseline justify-between gap-6">
+      <div class="min-w-0 flex-1">
         <h1 class="mb-1 text-[24px] font-bold tracking-[-0.02em]">{rec.script}</h1>
-        <div class="font-mono text-[11px] text-[rgba(0,0,0,0.54)]">{rec.id}</div>
+        <div class="mb-2 font-mono text-[11px] text-[rgba(0,0,0,0.54)]">{rec.id}</div>
+        <input
+          type="text"
+          placeholder="description"
+          class="w-full border-b border-transparent bg-transparent py-[2px] text-[13px] text-[rgba(0,0,0,0.84)] placeholder:text-[rgba(0,0,0,0.34)] focus:border-b-[rgba(0,0,0,0.4)] focus:outline-none"
+          bind:value={descDraft}
+          onfocus={() => (descEditing = true)}
+          onblur={saveDescription}
+          onkeydown={onDescriptionKeydown}
+        />
       </div>
-      <div class="flex items-center gap-3">
+      <div class="flex shrink-0 items-center gap-3">
         <span class={statusBadgeClasses(rec.status)}>{rec.status}</span>
         {#if rec.status === "running" || rec.status === "stopping"}
           <ActionButton color="red" onclick={handleStop}>stop</ActionButton>

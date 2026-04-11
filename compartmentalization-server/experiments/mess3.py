@@ -386,9 +386,23 @@ class Mess3(Experiment):
 
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        # Compute the total L2 norm of all parameter gradients. Cheapest
+        # sharpness proxy: spikes mean the loss landscape just handed us
+        # a cliff, steady decrease means training is well-behaved. We use
+        # clip_grad_norm_ with max_norm=inf so it returns the norm without
+        # actually clipping — faster than walking params manually because
+        # it stays on-GPU until the final .item() sync.
+        grad_norm = float(
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm=float("inf")
+            ).item()
+        )
         self.optimizer.step()
 
-        metrics: dict[str, float] = {"loss": float(loss.detach().item())}
+        metrics: dict[str, float] = {
+            "loss": float(loss.detach().item()),
+            "grad_norm": grad_norm,
+        }
 
         # Evaluation: probe R² + cosine similarity. Only runs every
         # EVAL_INTERVAL steps because it's O(~10ms) and would drown the

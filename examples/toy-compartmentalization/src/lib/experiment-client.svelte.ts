@@ -389,6 +389,17 @@ export class ExperimentClient {
     }
   }
 
+  async setDescription(id: string, description: string): Promise<void> {
+    await this.send('set_description', { id, description });
+    // Optimistic: reflect immediately. The server broadcasts an `updated`
+    // global event right after, which confirms and overrides.
+    const rec = this.experiments[id];
+    if (rec) {
+      rec.description = description;
+      this.experiments = { ...this.experiments };
+    }
+  }
+
   async stop(id: string): Promise<void> {
     await this.send('stop', { id });
   }

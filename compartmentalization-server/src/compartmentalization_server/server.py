@@ -324,6 +324,15 @@ async def _handle_ws_message(
             return
         await ws.send_json(reply({}))
 
+    elif msg_type == "set_description":
+        exp_id = msg["id"]
+        try:
+            mgr.set_description(exp_id, str(msg.get("description", "")))
+        except KeyError as e:
+            await ws.send_json(reply({"error": str(e)}))
+            return
+        await ws.send_json(reply({}))
+
     else:
         await ws.send_json({"type": "error", "message": f"unknown message type: {msg_type}"})
 

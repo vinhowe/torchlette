@@ -293,6 +293,18 @@ class ExperimentManager:
         del self.records[experiment_id]
         self._broadcast_global({"type": "deleted", "id": experiment_id})
 
+    def set_description(self, experiment_id: str, description: str) -> None:
+        """Update an experiment's description.
+
+        Description is metadata only — not part of the worker state — so
+        this never has to touch the running subprocess. We just rewrite
+        metadata.json and broadcast `updated` so every subscribed browser
+        sees the new value immediately. Works regardless of whether the
+        experiment is running, stopped, or still in "created" state.
+        """
+        rec = self._require(experiment_id)
+        self._update_meta(rec, description=description)
+
     def set_param(self, experiment_id: str, key: str, value: Any) -> None:
         """Forward a live param edit to the worker subprocess.
 

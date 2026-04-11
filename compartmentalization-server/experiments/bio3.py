@@ -703,10 +703,18 @@ class Bio3(Experiment):
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         # Matches the JS bio page's clipGradNorm_(model.parameters(), 1.0).
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        # The clip function returns the PRE-clip total L2 norm, which is
+        # the sharpness metric the user asked for: spikes = cliff in the
+        # loss landscape, steady decrease = well-behaved training.
+        grad_norm = float(
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0).item()
+        )
         self.optimizer.step()
 
-        metrics: dict[str, float] = {"loss": float(loss.detach().item())}
+        metrics: dict[str, float] = {
+            "loss": float(loss.detach().item()),
+            "grad_norm": grad_norm,
+        }
 
         if (self.step_count + 1) % EVAL_INTERVAL == 0:
             metrics.update(self._eval())
