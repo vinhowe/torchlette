@@ -18,9 +18,9 @@
   import { BorderedGroup, Slider } from "piston-controls";
   import { LineChart } from "$lib/components";
   import { baseChartOpt, chartAxes, lineSeries, legendBlock } from "$lib/chart-helpers";
-  import { THEME } from "$lib/theme";
+  import { THEME, SERIES_PALETTE } from "$lib/theme";
   import { getExperimentClient, type ExperimentClient } from "$lib/experiment-client-singleton.svelte";
-  import type { ExperimentRecord, ParamSpec, ScriptInfo } from "$lib/experiment-client.svelte";
+  import type { ExperimentRecord, MetricEntry, ParamSpec, ScriptInfo } from "$lib/experiment-client.svelte";
 
   let client: ExperimentClient = $state(getExperimentClient());
 
@@ -63,28 +63,130 @@
     }
   });
 
-  // ── derived chart option ──
-  // Down-sample the loss history if it gets long. Echarts handles 10k
-  // points fine but 100k starts to lag — we just stride for v0.1.
-  let lossSeries = $derived.by((): [number, number][] => {
+  // ── derived chart options ──
+  //
+  // The history is a flat list of {step, metrics} events. Different keys
+  // appear at different cadences: `loss` lands on every step while
+  // `probe_r2` / `cos_sim` / `acc_cN` / `translation_loss` only land on
+  // eval steps (every N steps). We render ONE chart per metric "family"
+  // (top-level key, ignoring any `_cN` compartment suffix), each family
+  // holding one series per compartment it has data for.
+  //
+  // This means: the three mess3 keys `probe_r2`, `probe_r2_c1`,
+  // `probe_r2_c2` collapse into a single "probe_r2" chart with 3 series.
+  // The four bio keys `acc_c0`, `acc_c1`, `acc_c2`, `acc_c3` collapse
+  // into one "acc" chart with 4 series. `loss` / `cos_sim` /
+  // `translation_loss` are each their own chart with one series.
+  //
+  // Family extraction strips a trailing `_c<digits>` from the key if
+  // present. Keys without that suffix pass through unchanged.
+
+  type ChartFamily = {
+    key: string; // family name: "loss", "probe_r2", "acc", ...
+    series: { name: string; data: [number, number][] }[];
+    yType: "value" | "log";
+    yMin?: number;
+    yMax?: number;
+  };
+
+  function familyOf(metricKey: string): { family: string; compIdx: number | null } {
+    const m = metricKey.match(/^(.*)_c(\d+)$/);
+    if (m) {
+      return { family: m[1], compIdx: Number(m[2]) };
+    }
+    return { family: metricKey, compIdx: null };
+  }
+
+  // Per-family axis hints: loss is log-scale, probe_r2 is bounded [-0.2, 1]
+  // (negative happens early when the probe is way off), cos_sim is
+  // bounded [-1, 1], acc is bounded [0, 1]. Anything else gets auto.
+  function axisHint(family: string): { yType: "value" | "log"; yMin?: number; yMax?: number } {
+    if (family === "loss" || family === "translation_loss") return { yType: "log" };
+    if (family === "probe_r2") return { yType: "value", yMin: -0.2, yMax: 1 };
+    if (family === "cos_sim") return { yType: "value", yMin: -1, yMax: 1 };
+    if (family === "acc") return { yType: "value", yMin: 0, yMax: 1 };
+    return { yType: "value" };
+  }
+
+  let chartFamilies = $derived.by((): ChartFamily[] => {
     if (!rec || rec.history.length === 0) return [];
+    // family → compIdx|null → series data
+    // compIdx=null collapses to a single unnamed series in the family
+    const grouped = new Map<string, Map<number | null, [number, number][]>>();
+    // Downsample: cap each series at ~4000 points. Echarts handles more
+    // but interaction gets laggy.
     const maxPoints = 4000;
     const stride = Math.max(1, Math.ceil(rec.history.length / maxPoints));
-    const out: [number, number][] = [];
     for (let i = 0; i < rec.history.length; i += stride) {
-      const e = rec.history[i];
-      const loss = e.metrics?.loss;
-      if (typeof loss === "number") out.push([e.step, loss]);
+      const entry = rec.history[i] as MetricEntry;
+      if (!entry.metrics) continue;
+      for (const [k, v] of Object.entries(entry.metrics)) {
+        if (typeof v !== "number" || !Number.isFinite(v)) continue;
+        const { family, compIdx } = familyOf(k);
+        if (!grouped.has(family)) grouped.set(family, new Map());
+        const byComp = grouped.get(family)!;
+        if (!byComp.has(compIdx)) byComp.set(compIdx, []);
+        byComp.get(compIdx)!.push([entry.step, v]);
+      }
     }
-    return out;
+    // Sort families in a stable order: loss first, then alphabetical.
+    const families: ChartFamily[] = [];
+    const familyOrder = (name: string): number => {
+      if (name === "loss") return 0;
+      if (name === "probe_r2") return 1;
+      if (name === "cos_sim") return 2;
+      if (name === "acc") return 3;
+      if (name === "translation_loss") return 4;
+      return 100;
+    };
+    const sortedFams = [...grouped.keys()].sort(
+      (a, b) => familyOrder(a) - familyOrder(b) || a.localeCompare(b),
+    );
+    for (const fam of sortedFams) {
+      const byComp = grouped.get(fam)!;
+      // Sort compartments numerically; null (plain key) first.
+      const compKeys = [...byComp.keys()].sort((a, b) => {
+        if (a === null) return -1;
+        if (b === null) return 1;
+        return (a as number) - (b as number);
+      });
+      const series = compKeys.map((c) => ({
+        name: c === null ? fam : `c${c}`,
+        data: byComp.get(c)!,
+      }));
+      families.push({ key: fam, series, ...axisHint(fam) });
+    }
+    return families;
   });
 
-  let chartOption = $derived({
-    ...baseChartOpt(),
-    ...chartAxes({ yType: "value" }),
-    legend: legendBlock(),
-    series: [lineSeries(lossSeries, { color: THEME.accent, name: "loss" })],
-  });
+  function chartOptionFor(fam: ChartFamily) {
+    const multi = fam.series.length > 1;
+    return {
+      ...baseChartOpt(),
+      grid: { top: multi ? 32 : 28, right: 12, bottom: 24, left: 44 },
+      ...(multi ? { legend: { ...legendBlock(), top: 4 } } : {}),
+      ...chartAxes({ yType: fam.yType, yMin: fam.yMin, yMax: fam.yMax }),
+      series: fam.series.map((s, i) => ({
+        type: "line" as const,
+        name: s.name,
+        data: s.data,
+        showSymbol: false,
+        lineStyle: { width: 1.5, color: SERIES_PALETTE[i % SERIES_PALETTE.length] },
+        itemStyle: { color: SERIES_PALETTE[i % SERIES_PALETTE.length] },
+      })),
+    };
+  }
+
+  function titleFor(family: string): string {
+    switch (family) {
+      case "loss": return "Training loss";
+      case "probe_r2": return "Belief probe R²";
+      case "cos_sim": return "Cross-compartment cosine similarity";
+      case "acc": return "QA accuracy per compartment";
+      case "translation_loss": return "Translation loss";
+      default: return family;
+    }
+  }
 
   // ── live param editing ──
   //
@@ -271,9 +373,18 @@
       <span>created <b class="font-medium text-[rgba(0,0,0,0.84)]">{rec.created_at}</b></span>
     </div>
 
-    <section class="mb-9">
-      <h2 class="mb-2 text-[15px] font-semibold tracking-[-0.01em]">Loss</h2>
-      <LineChart option={chartOption} height={320} />
+    <section class="mb-9 space-y-8">
+      {#each chartFamilies as fam (fam.key)}
+        <div>
+          <h2 class="mb-2 text-[15px] font-semibold tracking-[-0.01em]">
+            {titleFor(fam.key)}
+          </h2>
+          <LineChart option={chartOptionFor(fam)} height={260} />
+        </div>
+      {/each}
+      {#if chartFamilies.length === 0}
+        <div class="text-[13px] text-[rgba(0,0,0,0.54)]">No metrics yet.</div>
+      {/if}
     </section>
 
     {#if scriptInfo}
