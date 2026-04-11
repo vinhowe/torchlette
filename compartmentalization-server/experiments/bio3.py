@@ -48,7 +48,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from compartmentalization_server.api import Experiment, register
-from compartmentalization_server.models import Transformer, TransformerConfig
+from compartmentalization_server.models import (
+    Transformer,
+    TransformerConfig,
+    hessian_lambda_max,
+)
 
 EVAL_INTERVAL = 50
 
@@ -787,6 +791,42 @@ class Bio3(Experiment):
                     total_positions += step_tgt.shape[0]
             if total_positions > 0:
                 metrics["translation_loss"] = total_nll / total_positions
+
+        # ── Sharpness (λ_max of the Hessian) ──
+        # Power iteration with HVPs on a fresh training-distribution
+        # minibatch. The helper opens its own enable_grad scope, so it
+        # works fine from inside _eval's no_grad. Smaller batch than
+        # training (bio3 gradients can be heavy with a big world) to
+        # keep HVP cost bounded; 32 samples is enough for a stable
+        # estimate.
+        sharpness_bs = 32
+
+        def _sharpness_loss() -> torch.Tensor:
+            tokens, targets = generate_training_batch(
+                self.world,
+                batch_size=sharpness_bs,
+                seq_len=self.seq_len,
+                translation_frac=float(self.params["translation_pct"]) / 100.0,
+                translation_mode=str(self.params["translation_mode"]),
+            )
+            tokens = tokens.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
+            inputs = tokens[:, :-1]
+            shifted_targets = targets[:, :-1]
+            logits = self.model(inputs)
+            return F.cross_entropy(
+                logits.reshape(-1, self.world.vocab_size),
+                shifted_targets.reshape(-1),
+                ignore_index=-1,
+            )
+
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        try:
+            metrics["sharpness"] = hessian_lambda_max(
+                _sharpness_loss, params, num_iters=15
+            )
+        except Exception:
+            pass
 
         return metrics
 
