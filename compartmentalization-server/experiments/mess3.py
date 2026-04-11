@@ -228,6 +228,12 @@ def probe_r2(
 
 
 EVAL_INTERVAL = 50
+# Sharpness is more expensive than the other eval metrics: 15 power
+# iterations × 3 forward+backward passes ≈ 45 training-step-equivalents
+# per call. At EVAL_INTERVAL=50 that'd be ~1% overhead; at 500 it drops
+# to ~0.1% and the chart still has enough points to see trends across
+# a long run.
+SHARPNESS_INTERVAL = 500
 
 
 @register(
@@ -408,11 +414,19 @@ class Mess3(Experiment):
             "grad_norm": grad_norm,
         }
 
-        # Evaluation: probe R² + cosine similarity. Only runs every
-        # EVAL_INTERVAL steps because it's O(~10ms) and would drown the
-        # chart in duplicate points otherwise.
+        # Cheap eval: probe R² + cross-compartment cosine similarity.
+        # O(~10ms), every EVAL_INTERVAL steps.
         if (self.step_count + 1) % EVAL_INTERVAL == 0:
             metrics.update(self._eval())
+
+        # Expensive eval: sharpness (Hessian λ_max). Has its own
+        # much-longer interval since each call is ~45 training steps
+        # of compute.
+        if (self.step_count + 1) % SHARPNESS_INTERVAL == 0:
+            sharpness = self._compute_sharpness()
+            if sharpness is not None:
+                metrics["sharpness"] = sharpness
+
         return metrics
 
     @torch.no_grad()
@@ -476,12 +490,17 @@ class Mess3(Experiment):
                 F.cosine_similarity(a, c1, dim=-1).mean().item()
             )
 
-        # ── Sharpness (λ_max of the Hessian) ──
-        # Power iteration with HVPs on a fresh minibatch. The helper
-        # opens its own `torch.enable_grad` scope so we can call it
-        # from inside `_eval`'s `@torch.no_grad`. ~15 iterations × 3
-        # passes ≈ 45 training-step-equivalents, so at
-        # EVAL_INTERVAL=50 this is about 1% overhead overall.
+        return metrics
+
+    def _compute_sharpness(self) -> float | None:
+        """Hessian λ_max on a fresh minibatch via power iteration.
+
+        Called on its own cadence (SHARPNESS_INTERVAL steps) rather
+        than every eval because each call is ~45 training-step-
+        equivalents of compute. Returns None if the power iteration
+        fails for any reason (numerical degeneracy early in training,
+        model on wrong device, etc.) rather than crashing the step.
+        """
         sharpness_bs = min(64, self.eval_batch_size)
 
         def _sharpness_loss() -> torch.Tensor:
@@ -495,16 +514,9 @@ class Mess3(Experiment):
 
         params = [p for p in self.model.parameters() if p.requires_grad]
         try:
-            metrics["sharpness"] = hessian_lambda_max(
-                _sharpness_loss, params, num_iters=15
-            )
+            return hessian_lambda_max(_sharpness_loss, params, num_iters=15)
         except Exception:
-            # Numerical issues early in training (e.g. Hessian
-            # degeneracies when params are still close to init) — skip
-            # this step's reading rather than crashing the eval.
-            pass
-
-        return metrics
+            return None
 
     def state_dict(self) -> dict[str, Any]:
         return {

@@ -55,6 +55,10 @@ from compartmentalization_server.models import (
 )
 
 EVAL_INTERVAL = 50
+# Sharpness is ~45 training-step-equivalents per call (15 power
+# iterations × 3 passes each). Run it much less often than the cheap
+# metrics to keep total overhead at ~0.1%.
+SHARPNESS_INTERVAL = 500
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -720,8 +724,17 @@ class Bio3(Experiment):
             "grad_norm": grad_norm,
         }
 
+        # Cheap eval: QA accuracy + cos_sim + translation loss.
         if (self.step_count + 1) % EVAL_INTERVAL == 0:
             metrics.update(self._eval())
+
+        # Expensive eval: sharpness (Hessian λ_max). Own cadence to
+        # cap overhead.
+        if (self.step_count + 1) % SHARPNESS_INTERVAL == 0:
+            sharpness = self._compute_sharpness()
+            if sharpness is not None:
+                metrics["sharpness"] = sharpness
+
         return metrics
 
     @torch.no_grad()
