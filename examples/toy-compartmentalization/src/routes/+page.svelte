@@ -1,19 +1,39 @@
 <script lang="ts">
   import "../app.css";
-  import { onMount, tick } from "svelte";
+  import { onMount } from "svelte";
   import { createModel, MESS3_CONFIG, type MESS3Model } from "$lib/model";
   import {
     generateBatch, generateBatchWithCompartments, generateBatchForComp, generatePairedBatch,
-    theoreticalEntropy, beliefTrajectory, exploreBeliefSimplex,
+    theoreticalEntropy, exploreBeliefSimplex,
     setTransitionMatrices,
-    VOCAB_SIZE_DATA, NUM_STATES, STATIONARY_DIST,
-    type DataConfig,
+    VOCAB_SIZE_DATA, NUM_STATES,
   } from "$lib/data";
   import { config, initConfigUrlSync, resetConfigToDefaults, describeConfigDelta } from "$lib/mess3-config.svelte";
   import { RpcClient } from "$lib/remote-transport";
   import { createRemoteEngine, type RemoteEngine, type RemoteEngineStats } from "../../../../src/remote/client-engine";
 
+  import { THEME, COMP_COLORS, TOKEN_COLORS_RGB, SERIES_PALETTE } from "$lib/theme";
+  import { baseChartOpt, chartAxes, lineSeries, refLine, legendBlock } from "$lib/chart-helpers";
+  import { DemoPage, Figure, LineChart, StatsBar, Stat } from "$lib/components";
+
+  // Piston controls
+  import { BorderedGroup, CheckboxInput, NumberInput, Slider, TextInput } from "piston-controls";
+
   initConfigUrlSync();
+
+  // Toggling the remote checkbox swaps the engine in place — archives the
+  // current run so its trajectory survives, tears down the old transport if
+  // any, sets up the new one, and rebuilds the model on the new api. No
+  // page reload, so archivedRuns and config UI state stay intact and you
+  // can compare local vs remote runs side-by-side on the same charts.
+  $effect(() => {
+    const wantRemote = config.remote.enabled;
+    if (gpuReady && wantRemote !== isRemote) {
+      swapEngine(wantRemote).catch((e: any) => {
+        gpuError = e?.message ?? String(e);
+      });
+    }
+  });
 
   let api: any = $state(null);
   let nn: any = null;
@@ -26,51 +46,37 @@
   let remoteEngine: RemoteEngine | null = null;
   let remoteStats: RemoteEngineStats | null = $state(null);
   let serverGpuMB = $state('');
+  let serverHandles = $state(0);
   let isRemote = $state(false);
-
-  let lrLog = $state(Math.log10(config.optim.lr));
-  $effect(() => { lrLog = Math.log10(config.optim.lr); });
-  let wsLog = $state(Math.log10(config.init.weightScale));
-  $effect(() => { wsLog = Math.log10(config.init.weightScale); });
 
   let training = $state(false);
   let trainingActive = $state(false);
   let step = $state(0);
-  let stepMs = $state(0);       // wall-clock ms for the last training step
-  let stepsPerSec = $state(0);  // smoothed steps/sec
-  let phaseTimings = $state(''); // per-phase breakdown
+  let stepMs = $state(0);
+  let stepsPerSec = $state(0);
+  let phaseTimings = $state('');
   let lossHistory: number[] = $state([]);
   let memoryHistory: number[] = $state([]);
   let model: MESS3Model | null = $state(null);
   let optimizer: any = $state(null);
 
   // Simplex visualization data
-  // Ground truth: deterministic exploration (computed once)
   let gtBeliefs: { b0: number; b1: number; b2: number }[] = $state([]);
   let predBeliefs: number[][] = $state([]);
   let probeW: Float64Array | null = null;
   let probeBias: Float64Array | null = null;
   let probeR2: number = $state(0);
-  /** Per-comp R² using probe fitted on comp 0 */
   let probeR2PerComp: number[] = $state([]);
   let probeR2History: number[] = $state([]);
-  /** probeR2HistoryPerComp[c][evalIdx] = R² for comp c at eval step */
   let probeR2HistoryPerComp: number[][] = $state([]);
 
   const LOG_INTERVAL = 10;
   const VIZ_INTERVAL = 50;
   const PROBE_INTERVAL = 200;
 
-  // Token colors: red, green, blue (matching the demo)
-  const TOKEN_COLORS = [[232, 82, 74], [46, 204, 113], [74, 154, 222]];
+  // Token colors used by the belief→RGB mapping (sourced from shared theme)
+  const TOKEN_COLORS = TOKEN_COLORS_RGB;
 
-  let echarts: any = null;
-  let lossChart: any = null;
-  let r2Chart: any = null;
-  let memoryChart: any = null;
-  let lossEl: HTMLDivElement;
-  let r2El: HTMLDivElement;
-  let memoryEl: HTMLDivElement;
   let gtCanvas: HTMLCanvasElement;
   let predCanvas: HTMLCanvasElement;
 
@@ -83,152 +89,223 @@
     redrawSimplexes();
   }
 
-  onMount(async () => {
-    try {
-      const tl = await import("torchlette");
-      if (config.remote.enabled) {
-        // Remote training: full remote engine with handle lifecycle management.
-        rpcClient = new RpcClient(config.remote.url, (msg) => console.log(msg));
-        await rpcClient.connect();
-        remoteEngine = createRemoteEngine(rpcClient);
-        remoteStats = remoteEngine.stats;
-        isRemote = true;
-        api = remoteEngine.torch;
-      } else {
-        // Local WebGPU training.
-        await tl.initWebGPU();
-        api = new tl.Torchlette("webgpu", { enableFusion: true, memoryLimitBytes: 8 * 1024 * 1024 * 1024 });
-      }
-      nn = tl.nn;
-      Adam = tl.Adam;
-      crossEntropy = tl.nn.functional.crossEntropy;
-      getGPUMemoryStats = tl.getGPUMemoryStats;
-      gpuReady = true;
-    } catch (e: any) {
-      gpuError = e.message || String(e);
+  // Build (or rebuild) the compute engine. Called once at mount and again
+  // by swapEngine() when the user toggles the remote checkbox.
+  async function setupEngine(wantRemote: boolean): Promise<void> {
+    const tl = await import("torchlette");
+    // Both modes need WebGPU initialized client-side. Remote mode used to
+    // skip this and let createRemoteEngine register a CPU stub backend,
+    // but the cpu device path corrupted the lazy-graph dtype/op decisions
+    // and made remote training silently diverge from local. The client
+    // now always builds webgpu-flavored plans, even in remote mode.
+    await tl.initWebGPU();
+    if (wantRemote) {
+      rpcClient = new RpcClient(config.remote.url, (msg) => console.log(msg));
+      await rpcClient.connect();
+      remoteEngine = createRemoteEngine(rpcClient);
+      remoteStats = remoteEngine.stats;
+      isRemote = true;
+      api = remoteEngine.torch;
+    } else {
+      rpcClient = null;
+      remoteEngine = null;
+      remoteStats = null;
+      isRemote = false;
+      api = new tl.Torchlette("webgpu", { enableFusion: true, memoryLimitBytes: 8 * 1024 * 1024 * 1024 });
     }
-    echarts = await import("echarts");
-    await tick();
-    initCharts();
-    // 3D mouse drag
-    const onMove = (e: MouseEvent) => {
-      if (!dragging3d) return;
-      azimuth = dragStartAz + (e.clientX - dragStartX) * 0.008;
-      elevation = dragStartEl + (e.clientY - dragStartY) * 0.008;
-      elevation = Math.max(-Math.PI / 2.2, Math.min(Math.PI / 2.2, elevation));
-    };
-    const onUp = () => { dragging3d = false; };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
+    nn = tl.nn;
+    Adam = tl.Adam;
+    crossEntropy = tl.nn.functional.crossEntropy;
+    getGPUMemoryStats = tl.getGPUMemoryStats;
+    gpuReady = true;
+  }
 
-    // Start 3D render loop
-    if (gtCanvas) initDrag(gtCanvas);
-    if (predCanvas) initDrag(predCanvas);
-    renderLoopRunning = true;
-    render3DLoop();
-    syncSelfLoop();
+  // Hot-swap the engine in place. Stops training, archives the current run
+  // so it stays on the chart, drops references to the old engine + model
+  // (their GPU buffers will be reclaimed by GC + finalization), then sets
+  // up the new engine and rebuilds the model on it.
+  async function swapEngine(wantRemote: boolean): Promise<void> {
+    await stopAndWait();
+    archiveCurrentRun();
 
-    return () => {
-      lossChart?.dispose(); r2Chart?.dispose(); memoryChart?.dispose();
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-      renderLoopRunning = false;
-    };
+    // CRITICAL: force any in-flight pending tensors on the OLD api so they
+    // materialize on the OLD backend. The pending-tensor registry is
+    // process-global — without this, the new api's beginStep (called from
+    // resetModel below) would invoke forceAllPending, pick up the old
+    // model's pending tensors, and try to execute them on the wrong
+    // backend (e.g., dispatching a CPU matmul against a tensor that has
+    // no `.data` array because it was supposed to live on WebGPU).
+    // Once materialized, collectPendingRoots in engine.ts skips them.
+    if (api) {
+      try {
+        await api.runtime.forceAllPending();
+      } catch (e: any) {
+        console.warn('[swap] force on old api failed:', e?.message ?? e);
+      }
+    }
+
+    // If we're leaving remote mode, close the WebSocket so the server can
+    // recycle its caches. (The server's ws.on('close') handler runs the
+    // executor recycle when the last session disconnects.)
+    if (rpcClient && !wantRemote) {
+      rpcClient.close();
+    }
+
+    model = null;
+    optimizer = null;
+
+    await setupEngine(wantRemote);
+    await resetModel();
+  }
+
+  onMount(() => {
+    let cleanup: (() => void) | undefined;
+    (async () => {
+      try {
+        await setupEngine(config.remote.enabled);
+      } catch (e: any) {
+        gpuError = e.message || String(e);
+      }
+      const onMove = (e: MouseEvent) => {
+        if (!dragging3d) return;
+        azimuth = dragStartAz + (e.clientX - dragStartX) * 0.008;
+        elevation = dragStartEl + (e.clientY - dragStartY) * 0.008;
+        elevation = Math.max(-Math.PI / 2.2, Math.min(Math.PI / 2.2, elevation));
+      };
+      const onUp = () => { dragging3d = false; };
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+
+      if (gtCanvas) initDrag(gtCanvas);
+      if (predCanvas) initDrag(predCanvas);
+      renderLoopRunning = true;
+      render3DLoop();
+      syncSelfLoop();
+
+      cleanup = () => {
+        window.removeEventListener('mousemove', onMove);
+        window.removeEventListener('mouseup', onUp);
+        renderLoopRunning = false;
+      };
+    })();
+    return () => cleanup?.();
   });
 
-  const C = { fg: '#e2e8f0', muted: '#64748b', grid: '#1e293b', surface: '#1e293b' };
+  // ── Previous-run overlay ──────────────────────────────────────────────────
+  // Reset archives the current run so its trajectory is preserved as a faded
+  // line behind the new run; clear wipes both archived and current. Mirrors
+  // the pattern used by bio/brackets/xor.
+  type ArchivedRun = {
+    /** "local" if the run was on in-process WebGPU, "remote" if it went
+     *  through the Node WebSocket server. Drives the legend label so the
+     *  user can tell two overlaid lines apart at a glance. */
+    mode: "local" | "remote";
+    label: string;
+    lossHistory: number[];
+    probeR2History: number[];
+    probeR2HistoryPerComp: number[][];
+  };
+  let archivedRuns: ArchivedRun[] = $state([]);
 
-  function baseOpt() {
+  function lineSeriesXY(name: string, data: number[], xStep: number, color: string, isCurrent: boolean) {
     return {
-      backgroundColor: 'transparent',
-      textStyle: { color: C.muted, fontFamily: 'system-ui', fontSize: 11 },
-      grid: { top: 28, right: 12, bottom: 24, left: 44 },
-      animation: false,
+      name,
+      type: 'line' as const,
+      showSymbol: false,
+      data: data.map((y, i) => [i * xStep, y]),
+      lineStyle: { width: isCurrent ? 1.8 : 1.2, color, opacity: isCurrent ? 1 : 0.55 },
+      itemStyle: { color },
+      z: isCurrent ? 10 : 1,
     };
   }
+  const runColor = (i: number) => SERIES_PALETTE[(i + 1) % SERIES_PALETTE.length];
 
-  function initCharts() {
-    if (!lossEl) return;
-    lossChart = echarts.init(lossEl);
-    r2Chart = echarts.init(r2El);
-    memoryChart = echarts.init(memoryEl);
-    updateLossChart();
-    updateR2Chart();
-    updateMemoryChart();
-    syncSelfLoop();
-  }
+  // Format an archived run's legend label as "#N [mode] config-delta"
+  // so two overlaid lines (e.g. local vs remote on the same model) are
+  // immediately distinguishable in the legend.
+  const archiveLabel = (r: ArchivedRun, i: number) =>
+    `#${i + 1} [${r.mode}] ${r.label}`;
+  const currentLabel = () =>
+    `current [${isRemote ? "remote" : "local"}] ${describeConfigDelta(config)}`;
 
-  function updateLossChart() {
-    if (!lossChart) return;
-    const steps = lossHistory.map((_, i) => i * LOG_INTERVAL);
-    lossChart.setOption({
-      ...baseOpt(),
-      xAxis: { type: 'category', data: steps, axisLine: { lineStyle: { color: C.grid } }, axisLabel: { color: C.muted }, splitLine: { show: false } },
-      yAxis: { type: 'log', axisLine: { show: false }, splitLine: { lineStyle: { color: C.grid } }, axisLabel: { color: C.muted } },
-      tooltip: { trigger: 'axis', backgroundColor: C.surface, borderColor: C.grid, textStyle: { color: C.fg, fontSize: 11 } },
-      series: [{
-        type: 'line', data: lossHistory, showSymbol: false,
-        lineStyle: { width: 1.5, color: '#60a5fa' },
-        markLine: {
-          silent: true, symbol: 'none', animation: false,
-          data: [{ yAxis: entropy, lineStyle: { color: '#60a5fa', type: 'dotted', width: 1, opacity: 0.5 },
-            label: { formatter: `H=${entropy.toFixed(3)}`, position: 'insideEndTop', color: C.muted, fontSize: 9 } }],
-        },
-      }],
-    }, true);
-  }
+  // Reactive echarts options — re-derived whenever their inputs change.
+  let lossOption = $derived({
+    ...baseChartOpt(),
+    grid: { top: archivedRuns.length > 0 ? 48 : 28, right: 12, bottom: 24, left: 44 },
+    ...(archivedRuns.length > 0
+      ? { legend: { ...legendBlock(), top: 2, left: 44, right: 12, type: 'scroll' } }
+      : {}),
+    ...chartAxes({ yType: 'log' }),
+    series: [
+      ...archivedRuns.map((r, i) =>
+        lineSeriesXY(archiveLabel(r, i), r.lossHistory, LOG_INTERVAL, runColor(i), false),
+      ),
+      {
+        ...lineSeriesXY(currentLabel(), lossHistory, LOG_INTERVAL, THEME.accent, true),
+        markLine: refLine(entropy, `H=${entropy.toFixed(3)}`),
+      },
+    ],
+  });
 
-  const COMP_COLORS_R2 = ['#fbbf24', '#f472b6', '#34d399', '#a78bfa'];
-
-  function updateR2Chart() {
-    if (!r2Chart) return;
+  let r2Option = $derived.by(() => {
     const series: any[] = [];
+    // Faded archived runs first, current run on top.
+    for (let i = 0; i < archivedRuns.length; i++) {
+      const r = archivedRuns[i];
+      const c = runColor(i);
+      const tag = `#${i + 1} [${r.mode}]`;
+      if (r.probeR2HistoryPerComp.length > 0) {
+        for (let k = 0; k < r.probeR2HistoryPerComp.length; k++) {
+          series.push(lineSeriesXY(`${tag} c${k}`, r.probeR2HistoryPerComp[k], VIZ_INTERVAL, c, false));
+        }
+      } else {
+        series.push(lineSeriesXY(tag, r.probeR2History, VIZ_INTERVAL, c, false));
+      }
+    }
     if (probeR2HistoryPerComp.length > 0) {
       for (let c = 0; c < probeR2HistoryPerComp.length; c++) {
         series.push({
           name: c === 0 ? 'comp 0 (fitted)' : `comp ${c} (transfer)`,
-          type: 'line', data: probeR2HistoryPerComp[c].map((y, i) => [i * VIZ_INTERVAL, y]),
+          type: 'line',
+          data: probeR2HistoryPerComp[c].map((y, i) => [i * VIZ_INTERVAL, y]),
           showSymbol: true, symbolSize: 3,
-          lineStyle: { width: c === 0 ? 2 : 1.5, color: COMP_COLORS_R2[c % COMP_COLORS_R2.length] },
-          itemStyle: { color: COMP_COLORS_R2[c % COMP_COLORS_R2.length] },
+          lineStyle: { width: c === 0 ? 2 : 1.5, color: COMP_COLORS[c % COMP_COLORS.length] },
+          itemStyle: { color: COMP_COLORS[c % COMP_COLORS.length] },
+          z: 10,
         });
       }
     } else {
       series.push({
         name: 'R²', type: 'line', data: probeR2History.map((y, i) => [i * VIZ_INTERVAL, y]),
         showSymbol: true, symbolSize: 4,
-        lineStyle: { width: 1.5, color: '#fbbf24' },
-        itemStyle: { color: '#fbbf24' },
+        lineStyle: { width: 1.5, color: COMP_COLORS[0] },
+        itemStyle: { color: COMP_COLORS[0] },
+        z: 10,
       });
     }
-    r2Chart.setOption({
-      ...baseOpt(),
-      legend: probeR2HistoryPerComp.length > 1 ? {
-        top: 2, right: 12, textStyle: { color: C.muted, fontSize: 10 },
-        icon: 'circle', itemWidth: 8, itemHeight: 8,
-      } : undefined,
-      xAxis: { type: 'value', min: 0, axisLine: { lineStyle: { color: C.grid } }, axisLabel: { color: C.muted }, splitLine: { show: false } },
-      yAxis: { type: 'value', min: 0, max: 1, axisLine: { show: false }, splitLine: { lineStyle: { color: C.grid } }, axisLabel: { color: C.muted } },
-      tooltip: { trigger: 'axis', backgroundColor: C.surface, borderColor: C.grid, textStyle: { color: C.fg, fontSize: 11 } },
+    return {
+      ...baseChartOpt(),
+      grid: { top: archivedRuns.length > 0 ? 48 : 28, right: 12, bottom: 24, left: 44 },
+      ...(archivedRuns.length > 0 || probeR2HistoryPerComp.length > 1
+        ? { legend: { ...legendBlock(), top: 2, left: 44, right: 12, type: 'scroll' } }
+        : {}),
+      ...chartAxes({ yMin: 0, yMax: 1 }),
       series,
-    }, true);
-  }
+    };
+  });
 
-  function updateMemoryChart() {
-    if (!memoryChart) return;
-    const steps = memoryHistory.map((_, i) => i * LOG_INTERVAL);
-    memoryChart.setOption({
-      ...baseOpt(),
-      xAxis: { type: 'category', data: steps, axisLine: { lineStyle: { color: C.grid } }, axisLabel: { color: C.muted }, splitLine: { show: false } },
-      yAxis: { type: 'value', name: 'MB', nameTextStyle: { color: C.muted, fontSize: 10 },
-        axisLine: { show: false }, splitLine: { lineStyle: { color: C.grid } }, axisLabel: { color: C.muted } },
-      series: [{
-        type: 'line', data: memoryHistory, showSymbol: false,
-        lineStyle: { width: 1.5, color: '#6ee7b7' },
-        areaStyle: { color: 'rgba(110, 231, 183, 0.08)' },
-      }],
-    }, true);
-  }
+  let memoryOption = $derived({
+    ...baseChartOpt(),
+    ...chartAxes({ xType: 'category', xData: memoryHistory.map((_, i) => i * LOG_INTERVAL) }),
+    yAxis: {
+      type: 'value' as const, name: 'MB',
+      nameTextStyle: { color: THEME.muted, fontSize: 10 },
+      axisLine: { show: false },
+      splitLine: { lineStyle: { color: THEME.grid } },
+      axisLabel: { color: THEME.muted },
+    },
+    series: [lineSeries(memoryHistory, { color: THEME.accent2, area: true })],
+  });
 
   // --- 3D scatter visualization ---
   const CW = 400, CH = 400;
@@ -266,14 +343,14 @@
   function draw3DScatter(canvas: HTMLCanvasElement, points: { x: number; y: number; z: number }[], colors: [number, number, number][], label: string) {
     if (!canvas) return;
     const ctx = setupCanvas(canvas);
-    ctx.fillStyle = '#0f172a'; ctx.fillRect(0, 0, CW, CH);
+    ctx.fillStyle = THEME.bg; ctx.fillRect(0, 0, CW, CH);
     const cx = CW / 2, cy = CH / 2, scale = Math.min(CW, CH) * 0.35 * zoom3d;
     const cosA = Math.cos(azimuth), sinA = Math.sin(azimuth), cosE = Math.cos(elevation), sinE = Math.sin(elevation);
 
     // Wireframe cube
     const corners = [[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]];
     const edges = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
-    ctx.strokeStyle = 'rgba(148,163,184,0.08)'; ctx.lineWidth = 0.5; ctx.beginPath();
+    ctx.strokeStyle = 'rgba(0,0,0,0.08)'; ctx.lineWidth = 0.5; ctx.beginPath();
     for (const [a, b] of edges) {
       const pa = project3D(corners[a][0], corners[a][1], corners[a][2], cx, cy, scale, cosA, sinA, cosE, sinE);
       const pb = project3D(corners[b][0], corners[b][1], corners[b][2], cx, cy, scale, cosA, sinA, cosE, sinE);
@@ -282,8 +359,8 @@
     ctx.stroke();
 
     const n = points.length;
-    ctx.fillStyle = '#e2e8f0'; ctx.font = '12px system-ui'; ctx.textAlign = 'left'; ctx.fillText(label, 8, 14);
-    ctx.fillStyle = '#64748b'; ctx.font = '10px system-ui'; ctx.textAlign = 'right'; ctx.fillText(`${n} pts`, CW - 8, 14);
+    ctx.fillStyle = THEME.fg; ctx.font = '12px system-ui'; ctx.textAlign = 'left'; ctx.fillText(label, 8, 14);
+    ctx.fillStyle = THEME.muted; ctx.font = '10px system-ui'; ctx.textAlign = 'right'; ctx.fillText(`${n} pts`, CW - 8, 14);
     if (n === 0) return;
 
     const proj = new Array(n);
@@ -297,7 +374,7 @@
       const p = proj[i];
       const t = (p.rz - rzMin) / rzRange;
       const c = colors[p.i];
-      ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},${(0.15 + 0.45 * t).toFixed(2)})`;
+      ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},${(0.25 + 0.55 * t).toFixed(2)})`;
       ctx.beginPath(); ctx.arc(p.sx, p.sy, 1.0 + 1.5 * t, 0, 2 * Math.PI); ctx.fill();
     }
   }
@@ -307,19 +384,18 @@
   let gtColors: [number, number, number][] = [];
   let predPoints3D: { x: number; y: number; z: number }[] = [];
   let predColors: [number, number, number][] = [];
-  /** Per-comp predicted beliefs (only populated when c>1). */
   let perCompPredBeliefs: number[][][] = [];
 
   // Compartment colors for overlay visualization
   const COMP_RGB: [number, number, number][] = [
-    [251, 191, 36],   // gold (comp 0 — fitted)
-    [244, 114, 182],  // pink
-    [52, 211, 153],   // green
-    [167, 139, 250],  // purple
-    [251, 146, 60],   // orange
-    [34, 211, 238],   // cyan
-    [232, 121, 249],  // magenta
-    [148, 163, 184],  // gray
+    [212, 160, 23],   // gold (comp 0 — fitted)
+    [194, 24, 91],    // crimson
+    [56, 142, 60],    // green
+    [123, 31, 162],   // purple
+    [230, 81, 0],     // orange
+    [0, 151, 167],    // teal
+    [156, 39, 176],   // magenta
+    [97, 97, 97],     // gray
   ];
 
   function toSimplex3D(p0: number, p1: number, p2: number) {
@@ -331,7 +407,6 @@
     gtColors = gtBeliefs.map(b => beliefRGB(b.b0, b.b1, b.b2));
 
     if (config.world.nCompartments > 1 && perCompPredBeliefs.length > 0) {
-      // Multi-comp: overlay all comps' probe predictions, colored by compartment.
       const allPts: { x: number; y: number; z: number }[] = [];
       const allCols: [number, number, number][] = [];
       for (let c = 0; c < perCompPredBeliefs.length; c++) {
@@ -344,7 +419,6 @@
       predPoints3D = allPts;
       predColors = allCols;
     } else {
-      // Single comp: color by belief state (original).
       predPoints3D = predBeliefs.map(b => toSimplex3D(b[0], b[1], b[2]));
       predColors = predBeliefs.map(b => beliefRGB(b[0], b[1], b[2]));
     }
@@ -378,11 +452,10 @@
     }, { passive: false });
   }
 
-  function syncLr() {
-    config.optim.lr = 10 ** lrLog;
+  // Effect: when lr changes via Slider, push to optimizer if it exists.
+  $effect(() => {
     if (optimizer) optimizer.setLR(config.optim.lr);
-  }
-  function syncWs() { config.init.weightScale = 10 ** wsLog; }
+  });
 
   async function resetModel() {
     step = 0;
@@ -393,7 +466,6 @@
 
     await api.beginStep();
     api.manualSeed(config.init.seed);
-    // +1 for TR token used in paired/translation sequences.
     const vocabSize = VOCAB_SIZE_DATA * config.world.nCompartments + 1;
     model = createModel(api, nn, {
       ...MESS3_CONFIG,
@@ -409,17 +481,11 @@
       weightDecay: config.optim.weightDecay,
       adamW: config.optim.weightDecay > 0,
     });
-    // Pre-upload model weights BEFORE endStep so they're still pending.
-    // This binds their local storages to server handles, preventing
-    // "no HandleRef" errors when subsequent plans reference them.
     if (remoteEngine) {
       const uploaded = await remoteEngine.preUpload(model.parameters());
       console.log(`[preUpload] ${uploaded} param tensors`);
     }
     api.endStep();
-    updateLossChart();
-    updateMemoryChart();
-    updateR2Chart();
     redrawSimplexes();
   }
 
@@ -463,12 +529,10 @@
 
     const shouldLog = step % LOG_INTERVAL === 0;
 
-    // Loss readback before backward (backward disposes loss).
     if (shouldLog) {
       const val = await loss.item();
       if (Number.isFinite(val)) {
         lossHistory = [...lossHistory, val];
-        updateLossChart();
       } else {
         console.warn(`step ${step}: loss is ${val}, stopping`);
         training = false;
@@ -499,7 +563,6 @@
     if (shouldLog && getGPUMemoryStats && !isRemote) {
       const mem = getGPUMemoryStats();
       memoryHistory = [...memoryHistory, mem.currentBytes / (1024 * 1024)];
-      updateMemoryChart();
     }
 
     const elapsed = tEnd - t0;
@@ -514,11 +577,11 @@
       try {
         const s = await rpcClient.stats();
         if (s.gpu) serverGpuMB = `${s.gpu.currentMB}/${s.gpu.peakMB}MB`;
+        if (typeof s.handles === 'number') serverHandles = s.handles;
       } catch { /* ignore */ }
     }
   }
 
-  /** Extract activations + beliefs from a comp-specific batch. */
   async function extractActivationsAndBeliefs(comp: number): Promise<{ activations: number[][]; beliefs: number[][] }> {
     const evalBatch = config.probe.batchSize;
     const sl = config.model.seqLen;
@@ -548,7 +611,6 @@
     return { activations, beliefs };
   }
 
-  /** Compute R² of probe (probeW, probeBias) on given activations/beliefs. */
   function computeR2(activations: number[][], beliefs: number[][]): number {
     if (!probeW || !probeBias) return 0;
     const n = activations.length;
@@ -570,8 +632,6 @@
 
   async function updateBeliefSimplex(refitProbe: boolean) {
     if (!model) return;
-
-    // Always extract comp 0 for probe fitting + simplex display.
     const comp0 = await extractActivationsAndBeliefs(0);
 
     if (refitProbe || !probeW) {
@@ -579,7 +639,6 @@
     }
 
     if (probeW && probeBias) {
-      // Simplex display: apply probe to comp 0 activations.
       const pred: number[][] = [];
       const dim = comp0.activations[0].length;
       for (let i = 0; i < comp0.activations.length; i++) {
@@ -593,15 +652,12 @@
       }
       predBeliefs = pred;
 
-      // Per-comp R²: probe fitted on comp 0, applied to all comps.
-      // Also collect per-comp predicted beliefs for visualization.
       const nC = Math.min(4, config.world.nCompartments);
       const r2s: number[] = [computeR2(comp0.activations, comp0.beliefs)];
-      const allCompPreds: number[][][] = [pred]; // comp 0 already computed
+      const allCompPreds: number[][][] = [pred];
       for (let c = 1; c < nC; c++) {
         const compC = await extractActivationsAndBeliefs(c);
         r2s.push(computeR2(compC.activations, compC.beliefs));
-        // Apply comp-0 probe to comp c's activations for visualization.
         const cPred: number[][] = [];
         for (let i = 0; i < compC.activations.length; i++) {
           const p = [0, 0, 0];
@@ -625,7 +681,6 @@
       const newHist = probeR2HistoryPerComp.map(h => [...h]);
       for (let c = 0; c < nC; c++) newHist[c].push(r2s[c]);
       probeR2HistoryPerComp = newHist;
-      updateR2Chart();
     }
 
     redrawSimplexes();
@@ -635,8 +690,6 @@
     const n = activations.length;
     const d = activations[0].length;
     const dp1 = d + 1;
-
-    // Solve: beliefs (all 3 components) = W @ [activations; 1] via normal equation
     const XtX = new Float64Array(dp1 * dp1);
     const XtY = new Float64Array(dp1 * NUM_STATES);
 
@@ -712,6 +765,21 @@
   }
 
   function stopTraining() { training = false; }
+
+  function archiveCurrentRun() {
+    if (lossHistory.length === 0) return;
+    archivedRuns = [
+      ...archivedRuns,
+      {
+        mode: isRemote ? "remote" : "local",
+        label: describeConfigDelta(config),
+        lossHistory: [...lossHistory],
+        probeR2History: [...probeR2History],
+        probeR2HistoryPerComp: probeR2HistoryPerComp.map((h) => [...h]),
+      },
+    ];
+  }
+
   async function clearAll() {
     await stopAndWait();
     model = null; optimizer = null; step = 0;
@@ -719,181 +787,135 @@
     gtBeliefs = []; predBeliefs = [];
     probeW = null; probeBias = null; probeR2 = 0;
     probeR2History = []; probeR2PerComp = []; probeR2HistoryPerComp = [];
-    updateLossChart(); updateMemoryChart(); updateR2Chart();
+    archivedRuns = [];
   }
 
   let lastLoss = $derived(lossHistory.at(-1) ?? 0);
   let paramCount = $derived(model ? model.parameters().reduce((s: number, p: any) => s + p.shape.reduce((a: number, b: number) => a * b, 1), 0) : 0);
 </script>
 
-<div class="page">
-  <nav class="subnav">
-    <a href="/" class="current">mess3</a>
-    <a href="/bio">bio</a>
-    <a href="/xor">xor</a>
-    <a href="/brackets">brackets</a>
-  </nav>
-  <header>
-    <h1>Belief State Geometry in Transformers</h1>
-    <p class="lead">
-      A tiny transformer learns next-token prediction on sequences from the <em>MESS3</em> process
-      — a 3-state HMM. The optimal predictor must track a posterior over hidden states.
-      We probe the residual stream to recover the belief simplex geometry live during training.
-    </p>
-  </header>
+<DemoPage
+  title="Belief State Geometry in Transformers"
+  currentRoute="mess3"
+  {gpuError}
+  {gpuReady}
+  {training}
+  onTrain={runTraining}
+  onStop={stopTraining}
+  onReset={async () => { await stopAndWait(); archiveCurrentRun(); await resetModel(); }}
+  onDefaults={async () => { await stopAndWait(); resetConfigToDefaults(); }}
+  onClear={clearAll}
+>
+  {#snippet lead()}
+    A tiny transformer learns next-token prediction on sequences from the
+    <em class="italic text-[rgba(0,0,0,0.84)]">MESS3</em> process —
+    a 3-state HMM. The optimal predictor must track a posterior over hidden states. We probe the
+    residual stream to recover the belief simplex geometry live during training.
+  {/snippet}
 
-  {#if gpuError}
-    <div class="error">WebGPU: {gpuError}</div>
-  {/if}
+  {#snippet controls()}
+    <BorderedGroup title="World" id="grp-world" contentClass="p-2 space-y-2">
+      <Slider id="self-loop" label="Self-loop probability" min={0.3} max={0.9} step={0.01}
+              bind:value={config.world.selfLoop} />
+      <NumberInput id="ncomp" label="Compartments" min={1} max={8} step={1}
+                   bind:value={config.world.nCompartments} />
+      <Slider id="trpct" label="Translation %" min={0} max={100} step={1}
+              bind:value={config.objective.translationPct} unit="%" />
+    </BorderedGroup>
 
-  <div class="controls-bar">
-    <div class="control-group">
-      <span class="group-label">world</span>
-      <label>self-loop <input type="range" min="0.3" max="0.9" step="0.01" bind:value={config.world.selfLoop} oninput={syncSelfLoop} /><span class="val">{config.world.selfLoop.toFixed(2)}</span></label>
-      <label>c <input type="number" min="1" max="8" step="1" bind:value={config.world.nCompartments} style="width:36px" /></label>
-      <label>tr% <input type="range" min="0" max="100" step="1" bind:value={config.objective.translationPct} /><span class="val">{config.objective.translationPct}</span></label>
-    </div>
-    <div class="control-group">
-      <span class="group-label">init</span>
-      <label>seed <input type="number" min="0" step="1" bind:value={config.init.seed} style="width:56px" /></label>
-      <label>w× <input type="range" min="-2" max="1" step="0.05" bind:value={wsLog} oninput={syncWs} /><span class="val">{config.init.weightScale.toFixed(2)}</span></label>
-    </div>
-    <div class="control-group">
-      <span class="group-label">model</span>
-      <label>ctx <input type="range" min="5" max="20" step="1" bind:value={config.model.seqLen} /><span class="val">{config.model.seqLen}</span></label>
-      <label>probe <input type="number" min="32" max="2048" step="32" bind:value={config.probe.batchSize} style="width:52px" /></label>
-    </div>
-    <div class="control-group">
-      <span class="group-label">optim</span>
-      <label>lr <input type="range" min="-5" max="0" step="0.1" bind:value={lrLog} oninput={syncLr} /><span class="val">{config.optim.lr.toExponential(1)}</span></label>
-      <label>wd <input type="range" min="0" max="0.5" step="0.01" bind:value={config.optim.weightDecay} /><span class="val">{config.optim.weightDecay.toFixed(2)}</span></label>
-      <label>batch <input type="range" min="16" max="128" step="16" bind:value={config.optim.batchSize} /><span class="val">{config.optim.batchSize}</span></label>
-    </div>
-    <div class="control-group">
-      <span class="group-label">remote</span>
-      <label><input type="checkbox" bind:checked={config.remote.enabled} /> gpu</label>
-      <label>ws <input type="text" bind:value={config.remote.url} style="width:140px; font-size:10px" /></label>
-    </div>
-    <div class="control-actions">
-      <button onclick={runTraining} disabled={!gpuReady || training}>train</button>
-      <button onclick={stopTraining} disabled={!training}>stop</button>
-      <button onclick={async () => { await stopAndWait(); await resetModel(); }} disabled={!gpuReady}>reset</button>
-      <button onclick={async () => { await stopAndWait(); resetConfigToDefaults(); }}>defaults</button>
-      <button onclick={clearAll}>clear</button>
-      <span class="stat">step {step}</span>
-      <span class="stat">loss {lastLoss > 0 ? lastLoss.toFixed(4) : '--'}</span>
+    <BorderedGroup title="Init" id="grp-init" contentClass="p-2 space-y-2">
+      <NumberInput id="seed" label="Seed" min={0} step={1}
+                   bind:value={config.init.seed} />
+      <Slider id="wscale" label="Weight scale" min={0.01} max={10} step={0.01} useLog={true}
+              bind:value={config.init.weightScale} />
+    </BorderedGroup>
+
+    <BorderedGroup title="Model" id="grp-model" contentClass="p-2 space-y-2">
+      <Slider id="ctx" label="Context length" min={5} max={20} step={1}
+              bind:value={config.model.seqLen} />
+      <NumberInput id="probebs" label="Probe batch" min={32} max={2048} step={32}
+                   bind:value={config.probe.batchSize} />
+    </BorderedGroup>
+
+    <BorderedGroup title="Optimizer" id="grp-optim" contentClass="p-2 space-y-2">
+      <Slider id="lr" label="Learning rate" min={1e-5} max={1} step={1e-5} useLog={true}
+              bind:value={config.optim.lr} />
+      <Slider id="wd" label="Weight decay" min={0} max={0.5} step={0.01}
+              bind:value={config.optim.weightDecay} />
+      <Slider id="bs" label="Batch size" min={16} max={2048} step={16}
+              bind:value={config.optim.batchSize} />
+    </BorderedGroup>
+
+    <BorderedGroup title="Remote" id="grp-remote" contentClass="p-2 space-y-2">
+      <CheckboxInput id="remote-enable" label="Use remote GPU server"
+                     bind:checked={config.remote.enabled} />
+      <TextInput id="remote-url" label="WebSocket URL" bind:value={config.remote.url} />
+    </BorderedGroup>
+  {/snippet}
+
+  {#snippet stats()}
+    <StatsBar>
+      <Stat label="step" value={step} />
+      <Stat label="loss" value={lastLoss > 0 ? lastLoss.toFixed(4) : '—'} />
       {#if probeR2PerComp.length > 0}
-        <span class="stat">R² [{probeR2PerComp.map(r => r.toFixed(2)).join(', ')}]</span>
+        <Stat label="R²" value={`[${probeR2PerComp.map(r => r.toFixed(2)).join(', ')}]`} />
       {:else if probeR2 > 0}
-        <span class="stat">R²={probeR2.toFixed(3)}</span>
+        <Stat label="R²" value={probeR2.toFixed(3)} />
       {/if}
-      {#if paramCount}<span class="stat">{(paramCount / 1000).toFixed(1)}k</span>{/if}
-      {#if stepMs > 0}<span class="stat">{stepMs.toFixed(0)}ms/step</span>{/if}
-      {#if stepsPerSec > 0}<span class="stat">{stepsPerSec.toFixed(1)} step/s</span>{/if}
-      {#if phaseTimings}<span class="stat" title="Phase breakdown (ms)">{phaseTimings}</span>{/if}
+      {#if paramCount}<span>{(paramCount / 1000).toFixed(1)}k params</span>{/if}
+      {#if stepMs > 0}<span>{stepMs.toFixed(0)} ms/step</span>{/if}
+      {#if stepsPerSec > 0}<span>{stepsPerSec.toFixed(1)} steps/s</span>{/if}
+      {#if phaseTimings}<Stat value={phaseTimings} mono title="Phase breakdown (ms)" />{/if}
       {#if remoteStats}
-        <span class="stat">
-          rpc {remoteStats.executes}x {(remoteStats.bytesUp / 1024).toFixed(0)}KB↑ {(remoteStats.bytesDown / 1024).toFixed(0)}KB↓
-          h={remoteEngine?.handles.size() ?? 0} rel={remoteStats.handlesReleased}
-        </span>
-        {#if serverGpuMB}<span class="stat">gpu {serverGpuMB}</span>{/if}
+        <Stat
+          mono
+          value={`rpc ${remoteStats.executes}× ${(remoteStats.bytesUp / 1024).toFixed(0)} KB↑ ${(remoteStats.bytesDown / 1024).toFixed(0)} KB↓ h=${remoteEngine?.handles.size() ?? 0} rel=${remoteStats.handlesReleased}`}
+        />
+        {#if serverHandles > 0}<Stat label="srv-h" value={serverHandles} title="Handles currently held by the server (the leak indicator — should stay flat in steady state)" />{/if}
+        {#if serverGpuMB}<Stat label="srv-gpu" value={serverGpuMB} />{/if}
       {/if}
-    </div>
-  </div>
+    </StatsBar>
+  {/snippet}
 
-  <div class="figures">
-    <section class="figure">
-      <h2>Training Loss</h2>
-      <p class="caption">
-        Cross-entropy on MESS3. Dotted line = entropy floor H = {entropy.toFixed(3)} nats.
-      </p>
-      <div class="chart" bind:this={lossEl}></div>
-    </section>
+  {#snippet figures()}
+    <Figure
+      title="Training loss"
+      caption="Cross-entropy on MESS3. Dotted line marks the entropy floor H = {entropy.toFixed(3)} nats."
+    >
+      <LineChart option={lossOption} />
+    </Figure>
 
-    <section class="figure">
-      <h2>Belief Simplex</h2>
-      <p class="caption">
+    <Figure title="Belief simplex">
+      {#snippet caption()}
         Each point is a (position, sequence) pair. Left: ground-truth beliefs from the HMM
         (color = belief distribution: red/green/blue for S1/S2/S3).
         Right: affine linear probe of the last-layer residual stream (R² measures probe fit).
         {#if config.world.nCompartments > 1}
-          With c&gt;1, the probe is fitted on comp 0 only. Dots are colored by compartment —
-          if unified, all colors trace the same fractal; if compartmentalized, only comp 0 (gold)
-          shows the fractal while others scatter.
+          With more than one compartment, the probe is fitted on comp 0 only. Dots are colored by
+          compartment — if the model is unified, all colors trace the same fractal; if
+          compartmentalized, only comp 0 (gold) shows the fractal while the others scatter.
         {:else}
           The fractal should emerge as training converges.
         {/if}
-      </p>
-      <div class="simplex-pair">
-        <canvas bind:this={gtCanvas} class="simplex-canvas"></canvas>
-        <canvas bind:this={predCanvas} class="simplex-canvas"></canvas>
+      {/snippet}
+      <div class="flex flex-wrap gap-4">
+        <canvas bind:this={gtCanvas} class="h-[400px] w-[400px] border border-[rgba(0,0,0,0.08)] bg-[#fffaf3]"></canvas>
+        <canvas bind:this={predCanvas} class="h-[400px] w-[400px] border border-[rgba(0,0,0,0.08)] bg-[#fffaf3]"></canvas>
       </div>
-    </section>
+    </Figure>
 
-    <section class="figure">
-      <h2>Linear Probe R²</h2>
-      <p class="caption">How much belief state variance the residual stream linearly encodes. 1.0 = perfect recovery.</p>
-      <div class="chart small" bind:this={r2El}></div>
-    </section>
+    <Figure
+      title="Linear probe R²"
+      caption="How much belief-state variance the residual stream linearly encodes. 1.0 = perfect recovery."
+    >
+      <LineChart option={r2Option} height={160} />
+    </Figure>
 
-    <section class="figure">
-      <h2>GPU Memory</h2>
-      <p class="caption">Allocated GPU buffer memory.</p>
-      <div class="chart small" bind:this={memoryEl}></div>
-    </section>
-
-    <section class="figure">
-      <h2>MESS3 Process</h2>
-      <p class="caption">
-        3 hidden states, 3 tokens. Each state preferentially emits one token (p=0.77) and self-loops.
-        The belief state traces a fractal on the 2-simplex.
-      </p>
-    </section>
-  </div>
-</div>
-
-<style>
-  .page { max-width: 860px; margin: 0 auto; padding: 32px 20px 64px; }
-  .subnav { display: flex; gap: 16px; font-size: 11px; font-family: var(--font-mono); margin-bottom: 20px; }
-  .subnav a { color: var(--muted); text-decoration: none; text-transform: uppercase; letter-spacing: 0.05em; }
-  .subnav a:hover { color: var(--fg); }
-  .subnav a.current { color: var(--fg); font-weight: 600; }
-  header { margin-bottom: 28px; }
-  h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 8px; }
-  .lead { color: var(--muted); font-size: 14px; line-height: 1.6; max-width: 640px; }
-  .lead em { color: var(--fg); font-style: normal; font-weight: 500; }
-  .error { background: #450a0a; border: 1px solid #7f1d1d; padding: 6px 12px; font-size: 12px; margin-bottom: 16px; }
-
-  .controls-bar {
-    display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center;
-    padding: 12px 0; margin-bottom: 28px;
-    border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
-  }
-  .control-group {
-    display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center;
-    padding-right: 12px; border-right: 1px solid var(--border);
-  }
-  .control-group:last-of-type { border-right: none; }
-  .group-label {
-    font-size: 9px; font-family: var(--font-mono); color: var(--fg);
-    text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600;
-    padding-right: 4px;
-  }
-  .control-group label {
-    display: flex; align-items: center; gap: 6px;
-    font-size: 11px; color: var(--muted); font-family: var(--font-mono); white-space: nowrap;
-  }
-  .control-group input[type="range"] { width: 72px; }
-  .val { color: var(--fg); min-width: 28px; text-align: right; }
-  .control-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
-  .stat { font-size: 11px; font-family: var(--font-mono); color: var(--muted); }
-
-  .figures { display: flex; flex-direction: column; gap: 36px; }
-  .figure h2 { font-size: 14px; font-weight: 600; margin-bottom: 2px; }
-  .caption { font-size: 12px; color: var(--muted); line-height: 1.5; margin-bottom: 10px; max-width: 640px; }
-  .chart { width: 100%; height: 200px; }
-  .chart.small { height: 140px; }
-
-  .simplex-pair { display: flex; gap: 12px; flex-wrap: wrap; }
-  .simplex-canvas { width: 400px; height: 400px; }
-</style>
+    <Figure
+      title="GPU memory"
+      caption="Allocated GPU buffer memory (local mode only)."
+    >
+      <LineChart option={memoryOption} height={160} />
+    </Figure>
+  {/snippet}
+</DemoPage>

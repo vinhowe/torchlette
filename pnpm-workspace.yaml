@@ -2,6 +2,7 @@ packages:
   - packages/*
   - website
   - examples/gpt2-lora-trainer
+  - examples/toy-compartmentalization
 
 ignoredBuiltDependencies:
   - esbuild
