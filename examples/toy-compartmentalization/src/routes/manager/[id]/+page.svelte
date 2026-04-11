@@ -15,6 +15,7 @@
   import "../../../app.css";
   import { onMount, onDestroy } from "svelte";
   import { page } from "$app/stores";
+  import { goto } from "$app/navigation";
   import {
     ActionButton,
     BorderedGroup,
@@ -419,7 +420,27 @@
 
 <div class="mx-auto max-w-[1100px] px-6 pt-10 pb-24 text-[rgba(0,0,0,0.84)]">
   <nav class="mb-6 font-mono text-[11px]">
-    <a href="/manager" class="text-[rgba(0,0,0,0.54)] underline decoration-[rgba(0,0,0,0.18)] hover:text-[rgba(0,0,0,0.84)]">
+    <!--
+      Use an explicit goto() on click instead of relying on SvelteKit's
+      automatic <a href> interception. Plain anchors usually work, but
+      in SPA mode with adapter-static + fallback: 'index.html' — and no
+      +layout.svelte driving a shared router context — there are edge
+      cases (particularly with dynamic-segment parents) where the
+      automatic handler doesn't fire. goto() always works because it
+      calls the router directly; href is kept for semantic correctness
+      and right-click "open in new tab".
+    -->
+    <a
+      href="/manager"
+      class="text-[rgba(0,0,0,0.54)] underline decoration-[rgba(0,0,0,0.18)] hover:text-[rgba(0,0,0,0.84)]"
+      onclick={(e: MouseEvent) => {
+        // Let modified clicks (cmd/ctrl, shift, middle-click) fall
+        // through to the browser's default new-tab behavior.
+        if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+        e.preventDefault();
+        void goto("/manager");
+      }}
+    >
       ← experiments
     </a>
   </nav>
