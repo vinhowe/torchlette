@@ -33,8 +33,10 @@
   let totalSteps = $state(5000);
   let description = $state("");
   // Per-script param values: keyed by script name so switching scripts
-  // and back preserves what you typed.
-  let formParams = $state<Record<string, Record<string, number | string | boolean>>>({});
+  // and back preserves what you typed. Typed as numbers-only because
+  // every Slider binding takes a number; non-numeric params would need
+  // a different control (checkbox, select) that v0.1 doesn't support.
+  let formParams = $state<Record<string, Record<string, number>>>({});
   let creatingError = $state<string | null>(null);
   let creating = $state(false);
 
@@ -42,22 +44,38 @@
     scripts.find((s) => s.name === selectedScript),
   );
 
-  // Initialize form params for the selected script with defaults the first
-  // time we see it. Subsequent visits keep whatever the user typed.
-  $effect(() => {
-    if (selectedScriptInfo && !formParams[selectedScript]) {
-      const init: Record<string, number | string | boolean> = {};
-      for (const [key, spec] of Object.entries(selectedScriptInfo.params)) {
-        if (spec.default !== undefined) init[key] = spec.default as any;
-      }
-      formParams = { ...formParams, [selectedScript]: init };
+  /** Populate formParams[name] with the script's numeric defaults if not
+   *  already set. Non-numeric params are silently skipped — v0.1 assumes
+   *  every param the form renders is a number (Slider). Called
+   *  synchronously from the pre-render effect so the template never sees
+   *  `formParams[selectedScript]` as undefined while trying to bind
+   *  sliders to `formParams[selectedScript][key]`. */
+  function ensureFormParams(name: string) {
+    if (!name || formParams[name]) return;
+    const info = scripts.find((s) => s.name === name);
+    if (!info) return;
+    const init: Record<string, number> = {};
+    for (const [key, spec] of Object.entries(info.params)) {
+      if (typeof spec.default === "number") init[key] = spec.default;
     }
+    formParams = { ...formParams, [name]: init };
+  }
+
+  // Run BEFORE the DOM updates so the ensuring happens in the same microtask
+  // as the selectedScript / scripts change. A plain $effect would fire after
+  // the template re-runs, and bindings like `formParams[selectedScript][key]`
+  // would crash on the intermediate render where selectedScript is set but
+  // formParams[selectedScript] is still undefined.
+  $effect.pre(() => {
+    ensureFormParams(selectedScript);
   });
 
-  // Auto-pick the first script when scripts arrive.
+  // Auto-pick the first script when scripts arrive. Also initializes the
+  // form params for that script so there's no one-render gap.
   $effect(() => {
     if (!selectedScript && scripts.length > 0) {
       selectedScript = scripts[0].name;
+      ensureFormParams(scripts[0].name);
     }
   });
 
@@ -213,7 +231,7 @@
                      bind:value={description} />
         </BorderedGroup>
 
-        {#if selectedScriptInfo}
+        {#if selectedScriptInfo && formParams[selectedScript]}
           {@const liveParams = Object.entries(selectedScriptInfo.params).filter(([, s]) => s.live)}
           {@const structParams = Object.entries(selectedScriptInfo.params).filter(([, s]) => !s.live)}
           {#if liveParams.length > 0}
@@ -227,7 +245,7 @@
                   max={range.max}
                   step={range.step}
                   useLog={range.useLog}
-                  bind:value={formParams[selectedScript][key] as number}
+                  bind:value={formParams[selectedScript][key]}
                 />
               {/each}
             </BorderedGroup>
@@ -243,7 +261,7 @@
                   max={range.max}
                   step={range.step}
                   useLog={range.useLog}
-                  bind:value={formParams[selectedScript][key] as number}
+                  bind:value={formParams[selectedScript][key]}
                 />
               {/each}
             </BorderedGroup>

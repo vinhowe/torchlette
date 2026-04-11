@@ -87,21 +87,72 @@
   });
 
   // ── live param editing ──
-  // Debounce set_param RPCs so dragging a slider doesn't fire dozens.
-  const debounceMs = 50;
+  //
+  // The Slider component only supports bind:value (two-way). We can't
+  // bind directly to `rec.params[key]` because:
+  //   1. rec is $derived from the reactive client map, not mutable here
+  //   2. Every slider drag would have to round-trip through the server
+  //      before the UI updated, which feels terrible
+  //
+  // Instead we keep a local `liveValues` state that the sliders bind to,
+  // and a debounced $effect that pushes any change back to the server.
+  // Server-pushed updates (e.g. from another tab, or a resume-loaded
+  // experiment) are synced in via a separate $effect that copies
+  // rec.params → liveValues when the user hasn't recently touched a key.
+  let liveValues = $state<Record<string, number>>({});
+  // Track which key is currently being edited (i.e. has a debounce timer
+  // running). While dirty, we ignore incoming server pushes for that key
+  // so the slider doesn't jump back under the user's thumb.
+  const dirtyKeys = new Set<string>();
+  const debounceMs = 80;
   const debounceTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+  // Last value we've actually sent to the server — used as a diff base
+  // so the push-effect doesn't re-send the same value.
+  const lastPushed: Record<string, number> = {};
 
-  function pushParam(key: string, value: number) {
+  // Initialize + sync liveValues from rec.params. Runs whenever rec
+  // changes; skips keys that are currently being edited.
+  $effect(() => {
+    if (!rec || !scriptInfo) return;
+    for (const [key, spec] of Object.entries(scriptInfo.params)) {
+      if (!spec.live) continue;
+      if (dirtyKeys.has(key)) continue;
+      const raw = rec.params[key];
+      const numeric = typeof raw === "number" ? raw : Number(raw ?? spec.default ?? 0);
+      if (Number.isFinite(numeric) && liveValues[key] !== numeric) {
+        liveValues[key] = numeric;
+        lastPushed[key] = numeric;
+      }
+    }
+  });
+
+  // Debounced push: whenever liveValues changes, schedule a set_param
+  // for each key whose value drifted from what we last sent.
+  $effect(() => {
     if (!rec) return;
     const expId = rec.id;
-    if (debounceTimers[key]) clearTimeout(debounceTimers[key]);
-    debounceTimers[key] = setTimeout(() => {
-      delete debounceTimers[key];
-      void client.setParam(expId, key, value).catch((e) => {
-        console.error("set_param failed", e);
-      });
-    }, debounceMs);
-  }
+    for (const key of Object.keys(liveValues)) {
+      const value = liveValues[key];
+      if (lastPushed[key] === value) continue;
+      dirtyKeys.add(key);
+      if (debounceTimers[key]) clearTimeout(debounceTimers[key]);
+      debounceTimers[key] = setTimeout(() => {
+        delete debounceTimers[key];
+        lastPushed[key] = value;
+        void client
+          .setParam(expId, key, value)
+          .catch((e) => console.error("set_param failed", e))
+          .finally(() => {
+            // Release the dirty flag shortly after the RPC completes so
+            // incoming server pushes for this key can resume syncing.
+            // Using a short delay (vs immediate) absorbs the echo from
+            // the server's `updated` global broadcast that will arrive
+            // just after our setParam ack.
+            setTimeout(() => dirtyKeys.delete(key), 200);
+          });
+      }, debounceMs);
+    }
+  });
 
   // ── controls ──
   async function handleStop() {
@@ -235,16 +286,17 @@
             <BorderedGroup title="Live (sliders push to running worker)" id="grp-live" contentClass="p-2 space-y-2">
               {#each liveParams as [key, spec]}
                 {@const range = paramSpecRange(spec)}
-                <Slider
-                  id={`live-${key}`}
-                  label={spec.description || key}
-                  min={range.min}
-                  max={range.max}
-                  step={range.step}
-                  useLog={range.useLog}
-                  value={Number(rec.params[key] ?? spec.default ?? 0)}
-                  onchange={(v: number) => pushParam(key, v)}
-                />
+                {#if liveValues[key] !== undefined}
+                  <Slider
+                    id={`live-${key}`}
+                    label={spec.description || key}
+                    min={range.min}
+                    max={range.max}
+                    step={range.step}
+                    useLog={range.useLog}
+                    bind:value={liveValues[key]}
+                  />
+                {/if}
               {/each}
             </BorderedGroup>
           {/if}
