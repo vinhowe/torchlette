@@ -1,0 +1,28 @@
+@import "piston-controls/theme.css";
+
+/* piston-controls/theme.css uses `source('./')`, so Tailwind only scans its
+   own directory. Re-add the consumer source so utility classes used in this
+   app's components/routes get generated. */
+@source "./**/*.{html,js,svelte,ts}";
+
+/* Body styles + scrollbar live in @layer base so Tailwind utilities (in
+   @layer utilities) still beat them by layer order. NOTE: do not add a
+   universal `* { margin: 0; padding: 0 }` reset — un-layered styles win
+   over @layer utilities regardless of specificity, which would clobber
+   things like `.mx-auto`, `.px-6`, etc. Preflight handles the necessary
+   resets already. */
+@layer base {
+  body {
+    background: #fffaf3;
+    color: rgba(0, 0, 0, 0.84);
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: #fffaf3; }
+  ::-webkit-scrollbar-thumb { background: rgba(0, 0, 0, 0.15); }
+  * { scrollbar-width: thin; scrollbar-color: rgba(0, 0, 0, 0.15) #fffaf3; }
+}
