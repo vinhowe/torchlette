@@ -15,6 +15,7 @@
   import "../../app.css";
   import { onMount, onDestroy } from "svelte";
   import {
+    ActionButton,
     BorderedGroup,
     Slider,
     NumberInput,
@@ -324,14 +325,13 @@
       </div>
 
       <div class="mt-3 flex items-center gap-3">
-        <button
-          type="button"
+        <ActionButton
+          color="blue"
           onclick={handleCreate}
           disabled={creating || !connected}
-          class="bg-[rgba(0,0,0,0.84)] px-[14px] py-[6px] font-mono text-[11px] uppercase tracking-[0.06em] text-white hover:bg-[rgba(0,0,0,1)] disabled:opacity-40"
         >
           {creating ? "creating…" : "kick off"}
-        </button>
+        </ActionButton>
         {#if creatingError}
           <span class="text-[12px] text-[#c0392b]">{creatingError}</span>
         {/if}

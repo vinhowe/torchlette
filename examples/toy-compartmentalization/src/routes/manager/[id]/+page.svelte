@@ -15,7 +15,13 @@
   import "../../../app.css";
   import { onMount, onDestroy } from "svelte";
   import { page } from "$app/stores";
-  import { BorderedGroup, Slider, CheckboxInput, SelectInput } from "piston-controls";
+  import {
+    ActionButton,
+    BorderedGroup,
+    Slider,
+    CheckboxInput,
+    SelectInput,
+  } from "piston-controls";
   import { LineChart } from "$lib/components";
   import { baseChartOpt, chartAxes, lineSeries, legendBlock } from "$lib/chart-helpers";
   import { THEME, SERIES_PALETTE } from "$lib/theme";
@@ -361,15 +367,9 @@
       <div class="flex items-center gap-3">
         <span class={statusBadgeClasses(rec.status)}>{rec.status}</span>
         {#if rec.status === "running" || rec.status === "stopping"}
-          <button type="button" onclick={handleStop}
-            class="bg-[rgba(0,0,0,0.84)] px-[12px] py-[5px] font-mono text-[11px] uppercase tracking-[0.06em] text-white hover:bg-[rgba(0,0,0,1)]">
-            stop
-          </button>
+          <ActionButton color="red" onclick={handleStop}>stop</ActionButton>
         {:else}
-          <button type="button" onclick={handleDelete}
-            class="border border-[rgba(0,0,0,0.18)] bg-white px-[12px] py-[5px] font-mono text-[11px] uppercase tracking-[0.06em] text-[rgba(0,0,0,0.54)] hover:border-[#c0392b] hover:text-[#c0392b]">
-            delete
-          </button>
+          <ActionButton color="gray" onclick={handleDelete}>delete</ActionButton>
         {/if}
       </div>
     </header>
