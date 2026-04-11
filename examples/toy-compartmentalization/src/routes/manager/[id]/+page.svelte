@@ -15,12 +15,14 @@
   import "../../../app.css";
   import { onMount, onDestroy } from "svelte";
   import { page } from "$app/stores";
-  import { BorderedGroup, Slider } from "piston-controls";
+  import { BorderedGroup, Slider, CheckboxInput, SelectInput } from "piston-controls";
   import { LineChart } from "$lib/components";
   import { baseChartOpt, chartAxes, lineSeries, legendBlock } from "$lib/chart-helpers";
   import { THEME, SERIES_PALETTE } from "$lib/theme";
   import { getExperimentClient, type ExperimentClient } from "$lib/experiment-client-singleton.svelte";
   import type { ExperimentRecord, MetricEntry, ParamSpec, ScriptInfo } from "$lib/experiment-client.svelte";
+
+  type FormValue = number | boolean | string;
 
   let client: ExperimentClient = $state(getExperimentClient());
 
@@ -201,7 +203,7 @@
   // Server-pushed updates (e.g. from another tab, or a resume-loaded
   // experiment) are synced in via a separate $effect that copies
   // rec.params → liveValues when the user hasn't recently touched a key.
-  let liveValues = $state<Record<string, number>>({});
+  let liveValues = $state<Record<string, FormValue>>({});
   // Track which key is currently being edited (i.e. has a debounce timer
   // running). While dirty, we ignore incoming server pushes for that key
   // so the slider doesn't jump back under the user's thumb.
@@ -210,20 +212,26 @@
   const debounceTimers: Record<string, ReturnType<typeof setTimeout>> = {};
   // Last value we've actually sent to the server — used as a diff base
   // so the push-effect doesn't re-send the same value.
-  const lastPushed: Record<string, number> = {};
+  const lastPushed: Record<string, FormValue> = {};
 
   // Initialize + sync liveValues from rec.params. Runs whenever rec
-  // changes; skips keys that are currently being edited.
+  // changes; skips keys that are currently being edited. Handles all
+  // three live-param types: number / boolean / string (select).
   $effect(() => {
     if (!rec || !scriptInfo) return;
     for (const [key, spec] of Object.entries(scriptInfo.params)) {
       if (!spec.live) continue;
       if (dirtyKeys.has(key)) continue;
       const raw = rec.params[key];
-      const numeric = typeof raw === "number" ? raw : Number(raw ?? spec.default ?? 0);
-      if (Number.isFinite(numeric) && liveValues[key] !== numeric) {
-        liveValues[key] = numeric;
-        lastPushed[key] = numeric;
+      let coerced: FormValue | undefined;
+      if (typeof raw === "number" || typeof raw === "boolean" || typeof raw === "string") {
+        coerced = raw;
+      } else if (spec.default !== undefined) {
+        coerced = spec.default as FormValue;
+      }
+      if (coerced !== undefined && liveValues[key] !== coerced) {
+        liveValues[key] = coerced;
+        lastPushed[key] = coerced;
       }
     }
   });
@@ -316,6 +324,13 @@
     return { min, max, step, useLog };
   }
 
+  function controlKind(spec: ParamSpec): "number" | "boolean" | "select" | "unknown" {
+    if (spec.type === "select" || Array.isArray(spec.choices)) return "select";
+    if (spec.type === "boolean" || typeof spec.default === "boolean") return "boolean";
+    if (spec.type === "number" || typeof spec.default === "number") return "number";
+    return "unknown";
+  }
+
   function fmtLoss(rec: ExperimentRecord | undefined): string {
     const loss = rec?.latest_metrics?.loss;
     return typeof loss === "number" ? loss.toFixed(4) : "—";
@@ -394,29 +409,45 @@
         <h2 class="mb-3 text-[15px] font-semibold tracking-[-0.01em]">Parameters</h2>
         <div class="grid grid-cols-[repeat(auto-fit,minmax(260px,1fr))] gap-3">
           {#if liveParams.length > 0}
-            <BorderedGroup title="Live (sliders push to running worker)" id="grp-live" contentClass="p-2 space-y-2">
+            <BorderedGroup title="Live (edits push to running worker)" id="grp-live" contentClass="p-2 space-y-2">
               {#each liveParams as [key, spec]}
-                {@const range = paramSpecRange(spec)}
+                {@const kind = controlKind(spec)}
                 {#if liveValues[key] !== undefined}
-                  <Slider
-                    id={`live-${key}`}
-                    label={spec.description || key}
-                    min={range.min}
-                    max={range.max}
-                    step={range.step}
-                    useLog={range.useLog}
-                    bind:value={liveValues[key]}
-                  />
+                  {#if kind === "number"}
+                    {@const range = paramSpecRange(spec)}
+                    <Slider
+                      id={`live-${key}`}
+                      label={spec.description || key}
+                      min={range.min}
+                      max={range.max}
+                      step={range.step}
+                      useLog={range.useLog}
+                      bind:value={liveValues[key] as number}
+                    />
+                  {:else if kind === "boolean"}
+                    <CheckboxInput
+                      id={`live-${key}`}
+                      label={spec.description || key}
+                      bind:checked={liveValues[key] as boolean}
+                    />
+                  {:else if kind === "select"}
+                    <SelectInput
+                      id={`live-${key}`}
+                      label={spec.description || key}
+                      options={(spec.choices ?? []).map((c) => ({ value: c }))}
+                      bind:value={liveValues[key] as string}
+                    />
+                  {/if}
                 {/if}
               {/each}
             </BorderedGroup>
           {/if}
           {#if structParams.length > 0}
             <BorderedGroup title="Structural (fixed at creation)" id="grp-struct" contentClass="p-2 space-y-2">
-              {#each structParams as [key, spec]}
+              {#each structParams as [key]}
                 <div class="flex items-baseline justify-between font-mono text-[11px]">
                   <span class="text-[rgba(0,0,0,0.54)]">{key}</span>
-                  <span class="text-[rgba(0,0,0,0.84)]">{rec.params[key] ?? "—"}</span>
+                  <span class="text-[rgba(0,0,0,0.84)]">{String(rec.params[key] ?? "—")}</span>
                 </div>
               {/each}
             </BorderedGroup>
