@@ -70,6 +70,78 @@
     if (lastSubscribedId) {
       void client.unsubscribe(lastSubscribedId).catch(() => {});
     }
+    if (historySnapshotTimer !== null) {
+      clearTimeout(historySnapshotTimer);
+      historySnapshotTimer = null;
+    }
+  });
+
+  // ── Throttled history snapshot ──
+  //
+  // Metric events arrive as fast as the worker can push them —
+  // typically 50-100Hz for mess3 or small bio3. The client pushes
+  // each one onto rec.history, and without throttling, every push
+  // cascades into a full chartFamilies recompute (walks the whole
+  // history) + a `setOption` call on every Echarts instance. Six
+  // charts × 100Hz = 600 chart rebuilds per second. Even with
+  // progressive rendering that's enough to lock the main thread.
+  //
+  // Fix: maintain a separate `historySnapshot` — a $state.raw array
+  // that's updated from rec.history on a throttle, at most once per
+  // HISTORY_UPDATE_MS. chartFamilies reads from the snapshot, not
+  // from rec.history directly, so mutations to the live history
+  // don't trigger a recompute until the throttle window fires.
+  //
+  // The first snapshot happens immediately on subscribe so the
+  // backfill renders right away; subsequent updates coalesce.
+  const HISTORY_UPDATE_MS = 250;
+  let historySnapshot = $state.raw<MetricEntry[]>([]);
+  let historySnapshotAt = 0;
+  let historySnapshotTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastSnapshottedRecId: string | null = null;
+
+  function takeHistorySnapshot() {
+    if (!rec) return;
+    // Slice to create a new array reference — $state.raw only
+    // triggers on top-level reassignment, not in-place mutation.
+    historySnapshot = rec.history.slice();
+    historySnapshotAt = Date.now();
+    historySnapshotTimer = null;
+  }
+
+  $effect(() => {
+    if (!rec) return;
+    // Depend on rec.history.length so this effect re-runs each time
+    // a metric event pushes onto it. We read the length specifically
+    // (rather than the array) to avoid tracking deep array mutations.
+    const currentLen = rec.history.length;
+    const currentId = rec.id;
+
+    // When we switch to a different experiment, force an immediate
+    // snapshot — don't let the throttle from the previous experiment
+    // delay the new one's initial draw.
+    if (currentId !== lastSnapshottedRecId) {
+      lastSnapshottedRecId = currentId;
+      if (historySnapshotTimer !== null) {
+        clearTimeout(historySnapshotTimer);
+        historySnapshotTimer = null;
+      }
+      takeHistorySnapshot();
+      return;
+    }
+
+    // If the snapshot is empty (first render of this experiment),
+    // take it right away so the user sees their chart immediately.
+    if (historySnapshot.length === 0 && currentLen > 0) {
+      takeHistorySnapshot();
+      return;
+    }
+
+    // Otherwise, schedule a throttled update.
+    if (historySnapshotTimer !== null) return; // already pending
+    const elapsed = Date.now() - historySnapshotAt;
+    const delay = Math.max(0, HISTORY_UPDATE_MS - elapsed);
+    historySnapshotTimer = setTimeout(takeHistorySnapshot, delay);
   });
 
   // ── derived chart options ──
@@ -125,18 +197,23 @@
   }
 
   let chartFamilies = $derived.by((): ChartFamily[] => {
-    if (!rec || rec.history.length === 0) return [];
+    // Read from the throttled snapshot, NOT rec.history directly. The
+    // snapshot updates on a 250ms throttle via the $effect above; this
+    // means chartFamilies (and everything downstream — chart options,
+    // Echarts setOption calls) only recomputes when the snapshot
+    // actually changes, not on every incoming metric event at 50-100Hz.
+    if (historySnapshot.length === 0) return [];
 
-    // Phase 1: walk the FULL history (no stride) and collect every
+    // Phase 1: walk the FULL snapshot (no stride) and collect every
     // (step, value) pair per (family, compartment) bucket. We have to
     // do this ungated because different metrics land on different
     // cadences: loss/grad_norm every step, probe_r2/cos_sim/acc_cN
     // /translation_loss every EVAL_INTERVAL steps. A uniform stride on
-    // `rec.history` would snap to the loss cadence and silently drop
+    // the full list would snap to the loss cadence and silently drop
     // every sparse metric whose index happens to be odd — which was
     // the bug that made cos_sim disappear past step ~4000.
     const grouped = new Map<string, Map<number | null, [number, number][]>>();
-    for (const entry of rec.history as MetricEntry[]) {
+    for (const entry of historySnapshot) {
       if (!entry.metrics) continue;
       for (const [k, v] of Object.entries(entry.metrics)) {
         if (typeof v !== "number" || !Number.isFinite(v)) continue;
