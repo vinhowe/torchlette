@@ -40,7 +40,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from compartmentalization_server.api import Experiment, register
-from compartmentalization_server.models import Transformer, TransformerConfig
+from compartmentalization_server.models import (
+    Transformer,
+    TransformerConfig,
+    hessian_lambda_max,
+)
 
 # ──────────────────────────────────────────────────────────────────────────
 # MESS3 HMM data
@@ -471,6 +475,34 @@ class Mess3(Experiment):
             metrics["cos_sim"] = float(
                 F.cosine_similarity(a, c1, dim=-1).mean().item()
             )
+
+        # ── Sharpness (λ_max of the Hessian) ──
+        # Power iteration with HVPs on a fresh minibatch. The helper
+        # opens its own `torch.enable_grad` scope so we can call it
+        # from inside `_eval`'s `@torch.no_grad`. ~15 iterations × 3
+        # passes ≈ 45 training-step-equivalents, so at
+        # EVAL_INTERVAL=50 this is about 1% overhead overall.
+        sharpness_bs = min(64, self.eval_batch_size)
+
+        def _sharpness_loss() -> torch.Tensor:
+            tok = self.sampler.sample(sharpness_bs, self.seq_len)
+            inp = tok[:, :-1]
+            tgt = tok[:, 1:]
+            logits = self.model(inp)
+            return self.criterion(
+                logits.reshape(-1, self.vocab_size), tgt.reshape(-1)
+            )
+
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        try:
+            metrics["sharpness"] = hessian_lambda_max(
+                _sharpness_loss, params, num_iters=15
+            )
+        except Exception:
+            # Numerical issues early in training (e.g. Hessian
+            # degeneracies when params are still close to init) — skip
+            # this step's reading rather than crashing the eval.
+            pass
 
         return metrics
 

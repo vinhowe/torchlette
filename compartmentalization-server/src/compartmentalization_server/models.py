@@ -34,12 +34,14 @@ cross-compartment cosine similarity uses the MIDDLE layer residual).
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -255,3 +257,160 @@ class Transformer(nn.Module):
         if return_residuals:
             return logits, residuals
         return logits
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Sharpness (λ_max of the Hessian via power iteration)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def hessian_lambda_max(
+    loss_fn: Callable[[], torch.Tensor],
+    params: list[torch.Tensor],
+    num_iters: int = 15,
+    tol: float = 1e-3,
+) -> float:
+    """Estimate the largest eigenvalue of the Hessian ∇²L(w) via power
+    iteration with Hessian-vector products (HVPs).
+
+    This is the canonical "sharpness" measurement from the flat-vs-sharp
+    minima literature (Keskar et al. 2017, Cohen et al. 2022 "Edge of
+    Stability"): it tells you the curvature of the loss landscape in
+    the sharpest direction at the current parameters. Large = sharp
+    minimum, small = flat. NOT the same thing as gradient norm, which
+    measures distance from a critical point.
+
+    ## How it works
+
+    Power iteration on the Hessian:
+        v_{k+1} = Hv_k / ||Hv_k||
+        λ_k+1 = v_{k+1}ᵀ H v_{k+1}  (Rayleigh quotient)
+    converges to the eigenvector of the largest-magnitude eigenvalue.
+    The Rayleigh quotient converges to that eigenvalue itself.
+
+    We never form H explicitly (O(N²) memory for N params — infeasible
+    for anything bigger than a few thousand params). Instead we
+    compute Hv on the fly using the double-backward trick:
+        g = ∇L        (first backward, with create_graph=True)
+        Hv = ∇(g·v)   (second backward, differentiates through g)
+    PyTorch's autograd does this via `torch.autograd.grad` with
+    `create_graph=True` on the first call so the second call can
+    backprop through it.
+
+    ## Cost
+
+    Each iteration is one forward pass + two backward passes (the
+    first with create_graph=True). Roughly 3x the cost of a plain
+    training step. With num_iters=15, total cost per call is ~45
+    training-step-equivalents. Run it every ~50 training steps and the
+    overhead is ~1% overall.
+
+    ## Caveats
+
+      - Power iteration finds the largest-*magnitude* eigenvalue. Near
+        a minimum the Hessian is PSD so this is λ_max. Near a saddle
+        it could be the most-negative eigenvalue (in which case the
+        sign is negative). In practice for a converging training run
+        you're near a minimum most of the time.
+
+      - We force PyTorch's MATH SDPA backend during the forward pass.
+        The fused "efficient" / "flash" attention kernels have fast
+        first-derivatives but NO SECOND DERIVATIVE implementation —
+        calling autograd.grad a second time through them raises
+        "derivative for aten::_scaled_dot_product_efficient_attention_backward
+        is not implemented". The math backend is slower but supports
+        double-backward, which HVPs need. This wrapper makes the
+        choice transparent to callers.
+
+      - Can be called inside a `torch.no_grad()` scope (e.g. from an
+        eval method): this helper opens its own `torch.enable_grad`
+        block, which overrides the outer no_grad.
+
+      - If two top eigenvalues are close in magnitude, power iteration
+        converges slowly. In practice 15 iterations gives ~3 decimal
+        places of accuracy for transformers; bump `num_iters` if plots
+        look noisy.
+
+    ## Parameters
+
+    loss_fn : a zero-arg callable that computes and returns a fresh
+        scalar loss tensor. Called once per iteration so each iteration
+        sees a fresh graph — the second-derivative computation consumes
+        the graph each time, so it can't be reused across iterations.
+        Typical implementation: sample a minibatch, do a forward pass,
+        return cross_entropy(logits, targets).
+    params : list of parameter tensors to differentiate with respect to.
+        Typically `[p for p in model.parameters() if p.requires_grad]`.
+    num_iters : max power iterations. 15 is usually enough; 25-50 if
+        you need more accuracy or if the top two eigenvalues are close.
+    tol : relative tolerance for early exit. If two consecutive estimates
+        agree to within this, stop early.
+
+    ## Returns
+
+    Python float: the estimated top eigenvalue. Returns 0.0 on numerical
+    degeneracy (e.g. Hv is effectively zero — shouldn't happen for a
+    real model).
+    """
+    # Initial random direction, normalized to unit length.
+    v = [torch.randn_like(p) for p in params]
+    total = torch.sqrt(sum((vi * vi).sum() for vi in v))
+    if float(total.item()) == 0.0:
+        return 0.0
+    v = [vi / total for vi in v]
+
+    eigenvalue = 0.0
+    for it in range(num_iters):
+        # Clear any stale gradients from the training loop so the
+        # autograd.grad call doesn't accidentally inherit them.
+        for p in params:
+            if p.grad is not None:
+                p.grad = None
+
+        # SDPBackend.MATH forces F.scaled_dot_product_attention to use
+        # the math implementation, which is the only one that
+        # implements the second derivative. The fused "efficient" /
+        # "flash" kernels raise on double-backward. Scoped to just the
+        # forward pass since that's where the kernel selection happens.
+        with torch.enable_grad(), sdpa_kernel(SDPBackend.MATH):
+            loss = loss_fn()
+            # First derivative; create_graph=True so we can
+            # differentiate through it.
+            grads = torch.autograd.grad(
+                loss, params, create_graph=True, retain_graph=True,
+            )
+            # g · v : a scalar built from the current grad graph. This
+            # is the thing whose gradient w.r.t. params is H·v.
+            gv = sum((g * vi).sum() for g, vi in zip(grads, v))
+            # H · v = ∇(g · v). Detach each component so we drop the
+            # graph before the next iteration.
+            Hv_raw = torch.autograd.grad(gv, params, retain_graph=False)
+            Hv = [h.detach() for h in Hv_raw]
+
+        # Rayleigh quotient: vᵀHv. Since v is unit-norm this is the
+        # eigenvalue estimate for the current iteration.
+        new_eigenvalue = float(
+            sum((hi * vi).sum() for hi, vi in zip(Hv, v)).item()
+        )
+
+        # Normalize Hv to get the next iteration's direction.
+        norm_sq = sum((hi * hi).sum() for hi in Hv)
+        norm_val = float(norm_sq.sqrt().item())
+        if norm_val < 1e-12:
+            # Hessian times this direction is ~zero; either we're at
+            # a degenerate point or numerically unstable. Return what
+            # we have.
+            return eigenvalue
+        v = [hi / norm_val for hi in Hv]
+
+        # Early exit: if consecutive estimates are close enough, we're
+        # converged. The abs(...) / max(...) form avoids a divide-by-zero
+        # when eigenvalue is small and handles both signs.
+        if it > 0:
+            denom = max(abs(new_eigenvalue), 1e-6)
+            if abs(new_eigenvalue - eigenvalue) / denom < tol:
+                eigenvalue = new_eigenvalue
+                break
+        eigenvalue = new_eigenvalue
+
+    return eigenvalue

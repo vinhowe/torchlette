@@ -113,6 +113,10 @@
     // grad_norm spans orders of magnitude across training; log is the
     // only axis that's readable end-to-end.
     if (family === "grad_norm") return { yType: "log" };
+    // Hessian top eigenvalue (sharpness): log for the same reason,
+    // plus it typically grows during training toward 2/lr ("edge of
+    // stability"), which spans several decades.
+    if (family === "sharpness") return { yType: "log" };
     if (family === "probe_r2") return { yType: "value", yMin: -0.2, yMax: 1 };
     if (family === "cos_sim") return { yType: "value", yMin: -1, yMax: 1 };
     if (family === "acc") return { yType: "value", yMin: 0, yMax: 1 };
@@ -163,10 +167,11 @@
     const familyOrder = (name: string): number => {
       if (name === "loss") return 0;
       if (name === "grad_norm") return 1;
-      if (name === "probe_r2") return 2;
-      if (name === "cos_sim") return 3;
-      if (name === "acc") return 4;
-      if (name === "translation_loss") return 5;
+      if (name === "sharpness") return 2;
+      if (name === "probe_r2") return 3;
+      if (name === "cos_sim") return 4;
+      if (name === "acc") return 5;
+      if (name === "translation_loss") return 6;
       return 100;
     };
     const sortedFams = [...grouped.keys()].sort(
@@ -211,6 +216,7 @@
     switch (family) {
       case "loss": return "Training loss";
       case "grad_norm": return "Gradient L2 norm";
+      case "sharpness": return "Sharpness (Hessian λ_max)";
       case "probe_r2": return "Belief probe R²";
       case "cos_sim": return "Cross-compartment cosine similarity";
       case "acc": return "QA accuracy per compartment";
