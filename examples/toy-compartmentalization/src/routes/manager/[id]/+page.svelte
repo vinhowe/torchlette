@@ -150,8 +150,10 @@
 
     // Phase 2: downsample each series independently. Sparse metrics
     // with few points pass through untouched; dense metrics (loss,
-    // grad_norm) get strided down to at most `maxPoints`.
-    const maxPoints = 2500;
+    // grad_norm) get strided down to at most `maxPoints`. 1000 is
+    // plenty for the ~800px-wide chart area — anything more is
+    // subpixel noise and a tax on Echarts rendering time.
+    const maxPoints = 1000;
     const downsample = (points: [number, number][]): [number, number][] => {
       if (points.length <= maxPoints) return points;
       const stride = Math.ceil(points.length / maxPoints);
@@ -209,6 +211,13 @@
         showSymbol: false,
         lineStyle: { width: 1.5, color: SERIES_PALETTE[i % SERIES_PALETTE.length] },
         itemStyle: { color: SERIES_PALETTE[i % SERIES_PALETTE.length] },
+        // Progressive rendering: when the series has more than 500
+        // points, render 300 per animation frame instead of all at
+        // once. Prevents the multi-second main-thread freeze on
+        // backfill of long-running experiments where six charts
+        // otherwise try to rasterize thousands of points synchronously.
+        progressive: 300,
+        progressiveThreshold: 500,
       })),
     };
   }
