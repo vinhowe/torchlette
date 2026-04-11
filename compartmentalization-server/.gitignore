@@ -1,0 +1,15 @@
+# uv / Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Persistent experiment state — local to each developer's machine
+storage/*/
+
+# Logs
+*.log
