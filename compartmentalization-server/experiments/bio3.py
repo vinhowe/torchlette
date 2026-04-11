@@ -805,13 +805,16 @@ class Bio3(Experiment):
             if total_positions > 0:
                 metrics["translation_loss"] = total_nll / total_positions
 
-        # ── Sharpness (λ_max of the Hessian) ──
-        # Power iteration with HVPs on a fresh training-distribution
-        # minibatch. The helper opens its own enable_grad scope, so it
-        # works fine from inside _eval's no_grad. Smaller batch than
-        # training (bio3 gradients can be heavy with a big world) to
-        # keep HVP cost bounded; 32 samples is enough for a stable
-        # estimate.
+        return metrics
+
+    def _compute_sharpness(self) -> float | None:
+        """Hessian λ_max on a fresh training-distribution minibatch.
+
+        Expensive (~45 training-step-equivalents per call); gated on
+        SHARPNESS_INTERVAL in step() so it runs much less often than
+        the other eval metrics. Returns None on numerical failure
+        rather than crashing the step.
+        """
         sharpness_bs = 32
 
         def _sharpness_loss() -> torch.Tensor:
@@ -835,13 +838,9 @@ class Bio3(Experiment):
 
         params = [p for p in self.model.parameters() if p.requires_grad]
         try:
-            metrics["sharpness"] = hessian_lambda_max(
-                _sharpness_loss, params, num_iters=15
-            )
+            return hessian_lambda_max(_sharpness_loss, params, num_iters=15)
         except Exception:
-            pass
-
-        return metrics
+            return None
 
     def state_dict(self) -> dict[str, Any]:
         return {
