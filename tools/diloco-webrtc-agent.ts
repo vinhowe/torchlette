@@ -186,7 +186,7 @@ async function createModel(api: Torchlette, _modelDir: string) {
   await api._runtime().forceAllPending();
   log("Initialized GPT-2 124M from seed");
 
-  // Resume from checkpoint if available
+  // Resume from checkpoint if available.
   const ckptPath = "/tmp/diloco-webrtc-checkpoint.bin";
   if (fs.existsSync(ckptPath)) {
     const buf = fs.readFileSync(ckptPath);
@@ -222,12 +222,17 @@ async function createModel(api: Torchlette, _modelDir: string) {
 }
 
 // ── f16 weight encoding for checkpoint sync ──
-function encodeCheckpointF16(ckptPath: string): Buffer {
+// Frame body (after server strips routing prefix and re-prepends "F16W"):
+//   [F16W (4)][round (4 LE)][numParams (4 LE)][per-param: nel(4) + f16 data]
+function encodeCheckpointF16(ckptPath: string, round: number): Buffer {
   const buf = fs.readFileSync(ckptPath);
   let off = 0;
   const np = buf.readUInt32LE(off);
   off += 4;
   const parts: Buffer[] = [];
+  const roundBuf = Buffer.alloc(4);
+  roundBuf.writeUInt32LE(round, 0);
+  parts.push(roundBuf);
   const npBuf = Buffer.alloc(4);
   npBuf.writeUInt32LE(np, 0);
   parts.push(npBuf);
@@ -276,6 +281,58 @@ function encodeCheckpointF16(ckptPath: string): Buffer {
     parts.push(Buffer.from(f16.buffer, f16.byteOffset, f16.byteLength));
   }
   return Buffer.concat(parts);
+}
+
+// Decode the body that follows the [F16W][round] header into the local params.
+// Body layout (after caller strips F16W prefix + round):
+//   [numParams(4)][per-param: nel(4) + f16 data].
+async function applyF16WeightsToParams(
+  api: Torchlette,
+  params: import("../src/frontend/tensor").Tensor[],
+  body: Buffer,
+): Promise<void> {
+  let off = 0;
+  const np = body.readUInt32LE(off);
+  off += 4;
+  if (np !== params.length) {
+    throw new Error(
+      `F16W param count mismatch: got ${np}, expected ${params.length}`,
+    );
+  }
+  await api.beginStep();
+  for (let i = 0; i < np; i++) {
+    const nel = body.readUInt32LE(off);
+    off += 4;
+    const f16 = new Uint16Array(
+      body.buffer.slice(
+        body.byteOffset + off,
+        body.byteOffset + off + nel * 2,
+      ),
+    );
+    off += nel * 2;
+    const f32 = new Float32Array(nel);
+    for (let j = 0; j < nel; j++) {
+      const h = f16[j];
+      const sign = (h >> 15) & 1;
+      const exp = (h >> 10) & 0x1f;
+      const mant = h & 0x3ff;
+      let val: number;
+      if (exp === 0) {
+        val = (mant / 1024) * 2 ** -14;
+      } else if (exp === 31) {
+        val = mant ? Number.NaN : Number.POSITIVE_INFINITY;
+      } else {
+        val = 2 ** (exp - 15) * (1 + mant / 1024);
+      }
+      f32[j] = sign ? -val : val;
+    }
+    api.copy_(
+      params[i],
+      api.tensorFromArray(f32, params[i].shape, { device: "webgpu" }),
+    );
+  }
+  api.endStep();
+  await api.markStep();
 }
 
 // ── Training Step ──
@@ -396,13 +453,25 @@ async function main() {
   });
 
   // ── Connect ──
-  const ws = new WebSocket(SERVER_URL);
+  // maxPayload must accommodate full-size GPT-2 f16 weights (~238MB) plus headers.
+  const WS_MAX_PAYLOAD = 500 * 1024 * 1024;
+  const ws = new WebSocket(SERVER_URL, { maxPayload: WS_MAX_PAYLOAD });
   let peerGrads: Float32Array[] | null = null;
   let peerTokenCount = 0;
   let peerRound = -1;
   let peerCount = 0;
   let myPeerId = "";
   let sendingWeights = false; // serialize weight sends
+  let needsSync = false;
+  let currentRound = 0;
+  // Late-join sync: store the F16W blob in the handler, parse + load it from
+  // main() context. Mirrors the browser's pattern — handler is buffer-only,
+  // engine work happens in the main coroutine.
+  let pendingSyncBlob: { body: Buffer; sourceRound: number } | null = null;
+  let initialSyncResolver: (() => void) | null = null;
+  const initialSyncPromise = new Promise<void>((r) => {
+    initialSyncResolver = r;
+  });
 
   await new Promise<void>((resolve, reject) => {
     ws.on("open", () => {
@@ -421,7 +490,10 @@ async function main() {
         if (msg.type === "registered") {
           myPeerId = msg.peerId;
           peerCount = msg.peers - 1;
-          log(`Registered as ${myPeerId} (${msg.peers} peers total)`);
+          needsSync = !!msg.needsSync;
+          log(
+            `Registered as ${myPeerId} (${msg.peers} peers total, needsSync=${needsSync})`,
+          );
           resolve();
         }
       } catch {}
@@ -448,7 +520,7 @@ async function main() {
         const ckptPath = "/tmp/diloco-webrtc-checkpoint.bin";
         if (fs.existsSync(ckptPath)) {
           sendingWeights = true;
-          const payload = encodeCheckpointF16(ckptPath);
+          const payload = encodeCheckpointF16(ckptPath, currentRound);
           const targetBuf = Buffer.from(msg.target, "utf8");
           const header = Buffer.alloc(6 + targetBuf.length);
           header.write("F16W", 0);
@@ -456,7 +528,7 @@ async function main() {
           targetBuf.copy(header, 6);
           conn.send(Buffer.concat([header, payload]));
           log(
-            `Sent ${(payload.length / 1024 / 1024).toFixed(1)}MB weights (f16) to ${msg.target}`,
+            `Sent ${(payload.length / 1024 / 1024).toFixed(1)}MB weights (f16, round ${currentRound}) to ${msg.target}`,
           );
           sendingWeights = false;
         } else {
@@ -466,7 +538,27 @@ async function main() {
       return;
     } catch {
       const raw = Buffer.from(data);
-      if (raw.length > 16 && raw.toString("utf8", 0, 4) === "GRAD") {
+      if (raw.length > 8 && raw.toString("utf8", 0, 4) === "F16W") {
+        // Late-join weight sync: [F16W][round (4)][numParams (4)][per-param: nel + f16 data]
+        // Handler is BUFFER-ONLY: store a COPY of the blob (raw.slice/subarray
+        // return views — the underlying ws buffer can be recycled before main
+        // processes it). main() applies the weights in its own coroutine.
+        if (!initialSyncResolver) {
+          log(
+            `Ignoring F16W blob (${(raw.length / 1024 / 1024).toFixed(1)}MB): initial sync already complete`,
+          );
+        } else {
+          const sourceRound = raw.readUInt32LE(4);
+          // Buffer.from(buf) copies the bytes into a fresh allocation.
+          pendingSyncBlob = { body: Buffer.from(raw.subarray(8)), sourceRound };
+          log(
+            `Buffered F16W blob (${(raw.length / 1024 / 1024).toFixed(1)}MB, source round ${sourceRound}) — main will apply`,
+          );
+          const resolver = initialSyncResolver;
+          initialSyncResolver = null;
+          resolver();
+        }
+      } else if (raw.length > 16 && raw.toString("utf8", 0, 4) === "GRAD") {
         peerTokenCount = raw.readUInt32LE(4);
         peerRound = raw.readUInt32LE(8);
         const peerLoss = raw.readFloatLE(12);
@@ -499,7 +591,7 @@ async function main() {
       log("WebSocket disconnected — reconnecting in 5s...");
       setTimeout(() => {
         try {
-          const newWs = new WebSocket(SERVER_URL);
+          const newWs = new WebSocket(SERVER_URL, { maxPayload: WS_MAX_PAYLOAD });
           newWs.on("error", (e) => {
             log(
               `Reconnect failed: ${(e as Error).message} — retrying in 10s...`,
@@ -528,9 +620,50 @@ async function main() {
   }
   setupReconnect(ws);
 
+  // ── Late-join sync: pull weights from existing peer if needed ──
+  // Server auto-fires `send-weights` to an existing peer on our register when
+  // peers.size > 0. But that peer may not have a checkpoint written yet
+  // (its first round is still in progress). Retry periodically until F16W
+  // arrives or we hit the overall timeout.
+  if (needsSync) {
+    log("Awaiting weight sync from existing peer (server-triggered)...");
+    const SYNC_TIMEOUT_MS = 300_000; // 5 min total
+    const RETRY_INTERVAL_MS = 20_000;
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    const timeoutPromise = new Promise<"timeout">((r) => {
+      timeoutHandle = setTimeout(() => r("timeout"), SYNC_TIMEOUT_MS);
+    });
+    const retryHandle = setInterval(() => {
+      if (initialSyncResolver) {
+        log("Sync still pending — sending request-weights retry");
+        conn.send(JSON.stringify({ type: "request-weights" }));
+      }
+    }, RETRY_INTERVAL_MS);
+    const result = await Promise.race([
+      initialSyncPromise.then(() => "synced" as const),
+      timeoutPromise,
+    ]);
+    clearInterval(retryHandle);
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    if (result === "timeout") {
+      log(
+        `Sync timed out (${SYNC_TIMEOUT_MS / 1000}s) — proceeding from local init at round 0`,
+      );
+    } else if (pendingSyncBlob) {
+      // Apply weights now, in main coroutine context.
+      const { body, sourceRound } = pendingSyncBlob;
+      pendingSyncBlob = null;
+      await applyF16WeightsToParams(api, params, body);
+      currentRound = sourceRound;
+      log(
+        `Synced weights into params (jumped to round ${sourceRound})`,
+      );
+    }
+  }
+
   const tokensPerStep = EFFECTIVE_BATCH * SEQ_LEN;
   log(
-    `Training: ${OUTER_ROUNDS} rounds × ${INNER_STEPS} steps, batch=${BATCH_SIZE}×${ACCUM_STEPS}accum=${EFFECTIVE_BATCH}, seq=${SEQ_LEN}, ${tokensPerStep} tok/step`,
+    `Training: ${OUTER_ROUNDS} rounds × ${INNER_STEPS} steps, batch=${BATCH_SIZE}×${ACCUM_STEPS}accum=${EFFECTIVE_BATCH}, seq=${SEQ_LEN}, ${tokensPerStep} tok/step (starting at round ${currentRound})`,
   );
 
   // Persistent gradient accumulators (before any beginStep)
@@ -540,7 +673,8 @@ async function main() {
   await api._runtime().forceAllPending();
 
   // ── Training loop ──
-  for (let round = 0; round < OUTER_ROUNDS; round++) {
+  for (; currentRound < OUTER_ROUNDS; currentRound++) {
+    const round = currentRound; // local alias for log/header use
     const roundStart = performance.now();
     tokens = await fetchFreshTokens(tokenizer);
 
@@ -632,22 +766,12 @@ async function main() {
           for (let j = 0; j < avgGrads[p].length; j++)
             avgGrads[p][j] /= totalTokens;
 
-        await api.beginStep();
-        for (let i = 0; i < params.length; i++) {
-          api.copy_(
-            params[i],
-            api.tensorFromArray(globalSnapshot[i], params[i].shape, {
-              device: "webgpu",
-            }),
-          );
-        }
-        const avgTensors = avgGrads.map((pg, i) =>
-          api.tensorFromArray(pg, params[i].shape, { device: "webgpu" }),
-        );
-        await api._runtime().forceAllPending();
-        await outerOpt.step(params, avgTensors);
-        api.endStep();
-        await api.markStep();
+        // Compute outer step on CPU. stepFromCpu now manages its own step
+        // boundaries (begin/markStep cycles) so each batch of 20 uploads is
+        // fully fenced before the next batch — prevents Dawn "Buffer used in
+        // submit while destroyed" warnings caused by step-scoped temps being
+        // destroyed before their copy_ commands have actually been submitted.
+        await outerOpt.stepFromCpu(params, globalSnapshot, avgGrads);
         log(`  averaged with ${numContributors} contributors`);
       } else {
         log("  solo round — keeping local params");
