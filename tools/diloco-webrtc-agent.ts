@@ -48,6 +48,32 @@ const GPT2_CONFIG = {
 
 const log = (msg: string) => console.error(`[diloco-webrtc] ${msg}`);
 
+// ── stderr wrapper: count Dawn validation warnings ──
+// Dawn writes "[Buffer ...] used in submit while destroyed." (and other
+// validation messages) directly to stderr via fprintf. Wrap stderr.write at
+// the JS level so we can count them without losing visibility — the original
+// writer is always invoked.
+let totalDawnWarnings = 0;
+{
+  const origWrite = process.stderr.write.bind(process.stderr);
+  const re = /used in submit while destroyed/;
+  // biome-ignore lint/suspicious/noExplicitAny: stderr.write has many overloads
+  (process.stderr as any).write = (chunk: any, ...rest: any[]): boolean => {
+    let text: string | null = null;
+    if (typeof chunk === "string") text = chunk;
+    else if (chunk instanceof Uint8Array)
+      text = Buffer.from(chunk).toString("utf8");
+    if (text != null) {
+      // Each message contains the "used in submit while destroyed" line once;
+      // count line occurrences rather than chunks so multi-line chunks aren't
+      // undercounted.
+      const matches = text.match(new RegExp(re.source, "g"));
+      if (matches) totalDawnWarnings += matches.length;
+    }
+    return origWrite(chunk, ...rest);
+  };
+}
+
 // ── E3M0 ──
 function serializePseudoGrads(pseudoGrads: Float32Array[]): Buffer {
   const parts: Buffer[] = [];
@@ -673,12 +699,19 @@ async function main() {
   await api._runtime().forceAllPending();
 
   // ── Training loop ──
+  let prevWarnCount = totalDawnWarnings;
   for (; currentRound < OUTER_ROUNDS; currentRound++) {
     const round = currentRound; // local alias for log/header use
     const roundStart = performance.now();
     tokens = await fetchFreshTokens(tokenizer);
 
     const hasPeers = peerCount > 0;
+    // Per-round tracking surfaced to the structured-log line below. Set
+    // inside the outer-step block; default values mean "solo / no peer grad
+    // this round" (lag=0, contributors=1, took_outer_step=false).
+    let roundLag = 0;
+    let numContributors = 1;
+    let tookOuterStep = false;
     const globalSnapshot: Float32Array[] = [];
     for (const p of params)
       globalSnapshot.push(new Float32Array(await p.cpu()));
@@ -738,9 +771,8 @@ async function main() {
         for (let j = 0; j < pseudoGrads[p].length; j++)
           avgGrads[p][j] += pseudoGrads[p][j] * myTokens;
 
-      let numContributors = 1;
       if (peerGrads && peerGrads.length === params.length) {
-        const roundLag = peerRound >= 0 ? Math.abs(round - peerRound) : 0;
+        roundLag = peerRound >= 0 ? Math.abs(round - peerRound) : 0;
         if (roundLag > 10) {
           log(`  discarding stale gradient (${roundLag} rounds behind)`);
           peerGrads = null;
@@ -765,13 +797,8 @@ async function main() {
         for (let p = 0; p < avgGrads.length; p++)
           for (let j = 0; j < avgGrads[p].length; j++)
             avgGrads[p][j] /= totalTokens;
-
-        // Compute outer step on CPU. stepFromCpu now manages its own step
-        // boundaries (begin/markStep cycles) so each batch of 20 uploads is
-        // fully fenced before the next batch — prevents Dawn "Buffer used in
-        // submit while destroyed" warnings caused by step-scoped temps being
-        // destroyed before their copy_ commands have actually been submitted.
         await outerOpt.stepFromCpu(params, globalSnapshot, avgGrads);
+        tookOuterStep = true;
         log(`  averaged with ${numContributors} contributors`);
       } else {
         log("  solo round — keeping local params");
@@ -798,11 +825,50 @@ async function main() {
       );
     }
 
-    const elapsed = ((performance.now() - roundStart) / 1000).toFixed(1);
+    const elapsedSecRaw = (performance.now() - roundStart) / 1000;
+    const elapsed = elapsedSecRaw.toFixed(1);
     const avgLoss = losses.reduce((a, b) => a + b, 0) / losses.length;
     log(
       `round ${round}: loss=${avgLoss.toFixed(4)}, ${elapsed}s, peers=${peerCount + 1}`,
     );
+
+    // ── Structured stats line (machine-readable; tail|grep ^STATS|jq) ──
+    // One JSON record per round. Keep field names short and stable —
+    // anything you add here will get scraped by run-analysis tools.
+    try {
+      const { getGPUMemoryStats } = await import(
+        "../src/backend/webgpu/memory-tracker"
+      );
+      const { bufferPool: bp } = await import(
+        "../src/backend/webgpu/buffer-pool"
+      );
+      const mem = getGPUMemoryStats();
+      const pool = bp.stats();
+      const rss = process.memoryUsage().rss;
+      const warnsDelta = totalDawnWarnings - prevWarnCount;
+      prevWarnCount = totalDawnWarnings;
+      const tokensThisRound = INNER_STEPS * tokensPerStep;
+      const stats = {
+        t: new Date().toISOString(),
+        round,
+        loss: +avgLoss.toFixed(4),
+        elapsed_s: +elapsedSecRaw.toFixed(2),
+        tok_s: +(tokensThisRound / Math.max(elapsedSecRaw, 1e-3)).toFixed(1),
+        peers: peerCount + 1,
+        contributors: numContributors,
+        lag: roundLag,
+        outer_step: tookOuterStep,
+        gpu_mb: Math.round(mem.currentBytes / 1e6),
+        peak_mb: Math.round(mem.peakBytes / 1e6),
+        pool_mb: Math.round(pool.pooledBytes / 1e6),
+        cpu_rss_mb: Math.round(rss / 1e6),
+        warns: totalDawnWarnings,
+        warns_delta: warnsDelta,
+      };
+      console.error(`STATS ${JSON.stringify(stats)}`);
+    } catch (e) {
+      log(`  stats emit failed: ${(e as Error).message}`);
+    }
   }
 
   log("Training complete.");
