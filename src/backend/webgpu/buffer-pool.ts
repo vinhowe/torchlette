@@ -22,6 +22,7 @@ import {
   arenaBufferSet,
   gpuContext,
   sharedEncoderActive,
+  sharedEncoderWriteSet,
 } from "./webgpu-state";
 
 // ============================================================================
@@ -138,6 +139,32 @@ class SimpleBufferPool {
   /** Check if a buffer is still referenced by any owning tensor. */
   isLive(buffer: GPUBuffer): boolean {
     return this.bufferLiveCount.has(buffer);
+  }
+
+  /**
+   * Whether a buffer is safe to recycle for a fresh write right now.
+   *
+   * Two independent claims must be clear:
+   *   1. Host-side: no tensor still believes the buffer holds its data
+   *      (`bufferLiveCount` is zero).
+   *   2. GPU-side: no unsubmitted op in the open shared encoder still has
+   *      the buffer in its bindings — i.e., it's not in `sharedEncoderWriteSet`.
+   *
+   * Either claim alone is insufficient. A buffer can be ownerless (no tensor)
+   * yet still be the source of a queued, unsubmitted scatter; reusing it for
+   * a fresh `writeBuffer` overwrites the data before the queued reader runs,
+   * which manifests as later-step data leaking into earlier-step results.
+   *
+   * Use this anywhere a new buffer cache (arena, hint, slot) considers
+   * recycling an existing buffer. The pool's own `acquire()` doesn't go
+   * through this — its buckets are only populated post-fence (after
+   * `flushPendingToPool`) or post-submit (after `endSharedEncoder` resets
+   * the write set), so bucket residents are always recyclable.
+   */
+  canRecycle(buffer: GPUBuffer): boolean {
+    if (this.bufferLiveCount.has(buffer)) return false;
+    if (sharedEncoderActive && sharedEncoderWriteSet.has(buffer)) return false;
+    return true;
   }
 
   /** Mark a buffer as liveness-safe for immediate reuse during shared encoder. */

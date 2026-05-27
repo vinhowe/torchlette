@@ -273,7 +273,7 @@ export function destroyArena(arena: BufferArena, force = false): void {
     for (const buffer of arr) {
       if (buffer) {
         arenaBufferSet.delete(buffer);
-        if (force || !bufferPool.isLive(buffer)) {
+        if (force || bufferPool.canRecycle(buffer)) {
           gpuMemoryTracker.trackDeallocation(buffer);
           try {
             buffer.destroy();
@@ -296,30 +296,28 @@ function arenaAllocAt(
   const alignedSize = alignBufferSize(sizeBytes);
   const neededSizeClass = getSizeClass(alignedSize);
 
-  // Check if we already have a buffer at this position from a previous step
+  // Check if we already have a buffer at this position from a previous step.
+  // Reuse only when (a) the size class matches and (b) the buffer is safe
+  // to recycle right now — both ownership and in-flight encoder claims must
+  // be clear. See bufferPool.canRecycle for why both checks are required.
   const existing = arr[idx];
   if (existing) {
-    const existingSizeClass = getSizeClass(existing.size);
-    if (existingSizeClass === neededSizeClass && !bufferPool.isLive(existing)) {
-      // Perfect match, not referenced by any live tensor — safe to reuse
+    if (
+      getSizeClass(existing.size) === neededSizeClass &&
+      bufferPool.canRecycle(existing)
+    ) {
       trackSharedEncoderWrite(existing);
       return existing;
     }
-    // Either size class changed, or buffer is still live (referenced by a persistent
-    // tensor, e.g. model weight loaded by a shared plan template). In either case,
-    // remove from arena set and hand back to the pool's release chain so it gets
-    // properly destroyed once its refcount reaches zero (or reused if dead).
+    // Can't reuse here. Drop from arena set and let the normal release
+    // chain handle it: a live buffer's owner will release via tensor.destroy
+    // when the tensor goes away; an in-flight orphaned buffer is already in
+    // pendingRelease (queued by tensor.destroy) and will hit the pool after
+    // the next fence. Calling release() / deferredDestroy() here would
+    // double-track the buffer.
     arenaBufferSet.delete(existing);
     if (bufferPool.isLive(existing)) {
-      // Live buffer — owned by some other tensor. Just drop it from the
-      // arena set; when that tensor's destroy() eventually runs, it will
-      // route the buffer through the normal pool release chain.
-      // Calling release() here would create a duplicate pendingRelease
-      // entry pinned by the still-live owner's refcount → permanent leak.
       arenaLocal.conflictDetected = true;
-    } else {
-      // Dead buffer — destroy via the deferred queue (safe wrt GPU fences).
-      bufferPool.deferredDestroy(existing, existing.size);
     }
   }
 
