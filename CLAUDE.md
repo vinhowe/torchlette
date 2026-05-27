@@ -98,6 +98,8 @@ GPU memory is managed deterministically via two-tier reachability — no GC depe
 - Periodic reclamation between plan segments (flush + pool flush as separate calls)
 - The `sharedEncoderWriteSet` WAW check must be kept
 
+**Use `bufferPool.canRecycle(buf)` for any "is it safe to reuse?" decision in a buffer cache.** It checks both ownership (`bufferLiveCount`) AND in-flight encoder claims (`sharedEncoderWriteSet`). The pool's own `acquire()` doesn't need to call it — bucket residents are guaranteed safe by construction (only populated post-fence/flush). But any cache outside the pool — the buffer arena, hint maps, or future caches — must consult it before recycling, or it can hand out a buffer whose queued reader hasn't dispatched yet. That's the bug class behind the "later step's data leaks into earlier step's results" symptom (see `test/lifetime-natural-usage.spec.ts`).
+
 ## Performance Baselines (2026-03-25)
 
 ### Baseline A: DistilGPT-2, 512 tokens, Node/Dawn (V100)
