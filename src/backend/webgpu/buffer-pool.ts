@@ -529,16 +529,63 @@ class SimpleBufferPool {
   /**
    * Destroy all pending-destroy buffers. Only call after GPU sync
    * (queue.onSubmittedWorkDone()) to avoid "buffer destroyed while in use" errors.
+   *
+   * Each destroyed buffer is scrubbed from every other tracking set in the
+   * pool (`pool` buckets, `pendingRelease`, `pooledBufferSet`,
+   * `livenessSafeBuffers`, `bufferLiveCount`) to guarantee a destroyed buffer
+   * cannot be re-acquired by a future `acquire()` or `acquirePreferred()`.
+   * Without this scrub, a buffer ending up in BOTH pendingRelease (via
+   * `release()`) AND pendingDestroy (via a later `deferredDestroy()`) would
+   * be moved to the available pool by `flushPendingToPool` and then destroyed
+   * by `destroyPendingBuffers` — the next `acquire()` then hands out a
+   * destroyed buffer, and the next op's submit fails Dawn's
+   * "Buffer used in submit while destroyed" validation.
    */
   destroyPendingBuffers(): void {
+    if (this.pendingDestroy.length === 0) return;
+    const destroyed = new Set<GPUBuffer>();
     for (const { buffer } of this.pendingDestroy) {
+      destroyed.add(buffer);
       try {
         buffer.destroy();
       } catch {
-        // Ignore destroy errors (e.g. buffer already destroyed or invalid)
+        // Already destroyed or invalid — ignore.
       }
     }
     this.pendingDestroy = [];
+
+    // Scrub destroyed buffers from every other tracking set so a future
+    // acquire() / acquirePreferred() cannot hand out a destroyed GPUBuffer.
+    // Without this, a buffer that ends up in BOTH `pendingRelease` (via
+    // `release()`) AND `pendingDestroy` (via a later `deferredDestroy()`)
+    // would be promoted to a pool bucket by `flushPendingToPool` and then
+    // destroyed here — the next `acquire()` then hands out a destroyed
+    // buffer and Dawn's "Buffer used in submit while destroyed" validation
+    // fires at the next op's submit.
+    for (const buf of destroyed) {
+      this.pooledBufferSet.delete(buf);
+      this.livenessSafeBuffers.delete(buf);
+      this.bufferLiveCount.delete(buf);
+    }
+    for (const [sizeClass, bucket] of this.pool) {
+      const before = bucket.length;
+      const kept = bucket.filter((b) => !destroyed.has(b));
+      if (kept.length !== before) {
+        this.pool.set(sizeClass, kept);
+        this.pooledBytes -= (before - kept.length) * getSizeForClass(sizeClass);
+      }
+    }
+    if (this.pendingRelease.length > 0) {
+      const remaining: typeof this.pendingRelease = [];
+      let remainingBytes = 0;
+      for (const entry of this.pendingRelease) {
+        if (destroyed.has(entry.buffer)) continue;
+        remaining.push(entry);
+        remainingBytes += entry.size;
+      }
+      this.pendingRelease = remaining;
+      this.pendingReleaseBytes = remainingBytes;
+    }
   }
 
   /**
