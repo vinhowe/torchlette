@@ -131,21 +131,37 @@ async function fetchFreshTokens(
   const target = minTokens ?? INNER_STEPS * EFFECTIVE_BATCH * SEQ_LEN;
   let allText = "";
   let totalFetched = 0;
+  let consecutiveFailures = 0;
   // Fetch enough rows to cover one round of training
   while (true) {
     const offset = Math.floor(Math.random() * (HF_TOTAL_ROWS - HF_FETCH_ROWS));
     const url = `https://datasets-server.huggingface.co/rows?dataset=${HF_DATASET}&config=${HF_CONFIG}&split=train&offset=${offset}&length=${HF_FETCH_ROWS}`;
-    const resp = await fetch(url);
-    const data = await resp.json();
-    const text = data.rows.map((r: any) => r.row.text).join("\n\n");
-    allText += (allText ? "\n\n" : "") + text;
-    totalFetched += HF_FETCH_ROWS;
-    const tokens = tokenizer.encode(allText);
-    if (tokens.length >= target || totalFetched >= 1000) {
+    try {
+      const resp = await fetch(url, { signal: AbortSignal.timeout(30000) });
+      const ct = resp.headers.get("content-type") ?? "";
+      if (!resp.ok || !ct.includes("application/json")) {
+        throw new Error(`HF ${resp.status} ${ct.split(";")[0]}`);
+      }
+      const data = await resp.json();
+      if (!data.rows) throw new Error("HF response missing rows");
+      const text = data.rows.map((r: any) => r.row.text).join("\n\n");
+      allText += (allText ? "\n\n" : "") + text;
+      totalFetched += HF_FETCH_ROWS;
+      consecutiveFailures = 0;
+      const tokens = tokenizer.encode(allText);
+      if (tokens.length >= target || totalFetched >= 1000) {
+        log(
+          `Fetched ${tokens.length} tokens (${totalFetched} rows, target ${target})`,
+        );
+        return tokens;
+      }
+    } catch (e) {
+      consecutiveFailures++;
+      const wait = Math.min(60000, 2000 * 2 ** Math.min(consecutiveFailures, 5));
       log(
-        `Fetched ${tokens.length} tokens (${totalFetched} rows, target ${target})`,
+        `HF fetch failed (${consecutiveFailures}): ${(e as Error).message} — retry in ${wait / 1000}s`,
       );
-      return tokens;
+      await new Promise((r) => setTimeout(r, wait));
     }
   }
 }
