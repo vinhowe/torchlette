@@ -13,7 +13,7 @@
 
 import { clipGradNorm_ } from "../../nn/index.ts";
 import { normal_ } from "../../nn/init.ts";
-import { Adam } from "../../optim/index.ts";
+import { Adam, GradScaler } from "../../optim/index.ts";
 import type { Tensor } from "../../frontend/tensor.ts";
 import type { Torchlette } from "../../frontend/torchlette.ts";
 import { NesterovOuterOptimizer } from "../outer-optimizer.ts";
@@ -73,7 +73,7 @@ const defaultOpts = {
   loraAlpha: 1,
   fullFinetuning: true,
   checkpointing: true,
-  useAutocast: false,
+  useAutocast: true,
   gradClipNorm: 1.0,
 } as const;
 
@@ -94,6 +94,7 @@ export class WebGPUGPT2Trainer implements Trainer {
   private innerOpt!: Adam;
   private outerOpt!: NesterovOuterOptimizer;
   private accumGrads: Tensor[] = [];
+  private scaler: GradScaler | null = null;
 
   /** Anchor params snapshot on CPU. Updated by setAnchor / applyOuterStep. */
   private anchor: Float32Array[] = [];
@@ -188,6 +189,13 @@ export class WebGPUGPT2Trainer implements Trainer {
     this.accumGrads = this.params.map((p) =>
       this.api.zeros(p.shape, { device: "webgpu" }),
     );
+    if (this.opts.useAutocast) {
+      // GradScaler is required when forward runs in fp16 — without it,
+      // small-magnitude gradients underflow during the bf16/fp16 backward
+      // and training stalls (loss plateaus high). 1024 is the torchlette
+      // example default; the scaler auto-adjusts via inf detection.
+      this.scaler = new GradScaler(this.api, { initScale: 1024.0 });
+    }
     await this.api._runtime().forceAllPending();
 
     this.initialized = true;
@@ -249,8 +257,16 @@ export class WebGPUGPT2Trainer implements Trainer {
   ): Promise<number> {
     const api = this.api;
     const opts = this.opts;
+    const scaler = this.scaler;
     const maxStart = Math.max(1, tokens.length - opts.seqLen - 1);
     let totalLoss = 0;
+
+    if (scaler) {
+      // Reads back the inf-detection result from the previous step (no-op on
+      // the first step). Must run before scale() so the new scale factor is
+      // active for this step.
+      await scaler.resolveDeferred();
+    }
 
     for (const ag of this.accumGrads) api.zero_(ag);
 
@@ -283,7 +299,12 @@ export class WebGPUGPT2Trainer implements Trainer {
         return l;
       });
       totalLoss += await loss.item();
-      await loss.backward();
+      // Scale before backward so fp16 grads don't underflow; unscale before
+      // optimizer step below. With no scaler (autocast off), this is identity.
+      const backwardTarget = scaler ? scaler.scale(loss) : loss;
+      await backwardTarget.backward();
+      // Accumulate grads (in scaled space when using a scaler; unscale once
+      // at the end). 1/accum keeps the effective batch sized as configured.
       for (let i = 0; i < this.params.length; i++) {
         // biome-ignore lint/suspicious/noExplicitAny: tensor.grad isn't strongly typed
         const grad = (this.params[i] as any).grad;
@@ -304,10 +325,22 @@ export class WebGPUGPT2Trainer implements Trainer {
       // biome-ignore lint/suspicious/noExplicitAny: tensor._setGrad isn't strongly typed
       (this.params[i] as any)._setGrad(api.mul(this.accumGrads[i], 1));
     }
-    if (this.opts.gradClipNorm > 0) {
-      clipGradNorm_(api, this.params, this.opts.gradClipNorm);
+    if (scaler) {
+      // Unscale in place (also queues the inf detection that resolveDeferred
+      // will read on the next step). Then clip and step the optimizer through
+      // the scaler so an inf-found step is skipped and the scale backs off.
+      scaler.unscale_(this.innerOpt);
+      if (this.opts.gradClipNorm > 0) {
+        clipGradNorm_(api, this.params, this.opts.gradClipNorm);
+      }
+      scaler.step(this.innerOpt);
+      scaler.update();
+    } else {
+      if (this.opts.gradClipNorm > 0) {
+        clipGradNorm_(api, this.params, this.opts.gradClipNorm);
+      }
+      this.innerOpt.step();
     }
-    this.innerOpt.step();
     this.innerOpt.zeroGrad();
     api.endStep();
     await api.markStep();
