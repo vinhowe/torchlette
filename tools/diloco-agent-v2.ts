@@ -191,38 +191,40 @@ async function main(): Promise<void> {
     `Joined: peerId=${self?.peerId} cluster=${self?.clusterId}${self?.isHead ? "/head" : ""}`,
   );
 
+  const { getGPUMemoryStats: streamMem } = await import(
+    "../src/backend/webgpu/memory-tracker"
+  );
+  const { bufferPool: streamPool } = await import(
+    "../src/backend/webgpu/buffer-pool"
+  );
+  sm.onReport = (r) => {
+    const mem = streamMem();
+    const pool = streamPool.stats();
+    const rss = process.memoryUsage().rss;
+    console.error(
+      `STATS ${JSON.stringify({
+        t: new Date().toISOString(),
+        round: r.round,
+        anchor_round: r.anchorAfter,
+        outer_step: r.outerStepTaken,
+        contributors: r.contributors,
+        clusters: r.clustersContributed,
+        f16w_applied: r.f16wApplied,
+        loss: Number.isFinite(r.innerLoss) ? +r.innerLoss.toFixed(4) : null,
+        gpu_mb: Math.round(mem.currentBytes / 1e6),
+        peak_mb: Math.round(mem.peakBytes / 1e6),
+        pool_mb: Math.round(pool.pooledBytes / 1e6),
+        cpu_rss_mb: Math.round(rss / 1e6),
+      })}`,
+    );
+  };
   const reports = await sm.run(ROUNDS);
   log(
     `Training complete: ${reports.length} rounds, anchor=${sm.getAnchorRound()}`,
   );
 
-  // STATS lines for analyzer compatibility.
-  const { getGPUMemoryStats } = await import(
-    "../src/backend/webgpu/memory-tracker"
-  );
-  const { bufferPool: bp } = await import(
-    "../src/backend/webgpu/buffer-pool"
-  );
-  for (let i = 0; i < reports.length; i++) {
-    const r = reports[i];
-    const mem = getGPUMemoryStats();
-    const pool = bp.stats();
-    const rss = process.memoryUsage().rss;
-    const stats = {
-      t: new Date().toISOString(),
-      round: r.round,
-      anchor_round: r.anchorAfter,
-      outer_step: r.outerStepTaken,
-      contributors: r.contributors,
-      clusters: r.clustersContributed,
-      f16w_applied: r.f16wApplied,
-      gpu_mb: Math.round(mem.currentBytes / 1e6),
-      peak_mb: Math.round(mem.peakBytes / 1e6),
-      pool_mb: Math.round(pool.pooledBytes / 1e6),
-      cpu_rss_mb: Math.round(rss / 1e6),
-    };
-    console.error(`STATS ${JSON.stringify(stats)}`);
-  }
+  // Per-round STATS already streamed via sm.onReport; just summarize.
+  log(`Reports collected: ${reports.length}`);
 
   transport.close();
   await destroyWebGPU();

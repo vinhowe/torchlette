@@ -89,6 +89,8 @@ export interface RoundReport {
   /** Clusters that contributed an aggregate. */
   clustersContributed: number;
   f16wApplied: boolean;
+  /** Avg inner-step loss for this round (NaN if no inner steps ran). */
+  innerLoss: number;
 }
 
 export class HierarchicalBarrierStateMachine {
@@ -97,6 +99,7 @@ export class HierarchicalBarrierStateMachine {
 
   private currentRound: RoundNumber = 0;
   private anchorRound: AnchorRound = 0;
+  private lastInnerLoss = NaN;
 
   // Per-round buffers
   private readonly readySet = new Map<RoundNumber, Set<PeerId>>();
@@ -124,6 +127,8 @@ export class HierarchicalBarrierStateMachine {
   private needsSync = false;
 
   private running = false;
+  /** Optional per-round callback for streaming progress (e.g. STATS lines). */
+  onReport: ((r: RoundReport) => void) | undefined = undefined;
   private joined: Promise<void>;
   private waiters: Array<() => void> = [];
   private readonly transport: Transport;
@@ -174,6 +179,7 @@ export class HierarchicalBarrierStateMachine {
     while (this.running && this.currentRound < maxRounds) {
       const report = await this.runRound();
       reports.push(report);
+      this.onReport?.(report);
       this.currentRound++;
     }
     return reports;
@@ -253,10 +259,12 @@ export class HierarchicalBarrierStateMachine {
         contributors: 1,
         clustersContributed: 1,
         f16wApplied: true,
+        innerLoss: NaN,
       };
     }
 
-    await this.trainer.innerSteps(round);
+    const innerLoss = await this.trainer.innerSteps(round);
+    this.lastInnerLoss = innerLoss;
 
     const self = this.self;
     if (!self) {
@@ -433,6 +441,7 @@ export class HierarchicalBarrierStateMachine {
       contributors,
       clustersContributed,
       f16wApplied,
+      innerLoss: this.lastInnerLoss,
     };
   }
 
