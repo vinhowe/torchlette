@@ -250,15 +250,24 @@ async function createModel(api: Torchlette, _modelDir: string) {
 // ── f16 weight encoding for checkpoint sync ──
 // Frame body (after server strips routing prefix and re-prepends "F16W"):
 //   [F16W (4)][round (4 LE)][numParams (4 LE)][per-param: nel(4) + f16 data]
-function encodeCheckpointF16(ckptPath: string, round: number): Buffer {
+function encodeCheckpointF16(
+  ckptPath: string,
+  anchorRound: number,
+  currentRound: number,
+): Buffer {
   const buf = fs.readFileSync(ckptPath);
   let off = 0;
   const np = buf.readUInt32LE(off);
   off += 4;
   const parts: Buffer[] = [];
-  const roundBuf = Buffer.alloc(4);
-  roundBuf.writeUInt32LE(round, 0);
-  parts.push(roundBuf);
+  // Body starts with two 4-byte round identifiers: anchorRound is the
+  // consensus checkpoint id (mandatory match between peers before they can
+  // average pseudograds); currentRound is the training-counter the receiver
+  // should align to so the lag check doesn't reject every subsequent grad.
+  const roundsBuf = Buffer.alloc(8);
+  roundsBuf.writeUInt32LE(anchorRound, 0);
+  roundsBuf.writeUInt32LE(currentRound, 4);
+  parts.push(roundsBuf);
   const npBuf = Buffer.alloc(4);
   npBuf.writeUInt32LE(np, 0);
   parts.push(npBuf);
@@ -485,15 +494,28 @@ async function main() {
   let peerGrads: Float32Array[] | null = null;
   let peerTokenCount = 0;
   let peerRound = -1;
+  let peerAnchorRound = -1;
   let peerCount = 0;
   let myPeerId = "";
   let sendingWeights = false; // serialize weight sends
   let needsSync = false;
   let currentRound = 0;
+  // Anchor: the agreed-upon global parameter state, updated only after a
+  // successful outer step (matching pseudograds from matching anchors). All
+  // peers in lockstep on the anchor produce a deterministic outer step and
+  // therefore stay in lockstep on the next anchor. Diverged anchors mean
+  // peers' pseudograds are displacements from different origins and cannot
+  // be coherently averaged — trigger F16W resync instead.
+  let anchorRound = 0;
+  let globalSnapshot: Float32Array[] = [];
   // Late-join sync: store the F16W blob in the handler, parse + load it from
   // main() context. Mirrors the browser's pattern — handler is buffer-only,
   // engine work happens in the main coroutine.
-  let pendingSyncBlob: { body: Buffer; sourceRound: number } | null = null;
+  let pendingSyncBlob: {
+    body: Buffer;
+    sourceAnchorRound: number;
+    sourceCurrentRound: number;
+  } | null = null;
   let initialSyncResolver: (() => void) | null = null;
   const initialSyncPromise = new Promise<void>((r) => {
     initialSyncResolver = r;
@@ -546,7 +568,12 @@ async function main() {
         const ckptPath = "/tmp/diloco-webrtc-checkpoint.bin";
         if (fs.existsSync(ckptPath)) {
           sendingWeights = true;
-          const payload = encodeCheckpointF16(ckptPath, currentRound);
+          // The checkpoint on disk is globalSnapshot — i.e., anchor params.
+          // Stamp the blob with BOTH our anchorRound (consensus id; receiver
+          // sets their anchorRound to this) AND our currentRound (so the
+          // receiver's training counter aligns and lag checks don't reject
+          // every subsequent grad after a late-join with stale round counters).
+          const payload = encodeCheckpointF16(ckptPath, anchorRound, currentRound);
           const targetBuf = Buffer.from(msg.target, "utf8");
           const header = Buffer.alloc(6 + targetBuf.length);
           header.write("F16W", 0);
@@ -564,37 +591,45 @@ async function main() {
       return;
     } catch {
       const raw = Buffer.from(data);
-      if (raw.length > 8 && raw.toString("utf8", 0, 4) === "F16W") {
-        // Late-join weight sync: [F16W][round (4)][numParams (4)][per-param: nel + f16 data]
+      if (raw.length > 12 && raw.toString("utf8", 0, 4) === "F16W") {
+        // F16W weight sync. Two contexts:
+        //   - initial: registration set needsSync=true; we wait for this blob
+        //     before any training, then resume from sourceCurrentRound.
+        //   - mid-run: anchor mismatch with peer triggered request-weights;
+        //     main loop applies blob at top of next round to resync params,
+        //     anchor, currentRound, and outer-optimizer velocity.
+        // Wire format: [F16W (4)][anchorRound (4)][currentRound (4)][body...].
         // Handler is BUFFER-ONLY: store a COPY of the blob (raw.slice/subarray
         // return views — the underlying ws buffer can be recycled before main
-        // processes it). main() applies the weights in its own coroutine.
-        if (!initialSyncResolver) {
-          log(
-            `Ignoring F16W blob (${(raw.length / 1024 / 1024).toFixed(1)}MB): initial sync already complete`,
-          );
-        } else {
-          const sourceRound = raw.readUInt32LE(4);
-          // Buffer.from(buf) copies the bytes into a fresh allocation.
-          pendingSyncBlob = { body: Buffer.from(raw.subarray(8)), sourceRound };
-          log(
-            `Buffered F16W blob (${(raw.length / 1024 / 1024).toFixed(1)}MB, source round ${sourceRound}) — main will apply`,
-          );
+        // processes it).
+        const sourceAnchorRound = raw.readUInt32LE(4);
+        const sourceCurrentRound = raw.readUInt32LE(8);
+        pendingSyncBlob = {
+          body: Buffer.from(raw.subarray(12)),
+          sourceAnchorRound,
+          sourceCurrentRound,
+        };
+        log(
+          `Buffered F16W blob (${(raw.length / 1024 / 1024).toFixed(1)}MB, anchor r${sourceAnchorRound}, current r${sourceCurrentRound}) — main will apply`,
+        );
+        if (initialSyncResolver) {
           const resolver = initialSyncResolver;
           initialSyncResolver = null;
           resolver();
         }
-      } else if (raw.length > 16 && raw.toString("utf8", 0, 4) === "GRAD") {
+      } else if (raw.length > 20 && raw.toString("utf8", 0, 4) === "GRAD") {
         peerTokenCount = raw.readUInt32LE(4);
         peerRound = raw.readUInt32LE(8);
         const peerLoss = raw.readFloatLE(12);
-        peerGrads = deserializePseudoGrads(raw.slice(16));
+        peerAnchorRound = raw.readUInt32LE(16);
+        peerGrads = deserializePseudoGrads(raw.slice(20));
         log(
-          `Received ${(raw.length / 1024 / 1024).toFixed(1)}MB gradient (${peerTokenCount} tok, r${peerRound}, loss ${peerLoss.toFixed(2)})`,
+          `Received ${(raw.length / 1024 / 1024).toFixed(1)}MB gradient (${peerTokenCount} tok, r${peerRound}, anchor r${peerAnchorRound}, loss ${peerLoss.toFixed(2)})`,
         );
       } else {
         peerGrads = deserializePseudoGrads(raw);
-        log(`Received ${(raw.length / 1024 / 1024).toFixed(1)}MB gradient`);
+        peerAnchorRound = -1;
+        log(`Received ${(raw.length / 1024 / 1024).toFixed(1)}MB gradient (legacy, no anchor)`);
       }
     }
   };
@@ -677,15 +712,21 @@ async function main() {
       );
     } else if (pendingSyncBlob) {
       // Apply weights now, in main coroutine context.
-      const { body, sourceRound } = pendingSyncBlob;
+      const { body, sourceAnchorRound, sourceCurrentRound } = pendingSyncBlob;
       pendingSyncBlob = null;
       await applyF16WeightsToParams(api, params, body);
-      currentRound = sourceRound;
+      currentRound = sourceCurrentRound;
+      anchorRound = sourceAnchorRound;
       log(
-        `Synced weights into params (jumped to round ${sourceRound})`,
+        `Synced weights into params (anchor r${sourceAnchorRound}, current r${sourceCurrentRound})`,
       );
     }
   }
+
+  // Initialize anchor from whatever params we ended up with (random init,
+  // checkpoint resume, or F16W initial sync). After this, globalSnapshot is
+  // only mutated by the outer-step path and by mid-run F16W resync.
+  for (const p of params) globalSnapshot.push(new Float32Array(await p.cpu()));
 
   const tokensPerStep = EFFECTIVE_BATCH * SEQ_LEN;
   log(
@@ -700,9 +741,39 @@ async function main() {
 
   // ── Training loop ──
   let prevWarnCount = totalDawnWarnings;
+  let anchorResyncCount = 0;
   for (; currentRound < OUTER_ROUNDS; currentRound++) {
     const round = currentRound; // local alias for log/header use
     const roundStart = performance.now();
+
+    // Mid-run F16W resync: an anchor-mismatch request-weights from a previous
+    // round caused the relay to ship us a fresh F16W blob. Apply it BEFORE we
+    // start inner training so the round runs from the new shared anchor —
+    // BUT only if the blob actually advances us. Stale blobs from initial
+    // sync retries (relay-buffered F16Ws that arrived after we already
+    // synced) carry sourceAnchorRound ≤ our anchor and must be discarded,
+    // otherwise they undo legitimate outer steps.
+    if (pendingSyncBlob) {
+      const { body, sourceAnchorRound, sourceCurrentRound } = pendingSyncBlob;
+      pendingSyncBlob = null;
+      if (sourceAnchorRound > anchorRound) {
+        log(
+          `  mid-run F16W resync: anchor r${sourceAnchorRound}, current r${sourceCurrentRound}`,
+        );
+        await applyF16WeightsToParams(api, params, body);
+        globalSnapshot = [];
+        for (const p of params) globalSnapshot.push(new Float32Array(await p.cpu()));
+        anchorRound = sourceAnchorRound;
+        currentRound = sourceCurrentRound;
+        outerOpt.reset();
+        anchorResyncCount++;
+        continue;
+      }
+      log(
+        `  ignoring stale F16W blob (anchor r${sourceAnchorRound} <= self r${anchorRound})`,
+      );
+    }
+
     tokens = await fetchFreshTokens(tokenizer);
 
     const hasPeers = peerCount > 0;
@@ -712,9 +783,6 @@ async function main() {
     let roundLag = 0;
     let numContributors = 1;
     let tookOuterStep = false;
-    const globalSnapshot: Float32Array[] = [];
-    for (const p of params)
-      globalSnapshot.push(new Float32Array(await p.cpu()));
 
     const losses: number[] = [];
     for (let step = 0; step < INNER_STEPS; step++) {
@@ -747,21 +815,38 @@ async function main() {
         pseudoGrads.push(delta);
       }
 
-      // Send GRAD with 16-byte header: "GRAD" + u32 tokens + u32 round + f32 loss
+      // GRAD header (20 bytes): "GRAD" + u32 tokens + u32 round + f32 loss + u32 anchor_round.
+      // anchor_round tells the receiver which anchor this pseudograd was
+      // computed against. Peers can only safely average pseudograds that share
+      // an anchor — a mismatch means the deltas are displacements from different
+      // origins and merging them yields incoherent params.
       const avgLoss = losses.reduce((a, b) => a + b, 0) / losses.length;
       conn.send(JSON.stringify({ type: "request-neighbors", round }));
       const compressed = serializePseudoGrads(pseudoGrads);
-      const gradHeader = Buffer.alloc(16);
+      const gradHeader = Buffer.alloc(20);
       gradHeader.write("GRAD", 0);
       gradHeader.writeUInt32LE(INNER_STEPS * tokensPerStep, 4);
       gradHeader.writeUInt32LE(round, 8);
       gradHeader.writeFloatLE(avgLoss, 12);
+      gradHeader.writeUInt32LE(anchorRound, 16);
       conn.send(Buffer.concat([gradHeader, compressed]));
       log(
         `Sent ${(compressed.length / 1024 / 1024).toFixed(1)}MB gradients (round ${round})`,
       );
 
-      await new Promise((r) => setTimeout(r, 3000));
+      // Peer-grad wait window. Adaptive: poll for peerGrads up to a max
+      // timeout so fast peers don't pay full latency when peer has already
+      // delivered, while slow peers still get a chance to deliver. Default
+      // 3s preserves the original fixed-sleep behavior; bump PEER_WAIT_MS
+      // for heterogeneous peers where one side's inner step takes much
+      // longer than the other's.
+      {
+        const waitStart = Date.now();
+        const maxWait = parseInt(process.env.PEER_WAIT_MS ?? "3000", 10);
+        while (!peerGrads && Date.now() - waitStart < maxWait) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
 
       // Token-weighted + staleness-discounted averaging
       const myTokens = INNER_STEPS * tokensPerStep;
@@ -772,13 +857,33 @@ async function main() {
           avgGrads[p][j] += pseudoGrads[p][j] * myTokens;
 
       if (peerGrads && peerGrads.length === params.length) {
-        roundLag = peerRound >= 0 ? Math.abs(round - peerRound) : 0;
-        if (roundLag > 10) {
-          log(`  discarding stale gradient (${roundLag} rounds behind)`);
+        // ── Anchor-consistency check ──
+        // Two peers can only safely average pseudograds if both are
+        // displacements from the same anchor. Otherwise the merge applies one
+        // peer's gradient field at the other peer's location, which is noise
+        // proportional to the inter-anchor distance. Mismatch ⇒ refuse the
+        // merge and request an F16W resync from the peer that's ahead.
+        if (peerAnchorRound >= 0 && peerAnchorRound !== anchorRound) {
+          log(
+            `  anchor mismatch (peer anchor r${peerAnchorRound}, self anchor r${anchorRound}) — refusing merge`,
+          );
+          if (peerAnchorRound > anchorRound) {
+            log(`  we're behind — requesting F16W resync`);
+            conn.send(JSON.stringify({ type: "request-weights" }));
+          }
           peerGrads = null;
         } else {
+          // Anchors match. The lag check (currentRound difference) used to
+          // guard against averaging old grads from a stale peer, but with the
+          // anchor system "stale" means "from a different anchor" — which we
+          // already filtered above. A large currentRound diff under the same
+          // anchor just means peers spent different numbers of solo-revert
+          // rounds; the grads are still coherent displacements from the same
+          // origin. Keep the staleness-discount weighting but only as a soft
+          // down-weight, not a hard discard.
+          roundLag = peerRound >= 0 ? Math.abs(round - peerRound) : 0;
           const peerToks = peerTokenCount || myTokens;
-          const stalenessWeight = 0.7 ** roundLag;
+          const stalenessWeight = 0.7 ** Math.min(roundLag, 10);
           const effectiveToks = peerToks * stalenessWeight;
           totalTokens += effectiveToks;
           for (let p = 0; p < peerGrads.length; p++)
@@ -799,9 +904,32 @@ async function main() {
             avgGrads[p][j] /= totalTokens;
         await outerOpt.stepFromCpu(params, globalSnapshot, avgGrads);
         tookOuterStep = true;
-        log(`  averaged with ${numContributors} contributors`);
+        // Anchor advances: every peer who took this outer step did so with
+        // the same anchor + same averaged grad + same outer-opt math, so the
+        // post-step params are identical across peers. That shared point is
+        // the new anchor.
+        globalSnapshot = [];
+        for (const p of params) globalSnapshot.push(new Float32Array(await p.cpu()));
+        anchorRound = round + 1;
+        log(`  averaged with ${numContributors} contributors (new anchor r${anchorRound})`);
       } else {
-        log("  solo round — keeping local params");
+        // Solo round: inner training drifted local params in a direction not
+        // reconciled with any peer. Discard the drift by reverting to the
+        // anchor — keeps pseudograd magnitudes bounded across consecutive
+        // solo rounds and preserves the invariant that local-vs-anchor delta
+        // is always at most one round's worth of inner training.
+        log("  solo round — reverting local params to anchor");
+        await api.beginStep();
+        for (let i = 0; i < params.length; i++) {
+          api.copy_(
+            params[i],
+            api.tensorFromArray(globalSnapshot[i], params[i].shape, {
+              device: "webgpu",
+            }),
+          );
+        }
+        api.endStep();
+        await api.markStep();
       }
     }
 
@@ -858,6 +986,8 @@ async function main() {
         contributors: numContributors,
         lag: roundLag,
         outer_step: tookOuterStep,
+        anchor_round: anchorRound,
+        resyncs: anchorResyncCount,
         gpu_mb: Math.round(mem.currentBytes / 1e6),
         peak_mb: Math.round(mem.peakBytes / 1e6),
         pool_mb: Math.round(pool.pooledBytes / 1e6),

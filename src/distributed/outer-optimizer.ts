@@ -114,4 +114,14 @@ export class NesterovOuterOptimizer {
   dispose(): void {
     this.velocities.clear();
   }
+
+  /**
+   * Zero out momentum buffers. Use after an F16W resync — the velocity from
+   * before the resync was accumulated against an anchor that is no longer the
+   * one we're anchored to, so it would push params in a direction that is
+   * meaningless relative to the new anchor.
+   */
+  reset(): void {
+    for (const v of this.velocities.values()) v.fill(0);
+  }
 }
