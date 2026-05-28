@@ -11,6 +11,7 @@ import * as path from "node:path";
 import WebSocket from "ws";
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
 import { e3m0Dequantize, e3m0Quantize } from "../src/distributed/e3m0";
+import { faultInject } from "./diloco-fault-inject";
 import { NesterovOuterOptimizer } from "../src/distributed/outer-optimizer";
 import { Torchlette } from "../src/frontend/torchlette";
 import { clipGradNorm_ } from "../src/nn";
@@ -560,6 +561,7 @@ async function main() {
   });
 
   const messageHandler = async (data: Buffer) => {
+    if (faultInject.shouldDropIn(currentRound)) return;
     try {
       const msg = JSON.parse(data.toString());
       if (msg.type === "peer-joined") {
@@ -653,6 +655,7 @@ async function main() {
   const conn = {
     ws,
     send(data: Parameters<WebSocket["send"]>[0]) {
+      if (faultInject.shouldDropOut(currentRound)) return;
       if (this.ws.readyState === WebSocket.OPEN) this.ws.send(data);
     },
   };
