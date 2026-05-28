@@ -326,12 +326,22 @@ export class WebGPUGPT2Trainer implements Trainer {
       (this.params[i] as any)._setGrad(api.mul(this.accumGrads[i], 1));
     }
     if (scaler) {
-      // Unscale in place (also queues the inf detection that resolveDeferred
-      // will read on the next step). Then clip and step the optimizer through
-      // the scaler so an inf-found step is skipped and the scale backs off.
+      // GradScaler.unscale_ with a fused-Adam optimizer DEFERS the unscale
+      // into the optimizer kernel itself — it doesn't actually divide
+      // param.grad. That means a normal clipGradNorm_ called after unscale_
+      // sees grads still inflated by the scale factor (e.g. 1024), reads a
+      // huge norm, and clips every grad by ~scale*, effectively dividing the
+      // useful gradient by scale^2. To clip in the *unscaled* space without
+      // forcing an early grad rewrite, scale the threshold by the current
+      // scale factor instead — that's the equivalent operation against
+      // still-scaled grads.
       scaler.unscale_(this.innerOpt);
       if (this.opts.gradClipNorm > 0) {
-        clipGradNorm_(api, this.params, this.opts.gradClipNorm);
+        clipGradNorm_(
+          api,
+          this.params,
+          this.opts.gradClipNorm * scaler.getScale(),
+        );
       }
       scaler.step(this.innerOpt);
       scaler.update();
