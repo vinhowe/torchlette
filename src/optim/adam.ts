@@ -392,4 +392,20 @@ export class Adam {
       param.zeroGrad();
     }
   }
+
+  /**
+   * Reset moment estimates and step counts. Used when the optimizer's prior
+   * trajectory becomes meaningless — e.g., after a DiLoCo F16W resync where
+   * params jumped to a peer's anchor state and the m/v moments built up
+   * against the now-discarded local trajectory would push subsequent updates
+   * in a stale direction.
+   */
+  resetState(): void {
+    const runtime = this.api._runtime();
+    for (let i = 0; i < this.params.length; i++) {
+      this.expAvg[i] = runtime.zeros(this.params[i].shape, this.device);
+      this.expAvgSq[i] = runtime.zeros(this.params[i].shape, this.device);
+      this.steps[i] = 0;
+    }
+  }
 }

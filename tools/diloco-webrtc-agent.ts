@@ -497,7 +497,16 @@ async function main() {
   let peerAnchorRound = -1;
   let peerCount = 0;
   let myPeerId = "";
-  let sendingWeights = false; // serialize weight sends
+  // F16W send-side debounce: when the relay is slow to deliver an F16W blob,
+  // the requesting peer will re-send `request-weights` each round until it
+  // applies the resync, and the server fan-outs each request as a fresh
+  // `send-weights` to us. Without debouncing we re-encode and re-send 237MB
+  // per request, congesting the relay with redundant blobs. Skip a send if
+  // we've sent recently AND our anchor hasn't advanced (i.e., we'd be
+  // re-transmitting the same content).
+  let lastF16WSentMs = 0;
+  let lastF16WSentAnchor = -1;
+  const F16W_DEBOUNCE_MS = 10000;
   let needsSync = false;
   let currentRound = 0;
   // Anchor: the agreed-upon global parameter state, updated only after a
@@ -560,14 +569,18 @@ async function main() {
         peerCount = msg.peers;
         log(`Peer left: ${msg.peerId} (${msg.peers} total)`);
       } else if (msg.type === "send-weights") {
-        // Serialize: one weight send at a time
-        if (sendingWeights) {
-          log(`Already sending weights, skipping request from ${msg.target}`);
+        const now = Date.now();
+        if (
+          lastF16WSentAnchor === anchorRound &&
+          now - lastF16WSentMs < F16W_DEBOUNCE_MS
+        ) {
+          log(
+            `Skipping send-weights to ${msg.target}: same anchor r${anchorRound} sent ${((now - lastF16WSentMs) / 1000).toFixed(1)}s ago`,
+          );
           return;
         }
         const ckptPath = "/tmp/diloco-webrtc-checkpoint.bin";
         if (fs.existsSync(ckptPath)) {
-          sendingWeights = true;
           // The checkpoint on disk is globalSnapshot — i.e., anchor params.
           // Stamp the blob with BOTH our anchorRound (consensus id; receiver
           // sets their anchorRound to this) AND our currentRound (so the
@@ -580,10 +593,11 @@ async function main() {
           header.writeUInt16LE(targetBuf.length, 4);
           targetBuf.copy(header, 6);
           conn.send(Buffer.concat([header, payload]));
+          lastF16WSentMs = now;
+          lastF16WSentAnchor = anchorRound;
           log(
-            `Sent ${(payload.length / 1024 / 1024).toFixed(1)}MB weights (f16, round ${currentRound}) to ${msg.target}`,
+            `Sent ${(payload.length / 1024 / 1024).toFixed(1)}MB weights (f16, anchor r${anchorRound}) to ${msg.target}`,
           );
-          sendingWeights = false;
         } else {
           log(`No checkpoint yet, ${msg.target} will use random init`);
         }
@@ -765,6 +779,12 @@ async function main() {
         for (const p of params) globalSnapshot.push(new Float32Array(await p.cpu()));
         anchorRound = sourceAnchorRound;
         currentRound = sourceCurrentRound;
+        // F16W resync means we just jumped to a peer's anchor params — every
+        // prior optimizer moment was accumulated along a now-discarded
+        // trajectory and would push subsequent updates in a stale direction.
+        // Reset both inner Adam state and outer Nesterov velocity so the next
+        // round's optimizer step starts from a clean state at the new anchor.
+        innerOpt.resetState();
         outerOpt.reset();
         anchorResyncCount++;
         continue;
@@ -933,7 +953,10 @@ async function main() {
       }
     }
 
-    // Save checkpoint
+    // Save checkpoint via atomic rename — the send-weights handler reads the
+    // same file when responding to a peer's F16W request, and a torn read
+    // partway through a writeFileSync would ship corrupt params. fs.rename
+    // is atomic on POSIX within the same filesystem.
     if (globalSnapshot.length > 0) {
       const ckptParts: Buffer[] = [];
       const ckptHeader = Buffer.alloc(4);
@@ -947,10 +970,10 @@ async function main() {
         ckptParts.push(shapeBuf);
         ckptParts.push(Buffer.from(globalSnapshot[i].buffer));
       }
-      fs.writeFileSync(
-        "/tmp/diloco-webrtc-checkpoint.bin",
-        Buffer.concat(ckptParts),
-      );
+      const ckptPath = "/tmp/diloco-webrtc-checkpoint.bin";
+      const tmpPath = `${ckptPath}.tmp.${process.pid}`;
+      fs.writeFileSync(tmpPath, Buffer.concat(ckptParts));
+      fs.renameSync(tmpPath, ckptPath);
     }
 
     const elapsedSecRaw = (performance.now() - roundStart) / 1000;
