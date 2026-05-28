@@ -52,6 +52,10 @@ export interface WebGPUGPT2TrainerOptions {
   loraAlpha?: number;
   fullFinetuning?: boolean;
   checkpointing?: boolean;
+  /** Wrap forward in api.autocast (fp16 inputs to matmul). Defaults true. */
+  useAutocast?: boolean;
+  /** Clip gradient norm to this value before optimizer.step. 0 disables. */
+  gradClipNorm?: number;
   /** Logger; defaults to console.error. */
   log?: (msg: string) => void;
 }
@@ -69,6 +73,8 @@ const defaultOpts = {
   loraAlpha: 1,
   fullFinetuning: true,
   checkpointing: true,
+  useAutocast: false,
+  gradClipNorm: 1.0,
 } as const;
 
 export class WebGPUGPT2Trainer implements Trainer {
@@ -115,6 +121,8 @@ export class WebGPUGPT2Trainer implements Trainer {
       loraAlpha: merged.loraAlpha,
       fullFinetuning: merged.fullFinetuning,
       checkpointing: merged.checkpointing,
+      useAutocast: merged.useAutocast,
+      gradClipNorm: merged.gradClipNorm,
     };
   }
 
@@ -139,6 +147,19 @@ export class WebGPUGPT2Trainer implements Trainer {
     for (const p of this.params) {
       if (p.shape.length >= 2) normal_(this.api, p, 0, 0.02);
     }
+    // Zero out LoRA params so the LoRA branch is a no-op at init. The
+    // standard LoRA init is A~normal, B=0 — we re-randomized both above,
+    // which would make the LoRA delta contribute random noise on top of
+    // the base weights and slow early convergence. Setting both to zero
+    // makes the model behave like a plain GPT-2 until the LoRA params
+    // pick up signal through training (which never happens in
+    // fullFinetuning since we update the base directly).
+    for (const block of this.model.h) {
+      this.api.zero_(block.attn.cAttn.loraA);
+      this.api.zero_(block.attn.cAttn.loraB);
+      this.api.zero_(block.mlp.cFc.loraA);
+      this.api.zero_(block.mlp.cFc.loraB);
+    }
     await this.api._runtime().forceAllPending();
     this.opts.log(
       `Initialized GPT-2 (${this.params.length} param tensors, ${this.totalParamCount().toLocaleString()} elements)`,
@@ -153,7 +174,11 @@ export class WebGPUGPT2Trainer implements Trainer {
 
     this.innerOpt = new Adam(
       this.params,
-      { lr: this.opts.innerLr, weightDecay: this.opts.weightDecay },
+      {
+        lr: this.opts.innerLr,
+        weightDecay: this.opts.weightDecay,
+        adamW: true,
+      },
       this.api,
     );
     this.outerOpt = new NesterovOuterOptimizer(this.api, {
@@ -252,9 +277,8 @@ export class WebGPUGPT2Trainer implements Trainer {
         { device: "webgpu" },
       );
       const loss = api.tidy(() => {
-        const l = api.autocast(
-          () => this.model.forwardWithLoss(input, target).loss,
-        );
+        const fwd = () => this.model.forwardWithLoss(input, target).loss;
+        const l = this.opts.useAutocast ? api.autocast(fwd) : fwd();
         api.keep(l);
         return l;
       });
@@ -280,7 +304,9 @@ export class WebGPUGPT2Trainer implements Trainer {
       // biome-ignore lint/suspicious/noExplicitAny: tensor._setGrad isn't strongly typed
       (this.params[i] as any)._setGrad(api.mul(this.accumGrads[i], 1));
     }
-    clipGradNorm_(api, this.params, 1.0);
+    if (this.opts.gradClipNorm > 0) {
+      clipGradNorm_(api, this.params, this.opts.gradClipNorm);
+    }
     this.innerOpt.step();
     this.innerOpt.zeroGrad();
     api.endStep();
