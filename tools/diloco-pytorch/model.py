@@ -87,6 +87,15 @@ class GPT(nn.Module):
         self.head.weight = self.tok_emb.weight
 
         self.apply(self._init_weights)
+        # nanoGPT scaled-init for residual projections (GPT-2 paper §2.3):
+        # the output projection of each attention/MLP block is scaled down by
+        # 1/sqrt(2 * n_layer) so the residual stream variance stays ~constant
+        # with depth. Applied after the generic init above so it wins.
+        for pn, p in self.named_parameters():
+            if pn.endswith("proj.weight"):
+                nn.init.normal_(
+                    p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer)
+                )
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):

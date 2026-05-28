@@ -102,6 +102,29 @@ def main() -> None:
     token_source.load()
     rng = np.random.default_rng(seed)
 
+    # Optional shared window offsets (cross-framework parity). When set, the
+    # per-step batch windows come from this file instead of `rng`, so
+    # torchlette and PyTorch slice bit-identical token windows.
+    window_offsets = None
+    wo_path = os.environ.get("WINDOW_OFFSETS")
+    if wo_path and os.path.exists(wo_path):
+        window_offsets = np.fromfile(wo_path, dtype=np.int32)
+        log(f"shared window offsets: {window_offsets.size} from {wo_path}")
+
+    def windows_for(step_index: int):
+        """Return (inputs_np, targets_np) for the given global inner-step
+        index, sampling from shared offsets if provided else `rng`."""
+        toks = token_source.load()
+        if window_offsets is not None:
+            base = step_index * batch_size
+            starts = window_offsets[base : base + batch_size]
+            ins = np.stack([toks[s : s + seq_len] for s in starts]).astype(np.int64)
+            tgs = np.stack(
+                [toks[s + 1 : s + 1 + seq_len] for s in starts]
+            ).astype(np.int64)
+            return ins, tgs
+        return token_source.sample_window(seq_len, batch_size, rng)
+
     def save_ckpt(tag: str) -> None:
         if not ckpt_path:
             return
@@ -132,9 +155,8 @@ def main() -> None:
         for step in range(inner_steps):
             optimizer.zero_grad(set_to_none=True)
             for acc in range(accum_steps):
-                inputs_np, targets_np = token_source.sample_window(
-                    seq_len, batch_size, rng
-                )
+                global_step = (r * inner_steps + step) * accum_steps + acc
+                inputs_np, targets_np = windows_for(global_step)
                 inputs = torch.from_numpy(inputs_np).to(device, non_blocking=True)
                 targets = torch.from_numpy(targets_np).to(device, non_blocking=True)
                 if use_amp:

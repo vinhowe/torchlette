@@ -56,6 +56,17 @@ export interface WebGPUGPT2TrainerOptions {
   useAutocast?: boolean;
   /** Clip gradient norm to this value before optimizer.step. 0 disables. */
   gradClipNorm?: number;
+  /**
+   * Override window-start sampling. Given the linear inner-step index and
+   * batch size, returns `batchSize` start offsets into the token cache.
+   * Defaults to a per-step LCG. Used by the cross-framework parity harness
+   * to feed bit-identical windows to torchlette and the PyTorch baseline.
+   */
+  sampleWindowStarts?: (
+    stepIndex: number,
+    batchSize: number,
+    maxStart: number,
+  ) => number[];
   /** Logger; defaults to console.error. */
   log?: (msg: string) => void;
 }
@@ -98,9 +109,15 @@ export class WebGPUGPT2Trainer implements Trainer {
 
   private initialized = false;
   private tokensCache: ArrayLike<number> | null = null;
+  private readonly sampleWindowStarts?: (
+    stepIndex: number,
+    batchSize: number,
+    maxStart: number,
+  ) => number[];
 
   constructor(opts: WebGPUGPT2TrainerOptions) {
     this.api = opts.api;
+    this.sampleWindowStarts = opts.sampleWindowStarts;
     const merged = { ...defaultOpts, ...opts };
     this.opts = {
       api: opts.api,
@@ -142,11 +159,24 @@ export class WebGPUGPT2Trainer implements Trainer {
     });
     this.params = this.model.parameters();
 
-    // Seed-init via PyTorch-style normal_ for matrix-rank params (matches
-    // the GPT-2 paper init the PyTorch baseline uses; defaults for Linear/
-    // Embedding in the nn library are kaiming_uniform).
-    for (const p of this.params) {
-      if (p.shape.length >= 2) normal_(this.api, p, 0, 0.02);
+    // nanoGPT / GPT-2 paper init (must match the PyTorch baseline exactly):
+    //   - Linear/Embedding weight (2D ".weight"): N(0, 0.02)
+    //   - residual output projections (".cProj.weight"): N(0, 0.02/sqrt(2L))
+    //     — scaled down so residual-stream variance stays ~constant with
+    //     depth (GPT-2 §2.3). Both attention and MLP output projections.
+    //   - bias (".bias"): 0
+    //   - LayerNorm weight (1D ".weight"): leave at nn default (1.0)
+    const numLayers = this.opts.modelConfig.numLayers;
+    const residStd = 0.02 / Math.sqrt(2 * numLayers);
+    for (const [name, p] of this.model.namedParameters()) {
+      if (name.endsWith(".bias")) {
+        this.api.zero_(p);
+      } else if (name.endsWith("cProj.weight")) {
+        normal_(this.api, p, 0, residStd);
+      } else if (p.shape.length >= 2) {
+        normal_(this.api, p, 0, 0.02);
+      }
+      // 1D ".weight" (LayerNorm scale) stays at its nn default of 1.0.
     }
     await this.api._runtime().forceAllPending();
     this.opts.log(
@@ -227,8 +257,9 @@ export class WebGPUGPT2Trainer implements Trainer {
 
     let totalLoss = 0;
     for (let step = 0; step < this.opts.innerSteps; step++) {
-      const offset = (round * this.opts.innerSteps + step) * tokensPerStep;
-      totalLoss += await this.singleInnerStep(tokens, offset);
+      const stepIndex = round * this.opts.innerSteps + step;
+      const offset = stepIndex * tokensPerStep;
+      totalLoss += await this.singleInnerStep(tokens, offset, stepIndex);
     }
     return totalLoss / this.opts.innerSteps;
   }
@@ -236,6 +267,7 @@ export class WebGPUGPT2Trainer implements Trainer {
   private async singleInnerStep(
     tokens: ArrayLike<number>,
     offset: number,
+    stepIndex: number,
   ): Promise<number> {
     const api = this.api;
     const opts = this.opts;
@@ -259,10 +291,22 @@ export class WebGPUGPT2Trainer implements Trainer {
       const microOffset = microOffsetBase + acc * opts.batchSize * opts.seqLen;
       const inputData: number[] = [];
       const targetData: number[] = [];
-      let rng = (microOffset * 2654435761) >>> 0;
+      // Window starts come from the injected sampler if present (parity
+      // harness feeds shared offsets), else a per-step LCG.
+      let starts: number[];
+      if (this.sampleWindowStarts) {
+        const microStepIndex = stepIndex * opts.accumSteps + acc;
+        starts = this.sampleWindowStarts(microStepIndex, opts.batchSize, maxStart);
+      } else {
+        starts = [];
+        let rng = (microOffset * 2654435761) >>> 0;
+        for (let b = 0; b < opts.batchSize; b++) {
+          rng = ((rng * 1103515245 + 12345) & 0x7fffffff) >>> 0;
+          starts.push(rng % maxStart);
+        }
+      }
       for (let b = 0; b < opts.batchSize; b++) {
-        rng = ((rng * 1103515245 + 12345) & 0x7fffffff) >>> 0;
-        const start = rng % maxStart;
+        const start = starts[b]!;
         for (let i = 0; i < opts.seqLen; i++) {
           inputData.push(tokens[start + i]);
           targetData.push(tokens[start + i + 1]);

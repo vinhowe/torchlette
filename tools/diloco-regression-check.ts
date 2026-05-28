@@ -29,15 +29,15 @@ const TOKENS_PATH =
 
 // Baseline trajectory recorded 2026-05-28 on dw-2-1 V100, AC ON + scaler +
 // AdamW + plain GPT2 (no LoRA wrapper) + no-accumGrads path + selective
-// checkpointing. Loss should descend monotonically past these checkpoints.
-// Tolerance accounts for small variance from scaler scale adjustments +
-// nondeterministic kernel reductions; if you see a regression > 0.4 nats
-// here, something broke training.
+// checkpointing + nanoGPT init (scaled residual projections, zeroed biases).
+// Loss should descend monotonically past these checkpoints. Tolerance
+// accounts for small variance from scaler scale adjustments + nondeterministic
+// kernel reductions; a regression > 0.4 nats here means training broke.
 const BASELINE: Record<number, number> = {
   0: 9.55,
-  3: 6.08,
-  6: 5.75,
-  9: 5.28,
+  3: 5.77,
+  6: 5.18,
+  9: 4.85,
 };
 const LOSS_TOLERANCE = 0.4;
 // Steady-state peak GPU memory tolerance (after warmup): catches leaks
