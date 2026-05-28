@@ -31,6 +31,7 @@ import {
 } from "../src/distributed/protocol/webgpu-gpt2-trainer";
 import { WebSocketRelayTransport } from "../src/distributed/transports/websocket-relay";
 import { Torchlette } from "../src/frontend/torchlette";
+import { saveCheckpoint } from "./diloco-checkpoint";
 
 // ── Config ──
 const SEED = parseInt(process.env.SEED ?? "42", 10);
@@ -176,12 +177,13 @@ async function main(): Promise<void> {
     log,
   });
 
+  const dlMs = parseInt(process.env.DEADLINE_MS ?? "60000", 10);
   const sm = new HierarchicalBarrierStateMachine(transport, trainer, {
     quorumMin: QUORUM_MIN,
     quorumTargetFrac: QUORUM_TARGET_FRAC,
-    intraDeadlineMs: 60_000,
-    interDeadlineMs: 60_000,
-    globalDeadlineMs: 60_000,
+    intraDeadlineMs: dlMs,
+    interDeadlineMs: dlMs,
+    globalDeadlineMs: dlMs,
     f16wDebounceMs: 10_000,
   });
 
@@ -197,6 +199,17 @@ async function main(): Promise<void> {
   const { bufferPool: streamPool } = await import(
     "../src/backend/webgpu/buffer-pool"
   );
+  const ckptPath = process.env.CHECKPOINT_PATH;
+  const ckptEvery = parseInt(process.env.CHECKPOINT_EVERY ?? "10", 10);
+  const writeCkpt = async (tag: string) => {
+    if (!ckptPath) return;
+    const params = await trainer.snapshotAnchor();
+    const shapes = trainer.paramShapes();
+    fs.mkdirSync(path.dirname(ckptPath), { recursive: true });
+    saveCheckpoint(ckptPath, shapes, params);
+    log(`Checkpoint saved (${tag}): ${ckptPath} (${params.length} tensors)`);
+  };
+  let ckptInFlight = false;
   sm.onReport = (r) => {
     const mem = streamMem();
     const pool = streamPool.stats();
@@ -217,14 +230,43 @@ async function main(): Promise<void> {
         cpu_rss_mb: Math.round(rss / 1e6),
       })}`,
     );
+    if (
+      ckptPath &&
+      r.outerStepTaken &&
+      r.anchorAfter % ckptEvery === 0 &&
+      !ckptInFlight
+    ) {
+      ckptInFlight = true;
+      writeCkpt(`anchor=${r.anchorAfter}`).finally(() => {
+        ckptInFlight = false;
+      });
+    }
   };
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log("SIGTERM/SIGINT received — saving checkpoint and exiting");
+    try {
+      await writeCkpt("shutdown");
+    } catch (e) {
+      log(`shutdown checkpoint failed: ${e}`);
+    }
+    transport.close();
+    await destroyWebGPU();
+    process.exit(0);
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
   const reports = await sm.run(ROUNDS);
   log(
     `Training complete: ${reports.length} rounds, anchor=${sm.getAnchorRound()}`,
   );
 
-  // Per-round STATS already streamed via sm.onReport; just summarize.
+  // Per-round STATS streamed via sm.onReport; periodic checkpoint saves
+  // there too. Final save at end-of-run.
   log(`Reports collected: ${reports.length}`);
+  await writeCkpt("final");
 
   transport.close();
   await destroyWebGPU();
