@@ -166,6 +166,18 @@ export class WebGPUGPT2Trainer implements Trainer {
     await this.api._runtime().forceAllPending();
 
     this.initialized = true;
+
+    // Populate the anchor from the initialized params so snapshotAnchor()
+    // never returns empty. The state machine will call setAnchor() again
+    // before training starts, but other peers may request F16W in the gap
+    // between transport registration and run() — they need real params,
+    // not an empty array. Setting it here makes the trainer's anchor
+    // invariant "always reflects some valid params" hold post-init.
+    const anchor: Float32Array[] = [];
+    for (const p of this.params) {
+      anchor.push(new Float32Array(await p.cpu()));
+    }
+    this.anchor = anchor;
   }
 
   paramShapes(): ParamShapes {
