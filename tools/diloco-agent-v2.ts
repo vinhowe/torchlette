@@ -81,6 +81,39 @@ async function loadTokenizer(modelDir: string) {
   return tokenizer;
 }
 
+/**
+ * Reads a pre-tokenized TinyStories blob (uint16 token ids) from disk and
+ * returns deterministic random windows. Lets torchlette training match the
+ * PyTorch baseline's data pipeline (which reads the same .bin file), so
+ * convergence comparisons aren't muddied by HF datasets-server variance.
+ */
+class LocalTokenSource implements TokenSource {
+  private cached: Uint16Array | null = null;
+  constructor(
+    private readonly path: string,
+    private readonly seed: number,
+  ) {}
+  private load(): Uint16Array {
+    if (this.cached) return this.cached;
+    const buf = fs.readFileSync(this.path);
+    this.cached = new Uint16Array(
+      buf.buffer,
+      buf.byteOffset,
+      buf.byteLength / 2,
+    );
+    log(`Local tokens: ${this.cached.length.toLocaleString()} from ${this.path}`);
+    return this.cached;
+  }
+  async fetch(_minTokens: number): Promise<ArrayLike<number>> {
+    // Return the entire Uint16Array as ArrayLike<number>. The trainer
+    // indexes into it with `(round * inner_steps + step) * tokens_per_step`
+    // % maxStart — with a ~474M-token cache that spreads inner-step
+    // windows across diverse stories, matching PyTorch's random-window
+    // behavior closely enough for convergence comparison. No copy.
+    return this.load();
+  }
+}
+
 class HFTokenSource implements TokenSource {
   // biome-ignore lint/suspicious/noExplicitAny: tokenizer type comes from a dynamic import
   constructor(private readonly tokenizer: any) {}
@@ -141,8 +174,14 @@ async function main(): Promise<void> {
   const api = new Torchlette("webgpu", { enableFusion: true });
   api.manualSeed(SEED);
 
-  const tokenizer = await loadTokenizer(MODEL_DIR);
-  const tokenSource = new HFTokenSource(tokenizer);
+  const localTokensPath = process.env.LOCAL_TOKENS;
+  let tokenSource: TokenSource;
+  if (localTokensPath) {
+    tokenSource = new LocalTokenSource(localTokensPath, SEED);
+  } else {
+    const tokenizer = await loadTokenizer(MODEL_DIR);
+    tokenSource = new HFTokenSource(tokenizer);
+  }
 
   const trainer = new WebGPUGPT2Trainer({
     api,

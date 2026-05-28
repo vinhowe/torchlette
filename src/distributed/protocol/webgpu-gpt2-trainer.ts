@@ -31,9 +31,11 @@ export interface GPT2ModelConfig {
 export interface TokenSource {
   /**
    * Fetch at least `minTokens` tokens for the next round's inner training.
-   * Implementations may cache, prefetch, retry, etc.
+   * Implementations may cache, prefetch, retry, etc. Returning ArrayLike
+   * (not just number[]) lets callers pass a Uint16Array directly without
+   * a number[] copy — important when the cache is hundreds of MB.
    */
-  fetch(minTokens: number): Promise<number[]>;
+  fetch(minTokens: number): Promise<ArrayLike<number>>;
 }
 
 export interface WebGPUGPT2TrainerOptions {
@@ -100,7 +102,7 @@ export class WebGPUGPT2Trainer implements Trainer {
   private anchor: Float32Array[] = [];
 
   private initialized = false;
-  private tokensCache: number[] | null = null;
+  private tokensCache: ArrayLike<number> | null = null;
 
   constructor(opts: WebGPUGPT2TrainerOptions) {
     this.api = opts.api;
@@ -254,7 +256,7 @@ export class WebGPUGPT2Trainer implements Trainer {
   }
 
   private async singleInnerStep(
-    tokens: number[],
+    tokens: ArrayLike<number>,
     offset: number,
   ): Promise<number> {
     const api = this.api;
@@ -270,27 +272,43 @@ export class WebGPUGPT2Trainer implements Trainer {
       await scaler.resolveDeferred();
     }
 
-    for (const ag of this.accumGrads) api.zero_(ag);
-
+    // Build per-batch random window starts for every microbatch up front.
+    // The LCG is seeded per-step so two peers with the same SEED + cache
+    // see the same windows — important for the regression harness.
+    const microOffsetBase = offset;
+    const innerStepBatches: { input: number[]; target: number[] }[] = [];
     for (let acc = 0; acc < opts.accumSteps; acc++) {
-      const microOffset = offset + acc * opts.batchSize * opts.seqLen;
+      const microOffset = microOffsetBase + acc * opts.batchSize * opts.seqLen;
       const inputData: number[] = [];
       const targetData: number[] = [];
+      let rng = (microOffset * 2654435761) >>> 0;
       for (let b = 0; b < opts.batchSize; b++) {
-        const start = (microOffset + b * opts.seqLen) % maxStart;
+        rng = ((rng * 1103515245 + 12345) & 0x7fffffff) >>> 0;
+        const start = rng % maxStart;
         for (let i = 0; i < opts.seqLen; i++) {
           inputData.push(tokens[start + i]);
           targetData.push(tokens[start + i + 1]);
         }
       }
+      innerStepBatches.push({ input: inputData, target: targetData });
+    }
+
+    // accumSteps=1: single forward+backward+step inside one beginStep,
+    // matching the standalone regression harness exactly. Skipping the
+    // accumGrads dance is both an FLOP saving and a precision win — the
+    // extra mul(accumGrads, 1) lazy op introduces an additional materialization
+    // boundary that produced a measurable ~0.7-0.8 nat convergence gap vs.
+    // the no-accum path.
+    if (opts.accumSteps === 1) {
+      const batch = innerStepBatches[0]!;
       await api.beginStep();
       const input = api.tensorFromArray(
-        inputData,
+        batch.input,
         [opts.batchSize, opts.seqLen],
         { device: "webgpu" },
       );
       const target = api.tensorFromArray(
-        targetData,
+        batch.target,
         [opts.batchSize, opts.seqLen],
         { device: "webgpu" },
       );
@@ -301,12 +319,58 @@ export class WebGPUGPT2Trainer implements Trainer {
         return l;
       });
       totalLoss += await loss.item();
-      // Scale before backward so fp16 grads don't underflow; unscale before
-      // optimizer step below. With no scaler (autocast off), this is identity.
       const backwardTarget = scaler ? scaler.scale(loss) : loss;
       await backwardTarget.backward();
-      // Accumulate grads (in scaled space when using a scaler; unscale once
-      // at the end). 1/accum keeps the effective batch sized as configured.
+      if (scaler) {
+        scaler.unscale_(this.innerOpt);
+        if (this.opts.gradClipNorm > 0) {
+          clipGradNorm_(
+            api,
+            this.params,
+            this.opts.gradClipNorm * scaler.getScale(),
+          );
+        }
+        scaler.step(this.innerOpt);
+        scaler.update();
+      } else {
+        if (this.opts.gradClipNorm > 0) {
+          clipGradNorm_(api, this.params, this.opts.gradClipNorm);
+        }
+        this.innerOpt.step();
+      }
+      this.innerOpt.zeroGrad();
+      input.dispose();
+      target.dispose();
+      api.endStep();
+      await api.markStep();
+      return totalLoss / opts.accumSteps;
+    }
+
+    // accumSteps>1: accumulate gradients across micro-batches, then step.
+    for (const ag of this.accumGrads) api.zero_(ag);
+
+    for (let acc = 0; acc < opts.accumSteps; acc++) {
+      const batch = innerStepBatches[acc]!;
+      await api.beginStep();
+      const input = api.tensorFromArray(
+        batch.input,
+        [opts.batchSize, opts.seqLen],
+        { device: "webgpu" },
+      );
+      const target = api.tensorFromArray(
+        batch.target,
+        [opts.batchSize, opts.seqLen],
+        { device: "webgpu" },
+      );
+      const loss = api.tidy(() => {
+        const fwd = () => this.model.forwardWithLoss(input, target).loss;
+        const l = this.opts.useAutocast ? api.autocast(fwd) : fwd();
+        api.keep(l);
+        return l;
+      });
+      totalLoss += await loss.item();
+      const backwardTarget = scaler ? scaler.scale(loss) : loss;
+      await backwardTarget.backward();
       for (let i = 0; i < this.params.length; i++) {
         // biome-ignore lint/suspicious/noExplicitAny: tensor.grad isn't strongly typed
         const grad = (this.params[i] as any).grad;
@@ -328,15 +392,6 @@ export class WebGPUGPT2Trainer implements Trainer {
       (this.params[i] as any)._setGrad(api.mul(this.accumGrads[i], 1));
     }
     if (scaler) {
-      // GradScaler.unscale_ with a fused-Adam optimizer DEFERS the unscale
-      // into the optimizer kernel itself — it doesn't actually divide
-      // param.grad. That means a normal clipGradNorm_ called after unscale_
-      // sees grads still inflated by the scale factor (e.g. 1024), reads a
-      // huge norm, and clips every grad by ~scale*, effectively dividing the
-      // useful gradient by scale^2. To clip in the *unscaled* space without
-      // forcing an early grad rewrite, scale the threshold by the current
-      // scale factor instead — that's the equivalent operation against
-      // still-scaled grads.
       scaler.unscale_(this.innerOpt);
       if (this.opts.gradClipNorm > 0) {
         clipGradNorm_(

@@ -58,6 +58,9 @@ def main() -> None:
     n_layer = env_int("NUM_LAYERS", 8)
     n_head = env_int("NUM_HEADS", 4)
     n_embed = env_int("EMBED_DIM", 128)
+    use_amp = os.environ.get("USE_AMP", "0") == "1"
+    amp_dtype_name = os.environ.get("AMP_DTYPE", "float16")
+    amp_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[amp_dtype_name]
     ckpt_path = os.environ.get("CHECKPOINT_PATH")
     ckpt_every = env_int("CHECKPOINT_EVERY", 10)
 
@@ -83,6 +86,16 @@ def main() -> None:
         betas=(0.9, 0.999),
         eps=1e-8,
         weight_decay=weight_decay,
+    )
+    # Only use GradScaler for fp16 — bf16 doesn't underflow the same way and
+    # doesn't need scaling (PyTorch's GradScaler is a no-op for bf16 anyway).
+    scaler = (
+        torch.amp.GradScaler("cuda", init_scale=1024.0)
+        if use_amp and amp_dtype == torch.float16
+        else None
+    )
+    log(
+        f"AMP: enabled={use_amp} dtype={amp_dtype_name} scaler={'on' if scaler else 'off'}"
     )
 
     token_source = LocalTokenSource()
@@ -124,12 +137,26 @@ def main() -> None:
                 )
                 inputs = torch.from_numpy(inputs_np).to(device, non_blocking=True)
                 targets = torch.from_numpy(targets_np).to(device, non_blocking=True)
-                _, loss = model(inputs, targets)
-                (loss / accum_steps).backward()
+                if use_amp:
+                    with torch.amp.autocast("cuda", dtype=amp_dtype):
+                        _, loss = model(inputs, targets)
+                else:
+                    _, loss = model(inputs, targets)
+                scaled = (loss / accum_steps)
+                if scaler is not None:
+                    scaler.scale(scaled).backward()
+                else:
+                    scaled.backward()
                 total_loss += loss.item()
             if grad_clip > 0:
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
 
         avg_loss = total_loss / (inner_steps * accum_steps)
         dt = time.time() - t0
