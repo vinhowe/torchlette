@@ -50,6 +50,12 @@ export interface JoinMessage {
  * Sent by the coordinator (relay) to a joining peer with their cluster
  * assignment and the current swarm view. Receipt of this message is when
  * the peer transitions from "connecting" to "training".
+ *
+ * `needsSync` is true if other peers were already in the swarm when this
+ * one joined — i.e., there is consensus state we don't yet have. State
+ * machines use it to proactively request an F16W resync before they
+ * start training, rather than waiting for the slower anchor-mismatch
+ * path on the first peer-grad exchange.
  */
 export interface JoinAckMessage {
   type: "join-ack";
@@ -57,6 +63,7 @@ export interface JoinAckMessage {
   clusterId: ClusterId;
   isHead: boolean;
   peers: PeerInfo[];
+  needsSync: boolean;
 }
 
 /**

@@ -1,18 +1,13 @@
 /**
- * WebSocket Transport for the v2 DiLoCo relay server.
+ * Browser-side WebSocket Transport.
  *
- * Wire format (see server/diloco-server-v2.cjs):
- *   - Text frames: JSON {from, target, msg} for small protocol messages.
- *   - Binary frames: [u32 envelope_len LE][envelope JSON utf-8][payload]
- *     for messages carrying Float32Array[] (grad, F16W). The envelope
- *     mirrors the text JSON plus tensorShapes for payload reconstruction.
- *
- * The server's `registered` reply is translated to our JoinAck shape
- * before delivery so the state machine sees the same protocol message
- * it sees against InProcessBus.
+ * Mirrors WebSocketRelayTransport (Node) but uses the browser's global
+ * WebSocket, ArrayBuffer-based binary frames, and addEventListener-style
+ * event handling. Wire format is identical — same envelope JSON, same
+ * length-prefixed binary layout — so a browser peer is indistinguishable
+ * from a Node peer to the relay.
  */
 
-import WebSocket from "ws";
 import type {
   GradMessage,
   JoinAckMessage,
@@ -24,13 +19,10 @@ import type {
 } from "../protocol/messages.ts";
 import type { Transport } from "../protocol/transport.ts";
 
-export interface WebSocketRelayTransportOptions {
+export interface WebSocketBrowserTransportOptions {
   serverUrl: string;
   peerId: PeerId;
   model?: string;
-  /** Override max websocket payload size (bytes). Default 500 MB. */
-  maxPayload?: number;
-  /** Logger; defaults to console.error. */
   log?: (msg: string) => void;
 }
 
@@ -38,38 +30,34 @@ interface Envelope {
   from: PeerId;
   target: SendTarget;
   msg: ProtocolMessage;
-  /** Per-tensor shapes for binary-frame payload reconstruction. */
   tensorShapes?: number[][];
 }
 
 const FOUR = 4;
 
-function concatFloat32Buffers(arrays: Float32Array[]): Buffer {
+function concatFloat32(arrays: Float32Array[]): ArrayBuffer {
   let total = 0;
   for (const a of arrays) total += a.byteLength;
-  const out = Buffer.alloc(total);
+  const out = new Uint8Array(total);
   let pos = 0;
   for (const a of arrays) {
-    Buffer.from(a.buffer, a.byteOffset, a.byteLength).copy(out, pos);
+    out.set(
+      new Uint8Array(a.buffer, a.byteOffset, a.byteLength),
+      pos,
+    );
     pos += a.byteLength;
   }
-  return out;
+  return out.buffer;
 }
 
-function splitFloat32Buffers(
-  payload: Buffer,
-  shapes: number[][],
-): Float32Array[] {
+function splitFloat32(buf: ArrayBuffer, shapes: number[][]): Float32Array[] {
   const out: Float32Array[] = [];
   let pos = 0;
   for (const shape of shapes) {
     const n = shape.reduce((a, b) => a * b, 1);
     const bytes = n * 4;
-    // Copy into a fresh allocation so the underlying Node buffer can be
-    // garbage-collected independently of the long-lived param tensors.
-    const slice = payload.subarray(pos, pos + bytes);
     const arr = new Float32Array(n);
-    Buffer.from(arr.buffer).set(slice);
+    new Uint8Array(arr.buffer).set(new Uint8Array(buf, pos, bytes));
     out.push(arr);
     pos += bytes;
   }
@@ -81,8 +69,6 @@ function takeTensorPayload(
 ): { tensors: Float32Array[]; stripped: ProtocolMessage } | null {
   if (msg.type === "grad") {
     const { payload, ...rest } = msg as GradMessage;
-    // We must not lose the payload key in the envelope shape — use a tagged
-    // placeholder so the receiver's reconstructor knows to fill it back.
     return {
       tensors: payload,
       stripped: { ...rest, payload: [] } as GradMessage,
@@ -90,10 +76,7 @@ function takeTensorPayload(
   }
   if (msg.type === "f16w") {
     const { params, ...rest } = msg;
-    return {
-      tensors: params,
-      stripped: { ...rest, params: [] },
-    };
+    return { tensors: params, stripped: { ...rest, params: [] } };
   }
   return null;
 }
@@ -111,78 +94,71 @@ function restoreTensorPayload(
   return msg;
 }
 
-export class WebSocketRelayTransport implements Transport {
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+export class WebSocketBrowserTransport implements Transport {
   readonly peerId: PeerId;
   private readonly serverUrl: string;
   private readonly model: string;
   private readonly log: (msg: string) => void;
-  private readonly maxPayload: number;
 
   private ws: WebSocket | null = null;
   private handlers: Array<(message: ProtocolMessage) => void> = [];
   private pending: ProtocolMessage[] = [];
   private hasReplayedToFirstSubscriber = false;
   private closed = false;
-  /** Reconnect bookkeeping: true while a reconnect attempt is in flight. */
   private reconnecting = false;
-  /** Exponential backoff for reconnect attempts. Resets to base on success. */
   private reconnectDelayMs = 1_000;
   private readonly reconnectDelayMaxMs = 30_000;
 
-  private constructor(opts: WebSocketRelayTransportOptions) {
+  private constructor(opts: WebSocketBrowserTransportOptions) {
     this.peerId = opts.peerId;
     this.serverUrl = opts.serverUrl;
     this.model = opts.model ?? "gpt2";
-    this.log = opts.log ?? ((m) => console.error(`[transport] ${m}`));
-    this.maxPayload = opts.maxPayload ?? 500 * 1024 * 1024;
+    this.log = opts.log ?? ((m) => console.warn(`[transport] ${m}`));
   }
 
-  /**
-   * Connect, register, return a ready Transport. The server's `registered`
-   * reply is translated to a JoinAck and queued for the first subscriber.
-   */
   static async create(
-    opts: WebSocketRelayTransportOptions,
-  ): Promise<WebSocketRelayTransport> {
-    const t = new WebSocketRelayTransport(opts);
+    opts: WebSocketBrowserTransportOptions,
+  ): Promise<WebSocketBrowserTransport> {
+    const t = new WebSocketBrowserTransport(opts);
     await t.connectAndRegister();
     return t;
   }
 
   private async connectAndRegister(): Promise<void> {
-    const ws = new WebSocket(this.serverUrl, { maxPayload: this.maxPayload });
+    const ws = new WebSocket(this.serverUrl);
+    ws.binaryType = "arraybuffer";
     this.ws = ws;
 
     await new Promise<void>((resolve, reject) => {
-      const onError = (e: Error) => {
-        reject(e);
+      const onError = (e: Event) => {
+        ws.removeEventListener("error", onError);
+        reject(new Error(`websocket open failed: ${(e as ErrorEvent).message ?? "unknown"}`));
       };
-      ws.once("error", onError);
-      ws.once("open", () => {
-        ws.off("error", onError);
+      ws.addEventListener("error", onError, { once: true });
+      ws.addEventListener("open", () => {
+        ws.removeEventListener("error", onError);
         resolve();
-      });
+      }, { once: true });
       setTimeout(() => reject(new Error("WebSocket open timeout")), 15_000);
     });
 
-    // Wait for the registered reply BEFORE returning. Buffer everything
-    // else that arrives in the meantime — it goes to onReceive once a
-    // subscriber attaches.
     const registered = await new Promise<JoinAckMessage>((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new Error("Registration timeout")),
         15_000,
       );
-      const onMessage = (raw: WebSocket.RawData, isBinary?: boolean) => {
-        const parsed = this.parseFrame(raw, isBinary === true);
+      const onMessage = (event: MessageEvent) => {
+        const parsed = this.parseFrame(event.data);
         if (!parsed) return;
         if (
           parsed.kind === "text" &&
           (parsed.value as { type?: string }).type === "registered"
         ) {
           clearTimeout(timer);
-          ws.off("message", onMessage);
-          // Translate "registered" → JoinAck.
+          ws.removeEventListener("message", onMessage);
           const r = parsed.value as {
             peerId: string;
             clusterId: number;
@@ -190,22 +166,19 @@ export class WebSocketRelayTransport implements Transport {
             peers: PeerInfo[];
             needsSync?: boolean;
           };
-          const ack: JoinAckMessage = {
+          resolve({
             type: "join-ack",
             peerId: r.peerId,
             clusterId: r.clusterId,
             isHead: r.isHead,
             peers: r.peers,
             needsSync: r.needsSync === true,
-          };
-          resolve(ack);
+          });
         } else if (parsed.kind === "protocol") {
-          // Anything else (peer-list, grads, etc.) arriving pre-subscription
-          // gets queued.
           this.pending.push(parsed.value);
         }
       };
-      ws.on("message", onMessage);
+      ws.addEventListener("message", onMessage);
       ws.send(
         JSON.stringify({
           type: "register",
@@ -215,46 +188,32 @@ export class WebSocketRelayTransport implements Transport {
       );
     });
 
-    // Hand-off: once registration is done, wire the steady-state handler
-    // and queue the JoinAck so the first subscriber sees it.
     this.pending.unshift(registered);
-    this.attachSteadyStateHandlers(this.ws);
+    this.attachSteadyStateHandlers(ws);
     this.reconnectDelayMs = 1_000;
   }
 
-  /** Wire up the post-registration message + close listeners on `ws`. */
   private attachSteadyStateHandlers(ws: WebSocket): void {
-    ws.on("message", (raw, isBinary) =>
-      this.onWsMessage(raw, isBinary === true),
-    );
-    ws.on("close", () => {
-      if (this.closed) {
-        this.log("websocket closed (intentional)");
-        return;
-      }
-      if (this.ws !== ws) {
-        // Stale close on a superseded connection; ignore.
-        return;
-      }
+    ws.addEventListener("message", (event) => {
+      const parsed = this.parseFrame(event.data);
+      if (!parsed || parsed.kind !== "protocol") return;
+      this.deliver(parsed.value);
+    });
+    ws.addEventListener("close", () => {
+      if (this.closed) return;
+      if (this.ws !== ws) return;
       this.ws = null;
       this.log("websocket closed unexpectedly; scheduling reconnect");
       this.scheduleReconnect();
     });
-    ws.on("error", (e) => {
-      this.log(`websocket error: ${e.message}`);
+    ws.addEventListener("error", (e) => {
+      const err = e as ErrorEvent;
+      this.log(`websocket error: ${err.message ?? "unknown"}`);
     });
   }
 
-  /**
-   * Reconnect on next event-loop tick, backing off exponentially up to
-   * reconnectDelayMaxMs. After success, the server's fresh `registered`
-   * reply is delivered to the state machine AS A peer-list update — the
-   * state machine is already past its initial JoinAck and just needs to
-   * re-sync membership view + own role.
-   */
   private scheduleReconnect(): void {
-    if (this.closed) return;
-    if (this.reconnecting) return;
+    if (this.closed || this.reconnecting) return;
     this.reconnecting = true;
     const delay = this.reconnectDelayMs;
     this.reconnectDelayMs = Math.min(
@@ -274,16 +233,17 @@ export class WebSocketRelayTransport implements Transport {
 
   private async attemptReconnect(): Promise<void> {
     this.log(`reconnect attempt (peerId=${this.peerId})`);
-    const ws = new WebSocket(this.serverUrl, { maxPayload: this.maxPayload });
+    const ws = new WebSocket(this.serverUrl);
+    ws.binaryType = "arraybuffer";
     this.ws = ws;
     try {
       await new Promise<void>((resolve, reject) => {
-        const onError = (e: Error) => reject(e);
-        ws.once("error", onError);
-        ws.once("open", () => {
-          ws.off("error", onError);
+        const onError = () => reject(new Error("reconnect open failed"));
+        ws.addEventListener("error", onError, { once: true });
+        ws.addEventListener("open", () => {
+          ws.removeEventListener("error", onError);
           resolve();
-        });
+        }, { once: true });
         setTimeout(
           () => reject(new Error("reconnect open timeout")),
           15_000,
@@ -296,15 +256,15 @@ export class WebSocketRelayTransport implements Transport {
             () => reject(new Error("reconnect registration timeout")),
             15_000,
           );
-          const onMessage = (raw: WebSocket.RawData, isBinary?: boolean) => {
-            const parsed = this.parseFrame(raw, isBinary === true);
+          const onMessage = (event: MessageEvent) => {
+            const parsed = this.parseFrame(event.data);
             if (!parsed) return;
             if (
               parsed.kind === "text" &&
               (parsed.value as { type?: string }).type === "registered"
             ) {
               clearTimeout(timer);
-              ws.off("message", onMessage);
+              ws.removeEventListener("message", onMessage);
               const r = parsed.value as {
                 peerId: string;
                 clusterId: number;
@@ -324,7 +284,7 @@ export class WebSocketRelayTransport implements Transport {
               this.deliver(parsed.value);
             }
           };
-          ws.on("message", onMessage);
+          ws.addEventListener("message", onMessage);
           ws.send(
             JSON.stringify({
               type: "register",
@@ -335,10 +295,6 @@ export class WebSocketRelayTransport implements Transport {
         },
       );
 
-      // Don't re-deliver a JoinAck — the state machine is already past
-      // joined. Translate the reply into a peer-list update so it
-      // refreshes its membership view + own role (the previous
-      // disconnect may have triggered head re-election server-side).
       const update: PeerListUpdateMessage = {
         type: "peer-list",
         peers: reregistered.peers,
@@ -360,61 +316,59 @@ export class WebSocketRelayTransport implements Transport {
     }
   }
 
-  private onWsMessage(raw: WebSocket.RawData, isBinary: boolean): void {
-    const parsed = this.parseFrame(raw, isBinary);
-    if (!parsed || parsed.kind !== "protocol") return;
-    this.deliver(parsed.value);
-  }
-
   /**
-   * Parse an inbound frame. `isBinary` is the ws-library opcode flag — the
-   * payload arrives as Buffer either way, so this is the only reliable
-   * way to tell text from binary frames.
+   * Parse `event.data` — either string (text frame) or ArrayBuffer
+   * (binary envelope frame). Browser WebSocket with binaryType
+   * "arraybuffer" delivers ArrayBuffer for binary frames; setting
+   * binaryType is critical (default is "blob" which would force an
+   * async read).
    */
   private parseFrame(
-    raw: WebSocket.RawData,
-    isBinary: boolean,
+    data: unknown,
   ):
     | { kind: "text"; value: unknown }
     | { kind: "protocol"; value: ProtocolMessage }
     | null {
-    if (isBinary && Buffer.isBuffer(raw)) {
-      if (raw.length < FOUR) return null;
-      const envLen = raw.readUInt32LE(0);
-      if (envLen <= 0 || envLen > raw.length - FOUR) return null;
+    if (data instanceof ArrayBuffer) {
+      const buf = data;
+      if (buf.byteLength < FOUR) return null;
+      const view = new DataView(buf);
+      const envLen = view.getUint32(0, true);
+      if (envLen <= 0 || envLen > buf.byteLength - FOUR) return null;
       let envelope: Envelope | null = null;
       try {
-        envelope = JSON.parse(raw.toString("utf8", FOUR, FOUR + envLen));
+        envelope = JSON.parse(
+          textDecoder.decode(new Uint8Array(buf, FOUR, envLen)),
+        );
       } catch {
         return null;
       }
       if (!envelope) return null;
-      const payload = raw.subarray(FOUR + envLen);
+      const payload = buf.slice(FOUR + envLen);
       const tensors = envelope.tensorShapes
-        ? splitFloat32Buffers(payload, envelope.tensorShapes)
+        ? splitFloat32(payload, envelope.tensorShapes)
         : [];
-      const restored = restoreTensorPayload(envelope.msg, tensors);
-      return { kind: "protocol", value: restored };
+      return {
+        kind: "protocol",
+        value: restoreTensorPayload(envelope.msg, tensors),
+      };
     }
 
-    // Text frame.
-    let text: unknown;
+    if (typeof data !== "string") return null;
+    let parsed: unknown;
     try {
-      text = JSON.parse(raw.toString());
+      parsed = JSON.parse(data);
     } catch {
       return null;
     }
-    if (!text || typeof text !== "object") return null;
-    const obj = text as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object") return null;
+    const obj = parsed as Record<string, unknown>;
     if (obj.type === "registered" || obj.type === "pong") {
       return { kind: "text", value: obj };
     }
-    // Server-originated control messages (peer-list) come through bare —
-    // i.e., as the protocol message itself, NOT wrapped in {from,target,msg}.
     if (obj.type === "peer-list") {
       return { kind: "protocol", value: obj as PeerListUpdateMessage };
     }
-    // Protocol envelope: {from, target, msg}.
     if (obj.target && obj.msg) {
       return { kind: "protocol", value: obj.msg as ProtocolMessage };
     }
@@ -433,11 +387,13 @@ export class WebSocketRelayTransport implements Transport {
         msg: taken.stripped,
         tensorShapes: taken.tensors.map((a) => [a.length]),
       };
-      const envBytes = Buffer.from(JSON.stringify(envelope), "utf8");
-      const lenBuf = Buffer.alloc(FOUR);
-      lenBuf.writeUInt32LE(envBytes.length, 0);
-      const payloadBuf = concatFloat32Buffers(taken.tensors);
-      this.ws.send(Buffer.concat([lenBuf, envBytes, payloadBuf]));
+      const envBytes = textEncoder.encode(JSON.stringify(envelope));
+      const payload = concatFloat32(taken.tensors);
+      const out = new Uint8Array(FOUR + envBytes.byteLength + payload.byteLength);
+      new DataView(out.buffer).setUint32(0, envBytes.byteLength, true);
+      out.set(envBytes, FOUR);
+      out.set(new Uint8Array(payload), FOUR + envBytes.byteLength);
+      this.ws.send(out.buffer);
     } else {
       const envelope: Envelope = {
         from: this.peerId,
@@ -452,11 +408,8 @@ export class WebSocketRelayTransport implements Transport {
     this.handlers.push(handler);
     if (!this.hasReplayedToFirstSubscriber) {
       this.hasReplayedToFirstSubscriber = true;
-      // Replay any messages buffered before subscription (notably JoinAck).
       const pending = this.pending;
       this.pending = [];
-      // Use queueMicrotask so the caller's constructor returns before any
-      // handler invocations — mirrors InProcessBus's join-ack delivery.
       queueMicrotask(() => {
         for (const m of pending) handler(m);
       });

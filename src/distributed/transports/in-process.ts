@@ -103,6 +103,7 @@ export class InProcessBus {
     }
     const currentInfo = Array.from(this.peers.values()).map((p) => p.info);
     const { clusterId, isHead } = this.assigner.assign(peerId, currentInfo);
+    const needsSync = currentInfo.length > 0;
     const info: PeerInfo = { peerId, clusterId, isHead };
     const peer: BusPeer = { info, handlers: [], closed: false };
     this.peers.set(peerId, peer);
@@ -132,6 +133,7 @@ export class InProcessBus {
         clusterId,
         isHead,
         peers: allPeers,
+        needsSync,
       };
       this.deliverTo(peer, ack);
 

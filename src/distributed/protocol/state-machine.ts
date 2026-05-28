@@ -103,6 +103,7 @@ export class FlatBarrierStateMachine {
   private lastF16WSentMs = 0;
   private lastF16WSentAnchor: AnchorRound = -1;
   private lastF16WRequestedAtAnchor: AnchorRound = -1;
+  private needsSync = false;
 
   // ─── Control ─────────────────────────────────────────────────────────
   private running = false;
@@ -143,7 +144,12 @@ export class FlatBarrierStateMachine {
    */
   async run(maxRounds: number): Promise<RoundReport[]> {
     await this.joined;
-    await this.trainer.setAnchor();
+    if (this.needsSync) {
+      const synced = await this.fetchInitialF16W();
+      if (!synced) await this.trainer.setAnchor();
+    } else {
+      await this.trainer.setAnchor();
+    }
     this.running = true;
     const reports: RoundReport[] = [];
     while (this.running && this.currentRound < maxRounds) {
@@ -157,6 +163,42 @@ export class FlatBarrierStateMachine {
   stop(): void {
     this.running = false;
     this.signal();
+  }
+
+  /**
+   * Proactive initial sync for a late joiner: broadcast an f16w-request
+   * and wait for an F16W to arrive, then apply it. Returns true on
+   * success, false on timeout (caller falls back to own init).
+   */
+  private async fetchInitialF16W(): Promise<boolean> {
+    if (!this.self) return false;
+    this.lastF16WRequestedAtAnchor = -1;
+    this.transport.send(
+      { kind: "broadcast" },
+      {
+        type: "f16w-request",
+        peerId: this.self.peerId,
+        atLeastAnchor: 0,
+      },
+    );
+    const deadline = Date.now() + this.opts.matchmakingDeadlineMs;
+    while (Date.now() < deadline) {
+      if (this.pendingF16W) {
+        const blob = this.pendingF16W;
+        this.pendingF16W = null;
+        await this.trainer.applyF16W(blob.params);
+        await this.trainer.resetOptimState();
+        this.anchorRound = blob.sourceAnchor;
+        this.currentRound = blob.sourceCurrentRound;
+        this.needsSync = false;
+        return true;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await this.waitForSignal(remaining);
+    }
+    this.needsSync = false;
+    return false;
   }
 
   /** Tear down message subscription; does not close the transport. */
@@ -454,6 +496,7 @@ export class FlatBarrierStateMachine {
         };
         this.peers.clear();
         for (const p of msg.peers) this.peers.set(p.peerId, p);
+        this.needsSync = msg.needsSync;
         resolveJoin();
         return;
       }
@@ -492,7 +535,10 @@ export class FlatBarrierStateMachine {
         return;
       }
       case "f16w": {
-        if (msg.sourceAnchor > this.anchorRound) {
+        if (
+          msg.sourceAnchor > this.anchorRound ||
+          (this.needsSync && msg.sourceAnchor >= this.anchorRound)
+        ) {
           this.pendingF16W = {
             sourceAnchor: msg.sourceAnchor,
             sourceCurrentRound: msg.sourceCurrentRound,

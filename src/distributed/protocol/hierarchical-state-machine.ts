@@ -117,6 +117,11 @@ export class HierarchicalBarrierStateMachine {
   private lastF16WSentMs = 0;
   private lastF16WSentAnchor: AnchorRound = -1;
   private lastF16WRequestedAtAnchor: AnchorRound = -1;
+  /** Set from the join-ack: true when other peers were present at join.
+   *  run() proactively requests F16W before training when this is set,
+   *  so a late joiner doesn't waste rounds discovering the mismatch via
+   *  anchor-tagged grads. */
+  private needsSync = false;
 
   private running = false;
   private joined: Promise<void>;
@@ -150,7 +155,20 @@ export class HierarchicalBarrierStateMachine {
 
   async run(maxRounds: number): Promise<RoundReport[]> {
     await this.joined;
-    await this.trainer.setAnchor();
+    // Late joiner: pull current consensus from a peer BEFORE establishing
+    // our own random-init anchor. Otherwise the first peer-grad exchange
+    // burns a round catching us up via the anchor-mismatch path.
+    if (this.needsSync) {
+      const synced = await this.fetchInitialF16W();
+      if (!synced) {
+        // Sync timed out — fall back to own init. The first peer-grad
+        // exchange will detect the mismatch and recover via the regular
+        // F16W path.
+        await this.trainer.setAnchor();
+      }
+    } else {
+      await this.trainer.setAnchor();
+    }
     this.running = true;
     const reports: RoundReport[] = [];
     while (this.running && this.currentRound < maxRounds) {
@@ -159,6 +177,45 @@ export class HierarchicalBarrierStateMachine {
       this.currentRound++;
     }
     return reports;
+  }
+
+  /**
+   * Proactive initial sync. Broadcasts an f16w-request and waits for the
+   * first F16W to arrive, then applies it (sets params + anchor +
+   * currentRound). Returns true if synced, false on timeout.
+   */
+  private async fetchInitialF16W(): Promise<boolean> {
+    if (!this.self) return false;
+    // Bypass the "have we already requested at this anchor" debounce —
+    // we're at anchor=0 with random init, so 0 is what we'd send anyway,
+    // but we want this to fire unconditionally on cold join.
+    this.lastF16WRequestedAtAnchor = -1;
+    this.transport.send(
+      { kind: "broadcast" },
+      {
+        type: "f16w-request",
+        peerId: this.self.peerId,
+        atLeastAnchor: 0,
+      },
+    );
+    const deadline = Date.now() + this.opts.intraDeadlineMs;
+    while (Date.now() < deadline) {
+      if (this.pendingF16W) {
+        const blob = this.pendingF16W;
+        this.pendingF16W = null;
+        await this.trainer.applyF16W(blob.params);
+        await this.trainer.resetOptimState();
+        this.anchorRound = blob.sourceAnchor;
+        this.currentRound = blob.sourceCurrentRound;
+        this.needsSync = false;
+        return true;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await this.waitForSignal(remaining);
+    }
+    this.needsSync = false;
+    return false;
   }
 
   stop(): void {
@@ -640,6 +697,7 @@ export class HierarchicalBarrierStateMachine {
         };
         this.peers.clear();
         for (const p of msg.peers) this.peers.set(p.peerId, p);
+        this.needsSync = msg.needsSync;
         resolveJoin();
         return;
       }
@@ -690,7 +748,14 @@ export class HierarchicalBarrierStateMachine {
         this.handleF16WRequest();
         return;
       case "f16w":
-        if (msg.sourceAnchor > this.anchorRound) {
+        // Mid-run: require strict advance to avoid replaying stale blobs
+        // that arrive after we've already moved past them. Initial sync:
+        // accept >= because both peers may be at anchor 0 and we want the
+        // late joiner to adopt the first peer's params.
+        if (
+          msg.sourceAnchor > this.anchorRound ||
+          (this.needsSync && msg.sourceAnchor >= this.anchorRound)
+        ) {
           this.pendingF16W = {
             sourceAnchor: msg.sourceAnchor,
             sourceCurrentRound: msg.sourceCurrentRound,
