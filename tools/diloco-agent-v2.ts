@@ -1,0 +1,235 @@
+/**
+ * DiLoCo Agent v2.
+ *
+ * Wires together:
+ *   - WebSocketRelayTransport against server/diloco-server-v2.cjs
+ *   - WebGPUGPT2Trainer (real GPT-2 + Adam + Nesterov)
+ *   - HierarchicalBarrierStateMachine (sync barrier, cluster-aware)
+ *
+ * The existing diloco-webrtc-agent.ts stays in place — this is a parallel
+ * agent that talks to the v2 relay (different port). Both can run during
+ * transition.
+ *
+ * Env knobs:
+ *   SERVER_URL                ws://… of the v2 relay (default :8443 on localhost)
+ *   ROUNDS, STEPS, BATCH_SIZE, SEQ_LEN, ACCUM_STEPS, LR
+ *   OUTER_LR, OUTER_MU
+ *   NUM_LAYERS, NUM_HEADS, EMBED_DIM, MODEL_DIR
+ *   HF_DATASET, HF_CONFIG, HF_ROWS
+ *   SEED
+ *   QUORUM_MIN, QUORUM_TARGET_FRAC
+ *   PEER_ID
+ */
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
+import { HierarchicalBarrierStateMachine } from "../src/distributed/protocol/hierarchical-state-machine";
+import {
+  type TokenSource,
+  WebGPUGPT2Trainer,
+} from "../src/distributed/protocol/webgpu-gpt2-trainer";
+import { WebSocketRelayTransport } from "../src/distributed/transports/websocket-relay";
+import { Torchlette } from "../src/frontend/torchlette";
+
+// ── Config ──
+const SEED = parseInt(process.env.SEED ?? "42", 10);
+const ROUNDS = parseInt(process.env.ROUNDS ?? "100", 10);
+const INNER_STEPS = parseInt(process.env.STEPS ?? "20", 10);
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE ?? "4", 10);
+const SEQ_LEN = parseInt(process.env.SEQ_LEN ?? "512", 10);
+const ACCUM_STEPS = parseInt(process.env.ACCUM_STEPS ?? "1", 10);
+const LR = parseFloat(process.env.LR ?? "1e-4");
+const OUTER_LR = parseFloat(process.env.OUTER_LR ?? "0.7");
+const OUTER_MU = parseFloat(process.env.OUTER_MU ?? "0.9");
+
+const NUM_LAYERS = parseInt(process.env.NUM_LAYERS ?? "12", 10);
+const NUM_HEADS = parseInt(process.env.NUM_HEADS ?? "12", 10);
+const EMBED_DIM = parseInt(process.env.EMBED_DIM ?? "768", 10);
+const MODEL_DIR = process.env.MODEL ?? "gpt2";
+
+const SERVER_URL = process.env.SERVER_URL ?? "ws://127.0.0.1:8443";
+const PEER_ID = process.env.PEER_ID ?? `v2-${Date.now()}`;
+const QUORUM_MIN = parseInt(process.env.QUORUM_MIN ?? "2", 10);
+const QUORUM_TARGET_FRAC = parseFloat(
+  process.env.QUORUM_TARGET_FRAC ?? "1.0",
+);
+
+const HF_DATASET = process.env.HF_DATASET ?? "HuggingFaceFW/fineweb-edu";
+const HF_CONFIG = process.env.HF_CONFIG ?? "sample-10BT";
+const HF_TOTAL_ROWS = parseInt(process.env.HF_ROWS ?? "9672101", 10);
+const HF_FETCH_ROWS = 100;
+
+const log = (msg: string) => console.error(`[v2] ${msg}`);
+
+// ── Tokenizer + HF data source ──
+async function loadTokenizer(modelDir: string) {
+  const { GPT2Tokenizer } = await import(
+    "../examples/gpt2-lora-trainer/src/lib/torchlette/tokenizer"
+  );
+  const vocabPath = path.join(process.cwd(), "models", modelDir, "vocab.json");
+  const mergesPath = path.join(process.cwd(), "models", modelDir, "merges.txt");
+  const tokenizer = new GPT2Tokenizer();
+  tokenizer.load(
+    JSON.parse(fs.readFileSync(vocabPath, "utf-8")),
+    fs
+      .readFileSync(mergesPath, "utf-8")
+      .split("\n")
+      .filter((l: string) => l && !l.startsWith("#")),
+  );
+  return tokenizer;
+}
+
+class HFTokenSource implements TokenSource {
+  // biome-ignore lint/suspicious/noExplicitAny: tokenizer type comes from a dynamic import
+  constructor(private readonly tokenizer: any) {}
+  async fetch(minTokens: number): Promise<number[]> {
+    let allText = "";
+    let consecutiveFailures = 0;
+    while (true) {
+      const offset = Math.floor(
+        Math.random() * (HF_TOTAL_ROWS - HF_FETCH_ROWS),
+      );
+      const url = `https://datasets-server.huggingface.co/rows?dataset=${HF_DATASET}&config=${HF_CONFIG}&split=train&offset=${offset}&length=${HF_FETCH_ROWS}`;
+      try {
+        const resp = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+        const ct = resp.headers.get("content-type") ?? "";
+        if (!resp.ok || !ct.includes("application/json")) {
+          throw new Error(`HF ${resp.status} ${ct.split(";")[0]}`);
+        }
+        const data = await resp.json();
+        if (!data.rows) throw new Error("HF response missing rows");
+        // biome-ignore lint/suspicious/noExplicitAny: HF row shape isn't typed
+        const text = data.rows.map((r: any) => r.row.text).join("\n\n");
+        allText += (allText ? "\n\n" : "") + text;
+        consecutiveFailures = 0;
+        const tokens: number[] = this.tokenizer.encode(allText);
+        if (tokens.length >= minTokens) {
+          return tokens;
+        }
+      } catch (e) {
+        consecutiveFailures++;
+        const wait = Math.min(
+          60_000,
+          2_000 * 2 ** Math.min(consecutiveFailures, 5),
+        );
+        log(
+          `HF fetch failed (${consecutiveFailures}): ${(e as Error).message} — retry in ${wait / 1000}s`,
+        );
+        await new Promise((r) => setTimeout(r, wait));
+      }
+    }
+  }
+}
+
+// ── Main ──
+async function main(): Promise<void> {
+  process.env.TORCHLETTE_POOL_BUDGET_MB ??= "2000";
+
+  const ok = await initWebGPU();
+  if (!ok) {
+    log("WebGPU not available");
+    process.exit(1);
+  }
+
+  const { setGPUMemoryLimit } = await import(
+    "../src/backend/webgpu/memory-tracker"
+  );
+  setGPUMemoryLimit(31.5 * 1024 * 1024 * 1024);
+
+  const api = new Torchlette("webgpu", { enableFusion: true });
+  api.manualSeed(SEED);
+
+  const tokenizer = await loadTokenizer(MODEL_DIR);
+  const tokenSource = new HFTokenSource(tokenizer);
+
+  const trainer = new WebGPUGPT2Trainer({
+    api,
+    modelConfig: {
+      vocabSize: 50257,
+      blockSize: 1024,
+      numLayers: NUM_LAYERS,
+      numHeads: NUM_HEADS,
+      embedDim: EMBED_DIM,
+      dropoutRate: 0,
+    },
+    tokenSource,
+    innerLr: LR,
+    outerLr: OUTER_LR,
+    outerMu: OUTER_MU,
+    innerSteps: INNER_STEPS,
+    batchSize: BATCH_SIZE,
+    seqLen: SEQ_LEN,
+    accumSteps: ACCUM_STEPS,
+    weightDecay: 0.1,
+    fullFinetuning: true,
+    checkpointing: true,
+    log,
+  });
+  await trainer.initialize();
+
+  log(`Connecting to ${SERVER_URL} as ${PEER_ID}`);
+  const transport = await WebSocketRelayTransport.create({
+    serverUrl: SERVER_URL,
+    peerId: PEER_ID,
+    model: "gpt2-124m",
+    log,
+  });
+
+  const sm = new HierarchicalBarrierStateMachine(transport, trainer, {
+    quorumMin: QUORUM_MIN,
+    quorumTargetFrac: QUORUM_TARGET_FRAC,
+    intraDeadlineMs: 60_000,
+    interDeadlineMs: 60_000,
+    globalDeadlineMs: 60_000,
+    f16wDebounceMs: 10_000,
+  });
+
+  await sm.awaitJoined();
+  const self = sm.getSelf();
+  log(
+    `Joined: peerId=${self?.peerId} cluster=${self?.clusterId}${self?.isHead ? "/head" : ""}`,
+  );
+
+  const reports = await sm.run(ROUNDS);
+  log(
+    `Training complete: ${reports.length} rounds, anchor=${sm.getAnchorRound()}`,
+  );
+
+  // STATS lines for analyzer compatibility.
+  const { getGPUMemoryStats } = await import(
+    "../src/backend/webgpu/memory-tracker"
+  );
+  const { bufferPool: bp } = await import(
+    "../src/backend/webgpu/buffer-pool"
+  );
+  for (let i = 0; i < reports.length; i++) {
+    const r = reports[i];
+    const mem = getGPUMemoryStats();
+    const pool = bp.stats();
+    const rss = process.memoryUsage().rss;
+    const stats = {
+      t: new Date().toISOString(),
+      round: r.round,
+      anchor_round: r.anchorAfter,
+      outer_step: r.outerStepTaken,
+      contributors: r.contributors,
+      clusters: r.clustersContributed,
+      f16w_applied: r.f16wApplied,
+      gpu_mb: Math.round(mem.currentBytes / 1e6),
+      peak_mb: Math.round(mem.peakBytes / 1e6),
+      pool_mb: Math.round(pool.pooledBytes / 1e6),
+      cpu_rss_mb: Math.round(rss / 1e6),
+    };
+    console.error(`STATS ${JSON.stringify(stats)}`);
+  }
+
+  transport.close();
+  await destroyWebGPU();
+  process.exit(0);
+}
+
+main().catch((e) => {
+  log(`FATAL: ${e}`);
+  process.exit(1);
+});
