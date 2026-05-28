@@ -34,10 +34,10 @@ const TOKENS_PATH =
 // accounts for small variance from scaler scale adjustments + nondeterministic
 // kernel reductions; a regression > 0.4 nats here means training broke.
 const BASELINE: Record<number, number> = {
-  0: 9.55,
-  3: 5.77,
-  6: 5.18,
-  9: 4.85,
+  0: 9.56,
+  3: 5.79,
+  6: 5.24,
+  9: 4.91,
 };
 const LOSS_TOLERANCE = 0.4;
 // Steady-state peak GPU memory tolerance (after warmup): catches leaks

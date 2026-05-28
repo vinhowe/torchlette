@@ -389,7 +389,26 @@ export function scaledDotProductAttentionImpl(
         );
         const dK = torch.runtime.extractAttentionDK(bwdDQ, config);
         const dV = torch.runtime.extractAttentionDV(bwdDQ, config);
-        return [bwdDQ, dK, dV]; // dQ, dK, dV for inputs [q, k, v]
+        // dQ/dK/dV are the three outputs of ONE multi-output node (dQ is
+        // result[0], dK result[1], dV result[2], the latter two via pending
+        // refs). When SDPA is composed with other ops, the autograd consumes
+        // these siblings through downstream view-backward (e.g. the per-head
+        // reshape/permute/contiguous backward of a fused-qkv projection).
+        // Consuming the primary (dQ) reclaims/overwrites the node's lower-
+        // indexed output buffers before dK is read, so dQ and dK come back
+        // corrupted while dV (the last-consumed, highest index) survives —
+        // a silent ~0.5-nat training-quality regression that only appears
+        // when attention feeds further ops (i.e. every real transformer).
+        // Copy each gradient into an independent owned buffer so downstream
+        // backward can't alias the shared multi-output storage.
+        const detachGrad = (t: RuntimeTensor): RuntimeTensor => {
+          const dst = torch.zeros([batch, heads, seq, hd], {
+            device: q.device,
+          });
+          torch.runtime.copy_(dst._unwrap(), t);
+          return dst._unwrap();
+        };
+        return [detachGrad(bwdDQ), detachGrad(dK), detachGrad(dV)];
       },
       tensorsToSave,
     );
