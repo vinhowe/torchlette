@@ -148,18 +148,20 @@ export class WebGPUGPT2Trainer implements Trainer {
     for (const p of this.params) {
       if (p.shape.length >= 2) normal_(this.api, p, 0, 0.02);
     }
-    // Zero out LoRA params so the LoRA branch is a no-op at init. The
-    // standard LoRA init is A~normal, B=0 — we re-randomized both above,
-    // which would make the LoRA delta contribute random noise on top of
-    // the base weights and slow early convergence. Setting both to zero
-    // makes the model behave like a plain GPT-2 until the LoRA params
-    // pick up signal through training (which never happens in
-    // fullFinetuning since we update the base directly).
-    for (const block of this.model.h) {
-      this.api.zero_(block.attn.cAttn.loraA);
-      this.api.zero_(block.attn.cAttn.loraB);
-      this.api.zero_(block.mlp.cFc.loraA);
-      this.api.zero_(block.mlp.cFc.loraB);
+    // In fullFinetuning mode the LoRA branch is dead weight: lora_a/lora_b
+    // grads are always zero (the chain rule contribution from a zero-init
+    // branch back to zero-init weights), so the branch never picks up
+    // signal and just costs FLOPs and autograd graph nodes. Disable the
+    // forward LoRA path and zero its params so they don't drift later.
+    if (this.opts.fullFinetuning) {
+      for (const block of this.model.h) {
+        this.api.zero_(block.attn.cAttn.loraA);
+        this.api.zero_(block.attn.cAttn.loraB);
+        this.api.zero_(block.mlp.cFc.loraA);
+        this.api.zero_(block.mlp.cFc.loraB);
+        block.attn.cAttn.disableLora = true;
+        block.mlp.cFc.disableLora = true;
+      }
     }
     await this.api._runtime().forceAllPending();
     this.opts.log(

@@ -103,12 +103,20 @@ export class LoRALinear {
     }
   }
 
+  /** When true, forward bypasses the LoRA branch and only runs the base
+   *  linear. Used by full-finetuning code paths that re-init loraA/loraB
+   *  to zero — the LoRA branch is a guaranteed no-op and just costs FLOPs +
+   *  memory + autograd graph nodes that drop their gradients on the floor. */
+  disableLora = false;
+
   /**
    * Forward pass: y = linear(x, W, b) + scaling * linear(linear(x, A), B)
    */
   forward(x: Tensor): Tensor {
     // Base linear: y = x @ W^T + b (fused, optimized backward)
     const baseOut = this.api.linear(x, this.baseWeight, this.baseBias);
+
+    if (this.disableLora) return baseOut;
 
     // LoRA path: scaling * (x @ A^T @ B^T)
     const loraOut = this.api.linear(
