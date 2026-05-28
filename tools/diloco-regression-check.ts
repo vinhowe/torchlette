@@ -28,15 +28,16 @@ const TOKENS_PATH =
   "/mnt/pccfs2/backed_up/vin/dev/torchlette/ckpts/tinystories-tokens.bin";
 
 // Baseline trajectory recorded 2026-05-28 on dw-2-1 V100, AC ON + scaler +
-// AdamW + no-LoRA + no-accumGrads path. Loss should descend monotonically
-// past these checkpoints. Tolerance accounts for small variance from
-// scaler scale adjustments + nondeterministic kernel reductions; if you
-// see a regression > 0.4 nats here, something broke training.
+// AdamW + plain GPT2 (no LoRA wrapper) + no-accumGrads path + selective
+// checkpointing. Loss should descend monotonically past these checkpoints.
+// Tolerance accounts for small variance from scaler scale adjustments +
+// nondeterministic kernel reductions; if you see a regression > 0.4 nats
+// here, something broke training.
 const BASELINE: Record<number, number> = {
-  0: 9.57,
-  3: 6.27,
-  6: 5.91,
-  9: 5.46,
+  0: 9.55,
+  3: 6.08,
+  6: 5.75,
+  9: 5.28,
 };
 const LOSS_TOLERANCE = 0.4;
 // Steady-state peak GPU memory tolerance (after warmup): catches leaks
@@ -96,7 +97,6 @@ async function main() {
     seqLen: 256,
     accumSteps: 1,
     weightDecay: 0.01,
-    fullFinetuning: true,
     checkpointing: true,
     useAutocast: true,
     gradClipNorm: 1.0,

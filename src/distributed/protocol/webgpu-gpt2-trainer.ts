@@ -50,9 +50,7 @@ export interface WebGPUGPT2TrainerOptions {
   seqLen?: number;
   accumSteps?: number;
   weightDecay?: number;
-  loraRank?: number;
-  loraAlpha?: number;
-  fullFinetuning?: boolean;
+  /** Gradient checkpointing during forward; trades compute for memory. */
   checkpointing?: boolean;
   /** Wrap forward in api.autocast (fp16 inputs to matmul). Defaults true. */
   useAutocast?: boolean;
@@ -71,9 +69,6 @@ const defaultOpts = {
   seqLen: 512,
   accumSteps: 1,
   weightDecay: 0.1,
-  loraRank: 1,
-  loraAlpha: 1,
-  fullFinetuning: true,
   checkpointing: true,
   useAutocast: true,
   gradClipNorm: 1.0,
@@ -120,9 +115,6 @@ export class WebGPUGPT2Trainer implements Trainer {
       seqLen: merged.seqLen,
       accumSteps: merged.accumSteps,
       weightDecay: merged.weightDecay,
-      loraRank: merged.loraRank,
-      loraAlpha: merged.loraAlpha,
-      fullFinetuning: merged.fullFinetuning,
       checkpointing: merged.checkpointing,
       useAutocast: merged.useAutocast,
       gradClipNorm: merged.gradClipNorm,
@@ -135,35 +127,26 @@ export class WebGPUGPT2Trainer implements Trainer {
    */
   async initialize(): Promise<void> {
     if (this.initialized) return;
-    const { GPT2WithLoRA } = await import(
-      "../../../examples/gpt2-lora-trainer/src/lib/torchlette/gpt2-lora.ts"
+    // Use the plain (non-LoRA) GPT-2 model. The trainer drives full
+    // fine-tuning from random init, so the LoRA-wrapped version would only
+    // add a structurally dead branch (loraA/loraB stay at zero through
+    // training because the gradient chain through a zero-init outer matrix
+    // contributes zero back). Plain GPT2 has the smaller param list, no
+    // setFullFinetuning toggles, and passes checkpointing through forward
+    // options instead of via mutable state.
+    const { GPT2 } = await import(
+      "../../../examples/gpt2/model.ts"
     );
-    this.model = new GPT2WithLoRA(
-      this.api,
-      this.opts.modelConfig,
-      { rank: this.opts.loraRank, alpha: this.opts.loraAlpha },
-      "webgpu",
-    );
-    this.params = this.model.getAllParameters();
+    this.model = new GPT2(this.api, this.opts.modelConfig, {
+      device: "webgpu",
+    });
+    this.params = this.model.parameters();
 
-    // Seed-init via PyTorch-style normal_ for matrix-rank params.
+    // Seed-init via PyTorch-style normal_ for matrix-rank params (matches
+    // the GPT-2 paper init the PyTorch baseline uses; defaults for Linear/
+    // Embedding in the nn library are kaiming_uniform).
     for (const p of this.params) {
       if (p.shape.length >= 2) normal_(this.api, p, 0, 0.02);
-    }
-    // In fullFinetuning mode the LoRA branch is dead weight: lora_a/lora_b
-    // grads are always zero (the chain rule contribution from a zero-init
-    // branch back to zero-init weights), so the branch never picks up
-    // signal and just costs FLOPs and autograd graph nodes. Disable the
-    // forward LoRA path and zero its params so they don't drift later.
-    if (this.opts.fullFinetuning) {
-      for (const block of this.model.h) {
-        this.api.zero_(block.attn.cAttn.loraA);
-        this.api.zero_(block.attn.cAttn.loraB);
-        this.api.zero_(block.mlp.cFc.loraA);
-        this.api.zero_(block.mlp.cFc.loraB);
-        block.attn.cAttn.disableLora = true;
-        block.mlp.cFc.disableLora = true;
-      }
     }
     await this.api._runtime().forceAllPending();
     this.opts.log(
@@ -171,11 +154,6 @@ export class WebGPUGPT2Trainer implements Trainer {
     );
 
     this.model.train(true);
-    this.model.enableCheckpointing(this.opts.checkpointing);
-    if (this.opts.fullFinetuning) {
-      this.model.fullCheckpoint = true;
-      this.model.setFullFinetuning(true);
-    }
 
     this.innerOpt = new Adam(
       this.params,
@@ -313,7 +291,10 @@ export class WebGPUGPT2Trainer implements Trainer {
         { device: "webgpu" },
       );
       const loss = api.tidy(() => {
-        const fwd = () => this.model.forwardWithLoss(input, target).loss;
+        const fwd = () =>
+          this.model.forwardWithLoss(input, target, {
+            useCheckpoint: this.opts.checkpointing,
+          }).loss;
         const l = this.opts.useAutocast ? api.autocast(fwd) : fwd();
         api.keep(l);
         return l;
@@ -322,6 +303,10 @@ export class WebGPUGPT2Trainer implements Trainer {
       const backwardTarget = scaler ? scaler.scale(loss) : loss;
       await backwardTarget.backward();
       if (scaler) {
+        // See src/optim/grad-scaler.ts: the fused-Adam unscale path defers
+        // the actual unscale into the Adam kernel and leaves param.grad
+        // still scaled. clipGradNorm_ here would otherwise read scaled
+        // grads and clip by ~scale*, so scale the clip threshold to compensate.
         scaler.unscale_(this.innerOpt);
         if (this.opts.gradClipNorm > 0) {
           clipGradNorm_(
@@ -363,7 +348,10 @@ export class WebGPUGPT2Trainer implements Trainer {
         { device: "webgpu" },
       );
       const loss = api.tidy(() => {
-        const fwd = () => this.model.forwardWithLoss(input, target).loss;
+        const fwd = () =>
+          this.model.forwardWithLoss(input, target, {
+            useCheckpoint: this.opts.checkpointing,
+          }).loss;
         const l = this.opts.useAutocast ? api.autocast(fwd) : fwd();
         api.keep(l);
         return l;

@@ -202,7 +202,6 @@ async function main(): Promise<void> {
     seqLen: SEQ_LEN,
     accumSteps: ACCUM_STEPS,
     weightDecay: parseFloat(process.env.WEIGHT_DECAY ?? "0.1"),
-    fullFinetuning: true,
     checkpointing: process.env.CHECKPOINTING !== "0",
     useAutocast: process.env.USE_AUTOCAST !== "0",
     gradClipNorm: parseFloat(process.env.GRAD_CLIP ?? "1.0"),
