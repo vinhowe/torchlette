@@ -2,6 +2,10 @@
  * Tensor construction helpers: createTensor, createTrackedBuffer, createBufferWithData.
  */
 
+import {
+  getSlot,
+  isCompilationRecordingActive,
+} from "../../executor/compiled-plan";
 import { getSizeClass, getSizeForClass } from "../../graph/lifetime-analysis";
 import type { DType } from "../types";
 import { bufAcquire, bufRelease, bufRegister } from "./buffer-debug";
@@ -32,6 +36,28 @@ export function createTensor(
   dtype: DType = "f32",
   ownsBuffer = true,
 ): WebGPUTensor {
+  // Structural invariant: any owning storage tensor produced while a plan
+  // is being recorded must come from a buffer that the compiled-plan
+  // recorder knows about. The canonical path is allocateOutputBuffer in
+  // buffer-arena.ts, which calls recordAlloc() to register the buffer with
+  // bufferToSlot. Skipping that path (e.g. calling device.createBuffer
+  // directly) historically led to silent plan invalidation and bind-group
+  // cache misses. Catching it here fails fast at the dev's keyboard
+  // instead of by `console.warn` from the executor after the plan was
+  // already wasted.
+  if (
+    ownsBuffer &&
+    isCompilationRecordingActive() &&
+    buffer.usage === STORAGE_BUFFER_USAGE &&
+    getSlot(buffer) === undefined
+  ) {
+    throw new Error(
+      `createTensor: storage buffer (size ${buffer.size}) is not registered with the compiled-plan recorder. ` +
+        `Allocate result buffers via allocateOutputBuffer() from backend/webgpu/buffer-arena.ts instead of ` +
+        `device.createBuffer(). See src/executor/compiled-plan.ts for the recording protocol.`,
+    );
+  }
+
   const computedStrides = strides ?? contiguousStrides(shape);
   const isContiguousLayout =
     strides === undefined || checkContiguousStrides(shape, computedStrides);
