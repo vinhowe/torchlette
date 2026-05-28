@@ -150,7 +150,7 @@ export class HierarchicalBarrierStateMachine {
 
   async run(maxRounds: number): Promise<RoundReport[]> {
     await this.joined;
-    this.trainer.setAnchor();
+    await this.trainer.setAnchor();
     this.running = true;
     const reports: RoundReport[] = [];
     while (this.running && this.currentRound < maxRounds) {
@@ -187,7 +187,7 @@ export class HierarchicalBarrierStateMachine {
   private async runRound(): Promise<RoundReport> {
     const round = this.currentRound;
 
-    if (this.maybeApplyPendingF16W()) {
+    if (await this.maybeApplyPendingF16W()) {
       this.cleanupRound(round);
       return {
         round,
@@ -226,13 +226,13 @@ export class HierarchicalBarrierStateMachine {
     // Phase B: await intra quorum (peers in our cluster ready).
     const intraGroup = await this.awaitIntraQuorum(round, clusterMembers);
     if (intraGroup === null) {
-      this.trainer.revertToAnchor();
+      await this.trainer.revertToAnchor();
       this.cleanupRound(round);
       return this.report(round, false, 1, 1, false);
     }
 
     // Phase C: produce and route peer-grad.
-    const myGrad = this.trainer.pseudograd();
+    const myGrad = await this.trainer.pseudograd();
     if (self.isHead) {
       // CH stores own grad locally for intra aggregation.
       this.storeIntraGrad(round, self.peerId, {
@@ -247,7 +247,7 @@ export class HierarchicalBarrierStateMachine {
     } else {
       if (!clusterHead) {
         // Cluster has no head — degenerate. Treat as solo.
-        this.trainer.revertToAnchor();
+        await this.trainer.revertToAnchor();
         this.cleanupRound(round);
         return this.report(round, false, 1, 1, false);
       }
@@ -274,7 +274,7 @@ export class HierarchicalBarrierStateMachine {
       // Phase D: wait for cluster members' peer-grads.
       const intraResult = await this.awaitIntraGrads(round, intraGroup);
       if (!intraResult) {
-        this.trainer.revertToAnchor();
+        await this.trainer.revertToAnchor();
         this.cleanupRound(round);
         return this.report(round, false, 1, 1, false);
       }
@@ -317,7 +317,7 @@ export class HierarchicalBarrierStateMachine {
           totalContributors = clusterPeerCount;
           clustersContributed = 1;
         } else {
-          this.trainer.revertToAnchor();
+          await this.trainer.revertToAnchor();
           this.cleanupRound(round);
           return this.report(round, false, 1, 1, false);
         }
@@ -345,7 +345,7 @@ export class HierarchicalBarrierStateMachine {
       // Phase F': wait for global from CH.
       const global = await this.awaitGlobal(round);
       if (!global) {
-        this.trainer.revertToAnchor();
+        await this.trainer.revertToAnchor();
         this.cleanupRound(round);
         return this.report(round, false, 1, 1, false);
       }
@@ -356,7 +356,7 @@ export class HierarchicalBarrierStateMachine {
     }
 
     // Phase H: apply outer step.
-    this.trainer.applyOuterStep(globalAggregate);
+    await this.trainer.applyOuterStep(globalAggregate);
     this.anchorRound += 1;
     this.cleanupRound(round);
     return this.report(round, true, totalContributors, clustersContributed, false);
@@ -519,15 +519,15 @@ export class HierarchicalBarrierStateMachine {
   }
 
   // ─── Phase helpers ───────────────────────────────────────────────────
-  private maybeApplyPendingF16W(): boolean {
+  private async maybeApplyPendingF16W(): Promise<boolean> {
     const blob = this.pendingF16W;
     if (!blob || blob.sourceAnchor <= this.anchorRound) {
       this.pendingF16W = null;
       return false;
     }
     this.pendingF16W = null;
-    this.trainer.applyF16W(blob.params);
-    this.trainer.resetOptimState();
+    await this.trainer.applyF16W(blob.params);
+    await this.trainer.resetOptimState();
     this.anchorRound = blob.sourceAnchor;
     this.currentRound = blob.sourceCurrentRound;
     return true;
@@ -719,7 +719,7 @@ export class HierarchicalBarrierStateMachine {
     );
   }
 
-  private handleF16WRequest(): void {
+  private async handleF16WRequest(): Promise<void> {
     if (!this.self) return;
     const now = Date.now();
     if (
@@ -728,9 +728,11 @@ export class HierarchicalBarrierStateMachine {
     ) {
       return;
     }
-    const params = this.trainer.snapshotAnchor();
+    // Reserve the debounce window BEFORE the async read so concurrent
+    // requests during the read don't all kick off duplicate snapshots.
     this.lastF16WSentMs = now;
     this.lastF16WSentAnchor = this.anchorRound;
+    const params = await this.trainer.snapshotAnchor();
     this.transport.send(
       { kind: "broadcast" },
       {

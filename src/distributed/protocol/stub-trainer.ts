@@ -113,11 +113,11 @@ export class StubTrainer implements Trainer {
     return this.shapes;
   }
 
-  setAnchor(): void {
+  async setAnchor(): Promise<void> {
     this.anchor = copyOf(this.params);
   }
 
-  async innerSteps(_round: number): Promise<void> {
+  async innerSteps(_round: number): Promise<number> {
     for (let s = 0; s < this.innerStepsPerRound; s++) {
       for (let p = 0; p < this.params.length; p++) {
         const cur = this.params[p];
@@ -128,9 +128,10 @@ export class StubTrainer implements Trainer {
         }
       }
     }
+    return this.lossToTarget();
   }
 
-  pseudograd(): Float32Array[] {
+  async pseudograd(): Promise<Float32Array[]> {
     const out: Float32Array[] = [];
     for (let p = 0; p < this.params.length; p++) {
       const cur = this.params[p];
@@ -142,7 +143,7 @@ export class StubTrainer implements Trainer {
     return out;
   }
 
-  applyOuterStep(avgGrad: Float32Array[]): void {
+  async applyOuterStep(avgGrad: Float32Array[]): Promise<void> {
     for (let p = 0; p < this.params.length; p++) {
       const v = this.outerV[p];
       const g = avgGrad[p];
@@ -157,15 +158,15 @@ export class StubTrainer implements Trainer {
     this.anchor = copyOf(this.params);
   }
 
-  revertToAnchor(): void {
+  async revertToAnchor(): Promise<void> {
     this.params = copyOf(this.anchor);
   }
 
-  snapshotAnchor(): Float32Array[] {
+  async snapshotAnchor(): Promise<Float32Array[]> {
     return copyOf(this.anchor);
   }
 
-  applyF16W(params: Float32Array[]): void {
+  async applyF16W(params: Float32Array[]): Promise<void> {
     if (params.length !== this.params.length) {
       throw new Error(
         `applyF16W: payload tensor count ${params.length} != expected ${this.params.length}`,
@@ -175,7 +176,7 @@ export class StubTrainer implements Trainer {
     this.anchor = copyOf(params);
   }
 
-  resetOptimState(): void {
+  async resetOptimState(): Promise<void> {
     this.outerV = zerosLike(this.outerV);
   }
 

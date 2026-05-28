@@ -143,7 +143,7 @@ export class FlatBarrierStateMachine {
    */
   async run(maxRounds: number): Promise<RoundReport[]> {
     await this.joined;
-    this.trainer.setAnchor();
+    await this.trainer.setAnchor();
     this.running = true;
     const reports: RoundReport[] = [];
     while (this.running && this.currentRound < maxRounds) {
@@ -184,7 +184,7 @@ export class FlatBarrierStateMachine {
     const round = this.currentRound;
 
     // Step 1: apply pending F16W if it strictly advances our anchor.
-    if (this.maybeApplyPendingF16W()) {
+    if (await this.maybeApplyPendingF16W()) {
       this.cleanupRound(round);
       return {
         round,
@@ -201,7 +201,6 @@ export class FlatBarrierStateMachine {
     // Step 3: snapshot the swarm view at round start. Quorum is computed
     // against this set so late joiners don't inflate the denominator.
     const expectedPeers = new Set(this.peers.keys());
-    const expectedSize = expectedPeers.size;
     if (this.self) expectedPeers.add(this.self.peerId);
 
     // Step 4: announce. Mark self ready locally so we count toward quorum.
@@ -211,7 +210,7 @@ export class FlatBarrierStateMachine {
     // Step 5: wait for quorum.
     const quorumGroup = await this.awaitQuorum(round, expectedPeers);
     if (quorumGroup === null) {
-      this.trainer.revertToAnchor();
+      await this.trainer.revertToAnchor();
       this.cleanupRound(round);
       return {
         round,
@@ -225,14 +224,14 @@ export class FlatBarrierStateMachine {
     // Step 6: send grad to everyone in quorum (broadcast — peer routing
     // will deliver to whichever quorum members are still connected). We
     // also store our own grad locally so step 8 can include it.
-    const myGrad = this.trainer.pseudograd();
+    const myGrad = await this.trainer.pseudograd();
     this.sendGrad(round, myGrad);
     this.storeOwnGrad(round, myGrad);
 
     // Step 7: wait for grads from quorum members.
     const grads = await this.awaitGrads(round, quorumGroup);
     if (grads === null) {
-      this.trainer.revertToAnchor();
+      await this.trainer.revertToAnchor();
       this.cleanupRound(round);
       return {
         round,
@@ -245,7 +244,7 @@ export class FlatBarrierStateMachine {
 
     // Step 8: average + apply.
     const avg = averageGrads(grads);
-    this.trainer.applyOuterStep(avg);
+    await this.trainer.applyOuterStep(avg);
     this.anchorRound += 1;
     const contributors = grads.length;
     this.cleanupRound(round);
@@ -259,15 +258,15 @@ export class FlatBarrierStateMachine {
   }
 
   // ─── Phase helpers ───────────────────────────────────────────────────
-  private maybeApplyPendingF16W(): boolean {
+  private async maybeApplyPendingF16W(): Promise<boolean> {
     const blob = this.pendingF16W;
     if (!blob || blob.sourceAnchor <= this.anchorRound) {
       this.pendingF16W = null;
       return false;
     }
     this.pendingF16W = null;
-    this.trainer.applyF16W(blob.params);
-    this.trainer.resetOptimState();
+    await this.trainer.applyF16W(blob.params);
+    await this.trainer.resetOptimState();
     this.anchorRound = blob.sourceAnchor;
     this.currentRound = blob.sourceCurrentRound;
     return true;
@@ -525,7 +524,7 @@ export class FlatBarrierStateMachine {
     );
   }
 
-  private handleF16WRequest(): void {
+  private async handleF16WRequest(): Promise<void> {
     if (!this.self) return;
     const now = Date.now();
     if (
@@ -534,9 +533,11 @@ export class FlatBarrierStateMachine {
     ) {
       return;
     }
-    const params = this.trainer.snapshotAnchor();
+    // Reserve the debounce window BEFORE the async read so concurrent
+    // requests during the read don't all kick off duplicate snapshots.
     this.lastF16WSentMs = now;
     this.lastF16WSentAnchor = this.anchorRound;
+    const params = await this.trainer.snapshotAnchor();
     this.transport.send(
       { kind: "broadcast" },
       {

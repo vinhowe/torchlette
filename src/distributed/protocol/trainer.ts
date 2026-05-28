@@ -26,43 +26,49 @@ export interface Trainer {
    * Snapshot current params as the anchor. Called once at startup (so the
    * initial random init becomes the round-0 anchor) and after every
    * successful outer step (the post-step params are the next anchor).
+   *
+   * Async because real implementations may need to read params from GPU.
    */
-  setAnchor(): void;
+  setAnchor(): Promise<void>;
 
-  /** Run K inner training steps. `round` is informational (for logging). */
-  innerSteps(round: number): Promise<void>;
+  /**
+   * Run K inner training steps. `round` is informational (for logging).
+   * Returns the average inner loss over the K steps (informational, the
+   * state machine just attaches it to the round report).
+   */
+  innerSteps(round: number): Promise<number>;
 
   /**
    * Compute (current_params - anchor_params) per tensor. Caller MUST NOT
    * mutate the returned arrays — they may share storage with the trainer's
    * internal buffers depending on implementation.
    */
-  pseudograd(): Float32Array[];
+  pseudograd(): Promise<Float32Array[]>;
 
   /**
    * Apply outer optimization step using the averaged pseudograd from all
    * participating peers. Mutates current params AND moves the anchor to
    * the new params atomically.
    */
-  applyOuterStep(avgGrad: Float32Array[]): void;
+  applyOuterStep(avgGrad: Float32Array[]): Promise<void>;
 
   /**
    * Reset current params back to the anchor. Called when the quorum was
    * not met for this round so the local inner-step drift would be
    * incoherent with no peer ever seeing it.
    */
-  revertToAnchor(): void;
+  revertToAnchor(): Promise<void>;
 
   /** Anchor params for outbound F16W (copies — receiver may mutate). */
-  snapshotAnchor(): Float32Array[];
+  snapshotAnchor(): Promise<Float32Array[]>;
 
   /**
    * Apply an inbound F16W payload: overwrite params AND anchor with the
    * supplied tensors. Caller must follow with resetOptimState() to clear
    * the now-meaningless optimizer trajectory.
    */
-  applyF16W(params: Float32Array[]): void;
+  applyF16W(params: Float32Array[]): Promise<void>;
 
   /** Zero both inner and outer optimizer state (moments, velocity). */
-  resetOptimState(): void;
+  resetOptimState(): Promise<void>;
 }
