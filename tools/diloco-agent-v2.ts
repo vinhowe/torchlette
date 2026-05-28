@@ -162,7 +162,7 @@ async function main(): Promise<void> {
     batchSize: BATCH_SIZE,
     seqLen: SEQ_LEN,
     accumSteps: ACCUM_STEPS,
-    weightDecay: 0.1,
+    weightDecay: parseFloat(process.env.WEIGHT_DECAY ?? "0.1"),
     fullFinetuning: true,
     checkpointing: true,
     log,
