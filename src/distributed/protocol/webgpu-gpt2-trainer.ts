@@ -302,25 +302,14 @@ export class WebGPUGPT2Trainer implements Trainer {
       totalLoss += await loss.item();
       const backwardTarget = scaler ? scaler.scale(loss) : loss;
       await backwardTarget.backward();
+      if (scaler) scaler.unscale_(this.innerOpt);
+      if (this.opts.gradClipNorm > 0) {
+        clipGradNorm_(api, this.params, this.opts.gradClipNorm);
+      }
       if (scaler) {
-        // See src/optim/grad-scaler.ts: the fused-Adam unscale path defers
-        // the actual unscale into the Adam kernel and leaves param.grad
-        // still scaled. clipGradNorm_ here would otherwise read scaled
-        // grads and clip by ~scale*, so scale the clip threshold to compensate.
-        scaler.unscale_(this.innerOpt);
-        if (this.opts.gradClipNorm > 0) {
-          clipGradNorm_(
-            api,
-            this.params,
-            this.opts.gradClipNorm * scaler.getScale(),
-          );
-        }
         scaler.step(this.innerOpt);
         scaler.update();
       } else {
-        if (this.opts.gradClipNorm > 0) {
-          clipGradNorm_(api, this.params, this.opts.gradClipNorm);
-        }
         this.innerOpt.step();
       }
       this.innerOpt.zeroGrad();

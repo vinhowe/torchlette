@@ -223,34 +223,14 @@ export class GradScaler {
 
     const backend = runtime.getBackend(device);
 
-    // Fused-Adam unscale path: pass invScale/infFlagBuffer to Adam so it
-    // unscales inside the adamStep kernel (one dispatch per param instead
-    // of two). Adam.step() will consume the pending unscale config.
-    //
-    // KNOWN FOOTGUN: callers who read param.grad between unscale_() and
-    // step() (e.g. clip_grad_norm_ between them) will see SCALED values.
-    // The PyTorch-standard pattern unscale_ -> clip -> step is therefore
-    // broken on this path. The trainer compensates by scaling the clip
-    // threshold by scaler.getScale() (see webgpu-gpt2-trainer.ts). The
-    // proper fix is to take the lazy `unscaleGrad` path below
-    // unconditionally, but that op currently doesn't register its result
-    // buffer with the compiled-plan recorder — see executor.ts:1360 —
-    // which invalidates the plan cache every step and makes step time
-    // grow ~250ms/round in measurement. Track that fix separately and
-    // remove this early-return + the trainer's scale-the-threshold hack
-    // when it lands.
-    if (
-      backend.ops.adamStep &&
-      isFusedOptimizer(optimizer) &&
-      optimizer.hasFusedKernel()
-    ) {
-      const infFlagBuffer = backend.ops.createInfCountBuffer?.();
-      optimizer.setUnscaleConfig(invScale, infFlagBuffer);
-      this._pendingInfBuffer = infFlagBuffer;
-      this._pendingInfBackend = backend;
-      return;
-    }
-
+    // Always update param.grad's lazy ref to point at the unscaled value
+    // via the `unscaleGrad` op. The graph is the source of truth: anything
+    // that reads param.grad between here and the optimizer step (e.g.
+    // clip_grad_norm_) sees the unscaled value, matching PyTorch's
+    // unscale_() -> clip -> step() pattern. The IR fuser can still combine
+    // unscaleGrad -> adamStep into a single dispatch when that's optimal,
+    // but it does so from the graph instead of via an out-of-band optimizer
+    // config that broke param.grad's semantics.
     if (backend.ops.unscaleGrad) {
       this._unscaleFused(params, invScale, backend, device);
     } else {

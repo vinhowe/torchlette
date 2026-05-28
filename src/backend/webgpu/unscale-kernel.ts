@@ -14,6 +14,7 @@
  * Handles large buffers (>maxStorageBufferBindingSize) via tile-IR dispatchChunked.
  */
 
+import { allocateOutputBuffer } from "./buffer-arena";
 import { awaitDeferredFence } from "./buffer-pool";
 import { computeFlatChunkLayout } from "./chunked-dispatch";
 import { getMaxStorageBufferBindingSize, requireContext } from "./gpu-context";
@@ -26,7 +27,6 @@ import {
   MAX_WORKGROUPS_PER_DIM,
   WORKGROUP_SIZE,
 } from "./shape-utils";
-import { trackSharedEncoderWrite } from "./shared-encoder";
 import {
   createTileKernelDispatcher,
   type TileKernelInstance,
@@ -249,21 +249,13 @@ function destroyPersistentInfFlagBuffer(): void {
 // Output Buffer Allocation
 // ============================================================================
 
-function allocateFreshOutputBuffer(
-  device: GPUDevice,
-  sizeBytes: number,
-): GPUBuffer {
-  const buf = device.createBuffer({
-    size: sizeBytes,
-    usage:
-      GPUBufferUsage.STORAGE |
-      GPUBufferUsage.COPY_SRC |
-      GPUBufferUsage.COPY_DST,
-  });
-  gpuMemoryTracker.trackAllocation(buf, sizeBytes);
-  trackSharedEncoderWrite(buf);
-  return buf;
-}
+// allocateFreshOutputBuffer used to hand-roll a device.createBuffer here,
+// which bypassed the arena, the buffer pool, and (critically) recordAlloc()
+// — so the resulting buffer never got a slot in bufferToSlot, the compiled
+// plan got invalidated every step the scaler ran, and the bind-group cache
+// missed because the buffer identity changed every step. Route through
+// allocateOutputBuffer like every other backend op so unscaleGrad
+// participates in plan recording and arena slotting.
 
 // ============================================================================
 // Dispatch
@@ -290,12 +282,11 @@ export function dispatchUnscaleGrad(
   const maxBindingSize = getMaxStorageBufferBindingSize();
   const needsChunking = totalBytes > maxBindingSize;
 
-  // Allocate output buffer (fresh, no pool reuse)
+  // Allocate output buffer through the canonical arena path so it gets a
+  // slot in bufferToSlot (compiled-plan validity) and stable identity
+  // across steps (bind-group cache hits).
   const alignedBytes = roundUpToPowerOfTwo(totalBytes);
-  const gradOut = allocateFreshOutputBuffer(
-    requireContext().device,
-    alignedBytes,
-  );
+  const gradOut = allocateOutputBuffer(alignedBytes);
 
   // Compute grid_stride for 2D-safe indexing based on per-chunk element count
   const elemPerChunk = needsChunking
