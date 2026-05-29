@@ -89,6 +89,15 @@ GPU memory is managed deterministically via two-tier reachability — no GC depe
 
 **Gradient specs**: Simple ops (elementwise) define gradients in `src/ops/registry.ts` (UnaryGradFn, BinaryTTGradFn, BinaryTSGradFn). Complex ops define gradients in `custom-backward.ts`. Don't add complex backward logic to `torchlette.ts`.
 
+## Framework Correctness Principles
+
+**Single source of truth at seams; assert agreement.** Wherever two sides must agree on a value — a producer and a consumer on a buffer's shape/layout, a compiled/fused path and the naive path on a result, GPU and CPU on an op's semantics — derive that value from ONE source and assert the other matches *at the seam*. Never let both sides independently recompute it: when they silently diverge you get correct-looking-but-wrong results (the worst failure mode — no crash, just silently degraded training). Three instances this bit us, all now structurally guarded:
+- **Row-program output layout** (`row-program-dispatch.ts`): the kernel's write count (scalar `[R,1]` vs full `[R,D]`) must equal the consuming node's `sizeOf(shape)`. The buffer is sized from the consumer's shape and the dispatch throws if the kernel's write count disagrees (caught → safe sequential fallback + warning). A misclassified `scalarOutput` once made every row collapse onto row 0's value under `compile()`.
+- **Multi-output op consumers** (`graph-rewrites.ts` `structuralKey`, `fusion-detect.ts` `inputKey`): a pending ref's structural key MUST include `outputIndex`, else CSE merges consumers of different outputs of one node (SDPA dQ/dK collapsed onto dV). The canonical convention is `rewriter/matcher.ts` `refEqual` (compares node id AND outputIndex).
+- **GPU vs CPU op semantics** (`pow`): WGSL `pow(x,y)=exp2(y·log2(x))` is NaN for x<0 while the CPU `**` reference is correct — so CPU tests can't catch GPU-only numeric bugs. Integer-exponent `pow` lowers to a mul chain at the frontend to match.
+
+**Corollary — differentially test optimized paths against the naive one.** Fused / compiled / row-program / multi-output paths must be checked *numerically* against the plain (`enableFusion`-off, non-`compile()`, or CPU) path — not just "does it run." Every bug above was invisible to existing tests because they exercised only one path or ran on CPU; each fell out of a same-input cross-path diff (`tools/parity-forward-diff.ts`, `tools/compile-ln-repro.ts`, the jax-js bench). When you add a new optimized execution path, add a cross-path numerical guard with it.
+
 ## WebGPU Buffer Pool Invariants
 
 **Do NOT flush `pendingRelease` to pool mid-step.** Causes deterministic numerical corruption (~2% loss drift). Root cause: buffers released by earlier plans may still be read by GPU from a prior command buffer.

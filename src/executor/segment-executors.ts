@@ -330,14 +330,18 @@ export async function executeRowProgram(
     }
 
     setCurrentOpLabel("row-program");
+    const shape = outputNode.shape;
+    // Pass the consumer's element count (sizeOf(outputNode.shape)) as the single
+    // source of truth for the output layout — dispatchRowProgram sizes the buffer
+    // from it and asserts the kernel's write count matches (see SEAM INVARIANT).
     const outBuffer = dispatchRowProgram(
       program,
       inputBuffers,
       numRows,
       dimSize,
+      sizeOf(shape),
     );
 
-    const shape = outputNode.shape;
     outputNode.result = createStorageHandle(outputNode.device, {
       buffer: outBuffer,
       shape: shape.slice(),

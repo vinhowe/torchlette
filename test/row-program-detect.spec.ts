@@ -362,6 +362,7 @@ describe("row-program GPU dispatch", { timeout: 60000 }, () => {
       [inputT.buffer],
       3, // numRows
       4, // dimSize
+      3 * 4, // expectedOutElements: full-width [3,4] softmax output
     );
 
     // Read back and verify
