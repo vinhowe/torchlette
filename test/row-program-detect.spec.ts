@@ -208,6 +208,44 @@ describe("row-program-detect", () => {
     expect(program.inputs.length).toBe(1);
     expect(matches[0].outputNodeId).toBe(mulOut.id);
   });
+
+  it("marks a per-row SCALAR output rsqrt(mean(xc^2)+eps) as scalarOutput", () => {
+    // Regression guard for the compile() layernorm bug: when a row-program's
+    // output is an elementwise transform of reduction results (no per-element
+    // input), it is a per-row scalar [R,1] and MUST set scalarOutput. Without
+    // it, codegen emitted a full [R,D] write that a downstream [R,1] consumer
+    // read as row 0's value broadcast to every row. See tools/compile-ln-repro.ts
+    // and src/compiler/row-program-detect.ts (exprReadsInput).
+    const xNode = makeNode("tensorFromArray", [], [4, 8]);
+    xNode.result = { id: 200, device: "webgpu", backendTensor: {} as any };
+    const xRef: LazyRef = { kind: "pending", node: xNode };
+    const epsRef: LazyRef = { kind: "scalar", value: 1e-5, dtype: "f32" };
+    const mean1 = makeNode("mean", [xRef], [4, 1], "f32", {
+      dim: 1,
+      keepdim: true,
+    });
+    const sub1 = makeNode("sub", [xRef, pending(mean1)], [4, 8]);
+    const sq = makeNode("mul", [pending(sub1), pending(sub1)], [4, 8]);
+    const mean2 = makeNode("mean", [pending(sq)], [4, 1], "f32", {
+      dim: 1,
+      keepdim: true,
+    });
+    const addEps = makeNode("add", [pending(mean2), epsRef], [4, 1]);
+    // rsqrt is the TERMINAL output: a per-row inv-std scalar [4,1].
+    const rsqrtNode = makeNode("rsqrt", [pending(addEps)], [4, 1]);
+
+    const planNodes = [mean1, sub1, sq, mean2, addEps, rsqrtNode];
+    const { consumers, consumerCount } = buildConsumerMaps(planNodes);
+
+    const matches = detectRowPrograms(planNodes, consumerCount, consumers);
+    expect(matches.length).toBe(1);
+    const { program } = matches[0];
+    expect(matches[0].outputNodeId).toBe(rsqrtNode.id);
+    const write = program.phases[program.phases.length - 1];
+    expect(write.kind).toBe("write");
+    // The crux: elementwise-of-reduction output must be a per-row scalar write.
+    expect((write as { scalarOutput?: boolean }).scalarOutput).toBe(true);
+  });
 });
 
 // ============================================================================

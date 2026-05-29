@@ -24,6 +24,20 @@ import type {
   RPExpr,
   RPPhase,
 } from "./row-program-types";
+import { isRPValue } from "./row-program-types";
+
+/**
+ * Whether an expression reads any per-element input buffer (vs. only reduction
+ * results and constants). A write expression with NO per-element input produces
+ * one value PER ROW (reduced shape [...,1]) — e.g. `rsqrt(mean(xc²)+eps)`. Such
+ * outputs MUST use the scalar-output write path; emitting them full-width writes
+ * an [R,D] buffer that a downstream [R,1]-shaped consumer misreads (every row
+ * collapses onto row 0's block). See tools/compile-ln-repro.ts.
+ */
+function exprReadsInput(expr: RPExpr): boolean {
+  if (isRPValue(expr)) return expr.kind === "input";
+  return expr.inputs.some(exprReadsInput);
+}
 
 // ============================================================================
 // Helpers
@@ -497,7 +511,12 @@ function buildRowProgram(
   }
   if (!writeExpr) return null;
 
-  const isScalarOutput = REDUCE_OPS.has(outputNode.op);
+  // Per-row scalar output iff the write expression reads no per-element input
+  // (only reduceResults/consts). This covers both a bare reduction output AND
+  // elementwise transforms of reductions like rsqrt(mean(...)+eps). The old
+  // `REDUCE_OPS.has(outputNode.op)` test missed the latter, emitting a full
+  // [R,D] write that the [R,1] consumer collapsed onto row 0.
+  const isScalarOutput = !exprReadsInput(writeExpr);
   phases.push({
     kind: "write",
     bodyExpr: writeExpr,
