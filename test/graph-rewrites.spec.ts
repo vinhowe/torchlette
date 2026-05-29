@@ -923,6 +923,59 @@ describe("Graph Rewrites", () => {
 
       expect(count).toBe(0);
     });
+
+    it("does NOT merge consumers reading DIFFERENT outputs of one multi-output node", () => {
+      // Regression guard: structuralKey MUST include outputIndex. A multi-output
+      // node (e.g. fusedAttentionBackward → dQ/dK/dV at indices 0/1/2) feeds
+      // structurally-identical consumers that differ ONLY in which output slot
+      // they read. If the key drops outputIndex these keys collide, CSE merges
+      // the consumers, and every consumer collapses onto a single output — a
+      // silent gradient-corruption bug for any multi-output op. See
+      // tools/sdpa2-diff.ts and src/compiler/graph-rewrites.ts.
+      const prod = createLazyIRNode("matmul", [], [4], "f32", "cpu");
+      const mk = (outputIndex: number) =>
+        createLazyIRNode(
+          "contiguous",
+          [createPendingRef(prod, outputIndex)],
+          [4],
+          "f32",
+          "cpu",
+        );
+      const c0 = mk(0);
+      const c1 = mk(1);
+      const c2 = mk(2);
+
+      const ctx = buildContext([prod, c0, c1, c2]);
+      const bypassed = new Set<number>();
+      const count = eliminateCommonSubexpressions(ctx, bypassed);
+
+      // Three distinct outputs → three distinct keys → nothing merged.
+      expect(count).toBe(0);
+      expect(bypassed.size).toBe(0);
+    });
+
+    it("DOES merge consumers reading the SAME output index (sanity)", () => {
+      // The complement of the guard above: when the output slot matches, CSE
+      // must still fire — the outputIndex addition didn't break ordinary CSE.
+      const prod = createLazyIRNode("matmul", [], [4], "f32", "cpu");
+      const mk = () =>
+        createLazyIRNode(
+          "contiguous",
+          [createPendingRef(prod, 1)],
+          [4],
+          "f32",
+          "cpu",
+        );
+      const c0 = mk();
+      const c1 = mk();
+
+      const ctx = buildContext([prod, c0, c1]);
+      const bypassed = new Set<number>();
+      const count = eliminateCommonSubexpressions(ctx, bypassed);
+
+      expect(count).toBe(1);
+      expect(bypassed.has(c1.id)).toBe(true);
+    });
   });
 
   // ========================================================================
