@@ -27,17 +27,21 @@ const TOKENS_PATH =
   process.env.LOCAL_TOKENS ??
   "/mnt/pccfs2/backed_up/vin/dev/torchlette/ckpts/tinystories-tokens.bin";
 
-// Baseline trajectory recorded 2026-05-28 on dw-2-1 V100, AC ON + scaler +
+// Baseline trajectory re-verified 2026-05-29 on V100 (sivri), AC ON + scaler +
 // AdamW + plain GPT2 (no LoRA wrapper) + no-accumGrads path + selective
 // checkpointing + nanoGPT init (scaled residual projections, zeroed biases).
-// Loss should descend monotonically past these checkpoints. Tolerance
-// accounts for small variance from scaler scale adjustments + nondeterministic
-// kernel reductions; a regression > 0.4 nats here means training broke.
+// Re-recorded after the CSE-outputIndex, integer-pow, and row-program
+// scalar-output correctness fixes — the self-training trajectory is unchanged
+// from the original 2026-05-28 numbers within run-to-run noise (those fixes
+// matter for matched-weight gradient parity vs PyTorch, not this self-play loss
+// curve, since wrong-but-correlated grads still descend). Loss should descend
+// monotonically past these checkpoints. Tolerance absorbs scaler-scale jitter +
+// nondeterministic kernel reductions; a regression > 0.4 nats means training broke.
 const BASELINE: Record<number, number> = {
-  0: 9.56,
-  3: 5.79,
+  0: 9.5,
+  3: 5.8,
   6: 5.24,
-  9: 4.91,
+  9: 4.92,
 };
 const LOSS_TOLERANCE = 0.4;
 // Steady-state peak GPU memory tolerance (after warmup): catches leaks
