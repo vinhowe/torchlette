@@ -61,7 +61,11 @@ export function clipGradNorm_(
     } else if (normType === 2) {
       let totalSumSq: Tensor | null = null;
       for (const g of grads) {
-        const sq = api.pow(g, 2);
+        // mul(g, g), NOT pow(g, 2): pow is implemented as exp(2*ln(g)) which
+        // is NaN for negative inputs. Gradients are signed, so pow(g, 2) would
+        // poison the norm with NaN (→ wrong/skipped clipping). x*x is exact for
+        // any sign. (The general normType branch below already abs()es first.)
+        const sq = api.mul(g, g);
         const sumSq = api.sum(sq);
         totalSumSq = totalSumSq === null ? sumSq : api.add(totalSumSq, sumSq);
       }

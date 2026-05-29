@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import { nn, Torchlette } from "../src";
+import { initWebGPU } from "../src/backend/webgpu";
+import { cpuOnly } from "./helpers/webgpu";
 
 describe("Gradient Clipping", () => {
   const api = new Torchlette("cpu");
@@ -75,5 +77,39 @@ describe("Gradient Clipping", () => {
       // No error should be thrown
       nn.clipGradValue_(api, [a], 1.0);
     });
+  });
+});
+
+// WebGPU-specific: the L2 norm squares the gradients. WGSL's pow(x,y) =
+// exp2(y*log2(x)) is NaN for x<0, so the original pow(g,2) poisoned the norm
+// for any tensor with negative grad entries (i.e. essentially always) on the
+// GPU — silently breaking clipping. The CPU backend uses JS ** (correct), so
+// this only reproduces on WebGPU. Guards the pow(g,2)->mul(g,g) fix and the
+// integer-pow lowering. See src/nn/clip-grad.ts and src/frontend/torchlette.ts.
+describe.skipIf(cpuOnly)("Gradient Clipping (WebGPU, negative grads)", () => {
+  const api = new Torchlette("webgpu");
+  beforeAll(async () => {
+    if (!(await initWebGPU())) throw new Error("WebGPU init failed");
+  });
+
+  it("clips correctly with negative gradients (no NaN from pow(g,2))", async () => {
+    const a = api.tensorFromArray([1, 1], [2], { requiresGrad: true });
+    // grad(a) = [-3, 4]  => total L2 norm = 5 (would be NaN if pow(-3,2)=NaN)
+    const loss = api.mul(a, api.tensorFromArray([-3, 4], [2])).sum();
+    await loss.backward();
+    await nn.clipGradNorm_(api, [a], 1.0);
+    const g = await a.grad!.cpu();
+    const scale = 1.0 / (5.0 + 1e-6);
+    expect(Number.isNaN(g[0]!)).toBe(false);
+    expect(g[0]!).toBeCloseTo(-3 * scale, 4);
+    expect(g[1]!).toBeCloseTo(4 * scale, 4);
+  });
+
+  it("pow(x, 2) and pow(x, 3) are exact for negative x", async () => {
+    const x = api.tensorFromArray([-2, 3, -1], [3], { device: "webgpu" });
+    const sq = await api.pow(x, 2).cpu();
+    const cube = await api.pow(x, 3).cpu();
+    expect(Array.from(sq)).toEqual([4, 9, 1]);
+    expect(Array.from(cube)).toEqual([-8, 27, -1]);
   });
 });

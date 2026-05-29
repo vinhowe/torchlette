@@ -1763,6 +1763,41 @@ for (const opName of BINARY_AUTOGRAD_OPS) {
   };
 }
 
+// Override pow: lower pow(x, k) for a non-negative INTEGER exponent k to a
+// multiplication chain (exponentiation by squaring) instead of the generic
+// pow node. WGSL's pow(x, y) = exp2(y * log2(x)) returns NaN for x < 0, so
+// pow(signedTensor, 2) silently poisons results (this bit clipGradNorm_'s L2
+// norm). x*x is exact for any sign, needs no transcendental, and its autograd
+// (gradient accumulated through both mul inputs) reproduces d/dx x^k = k*x^(k-1)
+// exactly. Non-integer, negative, or tensor exponents keep the real pow (whose
+// log-based gradient is genuinely needed and matches PyTorch's domain limits).
+const _powTranscendental = Torchlette.prototype.pow;
+(Torchlette.prototype as any).pow = function (
+  this: Torchlette,
+  a: Tensor | number,
+  b: Tensor | number,
+): Tensor {
+  if (
+    typeof a !== "number" &&
+    typeof b === "number" &&
+    Number.isInteger(b) &&
+    b >= 0
+  ) {
+    // x^0 = 1 (a constant; pow would give NaN for x<0 via 0*log2(x)=NaN).
+    if (b === 0) return this.ones(a.shape, { device: a.device });
+    let result: Tensor | null = null;
+    let base: Tensor = a;
+    let e = b;
+    while (e > 0) {
+      if (e % 2 === 1) result = result === null ? base : this.mul(result, base);
+      e = Math.floor(e / 2);
+      if (e > 0) base = this.mul(base, base);
+    }
+    return result as Tensor;
+  }
+  return _powTranscendental.call(this, a, b);
+};
+
 // Comparison ops: non-differentiable, dispatch via _cmpOp.
 const COMPARISON_OPS = ["gt", "lt", "ge", "le", "eq", "ne"] as const;
 
