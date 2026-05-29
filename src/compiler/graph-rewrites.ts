@@ -255,7 +255,13 @@ function structuralKey(node: LazyIRNode): string | null {
   let key = `${node.op}|${node.shape.join(",")}|${node.dtype}`;
   for (const ref of node.inputs) {
     if (ref.kind === "pending") {
-      key += `|p:${ref.node.id}`;
+      // outputIndex MUST be part of the key: two refs to the same multi-output
+      // node but different output slots (e.g. fusedAttentionBackward dQ/dK/dV at
+      // indices 0/1/2) are DIFFERENT values. Omitting it makes structurally
+      // identical consumers of distinct outputs collide, so CSE merges them and
+      // every consumer collapses onto a single output — a silent, correctness-
+      // breaking gradient bug for any multi-output op (see tools/sdpa2-diff.ts).
+      key += `|p:${ref.node.id}:${ref.outputIndex ?? 0}`;
     } else if (ref.kind === "materialized") {
       key += `|m:${ref.storage.id}`;
     } else {

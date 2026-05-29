@@ -1146,9 +1146,12 @@ export function segmentPlanForExecution(
 /** Stable key for a non-scalar LazyRef (for input dedup tracking). */
 function inputKey(input: LazyRef): string | null {
   if (input.kind === "scalar") return null;
+  // Include outputIndex: distinct outputs of one multi-output node are distinct
+  // values needing distinct binding slots. Collapsing them here under-counts a
+  // fused group's inputs and can blow the storage-buffer binding limit.
   return input.kind === "materialized"
     ? `s:${input.storage.id}`
-    : `p:${input.node.id}`;
+    : `p:${input.node.id}:${input.outputIndex ?? 0}`;
 }
 
 /** Add a node's non-scalar input keys to a tracking set and return the count of newly added keys. */
