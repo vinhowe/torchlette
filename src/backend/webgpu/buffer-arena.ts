@@ -287,12 +287,56 @@ export function destroyArena(arena: BufferArena, force = false): void {
   }
 }
 
+/**
+ * Bounded-arena mode (TORCHLETTE_ARENA_LIVENESS=1): the per-position arena is
+ * UNBUDGETED — one persistent buffer per dispatch position sums to ~17GB for
+ * 124M GPT-2, OOMing a 32GB V100. Under this flag, buffers larger than a
+ * threshold SPILL to the budgeted buffer POOL instead of the arena: the pool
+ * already reclaims dead buffers SAFELY (released buffers wait in pendingRelease
+ * and are only reused after a GPU fence — so a buffer read by a still-queued op
+ * is never handed out, the hazard that a naive arena-side reuse hits). This
+ * bounds memory to the pool's live working set while keeping the many small
+ * buffers arena-resident for bind-group stability. The compiled-plan fast-replay
+ * records fixed per-position buffer identities, which spilling breaks, so it is
+ * disabled under this flag (executor gates on arenaLivenessEnabled()). The large
+ * activations are short-lived, so losing their bind-group stability costs little.
+ * Default off. Threshold via TORCHLETTE_ARENA_MAX_BUFFER_MB (default 2MB).
+ */
+let _arenaLiveness: boolean | null = null;
+export function arenaLivenessEnabled(): boolean {
+  if (_arenaLiveness === null) {
+    _arenaLiveness =
+      process.env.TORCHLETTE_ARENA_LIVENESS === "1" ||
+      !!(globalThis as { __torchletteArenaLiveness?: boolean })
+        .__torchletteArenaLiveness;
+  }
+  return _arenaLiveness;
+}
+let _arenaSpillBytes: number | null = null;
+function arenaSpillThreshold(): number {
+  if (_arenaSpillBytes === null) {
+    const mb = process.env.TORCHLETTE_ARENA_MAX_BUFFER_MB;
+    _arenaSpillBytes = (mb ? parseFloat(mb) : 2) * 1024 * 1024;
+  }
+  return _arenaSpillBytes;
+}
+/** Test/diagnostic hook: re-read the flag + threshold from env. */
+export function resetArenaLivenessCache(): void {
+  _arenaLiveness = null;
+  _arenaSpillBytes = null;
+}
+
 /** Allocate or reuse an arena buffer at the given position in the given array. */
 function arenaAllocAt(
   arr: (GPUBuffer | undefined)[],
   idx: number,
   sizeBytes: number,
 ): GPUBuffer | null {
+  // Bounded-arena spill: large buffers bypass the unbudgeted arena and fall
+  // through to the budgeted, fence-safe pool (caller treats null as "use pool").
+  // Only valid because the compiled plan is disabled under this flag — otherwise
+  // its replay would reuse stale recorded identities for spilled positions.
+  if (arenaLivenessEnabled() && sizeBytes > arenaSpillThreshold()) return null;
   const alignedSize = alignBufferSize(sizeBytes);
   const neededSizeClass = getSizeClass(alignedSize);
 

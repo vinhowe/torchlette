@@ -8,6 +8,7 @@ import type {
 import { isFusedBackend } from "../backend/types";
 import {
   type BufferArena,
+  arenaLivenessEnabled,
   beginSharedEncoder,
   clearActiveArena,
   clearArenaConflictDetected,
@@ -587,7 +588,10 @@ export async function executeLoweredPlan(
     loweredPlan.compiledPlan?.valid &&
     useTopLevelSharedEncoder &&
     options.bufferArena &&
-    process.env.TORCHLETTE_COMPILED_PLAN !== "0"
+    process.env.TORCHLETTE_COMPILED_PLAN !== "0" &&
+    // Liveness-aware arena reuses one buffer across multiple positions, so the
+    // compiled plan's fixed per-position buffer identities no longer hold.
+    !arenaLivenessEnabled()
   ) {
     if (process.env.TORCHLETTE_DEBUG_COMPILED) {
       console.log(
@@ -641,7 +645,10 @@ export async function executeLoweredPlan(
     useTopLevelSharedEncoder &&
     options.bufferArena &&
     !loweredPlan.compiledPlan &&
-    options.bufferArena.resolve.length > 0; // Arena populated from prior execution
+    options.bufferArena.resolve.length > 0 && // Arena populated from prior execution
+    // Liveness-aware arena reuses buffers across positions, so the recorded
+    // fixed buffer identities would be wrong — don't build a compiled plan.
+    !arenaLivenessEnabled();
   let compilationRecording: ReturnType<
     typeof startCompilationRecording
   > | null = null;

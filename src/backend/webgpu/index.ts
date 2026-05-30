@@ -9,6 +9,7 @@ export {
 export type { BufferArena } from "./buffer-arena";
 export {
   allocateOutputBuffer,
+  arenaLivenessEnabled,
   clearActiveArena,
   clearArenaConflictDetected,
   clearArenaExternalInputBuffers,
