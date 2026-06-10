@@ -18,6 +18,7 @@ const GPU_TEST_FILES = [
   "test/frontend-dtype.spec.ts",
   "test/memory-aware-scheduler.spec.ts",
   "test/optim/grad-scaler.spec.ts",
+  "test/optim/fused-vs-elementwise.spec.ts",
   "test/oracle/gpt2-checkpoint-parity.spec.ts",
   "test/true-segmentation-benchmark.spec.ts",
 ];

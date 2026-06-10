@@ -1,0 +1,122 @@
+/**
+ * Adam trajectory probe: trains a small param vector for a few steps and
+ * prints the per-step param values as JSON. One engine per process — the
+ * framework's module-global state (template cache, params-sequence cache,
+ * shared-encoder state) makes multiple Torchlette instances in one process
+ * interfere, so trajectory comparisons must isolate per process (same
+ * methodology as tools/parity-fullstack-tl.ts).
+ *
+ * Used by test/optim/fused-vs-elementwise.spec.ts and as a CLI probe for
+ * optimizer work (docs/architecture-debt.md stage 0/1).
+ *
+ * Env: ELEMENTWISE=1 (force pure-graph path), ADAMW=0/1, WD (weight decay),
+ *      COMPILED=0 (disable compiled plan), FUSION=0 (disable fusion),
+ *      STEPS (default 6), N (default 64), LR (default 1e-2),
+ *      LR2 + LR2_AT (switch LR to LR2 from step LR2_AT — late-varying
+ *      schedule probe: exercises inlined-scalar staleness detection after
+ *      the compiled plan has already recorded).
+ */
+
+import { initWebGPU } from "../src/backend/webgpu";
+import { Torchlette } from "../src/frontend/torchlette";
+import { Adam } from "../src/optim";
+
+const N = parseInt(process.env.N ?? "64", 10);
+const STEPS = parseInt(process.env.STEPS ?? "6", 10);
+const LR = parseFloat(process.env.LR ?? "1e-2");
+const WD = parseFloat(process.env.WD ?? "0");
+const ADAMW = process.env.ADAMW !== "0";
+
+if (process.env.ELEMENTWISE === "1") process.env.TORCHLETTE_FUSED_ADAM = "0";
+if (process.env.FOREACH === "0") process.env.TORCHLETTE_FOREACH_ADAM = "0";
+if (process.env.COMPILED === "0") process.env.TORCHLETTE_COMPILED_PLAN = "0";
+
+/** Deterministic pseudo-random init (reproducible across processes). */
+function initData(seed: number): number[] {
+  const out: number[] = [];
+  let x = seed;
+  for (let i = 0; i < N; i++) {
+    x = (x * 1103515245 + 12345) % 2147483648;
+    out.push(((x / 2147483648) * 2 - 1) * 0.5);
+  }
+  return out;
+}
+
+async function main() {
+  if (!(await initWebGPU())) {
+    console.error("WebGPU init failed");
+    process.exit(1);
+  }
+  const api = new Torchlette("webgpu", {
+    enableFusion: process.env.FUSION !== "0",
+  });
+  // NPARAMS > 1 splits the same N elements across multiple differently-sized
+  // params (exercises real packing: cat/narrow/copy_-back in foreach).
+  // The CONCATENATED trajectory is identical to the single-param run, so
+  // outputs are comparable across NPARAMS settings.
+  const nParams = parseInt(process.env.NPARAMS ?? "1", 10);
+  const pData = initData(7);
+  const tData = initData(99);
+  const splits: number[] = [];
+  {
+    let rest = N;
+    for (let i = 0; i < nParams; i++) {
+      const take = i === nParams - 1 ? rest : Math.floor(rest / 2) || 1;
+      splits.push(take);
+      rest -= take;
+    }
+  }
+  const params = [];
+  const targets = [];
+  let off = 0;
+  for (const len of splits) {
+    params.push(
+      api.tensorFromArray(pData.slice(off, off + len), [len], {
+        device: "webgpu",
+        requiresGrad: true,
+      }),
+    );
+    targets.push(
+      api.tensorFromArray(tData.slice(off, off + len), [len], {
+        device: "webgpu",
+      }),
+    );
+    off += len;
+  }
+  const opt = new Adam(params, { lr: LR, weightDecay: WD, adamW: ADAMW }, api);
+
+  const lr2 = process.env.LR2 ? parseFloat(process.env.LR2) : null;
+  const lr2At = parseInt(process.env.LR2_AT ?? "4", 10);
+
+  const trajectory: number[][] = [];
+  for (let step = 0; step < STEPS; step++) {
+    if (lr2 !== null && step === lr2At) opt.setGroupLR(0, lr2);
+    await api.beginStep();
+    // L = sum((p - target)^2) → dL/dp = 2(p - target); grads evolve with p.
+    let loss = null;
+    for (let i = 0; i < params.length; i++) {
+      const diff = api.sub(params[i], targets[i]);
+      const partial = api.sum(api.mul(diff, diff));
+      loss = loss ? api.add(loss, partial) : partial;
+    }
+    await loss!.backward();
+    opt.step();
+    opt.zeroGrad();
+    api.endStep();
+    await api.markStep();
+    const stepVals: number[] = [];
+    for (const p of params) stepVals.push(...Array.from(await p.cpu()));
+    trajectory.push(stepVals);
+  }
+
+  // Write + exit in the flush callback: process.exit() truncates pending
+  // pipe writes at 8KB, and Dawn's background threads prevent a natural exit.
+  process.stdout.write(`${JSON.stringify(trajectory)}\n`, () => {
+    process.exit(0);
+  });
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

@@ -45,6 +45,17 @@ export class Adam {
   /** Intermediate tensors from the last step — disposed after markStep(). */
   private _intermediates: RuntimeTensor[] = [];
   private steps: number[];
+  /**
+   * Packed foreach state, keyed by group index. While the foreach path is
+   * active, m/v live as ONE flat tensor per group (the per-param expAvg
+   * arrays are consumed at first pack and become stale). Mirrors PyTorch's
+   * foreach optimizers: the per-param definition is the semantics, the
+   * packed form is the batched execution of the same tensor program.
+   */
+  private _foreachState = new Map<
+    number,
+    { m: RuntimeTensor; v: RuntimeTensor; sig: string }
+  >();
   /** Pending unscale config from GradScaler (fused unscale+Adam path) */
   private _pendingUnscale: { invScale: number; infFlagBuffer: unknown } | null =
     null;
@@ -199,10 +210,161 @@ export class Adam {
   step(): Tensor[] {
     const runtime = this.api._runtime();
 
-    if (this.hasFusedKernel()) {
+    // Path selection (each pinned to the others by
+    // test/optim/fused-vs-elementwise.spec.ts):
+    //  - fused WGSL kernel (WebGPU default; TORCHLETTE_FUSED_ADAM=0 disables)
+    //  - foreach: the per-param tensor program batched over ONE packed flat
+    //    tensor per group — pure graph ops, so fusion/compiled-plan/scalar
+    //    table all apply, at ~constant op count instead of ~13 ops per param
+    //    (TORCHLETTE_FOREACH_ADAM=0 disables)
+    //  - per-param elementwise: the reference definition.
+    if (this.hasFusedKernel() && process.env.TORCHLETTE_FUSED_ADAM !== "0") {
       return this._stepFused(runtime);
     }
+    if (
+      process.env.TORCHLETTE_FOREACH_ADAM !== "0" &&
+      this.params.length > 1
+    ) {
+      return this._stepForeach(runtime);
+    }
     return this._stepElementwise(runtime);
+  }
+
+  /**
+   * Foreach Adam step: the SAME tensor program as `_updateParamElementwise`,
+   * executed once per parameter GROUP over packed flat tensors instead of
+   * once per parameter. Packing is graph-level (reshape + cat + narrow +
+   * copy_), so every downstream system sees ordinary tensor ops: vertical
+   * fusion collapses the arithmetic chain, the scalar table keeps the
+   * per-step coefficients honest under template/compiled caching, and the
+   * compiled plan replays the whole thing without optimizer-specific hooks.
+   *
+   * m/v state lives permanently packed (no per-step state copies); only the
+   * grads and params are packed in (N segment copies) and the updated params
+   * copied back out (N segment copies).
+   */
+  private _stepForeach(runtime: ReturnType<Torchlette["_runtime"]>): Tensor[] {
+    const updated: Tensor[] = [];
+    const groups = new Map<number, number[]>();
+    for (let i = 0; i < this.params.length; i++) {
+      updated.push(this.params[i]);
+      const grad = this.params[i].grad?._unwrap() ?? null;
+      if (!grad) continue;
+      const gi = this._groupIndex[i];
+      const list = groups.get(gi);
+      if (list) list.push(i);
+      else groups.set(gi, [i]);
+    }
+    for (const [gi, idxs] of groups) {
+      this._foreachGroupStep(runtime, gi, idxs);
+    }
+    return updated;
+  }
+
+  private _foreachGroupStep(
+    runtime: ReturnType<Torchlette["_runtime"]>,
+    gi: number,
+    idxs: number[],
+  ): void {
+    const sizes = idxs.map((i) =>
+      this.params[i].shape.reduce((a, b) => a * b, 1),
+    );
+    const offsets: number[] = [];
+    let total = 0;
+    for (const s of sizes) {
+      offsets.push(total);
+      total += s;
+    }
+    const sig = idxs.map((i, k) => `${i}:${sizes[k]}`).join(",");
+
+    for (const i of idxs) this._advanceStep(i);
+    const t = this.steps[idxs[0]];
+    for (const i of idxs) {
+      if (this.steps[i] !== t) {
+        throw new Error(
+          "Adam foreach: params in one group have diverging step counts " +
+            "(gradients intermittently missing for some params). Set " +
+            "TORCHLETTE_FOREACH_ADAM=0 to use the per-param path.",
+        );
+      }
+    }
+    const lr = this._groups[gi].lr;
+    const wd = this._groups[gi].weightDecay;
+
+    // Pack grads and params: [size_i] flats concatenated to one [total].
+    const gFlat = idxs.map((i, k) =>
+      runtime.reshape(this.params[i].grad!._unwrap(), [sizes[k]]),
+    );
+    const G = runtime.cat(gFlat);
+    const pFlat = idxs.map((i, k) =>
+      runtime.reshape(this.params[i]._unwrap(), [sizes[k]]),
+    );
+    const P = runtime.cat(pFlat);
+
+    // Packed m/v: initialized ONCE by packing the current per-param state
+    // (zeros at start; real moments when switching paths or after
+    // resetState), then updated IN PLACE every step via copy_. Stable
+    // storage matters structurally: re-creating state tensors each step
+    // ping-pongs against the buffer arena (last step's m is still a live
+    // input while this step's m wants the same plan position) — fresh
+    // allocations every step, unbounded growth. In-place state also keeps
+    // the steady-state plan structure identical every step (one template,
+    // one compiled plan).
+    let st = this._foreachState.get(gi);
+    if (st && st.sig !== sig) {
+      throw new Error(
+        "Adam foreach: the set of grad-bearing params in a group changed " +
+          "across steps; packed state cannot be remapped. Set " +
+          "TORCHLETTE_FOREACH_ADAM=0 to use the per-param path.",
+      );
+    }
+    if (!st) {
+      const mFlat = idxs.map((i, k) =>
+        runtime.reshape(this.expAvg[i], [sizes[k]]),
+      );
+      const vFlat = idxs.map((i, k) =>
+        runtime.reshape(this.expAvgSq[i], [sizes[k]]),
+      );
+      st = { m: runtime.cat(mFlat), v: runtime.cat(vFlat), sig };
+      this._foreachState.set(gi, st);
+    }
+
+    // The exact tensor program of _updateParamElementwise, batched.
+    let gAdj = G;
+    if (wd !== 0 && !this.adamW) {
+      gAdj = runtime.add(gAdj, runtime.mul(P, wd));
+    }
+    const mNew = runtime.add(
+      runtime.mul(st.m, this.beta1),
+      runtime.mul(gAdj, 1 - this.beta1),
+    );
+    const vNew = runtime.add(
+      runtime.mul(st.v, this.beta2),
+      runtime.mul(runtime.mul(gAdj, gAdj), 1 - this.beta2),
+    );
+    runtime.copy_(st.m, mNew);
+    runtime.copy_(st.v, vNew);
+
+    const bc1 = 1 - this.beta1 ** t;
+    const bc2 = 1 - this.beta2 ** t;
+    const mHat = runtime.div(mNew, bc1);
+    const vHat = runtime.div(vNew, bc2);
+    const denom = runtime.add(runtime.sqrt(vHat), this.eps);
+    let scaled = runtime.mul(runtime.div(mHat, denom), lr);
+    if (wd !== 0 && this.adamW) {
+      // Decoupled weight decay: p -= lr*wd*p (PyTorch AdamW).
+      scaled = runtime.add(scaled, runtime.mul(P, lr * wd));
+    }
+    const pNew = runtime.sub(P, scaled);
+
+    // Unpack: copy each segment back into its (persistent) param storage.
+    for (let k = 0; k < idxs.length; k++) {
+      const seg = runtime.reshape(
+        runtime.narrow(pNew, 0, offsets[k], sizes[k]),
+        this.params[idxs[k]].shape,
+      );
+      runtime.copy_(this.params[idxs[k]]._unwrap(), seg);
+    }
   }
 
   /**
@@ -307,7 +469,13 @@ export class Adam {
 
     let gradAdj = grad;
     const wd = this._getParamWeightDecay(i);
-    if (wd !== 0) {
+    // Classic Adam: L2 regularization THROUGH the gradient (affects m/v).
+    // AdamW: weight decay is DECOUPLED — applied directly to the param in the
+    // final update (below), never entering the moment estimates. This must
+    // match the fused kernel's `decoupled_wd` semantics; the two paths had
+    // silently forked (elementwise did L2 even with adamW=true) until the
+    // fused-vs-elementwise differential test pinned them together.
+    if (wd !== 0 && !this.adamW) {
       const paramW = runtime.mul(param._unwrap(), wd);
       gradAdj = runtime.add(gradAdj, paramW);
     }
@@ -341,7 +509,12 @@ export class Adam {
     const mHat = runtime.div(avg, bc1);
     const vHat = runtime.div(avgSq, bc2);
     const denom = runtime.add(runtime.sqrt(vHat), this.eps);
-    const scaled = runtime.mul(runtime.div(mHat, denom), this._getParamLR(i));
+    const lr = this._getParamLR(i);
+    let scaled = runtime.mul(runtime.div(mHat, denom), lr);
+    if (wd !== 0 && this.adamW) {
+      // Decoupled weight decay: p -= lr*wd*p (PyTorch AdamW).
+      scaled = runtime.add(scaled, runtime.mul(param._unwrap(), lr * wd));
+    }
     runtime.copy_(param._unwrap(), runtime.sub(param._unwrap(), scaled));
   }
 
@@ -407,5 +580,12 @@ export class Adam {
       this.expAvgSq[i] = runtime.zeros(this.params[i].shape, this.device);
       this.steps[i] = 0;
     }
+    // Packed foreach state is built FROM the per-param state on the next
+    // step — dispose it so the reset takes effect there too.
+    for (const st of this._foreachState.values()) {
+      st.m.dispose();
+      st.v.dispose();
+    }
+    this._foreachState.clear();
   }
 }
