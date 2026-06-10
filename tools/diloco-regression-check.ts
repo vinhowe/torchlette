@@ -37,11 +37,23 @@ const TOKENS_PATH =
 // curve, since wrong-but-correlated grads still descend). Loss should descend
 // monotonically past these checkpoints. Tolerance absorbs scaler-scale jitter +
 // nondeterministic kernel reductions; a regression > 0.4 nats means training broke.
+// Re-recorded 2026-05-31 after the compiled-plan intra-plan-copy fix
+// (recordedCopyBufferToBuffer): the default/compiled path's embedding grads
+// were inflating +1x/replay (scatterAdd's a→out copy was unreplayed), which
+// made this trajectory converge to ~4.92; with correct grads it reached ~4.78.
+// Re-recorded 2026-06-10 after the volatile-uniform fix (TAG_UNIFORM): the
+// compiled optimizer plan was replaying Adam's bias-corrected step_size frozen
+// at record time (t of the recording step, forever), i.e. a wrong LR schedule.
+// That was the REAL cause of the 4.78-vs-lowered-4.64 gap previously written
+// off as "benign clip-amplified fp32 noise". With per-replay config re-derive,
+// the compiled path now matches the lowered trajectory: faster early descent
+// is gone (round 0: 9.54→9.81, the frozen early-t step size was inflated) and
+// final convergence improves (round 9: 4.78→4.64).
 const BASELINE: Record<number, number> = {
-  0: 9.5,
-  3: 5.8,
-  6: 5.24,
-  9: 4.92,
+  0: 9.81,
+  3: 5.92,
+  6: 5.15,
+  9: 4.64,
 };
 const LOSS_TOLERANCE = 0.4;
 // Steady-state peak GPU memory tolerance (after warmup): catches leaks
@@ -101,9 +113,10 @@ async function main() {
     seqLen: 256,
     accumSteps: 1,
     weightDecay: 0.01,
-    checkpointing: true,
-    useAutocast: true,
-    gradClipNorm: 1.0,
+    // Feature toggles (default on) — used to localize compiled-vs-lowered diffs.
+    checkpointing: process.env.CHECKPOINTING !== "0",
+    useAutocast: process.env.USE_AUTOCAST !== "0",
+    gradClipNorm: process.env.GRAD_CLIP === "0" ? undefined : 1.0,
     log: (m: string) => log(`trainer: ${m}`),
   });
   await trainer.initialize();

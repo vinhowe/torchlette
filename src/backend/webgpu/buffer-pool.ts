@@ -173,6 +173,39 @@ class SimpleBufferPool {
   }
 
   /**
+   * Take a buffer OUT of pool circulation so the pool never hands it to
+   * another consumer. Used by compiled plans (planned-buffer mode) to pin
+   * the recorded buffer assignment: the caller must also add the buffer to
+   * arenaBufferSet so the release chain (tensor.destroy / deferredDestroy)
+   * leaves it alone. No-op if the buffer isn't currently pool-resident
+   * (e.g. still owned by a live tensor — it then simply never re-enters the
+   * pool thanks to the arenaBufferSet shield).
+   */
+  adoptBuffer(buffer: GPUBuffer): void {
+    const sizeClass = getSizeClass(buffer.size);
+    const bucket = this.pool.get(sizeClass);
+    if (bucket) {
+      const idx = bucket.indexOf(buffer);
+      if (idx !== -1) {
+        bucket.splice(idx, 1);
+        const actualSize = getSizeForClass(sizeClass);
+        this.pooledBytes -= actualSize;
+        this.pooledBufferSet.delete(buffer);
+        gpuMemoryTracker.trackAllocation(buffer, actualSize);
+        return;
+      }
+    }
+    const pendingIdx = this.pendingRelease.findIndex(
+      (e) => e.buffer === buffer,
+    );
+    if (pendingIdx !== -1) {
+      const { size } = this.pendingRelease.splice(pendingIdx, 1)[0];
+      this.pendingReleaseBytes -= size;
+      gpuMemoryTracker.trackAllocation(buffer, size);
+    }
+  }
+
+  /**
    * Try to acquire a storage buffer from the pool, or return null if none available.
    * Only returns buffers with STORAGE | COPY_SRC | COPY_DST usage.
    *

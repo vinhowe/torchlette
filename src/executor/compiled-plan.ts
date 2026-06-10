@@ -15,6 +15,7 @@ import type { DType } from "../backend/types";
 import type {
   GPUBindGroup,
   GPUBuffer,
+  GPUCommandEncoder,
   GPUComputePipeline,
 } from "../backend/webgpu/gpu-types";
 import { setCompilationRecording } from "../backend/webgpu/webgpu-state";
@@ -60,6 +61,10 @@ export interface DispatchCommand {
   gx: number;
   gy: number;
   gz: number;
+  /** Op label for profiler attribution during replay. */
+  label?: string;
+  /** Module label for per-module GPU breakdown during replay. */
+  module?: string;
   /** Inline bind group cache — bypasses global sequence-indexed cache.
    *  Needed because the normal path mixes cachedCreateBindGroup (advances
    *  dispatchIndex) and profiledCreateBindGroup (doesn't), so the global
@@ -87,12 +92,46 @@ export interface BarrierCommand {
   tag: 4; // "barrier"
 }
 
+/**
+ * Zero a (reused) buffer. zeros() clears arena/pool buffers via clearBuffer
+ * because they may hold stale data; that clear is NOT a dispatch/copy, so it
+ * must be recorded explicitly or the compiled replay skips it — leaving stale
+ * data that corrupts accumulating ops (e.g. the embedding-grad scatter-add,
+ * which reads a zeroed accumulator). See compiled-plan-clearbuffer regression.
+ */
+export interface ClearCommand {
+  tag: 5; // "clear"
+  slot: Slot;
+  bytes: number;
+}
+
+/**
+ * Re-write a uniform/config buffer with values RE-DERIVED from the current
+ * step's plan node. Tile-IR config buffers are rewritten by the lowered path
+ * on every dispatch, but a replayed dispatch binds the buffer as-is — so any
+ * per-step-varying uniform (Adam's bias-corrected step_size, GradScaler's
+ * inv_scale) would silently replay STALE values (the frozen-step-size bug:
+ * compiled training ran with the t-of-recording learning rate forever).
+ *
+ * The invariant: per-step-varying values must flow into replays as DATA —
+ * either a tensor write (TAG_WRITE re-executes the data source node) or a
+ * volatile uniform (this command re-packs from the node's fresh payload).
+ */
+export interface UniformCommand {
+  tag: 6; // "uniform" — volatile config re-pack from current node payload
+  slot: Slot;
+  nodeIndex: number;
+  pack: (node: LazyIRNode) => ArrayBufferView;
+}
+
 export type GpuCommand =
   | AllocCommand
   | DispatchCommand
   | CopyCommand
   | WriteCommand
-  | BarrierCommand;
+  | BarrierCommand
+  | ClearCommand
+  | UniformCommand;
 
 // Numeric tags for fast switch in hot loop
 export const TAG_ALLOC = 0 as const;
@@ -100,6 +139,8 @@ export const TAG_DISPATCH = 1 as const;
 export const TAG_COPY = 2 as const;
 export const TAG_WRITE = 3 as const;
 export const TAG_BARRIER = 4 as const;
+export const TAG_CLEAR = 5 as const;
+export const TAG_UNIFORM = 6 as const;
 
 // ============================================================================
 // Node result mapping
@@ -134,13 +175,28 @@ export interface CompiledPlan {
    *  Restored after compiled plan execution so subsequent non-compiled plans
    *  see the correct global sequence counter positions. */
   endCounters?: { dispatch: number; params: number; output: number };
+  /**
+   * Planned-buffer mode (bounded arena): the recorded buffer per alloc slot.
+   * Replays bind these directly — the exact lifetime-reusing assignment the
+   * recording execution proved safe under the same command order — instead
+   * of growing an unbudgeted per-position arena.
+   */
+  allocBuffers?: (GPUBuffer | undefined)[];
+  /** Buffers adopted from the pool by this plan; destroyed on invalidation. */
+  adoptedBuffers?: GPUBuffer[];
 }
 
 // ============================================================================
 // Compilation: build CompiledPlan from recorded dispatches
 // ============================================================================
 
-import type { BufferArena } from "../backend/webgpu/buffer-arena";
+import {
+  arenaLivenessEnabled,
+  type BufferArena,
+} from "../backend/webgpu/buffer-arena";
+import { bufferPool } from "../backend/webgpu/buffer-pool";
+import { gpuMemoryTracker } from "../backend/webgpu/memory-tracker";
+import { arenaBufferSet } from "../backend/webgpu/webgpu-state";
 /** Recorded dispatch entry — the subset of fields needed by the compiled plan. */
 export interface RecordedDispatch {
   pipeline: GPUComputePipeline;
@@ -150,6 +206,14 @@ export interface RecordedDispatch {
   workgroupsZ: number;
   /** GPUBuffers referenced by this bind group. */
   buffers?: GPUBuffer[];
+  /**
+   * Slots resolved at RECORD time (parallel to `buffers`, -1 = unmapped).
+   * Slot resolution must be temporal: when the allocator reuses one GPUBuffer
+   * for two lifetimes (pool reuse under the bounded arena), the final
+   * buffer→slot map only knows the LAST lifetime — resolving at build time
+   * would wire earlier consumers to the wrong slot.
+   */
+  slots?: number[];
   /** Op label for GPU timestamp profiling. */
   label?: string;
   /** Module label for per-module GPU breakdown. */
@@ -195,7 +259,50 @@ export function buildCompiledPlan(input: {
 }): CompiledPlan {
   const { commandLog, bufferToSlot, slotSources, nodeResults } = input;
 
+  // A recording hook flagged something a frozen replay would get wrong
+  // (e.g. step-varying uniform data with no volatile repack) — fall back
+  // to the lowered path for this template.
+  if (recordingInvalidReason) {
+    if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+      console.log(`[compiled] FAIL: ${recordingInvalidReason}`);
+    }
+    recordingInvalidReason = null;
+    return { commands: [], slots: [], results: [], valid: false };
+  }
+
   const commands: GpuCommand[] = [];
+
+  // Planned-buffer mode (EXPERIMENTAL, TORCHLETTE_COMPILED_PLANNED=1 under
+  // the bounded arena): the recording execution allocated through the
+  // budgeted POOL with liveness reuse, so memory stayed bounded — but the
+  // recorded buffer identities are then per-LIFETIME, not persistent.
+  // Capture the recorded buffer for every alloc slot and pin (adopt) those
+  // buffers to the plan, so replays bind the exact assignment the recording
+  // proved safe under the same command order.
+  //
+  // STATUS 2026-06-10: structure validated (fixed-weight probe replays at
+  // 1e-8; all allocs bind planned, zero fallbacks), but the full training
+  // loop reads STALE grads on replay steps (first dynamic-fallback replay is
+  // correct, the second is stale) — a cross-step buffer-reuse/readback
+  // ordering issue still to be root-caused. Off by default.
+  const planned =
+    arenaLivenessEnabled() && process.env.TORCHLETTE_COMPILED_PLANNED === "1";
+  const allocBuffers: (GPUBuffer | undefined)[] | undefined = planned
+    ? []
+    : undefined;
+
+  // Assign a persistent slot at BUILD time for a buffer unmapped at record
+  // time (config caches, k-split temps — long-lived singletons, never
+  // lifetime-split, so build-time resolution is safe for them).
+  const persistentSlot = (buf: GPUBuffer): Slot => {
+    let slot = bufferToSlot.get(buf);
+    if (slot === undefined) {
+      slot = slotSources.length;
+      bufferToSlot.set(buf, slot);
+      slotSources.push({ kind: "persistent", buffer: buf });
+    }
+    return slot;
+  };
 
   for (const entry of commandLog) {
     switch (entry.kind) {
@@ -206,15 +313,9 @@ export function buildCompiledPlan(input: {
           continue;
         }
         const bindings: Slot[] = [];
-        for (const buf of d.buffers) {
-          let slot = bufferToSlot.get(buf);
-          if (slot === undefined) {
-            // Auto-assign as persistent: cached/singleton buffer (attention config, k-split temp, etc.)
-            slot = slotSources.length;
-            bufferToSlot.set(buf, slot);
-            slotSources.push({ kind: "persistent", buffer: buf });
-          }
-          bindings.push(slot);
+        for (let i = 0; i < d.buffers.length; i++) {
+          const recorded = d.slots?.[i] ?? -1;
+          bindings.push(recorded >= 0 ? recorded : persistentSlot(d.buffers[i]));
         }
         commands.push({
           tag: TAG_DISPATCH,
@@ -223,12 +324,14 @@ export function buildCompiledPlan(input: {
           gx: d.workgroupsX,
           gy: d.workgroupsY,
           gz: d.workgroupsZ,
+          label: d.label,
+          module: d.module,
         });
         break;
       }
       case "alloc": {
-        const slot = bufferToSlot.get(entry.buffer);
-        if (slot === undefined) {
+        const slot = entry.slot;
+        if (slot < 0) {
           if (process.env.TORCHLETTE_DEBUG_COMPILED) {
             console.log(
               `[compiled] FAIL: alloc buffer unmapped, size=${entry.bytes}, commands so far=${commands.length}`,
@@ -236,33 +339,21 @@ export function buildCompiledPlan(input: {
           }
           return { commands: [], slots: [], results: [], valid: false };
         }
-        const inputSlots: Slot[] = [];
-        for (const ib of entry.inputBuffers) {
-          const is_ = bufferToSlot.get(ib);
-          if (is_ !== undefined) inputSlots.push(is_);
-        }
+        if (allocBuffers) allocBuffers[slot] = entry.buffer;
         commands.push({
           tag: TAG_ALLOC,
           slot,
           bytes: entry.bytes,
           allocKind: entry.allocKind,
-          inputSlots,
+          inputSlots: entry.inputSlots,
         });
         break;
       }
       case "copy": {
-        let srcSlot = bufferToSlot.get(entry.copy.src);
-        let dstSlot = bufferToSlot.get(entry.copy.dst);
-        if (srcSlot === undefined) {
-          srcSlot = slotSources.length;
-          bufferToSlot.set(entry.copy.src, srcSlot);
-          slotSources.push({ kind: "persistent", buffer: entry.copy.src });
-        }
-        if (dstSlot === undefined) {
-          dstSlot = slotSources.length;
-          bufferToSlot.set(entry.copy.dst, dstSlot);
-          slotSources.push({ kind: "persistent", buffer: entry.copy.dst });
-        }
+        const srcSlot =
+          entry.srcSlot >= 0 ? entry.srcSlot : persistentSlot(entry.copy.src);
+        const dstSlot =
+          entry.dstSlot >= 0 ? entry.dstSlot : persistentSlot(entry.copy.dst);
         commands.push({
           tag: TAG_COPY,
           src: srcSlot,
@@ -274,20 +365,73 @@ export function buildCompiledPlan(input: {
         break;
       }
       case "write": {
-        const slot = bufferToSlot.get(entry.buffer);
-        if (slot === undefined) {
+        if (entry.slot < 0) {
           return { commands: [], slots: [], results: [], valid: false };
         }
         commands.push({
           tag: TAG_WRITE,
-          slot,
+          slot: entry.slot,
           nodeIndex: entry.nodeIndex,
         });
+        break;
+      }
+      case "uniform": {
+        // Config buffers live in long-lived per-dispatcher caches, so they are
+        // not arena/write slots — assign as persistent if not already mapped.
+        commands.push({
+          tag: TAG_UNIFORM,
+          slot: persistentSlot(entry.buffer),
+          nodeIndex: entry.nodeIndex,
+          pack: entry.pack,
+        });
+        break;
+      }
+      case "clear": {
+        if (entry.slot < 0) {
+          // The cleared buffer has no slot (not recorded as an alloc/output).
+          // Can't replay the zeroing safely — invalidate and fall back to the
+          // lowered path rather than ship a plan that skips a required clear.
+          if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+            console.log(
+              `[compiled] FAIL: clear buffer unmapped, size=${entry.bytes}, commands so far=${commands.length}`,
+            );
+          }
+          return { commands: [], slots: [], results: [], valid: false };
+        }
+        commands.push({ tag: TAG_CLEAR, slot: entry.slot, bytes: entry.bytes });
         break;
       }
       case "barrier": {
         commands.push({ tag: TAG_BARRIER });
         break;
+      }
+    }
+  }
+
+  // Pin the recorded alloc buffers to the plan: take them out of pool
+  // circulation (adopt) and shield them from the release chain via
+  // arenaBufferSet — the same protection arena buffers get. Adoption is
+  // REFCOUNTED because a pool buffer released by one plan's liveness can be
+  // re-acquired by a LATER plan in the same step (forward's dead activation
+  // buffer reused by backward) — both plans then pin the same buffer and it
+  // must survive until the last one is destroyed. Buffers already
+  // arena-owned (small, below the spill threshold) are left to the arena.
+  let adoptedBuffers: GPUBuffer[] | undefined;
+  if (allocBuffers) {
+    adoptedBuffers = [];
+    const seen = new Set<GPUBuffer>();
+    for (const buf of allocBuffers) {
+      if (!buf || seen.has(buf)) continue;
+      seen.add(buf);
+      const rc = adoptedRefCount.get(buf);
+      if (rc !== undefined) {
+        adoptedRefCount.set(buf, rc + 1);
+        adoptedBuffers.push(buf);
+      } else if (!arenaBufferSet.has(buf)) {
+        bufferPool.adoptBuffer(buf);
+        arenaBufferSet.add(buf);
+        adoptedRefCount.set(buf, 1);
+        adoptedBuffers.push(buf);
       }
     }
   }
@@ -298,12 +442,14 @@ export function buildCompiledPlan(input: {
     const barrierCount = commands.filter((c) => c.tag === TAG_BARRIER).length;
     const writeCount = commands.filter((c) => c.tag === TAG_WRITE).length;
     const copyCount = commands.filter((c) => c.tag === TAG_COPY).length;
+    const clearCount = commands.filter((c) => c.tag === TAG_CLEAR).length;
+    const uniformCount = commands.filter((c) => c.tag === TAG_UNIFORM).length;
     const slotKinds: Record<string, number> = {};
     for (const s of slotSources) {
       slotKinds[s.kind] = (slotKinds[s.kind] || 0) + 1;
     }
     console.log(
-      `[compiled] Built: ${commands.length} cmds (${dispatchCount} dispatch, ${allocCount} alloc, ${barrierCount} barrier, ${writeCount} write, ${copyCount} copy), ${slotSources.length} slots (${JSON.stringify(slotKinds)}), ${nodeResults.length} results`,
+      `[compiled] Built: ${commands.length} cmds (${dispatchCount} dispatch, ${allocCount} alloc, ${barrierCount} barrier, ${writeCount} write, ${copyCount} copy, ${clearCount} clear, ${uniformCount} uniform), ${slotSources.length} slots (${JSON.stringify(slotKinds)}), ${nodeResults.length} results`,
     );
   }
 
@@ -312,13 +458,51 @@ export function buildCompiledPlan(input: {
     slots: slotSources,
     results: nodeResults,
     valid: true,
+    allocBuffers,
+    adoptedBuffers,
   };
+}
+
+/** Refcount for buffers adopted by compiled plans (shared across plans when
+ *  pool-liveness reuse hands one buffer to multiple plans in a step). */
+const adoptedRefCount = new Map<GPUBuffer, number>();
+
+/**
+ * Release a plan's adopted buffers (planned-buffer mode). Called when the
+ * compiled plan is invalidated or its template evicted. Buffers still owned
+ * by a live tensor re-enter the normal release chain once unpinned; the rest
+ * are destroyed immediately.
+ */
+export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
+  if (!compiled.adoptedBuffers) return;
+  for (const buf of compiled.adoptedBuffers) {
+    const rc = adoptedRefCount.get(buf);
+    if (rc !== undefined && rc > 1) {
+      adoptedRefCount.set(buf, rc - 1);
+      continue;
+    }
+    adoptedRefCount.delete(buf);
+    arenaBufferSet.delete(buf);
+    if (bufferPool.canRecycle(buf)) {
+      gpuMemoryTracker.trackDeallocation(buf);
+      try {
+        buf.destroy();
+      } catch {
+        /* already destroyed */
+      }
+    }
+  }
+  compiled.adoptedBuffers = undefined;
+  compiled.allocBuffers = undefined;
 }
 
 // ============================================================================
 // Command log entry types (used during recording)
 // ============================================================================
 
+// Slots are resolved at RECORD time (-1 / undefined = unmapped at record
+// time → assigned a persistent slot at build). See RecordedDispatch.slots
+// for why temporal resolution matters under buffer-lifetime reuse.
 export type CommandLogEntry =
   | { kind: "dispatch"; dispatch: RecordedDispatch }
   | {
@@ -327,9 +511,18 @@ export type CommandLogEntry =
       bytes: number;
       allocKind: 0 | 1;
       inputBuffers: GPUBuffer[];
+      slot: Slot;
+      inputSlots: Slot[];
     }
-  | { kind: "copy"; copy: RecordedCopy }
-  | { kind: "write"; buffer: GPUBuffer; nodeIndex: number }
+  | { kind: "copy"; copy: RecordedCopy; srcSlot: Slot; dstSlot: Slot }
+  | { kind: "write"; buffer: GPUBuffer; nodeIndex: number; slot: Slot }
+  | { kind: "clear"; buffer: GPUBuffer; bytes: number; slot: Slot }
+  | {
+      kind: "uniform";
+      buffer: GPUBuffer;
+      nodeIndex: number;
+      pack: (node: LazyIRNode) => ArrayBufferView;
+    }
   | { kind: "barrier" };
 
 // ============================================================================
@@ -344,6 +537,15 @@ let activeBufferToSlot: Map<GPUBuffer, Slot> | null = null;
 let activeSlotSources: SlotSource[] | null = null;
 /** Next slot index to assign. */
 let nextSlot = 0;
+/** Plan-node index of the node currently being executed (recording only). */
+let recordingNodeIndex = -1;
+/**
+ * Set when a recording hook detects something a replay cannot faithfully
+ * reproduce (e.g. a config buffer whose data changed across executions with
+ * no volatile repack). Survives stopCompilationRecording so buildCompiledPlan
+ * (which runs after) can read it; reset by startCompilationRecording.
+ */
+let recordingInvalidReason: string | null = null;
 
 /** Start compilation recording. Call before the normal-path execution. */
 export function startCompilationRecording(): {
@@ -355,12 +557,33 @@ export function startCompilationRecording(): {
   activeBufferToSlot = new Map();
   activeSlotSources = [];
   nextSlot = 0;
+  recordingNodeIndex = -1;
+  recordingInvalidReason = null;
   setCompilationRecording(true);
   return {
     commandLog: activeCommandLog,
     bufferToSlot: activeBufferToSlot,
     slotSources: activeSlotSources,
   };
+}
+
+/** Executor hook: the plan-node index about to be executed (for recording). */
+export function setRecordingNodeIndex(nodeIndex: number): void {
+  recordingNodeIndex = nodeIndex;
+}
+
+/**
+ * Poison the active recording. buildCompiledPlan returns an invalid plan, so
+ * the template keeps using the (always-correct) lowered path. Use when a
+ * recording hook observes state a frozen replay would get wrong.
+ */
+export function invalidateActiveRecording(reason: string): void {
+  if (activeCommandLog && !recordingInvalidReason) {
+    recordingInvalidReason = reason;
+    if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+      console.log(`[compiled] recording invalidated: ${reason}`);
+    }
+  }
 }
 
 /** Stop compilation recording. */
@@ -426,7 +649,17 @@ export function getAndClearLastBindGroupBuffers(): GPUBuffer[] | undefined {
  * is active. The dispatch's buffers must already have slots assigned.
  */
 export function recordDispatch(dispatch: RecordedDispatch): void {
-  activeCommandLog?.push({ kind: "dispatch", dispatch });
+  if (!activeCommandLog) return;
+  // Resolve binding slots NOW — the buffer→slot map is temporal under
+  // buffer-lifetime reuse (see RecordedDispatch.slots).
+  if (dispatch.buffers && activeBufferToSlot) {
+    const slots = new Array<number>(dispatch.buffers.length);
+    for (let i = 0; i < dispatch.buffers.length; i++) {
+      slots[i] = activeBufferToSlot.get(dispatch.buffers[i]) ?? -1;
+    }
+    dispatch.slots = slots;
+  }
+  activeCommandLog.push({ kind: "dispatch", dispatch });
 }
 
 /**
@@ -440,27 +673,130 @@ export function recordAlloc(
   inputBuffers: GPUBuffer[],
 ): void {
   if (!activeCommandLog) return;
-  // Assign arena slot for this output buffer
-  assignSlot(buffer, { kind: "arena" });
+  // Lifetime splitting: when the allocator (pool reuse under the bounded
+  // arena) hands the SAME GPUBuffer to a second alloc position, the two
+  // allocations are distinct LIFETIMES and must get distinct slots — commands
+  // recorded before this point keep the old slot (first lifetime), commands
+  // after resolve to the new slot (second lifetime). Without this, all
+  // references collapse onto the first slot and the replay wires later
+  // consumers to the wrong logical value.
+  let slot: Slot;
+  if (activeBufferToSlot && activeSlotSources) {
+    const existing = activeBufferToSlot.get(buffer);
+    if (existing !== undefined) {
+      // An alloc is always a fresh lifetime, whatever the buffer's previous
+      // slot kind was (arena, external, write) — re-point the buffer.
+      slot = nextSlot++;
+      activeBufferToSlot.set(buffer, slot);
+      activeSlotSources.push({ kind: "arena" });
+    } else {
+      slot = assignSlot(buffer, { kind: "arena" });
+    }
+  } else {
+    slot = -1;
+  }
+  const inputSlots: Slot[] = [];
+  for (const ib of inputBuffers) {
+    const is_ = activeBufferToSlot?.get(ib);
+    if (is_ !== undefined) inputSlots.push(is_);
+  }
   activeCommandLog.push({
     kind: "alloc",
     buffer,
     bytes,
     allocKind,
     inputBuffers,
+    slot,
+    inputSlots,
   });
 }
 
 /** Record a buffer-to-buffer copy. Called from shared encoder wrapper. */
 export function recordCopy(copy: RecordedCopy): void {
-  activeCommandLog?.push({ kind: "copy", copy });
+  if (!activeCommandLog) return;
+  activeCommandLog.push({
+    kind: "copy",
+    copy,
+    srcSlot: activeBufferToSlot?.get(copy.src) ?? -1,
+    dstSlot: activeBufferToSlot?.get(copy.dst) ?? -1,
+  });
+}
+
+/**
+ * Encode a buffer-to-buffer copy on the shared encoder AND record it for the
+ * compiled plan. Use this for any INTRA-PLAN copy — one whose destination is
+ * later read by a dispatch in the same plan (scatter-add accumulator, cat
+ * assembly, matmul k-split temp, packed-optimizer pack/unpack). If such a copy
+ * is issued via the raw `enc.copyBufferToBuffer` it is NOT replayed, so the
+ * compiled plan reuses the destination's stale contents — corrupting any op
+ * that reads it (silent, e.g. the embedding-grad +1x/replay bug).
+ *
+ * Do NOT use this for READBACK/staging copies (tensor → mappable buffer for
+ * item()/profiler/inf-flag): those are not part of the replayable compute and
+ * target buffers outside the plan. Leave those as raw copyBufferToBuffer.
+ *
+ * recordCopy is a no-op when not recording, so this is safe on the hot path.
+ */
+export function recordedCopyBufferToBuffer(
+  enc: GPUCommandEncoder,
+  src: GPUBuffer,
+  srcOffset: number,
+  dst: GPUBuffer,
+  dstOffset: number,
+  bytes: number,
+): void {
+  enc.copyBufferToBuffer(src, srcOffset, dst, dstOffset, bytes);
+  recordCopy({ src, dst, srcOffset, dstOffset, bytes });
 }
 
 /** Record a host→device write (tensorFromArray). Called from executor. */
 export function recordWrite(buffer: GPUBuffer, nodeIndex: number): void {
   if (!activeCommandLog) return;
-  assignSlot(buffer, { kind: "write" });
-  activeCommandLog.push({ kind: "write", buffer, nodeIndex });
+  const slot = assignSlot(buffer, { kind: "write" });
+  activeCommandLog.push({ kind: "write", buffer, nodeIndex, slot });
+}
+
+/**
+ * Record a VOLATILE uniform/config buffer: one whose contents must be
+ * re-derived from the executing node's payload on every replay (per-step
+ * values like Adam's bias-corrected step_size or GradScaler's inv_scale).
+ * `pack` receives the CURRENT step's plan node and returns the full packed
+ * uniform bytes; the replay re-writes the buffer in stream order, matching
+ * the lowered path's writeBuffer-at-dispatch-prep semantics.
+ */
+export function recordVolatileUniform(
+  buffer: GPUBuffer,
+  pack: (node: LazyIRNode) => ArrayBufferView,
+): void {
+  if (!activeCommandLog) return;
+  if (recordingNodeIndex < 0) {
+    invalidateActiveRecording(
+      "volatile uniform recorded outside node execution (no node index)",
+    );
+    return;
+  }
+  activeCommandLog.push({
+    kind: "uniform",
+    buffer,
+    nodeIndex: recordingNodeIndex,
+    pack,
+  });
+}
+
+/**
+ * Record a buffer-zeroing clear. Called from zeros() when it clears a reused
+ * arena/pool buffer during recording. The buffer's slot is assigned by the
+ * preceding recordAlloc (resolveOutputBuffer). Without this, the compiled
+ * replay reuses the (stale) arena buffer without re-zeroing.
+ */
+export function recordClear(buffer: GPUBuffer, bytes: number): void {
+  if (!activeCommandLog) return;
+  activeCommandLog.push({
+    kind: "clear",
+    buffer,
+    bytes,
+    slot: activeBufferToSlot?.get(buffer) ?? -1,
+  });
 }
 
 /** Record a barrier (flush). Called from executor. */
@@ -477,6 +813,7 @@ import {
   profiledCreateBindGroup,
   setDispatchSequenceCounters,
 } from "../backend/webgpu/bind-group-cache";
+import { setProfileModule } from "../backend/webgpu/profiler";
 import {
   allocateOutputBuffer,
   clearActiveArena,
@@ -498,6 +835,7 @@ import { createTensor } from "../backend/webgpu/tensor";
 import {
   paramsBufferSizeClass,
   requireContext,
+  trackSharedEncoderWrite,
 } from "../backend/webgpu/webgpu-state";
 import { createStorageHandle } from "../graph/node-factory";
 import { executeOpSync } from "./op-dispatch";
@@ -518,10 +856,20 @@ export async function executeCompiledPlan(
   const ctx = requireContext();
   const device = ctx.device;
   const slots: GPUBuffer[] = new Array(compiled.slots.length);
+  const externalInputSet = compiled.allocBuffers
+    ? new Set(externalInputBuffers)
+    : null;
+  // Planned buffers whose FIRST lifetime this replay failed safety checks
+  // (still owned by a live tensor, or external-input conflict) — all their
+  // lifetimes fall back to dynamic allocation this replay.
+  let plannedFallback: Set<GPUBuffer> | null = null;
+  let plannedSeen: Set<GPUBuffer> | null = null;
+  let plannedBindCount = 0;
+  let plannedFallbackCount = 0;
 
   if (process.env.TORCHLETTE_DEBUG_COMPILED) {
     console.log(
-      `[compiled] Executing: ${compiled.commands.length} cmds, ${compiled.slots.length} slots, ${compiled.results.length} results`,
+      `[compiled] Executing: ${compiled.commands.length} cmds, ${compiled.slots.length} slots, ${compiled.results.length} results${compiled.allocBuffers ? " (planned buffers)" : ""}`,
     );
   }
 
@@ -577,6 +925,44 @@ export async function executeCompiledPlan(
           for (let j = 0; j < cmd.inputSlots.length; j++) {
             inputBufs.push(slots[cmd.inputSlots[j]]);
           }
+          // Planned-buffer path: bind the recorded buffer for this lifetime.
+          // Safety: (1) first use this replay must not be owned by a live
+          // tensor (a kept/user tensor would be clobbered — same check the
+          // arena does via canRecycle); later lifetimes of the same buffer
+          // within this replay are safe by queue order, exactly as recorded.
+          // (2) never alias an external input (template-reuse conflict) or a
+          // direct input of this op. On failure, fall back to dynamic
+          // allocation for ALL of this buffer's lifetimes this replay.
+          const planned = compiled.allocBuffers
+            ? process.env.TORCHLETTE_PLANNED_BIND === "0"
+              ? undefined
+              : compiled.allocBuffers[cmd.slot]
+            : undefined;
+          if (planned) {
+            if (!plannedSeen) {
+              plannedSeen = new Set();
+              plannedFallback = new Set();
+            }
+            let ok = !plannedFallback!.has(planned);
+            if (ok && !plannedSeen.has(planned)) {
+              plannedSeen.add(planned);
+              if (
+                bufferPool.isLive(planned) ||
+                externalInputSet?.has(planned)
+              ) {
+                plannedFallback!.add(planned);
+                ok = false;
+              }
+            }
+            if (ok && inputBufs.some((b) => b === planned)) ok = false;
+            if (ok) {
+              trackSharedEncoderWrite(planned);
+              slots[cmd.slot] = planned;
+              plannedBindCount++;
+              break;
+            }
+            plannedFallbackCount++;
+          }
           slots[cmd.slot] =
             cmd.allocKind === 0
               ? resolveOutputBuffer(device, cmd.bytes, inputBufs)
@@ -587,6 +973,11 @@ export async function executeCompiledPlan(
           const bufs: GPUBuffer[] = new Array(cmd.bindings.length);
           for (let j = 0; j < cmd.bindings.length; j++) {
             bufs[j] = slots[cmd.bindings[j]];
+            if (bufs[j] === undefined) {
+              throw new Error(
+                `[compiled] dispatch at cmd ${ci} binds slot ${cmd.bindings[j]} which was never populated (label=${cmd.label ?? "?"})`,
+              );
+            }
           }
           // Inline bind group cache — bypasses global sequence-indexed cache.
           // The normal path mixes cachedCreateBindGroup (advances dispatchIndex)
@@ -621,7 +1012,15 @@ export async function executeCompiledPlan(
             cmd.cachedBindGroup = bg;
             cmd.cachedBuffers = bufs.slice();
           }
-          dispatchComputePass(cmd.pipeline, bg, cmd.gx, cmd.gy, cmd.gz);
+          if (cmd.module !== undefined) setProfileModule(cmd.module);
+          dispatchComputePass(
+            cmd.pipeline,
+            bg,
+            cmd.gx,
+            cmd.gy,
+            cmd.gz,
+            cmd.label,
+          );
           break;
         }
         case TAG_COPY: {
@@ -659,12 +1058,40 @@ export async function executeCompiledPlan(
           slots[cmd.slot] = gpuBuffer(writeNode.result!.backendTensor);
           break;
         }
+        case TAG_CLEAR: {
+          const encoder = getSharedEncoderInstance();
+          if (encoder) {
+            encoder.clearBuffer(slots[cmd.slot], 0, cmd.bytes);
+          }
+          break;
+        }
+        case TAG_UNIFORM: {
+          // Re-derive volatile uniform data from the CURRENT step's node
+          // payload (fresh per step) and re-write the config buffer. Stream
+          // order matches the lowered path's writeBuffer-at-dispatch-prep:
+          // queue.writeBuffer is ordered before any later submit, and flush
+          // boundaries (TAG_BARRIER) are replayed at the recorded positions.
+          const node = planNodes[cmd.nodeIndex];
+          if (!node) {
+            throw new Error(
+              `[compiled] TAG_UNIFORM nodeIndex ${cmd.nodeIndex} out of range (plan has ${planNodes.length} nodes)`,
+            );
+          }
+          device.queue.writeBuffer(slots[cmd.slot], 0, cmd.pack(node));
+          break;
+        }
         case TAG_BARRIER: {
           flushSharedEncoder();
           flushBufferPool();
           break;
         }
       }
+    }
+
+    if (process.env.TORCHLETTE_DEBUG_COMPILED && compiled.allocBuffers) {
+      console.log(
+        `[compiled] planned binds=${plannedBindCount} fallbacks=${plannedFallbackCount}`,
+      );
     }
 
     // Restore global sequence counters to where the normal path would have

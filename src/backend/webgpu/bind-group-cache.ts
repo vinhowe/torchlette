@@ -144,10 +144,31 @@ export function createParamsBuffer(
         }
       }
       // Data changed — write new data, update cached copy
+      if (process.env.TORCHLETTE_DEBUG_PARAMS_CHANGED) {
+        const diffs: string[] = [];
+        for (let i = 0; i < data.length; i++) {
+          if (cached.data[i] !== data[i]) {
+            const of = new Float32Array(Uint32Array.of(cached.data[i]).buffer)[0];
+            const nf = new Float32Array(Uint32Array.of(data[i]).buffer)[0];
+            diffs.push(`[${i}] ${cached.data[i]}→${data[i]} (f32 ${of}→${nf})`);
+            if (diffs.length >= 4) break;
+          }
+        }
+        console.log(
+          `[params-changed] seq=${idx} label=${getCurrentOpLabel() ?? "?"} len=${cached.data.length}→${data.length} ${diffs.join(" ")}`,
+        );
+      }
       profileApiCall("writeBuffer", () =>
         device.queue.writeBuffer(cached.buffer, 0, data),
       );
-      cached.data.set(data);
+      // Same size class does NOT imply same length (sizes are bucketed) — the
+      // dispatch sequence can shift across steps and put a longer params array
+      // at this position. set() would throw "offset is out of bounds".
+      if (cached.data.length === data.length) {
+        cached.data.set(data);
+      } else {
+        cached.data = data.slice();
+      }
       if (compiling)
         assignSlot(cached.buffer, {
           kind: "params",

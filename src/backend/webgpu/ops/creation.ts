@@ -9,6 +9,7 @@ import {
   releaseParamsBuffer,
 } from "../bind-group-cache";
 import { getActiveArena, resolveOutputBuffer } from "../buffer-arena";
+import { recordClear } from "../../../executor/compiled-plan";
 import { bufferPool, destroyCopy } from "../buffer-pool";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { f32ArrayToF16Array, requireContext } from "../gpu-context";
@@ -152,6 +153,12 @@ export function zeros(shape: number[], dtype: DType = "f32"): WebGPUTensor {
       encoder.clearBuffer(buffer, 0, alignedSize);
       submitOrCollect(encoder.finish());
     }
+    // Record the clear so the compiled plan replays it. Without this, the
+    // compiled replay reuses this (stale) arena/pool buffer without re-zeroing,
+    // corrupting accumulating ops that read a zeroed buffer (embedding-grad
+    // scatter-add). No-op when not recording. recordClear relies on the slot
+    // assigned by the resolveOutputBuffer above (recordAlloc).
+    recordClear(buffer, alignedSize);
   }
 
   return createTensor(shape, buffer);

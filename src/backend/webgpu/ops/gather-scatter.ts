@@ -20,6 +20,7 @@ import {
   releaseParamsBuffer,
 } from "../bind-group-cache";
 import { resolveOutputBuffer } from "../buffer-arena";
+import { recordedCopyBufferToBuffer } from "../../../executor/compiled-plan";
 import { computeDimChunkLayout } from "../chunked-dispatch";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { requireContext } from "../gpu-context";
@@ -241,9 +242,16 @@ export function scatterAdd(
       ]);
 
   {
+    // scatterAdd accumulates: out = copy(a); out[idx] += src. The kernel ADDS
+    // onto the copied content, so this copy is INTRA-PLAN and MUST be replayed
+    // by the compiled plan — otherwise `out` keeps the previous replay's result
+    // and the grad inflates +1x per step (embedding-grad accumulation bug). Use
+    // the recorded-copy helper. (Chunked path uses createTrackedBuffer for out,
+    // which is untracked → the executor invalidates the compiled plan → lowered
+    // path, so the standalone branch needs no recording.)
     const enc = getSharedEncoderInstance();
     if (enc) {
-      enc.copyBufferToBuffer(tensorA.buffer, 0, outBuffer, 0, outSize * F32_BYTES);
+      recordedCopyBufferToBuffer(enc, tensorA.buffer, 0, outBuffer, 0, outSize * F32_BYTES);
     } else {
       const cmdEnc = ctx.device.createCommandEncoder();
       cmdEnc.copyBufferToBuffer(tensorA.buffer, 0, outBuffer, 0, outSize * F32_BYTES);
@@ -353,7 +361,12 @@ export function cat(
       const dstByteOffset =
         (o * outDimSize + dimOffset) * innerSize * bytesPerElement;
       if (enc) {
-        enc.copyBufferToBuffer(
+        // INTRA-PLAN copies (the assembled tensor is read by later dispatches
+        // in the same plan) — must be recorded or compiled replays reuse the
+        // destination's stale contents (e.g. the foreach optimizer's packed
+        // grads freezing at the recording step's values).
+        recordedCopyBufferToBuffer(
+          enc,
           t.buffer,
           srcByteOffset,
           outBuffer,

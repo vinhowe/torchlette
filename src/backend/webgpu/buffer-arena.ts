@@ -365,9 +365,37 @@ function arenaAllocAt(
     }
   }
 
-  // Allocate a new buffer for this arena position
+  // Allocate a buffer for this arena position. Try the POOL first: an
+  // in-place-updated persistent tensor (copy_ into optimizer state / params)
+  // migrates its storage into this plan's output position every step, so
+  // the position's previous buffer is a live EXTERNAL INPUT next step → the
+  // conflict path vacates the position and the old state buffer lands in
+  // the pool when the tensor's storage moves on. Without pool reuse here,
+  // every such position allocates a FRESH buffer each step (e.g. the
+  // foreach optimizer's 328MB packed m/v leaked +640MB/step); with it, the
+  // producer/consumer ping-pong settles into two alternating pooled buffers.
+  if (process.env.TORCHLETTE_DEBUG_BIGALLOC && sizeBytes > 64 * 1024 * 1024) {
+    console.log(
+      `[bigalloc] arena idx=${idx} bytes=${(sizeBytes / 1e6).toFixed(0)}MB existing=${existing ? `yes(class ${getSizeClass(existing.size)} vs ${neededSizeClass}, recyclable=${bufferPool.canRecycle(existing)})` : "no"}`,
+    );
+  }
   const ctx = requireContext();
   const pooledSize = getSizeForClass(neededSizeClass);
+  // EXPERIMENTAL, default OFF: acquiring pool buffers into arena positions
+  // broke compiled replays (a pool buffer recorded at one slot can be handed
+  // to another → slot aliasing → training divergence). The in-place copy_
+  // fast path removed the allocation churn this was meant to fix.
+  const pooled =
+    process.env.TORCHLETTE_ARENA_POOL_ACQUIRE === "1"
+      ? bufferPool.acquire(alignedSize)
+      : null;
+  if (pooled) {
+    arr[idx] = pooled;
+    arenaBufferSet.add(pooled);
+    bufRegister(pooled, pooledSize, "arena");
+    trackSharedEncoderWrite(pooled);
+    return pooled;
+  }
   const usage = STORAGE_BUFFER_USAGE;
   const buffer = profileApiCall("createBuffer", () =>
     ctx.device.createBuffer({ size: pooledSize, usage }),

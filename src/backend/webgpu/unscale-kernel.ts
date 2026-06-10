@@ -310,15 +310,37 @@ export function dispatchUnscaleGrad(
     _pad0: 0,
   };
 
+  // Volatile repack for compiled-plan replays: inv_scale changes whenever the
+  // GradScaler rescales (overflow backoff / growth). Re-derive it from the
+  // CURRENT step's unscaleGrad node payload so replays never unscale with a
+  // frozen record-time scale.
+  const volatileRepack = (node: {
+    op?: string;
+    payload?: unknown;
+  }): Record<string, number> => {
+    if (node.op !== "unscaleGrad" || !node.payload) {
+      throw new Error(
+        `[unscale-kernel] volatile repack expected an unscaleGrad node, got '${node.op}' — compiled plan / node-index mismatch`,
+      );
+    }
+    const payload = node.payload as { invScale: number };
+    return { ...uniforms, inv_scale: payload.invScale };
+  };
+
   if (needsChunking) {
-    dispatcher.dispatchChunked(buffers, uniforms, {
-      modes: { grad_in: "chunked", grad_out: "chunked", inf_flag: "scalar" },
-      sizeUniform: "num_elements",
-      totalElements: numElements,
-      maxBytesPerElement: bytesPerElement,
-    });
+    dispatcher.dispatchChunked(
+      buffers,
+      uniforms,
+      {
+        modes: { grad_in: "chunked", grad_out: "chunked", inf_flag: "scalar" },
+        sizeUniform: "num_elements",
+        totalElements: numElements,
+        maxBytesPerElement: bytesPerElement,
+      },
+      volatileRepack,
+    );
   } else {
-    dispatcher.dispatch(buffers, uniforms);
+    dispatcher.dispatch(buffers, uniforms, volatileRepack);
   }
 
   return { gradOutBuffer: gradOut };

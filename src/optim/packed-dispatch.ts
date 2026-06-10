@@ -21,6 +21,7 @@ import { alignBufferSize } from "../backend/webgpu/shape-utils";
 import { getSharedEncoderInstance } from "../backend/webgpu/shared-encoder";
 import { onTeardown, requireContext } from "../backend/webgpu/webgpu-state";
 import { profileSubOpBegin, profileSubOpEnd } from "../graph/profiler";
+import { recordedCopyBufferToBuffer } from "../executor/compiled-plan";
 
 /**
  * Maximum packed buffer size before sub-batching (512 MB).
@@ -112,12 +113,15 @@ function dispatchPackedGroup(
   if (!enc)
     throw new Error("Packed optimizer dispatch requires shared encoder");
 
-  // Scatter: copy all individual buffers into packed buffers
+  // Scatter: copy all individual buffers into packed buffers. These are
+  // INTRA-PLAN copies — the packed-Adam dispatch reads them, so they MUST be
+  // replayed by the compiled plan. If unrecorded, compiled replay runs Adam on
+  // stale packed grads/params → optimizer-state drift (silent convergence gap).
   for (let i = 0; i < items.length; i++) {
     const bufs = items[i].buffers;
     const offset = i * elementBytes;
     for (let b = 0; b < bufferCount; b++) {
-      enc.copyBufferToBuffer(bufs[b], 0, packed[b], offset, elementBytes);
+      recordedCopyBufferToBuffer(enc, bufs[b], 0, packed[b], offset, elementBytes);
     }
   }
   profileSubOpEnd(`${label}.scatter`, _st);
@@ -127,13 +131,15 @@ function dispatchPackedGroup(
   dispatchFn(packed, totalElements);
   profileSubOpEnd(`${label}.dispatch`, _st2);
 
-  // Gather: copy modified packed buffers back to individual buffers
+  // Gather: copy modified packed buffers back to individual buffers. Also
+  // INTRA-PLAN — these write the updated params/m/v that the NEXT step reads,
+  // so they must be replayed too (else params/optimizer state stay stale).
   const _st3 = profileSubOpBegin();
   for (let i = 0; i < items.length; i++) {
     const bufs = items[i].buffers;
     const offset = i * elementBytes;
     for (const b of gatherIndices) {
-      enc.copyBufferToBuffer(packed[b], offset, bufs[b], 0, elementBytes);
+      recordedCopyBufferToBuffer(enc, packed[b], offset, bufs[b], 0, elementBytes);
     }
   }
   profileSubOpEnd(`${label}.gather`, _st3);

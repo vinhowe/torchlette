@@ -157,6 +157,15 @@ export function createTrackedBuffer(
     }
   }
 
+  if (
+    process.env.TORCHLETTE_DEBUG_BIGALLOC &&
+    alignedSize > 64 * 1024 * 1024
+  ) {
+    console.log(
+      `[bigalloc] createTrackedBuffer ${(alignedSize / 1e6).toFixed(0)}MB usage=${descriptor.usage} at ${new Error().stack?.split("\n").slice(2, 5).join(" | ")}`,
+    );
+  }
+
   // Check if this is a small UNIFORM-only buffer (params buffers)
   // These are temporary and don't need memory tracking to avoid memory leaks
   const isUniformOnly =

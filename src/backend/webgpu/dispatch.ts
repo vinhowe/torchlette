@@ -40,7 +40,7 @@ import {
 } from "./ops/ops-tile-ir";
 import { detectSimpleTranspose, ensureContiguous } from "./ops/views";
 import { getWarmupPipeline, recordPipeline } from "./pipeline-warmup";
-import { getTimestampWrites } from "./profiler";
+import { getProfileModule, getTimestampWrites } from "./profiler";
 import {
   broadcastShapes,
   compute2DDispatch,
@@ -73,7 +73,9 @@ export function dispatchComputePass(
   const ctx = requireContext();
   const label = labelOverride ?? getCurrentOpLabel();
 
-  // Record dispatch for compiled plan
+  // Record dispatch for compiled plan (label/module restore profiler
+  // attribution during replay — without them all replayed GPU time shows
+  // as "unknown").
   if (isCompilationRecordingActive()) {
     recordCompiledDispatch({
       pipeline,
@@ -82,6 +84,8 @@ export function dispatchComputePass(
       workgroupsY,
       workgroupsZ,
       buffers: getAndClearLastBindGroupBuffers(),
+      label: label ?? undefined,
+      module: getProfileModule(),
     });
   }
 

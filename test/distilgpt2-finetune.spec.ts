@@ -41,9 +41,15 @@ const NUM_STEPS = 5;
 // GPU non-determinism causes ~0.005 variation between runs
 // Updated 2026-03-15: multi-output IR (f8a6270) changed graph topology,
 // altering fusion reorder → f16 rounding → backward numerics.
-// Forward (step 0) unchanged; loss still converges monotonically.
+// Updated 2026-06-10: re-recorded after the gradient-correctness fixes that
+// landed since March — CSE outputIndex (SDPA dQ/dK collapsed onto dV),
+// integer-pow NaN, row-program scalar-output, compiled-plan intra-plan copy
+// + frozen-step_size volatile uniforms. Forward (step 0) unchanged; descent
+// is faster because backward grads are now correct (verified vs PyTorch to
+// ~1e-6 in the matched-weight parity harness). Verified bit-identical with
+// and without the adam-batch hoisting change.
 const EXPECTED_LOSSES: number[] = [
-  7.882518, 6.710576, 5.53542, 4.572787, 3.675487,
+  7.882518, 6.120456, 4.960944, 3.927158, 2.909983,
 ];
 
 const LOSS_TOLERANCE = 0.05;

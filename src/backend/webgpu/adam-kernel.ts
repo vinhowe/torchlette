@@ -279,6 +279,32 @@ interface AdamStepResult {
 }
 
 /**
+ * Write the config-derived (per-step-varying) uniform fields. SINGLE SOURCE
+ * for the AdamStepConfig → kernel-uniform mapping: used both by the live
+ * dispatch and by the compiled plan's volatile repack (which re-derives these
+ * from the current step's adamStep node payload at replay time). stepSize
+ * carries the bias correction (varies with t), lrTimesWd varies with LR
+ * schedules, invScale varies when GradScaler rescales — none of these may be
+ * frozen into a replayed config buffer.
+ */
+function setAdamConfigUniforms(
+  uniforms: Record<string, number>,
+  config: AdamStepConfig,
+  doUnscale: boolean,
+): void {
+  uniforms.beta1 = config.beta1;
+  uniforms.beta2 = config.beta2;
+  uniforms.step_size = config.stepSize;
+  uniforms.eps = config.eps;
+  uniforms.weight_decay = config.weightDecay;
+  uniforms.lr_times_wd = config.lrTimesWd;
+  uniforms.decoupled_wd = config.decoupledWd ? 1 : 0;
+  if (doUnscale) {
+    uniforms.inv_scale = config.invScale ?? 1.0;
+  }
+}
+
+/**
  * Dispatch the fused Adam/AdamW kernel.
  *
  * Uses tile-IR dispatchChunked for buffers exceeding maxStorageBufferBindingSize.
@@ -336,15 +362,9 @@ export function dispatchAdamStep(
 
   // Build uniforms
   const uniforms: Record<string, number> = {
-    beta1: config.beta1,
-    beta2: config.beta2,
-    step_size: config.stepSize,
-    eps: config.eps,
-    weight_decay: config.weightDecay,
-    lr_times_wd: config.lrTimesWd,
-    decoupled_wd: config.decoupledWd ? 1 : 0,
     num_elements: numElements,
   };
+  setAdamConfigUniforms(uniforms, config, doUnscale);
   if (doUnscale) {
     // Unscale path needs grid_stride for manual 2D indexing
     const epa = doF16 ? 128 : 64;
@@ -361,7 +381,6 @@ export function dispatchAdamStep(
     const wg = Math.ceil(workItems / WORKGROUP_SIZE);
     const gridSizeX = Math.min(wg, MAX_WORKGROUPS_PER_DIM);
     uniforms.grid_stride = gridSizeX * WORKGROUP_SIZE;
-    uniforms.inv_scale = config.invScale ?? 1.0;
     uniforms._pad0 = 0;
     uniforms._pad1 = 0;
   } else {
@@ -372,6 +391,27 @@ export function dispatchAdamStep(
   }
 
   const dispatcher = getAdamDispatcher(useVec4, doF16, doUnscale);
+
+  // Volatile repack for compiled-plan replays: re-derive the config-driven
+  // uniform values from the CURRENT step's adamStep node payload. Static
+  // fields (num_elements, grid_stride, pads) are captured from this dispatch.
+  // All adamStep nodes in one packed batch share the same hyperparameters
+  // (adamStepBatch builds batches that way), so any node of the batch is a
+  // valid source.
+  const baseUniforms = { ...uniforms };
+  const volatileRepack = (node: {
+    op?: string;
+    payload?: unknown;
+  }): Record<string, number> => {
+    if (node.op !== "adamStep" || !node.payload) {
+      throw new Error(
+        `[adam-kernel] volatile repack expected an adamStep node, got '${node.op}' — compiled plan / node-index mismatch`,
+      );
+    }
+    const u = { ...baseUniforms };
+    setAdamConfigUniforms(u, node.payload as AdamStepConfig, doUnscale);
+    return u;
+  };
 
   _st = profileSubOpBegin();
   if (needsChunking) {
@@ -389,16 +429,21 @@ export function dispatchAdamStep(
       ? { param_f16: f16BytesPerElement }
       : undefined;
 
-    dispatcher.dispatchChunked(buffers, uniforms, {
-      modes,
-      bytesPerElement: bpe,
-      sizeUniform: "num_elements",
-      totalElements: numElements,
-      maxBytesPerElement: bytesPerElement,
-      elementsPerAlignment: epa,
-    });
+    dispatcher.dispatchChunked(
+      buffers,
+      uniforms,
+      {
+        modes,
+        bytesPerElement: bpe,
+        sizeUniform: "num_elements",
+        totalElements: numElements,
+        maxBytesPerElement: bytesPerElement,
+        elementsPerAlignment: epa,
+      },
+      volatileRepack,
+    );
   } else {
-    dispatcher.dispatch(buffers, uniforms);
+    dispatcher.dispatch(buffers, uniforms, volatileRepack);
   }
   profileSubOpEnd("adam.dispatch", _st);
 
