@@ -34,12 +34,15 @@ export class NesterovOuterOptimizer {
     this.mu = config.momentum ?? 0.9;
   }
 
-  /** Apply one outer optimization step using a CPU snapshot + averaged grads. */
+  /** Apply one outer optimization step using a CPU snapshot + averaged grads.
+   *  Returns the updated parameter values — these are EXACTLY the bytes
+   *  uploaded into the GPU params (f32, bit-faithful), so the caller can use
+   *  them as the new anchor without reading the whole model back. */
   async stepFromCpu(
     params: Tensor[],
     snapshot: Float32Array[],
     avgGrads: Float32Array[],
-  ): Promise<void> {
+  ): Promise<Float32Array[]> {
     if (
       params.length !== snapshot.length ||
       params.length !== avgGrads.length
@@ -49,6 +52,7 @@ export class NesterovOuterOptimizer {
       );
     }
     const api = this.api;
+    const updatedAll: Float32Array[] = [];
     await api.beginStep();
     for (let i = 0; i < params.length; i++) {
       const param = params[i];
@@ -65,6 +69,7 @@ export class NesterovOuterOptimizer {
         v[j] = this.mu * v[j] + grad[j];
         updated[j] = snap[j] + this.lr * v[j];
       }
+      updatedAll.push(updated);
       api.copy_(
         param,
         api.tensorFromArray(updated, param.shape, { device: param.device }),
@@ -118,6 +123,7 @@ export class NesterovOuterOptimizer {
         `[outer-verify] worst |gpu - expected| = ${worst.toExponential(3)} (param ${worstIdx} elem ${worstElem})${corrupt.length ? `\n[outer-verify] CORRUPT: ${corrupt.join("\n[outer-verify] CORRUPT: ")}` : ""}`,
       );
     }
+    return updatedAll;
   }
 
   /**

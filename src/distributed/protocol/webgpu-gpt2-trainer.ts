@@ -456,13 +456,15 @@ export class WebGPUGPT2Trainer implements Trainer {
         `applyOuterStep: payload tensor count ${avgGrad.length} != ${this.params.length}`,
       );
     }
-    await this.outerOpt.stepFromCpu(this.params, this.anchor, avgGrad);
-    // Anchor = new params after outer step.
-    const anchor: Float32Array[] = [];
-    for (const p of this.params) {
-      anchor.push(new Float32Array(await p.cpu()));
-    }
-    this.anchor = anchor;
+    // The outer step returns the exact f32 values it uploaded into the GPU
+    // params — adopt them as the new anchor directly. Reading the model back
+    // here (the previous code) cost a full-model GPU->CPU transfer per round
+    // to fetch bytes we already hold.
+    this.anchor = await this.outerOpt.stepFromCpu(
+      this.params,
+      this.anchor,
+      avgGrad,
+    );
   }
 
   async revertToAnchor(): Promise<void> {
