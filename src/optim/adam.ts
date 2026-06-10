@@ -325,7 +325,14 @@ export class Adam {
       const vFlat = idxs.map((i, k) =>
         runtime.reshape(this.expAvgSq[i], [sizes[k]]),
       );
-      st = { m: runtime.cat(mFlat), v: runtime.cat(vFlat), sig };
+      // persist(): the packed state is created MID-STEP and held across
+      // steps — without adoption into the step snapshot it would be demoted
+      // as a temporary at markStep (buffer pooled while live → silent UAF).
+      st = {
+        m: runtime.persist(runtime.cat(mFlat)),
+        v: runtime.persist(runtime.cat(vFlat)),
+        sig,
+      };
       this._foreachState.set(gi, st);
     }
 
@@ -345,10 +352,15 @@ export class Adam {
     runtime.copy_(st.m, mNew);
     runtime.copy_(st.v, vNew);
 
+    // Read m/v through the POST-copy_ state refs so the param-update chain
+    // depends on the copies and any force of the params executes them.
+    // Reading mNew/vNew directly leaves the copy_ nodes as dangling roots
+    // that defer to a LATER plan — after zeroGrad has zeroed/freed the grad
+    // buffer their pending source reads (see _updateParamElementwise).
     const bc1 = 1 - this.beta1 ** t;
     const bc2 = 1 - this.beta2 ** t;
-    const mHat = runtime.div(mNew, bc1);
-    const vHat = runtime.div(vNew, bc2);
+    const mHat = runtime.div(st.m, bc1);
+    const vHat = runtime.div(st.v, bc2);
     const denom = runtime.add(runtime.sqrt(vHat), this.eps);
     let scaled = runtime.mul(runtime.div(mHat, denom), lr);
     if (wd !== 0 && this.adamW) {
@@ -511,21 +523,35 @@ export class Adam {
       runtime.mul(gradSq, 1 - this.beta2),
     );
 
-    if (process.env.TORCHLETTE_DEBUG_NO_DISPOSE !== "1") {
-      prevAvg.dispose();
-      prevAvgSq.dispose();
-    }
-    this.expAvg[i] = avg;
-    this.expAvgSq[i] = avgSq;
+    // Update state IN PLACE into the persistent (snapshot-protected) m/v
+    // tensors instead of replacing them with the mid-step-created results.
+    // Replacement was the silent-UAF pattern: the new tensor is demoted as a
+    // step temporary at markStep (it was not in the beginStep snapshot), its
+    // buffer returns to the pool while this.expAvg still points at it, and a
+    // later allocation corrupts it — the multi-param first-param m/v bug.
+    runtime.copy_(prevAvg, avg);
+    runtime.copy_(prevAvgSq, avgSq);
 
     // PyTorch-style bias-corrected Adam: apply bias correction to v directly
     // in the denominator, not via the step size. This matters because the
     // epsilon term must NOT be scaled by 1/sqrt(bc2).
     // PyTorch: param -= lr * (m / bc1) / (sqrt(v / bc2) + eps)
+    //
+    // Read m/v through the POST-copy_ state refs (prevAvg's lazy ref now
+    // points at the copy_ result), NOT through `avg`/`avgSq` directly. This
+    // makes the param-update chain DEPEND on the copies, so any force of the
+    // param (stepAsync's `force(param)`, partial forces) executes them.
+    // Reading `avg` left the copy_ nodes as DANGLING ROOTS: not in the
+    // param's dependency chain, they deferred to whatever plan next touched
+    // the state — one step LATE, after zeroGrad() had already zeroed/freed
+    // the grad buffer their pending source chain reads, and after freed
+    // intermediates were reacquired (src==dst in the scatter kernel is a
+    // Dawn read-write usage validation error → dropped command buffer).
+    // That was the gpt2-memorization stepAsync NaN regression.
     const bc1 = 1 - this.beta1 ** this.steps[i];
     const bc2 = 1 - this.beta2 ** this.steps[i];
-    const mHat = runtime.div(avg, bc1);
-    const vHat = runtime.div(avgSq, bc2);
+    const mHat = runtime.div(prevAvg, bc1);
+    const vHat = runtime.div(prevAvgSq, bc2);
     const denom = runtime.add(runtime.sqrt(vHat), this.eps);
     const lr = this._getParamLR(i);
     let scaled = runtime.mul(runtime.div(mHat, denom), lr);

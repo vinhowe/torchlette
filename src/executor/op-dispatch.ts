@@ -18,9 +18,13 @@ import {
   setCurrentOpLabel,
   setProfileModule,
 } from "../graph/profiler";
+import { storageTracker } from "../graph/storage-tracker";
 import type { LazyIRNode, LazyRef, StorageHandle } from "../graph/types";
 import { OP_REGISTRY } from "../ops/registry";
 import { lookupScalarStorage } from "./scalar-table";
+
+/** One-shot flag for the reclaimed-storage-read warning. */
+let _warnedReclaimedRead = false;
 
 // ---------------------------------------------------------------------------
 // Multi-output op protocol
@@ -126,6 +130,27 @@ export function getInputStorage(
   backend?: Backend,
 ): StorageHandle {
   if (ref.kind === "materialized") {
+    // Lifetime seam guard: a materialized ref whose storage was RECLAIMED
+    // means a tensor outlived its buffer — the silent-UAF class (markStep's
+    // step-scoped demotion reclaiming a mid-step-created tensor that user
+    // code still holds; the buffer is back in the pool and may carry another
+    // op's data). Warn by default; TORCHLETTE_STRICT_LIFETIME=1 throws.
+    if (storageTracker.isDestroyed(ref.storage.id)) {
+      const msg =
+        `[lifetime] reading RECLAIMED storage id=${ref.storage.id} ` +
+        `(shape=${JSON.stringify(ref.storage.backendTensor.shape)}). A tensor created ` +
+        `mid-step and held across markStep was demoted as a step temporary; ` +
+        `its buffer may have been reused. Create persistent state outside ` +
+        `the step, update it in place via copy_, or mark it with ` +
+        `runtime.persist().`;
+      if (process.env.TORCHLETTE_STRICT_LIFETIME === "1") {
+        throw new Error(msg);
+      }
+      if (!_warnedReclaimedRead) {
+        _warnedReclaimedRead = true;
+        console.warn(msg);
+      }
+    }
     return ref.storage;
   }
   if (ref.kind === "scalar") {

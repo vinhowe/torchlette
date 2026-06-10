@@ -94,8 +94,17 @@ async function main() {
         runtime.mul(states[i], 0.9),
         runtime.mul(gRt, 0.1),
       );
+      // Two modes, demonstrating the persistence contract:
+      //   default      — REPLACEMENT anti-pattern: the new tensor is demoted
+      //                  as a step temp at markStep (buffer pooled while
+      //                  live). Trips the [lifetime] read guard; survives
+      //                  only by allocation-order luck.
+      //   PERSIST=1    — runtime.persist() adopts the mid-step tensor into
+      //                  the step snapshot: the supported way to create
+      //                  long-lived state inside a step. No warning.
       states[i].dispose();
-      states[i] = mNew;
+      states[i] =
+        process.env.PERSIST === "1" ? runtime.persist(mNew) : mNew;
       if (useParamUpdate) {
         runtime.copy_(
           params[i]._unwrap(),

@@ -184,6 +184,36 @@ describe("fused vs elementwise Adam differential", { timeout: 600_000 }, () => {
     expect(maxAbsDiff(packed, reference)).toBeLessThan(1e-5);
   });
 
+  // Per-param path across param counts: this was the silent-UAF bug — the
+  // per-param path replaces this.expAvg[i] with a mid-step-created tensor
+  // each step; markStep demoted it as a step temporary (not in the beginStep
+  // snapshot), pooling its buffer while live, and with >1 param the loss
+  // plan's outputs landed in the state buffer (sparse corruption, first
+  // param only). Fixed by updating state IN PLACE (copy_) into the
+  // persistent constructor tensors; the [lifetime] read guard in
+  // getInputStorage now catches the class loudly.
+  it("per-param path matches across param counts (UAF regression)", async () => {
+    if (!webgpu) return;
+    const multi = await trajectory({
+      ADAMW: "1",
+      WD: "0",
+      NPARAMS: "2",
+      ELEMENTWISE: "1",
+      FOREACH: "0",
+      COMPILED: "0",
+      FUSION: "0",
+    });
+    const single = await trajectory({
+      ADAMW: "1",
+      WD: "0",
+      ELEMENTWISE: "1",
+      FOREACH: "0",
+      COMPILED: "0",
+      FUSION: "0",
+    });
+    expect(maxAbsDiff(multi, single)).toBeLessThan(1e-6);
+  });
+
   // Late-varying scalar: the LR is CONSTANT through the recording executions
   // (so it gets inlined into fused-recipe WGSL and recorded into the compiled
   // plan), then changes at step 4. The replay gate's inlined-scalar staleness

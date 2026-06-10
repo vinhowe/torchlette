@@ -953,6 +953,22 @@ export class RuntimeEngine {
     return this._creationOp("zeros", shape, device, { dtype }, dtype);
   }
 
+  /**
+   * Mark a tensor created MID-STEP as persistent across step boundaries.
+   *
+   * Persistence is inferred from the beginStep snapshot: tensors alive at
+   * snapshot time survive; everything created during the step is reclaimed
+   * at markStep — even if user code still holds it (its buffer returns to
+   * the pool while the tensor points at it: silent corruption when reused).
+   * Call this for legitimately long-lived state created inside a step
+   * (lazily-initialized optimizer state, EMA shadows, caches). Tensors
+   * created BETWEEN steps need nothing — the next snapshot captures them.
+   */
+  persist(t: Tensor): Tensor {
+    storageTracker.adoptIntoSnapshot(t);
+    return t;
+  }
+
   full(
     shape: number[],
     fillValue: number,

@@ -155,6 +155,30 @@ class StorageTracker {
   }
 
   /**
+   * Mark a tensor created MID-STEP as persistent: add it to the active
+   * step snapshot so releaseStepTemps will not reclaim its storage at
+   * markStep. This is THE supported way to create long-lived state inside
+   * a step (e.g. lazily-initialized optimizer state): without it, the
+   * snapshot-membership rule treats every mid-step tensor as a temporary —
+   * its buffer is reclaimed into the pool while the live tensor still
+   * points at it, and later writes corrupt it silently (the per-param Adam
+   * first-param m/v corruption). No-op when no step is active (tensors
+   * created between steps are captured by the next snapshot).
+   */
+  adoptIntoSnapshot(tensor: object): void {
+    this._stepStartTensors?.add(tensor);
+  }
+
+  /**
+   * Whether a storage has been DESTROYED (reclaimed). Reading a destroyed
+   * storage through a stale ref is the silent-UAF class — its buffer is
+   * back in the pool and may hold another op's data.
+   */
+  isDestroyed(storageId: number): boolean {
+    return !this.allStorages.has(storageId);
+  }
+
+  /**
    * Release tensor refs for step-scoped temporaries.
    * For each tracked storage: if its owning tensor is alive but was NOT
    * in the beginStep snapshot, release the ref — it's a step-scoped temp.
