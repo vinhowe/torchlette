@@ -142,8 +142,19 @@ export async function executeFusedSegment(
     }
 
     const inputRef = group.externalInputs[inputIdx];
-    // Scalar refs should always be inlined — this is a safety fallback
+    // Non-inlined scalar ref: demoted to a runtime input by the
+    // frozen-scalar adaptation. Resolve through getInputStorage — it hits
+    // the plan's scalar table (persistent 0-d buffer refreshed from the
+    // CURRENT step's value), so the fused kernel reads fresh data while the
+    // cached recipe/kernel stay value-independent.
     if (inputRef.kind === "scalar") {
+      const scalarStorage = getInputStorage(inputRef, backend);
+      const st = asGPUTensor(scalarStorage.backendTensor);
+      inputs.push({
+        buffer: st.buffer,
+        shape: [],
+        dtype: (st.dtype as DType) ?? "f32",
+      });
       continue;
     }
     let storage: StorageHandle | undefined;

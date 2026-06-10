@@ -35,7 +35,9 @@ import {
   buildIdPositionMap,
   computePlanFingerprint,
   type ExecutionSegment,
+  groupToRecipe,
   isFusibleOp,
+  isInlinableScalar,
 } from "../compiler/fusion-detect";
 import { analyzeGraph } from "../compiler/graph-compiler";
 import { runPasses, SIMPLIFICATION_PASSES } from "../compiler/graph-rewrites";
@@ -81,7 +83,11 @@ import { getLivePendingNodeIds } from "../runtime/tensor";
 import {
   assignSlot,
   buildCompiledPlan,
+  destroyCompiledPlanBuffers,
   executeCompiledPlan,
+  setRecordingNodeIndex,
+} from "./compiled-plan";
+import {
   isCompilationRecordingActive,
   type NodeResult,
   recordBarrier,
@@ -89,6 +95,11 @@ import {
   startCompilationRecording,
   stopCompilationRecording,
 } from "./compiled-plan";
+import {
+  clearActiveScalarTable,
+  destroyScalarTable,
+  refreshScalarTable,
+} from "./scalar-table";
 import {
   buildLoweredPlanFromAnalysis,
   getActionNodeIndices,
@@ -278,8 +289,10 @@ export function evictAllArenas(force = false): void {
     }
     // Also invalidate compiled plan (it depends on arena buffer identities)
     if (template.loweredPlan?.compiledPlan) {
+      destroyCompiledPlanBuffers(template.loweredPlan.compiledPlan);
       template.loweredPlan.compiledPlan = undefined;
     }
+    if (template.loweredPlan) destroyScalarTable(template.loweredPlan);
   }
 }
 
@@ -292,8 +305,10 @@ export function evictAllArenas(force = false): void {
 export function invalidateCompiledPlans(): void {
   for (const [, template] of fusionAnalysisCache) {
     if (template.loweredPlan?.compiledPlan) {
+      destroyCompiledPlanBuffers(template.loweredPlan.compiledPlan);
       template.loweredPlan.compiledPlan = undefined;
     }
+    if (template.loweredPlan) destroyScalarTable(template.loweredPlan);
     // Clear arena too — its bind groups reference stale param buffers
     if (template.bufferArena) {
       destroyArena(template.bufferArena);
@@ -303,6 +318,40 @@ export function invalidateCompiledPlans(): void {
 }
 
 /** Collect GPU buffers from all external (materialized/already-resolved) plan inputs. */
+/**
+ * Check whether any INLINED scalar constant in a fused-action recipe differs
+ * from the current step's value. Cheap scan: only fused actions with a built
+ * external-input pattern (always true once a compiled plan exists) and only
+ * their inlined-constant inputs. Used to invalidate a compiled plan whose
+ * recorded kernels baked a value that has since changed.
+ */
+function inlinedFusionScalarsStale(
+  loweredPlan: LoweredPlan,
+  planNodes: LazyIRNode[],
+): boolean {
+  for (const action of loweredPlan.actions) {
+    if (action.kind !== "fused") continue;
+    const pattern = action.cachedExternalInputPattern;
+    if (!pattern) continue;
+    const rin = action.recipe.inputs;
+    for (let i = 0; i < rin.length && i < pattern.length; i++) {
+      const inp = rin[i];
+      if (!inp?.isInlinedConstant) continue;
+      const p = pattern[i];
+      const node = planNodes[action.coveredNodeIndices[p.nodeLocalIdx]];
+      const ref = node?.inputs[p.inputIdx];
+      if (!ref) continue;
+      if (ref.kind === "scalar") {
+        if (ref.value !== inp.inlinedValue) return true;
+      } else {
+        const cur = isInlinableScalar(ref);
+        if (cur.inlinable && cur.value !== inp.inlinedValue) return true;
+      }
+    }
+  }
+  return false;
+}
+
 export function collectExternalInputBuffers(
   planNodes: LazyIRNode[],
 ): GPUBuffer[] {
@@ -577,6 +626,30 @@ export async function executeLoweredPlan(
   };
 
   const useTopLevelSharedEncoder = backend.name === "webgpu";
+
+  // Refresh per-step scalar values as DATA before ANY execution path —
+  // lowered actions and compiled replays both read scalar refs through the
+  // table buffers (getInputStorage / recorded dispatch bindings), so this
+  // single refresh keeps every value-independent cache honest. See
+  // scalar-table.ts.
+  refreshScalarTable(loweredPlan, planNodes, backend);
+
+  // Late-varying inlined scalars: a scalar whose value was constant through
+  // the recording executions is INLINED in fused-recipe WGSL (and thus in the
+  // recorded compiled plan). If such a value changes later — an LR schedule
+  // leaving its warmup plateau — the replay would compute with the baked
+  // value and the lowered-path adaptation could never fire (the fast path
+  // bypasses the fused actions). Detect it here and drop the compiled plan;
+  // the lowered execution below adapts the recipe (demotes the scalar to a
+  // runtime input) and re-records.
+  if (
+    loweredPlan.compiledPlan?.valid &&
+    inlinedFusionScalarsStale(loweredPlan, planNodes)
+  ) {
+    destroyCompiledPlanBuffers(loweredPlan.compiledPlan);
+    loweredPlan.compiledPlan = undefined;
+  }
+
   // =========================================================================
   // FAST PATH: Compiled Plan Execution
   // =========================================================================
@@ -589,9 +662,12 @@ export async function executeLoweredPlan(
     useTopLevelSharedEncoder &&
     options.bufferArena &&
     process.env.TORCHLETTE_COMPILED_PLAN !== "0" &&
-    // Liveness-aware arena reuses one buffer across multiple positions, so the
-    // compiled plan's fixed per-position buffer identities no longer hold.
-    !arenaLivenessEnabled()
+    // Liveness-aware arena reuses one buffer across multiple positions, so
+    // compiled replay needs the EXPERIMENTAL planned-buffer mode (such plans
+    // carry allocBuffers — the pinned, lifetime-split assignment recorded
+    // from the pool-reusing execution). See buildCompiledPlan for status.
+    (!arenaLivenessEnabled() ||
+      process.env.TORCHLETTE_COMPILED_PLANNED === "1")
   ) {
     if (process.env.TORCHLETTE_DEBUG_COMPILED) {
       console.log(
@@ -599,13 +675,17 @@ export async function executeLoweredPlan(
       );
     }
     const externalInputBuffers = collectExternalInputBuffers(planNodes);
-    await executeCompiledPlan(
-      loweredPlan.compiledPlan,
-      planNodes,
-      options.bufferArena,
-      backend,
-      externalInputBuffers,
-    );
+    try {
+      await executeCompiledPlan(
+        loweredPlan.compiledPlan,
+        planNodes,
+        options.bufferArena,
+        backend,
+        externalInputBuffers,
+      );
+    } finally {
+      clearActiveScalarTable();
+    }
     return {
       result: planNodes[planNodes.length - 1].result!,
       stats: loweredPlan.cachedStats ?? stats,
@@ -640,15 +720,30 @@ export async function executeLoweredPlan(
     setArenaExternalInputBuffers(collectExternalInputBuffers(planNodes));
   }
 
-  // Start compilation recording for compiled plan
+  // Start compilation recording for compiled plan.
+  // Bounded-arena (liveness) mode is supported via PLANNED BUFFERS: slot
+  // resolution happens at record time (lifetime splitting in recordAlloc),
+  // and buildCompiledPlan pins the recorded pool-buffer assignment to the
+  // plan — replays bind the exact lifetime-reusing assignment the recording
+  // proved safe, with memory bounded to the recording's working set.
   const shouldCompile =
     useTopLevelSharedEncoder &&
     options.bufferArena &&
     !loweredPlan.compiledPlan &&
     options.bufferArena.resolve.length > 0 && // Arena populated from prior execution
-    // Liveness-aware arena reuses buffers across positions, so the recorded
-    // fixed buffer identities would be wrong — don't build a compiled plan.
-    !arenaLivenessEnabled();
+    // Bounded-arena mode: compile only under the experimental planned-buffer
+    // flag (see buildCompiledPlan), else stay on the lowered path as before.
+    (!arenaLivenessEnabled() ||
+      process.env.TORCHLETTE_COMPILED_PLANNED === "1") &&
+    // Debug bisection: only compile plans up to N nodes.
+    (!process.env.TORCHLETTE_COMPILED_MAX_NODES ||
+      planNodes.length <=
+        parseInt(process.env.TORCHLETTE_COMPILED_MAX_NODES, 10)) &&
+    // Debug bisection: only compile plans whose node count is in the list.
+    (!process.env.TORCHLETTE_COMPILED_ONLY_NODES ||
+      process.env.TORCHLETTE_COMPILED_ONLY_NODES.split(",").includes(
+        String(planNodes.length),
+      ));
   let compilationRecording: ReturnType<
     typeof startCompilationRecording
   > | null = null;
@@ -827,17 +922,11 @@ export async function executeLoweredPlan(
                     pattern.push({ nodeLocalIdx: ni, inputIdx: ii });
                   }
                 } else if (inp.kind === "scalar") {
-                  if (
-                    !extInputs.some(
-                      (ei) =>
-                        ei.kind === "scalar" &&
-                        ei.value === inp.value &&
-                        ei.dtype === inp.dtype,
-                    )
-                  ) {
-                    extInputs.push(inp);
-                    pattern.push({ nodeLocalIdx: ni, inputIdx: ii });
-                  }
+                  // Positional — never value-deduped (must mirror
+                  // collectExternalInputs / groupToRecipe; equal-today
+                  // values may diverge across steps).
+                  extInputs.push(inp);
+                  pattern.push({ nodeLocalIdx: ni, inputIdx: ii });
                 } else {
                   if (
                     !extInputs.some(
@@ -867,6 +956,42 @@ export async function executeLoweredPlan(
             neededIntermediates:
               neededIntermediates.length > 0 ? neededIntermediates : undefined,
           };
+
+          // Frozen-scalar adaptation: the cached recipe bakes inlined scalar
+          // VALUES; the template fingerprint deliberately ignores them. If a
+          // scalar's current value differs from the baked one (per-step
+          // coefficient, scheduled LR), demote it to a RUNTIME input — its
+          // value then flows as data through the scalar table on every
+          // execution. The rebuilt recipe replaces the cached one and any
+          // compiled plan recorded against the old kernel is invalidated
+          // (adaptation fires on the recording execution — the first one
+          // where the value can differ — so the re-recording uses the new
+          // kernel). Inlining is kept for scalars that never change.
+          {
+            let stale: Set<number> | null = null;
+            const rin = action.recipe.inputs;
+            for (let i = 0; i < rin.length; i++) {
+              const inp = rin[i];
+              if (!inp?.isInlinedConstant) continue;
+              const ref = extInputs[i];
+              if (!ref) continue;
+              const cur =
+                ref.kind === "scalar"
+                  ? { inlinable: true as const, value: ref.value }
+                  : isInlinableScalar(ref);
+              if (cur.inlinable && cur.value !== inp.inlinedValue) {
+                (stale ??= new Set(action.runtimeScalarInputs)).add(i);
+              }
+            }
+            if (stale) {
+              action.runtimeScalarInputs = stale;
+              action.recipe = groupToRecipe(group, stale);
+              if (loweredPlan.compiledPlan) {
+                destroyCompiledPlanBuffers(loweredPlan.compiledPlan);
+                loweredPlan.compiledPlan = undefined;
+              }
+            }
+          }
 
           await executeFusedSegment(
             group,
@@ -1065,9 +1190,11 @@ export async function executeLoweredPlan(
             const nodes: LazyIRNode[] = [];
             const inputStorages: StorageHandle[][] = [];
             const items: import("../backend/types").AdamBatchItem[] = [];
+            let firstNodeIdx = -1;
             for (const nodeIdx of action.nodeIndices) {
               const node = planNodes[nodeIdx];
               if (node.result) continue;
+              if (firstNodeIdx < 0) firstNodeIdx = nodeIdx;
               const inputs = node.inputs.map((ref) =>
                 getInputStorage(ref, adamBackend),
               );
@@ -1083,6 +1210,10 @@ export async function executeLoweredPlan(
               });
             }
             if (items.length === 0) return;
+            // Attribute volatile uniform recordings (Adam config) to the first
+            // adamStep node — all items in a batch share hyperparameters by
+            // construction, so any node is a valid replay-time config source.
+            if (compilationRecording) setRecordingNodeIndex(firstNodeIdx);
             const results = adamStepBatch(items);
             for (let i = 0; i < nodes.length; i++) {
               const r = results[i];
@@ -1145,6 +1276,9 @@ export async function executeLoweredPlan(
           const nodeIdx = action.nodeIndex;
           const node = planNodes[nodeIdx];
           if (node.result) break;
+
+          // Tag the node for recording hooks (volatile uniform attribution).
+          if (compilationRecording) setRecordingNodeIndex(nodeIdx);
 
                   setProfileModule(node.module ?? "unknown");
           let inputs;
@@ -1231,7 +1365,17 @@ export async function executeLoweredPlan(
 
       // Liveness-based early release: free dead buffers after each action.
       // Uses the pre-built release schedule (action-index based, not step based).
-      if (livenessReleaseSchedule && !compilationRecording) {
+      // Liveness releases stay ON during recording in planned-buffer mode:
+      // the pool reuse they enable IS the planned-buffer assignment the
+      // compiled plan captures (recordAlloc splits lifetimes into distinct
+      // slots). In default (unbounded-arena) mode, releases are skipped
+      // during recording as before — arena identities are already stable.
+      if (
+        livenessReleaseSchedule &&
+        (!compilationRecording ||
+          (arenaLivenessEnabled() &&
+            process.env.TORCHLETTE_COMPILED_PLANNED === "1"))
+      ) {
         // Register newly-produced storages for release tracking
         const covered = getActionNodeIndices(action);
         for (const ni of covered) {
@@ -1389,6 +1533,9 @@ export async function executeLoweredPlan(
       clearArenaConflictDetected();
     }
 
+    // Deactivate the scalar-ref table for this plan execution
+    clearActiveScalarTable();
+
     // Deactivate buffer arena
     if (options.bufferArena && useTopLevelSharedEncoder) {
       clearActiveArena();
@@ -1521,6 +1668,12 @@ export async function executePlanOptimized(
   // Validate cache hit via secondary fingerprint.
   let validatedTemplate = cachedTemplate?.loweredPlan ? cachedTemplate : undefined;
   if (validatedTemplate && validatedTemplate.fingerprintSecondary !== fingerprint.secondary) {
+    if (validatedTemplate.loweredPlan?.compiledPlan) {
+      destroyCompiledPlanBuffers(validatedTemplate.loweredPlan.compiledPlan);
+    }
+    if (validatedTemplate.loweredPlan) {
+      destroyScalarTable(validatedTemplate.loweredPlan);
+    }
     validatedTemplate = undefined;
     fusionAnalysisCache.delete(fingerprint.primary);
   }
@@ -1714,6 +1867,10 @@ export async function executePlanOptimized(
         if (tmpl.bufferArena) {
           destroyArena(tmpl.bufferArena);
         }
+        if (tmpl.loweredPlan?.compiledPlan) {
+          destroyCompiledPlanBuffers(tmpl.loweredPlan.compiledPlan);
+        }
+        if (tmpl.loweredPlan) destroyScalarTable(tmpl.loweredPlan);
         fusionAnalysisCache.delete(fp);
         removed++;
       }

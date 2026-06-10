@@ -877,10 +877,15 @@ export function collectExternalInputs(
   for (const node of groupNodes) {
     for (const input of node.inputs) {
       if (input.kind === "pending" && groupNodeIds.has(input.node.id)) continue;
-      const key =
-        input.kind === "scalar"
-          ? `v:${input.value}_${input.dtype}`
-          : inputKey(input)!;
+      // Scalars dedupe by POSITION, never by value: two scalar refs that
+      // happen to be equal when the template is built may diverge on later
+      // steps (per-step coefficients), and value-collapsed positions would
+      // silently alias them. Tensor refs keep identity-based dedupe.
+      if (input.kind === "scalar") {
+        external.push(input);
+        continue;
+      }
+      const key = inputKey(input)!;
       if (!seen.has(key)) {
         seen.add(key);
         external.push(input);
@@ -897,7 +902,18 @@ export function collectExternalInputs(
  * @param group - The detected fusion group
  * @returns Recipe suitable for fusion-tile-ir
  */
-export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
+export function groupToRecipe(
+  group: FusionGroup,
+  /**
+   * Recipe input indices to demote from inlined constants to RUNTIME inputs.
+   * Set by the executor's frozen-scalar adaptation: a cached recipe bakes
+   * inlined values, so any scalar observed to CHANGE across template reuses
+   * must become a real (0-d) binding whose value flows as data (the scalar
+   * table) instead. Indices are stable across rebuilds — registration order
+   * is positional and unaffected by inlining flags.
+   */
+  runtimeScalarInputs?: ReadonlySet<number>,
+): FusedKernelRecipe {
   const nodeIds = group.nodes.map((n) => n.id);
   const nodeSet = new Set(nodeIds);
 
@@ -911,14 +927,10 @@ export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
   const registerInput = (ref: LazyRef): number => {
     let id: number;
     if (ref.kind === "scalar") {
-      // Scalar refs use a synthetic ID based on value+dtype
-      // Check if we've already registered this exact scalar
-      for (const [, existingIdx] of inputMap) {
-        const inp = inputs[-existingIdx - 1];
-        if (inp?.isInlinedConstant && inp.inlinedValue === ref.value) {
-          return existingIdx;
-        }
-      }
+      // Scalars register PER POSITION (synthetic id, no value-based dedupe):
+      // equal-today values may diverge on later steps, and value-collapsed
+      // positions would silently alias them. Must mirror
+      // collectExternalInputs and the executor's pattern rebuild.
       id = scalarIdCounter--;
     } else {
       id = ref.kind === "materialized" ? -ref.storage.id : ref.node.id;
@@ -930,15 +942,18 @@ export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
     inputMap.set(id, -(idx + 1));
 
     if (ref.kind === "scalar") {
-      // Scalar refs are always inlined constants — zero binding slots
-      inputs.push({
+      const entry: FusedInput = {
         id,
         index: idx,
         shape: [],
         dtype: ref.dtype,
-        isInlinedConstant: true,
-        inlinedValue: ref.value,
-      });
+      };
+      if (!runtimeScalarInputs?.has(idx)) {
+        // Inlined constant — zero binding slots
+        entry.isInlinedConstant = true;
+        entry.inlinedValue = ref.value;
+      }
+      inputs.push(entry);
     } else if (ref.kind === "materialized") {
       inputs.push({
         id,
@@ -955,7 +970,7 @@ export function groupToRecipe(group: FusionGroup): FusedKernelRecipe {
         shape: ref.node.shape ?? [1],
         dtype: ensureDType(ref.node.dtype),
       };
-      if (inlineCheck.inlinable) {
+      if (inlineCheck.inlinable && !runtimeScalarInputs?.has(idx)) {
         inputEntry.isInlinedConstant = true;
         inputEntry.inlinedValue = inlineCheck.value;
       }
@@ -1207,7 +1222,7 @@ function countNewExternals(
  *
  * Materialized refs already have GPU buffers and can't be inlined without readback.
  */
-function isInlinableScalar(
+export function isInlinableScalar(
   ref: LazyRef,
 ): { inlinable: true; value: number } | { inlinable: false } {
   // Scalar refs are trivially inlinable

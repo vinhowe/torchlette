@@ -20,6 +20,7 @@ import {
 } from "../graph/profiler";
 import type { LazyIRNode, LazyRef, StorageHandle } from "../graph/types";
 import { OP_REGISTRY } from "../ops/registry";
+import { lookupScalarStorage } from "./scalar-table";
 
 // ---------------------------------------------------------------------------
 // Multi-output op protocol
@@ -128,7 +129,14 @@ export function getInputStorage(
     return ref.storage;
   }
   if (ref.kind === "scalar") {
-    // Materialize scalar ref on-the-fly for non-fused execution
+    // Per-step-varying scalars resolve through the plan's scalar table: a
+    // persistent buffer the executor refreshed from THIS step's value before
+    // execution. No fill dispatch, stable buffer identity, and — critically —
+    // value-independent compiled plans (the legacy full([], v) path baked the
+    // value into the fill kernel's recorded params; see scalar-table.ts).
+    const tableStorage = lookupScalarStorage(ref);
+    if (tableStorage) return tableStorage;
+    // Legacy fallback (CPU backends, non-f32 scalars, refs outside the plan)
     const b = backend ?? getBackend("cpu");
     if (!b) throw new Error("No backend available to materialize scalar ref");
     const prevLabel = getCurrentOpLabel();

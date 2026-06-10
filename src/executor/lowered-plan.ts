@@ -26,6 +26,7 @@
 import type { DType } from "../backend/types";
 import type { FusedKernelRecipe } from "../backend/webgpu/fusion-types";
 import type { EpilogueOp } from "../compiler/matmul-epilogue";
+import { collectScalarSlots } from "./scalar-table";
 
 /** A path to resolve a tensor reference: planNodes[planNodeIndex].inputs[inputIndex]. */
 type PlanNodePath = { planNodeIndex: number; inputIndex: number };
@@ -47,6 +48,12 @@ interface LoweredFusedAction {
   neededIntermediateNodeIndices: number[];
   /** The fusion recipe (cached — same object reused across steps). */
   recipe: FusedKernelRecipe;
+  /**
+   * Recipe input indices demoted from inlined constants to runtime inputs
+   * because their values were observed to CHANGE across template reuses
+   * (frozen-scalar adaptation — see the executor's fused case).
+   */
+  runtimeScalarInputs?: Set<number>;
   /** Whether vectorization was enabled for this dispatch. */
   enableVectorization: boolean;
   /**
@@ -212,6 +219,12 @@ export interface LoweredPlan {
   cachedStats?: import("./executor").OptimizedExecutionStats;
   /** Compiled execution plan: flat GPU command sequence. */
   compiledPlan?: import("./compiled-plan").CompiledPlan;
+  /** Structural positions of f32 scalar refs — refreshed as DATA every
+   *  execution so template/compiled caches stay value-independent
+   *  (see scalar-table.ts and docs/architecture-debt.md stage 1). */
+  scalarSlots?: import("./scalar-table").ScalarSlot[];
+  /** Per-template scalar buffers (created lazily by the executor). */
+  scalarTable?: import("./scalar-table").PlanScalarTable;
 }
 
 // ============================================================================
@@ -243,6 +256,20 @@ const VIEW_OPS: ReadonlySet<string> = new Set([
  * the copy commands are invisible to the compute dispatch recording mechanism.
  */
 export const ENCODER_COPY_OPS: ReadonlySet<string> = new Set(["scatterAdd"]);
+
+/**
+ * Ops that may hoist above a batched adamStep run (see the adam-batch
+ * grouping). Light per-param producers that the optimizer-region DFS order
+ * interleaves with adamStep nodes: grad-clip's copy-back (stridedScatterCopy),
+ * the GradScaler's unscaleGrad, plain copies/casts. Kept narrow on purpose —
+ * a non-whitelisted op simply ends the batch run (correct, smaller batch).
+ */
+const ADAM_HOISTABLE_OPS: ReadonlySet<string> = new Set([
+  "stridedScatterCopy",
+  "unscaleGrad",
+  "copy",
+  "cast",
+]);
 
 /**
  * Merge non-adjacent same-config sequential reduction actions into batched
@@ -469,6 +496,13 @@ export function buildLoweredPlanFromAnalysis(
   const actions: LoweredAction[] = [];
   let nodesSinceReclaim = 0;
 
+  if (
+    process.env.TORCHLETTE_DEBUG_OPTPLAN &&
+    planNodes.some((n) => n.op === "adamStep")
+  ) {
+    console.log(`[optplan] ${planNodes.map((n) => n.op).join(",")}`);
+  }
+
   /** Insert a reclaim action if enough nodes have been processed. */
   const maybeReclaim = (nodeCount: number) => {
     nodesSinceReclaim += nodeCount;
@@ -537,9 +571,17 @@ export function buildLoweredPlanFromAnalysis(
   // dependents prevent merging. To enable: fuse sumToShape into a single node.
   mergeBatchableReductions(actions, planNodes);
 
+  // Collect f32 scalar-ref positions: their VALUES may change every step
+  // (optimizer bias correction, scheduled LR) while the template fingerprint
+  // deliberately ignores them. The executor refreshes these as DATA each
+  // execution (scalar-table.ts) so every cache keyed under the fingerprint
+  // stays value-independent.
+  const scalarSlots = collectScalarSlots(planNodes);
+
   return {
     actions,
     planNodeCount: planNodes.length,
+    scalarSlots: scalarSlots.length > 0 ? scalarSlots : undefined,
   };
 }
 
@@ -659,7 +701,8 @@ function emitSequentialActions(
       }
     }
 
-    // Adam batch: count consecutive adamStep nodes.
+    // Adam batch: collect the run of adamStep nodes, hoisting interleaved
+    // per-param PRODUCER nodes above the batch.
     //
     // Always emit an adam-batch action for adamStep, even when there's only
     // one node. adam-batch routes through backend.ops.adamStepBatch, which
@@ -669,19 +712,50 @@ function emitSequentialActions(
     // adamStep[0]" bug came from a generic-sequential path that left
     // node.results[0] = null until a later wrap-and-backfill that wasn't
     // always reached.
+    //
+    // Hoisting: the DFS plan order interleaves each param's grad-producing
+    // node with its adamStep (clip's copy-back `stridedScatterCopy_i` or the
+    // GradScaler's `unscaleGrad_i` sits right before `adamStep_i`), so a
+    // consecutive-only scan yields size-1 batches — adamStepBatch then
+    // flushes per param (~100 submits/step) and packed dispatch never
+    // engages. A node may hoist above the batched adams iff it is a
+    // whitelisted light op AND none of its pending inputs reference an
+    // adamStep already in the run (i.e. it is a producer, not a consumer —
+    // hoisting preserves dataflow order because plan order is topological,
+    // so all of the producer's own inputs precede it). The first
+    // non-hoistable node ends the run.
     if (node.op === "adamStep") {
-      let adamCount = 1;
-      for (let j = nodeIdx + 1; j < nodes.length; j++) {
-        if (nodes[j].op === "adamStep" && !nodes[j].result) adamCount++;
-        else break;
-      }
       const adamIndices: number[] = [];
-      for (let c = 0; c < adamCount; c++) {
-        adamIndices.push(posMap.get(nodes[nodeIdx + c].id) as number);
+      const hoisted: number[] = [];
+      const runAdamIds = new Set<number>();
+      let consumed = 0;
+      for (let j = nodeIdx; j < nodes.length; j++) {
+        const nj = nodes[j];
+        if (nj.op === "adamStep") {
+          if (!nj.result) {
+            adamIndices.push(posMap.get(nj.id) as number);
+            runAdamIds.add(nj.id);
+          }
+          consumed++;
+          continue;
+        }
+        if (!ADAM_HOISTABLE_OPS.has(nj.op) || nj.result) break;
+        const readsRunAdam = nj.inputs.some(
+          (r) => r.kind === "pending" && runAdamIds.has(r.node.id),
+        );
+        if (readsRunAdam) break;
+        hoisted.push(posMap.get(nj.id) as number);
+        consumed++;
+      }
+      // Trailing hoisted nodes (after the last adam) execute earlier than
+      // their original position — dataflow-safe (their inputs precede them;
+      // their consumers come after the run).
+      for (const p of hoisted) {
+        actions.push({ kind: "sequential", nodeIndex: p });
       }
       actions.push({ kind: "adam-batch", nodeIndices: adamIndices });
-      maybeReclaim(adamCount);
-      nodeIdx += adamCount - 1;
+      maybeReclaim(consumed);
+      nodeIdx += consumed - 1;
       continue;
     }
 
