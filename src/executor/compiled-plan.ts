@@ -192,6 +192,7 @@ export interface CompiledPlan {
 
 import {
   arenaLivenessEnabled,
+  compiledPlannedEnabled,
   type BufferArena,
 } from "../backend/webgpu/buffer-arena";
 import { bufferPool } from "../backend/webgpu/buffer-pool";
@@ -294,8 +295,7 @@ export function buildCompiledPlan(input: {
   // (webgpu-state), consulted by every destroy/release path. Validated:
   // fullstack parity 4e-6/30 steps vs lowered; medium@512 13.8GB peak at
   // compiled speed (~2.6x over lowered liveness, <half default-arena mem).
-  const planned =
-    arenaLivenessEnabled() && process.env.TORCHLETTE_COMPILED_PLANNED === "1";
+  const planned = compiledPlannedEnabled();
   const allocBuffers: (GPUBuffer | undefined)[] | undefined = planned
     ? []
     : undefined;

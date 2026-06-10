@@ -300,10 +300,10 @@ export function destroyArena(arena: BufferArena, force = false): void {
  * and are only reused after a GPU fence — so a buffer read by a still-queued op
  * is never handed out, the hazard that a naive arena-side reuse hits). This
  * bounds memory to the pool's live working set while keeping the many small
- * buffers arena-resident for bind-group stability. The compiled-plan fast-replay
- * records fixed per-position buffer identities, which spilling breaks, so it is
- * disabled under this flag (executor gates on arenaLivenessEnabled()). The large
- * activations are short-lived, so losing their bind-group stability costs little.
+ * buffers arena-resident for bind-group stability. Compiled-plan replay works
+ * in this mode via PLANNED BUFFERS (see compiledPlannedEnabled below): the
+ * recorded pool-buffer assignment is pinned to the plan and replays bind it
+ * directly — compiled speed at bounded memory.
  * Default off. Threshold via TORCHLETTE_ARENA_MAX_BUFFER_MB (default 2MB).
  */
 let _arenaLiveness: boolean | null = null;
@@ -315,6 +315,20 @@ export function arenaLivenessEnabled(): boolean {
         .__torchletteArenaLiveness;
   }
   return _arenaLiveness;
+}
+
+/**
+ * Planned compiled buffers: under the bounded (liveness) arena, compiled
+ * plans pin and replay the recorded pool-buffer assignment instead of
+ * disabling compilation. ON by default whenever liveness mode is on
+ * (measured: GPT-2 Medium @512 13.8GB at compiled speed, vs ~525ms/step
+ * lowered); TORCHLETTE_COMPILED_PLANNED=0 opts out (lowered execution, the
+ * pre-2026-06-10 liveness behavior). No effect in default-arena mode.
+ */
+export function compiledPlannedEnabled(): boolean {
+  return (
+    arenaLivenessEnabled() && process.env.TORCHLETTE_COMPILED_PLANNED !== "0"
+  );
 }
 let _arenaSpillBytes: number | null = null;
 function arenaSpillThreshold(): number {

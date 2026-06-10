@@ -13,6 +13,7 @@ import {
   clearActiveArena,
   clearArenaConflictDetected,
   clearArenaExternalInputBuffers,
+  compiledPlannedEnabled,
   destroyArena,
   endSharedEncoder,
   flushBufferPool,
@@ -666,8 +667,7 @@ export async function executeLoweredPlan(
     // compiled replay needs the EXPERIMENTAL planned-buffer mode (such plans
     // carry allocBuffers — the pinned, lifetime-split assignment recorded
     // from the pool-reusing execution). See buildCompiledPlan for status.
-    (!arenaLivenessEnabled() ||
-      process.env.TORCHLETTE_COMPILED_PLANNED === "1")
+    (!arenaLivenessEnabled() || compiledPlannedEnabled())
   ) {
     if (process.env.TORCHLETTE_DEBUG_COMPILED) {
       console.log(
@@ -733,8 +733,7 @@ export async function executeLoweredPlan(
     options.bufferArena.resolve.length > 0 && // Arena populated from prior execution
     // Bounded-arena mode: compile only under the experimental planned-buffer
     // flag (see buildCompiledPlan), else stay on the lowered path as before.
-    (!arenaLivenessEnabled() ||
-      process.env.TORCHLETTE_COMPILED_PLANNED === "1") &&
+    (!arenaLivenessEnabled() || compiledPlannedEnabled()) &&
     // Debug bisection: only compile plans up to N nodes.
     (!process.env.TORCHLETTE_COMPILED_MAX_NODES ||
       planNodes.length <=
@@ -1373,8 +1372,7 @@ export async function executeLoweredPlan(
       if (
         livenessReleaseSchedule &&
         (!compilationRecording ||
-          (arenaLivenessEnabled() &&
-            process.env.TORCHLETTE_COMPILED_PLANNED === "1"))
+          compiledPlannedEnabled())
       ) {
         // Register newly-produced storages for release tracking
         const covered = getActionNodeIndices(action);
