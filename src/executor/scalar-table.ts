@@ -122,6 +122,7 @@ export function refreshScalarTable(
 ): void {
   const slots = loweredPlan.scalarSlots;
   if (!slots || slots.length === 0) return;
+  if (process.env.TORCHLETTE_SCALAR_TABLE === "0") return; // debug kill switch
   const device = (backend as Backend & { device?: GPUDevice }).device;
   if (!device) return; // non-WebGPU backends keep the legacy full() path
 

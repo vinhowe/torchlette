@@ -101,9 +101,25 @@ async function main() {
     }
     await loss!.backward();
     opt.step();
-    opt.zeroGrad();
+    // ZEROGRAD_AFTER=1: defer zeroGrad until after markStep — probes whether
+    // disposing grads BEFORE their lazy consumers (the optimizer chain)
+    // execute is what corrupts state.
+    if (process.env.ZEROGRAD_AFTER !== "1") opt.zeroGrad();
     api.endStep();
     await api.markStep();
+    if (process.env.ZEROGRAD_AFTER === "1") opt.zeroGrad();
+    if (process.env.ADAM_STATE_DUMP === "1") {
+      const { _debugAdamState } = await import("../src/optim/adam");
+      const rt = api._runtime();
+      for (let i = 0; i < Math.min(2, params.length); i++) {
+        const st = _debugAdamState(opt, i);
+        const m = Array.from(await rt.cpu(st.m)).slice(0, 2);
+        const v = Array.from(await rt.cpu(st.v)).slice(0, 2);
+        console.error(
+          `[state] step=${step} i=${i} m=${m.map((x) => Number(x).toFixed(6))} v=${v.map((x) => Number(x).toFixed(8))}`,
+        );
+      }
+    }
     const stepVals: number[] = [];
     for (const p of params) stepVals.push(...Array.from(await p.cpu()));
     trajectory.push(stepVals);

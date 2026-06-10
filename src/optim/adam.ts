@@ -465,6 +465,22 @@ export class Adam {
     param: Tensor,
     grad: RuntimeTensor,
   ): void {
+    if (process.env.TORCHLETTE_DEBUG_ADAM_BUFS) {
+      const bid = (t: RuntimeTensor): string => {
+        const bt = (t as unknown as { backendTensor?: { buffer?: object } })
+          .backendTensor;
+        if (!bt?.buffer) return "pending";
+        let id = _adamDbgIds.get(bt.buffer);
+        if (id === undefined) {
+          id = _adamDbgNext++;
+          _adamDbgIds.set(bt.buffer, id);
+        }
+        return `b${id}`;
+      };
+      console.log(
+        `[adamdbg] t=${this.steps[i] + 1} i=${i} param=${bid(param._unwrap())} grad=${bid(grad)} m=${bid(this.expAvg[i])} v=${bid(this.expAvgSq[i])}`,
+      );
+    }
     this._advanceStep(i);
 
     let gradAdj = grad;
@@ -495,8 +511,10 @@ export class Adam {
       runtime.mul(gradSq, 1 - this.beta2),
     );
 
-    prevAvg.dispose();
-    prevAvgSq.dispose();
+    if (process.env.TORCHLETTE_DEBUG_NO_DISPOSE !== "1") {
+      prevAvg.dispose();
+      prevAvgSq.dispose();
+    }
     this.expAvg[i] = avg;
     this.expAvgSq[i] = avgSq;
 
@@ -588,4 +606,20 @@ export class Adam {
     }
     this._foreachState.clear();
   }
+}
+
+// Debug buffer-identity bookkeeping for TORCHLETTE_DEBUG_ADAM_BUFS.
+const _adamDbgIds = new WeakMap<object, number>();
+let _adamDbgNext = 1;
+
+// Debug accessor for state-value probes (tools/adam-trajectory-probe.ts).
+export function _debugAdamState(
+  opt: Adam,
+  i: number,
+): { m: RuntimeTensor; v: RuntimeTensor } {
+  const o = opt as unknown as {
+    expAvg: RuntimeTensor[];
+    expAvgSq: RuntimeTensor[];
+  };
+  return { m: o.expAvg[i], v: o.expAvgSq[i] };
 }
