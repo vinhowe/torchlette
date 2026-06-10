@@ -1,6 +1,7 @@
 /**
  * Strided scatter ops: stridedScatterCopy (+ chunked), stridedScatterAdd (+ chunked).
  */
+import { recordedCopyBufferToBuffer } from "../../../executor/compiled-plan";
 import type { BackendTensor } from "../../types";
 import {
   cachedCreateBindGroup,
@@ -9,7 +10,12 @@ import {
   releaseParamsBuffer,
 } from "../bind-group-cache";
 import { resolveOutputBuffer } from "../buffer-arena";
-import { destroyCopy } from "../buffer-pool";
+import { bufferPool, destroyCopy } from "../buffer-pool";
+import {
+  getSharedEncoderInstance,
+  submitOrCollect,
+} from "../shared-encoder";
+import { trackSharedEncoderWrite } from "../webgpu-state";
 import { dispatchComputePass, getPipeline } from "../dispatch";
 import { requireContext } from "../gpu-context";
 import type { WebGPUTensor } from "../gpu-types";
@@ -114,6 +120,59 @@ function stridedScatterImpl(
     ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
   const baseSizeBytes = baseSize * 4;
   const srcSizeBytes = srcTensor.size * 4;
+
+  // TRUE IN-PLACE fast path for full contiguous overwrites (copy_ semantics):
+  // one recorded buffer-to-buffer DMA into the base's EXISTING buffer, zero
+  // allocation, and — critically — the destination tensor keeps its storage
+  // identity. The copy-on-write path below migrates the destination into a
+  // fresh arena buffer every call, which makes persistent tensors updated
+  // via copy_ (params, packed optimizer state) ping-pong against their own
+  // plan positions: a perpetual external-input conflict, one fresh
+  // multi-hundred-MB allocation per state tensor per step. In-place writes
+  // follow the framework's existing in-place discipline (readers of the old
+  // value are scheduled earlier in the plan; in-queue pass ordering
+  // serializes them — same contract as the fused adamStep).
+  if (
+    op === "copy" &&
+    viewSize === baseSize &&
+    offset === 0 &&
+    checkContiguousStrides(viewShape, viewStrides) &&
+    baseTensor.isContiguous &&
+    (baseTensor.offset ?? 0) === 0 &&
+    (srcTensor.isContiguous ||
+      checkContiguousStrides(srcTensor.shape, srcTensor.strides)) &&
+    srcTensor.buffer !== baseTensor.buffer &&
+    baseSizeBytes <= srcTensor.buffer.size - (srcTensor.offset ?? 0) * 4
+  ) {
+    trackSharedEncoderWrite(baseTensor.buffer);
+    const enc = getSharedEncoderInstance();
+    if (enc) {
+      recordedCopyBufferToBuffer(
+        enc,
+        srcTensor.buffer,
+        (srcTensor.offset ?? 0) * 4,
+        baseTensor.buffer,
+        0,
+        baseSizeBytes,
+      );
+    } else {
+      const cmdEnc = ctx.device.createCommandEncoder();
+      cmdEnc.copyBufferToBuffer(
+        srcTensor.buffer,
+        (srcTensor.offset ?? 0) * 4,
+        baseTensor.buffer,
+        0,
+        baseSizeBytes,
+      );
+      submitOrCollect(cmdEnc.finish());
+    }
+    // Ownership transfer (same pattern as the fused adamStep): the result
+    // tensor wraps the base's buffer; neutralize the input tensor's release
+    // so the buffer isn't double-released when its handle drops.
+    if (baseTensor.ownsBuffer) bufferPool.decRef(baseTensor.buffer);
+    baseTensor.destroy = () => {};
+    return createTensor(baseTensor.shape, baseTensor.buffer);
+  }
 
   if (baseSizeBytes > maxBindingSize || srcSizeBytes > maxBindingSize) {
     const isFull = viewSize === baseSize && offset === 0;
