@@ -258,8 +258,15 @@ class SimpleBufferPool {
     }
   }
 
+  /** Debug: which path the last acquire() served from. */
+  lastAcquireSource = "";
+
+  /** Count of refused double-releases (see release() guard). */
+  doubleReleaseCount = 0;
+
   acquire(sizeBytes: number): GPUBuffer | null {
     if (!this.enabled) return null;
+    this.lastAcquireSource = "";
 
     const sizeClass = getSizeClass(sizeBytes);
 
@@ -284,6 +291,7 @@ class SimpleBufferPool {
           `[pool] acquire from POOL: ${(actualSize / 1e6).toFixed(2)} MB`,
         );
       }
+      this.lastAcquireSource = "bucket";
       return buffer;
     }
 
@@ -312,6 +320,7 @@ class SimpleBufferPool {
         this.recordWindowDemand(sizeClass, "acquires");
         this.pooledBufferSet.add(buffer);
         this.livenessSafeBuffers.delete(buffer);
+        this.lastAcquireSource = "pendingRelease";
         // Re-track allocation (was deallocated when added to pending)
         gpuMemoryTracker.trackAllocation(buffer, size);
         if (this.debugTrace) {
@@ -473,7 +482,29 @@ class SimpleBufferPool {
       return false; // Don't pool, destroy instead
     }
 
-    // Add to pending queue - will be available after GPU work completes
+    // IDEMPOTENT-RELEASE GUARD: a buffer already in pendingRelease or a pool
+    // bucket must NOT be queued again. Double-release (two storages owning
+    // one buffer — e.g. a replay-harvest wrap plus the node's real storage)
+    // puts the buffer in the pool TWICE; two later allocations then receive
+    // THE SAME buffer, and for upload buffers (queue.writeBuffer executes
+    // immediately, copies are encoded) every consumer reads the last
+    // writer's data — the 124M DiLoCo outer-step corruption. The pre-pin /
+    // returnToPool cycle further AMPLIFIES any duplicate. Refusing the
+    // second entry makes the class structurally harmless; the env-gated log
+    // keeps it diagnosable.
+    {
+      const inPending = this.pendingRelease.some((e) => e.buffer === buffer);
+      const inBucket = this.pool.get(sizeClass)?.includes(buffer) ?? false;
+      if (inPending || inBucket) {
+        this.doubleReleaseCount++;
+        if (process.env.TORCHLETTE_DEBUG_POOLDUP) {
+          console.log(
+            `[pool-dup] DOUBLE-RELEASE (refused) size=${actualSize} inPending=${inPending} inBucket=${inBucket} at ${new Error().stack?.split("\n").slice(2, 8).map((l) => l.trim()).join(" <- ")}`,
+          );
+        }
+        return true; // already owned by the pool — treat as released
+      }
+    }
     this.pendingRelease.push({ buffer, sizeClass, size: actualSize });
     this.pendingReleaseBytes += actualSize;
     this.releaseToPool++;
@@ -681,6 +712,19 @@ class SimpleBufferPool {
    * Used when a pre-pinned buffer wasn't consumed and needs to go back.
    */
   returnToPool(buffer: GPUBuffer, sizeClass: number): void {
+    // Idempotent: see the double-release guard in release().
+    if (
+      this.getBucket(sizeClass).includes(buffer) ||
+      this.pendingRelease.some((e) => e.buffer === buffer)
+    ) {
+      this.doubleReleaseCount++;
+      if (process.env.TORCHLETTE_DEBUG_POOLDUP) {
+        console.log(
+          `[pool-dup] returnToPool DOUBLE-ENTRY (refused) class=${sizeClass} at ${new Error().stack?.split("\n").slice(2, 8).map((l) => l.trim()).join(" <- ")}`,
+        );
+      }
+      return;
+    }
     this.getBucket(sizeClass).push(buffer);
     this.pooledBytes += getSizeForClass(sizeClass);
   }

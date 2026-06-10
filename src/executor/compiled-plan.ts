@@ -1197,6 +1197,7 @@ export async function executeCompiledPlan(
         case TAG_WRITE: {
           // Execute the data source node (tensorFromArray) to produce buffer data
           const writeNode = planNodes[cmd.nodeIndex];
+          const hadResult = !!writeNode.result;
           if (!writeNode.result) {
             const inputs = writeNode.inputs.map((ref) =>
               getInputStorage(ref, backend),
@@ -1214,6 +1215,11 @@ export async function executeCompiledPlan(
             writeNode.result = createStorageHandle(writeNode.device, result);
           }
           slots[cmd.slot] = gpuBuffer(writeNode.result!.backendTensor);
+          if (process.env.TORCHLETTE_DEBUG_WRITES) {
+            console.log(
+              `[replay-write] cmd=${ci} slot=${cmd.slot} node=${writeNode.id} bytes=${(writeNode.result!.backendTensor as { size?: number }).size ?? "?"} buf=${dbgBufId(slots[cmd.slot])} ${hadResult ? "PRE-MATERIALIZED" : "executed"}`,
+            );
+          }
           break;
         }
         case TAG_CLEAR: {
@@ -1304,6 +1310,45 @@ export async function executeCompiledPlan(
     for (const r of compiled.results) {
       const node = planNodes[r.nodeIndex];
       const buf = slots[r.slot];
+
+      // Will this result actually be ASSIGNED anywhere? Storage handles must
+      // be created LAZILY, only when assigned: an eagerly-created handle that
+      // nobody adopts is an ORPHAN with rc=0 — destroyUnreachable at markStep
+      // destroys it and, if it OWNS the buffer, releases a buffer that the
+      // node's real storage (e.g. a TAG_WRITE upload) still owns. The double
+      // release puts the buffer in the pool TWICE; two later allocations
+      // (outer-step uploads in the same size class) then receive THE SAME
+      // buffer in one replay — queue.writeBuffer executes immediately while
+      // the copies are still encoded, so every copy reads the LAST upload's
+      // data (the 124M DiLoCo outer-step corruption: whole params overwritten
+      // with another param's update, loss +0.5 nats).
+      const assignsPrimary = r.outputIndex === 0 && !node.result;
+      const assignsExtra =
+        r.outputIndex > 0 || (node.results && node.results.length > 0);
+      if (
+        process.env.TORCHLETTE_DEBUG_HARVEST_ALL ||
+        (process.env.TORCHLETTE_DEBUG_SHAPE &&
+          r.shape.join(",") === process.env.TORCHLETTE_DEBUG_SHAPE) ||
+        (process.env.TORCHLETTE_DEBUG_OPMATCH &&
+          node.op.includes(process.env.TORCHLETTE_DEBUG_OPMATCH))
+      ) {
+        console.log(
+          `[harvest-${r.shape.join("x")}] node[${r.nodeIndex}] op=${node.op} id=${node.id} oi=${r.outputIndex} slot=${r.slot} buf=${dbgBufId(slots[r.slot])} ${assignsPrimary || assignsExtra ? "assign" : "SKIP(existing buf=" + (node.result ? dbgBufId(gpuBuffer(node.result.backendTensor)) : "?") + ")"}`,
+        );
+      }
+      if (!assignsPrimary && !assignsExtra) {
+        if (process.env.TORCHLETTE_DEBUG_HARVEST) {
+          dbgHarvestSkipped++;
+          if (dbgHarvestSkipped <= 5 && node.result) {
+            const existing = gpuBuffer(node.result.backendTensor);
+            console.log(
+              `[harvest-skip] node[${r.nodeIndex}] op=${node.op} shape=${JSON.stringify(node.shape)} existing buf ${existing === buf ? "SAME" : "DIFFERS"} from replay slot`,
+            );
+          }
+        }
+        continue;
+      }
+
       let base: StorageHandle | undefined;
       for (let j = 0; j < node.inputs.length; j++) {
         const st = resolveInputStorage(node, j);
@@ -1325,33 +1370,11 @@ export async function executeCompiledPlan(
         sh.baseStorageId = base.id;
         rcRetain(base.id, "view.baseStorageId");
       }
-      if (
-        process.env.TORCHLETTE_DEBUG_HARVEST_ALL ||
-        (process.env.TORCHLETTE_DEBUG_SHAPE &&
-          r.shape.join(",") === process.env.TORCHLETTE_DEBUG_SHAPE) ||
-        (process.env.TORCHLETTE_DEBUG_OPMATCH &&
-          node.op.includes(process.env.TORCHLETTE_DEBUG_OPMATCH))
-      ) {
-        console.log(
-          `[harvest-${r.shape.join("x")}] node[${r.nodeIndex}] op=${node.op} id=${node.id} oi=${r.outputIndex} slot=${r.slot} buf=${dbgBufId(slots[r.slot])} sh=${(sh as { id?: number }).id} ${node.result ? "SKIP(existing buf=" + dbgBufId(gpuBuffer(node.result.backendTensor)) + ")" : "assign"}`,
-        );
-      }
-      if (r.outputIndex === 0) {
-        // Primary output
-        if (!node.result) {
-          node.result = sh;
-        } else if (process.env.TORCHLETTE_DEBUG_HARVEST) {
-          dbgHarvestSkipped++;
-          if (dbgHarvestSkipped <= 5) {
-            const existing = gpuBuffer(node.result.backendTensor);
-            console.log(
-              `[harvest-skip] node[${r.nodeIndex}] op=${node.op} shape=${JSON.stringify(node.shape)} existing buf ${existing === slots[r.slot] ? "SAME" : "DIFFERS"} from replay slot`,
-            );
-          }
-        }
+      if (assignsPrimary) {
+        node.result = sh;
       }
       // Multi-output: populate node.results array
-      if (r.outputIndex > 0 || (node.results && node.results.length > 0)) {
+      if (assignsExtra) {
         if (!node.results) {
           node.results = [node.result!];
         }

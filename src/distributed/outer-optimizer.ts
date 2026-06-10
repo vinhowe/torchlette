@@ -72,6 +72,52 @@ export class NesterovOuterOptimizer {
     }
     api.endStep();
     await api.markStep();
+
+    // Debug: verify the GPU params actually received the CPU-computed values
+    // (this plan is upload+copy only, so JS holds exact ground truth).
+    if (process.env.TORCHLETTE_DEBUG_OUTER_VERIFY === "1") {
+      let worst = 0;
+      let worstIdx = -1;
+      let worstElem = -1;
+      const TOL = 1e-5;
+      const corrupt: string[] = [];
+      for (let i = 0; i < params.length; i++) {
+        const snap = snapshot[i];
+        const v = this.velocities.get(params[i])!;
+        const got = await params[i].cpu();
+        let nBad = 0;
+        let first = -1;
+        let last = -1;
+        let sampleExp = 0;
+        let sampleGot = 0;
+        for (let j = 0; j < snap.length; j++) {
+          const expected = snap[j] + this.lr * v[j];
+          const d = Math.abs(got[j] - expected);
+          if (d > worst) {
+            worst = d;
+            worstIdx = i;
+            worstElem = j;
+          }
+          if (d > TOL) {
+            if (nBad === 0) {
+              first = j;
+              sampleExp = expected;
+              sampleGot = got[j];
+            }
+            last = j;
+            nBad++;
+          }
+        }
+        if (nBad > 0) {
+          corrupt.push(
+            `param ${i} (${params[i].shape.join("x")}, n=${snap.length}): ${nBad} bad elems in [${first}..${last}] e.g. expected=${sampleExp.toPrecision(6)} got=${sampleGot.toPrecision(6)}`,
+          );
+        }
+      }
+      console.log(
+        `[outer-verify] worst |gpu - expected| = ${worst.toExponential(3)} (param ${worstIdx} elem ${worstElem})${corrupt.length ? `\n[outer-verify] CORRUPT: ${corrupt.join("\n[outer-verify] CORRUPT: ")}` : ""}`,
+      );
+    }
   }
 
   /**
