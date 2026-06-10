@@ -36,3 +36,4 @@ CPU.*.cpuprofile
 *.cpuprofile
 
 .claude/worktrees/
+__pycache__/

@@ -95,8 +95,11 @@ GPU memory is managed deterministically via two-tier reachability — no GC depe
 - **Row-program output layout** (`row-program-dispatch.ts`): the kernel's write count (scalar `[R,1]` vs full `[R,D]`) must equal the consuming node's `sizeOf(shape)`. The buffer is sized from the consumer's shape and the dispatch throws if the kernel's write count disagrees (caught → safe sequential fallback + warning). A misclassified `scalarOutput` once made every row collapse onto row 0's value under `compile()`.
 - **Multi-output op consumers** (`graph-rewrites.ts` `structuralKey`, `fusion-detect.ts` `inputKey`): a pending ref's structural key MUST include `outputIndex`, else CSE merges consumers of different outputs of one node (SDPA dQ/dK collapsed onto dV). The canonical convention is `rewriter/matcher.ts` `refEqual` (compares node id AND outputIndex).
 - **GPU vs CPU op semantics** (`pow`): WGSL `pow(x,y)=exp2(y·log2(x))` is NaN for x<0 while the CPU `**` reference is correct — so CPU tests can't catch GPU-only numeric bugs. Integer-exponent `pow` lowers to a mul chain at the frontend to match.
+- **Compiled-plan replay vs per-step host values** (`tile-dispatch.ts` + `compiled-plan.ts`): the lowered path rewrites tile-IR uniform configs on every dispatch; a compiled replay binds the buffer's record-time contents. Any per-step-varying value (Adam's bias-corrected `step_size`, GradScaler's `inv_scale`, scheduled LR) must flow into replays as DATA — a tensor write (TAG_WRITE re-executes the source node) or a volatile uniform (TAG_UNIFORM re-packs from the current node's payload; `setAdamConfigUniforms` is the single source for the Adam mapping). Guarded at the seam: `getConfigBuffer` compares config bytes across executions and invalidates the recording (→ lowered fallback) when they changed with no volatile repack. The frozen `step_size` silently trained with the wrong LR schedule and was twice misattributed to "benign fp32 noise" before being found.
 
 **Corollary — differentially test optimized paths against the naive one.** Fused / compiled / row-program / multi-output paths must be checked *numerically* against the plain (`enableFusion`-off, non-`compile()`, or CPU) path — not just "does it run." Every bug above was invisible to existing tests because they exercised only one path or ran on CPU; each fell out of a same-input cross-path diff (`tools/parity-forward-diff.ts`, `tools/compile-ln-repro.ts`, the jax-js bench). When you add a new optimized execution path, add a cross-path numerical guard with it.
+
+**Corollary 2 — the differential must cross the optimization's ACTIVATION threshold.** The compiled plan only builds on the 2nd+ execution of a template and only covers what executes inside plans (the optimizer runs there too). Single-step parity tests and even fixed-weight multi-step probes (no `optimizer.step()`) both validated "the compiled plan" while never executing the part that was broken. The trajectory-level gate is `tools/parity-fullstack-tl.ts` run twice (`TORCHLETTE_COMPILED_PLAN=0` vs default) — per-step losses must agree to ~1e-5 over 30 steps. Run it after any compiled-plan / executor / optimizer-dispatch change.
 
 ## WebGPU Buffer Pool Invariants
 
@@ -123,6 +126,12 @@ Steady-state ~213ms/step wall clock. Memory: 1645MB steady, zero leak. Pool reus
 
 ### Baseline C: GPT-2 Medium, 512 tokens, Node/Dawn (V100)
 Steady-state ~162ms/step wall clock. Memory: 14.7GB steady, zero leak. Pool reuse 58%. 741/4449 nodes fused (16.7%). Top GPU: bare matmul 125ms (bwd), epilogue matmul ~49ms (fwd) + ~47ms (bwd), fusedAttentionBwd 22.5ms, adamStep 14.3ms (14 dispatches, packed). GPU is 81% matmul.
+
+### Re-measured 2026-06-10 (V100 sivri, arena/compiled-plan era)
+- **DistilGPT-2 512 (GradScaler+AdamW)**: ~56ms/step steady wall (98ms incl. warmup-skewed avg), 8 submits/step, adamStep 8 packed dispatches. Memory: **10.2GB** steady (unbudgeted arena — up from 1.6GB pre-arena; flat, zero leak). GPU ~68ms/step total, matmul family 66%.
+- **GPT-2 Medium 512**: **OOMs (>32GB) in default mode** — the per-position arena exceeds V100 memory. With `TORCHLETTE_ARENA_LIVENESS=1`: fits at 12.3GB peak but runs **~518ms/step** (compiled plans disabled in that mode). Closing that gap is the planned-buffers experiment (`TORCHLETTE_COMPILED_PLANNED=1`, parked — see memory `planned-compiled-buffers-wip`).
+- Optimizer batching fix: lowered-plan adam-batch grouping hoists interleaved per-param producers (unscaleGrad / clip's stridedScatterCopy) above one big batch (`ADAM_HOISTABLE_OPS`); previously every batch had size 1 (158 submits/step, no packing). Debug: `TORCHLETTE_DEBUG_OPTPLAN=1` dumps optimizer plan op order.
+- Compiled replay now preserves profiler attribution (label/module recorded per dispatch — previously 83% of GPU time showed as "unknown").
 
 ## Open Performance Targets
 
