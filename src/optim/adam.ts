@@ -56,10 +56,6 @@ export class Adam {
     number,
     { m: RuntimeTensor; v: RuntimeTensor; sig: string }
   >();
-  /** Pending unscale config from GradScaler (fused unscale+Adam path) */
-  private _pendingUnscale: { invScale: number; infFlagBuffer: unknown } | null =
-    null;
-
   constructor(
     params: Tensor[] | AdamParamGroup[],
     options: AdamOptions,
@@ -198,15 +194,6 @@ export class Adam {
     return !!backend.ops.adamStep;
   }
 
-  /**
-   * Set pending unscale config for fused unscale+Adam step.
-   * Called by GradScaler._unscaleFused() to pass invScale and infFlagBuffer
-   * so that the Adam kernel can fuse gradient unscaling with the optimizer step.
-   */
-  setUnscaleConfig(invScale: number, infFlagBuffer: unknown): void {
-    this._pendingUnscale = { invScale, infFlagBuffer };
-  }
-
   step(): Tensor[] {
     const runtime = this.api._runtime();
 
@@ -218,6 +205,15 @@ export class Adam {
     //    table all apply, at ~constant op count instead of ~13 ops per param
     //    (TORCHLETTE_FOREACH_ADAM=0 disables)
     //  - per-param elementwise: the reference definition.
+    //
+    // Foreach-as-default is BLOCKED by the buffer arena, not by foreach:
+    // measured 2026-06-10 (distilgpt2@512), foreach == fused to 1.5e-5/30
+    // steps fp32 fullstack, but the default arena gives each of foreach's
+    // ~30 full-model-size graph intermediates a PERSISTENT per-position
+    // slot: 20.3GB vs 9.1GB fused (under TORCHLETTE_ARENA_LIVENESS=1 it's
+    // 2.5GB current — the program is fine, the memory policy isn't). Flip
+    // the default once bounded-memory compiled execution lands
+    // (docs/architecture-debt.md, planned compiled buffers).
     if (this.hasFusedKernel() && process.env.TORCHLETTE_FUSED_ADAM !== "0") {
       return this._stepFused(runtime);
     }
@@ -381,15 +377,12 @@ export class Adam {
 
   /**
    * Fused Adam step: one dispatch per parameter.
-   * When _pendingUnscale is set, the kernel also fuses gradient unscaling
-   * and inf detection (eliminating separate unscaleGrad dispatches).
+   * (The kernel also supports a fused unscale+inf-check variant via
+   * AdamStepConfig.invScale/infFlagBuffer; GradScaler unscales through
+   * graph-level unscaleGrad nodes instead, so nothing engages it here.)
    */
   private _stepFused(runtime: ReturnType<Torchlette["_runtime"]>): Tensor[] {
     const updated: Tensor[] = [];
-
-    // Consume pending unscale config (set by GradScaler)
-    const unscale = this._pendingUnscale;
-    this._pendingUnscale = null;
 
     for (let i = 0; i < this.params.length; i++) {
       const param = this.params[i];
@@ -420,8 +413,6 @@ export class Adam {
         lrTimesWd: lr * wd,
         decoupledWd: this.adamW,
         emitF16: true,
-        invScale: unscale?.invScale,
-        infFlagBuffer: unscale?.infFlagBuffer,
       };
 
       // Create a single adamStep lazy node with 4 inputs: grad, param, m, v

@@ -37,16 +37,6 @@ import type { SGD } from "./sgd";
 
 export type Optimizer = Adam | SGD;
 
-/** Duck-type interface for optimizers with fused GPU kernels (e.g., Adam). */
-interface FusedOptimizer {
-  hasFusedKernel(): boolean;
-  setUnscaleConfig(invScale: number, infFlagBuffer: unknown): void;
-}
-
-function isFusedOptimizer(opt: Optimizer): opt is Optimizer & FusedOptimizer {
-  return typeof (opt as FusedOptimizer).hasFusedKernel === "function";
-}
-
 export type GradScalerOptions = {
   /** Initial scale factor. Default: 65536.0 (2^16) */
   initScale?: number;
