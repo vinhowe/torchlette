@@ -224,7 +224,7 @@ export interface RecordedDispatch {
   module?: string;
 }
 
-import type { LazyIRNode } from "../graph/types";
+import type { LazyIRNode, StorageHandle } from "../graph/types";
 import { getInputStorage } from "./op-dispatch";
 
 /** Recorded buffer copy for compilation. */
@@ -455,6 +455,11 @@ export function buildCompiledPlan(input: {
         pinnedBufferSet.add(buf);
         adoptedRefCount.set(buf, 1);
         adoptedBuffers!.push(buf);
+        if (process.env.TORCHLETTE_DEBUG_DESTROYED) {
+          console.log(
+            `[pin] buf=${dbgBufId(buf)} size=${(((buf as unknown as { size?: number }).size ?? 0) / 1e6).toFixed(1)}MB alreadyDestroyed=${_dbgDestroyed.has(buf)}`,
+          );
+        }
       }
     };
     for (const buf of allocBuffers) {
@@ -536,6 +541,21 @@ function dbgPatchDestroy(sample: GPUBuffer): void {
   const orig = proto.destroy;
   proto.destroy = function (this: GPUBuffer) {
     _dbgDestroyed.add(this);
+    const minMb = process.env.TORCHLETTE_DEBUG_DESTROY_STACK_MB;
+    if (
+      minMb &&
+      ((this as unknown as { size?: number }).size ?? 0) >
+        parseFloat(minMb) * 1024 * 1024
+    ) {
+      const stack = new Error().stack
+        ?.split("\n")
+        .slice(2, 8)
+        .map((l) => l.trim())
+        .join(" <- ");
+      console.log(
+        `[destroy-stack] buf=${dbgBufId(this)} size=${(((this as unknown as { size?: number }).size ?? 0) / 1e6).toFixed(1)}MB pinned=${pinnedBufferSet.has(this)} ${stack}`,
+      );
+    }
     return orig.call(this);
   };
 }
@@ -914,6 +934,7 @@ import {
   trackSharedEncoderWrite,
 } from "../backend/webgpu/webgpu-state";
 import { createStorageHandle } from "../graph/node-factory";
+import { rcRetain } from "../graph/refcount";
 import { executeOpSync } from "./op-dispatch";
 
 /**
@@ -1081,8 +1102,21 @@ export async function executeCompiledPlan(
             for (let j = 0; j < bufs.length; j++) {
               if (_dbgDestroyed.has(bufs[j])) {
                 const src = compiled.slots[cmd.bindings[j]];
+                let refDesc = "";
+                if (src?.kind === "external") {
+                  const ref =
+                    planNodes[src.planNodeIndex]?.inputs[src.inputIndex];
+                  refDesc =
+                    ref?.kind === "materialized"
+                      ? ` ref=materialized storage=${ref.storage.id}`
+                      : ref?.kind === "scalar"
+                        ? " ref=scalar"
+                        : ref
+                          ? ` ref=pending node=${(ref as { node: { id: number; op: string } }).node.id}:${(ref as { node: { op: string } }).node.op} oi=${(ref as { outputIndex?: number }).outputIndex ?? 0}`
+                          : " ref=MISSING";
+                }
                 console.log(
-                  `[destroyed-bind] cmd=${ci} label=${cmd.label ?? "?"} bindingIdx=${j} slot=${cmd.bindings[j]} kind=${src?.kind} buf=${dbgBufId(bufs[j])} IS DESTROYED`,
+                  `[destroyed-bind] cmd=${ci} label=${cmd.label ?? "?"} bindingIdx=${j} slot=${cmd.bindings[j]} kind=${src?.kind}${refDesc} buf=${dbgBufId(bufs[j])} IS DESTROYED`,
                 );
               }
             }
@@ -1240,18 +1274,57 @@ export async function executeCompiledPlan(
       );
     }
 
-    // Phase 3: Harvest results — assign to plan nodes for downstream plans
+    // Phase 3: Harvest results — assign to plan nodes for downstream plans.
+    //
+    // OWNERSHIP mirrors the lowered path's wrapResultAsStorage:
+    //  - IN-PLACE result (the slot buffer IS one of the node's input buffers
+    //    — fused adamStep updates param/m/v in their own buffers): the wrap
+    //    must be a NON-OWNING view chained to the input storage
+    //    (baseStorageId + rcRetain keeps the true owner alive). A naively
+    //    owning wrap double-owns the buffer: when the previous step's wrap
+    //    dies at markStep it DESTROYS the live state buffer (under a pool
+    //    budget release() refuses to pool the 167MB m/v buffers → deferred
+    //    destroy → every later adamStep submit binds a destroyed buffer and
+    //    is rejected — the 124M DiLoCo "while destroyed" failure).
+    //  - PINNED buffer (plan-owned planned/persistent binding): non-owning,
+    //    the plan's teardown disposes it.
+    //  - Otherwise (default-arena buffers, dynamic fallback allocs): owning,
+    //    as before (arena buffers are shielded by arenaBufferSet anyway).
     let dbgHarvestSkipped = 0;
+    const resolveInputStorage = (
+      node: LazyIRNode,
+      j: number,
+    ): StorageHandle | undefined => {
+      const ref = node.inputs[j];
+      if (!ref || ref.kind === "scalar") return undefined;
+      if (ref.kind === "materialized") return ref.storage;
+      const oi = ref.outputIndex ?? 0;
+      return oi === 0 ? ref.node.result : ref.node.results?.[oi];
+    };
     for (const r of compiled.results) {
       const node = planNodes[r.nodeIndex];
+      const buf = slots[r.slot];
+      let base: StorageHandle | undefined;
+      for (let j = 0; j < node.inputs.length; j++) {
+        const st = resolveInputStorage(node, j);
+        if (st && gpuBuffer(st.backendTensor) === buf) {
+          base = st;
+          break;
+        }
+      }
       const tensor = createTensor(
         r.shape,
-        slots[r.slot],
+        buf,
         r.strides,
         r.offset,
         r.dtype,
+        /* ownsBuffer */ !base && !pinnedBufferSet.has(buf),
       );
       const sh = createStorageHandle(node.device, tensor);
+      if (base) {
+        sh.baseStorageId = base.id;
+        rcRetain(base.id, "view.baseStorageId");
+      }
       if (
         process.env.TORCHLETTE_DEBUG_HARVEST_ALL ||
         (process.env.TORCHLETTE_DEBUG_SHAPE &&
