@@ -254,12 +254,13 @@ export async function executeFusedSegment(
     donatableInputIds &&
     donatableInputIds.size > 0 &&
     process.env.TORCHLETTE_DONATION !== "0" &&
-    // v1: SINGLE-output chains only. Multi-output singleton-batched groups
-    // (phase 2b) corrupted training when donated (foreach loss froze at
-    // 10.82 from step 1) — root cause not yet established; per-thread
-    // load-before-store should make them safe, so something in their
-    // consumer bookkeeping (view-chained last-reader? batched-group input
-    // attribution?) is wrong. Re-enable only with a dedicated differential.
+    // SINGLE-output chains only. Donating into multi-output singleton-
+    // batched groups (phase 2b) corrupts foreach training EVEN WITH the
+    // cross-plan consumer protection in executor.ts (tested: loss frozen at
+    // untrained from step 1; protection alone did not fix it) — the defect
+    // is in the donated multi-output kernel or its dispatch/bookkeeping,
+    // not in liveness. Re-enable only with a dedicated unit differential
+    // for batched-group donation.
     recipe.outputs.length === 1 &&
     (!group.additionalOutputNodes || group.additionalOutputNodes.length === 0) &&
     // NO externally-needed intermediates — those re-execute group nodes

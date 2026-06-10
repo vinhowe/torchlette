@@ -80,7 +80,10 @@ function markLivenessSafe(storage: StorageHandle): void {
   if (buf) bufferPool.markLivenessSafe(buf);
 }
 
-import { getLivePendingNodeIds } from "../runtime/tensor";
+import {
+  getLivePendingNodeIds,
+  getLivePendingRootNodes,
+} from "../runtime/tensor";
 import {
   assignSlot,
   buildCompiledPlan,
@@ -829,6 +832,44 @@ export async function executeLoweredPlan(
     for (const node of planNodes) {
       if (node.result) livenessOutputIds.add(node.id);
       if (livePendingIds.has(node.id)) livenessOutputIds.add(node.id);
+    }
+
+    // CROSS-PLAN CONSUMERS: a step's pending graph can split across several
+    // plans (e.g. the foreach optimizer's update graph). A node in THIS plan
+    // that an external live root's closure references will be read by a
+    // LATER plan — it must be protected from liveness release and from
+    // buffer donation. Walk the pending graph from every live root that is
+    // NOT itself in this plan and protect any plan node encountered.
+    {
+      const visited = new Set<number>();
+      const stack: LazyIRNode[] = [];
+      for (const rootObj of getLivePendingRootNodes()) {
+        const root = rootObj as LazyIRNode;
+        if (nodeIdSet.has(root.id)) continue; // this plan's own output
+        if (!visited.has(root.id)) {
+          visited.add(root.id);
+          stack.push(root);
+        }
+      }
+      while (stack.length > 0) {
+        const n = stack.pop()!;
+        if (nodeIdSet.has(n.id)) {
+          // Reached INTO the plan from outside: protect, don't descend —
+          // the node's own inputs are protected transitively only if some
+          // external path reads them; in-plan reads are already covered by
+          // livenessLastAction.
+          livenessOutputIds.add(n.id);
+          continue;
+        }
+        if (n.result) continue; // materialized boundary — replays from storage
+        for (const ref of n.inputs) {
+          if (ref.kind !== "pending") continue;
+          const child = ref.node as LazyIRNode;
+          if (visited.has(child.id)) continue;
+          visited.add(child.id);
+          stack.push(child);
+        }
+      }
     }
 
     // Map nodeId → plan index for O(1) lookup

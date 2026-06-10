@@ -134,6 +134,31 @@ export function getLivePendingNodeIds(): Set<number> {
 }
 
 /**
+ * Live pending ROOT NODES (the LazyIRNodes that live, undisposed tensors
+ * point at). Used by the executor's liveness analysis to walk the parts of
+ * the pending graph OUTSIDE the current plan: a plan node consumed by such
+ * an external root's closure must not be released or donated — a LATER plan
+ * in the same step will read it (the foreach update graph splits across
+ * plans; releasing its cross-plan intermediates was sound only by the
+ * accident of pendingRelease fence gating, and donation made the
+ * corruption deterministic).
+ */
+export function getLivePendingRootNodes(): object[] {
+  const roots: object[] = [];
+  for (const tensors of pendingTensorsByNodeId.values()) {
+    for (const t of tensors) {
+      const ref = (t as { lazyRef?: { kind?: string; node?: object } })
+        .lazyRef;
+      if (ref?.kind === "pending" && ref.node) {
+        roots.push(ref.node);
+        break; // one node object per registry entry
+      }
+    }
+  }
+  return roots;
+}
+
+/**
  * Clear the disposed pending node IDs set.
  * Called after plan execution to prevent unbounded growth.
  */
