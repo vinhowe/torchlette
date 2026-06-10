@@ -168,6 +168,13 @@ interface FusedDispatchOptions {
   cache?: FusionKernelCache;
   /** Enable vectorized loads/stores for memory coalescing (§15.3) */
   vectorize?: boolean;
+  /**
+   * BUFFER DONATION (see KernelGenOptions.donatedInput): index into
+   * recipe.inputs whose buffer becomes the primary output IN PLACE. The
+   * caller guarantees liveness (this dispatch is the input's last reader)
+   * and shape/dtype equality with out0; single-output recipes only.
+   */
+  donatedInput?: number;
 }
 
 /**
@@ -197,8 +204,26 @@ export function dispatchFusedKernel(
     );
   }
 
+  // Donation: the donated input shares out0's binding (one fewer binding).
+  const donated = options.donatedInput;
+  // Position of the donated input within the non-inlined `inputs` array.
+  let donatedPos = -1;
+  if (donated !== undefined) {
+    let pos = 0;
+    for (let i = 0; i < recipe.inputs.length; i++) {
+      if (recipe.inputs[i].isInlinedConstant) continue;
+      if (i === donated) {
+        donatedPos = pos;
+        break;
+      }
+      pos++;
+    }
+    if (donatedPos < 0) throw new Error(`donatedInput ${donated} not found`);
+  }
+
   // Check storage buffer binding count against device limits BEFORE creating pipeline.
-  const storageBindingCount = nonInlinedCount + recipe.outputs.length;
+  const storageBindingCount =
+    nonInlinedCount - (donated !== undefined ? 1 : 0) + recipe.outputs.length;
   const maxStorageBuffers = device.limits.maxStorageBuffersPerShaderStage;
   if (storageBindingCount > maxStorageBuffers!) {
     throw new Error(
@@ -209,6 +234,7 @@ export function dispatchFusedKernel(
   const kernelCache = options.cache ?? getFusionCache();
   const { pipeline, kernel } = kernelCache.getOrCreate(device, recipe, {
     vectorize: options.vectorize ?? true,
+    donatedInput: donated,
   });
 
   // All outputs must have the same shape (required for elementwise fusion)
@@ -223,8 +249,16 @@ export function dispatchFusedKernel(
   const outputBuffers: GPUBuffer[] = [];
   const outputTensors: FusedOutputTensor[] = [];
   for (const output of recipe.outputs) {
-    const outputBytes = totalElements * dtypeBytes(output.dtype);
-    const buffer = resolveOutputBuffer(device, outputBytes, inputGPUBuffers);
+    let buffer: GPUBuffer;
+    if (donated !== undefined) {
+      // In-place: write into the donated input's buffer. No allocation, no
+      // recordAlloc — the compiled-plan recording resolves this binding to
+      // the input's existing slot (in-place discipline, like adamStep).
+      buffer = inputs[donatedPos].buffer;
+    } else {
+      const outputBytes = totalElements * dtypeBytes(output.dtype);
+      buffer = resolveOutputBuffer(device, outputBytes, inputGPUBuffers);
+    }
     trackSharedEncoderWrite(buffer);
     outputBuffers.push(buffer);
     outputTensors.push({
@@ -240,9 +274,11 @@ export function dispatchFusedKernel(
     new Uint32Array([totalElements]),
   );
 
-  // Build flat buffer array: non-inlined inputs, then outputs, then params
+  // Build flat buffer array: non-inlined inputs (minus the donated one,
+  // which is bound as out0), then outputs, then params
   const bgBuffers: GPUBuffer[] = [];
   for (let i = 0; i < inputs.length; i++) {
+    if (i === donatedPos) continue;
     bgBuffers.push(inputs[i].buffer);
   }
   for (let i = 0; i < outputBuffers.length; i++) {

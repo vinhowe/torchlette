@@ -23,6 +23,11 @@ import {
   setCurrentOpLabel,
   setProfileModule,
 } from "../graph/profiler";
+import {
+  arenaBufferSet,
+  pinnedBufferSet,
+} from "../backend/webgpu/webgpu-state";
+import { rcRetain } from "../graph/refcount";
 import type { LazyIRNode, LazyRef, StorageHandle } from "../graph/types";
 import { getInputStorage } from "./op-dispatch";
 import { executeNode } from "./sequential";
@@ -56,6 +61,7 @@ export async function executeFusedSegment(
   recipe: ReturnType<typeof groupToRecipe>,
   backend: Backend,
   enableVectorization: boolean,
+  donatableInputIds?: Set<number>,
 ): Promise<void> {
   // For CPU or other backends without fusion support, fall back to sequential execution
   if (!isFusedBackend(backend) || !("dispatchFusedKernel" in backend)) {
@@ -133,6 +139,11 @@ export async function executeFusedSegment(
   // Prepare inputs from external refs, skipping inlined constants
   const inputs: Array<{ buffer: GPUBuffer; shape: number[]; dtype: DType }> =
     [];
+  // Parallel to `inputs` (non-inlined order): the source StorageHandle for
+  // donation eligibility + base-chaining; null for scalars and contiguous
+  // copies (not donatable). Also the recipe-input index per entry.
+  const inputStorages: Array<StorageHandle | null> = [];
+  const inputRecipeIdx: number[] = [];
   const tempContiguousCopies: Array<{ destroy?: () => void }> = [];
   for (let inputIdx = 0; inputIdx < group.externalInputs.length; inputIdx++) {
     // Skip inlined constants — their values are baked into the shader
@@ -155,6 +166,8 @@ export async function executeFusedSegment(
         shape: [],
         dtype: (st.dtype as DType) ?? "f32",
       });
+      inputStorages.push(null);
+      inputRecipeIdx.push(inputIdx);
       continue;
     }
     let storage: StorageHandle | undefined;
@@ -187,6 +200,8 @@ export async function executeFusedSegment(
           shape: contig.shape ?? tensor.shape ?? [1],
           dtype: (contig.dtype as DType) ?? (tensor.dtype as DType) ?? "f32",
         });
+        inputStorages.push(null);
+        inputRecipeIdx.push(inputIdx);
         continue;
       }
       // No contiguous op — fall back
@@ -203,6 +218,8 @@ export async function executeFusedSegment(
       shape: tensor.shape ?? [1],
       dtype: (tensor.dtype as DType) ?? "f32",
     });
+    inputStorages.push(storage);
+    inputRecipeIdx.push(inputIdx);
   }
 
   // Check if any input buffer exceeds maxStorageBufferBindingSize
@@ -219,6 +236,74 @@ export async function executeFusedSegment(
     return;
   }
 
+  // BUFFER DONATION: pick a dying input whose buffer the primary output can
+  // overwrite in place. Eligibility (every condition is load-bearing):
+  //  - liveness says this segment is the input node's LAST reader and the
+  //    node is not a plan output / externally referenced (donatableInputIds);
+  //  - single-output recipe, no externally-needed intermediates (those
+  //    re-execute group nodes AFTER the dispatch and would read the
+  //    clobbered input);
+  //  - same element count + dtype as out0, non-scalar, non-broadcast;
+  //  - buffer not arena-owned or plan-pinned (their identity is managed
+  //    elsewhere; donating transfers WRITE ownership to the output);
+  //  - buffer not bound twice in this kernel (read + rw of one buffer in a
+  //    single dispatch is a WebGPU validation error).
+  let donatedRecipeIdx: number | undefined;
+  let donatedStorage: StorageHandle | null = null;
+  if (
+    donatableInputIds &&
+    donatableInputIds.size > 0 &&
+    process.env.TORCHLETTE_DONATION !== "0" &&
+    // v1: SINGLE-output chains only. Multi-output singleton-batched groups
+    // (phase 2b) corrupted training when donated (foreach loss froze at
+    // 10.82 from step 1) — root cause not yet established; per-thread
+    // load-before-store should make them safe, so something in their
+    // consumer bookkeeping (view-chained last-reader? batched-group input
+    // attribution?) is wrong. Re-enable only with a dedicated differential.
+    recipe.outputs.length === 1 &&
+    (!group.additionalOutputNodes || group.additionalOutputNodes.length === 0) &&
+    // NO externally-needed intermediates — those re-execute group nodes
+    // after the dispatch and would read the clobbered donated input.
+    (!group.neededIntermediates || group.neededIntermediates.length === 0)
+  ) {
+    const out0 = recipe.outputs[0];
+    const outElems = sizeOf(out0.shape);
+    for (let pos = 0; pos < inputs.length; pos++) {
+      const storage = inputStorages[pos];
+      if (!storage) continue;
+      const rIdx = inputRecipeIdx[pos];
+      const rin = recipe.inputs[rIdx];
+      if (!rin || rin.isInlinedConstant || rin.isScalar) continue;
+      const ref = group.externalInputs[rIdx];
+      if (!ref || ref.kind !== "pending") continue;
+      if (!donatableInputIds.has(ref.node.id)) continue;
+      if (sizeOf(rin.shape) !== outElems) continue;
+      if (rin.dtype !== out0.dtype) continue;
+      const buf = inputs[pos].buffer;
+      if (arenaBufferSet.has(buf) || pinnedBufferSet.has(buf)) continue;
+      // No duplicate binding of the same buffer in this dispatch
+      let dup = false;
+      for (let q = 0; q < inputs.length; q++) {
+        if (q !== pos && inputs[q].buffer === buf) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) continue;
+      donatedRecipeIdx = rIdx;
+      donatedStorage = storage;
+      break;
+    }
+  }
+  if (process.env.TORCHLETTE_DEBUG_DONATION) {
+    const outElems = sizeOf(recipe.outputs[0].shape);
+    if (outElems > 1_000_000) {
+      console.log(
+        `[donation] group out=${recipe.outputs[0].shape.join("x")} outs=${recipe.outputs.length} needed=${group.neededIntermediates?.length ?? 0} addl=${group.additionalOutputNodes?.length ?? 0} donatable=${donatableInputIds ? [...donatableInputIds].length : "none"} -> ${donatedRecipeIdx !== undefined ? "DONATED in" + donatedRecipeIdx : "no"}`,
+      );
+    }
+  }
+
   try {
     // Set module context for profiling from the output node
     setProfileModule(group.outputNode.module ?? "unknown");
@@ -228,10 +313,38 @@ export async function executeFusedSegment(
     // Dispatch the fused kernel
     const result = dispatchFusedKernel(device, recipe, inputs, {
       vectorize: enableVectorization,
+      donatedInput: donatedRecipeIdx,
     });
 
     // Store results on output nodes
-    group.outputNode.result = wrapFusionOutput(group.outputNode.device, result);
+    if (donatedRecipeIdx !== undefined && donatedStorage) {
+      // In-place result: a NON-OWNING view base-chained to the donated
+      // input's storage (mirrors wrapResultAsStorage) — the input storage
+      // remains the buffer's owner and survives (rcRetain) until the output
+      // dies; liveness release of the input is deferred by the same retain.
+      const out0 = result.outputs[0];
+      const sh = createStorageHandle(group.outputNode.device as DeviceKind, {
+        buffer: out0.buffer,
+        shape: out0.shape,
+        dtype: out0.dtype,
+        size: sizeOf(out0.shape),
+        strides: contiguousStrides(out0.shape),
+        offset: 0,
+        isContiguous: true,
+        ownsBuffer: false,
+        toArray() {
+          return [];
+        },
+      } as BackendTensor);
+      sh.baseStorageId = donatedStorage.id;
+      rcRetain(donatedStorage.id, "view.baseStorageId");
+      group.outputNode.result = sh;
+    } else {
+      group.outputNode.result = wrapFusionOutput(
+        group.outputNode.device,
+        result,
+      );
+    }
     if (group.additionalOutputNodes && result.outputs) {
       for (let i = 0; i < group.additionalOutputNodes.length; i++) {
         const addNode = group.additionalOutputNodes[i];

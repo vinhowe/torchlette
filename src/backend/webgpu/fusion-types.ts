@@ -132,6 +132,16 @@ export interface KernelGenOptions {
   vectorize?: boolean;
   /** Force specific vector width (overrides auto-selection) */
   forceVectorWidth?: VectorWidth;
+  /**
+   * BUFFER DONATION: index into recipe.inputs of an input whose buffer the
+   * primary output writes IN PLACE. The kernel omits the input's read
+   * binding; its loads read out0's read_write binding instead (elementwise:
+   * each thread reads its element before storing — no cross-thread hazard).
+   * Caller guarantees: input is non-inlined, non-scalar, same shape+dtype as
+   * out0 (no broadcast), single-output recipe, and the input's storage dies
+   * at this dispatch (liveness last-consumer).
+   */
+  donatedInput?: number;
 }
 
 /** Generated kernel result. */
@@ -236,7 +246,11 @@ export function computeKernelMeta(
       ? totalWorkgroups
       : MAX_WORKGROUPS_PER_DIM;
   const baseCacheKey = generateKernelCacheKey(recipe, vectorWidth);
-  const cacheKey =
+  let cacheKey =
     gridSizeX >= MAX_WORKGROUPS_PER_DIM ? baseCacheKey + ":2d" : baseCacheKey;
+  // Donated-input kernels have different bindings — distinct pipeline.
+  if (options.donatedInput !== undefined) {
+    cacheKey += `:don${options.donatedInput}`;
+  }
   return { cacheKey, vectorWidth, workItems, workgroupSize, gridSizeX };
 }

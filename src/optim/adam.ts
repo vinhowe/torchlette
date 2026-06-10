@@ -373,6 +373,23 @@ export class Adam {
       );
       runtime.copy_(this.params[idxs[k]]._unwrap(), seg);
     }
+
+    // Dispose the big packed intermediates NOW that the update graph is
+    // built. The IR nodes survive (downstream nodes reference nodes, not
+    // wrappers); disposal removes them from the live-pending registry so
+    // the executor's liveness analysis can release — and the fused kernels
+    // DONATE — their buffers. Without this, every full-group-size
+    // intermediate (328MB each at 124M) is conservatively protected as
+    // "user-held" and the packed chain costs ~2x the fused path's memory.
+    // st.m / st.v / params are NOT disposed (persistent state).
+    for (const t of [G, gAdj, mNew, vNew, mHat, vHat, denom, scaled, pNew, P]) {
+      if (
+        t !== (st.m as unknown) &&
+        t !== (st.v as unknown)
+      ) {
+        (t as { dispose?: () => void }).dispose?.();
+      }
+    }
   }
 
   /**

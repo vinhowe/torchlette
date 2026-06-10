@@ -992,11 +992,29 @@ export async function executeLoweredPlan(
             }
           }
 
+          // BUFFER DONATION eligibility: external inputs whose LAST reader
+          // is this action and which are not plan outputs / externally
+          // referenced — their buffers may be overwritten in place by the
+          // fused kernel's primary output (segment-executors picks one).
+          let donatableInputIds: Set<number> | undefined;
+          if (livenessLastAction && livenessOutputIds) {
+            for (const ref of group.externalInputs) {
+              if (!ref || ref.kind !== "pending") continue;
+              const nid = ref.node.id;
+              if (
+                livenessLastAction.get(nid) === actionIndex &&
+                !livenessOutputIds.has(nid)
+              ) {
+                (donatableInputIds ??= new Set()).add(nid);
+              }
+            }
+          }
           await executeFusedSegment(
             group,
             action.recipe,
             backend,
             action.enableVectorization,
+            donatableInputIds,
           );
           stats.fusedNodes += groupNodes.length;
           stats.fusionGroups++;

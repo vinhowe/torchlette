@@ -256,11 +256,25 @@ export function generateFusedKernelTileIR(
   const meta = computeKernelMeta(recipe, options);
   const { vectorWidth, workItems, workgroupSize, gridSizeX } = meta;
 
-  // Build physical binding map (skip inlined constants)
+  // Buffer donation: the donated input shares out0's read_write binding —
+  // no separate read binding (WebGPU forbids one buffer bound read + rw in a
+  // single dispatch). Its loads read `out0` instead.
+  const donated = options.donatedInput;
+  if (donated !== undefined) {
+    const din = recipe.inputs[donated];
+    if (!din || din.isInlinedConstant || din.isScalar) {
+      throw new Error(`donatedInput ${donated} is not a bindable tensor input`);
+    }
+    if (sizeOf(din.shape) !== sizeOf(recipe.outputs[0].shape)) {
+      throw new Error(`donatedInput ${donated} shape != output shape`);
+    }
+  }
+
+  // Build physical binding map (skip inlined constants and the donated input)
   const physicalBinding: (number | null)[] = [];
   let nextBinding = 0;
   for (let i = 0; i < recipe.inputs.length; i++) {
-    if (recipe.inputs[i].isInlinedConstant) {
+    if (recipe.inputs[i].isInlinedConstant || i === donated) {
       physicalBinding.push(null);
     } else {
       physicalBinding.push(nextBinding++);
@@ -326,7 +340,12 @@ export function generateFusedKernelTileIR(
         const inputSize = sizeOf(input.shape);
         const isScalar = inputSize === 1;
 
-        if (isScalar) {
+        if (i === donated) {
+          // Donated input: read through out0's read_write binding (same
+          // element index — caller guarantees same shape, no broadcast).
+          const val = ctx.emitLet(`v${i}`, ctx.load(`out0`, idx));
+          inputExprs.set(i, val);
+        } else if (isScalar) {
           // Scalar input: load index 0
           const val = ctx.emitLet(`v${i}`, ctx.load(`in${i}`, ctx.u32(0)));
           inputExprs.set(i, val);
