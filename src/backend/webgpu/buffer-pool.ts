@@ -21,6 +21,7 @@ import {
   activeBatch,
   arenaBufferSet,
   gpuContext,
+  pinnedBufferSet,
   sharedEncoderActive,
   sharedEncoderWriteSet,
 } from "./webgpu-state";
@@ -436,6 +437,10 @@ class SimpleBufferPool {
    */
   release(buffer: GPUBuffer, sizeBytes: number, usage: number): boolean {
     if (!this.enabled) return false;
+    // Never pool a PINNED buffer: pooling hands it to an unrelated consumer
+    // while compiled replays still bind it by identity. (Callers route the
+    // false return to deferredDestroy, which is also pin-guarded.)
+    if (pinnedBufferSet.has(buffer)) return false;
 
     // Only pool storage buffers with compatible usage
     if (usage !== STORAGE_BUFFER_USAGE) {
@@ -505,7 +510,9 @@ class SimpleBufferPool {
   deferredDestroy(buffer: GPUBuffer, size: number): void {
     // Arena buffers are owned by the arena — never destroy them.
     // This check covers ALL callers (direct pool calls and wrapper).
-    if (arenaBufferSet.has(buffer)) return;
+    // Pinned buffers are owned by a compiled plan's recorded assignment;
+    // destroying one rejects every future replay submit that binds it.
+    if (arenaBufferSet.has(buffer) || pinnedBufferSet.has(buffer)) return;
     // Track deallocation immediately - the memory is now "freeable"
     gpuMemoryTracker.trackDeallocation(buffer);
     // When batching or shared encoder active, defer until after submit
@@ -577,15 +584,24 @@ class SimpleBufferPool {
   destroyPendingBuffers(): void {
     if (this.pendingDestroy.length === 0) return;
     const destroyed = new Set<GPUBuffer>();
-    for (const { buffer } of this.pendingDestroy) {
-      destroyed.add(buffer);
+    const keep: Array<{ buffer: GPUBuffer; size: number }> = [];
+    for (const entry of this.pendingDestroy) {
+      // A buffer can be PINNED (adopted by a compiled plan) after it was
+      // queued here — e.g. a recording-step temp queued for deferred
+      // destruction, then captured by buildCompiledPlan as a planned/
+      // persistent binding. Destroying it would reject every replay submit.
+      if (pinnedBufferSet.has(entry.buffer)) {
+        keep.push(entry);
+        continue;
+      }
+      destroyed.add(entry.buffer);
       try {
-        buffer.destroy();
+        entry.buffer.destroy();
       } catch {
         // Already destroyed or invalid — ignore.
       }
     }
-    this.pendingDestroy = [];
+    this.pendingDestroy = keep;
 
     // Scrub destroyed buffers from every other tracking set so a future
     // acquire() / acquirePreferred() cannot hand out a destroyed GPUBuffer.

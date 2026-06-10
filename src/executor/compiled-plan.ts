@@ -196,7 +196,10 @@ import {
 } from "../backend/webgpu/buffer-arena";
 import { bufferPool } from "../backend/webgpu/buffer-pool";
 import { gpuMemoryTracker } from "../backend/webgpu/memory-tracker";
-import { arenaBufferSet } from "../backend/webgpu/webgpu-state";
+import {
+  arenaBufferSet,
+  pinnedBufferSet,
+} from "../backend/webgpu/webgpu-state";
 /** Recorded dispatch entry — the subset of fields needed by the compiled plan. */
 export interface RecordedDispatch {
   pipeline: GPUComputePipeline;
@@ -280,11 +283,17 @@ export function buildCompiledPlan(input: {
   // buffers to the plan, so replays bind the exact assignment the recording
   // proved safe under the same command order.
   //
-  // STATUS 2026-06-10: structure validated (fixed-weight probe replays at
-  // 1e-8; all allocs bind planned, zero fallbacks), but the full training
-  // loop reads STALE grads on replay steps (first dynamic-fallback replay is
-  // correct, the second is stale) — a cross-step buffer-reuse/readback
-  // ordering issue still to be root-caused. Off by default.
+  // STATUS 2026-06-10 (evening): WORKING. The stale-grad bug was buffer
+  // destruction beating the pin: (a) adopted buffers were "pinned" by adding
+  // them to arenaBufferSet, whose members the arena evicts/destroys at will;
+  // (b) persistent-slot buffers (recorded bindings to op-internal/unmapped
+  // buffers) were never pinned at all. A replay submit that binds ONE
+  // destroyed buffer is rejected by the device IN ITS ENTIRETY — no compute
+  // executes, every output silently keeps its recorded values (all grads
+  // bit-identical to the recording step). Fixed via pinnedBufferSet
+  // (webgpu-state), consulted by every destroy/release path. Validated:
+  // fullstack parity 4e-6/30 steps vs lowered; medium@512 13.8GB peak at
+  // compiled speed (~2.6x over lowered liveness, <half default-arena mem).
   const planned =
     arenaLivenessEnabled() && process.env.TORCHLETTE_COMPILED_PLANNED === "1";
   const allocBuffers: (GPUBuffer | undefined)[] | undefined = planned
@@ -315,6 +324,14 @@ export function buildCompiledPlan(input: {
         const bindings: Slot[] = [];
         for (let i = 0; i < d.buffers.length; i++) {
           const recorded = d.slots?.[i] ?? -1;
+          if (recorded < 0 && process.env.TORCHLETTE_DEBUG_PERSISTENT) {
+            const had = bufferToSlot.has(d.buffers[i]);
+            if (!had) {
+              console.log(
+                `[persistent-slot] NEW slot ${slotSources.length} buf=${dbgBufId(d.buffers[i])} for unmapped buffer: dispatch label=${d.label ?? "?"} bindingIdx=${i} size=${(d.buffers[i] as { size?: number }).size ?? "?"}`,
+              );
+            }
+          }
           bindings.push(recorded >= 0 ? recorded : persistentSlot(d.buffers[i]));
         }
         commands.push({
@@ -410,7 +427,7 @@ export function buildCompiledPlan(input: {
 
   // Pin the recorded alloc buffers to the plan: take them out of pool
   // circulation (adopt) and shield them from the release chain via
-  // arenaBufferSet — the same protection arena buffers get. Adoption is
+  // pinnedBufferSet (consulted by every destroy/release path). Adoption is
   // REFCOUNTED because a pool buffer released by one plan's liveness can be
   // re-acquired by a LATER plan in the same step (forward's dead activation
   // buffer reused by backward) — both plans then pin the same buffer and it
@@ -420,19 +437,46 @@ export function buildCompiledPlan(input: {
   if (allocBuffers) {
     adoptedBuffers = [];
     const seen = new Set<GPUBuffer>();
-    for (const buf of allocBuffers) {
-      if (!buf || seen.has(buf)) continue;
+    const adopt = (buf: GPUBuffer) => {
+      if (seen.has(buf)) return;
       seen.add(buf);
       const rc = adoptedRefCount.get(buf);
       if (rc !== undefined) {
         adoptedRefCount.set(buf, rc + 1);
-        adoptedBuffers.push(buf);
+        adoptedBuffers!.push(buf);
       } else if (!arenaBufferSet.has(buf)) {
         bufferPool.adoptBuffer(buf);
-        arenaBufferSet.add(buf);
+        // PIN, don't masquerade as arena-owned: arenaBufferSet members are
+        // managed (evicted, released, destroyed) by the arena at will — the
+        // arena's conflict/eviction paths delete membership and route the
+        // buffer back into the release chain, killing the pin. The pinned
+        // set is consulted by EVERY destroy/release path and only this
+        // plan's teardown removes from it.
+        pinnedBufferSet.add(buf);
         adoptedRefCount.set(buf, 1);
-        adoptedBuffers.push(buf);
+        adoptedBuffers!.push(buf);
       }
+    };
+    for (const buf of allocBuffers) {
+      if (buf) adopt(buf);
+    }
+    if (process.env.TORCHLETTE_DEBUG_DESTROYED) {
+      const sample = allocBuffers.find((b) => b);
+      if (sample) dbgPatchDestroy(sample);
+    }
+    // PERSISTENT-slot buffers must be pinned too. They are recorded bindings
+    // whose buffer was unmapped at record time: op-internal allocations
+    // (contiguous/k-split temps), kernel side buffers (LN saved stats,
+    // partial workspaces), and module-singleton caches. Under the bounded
+    // arena these can be pool-recycled or destroyed when their owning
+    // tensor/storage dies (e.g. at markStep) — and a replay that binds ONE
+    // destroyed buffer has its ENTIRE submit rejected by the device
+    // ("buffer used in submit while destroyed"), silently freezing every
+    // output of the plan at its recorded values. That was the planned-
+    // buffers stale-grad bug: all grads bit-identical to the recording step
+    // because the backward's submits never executed.
+    for (const src of slotSources) {
+      if (src.kind === "persistent") adopt(src.buffer);
     }
   }
 
@@ -467,6 +511,38 @@ export function buildCompiledPlan(input: {
  *  pool-liveness reuse hands one buffer to multiple plans in a step). */
 const adoptedRefCount = new Map<GPUBuffer, number>();
 
+/** Debug: stable small ids for GPUBuffer identity in logs. */
+const _dbgBufIds = new WeakMap<GPUBuffer, number>();
+let _dbgBufNext = 1;
+export function dbgBufId(buf: GPUBuffer | undefined): string {
+  if (!buf) return "none";
+  let id = _dbgBufIds.get(buf);
+  if (id === undefined) {
+    id = _dbgBufNext++;
+    _dbgBufIds.set(buf, id);
+  }
+  return `b${id}`;
+}
+
+/** Debug: track destroyed GPUBuffers via prototype patch (debug env only). */
+const _dbgDestroyed = new WeakSet<GPUBuffer>();
+let _dbgDestroyPatched = false;
+function dbgPatchDestroy(sample: GPUBuffer): void {
+  if (_dbgDestroyPatched) return;
+  _dbgDestroyPatched = true;
+  const proto = Object.getPrototypeOf(sample) as {
+    destroy: (this: GPUBuffer) => void;
+  };
+  const orig = proto.destroy;
+  proto.destroy = function (this: GPUBuffer) {
+    _dbgDestroyed.add(this);
+    return orig.call(this);
+  };
+}
+export function dbgIsDestroyed(buf: GPUBuffer): boolean {
+  return _dbgDestroyed.has(buf);
+}
+
 /**
  * Release a plan's adopted buffers (planned-buffer mode). Called when the
  * compiled plan is invalidated or its template evicted. Buffers still owned
@@ -482,7 +558,7 @@ export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
       continue;
     }
     adoptedRefCount.delete(buf);
-    arenaBufferSet.delete(buf);
+    pinnedBufferSet.delete(buf);
     if (bufferPool.canRecycle(buf)) {
       gpuMemoryTracker.trackDeallocation(buf);
       try {
@@ -882,14 +958,35 @@ export async function executeCompiledPlan(
 
   try {
     // Phase 1: Pre-populate external + persistent slots
+    const dbgSlots = process.env.TORCHLETTE_DEBUG_SLOTS
+      ? process.env.TORCHLETTE_DEBUG_SLOTS.split(",").map(Number)
+      : null;
     for (let i = 0; i < compiled.slots.length; i++) {
       const src = compiled.slots[i];
       if (src.kind === "external") {
         const ref = planNodes[src.planNodeIndex].inputs[src.inputIndex];
         const storage = getInputStorage(ref, backend);
         slots[i] = gpuBuffer(storage.backendTensor);
+        if (dbgSlots?.includes(i)) {
+          const refDesc =
+            ref.kind === "materialized"
+              ? `materialized storage=${ref.storage.id}`
+              : ref.kind === "scalar"
+                ? "scalar"
+                : `pending node=${(ref as { node: { id: number; op: string } }).node.id}:${(ref as { node: { op: string } }).node.op} oi=${(ref as { outputIndex?: number }).outputIndex ?? 0}`;
+          console.log(
+            `[slot-src] slot ${i} EXTERNAL via planNodes[${src.planNodeIndex}].inputs[${src.inputIndex}] (${refDesc}) -> buf=${dbgBufId(slots[i])}`,
+          );
+        }
       } else if (src.kind === "persistent") {
         slots[i] = src.buffer;
+        if (dbgSlots?.includes(i)) {
+          console.log(
+            `[slot-src] slot ${i} PERSISTENT buf=${dbgBufId(slots[i])}`,
+          );
+        }
+      } else if (dbgSlots?.includes(i)) {
+        console.log(`[slot-src] slot ${i} kind=${src.kind}`);
       }
       // "arena", "write", and "params" slots are populated below
     }
@@ -979,6 +1076,28 @@ export async function executeCompiledPlan(
               );
             }
           }
+          if (process.env.TORCHLETTE_DEBUG_DESTROYED) {
+            dbgPatchDestroy(bufs[0]);
+            for (let j = 0; j < bufs.length; j++) {
+              if (_dbgDestroyed.has(bufs[j])) {
+                const src = compiled.slots[cmd.bindings[j]];
+                console.log(
+                  `[destroyed-bind] cmd=${ci} label=${cmd.label ?? "?"} bindingIdx=${j} slot=${cmd.bindings[j]} kind=${src?.kind} buf=${dbgBufId(bufs[j])} IS DESTROYED`,
+                );
+              }
+            }
+          }
+          if (
+            process.env.TORCHLETTE_DEBUG_SLOT &&
+            cmd.bindings.includes(
+              parseInt(process.env.TORCHLETTE_DEBUG_SLOT, 10),
+            )
+          ) {
+            const s = parseInt(process.env.TORCHLETTE_DEBUG_SLOT, 10);
+            console.log(
+              `[replay-dispatch] cmd=${ci} label=${cmd.label ?? "?"} binds slot ${s} at idx=${cmd.bindings.indexOf(s)} buf=${dbgBufId(slots[s])} (bindings=${cmd.bindings.join(",")})`,
+            );
+          }
           // Inline bind group cache — bypasses global sequence-indexed cache.
           // The normal path mixes cachedCreateBindGroup (advances dispatchIndex)
           // and profiledCreateBindGroup (doesn't), so the global sequence counter
@@ -1025,6 +1144,11 @@ export async function executeCompiledPlan(
         }
         case TAG_COPY: {
           const encoder = getSharedEncoderInstance();
+          if (process.env.TORCHLETTE_DEBUG_SHAPE) {
+            console.log(
+              `[replay-copy] cmd=${ci} src=${dbgBufId(slots[cmd.src])} dst=${dbgBufId(slots[cmd.dst])} bytes=${cmd.bytes} encoder=${encoder ? "yes" : "NULL-SKIPPED"}`,
+            );
+          }
           if (encoder) {
             encoder.copyBufferToBuffer(
               slots[cmd.src],
@@ -1093,6 +1217,18 @@ export async function executeCompiledPlan(
         `[compiled] planned binds=${plannedBindCount} fallbacks=${plannedFallbackCount}`,
       );
     }
+    // A planned-bind fallback is a cross-plan correctness hazard, not just a
+    // perf event: OTHER plans' recorded (persistent/planned) bindings to this
+    // buffer assume THIS plan rewrites it every step. When we fall back, our
+    // writes go to a dynamic buffer and every frozen reader sees the stale
+    // recorded one. Too late to unwind this execution — invalidate so the
+    // next step re-records against current buffer assignments, and say so.
+    if (plannedFallbackCount > 0 && compiled.allocBuffers) {
+      console.warn(
+        `[compiled-plan] ${plannedFallbackCount} planned-bind fallback(s) — recorded buffer assignment no longer safe; invalidating plan for re-record (cross-plan readers of the recorded buffers may have read stale data THIS step)`,
+      );
+      compiled.valid = false;
+    }
 
     // Restore global sequence counters to where the normal path would have
     // left them. Subsequent non-compiled plans see correct counter positions.
@@ -1105,6 +1241,7 @@ export async function executeCompiledPlan(
     }
 
     // Phase 3: Harvest results — assign to plan nodes for downstream plans
+    let dbgHarvestSkipped = 0;
     for (const r of compiled.results) {
       const node = planNodes[r.nodeIndex];
       const tensor = createTensor(
@@ -1115,10 +1252,29 @@ export async function executeCompiledPlan(
         r.dtype,
       );
       const sh = createStorageHandle(node.device, tensor);
+      if (
+        process.env.TORCHLETTE_DEBUG_HARVEST_ALL ||
+        (process.env.TORCHLETTE_DEBUG_SHAPE &&
+          r.shape.join(",") === process.env.TORCHLETTE_DEBUG_SHAPE) ||
+        (process.env.TORCHLETTE_DEBUG_OPMATCH &&
+          node.op.includes(process.env.TORCHLETTE_DEBUG_OPMATCH))
+      ) {
+        console.log(
+          `[harvest-${r.shape.join("x")}] node[${r.nodeIndex}] op=${node.op} id=${node.id} oi=${r.outputIndex} slot=${r.slot} buf=${dbgBufId(slots[r.slot])} sh=${(sh as { id?: number }).id} ${node.result ? "SKIP(existing buf=" + dbgBufId(gpuBuffer(node.result.backendTensor)) + ")" : "assign"}`,
+        );
+      }
       if (r.outputIndex === 0) {
         // Primary output
         if (!node.result) {
           node.result = sh;
+        } else if (process.env.TORCHLETTE_DEBUG_HARVEST) {
+          dbgHarvestSkipped++;
+          if (dbgHarvestSkipped <= 5) {
+            const existing = gpuBuffer(node.result.backendTensor);
+            console.log(
+              `[harvest-skip] node[${r.nodeIndex}] op=${node.op} shape=${JSON.stringify(node.shape)} existing buf ${existing === slots[r.slot] ? "SAME" : "DIFFERS"} from replay slot`,
+            );
+          }
         }
       }
       // Multi-output: populate node.results array
@@ -1129,9 +1285,51 @@ export async function executeCompiledPlan(
         node.results[r.outputIndex] = sh;
       }
     }
+    if (process.env.TORCHLETTE_DEBUG_HARVEST && dbgHarvestSkipped > 0) {
+      console.log(
+        `[harvest-skip] ${dbgHarvestSkipped}/${compiled.results.length} results NOT assigned (node.result already set); planNodes[0].id=${planNodes[0]?.id} planNodes[last].id=${planNodes[planNodes.length - 1]?.id}`,
+      );
+    }
   } finally {
     clearActiveArena();
     clearArenaExternalInputBuffers();
     endSharedEncoder();
+  }
+
+  // Debug: read back slot contents AFTER the replay's submission, to see
+  // which slots carry stale data across steps.
+  if (process.env.TORCHLETTE_DEBUG_READSLOTS) {
+    // CRITICAL: submit the step-level shared encoder first, else the staging
+    // copies below jump the queue and read PRE-replay data (this debug's
+    // first incarnation did exactly that — all its readings were invalid).
+    flushSharedEncoder();
+    const want = process.env.TORCHLETTE_DEBUG_READSLOTS.split(",").map(Number);
+    for (const si of want) {
+      const buf = slots[si];
+      if (!buf) {
+        console.log(`[readslot] slot ${si}: not populated`);
+        continue;
+      }
+      try {
+        const bytes = Math.min(64, (buf as unknown as { size: number }).size);
+        const staging = device.createBuffer({
+          size: 256,
+          usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        });
+        const enc = device.createCommandEncoder();
+        enc.copyBufferToBuffer(buf, 0, staging, 0, bytes);
+        device.queue.submit([enc.finish()]);
+        await staging.mapAsync(0x0001 /* MAP_READ */);
+        const f = new Float32Array(staging.getMappedRange().slice(0, bytes));
+        let sum = 0;
+        for (const v of f) sum += v;
+        console.log(
+          `[readslot] slot ${si} buf=${dbgBufId(buf)} sum16=${sum.toExponential(4)} [0..3]=${Array.from(f.slice(0, 4)).map((v) => v.toPrecision(4))}`,
+        );
+        staging.destroy();
+      } catch (e) {
+        console.log(`[readslot] slot ${si}: read failed (${e})`);
+      }
+    }
   }
 }

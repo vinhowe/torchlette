@@ -20,7 +20,7 @@ import {
   contiguousStrides,
   sizeOf,
 } from "./shape-utils";
-import { arenaBufferSet, sharedEncoderActive } from "./webgpu-state";
+import { arenaBufferSet, pinnedBufferSet, sharedEncoderActive } from "./webgpu-state";
 
 /**
  * Create a WebGPU tensor with optional stride info.
@@ -103,7 +103,9 @@ export function createTensor(
 
         // Arena buffers are owned by the arena, not the pool.
         // Don't release or destroy them — the arena will reuse them next step.
-        if (arenaBufferSet.has(buffer)) {
+        // Pinned buffers are owned by a compiled plan's recorded assignment —
+        // destroying or pooling one poisons every future replay submit.
+        if (arenaBufferSet.has(buffer) || pinnedBufferSet.has(buffer)) {
           return;
         }
 

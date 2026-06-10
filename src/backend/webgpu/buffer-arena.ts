@@ -25,6 +25,7 @@ import { alignBufferSize } from "./shape-utils";
 import { createTrackedBuffer } from "./tensor";
 import {
   arenaBufferSet,
+  pinnedBufferSet,
   getOutputSeqIndex,
   requireContext,
   setOutputSeqIndex,
@@ -273,6 +274,9 @@ export function destroyArena(arena: BufferArena, force = false): void {
     for (const buffer of arr) {
       if (buffer) {
         arenaBufferSet.delete(buffer);
+        // Pinned by a compiled plan's recorded assignment — the plan
+        // outlives this arena teardown; destroyCompiledPlanBuffers disposes.
+        if (pinnedBufferSet.has(buffer)) continue;
         if (force || bufferPool.canRecycle(buffer)) {
           gpuMemoryTracker.trackDeallocation(buffer);
           try {

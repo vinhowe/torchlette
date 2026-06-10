@@ -117,6 +117,19 @@ export function requireContext(): WebGPUContext {
 /** The set of all buffers owned by any active arena (for release interception). */
 export const arenaBufferSet = new Set<GPUBuffer>();
 
+/**
+ * Buffers PINNED by a compiled plan's recorded buffer assignment
+ * (planned-buffer mode, TORCHLETTE_COMPILED_PLANNED=1). A pinned buffer must
+ * survive across steps regardless of what the rest of the system thinks its
+ * lifetime is: replays bind it by identity, and a submit that touches ONE
+ * destroyed buffer is rejected by the device in its entirety — silently
+ * freezing every output of the plan at its recorded values. Consulted by
+ * every destroy/release path (tensor.destroy, pool deferredDestroy /
+ * destroyPendingBuffers / release, destroyArena). Unpinned only by
+ * destroyCompiledPlanBuffers.
+ */
+export const pinnedBufferSet = new Set<GPUBuffer>();
+
 // ============================================================================
 // GPU Submit Counter (moved from shared-encoder.ts)
 // ============================================================================

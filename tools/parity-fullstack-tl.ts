@@ -176,10 +176,14 @@ async function main() {
     // Debug: inspect a raw grad right after backward (pre-unscale).
     if (process.env.PRINT_RAW_GRAD) {
       await api._runtime().forceAllPending();
-      const gt = (named.get(process.env.PRINT_RAW_GRAD)! as unknown as {
-        grad: Tensor | null;
-      }).grad;
-      if (gt) {
+      for (const gname of process.env.PRINT_RAW_GRAD.split(",")) {
+        const p = named.get(gname);
+        if (!p) {
+          log(`unknown param ${gname}; available: ${[...named.keys()].slice(0, 8).join(" ")}...`);
+          continue;
+        }
+        const gt = (p as unknown as { grad: Tensor | null }).grad;
+        if (!gt) continue;
         const arr = Float32Array.from(await gt.cpu());
         let mx = 0;
         let nan = 0;
@@ -188,7 +192,7 @@ async function main() {
           else if (Math.abs(v) > mx) mx = Math.abs(v);
         }
         log(
-          `step ${step} RAW grad ${process.env.PRINT_RAW_GRAD}: max=${mx.toExponential(3)} nonfinite=${nan}/${arr.length} [0..3]=${Array.from(arr.slice(0, 4)).map((v) => v.toPrecision(4))}`,
+          `step ${step} RAW grad ${gname}: max=${mx.toExponential(3)} nonfinite=${nan}/${arr.length} [0..3]=${Array.from(arr.slice(0, 4)).map((v) => v.toPrecision(4))}`,
         );
       }
     }
