@@ -356,6 +356,13 @@ async function requestDeviceWithFallback(
   }
 }
 
+let _gpuUncapturedErrorCount = 0;
+
+/** Total uncaptured GPU device errors since init (each one = a dropped submit). */
+export function getGpuUncapturedErrorCount(): number {
+  return _gpuUncapturedErrorCount;
+}
+
 export async function initWebGPU(): Promise<boolean> {
   if (gpuContext) {
     return true;
@@ -388,6 +395,41 @@ export async function initWebGPU(): Promise<boolean> {
     pipelines: new Map(),
     f16Supported: actualF16Supported,
   });
+
+  // LOUD GPU ERRORS. A WebGPU validation error rejects the ENTIRE submit it
+  // occurs in — none of that work executes, buffers keep their old contents,
+  // and training silently continues on stale values. Dawn prints details to
+  // stderr but the process never learns anything happened; four separate
+  // silent-training-corruption bugs (destroyed-buffer binds, read/rw
+  // aliasing, multi-writable-binding aliasing) were each found only by loss
+  // archaeology. This handler makes the class observable: every uncaptured
+  // device error is counted and clearly attributed, and
+  // TORCHLETTE_STRICT_GPU=1 turns the first one into a crash.
+  (
+    device as unknown as {
+      onuncapturederror: ((ev: { error: { message: string } }) => void) | null;
+    }
+  ).onuncapturederror = (ev) => {
+    _gpuUncapturedErrorCount++;
+    if (_gpuUncapturedErrorCount <= 10) {
+      console.error(
+        `[torchlette] GPU UNCAPTURED ERROR #${_gpuUncapturedErrorCount} (the enclosing submit was DROPPED — downstream reads see stale data): ${ev.error?.message ?? ev.error}`,
+      );
+      if (_gpuUncapturedErrorCount === 10) {
+        console.error(
+          "[torchlette] further GPU errors will be counted but not logged (see getGpuUncapturedErrorCount())",
+        );
+      }
+    }
+    if (
+      typeof process !== "undefined" &&
+      process.env?.TORCHLETTE_STRICT_GPU === "1"
+    ) {
+      throw new Error(
+        `TORCHLETTE_STRICT_GPU: uncaptured GPU error: ${ev.error?.message ?? ev.error}`,
+      );
+    }
+  };
 
   if (
     typeof process !== "undefined" &&

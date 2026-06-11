@@ -248,12 +248,17 @@ export function dispatchFusedKernel(
   const inputGPUBuffers = inputs.map((inp) => inp.buffer);
   const outputBuffers: GPUBuffer[] = [];
   const outputTensors: FusedOutputTensor[] = [];
-  for (const output of recipe.outputs) {
+  for (let oi = 0; oi < recipe.outputs.length; oi++) {
+    const output = recipe.outputs[oi];
     let buffer: GPUBuffer;
-    if (donated !== undefined) {
-      // In-place: write into the donated input's buffer. No allocation, no
-      // recordAlloc — the compiled-plan recording resolves this binding to
-      // the input's existing slot (in-place discipline, like adamStep).
+    if (donated !== undefined && oi === 0) {
+      // In-place: write OUT0 (only!) into the donated input's buffer. No
+      // allocation, no recordAlloc — the compiled-plan recording resolves
+      // this binding to the input's existing slot (in-place discipline,
+      // like adamStep). Other outputs allocate normally; giving them the
+      // donated buffer too binds one buffer at multiple writable indices —
+      // a WebGPU validation error that rejects the ENTIRE submit (the
+      // multi-output foreach freeze).
       buffer = inputs[donatedPos].buffer;
     } else {
       const outputBytes = totalElements * dtypeBytes(output.dtype);
