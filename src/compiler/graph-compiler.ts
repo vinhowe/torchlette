@@ -14,6 +14,7 @@
  */
 
 import type { DType } from "../backend/types";
+import { enforceWriteAfterReadOrder } from "../executor/plan-builder";
 import type { LazyIRNode } from "../graph/types";
 import {
   type ExecutionSegment,
@@ -257,7 +258,13 @@ export function analyzeGraph(
   // Reorder plan to cluster fusible chains together
   let reorderedNodes = planNodes;
   if (planNodes.length > 2) {
-    reorderedNodes = reorderPlanForFusion(planNodes);
+    // Fusion reorder uses its own Kahn pass over NORMAL edges only — it can
+    // undo the WAR (write-after-read) ordering buildMergedPlan establishes
+    // for in-place ops. Re-enforce after reordering (order-preserving when
+    // no conflicts, so fusion priorities survive where legal).
+    reorderedNodes = enforceWriteAfterReadOrder(
+      reorderPlanForFusion(planNodes),
+    );
   }
 
   // Build consumer, position, and ID lookup maps in a single pass

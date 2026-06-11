@@ -79,7 +79,129 @@ export function buildMergedPlan(
     visit({ kind: "pending", node: root });
   }
 
-  return { nodes };
+  return { nodes: enforceWriteAfterReadOrder(nodes) };
+}
+
+/** In-place ops and the input positions whose refs they OVERWRITE. */
+const IN_PLACE_DST_INPUTS: Record<string, number[]> = {
+  stridedScatterCopy: [0],
+  stridedScatterAdd: [0],
+  // adamStep updates param/m/v (inputs 1..3) in place; grad (input 0) is read-only.
+  adamStep: [1, 2, 3],
+};
+
+/**
+ * WAR (write-after-read) ordering: an in-place node that OVERWRITES the
+ * buffer behind ref R must execute after every other plan node that READS R.
+ * DFS postorder guarantees def-before-use but says nothing about sibling
+ * readers vs an in-place writer of the same ref — the schedule was only
+ * correct by traversal luck (e.g. zeroGrad's zero_ scatters racing the
+ * optimizer's grad readers in the same plan; foreach's packed staging lost
+ * that race deterministically). Kahn's algorithm over the normal dependency
+ * edges PLUS anti-dependency edges (reader → in-place writer), tie-broken
+ * by original position so conflict-free plans keep their exact order
+ * (template/compiled-plan stability).
+ */
+export function enforceWriteAfterReadOrder(nodes: LazyIRNode[]): LazyIRNode[] {
+  // Fast path: no in-place writers, keep the array untouched.
+  let hasInPlace = false;
+  for (const n of nodes) {
+    if (IN_PLACE_DST_INPUTS[n.op]) {
+      hasInPlace = true;
+      break;
+    }
+  }
+  if (!hasInPlace) return nodes;
+
+  const indexOf = new Map<LazyIRNode, number>();
+  for (let i = 0; i < nodes.length; i++) indexOf.set(nodes[i], i);
+
+  // readers per ref key (producer node object + outputIndex)
+  const refKey = (ref: { node: LazyIRNode; outputIndex?: number }) => ref.node;
+  const readers = new Map<LazyIRNode, Map<number, number[]>>(); // prod → oi → reader idxs
+  for (let i = 0; i < nodes.length; i++) {
+    for (const ref of nodes[i].inputs) {
+      if (ref.kind !== "pending") continue;
+      const prod = refKey(ref);
+      let byOi = readers.get(prod);
+      if (!byOi) {
+        byOi = new Map();
+        readers.set(prod, byOi);
+      }
+      const oi = ref.outputIndex ?? 0;
+      let list = byOi.get(oi);
+      if (!list) {
+        byOi.set(oi, (list = []));
+      }
+      list.push(i);
+    }
+  }
+
+  // adjacency: normal edges (producer → consumer) + WAR edges (reader → writer)
+  const succ: number[][] = nodes.map(() => []);
+  const indeg = new Array<number>(nodes.length).fill(0);
+  const addEdge = (from: number, to: number) => {
+    succ[from].push(to);
+    indeg[to]++;
+  };
+  for (let i = 0; i < nodes.length; i++) {
+    for (const ref of nodes[i].inputs) {
+      if (ref.kind !== "pending") continue;
+      const pi = indexOf.get(ref.node);
+      if (pi !== undefined) addEdge(pi, i);
+    }
+  }
+  let warEdges = 0;
+  for (let i = 0; i < nodes.length; i++) {
+    const dstInputs = IN_PLACE_DST_INPUTS[nodes[i].op];
+    if (!dstInputs) continue;
+    for (const di of dstInputs) {
+      const ref = nodes[i].inputs[di];
+      if (!ref || ref.kind !== "pending") continue;
+      const list = readers.get(ref.node)?.get(ref.outputIndex ?? 0);
+      if (!list) continue;
+      for (const ri of list) {
+        if (ri !== i) {
+          addEdge(ri, i);
+          warEdges++;
+        }
+      }
+    }
+  }
+  if (warEdges === 0) return nodes;
+
+  // Kahn with min-original-index tie-break (deterministic, order-preserving
+  // when constraints allow).
+  const heap: number[] = []; // simple sorted insertion; plans are small
+  const pushReady = (i: number) => {
+    let lo = 0;
+    let hi = heap.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (heap[mid] < i) lo = mid + 1;
+      else hi = mid;
+    }
+    heap.splice(lo, 0, i);
+  };
+  for (let i = 0; i < nodes.length; i++) if (indeg[i] === 0) pushReady(i);
+  const order: LazyIRNode[] = [];
+  while (heap.length > 0) {
+    const i = heap.shift()!;
+    order.push(nodes[i]);
+    for (const j of succ[i]) {
+      if (--indeg[j] === 0) pushReady(j);
+    }
+  }
+  if (order.length !== nodes.length) {
+    // A WAR edge formed a cycle (a reader of the old value that also depends
+    // on the new value) — unsatisfiable; fall back to the original order and
+    // say so rather than silently dropping nodes.
+    console.warn(
+      `[plan-builder] WAR ordering cycle (${nodes.length - order.length} nodes); keeping DFS order — in-place ops may race their readers`,
+    );
+    return nodes;
+  }
+  return order;
 }
 
 /**
