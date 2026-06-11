@@ -1020,10 +1020,20 @@ export async function executeLoweredPlan(
                   ? { inlinable: true as const, value: ref.value }
                   : isInlinableScalar(ref);
               if (cur.inlinable && cur.value !== inp.inlinedValue) {
+                if (process.env.TORCHLETTE_DEBUG_SCALARS) {
+                  console.log(
+                    `[scalar-adapt] input ${i}: baked=${inp.inlinedValue} current=${cur.value}`,
+                  );
+                }
                 (stale ??= new Set(action.runtimeScalarInputs)).add(i);
               }
             }
             if (stale) {
+              if (process.env.TORCHLETTE_DEBUG_SCALARS) {
+                console.log(
+                  `[scalar-adapt] demoting ${stale.size} inlined scalar(s) on a ${groupNodes.length}-node group`,
+                );
+              }
               action.runtimeScalarInputs = stale;
               action.recipe = groupToRecipe(group, stale);
               if (loweredPlan.compiledPlan) {

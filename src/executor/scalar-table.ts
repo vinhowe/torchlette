@@ -30,6 +30,7 @@
 
 import type { Backend } from "../backend/types";
 import type { GPUBuffer, GPUDevice } from "../backend/webgpu/gpu-types";
+import { bufferPool } from "../backend/webgpu/buffer-pool";
 import { GPUBufferUsage } from "../backend/webgpu/gpu-types";
 import { flushSharedEncoder } from "../backend/webgpu/shared-encoder";
 import { sharedEncoderActive } from "../backend/webgpu/webgpu-state";
@@ -155,7 +156,14 @@ export function refreshScalarTable(
   let flushed = false;
   for (let i = 0; i < slots.length; i++) {
     const ref = planNodes[slots[i].nodeIndex]?.inputs[slots[i].inputIndex];
-    if (!ref || ref.kind !== "scalar") continue; // structural mismatch — skip
+    if (!ref || ref.kind !== "scalar") {
+      if (process.env.TORCHLETTE_DEBUG_SCALARS) {
+        console.log(
+          `[scalar-table] STRUCTURAL MISMATCH slot ${i}: planNodes[${slots[i].nodeIndex}].inputs[${slots[i].inputIndex}] is ${ref ? ref.kind : "missing"} (table value stays stale!)`,
+        );
+      }
+      continue; // structural mismatch — skip
+    }
     const v = ref.value;
     if (!Object.is(table.values[i], v)) {
       // Same-template re-execution within one submission scope (e.g. shared
@@ -183,11 +191,14 @@ export function destroyScalarTable(loweredPlan: {
   if (!table || table.destroyed) return;
   table.destroyed = true;
   for (const buf of table.buffers) {
-    try {
-      buf.destroy();
-    } catch {
-      /* already destroyed */
-    }
+    // DEFERRED destruction (fence-gated), never immediate: table buffers can
+    // be bound by encoded-but-unsubmitted passes when a template is evicted
+    // mid-step (liveness-mode pool pressure evicts arenas + tables while the
+    // step's encoder is open). An immediate destroy() poisons the pending
+    // submit — Dawn rejects it wholesale and every downstream read sees
+    // stale data (the forced-liveness late-LR failure: params silently
+    // frozen from the eviction step onward).
+    bufferPool.deferredDestroy(buf, 4);
   }
   loweredPlan.scalarTable = undefined;
 }

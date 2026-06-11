@@ -161,6 +161,11 @@ export async function executeFusedSegment(
     if (inputRef.kind === "scalar") {
       const scalarStorage = getInputStorage(inputRef, backend);
       const st = asGPUTensor(scalarStorage.backendTensor);
+      if (process.env.TORCHLETTE_DEBUG_SCALARS) {
+        console.log(
+          `[fused-scalar] in${inputIdx} value=${inputRef.value} buf=${(st.buffer as { label?: string }).label ?? "?"}#${(st.buffer as { size?: number }).size}`,
+        );
+      }
       inputs.push({
         buffer: st.buffer,
         shape: [],

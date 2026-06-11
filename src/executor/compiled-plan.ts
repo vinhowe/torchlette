@@ -580,12 +580,13 @@ export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
     adoptedRefCount.delete(buf);
     pinnedBufferSet.delete(buf);
     if (bufferPool.canRecycle(buf)) {
-      gpuMemoryTracker.trackDeallocation(buf);
-      try {
-        buf.destroy();
-      } catch {
-        /* already destroyed */
-      }
+      // DEFERRED destruction, never immediate: plan teardown fires MID-STEP
+      // (staleness gates, template eviction) while the step-level encoder
+      // still holds encoded passes binding these buffers — an immediate
+      // destroy() poisons the pending submit (Dawn drops it wholesale;
+      // downstream silently reads stale data — the forced-liveness late-LR
+      // freeze). deferredDestroy destroys after the next fence.
+      bufferPool.deferredDestroy(buf, (buf as { size?: number }).size ?? 0);
     }
   }
   compiled.adoptedBuffers = undefined;
