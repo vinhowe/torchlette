@@ -2,6 +2,7 @@
  * Fused kernel wrappers and I/O ops: adamStep, unscaleGrad, fusedCrossEntropy,
  * fusedLayerNorm, fusedAttention, read, waitForGPU, mulScalarInPlace.
  */
+import { ENV } from "../../../core/env";
 import type { BackendTensor } from "../../types";
 import { allocateOutputBuffer } from "../buffer-arena";
 import { bufferPool, destroyCopy } from "../buffer-pool";
@@ -247,7 +248,9 @@ export function adamStepBatch(items: AdamBatchItem[]): AdamBatchResult[] {
 
     // Try packed dispatch for groups of size ≥ 2 with the same element count.
     // dispatchPackedOptimizer requires items.length > 1 to even attempt.
-    if (items.length > 1) {
+    // TORCHLETTE_PACKED_ADAM=0: measurement kill switch (per-item dispatches,
+    // still one flush per batch) — quantifies what packing is worth.
+    if (items.length > 1 && ENV.TORCHLETTE_PACKED_ADAM !== "0") {
       // Pre-resolve contiguous tensors per item, evict f16 caches, build the
       // packed item descriptors. We hold onto the contiguous tensors so the
       // fallback path can claim ownership uniformly with adamStepInner.
