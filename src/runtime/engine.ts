@@ -1527,7 +1527,56 @@ export class RuntimeEngine {
   }
 
   copy_(dst: Tensor, src: Tensor): Tensor {
+    // GUARD: an in-place write through a VIEW (narrow/transpose/...) would
+    // update only the view wrapper's lazyRef — the BASE tensor's readers
+    // get no dependency edge and silently read stale data (this corrupted
+    // foreach's packed staging refill). Refuse loudly; region writes go
+    // through copyInto_, which orders against the base by construction.
+    if (dst.lazyRef.kind === "pending") {
+      const op = dst.lazyRef.node.op;
+      if (op === "narrow" || op === "transpose" || op === "expand") {
+        throw new Error(
+          `copy_ destination is a pending ${op} VIEW — base readers would ` +
+            `not see the write. Use copyInto_(base, offset, src) for ` +
+            `region writes, or copy_ the base tensor.`,
+        );
+      }
+    }
     return this._scatterInPlace("stridedScatterCopy", "copy_", dst, src);
+  }
+
+  /**
+   * Region write: copy src into base[offset .. offset+size(src)) (flat,
+   * contiguous). Unlike copy_(narrow(base, ...), src) — which only updates
+   * the view wrapper's ref and leaves base readers unordered against the
+   * write — this updates the BASE tensor's lazyRef, so every subsequent
+   * read of base depends on the scatter. The lazy-graph analogue of
+   * PyTorch's version-counter bump when a view is mutated.
+   */
+  copyInto_(base: Tensor, offset: number, src: Tensor): Tensor {
+    this.assertSameDevice(base, src);
+    const srcSize = src.shape.reduce((a, b) => a * b, 1);
+    const baseSize = base.shape.reduce((a, b) => a * b, 1);
+    if (offset < 0 || offset + srcSize > baseSize) {
+      throw new Error(
+        `copyInto_: region [${offset}, ${offset + srcSize}) out of bounds for base size ${baseSize}`,
+      );
+    }
+    const payload: StridedScatterOptions = {
+      offset,
+      viewShape: [srcSize],
+      viewStrides: [1],
+    };
+    const node = createLazyIRNode(
+      "stridedScatterCopy",
+      [base.lazyRef, src.lazyRef],
+      base.shape,
+      base.dtype,
+      base.device,
+      payload,
+    );
+    base._updateLazyRef(createPendingRef(node));
+    return base;
   }
   add_(dst: Tensor, src: Tensor): Tensor {
     return this._scatterInPlace("stridedScatterAdd", "add_", dst, src);
