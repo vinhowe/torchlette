@@ -279,12 +279,15 @@ export function destroyArena(arena: BufferArena, force = false): void {
         // outlives this arena teardown; destroyCompiledPlanBuffers disposes.
         if (pinnedBufferSet.has(buffer)) continue;
         if (force || bufferPool.canRecycle(buffer)) {
-          gpuMemoryTracker.trackDeallocation(buffer);
-          try {
-            buffer.destroy();
-          } catch {
-            /* already destroyed */
-          }
+          // DEFERRED destruction (fence-gated): arena teardown fires at
+          // template eviction, which memory pressure can trigger MID-STEP —
+          // encoded-but-unsubmitted passes may still bind these buffers, and
+          // an immediate destroy() poisons the pending submit (the same
+          // class as the scalar-table/compiled-plan teardown bug).
+          bufferPool.deferredDestroy(
+            buffer,
+            (buffer as { size?: number }).size ?? 0,
+          );
         }
       }
     }
