@@ -132,18 +132,24 @@ function stridedScatterImpl(
   // follow the framework's existing in-place discipline (readers of the old
   // value are scheduled earlier in the plan; in-queue pass ordering
   // serializes them — same contract as the fused adamStep).
+  // Applies to FULL overwrites and to contiguous REGION writes (copyInto_):
+  // a contiguous src into a contiguous slice [offset, offset+viewSize) of a
+  // contiguous base is a pure DMA at a byte offset. Without this, every
+  // region write took the copy-on-write path below — a full-base migration
+  // per call (148 region refills/step at 124M = tens of GB of churn, OOM).
   if (
     op === "copy" &&
-    viewSize === baseSize &&
-    offset === 0 &&
+    offset >= 0 &&
+    offset + viewSize <= baseSize &&
     checkContiguousStrides(viewShape, viewStrides) &&
     baseTensor.isContiguous &&
     (baseTensor.offset ?? 0) === 0 &&
     (srcTensor.isContiguous ||
       checkContiguousStrides(srcTensor.shape, srcTensor.strides)) &&
     srcTensor.buffer !== baseTensor.buffer &&
-    baseSizeBytes <= srcTensor.buffer.size - (srcTensor.offset ?? 0) * 4
+    viewSize * 4 <= srcTensor.buffer.size - (srcTensor.offset ?? 0) * 4
   ) {
+    const regionBytes = viewSize * 4;
     trackSharedEncoderWrite(baseTensor.buffer);
     const enc = getSharedEncoderInstance();
     if (enc) {
@@ -152,8 +158,8 @@ function stridedScatterImpl(
         srcTensor.buffer,
         (srcTensor.offset ?? 0) * 4,
         baseTensor.buffer,
-        0,
-        baseSizeBytes,
+        offset * 4,
+        regionBytes,
       );
     } else {
       const cmdEnc = ctx.device.createCommandEncoder();
@@ -161,8 +167,8 @@ function stridedScatterImpl(
         srcTensor.buffer,
         (srcTensor.offset ?? 0) * 4,
         baseTensor.buffer,
-        0,
-        baseSizeBytes,
+        offset * 4,
+        regionBytes,
       );
       submitOrCollect(cmdEnc.finish());
     }

@@ -277,7 +277,7 @@ async function main() {
   }
 
   const api = new Torchlette("webgpu", {
-    enableFusion: true,
+    enableFusion: process.env.TORCHLETTE_PROF_FUSION !== "0",
     enableMemoryPlanning: true,
     enableCheckpointSegmentation: true,
   });
@@ -295,7 +295,8 @@ async function main() {
   console.log("Model loaded.\n");
 
   const optimizer = new Adam(model.parameters(), { lr: 1e-4 }, api);
-  const useAMP = isF16Supported();
+  const useAMP =
+    isF16Supported() && process.env.TORCHLETTE_PROF_AMP !== "0";
   const scaler = useAMP ? new GradScaler(api, { initScale: 1024.0 }) : null;
   console.log(
     `AMP (f16): ${useAMP ? "enabled" : "disabled (shader-f16 not available)"}`,
