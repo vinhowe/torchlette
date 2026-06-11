@@ -310,8 +310,18 @@ export function destroyArena(arena: BufferArena, force = false): void {
 let _arenaLiveness: boolean | null = null;
 export function arenaLivenessEnabled(): boolean {
   if (_arenaLiveness === null) {
+    // DEFAULT ON (2026-06-11). The bounded arena + planned compiled buffers
+    // is strictly better than the unbudgeted per-position arena on every
+    // workload measured: same compiled speed at roughly half the memory
+    // (distil@512 5.0GB vs 9.1GB; Medium@512 13.8GB vs 28.6GB — the default
+    // arena barely fit a 32GB V100), and the production 124M DiLoCo runs
+    // live here. Validated: the forced-liveness full suite is green, all
+    // parity/regression gates pass in this mode, and the 4-peer soak
+    // converges better than the unbudgeted baseline.
+    // TORCHLETTE_ARENA_LIVENESS=0 opts back into the unbudgeted arena;
+    // the globalThis escape hatch still forces it on for browser tests.
     _arenaLiveness =
-      ENV.TORCHLETTE_ARENA_LIVENESS === "1" ||
+      ENV.TORCHLETTE_ARENA_LIVENESS !== "0" ||
       !!(globalThis as { __torchletteArenaLiveness?: boolean })
         .__torchletteArenaLiveness;
   }
