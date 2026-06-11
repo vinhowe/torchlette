@@ -1489,14 +1489,125 @@ export function computePlanFingerprint(
       hashByte(0xee);
     }
 
-    // Payload: for ops with structural payload (cast dtype, etc.)
+    // Payload: hash ALL content by default. The previous whitelist (dtype/
+    // dim/k) left every other payload field INVISIBLE to template caching —
+    // the general form of the frozen-scalar disease: an op whose payload
+    // carries a numeric value that varies across steps template-hits the
+    // first step's cached lowering/recipes/compiled plan and silently
+    // replays the stale value (sub's alpha was one live instance; full()'s
+    // fillValue and copyInto_'s offset were latent ones). Default-hash +
+    // explicit volatility (Dynamo guard philosophy: specialize and guard on
+    // everything; opt INTO dynamism) turns unknown varying payloads into
+    // template cache misses — a perf signal — instead of silent wrongness.
+    // Ops whose varying payload IS handled as per-execution data are
+    // exempted via PAYLOAD_HASH_EXEMPT below.
     if (node.payload) {
-      const p = node.payload as Record<string, unknown>;
-      if (p.dtype) hashStr(String(p.dtype));
-      if (typeof p.dim === "number") hashInt(p.dim);
-      if (typeof p.k === "number") hashInt(p.k);
+      const exempt = PAYLOAD_HASH_EXEMPT[node.op];
+      if (exempt !== "ALL") {
+        hashPayloadValue(node.payload, exempt, hashByte, hashInt, hashStr);
+      }
     }
   }
 
   return { primary: h1 >>> 0, secondary: h2 >>> 0 };
+}
+
+/**
+ * Ops whose payloads (or specific fields) are EXCLUDED from the template
+ * fingerprint because their per-step variation is already delivered to
+ * executions as data, not baked into cached artifacts:
+ * - adamStep / unscaleGrad: configs repacked per execution via TAG_UNIFORM;
+ *   getConfigBuffer's byte-compare guard invalidates if a varying config
+ *   ever lacks a repack.
+ * - tensorFromArray `values`: re-executed per replay (TAG_WRITE).
+ * - rand/randn/bernoulli `seed`: creation ops re-execute with the CURRENT
+ *   node's payload each step (verified: fresh, replay-identical RNG).
+ */
+const PAYLOAD_HASH_EXEMPT: Record<string, "ALL" | Set<string>> = {
+  adamStep: "ALL",
+  unscaleGrad: "ALL",
+  tensorFromArray: new Set(["values"]),
+  rand: new Set(["seed"]),
+  randn: new Set(["seed"]),
+  bernoulli: new Set(["seed"]),
+};
+
+const _f64Scratch = new Float64Array(1);
+const _f64Bytes = new Uint8Array(_f64Scratch.buffer);
+
+/** Canonically hash a payload value: sorted keys, primitives + number
+ *  arrays; non-primitives (GPUBuffers, typed arrays, functions) hash as a
+ *  type marker only — they are runtime handles, not template structure. */
+function hashPayloadValue(
+  v: unknown,
+  exemptFields: Set<string> | undefined,
+  hashByte: (b: number) => void,
+  hashInt: (n: number) => void,
+  hashStr: (s: string) => void,
+): void {
+  if (v === null || v === undefined) {
+    hashByte(0xb0);
+    return;
+  }
+  const t = typeof v;
+  if (t === "number") {
+    const n = v as number;
+    if (Number.isInteger(n) && Math.abs(n) < 0x40000000) {
+      hashByte(0xb1);
+      hashInt(n);
+    } else {
+      hashByte(0xb2);
+      _f64Scratch[0] = n;
+      for (let i = 0; i < 8; i++) hashByte(_f64Bytes[i]);
+    }
+    return;
+  }
+  if (t === "string") {
+    hashByte(0xb3);
+    hashStr(v as string);
+    return;
+  }
+  if (t === "boolean") {
+    hashByte(v ? 0xb5 : 0xb4);
+    return;
+  }
+  if (Array.isArray(v)) {
+    hashByte(0xb6);
+    hashInt(v.length);
+    for (const e of v) hashPayloadValue(e, undefined, hashByte, hashInt, hashStr);
+    return;
+  }
+  if (t === "object") {
+    if (ArrayBuffer.isView(v)) {
+      // Typed arrays are DATA (tensorFromArray values and friends) — shape
+      // of the template doesn't depend on their contents.
+      hashByte(0xb7);
+      hashInt((v as { length?: number }).length ?? 0);
+      return;
+    }
+    const obj = v as Record<string, unknown>;
+    const keys = Object.keys(obj).sort();
+    hashByte(0xb8);
+    for (const k of keys) {
+      if (exemptFields?.has(k)) continue;
+      const val = obj[k];
+      if (typeof val === "function") continue;
+      // Runtime handles (GPU buffers etc.): marker only.
+      if (
+        typeof val === "object" &&
+        val !== null &&
+        !Array.isArray(val) &&
+        !ArrayBuffer.isView(val) &&
+        Object.getPrototypeOf(val) !== Object.prototype
+      ) {
+        hashStr(k);
+        hashByte(0xb9);
+        continue;
+      }
+      hashStr(k);
+      hashPayloadValue(val, undefined, hashByte, hashInt, hashStr);
+    }
+    hashByte(0xba);
+    return;
+  }
 }
