@@ -259,20 +259,6 @@ const VIEW_OPS: ReadonlySet<string> = new Set([
 export const ENCODER_COPY_OPS: ReadonlySet<string> = new Set(["scatterAdd"]);
 
 /**
- * Ops that may hoist above a batched adamStep run (see the adam-batch
- * grouping). Light per-param producers that the optimizer-region DFS order
- * interleaves with adamStep nodes: grad-clip's copy-back (stridedScatterCopy),
- * the GradScaler's unscaleGrad, plain copies/casts. Kept narrow on purpose —
- * a non-whitelisted op simply ends the batch run (correct, smaller batch).
- */
-const ADAM_HOISTABLE_OPS: ReadonlySet<string> = new Set([
-  "stridedScatterCopy",
-  "unscaleGrad",
-  "copy",
-  "cast",
-]);
-
-/**
  * Merge non-adjacent same-config sequential reduction actions into batched
  * dispatches. Safe when no intervening action consumes the output of an
  * earlier reduction in the group (i.e., the reductions are independent).
@@ -702,8 +688,7 @@ function emitSequentialActions(
       }
     }
 
-    // Adam batch: collect the run of adamStep nodes, hoisting interleaved
-    // per-param PRODUCER nodes above the batch.
+    // Adam batch: collect the CONSECUTIVE run of adamStep nodes.
     //
     // Always emit an adam-batch action for adamStep, even when there's only
     // one node. adam-batch routes through backend.ops.adamStepBatch, which
@@ -714,45 +699,22 @@ function emitSequentialActions(
     // node.results[0] = null until a later wrap-and-backfill that wasn't
     // always reached.
     //
-    // Hoisting: the DFS plan order interleaves each param's grad-producing
-    // node with its adamStep (clip's copy-back `stridedScatterCopy_i` or the
-    // GradScaler's `unscaleGrad_i` sits right before `adamStep_i`), so a
-    // consecutive-only scan yields size-1 batches — adamStepBatch then
-    // flushes per param (~100 submits/step) and packed dispatch never
-    // engages. A node may hoist above the batched adams iff it is a
-    // whitelisted light op AND none of its pending inputs reference an
-    // adamStep already in the run (i.e. it is a producer, not a consumer —
-    // hoisting preserves dataflow order because plan order is topological,
-    // so all of the producer's own inputs precede it). The first
-    // non-hoistable node ends the run.
+    // Adjacency comes from the GENERIC same-op affinity tie-break in the
+    // plan builder's scheduling pass (enforceWriteAfterReadOrder): the DFS
+    // order interleaves each param's producer (unscaleGrad, clip's
+    // copy-back) with its adamStep, and the scheduler regroups independent
+    // same-op sequential dispatches adjacently for ANY op — no op-name
+    // whitelist in the executor (the old ADAM_HOISTABLE_OPS hoisting).
     if (node.op === "adamStep") {
       const adamIndices: number[] = [];
-      const hoisted: number[] = [];
-      const runAdamIds = new Set<number>();
       let consumed = 0;
       for (let j = nodeIdx; j < nodes.length; j++) {
         const nj = nodes[j];
-        if (nj.op === "adamStep") {
-          if (!nj.result) {
-            adamIndices.push(posMap.get(nj.id) as number);
-            runAdamIds.add(nj.id);
-          }
-          consumed++;
-          continue;
+        if (nj.op !== "adamStep") break;
+        if (!nj.result) {
+          adamIndices.push(posMap.get(nj.id) as number);
         }
-        if (!ADAM_HOISTABLE_OPS.has(nj.op) || nj.result) break;
-        const readsRunAdam = nj.inputs.some(
-          (r) => r.kind === "pending" && runAdamIds.has(r.node.id),
-        );
-        if (readsRunAdam) break;
-        hoisted.push(posMap.get(nj.id) as number);
         consumed++;
-      }
-      // Trailing hoisted nodes (after the last adam) execute earlier than
-      // their original position — dataflow-safe (their inputs precede them;
-      // their consumers come after the run).
-      for (const p of hoisted) {
-        actions.push({ kind: "sequential", nodeIndex: p });
       }
       actions.push({ kind: "adam-batch", nodeIndices: adamIndices });
       maybeReclaim(consumed);

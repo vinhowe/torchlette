@@ -1,6 +1,7 @@
 import type { Backend } from "../backend/types";
 import { sizeOf } from "../core/shape";
 import type { ExecutionPlan, LazyIRNode, LazyRef } from "../graph/types";
+import { isFusibleOp } from "../compiler/fusion-detect";
 import { analyzeLifetimes, type TensorLifetime } from "../graph/lifetime-analysis";
 
 /**
@@ -152,6 +153,17 @@ export function enforceWriteAfterReadOrder(nodes: LazyIRNode[]): LazyIRNode[] {
     }
   }
   let warEdges = 0;
+  // CHECKPOINT BOUNDARIES are order BARRIERS: segmented execution splits the
+  // plan at these nodes (segmentPlanAtCheckpoints) and runs pool flushes
+  // between segments — nodes must not migrate across a boundary (the
+  // affinity tie-break otherwise regroups same-op nodes across segments,
+  // breaking segment-local execution assumptions: "Input not ready" in
+  // checkpoint mode). Constrain every node to its original side.
+  for (let b = 0; b < nodes.length; b++) {
+    if (!nodes[b].isCheckpointBoundary) continue;
+    for (let i = 0; i < b; i++) addEdge(i, b);
+    for (let j = b + 1; j < nodes.length; j++) addEdge(b, j);
+  }
   for (let i = 0; i < nodes.length; i++) {
     const dstInputs = IN_PLACE_DST_INPUTS[nodes[i].op];
     if (!dstInputs) continue;
@@ -168,7 +180,11 @@ export function enforceWriteAfterReadOrder(nodes: LazyIRNode[]): LazyIRNode[] {
       }
     }
   }
-  if (warEdges === 0) return nodes;
+  // NOTE: no early-return on warEdges === 0 — the Kahn pass also applies the
+  // same-op AFFINITY tie-break (below), which regroups independent
+  // same-kernel sequential dispatches (adamStep runs) even when no WAR
+  // conflict exists. Order is preserved exactly wherever neither edges nor
+  // affinity apply (min-original-index tie-break).
 
   // Kahn with min-original-index tie-break (deterministic, order-preserving
   // when constraints allow).
@@ -185,9 +201,31 @@ export function enforceWriteAfterReadOrder(nodes: LazyIRNode[]): LazyIRNode[] {
   };
   for (let i = 0; i < nodes.length; i++) if (indeg[i] === 0) pushReady(i);
   const order: LazyIRNode[] = [];
+  let lastOp: string | null = null;
+  let lastOpAffine = false;
   while (heap.length > 0) {
-    const i = heap.shift()!;
+    // AFFINITY tie-break (generic same-op batching): when the last emitted
+    // node is a NON-FUSIBLE op (sequential dispatch — adamStep, scatters,
+    // unscaleGrad, ...) and another ready node has the same op, continue the
+    // run. This keeps independent same-kernel dispatches adjacent so the
+    // action builder's consecutive-run scans batch them — subsuming the old
+    // op-name hoisting whitelist (ADAM_HOISTABLE_OPS) with a mechanism that
+    // works for any op. Fusible ops keep strict original order: their
+    // adjacency IS the fusion-reorder's chain layout, which must not be
+    // perturbed. Deterministic: first (min-index) same-op ready node wins.
+    let pick = 0;
+    if (lastOpAffine && heap.length > 1) {
+      for (let h = 0; h < heap.length; h++) {
+        if (nodes[heap[h]].op === lastOp) {
+          pick = h;
+          break;
+        }
+      }
+    }
+    const i = heap.splice(pick, 1)[0];
     order.push(nodes[i]);
+    lastOp = nodes[i].op;
+    lastOpAffine = !isFusibleOp(lastOp);
     for (const j of succ[i]) {
       if (--indeg[j] === 0) pushReady(j);
     }
