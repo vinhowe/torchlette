@@ -25,6 +25,7 @@ export class SGD {
   private params: Tensor[];
   private readonly api: Torchlette;
   private readonly momentum: number;
+  private readonly device: import("../backend/types").DeviceKind;
   private _groups: ResolvedSGDGroup[];
   private _groupIndex: number[];
   private velocity: Array<RuntimeTensor | null>;
@@ -44,7 +45,12 @@ export class SGD {
       ? (params as SGDParamGroup[]).flatMap((g) => g.params)
       : (params as Tensor[]);
 
-    const { api: engine } = validateOptimizerParams("SGD", flatParams, api);
+    const { api: engine, device } = validateOptimizerParams(
+      "SGD",
+      flatParams,
+      api,
+    );
+    this.device = device;
     if (options.lr <= 0) {
       throw new Error("SGD learning rate must be > 0");
     }
@@ -121,15 +127,29 @@ export class SGD {
       }
       let update = gradAdj;
       if (this.momentum !== 0) {
-        const prev = this.velocity[i];
-        if (prev) {
-          const mom = runtime.mul(prev, this.momentum);
-          update = runtime.add(mom, gradAdj);
-        } else {
-          update = gradAdj;
+        let v = this.velocity[i];
+        if (!v) {
+          // Lazy persistent state: created MID-STEP and held across steps —
+          // persist() adopts it into the step snapshot (without it, markStep
+          // demotes the tensor as a temporary and its buffer is pooled while
+          // live: the silent-UAF class that corrupted per-param Adam, and
+          // corrupted multi-param SGD here via the old replace-and-hold
+          // `this.velocity[i] = update`).
+          v = runtime.persist(runtime.zeros(param.shape, this.device));
+          this.velocity[i] = v;
         }
-        this.velocity[i] = update;
+        // v = momentum*v + gradAdj, IN PLACE. `update` reads the POST-copy_
+        // ref so the param update below depends on the state write (a
+        // dangling-root copy_ defers to a later plan and reads freed grads).
+        runtime.copy_(
+          v,
+          runtime.add(runtime.mul(v, this.momentum), gradAdj),
+        );
+        update = v;
       }
+      // lr rides sub's alpha, which the runtime LOWERS to mul(update, lr) —
+      // a graph scalar on the principled path (inlined while constant,
+      // demoted to scalar-table data when an LR schedule changes it).
       const next = runtime.sub(param._unwrap(), update, {
         alpha: group.lr,
       });

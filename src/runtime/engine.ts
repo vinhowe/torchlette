@@ -1166,7 +1166,22 @@ export class RuntimeEngine {
   }
 
   sub(a: TensorOrScalar, b: TensorOrScalar, options?: SubOptions): Tensor {
-    return this._binaryOp("sub", a, b, options);
+    // alpha LOWERS to graph ops at this seam: a - alpha*b becomes
+    // sub(a, mul(b, alpha)). ONE definition for every backend (the payload
+    // form was silently DROPPED by the WebGPU backend while CPU honored it —
+    // SGD trained with lr=1.0 on GPU; the pow(x<0) class again), and alpha
+    // becomes a graph SCALAR on the principled path: inlined while constant,
+    // guarded, demoted to scalar-table data when it changes (LR schedules
+    // safe under fusion + compiled replay automatically). The mul fuses into
+    // the elementwise chain — zero extra dispatches.
+    const alpha = (options as { alpha?: number } | undefined)?.alpha;
+    if (alpha !== undefined && alpha !== 1) {
+      if (typeof b === "number") {
+        return this._binaryOp("sub", a, b * alpha, undefined);
+      }
+      return this._binaryOp("sub", a, this.mul(b, alpha), undefined);
+    }
+    return this._binaryOp("sub", a, b, undefined);
   }
   div(a: TensorOrScalar, b: TensorOrScalar, options?: DivOptions): Tensor {
     return this._binaryOp("div", a, b, options);

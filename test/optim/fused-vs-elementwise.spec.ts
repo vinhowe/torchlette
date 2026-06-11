@@ -101,6 +101,34 @@ function jsGroundTruth(opts: { adamW: boolean; wd: number }): number[][] {
   return traj;
 }
 
+/** Pure-JS SGD+momentum ground truth (mirrors the probe's setup). */
+function sgdGroundTruth(opts: { wd: number; momentum: number }): number[][] {
+  const N = 64;
+  const initData = (seed: number): number[] => {
+    const out: number[] = [];
+    let x = seed;
+    for (let i = 0; i < N; i++) {
+      x = (x * 1103515245 + 12345) % 2147483648;
+      out.push(((x / 2147483648) * 2 - 1) * 0.5);
+    }
+    return out;
+  };
+  const p = initData(7);
+  const t = initData(99);
+  const v = new Array(N).fill(0);
+  const lr = 1e-2;
+  const traj: number[][] = [];
+  for (let s = 1; s <= STEPS; s++) {
+    for (let i = 0; i < N; i++) {
+      const g = 2 * (p[i] - t[i]) + opts.wd * p[i];
+      v[i] = opts.momentum * v[i] + g;
+      p[i] -= lr * v[i];
+    }
+    traj.push([...p]);
+  }
+  return traj;
+}
+
 describe("fused vs elementwise Adam differential", { timeout: 600_000 }, () => {
   let webgpu = false;
 
@@ -208,6 +236,61 @@ describe("fused vs elementwise Adam differential", { timeout: 600_000 }, () => {
       WD: "0",
       ELEMENTWISE: "1",
       FOREACH: "0",
+      COMPILED: "0",
+      FUSION: "0",
+    });
+    expect(maxAbsDiff(multi, single)).toBeLessThan(1e-6);
+  });
+
+  // ======================== SGD (pure-graph optimizer) ====================
+  // SGD is the reference "ergonomic optimizer spec": plain JS numbers, pure
+  // tensor ops, zero engine knowledge. These gates caught (2026-06-11):
+  // (a) sub's alpha payload silently DROPPED by the WebGPU backend while CPU
+  //     honored it — SGD trained with lr=1.0 on GPU (fixed: the runtime
+  //     LOWERS alpha to mul(b, alpha), one definition for all backends, and
+  //     the scalar rides the principled inline→guard→demote path);
+  // (b) velocity replace-and-hold — the persistence-contract UAF class
+  //     (fixed: persistent velocity via persist() + copy_-in-place).
+  it("SGD+momentum: GPU == ground truth (full default optimizations)", async () => {
+    if (!webgpu) return;
+    const gpu = await trajectory({ SGD: "1", WD: "0.1", MOMENTUM: "0.9" });
+    const truth = sgdGroundTruth({ wd: 0.1, momentum: 0.9 });
+    expect(maxAbsDiff(gpu, truth)).toBeLessThan(1e-5);
+  });
+
+  it("SGD: late LR change is honored under full default optimizations", async () => {
+    if (!webgpu) return;
+    const optimized = await trajectory({
+      SGD: "1",
+      WD: "0",
+      LR2: "0.001",
+      LR2_AT: "4",
+      STEPS: "8",
+    });
+    const sequential = await trajectory({
+      SGD: "1",
+      WD: "0",
+      LR2: "0.001",
+      LR2_AT: "4",
+      STEPS: "8",
+      COMPILED: "0",
+      FUSION: "0",
+    });
+    expect(maxAbsDiff(optimized, sequential)).toBeLessThan(1e-5);
+  });
+
+  it("SGD: multi-param matches single-param (velocity UAF regression)", async () => {
+    if (!webgpu) return;
+    const multi = await trajectory({
+      SGD: "1",
+      WD: "0",
+      NPARAMS: "2",
+      COMPILED: "0",
+      FUSION: "0",
+    });
+    const single = await trajectory({
+      SGD: "1",
+      WD: "0",
       COMPILED: "0",
       FUSION: "0",
     });

@@ -19,7 +19,7 @@
 
 import { initWebGPU } from "../src/backend/webgpu";
 import { Torchlette } from "../src/frontend/torchlette";
-import { Adam } from "../src/optim";
+import { Adam, SGD } from "../src/optim";
 
 const N = parseInt(process.env.N ?? "64", 10);
 const STEPS = parseInt(process.env.STEPS ?? "6", 10);
@@ -83,7 +83,20 @@ async function main() {
     );
     off += len;
   }
-  const opt = new Adam(params, { lr: LR, weightDecay: WD, adamW: ADAMW }, api);
+  // SGD=1: drive SGD instead of Adam (MOMENTUM env, default 0.9) — same
+  // trajectory contract, same LR2/LR2_AT schedule knobs.
+  const opt =
+    process.env.SGD === "1"
+      ? new SGD(
+          params,
+          {
+            lr: LR,
+            weightDecay: WD,
+            momentum: parseFloat(process.env.MOMENTUM ?? "0.9"),
+          },
+          api,
+        )
+      : new Adam(params, { lr: LR, weightDecay: WD, adamW: ADAMW }, api);
 
   const lr2 = process.env.LR2 ? parseFloat(process.env.LR2) : null;
   const lr2At = parseInt(process.env.LR2_AT ?? "4", 10);
