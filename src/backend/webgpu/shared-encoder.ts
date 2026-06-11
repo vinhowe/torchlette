@@ -13,6 +13,7 @@
  * step-level scope management (beginStep/endStep).
  */
 
+import { ENV } from "../../core/env";
 import { getSizeClass } from "../../graph/lifetime-analysis";
 import { resetDispatchSequence } from "./bind-group-cache";
 import { pinnedOutputBuffers, prePinOutputBuffers } from "./buffer-arena";
@@ -153,7 +154,7 @@ const PARAMS_FLUSH_THRESHOLD = 2000;
 // Debug flag: set TORCHLETTE_DEBUG_SHARED_ENCODER=1 to enable verbose logging
 const DEBUG_SHARED_ENCODER =
   typeof process !== "undefined" &&
-  !!process.env?.TORCHLETTE_DEBUG_SHARED_ENCODER;
+  !!ENV.TORCHLETTE_DEBUG_SHARED_ENCODER;
 
 // currentOpLabel + get/set moved to webgpu-state.ts, re-exported here for backward compat.
 export { getCurrentOpLabel, setCurrentOpLabel } from "./webgpu-state";

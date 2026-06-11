@@ -13,6 +13,7 @@
  * cached in the FusionAnalysisTemplate.
  */
 
+import { ENV } from "../core/env";
 import type { DType } from "../backend/types";
 import { enforceWriteAfterReadOrder } from "../executor/plan-builder";
 import type { LazyIRNode } from "../graph/types";
@@ -303,8 +304,7 @@ export function analyzeGraph(
 
   // Log pass stats when TORCHLETTE_LOG_REWRITES=1
   if (
-    typeof process !== "undefined" &&
-    process.env?.TORCHLETTE_LOG_REWRITES === "1" &&
+    ENV.TORCHLETTE_LOG_REWRITES === "1" &&
     rewriteBypassedIds.size > 0
   ) {
     const parts: string[] = [];
@@ -342,8 +342,7 @@ export function analyzeGraph(
 
   // Debug: show epilogue chains for large plans
   if (
-    typeof process !== "undefined" &&
-    process.env?.TORCHLETTE_DEBUG_FUSION === "1" &&
+    ENV.TORCHLETTE_DEBUG_FUSION === "1" &&
     reorderedNodes.length > 200 &&
     matmulEpilogueChains.size > 0
   ) {
@@ -464,8 +463,7 @@ export function analyzeGraph(
   // --- Priority 40: Elementwise fusion (via segmentPlanForExecution) ---
   // Bypassed nodes are excluded from fusion (they become view-like pass-throughs)
   if (
-    typeof process !== "undefined" &&
-    process.env?.TORCHLETTE_DEBUG_FUSION === "1" &&
+    ENV.TORCHLETTE_DEBUG_FUSION === "1" &&
     reorderedNodes.length > 200
   ) {
     // Show which gelu ops are claimed and by which system
@@ -506,8 +504,7 @@ export function analyzeGraph(
 
   // Debug dump: show fusion break patterns for large backward plans
   if (
-    typeof process !== "undefined" &&
-    process.env?.TORCHLETTE_DEBUG_FUSION === "1" &&
+    ENV.TORCHLETTE_DEBUG_FUSION === "1" &&
     reorderedNodes.length > 200
   ) {
     let totalFusible = 0;

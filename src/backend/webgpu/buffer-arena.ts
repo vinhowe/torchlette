@@ -12,6 +12,7 @@
  * per step each have their own arena).
  */
 
+import { ENV } from "../../core/env";
 import { recordAlloc } from "../../executor/compiled-plan";
 import { getSizeClass, getSizeForClass } from "../../graph/lifetime-analysis";
 import type { BackendTensor } from "../types";
@@ -310,7 +311,7 @@ let _arenaLiveness: boolean | null = null;
 export function arenaLivenessEnabled(): boolean {
   if (_arenaLiveness === null) {
     _arenaLiveness =
-      process.env.TORCHLETTE_ARENA_LIVENESS === "1" ||
+      ENV.TORCHLETTE_ARENA_LIVENESS === "1" ||
       !!(globalThis as { __torchletteArenaLiveness?: boolean })
         .__torchletteArenaLiveness;
   }
@@ -327,13 +328,13 @@ export function arenaLivenessEnabled(): boolean {
  */
 export function compiledPlannedEnabled(): boolean {
   return (
-    arenaLivenessEnabled() && process.env.TORCHLETTE_COMPILED_PLANNED !== "0"
+    arenaLivenessEnabled() && ENV.TORCHLETTE_COMPILED_PLANNED !== "0"
   );
 }
 let _arenaSpillBytes: number | null = null;
 function arenaSpillThreshold(): number {
   if (_arenaSpillBytes === null) {
-    const mb = process.env.TORCHLETTE_ARENA_MAX_BUFFER_MB;
+    const mb = ENV.TORCHLETTE_ARENA_MAX_BUFFER_MB;
     _arenaSpillBytes = (mb ? parseFloat(mb) : 2) * 1024 * 1024;
   }
   return _arenaSpillBytes;
@@ -392,7 +393,7 @@ function arenaAllocAt(
   // every such position allocates a FRESH buffer each step (e.g. the
   // foreach optimizer's 328MB packed m/v leaked +640MB/step); with it, the
   // producer/consumer ping-pong settles into two alternating pooled buffers.
-  if (process.env.TORCHLETTE_DEBUG_BIGALLOC && sizeBytes > 64 * 1024 * 1024) {
+  if (ENV.TORCHLETTE_DEBUG_BIGALLOC && sizeBytes > 64 * 1024 * 1024) {
     console.log(
       `[bigalloc] arena idx=${idx} bytes=${(sizeBytes / 1e6).toFixed(0)}MB existing=${existing ? `yes(class ${getSizeClass(existing.size)} vs ${neededSizeClass}, recyclable=${bufferPool.canRecycle(existing)})` : "no"}`,
     );
@@ -404,7 +405,7 @@ function arenaAllocAt(
   // to another → slot aliasing → training divergence). The in-place copy_
   // fast path removed the allocation churn this was meant to fix.
   const pooled =
-    process.env.TORCHLETTE_ARENA_POOL_ACQUIRE === "1"
+    ENV.TORCHLETTE_ARENA_POOL_ACQUIRE === "1"
       ? bufferPool.acquire(alignedSize)
       : null;
   if (pooled) {

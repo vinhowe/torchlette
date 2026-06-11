@@ -1,3 +1,4 @@
+import { ENV } from "../core/env";
 import { getBackend } from "../backend/registry";
 import type {
   AdamStepConfig,
@@ -143,7 +144,7 @@ export function getInputStorage(
         `its buffer may have been reused. Create persistent state outside ` +
         `the step, update it in place via copy_, or mark it with ` +
         `runtime.persist().`;
-      if (process.env.TORCHLETTE_STRICT_LIFETIME === "1") {
+      if (ENV.TORCHLETTE_STRICT_LIFETIME === "1") {
         throw new Error(msg);
       }
       if (!_warnedReclaimedRead) {

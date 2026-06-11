@@ -23,6 +23,7 @@
  * existing sequence-hinted pool.
  */
 
+import { ENV } from "../core/env";
 import type { DType } from "../backend/types";
 import type { FusedKernelRecipe } from "../backend/webgpu/fusion-types";
 import type { EpilogueOp } from "../compiler/matmul-epilogue";
@@ -455,8 +456,8 @@ import type { LazyIRNode, LazyRef } from "../graph/types";
 
 /** Default reclaim interval, overridable via TORCHLETTE_RECLAIM_INTERVAL env var. */
 export const DEFAULT_RECLAIM_INTERVAL =
-  typeof process !== "undefined" && process.env?.TORCHLETTE_RECLAIM_INTERVAL
-    ? parseInt(process.env.TORCHLETTE_RECLAIM_INTERVAL, 10)
+  ENV.TORCHLETTE_RECLAIM_INTERVAL
+    ? parseInt(ENV.TORCHLETTE_RECLAIM_INTERVAL, 10)
     : 10000;
 
 interface BuildFromAnalysisInput {
@@ -497,7 +498,7 @@ export function buildLoweredPlanFromAnalysis(
   let nodesSinceReclaim = 0;
 
   if (
-    process.env.TORCHLETTE_DEBUG_OPTPLAN &&
+    ENV.TORCHLETTE_DEBUG_OPTPLAN &&
     planNodes.some((n) => n.op === "adamStep")
   ) {
     console.log(`[optplan] ${planNodes.map((n) => n.op).join(",")}`);

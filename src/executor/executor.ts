@@ -1,3 +1,4 @@
+import { ENV } from "../core/env";
 import { getBackend } from "../backend/registry";
 import type {
   AdamStepConfig,
@@ -665,14 +666,14 @@ export async function executeLoweredPlan(
     loweredPlan.compiledPlan?.valid &&
     useTopLevelSharedEncoder &&
     options.bufferArena &&
-    process.env.TORCHLETTE_COMPILED_PLAN !== "0" &&
+    ENV.TORCHLETTE_COMPILED_PLAN !== "0" &&
     // Liveness-aware arena reuses one buffer across multiple positions, so
     // compiled replay needs the EXPERIMENTAL planned-buffer mode (such plans
     // carry allocBuffers — the pinned, lifetime-split assignment recorded
     // from the pool-reusing execution). See buildCompiledPlan for status.
     (!arenaLivenessEnabled() || compiledPlannedEnabled())
   ) {
-    if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+    if (ENV.TORCHLETTE_DEBUG_COMPILED) {
       console.log(
         `[exec] COMPILED nodes=${planNodes.length} cmds=${loweredPlan.compiledPlan.commands.length}`,
       );
@@ -699,7 +700,7 @@ export async function executeLoweredPlan(
   // NORMAL PATH (with optional compilation recording for compiled plan)
   // =========================================================================
 
-  if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+  if (ENV.TORCHLETTE_DEBUG_COMPILED) {
     console.log(
       `[exec] NORMAL nodes=${planNodes.length} hasCompiledPlan=${!!loweredPlan.compiledPlan?.valid} hasArena=${!!options.bufferArena} arenaLen=${options.bufferArena?.resolve?.length ?? "n/a"}`,
     );
@@ -738,19 +739,19 @@ export async function executeLoweredPlan(
     // flag (see buildCompiledPlan), else stay on the lowered path as before.
     (!arenaLivenessEnabled() || compiledPlannedEnabled()) &&
     // Debug bisection: only compile plans up to N nodes.
-    (!process.env.TORCHLETTE_COMPILED_MAX_NODES ||
+    (!ENV.TORCHLETTE_COMPILED_MAX_NODES ||
       planNodes.length <=
-        parseInt(process.env.TORCHLETTE_COMPILED_MAX_NODES, 10)) &&
+        parseInt(ENV.TORCHLETTE_COMPILED_MAX_NODES, 10)) &&
     // Debug bisection: only compile plans whose node count is in the list.
-    (!process.env.TORCHLETTE_COMPILED_ONLY_NODES ||
-      process.env.TORCHLETTE_COMPILED_ONLY_NODES.split(",").includes(
+    (!ENV.TORCHLETTE_COMPILED_ONLY_NODES ||
+      ENV.TORCHLETTE_COMPILED_ONLY_NODES.split(",").includes(
         String(planNodes.length),
       ));
   let compilationRecording: ReturnType<
     typeof startCompilationRecording
   > | null = null;
   if (shouldCompile) {
-    if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+    if (ENV.TORCHLETTE_DEBUG_COMPILED) {
       console.log(`[exec] RECORDING nodes=${planNodes.length}`);
     }
     compilationRecording = startCompilationRecording();
@@ -797,7 +798,7 @@ export async function executeLoweredPlan(
   // =========================================================================
   // Liveness-based buffer release: free intermediate buffers mid-plan execution.
   // Enabled by default; opt out with TORCHLETTE_LIVENESS_RELEASE=0.
-  const enableLivenessRelease = process.env.TORCHLETTE_LIVENESS_RELEASE !== "0";
+  const enableLivenessRelease = ENV.TORCHLETTE_LIVENESS_RELEASE !== "0";
   let livenessOutputIds: Set<number> | null = null;
   let livenessReleased: Set<number> | null = null;
   let livenessDeferred: Set<number> | null = null;
@@ -1020,7 +1021,7 @@ export async function executeLoweredPlan(
                   ? { inlinable: true as const, value: ref.value }
                   : isInlinableScalar(ref);
               if (cur.inlinable && cur.value !== inp.inlinedValue) {
-                if (process.env.TORCHLETTE_DEBUG_SCALARS) {
+                if (ENV.TORCHLETTE_DEBUG_SCALARS) {
                   console.log(
                     `[scalar-adapt] input ${i}: baked=${inp.inlinedValue} current=${cur.value}`,
                   );
@@ -1029,7 +1030,7 @@ export async function executeLoweredPlan(
               }
             }
             if (stale) {
-              if (process.env.TORCHLETTE_DEBUG_SCALARS) {
+              if (ENV.TORCHLETTE_DEBUG_SCALARS) {
                 console.log(
                   `[scalar-adapt] demoting ${stale.size} inlined scalar(s) on a ${groupNodes.length}-node group`,
                 );
@@ -1492,7 +1493,7 @@ export async function executeLoweredPlan(
         }
       }
     }
-    if (livenessReleased?.size && process.env.TORCHLETTE_DEBUG_LIVENESS) {
+    if (livenessReleased?.size && ENV.TORCHLETTE_DEBUG_LIVENESS) {
       const outputCount = livenessOutputIds?.size ?? 0;
       const totalNodes = planNodes.length;
       const reclaimCount = loweredPlan.actions.filter(
@@ -1789,7 +1790,7 @@ export async function executePlanOptimized(
         recordPlanAnalysis({ ...validatedTemplate.planAnalysis });
       }
     }
-    if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+    if (ENV.TORCHLETTE_DEBUG_COMPILED) {
       const extCount = externalNodeIds?.size ?? 0;
       const n0 = plan.nodes[0];
       const n0Info = n0
@@ -1911,7 +1912,7 @@ export async function executePlanOptimized(
       // Insert reclaim points so released buffers get promoted to the available pool.
       // Matches the enableLivenessRelease default-on behavior.
       reclaimInterval:
-        process.env.TORCHLETTE_LIVENESS_RELEASE !== "0" ? 300 : undefined,
+        ENV.TORCHLETTE_LIVENESS_RELEASE !== "0" ? 300 : undefined,
     });
     template.loweredPlan = loweredPlan;
     // Create empty arena for WebGPU — populated during first execution,
@@ -1943,7 +1944,7 @@ export async function executePlanOptimized(
       }
     }
 
-    if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+    if (ENV.TORCHLETTE_DEBUG_COMPILED) {
       // Log op histogram for structural comparison
       const opCounts = new Map<string, number>();
       for (const n of plan.nodes)
@@ -2029,7 +2030,7 @@ export async function executePlanOptimized(
   // Allow runtime toggling from the browser via globalThis (env vars don't
   // exist in browsers and Vite replaces process.env at compile time).
   const arenaDisabled =
-    !!process.env.TORCHLETTE_NO_ARENA ||
+    !!ENV.TORCHLETTE_NO_ARENA ||
     !!(globalThis as { __torchletteNoArena?: boolean }).__torchletteNoArena;
   const bufferArena = arenaDisabled
     ? undefined

@@ -1,3 +1,4 @@
+import { ENV } from "../../core/env";
 /**
  * GPU buffer lifecycle tracking for debugging aliasing/reuse corruption.
  *
@@ -23,7 +24,7 @@
 type GPUBuffer = unknown;
 
 const _env =
-  typeof process !== "undefined" ? (process.env?.TORCHLETTE_BUF_DEBUG ?? "") : "";
+  typeof process !== "undefined" ? (ENV.TORCHLETTE_BUF_DEBUG ?? "") : "";
 const enabled = !!_env;
 const verbose = _env === "verbose" || _env === "trace";
 const assertMode = _env === "assert";

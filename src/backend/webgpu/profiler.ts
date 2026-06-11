@@ -5,6 +5,7 @@
  * When disabled, all functions are no-ops with zero overhead.
  */
 
+import { ENV } from "../../core/env";
 import type {
   GPUBuffer as LocalGPUBuffer,
   GPUDevice as LocalGPUDevice,
@@ -13,7 +14,7 @@ import type {
 // biome-ignore lint/style/useLet: must be mutable for runtime enable/disable
 // biome-ignore lint/style/useConst: must be mutable for runtime enable/disable
 let _profilingEnabled =
-  typeof process !== "undefined" && !!process.env?.TORCHLETTE_PROFILE;
+  typeof process !== "undefined" && !!ENV.TORCHLETTE_PROFILE;
 
 // ---------------------------------------------------------------------------
 // Stat entry types
@@ -852,7 +853,7 @@ export function printProfileSummary(label: string): void {
   // Auto-write JSON if env var is set
   const jsonPath =
     typeof process !== "undefined"
-      ? process.env?.TORCHLETTE_PROFILE_JSON
+      ? ENV.TORCHLETTE_PROFILE_JSON
       : undefined;
   if (jsonPath) {
     void writeProfileJSON(jsonPath);

@@ -2,6 +2,7 @@
  * Tensor construction helpers: createTensor, createTrackedBuffer, createBufferWithData.
  */
 
+import { ENV } from "../../core/env";
 import {
   getSlot,
   isCompilationRecordingActive,
@@ -149,7 +150,7 @@ export function createTrackedBuffer(
       const pooled = bufferPool.acquirePreferred(alignedSize, preferredBuffer);
       if (pooled) {
         bufAcquire(pooled, "createTrackedBuffer.preferred");
-        if (process.env.TORCHLETTE_DEBUG_WRITES && alignedSize > 2 * 1024 * 1024) {
+        if (ENV.TORCHLETTE_DEBUG_WRITES && alignedSize > 2 * 1024 * 1024) {
           console.log(`[alloc-path] PREFERRED size=${alignedSize}`);
         }
         return pooled;
@@ -158,18 +159,18 @@ export function createTrackedBuffer(
     const pooled = bufferPool.acquire(alignedSize);
     if (pooled) {
       bufAcquire(pooled, "createTrackedBuffer.acquire");
-      if (process.env.TORCHLETTE_DEBUG_WRITES && alignedSize > 2 * 1024 * 1024) {
+      if (ENV.TORCHLETTE_DEBUG_WRITES && alignedSize > 2 * 1024 * 1024) {
         console.log(`[alloc-path] ACQUIRE size=${alignedSize} src=${bufferPool.lastAcquireSource}`);
       }
       return pooled;
     }
-    if (process.env.TORCHLETTE_DEBUG_WRITES && alignedSize > 2 * 1024 * 1024) {
+    if (ENV.TORCHLETTE_DEBUG_WRITES && alignedSize > 2 * 1024 * 1024) {
       console.log(`[alloc-path] FRESH size=${alignedSize}`);
     }
   }
 
   if (
-    process.env.TORCHLETTE_DEBUG_BIGALLOC &&
+    ENV.TORCHLETTE_DEBUG_BIGALLOC &&
     alignedSize > 64 * 1024 * 1024
   ) {
     console.log(

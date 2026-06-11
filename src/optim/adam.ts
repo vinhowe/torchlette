@@ -1,3 +1,4 @@
+import { ENV } from "../core/env";
 import type { AdamStepConfig, DeviceKind } from "../backend/types";
 import type { Tensor, Torchlette } from "../frontend/torchlette";
 import { createLazyIRNode } from "../graph/node-factory";
@@ -214,11 +215,11 @@ export class Adam {
     // 2.5GB current — the program is fine, the memory policy isn't). Flip
     // the default once bounded-memory compiled execution lands
     // (docs/architecture-debt.md, planned compiled buffers).
-    if (this.hasFusedKernel() && process.env.TORCHLETTE_FUSED_ADAM !== "0") {
+    if (this.hasFusedKernel() && ENV.TORCHLETTE_FUSED_ADAM !== "0") {
       return this._stepFused(runtime);
     }
     if (
-      process.env.TORCHLETTE_FOREACH_ADAM !== "0" &&
+      ENV.TORCHLETTE_FOREACH_ADAM !== "0" &&
       this.params.length > 1
     ) {
       return this._stepForeach(runtime);
@@ -485,7 +486,7 @@ export class Adam {
     param: Tensor,
     grad: RuntimeTensor,
   ): void {
-    if (process.env.TORCHLETTE_DEBUG_ADAM_BUFS) {
+    if (ENV.TORCHLETTE_DEBUG_ADAM_BUFS) {
       const bid = (t: RuntimeTensor): string => {
         const bt = (t as unknown as { backendTensor?: { buffer?: object } })
           .backendTensor;

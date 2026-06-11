@@ -1,3 +1,4 @@
+import { ENV } from "../core/env";
 import type {
   Backend,
   BackendTensor,
@@ -161,7 +162,7 @@ export async function executeFusedSegment(
     if (inputRef.kind === "scalar") {
       const scalarStorage = getInputStorage(inputRef, backend);
       const st = asGPUTensor(scalarStorage.backendTensor);
-      if (process.env.TORCHLETTE_DEBUG_SCALARS) {
+      if (ENV.TORCHLETTE_DEBUG_SCALARS) {
         console.log(
           `[fused-scalar] in${inputIdx} value=${inputRef.value} buf=${(st.buffer as { label?: string }).label ?? "?"}#${(st.buffer as { size?: number }).size}`,
         );
@@ -258,7 +259,7 @@ export async function executeFusedSegment(
   if (
     donatableInputIds &&
     donatableInputIds.size > 0 &&
-    process.env.TORCHLETTE_DONATION !== "0" &&
+    ENV.TORCHLETTE_DONATION !== "0" &&
     // Multi-output groups donate into out0 only; additional outputs keep
     // their own allocations (the earlier corruption was a dispatch bug:
     // EVERY output was handed the donated buffer — one buffer at multiple
@@ -297,7 +298,7 @@ export async function executeFusedSegment(
       break;
     }
   }
-  if (process.env.TORCHLETTE_DEBUG_DONATION) {
+  if (ENV.TORCHLETTE_DEBUG_DONATION) {
     const outElems = sizeOf(recipe.outputs[0].shape);
     if (outElems > 1_000_000) {
       console.log(

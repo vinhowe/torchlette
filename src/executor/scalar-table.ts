@@ -28,6 +28,7 @@
  * map is rebuilt at each refresh.
  */
 
+import { ENV } from "../core/env";
 import type { Backend } from "../backend/types";
 import type { GPUBuffer, GPUDevice } from "../backend/webgpu/gpu-types";
 import { bufferPool } from "../backend/webgpu/buffer-pool";
@@ -123,7 +124,7 @@ export function refreshScalarTable(
 ): void {
   const slots = loweredPlan.scalarSlots;
   if (!slots || slots.length === 0) return;
-  if (process.env.TORCHLETTE_SCALAR_TABLE === "0") return; // debug kill switch
+  if (ENV.TORCHLETTE_SCALAR_TABLE === "0") return; // debug kill switch
   const device = (backend as Backend & { device?: GPUDevice }).device;
   if (!device) return; // non-WebGPU backends keep the legacy full() path
 
@@ -157,7 +158,7 @@ export function refreshScalarTable(
   for (let i = 0; i < slots.length; i++) {
     const ref = planNodes[slots[i].nodeIndex]?.inputs[slots[i].inputIndex];
     if (!ref || ref.kind !== "scalar") {
-      if (process.env.TORCHLETTE_DEBUG_SCALARS) {
+      if (ENV.TORCHLETTE_DEBUG_SCALARS) {
         console.log(
           `[scalar-table] STRUCTURAL MISMATCH slot ${i}: planNodes[${slots[i].nodeIndex}].inputs[${slots[i].inputIndex}] is ${ref ? ref.kind : "missing"} (table value stays stale!)`,
         );

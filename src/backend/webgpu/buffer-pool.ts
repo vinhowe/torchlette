@@ -10,6 +10,7 @@
  * (a zero-dependency leaf module).
  */
 
+import { ENV } from "../../core/env";
 import { getSizeClass, getSizeForClass } from "../../graph/lifetime-analysis";
 import type { DType } from "../types";
 import type { GPUBuffer, GPUDevice } from "./gpu-types";
@@ -497,7 +498,7 @@ class SimpleBufferPool {
       const inBucket = this.pool.get(sizeClass)?.includes(buffer) ?? false;
       if (inPending || inBucket) {
         this.doubleReleaseCount++;
-        if (process.env.TORCHLETTE_DEBUG_POOLDUP) {
+        if (ENV.TORCHLETTE_DEBUG_POOLDUP) {
           console.log(
             `[pool-dup] DOUBLE-RELEASE (refused) size=${actualSize} inPending=${inPending} inBucket=${inBucket} at ${new Error().stack?.split("\n").slice(2, 8).map((l) => l.trim()).join(" <- ")}`,
           );
@@ -718,7 +719,7 @@ class SimpleBufferPool {
       this.pendingRelease.some((e) => e.buffer === buffer)
     ) {
       this.doubleReleaseCount++;
-      if (process.env.TORCHLETTE_DEBUG_POOLDUP) {
+      if (ENV.TORCHLETTE_DEBUG_POOLDUP) {
         console.log(
           `[pool-dup] returnToPool DOUBLE-ENTRY (refused) class=${sizeClass} at ${new Error().stack?.split("\n").slice(2, 8).map((l) => l.trim()).join(" <- ")}`,
         );

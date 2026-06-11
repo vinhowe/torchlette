@@ -2,6 +2,7 @@
  * Matmul dispatch: kernel selection, pipeline caching, and execution.
  */
 
+import { ENV } from "../../../core/env";
 import {
   cachedCreateBindGroup,
   releaseParamsBuffer,
@@ -486,7 +487,7 @@ export async function pretuneMatmulShapes(
   // Autotuning requires either env var TORCHLETTE_AUTOTUNE=1 or programmatic
   // setAutotuneEnabled(true) (used by compile({ autotune: true }))
   const envEnabled =
-    typeof process !== "undefined" && process.env?.TORCHLETTE_AUTOTUNE === "1";
+    ENV.TORCHLETTE_AUTOTUNE === "1";
   if (!envEnabled && !isAutotuneEnabled()) {
     return;
   }

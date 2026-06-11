@@ -9,6 +9,7 @@
  * Use `printSchedulerAuditSummary()` at end-of-run to see aggregate numbers
  * (e.g. in profile-training.ts or a training script).
  */
+import { ENV } from "../../core/env";
 import type { ExecutionPlan } from "../../graph/types";
 import { computePeak, totalBytes, trivialAssignment } from "./cost-model";
 import { analyzeLiveRanges } from "./live-range";
@@ -16,7 +17,7 @@ import { bestFitScheduler, firstFitScheduler } from "./schedulers";
 
 // Read lazily so tools/tests can flip the flag at runtime.
 function isEnabled(): boolean {
-  return !!process.env.TORCHLETTE_SCHEDULER_AUDIT;
+  return !!ENV.TORCHLETTE_SCHEDULER_AUDIT;
 }
 
 interface AuditSample {

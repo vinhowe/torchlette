@@ -2,6 +2,7 @@
  * GPU context management: initialization, device lifecycle, f16 support.
  */
 
+import { ENV } from "../../core/env";
 import { clearBindGroupCache } from "./bind-group-cache";
 import { bufferPool, destroyProfilingFenceBuffer } from "./buffer-pool";
 import type {
@@ -76,7 +77,7 @@ function parseWebGPUOptions(): string[] {
   if (typeof process === "undefined") {
     return [];
   }
-  const raw = process.env.TORCHLETTE_WEBGPU_OPTS ?? "";
+  const raw = ENV.TORCHLETTE_WEBGPU_OPTS ?? "";
   const options = raw
     .split(",")
     .map((value) => value.trim())
@@ -422,8 +423,7 @@ export async function initWebGPU(): Promise<boolean> {
       }
     }
     if (
-      typeof process !== "undefined" &&
-      process.env?.TORCHLETTE_STRICT_GPU === "1"
+      ENV.TORCHLETTE_STRICT_GPU === "1"
     ) {
       throw new Error(
         `TORCHLETTE_STRICT_GPU: uncaptured GPU error: ${ev.error?.message ?? ev.error}`,
@@ -432,10 +432,9 @@ export async function initWebGPU(): Promise<boolean> {
   };
 
   if (
-    typeof process !== "undefined" &&
-    process.env?.TORCHLETTE_POOL_BUDGET_MB
+    ENV.TORCHLETTE_POOL_BUDGET_MB
   ) {
-    const mb = Number(process.env.TORCHLETTE_POOL_BUDGET_MB);
+    const mb = Number(ENV.TORCHLETTE_POOL_BUDGET_MB);
     if (Number.isFinite(mb) && mb > 0) {
       bufferPool.setMaxPoolBytes(mb * 1024 * 1024);
     }
@@ -452,7 +451,7 @@ export async function initWebGPU(): Promise<boolean> {
 
   const batchSubmits =
     typeof process !== "undefined"
-      ? process.env?.TORCHLETTE_BATCH_SUBMITS
+      ? ENV.TORCHLETTE_BATCH_SUBMITS
       : undefined;
   setSharedEncoderEnabled(batchSubmits !== "0");
 

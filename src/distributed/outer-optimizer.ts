@@ -12,6 +12,7 @@
  * Default hyperparameters from DiLoCo paper: lr = 0.7, mu = 0.9.
  */
 
+import { ENV } from "../core/env";
 import type { Tensor } from "../frontend/tensor";
 import type { Torchlette } from "../frontend/torchlette";
 
@@ -80,7 +81,7 @@ export class NesterovOuterOptimizer {
 
     // Debug: verify the GPU params actually received the CPU-computed values
     // (this plan is upload+copy only, so JS holds exact ground truth).
-    if (process.env.TORCHLETTE_DEBUG_OUTER_VERIFY === "1") {
+    if (ENV.TORCHLETTE_DEBUG_OUTER_VERIFY === "1") {
       let worst = 0;
       let worstIdx = -1;
       let worstElem = -1;

@@ -1,3 +1,4 @@
+import { ENV } from "../core/env";
 /**
  * Reference counting for StorageHandle lifecycle management.
  *
@@ -15,7 +16,7 @@
  */
 
 const _traceEnv =
-  typeof process !== "undefined" ? (process.env?.TORCHLETTE_RC_TRACE ?? "") : "";
+  typeof process !== "undefined" ? (ENV.TORCHLETTE_RC_TRACE ?? "") : "";
 const trace = !!_traceEnv;
 const verbose = _traceEnv === "verbose";
 

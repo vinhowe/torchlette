@@ -11,6 +11,7 @@
  * inference (growing KV cache buffers).
  */
 
+import { ENV } from "../core/env";
 import type { DType } from "../backend/types";
 import type {
   GPUBindGroup,
@@ -267,7 +268,7 @@ export function buildCompiledPlan(input: {
   // (e.g. step-varying uniform data with no volatile repack) — fall back
   // to the lowered path for this template.
   if (recordingInvalidReason) {
-    if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+    if (ENV.TORCHLETTE_DEBUG_COMPILED) {
       console.log(`[compiled] FAIL: ${recordingInvalidReason}`);
     }
     recordingInvalidReason = null;
@@ -324,7 +325,7 @@ export function buildCompiledPlan(input: {
         const bindings: Slot[] = [];
         for (let i = 0; i < d.buffers.length; i++) {
           const recorded = d.slots?.[i] ?? -1;
-          if (recorded < 0 && process.env.TORCHLETTE_DEBUG_PERSISTENT) {
+          if (recorded < 0 && ENV.TORCHLETTE_DEBUG_PERSISTENT) {
             const had = bufferToSlot.has(d.buffers[i]);
             if (!had) {
               console.log(
@@ -349,7 +350,7 @@ export function buildCompiledPlan(input: {
       case "alloc": {
         const slot = entry.slot;
         if (slot < 0) {
-          if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+          if (ENV.TORCHLETTE_DEBUG_COMPILED) {
             console.log(
               `[compiled] FAIL: alloc buffer unmapped, size=${entry.bytes}, commands so far=${commands.length}`,
             );
@@ -408,7 +409,7 @@ export function buildCompiledPlan(input: {
           // The cleared buffer has no slot (not recorded as an alloc/output).
           // Can't replay the zeroing safely — invalidate and fall back to the
           // lowered path rather than ship a plan that skips a required clear.
-          if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+          if (ENV.TORCHLETTE_DEBUG_COMPILED) {
             console.log(
               `[compiled] FAIL: clear buffer unmapped, size=${entry.bytes}, commands so far=${commands.length}`,
             );
@@ -455,7 +456,7 @@ export function buildCompiledPlan(input: {
         pinnedBufferSet.add(buf);
         adoptedRefCount.set(buf, 1);
         adoptedBuffers!.push(buf);
-        if (process.env.TORCHLETTE_DEBUG_DESTROYED) {
+        if (ENV.TORCHLETTE_DEBUG_DESTROYED) {
           console.log(
             `[pin] buf=${dbgBufId(buf)} size=${(((buf as unknown as { size?: number }).size ?? 0) / 1e6).toFixed(1)}MB alreadyDestroyed=${_dbgDestroyed.has(buf)}`,
           );
@@ -465,7 +466,7 @@ export function buildCompiledPlan(input: {
     for (const buf of allocBuffers) {
       if (buf) adopt(buf);
     }
-    if (process.env.TORCHLETTE_DEBUG_DESTROYED) {
+    if (ENV.TORCHLETTE_DEBUG_DESTROYED) {
       const sample = allocBuffers.find((b) => b);
       if (sample) dbgPatchDestroy(sample);
     }
@@ -485,7 +486,7 @@ export function buildCompiledPlan(input: {
     }
   }
 
-  if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+  if (ENV.TORCHLETTE_DEBUG_COMPILED) {
     const dispatchCount = commands.filter((c) => c.tag === TAG_DISPATCH).length;
     const allocCount = commands.filter((c) => c.tag === TAG_ALLOC).length;
     const barrierCount = commands.filter((c) => c.tag === TAG_BARRIER).length;
@@ -541,7 +542,7 @@ function dbgPatchDestroy(sample: GPUBuffer): void {
   const orig = proto.destroy;
   proto.destroy = function (this: GPUBuffer) {
     _dbgDestroyed.add(this);
-    const minMb = process.env.TORCHLETTE_DEBUG_DESTROY_STACK_MB;
+    const minMb = ENV.TORCHLETTE_DEBUG_DESTROY_STACK_MB;
     if (
       minMb &&
       ((this as unknown as { size?: number }).size ?? 0) >
@@ -677,7 +678,7 @@ export function setRecordingNodeIndex(nodeIndex: number): void {
 export function invalidateActiveRecording(reason: string): void {
   if (activeCommandLog && !recordingInvalidReason) {
     recordingInvalidReason = reason;
-    if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+    if (ENV.TORCHLETTE_DEBUG_COMPILED) {
       console.log(`[compiled] recording invalidated: ${reason}`);
     }
   }
@@ -965,7 +966,7 @@ export async function executeCompiledPlan(
   let plannedBindCount = 0;
   let plannedFallbackCount = 0;
 
-  if (process.env.TORCHLETTE_DEBUG_COMPILED) {
+  if (ENV.TORCHLETTE_DEBUG_COMPILED) {
     console.log(
       `[compiled] Executing: ${compiled.commands.length} cmds, ${compiled.slots.length} slots, ${compiled.results.length} results${compiled.allocBuffers ? " (planned buffers)" : ""}`,
     );
@@ -980,8 +981,8 @@ export async function executeCompiledPlan(
 
   try {
     // Phase 1: Pre-populate external + persistent slots
-    const dbgSlots = process.env.TORCHLETTE_DEBUG_SLOTS
-      ? process.env.TORCHLETTE_DEBUG_SLOTS.split(",").map(Number)
+    const dbgSlots = ENV.TORCHLETTE_DEBUG_SLOTS
+      ? ENV.TORCHLETTE_DEBUG_SLOTS.split(",").map(Number)
       : null;
     for (let i = 0; i < compiled.slots.length; i++) {
       const src = compiled.slots[i];
@@ -1053,7 +1054,7 @@ export async function executeCompiledPlan(
           // direct input of this op. On failure, fall back to dynamic
           // allocation for ALL of this buffer's lifetimes this replay.
           const planned = compiled.allocBuffers
-            ? process.env.TORCHLETTE_PLANNED_BIND === "0"
+            ? ENV.TORCHLETTE_PLANNED_BIND === "0"
               ? undefined
               : compiled.allocBuffers[cmd.slot]
             : undefined;
@@ -1098,7 +1099,7 @@ export async function executeCompiledPlan(
               );
             }
           }
-          if (process.env.TORCHLETTE_DEBUG_DESTROYED) {
+          if (ENV.TORCHLETTE_DEBUG_DESTROYED) {
             dbgPatchDestroy(bufs[0]);
             for (let j = 0; j < bufs.length; j++) {
               if (_dbgDestroyed.has(bufs[j])) {
@@ -1123,12 +1124,12 @@ export async function executeCompiledPlan(
             }
           }
           if (
-            process.env.TORCHLETTE_DEBUG_SLOT &&
+            ENV.TORCHLETTE_DEBUG_SLOT &&
             cmd.bindings.includes(
-              parseInt(process.env.TORCHLETTE_DEBUG_SLOT, 10),
+              parseInt(ENV.TORCHLETTE_DEBUG_SLOT, 10),
             )
           ) {
-            const s = parseInt(process.env.TORCHLETTE_DEBUG_SLOT, 10);
+            const s = parseInt(ENV.TORCHLETTE_DEBUG_SLOT, 10);
             console.log(
               `[replay-dispatch] cmd=${ci} label=${cmd.label ?? "?"} binds slot ${s} at idx=${cmd.bindings.indexOf(s)} buf=${dbgBufId(slots[s])} (bindings=${cmd.bindings.join(",")})`,
             );
@@ -1179,7 +1180,7 @@ export async function executeCompiledPlan(
         }
         case TAG_COPY: {
           const encoder = getSharedEncoderInstance();
-          if (process.env.TORCHLETTE_DEBUG_SHAPE) {
+          if (ENV.TORCHLETTE_DEBUG_SHAPE) {
             console.log(
               `[replay-copy] cmd=${ci} src=${dbgBufId(slots[cmd.src])} dst=${dbgBufId(slots[cmd.dst])} bytes=${cmd.bytes} encoder=${encoder ? "yes" : "NULL-SKIPPED"}`,
             );
@@ -1216,7 +1217,7 @@ export async function executeCompiledPlan(
             writeNode.result = createStorageHandle(writeNode.device, result);
           }
           slots[cmd.slot] = gpuBuffer(writeNode.result!.backendTensor);
-          if (process.env.TORCHLETTE_DEBUG_WRITES) {
+          if (ENV.TORCHLETTE_DEBUG_WRITES) {
             console.log(
               `[replay-write] cmd=${ci} slot=${cmd.slot} node=${writeNode.id} bytes=${(writeNode.result!.backendTensor as { size?: number }).size ?? "?"} buf=${dbgBufId(slots[cmd.slot])} ${hadResult ? "PRE-MATERIALIZED" : "executed"}`,
             );
@@ -1253,7 +1254,7 @@ export async function executeCompiledPlan(
       }
     }
 
-    if (process.env.TORCHLETTE_DEBUG_COMPILED && compiled.allocBuffers) {
+    if (ENV.TORCHLETTE_DEBUG_COMPILED && compiled.allocBuffers) {
       console.log(
         `[compiled] planned binds=${plannedBindCount} fallbacks=${plannedFallbackCount}`,
       );
@@ -1327,18 +1328,18 @@ export async function executeCompiledPlan(
       const assignsExtra =
         r.outputIndex > 0 || (node.results && node.results.length > 0);
       if (
-        process.env.TORCHLETTE_DEBUG_HARVEST_ALL ||
-        (process.env.TORCHLETTE_DEBUG_SHAPE &&
-          r.shape.join(",") === process.env.TORCHLETTE_DEBUG_SHAPE) ||
-        (process.env.TORCHLETTE_DEBUG_OPMATCH &&
-          node.op.includes(process.env.TORCHLETTE_DEBUG_OPMATCH))
+        ENV.TORCHLETTE_DEBUG_HARVEST_ALL ||
+        (ENV.TORCHLETTE_DEBUG_SHAPE &&
+          r.shape.join(",") === ENV.TORCHLETTE_DEBUG_SHAPE) ||
+        (ENV.TORCHLETTE_DEBUG_OPMATCH &&
+          node.op.includes(ENV.TORCHLETTE_DEBUG_OPMATCH))
       ) {
         console.log(
           `[harvest-${r.shape.join("x")}] node[${r.nodeIndex}] op=${node.op} id=${node.id} oi=${r.outputIndex} slot=${r.slot} buf=${dbgBufId(slots[r.slot])} ${assignsPrimary || assignsExtra ? "assign" : "SKIP(existing buf=" + (node.result ? dbgBufId(gpuBuffer(node.result.backendTensor)) : "?") + ")"}`,
         );
       }
       if (!assignsPrimary && !assignsExtra) {
-        if (process.env.TORCHLETTE_DEBUG_HARVEST) {
+        if (ENV.TORCHLETTE_DEBUG_HARVEST) {
           dbgHarvestSkipped++;
           if (dbgHarvestSkipped <= 5 && node.result) {
             const existing = gpuBuffer(node.result.backendTensor);
@@ -1382,7 +1383,7 @@ export async function executeCompiledPlan(
         node.results[r.outputIndex] = sh;
       }
     }
-    if (process.env.TORCHLETTE_DEBUG_HARVEST && dbgHarvestSkipped > 0) {
+    if (ENV.TORCHLETTE_DEBUG_HARVEST && dbgHarvestSkipped > 0) {
       console.log(
         `[harvest-skip] ${dbgHarvestSkipped}/${compiled.results.length} results NOT assigned (node.result already set); planNodes[0].id=${planNodes[0]?.id} planNodes[last].id=${planNodes[planNodes.length - 1]?.id}`,
       );
@@ -1395,12 +1396,12 @@ export async function executeCompiledPlan(
 
   // Debug: read back slot contents AFTER the replay's submission, to see
   // which slots carry stale data across steps.
-  if (process.env.TORCHLETTE_DEBUG_READSLOTS) {
+  if (ENV.TORCHLETTE_DEBUG_READSLOTS) {
     // CRITICAL: submit the step-level shared encoder first, else the staging
     // copies below jump the queue and read PRE-replay data (this debug's
     // first incarnation did exactly that — all its readings were invalid).
     flushSharedEncoder();
-    const want = process.env.TORCHLETTE_DEBUG_READSLOTS.split(",").map(Number);
+    const want = ENV.TORCHLETTE_DEBUG_READSLOTS.split(",").map(Number);
     for (const si of want) {
       const buf = slots[si];
       if (!buf) {

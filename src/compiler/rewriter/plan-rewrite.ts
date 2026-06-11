@@ -9,6 +9,7 @@
  * small rule set we currently have (single-digit rewrites per plan) this
  * is negligible — a few dozen microseconds of pattern matching.
  */
+import { ENV } from "../../core/env";
 import type { ExecutionPlan, LazyIRNode } from "../../graph/types";
 import { applyRules, type Rule } from "./engine";
 import type { ConsumerMaps } from "./substitute";
@@ -91,7 +92,7 @@ export function rewritePlan(
     plan.nodes.push(...live);
   }
 
-  if (process.env.TORCHLETTE_LOG_DSL) {
+  if (ENV.TORCHLETTE_LOG_DSL) {
     const parts: string[] = [];
     for (const [name, count] of stats.byRule) parts.push(`${name}=${count}`);
     console.log(

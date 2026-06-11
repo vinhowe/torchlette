@@ -9,6 +9,7 @@
  * Also manages the params buffer pool and sequence-indexed params buffer reuse.
  */
 
+import { ENV } from "../../core/env";
 import {
   assignSlot,
   isCompilationRecordingActive,
@@ -144,7 +145,7 @@ export function createParamsBuffer(
         }
       }
       // Data changed — write new data, update cached copy
-      if (process.env.TORCHLETTE_DEBUG_PARAMS_CHANGED) {
+      if (ENV.TORCHLETTE_DEBUG_PARAMS_CHANGED) {
         const diffs: string[] = [];
         for (let i = 0; i < data.length; i++) {
           if (cached.data[i] !== data[i]) {
