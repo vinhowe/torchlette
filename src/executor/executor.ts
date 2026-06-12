@@ -89,6 +89,7 @@ import {
   assignSlot,
   buildCompiledPlan,
   destroyCompiledPlanBuffers,
+  resetPlannerRegistry,
   executeCompiledPlan,
   setRecordingNodeIndex,
 } from "./compiled-plan";
@@ -347,6 +348,12 @@ export function getFusionAnalysisTemplate(
 export function clearTemplateCacheForNewEngine(): void {
   evictAllArenas(false);
   fusionAnalysisCache.clear();
+  // Step-scoped shared planner registry is module-global like the template
+  // cache: entries co-owned by the dead instance's plans must not seed the
+  // new instance's plans. evictAllArenas released plan ownership above (so
+  // buffers are already torn down cleanly); the reset bumps the generation
+  // as a backstop for any plan object that escaped the cache walk.
+  resetPlannerRegistry();
 }
 
 export function evictAllArenas(force = false): void {

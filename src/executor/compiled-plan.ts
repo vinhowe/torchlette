@@ -188,12 +188,16 @@ export interface CompiledPlan {
   allocBuffers?: (GPUBuffer | undefined)[];
   /** Buffers adopted from the pool by this plan; destroyed on invalidation. */
   adoptedBuffers?: GPUBuffer[];
-  /** Stage-4 memory planner output: alloc-slot → planner buffer index. */
+  /** Stage-4 memory planner output: alloc-slot → registry entry index.
+   *  Entries live in the step-scoped shared registry (cross-plan packing,
+   *  phase 1.5); this plan co-owns every entry listed in plannerEntries. */
   plannerAssignment?: Map<number, number>;
-  /** Planner buffer byte sizes; buffers materialize lazily at first replay. */
-  plannerBufferBytes?: number[];
-  /** Materialized planner buffers (plan-owned; destroyed at teardown). */
-  plannerBuffers?: (GPUBuffer | undefined)[];
+  /** Registry entry indices this plan co-owns (released at teardown). */
+  plannerEntries?: number[];
+  /** Registry generation at build; a mismatch at replay/teardown means the
+   *  registry was reset (engine-instance boundary) — indices are stale, all
+   *  allocs fall back dynamically and the plan invalidates for re-record. */
+  plannerGen?: number;
 }
 
 // ============================================================================
@@ -236,7 +240,7 @@ export interface RecordedDispatch {
 
 import type { LazyIRNode, StorageHandle } from "../graph/types";
 import { getInputStorage } from "./op-dispatch";
-import { planMemory } from "./memory-planner";
+import { planMemory, PlannerRegistry } from "./memory-planner";
 import { isScalarTableBuffer } from "./scalar-table";
 
 /** Recorded buffer copy for compilation. */
@@ -308,17 +312,16 @@ export function buildCompiledPlan(input: {
   // fullstack parity 4e-6/30 steps vs lowered; medium@512 13.8GB peak at
   // compiled speed (~2.6x over lowered liveness, <half default-arena mem).
   const planned = compiledPlannedEnabled();
-  // Stage-4 memory planner (OPT-IN: TORCHLETTE_MEMORY_PLANNER=1). Derives
-  // the buffer assignment from slot lifetimes instead of pinning whatever
-  // the recording allocated — deterministic, plan-owned, audited at build.
-  // Validated correctness-equal to the pin mechanism (parity to fp noise,
-  // full ladder green), but packs each plan INDEPENDENTLY: the pin
-  // mechanism shares buffers across plans within a step (forward's dead
-  // activations serve the backward plan via adoption refcounts), so the
-  // planner currently costs ~8% peak on Medium (14.98 vs 13.8GB). Default
-  // flips when cross-plan packing closes that gap (phase 1.5 in
-  // docs/stage4-compile-from-ir.md); the pin mechanism is deleted then.
-  const usePlanner = planned && ENV.TORCHLETTE_MEMORY_PLANNER === "1";
+  // Stage-4 memory planner (DEFAULT under planned mode since phase 1.5;
+  // TORCHLETTE_MEMORY_PLANNER=0 opts back into the legacy pin mechanism).
+  // Derives the buffer assignment from slot lifetimes instead of pinning
+  // whatever the recording allocated — deterministic, plan-owned, audited
+  // at build — and packs temps across plans through the step-scoped shared
+  // registry. Validated (2026-06-12, A100 same-machine A/B): parity to fp
+  // noise over 30 steps, steady-state speed parity, peak memory BEATS the
+  // pin mechanism by ~14% on both distil@512 (5.07 vs 5.88GB) and
+  // medium@512 (15.0 vs 17.5GB). See docs/stage4-compile-from-ir.md.
+  const usePlanner = planned && ENV.TORCHLETTE_MEMORY_PLANNER !== "0";
   const allocBuffers: (GPUBuffer | undefined)[] | undefined =
     planned && !usePlanner ? [] : undefined;
 
@@ -541,24 +544,25 @@ export function buildCompiledPlan(input: {
   }
 
   // Stage-4 memory planner: derive the alloc-slot buffer assignment from
-  // lifetimes over the final command stream. Throws on structural overlap
-  // (always-on audit) — a planner bug becomes a build failure, not a replay
-  // corruption.
+  // lifetimes over the final command stream, drawing temp entries from the
+  // step-scoped shared registry (cross-plan packing). Throws on structural
+  // overlap (always-on audit) — a planner bug becomes a build failure, not
+  // a replay corruption.
   let plannerAssignment: Map<number, number> | undefined;
-  let plannerBufferBytes: number[] | undefined;
+  let plannerEntries: number[] | undefined;
   if (usePlanner) {
     const resultSlots = new Set<number>(nodeResults.map((r) => r.slot));
-    const memPlan = planMemory(commands, resultSlots);
+    const memPlan = planMemory(commands, plannerRegistry, resultSlots);
     plannerAssignment = memPlan.assignment;
-    plannerBufferBytes = memPlan.bufferBytes;
+    plannerEntries = memPlan.entries;
     if (ENV.TORCHLETTE_DEBUG_COMPILED) {
       console.log(
-        `[memory-planner] ${memPlan.assignment.size} alloc slots → ${memPlan.bufferBytes.length} buffers, ${(memPlan.totalBytes / 1e6).toFixed(1)}MB planned`,
+        `[memory-planner] ${memPlan.assignment.size} alloc slots → ${memPlan.entries.length} entries (${(memPlan.newBytes / 1e6).toFixed(1)}MB new, ${(memPlan.reusedBytes / 1e6).toFixed(1)}MB shared cross-plan)`,
       );
     }
   }
 
-  return {
+  const plan: CompiledPlan = {
     commands,
     slots: slotSources,
     results: nodeResults,
@@ -566,8 +570,39 @@ export function buildCompiledPlan(input: {
     allocBuffers,
     adoptedBuffers,
     plannerAssignment,
-    plannerBufferBytes,
+    plannerEntries,
+    plannerGen: plannerEntries ? plannerRegistry.generation : undefined,
   };
+  if (plannerEntries) {
+    for (const idx of plannerEntries) {
+      plannerRegistry.entries[idx].owners.add(plan);
+    }
+  }
+  return plan;
+}
+
+/**
+ * Step-scoped shared planner-buffer registry (stage-4 phase 1.5). One per
+ * process; engine-instance boundaries reset it via resetPlannerRegistry()
+ * alongside the template cache (instance boundaries are cache boundaries —
+ * stale cross-instance entries were the class behind the "reshape issue").
+ */
+const plannerRegistry = new PlannerRegistry();
+
+/** Reset the planner registry, destroying any materialized buffers via the
+ *  fence-gated path. Plans built against the old generation fall back to
+ *  dynamic allocation at their next replay and self-invalidate. */
+export function resetPlannerRegistry(): void {
+  for (const e of plannerRegistry.reset()) {
+    if (e.buffer) {
+      pinnedBufferSet.delete(e.buffer);
+      bufferPool.deferredDestroy(
+        e.buffer,
+        (e.buffer as { size?: number }).size ?? 0,
+      );
+      e.buffer = undefined;
+    }
+  }
 }
 
 /** Refcount for buffers adopted by compiled plans (shared across plans when
@@ -631,12 +666,39 @@ export function dbgIsDestroyed(buf: GPUBuffer): boolean {
  * are destroyed immediately.
  */
 export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
-  if (!compiled.adoptedBuffers && !compiled.plannerBuffers) {
+  // Release co-owned registry entries (cross-plan packing). An entry's
+  // buffer dies with its LAST owner; the entry record itself stays and is
+  // re-listed for future plans (the buffer rematerializes on demand).
+  // Generation guard: after a registry reset the indices point into a NEW
+  // entries array — the reset already destroyed the old buffers.
+  if (compiled.plannerEntries) {
+    if (compiled.plannerGen === plannerRegistry.generation) {
+      for (const idx of compiled.plannerEntries) {
+        const e = plannerRegistry.entries[idx];
+        e.owners.delete(compiled);
+        if (e.owners.size === 0) {
+          if (e.buffer) {
+            pinnedBufferSet.delete(e.buffer);
+            // DEFERRED destruction, never immediate: teardown fires MID-STEP
+            // (staleness gates, eviction) while the step encoder holds
+            // encoded passes binding these buffers.
+            bufferPool.deferredDestroy(
+              e.buffer,
+              (e.buffer as { size?: number }).size ?? 0,
+            );
+            e.buffer = undefined;
+          }
+          plannerRegistry.relist(idx);
+        }
+      }
+    }
+    compiled.plannerEntries = undefined;
     compiled.plannerAssignment = undefined;
-    compiled.plannerBufferBytes = undefined;
+    compiled.plannerGen = undefined;
+  }
+  if (!compiled.adoptedBuffers) {
     return;
   }
-  compiled.adoptedBuffers ??= [];
   for (const buf of compiled.adoptedBuffers) {
     const rc = adoptedRefCount.get(buf);
     if (rc !== undefined && rc > 1) {
@@ -662,18 +724,6 @@ export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
   }
   compiled.adoptedBuffers = undefined;
   compiled.allocBuffers = undefined;
-  // Planner buffers are plan-owned, fence-gated destruction like everything.
-  if (compiled.plannerBuffers) {
-    for (const pbuf of compiled.plannerBuffers) {
-      if (pbuf) {
-        pinnedBufferSet.delete(pbuf);
-        bufferPool.deferredDestroy(pbuf, (pbuf as { size?: number }).size ?? 0);
-      }
-    }
-    compiled.plannerBuffers = undefined;
-  }
-  compiled.plannerAssignment = undefined;
-  compiled.plannerBufferBytes = undefined;
 }
 
 // ============================================================================
@@ -1072,6 +1122,8 @@ export async function executeCompiledPlan(
   let plannedSeen: Set<GPUBuffer> | null = null;
   let plannedBindCount = 0;
   let plannedFallbackCount = 0;
+  /** Lazily evaluated once per replay: registry reset since build? */
+  let plannerGenStale: boolean | undefined;
 
   if (ENV.TORCHLETTE_DEBUG_COMPILED) {
     console.log(
@@ -1152,39 +1204,60 @@ export async function executeCompiledPlan(
           for (let j = 0; j < cmd.inputSlots.length; j++) {
             inputBufs.push(slots[cmd.inputSlots[j]]);
           }
-          // Stage-4 planner path: bind the plan-owned planner buffer for
-          // this slot (materialized lazily, destroyed at plan teardown).
-          // No liveness/aliasing checks needed at replay: the assignment is
-          // audited at build (no overlapping lifetimes share a buffer) and
-          // planner buffers are fresh allocations no other owner can hold.
+          // Stage-4 planner path: bind the registry entry's shared buffer
+          // for this slot (materialized lazily, destroyed when the entry's
+          // last co-owning plan is torn down). No liveness/aliasing checks
+          // needed at replay: the per-plan assignment is audited at build
+          // (no overlapping lifetimes share an entry), cross-plan sharing
+          // covers only intra-plan-dead temps (safe under the strictly
+          // sequential plan execution within a step, in any order), and
+          // result entries are exclusive to their plan.
           if (compiled.plannerAssignment) {
-            const bufIdx = compiled.plannerAssignment.get(cmd.slot);
-            if (bufIdx !== undefined) {
-              compiled.plannerBuffers ??= new Array(
-                compiled.plannerBufferBytes!.length,
-              );
-              let pbuf = compiled.plannerBuffers[bufIdx];
+            if (plannerGenStale === undefined) {
+              plannerGenStale =
+                compiled.plannerGen !== plannerRegistry.generation;
+              if (plannerGenStale) {
+                // Registry was reset under this plan (engine-instance
+                // boundary): entry indices are meaningless. Fall back to
+                // dynamic allocation for the whole replay and re-record.
+                console.warn(
+                  "[compiled-plan] planner registry generation changed — dynamic-alloc fallback this step; invalidating plan for re-record",
+                );
+                compiled.valid = false;
+              }
+            }
+            const entryIdx = plannerGenStale
+              ? undefined
+              : compiled.plannerAssignment.get(cmd.slot);
+            if (entryIdx !== undefined) {
+              const entry = plannerRegistry.entries[entryIdx];
+              let pbuf = entry.buffer;
               if (!pbuf) {
                 pbuf = device.createBuffer({
-                  size: compiled.plannerBufferBytes![bufIdx],
+                  size: entry.bytes,
                   usage:
                     GPUBufferUsage.STORAGE |
                     GPUBufferUsage.COPY_SRC |
                     GPUBufferUsage.COPY_DST,
                 });
-                gpuMemoryTracker.trackAllocation(
-                  pbuf,
-                  compiled.plannerBufferBytes![bufIdx],
-                );
-                compiled.plannerBuffers[bufIdx] = pbuf;
+                gpuMemoryTracker.trackAllocation(pbuf, entry.bytes);
+                entry.buffer = pbuf;
               }
-              // Pin: harvest wraps pinned buffers NON-owning (the plan owns
-              // them; teardown unpins + destroys), and every destroy/release
-              // path skips pinned buffers — result buffers survive until
-              // plan teardown regardless of downstream storage lifecycles.
+              // Pin: harvest wraps pinned buffers NON-owning (the registry
+              // owns them; entry teardown unpins + destroys), and every
+              // destroy/release path skips pinned buffers — result buffers
+              // survive until plan teardown regardless of downstream
+              // storage lifecycles.
               pinnedBufferSet.add(pbuf);
               trackSharedEncoderWrite(pbuf);
               slots[cmd.slot] = pbuf;
+              break;
+            }
+            if (plannerGenStale) {
+              slots[cmd.slot] =
+                cmd.allocKind === 0
+                  ? resolveOutputBuffer(device, cmd.bytes, inputBufs)
+                  : allocateOutputBuffer(cmd.bytes);
               break;
             }
           }
