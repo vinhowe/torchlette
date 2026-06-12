@@ -1,5 +1,7 @@
 import { ENV } from "../core/env";
 import { getBackend } from "../backend/registry";
+import { diffStreams } from "./stream-diff";
+import { generateStream } from "./stream-generate";
 import type {
   AdamStepConfig,
   Backend,
@@ -1693,6 +1695,37 @@ export async function executeLoweredPlan(
       if (compiled.valid) {
         compiled.endCounters = getDispatchSequenceCounters();
         loweredPlan.compiledPlan = compiled;
+      }
+      // Stage-4 phase 2 cross-check (TORCHLETTE_STREAM_GENERATE=1): generate
+      // the command stream from the lowered plan and diff it against the
+      // recording at the command level. Divergence = a generator bug or a
+      // recording gap, surfaced at build time instead of in a loss curve.
+      // Coverage is reported per uncovered op class; plans with uncovered
+      // actions are skipped (record/replay remains their execution source).
+      if (ENV.TORCHLETTE_STREAM_GENERATE === "1" && compiled.valid) {
+        const gen = generateStream(loweredPlan, planNodes);
+        const top = [...gen.uncovered.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 8)
+          .map(([k, v]) => `${k}×${v}`)
+          .join(" ");
+        const recorded = gen.fullyCovered
+          ? compiled.commands
+          : compiled.commands.slice(0, gen.commands.length);
+        const d = diffStreams(gen.commands, recorded);
+        if (!d.equal) {
+          console.warn(
+            `[stream-gen] DIVERGE at cmd ${d.firstDivergence}: generated="${d.a}" recorded="${d.b}" (gen ${d.lengthA} vs rec-${gen.fullyCovered ? "full" : "prefix"} ${d.lengthB} cmds)`,
+          );
+        } else if (gen.fullyCovered) {
+          console.log(
+            `[stream-gen] MATCH ${compiled.commands.length} cmds (${gen.actionCount} actions)`,
+          );
+        } else {
+          console.log(
+            `[stream-gen] MATCH-PREFIX ${gen.commands.length}/${compiled.commands.length} cmds (${gen.coveredActions}/${gen.actionCount} actions; uncovered: ${top})`,
+          );
+        }
       }
       compilationRecording = null;
     }
