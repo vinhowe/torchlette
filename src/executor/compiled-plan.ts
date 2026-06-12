@@ -59,6 +59,9 @@ export interface DispatchCommand {
   tag: 1; // "dispatch"
   pipeline: GPUComputePipeline;
   bindings: Slot[];
+  /** Subrange per binding (null = whole buffer). Present only when some
+   *  binding is a subrange (chunked dispatches over >maxBindingSize tensors). */
+  bindingRanges?: Array<{ offset: number; size: number } | null>;
   gx: number;
   gy: number;
   gz: number;
@@ -185,6 +188,12 @@ export interface CompiledPlan {
   allocBuffers?: (GPUBuffer | undefined)[];
   /** Buffers adopted from the pool by this plan; destroyed on invalidation. */
   adoptedBuffers?: GPUBuffer[];
+  /** Stage-4 memory planner output: alloc-slot → planner buffer index. */
+  plannerAssignment?: Map<number, number>;
+  /** Planner buffer byte sizes; buffers materialize lazily at first replay. */
+  plannerBufferBytes?: number[];
+  /** Materialized planner buffers (plan-owned; destroyed at teardown). */
+  plannerBuffers?: (GPUBuffer | undefined)[];
 }
 
 // ============================================================================
@@ -209,8 +218,8 @@ export interface RecordedDispatch {
   workgroupsX: number;
   workgroupsY: number;
   workgroupsZ: number;
-  /** GPUBuffers referenced by this bind group. */
-  buffers?: GPUBuffer[];
+  /** Bind-group entries (buffer + optional subrange) referenced, in order. */
+  buffers?: CapturedBindEntry[];
   /**
    * Slots resolved at RECORD time (parallel to `buffers`, -1 = unmapped).
    * Slot resolution must be temporal: when the allocator reuses one GPUBuffer
@@ -227,6 +236,7 @@ export interface RecordedDispatch {
 
 import type { LazyIRNode, StorageHandle } from "../graph/types";
 import { getInputStorage } from "./op-dispatch";
+import { planMemory } from "./memory-planner";
 import { isScalarTableBuffer } from "./scalar-table";
 
 /** Recorded buffer copy for compilation. */
@@ -298,9 +308,19 @@ export function buildCompiledPlan(input: {
   // fullstack parity 4e-6/30 steps vs lowered; medium@512 13.8GB peak at
   // compiled speed (~2.6x over lowered liveness, <half default-arena mem).
   const planned = compiledPlannedEnabled();
-  const allocBuffers: (GPUBuffer | undefined)[] | undefined = planned
-    ? []
-    : undefined;
+  // Stage-4 memory planner (OPT-IN: TORCHLETTE_MEMORY_PLANNER=1). Derives
+  // the buffer assignment from slot lifetimes instead of pinning whatever
+  // the recording allocated — deterministic, plan-owned, audited at build.
+  // Validated correctness-equal to the pin mechanism (parity to fp noise,
+  // full ladder green), but packs each plan INDEPENDENTLY: the pin
+  // mechanism shares buffers across plans within a step (forward's dead
+  // activations serve the backward plan via adoption refcounts), so the
+  // planner currently costs ~8% peak on Medium (14.98 vs 13.8GB). Default
+  // flips when cross-plan packing closes that gap (phase 1.5 in
+  // docs/stage4-compile-from-ir.md); the pin mechanism is deleted then.
+  const usePlanner = planned && ENV.TORCHLETTE_MEMORY_PLANNER === "1";
+  const allocBuffers: (GPUBuffer | undefined)[] | undefined =
+    planned && !usePlanner ? [] : undefined;
 
   // Assign a persistent slot at BUILD time for a buffer unmapped at record
   // time (config caches, k-split temps — long-lived singletons, never
@@ -324,22 +344,32 @@ export function buildCompiledPlan(input: {
           continue;
         }
         const bindings: Slot[] = [];
+        let bindingRanges: Array<{ offset: number; size: number } | null> | undefined;
         for (let i = 0; i < d.buffers.length; i++) {
+          const entry = d.buffers[i];
           const recorded = d.slots?.[i] ?? -1;
           if (recorded < 0 && ENV.TORCHLETTE_DEBUG_PERSISTENT) {
-            const had = bufferToSlot.has(d.buffers[i]);
+            const had = bufferToSlot.has(entry.buffer);
             if (!had) {
               console.log(
-                `[persistent-slot] NEW slot ${slotSources.length} buf=${dbgBufId(d.buffers[i])} for unmapped buffer: dispatch label=${d.label ?? "?"} bindingIdx=${i} size=${(d.buffers[i] as { size?: number }).size ?? "?"}`,
+                `[persistent-slot] NEW slot ${slotSources.length} buf=${dbgBufId(entry.buffer)} for unmapped buffer: dispatch label=${d.label ?? "?"} bindingIdx=${i} size=${(entry.buffer as { size?: number }).size ?? "?"}`,
               );
             }
           }
-          bindings.push(recorded >= 0 ? recorded : persistentSlot(d.buffers[i]));
+          bindings.push(recorded >= 0 ? recorded : persistentSlot(entry.buffer));
+          if (entry.offset !== undefined || entry.size !== undefined) {
+            bindingRanges ??= new Array(d.buffers.length).fill(null);
+            bindingRanges[i] = {
+              offset: entry.offset ?? 0,
+              size: entry.size ?? 0,
+            };
+          }
         }
         commands.push({
           tag: TAG_DISPATCH,
           pipeline: d.pipeline,
           bindings,
+          bindingRanges,
           gx: d.workgroupsX,
           gy: d.workgroupsY,
           gz: d.workgroupsZ,
@@ -510,6 +540,24 @@ export function buildCompiledPlan(input: {
     );
   }
 
+  // Stage-4 memory planner: derive the alloc-slot buffer assignment from
+  // lifetimes over the final command stream. Throws on structural overlap
+  // (always-on audit) — a planner bug becomes a build failure, not a replay
+  // corruption.
+  let plannerAssignment: Map<number, number> | undefined;
+  let plannerBufferBytes: number[] | undefined;
+  if (usePlanner) {
+    const resultSlots = new Set<number>(nodeResults.map((r) => r.slot));
+    const memPlan = planMemory(commands, resultSlots);
+    plannerAssignment = memPlan.assignment;
+    plannerBufferBytes = memPlan.bufferBytes;
+    if (ENV.TORCHLETTE_DEBUG_COMPILED) {
+      console.log(
+        `[memory-planner] ${memPlan.assignment.size} alloc slots → ${memPlan.bufferBytes.length} buffers, ${(memPlan.totalBytes / 1e6).toFixed(1)}MB planned`,
+      );
+    }
+  }
+
   return {
     commands,
     slots: slotSources,
@@ -517,6 +565,8 @@ export function buildCompiledPlan(input: {
     valid: true,
     allocBuffers,
     adoptedBuffers,
+    plannerAssignment,
+    plannerBufferBytes,
   };
 }
 
@@ -581,7 +631,12 @@ export function dbgIsDestroyed(buf: GPUBuffer): boolean {
  * are destroyed immediately.
  */
 export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
-  if (!compiled.adoptedBuffers) return;
+  if (!compiled.adoptedBuffers && !compiled.plannerBuffers) {
+    compiled.plannerAssignment = undefined;
+    compiled.plannerBufferBytes = undefined;
+    return;
+  }
+  compiled.adoptedBuffers ??= [];
   for (const buf of compiled.adoptedBuffers) {
     const rc = adoptedRefCount.get(buf);
     if (rc !== undefined && rc > 1) {
@@ -607,6 +662,18 @@ export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
   }
   compiled.adoptedBuffers = undefined;
   compiled.allocBuffers = undefined;
+  // Planner buffers are plan-owned, fence-gated destruction like everything.
+  if (compiled.plannerBuffers) {
+    for (const pbuf of compiled.plannerBuffers) {
+      if (pbuf) {
+        pinnedBufferSet.delete(pbuf);
+        bufferPool.deferredDestroy(pbuf, (pbuf as { size?: number }).size ?? 0);
+      }
+    }
+    compiled.plannerBuffers = undefined;
+  }
+  compiled.plannerAssignment = undefined;
+  compiled.plannerBufferBytes = undefined;
 }
 
 // ============================================================================
@@ -738,16 +805,41 @@ export function getSlot(buffer: GPUBuffer): Slot | undefined {
 // dispatchComputePass to populate dispatch recordings with buffer lists.
 // ============================================================================
 
-/** Last bind group's buffer list — captured during compilation recording. */
-let lastBindGroupBuffers: GPUBuffer[] | null = null;
+/** A captured bind-group entry: buffer plus optional SUB-RANGE. Chunked
+ *  dispatches (embedding-grad where/cast over >maxStorageBufferBindingSize
+ *  tensors, chunked adam) bind buffer subranges; recording only the flat
+ *  buffer list loses the offsets — invisible while replays reuse the
+ *  recorded bind-group OBJECT (pinned buffers match), fatal the moment a
+ *  replay must REBUILD bind groups against different buffers (the stage-4
+ *  memory planner assigns fresh ones). */
+export interface CapturedBindEntry {
+  buffer: GPUBuffer;
+  offset?: number;
+  size?: number;
+}
+
+/** Last bind group's entry list — captured during compilation recording. */
+let lastBindGroupBuffers: CapturedBindEntry[] | null = null;
 
 /** Set the last bind group's buffer list. Called from bind-group-cache.ts. */
-export function setLastBindGroupBuffers(bufs: GPUBuffer[] | null): void {
-  lastBindGroupBuffers = bufs;
+export function setLastBindGroupBuffers(
+  bufs: GPUBuffer[] | CapturedBindEntry[] | null,
+): void {
+  if (bufs === null) {
+    lastBindGroupBuffers = null;
+    return;
+  }
+  lastBindGroupBuffers = (bufs as Array<GPUBuffer | CapturedBindEntry>).map(
+    (b) => (b && typeof b === "object" && "buffer" in (b as object)
+      ? (b as CapturedBindEntry)
+      : { buffer: b as GPUBuffer }),
+  );
 }
 
 /** Get and clear the last bind group's buffer list. Called from dispatch.ts. */
-export function getAndClearLastBindGroupBuffers(): GPUBuffer[] | undefined {
+export function getAndClearLastBindGroupBuffers():
+  | CapturedBindEntry[]
+  | undefined {
   const bufs = lastBindGroupBuffers ?? undefined;
   lastBindGroupBuffers = null;
   return bufs;
@@ -768,7 +860,7 @@ export function recordDispatch(dispatch: RecordedDispatch): void {
   if (dispatch.buffers && activeBufferToSlot) {
     const slots = new Array<number>(dispatch.buffers.length);
     for (let i = 0; i < dispatch.buffers.length; i++) {
-      slots[i] = activeBufferToSlot.get(dispatch.buffers[i]) ?? -1;
+      slots[i] = activeBufferToSlot.get(dispatch.buffers[i].buffer) ?? -1;
     }
     dispatch.slots = slots;
   }
@@ -1060,6 +1152,42 @@ export async function executeCompiledPlan(
           for (let j = 0; j < cmd.inputSlots.length; j++) {
             inputBufs.push(slots[cmd.inputSlots[j]]);
           }
+          // Stage-4 planner path: bind the plan-owned planner buffer for
+          // this slot (materialized lazily, destroyed at plan teardown).
+          // No liveness/aliasing checks needed at replay: the assignment is
+          // audited at build (no overlapping lifetimes share a buffer) and
+          // planner buffers are fresh allocations no other owner can hold.
+          if (compiled.plannerAssignment) {
+            const bufIdx = compiled.plannerAssignment.get(cmd.slot);
+            if (bufIdx !== undefined) {
+              compiled.plannerBuffers ??= new Array(
+                compiled.plannerBufferBytes!.length,
+              );
+              let pbuf = compiled.plannerBuffers[bufIdx];
+              if (!pbuf) {
+                pbuf = device.createBuffer({
+                  size: compiled.plannerBufferBytes![bufIdx],
+                  usage:
+                    GPUBufferUsage.STORAGE |
+                    GPUBufferUsage.COPY_SRC |
+                    GPUBufferUsage.COPY_DST,
+                });
+                gpuMemoryTracker.trackAllocation(
+                  pbuf,
+                  compiled.plannerBufferBytes![bufIdx],
+                );
+                compiled.plannerBuffers[bufIdx] = pbuf;
+              }
+              // Pin: harvest wraps pinned buffers NON-owning (the plan owns
+              // them; teardown unpins + destroys), and every destroy/release
+              // path skips pinned buffers — result buffers survive until
+              // plan teardown regardless of downstream storage lifecycles.
+              pinnedBufferSet.add(pbuf);
+              trackSharedEncoderWrite(pbuf);
+              slots[cmd.slot] = pbuf;
+              break;
+            }
+          }
           // Planned-buffer path: bind the recorded buffer for this lifetime.
           // Safety: (1) first use this replay must not be owned by a live
           // tensor (a kept/user tensor would be clobbered — same check the
@@ -1170,10 +1298,16 @@ export async function executeCompiledPlan(
           if (!bg) {
             const entries: Array<{
               binding: number;
-              resource: { buffer: GPUBuffer };
+              resource: { buffer: GPUBuffer; offset?: number; size?: number };
             }> = [];
             for (let j = 0; j < bufs.length; j++) {
-              entries.push({ binding: j, resource: { buffer: bufs[j] } });
+              const range = cmd.bindingRanges?.[j];
+              entries.push({
+                binding: j,
+                resource: range
+                  ? { buffer: bufs[j], offset: range.offset, size: range.size || undefined }
+                  : { buffer: bufs[j] },
+              });
             }
             bg = profiledCreateBindGroup(device, {
               layout: cmd.pipeline.getBindGroupLayout(0),

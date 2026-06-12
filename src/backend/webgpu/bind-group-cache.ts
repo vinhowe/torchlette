@@ -286,12 +286,14 @@ export function profiledCreateBindGroup(
   );
   // When recording, capture buffer references from the descriptor for compilation
   if (isCompilationRecordingActive() && descriptor.entries) {
-    const bufs: GPUBuffer[] = [];
+    const entries: Array<{ buffer: GPUBuffer; offset?: number; size?: number }> = [];
     for (const e of descriptor.entries) {
       const r = e.resource;
-      if (r && typeof r === "object" && "buffer" in r) bufs.push(r.buffer);
+      if (r && typeof r === "object" && "buffer" in r) {
+        entries.push({ buffer: r.buffer, offset: r.offset, size: r.size });
+      }
     }
-    setLastBindGroupBuffers(bufs);
+    setLastBindGroupBuffers(entries);
   }
   return bg;
 }
