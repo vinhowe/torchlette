@@ -215,16 +215,21 @@ export class Adam {
     // 2.5GB current — the program is fine, the memory policy isn't). Flip
     // the default once bounded-memory compiled execution lands
     // (docs/architecture-debt.md, planned compiled buffers).
+    let updated: Tensor[];
     if (this.hasFusedKernel() && ENV.TORCHLETTE_FUSED_ADAM !== "0") {
-      return this._stepFused(runtime);
-    }
-    if (
+      updated = this._stepFused(runtime);
+    } else if (
       ENV.TORCHLETTE_FOREACH_ADAM !== "0" &&
       this.params.length > 1
     ) {
-      return this._stepForeach(runtime);
+      updated = this._stepForeach(runtime);
+    } else {
+      updated = this._stepElementwise(runtime);
     }
-    return this._stepElementwise(runtime);
+    // Implied step boundary (minimal training loops): commits at the next
+    // backward() or explicit markStep(). See Torchlette.queueStepBoundary.
+    this.api.queueStepBoundary();
+    return updated;
   }
 
   /**
@@ -610,6 +615,7 @@ export class Adam {
       await runtime.force(param._unwrap());
       updated.push(param);
     }
+    this.api.queueStepBoundary();
     return updated;
   }
 

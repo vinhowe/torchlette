@@ -17,6 +17,7 @@ const GPU_TEST_FILES = [
   "test/distilgpt2-finetune.spec.ts",
   "test/distilgpt2-full-finetuning.spec.ts",
   "test/frontend-dtype.spec.ts",
+  "test/implied-step-boundary.spec.ts",
   "test/memory-aware-scheduler.spec.ts",
   "test/optim/grad-scaler.spec.ts",
   "test/optim/fused-vs-elementwise.spec.ts",

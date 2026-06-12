@@ -34,6 +34,19 @@ class StorageTracker {
    *  ensures persistence survives storage replacement (e.g., Adam m/v updates). */
   private _stepStartTensors: WeakSet<object> | null = null;
 
+  /** Implied-step-boundary generation (see Torchlette.queueStepBoundary).
+   *  Bumped when an optimizer queues a step boundary; each owning TENSOR
+   *  OBJECT is stamped with the generation current when it is first seen.
+   *  Gen-scoped cleanup uses the stamps to separate "this step's tensors"
+   *  from work the NEXT step has already lazily built by the time the
+   *  boundary commits. The stamp is wrapper-level, like persistence itself:
+   *  a persistent tensor's STORAGE can be replaced mid-step (fused Adam's
+   *  m/v side outputs re-point the wrapper every step), so a storage-level
+   *  stamp would mis-classify long-lived state as next-step work and demote
+   *  it — live optimizer state corrupted, the persistence-UAF class. */
+  private _stepGen = 0;
+  private _wrapperGen = new WeakMap<object, number>();
+
   /** Debug counters */
   private _debugDestroyCount = 0;
 
@@ -48,6 +61,16 @@ class StorageTracker {
    */
   trackTensor(storageId: number, tensorRef: object): void {
     this.tensorWeakRefs.set(storageId, new WeakRef(tensorRef));
+    if (!this._wrapperGen.has(tensorRef)) {
+      this._wrapperGen.set(tensorRef, this._stepGen);
+    }
+  }
+
+  /** Advance the step generation (called when a step boundary is queued).
+   *  Returns the generation that closes: storages stamped <= this value
+   *  belong to the step being ended. */
+  bumpStepGen(): number {
+    return this._stepGen++;
   }
 
   /** Unregister a storage (after it's been destroyed or early-released). */
@@ -146,11 +169,18 @@ class StorageTracker {
    * (model params, optimizer state). Tensors created during the step are
    * step-scoped temporaries and will have their refs released at markStep.
    */
-  snapshotForStep(): void {
+  snapshotForStep(maxGen?: number): void {
     this._stepStartTensors = new WeakSet();
     for (const [, ref] of this.tensorWeakRefs) {
       const target = ref.deref();
-      if (target) this._stepStartTensors.add(target);
+      if (!target) continue;
+      // Gen-scoped snapshot (implied boundaries): tensors created AFTER the
+      // boundary belong to the next step's lazily-built work — treating
+      // them as persistent would exempt them from cleanup forever.
+      if (maxGen !== undefined && (this._wrapperGen.get(target) ?? 0) > maxGen) {
+        continue;
+      }
+      this._stepStartTensors.add(target);
     }
   }
 
@@ -186,11 +216,20 @@ class StorageTracker {
    * m/v via _updateLazyRef) stay alive because the tensor OBJECT is in
    * the snapshot, even if the storage id is new.
    */
-  releaseStepTemps(): number {
+  releaseStepTemps(maxGen?: number): number {
     if (!this._stepStartTensors) return 0;
     let released = 0;
     for (const [id, ref] of this.tensorWeakRefs) {
       const target = ref.deref();
+      // Gen-scoped release (implied boundaries): tensors created after the
+      // boundary are the NEXT step's — they get their own boundary.
+      if (
+        maxGen !== undefined &&
+        target !== undefined &&
+        (this._wrapperGen.get(target) ?? 0) > maxGen
+      ) {
+        continue;
+      }
       // GC'd tensor: skip (will be handled by FR or gc scan in destroyUnreachable)
       if (target === undefined) continue;
       // Persistent tensor: skip

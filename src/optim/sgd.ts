@@ -156,6 +156,9 @@ export class SGD {
       runtime.copy_(param._unwrap(), next);
       updated.push(param);
     }
+    // Implied step boundary (minimal training loops): commits at the next
+    // backward() or explicit markStep(). See Torchlette.queueStepBoundary.
+    this.api.queueStepBoundary();
     return updated;
   }
 

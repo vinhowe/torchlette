@@ -1297,6 +1297,13 @@ export class Torchlette {
   // ============================================================================
 
   async backward(a: Tensor, grad?: Tensor): Promise<void> {
+    // A queued implied step boundary (optimizer.step() with no explicit
+    // markStep) commits here: backward is the first point in the NEXT
+    // iteration that is async, always present in a training loop, and
+    // early enough to keep memory flat. The previous step's residue is
+    // forced and its temporaries demoted before the new backward runs;
+    // gen-scoping protects this iteration's already-built forward graph.
+    await this._commitPendingStepBoundary();
     return backwardImpl(this, a, grad);
   }
 
@@ -1578,7 +1585,74 @@ export class Torchlette {
     }
   }
 
+  /**
+   * Queue an IMPLIED step boundary (the minimal-training-loop API).
+   * Called by optimizer step() implementations — built-ins do this
+   * automatically; custom optimizers should call it at the end of their
+   * step(). The boundary is DEFERRED: it commits at the next backward()
+   * (or explicit markStep()/beginStep()), so reading loss.item() after
+   * optimizer.step() still works, and multiple optimizers stepping
+   * back-to-back share one boundary (each bump supersedes the last —
+   * everything up to the final step() is one step's work).
+   *
+   * With this, a training loop needs NO beginStep/endStep/markStep:
+   *   forward → backward → optimizer.step()  — cleanup is automatic.
+   */
+  queueStepBoundary(): void {
+    this._pendingStepBoundary = storageTracker.bumpStepGen();
+  }
+
+  /** Pending implied boundary: the generation that closes when it commits. */
+  private _pendingStepBoundary: number | null = null;
+
+  /** Commit a queued implied step boundary: force the closing step's
+   *  residue (optimizer update chains), demote its temporaries (gen-scoped
+   *  — work the next iteration already built lazily is untouched), fence,
+   *  and snapshot persistents for the new step. Mirrors the explicit
+   *  endStep(); markStep(); beginStep() sequence. */
+  private async _commitPendingStepBoundary(): Promise<void> {
+    if (this._pendingStepBoundary === null) return;
+    const gen = this._pendingStepBoundary;
+    this._pendingStepBoundary = null;
+    this.runtime.endStep();
+    try {
+      await awaitDeferredFence();
+    } catch {
+      // CPU-only usage: no WebGPU fence to await.
+    }
+    await this.runtime.markStep();
+    await this.runtime.forceAllPending();
+    // QUIESCE BEFORE DESTROYING — order differs from explicit markStep
+    // deliberately. The force above may encode passes for the closing
+    // step's optimizer chain; a fence issued AFTER the demotion sweep
+    // executes the sweep's deferred destroys while those passes can still
+    // be pending — "used in submit while destroyed", the silent-corruption
+    // class (whole submit rejected, outputs frozen). Fencing first means
+    // everything the sweep destroys is past its last GPU use, and the
+    // deferred destruction fires at some far-future fence, long after
+    // submission.
+    try {
+      issueDeferredFence();
+      await awaitDeferredFence();
+    } catch {
+      // CPU-only usage.
+    }
+    storageTracker.destroyUnreachable();
+    storageTracker.releaseStepTemps(gen);
+    storageTracker.destroyUnreachable();
+    this.runtime.resetCumulativeFusionStats();
+    // beginStep equivalent: residue is already forced above; snapshot the
+    // persistents (gen-scoped: the next iteration's lazily-built tensors
+    // must NOT be classified persistent or they'd never be cleaned up).
+    storageTracker.snapshotForStep(gen);
+    await this.runtime.beginStep();
+  }
+
   async markStep(): Promise<void> {
+    // An explicit markStep IS the step boundary — supersede any queued
+    // implied one (full, un-scoped cleanup: everything created since the
+    // snapshot is this step's, exactly the pre-existing semantics).
+    this._pendingStepBoundary = null;
     // Step 0: If there's a deferred fence from the previous markStep, await it now.
     try {
       await awaitDeferredFence();
@@ -1621,6 +1695,11 @@ export class Torchlette {
   }
 
   async beginStep(): Promise<void> {
+    // Mixed explicit/implied usage: a queued boundary must close the old
+    // step before a new one begins.
+    if (this._pendingStepBoundary !== null) {
+      await this.markStep();
+    }
     // Force any unmaterialized tensors (e.g., model weights from init) so their
     // storages exist before the snapshot. Without this, lazy model-init tensors
     // would materialize during the step and be treated as step-scoped.
