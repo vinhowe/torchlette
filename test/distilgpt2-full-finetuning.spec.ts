@@ -63,7 +63,7 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
         resetBaseIdCounter();
 
         const api = new Torchlette("webgpu", {
-          enableFusion: false, // Disabled due to reshape issues with fusion
+          enableFusion: true, // Re-enabled 2026-06-12: the historical reshape issue is fixed; parity pinned by test/checkpoint-autocast-parity.spec.ts
           enableMemoryPlanning: true,
         });
         const model = new GPT2(api, TEST_CONFIG, { device: "webgpu" });
@@ -83,10 +83,13 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
         const input = api.tensorFromArray(inputData, [batchSize, seqLen]);
         const target = api.tensorFromArray(targetData, [batchSize, seqLen]);
 
-        // Forward with checkpoint (autocast disabled due to known reshape issue)
-        const result = model.forwardWithLoss(input, target, {
-          useCheckpoint: true,
-        });
+        // Forward with checkpoint + autocast (historical "reshape issue"
+        // fixed; the combination is pinned by checkpoint-autocast-parity.spec.ts)
+        const result = api.autocast(() =>
+          model.forwardWithLoss(input, target, {
+            useCheckpoint: true,
+          }),
+        );
 
         expect(result.loss).not.toBeNull();
         await result.loss?.backward();
@@ -188,7 +191,7 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
         resetBaseIdCounter();
 
         const api = new Torchlette("webgpu", {
-          enableFusion: false, // Disabled due to reshape issues with fusion
+          enableFusion: true, // Re-enabled 2026-06-12: the historical reshape issue is fixed; parity pinned by test/checkpoint-autocast-parity.spec.ts
           enableMemoryPlanning: true,
         });
         const model = new GPT2(api, TEST_CONFIG, { device: "webgpu" });
@@ -219,10 +222,13 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
           const input = api.tensorFromArray(inputData, [batchSize, seqLen]);
           const target = api.tensorFromArray(targetData, [batchSize, seqLen]);
 
-          // Forward with checkpoint (autocast disabled due to known reshape issue)
-          const result = model.forwardWithLoss(input, target, {
-            useCheckpoint: true,
-          });
+          // Forward with checkpoint + autocast (historical "reshape issue"
+          // fixed; pinned by checkpoint-autocast-parity.spec.ts)
+          const result = api.autocast(() =>
+            model.forwardWithLoss(input, target, {
+              useCheckpoint: true,
+            }),
+          );
 
           if (!result.loss) throw new Error("Loss is null");
           const lossVal = await result.loss.item();
@@ -264,7 +270,7 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
         resetBaseIdCounter();
 
         const api = new Torchlette("webgpu", {
-          enableFusion: false, // Disabled due to reshape issues with fusion
+          enableFusion: true, // Re-enabled 2026-06-12: the historical reshape issue is fixed; parity pinned by test/checkpoint-autocast-parity.spec.ts
           enableMemoryPlanning: true,
         });
         const model = new GPT2(api, TEST_CONFIG, { device: "webgpu" });
@@ -294,10 +300,13 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
           const input = api.tensorFromArray(inputData, [2, 16]);
           const target = api.tensorFromArray(targetData, [2, 16]);
 
-          // Forward with checkpoint (autocast disabled due to known reshape issue)
-          const result = model.forwardWithLoss(input, target, {
-            useCheckpoint: true,
-          });
+          // Forward with checkpoint + autocast (historical "reshape issue"
+          // fixed; pinned by checkpoint-autocast-parity.spec.ts)
+          const result = api.autocast(() =>
+            model.forwardWithLoss(input, target, {
+              useCheckpoint: true,
+            }),
+          );
 
           if (!result.loss) throw new Error("Loss is null");
           const lossVal = await result.loss.item();
@@ -350,7 +359,7 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
         storageTracker.reset();
 
         const api = new Torchlette("webgpu", {
-          enableFusion: false, // Disabled due to reshape issues with fusion
+          enableFusion: true, // Re-enabled 2026-06-12: the historical reshape issue is fixed; parity pinned by test/checkpoint-autocast-parity.spec.ts
           enableMemoryPlanning: true,
         });
         const model = new GPT2(api, TEST_CONFIG, { device: "webgpu" });
@@ -493,7 +502,7 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
         resetBaseIdCounter();
 
         const api = new Torchlette("webgpu", {
-          enableFusion: false, // Disabled due to reshape issues with fusion
+          enableFusion: true, // Re-enabled 2026-06-12: the historical reshape issue is fixed; parity pinned by test/checkpoint-autocast-parity.spec.ts
           enableMemoryPlanning: true,
         });
         const model = new GPT2(api, TEST_CONFIG, { device: "webgpu" });
@@ -512,10 +521,13 @@ describe("DistilGPT2 Full Finetuning Verification", () => {
         const input = api.tensorFromArray(inputData, [2, 16]);
         const target = api.tensorFromArray(targetData, [2, 16]);
 
-        // Forward with checkpoint + GradScaler (autocast disabled due to known reshape issue)
-        const result = model.forwardWithLoss(input, target, {
-          useCheckpoint: true,
-        });
+        // Forward with checkpoint + GradScaler + autocast (historical
+        // "reshape issue" fixed; pinned by checkpoint-autocast-parity.spec.ts)
+        const result = api.autocast(() =>
+          model.forwardWithLoss(input, target, {
+            useCheckpoint: true,
+          }),
+        );
 
         expect(result.loss).not.toBeNull();
         if (!result.loss) throw new Error("Loss is null");

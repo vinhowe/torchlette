@@ -9,6 +9,7 @@ const GPU_TEST_FILES = [
   "test/amp-speed-verification.spec.ts",
   "test/batch-execution-test.spec.ts",
   "test/checkpoint-early-release.spec.ts",
+  "test/checkpoint-autocast-parity.spec.ts",
   "test/checkpoint-memory-profile.spec.ts",
   "test/checkpoint-scale-analysis.spec.ts",
   "test/checkpoint-segmentation.spec.ts",

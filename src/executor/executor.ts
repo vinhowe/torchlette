@@ -331,6 +331,24 @@ export function getFusionAnalysisTemplate(
  *   buffers even if they appear "live" (the liveness state is stale
  *   between sessions and refusing to destroy leaks ~20 MiB per session).
  */
+/**
+ * Drop EVERY cached template — arenas, compiled plans, scalar tables, the
+ * lot. Called by the RuntimeEngine constructor: the template cache is
+ * module-global, and a NEW engine instance reusing templates lowered by a
+ * previous instance is the cross-instance interference class — fingerprints
+ * collide (tests reset node-ID counters; structurally identical models
+ * collide regardless), but the cached lowered plan's node rewrites and
+ * recorded buffers belong to the dead instance ("Input not ready:
+ * transpose" in the second instance of a test file; the differential
+ * harness went one-engine-per-process for the same reason). Instance
+ * boundaries must be cache boundaries. Warm-start within ONE engine across
+ * steps/sessions is unaffected.
+ */
+export function clearTemplateCacheForNewEngine(): void {
+  evictAllArenas(false);
+  fusionAnalysisCache.clear();
+}
+
 export function evictAllArenas(force = false): void {
   // Import is at top of file — destroyArena is already available
   for (const [, template] of fusionAnalysisCache) {

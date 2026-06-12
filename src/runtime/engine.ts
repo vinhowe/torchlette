@@ -30,6 +30,7 @@ import {
   contiguousStrides,
 } from "../core/shape";
 import {
+  clearTemplateCacheForNewEngine,
   executePlanOptimized,
   type OptimizedExecutionStats,
 } from "../executor/executor";
@@ -418,6 +419,11 @@ export class RuntimeEngine {
   private _memoryStatsProvider: MemoryStatsProvider | null = null;
 
   constructor(backendName?: DeviceKind, options?: RuntimeEngineOptions) {
+    // A fresh engine must not inherit another instance's lowered templates
+    // (module-global cache; cross-instance reuse replays node rewrites and
+    // recorded state belonging to the previous engine). See
+    // clearTemplateCacheForNewEngine.
+    clearTemplateCacheForNewEngine();
     if (backendName) {
       this.defaultDevice = backendName;
     }
