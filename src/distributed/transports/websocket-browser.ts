@@ -31,38 +31,11 @@ interface Envelope {
   target: SendTarget;
   msg: ProtocolMessage;
   tensorShapes?: number[][];
+  /** Payload element encoding. Absent = f32 (back-compat). */
+  wireDtype?: import("../wire-codec").WireDtype;
 }
 
 const FOUR = 4;
-
-function concatFloat32(arrays: Float32Array[]): ArrayBuffer {
-  let total = 0;
-  for (const a of arrays) total += a.byteLength;
-  const out = new Uint8Array(total);
-  let pos = 0;
-  for (const a of arrays) {
-    out.set(
-      new Uint8Array(a.buffer, a.byteOffset, a.byteLength),
-      pos,
-    );
-    pos += a.byteLength;
-  }
-  return out.buffer;
-}
-
-function splitFloat32(buf: ArrayBuffer, shapes: number[][]): Float32Array[] {
-  const out: Float32Array[] = [];
-  let pos = 0;
-  for (const shape of shapes) {
-    const n = shape.reduce((a, b) => a * b, 1);
-    const bytes = n * 4;
-    const arr = new Float32Array(n);
-    new Uint8Array(arr.buffer).set(new Uint8Array(buf, pos, bytes));
-    out.push(arr);
-    pos += bytes;
-  }
-  return out;
-}
 
 function takeTensorPayload(
   msg: ProtocolMessage,
@@ -344,9 +317,9 @@ export class WebSocketBrowserTransport implements Transport {
         return null;
       }
       if (!envelope) return null;
-      const payload = buf.slice(FOUR + envLen);
+      const payload = new Uint8Array(buf, FOUR + envLen);
       const tensors = envelope.tensorShapes
-        ? splitFloat32(payload, envelope.tensorShapes)
+        ? decodeTensors(payload, envelope.tensorShapes, envelope.wireDtype ?? "f32")
         : [];
       return {
         kind: "protocol",
@@ -381,18 +354,20 @@ export class WebSocketBrowserTransport implements Transport {
     }
     const taken = takeTensorPayload(message);
     if (taken) {
+      const wireDtype = defaultWireDtype();
       const envelope: Envelope = {
         from: this.peerId,
         target,
         msg: taken.stripped,
         tensorShapes: taken.tensors.map((a) => [a.length]),
+        wireDtype,
       };
       const envBytes = textEncoder.encode(JSON.stringify(envelope));
-      const payload = concatFloat32(taken.tensors);
+      const payload = encodeTensors(taken.tensors, wireDtype);
       const out = new Uint8Array(FOUR + envBytes.byteLength + payload.byteLength);
       new DataView(out.buffer).setUint32(0, envBytes.byteLength, true);
       out.set(envBytes, FOUR);
-      out.set(new Uint8Array(payload), FOUR + envBytes.byteLength);
+      out.set(payload, FOUR + envBytes.byteLength);
       this.ws.send(out.buffer);
     } else {
       const envelope: Envelope = {

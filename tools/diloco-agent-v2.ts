@@ -21,6 +21,7 @@
  *   PEER_ID
  */
 
+import { getGpuUncapturedErrorCount } from "../src/backend/webgpu/gpu-context";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { destroyWebGPU, initWebGPU } from "../src/backend/webgpu";
@@ -250,7 +251,27 @@ async function main(): Promise<void> {
     log(`Checkpoint saved (${tag}): ${ckptPath} (${params.length} tensors)`);
   };
   let ckptInFlight = false;
+  let lastGpuErrors = 0;
   sm.onReport = (r) => {
+    // ZOMBIE-PEER GUARD: a GPU device error means the enclosing submit was
+    // DROPPED — this peer's training silently stopped while its protocol
+    // side kept contributing garbage pseudo-grads to every round (observed:
+    // candlelight peer OOM'd at startup, reported loss=0 for 10 rounds, and
+    // the 2-peer average quietly became a half-weighted solo run). A peer
+    // whose GPU is broken must LEAVE the quorum, not poison it. Exit
+    // non-zero; quorum semantics handle the departure.
+    // TORCHLETTE_GPU_ERRORS_FATAL=0 opts out (debugging only).
+    const gpuErrors = getGpuUncapturedErrorCount();
+    if (
+      gpuErrors > lastGpuErrors &&
+      process.env.TORCHLETTE_GPU_ERRORS_FATAL !== "0"
+    ) {
+      console.error(
+        `FATAL: ${gpuErrors - lastGpuErrors} GPU device error(s) during round ${r.round} — this peer's submits are being dropped; exiting rather than contributing garbage to the quorum.`,
+      );
+      process.exit(1);
+    }
+    lastGpuErrors = gpuErrors;
     const mem = streamMem();
     const pool = streamPool.stats();
     const rss = process.memoryUsage().rss;

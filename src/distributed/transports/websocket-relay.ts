@@ -40,41 +40,17 @@ interface Envelope {
   msg: ProtocolMessage;
   /** Per-tensor shapes for binary-frame payload reconstruction. */
   tensorShapes?: number[][];
+  /** Payload element encoding. Absent = f32 (back-compat). */
+  wireDtype?: import("../wire-codec").WireDtype;
 }
 
 const FOUR = 4;
 
-function concatFloat32Buffers(arrays: Float32Array[]): Buffer {
-  let total = 0;
-  for (const a of arrays) total += a.byteLength;
-  const out = Buffer.alloc(total);
-  let pos = 0;
-  for (const a of arrays) {
-    Buffer.from(a.buffer, a.byteOffset, a.byteLength).copy(out, pos);
-    pos += a.byteLength;
-  }
-  return out;
-}
-
-function splitFloat32Buffers(
-  payload: Buffer,
-  shapes: number[][],
-): Float32Array[] {
-  const out: Float32Array[] = [];
-  let pos = 0;
-  for (const shape of shapes) {
-    const n = shape.reduce((a, b) => a * b, 1);
-    const bytes = n * 4;
-    // Copy into a fresh allocation so the underlying Node buffer can be
-    // garbage-collected independently of the long-lived param tensors.
-    const slice = payload.subarray(pos, pos + bytes);
-    const arr = new Float32Array(n);
-    Buffer.from(arr.buffer).set(slice);
-    out.push(arr);
-    pos += bytes;
-  }
-  return out;
-}
+import {
+  decodeTensors,
+  defaultWireDtype,
+  encodeTensors,
+} from "../wire-codec";
 
 function takeTensorPayload(
   msg: ProtocolMessage,
@@ -391,7 +367,11 @@ export class WebSocketRelayTransport implements Transport {
       if (!envelope) return null;
       const payload = raw.subarray(FOUR + envLen);
       const tensors = envelope.tensorShapes
-        ? splitFloat32Buffers(payload, envelope.tensorShapes)
+        ? decodeTensors(
+            new Uint8Array(payload.buffer, payload.byteOffset, payload.length),
+            envelope.tensorShapes,
+            envelope.wireDtype ?? "f32",
+          )
         : [];
       const restored = restoreTensorPayload(envelope.msg, tensors);
       return { kind: "protocol", value: restored };
@@ -427,16 +407,18 @@ export class WebSocketRelayTransport implements Transport {
     }
     const taken = takeTensorPayload(message);
     if (taken) {
+      const wireDtype = defaultWireDtype();
       const envelope: Envelope = {
         from: this.peerId,
         target,
         msg: taken.stripped,
         tensorShapes: taken.tensors.map((a) => [a.length]),
+        wireDtype,
       };
       const envBytes = Buffer.from(JSON.stringify(envelope), "utf8");
       const lenBuf = Buffer.alloc(FOUR);
       lenBuf.writeUInt32LE(envBytes.length, 0);
-      const payloadBuf = concatFloat32Buffers(taken.tensors);
+      const payloadBuf = Buffer.from(encodeTensors(taken.tensors, wireDtype));
       this.ws.send(Buffer.concat([lenBuf, envBytes, payloadBuf]));
     } else {
       const envelope: Envelope = {

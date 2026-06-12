@@ -193,6 +193,22 @@ wss.on("connection", (ws) => {
       if (text.type !== "register") return;
       peerId =
         text.peerId || "peer-" + Math.random().toString(36).slice(2, 10);
+      // SUPERSEDE duplicate registrations: a second connection claiming an
+      // existing peerId is either a legitimate reconnect (the transport
+      // retries with the same id) or an operator error (two processes
+      // launched with one identity — observed: both submit grads under one
+      // name and the round accounting silently corrupts, loss=0 stats).
+      // Either way the OLD socket must die, loudly.
+      const existing = peers.get(peerId);
+      if (existing) {
+        console.log(
+          `! ${peerId} re-registered — superseding previous connection (reconnect or duplicate launch)`,
+        );
+        try {
+          existing.ws.close(4000, "superseded by new registration");
+        } catch {}
+        peers.delete(peerId);
+      }
       const { clusterId, isHead } = assignCluster();
       const needsSync = peers.size > 0;
       peers.set(peerId, {
