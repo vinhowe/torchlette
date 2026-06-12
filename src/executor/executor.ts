@@ -268,6 +268,52 @@ type CachedSegmentDesc =
  */
 const fusionAnalysisCache = new Map<number, FusionAnalysisTemplate>();
 
+// ---------------------------------------------------------------------------
+// Payload-thrash detector: structural hash → how many DISTINCT full
+// fingerprints were seen for it. A growing count means plans that are
+// structurally identical keep missing the template cache because only
+// PAYLOAD VALUES differ — a per-step-varying payload defeating caching
+// (re-lowering/re-recording every step). The engine reports it; nobody has
+// to predict per-op which payloads change. Fix direction in the warning.
+// ---------------------------------------------------------------------------
+const structuralMissCounts = new Map<number, Set<number>>();
+const structuralWarned = new Set<number>();
+const PAYLOAD_THRASH_THRESHOLD = 4;
+
+function notePayloadThrash(
+  fingerprint: { primary: number; structural: number },
+  planNodes: LazyIRNode[],
+): void {
+  // Count DISTINCT full fingerprints per structural hash: an evicted
+  // template re-missing with the SAME full fingerprint is re-lowering but
+  // not payload thrash. Set growth = new payload variants.
+  let seen = structuralMissCounts.get(fingerprint.structural);
+  if (!seen) {
+    seen = new Set();
+    structuralMissCounts.set(fingerprint.structural, seen);
+  }
+  if (seen.size <= PAYLOAD_THRASH_THRESHOLD) seen.add(fingerprint.primary);
+  const n = seen.size;
+  if (n < PAYLOAD_THRASH_THRESHOLD || structuralWarned.has(fingerprint.structural)) {
+    return;
+  }
+  structuralWarned.add(fingerprint.structural);
+  const payloadOps = [
+    ...new Set(planNodes.filter((nd) => nd.payload).map((nd) => nd.op)),
+  ].join(", ");
+  console.warn(
+    `[template] PAYLOAD THRASH: ${n} structurally-identical plans missed the template cache with differing payload values (payload ops: ${payloadOps}). A per-step-varying op option is defeating caching — every step re-lowers and re-records. Fix: pass the value as a tensor/graph scalar (principled path), or lower the option to graph ops at the runtime seam (see runtime.sub alpha), or declare it volatile in PAYLOAD_HASH_EXEMPT WITH a per-execution delivery mechanism.`,
+  );
+}
+
+/** Test/debug: distinct-payload template misses per structural hash. */
+export function getPayloadThrashStats(): { structures: number; worst: number } {
+  let worst = 0;
+  for (const v of structuralMissCounts.values())
+    if (v.size > worst) worst = v.size;
+  return { structures: structuralMissCounts.size, worst };
+}
+
 /** Get a cached fusion analysis template by fingerprint. */
 export function getFusionAnalysisTemplate(
   fingerprint: number,
@@ -1744,6 +1790,10 @@ export async function executePlanOptimized(
     }
     validatedTemplate = undefined;
     fusionAnalysisCache.delete(fingerprint.primary);
+  }
+
+  if (!validatedTemplate) {
+    notePayloadThrash(fingerprint, plan.nodes);
   }
 
   if (validatedTemplate) {

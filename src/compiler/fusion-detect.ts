@@ -1411,6 +1411,12 @@ export function reorderPlanForFusion(nodes: LazyIRNode[]): LazyIRNode[] {
 export interface PlanFingerprint {
   primary: number;
   secondary: number;
+  /** Payload-FREE structural hash: identical ops/shapes/dtypes/structure
+   *  regardless of payload values. Used by the payload-thrash detector —
+   *  a full-fingerprint MISS whose structural hash HITS means only payload
+   *  values changed, i.e. a per-step-varying payload is defeating template
+   *  caching (the engine tells you; no per-op prediction needed). */
+  structural: number;
 }
 
 export function computePlanFingerprint(
@@ -1423,17 +1429,25 @@ export function computePlanFingerprint(
     idToPos.set(nodes[i].id, i);
   }
 
-  // Two parallel FNV-1a hashes with different seeds for collision avoidance.
+  // Two parallel FNV-1a hashes with different seeds for collision avoidance,
+  // plus a third (h3) that receives everything EXCEPT payload content — the
+  // structural hash for the payload-thrash detector.
   let h1 = 0x811c9dc5; // FNV-1a 32-bit offset basis
   let h2 = 0xcbf29ce4; // alternate seed (FNV-1a 64-bit offset low half)
+  let h3 = 0x811c9dc5;
   const prime1 = 0x01000193;
   const prime2 = 0x01000133;
+  let inPayload = false;
 
   const hashByte = (b: number) => {
     h1 ^= b & 0xff;
     h1 = Math.imul(h1, prime1);
     h2 ^= b & 0xff;
     h2 = Math.imul(h2, prime2);
+    if (!inPayload) {
+      h3 ^= b & 0xff;
+      h3 = Math.imul(h3, prime1);
+    }
   };
   const hashInt = (v: number) => {
     hashByte(v & 0xff);
@@ -1504,12 +1518,14 @@ export function computePlanFingerprint(
     if (node.payload) {
       const exempt = PAYLOAD_HASH_EXEMPT[node.op];
       if (exempt !== "ALL") {
+        inPayload = true;
         hashPayloadValue(node.payload, exempt, hashByte, hashInt, hashStr);
+        inPayload = false;
       }
     }
   }
 
-  return { primary: h1 >>> 0, secondary: h2 >>> 0 };
+  return { primary: h1 >>> 0, secondary: h2 >>> 0, structural: h3 >>> 0 };
 }
 
 /**
