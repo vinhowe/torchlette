@@ -425,6 +425,50 @@ function binaryChunked(
  * Dispatch unary op with full stride support.
  * Handles non-contiguous tensors (transposed, expanded views) directly.
  */
+/** Stage-4 plan/encode split for the DIRECT unary path (see
+ *  planBinaryDirect for the pattern). Returns null where dispatchUnary
+ *  routes to chunked dispatch. */
+export function planUnaryDirect(
+  opKey: string,
+  a: WebGPUTensor,
+): ElementwiseDirectPlan | null {
+  const dtype = a.dtype;
+  const bytesPerElement = dtypeBytes(dtype);
+  const ctx = requireContext();
+  const maxBindingSize =
+    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  if (a.size * bytesPerElement > maxBindingSize) return null;
+  return planUnaryDirectCore(opKey, a, bytesPerElement);
+}
+
+/** Unguarded unary plan core — dispatchUnary's direct tail (post-routing). */
+export function planUnaryDirectCore(
+  opKey: string,
+  a: WebGPUTensor,
+  bytesPerElement: number,
+): ElementwiseDirectPlan {
+  const dtype = a.dtype;
+  const totalWorkgroups = Math.ceil(a.size / WORKGROUP_SIZE);
+  const dispatch = compute2DDispatch(totalWorkgroups);
+  const use2D = dispatch.y > 1;
+  const shader = unaryStridedTileIR(
+    opKey,
+    a.shape,
+    a.strides,
+    a.offset,
+    dtype as "f32" | "f16" | "u32" | "i32",
+  );
+  const key = `unary:${opKey}:${a.shape.join("x")}:${a.strides.join(",")}:${a.offset}:${dtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
+  return {
+    key,
+    shader,
+    outputSizeBytes: a.size * bytesPerElement,
+    paramsData: params(a.size),
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y,
+  };
+}
+
 export function dispatchUnary(
   opKey: string,
   a: WebGPUTensor,
@@ -467,28 +511,18 @@ export function dispatchUnary(
     return createTensor(a.shape, outBuffer, undefined, 0, dtype, ownsBuffer);
   }
 
-  // Direct dispatch
-  const totalWorkgroups = Math.ceil(a.size / WORKGROUP_SIZE);
-  const dispatch = compute2DDispatch(totalWorkgroups);
-  const use2D = dispatch.y > 1;
-  const code = unaryStridedTileIR(
-    opKey,
-    a.shape,
-    a.strides,
-    a.offset,
-    dtype as "f32" | "f16" | "u32" | "i32",
-  );
-  const key = `unary:${opKey}:${a.shape.join("x")}:${a.strides.join(",")}:${a.offset}:${dtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
+  // Direct dispatch — single-sourced with the stream generator.
+  const plan = planUnaryDirectCore(opKey, a, bytesPerElement);
 
   const outBuffer = dispatchElementwise({
-    key,
-    shader: code,
+    key: plan.key,
+    shader: plan.shader,
     inputs: [a.buffer],
-    outputSizeBytes: a.size * bytesPerElement,
-    params: params(a.size),
+    outputSizeBytes: plan.outputSizeBytes,
+    params: plan.paramsData,
     outBuffer: options?.outBuffer,
-    dispatchX: dispatch.x,
-    dispatchY: dispatch.y,
+    dispatchX: plan.dispatchX,
+    dispatchY: plan.dispatchY,
   });
 
   const ownsBuffer = options?.outBuffer === undefined;

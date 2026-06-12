@@ -16,6 +16,7 @@ import { bufferPool, destroyCopy } from "../buffer-pool";
 import {
   dispatchComputePass,
   dispatchElementwise,
+  type ElementwiseDirectPlan,
   getPipeline,
 } from "../dispatch";
 import { f16WeightCache, requireContext } from "../gpu-context";
@@ -117,12 +118,50 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
     return result;
   }
 
-  // Compute 2D dispatch for large tensors (> 65535 workgroups)
+  // Direct dispatch — single-sourced with the stream generator.
+  const plan = planCastDirectCore(tensor, dtype);
+  const pipeline = getPipeline(ctx, plan.key, plan.shader);
+  const outBuffer = resolveOutputBuffer(ctx.device, plan.outputSizeBytes, [
+    tensor.buffer,
+  ]);
+  const uniformBuf = createParamsBuffer(ctx.device, plan.paramsData);
+  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
+    tensor.buffer,
+    outBuffer,
+    uniformBuf,
+  ]);
+  dispatchComputePass(pipeline, bindGroup, plan.dispatchX, plan.dispatchY);
+  releaseParamsBuffer(uniformBuf);
+  return createTensor(tensor.shape, outBuffer, undefined, 0, dtype);
+}
+
+/** Stage-4 plan/encode split for the DIRECT cast path. Null where cast()
+ *  routes to chunked dispatch (with a possible contiguous-copy prologue). */
+export function planCastDirect(
+  tensor: WebGPUTensor,
+  dtype: DType,
+): ElementwiseDirectPlan | null {
+  const ctx = requireContext();
+  const maxBindingSize =
+    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  if (
+    tensor.size * dtypeBytes(tensor.dtype) > maxBindingSize ||
+    tensor.size * dtypeBytes(dtype) > maxBindingSize
+  ) {
+    return null;
+  }
+  return planCastDirectCore(tensor, dtype);
+}
+
+/** Unguarded cast plan core — cast()'s direct tail (post-routing). */
+export function planCastDirectCore(
+  tensor: WebGPUTensor,
+  dtype: DType,
+): ElementwiseDirectPlan {
   const totalWorkgroups = Math.ceil(tensor.size / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
-
-  const code = castTileIR(
+  const shader = castTileIR(
     tensor.dtype as "f32" | "f16" | "i32" | "u32",
     dtype as "f32" | "f16" | "i32" | "u32",
     tensor.shape,
@@ -130,23 +169,14 @@ export function cast(a: BackendTensor, dtype: DType): BackendTensor {
     tensor.offset,
   );
   const key = `cast:${tensor.dtype}->${dtype}:${tensor.shape.join("x")}:${tensor.strides.join(",")}:${tensor.offset}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
-  const pipeline = getPipeline(ctx, key, code);
-
-  const bytesPerElement = dtypeBytes(dtype);
-  const outBuffer = resolveOutputBuffer(
-    ctx.device,
-    tensor.size * bytesPerElement,
-    [tensor.buffer],
-  );
-  const uniformBuf = createParamsBuffer(ctx.device, params(tensor.size));
-  const bindGroup = cachedCreateBindGroup(ctx.device, pipeline, [
-    tensor.buffer,
-    outBuffer,
-    uniformBuf,
-  ]);
-  dispatchComputePass(pipeline, bindGroup, dispatch.x, dispatch.y);
-  releaseParamsBuffer(uniformBuf);
-  return createTensor(tensor.shape, outBuffer, undefined, 0, dtype);
+  return {
+    key,
+    shader,
+    outputSizeBytes: tensor.size * dtypeBytes(dtype),
+    paramsData: params(tensor.size),
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y,
+  };
 }
 
 /**
@@ -364,41 +394,63 @@ export function contiguous(a: BackendTensor): BackendTensor {
  */
 function contiguousDirect(tensor: WebGPUTensor): WebGPUTensor {
   const ctx = requireContext();
+  // Single-sourced with the stream generator.
+  const plan = planContiguousDirectCore(tensor);
+  const outBuffer = resolveOutputBuffer(ctx.device, plan.outputSizeBytes, [
+    tensor.buffer,
+  ]);
+  dispatchElementwise({
+    key: plan.key,
+    shader: plan.shader,
+    inputs: [tensor.buffer],
+    outputSizeBytes: plan.outputSizeBytes,
+    params: plan.paramsData,
+    outBuffer,
+    dispatchX: plan.dispatchX,
+    dispatchY: plan.dispatchY,
+  });
+  return createTensor(tensor.shape, outBuffer, undefined, 0, tensor.dtype);
+}
+
+/** Stage-4 plan/encode split for the DIRECT contiguous path. Null where
+ *  contiguous() routes to chunked dispatch. The already-contiguous fast
+ *  path (no commands at all) is the CALLER's to mirror. */
+export function planContiguousDirect(
+  tensor: WebGPUTensor,
+): ElementwiseDirectPlan | null {
+  const ctx = requireContext();
+  const maxBindingSize =
+    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  if (tensor.buffer.size > maxBindingSize) return null;
+  return planContiguousDirectCore(tensor);
+}
+
+/** Unguarded contiguous plan core — contiguousDirect (post-routing). */
+export function planContiguousDirectCore(
+  tensor: WebGPUTensor,
+): ElementwiseDirectPlan {
   const shape = tensor.shape;
   const outSize = sizeOf(shape);
   const dtype = tensor.dtype;
   const bytesPerElement = dtypeBytes(dtype);
-
-  // Compute 2D dispatch for large tensors (> 65535 workgroups)
   const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
   const dispatch = compute2DDispatch(totalWorkgroups);
   const use2D = dispatch.y > 1;
-
-  // Create new contiguous buffer
-  const outBuffer = resolveOutputBuffer(ctx.device, outSize * bytesPerElement, [
-    tensor.buffer,
-  ]);
-
-  const code = contiguousTileIR(
+  const shader = contiguousTileIR(
     shape,
     tensor.strides,
     tensor.offset,
     dtype as "f32" | "f16" | "i32" | "u32",
   );
   const key = `contiguous:${shape.join(",")}:${tensor.strides.join(",")}:${tensor.offset}:${dtype}:${use2D ? `2d:${dispatch.gridSizeX}` : "1d"}`;
-
-  dispatchElementwise({
+  return {
     key,
-    shader: code,
-    inputs: [tensor.buffer],
+    shader,
     outputSizeBytes: outSize * bytesPerElement,
-    params: params(outSize),
-    outBuffer,
+    paramsData: params(outSize),
     dispatchX: dispatch.x,
     dispatchY: dispatch.y,
-  });
-
-  return createTensor(shape, outBuffer, undefined, 0, dtype);
+  };
 }
 
 /**

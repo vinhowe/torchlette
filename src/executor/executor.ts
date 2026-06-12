@@ -1027,6 +1027,11 @@ export async function executeLoweredPlan(
       const action = loweredPlan.actions[actionIndex];
       switch (action.kind) {
         case "fused": {
+          // Attribute recorded commands to the group's output node — without
+          // this they inherit the PREVIOUS sequential node's index, polluting
+          // its segment in the stream differential (and misattributing any
+          // volatile-uniform recordings).
+          if (compilationRecording) setRecordingNodeIndex(action.outputNodeIndex);
           // Reconstruct FusionGroup from plan nodes
           const groupNodes = action.coveredNodeIndices.map((i) => planNodes[i]);
           const outputNode = planNodes[action.outputNodeIndex];
@@ -1177,6 +1182,7 @@ export async function executeLoweredPlan(
         }
 
         case "matmul-epilogue": {
+          if (compilationRecording) setRecordingNodeIndex(action.matmulNodeIndex);
           const matmulNode = planNodes[action.matmulNodeIndex];
           const outputNode = planNodes[action.outputNodeIndex];
 
@@ -1401,6 +1407,7 @@ export async function executeLoweredPlan(
         }
 
         case "batched-reduction": {
+          if (compilationRecording) setRecordingNodeIndex(action.nodeIndices[0]);
           const batchNodes = action.nodeIndices.map((i) => planNodes[i]);
           const batchBackend = getBackend(batchNodes[0].device) ?? backend;
           const batchInputs = batchNodes.map((node) => {
@@ -1498,6 +1505,7 @@ export async function executeLoweredPlan(
         }
 
         case "row-program": {
+          if (compilationRecording) setRecordingNodeIndex(action.outputNodeIndex);
           // Remap inputRefs to current step's nodes (template reuse makes
           // the original refs stale — they point to cleared previous-step nodes).
           const remappedRefs = action.inputRefs.map((ref, i) => {

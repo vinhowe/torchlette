@@ -17,7 +17,14 @@
  * each sharing its spec/codegen with the imperative dispatcher so pipeline
  * identity resolves through the same caches.
  */
-import { planBinaryDirect } from "../backend/webgpu/dispatch";
+import {
+  planBinaryDirect,
+  planUnaryDirect,
+} from "../backend/webgpu/dispatch";
+import {
+  planCastDirect,
+  planContiguousDirect,
+} from "../backend/webgpu/ops/views";
 import { requireContext } from "../backend/webgpu/gpu-context";
 import { getPipeline } from "../backend/webgpu/dispatch";
 import { alignBufferSize } from "../backend/webgpu/shape-utils";
@@ -110,16 +117,51 @@ export function generateStream(
   const segments: Array<{ nodeIndex: number; commands: GpuCommand[] }> = [];
   let actionCount = 0;
   let coveredActions = 0;
-  const phantom = (node: LazyIRNode | undefined) => {
+  // Logical identity channel: plan-node index -> generated slot. Liveness
+  // may have RELEASED an intermediate's result before plan-build (its
+  // buffer identity is gone), but its slot is still well-defined — the one
+  // the walker assigned when it processed the producer. Views alias to
+  // their input's slot (the recording keys slots by buffer, so a view and
+  // its base share one slot; a separate logical slot per view node would
+  // break the diff bijection).
+  const nodeSlot = new Map<number, Slot>();
+  const resolveRefSlot = (ref: LazyIRNode["inputs"][number]): Slot | undefined => {
+    if (ref.kind === "scalar") return undefined;
+    if (ref.kind !== "materialized") {
+      const oi = ref.outputIndex ?? 0;
+      if (oi === 0) {
+        const idx = nodeIndexById.get(ref.node.id);
+        if (idx !== undefined) {
+          const s = nodeSlot.get(idx);
+          if (s !== undefined) return s;
+        }
+      }
+      const storage =
+        oi === 0 ? ref.node.result : ref.node.results?.[oi];
+      if (!storage) return undefined;
+      return bufferToSlot.get(gpuBuffer(storage.backendTensor) as unknown);
+    }
+    return bufferToSlot.get(
+      gpuBuffer(ref.storage.backendTensor) as unknown,
+    );
+  };
+  const phantom = (node: LazyIRNode | undefined, nodeIndex?: number) => {
     if (!node) return;
     const slot = slots.length;
     slots.push({ kind: "arena" });
     mapNodeResult(node, slot, bufferToSlot);
+    if (nodeIndex !== undefined) nodeSlot.set(nodeIndex, slot);
   };
   for (const action of loweredPlan.actions) {
     actionCount++;
     switch (action.kind) {
-      case "view":
+      case "view": {
+        const node = planNodes[action.nodeIndex];
+        const aliased = node ? resolveRefSlot(node.inputs[0]) : undefined;
+        if (aliased !== undefined) nodeSlot.set(action.nodeIndex, aliased);
+        coveredActions++;
+        break;
+      }
       case "prologue-skip":
         coveredActions++;
         break;
@@ -132,26 +174,32 @@ export function generateStream(
         const gen = generateDataSource(node, action.nodeIndex, slots);
         if (!gen) {
           miss(`data-source:${node.op}${node.dtype !== "f32" ? `:${node.dtype}` : ""}`);
-          phantom(node);
+          phantom(node, action.nodeIndex);
           break;
         }
         commands.push(...gen);
         segments.push({ nodeIndex: action.nodeIndex, commands: gen });
-        mapNodeResult(node, gen[0].tag === TAG_ALLOC ? (gen[0] as { slot: Slot }).slot : -1, bufferToSlot);
+        const dsSlot =
+          gen[0].tag === TAG_ALLOC ? (gen[0] as { slot: Slot }).slot : -1;
+        mapNodeResult(node, dsSlot, bufferToSlot);
+        if (dsSlot >= 0) nodeSlot.set(action.nodeIndex, dsSlot);
         coveredActions++;
         break;
       }
       case "sequential": {
         const node = planNodes[action.nodeIndex];
-        const gen = generateSequential(node, slots, bufferToSlot);
-        if (gen === null) {
-          miss(`op:${node.op}`);
-          phantom(node);
+        const gen = generateSequential(node, slots, resolveRefSlot);
+        if (typeof gen === "string") {
+          miss(`op:${node.op}${gen ? `[${gen}]` : ""}`);
+          phantom(node, action.nodeIndex);
           break;
         }
         commands.push(...gen.commands);
-        segments.push({ nodeIndex: action.nodeIndex, commands: gen.commands });
+        if (gen.commands.length > 0) {
+          segments.push({ nodeIndex: action.nodeIndex, commands: gen.commands });
+        }
         mapNodeResult(node, gen.outSlot, bufferToSlot);
+        nodeSlot.set(action.nodeIndex, gen.outSlot);
         coveredActions++;
         break;
       }
@@ -171,7 +219,7 @@ export function generateStream(
           ...(a.nodeIndices ?? []),
           ...(a.additionalOutputNodeIndices ?? []),
         ]) {
-          if (ni !== undefined) phantom(planNodes[ni]);
+          if (ni !== undefined) phantom(planNodes[ni], ni);
         }
         break;
       }
@@ -200,12 +248,60 @@ function mapNodeResult(
   bufferToSlot.set(gpuBuffer(node.result.backendTensor) as unknown, slot);
 }
 
+/** View ops whose output layout is NOT derivable from shape alone —
+ *  metadata synthesis for liveness-released producers excludes them. */
+const VIEW_OPS = new Set([
+  "reshape",
+  "view",
+  "transpose",
+  "permute",
+  "expand",
+  "narrow",
+  "squeeze",
+  "unsqueeze",
+  "broadcastTo",
+]);
+
+function contiguousStrides(shape: number[]): number[] {
+  const s = new Array<number>(shape.length);
+  let acc = 1;
+  for (let i = shape.length - 1; i >= 0; i--) {
+    s[i] = acc;
+    acc *= shape[i];
+  }
+  return s;
+}
+
 /** node.op → the WGSL symbol dispatchBinary receives from the backend. */
 const BINARY_OPS = new Map<string, string>([
   ["add", "+"],
   ["sub", "-"],
   ["mul", "*"],
   ["div", "/"],
+  ["pow", "pow"],
+  ["minimum", "min"],
+  ["maximum", "max"],
+]);
+
+/** Table-driven unary ops routed to dispatchUnary with identity opKeys. */
+const UNARY_OPS = new Set([
+  "sqrt",
+  "relu",
+  "exp",
+  "log",
+  "neg",
+  "abs",
+  "tanh",
+  "sigmoid",
+  "silu",
+  "sin",
+  "cos",
+  "rsqrt",
+  "floor",
+  "ceil",
+  "round",
+  "sign",
+  "isfinite",
 ]);
 
 /**
@@ -220,30 +316,88 @@ const BINARY_OPS = new Map<string, string>([
 function generateSequential(
   node: LazyIRNode,
   slots: SlotSource[],
-  bufferToSlot: Map<unknown, Slot>,
-): { commands: GpuCommand[]; outSlot: Slot } | null {
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
   const wgslOp = BINARY_OPS.get(node.op);
-  if (!wgslOp) return null;
-  if (node.inputs.length !== 2) return null;
+  const isUnary =
+    UNARY_OPS.has(node.op) ||
+    node.op === "cast" ||
+    node.op === "contiguous" ||
+    node.op === "gelu";
+  if (!wgslOp && !isUnary) return "";
+  if (wgslOp && node.inputs.length !== 2) return "arity";
+  if (isUnary && node.inputs.length !== 1) return "arity";
   const ins: WebGPUTensor[] = [];
   const inSlots: Slot[] = [];
   for (const ref of node.inputs) {
-    if (ref.kind === "scalar") return null; // scalar-table operand — later
+    if (ref.kind === "scalar") return "scalar-operand";
+    // Tensor METADATA (shape/strides/offset/dtype) comes from the storage
+    // when it still exists. Liveness may have RELEASED an intermediate's
+    // result before plan-build: for NON-VIEW producers the output layout is
+    // structural (fresh allocation: contiguous, offset 0, node shape/dtype)
+    // so the metadata is synthesized from the node — and if that assumption
+    // is ever wrong, the pipeline-identity diff catches it loudly. View
+    // producers' layouts aren't shape-derivable; they stay bailed.
     const storage =
       ref.kind === "materialized"
         ? ref.storage
         : ((ref.outputIndex ?? 0) === 0
             ? ref.node.result
             : ref.node.results?.[ref.outputIndex ?? 0]);
-    if (!storage) return null;
-    const buf = gpuBuffer(storage.backendTensor) as unknown;
-    const slot = bufferToSlot.get(buf);
-    if (slot === undefined) return null; // untracked producer — bail
-    ins.push(storage.backendTensor as WebGPUTensor);
+    let meta: WebGPUTensor;
+    if (storage) {
+      meta = storage.backendTensor as WebGPUTensor;
+    } else if (
+      ref.kind !== "materialized" &&
+      (ref.outputIndex ?? 0) === 0 &&
+      !VIEW_OPS.has(ref.node.op)
+    ) {
+      const shape = ref.node.shape;
+      const dtype = (ref.node.dtype ?? "f32") as WebGPUTensor["dtype"];
+      const size = sizeOf(shape);
+      meta = {
+        shape,
+        strides: contiguousStrides(shape),
+        offset: 0,
+        size,
+        dtype,
+        isContiguous: true,
+        // Only .size is consulted by planner guards.
+        buffer: { size: alignBufferSize(size * 4) },
+      } as unknown as WebGPUTensor;
+    } else {
+      return "no-storage";
+    }
+    const slot = resolveRefSlot(ref);
+    if (slot === undefined) return "untracked-producer";
+    ins.push(meta);
     inSlots.push(slot);
   }
-  const plan = planBinaryDirect(wgslOp, ins[0], ins[1]);
-  if (!plan) return null;
+  let plan;
+  if (wgslOp) {
+    plan = planBinaryDirect(wgslOp, ins[0], ins[1]);
+  } else if (node.op === "cast") {
+    plan = planCastDirect(ins[0], node.dtype);
+  } else if (node.op === "contiguous") {
+    // Already-contiguous fast path: a non-owning view, ZERO commands — the
+    // node's result shares the input buffer (mapNodeResult will re-map the
+    // same buffer to the input's slot; out slot is the input's).
+    if (ins[0].isContiguous) {
+      return { commands: [], outSlot: inSlots[0] };
+    }
+    plan = planContiguousDirect(ins[0]);
+  } else if (node.op === "gelu") {
+    // Backend convention (elementwise.ts gelu): approximate ?? "tanh";
+    // tanh -> opKey "gelu", erf -> "gelu_erf".
+    const p = node.payload as { approximate?: string } | undefined;
+    plan = planUnaryDirect(
+      (p?.approximate ?? "tanh") === "tanh" ? "gelu" : "gelu_erf",
+      ins[0],
+    );
+  } else {
+    plan = planUnaryDirect(node.op, ins[0]);
+  }
+  if (!plan) return "non-direct-route";
   // Resolve the pipeline through the SAME cache the dispatcher used (at
   // build time it is warm — this just interns the identity for the diff).
   const pipeline = getPipeline(requireContext(), plan.key, plan.shader);
