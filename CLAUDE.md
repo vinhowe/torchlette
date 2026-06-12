@@ -71,6 +71,8 @@ Known divergences: `number` not `bigint` for versions, 2 LocRoles not 6, no tomb
 
 ## Step-Scoped Storage Cleanup
 
+**Minimal training loops (2026-06-12):** `beginStep`/`endStep`/`markStep` are OPTIONAL in training loops. `optimizer.step()` queues a deferred step boundary that commits at the next `backward()` (or explicit `markStep()`); custom optimizers call `api.queueStepBoundary()` at the end of their `step()`. Explicit ceremony keeps its exact old semantics and supersedes queued boundaries. Differential gate: `test/implied-step-boundary.spec.ts` + `tools/t-implied-boundary-probe.ts`. Two rules the commit path must keep: (1) generation stamps are WRAPPER-level (storage-level stamps demote fused Adam's m/v — storage replaced every step); (2) quiesce (fence) BEFORE the demotion sweep — fencing after executes the sweep's deferred destroys under still-pending submits ("used in submit while destroyed").
+
 GPU memory is managed deterministically via two-tier reachability — no GC dependency.
 
 **At `beginStep()`**: all pending tensors are forced (materializes model weights on first call), then `snapshotForStep()` captures which RuntimeTensor objects are alive. These are "persistent" (model params, optimizer state).
