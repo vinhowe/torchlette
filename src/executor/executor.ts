@@ -371,6 +371,37 @@ export function evictAllArenas(force = false): void {
  * recompilation on the next step. Lighter than evictAllArenas() — avoids
  * the transient OOM from arena rebuild.
  */
+/** Stage-4 phase 0: snapshot all live compiled streams (for stream diffing). */
+export function getCompiledStreams(): Array<{
+  label: string;
+  commands: import("./compiled-plan").GpuCommand[];
+}> {
+  const out: Array<{
+    label: string;
+    commands: import("./compiled-plan").GpuCommand[];
+  }> = [];
+  for (const [fp, template] of fusionAnalysisCache) {
+    const cp = template.loweredPlan?.compiledPlan;
+    if (cp?.valid) {
+      out.push({ label: `fp=0x${fp.toString(16)}`, commands: cp.commands.slice() });
+    }
+  }
+  // Deterministic order for cross-snapshot comparison.
+  out.sort((a, b) => (a.label < b.label ? -1 : 1));
+  return out;
+}
+
+/** Stage-4 phase 0: drop compiled plans but KEEP templates/arenas — the next
+ *  execution re-records the same template (the determinism gate's lever). */
+export function invalidateCompiledKeepTemplates(): void {
+  for (const [, template] of fusionAnalysisCache) {
+    if (template.loweredPlan?.compiledPlan) {
+      destroyCompiledPlanBuffers(template.loweredPlan.compiledPlan);
+      template.loweredPlan.compiledPlan = undefined;
+    }
+  }
+}
+
 export function invalidateCompiledPlans(): void {
   for (const [, template] of fusionAnalysisCache) {
     if (template.loweredPlan?.compiledPlan) {

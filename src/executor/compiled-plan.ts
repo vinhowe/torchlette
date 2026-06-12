@@ -227,6 +227,7 @@ export interface RecordedDispatch {
 
 import type { LazyIRNode, StorageHandle } from "../graph/types";
 import { getInputStorage } from "./op-dispatch";
+import { isScalarTableBuffer } from "./scalar-table";
 
 /** Recorded buffer copy for compilation. */
 export interface RecordedCopy {
@@ -441,12 +442,18 @@ export function buildCompiledPlan(input: {
     const adopt = (buf: GPUBuffer) => {
       if (seen.has(buf)) return;
       seen.add(buf);
+      // Scalar-table buffers are TABLE-owned (refreshed every execution,
+      // destroyed only by destroyScalarTable). Adopting them couples their
+      // lifetime to the plan: invalidation destroys them while the live
+      // table still writes to them ("used in submit while destroyed").
+      if (isScalarTableBuffer(buf)) return;
       const rc = adoptedRefCount.get(buf);
       if (rc !== undefined) {
         adoptedRefCount.set(buf, rc + 1);
         adoptedBuffers!.push(buf);
       } else if (!arenaBufferSet.has(buf)) {
-        bufferPool.adoptBuffer(buf);
+        const poolOrigin = bufferPool.adoptBuffer(buf);
+        adoptedPoolOrigin.set(buf, poolOrigin);
         // PIN, don't masquerade as arena-owned: arenaBufferSet members are
         // managed (evicted, released, destroyed) by the arena at will — the
         // arena's conflict/eviction paths delete membership and route the
@@ -516,6 +523,9 @@ export function buildCompiledPlan(input: {
 /** Refcount for buffers adopted by compiled plans (shared across plans when
  *  pool-liveness reuse hands one buffer to multiple plans in a step). */
 const adoptedRefCount = new Map<GPUBuffer, number>();
+/** Whether an adopted buffer was POOL-managed at adoption (plan teardown
+ *  destroys only these; cache-owned pinned buffers are merely unpinned). */
+const adoptedPoolOrigin = new Map<GPUBuffer, boolean>();
 
 /** Debug: stable small ids for GPUBuffer identity in logs. */
 const _dbgBufIds = new WeakMap<GPUBuffer, number>();
@@ -580,6 +590,11 @@ export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
     }
     adoptedRefCount.delete(buf);
     pinnedBufferSet.delete(buf);
+    const poolOrigin = adoptedPoolOrigin.get(buf) ?? false;
+    adoptedPoolOrigin.delete(buf);
+    // Cache-owned buffers (tile configs, kernel workspaces, singleton
+    // params): unpin only — their caches own destruction.
+    if (!poolOrigin) continue;
     if (bufferPool.canRecycle(buf)) {
       // DEFERRED destruction, never immediate: plan teardown fires MID-STEP
       // (staleness gates, template eviction) while the step-level encoder

@@ -183,7 +183,14 @@ class SimpleBufferPool {
    * (e.g. still owned by a live tensor — it then simply never re-enters the
    * pool thanks to the arenaBufferSet shield).
    */
-  adoptBuffer(buffer: GPUBuffer): void {
+  /** Returns TRUE iff the buffer was actually pool-managed (bucket,
+   *  pendingRelease, or pendingDestroy) at adoption time. Cache-owned
+   *  buffers (tile configs, kernel workspaces) return false — the adopter
+   *  may PIN them but must not take destruction ownership: their caches
+   *  outlive the plan and keep using them (plan teardown destroying a
+   *  cache-owned config buffer = "used in submit while destroyed" on the
+   *  next lowered execution's config write). */
+  adoptBuffer(buffer: GPUBuffer): boolean {
     const sizeClass = getSizeClass(buffer.size);
     const bucket = this.pool.get(sizeClass);
     if (bucket) {
@@ -194,7 +201,7 @@ class SimpleBufferPool {
         this.pooledBytes -= actualSize;
         this.pooledBufferSet.delete(buffer);
         gpuMemoryTracker.trackAllocation(buffer, actualSize);
-        return;
+        return true;
       }
     }
     const pendingIdx = this.pendingRelease.findIndex(
@@ -204,7 +211,21 @@ class SimpleBufferPool {
       const { size } = this.pendingRelease.splice(pendingIdx, 1)[0];
       this.pendingReleaseBytes -= size;
       gpuMemoryTracker.trackAllocation(buffer, size);
+      return true;
     }
+    const destroyIdx = this.pendingDestroy.findIndex(
+      (e) => e.buffer === buffer,
+    );
+    if (destroyIdx !== -1) {
+      const { size } = this.pendingDestroy.splice(destroyIdx, 1)[0];
+      gpuMemoryTracker.trackAllocation(buffer, size);
+      return true;
+    }
+    // Live pool-tracked buffer (acquired, not yet released): pool-origin.
+    if (this.bufferLiveCount.has(buffer) || this.pooledBufferSet.has(buffer)) {
+      return true;
+    }
+    return false;
   }
 
   /**

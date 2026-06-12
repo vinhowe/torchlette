@@ -140,6 +140,7 @@ export function refreshScalarTable(
           GPUBufferUsage.COPY_SRC |
           GPUBufferUsage.COPY_DST,
       });
+      liveScalarTableBuffers.add(buf);
       buffers.push(buf);
       storages.push(wrapScalarBuffer(buf));
     }
@@ -184,6 +185,17 @@ export function refreshScalarTable(
   activeScalarStorages = map;
 }
 
+/** Module-level registry of LIVE scalar-table buffers. The compiled plan's
+ *  persistent-slot pinning must NOT adopt these: their lifetime belongs to
+ *  destroyScalarTable, and a plan invalidation that destroyed them would
+ *  leave the table writing to dead buffers (caught by the stage-4 stream
+ *  determinism gate as "used in submit while destroyed" on table refresh). */
+const liveScalarTableBuffers = new Set<unknown>();
+
+export function isScalarTableBuffer(buf: unknown): boolean {
+  return liveScalarTableBuffers.has(buf);
+}
+
 /** Destroy a plan's scalar-table buffers (template eviction/invalidation). */
 export function destroyScalarTable(loweredPlan: {
   scalarTable?: PlanScalarTable;
@@ -192,6 +204,7 @@ export function destroyScalarTable(loweredPlan: {
   if (!table || table.destroyed) return;
   table.destroyed = true;
   for (const buf of table.buffers) {
+    liveScalarTableBuffers.delete(buf);
     // DEFERRED destruction (fence-gated), never immediate: table buffers can
     // be bound by encoded-but-unsubmitted passes when a template is evicted
     // mid-step (liveness-mode pool pressure evicts arenas + tables while the
