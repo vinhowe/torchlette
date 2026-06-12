@@ -11,6 +11,7 @@
 
 import { ENV } from "../../core/env";
 import {
+  invalidateActiveRecording,
   assignSlot,
   isCompilationRecordingActive,
   setLastBindGroupBuffers,
@@ -144,7 +145,23 @@ export function createParamsBuffer(
           return cached.buffer; // Skip writeBuffer entirely
         }
       }
-      // Data changed — write new data, update cached copy
+      // Data changed at a stable dispatch position. If a compiled plan is
+      // being RECORDED right now, the recorded "params" slot would bake THIS
+      // execution's bytes and every replay would reuse them — but bytes that
+      // changed between consecutive executions of one template will keep
+      // changing (per-step-varying value reaching a raw params buffer: the
+      // frozen-data form of the frozen-scalar disease, previously guarded
+      // only for tile-IR configs via getConfigBuffer). Invalidate the
+      // recording: the plan falls back to lowered execution, which rewrites
+      // params every dispatch. The payload-fingerprint hash (2809588) makes
+      // this rare — values reaching params buffers normally derive from
+      // hashed payload/shape — so invalidation here is a correctness
+      // backstop, not a hot path.
+      if (compiling) {
+        invalidateActiveRecording(
+          `params bytes changed across executions at seq ${idx} (label=${getCurrentOpLabel() ?? "?"}) — raw params buffers cannot carry per-step-varying values into replays`,
+        );
+      }
       if (ENV.TORCHLETTE_DEBUG_PARAMS_CHANGED) {
         const diffs: string[] = [];
         for (let i = 0; i < data.length; i++) {

@@ -27,6 +27,7 @@ export {
 // Weight initialization (nn.init)
 export * as init from "./init";
 export { LayerNorm, type LayerNormOptions } from "./layernorm";
+export { RMSNorm, type RMSNormOptions } from "./rmsnorm";
 export { Linear, type LinearOptions } from "./linear";
 export { Module } from "./module";
 export { ModuleList } from "./modulelist";

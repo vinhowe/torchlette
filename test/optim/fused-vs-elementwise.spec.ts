@@ -50,8 +50,8 @@ async function trajectory(env: Record<string, string>): Promise<number[][]> {
       const line = stdout.trim().split("\n").pop()!;
       return JSON.parse(line);
     } catch (e) {
-      if (attempt >= 3) throw e;
-      await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+      if (attempt >= 5) throw e;
+      await new Promise((r) => setTimeout(r, 2500 * (attempt + 1)));
     }
   }
 }

@@ -413,21 +413,11 @@ function arenaAllocAt(
   }
   const ctx = requireContext();
   const pooledSize = getSizeForClass(neededSizeClass);
-  // EXPERIMENTAL, default OFF: acquiring pool buffers into arena positions
-  // broke compiled replays (a pool buffer recorded at one slot can be handed
-  // to another → slot aliasing → training divergence). The in-place copy_
-  // fast path removed the allocation churn this was meant to fix.
-  const pooled =
-    ENV.TORCHLETTE_ARENA_POOL_ACQUIRE === "1"
-      ? bufferPool.acquire(alignedSize)
-      : null;
-  if (pooled) {
-    arr[idx] = pooled;
-    arenaBufferSet.add(pooled);
-    bufRegister(pooled, pooledSize, "arena");
-    trackSharedEncoderWrite(pooled);
-    return pooled;
-  }
+  // NOTE: do NOT acquire pool buffers into arena positions. Tried
+  // (TORCHLETTE_ARENA_POOL_ACQUIRE, deleted 2026-06-12): a pool buffer
+  // recorded at one compiled-plan slot can be handed to another → slot
+  // aliasing → training divergence. The in-place copy_ fast path removed
+  // the allocation churn it was meant to fix.
   const usage = STORAGE_BUFFER_USAGE;
   const buffer = profileApiCall("createBuffer", () =>
     ctx.device.createBuffer({ size: pooledSize, usage }),

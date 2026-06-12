@@ -14,7 +14,7 @@ WebGPU is auto-detected at runtime. Use `TORCHLETTE_CPU_ONLY=1` to force CPU-onl
 
 For WebGPU backend changes, also run the relevant integration test (e.g. `npx tsx examples/gpt2/finetune-demo.ts` for training-related fixes).
 
-**Zero test failures policy.** Currently 852 tests pass across 55 test files. Never accept test failures. Fix before moving on.
+**Zero test failures policy.** Never accept test failures; fix before moving on. (Don't hand-maintain test counts here — run `npm run test` for the current numbers; as of 2026-06-12 it's ~1790 tests across ~137 file runs in the cpu+webgpu projects.)
 
 **Important:** Any standalone script or tool that uses WebGPU (Dawn) must call `process.exit(0)` at the end of `main()`. Dawn holds background threads that prevent Node from exiting naturally.
 
@@ -48,7 +48,7 @@ BENCH_WARMUP=3 BENCH_ITERS=7 npx tsx bench/matmul-comparison.ts
 - `src/runtime/` - RuntimeEngine (lazy IR node creation, dtype rules, table-driven ops)
 - `src/nn/` - Module system (auto parameters, linear, embedding, layernorm, init, grad clipping)
 - `src/optim/` - Optimizers (Adam/AdamW with fused GPU kernel, SGD, GradScaler, LR schedulers, parameter groups)
-- `test/` - 55 test files, 852 tests
+- `test/` - test suite (cpu + webgpu projects run the same specs; see vitest.config.ts)
 - `examples/gpt2/` - GPT-2 model, loader, tokenizer, finetune demo
 - `tools/profile-training.ts` - GPU training profiler (supports distilgpt2, gpt2, gpt2-medium)
 
@@ -90,6 +90,8 @@ GPU memory is managed deterministically via two-tier reachability — no GC depe
 **Gradient specs**: Simple ops (elementwise) define gradients in `src/ops/registry.ts` (UnaryGradFn, BinaryTTGradFn, BinaryTSGradFn). Complex ops define gradients in `custom-backward.ts`. Don't add complex backward logic to `torchlette.ts`.
 
 ## Framework Correctness Principles
+
+**Canonical debt/architecture document: `docs/architecture-debt.md`** — the sin taxonomy every bug ledger entry maps to, the stage plan (scalars-as-data → foreach → islands → compile-from-IR), and the rules that should hold. Read it before architectural work.
 
 **Single source of truth at seams; assert agreement.** Wherever two sides must agree on a value — a producer and a consumer on a buffer's shape/layout, a compiled/fused path and the naive path on a result, GPU and CPU on an op's semantics — derive that value from ONE source and assert the other matches *at the seam*. Never let both sides independently recompute it: when they silently diverge you get correct-looking-but-wrong results (the worst failure mode — no crash, just silently degraded training). Three instances this bit us, all now structurally guarded:
 - **Row-program output layout** (`row-program-dispatch.ts`): the kernel's write count (scalar `[R,1]` vs full `[R,D]`) must equal the consuming node's `sizeOf(shape)`. The buffer is sized from the consumer's shape and the dispatch throws if the kernel's write count disagrees (caught → safe sequential fallback + warning). A misclassified `scalarOutput` once made every row collapse onto row 0's value under `compile()`.
