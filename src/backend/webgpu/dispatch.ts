@@ -174,6 +174,87 @@ export function getPipeline(
  * Dispatch binary op with full stride support.
  * Handles non-contiguous tensors (transposed, expanded views) directly.
  */
+/**
+ * Stage-4 plan/encode split: everything the DIRECT binary dispatch decides,
+ * computed from tensor METADATA only (no GPU calls, no allocation). Returns
+ * null when the dispatcher would take a non-direct path (chunked dispatch
+ * or contiguous-copy insertion for oversized strided operands) — callers
+ * generating streams treat null as "uncovered". dispatchBinary's direct
+ * tail consumes the SAME plan, so the generator and the executor cannot
+ * silently disagree.
+ */
+export interface ElementwiseDirectPlan {
+  key: string;
+  shader: string;
+  outputSizeBytes: number;
+  paramsData: Uint32Array;
+  dispatchX: number;
+  dispatchY: number;
+}
+
+export function planBinaryDirect(
+  op: string,
+  a: WebGPUTensor,
+  b: WebGPUTensor,
+): ElementwiseDirectPlan | null {
+  // Generator-facing guard: bail where dispatchBinary takes a NON-direct
+  // path (chunked dispatch or contiguous-copy insertion). dispatchBinary's
+  // own tail calls the unguarded core — it has already routed those cases.
+  const outShape = broadcastShapes(a.shape, b.shape);
+  const outSize = sizeOf(outShape);
+  if (outSize === 0) return null;
+  const dtype = a.dtype;
+  if (b.dtype !== dtype) return null;
+  const bytesPerElement = dtypeBytes(dtype);
+  const ctx = requireContext();
+  const maxBindingSize =
+    ctx.device.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+  if (
+    a.size * bytesPerElement > maxBindingSize ||
+    b.size * bytesPerElement > maxBindingSize ||
+    outSize * bytesPerElement > maxBindingSize
+  ) {
+    return null; // chunked / contiguous-insertion territory
+  }
+  return planBinaryDirectCore(op, a, b, outShape, outSize, bytesPerElement);
+}
+
+/** Unguarded plan core — dispatchBinary's direct tail (post-routing). */
+export function planBinaryDirectCore(
+  op: string,
+  a: WebGPUTensor,
+  b: WebGPUTensor,
+  outShape: number[],
+  outSize: number,
+  bytesPerElement: number,
+): ElementwiseDirectPlan {
+  const dtype = a.dtype;
+  const indexShape = toIndexShape(outShape);
+  const aStrides = computeEffectiveBroadcastStrides(a, indexShape);
+  const bStrides = computeEffectiveBroadcastStrides(b, indexShape);
+  const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
+  const dispatch = compute2DDispatch(totalWorkgroups);
+  const use2D = dispatch.y > 1;
+  const shader = binaryBroadcastTileIR(
+    op,
+    indexShape,
+    aStrides,
+    bStrides,
+    a.offset,
+    b.offset,
+    dtype as "f32" | "f16" | "u32" | "i32",
+  );
+  const key = `binary:${op}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${a.offset}:${b.offset}:${dtype}:${use2D ? dispatch.gridSizeX : "1d"}`;
+  return {
+    key,
+    shader,
+    outputSizeBytes: outSize * bytesPerElement,
+    paramsData: params(outSize),
+    dispatchX: dispatch.x,
+    dispatchY: dispatch.y,
+  };
+}
+
 export function dispatchBinary(
   op: string,
   a: WebGPUTensor,
@@ -266,33 +347,26 @@ export function dispatchBinary(
     // Fall through to direct dispatch
   }
 
-  // Direct dispatch
-  const indexShape = toIndexShape(outShape);
-  const aStrides = computeEffectiveBroadcastStrides(a, indexShape);
-  const bStrides = computeEffectiveBroadcastStrides(b, indexShape);
-  const totalWorkgroups = Math.ceil(outSize / WORKGROUP_SIZE);
-  const dispatch = compute2DDispatch(totalWorkgroups);
-  const use2D = dispatch.y > 1;
-  const code = binaryBroadcastTileIR(
+  // Direct dispatch — decisions single-sourced with the stage-4 stream
+  // generator (planBinaryDirect guards + this core; stream-generate.ts).
+  const plan = planBinaryDirectCore(
     op,
-    indexShape,
-    aStrides,
-    bStrides,
-    a.offset,
-    b.offset,
-    dtype as "f32" | "f16" | "u32" | "i32",
+    a,
+    b,
+    outShape,
+    outSize,
+    bytesPerElement,
   );
-  const key = `binary:${op}:${indexShape.join("x")}:${aStrides.join(",")}:${bStrides.join(",")}:${a.offset}:${b.offset}:${dtype}:${use2D ? dispatch.gridSizeX : "1d"}`;
 
   const outBuffer = dispatchElementwise({
-    key,
-    shader: code,
+    key: plan.key,
+    shader: plan.shader,
     inputs: [a.buffer, b.buffer],
-    outputSizeBytes: outSize * bytesPerElement,
-    params: params(outSize),
+    outputSizeBytes: plan.outputSizeBytes,
+    params: plan.paramsData,
     outBuffer: options?.outBuffer,
-    dispatchX: dispatch.x,
-    dispatchY: dispatch.y,
+    dispatchX: plan.dispatchX,
+    dispatchY: plan.dispatchY,
   });
 
   const ownsBuffer = options?.outBuffer === undefined;

@@ -17,12 +17,22 @@
  * each sharing its spec/codegen with the imperative dispatcher so pipeline
  * identity resolves through the same caches.
  */
+import { planBinaryDirect } from "../backend/webgpu/dispatch";
+import { requireContext } from "../backend/webgpu/gpu-context";
+import { getPipeline } from "../backend/webgpu/dispatch";
 import { alignBufferSize } from "../backend/webgpu/shape-utils";
 import { gpuBuffer } from "../backend/webgpu/gpu-types";
+import type { WebGPUTensor } from "../backend/webgpu/tensor";
 import type { LazyIRNode, StorageHandle } from "../graph/types";
 import { sizeOf } from "../core/shape";
 import type { GpuCommand, Slot, SlotSource } from "./compiled-plan";
-import { TAG_ALLOC, TAG_BARRIER, TAG_CLEAR, TAG_WRITE } from "./compiled-plan";
+import {
+  TAG_ALLOC,
+  TAG_BARRIER,
+  TAG_CLEAR,
+  TAG_DISPATCH,
+  TAG_WRITE,
+} from "./compiled-plan";
 import type { LoweredPlan } from "./lowered-plan";
 
 export interface GeneratedStream {
@@ -122,14 +132,32 @@ export function generateStream(
         }
         if (generating) {
           commands.push(...gen);
+          // Map the node's actual result buffer to its alloc slot so later
+          // ops can reference it as an input (build-time shadow generation
+          // reads post-execution buffer identity; pure generation will use
+          // logical node identity instead).
+          mapNodeResult(node, gen[0].tag === TAG_ALLOC ? (gen[0] as { slot: Slot }).slot : -1, bufferToSlot);
+          coveredActions++;
+        }
+        break;
+      }
+      case "sequential": {
+        const node = planNodes[action.nodeIndex];
+        const gen = generateSequential(node, slots, bufferToSlot);
+        if (gen === null) {
+          miss(`op:${node.op}`);
+          generating = false;
+          break;
+        }
+        if (generating) {
+          commands.push(...gen.commands);
+          mapNodeResult(node, gen.outSlot, bufferToSlot);
           coveredActions++;
         }
         break;
       }
       default:
-        miss(action.kind === "sequential"
-          ? `op:${planNodes[(action as { nodeIndex: number }).nodeIndex]?.op ?? "?"}`
-          : action.kind);
+        miss(action.kind);
         generating = false;
         break;
     }
@@ -142,6 +170,94 @@ export function generateStream(
     coveredActions,
     uncovered,
     actionCount,
+  };
+}
+
+/** Map a generated node's actual result buffer → its alloc slot (temporal:
+ *  pool reuse overwrites, mirroring the recording's buffer→slot map). */
+function mapNodeResult(
+  node: LazyIRNode,
+  slot: Slot,
+  bufferToSlot: Map<unknown, Slot>,
+): void {
+  if (slot < 0 || !node.result) return;
+  bufferToSlot.set(gpuBuffer(node.result.backendTensor) as unknown, slot);
+}
+
+/** node.op → the WGSL symbol dispatchBinary receives from the backend. */
+const BINARY_OPS = new Map<string, string>([
+  ["add", "+"],
+  ["sub", "-"],
+  ["mul", "*"],
+  ["div", "/"],
+]);
+
+/**
+ * Sequential-action generator. Increment 1: DIRECT binary elementwise via
+ * planBinaryDirect — the SAME plan dispatchBinary's direct tail executes,
+ * so the generated pipeline (resolved through the same getPipeline cache),
+ * workgroups, and params are the dispatcher's by construction. Recorded
+ * shape: ALLOC(out, kind 0, inputs=[a,b]) then DISPATCH(bind=[a,b,out,
+ * params]); the params buffer takes the slot AFTER the output (assigned at
+ * createParamsBuffer during encoding).
+ */
+function generateSequential(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  bufferToSlot: Map<unknown, Slot>,
+): { commands: GpuCommand[]; outSlot: Slot } | null {
+  const wgslOp = BINARY_OPS.get(node.op);
+  if (!wgslOp) return null;
+  if (node.inputs.length !== 2) return null;
+  const ins: WebGPUTensor[] = [];
+  const inSlots: Slot[] = [];
+  for (const ref of node.inputs) {
+    if (ref.kind === "scalar") return null; // scalar-table operand — later
+    const storage =
+      ref.kind === "materialized"
+        ? ref.storage
+        : ((ref.outputIndex ?? 0) === 0
+            ? ref.node.result
+            : ref.node.results?.[ref.outputIndex ?? 0]);
+    if (!storage) return null;
+    const buf = gpuBuffer(storage.backendTensor) as unknown;
+    const slot = bufferToSlot.get(buf);
+    if (slot === undefined) return null; // untracked producer — bail
+    ins.push(storage.backendTensor as WebGPUTensor);
+    inSlots.push(slot);
+  }
+  const plan = planBinaryDirect(wgslOp, ins[0], ins[1]);
+  if (!plan) return null;
+  // Resolve the pipeline through the SAME cache the dispatcher used (at
+  // build time it is warm — this just interns the identity for the diff).
+  const pipeline = getPipeline(requireContext(), plan.key, plan.shader);
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const paramsSlot = slots.length;
+  slots.push({
+    kind: "params",
+    seqIndex: -1,
+    data: plan.paramsData,
+  });
+  return {
+    commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: plan.outputSizeBytes,
+        allocKind: 0,
+        inputSlots: inSlots,
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline,
+        bindings: [...inSlots, outSlot, paramsSlot],
+        gx: plan.dispatchX,
+        gy: plan.dispatchY,
+        gz: 1,
+      },
+    ],
+    outSlot,
   };
 }
 
