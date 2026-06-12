@@ -179,15 +179,6 @@ export interface CompiledPlan {
    *  Restored after compiled plan execution so subsequent non-compiled plans
    *  see the correct global sequence counter positions. */
   endCounters?: { dispatch: number; params: number; output: number };
-  /**
-   * Planned-buffer mode (bounded arena): the recorded buffer per alloc slot.
-   * Replays bind these directly — the exact lifetime-reusing assignment the
-   * recording execution proved safe under the same command order — instead
-   * of growing an unbudgeted per-position arena.
-   */
-  allocBuffers?: (GPUBuffer | undefined)[];
-  /** Buffers adopted from the pool by this plan; destroyed on invalidation. */
-  adoptedBuffers?: GPUBuffer[];
   /** Stage-4 memory planner output: alloc-slot → registry entry index.
    *  Entries live in the step-scoped shared registry (cross-plan packing,
    *  phase 1.5); this plan co-owns every entry listed in plannerEntries. */
@@ -211,10 +202,7 @@ import {
 } from "../backend/webgpu/buffer-arena";
 import { bufferPool } from "../backend/webgpu/buffer-pool";
 import { gpuMemoryTracker } from "../backend/webgpu/memory-tracker";
-import {
-  arenaBufferSet,
-  pinnedBufferSet,
-} from "../backend/webgpu/webgpu-state";
+import { pinnedBufferSet } from "../backend/webgpu/webgpu-state";
 /** Recorded dispatch entry — the subset of fields needed by the compiled plan. */
 export interface RecordedDispatch {
   pipeline: GPUComputePipeline;
@@ -241,7 +229,6 @@ export interface RecordedDispatch {
 import type { LazyIRNode, StorageHandle } from "../graph/types";
 import { getInputStorage } from "./op-dispatch";
 import { planMemory, PlannerRegistry } from "./memory-planner";
-import { isScalarTableBuffer } from "./scalar-table";
 
 /** Recorded buffer copy for compilation. */
 export interface RecordedCopy {
@@ -292,38 +279,22 @@ export function buildCompiledPlan(input: {
 
   const commands: GpuCommand[] = [];
 
-  // Planned-buffer mode (EXPERIMENTAL, TORCHLETTE_COMPILED_PLANNED=1 under
-  // the bounded arena): the recording execution allocated through the
-  // budgeted POOL with liveness reuse, so memory stayed bounded — but the
-  // recorded buffer identities are then per-LIFETIME, not persistent.
-  // Capture the recorded buffer for every alloc slot and pin (adopt) those
-  // buffers to the plan, so replays bind the exact assignment the recording
-  // proved safe under the same command order.
-  //
-  // STATUS 2026-06-10 (evening): WORKING. The stale-grad bug was buffer
-  // destruction beating the pin: (a) adopted buffers were "pinned" by adding
-  // them to arenaBufferSet, whose members the arena evicts/destroys at will;
-  // (b) persistent-slot buffers (recorded bindings to op-internal/unmapped
-  // buffers) were never pinned at all. A replay submit that binds ONE
-  // destroyed buffer is rejected by the device IN ITS ENTIRETY — no compute
-  // executes, every output silently keeps its recorded values (all grads
-  // bit-identical to the recording step). Fixed via pinnedBufferSet
-  // (webgpu-state), consulted by every destroy/release path. Validated:
-  // fullstack parity 4e-6/30 steps vs lowered; medium@512 13.8GB peak at
-  // compiled speed (~2.6x over lowered liveness, <half default-arena mem).
-  const planned = compiledPlannedEnabled();
-  // Stage-4 memory planner (DEFAULT under planned mode since phase 1.5;
-  // TORCHLETTE_MEMORY_PLANNER=0 opts back into the legacy pin mechanism).
-  // Derives the buffer assignment from slot lifetimes instead of pinning
-  // whatever the recording allocated — deterministic, plan-owned, audited
-  // at build — and packs temps across plans through the step-scoped shared
-  // registry. Validated (2026-06-12, A100 same-machine A/B): parity to fp
-  // noise over 30 steps, steady-state speed parity, peak memory BEATS the
-  // pin mechanism by ~14% on both distil@512 (5.07 vs 5.88GB) and
-  // medium@512 (15.0 vs 17.5GB). See docs/stage4-compile-from-ir.md.
-  const usePlanner = planned && ENV.TORCHLETTE_MEMORY_PLANNER !== "0";
-  const allocBuffers: (GPUBuffer | undefined)[] | undefined =
-    planned && !usePlanner ? [] : undefined;
+  // Stage-4 memory planner (THE compiled-replay buffer assignment under
+  // the liveness arena since phase 1.5; TORCHLETTE_MEMORY_PLANNER=0
+  // disables compiled replay wholesale — see compiledPlannedEnabled).
+  // Derives the assignment from slot lifetimes — one owner per buffer,
+  // deterministic, audited at build — and packs temps across plans through
+  // the step-scoped shared registry. Replaced the "pin the recorded pool
+  // buffers" mechanism (aa2a7f5, deleted in phase 1.5): same sharing, but
+  // derived rather than replayed-by-identity, so there is no adoption
+  // refcounting, no pool-origin tracking, and no replay-time fallback
+  // heuristics. Validated (2026-06-12, A100 same-machine A/B): parity to
+  // fp noise over 30 steps, steady-state speed parity, peak memory BEATS
+  // the pin mechanism by ~14% on both distil@512 (5.07 vs 5.88GB) and
+  // medium@512 (15.0 vs 17.5GB). docs/stage4-compile-from-ir.md.
+  // Under the legacy arena (TORCHLETTE_ARENA_LIVENESS=0) replays bind
+  // per-position arena buffers dynamically — no planner needed.
+  const usePlanner = compiledPlannedEnabled();
 
   // Assign a persistent slot at BUILD time for a buffer unmapped at record
   // time (config caches, k-split temps — long-lived singletons, never
@@ -391,7 +362,6 @@ export function buildCompiledPlan(input: {
           }
           return { commands: [], slots: [], results: [], valid: false };
         }
-        if (allocBuffers) allocBuffers[slot] = entry.buffer;
         commands.push({
           tag: TAG_ALLOC,
           slot,
@@ -460,72 +430,6 @@ export function buildCompiledPlan(input: {
     }
   }
 
-  // Pin the recorded alloc buffers to the plan: take them out of pool
-  // circulation (adopt) and shield them from the release chain via
-  // pinnedBufferSet (consulted by every destroy/release path). Adoption is
-  // REFCOUNTED because a pool buffer released by one plan's liveness can be
-  // re-acquired by a LATER plan in the same step (forward's dead activation
-  // buffer reused by backward) — both plans then pin the same buffer and it
-  // must survive until the last one is destroyed. Buffers already
-  // arena-owned (small, below the spill threshold) are left to the arena.
-  let adoptedBuffers: GPUBuffer[] | undefined;
-  if (allocBuffers) {
-    adoptedBuffers = [];
-    const seen = new Set<GPUBuffer>();
-    const adopt = (buf: GPUBuffer) => {
-      if (seen.has(buf)) return;
-      seen.add(buf);
-      // Scalar-table buffers are TABLE-owned (refreshed every execution,
-      // destroyed only by destroyScalarTable). Adopting them couples their
-      // lifetime to the plan: invalidation destroys them while the live
-      // table still writes to them ("used in submit while destroyed").
-      if (isScalarTableBuffer(buf)) return;
-      const rc = adoptedRefCount.get(buf);
-      if (rc !== undefined) {
-        adoptedRefCount.set(buf, rc + 1);
-        adoptedBuffers!.push(buf);
-      } else if (!arenaBufferSet.has(buf)) {
-        const poolOrigin = bufferPool.adoptBuffer(buf);
-        adoptedPoolOrigin.set(buf, poolOrigin);
-        // PIN, don't masquerade as arena-owned: arenaBufferSet members are
-        // managed (evicted, released, destroyed) by the arena at will — the
-        // arena's conflict/eviction paths delete membership and route the
-        // buffer back into the release chain, killing the pin. The pinned
-        // set is consulted by EVERY destroy/release path and only this
-        // plan's teardown removes from it.
-        pinnedBufferSet.add(buf);
-        adoptedRefCount.set(buf, 1);
-        adoptedBuffers!.push(buf);
-        if (ENV.TORCHLETTE_DEBUG_DESTROYED) {
-          console.log(
-            `[pin] buf=${dbgBufId(buf)} size=${(((buf as unknown as { size?: number }).size ?? 0) / 1e6).toFixed(1)}MB alreadyDestroyed=${_dbgDestroyed.has(buf)}`,
-          );
-        }
-      }
-    };
-    for (const buf of allocBuffers) {
-      if (buf) adopt(buf);
-    }
-    if (ENV.TORCHLETTE_DEBUG_DESTROYED) {
-      const sample = allocBuffers.find((b) => b);
-      if (sample) dbgPatchDestroy(sample);
-    }
-    // PERSISTENT-slot buffers must be pinned too. They are recorded bindings
-    // whose buffer was unmapped at record time: op-internal allocations
-    // (contiguous/k-split temps), kernel side buffers (LN saved stats,
-    // partial workspaces), and module-singleton caches. Under the bounded
-    // arena these can be pool-recycled or destroyed when their owning
-    // tensor/storage dies (e.g. at markStep) — and a replay that binds ONE
-    // destroyed buffer has its ENTIRE submit rejected by the device
-    // ("buffer used in submit while destroyed"), silently freezing every
-    // output of the plan at its recorded values. That was the planned-
-    // buffers stale-grad bug: all grads bit-identical to the recording step
-    // because the backward's submits never executed.
-    for (const src of slotSources) {
-      if (src.kind === "persistent") adopt(src.buffer);
-    }
-  }
-
   if (ENV.TORCHLETTE_DEBUG_COMPILED) {
     const dispatchCount = commands.filter((c) => c.tag === TAG_DISPATCH).length;
     const allocCount = commands.filter((c) => c.tag === TAG_ALLOC).length;
@@ -567,8 +471,6 @@ export function buildCompiledPlan(input: {
     slots: slotSources,
     results: nodeResults,
     valid: true,
-    allocBuffers,
-    adoptedBuffers,
     plannerAssignment,
     plannerEntries,
     plannerGen: plannerEntries ? plannerRegistry.generation : undefined,
@@ -604,13 +506,6 @@ export function resetPlannerRegistry(): void {
     }
   }
 }
-
-/** Refcount for buffers adopted by compiled plans (shared across plans when
- *  pool-liveness reuse hands one buffer to multiple plans in a step). */
-const adoptedRefCount = new Map<GPUBuffer, number>();
-/** Whether an adopted buffer was POOL-managed at adoption (plan teardown
- *  destroys only these; cache-owned pinned buffers are merely unpinned). */
-const adoptedPoolOrigin = new Map<GPUBuffer, boolean>();
 
 /** Debug: stable small ids for GPUBuffer identity in logs. */
 const _dbgBufIds = new WeakMap<GPUBuffer, number>();
@@ -660,10 +555,8 @@ export function dbgIsDestroyed(buf: GPUBuffer): boolean {
 }
 
 /**
- * Release a plan's adopted buffers (planned-buffer mode). Called when the
- * compiled plan is invalidated or its template evicted. Buffers still owned
- * by a live tensor re-enter the normal release chain once unpinned; the rest
- * are destroyed immediately.
+ * Release a plan's planner-registry entries. Called when the compiled plan
+ * is invalidated or its template evicted.
  */
 export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
   // Release co-owned registry entries (cross-plan packing). An entry's
@@ -696,34 +589,6 @@ export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
     compiled.plannerAssignment = undefined;
     compiled.plannerGen = undefined;
   }
-  if (!compiled.adoptedBuffers) {
-    return;
-  }
-  for (const buf of compiled.adoptedBuffers) {
-    const rc = adoptedRefCount.get(buf);
-    if (rc !== undefined && rc > 1) {
-      adoptedRefCount.set(buf, rc - 1);
-      continue;
-    }
-    adoptedRefCount.delete(buf);
-    pinnedBufferSet.delete(buf);
-    const poolOrigin = adoptedPoolOrigin.get(buf) ?? false;
-    adoptedPoolOrigin.delete(buf);
-    // Cache-owned buffers (tile configs, kernel workspaces, singleton
-    // params): unpin only — their caches own destruction.
-    if (!poolOrigin) continue;
-    if (bufferPool.canRecycle(buf)) {
-      // DEFERRED destruction, never immediate: plan teardown fires MID-STEP
-      // (staleness gates, template eviction) while the step-level encoder
-      // still holds encoded passes binding these buffers — an immediate
-      // destroy() poisons the pending submit (Dawn drops it wholesale;
-      // downstream silently reads stale data — the forced-liveness late-LR
-      // freeze). deferredDestroy destroys after the next fence.
-      bufferPool.deferredDestroy(buf, (buf as { size?: number }).size ?? 0);
-    }
-  }
-  compiled.adoptedBuffers = undefined;
-  compiled.allocBuffers = undefined;
 }
 
 // ============================================================================
@@ -1112,22 +977,12 @@ export async function executeCompiledPlan(
   const ctx = requireContext();
   const device = ctx.device;
   const slots: GPUBuffer[] = new Array(compiled.slots.length);
-  const externalInputSet = compiled.allocBuffers
-    ? new Set(externalInputBuffers)
-    : null;
-  // Planned buffers whose FIRST lifetime this replay failed safety checks
-  // (still owned by a live tensor, or external-input conflict) — all their
-  // lifetimes fall back to dynamic allocation this replay.
-  let plannedFallback: Set<GPUBuffer> | null = null;
-  let plannedSeen: Set<GPUBuffer> | null = null;
-  let plannedBindCount = 0;
-  let plannedFallbackCount = 0;
   /** Lazily evaluated once per replay: registry reset since build? */
   let plannerGenStale: boolean | undefined;
 
   if (ENV.TORCHLETTE_DEBUG_COMPILED) {
     console.log(
-      `[compiled] Executing: ${compiled.commands.length} cmds, ${compiled.slots.length} slots, ${compiled.results.length} results${compiled.allocBuffers ? " (planned buffers)" : ""}`,
+      `[compiled] Executing: ${compiled.commands.length} cmds, ${compiled.slots.length} slots, ${compiled.results.length} results${compiled.plannerAssignment ? " (planner)" : ""}`,
     );
   }
 
@@ -1261,44 +1116,8 @@ export async function executeCompiledPlan(
               break;
             }
           }
-          // Planned-buffer path: bind the recorded buffer for this lifetime.
-          // Safety: (1) first use this replay must not be owned by a live
-          // tensor (a kept/user tensor would be clobbered — same check the
-          // arena does via canRecycle); later lifetimes of the same buffer
-          // within this replay are safe by queue order, exactly as recorded.
-          // (2) never alias an external input (template-reuse conflict) or a
-          // direct input of this op. On failure, fall back to dynamic
-          // allocation for ALL of this buffer's lifetimes this replay.
-          const planned = compiled.allocBuffers
-            ? ENV.TORCHLETTE_PLANNED_BIND === "0"
-              ? undefined
-              : compiled.allocBuffers[cmd.slot]
-            : undefined;
-          if (planned) {
-            if (!plannedSeen) {
-              plannedSeen = new Set();
-              plannedFallback = new Set();
-            }
-            let ok = !plannedFallback!.has(planned);
-            if (ok && !plannedSeen.has(planned)) {
-              plannedSeen.add(planned);
-              if (
-                bufferPool.isLive(planned) ||
-                externalInputSet?.has(planned)
-              ) {
-                plannedFallback!.add(planned);
-                ok = false;
-              }
-            }
-            if (ok && inputBufs.some((b) => b === planned)) ok = false;
-            if (ok) {
-              trackSharedEncoderWrite(planned);
-              slots[cmd.slot] = planned;
-              plannedBindCount++;
-              break;
-            }
-            plannedFallbackCount++;
-          }
+          // No planner assignment (legacy arena mode, or a slot outside
+          // the assignment): dynamic allocation through the arena/pool.
           slots[cmd.slot] =
             cmd.allocKind === 0
               ? resolveOutputBuffer(device, cmd.bytes, inputBufs)
@@ -1474,24 +1293,6 @@ export async function executeCompiledPlan(
           break;
         }
       }
-    }
-
-    if (ENV.TORCHLETTE_DEBUG_COMPILED && compiled.allocBuffers) {
-      console.log(
-        `[compiled] planned binds=${plannedBindCount} fallbacks=${plannedFallbackCount}`,
-      );
-    }
-    // A planned-bind fallback is a cross-plan correctness hazard, not just a
-    // perf event: OTHER plans' recorded (persistent/planned) bindings to this
-    // buffer assume THIS plan rewrites it every step. When we fall back, our
-    // writes go to a dynamic buffer and every frozen reader sees the stale
-    // recorded one. Too late to unwind this execution — invalidate so the
-    // next step re-records against current buffer assignments, and say so.
-    if (plannedFallbackCount > 0 && compiled.allocBuffers) {
-      console.warn(
-        `[compiled-plan] ${plannedFallbackCount} planned-bind fallback(s) — recorded buffer assignment no longer safe; invalidating plan for re-record (cross-plan readers of the recorded buffers may have read stale data THIS step)`,
-      );
-      compiled.valid = false;
     }
 
     // Restore global sequence counters to where the normal path would have

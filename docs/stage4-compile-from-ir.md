@@ -86,6 +86,36 @@ found at the seam instead of in a loss curve.
   (pins stream determinism, which everything below assumes).
 - `DispatchPlan` type + registry stub; no behavior change.
 
+### Phase 0+1 status (2026-06-12): SHIPPED
+Phase 0 landed in ca7ff56 (determinism gate caught two real ownership bugs
+at build: scalar-table buffers adopted as persistent slots; cache-owned tile
+configs destroyed at plan teardown). Phase 1 landed opt-in in 067be59, then
+phase 1.5 (below) made it the default and DELETED the pin mechanism.
+
+### Phase 1.5 — Cross-plan packing (SHIPPED 2026-06-12)
+Finding: the pin mechanism's cross-plan sharing was never "forward's dead
+activations serve backward" — adoption at build time removes a plan's
+recorded buffers from pool circulation BEFORE later plans record, so the
+only sharing that ever existed was earlier plans' intra-plan-dead TEMPS
+(investigated via an "external death claims" prototype that re-expressed
+recorded reuse identity-independently: structurally zero witnesses).
+
+Since plans within a step execute strictly sequentially, ANY non-result
+planner buffer is safe to share with any other plan, in any order. Temps
+draw from a step-scoped shared PlannerRegistry (module-global, reset at
+engine-instance boundaries with a generation guard); results keep exclusive
+entries. This shares deterministically and completely what the pool shared
+opportunistically.
+
+Gates (A100 same-machine A/B): peak memory planner BEATS pin ~14% on both
+distil@512 (5.07 vs 5.88GB) and medium@512 (15.0 vs 17.5GB); steady-state
+speed parity; fullstack parity to fp noise; determinism PASS; 124M
+regression PASS both modes; suites green both modes. Deleted: adoption
+refcounting, pool-origin tracking, allocBuffers, planned-bind replay
+fallbacks, bufferPool.adoptBuffer. TORCHLETTE_MEMORY_PLANNER=0 now disables
+compiled replay wholesale (lowered path) — a dynamic-alloc replay would
+leak ownerless temp buffers, so it is not offered.
+
 ### Phase 1 — Memory planner against RECORDED streams
 Keep recording for WHAT to dispatch; replace the buffer assignment:
 - Inputs: per-slot byte sizes + first/last use (from the recorded alloc/

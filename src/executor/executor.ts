@@ -770,9 +770,8 @@ export async function executeLoweredPlan(
     options.bufferArena &&
     ENV.TORCHLETTE_COMPILED_PLAN !== "0" &&
     // Liveness-aware arena reuses one buffer across multiple positions, so
-    // compiled replay needs the EXPERIMENTAL planned-buffer mode (such plans
-    // carry allocBuffers — the pinned, lifetime-split assignment recorded
-    // from the pool-reusing execution). See buildCompiledPlan for status.
+    // compiled replay needs planned mode (the memory planner derives a
+    // lifetime-split buffer assignment per plan — see buildCompiledPlan).
     (!arenaLivenessEnabled() || compiledPlannedEnabled())
   ) {
     if (ENV.TORCHLETTE_DEBUG_COMPILED) {

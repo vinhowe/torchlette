@@ -340,8 +340,15 @@ export function arenaLivenessEnabled(): boolean {
  * pre-2026-06-10 liveness behavior). No effect in default-arena mode.
  */
 export function compiledPlannedEnabled(): boolean {
+  // Under the liveness arena, compiled replay REQUIRES the memory planner:
+  // replay alloc commands bind plan-owned registry buffers. A hypothetical
+  // dynamic-alloc replay leaks every non-result temp (no storage owns the
+  // buffers TAG_ALLOC creates), so TORCHLETTE_MEMORY_PLANNER=0 disables
+  // compiled replay wholesale — the lowered path is the escape hatch.
   return (
-    arenaLivenessEnabled() && ENV.TORCHLETTE_COMPILED_PLANNED !== "0"
+    arenaLivenessEnabled() &&
+    ENV.TORCHLETTE_COMPILED_PLANNED !== "0" &&
+    ENV.TORCHLETTE_MEMORY_PLANNER !== "0"
   );
 }
 let _arenaSpillBytes: number | null = null;
