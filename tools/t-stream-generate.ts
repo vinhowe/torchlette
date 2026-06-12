@@ -32,11 +32,20 @@ async function main() {
   });
   const out = stdout + "\n" + stderr;
   const lines = out.split("\n").filter((l) => l.includes("[stream-gen]"));
-  const matches = lines.filter((l) => l.includes("MATCH")).length;
+  const matches = lines.filter(
+    (l) => l.includes("MATCH") || l.includes("VERIFIED"),
+  ).length;
   const diverges = lines.filter((l) => l.includes("DIVERGE")).length;
+  let verifiedCmds = 0;
+  for (const l of lines) {
+    const m = l.match(/VERIFIED \d+\/\d+ segments \((\d+) cmds/);
+    if (m) verifiedCmds += parseInt(m[1], 10);
+  }
   for (const l of lines) console.log(l.trim());
-  console.log(`[t-stream-generate] hook-fires=${matches} diverges=${diverges}`);
-  if (diverges > 0 || matches === 0) {
+  console.log(
+    `[t-stream-generate] hook-fires=${matches} diverges=${diverges} verified-cmds=${verifiedCmds}`,
+  );
+  if (diverges > 0 || matches === 0 || verifiedCmds === 0) {
     console.log("STREAM-GENERATE: FAIL");
     process.exit(1);
   }

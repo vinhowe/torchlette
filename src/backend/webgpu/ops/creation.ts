@@ -153,13 +153,15 @@ export function zeros(shape: number[], dtype: DType = "f32"): WebGPUTensor {
       encoder.clearBuffer(buffer, 0, alignedSize);
       submitOrCollect(encoder.finish());
     }
-    // Record the clear so the compiled plan replays it. Without this, the
-    // compiled replay reuses this (stale) arena/pool buffer without re-zeroing,
-    // corrupting accumulating ops that read a zeroed buffer (embedding-grad
-    // scatter-add). No-op when not recording. recordClear relies on the slot
-    // assigned by the resolveOutputBuffer above (recordAlloc).
-    recordClear(buffer, alignedSize);
   }
+  // Record the clear UNCONDITIONALLY — outside the reuse check above. The
+  // encode-time clear is skippable for a fresh (spec-zeroed) buffer, but a
+  // REPLAY always binds a reused buffer: a recording taken on a step where
+  // this allocation happened to be fresh would replay without re-zeroing,
+  // corrupting accumulating ops that read a zeroed buffer (the embedding-
+  // grad scatter-add class, latent variant). No-op when not recording.
+  // recordClear relies on the slot assigned by resolveOutputBuffer above.
+  recordClear(buffer, alignedSize);
 
   return createTensor(shape, buffer);
 }

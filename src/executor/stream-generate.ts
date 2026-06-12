@@ -36,19 +36,19 @@ import {
 import type { LoweredPlan } from "./lowered-plan";
 
 export interface GeneratedStream {
-  /** Commands generated for the covered action PREFIX (all actions before
-   *  the first one lacking a generator; the whole plan when fullyCovered). */
+  /** Per-covered-action command segments, in action order. Verified against
+   *  the recording by diffSegmentsAligned (slot-bijection comparison), so
+   *  every covered action is checked even when other actions are uncovered. */
+  segments: Array<{ nodeIndex: number; commands: GpuCommand[] }>;
+  /** Flat concatenation of segments (full-stream diff when fullyCovered). */
   commands: GpuCommand[];
-  /** Slot sources, parallel to the recording's table over the prefix. */
+  /** Slot sources for generated slots (placeholder kinds; numbering local). */
   slots: SlotSource[];
-  /** Whether every action had a generator (full-stream diff vs prefix). */
+  /** Whether every action had a generator. */
   fullyCovered: boolean;
-  /** Actions covered before generation stopped. */
   coveredActions: number;
-  /** op/action label → count of actions WITHOUT a generator (entire plan,
-   *  not just the stopping action — coverage telemetry). */
+  /** op/action label → count of actions WITHOUT a generator. */
   uncovered: Map<string, number>;
-  /** Total actions examined. */
   actionCount: number;
 }
 
@@ -102,43 +102,43 @@ export function generateStream(
     uncovered.set(label, (uncovered.get(label) ?? 0) + 1);
   };
 
-  // 2. Walk actions in execution order, generating until the first action
-  //    without a generator (the PREFIX — diffable against the recorded
-  //    stream's head because both follow action order). Keep walking after
-  //    that for coverage telemetry only.
+  // 2. Walk actions in execution order. Covered actions yield verifiable
+  //    segments. Uncovered actions still map their output buffers to fresh
+  //    PHANTOM slots, so downstream covered actions can reference their
+  //    results — the segment diff compares modulo slot renaming, so phantom
+  //    numbering needn't match the recording.
+  const segments: Array<{ nodeIndex: number; commands: GpuCommand[] }> = [];
   let actionCount = 0;
   let coveredActions = 0;
-  let generating = true;
+  const phantom = (node: LazyIRNode | undefined) => {
+    if (!node) return;
+    const slot = slots.length;
+    slots.push({ kind: "arena" });
+    mapNodeResult(node, slot, bufferToSlot);
+  };
   for (const action of loweredPlan.actions) {
     actionCount++;
     switch (action.kind) {
       case "view":
       case "prologue-skip":
-        if (generating) coveredActions++;
+        coveredActions++;
         break;
       case "reclaim":
-        if (generating) {
-          commands.push({ tag: TAG_BARRIER });
-          coveredActions++;
-        }
+        commands.push({ tag: TAG_BARRIER });
+        coveredActions++;
         break;
       case "data-source": {
         const node = planNodes[action.nodeIndex];
         const gen = generateDataSource(node, action.nodeIndex, slots);
         if (!gen) {
           miss(`data-source:${node.op}${node.dtype !== "f32" ? `:${node.dtype}` : ""}`);
-          generating = false;
+          phantom(node);
           break;
         }
-        if (generating) {
-          commands.push(...gen);
-          // Map the node's actual result buffer to its alloc slot so later
-          // ops can reference it as an input (build-time shadow generation
-          // reads post-execution buffer identity; pure generation will use
-          // logical node identity instead).
-          mapNodeResult(node, gen[0].tag === TAG_ALLOC ? (gen[0] as { slot: Slot }).slot : -1, bufferToSlot);
-          coveredActions++;
-        }
+        commands.push(...gen);
+        segments.push({ nodeIndex: action.nodeIndex, commands: gen });
+        mapNodeResult(node, gen[0].tag === TAG_ALLOC ? (gen[0] as { slot: Slot }).slot : -1, bufferToSlot);
+        coveredActions++;
         break;
       }
       case "sequential": {
@@ -146,24 +146,40 @@ export function generateStream(
         const gen = generateSequential(node, slots, bufferToSlot);
         if (gen === null) {
           miss(`op:${node.op}`);
-          generating = false;
+          phantom(node);
           break;
         }
-        if (generating) {
-          commands.push(...gen.commands);
-          mapNodeResult(node, gen.outSlot, bufferToSlot);
-          coveredActions++;
+        commands.push(...gen.commands);
+        segments.push({ nodeIndex: action.nodeIndex, commands: gen.commands });
+        mapNodeResult(node, gen.outSlot, bufferToSlot);
+        coveredActions++;
+        break;
+      }
+      default: {
+        miss(action.kind);
+        // Map every output node the action produces (fused groups,
+        // matmul-epilogue, adam batches, row programs, reductions).
+        const a = action as {
+          nodeIndex?: number;
+          nodeIndices?: number[];
+          outputNodeIndex?: number;
+          additionalOutputNodeIndices?: number[];
+        };
+        for (const ni of [
+          a.nodeIndex,
+          a.outputNodeIndex,
+          ...(a.nodeIndices ?? []),
+          ...(a.additionalOutputNodeIndices ?? []),
+        ]) {
+          if (ni !== undefined) phantom(planNodes[ni]);
         }
         break;
       }
-      default:
-        miss(action.kind);
-        generating = false;
-        break;
     }
   }
 
   return {
+    segments,
     commands,
     slots,
     fullyCovered: uncovered.size === 0,
@@ -293,9 +309,15 @@ function generateDataSource(
     case "zeros": {
       const slot = slots.length;
       slots.push({ kind: "arena" });
+      // The executor records a TAG_WRITE for EVERY data-source node
+      // (op-agnostic), so a zeros node is ALLOC+CLEAR+WRITE. The write
+      // re-uploads zero data the clear already produced — redundant but
+      // recorded reality; mirror it (candidate cleanup: skip the write for
+      // zeros at the executor seam, which would also shrink replays).
       return [
         { tag: TAG_ALLOC, slot, bytes, allocKind: 0, inputSlots: [] },
         { tag: TAG_CLEAR, slot, bytes: alignBufferSize(bytes) },
+        { tag: TAG_WRITE, slot, nodeIndex },
       ];
     }
     default:

@@ -1,6 +1,6 @@
 import { ENV } from "../core/env";
 import { getBackend } from "../backend/registry";
-import { diffStreams } from "./stream-diff";
+import { diffSegmentsAligned, diffStreams } from "./stream-diff";
 import { generateStream } from "./stream-generate";
 import type {
   AdamStepConfig,
@@ -1709,21 +1709,26 @@ export async function executeLoweredPlan(
           .slice(0, 8)
           .map(([k, v]) => `${k}×${v}`)
           .join(" ");
-        const recorded = gen.fullyCovered
-          ? compiled.commands
-          : compiled.commands.slice(0, gen.commands.length);
-        const d = diffStreams(gen.commands, recorded);
-        if (!d.equal) {
-          console.warn(
-            `[stream-gen] DIVERGE at cmd ${d.firstDivergence}: generated="${d.a}" recorded="${d.b}" (gen ${d.lengthA} vs rec-${gen.fullyCovered ? "full" : "prefix"} ${d.lengthB} cmds)`,
-          );
-        } else if (gen.fullyCovered) {
-          console.log(
-            `[stream-gen] MATCH ${compiled.commands.length} cmds (${gen.actionCount} actions)`,
-          );
+        if (gen.fullyCovered) {
+          const d = diffStreams(gen.commands, compiled.commands);
+          if (d.equal) {
+            console.log(
+              `[stream-gen] MATCH ${compiled.commands.length} cmds (${gen.actionCount} actions)`,
+            );
+          } else {
+            console.warn(
+              `[stream-gen] DIVERGE at cmd ${d.firstDivergence}: generated="${d.a}" recorded="${d.b}" (gen ${d.lengthA} vs rec ${d.lengthB} cmds)`,
+            );
+          }
         } else {
+          const seg = diffSegmentsAligned(gen.segments, compiled.commands);
+          for (const div of seg.divergences.slice(0, 3)) {
+            console.warn(
+              `[stream-gen] DIVERGE node[${div.nodeIndex}] op=${planNodes[div.nodeIndex]?.op ?? "?"}: ${div.detail}`,
+            );
+          }
           console.log(
-            `[stream-gen] MATCH-PREFIX ${gen.commands.length}/${compiled.commands.length} cmds (${gen.coveredActions}/${gen.actionCount} actions; uncovered: ${top})`,
+            `[stream-gen] VERIFIED ${seg.verifiedActions}/${gen.segments.length} segments (${seg.verifiedCommands} cmds, ${seg.divergences.length} diverged, ${seg.unmatched} unmatched; covered ${gen.coveredActions}/${gen.actionCount} actions; uncovered: ${top})`,
           );
         }
       }

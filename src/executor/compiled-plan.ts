@@ -53,6 +53,9 @@ export interface AllocCommand {
   allocKind: 0 | 1;
   /** Slots whose buffers are inputs to this op (for aliasing check in resolveOutputBuffer). */
   inputSlots: Slot[];
+  /** Plan-node index that produced this command (segment-aligned stream
+   *  diffing, stage-4 phase 2). Not used by replay. */
+  nodeIndex?: number;
 }
 
 export interface DispatchCommand {
@@ -75,6 +78,8 @@ export interface DispatchCommand {
    *  sequence counter is misaligned during compiled plan replay. */
   cachedBindGroup?: GPUBindGroup;
   cachedBuffers?: GPUBuffer[];
+  /** Plan-node index (segment-aligned stream diffing). Not used by replay. */
+  nodeIndex?: number;
 }
 
 export interface CopyCommand {
@@ -84,6 +89,8 @@ export interface CopyCommand {
   srcOffset: number;
   dstOffset: number;
   bytes: number;
+  /** Plan-node index (segment-aligned stream diffing). Not used by replay. */
+  nodeIndex?: number;
 }
 
 export interface WriteCommand {
@@ -107,6 +114,8 @@ export interface ClearCommand {
   tag: 5; // "clear"
   slot: Slot;
   bytes: number;
+  /** Plan-node index (segment-aligned stream diffing). Not used by replay. */
+  nodeIndex?: number;
 }
 
 /**
@@ -349,6 +358,7 @@ export function buildCompiledPlan(input: {
           gz: d.workgroupsZ,
           label: d.label,
           module: d.module,
+          nodeIndex: entry.nodeIndex,
         });
         break;
       }
@@ -368,6 +378,7 @@ export function buildCompiledPlan(input: {
           bytes: entry.bytes,
           allocKind: entry.allocKind,
           inputSlots: entry.inputSlots,
+          nodeIndex: entry.nodeIndex,
         });
         break;
       }
@@ -383,6 +394,7 @@ export function buildCompiledPlan(input: {
           srcOffset: entry.copy.srcOffset,
           dstOffset: entry.copy.dstOffset,
           bytes: entry.copy.bytes,
+          nodeIndex: entry.nodeIndex,
         });
         break;
       }
@@ -420,7 +432,12 @@ export function buildCompiledPlan(input: {
           }
           return { commands: [], slots: [], results: [], valid: false };
         }
-        commands.push({ tag: TAG_CLEAR, slot: entry.slot, bytes: entry.bytes });
+        commands.push({
+          tag: TAG_CLEAR,
+          slot: entry.slot,
+          bytes: entry.bytes,
+          nodeIndex: entry.nodeIndex,
+        });
         break;
       }
       case "barrier": {
@@ -599,7 +616,7 @@ export function destroyCompiledPlanBuffers(compiled: CompiledPlan): void {
 // time → assigned a persistent slot at build). See RecordedDispatch.slots
 // for why temporal resolution matters under buffer-lifetime reuse.
 export type CommandLogEntry =
-  | { kind: "dispatch"; dispatch: RecordedDispatch }
+  | { kind: "dispatch"; dispatch: RecordedDispatch; nodeIndex?: number }
   | {
       kind: "alloc";
       buffer: GPUBuffer;
@@ -608,10 +625,11 @@ export type CommandLogEntry =
       inputBuffers: GPUBuffer[];
       slot: Slot;
       inputSlots: Slot[];
+      nodeIndex?: number;
     }
-  | { kind: "copy"; copy: RecordedCopy; srcSlot: Slot; dstSlot: Slot }
+  | { kind: "copy"; copy: RecordedCopy; srcSlot: Slot; dstSlot: Slot; nodeIndex?: number }
   | { kind: "write"; buffer: GPUBuffer; nodeIndex: number; slot: Slot }
-  | { kind: "clear"; buffer: GPUBuffer; bytes: number; slot: Slot }
+  | { kind: "clear"; buffer: GPUBuffer; bytes: number; slot: Slot; nodeIndex?: number }
   | {
       kind: "uniform";
       buffer: GPUBuffer;
@@ -779,7 +797,7 @@ export function recordDispatch(dispatch: RecordedDispatch): void {
     }
     dispatch.slots = slots;
   }
-  activeCommandLog.push({ kind: "dispatch", dispatch });
+  activeCommandLog.push({ kind: "dispatch", dispatch, nodeIndex: recordingNodeIndex });
 }
 
 /**
@@ -828,6 +846,7 @@ export function recordAlloc(
     inputBuffers,
     slot,
     inputSlots,
+    nodeIndex: recordingNodeIndex,
   });
 }
 
@@ -839,6 +858,7 @@ export function recordCopy(copy: RecordedCopy): void {
     copy,
     srcSlot: activeBufferToSlot?.get(copy.src) ?? -1,
     dstSlot: activeBufferToSlot?.get(copy.dst) ?? -1,
+    nodeIndex: recordingNodeIndex,
   });
 }
 
@@ -916,6 +936,7 @@ export function recordClear(buffer: GPUBuffer, bytes: number): void {
     buffer,
     bytes,
     slot: activeBufferToSlot?.get(buffer) ?? -1,
+    nodeIndex: recordingNodeIndex,
   });
 }
 

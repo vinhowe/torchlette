@@ -126,6 +126,122 @@ export function diffCompiledPlans(
 }
 
 // ============================================================================
+// Stage-4 phase 2: segment-aligned diffing — verify each covered action's
+// generated commands against the recording even when OTHER actions are
+// uncovered. Recorded commands carry the plan-node index that produced them;
+// slot numbering differs between the two streams once coverage has gaps, so
+// comparison is done MODULO a slot bijection built incrementally (consistent
+// across all compared segments — a generated slot must map to exactly one
+// recorded slot and vice versa). Pipelines compare by object identity (both
+// sides resolve through the same caches).
+// ============================================================================
+
+export interface SegmentDiffResult {
+  verifiedActions: number;
+  verifiedCommands: number;
+  divergences: Array<{ nodeIndex: number; detail: string }>;
+  /** Generated segments with no recorded counterpart (alignment gap). */
+  unmatched: number;
+}
+
+export function diffSegmentsAligned(
+  genSegments: Array<{ nodeIndex: number; commands: GpuCommand[] }>,
+  recorded: GpuCommand[],
+): SegmentDiffResult {
+  const recByNode = new Map<number, GpuCommand[]>();
+  for (const c of recorded) {
+    const ni = (c as { nodeIndex?: number }).nodeIndex;
+    if (ni === undefined || ni < 0) continue;
+    let l = recByNode.get(ni);
+    if (!l) recByNode.set(ni, (l = []));
+    l.push(c);
+  }
+  const g2r = new Map<number, number>();
+  const r2g = new Map<number, number>();
+  const mapSlot = (g: number, r: number): boolean => {
+    const eg = g2r.get(g);
+    if (eg !== undefined) return eg === r;
+    if (r2g.has(r)) return false;
+    g2r.set(g, r);
+    r2g.set(r, g);
+    return true;
+  };
+  const mapSlots = (g: number[], r: number[]): boolean =>
+    g.length === r.length && g.every((gs, i) => mapSlot(gs, r[i]));
+
+  const result: SegmentDiffResult = {
+    verifiedActions: 0,
+    verifiedCommands: 0,
+    divergences: [],
+    unmatched: 0,
+  };
+  for (const seg of genSegments) {
+    const rec = recByNode.get(seg.nodeIndex);
+    if (!rec) {
+      result.unmatched++;
+      continue;
+    }
+    let detail: string | null = null;
+    if (rec.length !== seg.commands.length) {
+      detail = `command count gen=${seg.commands.length} rec=${rec.length} (rec: ${canonicalizeStream(rec).join(" | ")})`;
+    } else {
+      for (let i = 0; i < rec.length && !detail; i++) {
+        const g = seg.commands[i];
+        const r = rec[i];
+        if (g.tag !== r.tag) {
+          detail = `cmd ${i}: tag gen=${g.tag} rec=${r.tag}`;
+          break;
+        }
+        switch (g.tag) {
+          case TAG_ALLOC: {
+            const rr = r as typeof g;
+            if (g.bytes !== rr.bytes) detail = `cmd ${i}: alloc bytes gen=${g.bytes} rec=${rr.bytes}`;
+            else if (g.allocKind !== rr.allocKind) detail = `cmd ${i}: allocKind gen=${g.allocKind} rec=${rr.allocKind}`;
+            else if (!mapSlots(g.inputSlots, rr.inputSlots)) detail = `cmd ${i}: alloc inputSlots gen=[${g.inputSlots}] rec=[${rr.inputSlots}]`;
+            else if (!mapSlot(g.slot, rr.slot)) detail = `cmd ${i}: alloc slot bijection gen=${g.slot} rec=${rr.slot}`;
+            break;
+          }
+          case TAG_DISPATCH: {
+            const rr = r as typeof g;
+            if (g.pipeline !== rr.pipeline) detail = `cmd ${i}: pipeline identity differs`;
+            else if (g.gx !== rr.gx || g.gy !== rr.gy || g.gz !== rr.gz) detail = `cmd ${i}: workgroups gen=${g.gx}x${g.gy}x${g.gz} rec=${rr.gx}x${rr.gy}x${rr.gz}`;
+            else if (!mapSlots(g.bindings, rr.bindings)) detail = `cmd ${i}: bindings gen=[${g.bindings}] rec=[${rr.bindings}]`;
+            break;
+          }
+          case TAG_CLEAR: {
+            const rr = r as typeof g;
+            if (g.bytes !== rr.bytes) detail = `cmd ${i}: clear bytes gen=${g.bytes} rec=${rr.bytes}`;
+            else if (!mapSlot(g.slot, rr.slot)) detail = `cmd ${i}: clear slot bijection`;
+            break;
+          }
+          case TAG_WRITE: {
+            const rr = r as typeof g;
+            if (g.nodeIndex !== rr.nodeIndex) detail = `cmd ${i}: write nodeIndex gen=${g.nodeIndex} rec=${rr.nodeIndex}`;
+            else if (!mapSlot(g.slot, rr.slot)) detail = `cmd ${i}: write slot bijection`;
+            break;
+          }
+          case TAG_COPY: {
+            const rr = r as typeof g;
+            if (g.bytes !== rr.bytes || g.srcOffset !== rr.srcOffset || g.dstOffset !== rr.dstOffset) detail = `cmd ${i}: copy geometry differs`;
+            else if (!mapSlot(g.src, rr.src) || !mapSlot(g.dst, rr.dst)) detail = `cmd ${i}: copy slot bijection`;
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    }
+    if (detail) {
+      result.divergences.push({ nodeIndex: seg.nodeIndex, detail });
+    } else {
+      result.verifiedActions++;
+      result.verifiedCommands += seg.commands.length;
+    }
+  }
+  return result;
+}
+
+// ============================================================================
 // Stage-4 phase 0: DispatchPlan interface (registry stub — no behavior yet).
 // ============================================================================
 
