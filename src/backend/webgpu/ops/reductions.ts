@@ -340,6 +340,18 @@ export function sum(a: BackendTensor, options?: SumOptions): BackendTensor {
   return reduction("sum", a, options);
 }
 
+/** Stage-4 plan/encode: the FULL-reduction dispatch plan, derived from the
+ *  SAME cached dispatcher instance fullReduction() uses (shared config
+ *  cache → shared config buffer identity). */
+export function planFullReductionDispatch(
+  op: ReduceOp,
+  size: number,
+): import("../tile-dispatch").TileKernelPlan {
+  return getCachedDispatcher(`${op}Full`, () =>
+    makeReductionSpec({ reduceOp: op }),
+  ).plan({ size });
+}
+
 // ============================================================================
 // Sum Full Reduction Chunked
 // ============================================================================

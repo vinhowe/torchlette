@@ -134,7 +134,26 @@ export type VolatileUniformRepack = (
   node: LazyIRNode,
 ) => Record<string, number>;
 
+/** Stage-4 plan/encode: a tile dispatch fully described without encoding. */
+export interface TileKernelPlan {
+  pipeline: GPUComputePipeline;
+  /** Binding names in bind-group order; null marks the uniform config slot. */
+  bindingOrder: (string | null)[];
+  grid: [number, number, number];
+  /** The instance's cached config buffer for these uniforms (null when the
+   *  spec has no uniforms, or the cache has no entry yet — generators run
+   *  post-execution, so a missing entry means a different uniform key). */
+  configBuffer: GPUBuffer | null;
+}
+
 export interface TileKernelInstance {
+  /**
+   * Derive the dispatch plan WITHOUT encoding or mutating the config cache.
+   * Single source: the same pipeline/binding/grid computations dispatch()
+   * performs (stream generation consumes this; see stream-generate.ts).
+   */
+  plan(uniforms: Record<string, number>): TileKernelPlan;
+
   /**
    * Dispatch the kernel. Buffers must match the binding names in the spec.
    * Uniforms must provide all declared uniform values.
@@ -286,6 +305,36 @@ export function createTileKernelDispatcher(
   }
 
   return {
+    plan(uniforms: Record<string, number>): TileKernelPlan {
+      const ctx = requireContext();
+      const wgsl = getWGSL();
+      const pipeline = getPipeline(ctx, wgsl, wgsl);
+      const bindingNames = Object.keys(spec.bindings);
+      const hasConfig = Object.keys(spec.uniforms).length > 0;
+      let configBuffer: GPUBuffer | null = null;
+      if (hasConfig) {
+        const configKey = uniformCacheKey(spec, uniforms);
+        configBuffer = configCache.get(configKey)?.buffer ?? null;
+      }
+      const bindingOrder: (string | null)[] = [];
+      const uniformIdx = spec.uniformBindingIndex;
+      let bindingIndex = 0;
+      for (let i = 0; i < bindingNames.length; i++) {
+        if (hasConfig && uniformIdx !== undefined && bindingIndex === uniformIdx) {
+          bindingOrder.push(null);
+          bindingIndex++;
+        }
+        bindingOrder.push(bindingNames[i]);
+        bindingIndex++;
+      }
+      if (hasConfig && (uniformIdx === undefined || bindingIndex <= uniformIdx)) {
+        bindingOrder.push(null);
+      }
+      const g = resolveGrid(spec)(uniforms);
+      const grid: [number, number, number] = [g[0] ?? 1, g[1] ?? 1, g[2] ?? 1];
+      return { pipeline, bindingOrder, grid, configBuffer };
+    },
+
     dispatch(
       buffers: Record<string, GPUBuffer>,
       uniforms: Record<string, number>,

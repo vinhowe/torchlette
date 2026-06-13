@@ -226,6 +226,12 @@ export function diffSegmentsAligned(
             else if (!mapSlot(g.src, rr.src) || !mapSlot(g.dst, rr.dst)) detail = `cmd ${i}: copy slot bijection`;
             break;
           }
+          case TAG_UNIFORM: {
+            const rr = r as typeof g;
+            if (g.nodeIndex !== rr.nodeIndex) detail = `cmd ${i}: uniform nodeIndex gen=${g.nodeIndex} rec=${rr.nodeIndex}`;
+            else if (!mapSlot(g.slot, rr.slot)) detail = `cmd ${i}: uniform slot bijection`;
+            break;
+          }
           default:
             break;
         }

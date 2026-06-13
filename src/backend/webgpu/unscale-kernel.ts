@@ -361,6 +361,29 @@ function roundUpToPowerOfTwo(size: number): number {
 /**
  * Reset all module-local mutable state (dispatcher, persistent inf flag buffer).
  */
+/** Stage-4 plan/encode: the unscale dispatch plan (direct path), derived
+ *  from the SAME dispatcher instance dispatchUnscaleGrad uses. Returns null
+ *  on the chunked route. */
+export function planUnscaleGradDispatch(
+  numElements: number,
+  invScale: number,
+): { plan: import("./tile-dispatch").TileKernelPlan; alignedBytes: number } | null {
+  const totalBytes = numElements * 4;
+  if (totalBytes > getMaxStorageBufferBindingSize()) return null;
+  const workgroups = Math.ceil(numElements / WORKGROUP_SIZE);
+  const gridSizeX = Math.min(workgroups, MAX_WORKGROUPS_PER_DIM);
+  const gridStride = gridSizeX * WORKGROUP_SIZE;
+  return {
+    plan: getUnscaleDispatcher().plan({
+      inv_scale: invScale,
+      num_elements: numElements,
+      grid_stride: gridStride,
+      _pad0: 0,
+    }),
+    alignedBytes: roundUpToPowerOfTwo(totalBytes),
+  };
+}
+
 export function resetUnscaleKernelState(): void {
   destroyPersistentInfFlagBuffer();
   if (unscaleDispatcher) {

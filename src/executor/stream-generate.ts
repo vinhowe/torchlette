@@ -25,6 +25,9 @@ import {
   planCastDirect,
   planContiguousDirect,
 } from "../backend/webgpu/ops/views";
+import { planFullReductionDispatch } from "../backend/webgpu/ops/reductions";
+import { planUnscaleGradDispatch } from "../backend/webgpu/unscale-kernel";
+import type { TileKernelPlan } from "../backend/webgpu/tile-dispatch";
 import { requireContext } from "../backend/webgpu/gpu-context";
 import { getPipeline } from "../backend/webgpu/dispatch";
 import { alignBufferSize } from "../backend/webgpu/shape-utils";
@@ -37,7 +40,9 @@ import {
   TAG_ALLOC,
   TAG_BARRIER,
   TAG_CLEAR,
+  TAG_COPY,
   TAG_DISPATCH,
+  TAG_UNIFORM,
   TAG_WRITE,
 } from "./compiled-plan";
 import type { LoweredPlan } from "./lowered-plan";
@@ -145,6 +150,21 @@ export function generateStream(
       gpuBuffer(ref.storage.backendTensor) as unknown,
     );
   };
+  // Slot for a REAL buffer object (config caches, inf flags): one slot per
+  // buffer, shared across the stream — mirroring the recording's
+  // buffer-keyed persistent slots so the diff bijection stays 1:1.
+  const bufferSlot = (buf: unknown, kind: SlotSource["kind"]): Slot => {
+    const existing = bufferToSlot.get(buf);
+    if (existing !== undefined) return existing;
+    const slot = slots.length;
+    slots.push(
+      kind === "persistent"
+        ? { kind: "persistent", buffer: buf as never }
+        : { kind: "arena" },
+    );
+    bufferToSlot.set(buf, slot);
+    return slot;
+  };
   const phantom = (node: LazyIRNode | undefined, nodeIndex?: number) => {
     if (!node) return;
     const slot = slots.length;
@@ -188,11 +208,16 @@ export function generateStream(
       }
       case "sequential": {
         const node = planNodes[action.nodeIndex];
-        const gen = generateSequential(node, slots, resolveRefSlot);
+        const gen = generateSequential(node, slots, resolveRefSlot, bufferSlot);
         if (typeof gen === "string") {
           miss(`op:${node.op}${gen ? `[${gen}]` : ""}`);
           phantom(node, action.nodeIndex);
           break;
+        }
+        for (const c of gen.commands) {
+          if (c.tag === TAG_UNIFORM && c.nodeIndex < 0) {
+            c.nodeIndex = action.nodeIndex;
+          }
         }
         commands.push(...gen.commands);
         if (gen.commands.length > 0) {
@@ -317,7 +342,14 @@ function generateSequential(
   node: LazyIRNode,
   slots: SlotSource[],
   resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
 ): { commands: GpuCommand[]; outSlot: Slot } | string {
+  // Tile-kernel ops with bespoke command patterns.
+  if (node.op === "sum") return generateSumFull(node, slots, resolveRefSlot, bufferSlot);
+  if (node.op === "unscaleGrad")
+    return generateUnscaleGrad(node, slots, resolveRefSlot, bufferSlot);
+  if (node.op === "stridedScatterCopy")
+    return generateScatterCopyDMA(node, resolveRefSlot);
   const wgslOp = BINARY_OPS.get(node.op);
   const isUnary =
     UNARY_OPS.has(node.op) ||
@@ -428,6 +460,257 @@ function generateSequential(
       },
     ],
     outSlot,
+  };
+}
+
+/** Bindings for a TileKernelPlan: name→slot with the config buffer at the
+ *  uniform position. Returns null when the plan's config buffer is absent
+ *  (uniform key never dispatched — shouldn't happen post-execution). */
+function tilePlanBindings(
+  plan: TileKernelPlan,
+  named: Record<string, Slot>,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): Slot[] | null {
+  const out: Slot[] = [];
+  for (const name of plan.bindingOrder) {
+    if (name === null) {
+      if (!plan.configBuffer) return null;
+      out.push(bufferSlot(plan.configBuffer, "persistent"));
+    } else {
+      const s = named[name];
+      if (s === undefined) return null;
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/** sum with no dim (FULL reduction): ALLOC(4 bytes, kind 0) + tile dispatch
+ *  [input, out, config]. Dim reductions / preamble chains stay uncovered. */
+function generateSumFull(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  const payload = node.payload as { dim?: number | number[] | null } | undefined;
+  if (payload?.dim != null) return "dim-reduction";
+  if (node.inputs.length !== 1) return "arity";
+  const ref = node.inputs[0];
+  if (ref.kind === "scalar") return "scalar-operand";
+  const storage =
+    ref.kind === "materialized"
+      ? ref.storage
+      : ((ref.outputIndex ?? 0) === 0
+          ? ref.node.result
+          : ref.node.results?.[ref.outputIndex ?? 0]);
+  const inSlot = resolveRefSlot(ref);
+  if (inSlot === undefined) return "untracked-producer";
+  let size: number;
+  if (storage) {
+    const t = storage.backendTensor as WebGPUTensor;
+    if (!t.isContiguous) return "non-contiguous";
+    size = t.size;
+  } else if (ref.kind !== "materialized" && !VIEW_OPS.has(ref.node.op)) {
+    size = sizeOf(ref.node.shape);
+  } else {
+    return "no-storage";
+  }
+  if (size * 4 > 128 * 1024 * 1024) return "chunked";
+  const plan = planFullReductionDispatch("sum", size);
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const bindings = tilePlanBindings(
+    plan,
+    { input: inSlot, out: outSlot },
+    bufferSlot,
+  );
+  if (!bindings) return "config-missing";
+  return {
+    commands: [
+      { tag: TAG_ALLOC, slot: outSlot, bytes: 4, allocKind: 0, inputSlots: [inSlot] },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: plan.pipeline,
+        bindings,
+        gx: plan.grid[0],
+        gy: plan.grid[1],
+        gz: plan.grid[2],
+      },
+    ],
+    outSlot,
+  };
+}
+
+/** unscaleGrad: ALLOC(kind 1, power-of-two bytes) + volatile UNIFORM repack
+ *  + tile dispatch [grad_in, grad_out, inf_flag, config]. */
+function generateUnscaleGrad(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  const payload = node.payload as
+    | { invScale?: number; infFlagBuffer?: unknown }
+    | undefined;
+  if (!payload || payload.invScale === undefined || !payload.infFlagBuffer) {
+    return "payload";
+  }
+  const ref = node.inputs[0];
+  if (!ref || ref.kind === "scalar") return "arity";
+  const storage =
+    ref.kind === "materialized"
+      ? ref.storage
+      : ((ref.outputIndex ?? 0) === 0
+          ? ref.node.result
+          : ref.node.results?.[ref.outputIndex ?? 0]);
+  const inSlot = resolveRefSlot(ref);
+  if (inSlot === undefined) return "untracked-producer";
+  let size: number;
+  if (storage) {
+    const t = storage.backendTensor as WebGPUTensor;
+    if (!t.isContiguous) return "non-contiguous";
+    size = t.size;
+  } else if (ref.kind !== "materialized" && !VIEW_OPS.has(ref.node.op)) {
+    size = sizeOf(ref.node.shape);
+  } else {
+    return "no-storage";
+  }
+  const planned = planUnscaleGradDispatch(size, payload.invScale);
+  if (!planned) return "chunked";
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const named: Record<string, Slot> = {
+    grad_in: inSlot,
+    grad_out: outSlot,
+    inf_flag: bufferSlot(payload.infFlagBuffer, "persistent"),
+  };
+  const bindings = tilePlanBindings(planned.plan, named, bufferSlot);
+  if (!bindings) return "config-missing";
+  const configSlot = bufferSlot(planned.plan.configBuffer, "persistent");
+  return {
+    commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: planned.alignedBytes,
+        allocKind: 1,
+        inputSlots: [],
+      },
+      {
+        tag: TAG_UNIFORM,
+        slot: configSlot,
+        nodeIndex: -1, // patched by the caller (walker knows the action index)
+        pack: () => new Uint32Array(0),
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: planned.plan.pipeline,
+        bindings,
+        gx: planned.plan.grid[0],
+        gy: planned.plan.grid[1],
+        gz: planned.plan.grid[2],
+      },
+    ],
+    outSlot,
+  };
+}
+
+/** Resolve a ref's slot + tensor metadata (real storage, or synthesized
+ *  contiguous/offset-0 for liveness-released NON-VIEW producers). */
+function refSlotAndMeta(
+  ref: LazyIRNode["inputs"][number],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+): { slot: Slot; meta: WebGPUTensor } | string {
+  if (ref.kind === "scalar") return "scalar-operand";
+  const storage =
+    ref.kind === "materialized"
+      ? ref.storage
+      : ((ref.outputIndex ?? 0) === 0
+          ? ref.node.result
+          : ref.node.results?.[ref.outputIndex ?? 0]);
+  let meta: WebGPUTensor;
+  if (storage) {
+    meta = storage.backendTensor as WebGPUTensor;
+  } else if (
+    ref.kind !== "materialized" &&
+    (ref.outputIndex ?? 0) === 0 &&
+    !VIEW_OPS.has(ref.node.op)
+  ) {
+    const shape = ref.node.shape;
+    const size = sizeOf(shape);
+    meta = {
+      shape,
+      strides: contiguousStrides(shape),
+      offset: 0,
+      size,
+      dtype: (ref.node.dtype ?? "f32") as WebGPUTensor["dtype"],
+      isContiguous: true,
+      buffer: { size: alignBufferSize(size * 4) },
+    } as unknown as WebGPUTensor;
+  } else {
+    return "no-storage";
+  }
+  const slot = resolveRefSlot(ref);
+  if (slot === undefined) return "untracked-producer";
+  return { slot, meta };
+}
+
+/** stridedScatterCopy, TRUE IN-PLACE DMA fast path: one TAG_COPY into the
+ *  base's EXISTING buffer (no alloc; the node's result keeps the base
+ *  slot). The dispatch (copy-on-write) route stays uncovered. Conditions
+ *  mirror stridedScatterImpl exactly. */
+function generateScatterCopyDMA(
+  node: LazyIRNode,
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  const payload = node.payload as
+    | { offset: number; viewShape: number[]; viewStrides: number[] }
+    | undefined;
+  if (!payload) return "payload";
+  if (node.inputs.length !== 2) return "arity";
+  const base = refSlotAndMeta(node.inputs[0], resolveRefSlot);
+  if (typeof base === "string") return base;
+  const src = refSlotAndMeta(node.inputs[1], resolveRefSlot);
+  if (typeof src === "string") return src;
+  const { offset, viewShape, viewStrides } = payload;
+  const baseSize = sizeOf(base.meta.shape);
+  const viewSize = sizeOf(viewShape);
+  const isContig = (shape: number[], strides: number[]) => {
+    let acc = 1;
+    for (let i = shape.length - 1; i >= 0; i--) {
+      if (strides[i] !== acc && shape[i] !== 1) return false;
+      acc *= shape[i];
+    }
+    return true;
+  };
+  if (
+    !(
+      offset >= 0 &&
+      offset + viewSize <= baseSize &&
+      isContig(viewShape, viewStrides) &&
+      base.meta.isContiguous &&
+      (base.meta.offset ?? 0) === 0 &&
+      (src.meta.isContiguous || isContig(src.meta.shape, src.meta.strides)) &&
+      viewSize * 4 <=
+        (src.meta.buffer as { size: number }).size -
+          (src.meta.offset ?? 0) * 4
+    )
+  ) {
+    return "non-dma-route";
+  }
+  return {
+    commands: [
+      {
+        tag: TAG_COPY,
+        src: src.slot,
+        srcOffset: (src.meta.offset ?? 0) * 4,
+        dst: base.slot,
+        dstOffset: offset * 4,
+        bytes: viewSize * 4,
+      },
+    ],
+    outSlot: base.slot,
   };
 }
 
