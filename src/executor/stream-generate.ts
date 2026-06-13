@@ -382,6 +382,33 @@ export function generateStream(
         coveredActions++;
         break;
       }
+      case "batched-reduction": {
+        const br = action as {
+          nodeIndices: number[];
+          reduceOp: string;
+          payload: { dim: number | number[]; keepdim?: boolean };
+        };
+        const gen = generateBatchedReduction(
+          br,
+          planNodes,
+          slots,
+          resolveRefSlot,
+          bufferSlot,
+        );
+        if (typeof gen === "string") {
+          miss(`batched-reduction[${gen}]`);
+          for (const ni of br.nodeIndices) phantom(planNodes[ni], ni);
+          break;
+        }
+        commands.push(...gen.commands);
+        segments.push({ nodeIndex: gen.firstNodeIndex, commands: gen.commands });
+        for (const o of gen.outputs) {
+          mapNodeResult(planNodes[o.nodeIndex], o.slot, bufferToSlot);
+          nodeSlot.set(o.nodeIndex, o.slot);
+        }
+        coveredActions++;
+        break;
+      }
       default: {
         miss(action.kind);
         // Map every output node the action produces (matmul-epilogue, row
@@ -793,6 +820,83 @@ function generateDimReduction(
     ],
     outSlot,
   };
+}
+
+/** The batched-reduction ACTION as executed by backend.batchedReduction:
+ *  for reductionSize > 64 it falls back to N INDIVIDUAL reduction() dispatches
+ *  (the true multi-in/out batched kernel only runs for small reductionSize),
+ *  all recorded under nodeIndices[0] (one setRecordingNodeIndex). So generate
+ *  one ALLOC+dispatch per node via the SAME cached dim-reduction dispatcher,
+ *  exactly mirroring the fallback. Bails (whole action) when the executor
+ *  would take the true-batched path (reductionSize ≤ 64) — a different command
+ *  shape — or when any member isn't generatable. */
+function generateBatchedReduction(
+  action: { nodeIndices: number[]; reduceOp: string; payload: { dim: number | number[]; keepdim?: boolean } },
+  planNodes: LazyIRNode[],
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+):
+  | { commands: GpuCommand[]; outputs: Array<{ nodeIndex: number; slot: Slot }>; firstNodeIndex: number }
+  | string {
+  if (action.nodeIndices.length === 0) return "empty";
+  const op = action.reduceOp;
+  if (op !== "sum" && op !== "max" && op !== "min") return "epilogue-op";
+  const dim = action.payload.dim;
+  const keepdim = action.payload.keepdim ?? false;
+  const firstNodeIndex = action.nodeIndices[0];
+  const commands: GpuCommand[] = [];
+  const outputs: Array<{ nodeIndex: number; slot: Slot }> = [];
+  for (const nodeIdx of action.nodeIndices) {
+    const node = planNodes[nodeIdx];
+    if (node.inputs.length !== 1) return "arity";
+    const ref = node.inputs[0];
+    if (ref.kind === "scalar") return "scalar-operand";
+    const inSlot = resolveRefSlot(ref);
+    if (inSlot === undefined) return "untracked-input";
+    const storage =
+      ref.kind === "materialized"
+        ? ref.storage
+        : ((ref.outputIndex ?? 0) === 0
+            ? ref.node.result
+            : ref.node.results?.[ref.outputIndex ?? 0]);
+    let inShape: number[];
+    if (storage) {
+      const t = storage.backendTensor as WebGPUTensor;
+      if (!t.isContiguous) return "non-contiguous";
+      inShape = t.shape;
+    } else {
+      const sd = refShapeDtype(ref) ?? contiguousViewShapeDtype(ref);
+      if (!sd) return "no-shape";
+      inShape = sd.shape;
+    }
+    // Which path did the executor take? reductionSize > 64 ⇒ individual
+    // fallback (what we generate); ≤ 64 ⇒ true batched dispatch (bail).
+    const dims = (Array.isArray(dim) ? dim : [dim]).map((d) =>
+      d < 0 ? d + inShape.length : d,
+    );
+    const reductionSize = dims.reduce((acc, d) => acc * inShape[d], 1);
+    if (reductionSize <= 64) return "true-batched";
+    const plan = planDimReductionDispatch(op, inShape, dim, keepdim);
+    if (!plan) return "all-dims-or-epilogue";
+    const outSlot = slots.length;
+    slots.push({ kind: "arena" });
+    const bindings = tilePlanBindings(plan, { input: inSlot, out: outSlot }, bufferSlot);
+    if (!bindings) return "config-missing";
+    commands.push(
+      { tag: TAG_ALLOC, slot: outSlot, bytes: sizeOf(node.shape) * 4, allocKind: 0, inputSlots: [inSlot] },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: plan.pipeline,
+        bindings,
+        gx: plan.grid[0],
+        gy: plan.grid[1],
+        gz: plan.grid[2],
+      },
+    );
+    outputs.push({ nodeIndex: nodeIdx, slot: outSlot });
+  }
+  return { commands, outputs, firstNodeIndex };
 }
 
 /** Resolve a ref's [shape, dtype] from live storage, else the producer
