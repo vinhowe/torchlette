@@ -438,6 +438,77 @@ export function dispatchLayerNormBackwardGradX(
   return outBuffer;
 }
 
+/** Stage-4 stream generation: the LN-backward gradX dispatch plan (single
+ *  output, no workspace — like the forward). ALLOC(grad_x, allocKind 1) +
+ *  one gradXTileKernel dispatch [grad_output, x, weight, grad_x, config]. */
+export function planLayerNormBackwardGradXDispatch(
+  numRows: number,
+  featureDim: number,
+  eps: number,
+): { plan: import("./tile-dispatch").TileKernelPlan; outputBytes: number } {
+  return {
+    plan: gradXTileKernel.plan({
+      num_rows: numRows,
+      feature_dim: featureDim,
+      eps,
+    }),
+    outputBytes: numRows * featureDim * 4,
+  };
+}
+
+/**
+ * Stage-4 stream generation: the full gradWeightBias dispatch plan — three
+ * tile dispatches (rowStats → partial accumulation → reduce) over CACHED
+ * workspace buffers (mean/invStd keyed by numRows; partialGW/GB keyed by
+ * numRowTiles:featureDim — raw createBuffers, so persistent slots with no
+ * recordAlloc, looked up read-only here). Two outputs (grad_weight,
+ * grad_bias) are allocateOutputBuffer (allocKind 1). Returns null workspace
+ * buffers if not cached (the generator runs post-recording so they're a
+ * guaranteed hit; null → the generator bails). Plans come from the SAME
+ * dispatcher instances → shared config-buffer identity.
+ */
+export function planLayerNormBackwardGradWeightBias(
+  numRows: number,
+  featureDim: number,
+  eps: number,
+): {
+  numRowTiles: number;
+  featureBytes: number;
+  rowStatsPlan: import("./tile-dispatch").TileKernelPlan;
+  partialPlan: import("./tile-dispatch").TileKernelPlan;
+  reducePlan: import("./tile-dispatch").TileKernelPlan;
+  meanBuffer: GPUBuffer | null;
+  invStdBuffer: GPUBuffer | null;
+  partialGW: GPUBuffer | null;
+  partialGB: GPUBuffer | null;
+} {
+  const numRowTiles = Math.ceil(numRows / ROWS_PER_TILE);
+  const rowStats = rowStatsTempCache.get(numRows) ?? null;
+  const partials = gradWBPartialCache.get(`${numRowTiles}:${featureDim}`) ?? null;
+  return {
+    numRowTiles,
+    featureBytes: featureDim * 4,
+    rowStatsPlan: rowStatsTileKernel.plan({
+      num_rows: numRows,
+      feature_dim: featureDim,
+      eps,
+    }),
+    partialPlan: gradWBPartialTileKernel.plan({
+      num_rows: numRows,
+      feature_dim: featureDim,
+      num_row_tiles: numRowTiles,
+    }),
+    reducePlan: gradWBReduceTileKernel.plan({
+      feature_dim: featureDim,
+      num_row_tiles: numRowTiles,
+    }),
+    meanBuffer: rowStats?.meanBuffer ?? null,
+    invStdBuffer: rowStats?.invStdBuffer ?? null,
+    partialGW: partials?.partialGW ?? null,
+    partialGB: partials?.partialGB ?? null,
+  };
+}
+
 /**
  * Dispatch fused LayerNorm backward gradWeight + gradBias kernel.
  * Three-pass approach:

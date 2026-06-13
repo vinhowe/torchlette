@@ -26,7 +26,11 @@ import {
   planContiguousDirect,
 } from "../backend/webgpu/ops/views";
 import { planFullReductionDispatch } from "../backend/webgpu/ops/reductions";
-import { planLayerNormForwardDispatch } from "../backend/webgpu/layernorm-kernel";
+import {
+  planLayerNormBackwardGradWeightBias,
+  planLayerNormBackwardGradXDispatch,
+  planLayerNormForwardDispatch,
+} from "../backend/webgpu/layernorm-kernel";
 import { planFusedKernel } from "../backend/webgpu/fusion-dispatch";
 import {
   lookupKSplitTempBuffer,
@@ -445,6 +449,10 @@ function generateSequential(
     return generateScatterCopyDMA(node, resolveRefSlot);
   if (node.op === "fusedLayerNormForward")
     return generateLayerNormForward(node, slots, resolveRefSlot, bufferSlot);
+  if (node.op === "fusedLayerNormBackwardGradX")
+    return generateLayerNormGradX(node, slots, resolveRefSlot, bufferSlot);
+  if (node.op === "fusedLayerNormBackwardGradWeightBias")
+    return generateLayerNormGradWB(node, slots, resolveRefSlot, bufferSlot);
   const wgslOp = BINARY_OPS.get(node.op);
   const isUnary =
     UNARY_OPS.has(node.op) ||
@@ -695,6 +703,181 @@ function generateLayerNormForward(
       },
     ],
     outSlot,
+  };
+}
+
+/** fusedLayerNormBackwardGradX: ALLOC(grad_x, kind 1) + one tile dispatch
+ *  [grad_output, x, weight, grad_x, config]. Single output, no workspace —
+ *  structurally identical to the forward. payload = FusedLayerNormConfig. */
+function generateLayerNormGradX(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (node.inputs.length !== 3) return "arity";
+  const cfg = node.payload as
+    | { numRows?: number; featureDim?: number; eps?: number }
+    | undefined;
+  if (!cfg || cfg.numRows == null || cfg.featureDim == null || cfg.eps == null) {
+    return "payload";
+  }
+  const inSlots: Slot[] = [];
+  for (const ref of node.inputs) {
+    if (ref.kind === "scalar") return "scalar-operand";
+    const s = resolveRefSlot(ref);
+    if (s === undefined) return "untracked-input";
+    inSlots.push(s);
+  }
+  const planned = planLayerNormBackwardGradXDispatch(
+    cfg.numRows,
+    cfg.featureDim,
+    cfg.eps,
+  );
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const bindings = tilePlanBindings(
+    planned.plan,
+    {
+      grad_output: inSlots[0],
+      x: inSlots[1],
+      weight: inSlots[2],
+      grad_x: outSlot,
+    },
+    bufferSlot,
+  );
+  if (!bindings) return "config-missing";
+  return {
+    commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: planned.outputBytes,
+        allocKind: 1,
+        inputSlots: [],
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: planned.plan.pipeline,
+        bindings,
+        gx: planned.plan.grid[0],
+        gy: planned.plan.grid[1],
+        gz: planned.plan.grid[2],
+      },
+    ],
+    outSlot,
+  };
+}
+
+/** fusedLayerNormBackwardGradWeightBias: the workspace case. Three tile
+ *  dispatches over CACHED workspace buffers (mean/invStd, partialGW/GB —
+ *  persistent slots, looked up by the plan; no ALLOC) then two output
+ *  ALLOCs (grad_weight, grad_bias) and the reduce dispatch. Command order
+ *  mirrors the dispatcher: rowStats DISPATCH, partial DISPATCH, ALLOC gw,
+ *  ALLOC gb, reduce DISPATCH. Multi-output (primary grad_weight); the
+ *  outSlot returned is grad_weight, grad_bias is allocated in-stream (the
+ *  segment diff verifies both ALLOCs). Inputs [grad_output, x]. */
+function generateLayerNormGradWB(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (node.inputs.length !== 2) return "arity";
+  const cfg = node.payload as
+    | { numRows?: number; featureDim?: number; eps?: number }
+    | undefined;
+  if (!cfg || cfg.numRows == null || cfg.featureDim == null || cfg.eps == null) {
+    return "payload";
+  }
+  if (node.inputs[0].kind === "scalar" || node.inputs[1].kind === "scalar") {
+    return "scalar-operand";
+  }
+  const goSlot = resolveRefSlot(node.inputs[0]);
+  const xSlot = resolveRefSlot(node.inputs[1]);
+  if (goSlot === undefined || xSlot === undefined) return "untracked-input";
+  const p = planLayerNormBackwardGradWeightBias(
+    cfg.numRows,
+    cfg.featureDim,
+    cfg.eps,
+  );
+  if (!p.meanBuffer || !p.invStdBuffer || !p.partialGW || !p.partialGB) {
+    return "workspace-missing";
+  }
+  const meanSlot = bufferSlot(p.meanBuffer as unknown, "persistent");
+  const invStdSlot = bufferSlot(p.invStdBuffer as unknown, "persistent");
+  const gwPartialSlot = bufferSlot(p.partialGW as unknown, "persistent");
+  const gbPartialSlot = bufferSlot(p.partialGB as unknown, "persistent");
+
+  const rowStatsBindings = tilePlanBindings(
+    p.rowStatsPlan,
+    { x: xSlot, row_mean: meanSlot, row_inv_std: invStdSlot },
+    bufferSlot,
+  );
+  const partialBindings = tilePlanBindings(
+    p.partialPlan,
+    {
+      grad_output: goSlot,
+      x: xSlot,
+      row_mean: meanSlot,
+      row_inv_std: invStdSlot,
+      partial_gw: gwPartialSlot,
+      partial_gb: gbPartialSlot,
+    },
+    bufferSlot,
+  );
+  if (!rowStatsBindings || !partialBindings) return "config-missing";
+
+  const gwSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const gbSlot = slots.length;
+  slots.push({ kind: "arena" });
+
+  const reduceBindings = tilePlanBindings(
+    p.reducePlan,
+    {
+      partial_gw: gwPartialSlot,
+      partial_gb: gbPartialSlot,
+      grad_weight: gwSlot,
+      grad_bias: gbSlot,
+    },
+    bufferSlot,
+  );
+  if (!reduceBindings) return "config-missing";
+
+  const dispatch = (
+    plan: TileKernelPlan,
+    bindings: Slot[],
+  ): GpuCommand => ({
+    tag: TAG_DISPATCH,
+    pipeline: plan.pipeline,
+    bindings,
+    gx: plan.grid[0],
+    gy: plan.grid[1],
+    gz: plan.grid[2],
+  });
+
+  return {
+    commands: [
+      dispatch(p.rowStatsPlan, rowStatsBindings),
+      dispatch(p.partialPlan, partialBindings),
+      {
+        tag: TAG_ALLOC,
+        slot: gwSlot,
+        bytes: p.featureBytes,
+        allocKind: 1,
+        inputSlots: [],
+      },
+      {
+        tag: TAG_ALLOC,
+        slot: gbSlot,
+        bytes: p.featureBytes,
+        allocKind: 1,
+        inputSlots: [],
+      },
+      dispatch(p.reducePlan, reduceBindings),
+    ],
+    outSlot: gwSlot,
   };
 }
 
