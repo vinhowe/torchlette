@@ -1711,7 +1711,7 @@ export async function executeLoweredPlan(
       // Coverage is reported per uncovered op class; plans with uncovered
       // actions are skipped (record/replay remains their execution source).
       if (ENV.TORCHLETTE_STREAM_GENERATE === "1" && compiled.valid) {
-        const gen = generateStream(loweredPlan, planNodes);
+        const gen = generateStream(loweredPlan, planNodes, backend);
         const top = [...gen.uncovered.entries()]
           .sort((a, b) => b[1] - a[1])
           .slice(0, 8)

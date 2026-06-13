@@ -186,27 +186,48 @@ interface FusedDispatchOptions {
  * @param inputs - Input tensors (must match recipe.inputs order)
  * @param options - Dispatch options (cache, vectorize)
  */
-export function dispatchFusedKernel(
+/**
+ * Stage-4 plan/encode split: everything dispatchFusedKernel decides BEFORE
+ * touching the GPU — pipeline, the abstract binding layout (in bind-group
+ * order), output allocation descriptors, workgroups, params bytes. The
+ * stream generator consumes this to emit ALLOC + DISPATCH commands without
+ * executing; dispatchFusedKernel consumes the same plan to allocate + bind
+ * + dispatch, so the two cannot disagree on binding order or workgroups.
+ */
+export type FusedBinding =
+  | { kind: "input"; pos: number } // inputs[pos].buffer
+  | { kind: "output"; index: number } // outputBuffers[index] (allocated)
+  | { kind: "params" };
+
+export interface FusedKernelPlan {
+  pipeline: GPUComputePipeline;
+  /** Bind-group order: inputs (minus donated) then outputs then params. */
+  bindings: FusedBinding[];
+  /** Per output: bytes to allocate, or the input pos whose buffer it reuses
+   *  in-place (donation — output 0 only). */
+  outputs: Array<{ bytes: number } | { donatedPos: number }>;
+  workgroups: [number, number, number];
+  paramsData: Uint32Array;
+  /** Resolved donated position within the non-inlined inputs (or -1). */
+  donatedPos: number;
+}
+
+export function planFusedKernel(
   device: GPUDevice,
   recipe: FusedKernelRecipe,
   inputs: FusedInputTensor[],
   options: FusedDispatchOptions = {},
-): FusedDispatchResult {
-  // Count non-inlined inputs (inlined constants don't need buffer bindings)
+): FusedKernelPlan {
   const nonInlinedCount = recipe.inputs.filter(
     (inp) => !inp.isInlinedConstant,
   ).length;
-
-  // Validate inputs — caller should pass only non-inlined input buffers
   if (inputs.length !== nonInlinedCount) {
     throw new Error(
       `Expected ${nonInlinedCount} non-inlined inputs, got ${inputs.length}`,
     );
   }
 
-  // Donation: the donated input shares out0's binding (one fewer binding).
   const donated = options.donatedInput;
-  // Position of the donated input within the non-inlined `inputs` array.
   let donatedPos = -1;
   if (donated !== undefined) {
     let pos = 0;
@@ -221,7 +242,6 @@ export function dispatchFusedKernel(
     if (donatedPos < 0) throw new Error(`donatedInput ${donated} not found`);
   }
 
-  // Check storage buffer binding count against device limits BEFORE creating pipeline.
   const storageBindingCount =
     nonInlinedCount - (donated !== undefined ? 1 : 0) + recipe.outputs.length;
   const maxStorageBuffers = device.limits.maxStorageBuffersPerShaderStage;
@@ -237,33 +257,76 @@ export function dispatchFusedKernel(
     donatedInput: donated,
   });
 
-  // All outputs must have the same shape (required for elementwise fusion)
   const primaryOutput = recipe.outputs[0];
   const totalElements = sizeOf(primaryOutput.shape);
 
-  // Create output buffers for all outputs.
-  // Use resolveOutputBuffer (not allocateOutputBuffer) so the arena aliasing
-  // check prevents returning an input buffer as the output — that would create
-  // a read/read_write conflict within the same compute pass.
+  const outputs: Array<{ bytes: number } | { donatedPos: number }> = [];
+  for (let oi = 0; oi < recipe.outputs.length; oi++) {
+    if (donated !== undefined && oi === 0) {
+      outputs.push({ donatedPos });
+    } else {
+      outputs.push({
+        bytes: totalElements * dtypeBytes(recipe.outputs[oi].dtype),
+      });
+    }
+  }
+
+  // Bind order: non-inlined inputs (minus donated) → outputs → params.
+  const bindings: FusedBinding[] = [];
+  for (let i = 0; i < inputs.length; i++) {
+    if (i === donatedPos) continue;
+    bindings.push({ kind: "input", pos: i });
+  }
+  for (let oi = 0; oi < recipe.outputs.length; oi++) {
+    bindings.push({ kind: "output", index: oi });
+  }
+  bindings.push({ kind: "params" });
+
+  const totalWorkgroups = Math.ceil(kernel.workItems / kernel.workgroupSize);
+  const workgroupsX = Math.min(totalWorkgroups, MAX_WORKGROUPS_PER_DIM);
+  const workgroupsY =
+    totalWorkgroups <= MAX_WORKGROUPS_PER_DIM
+      ? 1
+      : Math.ceil(totalWorkgroups / MAX_WORKGROUPS_PER_DIM);
+
+  return {
+    pipeline,
+    bindings,
+    outputs,
+    workgroups: [workgroupsX, workgroupsY, 1],
+    paramsData: new Uint32Array([totalElements]),
+    donatedPos,
+  };
+}
+
+export function dispatchFusedKernel(
+  device: GPUDevice,
+  recipe: FusedKernelRecipe,
+  inputs: FusedInputTensor[],
+  options: FusedDispatchOptions = {},
+): FusedDispatchResult {
+  const plan = planFusedKernel(device, recipe, inputs, options);
+  const { pipeline, donatedPos } = plan;
+
+  // All outputs must have the same shape (required for elementwise fusion)
+  const primaryOutput = recipe.outputs[0];
+
+  // Create output buffers for all outputs (per the plan's descriptors).
+  // resolveOutputBuffer's aliasing check prevents returning an input buffer
+  // as the output — that would be a read/read_write conflict in one pass.
   const inputGPUBuffers = inputs.map((inp) => inp.buffer);
   const outputBuffers: GPUBuffer[] = [];
   const outputTensors: FusedOutputTensor[] = [];
   for (let oi = 0; oi < recipe.outputs.length; oi++) {
     const output = recipe.outputs[oi];
-    let buffer: GPUBuffer;
-    if (donated !== undefined && oi === 0) {
-      // In-place: write OUT0 (only!) into the donated input's buffer. No
-      // allocation, no recordAlloc — the compiled-plan recording resolves
-      // this binding to the input's existing slot (in-place discipline,
-      // like adamStep). Other outputs allocate normally; giving them the
-      // donated buffer too binds one buffer at multiple writable indices —
-      // a WebGPU validation error that rejects the ENTIRE submit (the
-      // multi-output foreach freeze).
-      buffer = inputs[donatedPos].buffer;
-    } else {
-      const outputBytes = totalElements * dtypeBytes(output.dtype);
-      buffer = resolveOutputBuffer(device, outputBytes, inputGPUBuffers);
-    }
+    const desc = plan.outputs[oi];
+    // In-place out0 into the donated input's buffer (no alloc, no
+    // recordAlloc — the recording resolves this binding to the input's
+    // existing slot, in-place discipline like adamStep).
+    const buffer =
+      "donatedPos" in desc
+        ? inputs[desc.donatedPos].buffer
+        : resolveOutputBuffer(device, desc.bytes, inputGPUBuffers);
     trackSharedEncoderWrite(buffer);
     outputBuffers.push(buffer);
     outputTensors.push({
@@ -274,34 +337,23 @@ export function dispatchFusedKernel(
   }
 
   // Create uniform buffer for params via shared pool
-  const paramsBuffer = createParamsBuffer(
-    device,
-    new Uint32Array([totalElements]),
-  );
+  const paramsBuffer = createParamsBuffer(device, plan.paramsData);
 
-  // Build flat buffer array: non-inlined inputs (minus the donated one,
-  // which is bound as out0), then outputs, then params
-  const bgBuffers: GPUBuffer[] = [];
-  for (let i = 0; i < inputs.length; i++) {
-    if (i === donatedPos) continue;
-    bgBuffers.push(inputs[i].buffer);
-  }
-  for (let i = 0; i < outputBuffers.length; i++) {
-    bgBuffers.push(outputBuffers[i]);
-  }
-  bgBuffers.push(paramsBuffer);
+  // Build the bind-group buffer array from the plan's binding order.
+  const bgBuffers: GPUBuffer[] = plan.bindings.map((b) => {
+    if (b.kind === "input") return inputs[b.pos].buffer;
+    if (b.kind === "output") return outputBuffers[b.index];
+    return paramsBuffer;
+  });
   const bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers);
 
-  // Dispatch (batch/shared-encoder mode aware)
-  // Use 2D dispatch when workgroups exceed WebGPU per-dimension limit (65535)
-  const totalWorkgroups = Math.ceil(kernel.workItems / kernel.workgroupSize);
-  const workgroupsX = Math.min(totalWorkgroups, MAX_WORKGROUPS_PER_DIM);
-  const workgroupsY =
-    totalWorkgroups <= MAX_WORKGROUPS_PER_DIM
-      ? 1
-      : Math.ceil(totalWorkgroups / MAX_WORKGROUPS_PER_DIM);
-
-  dispatchComputePass(pipeline, bindGroup, workgroupsX, workgroupsY, 1);
+  dispatchComputePass(
+    pipeline,
+    bindGroup,
+    plan.workgroups[0],
+    plan.workgroups[1],
+    plan.workgroups[2],
+  );
 
   // Release the params uniform buffer via the params buffer pool (handles deferred destruction)
   releaseParamsBuffer(paramsBuffer);

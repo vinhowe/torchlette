@@ -26,6 +26,8 @@ import {
   planContiguousDirect,
 } from "../backend/webgpu/ops/views";
 import { planFullReductionDispatch } from "../backend/webgpu/ops/reductions";
+import { planFusedKernel } from "../backend/webgpu/fusion-dispatch";
+import { getInputStorage } from "./op-dispatch";
 import { planUnscaleGradDispatch } from "../backend/webgpu/unscale-kernel";
 import type { TileKernelPlan } from "../backend/webgpu/tile-dispatch";
 import { requireContext } from "../backend/webgpu/gpu-context";
@@ -78,6 +80,7 @@ const F32_BYTES = 4;
 export function generateStream(
   loweredPlan: LoweredPlan,
   planNodes: LazyIRNode[],
+  backend?: import("../backend/types").Backend,
 ): GeneratedStream {
   const commands: GpuCommand[] = [];
   const slots: SlotSource[] = [];
@@ -228,10 +231,34 @@ export function generateStream(
         coveredActions++;
         break;
       }
+      case "fused": {
+        const fa = action as FusedActionShape;
+        const gen = backend
+          ? generateFused(fa, planNodes, slots, resolveRefSlot, bufferSlot, backend)
+          : "no-backend";
+        if (typeof gen === "string") {
+          miss(`fused[${gen}]`);
+          for (const ni of [
+            fa.outputNodeIndex,
+            ...(fa.additionalOutputNodeIndices ?? []),
+          ]) {
+            if (ni !== undefined) phantom(planNodes[ni], ni);
+          }
+          break;
+        }
+        commands.push(...gen.commands);
+        segments.push({ nodeIndex: fa.outputNodeIndex, commands: gen.commands });
+        for (const o of gen.outputs) {
+          mapNodeResult(planNodes[o.nodeIndex], o.slot, bufferToSlot);
+          nodeSlot.set(o.nodeIndex, o.slot);
+        }
+        coveredActions++;
+        break;
+      }
       default: {
         miss(action.kind);
-        // Map every output node the action produces (fused groups,
-        // matmul-epilogue, adam batches, row programs, reductions).
+        // Map every output node the action produces (matmul-epilogue, adam
+        // batches, row programs, reductions).
         const a = action as {
           nodeIndex?: number;
           nodeIndices?: number[];
@@ -712,6 +739,181 @@ function generateScatterCopyDMA(
     ],
     outSlot: base.slot,
   };
+}
+
+interface FusedActionShape {
+  coveredNodeIndices: number[];
+  outputNodeIndex: number;
+  additionalOutputNodeIndices?: number[];
+  neededIntermediateNodeIndices?: number[];
+  enableVectorization?: boolean;
+  cachedExternalInputPattern?: Array<{ nodeLocalIdx: number; inputIdx: number }>;
+  recipe: import("../backend/webgpu/fusion-types").FusedKernelRecipe;
+  runtimeScalarInputs?: Set<number>;
+}
+
+/**
+ * Fused-segment generator. Covers the clean case — all external inputs
+ * contiguous, no needed-intermediate re-execution — and emits the fused
+ * kernel's ALLOC(s) + DISPATCH via planFusedKernel (shared with the
+ * dispatcher, so binding order / workgroups can't drift). Donation is
+ * detected POST-HOC: the recording already ran, so a donated out0 is the
+ * input whose buffer the output node's result aliases (ownsBuffer=false) —
+ * no liveness recomputation needed. Bails (uncovered) on contiguous-copy
+ * prologues, needed intermediates, and oversized buffers, exactly the
+ * branches executeFusedSegment routes away from the plain dispatch.
+ */
+function generateFused(
+  action: FusedActionShape,
+  planNodes: LazyIRNode[],
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+  backend: import("../backend/types").Backend,
+): { commands: GpuCommand[]; outputs: Array<{ nodeIndex: number; slot: Slot }> } | string {
+  if (action.neededIntermediateNodeIndices?.length) return "needed-intermediates";
+  const device = (backend as { device?: GPUDevice }).device;
+  if (!device) return "no-device";
+  if (!action.cachedExternalInputPattern) return "no-input-pattern";
+
+  const groupNodes = action.coveredNodeIndices.map((i) => planNodes[i]);
+  const extInputs = action.cachedExternalInputPattern.map(
+    (p) => groupNodes[p.nodeLocalIdx].inputs[p.inputIdx],
+  );
+  const recipe = action.recipe;
+
+  // Resolve the non-inlined inputs in recipe order (mirrors
+  // executeFusedSegment). planFusedKernel never dereferences input buffers
+  // (only their count + the donated position), so a liveness-RELEASED
+  // producer is fine: synthesize its metadata, resolve its slot via the
+  // logical channel. Real buffers are kept for donation detection.
+  const dispatchInputs: Array<{ buffer: GPUBuffer; shape: number[]; dtype: DType }> = [];
+  const inputSlots: Slot[] = [];
+  const inputBufs: Array<GPUBuffer | null> = [];
+  for (let i = 0; i < recipe.inputs.length; i++) {
+    if (recipe.inputs[i]?.isInlinedConstant) continue;
+    const ref = extInputs[i];
+    if (!ref) return "input-missing";
+    let storage: StorageHandle | undefined;
+    if (ref.kind === "scalar") {
+      storage = getInputStorage(ref, backend); // scalar table (still active)
+    } else if (ref.kind === "materialized") {
+      storage = ref.storage;
+    } else {
+      const oi = ref.outputIndex ?? 0;
+      storage = oi === 0 ? ref.node.result : ref.node.results?.[oi];
+    }
+    if (storage) {
+      const t = storage.backendTensor as WebGPUTensor;
+      if (t.isContiguous === false || (t.offset != null && t.offset > 0)) {
+        return "non-contiguous"; // executor inserts a contiguous-copy prologue
+      }
+      if (t.buffer.size > 128 * 1024 * 1024) return "oversized";
+      const slot =
+        ref.kind === "scalar"
+          ? bufferSlot(t.buffer as unknown, "persistent")
+          : resolveRefSlot(ref);
+      if (slot === undefined) return "untracked-input";
+      dispatchInputs.push({
+        buffer: t.buffer,
+        shape: t.shape ?? [1],
+        dtype: (t.dtype as DType) ?? "f32",
+      });
+      inputBufs.push(t.buffer);
+      inputSlots.push(slot);
+    } else if (ref.kind !== "materialized" && !VIEW_OPS.has(ref.node.op)) {
+      // Released non-view producer: slot logical, metadata synthesized.
+      const slot = resolveRefSlot(ref);
+      if (slot === undefined) return "untracked-input";
+      dispatchInputs.push({
+        buffer: undefined as unknown as GPUBuffer,
+        shape: ref.node.shape,
+        dtype: (ref.node.dtype ?? "f32") as DType,
+      });
+      inputBufs.push(null);
+      inputSlots.push(slot);
+    } else {
+      return "no-storage";
+    }
+  }
+
+  // POST-HOC donation: out0's result buffer aliasing one of the (live) inputs.
+  const outNode = planNodes[action.outputNodeIndex];
+  let donatedRecipeIdx: number | undefined;
+  if (outNode?.result && (outNode.result.backendTensor as WebGPUTensor).buffer) {
+    const out0buf = (outNode.result.backendTensor as WebGPUTensor).buffer;
+    let pos = 0;
+    for (let i = 0; i < recipe.inputs.length; i++) {
+      if (recipe.inputs[i]?.isInlinedConstant) continue;
+      if (inputBufs[pos] === out0buf) {
+        donatedRecipeIdx = i;
+        break;
+      }
+      pos++;
+    }
+  }
+
+  let plan;
+  try {
+    plan = planFusedKernel(device, recipe, dispatchInputs, {
+      vectorize: action.enableVectorization ?? true,
+      donatedInput: donatedRecipeIdx,
+    });
+  } catch {
+    return "plan-throw";
+  }
+
+  // Output slots: the donated out0 reuses the donated input's slot; allocated
+  // outputs get fresh slots. Maps recipe output index -> stream slot.
+  const outputSlots: Slot[] = [];
+  const commands: GpuCommand[] = [];
+  for (let oi = 0; oi < plan.outputs.length; oi++) {
+    const d = plan.outputs[oi];
+    if ("donatedPos" in d) {
+      outputSlots.push(inputSlots[d.donatedPos]);
+    } else {
+      const slot = slots.length;
+      slots.push({ kind: "arena" });
+      // inputSlots are the alloc's aliasing-check inputs (resolveOutputBuffer).
+      commands.push({
+        tag: TAG_ALLOC,
+        slot,
+        bytes: d.bytes,
+        allocKind: 0,
+        inputSlots: [...inputSlots],
+      });
+      outputSlots.push(slot);
+    }
+  }
+
+  const paramsSlot = slots.length;
+  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData });
+
+  const bindings: Slot[] = plan.bindings.map((b) => {
+    if (b.kind === "input") return inputSlots[b.pos];
+    if (b.kind === "output") return outputSlots[b.index];
+    return paramsSlot;
+  });
+  commands.push({
+    tag: TAG_DISPATCH,
+    pipeline: plan.pipeline,
+    bindings,
+    gx: plan.workgroups[0],
+    gy: plan.workgroups[1],
+    gz: plan.workgroups[2],
+  });
+
+  // Map output nodes: recipe output 0 -> outputNodeIndex, 1.. -> additional.
+  const outputs: Array<{ nodeIndex: number; slot: Slot }> = [
+    { nodeIndex: action.outputNodeIndex, slot: outputSlots[0] },
+  ];
+  const addl = action.additionalOutputNodeIndices ?? [];
+  for (let i = 0; i < addl.length; i++) {
+    if (outputSlots[i + 1] !== undefined) {
+      outputs.push({ nodeIndex: addl[i], slot: outputSlots[i + 1] });
+    }
+  }
+  return { commands, outputs };
 }
 
 /**
