@@ -14,6 +14,8 @@ WebGPU is auto-detected at runtime. Use `TORCHLETTE_CPU_ONLY=1` to force CPU-onl
 
 For WebGPU backend changes, also run the relevant integration test (e.g. `npx tsx examples/gpt2/finetune-demo.ts` for training-related fixes).
 
+**The load-bearing GPU correctness gates are now in-suite** (`test/compiled-plan-parity.spec.ts`, in the webgpu project — run `npm run test:gates` for just these): (1) compiled-plan trajectory == lowered trajectory over the full inner step (the frozen-step_size / clip-divergence class), (2) stage-4 stream generation matches the recording (no divergence), (3) stream recording is deterministic. They were previously manual-only `tools/` scripts that could silently rot. **CI (`ci.yml`) runs GPU-less so the whole webgpu project auto-skips there** — these gates only actually execute on a GPU box: locally via `npm run test`, or in CI via the `gpu-nightly.yml` workflow (needs a self-hosted `[self-hosted, gpu]` runner). If you change the executor / compiled plan / optimizer dispatch, run `npm run test:gates` before committing.
+
 **Zero test failures policy.** Never accept test failures; fix before moving on. (Don't hand-maintain test counts here — run `npm run test` for the current numbers; as of 2026-06-12 it's ~1790 tests across ~137 file runs in the cpu+webgpu projects.)
 
 **Important:** Any standalone script or tool that uses WebGPU (Dawn) must call `process.exit(0)` at the end of `main()`. Dawn holds background threads that prevent Node from exiting naturally.

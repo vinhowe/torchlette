@@ -13,6 +13,7 @@ const GPU_TEST_FILES = [
   "test/checkpoint-memory-profile.spec.ts",
   "test/checkpoint-scale-analysis.spec.ts",
   "test/checkpoint-segmentation.spec.ts",
+  "test/compiled-plan-parity.spec.ts",
   "test/distilgpt2-checkpoint-memory.spec.ts",
   "test/distilgpt2-finetune.spec.ts",
   "test/distilgpt2-full-finetuning.spec.ts",

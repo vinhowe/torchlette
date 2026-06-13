@@ -1,0 +1,40 @@
+name: gpu-nightly
+
+# The main `ci` workflow runs on GPU-less ubuntu-latest, where the webgpu
+# vitest project auto-skips — so every GPU correctness gate (compiled-vs-
+# lowered trajectory parity, stream-generation diff, stream determinism,
+# the loss-regression and fused-vs-elementwise differentials) runs ONLY
+# here. Without this job those gates are manual-only and rot silently
+# (2026-06-13 audit, task #44).
+#
+# REQUIRES a self-hosted runner labelled [self-hosted, gpu] with WebGPU/Dawn
+# available (the dw-2-1 / sivri boxes). Register one, or trigger manually.
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # nightly 07:00 UTC
+  workflow_dispatch: {}
+
+concurrency:
+  group: gpu-nightly
+  cancel-in-progress: true
+
+jobs:
+  gpu-gates:
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      # Full suite incl. the slow project. On a GPU runner canUseWebGPU() is
+      # true, so the webgpu project — and the compiled-plan-parity gates
+      # (compiled==lowered, stream-gen no-divergence, determinism) — execute.
+      - run: pnpm test:full
