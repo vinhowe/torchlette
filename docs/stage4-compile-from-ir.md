@@ -214,11 +214,40 @@ adam-batch; fusedAttention FORWARD. Three capture mechanisms cover the
 "generator can't derive it post-hoc" cases: `cachedMatmulPlan` (geometry),
 `cachedInputShapes` (released multi-output input shapes), and read-only
 workspace/config lookups (`lookupKSplitTempBuffer`, `lookupPackedBuffers`,
-`lookupAttentionConfigBuffer`). Coverage: fwd 285/289, bwd 395/414,
+`lookupAttentionConfigBuffer`). Coverage: fwd 286/289, bwd 397/414,
 optimizer 100% (FULLY GENERATED). A latent bug fell out:
 `getOrCreateConfigBuffer` never populated its cache (re-created the
 attention config uniform every dispatch) — fixed (perf + stable identity
 for the generator).
+
+**Cross-entropy fwd+bwd (DONE).** `ceFwd`/`ceBwd` are module-level cached
+dispatchers (stable identity already), one dispatch each, geometry fully in
+the payload config {batchSize, vocabSize, ignoreIndex} — no shape
+derivation. Added planCrossEntropyForward/BackwardDispatch + generators.
+Output is `allocateOutputBuffer` (arena kind 1, empty inputSlots — NOT the
+kind-0 resolveOutputBuffer with aliasing inputs); the diff caught both at
+build time. Guards: targets i32/u32 (else ensureI32Targets casts) and
+logits/grad contiguous (else asContiguous copies), via
+`resolveContiguousInputSlot`.
+
+**Scalar-operand elementwise (DONE).** A binary/unary op with a `kind:
+"scalar"` operand now binds the scalar's scalar-table buffer
+(`lookupScalarStorage`) as a PERSISTENT slot — the executor refreshes its
+value per step, so it's a persistent binding, not a stream write. General
+across any scalar-operand elementwise op; the legacy CPU/non-f32
+full([],v) fallback (table miss) still bails. Subtlety the diff caught: the
+scalar-table buffer is persistent so resolveOutputBuffer excludes it from
+the output's aliasing candidates — the ALLOC's inputSlots must list only
+poolable operands (track `aliasInSlots` separately from the DISPATCH
+bindings).
+
+**Remaining uncovered (fwd 3, bwd 17), all out of easy reach:** `mean` (×1
+fwd) — captured-state invCount epilogue buffer; expand/broadcast producers
+(`contiguous[no-storage]×2` fwd, `mul[no-storage]×1` bwd) — strided-view
+layout not shape-derivable, correctly excluded; `fused[needed-
+intermediates]×8` — structural (post-dispatch intermediate re-exec), the
+hardest/last class; `fusedAttentionBackward×8` — the lifetime-split-slot
+bijection blocker below.
 
 Added since: **gather** (forward, single-sourced on `planGatherDirect`);
 **scatterAdd** (embedding backward ×2, single-sourced on
