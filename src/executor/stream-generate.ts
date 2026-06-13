@@ -546,7 +546,12 @@ function generateSequential(
     } else if (
       ref.kind !== "materialized" &&
       (ref.outputIndex ?? 0) === 0 &&
-      !VIEW_OPS.has(ref.node.op)
+      // Non-view producers allocate fresh (contiguous, offset 0). Contiguous-
+      // view producers (reshape/view/flatten/squeeze/unsqueeze) share the
+      // base buffer but their logical layout is ALSO contiguous-offset-0, so
+      // the synthesized metadata is correct; the binding's buffer comes from
+      // the resolved slot. Strided views stay bailed.
+      (!VIEW_OPS.has(ref.node.op) || CONTIGUOUS_VIEW_OPS.has(ref.node.op))
     ) {
       const shape = ref.node.shape;
       const dtype = (ref.node.dtype ?? "f32") as WebGPUTensor["dtype"];
@@ -562,6 +567,9 @@ function generateSequential(
         buffer: { size: alignBufferSize(size * 4) },
       } as unknown as WebGPUTensor;
     } else {
+      // Remaining no-storage producers are strided views (expand/broadcast):
+      // their layout isn't shape-derivable and synthesizing contiguous
+      // metadata would be wrong, so they stay bailed.
       return "no-storage";
     }
     const slot = resolveRefSlot(ref);
