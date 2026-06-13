@@ -82,7 +82,7 @@ import {
   TAG_UNIFORM,
   TAG_WRITE,
 } from "./compiled-plan";
-import type { LoweredPlan } from "./lowered-plan";
+import type { AttnInputContig, LoweredPlan } from "./lowered-plan";
 
 export interface GeneratedStream {
   /** Per-covered-action command segments, in action order. Verified against
@@ -218,6 +218,35 @@ export function generateStream(
     switch (action.kind) {
       case "view": {
         const node = planNodes[action.nodeIndex];
+        // reshape (uniquely among the view ops) MATERIALIZES a contiguous
+        // copy when its input is non-contiguous (e.g. reshape-of-permute in
+        // attention's grad reshaping) — the backend does contiguous()+reshape.
+        // transpose/permute/expand/narrow are pure stride math, never copy.
+        // The copy is recorded under THIS node; mirror it from the captured
+        // input layout. When the input is contiguous reshape is a free view
+        // (falls through to the alias path below).
+        const vi = (action as { cachedViewInput?: AttnInputContig })
+          .cachedViewInput;
+        if (node && node.op === "reshape" && vi && !vi.contiguous) {
+          const inSlot = resolveRefSlot(node.inputs[0]);
+          if (inSlot === undefined) {
+            miss("view:reshape-copy[untracked-input]");
+            phantom(node, action.nodeIndex);
+            break;
+          }
+          const cc = planContigCopy(vi, inSlot, slots);
+          if (typeof cc === "string") {
+            miss(`view:reshape-copy[${cc}]`);
+            phantom(node, action.nodeIndex);
+            break;
+          }
+          commands.push(...cc.commands);
+          segments.push({ nodeIndex: action.nodeIndex, commands: cc.commands });
+          mapNodeResult(node, cc.outSlot, bufferToSlot);
+          nodeSlot.set(action.nodeIndex, cc.outSlot);
+          coveredActions++;
+          break;
+        }
         const aliased = node ? resolveRefSlot(node.inputs[0]) : undefined;
         if (aliased !== undefined) nodeSlot.set(action.nodeIndex, aliased);
         coveredActions++;
@@ -255,17 +284,17 @@ export function generateStream(
           node.op === "fusedAttentionForward" ||
           node.op === "fusedAttentionBackward"
         ) {
-          // Bail if any input needed a contiguous-copy prologue (the op
-          // asContiguous'd it) — that extra ALLOC+dispatch isn't generated.
-          if (
-            (action as { cachedAllInputsContig?: boolean })
-              .cachedAllInputsContig === false
-          ) {
-            miss(`op:${node.op}[contiguous-prologue]`);
-            phantom(node, action.nodeIndex);
-            break;
-          }
-          const ag = generateAttention(node, slots, resolveRefSlot, bufferSlot);
+          // Non-contiguous inputs get a contiguous-copy prologue (the op
+          // asContiguous's them); generateAttention emits it from the
+          // per-input layout captured at lowering.
+          const ag = generateAttention(
+            node,
+            slots,
+            resolveRefSlot,
+            bufferSlot,
+            (action as { cachedInputContig?: AttnInputContig[] })
+              .cachedInputContig,
+          );
           if (typeof ag === "string") {
             miss(`op:${node.op}[${ag}]`);
             phantom(node, action.nodeIndex);
@@ -482,6 +511,58 @@ function contiguousStrides(shape: number[]): number[] {
     acc *= shape[i];
   }
   return s;
+}
+
+/**
+ * Emit a contiguous-copy (ensureContiguous / reshape-of-strided / attention
+ * asContiguous) from a captured input LAYOUT: resolveOutputBuffer ALLOC
+ * (kind 0, the original as the aliasing input) + planContiguousDirect dispatch
+ * [orig, copy, params]. Returns the copy's output slot, or a bail string when
+ * the buffer exceeds maxBindingSize (chunked contiguous — a different command
+ * pattern). The plan is the SAME one the live path uses (shared getPipeline
+ * cache → identical pipeline identity for the diff).
+ */
+function planContigCopy(
+  info: AttnInputContig,
+  inSlot: Slot,
+  slots: SlotSource[],
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  const meta = {
+    shape: info.shape,
+    strides: info.strides,
+    offset: info.offset,
+    dtype: info.dtype,
+    size: sizeOf(info.shape),
+    isContiguous: false,
+    buffer: { size: info.bufferSize },
+  } as unknown as WebGPUTensor;
+  const cp = planContiguousDirect(meta);
+  if (!cp) return "contig-chunked";
+  const pipeline = getPipeline(requireContext(), cp.key, cp.shader);
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const paramsSlot = slots.length;
+  slots.push({ kind: "params", seqIndex: -1, data: cp.paramsData });
+  return {
+    commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: cp.outputSizeBytes,
+        allocKind: 0,
+        inputSlots: [inSlot],
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline,
+        bindings: [inSlot, outSlot, paramsSlot],
+        gx: cp.dispatchX,
+        gy: cp.dispatchY,
+        gz: 1,
+      },
+    ],
+    outSlot,
+  };
 }
 
 /** node.op → the WGSL symbol dispatchBinary receives from the backend. */
@@ -1423,6 +1504,7 @@ function generateAttention(
   slots: SlotSource[],
   resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
   bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+  inputContig: AttnInputContig[] | undefined,
 ):
   | { commands: GpuCommand[]; outputs: Array<{ outputIndex: number; slot: Slot }> }
   | string {
@@ -1458,6 +1540,32 @@ function generateAttention(
     slots.push({ kind: "arena" });
     return s;
   };
+
+  // Contiguous-copy prologue: the op asContiguous's each input (fused.ts),
+  // copying any whose isContiguous === false. We mirror that exactly from the
+  // per-input layout captured at lowering — for each non-contiguous input, one
+  // resolveOutputBuffer ALLOC (kind 0, the original as aliasing input) + one
+  // planContiguousDirect dispatch [orig, copy, params], then rebind the kernel
+  // input to the copy's slot. Copies are emitted in input order, before the
+  // attention dispatches (asContiguous runs on all inputs up front). The
+  // captured `contiguous` flag matches ensureContiguous, so the command count
+  // matches the recording. Without the capture we can't replay the copy → bail.
+  const prologue: GpuCommand[] = [];
+  if (inputContig) {
+    if (inputContig.length !== inSlots.length) return "contig-arity";
+    for (let i = 0; i < inSlots.length; i++) {
+      const info = inputContig[i];
+      if (info.contiguous) continue;
+      const cc = planContigCopy(info, inSlots[i], slots);
+      if (typeof cc === "string") return cc;
+      prologue.push(...cc.commands);
+      inSlots[i] = cc.outSlot;
+    }
+  } else if (node.op === "fusedAttentionBackward") {
+    // Forward inputs (q/k/v) are contiguous in the covered traces, so a
+    // missing capture there is benign; backward relies on the capture.
+    return "no-contig-capture";
+  }
   const causal = cfg.isCausal ?? false;
 
   if (node.op === "fusedAttentionForward") {
@@ -1476,6 +1584,7 @@ function generateAttention(
     const lseSlot = newSlot();
     return {
       commands: [
+        ...prologue,
         { tag: TAG_ALLOC, slot: outSlot, bytes: p.outBytes, allocKind: 1, inputSlots: [] },
         { tag: TAG_ALLOC, slot: lseSlot, bytes: p.lseBytes, allocKind: 1, inputSlots: [] },
         {
@@ -1521,6 +1630,7 @@ function generateAttention(
   });
   return {
     commands: [
+      ...prologue,
       { tag: TAG_ALLOC, slot: dBufSlot, bytes: p.dBytes, allocKind: 1, inputSlots: [] },
       dispatch(p.dPlan, [dOS, oS, dBufSlot, cfgSlot]),
       { tag: TAG_ALLOC, slot: dQSlot, bytes: p.dqBytes, allocKind: 1, inputSlots: [] },

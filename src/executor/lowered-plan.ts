@@ -85,10 +85,27 @@ interface LoweredNodeAction {
    *  generator can't derive them post-hoc (released multi-output inputs);
    *  e.g. narrowBackward's grad dim size. Template-invariant. */
   cachedInputShapes?: number[][];
-  /** Stage-4 phase-3: whether every input was contiguous at lowering
-   *  (attention ops asContiguous internally; a copy prologue isn't yet
-   *  generated, so the generator bails when false). Template-invariant. */
-  cachedAllInputsContig?: boolean;
+  /** Stage-4 phase-3: per-input layout captured at lowering for attention
+   *  ops (which asContiguous internally). `contiguous` mirrors
+   *  ensureContiguous (copy iff false); the layout fields let the generator
+   *  replay planContiguousDirect for the non-contiguous inputs (the inputs
+   *  are liveness-released by plan-build). Template-invariant. */
+  cachedInputContig?: AttnInputContig[];
+  /** Stage-4 phase-3: input layout for a `reshape` view action — reshape
+   *  materializes a contiguous copy when its input is non-contiguous (the
+   *  generator replays planContiguousDirect). Template-invariant. */
+  cachedViewInput?: AttnInputContig;
+}
+
+/** Per-input layout for an attention op's contiguous-copy prologue (stage-4
+ *  phase-3). Captured at lowering; replayed by the stream generator. */
+export interface AttnInputContig {
+  contiguous: boolean;
+  shape: number[];
+  strides: number[];
+  offset: number;
+  dtype: import("../backend/types").DType;
+  bufferSize: number;
 }
 
 /** A matmul + epilogue chain dispatch. */

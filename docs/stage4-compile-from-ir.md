@@ -214,11 +214,11 @@ adam-batch; fusedAttention FORWARD. Three capture mechanisms cover the
 "generator can't derive it post-hoc" cases: `cachedMatmulPlan` (geometry),
 `cachedInputShapes` (released multi-output input shapes), and read-only
 workspace/config lookups (`lookupKSplitTempBuffer`, `lookupPackedBuffers`,
-`lookupAttentionConfigBuffer`). Coverage: fwd 287/289, bwd 405/414,
-optimizer 100% (FULLY GENERATED) — FORWARD is now complete bar the two
-deliberately-excluded expand/broadcast producers; BACKWARD is complete bar
-fusedAttentionBackward×8 (bijection blocker) + 1 excluded expand producer. A latent bug fell out:
-`getOrCreateConfigBuffer` never populated its cache (re-created the
+`lookupAttentionConfigBuffer`). Coverage: fwd 287/289, bwd 413/414,
+optimizer 100% (FULLY GENERATED) — FORWARD and BACKWARD are both now
+complete bar the deliberately-excluded expand/broadcast producers
+(`contiguous[no-storage]×2` fwd, `mul[no-storage]×1` bwd). A latent bug fell
+out: `getOrCreateConfigBuffer` never populated its cache (re-created the
 attention config uniform every dispatch) — fixed (perf + stable identity
 for the generator).
 
@@ -243,14 +243,43 @@ the output's aliasing candidates — the ALLOC's inputSlots must list only
 poolable operands (track `aliasInSlots` separately from the DISPATCH
 bindings).
 
-**Remaining uncovered (fwd 2, bwd 9), all out of easy reach:**
+**Remaining uncovered (fwd 2, bwd 1), all deliberately excluded:**
 expand/broadcast producers (`contiguous[no-storage]×2` fwd,
-`mul[no-storage]×1` bwd) — strided-view layout not shape-derivable,
-correctly excluded; `fusedAttentionBackward×8` — the lifetime-split-slot
-bijection blocker below (now bails earlier at `[contiguous-prologue]`,
-since its inputs took the asContiguous path; same root, still uncovered).
-The only remaining tractable-vs-structural line is the bijection redesign;
-everything else is covered.
+`mul[no-storage]×1` bwd) — strided-view layout not shape-derivable, so
+synthesizing contiguous metadata would mislead the kernel. Nothing else is
+uncovered: forward, backward, and the optimizer are all complete. **The
+recorder is now ready to become a pure cross-check (phase 4).**
+
+**fusedAttentionBackward (DONE — and the "bijection blocker" was stale).**
+The 2026-06-13 doc claimed a lifetime-split-slot bijection blocker: dV read
+by narrowBackward across a recordAlloc slot split, rejected by the differ's
+1:1 gen↔rec map. An instrumented trace (TORCHLETTE_PROBE_SPLIT) DISPROVED
+it: every attention-bwd output buffer is allocated once, bound at exactly
+one slot, consumed by one downstream view at that same slot — **no split**.
+Phase-1.5's planner-derived buffer assignment (one owner per buffer, derived
+from liveness — the XLA model) had already dissolved the physical-reuse
+artifact the blocker described. The ACTUAL blockers were two general
+contiguous-copy gaps, both now fixed:
+- **Attention contiguous-prologue.** The op asContiguous's its inputs; a
+  non-contiguous one (e.g. dO) records one resolveOutputBuffer ALLOC + one
+  planContiguousDirect copy dispatch the generator didn't emit. Fix: capture
+  each input's layout at lowering (`cachedInputContig`, replacing the old
+  `cachedAllInputsContig` boolean); `generateAttention` replays
+  planContigCopy for the non-contiguous ones (mirrors ensureContiguous —
+  copy iff isContiguous===false — so the command count matches) and rebinds
+  the kernel input to the copy slot.
+- **reshape materialization.** A `reshape` (uniquely among the view ops)
+  materializes a contiguous copy when its input is non-contiguous AND the
+  new shape is stride-incompatible (`inferReshapeStrides===null`) — e.g.
+  reshape-of-permute in attention's grad reshaping (dV→permute→reshape→
+  narrowBackward). The generator treated reshape as an always-free view.
+  Fix: capture `cachedViewInput` for reshape view actions, OBSERVING the
+  copy decision (result.buffer !== input.buffer) rather than re-deriving it
+  — a non-contiguous input with compatible strides is still a free view, so
+  the isContiguous predicate over-triggers (it did, and the diff caught the
+  spurious copies as 24 unmatched segments in a non-attention plan). The
+  view case emits planContigCopy when the input materialized, else aliases.
+Both share `planContigCopy`. bwd 405→413/414; 0 diverged across all plans.
 
 **Needed-intermediate re-execution (DONE — was "the hardest/last class,"
 turned out mechanical).** A fused group's internal elementwise nodes that
@@ -315,27 +344,18 @@ whole action if the executor would instead take the true-batched path
 (≤64). mean-over-dim stays excluded (its invCount epilogue buffer is fresh
 per call — the same captured-state gap as full mean). bwd 392→395/414.
 
-**KNOWN BLOCKER — fusedAttentionBackward (the lifetime-split-slot limit).**
-Attempted and reverted (it broke narrowBackward). The attention-backward
-SEGMENT itself verifies; what fails is the consumer: narrowBackward reads
-attention's dV (a multi-output extra) and the recording assigns that ONE
-logical tensor TWO different slot numbers across segments — its value in
-the attention segment vs the slot narrowBackward reads (a recordAlloc
-lifetime split / intervening realloc, NOT a missing contiguous copy:
-narrowBackward emits only alloc+dispatch, no copy). The segment differ's
-GLOBAL gen↔rec bijection is 1:1 and so rejects one-gen-slot→two-rec-slots.
-This is a structural limit of bijection-based segment diffing against a
-recording that lifetime-splits buffers, surfaced only when BOTH the
-multi-output producer AND its downstream consumer are covered (while
-attention-bwd was uncovered its outputs were phantom slots, so
-narrowBackward verified). Candidate fixes, each non-trivial: (a) the
-generator models the recording's lifetime-split slot transitions for
-multi-output extras; (b) the differ tolerates gen→{rec aliases of one
-buffer} when it can prove they're lifetime-split (needs alias info it
-doesn't have today); (c) make recordAlloc NOT lifetime-split buffers that
-are still logically live across a consumer (changes the recording).
-Forward attention + the config-cache fix shipped (d00d1e7); backward
-attention stays cleanly bailed (`cachedAllInputsContig`).
+**RESOLVED (was "KNOWN BLOCKER — fusedAttentionBackward / lifetime-split-slot
+limit").** The 2026-06-13 claim — narrowBackward reads dV across a recordAlloc
+lifetime split, rejected by the 1:1 gen↔rec bijection — was investigated with
+an instrumented trace (TORCHLETTE_PROBE_SPLIT) and DISPROVED: attention-bwd
+outputs are each allocated once and bound at exactly one slot (no split). The
+phase-1.5 planner (one owner per buffer, derived from liveness) had already
+removed the physical-reuse artifact. The real blockers were two general
+contiguous-copy gaps (attention asContiguous prologue + reshape-of-strided
+materialization), both fixed — see the phase-3 progress section above.
+Lesson: a "structural limit" pinned to an old architecture's behavior must be
+re-confirmed against current code before being treated as a design fork; the
+cheap instrumented trace overturned a multi-session redesign plan in minutes.
 
 ### Phase 4 — Deletions and dividends
 - Delete: record* hooks (recorder kept only as the CI cross-check), the

@@ -1535,20 +1535,74 @@ export async function executeLoweredPlan(
           }
 
           // Attention fwd/bwd asContiguous() their inputs inside the op — a
-          // non-contiguous input inserts a contiguous-copy prologue (extra
-          // ALLOC+dispatch) the generator doesn't yet emit. Capture whether
-          // every input is contiguous at lowering; the generator bails
-          // (uncovered) otherwise. Contiguity is template-invariant.
+          // non-contiguous input inserts a contiguous-copy prologue (one
+          // ALLOC + one copy dispatch, mirroring ensureContiguous). Capture
+          // each input's layout at lowering (inputs are live here; released
+          // by plan-build) so the generator can replay planContiguousDirect
+          // for the non-contiguous ones. `contiguous` mirrors ensureContiguous
+          // EXACTLY (copy iff isContiguous === false) so the generated command
+          // count matches the recording. Template-invariant.
           if (
             action.kind === "sequential" &&
             (node.op === "fusedAttentionForward" ||
               node.op === "fusedAttentionBackward") &&
-            action.cachedAllInputsContig === undefined
+            action.cachedInputContig === undefined
           ) {
-            action.cachedAllInputsContig = backendInputs.every((t) => {
-              const w = t as { isContiguous?: boolean; offset?: number };
-              return w.isContiguous !== false && (w.offset ?? 0) === 0;
+            action.cachedInputContig = backendInputs.map((t) => {
+              const w = t as {
+                isContiguous?: boolean;
+                shape: number[];
+                strides: number[];
+                offset?: number;
+                dtype: import("../backend/types").DType;
+                buffer: { size: number };
+              };
+              return {
+                contiguous: w.isContiguous !== false,
+                shape: w.shape.slice(),
+                strides: w.strides.slice(),
+                offset: w.offset ?? 0,
+                dtype: w.dtype,
+                bufferSize: w.buffer.size,
+              };
             });
+          }
+
+          // reshape MATERIALIZES a contiguous copy ONLY when its input is
+          // non-contiguous AND the new shape is incompatible with the input
+          // strides (inferReshapeStrides === null); a non-contiguous input
+          // with compatible strides is still a free view (reshape in views.ts).
+          // So we don't re-derive that decision — we OBSERVE it: the copy
+          // produced a fresh buffer, so result.buffer !== input.buffer iff it
+          // materialized. `contiguous: !materialized` → the generator emits the
+          // copy (false) or a free alias (true). Capture the input layout for
+          // planContiguousDirect. e.g. reshape-of-permute in attention grads.
+          if (
+            action.kind === "view" &&
+            node.op === "reshape" &&
+            action.cachedViewInput === undefined &&
+            backendInputs.length >= 1
+          ) {
+            const w = backendInputs[0] as {
+              shape: number[];
+              strides: number[];
+              offset?: number;
+              dtype: import("../backend/types").DType;
+              buffer: { size: number };
+            };
+            const resultBuf = (
+              node.result?.backendTensor as { buffer?: object } | undefined
+            )?.buffer;
+            const materialized =
+              resultBuf !== undefined && resultBuf !== w.buffer;
+            action.cachedViewInput = {
+              contiguous: !materialized,
+              shape: w.shape.slice(),
+              strides: w.strides.slice(),
+              offset: w.offset ?? 0,
+              dtype: w.dtype,
+              bufferSize: w.buffer.size,
+            };
           }
           break;
         }
