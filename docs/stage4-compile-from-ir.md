@@ -214,8 +214,9 @@ adam-batch; fusedAttention FORWARD. Three capture mechanisms cover the
 "generator can't derive it post-hoc" cases: `cachedMatmulPlan` (geometry),
 `cachedInputShapes` (released multi-output input shapes), and read-only
 workspace/config lookups (`lookupKSplitTempBuffer`, `lookupPackedBuffers`,
-`lookupAttentionConfigBuffer`). Coverage: fwd 286/289, bwd 397/414,
-optimizer 100% (FULLY GENERATED). A latent bug fell out:
+`lookupAttentionConfigBuffer`). Coverage: fwd 287/289, bwd 397/414,
+optimizer 100% (FULLY GENERATED) — FORWARD is now complete bar the two
+deliberately-excluded expand/broadcast producers. A latent bug fell out:
 `getOrCreateConfigBuffer` never populated its cache (re-created the
 attention config uniform every dispatch) — fixed (perf + stable identity
 for the generator).
@@ -241,13 +242,14 @@ the output's aliasing candidates — the ALLOC's inputSlots must list only
 poolable operands (track `aliasInSlots` separately from the DISPATCH
 bindings).
 
-**Remaining uncovered (fwd 3, bwd 17), all out of easy reach:** `mean` (×1
-fwd) — captured-state invCount epilogue buffer; expand/broadcast producers
-(`contiguous[no-storage]×2` fwd, `mul[no-storage]×1` bwd) — strided-view
-layout not shape-derivable, correctly excluded; `fused[needed-
-intermediates]×8` — structural (post-dispatch intermediate re-exec), the
-hardest/last class; `fusedAttentionBackward×8` — the lifetime-split-slot
-bijection blocker below.
+**Remaining uncovered (fwd 2, bwd 17), all out of easy reach:**
+expand/broadcast producers (`contiguous[no-storage]×2` fwd,
+`mul[no-storage]×1` bwd) — strided-view layout not shape-derivable,
+correctly excluded; `fused[needed-intermediates]×8` — structural
+(post-dispatch intermediate re-exec), the hardest/last class;
+`fusedAttentionBackward×8` — the lifetime-split-slot bijection blocker
+below. Everything tractable without a major design effort (a new capture
+mechanism or the bijection redesign) is now covered.
 
 Added since: **gather** (forward, single-sourced on `planGatherDirect`);
 **scatterAdd** (embedding backward ×2, single-sourced on
@@ -261,17 +263,18 @@ contiguous-view class, clearing `cast[no-storage]` fwd+bwd). Strided views
 metadata would mislead the kernel; the remaining `contiguous[no-storage]×2`
 / `mul[no-storage]×1` are all `expand` producers, correctly excluded.
 
-**`mean` is NOT an easy tile op** (investigated, left uncovered): the
-backend `ReduceOp` is only sum/max/min — `mean` lowers to a `sum` FULL
-reduction with an invCount epilogue (mul by 1/count). That epilogue path
-dispatches through a FRESH uncached `createTileKernelDispatcher` with a
-per-call `invCount` buffer (createTrackedBuffer + writeBuffer 1/count).
-Neither the dispatcher's config buffer nor the invCount buffer is cached
-or shape-derivable, so `mean` belongs to the captured-state class, not the
-shared-cached-dispatcher class `generateFullReduction` covers for `sum`. A
-real fix would route the epilogue full-reduction through a cached
-dispatcher + count-keyed invCount buffer cache (a framework cleanup worth
-doing on its own), after which the generator could share the identity.
+**`mean` (DONE — the first-pass "captured-state" diagnosis was wrong).**
+`backend.mean()` (the path a plain `.mean()` node takes) does NOT use the
+invCount epilogue: it dispatches `sum` (cached full/dim reduction) into an
+intermediate buffer, then a `meanDiv` dispatch through the cached `"meanDiv"`
+dispatcher with `count` in a UNIFORM (not a buffer). So a mean node is ONE
+node → two ALLOC+dispatch pairs, both fully generatable. `generateMean` +
+`planMeanDivDispatch` cover it; the sum part reuses
+`planFullReductionDispatch`/`planDimReductionDispatch`. The fresh per-call
+`invCount` buffer only exists in `meanWithEpilogue` (the path taken when a
+user epilogue chain is fused onto the mean) — a different op the trainer's
+loss `.mean()` doesn't reach; if it ever shows up it stays the captured-state
+case (a cached dispatcher + count-keyed invCount-buffer cache would close it).
 
 **Dim reductions (DONE) — the cached-dispatcher cleanup the `mean` note
 predicted, applied to the dim path.** Dim reductions previously dispatched
