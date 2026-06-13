@@ -27,6 +27,8 @@ import {
 } from "../backend/webgpu/ops/views";
 import { planFullReductionDispatch } from "../backend/webgpu/ops/reductions";
 import { planFusedKernel } from "../backend/webgpu/fusion-dispatch";
+import { planTiledMatmul } from "../backend/webgpu/matmul/dispatch";
+import { dtypeBytes } from "../backend/webgpu/shape-utils";
 import { planAdamStepDispatch } from "../backend/webgpu/adam-kernel";
 import {
   lookupPackedBuffers,
@@ -257,6 +259,23 @@ export function generateStream(
           mapNodeResult(planNodes[o.nodeIndex], o.slot, bufferToSlot);
           nodeSlot.set(o.nodeIndex, o.slot);
         }
+        coveredActions++;
+        break;
+      }
+      case "matmul-epilogue": {
+        const me = action as MatmulEpilogueActionShape;
+        const gen = backend
+          ? generateMatmulEpilogue(me, planNodes, slots, resolveRefSlot, bufferSlot, backend)
+          : "no-backend";
+        if (typeof gen === "string") {
+          miss(`matmul-epilogue[${gen}]`);
+          phantom(planNodes[me.outputNodeIndex], me.outputNodeIndex);
+          break;
+        }
+        commands.push(...gen.commands);
+        segments.push({ nodeIndex: me.matmulNodeIndex, commands: gen.commands });
+        mapNodeResult(planNodes[me.outputNodeIndex], gen.outSlot, bufferToSlot);
+        nodeSlot.set(me.outputNodeIndex, gen.outSlot);
         coveredActions++;
         break;
       }
@@ -770,6 +789,123 @@ function generateScatterCopyDMA(
       },
     ],
     outSlot: base.slot,
+  };
+}
+
+interface PlanNodePath {
+  planNodeIndex: number;
+  inputIndex: number;
+}
+interface MatmulEpilogueActionShape {
+  matmulNodeIndex: number;
+  outputNodeIndex: number;
+  cachedDispatchConfig?: {
+    inputAPath: PlanNodePath;
+    inputBPath: PlanNodePath;
+    epilogueInputPaths: PlanNodePath[];
+    inputCastA?: "f16" | "f32";
+    inputCastB?: "f16" | "f32";
+    m: number;
+    k: number;
+    n: number;
+    transA: boolean;
+    transB: boolean;
+    batchSize: number;
+    batchStrideA: number;
+    batchStrideB: number;
+    batchStrideC: number;
+    outShape: number[];
+    dtypeA: "f16" | "f32";
+    dtypeB?: "f16" | "f32";
+    outputDtype: DType;
+    epilogueConfig: unknown;
+  };
+}
+
+/**
+ * matmul-epilogue generator. The action's cachedDispatchConfig (populated on
+ * the recording execution — the fast path that calls dispatchMatmulDirect)
+ * IS the structured plan: geometry, dtypes, epilogue config, and
+ * plan-node-relative input paths. Emits ALLOC(out) + the matmul DISPATCH via
+ * planTiledMatmul (shared with dispatchTiledMatmul's standard tail). Bails on
+ * the K-split path (op-internal temp + reduction — a later increment) and
+ * when the config isn't cached yet.
+ * Binding order mirrors dispatchTiledMatmul: [a, b, out, params, ...epi].
+ */
+function generateMatmulEpilogue(
+  action: MatmulEpilogueActionShape,
+  planNodes: LazyIRNode[],
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+  backend: import("../backend/types").Backend,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  const cfg = action.cachedDispatchConfig;
+  if (!cfg) return "no-config";
+  const device = (backend as { device?: GPUDevice }).device;
+  if (!device) return "no-device";
+
+  const pathSlot = (p: PlanNodePath): Slot | undefined => {
+    const ref = planNodes[p.planNodeIndex]?.inputs[p.inputIndex];
+    return ref ? resolveRefSlot(ref) : undefined;
+  };
+  const aSlot = pathSlot(cfg.inputAPath);
+  const bSlot = pathSlot(cfg.inputBPath);
+  if (aSlot === undefined || bSlot === undefined) return "untracked-input";
+  const epiSlots: Slot[] = [];
+  for (const p of cfg.epilogueInputPaths) {
+    const s = pathSlot(p);
+    if (s === undefined) return "untracked-epilogue-input";
+    epiSlots.push(s);
+  }
+
+  const plan = planTiledMatmul({
+    device,
+    a: undefined as unknown as GPUBuffer, // planTiledMatmul reads geometry only
+    b: undefined as unknown as GPUBuffer,
+    out: undefined as unknown as GPUBuffer,
+    m: cfg.m,
+    n: cfg.n,
+    k: cfg.k,
+    batchSize: cfg.batchSize,
+    batchStrideA: cfg.batchStrideA,
+    batchStrideB: cfg.batchStrideB,
+    batchStrideC: cfg.batchStrideC,
+    transA: cfg.transA,
+    transB: cfg.transB,
+    dtype: cfg.dtypeA,
+    dtypeB: cfg.dtypeB,
+    epilogue: cfg.epilogueConfig as never,
+    epilogueInputs: epiSlots.map(() => undefined as unknown as never), // count only
+    inputCastA: cfg.inputCastA as never,
+    inputCastB: cfg.inputCastB as never,
+  });
+  if (plan.kSplit) return "ksplit";
+
+  const outBytes = sizeOf(cfg.outShape) * dtypeBytes(cfg.outputDtype);
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const paramsSlot = slots.length;
+  slots.push({ kind: "params", seqIndex: -1, data: plan.paramsData });
+  return {
+    commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: outBytes,
+        allocKind: 0,
+        inputSlots: [aSlot, bSlot, ...epiSlots],
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: plan.pipeline,
+        bindings: [aSlot, bSlot, outSlot, paramsSlot, ...epiSlots],
+        gx: plan.dispatchX,
+        gy: plan.dispatchY,
+        gz: plan.dispatchZ,
+      },
+    ],
+    outSlot,
   };
 }
 

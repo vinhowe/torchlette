@@ -691,6 +691,111 @@ function computeKSplitFactor(
  * Automatically uses K-split when the output tile grid is too small
  * to saturate the GPU (e.g., small-M backward matmuls).
  */
+/**
+ * Stage-4 plan/encode split for the STANDARD (non-K-split) matmul path:
+ * pipeline + params bytes + dispatch dims + epilogue-input count, computed
+ * from geometry alone (no GPU alloc/encode). Returns {kSplit:true} when the
+ * K-split path applies — the stream generator treats that as uncovered
+ * (op-internal temp + two dispatches, a later increment). dispatchTiledMatmul
+ * consumes the SAME plan, so pipeline/bindings/workgroups can't drift.
+ * Binding order: [a, b, out, params, ...epilogueInputs].
+ */
+export interface MatmulStandardPlan {
+  kSplit: false;
+  pipeline: GPUComputePipeline;
+  paramsData: Uint32Array;
+  dispatchX: number;
+  dispatchY: number;
+  dispatchZ: number;
+  numEpilogueInputs: number;
+}
+
+export function planTiledMatmul(
+  options: DispatchMatmulOptions,
+): MatmulStandardPlan | { kSplit: true } {
+  const {
+    device,
+    m,
+    n,
+    k,
+    batchSize = 1,
+    transA = false,
+    transB = false,
+    alpha = 1.0,
+    dtype = "f32",
+    dtypeB,
+    epilogue,
+    epilogueInputs = [],
+    inputCastA,
+    inputCastB,
+  } = options;
+
+  const hasEpilogue =
+    !!epilogue &&
+    epilogue.ops.length > 0 &&
+    epilogue.ops.some((op) => op.kind !== "none");
+  const shapeClass = classifyShape(m, n, k, batchSize);
+  const config =
+    options.config ??
+    getConfigForShape(shapeClass, dtype, hasEpilogue, m, n, k);
+  validateConfig(config);
+  const transposeMode = getTransposeMode(transA, transB);
+  const lda = transA ? m : k;
+  const ldb = transB ? k : n;
+  const ldc = n;
+  const batchStrideA = options.batchStrideA ?? m * k;
+  const batchStrideB = options.batchStrideB ?? k * n;
+  const batchStrideC = options.batchStrideC ?? m * n;
+  const workgroupsX = Math.ceil(n / config.tileN);
+  const workgroupsY = Math.ceil(m / config.tileM);
+  const baseWorkgroups = workgroupsX * workgroupsY;
+  const kSplitFactor = computeKSplitFactor(
+    baseWorkgroups,
+    k,
+    config.tileK,
+    batchSize,
+    hasEpilogue,
+  );
+  if (kSplitFactor >= 2) return { kSplit: true };
+
+  const swapGrid =
+    batchSize === 1 && workgroupsX > workgroupsY * 4 ? true : undefined;
+  const codegenOptions: CodegenOptions = {
+    config,
+    transposeMode,
+    dtype,
+    dtypeB,
+    epilogue,
+    batched: batchSize > 1,
+    inputCastA,
+    inputCastB,
+    swapGrid,
+  };
+  const pipeline = getOrCreatePipeline(device, codegenOptions);
+  const paramsData = packMatmulParams(
+    m,
+    n,
+    k,
+    lda,
+    ldb,
+    ldc,
+    alpha,
+    batchSize,
+    batchStrideA,
+    batchStrideB,
+    batchStrideC,
+  );
+  return {
+    kSplit: false,
+    pipeline,
+    paramsData,
+    dispatchX: swapGrid ? workgroupsY : workgroupsX,
+    dispatchY: swapGrid ? workgroupsX : workgroupsY,
+    dispatchZ: batchSize,
+    numEpilogueInputs: epilogueInputs.length,
+  };
+}
+
 export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
   const {
     device,
@@ -852,59 +957,22 @@ export function dispatchTiledMatmul(options: DispatchMatmulOptions): void {
     return;
   }
 
-  // --- Standard path (no K-split) ---
-
-  // Swap grid axes for L2 cache reuse when the N-grid is much wider than M-grid.
-  // Consecutive workgroups then iterate over M (sharing B column tiles in L2).
-  const swapGrid =
-    batchSize === 1 && workgroupsX > workgroupsY * 4 ? true : undefined;
-
-  // Build codegen options
-  const codegenOptions: CodegenOptions = {
-    config,
-    transposeMode,
-    dtype,
-    dtypeB,
-    epilogue,
-    batched: batchSize > 1,
-    inputCastA,
-    inputCastB,
-    swapGrid,
-  };
-
-  // Get or create pipeline
-  const pipeline = getOrCreatePipeline(device, codegenOptions);
-
-  // Create params buffer via shared pool
-  const paramsData = packMatmulParams(
-    m,
-    n,
-    k,
-    lda,
-    ldb,
-    ldc,
-    alpha,
-    batchSize,
-    batchStrideA,
-    batchStrideB,
-    batchStrideC,
-  );
-  const paramsBuffer = sharedCreateParamsBuffer(device, paramsData);
-
-  // Build flat buffer array for cached bind group
+  // --- Standard path (no K-split) — decisions single-sourced in
+  // planTiledMatmul (the stream generator consumes the same plan). ---
+  const std = planTiledMatmul(options);
+  if (std.kSplit) {
+    throw new Error("dispatchTiledMatmul: K-split reached the standard tail");
+  }
+  const paramsBuffer = sharedCreateParamsBuffer(device, std.paramsData);
   const bgBuffers = [a, b, out, paramsBuffer, ...epilogueInputs];
-  const bindGroup = cachedCreateBindGroup(device, pipeline, bgBuffers);
-
-  const workgroupsZ = batchSize;
-
-  // When grid is swapped, X iterates over M and Y over N
-  const dispatchX = swapGrid ? workgroupsY : workgroupsX;
-  const dispatchY = swapGrid ? workgroupsX : workgroupsY;
-
-  // Encode and submit
-  dispatchComputePass(pipeline, bindGroup, dispatchX, dispatchY, workgroupsZ);
-
-  // Release params buffer back to shared pool
+  const bindGroup = cachedCreateBindGroup(device, std.pipeline, bgBuffers);
+  dispatchComputePass(
+    std.pipeline,
+    bindGroup,
+    std.dispatchX,
+    std.dispatchY,
+    std.dispatchZ,
+  );
   releaseParamsBuffer(paramsBuffer);
 }
 
