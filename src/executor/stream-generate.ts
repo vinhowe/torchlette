@@ -99,6 +99,12 @@ export interface GeneratedStream {
   /** op/action label → count of actions WITHOUT a generator. */
   uncovered: Map<string, number>;
   actionCount: number;
+  /** plan-node index → its primary-output (outputIndex 0) generated slot.
+   *  Used by the phase-4 cutover to build NodeResult slots from the generated
+   *  stream instead of the recording's buffer→slot map. */
+  nodeSlot: Map<number, Slot>;
+  /** `${nodeIndex}:${outputIndex}` → generated slot, for multi-output extras. */
+  nodeSlotExtra: Map<string, Slot>;
 }
 
 const F32_BYTES = 4;
@@ -137,6 +143,16 @@ export function generateStream(
       } else if (ref.kind === "scalar") {
         continue;
       } else {
+        // CRITICAL: the recording's pre-assignment (executor.ts) runs
+        // PRE-execution, when in-plan nodes have NO result — so only TRUE
+        // externals (materialized refs, prior-plan results) get external
+        // slots; in-plan producers (data sources, intermediates) get their
+        // slot from their own action later. The generator runs POST-execution,
+        // when EVERY node has a result, so it must exclude in-plan producers
+        // explicitly — otherwise a data-source buffer gets a spurious external
+        // slot whose Phase-1 replay resolution (planNodes[..].inputs[..] →
+        // getInputStorage) fails once the node's result is cleared (step 2+).
+        if (nodeIndexById.has(ref.node.id)) continue;
         const idx = ref.outputIndex ?? 0;
         storage = idx === 0 ? ref.node.result : ref.node.results?.[idx];
       }
@@ -477,6 +493,8 @@ export function generateStream(
     coveredActions,
     uncovered,
     actionCount,
+    nodeSlot,
+    nodeSlotExtra,
   };
 }
 

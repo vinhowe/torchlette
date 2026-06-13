@@ -90,6 +90,7 @@ import {
 import {
   assignSlot,
   buildCompiledPlan,
+  buildCompiledPlanFromGenerated,
   destroyCompiledPlanBuffers,
   resetPlannerRegistry,
   executeCompiledPlan,
@@ -1854,14 +1855,20 @@ export async function executeLoweredPlan(
         compiled.endCounters = getDispatchSequenceCounters();
         loweredPlan.compiledPlan = compiled;
       }
-      // Stage-4 phase 2 cross-check (TORCHLETTE_STREAM_GENERATE=1): generate
-      // the command stream from the lowered plan and diff it against the
-      // recording at the command level. Divergence = a generator bug or a
-      // recording gap, surfaced at build time instead of in a loss curve.
-      // Coverage is reported per uncovered op class; plans with uncovered
-      // actions are skipped (record/replay remains their execution source).
-      if (ENV.TORCHLETTE_STREAM_GENERATE === "1" && compiled.valid) {
-        const gen = generateStream(loweredPlan, planNodes, backend);
+      // Stage-4: generate the command stream from the lowered plan, once, if
+      // either consumer wants it — the cross-check gate or the phase-4 cutover.
+      const wantStreamGen = ENV.TORCHLETTE_STREAM_GENERATE === "1";
+      const wantCutover = ENV.TORCHLETTE_GENERATED_PLAN === "1";
+      const gen =
+        (wantStreamGen || wantCutover) && compiled.valid
+          ? generateStream(loweredPlan, planNodes, backend)
+          : undefined;
+
+      // Phase-2 cross-check (TORCHLETTE_STREAM_GENERATE=1): diff the generated
+      // stream against the recording at the command level. Divergence = a
+      // generator bug or a recording gap, surfaced at build time instead of in
+      // a loss curve. Coverage is reported per uncovered op class.
+      if (wantStreamGen && gen) {
         const top = [...gen.uncovered.entries()]
           .sort((a, b) => b[1] - a[1])
           .slice(0, 8)
@@ -1895,6 +1902,108 @@ export async function executeLoweredPlan(
           console.log(
             `[stream-gen] VERIFIED ${seg.verifiedActions}/${gen.segments.length} segments (${seg.verifiedCommands} cmds, ${seg.divergences.length} diverged, ${seg.unmatched} unmatched; covered ${gen.coveredActions}/${gen.actionCount} actions; uncovered: ${top})`,
           );
+        }
+      }
+
+      // Stage-4 phase-4 CUTOVER (TORCHLETTE_GENERATED_PLAN=1): when the
+      // generated stream fully covers the plan, build the compiled plan FROM
+      // IT and use it as the execution source — the recording stays only as
+      // the gate's reference (the recorded plan we just built is discarded,
+      // its planner entries released so the registry doesn't leak). The
+      // streams are proven byte-identical (modulo slot bijection) by the gate,
+      // so the generated plan is equivalent; flag-gated for A/B against the
+      // recorded build via the parity ladder. nodeResults carry the GENERATED
+      // slot per result node (gen.nodeSlot / gen.nodeSlotExtra); metadata
+      // comes from the live node result (same as the recorded harvest).
+      if (wantCutover && gen?.fullyCovered && compiled.valid) {
+        if (ENV.TORCHLETTE_DEBUG_COMPILED) {
+          const hist = (ss: typeof gen.slots) => {
+            const h: Record<string, number> = {};
+            for (const s of ss) h[s.kind] = (h[s.kind] ?? 0) + 1;
+            return JSON.stringify(h);
+          };
+          console.log(
+            `[cutover-slots] gen=${gen.slots.length} ${hist(gen.slots)} | rec=${compiled.slots.length} ${hist(compiled.slots)}`,
+          );
+        }
+        const genResults: NodeResult[] = [];
+        let genOk = true;
+        const emit = (i: number, oi: number, sh: { backendTensor: unknown }) => {
+          const bt = asGPUTensor(sh.backendTensor as never);
+          const slot =
+            oi === 0 ? gen.nodeSlot.get(i) : gen.nodeSlotExtra.get(`${i}:${oi}`);
+          if (slot === undefined) {
+            genOk = false;
+            return;
+          }
+          genResults.push({
+            nodeIndex: i,
+            outputIndex: oi,
+            slot,
+            shape: bt.shape.slice(),
+            strides: bt.strides.slice(),
+            dtype: bt.dtype,
+            offset: bt.offset,
+          });
+        };
+        for (let i = 0; i < planNodes.length && genOk; i++) {
+          const node = planNodes[i];
+          if (node.results && node.results.length > 0) {
+            for (let oi = 0; oi < node.results.length; oi++) {
+              const sh = node.results[oi];
+              if (sh) emit(i, oi, sh);
+            }
+          } else if (node.result) {
+            emit(i, 0, node.result);
+          }
+        }
+        if (ENV.TORCHLETTE_DEBUG_COMPILED) {
+          const recKeys = new Set(
+            nodeResults.map((r) => `${r.nodeIndex}:${r.outputIndex}`),
+          );
+          const genKeys = new Set(
+            genResults.map((r) => `${r.nodeIndex}:${r.outputIndex}`),
+          );
+          const missingInGen = [...recKeys].filter((k) => !genKeys.has(k));
+          const extraInGen = [...genKeys].filter((k) => !recKeys.has(k));
+          console.log(
+            `[cutover-results] genOk=${genOk} recResults=${nodeResults.length} genResults=${genResults.length} missingInGen=${missingInGen.length} extraInGen=${extraInGen.length}` +
+              (missingInGen.length
+                ? `\n  missing(first 8): ${missingInGen
+                    .slice(0, 8)
+                    .map((k) => {
+                      const ni = Number(k.split(":")[0]);
+                      return `${k}=${planNodes[ni]?.op}`;
+                    })
+                    .join(", ")}`
+                : ""),
+          );
+        }
+        if (genOk) {
+          const genPlan = buildCompiledPlanFromGenerated({
+            commands: gen.commands,
+            slots: gen.slots,
+            nodeResults: genResults,
+          });
+          if (genPlan.valid) {
+            // Release the just-built recorded plan's planner entries (it's
+            // being discarded) AFTER the generated plan is confirmed valid —
+            // if it weren't, loweredPlan.compiledPlan would still need the
+            // recorded entries to replay.
+            destroyCompiledPlanBuffers(compiled);
+            genPlan.endCounters = getDispatchSequenceCounters();
+            loweredPlan.compiledPlan = genPlan;
+            if (ENV.TORCHLETTE_DEBUG_COMPILED) {
+              const opc: Record<string, number> = {};
+              for (const n of planNodes) opc[n.op] = (opc[n.op] ?? 0) + 1;
+              const sig = ["adamStep", "matmul", "fusedAttentionForward", "fusedAttentionBackward", "fusedCrossEntropyForward", "tensorFromArray"]
+                .map((o) => `${o}=${opc[o] ?? 0}`)
+                .join(" ");
+              console.log(
+                `[compiled] phase-4 cutover: GENERATED plan execution source (${gen.commands.length} cmds, ${genResults.length} results) ops[${sig}]`,
+              );
+            }
+          }
         }
       }
       compilationRecording = null;

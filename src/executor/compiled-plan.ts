@@ -288,22 +288,9 @@ export function buildCompiledPlan(input: {
 
   const commands: GpuCommand[] = [];
 
-  // Stage-4 memory planner (THE compiled-replay buffer assignment under
-  // the liveness arena since phase 1.5; TORCHLETTE_MEMORY_PLANNER=0
-  // disables compiled replay wholesale — see compiledPlannedEnabled).
-  // Derives the assignment from slot lifetimes — one owner per buffer,
-  // deterministic, audited at build — and packs temps across plans through
-  // the step-scoped shared registry. Replaced the "pin the recorded pool
-  // buffers" mechanism (aa2a7f5, deleted in phase 1.5): same sharing, but
-  // derived rather than replayed-by-identity, so there is no adoption
-  // refcounting, no pool-origin tracking, and no replay-time fallback
-  // heuristics. Validated (2026-06-12, A100 same-machine A/B): parity to
-  // fp noise over 30 steps, steady-state speed parity, peak memory BEATS
-  // the pin mechanism by ~14% on both distil@512 (5.07 vs 5.88GB) and
-  // medium@512 (15.0 vs 17.5GB). docs/stage4-compile-from-ir.md.
-  // Under the legacy arena (TORCHLETTE_ARENA_LIVENESS=0) replays bind
-  // per-position arena buffers dynamically — no planner needed.
-  const usePlanner = compiledPlannedEnabled();
+  // The stage-4 memory planner (THE compiled-replay buffer assignment under
+  // the liveness arena since phase 1.5) runs in finalizeCompiledPlan over the
+  // final command stream — see the note there and compiledPlannedEnabled.
 
   // Assign a persistent slot at BUILD time for a buffer unmapped at record
   // time (config caches, k-split temps — long-lived singletons, never
@@ -447,6 +434,46 @@ export function buildCompiledPlan(input: {
     }
   }
 
+  return finalizeCompiledPlan(commands, slotSources, nodeResults);
+}
+
+/**
+ * Stage-4 phase-4 cutover: build a CompiledPlan directly from a GENERATED
+ * stream (stream-generate.ts) instead of the recorded log. The generator
+ * already emits final GpuCommand[] + SlotSource[] (slot assignment done) and a
+ * node→slot map, so this path skips the raw-log → command transform entirely
+ * and just runs the SAME planner + assembly tail. The generated stream is
+ * proven byte-identical to the recording (modulo slot bijection) by the
+ * differential gate, so the resulting plan is equivalent; callers gate on
+ * gen.fullyCovered (every action generatable) before using this. nodeResults
+ * must carry the GENERATED slot for each result node (built from gen.nodeSlot
+ * / gen.nodeSlotExtra, metadata from the live node result).
+ */
+export function buildCompiledPlanFromGenerated(input: {
+  commands: GpuCommand[];
+  slots: SlotSource[];
+  nodeResults: NodeResult[];
+}): CompiledPlan {
+  return finalizeCompiledPlan(input.commands, input.slots, input.nodeResults);
+}
+
+/**
+ * Shared tail of plan construction: the optional debug dump, the stage-4
+ * memory planner (alloc-slot → registry-entry assignment, derived from
+ * lifetimes over the final command stream with cross-plan temp packing; throws
+ * on structural overlap — a planner bug is a build failure, not a replay
+ * corruption), and final plan assembly + registry ownership. Used by both the
+ * recorded build (buildCompiledPlan) and the generated build
+ * (buildCompiledPlanFromGenerated) — the planner sees only the command stream
+ * + result slots, so it is identical for both.
+ */
+function finalizeCompiledPlan(
+  commands: GpuCommand[],
+  slotSources: SlotSource[],
+  nodeResults: NodeResult[],
+): CompiledPlan {
+  const usePlanner = compiledPlannedEnabled();
+
   if (ENV.TORCHLETTE_DEBUG_COMPILED) {
     const dispatchCount = commands.filter((c) => c.tag === TAG_DISPATCH).length;
     const allocCount = commands.filter((c) => c.tag === TAG_ALLOC).length;
@@ -464,11 +491,6 @@ export function buildCompiledPlan(input: {
     );
   }
 
-  // Stage-4 memory planner: derive the alloc-slot buffer assignment from
-  // lifetimes over the final command stream, drawing temp entries from the
-  // step-scoped shared registry (cross-plan packing). Throws on structural
-  // overlap (always-on audit) — a planner bug becomes a build failure, not
-  // a replay corruption.
   let plannerAssignment: Map<number, number> | undefined;
   let plannerEntries: number[] | undefined;
   if (usePlanner) {

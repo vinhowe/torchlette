@@ -393,6 +393,60 @@ cross-check and the above become deletable as the planner subsumes them.
   pointers → ~700ms cold start dies); single answer to "who owns this
   buffer"; the architecture-debt rules become enforced by construction.
 
+**Cutover WIP (2026-06-13, flag-gated `TORCHLETTE_GENERATED_PLAN=1`, DEFAULT
+OFF — default path + gate fully green).** Wired: `finalizeCompiledPlan` (the
+shared planner+assembly tail, extracted from `buildCompiledPlan`),
+`buildCompiledPlanFromGenerated` (feeds the generated commands/slots + gen-slot
+nodeResults through `finalize`), `generateStream` now exports `nodeSlot`/
+`nodeSlotExtra`, and the executor builds the generated plan + swaps it in when
+`gen.fullyCovered` and every result node has a gen slot. Two bugs found+fixed
+en route:
+1. **Spurious external slots (FIXED).** The generator's external pre-assignment
+   mirrored the executor's, but the executor runs PRE-execution (in-plan nodes
+   have no result → only true externals get external slots) while the generator
+   runs POST-execution (every node has a result). So in-plan data-source buffers
+   got spurious external slots whose Phase-1 replay resolution failed once the
+   node result cleared (step 2). Fix: skip pending refs whose producer is
+   in-plan (`nodeIndexById.has`). This is a real generator-correctness fix and
+   lands independent of the cutover (gate stays green).
+2. **Mixed-coverage harvest bail.** A "fully covered" plan can still have result
+   nodes with no `nodeSlot` entry (not action outputs); the harvest sets
+   genOk=false and that plan stays recorded — SAFE, but means the cutover is
+   per-plan (forward cuts over; backward+optimizer stays recorded for now).
+
+**OPEN — cross-step freeze (the blocker), now precisely localized.** With the
+flag on, the FORWARD plan cuts over (backward+optimizer stays recorded — genOk
+=false there, see #2). **Step-0/1 losses match the recorded baseline to fp
+noise**, then the loss FREEZES from step 2 at ≈ the INITIAL-param loss.
+
+Ruled out by direct comparison against the recorded plan (all IDENTICAL):
+generated commands (gate), flat command TAG order, slot-kind histograms, result
+coverage (259/259, 0 missing), data-source re-execution (inputs ARE fresh each
+step via TAG_WRITE), and — decisively — the forward's WEIGHT external slots
+resolve to the SAME buffers with the SAME storage progression as recorded
+(slot30: storage 4945→6542, both on buffer b1, in-place mutated). Also
+falsified: discarded-recorded-plan entry release (NO_RELEASE freezes too) and
+the memory planner (freezes identically under `ARENA_LIVENESS=0`).
+
+So the forward reads IDENTICAL weights+inputs as recorded yet the optimizer
+stops updating weights (they stay ~initial). The chain: **the generated forward
+plan computes the LOSS correctly but its SAVED ACTIVATIONS (the intermediates
+the backward plan consumes) are wrong → backward gets garbage/zero grads → the
+(recorded) optimizer no-ops → weights frozen → loss frozen.** This is present
+from step 1 (step-1 loss is right because it's the forward OUTPUT; step-1's opt
+already no-ops, so step 2 reads ~initial weights).
+
+Next: buffer-level trace of the forward plan's SAVED-ACTIVATION result slots —
+genResults marks them (count matches recorded, so they're in resultSlots and
+nominally excluded from planner packing), but the suspicion is a slot-
+CORRESPONDENCE error: `gen.nodeSlot[activationNode]` may name a slot that ISN'T
+where the generated stream actually WRITES that activation (e.g. an aliased/
+view slot), so the harvest reads a buffer that was repacked/overwritten while
+the true activation buffer is the one that should have been protected. Compare,
+per saved-activation node, gen.nodeSlot vs the slot its producing command
+writes, and the harvested buffer CONTENTS (generated vs recorded) for one
+activation across a step.
+
 ## Risks and mitigations
 - **Imperative-op long tail** (phase 3): mitigated by per-op fallback — no
   cutover moment; coverage counters make progress visible.
