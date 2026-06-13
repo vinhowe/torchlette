@@ -30,6 +30,7 @@ import {
   computeBatchStrides,
   computeMatmulOutputShape,
   dispatchTiledMatmul,
+  planTiledMatmul,
 } from "./matmul/dispatch";
 import type { EpilogueConfig, DType as MatmulDType } from "./matmul/types";
 import {
@@ -620,6 +621,76 @@ function prepareMatmulInputs(
     strideA,
     strideB,
     strideC,
+  };
+}
+
+/**
+ * Stage-4 phase-3: capture a BARE matmul's resolved dispatch plan from LIVE
+ * inputs (no epilogue, no donation — the dispatchMatmul slow path). Runs the
+ * same prepareMatmulInputs + planTiledMatmul the dispatcher uses. Returns a
+ * reason string when the generated stream can't faithfully reproduce it:
+ *  - "contiguous-prologue": an input needed a contiguous copy (an extra
+ *    prologue dispatch the generator doesn't yet emit);
+ *  - "ksplit": the K-split path (op-internal temp + reduction).
+ * On success: a simple-transpose input is a non-owning view on the SAME
+ * buffer and a contiguous input is itself — so the matmul binds the input
+ * buffers directly, and the generator resolves their slots from the node's
+ * input refs (works even after the inputs are liveness-released). The result
+ * is geometry-only (no live buffers) so it is safe to CACHE on the lowered
+ * action and read at generation time. */
+export interface BareMatmulPlan {
+  pipeline: GPUComputePipeline;
+  paramsData: Uint32Array;
+  dispatchX: number;
+  dispatchY: number;
+  dispatchZ: number;
+  outShape: number[];
+  outputDtype: DType;
+}
+
+export function planBareMatmul(
+  a: WebGPUTensor,
+  b: WebGPUTensor,
+): BareMatmulPlan | string {
+  const ctx = requireContext();
+  const prep = prepareMatmulInputs(a, b, false, false);
+  if (prep.aWasCopied || prep.bWasCopied) {
+    if (prep.aWasCopied) destroyCopy(prep.effectiveA);
+    if (prep.bWasCopied) destroyCopy(prep.effectiveB);
+    return "contiguous-prologue";
+  }
+  const dtypeA: "f16" | "f32" =
+    prep.effectiveA.dtype === "f16" && isF16Supported() ? "f16" : "f32";
+  const dtypeB: "f16" | "f32" =
+    prep.effectiveB.dtype === "f16" && isF16Supported() ? "f16" : "f32";
+  const outputDtype = dtypeA === "f32" || dtypeB === "f32" ? "f32" : dtypeA;
+  const plan = planTiledMatmul({
+    device: ctx.device,
+    queue: ctx.queue,
+    a: prep.effectiveA.buffer,
+    b: prep.effectiveB.buffer,
+    out: undefined as unknown as GPUBuffer,
+    m: prep.m,
+    n: prep.n,
+    k: prep.k,
+    batchSize: prep.batchSize,
+    batchStrideA: prep.strideA,
+    batchStrideB: prep.strideB,
+    batchStrideC: prep.strideC,
+    transA: prep.effectiveTransA,
+    transB: prep.effectiveTransB,
+    dtype: dtypeA,
+    dtypeB: dtypeB !== dtypeA ? dtypeB : undefined,
+  });
+  if (plan.kSplit) return "ksplit";
+  return {
+    pipeline: plan.pipeline,
+    paramsData: plan.paramsData,
+    dispatchX: plan.dispatchX,
+    dispatchY: plan.dispatchY,
+    dispatchZ: plan.dispatchZ,
+    outShape: prep.outShape,
+    outputDtype,
   };
 }
 

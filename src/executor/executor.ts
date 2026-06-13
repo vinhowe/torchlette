@@ -1495,6 +1495,28 @@ export async function executeLoweredPlan(
           if (action.kind === "data-source" && isCompilationRecordingActive()) {
             recordWrite(gpuBuffer(node.result!.backendTensor), nodeIdx);
           }
+
+          // Stage-4 phase-3: capture bare-matmul geometry NOW (inputs live).
+          // The stream generator runs at plan-build, after liveness has freed
+          // these inputs — so the geometry (transpose detection needs live
+          // strides) must be captured here and cached on the action. Geometry
+          // is shape/dtype-pure → valid for every step of this template.
+          if (
+            action.kind === "sequential" &&
+            node.op === "matmul" &&
+            action.cachedMatmulPlan === undefined &&
+            backend.name === "webgpu" &&
+            backendInputs.length === 2
+          ) {
+            try {
+              action.cachedMatmulPlan = _webgpuMatmulImports!.planBareMatmul(
+                asGPUTensor(backendInputs[0]),
+                asGPUTensor(backendInputs[1]),
+              );
+            } catch {
+              action.cachedMatmulPlan = "plan-throw";
+            }
+          }
           break;
         }
 

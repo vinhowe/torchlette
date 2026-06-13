@@ -75,6 +75,12 @@ interface LoweredNodeAction {
   kind: "sequential" | "view" | "data-source" | "prologue-skip";
   /** Plan-node index for this op. */
   nodeIndex: number;
+  /** Stage-4 phase-3: bare-matmul geometry captured at first (live)
+   *  execution, read by the stream generator post-hoc (matmul inputs are
+   *  liveness-released by plan-build). A string is a bail reason
+   *  (contiguous-prologue / ksplit) — uncovered, keeps record/replay.
+   *  Geometry is shape/dtype-pure → invariant within a template. */
+  cachedMatmulPlan?: import("../backend/webgpu/dispatch").BareMatmulPlan | string;
 }
 
 /** A matmul + epilogue chain dispatch. */

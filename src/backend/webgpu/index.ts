@@ -40,6 +40,7 @@ export {
   dispatchMatmul,
   dispatchMatmulDirect,
   getPipeline,
+  planBareMatmul,
 } from "./dispatch";
 export {
   destroyWebGPU,

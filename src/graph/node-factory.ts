@@ -168,6 +168,7 @@ export let _webgpuMatmulImports: {
   dispatchMatmul: typeof import("../backend/webgpu/index").dispatchMatmul;
   dispatchMatmulDirect: typeof import("../backend/webgpu/index").dispatchMatmulDirect;
   deferredDestroyBuffer: typeof import("../backend/webgpu/index").deferredDestroyBuffer;
+  planBareMatmul: typeof import("../backend/webgpu/dispatch").planBareMatmul;
 } | null = null;
 
 export let _webgpuMatmulGeomImports: {
@@ -183,6 +184,7 @@ export async function ensureWebGPUMatmulImports() {
       dispatchMatmul: mod.dispatchMatmul,
       dispatchMatmulDirect: mod.dispatchMatmulDirect,
       deferredDestroyBuffer: mod.deferredDestroyBuffer,
+      planBareMatmul: mod.planBareMatmul,
     };
   }
   if (!_webgpuMatmulGeomImports) {

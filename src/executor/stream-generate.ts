@@ -28,6 +28,7 @@ import {
 import { planFullReductionDispatch } from "../backend/webgpu/ops/reductions";
 import { planFusedKernel } from "../backend/webgpu/fusion-dispatch";
 import { planTiledMatmul } from "../backend/webgpu/matmul/dispatch";
+import type { BareMatmulPlan } from "../backend/webgpu/dispatch";
 import { dtypeBytes } from "../backend/webgpu/shape-utils";
 import { planAdamStepDispatch } from "../backend/webgpu/adam-kernel";
 import {
@@ -218,7 +219,16 @@ export function generateStream(
       }
       case "sequential": {
         const node = planNodes[action.nodeIndex];
-        const gen = generateSequential(node, slots, resolveRefSlot, bufferSlot);
+        const gen =
+          node.op === "matmul"
+            ? generateBareMatmul(
+                (action as { cachedMatmulPlan?: BareMatmulPlan | string })
+                  .cachedMatmulPlan,
+                node,
+                slots,
+                resolveRefSlot,
+              )
+            : generateSequential(node, slots, resolveRefSlot, bufferSlot);
         if (typeof gen === "string") {
           miss(`op:${node.op}${gen ? `[${gen}]` : ""}`);
           phantom(node, action.nodeIndex);
@@ -789,6 +799,57 @@ function generateScatterCopyDMA(
       },
     ],
     outSlot: base.slot,
+  };
+}
+
+/**
+ * Bare matmul generator (the dispatchMatmul slow path — no epilogue). Reads
+ * the geometry captured at lowering time (action.cachedMatmulPlan; matmul
+ * inputs are liveness-released by plan-build, so live-stride transpose
+ * detection can't run here). A simple-transpose input is a non-owning view
+ * on the SAME buffer → its slot is the input ref's slot. Emits ALLOC(out) +
+ * DISPATCH [a, b, out, params]. Bails when geometry wasn't captured (string
+ * reason / undefined → uncovered, record/replay stays).
+ */
+function generateBareMatmul(
+  cached: BareMatmulPlan | string | undefined,
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (cached === undefined) return "no-cached-plan";
+  if (typeof cached === "string") return cached; // bail reason from capture
+  if (node.inputs.length !== 2) return "arity";
+  const aRef = node.inputs[0];
+  const bRef = node.inputs[1];
+  if (aRef.kind === "scalar" || bRef.kind === "scalar") return "scalar-operand";
+  const aSlot = resolveRefSlot(aRef);
+  const bSlot = resolveRefSlot(bRef);
+  if (aSlot === undefined || bSlot === undefined) return "untracked-input";
+  const outBytes = sizeOf(cached.outShape) * dtypeBytes(cached.outputDtype);
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const paramsSlot = slots.length;
+  slots.push({ kind: "params", seqIndex: -1, data: cached.paramsData });
+  return {
+    commands: [
+      {
+        tag: TAG_ALLOC,
+        slot: outSlot,
+        bytes: outBytes,
+        allocKind: 0,
+        inputSlots: [aSlot, bSlot],
+      },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: cached.pipeline,
+        bindings: [aSlot, bSlot, outSlot, paramsSlot],
+        gx: cached.dispatchX,
+        gy: cached.dispatchY,
+        gz: cached.dispatchZ,
+      },
+    ],
+    outSlot,
   };
 }
 
