@@ -214,7 +214,7 @@ adam-batch; fusedAttention FORWARD. Three capture mechanisms cover the
 "generator can't derive it post-hoc" cases: `cachedMatmulPlan` (geometry),
 `cachedInputShapes` (released multi-output input shapes), and read-only
 workspace/config lookups (`lookupKSplitTempBuffer`, `lookupPackedBuffers`,
-`lookupAttentionConfigBuffer`). Coverage: fwd 285/289, bwd 391/414,
+`lookupAttentionConfigBuffer`). Coverage: fwd 285/289, bwd 395/414,
 optimizer 100% (FULLY GENERATED). A latent bug fell out:
 `getOrCreateConfigBuffer` never populated its cache (re-created the
 attention config uniform every dispatch) — fixed (perf + stable identity
@@ -243,6 +243,27 @@ shared-cached-dispatcher class `generateFullReduction` covers for `sum`. A
 real fix would route the epilogue full-reduction through a cached
 dispatcher + count-keyed invCount buffer cache (a framework cleanup worth
 doing on its own), after which the generator could share the identity.
+
+**Dim reductions (DONE) — the cached-dispatcher cleanup the `mean` note
+predicted, applied to the dim path.** Dim reductions previously dispatched
+through a FRESH `createTileKernelDispatcher` per call (no config-buffer
+caching, no stable identity — same disease as `mean`). Fixed: route them
+through a CACHED dispatcher (`getDimReductionDispatcher`, keyed by
+op+inputShape+dims+keepdim+epilogue-signature; the input is forced
+contiguous at the dispatch site so strides/outShape/useParallel are all
+derived) — `buildDimReductionSpec` is the single source for the dispatch
+path and the new `planDimReductionDispatch`. This removes a per-call config
+allocation AND gives the generator a stable identity. Covered:
+`sum[dim-reduction]` singleton (`generateDimReduction`) and the
+`batched-reduction` ACTION (`generateBatchedReduction`). The latter was the
+surprise: its members all have reductionSize 2048 (>64), so
+`backend.batchedReduction` falls back to N individual `reduction()`
+dispatches (the true multi-in/out batched kernel only fires for small
+reductionSize), all recorded under `nodeIndices[0]` — so the generator just
+loops the per-member dim-reduction emit into one segment, and bails the
+whole action if the executor would instead take the true-batched path
+(≤64). mean-over-dim stays excluded (its invCount epilogue buffer is fresh
+per call — the same captured-state gap as full mean). bwd 392→395/414.
 
 **KNOWN BLOCKER — fusedAttentionBackward (the lifetime-split-slot limit).**
 Attempted and reverted (it broke narrowBackward). The attention-backward
