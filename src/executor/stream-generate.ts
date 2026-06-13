@@ -26,7 +26,10 @@ import {
   planContiguousDirect,
   planNarrowBackward,
 } from "../backend/webgpu/ops/views";
-import { planFullReductionDispatch } from "../backend/webgpu/ops/reductions";
+import {
+  planDimReductionDispatch,
+  planFullReductionDispatch,
+} from "../backend/webgpu/ops/reductions";
 import {
   planGatherDirect,
   planScatterAddDirect,
@@ -673,7 +676,8 @@ function generateFullReduction(
 ): { commands: GpuCommand[]; outSlot: Slot } | string {
   const reduceOp = "sum";
   const payload = node.payload as { dim?: number | number[] | null } | undefined;
-  if (payload?.dim != null) return "dim-reduction";
+  if (payload?.dim != null)
+    return generateDimReduction(node, slots, resolveRefSlot, bufferSlot);
   if (node.inputs.length !== 1) return "arity";
   const ref = node.inputs[0];
   if (ref.kind === "scalar") return "scalar-operand";
@@ -708,6 +712,76 @@ function generateFullReduction(
   return {
     commands: [
       { tag: TAG_ALLOC, slot: outSlot, bytes: 4, allocKind: 0, inputSlots: [inSlot] },
+      {
+        tag: TAG_DISPATCH,
+        pipeline: plan.pipeline,
+        bindings,
+        gx: plan.grid[0],
+        gy: plan.grid[1],
+        gz: plan.grid[2],
+      },
+    ],
+    outSlot,
+  };
+}
+
+/** sum over dim(s) — NON-epilogue (e.g. a bias gradient): ALLOC(outSize*4,
+ *  kind 0) + tile dispatch [input, out, config], using the SAME cached
+ *  dispatcher reduction() uses (planDimReductionDispatch). Input must be
+ *  contiguous (the dispatch forces it otherwise, inserting an uncaptured copy)
+ *  and live or a non-view/contiguous-view producer for its shape. mean-over-dim
+ *  (invCount epilogue) is excluded by planDimReductionDispatch's non-epilogue
+ *  contract — it returns a plan only for plain sum/max/min. */
+function generateDimReduction(
+  node: LazyIRNode,
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+): { commands: GpuCommand[]; outSlot: Slot } | string {
+  if (node.inputs.length !== 1) return "arity";
+  const payload = node.payload as
+    | { dim?: number | number[] | null; keepdim?: boolean }
+    | undefined;
+  if (payload?.dim == null) return "no-dim";
+  const ref = node.inputs[0];
+  if (ref.kind === "scalar") return "scalar-operand";
+  const inSlot = resolveRefSlot(ref);
+  if (inSlot === undefined) return "untracked-producer";
+  // The dim-reduction kernel reads its input as a contiguous buffer. If the
+  // input is live and non-contiguous the real dispatch inserts a contiguous
+  // copy we don't capture here, so bail.
+  const storage =
+    ref.kind === "materialized"
+      ? ref.storage
+      : ((ref.outputIndex ?? 0) === 0
+          ? ref.node.result
+          : ref.node.results?.[ref.outputIndex ?? 0]);
+  let inShape: number[];
+  if (storage) {
+    const t = storage.backendTensor as WebGPUTensor;
+    if (!t.isContiguous) return "non-contiguous";
+    inShape = t.shape;
+  } else {
+    const sd = refShapeDtype(ref) ?? contiguousViewShapeDtype(ref);
+    if (!sd) return "no-shape";
+    inShape = sd.shape;
+  }
+  const plan = planDimReductionDispatch(
+    "sum",
+    inShape,
+    payload.dim,
+    payload.keepdim ?? false,
+  );
+  if (!plan) return "all-dims-or-epilogue";
+  const outShape = node.shape;
+  const outBytes = sizeOf(outShape) * 4;
+  const outSlot = slots.length;
+  slots.push({ kind: "arena" });
+  const bindings = tilePlanBindings(plan, { input: inSlot, out: outSlot }, bufferSlot);
+  if (!bindings) return "config-missing";
+  return {
+    commands: [
+      { tag: TAG_ALLOC, slot: outSlot, bytes: outBytes, allocKind: 0, inputSlots: [inSlot] },
       {
         tag: TAG_DISPATCH,
         pipeline: plan.pipeline,

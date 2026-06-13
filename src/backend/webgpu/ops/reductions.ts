@@ -266,44 +266,111 @@ export function reduction(
     }
   }
 
-  const {
-    normalizedDims,
-    outShape,
-    outSize,
-    reductionSize,
-    inputStrides,
-    outStrides,
-    inputToOutDim,
-  } = setup;
+  const { normalizedDims, outShape, outSize, reductionSize } = setup;
   const outBuffer = resolveOutputBuffer(ctx.device, outSize * bpe, [
     tensor.buffer,
   ]);
-  const useParallel = reductionSize > 64;
-  const spec = makeReductionSpec({
-    reduceOp: op,
-    dim: dimInfo(
-      inputShape,
-      inputStrides,
-      normalizedDims,
-      outShape,
-      outStrides,
-      inputToOutDim,
-      useParallel,
-    ),
-    epilogue,
-  });
   const buffers: Record<string, GPUBuffer> = {
     input: tensor.buffer,
     out: outBuffer,
   };
   if (hasEpilogue) addEpilogueBindings(buffers, epilogueOps!, epilogueInputs!);
-  createTileKernelDispatcher(spec).dispatch(buffers, {
-    outSize,
-    reductionSize,
-  });
+  // Cached dispatcher (shared config buffer → stable identity for stream
+  // generation, and no per-call config-buffer allocation). The spec is fully
+  // determined by (op, inputShape, dims, keepdim, epilogue) because the input
+  // was forced contiguous above, so strides/outShape/useParallel are derived.
+  getDimReductionDispatcher(
+    op,
+    inputShape,
+    setup,
+    keepdim,
+    epilogueOps,
+  ).dispatch(buffers, { outSize, reductionSize });
 
   if (contiguousCopy) contiguousCopy.destroy();
   return createTensor(outShape, outBuffer, undefined, 0, outputDtype);
+}
+
+/** Build the dim-reduction tile spec from a prepared setup (single source for
+ *  the dispatch path and planDimReductionDispatch). */
+function buildDimReductionSpec(
+  op: ReduceOp,
+  inputShape: number[],
+  setup: DimReductionSetup,
+  epilogue: { ops: ReductionEpilogueOpDesc[]; outputDtype: DType } | undefined,
+): ReturnType<typeof makeReductionSpec> {
+  const useParallel = setup.reductionSize > 64;
+  return makeReductionSpec({
+    reduceOp: op,
+    dim: dimInfo(
+      inputShape,
+      setup.inputStrides,
+      setup.normalizedDims,
+      setup.outShape,
+      setup.outStrides,
+      setup.inputToOutDim,
+      useParallel,
+    ),
+    epilogue,
+  });
+}
+
+/** A cache key that fully identifies a dim-reduction spec. Input is always
+ *  contiguous at the dispatch site, so shape+dims+keepdim derive strides,
+ *  outShape, and useParallel; the epilogue op chain (not its buffers) decides
+ *  the rest of the WGSL. */
+function dimReductionKey(
+  op: ReduceOp,
+  inputShape: number[],
+  normalizedDims: number[],
+  keepdim: boolean,
+  epilogueOps: ReductionEpilogueOpDesc[] | undefined,
+): string {
+  const epiSig = epilogueOps
+    ? epilogueOps
+        .map((e) => `${e.kind}:${(e as { op?: string }).op ?? ""}:${(e as { inputIndex?: number }).inputIndex ?? ""}`)
+        .join("|")
+    : "";
+  return `${op}Dim:${inputShape.join(",")}:${normalizedDims.join(",")}:${keepdim ? 1 : 0}:${epiSig}`;
+}
+
+/** Cached dim-reduction dispatcher. The epilogue chain is part of the cache
+ *  key (it changes the WGSL); epilogue BUFFERS are passed per-dispatch and are
+ *  not part of identity. */
+function getDimReductionDispatcher(
+  op: ReduceOp,
+  inputShape: number[],
+  setup: DimReductionSetup,
+  keepdim: boolean,
+  epilogueOps: ReductionEpilogueOpDesc[] | undefined,
+) {
+  const epilogue =
+    epilogueOps && epilogueOps.length > 0
+      ? { ops: epilogueOps, outputDtype: "f32" as DType }
+      : undefined;
+  return getCachedDispatcher(
+    dimReductionKey(op, inputShape, setup.normalizedDims, keepdim, epilogueOps),
+    () => buildDimReductionSpec(op, inputShape, setup, epilogue),
+  );
+}
+
+/** Stage-4 plan/encode: the dim-reduction dispatch plan for a NON-epilogue
+ *  reduction (plain sum/max/min over dims — e.g. bias gradients), derived from
+ *  the SAME cached dispatcher reduction() uses. Epilogue reductions (mean over
+ *  dim) are excluded: their invCount buffer is created fresh per call and isn't
+ *  generatable here. */
+export function planDimReductionDispatch(
+  op: ReduceOp,
+  inputShape: number[],
+  dim: number | number[],
+  keepdim: boolean,
+): import("../tile-dispatch").TileKernelPlan | null {
+  const setup = prepareDimReduction(inputShape, dim, keepdim);
+  if (!setup) return null; // all dims reduced → caller should use full reduction
+  return getDimReductionDispatcher(op, inputShape, setup, keepdim, undefined).plan({
+    outSize: setup.outSize,
+    reductionSize: setup.reductionSize,
+  });
 }
 
 // ============================================================================
