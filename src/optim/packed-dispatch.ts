@@ -77,6 +77,55 @@ function getPackedBuffers(count: number, alignedBytes: number): GPUBuffer[] {
   return bufs;
 }
 
+/** Stage-4 stream generation: read-only lookup of the cached packed buffers
+ *  for a (bufferCount, alignedBytes) key. Returns null when not yet
+ *  allocated — the generator runs post-recording, so a hit is guaranteed
+ *  for any group the recording dispatched. Never allocates (generation must
+ *  not mutate GPU state). */
+export function lookupPackedBuffers(
+  count: number,
+  alignedBytes: number,
+): GPUBuffer[] | null {
+  return packedBufferCache.get(`${count}:${alignedBytes}`) ?? null;
+}
+
+/** Stage-4: the element-count grouping + memory-limit sub-batching the
+ *  packed dispatch uses, as pure data (no GPU). The generator replays the
+ *  SAME partition so its scatter/dispatch/gather command order matches the
+ *  recording exactly. Mirrors dispatchPackedOptimizer's loop. */
+export function planPackedGroups(
+  items: PackedOptimizerItem[],
+): Array<{ numElements: number; indices: number[] }> {
+  const out: Array<{ numElements: number; indices: number[] }> = [];
+  if (items.length <= 1) return out;
+  const groups = new Map<number, number[]>();
+  for (let i = 0; i < items.length; i++) {
+    const numEl = items[i].numElements;
+    const g = groups.get(numEl);
+    if (g) g.push(i);
+    else groups.set(numEl, [i]);
+  }
+  for (const [numElements, indices] of groups) {
+    if (indices.length <= 1) continue;
+    const bufferCount = items[indices[0]].buffers.length;
+    const groupBytes = numElements * 4 * indices.length * bufferCount;
+    const maxBatchSize =
+      groupBytes > MAX_PACKED_BYTES
+        ? Math.max(
+            2,
+            Math.floor(MAX_PACKED_BYTES / (numElements * 4 * bufferCount)),
+          )
+        : indices.length;
+    for (let start = 0; start < indices.length; start += maxBatchSize) {
+      const end = Math.min(start + maxBatchSize, indices.length);
+      const batchIndices = indices.slice(start, end);
+      if (batchIndices.length <= 1) continue;
+      out.push({ numElements, indices: batchIndices });
+    }
+  }
+  return out;
+}
+
 /** Release all cached packed buffers. */
 function resetPackedOptimizerCache(): void {
   for (const bufs of packedBufferCache.values()) {

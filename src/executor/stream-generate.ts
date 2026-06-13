@@ -27,6 +27,11 @@ import {
 } from "../backend/webgpu/ops/views";
 import { planFullReductionDispatch } from "../backend/webgpu/ops/reductions";
 import { planFusedKernel } from "../backend/webgpu/fusion-dispatch";
+import { planAdamStepDispatch } from "../backend/webgpu/adam-kernel";
+import {
+  lookupPackedBuffers,
+  planPackedGroups,
+} from "../optim/packed-dispatch";
 import { getInputStorage } from "./op-dispatch";
 import { planUnscaleGradDispatch } from "../backend/webgpu/unscale-kernel";
 import type { TileKernelPlan } from "../backend/webgpu/tile-dispatch";
@@ -255,10 +260,37 @@ export function generateStream(
         coveredActions++;
         break;
       }
+      case "adam-batch": {
+        const ab = action as { nodeIndices: number[] };
+        const gen = backend
+          ? generateAdamBatch(ab, planNodes, slots, resolveRefSlot, bufferSlot, backend)
+          : "no-backend";
+        if (typeof gen === "string") {
+          miss(`adam-batch[${gen}]`);
+          for (const ni of ab.nodeIndices) phantom(planNodes[ni], ni);
+          break;
+        }
+        // Leading barrier (executor recordBarrier before adamStepBatch) lives
+        // in the flat stream only — non-node-attributed, not segment-checked.
+        commands.push({ tag: TAG_BARRIER });
+        for (const c of gen.commands) {
+          if (c.tag === TAG_UNIFORM && c.nodeIndex < 0) {
+            c.nodeIndex = gen.firstNodeIndex;
+          }
+        }
+        commands.push(...gen.commands);
+        segments.push({ nodeIndex: gen.firstNodeIndex, commands: gen.commands });
+        for (const o of gen.outputs) {
+          mapNodeResult(planNodes[o.nodeIndex], o.slot, bufferToSlot);
+          nodeSlot.set(o.nodeIndex, o.slot);
+        }
+        coveredActions++;
+        break;
+      }
       default: {
         miss(action.kind);
-        // Map every output node the action produces (matmul-epilogue, adam
-        // batches, row programs, reductions).
+        // Map every output node the action produces (matmul-epilogue, row
+        // programs, reductions).
         const a = action as {
           nodeIndex?: number;
           nodeIndices?: number[];
@@ -914,6 +946,240 @@ function generateFused(
     }
   }
   return { commands, outputs };
+}
+
+/**
+ * adam-batch generator. Mirrors the executor's adam-batch action exactly:
+ * adamStepBatch packs same-element-count params (dispatchPackedOptimizer)
+ * then falls back to per-item dispatch for the rest, ALL recorded under the
+ * first node's index (one segment). Per packed group: scatter copies
+ * (item buffers → cached packed buffers at offset), one volatile-uniform
+ * packed adam dispatch, gather copies (packed → item buffers). Per fallback
+ * item: an in-place adam dispatch (no alloc, non-f16). Shares the packed
+ * grouping (planPackedGroups), packed buffers (lookupPackedBuffers), and
+ * adam dispatch plan (planAdamStepDispatch) with the executor — no
+ * reimplementation drift. Bails on f16 / chunked / non-contiguous.
+ */
+function generateAdamBatch(
+  action: { nodeIndices: number[] },
+  planNodes: LazyIRNode[],
+  slots: SlotSource[],
+  resolveRefSlot: (ref: LazyIRNode["inputs"][number]) => Slot | undefined,
+  bufferSlot: (buf: unknown, kind: SlotSource["kind"]) => Slot,
+  backend: import("../backend/types").Backend,
+):
+  | { commands: GpuCommand[]; outputs: Array<{ nodeIndex: number; slot: Slot }>; firstNodeIndex: number }
+  | string {
+  const device = (backend as { device?: GPUDevice }).device;
+  if (!device) return "no-device";
+
+  // Resolve each adamStep node's [grad, param, m, v]: buffer, slot, size.
+  interface Item {
+    nodeIndex: number;
+    bufSlots: [Slot, Slot, Slot, Slot];
+    numElements: number;
+    config: import("../backend/types").AdamStepConfig;
+  }
+  const itemList: Item[] = [];
+  // The recording dispatched every node whose result was unset at that time;
+  // at generator time (post-recording) all results are set, so we process
+  // ALL nodeIndices (the executor's `if (node.result) continue` is a
+  // prior-plan dedup that doesn't apply here). firstNodeIndex is the action
+  // anchor — all commands recorded under it (setRecordingNodeIndex).
+  const firstNodeIndex = action.nodeIndices[0];
+  for (const nodeIdx of action.nodeIndices) {
+    const node = planNodes[nodeIdx];
+    if (node.inputs.length !== 4) return "arity";
+    // adam-batch needs only the input SLOTS + element count — never the
+    // input buffers (planAdamStepDispatch reads neither, the scatter/gather
+    // copies key on slots). So resolve slots LOGICALLY (resolveRefSlot
+    // handles liveness-released grads via the node→slot channel) and take
+    // the element count from the node shape. getInputStorage is avoided
+    // precisely because a released grad would trip its lifetime guard.
+    // Contiguity isn't checked here: grads (from backward) and persistent
+    // state are contiguous by construction, and any inserted contiguous
+    // copy would change the recorded command count → caught by the diff.
+    const bufSlots: Slot[] = [];
+    for (let bi = 0; bi < node.inputs.length; bi++) {
+      const slot = resolveRefSlot(node.inputs[bi]);
+      if (slot === undefined) return "untracked-input";
+      bufSlots.push(slot);
+    }
+    itemList.push({
+      nodeIndex: nodeIdx,
+      bufSlots: bufSlots as [Slot, Slot, Slot, Slot],
+      numElements: sizeOf(node.shape),
+      config: node.payload as import("../backend/types").AdamStepConfig,
+    });
+  }
+  if (itemList.length === 0) return "no-items";
+
+  const commands: GpuCommand[] = [];
+  const outputs: Array<{ nodeIndex: number; slot: Slot }> = [];
+  // param/m/v are updated in place — the node's result reuses the param/m/v
+  // input slot. Primary (param) = bufSlots[1].
+  for (const it of itemList) {
+    outputs.push({ nodeIndex: it.nodeIndex, slot: it.bufSlots[1] });
+  }
+
+  // PACKED groups (planPackedGroups mirrors dispatchPackedOptimizer's
+  // element-count grouping + memory sub-batching), then per-item fallback.
+  // planPackedGroups reads only numElements + buffers.length (4 for Adam).
+  const packItems = itemList.map((it) => ({
+    buffers: it.bufSlots as unknown as GPUBuffer[],
+    numElements: it.numElements,
+  }));
+  const groups = planPackedGroups(packItems);
+  const handled = new Set<number>();
+
+  const adamBinding = (
+    plan: import("../backend/webgpu/tile-dispatch").TileKernelPlan,
+    named: Record<string, Slot>,
+    infFlag: unknown | null,
+  ): Slot[] | null => {
+    const out: Slot[] = [];
+    for (const name of plan.bindingOrder) {
+      if (name === null) {
+        if (!plan.configBuffer) return null;
+        out.push(bufferSlot(plan.configBuffer, "persistent"));
+      } else if (name === "inf_flag") {
+        if (!infFlag) return null;
+        out.push(bufferSlot(infFlag, "persistent"));
+      } else {
+        const s = named[name];
+        if (s === undefined) return null;
+        out.push(s);
+      }
+    }
+    return out;
+  };
+
+  for (const g of groups) {
+    const numElements = g.numElements;
+    const totalElements = numElements * g.indices.length;
+    const elementBytes = numElements * 4;
+    const alignedBytes = alignBufferSize(totalElements * 4);
+    const packed = lookupPackedBuffers(4, alignedBytes);
+    if (!packed) return "packed-buffers-missing";
+    const packedSlots = packed.map((b) => bufferSlot(b as unknown, "persistent"));
+    // Scatter: each item's [grad,param,m,v] → packed[b] at i*elementBytes.
+    for (let i = 0; i < g.indices.length; i++) {
+      const it = itemList[g.indices[i]];
+      for (let b = 0; b < 4; b++) {
+        commands.push({
+          tag: TAG_COPY,
+          src: it.bufSlots[b],
+          srcOffset: 0,
+          dst: packedSlots[b],
+          dstOffset: i * elementBytes,
+          bytes: elementBytes,
+        });
+      }
+    }
+    // Packed dispatch (first item's config; the packed path forces
+    // emitF16=false — dispatchAdamStepKernel(...,false,...)).
+    const cfg = itemList[g.indices[0]].config;
+    const infFlag = (cfg.infFlagBuffer as unknown) ?? null;
+    const planned = planAdamStepDispatch(
+      totalElements,
+      cfg,
+      infFlag as GPUBuffer | null,
+      false,
+    );
+    if (!planned) return "adam-plan-null";
+    const bindings = adamBinding(
+      planned.plan,
+      { grad: packedSlots[0], param: packedSlots[1], m: packedSlots[2], v: packedSlots[3] },
+      infFlag,
+    );
+    if (!bindings) return "adam-bind-null";
+    const configSlot = bufferSlot(planned.plan.configBuffer, "persistent");
+    commands.push({
+      tag: TAG_UNIFORM,
+      slot: configSlot,
+      nodeIndex: -1,
+      pack: () => new Uint32Array(0),
+    });
+    commands.push({
+      tag: TAG_DISPATCH,
+      pipeline: planned.plan.pipeline,
+      bindings,
+      gx: planned.plan.grid[0],
+      gy: planned.plan.grid[1],
+      gz: planned.plan.grid[2],
+    });
+    // Gather: packed[b] at offset → item buffers, for b in [1,2,3].
+    for (let i = 0; i < g.indices.length; i++) {
+      const it = itemList[g.indices[i]];
+      for (const b of [1, 2, 3]) {
+        commands.push({
+          tag: TAG_COPY,
+          src: packedSlots[b],
+          srcOffset: i * elementBytes,
+          dst: it.bufSlots[b],
+          dstOffset: 0,
+          bytes: elementBytes,
+        });
+      }
+      handled.add(g.indices[i]);
+    }
+  }
+
+  // Fallback: per-item adam dispatch (adamStepInner). In-place param/m/v —
+  // no alloc — UNLESS config.emitF16 (large weights kept in f16 for the
+  // forward pass): then a param_f16 OUTPUT buffer is allocated (kind 1) and
+  // bound. Matches adamStepInner's `emitF16 = config.emitF16 ?? false`.
+  for (let idx = 0; idx < itemList.length; idx++) {
+    if (handled.has(idx)) continue;
+    const it = itemList[idx];
+    const infFlag = (it.config.infFlagBuffer as unknown) ?? null;
+    const emitF16 = (it.config as { emitF16?: boolean }).emitF16 ?? false;
+    const planned = planAdamStepDispatch(
+      it.numElements,
+      it.config,
+      infFlag as GPUBuffer | null,
+      emitF16,
+    );
+    if (!planned) return "adam-plan-null";
+    const named: Record<string, Slot> = {
+      grad: it.bufSlots[0],
+      param: it.bufSlots[1],
+      m: it.bufSlots[2],
+      v: it.bufSlots[3],
+    };
+    // f16 weight output: allocateOutputBuffer(numElements*2) = allocKind 1.
+    if (planned.doF16) {
+      const f16Slot = slots.length;
+      slots.push({ kind: "arena" });
+      commands.push({
+        tag: TAG_ALLOC,
+        slot: f16Slot,
+        bytes: planned.f16Bytes,
+        allocKind: 1,
+        inputSlots: [],
+      });
+      named.param_f16 = f16Slot;
+    }
+    const bindings = adamBinding(planned.plan, named, infFlag);
+    if (!bindings) return "adam-bind-null";
+    const configSlot = bufferSlot(planned.plan.configBuffer, "persistent");
+    commands.push({
+      tag: TAG_UNIFORM,
+      slot: configSlot,
+      nodeIndex: -1,
+      pack: () => new Uint32Array(0),
+    });
+    commands.push({
+      tag: TAG_DISPATCH,
+      pipeline: planned.plan.pipeline,
+      bindings,
+      gx: planned.plan.grid[0],
+      gy: planned.plan.grid[1],
+      gz: planned.plan.grid[2],
+    });
+  }
+
+  return { commands, outputs, firstNodeIndex };
 }
 
 /**

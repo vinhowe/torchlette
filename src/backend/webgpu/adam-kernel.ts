@@ -460,6 +460,54 @@ export function dispatchAdamStep(
 }
 
 /**
+ * Stage-4 plan/encode: the adam-step dispatch plan (non-f16 path used by the
+ * packed optimizer), derived from the SAME dispatcher instance + uniform
+ * mapping dispatchAdamStep uses. Returns null on the f16 / chunked routes.
+ * The binding order is [grad, param, m, v, (inf_flag?), config].
+ */
+export function planAdamStepDispatch(
+  numElements: number,
+  config: AdamStepConfig,
+  infFlagBuffer: GPUBuffer | null,
+  emitF16 = false,
+): {
+  plan: import("./tile-dispatch").TileKernelPlan;
+  doUnscale: boolean;
+  /** f16 weight emission active → the dispatch has a `param_f16` OUTPUT
+   *  binding the caller must allocate (numElements*2 bytes, allocKind 1). */
+  doF16: boolean;
+  f16Bytes: number;
+} | null {
+  if (numElements * 4 > getMaxStorageBufferBindingSize()) return null; // chunked
+  const doF16 = emitF16 && isF16Supported();
+  const doUnscale = infFlagBuffer !== null;
+  const useVec4 = doUnscale && numElements % 4 === 0;
+  const uniforms: Record<string, number> = { num_elements: numElements };
+  setAdamConfigUniforms(uniforms, config, doUnscale);
+  if (doUnscale) {
+    const epa = doF16 ? 128 : 64;
+    const workItems = useVec4 ? Math.ceil(numElements / 4) : numElements;
+    const wg = Math.ceil(workItems / WORKGROUP_SIZE);
+    const gridSizeX = Math.min(wg, MAX_WORKGROUPS_PER_DIM);
+    uniforms.grid_stride = gridSizeX * WORKGROUP_SIZE;
+    uniforms._pad0 = 0;
+    uniforms._pad1 = 0;
+    void epa;
+  } else {
+    uniforms._pad0 = 0;
+    uniforms._pad1 = 0;
+    uniforms._pad2 = 0;
+    uniforms._pad3 = 0;
+  }
+  return {
+    plan: getAdamDispatcher(useVec4, doF16, doUnscale).plan(uniforms),
+    doUnscale,
+    doF16,
+    f16Bytes: numElements * 2,
+  };
+}
+
+/**
  * Reset all module-local mutable state (dispatcher cache).
  */
 export function resetAdamKernelState(): void {

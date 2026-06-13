@@ -1717,24 +1717,31 @@ export async function executeLoweredPlan(
           .slice(0, 8)
           .map(([k, v]) => `${k}×${v}`)
           .join(" ");
+        // Always segment-aligned: gen-vs-record slot numbering matches only
+        // up to a bijection (the recording assigns slots in recordAlloc
+        // order; the generator in its own order), and the stream is
+        // slot-renaming-invariant by design — so raw-slot diffStreams (right
+        // for record-vs-record determinism) is too strict here. When fully
+        // covered, additionally assert the flat command COUNTS agree, which
+        // catches any non-node-attributed command (barriers) the generator
+        // failed to emit.
+        const seg = diffSegmentsAligned(gen.segments, compiled.commands);
+        for (const div of seg.divergences.slice(0, 3)) {
+          console.warn(
+            `[stream-gen] DIVERGE node[${div.nodeIndex}] op=${planNodes[div.nodeIndex]?.op ?? "?"}: ${div.detail}`,
+          );
+        }
         if (gen.fullyCovered) {
-          const d = diffStreams(gen.commands, compiled.commands);
-          if (d.equal) {
-            console.log(
-              `[stream-gen] MATCH ${compiled.commands.length} cmds (${gen.actionCount} actions)`,
-            );
-          } else {
+          const countMatch = gen.commands.length === compiled.commands.length;
+          if (!countMatch) {
             console.warn(
-              `[stream-gen] DIVERGE at cmd ${d.firstDivergence}: generated="${d.a}" recorded="${d.b}" (gen ${d.lengthA} vs rec ${d.lengthB} cmds)`,
+              `[stream-gen] DIVERGE flat command count: generated ${gen.commands.length} vs recorded ${compiled.commands.length}`,
             );
           }
+          console.log(
+            `[stream-gen] FULLY GENERATED ${gen.actionCount} actions: ${seg.verifiedActions}/${gen.segments.length} segments verified, ${seg.divergences.length} diverged, flat ${gen.commands.length}/${compiled.commands.length} cmds${countMatch ? " ✓" : " ✗"}`,
+          );
         } else {
-          const seg = diffSegmentsAligned(gen.segments, compiled.commands);
-          for (const div of seg.divergences.slice(0, 3)) {
-            console.warn(
-              `[stream-gen] DIVERGE node[${div.nodeIndex}] op=${planNodes[div.nodeIndex]?.op ?? "?"}: ${div.detail}`,
-            );
-          }
           console.log(
             `[stream-gen] VERIFIED ${seg.verifiedActions}/${gen.segments.length} segments (${seg.verifiedCommands} cmds, ${seg.divergences.length} diverged, ${seg.unmatched} unmatched; covered ${gen.coveredActions}/${gen.actionCount} actions; uncovered: ${top})`,
           );
